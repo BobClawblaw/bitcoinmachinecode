@@ -27,15 +27,20 @@ below is landed on `arm-port` and pushed; details in `worklog/2026-09-01.md`.
       test_addrv2_serve PASSES. Sweep harness: wallet_cli/bitcoin_rpcd/
       bitcoin_cli special builds + scratch daemon/ real dir + the
       relative-symlink fix (all overlay targets absolute now).
-- [ ] Interpreter/store segfaults: test_dersig_encoding (stack_push copy loop,
-      len=0xffffffff via the toalt path), test_interp_legacy_spend (done+44),
-      test_archive_truncate_nonmonotonic (main+528: some asm callee clobbers
-      main's x22; store_get_at audited clean), test_taproot_parity,
-      test_utxo_lsm, test_utxo_setinfo, test_multisig_opcount. Systematic tool
-      needed: AArch64 port of scripts/abi_callee_saved_audit.py (the x86 one is
-      NASM-specific; my objdump heuristic is not sound enough to gate fixes).
-      NOTE: test_utxo_lsm/utxo_setinfo now also have a REAL state to check
-      against (post-backfill production LSM, live=241230455).
+- [ ] Interpreter/store segfaults: FIXED (five root causes, see worklog
+      2026-09-01 "Segfault cluster"): mac_lsm_reload_impl 0x80 frame overflowed
+      by the WAL 49-byte PUSH staging (x27/x28 save slots overwritten),
+      store_truncate_index_only missing x19-x22 saves, interp_push_bool raw-arg
+      len, .Lsh_parse_varint zeroed cursor on fail, __tb_cmp x22 return.
+      test_archive_truncate_nonmonotonic / test_taproot_parity /
+      test_utxo_lsm / test_utxo_setinfo PASS. Remaining FUNCTIONAL fails:
+      test_dersig_encoding rc=1 ("tx h152841 re-hosted at h400000" case),
+      test_interp_legacy_spend rc=1 (2-of-3 multisig case),
+      test_multisig_opcount rc=1 (port accepts 10x 0-of-20 = 210 ops > 201
+      budget via KEY COUNT; sigops counting gap).
+      Follow-up: port the x86 auditor's SAVE-AREA-ALIAS check (static-size
+      staged writes vs live save slots) -- it would have caught the reload
+      frame bug mechanically.
 - [ ] test_keepup: pushed block not served byte-exact (the .do_block chain
       gate or the serve-side store read; gdb multi-inferior capture pending).
 - [x] signet chain flags: 4-way sfc_chain dispatch restored (f2877e2);
