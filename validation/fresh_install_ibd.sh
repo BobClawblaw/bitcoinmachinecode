@@ -11,11 +11,23 @@
 # (a line every 10 min while syncing), <dest>/RESULT at the end.
 set -u
 DEST=${1:?dest dir}; ORACLE=${2:-"/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"}
+# RESUME=1 restarts an interrupted run on the datadir it already built: the
+# clone, the build and the configuration are left exactly as they were, the
+# daemon is started again and the same watch resumes. Use it when something
+# OUTSIDE the test stopped it (a host reboot, an OOM kill of another job) --
+# never to paper over the daemon dying, which is a genuine failure.
+RESUME=${RESUME:-0}
 REPO=https://github.com/BobClawblaw/bitcoinmachinecode.git
 P2P=8362; RPC=8361
 mkdir -p "$DEST"; cd "$DEST" || exit 2
 PH="$DEST/phase.log"; ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }; ph(){ echo "$(ts) $*" | tee -a "$PH"; }
 ph "START dest=$DEST host=$(hostname) kernel=$(uname -r) nasm=$(nasm -v | head -1) gcc=$(gcc --version | head -1)"
+if [ "$RESUME" = 1 ]; then
+    [ -x src/asm/daemon/bitcoind ] || { ph "FAIL resume: no build at src/asm/daemon/bitcoind"; echo FAIL > RESULT; exit 2; }
+    [ -f data/bitcoin.conf ] || { ph "FAIL resume: no data/bitcoin.conf"; echo FAIL > RESULT; exit 2; }
+    if [ -f daemon.pid ] && kill -0 "$(cat daemon.pid)" 2>/dev/null; then ph "FAIL resume: daemon $(cat daemon.pid) is still running"; exit 2; fi
+    ph "RESUME commit=$(git -C src rev-parse --short HEAD) datadir=$(du -sh data | cut -f1) -- clone/build/conf untouched"
+else
 # 1. clone -- from GitHub, not the local checkout: this is what a stranger gets
 t0=$(date +%s); git clone -q "$REPO" src || { ph "FAIL clone"; echo FAIL > RESULT; exit 1; }
 ph "CLONE done $(( $(date +%s)-t0 ))s commit=$(git -C src rev-parse --short HEAD)"
@@ -38,9 +50,11 @@ rpcport=$RPC
 dbcache=8192
 CONF
 ph "CONF port=$P2P rpcport=$RPC dbcache=8192 (everything else = sample defaults)"
+fi
 # 4. start, unattended, low priority, its own console log; never as a unit
 ph "START daemon"
-setsid nohup nice -n 10 ionice -c3 src/asm/daemon/bitcoind serve "$DEST/data" > console.log 2>&1 < /dev/null &
+if [ "$RESUME" = 1 ]; then setsid nohup nice -n 10 ionice -c3 src/asm/daemon/bitcoind serve "$DEST/data" >> console.log 2>&1 < /dev/null &
+else setsid nohup nice -n 10 ionice -c3 src/asm/daemon/bitcoind serve "$DEST/data" > console.log 2>&1 < /dev/null & fi
 echo $! > daemon.pid; sleep 5
 kill -0 "$(cat daemon.pid)" 2>/dev/null || { ph "FAIL daemon exited at once (console.log)"; echo FAIL > RESULT; exit 1; }
 grep -q "no config file" console.log && { ph "FAIL the daemon did not find the configuration (see console.log)"; kill "$(cat daemon.pid)"; echo FAIL > RESULT; exit 1; }
@@ -51,14 +65,17 @@ last_phase=""
 while :; do
     sleep 600
     hb=$(grep '\[dl\] heartbeat' console.log | tail -1 | sed 's/.*heartbeat: //')
-    bad=$(grep -cE 'FATAL|REJECT|HALTED|SEGV' console.log)
+    # A lagging peer offering its own shorter chain makes the node log
+    # "[reorg] candidate REJECTED ... (no action taken)". That is the node
+    # being right, and it is routine on mainnet -- it must not fail the run.
+    bad=$(grep -E 'FATAL|REJECT|HALTED|SEGV' console.log | grep -vE '\[reorg\] (candidate REJECTED|probe of )' | grep -c .)
     du=$(du -sh data 2>/dev/null | cut -f1); rss=$(ps -o rss= -p "$(cat daemon.pid)" 2>/dev/null | awk '{printf "%.1fG", $1/1048576}')
     for m in 'header' 'catch-up' 'bulk' '\[utxo_live\] init' 'coinstats\] adopted' 'keep-up'; do
         l=$(grep -m1 -E "$m" console.log | cut -c1-140); [ -n "$l" ] && ! grep -qF "$m" "$PH" && ph "PHASE first '$m': $l"
     done
     echo "$(ts) $hb disk=$du rss=$rss bad=$bad" >> progress.log
     if ! kill -0 "$(cat daemon.pid)" 2>/dev/null; then ph "FAIL daemon died (bad=$bad)"; echo FAIL > RESULT; exit 1; fi
-    [ "$bad" != 0 ] && { ph "FAIL bad log markers: $(grep -E 'FATAL|REJECT|HALTED|SEGV' console.log | head -2 | cut -c1-140)"; echo FAIL > RESULT; exit 1; }
+    [ "$bad" != 0 ] && { ph "FAIL bad log markers: $(grep -E 'FATAL|REJECT|HALTED|SEGV' console.log | grep -vE '\[reorg\] (candidate REJECTED|probe of )' | head -2 | cut -c1-140)"; echo FAIL > RESULT; exit 1; }
     ours=$(echo "$hb" | grep -oE 'tip=[0-9]+' | cut -d= -f2); theirs=$($ORACLE getblockcount 2>/dev/null)
     [ -n "$ours" ] && [ -n "$theirs" ] && [ "$ours" -ge $((theirs-1)) ] && break
 done
