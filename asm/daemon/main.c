@@ -2873,6 +2873,21 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
  * fresh-install acceptance test, 2026-09-02). */
 #define DLC_HDR_SANE_MAX 100000L
 static int dlc_headers_sane(long have0, long pos){ return have0 - pos <= DLC_HDR_SANE_MAX; }
+
+/* Is a download worker dead weight this tick? The byte-rate floor
+ * (dead_weight_bps, 32 KB/s) is calibrated for blocks of a megabyte or more.
+ * In the first ~150k blocks of the chain a block is a few hundred bytes, so
+ * a peer serving 50 of them a second delivers 20 KB/s -- and the old rule
+ * (bytes only) called that dead weight, killed the worker, and banned the
+ * peer for the run: 85 of 121 peers within eight minutes of a fresh start
+ * (fresh-install acceptance test, 2026-09-02). A worker that hands over at
+ * least DLC_DEAD_WEIGHT_MIN_BLOCKS blocks per 10-second tick is pulling its
+ * weight whatever the byte count; near the tip that many blocks are tens of
+ * megabytes, so the byte rule stays the binding one there. */
+#define DLC_DEAD_WEIGHT_MIN_BLOCKS 10L
+static int dlc_dead_weight(double byte_rate, long blocks_this_tick){
+    return byte_rate >= 0.0 && byte_rate < g_cfg.dead_weight_bps && blocks_this_tick < DLC_DEAD_WEIGHT_MIN_BLOCKS;
+}
 static int __attribute__((unused)) dlc_headers_connect_ok(unsigned char* hst, long have, const unsigned char loc[32]){
     unsigned char rec[112];
     if(have <= 0) return 1;                                   /* fresh store: nothing to connect to */
@@ -3692,7 +3707,7 @@ static long dl_catchup(const char* dir, int min_workers){
             }
             char flag[48]="";
             if(kids[w]!=0 && byte_rate>=0.0){
-                if(byte_rate<g_cfg.dead_weight_bps){
+                if(dlc_dead_weight(byte_rate, b-prev_blocks[w])){
                     dead_ticks[w]++;
                     if(dead_ticks[w]>=g_cfg.dead_weight_ticks){
                         long bidx = stats[w].held_idx;
