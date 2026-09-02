@@ -1088,8 +1088,9 @@ int main(void){
         rj_free(r); rj_free(outer); }
       r = NULL; ec = 0; em = NULL;
       rc = rpc_node_dispatch("getprivatebroadcastinfo", NULL, &r, &ec, &em);
-      ck("getprivatebroadcastinfo -> -1 naming the missing queue",
-         rc == 0 && ec == -1 && em && strstr(em, "private broadcast"));
+      /* Core: RPC_METHOD_NOT_FOUND with this exact text while -privatebroadcast is off */
+      ck("getprivatebroadcastinfo while the option is off -> -32601 with Core's text",
+         rc == 0 && ec == -32601 && em && strstr(em, "Private broadcast is not enabled"));
       rj_free(r); }
 
     /* ---- the peer-control channel, end to end ---- */
