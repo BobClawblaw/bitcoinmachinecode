@@ -413,3 +413,6 @@ asm/tests/tool_*
 # per-chain live confs carry rpc credentials, like config/bitcoin.conf
 config/bitcoin.testnet4.conf
 config/bitcoin.regtest.conf
+asm/daemon/build_txospender_index
+asm/daemon/utxo_dump_keys
+asm/daemon/utxo_repair_del
