@@ -143,36 +143,51 @@ Every round lost the spends of **exactly one block: the block applied
 immediately before the one that failed** — i.e. the last block whose
 operations were in the memtable when it flushed.
 
-### Root cause
+### Root cause (pinned 2026-09-02 by the regtest repro, `tests/test_utxo_lost_tombstones`)
 
-- `b3d47a9` (13:29, deploy `y`): the memtable flush writes records through a
-  1 MB buffer, but the sparse-index samples still used `lseek(SEEK_CUR)`,
-  which excludes the buffered bytes. Every sample after a drain pointed
-  short of its record; lookups through the fresh run missed. The first
-  block after each flush therefore rejected with "missing/already-spent".
-- The daemon's failure path (`daemon/main.c`, download-worker loop) treats
-  ANY catch-up failure as "manifest full" and calls `utxo_live_recover()`,
-  a compaction, then retries. The compaction's sequential rewrite has
-  correct offsets, so the retry passed and the log said SUCCEEDED.
-- Between the flush and the compaction, the spends recorded by the last
-  block before the flush were lost — 471 at 539016, 491 at 428470, 35 at
-  445238, … 2,596 in total. The exact step that drops them (the flush
-  writing them, the failed apply's partial rollback, or the compaction's
-  merge order) is not yet pinned; it needs the regtest repro described
-  under "Fixes".
-- `bc098fd` (14:23) fixed the read side and stopped the trigger. Its commit
-  message records the rejects as "each recovered by a full compaction" —
-  the recovery was trusted because the retry succeeded, exactly the trap
-  `project-bmc-live-daemon` warns about: "treat any FATAL + in-place
-  recovery pair as worth investigating before trusting the retry".
+- **The trigger.** `b3d47a9` (13:29, deploy `y`): the memtable flush writes
+  records through a 1 MB buffer, but the sparse-index samples still used
+  `lseek(SEEK_CUR)`, which excludes the buffered bytes. The buffer drains at a
+  *piece* boundary (a record is written as key, value-portion, script), so
+  with mainnet's mixed 22-34-byte scripts the drain lands mid-record and every
+  sample after it points into the middle of a record: the read-side scan
+  parses garbage and 10-15% of point lookups through such a run MISS.
+  (Fixed-size short records never straddle the drain, which is why the first
+  repro attempts saw no misses -- the fault is shape-dependent.)
+- **The mechanism.** The replay ran with undo capture on (`g_undo_enabled`
+  defaults to 1; `daemon/main.c` never clears it), so every spend went
+  through `undo_capture_and_del` = `utxo_lsm_get` THEN `utxo_lsm_del`. A
+  flush lands in the middle of a block. For the spends after that point whose
+  coins had just gone into the fresh run, the capture's lookup missed,
+  returned 0, and `live_on_input` accepted 0 as "already absent -- a
+  crash-resumed re-apply" and SKIPPED the spend. The coin stayed in the run.
+  Verification of the NEXT block missed too and rejected; the blind recovery
+  compacted (a sequential rewrite, correct offsets) and the retry passed.
+  So the damage was exactly the post-flush spends of the block the flush
+  landed in, at the lookup-miss rate. The block data confirms it to the
+  transaction: in 539016 the first lost spend is tx 61, none of the 170
+  in-window spends before it were lost, 471 of the 4,691 after it were
+  (10%), and none of the 274 spends of older-run coins were -- their run had
+  been rewritten by an earlier compaction.
+- **What the store did NOT do.** The store never lost a record. In every
+  sequence the repro can drive -- flush, reject, compaction, reload,
+  post-flush spends of run-resident coins -- the ground-truth walk stays
+  exact. Only point lookups lied, and one caller believed them.
+- **The mask.** `daemon/main.c` treated every catch-up failure as "manifest
+  full", compacted, retried, and called the retry's success proof. Fixed in
+  `874c1a8` (gated, walk-verified recovery).
+- **The missed signal.** `bc098fd` (14:23) fixed the read side and stopped
+  the trigger; its message records the rejects as "each recovered by a full
+  compaction". Nobody asked what the spends between a flush and its reject
+  had seen.
 
 ### Why it had never happened before
 
-The buffered flush is one day old. Before it, flushes wrote each record
-with three `write()`s and the sparse index was consistent by construction.
-The blind-recovery pattern has existed since incident #45's era, but it had
-only ever fired on a genuinely full manifest, where compaction is the right
-answer and loses nothing.
+The buffered flush was one day old, and the "0 is not fatal" branch in
+`live_on_input` had been dead in practice since Stage D began verifying a
+block before applying it (a re-applied block is rejected by verification,
+and crash-resumed blocks are handled by the ghost rollback at boot). It
+took a lookup that lies to reach it.
 
 ### What was damaged, and what was not
 
@@ -212,12 +227,19 @@ Done tonight:
 
 To do (in this order):
 
-1. **Repro, then root-cause the lost tombstones**: a test that fills a
-   memtable across a flush with the `b3d47a9` object (or a forced bad
-   sparse sample), applies a block whose spends sit in the pre-flush
-   window, triggers the reject → `utxo_live_recover()` → retry path, and
-   walk-counts. `tests/test_lsm_flush_sparse` already builds the run; it
-   needs the recover step and a `del` in the last block.
+1. **Repro, then root-cause the lost tombstones** -- DONE 2026-09-02 (this
+   branch). `tests/bitcoin_utxo_lsm_badsparse.o` is the LSM assembled with the
+   read-side fix compiled out; `test_lsm_lost_tombstones{,_bad}` (store level)
+   shows the lie and the walk staying exact; `test_utxo_lost_tombstones{,_bad}`
+   (daemon level: 32-tx blocks, 86-byte records so the drain lands mid-record,
+   undo capture on, the old main.c loop) reproduced the loss -- `resurrected_
+   spent=11 of 31904`, +10 at the first flush and +1 at the second -- and now
+   proves the fix. **Fix:** an absent coin at apply time is a store lookup
+   inconsistency: the block fails, the partial apply is rolled back without
+   trusting a lookup, UTXO tracking HALTS (sticky, heartbeat marker) and the
+   worker stops retrying with an operator message. The repro halts at the
+   first lying lookup with the walk equal to the pre-block state and zero
+   earlier spends lost.
 2. **Make recovery honest** -- DONE, `874c1a8` (2026-09-01 23:30 UTC, gate
    green twice: 310 gated tests on the branch and again on `main`). Every
    catch-up failure is classified (consensus reject / store error /
