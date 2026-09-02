@@ -419,3 +419,4 @@ asm/daemon/utxo_repair_del
 
 # built from the scratch Core tree by validation/build_core_oracle.sh; never committed
 validation/core_script_oracle
+asm/tests/fuzz_script_diff
