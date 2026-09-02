@@ -1794,8 +1794,11 @@ varint_put:
     jb   .v1
     cmp  rsi, 0xffff
     jbe  .v3
-    cmp  rsi, 0xffffffff
-    jbe  .v5
+    ; "fits 32 bits?" -- not `cmp rsi, 0xffffffff` (imm32 sign-extends to -1:
+    ; the 9-byte form was unreachable). rax is free: every exit sets it.
+    mov  rax, rsi
+    shr  rax, 32
+    jz   .v5
     mov  byte [rdi], 0xff
     mov  [rdi+1], rsi
     mov  rax, 9
