@@ -550,7 +550,6 @@ static int cmd_getaddednodeinfo(const rj_val* params, rj_val** res){
 /* listbanned: this node keeps no ban list. Core returns an empty array when
  * nothing is banned, so an empty array here is the SAME answer, not a stub;
  * the divergence is that nothing can ever populate it (see setban). */
-static int cmd_empty_array(rj_val** res){ *res = rj_arr(); return 1; }
 
 /* ping -- Core queues a ping to every peer and returns null immediately;
  * the result shows up in getpeerinfo's pingtime. This node's peer legs are
@@ -1801,7 +1800,8 @@ long rpc_node_mempool_load(const char* path){
     long* order = malloc((size_t)(col.n + 1) * sizeof *order);
     if (order) mpd_order_parents_first(col.v, col.n, order);
     for (long k = 0; k < col.n; k++){ long i = order ? order[k] : k; mpd_import_one(&c, col.v[i].tx, col.v[i].len, col.v[i].t, col.v[i].d); }
-    for (long i = 0; i < col.n; i++) free(col.v[i].tx); free(col.v); free(order);
+    for (long i = 0; i < col.n; i++) free(col.v[i].tx);
+    free(col.v); free(order);
     long deferred = c.nretry;
     long gained = mpd_retry_passes(&c);
     fprintf(stderr, "[mempool] loaded %s: %ld accepted, %ld rejected of %ld (%ld waited for a parent, %ld of them then accepted)\n",

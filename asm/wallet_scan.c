@@ -292,7 +292,6 @@ long wscan_run(long from, long to,
                 p += cc + sl + 4;
                 if (p > end) goto malformed;
             }
-            const unsigned char* outs_at = p;
             unsigned long n_out = wscan_varint(p, end, &cc);
             if (cc == 0) goto malformed;
             p += cc;

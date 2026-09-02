@@ -894,7 +894,8 @@ static int crt_b64dec(const char* in, unsigned char* out, long cap, long* outn){
     static signed char T[256]; static int init=0;
     if (!init){ for (int i=0;i<256;i++) T[i]=-1;
         const char* B="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        for (int i=0;i<64;i++) T[(unsigned char)B[i]]=(signed char)i; init=1; }
+        for (int i=0;i<64;i++) T[(unsigned char)B[i]]=(signed char)i;
+        init=1; }
     unsigned acc=0; int bits=0; long o=0;
     for (const char* q=in; *q; q++){
         if (*q=='=' || *q=='\n' || *q=='\r' || *q==' ') continue;
@@ -1209,7 +1210,8 @@ static int psbt_decode_common(rj_val* o, const unsigned char* key, unsigned long
         if (t == 0x03 && vl == 4){ unsigned v = (unsigned)val[0] | ((unsigned)val[1]<<8); const char* nm = NULL;
             switch (v){ case 0: nm = "DEFAULT"; break; case 1: nm = "ALL"; break; case 2: nm = "NONE"; break; case 3: nm = "SINGLE"; break;
                         case 0x81: nm = "ALL|ANYONECANPAY"; break; case 0x82: nm = "NONE|ANYONECANPAY"; break; case 0x83: nm = "SINGLE|ANYONECANPAY"; break; default: break; }
-            if (nm) rj_obj_set(o, "sighash", rj_str(nm)); return 1; }
+            if (nm) rj_obj_set(o, "sighash", rj_str(nm));
+            return 1; }
         if (t == 0x06 && kl >= 34 && vl >= 4){ rj_val* a = psbt_obj_arr(o, "bip32_derivs"); rj_val* d = rj_obj();
             rj_obj_set(d, "pubkey", psbt_hexval(key+1, kl-1)); rj_obj_set(d, "master_fingerprint", psbt_hexval(val, 4));
             char ps[512]; psbt_path_str(ps, sizeof ps, val+4, vl-4); rj_obj_set(d, "path", rj_str(ps)); rj_arr_push(a, d); return 1; }
@@ -1431,8 +1433,8 @@ static int cmd_joinpsbts(const rj_val* params, long* ec, const char** em, rj_val
         { psbt_v2meta vm; if (!psbt_load(arr->items[pi]->str, bufs[pi], sizeof bufs[pi], &blens[pi], &vm, ec, em)) return 0;
           if (vm.version >= 2){ *ec=-8; *em="joinpsbts only operates on version 0 PSBTs"; return 0; } }
         long p=5; psbt_kv g[PSBT_MAXKV]; int gn=psbt_parse_map(bufs[pi],blens[pi],&p,g,PSBT_MAXKV);
-        const unsigned char* utx=NULL; unsigned long utxl=0;
-        for (int j=0;j<gn;j++) if (g[j].kl>=1 && g[j].k[0]==0x00){ utx=g[j].v; utxl=g[j].vl; break; }
+        const unsigned char* utx=NULL;
+        for (int j=0;j<gn;j++) if (g[j].kl>=1 && g[j].k[0]==0x00){ utx=g[j].v; break; }
         if (!utx){ *ec=-22; *em="TX decode failed"; return 0; }
         /* parse this tx's inputs/outputs */
         unsigned long cc; long q=4; unsigned long n_in=srw_varint(utx+q,&cc); q+=cc;
@@ -1541,7 +1543,8 @@ static int cmd_analyzepsbt(const rj_val* params, long* ec, const char** em, rj_v
         const unsigned char *fin_sig=NULL,*fin_wit=NULL,*redeem=NULL,*wscript=NULL,*nwu=NULL,*wu=NULL;
         unsigned long fin_sig_l=0,fin_wit_l=0,redeem_l=0,wscript_l=0,wu_l=0;
         for (int j=0;j<nkv;j++){
-            if (kv[j].kl!=1) continue; unsigned char t=kv[j].k[0];
+            if (kv[j].kl!=1) continue;
+            unsigned char t=kv[j].k[0];
             if (t==0x00) nwu=kv[j].v;
             else if (t==0x01){ wu=kv[j].v; wu_l=kv[j].vl; }
             else if (t==0x04){ redeem=kv[j].v; redeem_l=kv[j].vl; }
@@ -1889,16 +1892,6 @@ static int srw_ecdsa(unsigned char* der, const unsigned char z[32], const unsign
     int dl = der_signature_export(der, r, sv); der[dl++] = (unsigned char)hashtype; return dl;
 }
 /* the signatures we can produce for a multisig script (key order, at most k); returns how many */
-static int srw_multisig_sigs(unsigned char (*sigs)[80], int* siglens, int k, const unsigned char* keys[], const int* keylen, int n,
-                             const unsigned char z[32], unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys, int hashtype){
-    int got = 0;
-    for (int i = 0; i < n && got < k; i++){
-        int h = srw_key_index(keys[i], keylen[i], kpub, ncomp, nkeys);
-        if (h < 0) continue;
-        siglens[got] = srw_ecdsa(sigs[got], z, kpriv[h], hashtype); got++;
-    }
-    return got;
-}
 /* the same, merging PARTIAL_SIGs the PSBT carries for keys we do not hold, in script order;
  * rec[]/nrec receive (pubkey, sig) for every signature placed (2026-09-01) */
 static int srw_multisig_sigs2(unsigned char (*sigs)[80], int* siglens, int k, const unsigned char* keys[], const int* keylen, int n,
@@ -1942,7 +1935,7 @@ static int srw_tap_sighash(unsigned char z[32], const unsigned char* tx, unsigne
     msg[m++] = (unsigned char)locktime; msg[m++] = (unsigned char)(locktime >> 8); msg[m++] = (unsigned char)(locktime >> 16); msg[m++] = (unsigned char)(locktime >> 24);
     if (!acp){
         for (unsigned long j = 0; j < n_in; j++) if (!prev_of[j]){ free(msg); return 0; }
-        unsigned char* b = malloc(n_in * 36 + 64 * n_in + 16); if (!b){ free(msg); return 0; }
+        unsigned char* b = calloc(1, n_in * 36 + 64 * n_in + 16); if (!b){ free(msg); return 0; }   /* zeroed: n_in may be 0 */
         unsigned long bl = 0;
         for (unsigned long j = 0; j < n_in; j++){ memcpy(b + bl, outpoints[j], 36); bl += 36; }
         sha256_full(msg + m, b, bl); m += 32;                                   /* sha_prevouts */
@@ -2697,9 +2690,6 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
                 unsigned long tl = (unsigned long)(hl2/2), q = 4, cc2;
                 if (tl > 6 && txb[4] == 0x00 && txb[5] == 0x01) q = 6;
                 unsigned long ni = srw_varint(txb + q, &cc2); q += cc2;
-                extern int rpc_wops_own_coin_spk(const void*, const unsigned char*, unsigned int,
-                                                 unsigned long long*, unsigned char*, unsigned long*,
-                                                 unsigned char*, unsigned long*);
                 for (unsigned long i = 0; i < ni && ni <= 10000; i++){
                     if (q + 36 > tl) break;
                     const unsigned char* op = txb + q;
@@ -3566,24 +3556,6 @@ static void psbt_musig_stage(psbt_kv (*ikv)[FIN_MAXKV], int* in_n, int n_in,
     }
 }
 /* network serialization of utx with the given final scriptSigs/witnesses */
-static char* mu_extract_hex(const unsigned char* utx, unsigned long utxl, crt_in_t* uin, int n_in, unsigned long ost, unsigned long oen,
-                            unsigned char (*fss)[256], const unsigned long* fsslen, unsigned char (*fwit)[256], const unsigned long* fwitlen){
-    int any_wit = 0; for (int i = 0; i < n_in; i++) if (fwitlen[i] > 1) any_wit = 1;
-    unsigned char* out = malloc(utxl + 16 + (unsigned long)n_in * 600); if (!out) return NULL; long o = 0;
-    memcpy(out, utx, 4); o = 4;
-    if (any_wit){ out[o++] = 0x00; out[o++] = 0x01; }
-    o += crt_varint(out + o, (unsigned long long)n_in);
-    for (int i = 0; i < n_in; i++){
-        memcpy(out + o, uin[i].op, 36); o += 36;
-        o += crt_varint(out + o, (unsigned long long)fsslen[i]); memcpy(out + o, fss[i], fsslen[i]); o += (long)fsslen[i];
-        unsigned sq = uin[i].seq; out[o++]=(unsigned char)sq; out[o++]=(unsigned char)(sq>>8); out[o++]=(unsigned char)(sq>>16); out[o++]=(unsigned char)(sq>>24);
-    }
-    memcpy(out + o, utx + ost, oen - ost); o += (long)(oen - ost);
-    if (any_wit) for (int i = 0; i < n_in; i++){ if (fwitlen[i]){ memcpy(out + o, fwit[i], fwitlen[i]); o += (long)fwitlen[i]; } else out[o++] = 0x00; }
-    memcpy(out + o, utx + utxl - 4, 4); o += 4;
-    char* hx = malloc((size_t)o*2+1); if (hx) bin_to_hex(hx, out, (size_t)o);
-    free(out); return hx;
-}
 /* ==== end MuSig2 ========================================================= */
 
 static char* dpp_musig_update(const char* b64, dpp_desc_t* dv, int nd);
@@ -3685,18 +3657,18 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
     }
     static unsigned char in_spk[FIN_MAXIO][128]; static unsigned long in_spklen[FIN_MAXIO];
     static unsigned char rec_ss[FIN_MAXIO][4096]; static unsigned long rec_sslen[FIN_MAXIO];
-    static unsigned char rec_wit[FIN_MAXIO][4096]; static unsigned long rec_witlen[FIN_MAXIO]; static unsigned rec_witems[FIN_MAXIO];
+    static unsigned char rec_wit[FIN_MAXIO][4096]; static unsigned long rec_witlen[FIN_MAXIO];
     static int rec_state[FIN_MAXIO];   /* 0 unsigned, 1 partial, 2 complete */
     /* signatures the delegate placed (its "_sigs"): PARTIAL_SIG (0x02|pub33) or TAP_SCRIPT_SIG (0x14|x|leafhash) */
     #define SG_MAX 8
     static unsigned char sg_k[FIN_MAXIO][SG_MAX][67]; static unsigned long sg_kl[FIN_MAXIO][SG_MAX];
     static unsigned char sg_v[FIN_MAXIO][SG_MAX][80]; static unsigned long sg_vl[FIN_MAXIO][SG_MAX]; static int sg_n[FIN_MAXIO];
-    for (int i = 0; i < n_in; i++){ in_spklen[i] = 0; rec_sslen[i] = rec_witlen[i] = 0; rec_witems[i] = 0; rec_state[i] = 0; sg_n[i] = 0; }
+    for (int i = 0; i < n_in; i++){ in_spklen[i] = 0; rec_sslen[i] = rec_witlen[i] = 0; rec_state[i] = 0; sg_n[i] = 0; }
     /* inputs the MuSig2 stage finished are complete before any round: their
      * witness is the aggregated key-path signature, and the delegate's
      * "keys not provided" for them is ignored by the per-input record */
     for (int i = 0; i < n_in; i++) if (mu_witlen[i] && mu_witlen[i] <= sizeof rec_wit[i]){
-        memcpy(rec_wit[i], mu_wit[i], mu_witlen[i]); rec_witlen[i] = mu_witlen[i]; rec_witems[i] = 1; rec_state[i] = 2; }
+        memcpy(rec_wit[i], mu_wit[i], mu_witlen[i]); rec_witlen[i] = mu_witlen[i]; rec_state[i] = 2; }
     rj_val* sres = NULL;
     for (int round = 0; round <= max_leaf; round++){
     if (sres){ rj_free(sres); sres = NULL; }
@@ -3855,7 +3827,7 @@ static int psbt_process(const char* b64, int sign, const char* sht, int finalize
           if (st <= rec_state[i]) continue;
           if (rin[i].sslen > sizeof rec_ss[i] || rin[i].witlen > sizeof rec_wit[i]) continue;
           memcpy(rec_ss[i], rin[i].ss, rin[i].sslen); rec_sslen[i] = rin[i].sslen;
-          memcpy(rec_wit[i], rin[i].wit, rin[i].witlen); rec_witlen[i] = rin[i].witlen; rec_witems[i] = rin[i].witems;
+          memcpy(rec_wit[i], rin[i].wit, rin[i].witlen); rec_witlen[i] = rin[i].witlen;
           rec_state[i] = st;
       }
     }
@@ -4048,7 +4020,8 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
           }
           g_wupd_dv = wdv; g_wupd_nd = wnd;
       }
-      if (ld) rj_free(ld); rj_free(np); }
+      if (ld) rj_free(ld);
+      rj_free(np); }
     int rc = psbt_process(b64, sign, sht, finalize, wallet_psbt_signer, (void*)w, wallet_musig_keyfn, g_wupd_dv, g_wupd_nd, ec, em, result);
     return rc;
 }
@@ -4125,7 +4098,7 @@ static int dpp_signer(rj_val* fwd, void* vctx, long* ec, const char** em, rj_val
 }
 /* MuSig2 key oracle for descriptorprocesspsbt: any key of any supplied
  * descriptor, at any index of its range (a participant's key is handed in
- * as its own descriptor, e.g. tr(<xprv>/0/*) or pk(<WIF>)) */
+ * as its own descriptor, e.g. tr(<xprv>/0/<wildcard>) or pk(<WIF>)) */
 static int dpp_musig_keyfn(void* vctx, const unsigned char pub33[33], unsigned char priv[32]){
     dpp_ctx_t* c = (dpp_ctx_t*)vctx;
     for (int di = 0; di < c->n; di++){
