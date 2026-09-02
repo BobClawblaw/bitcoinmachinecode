@@ -23,26 +23,28 @@ static void ck(const char* l, int c){ if (c) printf("  ok  %s\n", l); else { pri
 static int rd(int fd, unsigned char* b, int n){ int g = 0; while (g < n){ int r = (int)read(fd, b + g, (size_t)(n - g)); if (r <= 0) return g; g += r; } return g; }
 
 /* mode: 0 noauth+success, 1 userpass required, 2 REP=5 refused, 3 silent, 4 wrong password */
+/* a short write in the fake proxy would break the wire assertions anyway; make it loud */
+static void wr(int fd, const void* b, int n){ if (write(fd, b, n) != n) _exit(9); }
 static void fake_proxy(int ls, int mode, int report){
     int c = accept(ls, 0, 0); if (c < 0) _exit(1);
     unsigned char b[600]; int n;
     n = rd(c, b, 2); if (n != 2){ _exit(2); }
-    int nm = b[1]; n = rd(c, b + 2, nm); write(report, b, 2 + nm);          /* greeting as sent */
+    int nm = b[1]; n = rd(c, b + 2, nm); wr(report, b, 2 + nm);          /* greeting as sent */
     if (mode == 3){ sleep(3); _exit(0); }
     unsigned char sel[2] = { 5, (unsigned char)(mode == 1 || mode == 4 ? 2 : 0) };
-    write(c, sel, 2);
+    wr(c, sel, 2);
     if (mode == 1 || mode == 4){
         n = rd(c, b, 2); int ul = b[1]; n = rd(c, b + 2, ul + 1); int pl = b[2 + ul]; n = rd(c, b + 3 + ul, pl);
-        write(report, b, 3 + ul + pl);                                       /* auth as sent */
-        unsigned char ar[2] = { 1, (unsigned char)(mode == 4 ? 1 : 0) }; write(c, ar, 2);
+        wr(report, b, 3 + ul + pl);                                       /* auth as sent */
+        unsigned char ar[2] = { 1, (unsigned char)(mode == 4 ? 1 : 0) }; wr(c, ar, 2);
         if (mode == 4) _exit(0);
     }
-    n = rd(c, b, 5); int hl = b[4]; n = rd(c, b + 5, hl + 2); write(report, b, 5 + hl + 2); /* request as sent */
+    n = rd(c, b, 5); int hl = b[4]; n = rd(c, b + 5, hl + 2); wr(report, b, 5 + hl + 2); /* request as sent */
     unsigned char rep[10] = { 5, (unsigned char)(mode == 2 ? 5 : 0), 0, 1, 0,0,0,0, 0,0 };
-    write(c, rep, 10);
+    wr(c, rep, 10);
     if (mode == 2) _exit(0);
     /* tunnel: echo whatever arrives, prefixed with '>' */
-    n = rd(c, b, 5); if (n == 5){ unsigned char o[6] = {'>'}; memcpy(o + 1, b, 5); write(c, o, 6); }
+    n = rd(c, b, 5); if (n == 5){ unsigned char o[6] = {'>'}; memcpy(o + 1, b, 5); wr(c, o, 6); }
     close(c); _exit(0);
 }
 static int listen_lo(int* port){
@@ -51,11 +53,11 @@ static int listen_lo(int* port){
     socklen_t al = sizeof a; getsockname(ls, (struct sockaddr*)&a, &al); listen(ls, 2); *port = ntohs(a.sin_port); return ls;
 }
 static int run_case(int mode, const char* user, const char* pass, unsigned char* wire, int* wl, int* rep){
-    int port, rp[2]; pipe(rp); int ls = listen_lo(&port);
+    int port, rp[2]; if (pipe(rp)) return -1; int ls = listen_lo(&port);
     pid_t pid = fork(); if (pid == 0){ close(rp[0]); fake_proxy(ls, mode, rp[1]); }
     close(rp[1]); close(ls);
     int fd = socks5_connect("127.0.0.1", port, "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion", 8333, user, pass, 1500, rep);
-    if (fd >= 0){ write(fd, "hello", 5); unsigned char e[6]; int n = rd(fd, e, 6); if (n == 6 && e[0] == '>' && !memcmp(e + 1, "hello", 5)) fd = 100000 + fd; close(fd >= 100000 ? fd - 100000 : fd); }
+    if (fd >= 0){ (void)!write(fd, "hello", 5); /* a short write fails the echo check below */ unsigned char e[6]; int n = rd(fd, e, 6); if (n == 6 && e[0] == '>' && !memcmp(e + 1, "hello", 5)) fd = 100000 + fd; close(fd >= 100000 ? fd - 100000 : fd); }
     int st; waitpid(pid, &st, 0);
     *wl = 0; { int r; while ((r = (int)read(rp[0], wire + *wl, 600 - *wl)) > 0) *wl += r; } close(rp[0]);
     return fd;

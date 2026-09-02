@@ -40,14 +40,14 @@ static uint64_t tsp_rd_varint(const uint8_t* p, const uint8_t* end, uint64_t* co
     if (p + 9 > end){ *consumed = 0; return 0; }
     *consumed = 9; uint64_t v = 0; for (int i = 0; i < 8; i++) v |= (uint64_t)p[1+i] << (8*i); return v;
 }
-static void tsp_pack(uint8_t out[TSP_REC], const tsp_rec* r){
+static inline void tsp_pack(uint8_t out[TSP_REC], const tsp_rec* r){
     memcpy(out, r->prefix, 12);
     for (int b = 0; b < 4; b++) out[12+b] = (uint8_t)(r->vout   >> (8*b));
     for (int b = 0; b < 4; b++) out[16+b] = (uint8_t)(r->height >> (8*b));
     for (int b = 0; b < 4; b++) out[20+b] = (uint8_t)(r->offset >> (8*b));
     for (int b = 0; b < 4; b++) out[24+b] = (uint8_t)(r->len    >> (8*b));
 }
-static void tsp_unpack(tsp_rec* r, const uint8_t in[TSP_REC]){
+static inline void tsp_unpack(tsp_rec* r, const uint8_t in[TSP_REC]){
     memcpy(r->prefix, in, 12); r->vout = r->height = r->offset = r->len = 0;
     for (int b = 0; b < 4; b++) r->vout   |= (uint32_t)in[12+b] << (8*b);
     for (int b = 0; b < 4; b++) r->height |= (uint32_t)in[16+b] << (8*b);
@@ -55,13 +55,13 @@ static void tsp_unpack(tsp_rec* r, const uint8_t in[TSP_REC]){
     for (int b = 0; b < 4; b++) r->len    |= (uint32_t)in[24+b] << (8*b);
 }
 /* key order: prefix bytes, then vout */
-static int tsp_key_cmp(const uint8_t* prefix_a, uint32_t vout_a, const uint8_t* prefix_b, uint32_t vout_b){
+static inline int tsp_key_cmp(const uint8_t* prefix_a, uint32_t vout_a, const uint8_t* prefix_b, uint32_t vout_b){
     int c = memcmp(prefix_a, prefix_b, 12); if (c) return c;
     return vout_a < vout_b ? -1 : vout_a > vout_b ? 1 : 0;
 }
 /* Walk a block; call cb(ctx, prevout_txid_wire, vout, tx_offset, tx_len) for
  * every non-coinbase input. Returns 0 on a malformed block. */
-static int tsp_walk_block(const uint8_t* blk, long blen,
+static inline int tsp_walk_block(const uint8_t* blk, long blen,
                           void (*cb)(void*, const uint8_t*, uint32_t, uint32_t, uint32_t), void* ctx){
     const uint8_t* p = blk + 80; const uint8_t* end = blk + blen;
     uint64_t cc, ntx = tsp_rd_varint(p, end, &cc);

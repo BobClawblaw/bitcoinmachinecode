@@ -145,7 +145,7 @@ int main(void){
 
     /* Sign it for real, so the PSBT below carries a genuine signature and
      * the extractor has an authoritative answer to be compared against. */
-    char pj[2000];
+    char pj[8200];   /* holds one 4000-byte psbt64 plus framing */
     snprintf(pj, sizeof pj,
         "[\"%s\",[\"%s\"],[{\"txid\":\"000000000000000000000000000000000000"
         "0000000000000000000000000001\",\"vout\":0,\"scriptPubKey\":\"%s\","
@@ -288,7 +288,7 @@ int main(void){
       rj_free(r); }
     ck("the two halves really are different transactions", strcmp(halfA, halfB) != 0);
 
-    { char cj[5000];
+    { char cj[9000];   /* two 4000-byte hex strings plus framing */
       snprintf(cj, sizeof cj, "[[\"%s\",\"%s\"]]", halfA, halfB);
       rj_val* r = call("combinerawtransaction", cj, &ec, &em);
       ck("combinerawtransaction dispatched", r && r->typ == RJ_STR);
@@ -305,7 +305,7 @@ int main(void){
     { /* a half and the whole are CONSISTENT (the signer is deterministic, so
        * input 0 carries the identical scriptSig in both) -- combining them
        * must succeed and yield the whole, not trip the conflict check */
-      char cj[5000]; snprintf(cj, sizeof cj, "[[\"%s\",\"%s\"]]", halfA, both);
+      char cj[9000];   /* two 4000-byte hex strings plus framing */ snprintf(cj, sizeof cj, "[[\"%s\",\"%s\"]]", halfA, both);
       rj_val* r = call("combinerawtransaction", cj, &ec, &em);
       ck_str("a half plus the whole combines cleanly (identical data is not a conflict)",
              r ? r->str : NULL, both);
@@ -319,14 +319,14 @@ int main(void){
        * outpoint(72) + scriptSig-len(2) = 84 hex chars */
       bad[90] = (bad[90] == 'a') ? 'b' : 'a';
       ck("the mutated copy really differs from halfA", strcmp(bad, halfA) != 0);
-      char cj[5000]; snprintf(cj, sizeof cj, "[[\"%s\",\"%s\"]]", halfA, bad);
+      char cj[9000];   /* two 4000-byte hex strings plus framing */ snprintf(cj, sizeof cj, "[[\"%s\",\"%s\"]]", halfA, bad);
       rj_val* r = call("combinerawtransaction", cj, &ec, &em);
       ck("two txs with DIFFERENT data for one input -> refused, not merged",
          r == NULL && ec == -22 && em && strstr(em, "combinepsbt"));
       rj_free(r); }
 
     { /* mismatched inputs: 2-input tx vs the 1-input tx from part 1 */
-      char cj[5000]; snprintf(cj, sizeof cj, "[[\"%s\",\"%s\"]]", both, signed_hex);
+      char cj[9000];   /* two 4000-byte hex strings plus framing */ snprintf(cj, sizeof cj, "[[\"%s\",\"%s\"]]", both, signed_hex);
       rj_val* r = call("combinerawtransaction", cj, &ec, &em);
       ck("transactions with different inputs -> -8", r == NULL && ec == -8);
       rj_free(r); }

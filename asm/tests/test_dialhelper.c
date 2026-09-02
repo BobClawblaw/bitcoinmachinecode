@@ -172,7 +172,8 @@ int main(void){
           char host2[64]; snprintf(host2, sizeof host2, "127.0.0.1:%d", ntohs(sa2.sin_port)); \
           int fd2 = -1; for (int k = 0; k < 50 && fd2 < 0; k++){ fd2 = socket(AF_INET, SOCK_STREAM, 0); if (connect(fd2, (struct sockaddr*)&sa2, sizeof sa2) != 0){ close(fd2); fd2 = -1; usleep(20000); } } \
           long res = -2; if (fd2 >= 0 && node_handshake(fd2) == 1) res = dlc_fetch_headers(fd2, hst, host2); \
-          if (fd2 >= 0) close(fd2); kill(fp2, SIGKILL); waitpid(fp2, NULL, 0); close(l2); \
+          if (fd2 >= 0) close(fd2); \
+          kill(fp2, SIGKILL); waitpid(fp2, NULL, 0); close(l2); \
           ok((cond), label_ok); (void)res; }while(0)
       { unsigned char hp[2][80]; memcpy(hp[0], h1, 80); memcpy(hp[1], h2, 80);
         long res_a = -2; HFETCH(0, 2, hp, "a page continuing our tip: both headers appended (count 3)", (res_a = res) == 2 && hst_count(hst) == 3); }

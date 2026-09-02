@@ -88,7 +88,7 @@ static void service_conn(int cfd) {
     const char *method, *path, *body; size_t mlen, plen, blen;
     if (!http_request_parse(buf, (size_t)got, &method, &mlen, &path, &plen, &body, &blen)) {
         const char* e400 = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-        write(cfd, e400, strlen(e400)); close(cfd); return;
+        (void)!write(cfd, e400, strlen(e400)); close(cfd); return;   /* error path, best effort */
     }
     /* capture the request line + body for wire assertions */
     {
@@ -139,8 +139,8 @@ static void service_conn(int cfd) {
     int hl = snprintf(hdr, sizeof hdr,
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %ld\r\n\r\n",
         (long)strlen(reply_body));
-    write(cfd, hdr, (size_t)hl);
-    write(cfd, reply_body, strlen(reply_body));
+    if (write(cfd, hdr, (size_t)hl) != (ssize_t)hl || write(cfd, reply_body, strlen(reply_body)) != (ssize_t)strlen(reply_body))
+        perror("fake server: short write");       /* the wire assertions then fail loudly */
     close(cfd);
 }
 
@@ -199,7 +199,7 @@ static int run_cli(const char* portarg, ...) {
     argv[ac] = NULL;
 
     int pout[2], perr[2];
-    pipe(pout); pipe(perr);
+    if (pipe(pout) || pipe(perr)) { perror("pipe"); return -1; }
     pid_t pid = fork();
     if (pid == 0) {
         dup2(pout[1], 1); dup2(perr[1], 2);

@@ -158,7 +158,7 @@ static int zp_bind(const char* addr){
      *
      * Core accepts it, but on a node like this one it silently publishes every
      * block and transaction to the whole LAN -- and the operator who typed
-     * `tcp://*:28332` copied it from a tutorial and got a listener far wider
+     * the wildcard bind (`tcp:` + `//` + `*:28332`) copied it from a tutorial and got a listener far wider
      * than intended. There is no authentication on a ZMQ publisher: whoever
      * connects, subscribes.
      *

@@ -97,7 +97,6 @@ static void build_nonmonotonic_archive(void){
      * (mirrors how a real out-of-order parallel downloader would populate
      * them -- nothing here assumes ascending file_no open order). */
     FILE* f[4] = {0,0,0,0};
-    long pos[4] = {0,0,0,0};
     int fileno_at[7];
     for (int h = 0; h < 7; h++){
         int fn = HEIGHT_FILE[h];

@@ -19,6 +19,7 @@
 #define MAX_STACK 1000
 
 /* struct script_state matches bitcoin_interp.asm offsets */
+struct sc_slice { const uint8_t* p; size_t n; };   /* named: an anonymous struct in a parameter list is a distinct type per declaration */
 struct script_state {
     uint8_t* main_elems;      /* +0  */
     size_t   main_sp;         /* +8  */
@@ -34,7 +35,7 @@ struct script_state {
     void*    checksig_ctx;    /* +88 */
     uint64_t (*checksig_fn)(void*, const uint8_t*, size_t,
                             const uint8_t*, size_t,
-                            const struct { const uint8_t* p; size_t n; }*); /* +96 */
+                            const struct sc_slice*); /* +96 */
 };
 
 extern int script_eval(struct script_state* st);

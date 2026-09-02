@@ -118,8 +118,8 @@ static int file_exists(const char* dir, long h){
 /* truncate a file to n bytes (to construct torn tails) in BOTH dirs */
 static void truncate_both(long h, long nbytes){
     char p[96];
-    snprintf(p, sizeof p, "a/undo_%ld.dat", h); truncate(p, nbytes);
-    snprintf(p, sizeof p, "b/undo_%ld.dat", h); truncate(p, nbytes);
+    snprintf(p, sizeof p, "a/undo_%ld.dat", h); if (truncate(p, nbytes)){ perror("truncate a"); exit(1); }
+    snprintf(p, sizeof p, "b/undo_%ld.dat", h); if (truncate(p, nbytes)){ perror("truncate b"); exit(1); }
 }
 
 int main(void){
@@ -187,12 +187,14 @@ int main(void){
         static undo_rec_t ra[2], rb[2];
         memset(ra, 0, sizeof ra); memset(rb, 0, sizeof rb);
         long na, nb;
-        if (chdir("a")) return 1; na = undo_load(42, ra, 2);
-        if (chdir("../b")) return 1; nb = ref_undo_load(42, rb, 2);
+        if (chdir("a")) return 1;
+        na = undo_load(42, ra, 2);
+        if (chdir("../b")) return 1;
+        nb = ref_undo_load(42, rb, 2);
         if (chdir("..")) return 1;
         ck("load: max_recs cap identical", na, nb);
     }
-    ck("load: absent height reads as 0 (asm)", ({ long v; chdir("a"); v = undo_load(777777, 0, 0); chdir(".."); v; }), 0);
+    ck("load: absent height reads as 0 (asm)", ({ long v = -99; if (!chdir("a")){ v = undo_load(777777, 0, 0); if (chdir("..")) v = -98; } v; }), 0);
 
     /* ---- 3. replay: stream checksum + cb-abort + NULL cb ---- */
     {
@@ -202,8 +204,10 @@ int main(void){
             cbctx_t ca = { 14695981039346656037ULL, 0, -1 };
             cbctx_t cc = { 14695981039346656037ULL, 0, -1 };
             long na, nb;
-            if (chdir("a")) return 1; na = undo_replay(h, cb_sum, &ca);
-            if (chdir("../b")) return 1; nb = ref_undo_replay(h, cb_sum, &cc);
+            if (chdir("a")) return 1;
+            na = undo_replay(h, cb_sum, &ca);
+            if (chdir("../b")) return 1;
+            nb = ref_undo_replay(h, cb_sum, &cc);
             if (chdir("..")) return 1;
             if (na != nb || ca.sum != cc.sum || ca.calls != cc.calls) all = 0;
         }
@@ -212,16 +216,20 @@ int main(void){
     {
         cbctx_t ca = { 1, 0, 1 }, cc = { 1, 0, 1 };   /* abort at record 1 */
         long na, nb;
-        if (chdir("a")) return 1; na = undo_replay(42, cb_sum, &ca);
-        if (chdir("../b")) return 1; nb = ref_undo_replay(42, cb_sum, &cc);
+        if (chdir("a")) return 1;
+        na = undo_replay(42, cb_sum, &ca);
+        if (chdir("../b")) return 1;
+        nb = ref_undo_replay(42, cb_sum, &cc);
         if (chdir("..")) return 1;
         ck("replay: cb abort -> -1 on both", na, nb);
         ck("replay: cb abort is -1 (not a short count)", na, -1);
     }
     {
         long na, nb;
-        if (chdir("a")) return 1; na = undo_replay(42, 0, 0);
-        if (chdir("../b")) return 1; nb = ref_undo_replay(42, 0, 0);
+        if (chdir("a")) return 1;
+        na = undo_replay(42, 0, 0);
+        if (chdir("../b")) return 1;
+        nb = ref_undo_replay(42, 0, 0);
         if (chdir("..")) return 1;
         ck("replay: NULL cb just counts, identically", na, nb);
     }
@@ -231,13 +239,17 @@ int main(void){
         /* height 1's file: truncate to 30 bytes (mid-header) */
         truncate_both(1, 30);
         long na, nb; int ta = 7, tb = 7;
-        if (chdir("a")) return 1; na = undo_replay(1, 0, 0);
-        if (chdir("../b")) return 1; nb = ref_undo_replay(1, 0, 0);
+        if (chdir("a")) return 1;
+        na = undo_replay(1, 0, 0);
+        if (chdir("../b")) return 1;
+        nb = ref_undo_replay(1, 0, 0);
         if (chdir("..")) return 1;
         ck("torn header: strict replay -1 on both", na, nb);
         ck("torn header: strict is -1", na, -1);
-        if (chdir("a")) return 1; na = undo_replay_tolerant(1, 0, 0, &ta);
-        if (chdir("../b")) return 1; nb = ref_undo_replay_tolerant(1, 0, 0, &tb);
+        if (chdir("a")) return 1;
+        na = undo_replay_tolerant(1, 0, 0, &ta);
+        if (chdir("../b")) return 1;
+        nb = ref_undo_replay_tolerant(1, 0, 0, &tb);
         if (chdir("..")) return 1;
         ck("torn header: tolerant count identical", na, nb);
         ck("torn header: torn flag set on both", (long)ta*10+tb, 11);
@@ -247,12 +259,16 @@ int main(void){
          * second is slen=UNDO_MAX_SCRIPT; cut into its script region */
         truncate_both(42, 51 + 51 + 100);
         long na, nb; int ta = 7, tb = 7;
-        if (chdir("a")) return 1; na = undo_replay(42, 0, 0);
-        if (chdir("../b")) return 1; nb = ref_undo_replay(42, 0, 0);
+        if (chdir("a")) return 1;
+        na = undo_replay(42, 0, 0);
+        if (chdir("../b")) return 1;
+        nb = ref_undo_replay(42, 0, 0);
         if (chdir("..")) return 1;
         ck("torn script: strict replay -1 on both", na, nb);
-        if (chdir("a")) return 1; na = undo_replay_tolerant(42, 0, 0, &ta);
-        if (chdir("../b")) return 1; nb = ref_undo_replay_tolerant(42, 0, 0, &tb);
+        if (chdir("a")) return 1;
+        na = undo_replay_tolerant(42, 0, 0, &ta);
+        if (chdir("../b")) return 1;
+        nb = ref_undo_replay_tolerant(42, 0, 0, &tb);
         if (chdir("..")) return 1;
         ck("torn script: tolerant counts identical", na, nb);
         ck("torn script: tolerant stops after the intact record", na, 1);
@@ -263,13 +279,15 @@ int main(void){
         int fd;
         u8 bad[51]; memset(bad, 0, sizeof bad); bad[49] = 0xff; bad[50] = 0xff; /* slen=0xffff */
         if (chdir("a")) return 1;
-        fd = open("undo_500.dat", O_WRONLY|O_CREAT|O_TRUNC, 0644); write(fd, bad, 51); close(fd);
+        fd = open("undo_500.dat", O_WRONLY|O_CREAT|O_TRUNC, 0644); if (write(fd, bad, 51) != 51){ perror("write undo_500"); exit(1); } close(fd);
         if (chdir("../b")) return 1;
-        fd = open("undo_500.dat", O_WRONLY|O_CREAT|O_TRUNC, 0644); write(fd, bad, 51); close(fd);
+        fd = open("undo_500.dat", O_WRONLY|O_CREAT|O_TRUNC, 0644); if (write(fd, bad, 51) != 51){ perror("write undo_500"); exit(1); } close(fd);
         if (chdir("..")) return 1;
         long na, nb; int ta = 7, tb = 7;
-        if (chdir("a")) return 1; na = undo_replay_tolerant(500, 0, 0, &ta);
-        if (chdir("../b")) return 1; nb = ref_undo_replay_tolerant(500, 0, 0, &tb);
+        if (chdir("a")) return 1;
+        na = undo_replay_tolerant(500, 0, 0, &ta);
+        if (chdir("../b")) return 1;
+        nb = ref_undo_replay_tolerant(500, 0, 0, &tb);
         if (chdir("..")) return 1;
         ck("oversized slen: -1 even in tolerant mode, on both", na, nb);
         ck("oversized slen: is -1", na, -1);
@@ -278,12 +296,16 @@ int main(void){
     /* ---- 5. discard / prune / prune_from ---- */
     {
         long da, db;
-        if (chdir("a")) return 1; da = undo_discard(500);
-        if (chdir("../b")) return 1; db = ref_undo_discard(500);
+        if (chdir("a")) return 1;
+        da = undo_discard(500);
+        if (chdir("../b")) return 1;
+        db = ref_undo_discard(500);
         if (chdir("..")) return 1;
         ck("discard: removed -> 1 on both", da*10+db, 11);
-        if (chdir("a")) return 1; da = undo_discard(500);
-        if (chdir("../b")) return 1; db = ref_undo_discard(500);
+        if (chdir("a")) return 1;
+        da = undo_discard(500);
+        if (chdir("../b")) return 1;
+        db = ref_undo_discard(500);
         if (chdir("..")) return 1;
         ck("discard: second time -> 0 on both", da*10+db, 0);
     }
@@ -293,8 +315,10 @@ int main(void){
         long ca = 0, cc = 0, guard = 0;
         for (;;){
             long na, nb;
-            if (chdir("a")) return 1; na = undo_prune_from(ca, 963764, 963764-91842+1, 40000);
-            if (chdir("../b")) return 1; nb = ref_undo_prune_from(cc, 963764, 963764-91842+1, 40000);
+            if (chdir("a")) return 1;
+            na = undo_prune_from(ca, 963764, 963764-91842+1, 40000);
+            if (chdir("../b")) return 1;
+            nb = ref_undo_prune_from(cc, 963764, 963764-91842+1, 40000);
             if (chdir("..")) return 1;
             if (na != nb){ printf("FAIL prune_from cursor asm=%ld ref=%ld\n", na, nb); fails++; break; }
             if (na == ca) break;
@@ -313,8 +337,10 @@ int main(void){
     }
     {
         long pa, pb;
-        if (chdir("a")) return 1; pa = undo_prune(963764, 100);
-        if (chdir("../b")) return 1; pb = ref_undo_prune(963764, 100);
+        if (chdir("a")) return 1;
+        pa = undo_prune(963764, 100);
+        if (chdir("../b")) return 1;
+        pb = ref_undo_prune(963764, 100);
         if (chdir("..")) return 1;
         ck("prune: removed counts identical", pa, pb);
         int gone = !file_exists("a",91842) && !file_exists("b",91842)
@@ -328,8 +354,10 @@ int main(void){
     {
         u8 txid[32]; mk_txid(txid, 9);
         long ra, rb;
-        if (chdir("a")) return 1; ra = undo_append_record(-7, txid, 0, 1, 0, 0, script, 4);
-        if (chdir("../b")) return 1; rb = ref_undo_append_record(-7, txid, 0, 1, 0, 0, script, 4);
+        if (chdir("a")) return 1;
+        ra = undo_append_record(-7, txid, 0, 1, 0, 0, script, 4);
+        if (chdir("../b")) return 1;
+        rb = ref_undo_append_record(-7, txid, 0, 1, 0, 0, script, 4);
         if (chdir("..")) return 1;
         ck("negative height: append rc identical", ra, rb);
         ck("negative height: undo_-7.dat byte-identical", file_eq(-7), 1);
