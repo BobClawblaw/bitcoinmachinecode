@@ -67,6 +67,8 @@ typedef struct {
 #define RPC_CTL_SETNETACTIVE   5   /* ctl_num = 0/1 */
 #define RPC_CTL_PING           6
 #define RPC_CTL_ADDPEERADDRESS 7   /* ctl_arg = "host:port" (any BIP155 network), ctl_num = tried */
+#define RPC_CTL_PB_ABORT       8   /* ctl_arg = txid/wtxid hex; ctl_out = "txid wtxid\n" per removed tx; ctl_result = count */
+#define RPC_PB_INFO_CAP  262144    /* the private-broadcast snapshot (txid wtxid time len hex npeers peers...) */
 #define RPC_MAX_BANS           64
 
 /* ZMQ transaction notification ring (see zmq_ring at the end of the struct).
@@ -150,6 +152,19 @@ typedef struct {
     volatile long long          ctl_num;      /* bantime / nodeid / bool */
     char                        ctl_arg[128]; /* address, subnet, or host:port */
     char                        ctl_reason[128];
+    char                        ctl_out[4096];  /* larger results (abortprivatebroadcast's removed list) */
+
+    /* -privatebroadcast (Core v30). The parent sets tx_submit_private=1 on a
+     * sendrawtransaction so the worker queues the tx for private broadcast
+     * instead of mempool+relay (the worker clears it after every submission).
+     * pb_enabled/pb_reachable are published by the worker at boot for the RPC
+     * gating; pb_info is the worker's snapshot of the queue (pb_info_seq bumps
+     * on change), one line per tx, parsed by getprivatebroadcastinfo. */
+    volatile int                tx_submit_private;
+    volatile int                pb_enabled;
+    volatile int                pb_reachable;
+    volatile unsigned long long pb_info_seq;
+    char                        pb_info[RPC_PB_INFO_CAP];
 
     /* Runtime network toggle (setnetworkactive). The worker checks this
      * before dialing; the parent reads it for getnetworkinfo's
