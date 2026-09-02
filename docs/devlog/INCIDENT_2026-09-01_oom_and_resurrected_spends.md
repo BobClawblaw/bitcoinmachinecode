@@ -17,7 +17,7 @@ fully explained below with the evidence; neither is fixed in the store yet.
 | UTXO defect | At every height ≥ 539,017 our set = Core's set + exactly 2,596 outpoints. Zero outpoints missing. Sum of the extras = the `gettxoutsetinfo` amount delta to the satoshi. |
 | Origin | Eight `FATAL: apply_block failed → in-place recovery (compact)` rounds during today's from-genesis rebuild, 13:37–14:23 UTC, at heights 428471 … 539017. Each round lost the spends of the one block applied just before the failure. |
 | Underlying bug | Deploy `y` = commit `b3d47a9` (13:29, buffered memtable flush) left the sparse-index samples on the pre-buffer file offset. Fixed for lookups in `bc098fd` (14:23). The damage done by the eight recoveries in between was never assessed. |
-| State now | **REPAIRED 21:23 UTC and PROVEN 21:28**: the 2,596 outpoints were deleted offline (`daemon/utxo_repair_del`), the coinstats state re-seeded from a full walk, and `gettxoutsetinfo muhash` at height 965085 is `7b3938df…8c44` on both nodes, 165,721,328 txouts, 20,078,163.63377124 BTC. The blind recovery path is still in place (to-do below). |
+| State now | **CLOSED 2026-09-02 01:06 UTC.** Set repaired and proven (below); gated recovery deployed as `ah`; the lying-lookup mechanism pinned by a regtest repro and the halt-on-absent-coin fix deployed as `ai`, muhash identical to the oracle at 965104. Earlier state: **REPAIRED 21:23 UTC and PROVEN 21:28**: the 2,596 outpoints were deleted offline (`daemon/utxo_repair_del`), the coinstats state re-seeded from a full walk, and `gettxoutsetinfo muhash` at height 965085 is `7b3938df…8c44` on both nodes, 165,721,328 txouts, 20,078,163.63377124 BTC. The blind recovery path is still in place (to-do below). |
 
 ## Part 1 — the host outage
 
@@ -239,7 +239,11 @@ To do (in this order):
    trusting a lookup, UTXO tracking HALTS (sticky, heartbeat marker) and the
    worker stops retrying with an operator message. The repro halts at the
    first lying lookup with the walk equal to the pre-block state and zero
-   earlier spends lost.
+   earlier spends lost. **DEPLOYED** as `ai` 2026-09-02 01:06 UTC (main
+   `fbbae91`): clean stop, RPC up 48 s, reload exact (965104 /
+   165,695,164), muhash identical to the oracle at 965104
+   (`2bc5760c…74f8`). Rollback: relink `bitcoind.live` to
+   `bitcoind.deploy-20260901ah`.
 2. **Make recovery honest** -- DONE, `874c1a8` (2026-09-01 23:30 UTC, gate
    green twice: 310 gated tests on the branch and again on `main`). Every
    catch-up failure is classified (consensus reject / store error /
@@ -250,9 +254,8 @@ To do (in this order):
    `utxo_live_verify_after_recovery()` walks the set and requires
    walk == counter == pre-recovery count, else UTXO tracking HALTS for the
    process (sticky; heartbeat shows `[UTXO HALTED ...]`).
-   `tests/test_utxo_recover_gate` covers all three outcomes. NOT YET
-   DEPLOYED to the live daemon (still on `ag`); deploy = relink + restart at
-   a quiet moment.
+   `tests/test_utxo_recover_gate` covers all three outcomes. DEPLOYED as
+   `ah` 2026-09-01 23:38 UTC (reload exact, muhash identical at 965099).
 3. **Repair the live set**:
    DONE (surgical, see above); the muhash match is the proof. A from-genesis
    rebuild on `bc098fd`+ remains the independent confirmation if wanted.
@@ -296,8 +299,8 @@ To do (in this order):
 
 ## Operator notes
 
-- The daemon is up on `ag`, tracking the tip, and its UTXO set is
-  muhash-identical to Core again as of 965085.
+- The daemon is up on `ai` (gated recovery + halt-on-absent-coin), tracking
+  the tip, muhash-identical to Core as of 965104.
 - `bitcoind.service` (production Core) is down since the reset and is the
   user's to start.
 - `/storage/bmc-diff-work/` and `/storage/bmc-diff-*` hold ~62 GB of
