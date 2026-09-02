@@ -233,7 +233,13 @@ der_parse_sig:
 .Ldp_htzero:
 	mov  x9, #0
 .Ldp_htdone:
-	str  x9, [x23]
+	str  w9, [x23]                    /* u32: the x86 stores r9d (4 bytes);
+	                                   * the 8-byte store smashed 4 bytes of
+	                                   * the caller's data after htype -- in
+	                                   * test_script.c that is r[0]'s low half,
+	                                   * in script_eval's state a word of live
+	                                   * interpreter state (the whole CHECKSIG
+	                                   * cluster) */
 	mov  w0, #1
 	b    .Ldp_done
 .Ldp_fail:

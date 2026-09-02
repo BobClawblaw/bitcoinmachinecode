@@ -2093,7 +2093,11 @@ interp_checksig:
 	mov  x0,x21
 	bl   interp_sig_encoding_ok
 	cbnz x0,.cs_enc_ok
-	mov  w0,#-1
+	mov  x0,#-1                     /* FULL 64-bit -1: script_eval compares
+	                                 * cmp x0,#-1 (the x86 returns rax=-1);
+	                                 * a w0 write zero-extends and the SIG_DER
+	                                 * error read as checksig-TRUE, accepting
+	                                 * non-strict signatures post-activation */
 	b    .cs_end
 .cs_enc_ok:
 	TLS_ADDR x12, interp_slice
