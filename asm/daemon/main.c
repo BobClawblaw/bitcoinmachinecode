@@ -2861,8 +2861,18 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
 /* Does the header at position `have` (the first one a peer just appended)
  * extend the header we asked from (`loc`, our previous tip)? A getheaders
  * answer that starts anywhere else is not a continuation of our chain. */
+/* DLC_HDR_SANE_MAX: how far BELOW our header tip a peer's answer may attach.
+ * The 2026-09-01 incident was a reply that attached at genesis while we held
+ * 965k headers -- a wholesale replacement dressed as a continuation. What
+ * makes that implausible is the DEPTH of the fork (a year is ~52k blocks),
+ * not the number of headers that follow: a fresh node, or one restarted in
+ * the middle of its first sync, legitimately takes hundreds of thousands
+ * of headers in one session. The first version of this guard capped the
+ * count instead and rolled the whole session back at 100,001 -- so a node
+ * starting from genesis could never get past 100k (found by the
+ * fresh-install acceptance test, 2026-09-02). */
 #define DLC_HDR_SANE_MAX 100000L
-static int __attribute__((unused)) dlc_headers_sane(long have0, long added){ return have0 <= 0 || added <= DLC_HDR_SANE_MAX; }
+static int dlc_headers_sane(long have0, long pos){ return have0 - pos <= DLC_HDR_SANE_MAX; }
 static int __attribute__((unused)) dlc_headers_connect_ok(unsigned char* hst, long have, const unsigned char loc[32]){
     unsigned char rec[112];
     if(have <= 0) return 1;                                   /* fresh store: nothing to connect to */
@@ -2894,8 +2904,10 @@ static void dlc_headers_rollback(unsigned char* hst, long have){
  *   - headers that overlap what we hold must be IDENTICAL (a peer on a fork
  *     is refused, not merged);
  *   - every header links to the previous one and carries no transactions;
- *   - no more than DLC_HDR_SANE_MAX are accepted from one peer (a node a year
- *     offline is ~52k behind; the incident's reply was 966,669).
+ *   - the page may not attach more than DLC_HDR_SANE_MAX headers below our
+ *     tip (a node a year offline is ~52k behind; the incident's reply
+ *     attached at genesis). How many headers FOLLOW is not limited: from
+ *     genesis, or restarted mid-sync, the honest answer is the whole chain.
  * Appends go through hst_append; on any refusal the store is rolled back to
  * where this fetch started. Returns headers appended, or -1. */
 #define DLC_HDR_PAGE 2000
@@ -2948,10 +2960,14 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
         const unsigned char* first = msg + used;
         int at = -1; for(int q = 0; q < nl; q++) if(!memcmp(first + 4, loc + q * 32, 32)){ at = q; break; }
         if(at < 0){
-            fprintf(stderr,"[dlc] headers from %s do not connect to any header we hold (%lu offered) -- discarding\\n", cand, cnt);
+            fprintf(stderr,"[dlc] headers from %s do not connect to any header we hold (%lu offered) -- discarding\n", cand, cnt);
             dlc_headers_rollback(hst, have0); return -1;
         }
         long pos = lh[at] + 1;                    /* the height this page's first header would have */
+        if(!dlc_headers_sane(have0, pos)){
+            fprintf(stderr,"[dlc] headers from %s attach at height %ld while we hold %ld -- a fork deeper than %ld is not a continuation; discarding\n", cand, pos, have0, DLC_HDR_SANE_MAX);
+            dlc_headers_rollback(hst, have0); return -1;
+        }
         long have = hst_count(hst);
         unsigned char prev[32]; memcpy(prev, loc + at * 32, 32);
         unsigned long i = 0;
@@ -2959,7 +2975,7 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
             const unsigned char* h = first + i * 81;
             if(h[80] != 0) break;                 /* txn_count must be 0 in a headers message */
             if(memcmp(h + 4, prev, 32) != 0){
-                fprintf(stderr,"[dlc] headers from %s break their own chain at %lu -- discarding\\n", cand, i);
+                fprintf(stderr,"[dlc] headers from %s break their own chain at %lu -- discarding\n", cand, i);
                 dlc_headers_rollback(hst, have0); return -1;
             }
             unsigned char bh[32]; block_hash(bh, h);
@@ -2967,14 +2983,10 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
                 /* overlap with what we hold: must be the same block */
                 unsigned char rec[112];
                 if(hst_get_at(hst, (unsigned long long)(pos + (long)i), rec) != 1 || memcmp(rec + 80, bh, 32) != 0){
-                    fprintf(stderr,"[dlc] headers from %s fork from our chain at height %ld -- discarding\\n", cand, pos + (long)i);
+                    fprintf(stderr,"[dlc] headers from %s fork from our chain at height %ld -- discarding\n", cand, pos + (long)i);
                     dlc_headers_rollback(hst, have0); return -1;
                 }
             } else {
-                if(added + 1 > DLC_HDR_SANE_MAX){
-                    fprintf(stderr,"[dlc] %s offered more than %ld header(s) beyond %ld -- far beyond any plausible gap; discarding\\n", cand, DLC_HDR_SANE_MAX, have0);
-                    dlc_headers_rollback(hst, have0); return -1;
-                }
                 if(hst_append(hst, h, bh) < 0){ dlc_headers_rollback(hst, have0); return -1; }
                 added++;
             }
