@@ -105,7 +105,7 @@ idxscan_all_present:
     jge  .advance
     mov  rax, r9
     imul rax, 48
-    lea  rax, [rel idxscan_buf + rax]
+    lea  rax, [idxscan_buf + rax]        ; absolute base+index (no RIP form exists with an index register; this is what nasm emitted for the old `rel` spelling, byte-identical)
     mov  eax, [rax]
     test eax, eax
     jz   .close_absent
@@ -198,7 +198,7 @@ idxscan_tip:
     jl   .advance
     mov  rax, r9
     imul rax, 48
-    lea  rax, [rel idxscan_buf + rax]
+    lea  rax, [idxscan_buf + rax]        ; absolute base+index (no RIP form exists with an index register; this is what nasm emitted for the old `rel` spelling, byte-identical)
     mov  eax, [rax]
     test eax, eax
     jnz  .found
@@ -475,7 +475,7 @@ idxscan_first_hole:
     jge  .checkshort
     mov  rax, r9
     imul rax, 48
-    lea  rax, [rel idxscan_buf + rax]
+    lea  rax, [idxscan_buf + rax]        ; absolute base+index (no RIP form exists with an index register; this is what nasm emitted for the old `rel` spelling, byte-identical)
     mov  eax, [rax]
     test eax, eax
     jz   .found_at_i
@@ -592,7 +592,7 @@ idxscan_progress:
     jge  .afterscan
     mov  rax, rcx
     imul rax, 48
-    lea  rax, [rel idxscan_buf + rax]
+    lea  rax, [idxscan_buf + rax]        ; absolute base+index (no RIP form exists with an index register; this is what nasm emitted for the old `rel` spelling, byte-identical)
     mov  eax, [rax]
     test eax, eax
     jz   .nextrec
