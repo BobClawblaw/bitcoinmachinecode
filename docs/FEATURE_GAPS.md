@@ -1528,3 +1528,25 @@ one Core wallet transaction as the bump, saying so.
 Also fixed on the way: `addnode=host:port` now keeps its port in the boot
 book fold-in, the liveness probe and the download worker's re-dial (it
 silently dialled the chain default before).
+
+## Update 2026-09-02 — audit finding N4: the legacy wallet-file scheme is gone from the write paths
+
+Two wallet stores existed. The descriptor wallet's container (`bmcwallet.enc`,
+`BMCWENC1`, daemon/wallet_crypter.c: Core's BytesToKeySHA512AES with 100,000
+iterations, random salt, AES-256-CBC) has been the live wallet's since
+2026-08-27. The OLDER store in `asm/wallet_store.c` — the CLI's mnemonic file
+(`BMCWAL v2`) and addhdkey's extra-xprv blob (`BMCHDK v1`) — kept its own
+scheme: PBKDF2-HMAC-SHA512 at 2,048 iterations with an EMPTY salt, a custom
+CTR cipher keyed from the same bytes, and a custom tag. It predates the
+crypter and nothing ever routed it through the strong container, so
+`wallet_cli init <passphrase>` and `addhdkey` still wrote the weak shape
+(audit 2026-09-02, N4).
+
+Now: both write the strong container — `BMCWAL v3` / `format=wcrypt` lines
+holding the hex of a `wcrypt_seal` blob — and never the legacy shape again.
+Legacy files still open (read-only code kept for exactly that), and a
+successful open rewrites the file upgraded, atomically (tmp + rename, 0600),
+with a `[wallet] … upgraded legacy …` line. `tests/test_wallet_store` proves
+it against genuine legacy fixtures written by the pre-change code:
+right/wrong passphrase, the in-place upgrade, the second open through the
+strong path, the secret blob likewise, and that no `.tmp` is left behind.
