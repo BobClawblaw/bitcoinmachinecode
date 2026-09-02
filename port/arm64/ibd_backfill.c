@@ -50,6 +50,10 @@ extern long   utxo_lsm_count(void* lst);
 extern long   utxo_lsm_flush(void* lst, void* u);
 extern long   utxo_lsm_close(void* lst);
 extern void   sha256d(void* out32, const void* in, unsigned long len);
+extern char g_utxo_defer_recount;   /* the daemon defers the boot recount
+                                    * (u->n stays at the persisted base) --
+                                    * the tool must too: the full recount
+                                    * chokes on the live WAL's retried ops */
 
 struct lsm_state {
     long log_fd, idx_fd;
@@ -239,6 +243,7 @@ int main(int argc, char** argv){
     if(!tomb_buf||!manifest_buf||!scratch_buf){ fprintf(stderr,"LSM buffer malloc failed\n"); return 1; }
     g_lst = calloc(1,sizeof(struct lsm_state));
     memset(g_lst,0,sizeof *g_lst);
+    g_utxo_defer_recount = 1;         /* defer the boot recount (daemon parity) */
     g_lst->op_threshold=G_op; g_lst->fill_threshold=G_fill;
     g_lst->tomb_buf=tomb_buf; g_lst->tomb_cap=G_tomb_cap;
     g_lst->manifest_buf=manifest_buf; g_lst->manifest_cap=G_manifest_cap;
@@ -293,10 +298,14 @@ int main(int argc, char** argv){
                     unsigned long long pval; unsigned long pheight=0,pcb=0; const u8*psp; unsigned long pspl;
                     long gr=utxo_lsm_get(g_lst,g_utxo,ph,pidx,&pval,&pheight,&pcb,&psp,&pspl);
                     if(gr==0){ missing++;
-                        if(missing<=3 || BMC_TRACE_ON())
-                            fprintf(stderr,"h%ld tx%lu MISSING-PREVOUT idx=%lu ph=",h,ti,pidx);
-                        if(missing<=3 || BMC_TRACE_ON())
-                            { for(int q=0;q<32;q++) fprintf(stderr,"%02x",ph[q]); fprintf(stderr,"\n"); }
+                        /* repair mode: EVERY missing prevout, full 36-byte
+                         * key (txid + index LE) so each hole maps to its
+                         * creating block */
+                        fprintf(stderr,"MISSING h%ld idx=%lu key=",h,pidx);
+                        for(int q=0;q<32;q++) fprintf(stderr,"%02x",ph[q]);
+                        fprintf(stderr,"%02x%02x%02x%02x\n",
+                                (int)(pidx&0xff),(int)((pidx>>8)&0xff),
+                                (int)((pidx>>16)&0xff),(int)((pidx>>24)&0xff));
                         continue; }
                     /* 1=tombstoned now, 0=absent (already spent earlier -- the
                      * 1189 dels the post-fix ibd_lsm run DID record), -1=err */
