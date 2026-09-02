@@ -41,9 +41,6 @@ extern int  cons_verify(const void* b, unsigned long l, void* s, unsigned long c
 extern int  pow_check(const unsigned char h[80]);
 
 /* --- block builder (single-coinbase, valid; from test_bitcoind_sync) --- */
-static unsigned char big_sc[32]={
-0x59,0xb2,0x66,0x6b,0x17,0x34,0x3a,0xf4,0xd4,0x6e,0x4f,0x5c,0x1d,0x58,0x9c,0x0b,
-0xb8,0x7a,0xdb,0x8f,0x9d,0xd1,0x2a,0x6b,0x1b,0x45,0xcc,0x34,0x9c,0x03,0xad,0x9b};
 
 static long build_cb_block(unsigned char* b, const unsigned char prev[32], unsigned hgt){
     unsigned char* o=b;
@@ -153,8 +150,10 @@ int main(void){
     /* framing: [u32 len][u32 magic][raw] per block */
     long off=0; struct St* s=(struct St*)stb;
     for(int i=0;i<NB;i++){
+        if(off+8>(long)ft){ exact=0; break; }          /* the file must hold every frame it claims */
         unsigned len = fb[off]|(fb[off+1]<<8)|(fb[off+2]<<16)|(fb[off+3]<<24);
         if(len!=(unsigned)blen[i]){ exact=0; break; }
+        if(off+8+(long)len>(long)ft){ exact=0; break; }
         if(memcmp(fb+off+8, blocks[i], (size_t)blen[i])!=0){ exact=0; break; }
         off += 8 + len;
     }

@@ -98,22 +98,27 @@ static u64 tx_span(const u8* tx, const u8* end){
     if (sw) p += 2;
     u64 nin = rd_cs_local(&p, end, &ok); if (!ok) return 0;
     for (u64 i = 0; i < nin; i++){
-        if (p + 36 > end) return 0; p += 36;
+        if (p + 36 > end) return 0;
+        p += 36;
         u64 sl = rd_cs_local(&p, end, &ok); if (!ok) return 0;
-        if ((u64)(end - p) < sl + 4) return 0; p += sl + 4;
+        if ((u64)(end - p) < sl + 4) return 0;
+        p += sl + 4;
     }
     u64 nout = rd_cs_local(&p, end, &ok); if (!ok) return 0;
     for (u64 i = 0; i < nout; i++){
-        if (p + 8 > end) return 0; p += 8;
+        if (p + 8 > end) return 0;
+        p += 8;
         u64 sl = rd_cs_local(&p, end, &ok); if (!ok) return 0;
-        if ((u64)(end - p) < sl) return 0; p += sl;
+        if ((u64)(end - p) < sl) return 0;
+        p += sl;
     }
     if (sw){
         for (u64 i = 0; i < nin; i++){
             u64 ni = rd_cs_local(&p, end, &ok); if (!ok) return 0;
             for (u64 j = 0; j < ni; j++){
                 u64 il = rd_cs_local(&p, end, &ok); if (!ok) return 0;
-                if ((u64)(end - p) < il) return 0; p += il;
+                if ((u64)(end - p) < il) return 0;
+                p += il;
             }
         }
     }

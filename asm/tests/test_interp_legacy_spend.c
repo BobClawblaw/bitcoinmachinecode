@@ -220,8 +220,8 @@ int main(void){
     sc1[sc1n++]=0x76; sc1[sc1n++]=0xa9; sc1[sc1n++]=0x14;           /* DUP HASH160 PUSH20 */
     memcpy(sc1+sc1n,h1,20); sc1n+=20;
     sc1[sc1n++]=0x88; sc1[sc1n++]=0xac;                              /* EQUALVERIFY CHECKSIG */
-    uint8_t cspk[34]; cspk[0]=0x21; memcpy(cspk+1,p1,33); cspk[34]=0x00; /* placeholder */
-    uint8_t checksig_script[34]; int csn=0;
+    uint8_t cspk[35]; cspk[0]=0x21; memcpy(cspk+1,p1,33); cspk[34]=0x00; /* placeholder */
+    uint8_t checksig_script[35]; int csn=0;              /* PUSH33 + 33 + OP_CHECKSIG = 35 bytes (was [34]: wrote one past the end) */
     checksig_script[csn++] = 0x21;                  /* PUSH33 */
     memcpy(checksig_script+csn, p1, 33); csn += 33;
     checksig_script[csn++] = 0xac;                  /* OP_CHECKSIG */
@@ -246,7 +246,7 @@ int main(void){
     }
     {
         /* wrong pubkey -> sig fails */
-        uint8_t checksig_script2[34]; int csn2=0;
+        uint8_t checksig_script2[35]; int csn2=0;
         checksig_script2[csn2++] = 0x21; memcpy(checksig_script2+csn2, p2, 33); csn2+=33;
         checksig_script2[csn2++] = 0xac;
         const uint8_t* init[1] = { sig1 };   /* sig1 signed by p1, but pub=p2 */

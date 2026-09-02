@@ -454,8 +454,8 @@ static int rg_hdr_at(void* vctx, long h, unsigned char hdr[80]){
         memcpy(hdr, x->c->hdr[i], 80);
         return 1;
     }
-    unsigned long long meta[3];
-    if (store_get_at(x->st, (unsigned long long)h, meta) != 1) return 0;
+    uint64_t meta[3];                       /* store_get_at's declared out type */
+    if (store_get_at(x->st, (uint64_t)h, meta) != 1) return 0;
     int fd = store_rd_fd(x->st, (unsigned)meta[2]);
     if (fd < 0) return 0;
     /* +8 skips the [len][magic] frame header -- store_read_meta's own

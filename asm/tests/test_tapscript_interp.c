@@ -19,6 +19,7 @@
 #define MAX_STACK 1000
 
 /* struct script_state matches bitcoin_interp.asm offsets */
+struct sc_slice { const uint8_t* p; size_t n; };   /* named: an anonymous struct in a parameter list is a distinct type per declaration */
 struct script_state {
     uint8_t* main_elems;      /* +0  */
     size_t   main_sp;         /* +8  */
@@ -34,7 +35,7 @@ struct script_state {
     void*    checksig_ctx;    /* +88 */
     uint64_t (*checksig_fn)(void*, const uint8_t*, size_t,
                             const uint8_t*, size_t,
-                            const struct { const uint8_t* p; size_t n; }*); /* +96 */
+                            const struct sc_slice*); /* +96 */
 };
 
 extern int script_eval(struct script_state* st);
@@ -99,7 +100,7 @@ static int run_script(const char* script_hex,
  * generated source removes that failure mode entirely.
  * Regenerate with validation/gen_script_error_defines.py. */
 #include "script_error_codes.h"
-#define FLAG_DISCOURAGE_OP_SUCCESS (1ull<<18)
+#define FLAG_DISCOURAGE_OP_SUCCESS (1ull<<19)   /* Core bit 19; was 18 here and in the asm until 2026-09-02 (bit 18 is DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) */
 #define FLAG_MINIMALIF (1ull<<13)
 #define SIGV_BASE 0
 #define SIGV_WITNESS_V0 1

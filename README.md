@@ -188,6 +188,15 @@ and the archive tools (`check_chain`, `verify`, `dumpblock`, `unified_ibd`,
    or the path in `$BITCOIN_CONF`. The file is shared by every chain; keep
    it at the datadir root, not inside a chain subdirectory.
 
+   **The copy above lands in the repository's `config/`, which the daemon
+   only finds when the datadir is `<repo>/data`.** With a datadir anywhere
+   else, put the file at `<datadir>/bitcoin.conf` (or export
+   `BITCOIN_CONF`). A daemon that finds no file logs `[config] no config
+   file at ... -- using compiled defaults` and runs on the defaults: P2P
+   port 8333, RPC on loopback, `dbcache=1024`. The fresh-install acceptance
+   test (`validation/fresh_install_ibd.sh`) hit exactly this on its first
+   run, 2026-09-02.
+
 2. **Run the daemon.**
 
    ```sh

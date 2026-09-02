@@ -94,7 +94,7 @@ int main(void){
     {
         /* tx: 1 in (empty scriptSig), 1 out P2PKH -> 1 */
         unsigned char tx[1000];
-        unsigned char* outs[1]; int lens[1];
+        const unsigned char* outs[1]; int lens[1];
         int oo=0; push_p2pkh(s,&oo); outs[0]=s; lens[0]=oo;
         int n=build_tx(tx,0,NULL,1,outs,lens,0);
         ck("legacy tx P2PKH out = 1", tx_legacy_sigops(tx,n), 1);
@@ -102,7 +102,7 @@ int main(void){
     {
         /* tx: 1 out 2-of-3 multisig -> 20 (inaccurate) */
         unsigned char tx[1000];
-        int oo=0; push_mofn(s,&oo,2,3); unsigned char* os[1]; int ls[1]={oo}; os[0]=s;
+        int oo=0; push_mofn(s,&oo,2,3); const unsigned char* os[1]; int ls[1]={oo}; os[0]=s;
         int n=build_tx(tx,0,NULL,1,os,ls,0);
         ck("legacy tx 2-of-3 out = 20", tx_legacy_sigops(tx,n), 20);
     }
@@ -110,14 +110,14 @@ int main(void){
         /* scriptSig = single OP_1 (0 sigops, no sigop opcode), out P2PKH -> 1 */
         unsigned char tx[1000];
         unsigned char sig_data[1]={0x51};
-        int oo=0; push_p2pkh(s,&oo); unsigned char* os[1]; int ls[1]={oo}; os[0]=s;
+        int oo=0; push_p2pkh(s,&oo); const unsigned char* os[1]; int ls[1]={oo}; os[0]=s;
         int n=build_tx(tx,1,sig_data,1,os,ls,0);
         ck("scriptSig OP_1 not counted, P2PKH out = 1", tx_legacy_sigops(tx,n), 1);
     }
     {
         /* SegWit marker+flag must be skipped: tx marked segwit, 1 P2PKH out -> 1 */
         unsigned char tx[1000];
-        int oo=0; push_p2pkh(s,&oo); unsigned char* os[1]; int ls[1]={oo}; os[0]=s;
+        int oo=0; push_p2pkh(s,&oo); const unsigned char* os[1]; int ls[1]={oo}; os[0]=s;
         int n=build_tx(tx,0,NULL,1,os,ls,1);
         ck("segwit-flagged tx P2PKH out = 1", tx_legacy_sigops(tx,n), 1);
     }

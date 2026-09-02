@@ -93,7 +93,8 @@ static void campaign1(long nrand){
     { /* (2^256-1) mod n = 2^256-1-n */ u64 all[4]={~0ULL,~0ULL,~0ULL,~0ULL}; sub4(a,all,N); check_inv(a,"2^256-1 mod n"); }
     for(int k=0;k<=250;k++){ char l[32]; u64 o[4]={0x1f,0,0,0}; /* 0x1f << k : long trailing-zero runs */
         memset(a,0,32); int w=k>>6, b=k&63; a[w]=o[0]<<b; if(b>59 && w<3) a[w+1]=o[0]>>(64-b);
-        if(ge(a,N)) continue; snprintf(l,sizeof l,"0x1f<<%d",k); check_inv(a,l); }
+        if(ge(a,N)) continue;
+        snprintf(l,sizeof l,"0x1f<<%d",k); check_inv(a,l); }
     /* random */
     for(long i=0;i<nrand;i++){ rnd_scalar(a); check_inv(a,"random"); if(failures>20) return; }
     printf("campaign 1: sc_inv_var vs sc_inv: %ld cases (%ld random)\n", c1_cases, nrand);

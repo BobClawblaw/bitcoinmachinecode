@@ -52,6 +52,11 @@ static int conf_lookup(const char* datadir, const char* key, char* out, long cap
     return conf_get(p, key, out, cap);
 }
 
+/* bounded string copy: strnlen+memcpy, so the compiler can see the bound
+ * (snprintf("%s") from a larger scratch buffer trips -Wformat-truncation) */
+static void cc_copy(char* dst, size_t cap, const char* src){
+    size_t l = strnlen(src, cap - 1); memcpy(dst, src, l); dst[l] = 0;
+}
 static int read_cookie(const char* path, cli_conf_t* c){
     FILE* f = fopen(path, "r");
     if (!f) return 0;
@@ -62,8 +67,8 @@ static int read_cookie(const char* path, cli_conf_t* c){
     char* colon = strchr(buf, ':');
     if (!colon) return 0;
     *colon = 0;
-    snprintf(c->user, sizeof c->user, "%s", buf);
-    snprintf(c->pass, sizeof c->pass, "%s", colon + 1);
+    cc_copy(c->user, sizeof c->user, buf);
+    cc_copy(c->pass, sizeof c->pass, colon + 1);
     c->from_cookie = 1;
     return 1;
 }
@@ -77,9 +82,9 @@ int cli_conf_resolve(const char* datadir, const char* chain_override,
 
     char v[512];
     if (chain_override && *chain_override)
-        snprintf(out->chain, sizeof out->chain, "%s", chain_override);
+        cc_copy(out->chain, sizeof out->chain, chain_override);
     else if (conf_lookup(datadir, "chain", v, sizeof v))
-        snprintf(out->chain, sizeof out->chain, "%s", v);
+        cc_copy(out->chain, sizeof out->chain, v);
     else
         snprintf(out->chain, sizeof out->chain, "main");
 
@@ -97,9 +102,9 @@ int cli_conf_resolve(const char* datadir, const char* chain_override,
 
     /* A configured user/password wins, exactly as the daemon prefers it. */
     int have_user = conf_lookup(datadir, "rpcuser", v, sizeof v);
-    if (have_user) snprintf(out->user, sizeof out->user, "%s", v);
+    if (have_user) cc_copy(out->user, sizeof out->user, v);
     int have_pass = conf_lookup(datadir, "rpcpassword", v, sizeof v);
-    if (have_pass) snprintf(out->pass, sizeof out->pass, "%s", v);
+    if (have_pass) cc_copy(out->pass, sizeof out->pass, v);
     if (have_user && have_pass) return 1;
 
     if (!datadir || !*datadir){

@@ -46,8 +46,10 @@ static int key_add(const u8 pub[33]){
     tkey_t* k = &K[nK]; memset(k, 0, sizeof *k); memcpy(k->pub, pub, 33);
     hash160(k->h33, pub, 33); hash160(k->h32, pub + 1, 32);
     /* mock signatures: distinct per key, sized like real ones (Core's test uses real ones only for equality) */
-    for (int i = 0; i < 72; i++) k->ecdsa[i] = (u8)(0x30 + i * 7 + pub[1 + (i % 32)]); k->ecdsa[71] = 1;
-    for (int i = 0; i < 65; i++) k->schnorr[i] = (u8)(0x40 + i * 11 + pub[1 + (i % 32)]); k->schnorr[64] = 1;
+    for (int i = 0; i < 72; i++) k->ecdsa[i] = (u8)(0x30 + i * 7 + pub[1 + (i % 32)]);
+    k->ecdsa[71] = 1;
+    for (int i = 0; i < 65; i++) k->schnorr[i] = (u8)(0x40 + i * 11 + pub[1 + (i % 32)]);
+    k->schnorr[64] = 1;
     return nK++;
 }
 static int find_pub(const u8* b, size_t n){
@@ -306,7 +308,8 @@ int main(void){
             int n = PK[c]; char* ms = malloc(200000); ms[0] = 0; size_t o = 0;
             for (int i = 0; i < n - 1; i++){ char h[67]; hex(h, K[i].pub, 33); o += (size_t)sprintf(ms + o, "and_b(pk(%s),a:", h); }
             { char h[67]; hex(h, K[n - 1].pub, 33); o += (size_t)sprintf(ms + o, "pk(%s)", h); }
-            for (int i = 0; i < n - 1; i++) ms[o++] = ')'; ms[o] = 0;
+            for (int i = 0; i < n - 1; i++) ms[o++] = ')';
+            ms[o] = 0;
             test_both(ms, "?", "?", 1 | 2 | 4 | 16, n + (n - 1) * 3, n, -1, -1, n + 1);
             free(ms);
         }
@@ -316,7 +319,8 @@ int main(void){
             char* ms = malloc(64000); size_t o = 0;
             for (int i = 0; i < count; i++) o += (size_t)sprintf(ms + o, "and_b(older(1),a:");
             { char h[67]; hex(h, K[0].pub, 33); o += (size_t)sprintf(ms + o, "pk(%s)", h); }
-            for (int i = 0; i < count; i++) ms[o++] = ')'; ms[o] = 0;
+            for (int i = 0; i < count; i++) ms[o++] = ')';
+            ms[o] = 0;
             ms_tree_t t; int root;
             ck(count == 998 ? "998-deep chain parses under tapscript" : "999-deep chain parses under tapscript", parse_ok(ms, 1, &t, &root));
             if (root >= 0) ck(count == 998 ? "998-deep chain stays within the execution stack" : "999-deep chain exceeds the execution stack (detected)", ms_check_stack_size(&t, root) == (count == 998));

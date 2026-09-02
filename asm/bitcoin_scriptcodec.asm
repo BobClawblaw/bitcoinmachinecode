@@ -43,7 +43,7 @@ global snum_overflow
 snum_overflow: resq 1
 
 ; vfExec condition stack
-align 16
+alignb 16                 ; alignb, not align: this is .tbss, padding bytes cannot be "initialized" (nasm -w+other)
 vfexec:     resb 1024
 vfexec_sp:  resq 1
 global vfexec, vfexec_sp
@@ -317,10 +317,31 @@ scriptnum_decode:
     TLS_ADDR rax, snum_overflow   ; rax free here (rdi/rsi/rdx are the incoming
                                    ; len/data/maxsize params, untouched by this)
     mov   qword [rax], 0
+    ; rdx: low byte = maxsize; bit 8 = "require minimal encoding" (the caller
+    ; sets it under SCRIPT_VERIFY_MINIMALDATA -- Core's fRequireMinimal). Both
+    ; failures are reported through snum_overflow, i.e. SCRIPT_ERR_SCRIPTNUM,
+    ; exactly Core's error for either. (2026-09-02, differential vs Core.)
+    mov   rcx, rdx
+    and   rdx, 0xff
     cmp   rdi, rdx
     jbe   .size_ok
     mov   qword [rax], 1
 .size_ok:
+    test  rcx, 0x100
+    jz    .min_ok
+    test  rdi, rdi
+    jz    .min_ok
+    movzx ecx, byte [rsi+rdi-1]
+    test  cl, 0x7f
+    jnz   .min_ok             ; top byte carries magnitude: minimal
+    cmp   rdi, 1
+    je    .min_bad            ; lone 0x00 / 0x80: negative or padded zero
+    movzx ecx, byte [rsi+rdi-2]
+    test  cl, 0x80
+    jnz   .min_ok             ; the pad byte is needed for the sign
+.min_bad:
+    mov   qword [rax], 1
+.min_ok:
     mov   r12, rdi            ; len
     mov   r13, rsi            ; data
     mov   r14, 0              ; result
@@ -584,20 +605,16 @@ check_minimal_push:
     cmp   rsi, 1
     jne   .not_one
     movzx eax, byte [rdx]
+    cmp   al, 0x81
+    je    .one_nonmin         ; 0x81 -> should use OP_1NEGATE. (Before 2026-09-02 this
+                              ; test sat behind a `jb` that only a 0x00 byte reached, so a
+                              ; pushed 0x81 passed MINIMALDATA; found by the Core differential.)
     cmp   al, 1
-    jb    .not_one_min        ; 0 handled above (empty); 0 -> len1? no
+    jb    .not_one
     cmp   al, 16
     ja    .not_one
-    ; size==1 and 1<=b<=16 -> should use OP_1..OP_16
-    xor   eax, eax
-    ret
-    ; (fallthrough not reached)
-.not_one_min:
-    movzx eax, byte [rdx]
-    cmp   al, 0x81
-    jne   .not_one
-    ; 0x81 -> should use OP_1NEGATE
-    xor   eax, eax
+.one_nonmin:
+    xor   eax, eax            ; 1..16 -> should use OP_1..OP_16
     ret
 .not_one:
     ; size<=75 -> direct push, opcode must equal size

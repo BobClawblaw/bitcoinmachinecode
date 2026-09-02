@@ -570,17 +570,6 @@ static int lsock_v6(int port){
                        bindaddr ? g_cfg.bind_addr : "[::]", port);
     return l;
 }
-
-/* ---- BEST-EFFORT OUTBOUND CATCH-UP (stays-up-to-date on boot) ----
- * The serve loop is inbound-only; without an outbound connection the node can
- * never pull missed blocks. On serve startup we try real mainnet seeds (via the
- * verified asm tcp_connect_ip + node_handshake) and run the verified asm
- * node_drain per-peer download loop to catch up the store to the chain tip.
- * It is deliberately best-effort and non-fatal: any seed/network failure falls
- * straight through to serving (the node still serves whatever it has, and the
- * new bitcoin_serve.asm `.do_block` keep-up path stores any block a peer later
- * pushes). Returns the count of blocks added on success, 0/-1 on no-network.
- * Sieve out peers that hang: a 10s recv timeout + per-seed cap. */
 /* DNS seed hostnames come from the SELECTED CHAIN (daemon/chainparams.c owns
  * the per-chain lists, mainnet's being the set that always lived here).
  * These two are set right after chainparams_select() in main(); the static
@@ -593,71 +582,7 @@ static void anchor_locator(unsigned char loc[32]);   /* fwd decl (defined below)
  * synchronous node_sync catch-up (blocking on a real seed) is interrupted and
  * the mux loop can start. node_sync's blocking p2p_read is interrupted by the
  * signal (EINTR), so it returns and the parent proceeds to the mux loop. */
-static void catchup_alarm(int sig){ (void)sig; }
-/* Bounded boot catch-up. Runs ONE node_sync pass (the verified asm download->
- * validate->store path) against the first reachable seed, anchored at the
- * stored tip, to close any small gap before the mux starts. A wall-clock alarm
- * (CATCHUP_MAX_SECS) bounds the synchronous window: if the gap is large the
- * alarm fires, node_sync returns, and the mux loop takes over closing the rest
- * gradually WHILE SERVING (the mux is the long-running stays-current
- * mechanism). Returns # blocks pulled. */
-static long outbound_catchup(long max_blocks){
-    static unsigned char cbuf[4<<20];
-    long total=0;
-    /* This path dials the DNS seed hostnames directly, so it IS dns seeding:
-     * -dnsseed=0 and -connect must suppress it or the node would quietly
-     * contact seeds the operator disabled. Under -connect the configured
-     * nodes are used instead. */
-    const char* clist[CFG_MAX_NODES];
-    const char** srcs = (const char**)g_seed_hosts;
-    size_t nsrcs = (size_t)g_n_seed_hosts;
-    if(g_cfg.connect_only){
-        for(int i=0;i<g_cfg.n_connect;i++) clist[i]=g_cfg.connectn[i];
-        srcs = clist; nsrcs = (size_t)g_cfg.n_connect;
-        if(nsrcs==0){ fprintf(stderr,"[catchup] connect=0 -- no outbound catch-up\n"); return 0; }
-    } else if(!g_cfg.dnsseed){
-        fprintf(stderr,"[catchup] dnsseed=0 -- skipping seed-based boot catch-up\n");
-        return 0;
-    }
-    if(dialer_dns_blocked()){
-        fprintf(stderr,"[catchup] a proxy is configured (or dns=0) -- not resolving seed names\n");
-        return 0;
-    }
-    for(size_t s=0; s<nsrcs; s++){
-        const char* host=srcs[s];
-        struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
-        if(getaddrinfo(host,NULL,&h,&res)!=0) continue;
-        unsigned ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
-        freeaddrinfo(res);
-        int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)g_chainp->default_port));
-        if(fd<0) continue;
-        struct timeval tv; tv.tv_sec=10; tv.tv_usec=0;
-        setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
-        /* this path speaks v1 only; clear any flag a recycled fd may carry */
-        bmc_v2_close(fd);
-        if(node_handshake(fd)!=1 || !peer_has_witness(host)){ close(fd); continue; }
-        static unsigned char loc[32];
-        /* Anchor from the STORED TIP index record (index-hash read, robust to a
-         * transiently-unreadable tip body -- avoiding the live-found genesis
-         * re-download duplicate-tail corruption) or a zero locator when empty. */
-        anchor_locator(loc);
-        /* Wall-clock cap: alarm after CATCHUP_MAX_SECS so a large gap does not
-         * block the mux start. node_sync's blocking reads see the SIGALRM as
-         * EINTR and return; we then proceed to the mux loop. */
-        struct sigaction sa; memset(&sa,0,sizeof sa); sa.sa_handler=catchup_alarm;
-        sigaction(SIGALRM,&sa,NULL);
-        alarm(CATCHUP_MAX_SECS);
-        long cnt=0;
-        long ok=node_sync(fd, store_buf, loc, cbuf, (long)sizeof cbuf, &cnt);
-        alarm(0);
-        int tip=*(int*)(store_buf+24);
-        fprintf(stderr,"[catchup] %-28s sync ok=%ld new=%ld tip=%d\n", host, ok, cnt, tip);
-        close(fd);
-        total=cnt;
-        break;   /* one bounded pass; the mux loop closes the rest */
-    }
-    return total>max_blocks?max_blocks:total;
-}
+
 
 static unsigned char fake_blocks[8][4096]; static long fake_blen[8]; static unsigned char fake_bh[8][32]; static int fake_NB=0;
 static void put_u32(unsigned char*p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24;}
@@ -773,7 +698,6 @@ static int serve_loop(int fd, int lfd){
             if(plen>=37){
                 unsigned cnt = pl[0];                       /* count varint (1B here) */
                 if(cnt>=1 && 1+cnt*36 <= plen){
-                    int tip = *(int*)(store_buf+24);
                     for(unsigned item=0; item<cnt; item++){
                         size_t off = 1 + item*36;           /* [type 4B][hash 32] */
                         unsigned int type = pl[off]|pl[off+1]<<8|pl[off+2]<<16|pl[off+3]<<24;
@@ -909,26 +833,38 @@ static long wn_varint(const unsigned char* p, long n, unsigned long long* v){
     if (p[0] < 0xfd){ *v = p[0]; return 1; }
     if (p[0] == 0xfd){ if (n < 3) return 0; *v = p[1] | (p[2] << 8); return 3; }
     if (p[0] == 0xfe){ if (n < 5) return 0; *v = p[1] | (p[2]<<8) | ((unsigned long long)p[3]<<16) | ((unsigned long long)p[4]<<24); return 5; }
-    if (n < 9) return 0; *v = 0; for (int i = 0; i < 8; i++) *v |= (unsigned long long)p[1+i] << (8*i); return 9;
+    if (n < 9) return 0;
+    *v = 0; for (int i = 0; i < 8; i++) *v |= (unsigned long long)p[1+i] << (8*i); return 9;
 }
 /* serialized length of the tx at p (segwit-aware); 0 if malformed */
 static long wn_tx_len(const unsigned char* p, long n){
     long q = 4; unsigned long long v; long k; int segwit = 0;
     if (q + 2 <= n && p[q] == 0x00 && p[q+1] == 0x01){ segwit = 1; q += 2; }
-    if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k; unsigned long long nin = v;
+    if (!(k = wn_varint(p + q, n - q, &v))) return 0;
+    q += k; unsigned long long nin = v;
     for (unsigned long long i = 0; i < nin; i++){
-        q += 36; if (q > n) return 0;
-        if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k + (long)v + 4; if (q > n) return 0;
+        q += 36;
+        if (q > n) return 0;
+        if (!(k = wn_varint(p + q, n - q, &v))) return 0;
+        q += k + (long)v + 4;
+        if (q > n) return 0;
     }
-    if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k; unsigned long long nout = v;
+    if (!(k = wn_varint(p + q, n - q, &v))) return 0;
+    q += k; unsigned long long nout = v;
     for (unsigned long long i = 0; i < nout; i++){
-        q += 8; if (q > n) return 0;
-        if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k + (long)v; if (q > n) return 0;
+        q += 8;
+        if (q > n) return 0;
+        if (!(k = wn_varint(p + q, n - q, &v))) return 0;
+        q += k + (long)v;
+        if (q > n) return 0;
     }
     if (segwit) for (unsigned long long i = 0; i < nin; i++){
-        if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k;
+        if (!(k = wn_varint(p + q, n - q, &v))) return 0;
+        q += k;
         for (unsigned long long j = 0; j < v; j++){ unsigned long long l;
-            if (!(k = wn_varint(p + q, n - q, &l))) return 0; q += k + (long)l; if (q > n) return 0; }
+            if (!(k = wn_varint(p + q, n - q, &l))) return 0;
+            q += k + (long)l;
+            if (q > n) return 0; }
     }
     q += 4;
     return q <= n ? q : 0;
@@ -945,7 +881,8 @@ static void walletnotify_tx(const unsigned char* tx, long len){
 static void walletnotify_block(const unsigned char* blk, long blen){
     if (blen < 81) return;
     unsigned long long ntx; long p = 80, k = wn_varint(blk + p, blen - p, &ntx);
-    if (!k) return; p += k;
+    if (!k) return;
+    p += k;
     for (unsigned long long i = 0; i < ntx && p < blen; i++){
         long tl = wn_tx_len(blk + p, blen - p);
         if (tl <= 0) return;
@@ -1359,7 +1296,7 @@ int peer_misbehaving(const char* ip, int points, const char* reason){
 
 /* strip ":port" so a ban on the address matches a leg recorded as ip:port */
 static void ctl_ip_only(const char* hostport, char* out, size_t cap){
-    snprintf(out, cap, "%s", hostport ? hostport : "");
+    { const char* src = hostport ? hostport : ""; size_t l = strnlen(src, cap - 1); memcpy(out, src, l); out[l] = 0; }
     char* c = strrchr(out, ':');
     if(c) *c = 0;
 }
@@ -1737,7 +1674,7 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
     if(!have_lit && dialer_dns_blocked()){
         const char* why = "";
         int nfd = dialer_connect_name(host, out_port, g_cfg.connect_timeout_ms > 0 ? g_cfg.connect_timeout_ms : 15000, &why);
-        if(nfd < 0){ snprintf(g_dial_fail,sizeof g_dial_fail,"cannot dial the name \"%.40s\": %.50s", host, why); return -1; }
+        if(nfd < 0){ snprintf(g_dial_fail,sizeof g_dial_fail,"cannot dial the name \"%.30s\": %.40s", host, why); return -1; }
         struct timeval tv; tv.tv_sec=30; tv.tv_usec=0; setsockopt(nfd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
         if(node_handshake(nfd)!=1 || !peer_has_witness(host)){ close(nfd); snprintf(g_dial_fail,sizeof g_dial_fail,"handshake failed (via proxy)"); return -1; }
         { extern void addrself_note_peer_view(const unsigned char*, long);
@@ -2239,7 +2176,7 @@ static void* txsub_pool(void);
 static int   txsub_worker_ready(void);
 extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32], unsigned long* out_len);
 typedef struct { int rc; char why[128]; } pbh_result_t;
-typedef struct { pid_t pid; int sp; int tx_index; int peer_slot; long long t0; char host[96]; } pbh_slot_t;
+typedef struct { pid_t pid; int sp; int tx_index; int peer_slot; long long t0; char host[128]; } pbh_slot_t;   /* 128: a "host:port" as mux_out_host holds it */
 static pbh_slot_t g_pbh[PB_MAX_CONNECTIONS];
 static long      g_pb_num_to_open = 0;          /* Core CConnman::PrivateBroadcast::m_num_to_open */
 static long long g_pb_next_reattempt_s = 0;
@@ -2406,7 +2343,7 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
     for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], host)){ close(fd); return 0; }   /* already a leg */
     g_peer_version_len = r->vlen; if(r->vlen) memcpy(g_peer_version_payload, r->vpayload, (size_t)r->vlen);
     g_peer_wants_addrv2 = r->wants_addrv2;
-    strncpy(mux_out_host[mux_n_out], host, 127); mux_out_host[mux_n_out][127] = 0;
+    snprintf(mux_out_host[mux_n_out], sizeof mux_out_host[mux_n_out], "%s", host);
     mux_out_fd[mux_n_out] = fd;
     mux_out_wants_v2[mux_n_out] = r->wants_addrv2;
     mux_out_peer[mux_n_out] = 0;
@@ -2642,9 +2579,6 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
     return total;
 }
 
-/* pick up to n distinct public IPv4 endpoints from the amr book into
- * out[i] = "a.b.c.d" (IP only; the downloader dials each on the standard
- * out_port, matching how outbound_connect/serve_mux treat all peers). */
 /* ---- known-good peer memory (peers.good) ---------------------------------
  * The address book records that an IP was SEEN, never that it was any use.
  * So every boot re-probed ~2,000 aged entries, kept whichever ~4% happened to
@@ -2666,16 +2600,6 @@ static long dl_bootstrap(void* ab, const char* peers[], int pool_len){
  * them did not, and the node came up with zero outbound legs and skipped its
  * boot catch-up on every restart (2026-08-28 pre-deploy review, caught
  * before this reached the live node). */
-static int pool_split(const char* entry, char* host, long cap, int* port){
-    bmc_addr_t a;
-    if(!bmc_addr_from_string_port(&a, entry, 0)){
-        snprintf(host, (size_t)cap, "%s", entry);      /* a DNS name: leave it whole */
-        return 0;
-    }
-    bmc_addr_to_string(host, cap, &a);
-    if(port && a.port) *port = a.port;
-    return 1;
-}
 /* the IPv4 of a pool entry (0 if it is not a dialable v4), and its port */
 static unsigned pool_ipv4(const char* entry, int* port){
     bmc_addr_t a;
@@ -2696,7 +2620,7 @@ static int dl_load_good_peers(char out[][DL_POOL_SLOT], int cap){
         if(!L) continue;
         struct in_addr t;
         if(inet_pton(AF_INET,line,&t)!=1) continue;   /* ignore junk lines */
-        strncpy(out[n],line,63); out[n][63]=0; n++;
+        snprintf(out[n],sizeof out[n],"%s",line); n++;
     }
     fclose(f);
     return n;
@@ -2704,7 +2628,7 @@ static int dl_load_good_peers(char out[][DL_POOL_SLOT], int cap){
 
 /* Written atomically (tmp+rename) so a crash mid-write cannot leave a
  * truncated list that silently shrinks the next boot's head start. */
-static void dl_save_good_peers(char peers[][64], int n){
+static void dl_save_good_peers(char peers[][DL_POOL_SLOT], int n){   /* stride must match the caller's good[][] (was [][64]: read the wrong entries -- 2026-09-02) */
     if(n<=0) return;
     FILE* f = fopen(DL_GOODPEERS_FILE ".tmp","w");
     if(!f) return;
@@ -2786,7 +2710,8 @@ static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
     /* if clearnet cannot fill its share, let the others grow into the room */
     for(int k = 1; k < DL_POOL_NNET && quota[0] + taken < nitems; k++){
         long room = nitems - quota[0] - taken; long extra = have[k] - quota[k];
-        if(extra > room) extra = room; if(extra > 0){ quota[k] += extra; taken += extra; }
+        if(extra > room) extra = room;
+        if(extra > 0){ quota[k] += extra; taken += extra; }
     }
     /* pass 3: layout. Slots 0..7 (the boot dials) are clearnet except one
      * onion (slot 3) and one ipv6 (slot 6) when available; after that the
@@ -2900,7 +2825,7 @@ static long dlc_first_hole(long tip){
     return idxscan_first_hole(tip);
 }
 
-/* combined hole+extend span: 1 with *start_h/*end_h set, or 0 if the
+/* combined hole+extend span: 1 with *start_h / *end_h set, or 0 if the
  * archive is already contiguous through hdr_len-1. chunk_all_present makes
  * it safe for this ONE span to also re-cover already-filled heights between
  * a hole and the current tip, so no separate hole-then-extend passes are
@@ -2943,8 +2868,33 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
 /* Does the header at position `have` (the first one a peer just appended)
  * extend the header we asked from (`loc`, our previous tip)? A getheaders
  * answer that starts anywhere else is not a continuation of our chain. */
+/* DLC_HDR_SANE_MAX: how far BELOW our header tip a peer's answer may attach.
+ * The 2026-09-01 incident was a reply that attached at genesis while we held
+ * 965k headers -- a wholesale replacement dressed as a continuation. What
+ * makes that implausible is the DEPTH of the fork (a year is ~52k blocks),
+ * not the number of headers that follow: a fresh node, or one restarted in
+ * the middle of its first sync, legitimately takes hundreds of thousands
+ * of headers in one session. The first version of this guard capped the
+ * count instead and rolled the whole session back at 100,001 -- so a node
+ * starting from genesis could never get past 100k (found by the
+ * fresh-install acceptance test, 2026-09-02). */
 #define DLC_HDR_SANE_MAX 100000L
-static int __attribute__((unused)) dlc_headers_sane(long have0, long added){ return have0 <= 0 || added <= DLC_HDR_SANE_MAX; }
+static int dlc_headers_sane(long have0, long pos){ return have0 - pos <= DLC_HDR_SANE_MAX; }
+
+/* Is a download worker dead weight this tick? The byte-rate floor
+ * (dead_weight_bps, 32 KB/s) is calibrated for blocks of a megabyte or more.
+ * In the first ~150k blocks of the chain a block is a few hundred bytes, so
+ * a peer serving 50 of them a second delivers 20 KB/s -- and the old rule
+ * (bytes only) called that dead weight, killed the worker, and banned the
+ * peer for the run: 85 of 121 peers within eight minutes of a fresh start
+ * (fresh-install acceptance test, 2026-09-02). A worker that hands over at
+ * least DLC_DEAD_WEIGHT_MIN_BLOCKS blocks per 10-second tick is pulling its
+ * weight whatever the byte count; near the tip that many blocks are tens of
+ * megabytes, so the byte rule stays the binding one there. */
+#define DLC_DEAD_WEIGHT_MIN_BLOCKS 10L
+static int dlc_dead_weight(double byte_rate, long blocks_this_tick){
+    return byte_rate >= 0.0 && byte_rate < g_cfg.dead_weight_bps && blocks_this_tick < DLC_DEAD_WEIGHT_MIN_BLOCKS;
+}
 static int __attribute__((unused)) dlc_headers_connect_ok(unsigned char* hst, long have, const unsigned char loc[32]){
     unsigned char rec[112];
     if(have <= 0) return 1;                                   /* fresh store: nothing to connect to */
@@ -2976,8 +2926,10 @@ static void dlc_headers_rollback(unsigned char* hst, long have){
  *   - headers that overlap what we hold must be IDENTICAL (a peer on a fork
  *     is refused, not merged);
  *   - every header links to the previous one and carries no transactions;
- *   - no more than DLC_HDR_SANE_MAX are accepted from one peer (a node a year
- *     offline is ~52k behind; the incident's reply was 966,669).
+ *   - the page may not attach more than DLC_HDR_SANE_MAX headers below our
+ *     tip (a node a year offline is ~52k behind; the incident's reply
+ *     attached at genesis). How many headers FOLLOW is not limited: from
+ *     genesis, or restarted mid-sync, the honest answer is the whole chain.
  * Appends go through hst_append; on any refusal the store is rolled back to
  * where this fetch started. Returns headers appended, or -1. */
 #define DLC_HDR_PAGE 2000
@@ -3030,10 +2982,14 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
         const unsigned char* first = msg + used;
         int at = -1; for(int q = 0; q < nl; q++) if(!memcmp(first + 4, loc + q * 32, 32)){ at = q; break; }
         if(at < 0){
-            fprintf(stderr,"[dlc] headers from %s do not connect to any header we hold (%lu offered) -- discarding\\n", cand, cnt);
+            fprintf(stderr,"[dlc] headers from %s do not connect to any header we hold (%lu offered) -- discarding\n", cand, cnt);
             dlc_headers_rollback(hst, have0); return -1;
         }
         long pos = lh[at] + 1;                    /* the height this page's first header would have */
+        if(!dlc_headers_sane(have0, pos)){
+            fprintf(stderr,"[dlc] headers from %s attach at height %ld while we hold %ld -- a fork deeper than %ld is not a continuation; discarding\n", cand, pos, have0, DLC_HDR_SANE_MAX);
+            dlc_headers_rollback(hst, have0); return -1;
+        }
         long have = hst_count(hst);
         unsigned char prev[32]; memcpy(prev, loc + at * 32, 32);
         unsigned long i = 0;
@@ -3041,7 +2997,7 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
             const unsigned char* h = first + i * 81;
             if(h[80] != 0) break;                 /* txn_count must be 0 in a headers message */
             if(memcmp(h + 4, prev, 32) != 0){
-                fprintf(stderr,"[dlc] headers from %s break their own chain at %lu -- discarding\\n", cand, i);
+                fprintf(stderr,"[dlc] headers from %s break their own chain at %lu -- discarding\n", cand, i);
                 dlc_headers_rollback(hst, have0); return -1;
             }
             unsigned char bh[32]; block_hash(bh, h);
@@ -3049,14 +3005,10 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
                 /* overlap with what we hold: must be the same block */
                 unsigned char rec[112];
                 if(hst_get_at(hst, (unsigned long long)(pos + (long)i), rec) != 1 || memcmp(rec + 80, bh, 32) != 0){
-                    fprintf(stderr,"[dlc] headers from %s fork from our chain at height %ld -- discarding\\n", cand, pos + (long)i);
+                    fprintf(stderr,"[dlc] headers from %s fork from our chain at height %ld -- discarding\n", cand, pos + (long)i);
                     dlc_headers_rollback(hst, have0); return -1;
                 }
             } else {
-                if(added + 1 > DLC_HDR_SANE_MAX){
-                    fprintf(stderr,"[dlc] %s offered more than %ld header(s) beyond %ld -- far beyond any plausible gap; discarding\\n", cand, DLC_HDR_SANE_MAX, have0);
-                    dlc_headers_rollback(hst, have0); return -1;
-                }
                 if(hst_append(hst, h, bh) < 0){ dlc_headers_rollback(hst, have0); return -1; }
                 added++;
             }
@@ -3145,7 +3097,7 @@ static long dl_header_mirror_topup(unsigned char* store){
     return n;
 }
 
-static long dlc_headers(char live[][64], int nlive){
+static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
     static unsigned char hst[4096]; hst_init(hst);
     struct stat hs;
     dl_header_mirror_topup(store_buf);
@@ -3228,7 +3180,7 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
 static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
 
-static int dlc_worker(int w, long end_h, char live[][64], int nlive,
+static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                       int slot0, volatile long* next_claim, volatile long* done_count,
                       volatile dlc_stat_t* mystat, volatile int* claimed,
                       volatile int* banned){
@@ -3385,7 +3337,7 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
  * to call unconditionally on every boot -- this is what makes the node
  * self-healing without any external tooling. */
 /* one non-blocking dial+poll round over pool[from..from+ntry), appending any
- * live+handshaked candidates into live[]/*nlive (capped at cap). Never
+ * live+handshaked candidates into live[] / *nlive (capped at cap). Never
  * blocks longer than wait_ms regardless of how many candidates in this
  * batch are dead or black-holed -- poll() naturally times out, unlike a
  * blocking connect() to an unreachable host. Same technique as the parallel
@@ -3394,7 +3346,7 @@ static int dlc_worker(int w, long end_h, char live[][64], int nlive,
  * one round measurably tanks the success rate -- observed 1/140 live).
  * Returns how many were promoted this round. */
 static int dlc_probe_round(char pool[][DL_POOL_SLOT], int from, int ntry,
-                           char live[][64], int* nlive, int cap, int wait_ms){
+                           char live[][DL_POOL_SLOT], int* nlive, int cap, int wait_ms){
     if(ntry>MUX_MAX_OUT*3) ntry=MUX_MAX_OUT*3;
     static int cfd[MUX_MAX_OUT*3];
     int nc=0;
@@ -3464,7 +3416,7 @@ static int dlc_probe_round(char pool[][DL_POOL_SLOT], int from, int ntry,
         if(!ready){ close(cfd[k]); continue; }
         int soerr=0; socklen_t sl=sizeof soerr;
         if(getsockopt(cfd[k],SOL_SOCKET,SO_ERROR,&soerr,&sl)<0||soerr!=0){ close(cfd[k]); continue; }
-        strncpy(live[*nlive],pool[from+k],63); (*nlive)++; got++;
+        snprintf(live[*nlive],sizeof live[*nlive],"%s",pool[from+k]); (*nlive)++; got++;
         close(cfd[k]);
     }
     return got;
@@ -3559,7 +3511,7 @@ static long dl_catchup(const char* dir, int min_workers){
             char ipd[64];
             if(!dl_resolve1(g_cfg.connectn[i], ipd)){
                 fprintf(stderr,"[dlc] connect=%s did not resolve\n", g_cfg.connectn[i]); continue; }
-            strncpy(pool[npool],ipd,63); pool[npool][63]=0; npool++;
+            snprintf(pool[npool],sizeof pool[npool],"%s",ipd); npool++;
         }
         fprintf(stderr,"[dlc] connect= -- pool restricted to %d configured node(s)\n", npool);
     } else {
@@ -3571,7 +3523,7 @@ static long dl_catchup(const char* dir, int min_workers){
         for(int i=0;i<g_cfg.n_addnode && npool<DLC_MAXPOOL;i++){
             char ipd[64];
             if(!dl_resolve1(g_cfg.addnode[i], ipd)) continue;
-            strncpy(pool[npool],ipd,63); pool[npool][63]=0; npool++; nadd++;
+            snprintf(pool[npool],sizeof pool[npool],"%s",ipd); npool++; nadd++;
         }
         ngood = dl_load_good_peers(pool+npool, DLC_MAXPOOL-npool);
         npool += ngood;
@@ -3582,7 +3534,7 @@ static long dl_catchup(const char* dir, int min_workers){
                 int dup=0;
                 for(int j=0;j<npool;j++) if(!strcmp(book[i],pool[j])){ dup=1; break; }
                 if(dup) continue;
-                strncpy(pool[npool],book[i],63); pool[npool][63]=0; npool++;
+                { size_t l = strnlen(book[i], sizeof pool[npool] - 1); memcpy(pool[npool], book[i], l); pool[npool][l] = 0; } npool++;   /* full slot: a v3 onion host:port is 67 bytes, 63 cut it */
             }
         }
     }
@@ -3637,7 +3589,11 @@ static long dl_catchup(const char* dir, int min_workers){
         }
         else if(nlive>0 && nlive < want/2){
             fprintf(stderr,"[addr] only %d live peer(s) (target %d) -- asking peers for more\n", nlive, want);
-            addr_replenish(ab, live, nlive, 3 /* ask at most 3 */, 20 /* seconds each */, 400);
+            /* addr_replenish (daemon/addr_ingest.c) reads a [][64] table; live[] is
+             * [][DL_POOL_SLOT], so hand it a copy with the stride it expects */
+            { static char rep[DLC_MAXPOOL][64];
+              for(int i=0;i<nlive;i++){ size_t l = strnlen(live[i], 63); memcpy(rep[i], live[i], l); rep[i][l] = 0; }
+              addr_replenish(ab, rep, nlive, 3 /* ask at most 3 */, 20 /* seconds each */, 400); }
         }
     }
     if(nlive<=0){ fprintf(stderr,"[dlc] no live peers; skipping catch-up\n"); return 0; }
@@ -3731,7 +3687,7 @@ static long dl_catchup(const char* dir, int min_workers){
             long holes = cur_tip>=0 ? (cur_tip+1-present) : 0;
             double overall_pct = 100.0*(double)present/(double)(end_h+1);
             double span_pct = cur_tip>=0 ? 100.0*(double)present/(double)(cur_tip+1) : 0.0;
-            char elapsed[16]; dlc_fmt_elapsed(elapsed,sizeof elapsed,(long)(time(NULL)-catchup_start));
+            char elapsed[32]; dlc_fmt_elapsed(elapsed,sizeof elapsed,(long)(time(NULL)-catchup_start));
             fprintf(stderr,"[dlc] == elapsed %s | overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free) ==\n",
                     elapsed, present, end_h+1, overall_pct, holes, cur_tip, span_pct);
         }
@@ -3758,7 +3714,7 @@ static long dl_catchup(const char* dir, int min_workers){
             }
             char flag[48]="";
             if(kids[w]!=0 && byte_rate>=0.0){
-                if(byte_rate<g_cfg.dead_weight_bps){
+                if(dlc_dead_weight(byte_rate, b-prev_blocks[w])){
                     dead_ticks[w]++;
                     if(dead_ticks[w]>=g_cfg.dead_weight_ticks){
                         long bidx = stats[w].held_idx;
@@ -3796,7 +3752,7 @@ static long dl_catchup(const char* dir, int min_workers){
              * kill has already happened (a historical per-kill tally only
              * changes once a drop actually fires, which can take a while to
              * show up at all). Resets to nothing once healthy or just cut. */
-            char dragbuf[32]="";
+            char dragbuf[48]="";
             if(dead_ticks[w]>0) snprintf(dragbuf,sizeof dragbuf," (Dragging: %d of %d)",dead_ticks[w],g_cfg.dead_weight_ticks);
             fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s)%s%s%s\n",
                     w, stats[w].peer[0]?(const char*)stats[w].peer:"(connecting)",
@@ -4189,7 +4145,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * paths go through idxscan_append_locked (flock-guarded, atomic-height-
      * under-lock) so they can't collide, see that function's header comment
      * in bitcoin_idxscan.asm. */
-    chdir(dir);
+    if(chdir(dir) != 0){ fprintf(stderr,"[dlc] FATAL: cannot chdir to the datadir %s: %s\n", dir, strerror(errno)); _exit(2); }
     /* ZMQ publisher binds HERE, in the worker, because a PUB socket's
      * subscriber fds are per-process and only this process can write to them.
      * Binding is non-fatal: a busy port must not stop the node syncing. */
@@ -4931,8 +4887,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     extern long tx_accept_test_reason(void*, const unsigned char*,
                                      const unsigned char*, unsigned long, char*,
                                      unsigned long, unsigned long long*);
-                    extern int tx_txid(unsigned char[32], const unsigned char*, unsigned long,
-                                       unsigned char*, unsigned long);
+                    extern int tx_txid(unsigned char* out, const unsigned char* tx, unsigned long txlen, unsigned char* scratch, unsigned long scratchcap);
                     static unsigned char tscratch[2000*81 + 8];
                     unsigned char tid[32];
                     unsigned long long fee = 0;
@@ -4954,7 +4909,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         /* Core BroadcastTransaction(NO_MEMPOOL_PRIVATE_BROADCAST): test-accept
                          * first (its rejection is the RPC's), then queue -- never the mempool */
                         extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*, unsigned long, char*, unsigned long, unsigned long long*);
-                        extern int tx_txid(unsigned char[32], const unsigned char*, unsigned long, unsigned char*, unsigned long);
+                        extern int tx_txid(unsigned char* out, const unsigned char* tx, unsigned long txlen, unsigned char* scratch, unsigned long scratchcap);
                         static unsigned char pscratch[2000*81 + 8]; unsigned char tid[32]; unsigned long long fee = 0;
                         if(!tx_txid(tid, (const unsigned char*)g_node_status->tx_submit_buf, tlen, pscratch, sizeof pscratch)){ result = -22; snprintf(reason, sizeof reason, "TX decode failed"); }
                         else {
@@ -5884,7 +5839,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
        * switched-to wallet's seed through the SAME installer the encryption
        * unlock path uses -- one seed slot, one way to write it. */
       rpc_wops_set_seed_installer(wenc_install_seed);
-      char wd[512]; snprintf(wd, sizeof wd, "%s", dir ? dir : ".");
+      char wd[4200]; snprintf(wd, sizeof wd, "%s", dir ? dir : ".");   /* the datadir path: PATH_MAX-sized like g_cfg's */
       if (g_cfg.walletdir[0] ? wenc_boot(g_cfg.walletdir) : (wenc_boot(".") || wenc_boot(wd))){
           /* An encrypted wallet boots LOCKED, as Core's does. If the operator
            * has configured a passphrase source (walletpassfile= or
@@ -5948,7 +5903,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern long mpool_policy_estimate(void*, unsigned long long*, unsigned long long*);
       extern unsigned long long mpool_policy_min_fee(void*);
       extern long mpool_count(void*);
-      extern const unsigned char* mpool_get(void*, const unsigned char*, unsigned long*);
+      extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32], unsigned long* out_len);
       rpc_mempool_hooks h = {
           .mp = mp_ext_area, .polstate = mp_ext_polstate,
           .maxbytes = (long long)mp_ext_blobcap,
@@ -6014,7 +5969,8 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
         rj_val* r = NULL; long ec = 0; const char* em = NULL;
         int ok = rpc_dispatch("loadwallet", p, &g_rpc_wallet, &r, &ec, &em);
         fprintf(stderr,"[wallet] wallet=%s: %s%s\n", g_cfg.wallet_names[wi], ok == 1 ? "loaded" : "NOT loaded: ", ok == 1 ? "" : (em ? em : "?"));
-        if(r) rj_free(r); rj_free(p);
+        if(r) rj_free(r);
+        rj_free(p);
     }
     /* getaddednodeinfo reports the operator's addnode= list verbatim. */
     rpc_node_set_addednodes(g_cfg.n_addnode ? (const char (*)[64])g_cfg.addnode : NULL,
@@ -6419,7 +6375,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 i2p_inbound_t m;
                 if(read(li2p, &m, sizeof m) == (ssize_t)sizeof m){
                     c = m.fd;
-                    snprintf(peerdesc, sizeof peerdesc, "%s:0", m.b32);
+                    snprintf(peerdesc, sizeof peerdesc, "%.60s:0", m.b32);   /* a b32 name is 60 chars */
                     fprintf(stderr,"[serve] inbound over i2p from %s\n", m.b32);
                 } else c = -1;
             } else if(ready_on){
@@ -6470,7 +6426,8 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 /* over -maxuploadtarget for this 24h window -- unless the
                  * peer has the `download` permission (Core: served regardless) */
                 char ipb[64]; const char* q = strrchr(peerdesc, ':'); size_t n = q ? (size_t)(q - peerdesc) : strlen(peerdesc);
-                if(n >= sizeof ipb) n = sizeof ipb - 1; memcpy(ipb, peerdesc, n); ipb[n] = 0;
+                if(n >= sizeof ipb) n = sizeof ipb - 1;
+                memcpy(ipb, peerdesc, n); ipb[n] = 0;
                 if(!(netperm_for(ipb) & NP_DOWNLOAD)){ close(c); c = -1; }
             }
             if(c>=0 && g_inbound_n >= CFG_INBOUND_LIMIT()){
@@ -7151,7 +7108,8 @@ int main(int argc, char** argv){
         }
         /* # outbound peers is optional 4th arg (default 3). */
         int nwant = (argc>=5)? atoi(argv[4]) : 3;
-        if(nwant<0) nwant=0; if(nwant>MUX_MAX_OUT) nwant=MUX_MAX_OUT;
+        if(nwant<0) nwant=0;
+        if(nwant>MUX_MAX_OUT) nwant=MUX_MAX_OUT;
         /* # dl_catchup chunk-claiming workers is optional 5th arg (default
          * 16 -- tried both 8 and 16 against the real archive; 16 gave a
          * modest throughput bump once the liveness probe was fixed to
@@ -7456,7 +7414,8 @@ int main(int argc, char** argv){
         const char* peer[] = { argv[4] };
         int out_port = atoi(argv[5]);
         int nwant = (argc>=7)? atoi(argv[6]) : 1;
-        if(nwant<1) nwant=1; if(nwant>1) nwant=1;   /* one loopback peer */
+        if(nwant<1) nwant=1;
+        if(nwant>1) nwant=1;   /* one loopback peer */
         store_reload(store_buf);
         int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
         if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;

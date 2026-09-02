@@ -37,7 +37,6 @@ extern unsigned long long bip152_shortid(unsigned char out[6], const unsigned ch
 
 static int failures=0;
 static void ck(const char*l,int ok){ if(ok) printf("PASS %s\n",l); else{ printf("FAIL %s\n",l); failures++; } }
-static void cki(const char*l,long g,long e){ if(g==e)printf("PASS %s (got %ld)\n",l,g); else{printf("FAIL %s got=%ld exp=%ld\n",l,g,e);failures++;} }
 
 static void put_u64(unsigned char*p, unsigned long long v){ for(int i=0;i<8;i++) p[i]=(unsigned char)(v>>(8*i)); }
 static void put_varint(unsigned char**p, unsigned long long v){
@@ -115,7 +114,6 @@ int main(void){
                tx3 equals BLOCK_RAW's 4th tx. Compute expected via block offset:
                tx1 at BLOCK_TX_LEN[0]+ ... walk. We'll compare to the known lens. */
             /* tx1 length = BLOCK_TX_LEN[1], tx3 length = BLOCK_TX_LEN[3] */
-            int off=0; /* skip header+count */
             /* recompute the block's tx byte offsets */
             int start1=81, start2=start1+BLOCK_TX_LEN[0], start3=start2+BLOCK_TX_LEN[1], start4=start3+BLOCK_TX_LEN[2];
             /* tx bytes follow count at buf+33 */

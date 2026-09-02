@@ -58,9 +58,11 @@ static long fx_read_block(long h, unsigned char* buf, long cap){
 static long fx_tip(void){ return g_fxtip; }
 
 static long fx_u32(unsigned char* o, unsigned int v){
-    for (int i = 0; i < 4; i++) o[i] = (unsigned char)(v >> (8*i)); return 4; }
+    for (int i = 0; i < 4; i++) o[i] = (unsigned char)(v >> (8*i));
+    return 4; }
 static long fx_u64(unsigned char* o, unsigned long long v){
-    for (int i = 0; i < 8; i++) o[i] = (unsigned char)(v >> (8*i)); return 8; }
+    for (int i = 0; i < 8; i++) o[i] = (unsigned char)(v >> (8*i));
+    return 8; }
 
 static void fx_derive(const unsigned char* seed, unsigned idx, int br, unsigned char h[20]){
     unsigned path[5] = {0x80000000u|84u, 0x80000000u, 0x80000000u, idx, (unsigned)br};

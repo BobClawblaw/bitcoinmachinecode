@@ -150,8 +150,19 @@ int main(void){
       dlc_headers_rollback(hst, 1);
       ok(hst_count(hst) == 1, "rollback drops the appended header: the store is back at 1");
       { struct stat st; ok(stat("headers.dat", &st) == 0 && st.st_size == 112, "...and headers.dat is back to 112 bytes"); }
-      ok(dlc_headers_sane(0, 5000000), "a fresh store may take the whole chain");
-      ok(dlc_headers_sane(965018, 100000) && !dlc_headers_sane(965018, 100001), "a non-empty store refuses more than DLC_HDR_SANE_MAX headers from one answer");
+      /* the guard is about WHERE an answer attaches, never about how much follows (2026-09-02) */
+      ok(dlc_headers_sane(0, 1), "a fresh store takes an answer from height 1 -- the whole chain may follow");
+      ok(dlc_headers_sane(50000, 50000), "a node restarted mid-sync takes an answer at its tip, however long");
+      ok(dlc_headers_sane(965018, 965018 - 100000), "an answer 100k below the tip is still a continuation");
+      ok(!dlc_headers_sane(965018, 1), "the incident: an answer from genesis against 965k held is refused");
+      ok(!dlc_headers_sane(965018, 965018 - 100001), "...as is one more than DLC_HDR_SANE_MAX below the tip");
+      /* dead weight (2026-09-02): the byte floor alone banned honest peers serving tiny early blocks */
+      g_cfg.dead_weight_bps = 32768.0;
+      ok(dlc_dead_weight(2000.0, 0), "2 KB/s and no blocks this tick: dead weight");
+      ok(dlc_dead_weight(2000.0, 9), "2 KB/s and 9 blocks: still dead weight (below the block floor)");
+      ok(!dlc_dead_weight(2000.0, 50), "2 KB/s but 50 tiny blocks a tick: pulling its weight, not banned");
+      ok(!dlc_dead_weight(1500000.0, 1), "1.5 MB/s and one block: fine near the tip");
+      ok(!dlc_dead_weight(-1.0, 0), "no rate sample yet: not judged");
       if (cwd0[0]) (void)!chdir(cwd0); }
 
     printf("== 6. the boot header fetch: exponential locator, per-page checks ==\n");
@@ -172,7 +183,8 @@ int main(void){
           char host2[64]; snprintf(host2, sizeof host2, "127.0.0.1:%d", ntohs(sa2.sin_port)); \
           int fd2 = -1; for (int k = 0; k < 50 && fd2 < 0; k++){ fd2 = socket(AF_INET, SOCK_STREAM, 0); if (connect(fd2, (struct sockaddr*)&sa2, sizeof sa2) != 0){ close(fd2); fd2 = -1; usleep(20000); } } \
           long res = -2; if (fd2 >= 0 && node_handshake(fd2) == 1) res = dlc_fetch_headers(fd2, hst, host2); \
-          if (fd2 >= 0) close(fd2); kill(fp2, SIGKILL); waitpid(fp2, NULL, 0); close(l2); \
+          if (fd2 >= 0) close(fd2); \
+          kill(fp2, SIGKILL); waitpid(fp2, NULL, 0); close(l2); \
           ok((cond), label_ok); (void)res; }while(0)
       { unsigned char hp[2][80]; memcpy(hp[0], h1, 80); memcpy(hp[1], h2, 80);
         long res_a = -2; HFETCH(0, 2, hp, "a page continuing our tip: both headers appended (count 3)", (res_a = res) == 2 && hst_count(hst) == 3); }

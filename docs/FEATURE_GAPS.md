@@ -1582,3 +1582,64 @@ pass, then `-Werror`**.
   `-stdinwalletpassphrase` and `-stdin`. Pinned by `tests/test_cli_prompt`
   (a real pty). Parity attestation heights are now published in
   `docs/PARITY_ATTESTATION.md` (audit recommendation 8).
+
+## Update 2026-09-02 — every C compile is `-Wall -Werror` (audit N7, the deferred half)
+
+The tree carried 3,166 warning lines per full build (287 unique sites once
+the per-rule repeats are removed; 57 of the object rules had never been
+compiled with `-Wall` at all, hiding 27 more). All were fixed at the root
+(prototypes corrected, results checked, buffers bounded, indentation made to
+say what the code does, dead helpers removed), never with pragmas or blanket
+casts, and `WARNFLAGS := -Wall -Werror` is now appended to every C compile in
+the Makefile. The classes and what they turned out to be are recorded in
+`worklog/2026-09-02.md`. nasm followed the same day: `NASMFLAGS := -f elf64 -I. -Werror`. Its ten
+warning sites hid four real defects, one of them consensus-relevant: the
+CHECKSEQUENCEVERIFY disable-flag test used a sign-extended immediate and
+turned enforced 5-byte operands into NOPs (`tests/test_csv_disable_flag`).
+Details in `worklog/2026-09-02.md`.
+
+## Update 2026-09-02 — randomized script differential against Core (audit §6.9): DONE, and it paid
+
+`tests/fuzz_script_diff` (manual; needs `validation/build_core_oracle.sh`
+to build Core's `EvalScript` as a line oracle) compares verdict, error code
+and the entire final stack on random scripts. The first 20,000 cases found
+728 divergences; all traced to five root causes in the interpreter, every
+one of them a policy-flag behaviour (MINIMALDATA scriptnum encoding, MINIMALIF
+error code, the 0x81 push rule, STRICTENC pubkey encoding, NULLDUMMY
+precedence) -- mempool/relay parity, never block validation. After the fixes:
+1.62 million cases over four seeds, zero mismatches. Seventeen vectors are
+pinned in `tests/test_interp_core_vectors` so the gate does not need Core.
+Not yet covered by the generator: tapscript (sigversion 3, needs execution
+data on both sides) and real signatures (the checker fails every signature on
+both sides by construction). Those are the next extension.
+
+## Update 2026-09-02 — the differential now covers real signatures and taproot
+
+`tests/fuzz_verify_diff` (manual) compares our whole-input verification --
+the exact `sv_verify_script` / `sv_verify_witness_v0` / `taproot_verify_input`
+calls `daemon/tx_verify.c` makes -- against Core's `VerifyScript`, on random
+transactions whose signatures Core itself produces (ECDSA over legacy and
+BIP143 sighashes, Schnorr over BIP341 key-path and BIP342 script-path
+sighashes with annexes, code separators and two-leaf trees). Verdicts never
+disagreed; error codes under the standard policy flags did, which is how
+NULLFAIL, LOW_S, the STRICTENC hashtype rule and CONST_SCRIPTCODE arrived in
+the interpreter. 63,000 whole-input cases and 400,000 more EvalScript cases
+now match exactly. `tests/test_verify_core_vectors` keeps 71 of the Core-signed
+spends in the gate. Not covered: tapscript at the EvalScript level with
+execution data (the whole-input path covers it end to end instead), and
+MuSig2/PSBT flows (a different layer).
+
+## Update 2026-09-02 — fresh-install acceptance test: two findings before the first 100k headers
+
+`validation/fresh_install_ibd.sh` (clone from GitHub, README build, minimal
+configuration, unattended sync, muhash against Core at the tip) found, within
+its first minutes: (1) the quick start's configuration copy is invisible to a
+daemon whose datadir is not `<repo>/data` -- the daemon then runs on compiled
+defaults; (2) the header-sync guard added after the 2026-09-01 incident capped
+the number of headers per session at 100,000 and rolled the session back,
+so a node syncing from genesis could never pass 100k headers. The guard now
+limits how deep below our tip an answer may attach (the incident's case),
+not how many headers follow. (3) The download workers' dead-weight rule
+(bytes per second only) banned honest peers serving the tiny early blocks;
+it now also requires a low block rate. The run continues from a fresh clone of the
+fixed tree; `phase.log` / `progress.log` / `RESULT` in the run directory.

@@ -2,7 +2,7 @@
  * (audit 2026-08-29 finding 8).
  *
  * There is NO authentication on a ZMQ publisher: whoever connects,
- * subscribes. `tcp://*:28332` is the spelling every tutorial uses, and on a
+ * subscribes. the wildcard bind (`tcp:` + `//` + `*:28332`) is the spelling every tutorial uses, and on a
  * node like this one it hands every block and transaction to the whole LAN --
  * a blast radius the operator inherited rather than chose.
  *

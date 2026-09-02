@@ -72,7 +72,7 @@ int main(void){
 
     /* ---- index.dat record layout: [hash32][file_no u32][pos u64][size u32] ---- */
     FILE* idf = fopen("index.dat","rb");
-    unsigned char irec[48]; fseek(idf,48,SEEK_SET); fread(irec,1,48,idf); fclose(idf);
+    unsigned char irec[48]; fseek(idf,48,SEEK_SET); cki("index rec1 read", (long)fread(irec,1,48,idf), 48); fclose(idf);
     cki("index rec1 hash byte0", irec[0], 0x11);
     unsigned fn; memcpy(&fn, irec+32, 4);   cki("index rec1 file_no", fn, 0);
     unsigned long long pos; memcpy(&pos, irec+36, 8); cki("index rec1 pos", pos, 208);

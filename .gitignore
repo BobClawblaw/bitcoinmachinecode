@@ -423,3 +423,8 @@ port/arm64/parity_out/
 asm/daemon/build_txospender_index
 asm/daemon/utxo_dump_keys
 asm/daemon/utxo_repair_del
+
+# built from the scratch Core tree by validation/build_core_oracle.sh; never committed
+validation/core_script_oracle
+asm/tests/fuzz_script_diff
+asm/tests/fuzz_verify_diff
