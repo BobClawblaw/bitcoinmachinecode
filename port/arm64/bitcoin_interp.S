@@ -2205,6 +2205,19 @@ interp_checkmultisig:
 	cmp  w19,#20
 	b.gt .err_pubcount
 	str  w19,[sp,#0x48]
+	/* Core: nOpCount += nKeysCount, THEN re-check MAX_OPS_PER_SCRIPT
+	 * (interpreter.cpp's OP_CHECKMULTISIG arm; x86 fix 2026-08-26). The key
+	 * count is charged to the 201-opcode budget, not just the single opcode
+	 * -- ten 0-of-20 multisigs are 200 keys + 10 opcodes = 210 and must be
+	 * REJECTED with SCRIPT_ERR_OP_COUNT. The port predated that fix. */
+	ldr  w2,[x24,#SL_OPCOUNT]
+	add  w2,w2,w19
+	str  w2,[x24,#SL_OPCOUNT]
+	cmp  w2,#MAX_OPS_PER_SCRIPT
+	b.ls 1f
+	mov  w0,#SE_OP_COUNT
+	b    .err_set
+1:
 	/* ---- nSigs = stacktop(nkeys+2) ---- */
 	ldr  w2,[sp,#0x48]
 	add  w2,w2,#2
