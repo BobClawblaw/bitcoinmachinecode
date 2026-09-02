@@ -1333,7 +1333,7 @@ that served BIP157 before this change must now set it explicitly.
 | `prevoutfetchthreads` | Set the number of threads used to prefetch block input prevouts from the chainstate database (0 disables, up t… | accepted, no effect: prevouts come from the in-process UTXO set |
 | `printpriority` | Log transaction fee rate in BTC/kvB when mining blocks (default: 0) | implemented |
 | `printtoconsole` | Send trace/debug info to console (default: 1 when no -daemon. To disable logging to file, set -nodebuglogfile) | accepted, no effect: stderr IS the log (systemd appends it to the log file) |
-| `privatebroadcast` | Broadcast transactions submitted via sendrawtransaction RPC using short-lived connections through the Tor or I… | accepted, no effect: no private broadcast |
+| `privatebroadcast` | Broadcast transactions submitted via sendrawtransaction RPC using short-lived connections through the Tor or I… | implemented 2026-09-02: sendrawtransaction is validated and queued, three short-lived anonymous connections over Tor/I2P (or clearnet through the Tor proxy) deliver it, the tx stays out of the mempool until heard back; getprivatebroadcastinfo / abortprivatebroadcast; see the 2026-09-02 update |
 | `proxy` |  | implemented |
 | `proxyrandomize` | Randomize credentials for every proxy connection. This enables Tor stream isolation (default: 1) | implemented |
 | `prune` | Reduce storage requirements by enabling pruning (deleting) of old blocks. This allows the pruneblockchain RPC … | implemented |
@@ -1378,7 +1378,7 @@ that served BIP157 before this change must now set it explicitly.
 | `txindex` | Maintain a full transaction index, used by the getrawtransaction rpc call (default: 0) | implemented |
 | `txospenderindex` | Maintain a transaction output spender index, used by the gettxspendingprevout rpc call (default: 0) | implemented 2026-09-01 — the index is enabled by the presence of `txospender.dat` (offline base + live tail), the key is accepted and changes nothing |
 | `txreconciliation` | Enable transaction reconciliations per BIP 330 (default: 0) | accepted, no effect: Erlay: BIP330 negotiation is built but reconciliation is a deliberate stop |
-| `txsendrate` | Set the maximum ongoing rate for sending transactions to (inbound) peers (default: 14 tx/s) | accepted, no effect: no private broadcast |
+| `txsendrate` | Set the maximum ongoing rate for sending transactions to (inbound) peers (default: 14 tx/s) | accepted, no effect: no inbound tx send-rate limiter (debug-only in Core) |
 | `uacomment` | Append comment to the user agent string | implemented |
 | `unsafesqlitesync` | Set SQLite synchronous=OFF to disable waiting for the database to sync to disk. This is unsafe and can cause d… | accepted, no effect: no sqlite |
 | `v2transport` | Support v2 transport (default: 1) | implemented |
@@ -1474,3 +1474,57 @@ Core's Updater does (they must already be in the PSBT, as
 `utxoupdatepsbt` puts them); partial-signature EXTRACTION (`finalize=false`)
 for miniscript inputs stays limited to the P2WPKH/P2PKH/taproot forms.
 
+## Update 2026-09-02 — private broadcast (Core v30 `-privatebroadcast`)
+
+Implemented and proven against a real Core on regtest
+(`validation/private_broadcast_regtest_e2e.sh`, 24 checks). With
+`privatebroadcast=1`, `sendrawtransaction` test-accepts the transaction and
+QUEUES it (`daemon/private_broadcast.c`) instead of admitting it to the
+mempool; the download worker owes three connections per transaction and
+opens each in a forked helper child (the same shape as its background
+dials): a random reachable network among tor, i2p and clearnet-through-the-
+tor-proxy, a random routable address of that network from the book, a fresh
+transient I2P session or random SOCKS5 credentials per connection, then
+Core's exact conversation — an anonymous `version` (services 0, time 0,
+zero addresses, height 0, relay 0, user agent `/pynode:0.0.1/`), `verack`,
+one `inv`, the peer's `getdata` for exactly that inv, the `tx`, a `ping`,
+and the `pong` as the receipt; nothing else is ever sent (no pong, no
+sendaddrv2/wtxidrelay echoes). The transaction leaves the queue when it
+comes back from the network over an ordinary peer; stale entries are
+re-tested every 2–3 minutes and re-broadcast or dropped with the reason.
+`getprivatebroadcastinfo` and `abortprivatebroadcast` are Core's shapes;
+both refuse with Core's text when the option is off. Boot refuses the option
+without Tor or I2P reachability (Core's words) and warns on
+`proxyrandomize=0`.
+
+What Core proved on the wire: its `getpeerinfo` shows our connections as
+`/pynode:0.0.1/`, services `0000000000000000`, `relaytxes` false; its
+mempool gains the transaction; the SOCKS5 stub standing in for Tor saw
+three connections with three distinct credential pairs (stream isolation);
+the transaction returned to our node over the normal leg and the queue
+emptied.
+
+Divergences, on purpose:
+- Core refuses `-privatebroadcast` together with `-connect`; this node WARNS
+  instead. Core's private dials share the connection budget `connect=`
+  restricts; ours come from the address book regardless, so the pairing
+  works — the warning says the private connections go outside the
+  `connect=` list.
+- Private connections are not itemised in `getpeerinfo` (they live in
+  helper children for seconds); Core lists them with
+  `connection_type: private_broadcast`.
+- The queue holds 64 transactions (Core: 10,000) and 8 concurrent
+  connections (Core: 64) — a personal node's numbers.
+- v1 transport only for the private connections (Core uses v2 when the
+  peer advertises it).
+
+Observed about Core v31.99 while testing, recorded because it will confuse
+the next person: after accepting a transaction from an inbound peer Core
+sometimes held its announcement to our (inbound-to-Core) leg for 60–120 s
+until another transaction bumped its inbound tx-send-rate bucket; once
+bumped, both went out in one `inv`. The harness waits 90 s and then sends
+one Core wallet transaction as the bump, saying so.
+
+Also fixed on the way: `addnode=host:port` now keeps its port in the boot
+book fold-in, the liveness probe and the download worker's re-dial (it
+silently dialled the chain default before).
