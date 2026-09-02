@@ -102,7 +102,9 @@ static long rd_cs(const unsigned char* p, const unsigned char* end, unsigned lon
     if (f < 0xfd) { *v=f; return 1; }
     if (f == 0xfd){ if (p+2>end) return -1; *v=(unsigned)p[0]|((unsigned)p[1]<<8); return 3; }
     if (f == 0xfe){ if (p+4>end) return -1; *v=0; for(int i=0;i<4;i++) *v|=(unsigned long long)p[i]<<(8*i); return 5; }
-    if (p+8>end) return -1; *v=0; for(int i=0;i<8;i++) *v|=(unsigned long long)p[i]<<(8*i); return 9;
+    if (p+8>end) return -1;
+    *v=0; for(int i=0;i<8;i++) *v|=(unsigned long long)p[i]<<(8*i);
+    return 9;
     return -1;
 }
 
@@ -179,7 +181,8 @@ static void do_connect(const unsigned char* blk, unsigned long n, int height){
                 if (q+36>end) break;
                 const unsigned char* prev = q; q += 36;
                 unsigned long long sl=0; cc=rd_cs(q,end,&sl); if(cc<0) break; q+=cc;
-                if(q+sl+4>end) break; q+=sl+4;
+                if(q+sl+4>end) break;
+                q+=sl+4;
                 if (i>0){
                     unsigned long idx=(unsigned long)(prev[32]|(prev[33]<<8)|(prev[34]<<16)|((uint32_t)prev[35]<<24));
                     utxo_del(g_utxo, prev, idx);
