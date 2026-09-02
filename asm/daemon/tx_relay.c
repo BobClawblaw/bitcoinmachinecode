@@ -568,11 +568,22 @@ static void txr_orphan_expire(void){
  * in this single-threaded worker; the serve children and the RPC parent
  * open it read-only. */
 extern long addr_ingest_msg_n(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit);
+extern long addr_ingest_msg_v(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit, int* viol);
 extern long p2p_addr_count(const void* pl, long plen);
+/* audit 2026-09-02 N3: a malformed addr/addrv2, or one declaring more than
+ * MAX_ADDR_TO_SEND entries, is misbehaviour (Core: Misbehaving "addr message
+ * size = %u"). The worker knows the peer only by fd; main.c owns the leg
+ * table and the shared misbehaviour table, so it supplies the strong
+ * definition. A weak reference resolves to NULL in the standalone tests. */
+extern void txr_report_violation_fd(int fd, const char* reason) __attribute__((weak));
+#define TXR_ADDR_VIOL_REASON "malformed addr/addrv2 payload or count above MAX_ADDR_TO_SEND"
 /* weak default: targets that link tx_relay.c without daemon/addr_ingest.c
  * (a strong definition anywhere in the link wins) */
 __attribute__((weak)) long addr_ingest_msg_n(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit){
     (void)ab; (void)cmd; (void)pl; (void)plen; (void)limit; return 0;
+}
+__attribute__((weak)) long addr_ingest_msg_v(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit, int* viol){
+    (void)ab; (void)cmd; (void)pl; (void)plen; (void)limit; if (viol) *viol = 0; return 0;
 }
 #define TXR_ADDR_BUCKET_MAX   1000.0     /* Core MAX_ADDR_PROCESSING_TOKEN_BUCKET */
 #define TXR_ADDR_RATE_PER_S   0.1        /* Core MAX_ADDR_RATE_PER_SECOND */
@@ -593,7 +604,11 @@ static long txr_addr_declared(const char* cmd, const u8* pl, unsigned plen){
 }
 static long txr_addr_ingest(int fd, const char* cmd, const u8* pl, unsigned plen){
     long n = txr_addr_declared(cmd, pl, plen);
-    if (n <= 0 || n > 1000) return 0;                /* Core: > MAX_ADDR_TO_SEND misbehaves */
+    if (n < 0 || n > 1000){                          /* malformed, or Core: > MAX_ADDR_TO_SEND misbehaves */
+        if (txr_report_violation_fd) txr_report_violation_fd(fd, TXR_ADDR_VIOL_REASON);
+        return 0;
+    }
+    if (n == 0) return 0;
     /* per-leg token bucket, keyed by fd (a leg's fd is stable for its life) */
     long long now = txr_now_ms();
     int slot = -1, free_slot = -1;
@@ -616,7 +631,9 @@ static long txr_addr_ingest(int fd, const char* cmd, const u8* pl, unsigned plen
     if (budget > n) budget = n;
     else txr_addr_gossip_limited += n - budget;         /* the tail Core would drop too */
     *tk -= (double)budget;
-    long added = addr_ingest_msg_n(NULL, cmd, pl, (long)plen, budget);
+    int viol = 0;
+    long added = addr_ingest_msg_v(NULL, cmd, pl, (long)plen, budget, &viol);
+    if (viol && txr_report_violation_fd) txr_report_violation_fd(fd, TXR_ADDR_VIOL_REASON);
     txr_addr_gossip_msgs++;
     if (added > 0) txr_addr_gossip_added += added;
     return added;

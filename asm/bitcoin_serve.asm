@@ -94,6 +94,12 @@ global g_serve_policy_log
 g_serve_policy_log: dq 0          ; void (*)(const char* reason)
 viol_oversize: db "oversized message announcement", 0
 viol_invsz:    db "inv/getdata vector above MAX_INV_SZ", 0
+; audit 2026-09-02 N3: the parse-failure classes. A payload that cannot even
+; be parsed is a protocol violation (Core: deserialization failure ->
+; Misbehaving), unlike a well-formed tx we reject by policy or a block that
+; fails consensus, which are NOT scored here -- see .do_block.
+viol_txparse:  db "malformed tx payload (parse failure)", 0
+viol_blkshort: db "malformed block payload (shorter than a header)", 0
 
 pl_buf:    times (8<<20) db 0     ; receive buffer
 sb_buf:    times (8<<20) db 0     ; single block buffer
@@ -639,7 +645,7 @@ node_serve_loop:
 .tx_gate_ok:
     mov  rax, [s_plen]
     cmp  rax, 10            ; version(4)+1in+1out+locktime(4) min
-    jb   .next
+    jb   .viol_tx_malformed  ; N3: too short to be a tx -> score, then drop
     ; tx_txid(s_txid, pl_buf, s_plen, hp_buf, cap)
     lea  rdi, [s_txid]
     lea  rsi, [pl_buf]
@@ -648,7 +654,7 @@ node_serve_loop:
     mov  r8, (2000*81+8)
     call tx_txid
     test rax, rax
-    jz   .next
+    jz   .viol_tx_malformed  ; N3: does not parse -> score, then drop
     ; tx_accept_validate(mp_cur, s_txid, pl_buf, s_plen) -- full mempool
     ; policy (fee/RBF/ancestor-descendant limits) + whole-tx signature
     ; validation before storing for relay, replacing the previous
@@ -671,7 +677,7 @@ node_serve_loop:
     ; Guard 1: minimum block = 80-byte header + count byte.
     mov  rax, [s_plen]
     cmp  rax, 81
-    jb   .next
+    jb   .viol_block_short   ; N3: shorter than a header -> score, then drop
     ; Guard 2: consensus validation. cons_verify(pl_buf, s_plen, scratch, cap)
     ; uses a 1MB reconstruction scratch below rbp internally; pass hp_buf
     ; (idle here) as the scratch source. Returns 1 = valid.
@@ -694,7 +700,13 @@ node_serve_loop:
     mov  r13, [s_lfd]
     mov  r14, [s_st]
     test rax, rax
-    jz   .next                ; invalid block -> ignore
+    jz   .next                ; invalid block -> ignore. DELIBERATELY not scored
+                              ; (audit N3): cons_verify returns one bit, and a
+                              ; false-reject in OUR verifier would then ban every
+                              ; honest peer relaying a valid block -- a self-
+                              ; partition. Core scores consensus-invalid blocks
+                              ; because its verifier is the reference; ours is
+                              ; not (audit N1/N2). Parse failures are scored.
     ; Guard 3: re-derive the block hash from its 80-byte header and require it
     ; to be unknown (not already in the hash index). If we already have it,
     ; this is a duplicate relay -- skip, no re-store.
@@ -1592,6 +1604,27 @@ node_serve_loop:
     test rax, rax
     je   .next
     lea  rdi, [viol_invsz]
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16
+    call rax
+    mov  rsp, rbp
+    pop  rbp
+    jmp  .next
+
+; Shared tail for the parse-failure classes (audit 2026-09-02 N3). rdi = reason.
+; The hook is a C callee: it preserves r12-r15 (the loop's live registers), and
+; the loop continues at .next exactly as the silent drop did before.
+.viol_tx_malformed:
+    lea  rdi, [viol_txparse]
+    jmp  .viol_report_next
+.viol_block_short:
+    lea  rdi, [viol_blkshort]
+    jmp  .viol_report_next
+.viol_report_next:
+    mov  rax, [g_serve_violation_hook]
+    test rax, rax
+    je   .next
     push rbp
     mov  rbp, rsp
     and  rsp, -16
