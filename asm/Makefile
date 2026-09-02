@@ -1388,6 +1388,16 @@ tests/test_utxo_setinfo: tests/test_utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJ
 daemon/utxo_setinfo: daemon/utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS)
 	$(CC) $(CFLAGS) -o $@ daemon/utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS)
 
+# utxo_dump_keys / utxo_repair_del -- incident 2026-09-01 tools. The dumper is a
+# read-only walk of a datadir's UTXO set ("txid vout value height spendable" per
+# line, usable against a running node between writes); the repair tool deletes a
+# listed set of outpoints offline (daemon stopped) after verifying every one is
+# present. Not gated: both act on a real datadir.
+daemon/utxo_dump_keys: daemon/utxo_dump_keys.c $(UTXOLSMOBJS)
+	$(CC) $(CFLAGS) -o $@ daemon/utxo_dump_keys.c $(UTXOLSMOBJS) -lpthread
+daemon/utxo_repair_del: daemon/utxo_repair_del.c $(UTXOLSMOBJS)
+	$(CC) $(CFLAGS) -o $@ daemon/utxo_repair_del.c $(UTXOLSMOBJS) -lpthread
+
 # Regression test for the 2026-08-20 compaction manifest-ordering bug (see
 # tests/test_compact_manifest_order.c's own header) -- needs manifest_n to
 # exceed COMPACT_MAX_RUNS(64) before compacting, which no other test does.
