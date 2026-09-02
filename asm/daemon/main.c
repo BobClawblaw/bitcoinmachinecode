@@ -161,6 +161,12 @@ extern int  utxo_live_init(const char* dir);           /* daemon/utxo_live.c */
 extern long utxo_live_catchup(void* store_buf);        /* daemon/utxo_live.c */
 extern void utxo_live_set_shutdown_flag(const volatile sig_atomic_t* flag); /* daemon/utxo_live.c */
 extern long utxo_live_count(void);                      /* daemon/utxo_live.c */
+extern long utxo_live_recovery_applicable(void);         /* daemon/utxo_live.c: incident 2026-09-01 */
+extern long utxo_live_verify_after_recovery(long count_before);
+extern long utxo_live_halted(void);
+extern long utxo_live_last_fail_kind(void);
+extern const char* utxo_live_fail_kind_name(long k);
+extern const char* utxo_live_last_reject(void);
 /* Clamp the DISPLAYED live-UTXO count at 0. Backstop only: the count itself
  * is now kept accurate across restarts by the manifest persist/restore in
  * bitcoin_utxo_lsm.asm (this replaced the WAL-tail-only reload seed that let
@@ -218,7 +224,7 @@ extern int  net_feeler_probe(const char* ip_str);                             /*
 extern unsigned net_netgroup_v4(unsigned ip);                                 /* daemon/net_policy.c */
 extern long p2p_addr_count(const void* pl, long plen);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
-extern long store_get_tip(void* st);
+extern long store_get_tip(void* st, long out_meta[3]);   /* -> 1 ok / -1 empty; a one-arg call SEGVs (2026-09-01 r boot) */
 extern int  store_get_tip_hash(void* st, unsigned char out[32]);   /* bitcoin_store.asm */
 /* ZMQ notifications: publisher (daemon/zmq_pub.c) + the cross-process
  * staging ring (daemon/zmq_notify.c). The publisher owns sockets and so runs
@@ -233,6 +239,9 @@ extern void axt_boot(void* store_buf);                                        /*
 extern void axt_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern int  axt_active(void);
 extern int  txit_active(void);
+extern void tsp_boot(void* store_buf);                                        /* daemon/txosp_tail.c */
+extern int  tsp_active(void);
+extern void tsp_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern void txit_on_block(void* store_buf, long h, const unsigned char* blk, long blen);
 extern void bfi_on_block(void* store_buf, long h, const unsigned char* blk, unsigned long blen);  /* daemon/bfilter_index.c */
 typedef int (*bfi_undo_cb_t)(void*, const unsigned char*, unsigned int, unsigned long long,
@@ -395,6 +404,7 @@ static void rebuild_hash_index_after_reorg(void){
      * already-indexed (fires with tip == fork height on the mid-reorg
      * invocation; the post-reconnect invocation is a no-op) */
     { extern void txit_on_truncate(void*); txit_on_truncate(store_buf); }
+    { extern void tsp_on_truncate(void*); tsp_on_truncate(store_buf); }
     { extern void axt_on_truncate(void*); axt_on_truncate(store_buf); }
     { extern void bfi_on_truncate(long); bfi_on_truncate(*(int*)(store_buf+24)); }
 }
@@ -875,6 +885,75 @@ static int serve_loop(int fd, int lfd){
 #define MAX_BLOCK_RELAY_ONLY       8         /* ceiling; g_cfg picks the live count */
 #define CFG_INBOUND_LIMIT() \
     (g_cfg.max_connections - g_cfg.max_outbound - g_cfg.max_block_relay_only - g_cfg.max_feeler)
+
+/* -shrinkdebugfile (2026-09-01): Core truncates a debug.log over 10 MB to
+ * its last 200 KB at start-up. This node's own leveled log is g_logpath;
+ * the stderr stream systemd appends is that unit's file, not ours. */
+static void log_shrink(const char* path){
+    struct stat sb;
+    if (!path || !*path || !strcmp(path, "/dev/null") || stat(path, &sb) != 0 || !S_ISREG(sb.st_mode)) return;
+    if (sb.st_size <= 10L * 1000 * 1000) return;
+    FILE* f = fopen(path, "rb"); if (!f) return;
+    static char tail[200000];
+    fseek(f, -(long)sizeof tail, SEEK_END);
+    size_t n = fread(tail, 1, sizeof tail, f); fclose(f);
+    f = fopen(path, "wb"); if (!f) return;
+    fwrite(tail, 1, n, f); fclose(f);
+    fprintf(stderr, "[boot] shrinkdebugfile: %s was %ld bytes -- kept the last %zu\n", path, (long)sb.st_size, n);
+}
+/* -walletnotify (2026-09-01): run the command with %s = txid for every
+ * transaction that concerns the wallet -- on mempool acceptance (txsub and
+ * the relay legs) and again when it confirms (walletnotify_block). */
+static long wn_varint(const unsigned char* p, long n, unsigned long long* v){
+    if (n < 1) return 0;
+    if (p[0] < 0xfd){ *v = p[0]; return 1; }
+    if (p[0] == 0xfd){ if (n < 3) return 0; *v = p[1] | (p[2] << 8); return 3; }
+    if (p[0] == 0xfe){ if (n < 5) return 0; *v = p[1] | (p[2]<<8) | ((unsigned long long)p[3]<<16) | ((unsigned long long)p[4]<<24); return 5; }
+    if (n < 9) return 0; *v = 0; for (int i = 0; i < 8; i++) *v |= (unsigned long long)p[1+i] << (8*i); return 9;
+}
+/* serialized length of the tx at p (segwit-aware); 0 if malformed */
+static long wn_tx_len(const unsigned char* p, long n){
+    long q = 4; unsigned long long v; long k; int segwit = 0;
+    if (q + 2 <= n && p[q] == 0x00 && p[q+1] == 0x01){ segwit = 1; q += 2; }
+    if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k; unsigned long long nin = v;
+    for (unsigned long long i = 0; i < nin; i++){
+        q += 36; if (q > n) return 0;
+        if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k + (long)v + 4; if (q > n) return 0;
+    }
+    if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k; unsigned long long nout = v;
+    for (unsigned long long i = 0; i < nout; i++){
+        q += 8; if (q > n) return 0;
+        if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k + (long)v; if (q > n) return 0;
+    }
+    if (segwit) for (unsigned long long i = 0; i < nin; i++){
+        if (!(k = wn_varint(p + q, n - q, &v))) return 0; q += k;
+        for (unsigned long long j = 0; j < v; j++){ unsigned long long l;
+            if (!(k = wn_varint(p + q, n - q, &l))) return 0; q += k + (long)l; if (q > n) return 0; }
+    }
+    q += 4;
+    return q <= n ? q : 0;
+}
+static void walletnotify_tx(const unsigned char* tx, long len){
+    if (!g_cfg.walletnotify[0] || !g_rpc_wallet.seed || len < 10) return;
+    if (!rpc_wops_tx_touches_wallet(&g_rpc_wallet, tx, (unsigned long)len)) return;
+    extern int tx_txid(unsigned char* out, const unsigned char* tx, unsigned long txlen, unsigned char* scratch, unsigned long scratchcap);
+    unsigned char id[32]; unsigned char* scratch = malloc((size_t)len + 64); if (!scratch) return;
+    tx_txid(id, tx, (unsigned long)len, scratch, (unsigned long)len + 64); free(scratch);
+    char hx[65]; for (int b = 0; b < 32; b++) snprintf(hx + b*2, 3, "%02x", id[31-b]);
+    notify_run(g_cfg.walletnotify, hx, "walletnotify");
+}
+static void walletnotify_block(const unsigned char* blk, long blen){
+    if (blen < 81) return;
+    unsigned long long ntx; long p = 80, k = wn_varint(blk + p, blen - p, &ntx);
+    if (!k) return; p += k;
+    for (unsigned long long i = 0; i < ntx && p < blen; i++){
+        long tl = wn_tx_len(blk + p, blen - p);
+        if (tl <= 0) return;
+        walletnotify_tx(blk + p, tl);
+        p += tl;
+    }
+}
+static void txr_walletnotify_hook(const unsigned char* txid, const unsigned char* tx, unsigned long len){ (void)txid; walletnotify_tx(tx, (long)len); }
 /* BIP324 v2 transport. Off means the node behaves exactly as it did before
  * this existed: p2p_read/p2p_write never register an fd, so their dispatch
  * falls straight through to v1. */
@@ -1064,6 +1143,105 @@ static void mis_lock_release(node_status_t* st){ __sync_lock_release(&st->mis_lo
  * tracked, and that remains a gap worth closing separately. */
 static char g_cur_peer_ip[64];
 extern void (*g_serve_violation_hook)(const char*);
+#include "relay_policy.h"
+#include "../bmc_thread.h"   /* 2026-09-01: the mempool-reload and i2p-accept threads ran on glibc-default stacks; with ~12 MB of static TLS that is a few KB of real stack, and the one-write logging buffer (8 KB) overflowed it the moment a reused datadir had a mempool.dat to reload (fault addr == rsp in log_vfprintf_at, reproduced by validation/relay_policy_core_diff.sh run B twice) */
+extern unsigned g_conn_perms;                     /* whitebind permissions of this child (defined below) */
+/* ---- relay policy per inbound connection (2026-09-01; daemon/relay_policy.c)
+ * The serve child sets these once the peer's version is in hand (the asm
+ * handshake calls g_accept_version_hook between capturing the peer's
+ * version and building ours), and the serve loop's C gates read them. */
+extern void (*g_accept_version_hook)(void);      /* bitcoind.asm node_accept_handshake */
+extern unsigned char node_relay_flag;            /* bitcoind.asm: fRelay byte of OUR version */
+extern unsigned char g_serve_send_feefilter;     /* bitcoin_serve.asm: send `feefilter` at connect */
+static unsigned g_conn_perms_all;                /* whitelist | whitebind, this connection */
+static int      g_peer_relays_txs = 1;           /* the peer's version fRelay */
+static int      g_inbound_slot = -1;             /* our entry in the shared peer table */
+/* inbound peers that negotiated tx relay in both directions (the share Core
+ * counts: m_relays_txs on inbound peers), read from the shared table */
+static long inbound_relaying_now(void){
+    if(!g_node_status) return 0;
+    long n = 0;
+    for(int i = MUX_MAX_OUT; i < RPC_MAX_PEERS; i++){
+        const rpc_peer_t* q = &g_node_status->peers[i];
+        if(!q->used || !q->inbound || !q->relaytxes) continue;
+        if(q->pid > 0 && kill((pid_t)q->pid, 0) != 0 && errno == ESRCH) continue;
+        n++;
+    }
+    return n;
+}
+static void serve_on_peer_version(void){
+    unsigned perms = netperm_for(g_cur_peer_ip) | g_conn_perms;
+    g_conn_perms_all = perms;
+    int fr = rp_version_frelay(g_peer_version_payload, g_peer_version_len);
+    g_peer_relays_txs = fr != 0;
+    int exhausted = rp_inbound_share_exhausted(inbound_relaying_now(), CFG_INBOUND_LIMIT(), g_cfg.inboundrelaypercent);
+    node_relay_flag = (unsigned char)rp_our_frelay(perms, RP_CONN_INBOUND, exhausted);
+    g_serve_send_feefilter = (unsigned char)rp_send_feefilter(perms);
+}
+/* the serve loop's gates (bitcoin_serve.asm calls these): 0 go on, 1 drop
+ * the message quietly, -1 protocol violation (the loop disconnects) */
+int serve_tx_gate(void){
+    if(rp_reject_incoming_txs(g_conn_perms_all, RP_CONN_INBOUND)) return -1;   /* Core: "transaction sent in violation of protocol" */
+    if(!node_relay_flag) return 1;                                              /* we asked for no relay (inbound share): not relaying */
+    return 0;
+}
+int serve_inv_gate(const unsigned char* pl, long plen){
+    extern int serve_inv_bounds(const unsigned char*, long, unsigned long long*, long*);
+    unsigned long long n = 0; long off = 0;
+    if(serve_inv_bounds(pl, plen, &n, &off) != 1) return 0;
+    for(unsigned long long i = 0; i < n; i++){
+        const unsigned char* e = pl + off + i*36;
+        unsigned t = (unsigned)e[0] | ((unsigned)e[1]<<8) | ((unsigned)e[2]<<16) | ((unsigned)e[3]<<24);
+        if(t == 1 || t == 5 || t == 0x40000001u){                                /* MSG_TX / MSG_WTX / MSG_WITNESS_TX */
+            if(rp_reject_incoming_txs(g_conn_perms_all, RP_CONN_INBOUND)) return -1;
+            return 0;
+        }
+    }
+    return 0;
+}
+/* `mempool` (BIP35): Core answers only with NODE_BLOOM (never advertised
+ * here) or the `mempool` permission, and disconnects anyone else unless
+ * noban. The reply is one inv(MSG_TX) per pool entry, MAX_INV_SZ per message. */
+int serve_mempool_msg(int fd, void* mp){
+    if(!(g_conn_perms_all & NP_MEMPOOL)) return (g_conn_perms_all & NP_NOBAN) ? 1 : -1;
+    if(!mp) return 1;
+    unsigned char* m = (unsigned char*)mp;
+    unsigned long long mask; memcpy(&mask, m+8, 8);
+    static unsigned char inv[3 + 50000*36]; unsigned n = 0; long sent = 0;
+    for(unsigned long long i = 0; i <= mask; i++){
+        unsigned char* sl = m + 40 + i*48;
+        unsigned long long len; memcpy(&len, sl, 8);
+        if(len == 0xFFFFFFFFFFFFFFFFULL) continue;
+        unsigned char* e = inv + 3 + n*36; e[0]=1; e[1]=0; e[2]=0; e[3]=0; memcpy(e+4, sl+8, 32); n++;
+        if(n == 50000){ inv[0]=0xfd; inv[1]=(unsigned char)n; inv[2]=(unsigned char)(n>>8); p2p_write(fd, "inv", 3, inv, 3 + n*36); sent += n; n = 0; }
+    }
+    if(n){ if(n < 0xfd){ inv[2]=(unsigned char)n; p2p_write(fd, "inv", 3, inv+2, 1 + n*36); }
+           else { inv[0]=0xfd; inv[1]=(unsigned char)n; inv[2]=(unsigned char)(n>>8); p2p_write(fd, "inv", 3, inv, 3 + n*36); } sent += n; }
+    fprintf(stderr,"[serve] mempool request from %s (mempool permission): %ld inv entries\n", g_cur_peer_ip, sent);
+    return 1;
+}
+/* a relay-policy violation: Core disconnects without scoring (fDisconnect) */
+void serve_policy_disconnect_log(const char* reason){
+    fprintf(stderr,"[serve] %s: %s -- disconnecting\n", g_cur_peer_ip[0] ? g_cur_peer_ip : "peer", reason ? reason : "protocol violation");
+}
+/* claim a shared peer-table slot for this inbound child (64..127; a dead
+ * child's slot is reused) and publish what getpeerinfo shows */
+static void rpc_fill_peer_slot(int slot, const char* host);
+static int inbound_slot_claim(const char* peerdesc){
+    if(!g_node_status) return -1;
+    for(int i = RPC_MAX_PEERS - 1; i >= MUX_MAX_OUT; i--){
+        rpc_peer_t* q = &g_node_status->peers[i];
+        if(q->used && q->inbound && q->pid > 0 && kill((pid_t)q->pid, 0) != 0 && errno == ESRCH)
+            __sync_bool_compare_and_swap(&q->used, 1, 0);
+        if(q->used) continue;
+        if(!__sync_bool_compare_and_swap(&q->used, 0, 1)) continue;
+        rpc_fill_peer_slot(i, peerdesc);
+        q->inbound = 1; q->pid = (int)getpid(); q->perms = g_conn_perms_all;
+        q->relaytxes = node_relay_flag && g_peer_relays_txs;
+        return i;
+    }
+    return -1;
+}
 /* Declared, because it is DEFINED below this call. Without it C assumes
  * `int peer_misbehaving()` with unspecified arguments -- which happens to work
  * for these types under the SysV ABI, which is exactly why the warning had
@@ -1837,6 +2015,8 @@ static void rpc_fill_peer_slot(int slot, const char* host){
             unsigned height; memcpy(&height, p+off, 4); pr->start_height = (int)height;
         }
     }
+    { extern int rp_version_frelay(const unsigned char*, long);
+      pr->relaytxes = rp_version_frelay(p, len) != 0; }   /* Core relaytxes: the peer's fRelay */
     pr->used = 1;   /* publish last: readers see a fully-formed slot */
 }
 
@@ -1981,6 +2161,25 @@ static int leg_is_anon_net(int net){ return net == BMC_NET_TORV3 || net == BMC_N
 static int dh_inflight_net(int net){ for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0 && g_dh[i].net == net) return 1; return 0; }
 static int dh_inflight_count(void){ int n = 0; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0) n++; return n; }
 static long long dh_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
+/* The next candidate of `net` for a reserved-slot dial: a rotating cursor
+ * per network, so a failed background dial is followed by the NEXT address
+ * rather than the same one every pass (deploy l on 2026-09-01 re-dialled
+ * one dead onion every 5 s for the whole watch). Hosts a live leg already
+ * holds and banned IPs are skipped. Returns the pool index, or -1. */
+static int g_dh_cursor[2];
+static int dh_reserved_pick(int an, int net, const char* srcpool[], int nsrc){
+    if(nsrc <= 0 || an < 0 || an > 1) return -1;
+    for(int step = 0; step < nsrc; step++){
+        int ci = (g_dh_cursor[an] + step) % nsrc;
+        if(leg_net_of(srcpool[ci]) != net) continue;
+        int already = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], srcpool[ci])){ already = 1; break; }
+        if(already) continue;
+        { char ip[128]; ctl_ip_only(srcpool[ci], ip, sizeof ip); if(ctl_is_banned(ip)) continue; }
+        g_dh_cursor[an] = (ci + 1) % nsrc;
+        return ci;
+    }
+    return -1;
+}
 static int dh_start(const char* host, int out_port){
     int slot = -1; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid <= 0){ slot = i; break; }
     if(slot < 0) return 0;
@@ -2585,6 +2784,134 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
     return *start_h <= true_end;
 }
 
+/* Does the header at position `have` (the first one a peer just appended)
+ * extend the header we asked from (`loc`, our previous tip)? A getheaders
+ * answer that starts anywhere else is not a continuation of our chain. */
+#define DLC_HDR_SANE_MAX 100000L
+static int __attribute__((unused)) dlc_headers_sane(long have0, long added){ return have0 <= 0 || added <= DLC_HDR_SANE_MAX; }
+static int __attribute__((unused)) dlc_headers_connect_ok(unsigned char* hst, long have, const unsigned char loc[32]){
+    unsigned char rec[112];
+    if(have <= 0) return 1;                                   /* fresh store: nothing to connect to */
+    if(hst_get_at(hst, (unsigned long long)have, rec) != 1) return 0;
+    return memcmp(rec + 4, loc, 32) == 0;                     /* header[4..36) = hashPrevBlock */
+}
+/* drop everything appended past `have`: headers.dat is the store's backing
+ * file (112-byte records), so truncate it and reload */
+static void dlc_headers_rollback(unsigned char* hst, long have){
+    if(truncate("headers.dat", (off_t)have * 112) != 0)
+        fprintf(stderr,"[dlc] could not roll headers.dat back to %ld record(s): %s\n", have, strerror(errno));
+    hst_init(hst);
+    hst_reload(hst);
+}
+
+/* ---- boot header fetch, in C (incident 2026-09-01) --------------------------
+ * The asm node_ibd_headers took a single-hash locator, appended every page
+ * a peer sent without checking that the first one continued the block it
+ * asked from, and its return value did not report what it appended (5033
+ * for a 961,640-header reply; 0 for the next). Two peers in a row answered
+ * from GENESIS on the 12:23 boot -- a peer a block behind does not know our
+ * newest hash, and a one-hash locator gives it nothing else to match. This
+ * fetch does what Core does: an exponential locator (the last 10 headers,
+ * then doubling steps back to genesis), one page at a time, and every page
+ * is checked before it is stored:
+ *   - the page's first header must extend a header WE HOLD (our tip, or an
+ *     earlier locator point -- a peer behind us answers from the last block
+ *     it knows);
+ *   - headers that overlap what we hold must be IDENTICAL (a peer on a fork
+ *     is refused, not merged);
+ *   - every header links to the previous one and carries no transactions;
+ *   - no more than DLC_HDR_SANE_MAX are accepted from one peer (a node a year
+ *     offline is ~52k behind; the incident's reply was 966,669).
+ * Appends go through hst_append; on any refusal the store is rolled back to
+ * where this fetch started. Returns headers appended, or -1. */
+#define DLC_HDR_PAGE 2000
+#define DLC_HDR_LOCATOR_MAX 40
+static int dlc_locator_build(unsigned char* hst, unsigned char* loc_out /* MAX*32 */, long* heights /* MAX */){
+    long have = hst_count(hst); int n = 0;
+    if(have <= 0) return 0;
+    long h = have - 1, step = 1;
+    while(h >= 0 && n < DLC_HDR_LOCATOR_MAX){
+        unsigned char rec[112];
+        if(hst_get_at(hst, (unsigned long long)h, rec) != 1) break;
+        memcpy(loc_out + n * 32, rec + 80, 32); heights[n] = h; n++;
+        if(n >= 10) step *= 2;
+        if(h == 0) break;
+        h -= step; if(h < 0) h = 0;
+    }
+    return n;
+}
+static unsigned long dlc_varint(const unsigned char* p, unsigned long avail, unsigned long* used){
+    if(avail < 1){ *used = 0; return 0; }
+    if(p[0] < 0xfd){ *used = 1; return p[0]; }
+    if(p[0] == 0xfd){ if(avail < 3){ *used = 0; return 0; } *used = 3; return (unsigned long)p[1] | ((unsigned long)p[2] << 8); }
+    *used = 0; return 0;                       /* a headers count never needs more */
+}
+static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
+    long have0 = hst_count(hst), added = 0;
+    static unsigned char page[DLC_HDR_PAGE * 81 + 16];
+    static unsigned char msg[2 << 20];
+    unsigned char stop[32]; memset(stop, 0, 32);
+    for(int round = 0; round < 1000; round++){
+        unsigned char loc[DLC_HDR_LOCATOR_MAX * 32]; long lh[DLC_HDR_LOCATOR_MAX];
+        int nl = dlc_locator_build(hst, loc, lh);
+        if(nl <= 0) return -1;
+        long plen = p2p_getheaders(page, loc, nl, stop);
+        if(plen <= 0 || p2p_write(fd, "getheaders", 10, page, (unsigned)plen) < 0) return -1;
+        /* the reply: skip anything else the peer says first (inv, ping, ...) */
+        unsigned mlen = 0; char cmd[12]; int got = 0;
+        for(int k = 0; k < 40 && !got; k++){
+            int r = p2p_read(fd, cmd, msg, sizeof msg, &mlen);
+            if(r <= 0) break;
+            if(!strncmp(cmd, "headers", 12)) got = 1;
+            else if(!strncmp(cmd, "ping", 12) && mlen == 8) p2p_write(fd, "pong", 4, msg, 8);
+        }
+        if(!got){ if(added) break; return -1; }
+        unsigned long used; unsigned long cnt = dlc_varint(msg, mlen, &used);
+        if(!used || cnt > DLC_HDR_PAGE || used + cnt * 81 > mlen) break;   /* malformed: stop here */
+        if(cnt == 0) break;
+        /* where does this page attach? the first header's prev must be one of
+         * the hashes we asked with */
+        const unsigned char* first = msg + used;
+        int at = -1; for(int q = 0; q < nl; q++) if(!memcmp(first + 4, loc + q * 32, 32)){ at = q; break; }
+        if(at < 0){
+            fprintf(stderr,"[dlc] headers from %s do not connect to any header we hold (%lu offered) -- discarding\\n", cand, cnt);
+            dlc_headers_rollback(hst, have0); return -1;
+        }
+        long pos = lh[at] + 1;                    /* the height this page's first header would have */
+        long have = hst_count(hst);
+        unsigned char prev[32]; memcpy(prev, loc + at * 32, 32);
+        unsigned long i = 0;
+        for(; i < cnt; i++){
+            const unsigned char* h = first + i * 81;
+            if(h[80] != 0) break;                 /* txn_count must be 0 in a headers message */
+            if(memcmp(h + 4, prev, 32) != 0){
+                fprintf(stderr,"[dlc] headers from %s break their own chain at %lu -- discarding\\n", cand, i);
+                dlc_headers_rollback(hst, have0); return -1;
+            }
+            unsigned char bh[32]; block_hash(bh, h);
+            if(pos + (long)i < have){
+                /* overlap with what we hold: must be the same block */
+                unsigned char rec[112];
+                if(hst_get_at(hst, (unsigned long long)(pos + (long)i), rec) != 1 || memcmp(rec + 80, bh, 32) != 0){
+                    fprintf(stderr,"[dlc] headers from %s fork from our chain at height %ld -- discarding\\n", cand, pos + (long)i);
+                    dlc_headers_rollback(hst, have0); return -1;
+                }
+            } else {
+                if(added + 1 > DLC_HDR_SANE_MAX){
+                    fprintf(stderr,"[dlc] %s offered more than %ld header(s) beyond %ld -- far beyond any plausible gap; discarding\\n", cand, DLC_HDR_SANE_MAX, have0);
+                    dlc_headers_rollback(hst, have0); return -1;
+                }
+                if(hst_append(hst, h, bh) < 0){ dlc_headers_rollback(hst, have0); return -1; }
+                added++;
+            }
+            memcpy(prev, bh, 32);
+        }
+        if(i < cnt) break;                        /* a non-empty txn_count: stop taking this peer's pages */
+        if(cnt < DLC_HDR_PAGE) break;             /* a short page is the peer's tip */
+    }
+    return added;
+}
+
 /* extend headers.dat as far as a discovered peer will serve, resuming from
  * whatever's already on disk (a real locator from the last stored hash) so
  * repeat boots only pull the delta instead of refetching from genesis every
@@ -2627,7 +2954,8 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
     bmc_v2_close(fd);      /* v1-only path; see the note at the other one */
     if(node_handshake(fd)!=1){ close(fd); *why = DLC_HT_HANDSHAKE; return -1; }
     if(!peer_has_witness(cand)){ close(fd); *why = DLC_HT_WITNESS; return -1; }
-    long added=node_ibd_headers(fd, hst, loc, hdrbuf, hdrbuf_sz);
+    (void)loc; (void)hdrbuf; (void)hdrbuf_sz;
+    long added = dlc_fetch_headers(fd, hst, cand);
     close(fd);
     if(added<0){ *why = DLC_HT_FETCH; return -1; }
     return added;
@@ -2638,9 +2966,33 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
  * connect-phase timeout, so trying an UNCONFIRMED candidate here would carry
  * the same hang risk documented on dlc_worker; deliberately no fallback to
  * raw pool entries. */
+/* headers.dat is DERIVED from the archive: append the header of every stored
+ * block the mirror lacks, from the blocks themselves. The worker's leg sync
+ * stored blocks without touching the mirror, so every boot used to ask peers
+ * from a stale point (12 blocks stale on 2026-09-01), and a peer that did not
+ * know that block answered from genesis. Stops at the first hole; the peer
+ * sync takes over from there. Returns headers appended. */
+static long dl_header_mirror_topup(unsigned char* store){
+    static unsigned char hst[4096]; hst_init(hst);
+    struct stat hs;
+    if(stat("headers.dat",&hs)==0 && hs.st_size>=112) hst_reload(hst);
+    long have = hst_count(hst); long tip = *(int*)(store + 24); long n = 0;   /* store tip lives at +24 (store_get_tip takes (st, out_meta[3]), not one arg) */
+    if(have <= 0 || tip < 0) return 0;               /* an empty mirror is seeded with genesis by dlc_headers */
+    for(long h = have; h <= tip; h++){
+        static unsigned char hb[4u<<20];   /* store_read_at returns the WHOLE block (a 128-byte stack buffer SEGV-looped the q boot) */
+        if(store_read_at(store, (unsigned long)h, hb, sizeof hb) < 80) break;
+        unsigned char bh[32]; block_hash(bh, hb);
+        if(hst_append(hst, hb, bh) < 0) break;
+        n++;
+    }
+    if(n) fprintf(stderr,"[dl] header mirror +%ld from the archive (now %ld, archive tip %ld)\n", n, hst_count(hst), tip);
+    return n;
+}
+
 static long dlc_headers(char live[][64], int nlive){
     static unsigned char hst[4096]; hst_init(hst);
     struct stat hs;
+    dl_header_mirror_topup(store_buf);
     if(stat("headers.dat",&hs)==0 && hs.st_size>=112) hst_reload(hst);
     long have = hst_count(hst);
     if(have==0){
@@ -3198,6 +3550,16 @@ static long dl_catchup(const char* dir, int min_workers){
     int alive=nw;
     while(alive>0){
         struct timespec ts={10,0}; nanosleep(&ts,NULL);
+        if(g_shutdown_requested){
+            /* incident 2026-09-01: this loop ignored SIGTERM and the stop hung
+             * until a SIGKILL. Workers inherit the flag-only handler, so they
+             * are told, given a moment, then killed. */
+            fprintf(stderr,"[dlc] shutdown requested -- stopping %d worker(s)\n", alive);
+            for(int w=0;w<nw;w++) if(kids[w]) kill(kids[w], SIGTERM);
+            { struct timespec g={1,0}; nanosleep(&g,NULL); }
+            for(int w=0;w<nw;w++) if(kids[w]){ int stt; if(waitpid(kids[w],&stt,WNOHANG)==0){ kill(kids[w], SIGKILL); waitpid(kids[w],&stt,0); } kids[w]=0; }
+            alive=0; break;
+        }
         alive=0;
         for(int w=0;w<nw;w++){
             if(kids[w]==0) continue;
@@ -3576,6 +3938,7 @@ static int txsub_package(char* msg, unsigned long mcap){
                                         mux_out_fd, mux_n_out, r, sizeof r, &relayed);
         if (rc == 1){
             st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
+            walletnotify_tx(txs[i], (long)lens[i]);
             /* whatever THIS member displaced by RBF, folded into the
              * package-wide union Core reports at the top level. Read
              * immediately: the next member's accept overwrites it. */
@@ -3631,8 +3994,8 @@ static int txsub_package(char* msg, unsigned long mcap){
  * dl_catchup is synchronous and holds the worker for its duration; the legs
  * idle meanwhile and re-dial afterwards through the normal dead-slot path. */
 #define TXSUB_FOLLOW_MS      30       /* worker lingers this long for the next tx submission after acking one */
-#define TXSUB_ROTATION_BUDGET 256    /* submissions serviced per rotation before the main loop runs again */
-#define TXSUB_ROTATION_MS     250    /* ...or this much wall time, whichever comes first */
+#define TXSUB_ROTATION_BUDGET 2048   /* submissions serviced per rotation before the main loop runs again */
+#define TXSUB_ROTATION_MS     1000   /* ...or this much wall time, whichever comes first */
 static long long txsub_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
 #define DL_PARALLEL_GAP      2000L
 #define DL_PARALLEL_REARM_S  600L
@@ -3775,6 +4138,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * After the archive verify -- a repair may have truncated heights the
      * tail would otherwise trust. No base index => logs once and disables. */
     if(archive_ok) txit_boot(store_buf);
+    /* txo-spender index tail (Core -txospenderindex): same shape, same rules */
+    if(archive_ok) tsp_boot(store_buf);
     /* live address index (EXTENSION -- Core has no such index): only when
      * the operator asked with addrindex=1 */
     if(archive_ok && g_cfg.addrindex) axt_boot(store_buf);
@@ -4133,6 +4498,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             g_node_status->n_out = lp; g_node_status->tip_height = *(int*)(store_buf+24);
             long long nows = (long long)time(NULL);
             for(int i=0;i<RPC_MAX_PEERS;i++){
+                if(i >= MUX_MAX_OUT) continue;                      /* inbound children own 64..127 */
                 if(!(i < mux_n_out && mux_out_fd[i] >= 0)){ g_node_status->peers[i].used = 0; continue; }
                 /* per-socket byte + last-activity meters from the kernel: no
                  * asm changes, no double counting -- TCP_INFO is authoritative
@@ -4542,6 +4908,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     (int)g_shutdown_requested, *(int*)(store_buf+24), live_peers,
                     utxo_live_ok?live_utxo_disp():-1L,
                     fmt_uptime(upbuf, (stop_ms-boot_ms)/1000));
+            /* fee_estimates.dat (Core Flush()) -- weak: the dial/sync test
+             * harnesses that link this file do not carry daemon/fee_hooks.c */
+            { extern void fest_shutdown_flush(void); fest_shutdown_flush(); }
             _exit(0);
         }
         long long now_ms = 0;
@@ -4637,6 +5006,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(mux_out_fd[i]>=0 && txsub_worker_ready()){
                 extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
                 long acc = txrelay_poll_leg(mux_out_fd[i], txsub_pool(), 250);
+                if(acc == -2){
+                    /* Core: "transaction sent in violation of protocol" -- we told
+                     * this peer fRelay=0 (-blocksonly) and it relayed anyway */
+                    fprintf(stderr,"[mux:%d] %s sent transactions in -blocksonly: violation, disconnecting\n", i, mux_out_host[i]);
+                    mux_next_peer(i, peers, pool_len, out_port);
+                    mux_out_nextretry[i] = (long long)(clock() * 1000.0 / CLOCKS_PER_SEC) + REDIAL_BACKOFF_MS;
+                    continue;
+                }
                 { extern void txrelay_publish_orphans(void); txrelay_publish_orphans(); }
                 if(acc>0){
                     /* per-leg attribution, ONE line a minute for all legs:
@@ -4790,7 +5167,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(g_cfg.max_feeler > 0 && now_ms >= next_feeler_ms && nsrc > 0){
             next_feeler_ms = now_ms + g_cfg.feeler_interval_ms;
             int pick = (int)((unsigned)rot * 2654435761u % (unsigned)nsrc);
+            unsigned char saved_relay = node_relay_flag; node_relay_flag = 0;   /* Core: feelers get fRelay=0 */
             int alive = net_feeler_probe(srcpool[pick]);
+            node_relay_flag = saved_relay;
             fprintf(stderr,"[net] feeler %s -> %s\n", srcpool[pick], alive?"alive":"dead");
         }
 
@@ -4806,14 +5185,50 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             phase_timer_t utxo_ct_pt; phase_start(&utxo_ct_pt);
             long ar = utxo_live_catchup(store_buf);
             if(ar < 0){
-                fprintf(stderr,"[dl] utxo_live_catchup FAILED at height %ld -- attempting in-place recovery\n",
-                        utxo_live_applied_height());
-                long rounds = utxo_live_recover();
-                ar = utxo_live_catchup(store_buf);
+                /* Incident 2026-09-01: recovery is no longer blind. Compaction
+                 * runs ONLY when utxo_live says the failure is a store error
+                 * with a full manifest; a consensus reject or any other
+                 * failure backs off and retries WITHOUT touching the runs
+                 * (the block is re-applied from the checkpoint; if the
+                 * archive is repaired meanwhile it will pass, otherwise it
+                 * fails the same way and stays DEGRADED -- visibly). After a
+                 * compaction the whole set is walked and must equal the
+                 * pre-recovery count, or UTXO tracking halts for good. */
+                long rounds = -1;
+                if(utxo_live_halted()){
+                    /* a spend found its coin absent right after verification resolved
+                     * it: the store is lying and nothing downstream can be trusted */
+                    utxo_live_ok = 0;
+                    fprintf(stderr,"[dl] UTXO TRACKING HALTED at height %ld: store lookup inconsistency during apply (incident 2026-09-01 class). "
+                                   "Blocks keep flowing without UTXO tracking; operator must drop and rebuild the UTXO state.\n",
+                            utxo_live_applied_height());
+                } else if(utxo_live_recovery_applicable()){
+                    long count_before = utxo_live_count();
+                    fprintf(stderr,"[dl] utxo_live_catchup FAILED at height %ld with a full manifest -- compacting in place (pre-recovery count %ld)\n",
+                            utxo_live_applied_height(), count_before);
+                    rounds = utxo_live_recover();
+                    if(!utxo_live_verify_after_recovery(count_before)){
+                        utxo_live_ok = 0;
+                        fprintf(stderr,"[dl] UTXO TRACKING HALTED at height %ld: the set is inconsistent after recovery. "
+                                       "Blocks keep flowing without UTXO tracking; operator must drop and rebuild the UTXO state.\n",
+                                utxo_live_applied_height());
+                        ar = -1;
+                    } else {
+                        ar = utxo_live_catchup(store_buf);
+                    }
+                } else {
+                    fprintf(stderr,"[dl] utxo_live_catchup FAILED at height %ld: %s%s%s -- recovery refused (not a full manifest); will retry from the checkpoint\n",
+                            utxo_live_applied_height() + 1,
+                            utxo_live_fail_kind_name(utxo_live_last_fail_kind()),
+                            utxo_live_last_fail_kind() == 1 ? ": " : "",
+                            utxo_live_last_fail_kind() == 1 ? utxo_live_last_reject() : "");
+                }
                 if(ar >= 0){
                     utxo_fail_streak = 0;
-                    fprintf(stderr,"[dl] utxo recovery SUCCEEDED (%ld compaction round(s)) -- tracking continues at height %ld\n",
+                    fprintf(stderr,"[dl] utxo recovery SUCCEEDED (%ld compaction round(s), post-recovery walk verified) -- tracking continues at height %ld\n",
                             rounds, utxo_live_applied_height());
+                } else if(!utxo_live_ok){
+                    /* halted: no backoff, no retry -- the heartbeat carries the marker */
                 } else {
                     if(utxo_fail_streak < 30) utxo_fail_streak++;
                     long shift = utxo_fail_streak - 1; if(shift > 6) shift = 6;
@@ -4853,6 +5268,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     fprintf(stderr,"[dl] new block: height=%d (+%d)\n",
                             now_tip, now_tip-last_seen_tip);
                 }
+                dl_header_mirror_topup(store_buf);   /* keep the derived header mirror at the archive tip, whichever path appended */
                 /* ZMQ hashblock/rawblock + the txid-index tail, from this
                  * same choke point for the same reason the log line is: it
                  * fires no matter which path appended the block.
@@ -4877,6 +5293,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                          * (idempotent by height -- a replayed height is a
                          * no-op) */
                         txit_on_block(store_buf, zh, zb, bl);
+                        tsp_on_block(store_buf, zh, zb, bl);
                         /* filter index tail: adopt/append (cheap probe when
                          * the backfill has not closed in yet) */
                         if (g_cfg.blockfilterindex)
@@ -4893,6 +5310,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                 snprintf(hx + _i*2, 3, "%02x", bh[31-_i]);  /* display order */
                             notify_run(g_cfg.blocknotify, hx, "blocknotify");
                         }
+                        /* -walletnotify: one run per transaction in this block
+                         * that spends or pays this wallet (Core fires it on
+                         * confirmation as well as on mempool arrival) */
+                        if (g_cfg.walletnotify[0] && g_rpc_wallet.seed) walletnotify_block(zb, (long)bl);
                         /* mempool reconciliation (Core removeForBlock):
                          * confirmed txs leave pool+policy graph, txs
                          * CONFLICTING with this block's spends leave with
@@ -4904,10 +5325,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                          * mpool_del callback (it also cleans the policy
                          * graph and counts conflicts) -- that callback path
                          * was removed at the 2026-08-27 policy-parity merge. */
-                        { extern long tx_accept_block_connect(void*, const unsigned char*, unsigned long);
+                        { extern long tx_accept_block_connect_h(void*, const unsigned char*, unsigned long, long);
+                          extern void tx_accept_set_tip_time(long, long);
                           extern void* mp_ext_area;
+                          /* fee estimation's "chainstate is current": this block's time */
+                          { unsigned int bt; memcpy(&bt, zb + 68, 4); tx_accept_set_tip_time((long)bt, -1); }
                           if (txsub_worker_ready() && mp_ext_area){
-                              long mr = tx_accept_block_connect(mp_ext_area, zb, (unsigned long)bl);
+                              long mr = tx_accept_block_connect_h(mp_ext_area, zb, (unsigned long)bl, (long)zh);
                               if (mr > 0)
                                   fprintf(stderr,"[mempool] block %d: removed %ld pool tx (confirmed/conflicted)\n", zh, mr);
                           } }
@@ -4951,7 +5375,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     *(int*)(store_buf+24), live_peers, mux_n_out,
                     utxo_live_ok?live_utxo_disp():-1L,
                     fmt_uptime(upbuf, (now_ms-boot_ms)/1000), failbuf,
-                    utxo_fail_streak ? "  [UTXO DEGRADED -- retrying]" : "");
+                    utxo_live_halted() ? "  [UTXO HALTED -- inconsistent after recovery; drop and rebuild]"
+                    : utxo_fail_streak ? "  [UTXO DEGRADED -- retrying]" : "");
             if(g_cfg.maxuploadtarget_mb > 0)
                 fprintf(stderr,"[dl] upload: %lldMB of %ldMB this 24h window\n",
                         upload_bytes_this_window()>>20, g_cfg.maxuploadtarget_mb);
@@ -4993,13 +5418,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             for(int an = 0; an < 2 && dh_inflight_count() < DH_MAX; an++){
                 int net = anon_nets[an];
                 if(!dialer_net_reachable(net) || legs_on_net(net) > 0 || dh_inflight_net(net)) continue;
-                for(int ci = 0; ci < nsrc; ci++){
-                    if(leg_net_of(srcpool[ci]) != net) continue;
-                    int already = 0; for(int k = 0; k < mux_n_out; k++) if(!strcmp(mux_out_host[k], srcpool[ci])){ already = 1; break; }
-                    if(already) continue;
-                    { char ip[128]; ctl_ip_only(srcpool[ci], ip, sizeof ip); if(ctl_is_banned(ip)) continue; }
-                    if(dh_start(srcpool[ci], out_port)) break;
-                }
+                int ci = dh_reserved_pick(an, net, srcpool, nsrc);
+                if(ci >= 0) dh_start(srcpool[ci], out_port);
             }
         }
         if(mux_n_out - legs_anon() < MUX_WANT_OUT() && (rot % 8)==0){
@@ -5121,6 +5541,24 @@ static int provide_wallet_mnemonic(char* out, long cap, char* pass_out, long pca
     return 1;
 }
 
+/* -persistmempool reload on its own thread (see serve_start_rpc). */
+static pthread_t g_mempool_reload_thread;
+static volatile int g_mempool_reload_started;
+static void* mempool_reload_thread(void* arg){
+    (void)arg;
+    extern long rpc_node_mempool_load(const char* path);
+    long acc = rpc_node_mempool_load("mempool.dat");
+    if(acc < 0) fprintf(stderr,"[mempool] mempool.dat present but could not be read -- starting empty\n");
+    return NULL;
+}
+/* Called from the shutdown path before the dump: a reload still running
+ * aborts on the flag within milliseconds (mpd_import_one polls it every
+ * 3 ms and then drains the file without waiting), and the dump must not
+ * race its last submission. */
+static void mempool_reload_join(void){
+    if(g_mempool_reload_started){ pthread_join(g_mempool_reload_thread, NULL); g_mempool_reload_started = 0; }
+}
+
 static void serve_start_rpc(const char* dir, const char* cfgpath){
     static char user[128], pass[256]; int port;
     serve_rpc_read_creds(cfgpath, &port, user, sizeof user, pass, sizeof pass);
@@ -5178,6 +5616,16 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* Core -walletdir: every wallet file lives there (absolute, or relative
      * to the chain directory we are in). Created 0700 if absent; the RPC
      * wallet layer learns it through its setter, never from node_config. */
+    /* wallet policy defaults from the config (2026-09-01) -- independent of walletdir */
+    { rpc_wops_defaults wd;
+      wd.addresstype = rpc_wops_type_from_name(g_cfg.addresstype); if(wd.addresstype < 0) wd.addresstype = WOT_BECH32;
+      wd.changetype  = g_cfg.changetype[0] ? rpc_wops_type_from_name(g_cfg.changetype) : -1;
+      wd.txconfirmtarget = g_cfg.txconfirmtarget; wd.walletrbf = g_cfg.walletrbf; wd.walletbroadcast = g_cfg.walletbroadcast;
+      wd.mintxfee_satkvb = g_cfg.mintxfee_satkvb; wd.fallbackfee_satkvb = g_cfg.fallbackfee_satkvb;
+      wd.discardfee_satkvb = g_cfg.discardfee_satkvb; wd.consolidatefeerate_satkvb = g_cfg.consolidatefeerate_satkvb;
+      wd.maxapsfee_sat = g_cfg.maxapsfee_sat; wd.avoidpartialspends = g_cfg.avoidpartialspends;
+      wd.spendzeroconfchange = g_cfg.spendzeroconfchange;
+      rpc_wops_set_defaults(&wd); }
     if(g_cfg.walletdir[0]){
         struct stat wsb;
         if(stat(g_cfg.walletdir, &wsb) != 0){
@@ -5264,7 +5712,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * mempool_configure, written by the worker + inbound children) so
      * getrawmempool/getmempoolinfo report the real pool. All-null when the
      * static per-process fallback is in play (maxmempool=0). */
-    { extern void* mp_ext_area; extern void* mp_ext_polstate;
+    { extern void* mp_ext_area; extern void* mp_ext_polstate; extern void* mp_ext_feeest;
       extern unsigned long mp_ext_blobcap;
       extern void mp_lock(void); extern void mp_unlock(void);
       extern long mempool_time_of(const unsigned char*);
@@ -5287,7 +5735,9 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
           /* main.c's existing extern types the length as long; the hooks
            * member says unsigned long -- ABI-identical on x86-64 SysV. */
           .sha256d = (void(*)(unsigned char*, const void*, unsigned long))sha256d,
-          .min_fee = mpool_policy_min_fee };
+          .min_fee = mpool_policy_min_fee,
+          .feeest = mp_ext_feeest,
+          .min_relay_satkvb = g_cfg.minrelaytxfee_satkvb > 0 ? (unsigned long long)g_cfg.minrelaytxfee_satkvb : 100ULL };
       rpc_node_set_mempool(&h);
       /* getblocktemplate reads the same pool through rpc_chain */
       rpc_chain_set_mempool(&h, gbt_sigops_legacy4); }
@@ -5322,6 +5772,24 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* the external signer command, when the operator configured one */
     { extern void rpc_signer_set_cmd(const char*);
       rpc_signer_set_cmd(g_cfg.signer[0] ? g_cfg.signer : NULL); }
+    { extern void rpc_chain_set_gbt_policy(long, long, long, int, int);
+      extern void rpc_chain_set_maxtipage(long);
+      rpc_chain_set_gbt_policy(g_cfg.blockmaxweight, g_cfg.blockreservedweight, g_cfg.blockmintxfee_satkvb,
+                               g_cfg.blockversion, g_cfg.printpriority);
+      rpc_chain_set_maxtipage(g_cfg.maxtipage); }
+    { extern void (*txr_on_accept)(const unsigned char*, const unsigned char*, unsigned long);
+      txr_on_accept = g_cfg.walletnotify[0] ? txr_walletnotify_hook : 0; }
+    /* -wallet=<name>: Core loads every named wallet at start-up. This node
+     * serves ONE active wallet, so the first name is loaded and the rest are
+     * named as skipped (loadwallet switches between them at run time). */
+    for(int wi = 0; wi < g_cfg.n_wallet_names; wi++){
+        if(wi > 0){ fprintf(stderr,"[wallet] wallet=%s: not loaded -- this node serves one active wallet at a time (loadwallet switches)\n", g_cfg.wallet_names[wi]); continue; }
+        rj_val* p = rj_arr(); rj_arr_push(p, rj_str(g_cfg.wallet_names[wi]));
+        rj_val* r = NULL; long ec = 0; const char* em = NULL;
+        int ok = rpc_dispatch("loadwallet", p, &g_rpc_wallet, &r, &ec, &em);
+        fprintf(stderr,"[wallet] wallet=%s: %s%s\n", g_cfg.wallet_names[wi], ok == 1 ? "loaded" : "NOT loaded: ", ok == 1 ? "" : (em ? em : "?"));
+        if(r) rj_free(r); rj_free(p);
+    }
     /* getaddednodeinfo reports the operator's addnode= list verbatim. */
     rpc_node_set_addednodes(g_cfg.n_addnode ? (const char (*)[64])g_cfg.addnode : NULL,
                             g_cfg.n_addnode);
@@ -5370,6 +5838,16 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
 
     rpc_server_cfg cfg = {0}; cfg.port = port; cfg.user = user; cfg.pass = pass; cfg.wallet = &g_rpc_wallet;
     cfg.bind_addr = bindaddr; cfg.allows = rpc_acl_allows;
+    cfg.threads = g_cfg.rpcthreads; cfg.workqueue = g_cfg.rpcworkqueue; cfg.timeout_s = g_cfg.rpcservertimeout;
+    rpc_cookie_set_perms(g_cfg.rpccookieperms);
+    rpc_whitelist_clear();
+    for(int wi = 0; wi < g_cfg.n_rpcwhitelist; wi++)
+        if(!rpc_whitelist_add(g_cfg.rpcwhitelist[wi]))
+            fprintf(stderr,"[rpc] rpcwhitelist=%s rejected (expected <user>:<rpc1>,<rpc2>,...)\n", g_cfg.rpcwhitelist[wi]);
+    rpc_whitelist_set_default(g_cfg.rpcwhitelistdefault);
+    if(g_cfg.n_rpcwhitelist)
+        fprintf(stderr,"[rpc] %d rpcwhitelist entr%s; users without one may call %s\n", g_cfg.n_rpcwhitelist,
+                g_cfg.n_rpcwhitelist == 1 ? "y" : "ies", g_cfg.rpcwhitelistdefault == 0 ? "anything" : "nothing (rpcwhitelistdefault)");
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){
         fprintf(stderr, "[rpc] server start failed: %s\n", err);
@@ -5416,8 +5894,20 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     if(CFG_PERSISTMEMPOOL()){
         struct stat mst;
         if(stat("mempool.dat", &mst) == 0){
-            long acc = rpc_node_mempool_load("mempool.dat");
-            if(acc < 0) fprintf(stderr,"[mempool] mempool.dat present but could not be read -- starting empty\n");
+            /* The reload must yield to SIGTERM in THIS process, not only in
+             * the worker: the hook was installed in the worker alone, so the
+             * serve parent ignored systemd's SIGTERM until two 90 s
+             * validation timeouts aborted the import (184 s on 2026-09-01
+             * 08:22; SIGKILLed by the deploy escalation at 08:38, with no
+             * mempool.dat saved). And it runs on a thread: inline, it kept
+             * the serve loop -- inbound accept, the legs, the shutdown
+             * check -- from starting for the 10-20 minutes a ten-thousand-
+             * entry dump takes at the worker's rotation budget. */
+            { extern void rpc_node_set_shutdown_flag(const volatile sig_atomic_t*);
+              rpc_node_set_shutdown_flag(&g_shutdown_requested); }
+            if(bmc_pthread_create(&g_mempool_reload_thread, mempool_reload_thread, NULL) == 0)
+                g_mempool_reload_started = 1;
+            else mempool_reload_thread(NULL);
         } else {
             fprintf(stderr,"[mempool] no mempool.dat to reload (persistmempool=1)\n");
         }
@@ -5505,7 +5995,49 @@ static int tor_onion_listener(int port){
     return lo;
 }
 
-static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l, int l6, int lo){
+/* ---- inbound over I2P ----------------------------------------------------
+ * Core's i2p.cpp: an inbound I2P connection is a SAM "STREAM ACCEPT" on our
+ * session -- a blocking request that completes when a peer connects, at
+ * which point THAT SAM socket carries the peer's bytes. There is no
+ * listening socket to poll, so an acceptor thread sits in STREAM ACCEPT and
+ * hands each completed stream (fd + the caller's .b32.i2p) to the serve loop
+ * over a pipe, which the loop polls beside its listeners. The stream then
+ * takes the same inbound path as a TCP or onion accept: capacity check,
+ * fork, handshake. Its network is i2p by construction (the socket came from
+ * SAM), exactly as an onion inbound is onion by which listener accepted it.
+ * The session itself belongs to the dialer (dialer_init, before the worker
+ * fork), and SAM lets any number of stream sockets reference it. */
+typedef struct { int fd; char b32[80]; } i2p_inbound_t;
+static int g_i2p_pipe[2] = {-1, -1};
+static void* i2p_accept_thread(void* arg){
+    (void)arg;
+    extern int dialer_i2p_accept(char* peer_b32, long cap, int timeout_ms);
+    for(;;){
+        if(g_shutdown_requested) break;
+        char b32[80]; b32[0] = 0;
+        int fd = dialer_i2p_accept(b32, sizeof b32, 600000);   /* no caller in 10 min: re-arm */
+        if(fd < 0){ if(g_shutdown_requested) break; sleep(5); continue; }   /* a SAM hiccup: back off, re-arm */
+        i2p_inbound_t m; m.fd = fd; snprintf(m.b32, sizeof m.b32, "%s", b32);
+        if(write(g_i2p_pipe[1], &m, sizeof m) != (ssize_t)sizeof m) close(fd);
+    }
+    return NULL;
+}
+/* returns the pipe's read end for the serve loop to poll, or -1 when
+ * inbound I2P is off (listen=0, i2pacceptincoming=0, or no SAM session) */
+static int i2p_inbound_start(void){
+    extern int dialer_i2p_ready(void);
+    extern const char* dialer_i2p_b32(void);
+    if(!g_cfg.listen || !g_cfg.i2pacceptincoming || !dialer_i2p_ready()) return -1;
+    if(pipe(g_i2p_pipe) != 0) return -1;
+    pthread_t th;
+    if(bmc_pthread_create(&th, i2p_accept_thread, NULL) != 0){
+        close(g_i2p_pipe[0]); close(g_i2p_pipe[1]); g_i2p_pipe[0] = g_i2p_pipe[1] = -1; return -1; }
+    pthread_detach(th);
+    fprintf(stderr,"[i2p] accepting inbound streams on %s (SAM STREAM ACCEPT)\n", dialer_i2p_b32());
+    return g_i2p_pipe[0];
+}
+
+static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l, int l6, int lo, int li2p){
     /* Prefer the persisted ADDRESS BOOK over whatever pool the caller passed.
      *
      * The sole non-`-connect` caller passes `catchup_seeds` -- the six DNS
@@ -5551,7 +6083,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
      * onion slot and before the legs. The leg offset is DERIVED below, so
      * adding these cannot reintroduce the off-by-one that once made every leg
      * read the previous leg's revents. */
-    struct pollfd pfds[MUX_MAX_OUT+3+NETPERM_MAX_BIND];
+    struct pollfd pfds[MUX_MAX_OUT+4+NETPERM_MAX_BIND];   /* +1: the I2P acceptor pipe */
     for(;;){
         if(g_node_status) g_node_status->n_inbound = (int)g_inbound_n;   /* for the RPC thread */
         int nfds=0;
@@ -5564,6 +6096,9 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
          * tor is unreachable, and poll() ignores a negative fd */
         int onionslot = nfds;
         pfds[nfds].fd=lo;    pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
+        /* the I2P acceptor thread's pipe; -1 when inbound I2P is off */
+        int i2pslot = nfds;
+        pfds[nfds].fd=li2p;  pfds[nfds].events=POLLIN; pfds[nfds].revents=0; nfds++;
         /* -whitebind listeners: peers arriving here carry that entry's
          * permissions, decided by WHICH socket accepted them. */
         int wbslot = nfds;
@@ -5589,6 +6124,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             /* -persistmempool: dump BEFORE the worker is signalled, while the
              * shared pool is still quiescent and nothing is evicting under
              * the writer. */
+            mempool_reload_join();
             if(CFG_PERSISTMEMPOOL()){
                 long w = rpc_node_mempool_save("mempool.dat");
                 if(w >= 0) fprintf(stderr,"[mempool] saved %ld transaction(s) to mempool.dat\n", w);
@@ -5629,10 +6165,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         int ready_v4 = (pfds[0].revents & (POLLIN|POLLHUP|POLLERR)) != 0;
         int ready_v6 = (l6 >= 0 && (pfds[v6slot].revents & (POLLIN|POLLHUP|POLLERR)) != 0);
         int ready_on = (lo >= 0 && (pfds[onionslot].revents & (POLLIN|POLLHUP|POLLERR)) != 0);
+        int ready_i2p = (li2p >= 0 && (pfds[i2pslot].revents & POLLIN) != 0);
         int wb_ready = -1;                       /* index into g_wb_fd, or -1 */
         for(int wi = 0; wi < g_wb_n; wi++)
             if(pfds[wbslot+wi].revents & (POLLIN|POLLHUP|POLLERR)){ wb_ready = wi; break; }
-        if(ready_v4 || ready_v6 || ready_on || wb_ready >= 0){
+        if(ready_v4 || ready_v6 || ready_on || ready_i2p || wb_ready >= 0){
             struct sockaddr_in6 ca6; socklen_t cal6 = sizeof ca6;
             struct sockaddr_in ca; socklen_t cal=sizeof ca;
             int c;
@@ -5649,6 +6186,16 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 snprintf(peerdesc, sizeof peerdesc, "%s:%d", inet_ntoa(ca.sin_addr), ntohs(ca.sin_port));
                 if(c >= 0)
                     fprintf(stderr,"[serve] inbound on whitebind listener from %s (noban)\n", peerdesc);
+            } else if(ready_i2p){
+                /* Handed over by the SAM acceptor thread: the socket is the
+                 * SAM stream itself, past STREAM STATUS RESULT=OK, carrying
+                 * the peer's raw bytes from here on. */
+                i2p_inbound_t m;
+                if(read(li2p, &m, sizeof m) == (ssize_t)sizeof m){
+                    c = m.fd;
+                    snprintf(peerdesc, sizeof peerdesc, "%s:0", m.b32);
+                    fprintf(stderr,"[serve] inbound over i2p from %s\n", m.b32);
+                } else c = -1;
             } else if(ready_on){
                 /* Arrived on the onion service's loopback target, so it IS an
                  * onion peer -- established by WHICH SOCKET accepted it, not
@@ -5694,8 +6241,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             if(c>=0) peer_sock_buffers(c);
             if(c>=0) serve_idx_topup();
             if(c>=0 && upload_note_and_check(0)){
-                /* over -maxuploadtarget for this 24h window */
-                close(c); c = -1;
+                /* over -maxuploadtarget for this 24h window -- unless the
+                 * peer has the `download` permission (Core: served regardless) */
+                char ipb[64]; const char* q = strrchr(peerdesc, ':'); size_t n = q ? (size_t)(q - peerdesc) : strlen(peerdesc);
+                if(n >= sizeof ipb) n = sizeof ipb - 1; memcpy(ipb, peerdesc, n); ipb[n] = 0;
+                if(!(netperm_for(ipb) & NP_DOWNLOAD)){ close(c); c = -1; }
             }
             if(c>=0 && g_inbound_n >= CFG_INBOUND_LIMIT()){
                 /* At capacity: accept and close immediately so the connection
@@ -5733,6 +6283,14 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                      * shared table, no fd keying, nothing to clean up when the
                      * connection ends. */
                     g_conn_perms = accepted_perms;
+                    /* -inboundrelaypercent: past that share of the inbound
+                     * budget we answer with fRelay=0, as Core does, so the
+                     * peer sends us no transactions (blocks and addrs still
+                     * flow). Counted over all inbound connections, which is
+                     * Core's count of relaying inbound peers when every
+                     * earlier peer relays. */
+                    /* decided per peer once its version is in hand (relay policy, share) */
+                    g_accept_version_hook = serve_on_peer_version;
                     for(int wi = 0; wi < g_wb_n; wi++) close(g_wb_fd[wi]);
                     /* BIP324 first, if enabled. A v1 peer is detected in-band
                      * -- it opens with magic + "version" + five NULs, and any
@@ -5760,12 +6318,14 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                       memcpy(g_cur_peer_ip, peerdesc, n); g_cur_peer_ip[n] = 0; }
                     g_serve_violation_hook = serve_violation_report;
                     int hok = node_accept_handshake(c);
+                    if(hok==1) g_inbound_slot = inbound_slot_claim(peerdesc);
                     char pv[256]; pv[0]=0; if(hok==1) format_peer_version_info(pv, sizeof pv);
                     close(l6 >= 0 ? l6 : l);
                     fprintf(stderr,"[serve] inbound %s %s [%s] (pid %d) %s\n", peerdesc,
                             hok==1?"connected":"handshake failed", v2res, getpid(), pv);
                     if(hok==1)
                         node_serve_loop(c, (mkdir("logs", 0755), node_log_open(g_logpath)), store_buf, ht_idx, out_buf, (long)sizeof out_buf);
+                    if(g_inbound_slot >= 0 && g_node_status) g_node_status->peers[g_inbound_slot].used = 0;
                     close(c); _exit(0);
                 }
                 close(c);
@@ -5885,6 +6445,19 @@ int main(int argc, char** argv){
      * the download worker inherits the same resolved values. */
     { char cfgpath[512];
       node_config_load(node_config_path(absp, cfgpath, sizeof cfgpath));
+      { extern int (*g_serve_tx_gate)(void); extern int (*g_serve_inv_gate)(const unsigned char*, long);
+        extern int (*g_serve_mempool_hook)(int, void*); extern void (*g_serve_policy_log)(const char*);
+        g_serve_tx_gate = serve_tx_gate; g_serve_inv_gate = serve_inv_gate;
+        g_serve_mempool_hook = serve_mempool_msg; g_serve_policy_log = serve_policy_disconnect_log; }
+      { extern void rp_set_blocksonly(int); extern void rpc_node_set_localrelay(int);
+        rp_set_blocksonly(g_cfg.blocksonly);
+        node_relay_flag = g_cfg.blocksonly ? 0 : 1;          /* fRelay of every version we send (per-peer overrides in the serve child) */
+        rpc_node_set_localrelay(!g_cfg.blocksonly);
+        if(g_cfg.blocksonly) fprintf(stderr,"[config] -blocksonly: no tx relay from peers (relay permission excepted); RPC submissions still relay\n"); }
+      /* -logtimestamps/-logtimemicros/-logthreadnames/-logsourcelocations take
+       * effect from the config echo onward (weak globals in log_ts.h) */
+      g_log_timestamps = g_cfg.logtimestamps; g_log_timemicros = g_cfg.logtimemicros;
+      g_log_threadnames = g_cfg.logthreadnames; g_log_sourcelocations = g_cfg.logsourcelocations;
       if(g_cfg.debuglogfile[0])
           snprintf(g_logpath, sizeof g_logpath, "%s",
                    !strcmp(g_cfg.debuglogfile, "0") ? "/dev/null" : g_cfg.debuglogfile);
@@ -5895,10 +6468,30 @@ int main(int argc, char** argv){
        * with no config. main.c is the only place that has both -- pushing the
        * value across here is what keeps both link sets independent. */
       wallet_pass_set_file(g_cfg.walletpassfile); }
+    /* ---- 2026-09-01 option-surface completion: push the config into the
+     * subsystems that own each behaviour (none of them include node_config.h) */
+    if(g_cfg.shrinkdebugfile) log_shrink(g_logpath);
+    { /* -uacomment: Core renders "/Name:ver(c1; c2)/" */
+      extern unsigned char node_ua_buf[256]; extern unsigned long long node_ua_len;
+      char ua[256]; int n = snprintf(ua, sizeof ua, "%s", NODE_UA_STRING);
+      if(g_cfg.n_uacomment && n > 1 && ua[n-1] == '/'){
+          n--; ua[n] = 0;                                   /* drop the closing slash */
+          n += snprintf(ua + n, sizeof ua - n, "(");
+          for(int i = 0; i < g_cfg.n_uacomment && n < (int)sizeof ua - 4; i++)
+              n += snprintf(ua + n, sizeof ua - n, "%s%s", i ? "; " : "", g_cfg.uacomment[i]);
+          if(n > (int)sizeof ua - 3) n = (int)sizeof ua - 3;
+          n += snprintf(ua + n, sizeof ua - n, ")/");
+      }
+      if(n > 255) n = 255;
+      memcpy(node_ua_buf, ua, (size_t)n); node_ua_len = (unsigned long long)n;
+      rpc_node_set_user_agent(ua);
+      if(g_cfg.n_uacomment) fprintf(stderr,"[boot] user agent: %s\n", ua); }
+    { extern void serve_cfilters_set_enabled(int); serve_cfilters_set_enabled(g_cfg.peerblockfilters); }
     /* Advertise NODE_P2P_V2 once the config is known, as Core does in
      * init.cpp. A peer has no other way to learn that we will accept a
      * BIP324 handshake, and nothing on the wire reveals it. */
     { extern unsigned long long node_services;
+      if(g_cfg.peerblockfilters) node_services |= (1ULL << 6);   /* NODE_COMPACT_FILTERS: -peerblockfilters */
       if(CFG_V2TRANSPORT()){
           node_services |= BMC_NODE_P2P_V2;
           /* Report how many known peers we could actually dial over v2. This
@@ -6122,6 +6715,11 @@ int main(int argc, char** argv){
         }
     }
     dir = effdir;
+    /* derived files must not outrun the archive (incident 2026-09-01): trim
+     * an empty index tail and over-long headers/chainwork before the store
+     * reads its tip from index.dat's length */
+    { long tr = archive_trim_derived_tails();
+      if(tr < 0) fprintf(stderr,"[boot] WARNING: could not trim the derived files past the tip: %s\n", strerror(errno)); }
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
     /* A fresh non-main datadir self-seeds its own genesis at index 0 (the
      * mainnet archive got genesis by a one-time injection, 5f36dee -- a
@@ -6521,6 +7119,15 @@ int main(int argc, char** argv){
         if(!g_cfg.boot_catchup) fprintf(stderr,"[boot] bmc.bootcatchup=0 -- skipping the boot catch-up; the worker's far-behind trigger will run it if needed\n");
         fprintf(stderr,"[boot] catch-up check done: %ld block(s) written (%.2fs)\n",
                 caught, phase_elapsed(&catchup_pt));
+        if(g_shutdown_requested){
+            /* 2026-09-01 12:29: a stop during the boot catch-up returned here
+             * and the boot went ON -- hash index, worker, UTXO engine sized
+             * against an index the catch-up had just polluted -- and the
+             * worker's start under the pending SIGTERM left utxo.idx empty
+             * (a full UTXO rebuild followed). A stop is a stop. */
+            fprintf(stderr,"[boot] shutdown requested during the catch-up -- exiting before the worker starts\n");
+            _exit(0);
+        }
         if(caught>0){
             store_reload(store_buf);        /* our copy predates dl_catchup's writes */
             fprintf(stderr,"[catchup] store now tips at height %d\n", *(int*)(store_buf+24));
@@ -6609,7 +7216,7 @@ int main(int argc, char** argv){
         { char rpccfg[512]; serve_start_rpc(dir, node_config_path(absp, rpccfg, sizeof rpccfg)); }
         /* PURE-INBOUND serving: nwant=0 -> serve_mux adds no outbound legs, so
          * it only accepts+forks serve children (never blocks on sync). */
-        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port));
+        return serve_mux(port, (const char**)g_seed_hosts, 0, g_n_seed_hosts, g_chainp->default_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port), i2p_inbound_start());
     }
 
     if(strcmp(mode,"serve-test")==0 && argc>=6){
@@ -6633,7 +7240,7 @@ int main(int argc, char** argv){
         int l = lsock(port);
         wb_listen_open();
         if(l<0){ fprintf(stderr,"lsock failed: %s\n", strerror(errno)); return 1; }
-        return serve_mux(port, peer, nwant, 1, out_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port));
+        return serve_mux(port, peer, nwant, 1, out_port, l, g_cfg.listen ? lsock_v6(port) : -1, tor_onion_listener(port), i2p_inbound_start());
     }
     return 2;
 }

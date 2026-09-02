@@ -123,9 +123,17 @@ node without RPC. A fresh non-main chain directory self-seeds its genesis.
   `::1` are always allowed); otherwise the log says `Option -rpcbind was
   ignored because -rpcallowip was not specified`. A malformed `rpcallowip`
   is fatal.
-- **Peer permissions.** `whitelist=[perms@]<subnet>` grants `noban` (the
-  only permission implemented); `whitebind=` attaches permissions to an
-  extra listener. `whitelistrelay`/`whitelistforcerelay` are not implemented.
+- **Peer permissions (2026-09-01).** `whitelist=[perms@]<subnet>` and
+  `whitebind=[perms@]addr:port` grant Core's `noban`, `relay`, `forcerelay`,
+  `mempool`, `download`, `addr` (and `in`); a bare entry gets Core's implicit
+  set (noban, mempool, relay per `whitelistrelay`, forcerelay per
+  `whitelistforcerelay`). `bloomfilter` and `out` are refused at start-up
+  with the reason. `blocksonly=1` refuses transactions from every peer
+  without `relay` (disconnect, not scored, Core's log words), sends fRelay=0
+  and no feefilter, and reports `localrelay:false`; `inboundrelaypercent`
+  caps the inbound peers that negotiate tx relay (only relaying peers count).
+  `getpeerinfo` now itemizes inbound peers (slots 64..127 of the shared
+  table) with `permissions` and a truthful `relaytxes`.
 
 ### Wallet passphrase source
 
@@ -179,8 +187,12 @@ v2transport=1              # BIP324 encrypted transport, default on
   onion needs only `onion=`/`proxy=`.
 - **I2P.** `i2psam=` opens a SAM session with a destination persisted in
   `<chaindir>/i2p_private_key`; boot line `[dial] i2p session up via SAM
-  <ip:port>, our address <b32>.b32.i2p`. I2P is outbound only; inbound I2P
-  streams are not accepted.
+  <ip:port>, our address <b32>.b32.i2p`. With `listen=1` an acceptor thread
+  sits in SAM `STREAM ACCEPT` on that session and inbound I2P streams reach the
+  serve loop like any other inbound peer; boot line `[i2p] accepting inbound
+  streams on <b32>.b32.i2p`, per-peer line `[serve] inbound over i2p from
+  <b32>`. `i2pacceptincoming=0` turns that off. A router that reports itself
+  firewalled cannot publish a leaseset, so no inbound will arrive until it can.
 - **CJDNS.** Needs a running `cjdroute` (a systemd unit in the reference
   deployment; the node's unit is ordered after it) and IPv6 on the host; boot line
   `[dial] cjdns reachable (fc00::/8 over IPv6)`. Inbound cjdns peers arrive
@@ -201,8 +213,19 @@ I2P destination.
   `zmqpubsequence` is not supported and is refused.
 - `txindex=1` has no effect on the daemon: the index is built offline
   (`daemon/build_tx_index <datadir>`) and used when `txindex.dat` exists.
+- **txospenderindex** (2026-09-01): same pattern — `daemon/build_txospender_index
+  <datadir> [from] [to]` writes `txospender.dat` (~35 GB for mainnet; run it
+  while the node is idle, it reads the whole archive once), the daemon then
+  keeps `txospender.tail` current and `gettxspendingprevout` answers
+  confirmed spends. Absent file = index off, exactly as Core without the
+  option.
   `blockfilterindex` and `coinstatsindex` are on; the keys only turn them off.
-- `assumevalid` is parsed and ignored: every script in every block is verified.
+- `assumevalid=<hash>` skips script evaluation for blocks at and below that
+  block (PoW, merkle, structure and every UTXO check still run); the height is
+  resolved from the archive at boot (`[utxo_live] assumevalid: block found at
+  height N`). Unset = the chain's built-in block (Core v31: mainnet 938343,
+  testnet4 123613, signet 293175; regtest none). `assumevalid=0` evaluates
+  every script of every block.
 - `pid=<file>` writes the pid once the RPC port is bound. `blocknotify`,
   `alertnotify`, `startupnotify`, `shutdownnotify` run a shell command with
   `%s` sanitised to `[A-Za-z0-9._:/-]`.
@@ -571,3 +594,39 @@ Outside the chain directory: `<datadir>/bitcoin.conf` or
 `<repo>/config/bitcoin.conf`; `<repo>/logs/<chain>/bitcoin.<chain>.log`;
 `<repo>/asm/daemon/bitcoind.live` and `bitcoind.deploy-*`;
 `<repo>/config/logrotate-bmc.conf`.
+
+## Config options added 2026-09-01 (Core names, Core defaults)
+
+`config/bitcoin.sample.conf` documents every key. Of note for operators:
+
+- `uacomment=<text>` (repeatable) appears in the user agent on the wire and in
+  `getnetworkinfo`; `( ) / \ ; :` and control characters are refused.
+- `peerblockfilters=1` is now required to serve BIP157 filters and to
+  advertise `NODE_COMPACT_FILTERS` — Core's default is 0 and this node follows
+  it. `blockfilterindex=` still controls whether the index is maintained.
+- `rpcwhitelist=<user>:<m1>,<m2>` locks an RPC user to a method list (HTTP
+  403 otherwise); once any whitelist exists, users without one may call
+  nothing unless `rpcwhitelistdefault=0`. `rpcthreads`/`rpcworkqueue` size the
+  HTTP server (503 "Work queue depth exceeded" past the queue);
+  `rpcservertimeout` bounds a slow client. `rpccookieperms=group|all` widens
+  the cookie file's mode (0640 / 0644).
+- Wallet: `addresstype`/`changetype` pick what `getnewaddress` and change
+  use (a type must be activated with `createwalletdescriptor` first);
+  `fallbackfee` is 0 by default, so with no fee estimate a send fails with
+  Core's "Fee estimation failed. Fallbackfee is disabled..." — set it (BTC/kvB)
+  on a fresh node. `walletbroadcast=0` returns txids without broadcasting.
+  `walletnotify=<cmd>` runs with `%s` = txid on mempool arrival and on
+  confirmation. `wallet=<name>` loads a named wallet at start-up (one active
+  wallet at a time; further names are logged as skipped).
+- Mining: `blockmaxweight`, `blockreservedweight`, `blockmintxfee`
+  (BTC/kvB), `blockversion`, `printpriority` shape `getblocktemplate`.
+- Logging: `logtimestamps=0`, `logtimemicros=1`, `logthreadnames=1`,
+  `logsourcelocations=1` change the stderr prefix from the point the config
+  is read; `shrinkdebugfile` (default 1) truncates a `debuglogfile` over
+  10 MB to its last 200 KB at start-up.
+- `includeconf=<file>` (relative to the main file's directory) is read after
+  it; an included file may not include another.
+- Core options that are accepted WITHOUT effect are each named at start-up
+  with the reason (`[config] <key>= is a Bitcoin Core option that has NO
+  EFFECT here: ...`); the full classification of all 181 Core options is in
+  `docs/FEATURE_GAPS.md`.

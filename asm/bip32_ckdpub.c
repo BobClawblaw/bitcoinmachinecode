@@ -212,3 +212,55 @@ int bip32_ckdpub_derive(const char* xpub_b58, const unsigned* path, int pathlen,
     memcpy(out_pub, K, 33);
     return 1;
 }
+/* ---- exported steps for the descriptor engine (descriptor.c) ---------- */
+int bip32_ckdpub_step_pub(const unsigned char Kpar[33], const unsigned char ccpar[32], unsigned index,
+                          unsigned char Kout[33], unsigned char ccout[32]){
+    return ckdpub_step(Kpar, ccpar, index, Kout, ccout);
+}
+int bip32_pubkey_decompress(const unsigned char pub33[33], unsigned char out65[65]){
+    uint64_t X[4], Y[4];
+    if (decompress(pub33, X, Y) != 0) return 0;
+    out65[0] = 0x04;
+    for (int i = 0; i < 32; i++){ out65[1+i] = (unsigned char)(X[3 - i/8] >> (8 * (7 - i%8))); out65[33+i] = (unsigned char)(Y[3 - i/8] >> (8 * (7 - i%8))); }
+    return 1;
+}
+
+/* Q = lift_x(x) + t*G, the BIP341 output key for internal x-only key `x`
+ * and tweak `t` (already reduced by the caller's check t < n). Returns 1
+ * with Q's x coordinate, 0 if x is not on the curve, t is out of range, or
+ * Q is the point at infinity. Plain C over the same field/point kernels as
+ * CKDpub: no thread-local scratch, so it links into any thread. */
+int bip32_xonly_tweak_add(const unsigned char x[32], const unsigned char t[32], unsigned char out_x[32]){
+    unsigned char comp[33]; comp[0] = 0x02; memcpy(comp + 1, x, 32);
+    uint64_t Px[4], Py[4];
+    if (decompress(comp, Px, Py) != 0) return 0;
+    uint64_t T[4]; be32_to_limbs(T, t);
+    if (fe_is_zero(T) || !lt_n(T)) return 0;
+    uint64_t Gaff[8] = {G_X[0],G_X[1],G_X[2],G_X[3], G_Y[0],G_Y[1],G_Y[2],G_Y[3]};
+    uint64_t TG[12]; point_scalar_mul_ct(TG, Gaff, T);
+    uint64_t Pj[12] = {Px[0],Px[1],Px[2],Px[3], Py[0],Py[1],Py[2],Py[3], 1,0,0,0};
+    uint64_t Qj[12]; point_add(Qj, TG, Pj);
+    uint64_t Qx[4], Qy[4];
+    if (jac_to_aff(Qx, Qy, Qj) != 0) return 0;
+    for (int i = 0; i < 32; i++) out_x[i] = (unsigned char)(Qx[3 - i/8] >> (8 * (7 - i%8)));
+    return 1;
+}
+
+/* Same as bip32_xonly_tweak_add, also reporting Q's Y parity (1 = odd): the
+ * bit a BIP341 control block carries in its first byte. */
+int bip32_xonly_tweak_add_par(const unsigned char x[32], const unsigned char t[32], unsigned char out_x[32], int* odd){
+    unsigned char comp[33]; comp[0] = 0x02; memcpy(comp + 1, x, 32);
+    uint64_t Px[4], Py[4];
+    if (decompress(comp, Px, Py) != 0) return 0;
+    uint64_t T[4]; be32_to_limbs(T, t);
+    if (fe_is_zero(T) || !lt_n(T)) return 0;
+    uint64_t Gaff[8] = {G_X[0],G_X[1],G_X[2],G_X[3], G_Y[0],G_Y[1],G_Y[2],G_Y[3]};
+    uint64_t TG[12]; point_scalar_mul_ct(TG, Gaff, T);
+    uint64_t Pj[12] = {Px[0],Px[1],Px[2],Px[3], Py[0],Py[1],Py[2],Py[3], 1,0,0,0};
+    uint64_t Qj[12]; point_add(Qj, TG, Pj);
+    uint64_t Qx[4], Qy[4];
+    if (jac_to_aff(Qx, Qy, Qj) != 0) return 0;
+    for (int i = 0; i < 32; i++) out_x[i] = (unsigned char)(Qx[3 - i/8] >> (8 * (7 - i%8)));
+    if (odd) *odd = (int)(Qy[0] & 1);
+    return 1;
+}

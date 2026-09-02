@@ -3,8 +3,8 @@
 Bitcoin Machine Code (`bmc`) is a full validating Bitcoin node for Linux
 x86-64, written in hand-authored NASM assembly with a C orchestration layer.
 Every line of assembly and C in the tree is AI-authored. It downloads and
-verifies the chain from genesis with full script verification (no
-`assumevalid`), maintains a chain-scale UTXO set that matches Bitcoin Core's
+verifies the chain from genesis (with Core's `assumevalid` default;
+`assumevalid=0` evaluates every script), maintains a chain-scale UTXO set that matches Bitcoin Core's
 chainstate entry for entry, runs a Core-style mempool and transaction relay,
 serves Bitcoin Core's JSON-RPC surface, maintains the optional `txindex`,
 `coinstatsindex` and `blockfilterindex` indexes, and includes an HD wallet
@@ -30,8 +30,10 @@ testnet4, signet (public or custom) and regtest.
 - Script-verification flags are generated from Bitcoin Core's own source
   (`validation/gen_script_flags.py`), including the historical exception
   blocks matched by hash.
-- `assumevalid` is parsed and deliberately ignored: every signature in every
-  block is verified.
+- `assumevalid` follows Core: the chain's built-in assumed-valid block (mainnet
+  938343 in Core v31) unless overridden; script evaluation is skipped at and
+  below it, every other check runs. `assumevalid=0` evaluates every signature
+  in every block.
 - Signet (BIP325) block-signature enforcement through the same script
   interpreter used for transactions.
 - Reorg handling with cumulative-work fork choice, an undo log, and crash
@@ -68,8 +70,9 @@ testnet4, signet (public or custom) and regtest.
 - Mempool admission runs the consensus verifier (legacy + full taproot)
   against the confirmed set plus in-mempool parents.
 - `mempool.dat` persistence in Core's format (`persistmempool`,
-  `savemempool`, `importmempool`); `estimatesmartfee` over the node's own
-  accepted-feerate estimator.
+  `savemempool`, `importmempool`); `estimatesmartfee`/`estimaterawfee` on a
+  port of Core's block-policy fee estimator (three horizons, feerate
+  buckets, `fee_estimates.dat`), byte-identical to Core on regtest.
 
 **P2P and relay**
 
@@ -100,7 +103,7 @@ testnet4, signet (public or custom) and regtest.
 - At-rest encryption (`encryptwallet`, `walletpassphrase`,
   `walletpassphrasechange`, `walletlock`) using AES-256-CBC under Core's
   `BytesToKeySHA512AES` key derivation.
-- PSBT: `createpsbt`, `decodepsbt`, `converttopsbt`, `combinepsbt`,
+- PSBT (v0 and v2/BIP370, Core-ordered bytes, Core master's v2 default): `createpsbt`, `decodepsbt`, `converttopsbt`, `combinepsbt`,
   `joinpsbts`, `analyzepsbt`, `finalizepsbt`, `utxoupdatepsbt`,
   `walletprocesspsbt`.
 - Descriptors and watch-only: `importdescriptors`, `listdescriptors`,
@@ -115,7 +118,7 @@ testnet4, signet (public or custom) and regtest.
 - Bitcoin Core's JSON-RPC method set (155 methods; only `rpc.discover` is
   absent), with Core's result shapes, error codes and messages. See
   [`docs/RPC_LIVE_NODE.md`](docs/RPC_LIVE_NODE.md).
-- `txindex`, `coinstatsindex` (incremental MuHash, so `gettxoutsetinfo`
+- `txindex, txospenderindex`, `coinstatsindex` (incremental MuHash, so `gettxoutsetinfo`
   answers without a UTXO walk) and `blockfilterindex` (BIP158 basic filters
   plus the filter-header chain), all tip-following; `getindexinfo`.
 - `addrindex` (an extension with no Core equivalent): `getaddressbalance`
@@ -330,8 +333,8 @@ log echoes the resolved values.
   `onion=127.0.0.1:9050`, `onlynet=onion`, `discover=0`.
 - **I2P.** `i2psam=127.0.0.1:7656` points at a router's SAM 3.1 bridge. The
   node keeps one destination across restarts (`i2p_private_key` in the
-  datadir) and dials I2P peers through it. Inbound I2P streams are not
-  accepted.
+  datadir), dials I2P peers through it and, with `listen=1`, accepts inbound
+  I2P streams on that destination (`i2pacceptincoming=0` turns that off).
 - **CJDNS.** A CJDNS address is an `fc00::/8` IPv6 address on `cjdroute`'s
   tun interface, so it needs working IPv6 on the host. The node cannot detect
   the interface; set `cjdnsreachable=1` to enable dialing and accepting CJDNS
@@ -379,7 +382,8 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
 - **Mempool eviction is per-leaf.** `TrimToSize` evicts the lowest-feerate
   leaf transaction and works inward, where Core evicts by linearization
   chunk. Sibling eviction is not implemented.
-- **`assumevalid` is ignored.** Every block is fully script-verified.
+- **`assumevalid`** uses Core v31's built-in block (938343 on mainnet); newer
+  Core releases move it, this node's table is updated with the oracle.
 - **`gettxoutsetinfo` defaults to `muhash`**; `hash_serialized_3` is refused,
   and the coinstats "extras" beyond the core fields are omitted (stated in
   the result).
@@ -387,18 +391,62 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   an extension with no Core equivalent.
 - **ZMQ `sequence` topic** is refused by configuration rather than
   published; the other four topics are supported.
-- **Wallet.** There is no general descriptor engine; `descriptorprocesspsbt`
-  refuses rather than guessing, and `createwalletdescriptor` answers only for
-  the address type the wallet holds.
-- **Mining.** `getblocktemplate` reports a lower-bound `sigops` and orders
-  transactions validly but not fee-optimally; BIP23 proposal mode and any
-  stratum/pool interface are absent.
+- **Wallet.** The seed wallet always carries bech32 (wpkh); `createwalletdescriptor`
+  adds legacy (pkh, 44'), p2sh-segwit (sh(wpkh), 49') and bech32m (tr, 86'),
+  after which `getnewaddress`/`getrawchangeaddress` accept that address type,
+  the rescan window covers those keys and the wallet signs for them (P2PKH,
+  P2SH-P2WPKH, P2TR key path). Descriptors are otherwise general: the engine parses
+  and expands pk/pkh/wpkh/combo, multi/sortedmulti, sh/wsh, tr with script
+  trees, rawtr, addr and raw over hex, x-only, WIF and xpub/xprv keys with
+  origins, paths and ranges (proven byte-identical to Core on its own test
+  vectors). **Miniscript** (`miniscript.c`, Core's script/miniscript.h in C:
+  parser, type system, resource limits, script emission and decoding, the
+  non-malleable satisfier) is accepted inside `wsh()` and as `tr()` leaves
+  with Core's sanity errors verbatim, proven on all 97 of Core's
+  miniscript_tests.cpp vectors in both contexts against this node's own
+  interpreter (`tests/test_miniscript`, 44,921 checks) and on a 48-descriptor
+  regtest differential where Core mines every witness this node signs
+  (`validation/miniscript_core_diff.py`). **`musig()`** (BIP390) keys of
+  `tr()`/`rawtr()` and their leaves aggregate, derive and print as Core's do
+  (Core's own vectors), and `descriptorprocesspsbt` is their Updater as well
+  as their signer.
+  `descriptorprocesspsbt` signs from the keys a descriptor carries.
+  `signrawtransactionwithkey` and the descriptor signer cover P2PKH, P2WPKH,
+  P2SH-P2WPKH, P2SH multisig, P2WSH and P2SH-P2WSH (CHECKMULTISIG, a single
+  CHECKSIG, or any miniscript witnessScript -- the satisfier signs with the
+  keys held, the PSBT's preimages and the tx's timelocks), P2TR key-path
+  spends of `tr(KEY)` and of `tr(KEY,{...})` (internal key + merkle root),
+  and P2TR script-path spends of `pk()`, `multi_a()` and miniscript leaves
+  (leaf + control block). PSBTs carry the BIP371 taproot fields
+  (leaf scripts, control blocks, internal key, merkle root, bip32 origins
+  with leaf hashes, key-path and script-path partial signatures); the signer
+  tries the key path first and then each leaf, carries partials other
+  signers left, and `decodepsbt` names every field as Core does.
+  **MuSig2** (BIP327 in C, `musig2.c`,
+  proven on the BIP's vectors; BIP373 PSBT fields): `walletprocesspsbt` /
+  `descriptorprocesspsbt` run Core's rounds for any P2TR key-path aggregate
+  the PSBT names -- direct, BIP32-derived via the synthetic xpub, or
+  taproot-tweaked -- publishing our pubnonce, then our partial signature,
+  then the aggregated signature; `decodepsbt` prints the `musig2_*` fields
+  with Core's names; secret nonces never leave the process and are erased
+  on use. Proven by `validation/musig_core_diff.py`: 3-of-3 sessions with
+  two Core wallets and this node as the third signer, judged by Core's
+  `finalizepsbt`, `testmempoolaccept` and a mined block (110/110).
+  BIP340
+  signing is in C and proven on Core's test vectors; every signed form is
+  checked against Core's script engine by `validation/signer_core_diff.sh`.
+- **Mining.** `getblocktemplate` fills the block with whole linearization
+  chunks in feerate order (Core v31's cluster-mempool block assembly; a chunk
+  that does not fit skips its cluster) and reports a lower-bound `sigops`;
+  a stratum/pool interface is absent.
 - **Erlay (BIP330).** The `sendtxrcncl` negotiation is implemented and
-  tested but not emitted on the wire; reconciliation rounds are not built.
+  tested but not emitted on the wire. Reconciliation rounds are not built;
+  Bitcoin Core itself ships only the negotiation (its `-txreconciliation` is
+  off by default and its message processing has no `reqrecon`/`sketch`).
 - **Not implemented:** REST interface, UPnP/NAT-PMP, BIP37 bloom filters
   (`peerbloomfilters`), `whitelistrelay`/`whitelistforcerelay`, GUI,
   `loadtxoutset` (assumeutxo import; export via `dumptxoutset` works),
-  inbound I2P, `walletnotify`, `maxtxfee` enforcement, `uacomment`,
+  `walletnotify`, `maxtxfee` enforcement, `uacomment`,
   `rpcthreads`/`rpcworkqueue`, `includeconf`/`settings`. Each unimplemented
   Core option is named in the startup log when set.
 - **Chains.** Legacy testnet3 (`testnet=1`, `chain=test`) is refused.

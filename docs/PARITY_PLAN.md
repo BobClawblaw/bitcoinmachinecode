@@ -1,5 +1,9 @@
 # Bitcoin Core feature-parity plan
 
+> **Reconciled 2026-09-01:** every checkbox below is now closed or annotated;
+> the living inventory is `docs/FEATURE_GAPS.md` — this file is kept as the
+> historical plan and its gating analysis.
+
 > ## Status: RPC surface COMPLETE — all methods, all 5 subsystems (2026-08-26)
 >
 > **Update 2026-08-27.** The surface is ~157 dispatched methods and three of
@@ -115,7 +119,7 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       oracle's own scantxoutset result for the same descriptor. Also
       upgraded desc_parse_core's unknown-function error to Core's exact
       "'X' is not a valid descriptor function" shape.
-- [ ] getmempoolentry / getmempoolancestors / getmempooldescendants (after T4)
+- [x] getmempoolentry / getmempoolancestors / getmempooldescendants (after T4)  **[CLOSED (all three real; RPC surface 155/155 on 2026-08-26 — FEATURE_GAPS.md is the source of truth)]**
 
 ### T3 — Mining-info RPCs  [oracle-verifiable, non-wallet]
 - [x] getnetworkhashps + getmininginfo — getnetworkhashps diffed byte-for-byte
@@ -224,16 +228,16 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       objects; -8/-5 error parity shared with getmempoolentry.
 
 ### T5 — Fee estimation
-- [x] estimatesmartfee -- Core's CONTRACT (arg validation with Core-exact -8
-      messages incl the conf_target [1,1008] range and estimate_mode list;
-      blocks clamps to >= 2, oracle-verified; fresh node returns
-      {"errors":["Insufficient data or no feerate found"],"blocks":N}) over
-      OUR estimator: the tx-accept policy layer's EMA of accepted feerates
-      (shared state, read under mp_lock), floored at min relay fee. The
-      NUMBER is honestly ours -- Core's bucket tracker needs confirmed-block
-      history we don't keep. economical/conservative accepted (case-insens.)
-      but return the same EMA (one estimator). Deploy batched (build-side).
-- [ ] estimaterawfee (hidden/debug RPC -- low value, deferred)
+- [x] estimatesmartfee -- 2026-09-01: Core's CBlockPolicyEstimator ported
+      (daemon/fee_estimator.c: three horizons, feerate buckets, confirmed-
+      block history fed from admission + block connect + removals,
+      fee_estimates.dat), so the NUMBER is now Core's number: economical vs
+      conservative differ, "blocks" follows MaxUsableEstimate (a fresh node
+      answers 0, like Core), feerate = max(estimate, mempool min fee,
+      minrelay). Byte-identical to Core on validation/feeest_core_diff.sh.
+      (Before: Core's contract over an accepted-feerate EMA.)
+- [x] estimaterawfee -- 2026-09-01: Core's per-horizon pass/fail bucket
+      report with Core's field names and rounding, same differential.
 
 ### T6 — Wallet-state RPCs on the RPC surface
 - [x] listtransactions + gettransaction + getwalletinfo — journal-backed
@@ -253,7 +257,7 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       getnewaddress/getaddressinfo/getwalletinfo go live on a daemon with a
       store present; absent store = unconfigured, exactly as before. The
       mnemonic buffer is wiped after seed derivation.
-- [ ] sendtoaddress/sendmany via RPC — DEFERRED with a design question:
+- [x] sendtoaddress/sendmany via RPC — DEFERRED with a design question:  **[CLOSED 2026-08-27 (wallet RPCs complete; delegated signing resolved the design question)]**
       Core auto-selects inputs and auto-computes fees from wallet state;
       our live daemon tracks no wallet UTXOs (rpc_wallet's injected set is
       for harnesses; the addr index is not configured in production).
@@ -261,10 +265,10 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       a fee policy (EMA-based) -- a supervised design, not an overnight
       wiring job. The CLI primitive (explicit UTXOs + key) remains the
       working path.
-- [ ] getreceivedbyaddress, getunconfirmedbalance (same UTXO-source gate)
+- [x] getreceivedbyaddress, getunconfirmedbalance (same UTXO-source gate)  **[CLOSED (wallet RPC tranche 2026-08-27)]**
 
 ### T7 — Wallet management (multiwallet)
-- [ ] createwallet/loadwallet/unloadwallet/listwallets, backupwallet,
+- [x] createwallet/loadwallet/unloadwallet/listwallets, backupwallet,  **[CLOSED (multi-wallet management landed 2026-08-2x; see FEATURE_GAPS.md)]**
       walletpassphrase/encryptwallet, importdescriptors/importprivkey,
       fundrawtransaction, bumpfee
 
@@ -283,11 +287,11 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       (txindex/coinstatsindex/blockfilterindex), so it returns {} exactly as
       Core does when none are enabled; verified live (Core is also lenient on a
       non-string arg -> {}). The remaining index BUILDS below are the real work.
-- [ ] txindex (global) → getrawtransaction without blockhash
-- [ ] blockfilterindex → getblockfilter (BIP157/158)
+- [x] txindex (global) → getrawtransaction without blockhash  **[CLOSED (offline base + live tail; getrawtransaction by txid)]**
+- [x] blockfilterindex → getblockfilter (BIP157/158)  **[CLOSED 2026-08-28 (built AND served; adoption proven vs Core)]**
 
 ### T10 — Networks
-- [ ] testnet3/testnet4 + signet chain params, net magic, DNS seeds, RPC ports
+- [x] testnet3/testnet4 + signet chain params, net magic, DNS seeds, RPC ports  **[CLOSED (testnet4, signet, regtest; testnet3 refused by design)]**
 
 ## Gating analysis (2026-08-25, autonomous session)
 The safe + fully-oracle-verifiable-NOW RPC queue is exhausted after joinpsbts +

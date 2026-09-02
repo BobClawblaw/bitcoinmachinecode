@@ -100,7 +100,9 @@ DEL_SIZE  equ 44              ; DEL record fully fixed size (unchanged -- DEL
 IDX_HDR   equ 20              ; utxo.idx header: magic(4)+log_off(8)+n(8)
 
 logname: db "utxo.dat",0
+WALBUF_CAP equ 1048576
 idxname: db "utxo.idx",0
+idxtmp:  db "utxo.idx.tmp",0   ; the checkpoint is written here and renamed over utxo.idx (2026-09-01)
 
 ; external in-memory UTXO primitives (bitcoin_utxo.asm)
 extern utxo_put
@@ -181,8 +183,56 @@ mac_read_exact:
 ;   path roughly in half (this was a measured bottleneck: ~2 syscalls per
 ;   utxo_store_put, up to 3.78B times across a full-archive replay).
 ; ============================================================================
+;   BUFFERED (2026-09-01): records are appended to a 1 MB process-wide
+;   buffer (wal_buf) and land in the file in one write(2) per drain -- the
+;   per-record write() was ~6% of the live replay's CPU (mac_wr_log + the
+;   kernel's write path). log_len is the LOGICAL length (file + buffered
+;   bytes) at all times -- the lesson of the same day's sparse-offset bug.
+;   Drains: utxo_store_wal_drain (exported; the apply loop calls it after
+;   every block), and implicitly before a checkpoint (utxo_store_sync), a
+;   reload (which measures the file), a flush (which truncates the file),
+;   a close, and whenever a DIFFERENT store's fd wants the buffer. A crash
+;   can therefore lose only the not-yet-drained SUFFIX of the op stream --
+;   the same "partially applied block" state the ghost guard already
+;   reverses (undo records are written immediately; restoring a coin whose
+;   delete never landed is a put over an existing key, which is a no-op).
 mac_wr_log:
     mov  rdi, [r12]        ; log_fd
+    mov  rax, [rel wal_fill]
+    test rax, rax
+    jz   .wl_owner_ok
+    cmp  rdi, [rel wal_fd]
+    je   .wl_owner_ok
+    call mac_wal_drain_fd_pending   ; another store's bytes are pending: land them on THEIR fd first
+    test rax, rax
+    jnz  .wf
+    mov  rdi, [r12]
+.wl_owner_ok:
+    mov  [rel wal_fd], rdi
+    cmp  r14, WALBUF_CAP
+    ja   .wl_direct
+    mov  rax, [rel wal_fill]
+    add  rax, r14
+    cmp  rax, WALBUF_CAP
+    jbe  .wl_append
+    call mac_wal_drain_fd            ; rdi = this fd: make room
+    test rax, rax
+    jnz  .wf
+.wl_append:
+    lea  rdi, [rel wal_buf]
+    add  rdi, [rel wal_fill]
+    mov  rsi, r13
+    mov  rcx, r14
+    rep  movsb
+    add  [rel wal_fill], r14
+    add  qword [r12+16], r14
+    xor  eax, eax
+    ret
+.wl_direct:                          ; larger than the buffer: drain, then write it straight through
+    call mac_wal_drain_fd
+    test rax, rax
+    jnz  .wf
+    mov  rdi, [r12]
     mov  rsi, r13
     mov  rdx, r14
     mov  eax, 1            ; write
@@ -194,6 +244,58 @@ mac_wr_log:
     ret
 .wf:
     mov  rax, -1
+    ret
+
+; mac_wal_drain_fd(fd=rdi) -> rax 0 / -1: write every buffered byte to fd.
+; Loops over short writes; on an error the unwritten tail is moved to the
+; front of the buffer so a retry writes exactly the bytes that never landed.
+; Clobbers rax rcx rdx rsi rdi r8-r11 only.
+mac_wal_drain_fd:
+    mov  r8, rdi
+    lea  r9, [rel wal_buf]
+    mov  r10, [rel wal_fill]
+.wd_loop:
+    test r10, r10
+    jz   .wd_done
+    mov  rdi, r8
+    mov  rsi, r9
+    mov  rdx, r10
+    mov  eax, 1            ; write
+    syscall
+    test rax, rax
+    jle  .wd_err
+    add  r9, rax
+    sub  r10, rax
+    jmp  .wd_loop
+.wd_done:
+    mov  qword [rel wal_fill], 0
+    xor  eax, eax
+    ret
+.wd_err:
+    lea  rdi, [rel wal_buf]
+    mov  rsi, r9
+    mov  rcx, r10
+    rep  movsb             ; dst < src: a forward overlapping copy is safe
+    mov  [rel wal_fill], r10
+    mov  rax, -1
+    ret
+mac_wal_drain_fd_pending:            ; drain to whichever fd owns the pending bytes
+    mov  rdi, [rel wal_fd]
+    jmp  mac_wal_drain_fd
+
+; ============================================================================
+; utxo_store_wal_drain(st) -> 0 ok / -1 write error. Lands the buffered WAL
+; bytes (whichever store they belong to) in the file. Callable from C.
+; ============================================================================
+global utxo_store_wal_drain
+utxo_store_wal_drain:
+    mov  rax, [rel wal_fill]
+    test rax, rax
+    jz   .wdr_none
+    mov  rdi, [rel wal_fd]
+    jmp  mac_wal_drain_fd
+.wdr_none:
+    xor  eax, eax
     ret
 
 ; ============================================================================
@@ -540,15 +642,27 @@ utxo_store_sync:
     sub  rsp, 0x100
     mov  r12, rdi
     mov  r13, rsi
-    ; open utxo.idx O_WRONLY|O_CREAT|O_TRUNC 0644
-    lea  rdi, [rel idxname]
+    ; the checkpoint records ckpt_log_off = log_len: every buffered byte must be in the file first
+    mov  rdi, r12
+    call utxo_store_wal_drain
+    cmp  rax, -1
+    je   .fail
+    ; open utxo.idx.tmp O_WRONLY|O_CREAT|O_TRUNC 0644. The checkpoint used to
+    ; truncate utxo.idx in place and rewrite it; a stop between the two left
+    ; an EMPTY checkpoint and the next boot replayed the UTXO set from
+    ; genesis (2026-09-01 12:29). Now the whole file is written and fsynced
+    ; under a temporary name and rename()d over utxo.idx: readers see the
+    ; old checkpoint or the new one, never a torn one. st->idx_fd (opened at
+    ; init) is only ever fsynced/closed, never written, so the stale inode it
+    ; keeps after the rename is harmless.
+    lea  rdi, [rel idxtmp]
     mov  esi, 1 | 0x40 | 0x200
     mov  edx, 0o644
     mov  eax, 2
     syscall
     test rax, rax
     jl   .fail
-    mov  r14, rax           ; idx fd
+    mov  r14, rax           ; tmp checkpoint fd
     ; header @ rbp-0x60: magic(4) log_off(8) n(8) = 20 bytes
     mov  dword [rbp-0x60], MAGIC_IDX
     mov  rax, [r12+16]
@@ -673,11 +787,18 @@ utxo_store_sync:
     mov  [r12+24], rax      ; ckpt_log_off = log_len
     mov  rax, [r13]
     mov  [r12+32], rax      ; ckpt_n = n
-    ; fsync idx then log
+    ; fsync the tmp checkpoint, then the log
     mov  rdi, r14
     call mac_fsync
     mov  rdi, [r12]
     call mac_fsync
+    ; rename(utxo.idx.tmp, utxo.idx): the atomic publish
+    lea  rdi, [rel idxtmp]
+    lea  rsi, [rel idxname]
+    mov  eax, 82
+    syscall
+    test rax, rax
+    jl   .fclose
     mov  rdi, r14
     mov  eax, 3
     syscall
@@ -693,6 +814,9 @@ utxo_store_sync:
 .fclose:
     mov  rdi, r14
     mov  eax, 3
+    syscall
+    lea  rdi, [rel idxtmp]  ; a failed checkpoint leaves no tmp behind
+    mov  eax, 87
     syscall
 .fail:
     mov  rax, -1
@@ -750,6 +874,11 @@ utxo_store_reload:
     sub  rsp, 0x160+65536
     mov  r12, rdi
     mov  r13, rsi
+    ; ---- (0) land any buffered WAL bytes: the size measured below must be the logical length ----
+    mov  rdi, r12
+    call utxo_store_wal_drain
+    cmp  rax, -1
+    je   .fail
     ; ---- (1) reset table ----
     mov  rdi, r13
     call utxo_store_clear
@@ -1010,6 +1139,9 @@ utxo_store_close:
     mov  rdi, [r12]
     cmp  rdi, -1
     je   .skip_log
+    mov  rdi, r12
+    call utxo_store_wal_drain
+    mov  rdi, [r12]
     call mac_fsync
     mov  rdi, [r12]
     mov  eax, 3
@@ -1028,3 +1160,8 @@ utxo_store_close:
     ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits
+
+section .bss
+wal_buf:   resb WALBUF_CAP      ; buffered WAL bytes not yet written (see mac_wr_log)
+wal_fill:  resq 1               ; bytes valid in wal_buf
+wal_fd:    resq 1               ; the log fd those bytes belong to

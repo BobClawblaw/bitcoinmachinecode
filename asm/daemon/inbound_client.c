@@ -13,6 +13,7 @@
  * Usage: inbound_client <host> <port>
  */
 #include <stdio.h>
+#include "log_ts.h"
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>

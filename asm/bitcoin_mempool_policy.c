@@ -740,6 +740,7 @@ static void node_score(const mpol_node* n, uint64_t* fee, uint64_t* size){
     if (pkg > own){ *fee = n->desc_fee; *size = n->desc_bytes ? n->desc_bytes : 1; }
     else          { *fee = n->fee;      *size = n->size ? n->size : 1; }
 }
+static int worst_package(void* st) __attribute__((unused));
 static int worst_package(void* st){
     mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
@@ -751,6 +752,135 @@ static int worst_package(void* st){
         }
     }
     return best;
+}
+
+/* ---- cluster linearization and the worst chunk (Core v31 TrimToSize) -----
+ * Core evicts by CHUNK: every cluster (connected component of the spend
+ * graph) has a linearization -- a topological order cut into chunks of
+ * non-increasing feerate, a child that pays for its parent sharing the
+ * parent's chunk -- and TrimToSize removes the worst chunk of all clusters
+ * (GetWorstMainChunk), setting the floor to that chunk's feerate plus the
+ * incremental relay fee. Per-leaf eviction scored a child by its own
+ * descendant package, so a cheap parent whose child paid for it could be
+ * kept while a better-paying single transaction was evicted -- the wrong
+ * transaction under load. The linearization here is the ancestor-set
+ * greedy (best ancestor-set feerate first, bumped chunks merged), which is
+ * Core's own pre-cluster ordering and optimal for the chains and small
+ * trees that dominate real pools; Core's exact search only differs on
+ * pathological wide clusters. Clusters larger than CHUNK_MAX_CLUSTER fall
+ * back to the per-leaf score for that cluster alone. */
+#define CHUNK_MAX_CLUSTER 128
+typedef struct { uint32_t idx[CHUNK_MAX_CLUSTER]; int n; uint64_t fee, size; } mpol_chunk;
+
+/* the connected component containing node `seed` (indices), via parent links
+ * in both directions using a caller-built child adjacency */
+static int cluster_members(void* st, uint32_t seed, const uint32_t* child_head, const uint32_t* child_next,
+                           uint32_t* stamp_mark, uint32_t stamp, uint32_t* out, int cap){
+    mpol_node* t = mpol_nodes_base(st);
+    int n = 0, sp = 0; uint32_t stack[CHUNK_MAX_CLUSTER + 1];
+    stamp_mark[seed] = stamp; stack[sp++] = seed;
+    while (sp > 0){
+        uint32_t cur = stack[--sp];
+        if (n >= cap) return -1;
+        out[n++] = cur;
+        for (uint32_t k = 0; k < t[cur].n_parents; k++){
+            uint32_t pp = t[cur].parent[k];
+            if (pp == 0xFFFFFFFFu || stamp_mark[pp] == stamp) continue;
+            if (sp >= CHUNK_MAX_CLUSTER) return -1;
+            stamp_mark[pp] = stamp; stack[sp++] = pp;
+        }
+        for (uint32_t c = child_head[cur]; c != 0xFFFFFFFFu; c = child_next[c]){
+            if (stamp_mark[c] == stamp) continue;
+            if (sp >= CHUNK_MAX_CLUSTER) return -1;
+            stamp_mark[c] = stamp; stack[sp++] = c;
+        }
+    }
+    return n;
+}
+
+/* the LAST chunk of the cluster's linearization (its worst): ancestor-set
+ * greedy over the members, chunks merged while a later one pays more */
+static int cluster_last_chunk(void* st, const uint32_t* mem, int n, mpol_chunk* out){
+    mpol_node* t = mpol_nodes_base(st);
+    unsigned char done[CHUNK_MAX_CLUSTER]; memset(done, 0, sizeof done);
+    mpol_chunk chunks[CHUNK_MAX_CLUSTER]; int nch = 0;
+    int left = n;
+    while (left > 0){
+        /* for every undone member, the feerate of its undone ancestor set */
+        int best = -1; uint64_t bf = 0, bs = 1; uint32_t bestset[CHUNK_MAX_CLUSTER]; int bestn = 0;
+        for (int m = 0; m < n; m++){
+            if (done[m]) continue;
+            /* ancestor set within the cluster (undone only) */
+            unsigned char inset[CHUNK_MAX_CLUSTER]; memset(inset, 0, sizeof inset);
+            uint32_t stk[CHUNK_MAX_CLUSTER]; int sp = 0; inset[m] = 1; stk[sp++] = (uint32_t)m;
+            uint64_t f = 0, sz = 0; int cnt = 0;
+            while (sp > 0){
+                int cur = (int)stk[--sp];
+                f += t[mem[cur]].fee; sz += t[mem[cur]].size; cnt++;
+                for (uint32_t k = 0; k < t[mem[cur]].n_parents; k++){
+                    uint32_t pp = t[mem[cur]].parent[k];
+                    if (pp == 0xFFFFFFFFu) continue;
+                    for (int q = 0; q < n; q++) if (mem[q] == pp && !done[q] && !inset[q]){ inset[q] = 1; stk[sp++] = (uint32_t)q; }
+                }
+            }
+            if (sz == 0) sz = 1;
+            if (best < 0 || (unsigned __int128)f * bs > (unsigned __int128)bf * sz){
+                best = m; bf = f; bs = sz; bestn = 0;
+                for (int q = 0; q < n; q++) if (inset[q]) bestset[bestn++] = (uint32_t)q;
+            }
+        }
+        if (best < 0) break;
+        mpol_chunk* c = &chunks[nch++];
+        c->n = 0; c->fee = bf; c->size = bs;
+        for (int q = 0; q < bestn; q++){ done[bestset[q]] = 1; c->idx[c->n++] = mem[bestset[q]]; }
+        left -= bestn;
+        /* merge backwards while this chunk pays more than the one before it */
+        while (nch >= 2){
+            mpol_chunk* a = &chunks[nch-2]; mpol_chunk* b = &chunks[nch-1];
+            if ((unsigned __int128)b->fee * a->size > (unsigned __int128)a->fee * b->size){
+                for (int q = 0; q < b->n && a->n < CHUNK_MAX_CLUSTER; q++) a->idx[a->n++] = b->idx[q];
+                a->fee += b->fee; a->size += b->size; nch--;
+            } else break;
+        }
+    }
+    if (nch == 0) return 0;
+    *out = chunks[nch-1];
+    return 1;
+}
+
+/* The worst chunk across all clusters: 1 with *out filled, 0 if the pool is
+ * empty. Clusters beyond CHUNK_MAX_CLUSTER contribute their per-leaf worst
+ * (the old score) as a one-member chunk. */
+static int worst_chunk(void* st, mpol_chunk* out){
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    if (n == 0) return 0;
+    static uint32_t child_head[65536], child_next[65536], mark[65536];
+    if (n > 65536) return 0;
+    for (uint32_t i = 0; i < n; i++){ child_head[i] = 0xFFFFFFFFu; child_next[i] = 0xFFFFFFFFu; mark[i] = 0; }
+    for (uint32_t i = 0; i < n; i++)
+        for (uint32_t k = 0; k < t[i].n_parents; k++){
+            uint32_t pp = t[i].parent[k];
+            if (pp == 0xFFFFFFFFu || pp >= n) continue;
+            child_next[i] = child_head[pp]; child_head[pp] = i;   /* a node may be pushed once per parent link: harmless for the walk */
+        }
+    int have = 0; mpol_chunk best; best.n = 0; best.fee = 0; best.size = 1;
+    uint32_t stamp = 1;
+    static uint32_t mem[CHUNK_MAX_CLUSTER + 1];
+    for (uint32_t i = 0; i < n; i++){
+        if (mark[i]) continue;
+        stamp++;
+        int cn = cluster_members(st, i, child_head, child_next, mark, stamp, mem, CHUNK_MAX_CLUSTER);
+        mpol_chunk c;
+        if (cn < 0){
+            /* too wide: per-leaf worst inside this cluster, marks already set for the visited part */
+            int w = (int)i; uint64_t wf, ws; node_score(&t[i], &wf, &ws);
+            c.n = 1; c.idx[0] = (uint32_t)w; c.fee = wf; c.size = ws;
+        } else if (!cluster_last_chunk(st, mem, cn, &c)) continue;
+        if (!have || (unsigned __int128)c.fee * best.size < (unsigned __int128)best.fee * c.size){ best = c; have = 1; }
+    }
+    if (have) *out = best;
+    return have;
 }
 
 /* ========================================================================== */
@@ -1218,18 +1348,20 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * itself would be the worst, reject it as "mempool full". */
     { long put = mpool_put(mp, txid, tx, txlen);
       while (put == 2){
-          int w = worst_package(st);
-          if (w < 0){ _mpol_last_reason = "mempool full"; return 0; }
-          uint64_t wf, ws; node_score(&mpol_nodes_base(st)[w], &wf, &ws);
-          /* incoming loses if its feerate <= the worst package's score */
+          /* Core v31: evict the worst CHUNK of all clusters, not the worst leaf */
+          mpol_chunk wc;
+          if (!worst_chunk(st, &wc) || wc.n == 0){ _mpol_last_reason = "mempool full"; return 0; }
+          uint64_t wf = wc.fee, ws = wc.size ? wc.size : 1;
+          /* incoming loses if its feerate <= the worst chunk's feerate */
           if ((unsigned __int128)fee * ws <= (unsigned __int128)wf * vsize){
               floor_bump(st, wf * 1000 / ws + pol->incremental_fee);
               _mpol_last_reason = "mempool full";
               return 0;
           }
-          unsigned char wt[32]; memcpy(wt, mpol_nodes_base(st)[w].txid, 32);
+          unsigned char wt[CHUNK_MAX_CLUSTER][32]; int wn = wc.n;
+          for (int q = 0; q < wn; q++) memcpy(wt[q], mpol_nodes_base(st)[wc.idx[q]].txid, 32);
           floor_bump(st, wf * 1000 / ws + pol->incremental_fee);
-          mpool_policy_remove_package(st, mp, wt);
+          for (int q = 0; q < wn; q++) mpool_policy_remove_package(st, mp, wt[q]);   /* descendants live in the chunk too; a gone txid is a no-op */
           mpool_compact(mp);
           put = mpool_put(mp, txid, tx, txlen);
       }
@@ -1457,6 +1589,18 @@ static int mpe_seen(unsigned char set[][32], int n, const unsigned char* txid){
  * witness portions need them); the GBT template reads it back through
  * mpool_policy_entry_info. Caller holds mp_lock. (mining-polish graft,
  * re-attached at the 2026-08-27 policy-parity merge.) */
+/* fee estimation (daemon/fee_estimator.c): Core tracks a tx only when it
+ * has no in-mempool parents and was not submitted as part of a package. */
+long mpool_policy_n_parents(void* st, const unsigned char txid[32]){
+    if (!st || *(uint32_t*)st != MPOL_MAGIC) return -1;
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    for (uint32_t i = n; i > 0; i--)
+        if (!memcmp(t[i-1].txid, txid, 32)) return (long)t[i-1].n_parents;
+    return -1;
+}
+int mpol_in_package_context(void){ return g_pkg_n > 0; }
+
 long mpool_policy_set_sigops(void* st, const unsigned char txid[32], unsigned int cost){
     if (!st || *(uint32_t*)st != MPOL_MAGIC) return 0;
     mpol_node* t = mpol_nodes_base(st);

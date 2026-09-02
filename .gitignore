@@ -417,3 +417,6 @@ asm/tests/tool_*
 config/bitcoin.testnet4.conf
 config/bitcoin.regtest.conf
 port/arm64/parity_out/
+asm/daemon/build_txospender_index
+asm/daemon/utxo_dump_keys
+asm/daemon/utxo_repair_del

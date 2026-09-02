@@ -302,6 +302,21 @@ static void compact_poll(void){
 static void compact_flush_hook(void){ compact_poll(); }
 /* Leveled: which runs to merge, by size ratio (lsm_compact_pick). Sizes come
  * from the run files themselves. Returns k, sets *lo. */
+/* Byte budget for the mapped run files: 45% of MemTotal by default (the
+ * memtable mapping, the flush scratch and the rest of the box need the
+ * other half), overridable for tests. 0 = off. */
+static u64 g_run_budget = ~0ULL;
+u64 utxo_live_run_budget(void){
+    if (g_run_budget != ~0ULL) return g_run_budget;
+    u64 kb = 0; FILE* f = fopen("/proc/meminfo", "r");
+    if (f){ char line[128]; while (fgets(line, sizeof line, f)) if (!strncmp(line, "MemTotal:", 9)){ kb = strtoull(line + 9, NULL, 10); break; } fclose(f); }
+    /* 35%, not 45%: on the 63 GB box the worker itself holds ~16 GB of anonymous
+     * flush scratch plus the file-backed memtable, and at 25.7 GB of runs (4 runs)
+     * lookups were already faulting from disk (2026-09-01 18:09, 3-12 blk/s). */
+    g_run_budget = kb ? kb * 1024 / 100 * 35 : 0;
+    return g_run_budget;
+}
+void utxo_live_set_run_budget(unsigned long long bytes){ g_run_budget = bytes; }
 static long compact_pick_now(long* lo){
     long n = (long)g_utxo_lst.manifest_n;
     if (n < 2) return 0;
@@ -313,7 +328,15 @@ static long compact_pick_now(long* lo){
         char nm[64]; snprintf(nm, sizeof nm, "utxo_run_%06u.dat", (unsigned)r);
         struct stat sb; sizes[i] = stat(nm, &sb) == 0 ? (u64)sb.st_size : 0;
     }
-    return lsm_compact_pick(sizes, n, utxo_live_compact_threshold(), 64, lo);
+    u64 budget = utxo_live_run_budget();
+    long k = lsm_compact_pick_budget(sizes, n, utxo_live_compact_threshold(), 64, budget, lo);
+    if (k && n < utxo_live_compact_threshold()){
+        static long announced = -1; u64 total = 0; for (long i = 0; i < n; i++) total += sizes[i];
+        if (announced != n){ announced = n;
+            fprintf(stderr, "[utxo_live] run files total %.1f GB > budget %.1f GB (35%% of RAM) -- compacting %ld of %ld runs below the count threshold\n",
+                    (double)total / 1e9, (double)budget / 1e9, k, n); }
+    }
+    return k;
 }
 static long g_cmp_lo = 0;
 static int compact_start_async(long height, const char* why){
@@ -373,6 +396,41 @@ static long  g_applied_height = -1;
 /* Height whose block is currently being applied -- the key undo records are
  * filed under. Set by apply_block_at before any walk begins. */
 static long  g_apply_height = -1;
+/* -assumevalid (2026-09-01): the height of the operator's assumed-valid block,
+ * resolved from the archive index at init (-1 = none). While applying a block
+ * at or below it, tx_verify's script EVALUATION is switched off -- everything
+ * else (PoW, merkle, structure, every UTXO check) runs unchanged, exactly
+ * Core's semantics. A submitblock dry run always evaluates scripts. */
+extern void tx_verify_set_script_checks(int on);
+static long g_assumevalid_height = -1;
+static int  g_av_announced_end = 0;
+extern const chainparams_t* g_chainp;
+static void utxo_live_resolve_assumevalid(void){
+    g_assumevalid_height = -1;
+    unsigned char want[32];
+    if (g_cfg.assumevalid_mode == 2) return;                       /* assumevalid=0 */
+    if (g_cfg.assumevalid_mode == 1) memcpy(want, g_cfg.assumevalid, 32);
+    else {                                                          /* the chain default, as Core ships it */
+        if (!g_chainp || !g_chainp->assumevalid) return;
+        const char* hx = g_chainp->assumevalid;
+        for (int q = 0; q < 32; q++){
+            int hi = hx[2*q], lo = hx[2*q+1];
+            hi = hi>='0'&&hi<='9'?hi-'0':hi>='a'&&hi<='f'?hi-'a'+10:hi-'A'+10;
+            lo = lo>='0'&&lo<='9'?lo-'0':lo>='a'&&lo<='f'?lo-'a'+10:lo-'A'+10;
+            want[31-q] = (unsigned char)((hi<<4)|lo);
+        }
+    }
+    FILE* f = fopen("index.dat", "rb"); if (!f) return;
+    unsigned char rec[48]; long h = 0;
+    while (fread(rec, 1, 48, f) == 48){ if (!memcmp(rec, want, 32)){ g_assumevalid_height = h; break; } h++; }
+    fclose(f);
+    if (g_assumevalid_height >= 0)
+        fprintf(stderr, "[utxo_live] assumevalid: block found at height %ld -- script evaluation skipped through it, resumed above\n", g_assumevalid_height);
+    else
+        fprintf(stderr, "[utxo_live] assumevalid: block not in the archive -- every script is evaluated\n");
+}
+
+
 
 /* Mined-transaction callback: the serve worker registers a hook that removes
  * each just-CONFIRMED txid from the shared mempool, so getblocktemplate can
@@ -505,7 +563,10 @@ void utxo_live_set_coinstats(csi_coin_fn add, csi_coin_fn rm,
     g_csi_add = add; g_csi_rm = rm; g_csi_inval = inval; g_csi_commit = commit;
 }
 
+extern long utxo_store_wal_drain(void* st);
 static int persist_applied_height(long h){
+    /* the height claims every op through h is in the WAL: land the buffer first */
+    if (utxo_store_wal_drain(&g_utxo_lst) != 0) return 0;
     u8 buf[12];
     u32 magic = UTXO_APPLIED_HEIGHT_MAGIC;
     memcpy(buf, &magic, 4);
@@ -530,6 +591,8 @@ static int persist_applied_height(long h){
 }
 
 /* ---- per-block apply, reusing the shared walker from utxo_walk.h ---- */
+static long g_store_inconsistent = 0;   /* set when a spend found no coin the verifier had just resolved (incident 2026-09-01) */
+static int  g_halted = 0;               /* UTXO tracking halted for the life of the process (see utxo_live_halted) */
 typedef struct {
     const u8* txid;
     long fatal;
@@ -554,6 +617,26 @@ static void live_on_input(void* ctxv, const u8 txid[32], u32 index){
          * reads back. */
         long r = undo_capture_and_del(&g_utxo_lst, g_utxo_table, g_apply_height, txid, index);
         if (r == -1) ctx->fatal = 1;
+        /* Incident 2026-09-01 (the 2,596 resurrected coins): a 0 here used to be
+         * silently accepted as "already absent, re-applied block". That rationale
+         * died when Stage D started verifying every prevout BEFORE the apply and
+         * utxo_live_recover_partial_block took over crash-resumed blocks: by the
+         * time we are here, Phase 1 resolved this exact outpoint a moment ago, so
+         * an absent coin now can only mean the store answered two different
+         * things to the same question. Under b3d47a9's bad sparse samples that
+         * is precisely what happened -- the lookup inside undo_capture_and_del
+         * missed for ~10-15% of the coins in a freshly flushed run, the spend was
+         * skipped, and the coin came back from the run. The block fails instead
+         * (rollback_partial_apply restores the spends already made from this
+         * block's undo records), the failure is classified as a store error, and
+         * the node retries from the checkpoint -- loudly, never silently. */
+        if (r == 0) {
+            fprintf(stderr, "[utxo_live] FATAL h=%ld: prevout resolved by verification is ABSENT at apply (store lookup inconsistency) -- failing the block\n",
+                    g_apply_height);
+            g_store_inconsistent = 1;
+            g_halted = 1;          /* nothing below (rollback, retry, recovery) can trust a lookup now */
+            ctx->fatal = 1;
+        }
         g_test_input_count++;
         UTXO_LIVE_TEST_CRASH_AT(UTXO_LIVE_CRASH_AFTER_INPUTS, g_test_input_count);
         return;
@@ -939,6 +1022,39 @@ static int bip30_enforced(long height, const u8 hash32[32])
 static const char* g_last_reject = "";
 const char* utxo_live_last_reject(void){ return g_last_reject; }
 
+/* ---- failure classification + honest recovery (incident 2026-09-01) ----
+ * utxo_live_catchup() used to fail with a bare -1 and daemon/main.c treated
+ * EVERY failure as "manifest full": compact in place, retry, and call the
+ * retry's success proof that the failure was benign. On 2026-09-01 eight
+ * consensus REJECTs ("input references a missing/already-spent UTXO", caused
+ * by b3d47a9's sparse-index offsets) were "recovered" that way, and each
+ * round silently lost the spends of the block applied just before the
+ * failure: 2,596 spent coins resurrected, muhash parity broken from height
+ * 539,017 to the tip. So:
+ *   - every failure is CLASSIFIED (consensus reject / store error / other);
+ *   - utxo_live_recovery_applicable() admits compaction ONLY for a store
+ *     error with a genuinely full manifest -- the one condition compaction
+ *     actually cures;
+ *   - utxo_live_verify_after_recovery(count_before) walks the whole set and
+ *     requires walk == counter == the pre-recovery count. A mismatch HALTS
+ *     UTXO tracking for the life of the process (utxo_live_halted()); the
+ *     operator drops and rebuilds. Continuing on an inconsistent set is how
+ *     the damage became permanent last time. */
+#define UTXO_FAIL_NONE   0
+#define UTXO_FAIL_REJECT 1   /* verification refused the block: utxo_live_last_reject() names it */
+#define UTXO_FAIL_STORE  2   /* a put/del/flush/WAL step returned an error */
+#define UTXO_FAIL_OTHER  3   /* hole/short block, partial-block recovery failure */
+static int  g_last_fail_kind = UTXO_FAIL_NONE;
+long utxo_live_store_inconsistencies(void){ return g_store_inconsistent; }
+static long g_last_fail_height = -1;
+long utxo_live_last_fail_kind(void){ return g_last_fail_kind; }
+long utxo_live_last_fail_height(void){ return g_last_fail_height; }
+long utxo_live_halted(void){ return g_halted; }
+const char* utxo_live_fail_kind_name(long k){
+    return k == UTXO_FAIL_REJECT ? "consensus-reject" : k == UTXO_FAIL_STORE ? "store-error"
+         : k == UTXO_FAIL_OTHER ? "archive/recovery" : "none";
+}
+
 /* Point query against the LIVE UTXO set, for the gettxout IPC (daemon/main.c).
  * The RPC server runs in the serve PARENT and has no handle on this state --
  * the download worker (this process) owns it. Called ONLY from the worker's
@@ -1258,14 +1374,43 @@ long utxo_live_dryrun_block(const u8* blockbuf, u64 blocklen, long height){
     long saved = g_apply_height;
     g_apply_height = height;
     g_dry_run = 1;
+    tx_verify_set_script_checks(1);           /* a proposal is never assumed valid */
     int r = apply_block_inner(blockbuf, blocklen);
     g_dry_run = 0;
     g_apply_height = saved;
     return r;
 }
 
+extern void undo_close_current(void);
+static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height);
+/* Block boundary = WAL drain + undo file close (2026-09-01): the WAL is
+ * buffered in the store (one write per block instead of one per record)
+ * and the block's undo file stays open across its inputs. Both land here,
+ * success or failure, so everything after this point -- the checkpoint, a
+ * rollback, the next block's undo file -- sees a complete on-disk record. */
 static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
+    int r = apply_block_at_inner(blockbuf, blocklen, height);
+    undo_close_current();
+    if (utxo_store_wal_drain(&g_utxo_lst) != 0) {
+        fprintf(stderr, "[utxo_live] FATAL: WAL drain failed after height %ld\n", height);
+        g_last_fail_kind = UTXO_FAIL_STORE; g_last_fail_height = height;
+        return 0;
+    }
+    if (!r) {
+        /* apply_block_inner clears g_last_reject at entry and sets it on
+         * every verification refusal; a failure with it still empty came
+         * from the store (put/del -1, table full) -- see live_on_input/output. */
+        g_last_fail_kind = g_last_reject[0] ? UTXO_FAIL_REJECT : UTXO_FAIL_STORE;
+        g_last_fail_height = height;
+    }
+    return r;
+}
+static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height){
     g_apply_height = height;
+    { int on = (g_assumevalid_height < 0 || height > g_assumevalid_height);
+      tx_verify_set_script_checks(on);
+      if (on && g_assumevalid_height >= 0 && !g_av_announced_end){ g_av_announced_end = 1;
+          fprintf(stderr, "[utxo_live] assumevalid: above height %ld -- script evaluation resumed\n", g_assumevalid_height); } }
     /* GHOST GUARD (closes the multi-block WAL-vs-checkpoint window, 2026-08-25):
      * an undo_<h>.dat here can only mean h was applied -- partially or fully --
      * by a previous process whose checkpoint never landed (a clean apply +
@@ -1436,6 +1581,16 @@ static void del_created_on_output(void* ctxv, u32 out_index, u64 value,
      * 151) after its key-by-key comparison had already passed. One get per
      * created output, on rollback/unapply paths only. */
     u64 v=0; unsigned long hh=0, cb=0, sl=0; const u8* sc=0;
+    if (g_store_inconsistent) {
+        /* Incident 2026-09-01: the get above is the same lookup that just lied.
+         * Gating the delete on it left 122 of a rolled-back block's outputs in
+         * the set in the repro. Delete unconditionally: the tally may drift by
+         * the absent keys, but the node is halting and the operator rebuilds. */
+        static int said = 0;
+        if (!said++) fprintf(stderr, "[utxo_live] rollback under a store inconsistency: deleting created outputs without a lookup (live counter may drift; rebuild pending)\n");
+        if (utxo_lsm_del(&g_utxo_lst, g_utxo_table, c->txid, out_index) < 0) c->fatal = 1;
+        return;
+    }
     if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, c->txid, out_index, &v, &hh, &cb, &sc, &sl) != 1) return;
     /* copy the script BEFORE the del: get()'s pointer is only valid until
      * the next LSM call, and the remove-event needs the exact bytes */
@@ -1760,6 +1915,7 @@ long utxo_live_compact_threshold(void){
 extern void txv_set_bulk_mode(int on);
 
 int utxo_live_init(const char* dir){
+    utxo_live_resolve_assumevalid();
     g_recovery_checked = 0;
     g_test_input_count = 0;
     /* Pick the memtable size from how far behind we actually are. */
@@ -1902,7 +2058,8 @@ int utxo_live_init(const char* dir){
      * steady-state catch-up uses (UTXO_LIVE_COMPACT_THRESHOLD). Bounded by
      * manifest_cap iterations so a compact() that stops making progress
      * (e.g. every remaining run already merged) can't spin forever. */
-    for (unsigned long guard = 0; g_utxo_lst.manifest_n >= (u64)utxo_live_compact_threshold() && guard < UTXO_LIVE_MANIFEST_CAP; guard++) {
+    for (unsigned long guard = 0; g_utxo_lst.manifest_n >= 2 && guard < UTXO_LIVE_MANIFEST_CAP; guard++) {
+        /* count threshold OR byte budget (2026-09-01): compact_pick_now applies both */
         u64 before = g_utxo_lst.manifest_n;
         long lo = 0, k = compact_pick_now(&lo);
         if (k == 0) break;   /* (subsumes the old before<2 guard: pick returns 0 for n<2) */
@@ -1985,16 +2142,25 @@ long utxo_live_catchup(void* store_buf){
         g_recovery_checked = 1;
         g_recovery_result = utxo_live_recover_partial_block(store_buf);
     }
-    if (g_recovery_result < 0) return -1;
+    if (g_recovery_result < 0) { g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = g_applied_height + 1; return -1; }
+    if (g_halted) return -1;          /* utxo_live_verify_after_recovery() found the set inconsistent */
     if (tip < 0 || tip <= g_applied_height) return 0;
+    g_last_fail_kind = UTXO_FAIL_NONE;
 
     static u8 blockbuf[8<<20];
     long applied = 0;
     time_t last_progress_log = 0;   /* 0 => the first block prints immediately (restart-visible) */
+    /* rate + ETA on the progress tick (2026-09-01): instantaneous rate over
+     * the last tick interval, session-average rate since this call began
+     * (the ETA uses the average -- flush pauses make the instantaneous
+     * figure swing 0..80 blk/s), ETA as DD:HH:MM:SS of the remaining gap. */
+    long long cu_t0 = mono_ms(), cu_last_ms = cu_t0;
+    long cu_h0 = g_applied_height, cu_last_h = g_applied_height;
     for (long h = g_applied_height + 1; h <= tip; h++){
         long len = store_read_at(store_buf, h, blockbuf, sizeof blockbuf);
         if (len < 81) {
             fprintf(stderr, "[utxo_live] WARNING: hole/short block at height %ld (len=%ld) -- stopping catch-up short\n", h, len);
+            g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = h;
             break;
         }
         if (!apply_block_at(blockbuf, (u64)len, h)) {
@@ -2092,8 +2258,16 @@ long utxo_live_catchup(void* store_buf){
         {
             time_t now = time(NULL);
             if (now - last_progress_log >= 30 || h % 20000 == 0) {
-                fprintf(stderr, "[utxo_live] catchup progress: height=%ld/%ld (%.1f%%)\n",
-                        h, tip, tip > 0 ? 100.0 * (double)h / (double)tip : 0.0);
+                long long nowms = mono_ms();
+                double inst = nowms > cu_last_ms ? (double)(h - cu_last_h) * 1000.0 / (double)(nowms - cu_last_ms) : 0.0;
+                double avg  = nowms > cu_t0     ? (double)(h - cu_h0)     * 1000.0 / (double)(nowms - cu_t0)     : 0.0;
+                long rem = tip - h, eta = avg > 0.0 ? (long)((double)rem / avg) : -1;
+                char etabuf[32];
+                if (eta >= 0) snprintf(etabuf, sizeof etabuf, "%02ld:%02ld:%02ld:%02ld", eta / 86400, (eta / 3600) % 24, (eta / 60) % 60, eta % 60);
+                else          snprintf(etabuf, sizeof etabuf, "--:--:--:--");
+                fprintf(stderr, "[utxo_live] catchup progress: height=%ld/%ld (%.1f%%) %.1f blk/s (avg %.1f) eta %s\n",
+                        h, tip, tip > 0 ? 100.0 * (double)h / (double)tip : 0.0, inst, avg, etabuf);
+                cu_last_ms = nowms; cu_last_h = h;
                 last_progress_log = now;
             }
         }
@@ -2205,6 +2379,46 @@ long utxo_live_recover(void){
         rounds++;
     }
     return rounds;
+}
+
+/* Is compaction the right answer to the last failure? Only for a store
+ * error with a full manifest (mac_flush refuses to add a run once manifest_n
+ * reaches manifest_cap, and every later put/del fails). Anything else --
+ * a consensus reject above all -- is NOT cured by merging runs, and merging
+ * runs under a failure we do not understand is exactly what lost 2,596
+ * spends on 2026-09-01. Logs its verdict either way so the operator sees
+ * WHY the node did or did not compact. */
+long utxo_live_recovery_applicable(void){
+    unsigned long n = (unsigned long)g_utxo_lst.manifest_n, cap = (unsigned long)g_utxo_lst.manifest_cap;
+    if (g_last_fail_kind == UTXO_FAIL_STORE && cap && n >= cap){
+        fprintf(stderr, "[utxo_live] recovery applicable: store error at height %ld with a FULL manifest (%lu/%lu runs)\n",
+                g_last_fail_height, n, cap);
+        return 1;
+    }
+    fprintf(stderr, "[utxo_live] recovery REFUSED: failure at height %ld is %s (%s), manifest %lu/%lu -- compaction would not cure it\n",
+            g_last_fail_height, utxo_live_fail_kind_name(g_last_fail_kind),
+            g_last_fail_kind == UTXO_FAIL_REJECT ? g_last_reject : "-", n, cap);
+    return 0;
+}
+
+/* After a recovery compaction: the set must be exactly what it was before
+ * (the failed block was rolled back before recovery ran), by the ground-
+ * truth walk, and the O(1) counter must agree. Any other outcome means the
+ * merge changed the set -- halt, loudly, permanently for this process. */
+long utxo_live_walk_count(void);
+long utxo_live_verify_after_recovery(long count_before){
+    if (g_halted){ fprintf(stderr, "[utxo_live] post-recovery check: already HALTED -- stays halted\n"); return 0; }
+    long walk = utxo_live_walk_count();
+    long counter = utxo_lsm_count(&g_utxo_lst);
+    if (walk >= 0 && walk == count_before && counter == count_before){
+        fprintf(stderr, "[utxo_live] post-recovery check OK: walk=%ld == counter=%ld == pre-recovery count\n", walk, counter);
+        return 1;
+    }
+    g_halted = 1;
+    fprintf(stderr, "[utxo_live] POST-RECOVERY CHECK FAILED: walk=%ld counter=%ld pre-recovery=%ld -- the compaction changed the set. "
+                    "UTXO tracking HALTED for this process; operator: drop and rebuild the UTXO state (archive_drop_utxo_state), do not trust gettxoutsetinfo until then\n",
+            walk, counter, count_before);
+    return 0;
 }
 
 long utxo_live_applied_height(void){ return g_applied_height; }

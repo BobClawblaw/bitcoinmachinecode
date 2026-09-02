@@ -23,6 +23,15 @@ static np_entry_t g_np[NP_MAX_ENTRIES];
 static int        g_np_n;
 
 int netperm_count(void){ return g_np_n; }
+static unsigned g_implicit_flags = NP_NOBAN | NP_DOWNLOAD | NP_MEMPOOL | NP_RELAY;   /* Core defaults: whitelistrelay=1 */   /* Core: whitelistrelay=1, whitelistforcerelay=0 */
+void netperm_set_implicit_defaults(int relay, int forcerelay){
+    /* Core (net.cpp, Implicit): NoBan (+Download), Mempool, Relay if
+     * -whitelistrelay, ForceRelay(+Relay) if -whitelistforcerelay */
+    g_implicit_flags = NP_NOBAN | NP_DOWNLOAD | NP_MEMPOOL | (relay ? NP_RELAY : 0) | (forcerelay ? (NP_FORCERELAY | NP_RELAY) : 0);
+    /* entries already parsed without an explicit perms@ list follow the new
+     * defaults (whitelistrelay= may sit below whitelist= in the file) */
+    for (int i = 0; i < g_np_n; i++) if (g_np[i].implicit) g_np[i].flags = g_implicit_flags;
+}
 
 int netperm_add(const char* spec, const char** err){
     static const char* dummy;
@@ -35,7 +44,7 @@ int netperm_add(const char* spec, const char** err){
     if (strlen(spec) >= sizeof buf){ *err = "too long"; return 0; }
     snprintf(buf, sizeof buf, "%s", spec);
 
-    unsigned flags = NP_NOBAN;
+    unsigned flags = g_implicit_flags;
     int implicit = 1;
     char* at = strrchr(buf, '@');       /* rightmost: IPv6 has no '@' */
     char* addrpart = buf;
@@ -98,7 +107,7 @@ int netperm_whitebind_add(const char* spec, const char** err){
     if (strlen(spec) >= sizeof buf){ *err = "too long"; return 0; }
     snprintf(buf, sizeof buf, "%s", spec);
 
-    unsigned flags = NP_NOBAN;
+    unsigned flags = g_implicit_flags;   /* a bare addr:port gets Core's implicit set, as -whitelist does */
     char* at = strrchr(buf, '@');
     char* hostpart = buf;
     if (at){
@@ -147,10 +156,8 @@ void netperm_reset(void){ g_np_n = 0; }
  * satisfy an ordering constraint is how the previous edit broke it. */
 static int parse_perms(const char* s, unsigned* flags, const char** err);
 
-static const char* const k_known[] = {
-    "bloomfilter", "relay", "forcerelay", "download", "mempool", "addr",
-    "in", "out", 0
-};
+/* Recognised by Core, refused here with the reason (see netperm.h). */
+static const char* const k_refused[] = { "bloomfilter", "out", 0 };
 
 static int parse_perms(const char* s, unsigned* flags, const char** err){
     char buf[256];
@@ -159,13 +166,18 @@ static int parse_perms(const char* s, unsigned* flags, const char** err){
     *flags = 0;
     char* save = 0;
     for (char* t = strtok_r(buf, ",", &save); t; t = strtok_r(0, ",", &save)){
-        if (!strcmp(t, "noban")){ *flags |= NP_NOBAN; continue; }
-        for (int i = 0; k_known[i]; i++)
-            if (!strcmp(t, k_known[i])){
-                /* Recognised by Core, not enforced here. Saying so is the
-                 * whole point: the alternative is accepting it silently. */
-                *err = "recognised by Core but NOT enforced by this node "
-                       "(only `noban` is); remove it rather than rely on it";
+        if (!strcmp(t, "noban")){ *flags |= NP_NOBAN | NP_DOWNLOAD; continue; }          /* Core: noban implies download */
+        if (!strcmp(t, "relay")){ *flags |= NP_RELAY; continue; }
+        if (!strcmp(t, "forcerelay")){ *flags |= NP_FORCERELAY | NP_RELAY; continue; }   /* Core: forcerelay implies relay */
+        if (!strcmp(t, "mempool")){ *flags |= NP_MEMPOOL; continue; }
+        if (!strcmp(t, "download")){ *flags |= NP_DOWNLOAD; continue; }
+        if (!strcmp(t, "addr")){ *flags |= NP_ADDR; continue; }
+        if (!strcmp(t, "in")) continue;                                                  /* Core's default direction: inbound */
+        for (int i = 0; k_refused[i]; i++)
+            if (!strcmp(t, k_refused[i])){
+                *err = !strcmp(t, "bloomfilter")
+                     ? "recognised by Core but NOT enforced by this node (BIP37 bloom filters are not implemented); remove it rather than rely on it"
+                     : "recognised by Core but NOT enforced by this node (whitelist applies to inbound peers only here); remove it rather than rely on it";
                 return 0;
             }
         *err = "unknown permission";
@@ -181,4 +193,16 @@ unsigned netperm_for(const char* ip){
     for (int i = 0; i < g_np_n; i++)
         if (subnet_covers(&g_np[i].net, ip)) out |= g_np[i].flags;
     return out;
+}
+
+int netperm_names(unsigned flags, const char** out, int cap){
+    int n = 0;
+    /* Core NetPermissions::ToStrings order */
+    if (n < cap && (flags & NP_NOBAN))      out[n++] = "noban";
+    if (n < cap && (flags & NP_FORCERELAY)) out[n++] = "forcerelay";
+    if (n < cap && (flags & NP_RELAY))      out[n++] = "relay";
+    if (n < cap && (flags & NP_MEMPOOL))    out[n++] = "mempool";
+    if (n < cap && (flags & NP_DOWNLOAD))   out[n++] = "download";
+    if (n < cap && (flags & NP_ADDR))       out[n++] = "addr";
+    return n;
 }

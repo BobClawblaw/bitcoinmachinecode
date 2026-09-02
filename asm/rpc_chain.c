@@ -59,6 +59,7 @@
 #include "version_gen.h"
 
 #include <stdio.h>
+#include "daemon/log_ts.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -115,6 +116,20 @@ static void default_stop(void){ kill(getpid(), SIGTERM); }
 static void (*g_stop_fn)(void) = default_stop;
 void rpc_chain_set_stop_handler(void (*fn)(void)){ g_stop_fn = fn ? fn : default_stop; }
 void rpc_chain_set_prune_mib(long mib){ g_prune_mib = mib; }
+/* -blockmaxweight/-blockreservedweight/-blockmintxfee/-blockversion/-printpriority
+ * and -maxtipage: injected by main.c from the config (this file never includes
+ * node_config.h). Defaults are Core's. */
+static long g_gbt_maxweight = 4000000, g_gbt_reserved = 8000, g_gbt_minfee_satkvb = 1;
+static int  g_gbt_version = 0, g_gbt_printpriority = 0;
+static long g_maxtipage = 86400;
+void rpc_chain_set_gbt_policy(long maxweight, long reserved, long minfee_satkvb, int version, int printpriority){
+    if (maxweight < 4000) maxweight = 4000; if (maxweight > 4000000) maxweight = 4000000;
+    if (reserved < 2000) reserved = 2000; if (reserved > maxweight) reserved = maxweight;
+    g_gbt_maxweight = maxweight; g_gbt_reserved = reserved;
+    g_gbt_minfee_satkvb = minfee_satkvb < 0 ? 0 : minfee_satkvb;
+    g_gbt_version = version; g_gbt_printpriority = printpriority;
+}
+void rpc_chain_set_maxtipage(long seconds){ g_maxtipage = seconds < 0 ? 0 : seconds; }
 
 #define ST_IDX_FD(st)     (*(long*)((u8*)(st)+8))
 #define ST_TIP(st)        (*(int*)((u8*)(st)+24))
@@ -593,6 +608,19 @@ static rj_val* script_pubkey_json_x(const u8* s, size_t n, int want_desc){
     rj_obj_set(o, "type", rj_str(type));
     return o;
 }
+/* exported for decodepsbt (witness_utxo.scriptPubKey), the tx-output shape with desc */
+rj_val* rpc_chain_script_pubkey_json(const unsigned char* sc, unsigned long n){ return script_pubkey_json_x(sc, (size_t)n, 1); }
+/* ScriptToAsmStr(script, attempt_sighash_decode) -- decodepsbt final_scriptSig */
+char* rpc_chain_script_asm(const unsigned char* sc, unsigned long n, int sighash){ return script_asm(sc, (size_t)n, sighash); }
+/* ScriptToUniv(include_hex=true, include_address=false): decodepsbt's redeem_script / witness_script */
+rj_val* rpc_chain_script_json_noaddr(const unsigned char* sc, unsigned long n){
+    rj_val* o = rj_obj();
+    char* a = script_asm(sc, n, 0); rj_obj_set(o, "asm", rj_str(a ? a : "")); free(a);
+    /* no "desc": Core's decodepsbt calls the ScriptToUniv overload without a provider for these */
+    char* h = malloc(n*2 + 1); if (h){ hex_of(h, sc, n); rj_obj_set(o, "hex", rj_str(h)); free(h); }
+    rj_obj_set(o, "type", rj_str(script_type(sc, n)));
+    return o;
+}
 
 /* ---- TxToUniv (core_io.cpp), include_hex=true, no undo data ---- */
 static rj_val* amount_json(u64 sats){ return rj_numf("%llu.%08llu", sats / 100000000ULL, sats % 100000000ULL); }
@@ -968,7 +996,7 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
     rj_val* o = rj_obj();
     { rj_val* caps = rj_arr(); rj_arr_push(caps, rj_str("proposal"));
       rj_obj_set(o, "capabilities", caps); }
-    rj_obj_set(o, "version", rj_numf("%d", 536870912));      /* 0x20000000 */
+    rj_obj_set(o, "version", rj_numf("%d", g_gbt_version ? g_gbt_version : 536870912));  /* 0x20000000 unless -blockversion */
     { rj_val* rls = rj_arr();
       rj_arr_push(rls, rj_str("csv")); rj_arr_push(rls, rj_str("!segwit"));
       rj_arr_push(rls, rj_str("taproot"));
@@ -993,16 +1021,26 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
         { u8* m = (u8*)g_gbt_mph.mp; unsigned long long mask; memcpy(&mask, m+8, 8);
           for (unsigned long i = 0; i <= mask && n < GBT_MAX_TX; i++){
               gbt_ent e; if (gbt_slot(g_gbt_mph.mp, i, &e) == 1) ents[n++] = e; } }
-        /* ---- ancestor-package greedy selection (Core addPackageTxs) ----
-         * Repeatedly pick the candidate whose ANCESTOR PACKAGE (its not-yet-
-         * selected in-pool ancestors + itself) has the highest package
-         * feerate; emit that package parents-first; repeat. CPFP falls out:
-         * a high-fee child lifts its cheap parent's package score. Weight
-         * and sigop budgets are Core's (4M weight / 80k cost, minus the
-         * 4000-weight / 400-sigop coinbase reservation); an over-budget
-         * package is skipped and selection continues. Tie-break: smaller
-         * txid (Core tie-breaks inside its modified-set comparator; the
-         * ordering difference is score-equal, documented divergence). */
+        /* ---- chunk selection (Core v31 cluster mempool: BlockAssembler over
+         * the linearization) ----
+         * Each cluster (connected component of the spend graph) is
+         * linearized -- ancestor-set greedy, a later chunk that pays more
+         * than the one before it merged into it -- into chunks of
+         * non-increasing feerate. The block is filled with WHOLE chunks in
+         * feerate order across clusters, parents-first inside a chunk. A
+         * chunk that does not fit is skipped together with the rest of its
+         * cluster (later chunks depend on it) and selection continues with
+         * other clusters' chunks: Core's BlockBuilder::Skip. Ancestor-
+         * package greedy (Core's addPackageTxs before v31) scored a package
+         * by its ancestor set alone and skipped per package; the chunk view
+         * is what lifts a cheap parent by the chunk it ends up in, and what
+         * keeps a skipped cluster's descendants out. Weight and sigop budgets
+         * are Core's (4M weight / 80k cost, minus the 4000-weight / 400-sigop
+         * coinbase reservation). Tie-break among equal feerates: the cluster
+         * seen first (slot order), then the smaller txid -- Core's exact tie
+         * order is not part of the protocol. Clusters wider than
+         * GBT_CLUSTER_MAX are linearized without the merge step (each
+         * ancestor set is its own chunk), which is the pre-v31 order. */
         static mp_entry_info infs[GBT_MAX_TX];
         static unsigned char have_inf[GBT_MAX_TX];
         static unsigned long long tfee[GBT_MAX_TX], tsize[GBT_MAX_TX];
@@ -1021,61 +1059,118 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
                         ? (long)infs[i].sigop_cost
                         : (g_gbt_sigop_cost ? g_gbt_sigop_cost(ents[i].tx, ents[i].len) : 0);
         }
-        long emitted_n = 0;
-        long long budget_w = 4000000 - 4000, budget_s = 80000 - 400;
-        long long used_w = 0, used_s = 0;
-        for (long round = 0; round < n; round++){
-            long best = -1;
-            unsigned long long bf = 0, bs = 1;
-            for (long i = 0; i < n; i++){
-                if (emitted[i] || skipped[i] || !have_inf[i]) continue;
-                /* package = ancestors (incl self) minus already-emitted */
-                unsigned long long pf = infs[i].anc_fee, ps = infs[i].anc_size;
-                int unresolved = 0;
-                for (int a = 0; a < infs[i].n_anc; a++){
-                    if (!memcmp(infs[i].anc[a], ents[i].txid, 32)) continue;   /* self */
-                    long j = -1;
-                    for (long m = 0; m < n; m++)
-                        if (!memcmp(ents[m].txid, infs[i].anc[a], 32)){ j = m; break; }
-                    if (j < 0){ unresolved = 1; break; }       /* registry-stale */
-                    if (emitted[j]){ pf -= tfee[j]; ps -= tsize[j]; }
-                    else if (skipped[j]){ unresolved = 1; break; }
-                }
-                if (unresolved){ skipped[i] = 1; continue; }
-                if (ps == 0) ps = 1;
-                /* pf/ps > bf/bs  <=>  pf*bs > bf*ps (fits: fee<2^40, size<2^24) */
-                int better = (best < 0) || (pf * bs > bf * ps) ||
-                             (pf * bs == bf * ps && memcmp(ents[i].txid, ents[best].txid, 32) < 0);
-                if (better){ best = i; bf = pf; bs = ps; }
-            }
-            if (best < 0) break;
-            /* collect the package as candidate indexes */
-            int pkg[MPE_MAX_SET]; int np = 0;
-            long long ww = 0, ss = 0;
-            for (int a = 0; a < infs[best].n_anc && np < MPE_MAX_SET; a++){
+        /* ancestor index lists (self excluded), resolved once; an entry
+         * whose ancestor is not in the registry is left out (registry-stale) */
+        static int anc_idx[GBT_MAX_TX][MPE_MAX_SET]; static int anc_n[GBT_MAX_TX];
+        static unsigned char usable[GBT_MAX_TX];
+        for (long i = 0; i < n; i++){
+            anc_n[i] = 0; usable[i] = have_inf[i];
+            if (!have_inf[i]) continue;
+            for (int a = 0; a < infs[i].n_anc; a++){
+                if (!memcmp(infs[i].anc[a], ents[i].txid, 32)) continue;
                 long j = -1;
-                for (long m = 0; m < n; m++)
-                    if (!memcmp(ents[m].txid, infs[best].anc[a], 32)){ j = m; break; }
-                if (j < 0 || emitted[j]) continue;
-                pkg[np++] = (int)j; ww += tweight[j]; ss += tsig[j];
+                for (long m = 0; m < n; m++) if (!memcmp(ents[m].txid, infs[i].anc[a], 32)){ j = m; break; }
+                if (j < 0){ usable[i] = 0; break; }
+                anc_idx[i][anc_n[i]++] = (int)j;
             }
-            if (np == 0){ skipped[best] = 1; continue; }
-            if (used_w + ww > budget_w || used_s + ss > budget_s){
-                skipped[best] = 1;                   /* try lighter packages */
-                continue;
-            }
-            /* parents-first inside the package: a child's ancestor set is a
-             * strict superset of its parent's, so ascending n_anc is a valid
-             * topological order */
-            for (int a = 0; a < np; a++)
-                for (int b = a + 1; b < np; b++)
-                    if (infs[pkg[b]].n_anc < infs[pkg[a]].n_anc){ int t_ = pkg[a]; pkg[a] = pkg[b]; pkg[b] = t_; }
-            for (int a = 0; a < np; a++){
-                emitted[pkg[a]] = 1;
-                order[emitted_n++] = pkg[a];
-            }
-            used_w += ww; used_s += ss;
         }
+        /* clusters: union-find over ancestor links */
+        static int uf[GBT_MAX_TX];
+        for (long i = 0; i < n; i++) uf[i] = (int)i;
+        #define UF_FIND(x) ({ int r_ = (x); while (uf[r_] != r_) r_ = uf[r_]; int q_ = (x); while (uf[q_] != r_){ int t_ = uf[q_]; uf[q_] = r_; q_ = t_; } r_; })
+        for (long i = 0; i < n; i++){
+            if (!usable[i]) continue;
+            for (int a = 0; a < anc_n[i]; a++){ int ra = UF_FIND(anc_idx[i][a]), ri = UF_FIND((int)i); if (ra != ri) uf[ra] = ri; }
+        }
+        /* group members by cluster root (stable in slot order) */
+        static int byroot[GBT_MAX_TX]; long nb = 0;
+        static int root_of[GBT_MAX_TX];
+        for (long i = 0; i < n; i++){ if (!usable[i]) continue; root_of[i] = UF_FIND((int)i); byroot[nb++] = (int)i; }
+        /* insertion sort by root (n <= 4000; clusters are small in practice) */
+        for (long i = 1; i < nb; i++){ int v = byroot[i]; long j = i - 1; while (j >= 0 && root_of[byroot[j]] > root_of[v]){ byroot[j+1] = byroot[j]; j--; } byroot[j+1] = v; }
+        /* chunks: contiguous member runs in cmem; merging two adjacent chunks
+         * of one cluster is a run extension */
+        #define GBT_CLUSTER_MAX 512
+        typedef struct { int start, cnt; unsigned long long fee, size; long long w, s; int cluster, seq; } gbt_chunk;
+        static gbt_chunk chunks[GBT_MAX_TX]; long nch = 0;
+        static int cmem[GBT_MAX_TX]; long ncm = 0;
+        static unsigned char done[GBT_MAX_TX];
+        for (long i = 0; i < n; i++) done[i] = 0;
+        long gi = 0; int cluster_no = 0;
+        while (gi < nb){
+            long gj = gi; while (gj < nb && root_of[byroot[gj]] == root_of[byroot[gi]]) gj++;
+            long msz = gj - gi; const int* mem = &byroot[gi];
+            int merge = msz <= GBT_CLUSTER_MAX;
+            long first_chunk = nch;
+            for (long left = msz; left > 0; ){
+                /* the undone member whose undone ancestor set has the best feerate */
+                int best = -1; unsigned long long bf = 0, bs = 1;
+                for (long m = 0; m < msz; m++){
+                    int t = mem[m]; if (done[t]) continue;
+                    unsigned long long f = tfee[t], z = tsize[t];
+                    for (int a = 0; a < anc_n[t]; a++) if (!done[anc_idx[t][a]]){ f += tfee[anc_idx[t][a]]; z += tsize[anc_idx[t][a]]; }
+                    if (z == 0) z = 1;
+                    int better = (best < 0) || ((unsigned __int128)f * bs > (unsigned __int128)bf * z) ||
+                                 ((unsigned __int128)f * bs == (unsigned __int128)bf * z && memcmp(ents[t].txid, ents[best].txid, 32) < 0);
+                    if (better){ best = t; bf = f; bs = z; }
+                }
+                if (best < 0) break;
+                gbt_chunk* c = &chunks[nch]; c->start = (int)ncm; c->cnt = 0; c->fee = 0; c->size = 0; c->w = 0; c->s = 0; c->cluster = cluster_no; c->seq = (int)(nch - first_chunk);
+                /* members: undone ancestors + best, parents-first (ascending ancestor count is a topological order inside an ancestor set) */
+                int set[MPE_MAX_SET + 1]; int ns = 0;
+                for (int a = 0; a < anc_n[best]; a++) if (!done[anc_idx[best][a]]) set[ns++] = anc_idx[best][a];
+                set[ns++] = best;
+                for (int x = 0; x < ns; x++) for (int y = x + 1; y < ns; y++) if (anc_n[set[y]] < anc_n[set[x]]){ int t_ = set[x]; set[x] = set[y]; set[y] = t_; }
+                for (int x = 0; x < ns; x++){ int t = set[x]; done[t] = 1; cmem[ncm++] = t; c->cnt++; c->fee += tfee[t]; c->size += tsize[t]; c->w += tweight[t]; c->s += tsig[t]; left--; }
+                nch++;
+                /* merge backwards while this chunk pays more than the one before it */
+                while (merge && nch - first_chunk >= 2){
+                    gbt_chunk* pv = &chunks[nch-2]; gbt_chunk* cu = &chunks[nch-1];
+                    if ((unsigned __int128)cu->fee * pv->size > (unsigned __int128)pv->fee * cu->size){
+                        pv->cnt += cu->cnt; pv->fee += cu->fee; pv->size += cu->size; pv->w += cu->w; pv->s += cu->s; nch--;
+                    } else break;
+                }
+            }
+            cluster_no++; gi = gj;
+        }
+        /* chunk order across clusters: feerate descending; ties by cluster (slot order) then sequence */
+        static int corder[GBT_MAX_TX];
+        for (long i = 0; i < nch; i++) corder[i] = (int)i;
+        for (long i = 1; i < nch; i++){
+            int v = corder[i]; long j = i - 1;
+            while (j >= 0){
+                const gbt_chunk* A = &chunks[corder[j]]; const gbt_chunk* B = &chunks[v];
+                int a_before = ((unsigned __int128)A->fee * B->size > (unsigned __int128)B->fee * A->size) ||
+                               ((unsigned __int128)A->fee * B->size == (unsigned __int128)B->fee * A->size &&
+                                (A->cluster < B->cluster || (A->cluster == B->cluster && A->seq < B->seq)));
+                if (a_before) break;
+                corder[j+1] = corder[j]; j--;
+            }
+            corder[j+1] = v;
+        }
+        long emitted_n = 0;
+        /* Core: MAX_BLOCK_WEIGHT - reserved (the coinbase and header the
+         * miner adds); -blockmaxweight caps the template lower. Sigops keep
+         * the same proportional reserve. */
+        long long budget_w = g_gbt_maxweight - g_gbt_reserved, budget_s = 80000 - (80000LL * g_gbt_reserved) / 4000000;
+        long long used_w = 0, used_s = 0;
+        static unsigned char cluster_skipped[GBT_MAX_TX];
+        for (int i = 0; i < cluster_no; i++) cluster_skipped[i] = 0;
+        for (long ci = 0; ci < nch; ci++){
+            const gbt_chunk* c = &chunks[corder[ci]];
+            if (cluster_skipped[c->cluster]) continue;
+            if (used_w + c->w > budget_w || used_s + c->s > budget_s){ cluster_skipped[c->cluster] = 1; continue; }
+            /* -blockmintxfee: a chunk paying below it is left out (Core's
+             * BlockAssembler stops at the first package under the floor) */
+            if (c->size && (unsigned __int128)c->fee * 1000 < (unsigned __int128)g_gbt_minfee_satkvb * c->size){ cluster_skipped[c->cluster] = 1; continue; }
+            if (g_gbt_printpriority)
+                fprintf(stderr, "[gbt] chunk of %d tx: fee %llu sat, %llu vB, %.8f BTC/kvB\n", c->cnt,
+                        (unsigned long long)c->fee, (unsigned long long)c->size,
+                        c->size ? (double)c->fee / (double)c->size * 1000.0 / 1e8 : 0.0);
+            for (int k = 0; k < c->cnt; k++){ emitted[cmem[c->start + k]] = 1; order[emitted_n++] = cmem[c->start + k]; }
+            used_w += c->w; used_s += c->s;
+        }
+        #undef UF_FIND
         /* render in order; depends[] are 1-based indices into this array */
         for (long oi = 0; oi < emitted_n; oi++){
             long i = order[oi];
@@ -1332,7 +1427,7 @@ static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
     double prog = hh >= 0 ? (double)(tip + 1) / (double)(hh + 1) : 1.0;
     if (prog > 1.0) prog = 1.0;
     rj_obj_set(o, "verificationprogress", rj_double(prog));
-    rj_obj_set(o, "initialblockdownload", rj_bool((time_t)t < time(NULL) - 24*3600));
+    rj_obj_set(o, "initialblockdownload", rj_bool((time_t)t < time(NULL) - g_maxtipage));   /* -maxtipage */
     u8 cw[16]; if (chainwork_at(tip, cw)){ chainwork_hex(cw, hx); rj_obj_set(o, "chainwork", rj_str(hx)); }
     rj_obj_set(o, "size_on_disk", rj_numf("%lld", size_on_disk()));
     int pruned = g_prune_mib != 0 || ST_PRUNE_H(g_st) > 0;
@@ -1483,6 +1578,106 @@ static int txi_lookup(const u8 txid_wire[32], long* h_out, u32* off_out, u32* le
         const u8* r = g_txi_tail + o;
         if (memcmp(r, txid_wire, 8)) continue;
         if (txi_verify_rec(r, txid_wire, h_out, off_out, len_out)) return 1;
+    }
+    return 0;
+}
+
+
+/* ---- txo-spender index reader (Core's -txospenderindex; 2026-09-01) -------
+ * Base file + unsorted tail, exactly the txid index's shape (see
+ * daemon/txosp_format.h). Every candidate is VERIFIED against the archive:
+ * the spending transaction is read at the recorded location and must carry
+ * the FULL outpoint among its inputs. */
+#include "daemon/txosp_format.h"
+static const u8* g_tsp; static u64 g_tsp_n, g_tsp_sparse_off, g_tsp_nsparse; static long g_tsp_to = -1;
+static const u8* g_tsp_tail; static u64 g_tsp_tail_sz; static long g_tsp_tail_maxh = -1;
+static void tsp_open(void){
+    if (g_tsp) return;
+    int fd = open(TSP_BASE_FILE, O_RDONLY); if (fd < 0) return;
+    struct stat sb; if (fstat(fd, &sb) != 0 || sb.st_size < TSP_HDR){ close(fd); return; }
+    void* m = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_SHARED, fd, 0); close(fd);
+    if (m == MAP_FAILED) return;
+    const u8* b = m;
+    if (memcmp(b, TSP_MAGIC, 8)){ munmap(m, (size_t)sb.st_size); return; }
+    u64 n = 0, so = 0, ns = 0; u32 t = 0;
+    for (int i = 0; i < 8; i++) n  |= (u64)b[8+i]  << (8*i);
+    for (int i = 0; i < 8; i++) so |= (u64)b[16+i] << (8*i);
+    for (int i = 0; i < 8; i++) ns |= (u64)b[24+i] << (8*i);
+    for (int i = 0; i < 4; i++) t  |= (u32)b[36+i] << (8*i);
+    if (so + ns * TSP_SPARSE > (u64)sb.st_size || TSP_HDR + n * TSP_REC != so){ munmap(m, (size_t)sb.st_size); return; }
+    g_tsp = b; g_tsp_n = n; g_tsp_sparse_off = so; g_tsp_nsparse = ns; g_tsp_to = (long)t;
+    fprintf(stderr, "[txospender] %llu records, to height %ld\n", (unsigned long long)n, g_tsp_to);
+}
+static void tsp_tail_refresh(void){
+    struct stat sb;
+    if (stat(TSP_TAIL_FILE, &sb) != 0 || (u64)sb.st_size < TSP_REC){ if (g_tsp_tail){ munmap((void*)g_tsp_tail, (size_t)g_tsp_tail_sz); g_tsp_tail = NULL; g_tsp_tail_sz = 0; } return; }
+    u64 sz = (u64)sb.st_size - (u64)sb.st_size % TSP_REC;
+    if (g_tsp_tail && sz == g_tsp_tail_sz) return;
+    if (g_tsp_tail){ munmap((void*)g_tsp_tail, (size_t)g_tsp_tail_sz); g_tsp_tail = NULL; g_tsp_tail_sz = 0; }
+    int fd = open(TSP_TAIL_FILE, O_RDONLY); if (fd < 0) return;
+    void* m = mmap(NULL, (size_t)sz, PROT_READ, MAP_SHARED, fd, 0); close(fd);
+    if (m == MAP_FAILED) return;
+    g_tsp_tail = m; g_tsp_tail_sz = sz; g_tsp_tail_maxh = -1;
+    for (u64 o = 0; o + TSP_REC <= sz; o += TSP_REC){ tsp_rec r; tsp_unpack(&r, g_tsp_tail + o); if ((long)r.height > g_tsp_tail_maxh) g_tsp_tail_maxh = (long)r.height; }
+}
+/* verify: the tx at (height, off, len) spends (txid_wire, vout); on success
+ * fills the spender's txid, height, and optionally copies the tx bytes */
+static int tsp_verify_rec(const u8* r, const u8 txid_wire[32], u32 vout, u8 spender[32], long* h_out, u8* txout, long txcap, long* txlen_out){
+    static u8 scratch[4u << 20];
+    tsp_rec rec; tsp_unpack(&rec, r);
+    if (rec.vout != vout) return 0;
+    long blen = read_block((long)rec.height);
+    if (blen < 81 || (u64)rec.offset + rec.len > (u64)blen || rec.len < 10) return 0;
+    const u8* tx = g_blockbuf + rec.offset; const u8* end = tx + rec.len;
+    const u8* q = tx + 4; if (q + 2 <= end && q[0] == 0 && q[1] == 1) q += 2;
+    u64 cc, nin = tsp_rd_varint(q, end, &cc); if (!cc) return 0; q += cc;
+    int hit = 0;
+    for (u64 i = 0; i < nin && q + 36 <= end; i++){
+        u32 vo = (u32)q[32] | ((u32)q[33] << 8) | ((u32)q[34] << 16) | ((u32)q[35] << 24);
+        if (vo == vout && !memcmp(q, txid_wire, 32)){ hit = 1; break; }
+        q += 36; u64 sl = tsp_rd_varint(q, end, &cc); if (!cc) return 0; q += cc + sl + 4;
+    }
+    if (!hit) return 0;
+    if (tx_txid(spender, tx, rec.len, scratch, sizeof scratch) != 1) return 0;
+    *h_out = (long)rec.height;
+    if (txout && txlen_out){ if ((long)rec.len <= txcap){ memcpy(txout, tx, rec.len); *txlen_out = (long)rec.len; } else *txlen_out = -1; }
+    return 1;
+}
+int rpc_chain_txospender_available(void){ tsp_open(); return g_tsp != NULL; }
+/* 1 = spent by `spender` (wire txid) in block `height` whose hash is filled;
+ * 0 = no confirmed spend known (unspent, or beyond the index's coverage). */
+int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsigned vout, unsigned char spender_wire[32],
+                                long* height_out, unsigned char blockhash_wire[32], unsigned char* txout, long txcap, long* txlen_out){
+    (void)refresh();                                   /* the tail may name blocks newer than our cached tip */
+    tsp_open();
+    if (g_tsp && g_tsp_n){
+        const u8* recs = g_tsp + TSP_HDR; const u8* sp = g_tsp + g_tsp_sparse_off;
+        u64 lo = 0, hi = g_tsp_nsparse ? g_tsp_nsparse - 1 : 0, start = 0;
+        while (g_tsp_nsparse && lo <= hi){
+            u64 mid = lo + (hi - lo) / 2; const u8* e = sp + mid * TSP_SPARSE;
+            u32 ev = (u32)e[12] | ((u32)e[13] << 8) | ((u32)e[14] << 16) | ((u32)e[15] << 24);
+            int c = tsp_key_cmp(e, ev, txid_wire, vout);
+            if (c <= 0){ u64 off = 0; for (int i = 0; i < 8; i++) off |= (u64)e[16+i] << (8*i); start = (off - TSP_HDR) / TSP_REC; lo = mid + 1; }
+            else { if (mid == 0) break; hi = mid - 1; }
+        }
+        for (u64 i = start; i < g_tsp_n; i++){
+            const u8* r = recs + i * TSP_REC;
+            u32 rv = (u32)r[12] | ((u32)r[13] << 8) | ((u32)r[14] << 16) | ((u32)r[15] << 24);
+            int c = tsp_key_cmp(r, rv, txid_wire, vout);
+            if (c < 0) continue;
+            if (c > 0) break;
+            if (tsp_verify_rec(r, txid_wire, vout, spender_wire, height_out, txout, txcap, txlen_out)){
+                u8 rec[48]; if (read_idx_rec(*height_out, rec)) memcpy(blockhash_wire, rec, 32); else memset(blockhash_wire, 0, 32);
+                return 1; }
+        }
+    }
+    tsp_tail_refresh();
+    for (u64 o = 0; g_tsp_tail && o + TSP_REC <= g_tsp_tail_sz; o += TSP_REC){
+        const u8* r = g_tsp_tail + o;
+        if (memcmp(r, txid_wire, 12)) continue;
+        if (tsp_verify_rec(r, txid_wire, vout, spender_wire, height_out, txout, txcap, txlen_out)){
+            u8 rec[48]; if (read_idx_rec(*height_out, rec)) memcpy(blockhash_wire, rec, 32); else memset(blockhash_wire, 0, 32);
+            return 1; }
     }
     return 0;
 }
@@ -2034,199 +2229,75 @@ static int desc_checksum(const char* span, char out[9]){
 }
 
 /* ---- descriptor engine: getdescriptorinfo + deriveaddresses ----------------
- * Core rpc/output_script.cpp + descriptor.cpp. getdescriptorinfo parses a
- * descriptor, validates its checksum, and reports isrange/issolvable/
- * hasprivatekeys. deriveaddresses does BIP32 public derivation (CKDpub, in
- * bip32_ckdpub.c, verified byte-for-byte against Core) and builds addresses.
- *
- * Supported key material: an xpub (mainnet) or a raw compressed/uncompressed
- * pubkey. Supported output functions for address derivation: pkh, wpkh,
- * sh(wpkh(...)). pk()/tr()/combo() parse and checksum in getdescriptorinfo but
- * deriveaddresses reports them as not having a single corresponding address
- * (pk) or as unsupported (tr/combo) rather than fabricating one. */
-extern int bip32_ckdpub_derive(const char* xpub, const unsigned* path, int n, u8 out[33]);
-extern int bip32_xpub_parse(const char* xpub, u8 pub33[33], u8 cc32[32]);
-extern int pubkey_parse(const u8* pub, unsigned long publen, u64 qx[4], u64 qy[4]);
+ * Core rpc/output_script.cpp over descriptor.c, this node's port of Core's
+ * descriptor.cpp: pk/pkh/wpkh/combo, multi/sortedmulti, sh/wsh wrappers,
+ * tr with script trees (multi_a/sortedmulti_a leaves), rawtr, addr, raw;
+ * hex, x-only, WIF, xpub/xprv keys with origins, paths and ranges. Expansion
+ * is byte-identical to Core on its own descriptor_tests.cpp vectors
+ * (tests/test_descriptor_vectors). Miniscript and musig() are refused by
+ * name. */
+#include "descriptor.h"
+extern int wscan_spk_h160(const unsigned char* spk, unsigned long len, const unsigned char** h);
 
-enum { DSC_PKH=0, DSC_WPKH=1, DSC_SHWPKH=2, DSC_PK=3, DSC_COMBO=4, DSC_TR=5, DSC_ADDR=6, DSC_RAW=7, DSC_UNK=-1 };
-typedef struct {
-    int  script;
-    char key[160];       /* xpub or hex pubkey; or the address text for addr() */
-    int  keytype;        /* 0 raw-pubkey, 1 xpub, 2 has-private, 3 addr, 4 raw, -1 bad */
-    unsigned path[32];
-    int  pathlen;        /* fixed components (before any '*') */
-    int  ranged;         /* trailing slash-star present */
-    int  hardened;       /* any hardened path element */
-    u8   rawpub[65];     /* decoded raw pubkey (keytype 0) */
-    int  rawlen;
-    u8   spk[520];       /* scriptPubKey for addr()/raw() */
-    int  spklen;
-} desc_t;
-
-/* Parse the descriptor core string (checksum already stripped) into d.
- * Returns 1 on success; 0 with *ec / *em set on a parse/validation error. */
-static int desc_parse_core(const char* core, desc_t* d, long* ec, const char** em){
-    static char perr[192];
-    memset(d, 0, sizeof *d); d->keytype = -1;
-    size_t L = strlen(core);
-    const char* inner; size_t ilen;
-    if (!strncmp(core,"pkh(",4) && core[L-1]==')'){ d->script=DSC_PKH; inner=core+4; ilen=L-5; }
-    else if (!strncmp(core,"wpkh(",5) && core[L-1]==')'){ d->script=DSC_WPKH; inner=core+5; ilen=L-6; }
-    else if (!strncmp(core,"sh(wpkh(",8) && L>=10 && core[L-1]==')' && core[L-2]==')'){ d->script=DSC_SHWPKH; inner=core+8; ilen=L-10; }
-    else if (!strncmp(core,"pk(",3) && core[L-1]==')'){ d->script=DSC_PK; inner=core+3; ilen=L-4; }
-    else if (!strncmp(core,"combo(",6) && core[L-1]==')'){ d->script=DSC_COMBO; inner=core+6; ilen=L-7; }
-    else if (!strncmp(core,"tr(",3) && core[L-1]==')'){ d->script=DSC_TR; inner=core+3; ilen=L-4; }
-    else if (!strncmp(core,"addr(",5) && core[L-1]==')'){ d->script=DSC_ADDR; inner=core+5; ilen=L-6; }
-    else if (!strncmp(core,"raw(",4) && core[L-1]==')'){ d->script=DSC_RAW; inner=core+4; ilen=L-5; }
-    else { snprintf(perr, sizeof perr, "'%s' is not a valid descriptor function", core);
-           *ec=-5; *em=perr; return 0; }   /* Core's exact message shape */
-
-    /* addr()/raw(): the content is an address or a raw hex script, not a key. */
-    if (d->script==DSC_ADDR){
-        char a[160]; if (ilen>=sizeof a){ *ec=-5; *em="Address too long"; return 0; }
-        memcpy(a,inner,ilen); a[ilen]=0;
-        int type=0; unsigned char ver=0, h160[20], prog[32];
-        if (!wallet_validate_address(a,&type,&ver,h160,prog)){ snprintf(perr,sizeof perr,"Address is not valid: %s",a); *ec=-5; *em=perr; return 0; }
-        int sl=0;
-        switch (type){
-            case 1: d->spk[0]=0x76;d->spk[1]=0xa9;d->spk[2]=0x14;memcpy(d->spk+3,h160,20);d->spk[23]=0x88;d->spk[24]=0xac;sl=25; break;  /* P2PKH */
-            case 2: d->spk[0]=0x00;d->spk[1]=0x14;memcpy(d->spk+2,h160,20);sl=22; break;                                                 /* P2WPKH */
-            case 3: d->spk[0]=0xa9;d->spk[1]=0x14;memcpy(d->spk+2,h160,20);d->spk[22]=0x87;sl=23; break;                                  /* P2SH */
-            case 4: d->spk[0]=0x00;d->spk[1]=0x20;memcpy(d->spk+2,prog,32);sl=34; break;                                                 /* P2WSH */
-            case 5: d->spk[0]=0x51;d->spk[1]=0x20;memcpy(d->spk+2,prog,32);sl=34; break;                                                 /* P2TR */
-            default: snprintf(perr,sizeof perr,"Address is not valid: %s",a); *ec=-5; *em=perr; return 0;
-        }
-        d->spklen=sl; snprintf(d->key,sizeof d->key,"%s",a); d->keytype=3; return 1;
-    }
-    if (d->script==DSC_RAW){
-        if ((ilen&1) || ilen/2>520){ *ec=-5; *em="Raw script invalid"; return 0; }
-        d->spklen=(int)(ilen/2);
-        for (int i=0;i<d->spklen;i++){ int hi=hex1(inner[i*2]), lo=hex1(inner[i*2+1]); if(hi<0||lo<0){ *ec=-5; *em="Raw script must be hex"; return 0; } d->spk[i]=(u8)((hi<<4)|lo); }
-        d->keytype=4; return 1;
-    }
-
-    char key[256];
-    if (ilen >= sizeof key){ *ec=-5; *em="Descriptor too long"; return 0; }
-    memcpy(key, inner, ilen); key[ilen]=0;
-    char* p = key;
-    if (*p == '['){                                   /* skip [origin] */
-        char* rb = strchr(p, ']');
-        if (!rb){ *ec=-5; *em="key origin start '[' with no matching ']'"; return 0; }
-        p = rb + 1;
-    }
-    /* keybody up to first '/' */
-    char* slash = strchr(p, '/');
-    size_t kb = slash ? (size_t)(slash - p) : strlen(p);
-    if (kb == 0 || kb >= sizeof d->key){ *ec=-5; *em="Invalid key"; return 0; }
-    memcpy(d->key, p, kb); d->key[kb]=0;
-
-    if (!strncmp(d->key,"xpub",4)){
-        u8 pub[33], cc[32];
-        if (!bip32_xpub_parse(d->key, pub, cc)){
-            snprintf(perr,sizeof perr,"key '%s' is not valid", d->key); *ec=-5; *em=perr; return 0; }
-        d->keytype = 1;
-    } else if (!strncmp(d->key,"xprv",4) || !strncmp(d->key,"tprv",4) || !strncmp(d->key,"tpub",4)){
-        d->keytype = 2;                               /* recognized; derivation unsupported */
-    } else {                                          /* raw hex pubkey */
-        size_t hl = strlen(d->key); int ok = (hl==66||hl==130) && !(hl&1);
-        for (size_t i=0; ok && i<hl; i++) if (hex1(d->key[i])<0) ok=0;
-        if (ok){
-            d->rawlen = (int)(hl/2);
-            for (int i=0;i<d->rawlen;i++) d->rawpub[i]=(u8)((hex1(d->key[i*2])<<4)|hex1(d->key[i*2+1]));
-            u64 qx[4], qy[4];
-            if (!pubkey_parse(d->rawpub,(unsigned long)d->rawlen,qx,qy)){
-                snprintf(perr,sizeof perr,"key '%s' is not valid", d->key); *ec=-5; *em=perr; return 0; }
-            d->keytype = 0;
-        } else { snprintf(perr,sizeof perr,"key '%s' is not valid", d->key); *ec=-5; *em=perr; return 0; }
-    }
-    /* path components */
-    if (slash){
-        char* q = slash;
-        while (*q == '/'){
-            q++;
-            char comp[32]; int ci=0;
-            while (*q && *q!='/' && ci<31) comp[ci++]=*q++;
-            comp[ci]=0;
-            if (!strcmp(comp,"*")){ d->ranged=1; if (*q=='/'){ *ec=-5; *em="'*' must be the last path element"; return 0; } break; }
-            int hard=0; size_t cl=strlen(comp);
-            if (cl && (comp[cl-1]=='\''||comp[cl-1]=='h'||comp[cl-1]=='H')){ hard=1; comp[cl-1]=0; cl--; }
-            if (cl==0){ *ec=-5; *em="Invalid path element"; return 0; }
-            unsigned v=0; for (size_t i=0;i<cl;i++){ if(comp[i]<'0'||comp[i]>'9'){ *ec=-5; *em="Invalid path element"; return 0; } v=v*10+(unsigned)(comp[i]-'0'); }
-            if (d->pathlen>=32){ *ec=-5; *em="Path too deep"; return 0; }
-            if (hard){ d->hardened=1; v|=0x80000000u; }
-            d->path[d->pathlen++]=v;
-        }
-    }
-    if (d->keytype==1 && d->hardened){ *ec=-5; *em="Cannot derive a hardened child from an xpub"; return 0; }
+/* parse for an RPC: Core's exact checksum messages; deriveaddresses REQUIRES
+ * a checksum, getdescriptorinfo verifies one when present */
+static int rpcdesc_parse(const char* in, int need_checksum, descr_t* d, long* ec, const char** em){
+    static char perr[256];
+    if (need_checksum && !strchr(in, '#')){ *ec=-5; *em="Missing checksum"; return 0; }
+    char err[256];
+    if (!descr_parse(in, d, err, sizeof err)){ snprintf(perr, sizeof perr, "%s", err); *ec=-5; *em=perr; return 0; }
+    return 1;
+}
+/* the single address at range index idx (Core ExtractDestination: bare pk,
+ * bare multisig and combo have none) */
+static int rpcdesc_address_at(const descr_t* d, long idx, char* out, long cap, long* ec, const char** em){
+    static char perr[256];
+    descr_spk_t sp[4]; int n = descr_expand(d, idx, sp, 4);
+    if (n < 0){ const char* e = descr_last_error(); snprintf(perr, sizeof perr, "%s", e[0] ? e : "Key derivation failed"); *ec=-5; *em=perr; return 0; }
+    if (n != 1 || !descr_has_address(d)){ *ec=-5; *em="Descriptor does not have a corresponding address"; return 0; }
+    out[0]=0;
+    if (wallet_script_to_address(out, cap, sp[0].spk, sp[0].len) <= 0 || !out[0]){ *ec=-5; *em="Descriptor does not have a corresponding address"; return 0; }
     return 1;
 }
 
-/* build the address for a derived/raw compressed-or-uncompressed pubkey into
- * out (>=128); returns 1 on success, 0 with *ec / *em on a no-address type. */
-static int desc_addr_for_pub(int script, const u8* pub, int publen, char* out, long cap, long* ec, const char** em){
-    u8 h[20]; hash160(h, pub, (long long)publen);
-    if (script==DSC_PKH){ u8 s[25]={0x76,0xa9,0x14}; memcpy(s+3,h,20); s[23]=0x88; s[24]=0xac; wallet_script_to_address(out,cap,s,25); return 1; }
-    if (script==DSC_WPKH){ if(publen!=33){ *ec=-5; *em="Uncompressed key not allowed for wpkh"; return 0; } u8 s[22]={0x00,0x14}; memcpy(s+2,h,20); wallet_script_to_address(out,cap,s,22); return 1; }
-    if (script==DSC_SHWPKH){ if(publen!=33){ *ec=-5; *em="Uncompressed key not allowed for wpkh"; return 0; } u8 rd[22]={0x00,0x14}; memcpy(rd+2,h,20); u8 rh[20]; hash160(rh,rd,22); u8 s[23]={0xa9,0x14}; memcpy(s+2,rh,20); s[22]=0x87; wallet_script_to_address(out,cap,s,23); return 1; }
-    if (script==DSC_PK){ *ec=-5; *em="Descriptor does not have a corresponding address"; return 0; }
-    *ec=-5; *em="Descriptor derivation for this function is not supported"; return 0;
-}
-
-/* derive the compressed pubkey at range index `idx` (ignored when !ranged). */
-static int desc_pub_at(const desc_t* d, long idx, u8 pub[65], int* publen){
-    if (d->keytype==0){ memcpy(pub, d->rawpub, d->rawlen); *publen=d->rawlen; return 1; }
-    if (d->keytype==1){
-        unsigned path[33]; int n=d->pathlen;
-        for (int i=0;i<n;i++) path[i]=d->path[i];
-        if (d->ranged){ if (idx<0 || idx>0x7fffffffL) return 0; path[n++]=(unsigned)idx; }
-        u8 c[33]; if (!bip32_ckdpub_derive(d->key, path, n, c)) return 0;
-        memcpy(pub,c,33); *publen=33; return 1;
-    }
-    return 0;   /* keytype 2 (private) derivation unsupported */
-}
-
-static int cmd_getdescriptorinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
+static int cmd_getdescriptorinfo_impl(const rj_val* params, rj_val** res, long* ec, const char** em, descr_t* d){
     const char* in = rpc_param_str(params, 0, ec, em); if (!in) return 0;
-    static char perr[192];
-    char core[320]; const char* hash = strchr(in, '#');
-    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
-    if (cl >= sizeof core){ *ec=-5; *em="Descriptor too long"; return 0; }
-    memcpy(core, in, cl); core[cl]=0;
-    char cks[9]; if (!desc_checksum(core, cks)){ *ec=-5; *em="Invalid characters in descriptor"; return 0; }
-    if (hash){
-        const char* prov = hash+1;
-        if (strlen(prov)!=8 || strcmp(prov,cks)){
-            snprintf(perr,sizeof perr,"Provided checksum '%s' does not match computed checksum '%s'", prov, cks);
-            *ec=-5; *em=perr; return 0; }
-    }
-    desc_t d;
-    if (!desc_parse_core(core, &d, ec, em)) return 0;
-    char full[340]; snprintf(full,sizeof full,"%s#%s", core, cks);
+    if (!rpcdesc_parse(in, 0, d, ec, em)) return 0;
+    /* "descriptor": the public form with ITS checksum; "checksum": the
+     * checksum of the descriptor as given (Core reports both) */
+    static char pub[1500], full[1520];
+    if (!descr_to_string(d, 0, pub, sizeof pub)){ *ec=-5; *em="Descriptor too long"; return 0; }
+    char pcs[9]; descr_checksum(pub, pcs);
+    snprintf(full, sizeof full, "%s#%s", pub, pcs);
+    int t = d->nodes[d->root].type;
     rj_val* o = rj_obj();
     rj_obj_set(o,"descriptor", rj_str(full));
-    rj_obj_set(o,"checksum", rj_str(cks));
-    rj_obj_set(o,"isrange", rj_bool(d.ranged));
-    rj_obj_set(o,"issolvable", rj_bool(d.script != DSC_RAW && d.script != DSC_ADDR));  /* addr()/raw() carry no key */
-    rj_obj_set(o,"hasprivatekeys", rj_bool(d.keytype==2));
+    rj_obj_set(o,"checksum", rj_str(d->checksum));
+    rj_obj_set(o,"isrange", rj_bool(d->ranged));
+    rj_obj_set(o,"issolvable", rj_bool(t != DN_RAW && t != DN_ADDR));   /* addr()/raw() carry no key */
+    rj_obj_set(o,"hasprivatekeys", rj_bool(d->has_priv));
+    if (descr_multipath_n(d) > 1){                                       /* BIP389: "descriptor" is the first expansion; all of them here */
+        rj_val* arr = rj_arr();
+        for (int sel = 0; sel < descr_multipath_n(d); sel++){
+            descr_multipath_select(d, sel);
+            if (!descr_to_string(d, 0, pub, sizeof pub)) continue;
+            char c2[9]; descr_checksum(pub, c2); snprintf(full, sizeof full, "%s#%s", pub, c2);
+            rj_arr_push(arr, rj_str(full));
+        }
+        descr_multipath_select(d, 0);
+        rj_obj_set(o,"multipath_expansion", arr);
+    }
     *res = o;
     return 1;
 }
+static int cmd_getdescriptorinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
+    descr_t* d = malloc(sizeof *d); if (!d){ *ec=-7; *em="oom"; return 0; }
+    int r = cmd_getdescriptorinfo_impl(params, res, ec, em, d); free(d); return r;
+}
 
-static int cmd_deriveaddresses(const rj_val* params, rj_val** res, long* ec, const char** em){
+static int cmd_deriveaddresses_impl(const rj_val* params, rj_val** res, long* ec, const char** em, descr_t* d){
     const char* in = rpc_param_str(params, 0, ec, em); if (!in) return 0;
-    static char perr[192];
-    const char* hash = strchr(in, '#');
-    if (!hash){ *ec=-5; *em="Missing checksum"; return 0; }
-    size_t cl = (size_t)(hash-in);
-    char core[320]; if (cl >= sizeof core){ *ec=-5; *em="Descriptor too long"; return 0; }
-    memcpy(core, in, cl); core[cl]=0;
-    char cks[9]; if (!desc_checksum(core, cks)){ *ec=-5; *em="Invalid characters in descriptor"; return 0; }
-    const char* prov = hash+1;
-    if (strlen(prov)!=8 || strcmp(prov,cks)){
-        snprintf(perr,sizeof perr,"Provided checksum '%s' does not match computed checksum '%s'", prov, cks);
-        *ec=-5; *em=perr; return 0; }
-    desc_t d;
-    if (!desc_parse_core(core, &d, ec, em)) return 0;
+    if (!rpcdesc_parse(in, 1, d, ec, em)) return 0;
 
     /* range argument (params[1]): int N -> [0,N]; [a,b] -> [a,b]; inclusive. */
     long begin=0, end=0; int have_range=0;
@@ -2237,115 +2308,125 @@ static int cmd_deriveaddresses(const rj_val* params, rj_val** res, long* ec, con
             have_range=1; begin=(long)strtoll(r->items[0]->str,NULL,10); end=(long)strtoll(r->items[1]->str,NULL,10); }
         else if (r->typ!=RJ_NULL){ *ec=-8; *em="Invalid range"; return 0; }
     }
-    if (d.ranged && !have_range){ *ec=-8; *em="Range must be specified for a ranged descriptor"; return 0; }
-    if (!d.ranged && have_range){ *ec=-8; *em="Range should not be specified for an un-ranged descriptor"; return 0; }
+    if (d->ranged && !have_range){ *ec=-8; *em="Range must be specified for a ranged descriptor"; return 0; }
+    if (!d->ranged && have_range){ *ec=-8; *em="Range should not be specified for an un-ranged descriptor"; return 0; }
     if (have_range){
         if (begin<0 || end<0){ *ec=-8; *em="Range should be greater or equal than 0"; return 0; }
         if (end<begin){ *ec=-8; *em="Range specified as [begin,end] must not have begin after end"; return 0; }
         if (end-begin > 100000){ *ec=-8; *em="Range is too large"; return 0; }
     }
-    if (d.keytype==2){ *ec=-5; *em="Address derivation from extended private keys is not supported"; return 0; }
-
-    /* addr()/raw(): the address is the descriptor's own script's address. */
-    if (d.script==DSC_ADDR || d.script==DSC_RAW){
-        char addr[128]; addr[0]=0;
-        if (wallet_script_to_address(addr, sizeof addr, d.spk, d.spklen) <= 0 || !addr[0]){
-            *ec=-5; *em="Descriptor does not have a corresponding address"; return 0; }
-        rj_val* arr = rj_arr(); rj_arr_push(arr, rj_str(addr));
-        *res = arr; return 1;
+    long lo = d->ranged?begin:0, hi = d->ranged?end:0;
+    int nmp = descr_multipath_n(d);
+    rj_val* outer = nmp > 1 ? rj_arr() : NULL;                           /* BIP389: one address list per expansion, in specifier order */
+    for (int sel = 0; sel < nmp; sel++){
+        if (nmp > 1) descr_multipath_select(d, sel);
+        rj_val* arr = rj_arr();
+        for (long i=lo; i<=hi; i++){
+            char addr[128];
+            if (!rpcdesc_address_at(d, i, addr, sizeof addr, ec, em)){ rj_free(arr); if (outer) rj_free(outer); return 0; }
+            rj_arr_push(arr, rj_str(addr));
+        }
+        if (outer) rj_arr_push(outer, arr); else { *res = arr; return 1; }
     }
-
-    rj_val* arr = rj_arr();
-    long lo = d.ranged?begin:0, hi = d.ranged?end:0;
-    for (long i=lo; i<=hi; i++){
-        u8 pub[65]; int pl=0;
-        if (!desc_pub_at(&d, i, pub, &pl)){ rj_free(arr); *ec=-5; *em="Key derivation failed"; return 0; }
-        char addr[128]; addr[0]=0;
-        if (!desc_addr_for_pub(d.script, pub, pl, addr, sizeof addr, ec, em)){ rj_free(arr); return 0; }
-        rj_arr_push(arr, rj_str(addr));
-    }
-    *res = arr;
+    *res = outer;
     return 1;
+}
+static int cmd_deriveaddresses(const rj_val* params, rj_val** res, long* ec, const char** em){
+    descr_t* d = malloc(sizeof *d); if (!d){ *ec=-7; *em="oom"; return 0; }
+    int r = cmd_deriveaddresses_impl(params, res, ec, em, d); free(d); return r;
 }
 
 /* ---- exported descriptor API (wallet management) ---------------------------
- * rpc_wallet_ops.c's importdescriptors / watch-only wallets need the SAME
- * parse + CKDpub derivation this file already proved against Core, without a
- * second engine growing next to it. Three narrow entry points:
+ * rpc_wallet_ops.c's importdescriptors / watch-only wallets use the SAME
+ * engine, without a second one growing next to it. Three entry points:
  *
  *   rpc_desc_normalize  checksum-verify (or append) and classify;
- *   rpc_desc_expand     h160s to SCAN for over an index range -- the key hash
- *                       for pkh/wpkh, the P2SH SCRIPT hash for sh(wpkh), i.e.
- *                       exactly the 20 bytes that appear in the scriptPubKey
- *                       (wallet_scan.c matches P2WPKH/P2PKH/P2SH by that hash);
+ *   rpc_desc_expand     the 20 bytes to SCAN for over an index range -- the
+ *                       key hash for pkh/wpkh, the script hash for sh(...),
+ *                       the first 20 bytes of the 32-byte program for
+ *                       wsh(...)/tr(...) (wallet_scan.c matches every one of
+ *                       those forms by that 20-byte compare);
  *   rpc_desc_address_at the address at one index, byte-identical to what
  *                       deriveaddresses answers (same code path).
  *
- * Script types reported: 0 pkh, 1 wpkh, 2 sh(wpkh). Everything else that
- * parses (pk/tr/combo/addr/raw) is refused for wallet use with a reason --
- * a watch-only wallet must only claim scripts it can actually recognize in
- * the chain scan. */
-int rpc_desc_normalize(const char* in, char* out, long cap, int* is_range,
-                       char* err, unsigned long errcap){
-    char core[320]; const char* hash = strchr(in, '#');
-    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
-    if (cl >= sizeof core){ snprintf(err,errcap,"Descriptor too long"); return 0; }
-    memcpy(core, in, cl); core[cl]=0;
-    char cks[9];
-    if (!desc_checksum(core, cks)){ snprintf(err,errcap,"Invalid characters in descriptor"); return 0; }
-    if (hash && (strlen(hash+1)!=8 || strcmp(hash+1,cks))){
-        snprintf(err,errcap,"Provided checksum '%s' does not match computed checksum '%s'", hash+1, cks);
-        return 0; }
-    desc_t d; long ec2; const char* em2;
-    if (!desc_parse_core(core, &d, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return 0; }
-    if (d.keytype==2){ snprintf(err,errcap,"private-key descriptors are not supported for import"); return 0; }
-    if (!(d.script==DSC_PKH || d.script==DSC_WPKH || d.script==DSC_SHWPKH)){
-        snprintf(err,errcap,"only pkh/wpkh/sh(wpkh) descriptors can be imported for watching"); return 0; }
-    if (is_range) *is_range = d.ranged;
-    if ((long)snprintf(out, (size_t)cap, "%s#%s", core, cks) >= cap){
+ * Script types reported: 0 pkh, 1 wpkh, 2 sh(...), 3 wsh(...), 4 tr(...),
+ * 5 addr/raw. Descriptors whose expansion has no single address (bare pk,
+ * bare multisig, combo) are refused for wallet use with a reason -- a
+ * watch-only wallet must only claim scripts it can recognize in the chain
+ * scan; private-key descriptors are refused because this wallet holds no
+ * imported keys. */
+static int rpc_desc_normalize_impl(const char* in, char* out, long cap, int* is_range,
+                       char* err, unsigned long errcap, descr_t* d){
+    char e[256];
+    if (!descr_parse(in, d, e, sizeof e)){ snprintf(err,errcap,"%s", e); return 0; }
+    if (d->has_priv){ snprintf(err,errcap,"private-key descriptors are not supported for import"); return 0; }
+    if (!descr_has_address(d)){
+        snprintf(err,errcap,"only descriptors with one address per index (pkh, wpkh, sh, wsh, tr, addr) can be imported for watching"); return 0; }
+    if (is_range) *is_range = d->ranged;
+    if ((long)snprintf(out, (size_t)cap, "%s#%s", d->text, d->checksum) >= cap){
         snprintf(err,errcap,"Descriptor too long"); return 0; }
     return 1;
 }
+/* BIP389 for importdescriptors: the number of expansions of `in` (1 when it is
+ * not multipath), writing each expansion's public form + checksum into out[]
+ * (up to cap). 0 with err on a parse error. */
+int rpc_desc_multipath_expand(const char* in, char (*out)[340], int cap, char* err, unsigned long errcap){
+    descr_t* d = malloc(sizeof *d); if (!d){ snprintf(err,errcap,"oom"); return 0; }
+    char e[256];
+    if (!descr_parse(in, d, e, sizeof e)){ snprintf(err,errcap,"%s", e); free(d); return 0; }
+    int n = descr_multipath_n(d); if (n > cap) n = cap;
+    for (int sel = 0; sel < n; sel++){
+        char pub[1500]; descr_multipath_select(d, sel);
+        if (!descr_to_string(d, 0, pub, sizeof pub) || strlen(pub) + 10 > 340){ snprintf(err,errcap,"Descriptor too long"); free(d); return 0; }
+        char c2[9]; descr_checksum(pub, c2); snprintf(out[sel], 340, "%s#%s", pub, c2);
+    }
+    free(d); return n;
+}
+rpc_desc_normalize(const char* in, char* out, long cap, int* is_range,
+                       char* err, unsigned long errcap){
+    descr_t* d = malloc(sizeof *d); if (!d){ snprintf(err,errcap,"oom"); return 0; }
+    int r = rpc_desc_normalize_impl(in, out, cap, is_range, err, errcap, d); free(d); return r;
+}
 
-long rpc_desc_expand(const char* in, long start, long count,
+static long rpc_desc_expand_impl(const char* in, long start, long count,
                      unsigned char (*h160s)[20], long cap, int* script_type,
-                     char* err, unsigned long errcap){
-    char core[320]; const char* hash = strchr(in, '#');
-    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
-    if (cl >= sizeof core){ snprintf(err,errcap,"Descriptor too long"); return -1; }
-    memcpy(core, in, cl); core[cl]=0;
-    desc_t d; long ec2; const char* em2;
-    if (!desc_parse_core(core, &d, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return -1; }
-    if (script_type)
-        *script_type = d.script==DSC_PKH ? 0 : d.script==DSC_WPKH ? 1 : 2;
-    if (!d.ranged){ start = 0; count = 1; }
+                     char* err, unsigned long errcap, descr_t* d){
+    char e[256];
+    if (!descr_parse(in, d, e, sizeof e)){ snprintf(err,errcap,"%s", e); return -1; }
+    if (!d->ranged){ start = 0; count = 1; }
     long n = 0;
     for (long i = start; i < start+count && n < cap; i++, n++){
-        u8 pub[65]; int pl=0;
-        if (!desc_pub_at(&d, i, pub, &pl)){ snprintf(err,errcap,"Key derivation failed"); return -1; }
-        if (d.script!=DSC_PKH && pl!=33){ snprintf(err,errcap,"Uncompressed key not allowed for wpkh"); return -1; }
-        u8 kh[20]; hash160(kh, pub, pl);
-        if (d.script==DSC_SHWPKH){
-            u8 rd[22]={0x00,0x14}; memcpy(rd+2,kh,20);
-            hash160(h160s[n], rd, 22);           /* the P2SH script hash */
-        } else memcpy(h160s[n], kh, 20);
+        descr_spk_t sp[4]; int k = descr_expand(d, i, sp, 4);
+        if (k != 1){ snprintf(err,errcap,"%s", k < 0 ? descr_last_error() : "Descriptor does not have a corresponding address"); return -1; }
+        const unsigned char* h;
+        if (!wscan_spk_h160(sp[0].spk, (unsigned long)sp[0].len, &h)){ snprintf(err,errcap,"Descriptor script cannot be scanned for"); return -1; }
+        memcpy(h160s[n], h, 20);
+        if (script_type && n == 0){
+            int t = d->nodes[d->root].type;
+            *script_type = t==DN_PKH ? 0 : t==DN_WPKH ? 1 : t==DN_SH ? 2 : t==DN_WSH ? 3 : (t==DN_TR||t==DN_RAWTR) ? 4 : 5;
+        }
     }
     return n;
 }
+rpc_desc_expand(const char* in, long start, long count,
+                     unsigned char (*h160s)[20], long cap, int* script_type,
+                     char* err, unsigned long errcap){
+    descr_t* d = malloc(sizeof *d); if (!d){ snprintf(err,errcap,"oom"); return -1; }
+    long r = rpc_desc_expand_impl(in, start, count, h160s, cap, script_type, err, errcap, d); free(d); return r;
+}
 
-int rpc_desc_address_at(const char* in, long idx, char* out, long cap,
-                        char* err, unsigned long errcap){
-    char core[320]; const char* hash = strchr(in, '#');
-    size_t cl = hash ? (size_t)(hash-in) : strlen(in);
-    if (cl >= sizeof core){ snprintf(err,errcap,"Descriptor too long"); return 0; }
-    memcpy(core, in, cl); core[cl]=0;
-    desc_t d; long ec2; const char* em2;
-    if (!desc_parse_core(core, &d, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return 0; }
-    u8 pub[65]; int pl=0;
-    if (!desc_pub_at(&d, idx, pub, &pl)){ snprintf(err,errcap,"Key derivation failed"); return 0; }
-    if (!desc_addr_for_pub(d.script, pub, pl, out, cap, &ec2, &em2)){
-        snprintf(err,errcap,"%s", em2); return 0; }
+static int rpc_desc_address_at_impl(const char* in, long idx, char* out, long cap,
+                        char* err, unsigned long errcap, descr_t* d){
+    char e[256];
+    if (!descr_parse(in, d, e, sizeof e)){ snprintf(err,errcap,"%s", e); return 0; }
+    long ec2; const char* em2;
+    if (!rpcdesc_address_at(d, idx, out, cap, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return 0; }
     return 1;
+}
+rpc_desc_address_at(const char* in, long idx, char* out, long cap,
+                        char* err, unsigned long errcap){
+    descr_t* d = malloc(sizeof *d); if (!d){ snprintf(err,errcap,"oom"); return 0; }
+    int r = rpc_desc_address_at_impl(in, idx, out, cap, err, errcap, d); free(d); return r;
 }
 
 static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, const char** em){
@@ -3661,6 +3742,16 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
         rj_obj_set(e, "best_block_height", rj_numf("%ld", cov_to));
         rj_obj_set(o, "txindex", e);
     }
+    tsp_open();
+    if (g_tsp && (!want || !strcmp(want, "txospenderindex"))){
+        rj_val* e = rj_obj();
+        long tip = refresh();
+        tsp_tail_refresh();
+        long cov_to = g_tsp_tail_maxh > g_tsp_to ? g_tsp_tail_maxh : g_tsp_to;
+        rj_obj_set(e, "synced", rj_bool(tip >= 0 && cov_to >= tip));
+        rj_obj_set(e, "best_block_height", rj_numf("%ld", cov_to));
+        rj_obj_set(o, "txospenderindex", e);
+    }
     { extern long bfi_probe_count(void);
       long bn = bfi_probe_count();
       if (bn >= 0 && (!want || !strcmp(want, "basic block filter index"))){
@@ -3784,41 +3875,12 @@ void rpc_chain_set_utxoscan(long (*run)(const unsigned char*, const unsigned int
 }
 #define SCAN_MAX_TARGETS 4096
 #define SCAN_MAX_HITS    32768
-/* spk for descriptor d at index i (i ignored for un-ranged). 1 ok / 0 fail. */
-static int desc_spk_at(const desc_t* d, long i, u8 spk[128], u32* spklen,
-                       long* ec, const char** em){
-    if (d->script==DSC_ADDR || d->script==DSC_RAW){
-        if (d->spklen > 128){ *ec=-5; *em="Descriptor script too large"; return 0; }
-        memcpy(spk, d->spk, d->spklen); *spklen = (u32)d->spklen; return 1;
-    }
-    u8 pub[65]; int pl=0;
-    if (!desc_pub_at(d, i, pub, &pl)){ *ec=-5; *em="Key derivation failed"; return 0; }
-    u8 h[20];
-    switch (d->script){
-    case DSC_PKH:
-        hash160(h, pub, pl);
-        spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3,h,20); spk[23]=0x88; spk[24]=0xac;
-        *spklen=25; return 1;
-    case DSC_WPKH:
-        hash160(h, pub, pl);
-        spk[0]=0x00; spk[1]=0x14; memcpy(spk+2,h,20); *spklen=22; return 1;
-    case DSC_SHWPKH: {
-        u8 redeem[22]; hash160(h, pub, pl);
-        redeem[0]=0x00; redeem[1]=0x14; memcpy(redeem+2,h,20);
-        hash160(h, redeem, 22);
-        spk[0]=0xa9; spk[1]=0x14; memcpy(spk+2,h,20); spk[22]=0x87; *spklen=23; return 1; }
-    case DSC_PK:
-        spk[0]=(u8)pl; memcpy(spk+1,pub,(size_t)pl); spk[1+pl]=0xac; *spklen=(u32)(pl+2); return 1;
-    default:
-        *ec=-5; *em="Descriptor type not scannable"; return 0;
-    }
-}
 /* Expand scanobjects (descriptor strings or {desc,range}) into concrete
  * scriptPubKeys. Shared by scantxoutset, scanblocks and
  * getdescriptoractivity so the three cannot drift in what they accept. */
 static int scan_expand_objects(const rj_val* objs, u8 (*targets)[128], u32* tlens,
                                int cap, int* ntgt_io, long* ec, const char** em){
-    static char perr[192];
+    static char perr[320];
     int ntgt = *ntgt_io;
     for (unsigned long oi = 0; oi < objs->nitems; oi++){
         const rj_val* ob = objs->items[oi];
@@ -3851,15 +3913,22 @@ static int scan_expand_objects(const rj_val* objs, u8 (*targets)[128], u32* tlen
               if (strlen(hash+1)!=8 || strcmp(hash+1,cks)){
                   snprintf(perr,sizeof perr,"Provided checksum '%s' does not match computed checksum '%s'", hash+1, cks);
                   *ec=-5; *em=perr; return 0; } } }
-        desc_t d;
-        if (!desc_parse_core(core, &d, ec, em)) return 0;
+        static descr_t d;   /* ~45 KB: not on the RPC thread's stack; the dispatcher is single-threaded */
+        { char e[256]; if (!descr_parse(core, &d, e, sizeof e)){ snprintf(perr,sizeof perr,"%s",e); *ec=-5; *em=perr; return 0; } }
         long lo = 0, hi = 0;
         if (d.ranged){ lo = rbegin; hi = (rend >= 0) ? rend : 1000; }   /* Core's default range */
+        for (int sel = 0; sel < descr_multipath_n(&d); sel++){          /* BIP389: every expansion is scanned */
+        descr_multipath_select(&d, sel);
         for (long i = lo; i <= hi; i++){
-            if (ntgt >= cap){ *ec=-8; *em="Too many scan targets"; return 0; }
-            if (!desc_spk_at(&d, i, targets[ntgt], &tlens[ntgt], ec, em)) return 0;
-            ntgt++;
+            descr_spk_t sp[4]; int n = descr_expand(&d, i, sp, 4);   /* combo: all four forms are scanned */
+            if (n < 0){ snprintf(perr,sizeof perr,"%s", descr_last_error()); *ec=-5; *em=perr; return 0; }
+            for (int q = 0; q < n; q++){
+                if (ntgt >= cap){ *ec=-8; *em="Too many scan targets"; return 0; }
+                if (sp[q].len > 128){ *ec=-5; *em="Descriptor script too large"; return 0; }
+                memcpy(targets[ntgt], sp[q].spk, (size_t)sp[q].len); tlens[ntgt] = (u32)sp[q].len; ntgt++;
+            }
         }
+        }   /* expansions */
     }
     *ntgt_io = ntgt;
     return 1;

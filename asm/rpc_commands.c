@@ -21,6 +21,7 @@
 
 /* ---- extern wallet_core command layer (from asm/wallet_core.c) ---- */
 extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64], unsigned index);
+#include "rpc_wallet_ops.h"   /* output types: rpc_wops_type_path / rpc_wops_type_spk / rpc_wops_active_types */
 extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[64], unsigned index);
 extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20], unsigned char prog32[32]);
 extern int  wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen);
@@ -240,13 +241,31 @@ static const char* spk_type(int t) {
 }
 
 /* ---- getnewaddress / getrawchangeaddress ---- */
-static int cmd_getnewaddr(const char* method, const rpc_wallet* w, rj_val** result) {
+/* getnewaddress ( "label" "address_type" ) / getrawchangeaddress ( "address_type" ):
+ * bech32 by default; legacy / p2sh-segwit / bech32m once createwalletdescriptor
+ * activated them (Core: an inactive type is "No <type> addresses available"). */
+static int cmd_getnewaddr(const char* method, const rj_val* params, const rpc_wallet* w, long* ec, const char** em, rj_val** result) {
     if (!w->seed) { return 0; }
-    char addr[96];
-    long n = !strcmp(method, "getrawchangeaddress")
-        ? wallet_derive_p2wpkh_change(addr, 96, w->seed, 0)
-        : wallet_derive_p2wpkh_address(addr, 96, w->seed, 0);
-    if (n < 0) return 0;
+    int is_change = !strcmp(method, "getrawchangeaddress");
+    const char* tname = NULL;
+    if (params && params->typ == RJ_ARR){
+        int ai = is_change ? 0 : 1;
+        if ((int)params->nitems > ai && params->items[ai]->typ == RJ_STR && params->items[ai]->str[0]) tname = params->items[ai]->str;
+    }
+    int t = rpc_wops_default_type(is_change);       /* -addresstype / -changetype */
+    static char msg[160];
+    if (tname){
+        t = rpc_wops_type_from_name(tname);
+        if (t < 0){ snprintf(msg, sizeof msg, "Unknown address type '%s'", tname); *ec = -5; *em = msg; return 0; }
+        if (!(rpc_wops_active_types() & (1 << t))){ snprintf(msg, sizeof msg, "Error: No %s addresses available for this wallet", tname); *ec = -4; *em = msg; return 0; }
+    }
+    unsigned idx[5]; rpc_wops_type_path(t, 0, is_change, idx);
+    unsigned char k[32], c[32], pub[33], spk[34], h20[20]; unsigned long sl;
+    if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) return 0;
+    scalar_to_pubkey(pub, k);
+    if (!rpc_wops_type_spk(t, pub, spk, &sl, h20)) return 0;
+    char addr[96]; addr[0] = 0;
+    if (wallet_script_to_address(addr, sizeof addr, spk, (long)sl) <= 0 || !addr[0]) return 0;
     *result = rj_str(addr);
     return 1;
 }
@@ -432,13 +451,14 @@ static int cmd_listunspent(const rj_val* params, const rpc_wallet* w, long* ec, 
         }
         long tip = rpc_chain_tip_height();
         for (int i = 0; i < n; i++) {
-            unsigned char spk[22]; spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, coins[i].h160, 20);
+            unsigned char spk[34]; unsigned long spkl = coins[i].spklen;
+            if (spkl) memcpy(spk, coins[i].spk, spkl); else { spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, coins[i].h160, 20); spkl = 22; }
             char txidhex[65]; unsigned char disp[32];
             for (int k = 0; k < 32; k++) disp[k] = coins[i].txid[31-k];
             bin_to_hex(txidhex, disp, 32);
-            char scripthex[70]; bin_to_hex(scripthex, spk, 22);
+            char scripthex[70]; bin_to_hex(scripthex, spk, spkl);
             char addr[96]; addr[0] = 0;
-            wallet_script_to_address(addr, sizeof addr, spk, 22);
+            wallet_script_to_address(addr, sizeof addr, spk, (long)spkl);
             char amt[24]; rpc_amounts((long long)coins[i].value, amt, sizeof amt);
             int confs = tip >= 0 ? (int)(tip - (long)coins[i].height + 1) : 0;
             int mature = wallet_coin_mature(&coins[i], tip);
@@ -810,10 +830,18 @@ static char* psbt_wrap_unsigned(const unsigned char* tx, long n, size_t nin, siz
     char* b64=malloc((size_t)((p+2)/3)*4 + 1); if (!b64) return NULL;
     crt_b64(b64, psbt, p); return b64;
 }
+static void psbt_wr32(unsigned char* p, unsigned v);
+static int psbt_version_arg(const rj_val* params, unsigned long idx, int* ver, long* ec, const char** em);
+static char* psbt_wrap_version(const unsigned char* tx, long n, size_t nin, size_t nout, int ver);
 static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     static unsigned char tx[131072]; long n; size_t nin, nout;
     if (!crt_build_unsigned(params, tx, &n, &nin, &nout, ec, em)) return 0;
-    char* b64=psbt_wrap_unsigned(tx,n,nin,nout); if (!b64){ *ec=-7; *em="oom"; return 0; }
+    if (params->nitems >= 5 && params->items[4]->typ == RJ_NUM){                /* Core: tx version */
+        long v = strtol(params->items[4]->str, 0, 10);
+        if (v < 1 || v > 0x7fffffffL){ *ec = -8; *em = "Invalid parameter, version must be between 1 and 2147483647"; return 0; }
+        psbt_wr32(tx, (unsigned)v); }
+    int ver; if (!psbt_version_arg(params, 5, &ver, ec, em)) return 0;
+    char* b64=psbt_wrap_version(tx,n,nin,nout,ver); if (!b64){ *ec=-7; *em="oom"; return 0; }
     *result=rj_str(b64); free(b64);
     return 1;
 }
@@ -855,7 +883,8 @@ static int cmd_converttopsbt(const rj_val* params, long* ec, const char** em, rj
     /* locktime: last 4 bytes of the tx (witness, if any, sits before locktime) */
     utx[u++]=raw[txlen-4];utx[u++]=raw[txlen-3];utx[u++]=raw[txlen-2];utx[u++]=raw[txlen-1];
     if (had_sig && !permitsig){ *ec=-22; *em="Inputs must not have scriptSigs and scriptWitnesses"; return 0; }
-    char* b64=psbt_wrap_unsigned(utx,u,(size_t)n_in,(size_t)n_out); if (!b64){ *ec=-7; *em="oom"; return 0; }
+    int ver; if (!psbt_version_arg(params, 3, &ver, ec, em)) return 0;
+    char* b64=psbt_wrap_version(utx,u,(size_t)n_in,(size_t)n_out,ver); if (!b64){ *ec=-7; *em="oom"; return 0; }
     *result=rj_str(b64); free(b64);
     return 1;
 }
@@ -884,64 +913,6 @@ static unsigned long srw_varint(const unsigned char* p, unsigned long* consumed)
 static int psbt_field_hex(rj_val* o, const char* name, const unsigned char* v, unsigned long n){
     char* h=malloc(n*2+1); if (!h) return 0; bin_to_hex(h,v,n); rj_obj_set(o,name,rj_str(h)); free(h); return 1;
 }
-static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
-    const char* b64 = rpc_param_str(params,0,ec,em); if (!b64) return 0;
-    static unsigned char buf[200000]; long blen=0;
-    if (!crt_b64dec(b64,buf,sizeof buf,&blen) || blen<5 || memcmp(buf,"psbt\xff",5)!=0){ *ec=-22; *em="TX decode failed"; return 0; }
-    long p=5; const unsigned char* utx=NULL; unsigned long utxlen=0; int psbtver=0;
-    while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if (kl==0) break;
-        const unsigned char* key=buf+p; p+=kl;
-        unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
-        if (kl>=1 && key[0]==0x00){ utx=val; utxlen=vl; }
-        else if (kl>=1 && key[0]==0xfb){ psbtver=(int)val[0]; }
-    }
-    rj_val* o=rj_obj();
-    long n_in=0, n_out=0;
-    if (utx){
-        rj_val* txo=NULL; long e2; const char* m2;
-        if (rpc_chain_decode_rawtx(utx,(long)utxlen,&txo,&e2,&m2)){
-            rj_val* vin=rj_obj_get(txo,"vin"); rj_val* vout=rj_obj_get(txo,"vout");
-            n_in = vin?(long)vin->nitems:0; n_out = vout?(long)vout->nitems:0;
-            rj_obj_set(o,"tx",txo);
-        }
-    }
-    rj_obj_set(o,"global_xpubs",rj_arr());
-    rj_obj_set(o,"psbt_version",rj_numf("%d",psbtver));
-    rj_obj_set(o,"proprietary",rj_arr());
-    rj_obj_set(o,"unknown",rj_obj());
-    rj_val* ins=rj_arr();
-    for (long i=0;i<n_in && p<blen;i++){
-        rj_val* io=rj_obj();
-        while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if (kl==0) break;
-            const unsigned char* key=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
-            if (kl>=1){ switch (key[0]){
-                    case 0x04: psbt_field_hex(io,"redeem_script",val,vl); break;
-                    case 0x05: psbt_field_hex(io,"witness_script",val,vl); break;
-                    case 0x07: psbt_field_hex(io,"final_scriptSig",val,vl); break;
-                    default: break; } }
-        }
-        rj_arr_push(ins,io);
-    }
-    rj_obj_set(o,"inputs",ins);
-    rj_val* outs=rj_arr();
-    for (long i=0;i<n_out && p<blen;i++){
-        rj_val* oo=rj_obj();
-        while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if (kl==0) break;
-            const unsigned char* key=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
-            if (kl>=1){ switch (key[0]){ case 0x00: psbt_field_hex(oo,"redeem_script",val,vl); break;
-                                         case 0x01: psbt_field_hex(oo,"witness_script",val,vl); break;
-                                         default: break; } }
-        }
-        rj_arr_push(outs,oo);
-    }
-    rj_obj_set(o,"outputs",outs);
-    *result=o;
-    return 1;
-}
-
-/* combinepsbt (Core rpc/rawtransaction.cpp): merge PSBTs for the SAME unsigned
- * tx by unioning each map's key-value pairs (dedup by key; first occurrence
- * wins). Returns the merged base64 PSBT. */
 typedef struct { const unsigned char* k; unsigned long kl; const unsigned char* v; unsigned long vl; } psbt_kv;
 static int psbt_parse_map(const unsigned char* buf, long blen, long* pp, psbt_kv* kvs, int cap){
     int n=0; long p=*pp;
@@ -967,6 +938,437 @@ static long psbt_ser_map(unsigned char* out, const psbt_kv* kvs, int n){
 #define PSBT_MAXP 16
 #define PSBT_MAXKV 128
 #define PSBT_MAXIO 1000
+typedef struct {
+    const unsigned char* op;      /* 36-byte outpoint */
+    const unsigned char* ss;  unsigned long sslen;   /* scriptSig */
+    const unsigned char* wit; unsigned long witlen;  /* serialized witness stack */
+    unsigned witems;
+    unsigned seq;
+} crt_in_t;
+static int crt_walk(const unsigned char* tx, unsigned long len, crt_in_t* ins, int cap, int* n_in_out, unsigned long* out_start, unsigned long* out_end, int* segwit_out);
+
+/* ==== PSBT v2 (BIP370), 2026-09-01 ============================================
+ * Every PSBT RPC works on a v0-SHAPED buffer: the global map begins with the
+ * unsigned transaction, real (v0) or SYNTHESIZED from the v2 fields
+ * (tx_version, per-input previous txid/index/sequence, required locktimes
+ * folded per BIP370, per-output amount/script). The v2 per-input and
+ * per-output keys stay inside their maps untouched, so every role that
+ * copies "other" keys through keeps them, and psbt_v2_emit turns the result
+ * back into the caller's version: strips the unsigned tx, re-adds the v2
+ * globals, fills the v2 input/output keys a Creator implies, and sorts every
+ * map by key -- Core's serialization order -- so a v2 that Core produced
+ * comes back byte-identical. The validation messages are Core's
+ * (psbt.h), prefixed "TX decode failed " the way DecodeBase64PSBT's caller
+ * reports them. */
+typedef struct {
+    int version;                       /* 0 or 2 */
+    unsigned tx_version;
+    int has_fallback; unsigned fallback_locktime;
+    int has_mod; unsigned char mod;
+    int created;                       /* built from a tx here: sequences are written (Core's constructor sets them) */
+    int locktime_conflict;             /* inputs' required locktimes cannot be satisfied together */
+    unsigned long n_in, n_out;
+} psbt_v2meta;
+static char g_psbt_errbuf[192];
+static const char* psbt_v2_fail(const char* what){ snprintf(g_psbt_errbuf, sizeof g_psbt_errbuf, "TX decode failed %s", what); return g_psbt_errbuf; }
+static unsigned psbt_rd32(const unsigned char* p){ return (unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24); }
+static void psbt_wr32(unsigned char* p, unsigned v){ p[0]=(unsigned char)v; p[1]=(unsigned char)(v>>8); p[2]=(unsigned char)(v>>16); p[3]=(unsigned char)(v>>24); }
+static int psbt_kv_cmp(const void* a, const void* b){
+    const psbt_kv* x = a; const psbt_kv* y = b;
+    unsigned long n = x->kl < y->kl ? x->kl : y->kl;
+    int c = memcmp(x->k, y->k, n); if (c) return c;
+    return x->kl < y->kl ? -1 : x->kl > y->kl ? 1 : 0;
+}
+/* Any PSBT -> v0-shaped buffer. Returns the length, or -1 with *err set. */
+static long psbt_v2_normalize(const unsigned char* in, long inlen, unsigned char* out, long cap, psbt_v2meta* m, const char** err){
+    memset(m, 0, sizeof *m);
+    if (inlen < 5 || memcmp(in, "psbt\xff", 5)){ *err = "TX decode failed"; return -1; }
+    long p = 5; static psbt_kv g[PSBT_MAXKV]; int gn = psbt_parse_map(in, inlen, &p, g, PSBT_MAXKV);
+    long maps_start = p;
+    const unsigned char* utx = NULL; unsigned long utxl = 0;
+    int f_txver = 0, f_fb = 0, f_in = 0, f_out = 0, f_ver = 0, f_mod = 0; unsigned ver = 0, txver = 0, fb = 0; unsigned long cin = 0, cout = 0; unsigned char mod = 0;
+    for (int i = 0; i < gn; i++){
+        if (g[i].kl != 1) continue;
+        switch (g[i].k[0]){
+        case 0x00: utx = g[i].v; utxl = g[i].vl; break;
+        case 0x02: if (g[i].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } txver = psbt_rd32(g[i].v); f_txver = 1; break;
+        case 0x03: if (g[i].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } fb = psbt_rd32(g[i].v); f_fb = 1; break;
+        case 0x04: { unsigned long cc; cin = srw_varint(g[i].v, &cc); if (cc != g[i].vl){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } f_in = 1; } break;
+        case 0x05: { unsigned long cc; cout = srw_varint(g[i].v, &cc); if (cc != g[i].vl){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } f_out = 1; } break;
+        case 0x06: if (g[i].vl != 1){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } mod = g[i].v[0]; f_mod = 1; break;
+        case 0xfb: if (g[i].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } ver = psbt_rd32(g[i].v); f_ver = 1;
+                   if (ver > 2){ *err = psbt_v2_fail("Unsupported version number"); return -1; } break;
+        default: break;
+        }
+    }
+    (void)f_ver;
+    if (ver == 0){
+        if (!utx){ *err = psbt_v2_fail("No unsigned transaction was provided"); return -1; }
+        if (f_txver){ *err = psbt_v2_fail("PSBT_GLOBAL_TX_VERSION is not allowed in PSBTv0"); return -1; }
+        if (f_fb){ *err = psbt_v2_fail("PSBT_GLOBAL_FALLBACK_LOCKTIME is not allowed in PSBTv0"); return -1; }
+        if (f_in){ *err = psbt_v2_fail("PSBT_GLOBAL_INPUT_COUNT is not allowed in PSBTv0"); return -1; }
+        if (f_out){ *err = psbt_v2_fail("PSBT_GLOBAL_OUTPUT_COUNT is not allowed in PSBTv0"); return -1; }
+        if (f_mod){ *err = psbt_v2_fail("PSBT_GLOBAL_TX_MODIFIABLE is not allowed in PSBTv0"); return -1; }
+        if (inlen > cap){ *err = "TX decode failed"; return -1; }
+        memcpy(out, in, (size_t)inlen);
+        m->version = 0; m->tx_version = psbt_rd32(utx);
+        { unsigned long cc; long q = 4; m->n_in = srw_varint(utx + q, &cc); q += cc;
+          for (unsigned long k = 0; k < m->n_in && (unsigned long)q < utxl; k++){ q += 36; unsigned long sl = srw_varint(utx + q, &cc); q += cc + sl + 4; }
+          m->n_out = (unsigned long)q < utxl ? srw_varint(utx + q, &cc) : 0; }
+        return inlen;
+    }
+    if (ver == 1){ *err = psbt_v2_fail("There is no PSBT version 1"); return -1; }
+    if (!f_txver){ *err = psbt_v2_fail("PSBT_GLOBAL_TX_VERSION is required in PSBTv2"); return -1; }
+    if (!f_in){ *err = psbt_v2_fail("PSBT_GLOBAL_INPUT_COUNT is required in PSBTv2"); return -1; }
+    if (!f_out){ *err = psbt_v2_fail("PSBT_GLOBAL_OUTPUT_COUNT is required in PSBTv2"); return -1; }
+    if (utx){ *err = psbt_v2_fail("PSBT_GLOBAL_UNSIGNED_TX is not allowed in PSBTv2"); return -1; }
+    if (cin > PSBT_MAXIO || cout > PSBT_MAXIO){ *err = "TX decode failed PSBT too large"; return -1; }
+    m->version = 2; m->tx_version = txver; m->has_fallback = f_fb; m->fallback_locktime = fb; m->has_mod = f_mod; m->mod = mod; m->n_in = cin; m->n_out = cout;
+    /* inputs: previous txid/index required; sequence, required locktimes optional */
+    static unsigned char tx[200000]; long t = 0;
+    psbt_wr32(tx + t, txver); t += 4;
+    t += crt_varint(tx + t, cin);
+    int have_time = 1, have_height = 1; unsigned time_lock = 0, height_lock = 0;
+    for (unsigned long i = 0; i < cin; i++){
+        static psbt_kv kv[PSBT_MAXKV]; int n = psbt_parse_map(in, inlen, &p, kv, PSBT_MAXKV);
+        const unsigned char* ptxid = NULL; int f_idx = 0; unsigned idx = 0, seq = 0xffffffffu; int f_tl = 0, f_hl = 0; unsigned tl = 0, hl = 0;
+        for (int j = 0; j < n; j++){
+            if (kv[j].kl != 1) continue;
+            switch (kv[j].k[0]){
+            case 0x0e: if (kv[j].vl != 32){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } ptxid = kv[j].v; break;
+            case 0x0f: if (kv[j].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } idx = psbt_rd32(kv[j].v); f_idx = 1; break;
+            case 0x10: if (kv[j].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } seq = psbt_rd32(kv[j].v); break;
+            case 0x11: if (kv[j].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } tl = psbt_rd32(kv[j].v); f_tl = 1;
+                       if (tl < 500000000u){ *err = psbt_v2_fail("Required time based locktime is invalid (less than 500000000)"); return -1; } break;
+            case 0x12: if (kv[j].vl != 4){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } hl = psbt_rd32(kv[j].v); f_hl = 1;
+                       if (hl >= 500000000u){ *err = psbt_v2_fail("Required height based locktime is invalid (greater than or equal to 500000000)"); return -1; }
+                       if (hl == 0){ *err = psbt_v2_fail("Required height based locktime is invalid (0)"); return -1; } break;
+            default: break;
+            }
+        }
+        if (!ptxid){ *err = psbt_v2_fail("Previous TXID is required in PSBTv2"); return -1; }
+        if (!f_idx){ *err = psbt_v2_fail("Previous output's index is required in PSBTv2"); return -1; }
+        /* BIP370 locktime fold (Core ComputeTimeLock) */
+        if (f_tl && !f_hl){ have_height = 0; if (!have_time) m->locktime_conflict = 1; }
+        else if (!f_tl && f_hl){ have_time = 0; if (!have_height) m->locktime_conflict = 1; }
+        if (f_tl && have_time && tl > time_lock) time_lock = tl;
+        if (f_hl && have_height && hl > height_lock) height_lock = hl;
+        if (t + 41 > (long)sizeof tx){ *err = "TX decode failed PSBT too large"; return -1; }
+        memcpy(tx + t, ptxid, 32); t += 32; psbt_wr32(tx + t, idx); t += 4; tx[t++] = 0x00; psbt_wr32(tx + t, seq); t += 4;
+    }
+    t += crt_varint(tx + t, cout);
+    for (unsigned long i = 0; i < cout; i++){
+        static psbt_kv kv[PSBT_MAXKV]; int n = psbt_parse_map(in, inlen, &p, kv, PSBT_MAXKV);
+        const unsigned char* amt = NULL; const unsigned char* sc = NULL; unsigned long scl = 0; int f_sc = 0;
+        for (int j = 0; j < n; j++){
+            if (kv[j].kl != 1) continue;
+            if (kv[j].k[0] == 0x03){ if (kv[j].vl != 8){ *err = psbt_v2_fail("Size of value was not the stated size"); return -1; } amt = kv[j].v; }
+            else if (kv[j].k[0] == 0x04){ sc = kv[j].v; scl = kv[j].vl; f_sc = 1; }
+        }
+        if (!amt){ *err = psbt_v2_fail("Output amount is required in PSBTv2"); return -1; }
+        if (!f_sc){ *err = psbt_v2_fail("Output script is required in PSBTv2"); return -1; }
+        if (t + 17 + (long)scl > (long)sizeof tx){ *err = "TX decode failed PSBT too large"; return -1; }
+        memcpy(tx + t, amt, 8); t += 8; t += crt_varint(tx + t, scl); if (scl) memcpy(tx + t, sc, scl); t += scl;
+    }
+    unsigned locktime = 0;
+    if (!m->locktime_conflict){
+        if (have_height && height_lock > 0) locktime = height_lock;
+        else if (have_time && time_lock > 0) locktime = time_lock;
+        else locktime = f_fb ? fb : 0;
+    }
+    psbt_wr32(tx + t, locktime); t += 4;
+    /* write: magic | global [unsigned tx, then every other global key except the v2 ones] | the maps verbatim */
+    long o = 0;
+    if (5 + 12 + t + (inlen - maps_start) + 64 > cap){ *err = "TX decode failed PSBT too large"; return -1; }
+    memcpy(out, "psbt\xff", 5); o = 5;
+    out[o++] = 0x01; out[o++] = 0x00; o += crt_varint(out + o, (unsigned long long)t); memcpy(out + o, tx, (size_t)t); o += t;
+    for (int i = 0; i < gn; i++){
+        if (g[i].kl == 1 && (g[i].k[0] == 0x00 || (g[i].k[0] >= 0x02 && g[i].k[0] <= 0x06) || g[i].k[0] == 0xfb)) continue;
+        if (o + 20 + (long)g[i].kl + (long)g[i].vl > cap){ *err = "TX decode failed PSBT too large"; return -1; }
+        o += crt_varint(out + o, g[i].kl); memcpy(out + o, g[i].k, g[i].kl); o += g[i].kl;
+        o += crt_varint(out + o, g[i].vl); memcpy(out + o, g[i].v, g[i].vl); o += g[i].vl;
+    }
+    out[o++] = 0x00;
+    memcpy(out + o, in + maps_start, (size_t)(inlen - maps_start)); o += inlen - maps_start;
+    return o;
+}
+/* v0-shaped buffer -> the caller's version. Returns the length or -1. */
+static long psbt_v2_emit(const unsigned char* v0, long v0len, unsigned char* out, long cap, const psbt_v2meta* m){
+    if (m->version != 2){ if (v0len > cap) return -1; memcpy(out, v0, (size_t)v0len); return v0len; }
+    long p = 5; static psbt_kv g[PSBT_MAXKV + 8]; int gn = psbt_parse_map(v0, v0len, &p, g, PSBT_MAXKV);
+    const unsigned char* utx = NULL; unsigned long utxl = 0;
+    for (int i = 0; i < gn; i++) if (g[i].kl == 1 && g[i].k[0] == 0x00){ utx = g[i].v; utxl = g[i].vl; }
+    if (!utx) return -1;
+    static crt_in_t uin[PSBT_MAXIO]; int n_in, sw; unsigned long ost, oen;
+    if (!crt_walk(utx, utxl, uin, PSBT_MAXIO, &n_in, &ost, &oen, &sw)) return -1;
+    unsigned long n_out; unsigned long cc; n_out = srw_varint(utx + ost, &cc);
+    /* globals: drop the unsigned tx and any stale v2 globals, add the current ones, sort */
+    static unsigned char kb[8][2], vb[8][9]; int kn = 0; static psbt_kv add[8]; int an = 0;
+    static psbt_kv gg[PSBT_MAXKV + 8]; int ggn = 0;
+    for (int i = 0; i < gn; i++){ if (g[i].kl == 1 && (g[i].k[0] == 0x00 || (g[i].k[0] >= 0x02 && g[i].k[0] <= 0x06) || g[i].k[0] == 0xfb)) continue; gg[ggn++] = g[i]; }
+    #define PSBT_ADD1(T, VAL, VL) do{ kb[kn][0] = (T); add[an].k = kb[kn]; add[an].kl = 1; memcpy(vb[kn], (VAL), (VL)); add[an].v = vb[kn]; add[an].vl = (VL); an++; kn++; }while(0)
+    { unsigned char v4[4]; psbt_wr32(v4, m->tx_version ? m->tx_version : psbt_rd32(utx)); PSBT_ADD1(0x02, v4, 4); }
+    if (m->has_fallback){ unsigned char v4[4]; psbt_wr32(v4, m->fallback_locktime); PSBT_ADD1(0x03, v4, 4); }
+    { unsigned char cs[9]; long l = crt_varint(cs, (unsigned long long)n_in); PSBT_ADD1(0x04, cs, (unsigned long)l); }
+    { unsigned char cs[9]; long l = crt_varint(cs, (unsigned long long)n_out); PSBT_ADD1(0x05, cs, (unsigned long)l); }
+    if (m->has_mod){ PSBT_ADD1(0x06, &m->mod, 1); }
+    { unsigned char v4[4]; psbt_wr32(v4, 2); PSBT_ADD1(0xfb, v4, 4); }
+    for (int i = 0; i < an; i++) gg[ggn++] = add[i];
+    qsort(gg, (size_t)ggn, sizeof(psbt_kv), psbt_kv_cmp);
+    long o = 0; memcpy(out, "psbt\xff", 5); o = 5;
+    o += psbt_ser_map(out + o, gg, ggn);
+    /* inputs: fill previous txid/index (+sequence for a PSBT created here), sort */
+    static const unsigned char K0E = 0x0e, K0F = 0x0f, K10 = 0x10, K03 = 0x03, K04 = 0x04;
+    for (int i = 0; i < n_in; i++){
+        static psbt_kv kv[PSBT_MAXKV + 3]; int n = psbt_parse_map(v0, v0len, &p, kv, PSBT_MAXKV);
+        int has_e = 0, has_f = 0, has_s = 0;
+        for (int j = 0; j < n; j++) if (kv[j].kl == 1){ if (kv[j].k[0] == 0x0e) has_e = 1; else if (kv[j].k[0] == 0x0f) has_f = 1; else if (kv[j].k[0] == 0x10) has_s = 1; }
+        if (!has_e){ kv[n].k = &K0E; kv[n].kl = 1; kv[n].v = uin[i].op; kv[n].vl = 32; n++; }
+        if (!has_f){ kv[n].k = &K0F; kv[n].kl = 1; kv[n].v = uin[i].op + 32; kv[n].vl = 4; n++; }
+        if (!has_s && m->created){ kv[n].k = &K10; kv[n].kl = 1; kv[n].v = uin[i].op + 37; kv[n].vl = 4; n++; }   /* empty scriptSig: the sequence follows the 1-byte length */
+        qsort(kv, (size_t)n, sizeof(psbt_kv), psbt_kv_cmp);
+        if (o + 40 > cap) return -1;
+        o += psbt_ser_map(out + o, kv, n);
+    }
+    { const unsigned char* q = utx + ost + cc;
+      for (unsigned long i = 0; i < n_out; i++){
+        static psbt_kv kv[PSBT_MAXKV + 3]; int n = psbt_parse_map(v0, v0len, &p, kv, PSBT_MAXKV);
+        const unsigned char* amt = q; unsigned long c2; unsigned long sl = srw_varint(q + 8, &c2); const unsigned char* sc = q + 8 + c2; q += 8 + c2 + sl;
+        int has_a = 0, has_sc = 0;
+        for (int j = 0; j < n; j++) if (kv[j].kl == 1){ if (kv[j].k[0] == 0x03) has_a = 1; else if (kv[j].k[0] == 0x04) has_sc = 1; }
+        if (!has_a){ kv[n].k = &K03; kv[n].kl = 1; kv[n].v = amt; kv[n].vl = 8; n++; }
+        if (!has_sc){ kv[n].k = &K04; kv[n].kl = 1; kv[n].v = sc; kv[n].vl = sl; n++; }
+        qsort(kv, (size_t)n, sizeof(psbt_kv), psbt_kv_cmp);
+        if (o + 40 + (long)sl > cap) return -1;
+        o += psbt_ser_map(out + o, kv, n);
+      } }
+    return o;
+}
+/* Core's GetUniqueID for v2 hashes the unsigned tx with every sequence zeroed */
+static int psbt_same_tx_seqblind(const unsigned char* a, const unsigned char* b, unsigned long len){
+    static unsigned char ca[200000], cb[200000]; if (len > sizeof ca) return 0;
+    memcpy(ca, a, len); memcpy(cb, b, len);
+    for (int w = 0; w < 2; w++){ unsigned char* t = w ? cb : ca; unsigned long cc; long q = 4; unsigned long n_in = srw_varint(t + q, &cc); q += cc;
+        for (unsigned long k = 0; k < n_in && (unsigned long)q + 41 <= len; k++){ q += 36; unsigned long sl = srw_varint(t + q, &cc); q += cc + sl; memset(t + q, 0, 4); q += 4; } }
+    return memcmp(ca, cb, len) == 0;
+}
+/* decode + normalize a base64 PSBT into `out`; 0 with ec/em on failure */
+static int psbt_load(const char* b64, unsigned char* out, long cap, long* outlen, psbt_v2meta* m, long* ec, const char** em){
+    static unsigned char raw[400000]; long rl = 0;
+    if (!crt_b64dec(b64, raw, sizeof raw, &rl) || rl < 5 || memcmp(raw, "psbt\xff", 5)){ *ec = -22; *em = "TX decode failed"; return 0; }
+    const char* err = NULL; long n = psbt_v2_normalize(raw, rl, out, cap, m, &err);
+    if (n < 0){ *ec = -22; *em = err ? err : "TX decode failed"; return 0; }
+    *outlen = n; return 1;
+}
+/* v0-shaped bytes -> base64 in the caller's version (malloc'd) */
+static char* psbt_b64_out(const unsigned char* v0, long v0len, const psbt_v2meta* m){
+    static unsigned char ob[440000]; long n = psbt_v2_emit(v0, v0len, ob, sizeof ob, m);
+    if (n < 0) return NULL;
+    char* b = malloc((size_t)((n + 2) / 3) * 4 + 1); if (!b) return NULL;
+    crt_b64(b, ob, n); return b;
+}
+/* psbt_version argument (Core: default 2, only 0 or 2) at `idx` */
+static int psbt_version_arg(const rj_val* params, unsigned long idx, int* ver, long* ec, const char** em){
+    *ver = 2;
+    if (params && params->typ == RJ_ARR && params->nitems > idx && params->items[idx]->typ != RJ_NULL){
+        if (params->items[idx]->typ != RJ_NUM){ *ec = -3; *em = "JSON value of type string is not of expected type number"; return 0; }
+        long v = strtol(params->items[idx]->str, 0, 10);
+        if (v != 0 && v != 2){ *ec = -8; *em = "The PSBT version can only be 2 or 0"; return 0; }
+        *ver = (int)v;
+    }
+    return 1;
+}
+/* wrap an unsigned tx as a PSBT of the requested version (Core's Creator) */
+static char* psbt_wrap_version(const unsigned char* tx, long n, size_t nin, size_t nout, int ver){
+    char* b64 = psbt_wrap_unsigned(tx, n, nin, nout); if (!b64 || ver != 2) return b64;
+    static unsigned char v0[400000]; long v0l = 0;
+    if (!crt_b64dec(b64, v0, sizeof v0, &v0l)){ free(b64); return NULL; }
+    free(b64);
+    psbt_v2meta m; memset(&m, 0, sizeof m); m.version = 2; m.tx_version = psbt_rd32(tx);
+    m.has_fallback = 1; m.fallback_locktime = psbt_rd32(tx + n - 4); m.created = 1;
+    return psbt_b64_out(v0, v0l, &m);
+}
+
+static void psbt_path_str(char* out, unsigned long cap, const unsigned char* p, unsigned long n){
+    /* Core's WriteHDKeypath: "m" then "/<i>" with an h suffix for hardened */
+    unsigned long o = 0; o += (unsigned long)snprintf(out + o, cap - o, "m");
+    for (unsigned long i = 0; i + 4 <= n && o + 16 < cap; i += 4){
+        unsigned v = (unsigned)p[i] | ((unsigned)p[i+1]<<8) | ((unsigned)p[i+2]<<16) | ((unsigned)p[i+3]<<24);
+        o += (unsigned long)snprintf(out + o, cap - o, "/%u%s", v & 0x7fffffffu, (v & 0x80000000u) ? "h" : "");
+    }
+}
+static rj_val* psbt_hexval(const unsigned char* v, unsigned long n){ char* h = malloc(n*2+1); if (!h) return rj_str(""); bin_to_hex(h, v, n); rj_val* r = rj_str(h); free(h); return r; }
+static rj_val* psbt_obj_arr(rj_val* o, const char* name){ rj_val* a = rj_obj_get(o, name); if (!a){ a = rj_arr(); rj_obj_set(o, name, a); } return a; }
+/* decodepsbt input/output taproot + partial-signature fields, Core's names
+ * (rpc/rawtransaction.cpp decodepsbt). Returns 1 if the key was consumed. */
+static int psbt_decode_common(rj_val* o, const unsigned char* key, unsigned long kl, const unsigned char* val, unsigned long vl, int is_input){
+    unsigned char t = key[0];
+    if (is_input){
+        if (t == 0x02 && kl >= 34){ rj_val* ps = rj_obj_get(o, "partial_signatures"); if (!ps){ ps = rj_obj(); rj_obj_set(o, "partial_signatures", ps); }
+            char kh[140]; bin_to_hex(kh, key+1, kl-1); rj_obj_set(ps, kh, psbt_hexval(val, vl)); return 1; }
+        if (t == 0x03 && vl == 4){ unsigned v = (unsigned)val[0] | ((unsigned)val[1]<<8); const char* nm = NULL;
+            switch (v){ case 0: nm = "DEFAULT"; break; case 1: nm = "ALL"; break; case 2: nm = "NONE"; break; case 3: nm = "SINGLE"; break;
+                        case 0x81: nm = "ALL|ANYONECANPAY"; break; case 0x82: nm = "NONE|ANYONECANPAY"; break; case 0x83: nm = "SINGLE|ANYONECANPAY"; break; default: break; }
+            if (nm) rj_obj_set(o, "sighash", rj_str(nm)); return 1; }
+        if (t == 0x06 && kl >= 34 && vl >= 4){ rj_val* a = psbt_obj_arr(o, "bip32_derivs"); rj_val* d = rj_obj();
+            rj_obj_set(d, "pubkey", psbt_hexval(key+1, kl-1)); rj_obj_set(d, "master_fingerprint", psbt_hexval(val, 4));
+            char ps[512]; psbt_path_str(ps, sizeof ps, val+4, vl-4); rj_obj_set(d, "path", rj_str(ps)); rj_arr_push(a, d); return 1; }
+        if (t == 0x08){ rj_val* a = rj_arr(); const unsigned char* q = val; unsigned long cc; unsigned long cnt = srw_varint(q, &cc); q += cc;
+            for (unsigned long z = 0; z < cnt && (unsigned long)(q - val) < vl; z++){ unsigned long l = srw_varint(q, &cc); q += cc; if ((unsigned long)(q - val) + l > vl) break; rj_arr_push(a, psbt_hexval(q, l)); q += l; }
+            rj_obj_set(o, "final_scriptwitness", a); return 1; }
+        if (t == 0x13 && (vl == 64 || vl == 65)){ rj_obj_set(o, "taproot_key_path_sig", psbt_hexval(val, vl)); return 1; }
+        if (t == 0x14 && kl == 65){ rj_val* a = psbt_obj_arr(o, "taproot_script_path_sigs"); rj_val* d = rj_obj();
+            rj_obj_set(d, "pubkey", psbt_hexval(key+1, 32)); rj_obj_set(d, "leaf_hash", psbt_hexval(key+33, 32)); rj_obj_set(d, "sig", psbt_hexval(val, vl)); rj_arr_push(a, d); return 1; }
+        if (t == 0x15 && kl >= 34 && vl >= 1){ rj_val* a = psbt_obj_arr(o, "taproot_scripts"); rj_val* d = NULL;
+            /* Core groups control blocks by (script, leaf_ver) */
+            for (unsigned long z = 0; z < a->nitems; z++){ rj_val* e = a->items[z]; rj_val* sc = rj_obj_get(e, "script"); rj_val* lv = rj_obj_get(e, "leaf_ver");
+                if (sc && sc->str && strlen(sc->str) == (vl-1)*2 && lv && (unsigned)strtoul(lv->str, 0, 10) == val[vl-1]){ char* h = malloc(vl*2); bin_to_hex(h, val, vl-1); int same = !strcmp(h, sc->str); free(h); if (same){ d = e; break; } } }
+            if (!d){ d = rj_obj(); rj_obj_set(d, "script", psbt_hexval(val, vl-1)); rj_obj_set(d, "leaf_ver", rj_numf("%u", (unsigned)val[vl-1])); rj_obj_set(d, "control_blocks", rj_arr()); rj_arr_push(a, d); }
+            rj_arr_push(rj_obj_get(d, "control_blocks"), psbt_hexval(key+1, kl-1)); return 1; }
+        if (t == 0x17 && vl == 32){ rj_obj_set(o, "taproot_internal_key", psbt_hexval(val, 32)); return 1; }
+        if (t == 0x18 && vl == 32){ rj_obj_set(o, "taproot_merkle_root", psbt_hexval(val, 32)); return 1; }
+    } else {
+        if (t == 0x02 && kl >= 34 && vl >= 4){ rj_val* a = psbt_obj_arr(o, "bip32_derivs"); rj_val* d = rj_obj();
+            rj_obj_set(d, "pubkey", psbt_hexval(key+1, kl-1)); rj_obj_set(d, "master_fingerprint", psbt_hexval(val, 4));
+            char ps[512]; psbt_path_str(ps, sizeof ps, val+4, vl-4); rj_obj_set(d, "path", rj_str(ps)); rj_arr_push(a, d); return 1; }
+        if (t == 0x05 && vl == 32){ rj_obj_set(o, "taproot_internal_key", psbt_hexval(val, 32)); return 1; }
+        if (t == 0x06){ rj_val* a = rj_arr(); const unsigned char* q = val;
+            while ((unsigned long)(q - val) + 2 < vl){ unsigned char depth = q[0], lv = q[1]; unsigned long cc; unsigned long l = srw_varint(q+2, &cc); q += 2 + cc; if ((unsigned long)(q - val) + l > vl) break;
+                rj_val* d = rj_obj(); rj_obj_set(d, "depth", rj_numf("%u", depth)); rj_obj_set(d, "leaf_ver", rj_numf("%u", lv)); rj_obj_set(d, "script", psbt_hexval(q, l)); rj_arr_push(a, d); q += l; }
+            rj_obj_set(o, "taproot_tree", a); return 1; }
+    }
+    /* taproot bip32 derivs share a shape on both sides: 0x16 (input) / 0x07 (output) */
+    if (((is_input && t == 0x16) || (!is_input && t == 0x07)) && kl == 33){
+        unsigned long cc; unsigned long nlh = srw_varint(val, &cc); unsigned long q = cc + nlh * 32; if (q + 4 > vl) return 1;
+        rj_val* a = psbt_obj_arr(o, "taproot_bip32_derivs"); rj_val* d = rj_obj();
+        rj_obj_set(d, "pubkey", psbt_hexval(key+1, 32)); rj_obj_set(d, "master_fingerprint", psbt_hexval(val+q, 4));
+        char ps[512]; psbt_path_str(ps, sizeof ps, val+q+4, vl-q-4); rj_obj_set(d, "path", rj_str(ps));
+        rj_val* lh = rj_arr(); for (unsigned long z = 0; z < nlh; z++) rj_arr_push(lh, psbt_hexval(val+cc+z*32, 32)); rj_obj_set(d, "leaf_hashes", lh);
+        rj_arr_push(a, d); return 1; }
+    return 0;
+}
+/* MuSig2 (BIP373) in decodepsbt, Core's field names: musig2_participant_pubkeys
+ * [{aggregate_pubkey, participant_pubkeys[]}], musig2_pubnonces /
+ * musig2_partial_sigs [{participant_pubkey, aggregate_pubkey, [leaf_hash],
+ * pubnonce|partial_sig}] */
+static rj_val* psbt_arr_at(rj_val* o, const char* name){ rj_val* a=rj_obj_get(o,name); if(!a){ a=rj_arr(); rj_obj_set(o,name,a); a=rj_obj_get(o,name); } return a; }
+static void psbt_musig_participants(rj_val* o, const unsigned char* agg, const unsigned char* val, unsigned long vl){
+    rj_val* e=rj_obj(); psbt_field_hex(e,"aggregate_pubkey",agg,33);
+    rj_val* parts=rj_arr(); for (unsigned long q=0;q+33<=vl;q+=33){ char h[67]; bin_to_hex(h,val+q,33); rj_arr_push(parts,rj_str(h)); }
+    rj_obj_set(e,"participant_pubkeys",parts); rj_arr_push(psbt_arr_at(o,"musig2_participant_pubkeys"),e);
+}
+static void psbt_musig_signer_field(rj_val* o, unsigned char type, const unsigned char* key, unsigned long kl, const unsigned char* val, unsigned long vl){
+    rj_val* e=rj_obj(); psbt_field_hex(e,"participant_pubkey",key+1,33); psbt_field_hex(e,"aggregate_pubkey",key+34,33);
+    if (kl==99) psbt_field_hex(e,"leaf_hash",key+67,32);
+    psbt_field_hex(e,type==0x1b?"pubnonce":"partial_sig",val,vl);
+    rj_arr_push(psbt_arr_at(o,type==0x1b?"musig2_pubnonces":"musig2_partial_sigs"),e);
+}
+static int cmd_decodepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* b64 = rpc_param_str(params,0,ec,em); if (!b64) return 0;
+    static unsigned char buf[400000]; long blen=0; psbt_v2meta vm;
+    if (!psbt_load(b64, buf, sizeof buf, &blen, &vm, ec, em)) return 0;
+    long p=5; const unsigned char* utx=NULL; unsigned long utxlen=0; int psbtver=vm.version;
+    while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if (kl==0) break;
+        const unsigned char* key=buf+p; p+=kl;
+        unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
+        if (kl>=1 && key[0]==0x00){ utx=val; utxlen=vl; }
+    }
+    rj_val* o=rj_obj();
+    long n_in=0, n_out=0; rj_val* txo=NULL;
+    if (utx){
+        long e2; const char* m2;
+        if (rpc_chain_decode_rawtx(utx,(long)utxlen,&txo,&e2,&m2)){
+            rj_val* vin=rj_obj_get(txo,"vin"); rj_val* vout=rj_obj_get(txo,"vout");
+            n_in = vin?(long)vin->nitems:0; n_out = vout?(long)vout->nitems:0;
+            if (psbtver < 2) rj_obj_set(o,"tx",txo);                /* Core: the decoded tx only for v0 */
+        }
+    }
+    rj_obj_set(o,"global_xpubs",rj_arr());
+    if (psbtver >= 2){                                              /* Core's PSBTv2 globals, in its order */
+        rj_obj_set(o,"tx_version",rj_numf("%u",vm.tx_version));
+        if (vm.has_fallback) rj_obj_set(o,"fallback_locktime",rj_numf("%u",vm.fallback_locktime));
+        rj_obj_set(o,"input_count",rj_numf("%lu",vm.n_in));
+        rj_obj_set(o,"output_count",rj_numf("%lu",vm.n_out));
+        if (vm.has_mod){ rj_obj_set(o,"inputs_modifiable",rj_bool(vm.mod&1)); rj_obj_set(o,"outputs_modifiable",rj_bool((vm.mod>>1)&1)); rj_obj_set(o,"has_sighash_single",rj_bool((vm.mod>>2)&1)); }
+    }
+    rj_obj_set(o,"psbt_version",rj_numf("%d",psbtver));
+    rj_obj_set(o,"proprietary",rj_arr());
+    rj_obj_set(o,"unknown",rj_obj());
+    rj_val* ins=rj_arr();
+    long long total_in = 0; int have_all_utxos = 1;                 /* Core: "fee" when every input's UTXO is known */
+    static crt_in_t d_uin[PSBT_MAXIO]; int d_nin = 0; { int sw; unsigned long os, oe; if (!utx || !crt_walk(utx, utxlen, d_uin, PSBT_MAXIO, &d_nin, &os, &oe, &sw)) d_nin = 0; }
+    for (long i=0;i<n_in && p<blen;i++){
+        rj_val* io=rj_obj(); long long in_val = -1;
+        while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if (kl==0) break;
+            const unsigned char* key=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
+            if (kl>=1){ switch (key[0]){
+                    case 0x00: { rj_val* t2=NULL; long e3; const char* m3;
+                        if (rpc_chain_decode_rawtx(val,(long)vl,&t2,&e3,&m3)){ rj_obj_set(io,"non_witness_utxo",t2);
+                            /* this input's prevout value from the parent's vout[n] */
+                            if (i < d_nin && in_val < 0){ unsigned long vo = (unsigned long)d_uin[i].op[32] | ((unsigned long)d_uin[i].op[33]<<8) | ((unsigned long)d_uin[i].op[34]<<16) | ((unsigned long)d_uin[i].op[35]<<24);
+                                unsigned long q = 4; if (vl > 6 && val[4]==0 && val[5]==1) q = 6; unsigned long c2; unsigned long ni = srw_varint(val+q,&c2); q += c2;
+                                for (unsigned long k = 0; k < ni && q < vl; k++){ q += 36; unsigned long sl = srw_varint(val+q,&c2); q += c2 + sl + 4; }
+                                unsigned long no = srw_varint(val+q,&c2); q += c2;
+                                for (unsigned long k = 0; k < no && q + 8 <= vl; k++){ long long v = 0; for (int b = 0; b < 8; b++) v |= ((long long)val[q+b]) << (8*b); unsigned long sl = srw_varint(val+q+8,&c2); if (k == vo) in_val = v; q += 8 + c2 + sl; } } }
+                        break; }
+                    case 0x01: if (vl >= 9){ long long v = 0; for (int b = 0; b < 8; b++) v |= ((long long)val[b]) << (8*b);
+                        unsigned long c2; unsigned long sl = srw_varint(val+8,&c2);
+                        if (8 + c2 + sl <= vl){ rj_val* wo = rj_obj(); char am[32]; rpc_amounts(v, am, sizeof am); rj_obj_set(wo,"amount",rj_numf("%s",am));
+                            rj_obj_set(wo,"scriptPubKey",rpc_chain_script_pubkey_json(val+8+c2, sl)); rj_obj_set(io,"witness_utxo",wo); in_val = v; } }
+                        break;
+                    case 0x04: rj_obj_set(io,"redeem_script",rpc_chain_script_json_noaddr(val,vl)); break;      /* Core: ScriptToUniv object */
+                    case 0x05: rj_obj_set(io,"witness_script",rpc_chain_script_json_noaddr(val,vl)); break;
+                    case 0x07: { rj_val* fo = rj_obj(); char* a = rpc_chain_script_asm(val, vl, 1); rj_obj_set(fo,"asm",rj_str(a ? a : "")); free(a);
+                                 char* hx = malloc(vl*2+1); if (hx){ bin_to_hex(hx,val,vl); rj_obj_set(fo,"hex",rj_str(hx)); free(hx); }
+                                 rj_obj_set(io,"final_scriptSig",fo); break; }
+                    case 0x0e: if (vl==32){ char hx[65]; for (int b=0;b<32;b++) sprintf(hx+2*b,"%02x",val[31-b]); rj_obj_set(io,"previous_txid",rj_str(hx)); } break;
+                    case 0x0f: if (vl==4) rj_obj_set(io,"previous_vout",rj_numf("%u",psbt_rd32(val))); break;
+                    case 0x10: if (vl==4) rj_obj_set(io,"sequence",rj_numf("%u",psbt_rd32(val))); break;
+                    case 0x11: if (vl==4) rj_obj_set(io,"time_locktime",rj_numf("%u",psbt_rd32(val))); break;
+                    case 0x12: if (vl==4) rj_obj_set(io,"height_locktime",rj_numf("%u",psbt_rd32(val))); break;
+                    /* MuSig2 (BIP373), Core's decodepsbt shapes */
+                    case 0x1a: if (kl==34 && vl%33==0) psbt_musig_participants(io,key+1,val,vl); break;
+                    case 0x1b: case 0x1c: if ((kl==67||kl==99) && vl==(key[0]==0x1b?66:32)) psbt_musig_signer_field(io,key[0],key,kl,val,vl); break;
+                    default: psbt_decode_common(io,key,kl,val,vl,1); break; } }
+        }
+        if (in_val < 0) have_all_utxos = 0; else total_in += in_val;
+        rj_arr_push(ins,io);
+    }
+    rj_obj_set(o,"inputs",ins);
+    rj_val* outs=rj_arr();
+    rj_val* dvout = txo ? rj_obj_get(txo,"vout") : NULL;
+    for (long i=0;i<n_out && p<blen;i++){
+        rj_val* oo=rj_obj();
+        if (psbtver >= 2 && dvout && (unsigned long)i < dvout->nitems){        /* Core: amount + ScriptToUniv(script) */
+            rj_val* dv = dvout->items[i]; rj_val* val_ = rj_obj_get(dv,"value"); rj_val* spk = rj_obj_get(dv,"scriptPubKey");
+            if (val_) rj_obj_set(oo,"amount",rj_clone(val_));
+            if (spk) rj_obj_set(oo,"script",rj_clone(spk));
+        }
+        while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if (kl==0) break;
+            const unsigned char* key=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* val=buf+p; p+=vl;
+            if (kl>=1){ switch (key[0]){ case 0x00: rj_obj_set(oo,"redeem_script",rpc_chain_script_json_noaddr(val,vl)); break;
+                                         case 0x01: rj_obj_set(oo,"witness_script",rpc_chain_script_json_noaddr(val,vl)); break;
+                                         case 0x08: if (kl==34 && vl%33==0) psbt_musig_participants(oo,key+1,val,vl); break;
+                                         default: psbt_decode_common(oo,key,kl,val,vl,0); break; } }
+        }
+        rj_arr_push(outs,oo);
+    }
+    rj_obj_set(o,"outputs",outs);
+    if (have_all_utxos && n_in > 0 && utx){                          /* Core: fee = inputs - outputs, only when every UTXO is known */
+        long long out_sum = 0; unsigned long cc; long q = 4; unsigned long ni = srw_varint(utx+q,&cc); q += cc;
+        for (unsigned long k = 0; k < ni; k++){ q += 36; unsigned long sl = srw_varint(utx+q,&cc); q += cc + sl + 4; }
+        unsigned long no = srw_varint(utx+q,&cc); q += cc;
+        for (unsigned long k = 0; k < no; k++){ long long v = 0; for (int b = 0; b < 8; b++) v |= ((long long)utx[q+b]) << (8*b); out_sum += v; q += 8; unsigned long sl = srw_varint(utx+q,&cc); q += cc + sl; }
+        char am[32]; rpc_amounts(total_in - out_sum, am, sizeof am); rj_obj_set(o,"fee",rj_numf("%s",am));
+    }
+    if (txo && psbtver >= 2) rj_free(txo);
+    *result=o;
+    return 1;
+}
+
+/* combinepsbt (Core rpc/rawtransaction.cpp): merge PSBTs for the SAME unsigned
+ * tx by unioning each map's key-value pairs (dedup by key; first occurrence
+ * wins). Returns the merged base64 PSBT. */
 static int cmd_combinepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     if (!params||params->typ!=RJ_ARR||params->nitems<1||params->items[0]->typ!=RJ_ARR||params->items[0]->nitems<1){
         *ec=-8; *em="Invalid parameter, expected an array of base64 PSBTs"; return 0; }
@@ -977,14 +1379,17 @@ static int cmd_combinepsbt(const rj_val* params, long* ec, const char** em, rj_v
     static psbt_kv ikv[PSBT_MAXIO][PSBT_MAXKV]; static int in_n[PSBT_MAXIO];
     static psbt_kv okv[PSBT_MAXIO][PSBT_MAXKV]; static int out_n[PSBT_MAXIO];
     long n_in=-1, n_out=-1;
+    psbt_v2meta vm0; memset(&vm0, 0, sizeof vm0);
     for (int pi=0; pi<np; pi++){
         if (arr->items[pi]->typ!=RJ_STR){ *ec=-22; *em="TX decode failed"; return 0; }
-        if (!crt_b64dec(arr->items[pi]->str, bufs[pi], sizeof bufs[pi], &blens[pi]) || blens[pi]<5 || memcmp(bufs[pi],"psbt\xff",5)!=0){ *ec=-22; *em="TX decode failed"; return 0; }
+        psbt_v2meta vm;
+        if (!psbt_load(arr->items[pi]->str, bufs[pi], sizeof bufs[pi], &blens[pi], &vm, ec, em)) return 0;
+        if (pi == 0) vm0 = vm; else if (vm.version != vm0.version){ *ec=-8; *em="PSBTs not compatible (different transactions)"; return 0; }
         long p=5;
         psbt_kv g[PSBT_MAXKV]; int g_n=psbt_parse_map(bufs[pi],blens[pi],&p,g,PSBT_MAXKV);
         const unsigned char* utx=NULL; unsigned long utxl=0;
         for (int j=0;j<g_n;j++) if (g[j].kl>=1 && g[j].k[0]==0x00){ utx=g[j].v; utxl=g[j].vl; break; }
-        if (!utx){ *ec=-22; *em="Only PSBTv0 (with an unsigned tx) can be combined"; return 0; }
+        if (!utx){ *ec=-22; *em="TX decode failed"; return 0; }
         if (!utx0){ utx0=utx; utx0len=utxl;
             unsigned long cc; long q=4; n_in=(long)srw_varint(utx+q,&cc); q+=cc;
             for (long k=0;k<n_in;k++){ q+=36; unsigned long sl=srw_varint(utx+q,&cc); q+=cc+sl+4; }
@@ -992,7 +1397,7 @@ static int cmd_combinepsbt(const rj_val* params, long* ec, const char** em, rj_v
             if (n_in>PSBT_MAXIO||n_out>PSBT_MAXIO){ *ec=-22; *em="PSBT too large to combine"; return 0; }
             for (long k=0;k<n_in;k++) in_n[k]=0;
             for (long k=0;k<n_out;k++) out_n[k]=0;
-        } else if (utxl!=utx0len || memcmp(utx,utx0,utxl)){ *ec=-8; *em="PSBTs do not refer to the same transactions."; return 0; }
+        } else if (utxl!=utx0len || (vm0.version < 2 ? memcmp(utx,utx0,utxl) != 0 : !psbt_same_tx_seqblind(utx,utx0,utxl))){ *ec=-8; *em="PSBTs not compatible (different transactions)"; return 0; }
         gn=psbt_union(gkv,gn,PSBT_MAXKV,g,g_n);
         for (long k=0;k<n_in;k++){ psbt_kv m[PSBT_MAXKV]; int mn=psbt_parse_map(bufs[pi],blens[pi],&p,m,PSBT_MAXKV); in_n[k]=psbt_union(ikv[k],in_n[k],PSBT_MAXKV,m,mn); }
         for (long k=0;k<n_out;k++){ psbt_kv m[PSBT_MAXKV]; int mn=psbt_parse_map(bufs[pi],blens[pi],&p,m,PSBT_MAXKV); out_n[k]=psbt_union(okv[k],out_n[k],PSBT_MAXKV,m,mn); }
@@ -1002,8 +1407,8 @@ static int cmd_combinepsbt(const rj_val* params, long* ec, const char** em, rj_v
     n+=psbt_ser_map(out+n,gkv,gn);
     for (long k=0;k<n_in;k++)  n+=psbt_ser_map(out+n,ikv[k],in_n[k]);
     for (long k=0;k<n_out;k++) n+=psbt_ser_map(out+n,okv[k],out_n[k]);
-    char* b64=malloc((size_t)((n+2)/3)*4+1); if(!b64){ *ec=-7; *em="oom"; return 0; }
-    crt_b64(b64,out,n); *result=rj_str(b64); free(b64);
+    char* b64=psbt_b64_out(out,n,&vm0); if(!b64){ *ec=-7; *em="oom"; return 0; }
+    *result=rj_str(b64); free(b64);
     return 1;
 }
 
@@ -1023,11 +1428,12 @@ static int cmd_joinpsbts(const rj_val* params, long* ec, const char** em, rj_val
     static psbt_kv omaps[PSBT_MAXIO][PSBT_MAXKV]; static int omaps_n[PSBT_MAXIO]; long tot_o=0;
     for (int pi=0; pi<np; pi++){
         if (arr->items[pi]->typ!=RJ_STR){ *ec=-22; *em="TX decode failed"; return 0; }
-        if (!crt_b64dec(arr->items[pi]->str, bufs[pi], sizeof bufs[pi], &blens[pi]) || blens[pi]<5 || memcmp(bufs[pi],"psbt\xff",5)!=0){ *ec=-22; *em="TX decode failed"; return 0; }
+        { psbt_v2meta vm; if (!psbt_load(arr->items[pi]->str, bufs[pi], sizeof bufs[pi], &blens[pi], &vm, ec, em)) return 0;
+          if (vm.version >= 2){ *ec=-8; *em="joinpsbts only operates on version 0 PSBTs"; return 0; } }
         long p=5; psbt_kv g[PSBT_MAXKV]; int gn=psbt_parse_map(bufs[pi],blens[pi],&p,g,PSBT_MAXKV);
         const unsigned char* utx=NULL; unsigned long utxl=0;
         for (int j=0;j<gn;j++) if (g[j].kl>=1 && g[j].k[0]==0x00){ utx=g[j].v; utxl=g[j].vl; break; }
-        if (!utx){ *ec=-22; *em="Only PSBTv0 (with an unsigned tx) can be joined"; return 0; }
+        if (!utx){ *ec=-22; *em="TX decode failed"; return 0; }
         /* parse this tx's inputs/outputs */
         unsigned long cc; long q=4; unsigned long n_in=srw_varint(utx+q,&cc); q+=cc;
         for (unsigned long k=0;k<n_in;k++){
@@ -1098,14 +1504,13 @@ static void apsbt_hex(char* dst, const unsigned char* b, int n){ for(int i=0;i<n
 static int cmd_analyzepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     if (!params||params->typ!=RJ_ARR||params->nitems<1||params->items[0]->typ!=RJ_STR){
         *ec=-8; *em="Invalid parameters, expected a PSBT string"; return 0; }
-    static unsigned char buf[400000]; long blen;
-    if (!crt_b64dec(params->items[0]->str, buf, sizeof buf, &blen) || blen<5 || memcmp(buf,"psbt\xff",5)!=0){
-        *ec=-22; *em="TX decode failed"; return 0; }
+    static unsigned char buf[400000]; long blen; psbt_v2meta vm;
+    if (!psbt_load(params->items[0]->str, buf, sizeof buf, &blen, &vm, ec, em)) return 0;
     long p=5; psbt_kv g[PSBT_MAXKV]; int gn=psbt_parse_map(buf,blen,&p,g,PSBT_MAXKV);
     const unsigned char* utx=NULL;
     for (int j=0;j<gn;j++) if (g[j].kl>=1 && g[j].k[0]==0x00){ utx=g[j].v; break; }
     rj_val* out=rj_obj();
-    if (!utx){ rj_obj_set(out,"error",rj_str("PSBT cannot be made into a valid transaction")); *result=out; return 1; }
+    if (!utx || vm.locktime_conflict){ rj_obj_set(out,"error",rj_str("PSBT cannot be made into a valid transaction")); *result=out; return 1; }
 
     unsigned long cc; long q=4; unsigned long n_in=srw_varint(utx+q,&cc); q+=cc;
     #define APSBT_MAXIN 5000
@@ -1282,6 +1687,7 @@ static int srw_wif(const char* wif, unsigned char priv[32], int* comp){
 /* parse SIGHASH type string -> byte; default ALL. -1 on error. */
 static int srw_hashtype(const char* s){
     if (!s) return 0x01;
+    if (!strcmp(s,"DEFAULT")) return 0x100;   /* Core: SIGHASH_DEFAULT -- ALL for ECDSA, the 64-byte default for taproot */
     int base=0, acp=0; const char* bar=strchr(s,'|');
     size_t bl = bar ? (size_t)(bar-s) : strlen(s);
     if (bl==3 && !strncmp(s,"ALL",3)) base=1;
@@ -1291,8 +1697,298 @@ static int srw_hashtype(const char* s){
     if (bar){ if (!strcmp(bar+1,"ANYONECANPAY")) acp=0x80; else return -1; }
     return base|acp;
 }
+#include "miniscript_sign.h"
+#define SRW_WITCAP 4200            /* per-input witness buffer: items + a witnessScript of up to 3600 bytes */
 typedef struct { unsigned char txid_wire[32]; unsigned long vout; unsigned char spk[64]; unsigned long spklen;
-                 unsigned long long amount; unsigned char redeem[128]; unsigned long redeemlen; } srw_prev_t;
+                 unsigned long long amount; unsigned char redeem[128]; unsigned long redeemlen;
+                 unsigned char wscript[3700]; unsigned long wscriptlen;   /* a P2WSH witnessScript is at most 3600 bytes (miniscript reaches it) */
+                 /* taproot (2026-09-01): a script-path leaf + its control block, and/or the
+                  * key-path tweak inputs. Fed by the PSBT layer through the prevtx object's
+                  * internal keys tapLeafScript/tapControlBlock/tapMerkleRoot/tapInternalKey. */
+                 unsigned char tapleaf[1024]; unsigned long tapleaflen;
+                 unsigned char tapctrl[33+32*16]; unsigned long tapctrllen;
+                 unsigned char tapmerkle[32]; int has_merkle;
+                 unsigned char tapinternal[32]; int has_internal;
+                 /* partial signatures already in the PSBT (TAP_SCRIPT_SIG / TAP_KEY_SIG), carried
+                  * into the witness for the keys this call does not hold */
+                 struct { unsigned char x[32], lh[32], sig[65]; int sl; } tap_psig[32]; int n_tap_psig;
+                 unsigned char tap_keysig[65]; int tap_keysig_len;
+                 ms_preimages_t pre;                                      /* PSBT hash preimages (miniscript satisfier) */
+                 unsigned char pubs[64][33]; int npubs;
+                 /* PARTIAL_SIGs (0x02) carried from the PSBT for P2WSH / P2SH multisig and miniscript inputs */
+                 struct { unsigned char pub[33]; unsigned char sig[80]; int sl; } v0_psig[32]; int n_v0_psig; } srw_prev_t;     /* pubkeys known without a key: pk_h() resolution */
+
+/* ---- CHECKMULTISIG / taproot signing helpers (2026-09-01) ------------------
+ * The raw signer used to sign P2PKH, P2WPKH and P2SH-P2WPKH only. It now
+ * also signs: legacy P2SH multisig (redeemScript = OP_k <pubs> OP_n
+ * OP_CHECKMULTISIG), P2WSH and P2SH-P2WSH (witnessScript = the same template
+ * or a single <pub> OP_CHECKSIG), and P2TR key-path spends whose internal
+ * key is a given key with no script tree (tr(KEY)) -- the BIP341 tweak is
+ * TapTweak(P), the signing key P's private key tweaked, the signature BIP340
+ * (bip340_sign.c). Signatures for a multisig are emitted in the script's key
+ * order, at most k; fewer than k leaves the input incomplete. */
+extern void sha256_full(unsigned char out[32], const void* msg, unsigned long len);
+extern int  bip32_pubkey_decompress(const unsigned char pub33[33], unsigned char out65[65]);
+extern int  bip32_xonly_tweak_add(const unsigned char x[32], const unsigned char t[32], unsigned char out_x[32]);
+extern int  bip340_sign(unsigned char sig[64], const unsigned char* msg, unsigned long msglen, const unsigned char priv_be[32], const unsigned char aux[32]);
+extern int  bip340_tweak_privkey(unsigned char out_priv[32], const unsigned char priv_be[32], const unsigned char tweak[32]);
+extern int  wallet_ecdsa_sign(unsigned long long out_r[4], unsigned long long out_s[4], const unsigned char z[32], const unsigned char priv[32]);
+extern int  der_signature_export(unsigned char* out, const unsigned long long r[4], const unsigned long long s[4]);
+/* OP_k <pub>... OP_n OP_CHECKMULTISIG -> k, the key pointers/lengths, n; -1 if not that template */
+static int srw_parse_multisig(const unsigned char* sc, unsigned long sl, int* k, const unsigned char* keys[20], int keylen[20]){
+    if (sl < 4 || sc[sl-1] != 0xae) return -1;
+    if (sc[0] < 0x51 || sc[0] > 0x60) return -1;
+    int kk = sc[0] - 0x50;
+    unsigned long tail; int n;
+    if (sc[sl-2] >= 0x51 && sc[sl-2] <= 0x60){ n = sc[sl-2] - 0x50; tail = 2; }
+    else if (sl >= 5 && sc[sl-3] == 0x01 && sc[sl-2] >= 17 && sc[sl-2] <= 20){ n = sc[sl-2]; tail = 3; }
+    else return -1;
+    unsigned long q = 1; int cnt = 0;
+    while (q < sl - tail){
+        unsigned l = sc[q];
+        if ((l != 33 && l != 65) || q + 1 + l > sl - tail || cnt >= 20) return -1;
+        keys[cnt] = sc + q + 1; keylen[cnt] = (int)l; cnt++; q += 1 + l;
+    }
+    if (cnt != n || kk < 1 || kk > n) return -1;
+    *k = kk; return n;
+}
+/* the held key matching a script key (compressed or uncompressed), or -1 */
+static const char* srw_sign_wsh(const srw_prev_t* P, unsigned char* wit, unsigned long* witlen, int* wititems,
+                                const unsigned char* tx, const unsigned char hp[32], const unsigned char hs[32],
+                                const unsigned char outpoint36[36], unsigned seq, const unsigned char ho[32], unsigned long locktime, int hashtype,
+                                unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys);
+static int srw_tap_sighash(unsigned char z[32], const unsigned char* tx, unsigned long txlen,
+                           unsigned long i, unsigned long n_in, const unsigned char* const* outpoints, const unsigned* seqs,
+                           srw_prev_t* const* prev_of, unsigned long out_start, unsigned long out_end,
+                           unsigned long locktime, int hashtype, const unsigned char* leafhash);
+/* ---- taproot script path (2026-09-01) --------------------------------------
+ * The leaf forms this node signs on its own: pk(KEY) -> <x> CHECKSIG, and
+ * multi_a(k, K1..Kn) -> <x1> CHECKSIG <x2> CHECKSIGADD .. <k> NUMEQUAL. Any
+ * other leaf is left to the miniscript satisfier (separate workstream). */
+#define SRW_TAP_MAXKEYS 32
+typedef struct { unsigned char pub[33]; int publen; unsigned char sig[80]; int sl; unsigned char lh[32]; int has_lh; } srw_rec_t;
+#define SRW_RECS 8
+static srw_rec_t* g_srw_rec; static int* g_srw_nrec;   /* the current input's record sink (the raw signer is single-threaded) */
+static int srw_tap_leaf_keys(const unsigned char* sc, unsigned long n, unsigned char (*keys)[32], int* k_of){
+    /* returns the key count (>0) and the threshold in *k_of; 0 = not a form we sign */
+    int nk = 0; unsigned long p = 0;
+    if (n == 34 && sc[0] == 0x20 && sc[33] == 0xac){ memcpy(keys[0], sc+1, 32); *k_of = 1; return 1; }
+    while (p + 34 <= n && nk < SRW_TAP_MAXKEYS && sc[p] == 0x20){
+        unsigned char op = sc[p+33];
+        if (nk == 0 ? op != 0xac : op != 0xba) return 0;
+        memcpy(keys[nk++], sc+p+1, 32); p += 34;
+    }
+    if (nk < 1 || p >= n) return 0;
+    int k;
+    if (sc[p] >= 0x51 && sc[p] <= 0x60){ k = sc[p] - 0x50; p++; }
+    else if (sc[p] == 0x01 && p + 1 < n){ k = sc[p+1]; p += 2; }
+    else return 0;
+    if (p + 1 != n || sc[p] != 0x9c || k < 1 || k > nk) return 0;
+    *k_of = k; return nk;
+}
+static void srw_tapleaf_hash(unsigned char out[32], unsigned char ver, const unsigned char* sc, unsigned long n){
+    unsigned char th[32]; sha256_full(th, "TapLeaf", 7);
+    unsigned char* b = malloc(64 + 1 + 9 + n); unsigned long m = 0;
+    memcpy(b, th, 32); m += 32; memcpy(b + m, th, 32); m += 32; b[m++] = ver;
+    m += crt_varint(b + m, n); memcpy(b + m, sc, n); m += n;
+    sha256_full(out, b, m); free(b);
+}
+static void srw_tapbranch(unsigned char out[32], const unsigned char* a, const unsigned char* b){
+    unsigned char th[32]; sha256_full(th, "TapBranch", 9);
+    unsigned char buf[128]; memcpy(buf, th, 32); memcpy(buf+32, th, 32);
+    if (memcmp(a, b, 32) <= 0){ memcpy(buf+64, a, 32); memcpy(buf+96, b, 32); } else { memcpy(buf+64, b, 32); memcpy(buf+96, a, 32); }
+    sha256_full(out, buf, 128);
+}
+static void srw_taptweak(unsigned char t[32], const unsigned char* xonly, const unsigned char* root /* NULL = no tree */){
+    unsigned char th[32]; sha256_full(th, "TapTweak", 8);
+    unsigned char tb[128]; memcpy(tb, th, 32); memcpy(tb+32, th, 32); memcpy(tb+64, xonly, 32);
+    if (root){ memcpy(tb+96, root, 32); sha256_full(t, tb, 128); } else sha256_full(t, tb, 96);
+}
+/* Sign one P2TR script-path input. Builds the witness [sig..., script, control]
+ * (multi_a: one slot per key, empty where we hold no key, at most k filled),
+ * even when incomplete, so the PSBT layer can extract partial signatures.
+ * Returns NULL or an error string ("Missing signatures: ..." is partial). */
+static const char* srw_sign_tap_script(const srw_prev_t* P, const unsigned char* spk, unsigned char* wit, unsigned long* witlen, int* wititems,
+                                       const unsigned char* tx, unsigned long txlen, unsigned long i, unsigned long n_in,
+                                       const unsigned char* const* outpoints, const unsigned* seqs, srw_prev_t* const* prev_of,
+                                       unsigned long out_start, unsigned long out_end, unsigned long locktime, int tht,
+                                       unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys){
+    const unsigned char* ctrl = P->tapctrl; unsigned long cl = P->tapctrllen;
+    unsigned char ver = ctrl[0] & 0xfe;
+    unsigned char lh[32]; srw_tapleaf_hash(lh, ver, P->tapleaf, P->tapleaflen);
+    unsigned char k[32]; memcpy(k, lh, 32);
+    for (unsigned long q = 33; q + 32 <= cl; q += 32) srw_tapbranch(k, k, ctrl + q);
+    unsigned char t[32], qx[32]; srw_taptweak(t, ctrl + 1, k);
+    if (!bip32_xonly_tweak_add(ctrl + 1, t, qx) || memcmp(qx, spk + 2, 32)) return "tapControlBlock does not commit to this scriptPubKey";
+    unsigned char keys[SRW_TAP_MAXKEYS][32]; int kth = 0;
+    int nk = srw_tap_leaf_keys(P->tapleaf, P->tapleaflen, keys, &kth);
+    unsigned char z[32];
+    if (!srw_tap_sighash(z, tx, txlen, i, n_in, outpoints, seqs, prev_of, out_start, out_end, locktime, tht, lh))
+        return "P2TR sighash needs scriptPubKey and amount for every input";
+    if (nk <= 0){
+        /* any other leaf is a miniscript (2026-09-01): the satisfier signs with the keys we hold,
+         * the partial signatures the PSBT carries for this leaf, its preimages and the tx's timelocks */
+        ms_psig_t ps[32]; int nps = 0;
+        for (int q = 0; q < P->n_tap_psig && nps < 32; q++) if (!memcmp(P->tap_psig[q].lh, lh, 32)){ ps[nps].x = P->tap_psig[q].x; ps[nps].sig = P->tap_psig[q].sig; ps[nps].sl = P->tap_psig[q].sl; nps++; }
+        const char* merr = NULL; unsigned long ml = 0; int mi = 0;
+        unsigned long need = 3 + P->tapleaflen + 3 + cl; if (need + 64 > SRW_WITCAP) return "P2TR leaf too large for this node's witness buffer";
+        static ms_sigrec_t mr[SRW_RECS]; int nmr = 0;
+        int r = ms_sign_witness_tapleaf(P->tapleaf, P->tapleaflen, z, tht, seqs[i], locktime, kpriv, kpub, nkeys,
+                                        (const unsigned char (*)[33])P->pubs, P->npubs, ps, nps, &P->pre, mr, SRW_RECS, &nmr, wit, SRW_WITCAP - need, &ml, &mi, &merr);
+        if (g_srw_rec && g_srw_nrec){ for (int q = 0; q < nmr && *g_srw_nrec < SRW_RECS; q++){ srw_rec_t* rr = &g_srw_rec[*g_srw_nrec]; memcpy(rr->pub, mr[q].pub, (size_t)mr[q].publen); rr->publen = mr[q].publen; memcpy(rr->sig, mr[q].sig, (size_t)mr[q].sl); rr->sl = mr[q].sl; memcpy(rr->lh, lh, 32); rr->has_lh = 1; (*g_srw_nrec)++; } }
+        if (r == 0) return "P2TR script-path: pk(), multi_a() and miniscript leaves are signed on this node; this leaf is none of those";
+        if (r == -1) return merr;
+        unsigned long o = ml;
+        o += crt_varint(wit + o, P->tapleaflen); memcpy(wit + o, P->tapleaf, P->tapleaflen); o += P->tapleaflen;
+        o += crt_varint(wit + o, cl); memcpy(wit + o, ctrl, cl); o += cl;
+        *witlen = o; *wititems = mi + 2;
+        return NULL;
+    }
+    static unsigned char sigs[SRW_TAP_MAXKEYS][65]; int sl[SRW_TAP_MAXKEYS]; int got = 0;
+    for (int a = 0; a < nk; a++){
+        sl[a] = 0;
+        if (got >= kth) continue;
+        for (int b = 0; b < nkeys; b++){
+            if (!ncomp[b] || memcmp(kpub[b] + 1, keys[a], 32)) continue;
+            unsigned char aux[32], ab[64]; memcpy(ab, z, 32); memcpy(ab+32, kpriv[b], 32); sha256d(aux, ab, 64);
+            if (!bip340_sign(sigs[a], z, 32, kpriv[b], aux)) return "schnorr signing failed";
+            sl[a] = 64; if (tht != 0){ sigs[a][64] = (unsigned char)tht; sl[a] = 65; }
+            got++; break;
+        }
+    }
+    for (int a = 0; a < nk && got < kth; a++){                       /* slots we could not sign: partials from the PSBT */
+        if (sl[a]) continue;
+        for (int q = 0; q < P->n_tap_psig; q++){
+            if (memcmp(P->tap_psig[q].x, keys[a], 32) || memcmp(P->tap_psig[q].lh, lh, 32)) continue;
+            memcpy(sigs[a], P->tap_psig[q].sig, (size_t)P->tap_psig[q].sl); sl[a] = P->tap_psig[q].sl; got++; break;
+        }
+    }
+    if (got == 0) return "Keys not provided for this input";   /* nothing signed and nothing carried: no partial witness to keep
+                                                                * (a 0-of-k "partial" from one leaf must not shadow a real partial
+                                                                * from another leaf in the PSBT layer's signing rounds) */
+    unsigned long o = 0; int items = 0;
+    if (nk == 1 && kth == 1){ if (sl[0]){ wit[o++] = (unsigned char)sl[0]; memcpy(wit+o, sigs[0], sl[0]); o += sl[0]; items++; } }
+    else { for (int a = nk - 1; a >= 0; a--){ wit[o++] = (unsigned char)sl[a]; if (sl[a]){ memcpy(wit+o, sigs[a], sl[a]); o += sl[a]; } items++; } }
+    o += crt_varint(wit + o, P->tapleaflen); memcpy(wit + o, P->tapleaf, P->tapleaflen); o += P->tapleaflen; items++;
+    o += crt_varint(wit + o, cl); memcpy(wit + o, ctrl, cl); o += cl; items++;
+    *witlen = o; *wititems = items;
+    if (got < kth){ static char mbuf[64]; snprintf(mbuf, sizeof mbuf, "Missing signatures: have %d of %d", got, kth); return mbuf; }
+    return NULL;
+}
+
+static int srw_key_index(const unsigned char* key, int klen, unsigned char (*kpub)[33], const int* ncomp, int nkeys){
+    for (int h = 0; h < nkeys; h++){
+        if (klen == 33){ if (ncomp[h] && !memcmp(key, kpub[h], 33)) return h; }
+        else { unsigned char u[65]; if (!ncomp[h] && bip32_pubkey_decompress(kpub[h], u) && !memcmp(key, u, 65)) return h; }
+    }
+    return -1;
+}
+/* DER signature + hashtype byte for sighash z under held key h */
+static int srw_ecdsa(unsigned char* der, const unsigned char z[32], const unsigned char priv[32], int hashtype){
+    unsigned long long r[4], sv[4]; wallet_ecdsa_sign(r, sv, z, priv);
+    int dl = der_signature_export(der, r, sv); der[dl++] = (unsigned char)hashtype; return dl;
+}
+/* the signatures we can produce for a multisig script (key order, at most k); returns how many */
+static int srw_multisig_sigs(unsigned char (*sigs)[80], int* siglens, int k, const unsigned char* keys[], const int* keylen, int n,
+                             const unsigned char z[32], unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys, int hashtype){
+    int got = 0;
+    for (int i = 0; i < n && got < k; i++){
+        int h = srw_key_index(keys[i], keylen[i], kpub, ncomp, nkeys);
+        if (h < 0) continue;
+        siglens[got] = srw_ecdsa(sigs[got], z, kpriv[h], hashtype); got++;
+    }
+    return got;
+}
+/* the same, merging PARTIAL_SIGs the PSBT carries for keys we do not hold, in script order;
+ * rec[]/nrec receive (pubkey, sig) for every signature placed (2026-09-01) */
+static int srw_multisig_sigs2(unsigned char (*sigs)[80], int* siglens, int k, const unsigned char* keys[], const int* keylen, int n,
+                              const unsigned char z[32], unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys, int hashtype,
+                              const srw_prev_t* P, srw_rec_t* rec, int reccap, int* nrec){
+    int got = 0;
+    for (int i = 0; i < n && got < k; i++){
+        int h = srw_key_index(keys[i], keylen[i], kpub, ncomp, nkeys);
+        if (h >= 0){ siglens[got] = srw_ecdsa(sigs[got], z, kpriv[h], hashtype); }
+        else {
+            int found = -1;
+            if (keylen[i] == 33) for (int q = 0; q < P->n_v0_psig; q++) if (!memcmp(P->v0_psig[q].pub, keys[i], 33)){ found = q; break; }
+            if (found < 0) continue;
+            memcpy(sigs[got], P->v0_psig[found].sig, (size_t)P->v0_psig[found].sl); siglens[got] = P->v0_psig[found].sl;
+        }
+        if (rec && *nrec < reccap && keylen[i] == 33){ srw_rec_t* r = &rec[*nrec]; memcpy(r->pub, keys[i], 33); r->publen = 33; memcpy(r->sig, sigs[got], (size_t)siglens[got]); r->sl = siglens[got]; r->has_lh = 0; (*nrec)++; }
+        got++;
+    }
+    return got;
+}
+/* push data with a minimal length prefix (< 0x4c, else OP_PUSHDATA1/2) */
+static unsigned long srw_push(unsigned char* o, const unsigned char* d, unsigned long n){
+    unsigned long w = 0;
+    if (n < 0x4c) o[w++] = (unsigned char)n;
+    else if (n <= 0xff){ o[w++] = 0x4c; o[w++] = (unsigned char)n; }
+    else { o[w++] = 0x4d; o[w++] = (unsigned char)n; o[w++] = (unsigned char)(n >> 8); }
+    memcpy(o + w, d, n); return w + n;
+}
+/* BIP341 key-path sighash (ext_flag 0, no annex) for input i. prev_of[j] is
+ * the prevtx of input j (all needed unless ANYONECANPAY). 1 ok / 0 missing data. */
+static int srw_tap_sighash(unsigned char z[32], const unsigned char* tx, unsigned long txlen,
+                           unsigned long i, unsigned long n_in, const unsigned char* const* outpoints, const unsigned* seqs,
+                           srw_prev_t* const* prev_of, unsigned long out_start, unsigned long out_end,
+                           unsigned long locktime, int hashtype, const unsigned char* leafhash /* NULL = key path */){
+    int base = hashtype & 3, acp = hashtype & 0x80;
+    if (hashtype != 0 && !(base == 1 || base == 2 || base == 3)) return 0;   /* DEFAULT, ALL, NONE, SINGLE (+ACP) */
+    unsigned char* msg = malloc(300 + txlen); if (!msg) return 0; unsigned long m = 0;
+    msg[m++] = 0x00;                                   /* epoch */
+    msg[m++] = (unsigned char)hashtype;
+    memcpy(msg + m, tx, 4); m += 4;                    /* nVersion */
+    msg[m++] = (unsigned char)locktime; msg[m++] = (unsigned char)(locktime >> 8); msg[m++] = (unsigned char)(locktime >> 16); msg[m++] = (unsigned char)(locktime >> 24);
+    if (!acp){
+        for (unsigned long j = 0; j < n_in; j++) if (!prev_of[j]){ free(msg); return 0; }
+        unsigned char* b = malloc(n_in * 36 + 64 * n_in + 16); if (!b){ free(msg); return 0; }
+        unsigned long bl = 0;
+        for (unsigned long j = 0; j < n_in; j++){ memcpy(b + bl, outpoints[j], 36); bl += 36; }
+        sha256_full(msg + m, b, bl); m += 32;                                   /* sha_prevouts */
+        bl = 0; for (unsigned long j = 0; j < n_in; j++){ unsigned long long a = prev_of[j]->amount; for (int q = 0; q < 8; q++) b[bl++] = (unsigned char)(a >> (8*q)); }
+        sha256_full(msg + m, b, bl); m += 32;                                   /* sha_amounts */
+        bl = 0; for (unsigned long j = 0; j < n_in; j++){ bl += crt_varint(b + bl, prev_of[j]->spklen); memcpy(b + bl, prev_of[j]->spk, prev_of[j]->spklen); bl += prev_of[j]->spklen; }
+        sha256_full(msg + m, b, bl); m += 32;                                   /* sha_scriptpubkeys */
+        bl = 0; for (unsigned long j = 0; j < n_in; j++){ unsigned sq = seqs[j]; b[bl++] = (unsigned char)sq; b[bl++] = (unsigned char)(sq >> 8); b[bl++] = (unsigned char)(sq >> 16); b[bl++] = (unsigned char)(sq >> 24); }
+        sha256_full(msg + m, b, bl); m += 32;                                   /* sha_sequences */
+        free(b);
+    }
+    unsigned long cc; unsigned long n_out = srw_varint(tx + out_start, &cc);
+    const unsigned char* outs = tx + out_start + cc; unsigned long outs_len = out_end - (out_start + cc);
+    if (base != 2 && base != 3){ sha256_full(msg + m, outs, outs_len); m += 32; }   /* sha_outputs */
+    msg[m++] = leafhash ? 0x02 : 0x00;                 /* spend_type: ext_flag (1 = tapscript) * 2 + annex (never) */
+    if (acp){
+        if (!prev_of[i]){ free(msg); return 0; }
+        memcpy(msg + m, outpoints[i], 36); m += 36;
+        unsigned long long a = prev_of[i]->amount; for (int q = 0; q < 8; q++) msg[m++] = (unsigned char)(a >> (8*q));
+        m += crt_varint(msg + m, prev_of[i]->spklen); memcpy(msg + m, prev_of[i]->spk, prev_of[i]->spklen); m += prev_of[i]->spklen;
+        unsigned sq = seqs[i]; msg[m++] = (unsigned char)sq; msg[m++] = (unsigned char)(sq >> 8); msg[m++] = (unsigned char)(sq >> 16); msg[m++] = (unsigned char)(sq >> 24);
+    } else { msg[m++] = (unsigned char)i; msg[m++] = (unsigned char)(i >> 8); msg[m++] = (unsigned char)(i >> 16); msg[m++] = (unsigned char)(i >> 24); }
+    if (base == 3){                                    /* SINGLE: sha256 of this input's output */
+        if (i >= n_out){ free(msg); return 0; }
+        const unsigned char* q = outs; unsigned long left = outs_len;
+        for (unsigned long oi = 0; ; oi++){
+            if (left < 9){ free(msg); return 0; }
+            unsigned long c2; unsigned long sl = srw_varint(q + 8, &c2); unsigned long olen = 8 + c2 + sl;
+            if (olen > left){ free(msg); return 0; }
+            if (oi == i){ sha256_full(msg + m, q, olen); m += 32; break; }
+            q += olen; left -= olen;
+        }
+    }
+    if (leafhash){                                     /* BIP342 extension: tapleaf_hash, key_version, codesep_pos */
+        memcpy(msg + m, leafhash, 32); m += 32;
+        msg[m++] = 0x00;
+        msg[m++] = 0xff; msg[m++] = 0xff; msg[m++] = 0xff; msg[m++] = 0xff;
+    }
+    /* TaggedHash("TapSighash", msg) */
+    unsigned char th[32]; sha256_full(th, "TapSighash", 10);
+    unsigned char* pre = malloc(64 + m); if (!pre){ free(msg); return 0; }
+    memcpy(pre, th, 32); memcpy(pre + 32, th, 32); memcpy(pre + 64, msg, m);
+    sha256_full(z, pre, 64 + m);
+    free(pre); free(msg);
+    return 1;
+}
 
 /* BIP143 segwit-v0 sighash. hp/hs/ho are the caller-selected hashPrevouts /
  * hashSequence / hashOutputs (zeroed per the SIGHASH type). */
@@ -1315,6 +2011,42 @@ static void srw_bip143(unsigned char z[32], const unsigned char ver4[4],
     sha256d(z,pre,n); free(pre);
 }
 
+/* sign a P2WSH input: witnessScript = CHECKMULTISIG template (witness: <> sigs... ws)
+ * or <pub> OP_CHECKSIG (witness: sig ws). NULL on success, else the error. */
+static const char* srw_sign_wsh(const srw_prev_t* P, unsigned char* wit, unsigned long* witlen, int* wititems,
+                                const unsigned char* tx, const unsigned char hp[32], const unsigned char hs[32],
+                                const unsigned char outpoint36[36], unsigned seq, const unsigned char ho[32], unsigned long locktime, int hashtype,
+                                unsigned char (*kpriv)[32], unsigned char (*kpub)[33], const int* ncomp, int nkeys){
+    const unsigned char* ws=P->wscript; unsigned long wl=P->wscriptlen;
+    unsigned char z[32]; srw_bip143(z, tx, hp, hs, outpoint36, ws, wl, P->amount, seq, ho, locktime, hashtype);
+    unsigned long o=0;
+    if (wl==35 && ws[0]==33 && ws[34]==0xac){                                   /* <pub> CHECKSIG */
+        int h=srw_key_index(ws+1,33,kpub,ncomp,nkeys); if (h<0) return "Keys not provided for this input";
+        unsigned char der[80]; int dl=srw_ecdsa(der,z,kpriv[h],hashtype);
+        wit[o++]=(unsigned char)dl; memcpy(wit+o,der,(size_t)dl); o+=dl;
+        o+=crt_varint(wit+o,wl); memcpy(wit+o,ws,wl); o+=wl; *witlen=o; *wititems=2; return NULL;   /* witness items are varint-prefixed, not script pushes */
+    }
+    int k; const unsigned char* keys[20]; int kl[20]; int n=srw_parse_multisig(ws,wl,&k,keys,kl);
+    if (n<0){
+        /* miniscript (2026-09-01): the satisfier builds the witness from the keys we hold, the
+         * PSBT's preimages, partial signatures and the tx's timelock fields; the witnessScript is appended here */
+        const char* merr=NULL; unsigned long ml=0; int mi=0;
+        ms_psig_t ps[32]; int nps=0; for (int q=0;q<P->n_v0_psig&&nps<32;q++){ ps[nps].x=P->v0_psig[q].pub; ps[nps].sig=P->v0_psig[q].sig; ps[nps].sl=P->v0_psig[q].sl; nps++; }
+        static ms_sigrec_t mr[SRW_RECS]; int nmr=0;
+        int r=ms_sign_witness_v0(ws,wl,z,hashtype,seq,locktime,kpriv,kpub,ncomp,nkeys,(const unsigned char (*)[33])P->pubs,P->npubs,ps,nps,&P->pre,mr,SRW_RECS,&nmr,wit,SRW_WITCAP-(3+wl),&ml,&mi,&merr);
+        if (g_srw_rec && g_srw_nrec){ for (int q=0;q<nmr&&*g_srw_nrec<SRW_RECS;q++){ srw_rec_t* rr=&g_srw_rec[*g_srw_nrec]; memcpy(rr->pub,mr[q].pub,(size_t)mr[q].publen); rr->publen=mr[q].publen; memcpy(rr->sig,mr[q].sig,(size_t)mr[q].sl); rr->sl=mr[q].sl; rr->has_lh=0; (*g_srw_nrec)++; } }
+        if (r==1){ o=ml; o+=crt_varint(wit+o,wl); memcpy(wit+o,ws,wl); o+=wl; *witlen=o; *wititems=mi+1; return NULL; }
+        if (r==-1) return merr;
+        return "Unsupported witnessScript (CHECKMULTISIG, <pub> CHECKSIG or miniscript only)";
+    }
+    unsigned char sigs[20][80]; int sls[20];
+    int got=srw_multisig_sigs2(sigs,sls,k,keys,kl,n,z,kpriv,kpub,ncomp,nkeys,hashtype,P,g_srw_rec,g_srw_rec?SRW_RECS:0,g_srw_nrec?g_srw_nrec:&(int){0});
+    wit[o++]=0x00;                                                              /* the empty dummy element */
+    for (int q=0;q<got;q++){ wit[o++]=(unsigned char)sls[q]; memcpy(wit+o,sigs[q],(size_t)sls[q]); o+=sls[q]; }
+    o+=crt_varint(wit+o,wl); memcpy(wit+o,ws,wl); o+=wl; *witlen=o; *wititems=2+got;
+    if (got<k){ static char mbuf[64]; snprintf(mbuf,sizeof mbuf,"Missing signatures: have %d of %d",got,k); return mbuf; }
+    return NULL;
+}
 static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const char** em, rj_val** result){
     if (!params || params->typ!=RJ_ARR || params->nitems<2 || params->items[0]->typ!=RJ_STR || params->items[1]->typ!=RJ_ARR){
         *ec=-8; *em="Invalid parameters, expected hexstring and privkeys array"; return 0; }
@@ -1326,9 +2058,14 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
     if (!hex_to_bytes(tx,txhex,thl)){ *ec=-22; *em="TX decode failed"; return 0; }
     /* --- keys --- */
     const rj_val* pk=params->items[1];
-    int nk=(int)pk->nitems; if (nk>64) nk=64;
-    unsigned char kpriv[64][32]; unsigned char kpub[64][33]; unsigned char kh[64][20]; int ncomp[64]; int nkeys=0;
-    for (int i=0;i<(int)pk->nitems && nkeys<64;i++){
+    /* 512 keys: the wallet signer hands over its whole window for every
+     * active output type (4 types x 2 chains x SRWW_WINDOW); the old cap of
+     * 64 silently dropped the 49'/86' keys. Static: the RPC thread's stack
+     * is small (see project_tls_thread_stacks). */
+    #define SRW_MAX_KEYS 512
+    int nk=(int)pk->nitems; if (nk>SRW_MAX_KEYS) nk=SRW_MAX_KEYS;
+    static unsigned char kpriv[SRW_MAX_KEYS][32]; static unsigned char kpub[SRW_MAX_KEYS][33]; static unsigned char kh[SRW_MAX_KEYS][20]; static int ncomp[SRW_MAX_KEYS]; int nkeys=0;
+    for (int i=0;i<(int)pk->nitems && nkeys<SRW_MAX_KEYS;i++){
         if (pk->items[i]->typ!=RJ_STR) continue;
         int comp=1; if (!srw_wif(pk->items[i]->str,kpriv[nkeys],&comp)){ *ec=-8; *em="Invalid private key"; return 0; }
         scalar_to_pubkey(kpub[nkeys],kpriv[nkeys]); wallet_key_h160(kh[nkeys],kpriv[nkeys]); ncomp[nkeys]=comp; nkeys++;
@@ -1350,11 +2087,57 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
             rj_val* am=rj_obj_get(e,"amount"); P->amount = (am&&am->typ==RJ_NUM)? (unsigned long long)crt_amount_to_sat(am->str) : 0;
             rj_val* rs=rj_obj_get(e,"redeemScript"); P->redeemlen=0;
             if (rs&&rs->typ==RJ_STR){ size_t rl=strlen(rs->str); if (!(rl&1)&&rl/2<=128){ P->redeemlen=(unsigned long)(rl/2); hex_to_bytes(P->redeem,rs->str,rl); } }
+            rj_val* ws=rj_obj_get(e,"witnessScript"); P->wscriptlen=0;
+            if (ws&&ws->typ==RJ_STR){ size_t wl=strlen(ws->str); if (!(wl&1)&&wl/2<=sizeof P->wscript){ P->wscriptlen=(unsigned long)(wl/2); hex_to_bytes(P->wscript,ws->str,wl); } }
+            P->tapleaflen=0; P->tapctrllen=0; P->has_merkle=0; P->has_internal=0;
+            { rj_val* tl=rj_obj_get(e,"tapLeafScript"); rj_val* tc=rj_obj_get(e,"tapControlBlock");
+              if (tl&&tl->typ==RJ_STR&&tc&&tc->typ==RJ_STR){ size_t a=strlen(tl->str), b=strlen(tc->str);
+                  if (!(a&1)&&a/2<=sizeof P->tapleaf&&!(b&1)&&b/2>=33&&b/2<=sizeof P->tapctrl&&((b/2-33)%32)==0
+                      &&hex_to_bytes(P->tapleaf,tl->str,a)&&hex_to_bytes(P->tapctrl,tc->str,b)){ P->tapleaflen=a/2; P->tapctrllen=b/2; } }
+              rj_val* tm=rj_obj_get(e,"tapMerkleRoot"); if (tm&&tm->typ==RJ_STR&&strlen(tm->str)==64&&hex_to_bytes(P->tapmerkle,tm->str,64)) P->has_merkle=1;
+              rj_val* ti=rj_obj_get(e,"tapInternalKey"); if (ti&&ti->typ==RJ_STR&&strlen(ti->str)==64&&hex_to_bytes(P->tapinternal,ti->str,64)) P->has_internal=1;
+              P->n_tap_psig=0; P->tap_keysig_len=0;
+              rj_val* tp=rj_obj_get(e,"tapPartialSigs");
+              if (tp&&tp->typ==RJ_ARR){ for (unsigned long q=0;q<tp->nitems&&P->n_tap_psig<32;q++){ rj_val* d=tp->items[q]; if (d->typ!=RJ_OBJ) continue;
+                  rj_val* px=rj_obj_get(d,"pubkey"); rj_val* pl=rj_obj_get(d,"leaf_hash"); rj_val* pg=rj_obj_get(d,"sig");
+                  if (!px||!pl||!pg||px->typ!=RJ_STR||pl->typ!=RJ_STR||pg->typ!=RJ_STR||strlen(px->str)!=64||strlen(pl->str)!=64) continue;
+                  size_t gl=strlen(pg->str); if (gl!=128&&gl!=130) continue;
+                  int n2=P->n_tap_psig; if (!hex_to_bytes(P->tap_psig[n2].x,px->str,64)||!hex_to_bytes(P->tap_psig[n2].lh,pl->str,64)||!hex_to_bytes(P->tap_psig[n2].sig,pg->str,gl)) continue;
+                  P->tap_psig[n2].sl=(int)(gl/2); P->n_tap_psig++; } }
+              P->n_v0_psig=0;
+              { rj_val* ps0=rj_obj_get(e,"partialSigs");
+                if (ps0&&ps0->typ==RJ_ARR){ for (unsigned long q=0;q<ps0->nitems&&P->n_v0_psig<32;q++){ rj_val* d=ps0->items[q]; if (d->typ!=RJ_OBJ) continue;
+                    rj_val* px=rj_obj_get(d,"pubkey"); rj_val* pg=rj_obj_get(d,"sig");
+                    if (!px||!pg||px->typ!=RJ_STR||pg->typ!=RJ_STR||strlen(px->str)!=66) continue;
+                    size_t gl=strlen(pg->str); if (gl<16||gl>160||(gl&1)) continue;
+                    int n2=P->n_v0_psig; if (!hex_to_bytes(P->v0_psig[n2].pub,px->str,66)||!hex_to_bytes(P->v0_psig[n2].sig,pg->str,gl)) continue;
+                    P->v0_psig[n2].sl=(int)(gl/2); P->n_v0_psig++; } } }
+              rj_val* tk=rj_obj_get(e,"tapKeySig"); if (tk&&tk->typ==RJ_STR&&(strlen(tk->str)==128||strlen(tk->str)==130)&&hex_to_bytes(P->tap_keysig,tk->str,strlen(tk->str))) P->tap_keysig_len=(int)(strlen(tk->str)/2); }
+            /* "preimages": [{"hash":hex20|hex32,"preimage":hex32},...] -- what a PSBT's
+             * PSBT_IN_*_PREIMAGES fields carry, for miniscript hash challenges */
+            /* "pubkeys": [hex33,...] -- keys a descriptor names without a private key (pk_h needs them) */
+            rj_val* pk2=rj_obj_get(e,"pubkeys"); P->npubs=0;
+            if (pk2&&pk2->typ==RJ_ARR){ for (size_t q=0;q<pk2->nitems&&P->npubs<64;q++){ rj_val* v=pk2->items[q]; if (v->typ!=RJ_STR||strlen(v->str)!=66) continue; if (hex_to_bytes(P->pubs[P->npubs],v->str,66)) P->npubs++; } }
+            rj_val* pm=rj_obj_get(e,"preimages"); P->pre.n=0;
+            if (pm&&pm->typ==RJ_ARR){
+                for (size_t q=0;q<pm->nitems&&P->pre.n<MS_PRE_MAX;q++){
+                    rj_val* po=pm->items[q]; if (po->typ!=RJ_OBJ) continue;
+                    rj_val* h=rj_obj_get(po,"hash"); rj_val* pr=rj_obj_get(po,"preimage");
+                    if (!h||h->typ!=RJ_STR||!pr||pr->typ!=RJ_STR) continue;
+                    size_t hl=strlen(h->str), pl=strlen(pr->str);
+                    if ((hl!=40&&hl!=64)||pl!=64) continue;
+                    int m=P->pre.n;
+                    if (!hex_to_bytes(P->pre.hash[m],h->str,hl)||!hex_to_bytes(P->pre.pre[m],pr->str,pl)) continue;
+                    P->pre.hlen[m]=(int)(hl/2); P->pre.n++;
+                }
+            }
             nprev++;
         }
     }
     int hashtype = (params->nitems>=4 && params->items[3]->typ==RJ_STR) ? srw_hashtype(params->items[3]->str) : 0x01;
+    int ht_explicit = (params->nitems>=4 && params->items[3]->typ==RJ_STR);   /* taproot signs SIGHASH_DEFAULT unless one was asked for */
     if (hashtype<0){ *ec=-8; *em="Invalid sighash param"; return 0; }
+    if (hashtype==0x100){ hashtype=0x01; ht_explicit=0; }                     /* "DEFAULT": ALL for ECDSA, no hashtype byte for taproot */
 
     /* --- parse the unsigned tx into inputs (outpoint,seq) + outputs region + locktime --- */
     unsigned long p=4, cc; unsigned long n_in=srw_varint(tx+p,&cc); p+=cc;
@@ -1382,12 +2165,23 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
     const unsigned char* bip_ho = (ht_base==1) ? hashOutputs : zero32;
 
     /* --- sign each input --- */
-    static unsigned char ss[10000][256]; unsigned long sslen[10000];      /* scriptSig per input */
-    static unsigned char witbuf[10000][256]; unsigned long witlen[10000]; int wititems[10000]; /* witness serialized (count+items) */
+    static unsigned char ss[10000][1400]; unsigned long sslen[10000];      /* scriptSig per input (a 3-sig P2SH multisig is ~330 bytes) */
+    static unsigned char witbuf[10000][SRW_WITCAP]; unsigned long witlen[10000]; int wititems[10000]; /* witness items (the count goes in front at assembly) */
+    /* the signatures placed per input (own or carried), for the PSBT's partial-signature fields */
+    static srw_rec_t srec[10000][SRW_RECS]; static int nsrec[10000];
+    for (unsigned long i=0;i<n_in;i++) nsrec[i]=0;
+    /* prevtx of every input, for the taproot sighash (which commits to all spent outputs) */
+    static srw_prev_t* prev_of[10000];
+    for (unsigned long i=0;i<n_in;i++){
+        prev_of[i]=NULL;
+        unsigned long vo=(unsigned long)in_outpoint[i][32]|((unsigned long)in_outpoint[i][33]<<8)|((unsigned long)in_outpoint[i][34]<<16)|((unsigned long)in_outpoint[i][35]<<24);
+        for (int k=0;k<nprev;k++) if (prev[k].vout==vo && !memcmp(prev[k].txid_wire,in_outpoint[i],32)){ prev_of[i]=&prev[k]; break; }
+    }
     int any_segwit=0, complete=1;
     rj_val* errors=rj_arr();
     unsigned char* pre=malloc((size_t)txlen+8192); if (!pre){ *ec=-7; *em="oom"; return 0; }
     for (unsigned long i=0;i<n_in;i++){
+        g_srw_rec=srec[i]; g_srw_nrec=&nsrec[i];   /* signature records for this input (PSBT partials) */
         sslen[i]=0; witlen[i]=0; wititems[i]=0;
         /* match prevout */
         srw_prev_t* P=NULL; unsigned long vo=(unsigned long)in_outpoint[i][32]|((unsigned long)in_outpoint[i][33]<<8)|((unsigned long)in_outpoint[i][34]<<16)|((unsigned long)in_outpoint[i][35]<<24);
@@ -1425,8 +2219,60 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
                         witbuf[i][o++]=33; memcpy(witbuf[i]+o,kpub[found],33); o+=33; witlen[i]=o; wititems[i]=2; any_segwit=1;
                         /* scriptSig = push(redeemScript) */
                         ss[i][0]=(unsigned char)P->redeemlen; memcpy(ss[i]+1,P->redeem,P->redeemlen); sslen[i]=1+P->redeemlen; } }
+            } else if (sl==23 && spk[0]==0xa9&&spk[1]==0x14&&spk[22]==0x87 && P->redeemlen>0){     /* P2SH: P2SH-P2WSH or legacy multisig */
+                unsigned char rh[20]; hash160(rh,P->redeem,P->redeemlen);
+                if (memcmp(rh,spk+2,20)){ err="redeemScript does not match scriptPubKey"; }
+                else if (P->redeemlen==34 && P->redeem[0]==0x00 && P->redeem[1]==0x20){                 /* P2SH-P2WSH */
+                    if (!P->wscriptlen) err="witnessScript needed for P2SH-P2WSH";
+                    else { unsigned char wh[32]; sha256_full(wh,P->wscript,P->wscriptlen);
+                        if (memcmp(wh,P->redeem+2,32)) err="witnessScript does not match redeemScript";
+                        else { err=srw_sign_wsh(P, witbuf[i], &witlen[i], &wititems[i], tx, bip_hp, bip_hs, in_outpoint[i], in_seq[i], bip_ho, locktime, hashtype, kpriv, kpub, ncomp, nkeys);
+                               if (!err || strstr(err,"Missing signatures")){ sslen[i]=srw_push(ss[i],P->redeem,P->redeemlen); any_segwit=1; } } }
+                } else {                                                                                  /* legacy P2SH multisig */
+                    int k; const unsigned char* keys[20]; int kl[20]; int n=srw_parse_multisig(P->redeem,P->redeemlen,&k,keys,kl);
+                    if (n<0) err="Unsupported redeemScript (CHECKMULTISIG, P2WPKH or P2WSH only)";
+                    else if (!legacy_sighash(z,tx,txlen,i,P->redeem,P->redeemlen,hashtype,pre,(unsigned long)txlen+8192)) err="sighash failed";
+                    else { unsigned char sigs[20][80]; int sls[20];
+                        int got=srw_multisig_sigs2(sigs,sls,k,keys,kl,n,z,kpriv,kpub,ncomp,nkeys,hashtype,P,(srw_rec_t*)srec[i],SRW_RECS,&nsrec[i]);
+                        unsigned long o=0; ss[i][o++]=0x00;                                             /* CHECKMULTISIG's dummy */
+                        for (int q=0;q<got;q++) o+=srw_push(ss[i]+o,sigs[q],(unsigned long)sls[q]);
+                        o+=srw_push(ss[i]+o,P->redeem,P->redeemlen); sslen[i]=o;
+                        if (got<k){ static char mbuf[64]; snprintf(mbuf,sizeof mbuf,"Missing signatures: have %d of %d",got,k); err=mbuf; } }
+                }
+            } else if (sl==34 && spk[0]==0x00 && spk[1]==0x20){                                          /* P2WSH */
+                if (!P->wscriptlen) err="witnessScript needed for P2WSH";
+                else { unsigned char wh[32]; sha256_full(wh,P->wscript,P->wscriptlen);
+                    if (memcmp(wh,spk+2,32)) err="witnessScript does not match scriptPubKey";
+                    else { err=srw_sign_wsh(P, witbuf[i], &witlen[i], &wititems[i], tx, bip_hp, bip_hs, in_outpoint[i], in_seq[i], bip_ho, locktime, hashtype, kpriv, kpub, ncomp, nkeys);
+                           if (!err || strstr(err,"Missing signatures")) any_segwit=1; } }
+            } else if (sl==34 && spk[0]==0x51 && spk[1]==0x20 && P->tapleaflen){                        /* P2TR script path: a leaf + control block were supplied */
+                int tht = ht_explicit ? hashtype : 0x00;
+                err=srw_sign_tap_script(P, spk, witbuf[i], &witlen[i], &wititems[i], tx, txlen, i, n_in, (const unsigned char* const*)in_outpoint, in_seq, prev_of, out_start, out_end, locktime, tht, kpriv, kpub, ncomp, nkeys);
+                if (!err || strstr(err,"Missing signatures")) any_segwit=1;
+            } else if (sl==34 && spk[0]==0x51 && spk[1]==0x20){                                          /* P2TR key path: tr(KEY) with no tree, or with the merkle root supplied */
+                unsigned char tweak[32];
+                for (int k=0;k<nkeys;k++){
+                    if (!ncomp[k]) continue;
+                    if (P->has_internal && memcmp(kpub[k]+1,P->tapinternal,32)) continue;
+                    unsigned char t[32]; srw_taptweak(t,kpub[k]+1,P->has_merkle?P->tapmerkle:NULL);
+                    unsigned char q[32]; if (bip32_xonly_tweak_add(kpub[k]+1,t,q) && !memcmp(q,spk+2,32)){ found=k; memcpy(tweak,t,32); break; }
+                }
+                if (found<0 && P->tap_keysig_len){                                                    /* already signed by another signer: carry it */
+                    unsigned long o=0; witbuf[i][o++]=(unsigned char)P->tap_keysig_len; memcpy(witbuf[i]+o,P->tap_keysig,(size_t)P->tap_keysig_len); o+=P->tap_keysig_len;
+                    witlen[i]=o; wititems[i]=1; any_segwit=1; }
+                else if (found<0) err=P->has_merkle ? "Keys not provided for this input (a P2TR key path with a script tree needs its internal key)"
+                                               : "Keys not provided for this input (a P2TR key path needs the internal key of tr(KEY) with no script tree)";
+                else { int tht = ht_explicit ? hashtype : 0x00;
+                    if (!srw_tap_sighash(z,tx,txlen,i,n_in,(const unsigned char* const*)in_outpoint,in_seq,prev_of,out_start,out_end,locktime,tht,NULL))
+                        err="P2TR sighash needs scriptPubKey and amount for every input";
+                    else { unsigned char dq[32], aux[32], sig[65];
+                        if (!bip340_tweak_privkey(dq,kpriv[found],tweak)) err="taproot tweak failed";
+                        else { unsigned char ab[64]; memcpy(ab,z,32); memcpy(ab+32,dq,32); sha256d(aux,ab,64);   /* deterministic aux, as the ECDSA nonce is */
+                            if (!bip340_sign(sig,z,32,dq,aux)) err="schnorr signing failed";
+                            else { int sl2=64; if (tht!=0){ sig[64]=(unsigned char)tht; sl2=65; }
+                                unsigned long o=0; witbuf[i][o++]=(unsigned char)sl2; memcpy(witbuf[i]+o,sig,(size_t)sl2); o+=sl2; witlen[i]=o; wititems[i]=1; any_segwit=1; } } } }
             } else {
-                err="Unsupported script type (P2WSH/P2SH-multisig/P2TR signing not yet implemented)";
+                err="Unsupported script type (bare multisig / P2TR script-path signing not implemented)";
             }
         }
         if (err){
@@ -1467,6 +2313,18 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
     rj_obj_set(o,"hex",rj_str(hex)); free(hex);
     rj_obj_set(o,"complete",rj_bool(complete));
     if (errors->nitems>0) rj_obj_set(o,"errors",errors); else rj_free(errors);
+    /* "_sigs" (internal, consumed by the PSBT layer): every signature placed per input, keyed by
+     * pubkey (33-byte for ECDSA, x-only + leaf_hash for tapscript) -- the PARTIAL_SIG / TAP_SCRIPT_SIG fields */
+    { rj_val* sa=rj_arr(); int any=0;
+      for (unsigned long i=0;i<n_in;i++) for (int q=0;q<nsrec[i];q++){
+          rj_val* e=rj_obj(); char idh[65]; unsigned char disp[32]; for(int b=0;b<32;b++) disp[b]=in_outpoint[i][31-b]; bin_to_hex(idh,disp,32);
+          unsigned long vo=(unsigned long)in_outpoint[i][32]|((unsigned long)in_outpoint[i][33]<<8)|((unsigned long)in_outpoint[i][34]<<16)|((unsigned long)in_outpoint[i][35]<<24);
+          rj_obj_set(e,"txid",rj_str(idh)); rj_obj_set(e,"vout",rj_numf("%lu",vo));
+          char ph[67]; bin_to_hex(ph,srec[i][q].pub,(size_t)srec[i][q].publen); rj_obj_set(e,"pubkey",rj_str(ph));
+          char sh[161]; bin_to_hex(sh,srec[i][q].sig,(size_t)srec[i][q].sl); rj_obj_set(e,"sig",rj_str(sh));
+          if (srec[i][q].has_lh){ char lh[65]; bin_to_hex(lh,srec[i][q].lh,32); rj_obj_set(e,"leaf_hash",rj_str(lh)); }
+          rj_arr_push(sa,e); any=1; }
+      if (any) rj_obj_set(o,"_sigs",sa); else rj_free(sa); }
     *result=o;
     return 1;
 }
@@ -1772,15 +2630,19 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
      * sighashtype), so the caller's arg 1 is prevtxs and arg 2 is the
      * sighash type; they shift by one here. */
     rj_val* keys = rj_arr();
-    for (unsigned i = 0; i < SRWW_WINDOW; i++){
-        for (int chain = 0; chain <= 1; chain++){
-            unsigned idx[5] = {0x80000000u | 84u, 0x80000000u, 0x80000000u, i, (unsigned)chain};
-            unsigned char k[32], c[32]; char wif[64];
-            if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
-            srww_wif(wif, k);
-            rj_arr_push(keys, rj_str(wif));
+    { int mask = rpc_wops_active_types();
+      for (int t = 0; t < 4; t++){
+        if (!(mask & (1 << t))) continue;
+        for (unsigned i = 0; i < SRWW_WINDOW; i++){
+            for (int chain = 0; chain <= 1; chain++){
+                unsigned idx[5]; rpc_wops_type_path(t, i, chain, idx);
+                unsigned char k[32], c[32]; char wif[64];
+                if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
+                srww_wif(wif, k);
+                rj_arr_push(keys, rj_str(wif));
+            }
         }
-    }
+      } }
     /* ...and every key addhdkey contributed. A wallet that WATCHES an added
      * key's outputs (they are in the rescan window) but cannot sign for them
      * would report coins as spendable and then fail at signing -- worse than
@@ -1790,6 +2652,31 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
       int nh = rpc_wops_hdkey_privkeys(hk, (int)(sizeof hk / sizeof hk[0]), SRWW_WINDOW);
       for (int i = 0; i < nh; i++){ char wif[64]; srww_wif(wif, hk[i]); rj_arr_push(keys, rj_str(wif)); }
       memset(hk, 0, sizeof hk); }
+    /* ...and every key a PSBT's taproot bip32 origin names under OUR master
+     * fingerprint (walletprocesspsbt forwards them as prevtx.tapBip32): a
+     * script-path leaf key at an arbitrary path that no rescan window covers. */
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_ARR){
+        extern int rpc_wops_master_fp(const void* seed, char out[9]);
+        extern int bip32_derive_path(unsigned char k[32], unsigned char c[32], const unsigned char* seed, long seedlen, const unsigned* indexes, long n);
+        char myfp[9]; if (!rpc_wops_master_fp(w->seed, myfp)) myfp[0] = 0;
+        const rj_val* pv = params->items[1]; int added = 0;
+        for (unsigned long i = 0; i < pv->nitems && added < 64; i++){
+            const rj_val* e = pv->items[i]; if (e->typ != RJ_OBJ) continue;
+            rj_val* tb = rj_obj_get(e, "tapBip32"); if (!tb || tb->typ != RJ_ARR) continue;
+            for (unsigned long q = 0; q < tb->nitems && added < 64; q++){
+                rj_val* d = tb->items[q]; if (d->typ != RJ_OBJ) continue;
+                rj_val* fp = rj_obj_get(d, "fingerprint"); rj_val* pa = rj_obj_get(d, "path");
+                if (!fp || fp->typ != RJ_STR || !myfp[0] || strcmp(fp->str, myfp) || !pa || pa->typ != RJ_ARR || pa->nitems > 32) continue;
+                unsigned path[32]; int n = 0;
+                for (unsigned long z = 0; z < pa->nitems; z++){ if (pa->items[z]->typ != RJ_NUM) break; path[n++] = (unsigned)strtoul(pa->items[z]->str, 0, 10); }
+                if ((unsigned long)n != pa->nitems) continue;
+                unsigned char k[32], c[32];
+                if (bip32_derive_path(k, c, w->seed, 64, path, n) != 1) continue;
+                char wif[64]; srww_wif(wif, k); rj_arr_push(keys, rj_str(wif)); added++;
+                memset(k, 0, 32); memset(c, 0, 32);
+            }
+        }
+    }
     rj_val* fwd = rj_arr();
     rj_arr_push(fwd, rj_str(params->items[0]->str));
     rj_arr_push(fwd, keys);
@@ -1810,15 +2697,16 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
                 unsigned long tl = (unsigned long)(hl2/2), q = 4, cc2;
                 if (tl > 6 && txb[4] == 0x00 && txb[5] == 0x01) q = 6;
                 unsigned long ni = srw_varint(txb + q, &cc2); q += cc2;
-                extern int rpc_wops_own_coin(const void*, const unsigned char*, unsigned int,
-                                             unsigned long long*, unsigned char*);
+                extern int rpc_wops_own_coin_spk(const void*, const unsigned char*, unsigned int,
+                                                 unsigned long long*, unsigned char*, unsigned long*,
+                                                 unsigned char*, unsigned long*);
                 for (unsigned long i = 0; i < ni && ni <= 10000; i++){
                     if (q + 36 > tl) break;
                     const unsigned char* op = txb + q;
                     unsigned int vo = (unsigned int)op[32] | ((unsigned int)op[33]<<8) |
                                       ((unsigned int)op[34]<<16) | ((unsigned int)op[35]<<24);
-                    unsigned long long val; unsigned char h160[20];
-                    if (rpc_wops_own_coin(w->seed, op, vo, &val, h160)){
+                    unsigned long long val; unsigned char cspk[34], crd[22]; unsigned long cspkl = 0, crdl = 0;
+                    if (rpc_wops_own_coin_spk(w->seed, op, vo, &val, cspk, &cspkl, crd, &crdl)){
                         /* skip if the caller already supplied this outpoint */
                         char tid[65];
                         for (int k = 0; k < 32; k++){
@@ -1838,10 +2726,9 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
                             rj_val* e = rj_obj();
                             rj_obj_set(e, "txid", rj_str(tid));
                             rj_obj_set(e, "vout", rj_numf("%u", vo));
-                            { char spkh[48]; unsigned char spk[22];
-                              spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, h160, 20);
-                              bin_to_hex(spkh, spk, 22);
+                            { char spkh[72]; bin_to_hex(spkh, cspk, cspkl);
                               rj_obj_set(e, "scriptPubKey", rj_str(spkh)); }
+                            if (crdl){ char rdh[48]; bin_to_hex(rdh, crd, crdl); rj_obj_set(e, "redeemScript", rj_str(rdh)); }
                             { char am[32]; rpc_amounts((long long)val, am, sizeof am);
                               rj_obj_set(e, "amount", rj_numf("%s", am)); }
                             rj_arr_push(pv, e);
@@ -1876,15 +2763,17 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
  * not-ours input. */
 
 static int simraw_is_ours_spk(const rpc_wallet* w, const unsigned char* spk, unsigned long spklen){
-    if (spklen != 22 || spk[0] != 0x00 || spk[1] != 0x14) return 0;   /* P2WPKH only */
-    for (unsigned i = 0; i < SRWW_WINDOW; i++){
-        for (int chain = 0; chain <= 1; chain++){
-            unsigned idx[5] = {0x80000000u | 84u, 0x80000000u, 0x80000000u, i, (unsigned)chain};
-            unsigned char k[32], c[32], pub[33], h[20];
-            if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
-            scalar_to_pubkey(pub, k);
-            hash160(h, pub, 33);
-            if (!memcmp(h, spk + 2, 20)) return 1;
+    int mask = rpc_wops_active_types();
+    for (int t = 0; t < 4; t++){
+        if (!(mask & (1 << t))) continue;
+        for (unsigned i = 0; i < SRWW_WINDOW; i++){
+            for (int chain = 0; chain <= 1; chain++){
+                unsigned idx[5]; rpc_wops_type_path(t, i, chain, idx);
+                unsigned char k[32], c[32], pub[33], ospk[34], h20[20]; unsigned long ol;
+                if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
+                scalar_to_pubkey(pub, k);
+                if (rpc_wops_type_spk(t, pub, ospk, &ol, h20) && ol == spklen && !memcmp(ospk, spk, ol)) return 1;
+            }
         }
     }
     return 0;
@@ -1966,13 +2855,7 @@ static int cmd_simulaterawtransaction(const rj_val* params, const rpc_wallet* w,
  * the merger, and silently keeping one would hand back a transaction missing
  * signatures that the caller supplied -- so it errors and points at
  * combinepsbt, which merges properly at the PSBT level. */
-typedef struct {
-    const unsigned char* op;      /* 36-byte outpoint */
-    const unsigned char* ss;  unsigned long sslen;   /* scriptSig */
-    const unsigned char* wit; unsigned long witlen;  /* serialized witness stack */
-    unsigned witems;
-    unsigned seq;
-} crt_in_t;
+
 
 /* Walk a raw tx into inputs + the outputs/locktime tail. 0 on malformed. */
 static int crt_walk(const unsigned char* tx, unsigned long len, crt_in_t* ins, int cap,
@@ -2181,6 +3064,13 @@ static int fin_build(const psbt_kv* kv, int n, const unsigned char* spk, unsigne
                      unsigned char* ss, unsigned long* sslen,
                      unsigned char* wit, unsigned long* witlen){
     *sslen = 0; *witlen = 0;
+    /* P2TR key path with PSBT_IN_TAP_KEY_SIG (a MuSig2 aggregate lands here): witness = [sig] */
+    if (spklen == 34 && spk[0] == 0x51 && spk[1] == 0x20){
+        const psbt_kv* ks = fin_find(kv, n, 0x13);
+        if (!ks || (ks->vl != 64 && ks->vl != 65)) return 0;
+        wit[0] = 0x01; wit[1] = (unsigned char)ks->vl; memcpy(wit + 2, ks->v, ks->vl); *witlen = 2 + ks->vl;
+        return 1;
+    }
     if (fin_count(kv, n, 0x02) != 1) return 0;        /* exactly one partial sig */
     const psbt_kv* ps = fin_find(kv, n, 0x02);
     if (!ps || ps->kl != 34 || ps->vl < 9 || ps->vl > 73) return 0;  /* 0x02||pub33 */
@@ -2234,13 +3124,13 @@ static int cmd_finalizepsbt(const rj_val* params, long* ec, const char** em, rj_
     int extract = 1;
     if (params->nitems >= 2 && params->items[1]->typ == RJ_BOOL)
         extract = params->items[1]->str[0] == '1';
-    static unsigned char buf[200000]; long blen = 0;
-    if (!crt_b64dec(b64, buf, sizeof buf, &blen) || blen < 5 || memcmp(buf, "psbt\xff", 5)){
-        *ec = -22; *em = "TX decode failed"; return 0; }
+    static unsigned char buf[400000]; long blen = 0; psbt_v2meta vm;
+    if (!psbt_load(b64, buf, sizeof buf, &blen, &vm, ec, em)) return 0;
+    if (vm.locktime_conflict){ *ec = -22; *em = "PSBT cannot be made into a valid transaction"; return 0; }
     long p = 5;
     static psbt_kv gkv[FIN_MAXKV]; int gn = psbt_parse_map(buf, blen, &p, gkv, FIN_MAXKV);
     const psbt_kv* utxk = fin_find(gkv, gn, 0x00);
-    if (!utxk){ *ec = -22; *em = "Only PSBTv0 (with an unsigned tx) can be finalized"; return 0; }
+    if (!utxk){ *ec = -22; *em = "TX decode failed"; return 0; }
     const unsigned char* utx = utxk->v; unsigned long utxl = utxk->vl;
 
     /* walk the unsigned tx for the outpoints and the outputs/locktime tail */
@@ -2251,7 +3141,7 @@ static int cmd_finalizepsbt(const rj_val* params, long* ec, const char** em, rj_
 
     static psbt_kv ikv[FIN_MAXIO][FIN_MAXKV]; static int in_n[FIN_MAXIO];
     static unsigned char fss[FIN_MAXIO][256]; static unsigned long fsslen[FIN_MAXIO];
-    static unsigned char fwit[FIN_MAXIO][256]; static unsigned long fwitlen[FIN_MAXIO];
+    static unsigned char fwit[FIN_MAXIO][4200]; static unsigned long fwitlen[FIN_MAXIO];   /* items + a witnessScript of up to 3600 bytes */
     for (int i = 0; i < n_in; i++) in_n[i] = psbt_parse_map(buf, blen, &p, ikv[i], FIN_MAXKV);
     unsigned long n_out;
     { unsigned long cc; n_out = srw_varint(utx + ost, &cc); }
@@ -2267,7 +3157,7 @@ static int cmd_finalizepsbt(const rj_val* params, long* ec, const char** em, rj_
         const psbt_kv* f8 = fin_find(ikv[i], in_n[i], 0x08);
         if (f7 || f8){
             if (f7){ memcpy(fss[i], f7->v, f7->vl > 256 ? 256 : f7->vl); fsslen[i] = f7->vl > 256 ? 256 : f7->vl; }
-            if (f8){ memcpy(fwit[i], f8->v, f8->vl > 256 ? 256 : f8->vl); fwitlen[i] = f8->vl > 256 ? 256 : f8->vl; }
+            if (f8){ memcpy(fwit[i], f8->v, f8->vl > 4200 ? 4200 : f8->vl); fwitlen[i] = f8->vl > 4200 ? 4200 : f8->vl; }
             continue;
         }
         const unsigned char* spk; unsigned long spklen;
@@ -2336,8 +3226,7 @@ static int cmd_finalizepsbt(const rj_val* params, long* ec, const char** em, rj_
     }
     for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++)
         o += psbt_ser_map(out + o, okv[i], out_n[i]);
-    char* b = malloc((size_t)((o+2)/3)*4+1); if (!b){ *ec=-7; *em="oom"; return 0; }
-    crt_b64(b, out, o);
+    char* b = psbt_b64_out(out, o, &vm); if (!b){ *ec=-7; *em="oom"; return 0; }
     rj_val* r = rj_obj();
     rj_obj_set(r, "psbt", rj_str(b));
     rj_obj_set(r, "complete", rj_bool(complete));
@@ -2358,22 +3247,24 @@ static int cmd_finalizepsbt(const rj_val* params, long* ec, const char** em, rj_
  * derivations. That is not implemented, so supplying it is an ERROR rather
  * than an argument quietly ignored -- a caller who passed descriptors and
  * got a PSBT back without them would reasonably believe they were applied. */
+#include "descriptor.h"
+#include "psbt_update.h"
+typedef struct { descr_t* d; long lo, hi; } dpp_desc_t;
+static int dpp_load_descs(const rj_val* da, descr_t* descs, dpp_desc_t* dv, int cap, int* nd_out, long* ec, const char** em);
 static int cmd_utxoupdatepsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
+    /* descriptors (2026-09-01): after the UTXO fill below, the Updater adds the
+     * scripts / origins / taproot fields those descriptors provide */
+    static descr_t udescs[16]; static dpp_desc_t udv[16]; int und = 0;
     if (params->nitems >= 2 && params->items[1]->typ == RJ_ARR && params->items[1]->nitems > 0){
-        *ec = -8;
-        *em = "the descriptors argument is not implemented by this node: it would add "
-              "redeem/witness scripts and BIP32 derivations to the PSBT. Call without "
-              "descriptors to fill witness UTXOs from the UTXO set";
-        return 0;
+        if (!dpp_load_descs(params->items[1], udescs, udv, 16, &und, ec, em)) return 0;
     }
-    static unsigned char buf[200000]; long blen = 0;
-    if (!crt_b64dec(b64, buf, sizeof buf, &blen) || blen < 5 || memcmp(buf, "psbt\xff", 5)){
-        *ec = -22; *em = "TX decode failed"; return 0; }
+    static unsigned char buf[400000]; long blen = 0; psbt_v2meta vm;
+    if (!psbt_load(b64, buf, sizeof buf, &blen, &vm, ec, em)) return 0;
     long p = 5;
     static psbt_kv gkv[FIN_MAXKV]; int gn = psbt_parse_map(buf, blen, &p, gkv, FIN_MAXKV);
     const psbt_kv* utxk = fin_find(gkv, gn, 0x00);
-    if (!utxk){ *ec = -22; *em = "Only PSBTv0 (with an unsigned tx) can be updated"; return 0; }
+    if (!utxk){ *ec = -22; *em = "TX decode failed"; return 0; }
     static crt_in_t uin[FIN_MAXIO];
     int n_in, sw; unsigned long ost, oen;
     if (!crt_walk(utxk->v, utxk->vl, uin, FIN_MAXIO, &n_in, &ost, &oen, &sw)){
@@ -2422,8 +3313,12 @@ static int cmd_utxoupdatepsbt(const rj_val* params, long* ec, const char** em, r
     }
     for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++)
         o += psbt_ser_map(out + o, okv[i], out_n[i]);
-    char* b = malloc((size_t)((o+2)/3)*4+1); if (!b){ *ec=-7; *em="oom"; return 0; }
-    crt_b64(b, out, o);
+    if (und){   /* the Updater (psbt_update.c) works on the v0-shaped buffer, before the caller's version is emitted */
+        static unsigned char out2[240000];
+        long o2 = psbt_update_bytes_from_descs(out, o, (pu_desc_t*)udv, und, out2, sizeof out2);
+        if (o2 > 0 && o2 <= (long)sizeof out){ memcpy(out, out2, (size_t)o2); o = o2; }
+    }
+    char* b = psbt_b64_out(out, o, &vm); if (!b){ *ec=-7; *em="oom"; return 0; }
     *result = rj_str(b); free(b);
     return 1;
 }
@@ -2441,22 +3336,287 @@ static int cmd_utxoupdatepsbt(const rj_val* params, long* ec, const char** em, r
  * push-sig push-pub) and refuses others by name. bip32derivs is accepted
  * and ignored: this node adds no derivation metadata (the PSBT remains
  * valid without it; stated rather than silently half-done). */
-int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
-                              long* ec, const char** em, rj_val** result){
-    const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
-    int sign = 1, finalize = 1;
-    if (params->nitems >= 2 && params->items[1]->typ == RJ_BOOL) sign = params->items[1]->str[0]=='1';
-    const char* sht = (params->nitems >= 3 && params->items[2]->typ == RJ_STR) ? params->items[2]->str : NULL;
-    if (params->nitems >= 5 && params->items[4]->typ == RJ_BOOL) finalize = params->items[4]->str[0]=='1';
-    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+/* The Signer is pluggable: walletprocesspsbt signs with the wallet's keys,
+ * descriptorprocesspsbt with the private keys the given descriptors carry.
+ * Both go through the same extract / synthesize-prevtxs / sign / splice
+ * path, so the two cannot drift in what they hand back. `fwd` is the
+ * signrawtransaction argument list [hex, prevtxs, sighashtype?]. */
+typedef int (*psbt_signer_fn)(rj_val* fwd, void* ctx, long* ec, const char** em, rj_val** sres);
+/* ==== MuSig2 (BIP327 crypto, BIP373 PSBT fields) =========================
+ * Everything MuSig2 in the PSBT signer lives between these markers.
+ *
+ * Fields: PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS 0x1a (key = agg33, value =
+ * participants 33*n), PSBT_IN_MUSIG2_PUB_NONCE 0x1b and
+ * PSBT_IN_MUSIG2_PARTIAL_SIG 0x1c (key = part33 || agg33 [|| leaf_hash],
+ * value = 66-byte pubnonce / 32-byte partial sig), PSBT_OUT_MUSIG2_
+ * PARTICIPANT_PUBKEYS 0x08. As in Core, 0x1a is keyed by the UNTWEAKED
+ * aggregate while 0x1b/0x1c are keyed by the key that is actually in the
+ * script (after BIP32 derivation of the synthetic xpub and the taproot
+ * tweak) -- "plain_pub" below.
+ *
+ * Flow (Core's SignMuSig2, key path only -- leaf scripts are not signed
+ * here): for every aggregate on a P2TR input: if every participant's
+ * partial signature is present, aggregate into the BIP340 signature and
+ * set PSBT_IN_TAP_KEY_SIG; else, for every participant whose private key
+ * this signer holds: with every pubnonce present and our secret nonce for
+ * this session still in memory, produce our partial signature; with our
+ * pubnonce absent, generate a nonce (getrandom + BIP327 derivation from
+ * the key, the aggregate and the sighash) and publish it. Secret nonces
+ * live only in this process, keyed by Core's session id (aggregate ||
+ * participant || sighash || pubnonce), and are erased the moment they are
+ * used -- a PSBT never carries one, and a lost session simply means that
+ * participant restarts round 1. */
+#include "musig2.h"
+#include <sys/random.h>
+extern int  bip32_ckdpub_step_pub(const unsigned char Kpar[33], const unsigned char ccpar[32], unsigned index, unsigned char Kout[33], unsigned char ccout[32]);
+extern void hmac_sha512(unsigned char out[64], const void* key, long long keylen, const void* data, long long datalen);
+typedef int (*psbt_keyfn)(void* sctx, const unsigned char pub33[33], unsigned char priv[32]);
 
-    static unsigned char buf[200000]; long blen = 0;
-    if (!crt_b64dec(b64, buf, sizeof buf, &blen) || blen < 5 || memcmp(buf, "psbt\xff", 5)){
-        *ec = -22; *em = "TX decode failed"; return 0; }
+#define MU_SESSIONS 64
+typedef struct { unsigned char id[32]; unsigned char secnonce[97]; int used; } mu_sess_t;
+static mu_sess_t g_mu_sess[MU_SESSIONS]; static int g_mu_sess_next = 0;
+static void mu_session_id(unsigned char id[32], const unsigned char plain[33], const unsigned char part[33],
+                          const unsigned char sighash[32], const unsigned char pubnonce[66]){
+    unsigned char b[33+33+32+66]; memcpy(b, plain, 33); memcpy(b+33, part, 33); memcpy(b+66, sighash, 32); memcpy(b+98, pubnonce, 66);
+    sha256_full(id, b, sizeof b);
+}
+static void mu_session_put(const unsigned char id[32], const unsigned char secnonce[97]){
+    mu_sess_t* e = &g_mu_sess[g_mu_sess_next]; g_mu_sess_next = (g_mu_sess_next + 1) % MU_SESSIONS;
+    memcpy(e->id, id, 32); memcpy(e->secnonce, secnonce, 97); e->used = 1;
+}
+static mu_sess_t* mu_session_get(const unsigned char id[32]){
+    for (int i = 0; i < MU_SESSIONS; i++) if (g_mu_sess[i].used && !memcmp(g_mu_sess[i].id, id, 32)) return &g_mu_sess[i];
+    return NULL;
+}
+static void mu_session_erase(mu_sess_t* e){ memset(e, 0, sizeof *e); }
+/* exported for tests: forget every session (simulates a restart) */
+void rpc_musig2_forget_sessions(void){ memset(g_mu_sess, 0, sizeof g_mu_sess); g_mu_sess_next = 0; }
+
+static unsigned long mu_rd_varint(const unsigned char* p, unsigned long* cc){ return srw_varint(p, cc); }
+/* value + scriptPubKey of an input's witness_utxo; 0 if absent */
+static int mu_witness_utxo(const psbt_kv* kv, int n, unsigned long long* amount, const unsigned char** spk, unsigned long* spklen){
+    const psbt_kv* wu = fin_find(kv, n, 0x01);
+    if (!wu || wu->vl < 9) return 0;
+    unsigned long long a = 0; for (int k = 0; k < 8; k++) a |= (unsigned long long)wu->v[k] << (8*k);
+    unsigned long cc; unsigned long sl = mu_rd_varint(wu->v + 8, &cc);
+    if (8 + cc + sl > wu->vl) return 0;
+    *amount = a; *spk = wu->v + 8 + cc; *spklen = sl; return 1;
+}
+static void mu_taptweak(unsigned char t[32], const unsigned char x[32], const unsigned char* root){
+    unsigned char th[32]; sha256_full(th, "TapTweak", 8);
+    unsigned char b[128]; memcpy(b, th, 32); memcpy(b+32, th, 32); memcpy(b+64, x, 32); unsigned long n = 96;
+    if (root){ memcpy(b+96, root, 32); n = 128; }
+    sha256_full(t, b, n);
+}
+/* BIP32 unhardened derivation of the synthetic musig() xpub along `path`,
+ * applying each step's scalar as a plain tweak to the key aggregation.
+ * -> 1 ok / 0 hardened step or derivation failure. */
+static int mu_apply_derivation(musig2_keyagg_t* ka, const unsigned char agg33[33], const unsigned* path, int plen){
+    static const unsigned char MUSIG_CC[32] = { 0x86,0x80,0x87,0xca,0x02,0xa6,0xf9,0x74,0xc4,0x59,0x89,0x24,0xc3,0x6b,0x57,0x76,
+                                                0x2d,0x32,0xcb,0x45,0x71,0x71,0x67,0xe3,0x00,0x62,0x2c,0x71,0x67,0xe3,0x89,0x65 };
+    unsigned char K[33], cc[32]; memcpy(K, agg33, 33); memcpy(cc, MUSIG_CC, 32);
+    for (int i = 0; i < plen; i++){
+        if (path[i] >= 0x80000000u) return 0;
+        unsigned char data[37]; memcpy(data, K, 33);
+        data[33] = (unsigned char)(path[i] >> 24); data[34] = (unsigned char)(path[i] >> 16); data[35] = (unsigned char)(path[i] >> 8); data[36] = (unsigned char)path[i];
+        unsigned char I[64]; hmac_sha512(I, cc, 32, data, 37);
+        if (!musig2_tweak(ka, I, 0)) return 0;
+        unsigned char K2[33], cc2[32];
+        if (bip32_ckdpub_step_pub(K, cc, path[i], K2, cc2) != 1) return 0;
+        memcpy(K, K2, 33); memcpy(cc, cc2, 32);
+    }
+    return 1;
+}
+#define MU_MAX_PART MUSIG2_MAX_KEYS
+#define MU_EXTRA 4
+static unsigned char g_mu_kbuf[FIN_MAXIO][MU_EXTRA][100]; static unsigned char g_mu_vbuf[FIN_MAXIO][MU_EXTRA][80]; static int g_mu_extra_n[FIN_MAXIO];
+static int mu_append(psbt_kv* kv, int* n, int i, const unsigned char* k, unsigned long kl, const unsigned char* v, unsigned long vl){
+    if (*n >= FIN_MAXKV || g_mu_extra_n[i] >= MU_EXTRA || kl > 100 || vl > 80) return 0;
+    int e = g_mu_extra_n[i]++;
+    memcpy(g_mu_kbuf[i][e], k, kl); memcpy(g_mu_vbuf[i][e], v, vl);
+    kv[*n].k = g_mu_kbuf[i][e]; kv[*n].kl = kl; kv[*n].v = g_mu_vbuf[i][e]; kv[*n].vl = vl; (*n)++;
+    return 1;
+}
+/* One aggregate on one input. Returns 1 when it produced the final
+ * signature (wit = [sig]), 0 otherwise (nonce/partial-sig rounds or nothing
+ * to do). */
+static int mu_process_aggregate(psbt_kv* kv, int* kn, int i, const psbt_kv* agg_kv,
+                                const unsigned char* utx, unsigned long utxl, crt_in_t* uin, int n_in,
+                                unsigned long ost, unsigned long oen, srw_prev_t* const* prev_of, int tht,
+                                psbt_keyfn keyfn, void* sctx, unsigned char* wit, unsigned long* witlen){
+    const unsigned char* agg33 = agg_kv->k + 1;
+    int np = (int)(agg_kv->vl / 33); if (np < 1 || np > MU_MAX_PART || agg_kv->vl % 33) return 0;
+    unsigned char parts[MU_MAX_PART][33]; for (int p = 0; p < np; p++) memcpy(parts[p], agg_kv->v + 33*p, 33);
+    musig2_keyagg_t ka; if (!musig2_key_agg(&ka, parts, np)) return 0;
+    unsigned char plain_agg[33]; musig2_agg_plain(plain_agg, &ka);
+    if (memcmp(plain_agg, agg33, 33)) return 0;                      /* the field's aggregate must be the participants' */
+    unsigned long long amount; const unsigned char* spk; unsigned long spklen;
+    if (!mu_witness_utxo(kv, *kn, &amount, &spk, &spklen)) return 0;
+    if (spklen != 34 || spk[0] != 0x51 || spk[1] != 0x20) return 0;  /* key path of a P2TR output only */
+    const psbt_kv* ik = fin_find(kv, *kn, 0x17); const psbt_kv* mr = fin_find(kv, *kn, 0x18);
+    if (ik && ik->vl != 32) return 0;
+    if (mr && mr->vl != 32) return 0;
+    const unsigned char* script_x = ik ? ik->v : spk + 2;          /* the key the aggregate must reach before the taptweak */
+    unsigned char ax[32]; musig2_agg_xonly(ax, &ka);
+    if (memcmp(ax, script_x, 32)){
+        /* derived aggregate: find the tap bip32 derivation of script_x whose fingerprint is ours */
+        unsigned char fp[20]; hash160(fp, agg33, 33);
+        int done = 0;
+        for (int q = 0; q < *kn && !done; q++){
+            if (kv[q].kl != 33 || kv[q].k[0] != 0x16 || memcmp(kv[q].k + 1, script_x, 32)) continue;
+            unsigned long cc; unsigned long nl = mu_rd_varint(kv[q].v, &cc); unsigned long o = cc + 32 * nl;
+            if (o + 4 > kv[q].vl || memcmp(kv[q].v + o, fp, 4)) continue;
+            o += 4; int plen = (int)((kv[q].vl - o) / 4); if (plen < 1 || plen > 32) continue;
+            unsigned path[32]; for (int t = 0; t < plen; t++){ const unsigned char* z = kv[q].v + o + 4*t; path[t] = (unsigned)z[0] | ((unsigned)z[1]<<8) | ((unsigned)z[2]<<16) | ((unsigned)z[3]<<24); }
+            if (!mu_apply_derivation(&ka, agg33, path, plen)) return 0;
+            musig2_agg_xonly(ax, &ka);
+            if (memcmp(ax, script_x, 32)) return 0;
+            done = 1;
+        }
+        if (!done) return 0;
+    }
+    if (ik){                                                          /* taproot tweak (BIP341), x-only */
+        unsigned char t[32]; mu_taptweak(t, script_x, mr ? mr->v : NULL);
+        if (!musig2_tweak(&ka, t, 1)) return 0;
+        musig2_agg_xonly(ax, &ka);
+        if (memcmp(ax, spk + 2, 32)) return 0;                        /* must land on the output key */
+    }
+    unsigned char plain[33]; musig2_agg_plain(plain, &ka);          /* the 0x1b/0x1c "aggregate_pubkey" */
+
+    /* collect pubnonces / partial sigs for (plain, no leaf) in participant order */
+    unsigned char pn[MU_MAX_PART][66]; int has_pn[MU_MAX_PART]; int n_pn = 0;
+    unsigned char ps[MU_MAX_PART][32]; int has_ps[MU_MAX_PART]; int n_ps = 0;
+    for (int p = 0; p < np; p++){
+        has_pn[p] = has_ps[p] = 0;
+        for (int q = 0; q < *kn; q++){
+            if (kv[q].kl != 67 || memcmp(kv[q].k + 1, parts[p], 33) || memcmp(kv[q].k + 34, plain, 33)) continue;
+            if (kv[q].k[0] == 0x1b && kv[q].vl == 66 && !has_pn[p]){ memcpy(pn[p], kv[q].v, 66); has_pn[p] = 1; n_pn++; }
+            if (kv[q].k[0] == 0x1c && kv[q].vl == 32 && !has_ps[p]){ memcpy(ps[p], kv[q].v, 32); has_ps[p] = 1; n_ps++; }
+        }
+    }
+    /* sighash (BIP341 key path, SIGHASH_DEFAULT unless one was asked for) */
+    unsigned char z[32];
+    { const unsigned char* ops[FIN_MAXIO]; unsigned seqs[FIN_MAXIO];
+      for (int j = 0; j < n_in; j++){ ops[j] = uin[j].op; seqs[j] = uin[j].seq; }
+      unsigned long locktime = (unsigned long)utx[utxl-4] | ((unsigned long)utx[utxl-3]<<8) | ((unsigned long)utx[utxl-2]<<16) | ((unsigned long)utx[utxl-1]<<24);
+      if (!srw_tap_sighash(z, utx, utxl, (unsigned long)i, (unsigned long)n_in, ops, seqs, prev_of, ost, oen, locktime, tht, NULL)) return 0; }
+
+    if (n_ps == np && n_pn == np){                                    /* round 3: aggregate */
+        unsigned char aggnonce[66]; if (!musig2_nonce_agg(aggnonce, pn, np)) return 0;
+        musig2_session_t ss; if (!musig2_session(&ss, &ka, aggnonce, z, 32)) return 0;
+        unsigned char sig[65]; if (!musig2_partial_sig_agg(sig, &ss, &ka, ps, np)) return 0;
+        unsigned long sl = 64; if (tht){ sig[64] = (unsigned char)tht; sl = 65; }
+        unsigned char k13 = 0x13;
+        if (!fin_find(kv, *kn, 0x13)) mu_append(kv, kn, i, &k13, 1, sig, sl);
+        wit[0] = 0x01; wit[1] = (unsigned char)sl; memcpy(wit + 2, sig, sl); *witlen = 2 + sl;
+        return 1;
+    }
+    if (!keyfn) return 0;
+    for (int p = 0; p < np; p++){
+        unsigned char priv[32];
+        if (has_ps[p] || !keyfn(sctx, parts[p], priv)) continue;
+        if (n_pn == np){                                              /* round 2: our partial signature */
+            unsigned char id[32]; mu_session_id(id, plain, parts[p], z, pn[p]);
+            mu_sess_t* se = mu_session_get(id); if (!se) continue;      /* not our nonce, or a session this process never had */
+            unsigned char aggnonce[66]; if (!musig2_nonce_agg(aggnonce, pn, np)) continue;
+            musig2_session_t ss; if (!musig2_session(&ss, &ka, aggnonce, z, 32)) continue;
+            unsigned char psig[32]; int ok = musig2_partial_sign(psig, se->secnonce, priv, &ka, &ss);
+            mu_session_erase(se);                                     /* never twice with the same nonce */
+            if (!ok) continue;
+            unsigned char k[67]; k[0] = 0x1c; memcpy(k+1, parts[p], 33); memcpy(k+34, plain, 33);
+            mu_append(kv, kn, i, k, 67, psig, 32);
+        } else if (!has_pn[p]){                                       /* round 1: our nonce */
+            unsigned char rnd[32]; if (getrandom(rnd, 32, 0) != 32) continue;
+            unsigned char aggx[32]; musig2_keyagg_t k0; if (!musig2_key_agg(&k0, parts, np)) continue; musig2_agg_xonly(aggx, &k0);
+            unsigned char sec[97], pub[66];
+            if (!musig2_nonce_gen(sec, pub, rnd, priv, parts[p], aggx, z, 32, NULL, 0)) continue;
+            unsigned char id[32]; mu_session_id(id, plain, parts[p], z, pub); mu_session_put(id, sec);
+            memset(sec, 0, sizeof sec);
+            unsigned char k[67]; k[0] = 0x1b; memcpy(k+1, parts[p], 33); memcpy(k+34, plain, 33);
+            mu_append(kv, kn, i, k, 67, pub, 66);
+        }
+        memset(priv, 0, 32);
+    }
+    return 0;
+}
+/* The stage: runs over every input before the raw signer is delegated to.
+ * mu_witlen[i] != 0 marks an input this stage finished (wit = [sig]). */
+static void psbt_musig_stage(psbt_kv (*ikv)[FIN_MAXKV], int* in_n, int n_in,
+                             const unsigned char* utx, unsigned long utxl, crt_in_t* uin,
+                             unsigned long ost, unsigned long oen, const char* sht,
+                             psbt_keyfn keyfn, void* sctx,
+                             unsigned char (*mu_wit)[80], unsigned long* mu_witlen){
+    int any = 0;
+    for (int i = 0; i < n_in; i++){ mu_witlen[i] = 0; g_mu_extra_n[i] = 0; if (fin_find(ikv[i], in_n[i], 0x1a)) any = 1; }
+    if (!any) return;
+    int tht = 0;
+    if (sht){ int h = srw_hashtype(sht); if (h < 0) return; tht = h; }
+    static srw_prev_t prev[FIN_MAXIO]; static srw_prev_t* prev_of[FIN_MAXIO];
+    for (int j = 0; j < n_in; j++){
+        prev_of[j] = NULL; unsigned long long a; const unsigned char* spk; unsigned long sl;
+        if (!mu_witness_utxo(ikv[j], in_n[j], &a, &spk, &sl) || sl > sizeof prev[j].spk) continue;
+        memset(&prev[j], 0, sizeof prev[j]); prev[j].amount = a; memcpy(prev[j].spk, spk, sl); prev[j].spklen = sl; prev_of[j] = &prev[j];
+    }
+    for (int i = 0; i < n_in; i++){
+        for (int q = 0; q < in_n[i]; q++){
+            const psbt_kv* a = &ikv[i][q];
+            if (a->kl != 34 || a->k[0] != 0x1a) continue;
+            if (mu_process_aggregate(ikv[i], &in_n[i], i, a, utx, utxl, uin, n_in, ost, oen, prev_of, tht, keyfn, sctx, mu_wit[i], &mu_witlen[i])) break;
+        }
+    }
+}
+/* network serialization of utx with the given final scriptSigs/witnesses */
+static char* mu_extract_hex(const unsigned char* utx, unsigned long utxl, crt_in_t* uin, int n_in, unsigned long ost, unsigned long oen,
+                            unsigned char (*fss)[256], const unsigned long* fsslen, unsigned char (*fwit)[256], const unsigned long* fwitlen){
+    int any_wit = 0; for (int i = 0; i < n_in; i++) if (fwitlen[i] > 1) any_wit = 1;
+    unsigned char* out = malloc(utxl + 16 + (unsigned long)n_in * 600); if (!out) return NULL; long o = 0;
+    memcpy(out, utx, 4); o = 4;
+    if (any_wit){ out[o++] = 0x00; out[o++] = 0x01; }
+    o += crt_varint(out + o, (unsigned long long)n_in);
+    for (int i = 0; i < n_in; i++){
+        memcpy(out + o, uin[i].op, 36); o += 36;
+        o += crt_varint(out + o, (unsigned long long)fsslen[i]); memcpy(out + o, fss[i], fsslen[i]); o += (long)fsslen[i];
+        unsigned sq = uin[i].seq; out[o++]=(unsigned char)sq; out[o++]=(unsigned char)(sq>>8); out[o++]=(unsigned char)(sq>>16); out[o++]=(unsigned char)(sq>>24);
+    }
+    memcpy(out + o, utx + ost, oen - ost); o += (long)(oen - ost);
+    if (any_wit) for (int i = 0; i < n_in; i++){ if (fwitlen[i]){ memcpy(out + o, fwit[i], fwitlen[i]); o += (long)fwitlen[i]; } else out[o++] = 0x00; }
+    memcpy(out + o, utx + utxl - 4, 4); o += 4;
+    char* hx = malloc((size_t)o*2+1); if (hx) bin_to_hex(hx, out, (size_t)o);
+    free(out); return hx;
+}
+/* ==== end MuSig2 ========================================================= */
+
+static char* dpp_musig_update(const char* b64, dpp_desc_t* dv, int nd);
+static int psbt_process(const char* b64, int sign, const char* sht, int finalize,
+                        psbt_signer_fn signer, void* sctx, psbt_keyfn keyfn,
+                        dpp_desc_t* upd_dv, int upd_nd,
+                        long* ec, const char** em, rj_val** result){
+
+    static unsigned char buf[400000]; long blen = 0; psbt_v2meta vm;
+    if (!psbt_load(b64, buf, sizeof buf, &blen, &vm, ec, em)) return 0;
+    if (vm.locktime_conflict){ *ec = -22; *em = "PSBT cannot be made into a valid transaction"; return 0; }
+    if (upd_nd > 0){
+        /* ==== Updater (psbt_update.c) on the v0-shaped buffer: scripts, bip32
+         * origins, taproot leaves/control blocks/derivs; then the musig()
+         * updater (BIP390/BIP373), which speaks v0 base64 -- shim through it.
+         * The caller's version (vm) is preserved on output. */
+        static unsigned char ub[400000];
+        long un = psbt_update_bytes_from_descs(buf, blen, (pu_desc_t*)upd_dv, upd_nd, ub, sizeof ub);
+        if (un > 0){ memcpy(buf, ub, (size_t)un); blen = un; }
+        char* v0b = malloc((size_t)((blen + 2) / 3) * 4 + 1);
+        if (v0b){
+            crt_b64(v0b, buf, blen);
+            char* mu = dpp_musig_update(v0b, upd_dv, upd_nd);
+            if (mu){ long nl = 0; static unsigned char mb[400000];
+                     if (crt_b64dec(mu, mb, sizeof mb, &nl) && nl >= 5 && !memcmp(mb, "psbt\xff", 5)){ memcpy(buf, mb, (size_t)nl); blen = nl; }
+                     free(mu); }
+            free(v0b);
+        }
+    }
     long p = 5;
     static psbt_kv gkv[FIN_MAXKV]; int gn = psbt_parse_map(buf, blen, &p, gkv, FIN_MAXKV);
     const psbt_kv* utxk = fin_find(gkv, gn, 0x00);
-    if (!utxk){ *ec = -22; *em = "Only PSBTv0 (with an unsigned tx) can be processed"; return 0; }
+    if (!utxk){ *ec = -22; *em = "TX decode failed"; return 0; }
     const unsigned char* utx = utxk->v; unsigned long utxl = utxk->vl;
 
     static crt_in_t uin[FIN_MAXIO];
@@ -2483,6 +3643,63 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
         return 1;
     }
 
+    /* MuSig2 (BIP327/BIP373): nonces, partial signatures, or the final
+     * key-path signature for aggregates this signer participates in */
+    static unsigned char mu_wit[FIN_MAXIO][80]; static unsigned long mu_witlen[FIN_MAXIO];
+    psbt_musig_stage(ikv, in_n, n_in, utx, utxl, uin, ost, oen, sht, keyfn, sctx, mu_wit, mu_witlen);
+
+    /* taproot fields per input (2026-09-01): leaves (0x15), bip32 origins
+     * (0x16), internal key (0x17), merkle root (0x18). Signing runs in
+     * ROUNDS: round 0 offers every input its key path (internal key + root),
+     * round r>=1 offers leaf r-1; each input keeps the first round that
+     * signed it (a complete signature beats a partial one). The rounds are
+     * re-assembled into one transaction below. */
+    typedef struct { const unsigned char* leaf[8]; unsigned long leaflen[8]; const unsigned char* ctrl[8]; unsigned long ctrllen[8]; int nleaf;
+                     const unsigned char* internal; const unsigned char* merkle;
+                     struct { unsigned char fp[4]; unsigned path[32]; int n; } deriv[8]; int nderiv;
+                     const unsigned char* keysig; unsigned long keysiglen;
+                     const unsigned char* psig_k[32]; const unsigned char* psig_v[32]; unsigned long psig_vl[32]; int npsig; } ptap_t;
+    static ptap_t ptap[FIN_MAXIO]; int max_leaf = 0;
+    for (int i = 0; i < n_in; i++){
+        ptap_t* T = &ptap[i]; memset(T, 0, sizeof *T);
+        for (int k2 = 0; k2 < in_n[i]; k2++){
+            const psbt_kv* kv = &ikv[i][k2]; if (!kv->kl) continue;
+            switch (kv->k[0]){
+            case 0x15: if (kv->kl >= 34 && ((kv->kl - 34) % 32) == 0 && kv->vl >= 2 && T->nleaf < 8){
+                           T->ctrl[T->nleaf] = kv->k + 1; T->ctrllen[T->nleaf] = kv->kl - 1;
+                           T->leaf[T->nleaf] = kv->v; T->leaflen[T->nleaf] = kv->vl - 1; T->nleaf++; } break;
+            case 0x16: if (kv->kl == 33 && T->nderiv < 8){
+                           unsigned long cc; unsigned long nlh = srw_varint(kv->v, &cc); unsigned long q = cc + nlh * 32;
+                           if (q + 4 <= kv->vl && ((kv->vl - q - 4) % 4) == 0 && (kv->vl - q - 4) / 4 <= 32){
+                               memcpy(T->deriv[T->nderiv].fp, kv->v + q, 4); q += 4; int n = 0;
+                               while (q + 4 <= kv->vl){ T->deriv[T->nderiv].path[n++] = (unsigned)kv->v[q] | ((unsigned)kv->v[q+1]<<8) | ((unsigned)kv->v[q+2]<<16) | ((unsigned)kv->v[q+3]<<24); q += 4; }
+                               T->deriv[T->nderiv].n = n; T->nderiv++; } } break;
+            case 0x17: if (kv->vl == 32) T->internal = kv->v; break;
+            case 0x18: if (kv->vl == 32) T->merkle = kv->v; break;
+            case 0x13: if (kv->vl == 64 || kv->vl == 65){ T->keysig = kv->v; T->keysiglen = kv->vl; } break;
+            case 0x14: if (kv->kl == 65 && (kv->vl == 64 || kv->vl == 65) && T->npsig < 32){ T->psig_k[T->npsig] = kv->k + 1; T->psig_v[T->npsig] = kv->v; T->psig_vl[T->npsig] = kv->vl; T->npsig++; } break;
+            default: break;
+            }
+        }
+        if (T->nleaf > max_leaf) max_leaf = T->nleaf;
+    }
+    static unsigned char in_spk[FIN_MAXIO][128]; static unsigned long in_spklen[FIN_MAXIO];
+    static unsigned char rec_ss[FIN_MAXIO][4096]; static unsigned long rec_sslen[FIN_MAXIO];
+    static unsigned char rec_wit[FIN_MAXIO][4096]; static unsigned long rec_witlen[FIN_MAXIO]; static unsigned rec_witems[FIN_MAXIO];
+    static int rec_state[FIN_MAXIO];   /* 0 unsigned, 1 partial, 2 complete */
+    /* signatures the delegate placed (its "_sigs"): PARTIAL_SIG (0x02|pub33) or TAP_SCRIPT_SIG (0x14|x|leafhash) */
+    #define SG_MAX 8
+    static unsigned char sg_k[FIN_MAXIO][SG_MAX][67]; static unsigned long sg_kl[FIN_MAXIO][SG_MAX];
+    static unsigned char sg_v[FIN_MAXIO][SG_MAX][80]; static unsigned long sg_vl[FIN_MAXIO][SG_MAX]; static int sg_n[FIN_MAXIO];
+    for (int i = 0; i < n_in; i++){ in_spklen[i] = 0; rec_sslen[i] = rec_witlen[i] = 0; rec_witems[i] = 0; rec_state[i] = 0; sg_n[i] = 0; }
+    /* inputs the MuSig2 stage finished are complete before any round: their
+     * witness is the aggregated key-path signature, and the delegate's
+     * "keys not provided" for them is ignored by the per-input record */
+    for (int i = 0; i < n_in; i++) if (mu_witlen[i] && mu_witlen[i] <= sizeof rec_wit[i]){
+        memcpy(rec_wit[i], mu_wit[i], mu_witlen[i]); rec_witlen[i] = mu_witlen[i]; rec_witems[i] = 1; rec_state[i] = 2; }
+    rj_val* sres = NULL;
+    for (int round = 0; round <= max_leaf; round++){
+    if (sres){ rj_free(sres); sres = NULL; }
     /* prevtxs from the PSBT's own utxo fields (witness_utxo first, else
      * index the non-witness parent at the outpoint's vout); an input with
      * neither is left to the delegate's wallet-coin synthesis */
@@ -2532,6 +3749,50 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
           if (sh){ bin_to_hex(sh, spk, spklen); rj_obj_set(e, "scriptPubKey", rj_str(sh)); free(sh); } }
         { char am[32]; rpc_amounts((long long)amount, am, sizeof am);
           rj_obj_set(e, "amount", rj_numf("%s", am)); }
+        if (spklen <= sizeof in_spk[i]){ memcpy(in_spk[i], spk, spklen); in_spklen[i] = spklen; }
+        { const ptap_t* T = &ptap[i]; char hx[2*(33+32*16)+1];
+          if (T->internal){ bin_to_hex(hx, T->internal, 32); rj_obj_set(e, "tapInternalKey", rj_str(hx)); }
+          if (T->merkle){ bin_to_hex(hx, T->merkle, 32); rj_obj_set(e, "tapMerkleRoot", rj_str(hx)); }
+          if (round >= 1 && round - 1 < T->nleaf && T->leaflen[round-1] <= 1024){
+              char* lh = malloc(T->leaflen[round-1]*2+1);
+              if (lh){ bin_to_hex(lh, T->leaf[round-1], T->leaflen[round-1]); rj_obj_set(e, "tapLeafScript", rj_str(lh)); free(lh); }
+              bin_to_hex(hx, T->ctrl[round-1], T->ctrllen[round-1]); rj_obj_set(e, "tapControlBlock", rj_str(hx)); }
+          if (T->keysig){ char kh[131]; bin_to_hex(kh, T->keysig, T->keysiglen); rj_obj_set(e, "tapKeySig", rj_str(kh)); }
+          { rj_val* arr = NULL;   /* PARTIAL_SIG (0x02 | pub33) entries: carried into multisig / miniscript witnesses */
+            for (int k2 = 0; k2 < in_n[i]; k2++){ const psbt_kv* kv = &ikv[i][k2];
+                if (kv->kl != 34 || kv->k[0] != 0x02 || kv->vl < 8 || kv->vl > 80) continue;
+                if (!arr) arr = rj_arr();
+                rj_val* d = rj_obj(); char h1[67], h2[161]; bin_to_hex(h1, kv->k + 1, 33); bin_to_hex(h2, kv->v, kv->vl);
+                rj_obj_set(d, "pubkey", rj_str(h1)); rj_obj_set(d, "sig", rj_str(h2)); rj_arr_push(arr, d); }
+            if (arr) rj_obj_set(e, "partialSigs", arr); }
+          if (T->npsig){ rj_val* arr = rj_arr();
+              for (int q = 0; q < T->npsig; q++){ rj_val* d = rj_obj(); char h1[65], h2[65], h3[131]; bin_to_hex(h1, T->psig_k[q], 32); bin_to_hex(h2, T->psig_k[q] + 32, 32); bin_to_hex(h3, T->psig_v[q], T->psig_vl[q]);
+                  rj_obj_set(d, "pubkey", rj_str(h1)); rj_obj_set(d, "leaf_hash", rj_str(h2)); rj_obj_set(d, "sig", rj_str(h3)); rj_arr_push(arr, d); }
+              rj_obj_set(e, "tapPartialSigs", arr); }
+          if (T->nderiv){ rj_val* arr = rj_arr();
+              for (int q = 0; q < T->nderiv; q++){ rj_val* d = rj_obj(); char fp[9]; bin_to_hex(fp, T->deriv[q].fp, 4); rj_obj_set(d, "fingerprint", rj_str(fp));
+                  rj_val* pa = rj_arr(); for (int z = 0; z < T->deriv[q].n; z++) rj_arr_push(pa, rj_numf("%u", T->deriv[q].path[z]));
+                  rj_obj_set(d, "path", pa); rj_arr_push(arr, d); }
+              rj_obj_set(e, "tapBip32", arr); } }
+        /* the PSBT's own redeem/witness scripts (0x04/0x05) and hash preimages
+         * (0x0a ripemd160, 0x0b sha256, 0x0c hash160, 0x0d hash256): what a
+         * miniscript input needs beyond keys (2026-09-01) */
+        { const psbt_kv* rs = fin_find(ikv[i], in_n[i], 0x04);
+          if (rs && rs->vl && rs->vl <= 128){ char* h = malloc(rs->vl*2+1); if (h){ bin_to_hex(h, rs->v, rs->vl); rj_obj_set(e, "redeemScript", rj_str(h)); free(h); } }
+          const psbt_kv* wsf = fin_find(ikv[i], in_n[i], 0x05);
+          if (wsf && wsf->vl && wsf->vl <= 3700){ char* h = malloc(wsf->vl*2+1); if (h){ bin_to_hex(h, wsf->v, wsf->vl); rj_obj_set(e, "witnessScript", rj_str(h)); free(h); } }
+          rj_val* pa = NULL;
+          for (int k2 = 0; k2 < in_n[i]; k2++){
+              const psbt_kv* kv = &ikv[i][k2];
+              if (kv->kl < 1 || kv->k[0] < 0x0a || kv->k[0] > 0x0d) continue;
+              unsigned long hl = kv->kl - 1; if ((hl != 20 && hl != 32) || kv->vl != 32) continue;
+              if (!pa) pa = rj_arr();
+              rj_val* po = rj_obj(); char hh[65], ph[65];
+              bin_to_hex(hh, kv->k + 1, hl); bin_to_hex(ph, kv->v, 32);
+              rj_obj_set(po, "hash", rj_str(hh)); rj_obj_set(po, "preimage", rj_str(ph));
+              rj_arr_push(pa, po);
+          }
+          if (pa) rj_obj_set(e, "preimages", pa); }
         rj_arr_push(pv, e);
     }
 
@@ -2544,36 +3805,123 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
     free(uhex);
     rj_arr_push(fwd, pv);
     if (sht) rj_arr_push(fwd, rj_str(sht));
-    rj_val* sres = NULL;
-    int rc = cmd_signrawtransactionwithwallet(fwd, w, ec, em, &sres);
+    int rc = signer(fwd, sctx, ec, em, &sres);
     rj_free(fwd);
     if (!rc) return 0;
-    rj_val* shex = rj_obj_get(sres, "hex");
-    rj_val* scomp = rj_obj_get(sres, "complete");
-    int complete = scomp && scomp->str && scomp->str[0]=='1';
-    if (!shex || !shex->str){ rj_free(sres); *ec = -22; *em = "signing produced no transaction"; return 0; }
+    rj_val* rhex = rj_obj_get(sres, "hex");
+    if (!rhex || !rhex->str){ rj_free(sres); *ec = -22; *em = "signing produced no transaction"; return 0; }
+    if (getenv("PSBT_DEBUG")){ long jl = 0; char* js = rj_write_alloc(sres, 0, &jl); fprintf(stderr, "[psbt_debug] round %d signer result: %.1500s\n", round, js ? js : "?"); free(js); }
+    /* record what this round signed, per input */
+    { static unsigned char rbuf[200000]; unsigned long rhl = strlen(rhex->str);
+      if ((rhl & 1) || rhl/2 > sizeof rbuf || !hex_to_bytes(rbuf, rhex->str, rhl)){ rj_free(sres); *ec = -22; *em = "TX decode failed"; return 0; }
+      static crt_in_t rin[FIN_MAXIO]; int rn, rsw; unsigned long rost, roen;
+      if (!crt_walk(rbuf, rhl/2, rin, FIN_MAXIO, &rn, &rost, &roen, &rsw) || rn != n_in){ rj_free(sres); *ec = -22; *em = "signed transaction shape mismatch"; return 0; }
+      rj_val* errs = rj_obj_get(sres, "errors");
+      { rj_val* sa = rj_obj_get(sres, "_sigs");
+        for (unsigned long q = 0; sa && sa->typ == RJ_ARR && q < sa->nitems; q++){
+            rj_val* e = sa->items[q]; rj_val* et = rj_obj_get(e, "txid"); rj_val* ev = rj_obj_get(e, "vout"); rj_val* ep = rj_obj_get(e, "pubkey"); rj_val* es = rj_obj_get(e, "sig"); rj_val* el = rj_obj_get(e, "leaf_hash");
+            if (!et || !ev || !ep || !es || et->typ != RJ_STR || ep->typ != RJ_STR || es->typ != RJ_STR) continue;
+            for (int i = 0; i < n_in; i++){
+                char tid[65]; for (int k2 = 0; k2 < 32; k2++){ static const char* H = "0123456789abcdef"; unsigned char b2 = uin[i].op[31-k2]; tid[k2*2] = H[b2>>4]; tid[k2*2+1] = H[b2&15]; } tid[64] = 0;
+                unsigned long vo = (unsigned long)uin[i].op[32] | ((unsigned long)uin[i].op[33]<<8) | ((unsigned long)uin[i].op[34]<<16) | ((unsigned long)uin[i].op[35]<<24);
+                if (strcmp(et->str, tid) || strtoul(ev->str, 0, 10) != vo) continue;
+                if (sg_n[i] >= SG_MAX) break;
+                unsigned char key[67]; unsigned long kl = 0; size_t pl = strlen(ep->str), sl = strlen(es->str);
+                if (el && el->typ == RJ_STR && pl == 64 && strlen(el->str) == 64){ key[0] = 0x14; if (!hex_to_bytes(key+1, ep->str, 64) || !hex_to_bytes(key+33, el->str, 64)) break; kl = 65; }
+                else if (pl == 66){ key[0] = 0x02; if (!hex_to_bytes(key+1, ep->str, 66)) break; kl = 34; }
+                else break;
+                if ((sl & 1) || sl/2 > 80) break;
+                int dup = 0; for (int z = 0; z < sg_n[i]; z++) if (sg_kl[i][z] == kl && !memcmp(sg_k[i][z], key, kl)) dup = 1;
+                if (dup) break;
+                memcpy(sg_k[i][sg_n[i]], key, kl); sg_kl[i][sg_n[i]] = kl; hex_to_bytes(sg_v[i][sg_n[i]], es->str, sl); sg_vl[i][sg_n[i]] = sl/2; sg_n[i]++;
+                break;
+            }
+        } }
+      for (int i = 0; i < n_in; i++){
+          int signed_i = (rin[i].sslen > 0) || (rin[i].witlen > 0 && rin[i].witems > 0);
+          if (!signed_i) continue;
+          int partial = 0, failed = 0;
+          if (errs && errs->typ == RJ_ARR){
+              char tid[65]; for (int k2 = 0; k2 < 32; k2++){ static const char* H = "0123456789abcdef"; unsigned char b2 = uin[i].op[31-k2]; tid[k2*2] = H[b2>>4]; tid[k2*2+1] = H[b2&15]; } tid[64] = 0;
+              unsigned long vo = (unsigned long)uin[i].op[32] | ((unsigned long)uin[i].op[33]<<8) | ((unsigned long)uin[i].op[34]<<16) | ((unsigned long)uin[i].op[35]<<24);
+              for (unsigned long q = 0; q < errs->nitems; q++){
+                  rj_val* eo = errs->items[q]; rj_val* et = rj_obj_get(eo, "txid"); rj_val* ev = rj_obj_get(eo, "vout"); rj_val* ee = rj_obj_get(eo, "error");
+                  if (!et || !ev || et->typ != RJ_STR || strcmp(et->str, tid) || strtoul(ev->str, 0, 10) != vo) continue;
+                  if (ee && ee->str && strstr(ee->str, "Missing signatures")) partial = 1; else failed = 1;
+              }
+          }
+          if (failed) continue;
+          int st = partial ? 1 : 2;
+          if (st <= rec_state[i]) continue;
+          if (rin[i].sslen > sizeof rec_ss[i] || rin[i].witlen > sizeof rec_wit[i]) continue;
+          memcpy(rec_ss[i], rin[i].ss, rin[i].sslen); rec_sslen[i] = rin[i].sslen;
+          memcpy(rec_wit[i], rin[i].wit, rin[i].witlen); rec_witlen[i] = rin[i].witlen; rec_witems[i] = rin[i].witems;
+          rec_state[i] = st;
+      }
+    }
+    { int all = 1; for (int i = 0; i < n_in; i++) if (rec_state[i] != 2) all = 0; if (all) break; }
+    }   /* rounds */
+    if (!sres){ *ec = -22; *em = "signing produced no transaction"; return 0; }
 
-    /* splice the signed inputs back into the PSBT */
-    static unsigned char sbuf[200000];
-    unsigned long shl = strlen(shex->str);
-    if ((shl & 1) || shl/2 > sizeof sbuf || !hex_to_bytes(sbuf, shex->str, shl)){
-        rj_free(sres); *ec = -22; *em = "TX decode failed"; return 0; }
+    /* re-assemble one transaction from the per-input records */
+    static unsigned char sbuf[200000]; unsigned long shl = 0;
+    int complete = 1, anywit = 0;
+    for (int i = 0; i < n_in; i++){ if (rec_state[i] != 2) complete = 0; if (rec_witlen[i]) anywit = 1; }
+    { unsigned long o = 0; memcpy(sbuf + o, utx, 4); o += 4;
+      if (anywit){ sbuf[o++] = 0x00; sbuf[o++] = 0x01; }
+      o += crt_varint(sbuf + o, (unsigned long long)n_in);
+      for (int i = 0; i < n_in; i++){
+          if (o + 36 + 9 + rec_sslen[i] + 4 > sizeof sbuf){ rj_free(sres); *ec = -22; *em = "transaction too large"; return 0; }
+          memcpy(sbuf + o, uin[i].op, 36); o += 36;
+          o += crt_varint(sbuf + o, rec_sslen[i]); memcpy(sbuf + o, rec_ss[i], rec_sslen[i]); o += rec_sslen[i];
+          unsigned sq = uin[i].seq; sbuf[o++] = (unsigned char)sq; sbuf[o++] = (unsigned char)(sq>>8); sbuf[o++] = (unsigned char)(sq>>16); sbuf[o++] = (unsigned char)(sq>>24);
+      }
+      if (o + (oen - ost) + 4 > sizeof sbuf){ rj_free(sres); *ec = -22; *em = "transaction too large"; return 0; }
+      memcpy(sbuf + o, utx + ost, oen - ost); o += oen - ost;
+      if (anywit){ for (int i = 0; i < n_in; i++){
+          if (o + rec_witlen[i] + 1 > sizeof sbuf){ rj_free(sres); *ec = -22; *em = "transaction too large"; return 0; }
+          if (rec_witlen[i]){ memcpy(sbuf + o, rec_wit[i], rec_witlen[i]); o += rec_witlen[i]; } else sbuf[o++] = 0x00; } }
+      memcpy(sbuf + o, utx + utxl - 4, 4); o += 4;
+      shl = o * 2; }
+    static char shexbuf[400001]; bin_to_hex(shexbuf, sbuf, shl/2);
     static crt_in_t sin[FIN_MAXIO];
     int sn, ssw; unsigned long sost, soen;
     if (!crt_walk(sbuf, shl/2, sin, FIN_MAXIO, &sn, &sost, &soen, &ssw) || sn != n_in){
         rj_free(sres); *ec = -22; *em = "signed transaction shape mismatch"; return 0; }
 
-    static unsigned char fss[FIN_MAXIO][256]; static unsigned long fsslen[FIN_MAXIO];
-    static unsigned char fwit[FIN_MAXIO][256]; static unsigned long fwitlen[FIN_MAXIO];
-    static unsigned char psig_k[FIN_MAXIO][67]; static unsigned long psig_kl[FIN_MAXIO];
-    static unsigned char psig_v[FIN_MAXIO][80]; static unsigned long psig_vl[FIN_MAXIO];
+    static unsigned char fss[FIN_MAXIO][4096]; static unsigned long fsslen[FIN_MAXIO];
+    static unsigned char fwit[FIN_MAXIO][6000]; static unsigned long fwitlen[FIN_MAXIO];
+    #define PX_MAX (SRW_TAP_MAXKEYS + 2)
+    static unsigned char px_k[FIN_MAXIO][PX_MAX][67]; static unsigned long px_kl[FIN_MAXIO][PX_MAX];
+    static unsigned char px_v[FIN_MAXIO][PX_MAX][80]; static unsigned long px_vl[FIN_MAXIO][PX_MAX]; static int px_n[FIN_MAXIO];
     for (int i = 0; i < n_in; i++){
-        fsslen[i] = fwitlen[i] = psig_kl[i] = psig_vl[i] = 0;
+        fsslen[i] = fwitlen[i] = 0; px_n[i] = 0;
         int signed_i = (sin[i].sslen > 0) || (sin[i].witlen > 0 && sin[i].witems > 0);
         if (!signed_i) continue;
-        if (finalize){
-            if (sin[i].sslen > 0 && sin[i].sslen <= 256){ memcpy(fss[i], sin[i].ss, sin[i].sslen); fsslen[i] = sin[i].sslen; }
-            if (sin[i].witlen > 0 && sin[i].witlen <= 256){ memcpy(fwit[i], sin[i].wit, sin[i].witlen); fwitlen[i] = sin[i].witlen; }
+        int is_p2tr = in_spklen[i] == 34 && in_spk[i][0] == 0x51 && in_spk[i][1] == 0x20;
+        if (finalize && rec_state[i] == 2){
+            if (sin[i].sslen > 0 && sin[i].sslen <= sizeof fss[i]){ memcpy(fss[i], sin[i].ss, sin[i].sslen); fsslen[i] = sin[i].sslen; }
+            if (sin[i].witlen > 0 && sin[i].witlen <= sizeof fwit[i]){ memcpy(fwit[i], sin[i].wit, sin[i].witlen); fwitlen[i] = sin[i].witlen; }
+        } else if (is_p2tr){
+            /* taproot partials: key path -> PSBT_IN_TAP_KEY_SIG (0x13); script
+             * path -> one PSBT_IN_TAP_SCRIPT_SIG (0x14 | xonly | leafhash) per
+             * signature present in the witness [sigs..., script, control] */
+            const unsigned char* it[SRW_TAP_MAXKEYS + 2]; unsigned long il[SRW_TAP_MAXKEYS + 2]; int nit = 0;
+            { const unsigned char* q = sin[i].wit; unsigned long cc; unsigned long cnt = srw_varint(q, &cc); q += cc;
+              for (unsigned long z = 0; z < cnt && nit < SRW_TAP_MAXKEYS + 2; z++){ il[nit] = srw_varint(q, &cc); q += cc; it[nit] = q; q += il[nit]; nit++; } }
+            if (nit == 1 && (il[0] == 64 || il[0] == 65)){
+                px_k[i][0][0] = 0x13; px_kl[i][0] = 1; memcpy(px_v[i][0], it[0], il[0]); px_vl[i][0] = il[0]; px_n[i] = 1;
+            } else if (nit >= 3 && il[nit-1] >= 33){
+                unsigned char keys[SRW_TAP_MAXKEYS][32]; int kth = 0;
+                int nk = srw_tap_leaf_keys(it[nit-2], il[nit-2], keys, &kth);
+                unsigned char lh[32]; srw_tapleaf_hash(lh, it[nit-1][0] & 0xfe, it[nit-2], il[nit-2]);
+                for (int a = 0; a < nk && px_n[i] < PX_MAX; a++){
+                    int idx = (nk == 1 && kth == 1) ? 0 : (nk - 1 - a);
+                    if (idx >= nit - 2 || (il[idx] != 64 && il[idx] != 65)) continue;
+                    int n2 = px_n[i]; px_k[i][n2][0] = 0x14; memcpy(px_k[i][n2]+1, keys[a], 32); memcpy(px_k[i][n2]+33, lh, 32); px_kl[i][n2] = 65;
+                    memcpy(px_v[i][n2], it[idx], il[idx]); px_vl[i][n2] = il[idx]; px_n[i]++;
+                }
+            }
         } else {
             /* PARTIAL_SIG extraction: P2WPKH witness [sig, pub] or P2PKH
              * scriptSig push(sig) push(pub) */
@@ -2591,13 +3939,18 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
                 if (1 + sigl < sin[i].sslen){ publ = q[1+sigl]; pub = q + 2 + sigl; }
             }
             if (!sig || !pub || sigl > 79 || (publ != 33 && publ != 65)){
+                /* a partially signed multisig under finalize=true: nothing
+                 * final to write and no per-key partial this node can name
+                 * without verifying each signature -- the input is left as
+                 * supplied and the result says complete=false */
+                if (rec_state[i] == 1) continue;   /* partial multisig/miniscript: the Updater's fields stay, no per-key partial is named (see _sigs below) */
                 rj_free(sres); *ec = -8;
                 *em = "finalize=false: partial-signature extraction is supported only for "
-                      "P2WPKH and P2PKH inputs on this node";
+                      "P2WPKH, P2PKH and P2TR inputs on this node";
                 return 0;
             }
-            psig_k[i][0] = 0x02; memcpy(psig_k[i]+1, pub, publ); psig_kl[i] = 1 + publ;
-            memcpy(psig_v[i], sig, sigl); psig_vl[i] = sigl;
+            px_k[i][0][0] = 0x02; memcpy(px_k[i][0]+1, pub, publ); px_kl[i][0] = 1 + publ;
+            memcpy(px_v[i][0], sig, sigl); px_vl[i][0] = sigl; px_n[i] = 1;
         }
     }
 
@@ -2609,32 +3962,323 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
         int finalized = fsslen[i] || fwitlen[i];
         for (int k2 = 0; k2 < in_n[i] && kn < FIN_MAXKV; k2++){
             unsigned char t = ikv[i][k2].kl ? ikv[i][k2].k[0] : 0xff;
-            if (finalized && (t==0x02||t==0x03||t==0x04||t==0x05||t==0x06||t==0x07||t==0x08))
+            if (finalized && (t==0x02||t==0x03||t==0x04||t==0x05||t==0x06||t==0x07||t==0x08||(t>=0x13&&t<=0x1c)))
                 continue;
+            /* a partial we produce replaces the same key already present */
+            { int dup = 0; for (int q = 0; q < px_n[i]; q++) if (ikv[i][k2].kl == px_kl[i][q] && !memcmp(ikv[i][k2].k, px_k[i][q], px_kl[i][q])) dup = 1; if (dup) continue; }
             keep[kn++] = ikv[i][k2];
         }
-        psbt_kv extra[3]; int en = 0;
-        unsigned char k7 = 0x07, k8 = 0x08;
+        if (!finalized){   /* the delegate's own signatures become PARTIAL_SIG / TAP_SCRIPT_SIG entries */
+            for (int q = 0; q < sg_n[i] && px_n[i] < PX_MAX; q++){
+                int dup = 0; for (int z = 0; z < px_n[i]; z++) if (px_kl[i][z] == sg_kl[i][q] && !memcmp(px_k[i][z], sg_k[i][q], sg_kl[i][q])) dup = 1;
+                if (dup) continue;
+                memcpy(px_k[i][px_n[i]], sg_k[i][q], sg_kl[i][q]); px_kl[i][px_n[i]] = sg_kl[i][q];
+                memcpy(px_v[i][px_n[i]], sg_v[i][q], sg_vl[i][q]); px_vl[i][px_n[i]] = sg_vl[i][q]; px_n[i]++;
+            }
+            /* ...and replace the same keys already in the map (a partial from a previous pass) */
+            int kn2 = 0; for (int z = 0; z < kn; z++){ int rep = 0; for (int q = 0; q < px_n[i]; q++) if (keep[z].kl == px_kl[i][q] && !memcmp(keep[z].k, px_k[i][q], px_kl[i][q])) rep = 1; if (!rep) keep[kn2++] = keep[z]; } kn = kn2;
+        }
+        static psbt_kv extra[PX_MAX + 2]; int en = 0;
+        static unsigned char k7 = 0x07, k8 = 0x08;
         if (fsslen[i]){ extra[en].k=&k7; extra[en].kl=1; extra[en].v=fss[i]; extra[en].vl=fsslen[i]; en++; }
         if (fwitlen[i]){ extra[en].k=&k8; extra[en].kl=1; extra[en].v=fwit[i]; extra[en].vl=fwitlen[i]; en++; }
-        if (psig_kl[i]){ extra[en].k=psig_k[i]; extra[en].kl=psig_kl[i]; extra[en].v=psig_v[i]; extra[en].vl=psig_vl[i]; en++; }
+        for (int q = 0; q < px_n[i]; q++){ extra[en].k=px_k[i][q]; extra[en].kl=px_kl[i][q]; extra[en].v=px_v[i][q]; extra[en].vl=px_vl[i][q]; en++; }
         for (int k2 = 0; k2 < en && kn < FIN_MAXKV; k2++) keep[kn++] = extra[k2];
         o += psbt_ser_map(out + o, keep, kn);
     }
     for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++)
         o += psbt_ser_map(out + o, okv[i], out_n[i]);
 
-    char* b = malloc((size_t)((o+2)/3)*4+1);
+    char* b = psbt_b64_out(out, o, &vm);
     if (!b){ rj_free(sres); *ec=-7; *em="oom"; return 0; }
-    crt_b64(b, out, o);
     rj_val* r = rj_obj();
     rj_obj_set(r, "psbt", rj_str(b));
     rj_obj_set(r, "complete", rj_bool(complete));
-    if (complete && finalize) rj_obj_set(r, "hex", rj_str(shex->str));
+    if (complete && finalize) rj_obj_set(r, "hex", rj_str(shexbuf));
     free(b);
     rj_free(sres);
     *result = r;
     return 1;
+}
+
+static int wallet_psbt_signer(rj_val* fwd, void* ctx, long* ec, const char** em, rj_val** sres){
+    return cmd_signrawtransactionwithwallet(fwd, (const rpc_wallet*)ctx, ec, em, sres);
+}
+/* MuSig2 key oracle for the wallet: the same window of HD keys the wallet
+ * signer hands to the raw signer, plus the imported HD keys */
+static int wallet_musig_keyfn(void* vctx, const unsigned char pub33[33], unsigned char priv[32]){
+    const rpc_wallet* w = (const rpc_wallet*)vctx; if (!w || !w->seed) return 0;
+    int mask = rpc_wops_active_types();
+    for (int t = 0; t < 4; t++){
+        if (!(mask & (1 << t))) continue;
+        for (unsigned i = 0; i < SRWW_WINDOW; i++) for (int chain = 0; chain <= 1; chain++){
+            unsigned idx[5]; rpc_wops_type_path(t, i, chain, idx);
+            unsigned char k[32], c[32], pub[33];
+            if (bip32_derive_path(k, c, w->seed, 64, idx, 5) != 1) continue;
+            scalar_to_pubkey(pub, k);
+            if (!memcmp(pub, pub33, 33)){ memcpy(priv, k, 32); return 1; }
+        }
+    }
+    { extern int rpc_wops_hdkey_privkeys(unsigned char (*out)[32], int cap, unsigned window);
+      static unsigned char hk[256][32]; int nh = rpc_wops_hdkey_privkeys(hk, 256, SRWW_WINDOW);
+      for (int i = 0; i < nh; i++){ unsigned char pub[33]; scalar_to_pubkey(pub, hk[i]); if (!memcmp(pub, pub33, 33)){ memcpy(priv, hk[i], 32); return 1; } } }
+    return 0;
+}
+int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
+                              long* ec, const char** em, rj_val** result){
+    const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
+    int sign = 1, finalize = 1;
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_BOOL) sign = params->items[1]->str[0]=='1';
+    const char* sht = (params->nitems >= 3 && params->items[2]->typ == RJ_STR) ? params->items[2]->str : NULL;
+    if (params->nitems >= 5 && params->items[4]->typ == RJ_BOOL) finalize = params->items[4]->str[0]=='1';
+    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+    /* ==== Updater from the wallet's own descriptors (listdescriptors): scripts, origins, taproot fields ==== */
+    static dpp_desc_t* g_wupd_dv; static int g_wupd_nd; g_wupd_nd = 0;
+    { rj_val* ld = NULL; long e2 = 0; const char* m2 = NULL; rj_val* np = rj_arr();
+      if (rpc_wops_dispatch("listdescriptors", np, w, &ld, &e2, &m2) && ld){
+          rj_val* arr = rj_obj_get(ld, "descriptors");
+          static descr_t wdescs[16]; static dpp_desc_t wdv[16]; int wnd = 0;
+          for (unsigned long i = 0; arr && i < arr->nitems && wnd < 16; i++){
+              rj_val* e = arr->items[i]; rj_val* ds = rj_obj_get(e, "desc"); rj_val* rg = rj_obj_get(e, "range");
+              if (!ds || ds->typ != RJ_STR) continue;
+              char err[256]; if (!descr_parse(ds->str, &wdescs[wnd], err, sizeof err)) continue;
+              long lo = 0, hi = 0;
+              if (wdescs[wnd].ranged){ hi = 1000; if (rg && rg->typ == RJ_ARR && rg->nitems == 2){ lo = strtol(rg->items[0]->str, NULL, 10); hi = strtol(rg->items[1]->str, NULL, 10); } if (hi - lo > 5000) hi = lo + 5000; }
+              wdv[wnd].d = &wdescs[wnd]; wdv[wnd].lo = lo; wdv[wnd].hi = hi; wnd++;
+          }
+          g_wupd_dv = wdv; g_wupd_nd = wnd;
+      }
+      if (ld) rj_free(ld); rj_free(np); }
+    int rc = psbt_process(b64, sign, sht, finalize, wallet_psbt_signer, (void*)w, wallet_musig_keyfn, g_wupd_dv, g_wupd_nd, ec, em, result);
+    return rc;
+}
+
+/* ==== descriptorprocesspsbt ==============================================
+ * Core's wallet-less Signer: the private keys come from the descriptors
+ * themselves (WIF keys, or xprv-derived at the index whose expansion IS an
+ * input's scriptPubKey). For every prevtx the PSBT supplied, the descriptor
+ * and index that produce its script are found by expansion, that
+ * descriptor's private keys at that index go to signrawtransactionwithkey,
+ * and a sh() descriptor's redeemScript is supplied alongside. Inputs no
+ * descriptor covers stay unsigned and the result reports complete=false,
+ * as Core does. The script forms that can be signed are the raw signer's:
+ * P2PKH, P2WPKH, P2SH-P2WPKH. */
+#include "descriptor.h"
+#include "psbt_update.h"
+typedef struct { dpp_desc_t* v; int n; } dpp_ctx_t;
+static void dpp_wif(char* out, const unsigned char priv[32], int compressed){
+    unsigned char pay[34]; pay[0] = 0x80; memcpy(pay+1, priv, 32); pay[33] = 1;   /* the raw signer reads the 0x80 form on every chain */
+    base58check_encode(out, pay, compressed ? 34 : 33);
+}
+static int dpp_signer(rj_val* fwd, void* vctx, long* ec, const char** em, rj_val** sres){
+    dpp_ctx_t* c = (dpp_ctx_t*)vctx;
+    rj_val* keys = rj_arr();
+    rj_val* pv = (fwd->nitems >= 2 && fwd->items[1]->typ == RJ_ARR) ? rj_clone(fwd->items[1]) : rj_arr();
+    int nkeys = 0;
+    for (unsigned long i = 0; i < pv->nitems; i++){
+        rj_val* e = pv->items[i]; rj_val* sh = rj_obj_get(e, "scriptPubKey");
+        if (!sh || sh->typ != RJ_STR) continue;
+        unsigned char spk[128]; size_t shl = strlen(sh->str);
+        if ((shl & 1) || shl/2 > sizeof spk || !hex_to_bytes(spk, sh->str, shl)) continue;
+        int done = 0;
+        for (int di = 0; di < c->n && !done; di++){
+            descr_t* d = c->v[di].d;
+            for (long idx = c->v[di].lo; idx <= c->v[di].hi && !done; idx++){
+                descr_spk_t sp[4]; int n = descr_expand(d, idx, sp, 4);
+                for (int q = 0; q < n && !done; q++){
+                    if (sp[q].len != (int)(shl/2) || memcmp(sp[q].spk, spk, (size_t)sp[q].len)) continue;
+                    done = 1;
+                    rj_val* pubs = rj_arr();
+                    for (int k = 0; k < d->nk && nkeys < 64; k++){
+                        unsigned char priv[32]; int comp = 1;
+                        { unsigned char pub[65]; int pl; if (descr_key_pub_at(d, k, idx, pub, &pl) && pl == 33){ char ph[67]; bin_to_hex(ph, pub, 33); rj_arr_push(pubs, rj_str(ph)); } }
+                        if (!descr_key_priv_at(d, k, idx, priv, &comp)) continue;
+                        char wif[64]; dpp_wif(wif, priv, comp); rj_arr_push(keys, rj_str(wif)); nkeys++;
+                    }
+                    if (pubs->nitems && !rj_obj_get(e, "pubkeys")) rj_obj_set(e, "pubkeys", pubs); else rj_free(pubs);
+                    unsigned char inner[1400]; int which = 0;
+                    int il = descr_inner_script_at(d, idx, inner, (int)sizeof inner, &which);
+                    if (il > 0 && which == 1 && !rj_obj_get(e, "redeemScript")){
+                        char* h = malloc((size_t)il * 2 + 1);
+                        if (h){ bin_to_hex(h, inner, (size_t)il); rj_obj_set(e, "redeemScript", rj_str(h)); free(h); }
+                    }
+                    if (il > 0 && (which == 2 || which == 3) && !rj_obj_get(e, "witnessScript")){
+                        char* h = malloc((size_t)il * 2 + 1);
+                        if (h){ bin_to_hex(h, inner, (size_t)il); rj_obj_set(e, "witnessScript", rj_str(h)); free(h); }
+                        if (which == 3 && !rj_obj_get(e, "redeemScript")){          /* sh(wsh(...)): redeemScript = 0 <sha256(ws)> */
+                            unsigned char rd[34]; rd[0] = 0x00; rd[1] = 0x20; sha256_full(rd + 2, inner, (unsigned long)il);
+                            char rh[69]; bin_to_hex(rh, rd, 34); rj_obj_set(e, "redeemScript", rj_str(rh));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    rj_val* f2 = rj_arr();
+    rj_arr_push(f2, rj_str(fwd->items[0]->str));
+    rj_arr_push(f2, keys);
+    rj_arr_push(f2, pv);
+    if (fwd->nitems >= 3 && fwd->items[2]->typ == RJ_STR) rj_arr_push(f2, rj_str(fwd->items[2]->str));
+    int rc = cmd_signrawtransactionwithkey(f2, ec, em, sres);
+    rj_free(f2);
+    return rc;
+}
+/* MuSig2 key oracle for descriptorprocesspsbt: any key of any supplied
+ * descriptor, at any index of its range (a participant's key is handed in
+ * as its own descriptor, e.g. tr(<xprv>/0/*) or pk(<WIF>)) */
+static int dpp_musig_keyfn(void* vctx, const unsigned char pub33[33], unsigned char priv[32]){
+    dpp_ctx_t* c = (dpp_ctx_t*)vctx;
+    for (int di = 0; di < c->n; di++){
+        descr_t* d = c->v[di].d;
+        for (long idx = c->v[di].lo; idx <= c->v[di].hi; idx++)
+            for (int k = 0; k < d->nk; k++){
+                unsigned char pub[65]; int pl = 0;
+                if (!descr_key_pub_at(d, k, idx, pub, &pl) || pl != 33 || memcmp(pub, pub33, 33)) continue;
+                int comp = 1; if (descr_key_priv_at(d, k, idx, priv, &comp)) return 1;
+            }
+    }
+    return 0;
+}
+/* descriptorprocesspsbt's Updater step for musig() (2026-09-01): for every
+ * input whose witness_utxo is a tr(musig(...)) / rawtr(musig(...)) expansion
+ * of one of the descriptors, add what Core's UpdatePSBTInput adds and the
+ * MuSig2 signer consumes: PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS (0x1a, keyed by
+ * the untweaked, underived aggregate; the sorted participants), a
+ * PSBT_IN_TAP_BIP32_DERIVATION (0x16) for the derived key with fingerprint
+ * hash160(aggregate)[0..4] and the musig() path (only when there is one),
+ * and PSBT_IN_TAP_INTERNAL_KEY (0x17) for tr(). Fields already present are
+ * left alone. Returns a malloc'd base64 PSBT, or NULL when nothing changed. */
+static char* dpp_musig_update(const char* b64, dpp_desc_t* dv, int nd){
+    static unsigned char buf[200000]; long blen = 0;
+    if (!crt_b64dec(b64, buf, sizeof buf, &blen) || blen < 5 || memcmp(buf, "psbt\xff", 5)) return NULL;
+    long p = 5;
+    static psbt_kv gkv[FIN_MAXKV]; int gn = psbt_parse_map(buf, blen, &p, gkv, FIN_MAXKV);
+    const psbt_kv* utxk = fin_find(gkv, gn, 0x00); if (!utxk) return NULL;
+    static crt_in_t uin[FIN_MAXIO]; int n_in, sw; unsigned long ost, oen;
+    if (!crt_walk(utxk->v, utxk->vl, uin, FIN_MAXIO, &n_in, &ost, &oen, &sw)) return NULL;
+    static psbt_kv ikv[FIN_MAXIO][FIN_MAXKV]; static int in_n[FIN_MAXIO];
+    for (int i = 0; i < n_in; i++) in_n[i] = psbt_parse_map(buf, blen, &p, ikv[i], FIN_MAXKV);
+    unsigned long n_out; { unsigned long cc; n_out = srw_varint(utxk->v + ost, &cc); }
+    static psbt_kv okv[FIN_MAXIO][FIN_MAXKV]; static int out_n[FIN_MAXIO];
+    for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++) out_n[i] = psbt_parse_map(buf, blen, &p, okv[i], FIN_MAXKV);
+    /* new field storage: at most one aggregate per input */
+    static unsigned char k1a[FIN_MAXIO][34], v1a[FIN_MAXIO][33 * MUSIG2_MAX_KEYS], k16[FIN_MAXIO][33], v16[FIN_MAXIO][1 + 4 + 4 * 40], k17[FIN_MAXIO], v17[FIN_MAXIO][32];
+    static unsigned char k16p[FIN_MAXIO][MUSIG2_MAX_KEYS][33], v16p[FIN_MAXIO][MUSIG2_MAX_KEYS][5 + 4 * (DESCR_MAX_PATH * 2 + 1)];
+    int changed = 0;
+    for (int i = 0; i < n_in; i++){
+        unsigned long long amount; const unsigned char* spk; unsigned long spklen;
+        if (!mu_witness_utxo(ikv[i], in_n[i], &amount, &spk, &spklen)) continue;
+        if (spklen != 34 || spk[0] != 0x51 || spk[1] != 0x20) continue;
+        if (fin_find(ikv[i], in_n[i], 0x1a)) continue;                        /* already updated */
+        for (int di = 0; di < nd; di++){
+            descr_t* d = dv[di].d; int kx = descr_top_key(d);
+            if (kx < 0 || d->keys[kx].kind != DK_MUSIG) continue;
+            int is_tr = d->nodes[d->root].type == DN_TR;
+            if (is_tr && d->nodes[d->root].child[0] >= 0) continue;           /* key-path musig with a script tree: not updated here */
+            int hit = 0;
+            for (long idx = dv[di].lo; idx <= dv[di].hi && !hit; idx++){
+                descr_spk_t sp[4]; if (descr_expand(d, idx, sp, 4) != 1 || sp[0].len != 34 || memcmp(sp[0].spk, spk, 34)) continue;
+                unsigned char agg[33], parts[MUSIG2_MAX_KEYS][33], der[33]; int np = 0, plen = 0; unsigned path[40];
+                if (!descr_musig_info(d, kx, idx, agg, parts, &np, der, path, &plen)) break;
+                hit = 1;
+                k1a[i][0] = 0x1a; memcpy(k1a[i] + 1, agg, 33); memcpy(v1a[i], parts, (size_t)np * 33);
+                if (in_n[i] + 3 > FIN_MAXKV) break;
+                ikv[i][in_n[i]].k = k1a[i]; ikv[i][in_n[i]].kl = 34; ikv[i][in_n[i]].v = v1a[i]; ikv[i][in_n[i]].vl = (unsigned long)np * 33; in_n[i]++;
+                if (plen > 0){
+                    k16[i][0] = 0x16; memcpy(k16[i] + 1, der + 1, 32);
+                    unsigned char fp[20]; hash160(fp, agg, 33);
+                    v16[i][0] = 0; memcpy(v16[i] + 1, fp, 4);
+                    for (int t = 0; t < plen; t++){ unsigned char* z = v16[i] + 5 + 4 * t; z[0] = (unsigned char)path[t]; z[1] = (unsigned char)(path[t] >> 8); z[2] = (unsigned char)(path[t] >> 16); z[3] = (unsigned char)(path[t] >> 24); }
+                    int dup = 0; for (int q = 0; q < in_n[i]; q++) if (ikv[i][q].kl == 33 && ikv[i][q].k[0] == 0x16 && !memcmp(ikv[i][q].k + 1, der + 1, 32)) dup = 1;
+                    if (!dup){ ikv[i][in_n[i]].k = k16[i]; ikv[i][in_n[i]].kl = 33; ikv[i][in_n[i]].v = v16[i]; ikv[i][in_n[i]].vl = 5 + 4 * (unsigned long)plen; in_n[i]++; }
+                }
+                if (is_tr && !fin_find(ikv[i], in_n[i], 0x17)){
+                    k17[i] = 0x17; memcpy(v17[i], der + 1, 32);
+                    ikv[i][in_n[i]].k = &k17[i]; ikv[i][in_n[i]].kl = 1; ikv[i][in_n[i]].v = v17[i]; ikv[i][in_n[i]].vl = 32; in_n[i]++;
+                }
+                /* one TAP_BIP32_DERIVATION per participant, as Core's UpdatePSBTInput writes them: the
+                 * key's origin when it has one, else the xpub's own fingerprint + path, else the bare
+                 * key's hash160 prefix with an empty path -- what lets every signer find its key */
+                const descr_key_t* mk = &d->keys[kx];
+                for (int q = 0; q < mk->musig_n && in_n[i] + 1 <= FIN_MAXKV; q++){
+                    const descr_key_t* pkey = &d->keys[mk->musig_parts[q]];
+                    unsigned char ppub[65]; int ppl = 0;
+                    if (!descr_key_pub_at(d, mk->musig_parts[q], idx, ppub, &ppl) || ppl != 33) continue;
+                    unsigned char* kk = k16p[i][q]; unsigned char* vv = v16p[i][q];
+                    kk[0] = 0x16; memcpy(kk + 1, ppub + 1, 32);
+                    int dup = 0; for (int z = 0; z < in_n[i]; z++) if (ikv[i][z].kl == 33 && ikv[i][z].k[0] == 0x16 && !memcmp(ikv[i][z].k + 1, ppub + 1, 32)) dup = 1;
+                    if (dup) continue;
+                    unsigned pp[DESCR_MAX_PATH * 2 + 1]; int pn = 0;
+                    vv[0] = 0;
+                    if (pkey->has_origin){ memcpy(vv + 1, pkey->origin_fp, 4); for (int z = 0; z < pkey->origin_len && pn < DESCR_MAX_PATH * 2; z++) pp[pn++] = pkey->origin[z]; }
+                    else { unsigned char h[20]; hash160(h, pkey->pub, (pkey->kind == DK_XPUB || pkey->kind == DK_XPRV) ? 33 : pkey->publen); memcpy(vv + 1, h, 4); }
+                    if (pkey->kind == DK_XPUB || pkey->kind == DK_XPRV){
+                        for (int z = 0; z < pkey->pathlen && pn < DESCR_MAX_PATH * 2; z++) pp[pn++] = pkey->path[z];
+                        if (pkey->ranged && pn < DESCR_MAX_PATH * 2) pp[pn++] = (unsigned)idx | (pkey->range_hard ? 0x80000000u : 0);
+                    }
+                    for (int z = 0; z < pn; z++){ unsigned char* w = vv + 5 + 4 * z; w[0] = (unsigned char)pp[z]; w[1] = (unsigned char)(pp[z] >> 8); w[2] = (unsigned char)(pp[z] >> 16); w[3] = (unsigned char)(pp[z] >> 24); }
+                    ikv[i][in_n[i]].k = kk; ikv[i][in_n[i]].kl = 33; ikv[i][in_n[i]].v = vv; ikv[i][in_n[i]].vl = 5 + 4 * (unsigned long)pn; in_n[i]++;
+                }
+                changed = 1;
+            }
+            if (hit) break;
+        }
+    }
+    if (!changed) return NULL;
+    static unsigned char out[220000]; long o = 0;
+    memcpy(out, "psbt\xff", 5); o = 5;
+    o += psbt_ser_map(out + o, gkv, gn);
+    for (int i = 0; i < n_in; i++) o += psbt_ser_map(out + o, ikv[i], in_n[i]);
+    for (unsigned long i = 0; i < n_out && i < FIN_MAXIO; i++) o += psbt_ser_map(out + o, okv[i], out_n[i]);
+    char* b = malloc((size_t)((o + 2) / 3) * 4 + 1); if (!b) return NULL;
+    crt_b64(b, out, o);
+    return b;
+}
+#define DPP_MAX_DESCS 16
+/* the descriptors argument -> parsed descriptors with ranges; a multipath descriptor expands to one entry per path */
+static int dpp_load_descs(const rj_val* da, descr_t* descs, dpp_desc_t* dv, int cap, int* nd_out, long* ec, const char** em){
+    int nd = 0;
+    static char perr[300];
+    if ((int)da->nitems > cap){ *ec = -8; *em = "Too many descriptors"; return 0; }
+    for (unsigned long i = 0; i < da->nitems; i++){
+        const rj_val* o = da->items[i]; const char* ds = NULL; long lo = 0, hi = 1000;
+        if (o->typ == RJ_STR) ds = o->str;
+        else if (o->typ == RJ_OBJ){
+            rj_val* dv0 = rj_obj_get(o, "desc"); if (dv0 && dv0->typ == RJ_STR) ds = dv0->str;
+            rj_val* rv = rj_obj_get(o, "range");
+            if (rv && rv->typ == RJ_NUM) hi = strtol(rv->str, NULL, 10);
+            else if (rv && rv->typ == RJ_ARR && rv->nitems == 2 && rv->items[0]->typ == RJ_NUM && rv->items[1]->typ == RJ_NUM){
+                lo = strtol(rv->items[0]->str, NULL, 10); hi = strtol(rv->items[1]->str, NULL, 10); }
+        }
+        if (!ds){ *ec = -8; *em = "Descriptor needs to be provided in scan object"; return 0; }
+        char e[256];
+        if (nd >= cap){ *ec = -8; *em = "Too many descriptors"; return 0; }
+        if (!descr_parse(ds, &descs[nd], e, sizeof e)){ snprintf(perr, sizeof perr, "%s", e); *ec = -5; *em = perr; return 0; }
+        if (!descs[nd].ranged){ lo = 0; hi = 0; }
+        if (lo < 0 || hi < lo || hi - lo > 100000){ *ec = -8; *em = "Invalid range"; return 0; }
+        dv[nd].d = &descs[nd]; dv[nd].lo = lo; dv[nd].hi = hi; nd++;
+        /* BIP389: every further expansion is a descriptor of its own */
+        for (int sel = 1; sel < descr_multipath_n(&descs[nd-1]); sel++){
+            if (nd >= cap){ *ec = -8; *em = "Too many descriptors"; return 0; }
+            descs[nd] = descs[nd-1]; descr_multipath_select(&descs[nd], sel);
+            dv[nd].d = &descs[nd]; dv[nd].lo = lo; dv[nd].hi = hi; nd++;
+        }
+    }
+    *nd_out = nd; return 1;
+}
+int rpc_cmd_descriptorprocesspsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    const char* b64 = rpc_param_str(params, 0, ec, em); if (!b64) return 0;
+    if (params->nitems < 2 || params->items[1]->typ != RJ_ARR){ *ec = -8; *em = "descriptors must be an array of descriptor strings or {desc,range} objects"; return 0; }
+    const char* sht = (params->nitems >= 3 && params->items[2]->typ == RJ_STR) ? params->items[2]->str : NULL;
+    int finalize = 1;
+    if (params->nitems >= 5 && params->items[4]->typ == RJ_BOOL) finalize = params->items[4]->str[0]=='1';
+    static descr_t descs[DPP_MAX_DESCS]; static dpp_desc_t dv[DPP_MAX_DESCS]; int nd = 0;
+    if (!dpp_load_descs(params->items[1], descs, dv, DPP_MAX_DESCS, &nd, ec, em)) return 0;
+    dpp_ctx_t ctx = { dv, nd };
+    /* ==== Updater (psbt_update.c): scripts, bip32 origins, taproot leaves/control blocks/derivs ==== */
+    /* the Updater runs inside psbt_process, on the v0-shaped buffer, version preserved */
+    int rc = psbt_process(b64, 1, sht, finalize, dpp_signer, &ctx, dpp_musig_keyfn, dv, nd, ec, em, result);
+    return rc;
 }
 
 /* The wallet/util subset rpc_commands.c dispatches itself. At file scope
@@ -2857,7 +4501,7 @@ int rpc_dispatch(const char* method, const rj_val* params,
             }
             *err_code = 32603; *err_msg = "wallet seed not configured"; return 0;
         }
-        return cmd_getnewaddr(method, w, result);
+        return cmd_getnewaddr(method, params, w, err_code, err_msg, result);
     }
     if (!strcmp(method, "validateaddress") || !strcmp(method, "getaddressinfo"))
         return cmd_validate(method, params, err_code, err_msg, result);
@@ -2930,15 +4574,8 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_finalizepsbt(params, err_code, err_msg, result);
     if (!strcmp(method, "utxoupdatepsbt"))
         return cmd_utxoupdatepsbt(params, err_code, err_msg, result);
-    if (!strcmp(method, "descriptorprocesspsbt")){
-        *err_code = -1;
-        *err_msg = "this node cannot sign from descriptors: the descriptor engine "
-                   "derives addresses and scripts (deriveaddresses/getdescriptorinfo) "
-                   "but has no path from a descriptor to a spending key, so there is "
-                   "nothing to sign a PSBT with. Use signrawtransactionwithwallet on "
-                   "the extracted transaction";
-        return 0;
-    }
+    if (!strcmp(method, "descriptorprocesspsbt"))
+        return rpc_cmd_descriptorprocesspsbt(params, err_code, err_msg, result);
     /* the rest of Core's Wallet category (rpc_wallet_ops.c) -- labels, wallet
      * inventory, output locks, message signing, descriptor reporting, and the
      * lifecycle methods a single-seed wallet cannot honour. */

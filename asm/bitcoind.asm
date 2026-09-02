@@ -67,17 +67,22 @@ node_make_version:
     ; user_agent varstr at +80: len byte + UA bytes. Length is DERIVED at
     ; assembly time from version.inc (%strlen), so it can never drift from the
     ; string itself.
-    mov  byte [r12+80], NODE_UA_LEN
-    lea  rsi, [rel ua]
+    ; 2026-09-01: the UA is read from node_ua_buf/node_ua_len at RUNTIME so
+    ; daemon/main.c can append -uacomment (Core: "/Name:ver(c1; c2)/"). The
+    ; buffer starts as NODE_UA_STRING, so targets that never touch it keep
+    ; the assembly-time identity. Max 255 bytes (one-byte varstr length).
+    mov  rcx, [rel node_ua_len]
+    mov  byte [r12+80], cl
+    lea  rsi, [rel node_ua_buf]
     lea  rdi, [r12+81]
-    mov  rcx, NODE_UA_LEN
     rep  movsb
-    ; start_height u32 then relay byte (cursor-relative: after 81+UA_LEN)
-    lea  rdi, [r12+81+NODE_UA_LEN]
+    ; start_height u32 then relay byte (cursor-relative: rdi is past the UA)
     mov  dword [rdi], 0
-    mov  byte [rdi+4], 1
+    mov  al, [rel node_relay_flag]
+    mov  byte [rdi+4], al
     ; total length = 81 + UA_LEN + 4 + 1 -- derived, no hardcoded total
-    mov  rax, 81 + NODE_UA_LEN + 5
+    mov  rax, [rel node_ua_len]
+    add  rax, 81 + 5
     pop  r12
     pop  rbx
     pop  rbp
@@ -92,8 +97,11 @@ node_handshake:
     push r13
     push r14
     push r15
-    sub  rsp, 0x338        ; locals ALL below save area (rbp-8..-40):
-                           ; version payload @ rbp-0xa0 (>=112B: 81+UA26+5)
+    sub  rsp, 0x538        ; locals ALL below save area (rbp-8..-40):
+                           ; version payload @ rbp-0x538 (512 B: 81+UA<=255+5;
+                           ;   moved from rbp-0xa0 on 2026-09-01 when the UA
+                           ;   became runtime-sized for -uacomment; the old
+                           ;   slot held 120 B). 0x28+0x538 = 0x560: aligned.
                            ; cmd[12]      @ rbp-0xe0 (-0xe0..-0xd5)
                            ; plen(4)      @ rbp-0xc8
                            ; payload buf  @ rbp-0x2e0 (cap 0x100=256)
@@ -118,14 +126,14 @@ node_handshake:
     mov  r12, rdi           ; fd
     mov  qword [rel g_peer_wants_addrv2], 0   ; per-handshake: the peer has not asked yet
     ; build version payload
-    lea  rdi, [rbp-0xa0]
+    lea  rdi, [rbp-0x538]
     call node_make_version
     mov  r13, rax
     ; send version
     mov  rdi, r12
     lea  rsi, [rel _version]
     mov  rdx, 7
-    lea  rcx, [rbp-0xa0]
+    lea  rcx, [rbp-0x538]
     mov  r8, r13
     call p2p_write
     cmp  rax, 24
@@ -229,7 +237,7 @@ node_handshake:
 .fail:
     mov  eax, 0
 .ret:
-    add  rsp, 0x338
+    add  rsp, 0x538
     pop  r15
     pop  r14
     pop  r13
@@ -264,7 +272,9 @@ node_accept_handshake:
     push r13
     push r14
     push r15
-    sub  rsp, 0x400        ; 5 pushes (0x28) + 0x400 = 0x428 -> RSP 8 mod 16 at
+    sub  rsp, 0x600        ; 5 pushes (0x28) + 0x600 = 0x628 -> RSP 8 mod 16 at
+                           ; (2026-09-01: +0x200 for the runtime-sized UA; our
+                           ; version now lives at rbp-0x600, 512 B)
                            ; every call (matches the node_* call parity). Locals
                            ; ALL below the save area (rbp-8..-40):
                            ; cmd[12]        @ rbp-0x48
@@ -316,15 +326,26 @@ node_accept_handshake:
     lea  rdi, [rel g_peer_version_payload]
     lea  rsi, [rbp-0x300]
     rep  movsb
+    ; relay policy hook (C): decides fRelay for THIS peer from its version + permissions
+    mov  rax, [rel g_accept_version_hook]
+    test rax, rax
+    jz   .no_avh
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16                ; C callee: align explicitly
+    call rax
+    mov  rsp, rbp
+    pop  rbp
+.no_avh:
     ; build our version reply
-    lea  rdi, [rbp-0x180]
+    lea  rdi, [rbp-0x600]
     call node_make_version
-    mov  r13, rax          ; payload len (128) -- callee-saved
+    mov  r13, rax          ; payload len -- callee-saved
     ; send our version
     mov  rdi, r12
     lea  rsi, [rel _version]
     mov  rdx, 7
-    lea  rcx, [rbp-0x180]
+    lea  rcx, [rbp-0x600]
     mov  r8, r13
     call p2p_write
     cmp  rax, 24
@@ -400,7 +421,7 @@ node_accept_handshake:
 .fail:
     mov  eax, 0
 .ret:
-    add  rsp, 0x400
+    add  rsp, 0x600
     pop  r15
     pop  r14
     pop  r13
@@ -2106,6 +2127,24 @@ sync_fail_code: resd 1                     ; which .fail exit node_sync_multi to
 section .data
 align 16
 ua: db NODE_UA_STRING   ; user-agent from version.inc (length derived via %strlen)
+; runtime user agent (2026-09-01): starts as NODE_UA_STRING; daemon/main.c
+; rewrites it with -uacomment appended. node_relay_flag is the version
+; message's fRelay byte (1 = we accept tx relay from this peer); main.c
+; clears it for the inbound handshakes that -inboundrelaypercent excludes.
+global node_ua_buf
+global node_ua_len
+global node_relay_flag
+; called by node_accept_handshake after the peer's version is captured and
+; BEFORE ours is built: main.c sets node_relay_flag / feefilter for this peer
+; from the relay policy (2026-09-01). 0 = no hook.
+global g_accept_version_hook
+g_accept_version_hook: dq 0
+align 16
+node_ua_buf: db NODE_UA_STRING
+             times (256 - NODE_UA_LEN) db 0
+node_ua_len: dq NODE_UA_LEN
+node_relay_flag: db 1
+                 times 7 db 0
 
 ; ---- the services we advertise in our own `version` --------------------------
 ; NODE_NETWORK(1) | NODE_WITNESS(8) by default. daemon/main.c ORs in

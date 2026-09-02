@@ -83,6 +83,7 @@ typedef struct {
      * selection fails rather than defaulting to something. */
     const unsigned char* signet_challenge;
     long                 signet_challenge_len;
+    const char*  assumevalid;     /* Core defaultAssumeValid (display hex) or NULL; assumevalid=0 turns it off */
 } chainparams_t;
 
 /* The selected chain. Statically CHAIN_MAIN. */

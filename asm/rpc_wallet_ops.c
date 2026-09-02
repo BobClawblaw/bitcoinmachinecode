@@ -369,6 +369,16 @@ static int wop_exists(const char* rel){
  * the legacy layout (the chain directory, or data/ beneath it). Set by
  * main.c from the config so this file carries no node_config dependency. */
 void rpc_wops_set_walletdir(const char* d){ snprintf(g_walletdir, sizeof g_walletdir, "%s", d ? d : ""); }
+static rpc_wops_defaults g_wdef = { WOT_BECH32, -1, 6, 1, 1, 1000, 0, 10000, 10000, 0, 0, 1 };
+static int g_wdef_set = 0;   /* 0 = pre-config behaviour (min-relay fallback when the estimator is empty) */
+void rpc_wops_set_defaults(const rpc_wops_defaults* d){ if (d){ g_wdef = *d; g_wdef_set = 1; } }
+int rpc_wops_default_type(int is_change){
+    if (!is_change) return g_wdef.addresstype;
+    if (g_wdef.changetype >= 0) return g_wdef.changetype;
+    /* Core's rule when -changetype is unset: legacy wallets make legacy
+     * change, everything else bech32 (the "implementation detail") */
+    return g_wdef.addresstype == WOT_LEGACY ? WOT_LEGACY : WOT_BECH32;
+}
 const char* rpc_wops_walletdir(void){ return g_walletdir; }
 static const char* wop_wallet_prefix(void){
     static char pfx[96];
@@ -1024,11 +1034,12 @@ static int wop_master_fp(const unsigned char seed[64], char out[9]){
     snprintf(out, 9, "%02x%02x%02x%02x", h[0], h[1], h[2], h[3]);
     return 1;
 }
+int rpc_wops_master_fp(const void* seed, char out[9]){ return wop_master_fp((const unsigned char*)seed, out); }
 
-static rj_val* wop_desc_entry(const unsigned char seed[64], int is_change){
+static rj_val* wop_desc_entry_t(const unsigned char seed[64], int t, int is_change){
     char mfp[9];
     if (!wop_master_fp(seed, mfp)) return NULL;
-    unsigned idx[5] = {0x80000000u | 84u, 0x80000000u, 0x80000000u, 0, (unsigned)is_change};
+    unsigned idx[5]; rpc_wops_type_path(t, 0, is_change, idx);
     unsigned char k[32], c[32], pub[33];
     if (bip32_derive_path(k, c, seed, 64, idx, 5) != 1) return NULL;
     scalar_to_pubkey(pub, k);
@@ -1037,7 +1048,11 @@ static rj_val* wop_desc_entry(const unsigned char seed[64], int is_change){
     for (int i = 0; i < 33; i++){ pubhex[i*2] = H[pub[i]>>4]; pubhex[i*2+1] = H[pub[i]&15]; }
     pubhex[66] = 0;
     char inner[256];
-    snprintf(inner, sizeof inner, "wpkh([%s/84h/0h/0h/0/%d]%s)", mfp, is_change, pubhex);
+    unsigned purpose = idx[0] & 0x7fffffffu;
+    if (t == WOT_LEGACY)           snprintf(inner, sizeof inner, "pkh([%s/%uh/0h/0h/0/%d]%s)", mfp, purpose, is_change, pubhex);
+    else if (t == WOT_P2SH_SEGWIT) snprintf(inner, sizeof inner, "sh(wpkh([%s/%uh/0h/0h/0/%d]%s))", mfp, purpose, is_change, pubhex);
+    else if (t == WOT_BECH32M)     snprintf(inner, sizeof inner, "tr([%s/%uh/0h/0h/0/%d]%s)", mfp, purpose, is_change, pubhex + 2);   /* x-only, as Core prints tr() keys */
+    else                           snprintf(inner, sizeof inner, "wpkh([%s/%uh/0h/0h/0/%d]%s)", mfp, purpose, is_change, pubhex);
     char cks[9];
     char desc[288];
     if (rpc_chain_desc_checksum(inner, cks)) snprintf(desc, sizeof desc, "%s#%s", inner, cks);
@@ -1050,6 +1065,8 @@ static rj_val* wop_desc_entry(const unsigned char seed[64], int is_change){
     rj_obj_set(e, "active", rj_bool(1));
     rj_obj_set(e, "internal", rj_bool(is_change));
     return e;
+}
+static rj_val* wop_desc_entry(const unsigned char seed[64], int is_change){ return wop_desc_entry_t(seed, WOT_BECH32, is_change);
 }
 
 static int cmd_listdescriptors(const rj_val* params, const rpc_wallet* w,
@@ -1084,9 +1101,13 @@ static int cmd_listdescriptors(const rj_val* params, const rpc_wallet* w,
     }
     if (!w || !w->seed) return wop_err(ec, em, -4, "No wallet is loaded");
     rj_val* arr = rj_arr();
-    for (int ch = 0; ch <= 1; ch++){
-        rj_val* e = wop_desc_entry(w->seed, ch);
-        if (e) rj_arr_push(arr, e);
+    int mask = rpc_wops_active_types();
+    for (int t = 0; t < 4; t++){
+        if (!(mask & (1 << t))) continue;
+        for (int ch = 0; ch <= 1; ch++){
+            rj_val* e = wop_desc_entry_t(w->seed, t, ch);
+            if (e) rj_arr_push(arr, e);
+        }
     }
     rj_val* o = rj_obj();
     rj_obj_set(o, "wallet_name", rj_str(rpc_wops_active_wallet_name()));
@@ -1270,7 +1291,7 @@ static int cmd_migratewallet(const rj_val* params, long* ec, const char** em){
  * see funds paid to it. Refusing is the honest answer until the scan and the
  * address path learn those script types. */
 static int cmd_createwalletdescriptor(const rj_val* params, const rpc_wallet* w,
-                                      long* ec, const char** em){
+                                      long* ec, const char** em, rj_val** res){
     const char* type = wop_str_arg(params, 0);
     if (!type || !type[0])
         return wop_err(ec, em, -8, "createwalletdescriptor requires an address type");
@@ -1288,19 +1309,25 @@ static int cmd_createwalletdescriptor(const rj_val* params, const rpc_wallet* w,
                 "watch-only wallet. Use importdescriptors instead.");
         return wop_err(ec, em, -4, "No wallet is loaded");
     }
-    if (!strcmp(type, "bech32"))
-        /* True for the seed AND for every added key: addhdkey puts a key
-         * straight into the derivation window, so its wpkh descriptors exist
-         * from that moment -- there is no separate materialisation step for
-         * this call to perform. gethdkeys lists them; listdescriptors shows
-         * the seed's. */
-        return wop_err(ec, em, -4, "Descriptor already exists");
-    snprintf(msg, sizeof msg,
-             "this wallet derives only wpkh (bech32) keys: its rescan matches "
-             "P2WPKH scripts and getnewaddress hands out bech32 addresses, so a "
-             "'%s' descriptor would never be recognised or used. bech32 already "
-             "exists; see listdescriptors.", type);
-    return wop_err(ec, em, -4, msg);
+    /* bech32 is always present (for the seed AND every addhdkey key, which
+     * join the derivation window the moment they are added); the other three
+     * are activated here (2026-09-01): their descriptors join listdescriptors,
+     * their keys join the rescan window, getnewaddress can hand them out and
+     * the wallet signs for them (P2PKH / P2SH-P2WPKH / P2TR key path). */
+    int t = rpc_wops_type_from_name(type);
+    if (t < 0) { snprintf(msg, sizeof msg, "Unknown address type '%s'", type); return wop_err(ec, em, -5, msg); }
+    int r = rpc_wops_activate_type(t);
+    if (r == 0) return wop_err(ec, em, -4, "Descriptor already exists");
+    if (r < 0)  return wop_err(ec, em, -4, "could not record the new descriptor in the wallet directory");
+    /* Core: {"descs": [<external>, <internal>]} */
+    rj_val* descs = rj_arr();
+    for (int ch = 0; ch <= 1; ch++){
+        rj_val* e = wop_desc_entry_t(w->seed, t, ch);
+        if (e){ rj_val* d = rj_obj_get(e, "desc"); if (d) rj_arr_push(descs, rj_str(d->str)); rj_free(e); }
+    }
+    rj_val* o = rj_obj(); rj_obj_set(o, "descs", descs);
+    *res = o;
+    return 1;
 }
 
 static int cmd_exportwatchonlywallet(const rj_val* params, const rpc_wallet* w,
@@ -1314,8 +1341,9 @@ static int cmd_exportwatchonlywallet(const rj_val* params, const rpc_wallet* w,
     long ranges[WOP_MAX_DESCS], nexts[WOP_MAX_DESCS];
     int nd = 0;
     if (w && w->seed){
-        for (int ch = 0; ch <= 1 && nd < WOP_MAX_DESCS; ch++){
-            rj_val* e = wop_desc_entry(w->seed, ch);
+        int mask = rpc_wops_active_types();
+        for (int t = 0; t < 4; t++) for (int ch = 0; (mask & (1 << t)) && ch <= 1 && nd < WOP_MAX_DESCS; ch++){
+            rj_val* e = wop_desc_entry_t(w->seed, t, ch);
             if (!e) continue;
             rj_val* d = rj_obj_get(e, "desc");
             if (d && d->str){
@@ -1546,7 +1574,7 @@ void rpc_wops_set_scanner(long (*read_block)(long, unsigned char*, long),
  * per added key keeps the matcher (searched once per output of every
  * transaction in the chain) from growing by an order of magnitude. */
 #define WOP_HDK_WINDOW 100
-#define WOP_KEYSET_CAP (WOP_SCAN_KEYS*2 + WOP_MAX_HDKEYS*WOP_HDK_WINDOW*2)
+#define WOP_KEYSET_CAP (WOP_SCAN_KEYS*2*4 + WOP_MAX_HDKEYS*WOP_HDK_WINDOW*2)   /* x4: one window per output type */
 
 extern int  bip32_derive_path(unsigned char k[32], unsigned char c[32],
                               const unsigned char* seed, long seedlen,
@@ -1627,16 +1655,23 @@ static int wop_keyset_cached(const rpc_wallet* w, const wscan_key** out){
 int wop_keyset(const rpc_wallet* w, wscan_key* keys, int cap){
     if (!w || !w->seed) return 0;
     int n = 0;
-    for (unsigned i = 0; i < WOP_SCAN_KEYS && n + 2 <= cap; i++){
-        for (int b = 0; b <= 1; b++){
-            unsigned path[5] = {0x80000000u|84u, 0x80000000u, 0x80000000u, i, (unsigned)b};
-            unsigned char k[32], c[32], pub[33];
-            if (bip32_derive_path(k, c, w->seed, 64, path, 5) != 1) continue;
-            scalar_to_pubkey(pub, k);
-            hash160(keys[n].h160, pub, 33);
-            keys[n].keyidx = i; keys[n].branch = (unsigned char)b;
-            keys[n].hdkey = 0;                     /* 0 = the wallet's own seed */
-            n++;
+    /* every ACTIVE output type gets its own window over its own purpose path;
+     * the 20 bytes stored are what the chain scan matches: the key hash for
+     * pkh/wpkh, the script hash for sh(wpkh), the first 20 of Q for tr */
+    int mask = rpc_wops_active_types();
+    for (int t = 0; t < 4; t++){
+        if (!(mask & (1 << t))) continue;
+        for (unsigned i = 0; i < WOP_SCAN_KEYS && n + 2 <= cap; i++){
+            for (int b = 0; b <= 1; b++){
+                unsigned path[5]; rpc_wops_type_path(t, i, b, path);
+                unsigned char k[32], c[32], pub[33], spk[34]; unsigned long sl;
+                if (bip32_derive_path(k, c, w->seed, 64, path, 5) != 1) continue;
+                scalar_to_pubkey(pub, k);
+                if (!rpc_wops_type_spk(t, pub, spk, &sl, keys[n].h160)) continue;
+                keys[n].keyidx = i; keys[n].branch = WOT_BRANCH(t, b);
+                keys[n].hdkey = 0;                     /* 0 = the wallet's own seed */
+                n++;
+            }
         }
     }
     /* ...then every key ADDED by addhdkey. They join the same window, so the
@@ -1687,6 +1722,17 @@ static int cmd_importdescriptors(const rj_val* params, const rpc_wallet* w,
         const rj_val* q = reqs->items[i];
         const rj_val* dv = q->typ == RJ_OBJ ? rj_obj_get((rj_val*)q, "desc") : NULL;
         char norm[340]; char err[192]; int is_range = 0;
+        /* BIP389: a multipath descriptor imports as one descriptor per expansion
+         * (Core: the first path receives, the second is change) */
+        static char mpx[8][340]; int nmp = 1;
+        if (dv && dv->typ == RJ_STR && strchr(dv->str, '<')){
+            extern int rpc_desc_multipath_expand(const char* in, char (*out)[340], int cap, char* err, unsigned long errcap);
+            nmp = rpc_desc_multipath_expand(dv->str, mpx, 8, err, sizeof err);
+            if (nmp <= 0){ rj_obj_set(r, "success", rj_bool(0)); rj_val* e = rj_obj(); rj_obj_set(e, "code", rj_numf("%d", -5)); rj_obj_set(e, "message", rj_str(err)); rj_obj_set(r, "error", e); rj_arr_push(arr, r); continue; }
+        }
+        for (int mp = 0; mp < nmp; mp++){
+        const char* dtext = nmp > 1 ? mpx[mp] : dv->str;
+        if (mp > 0){ r = rj_obj(); }
         if (!dv || dv->typ != RJ_STR){
             rj_obj_set(r, "success", rj_bool(0));
             rj_val* e = rj_obj();
@@ -1695,7 +1741,7 @@ static int cmd_importdescriptors(const rj_val* params, const rpc_wallet* w,
             rj_obj_set(r, "error", e);
             rj_arr_push(arr, r); continue;
         }
-        if (!rpc_desc_normalize(dv->str, norm, sizeof norm, &is_range, err, sizeof err)){
+        if (!rpc_desc_normalize(dtext, norm, sizeof norm, &is_range, err, sizeof err)){
             rj_obj_set(r, "success", rj_bool(0));
             rj_val* e = rj_obj();
             rj_obj_set(e, "code", rj_numf("%d", -5));
@@ -1735,7 +1781,8 @@ static int cmd_importdescriptors(const rj_val* params, const rpc_wallet* w,
         rj_arr_push(wa, rj_str("run rescanblockchain to discover this descriptor's "
                                "history (this node does not rescan on import)"));
         rj_obj_set(r, "warnings", wa);
-        rj_arr_push(arr, r);
+        if (mp == 0) rj_arr_push(arr, r); else rj_free(r);   /* Core answers one result per request */
+        }   /* expansions */
     }
     if (added){ wop_descs_save(); g_wk_n = -1; wop_records_invalidate(); }
     *res = arr;
@@ -1778,6 +1825,31 @@ static int wop_rec_h160(const wscan_key* keys, int nk, const wscan_rec* r, unsig
 
 /* The wallet's own P2WPKH address for a key, as getnewaddress renders it. */
 extern long wallet_p2wpkh_address(char* out, long cap, const unsigned char h160[20]);
+extern int  wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen);
+/* the address of a key-window entry, by its output type: the stored 20 bytes
+ * are the key hash (wpkh/pkh) or script hash (sh) directly; a tr entry holds
+ * only the first 20 bytes of Q, so it is re-derived from the cached seed */
+static int wop_key_address(const wscan_key* k, char* out, long cap){
+    int t = WOT_TYPE(k->branch); unsigned char spk[34]; unsigned long sl = 0;
+    if (t == WOT_BECH32){ spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, k->h160, 20); sl = 22; }
+    else if (t == WOT_LEGACY){ spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3, k->h160, 20); spk[23]=0x88; spk[24]=0xac; sl = 25; }
+    else if (t == WOT_P2SH_SEGWIT){ spk[0]=0xa9; spk[1]=0x14; memcpy(spk+2, k->h160, 20); spk[22]=0x87; sl = 23; }
+    else {
+        if (k->hdkey != 0) return -1;
+        unsigned path[5]; rpc_wops_type_path(t, k->keyidx, WOT_CHAIN(k->branch), path);
+        unsigned char kk[32], cc[32], pub[33], h20[20];
+        if (bip32_derive_path(kk, cc, g_ks_seed, 64, path, 5) != 1) return -1;
+        scalar_to_pubkey(pub, kk);
+        if (!rpc_wops_type_spk(t, pub, spk, &sl, h20)) return -1;
+    }
+    out[0] = 0;
+    return wallet_script_to_address(out, cap, spk, (long)sl) > 0 ? (int)strlen(out) : -1;
+}
+static const wscan_key* wop_rec_key(const wscan_key* keys, int nk, const wscan_rec* r){
+    for (int i = 0; i < nk; i++)
+        if (keys[i].hdkey == r->hdkey && keys[i].keyidx == r->keyidx && keys[i].branch == r->branch) return &keys[i];
+    return NULL;
+}
 
 #define WOP_MAXREC 200000
 static wscan_rec* g_wop_recs;
@@ -1874,8 +1946,21 @@ int rpc_wops_wallet_coins(const void* wseed, rpc_wops_coin* out, int cap){
         c->height = recs[i].height;
         c->is_coinbase = recs[i].is_coinbase ? 1 : 0;
         c->branch = recs[i].branch;
-        memset(c->h160, 0, 20);
-        if (keys) wop_rec_h160(keys, nk, &recs[i], c->h160);
+        memset(c->h160, 0, 20); c->spklen = 0; c->redeemlen = 0;
+        if (keys && wop_rec_h160(keys, nk, &recs[i], c->h160)){
+            int t = WOT_TYPE(c->branch);
+            if (t == WOT_BECH32M){                       /* the window holds 20 of Q's 32 bytes: re-derive */
+                unsigned path[5]; rpc_wops_type_path(t, recs[i].keyidx, WOT_CHAIN(c->branch), path);
+                unsigned char kk[32], cc[32], pub[33], h20[20];
+                if (recs[i].hdkey == 0 && bip32_derive_path(kk, cc, w.seed, 64, path, 5) == 1){ scalar_to_pubkey(pub, kk); rpc_wops_type_spk(t, pub, c->spk, &c->spklen, h20); }
+            } else if (t == WOT_LEGACY){ c->spk[0]=0x76;c->spk[1]=0xa9;c->spk[2]=0x14;memcpy(c->spk+3,c->h160,20);c->spk[23]=0x88;c->spk[24]=0xac; c->spklen=25; }
+            else if (t == WOT_P2SH_SEGWIT){ c->spk[0]=0xa9;c->spk[1]=0x14;memcpy(c->spk+2,c->h160,20);c->spk[22]=0x87; c->spklen=23;
+                /* redeemScript = 0 <hash160(pub)> from the key at this index */
+                unsigned path[5]; rpc_wops_type_path(t, recs[i].keyidx, WOT_CHAIN(c->branch), path);
+                unsigned char kk[32], cc[32], pub[33], kh[20];
+                if (recs[i].hdkey == 0 && bip32_derive_path(kk, cc, w.seed, 64, path, 5) == 1){ scalar_to_pubkey(pub, kk); hash160(kh, pub, 33); c->redeem[0]=0x00; c->redeem[1]=0x14; memcpy(c->redeem+2, kh, 20); c->redeemlen = 22; } }
+            else { c->spk[0]=0x00; c->spk[1]=0x14; memcpy(c->spk+2, c->h160, 20); c->spklen = 22; }
+        }
         m++;
     }
     return m;
@@ -2040,7 +2125,7 @@ static int cmd_listreceivedbyaddress(const rj_val* params, const rpc_wallet* w,
                 recs[r].branch == keys[i].branch) seen = 1;
         if (!seen && !include_empty) continue;
         char addr[96];
-        if (wallet_p2wpkh_address(addr, sizeof addr, keys[i].h160) < 0) continue;
+        if (wop_key_address(&keys[i], addr, sizeof addr) < 0) continue;
         rj_val* txids = rj_arr();
         unsigned long long total = wop_received_h160(keys[i].h160, minconf, keys, nk, txids);
         if (!total && !include_empty){ rj_free(txids); continue; }
@@ -2133,7 +2218,7 @@ static int cmd_listaddressgroupings(const rpc_wallet* w, long* ec, const char** 
         }
         if (!seen) continue;
         char addr[96];
-        if (wallet_p2wpkh_address(addr, sizeof addr, keys[i].h160) < 0) continue;
+        if (wop_key_address(&keys[i], addr, sizeof addr) < 0) continue;
         rj_val* e = rj_arr();
         rj_arr_push(e, rj_str(addr));
         { char am[32]; rpc_amounts((long long)bal, am, sizeof am);
@@ -2174,10 +2259,10 @@ static int cmd_listsinceblock(const rj_val* params, const rpc_wallet* w,
     static const char* HEX = "0123456789abcdef";
     for (long r = 0; r < n; r++){
         if ((long)recs[r].height <= since) continue;
-        unsigned char h[20];
-        if (!wop_rec_h160(keys, nk, &recs[r], h)) continue;
+        const wscan_key* rk = wop_rec_key(keys, nk, &recs[r]);
+        if (!rk) continue;
         char addr[96];
-        if (wallet_p2wpkh_address(addr, sizeof addr, h) < 0) continue;
+        if (wop_key_address(rk, addr, sizeof addr) < 0) continue;
         rj_val* e = rj_obj();
         rj_obj_set(e, "address", rj_str(addr));
         rj_obj_set(e, "category", rj_str(recs[r].kind == 0 ? "receive" : "send"));
@@ -2333,6 +2418,8 @@ static int wf_coins(const rpc_wallet* w, wf_coin* out, int cap, int minconf){
     for (long i = 0; i < n && m < cap; i++){
         if (recs[i].kind != 0) continue;
         if (wop_confs(recs[i].height) < minconf) continue;
+        /* -spendzeroconfchange=0: our own unconfirmed change stays put */
+        if (!g_wdef.spendzeroconfchange && WOT_CHAIN(recs[i].branch) == 1 && wop_confs(recs[i].height) < 1) continue;
         /* Spent later? Matched on the OUTPOINT the spend record carries --
          * (prev_txid, vout) -- not on a heuristic over value and key. Two
          * equal-valued receives at the same index to the same key would
@@ -2371,7 +2458,7 @@ static int wf_coins(const rpc_wallet* w, wf_coin* out, int cap, int minconf){
 
 static unsigned long long wf_feerate_sat_kvb(int conf_target){
     rj_val* p = rj_arr();
-    rj_arr_push(p, rj_numf("%d", conf_target > 0 ? conf_target : 6));
+    rj_arr_push(p, rj_numf("%d", conf_target > 0 ? conf_target : g_wdef.txconfirmtarget));
     rj_val* r = NULL; long ec; const char* em;
     rpc_wallet dummy; memset(&dummy, 0, sizeof dummy);
     unsigned long long rate = 0;
@@ -2393,7 +2480,17 @@ static unsigned long long wf_feerate_sat_kvb(int conf_target){
     }
     if (r) rj_free(r);
     rj_free(p);
+    if (rate == 0){
+        /* no estimate: Core uses -fallbackfee, and with it disabled (its
+         * default) refuses to guess. Before the config reached this file the
+         * wallet fell back to the minimum relay rate; that stays the
+         * behaviour of a wallet nobody configured (tests, tools). */
+        if (!g_wdef_set) rate = WF_MIN_RELAY_SAT_KVB;
+        else if (g_wdef.fallbackfee_satkvb > 0) rate = (unsigned long long)g_wdef.fallbackfee_satkvb;
+        else return 0;                                  /* caller: "Fee estimation failed..." */
+    }
     if (rate < WF_MIN_RELAY_SAT_KVB) rate = WF_MIN_RELAY_SAT_KVB;
+    if (g_wdef.mintxfee_satkvb > 0 && rate < (unsigned long long)g_wdef.mintxfee_satkvb) rate = (unsigned long long)g_wdef.mintxfee_satkvb;   /* -mintxfee */
     return rate;
 }
 
@@ -2416,11 +2513,22 @@ static int wf_select(wf_coin* coins, int ncoins, unsigned long long target,
                      long out_wu, unsigned long long feerate_kvb,
                      int* pick, unsigned long long* fee_out,
                      unsigned long long* change_out){
-    /* sort largest first */
+    /* sort largest first -- or SMALLEST first when the rate is at or below
+     * -consolidatefeerate: Core lets a cheap transaction carry more inputs
+     * than it strictly needs so the UTXO pool shrinks while it is cheap */
+    int consolidate = g_wdef.consolidatefeerate_satkvb > 0 && feerate_kvb <= (unsigned long long)g_wdef.consolidatefeerate_satkvb;
     for (int i = 1; i < ncoins; i++){
         wf_coin k = coins[i]; int j = i - 1;
-        while (j >= 0 && coins[j].value < k.value){ coins[j+1] = coins[j]; j--; }
+        while (j >= 0 && (consolidate ? coins[j].value > k.value : coins[j].value < k.value)){ coins[j+1] = coins[j]; j--; }
         coins[j+1] = k;
+    }
+    /* -discardfee: change that would be dust at that rate (Core's
+     * GetDustThreshold over a P2WPKH output + its ~68 vB spend) is given to
+     * the miner instead of creating an output nobody would spend */
+    unsigned long long dust = WF_DUST_SAT;
+    if (g_wdef.discardfee_satkvb > 0){
+        unsigned long long d = ((31ULL + 68ULL) * (unsigned long long)g_wdef.discardfee_satkvb + 999) / 1000;
+        if (d > dust) dust = d;
     }
     unsigned long long sum = 0;
     int n = 0;
@@ -2434,7 +2542,7 @@ static int wf_select(wf_coin* coins, int ncoins, unsigned long long target,
         unsigned long long fee = ((unsigned long long)wf_vsize(wu) * feerate_kvb + 999) / 1000;
         if (sum < target + fee) continue;
         unsigned long long change = sum - target - fee;
-        if (change < WF_DUST_SAT){
+        if (change < dust){
             /* drop the change output: recompute the fee without it and give
              * the remainder to the miner rather than creating dust */
             long wu2 = WF_OVERHEAD_WU + (long)n * (WF_IN_BASE_WU + WF_IN_WIT_WU) + out_wu;
@@ -2469,7 +2577,8 @@ static long wf_build_unsigned(unsigned char* o, const wf_coin* coins, const int*
         unsigned int vo = coins[pick[i]].vout;
         for (int k=0;k<4;k++) o[p++] = (unsigned char)(vo >> (8*k));
         o[p++] = 0x00;                                              /* empty scriptSig */
-        for (int k=0;k<4;k++) o[p++] = (unsigned char)(0xfffffffdu >> (8*k)); /* RBF */
+        { unsigned int seq = g_wdef.walletrbf ? 0xfffffffdu : 0xfffffffeu;        /* -walletrbf */
+          for (int k=0;k<4;k++) o[p++] = (unsigned char)(seq >> (8*k)); }
     }
     p += wf_vi(o + p, (unsigned long long)nout);
     for (int i = 0; i < nout; i++){
@@ -2527,6 +2636,9 @@ static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
     long out_wu = 0;
     for (int i = 0; i < nout; i++){ target += outs[i].value; out_wu += wf_out_wu(outs[i].spklen); }
     unsigned long long rate = wf_feerate_sat_kvb(conf_target);
+    if (rate == 0)
+        return wop_err(ec, em, -4, "Fee estimation failed. Fallbackfee is disabled. Please either enable "
+                                   "fallbackfee or specify a fee rate.");          /* Core's text */
     int pick[WF_MAX_IN];
     unsigned long long fee = 0, change = 0;
     /* ---- Branch-and-Bound first (Core SelectCoinsBnB; wallet_bnb.c) ----
@@ -2572,6 +2684,25 @@ static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
     }
     if (nin < 0)
         nin = wf_select(coins, nc, target, out_wu, rate, pick, &fee, &change);
+    /* -avoidpartialspends / -maxapsfee: once a destination is being spent
+     * from, spend EVERYTHING that sits on it -- if the extra inputs cost at
+     * most maxapsfee (Core: 0 by default, -1 = regardless of cost). Only the
+     * change-making path can absorb extra inputs; a changeless BnB pick is
+     * left alone (extending it would need a change output). */
+    if (nin > 0 && change > 0 && (g_wdef.avoidpartialspends || g_wdef.maxapsfee_sat != 0) && nin < WF_MAX_IN){
+        unsigned long long extra_fee = 0, extra_val = 0; int added = 0;
+        for (int i = 0; i < nc && nin + added < WF_MAX_IN; i++){
+            int picked = 0; for (int k = 0; k < nin + added; k++) if (pick[k] == i){ picked = 1; break; }
+            if (picked) continue;
+            int same = 0; for (int k = 0; k < nin; k++) if (!memcmp(coins[pick[k]].h160, coins[i].h160, 20)){ same = 1; break; }
+            if (!same) continue;
+            unsigned long long f1 = ((unsigned long long)wf_vsize(WF_IN_BASE_WU + WF_IN_WIT_WU) * rate + 999) / 1000;
+            if (g_wdef.maxapsfee_sat >= 0 && extra_fee + f1 > (unsigned long long)g_wdef.maxapsfee_sat && !g_wdef.avoidpartialspends) break;
+            if (g_wdef.maxapsfee_sat >= 0 && g_wdef.avoidpartialspends && extra_fee + f1 > (unsigned long long)g_wdef.maxapsfee_sat && g_wdef.maxapsfee_sat > 0) break;
+            pick[nin + added++] = i; extra_fee += f1; extra_val += coins[i].value;
+        }
+        if (added){ nin += added; fee += extra_fee; change += extra_val - extra_fee; }
+    }
     if (nin < 0){
         unsigned long long have = 0;
         for (int i = 0; i < nc; i++) have += coins[i].value;
@@ -2663,6 +2794,20 @@ static int wf_sign(const rpc_wallet* w, const char* hex, rj_val* prevtxs,
 static int wf_send(const rpc_wallet* w, const char* signed_hex, char** txid_out,
                    long* ec, const char** em){
     *txid_out = NULL;
+    if (!g_wdef.walletbroadcast){
+        /* -walletbroadcast=0: the transaction is built and signed but never
+         * handed to the mempool; the caller gets its txid (Core keeps it as
+         * an unbroadcast wallet tx) */
+        extern int tx_txid(void* out, const void* tx, unsigned long txlen, void* buf, unsigned long buflen);
+        size_t hl = strlen(signed_hex); unsigned char* raw = malloc(hl / 2 + 1); unsigned char* scratch = malloc(hl / 2 + 64);
+        if (!raw || !scratch){ free(raw); free(scratch); return wop_err(ec, em, -7, "out of memory"); }
+        for (size_t i = 0; i + 1 < hl; i += 2){ unsigned v; sscanf(signed_hex + i, "%2x", &v); raw[i/2] = (unsigned char)v; }
+        unsigned char id[32]; tx_txid(id, raw, hl / 2, scratch, hl / 2 + 64);
+        char* hx = malloc(65); for (int b = 0; b < 32; b++) snprintf(hx + b*2, 3, "%02x", id[31-b]); hx[64] = 0;
+        free(raw); free(scratch);
+        *txid_out = hx;
+        return 1;
+    }
     rj_val* p = rj_arr();
     rj_arr_push(p, rj_str(signed_hex));
     rj_val* r = NULL;
@@ -2936,7 +3081,16 @@ static int cmd_walletcreatefundedpsbt(const rj_val* params, const rpc_wallet* w,
     char* hex; rj_val* pv; unsigned long long fee; int cp;
     if (!wf_fund(w, outs, nout, 6, &hex, &pv, &fee, &cp, ec, em)) return 0;
     rj_free(pv);
-    rj_val* p = rj_arr(); rj_arr_push(p, rj_str(hex));
+    /* options.psbt_version (Core: default 2, 0 or 2) -- the options object is
+     * any object argument after the outputs */
+    long pver = 2;
+    if (params && params->typ == RJ_ARR){ int seen_outs = 0;
+        for (size_t i = 0; i < params->nitems; i++){ const rj_val* a = params->items[i];
+            if (a == outs_arg){ seen_outs = 1; continue; }
+            if (seen_outs && a->typ == RJ_OBJ){ rj_val* v = rj_obj_get((rj_val*)a, "psbt_version");
+                if (v && v->typ == RJ_NUM){ pver = strtol(v->str, 0, 10);
+                    if (pver != 0 && pver != 2){ free(hex); return wop_err(ec, em, -8, "The PSBT version can only be 2 or 0"); } } } } }
+    rj_val* p = rj_arr(); rj_arr_push(p, rj_str(hex)); rj_arr_push(p, rj_bool(0)); rj_arr_push(p, rj_null()); rj_arr_push(p, rj_numf("%ld", pver));
     rj_val* r = NULL;
     int rc = rpc_dispatch("converttopsbt", p, w, &r, ec, em);
     rj_free(p);
@@ -3666,7 +3820,7 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
     if (!strcmp(m, "exportwatchonlywallet"))
         return cmd_exportwatchonlywallet(params, w, ec, em, res);
     if (!strcmp(m, "createwalletdescriptor"))
-        return cmd_createwalletdescriptor(params, w, ec, em);
+        return cmd_createwalletdescriptor(params, w, ec, em, res);
     if (!strcmp(m, "importprunedfunds"))
         return cmd_importprunedfunds(params, w, ec, em, res);
     if (!strcmp(m, "removeprunedfunds"))
@@ -3731,4 +3885,145 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
     if (!strcmp(m, "psbtbumpfee")) return cmd_bumpfee_common(params, w, ec, em, res, 1);
 
     return -1;   /* unreachable while WOP_METHODS and this ladder agree */
+}
+
+
+/* ==== output types (2026-09-01) ============================================
+ * See rpc_wallet_ops.h. The active set is a line-per-type file in the wallet
+ * directory (wallet.types); bech32 needs no line. */
+#define WOP_TYPES_REL "wallet.types"
+static int g_wot_mask = -1;
+const char* rpc_wops_type_name(int t){ return t==WOT_LEGACY?"legacy" : t==WOT_P2SH_SEGWIT?"p2sh-segwit" : t==WOT_BECH32M?"bech32m" : "bech32"; }
+int rpc_wops_type_from_name(const char* s){
+    if (!s) return -1;
+    if (!strcmp(s, "bech32")) return WOT_BECH32;
+    if (!strcmp(s, "legacy")) return WOT_LEGACY;
+    if (!strcmp(s, "p2sh-segwit")) return WOT_P2SH_SEGWIT;
+    if (!strcmp(s, "bech32m")) return WOT_BECH32M;
+    return -1;
+}
+int rpc_wops_active_types(void){
+    if (g_wot_mask >= 0) return g_wot_mask;
+    g_wot_mask = 1 << WOT_BECH32;
+    char pb[512]; FILE* f = fopen(wop_path(WOP_TYPES_REL, pb, sizeof pb), "r");
+    if (f){
+        char line[64];
+        while (fgets(line, sizeof line, f)){ line[strcspn(line, "\r\n")] = 0; int t = rpc_wops_type_from_name(line); if (t >= 0) g_wot_mask |= 1 << t; }
+        fclose(f);
+    }
+    return g_wot_mask;
+}
+int rpc_wops_activate_type(int t){
+    if (t < 0 || t > 3) return -1;
+    if (rpc_wops_active_types() & (1 << t)) return 0;
+    char pb[512]; FILE* f = fopen(wop_path(WOP_TYPES_REL, pb, sizeof pb), "a");
+    if (!f) return -1;
+    fprintf(f, "%s\n", rpc_wops_type_name(t)); fclose(f);
+    g_wot_mask |= 1 << t;
+    wop_keyset_invalidate();
+    return 1;
+}
+void rpc_wops_set_active_types_for_test(int mask){ g_wot_mask = mask | 1; wop_keyset_invalidate(); }
+void rpc_wops_type_path(int t, unsigned i, int chain, unsigned idx[5]){
+    unsigned purpose = t==WOT_LEGACY?44u : t==WOT_P2SH_SEGWIT?49u : t==WOT_BECH32M?86u : 84u;
+    idx[0] = 0x80000000u | purpose; idx[1] = 0x80000000u; idx[2] = 0x80000000u; idx[3] = i; idx[4] = (unsigned)chain;
+}
+int rpc_wops_type_spk(int t, const unsigned char pub[33], unsigned char spk[34], unsigned long* spklen, unsigned char h20[20]){
+    unsigned char h[20]; hash160(h, pub, 33);
+    switch (t){
+    case WOT_LEGACY:
+        spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3, h, 20); spk[23]=0x88; spk[24]=0xac; *spklen = 25; memcpy(h20, h, 20); return 1;
+    case WOT_P2SH_SEGWIT: {
+        unsigned char rd[22] = {0x00, 0x14}; memcpy(rd+2, h, 20); unsigned char sh[20]; hash160(sh, rd, 22);
+        spk[0]=0xa9; spk[1]=0x14; memcpy(spk+2, sh, 20); spk[22]=0x87; *spklen = 23; memcpy(h20, sh, 20); return 1; }
+    case WOT_BECH32M: {
+        extern void sha256_full(unsigned char out[32], const void* msg, unsigned long len);
+        extern int  bip32_xonly_tweak_add(const unsigned char x[32], const unsigned char t[32], unsigned char out_x[32]);
+        unsigned char th[32]; sha256_full(th, "TapTweak", 8);
+        unsigned char tb[96]; memcpy(tb, th, 32); memcpy(tb+32, th, 32); memcpy(tb+64, pub+1, 32);
+        unsigned char tw[32]; sha256_full(tw, tb, 96);
+        unsigned char q[32]; if (!bip32_xonly_tweak_add(pub+1, tw, q)) return 0;
+        spk[0]=0x51; spk[1]=0x20; memcpy(spk+2, q, 32); *spklen = 34; memcpy(h20, q, 20); return 1; }
+    default:
+        spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, h, 20); *spklen = 22; memcpy(h20, h, 20); return 1;
+    }
+}
+int rpc_wops_own_coin_spk(const void* wseed, const unsigned char txid_wire[32], unsigned int vout,
+                          unsigned long long* value_out, unsigned char spk[34], unsigned long* spklen,
+                          unsigned char redeem[22], unsigned long* redeemlen){
+    rpc_wallet w; memset(&w, 0, sizeof w); w.seed = (const unsigned char*)wseed;
+    const wscan_key* keys; int nk = wop_keyset_cached(&w, &keys);
+    if (!keys) return 0;
+    wscan_rec* recs; long n = wop_records(&recs);
+    for (long i = 0; i < n; i++){
+        if (recs[i].kind != 0) continue;
+        if (recs[i].vout != vout || memcmp(recs[i].txid, txid_wire, 32)) continue;
+        const wscan_key* k = wop_rec_key(keys, nk, &recs[i]);
+        if (!k) return 0;
+        *value_out = recs[i].value; *redeemlen = 0;
+        int t = WOT_TYPE(k->branch);
+        if (t == WOT_BECH32M || t == WOT_P2SH_SEGWIT){
+            if (k->hdkey != 0) return 0;
+            unsigned path[5]; rpc_wops_type_path(t, k->keyidx, WOT_CHAIN(k->branch), path);
+            unsigned char kk[32], cc[32], pub[33], h20[20];
+            if (bip32_derive_path(kk, cc, w.seed, 64, path, 5) != 1) return 0;
+            scalar_to_pubkey(pub, kk);
+            if (!rpc_wops_type_spk(t, pub, spk, spklen, h20)) return 0;
+            if (t == WOT_P2SH_SEGWIT){ unsigned char kh[20]; hash160(kh, pub, 33); redeem[0]=0x00; redeem[1]=0x14; memcpy(redeem+2, kh, 20); *redeemlen = 22; }
+        } else if (t == WOT_LEGACY){ spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3, k->h160, 20); spk[23]=0x88; spk[24]=0xac; *spklen = 25; }
+        else { spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, k->h160, 20); *spklen = 22; }
+        return 1;
+    }
+    return 0;
+}
+
+/* ---- -walletnotify support (2026-09-01) ---------------------------------
+ * Does this transaction concern the wallet? An input spending one of our
+ * coins (by outpoint, via the scan records) or an output paying one of our
+ * keys (by scriptPubKey shape per output type). A minimal parser: version,
+ * optional segwit marker, inputs, outputs; witnesses are not needed. */
+static unsigned long wn_varint(const unsigned char* p, unsigned long n, unsigned long* v){
+    if (n < 1) return 0;
+    if (p[0] < 0xfd){ *v = p[0]; return 1; }
+    if (p[0] == 0xfd){ if (n < 3) return 0; *v = p[1] | (p[2] << 8); return 3; }
+    if (p[0] == 0xfe){ if (n < 5) return 0; *v = p[1] | (p[2]<<8) | ((unsigned long)p[3]<<16) | ((unsigned long)p[4]<<24); return 5; }
+    return 0;
+}
+static int wn_spk_is_ours(const wscan_key* keys, int nk, const unsigned char* spk, unsigned long sl){
+    for (int i = 0; i < nk; i++){
+        int t = WOT_TYPE(keys[i].branch);
+        if (t == WOT_BECH32 && sl == 22 && spk[0] == 0x00 && spk[1] == 0x14 && !memcmp(spk+2, keys[i].h160, 20)) return 1;
+        if (t == WOT_LEGACY && sl == 25 && spk[0] == 0x76 && spk[1] == 0xa9 && spk[2] == 0x14 && !memcmp(spk+3, keys[i].h160, 20)) return 1;
+        if (t == WOT_P2SH_SEGWIT && sl == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && !memcmp(spk+2, keys[i].h160, 20)) return 1;
+        if (t == WOT_BECH32M && sl == 34 && spk[0] == 0x51 && spk[1] == 0x20 && !memcmp(spk+2, keys[i].h160, 20)) return 1;
+    }
+    return 0;
+}
+int rpc_wops_tx_touches_wallet(const rpc_wallet* w, const unsigned char* tx, unsigned long len){
+    if (!w || !w->seed || !tx || len < 10) return 0;
+    const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
+    if (!keys) return 0;
+    unsigned long p = 4, v, n;
+    if (p + 2 <= len && tx[p] == 0x00 && tx[p+1] == 0x01) p += 2;          /* segwit marker+flag */
+    if (!(n = wn_varint(tx + p, len - p, &v))) return 0; p += n;
+    unsigned long nin = v;
+    for (unsigned long i = 0; i < nin; i++){
+        if (p + 36 > len) return 0;
+        unsigned int vout = tx[p+32] | (tx[p+33]<<8) | ((unsigned)tx[p+34]<<16) | ((unsigned)tx[p+35]<<24);
+        unsigned long long cv; unsigned char h[20];
+        if (rpc_wops_own_coin(w->seed, tx + p, vout, &cv, h)) return 1;
+        p += 36;
+        if (!(n = wn_varint(tx + p, len - p, &v))) return 0; p += n;
+        if (p + v + 4 > len) return 0; p += v + 4;
+    }
+    if (!(n = wn_varint(tx + p, len - p, &v))) return 0; p += n;
+    unsigned long nout = v;
+    for (unsigned long i = 0; i < nout; i++){
+        if (p + 8 > len) return 0; p += 8;
+        if (!(n = wn_varint(tx + p, len - p, &v))) return 0; p += n;
+        if (p + v > len) return 0;
+        if (wn_spk_is_ours(keys, nk, tx + p, v)) return 1;
+        p += v;
+    }
+    return 0;
 }

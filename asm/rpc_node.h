@@ -14,7 +14,7 @@
 /* One outbound peer, published by the download worker at connect/handshake.
  * Byte/last-send counters Core tracks per-socket are not tracked here (the
  * worker has no per-fd meters); getpeerinfo reports them as 0/-1. */
-#define RPC_MAX_PEERS 64
+#define RPC_MAX_PEERS 128   /* 0..63 outbound legs (the worker), 64..127 inbound children (2026-09-01) */
 /* Shared misbehaviour table size; mirrored by MISBEHAVIOR_SLOTS in
  * daemon/main.c, which asserts the two agree at compile time. */
 #define RPC_MISBEHAVIOR_SLOTS 64
@@ -32,6 +32,12 @@ typedef struct {
     volatile long long        bytes_recv;
     volatile long long        last_send;    /* unix secs of last data sent */
     volatile long long        last_recv;    /* unix secs of last data recv */
+    /* 2026-09-01 relay policy: the peer's fRelay (Core relaytxes), its
+     * permissions (getpeerinfo "permissions"), and for an inbound slot the
+     * serve child's pid -- a dead pid means the slot is stale. */
+    volatile int              relaytxes;
+    volatile unsigned         perms;
+    volatile int              pid;
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
@@ -248,6 +254,7 @@ typedef struct {
  * The const setter keeps status reads read-only; the writable variant is for
  * sendrawtransaction, which stages into the submission channel above. */
 void rpc_node_set_status(const node_status_t* st);
+void rpc_node_set_user_agent(const char* ua);   /* -uacomment: getnetworkinfo subversion */
 void rpc_node_set_status_rw(node_status_t* st);
 
 /* Hand the RPC layer the SHARED mempool (daemon/mempool_cfg.c's MAP_SHARED
@@ -277,6 +284,8 @@ typedef struct {
                      unsigned long long*);                      /* fee EMA+samples */
     void (*sha256d)(unsigned char*, const void*, unsigned long);/* for wtxid */
     unsigned long long (*min_fee)(void*);   /* dynamic mempoolminfee, sat/kvB (polstate) */
+    void*     feeest;         /* shared fee estimator (daemon/fee_estimator.c); NULL = none */
+    unsigned long long min_relay_satkvb;    /* -minrelaytxfee, sat/kvB (estimatesmartfee floor) */
 } rpc_mempool_hooks;
 void rpc_node_set_mempool(const rpc_mempool_hooks* h);
 

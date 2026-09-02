@@ -69,10 +69,62 @@ typedef struct {
     unsigned long long value;
     unsigned long      height;
     int                is_coinbase;
-    unsigned char      h160[20];      /* the wallet key that owns it */
-    unsigned char      branch;        /* 0 receive, 1 change */
+    unsigned char      h160[20];      /* the wallet key that owns it (the 20 bytes the scan matched) */
+    unsigned char      branch;        /* WOT_BRANCH(type, chain): bit 0 = 0 receive / 1 change */
+    unsigned char      spk[34]; unsigned long spklen;        /* the coin's scriptPubKey (type-aware) */
+    unsigned char      redeem[22]; unsigned long redeemlen;  /* P2SH-P2WPKH: its redeemScript */
 } rpc_wops_coin;
 
+/* ---- output types of the seed wallet (2026-09-01) --------------------------
+ * The wallet always carries bech32 (wpkh, purpose 84'); createwalletdescriptor
+ * adds legacy (pkh, 44'), p2sh-segwit (sh(wpkh), 49') and bech32m (tr, 86').
+ * A record's branch byte carries the TYPE in its high nibble and the chain
+ * (0 receive, 1 change) in bit 0, so every record written before this reads
+ * as bech32 unchanged: no journal format change. Derivation keeps this
+ * wallet's ordering m/<purpose>'/0'/0'/<i>/<chain>. */
+enum { WOT_BECH32 = 0, WOT_LEGACY = 1, WOT_P2SH_SEGWIT = 2, WOT_BECH32M = 3 };
+#define WOT_CHAIN(b)  ((b) & 1)
+#define WOT_TYPE(b)   (((b) >> 4) & 3)
+#define WOT_BRANCH(t, chain) ((unsigned char)((((t) & 3) << 4) | ((chain) & 1)))
+int  rpc_wops_active_types(void);            /* bitmask; bit WOT_BECH32 always set */
+int  rpc_wops_activate_type(int t);          /* 1 newly active, 0 already active, -1 error */
+void rpc_wops_set_active_types_for_test(int mask);
+void rpc_wops_type_path(int t, unsigned i, int chain, unsigned idx[5]);
+int  rpc_wops_type_spk(int t, const unsigned char pub[33], unsigned char spk[34], unsigned long* spklen, unsigned char h20[20]);
+const char* rpc_wops_type_name(int t);
+int  rpc_wops_type_from_name(const char* s);
+/* the wallet's own coin behind an outpoint: value, scriptPubKey and (P2SH-P2WPKH) redeemScript */
+int  rpc_wops_own_coin_spk(const void* wseed, const unsigned char txid_wire[32], unsigned int vout,
+                           unsigned long long* value_out, unsigned char spk[34], unsigned long* spklen,
+                           unsigned char redeem[22], unsigned long* redeemlen);
+
 int rpc_wops_wallet_coins(const void* wallet_seed, rpc_wops_coin* out, int cap);
+
+/* master key fingerprint as 8 hex chars (2026-09-01: taproot PSBT derivation matching) */
+int rpc_wops_master_fp(const void* seed, char out[9]);
+
+/* ---- wallet policy defaults from the config (2026-09-01, Core names) ----
+ * Injected by main.c; this file never includes node_config.h. Until the
+ * setter runs the wallet behaves as before (bech32, target 6, RBF on,
+ * broadcast on, min-relay fallback when the estimator has no data). */
+typedef struct {
+    int  addresstype;                 /* WOT_* for getnewaddress            */
+    int  changetype;                  /* WOT_* for change, -1 = Core's rule */
+    int  txconfirmtarget;             /* default conf_target                */
+    int  walletrbf;                   /* default sequence: RBF or final     */
+    int  walletbroadcast;             /* 0 = build+sign but never broadcast */
+    long mintxfee_satkvb;             /* floor for created transactions      */
+    long fallbackfee_satkvb;          /* 0 = disabled: estimation failure is an error (Core) */
+    long discardfee_satkvb;           /* change below dust at this rate is given to the miner */
+    long consolidatefeerate_satkvb;   /* at or below this rate: spend small coins first     */
+    long maxapsfee_sat;               /* extra absolute fee tolerated for partial-spend avoidance; -1 = always */
+    int  avoidpartialspends;          /* group coins by destination           */
+    int  spendzeroconfchange;         /* 0 = unconfirmed change is not spendable */
+} rpc_wops_defaults;
+void rpc_wops_set_defaults(const rpc_wops_defaults* d);
+int  rpc_wops_default_type(int is_change);
+/* 1 if any input spends a coin this wallet holds or any output pays one of
+ * its keys (the -walletnotify test); 0 otherwise. */
+int  rpc_wops_tx_touches_wallet(const rpc_wallet* w, const unsigned char* tx, unsigned long len);
 
 #endif

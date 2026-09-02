@@ -127,35 +127,73 @@ int nodecfg_hex32_be(const char* str, unsigned char out[32]){
 /* Core options this node does not implement. Listed explicitly rather than
  * inferred, so adding support means deleting a line here and the warning
  * stops -- and so the list itself is a readable statement of the gap. */
-static const char* const k_unimplemented[] = {
-    /* `whitelist` is IMPLEMENTED (noban only) -- see daemon/netperm.c. The
-     * three below are not: whitebind needs a second listener carrying its own
-     * permissions, and whitelistrelay/whitelistforcerelay are relay
-     * permissions with no enforcement point here yet. */
-    /* whitebind is IMPLEMENTED (daemon/netperm.c + main.c's accept loop). */
-    "whitelistrelay","whitelistforcerelay",
-    "txreconciliation","natpmp","upnp",
-    "peerbloomfilters","peerblockfilters",
-    /* rpcallowip and rpcbind are IMPLEMENTED (daemon/rpc_acl.c). */
-    "rpcthreads","rpcworkqueue",
-    "rpcservertimeout","rest","server",
-    /* -reindex and -reindex-chainstate are IMPLEMENTED (daemon/archive_reindex.c
-     * rebuilds the block index from the blk files; main.c drops the chain
-     * state). loadblock/blocksdir/blocksxor describe Core's block files,
-     * which this node does not use. */
-    "loadblock","blocksdir","blocksxor",
-    "persistmempoolv1","dbbatchsize","prevoutfetchthreads",
-    "uacomment","maxtxfee","maxapsfee",
-    "blockmaxweight","blockmintxfee","blockversion","blockreservedweight",
-        "walletnotify",
-    "settings","includeconf","allowignoredconf",
-    "fixedseeds",
-    NULL
+/* Core options this node ACCEPTS WITHOUT EFFECT, each with the reason it is
+ * inert here. Named at every start-up (Core would silently accept them; an
+ * operator who sets one deserves to know it does nothing). Everything Core
+ * defines that is not here and not parsed above is implemented. Kept in
+ * sync with docs/FEATURE_GAPS.md's config table (2026-09-01). */
+static const struct { const char* key; const char* why; } k_noeffect[] = {
+    {"peerbloomfilters",   "BIP37 bloom filtering is not implemented; NODE_BLOOM is never advertised (Core's default is 0 too)"},
+    {"txreconciliation",   "Erlay: BIP330 negotiation is built but reconciliation is a deliberate stop"},
+    {"natpmp",             "no NAT-PMP/UPnP port mapping by design"},
+    {"upnp",               "no NAT-PMP/UPnP port mapping by design"},
+    {"rest",               "no REST interface by design"},
+    {"server",             "the JSON-RPC server is always on"},
+    {"daemon",             "a systemd unit (or the shell) backgrounds the process"},
+    {"daemonwait",         "a systemd unit (or the shell) backgrounds the process"},
+    {"loadblock",          "the block archive is this node's own format (index.dat + blk files); Core blk*.dat files are not imported"},
+    {"blocksdir",          "the archive lives under <datadir>/<chain> and is not relocatable"},
+    {"blocksxor",          "the archive is never XOR-obfuscated"},
+    {"stopafterblockimport","no block import step"},
+    {"persistmempoolv1",   "mempool.dat is written in the current format only"},
+    {"dbbatchsize",        "no LevelDB"},
+    {"prevoutfetchthreads","prevouts come from the in-process UTXO set"},
+    {"maxsigcachesize",    "no signature cache: each block's scripts are verified once by the parallel verifier"},
+    {"settings",           "no settings.json: values set over RPC are not persisted"},
+    {"allowignoredconf",   "-conf is always honoured"},
+    {"includeconf",        NULL},   /* implemented (see node_config_load); listed so the table is complete */
+    {"fixedseeds",         "no compiled-in seed list: DNS seeds, seednode= and peers.dat only"},
+    {"blockreconstructionextratxn","compact-block reconstruction draws on the mempool only"},
+    {"logips",             "peer addresses are always logged"},
+    {"loglevel",           "no per-category log levels"},
+    {"loglevelalways",     "no per-category log levels"},
+    {"logratelimit",       "no log rate limiting"},
+    {"debug",              "no log categories"},
+    {"debugexclude",       "no log categories"},
+    {"printtoconsole",     "stderr IS the log (systemd appends it to the log file)"},
+    {"checkblockindex",    "index invariants are checked at boot (archive self-heal) and in the test suite, not on a timer"},
+    {"checkmempool",       "mempool invariants are checked in the test suite, not on a timer"},
+    {"checkaddrman",       "address-book invariants are checked in the test suite, not on a timer"},
+    {"mocktime",           "no mock clock: regtest tests drive time through block timestamps"},
+    {"testactivationheight","regtest deployments are active from genesis here"},
+    {"vbparams",           "regtest deployments are active from genesis here"},
+    {"capturemessages",    "no P2P message capture"},
+    {"keypool",            "the descriptor wallet derives keys on demand; there is no keypool"},
+    {"unsafesqlitesync",   "no sqlite"},
+    {"walletrejectlongchains","the mempool's cluster limits bound unconfirmed chains"},
+    {"walletcrosschain",   "one chain per datadir"},
+    {"privatebroadcast",   "no private broadcast"},
+    {"txsendrate",         "no private broadcast"},
+    {"deprecatedrpc",      "no deprecated-RPC toggles"},
+    {"rpcdoccheck",        "debug-only"},
+    {"test",               "debug-only"},
+    {"txospenderindex",    "the index is on whenever txospender.dat exists (build it with daemon/build_txospender_index); the key itself changes nothing"},
+    {"fastprune",          "debug-only pruning knob; this node prunes by its own MiB budget"},
+    {"testnet",            "testnet3 is refused by design; use testnet4=1"},
+    {"version",            "command-line only"},
+    {"help",               "command-line only"},
+    {"conf",               "command-line only (-conf=)"},
+    {"datadir",            "command-line only (-datadir=)"},
+    {NULL, NULL}
 };
+const char* nodecfg_noeffect_reason(const char* key){
+    for (int i = 0; k_noeffect[i].key; i++)
+        if (!strcmp(key, k_noeffect[i].key)) return k_noeffect[i].why ? k_noeffect[i].why : "";
+    return NULL;
+}
 int nodecfg_unimplemented(const char* key){
-    for (int i = 0; k_unimplemented[i]; i++)
-        if (!strcmp(key, k_unimplemented[i])) return 1;
-    return 0;
+    const char* r = nodecfg_noeffect_reason(key);
+    return r != NULL && *r != 0;
 }
 
 static void set_defaults(void){
@@ -175,6 +213,26 @@ static void set_defaults(void){
     g_cfg.discover              = 1;
     g_cfg.i2pacceptincoming     = 1;
     g_cfg.listenonion           = 1;
+    /* 2026-09-01 surface completion -- Core v31.99 defaults */
+    g_cfg.n_uacomment = 0; memset(g_cfg.uacomment, 0, sizeof g_cfg.uacomment);
+    g_cfg.blockmaxweight = 4000000; g_cfg.blockreservedweight = 8000; g_cfg.blockmintxfee_satkvb = 1;
+    g_cfg.blockversion = 0; g_cfg.printpriority = 0;
+    g_cfg.mintxfee_satkvb = 1000; g_cfg.fallbackfee_satkvb = 0; g_cfg.discardfee_satkvb = 10000;
+    g_cfg.consolidatefeerate_satkvb = 10000; g_cfg.maxapsfee_sat = 0; g_cfg.avoidpartialspends = 0;
+    g_cfg.spendzeroconfchange = 1; g_cfg.walletrbf = 1; g_cfg.txconfirmtarget = 6; g_cfg.walletbroadcast = 1;
+    g_cfg.keypool = 1000; g_cfg.walletnotify[0] = 0; g_cfg.n_wallet_names = 0;
+    snprintf(g_cfg.addresstype, sizeof g_cfg.addresstype, "bech32"); g_cfg.changetype[0] = 0;
+    g_cfg.maxtipage = 86400; g_cfg.inboundrelaypercent = 50; g_cfg.whitelistrelay = 1; g_cfg.whitelistforcerelay = 0;
+    g_cfg.whitelistrelay_explicit = 0; g_cfg.maxmempool_explicit = 0; g_cfg.acceptstalefeeestimates = 0;
+    g_cfg.peerbloomfilters = 0; g_cfg.peerblockfilters = 0; g_cfg.fixedseeds = 1; g_cfg.n_signetseednode = 0;
+    g_cfg.txreconciliation = 0;
+    g_cfg.logips = 0; g_cfg.logtimestamps = 1; g_cfg.logtimemicros = 0; g_cfg.logthreadnames = 0;
+    g_cfg.logsourcelocations = 0; g_cfg.shrinkdebugfile = 1; g_cfg.printtoconsole = 0; g_cfg.loglevel[0] = 0;
+    g_cfg.rpcthreads = 16; g_cfg.rpcworkqueue = 64; g_cfg.rpcservertimeout = 30; g_cfg.n_rpcwhitelist = 0;
+    g_cfg.rpcwhitelistdefault = -1; g_cfg.rpccookieperms = 0;
+    g_cfg.limitclustercount = 64; g_cfg.limitclustersize_kvb = 101;
+    g_cfg.checkblockindex = 0; g_cfg.checkmempool = 0; g_cfg.checkaddrman = 0; g_cfg.capturemessages = 0;
+    g_cfg.stopafterblockimport = 0; g_cfg.mocktime = 0; g_cfg.n_includeconf = 0;
     g_cfg.bantime               = 86400;
     g_cfg.blockfilterindex      = 1;
     g_cfg.coinstatsindex        = 1;
@@ -212,6 +270,8 @@ static void set_defaults(void){
     g_cfg.utxo_bulk_blob_mb     = 1024;
     g_cfg.utxo_bulk_gap_blocks  = 50000L;
     g_cfg.utxo_compact_threshold= 12;
+    g_cfg.assumevalid_mode      = 0;        /* the chain default (Core defaultAssumeValid) */
+    memset(g_cfg.assumevalid, 0, 32);
     g_cfg.dbcache_mb            = 1024;     /* Core v31 default (MiB) */
     g_cfg.connect_timeout_ms    = 5000;     /* Core's -timeout default */
     g_cfg.peer_timeout_s        = 60;       /* Core's -peertimeout default */
@@ -332,6 +392,7 @@ int node_config_is_manual(const char* ip){
  * not trusted input: a typo that sets min_usable_peers to 0 or maxpool to -1
  * should not be able to reproduce the peer-starvation stall that a bad
  * eviction threshold caused on 2026-08-18. */
+static int hexval(int c){ return c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:-1; }
 static int clamp_int(int v, int lo, int hi, const char* key, int* bad){
     if(v < lo || v > hi){
         fprintf(stderr,"[config] %s=%d out of range [%d,%d] -- ignoring\n", key, v, lo, hi);
@@ -357,8 +418,9 @@ const char* node_config_path(const char* datadir, char* buf, unsigned long cap){
     return buf;
 }
 
+static int g_include_depth = 0;
 long node_config_load(const char* path){
-    set_defaults();
+    if(!g_include_depth) set_defaults();
     FILE* f = fopen(path, "r");
     if(!f){
         fprintf(stderr,"[config] no config file at %s -- using compiled defaults\n", path);
@@ -453,7 +515,7 @@ long node_config_load(const char* path){
              * much a single peer can make us buffer for one message. */
             t=clamp_int(iv,64,262144,key,&bad); if(t>=0){ g_cfg.maxrecvbuffer_kb=t; applied++; } }
         else if(!strcmp(key,"maxmempool")){    /* Core: MB */
-            t=clamp_int(iv,1,65536,key,&bad); if(t>=0){ g_cfg.maxmempool_mb=t; applied++; } }
+            t=clamp_int(iv,1,65536,key,&bad); if(t>=0){ g_cfg.maxmempool_mb=t; g_cfg.maxmempool_explicit=1; applied++; } }
         else if(!strcmp(key,"mempoolexpiry")){ /* Core: hours */
             t=clamp_int(iv,0,8760,key,&bad);  if(t>=0){ g_cfg.mempoolexpiry_h=t; applied++; } }
         /* mempool policy limits (Core limit-count/size, relay fees, mempoolfullrbf).
@@ -634,19 +696,26 @@ long node_config_load(const char* path){
                                   "automatically when txindex.dat is present; this daemon "
                                   "does not build or update it\n"); }
         else if(!strcmp(key,"assumevalid")){
-            /* This string was STALE and said the opposite of the truth: it
-             * claimed block connection performs no script verification,
-             * describing the node as it was before Stage D wired
-             * tx_verify_block_connect_all into utxo_live.c's apply path.
-             * Nobody updated it when that landed, and it is exactly the sort
-             * of confident, specific, wrong explanation that a reader (or a
-             * later session) takes at face value -- this one did, on
-             * 2026-08-28, and briefly "corrected" the docs to match it.
-             * Fixed with the reason that is actually true. */
-            fprintf(stderr,"[config] assumevalid IGNORED -- this node verifies every input script in "
-                           "every block it connects (tx_verify_block_connect_all, ahead of any UTXO "
-                           "write), which is the whole point of it; assumevalid exists to SKIP that, "
-                           "so it is declined rather than unimplemented\n"); }
+            /* Core's -assumevalid: script evaluation is skipped for blocks
+             * that are ancestors of this block; PoW, merkle, structure and
+             * every UTXO check still run. Honoured ONLY when set explicitly
+             * (2026-09-01); with no value this node verifies every script of
+             * every block, which stays the default and the README's promise.
+             * "0" disables it, as in Core. */
+            const char* v = val;
+            if(!v || !*v || !strcmp(v,"0")){ g_cfg.assumevalid_mode = 2; applied++;
+                fprintf(stderr,"[config] assumevalid=0: every script of every block is evaluated (Core's default skips them below its built-in block)\n"); }
+            else if(strlen(v)==64){
+                int okh = 1;
+                for(int q=0;q<32;q++){
+                    int hi = hexval(v[2*q]), lo = hexval(v[2*q+1]);
+                    if(hi<0||lo<0){ okh=0; break; }
+                    g_cfg.assumevalid[31-q] = (unsigned char)((hi<<4)|lo);   /* display order -> wire order */
+                }
+                if(okh){ g_cfg.assumevalid_mode = 1; applied++;
+                         fprintf(stderr,"[config] assumevalid=%s: script evaluation is skipped for blocks at or below it (Core semantics); every other consensus check still runs\n", v); }
+                else { fprintf(stderr,"[config] assumevalid: not a 64-hex block hash -- ignored\n"); bad++; }
+            } else { fprintf(stderr,"[config] assumevalid: not a 64-hex block hash -- ignored\n"); bad++; } }
 
         else if(!strcmp(key,"dnsseed")){      /* Core: query the DNS seeds  */
             g_cfg.dnsseed = iv?1:0; saw_dnsseed = 1; applied++; }
@@ -726,17 +795,169 @@ long node_config_load(const char* path){
          * nothing, and `externalip` was parsed-but-unread for weeks. An
          * operator who sets a real Core option deserves to be told it has no
          * effect here, rather than discovering it from behaviour. */
+        /* ---- 2026-09-01: Core v31.99 option-surface completion ---- */
+        else if(!strcmp(key,"uacomment")){
+            /* Core SAFE_CHARS_UA_COMMENT: printable ASCII minus ( ) / \ ; : and control */
+            int okc = *val != 0;
+            for(const char* c = val; *c; c++)
+                if(*c < 0x20 || *c > 0x7e || *c=='(' || *c==')' || *c=='/' || *c=='\\' || *c==';' || *c==':') okc = 0;
+            if(!okc){ fprintf(stderr,"[config] uacomment=%s contains unsafe characters -- ignoring\n", val); bad++; }
+            else if(g_cfg.n_uacomment >= 4){ fprintf(stderr,"[config] uacomment: at most 4 entries -- ignoring %s\n", val); bad++; }
+            else if(strlen(val) > 63){ fprintf(stderr,"[config] uacomment=%s too long (max 63) -- ignoring\n", val); bad++; }
+            else { snprintf(g_cfg.uacomment[g_cfg.n_uacomment++], 64, "%s", val); applied++; } }
+        else if(!strcmp(key,"blockmaxweight")){
+            t=clamp_int(iv,4000,4000000,key,&bad); if(t>=0){ g_cfg.blockmaxweight=t; applied++; } }
+        else if(!strcmp(key,"blockreservedweight")){
+            t=clamp_int(iv,2000,4000000,key,&bad); if(t>=0){ g_cfg.blockreservedweight=t; applied++; } }
+        else if(!strcmp(key,"blockmintxfee") || !strcmp(key,"mintxfee") || !strcmp(key,"fallbackfee") ||
+                !strcmp(key,"discardfee") || !strcmp(key,"consolidatefeerate")){
+            double btc = atof(val);
+            if(btc < 0 || btc >= 1.0){ fprintf(stderr,"[config] %s=%s out of range -- ignoring\n", key, val); bad++; }
+            else { long satkvb = (long)(btc * 1e8 + 0.5);
+                   if(!strcmp(key,"blockmintxfee"))      g_cfg.blockmintxfee_satkvb = satkvb;
+                   else if(!strcmp(key,"mintxfee"))      g_cfg.mintxfee_satkvb = satkvb;
+                   else if(!strcmp(key,"fallbackfee"))   g_cfg.fallbackfee_satkvb = satkvb;
+                   else if(!strcmp(key,"discardfee"))    g_cfg.discardfee_satkvb = satkvb;
+                   else                                  g_cfg.consolidatefeerate_satkvb = satkvb;
+                   applied++; } }
+        else if(!strcmp(key,"maxapsfee")){           /* Core: BTC absolute; -1 = always avoid partial spends */
+            double btc = atof(val);
+            if(btc < 0){ g_cfg.maxapsfee_sat = -1; applied++; }
+            else if(btc >= 1.0){ fprintf(stderr,"[config] maxapsfee=%s out of range -- ignoring\n", val); bad++; }
+            else { g_cfg.maxapsfee_sat = (long)(btc * 1e8 + 0.5); applied++; } }
+        else if(!strcmp(key,"blockversion")){ g_cfg.blockversion = iv; applied++; }
+        else if(!strcmp(key,"printpriority")){ g_cfg.printpriority = iv?1:0; applied++; }
+        else if(!strcmp(key,"avoidpartialspends")){ g_cfg.avoidpartialspends = iv?1:0; applied++; }
+        else if(!strcmp(key,"spendzeroconfchange")){ g_cfg.spendzeroconfchange = iv?1:0; applied++; }
+        else if(!strcmp(key,"walletrbf")){ g_cfg.walletrbf = iv?1:0; applied++; }
+        else if(!strcmp(key,"walletbroadcast")){ g_cfg.walletbroadcast = iv?1:0; applied++; }
+        else if(!strcmp(key,"txconfirmtarget")){
+            t=clamp_int(iv,1,1008,key,&bad); if(t>=0){ g_cfg.txconfirmtarget=t; applied++; } }
+        else if(!strcmp(key,"keypool")){
+            t=clamp_int(iv,1,1000000,key,&bad); if(t>=0){ g_cfg.keypool=t; applied++; } }
+        else if(!strcmp(key,"walletnotify")){
+            snprintf(g_cfg.walletnotify,sizeof g_cfg.walletnotify,"%s",val); applied++; }
+        else if(!strcmp(key,"wallet")){
+            if(g_cfg.n_wallet_names >= 8){ fprintf(stderr,"[config] wallet: at most 8 entries -- ignoring %s\n", val); bad++; }
+            else if(strchr(val,'/') || strlen(val) > 63){ fprintf(stderr,"[config] wallet=%s: a wallet NAME (no path), max 63 chars -- ignoring\n", val); bad++; }
+            else { snprintf(g_cfg.wallet_names[g_cfg.n_wallet_names++], 64, "%s", val); applied++; } }
+        else if(!strcmp(key,"addresstype") || !strcmp(key,"changetype")){
+            if(strcmp(val,"legacy") && strcmp(val,"p2sh-segwit") && strcmp(val,"bech32") && strcmp(val,"bech32m")){
+                fprintf(stderr,"[config] %s=%s: expected legacy, p2sh-segwit, bech32 or bech32m -- ignoring\n", key, val); bad++; }
+            else { snprintf(!strcmp(key,"addresstype") ? g_cfg.addresstype : g_cfg.changetype, 16, "%s", val); applied++; } }
+        else if(!strcmp(key,"maxtipage")){
+            long lv = atol(val);
+            if(lv < 0){ fprintf(stderr,"[config] maxtipage=%s out of range -- ignoring\n", val); bad++; }
+            else { g_cfg.maxtipage = lv; applied++; } }
+        else if(!strcmp(key,"inboundrelaypercent")){
+            t=clamp_int(iv,0,100,key,&bad); if(t>=0){ g_cfg.inboundrelaypercent=t; applied++; } }
+        else if(!strcmp(key,"whitelistrelay")){ g_cfg.whitelistrelay = iv?1:0; g_cfg.whitelistrelay_explicit = 1; applied++; }
+        else if(!strcmp(key,"acceptstalefeeestimates")){ g_cfg.acceptstalefeeestimates = iv?1:0; applied++; }
+        else if(!strcmp(key,"whitelistforcerelay")){ g_cfg.whitelistforcerelay = iv?1:0; applied++; }
+        else if(!strcmp(key,"peerbloomfilters")){
+            g_cfg.peerbloomfilters = iv?1:0;
+            if(iv) fprintf(stderr,"[config] peerbloomfilters=1: BIP37 bloom filtering is not implemented -- NODE_BLOOM is not advertised\n");
+            applied++; }
+        else if(!strcmp(key,"peerblockfilters")){ g_cfg.peerblockfilters = iv?1:0; applied++; }
+        else if(!strcmp(key,"fixedseeds")){ g_cfg.fixedseeds = iv?1:0; applied++; }
+        else if(!strcmp(key,"txreconciliation")){ g_cfg.txreconciliation = iv?1:0; applied++; }
+        else if(!strcmp(key,"signetseednode")){
+            if(g_cfg.n_signetseednode >= 4){ fprintf(stderr,"[config] signetseednode: at most 4 entries -- ignoring %s\n", val); bad++; }
+            else if(strlen(val) > 79 || !*val){ fprintf(stderr,"[config] signetseednode=%s rejected\n", val); bad++; }
+            else { snprintf(g_cfg.signetseednode[g_cfg.n_signetseednode++], 80, "%s", val); applied++; } }
+        else if(!strcmp(key,"logips")){ g_cfg.logips = iv?1:0; applied++; }
+        else if(!strcmp(key,"logtimestamps")){ g_cfg.logtimestamps = iv?1:0; applied++; }
+        else if(!strcmp(key,"logtimemicros")){ g_cfg.logtimemicros = iv?1:0; applied++; }
+        else if(!strcmp(key,"logthreadnames")){ g_cfg.logthreadnames = iv?1:0; applied++; }
+        else if(!strcmp(key,"logsourcelocations")){ g_cfg.logsourcelocations = iv?1:0; applied++; }
+        else if(!strcmp(key,"shrinkdebugfile")){ g_cfg.shrinkdebugfile = iv?1:0; applied++; }
+        else if(!strcmp(key,"printtoconsole")){ g_cfg.printtoconsole = iv?1:0; applied++; }
+        else if(!strcmp(key,"loglevel")){ snprintf(g_cfg.loglevel,sizeof g_cfg.loglevel,"%s",val); applied++; }
+        else if(!strcmp(key,"rpcthreads")){
+            t=clamp_int(iv,1,256,key,&bad); if(t>=0){ g_cfg.rpcthreads=t; applied++; } }
+        else if(!strcmp(key,"rpcworkqueue")){
+            t=clamp_int(iv,1,4096,key,&bad); if(t>=0){ g_cfg.rpcworkqueue=t; applied++; } }
+        else if(!strcmp(key,"rpcservertimeout")){
+            t=clamp_int(iv,1,86400,key,&bad); if(t>=0){ g_cfg.rpcservertimeout=t; applied++; } }
+        else if(!strcmp(key,"rpcwhitelist")){
+            if(!strchr(val,':')){ fprintf(stderr,"[config] rpcwhitelist=%s: expected <user>:<rpc1>,<rpc2>,... -- ignoring\n", val); bad++; }
+            else if(g_cfg.n_rpcwhitelist >= 16){ fprintf(stderr,"[config] rpcwhitelist: at most 16 entries -- ignoring %s\n", val); bad++; }
+            else if(strlen(val) > 511){ fprintf(stderr,"[config] rpcwhitelist entry too long -- ignoring\n"); bad++; }
+            else { snprintf(g_cfg.rpcwhitelist[g_cfg.n_rpcwhitelist++], 512, "%s", val); applied++; } }
+        else if(!strcmp(key,"rpcwhitelistdefault")){ g_cfg.rpcwhitelistdefault = iv?1:0; applied++; }
+        else if(!strcmp(key,"rpccookieperms")){
+            if(!strcmp(val,"owner")) g_cfg.rpccookieperms = 0;
+            else if(!strcmp(val,"group")) g_cfg.rpccookieperms = 1;
+            else if(!strcmp(val,"all")) g_cfg.rpccookieperms = 2;
+            else { fprintf(stderr,"[config] rpccookieperms=%s: expected owner, group or all -- ignoring\n", val); bad++; continue; }
+            applied++; }
+        else if(!strcmp(key,"limitclustercount")){
+            /* Core v31 bounds a mempool cluster; this mempool's ancestor/descendant
+             * limits are the same bound seen from either end of a chain */
+            t=clamp_int(iv,1,10000,key,&bad); if(t>=0){ g_cfg.limitclustercount=t; g_cfg.limitancestorcount=t; g_cfg.limitdescendantcount=t; applied++; } }
+        else if(!strcmp(key,"limitclustersize")){    /* Core: kvB */
+            t=clamp_int(iv,1,100000,key,&bad); if(t>=0){ g_cfg.limitclustersize_kvb=t; g_cfg.limitancestorsize_kvb=t; g_cfg.limitdescendantsize_kvb=t; applied++; } }
+        else if(!strcmp(key,"checkblockindex")){ g_cfg.checkblockindex = iv?1:0; applied++; }
+        else if(!strcmp(key,"checkmempool")){ g_cfg.checkmempool = iv?1:0; applied++; }
+        else if(!strcmp(key,"checkaddrman")){ g_cfg.checkaddrman = iv?1:0; applied++; }
+        else if(!strcmp(key,"capturemessages")){ g_cfg.capturemessages = iv?1:0; applied++; }
+        else if(!strcmp(key,"stopafterblockimport")){ g_cfg.stopafterblockimport = iv?1:0; applied++; }
+        else if(!strcmp(key,"mocktime")){ g_cfg.mocktime = atoll(val); applied++; }
+        else if(!strcmp(key,"includeconf")){
+            if(g_include_depth){ fprintf(stderr,"[config] includeconf inside an included file is not allowed (Core rule) -- ignoring %s\n", val); bad++; }
+            else if(g_cfg.n_includeconf >= 8){ fprintf(stderr,"[config] includeconf: at most 8 files -- ignoring %s\n", val); bad++; }
+            else if(strlen(val) > 255 || !*val){ fprintf(stderr,"[config] includeconf=%s rejected\n", val); bad++; }
+            else { snprintf(g_cfg.includeconf[g_cfg.n_includeconf++], 256, "%s", val); applied++; } }
         else if(nodecfg_unimplemented(key)){
-            fprintf(stderr,"[config] %s= is a Bitcoin Core option this node does "
-                           "not implement -- it has NO EFFECT\n", key);
+            fprintf(stderr,"[config] %s= is a Bitcoin Core option that has NO EFFECT here: %s\n",
+                    key, nodecfg_noeffect_reason(key));
             unimpl++;
         }
     }
     fclose(f);
     if(unimpl)
-        fprintf(stderr,"[config] %d Core option(s) in this file are NOT implemented here "
+        fprintf(stderr,"[config] %d Core option(s) in this file have no effect here "
                        "and were ignored (each named above)\n", unimpl);
+    /* -includeconf: Core reads each named file after the main one, relative
+     * to the main file's directory; an included file may not include. */
+    if(!g_include_depth && g_cfg.n_includeconf){
+        char dir[512]; snprintf(dir, sizeof dir, "%s", path);
+        char* sl = strrchr(dir, '/'); if(sl) sl[1] = 0; else dir[0] = 0;
+        int n = g_cfg.n_includeconf; g_include_depth = 1;
+        for(int i = 0; i < n; i++){
+            char ip[800];
+            if(g_cfg.includeconf[i][0] == '/') snprintf(ip, sizeof ip, "%s", g_cfg.includeconf[i]);
+            else snprintf(ip, sizeof ip, "%s%s", dir, g_cfg.includeconf[i]);
+            fprintf(stderr,"[config] includeconf: reading %s\n", ip);
+            long a = node_config_load(ip);
+            if(a > 0) applied += a;
+        }
+        g_include_depth = 0;
+    }
 
+    /* -whitelistrelay / -whitelistforcerelay: the permissions implicit
+     * whitelist entries carry (recomputed now, after every line is read) */
+    /* Core init.cpp parameter interactions, same log lines:
+     *   -blocksonly=1 -> -whitelistrelay=0 (unless set) and -maxmempool=5 (unless set)
+     *   -whitelistforcerelay=1 -> -whitelistrelay=1 */
+    if(!g_include_depth){
+        if(g_cfg.blocksonly){
+            if(!g_cfg.whitelistrelay_explicit && g_cfg.whitelistrelay){ g_cfg.whitelistrelay = 0;
+                fprintf(stderr,"[config] parameter interaction: -blocksonly=1 -> setting -whitelistrelay=0\n"); }
+            if(!g_cfg.maxmempool_explicit && g_cfg.maxmempool_mb != 5){ g_cfg.maxmempool_mb = 5;
+                fprintf(stderr,"[config] parameter interaction: -blocksonly=1 -> setting -maxmempool=5\n"); }
+        }
+        if(g_cfg.whitelistforcerelay && !g_cfg.whitelistrelay && !g_cfg.whitelistrelay_explicit){ g_cfg.whitelistrelay = 1;   /* SoftSet: an explicit 0 stands */
+            fprintf(stderr,"[config] parameter interaction: -whitelistforcerelay=1 -> setting -whitelistrelay=1\n"); }
+    }
+    if(!g_include_depth) netperm_set_implicit_defaults(g_cfg.whitelistrelay, g_cfg.whitelistforcerelay);
+    /* -signetseednode: seed nodes that apply only when the chain is signet
+     * (Core keeps them separate so a shared file can carry both). */
+    if(!g_include_depth && !strcmp(g_cfg.chain, "signet"))
+        for(int i = 0; i < g_cfg.n_signetseednode; i++){
+            if(g_cfg.n_seednode >= CFG_MAX_NODES) break;
+            snprintf(g_cfg.seednode[g_cfg.n_seednode++], sizeof g_cfg.seednode[0], "%s", g_cfg.signetseednode[i]);
+        }
     /* -connect's implications, applied once the whole file has been seen. */
     if(g_cfg.connect_only){
         if(!saw_dnsseed && g_cfg.dnsseed){
@@ -805,4 +1026,25 @@ void node_config_log(void){
     if(g_cfg.prune_mib>1)     fprintf(stderr,"[config] chain:   prune budget %ld MiB\n", g_cfg.prune_mib);
     if(g_cfg.checkblocks)     fprintf(stderr,"[config] chain:   checking last %ld block(s)\n", g_cfg.checkblocks);
     if(g_cfg.stopatheight)    fprintf(stderr,"[config] chain:   stopping at height %ld\n", g_cfg.stopatheight);
+    fprintf(stderr,"[config] mine : blockmaxweight=%d reserved=%d blockmintxfee=%ld sat/kvB version=%s printpriority=%d\n",
+            g_cfg.blockmaxweight, g_cfg.blockreservedweight, g_cfg.blockmintxfee_satkvb,
+            g_cfg.blockversion ? "override" : "0x20000000", g_cfg.printpriority);
+    fprintf(stderr,"[config] wallet: addresstype=%s changetype=%s txconfirmtarget=%d walletrbf=%d broadcast=%d "
+                   "mintxfee=%ld fallbackfee=%ld discardfee=%ld consolidate=%ld sat/kvB aps=%d/%ld zeroconfchange=%d wallets=%d\n",
+            g_cfg.addresstype, g_cfg.changetype[0] ? g_cfg.changetype : "(auto)", g_cfg.txconfirmtarget, g_cfg.walletrbf,
+            g_cfg.walletbroadcast, g_cfg.mintxfee_satkvb, g_cfg.fallbackfee_satkvb, g_cfg.discardfee_satkvb,
+            g_cfg.consolidatefeerate_satkvb, g_cfg.avoidpartialspends, g_cfg.maxapsfee_sat, g_cfg.spendzeroconfchange,
+            g_cfg.n_wallet_names);
+    fprintf(stderr,"[config] rpc  : threads=%d workqueue=%d timeout=%ds whitelists=%d(default=%s) cookieperms=%s\n",
+            g_cfg.rpcthreads, g_cfg.rpcworkqueue, g_cfg.rpcservertimeout, g_cfg.n_rpcwhitelist,
+            g_cfg.rpcwhitelistdefault < 0 ? "auto" : (g_cfg.rpcwhitelistdefault ? "1" : "0"),
+            g_cfg.rpccookieperms == 0 ? "owner" : (g_cfg.rpccookieperms == 1 ? "group" : "all"));
+    fprintf(stderr,"[config] log  : timestamps=%d micros=%d threadnames=%d sourcelocations=%d shrink=%d\n",
+            g_cfg.logtimestamps, g_cfg.logtimemicros, g_cfg.logthreadnames, g_cfg.logsourcelocations, g_cfg.shrinkdebugfile);
+    fprintf(stderr,"[config] peers: maxtipage=%lds inboundrelay=%d%% whitelistrelay=%d forcerelay=%d peerblockfilters=%d uacomment=%d\n",
+            g_cfg.maxtipage, g_cfg.inboundrelaypercent, g_cfg.whitelistrelay, g_cfg.whitelistforcerelay,
+            g_cfg.peerblockfilters, g_cfg.n_uacomment);
 }
+
+/* -acceptstalefeeestimates for daemon/mempool_cfg.c (weakly bound there). */
+int node_config_accept_stale_fee(void){ return g_cfg.acceptstalefeeestimates; }

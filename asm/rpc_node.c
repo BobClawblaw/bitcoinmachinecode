@@ -15,8 +15,10 @@
 #include "mempool_entry.h"
 #include "version_gen.h"
 #include <signal.h>
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
+#include "daemon/log_ts.h"
 #include <stdlib.h>   /* atof/atol/atoll -- implicitly declared before 2026-08-25,
                         * which silently corrupted their return values */
 #include <pthread.h>
@@ -29,7 +31,13 @@ static node_status_t*       g_status_rw;     /* writable handle for submission *
 static pthread_mutex_t      g_submit_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void rpc_node_set_status(const node_status_t* st){ g_status = st; }
+/* -uacomment: the runtime user agent main.c built (getnetworkinfo subversion). */
+static char g_user_agent[256];
+void rpc_node_set_user_agent(const char* ua){ snprintf(g_user_agent, sizeof g_user_agent, "%s", ua ? ua : ""); }
 void rpc_node_set_status_rw(node_status_t* st){ g_status_rw = st; if (!g_status) g_status = st; }
+/* getnetworkinfo localrelay: false under -blocksonly (Core: !ignore_incoming_txs) */
+static int g_localrelay = 1;
+void rpc_node_set_localrelay(int on){ g_localrelay = on ? 1 : 0; }
 
 /* txid of a raw tx (BIP141: hash of the no-witness serialization); worker
  * recomputes independently for the mempool. */
@@ -95,14 +103,14 @@ static int cmd_getnetworkinfo(rj_val** res){
 
     rj_val* o = rj_obj();
     rj_obj_set(o, "version", rj_numf("%ld", node_client_version()));
-    rj_obj_set(o, "subversion", rj_str(NODE_UA_STRING));
+    rj_obj_set(o, "subversion", rj_str(g_user_agent[0] ? g_user_agent : NODE_UA_STRING));
     rj_obj_set(o, "protocolversion", rj_numf("%d", NODE_PROTOCOL_VER));
     { char h[17]; snprintf(h, sizeof h, "%016llx", (unsigned long long)NODE_LOCAL_SERVICES);
       rj_obj_set(o, "localservices", rj_str(h)); }
     { rj_val* names = rj_arr(); rj_arr_push(names, rj_str("NETWORK"));
       rj_arr_push(names, rj_str("WITNESS"));
       rj_obj_set(o, "localservicesnames", names); }
-    rj_obj_set(o, "localrelay", rj_bool(1));
+    rj_obj_set(o, "localrelay", rj_bool(g_localrelay));
     rj_obj_set(o, "timeoffset", rj_numf("%d", 0));
     /* the REAL toggle state, not a constant: setnetworkactive changes it and
      * getnetworkinfo must reflect that, or the two disagree about whether
@@ -164,13 +172,14 @@ static int cmd_getpeerinfo(rj_val** res){
         for (int i = 0; i < RPC_MAX_PEERS; i++){
             const rpc_peer_t* p = &g_status->peers[i];
             if (!p->used) continue;
+            if (p->inbound && p->pid > 0 && kill((pid_t)p->pid, 0) != 0 && errno == ESRCH) continue;   /* a serve child that died with its slot */
             rj_val* o = rj_obj();
             rj_obj_set(o, "id", rj_numf("%d", id++));
             rj_obj_set(o, "addr", rj_str(p->addr));
             { char h[17]; snprintf(h, sizeof h, "%016llx", (unsigned long long)p->services);
               rj_obj_set(o, "services", rj_str(h)); }
             { rj_val* sn = rj_arr(); services_names(p->services, sn); rj_obj_set(o, "servicesnames", sn); }
-            rj_obj_set(o, "relaytxes", rj_bool(1));
+            rj_obj_set(o, "relaytxes", rj_bool(p->relaytxes));
             rj_obj_set(o, "lastsend", rj_numf("%lld", (long long)p->last_send));
             rj_obj_set(o, "lastrecv", rj_numf("%lld", (long long)p->last_recv));
             rj_obj_set(o, "bytessent", rj_numf("%lld", (long long)p->bytes_sent));
@@ -180,6 +189,15 @@ static int cmd_getpeerinfo(rj_val** res){
             rj_obj_set(o, "version", rj_numf("%u", p->proto));
             rj_obj_set(o, "subver", rj_str(p->subver));
             rj_obj_set(o, "inbound", rj_bool(p->inbound));
+            { /* Core NetPermissions::ToStrings order (net_permissions.cpp) */
+              rj_val* pa = rj_arr(); unsigned f = p->perms;
+              if (f & (1u<<0)) rj_arr_push(pa, rj_str("noban"));
+              if (f & (1u<<2)) rj_arr_push(pa, rj_str("forcerelay"));
+              if (f & (1u<<1)) rj_arr_push(pa, rj_str("relay"));
+              if (f & (1u<<3)) rj_arr_push(pa, rj_str("mempool"));
+              if (f & (1u<<4)) rj_arr_push(pa, rj_str("download"));
+              if (f & (1u<<5)) rj_arr_push(pa, rj_str("addr"));
+              rj_obj_set(o, "permissions", pa); }
             rj_obj_set(o, "startingheight", rj_numf("%d", p->start_height));
             rj_obj_set(o, "synced_headers", rj_numf("%d", -1));
             rj_obj_set(o, "synced_blocks", rj_numf("%d", -1));
@@ -919,6 +937,11 @@ static int gtsp_spends(const unsigned char* tx, unsigned long len,
     return 0;
 }
 
+/* the txo-spender index lives in rpc_chain.c; weak so the mempool-only test
+ * binaries that do not link the chain side still build (then: unavailable) */
+extern int rpc_chain_txospender_available(void) __attribute__((weak));
+extern int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsigned vout, unsigned char spender_wire[32],
+                                       long* height_out, unsigned char blockhash_wire[32], unsigned char* txout, long txcap, long* txlen_out) __attribute__((weak));
 static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
                                     long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
@@ -927,6 +950,17 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
     const rj_val* list = params->items[0];
     if (list->nitems == 0){
         *ec = -8; *em = "Invalid parameter, outputs are missing"; return 0; }
+    /* options (Core): mempool_only defaults to "true if txospenderindex
+     * unavailable, otherwise false"; return_spending_tx defaults to false */
+    int index_ok = (rpc_chain_txospender_available && rpc_chain_txospender_available()) ? 1 : 0;
+    int mempool_only = !index_ok, return_tx = 0;
+    if (params->nitems >= 2 && params->items[1]->typ == RJ_OBJ){
+        const rj_val* o = params->items[1];
+        rj_val* mo = rj_obj_get((rj_val*)o, "mempool_only"); rj_val* rt = rj_obj_get((rj_val*)o, "return_spending_tx");
+        if (mo){ if (mo->typ != RJ_BOOL){ *ec = -3; *em = "JSON value of type string is not of expected type bool"; return 0; } mempool_only = mo->str[0] == '1'; }
+        if (rt){ if (rt->typ != RJ_BOOL){ *ec = -3; *em = "JSON value of type string is not of expected type bool"; return 0; } return_tx = rt->str[0] == '1'; }
+    } else if (params->nitems >= 2 && params->items[1]->typ != RJ_NULL){
+        *ec = -3; *em = "JSON value of type string is not of expected type object"; return 0; }
     /* validate the whole list before touching the pool, so a bad entry
      * cannot produce a half-answered array */
     for (size_t i = 0; i < list->nitems; i++){
@@ -941,10 +975,12 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
     }
     static const char* HEXD = "0123456789abcdef";
     rj_val* arr = rj_arr();
+    int* pending = malloc(sizeof(int) * (list->nitems + 1)); int npending = 0;
+    if (!pending){ *ec = -7; *em = "oom"; return 0; }
     if (g_mph.mp) mpl();
     for (size_t i = 0; i < list->nitems; i++){
         const rj_val* e = list->items[i];
-        unsigned char want[32];
+        unsigned char want[32]; int found_mp = 0;
         gtsp_hex32_wire(rj_obj_get((rj_val*)e, "txid")->str, want);
         unsigned long vout = (unsigned long)atol(rj_obj_get((rj_val*)e, "vout")->str);
         rj_val* o = rj_obj();
@@ -963,12 +999,34 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
                 }
                 hx[64] = 0;
                 rj_obj_set(o, "spendingtxid", rj_str(hx));
+                if (return_tx){ char* th = malloc(me.len * 2 + 1); if (th){ for (unsigned long b = 0; b < me.len; b++){ th[b*2] = HEXD[me.tx[b]>>4]; th[b*2+1] = HEXD[me.tx[b]&15]; } th[me.len*2] = 0; rj_obj_set(o, "spendingtx", rj_str(th)); free(th); } }
+                found_mp = 1;
                 break;
             }
         }
+        if (!found_mp && !mempool_only) pending[npending++] = (int)i;   /* the index answers these below */
         rj_arr_push(arr, o);
     }
     if (g_mph.mp) mpu();
+    if (npending){
+        /* Core: "Mempool lacks a relevant spend, and txospenderindex is unavailable." */
+        if (!index_ok || !rpc_chain_txospender_lookup){ rj_free(arr); free(pending); *ec = -1; *em = "Mempool lacks a relevant spend, and txospenderindex is unavailable."; return 0; }
+        static unsigned char txbuf[4u << 20];
+        for (int q = 0; q < npending; q++){
+            int i = pending[q]; rj_val* o = arr->items[i]; const rj_val* e = list->items[i];
+            unsigned char want[32]; gtsp_hex32_wire(rj_obj_get((rj_val*)e, "txid")->str, want);
+            unsigned vout = (unsigned)atol(rj_obj_get((rj_val*)e, "vout")->str);
+            unsigned char sp[32], bh[32]; long h = -1, tl = 0;
+            if (!rpc_chain_txospender_lookup(want, vout, sp, &h, bh, return_tx ? txbuf : NULL, (long)sizeof txbuf, &tl)) continue;
+            char hx[65];
+            for (int b = 0; b < 32; b++){ unsigned char v = sp[31-b]; hx[b*2] = HEXD[v>>4]; hx[b*2+1] = HEXD[v&15]; } hx[64] = 0;
+            rj_obj_set(o, "spendingtxid", rj_str(hx));
+            if (return_tx && tl > 0){ char* th = malloc((size_t)tl * 2 + 1); if (th){ for (long b = 0; b < tl; b++){ th[b*2] = HEXD[txbuf[b]>>4]; th[b*2+1] = HEXD[txbuf[b]&15]; } th[tl*2] = 0; rj_obj_set(o, "spendingtx", rj_str(th)); free(th); } }
+            for (int b = 0; b < 32; b++){ unsigned char v = bh[31-b]; hx[b*2] = HEXD[v>>4]; hx[b*2+1] = HEXD[v&15]; }
+            rj_obj_set(o, "blockhash", rj_str(hx));
+        }
+    }
+    free(pending);
     *res = arr;
     return 1;
 }
@@ -1180,53 +1238,145 @@ static int cmd_getmempooldescendants(const rj_val* params, rj_val** res, long* e
     return cmd_mpe_relatives(params, res, ec, em, 1);
 }
 
-/* estimatesmartfee conf_target ("estimate_mode") -- Core rpc/fees.cpp shape
- * and argument validation, over THIS node's estimator. Core's estimator is a
- * confirmed-block bucket tracker; ours is the tx-accept policy layer's EMA of
- * accepted feerates (sat/kB, bitcoin_mempool_policy.c) -- an honest,
- * DIFFERENT estimator, so the NUMBER is ours, only the contract is Core's:
- *   - conf_target outside [1,1008] -> -8, Core's exact message.
- *   - estimate_mode other than unset/economical/conservative (any case) ->
- *     -8, Core's exact message. Both modes return the same EMA (one
- *     estimator; the economical/conservative split is meaningless for it).
- *   - no samples yet -> {"errors":["Insufficient data or no feerate found"],
- *     "blocks":N} exactly like a fresh Core node.
- *   - otherwise {"feerate": BTC/kvB, "blocks": N}, floored at the min relay
- *     fee, with N = the target clamped to >= 2 (Core's minimum horizon --
- *     estimatesmartfee 1 answers with "blocks": 2, verified on the oracle). */
+/* ==== fee estimation: estimatesmartfee / estimaterawfee =================
+ * Core rpc/fees.cpp over daemon/fee_estimator.c (the CBlockPolicyEstimator
+ * port). The estimator lives in the mempool hooks' `feeest` region; the
+ * functions are WEAK externs so rpc_node.o keeps its no-link-fanout
+ * property (test binaries without fee_estimator.c see NULL and answer the
+ * way a fresh estimator does: "Insufficient data", blocks 0). */
+#include "daemon/fee_estimator.h"
+extern unsigned long long fest_estimate_smart(const void*, int, int, int*, fest_result_t*) __attribute__((weak));
+extern unsigned long long fest_estimate_raw(const void*, int, double, int, fest_result_t*) __attribute__((weak));
+extern unsigned fest_highest_target(const void*, int) __attribute__((weak));
+
+static const char* rj_type_name(const rj_val* v){
+    if (!v) return "null";
+    switch (v->typ){ case RJ_NULL: return "null"; case RJ_BOOL: return "bool"; case RJ_NUM: return "number";
+                     case RJ_STR: return "string"; case RJ_ARR: return "array"; case RJ_OBJ: return "object"; default: return "null"; }
+}
+/* Core ParseConfirmTarget: "Invalid conf_target, must be between 1 and <max>" */
+static int fee_parse_target(const rj_val* params, unsigned max_target, long* ec, const char** em, int* out){
+    static char msg[96];
+    const rj_val* v = (params && params->typ == RJ_ARR && params->nitems >= 1) ? params->items[0] : 0;
+    if (!v || v->typ != RJ_NUM){
+        snprintf(msg, sizeof msg, "JSON value of type %s is not of expected type number", rj_type_name(v));
+        *ec = -3; *em = msg; return 0; }
+    long t = atol(v->str);
+    if (t < 1 || (unsigned long)t > max_target){
+        snprintf(msg, sizeof msg, "Invalid conf_target, must be between 1 and %u", max_target);
+        *ec = -8; *em = msg; return 0; }
+    *out = (int)t;
+    return 1;
+}
+static rj_val* fee_btc_per_kvb(unsigned long long satkvb){
+    return rj_numf("%llu.%08llu", satkvb / 100000000ULL, satkvb % 100000000ULL);   /* ValueFromAmount */
+}
+static rj_val* fee_dbl(double v){ return rj_numf("%.16g", v); }   /* UniValue: setprecision(16) */
+/* C round(): half away from zero. Beyond 2^53 a double has no fraction to
+ * round (the INF bucket bound is 1e99 -- a cast would overflow to 0). */
+static double fee_round(double v){
+    if (v >= 9007199254740992.0 || v <= -9007199254740992.0) return v;
+    return v < 0 ? -(double)(unsigned long long)(-v + 0.5) : (double)(unsigned long long)(v + 0.5);
+}
+
 static int cmd_estimatesmartfee(const rj_val* params, rj_val** res, long* ec, const char** em){
-    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
-        params->items[0]->typ != RJ_NUM){
-        *ec = -3; *em = "JSON value of type null is not of expected type number"; return 0; }
-    long target = atol(params->items[0]->str);
-    if (target < 1 || target > 1008){
-        *ec = -8; *em = "Invalid conf_target, must be between 1 and 1008"; return 0; }
-    if (params->nitems >= 2 && params->items[1]->typ == RJ_STR){
-        const char* m = params->items[1]->str; char lo[16]; size_t i=0;
-        for (; m[i] && i+1<sizeof lo; i++) lo[i] = (char)(m[i]>='A'&&m[i]<='Z' ? m[i]+32 : m[i]);
-        lo[i]=0;
-        if (strcmp(lo,"unset") && strcmp(lo,"economical") && strcmp(lo,"conservative")){
+    const void* fe = g_mph.feeest;
+    unsigned max_target = (fe && fest_highest_target) ? fest_highest_target(fe, FEST_LONG) : 1008u;
+    int target = 0;
+    if (!fee_parse_target(params, max_target, ec, em, &target)) return 0;
+    int conservative = 0;
+    if (params->nitems >= 2 && params->items[1]->typ != RJ_NULL){
+        const rj_val* mv = params->items[1];
+        if (mv->typ != RJ_STR){ *ec = -3; *em = "JSON value is not a string as expected"; return 0; }
+        /* FeeModeFromString: case-insensitive over unset/economical/conservative */
+        char lo[16]; size_t i = 0;
+        for (; mv->str[i] && i + 1 < sizeof lo; i++) lo[i] = (char)(mv->str[i] >= 'A' && mv->str[i] <= 'Z' ? mv->str[i] + 32 : mv->str[i]);
+        lo[i] = 0;
+        if (mv->str[i] || (strcmp(lo, "unset") && strcmp(lo, "economical") && strcmp(lo, "conservative"))){
             *ec = -8; *em = "Invalid estimate_mode parameter, must be one of: \"unset\", \"economical\", \"conservative\"";
             return 0; }
+        conservative = !strcmp(lo, "conservative");
     }
-    long blocks = target < 2 ? 2 : target;
-    rj_val* o = rj_obj();
-    unsigned long long satperkb=0, samples=0; int have=0;
-    if (g_mph.polstate && g_mph.estimate){
+    int returned = 0; unsigned long long feerate = 0;
+    if (fe && fest_estimate_smart){
         mpl();
-        have = (int)g_mph.estimate(g_mph.polstate, &satperkb, &samples);
+        feerate = fest_estimate_smart(fe, target, conservative, &returned, 0);
         mpu();
     }
-    if (!have || samples == 0){
+    rj_val* o = rj_obj();
+    if (feerate != 0){
+        /* max(estimate, mempool min fee, min relay feerate) */
+        unsigned long long minpool = 0;
+        if (g_mph.polstate && g_mph.min_fee){ mpl(); minpool = g_mph.min_fee(g_mph.polstate); mpu(); }
+        unsigned long long minrelay = g_mph.min_relay_satkvb ? g_mph.min_relay_satkvb : 100ULL;
+        if (minpool > feerate) feerate = minpool;
+        if (minrelay > feerate) feerate = minrelay;
+        rj_obj_set(o, "feerate", fee_btc_per_kvb(feerate));
+    } else {
         rj_val* errs = rj_arr();
         rj_arr_push(errs, rj_str("Insufficient data or no feerate found"));
         rj_obj_set(o, "errors", errs);
-    } else {
-        unsigned long long floor_satkvb = 1000;   /* min relay fee, 0.00001 BTC/kvB */
-        if (satperkb < floor_satkvb) satperkb = floor_satkvb;
-        rj_obj_set(o, "feerate", rj_numf("%llu.%08llu", satperkb/100000000ULL, satperkb%100000000ULL));
     }
-    rj_obj_set(o, "blocks", rj_numf("%ld", blocks));
+    rj_obj_set(o, "blocks", rj_numf("%d", returned));
+    *res = o;
+    return 1;
+}
+
+static rj_val* fee_bucket_obj(const fest_bucket_t* b){
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "startrange", fee_dbl(fee_round(b->start)));
+    rj_obj_set(o, "endrange", fee_dbl(fee_round(b->end)));
+    rj_obj_set(o, "withintarget", fee_dbl(fee_round(b->within_target * 100.0) / 100.0));
+    rj_obj_set(o, "totalconfirmed", fee_dbl(fee_round(b->total_confirmed * 100.0) / 100.0));
+    rj_obj_set(o, "inmempool", fee_dbl(fee_round(b->in_mempool * 100.0) / 100.0));
+    rj_obj_set(o, "leftmempool", fee_dbl(fee_round(b->left_mempool * 100.0) / 100.0));
+    return o;
+}
+/* estimaterawfee conf_target (threshold=0.95): one object per horizon that
+ * tracks the target -- feerate/decay/scale/pass[/fail], or on no answer
+ * decay/scale/fail/errors -- with Core's rounding (rpc/fees.cpp). */
+static int cmd_estimaterawfee(const rj_val* params, rj_val** res, long* ec, const char** em){
+    const void* fe = g_mph.feeest;
+    unsigned max_target = (fe && fest_highest_target) ? fest_highest_target(fe, FEST_LONG) : 1008u;
+    int target = 0;
+    if (!fee_parse_target(params, max_target, ec, em, &target)) return 0;
+    double threshold = 0.95;
+    if (params->nitems >= 2 && params->items[1]->typ != RJ_NULL){
+        const rj_val* tv = params->items[1];
+        if (tv->typ != RJ_NUM){
+            static char msg[96]; snprintf(msg, sizeof msg, "JSON value of type %s is not of expected type number", rj_type_name(tv));
+            *ec = -3; *em = msg; return 0; }
+        threshold = atof(tv->str);
+    }
+    if (threshold < 0 || threshold > 1){ *ec = -8; *em = "Invalid threshold"; return 0; }
+    static const char* const names[3] = { "short", "medium", "long" };
+    static const unsigned defaults[3] = { 12u, 48u, 1008u };
+    rj_val* o = rj_obj();
+    for (int h = 0; h < 3; h++){
+        unsigned hi = (fe && fest_highest_target) ? fest_highest_target(fe, h) : defaults[h];
+        if ((unsigned)target > hi) continue;
+        fest_result_t r; memset(&r, 0, sizeof r);
+        r.pass.start = r.pass.end = r.fail.start = r.fail.end = -1;
+        unsigned long long feerate = 0;
+        if (fe && fest_estimate_raw){ mpl(); feerate = fest_estimate_raw(fe, target, threshold, h, &r); mpu(); }
+        else { r.decay = h == 0 ? 0.962 : h == 1 ? 0.9952 : 0.99931; r.scale = h == 0 ? 1 : h == 1 ? 2 : 24; }
+        rj_val* ho = rj_obj();
+        if (feerate != 0){
+            rj_obj_set(ho, "feerate", fee_btc_per_kvb(feerate));
+            rj_obj_set(ho, "decay", fee_dbl(r.decay));
+            rj_obj_set(ho, "scale", rj_numf("%u", r.scale));
+            rj_obj_set(ho, "pass", fee_bucket_obj(&r.pass));
+            if (r.fail.start != -1) rj_obj_set(ho, "fail", fee_bucket_obj(&r.fail));
+        } else {
+            rj_obj_set(ho, "decay", fee_dbl(r.decay));
+            rj_obj_set(ho, "scale", rj_numf("%u", r.scale));
+            rj_obj_set(ho, "fail", fee_bucket_obj(&r.fail));
+            rj_val* errs = rj_arr();
+            rj_arr_push(errs, rj_str("Insufficient data or no feerate found which meets threshold"));
+            rj_obj_set(ho, "errors", errs);
+        }
+        rj_obj_set(o, names[h], ho);
+    }
     *res = o;
     return 1;
 }
@@ -1403,7 +1553,7 @@ static int cmd_getprioritisedtransactions(rj_val** res){
  * daemon (which has the worker + peer legs); the standalone bitcoin_rpcd has no
  * worker, so g_status_rw is NULL and this reports the node as unavailable. */
 #define SRT_WAIT_MS   90000     /* worker pickup can wait behind a 60s leg sync */
-#define SRT_POLL_US   3000
+#define SRT_POLL_US   500       /* was 3000: a 10k-entry mempool.dat reload took ~20 min at the submitter's poll rate (2026-09-01) */
 
 /* ==== savemempool / importmempool -- Core's mempool.dat ====================
  * The pool is shared memory the parent can read directly under the same lock
@@ -1509,6 +1659,68 @@ typedef struct {
  * hours -- the 2026-09-01 01:07 "deactivating" stall. */
 static const volatile sig_atomic_t* g_mpd_shutdown_flag;
 void rpc_node_set_shutdown_flag(const volatile sig_atomic_t* f){ g_mpd_shutdown_flag = f; }
+#define MPD_POLL_US 200      /* reload ack poll: 3 ms per entry was 30 s of pure waiting on a 10k dump */
+/* ---- parents-first ordering (2026-09-01) --------------------------------
+ * mempool.dat is written in pool order, not parent-before-child, so on a
+ * real dump about half the entries were rejected once for a missing input
+ * and re-offered in retry passes (8018 entries: 4203 waited). Collect the
+ * dump first, then emit every entry after the in-dump parents it spends
+ * (Kahn's algorithm, file order preserved among the ready ones). */
+typedef struct { unsigned char* tx; unsigned long len; long long t, d; unsigned char txid[32]; } mpd_ent;
+typedef struct { mpd_ent* v; long n, cap; int oom; } mpd_collect_ctx;
+static int mpd_collect_sink(void* vctx, const unsigned char* tx, unsigned long len, long long t, long long d){
+    mpd_collect_ctx* c = (mpd_collect_ctx*)vctx;
+    if (c->n == c->cap){ long nc = c->cap ? c->cap * 2 : 256; mpd_ent* nv = realloc(c->v, (size_t)nc * sizeof *nv); if (!nv){ c->oom = 1; return -1; } c->v = nv; c->cap = nc; }
+    unsigned char* cp = malloc(len); if (!cp){ c->oom = 1; return -1; }
+    memcpy(cp, tx, len);
+    static unsigned char scratch[2000*81 + 8];
+    mpd_ent* e = &c->v[c->n]; e->tx = cp; e->len = len; e->t = t; e->d = d;
+    if (!tx_txid(e->txid, cp, len, scratch, sizeof scratch)) memset(e->txid, 0, 32);
+    c->n++; return 0;
+}
+/* every prevout txid of `tx`: cb(ctx, txid_wire) per input */
+static void mpd_each_prevout(const unsigned char* tx, unsigned long len, void (*cb)(void*, const unsigned char*), void* ctx){
+    if (len < 10) return;
+    unsigned long p = 4; if (len > 6 && tx[4] == 0x00 && tx[5] == 0x01) p = 6;
+    unsigned long cc; unsigned long n_in = mp_varint(tx + p, &cc); p += cc;
+    if (n_in == 0 || n_in > 100000) return;
+    for (unsigned long i = 0; i < n_in; i++){
+        if (p + 36 > len) return;
+        cb(ctx, tx + p); p += 36;
+        unsigned long ssl = mp_varint(tx + p, &cc); p += cc + ssl + 4;
+        if (p > len) return;
+    }
+}
+typedef struct { const mpd_ent* v; long n; const long* slot; unsigned long mask; long* indeg; long self; long* children; long* child_head; long* child_next; long nchild; } mpd_topo_ctx;
+static long mpd_find(const mpd_topo_ctx* T, const unsigned char* txid){
+    unsigned long h = 0; for (int i = 0; i < 8; i++) h = (h << 8) | txid[i];
+    for (unsigned long k = h & T->mask;; k = (k + 1) & T->mask){ long s = T->slot[k]; if (s < 0) return -1; if (!memcmp(T->v[s].txid, txid, 32)) return s; }
+}
+static void mpd_topo_edge(void* vctx, const unsigned char* prev){
+    mpd_topo_ctx* T = (mpd_topo_ctx*)vctx; long p = mpd_find(T, prev);
+    if (p < 0 || p == T->self) return;
+    T->indeg[T->self]++;
+    T->children[T->nchild] = T->self; T->child_next[T->nchild] = T->child_head[p]; T->child_head[p] = T->nchild; T->nchild++;
+}
+/* fills order[0..n) with entry indexes, parents before children; returns the
+ * number placed (entries in a cycle -- impossible for valid txs -- go last) */
+long mpd_order_parents_first(const mpd_ent* v, long n, long* order){
+    unsigned long cap = 1; while (cap < (unsigned long)n * 2) cap <<= 1;
+    long* slot = malloc(cap * sizeof *slot); long* indeg = calloc((size_t)n, sizeof *indeg);
+    long total_in = 0; for (long i = 0; i < n; i++){ /* upper bound on edges: count inputs */ unsigned long p = 4; if (v[i].len > 6 && v[i].tx[4] == 0 && v[i].tx[5] == 1) p = 6; unsigned long cc; total_in += (long)mp_varint(v[i].tx + p, &cc); }
+    long* children = malloc((size_t)(total_in + 1) * sizeof *children); long* child_next = malloc((size_t)(total_in + 1) * sizeof *child_next); long* child_head = malloc((size_t)n * sizeof *child_head);
+    if (!slot || !indeg || !children || !child_next || !child_head){ free(slot); free(indeg); free(children); free(child_next); free(child_head); for (long i = 0; i < n; i++) order[i] = i; return n; }
+    for (unsigned long k = 0; k < cap; k++) slot[k] = -1;
+    for (long i = 0; i < n; i++){ unsigned long h = 0; for (int b = 0; b < 8; b++) h = (h << 8) | v[i].txid[b]; unsigned long k = h & (cap - 1); while (slot[k] >= 0) k = (k + 1) & (cap - 1); slot[k] = i; child_head[i] = -1; }
+    mpd_topo_ctx T = { v, n, slot, cap - 1, indeg, 0, children, child_head, child_next, 0 };
+    for (long i = 0; i < n; i++){ T.self = i; mpd_each_prevout(v[i].tx, v[i].len, mpd_topo_edge, &T); }
+    long placed = 0, head = 0; long* q = order;
+    for (long i = 0; i < n; i++) if (indeg[i] == 0) q[placed++] = i;
+    while (head < placed){ long u = q[head++]; for (long e = child_head[u]; e >= 0; e = child_next[e]){ long c = children[e]; if (--indeg[c] == 0) q[placed++] = c; } }
+    if (placed < n) for (long i = 0; i < n; i++) if (indeg[i] > 0){ q[placed++] = i; indeg[i] = 0; }
+    free(slot); free(indeg); free(children); free(child_next); free(child_head);
+    return placed;
+}
 static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len,
                           long long t, long long d){
     (void)t; (void)d;   /* entry time and fee delta are not restorable here --
@@ -1531,8 +1743,8 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
     while (waited < SRT_WAIT_MS*1000){
         if (st->tx_submit_ack == myseq){ ok = (st->tx_submit_result == 1); acked = 1; break; }
         if (g_mpd_shutdown_flag && *g_mpd_shutdown_flag){ c->aborted = 1; c->abort_why = "shutdown requested"; break; }
-        struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
-        waited += SRT_POLL_US;
+        struct timespec ts = {0, MPD_POLL_US*1000L}; nanosleep(&ts, NULL);   /* the worker acks within ~0.5 ms once it is servicing the stream */
+        waited += MPD_POLL_US;
     }
     if (acked) c->consec_timeouts = 0;
     else if (!c->aborted && ++c->consec_timeouts >= 2){ c->aborted = 1; c->abort_why = "the worker is not answering"; }
@@ -1582,9 +1794,13 @@ long rpc_node_mempool_load(const char* path){
     if (!g_status_rw) return -1;
     mpd_import_ctx c; memset(&c, 0, sizeof c); c.collecting = 1;
     char err[160]; err[0] = 0;
-    long r = mempool_dump_read(path ? path : "mempool.dat",
-                               mpd_import_one, &c, err, sizeof err);
-    if (r < 0){ mpd_retry_passes(&c); return -1; }
+    mpd_collect_ctx col; memset(&col, 0, sizeof col);
+    long r = mempool_dump_read(path ? path : "mempool.dat", mpd_collect_sink, &col, err, sizeof err);
+    if (r < 0 || col.oom){ for (long i = 0; i < col.n; i++) free(col.v[i].tx); free(col.v); return -1; }
+    long* order = malloc((size_t)(col.n + 1) * sizeof *order);
+    if (order) mpd_order_parents_first(col.v, col.n, order);
+    for (long k = 0; k < col.n; k++){ long i = order ? order[k] : k; mpd_import_one(&c, col.v[i].tx, col.v[i].len, col.v[i].t, col.v[i].d); }
+    for (long i = 0; i < col.n; i++) free(col.v[i].tx); free(col.v); free(order);
     long deferred = c.nretry;
     long gained = mpd_retry_passes(&c);
     fprintf(stderr, "[mempool] loaded %s: %ld accepted, %ld rejected of %ld (%ld waited for a parent, %ld of them then accepted)\n",
@@ -2096,7 +2312,7 @@ static const char* const NODE_METHODS[] = {
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "getrawaddrman", "getorphantxs", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "addpeeraddress", "disconnectnode",
     "setban", "setnetworkactive", "ping", "getzmqnotifications",
-    "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "prioritisetransaction", "getprioritisedtransactions", "submitblock", "sendrawtransaction", NULL
+    "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "estimaterawfee", "prioritisetransaction", "getprioritisedtransactions", "submitblock", "sendrawtransaction", NULL
 };
 
 const char* rpc_node_method_at(int i){
@@ -2160,6 +2376,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getmempoolancestors"))   return cmd_getmempoolancestors(params, res, ec, em);
     if (!strcmp(m, "getmempooldescendants")) return cmd_getmempooldescendants(params, res, ec, em);
     if (!strcmp(m, "estimatesmartfee"))   return cmd_estimatesmartfee(params, res, ec, em);
+    if (!strcmp(m, "estimaterawfee"))     return cmd_estimaterawfee(params, res, ec, em);
     if (!strcmp(m, "prioritisetransaction"))      return cmd_prioritisetransaction(params, res, ec, em);
     if (!strcmp(m, "getprioritisedtransactions")) return cmd_getprioritisedtransactions(res);
     if (!strcmp(m, "submitblock"))        return cmd_submitblock(params, res, ec, em);

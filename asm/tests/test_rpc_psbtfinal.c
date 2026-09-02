@@ -62,6 +62,10 @@ static rj_val* call(const char* method, const char* pj, long* ec, const char** e
     if (!ok){ if (r) rj_free(r); return NULL; }
     return r;
 }
+static void expect_err_any(const char* label, const char* method, const char* pj, long want_ec){
+    long ec2 = 0; const char* em2 = NULL; rj_val* r = call(method, pj, &ec2, &em2);
+    ck(label, r == NULL && ec2 == want_ec); if (r) rj_free(r);
+}
 static const char* S(const rj_val* o, const char* k){
     rj_val* v = o ? rj_obj_get((rj_val*)o, k) : NULL; return v ? v->str : NULL;
 }
@@ -345,11 +349,11 @@ int main(void){
         rj_free(f); }
       rj_free(r); }
 
-    { /* the descriptors argument is refused rather than ignored */
+    { /* the descriptors argument is honoured (2026-09-01: the Updater); a malformed descriptor is a parse error, not ignored */
       snprintf(pj, sizeof pj, "[\"%s\",[\"wpkh(%s)\"]]", psbt64, "xpub");
       rj_val* r = call("utxoupdatepsbt", pj, &ec, &em);
-      ck("supplying descriptors is an ERROR, not a silently ignored argument",
-         r == NULL && ec == -8 && em && strstr(em, "descriptors argument"));
+      ck("a malformed descriptor in the descriptors argument is an ERROR, not silently ignored",
+         r == NULL && ec == -5 && em && strstr(em, "not valid"));
       rj_free(r); }
 
     { /* fundrawtransaction is implemented now (rpc_wallet_ops.c); in this
@@ -361,8 +365,8 @@ int main(void){
          r == NULL && ec == -4 && em && strstr(em, "rescan"));
       rj_free(r);
       r = call("descriptorprocesspsbt", "[\"x\",[]]", &ec, &em);
-      ck("descriptorprocesspsbt refuses, naming the missing descriptor->key path",
-         r == NULL && ec == -1 && em && strstr(em, "spending key"));
+      ck("descriptorprocesspsbt is real (2026-09-01): a bad PSBT fails at decoding, not at a missing signer",
+         r == NULL && ec == -22 && em && strstr(em, "decode"));
       rj_free(r); }
 
     /* ================================================================
@@ -460,6 +464,98 @@ int main(void){
        rpc_known_method("combinerawtransaction") &&
        rpc_known_method("finalizepsbt") &&
        rpc_known_method("utxoupdatepsbt"));
+
+    /* ================================================================
+     * descriptorprocesspsbt: the wallet-less Signer (2026-09-01). The
+     * private key comes from the descriptor itself. A P2WPKH input under
+     * wpkh(WIF) is signed and finalized; a P2SH-P2WPKH input under
+     * sh(wpkh(WIF)) gets its redeemScript from the descriptor; a
+     * descriptor that does not cover the input signs nothing.
+     * ================================================================ */
+    {
+        extern void base58check_encode(char* out, const unsigned char* payload, long long paylen);
+        extern void scalar_to_pubkey(unsigned char pub[33], const unsigned char k[32]);
+        extern void hash160(unsigned char out[20], const void* in, long long len);
+        unsigned char dk[32]; for (int i = 0; i < 32; i++) dk[i] = (unsigned char)(0x71 + i);
+        unsigned char dpub[33], dh[20]; scalar_to_pubkey(dpub, dk); hash160(dh, dpub, 33);
+        char dhh[41]; hexify(dhh, dh, 20);
+        unsigned char pay[34]; pay[0] = 0x80; memcpy(pay+1, dk, 32); pay[33] = 1;
+        char wif[64]; base58check_encode(wif, pay, 34);
+        char wuns[600];
+        snprintf(wuns, sizeof wuns,
+            "02000000" "01"
+            "0303030303030303030303030303030303030303030303030303030303030303"
+            "00000000" "00" "fdffffff"
+            "01" "605af40500000000" "19" "76a914fc7250a211deddc70ee5a2738de5f07817351cef88ac"
+            "00000000");
+        unsigned char utx2[600]; size_t utx2l = unhex(utx2, wuns);
+        /* helper: a one-input PSBT carrying witness_utxo {1 BTC, spk} */
+        #define MK_PSBT(ps64, spkhex) do{ \
+            unsigned char ps[2000]; long o = 0; \
+            ps[o++]='p'; ps[o++]='s'; ps[o++]='b'; ps[o++]='t'; ps[o++]=0xff; \
+            { unsigned char k = 0x00; o += kv(ps+o, &k, 1, utx2, utx2l); ps[o++] = 0x00; } \
+            { unsigned char wu[64]; long w2 = 0; unsigned long long val = 100000000ULL; \
+              for (int i = 0; i < 8; i++) wu[w2++] = (unsigned char)(val >> (8*i)); \
+              unsigned char spkb[64]; size_t spkl = unhex(spkb, spkhex); \
+              w2 += vi(wu+w2, spkl); memcpy(wu+w2, spkb, spkl); w2 += (long)spkl; \
+              unsigned char k1 = 0x01; o += kv(ps+o, &k1, 1, wu, (unsigned long)w2); ps[o++] = 0x00; } \
+            ps[o++] = 0x00; b64(ps64, ps, o); }while(0)
+        char wspk[64]; snprintf(wspk, sizeof wspk, "0014%s", dhh);
+        char ps64[4000]; MK_PSBT(ps64, wspk);
+        char pj[4400]; snprintf(pj, sizeof pj, "[\"%s\", [\"wpkh(%s)\"]]", ps64, wif);
+        rj_val* dr = call("descriptorprocesspsbt", pj, &ec, &em);
+        ck("descriptorprocesspsbt signs a wpkh(WIF) input", dr != NULL);
+        if (!dr) printf("    (%ld: %s)\n", ec, em ? em : "");
+        ck("...complete true", dr && S(dr, "complete") && S(dr, "complete")[0] == '1');
+        { const char* h = dr ? S(dr, "hex") : NULL; char ph[67]; hexify(ph, dpub, 33);
+          ck("...hex present and its witness carries the descriptor's pubkey", h && strstr(h, ph)); }
+        rj_free(dr);
+        /* sh(wpkh(WIF)): the redeemScript comes from the descriptor */
+        { unsigned char rd[22] = {0x00, 0x14}; memcpy(rd+2, dh, 20); unsigned char rh[20]; hash160(rh, rd, 22);
+          char rhh[41]; hexify(rhh, rh, 20); char sspk[64]; snprintf(sspk, sizeof sspk, "a914%s87", rhh);
+          MK_PSBT(ps64, sspk);
+          snprintf(pj, sizeof pj, "[\"%s\", [\"sh(wpkh(%s))\"]]", ps64, wif);
+          dr = call("descriptorprocesspsbt", pj, &ec, &em);
+          ck("sh(wpkh(WIF)) input signs with the descriptor's redeemScript", dr && S(dr, "complete") && S(dr, "complete")[0] == '1');
+          if (!dr) printf("    (%ld: %s)\n", ec, em ? em : "");
+          rj_free(dr); }
+        /* a descriptor that does not cover the input signs nothing */
+        MK_PSBT(ps64, wspk);
+        snprintf(pj, sizeof pj, "[\"%s\", [\"pkh(%s)\"]]", ps64, wif);
+        dr = call("descriptorprocesspsbt", pj, &ec, &em);
+        ck("an uncovered input is left unsigned: complete false, no hex", dr && S(dr, "complete") && S(dr, "complete")[0] == '0' && !S(dr, "hex"));
+        rj_free(dr);
+        /* a public-only descriptor cannot sign, and says nothing false */
+        { char ph[67]; hexify(ph, dpub, 33);
+          snprintf(pj, sizeof pj, "[\"%s\", [\"wpkh(%s)\"]]", ps64, ph);
+          dr = call("descriptorprocesspsbt", pj, &ec, &em);
+          ck("a public-key-only descriptor leaves the input unsigned", dr && S(dr, "complete") && S(dr, "complete")[0] == '0');
+          rj_free(dr); }
+        expect_err_any("a malformed descriptor is refused", "descriptorprocesspsbt", "[\"cHNidP8=\", [\"wpkh(notakey)\"]]", -5);
+        /* wsh(multi(2,K1,K2)): the witnessScript comes from the descriptor (2026-09-01) */
+        { unsigned char dk2[32]; for (int i = 0; i < 32; i++) dk2[i] = (unsigned char)(0x91 + i);
+          unsigned char dpub2[33]; scalar_to_pubkey(dpub2, dk2);
+          unsigned char pay2[34]; pay2[0] = 0x80; memcpy(pay2+1, dk2, 32); pay2[33] = 1; char wif2[64]; base58check_encode(wif2, pay2, 34);
+          unsigned char ws[71]; int o = 0; ws[o++] = 0x52; ws[o++] = 33; memcpy(ws+o, dpub, 33); o += 33; ws[o++] = 33; memcpy(ws+o, dpub2, 33); o += 33; ws[o++] = 0x52; ws[o++] = 0xae;
+          extern void sha256_full(unsigned char out[32], const void* msg, unsigned long len);
+          unsigned char wsh[32]; sha256_full(wsh, ws, (unsigned long)o); char wshh[65]; hexify(wshh, wsh, 32);
+          char wspk2[80]; snprintf(wspk2, sizeof wspk2, "0020%s", wshh);
+          MK_PSBT(ps64, wspk2);
+          char ph1[67], ph2[67]; hexify(ph1, dpub, 33); hexify(ph2, dpub2, 33);
+          snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(multi(2,%s,%s))\"]]", ps64, wif, wif2);
+          dr = call("descriptorprocesspsbt", pj, &ec, &em);
+          ck("wsh(multi(2,WIF,WIF)) input signs to completion with the descriptor's witnessScript", dr && S(dr, "complete") && S(dr, "complete")[0] == '1');
+          if (!dr) printf("    (%ld: %s)\n", ec, em ? em : "");
+          rj_free(dr);
+          /* only one of the two keys: partial, not complete */
+          snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(multi(2,%s,%s))\"]]", ps64, wif, ph2);
+          dr = call("descriptorprocesspsbt", pj, &ec, &em);
+          ck("...with one private key it stays incomplete", dr && S(dr, "complete") && S(dr, "complete")[0] == '0');
+          if (!dr) printf("    (%ld: %s)\n", ec, em ? em : "");
+          else if (S(dr, "complete")) printf("    (complete=%s)\n", S(dr, "complete"));
+          rj_free(dr); }
+        #undef MK_PSBT
+    }
 
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;

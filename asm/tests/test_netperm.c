@@ -65,8 +65,7 @@ int main(void){
     {
         /* Each is a real Core token. Accepting any of them would mean the
          * operator believes something the node does not do. */
-        const char* recognised[] = { "mempool", "relay", "forcerelay",
-                                     "download", "addr", "bloomfilter", 0 };
+        const char* recognised[] = { "bloomfilter", "out", 0 };   /* 2026-09-01: mempool/download/addr/in are enforced now */
         int all = 1;
         for (int i = 0; recognised[i]; i++){
             char spec[64]; snprintf(spec, sizeof spec, "%s@127.0.0.1", recognised[i]);
@@ -88,9 +87,31 @@ int main(void){
     {   /* noban alongside an unenforced one must still refuse: granting the
          * half we implement would be worse than refusing the whole line. */
         const char* e = 0;
-        ok(!netperm_add("noban,mempool@127.0.0.1", &e),
-           "noban,mempool is refused rather than half-honoured");
+        ok(!netperm_add("noban,bloomfilter@127.0.0.1", &e),
+           "noban,bloomfilter is refused rather than half-honoured");
+        e = 0; netperm_reset();
+        ok(netperm_add("noban,mempool@127.0.0.1", &e) && (netperm_for("127.0.0.1") & NP_MEMPOOL) && (netperm_for("127.0.0.1") & NP_NOBAN),
+           "noban,mempool grants both (2026-09-01: mempool is enforced)");
+        netperm_reset();
     }
+
+    printf("== relay / forcerelay (2026-09-01: -whitelistrelay, -whitelistforcerelay) ==\n");
+    netperm_reset(); netperm_set_implicit_defaults(1, 0);           /* Core's defaults */
+    ok(add("relay@10.1.1.1") && (netperm_for("10.1.1.1") & NP_RELAY) && !(netperm_for("10.1.1.1") & NP_FORCERELAY),
+       "relay@ grants relay, not forcerelay");
+    ok(add("forcerelay@10.1.1.2") && (netperm_for("10.1.1.2") & NP_FORCERELAY) && (netperm_for("10.1.1.2") & NP_RELAY),
+       "forcerelay@ grants forcerelay AND relay (Core: forcerelay implies relay)");
+    ok(add("noban@10.1.1.3") && !(netperm_for("10.1.1.3") & NP_RELAY),
+       "an explicit noban@ list grants only what it names");
+    ok(add("10.1.1.4") && (netperm_for("10.1.1.4") & NP_NOBAN) && (netperm_for("10.1.1.4") & NP_RELAY) && !(netperm_for("10.1.1.4") & NP_FORCERELAY),
+       "an implicit entry gets noban+relay with Core's defaults (whitelistrelay=1, forcerelay=0)");
+    netperm_set_implicit_defaults(0, 0);
+    ok(!(netperm_for("10.1.1.4") & NP_RELAY) && (netperm_for("10.1.1.1") & NP_RELAY),
+       "whitelistrelay=0 strips relay from implicit entries only (explicit relay@ keeps it)");
+    netperm_set_implicit_defaults(1, 1);
+    ok((netperm_for("10.1.1.4") & NP_FORCERELAY) && (netperm_for("10.1.1.4") & NP_RELAY),
+       "whitelistforcerelay=1 gives implicit entries forcerelay+relay");
+    netperm_set_implicit_defaults(1, 0);
 
     printf("== malformed input is refused, not guessed at ==\n");
     netperm_reset();
@@ -118,7 +139,7 @@ int main(void){
         /* The fd mapping is the whole mechanism: a peer's permissions come
          * from the socket that accepted it, which is how a peer whose address
          * you cannot predict gets them at all. */
-        netperm_bind_fd(7, NP_NOBAN);
+        netperm_bind_fd(7, netperm_whitebind_flags(0));
         ok(netperm_for_fd(7) & NP_NOBAN, "a bound listener fd grants its flags");
         ok(netperm_for_fd(8) == 0, "an unrelated fd grants nothing");
         ok(netperm_for_fd(-1) == 0, "and -1 is not a listener");
@@ -131,7 +152,7 @@ int main(void){
         ok(!netperm_whitebind_add("noban@127.0.0.1:0", &e), "port 0 is refused");
         ok(!netperm_whitebind_add("noban@127.0.0.1:70000", &e), "a port over 65535 is refused");
         ok(!netperm_whitebind_add("noban@nothost:8333", &e), "a hostname is refused");
-        ok(!netperm_whitebind_add("mempool@127.0.0.1:8333", &e),
+        ok(!netperm_whitebind_add("bloomfilter@127.0.0.1:8333", &e),
            "a permission this node does not enforce is refused here too");
         ok(!netperm_whitebind_add("", &e), "empty is refused");
 
