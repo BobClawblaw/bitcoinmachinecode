@@ -75,7 +75,7 @@ int main(void){
     char wsh[8001]; hexify(wsh, ws, (size_t)wl);
 
     printf("== 1. signrawtransactionwithkey: key branch with the preimage ==\n");
-    char params[12000];
+    char params[20000];
     snprintf(params, sizeof params, "[\"%s\",[\"%s\"],[{\"txid\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"vout\":0,\"scriptPubKey\":\"%s\",\"amount\":1.0,\"witnessScript\":\"%s\",\"pubkeys\":[\"%s\"],\"preimages\":[{\"hash\":\"%s\",\"preimage\":\"%s\"}]}]]",
              UNSIGNED, W1, spk, wsh, PUB2, hh, ph);
     long ec = 0; const char* em = NULL; rj_val* r = call("signrawtransactionwithkey", params, &ec, &em);
@@ -189,7 +189,7 @@ int main(void){
     printf("== 6. musig(): descriptorprocesspsbt is the Updater too -- participants/derivation fields, then the rounds ==\n");
     for (int variant = 0; variant < 2; variant++){
         /* variant 0: tr(musig(A,B)) -- we hold both keys: fields, two pubnonces, then the rounds run to a key-path signature
-         * variant 1: tr(musig(xprv,xpub)/0/*) -- derivation: the bip32 field appears; we hold one key: one pubnonce, never complete */
+         * variant 1: tr(musig(xprv,xpub)/0/<star>) -- derivation: the bip32 field appears; we hold one key: one pubnonce, never complete */
         char mdesc[700];
         if (variant == 0) snprintf(mdesc, sizeof mdesc, "tr(musig(%s,%s))", W1, W2);
         else snprintf(mdesc, sizeof mdesc, "tr(musig(xprvA1RpRA33e1JQ7ifknakTFpgNXPmW2YvmhqLQYMmrj4xJXXWYpDPS3xz7iAxn8L39njGVyuoseXzU6rcxFLJ8HFsTjSyQbLYnMpCqE2VbFWc,xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y)/0/*)");

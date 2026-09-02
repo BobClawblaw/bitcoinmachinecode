@@ -87,7 +87,8 @@ static int tx_witness_of(const unsigned char* tx, long txlen, unsigned long want
     }
     unsigned long nout = rd_varint(q,e,&c); if(!c) return 0; q += c;
     for (unsigned long i=0;i<nout;i++){
-        if (q+8 > e) return 0; q += 8;
+        if (q+8 > e) return 0;
+        q += 8;
         unsigned long sl = rd_varint(q,e,&c); if(!c) return 0; q += c + sl;
         if (q > e) return 0;
     }
@@ -174,7 +175,6 @@ int main(void){
             unsigned long nprev=strtoul(np_h,0,10);
             long tn=hex2b(tx_h, txs, 1<<20);
             static unsigned char amounts[10000*8], spks_packed[1<<20], outpoints[10000*36];
-            static unsigned long spk_off[10001];
             unsigned long spos=0; int bad=0;
             unsigned long tap_spk_off=0, tap_spk_len=0;
             for(unsigned long i=0;i<nprev && !bad;i++){
@@ -185,7 +185,6 @@ int main(void){
                 for(int b=0;b<8;b++) amounts[i*8+b]=(unsigned char)(amt>>(8*b));
                 long pl=hex2b(spk_h2, spks_packed+spos+1, (1<<20)-spos-2);
                 spks_packed[spos]=(unsigned char)pl;          /* varint-style length prefix */
-                spk_off[i]=spos;
                 if(i==idx){ tap_spk_off=spos+1; tap_spk_len=(unsigned long)pl; }
                 spos += 1 + (unsigned long)pl;
             }

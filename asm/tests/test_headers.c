@@ -72,7 +72,8 @@ int main(void){
     fseek(f,0,SEEK_END); long sz=ftell(f); fclose(f);
     cki("headers.dat size = 5*112", sz, 560);
     FILE* f2 = fopen("headers.dat","rb");
-    unsigned char e0[112]; fread(e0,1,112,f2); fclose(f2);
+    unsigned char e0[112]; size_t e0n = fread(e0,1,112,f2); fclose(f2);
+    cki("entry0 is 112 bytes on disk", (long)e0n, 112);
     cki("entry0 hdr == hdr0", memcmp(e0, hdr[0], 80)==0, 1);
     cki("entry0 hash == bh0", memcmp(e0+80, bh[0], 32)==0, 1);
 

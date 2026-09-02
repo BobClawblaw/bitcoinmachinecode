@@ -240,8 +240,8 @@ int main(void){
     { char tdir[] = "/tmp/bmc_wsl_XXXXXX";
       if (!mkdtemp(tdir)){ ck("wsl mkdtemp", 0); }
       else {
-        char oldcwd[512]; getcwd(oldcwd, sizeof oldcwd);
-        chdir(tdir);
+        char oldcwd[512]; if (!getcwd(oldcwd, sizeof oldcwd)){ ck("wsl getcwd", 0); oldcwd[0] = 0; }
+        if (chdir(tdir) != 0) ck("wsl chdir into the temp dir", 0);
         extern int txlog_append(const char*, unsigned long long, const unsigned char*,
                                 long long, long long, const unsigned char*, unsigned long, long);
         unsigned char tx1[32], tx2[32], dest[20];
@@ -352,7 +352,7 @@ int main(void){
              mine && rj_obj_get(mine,"trusted") && rj_obj_get(mine,"untrusted_pending")
              && rj_obj_get(mine,"immature") && rj_obj_get(mine,"nonmempool"));
           rj_free(r2); rj_free(pr); }
-        chdir(oldcwd);
+        if (oldcwd[0] && chdir(oldcwd) != 0) ck("wsl chdir back", 0);
       } }
 
     /* --- error parity --- */

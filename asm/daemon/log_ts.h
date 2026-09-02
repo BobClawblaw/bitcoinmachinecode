@@ -4,7 +4,7 @@
  * Include AFTER <stdio.h> (needs FILE/vfprintf already declared) and
  * BEFORE any fprintf(stderr, ...) calls in the including file. Redefines
  * fprintf via macro for the REST of that translation unit only -- this
- * codebase's daemon/*.c files call fprintf exclusively on stderr for
+ * codebase's daemon .c files call fprintf exclusively on stderr for
  * logging (verified: every fprintf( call site is fprintf(stderr, ...),
  * none write to any other stream), so there's no risk of accidentally
  * timestamping a data write.
@@ -52,17 +52,20 @@ static int log_vfprintf_at(const char* file, int line, FILE* stream, const char*
                          tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
                          tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ts.tv_nsec / 1000000);
     }
-    if (p < 0) p = 0; if (p > (int)sizeof buf) p = (int)sizeof buf;
+    if (p < 0) p = 0;
+    if (p > (int)sizeof buf) p = (int)sizeof buf;
     if (g_log_threadnames && p < (int)sizeof buf - 24){
         char tn[17] = {0};
         if (prctl(PR_GET_NAME, tn, 0, 0, 0) != 0) tn[0] = 0;   /* the calling thread's comm */
         int q = snprintf(buf + p, sizeof buf - p, "[%s] ", tn[0] ? tn : "-");
-        if (q > 0) p += q; if (p > (int)sizeof buf) p = (int)sizeof buf;
+        if (q > 0) p += q;
+        if (p > (int)sizeof buf) p = (int)sizeof buf;
     }
     if (g_log_sourcelocations && file && p < (int)sizeof buf - 8){
         const char* base = file; for (const char* c = file; *c; c++) if (*c == '/') base = c + 1;
         int q = snprintf(buf + p, sizeof buf - p, "[%s:%d] ", base, line);
-        if (q > 0) p += q; if (p > (int)sizeof buf) p = (int)sizeof buf;
+        if (q > 0) p += q;
+        if (p > (int)sizeof buf) p = (int)sizeof buf;
     }
     int m = vsnprintf(buf + p, sizeof buf - p, fmt, ap);
     int total = p + (m > 0 ? m : 0);
@@ -71,13 +74,14 @@ static int log_vfprintf_at(const char* file, int line, FILE* stream, const char*
     return m;
 }
 
-static int log_fprintf_at(const char* file, int line, FILE* stream, const char* fmt, ...) {
+static inline int log_fprintf_at(const char* file, int line, FILE* stream, const char* fmt, ...) {
     va_list ap; va_start(ap, fmt);
     int m = log_vfprintf_at(file, line, stream, fmt, ap);
     va_end(ap); return m;
 }
-/* direct callers (a few files log through the function by name) */
-static int log_fprintf(FILE* stream, const char* fmt, ...) {
+/* direct callers (a few files log through the function by name; inline so
+ * the translation units that do not are not told it is unused) */
+static inline int log_fprintf(FILE* stream, const char* fmt, ...) {
     va_list ap; va_start(ap, fmt);
     int m = log_vfprintf_at(NULL, 0, stream, fmt, ap);
     va_end(ap); return m;

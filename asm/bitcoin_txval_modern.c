@@ -204,7 +204,8 @@ static int mv_parse(mv_tx_t* T){
         T->out_total += v;
         if (T->out_total > MV_MAX_MONEY) return 0;
         uint64_t sl = rd_cs(&p, end, &ok);
-        if (!ok || sl > (uint64_t)(end - p)) return 0; p += sl;
+        if (!ok || sl > (uint64_t)(end - p)) return 0;
+        p += sl;
     }
     /* witness: no overall stack-count field on the wire -- exactly one
      * stack per input, back-to-back (Core's SerializeTransaction writes

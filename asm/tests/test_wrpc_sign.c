@@ -53,7 +53,7 @@ static int validate_signed_tx(const unsigned char* tx, unsigned long txlen, void
     if(tx_parse(&info,tx,txlen)!=1){printf("  [parse]\n");return 0;}
     if(info.n_in==0||info.n_out==0)return 0;
     unsigned long long total_in=0;
-    const unsigned char* scripts[64]; unsigned long long vals[64];
+    const unsigned char* scripts[64];
     const unsigned char* p=tx+4;
     unsigned long ni=rd_varint(p,&p);
     for(unsigned int i=0;i<ni&&i<64;i++){
@@ -62,7 +62,7 @@ static int validate_signed_tx(const unsigned char* tx, unsigned long txlen, void
         p+=36; unsigned long sl=rd_varint(p,&p); p+=sl+4;
         unsigned long long val; const unsigned char* s; unsigned long ssl, h_unused, cb_unused;
         if(utxo_get(utxo,txid,idx,&val,&h_unused,&cb_unused,&s,&ssl)!=1){printf("  [double-spend]\n");return 0;}
-        scripts[i]=s; vals[i]=val; total_in+=val;
+        scripts[i]=s; total_in+=val;
     }
     for(unsigned int i=0;i<info.n_in&&i<64;i++)
         if(verify_p2pkh(tx,txlen,i,scripts[i],25,work,workcap)!=1){printf("  [sig] in %u\n",i);return 0;}

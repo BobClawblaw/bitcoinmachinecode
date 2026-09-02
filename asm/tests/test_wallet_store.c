@@ -29,7 +29,7 @@ static int copy_file(const char* from, const char* to){
 int main(void){
     const char* MN = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     const char* XPRV = "xprv9s21ZrQH143K3QTDL4LXw2F7HEK3wJUD2nW2nRk4stbPy6cq3jPPqjiChkVvvNKmPGJxWUtg6LnF5kejMRNNU3TGtRBeJgk33yuGBxrMPHi";
-    char fix_v2[512], fix_hdk[512]; char cwd[512]; if (!getcwd(cwd, sizeof cwd)) return 1;
+    char fix_v2[1024], fix_hdk[1024]; char cwd[512]; if (!getcwd(cwd, sizeof cwd)) return 1;
     snprintf(fix_v2, sizeof fix_v2, "%s/tests/fixtures/wallet_store_legacy_v2.wal", cwd);
     snprintf(fix_hdk, sizeof fix_hdk, "%s/tests/fixtures/wallet_store_legacy_hdk.dat", cwd);
     char tmpl[] = "/tmp/wstoreXXXXXX"; char* dir = mkdtemp(tmpl); if (!dir || chdir(dir) != 0){ printf("FAIL tmpdir\n"); return 1; }

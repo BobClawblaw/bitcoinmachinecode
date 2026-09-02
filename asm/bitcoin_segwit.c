@@ -318,9 +318,9 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
     const uint8_t* outs_start = q;      /* nout varint + every CTxOut, verbatim */
     uint64_t nout = read_cs(&q, end, &ok);
     if (!ok) return 0;
-    for (uint64_t i=0;i<nout;i++){ if (sw_avail(q, end) < 8) return 0; q += 8;
+    for (uint64_t i=0;i<nout;i++){ if (sw_avail(q, end) < 8) { return 0; } q += 8;
         uint64_t sl = read_cs(&q, end, &ok);
-        if (!ok || sw_avail(q, end) < sl) return 0; q += sl; }
+        if (!ok || sw_avail(q, end) < sl) { return 0; } q += sl; }
     /* q = witness section start (segwit) or locktime (legacy). Wire format
      * has no overall witness-stack-count field: exactly one stack per
      * input, back-to-back. */
@@ -331,7 +331,7 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
             uint64_t nitems = read_cs(&q, end, &ok);
             if (!ok) return 0;
             for (uint64_t j=0;j<nitems;j++){ uint64_t il=read_cs(&q, end, &ok);
-                if (!ok || sw_avail(q, end) < il) return 0; q += il; }
+                if (!ok || sw_avail(q, end) < il) { return 0; } q += il; }
         }
         lock = q;
     }
@@ -340,11 +340,11 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
     uint8_t* d = out;
     long dsz = 0;
     /* version */
-    if (dsz + 4 > cap) return 0; memcpy(d, tx, 4); d += 4; dsz += 4;
+    if (dsz + 4 > cap) { return 0; } memcpy(d, tx, 4); d += 4; dsz += 4;
     /* nin */
     {
         uint8_t tmp[9]; put_cs(tmp, nin); long csn = cs_size(nin);
-        if (dsz + csn > cap) return 0; memcpy(d, tmp, csn); d += csn; dsz += csn;
+        if (dsz + csn > cap) { return 0; } memcpy(d, tmp, csn); d += csn; dsz += csn;
     }
     /* inputs (scriptSigs preserved; our segwit spends carry empty ones) */
     {
@@ -353,7 +353,7 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
         if (!ok) return 0;
         const uint8_t* it = in0;
         for (uint64_t i=0;i<nin;i++){
-            if (dsz + 36 > cap) return 0; memcpy(d, it, 36); d += 36; dsz += 36; it += 36;
+            if (dsz + 36 > cap) { return 0; } memcpy(d, it, 36); d += 36; dsz += 36; it += 36;
             uint64_t sl = read_cs(&it, end, &ok);
             if (!ok) return 0;
             /* cap is a long and sl is wire-derived: compare unsigned before
@@ -376,13 +376,8 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
         memcpy(d, outs_start, (size_t)olen); d += olen; dsz += olen;
     }
     /* locktime */
-    if (dsz + 4 > cap) return 0; memcpy(d, lock, 4); d += 4; dsz += 4;
+    if (dsz + 4 > cap) { return 0; } memcpy(d, lock, 4); d += 4; dsz += 4;
     return dsz;
-}
-
-/* Convert big-endian 32-byte to limbs (for ecdsa z). */
-static void z_limbs_from_be(uint64_t z[4], const uint8_t* be32){
-    be_to_limbs(z, be32, 32);
 }
 
 /* ==========================================================================
@@ -470,9 +465,9 @@ long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
     }
 
     /* version */
-    if (p + 4 > pend) return 0; w32le(p, (uint32_t)t.version); p += 4;
+    if (p + 4 > pend) { return 0; } w32le(p, (uint32_t)t.version); p += 4;
     /* hashPrevouts / hashSequence */
-    if (p + 64 > pend) return 0; memcpy(p, hashPrevouts, 32); p += 32;
+    if (p + 64 > pend) { return 0; } memcpy(p, hashPrevouts, 32); p += 32;
     memcpy(p, hashSequence, 32); p += 32;
     /* outpoint[nIn] */
     {
@@ -484,18 +479,18 @@ long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
     put_cs(p, scriptcode_len); p += cs_size(scriptcode_len);
     memcpy(p, scriptCode, scriptcode_len); p += scriptcode_len;
     /* amount */
-    if (p + 8 > pend) return 0; w64le(p, amount); p += 8;
+    if (p + 8 > pend) { return 0; } w64le(p, amount); p += 8;
     /* nSequence[nIn] */
     {
         if (p + 4 > pend) return 0;
         w32le(p, sw_seq(&t, n_in)); p += 4;
     }
     /* hashOutputs */
-    if (p + 32 > pend) return 0; memcpy(p, hashOutputs, 32); p += 32;
+    if (p + 32 > pend) { return 0; } memcpy(p, hashOutputs, 32); p += 32;
     /* locktime */
-    if (p + 4 > pend) return 0; w32le(p, t.locktime); p += 4;
+    if (p + 4 > pend) { return 0; } w32le(p, t.locktime); p += 4;
     /* nHashType */
-    if (p + 4 > pend) return 0; w32le(p, nHashType); p += 4;
+    if (p + 4 > pend) { return 0; } w32le(p, nHashType); p += 4;
 
     long prelen = (long)(p - pre);
     /* final sighash = double SHA256 of the preimage */

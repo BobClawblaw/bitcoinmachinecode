@@ -66,7 +66,8 @@ int main(void){
     printf("== 1. tr() with public keys: the Updater fills the taproot fields, nothing signs ==\n");
     snprintf(pj, sizeof pj, "[\"%s\", [\"%s\"], \"DEFAULT\", true, false]", ps64, desc_pub);
     r = call("descriptorprocesspsbt", pj, &ec, &em);
-    ck("descriptorprocesspsbt returns", r && S(r, "psbt")); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+    ck("descriptorprocesspsbt returns", r && S(r, "psbt"));
+    if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
     ck("...complete=false (no private keys)", r && S(r, "complete") && S(r, "complete")[0] == '0');
     d = r && S(r, "psbt") ? decode(S(r, "psbt")) : NULL; rj_val* i0 = in0(d);
     { rj_val* ts = i0 ? rj_obj_get(i0, "taproot_scripts") : NULL;
@@ -93,12 +94,14 @@ int main(void){
       rj_val* o0 = out0(d);
       ck("output paying the same tr(): taproot_internal_key, taproot_tree (2 leaves), taproot_bip32_derivs", o0 && S(o0, "taproot_internal_key") && rj_obj_get(o0, "taproot_tree") && rj_obj_get(o0, "taproot_tree")->nitems == 2 && rj_obj_get(o0, "taproot_bip32_derivs") && rj_obj_get(o0, "taproot_bip32_derivs")->nitems == 3);
       { rj_val* tt = o0 ? rj_obj_get(o0, "taproot_tree") : NULL; ck("...tree leaves at depth 1 with leaf_ver 192", tt && tt->nitems == 2 && S(tt->items[0], "depth") && !strcmp(S(tt->items[0], "depth"), "1") && !strcmp(S(tt->items[0], "leaf_ver"), "192")); } }
-    if (d) rj_free(d); if (r) rj_free(r);
+    if (d) rj_free(d);
+    if (r) rj_free(r);
 
     printf("== 2. with x1's private key: signs leaf A with no fields pre-supplied ==\n");
     snprintf(pj, sizeof pj, "[\"%s\", [\"tr(%s,{pk(%s),multi_a(2,%s,%s)})\"]]", ps64, xh[2], wif[1], xh[0], xh[1]);
     r = call("descriptorprocesspsbt", pj, &ec, &em);
-    ck("complete via leaf A", r && S(r, "complete") && S(r, "complete")[0] == '1'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+    ck("complete via leaf A", r && S(r, "complete") && S(r, "complete")[0] == '1');
+    if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
     { const char* h = r ? S(r, "hex") : NULL; char lah[80]; hexs(lah, la, 34); ck("...the witness carries leaf A and a control block naming the internal key", h && strstr(h, lah) && strstr(h, xh[2])); }
     if (r) rj_free(r);
 
@@ -109,16 +112,20 @@ int main(void){
       snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(multi(2,%s,%s))\"], \"ALL\", true, false]", ps64, ph[0], ph[1]);
       r = call("descriptorprocesspsbt", pj, &ec, &em); d = r && S(r, "psbt") ? decode(S(r, "psbt")) : NULL; i0 = in0(d);
       char wsh_hex[160]; hexs(wsh_hex, ws, o);
-      ck("witness_script filled", i0 && SH(i0, "witness_script") && !strcmp(SH(i0, "witness_script"), wsh_hex)); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      ck("witness_script filled", i0 && SH(i0, "witness_script") && !strcmp(SH(i0, "witness_script"), wsh_hex));
+      if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
       rj_val* dv = i0 ? rj_obj_get(i0, "bip32_derivs") : NULL; u8 h[20]; char fp[9]; hash160(h, pub[0], 33); hexs(fp, h, 4);
       ck("bip32_derivs for both keys with hash160 fingerprints", dv && dv->nitems == 2 && S(dv->items[0], "master_fingerprint") && (!strcmp(S(dv->items[0], "master_fingerprint"), fp) || !strcmp(S(dv->items[1], "master_fingerprint"), fp)));
       rj_val* o0 = out0(d); ck("the change-like output gets witness_script + bip32_derivs too", o0 && SH(o0, "witness_script") && rj_obj_get(o0, "bip32_derivs") && rj_obj_get(o0, "bip32_derivs")->nitems == 2);
-      if (d) rj_free(d); if (r) rj_free(r);
+      if (d) rj_free(d);
+      if (r) rj_free(r);
       printf("== 6. utxoupdatepsbt with descriptors adds the same ==\n");
       snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(multi(2,%s,%s))\"]]", ps64, ph[0], ph[1]);
       r = call("utxoupdatepsbt", pj, &ec, &em); d = r && r->str ? decode(r->str) : NULL; i0 = in0(d);
-      ck("utxoupdatepsbt(descriptors): witness_script + bip32_derivs", i0 && SH(i0, "witness_script") && rj_obj_get(i0, "bip32_derivs")); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
-      if (d) rj_free(d); if (r) rj_free(r); }
+      ck("utxoupdatepsbt(descriptors): witness_script + bip32_derivs", i0 && SH(i0, "witness_script") && rj_obj_get(i0, "bip32_derivs"));
+      if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      if (d) rj_free(d);
+      if (r) rj_free(r); }
 
     printf("== 4. an xpub with an origin: fingerprint + full path incl. the index ==\n");
     { const char* xp = "[d34db33f/84h/0h/0h]xpub68NZiKmJWnxxS6aaHmn81bvJeTESw724CRDs6HbuccFQN9Ku14VQrADWgqbhhTHBaohPX4CjNLf9fq9MYo6oDaPPLPxSb7gwQN3ih19Zm4Y/0/*";
@@ -130,8 +137,10 @@ int main(void){
       r = call("descriptorprocesspsbt", pj, &ec, &em); d = r && S(r, "psbt") ? decode(S(r, "psbt")) : NULL; i0 = in0(d);
       rj_val* dv = i0 ? rj_obj_get(i0, "bip32_derivs") : NULL;
       ck("bip32_derivs: origin fingerprint d34db33f, path m/84h/0h/0h/0/7", dv && dv->nitems == 1 && S(dv->items[0], "master_fingerprint") && !strcmp(S(dv->items[0], "master_fingerprint"), "d34db33f") && S(dv->items[0], "path") && !strcmp(S(dv->items[0], "path"), "m/84h/0h/0h/0/7"));
-      if (!r) printf("    (%ld: %s)\n", ec, em ? em : ""); if (dv && dv->nitems) printf("    (path %s)\n", S(dv->items[0], "path") ? S(dv->items[0], "path") : "-");
-      if (d) rj_free(d); if (r) rj_free(r); }
+      if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      if (dv && dv->nitems) printf("    (path %s)\n", S(dv->items[0], "path") ? S(dv->items[0], "path") : "-");
+      if (d) rj_free(d);
+      if (r) rj_free(r); }
 
 
     printf("== 7. partial signatures: wsh(multi) signed by K0 then K1 (finalize=false carry) ==\n");
@@ -140,7 +149,8 @@ int main(void){
       static u8 utx2[400]; long ul2 = mk_utx(utx2, wspk, 34); mk_psbt(ps64, utx2, ul2, wspk, 34);
       snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(multi(2,%s,%s))\"], \"ALL\", true, false]", ps64, wif[0], ph[1]);
       r = call("descriptorprocesspsbt", pj, &ec, &em);
-      ck("K0 alone: not complete", r && S(r, "complete") && S(r, "complete")[0] == '0'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      ck("K0 alone: not complete", r && S(r, "complete") && S(r, "complete")[0] == '0');
+      if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
       char* half = r && S(r, "psbt") ? strdup(S(r, "psbt")) : NULL; if (r) rj_free(r);
       d = half ? decode(half) : NULL; i0 = in0(d);
       { rj_val* ps = i0 ? rj_obj_get(i0, "partial_signatures") : NULL;
@@ -150,8 +160,10 @@ int main(void){
       if (d) rj_free(d);
       if (half){ snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(multi(2,%s,%s))\"]]", half, ph[0], wif[1]);
           r = call("descriptorprocesspsbt", pj, &ec, &em);
-          ck("K1 completes it using K0's carried partial", r && S(r, "complete") && S(r, "complete")[0] == '1'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
-          if (r) rj_free(r); free(half); } }
+          ck("K1 completes it using K0's carried partial", r && S(r, "complete") && S(r, "complete")[0] == '1');
+          if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+          if (r) rj_free(r);
+          free(half); } }
 
     printf("== 8. partial signatures: wsh(and_v(v:pk(K0),pk(K1))) miniscript, K1 first then K0 ==\n");
     { char dtext[300]; snprintf(dtext, sizeof dtext, "wsh(and_v(v:pk(%s),pk(%s)))", ph[0], ph[1]);
@@ -160,7 +172,8 @@ int main(void){
       static u8 utx3[400]; long ul3 = mk_utx(utx3, sp[0].spk, sp[0].len); mk_psbt(ps64, utx3, ul3, sp[0].spk, sp[0].len);
       snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(and_v(v:pk(%s),pk(%s)))\"], \"ALL\", true, false]", ps64, ph[0], wif[1]);
       r = call("descriptorprocesspsbt", pj, &ec, &em);
-      ck("K1 alone: not complete", r && S(r, "complete") && S(r, "complete")[0] == '0'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      ck("K1 alone: not complete", r && S(r, "complete") && S(r, "complete")[0] == '0');
+      if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
       char* half = r && S(r, "psbt") ? strdup(S(r, "psbt")) : NULL; if (r) rj_free(r);
       d = half ? decode(half) : NULL; i0 = in0(d);
       { rj_val* ps = i0 ? rj_obj_get(i0, "partial_signatures") : NULL;
@@ -169,8 +182,10 @@ int main(void){
       if (d) rj_free(d);
       if (half){ snprintf(pj, sizeof pj, "[\"%s\", [\"wsh(and_v(v:pk(%s),pk(%s)))\"]]", half, wif[0], ph[1]);
           r = call("descriptorprocesspsbt", pj, &ec, &em);
-          ck("K0 completes the miniscript input with K1's carried partial", r && S(r, "complete") && S(r, "complete")[0] == '1'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
-          if (r) rj_free(r); free(half); } }
+          ck("K0 completes the miniscript input with K1's carried partial", r && S(r, "complete") && S(r, "complete")[0] == '1');
+          if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+          if (r) rj_free(r);
+          free(half); } }
 
     printf("== 9. tapscript miniscript leaf: tr(K2,and_v(v:pk(x0),pk(x1))), x0 first then x1 ==\n");
     { char dtext[300]; snprintf(dtext, sizeof dtext, "tr(%s,and_v(v:pk(%s),pk(%s)))", xh[2], xh[0], xh[1]);
@@ -179,7 +194,8 @@ int main(void){
       static u8 utx4[400]; long ul4 = mk_utx(utx4, sp[0].spk, sp[0].len); mk_psbt(ps64, utx4, ul4, sp[0].spk, sp[0].len);
       snprintf(pj, sizeof pj, "[\"%s\", [\"tr(%s,and_v(v:pk(%s),pk(%s)))\"], \"DEFAULT\", true, false]", ps64, xh[2], wif[0], xh[1]);
       r = call("descriptorprocesspsbt", pj, &ec, &em);
-      ck("x0 alone: not complete", r && S(r, "complete") && S(r, "complete")[0] == '0'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      ck("x0 alone: not complete", r && S(r, "complete") && S(r, "complete")[0] == '0');
+      if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
       char* half = r && S(r, "psbt") ? strdup(S(r, "psbt")) : NULL; if (r) rj_free(r);
       d = half ? decode(half) : NULL; i0 = in0(d);
       { rj_val* sp2 = i0 ? rj_obj_get(i0, "taproot_script_path_sigs") : NULL;
@@ -188,8 +204,10 @@ int main(void){
       if (d) rj_free(d);
       if (half){ snprintf(pj, sizeof pj, "[\"%s\", [\"tr(%s,and_v(v:pk(%s),pk(%s)))\"]]", half, xh[2], xh[0], wif[1]);
           r = call("descriptorprocesspsbt", pj, &ec, &em);
-          ck("x1 completes the leaf with x0's carried partial", r && S(r, "complete") && S(r, "complete")[0] == '1'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
-          if (r) rj_free(r); free(half); } }
+          ck("x1 completes the leaf with x0's carried partial", r && S(r, "complete") && S(r, "complete")[0] == '1');
+          if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+          if (r) rj_free(r);
+          free(half); } }
 
     printf("== 10. two-leaf tree {pk(x2), multi_a(2,x0,x1)} with a NUMS internal key: x0's partial lands ==\n");
     { const char* NUMS = "50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0";
@@ -199,12 +217,15 @@ int main(void){
       static u8 utx5[400]; long ul5 = mk_utx(utx5, sp[0].spk, sp[0].len); mk_psbt(ps64, utx5, ul5, sp[0].spk, sp[0].len);
       snprintf(pj, sizeof pj, "[\"%s\", [\"tr(%s,{pk(%s),multi_a(2,%s,%s)})\"], \"DEFAULT\", true, false]", ps64, NUMS, xh[2], wif[0], xh[1]);
       r = call("descriptorprocesspsbt", pj, &ec, &em);
-      ck("x0 alone: not complete", r && S(r, "complete") && S(r, "complete")[0] == '0'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      ck("x0 alone: not complete", r && S(r, "complete") && S(r, "complete")[0] == '0');
+      if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
       d = r && S(r, "psbt") ? decode(S(r, "psbt")) : NULL; i0 = in0(d);
       { rj_val* sp2 = i0 ? rj_obj_get(i0, "taproot_script_path_sigs") : NULL;
         ck("...taproot_script_path_sigs carries x0's partial for the multi_a leaf", sp2 && sp2->nitems >= 1 && S(sp2->items[0], "pubkey") && !strcmp(S(sp2->items[0], "pubkey"), xh[0]));
-        if (!sp2) { long jl = 0; char* js = i0 ? rj_write_alloc(i0, 0, &jl) : NULL; printf("    (input: %.900s)\n", js ? js : "-"); free(js); } }
-      if (d) rj_free(d); if (r) rj_free(r); }
+        if (!sp2) { long jl = 0; char* js = i0 ? rj_write_alloc(i0, 0, &jl) : NULL; printf("    (input: %.900s)\n", js ? js : "-"); free(js); }
+        }
+      if (d) rj_free(d);
+      if (r) rj_free(r); }
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
 }

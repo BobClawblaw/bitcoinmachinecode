@@ -28,6 +28,7 @@ typedef unsigned char u8;
 typedef unsigned long u64;
 
 extern void block_hash(u8 out[32], const u8 hdr[80]);
+extern void sha256d(unsigned char o[32], const void* m, long l);   /* bitcoin_hash.asm */
 extern u64  script_flags_for_block(u64 height, const u8 hash32[32]);
 extern unsigned int net_magic;   /* bitcoin_net.asm */
 extern unsigned int sfc_chain;   /* bitcoin_script_flags.asm */

@@ -35,7 +35,8 @@ static void put_le64(unsigned char* o, size_t* p, unsigned long long v){
 }
 static void coinbase_bip34(unsigned char* o, size_t* p, int height){
     put_le32(o,p,1); put_varint(o,p,1);
-    for(int i=0;i<32;i++) o[(*p)++]=0; put_le32(o,p,0xffffffff);
+    for(int i=0;i<32;i++) o[(*p)++]=0;
+    put_le32(o,p,0xffffffff);
     unsigned char sc[6]; size_t sl=0;
     if (height){ int h=height; unsigned char nb[4]; int nn=0; while(h){ nb[nn++]=h&0xff; h>>=8; } sc[sl++]=(unsigned char)nn; for(int i=0;i<nn;i++) sc[sl++]=nb[i]; }
     else sc[sl++]=0;
@@ -61,7 +62,9 @@ static size_t build_cb_block(unsigned char* out, unsigned long long prev_be,
     unsigned char merk[32]; merkle_root(merk,ids,1);
     unsigned char hdr[80]; size_t hp=0;
     put_le32(hdr,&hp,0x20000000ull);
-    for(int i=0;i<32;i++) hdr[hp++]=((unsigned char*)&prev_be)[i]; /* prev LE */
+    /* prev: the 8-byte tag, then zeros. (Was a 32-byte read of an 8-byte variable:
+     * bytes 8..31 came from whatever sat above it on the stack.) */
+    for(int i=0;i<32;i++) hdr[hp++]=(i<8)?((unsigned char*)&prev_be)[i]:0;
     memcpy(hdr+hp,merk,32); hp+=32;
     put_le32(hdr,&hp,btime);
     put_le32(hdr,&hp,nbits);
@@ -81,14 +84,15 @@ static void do_connect(const unsigned char* blk, size_t n, int h, int* en, int* 
     snprintf(cmd,sizeof cmd,
         "{ printf 'RESET\\nCONNECT %s %d\\nQUIT\\n'; } | %s > b30shim.out 2>/dev/null",
         hex, h, shim);
-    system(cmd);
+    if (system(cmd) != 0) fprintf(stderr, "warning: shim pipeline exited nonzero\n");
     /* parse: line1=RESET OK, line2=CONNECT verdict */
     FILE* f=fopen("b30shim.out","r");
     char line[256]; int e=-1,a=-1,b=-1;
     int lc=0;
     while(f && fgets(line,sizeof line,f)){ lc++; if(lc==2){ sscanf(line,"OK %d %d %d %d",&e,&a,&b,&b); break; } }
     if(f) fclose(f);
-    if(en)*en=e; if(bi)*bi=a;
+    if(en)*en=e;
+    if(bi)*bi=a;
 }
 
 

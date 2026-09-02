@@ -85,7 +85,8 @@ int main(void){
       long n = mk_v2(ps, 2, 1, 777, 1, 0x03, ins, 3, 50000, spk, 22, 0, 0, 2); b64(b1, ps, n);
       snprintf(pj, sizeof pj, "[\"%s\"]", b1); r = call("decodepsbt", pj, &ec, &em);
       ck("decodepsbt shows time/height locktimes per input + modifiable flags", r && rj_obj_get(r,"inputs") && rj_obj_get(r,"inputs")->nitems == 3 && S(rj_obj_get(r,"inputs")->items[1],"height_locktime") && !strcmp(S(rj_obj_get(r,"inputs")->items[1],"height_locktime"),"250") && S(r,"inputs_modifiable") && S(r,"inputs_modifiable")[0]=='1' && S(r,"outputs_modifiable")[0]=='1' && S(r,"has_sighash_single")[0]=='0');
-      if (!r) printf("    (%ld: %s)\n", ec, em ? em : ""); rj_free(r);
+      if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      rj_free(r);
       /* the synthesized tx: all inputs allow a height lock -> locktime = max height = 250 (not the fallback 777) */
       snprintf(pj, sizeof pj, "[\"%s\",false]", b1); r = call("finalizepsbt", pj, &ec, &em);
       ck("finalizepsbt(unsigned v2) -> incomplete, version preserved", r && S(r,"complete") && S(r,"complete")[0]=='0' && S(r,"psbt") && strncmp(S(r,"psbt"), "cHNidP8BAgQC", 12) == 0);
@@ -153,7 +154,8 @@ int main(void){
       u8 spk[25] = { 0x76, 0xa9, 0x14 }; memset(spk+3, 0xfc, 20); spk[23] = 0x88; spk[24] = 0xac;
       static u8 ps[4000]; long n = mk_v2(ps, 2, 1, 0, 0, 0, &in1, 1, 99990000ULL, spk, 25, 0, 0, 2); b64(b1, ps, n);
       snprintf(pj, sizeof pj, "[\"%s\", [\"wpkh(%s)\"]]", b1, wif); r = call("descriptorprocesspsbt", pj, &ec, &em);
-      ck("descriptorprocesspsbt signs the v2 input to completion", r && S(r,"complete") && S(r,"complete")[0]=='1' && S(r,"hex")); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+      ck("descriptorprocesspsbt signs the v2 input to completion", r && S(r,"complete") && S(r,"complete")[0]=='1' && S(r,"hex"));
+      if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
       static char hex2[4000]; hex2[0] = 0; if (r && S(r,"hex")) strcpy(hex2, S(r,"hex"));
       if (r && S(r,"psbt")){ snprintf(pj, sizeof pj, "[\"%s\"]", S(r,"psbt")); rj_val* d = call("decodepsbt", pj, &ec, &em);
           rj_val* i0 = d && rj_obj_get(d,"inputs") ? rj_obj_get(d,"inputs")->items[0] : NULL;
@@ -163,7 +165,8 @@ int main(void){
       { static u8 p0[4000]; long o = 0; memcpy(p0, "psbt\xff", 5); o = 5; u8 tx[200]; long t = 0; w32(tx+t, 2); t += 4; tx[t++] = 1; memcpy(tx+t, in1.txid, 32); t += 32; w32(tx+t, 0); t += 4; tx[t++] = 0; w32(tx+t, 0xfffffffd); t += 4; tx[t++] = 1; unsigned long long a = 99990000ULL; for (int i = 0; i < 8; i++) tx[t++] = (u8)(a >> (8*i)); tx[t++] = 25; memcpy(tx+t, spk, 25); t += 25; w32(tx+t, 0); t += 4;
         u8 k = 0x00; o += kv(p0+o, &k, 1, tx, (unsigned long)t); p0[o++] = 0; k = 0x01; o += kv(p0+o, &k, 1, wu, 31); p0[o++] = 0; p0[o++] = 0; b64(b2, p0, o);
         snprintf(pj, sizeof pj, "[\"%s\", [\"wpkh(%s)\"]]", b2, wif); r = call("descriptorprocesspsbt", pj, &ec, &em);
-        ck("the v0 twin signs to the identical transaction hex", r && S(r,"hex") && hex2[0] && !strcmp(S(r,"hex"), hex2)); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+        ck("the v0 twin signs to the identical transaction hex", r && S(r,"hex") && hex2[0] && !strcmp(S(r,"hex"), hex2));
+        if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
         if (r && S(r,"psbt")) ck("...and comes back as v0", strncmp(S(r,"psbt"), "cHNidP8BA", 9) == 0 && strncmp(S(r,"psbt"), "cHNidP8BAgQC", 12) != 0);
         rj_free(r);
         printf("== 6. mixed versions ==\n");

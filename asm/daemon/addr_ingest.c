@@ -72,7 +72,8 @@ static int ai_compact(const unsigned char* pl, long plen, unsigned long long* po
     if(c < 0xfd){ *v = c; *pos += 1; return 1; }
     if(c == 0xfd){ if((long)*pos + 3 > plen) return 0; *v = (unsigned long long)pl[*pos+1] | ((unsigned long long)pl[*pos+2] << 8); *pos += 3; return 1; }
     if(c == 0xfe){ if((long)*pos + 5 > plen) return 0; *v = 0; for(int i=0;i<4;i++) *v |= (unsigned long long)pl[*pos+1+i] << (8*i); *pos += 5; return 1; }
-    if((long)*pos + 9 > plen) return 0; *v = 0; for(int i=0;i<8;i++) *v |= (unsigned long long)pl[*pos+1+i] << (8*i); *pos += 9; return 1;
+    if((long)*pos + 9 > plen) return 0;
+    *v = 0; for(int i=0;i<8;i++) *v |= (unsigned long long)pl[*pos+1+i] << (8*i); *pos += 9; return 1;
 }
 ab2_t* addr_book(void){
     if(!g_book) g_book = ab2_open(".", 1);

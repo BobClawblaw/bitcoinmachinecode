@@ -487,7 +487,7 @@ static long txacc_sigop_cost(void* mp_area, const u8* tx, unsigned long txlen){
     p += 4;
     int segwit = (end - p >= 2 && p[0] == 0x00 && p[1] == 0x01);
     if (segwit) p += 2;
-    unsigned cc; u64 nin = txacc_varint(&p, end, &cc); if (!cc || nin == 0 || nin > 100000) return -1;
+    u64 cc; u64 nin = txacc_varint(&p, end, &cc);   /* u64: txacc_varint stores 8 bytes through this pointer (was `unsigned`: a 4-byte local overwritten by 8 -- 2026-09-02) */ if (!cc || nin == 0 || nin > 100000) return -1;
     struct { const u8* prev; u32 idx; const u8* ss; unsigned long ssl; } in[512];
     if (nin > 512) return -1;                                     /* far above standardness */
     for (u64 i = 0; i < nin; i++){
@@ -559,7 +559,7 @@ long txacc_legacy_sigops(const u8* tx, unsigned long txlen){
     p += 4;
     int segwit = (end - p >= 2 && p[0] == 0x00 && p[1] == 0x01);
     if (segwit) p += 2;
-    unsigned cc; u64 nin = txacc_varint(&p, end, &cc); if (!cc) return -1;
+    u64 cc; u64 nin = txacc_varint(&p, end, &cc);   /* u64: txacc_varint stores 8 bytes through this pointer (was `unsigned`: a 4-byte local overwritten by 8 -- 2026-09-02) */ if (!cc) return -1;
     long total = 0;
     for (u64 i = 0; i < nin; i++){
         if ((unsigned long)(end - p) < 36) return -1;
@@ -587,7 +587,7 @@ const char* txacc_witness_standard(void* mp_area, const u8* tx, unsigned long tx
     int segwit = (end - p >= 2 && p[0] == 0x00 && p[1] == 0x01);
     if (!segwit) return 0;
     p += 2;
-    unsigned cc; u64 nin = txacc_varint(&p, end, &cc); if (!cc || nin == 0 || nin > 512) return 0;
+    u64 cc; u64 nin = txacc_varint(&p, end, &cc);   /* u64: txacc_varint stores 8 bytes through this pointer (was `unsigned`: a 4-byte local overwritten by 8 -- 2026-09-02) */ if (!cc || nin == 0 || nin > 512) return 0;
     struct { const u8* prev; u32 idx; const u8* ss; unsigned long ssl; } in[512];
     for (u64 i = 0; i < nin; i++){
         if ((unsigned long)(end - p) < 36) return 0;

@@ -35,13 +35,6 @@ extern long tx_parse(unsigned long long info[8],const void*tx,unsigned long long
 
 static void put_u32(unsigned char*p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24;}
 static void put_u64(unsigned char*p,unsigned long long v){for(int i=0;i<8;i++)p[i]=v>>(8*i);}
-static unsigned long long varint(unsigned char*p,unsigned long long v){
-    if(v<0xfd){p[0]=v&0xff;return 1;} if(v<=0xffff){p[0]=0xfd;p[1]=v;p[2]=v>>8;return 3;}
-    p[0]=0xfe;for(int i=0;i<4;i++)p[4+i]=v>>(8*i);return 5;
-}
-static unsigned char big_sc[32]={
-0x59,0xb2,0x66,0x6b,0x17,0x34,0x3a,0xf4,0xd4,0x6e,0x4f,0x5c,0x1d,0x58,0x9c,0x0b,
-0xb8,0x7a,0xdb,0x8f,0x9d,0xd1,0x2a,0x6b,0x1b,0x45,0xcc,0x34,0x9c,0x03,0xad,0x9b};
 
 /* build a single-coinbase block (1 tx), the simplest valid block. */
 static long build_cb_block(unsigned char* b, const unsigned char prev[32], unsigned char mh[32], unsigned hgt){

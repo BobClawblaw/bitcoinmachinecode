@@ -81,10 +81,6 @@ static int input_outpoint(const unsigned char* tx, unsigned int i,
     }
     return 1;
 }
-static void hex_in(unsigned char* out, const char* h) {
-    int n = (int)(strlen(h)) / 2;
-    for (int i = 0; i < n; i++) { unsigned int v; sscanf(h + 2 * i, "%2x", &v); out[i] = (unsigned char)v; }
-}
 
 /* ---- whole-transaction validator (mirrors test_txval) ---- */
 static int validate_signed_tx(const unsigned char* tx, unsigned long txlen,
@@ -93,7 +89,7 @@ static int validate_signed_tx(const unsigned char* tx, unsigned long txlen,
     if (tx_parse(&info, tx, txlen) != 1) { printf("  [parse] malformed\n"); return 0; }
     if (info.n_in == 0 || info.n_out == 0) { printf("  [shape]\n"); return 0; }
     unsigned long long total_in = 0;
-    const unsigned char* scripts[64]; unsigned long slens[64]; unsigned long long vals[64];
+    const unsigned char* scripts[64]; unsigned long slens[64];
     for (unsigned int i = 0; i < info.n_in && i < 64; i++) {
         unsigned char txid[32]; unsigned long index;
         input_outpoint(tx, i, txid, &index);
@@ -101,7 +97,7 @@ static int validate_signed_tx(const unsigned char* tx, unsigned long txlen,
         if (utxo_get(utxo, txid, index, &val, &h_unused, &cb_unused, &sp, &sl) != 1) {
             printf("  [double-spend] input %u absent/unspent\n", i); return 0;
         }
-        scripts[i] = sp; slens[i] = sl; vals[i] = val; total_in += val;
+        scripts[i] = sp; slens[i] = sl; total_in += val;
     }
     for (unsigned int i = 0; i < info.n_in && i < 64; i++)
         if (verify_p2pkh(tx, txlen, i, scripts[i], slens[i], work, workcap) != 1) {
@@ -140,8 +136,8 @@ int main(void) {
     /* three "our" UTOXs: different txids/indices, P2PKH script of priv */
     unsigned char scr[25]; wallet_make_p2pkh_script(scr, priv);
     unsigned long long vA = 5000000ULL, vB = 3000000ULL, vC = 2000000ULL; /* 10 BTC total */
-    unsigned char tA[32], tB[32], tC[32], tZ[32];
-    for (int i = 0; i < 32; i++) { tA[i] = (unsigned char)(0x10 + i); tB[i] = (unsigned char)(0x20 + i); tC[i] = (unsigned char)(0x30 + i); tZ[i] = (unsigned char)(0x90 + i); }
+    unsigned char tA[32], tB[32], tC[32];
+    for (int i = 0; i < 32; i++) { tA[i] = (unsigned char)(0x10 + i); tB[i] = (unsigned char)(0x20 + i); tC[i] = (unsigned char)(0x30 + i); }
     unsigned long iA = 0, iB = 1, iC = 2;
 
     /* destination: a different key's h160 */
@@ -186,8 +182,10 @@ int main(void) {
             for (unsigned int i = 0; i < info.n_in; i++) { p += 36; unsigned long sl = rd_varint(p, &p); p += sl + 4; }
             (void)rd_varint(p, &p);
             unsigned long long out0=0, out1=0;
-            for (int j = 0; j < 8; j++) out0 |= (unsigned long long)p[j] << (8*j); p += 8; unsigned long sl0 = rd_varint(p, &p); p += sl0;
-            for (int j = 0; j < 8; j++) out1 |= (unsigned long long)p[j] << (8*j); p += 8; unsigned long sl1 = rd_varint(p, &p); p += sl1;
+            for (int j = 0; j < 8; j++) out0 |= (unsigned long long)p[j] << (8*j);
+            p += 8; unsigned long sl0 = rd_varint(p, &p); p += sl0;
+            for (int j = 0; j < 8; j++) out1 |= (unsigned long long)p[j] << (8*j);
+            p += 8; unsigned long sl1 = rd_varint(p, &p); p += sl1;
             ck("send: out0 == amount", out0 == amount, 1);
             ck("send: out1 == change (total-amount-fee)", out1, total_in - amount - fee);
             /* fee = in - (out0+out1) */

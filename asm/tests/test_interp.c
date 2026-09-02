@@ -12,6 +12,7 @@
 #define MAX_STACK 1000
 
 /* struct script_state (matches bitcoin_interp.asm) */
+struct sc_slice { const uint8_t* p; size_t n; };   /* named: an anonymous struct in a parameter list is a distinct type per declaration */
 struct script_state {
     uint8_t* main_elems;      /* +0  */
     size_t   main_sp;         /* +8  */
@@ -27,7 +28,7 @@ struct script_state {
     void*    checksig_ctx;    /* +88 */
     uint64_t (*checksig_fn)(void*, const uint8_t*, size_t,
                             const uint8_t*, size_t,
-                            const struct { const uint8_t* p; size_t n; }*); /* +96 */
+                            const struct sc_slice*); /* +96 */
 };
 
 extern int script_eval(struct script_state* st);
@@ -216,17 +217,6 @@ static const struct vec VECS[] = {
 };
 #define N_VECS (sizeof(VECS)/sizeof(VECS[0]))
 
-static void run_vec(const struct vec* v){
-    /* initial stack empty */
-    int r = run_script(v->script, NULL, NULL, 0, 0, 0, 0);
-    /* The interpreter returns 1 if script executed to completion with no error;
-       the accept/reject for a bare script is whether the leave value is truthy.
-       For these opcode vectors we assert on the run result (execution accepted). */
-    /* For simple validation we treat the FINAL stack top as the result is left to caller;
-       here we check run result == exp_ok only for error-class vectors. */
-    (void)r; (void)v;
-}
-
 static int run_checksig_true(void){
     return run_script("514f51ac", NULL,NULL,0,0,0,(uint64_t)fake_checksig); /* 1 -1 CHECKSIG */
 }
@@ -240,7 +230,6 @@ int main(void){
         uint64_t checkfn=0;
         int r = run_script(VECS[i].script, NULL,NULL,0,0,0,checkfn);
         /* an "ok" vector: interpreter returns 1 on execution success */
-        int pass = (r==1)==(VECS[i].exp_ok==1);
         /* but for most of these the truthiness of the final stack is what matters;
            see note. We assert interpreter-did-not-error where exp_ok==1. */
         if(VECS[i].exp_ok==1){

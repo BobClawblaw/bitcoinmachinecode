@@ -478,13 +478,13 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
     uint8_t* pend = pre + cap;
 
     /* epoch */
-    if (p + 1 > pend) return 0; *p++ = 0x00;
+    if (p + 1 > pend) { return 0; } *p++ = 0x00;
     /* hash_type */
-    if (p + 1 > pend) return 0; *p++ = ht;
+    if (p + 1 > pend) { return 0; } *p++ = ht;
     /* nVersion (LE) */
-    if (p + 4 > pend) return 0; w32le(p, (uint32_t)t.version); p += 4;
+    if (p + 4 > pend) { return 0; } w32le(p, (uint32_t)t.version); p += 4;
     /* nLockTime */
-    if (p + 4 > pend) return 0; w32le(p, t.locktime); p += 4;
+    if (p + 4 > pend) { return 0; } w32le(p, t.locktime); p += 4;
     /* pre-hashes (not ACP) */
     if (!acp){
         if (p + 4*SHA256SZ > pend) return 0;
@@ -508,19 +508,19 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
     if (!is_none && !is_single){
         uint64_t olen; const uint8_t* obytes = tx_txout_range(&t, 0, t.nout, &olen);
         uint8_t ho[32]; sha256_full(ho, obytes, (int64_t)olen);
-        if (p + 32 > pend) return 0; memcpy(p, ho, 32); p += 32;
+        if (p + 32 > pend) { return 0; } memcpy(p, ho, 32); p += 32;
     }
     /* spend_type = ext_flag*2 | annex_present (BIP341 bit0 = annex present) */
     int annex_present = (c->annex != NULL);
-    if (p + 1 > pend) return 0; *p++ = (uint8_t)(c->ext_flag * 2 + annex_present);
+    if (p + 1 > pend) { return 0; } *p++ = (uint8_t)(c->ext_flag * 2 + annex_present);
     if (acp){
         /* outpoint */
         const uint8_t* op = tx_outpoint(&t, c->n_in);
-        if (p + 36 > pend) return 0; memcpy(p, op, 36); p += 36;
+        if (p + 36 > pend) { return 0; } memcpy(p, op, 36); p += 36;
         /* amount */
         uint64_t amt; const uint8_t* a = c->amounts + c->n_in*8;
         amt = 0; for(int b=0;b<8;b++) amt |= (uint64_t)a[b]<<(8*b);
-        if (p + 8 > pend) return 0; w64le(p, amt); p += 8;
+        if (p + 8 > pend) { return 0; } w64le(p, amt); p += 8;
         /* scriptPubKey of the spent output being signed. ts_agg_hashes
          * located it during the walk it had to do anyway; this used to be a
          * SECOND unbounded walk of the spks run, from the start, with an
@@ -531,10 +531,10 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
         memcpy(p, spk_nin, sl); p += sl;
         /* nSequence */
         uint32_t seq = tx_seq(&t, c->n_in);
-        if (p + 4 > pend) return 0; w32le(p, seq); p += 4;
+        if (p + 4 > pend) { return 0; } w32le(p, seq); p += 4;
     } else {
         /* input_index */
-        if (p + 4 > pend) return 0; w32le(p, (uint32_t)c->n_in); p += 4;
+        if (p + 4 > pend) { return 0; } w32le(p, (uint32_t)c->n_in); p += 4;
     }
     /* annex (BIP341): sha256(compactsize(len) || annex) */
     if (annex_present){
@@ -549,7 +549,7 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
         put_cs(abuf, c->annexlen); an += cs_size(c->annexlen);
         memcpy(abuf+an, c->annex, (size_t)c->annexlen); an += (size_t)c->annexlen;
         uint8_t ha[32]; sha256_full(ha, abuf, (int64_t)an);
-        if (p + 32 > pend) return 0; memcpy(p, ha, 32); p += 32;
+        if (p + 32 > pend) { return 0; } memcpy(p, ha, 32); p += 32;
     }
     /* SINGLE: sha_single_output -- in place, same property as sha_outputs,
      * over the one-output slice [out_off[n_in], out_off[n_in+1]). */
@@ -558,7 +558,7 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
             uint64_t slen1; const uint8_t* sbytes =
                 tx_txout_range(&t, c->n_in, c->n_in + 1, &slen1);
             uint8_t hs[32]; sha256_full(hs, sbytes, (int64_t)slen1);
-            if (p + 32 > pend) return 0; memcpy(p, hs, 32); p += 32;
+            if (p + 32 > pend) { return 0; } memcpy(p, hs, 32); p += 32;
         } else {
             /* Core, interpreter.cpp, in the SIGHASH_SINGLE branch:
              *     if (in_pos >= tx_to.vout.size()) return false;
@@ -583,9 +583,9 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
     /* BIP342 ext (tapscript) */
     if (c->ext_flag == 1){
         if (c->tapleaf == NULL) return 0;
-        if (p + 32 > pend) return 0; memcpy(p, c->tapleaf, 32); p += 32;
-        if (p + 1 > pend) return 0; *p++ = 0x00;          /* key_version */
-        if (p + 4 > pend) return 0; w32le(p, c->codesep_pos); p += 4;
+        if (p + 32 > pend) { return 0; } memcpy(p, c->tapleaf, 32); p += 32;
+        if (p + 1 > pend) { return 0; } *p++ = 0x00;          /* key_version */
+        if (p + 4 > pend) { return 0; } w32le(p, c->codesep_pos); p += 4;
     }
     long prelen = (long)(p - pre);
     tagged_hash256(out32, "TapSighash", 10, pre, (uint64_t)prelen);

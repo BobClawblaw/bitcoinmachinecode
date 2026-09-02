@@ -82,7 +82,8 @@ static void serve_conn(int cfd, int expose, int max_syncs){
     int synced=0;
     for(int n=0;n<200000 && (max_syncs<0 || synced<max_syncs);n++){
         plen=0; int r=p2p_read(cfd,cmd,pl,sizeof pl,&plen);
-        if(r<=0) continue; cmd[11]=0;
+        if(r<=0) continue;
+        cmd[11]=0;
         if(strncmp(cmd,"getheaders",10)==0){
             synced++;
             int zero=1; for(int z=0;z<32;z++) if(pl[5+z]){zero=0;break;}
@@ -111,7 +112,7 @@ static void peer(int port_pipe, int grow_pipe){
     if(bind(ls,(struct sockaddr*)&a,sizeof a)<0){ _exit(9); }
     socklen_t al=sizeof a; getsockname(ls,(struct sockaddr*)&a,&al);
     unsigned short port=ntohs(a.sin_port);
-    unsigned char pb[2]; pb[0]=port; pb[1]=port>>8; write(port_pipe,pb,2);
+    unsigned char pb[2]; pb[0]=port; pb[1]=port>>8; if(write(port_pipe,pb,2)!=2) _exit(9);
     listen(ls,4);
     /* conn #1: initial leg. Serve blocks 0..4 through the node's first sync,
      * then return so we can RIP the connection (the D2 dead-leg trigger). */
@@ -137,7 +138,8 @@ static void peer(int port_pipe, int grow_pipe){
         if(gfd>=0){ char c; if(read(gfd,&c,1)==1){ if(c=='B') expose=6; if(c=='Q') quit=1; } }
         if(quit) break;
         plen2=0; int r=p2p_read(c2,cmd2,pl2,sizeof pl2,&plen2);
-        if(r<=0) continue; cmd2[11]=0;
+        if(r<=0) continue;
+        cmd2[11]=0;
         if(strncmp(cmd2,"getheaders",10)==0){
             int zero=1; for(int z=0;z<32;z++) if(pl2[5+z]){zero=0;break;}
             int from=0; if(!zero){ from=expose; for(int i=0;i<expose;i++) if(memcmp(pl2+5,bh[i],32)==0){from=i+1;break;} }
@@ -176,7 +178,7 @@ static int inbound_getdata(int port, int h){
 }
 
 static long blkfile_size(const char* dir){
-    char p[512]; snprintf(p,sizeof p,"%s/main/blk00000.dat",dir);
+    char p[1600]; snprintf(p,sizeof p,"%s/main/blk00000.dat",dir);
     struct stat st; if(stat(p,&st)!=0) return -1; return (long)st.st_size;
 }
 
@@ -221,7 +223,7 @@ int main(int argc, char** argv){
     usleep(1500000);
 
     /* expose block 5 to the RE-DIALED leg only, then let it be pulled */
-    write(growpipe[1],"B",1);
+    if(write(growpipe[1],"B",1)!=1){ printf("FAIL growpipe write\n"); failures++; }
     for(int w=0; w<60; w++){
         usleep(50000);
     }
@@ -236,7 +238,7 @@ int main(int argc, char** argv){
     long sz = blkfile_size(ndir);
     cki("store grew (block 5 appended after re-dial)", sz>765?1:0, 1);
 
-    write(growpipe[1],"Q",1);
+    (void)!write(growpipe[1],"Q",1);   /* cleanup: the peer is killed next anyway */
     int st1,st2; kill(node,SIGTERM); waitpid(node,&st1,0); kill(peer_pid,SIGTERM); waitpid(peer_pid,&st2,0);
     close(growpipe[1]);
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);

@@ -24,7 +24,7 @@ static int raw_exchange(int port, const char* req){
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)port); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd, (struct sockaddr*)&a, sizeof a) < 0){ close(fd); return -1; }
-    write(fd, req, strlen(req));
+    if (write(fd, req, strlen(req)) != (ssize_t)strlen(req)){ close(fd); return -1; }
     size_t got = 0;
     for (;;){ ssize_t n = read(fd, raw_out + got, sizeof raw_out - 1 - got); if (n <= 0) break; got += (size_t)n; if (got >= sizeof raw_out - 1) break; }
     close(fd); raw_out[got] = 0; return (int)got;
@@ -41,7 +41,7 @@ static void post(char* buf, size_t cap, int port, const char* user, const char* 
 }
 static int status_of(void){ return atoi(raw_out + 9); }
 static pid_t spawn(const char* whitelist, const char* wl_default, const char* threads, const char* queue, int* port_out){
-    int pout[2]; pipe(pout);
+    int pout[2]; if (pipe(pout) < 0){ perror("pipe"); _exit(2); }
     pid_t srv = fork();
     if (srv == 0){
         dup2(pout[1], 2); close(pout[0]); close(pout[1]);

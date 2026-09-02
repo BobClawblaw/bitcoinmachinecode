@@ -123,8 +123,8 @@ static long g_gbt_maxweight = 4000000, g_gbt_reserved = 8000, g_gbt_minfee_satkv
 static int  g_gbt_version = 0, g_gbt_printpriority = 0;
 static long g_maxtipage = 86400;
 void rpc_chain_set_gbt_policy(long maxweight, long reserved, long minfee_satkvb, int version, int printpriority){
-    if (maxweight < 4000) maxweight = 4000; if (maxweight > 4000000) maxweight = 4000000;
-    if (reserved < 2000) reserved = 2000; if (reserved > maxweight) reserved = maxweight;
+    if (maxweight < 4000) { maxweight = 4000; } if (maxweight > 4000000) { maxweight = 4000000; }
+    if (reserved < 2000) { reserved = 2000; } if (reserved > maxweight) { reserved = maxweight; }
     g_gbt_maxweight = maxweight; g_gbt_reserved = reserved;
     g_gbt_minfee_satkvb = minfee_satkvb < 0 ? 0 : minfee_satkvb;
     g_gbt_version = version; g_gbt_printpriority = printpriority;
@@ -163,7 +163,6 @@ static u64 read_varint(const u8* p, const u8* end, u64* consumed){
     if (p+9 > end){ *consumed = 0; return 0; }
     *consumed = 9; return rd64(p+1);
 }
-static size_t varint_size(u64 n){ return n < 0xfd ? 1 : n <= 0xffff ? 3 : n <= 0xffffffffULL ? 5 : 9; }
 
 /* Core ParseHashV: "parameter N must be of length 64 (not M, for 'x')" /
  * "parameter N must be hexadecimal string (not 'x')". Writes the 32-byte
@@ -413,16 +412,16 @@ static int tx_walk(const u8* p, const u8* end, txw_t* w){
     w->n_in = read_varint(p, end, &c); if (!c) return 0; p += c;
     if (w->n_in > TX_MAX_IN) return 0;
     for (u64 i = 0; i < w->n_in; i++){
-        if (p + 36 > end) return 0; p += 36;
+        if (p + 36 > end) { return 0; } p += 36;
         u64 sl = read_varint(p, end, &c); if (!c) return 0; p += c;
         { u64 avail=(u64)(end - p); if (avail < sl || avail - sl < 4) return 0; } p += sl + 4;  /* split bound (incident #38) */
     }
     w->vout = p;
     w->n_out = read_varint(p, end, &c); if (!c) return 0; p += c;
     for (u64 i = 0; i < w->n_out; i++){
-        if (p + 8 > end) return 0; p += 8;
+        if (p + 8 > end) { return 0; } p += 8;
         u64 sl = read_varint(p, end, &c); if (!c) return 0; p += c;
-        if ((u64)(end - p) < sl) return 0; p += sl;
+        if ((u64)(end - p) < sl) { return 0; } p += sl;
     }
     size_t witbytes = 0;
     w->wit = NULL;
@@ -432,7 +431,7 @@ static int tx_walk(const u8* p, const u8* end, txw_t* w){
             u64 ni = read_varint(p, end, &c); if (!c) return 0; p += c;
             for (u64 j = 0; j < ni; j++){
                 u64 il = read_varint(p, end, &c); if (!c) return 0; p += c;
-                if ((u64)(end - p) < il) return 0; p += il;
+                if ((u64)(end - p) < il) { return 0; } p += il;
             }
         }
         witbytes = (size_t)(p - w->wit);
@@ -895,18 +894,6 @@ void rpc_chain_set_mempool(const void* hooks_rpc_mempool,
     g_gbt_sigop_cost = sigop_cost;
 }
 
-/* arith_uint256::GetCompact (fNegative=false) over a big-endian 32-byte target */
-static u32 gbt_compact(const u8 t[32]){
-    int size = 32; while (size > 0 && t[32-size] == 0) size--;
-    u32 word = 0;
-    for (int i = 0; i < 3; i++){
-        int pos = 32 - size + i;               /* top 3 bytes */
-        word = (word << 8) | (u8)(pos < 32 && i < size ? t[pos] : 0);
-    }
-    if (size < 3) word <<= 8 * (3 - size);
-    if (word & 0x00800000){ word >>= 8; size++; }
-    return ((u32)size << 24) | (word & 0x007fffff);
-}
 
 /* Pure retarget arithmetic -- MOVED to bitcoin_pow_rules.c (one
  * implementation for GBT and validation; proven against every header of the
@@ -1014,7 +1001,6 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
     rj_val* txs = rj_arr();
     if (g_gbt_mph.mp && g_gbt_mph.get){
         static gbt_ent ents[GBT_MAX_TX];
-        static unsigned char emitted[GBT_MAX_TX];
         static int order[GBT_MAX_TX];
         long n = 0;
         if (g_gbt_mph.lock) g_gbt_mph.lock();
@@ -1045,9 +1031,8 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
         static unsigned char have_inf[GBT_MAX_TX];
         static unsigned long long tfee[GBT_MAX_TX], tsize[GBT_MAX_TX];
         static long tweight[GBT_MAX_TX], tsig[GBT_MAX_TX];
-        static unsigned char skipped[GBT_MAX_TX];
         for (long i = 0; i < n; i++){
-            have_inf[i] = 0; skipped[i] = 0; emitted[i] = 0;
+            have_inf[i] = 0;
             tfee[i] = 0; tsize[i] = 1;
             if (g_gbt_mph.polstate && g_gbt_mph.pol_entry_info &&
                 g_gbt_mph.pol_entry_info(g_gbt_mph.polstate, ents[i].txid, &infs[i])){
@@ -1167,7 +1152,7 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
                 fprintf(stderr, "[gbt] chunk of %d tx: fee %llu sat, %llu vB, %.8f BTC/kvB\n", c->cnt,
                         (unsigned long long)c->fee, (unsigned long long)c->size,
                         c->size ? (double)c->fee / (double)c->size * 1000.0 / 1e8 : 0.0);
-            for (int k = 0; k < c->cnt; k++){ emitted[cmem[c->start + k]] = 1; order[emitted_n++] = cmem[c->start + k]; }
+            for (int k = 0; k < c->cnt; k++){ order[emitted_n++] = cmem[c->start + k]; }
             used_w += c->w; used_s += c->s;
         }
         #undef UF_FIND
@@ -1630,7 +1615,7 @@ static int tsp_verify_rec(const u8* r, const u8 txid_wire[32], u32 vout, u8 spen
     if (blen < 81 || (u64)rec.offset + rec.len > (u64)blen || rec.len < 10) return 0;
     const u8* tx = g_blockbuf + rec.offset; const u8* end = tx + rec.len;
     const u8* q = tx + 4; if (q + 2 <= end && q[0] == 0 && q[1] == 1) q += 2;
-    u64 cc, nin = tsp_rd_varint(q, end, &cc); if (!cc) return 0; q += cc;
+    uint64_t cc = 0; u64 nin = tsp_rd_varint(q, end, &cc); if (!cc) return 0; q += cc;   /* uint64_t: tsp_rd_varint's out-param type */
     int hit = 0;
     for (u64 i = 0; i < nin && q + 36 <= end; i++){
         u32 vo = (u32)q[32] | ((u32)q[33] << 8) | ((u32)q[34] << 16) | ((u32)q[35] << 24);
@@ -1856,7 +1841,7 @@ typedef struct { const u8 (*leaves)[32]; const u8* match; u32 ntx;
                  u8 (*hashes)[32]; u32 nhash; u8* bits; u32 nbits; } pmt_build_t;
 static int pmt_match_sub(const u8* match, u32 ntx, int height, u32 pos){
     u64 lo = (u64)pos << height, hi = lo + ((u64)1<<height); if (hi>ntx) hi=ntx;
-    for (u64 i=lo;i<hi;i++) if (match[i]) return 1; return 0;
+    for (u64 i=lo;i<hi;i++) { if (match[i]) return 1; } return 0;
 }
 static void pmt_build(pmt_build_t* b, int height, u32 pos){
     int parent = pmt_match_sub(b->match, b->ntx, height, pos);
@@ -2382,7 +2367,7 @@ int rpc_desc_multipath_expand(const char* in, char (*out)[340], int cap, char* e
     }
     free(d); return n;
 }
-rpc_desc_normalize(const char* in, char* out, long cap, int* is_range,
+int rpc_desc_normalize(const char* in, char* out, long cap, int* is_range,
                        char* err, unsigned long errcap){
     descr_t* d = malloc(sizeof *d); if (!d){ snprintf(err,errcap,"oom"); return 0; }
     int r = rpc_desc_normalize_impl(in, out, cap, is_range, err, errcap, d); free(d); return r;
@@ -2408,7 +2393,7 @@ static long rpc_desc_expand_impl(const char* in, long start, long count,
     }
     return n;
 }
-rpc_desc_expand(const char* in, long start, long count,
+long rpc_desc_expand(const char* in, long start, long count,
                      unsigned char (*h160s)[20], long cap, int* script_type,
                      char* err, unsigned long errcap){
     descr_t* d = malloc(sizeof *d); if (!d){ snprintf(err,errcap,"oom"); return -1; }
@@ -2423,7 +2408,7 @@ static int rpc_desc_address_at_impl(const char* in, long idx, char* out, long ca
     if (!rpcdesc_address_at(d, idx, out, cap, &ec2, &em2)){ snprintf(err,errcap,"%s", em2); return 0; }
     return 1;
 }
-rpc_desc_address_at(const char* in, long idx, char* out, long cap,
+int rpc_desc_address_at(const char* in, long idx, char* out, long cap,
                         char* err, unsigned long errcap){
     descr_t* d = malloc(sizeof *d); if (!d){ snprintf(err,errcap,"oom"); return 0; }
     int r = rpc_desc_address_at_impl(in, idx, out, cap, err, errcap, d); free(d); return r;
@@ -3809,7 +3794,7 @@ void rpc_chain_set_utxosetinfo(long (*run)(int, void*, char*, unsigned long)){
     g_usi_run = run;
 }
 static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
-    static char embuf[192];
+    static char embuf[256];   /* >= msg[256]: the snprintf below copies it whole */
     int want_muhash = 1;   /* OUR default (documented divergence, see above) */
     if (params && params->typ == RJ_ARR && params->nitems >= 1){
         if (params->items[0]->typ != RJ_STR){
@@ -3935,7 +3920,7 @@ static int scan_expand_objects(const rj_val* objs, u8 (*targets)[128], u32* tlen
 }
 
 static int cmd_scantxoutset(const rj_val* params, rj_val** res, long* ec, const char** em){
-    static char perr[192];
+    static char perr[256];   /* >= msg[256] */
     const char* action = rpc_param_str(params, 0, ec, em); if (!action) return 0;
     if (!strcmp(action, "status")){ *res = rj_null(); return 1; }
     if (!strcmp(action, "abort")){ *res = rj_bool(0); return 1; }

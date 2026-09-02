@@ -998,7 +998,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
       /* sigop-adjusted virtual size (Core GetVirtualTransactionSize with
        * bytespersigop=20): max(vsize, sigop_cost*5) */
       { uint64_t sv = mpol_pending_sigops * mpol_bytes_per_sigop / 4;   /* cost is x4 units; Core: sigops*bytespersigop/WITNESS_SCALE_FACTOR */
-        if (sv > eff_vsize) eff_vsize = sv; mpol_pending_sigops = 0; }
+        if (sv > eff_vsize) { eff_vsize = sv; } mpol_pending_sigops = 0; }
       if (eff_fee * 1000 < eff_vsize * pol->relay_fee_rate){      /* both sides sat/kvB-scaled */
           _mpol_last_reason = "min relay fee not met"; return 0; }
       /* dynamic floor (sat/kvB, rolling decay) -- Core "mempool min fee not met" */
@@ -1147,8 +1147,8 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         uint32_t bfs[CLUSTER_LIMIT + 1]; int sp = 0;
         uint64_t cl_bytes = 0; int too_big = 0;
         #define MPOL_CL_EVICTED(ix) ({ int _ev = 0; \
-            for (int _e = 0; _e < n_evict; _e++) \
-                if (!memcmp(t[ix].txid, evict_set[_e], 32)){ _ev = 1; break; } _ev; })
+            for (int _e = 0; _e < n_evict; _e++) { \
+                if (!memcmp(t[ix].txid, evict_set[_e], 32)){ _ev = 1; break; } } _ev; })
         /* seed from EVERY in-pool parent, not the MPOL_MAX_PARENTS(24)-capped
          * par_idx: a 64-input child is exactly the wide shape this exists
          * to refuse */

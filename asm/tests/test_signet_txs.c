@@ -41,25 +41,6 @@ static unsigned long unhex(const char* h, unsigned char* out, unsigned long cap)
     return n;
 }
 
-/* Compares and SAYS SO either way. A comparison that prints only on failure
- * looks identical to one that never ran. */
-static int cmp_bytes(const char* what, const unsigned char* got, unsigned long glen,
-                     const char* want_hex){
-    unsigned char want[1 << 16];
-    unsigned long wlen = unhex(want_hex, want, sizeof want);
-    if (glen != wlen){
-        printf("  FAIL %s: %lu bytes, expected %lu\n", what, glen, wlen);
-        fails++; return 0;
-    }
-    if (memcmp(got, want, wlen) != 0){
-        unsigned long i = 0; while (i < wlen && got[i] == want[i]) i++;
-        printf("  FAIL %s: first difference at byte %lu (%02x vs %02x)\n",
-               what, i, got[i], want[i]);
-        fails++; return 0;
-    }
-    return 1;
-}
-
 int main(void){
     static unsigned char buf[1 << 20], leaves[1 << 16], scratch[1 << 16];
     static unsigned char sol[1 << 16], chal[1 << 16], prev[32], want_mrk[32];

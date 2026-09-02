@@ -58,7 +58,8 @@ int main(void){
               fputs(line + 1, o); keys++;
           }
       }
-      if (f) fclose(f); if (o) fclose(o);
+      if (f) fclose(f);
+      if (o) fclose(o);
       long applied = node_config_load("uncommented.conf");
       printf("  sample documents %ld parser keys; uncommenting applied %ld\n", keys, applied);
       if (keys > 30 && applied >= keys)

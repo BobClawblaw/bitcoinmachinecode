@@ -99,12 +99,14 @@ static int validate_tx(const unsigned char* tx, unsigned long txlen,
     unsigned long long total_in = 0;
     const unsigned char* scripts[64];
     unsigned long slens[64];
-    unsigned long long vals[64];
     for (unsigned int i = 0; i < info.n_in && i < 64; i++) {
         unsigned char txid[32];
-        unsigned long index;
+        unsigned long index = 0;
         const unsigned char* s = tx;
-        (void)input_outpoint(s, i, txid, &index);
+        if (!input_outpoint(s, i, txid, &index)) {
+            printf("  [double-spend] input %u: cannot walk to its outpoint\n", i);
+            return 0;
+        }
 
         unsigned long long val; const unsigned char* sp; unsigned long sl, h_unused, cb_unused;
         if (utxo_get(utxo, txid, index, &val, &h_unused, &cb_unused, &sp, &sl) != 1) {
@@ -113,7 +115,7 @@ static int validate_tx(const unsigned char* tx, unsigned long txlen,
                    i, txid[0], txid[1], txid[31], index);
             return 0;
         }
-        scripts[i] = sp; slens[i] = sl; vals[i] = val;
+        scripts[i] = sp; slens[i] = sl;
         total_in += val;
     }
 

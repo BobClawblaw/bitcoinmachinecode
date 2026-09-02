@@ -40,7 +40,8 @@ int txsub_accept_and_relay(void* mp_area, const u8* tx, unsigned long len,
     u8 txid[32];
     static u8 scratch[2000*81 + 8];              /* worker is single-threaded */
     if (!tx_txid(txid, tx, len, scratch, sizeof scratch)){
-        if (reason && rcap) snprintf(reason, rcap, "TX decode failed"); return -22; }
+        if (reason && rcap) snprintf(reason, rcap, "TX decode failed");
+        return -22; }
 
     long r = tx_accept_validate_reason(mp_area, txid, tx, len, reason, rcap);
     if (r != 1) return (int)r;

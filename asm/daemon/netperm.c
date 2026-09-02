@@ -134,7 +134,11 @@ int netperm_whitebind_add(const char* spec, const char** err){
         return 0;
     }
 
-    snprintf(g_nb[g_nb_n].addr, sizeof g_nb[g_nb_n].addr, "%s", hostpart);
+    /* a validated IPv4 literal is at most 15 bytes; refuse anything that
+     * would not fit rather than store a truncated address */
+    if (snprintf(g_nb[g_nb_n].addr, sizeof g_nb[g_nb_n].addr, "%s", hostpart) >= (int)sizeof g_nb[g_nb_n].addr){
+        *err = "address too long"; return 0;
+    }
     g_nb[g_nb_n].port  = (int)port;
     g_nb[g_nb_n].flags = flags;
     g_nb[g_nb_n].fd    = -1;

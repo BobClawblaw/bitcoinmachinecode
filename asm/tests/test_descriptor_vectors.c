@@ -55,7 +55,7 @@ int main(void){
             /* Core's DescriptorID: sha256 of the public form with its checksum, displayed reversed */
             if (v->desc_id[0]){
                 char pcs[9]; descr_checksum(want, pcs);
-                char full[1500]; snprintf(full, sizeof full, "%s#%s", want, pcs);
+                char full[1600]; snprintf(full, sizeof full, "%s#%s", want, pcs);
                 unsigned char dg[32]; sha256_full(dg, full, strlen(full));
                 char idh[65]; for (int q = 0; q < 32; q++) sprintf(idh + 2*q, "%02x", dg[31-q]);
                 if (strcmp(idh, v->desc_id)){ printf("  FAIL vec %d descriptor id: %s want %s\n", i, idh, v->desc_id); fails++; }

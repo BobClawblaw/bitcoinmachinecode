@@ -1126,13 +1126,12 @@ long wallet_signrawtx_withkeys(unsigned char* out_tx, long cap,
         unsigned long p = 4, cc;
         unsigned long ni = get_varint(work + p, &cc); p += cc;
         if (ni != n_in) { free(work); free(next); return -1; }
-        unsigned long sig_off = 0, sig_len = 0, siglen_pos = 0;
+        unsigned long sig_len = 0;
         for (unsigned long k = 0; k < n_in; k++) {
             if (p + 36 > (unsigned long)wlen) { free(work); free(next); return -1; }
             p += 36;
-            siglen_pos = p;
             unsigned long sl = get_varint(work + p, &cc);
-            if (k == i) { sig_off = p; sig_len = sl; }
+            if (k == i) { sig_len = sl; }
             p += cc + sl + 4;
         }
         /* if already signed (non-empty scriptSig), skip */

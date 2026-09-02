@@ -14,9 +14,6 @@ static int hex2b(const char* h, uint8_t* o){
     for(const char*p=h;p[0]&&p[1];p+=2){ unsigned v; sscanf(p,"%2x",&v); o[n++]=(uint8_t)v; }
     return n;
 }
-static int hex2b_args(const char* h, uint8_t* o, size_t* outlen){
-    int n=hex2b(h,o); if(outlen)*outlen=n; return n;
-}
 
 int main(void){
     char line[65536];

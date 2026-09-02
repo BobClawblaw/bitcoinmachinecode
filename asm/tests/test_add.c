@@ -28,7 +28,7 @@ static const u64 G12[12]={
     1,0,0,0};
 int main(void){
     u64 two[12], three[12], five[12], seven[12], ax[4], ay[4];
-    u64 k2[4]={2,0,0,0}, k3[4]={3,0,0,0}, k7[4]={7,0,0,0};
+    u64 k2[4]={2,0,0,0}, k3[4]={3,0,0,0};
     /* 2G and 3G via scalar_mul (Jacobian) */
     point_scalar_mul(two, Gaf, k2);
     point_scalar_mul(three, Gaf, k3);

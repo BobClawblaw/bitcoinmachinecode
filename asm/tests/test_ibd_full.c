@@ -150,8 +150,10 @@ int main(void){
     FILE* bf=fopen("blk00000.dat","rb"); size_t ft=fread(fb,1,(size_t)NB*(MAXBLK+16),bf); fclose(bf);
     long off=0;
     for(int i=0;i<NB;i++){
+        if(off+8>(long)ft){ exact=0; break; }          /* the file must hold every frame it claims */
         unsigned len = fb[off]|(fb[off+1]<<8)|(fb[off+2]<<16)|(fb[off+3]<<24);
         if((long)len!=blen[i]){ exact=0; break; }
+        if(off+8+(long)len>(long)ft){ exact=0; break; }
         if(memcmp(fb+off+8,blocks[i],(size_t)blen[i])!=0){ exact=0; break; }
         off += 8 + len;
     }

@@ -54,7 +54,7 @@ static int run_cli(int port, const char* user, const char* pass,
     if (p1) argv[ac++] = (char*)p1;
     argv[ac] = NULL;
     int pout[2], perr[2];
-    pipe(pout); pipe(perr);
+    if (pipe(pout) < 0 || pipe(perr) < 0){ perror("pipe"); _exit(2); }
     pid_t pid = fork();
     if (pid == 0) {
         dup2(pout[1], 1); dup2(perr[1], 2);
@@ -97,7 +97,7 @@ static int raw_exchange(int port, const char* req, size_t reqlen) {
     a.sin_family = AF_INET; a.sin_port = htons((unsigned short)port);
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd, (struct sockaddr*)&a, sizeof a) < 0) { close(fd); return -1; }
-    write(fd, req, reqlen);
+    if (write(fd, req, reqlen) != (ssize_t)reqlen){ close(fd); return -1; }
     /* read until headers + Content-Length body complete, or connection closes */
     size_t got = 0;
     while (got < sizeof raw_out - 1) {
@@ -155,7 +155,7 @@ static int has_substr(const char* s, const char* sub) { return strstr(s, sub) !=
 
 int main(void) {
     /* ---- spin up the REAL server daemon on an ephemeral port ---- */
-    int pout[2]; pipe(pout);
+    int pout[2]; if (pipe(pout) < 0){ perror("pipe"); return 1; }
     pid_t srv = fork();
     if (srv == 0) {
         dup2(pout[1], 2); close(pout[0]); close(pout[1]);

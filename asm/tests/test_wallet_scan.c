@@ -51,10 +51,12 @@ static long put_vi(unsigned char* o, unsigned long v){
     o[0] = 0xfd; o[1] = (unsigned char)v; o[2] = (unsigned char)(v >> 8); return 3;
 }
 static long put_u32(unsigned char* o, unsigned int v){
-    for (int i = 0; i < 4; i++) o[i] = (unsigned char)(v >> (8*i)); return 4;
+    for (int i = 0; i < 4; i++) o[i] = (unsigned char)(v >> (8*i));
+    return 4;
 }
 static long put_u64(unsigned char* o, unsigned long long v){
-    for (int i = 0; i < 8; i++) o[i] = (unsigned char)(v >> (8*i)); return 8;
+    for (int i = 0; i < 8; i++) o[i] = (unsigned char)(v >> (8*i));
+    return 8;
 }
 
 /* ---- key set ------------------------------------------------------------ */

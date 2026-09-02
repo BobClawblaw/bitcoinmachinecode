@@ -94,7 +94,7 @@ int lsm_manifest_adopt_child(struct lsm_state* lst, const uint64_t* inputs, int 
     if (cn < 1){ free(c); return -1; }
     const unsigned char* cur = (const unsigned char*)lst->manifest_buf;
     /* the child's manifest = [merged] + the non-input runs it saw at fork:
-        /* the merged run is the one child entry we do not know; every other
+     * the merged run is the one child entry we do not know; every other
      * entry must be ours, and none may be an input. (Leveled: the merged
      * run sits wherever the batch began, not necessarily at index 0.) */
     int unknown = 0, bad = 0; uint64_t merged = 0;

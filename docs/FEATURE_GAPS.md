@@ -1582,3 +1582,17 @@ pass, then `-Werror`**.
   `-stdinwalletpassphrase` and `-stdin`. Pinned by `tests/test_cli_prompt`
   (a real pty). Parity attestation heights are now published in
   `docs/PARITY_ATTESTATION.md` (audit recommendation 8).
+
+## Update 2026-09-02 — every C compile is `-Wall -Werror` (audit N7, the deferred half)
+
+The tree carried 3,166 warning lines per full build (287 unique sites once
+the per-rule repeats are removed; 57 of the object rules had never been
+compiled with `-Wall` at all, hiding 27 more). All were fixed at the root
+(prototypes corrected, results checked, buffers bounded, indentation made to
+say what the code does, dead helpers removed), never with pragmas or blanket
+casts, and `WARNFLAGS := -Wall -Werror` is now appended to every C compile in
+the Makefile. The classes and what they turned out to be are recorded in
+`worklog/2026-09-02.md`. **Not** covered: nasm's six warning kinds (22 lines:
+`.tbss` initialisation in bitcoin_scriptcodec.asm, RIP-relative displacement
+notes in bitcoin_idx*.asm, three number-overflow notes) -- those are the next
+cleanup, after which `NASMFLAGS` gets `-Werror` too.

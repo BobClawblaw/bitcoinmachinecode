@@ -121,7 +121,7 @@ static int sv_last_push(const uint8_t* ss, uint32_t ssl, const uint8_t** data, u
 }
 
 /* sv_classify_segwit: decide whether an input spends a witness program.
- *   returns  1  native program (spk itself)        -> *version/*prog/*proglen set
+ *   returns  1  native program (spk itself)        -> *version, *prog, *proglen set
  *            2  P2SH-wrapped program (BIP141 "P2SH-P2WPKH/P2SH-P2WSH"):
  *               spk is P2SH, scriptSig is exactly one push whose payload is
  *               a witness program and hash160(payload) == the P2SH hash

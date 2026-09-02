@@ -110,11 +110,6 @@ extern void sha512_full(unsigned char out[64], const void* msg, long len);
 
 /* ---- internal helpers ------------------------------------------------ */
 
-static void hex_encode(char* out, const unsigned char* in, int n) {
-    static const char* h = "0123456789abcdef";
-    for (int i = 0; i < n; i++) { out[i*2] = h[in[i]>>4]; out[i*2+1] = h[in[i]&15]; }
-    out[n*2] = 0;
-}
 static int hex_val(char c) {
     if (c>='0'&&c<='9') return c-'0';
     if (c>='a'&&c<='f') return c-'a'+10;
@@ -223,7 +218,7 @@ int wallet_store_load(const char* path, char* mnemonic_out, int cap,
         if (line[0]=='#') continue;
         if (!strncmp(line, "kdf=", 4)) continue;
         if (!strncmp(line, "cipher=", 7)) continue;
-        if (!strncmp(line, "tag=", 4)) { snprintf(taghex, sizeof taghex, "%s", line+4); continue; }
+        if (!strncmp(line, "tag=", 4)) { if (strlen(line+4) == 64) memcpy(taghex, line+4, 65); continue; }   /* a tag is exactly 64 hex chars; anything else stays unset and fails the check */
         /* legacy v1 informational pass= is decoded but does not carry the secret
          * for v2; we keep it for completeness of the buffer only. */
         if (!strncmp(line, "pass=", 5)) continue;
@@ -252,7 +247,7 @@ int wallet_store_load(const char* path, char* mnemonic_out, int cap,
         const char* sec = NULL;
         if (pass_out && pcap > 0 && pass_out[0]) sec = pass_out;   /* caller pre-filled */
         if (!sec) sec = getenv("BMC_WALLET_PASS");
-        if (!sec || !sec[0]) { if (pass_out && pcap>0) snprintf(pass_out, pcap, ""); return -1; }
+        if (!sec || !sec[0]) { if (pass_out && pcap>0) pass_out[0] = 0; return -1; }
         unsigned char K[64]; deriv_key(K, sec);
         int ctlen = (int)(strlen(cthex)/2); if (ctlen <= 0) return -1;
         /* first pass validate hex length (must be even) */
@@ -322,7 +317,7 @@ int wallet_secret_read(const char* path, const char* magic,
         if (!strncmp(line, magic, strlen(magic))){ seen_magic = 1; continue; }
         if (!strcmp(line, BMCWAL_FORMAT_WCRYPT)){ sealed = 1; continue; }
         if (!strncmp(line, "kdf=", 4) || !strncmp(line, "cipher=", 7)) continue;
-        if (!strncmp(line, "tag=", 4)){ snprintf(taghex, sizeof taghex, "%s", line+4); continue; }
+        if (!strncmp(line, "tag=", 4)){ if (strlen(line+4) == 64) memcpy(taghex, line+4, 65); continue; }
         if (!cthex){ cthex = strdup(line); }
     }
     fclose(f);

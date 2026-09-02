@@ -15,7 +15,7 @@ static void ck3(const char*lbl, const u64 r[4], const u64 e[4]){
 #define A {0xbfd25e8cd0364140ULL,0xbaaedce6af48a03bULL,0xfffffffffffffffeULL,0xffffffffffffffffULL} /* n-1 */
 #define B {0x0000000000000001ULL,0x0000000000000000ULL,0x0000000000000000ULL,0x0000000000000000ULL}
 int main(void){
-    u64 r[4], a[4], b[4], e[4];
+    u64 r[4];
     /* add(n-1,1)=0 */
     u64 n1[4]=A, one[4]=B, zero[4]={0,0,0,0};
     sc_add(r, n1, one); ck3("sc_add(n-1,1)=0", r, zero);

@@ -16,7 +16,8 @@ int main(){
     unsigned char out[32], buf[512];
     int r = tx_txid(out, tx, 64, buf, sizeof buf);
     printf("tx_txid valid=%d\n", r);
-    for(int i=0;i<8;i++) printf("%02x", out[i]); printf("...\n");
+    for(int i=0;i<8;i++) printf("%02x", out[i]);
+    printf("...\n");
     /* a valid 1-in/1-out legacy tx MUST parse */
     if(r!=1){ printf("FAIL: tx_txid rejected a valid tx\n"); return 1; }
     /* txid must equal sha256d(raw) for a legacy tx (no witness) */

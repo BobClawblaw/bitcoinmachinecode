@@ -18,9 +18,6 @@ static void cki(const char* lbl, int got, int exp){
     if (got==exp) printf("PASS %s\n", lbl);
     else { printf("FAIL %s got=%d exp=%d\n", lbl, got, exp); failures++; }
 }
-static void prb(const char* n, const unsigned char* b, int len){
-    printf("%s = ", n); for(int i=0;i<len;i++) printf("%02x", b[i]); printf("\n");
-}
 int main(void){
     /* genesis block header, 80 bytes */
     unsigned char hdr[80] = {
@@ -74,15 +71,21 @@ int main(void){
     ckh("merkle(1)=coinbase-txid", root, leaf0);
     /* expected merkle digests (internal byte order) computed by own Python oracle */
     unsigned char e2[32]={0x5c,0xcd,0x15,0xde,0x17,0x5a,0x45,0xb0,0x84,0x92,0x61,0x61,0x15,0x5c,0x16,0xfa,0x95,0xe2,0x7e,0x25,0xe7,0xb4,0x39,0x21,0x79,0x4e,0xda,0x28,0x9c,0xa7,0xaf,0xc0};
-    for(int i=0;i<32;i++) buf[i]=leaf0[i]; for(int i=0;i<32;i++) buf[32+i]=leaf1[i];
+    for(int i=0;i<32;i++) buf[i]=leaf0[i];
+    for(int i=0;i<32;i++) buf[32+i]=leaf1[i];
     merkle_root(root, buf, 2);
     ckh("merkle(2)", root, e2);
     unsigned char e3[32]={0x40,0xd1,0xd5,0x7c,0xa9,0xbf,0xcb,0xb0,0xb1,0xa6,0x5f,0xe0,0x8f,0x13,0xed,0xaf,0xe1,0x6e,0x22,0xad,0x72,0x77,0x02,0x63,0x74,0x25,0x21,0xfc,0x3d,0x83,0x92,0xc2};
-    for(int i=0;i<32;i++) buf[i]=leaf0[i]; for(int i=0;i<32;i++) buf[32+i]=leaf1[i]; for(int i=0;i<32;i++) buf[64+i]=leaf2[i];
+    for(int i=0;i<32;i++) buf[i]=leaf0[i];
+    for(int i=0;i<32;i++) buf[32+i]=leaf1[i];
+    for(int i=0;i<32;i++) buf[64+i]=leaf2[i];
     merkle_root(root, buf, 3);
     ckh("merkle(3)", root, e3);
     unsigned char e4[32]={0xd6,0xe7,0x25,0x3f,0x36,0x7d,0x9a,0x2d,0x01,0x1b,0x8e,0x6f,0x21,0xc5,0x7c,0x02,0xf1,0x91,0xef,0x2b,0x40,0xd6,0x58,0xed,0x4e,0xbb,0x93,0xbd,0xe3,0x74,0xfc,0x38};
-    for(int i=0;i<32;i++) buf[i]=leaf0[i]; for(int i=0;i<32;i++) buf[32+i]=leaf1[i]; for(int i=0;i<32;i++) buf[64+i]=leaf2[i]; for(int i=0;i<32;i++) buf[96+i]=leaf3[i];
+    for(int i=0;i<32;i++) buf[i]=leaf0[i];
+    for(int i=0;i<32;i++) buf[32+i]=leaf1[i];
+    for(int i=0;i<32;i++) buf[64+i]=leaf2[i];
+    for(int i=0;i<32;i++) buf[96+i]=leaf3[i];
     merkle_root(root, buf, 4);
     ckh("merkle(4)", root, e4);
 

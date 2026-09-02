@@ -30,7 +30,6 @@ static void ck(const char* name, const uint8_t* got, const char* hex){
     }
 }
 static void h2b(uint8_t* o, const char* h){ for(int i=0;i<32;i++){unsigned v;sscanf(h+2*i,"%2x",&v);o[i]=(uint8_t)v;} }
-static void prx(char* n, const uint8_t* d){ printf("%s=",n); for(int i=0;i<32;i++)printf("%02x",d[i]); printf("\n"); }
 
 int main(void){
     uint8_t out[32], a[32], b[32], scr[1];

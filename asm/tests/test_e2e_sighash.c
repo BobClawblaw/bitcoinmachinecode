@@ -209,7 +209,6 @@ static int validate_tx(const unsigned char* tx, unsigned long txlen,
     unsigned long long total_in = 0;
     const unsigned char* scripts[64];
     unsigned long slens[64];
-    unsigned long long vals[64];
 
     for (unsigned int i = 0; i < info.n_in && i < 64; i++) {
         unsigned char txid[32]; unsigned long index;
@@ -229,7 +228,7 @@ static int validate_tx(const unsigned char* tx, unsigned long txlen,
             printf("  [double-spend] input %u outpoint absent/unspent\n", i);
             return 0;
         }
-        scripts[i] = sp; slens[i] = sl; vals[i] = val;
+        scripts[i] = sp; slens[i] = sl;
         total_in += val;
     }
 

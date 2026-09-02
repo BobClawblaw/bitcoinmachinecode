@@ -1052,8 +1052,12 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
 long txrelay_notfound_count(void){ return txr_notfound_seen; }
 /* The second stats line: why orphans dropped, and how the parent fetching went. */
 void txrelay_stats2(long* ttl, long* evict, long* reject, long* parent_req, long* notfound, long* refetch){
-    if (ttl) *ttl = txr_drop_ttl; if (evict) *evict = txr_drop_evict; if (reject) *reject = txr_drop_reject;
-    if (parent_req) *parent_req = txr_parent_req; if (notfound) *notfound = txr_notfound_seen; if (refetch) *refetch = txr_req_refetch;
+    if (ttl) *ttl = txr_drop_ttl;
+    if (evict) *evict = txr_drop_evict;
+    if (reject) *reject = txr_drop_reject;
+    if (parent_req) *parent_req = txr_parent_req;
+    if (notfound) *notfound = txr_notfound_seen;
+    if (refetch) *refetch = txr_req_refetch;
 }
 long txrelay_stats(long* parked, long* resolved, long* dropped,
                    long* p1c_ok, long* p1c_fail, long* orphans_held){

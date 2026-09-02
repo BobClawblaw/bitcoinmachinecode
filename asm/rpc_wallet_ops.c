@@ -616,7 +616,7 @@ static int wop_activate(const char* name, long* ec, const char** em){
         if (wallet_store_load(store, mn, (int)sizeof mn, pass, (int)sizeof pass) != 0){
             memset(mn, 0, sizeof mn); memset(pass, 0, sizeof pass);
             snprintf(perr, sizeof perr, "Wallet file verification failed. Failed to load "
-                     "wallet store %s (encrypted? set BMC_WALLET_PASS or walletpassfile=)", store);
+                     "wallet store %.120s (encrypted? set BMC_WALLET_PASS or walletpassfile=)", store);
             *ec = -18; *em = perr; return 0;
         }
         static unsigned char seed[64];
@@ -802,7 +802,7 @@ static int cmd_restorewallet(const rj_val* params, long* ec, const char** em, rj
 }
 
 #define WOP_MAX_DESCS 16
-typedef struct { char desc[340]; long range; long next; int script; } wop_desc_t;
+typedef struct { char desc[512]; long range; long next; int script; } wop_desc_t;   /* = the reader's line[512] */
 static wop_desc_t g_wd[WOP_MAX_DESCS];
 static int  g_wd_n = -1;                  /* -1 = not loaded from file */
 static wscan_key* g_wk;                   /* descriptor-derived key window */
@@ -1065,8 +1065,6 @@ static rj_val* wop_desc_entry_t(const unsigned char seed[64], int t, int is_chan
     rj_obj_set(e, "active", rj_bool(1));
     rj_obj_set(e, "internal", rj_bool(is_change));
     return e;
-}
-static rj_val* wop_desc_entry(const unsigned char seed[64], int is_change){ return wop_desc_entry_t(seed, WOT_BECH32, is_change);
 }
 
 static int cmd_listdescriptors(const rj_val* params, const rpc_wallet* w,
@@ -1337,7 +1335,7 @@ static int cmd_exportwatchonlywallet(const rj_val* params, const rpc_wallet* w,
         return wop_err(ec, em, -8, "exportwatchonlywallet requires a destination path");
 
     /* gather this wallet's public descriptors, from whichever kind it is */
-    char descs[WOP_MAX_DESCS][340];
+    char descs[WOP_MAX_DESCS][512];   /* = wop_desc_t.desc */
     long ranges[WOP_MAX_DESCS], nexts[WOP_MAX_DESCS];
     int nd = 0;
     if (w && w->seed){
@@ -1355,7 +1353,7 @@ static int cmd_exportwatchonlywallet(const rj_val* params, const rpc_wallet* w,
     } else if (g_aw_watchonly){
         wop_descs_load();
         for (int i = 0; i < g_wd_n && nd < WOP_MAX_DESCS; i++){
-            snprintf(descs[nd], sizeof descs[nd], "%s", g_wd[i].desc);
+            snprintf(descs[nd], sizeof descs[nd], "%.*s", (int)sizeof descs[nd] - 1, g_wd[i].desc);   /* same width both sides; the precision is what gcc can see */
             ranges[nd] = g_wd[i].range; nexts[nd] = g_wd[i].next; nd++;
         }
     } else {
@@ -2618,7 +2616,7 @@ static void wf_hex(char* out, const unsigned char* b, long n){
 
 /* Fund a set of outputs: select coins, add change, return the unsigned hex
  * plus the prevtxs array signrawtransactionwithwallet needs for BIP143.
- * Returns 1, or 0 with *ec/*em set. */
+ * Returns 1, or 0 with *ec / *em set. */
 static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
                    int conf_target, char** hex_out, rj_val** prevtxs_out,
                    unsigned long long* fee_out, int* changepos_out,
@@ -3751,9 +3749,6 @@ int rpc_wops_bump_link(const char* txid_disp, char* replaced_by, size_t rb_cap,
     "createrawtransaction then signrawtransactionwithwallet, which signs " \
     "the inputs the wallet holds keys for and reports the rest in errors[]"
 
-static int wop_unsupported(const char* msg, long* ec, const char** em){
-    *ec = -1; *em = msg; return 0;
-}
 
 /* ==== dispatch =========================================================== */
 
@@ -4005,7 +4000,7 @@ int rpc_wops_tx_touches_wallet(const rpc_wallet* w, const unsigned char* tx, uns
     if (!keys) return 0;
     unsigned long p = 4, v, n;
     if (p + 2 <= len && tx[p] == 0x00 && tx[p+1] == 0x01) p += 2;          /* segwit marker+flag */
-    if (!(n = wn_varint(tx + p, len - p, &v))) return 0; p += n;
+    if (!(n = wn_varint(tx + p, len - p, &v))) { return 0; } p += n;
     unsigned long nin = v;
     for (unsigned long i = 0; i < nin; i++){
         if (p + 36 > len) return 0;
@@ -4013,14 +4008,14 @@ int rpc_wops_tx_touches_wallet(const rpc_wallet* w, const unsigned char* tx, uns
         unsigned long long cv; unsigned char h[20];
         if (rpc_wops_own_coin(w->seed, tx + p, vout, &cv, h)) return 1;
         p += 36;
-        if (!(n = wn_varint(tx + p, len - p, &v))) return 0; p += n;
-        if (p + v + 4 > len) return 0; p += v + 4;
+        if (!(n = wn_varint(tx + p, len - p, &v))) { return 0; } p += n;
+        if (p + v + 4 > len) { return 0; } p += v + 4;
     }
-    if (!(n = wn_varint(tx + p, len - p, &v))) return 0; p += n;
+    if (!(n = wn_varint(tx + p, len - p, &v))) { return 0; } p += n;
     unsigned long nout = v;
     for (unsigned long i = 0; i < nout; i++){
-        if (p + 8 > len) return 0; p += 8;
-        if (!(n = wn_varint(tx + p, len - p, &v))) return 0; p += n;
+        if (p + 8 > len) { return 0; } p += 8;
+        if (!(n = wn_varint(tx + p, len - p, &v))) { return 0; } p += n;
         if (p + v > len) return 0;
         if (wn_spk_is_ours(keys, nk, tx + p, v)) return 1;
         p += v;

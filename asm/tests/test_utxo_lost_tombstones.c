@@ -194,6 +194,7 @@ int main(void){
 #endif
     u8 prev[32]; memset(prev,0,32); u8 hash[32], t1[32];
     long rejects = 0, recoveries = 0, applied_total = 0, expected = 0, halted_at = -1, expected_at_halt = -1;
+    (void)halted_at;   /* read only under LSM_REPRO_BAD_SPARSE */
     for (long h = 0; h < MATURE; h++){
         long len = mk_and_mine(rawb, hash, t1, prev, (u32)h, 1600000000u + (u32)h);
         memcpy(cbid[h], t1, 32);

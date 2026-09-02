@@ -273,7 +273,6 @@ static int check_sig(const Ref* sig, const Ref* pub,
     if (sig->n==0 || pub->n==0) return 0;
     unsigned char hb = sig->d[sig->n-1];
     if ((hb & 0x1f)!=1) return 0;
-    size_t siglen = sig->n-1;
     unsigned char sighash[32];
     int ra = sighash_all(sighash, tx, txlen, nIn, sc, sc_len, work, workcap-64);
     if (!ra) return 0;
@@ -528,7 +527,7 @@ static int eval_arith(Stack* stk, unsigned char op, int fReqMin, int* err){
         Ref*a=stacktop(stk,2),*b=stacktop(stk,1); if(!a||!b){*err=ERR_INVALID_STACK_OPERATION;return 0;}
         int64_t x,y; if(!snum_decode(a,fReqMin,4,&x)||!snum_decode(b,fReqMin,4,&y)){*err=ERR_SCRIPTNUM;return 0;}
         stack_pop(stk);stack_pop(stk);
-        unsigned char buf[9]; size_t m; int64_t r;
+        unsigned char buf[9]; size_t m;
         switch(op){
         case OP_ADD: m=snum_ser(x+y,buf); stack_push(stk,buf,m); return 1;
         case OP_SUB: m=snum_ser(x-y,buf); stack_push(stk,buf,m); return 1;

@@ -54,7 +54,9 @@ static int get_cs(const u8* p, u64 avail, u64* out){
     if (p[0] < 253){ *out = p[0]; return 1; }
     if (p[0] == 253){ if (avail < 3) return 0; *out = (u64)p[1] | ((u64)p[2]<<8); return 3; }
     if (p[0] == 254){ if (avail < 5) return 0; *out = 0; for(int i=0;i<4;i++) *out |= (u64)p[1+i]<<(8*i); return 5; }
-    if (avail < 9) return 0; *out = 0; for(int i=0;i<8;i++) *out |= (u64)p[1+i]<<(8*i); return 9;
+    if (avail < 9) return 0;
+    *out = 0; for(int i=0;i<8;i++) *out |= (u64)p[1+i]<<(8*i);
+    return 9;
 }
 
 /* ---- writer -------------------------------------------------------------

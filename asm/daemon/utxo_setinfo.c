@@ -234,7 +234,8 @@ static int fingerprint_take(fingerprint* f)
     while ((de = readdir(d)) != NULL) {
         if (strncmp(de->d_name, "utxo_run_", 9) != 0) continue;
         if (nn >= FP_MAX) { closedir(d); return 0; }
-        snprintf(names[nn++], 64, "%s", de->d_name);
+        if (snprintf(names[nn], 64, "%s", de->d_name) >= 64) { closedir(d); return 0; }   /* not one of ours: refuse rather than truncate */
+        nn++;
     }
     closedir(d);
     for (int i = 1; i < nn; i++) {
