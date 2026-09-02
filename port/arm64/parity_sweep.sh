@@ -376,16 +376,19 @@ fi
 # daemon/wallet_cli: x86 builds it from daemon/wallet_cli.c + the wallet C +
 # WALLETPRIMS + bitcoin_script.o -- all arch-neutral C + port objects. The
 # e2e sighash test execs it as ./daemon/wallet_cli from the scratch dir.
-if [ ! -x "$OUT/wallet_cli" ]; then
-  gcc -no-pie -O2 -I../../asm -o "$OUT/wallet_cli" \
-    ../../asm/daemon/wallet_cli.c ../../asm/wallet_core.c ../../asm/wallet_store.c \
-    ../../asm/wallet_book.c ../../asm/wallet_txlog.c ../../asm/wallet_msgsign.c \
-    secp256k1_fe.o secp256k1_point.o ../../asm/secp256k1_glv_c.c secp256k1_point_ct.o \
-    secp256k1_scalar.o ../../asm/secp256k1_scalar_c.c secp256k1_ecdsa.o \
-    bitcoin_keys.o bitcoin_addr.o bitcoin_pubkey.o bitcoin_sighash.o \
-    bitcoin_hash.o sha256.o ripemd160.o bitcoin_bip39.o sha512.o bitcoin_hmac.o \
-    bitcoin_bip32.o bech32.o bitcoin_utxo.o bitcoin_script.o \
-    bitcoin_sighash_all_ext.o secp256k1_glv.o secp256k1_glv_mul.o 2>> "$OUT/build.log" \
+# rebuilt EVERY sweep: a stale wallet_cli silently measures pre-merge code
+# rebuilt EVERY sweep from build_daemon.sh's own lists -- a stale or
+# hand-maintained link line silently measures pre-merge code (the 2026-09-02
+# rpcd did: zero whitelist symbols). Swap the daemon main for the tool main.
+if true; then
+  eval $(grep -E "^DAEMONSRCS=|^RPCSRCS=|^NEWSRCS=|^DAEMONOBJS=" build_daemon.sh)
+  SRCS=$(echo "$DAEMONSRCS $RPCSRCS $NEWSRCS" | tr ' ' '\n' | grep -v "daemon/main.c" | tr '\n' ' ')
+  # wallet_core's book_* live in asm/wallet_book.c (the daemon gets it via DAEMONOBJS-adjacent wiring; the shim adds it explicitly too)
+  SRCS="$SRCS ../../asm/wallet_book.c"
+  OB=$(for m in $DAEMONOBJS; do echo "${m}.o"; done)
+  gcc -no-pie -O2 -Wl,-z,relro,-z,now -lpthread -I../../asm -I../../asm/daemon -I../.. \
+    -o "$OUT/wallet_cli" ../../asm/daemon/wallet_cli.c $SRCS ../../asm/wallet_core.c $OB \
+    2>> "$OUT/build.log" \
   || echo -e "build-fail\tSPECIAL:wallet_cli\tsee build.log" >> "$OUT/results.tsv"
 fi
 # daemon/bitcoin_rpcd: the RPC daemon binary (test_rpc_server execs it as
@@ -393,38 +396,34 @@ fi
 # bitcoin_rpcd.c swapped for main.c (build_daemon.sh's lists, minus main).
 # daemon/bitcoin_cli: daemon/bitcoin_cli.c + cli_conf.c + rpc_net/commands/json
 # + RPCLIBS (test_rpc_server shells out to it).
-if [ ! -x "$OUT/bitcoin_cli" ]; then
-  gcc -no-pie -O2 -I../../asm -o "$OUT/bitcoin_cli" \
-    ../../asm/daemon/bitcoin_cli.c ../../asm/daemon/cli_conf.c \
-    ../../asm/rpc_net.c ../../asm/rpc_commands.c ../../asm/rpc_json.c \
-    ../../asm/rpc_node.c ../../asm/daemon/mempool_persist.c ../../asm/rpc_wallet_ops.c \
-    ../../asm/rpc_signer.c ../../asm/daemon/bfilter_index.c \
-    ../../asm/daemon/addr_index_tail.c ../../asm/wallet_labels.c \
-    ../../asm/wallet_scan.c ../../asm/wallet_scan_hash.c \
-    ../../asm/daemon/wallet_enc_state.c ../../asm/daemon/wallet_crypter.c \
-    ../../asm/bitcoin_aes.c ../../asm/rpc_chain.c ../../asm/bitcoin_pow_rules.c \
-    ../../asm/block_filter.c ../../asm/bip32_ckdpub.c \
-    ../../asm/daemon/wallet_pass.c ../../asm/wallet_core.c ../../asm/wallet_msgsign.c \
-    ../../asm/wallet_store.c ../../asm/wallet_bnb.c ../../asm/wallet_txlog.c \
-    secp256k1_fe.o secp256k1_point.o ../../asm/secp256k1_glv_c.c secp256k1_point_ct.o \
-    secp256k1_scalar.o ../../asm/secp256k1_scalar_c.c secp256k1_ecdsa.o \
-    bitcoin_keys.o bitcoin_addr.o bitcoin_pubkey.o bitcoin_sighash.o \
-    bitcoin_sighash_all_ext.o secp256k1_glv.o secp256k1_glv_mul.o \
-    bitcoin_hash.o sha256.o ripemd160.o bitcoin_bip39.o sha512.o bitcoin_hmac.o \
-    bitcoin_bip32.o bech32.o bitcoin_utxo.o bitcoin_script.o \
-    bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o \
-    bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_tx.o \
-    bitcoin_chainwork.o parity_out/addrbook.a 2>> "$OUT/build.log" \
+# rebuilt EVERY sweep: a stale bitcoin_cli silently measures pre-merge code
+# rebuilt EVERY sweep from build_daemon.sh's own lists -- a stale or
+# hand-maintained link line silently measures pre-merge code (the 2026-09-02
+# rpcd did: zero whitelist symbols). Swap the daemon main for the tool main.
+if true; then
+  eval $(grep -E "^DAEMONSRCS=|^RPCSRCS=|^NEWSRCS=|^DAEMONOBJS=" build_daemon.sh)
+  SRCS=$(echo "$DAEMONSRCS $RPCSRCS $NEWSRCS" | tr ' ' '\n' | grep -v "daemon/main.c" | tr '\n' ' ')
+  # wallet_core's book_* live in asm/wallet_book.c (the daemon gets it via DAEMONOBJS-adjacent wiring; the shim adds it explicitly too)
+  SRCS="$SRCS ../../asm/wallet_book.c"
+  OB=$(for m in $DAEMONOBJS; do echo "${m}.o"; done)
+  gcc -no-pie -O2 -Wl,-z,relro,-z,now -lpthread -I../../asm -I../../asm/daemon -I../.. \
+    -o "$OUT/bitcoin_cli" ../../asm/daemon/bitcoin_cli.c $SRCS ../../asm/wallet_core.c $OB \
+    2>> "$OUT/build.log" \
   || echo -e "build-fail\tSPECIAL:bitcoin_cli\tsee build.log" >> "$OUT/results.tsv"
 fi
-if [ ! -x "$OUT/bitcoin_rpcd" ]; then
-  DS="../../asm/daemon/utxo_live.c ../../asm/daemon/block_witness.c ../../asm/daemon/tx_accept.c ../../asm/daemon/zmq_notify.c ../../asm/daemon/zmq_pub.c ../../asm/daemon/reorg.c ../../asm/daemon/undo_log.c ../../asm/daemon/locator_build.c ../../asm/daemon/archive_verify.c ../../asm/daemon/addr_ingest.c ../../asm/daemon/net_policy.c ../../asm/daemon/node_config.c ../../asm/daemon/chainparams.c ../../asm/daemon/mempool_cfg.c ../../asm/daemon/upload_cap.c ../../asm/daemon/tx_submit.c ../../asm/daemon/tx_relay.c ../../asm/daemon/tx_index_tail.c ../../asm/daemon/blk_submit.c ../../asm/daemon/utxo_setinfo_rpc.c ../../asm/daemon/coinstats_index.c ../../asm/daemon/addr_self.c ../../asm/daemon/bfilter_index.c ../../asm/daemon/block_strip.c ../../asm/wallet_store.c ../../asm/bitcoin_mempool_policy.c ../../asm/daemon/mempool_compact.c ../../asm/bitcoin_txval_modern.c ../../asm/bitcoin_segwit.c ../../asm/bitcoin_taproot_sighash.c ../../asm/daemon/tx_verify.c ../../asm/bitcoin_scriptverify.c ../../asm/bitcoin_witness_v0.c ../../asm/daemon/serve_cfilters.c ../../asm/wallet_msgsign.c"
-  RS="../../asm/rpc_server.c ../../asm/rpc_commands.c ../../asm/rpc_chain.c ../../asm/bitcoin_pow_rules.c ../../asm/block_filter.c ../../asm/utxo_snapshot.c ../../asm/rpc_signer.c ../../asm/bip32_ckdpub.c ../../asm/rpc_json.c ../../asm/rpc_net.c ../../asm/rpc_node.c ../../asm/daemon/mempool_persist.c ../../asm/rpc_wallet_ops.c ../../asm/daemon/addr_index_tail.c ../../asm/wallet_labels.c ../../asm/wallet_scan.c ../../asm/wallet_scan_hash.c ../../asm/daemon/wallet_enc_state.c ../../asm/daemon/wallet_crypter.c ../../asm/bitcoin_aes.c ../../asm/wallet_txlog.c ../../asm/wallet_bnb.c"
-  NS="../../asm/daemon/addrbook.c ../../asm/daemon/asmap.c ../../asm/daemon/dialer.c ../../asm/daemon/i2psam.c ../../asm/daemon/minchainwork.c ../../asm/daemon/net6.c ../../asm/daemon/netaddr.c ../../asm/daemon/netperm.c ../../asm/daemon/notify.c ../../asm/daemon/serve_addr.c ../../asm/daemon/serve_invbounds.c ../../asm/daemon/signet.c ../../asm/daemon/signet_block.c ../../asm/daemon/signet_verify.c ../../asm/daemon/socks5.c ../../asm/daemon/subnet.c ../../asm/daemon/torcontrol.c ../../asm/daemon/txrecon.c ../../asm/daemon/v2transport.c ../../asm/daemon/wallet_pass.c ../../asm/base32.c ../../asm/bitcoin_sha3.c ../../asm/crypto_chacha20.c ../../asm/crypto_hkdf.c ../../asm/crypto_poly1305.c ../../asm/crypto_ellswift.c ../../asm/crypto_ellswift_ecdh.c ../../asm/crypto_ellswift_enc.c ../../asm/crypto_fe_sqrt.c ../../asm/crypto_bip324.c ../../asm/crypto_bip324_fs.c ../../asm/crypto_bip324_transport.c ../../asm/daemon/rpc_acl.c ../../asm/daemon/cli_conf.c ../../asm/daemon/lsm_manifest.c ../../asm/daemon/archive_reindex.c"
-  OB="sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o node_log.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o bitcoin_sigops.o bitcoin_cmpct.o bitcoin_idxscan.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_store_fast.o secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o ../../asm/secp256k1_glv_c.c secp256k1_point_ct.o secp256k1_glv.o secp256k1_glv_mul.o secp256k1_fe.o secp256k1_scalar.o ../../asm/secp256k1_scalar_c.c ripemd160.o bitcoin_addr.o bitcoin_chainwork.o bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_script_flags.o sha1.o bitcoin_utxo_stats.o bitcoin_muhash.o bitcoin_strip_witness.o bitcoin_store_ext.o bech32.o bitcoin_bip32.o bitcoin_bip39.o bitcoin_hmac.o sha512.o bitcoin_keys.o bitcoin_sighash_all_ext.o"
+# rebuilt EVERY sweep: a stale bitcoin_rpcd silently measures pre-merge code
+# rebuilt EVERY sweep from build_daemon.sh's own lists -- a stale or
+# hand-maintained link line silently measures pre-merge code (the 2026-09-02
+# rpcd did: zero whitelist symbols). Swap the daemon main for the tool main.
+if true; then
+  eval $(grep -E "^DAEMONSRCS=|^RPCSRCS=|^NEWSRCS=|^DAEMONOBJS=" build_daemon.sh)
+  SRCS=$(echo "$DAEMONSRCS $RPCSRCS $NEWSRCS" | tr ' ' '\n' | grep -v "daemon/main.c" | tr '\n' ' ')
+  # wallet_core's book_* live in asm/wallet_book.c (the daemon gets it via DAEMONOBJS-adjacent wiring; the shim adds it explicitly too)
+  SRCS="$SRCS ../../asm/wallet_book.c"
+  OB=$(for m in $DAEMONOBJS; do echo "${m}.o"; done)
   gcc -no-pie -O2 -Wl,-z,relro,-z,now -lpthread -I../../asm -I../../asm/daemon -I../.. \
-    -o "$OUT/bitcoin_rpcd" ../../asm/daemon/bitcoin_rpcd.c $DS $RS $NS ../../asm/wallet_core.c \
-    $(for m in $OB; do echo "$m"; done) 2>> "$OUT/build.log" \
+    -o "$OUT/bitcoin_rpcd" ../../asm/daemon/bitcoin_rpcd.c $SRCS ../../asm/wallet_core.c $OB \
+    2>> "$OUT/build.log" \
   || echo -e "build-fail\tSPECIAL:bitcoin_rpcd\tsee build.log" >> "$OUT/results.tsv"
 fi
 [ -f ecdsa_verify_ref.o ] || gcc -march=armv8.2-a+sha2 -c -o ecdsa_verify_ref.o ecdsa_verify_ref.S 2>> "$OUT/build.log"
@@ -436,37 +435,54 @@ PASS=0; FAIL=0; BF=0; SKIP=0; BENCH=0; N=0
 
 is_elf() { [ "$(head -c4 "$1" 2>/dev/null | tail -c1)" = "$(printf '\177')" ]; }
 
+# The x86 suite runs its test binaries FROM asm/ (make test: cwd=asm, binaries
+# in asm/tests/, daemon build products in asm/daemon/) and the tests' tt_src()
+# captures that cwd at launch -- tt_src("../config/..."), tt_src("daemon/main.c")
+# and tt_src("tests/<helper>") all resolve against it. The ARM sweep used to
+# launch from a /tmp scratch with a symlink farm, which broke every tt_src
+# source read (test_archive_trim, test_mempool_persist_wiring,
+# test_node_config: "daemon/main.c readable"). Replicate the x86 layout:
+# launch from $REPO/asm with the ARM-built binaries symlinked into place.
+ensure_asm_layout() {
+    local AB="$REPO/port/arm64"
+    # daemon build products the tests exec via tt_src("daemon/<name>")
+    ln -sf "$AB/daemon_out/bitcoind" "$REPO/asm/daemon/bitcoind"
+    [ -x "$AB/$OUT/wallet_cli" ] && ln -sf "$AB/$OUT/wallet_cli" "$REPO/asm/daemon/wallet_cli"
+    [ -x "$AB/$OUT/bitcoin_rpcd" ] && ln -sf "$AB/$OUT/bitcoin_rpcd" "$REPO/asm/daemon/bitcoin_rpcd"
+    [ -x "$AB/$OUT/bitcoin_cli" ] && ln -sf "$AB/$OUT/bitcoin_cli" "$REPO/asm/daemon/bitcoin_cli"
+    # the txo-spender index base builder (x86: asm/Makefile daemon/build_txospender_index)
+    if [ -x "$AB/$OUT/build_txospender_index" ]; then
+        ln -sf "$AB/$OUT/build_txospender_index" "$REPO/asm/daemon/build_txospender_index"
+    elif [ -x "$AB/build_txospender_index" ]; then
+        ln -sf "$AB/build_txospender_index" "$REPO/asm/daemon/build_txospender_index"
+    fi
+    return 0
+}
+link_helper() {  # link an ARM-built binary into asm/tests/ for tt_src("tests/<name>")
+    local f="$1"
+    [ -f "$f" ] && [ -x "$f" ] && ln -sf "$f" "$REPO/asm/tests/$(basename "$f")"
+    return 0
+}
+
 run_inv() {  # name kind args index
     local name="$1" kind="$2" args="$3" idx="$4"
     local label="$name"; [ "$idx" != "1" ] && label="$name#$idx"
-    local scratch="/tmp/par_run_$label"
     local bin="$REPO/port/arm64/$OUT/$name"
-    rm -rf "$scratch"; mkdir -p "$scratch/tests"
-    # symlink farm over asm/tests, minus stale executables (x86 ELF)
-    for f in "$REPO/asm/tests"/*; do
-        [ -x "$f" ] && is_elf "$f" && continue
-        ln -s "$f" "$scratch/tests/" 2>> "$OUT/build.log"
-    done
-    # overlay every binary we built (helpers the tests exec). Targets must be
-    # ABSOLUTE: $OUT is relative to port/arm64 and the symlink is resolved
-    # from the scratch cwd in /tmp, where "parity_out/..." does not exist.
+    ensure_asm_layout
+    # overlay every binary we built (helpers the tests exec via
+    # tt_src("tests/<name>")) into the real asm/tests dir, x86-suite style
     AB="$REPO/port/arm64"
     for f in "$AB/$OUT"/test_* "$AB/$OUT"/bench_* "$AB/$OUT"/*_shim "$AB/$OUT"/smoke_* "$AB/$OUT"/run_batch "$AB/$OUT"/fakepeer_*; do
-        [ -f "$f" ] && [ -x "$f" ] && ln -sf "$f" "$scratch/tests/$(basename "$f")"
+        link_helper "$f"
     done
-    # tests that spawn/inspect the daemon expect ./daemon/bitcoind and
-    # ./daemon/wallet_cli (the x86 suite runs from asm/, where daemon/ holds
-    # those build products)
-    mkdir -p "$scratch/daemon"
-    ln -sf "$REPO/port/arm64/daemon_out/bitcoind" "$scratch/daemon/bitcoind"
-    [ -x "$AB/$OUT/wallet_cli" ] && ln -sf "$AB/$OUT/wallet_cli" "$scratch/daemon/wallet_cli"
-    [ -x "$AB/$OUT/bitcoin_rpcd" ] && ln -sf "$AB/$OUT/bitcoin_rpcd" "$scratch/daemon/bitcoin_rpcd"
-    [ -x "$AB/$OUT/bitcoin_cli" ] && ln -sf "$AB/$OUT/bitcoin_cli" "$scratch/daemon/bitcoin_cli"
-    # ./daemon/bitcoind arg remap -> the ARM daemon
+    # ./daemon/bitcoind arg remap -> the ARM daemon (cwd is asm/ now, where
+    # ./daemon/bitcoind already resolves via the symlink above; keep the
+    # remap for older arg forms)
     local args2="${args//.\/daemon\/bitcoind/$REPO/port/arm64/daemon_out/bitcoind}"
-    ( cd "$scratch" && timeout "$TMO" "$bin" $args2 > out.txt 2>&1 )
+    ( cd "$REPO/asm" && timeout "$TMO" "$bin" $args2 > "$REPO/port/arm64/$OUT/$label.out.txt" 2>&1 )
     local rc=$?
-    local note; note=$(tail -c 300 "$scratch/out.txt" | tr '\n\t' '  ' | cut -c1-160)
+    local outf="$REPO/port/arm64/$OUT/$label.out.txt"
+    local note; note=$(tail -c 300 "$outf" | tr '\n\t' '  ' | cut -c1-160)
     if [ $rc -eq 0 ]; then
         if [ "$kind" = "bench" ]; then
             echo -e "bench-ok\t$label\t$note" >> "$OUT/results.tsv"; BENCH=$((BENCH+1))
@@ -479,9 +495,8 @@ run_inv() {  # name kind args index
         echo -e "fail\t$label\trc=$rc | $note" >> "$OUT/results.tsv"; FAIL=$((FAIL+1))
     fi
     if [ $rc -ne 0 ]; then
-        cp "$scratch/out.txt" "$OUT/$label.out.txt" 2>/dev/null   # kept for triage, gitignored
+        : # the .out.txt is already in place for triage (gitignored)
     fi
-    rm -rf "$scratch"
 }
 
 while IFS=$'\x1f' read -r name kind why argv args; do

@@ -415,8 +415,13 @@ node_serve_loop:
 	movk w24, #0x0000, lsl #16        /* "tx" */
 	cmp  w23, w24
 	b.eq .do_tx
-	mov  w24, #0x6f6c
-	movk w24, #0x636f, lsl #16        /* "bloc" (0x636f6c62 LE, "block" cmd[0..3]) */
+	mov  w24, #0x6c62
+	movk w24, #0x636f, lsl #16        /* "bloc" (0x636f6c62 LE, "block" cmd[0..3])
+	                                   * -- was #0x6f6c ("oloc"): the movz half was
+	                                   * byte-rotated (ASCII-immediate pitfall #2),
+	                                   * so EVERY inbound block push was silently
+	                                   * dropped and test_keepup's pushed block
+	                                   * was never stored or served */
 	cmp  w23, w24
 	b.eq .do_block
 	mov  w24, #0x6573
