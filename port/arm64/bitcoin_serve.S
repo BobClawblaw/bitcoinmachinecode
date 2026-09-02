@@ -132,6 +132,8 @@ viol_invsz:    .ascii "inv/getdata vector above MAX_INV_SZ\0"
 viol_txrelay:  .ascii "transaction sent in violation of protocol\0"
 viol_invtx:    .ascii "transaction inv sent in violation of protocol\0"
 viol_mempool:  .ascii "mempool request with bloom filters disabled\0"
+viol_txparse:  .ascii "malformed tx payload (parse failure)\0"
+viol_blkshort: .ascii "malformed block payload (shorter than a header)\0"
 cn_getbtxn:.ascii "getblocktxn\0"
 cn_btxn:   .ascii "blocktxn\0"
 cn_cmpct:  .ascii "cmpctblock\0"
@@ -464,6 +466,19 @@ node_serve_loop:
 	b.eq .viol_mempool_go
 	b    .next
 
+.viol_tx_malformed:
+	LOADADDR x0, viol_txparse
+	b    .viol_report_next
+.viol_block_short:
+	LOADADDR x0, viol_blkshort
+.viol_report_next:
+	/* audit N3: these SCORE (misbehaviour hook), unlike the policy_log
+	 * disconnect path -- the test's fake hook returns 70 */
+	LOADADDR x9, g_serve_violation_hook
+	ldr  x9, [x9]
+	cbz  x9, .next
+	blr  x9
+	b    .next
 .viol_mempool_go:
 	LOADADDR x0, viol_mempool
 	b    .viol_disconnect
@@ -606,7 +621,7 @@ node_serve_loop:
 	LOADADDR x9, s_plen
 	ldr  x9, [x9]
 	cmp  x9, #10
-	b.lo .next
+	b.lo .viol_tx_malformed       /* N3: too short to be a tx -> score, drop */
 	/* tx_txid(s_txid, pl_buf, s_plen, hp_buf, cap) */
 	LOADADDR x0, s_txid
 	LOADADDR x1, pl_buf
@@ -616,7 +631,7 @@ node_serve_loop:
 	movz x4, #0x7918                  /* 2000*81+8 = 162008 = 0x27918 */
 	movk x4, #0x2, lsl #16
 	bl   tx_txid
-	cbz  x0, .next
+	cbz  x0, .viol_tx_malformed   /* N3: does not parse -> score, drop */
 	LOADADDR x9, tx_dv_ok
 	ldrb w9, [x9]
 	cmp  w9, #1
@@ -634,7 +649,7 @@ node_serve_loop:
 	LOADADDR x9, s_plen
 	ldr  x9, [x9]
 	cmp  x9, #81
-	b.lo .next
+	b.lo .viol_block_short        /* N3: shorter than a header -> score, drop */
 	LOADADDR x0, pl_buf
 	mov  x1, x9                       /* s_plen */
 	LOADADDR x2, serve_txid_scratch

@@ -413,6 +413,9 @@ bitcoin.conf
 config/bitcoin.conf
 asm/.link-audit-cache/
 asm/tests/tool_*
+# parity_sweep.sh links ARM-built binaries into the x86 asm/ layout; this shim
+# name has no x86 build rule, so nothing else covered it
+asm/tests/bip30_daemon_shim
 # per-chain live confs carry rpc credentials, like config/bitcoin.conf
 config/bitcoin.testnet4.conf
 config/bitcoin.regtest.conf
