@@ -81,7 +81,7 @@ static const int ms4_wit0_len = 65;
 typedef struct { const char* name; const uint8_t* tx; int txlen;
   const uint8_t* txid; const uint8_t* prev_spk; int prev_spklen; unsigned long long prev_amount;
   int type; int nwit; const uint8_t** wit; const int* witlen; } msend_t;
-static const uint8_t* ms_wit0[]={}; static const uint8_t* ms_wit1[]={};
+static const uint8_t* ms_wit0[] __attribute__((unused)) = {}; static const uint8_t* ms_wit1[] __attribute__((unused)) = {};   /* empty witnesses: some includers use only the witnessed vectors */
 static const uint8_t* ms0_witp[] = { ms0_wit0, ms0_wit1 };
 static const int ms0_witl[] = { ms0_wit0_len, ms0_wit1_len };
 static const uint8_t* ms1_witp[] = { ms1_wit0, ms1_wit1 };

@@ -162,6 +162,7 @@ int run_case(int evil){
     int fd=tcp_connect_ip(ip,htons(port));
     if(fd<0){ printf("FAIL connect\n"); return -1; }
     int hk=node_handshake(fd);
+    if(hk!=1){ printf("FAIL handshake (rc=%d)\n", hk); return -1; }
 
     /* initial locator = zero (start from genesis) */
     static unsigned char loc[32]; memset(loc,0,32);
@@ -204,7 +205,8 @@ int run_case(int evil){
                handshake); serve the matching page (empty at tip) right away. */
             unsigned char rb[8192]; char cd[12]; unsigned pl=0;
             for(int i=0;i<100;i++){
-                if(p2p_read(c,cd,rb,sizeof rb,&pl)<=0) _exit(0); cd[11]=0;
+                if(p2p_read(c,cd,rb,sizeof rb,&pl)<=0) _exit(0);
+                cd[11]=0;
                 if(strncmp(cd,"getheaders",10)==0){
                     const unsigned char* loc2=rb+5;   /* +4 version +1 count */
                     int fx=-1; for(int k=0;k<NCHAIN;k++) if(memcmp(chainhash[k],loc2,32)==0){fx=k;break;}

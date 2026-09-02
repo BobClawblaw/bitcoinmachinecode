@@ -45,7 +45,7 @@ static uint64_t txi_rd_varint(const uint8_t* p, const uint8_t* end, uint64_t* co
  * caller must treat 0 as "index nothing from this block", never "index what
  * we got": a partially-indexed block answers "no such transaction" for the
  * rest of it. */
-static int txi_walk_block(const uint8_t* blk, long blen,
+static inline int txi_walk_block(const uint8_t* blk, long blen,
                           void (*cb)(void*, const uint8_t*, uint32_t, uint32_t), void* ctx){
     const uint8_t* p = blk + 80; const uint8_t* end = blk + blen;
     uint64_t cc, ntx = txi_rd_varint(p, end, &cc);

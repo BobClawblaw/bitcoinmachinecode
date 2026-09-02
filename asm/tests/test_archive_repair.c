@@ -43,7 +43,7 @@ static void write_rec(int fd, long h, unsigned char hashbyte, int is_hole){
         memset(rec, hashbyte, 32);   /* fake "hash": constant byte per logical block */
         /* file_no/data_pos/data_size don't matter for duplicate detection */
     }
-    pwrite(fd, rec, 48, (off_t)h*48);
+    if (pwrite(fd, rec, 48, (off_t)h*48) != 48){ perror("pwrite"); _exit(2); }
 }
 
 int main(void){
@@ -83,7 +83,7 @@ int main(void){
     unsigned char rec[48];
     int all_good = 1;
     for (long h=0; h<20; h++){
-        pread(fd, rec, 48, (off_t)h*48);
+        if (pread(fd, rec, 48, (off_t)h*48) != 48){ printf("FAIL short read h=%ld\n", h); all_good = 0; break; }
         int is_zero = 1;
         for (int i=0;i<48;i++) if (rec[i]) { is_zero=0; break; }
         int should_be_zero = (h>=10 && h<=14);

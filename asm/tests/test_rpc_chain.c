@@ -940,9 +940,9 @@ int main(void){
                                        unsigned long, const unsigned char*, void*);
         extern long   mpool_policy_entry(void*, const unsigned char*,
                                          unsigned long long*, unsigned long long*);
-        struct mp_entry_info;
+        /* struct mp_entry_info is forward-declared at file scope by rpc_node.h; a
+         * block-scope `struct mp_entry_info;` would declare a DIFFERENT type. */
         extern long   mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
-        extern void   sha256d(unsigned char*, const void*, unsigned long);
 
         static unsigned char pol[128], stbuf[1<<20];
         static unsigned char mp[40 + 4096*48 + 8], mblob[1<<20];

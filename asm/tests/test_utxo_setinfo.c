@@ -226,7 +226,7 @@ static void dirfp_take(dirfp* f)
         if (f->n >= 64) break;
         struct stat sb;
         if (stat(de->d_name, &sb) != 0) continue;
-        snprintf(f->name[f->n], 64, "%s", de->d_name);
+        snprintf(f->name[f->n], 64, "%.63s", de->d_name);
         f->size[f->n] = (u64)sb.st_size;
         f->sec[f->n] = (u64)sb.st_mtim.tv_sec;
         f->nsec[f->n] = (u64)sb.st_mtim.tv_nsec;

@@ -7,7 +7,7 @@ extern int bip32_master(unsigned char k[32], unsigned char c[32], const unsigned
 extern int bip32_ckd_priv(unsigned char k[32], unsigned char c[32],
                           const unsigned char* kpar, const unsigned char* cpar, unsigned index);
 static int failures=0;
-static void hx(unsigned char*d,int n){for(int i=0;i<n;i++)printf("%02x",d[i]);}
+static void hx(const unsigned char*d,int n){for(int i=0;i<n;i++)printf("%02x",d[i]);}
 static void ck(const char* name,const unsigned char*k,const unsigned char*c,const char* ek,const char* ec){
     unsigned char ekb[32],ecb[32]; int ok=1;
     for(int i=0;i<32;i++){unsigned v;sscanf(ek+i*2,"%2x",&v);ekb[i]=(unsigned char)v;}

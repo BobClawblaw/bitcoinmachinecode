@@ -72,11 +72,6 @@ static void ckb(const char* name, int cond){
     else { g_fails++; printf("  FAIL %s\n", name); }
 }
 
-static int hex_in(unsigned char* out, const char* h){
-    int n = (int)strlen(h)/2;
-    for (int i=0;i<n;i++){ unsigned v; sscanf(h+2*i,"%2x",&v); out[i]=(unsigned char)v; }
-    return n;
-}
 
 /* txval modern reasons: check the reason contains a substring */
 static int reason_has(const char* want){

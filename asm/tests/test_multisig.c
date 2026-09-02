@@ -59,7 +59,7 @@ static void ck_hash(const char *label, const unsigned char hash[20],
     if (memcmp(hash, exp, 20) == 0)
         printf("ok  : %s\n", label);
     else {
-        char g[41], e[41];
+        char g[41];
         hash2hex(hash, g);
         printf("FAIL: %s\ngot: %s\nexp: %s\n", label, g, hexExp);
         fails++;

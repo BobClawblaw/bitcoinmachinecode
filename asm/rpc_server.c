@@ -366,6 +366,13 @@ static int parse_method(const rj_val* req, const char** method,
     return 1;
 }
 
+/* write all of [p, p+n) or fail: a short write on a reply is a corrupt
+ * reply, which was silently possible for the header before 2026-09-02 */
+static int write_all(int fd, const void* p, size_t n){
+    const unsigned char* b = (const unsigned char*)p;
+    while (n){ ssize_t w = write(fd, b, n); if (w <= 0) return -1; b += w; n -= (size_t)w; }
+    return 0;
+}
 static const char* status_text(int s) {
     switch (s) {
         case HTTP_OK: return "OK";
@@ -479,7 +486,7 @@ static void handle_request(int cfd, const char* body, size_t blen) {
         "Content-Length: %ld\r\n"
         "\r\n",
         status, status_text(status), bodylen);
-    write(cfd, hdr, (size_t)hl);
+    if (write_all(cfd, hdr, (size_t)hl) != 0) return;   /* peer gone: nothing to send the body to */
     for (long off = 0; respbody && off < bodylen; ) {   /* full write, handles short writes */
         ssize_t wr = write(cfd, respbody + off, (size_t)(bodylen - off));
         if (wr <= 0) break;
@@ -614,7 +621,7 @@ static void service_conn(int cfd) {
     const char *m, *path, *body; size_t mlen, plen, blen;
     if (!http_request_parse(buf, (size_t)got, &m, &mlen, &path, &plen, &body, &blen)) {
         const char* e = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-        write(cfd, e, strlen(e)); free(buf); close(cfd); return;
+        (void)write_all(cfd, e, strlen(e)); free(buf); close(cfd); return;
     }
     (void)path; (void)plen;
 
@@ -626,7 +633,7 @@ static void service_conn(int cfd) {
             "HTTP/1.1 405 Method Not Allowed\r\n"
             "Content-Type: text/plain\r\n"
             "Content-Length: %zu\r\n\r\n%s", strlen(txt), txt);
-        write(cfd, resp, (size_t)rl); free(buf); close(cfd); return;
+        (void)write_all(cfd, resp, (size_t)rl); free(buf); close(cfd); return;
     }
 
     /* auth (Core: 401 + WWW-Authenticate when missing/incorrect).
@@ -642,13 +649,13 @@ static void service_conn(int cfd) {
             "HTTP/1.1 401 Unauthorized\r\n"
             "WWW-Authenticate: %s\r\n"
             "Content-Length: 0\r\n\r\n", WWW_AUTH_HEADER);
-        write(cfd, resp, (size_t)rl); free(buf); close(cfd); return;
+        (void)write_all(cfd, resp, (size_t)rl); free(buf); close(cfd); return;
     }
 
     { char user[64]; snprintf(user, sizeof user, "%s", g_last_auth_user);
       if (wl_forbidden(user, body, blen)){
           const char* e = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n";
-          write(cfd, e, strlen(e)); free(buf); close(cfd); return;
+          (void)write_all(cfd, e, strlen(e)); free(buf); close(cfd); return;
       } }
     /* longpoll: a getblocktemplate carrying a longpollid waits OFF-THREAD
      * (see the block comment above lp_waiter) */
@@ -704,7 +711,7 @@ static void* server_thread(void* arg) {
         if (g_q_n >= g_workqueue || g_q_n >= RPC_QUEUE_CAP){
             pthread_mutex_unlock(&g_q_lock);
             const char* e = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 25\r\n\r\nWork queue depth exceeded";
-            write(c, e, strlen(e)); close(c);
+            (void)write_all(c, e, strlen(e)); close(c);
             continue;
         }
         g_q[g_q_tail] = c; g_q_tail = (g_q_tail + 1) % RPC_QUEUE_CAP; g_q_n++;

@@ -731,7 +731,12 @@ long archive_prune_file_granular(long target_height){
                 unsigned int fno = rec_fileno[h];
                 if (fno == 0xFFFFFFFFu) continue;
                 if ((long)fno >= fno_cap || !prunable[fno]) continue;
-                pwrite(wfd, pruned_size, 4, (off_t)h * 48 + 44);
+                if (pwrite(wfd, pruned_size, 4, (off_t)h * 48 + 44) != 4){
+                    /* the record still points into a file that is gone: say so
+                     * loudly, per height, rather than leave a silent dangling entry */
+                    fprintf(stderr, "[archive_verify] WARNING: could not mark index record h=%ld as pruned (%s) -- it still points into deleted blk%05u.dat\n",
+                            h, strerror(errno), fno);
+                }
             }
             close(wfd);
         }

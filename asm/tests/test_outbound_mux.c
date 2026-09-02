@@ -92,7 +92,7 @@ static void mining_peer(int port_pipe, int grow_pipe, int stat_pipe){
     if(bind(ls,(struct sockaddr*)&a,sizeof a)<0){ fprintf(stderr,"[peer] bind fail\n"); _exit(9); }
     socklen_t al=sizeof a; getsockname(ls,(struct sockaddr*)&a,&al);
     unsigned short port=ntohs(a.sin_port);
-    unsigned char pb[4]; pb[0]=port; pb[1]=port>>8; write(port_pipe,pb,2);
+    unsigned char pb[4]; pb[0]=port; pb[1]=port>>8; if(write(port_pipe,pb,2)!=2) _exit(9);
     listen(ls,4);
     int cfd=accept(ls,0,0);
     if(cfd<0) _exit(9);
@@ -112,7 +112,7 @@ static void mining_peer(int port_pipe, int grow_pipe, int stat_pipe){
      * version arrived, then its verack */
     for(int i=0;i<6;i++){
         plen=0; if(p2p_read(cfd,cmd,pl,sizeof pl,&plen)<=0) break; cmd[11]=0;
-        if(strncmp(cmd,"sendaddrv2",10)==0 && stat_pipe>=0) write(stat_pipe,"S",1);
+        if(strncmp(cmd,"sendaddrv2",10)==0 && stat_pipe>=0) (void)!write(stat_pipe,"S",1);
         if(strncmp(cmd,"verack",6)==0) break;
     }
     int grow=5;
@@ -122,7 +122,8 @@ static void mining_peer(int port_pipe, int grow_pipe, int stat_pipe){
     for(int n=0;n<100000;n++){
         if(gfd>=0){ char c; if(read(gfd,&c,1)==1 && c=='M' && grow<NB) grow++; }
         plen=0; int r=p2p_read(cfd,cmd,pl,sizeof pl,&plen);
-        if(r<=0) continue; cmd[11]=0;
+        if(r<=0) continue;
+        cmd[11]=0;
         if(strncmp(cmd,"getheaders",10)==0){
             int zero=1; for(int z=0;z<32;z++) if(pl[5+z]){zero=0;break;}
             int from=0; if(!zero){ from=grow; for(int i=0;i<grow;i++) if(memcmp(pl+5,bh[i],32)==0){from=i+1;break;} }
@@ -228,7 +229,7 @@ int main(int argc, char** argv){
     long size_before = blkfile_size(ndir);
 
     /* ---- mine block 5 ---- */
-    write(growpipe[1],"M",1);
+    if(write(growpipe[1],"M",1)!=1){ printf("FAIL growpipe write\n"); failures++; }
 
     /* give the node's next node_sync pass time to pull block 5 */
     for(int w=0; w<40; w++){
@@ -257,7 +258,7 @@ int main(int argc, char** argv){
       cki("leg log records the peer's offer: 'outbound 0 = ... addrv2=1'", seen && !seen_v1, 1); }
 
     /* cleanup */
-    write(growpipe[1],"Q",1);
+    (void)!write(growpipe[1],"Q",1);   /* cleanup: the peer is killed next anyway */
     int st1,st2; kill(node,SIGTERM); waitpid(node,&st1,0); kill(peer,SIGTERM); waitpid(peer,&st2,0);
     close(growpipe[1]);
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);

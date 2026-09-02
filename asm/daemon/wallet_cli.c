@@ -334,7 +334,7 @@ static int cmd_gettxout(int argc, char** argv) {
     if (argc < 6) { fprintf(stderr, "usage: wallet_cli gettxout <txid_hex64> <vout> <value> <script_hex>\n"); return 2; }
     unsigned char txid[32];
     if (!hex_to_bytes(txid, argv[2], 64)) { fprintf(stderr, "bad txid hex\n"); return 1; }
-    unsigned long vout = strtoul(argv[3], NULL, 10);
+    /* argv[3] (<vout>) is accepted for the Core-shaped usage line; the answer below does not depend on it */
     unsigned long long value = strtoull(argv[4], NULL, 10);
     unsigned char script[128];
     int sl = (int)strlen(argv[5]);
