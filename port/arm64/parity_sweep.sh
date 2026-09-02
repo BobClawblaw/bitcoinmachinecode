@@ -361,11 +361,28 @@ gcc -no-pie -O2 -c ../../asm/daemon/undo_log.c -o /tmp/undo_ref_raw.o 2>> "$OUT/
            /tmp/undo_ref_raw.o "$OUT/undo_log_ref.o" 2>> "$OUT/build.log" \
 || echo -e "build-fail\tSPECIAL:undo_log_ref\tgcc/objcopy failed" >> "$OUT/results.tsv"
 # addrbook.a: x86 builds it with `ar rcs` from ADDRBOOKOBJS (all arch-neutral
-# C). The mapper maps tests/X.a -> parity_out/X.a; build it here once.
+# C). The mapper maps tests/X.a -> parity_out/X.a; build it here.
+# STALENESS MATTERS: this archive is on the link line of every test that links
+# daemon/main.c (the DIALSRCS/BUDGETSRCS/TXOQSRCS family). Built-once meant a
+# pre-merge addrbook.a kept being reused, and it silently lacked dialer.c's new
+# dialer_i2p_accept / dialer_i2p_ready / dialer_pb_pick_network /
+# dialer_connect_private entry points -- nine tests failed to link and the
+# error named main.c's callers, not the archive (the verify_p2sh_shim trap in a
+# different costume, 2026-09-02). Rebuild when any member is newer.
+ABMEMBERS="daemon/netaddr daemon/addrbook bitcoin_sha3 base32 daemon/socks5 daemon/i2psam daemon/torcontrol daemon/dialer daemon/net6 daemon/asmap"
+ab_stale=0
 if [ ! -f "$OUT/addrbook.a" ]; then
+  ab_stale=1
+else
+  for m in $ABMEMBERS; do
+    for ext in c h; do
+      [ "../../asm/$m.$ext" -nt "$OUT/addrbook.a" ] && ab_stale=1
+    done
+  done
+fi
+if [ "$ab_stale" = 1 ]; then
   mkdir -p /tmp/par_ab && rm -f /tmp/par_ab/*.o
-  for m in daemon/netaddr daemon/addrbook bitcoin_sha3 base32 daemon/socks5 \
-           daemon/i2psam daemon/torcontrol daemon/dialer daemon/net6 daemon/asmap; do
+  for m in $ABMEMBERS; do
     o=/tmp/par_ab/$(basename "$m").o
     gcc -no-pie -O2 -c "../../asm/$m.c" -o "$o" 2>> "$OUT/build.log" || \
       { echo -e "build-fail\tSPECIAL:addrbook.a\tmember $m" >> "$OUT/results.tsv"; break; }

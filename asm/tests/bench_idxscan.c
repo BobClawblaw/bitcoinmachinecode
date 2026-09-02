@@ -92,7 +92,9 @@ static void snapshot_index(const char* src_dir, char* out_dir, size_t out_cap){
     char srcpath[4096], dstpath[4096];
     snprintf(srcpath, sizeof srcpath, "%s/index.dat", src_dir);
     snprintf(dstpath, sizeof dstpath, "%s/index.dat", tmpl);
-    char cmd[8192];
+    /* sized from the two paths it can actually receive: 2 x 4095 + the fixed
+     * text, so the cp line can never be cut (-Werror=format-truncation) */
+    char cmd[sizeof srcpath + sizeof dstpath + 16];
     snprintf(cmd, sizeof cmd, "cp '%s' '%s'", srcpath, dstpath);
     if (system(cmd) != 0) { fprintf(stderr, "snapshot copy failed\n"); exit(1); }
     snprintf(out_dir, out_cap, "%s", tmpl);

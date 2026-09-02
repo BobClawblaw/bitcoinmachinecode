@@ -106,7 +106,9 @@ int main(int argc,char**argv){
     printf("chain built NB=%ld in %lds (%.1f MB)\n", NB, time(0)-t0, (double)NB*150/1e6);
 
     char path[80]; snprintf(path,sizeof path,"/tmp/ibdscale_%d", getpid()); mkdir(path,0755);
-    char cwd[1024]; getcwd(cwd,sizeof cwd); chdir(path);
+    char cwd[1024];
+    if (!getcwd(cwd, sizeof cwd)) { perror("getcwd"); return 1; }
+    if (chdir(path) != 0) { perror("chdir scratch"); return 1; }
     static unsigned char hstb[256], stb[256];
     if(hst_init(hstb)!=1 || store_init(stb)!=1){ printf("FAIL init\n"); return 1; }
 
@@ -125,7 +127,9 @@ int main(int argc,char**argv){
     close(fd); waitpid(pid,0,0); close(ls);
 
     int fails=0;
-    #define CK(lbl,g,e) do{ int ok=((g)==(e)); printf("%s %s (got %ld exp %ld)\n", ok?"PASS":"FAIL", lbl,g,e); if(!ok)fails++; }while(0)
+    /* (g)/(e) reach a %ld: hst_count()/->tip/hdr_ok/NB-1 are not all long, and
+     * printing an int as %ld is a real mismatch on any ABI where they differ. */
+    #define CK(lbl,g,e) do{ long _g=(long)(g), _e=(long)(e); int ok=(_g==_e); printf("%s %s (got %ld exp %ld)\n", ok?"PASS":"FAIL", lbl,_g,_e); if(!ok)fails++; }while(0)
     CK("node_ibd stored all NB blocks", nblk, NB);
     CK("header store has NB entries", hst_count(hstb), NB);
     CK("block store tip == NB-1", ((struct St*)stb)->tip, NB-1);
@@ -138,7 +142,9 @@ int main(int argc,char**argv){
     }
     CK("all stored (hdr, hash) match chain", hdr_ok, 1);
 
-    chdir(cwd); char rm[300]; snprintf(rm,sizeof rm,"rm -rf %s", path); system(rm);
+    if (chdir(cwd) != 0) { perror("chdir back"); return 1; }
+    char rm[300]; snprintf(rm,sizeof rm,"rm -rf %s", path);
+    if (system(rm) != 0) printf("NOTE: could not clean up the scratch dir %s\n", path);
     printf("\n%s (%d failures)\n", fails?"SCALE TEST FAILED":"SCALE TEST PASSED (entire synthetic chain archived)", fails);
     return fails?1:0;
 }

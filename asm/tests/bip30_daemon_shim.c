@@ -101,19 +101,22 @@ static void count_block(const u8* b, u64 n, long* ntx, long* nout){
     u64 tx = rd_cs(&p, end, &ok); if (!ok) return;
     *ntx = (long)tx;
     for (u64 i = 0; i < tx && ok; i++){
-        if ((u64)(end-p) < 4) return; p += 4;                       /* version */
+        if ((u64)(end-p) < 4) return;
+        p += 4;                                    /* version */
         int segwit = 0;
         if (end-p >= 2 && p[0]==0x00 && p[1]==0x01){ segwit = 1; p += 2; }
         u64 nin = rd_cs(&p, end, &ok); if (!ok) return;
         for (u64 k=0;k<nin && ok;k++){
-            if ((u64)(end-p) < 36) return; p += 36;
+            if ((u64)(end-p) < 36) return;
+            p += 36;
             u64 sl = rd_cs(&p, end, &ok); if (!ok || (u64)(end-p) < sl+4) return;
             p += sl + 4;
         }
         u64 non = rd_cs(&p, end, &ok); if (!ok) return;
         *nout += (long)non;
         for (u64 k=0;k<non && ok;k++){
-            if ((u64)(end-p) < 8) return; p += 8;
+            if ((u64)(end-p) < 8) return;
+            p += 8;
             u64 sl = rd_cs(&p, end, &ok); if (!ok || (u64)(end-p) < sl) return;
             p += sl;
         }
@@ -126,7 +129,8 @@ static void count_block(const u8* b, u64 n, long* ntx, long* nout){
                 }
             }
         }
-        if ((u64)(end-p) < 4) return; p += 4;                       /* locktime */
+        if ((u64)(end-p) < 4) return;
+        p += 4;                                    /* locktime */
     }
 }
 

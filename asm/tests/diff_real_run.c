@@ -142,7 +142,7 @@ int main(int argc, char** argv){
         if (r1!=r2 || v1!=v2 || h1!=h2 || c1!=c2 || l1!=l2 ||
             (r1==1 && l1 && memcmp(s1,s2,l1)!=0)) {
             if (mism<10)
-                printf("MISMATCH key[%lu] idx=%u  mm{r=%ld v=%llu h=%llu cb=%llu sl=%u}  asm{r=%ld v=%llu h=%llu cb=%llu sl=%u}\n",
+                printf("MISMATCH key[%lu] idx=%u  mm{r=%ld v=%llu h=%llu cb=%llu sl=%lu}  asm{r=%ld v=%llu h=%llu cb=%llu sl=%lu}\n",
                        i,idx,r1,v1,(unsigned long long)h1,(unsigned long long)c1,l1,
                        r2,v2,(unsigned long long)h2,(unsigned long long)c2,l2);
             mism++;

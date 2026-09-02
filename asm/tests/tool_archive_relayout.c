@@ -8,7 +8,8 @@
  * order (128 MiB rotation, same as the writer), writes a matching new
  * index.dat, verifies every block's sha256d against the index hash, and
  * leaves the result in <out-dir>. Swapping is the operator's explicit step:
- *   stop daemon; mv blk*.dat index.dat <backup>/; mv <out>/* <archive>/; start.
+ *   stop daemon; mv blk*.dat index.dat to <backup>/; move <out-dir>'s files into
+ *   <archive>/; start.
  * Usage: tool_archive_relayout <archive-dir> <out-dir> */
 #include <stdio.h>
 #include <stdlib.h>

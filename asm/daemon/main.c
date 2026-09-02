@@ -942,7 +942,11 @@ static int g_sync_fail_streak[MUX_MAX_OUT]; /* monotonic ms deadline before the 
  * addition without editing the config, and getaddednodeinfo reports the
  * config list, so conflating them would make `remove` appear to fail. */
 #define CTL_MAX_ADDNODE 32
-static char g_ctl_addnode[CTL_MAX_ADDNODE][64];
+/* A runtime addnode= entry is a host:port, and a v3 onion is 62 chars + ':port'
+ * = 67: the old 64-byte slot cut it at 63 and the node dialed a broken name.
+ * The ctl argument buffer is char arg[128], so 128 is the size that cannot truncate. */
+#define CTL_HOST_SLOT 128
+static char g_ctl_addnode[CTL_MAX_ADDNODE][CTL_HOST_SLOT];
 static int  g_ctl_n_addnode = 0;
 
 /* Is `ip` covered by a ban entry? Entries are either a bare address or
@@ -4736,7 +4740,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 if(num == 1){                                  /* remove */
                     for(int i = 0; i < g_ctl_n_addnode; i++)
                         if(!strcmp(g_ctl_addnode[i], arg)){
-                            memmove(g_ctl_addnode[i], g_ctl_addnode[g_ctl_n_addnode - 1], 64);
+                            memmove(g_ctl_addnode[i], g_ctl_addnode[g_ctl_n_addnode - 1], CTL_HOST_SLOT);
                             g_ctl_n_addnode--;
                             result = 1; break;
                         }
@@ -4745,7 +4749,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     for(int i = 0; i < g_ctl_n_addnode; i++)
                         if(!strcmp(g_ctl_addnode[i], arg)) dup = 1;
                     if(!dup && num == 0){
-                        snprintf(g_ctl_addnode[g_ctl_n_addnode++], 64, "%s", arg);
+                        snprintf(g_ctl_addnode[g_ctl_n_addnode++], CTL_HOST_SLOT, "%s", arg);
                         fprintf(stderr,"[ctl] addnode: %s (runtime list now %d)\n",
                                 arg, g_ctl_n_addnode);
                     }
@@ -4800,6 +4804,17 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         snprintf(reason, sizeof reason,
                                  "this node enforces only /8, /16, /24 and /32 subnets; "
                                  "a prefix it cannot match would be stored and never enforced");
+                    } else if(strlen(arg) >= sizeof g_node_status->bans[0].subnet){
+                        /* 2026-09-02 (-Wall -Werror audit): the argument is 127
+                         * chars and the slot is 64. Truncating here would store a
+                         * SHORTER subnet, and subnet_covers_str() matches a
+                         * truncated prefix BROADLY -- a setban of one host would
+                         * ban a whole /8. Refuse instead. */
+                        result = -1;
+                        snprintf(reason, sizeof reason,
+                                 "that subnet is too long for the ban table (%u bytes); "
+                                 "a truncated form would ban more than you asked for",
+                                 (unsigned)sizeof g_node_status->bans[0].subnet);
                     } else {
                         int dup = 0, slot = -1;
                         for(int i = 0; i < RPC_MAX_BANS; i++){
@@ -4812,7 +4827,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                             result = -1;
                             snprintf(reason, sizeof reason, "the ban list is full (%d)", RPC_MAX_BANS);
                         } else {
-                            snprintf((char*)g_node_status->bans[slot].subnet, 64, "%s", arg);
+                            /* %.63s = sizeof(subnet)-1: the branch above already
+                             * refuses anything longer, and spelling the bound here
+                             * is what lets -Werror=format-truncation see it. */
+                            snprintf((char*)g_node_status->bans[slot].subnet, 64, "%.63s", arg);
                             g_node_status->bans[slot].created = (long long)time(NULL);
                             __sync_synchronize();
                             g_node_status->bans[slot].until = num;   /* published last */
