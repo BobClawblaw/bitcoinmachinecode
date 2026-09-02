@@ -2218,28 +2218,28 @@ tests/test_reindex: tests/test_reindex.c daemon/archive_reindex.c daemon/archive
 # to Core's scriptPubKeys; Core's public-form strings, checksums, descriptor
 # ids, and parse-error rules.
 tests/test_descriptor_vectors: tests/test_descriptor_vectors.c tests/desc_vectors.h descriptor.c descriptor.h miniscript.c miniscript.h musig2.c musig2.h bip32_ckdpub.c \
-    wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c daemon/wallet_pass.c $(WALLETPRIMS) secp256k1_schnorr.o bitcoin_script.o bitcoin_tx.o
-	$(CC) -no-pie -O2 -I. -o $@ tests/test_descriptor_vectors.c descriptor.c miniscript.c musig2.c bip32_ckdpub.c wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c \
+    wallet_core.c wallet_msgsign.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c wallet_bnb.c daemon/wallet_pass.c $(WALLETPRIMS) secp256k1_schnorr.o bitcoin_script.o bitcoin_tx.o
+	$(CC) -no-pie -O2 -I. -o $@ tests/test_descriptor_vectors.c descriptor.c miniscript.c musig2.c bip32_ckdpub.c wallet_core.c wallet_msgsign.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c wallet_bnb.c \
 	    daemon/wallet_pass.c $(WALLETPRIMS) secp256k1_schnorr.o bitcoin_script.o bitcoin_tx.o -lpthread
 
 # The miniscript engine against Core's miniscript_tests.cpp (both contexts,
 # script/type/limit figures, decode round trips) and its satisfier against
 # THIS node's interpreter with a mock signature checker.
 tests/test_miniscript: tests/test_miniscript.c tests/miniscript_vectors.h miniscript.c miniscript.h bitcoin_interp.o bitcoin_scriptcodec.o sha1.o \
-    bip32_ckdpub.c wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c daemon/wallet_pass.c $(WALLETPRIMS) bitcoin_script.o bitcoin_tx.o
-	$(CC) -no-pie -O2 -I. -o $@ tests/test_miniscript.c miniscript.c bip32_ckdpub.c wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c \
+    bip32_ckdpub.c wallet_core.c wallet_msgsign.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c wallet_bnb.c daemon/wallet_pass.c $(WALLETPRIMS) bitcoin_script.o bitcoin_tx.o
+	$(CC) -no-pie -O2 -I. -o $@ tests/test_miniscript.c miniscript.c bip32_ckdpub.c wallet_core.c wallet_msgsign.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c wallet_bnb.c \
 	    daemon/wallet_pass.c $(WALLETPRIMS) bitcoin_interp.o bitcoin_scriptcodec.o sha1.o bitcoin_script.o bitcoin_tx.o -lpthread
 
 tests/test_bip340_sign: tests/test_bip340_sign.c tests/bip340_vectors.h bip340_sign.c bip32_ckdpub.c \
-    wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c daemon/wallet_pass.c $(WALLETPRIMS) secp256k1_schnorr.o bitcoin_script.o bitcoin_tx.o
-	$(CC) -no-pie -O2 -I. -o $@ tests/test_bip340_sign.c bip340_sign.c bip32_ckdpub.c wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c \
+    wallet_core.c wallet_msgsign.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c wallet_bnb.c daemon/wallet_pass.c $(WALLETPRIMS) secp256k1_schnorr.o bitcoin_script.o bitcoin_tx.o
+	$(CC) -no-pie -O2 -I. -o $@ tests/test_bip340_sign.c bip340_sign.c bip32_ckdpub.c wallet_core.c wallet_msgsign.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c wallet_bnb.c \
 	    daemon/wallet_pass.c $(WALLETPRIMS) secp256k1_schnorr.o bitcoin_script.o bitcoin_tx.o -lpthread
 
 # BIP327 MuSig2 vectors (every group, including the failing cases) + the
 # aggregated signatures re-verified by the consensus schnorr_verify.
 tests/test_musig2: tests/test_musig2.c tests/musig2_vectors.h musig2.c musig2.h \
-    wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c daemon/wallet_pass.c $(WALLETPRIMS) secp256k1_schnorr.o bitcoin_script.o bitcoin_tx.o
-	$(CC) -no-pie -O2 -Wall -I. -o $@ tests/test_musig2.c musig2.c bip32_ckdpub.c wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c \
+    wallet_core.c wallet_msgsign.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c wallet_bnb.c daemon/wallet_pass.c $(WALLETPRIMS) secp256k1_schnorr.o bitcoin_script.o bitcoin_tx.o
+	$(CC) -no-pie -O2 -Wall -I. -o $@ tests/test_musig2.c musig2.c bip32_ckdpub.c wallet_core.c wallet_msgsign.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c wallet_bnb.c \
 	    daemon/wallet_pass.c $(WALLETPRIMS) secp256k1_schnorr.o bitcoin_script.o bitcoin_tx.o -lpthread
 
 
