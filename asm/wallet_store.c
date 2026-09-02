@@ -52,7 +52,56 @@
 #include <sys/stat.h>
 
 #define BMCWAL_MAGIC_V1 "BMCWAL v1"
-#define BMCWAL_MAGIC_V2 "BMCWAL v2"
+#define BMCWAL_MAGIC_V2 "BMCWAL v2"   /* LEGACY, read-only since 2026-09-02: 2048-iteration PBKDF2, custom CTR/tag */
+#define BMCWAL_MAGIC_V3 "BMCWAL v3"   /* the strong container: daemon/wallet_crypter.c (Core's BytesToKeySHA512AES,
+                                       * 100000 iterations, random salt, AES-256-CBC) -- the same scheme the live
+                                       * descriptor wallet uses (BMCWENC1). Security audit 2026-09-02 finding N4. */
+#define BMCWAL_FORMAT_WCRYPT "format=wcrypt"
+/* daemon/wallet_crypter.c */
+extern long wcrypt_seal(const char* pass, long passlen, const unsigned char* seed, long seedlen, unsigned char* out, long cap);
+extern long wcrypt_open(const char* pass, long passlen, const unsigned char* blob, long len, unsigned char* seed_out, long cap);
+static int hex_val(char c);
+/* write `body` to path atomically (tmp + rename), mode 0600 */
+static int store_write_atomic(const char* path, const char* body){
+    char tmp[4096]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE* f = fopen(tmp, "w"); if (!f) return -1;
+    int ok = fputs(body, f) >= 0 && fflush(f) == 0;
+    fclose(f);
+    if (!ok){ remove(tmp); return -1; }
+    chmod(tmp, 0600);
+    if (rename(tmp, path) != 0){ remove(tmp); return -1; }
+    return 0;
+}
+/* "<magic>\n" BMCWAL_FORMAT_WCRYPT "\n<hex of the sealed container>\n"; -1 on failure */
+static int store_write_sealed(const char* path, const char* magic, const char* pass, const char* plaintext){
+    unsigned char blob[8192];
+    long n = wcrypt_seal(pass, (long)strlen(pass), (const unsigned char*)plaintext, (long)strlen(plaintext), blob, sizeof blob);
+    if (n <= 0) return -1;
+    static const char* H = "0123456789abcdef";
+    char* body = (char*)malloc(strlen(magic) + 1 + sizeof(BMCWAL_FORMAT_WCRYPT) + 1 + (size_t)n * 2 + 2);
+    if (!body) return -1;
+    int o = sprintf(body, "%s\n%s\n", magic, BMCWAL_FORMAT_WCRYPT);
+    for (long i = 0; i < n; i++){ body[o++] = H[blob[i] >> 4]; body[o++] = H[blob[i] & 15]; }
+    body[o++] = '\n'; body[o] = 0;
+    int rc = store_write_atomic(path, body);
+    memset(body, 0, (size_t)o); free(body);
+    return rc;
+}
+/* plaintext length, 0 = wrong passphrase, -1 = malformed */
+static long store_open_sealed(const char* hex, const char* pass, char* out, int cap){
+    long hl = (long)strlen(hex); if ((hl & 1) || hl < 32) return -1;
+    unsigned char* blob = (unsigned char*)malloc((size_t)hl / 2); if (!blob) return -1;
+    for (long i = 0; i < hl / 2; i++){
+        int a = hex_val(hex[i*2]), b = hex_val(hex[i*2+1]); if (a < 0 || b < 0){ free(blob); return -1; }
+        blob[i] = (unsigned char)(a * 16 + b);
+    }
+    unsigned char plain[4096];
+    long n = wcrypt_open(pass, (long)strlen(pass), blob, hl / 2, plain, sizeof plain);
+    free(blob);
+    if (n <= 0 || n >= cap) return n <= 0 ? n : -1;
+    memcpy(out, plain, (size_t)n); out[n] = 0; memset(plain, 0, sizeof plain);
+    return n;
+}
 
 /* Provided by the verified wallet_core / bip39 link chain. */
 extern int  bip39_mnemonic_to_seed(unsigned char seed[64], const char* mnemonic,
@@ -140,22 +189,8 @@ int wallet_store_create(const char* path, const char* mnemonic, const char* pass
         fprintf(f, BMCWAL_MAGIC_V1 "\n");
         fprintf(f, "%s\n", mnemonic);
     } else {
-        unsigned char K[64]; deriv_key(K, pass);
-        int mn = (int)strlen(mnemonic);
-        unsigned char* ct = (unsigned char*)malloc((size_t)mn + 1);
-        if (!ct) { fclose(f); return -1; }
-        ctr_xor(ct, (const unsigned char*)mnemonic, mn, K);
-        unsigned char tag[32];
-        make_tag(tag, K, ct, mn);
-        char taghex[65], cthex[512];
-        hex_encode(taghex, tag, 32);
-        hex_encode(cthex, ct, mn);
-        fprintf(f, BMCWAL_MAGIC_V2 "\n");
-        fprintf(f, "kdf=pbkdf2-hmac-sha512\n");
-        fprintf(f, "cipher=ctr-sha512\n");
-        fprintf(f, "tag=%s\n", taghex);
-        fprintf(f, "%s\n", cthex);
-        free(ct);
+        fclose(f); remove(path);
+        return store_write_sealed(path, BMCWAL_MAGIC_V3, pass, mnemonic);   /* the strong container, never v2 again */
     }
     fclose(f);
     chmod(path, 0600);
@@ -171,7 +206,7 @@ int wallet_store_load(const char* path, char* mnemonic_out, int cap,
     if (!f) return -1;
 
     char line[1024];
-    int is_v2 = 0;
+    int is_v2 = 0, is_v3 = 0;
     char taghex[65] = {0};
     char cthex[1400] = {0};
     char mnemonic_plain[1024] = {0};
@@ -183,6 +218,8 @@ int wallet_store_load(const char* path, char* mnemonic_out, int cap,
         if (line[0]==0) continue;
         if (!strncmp(line, BMCWAL_MAGIC_V1, strlen(BMCWAL_MAGIC_V1))) continue;
         if (!strncmp(line, BMCWAL_MAGIC_V2, strlen(BMCWAL_MAGIC_V2))) { is_v2 = 1; continue; }
+        if (!strncmp(line, BMCWAL_MAGIC_V3, strlen(BMCWAL_MAGIC_V3))) { is_v3 = 1; continue; }
+        if (!strcmp(line, BMCWAL_FORMAT_WCRYPT)) continue;
         if (line[0]=='#') continue;
         if (!strncmp(line, "kdf=", 4)) continue;
         if (!strncmp(line, "cipher=", 7)) continue;
@@ -190,7 +227,7 @@ int wallet_store_load(const char* path, char* mnemonic_out, int cap,
         /* legacy v1 informational pass= is decoded but does not carry the secret
          * for v2; we keep it for completeness of the buffer only. */
         if (!strncmp(line, "pass=", 5)) continue;
-        if (is_v2 && !have_ct && line[0] && !strchr(line, ' ')) {
+        if ((is_v2 || is_v3) && !have_ct && line[0] && !strchr(line, ' ')) {
             snprintf(cthex, sizeof cthex, "%s", line);
             have_ct = 1; continue;
         }
@@ -200,7 +237,14 @@ int wallet_store_load(const char* path, char* mnemonic_out, int cap,
         }
     }
     fclose(f);
-
+    if (is_v3) {
+        const char* sec = NULL;
+        if (pass_out && pcap > 0 && pass_out[0]) sec = pass_out;
+        if (!sec) sec = getenv("BMC_WALLET_PASS");
+        if (!sec || !sec[0]) { if (pass_out && pcap>0) pass_out[0] = 0; return -1; }
+        if (!have_ct) return -1;
+        return store_open_sealed(cthex, sec, mnemonic_out, cap) > 0 ? 0 : -1;
+    }
     if (is_v2) {
         /* Encrypted wallet: the secret passphrase is NOT in the file. The caller
          * supplies it via the *input* value of pass_out (pre-filled), else via
@@ -225,6 +269,12 @@ int wallet_store_load(const char* path, char* mnemonic_out, int cap,
         memcpy(mnemonic_out, ct, (size_t)ctlen);
         mnemonic_out[ctlen] = 0;
         free(ct);
+        /* legacy opened with the right passphrase: rewrite it in the strong
+         * container now, atomically, so the 2048-iteration file stops existing */
+        if (store_write_sealed(path, BMCWAL_MAGIC_V3, sec, mnemonic_out) == 0)
+            fprintf(stderr, "[wallet] %s: upgraded legacy BMCWAL v2 (2048-iteration KDF, custom cipher) to v3 (BytesToKeySHA512AES 100000 iterations, AES-256-CBC)\n", path);
+        else
+            fprintf(stderr, "[wallet] %s: legacy BMCWAL v2 opened but could NOT be rewritten as v3 -- re-create it\n", path);
         return 0;
     }
 
@@ -252,31 +302,7 @@ int wallet_secret_write(const char* path, const char* magic,
                         const char* plaintext, const char* pass){
     if (!path || !magic || !plaintext) return -1;
     if (!pass || !pass[0]) return -1;      /* refuse to write a secret in the clear */
-    int n = (int)strlen(plaintext);
-    unsigned char K[64]; deriv_key(K, pass);
-    unsigned char* ct = (unsigned char*)malloc((size_t)n + 1);
-    if (!ct) return -1;
-    ctr_xor(ct, (const unsigned char*)plaintext, n, K);
-    unsigned char tag[32];
-    make_tag(tag, K, ct, n);
-    char taghex[65];
-    hex_encode(taghex, tag, 32);
-    char* cthex = (char*)malloc((size_t)n*2 + 1);
-    if (!cthex){ free(ct); return -1; }
-    hex_encode(cthex, ct, n);
-    FILE* f = fopen(path, "w");
-    if (!f){ free(ct); free(cthex); return -1; }
-    fprintf(f, "%s\n", magic);
-    fprintf(f, "kdf=pbkdf2-hmac-sha512\n");
-    fprintf(f, "cipher=ctr-sha512\n");
-    fprintf(f, "tag=%s\n", taghex);
-    fprintf(f, "%s\n", cthex);
-    int ok = (fflush(f) == 0);
-    fclose(f);
-    chmod(path, 0600);
-    memset(K, 0, sizeof K);
-    free(ct); free(cthex);
-    return ok ? 0 : -1;
+    return store_write_sealed(path, magic, pass, plaintext);   /* the strong container (2026-09-02) */
 }
 
 int wallet_secret_read(const char* path, const char* magic,
@@ -288,17 +314,23 @@ int wallet_secret_read(const char* path, const char* magic,
     if (!f) return -1;
     char line[4096], taghex[65] = {0};
     char* cthex = NULL;
-    int seen_magic = 0;
+    int seen_magic = 0, sealed = 0;
     while (fgets(line, sizeof line, f)){
         size_t l = strlen(line);
         while (l && (line[l-1]=='\n' || line[l-1]=='\r')) line[--l] = 0;
         if (!line[0]) continue;
         if (!strncmp(line, magic, strlen(magic))){ seen_magic = 1; continue; }
+        if (!strcmp(line, BMCWAL_FORMAT_WCRYPT)){ sealed = 1; continue; }
         if (!strncmp(line, "kdf=", 4) || !strncmp(line, "cipher=", 7)) continue;
         if (!strncmp(line, "tag=", 4)){ snprintf(taghex, sizeof taghex, "%s", line+4); continue; }
         if (!cthex){ cthex = strdup(line); }
     }
     fclose(f);
+    if (sealed){
+        if (!seen_magic || !cthex){ free(cthex); return -1; }
+        long n = store_open_sealed(cthex, pass, out, cap); free(cthex);
+        return n > 0 ? 0 : -1;
+    }
     if (!seen_magic || !cthex || !taghex[0]){ free(cthex); return -1; }
     int ctn = (int)strlen(cthex) / 2;
     if (ctn <= 0 || ctn >= cap){ free(cthex); return -1; }
@@ -315,5 +347,8 @@ int wallet_secret_read(const char* path, const char* magic,
     out[ctn] = 0;
     memset(K, 0, sizeof K);
     free(ct); free(cthex);
+    /* legacy blob opened with the right passphrase: rewrite it sealed, atomically */
+    if (store_write_sealed(path, magic, pass, out) == 0)
+        fprintf(stderr, "[wallet] %s: upgraded a legacy secret blob (2048-iteration KDF, custom cipher) to the sealed container\n", path);
     return 0;
 }
