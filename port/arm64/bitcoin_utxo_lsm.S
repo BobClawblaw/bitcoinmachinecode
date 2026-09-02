@@ -177,7 +177,6 @@ mac_write_exact:
 	mov  x0, #0
 	ret
 
-/* mac_fsync2(fd=x0) -> rax (0 ok) */
 mac_fsync2:
 	mov  x8, #SYS_fsync
 	svc  #0
@@ -1663,7 +1662,10 @@ mac_flush:
 	mov  x8, #SYS_lseek
 	svc  #0
 	tbnz x0, #63, .fl_err_close
-	mov  x24, x0                    /* this record's file offset */
+	mov  x24, x0                    /* this record's file offset (unbuffered:
+	                                 * SEEK_CUR is already the logical offset;
+	                                 * the x86 bc098fd logical-offset term
+	                                 * applies only to its buffered writer) */
 	/* sparse dest = scratch + off_desc_b + sparse_n*44 */
 	ldr  x9, [x28, #0x60]            /* sparse_n */
 	mov  x10, #44

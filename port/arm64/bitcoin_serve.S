@@ -129,6 +129,9 @@ cn_tx:     .ascii "tx\0"
 cn_getdata:.ascii "getdata\0"
 viol_oversize: .ascii "oversized message announcement\0"
 viol_invsz:    .ascii "inv/getdata vector above MAX_INV_SZ\0"
+viol_txrelay:  .ascii "transaction sent in violation of protocol\0"
+viol_invtx:    .ascii "transaction inv sent in violation of protocol\0"
+viol_mempool:  .ascii "mempool request with bloom filters disabled\0"
 cn_getbtxn:.ascii "getblocktxn\0"
 cn_btxn:   .ascii "blocktxn\0"
 cn_cmpct:  .ascii "cmpctblock\0"
@@ -338,7 +341,11 @@ node_serve_loop:
 	ldr  w9, [x21, #24]               /* tip height = st[24] */
 	LOADADDR x10, s_lasttip
 	str  x9, [x10]
-	/* feefilter_send: int64 LE min-relay-feerate */
+	/* feefilter_send: int64 LE min-relay-feerate -- gated (x86 2026-09-01):
+	 * -blocksonly / forcerelay peers get no feefilter from us (Core) */
+	LOADADDR x9, g_serve_send_feefilter
+	ldrb w9, [x9]
+	cbz  w9, .LAH_ff_skip
 	LOADADDR x10, s_myfee
 	ldr  x11, [x10]
 	LOADADDR x10, hp_buf
@@ -352,6 +359,7 @@ node_serve_loop:
 	LOADADDR x9, s_feesent
 	mov  w10, #1
 	strb w10, [x9]
+.LAH_ff_skip:
 
 .outer:
 	LOADADDR x9, s_plen
@@ -419,12 +427,54 @@ node_serve_loop:
 	movk w24, #0x6665, lsl #16        /* "feef" */
 	cmp  w23, w24
 	b.eq .maybe_feefilter
+	mov  w24, #0x656d
+	movk w24, #0x706d, lsl #16        /* "memp" (mempool) */
+	cmp  w23, w24
+	b.eq .maybe_mempool
 	mov  w24, #0x7477
 	movk w24, #0x6978, lsl #16        /* "wtxi" (wtxidrelay) -- handshake-only;
 	                                     after verack Core disconnects */
 	cmp  w23, w24
 	b.eq .done
 	b    .next
+
+.maybe_mempool:
+	/* cmd[4..7] == "ool\0"? (x86 .maybe_mempool) */
+	LOADADDR x9, s_cmd
+	ldr  w9, [x9, #4]
+	mov  w24, #0x6c6f
+	movk w24, #0x006f, lsl #16        /* 0x006c6f6f LE */
+	cmp  w9, w24
+	b.ne .next
+	/* serve_mempool_msg(fd, mp): 1 handled/ignored, -1 violation (no
+	 * `mempool` permission and not noban: Core disconnects) */
+	LOADADDR x9, g_serve_mempool_hook
+	ldr  x9, [x9]
+	cbz  x9, .next
+	mov  x0, x19
+	LOADADDR x1, mp_cur
+	ldr  x1, [x1]
+	blr  x9
+	cmp  x0, #-1
+	b.eq .viol_mempool_go
+	b    .next
+
+.viol_mempool_go:
+	LOADADDR x0, viol_mempool
+	b    .viol_disconnect
+.viol_invtx_go:
+	LOADADDR x0, viol_invtx
+	b    .viol_disconnect
+.viol_txrelay_go:
+	LOADADDR x0, viol_txrelay
+.viol_disconnect:
+	/* Core: fDisconnect, no misbehaviour score (net_processing "in violation
+	 * of protocol" paths) -- log through C, then drop the connection */
+	LOADADDR x9, g_serve_policy_log
+	ldr  x9, [x9]
+	cbz  x9, .done
+	blr  x9
+	b    .done
 
 .do_verack:
 	b    .next
@@ -460,6 +510,18 @@ node_serve_loop:
 	b.eq .inv_toobig
 	cmp  w0, #0
 	b.le .next                       /* malformed or short: drop quietly */
+	/* relay policy: a tx inv from a peer that may not send us txs (-blocksonly
+	 * without the relay permission) is a protocol violation (Core, x86 parity) */
+	LOADADDR x9, g_serve_inv_gate
+	ldr  x9, [x9]
+	cbz  x9, .inv_gate_ok
+	LOADADDR x0, pl_buf
+	LOADADDR x10, s_plen
+	ldr  x1, [x10]
+	blr  x9
+	cmp  x0, #-1
+	b.eq .viol_invtx_go
+.inv_gate_ok:
 	LOADADDR x9, s_ivn
 	ldr  x9, [x9]
 	LOADADDR x10, s_cnt
@@ -526,6 +588,16 @@ node_serve_loop:
 	b    .next
 
 .do_tx:
+	/* relay policy first (x86 parity): -1 violation (disconnect), 1 drop
+	 * quietly, 0 go on */
+	LOADADDR x9, g_serve_tx_gate
+	ldr  x9, [x9]
+	cbz  x9, .tx_gate_ok
+	blr  x9
+	cmp  x0, #-1
+	b.eq .viol_txrelay_go
+	cbnz x0, .next
+.tx_gate_ok:
 	LOADADDR x9, s_plen
 	ldr  x9, [x9]
 	cmp  x9, #10
@@ -1612,13 +1684,35 @@ node_announce_tip:
 	.size node_announce_tip, .-node_announce_tip
 
 /* serve-violation hook (x86 bitcoin_serve.asm): NULL by default, filled by
- * daemon/main.c to log/act when a peer violates a serve-side rule. */
-	.section .data
+ * daemon/main.c to log/act when a peer violates a serve-side rule. */	.section .data
 	.align 3
 	.global g_serve_violation_hook
 	.type g_serve_violation_hook, %object
 g_serve_violation_hook:
 	.quad 0
 	.size g_serve_violation_hook, 8
+
+/* ---- relay-policy gates (x86 2026-09-01 parity, commit e8adcca): NULL =
+ * old behaviour. daemon/main.c installs the relay_policy hooks at boot. */
+	.global g_serve_tx_gate
+	.type g_serve_tx_gate, %object
+g_serve_tx_gate:	.quad 0      /* int (*)(void): 0 accept, 1 drop, -1 violation */
+	.size g_serve_tx_gate, 8
+	.global g_serve_inv_gate
+	.type g_serve_inv_gate, %object
+g_serve_inv_gate:	.quad 0      /* int (*)(const u8* pl, long plen) */
+	.size g_serve_inv_gate, 8
+	.global g_serve_mempool_hook
+	.type g_serve_mempool_hook, %object
+g_serve_mempool_hook:	.quad 0 /* int (*)(int fd, void* mp): 1 handled, -1 violation */
+	.size g_serve_mempool_hook, 8
+	.global g_serve_policy_log
+	.type g_serve_policy_log, %object
+g_serve_policy_log:	.quad 0  /* void (*)(const char* reason) */
+	.size g_serve_policy_log, 8
+	.global g_serve_send_feefilter
+	.type g_serve_send_feefilter, %object
+g_serve_send_feefilter:	.byte 1 /* -blocksonly / forcerelay peer: Core sends none */
+	.size g_serve_send_feefilter, 1
 
 	.section .note.GNU-stack,"",%progbits

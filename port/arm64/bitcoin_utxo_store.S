@@ -80,8 +80,87 @@ mac_read_exact:
 	ldp  x19,x20,[sp],#16
 	ret
 
+/* ---------- WAL buffering (x86 2026-09-01 parity, incident replay) ----------
+ * Records are appended to a 1 MB process-wide buffer (wal_buf) and land in
+ * the file in one write(2) per drain -- the per-record write() was ~6% of the
+ * live replay's CPU. log_len ([st+16]) is the LOGICAL length (file + buffered
+ * bytes) at all times -- the lesson of the same day's sparse-offset bug.
+ * Drains: utxo_store_wal_drain (exported; the apply loop calls it after every
+ * block), and implicitly before a checkpoint (utxo_store_sync), a reload
+ * (which measures the file), a flush (which truncates the file), a close, and
+ * whenever a DIFFERENT store's fd wants the buffer. A crash can therefore
+ * lose only the not-yet-drained SUFFIX of the op stream. */
+	.equ WALBUF_CAP, 1048576
+	.section .bss
+	.align 4
+wal_buf:	.zero WALBUF_CAP
+	.align 3
+wal_fill:	.zero 8
+wal_fd:		.zero 8
+	.text
+
+/* mac_wal_drain_fd(fd=x0) -> 0 ok / -1: write every buffered byte to fd.
+ * Loops over short writes; on an error the unwritten tail moves to the front
+ * of the buffer so a retry writes exactly the bytes that never landed.
+ * Clobbers x0-x11 only; caller-saved contract. */
+mac_wal_drain_fd:
+	mov  x8, x0
+	adrp x9, wal_buf
+	add  x9, x9, :lo12:wal_buf
+	adrp x10, wal_fill
+	ldr  x10, [x10, :lo12:wal_fill]
+.wd_loop:
+	cbz  x10, .wd_done
+	mov  x0, x8
+	mov  x1, x9
+	mov  x2, x10
+	mov  x11, x8                     /* fd across the syscall (x8 = syscall no);
+	                                 * RAW syscall like the x86: mac_write_exact
+	                                 * clobbers x9/x10, this loop's state */
+	mov  x8, #SYS_write
+	svc  #0
+	mov  x8, x11
+	cmp  x0, #0
+	b.le .wd_err
+	add  x9, x9, x0
+	sub  x10, x10, x0
+	b    .wd_loop
+.wd_done:
+	adrp x0, wal_fill
+	str  xzr, [x0, :lo12:wal_fill]
+	mov  x0, #0
+	ret
+.wd_err:
+	/* dst < src: a forward overlapping copy is safe */
+	adrp x0, wal_buf
+	add  x0, x0, :lo12:wal_buf
+	mov  x1, x9
+	mov  x2, x10
+3:	ldrb w3, [x1], #1
+	strb w3, [x0], #1
+	subs x2, x2, #1
+	b.ne 3b
+	adrp x0, wal_fill
+	str  x10, [x0, :lo12:wal_fill]
+	mov  x0, #-1
+	ret
+	/* clobbers x0-x11 */
+
+mac_wal_drain_fd_pending:            /* drain to whichever fd owns the pending bytes */
+	adrp x0, wal_fd
+	ldr  x0, [x0, :lo12:wal_fd]
+	b    mac_wal_drain_fd
+
 /* ---------- mac_wr_log(st=x19, buf=x20, len=x21) -> 0 ok / -1, local.
- * Clobbers x0-x8 only; preserves x19/x20/x21. Single-writer append. */
+ * DIRECT WRITE for now. The x86's 2026-09-01 buffered form (wal_buf 1 MB,
+ * drains on owner-switch/cap/oversize) was ported and reverted: a subtle
+ * stack corruption surfaced in test_utxo_wal_buffer (put's x19 became a
+ * record byte 0x8d after the make-room drain path) that four gdb rounds
+ * did not pin down; the buffering buys ~6% of replay CPU, not correctness.
+ * log_len stays the LOGICAL length = file length here (fill is always 0).
+ * mac_wal_drain_fd/mac_wal_drain_fd_pending/utxo_store_wal_drain below keep
+ * the x86 SHAPE so the C callers and the drain sites stay valid; with fill
+ * always zero they are no-ops. Clobbers x0-x8 only; preserves x19/x20/x21. */
 mac_wr_log:
 	ldr  x0,[x19]
 	mov  x1,x20
@@ -104,6 +183,25 @@ mac_fsync:
 	mov  x8,#SYS_fsync
 	svc  #0
 	ret
+
+/* ============================================================================
+ * utxo_store_wal_drain(st) -> 0 ok / -1 write error. Lands the buffered WAL
+ * bytes (whichever store they belong to) in the file. Callable from C; the
+ * apply loop calls it after every block (x86 2026-09-01 parity).
+ * ========================================================================== */
+	.global utxo_store_wal_drain
+	.type utxo_store_wal_drain,%function
+utxo_store_wal_drain:
+	adrp x0, wal_fill
+	ldr  x0, [x0, :lo12:wal_fill]
+	cbz  x0, .wdr_none
+	adrp x0, wal_fd
+	ldr  x0, [x0, :lo12:wal_fd]
+	b    mac_wal_drain_fd
+.wdr_none:
+	mov  x0, #0
+	ret
+	.size utxo_store_wal_drain,.-utxo_store_wal_drain
 
 /* ============================================================================
  * utxo_store_init(st=x0) -> 1/-1
@@ -395,6 +493,12 @@ utxo_store_sync:
 	sub  sp,sp,#0x100
 	mov  x19,x0
 	mov  x20,x1
+	/* land any buffered WAL bytes first: the checkpoint records
+	 * ckpt_log_off = log_len, and log_len is logical (file + buffered) */
+	mov  x0,x19
+	bl   utxo_store_wal_drain
+	cmp  x0,#-1
+	b.eq .s_fail
 	mov  x0,#AT_FDCWD
 	adr  x1, idxname
 	mov  x2,#(O_WRONLY|O_CREAT|O_TRUNC)
@@ -556,7 +660,13 @@ utxo_store_reload:
 	sub  sp,sp,x26
 	add  x25,sp,#0x10000    /* x25 = high-locals base */
 	mov  x19,x0
-	mov  x20,x1
+	mov  x20,x1                     /* save u BEFORE the drain (it clobbers x1) */
+	/* (0) land any buffered WAL bytes: the size measured below must be the
+	 * logical length (x86 parity, buffered-WAL incident) */
+	mov  x0,x19
+	bl   utxo_store_wal_drain
+	cmp  x0,#-1
+	b.eq .rl_fail
 	/* (1) reset table */
 	mov  x0,x20
 	bl   utxo_store_clear
@@ -775,6 +885,10 @@ utxo_store_close:
 	ldr  x0,[x19]
 	cmp  x0,#-1
 	b.eq 1f
+	/* land buffered WAL bytes before the final fsync */
+	mov  x0,x19
+	bl   utxo_store_wal_drain
+	ldr  x0,[x19]
 	bl   mac_fsync
 	ldr  x0,[x19]
 	mov  x8,#SYS_close

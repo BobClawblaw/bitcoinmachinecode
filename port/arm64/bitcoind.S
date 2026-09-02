@@ -137,21 +137,29 @@ node_make_version:
 	movk x7, #0x3344, lsl #32
 	movk x7, #0x1122, lsl #48
 	str  x7, [x19, #72]
-	/* user_agent varstr at +80: len byte + UA bytes (len 26) */
-	mov  w8, #26
+	/* user_agent varstr at +80: len byte + UA bytes. x86 2026-09-01 parity:
+	 * the UA is read from node_ua_buf/node_ua_len at RUNTIME so daemon/main.c
+	 * can append -uacomment (Core: "/Name:ver(c1; c2)/"). The buffer starts
+	 * as the assembly string, so targets that never touch it keep the
+	 * assembly-time identity. Max 255 bytes (one-byte varstr length). */
+	adrp x8, node_ua_len
+	ldr  x8, [x8, :lo12:node_ua_len]
+	adrp x9, node_ua_buf
+	add  x9, x9, :lo12:node_ua_buf
 	strb w8, [x19, #80]
 	add  x0, x19, #81                 /* dst = out+81 */
-	adrp x1, ua_str
-	add  x1, x1, :lo12:ua_str         /* src = ua string */
-	mov  x2, #26
+	mov  x1, x9                       /* src = node_ua_buf */
+	mov  x2, x8
 	bl   .Lcopy
-	/* start_height u32 + relay byte at +81+26 */
-	mov  x1, x19
-	add  x1, x1, #107
-	str  wzr, [x1, #0]
-	mov  w2, #1
-	strb w2, [x1, #4]
-	mov  x0, #112                    /* 81 + 26 + 5 */
+	/* start_height u32 then relay byte, CURSOR-RELATIVE (past the UA) */
+	add  x1, x19, #81
+	add  x1, x1, x8
+	str  wzr, [x1], #4
+	adrp x2, node_relay_flag
+	ldrb w2, [x2, :lo12:node_relay_flag]
+	strb w2, [x1]
+	/* total length = 81 + ua_len + 5 -- derived, no hardcoded total */
+	add  x0, x8, #86
 	ldp  x19, x20, [sp], #16
 	ldp  x29, x30, [sp], #16
 	ret
@@ -392,6 +400,13 @@ node_accept_handshake:
 	mov  x0, x1                        /* dst = payload */
 	add  x1, sp, #192                  /* src */
 	bl   .Lcopy
+	/* relay policy hook (C): decides fRelay for THIS peer from its version +
+	 * permissions (x86 2026-09-01; main.c installs serve_on_peer_version). */
+	adrp x9, g_accept_version_hook
+	ldr  x9, [x9, :lo12:g_accept_version_hook]
+	cbz  x9, .LAH_no_avh
+	blr  x9
+.LAH_no_avh:
 	/* build + send our version reply */
 	add  x0, sp, #32
 	bl   node_make_version
@@ -1922,6 +1937,25 @@ _sendaddrv2:	.ascii "sendaddrv2\0"
 _wtxidrelay:	.ascii "wtxidrelay\0"
 _sendcmpct:	.ascii "sendcmpct\0"
 ua_str:		.ascii "/BitcoinMachineCode:0.0.1/"
+
+/* ---- runtime UA + relay byte + accept hook (x86 2026-09-01 parity) ----
+ * main.c memcpy's a -uacomment into node_ua_buf and sets node_relay_flag /
+ * g_accept_version_hook per-peer from the relay policy. The buffer starts as
+ * the assembly string so targets that never touch it keep the identity. */
+	.global node_ua_buf
+	.global node_ua_len
+	.global node_relay_flag
+	.global g_accept_version_hook
+	.section .data
+	.align 3
+node_ua_buf:		.ascii "/BitcoinMachineCode:0.0.1/"
+			.zero 256-26
+	.align 3
+node_ua_len:		.quad 26
+node_relay_flag:	.byte 1
+			.zero 7
+	.align 3
+g_accept_version_hook:	.quad 0
 
 /* ---- the services we advertise in our own `version` ----
  * NODE_NETWORK(1)|NODE_WITNESS(8) by default. daemon/main.c ORs in
