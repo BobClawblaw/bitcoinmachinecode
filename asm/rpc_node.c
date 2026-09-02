@@ -714,7 +714,7 @@ static int cmd_getmempoolinfo(rj_val** res){
 #define CTL_POLL_US 500
 
 static int ctl_send(int op, const char* arg, long long num,
-                    long* ec, const char** em, int* result_out){
+                    long* ec, const char** em, int* result_out, char* out, size_t outcap){
     static char reason[128];
     if (!g_status_rw){
         *ec = -4;
@@ -739,6 +739,7 @@ static int ctl_send(int op, const char* arg, long long num,
             result = s->ctl_result;
             memcpy(reason, (const void*)s->ctl_reason, sizeof reason);
             reason[sizeof reason - 1] = 0;
+            if (out && outcap) snprintf(out, outcap, "%s", (const char*)s->ctl_out);
             done = 1; break;
         }
         struct timespec ts = {0, CTL_POLL_US * 1000L}; nanosleep(&ts, NULL);
@@ -769,7 +770,7 @@ static int cmd_addnode(const rj_val* params, rj_val** res, long* ec, const char*
     else if (!strcmp(cmd, "onetry")) mode = 2;
     else { *ec = -8; *em = "command must be \"add\", \"remove\" or \"onetry\""; return 0; }
     int r = 0;
-    if (!ctl_send(RPC_CTL_ADDNODE, node, mode, ec, em, &r)) return 0;
+    if (!ctl_send(RPC_CTL_ADDNODE, node, mode, ec, em, &r, NULL, 0)) return 0;
     if (mode == 1 && r == 0){
         /* Core: removing a node that was never added is an error, not a
          * silent success -- the caller's mental model is wrong either way. */
@@ -798,7 +799,7 @@ static int cmd_addpeeraddress(const rj_val* params, rj_val** res, long* ec, cons
     if (!bmc_addr_from_string(&a, addr)){ *ec = -8; *em = "Invalid address"; return 0; }
     char hp[128]; a.port = (unsigned short)port; bmc_addr_to_string_port(hp, sizeof hp, &a);
     int r = 0;
-    if (!ctl_send(RPC_CTL_ADDPEERADDRESS, hp, tried, ec, em, &r)) return 0;
+    if (!ctl_send(RPC_CTL_ADDPEERADDRESS, hp, tried, ec, em, &r, NULL, 0)) return 0;
     rj_val* o = rj_obj();
     if (r != 1) rj_obj_set(o, "error", rj_str(tried ? "failed-adding-to-tried" : "failed-adding-to-new"));
     rj_obj_set(o, "success", rj_bool(r == 1));
@@ -818,7 +819,7 @@ static int cmd_disconnectnode(const rj_val* params, rj_val** res, long* ec, cons
     if ((!addr || !addr[0]) && nodeid < 0){
         *ec = -32602; *em = "Only one of address and nodeid should be provided."; return 0; }
     int r = 0;
-    if (!ctl_send(RPC_CTL_DISCONNECT, addr ? addr : "", nodeid, ec, em, &r)) return 0;
+    if (!ctl_send(RPC_CTL_DISCONNECT, addr ? addr : "", nodeid, ec, em, &r, NULL, 0)) return 0;
     if (r == 0){ *ec = -29; *em = "Node not found in connected nodes"; return 0; }
     *res = rj_null();
     return 1;
@@ -844,7 +845,7 @@ static int cmd_setban(const rj_val* params, rj_val** res, long* ec, const char**
         until = absolute ? bantime : (long long)time(NULL) + bantime;
     }
     int r = 0;
-    if (!ctl_send(RPC_CTL_SETBAN, subnet, until, ec, em, &r)) return 0;
+    if (!ctl_send(RPC_CTL_SETBAN, subnet, until, ec, em, &r, NULL, 0)) return 0;
     if (r == 0){
         *ec = -30;
         *em = add ? "Error: IP/Subnet already banned"
@@ -856,7 +857,7 @@ static int cmd_setban(const rj_val* params, rj_val** res, long* ec, const char**
 }
 
 static int cmd_clearbanned(rj_val** res, long* ec, const char** em){
-    if (!ctl_send(RPC_CTL_CLEARBANNED, "", 0, ec, em, NULL)) return 0;
+    if (!ctl_send(RPC_CTL_CLEARBANNED, "", 0, ec, em, NULL, NULL, 0)) return 0;
     *res = rj_null();
     return 1;
 }
@@ -886,13 +887,13 @@ static int cmd_setnetworkactive(const rj_val* params, rj_val** res, long* ec, co
         params->items[0]->typ != RJ_BOOL){
         *ec = -8; *em = "setnetworkactive requires a boolean"; return 0; }
     int on = params->items[0]->str[0] == '1';
-    if (!ctl_send(RPC_CTL_SETNETACTIVE, "", on, ec, em, NULL)) return 0;
+    if (!ctl_send(RPC_CTL_SETNETACTIVE, "", on, ec, em, NULL, NULL, 0)) return 0;
     *res = rj_bool(on);                       /* Core echoes the new state */
     return 1;
 }
 
 static int cmd_ping(rj_val** res, long* ec, const char** em){
-    if (!ctl_send(RPC_CTL_PING, "", 0, ec, em, NULL)) return 0;
+    if (!ctl_send(RPC_CTL_PING, "", 0, ec, em, NULL, NULL, 0)) return 0;
     *res = rj_null();                         /* Core: queued, returns null */
     return 1;
 }
@@ -1855,9 +1856,22 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
 
     /* stage into shared memory: buffer + len published BEFORE the seq bump */
     node_status_t* s = g_status_rw;
+    /* Core v30 -privatebroadcast: the tx is validated and QUEUED for short-lived
+     * Tor/I2P connections instead of entering the mempool; refused up front when
+     * neither anonymity network is reachable (Core's exact words). */
+    if (s->pb_enabled && !s->pb_reachable){
+        pthread_mutex_unlock(&g_submit_lock);
+        *ec = -1;
+        *em = "-privatebroadcast is enabled, but none of the Tor or I2P networks is "
+              "reachable. Maybe the location of the Tor proxy couldn't be retrieved "
+              "from the Tor daemon at startup. Check whether the Tor daemon is running "
+              "and that -torcontrol, -torpassword and -i2psam are configured properly.";
+        return 0;
+    }
     memcpy((void*)s->tx_submit_buf, stage, n);
     s->tx_submit_len = n;
     s->tx_submit_result = 0;
+    s->tx_submit_private = s->pb_enabled ? 1 : 0;
     /* explicit: a stale 1 left by a previous testmempoolaccept would turn a
      * real submission into a dry run and report a txid for a tx that was
      * never accepted or relayed. */
@@ -2315,6 +2329,72 @@ static const char* const NODE_METHODS[] = {
     "getmempoolinfo", "getrawmempool", "getmempoolentry", "getmempoolancestors", "getmempooldescendants", "estimatesmartfee", "estimaterawfee", "prioritisetransaction", "getprioritisedtransactions", "submitblock", "sendrawtransaction", NULL
 };
 
+/* ---- -privatebroadcast RPCs (Core v30) -------------------------------------
+ * getprivatebroadcastinfo: the worker's snapshot (pb_info: one line per queued
+ * tx, "txid wtxid time_added len hex npeers (addr sent received)*") rendered in
+ * Core's shape. abortprivatebroadcast: a ctl op; the worker answers with the
+ * removed "txid wtxid" pairs in ctl_out. Both refuse, as Core does, when the
+ * option is off. */
+static const char* PB_NOT_ENABLED =
+    "Private broadcast is not enabled. Ensure you're running Bitcoin Core with -privatebroadcast=1";
+static int cmd_getprivatebroadcastinfo(rj_val** res, long* ec, const char** em){
+    if (!g_status || !g_status->pb_enabled){ *ec = -32601; *em = PB_NOT_ENABLED; return 0; }
+    static char snap[RPC_PB_INFO_CAP];
+    memcpy(snap, (const void*)g_status->pb_info, sizeof snap); snap[sizeof snap - 1] = 0;
+    rj_val* txs = rj_arr();
+    char* save = NULL;
+    for (char* line = strtok_r(snap, "\n", &save); line; line = strtok_r(NULL, "\n", &save)){
+        char txid[65], wtxid[65]; long long added = 0; unsigned long len = 0; int consumed = 0;
+        if (sscanf(line, "%64s %64s %lld %lu %n", txid, wtxid, &added, &len, &consumed) < 4) continue;
+        char* hex = line + consumed;
+        char* sp = strchr(hex, ' '); if (!sp) continue;
+        *sp = 0;
+        int npeers = 0; int c2 = 0;
+        if (sscanf(sp + 1, "%d %n", &npeers, &c2) < 1) continue;
+        rj_val* o = rj_obj();
+        rj_obj_set(o, "txid", rj_str(txid));
+        rj_obj_set(o, "wtxid", rj_str(wtxid));
+        rj_obj_set(o, "hex", rj_str(hex));
+        rj_obj_set(o, "time_added", rj_numf("%lld", added));
+        rj_val* peers = rj_arr();
+        char* q = sp + 1 + c2;
+        for (int k = 0; k < npeers; k++){
+            char addr[96]; long long sent = 0, recv = 0; int c3 = 0;
+            if (sscanf(q, "%95s %lld %lld %n", addr, &sent, &recv, &c3) < 3) break;
+            q += c3;
+            rj_val* pe = rj_obj();
+            rj_obj_set(pe, "address", rj_str(addr));
+            rj_obj_set(pe, "sent", rj_numf("%lld", sent));
+            if (recv) rj_obj_set(pe, "received", rj_numf("%lld", recv));
+            rj_arr_push(peers, pe);
+        }
+        rj_obj_set(o, "peers", peers);
+        rj_arr_push(txs, o);
+    }
+    rj_val* out = rj_obj();
+    rj_obj_set(out, "transactions", txs);
+    *res = out; return 1;
+}
+static int cmd_abortprivatebroadcast(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!g_status || !g_status->pb_enabled){ *ec = -32601; *em = PB_NOT_ENABLED; return 0; }
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_STR ||
+        strlen(params->items[0]->str) != 64){
+        *ec = -8; *em = "id must be a 64-character hex txid or wtxid"; return 0; }
+    for (const char* c = params->items[0]->str; *c; c++) if (srt_hex1(*c) < 0){ *ec = -8; *em = "id must be hex"; return 0; }
+    int r = 0; static char out[4096];
+    if (!ctl_send(RPC_CTL_PB_ABORT, params->items[0]->str, 0, ec, em, &r, out, sizeof out)) return 0;
+    rj_val* removed = rj_arr();
+    char* save = NULL;
+    for (char* line = strtok_r(out, "\n", &save); line; line = strtok_r(NULL, "\n", &save)){
+        char txid[65], wtxid[65];
+        if (sscanf(line, "%64s %64s", txid, wtxid) != 2) continue;
+        rj_val* o = rj_obj(); rj_obj_set(o, "txid", rj_str(txid)); rj_obj_set(o, "wtxid", rj_str(wtxid));
+        rj_arr_push(removed, o);
+    }
+    rj_val* o = rj_obj(); rj_obj_set(o, "removed_transactions", removed);
+    *res = o; return 1;
+}
+
 const char* rpc_node_method_at(int i){
     int n = 0;
     while (NODE_METHODS[n]) n++;
@@ -2334,11 +2414,8 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "submitpackage")) return cmd_submitpackage(params, res, ec, em);
     if (!strcmp(m, "savemempool"))   return cmd_savemempool(res, ec, em);
     if (!strcmp(m, "importmempool")) return cmd_importmempool(params, res, ec, em);
-    if (!strcmp(m, "getprivatebroadcastinfo") || !strcmp(m, "abortprivatebroadcast"))
-        return cmd_net_unsupported(
-            "this node has no private broadcast queue: sendrawtransaction "
-            "relays to every live peer leg immediately, so there is no "
-            "pending private broadcast to report on or abort", ec, em);
+    if (!strcmp(m, "getprivatebroadcastinfo")) return cmd_getprivatebroadcastinfo(res, ec, em);
+    if (!strcmp(m, "abortprivatebroadcast"))   return cmd_abortprivatebroadcast(params, res, ec, em);
     if (!strcmp(m, "getmempoolcluster"))
         return cmd_net_unsupported(
             "this node's mempool has no cluster linearization: it tracks the "

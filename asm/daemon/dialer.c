@@ -234,3 +234,54 @@ int dialer_connect(const bmc_addr_t* a, int timeout_ms, const char** why){
         *why = "unknown network"; return -1;
     }
 }
+
+/* ---- private broadcast (Core PickNetwork / ConnectNode for PRIVATE_BROADCAST) ---- */
+int dialer_pb_pick_network(void){
+    if (!g_ready) dialer_init();
+    int nets[4]; int n = 0;
+    int tor = g_onion_ip[0] != 0 && onlynet_allows(BMC_NET_TORV3);
+    if (tor){
+        nets[n++] = BMC_NET_TORV3;
+        if (g_proxy_ip[0]){                       /* clearnet, but only through the proxy */
+            if (onlynet_allows(BMC_NET_IPV4)) nets[n++] = BMC_NET_IPV4;
+            if (onlynet_allows(BMC_NET_IPV6)) nets[n++] = BMC_NET_IPV6;
+        }
+    }
+    if (g_i2p_ok && onlynet_allows(BMC_NET_I2P)) nets[n++] = BMC_NET_I2P;
+    if (n == 0) return 0;
+    unsigned char r = 0; int fd = open("/dev/urandom", O_RDONLY);
+    if (fd >= 0){ if (read(fd, &r, 1) != 1) r = 0; close(fd); }
+    return nets[r % n];
+}
+int dialer_connect_private(const bmc_addr_t* a, int timeout_ms, const char** why){
+    static char err[192];
+    const char* dummy; if (!why) why = &dummy;
+    if (!g_ready) dialer_init();
+    if (!onlynet_allows(a->net)){ snprintf(err, sizeof err, "onlynet excludes %s", bmc_net_name(a->net)); *why = err; return -1; }
+    char host[96];
+    if (!bmc_addr_to_string(host, sizeof host, a)){ *why = "unprintable address"; return -1; }
+    switch (a->net){
+    case BMC_NET_TORV3:
+        return dialer_connect(a, timeout_ms, why);          /* SOCKS5 to tor with isolation credentials */
+    case BMC_NET_IPV4: case BMC_NET_IPV6: {
+        if (!g_proxy_ip[0]){ *why = "private broadcast to clearnet needs -proxy (never direct)"; return -1; }
+        char u[40], p[40];
+        if (!dialer_isolation_creds(u, sizeof u, p, sizeof p)){ *why = "cannot read /dev/urandom for stream isolation"; return -1; }
+        int rep = 0;
+        int fd = socks5_connect(g_proxy_ip, g_proxy_port, host, a->port ? a->port : 8333, u, p, timeout_ms, &rep);
+        if (fd < 0){ snprintf(err, sizeof err, "socks5 rc=%d rep=%d", fd, rep); *why = err; }
+        return fd; }
+    case BMC_NET_I2P: {
+        if (!g_sam_ip[0]){ *why = "no SAM bridge (-i2psam)"; return -1; }
+        /* a TRANSIENT session of its own: the control socket lives in this
+         * (helper) process for the stream's lifetime and dies with it */
+        static i2psam_t tmp;
+        if (!i2psam_session(&tmp, g_sam_ip, g_sam_port, "/nonexistent/private-broadcast-transient", timeout_ms)){
+            snprintf(err, sizeof err, "transient i2p session: %.120s", tmp.err); *why = err; return -1; }
+        int fd = i2psam_connect(&tmp, g_sam_ip, g_sam_port, host, timeout_ms, err, sizeof err);
+        if (fd < 0) *why = err;
+        return fd; }
+    default:
+        snprintf(err, sizeof err, "%s is not a private-broadcast network", bmc_net_name(a->net)); *why = err; return -1;
+    }
+}

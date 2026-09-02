@@ -74,6 +74,7 @@ node_config_t g_cfg = {
      * 2026-08-28 -- which left stream isolation OFF for exactly the
      * operator who configured nothing but a proxy. */
     .proxyrandomize        = 1,
+    .privatebroadcast      = 0,      /* Core DEFAULT_PRIVATE_BROADCAST         */
     .dns                   = 1,      /* Core -dns default: on                */
     .discover              = 1,      /* Core -discover default: on           */
     .i2pacceptincoming     = 1,      /* Core -i2pacceptincoming default: on  */
@@ -172,8 +173,7 @@ static const struct { const char* key; const char* why; } k_noeffect[] = {
     {"unsafesqlitesync",   "no sqlite"},
     {"walletrejectlongchains","the mempool's cluster limits bound unconfirmed chains"},
     {"walletcrosschain",   "one chain per datadir"},
-    {"privatebroadcast",   "no private broadcast"},
-    {"txsendrate",         "no private broadcast"},
+    {"txsendrate",         "no inbound tx send-rate limiter (debug-only in Core)"},
     {"deprecatedrpc",      "no deprecated-RPC toggles"},
     {"rpcdoccheck",        "debug-only"},
     {"test",               "debug-only"},
@@ -209,6 +209,7 @@ static void set_defaults(void){
     g_cfg.addr_max_per_response = 256;
     g_cfg.addr_max_per_netgroup = 16;
     g_cfg.proxyrandomize        = 1;     /* Core DEFAULT_PROXYRANDOMIZE */
+    g_cfg.privatebroadcast      = 0;
     g_cfg.dns                   = 1;
     g_cfg.discover              = 1;
     g_cfg.i2pacceptincoming     = 1;
@@ -657,6 +658,8 @@ long node_config_load(const char* path){
             snprintf(g_cfg.externalip,sizeof g_cfg.externalip,"%s",val); applied++; }
         else if(!strcmp(key,"proxyrandomize")){
             g_cfg.proxyrandomize = iv?1:0; applied++; }
+        else if(!strcmp(key,"privatebroadcast")){   /* Core -privatebroadcast */
+            g_cfg.privatebroadcast = iv?1:0; applied++; }
         else if(!strcmp(key,"onlynet")){      /* Core -onlynet, repeatable  */
             if(g_cfg.n_onlynet < 6){
                 snprintf(g_cfg.onlynet[g_cfg.n_onlynet],8,"%s",val);

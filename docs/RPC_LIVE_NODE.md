@@ -1424,3 +1424,12 @@ a far more alarming conclusion than the truth; and it consumed a coin the
 TRUC fixtures had reserved, which is why it now runs last.
 
 Regtest e2e: **64 checks, 0 failures.**
+
+### `getprivatebroadcastinfo` / `abortprivatebroadcast` — LIVE 2026-09-02
+Core v30's private broadcast (`privatebroadcast=1`): `sendrawtransaction`
+queues instead of admitting; the two RPCs render and cancel the queue in
+Core's shapes (`transactions[].{txid,wtxid,hex,time_added,peers[].{address,
+sent,received}}`, `removed_transactions[].{txid,wtxid}`) and refuse with
+Core's text when the option is off. Proven end to end against Core on
+regtest: `validation/private_broadcast_regtest_e2e.sh`. See
+FEATURE_GAPS.md's 2026-09-02 update for the mechanics and divergences.

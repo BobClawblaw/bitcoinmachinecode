@@ -41,4 +41,12 @@ int  dialer_may_announce_clearnet(void);
 int  dialer_connect(const bmc_addr_t* a, int timeout_ms, const char** why);
 /* our own I2P address once a SAM session exists ("" if none) */
 const char* dialer_i2p_b32(void);
+/* -privatebroadcast (Core CConnman::PrivateBroadcast::PickNetwork): a random
+ * network among tor, i2p and -- when a clearnet SOCKS5 proxy is set and tor
+ * is reachable -- ipv4/ipv6 THROUGH that proxy. 0 when none is usable. */
+int  dialer_pb_pick_network(void);
+/* connect for a private broadcast: never direct; a fresh transient I2P
+ * session per connection (Core forces one so the sender's I2P identity is
+ * not this node's), random SOCKS5 credentials on every proxied dial. */
+int  dialer_connect_private(const bmc_addr_t* a, int timeout_ms, const char** why);
 #endif
