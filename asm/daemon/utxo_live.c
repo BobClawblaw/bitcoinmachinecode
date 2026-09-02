@@ -567,6 +567,8 @@ static int persist_applied_height(long h){
 }
 
 /* ---- per-block apply, reusing the shared walker from utxo_walk.h ---- */
+static long g_store_inconsistent = 0;   /* set when a spend found no coin the verifier had just resolved (incident 2026-09-01) */
+static int  g_halted = 0;               /* UTXO tracking halted for the life of the process (see utxo_live_halted) */
 typedef struct {
     const u8* txid;
     long fatal;
@@ -591,6 +593,26 @@ static void live_on_input(void* ctxv, const u8 txid[32], u32 index){
          * reads back. */
         long r = undo_capture_and_del(&g_utxo_lst, g_utxo_table, g_apply_height, txid, index);
         if (r == -1) ctx->fatal = 1;
+        /* Incident 2026-09-01 (the 2,596 resurrected coins): a 0 here used to be
+         * silently accepted as "already absent, re-applied block". That rationale
+         * died when Stage D started verifying every prevout BEFORE the apply and
+         * utxo_live_recover_partial_block took over crash-resumed blocks: by the
+         * time we are here, Phase 1 resolved this exact outpoint a moment ago, so
+         * an absent coin now can only mean the store answered two different
+         * things to the same question. Under b3d47a9's bad sparse samples that
+         * is precisely what happened -- the lookup inside undo_capture_and_del
+         * missed for ~10-15% of the coins in a freshly flushed run, the spend was
+         * skipped, and the coin came back from the run. The block fails instead
+         * (rollback_partial_apply restores the spends already made from this
+         * block's undo records), the failure is classified as a store error, and
+         * the node retries from the checkpoint -- loudly, never silently. */
+        if (r == 0) {
+            fprintf(stderr, "[utxo_live] FATAL h=%ld: prevout resolved by verification is ABSENT at apply (store lookup inconsistency) -- failing the block\n",
+                    g_apply_height);
+            g_store_inconsistent = 1;
+            g_halted = 1;          /* nothing below (rollback, retry, recovery) can trust a lookup now */
+            ctx->fatal = 1;
+        }
         g_test_input_count++;
         UTXO_LIVE_TEST_CRASH_AT(UTXO_LIVE_CRASH_AFTER_INPUTS, g_test_input_count);
         return;
@@ -999,8 +1021,8 @@ const char* utxo_live_last_reject(void){ return g_last_reject; }
 #define UTXO_FAIL_STORE  2   /* a put/del/flush/WAL step returned an error */
 #define UTXO_FAIL_OTHER  3   /* hole/short block, partial-block recovery failure */
 static int  g_last_fail_kind = UTXO_FAIL_NONE;
+long utxo_live_store_inconsistencies(void){ return g_store_inconsistent; }
 static long g_last_fail_height = -1;
-static int  g_halted = 0;
 long utxo_live_last_fail_kind(void){ return g_last_fail_kind; }
 long utxo_live_last_fail_height(void){ return g_last_fail_height; }
 long utxo_live_halted(void){ return g_halted; }
@@ -1512,6 +1534,16 @@ static void del_created_on_output(void* ctxv, u32 out_index, u64 value,
      * 151) after its key-by-key comparison had already passed. One get per
      * created output, on rollback/unapply paths only. */
     u64 v=0; unsigned long hh=0, cb=0, sl=0; const u8* sc=0;
+    if (g_store_inconsistent) {
+        /* Incident 2026-09-01: the get above is the same lookup that just lied.
+         * Gating the delete on it left 122 of a rolled-back block's outputs in
+         * the set in the repro. Delete unconditionally: the tally may drift by
+         * the absent keys, but the node is halting and the operator rebuilds. */
+        static int said = 0;
+        if (!said++) fprintf(stderr, "[utxo_live] rollback under a store inconsistency: deleting created outputs without a lookup (live counter may drift; rebuild pending)\n");
+        if (utxo_lsm_del(&g_utxo_lst, g_utxo_table, c->txid, out_index) < 0) c->fatal = 1;
+        return;
+    }
     if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, c->txid, out_index, &v, &hh, &cb, &sc, &sl) != 1) return;
     /* copy the script BEFORE the del: get()'s pointer is only valid until
      * the next LSM call, and the remove-event needs the exact bytes */

@@ -2176,7 +2176,9 @@ mac_flush:
     pop  rsi
     test rax, rax
     js   .fl_err_close
+%ifndef LSM_REPRO_BAD_SPARSE
     add  rax, [rel mac_fl_fill]    ; + the records still in the write buffer: the LOGICAL offset
+%endif                             ; (tests/bitcoin_utxo_lsm_badsparse.o omits it: the b3d47a9 bug, for test_lsm_lost_tombstones)
     mov  rbx, rax                  ; this record's file offset
     mov  rdx, [rbp-0x1A0]            ; sparse_n
     mov  rdi, [r12+128]
