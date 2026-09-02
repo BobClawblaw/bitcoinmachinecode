@@ -66,7 +66,8 @@ int main(void){
   /* seed every prevout of every fixture (RPC display order -> wire order) */
   for(unsigned f=0; f<COV_N; f++){ const cov_fixture_t* F=&COV_FIXTURES[f];
     for(unsigned k=0;k<F->n_in;k++){ u8 tid[32],rev[32]; hx(F->prev[k].txid_hex,tid);
-      for(int b=0;b<32;b++) rev[b]=tid[31-b]; memcpy(tid,rev,32);
+      for(int b=0;b<32;b++) rev[b]=tid[31-b];
+      memcpy(tid,rev,32);
       int sl=hx(F->prev[k].spk_hex,spk);
       if(utxo_lsm_put(&g_lst,g_tab,tid,F->prev[k].index,F->prev[k].value,0,0,spk,(uint32_t)sl)!=1){fprintf(stderr,"put\n");return 1;} } }
   u8 bh[32]={0}; char nm[200];

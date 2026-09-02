@@ -154,7 +154,9 @@ long ab2_count_net(const ab2_t* b, int net){
     long c = 0; for (long i = 0; i < b->n; i++) if (b->recs[i].a.net == net) c++; return c;
 }
 int ab2_get(const ab2_t* b, long i, ab2_rec_t* out){
-    if (!b || i < 0 || i >= b->n) return 0; *out = b->recs[i]; return 1;
+    if (!b || i < 0 || i >= b->n) return 0;
+    *out = b->recs[i];
+    return 1;
 }
 int ab2_add(ab2_t* b, const bmc_addr_t* a, unsigned long long services, unsigned last_seen){
     if (!b || !b->rw) return -1;

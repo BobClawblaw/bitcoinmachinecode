@@ -59,7 +59,7 @@ int main(void){
         "  ;;\n"
         "*) echo 'bad args' >&2; exit 9 ;;\n"
         "esac\n");
-    { char cmd[512]; snprintf(cmd, sizeof cmd, "%s/fakehwi", tt_workdir());
+    { char cmd[1100]; snprintf(cmd, sizeof cmd, "%s/fakehwi", tt_workdir());
       rpc_signer_set_cmd(cmd); }
     ck("configured is reported", rpc_signer_configured() == 1);
 
@@ -104,7 +104,7 @@ int main(void){
 
     /* ---- failure shapes ---- */
     { write_script("badexit", "echo 'device wedged' >&2\nexit 3\n");
-      char cmd[512]; snprintf(cmd, sizeof cmd, "%s/badexit", tt_workdir());
+      char cmd[1100]; snprintf(cmd, sizeof cmd, "%s/badexit", tt_workdir());
       rpc_signer_set_cmd(cmd);
       r = NULL; ec = 0;
       ck("a signer that exits nonzero -> error naming the status",
@@ -112,7 +112,7 @@ int main(void){
          em && strstr(em, "status"));
       rj_free(r); }
     { write_script("notjson", "echo 'i am not json'\n");
-      char cmd[512]; snprintf(cmd, sizeof cmd, "%s/notjson", tt_workdir());
+      char cmd[1100]; snprintf(cmd, sizeof cmd, "%s/notjson", tt_workdir());
       rpc_signer_set_cmd(cmd);
       r = NULL; ec = 0;
       ck("non-JSON output -> error quoting what came back",

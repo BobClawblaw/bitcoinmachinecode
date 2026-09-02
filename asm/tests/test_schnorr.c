@@ -92,7 +92,7 @@ int main(int argc, char** argv){
     long sz = ftell(fp);
     fseek(fp, 0, SEEK_SET);
     char* buf = malloc(sz+1);
-    fread(buf, 1, sz, fp);
+    if (fread(buf, 1, sz, fp) != (size_t)sz) { perror("read"); return 2; }
     buf[sz] = 0;
     fclose(fp);
 

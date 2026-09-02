@@ -4,7 +4,8 @@
 #include <string.h>
 extern void ripemd160(unsigned char out[20], const void* in, long long len);
 static int failures=0;
-static void r(const char*name,const unsigned char*in,long long len,const char*exp){
+static void r(const char*name,const void*in_v,long long len,const char*exp){
+    const unsigned char* in=(const unsigned char*)in_v;   /* vectors are C strings or byte buffers; the hash sees bytes */
     unsigned char d[20]; int ok=1;
     ripemd160(d,in,len);
     for(int i=0;i<20;i++){unsigned v;sscanf(exp+i*2,"%2x",&v);if(d[i]!=(unsigned char)v)ok=0;}
@@ -27,7 +28,7 @@ int main(void){
     { static unsigned char buf[200]; memset(buf,'E',65); r("len65",buf,65,"3be8da5222fd9faebf31485575f6bd773813a027"); }
     { static unsigned char buf[200]; memset(buf,'F',120); r("len120",buf,120,"cd5ef8c9ca5f12c41726536ee5b0cd3c90853d69"); }
     /* fuzz: deterministic byte patterns at assorted lengths incl. multi-block */
-    { static unsigned char buf[70000], e[70000]; 
+    { static unsigned char e[70000]; 
       for(int i=0;i<70000;i++)e[i]=(unsigned char)((i*7)%256);
       struct{int ln;const char*h;} cv[]={
         {1,"c81b94933420221a7ac004a90242d8b1d3e5070d"},

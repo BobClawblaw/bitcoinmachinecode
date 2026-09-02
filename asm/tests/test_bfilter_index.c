@@ -114,7 +114,8 @@ int main(void){
     printf("\n== 2: torn tail reconciles ==\n");
     { int ifd = open("bfilters.idx", O_RDWR); struct stat s; fstat(ifd, &s);
       /* append 20 junk bytes (a torn record) and 7 orphan data bytes */
-      pwrite(ifd, "junkjunkjunkjunkjunk", 20, s.st_size); close(ifd);
+      if (pwrite(ifd, "junkjunkjunkjunkjunk", 20, s.st_size) != 20){ printf("  FAIL cannot write the torn-record fixture\n"); failures++; }
+      close(ifd);
       int dfd = open("bfilters.dat", O_WRONLY|O_APPEND); (void)!write(dfd, "orphans", 7); close(dfd); }
     ck("reopen reconciles to 2", bfi_open(1) == 2);
     ck("append still works on the grid", bfi_append(f1, 5) == 1 && bfi_count() == 3);

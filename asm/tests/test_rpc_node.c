@@ -16,7 +16,7 @@ long mempool_resolve_confirmed_utxo(void* u, const unsigned char* txid, unsigned
                                     unsigned long long* val, const unsigned char** spk,
                                     unsigned long* spklen){
     (void)u;(void)txid;(void)index;
-    static const unsigned char SPK[22] = {0x00,0x14, 0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99,
+static const unsigned char SPK[22] = {0x00,0x14, 0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99,
                                           0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99,0x99};
     *val = 100000; *spk = SPK; *spklen = 22;
     return 1;
@@ -108,7 +108,7 @@ static void* fake_ctlworker(void* arg){
                         if (!ns->bans[i].until && slot < 0) slot = i;
                     }
                     if (dup || slot < 0) result = 0;
-                    else { snprintf((char*)ns->bans[slot].subnet, 64, "%s", a);
+                    else { snprintf((char*)ns->bans[slot].subnet, 64, "%.63s", a);
                            ns->bans[slot].created = 111;
                            ns->bans[slot].until = num; result = 1; }
                 }
@@ -153,6 +153,8 @@ static void* fake_worker(void* arg){
  * bitcoin_addrmgr.asm -- ip u32 LE, port u16 BE, services u64 LE at [6],
  * last_seen u32 LE at [14]. */
 #include "../daemon/addrbook.h"
+/* tx_txid (bitcoin_tx.asm): declared at file scope so every block in main sees it */
+extern int tx_txid(unsigned char*, const unsigned char*, unsigned long, unsigned char*, unsigned long);
 static ab2_rec_t FAKE_AB[3];
 static void fake_ab_init(void){
     bmc_addr_from_string_port(&FAKE_AB[0].a, "76.156.14.11:8333", 0); FAKE_AB[0].services = 0x409; FAKE_AB[0].last_seen = 1700000000u;

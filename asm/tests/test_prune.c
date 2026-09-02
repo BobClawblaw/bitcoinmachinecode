@@ -74,8 +74,8 @@ static void single_file_case(void){
     { FILE* f=fopen("blk00000.dat","rb"); fseek(f,0,SEEK_END); long sz=ftell(f); fclose(f);
       cki("s1 blk file compacted size", sz, 416); }         /* 2*(8+200) */
     /* served bytes at new frame start (offset 8) must equal the ORIGINAL h3 payload */
-    { FILE* f=fopen("blk00000.dat","rb"); fseek(f,8,SEEK_SET); unsigned char c[200]; fread(c,1,200,f); fclose(f);
-      int ok=1; for(int i=0;i<200;i++) if(c[i]!=(unsigned char)(30+i)) ok=0;
+    { FILE* f=fopen("blk00000.dat","rb"); fseek(f,8,SEEK_SET); unsigned char c[200]; size_t got=fread(c,1,200,f); fclose(f);
+      int ok=(got==200); for(int i=0;i<200;i++) if(c[i]!=(unsigned char)(30+i)) ok=0;
       cki("s1 retained h3 bytes intact", ok, 1); }
     /* persistence: restart keeps the gate */
     struct St st2; memset(&st2,0,sizeof st2);
@@ -188,13 +188,13 @@ int main(void){
     const char* base = tt_workdir();
 
     /* single-file case in its own subdir */
-    { mkdir("single",0700); chdir("single"); single_file_case(); chdir(base); }
+    { mkdir("single",0700); if(chdir("single")) return 1; single_file_case(); if(chdir(base)) return 1; }
 
     /* multi-file case */
-    { mkdir("multi",0700); chdir("multi"); multi_file_case(); chdir(base); }
+    { mkdir("multi",0700); if(chdir("multi")) return 1; multi_file_case(); if(chdir(base)) return 1; }
 
     /* prune-all */
-    { mkdir("all",0700); chdir("all"); prune_all_case(); chdir(base); }
+    { mkdir("all",0700); if(chdir("all")) return 1; prune_all_case(); if(chdir(base)) return 1; }
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;

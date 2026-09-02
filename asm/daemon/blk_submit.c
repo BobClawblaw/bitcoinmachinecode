@@ -55,26 +55,37 @@ static u64 bsub_txlen(const u8* p, const u8* end){
     int segwit = (q + 2 <= end && q[0] == 0x00 && q[1] == 0x01);
     if (segwit) q += 2;
     u64 nin, c;
-    if (!(c = bsub_varint(q, end, &nin))) return 0; q += c;
+    if (!(c = bsub_varint(q, end, &nin))) return 0;
+    q += c;
     if (nin == 0 || nin > 1u<<20) return 0;
     for (u64 i = 0; i < nin; i++){
-        if (q + 36 > end) return 0; q += 36;
-        u64 sl; if (!(c = bsub_varint(q, end, &sl))) return 0; q += c;
-        if (q + sl + 4 > end) return 0; q += sl + 4;
+        if (q + 36 > end) return 0;
+        q += 36;
+        u64 sl; if (!(c = bsub_varint(q, end, &sl))) return 0;
+        q += c;
+        if (q + sl + 4 > end) return 0;
+        q += sl + 4;
     }
-    u64 nout; if (!(c = bsub_varint(q, end, &nout))) return 0; q += c;
+    u64 nout; if (!(c = bsub_varint(q, end, &nout))) return 0;
+    q += c;
     if (nout == 0 || nout > 1u<<20) return 0;
     for (u64 i = 0; i < nout; i++){
-        if (q + 8 > end) return 0; q += 8;
-        u64 sl; if (!(c = bsub_varint(q, end, &sl))) return 0; q += c;
-        if (q + sl > end) return 0; q += sl;
+        if (q + 8 > end) return 0;
+        q += 8;
+        u64 sl; if (!(c = bsub_varint(q, end, &sl))) return 0;
+        q += c;
+        if (q + sl > end) return 0;
+        q += sl;
     }
     if (segwit){
         for (u64 i = 0; i < nin; i++){
-            u64 items; if (!(c = bsub_varint(q, end, &items))) return 0; q += c;
+            u64 items; if (!(c = bsub_varint(q, end, &items))) return 0;
+            q += c;
             for (u64 k = 0; k < items; k++){
-                u64 il; if (!(c = bsub_varint(q, end, &il))) return 0; q += c;
-                if (q + il > end) return 0; q += il;
+                u64 il; if (!(c = bsub_varint(q, end, &il))) return 0;
+                q += c;
+                if (q + il > end) return 0;
+                q += il;
             }
         }
     }

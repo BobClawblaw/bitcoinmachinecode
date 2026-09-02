@@ -120,9 +120,11 @@ int i2psam_connect(i2psam_t* s, const char* sam_ip, int sam_port, const char* de
     static char cmd[8192], line[8192];
     snprintf(cmd, sizeof cmd, "STREAM CONNECT ID=%s DESTINATION=%s SILENT=false\n", s->id, dest_or_b32);
     if (!send_line(fd, cmd, timeout_ms) || !read_line(fd, line, sizeof line, timeout_ms)){
-        if (err) snprintf(err, errcap, "STREAM CONNECT: no reply"); close(fd); return -1; }
+        if (err) snprintf(err, errcap, "STREAM CONNECT: no reply");
+        close(fd); return -1; }
     if (!strstr(line, "RESULT=OK")){
-        if (err) snprintf(err, errcap, "%.150s", line); close(fd); return -1; }
+        if (err) snprintf(err, errcap, "%.150s", line);
+        close(fd); return -1; }
     return fd;
 }
 int i2psam_accept(i2psam_t* s, const char* sam_ip, int sam_port, char* peer_b32, long cap, int timeout_ms){
