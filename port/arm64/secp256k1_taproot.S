@@ -174,7 +174,9 @@ tap_branch_hash:
     .type __tb_cmp,%function
 __tb_cmp:
     mov  x3,#0
-    mov  x0,#0
+    mov  x6,#0                  /* result in x6; x0 stays the ARG pointer
+                                 * until the last read (draft bug: seeding x0
+                                 * as the accumulator destroyed the a[] arg) */
 .Ltbc:
     cmp  x3,#32
     b.hs .Ltbc_d
@@ -186,8 +188,9 @@ __tb_cmp:
     add  x3,x3,#1
     b    .Ltbc
 .Ltbc_b:
-    mov  x0,#1
+    mov  x6,#1
 .Ltbc_d:
+    mov  x0,x6
     ret
     .size __tb_cmp,.-__tb_cmp
 
