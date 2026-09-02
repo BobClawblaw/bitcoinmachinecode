@@ -1639,5 +1639,7 @@ defaults; (2) the header-sync guard added after the 2026-09-01 incident capped
 the number of headers per session at 100,000 and rolled the session back,
 so a node syncing from genesis could never pass 100k headers. The guard now
 limits how deep below our tip an answer may attach (the incident's case),
-not how many headers follow. The run continues from a fresh clone of the
+not how many headers follow. (3) The download workers' dead-weight rule
+(bytes per second only) banned honest peers serving the tiny early blocks;
+it now also requires a low block rate. The run continues from a fresh clone of the
 fixed tree; `phase.log` / `progress.log` / `RESULT` in the run directory.
