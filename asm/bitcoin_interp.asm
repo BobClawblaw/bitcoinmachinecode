@@ -2246,7 +2246,12 @@ script_eval:
 .csv_nn:
     ; disable flag (bit 31) on the SCRIPT's own operand -> NOP (pre-existing,
     ; correct -- unrelated to the input's real nSequence checked below).
-    test  rax, 0x80000000
+    ; bit 31 ONLY (Core: nSequence & SEQUENCE_LOCKTIME_DISABLE_FLAG, the flag is
+    ; 1<<31 as int64). NOT `test rax, 0x80000000`: that imm32 sign-extends to
+    ; 0xFFFFFFFF80000000, so a 5-byte operand with any of bits 32-39 set and
+    ; bit 31 clear was treated as "disabled" -> NOP -> accepted, where Core
+    ; masks the operand and enforces it (false-accept, fixed 2026-09-02).
+    test  eax, 0x80000000
     jnz   .next_op
     ; BIP68/BIP112 CheckSequence (real Core algorithm, script/interpreter.cpp),
     ; using tx.nVersion / this input's nSequence now threaded into
