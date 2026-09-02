@@ -100,7 +100,7 @@ static int run_script(const char* script_hex,
  * generated source removes that failure mode entirely.
  * Regenerate with validation/gen_script_error_defines.py. */
 #include "script_error_codes.h"
-#define FLAG_DISCOURAGE_OP_SUCCESS (1ull<<18)
+#define FLAG_DISCOURAGE_OP_SUCCESS (1ull<<19)   /* Core bit 19; was 18 here and in the asm until 2026-09-02 (bit 18 is DISCOURAGE_UPGRADABLE_TAPROOT_VERSION) */
 #define FLAG_MINIMALIF (1ull<<13)
 #define SIGV_BASE 0
 #define SIGV_WITNESS_V0 1
