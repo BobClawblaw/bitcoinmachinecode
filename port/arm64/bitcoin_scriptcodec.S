@@ -6,7 +6,9 @@
  *
  * Ported here (each verified against a Python oracle):
  *   int64 scriptnum_decode(u64 len, const u8* data, u64 maxsize)
- *        -> x0 = value (sets global snum_overflow = 1 if len > maxsize)
+ *        -> x0 = value (sets global snum_overflow = 1 if len > maxsize, or --
+ *           2026-09-02 -- if the ENCODING is non-minimal and bit 8 of maxsize
+ *           is set: Core passes fRequireMinimal under MINIMALDATA)
  *   ScriptNumOut scriptnum_serialize(int64 value)
  *        -> x0 = ptr into scriptnum_buf, x1 = byte length
  *   int cast_to_bool(u64 len, const u8* data)             -> x0 0/1
@@ -58,11 +60,37 @@ elem_tmp3: .space 528
 scriptnum_decode:
 	TLS_ADDR x9, snum_overflow
 	str  xzr, [x9]                  /* overflow = 0 */
+	mov  x10, x2                    /* keep the raw word: low byte = maxsize,
+	                                 * bit 8 = "require minimal encoding" (the
+	                                 * caller sets it under MINIMALDATA --
+	                                 * Core's fRequireMinimal). Both failures
+	                                 * report through snum_overflow, i.e.
+	                                 * SCRIPT_ERR_SCRIPTNUM, exactly Core's
+	                                 * error for either. 2026-09-02, the
+	                                 * randomized differential vs Core. */
+	and  x2, x2, #0xff
 	cmp  x0, x2                     /* len vs maxsize */
-	b.ls 1f
-	mov  w3, #1
-	str  x3, [x9]                   /* overflow = 1 */
-1:
+	b.ls .sd_size_ok
+	mov  w11, #1
+	str  x11, [x9]                  /* overflow = 1 */
+.sd_size_ok:
+	tst  x10, #0x100
+	b.eq .sd_min_ok
+	cbz  x0, .sd_min_ok             /* empty is minimal */
+	sub  x11, x0, #1
+	ldrb w11, [x1, x11]
+	tst  w11, #0x7f
+	b.ne .sd_min_ok                 /* top byte carries magnitude: minimal */
+	cmp  x0, #1
+	b.eq .sd_min_bad                /* lone 0x00 / 0x80: pad byte or a sign */
+	sub  x11, x0, #2
+	ldrb w11, [x1, x11]
+	tst  w11, #0x80
+	b.ne .sd_min_ok                 /* the pad byte IS needed for the sign */
+.sd_min_bad:
+	mov  w11, #1
+	str  x11, [x9]
+.sd_min_ok:
 	mov  x4, x0                     /* len */
 	mov  x5, x1                     /* data */
 	mov  x6, xzr                    /* result */
@@ -256,17 +284,19 @@ check_minimal_push:
 	cmp  x1, #1
 	b.ne .mp_not1
 	ldrb w3, [x2]
+	cmp  w3, #0x81
+	b.eq .mp_nonmin               /* 0x81 -> should use OP_1NEGATE. Before
+	                               * 2026-09-02 this test sat behind a `b.hi
+	                               * .mp_not1` that only a 0x00 byte escaped,
+	                               * so a pushed 0x81 passed MINIMALDATA; the
+	                               * same unreachable-branch bug main had, and
+	                               * the Core differential found both. */
 	cmp  w3, #1
-	b.lo .mp_not1min
+	b.lo .mp_not1                 /* 0x00: Core falls through to the size rule */
 	cmp  w3, #16
 	b.hi .mp_not1
-	mov  w0, #0
-	ret
-.mp_not1min:
-	ldrb w3, [x2]
-	cmp  w3, #0x81
-	b.ne .mp_not1
-	mov  w0, #0
+.mp_nonmin:
+	mov  w0, #0                   /* 1..16 -> should use OP_1..OP_16 */
 	ret
 .mp_empty:
 	cbz  w0, 8f
