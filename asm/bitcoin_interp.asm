@@ -183,9 +183,18 @@
 %define SCRIPT_VERIFY_NULLDUMMY (1<<4)
 %define SCRIPT_VERIFY_MINIMALDATA (1<<6)
 %define SCRIPT_VERIFY_MINIMALIF (1<<13)
+; SNUM_MAX n: rdx = maxsize for scriptnum_decode, plus bit 8 when MINIMALDATA
+; is set (Core passes fRequireMinimal to every CScriptNum read). r12 = state.
+%macro SNUM_MAX 1
+    mov   rdx, %1
+    test  qword [r12+56], SCRIPT_VERIFY_MINIMALDATA
+    jz    %%nomin
+    or    rdx, 0x100
+%%nomin:
+%endmacro
 %define SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY (1<<9)
 %define SCRIPT_VERIFY_CHECKSEQUENCEVERIFY (1<<10)
-%define SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS (1<<18)
+%define SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS (1<<19)   ; Core bit 19 (bit 18 is DISCOURAGE_UPGRADABLE_TAPROOT_VERSION); was 18 until 2026-09-02, nothing set it
 
 %define SCRIPT_ERR_OK                                    0
 %define SCRIPT_ERR_UNKNOWN_ERROR                         1
@@ -791,7 +800,7 @@ script_eval:
     cmp   byte [r13+ELEM_DATA_OFF], 1
     je    .if_minif_ok
 .wif_minif:
-    mov   rax, SCRIPT_ERR_MINIMALDATA
+    mov   rax, SCRIPT_ERR_MINIMALIF    ; was MINIMALDATA (wrong code, same verdict) until 2026-09-02
     jmp   .err_ret0
 .if_minif_ok:
     mov   r14d, [r13]
@@ -1273,8 +1282,12 @@ script_eval:
     lea   r15, [r13+ELEM_DATA_OFF]
     mov   rdi, r14
     mov   rsi, r15
-    mov   rdx, 4
+    SNUM_MAX 4
     call  scriptnum_decode
+    mov   rcx, [rbp-0xB0]     ; &snum_overflow: size or (under MINIMALDATA) encoding -> SCRIPT_ERR_SCRIPTNUM
+    mov   rcx, [rcx]
+    test  rcx, rcx
+    jnz   .snum_fail
     mov   rbx, rax            ; n
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
@@ -1576,7 +1589,7 @@ script_eval:
     lea   r15, [r13+ELEM_DATA_OFF]
     mov   rdi, r14
     mov   rsi, r15
-    mov   rdx, 4
+    SNUM_MAX 4
     call  scriptnum_decode
     mov   rcx, [rbp-0xB0]
     mov   rcx, [rcx]
@@ -1672,7 +1685,7 @@ script_eval:
     lea   r15, [r13+ELEM_DATA_OFF]
     mov   rdi, r14
     mov   rsi, r15
-    mov   rdx, 4
+    SNUM_MAX 4
     call  scriptnum_decode
     mov   r14, rax          ; bn1
     mov   rcx, [rbp-0xB0]
@@ -1687,7 +1700,7 @@ script_eval:
     add   r13, ELEM_DATA_OFF
     mov   rdi, r15
     mov   rsi, r13
-    mov   rdx, 4
+    SNUM_MAX 4
     call  scriptnum_decode
     mov   r15, rax          ; bn2
     mov   rcx, [rbp-0xB0]
@@ -1830,8 +1843,12 @@ script_eval:
     lea   r15, [r13+ELEM_DATA_OFF]
     mov   rdi, r14
     mov   rsi, r15
-    mov   rdx, 4
+    SNUM_MAX 4
     call  scriptnum_decode
+    mov   rcx, [rbp-0xB0]     ; &snum_overflow: size or (under MINIMALDATA) encoding -> SCRIPT_ERR_SCRIPTNUM
+    mov   rcx, [rcx]
+    test  rcx, rcx
+    jnz   .snum_fail
     mov   r15, rax          ; val -- must survive the two scriptnum_decode
                              ; calls below; they used to clobber it via a
                              ; `lea r15, [r13+ELEM_DATA_OFF]` scratch step
@@ -1850,8 +1867,12 @@ script_eval:
     mov   r14d, [r13]
     lea   rsi, [r13+ELEM_DATA_OFF]
     mov   rdi, r14
-    mov   rdx, 4
+    SNUM_MAX 4
     call  scriptnum_decode
+    mov   rcx, [rbp-0xB0]     ; &snum_overflow: size or (under MINIMALDATA) encoding -> SCRIPT_ERR_SCRIPTNUM
+    mov   rcx, [rcx]
+    test  rcx, rcx
+    jnz   .snum_fail
     mov   r14, rax          ; min -- must also survive the max lookup below;
                              ; loading max's length straight into edi (not
                              ; via r14) so this doesn't clobber it the same
@@ -1862,8 +1883,12 @@ script_eval:
     mov   r13, rax
     lea   rsi, [r13+ELEM_DATA_OFF]
     mov   edi, [r13]
-    mov   rdx, 4
+    SNUM_MAX 4
     call  scriptnum_decode
+    mov   rcx, [rbp-0xB0]     ; &snum_overflow: size or (under MINIMALDATA) encoding -> SCRIPT_ERR_SCRIPTNUM
+    mov   rcx, [rcx]
+    test  rcx, rcx
+    jnz   .snum_fail
     mov   rbx, rax          ; max
     ; `setl r14b` below has incident #28's shape -- r14 still holds min -- but
     ; the answer is CORRECT here, and only because r13d is zeroed first: r13d
@@ -2019,6 +2044,8 @@ script_eval:
     call  interp_checksig
     cmp   rax, -1           ; strict-DER encoding failure -> hard script error
     je    .err_sigder
+    cmp   rax, -2           ; STRICTENC pubkey encoding failure -> hard script error
+    je    .err_pubkeytype
     mov   r13, rax          ; success
     ; pop sig, pub, push bool
     lea   rdi, [r12+8]
@@ -2064,6 +2091,9 @@ script_eval:
 .err_sigder:
     mov   rax, SCRIPT_ERR_SIG_DER
     jmp   .err_ret0
+.err_pubkeytype:
+    mov   rax, SCRIPT_ERR_PUBKEYTYPE
+    jmp   .err_ret0
 
 .op_checksigadd:
     mov   eax, dword [r12+48]
@@ -2085,8 +2115,12 @@ script_eval:
     add   r13, ELEM_DATA_OFF
     mov   rdi, r14
     mov   rsi, r13
-    mov   rdx, 4
+    SNUM_MAX 4
     call  scriptnum_decode
+    mov   rcx, [rbp-0xB0]     ; &snum_overflow: size or (under MINIMALDATA) encoding -> SCRIPT_ERR_SCRIPTNUM
+    mov   rcx, [rcx]
+    test  rcx, rcx
+    jnz   .snum_fail
     mov   rbx, rax          ; num (rbx preserved)
     call  interp_checksig_add
     mov   r13, rax          ; success
@@ -2181,8 +2215,12 @@ script_eval:
     add   r13, ELEM_DATA_OFF
     mov   rdi, r14
     mov   rsi, r13
-    mov   rdx, 5
+    SNUM_MAX 5
     call  scriptnum_decode
+    mov   rcx, [rbp-0xB0]     ; &snum_overflow: size or (under MINIMALDATA) encoding -> SCRIPT_ERR_SCRIPTNUM
+    mov   rcx, [rcx]
+    test  rcx, rcx
+    jnz   .snum_fail
     test  rax, rax
     jns   .cltv_nn
     mov   rax, SCRIPT_ERR_NEGATIVE_LOCKTIME
@@ -2237,8 +2275,12 @@ script_eval:
     add   r13, ELEM_DATA_OFF
     mov   rdi, r14
     mov   rsi, r13
-    mov   rdx, 5
+    SNUM_MAX 5
     call  scriptnum_decode
+    mov   rcx, [rbp-0xB0]     ; &snum_overflow: size or (under MINIMALDATA) encoding -> SCRIPT_ERR_SCRIPTNUM
+    mov   rcx, [rcx]
+    test  rcx, rcx
+    jnz   .snum_fail
     test  rax, rax
     jns   .csv_nn
     mov   rax, SCRIPT_ERR_NEGATIVE_LOCKTIME
@@ -2619,6 +2661,36 @@ interp_sig_encoding_ok:
     mov   eax, 1
     ret
 
+; interp_pubkey_encoding_ok(rdi = publen, rsi = pubdata) -> rax = 1 ok / 0 = the
+; script must fail with SCRIPT_ERR_PUBKEYTYPE. r12 = script_state.
+; Core's CheckPubKeyEncoding: under STRICTENC the key must be 33 bytes starting
+; 02/03 or 65 bytes starting 04 (IsCompressedOrUncompressedPubKey). Runs
+; BEFORE the empty-signature shortcut, as in Core. (2026-09-02, Core
+; differential: STRICTENC scripts with a malformed key passed here.)
+interp_pubkey_encoding_ok:
+    mov   rax, [r12+56]
+    test  rax, SCRIPT_VERIFY_STRICTENC
+    jz    .pke_ok
+    cmp   rdi, 33
+    jne   .pke_65
+    movzx eax, byte [rsi]
+    cmp   al, 2
+    je    .pke_ok
+    cmp   al, 3
+    je    .pke_ok
+    jmp   .pke_bad
+.pke_65:
+    cmp   rdi, 65
+    jne   .pke_bad
+    cmp   byte [rsi], 4
+    je    .pke_ok
+.pke_bad:
+    xor   eax, eax
+    ret
+.pke_ok:
+    mov   eax, 1
+    ret
+
 ; interp_checksig() -> rax = 0/1, or -1 = SCRIPT_ERR_SIG_DER (bad encoding is a
 ;                      hard script ERROR in Core, not a false CHECKSIG result)
 ;                      ; sig = sp-2, pub = sp-1
@@ -2639,17 +2711,14 @@ interp_checksig:
     call  stack_second_ptr
     mov   r13, rax            ; sig elem
     mov   ebx, [r13]          ; siglen (32-bit elem length; was rbx[8])
-    test  rbx, rbx
-    jz    .false
-    mov   rax, [r12+96]
-    test  rax, rax
-    jz    .false
     ; ---- BIP66/DERSIG. Core runs CheckSignatureEncoding at the TOP of
     ; EvalChecksigPreTapscript, before any hashing or ECDSA work, and its
     ; failure aborts the whole script (SCRIPT_ERR_SIG_DER) rather than making
     ; CHECKSIG push false. The distinction is consensus-visible: with a mere
     ; false, `<sig> <pk> CHECKSIG OP_NOT` would still ACCEPT a signature Core
     ; rejects. -1 carries the error out to .op_checksig.
+    ; Core order (2026-09-02): sig encoding (true for an empty sig), then
+    ; pubkey encoding (STRICTENC), THEN the empty-sig -> false shortcut.
     mov   rdi, r13
     call  interp_sig_encoding_ok
     test  rax, rax
@@ -2657,6 +2726,19 @@ interp_checksig:
     mov   rax, -1
     jmp   .end
 .encoding_ok:
+    mov   rdi, r14            ; publen
+    mov   rsi, r15            ; pubdata
+    call  interp_pubkey_encoding_ok
+    test  rax, rax
+    jnz   .pubenc_ok
+    mov   rax, -2             ; SCRIPT_ERR_PUBKEYTYPE (the caller maps it)
+    jmp   .end
+.pubenc_ok:
+    test  rbx, rbx
+    jz    .false
+    mov   rax, [r12+96]
+    test  rax, rax
+    jz    .false
     ; build slice
     mov   rax, [rbp-0x20]
     TLS_ADDR r10, interp_slice
@@ -2759,6 +2841,7 @@ interp_checkmultisig:
     push  r15
     push  rbx
     sub   rsp, 64               ; locals: [rsp+24]=nKeys, [rsp+16]=nSigs, [rsp+8]=sp, [rsp+0]=remaining
+    mov   qword [rsp+56], 0     ; [rsp+56] = NULLDUMMY violation seen; raised AFTER the signature loop (Core order, 2026-09-02)
                                  ; [rsp+32]=cur_src ptr, [rsp+40]=cur_src len, [rsp+48]=dst buf ptr
                                  ; (used only by the up-front scriptCode-strip loop below)
     mov   rax, [rbp-0x70]
@@ -2798,8 +2881,12 @@ interp_checkmultisig:
     lea   r14, [r15+ELEM_DATA_OFF]
     mov   rdi, r13
     mov   rsi, r14
-    mov   rdx, 4
+    SNUM_MAX 4
     call  scriptnum_decode
+    mov   rcx, [rbp-0xB0]     ; &snum_overflow: size or (under MINIMALDATA) encoding -> SCRIPT_ERR_SCRIPTNUM
+    mov   rcx, [rcx]
+    test  rcx, rcx
+    jnz   .snum_fail
     mov   r15d, eax              ; nKeys
     test  eax, eax
     js    .err_pubcount
@@ -2845,8 +2932,12 @@ interp_checkmultisig:
     lea   r14, [r15+ELEM_DATA_OFF]
     mov   rdi, r13
     mov   rsi, r14
-    mov   rdx, 4
+    SNUM_MAX 4
     call  scriptnum_decode
+    mov   rcx, [rbp-0xB0]     ; &snum_overflow: size or (under MINIMALDATA) encoding -> SCRIPT_ERR_SCRIPTNUM
+    mov   rcx, [rcx]
+    test  rcx, rcx
+    jnz   .snum_fail
     mov   r14d, eax              ; nSigs
     test  eax, eax
     js    .err_sigcount
@@ -2888,7 +2979,8 @@ interp_checkmultisig:
     call  stack_elem_ptr
     mov   ecx, [rax]             ; dummy length
     test  ecx, ecx
-    jnz   .err_nulldummy
+    jz    .cms_dummy_ok
+    mov   qword [rsp+56], 1      ; remember; a SIG_DER/PUBKEYTYPE from the loop takes precedence, as in Core
 .cms_dummy_ok:
     ; recompute need: the checks above clobbered eax.
     mov   eax, [rsp+24]
@@ -3067,6 +3159,11 @@ interp_checkmultisig:
     call  interp_sig_encoding_ok
     test  rax, rax
     jz    .err_sigder
+    mov   edi, [r14]             ; publen
+    lea   rsi, [r14+ELEM_DATA_OFF]
+    call  interp_pubkey_encoding_ok
+    test  rax, rax
+    jz    .err_pubkeytype
     ; scriptCode (interp_slice) was already built once, with ALL on-stack
     ; signatures stripped, in the .cms_strip_loop above -- do not rebuild it
     ; per iteration (see the comment there for why per-call stripping of
@@ -3101,6 +3198,8 @@ interp_checkmultisig:
     jg    .cms_fail              ; remaining > keys-left -> cannot satisfy -> fail
     jmp   .cms_loop
 .cms_end:
+    cmp   qword [rsp+56], 0      ; deferred BIP147 NULLDUMMY (see the check above the loop)
+    jne   .err_nulldummy
     ; loop ended; success iff remaining==0 (all sigs matched)
     mov   eax, [rsp+0]
     test  eax, eax
@@ -3109,6 +3208,8 @@ interp_checkmultisig:
     mov   edx, 1
     jmp   .cms_finish
 .cms_fail:
+    cmp   qword [rsp+56], 0      ; deferred BIP147 NULLDUMMY (see the check above the loop)
+    jne   .err_nulldummy
     mov   edx, 0
 .cms_finish:
     ; pop total = need+1 = nkeys+nsigs+3 elements (locals nKeys/nSigs intact)
@@ -3170,6 +3271,15 @@ interp_checkmultisig:
 .err_sigder:
     mov   rax, [rbp-0x70]
     mov   qword [rax], SCRIPT_ERR_SIG_DER
+    jmp   .err_exit
+.snum_fail:                          ; 2026-09-02: a count that overflows 4 bytes or is non-minimal under MINIMALDATA
+    mov   rax, [rbp-0x70]
+    mov   qword [rax], SCRIPT_ERR_SCRIPTNUM
+    jmp   .err_exit
+.err_pubkeytype:                     ; 2026-09-02: STRICTENC pubkey encoding (Core's CheckPubKeyEncoding per pair)
+    mov   rax, [rbp-0x70]
+    mov   qword [rax], SCRIPT_ERR_PUBKEYTYPE
+    jmp   .err_exit
 .err_exit:
     xor   eax, eax
     add   rsp, 64
