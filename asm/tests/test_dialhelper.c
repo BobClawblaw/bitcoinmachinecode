@@ -150,8 +150,12 @@ int main(void){
       dlc_headers_rollback(hst, 1);
       ok(hst_count(hst) == 1, "rollback drops the appended header: the store is back at 1");
       { struct stat st; ok(stat("headers.dat", &st) == 0 && st.st_size == 112, "...and headers.dat is back to 112 bytes"); }
-      ok(dlc_headers_sane(0, 5000000), "a fresh store may take the whole chain");
-      ok(dlc_headers_sane(965018, 100000) && !dlc_headers_sane(965018, 100001), "a non-empty store refuses more than DLC_HDR_SANE_MAX headers from one answer");
+      /* the guard is about WHERE an answer attaches, never about how much follows (2026-09-02) */
+      ok(dlc_headers_sane(0, 1), "a fresh store takes an answer from height 1 -- the whole chain may follow");
+      ok(dlc_headers_sane(50000, 50000), "a node restarted mid-sync takes an answer at its tip, however long");
+      ok(dlc_headers_sane(965018, 965018 - 100000), "an answer 100k below the tip is still a continuation");
+      ok(!dlc_headers_sane(965018, 1), "the incident: an answer from genesis against 965k held is refused");
+      ok(!dlc_headers_sane(965018, 965018 - 100001), "...as is one more than DLC_HDR_SANE_MAX below the tip");
       if (cwd0[0]) (void)!chdir(cwd0); }
 
     printf("== 6. the boot header fetch: exponential locator, per-page checks ==\n");
