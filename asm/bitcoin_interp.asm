@@ -183,6 +183,8 @@
 %define SCRIPT_VERIFY_NULLDUMMY (1<<4)
 %define SCRIPT_VERIFY_MINIMALDATA (1<<6)
 %define SCRIPT_VERIFY_MINIMALIF (1<<13)
+%define SCRIPT_VERIFY_NULLFAIL (1<<14)       ; BIP146 policy: a failing non-empty signature is an error, not false
+%define SCRIPT_VERIFY_CONST_SCRIPTCODE (1<<16) ; policy: a signature found in the scriptCode (legacy FindAndDelete) is an error
 ; SNUM_MAX n: rdx = maxsize for scriptnum_decode, plus bit 8 when MINIMALDATA
 ; is set (Core passes fRequireMinimal to every CScriptNum read). r12 = state.
 %macro SNUM_MAX 1
@@ -2046,7 +2048,27 @@ script_eval:
     je    .err_sigder
     cmp   rax, -2           ; STRICTENC pubkey encoding failure -> hard script error
     je    .err_pubkeytype
+    cmp   rax, -3
+    je    .err_highs
+    cmp   rax, -4
+    je    .err_hashtype
+    cmp   rax, -5           ; the C checker: CONST_SCRIPTCODE found the sig in the scriptCode
+    je    .err_findanddelete
     mov   r13, rax          ; success
+    ; BIP146 NULLFAIL (2026-09-02): a failing signature that is not empty is
+    ; an error under the flag, not a pushed false (Core: "Signature must be
+    ; zero for failed CHECK(MULTI)SIG operation").
+    test  r13, r13
+    jnz   .cs_nullfail_ok
+    mov   rax, [r12+56]
+    test  rax, SCRIPT_VERIFY_NULLFAIL
+    jz    .cs_nullfail_ok
+    lea   rdi, [r12+8]
+    mov   rsi, [r12+0]
+    call  stack_second_ptr    ; the signature element
+    cmp   dword [rax], 0
+    jne   .err_nullfail
+.cs_nullfail_ok:
     ; pop sig, pub, push bool
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
@@ -2093,6 +2115,18 @@ script_eval:
     jmp   .err_ret0
 .err_pubkeytype:
     mov   rax, SCRIPT_ERR_PUBKEYTYPE
+    jmp   .err_ret0
+.err_highs:
+    mov   rax, SCRIPT_ERR_SIG_HIGH_S
+    jmp   .err_ret0
+.err_hashtype:
+    mov   rax, SCRIPT_ERR_SIG_HASHTYPE
+    jmp   .err_ret0
+.err_nullfail:
+    mov   rax, SCRIPT_ERR_SIG_NULLFAIL
+    jmp   .err_ret0
+.err_findanddelete:
+    mov   rax, SCRIPT_ERR_SIG_FINDANDDELETE
     jmp   .err_ret0
 
 .op_checksigadd:
@@ -2656,10 +2690,61 @@ interp_sig_encoding_ok:
     test  esi, esi
     jz    .sigenc_ok                 ; empty signature: Core returns true
     add   rdi, ELEM_DATA_OFF
-    jmp   der_sig_strict             ; tail call; its 0/1 is our 0/1
+    call  der_sig_strict             ; leaf: clobbers only rax/rcx/r8/r9, rdi/rsi survive
+    test  rax, rax
+    jz    .sigenc_der                ; -> 0 = SCRIPT_ERR_SIG_DER
+    ; ---- Core's trailing arms (2026-09-02, Core differential with real
+    ; signatures): after strict DER passed, LOW_S then STRICTENC hashtype.
+    ; Returns -1 = SIG_HIGH_S, -2 = SIG_HASHTYPE; the callers map them.
+    mov   rax, [r12+56]
+    test  rax, SCRIPT_VERIFY_LOW_S
+    jz    .sigenc_ht
+    ; S: lenR = sig[3], lenS = sig[5+lenR], S bytes at sig[6+lenR]. Strict DER
+    ; already holds, so a 33-byte S has a 0x00 pad before a >=0x80 byte (high),
+    ; a <32-byte S is below 2^248 (low), a 32-byte S compares against N/2.
+    movzx ecx, byte [rdi+3]
+    movzx r8d, byte [rdi+5+rcx]      ; lenS
+    cmp   r8d, 33
+    je    .sigenc_highs
+    cmp   r8d, 32
+    jb    .sigenc_ht
+    lea   r9, [rdi+6+rcx]            ; S, 32 bytes big-endian
+    lea   rcx, [rel half_order_n]
+    xor   r8d, r8d
+.sigenc_cmp:
+    movzx eax, byte [r9+r8]
+    cmp   al, byte [rcx+r8]
+    jb    .sigenc_ht                 ; S < N/2: low
+    ja    .sigenc_highs              ; S > N/2: high
+    inc   r8d
+    cmp   r8d, 32
+    jb    .sigenc_cmp                ; equal so far; all equal = N/2 exactly = low
+.sigenc_ht:
+    mov   rax, [r12+56]
+    test  rax, SCRIPT_VERIFY_STRICTENC
+    jz    .sigenc_ok
+    movzx eax, byte [rdi+rsi-1]      ; hashtype byte
+    and   eax, 0x7f                  ; drop ANYONECANPAY
+    cmp   eax, 1
+    jb    .sigenc_badht
+    cmp   eax, 3
+    ja    .sigenc_badht
 .sigenc_ok:
     mov   eax, 1
     ret
+.sigenc_der:
+    xor   eax, eax
+    ret
+.sigenc_highs:
+    mov   rax, -1
+    ret
+.sigenc_badht:
+    mov   rax, -2
+    ret
+; secp256k1 group order / 2, big-endian: the LOW_S bound (BIP62, Core's
+; IsLowDERSignature). Read-only data kept next to its only reader.
+half_order_n: db 0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
+              db 0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
 
 ; interp_pubkey_encoding_ok(rdi = publen, rsi = pubdata) -> rax = 1 ok / 0 = the
 ; script must fail with SCRIPT_ERR_PUBKEYTYPE. r12 = script_state.
@@ -2721,9 +2806,19 @@ interp_checksig:
     ; pubkey encoding (STRICTENC), THEN the empty-sig -> false shortcut.
     mov   rdi, r13
     call  interp_sig_encoding_ok
-    test  rax, rax
-    jnz   .encoding_ok
-    mov   rax, -1
+    cmp   rax, 1
+    je    .encoding_ok
+    cmp   rax, -1
+    je    .enc_highs
+    cmp   rax, -2
+    je    .enc_badht
+    mov   rax, -1             ; SCRIPT_ERR_SIG_DER
+    jmp   .end
+.enc_highs:
+    mov   rax, -3             ; SCRIPT_ERR_SIG_HIGH_S
+    jmp   .end
+.enc_badht:
+    mov   rax, -4             ; SCRIPT_ERR_SIG_HASHTYPE
     jmp   .end
 .encoding_ok:
     mov   rdi, r14            ; publen
@@ -2734,8 +2829,18 @@ interp_checksig:
     mov   rax, -2             ; SCRIPT_ERR_PUBKEYTYPE (the caller maps it)
     jmp   .end
 .pubenc_ok:
+    ; Empty signature -> false. EXCEPT under CONST_SCRIPTCODE (2026-09-02):
+    ; Core runs FindAndDelete of the signature's push (OP_0 for an empty one)
+    ; against the scriptCode BEFORE the checker, and finding it is
+    ; SIG_FINDANDDELETE. That search lives in the C callback, so with the
+    ; flag set the callback must see the empty signature too (it returns
+    ; false for it after the search).
     test  rbx, rbx
+    jnz   .cs_call
+    mov   rax, [r12+56]
+    test  rax, SCRIPT_VERIFY_CONST_SCRIPTCODE
     jz    .false
+.cs_call:
     mov   rax, [r12+96]
     test  rax, rax
     jz    .false
@@ -3106,6 +3211,12 @@ interp_checkmultisig:
     TLS_ADDR r8, cms_needle
     mov   r9, r15                ; needlelen
     call  script_find_and_delete ; rdi dst rsi dstcap rdx src rcx srclen r8 needle r9 needlelen -> rax outlen
+    cmp   rax, [rsp+40]          ; shorter than the source = the signature WAS in the scriptCode
+    jge   .cms_strip_nofind
+    mov   rcx, [r12+56]
+    test  rcx, SCRIPT_VERIFY_CONST_SCRIPTCODE
+    jnz   .err_findanddelete     ; Core: SIG_FINDANDDELETE, raised while stripping, before the loop
+.cms_strip_nofind:
     mov   rdi, [rsp+48]
     mov   [rsp+32], rdi
     mov   [rsp+40], rax
@@ -3157,8 +3268,14 @@ interp_checkmultisig:
     ; up-front collect loop.
     mov   rdi, rbx               ; vSig elem ptr
     call  interp_sig_encoding_ok
-    test  rax, rax
-    jz    .err_sigder
+    cmp   rax, 1
+    je    .cms_enc_ok
+    cmp   rax, -1
+    je    .err_highs
+    cmp   rax, -2
+    je    .err_hashtype
+    jmp   .err_sigder
+.cms_enc_ok:
     mov   edi, [r14]             ; publen
     lea   rsi, [r14+ELEM_DATA_OFF]
     call  interp_pubkey_encoding_ok
@@ -3208,6 +3325,30 @@ interp_checkmultisig:
     mov   edx, 1
     jmp   .cms_finish
 .cms_fail:
+    ; BIP146 NULLFAIL first (Core's order: the sig loop, then NULLFAIL over the
+    ; still-present signatures, then the pops, then NULLDUMMY on the dummy).
+    mov   rax, [r12+56]
+    test  rax, SCRIPT_VERIFY_NULLFAIL
+    jz    .cms_nullfail_done
+    xor   ebx, ebx               ; j
+.cms_nullfail_loop:
+    cmp   ebx, [rsp+16]          ; nSigs
+    jge   .cms_nullfail_done
+    mov   ecx, [rsp+24]          ; nKeys
+    add   ecx, 3
+    add   ecx, ebx               ; k = nKeys+3+j (1-based from top)
+    mov   edx, [rsp+8]           ; sp
+    sub   edx, ecx               ; idx from the bottom
+    movsxd rdx, edx
+    mov   rdi, r12
+    add   rdi, 8
+    mov   rsi, [r12+0]
+    call  stack_elem_ptr
+    cmp   dword [rax], 0
+    jne   .err_nullfail
+    inc   ebx
+    jmp   .cms_nullfail_loop
+.cms_nullfail_done:
     cmp   qword [rsp+56], 0      ; deferred BIP147 NULLDUMMY (see the check above the loop)
     jne   .err_nulldummy
     mov   edx, 0
@@ -3279,6 +3420,22 @@ interp_checkmultisig:
 .err_pubkeytype:                     ; 2026-09-02: STRICTENC pubkey encoding (Core's CheckPubKeyEncoding per pair)
     mov   rax, [rbp-0x70]
     mov   qword [rax], SCRIPT_ERR_PUBKEYTYPE
+    jmp   .err_exit
+.err_highs:
+    mov   rax, [rbp-0x70]
+    mov   qword [rax], SCRIPT_ERR_SIG_HIGH_S
+    jmp   .err_exit
+.err_hashtype:
+    mov   rax, [rbp-0x70]
+    mov   qword [rax], SCRIPT_ERR_SIG_HASHTYPE
+    jmp   .err_exit
+.err_nullfail:
+    mov   rax, [rbp-0x70]
+    mov   qword [rax], SCRIPT_ERR_SIG_NULLFAIL
+    jmp   .err_exit
+.err_findanddelete:
+    mov   rax, [rbp-0x70]
+    mov   qword [rax], SCRIPT_ERR_SIG_FINDANDDELETE
     jmp   .err_exit
 .err_exit:
     xor   eax, eax
