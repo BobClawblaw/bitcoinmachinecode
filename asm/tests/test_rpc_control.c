@@ -148,7 +148,12 @@ int main(void){
           rj_val* p2 = rj_parse("[]", 2);
           rpc_dispatch(line, p2, &w, &r2, &e2, &m2);
           rj_free(p2); rj_free(r2);
-          if (e2 == -32601){
+          if (e2 == -32601 && m2 && strstr(m2, "Private broadcast is not enabled")){
+              /* Core answers RPC_METHOD_NOT_FOUND with exactly this text for
+               * getprivatebroadcastinfo/abortprivatebroadcast when the option
+               * is off (rpc/mempool.cpp); the method IS wired */
+              printf("      (refuses like Core with RPC_METHOD_NOT_FOUND while -privatebroadcast is off: %s)\n", line);
+          } else if (e2 == -32601){
               printf("      (advertised but UNHANDLED: %s)\n", line);
               bad++;
           }
