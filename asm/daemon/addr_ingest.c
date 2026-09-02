@@ -45,7 +45,10 @@ extern unsigned net_netgroup_v4(unsigned ip);           /* daemon/net_policy.c *
 #define AI_MAX_PER_NETGROUP 16
 
 typedef struct { unsigned ng[AI_MAX_PER_RESPONSE]; int cnt[AI_MAX_PER_RESPONSE]; int n; int taken;
-                 long limit; /* > 0: consider at most this many records (caller's token budget) */ } ai_quota_t;
+                 long limit; /* > 0: consider at most this many records (caller's token budget) */
+                 int* viol;  /* audit 2026-09-02 N3: set to 1 when the payload is a protocol violation
+                              * (malformed, or a count above MAX_ADDR_TO_SEND); NULL = nobody asked */ } ai_quota_t;
+#define AI_VIOL(q) do { if ((q)->viol) *(q)->viol = 1; } while (0)
 
 
 static void ai_u32(unsigned char*p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24;}
@@ -102,7 +105,10 @@ static long ai_ingest_one(ab2_t* b, const bmc_addr_t* a, unsigned long long svc,
  * the IPv4 from the wrong offset and fabricated addresses from timestamps. */
 static long ai_ingest_addr1(void* unused, const unsigned char* pl, long plen, ai_quota_t* q){
     (void)unused;
-    long cnt = p2p_addr_count(pl, plen); if(cnt<=0) return 0;
+    long cnt = p2p_addr_count(pl, plen);
+    if(cnt < 0){ AI_VIOL(q); return 0; }                  /* count does not fit the payload: malformed */
+    if(cnt == 0) return 0;
+    if(cnt > 1000){ AI_VIOL(q); return 0; }               /* Core: MAX_ADDR_TO_SEND, misbehaving */
     long base = (pl[0]<0xfd)?1:(pl[0]==0xfd?3:(pl[0]==0xfe?5:9));
     ab2_t* b = addr_book(); if(!b) return 0;
     long added=0;
@@ -121,15 +127,15 @@ static long ai_ingest_addrv2(void* unused, const unsigned char* pl, long plen, a
     (void)unused;
     if(plen < 1) return 0;
     unsigned long long pos = 0, cnt = 0;
-    if(!ai_compact(pl, plen, &pos, &cnt)) return 0;
-    if(cnt > 1000) return 0;                              /* Core: MAX_ADDR_TO_SEND, misbehaving */
+    if(!ai_compact(pl, plen, &pos, &cnt)){ AI_VIOL(q); return 0; }   /* truncated count: malformed */
+    if(cnt > 1000){ AI_VIOL(q); return 0; }               /* Core: MAX_ADDR_TO_SEND, misbehaving */
     ab2_t* b = addr_book(); if(!b) return 0;
     long added = 0;
     for(unsigned long long k=0; k<cnt && (long)pos < plen; k++){
         if(q->limit > 0 && (long)k >= q->limit) break;   /* token budget exhausted */
         bmc_addr_t a; unsigned long long svc; unsigned tm; long used = 0;
         long r = bmc_addr_decode_v2(&a, &svc, &tm, pl + pos, plen - (long)pos, &used);
-        if(r == -1) break;                                /* malformed: stop */
+        if(r == -1){ AI_VIOL(q); break; }                 /* malformed record: violation, stop */
         pos += (unsigned long long)used;
         if(r == -2) continue;                             /* unknown network: skipped */
         added += ai_ingest_one(b, &a, svc, tm, q);
@@ -140,15 +146,19 @@ static long ai_ingest_addrv2(void* unused, const unsigned char* pl, long plen, a
  * `limit` records (0 = all; the caller's token budget). Public so the parsers
  * can be tested on Core's own bytes and so the outbound legs
  * (daemon/tx_relay.c) share them. The `ab` argument is legacy and ignored. */
-long addr_ingest_msg_n(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit){
+long addr_ingest_msg_v(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit, int* viol){
     (void)ab;
-    ai_quota_t quota; memset(&quota,0,sizeof quota); quota.limit = limit;
+    ai_quota_t quota; memset(&quota,0,sizeof quota); quota.limit = limit; quota.viol = viol;
+    if(viol) *viol = 0;
     if(!strncmp(cmd,"addrv2",6)) return ai_ingest_addrv2(NULL, pl, plen, &quota);
     if(!strncmp(cmd,"addr",4))   return ai_ingest_addr1(NULL, pl, plen, &quota);
     return 0;
 }
+long addr_ingest_msg_n(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit){
+    return addr_ingest_msg_v(ab, cmd, pl, plen, limit, NULL);
+}
 long addr_ingest_msg(void* ab, const char* cmd, const unsigned char* pl, long plen){
-    return addr_ingest_msg_n(ab, cmd, pl, plen, 0);
+    return addr_ingest_msg_v(ab, cmd, pl, plen, 0, NULL);
 }
 
 /* Connect, handshake, send getaddr, and fold replies into `ab` for up to
