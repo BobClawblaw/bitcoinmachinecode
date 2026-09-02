@@ -24,8 +24,13 @@ t0=$(date +%s); ( cd src/asm && make -s daemon/bitcoind daemon/bitcoin_cli ) > b
 ph "BUILD done $(( $(date +%s)-t0 ))s warnings=$(grep -c warning build.log)"
 # 3. configuration -- the sample, plus the three things a second node on one box must set
 mkdir -p data
-cp src/config/bitcoin.sample.conf src/config/bitcoin.conf
-cat >> src/config/bitcoin.conf <<CONF
+# README: the daemon reads <datadir>/bitcoin.conf, then <datadir>/../config/bitcoin.conf.
+# The quick start's `cp config/bitcoin.sample.conf config/bitcoin.conf` only
+# works when the datadir is <repo>/data; ours is elsewhere, so the file goes
+# to the first location. (Run 1 of this test put it in the repo and the daemon
+# silently ran on compiled defaults -- the README now says so explicitly.)
+cp src/config/bitcoin.sample.conf data/bitcoin.conf
+cat >> data/bitcoin.conf <<CONF
 
 # fresh-install acceptance test $(ts): a second node on the same box
 port=$P2P
@@ -38,6 +43,8 @@ ph "START daemon"
 setsid nohup nice -n 10 ionice -c3 src/asm/daemon/bitcoind serve "$DEST/data" > console.log 2>&1 < /dev/null &
 echo $! > daemon.pid; sleep 5
 kill -0 "$(cat daemon.pid)" 2>/dev/null || { ph "FAIL daemon exited at once (console.log)"; echo FAIL > RESULT; exit 1; }
+grep -q "no config file" console.log && { ph "FAIL the daemon did not find the configuration (see console.log)"; kill "$(cat daemon.pid)"; echo FAIL > RESULT; exit 1; }
+ph "DAEMON pid=$(cat daemon.pid) $(grep -m1 '\[config\] net' console.log | sed 's/.*net  : //')"
 # 5. monitor until the tip, then judge
 CLI="src/asm/daemon/bitcoin_cli -datadir=$DEST/data"
 last_phase=""
