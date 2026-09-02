@@ -630,3 +630,21 @@ Outside the chain directory: `<datadir>/bitcoin.conf` or
   with the reason (`[config] <key>= is a Bitcoin Core option that has NO
   EFFECT here: ...`); the full classification of all 181 Core options is in
   `docs/FEATURE_GAPS.md`.
+
+## Decrypting a wallet by hand (no passphrase on disk)
+
+Nothing needs a `.pass` file or `BMC_WALLET_PASS` any more; both still work
+and take precedence when present.
+
+- `wallet_cli getaddress|getprivkey|load [...]` on an encrypted wallet with
+  no passphrase supplied **asks for it** on the terminal with echo off (via
+  `/dev/tty`, so redirecting stdout is fine). With stdin not a terminal it
+  reads one line from stdin instead: `printf '%s\n' "$PASS" | wallet_cli getaddress`.
+- `wallet_cli init` with no passphrase argument asks twice; a passphrase
+  entered this way is **not** written to a `.pass` file. Enter nothing for a
+  plaintext wallet, as before.
+- The RPC client follows Core: `bitcoin_cli -stdinwalletpassphrase
+  walletpassphrase 60` reads the passphrase as the first line of stdin (echo
+  off on a terminal) and sends it as the first parameter, so it never appears
+  in `ps` or the shell history; `-stdin` reads the remaining parameters one
+  per line.
