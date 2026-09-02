@@ -1612,3 +1612,19 @@ pinned in `tests/test_interp_core_vectors` so the gate does not need Core.
 Not yet covered by the generator: tapscript (sigversion 3, needs execution
 data on both sides) and real signatures (the checker fails every signature on
 both sides by construction). Those are the next extension.
+
+## Update 2026-09-02 — the differential now covers real signatures and taproot
+
+`tests/fuzz_verify_diff` (manual) compares our whole-input verification --
+the exact `sv_verify_script` / `sv_verify_witness_v0` / `taproot_verify_input`
+calls `daemon/tx_verify.c` makes -- against Core's `VerifyScript`, on random
+transactions whose signatures Core itself produces (ECDSA over legacy and
+BIP143 sighashes, Schnorr over BIP341 key-path and BIP342 script-path
+sighashes with annexes, code separators and two-leaf trees). Verdicts never
+disagreed; error codes under the standard policy flags did, which is how
+NULLFAIL, LOW_S, the STRICTENC hashtype rule and CONST_SCRIPTCODE arrived in
+the interpreter. 63,000 whole-input cases and 400,000 more EvalScript cases
+now match exactly. `tests/test_verify_core_vectors` keeps 71 of the Core-signed
+spends in the gate. Not covered: tapscript at the EvalScript level with
+execution data (the whole-input path covers it end to end instead), and
+MuSig2/PSBT flows (a different layer).

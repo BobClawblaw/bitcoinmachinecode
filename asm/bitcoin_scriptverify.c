@@ -113,6 +113,13 @@ struct sv_ctx {
     uint32_t tx_locktime; uint32_t in_sequence; uint32_t tx_version;
     uint64_t amount;               /* prevout value -- BIP143 sighash input (witness v0 only) */
 };
+/* The script flags of the run in progress, for the checker (CONST_SCRIPTCODE,
+ * 2026-09-02). Thread-local rather than a new sv_ctx field: several tests
+ * mirror struct sv_ctx with their own copy of the layout, and a field
+ * appended here would be written past the end of theirs. */
+static __thread uint64_t sv_tls_flags;
+#define SV_CONST_SCRIPTCODE (1ULL<<16)
+#define SV_CB_ERR_FINDANDDELETE ((uint64_t)-5)   /* callback -> interpreter: SCRIPT_ERR_SIG_FINDANDDELETE */
 extern long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
                               int64_t n_in, uint32_t nHashType, uint64_t amount,
                               const uint8_t* scriptCode, uint64_t scriptcode_len,
@@ -171,6 +178,19 @@ static uint64_t sv_checksig(void* cptr, const uint8_t* sig, size_t siglen,
                             const uint8_t* pub, size_t publen, const void* slice){
     struct sv_ctx* c = (struct sv_ctx*)cptr;
     const struct { const uint8_t* p; size_t n; }* sc = slice;
+    /* Core order (EvalChecksigPreTapscript): FindAndDelete of the signature
+     * from the scriptCode happens BEFORE the empty-signature shortcut, and
+     * under SCRIPT_VERIFY_CONST_SCRIPTCODE finding it is a hard error
+     * (SIG_FINDANDDELETE) -- also for an empty signature, whose push (OP_0)
+     * can legitimately occur in a scriptCode. 2026-09-02, Core differential. */
+    if (sv_tls_flags & SV_CONST_SCRIPTCODE){
+        uint8_t nd[600]; long long nl = siglen ? script_push_encode(nd, sizeof nd, sig, (unsigned long)siglen) : (nd[0] = 0x00, 1);   /* CScript() << empty = OP_0 */
+        static __thread uint8_t* scX; BMC_TLS_BUF(scX, 10008);
+        if (nl > 0 && sc->n <= 10000){
+            long long xl = script_find_and_delete(scX, 10008, sc->p, sc->n, nd, (unsigned long)nl);
+            if (xl >= 0 && (size_t)xl < sc->n) return SV_CB_ERR_FINDANDDELETE;
+        }
+    }
     if (!siglen) return 0;                       /* empty sig: fail, not error */
 
     /* BUG FIX (2026-08-19): this used to reject any hashtype whose low 5
@@ -281,6 +301,7 @@ int sv_run_v(const uint8_t* script, size_t slen, sv_stack* st,
     s.flags      = flags;
     s.work       = scratch; s.work_cap = 1<<16;
     s.error_out  = &e;
+    sv_tls_flags   = flags;
     s.checksig_ctx = ctx;
     s.checksig_fn  = cs;
     s.tx_locktime  = ctx->tx_locktime;
