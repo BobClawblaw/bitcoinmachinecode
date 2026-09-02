@@ -1597,3 +1597,18 @@ warning sites hid four real defects, one of them consensus-relevant: the
 CHECKSEQUENCEVERIFY disable-flag test used a sign-extended immediate and
 turned enforced 5-byte operands into NOPs (`tests/test_csv_disable_flag`).
 Details in `worklog/2026-09-02.md`.
+
+## Update 2026-09-02 — randomized script differential against Core (audit §6.9): DONE, and it paid
+
+`tests/fuzz_script_diff` (manual; needs `validation/build_core_oracle.sh`
+to build Core's `EvalScript` as a line oracle) compares verdict, error code
+and the entire final stack on random scripts. The first 20,000 cases found
+728 divergences; all traced to five root causes in the interpreter, every
+one of them a policy-flag behaviour (MINIMALDATA scriptnum encoding, MINIMALIF
+error code, the 0x81 push rule, STRICTENC pubkey encoding, NULLDUMMY
+precedence) -- mempool/relay parity, never block validation. After the fixes:
+1.62 million cases over four seeds, zero mismatches. Seventeen vectors are
+pinned in `tests/test_interp_core_vectors` so the gate does not need Core.
+Not yet covered by the generator: tapscript (sigversion 3, needs execution
+data on both sides) and real signatures (the checker fails every signature on
+both sides by construction). Those are the next extension.

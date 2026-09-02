@@ -416,3 +416,6 @@ config/bitcoin.regtest.conf
 asm/daemon/build_txospender_index
 asm/daemon/utxo_dump_keys
 asm/daemon/utxo_repair_del
+
+# built from the scratch Core tree by validation/build_core_oracle.sh; never committed
+validation/core_script_oracle
