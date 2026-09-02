@@ -1550,3 +1550,15 @@ with a `[wallet] … upgraded legacy …` line. `tests/test_wallet_store` proves
 it against genuine legacy fixtures written by the pre-change code:
 right/wrong passphrase, the in-place upgrade, the second open through the
 strong path, the secret blob likewise, and that no `.tmp` is left behind.
+
+## Update 2026-09-02 — audit N3/N5/N6/N7/N11 remediation
+
+See the remediation record at the end of `docs/audits/SECURITY_AUDIT_2026-09-02.md`.
+In short: three more misbehaviour classes are scored (parse failures, never
+policy or consensus rejects -- the self-partition argument is in the asm
+comment at `.do_block`); the service runs under a systemd sandbox with core
+dumps off; log rotation actually works now (it never had) and runs as the
+service user from a root-owned config; the build's hardening is explicit and
+every shipped tool is linked `BIND_NOW`; `-Werror` is blocked by 433 existing
+warnings (209 incompatible-pointer-types) -- **open item: a warning-cleanup
+pass, then `-Werror`**.
