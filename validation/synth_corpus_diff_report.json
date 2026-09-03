@@ -1,8 +1,8 @@
 {
- "cases": 74,
- "accept_ok": 74,
- "muts": 95,
- "mut_agree": 95,
+ "cases": 79,
+ "accept_ok": 79,
+ "muts": 96,
+ "mut_agree": 96,
  "accept_div": [],
  "mut_div": [],
  "false_accept": [],
@@ -148,6 +148,31 @@
   "sighash-legacy-SINGLE-bug": {
    "accept": 1,
    "mut_ok": 2,
+   "div": 0
+  },
+  "sighash-v0-SINGLE-bug": {
+   "accept": 1,
+   "mut_ok": 1,
+   "div": 0
+  },
+  "sighash-taproot-SINGLE-bug": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "limit/p2wsh witnessScript 521 bytes (over the P2SH cap) is legal": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "limit/p2wsh witnessScript exactly 10000 bytes is legal": {
+   "accept": 1,
+   "mut_ok": 0,
+   "div": 0
+  },
+  "limit/p2wsh witnessScript 10001 bytes is rejected": {
+   "accept": 1,
+   "mut_ok": 0,
    "div": 0
   },
   "opsuccess/80 alone": {
