@@ -1849,6 +1849,75 @@ static const wscan_key* wop_rec_key(const wscan_key* keys, int nk, const wscan_r
     return NULL;
 }
 
+/* getaddressinfo's wallet-context fields, real rather than hardcoded stubs
+ * (audit finding, 2026-09-03: ismine/iswatchonly/ischange were always
+ * false and pubkey always empty, regardless of the actual wallet).
+ *
+ * Reuses the SAME key window listunspent/rescan already search
+ * (wop_keyset_cached), rather than re-deriving with a hand-rolled gap
+ * limit that could silently disagree with the wallet's own policy. Which
+ * keyset that function returns already encodes ismine vs iswatchonly:
+ * a seed-holding wallet (w->seed set) gets the spendable HD window, so a
+ * match there means we can sign for it; a seed-less wallet with imported
+ * watch-only descriptors gets wop_watch_keyset's window instead, so a
+ * match there means we track it but cannot sign.
+ *
+ * A key is identified by its own scriptPubKey (h20, from
+ * wscan_spk_h160 -- the SAME 20-byte identity the block scanner matches
+ * on: full hash160 for pkh/wpkh/sh, the first 20 bytes of Q for tr), then
+ * CONFIRMED by re-deriving that candidate's own scriptPubKey and comparing
+ * it byte for byte against the query -- catching the case a 160-bit prefix
+ * happens to collide between two different address types, which
+ * wscan_spk_h160's own comment already calls out as a real (if
+ * astronomically unlikely) risk for imported descriptors. */
+int rpc_wops_address_ownership(const rpc_wallet* w, const unsigned char* spk, unsigned long spklen,
+                               int* is_mine_out, int* is_watchonly_out, int* is_change_out,
+                               unsigned char pubkey_out[33], int* has_pubkey_out){
+    *is_mine_out = 0; *is_watchonly_out = 0; *is_change_out = 0; *has_pubkey_out = 0;
+    const unsigned char* h20;
+    if (!wscan_spk_h160(spk, spklen, &h20)) return 1;   /* not an address shape we track ownership for at all */
+    const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
+    if (nk <= 0) return 1;
+    int spending = (w && w->seed) ? 1 : 0;
+    for (int i = 0; i < nk; i++){
+        if (memcmp(keys[i].h160, h20, 20) != 0) continue;
+        /* Re-derive this candidate's OWN scriptPubKey and pubkey by the same
+         * single path wop_key_address uses for every type -- hash-based
+         * (pkh/sh(wpkh)/wpkh) and taproot alike -- rather than hand-building
+         * three encodings and treating taproot separately. That uniformity
+         * is what makes the confirmation below meaningful for taproot too:
+         * the fast match above is only a 20-byte PREFIX of a 32-byte
+         * program (wscan_spk_h160's own doc comment says so), so without
+         * re-deriving the full key here a prefix collision could report
+         * ownership of the wrong key. Watch-only imported keys (hdkey != 0
+         * has no meaning there; imports have no seed to derive from at all)
+         * are confirmed by the fast match alone, exactly as the block
+         * scanner already trusts it for finding their coins. */
+        int t = WOT_TYPE(keys[i].branch);
+        int confirmed = 1;
+        unsigned char pub[33]; int have_pub = 0;
+        if (spending && keys[i].hdkey == 0){
+            unsigned path[5]; rpc_wops_type_path(t, keys[i].keyidx, WOT_CHAIN(keys[i].branch), path);
+            unsigned char kk[32], cc[32], cand_spk[34], h20b[20]; unsigned long cand_sl;
+            confirmed = 0;
+            if (bip32_derive_path(kk, cc, w->seed, 64, path, 5) == 1){
+                scalar_to_pubkey(pub, kk); have_pub = 1;
+                if (rpc_wops_type_spk(t, pub, cand_spk, &cand_sl, h20b) &&
+                    cand_sl == spklen && !memcmp(cand_spk, spk, spklen)) confirmed = 1;
+            }
+        }
+        if (!confirmed) continue;
+        *is_mine_out      = spending;
+        *is_watchonly_out = !spending;
+        *is_change_out    = WOT_CHAIN(keys[i].branch);
+        if (spending && have_pub && t == WOT_LEGACY){
+            memcpy(pubkey_out, pub, 33); *has_pubkey_out = 1;
+        }
+        return 1;
+    }
+    return 1;
+}
+
 #define WOP_MAXREC 200000
 static wscan_rec* g_wop_recs;
 static long g_wop_nrec = -1;

@@ -326,4 +326,10 @@ void node_config_set_conf_path(const char* path);
  * warn instead of silently accepting it. */
 int nodecfg_unimplemented(const char* key);
 
+/* getnetworkinfo's per-network proxy fields (rpc_node.c), exported narrowly
+ * rather than exposing g_cfg itself to callers that link this file only
+ * weakly -- see the definition in node_config.c for why. */
+void node_config_get_proxy_info(const char** proxy, const char** onion_proxy,
+                                const char** i2psam, int* proxyrandomize);
+
 #endif
