@@ -289,6 +289,11 @@ interp_err: resq 1
 ; 0xffffffff if none (tapscript sighash field); only set meaningfully under
 ; SIGVERSION_TAPSCRIPT -- legacy checksig_fn readers look at p/n only.
 interp_slice: resq 3
+; SCR-3 (audit 2026-09-03): the script_state pointer of the running
+; script_eval, so the checksig helpers (which have their own frames and
+; their own r12) can gate the tapscript empty-pubkey rule on sigversion.
+global interp_state
+interp_state: resq 1
 
 section .text
 
@@ -366,6 +371,15 @@ script_eval:
                               ; All locals here are rbp-relative, so growing the
                               ;   reservation by 8 moves no operand.
     mov   r12, rdi            ; state
+    ; SCR-3: interp_checksig/_add run in their own frames (their own r12); the
+    ; tapscript empty-pubkey rule gates on sigversion, so stash the state
+    ; pointer in a per-thread slot they can reach. Written straight through
+    ; rax -- no frame slot and no frame resize: the prologue's local map ends
+    ; at -0xB0 and the frame size is ABI-frozen (see the notes above).
+    ; script_eval is non-reentrant, so one slot per thread is exactly as safe
+    ; as interp_slice below.
+    TLS_ADDR rax, interp_state
+    mov   [rax], rdi
 
     ; per-thread scratch addresses, computed once (see file-header note
     ; above script_eval and the TLS_ADDR macro) -- unused-but-reserved
@@ -821,11 +835,22 @@ script_eval:
 .if_ni:
     mov   rdi, r14
     call  vfexec_push
+    test  rax, rax
+    jz    .vfexec_full           ; SCR-2: condition stack cannot grow further
     jmp   .next_op
 .if_notexec:
     xor   edi, edi
     call  vfexec_push
+    test  rax, rax
+    jz    .vfexec_full
     jmp   .next_op
+.vfexec_full:
+    ; Unreachable for any script that fits the 4 MiB block-witness limit (the
+    ; condition stack is sized for 5 MiB of OP_IF). If it ever trips, the
+    ; correct response is a hard script error, never a silent continue -- the
+    ; pre-fix overflow of vfexec into vfexec_sp produced exactly that.
+    mov   rax, SCRIPT_ERR_UNKNOWN_ERROR
+    jmp   .err_ret0
 
 .op_else:
     call  vfexec_depth
@@ -2336,7 +2361,11 @@ script_eval:
     mov   r15, rax                     ; r15 = scriptSequence
     mov   eax, [r12+112]               ; tx_version (u32)
     cmp   eax, 2
-    jl    .csv_unsatisfied             ; BIP68 requires tx.nVersion >= 2
+    ; SCR-4 fix (audit 2026-09-03): CTransaction::version is uint32_t and
+    ; CheckSequence does `txTo->version < 2` UNSIGNED (interpreter.cpp). A
+    ; transaction with nVersion >= 0x80000000 HAS BIP68 enforced by Core; the
+    ; old `jl` read it as negative and false-rejected every CSV spend it.
+    jb    .csv_unsatisfied             ; BIP68 requires tx.nVersion >= 2
     mov   eax, [r12+108]               ; in_sequence (u32)
     test  eax, 0x80000000              ; this input's OWN disable flag
     jnz   .csv_unsatisfied
@@ -2367,8 +2396,23 @@ script_eval:
     jmp   .err_ret0
 
 .next_op:
+    ; SCR-1 fix (audit 2026-09-03): Core checks, AFTER EVERY OPCODE,
+    ; "if (stack.size() + altstack.size() > MAX_STACK_SIZE) return
+    ; SCRIPT_ERR_STACK_SIZE" (interpreter.cpp, end of the EvalScript for
+    ; body). The per-stack guards in stack_push et al. cap each stack at
+    ; 1000 INDEPENDENTLY, so a script could run with up to 2000 live
+    ; elements -- a consensus false accept under tapscript (no opcode
+    ; limit) and a false accept under witness v0 too. The buffers stay at
+    ; 1000 each (memory-safety backstop); the consensus rule is the sum.
+    mov   rax, [r12+8]        ; main_sp
+    add   rax, [r12+24]       ; + alt_sp
+    cmp   rax, MAX_STACK_SIZE
+    ja    .stack_size_err
     inc   qword [rbp-0x30]
     jmp   .loop
+.stack_size_err:
+    mov   rax, SCRIPT_ERR_STACK_SIZE
+    jmp   .err_ret0
 
 .loop_done:
     call  vfexec_depth
@@ -2778,6 +2822,7 @@ interp_pubkey_encoding_ok:
 
 ; interp_checksig() -> rax = 0/1, or -1 = SCRIPT_ERR_SIG_DER (bad encoding is a
 ;                      hard script ERROR in Core, not a false CHECKSIG result)
+;                      ; -5 = SCRIPT_ERR_TAPSCRIPT_EMPTY_PUBKEY (SCR-3)
 ;                      ; sig = sp-2, pub = sp-1
 interp_checksig:
     push  r12
@@ -2796,6 +2841,18 @@ interp_checksig:
     call  stack_second_ptr
     mov   r13, rax            ; sig elem
     mov   ebx, [r13]          ; siglen (32-bit elem length; was rbx[8])
+    ; ---- SCR-3 (audit 2026-09-03): under SIGVERSION_TAPSCRIPT the ENTIRE
+    ; pre-tapscript arm is wrong (Core routes tapscript through
+    ; EvalChecksigTapscript): no sig-encoding checks, no pubkey-encoding
+    ; checks -- and no empty-signature shortcut before the pubkey rules.
+    ; Gate straight into the callback, which implements Core's sequence
+    ; (weight charge only for a non-empty sig; publen == 0 -> hard fail
+    ; REGARDLESS of the signature; publen != 32 -> upgradable success).
+    TLS_ADDR rax, interp_state
+    mov   rax, [rax]
+    mov   eax, dword [rax+48]
+    cmp   rax, SIGVERSION_TAPSCRIPT
+    je    .cs_call
     ; ---- BIP66/DERSIG. Core runs CheckSignatureEncoding at the TOP of
     ; EvalChecksigPreTapscript, before any hashing or ECDSA work, and its
     ; failure aborts the whole script (SCRIPT_ERR_SIG_DER) rather than making
@@ -2874,6 +2931,9 @@ interp_checksig:
     ret
 
 ; interp_checksig_add() -> rax = 0/1 ; sig = sp-3, pub = sp-1 (tapscript CHECKSIGADD)
+;   (interp_checksig_add is reached ONLY from .op_checksigadd, which is
+;   BAD_OPCODE outside tapscript -- so r12+48 is SIGVERSION_TAPSCRIPT here by
+;   construction, and the sigversion is read straight from r12.)
 interp_checksig_add:
     push  r12
     push  r13
@@ -2892,8 +2952,12 @@ interp_checksig_add:
     call  stack_third_ptr
     mov   r13, rax
     mov   ebx, [r13]          ; siglen (32-bit elem length; was rbx[8])
-    test  rbx, rbx
-    jz    .false
+    ; SCR-3 (audit 2026-09-03): the empty-signature shortcut must NOT skip
+    ; the callback under tapscript -- Core's EvalChecksigTapscript evaluates
+    ; the pubkey rules regardless of the signature, and an empty pubkey is a
+    ; hard script failure (TAPSCRIPT_EMPTY_PUBKEY), not a pushed 0. The C
+    ; callback implements Core's full sequence (weight charge only for a
+    ; non-empty sig; publen==0 -> hard fail; publen!=32 -> upgradable).
     mov   rax, [r12+96]
     test  rax, rax
     jz    .false

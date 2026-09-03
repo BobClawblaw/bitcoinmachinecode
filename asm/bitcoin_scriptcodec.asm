@@ -42,9 +42,19 @@ global scriptnum_buf
 global snum_overflow
 snum_overflow: resq 1
 
-; vfExec condition stack
+; vfExec condition stack.
+; CORE HAS NO NESTING LIMIT UNDER TAPSCRIPT: there is no opcode limit and no
+; script-size limit for a tapscript leaf, so OP_IF nesting can run to one
+; conditional per script byte. A 1 MiB leaf therefore needs 1,048,576 slots;
+; the old 1024-byte buffer overflowed into vfexec_sp itself on the 1025th
+; nested OP_IF -- an attacker-controlled out-of-bounds write from P2P input
+; AND a false accept of an unbalanced script (audit SCR-2, 2026-09-03). The
+; buffer now covers 5 MiB of script bytes (a leaf cannot exceed the 4 MiB
+; block witness limit, so no validly-framed script can reach the cap) and
+; vfexec_push enforces it.
 alignb 16                 ; alignb, not align: this is .tbss, padding bytes cannot be "initialized" (nasm -w+other)
-vfexec:     resb 1024
+VFEXEC_MAX equ 5*1024*1024
+vfexec:     resb VFEXEC_MAX
 vfexec_sp:  resq 1
 global vfexec, vfexec_sp
 
@@ -723,15 +733,29 @@ get_op:
 ; vfexec helpers (condition stack, static)
 ; ============================================================================
 ; vfexec_push(value in edi) -- push a 0/1
+;   SCR-2 fix (audit 2026-09-03): the push is now bounded. The buffer covers
+;   every nesting depth a script that fits in a block can express, so hitting
+;   the cap means the script is malformed; fail the push (rax=0) and let the
+;   interpreter treat it as an internal error rather than scribbling past
+;   vfexec into vfexec_sp.
 global vfexec_push
 vfexec_push:
     push  rdx
     push  r8
     TLS_ADDR r8, vfexec_sp
     mov   rcx, [r8]
+    cmp   rcx, VFEXEC_MAX
+    jae   .full
     TLS_ADDR rdx, vfexec
     mov   [rdx+rcx], dil
     inc   qword [r8]
+    xor   eax, eax
+    inc   rax
+    pop   r8
+    pop   rdx
+    ret
+.full:
+    xor   eax, eax                ; 0 = refused (caller must fail the script)
     pop   r8
     pop   rdx
     ret
