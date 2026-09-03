@@ -2777,6 +2777,11 @@ static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
  * so all 512 were covered in 0.49s -- so there is no reason to sample. */
 #define DLC_MAXPOOL 2048
 #define DLC_HDR_TRY_PEERS 8
+/* Connect-phase deadline for dlc_headers_try, in ms -- the probe round's own
+ * per-round budget (wait_ms at the dl_bootstrap call site). The phase dials
+ * peers that were confirmed live seconds ago; one that has since gone silent
+ * must cost this, not the kernel's SYN-retry clock. */
+#define DLC_HDR_CONNECT_MS 8000
 /* wall-clock budget for ONE chunk transfer. At DLC_CHUNK_BLOCKS=40
  * (~50-60MB near the real tip), 120s requires ~467KB/s sustained to
  * survive -- similar bar to the old 480s/200-block combo, but the
@@ -3061,8 +3066,34 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
     int pport = 0; unsigned ip = 0;
     if(!dlc_parse_peer(cand, &ip, &pport)){ *why = DLC_HT_PARSE; return -1; }
     int cport = pport ? pport : node_config_peer_port(cand);
-    int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cport ? cport : g_chainp->default_port)));
+    /* 2026-09-03, boot archive-gap: this was the PLAIN blocking tcp_connect_ip
+     * -- no connect-phase timeout -- and the phase's own silence (31-66s of
+     * nothing between "confirmed-live peer(s)" and "headers: already current",
+     * five boots in a row varying 7x: 20s/148s/86s/50s/20s) was peers that
+     * confirmed live during the probe round but dropped-SYN'd by the time the
+     * header phase dialed them, each burning the kernel's SYN-retry clock
+     * (default tcp_syn_retries=6, ~127s worst case) before failing over. The
+     * first peer that actually completes answers "already current", so the
+     * phase ALWAYS finishes -- the variance was how many dead dials stood in
+     * line ahead of it. Bounded exactly the way dlc_probe_round already dials:
+     * non-blocking connect + POLLOUT deadline, then back to blocking for the
+     * handshake/fetch below (they assume blocking reads under SO_RCVTIMEO). */
+    int fd=socket(AF_INET,SOCK_STREAM,0);
     if(fd<0){ *why = DLC_HT_CONNECT; return -1; }
+    int fl=fcntl(fd,F_GETFL,0); fcntl(fd,F_SETFL,fl|O_NONBLOCK);
+    struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET;
+    sa.sin_addr.s_addr=ip;
+    sa.sin_port=(unsigned short)htons((unsigned short)(cport ? cport : g_chainp->default_port));
+    if(connect(fd,(struct sockaddr*)&sa,sizeof sa)!=0 && errno!=EINPROGRESS){
+        close(fd); *why = DLC_HT_CONNECT; return -1;
+    }
+    struct pollfd pf; pf.fd=fd; pf.events=POLLOUT; pf.revents=0;
+    if(poll(&pf,1,DLC_HDR_CONNECT_MS)<=0){ close(fd); *why = DLC_HT_CONNECT; return -1; }
+    int soerr=0; socklen_t slen=sizeof soerr;
+    if(getsockopt(fd,SOL_SOCKET,SO_ERROR,&soerr,&slen)!=0 || soerr!=0){
+        close(fd); *why = DLC_HT_CONNECT; return -1;
+    }
+    fl=fcntl(fd,F_GETFL,0); fcntl(fd,F_SETFL,fl & ~O_NONBLOCK);
     struct timeval tv; tv.tv_sec=15; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     bmc_v2_close(fd);      /* v1-only path; see the note at the other one */
     if(node_handshake(fd)!=1){ close(fd); *why = DLC_HT_HANDSHAKE; return -1; }
@@ -3075,10 +3106,14 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
 }
 
 /* live[] must already be confirmed-reachable (via dlc_probe_round below) --
- * dlc_headers_try's tcp_connect_ip() is a plain blocking connect with no
- * connect-phase timeout, so trying an UNCONFIRMED candidate here would carry
- * the same hang risk documented on dlc_worker; deliberately no fallback to
- * raw pool entries. */
+ * dlc_headers_try dials with the probe's own bounded connect (non-blocking +
+ * POLLOUT deadline, DLC_HDR_CONNECT_MS), so a candidate that confirmed live
+ * and then went silent costs 8s, not the kernel's SYN-retry clock. Trying an
+ * UNCONFIRMED raw-pool candidate here is still deliberately refused: each
+ * try also spends handshake + getheaders round trips, and an unconfirmed
+ * candidate has no evidence those will ever answer (the hang this bounded
+ * connect replaced was documented on dlc_worker, where a worker had to be
+ * SIGKILLed). */
 /* headers.dat is DERIVED from the archive: append the header of every stored
  * block the mirror lacks, from the blocks themselves. The worker's leg sync
  * stored blocks without touching the mirror, so every boot used to ask peers
