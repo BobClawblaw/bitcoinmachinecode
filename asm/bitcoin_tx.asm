@@ -88,9 +88,16 @@ tx_parse:
     mov  r12d, 1
     mov  r9,  r10
 .read_nin:
-
-    ; ---- varint n_in (inline CompactSize decode) ----
-    mov  eax, [r9]           ; first varint byte
+    ; VAL-8 (audit 2026-09-03): bound-check the first varint byte. The marker
+    ; fall-through above can land here with r9 == r11 (txlen == 4 exactly),
+    ; and the 0xfe/0xff branches read further with no bound either. Every
+    ; field read now checks width against end BEFORE the load, and decoded
+    ; counts/lengths are capped at Core's MAX_SIZE (0x02000000, serialize.h
+    ; ReadCompactSize range check) so the length application below cannot be
+    ; defeated by a wrapping 8-byte varint.
+    cmp  r9,  r11
+    jae  .fail
+    movzx eax, byte [r9]           ; first varint byte
     xor  ecx, ecx
     movzx ecx, al
     cmp  cl, 0xfd
@@ -124,6 +131,8 @@ tx_parse:
     mov  rcx, [r9+1]
     mov  r9,  r10
 .have_nin:
+    cmp  rcx, 0x02000000      ; MAX_SIZE (Core ReadCompactSize range_check:
+    ja   .fail                ; n > MAX_SIZE is invalid, n == MAX_SIZE legal)
     mov  [rdi+12], ecx       ; info.n_in
 
     ; ---- walk n_in inputs ----
@@ -148,8 +157,13 @@ tx_parse:
     ; r10 == (n_in read above). Save n_in in a slot.
     mov  r9,  rbx
     ; scriptlen varint (reuse inline decoder via a small loop segment)
-    ; read first varint byte into r15? We only have r10/rbx free-ish. Use rax.
-    mov  eax, [r9]
+    ; VAL-8: the first varint byte needs its own bound check (the prevout +
+    ; index checks above stop at r9+4 == end; the scriptlen byte may be the
+    ; byte AT end). The MAX_SIZE cap makes the script+seq application below
+    ; wrap-proof (r9 <= end <= base+4MB, len <= 32MB: no 64-bit wrap).
+    cmp  r9,  r11
+    jae  .fail
+    movzx eax, byte [r9]
     movzx eax, al
     cmp  eax, 0xfd
     jae  .sbig
@@ -181,6 +195,11 @@ tx_parse:
     mov  r15, [r9+1]
     mov  r9,  rbx
 .have_slen:
+    ; VAL-8: MAX_SIZE cap (the .sff branch reads a full 8 bytes -- an
+    ; uncapped length wraps r9+LEN past end and the check below reads low
+    ; instead of failing).
+    cmp  r15, 0x02000000
+    ja   .fail
     ; script bytes
     lea  rbx, [r9+r15]
     cmp  rbx, r11
@@ -213,7 +232,10 @@ tx_parse:
 .ins_done:
 
     ; ---- varint n_out ----
-    mov  eax, [r9]
+    ; VAL-8: bound-check the first byte (r9 can sit exactly at end here).
+    cmp  r9,  r11
+    jae  .fail
+    movzx eax, byte [r9]
     xor  ecx, ecx
     movzx ecx, al
     cmp  cl, 0xfd
@@ -245,6 +267,8 @@ tx_parse:
     mov  rcx, [r9+1]
     mov  r9,  rbx
 .have_nout:
+    cmp  rcx, 0x02000000      ; MAX_SIZE (Core ReadCompactSize range_check)
+    ja   .fail                ; n == MAX_SIZE legal
     mov  [rdi+16], ecx       ; info.n_out
 
     ; ---- walk n_out outputs ----
@@ -265,7 +289,11 @@ tx_parse:
     ja   .fail
     mov  r9,  rbx
     ; scriptlen varint
-    mov  eax, [r9]
+    ; VAL-8: bound-check the first byte (r9 can be exactly at end here; the
+    ; value(8) check above stops at r9+8 == end). MAX_SIZE cap below.
+    cmp  r9,  r11
+    jae  .fail
+    movzx eax, byte [r9]
     movzx eax, al
     cmp  eax, 0xfd
     jae  .pbv
@@ -297,6 +325,10 @@ tx_parse:
     mov  r15, [r9+1]
     mov  r9,  rbx
 .have_pslen:
+    ; VAL-8: MAX_SIZE cap (the .pff branch reads a full 8 bytes -- an
+    ; uncapped length wraps r9+LEN past end so the check reads low).
+    cmp  r15, 0x02000000
+    ja   .fail
     ; record output[0] script offset/len
     mov  eax, [rdi+16]
     cmp  r10d, eax
@@ -328,7 +360,7 @@ tx_parse:
     ; varint item count
     cmp  r9,  r11
     jae  .fail
-    mov  eax, [r9]
+    movzx eax, byte [r9]
     movzx eax, al
     cmp  eax, 0xfd
     jae  .witbig
@@ -360,13 +392,17 @@ tx_parse:
     mov  r15, [r9+1]
     mov  r9,  rbx
 .have_wit_items:
+    ; VAL-8: MAX_SIZE cap on the witness item count (a wrapping 8-byte count
+    ; would otherwise spin the walk loop; Core's ReadCompressedSize caps it).
+    cmp  r15, 0x02000000
+    ja   .fail
     ; walk the items: each is (varint len + bytes), length into rbx
 .next_wit_item:
     test r15, r15
     jz   .wit_in_done
     cmp  r9,  r11
     jae  .fail
-    mov  eax, [r9]
+    movzx eax, byte [r9]
     movzx eax, al
     cmp  eax, 0xfd
     jae  .wlb
@@ -398,6 +434,9 @@ tx_parse:
     mov  rdx, [r9+1]
     add  r9,  9
 .have_wlen:
+    ; VAL-8: MAX_SIZE cap on the witness item length before r9 += rdx.
+    cmp  rdx, 0x02000000
+    ja   .fail
     lea  rbx, [r9+rdx]       ; skip the item bytes
     cmp  rbx, r11
     ja   .fail
@@ -509,6 +548,15 @@ tx_txid:
 .have_cur:
 
     ; ---- varint n_in (r10d = n_in) ----
+    ; VAL-8 (audit 2026-09-03): same class as tx_parse -- every field read
+    ; now checks its width against r9 (end) BEFORE the load, and every
+    ; decoded count/length is capped at Core's MAX_SIZE (0x02000000) so the
+    ; `lea rbx,[r8+36+9]; add rbx,rdx; cmp rbx,r9` applications below can be
+    ; defeated by a wrapping 8-byte varint. (The audit's scenario: an
+    ; 0xff-varint scriptlen of -2^40 puts the reconstructed mid-copy cursor
+    ; 1 TiB BELOW the buffer -- an immediate SIGSEGV of the calling child.)
+    cmp  r8,  r9
+    jae  .fail
     movzx ecx, byte [r8]
     cmp  cl, 0xfd
     jae  .vbig
@@ -518,29 +566,48 @@ tx_txid:
 .vbig:
     cmp  cl, 0xfd
     jne  .vfe
+    lea  r10, [r8+3]
+    cmp  r10, r9
+    ja   .fail
     movzx r10d, word [r8+1]
     lea  r8,  [r8+3]
     jmp  .have_nin
 .vfe:
     cmp  cl, 0xfe
     jne  .vff
+    lea  r10, [r8+5]
+    cmp  r10, r9
+    ja   .fail
     mov  r10d, [r8+1]
     lea  r8,  [r8+5]
     jmp  .have_nin
 .vff:
+    lea  r10, [r8+9]
+    cmp  r10, r9
+    ja   .fail
     mov  r10,  [r8+1]
     lea  r8,  [r8+9]
 .have_nin:
+    cmp  r10, 0x02000000       ; MAX_SIZE (Core ReadCompactSize range_check)
+    ja   .fail                 ; n == MAX_SIZE legal
     mov  rcx, r10            ; counter = n_in
 .next_in:
     test rcx, rcx
     jz   .ins_done
     ; input: prevout(32) index(4) varint scriptlen script seq(4)
-    movzx eax, byte [r8+36]  ; scriptlen first byte (after 36 fixed bytes)
+    ; bound the 36 fixed bytes BEFORE peeking the scriptlen byte at +36
+    ; (the audit's SER-2 class: the old code read [r8+36] first, up to 3
+    ; bytes past end on a truncated buffer).
+    lea  r10, [r8+36]
+    cmp  r10, r9
+    ja   .fail
+    cmp  r10, r9
+    jae  .fail               ; need >=1 byte for the scriptlen varint
+    movzx eax, byte [r10]    ; scriptlen first byte
     cmp  eax, 0xfd
     jae  .sbig
     movzx edx, al
-    lea  rbx, [r8+36+1]
+    lea  rbx, [r10+1]
     lea  rbx, [rbx+rdx]
     lea  rbx, [rbx+4]
     cmp  rbx, r9
@@ -550,8 +617,11 @@ tx_txid:
 .sbig:
     cmp  eax, 0xfd
     jne  .sfe
-    movzx edx, word [r8+37]
-    lea  rbx, [r8+36+3]
+    lea  rdx, [r10+3]
+    cmp  rdx, r9
+    ja   .fail
+    movzx edx, word [r10+1]
+    lea  rbx, [r10+3]
     lea  rbx, [rbx+rdx]
     lea  rbx, [rbx+4]
     cmp  rbx, r9
@@ -561,8 +631,11 @@ tx_txid:
 .sfe:
     cmp  eax, 0xfe
     jne  .sff
-    mov  edx, [r8+37]
-    lea  rbx, [r8+36+5]
+    lea  rdx, [r10+5]
+    cmp  rdx, r9
+    ja   .fail
+    mov  edx, [r10+1]
+    lea  rbx, [r10+5]
     lea  rbx, [rbx+rdx]
     lea  rbx, [rbx+4]
     cmp  rbx, r9
@@ -570,8 +643,13 @@ tx_txid:
     mov  r8,  rbx
     jmp  .in_done
 .sff:
-    mov  rdx, [r8+37]
-    lea  rbx, [r8+36+9]
+    lea  rdx, [r10+9]
+    cmp  rdx, r9
+    ja   .fail
+    mov  rdx, [r10+1]
+    cmp  rdx, 0x02000000     ; MAX_SIZE: cap before r8 + 9 + LEN + 4
+    ja   .fail
+    lea  rbx, [r10+9]
     lea  rbx, [rbx+rdx]
     lea  rbx, [rbx+4]
     cmp  rbx, r9
@@ -583,6 +661,10 @@ tx_txid:
 .ins_done:
 
     ; ---- varint n_out (r10d = n_out) ----
+    ; VAL-8: bound-check the first byte, width-check the 0xfd/0xfe/0xff
+    ; payloads, cap the decoded count at MAX_SIZE.
+    cmp  r8,  r9
+    jae  .fail
     movzx ecx, byte [r8]
     cmp  cl, 0xfd
     jae  .ovbig
@@ -592,29 +674,50 @@ tx_txid:
 .ovbig:
     cmp  cl, 0xfd
     jne  .ofe
+    lea  r10, [r8+3]
+    cmp  r10, r9
+    ja   .fail
     movzx r10d, word [r8+1]
     lea  r8,  [r8+3]
     jmp  .have_nout
 .ofe:
     cmp  cl, 0xfe
     jne  .off
+    lea  r10, [r8+5]
+    cmp  r10, r9
+    ja   .fail
     mov  r10d, [r8+1]
     lea  r8,  [r8+5]
     jmp  .have_nout
 .off:
+    lea  r10, [r8+9]
+    cmp  r10, r9
+    ja   .fail
     mov  r10,  [r8+1]
     lea  r8,  [r8+9]
 .have_nout:
+    cmp  r10, 0x02000000
+    ja   .fail                 ; MAX_SIZE (n == MAX_SIZE legal)
     mov  rcx, r10            ; counter = n_out
 .next_out:
     test rcx, rcx
     jz   .outs_done
     ; output: value(8) varint scriptlen script
-    movzx eax, byte [r8+8]
+    ; bound value(8) BEFORE peeking the scriptlen byte at +8, then bound the
+    ; varint width. The old code peeked [r8+8] with no bound on the value
+    ; field (up to 7 bytes past end on a heap-tight buffer, and the 0xff
+    ; scriptlen branch below applied an UNCAPPED 8-byte length to the cursor
+    ; -- the wrapping-cursor class again).
+    lea  r10, [r8+8]
+    cmp  r10, r9
+    ja   .fail
+    cmp  r10, r9
+    jae  .fail               ; need >=1 byte for the scriptlen varint
+    movzx eax, byte [r10]
     cmp  eax, 0xfd
     jae  .pbig
     movzx edx, al
-    lea  rbx, [r8+8+1]
+    lea  rbx, [r10+1]
     lea  rbx, [rbx+rdx]
     cmp  rbx, r9
     ja   .fail
@@ -623,8 +726,11 @@ tx_txid:
 .pbig:
     cmp  eax, 0xfd
     jne  .pfe
-    movzx edx, word [r8+9]
-    lea  rbx, [r8+8+3]
+    lea  rdx, [r10+3]
+    cmp  rdx, r9
+    ja   .fail
+    movzx edx, word [r10+1]
+    lea  rbx, [r10+3]
     lea  rbx, [rbx+rdx]
     cmp  rbx, r9
     ja   .fail
@@ -633,16 +739,24 @@ tx_txid:
 .pfe:
     cmp  eax, 0xfe
     jne  .pff
-    mov  edx, [r8+9]
-    lea  rbx, [r8+8+5]
+    lea  rdx, [r10+5]
+    cmp  rdx, r9
+    ja   .fail
+    mov  edx, [r10+1]
+    lea  rbx, [r10+5]
     lea  rbx, [rbx+rdx]
     cmp  rbx, r9
     ja   .fail
     mov  r8,  rbx
     jmp  .out_done
 .pff:
-    mov  rdx, [r8+9]
-    lea  rbx, [r8+8+9]
+    lea  rdx, [r10+9]
+    cmp  rdx, r9
+    ja   .fail
+    mov  rdx, [r10+1]
+    cmp  rdx, 0x02000000     ; MAX_SIZE before r8 + 9 + LEN
+    ja   .fail
+    lea  rbx, [r10+9]
     lea  rbx, [rbx+rdx]
     cmp  rbx, r9
     ja   .fail
