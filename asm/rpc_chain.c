@@ -1932,11 +1932,50 @@ static int cmd_gettxoutproof(const rj_val* params, rj_val** res, long* ec, const
     if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_ARR){
         *ec = -8; *em = "Invalid parameter, expected array of txids"; return 0; }
     const rj_val* txarr = params->items[0];
-    /* blockhash is required (no txindex) */
-    if (!param_present(params, 1)){
-        *ec = -5; *em = "Transaction not found in specified block (a blockhash is required with no txindex)"; return 0; }
+    if (txarr->nitems < 1){ *ec = -8; *em = "Parameter 'txids' cannot be empty"; return 0; }
     refresh(); long h;
-    if (!lookup_block_param(params, 1, 1, &h, ec, em)) return 0;
+    if (param_present(params, 1)){
+        if (!lookup_block_param(params, 1, 1, &h, ec, em)) return 0;
+    } else {
+        /* No blockhash given. Core's own order: try the txid index (built
+         * offline, daemon/build_tx_index, or maintained live by
+         * daemon/tx_index_tail.c) on the FIRST requested txid -- exactly
+         * one lookup, since a proof only makes sense when every txid in the
+         * request lives in the SAME block, and the loop below already
+         * confirms that for the rest.
+         *
+         * This used to be an unconditional "-5, a blockhash is required
+         * with no txindex" -- true in 2026-08-21 when txindex did not
+         * exist, false since 2026-08-26 when it landed (audit finding,
+         * 2026-09-03: the stated REASON was wrong, not just the message). */
+        if (txarr->items[0]->typ != RJ_STR || strlen(txarr->items[0]->str) != 64){
+            *ec = -8; *em = "Invalid txid"; return 0; }
+        u8 first_disp[32];
+        for (int k = 0; k < 32; k++){
+            int hi = hex1(txarr->items[0]->str[k*2]), lo = hex1(txarr->items[0]->str[k*2+1]);
+            if (hi < 0 || lo < 0){ *ec = -8; *em = "Invalid txid"; return 0; }
+            first_disp[k] = (u8)(hi<<4|lo);
+        }
+        u8 first_wire[32]; for (int i = 0; i < 32; i++) first_wire[i] = first_disp[31-i];
+        long th; u32 toff, tlen;
+        if (txi_lookup(first_wire, &th, &toff, &tlen)){
+            (void)toff; (void)tlen; h = th;
+        } else {
+            txi_open();
+            if (g_txi){
+                static char nomsg[288];
+                long cov_to = g_txi_tail_maxh > g_txi_to ? g_txi_tail_maxh : g_txi_to;
+                snprintf(nomsg, sizeof nomsg,
+                         "Transaction not found in the txid index (covers heights %ld..%ld); "
+                         "if the transaction is outside that range, rebuild the index over it "
+                         "or pass the block hash.", g_txi_from, cov_to);
+                *ec = -5; *em = nomsg; return 0;
+            }
+            *ec = -5; *em = "No txid index built (daemon/build_tx_index) and no block hash given -- "
+                            "pass the block hash, or build the index to locate a confirmed "
+                            "transaction by txid alone."; return 0;
+        }
+    }
 
     static u8 (*leaves)[32]; if (!leaves){ leaves = malloc(sizeof(*leaves)*PMT_MAX_TX); if(!leaves){*ec=-7;*em="oom";return 0;} }
     long ntx = pmt_block_txids(h, leaves, PMT_MAX_TX);
