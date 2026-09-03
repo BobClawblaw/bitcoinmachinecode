@@ -1155,6 +1155,167 @@ def synth_sighash_single_bug():
     c.add_mut('wrong pubkey', mutated_ss_hex=(pushdata(sig) + pushdata(other)).hex())
     return c
 
+def synth_sighash_single_v0_no_output():
+    """The BIP143 twin of the legacy SIGHASH_SINGLE bug -- and a DIFFERENT
+    rule, not the same one carried over. Legacy substitutes the sighash
+    ITSELF with the constant uint256(1) when the input index has no matching
+    output. BIP143 does something narrower: only the hashOutputs MID-HASH
+    (one field inside an otherwise ordinary preimage) is zeroed, per
+    interpreter.cpp's own SignatureHash -- the `sigversion != WITNESS_V0`
+    guard on the legacy hack excludes segwit v0 explicitly. Getting this
+    backwards (treating v0 like the legacy constant, or skipping the
+    special case for v0 at all and running off the end of the outputs
+    array) is exactly the kind of thing a hand port of "the sighash bug"
+    could copy wrong. bip143_sighash() above already implements the correct
+    zero-fill; this proves it against Core, not against itself."""
+    priv, pub = keypair(0x8a)
+    h = hash160(pub)
+    spk = b'\x00\x14' + h
+    script_code = bytes([OP_DUP, OP_HASH160]) + pushdata(h) + bytes([OP_EQUALVERIFY, OP_CHECKSIG])
+    ins  = [(outpoint(0), 0xfffffffd), (outpoint(1), 0xfffffffd)]
+    outs = [(DEST_VAL, DEST_SPK)]                       # ONE output, input index 1 signed
+    sh = bip143_sighash(ins, outs, 1, script_code, IN_VAL, SIGHASH_SINGLE)
+    sig = ecdsa_sig(priv, sh, SIGHASH_SINGLE)
+    wits = [[], [sig, pub]]
+    tx = serialize_tx(2, [(outpoint(0), b'', 0xfffffffd), (outpoint(1), b'', 0xfffffffd)], outs, 0, wits)
+    c = Case('sighash-v0-SINGLE-bug', 'v0', F_ALL, spk.hex(), tx.hex(), '', IN_VAL,
+             [(IN_VAL, OTHER_SPK.hex()), (IN_VAL, spk.hex())], idx=1)
+    bad = bytearray(sig); bad[10] ^= 0x01
+    c.add_mut('signature over the zero-filled preimage corrupted',
+              mutated_tx_hex=serialize_tx(2, [(outpoint(0), b'', 0xfffffffd), (outpoint(1), b'', 0xfffffffd)],
+                                          outs, 0, [[], [bytes(bad), pub]]).hex())
+    return c
+
+def synth_sighash_single_taproot_no_output():
+    """BIP341's THIRD answer to the same question legacy and BIP143 answer
+    differently: taproot does not substitute anything. Core's
+    SigningDataSighash returns false outright when the SIGHASH_SINGLE input
+    index has no matching output, so the sighash cannot even be COMPUTED --
+    there is no signature that could make this spend valid, and Core rejects
+    it before signature verification is ever reached.
+
+    This is a REGRESSION TEST for a real, already-fixed bug
+    (bitcoin_taproot_sighash.c, 2026-08-22): the taproot sighash used to
+    carry BIP143's zero-fill behaviour over by writing 32 zero bytes in this
+    exact position and returning a computable, signable hash -- accepting a
+    spend Core has always rejected. 130 of 945 vectors in the corpus that
+    caught it were exactly this case on real mainnet transactions, which is
+    to say a chain-splitting bug that was NOT a constructed corner case.
+    Nothing has pinned that fix against Core's own behaviour since -- the
+    diagnostic script that found it is gone, and no unit or differential
+    test names this input shape. This is that test.
+
+    The signature is built with the OLD, WRONG (zero-filled) formula on
+    purpose: not a garbage signature that any engine would reject for any
+    reason, but the exact bytes that a REGRESSED implementation would have
+    happily accepted. A garbage signature proves nothing about which rule
+    caused the rejection; this proves the SPECIFIC rule still holds."""
+    dt, ix, ox, par = _tr_key(0x8b)
+    spk = b'\x51\x20' + ox
+    ins  = [(outpoint(0), 0xfffffffd), (outpoint(1), 0xfffffffd)]
+    outs = [(DEST_VAL, DEST_SPK)]                       # ONE output, input index 1 signed
+    in_spks = [OTHER_SPK, spk]; in_amts = [IN_VAL, IN_VAL]
+    ht = SIGHASH_SINGLE
+    # Replicates taproot_sighash()'s exact construction, EXCEPT for the one
+    # line BIP341 forbids: a zero-filled sha_single_output instead of the
+    # IndexError that indexing tx_outs[1] against a 1-output list would
+    # raise. This is deliberately NOT a call to taproot_sighash() with a
+    # guard added -- it is the bug, spelled out, so the test documents what
+    # it is proving rather than merely avoiding a crash.
+    sha_prevouts = sha(b''.join(op for op, _ in ins))
+    sha_amounts  = sha(b''.join(le(a, 8) for a in in_amts))
+    sha_spks     = sha(b''.join(varint(len(spk_)) + spk_ for spk_ in in_spks))
+    sha_seqs     = sha(b''.join(le(seq, 4) for _, seq in ins))
+    m = bytearray()
+    m += bytes([0]) + bytes([ht]) + le(2, 4) + le(0, 4)
+    m += sha_prevouts + sha_amounts + sha_spks + sha_seqs   # not ANYONECANPAY
+    m += bytes([0])                                          # spend_type: no ext, no annex
+    m += le(1, 4)                                            # nIn = 1
+    # THE BUG, precisely: the FIELD that should hold sha256(output) is
+    # substituted with 32 raw zero bytes -- not the hash of anything, the
+    # field itself zeroed, matching what the pre-fix C code literally wrote
+    # in this exact position (bitcoin_taproot_sighash.c's own comment: "it
+    # wrote 32 zero bytes").
+    m += b'\x00' * 32
+    t = hashlib.sha256(b'TapSighash').digest()
+    sh = hashlib.sha256(t + t + bytes(m)).digest()
+    sig = dt.sign_schnorr(sh, bytes(32))
+    wits = [[], [sig]]
+    tx = serialize_tx(2, [(outpoint(0), b'', 0xfffffffd), (outpoint(1), b'', 0xfffffffd)], outs, 0, wits)
+    c = Case('sighash-taproot-SINGLE-bug', 'v1', F_ALL, spk.hex(), tx.hex(), '', IN_VAL,
+             [(IN_VAL, OTHER_SPK.hex()), (IN_VAL, spk.hex())], idx=1, expect_accept=False)
+    return c
+
+def _p2wsh_script_of_size(target_len):
+    """A witnessScript of exactly target_len bytes leaving ONE truthy stack
+    element -- P2WSH implicitly requires exactly one, regardless of the
+    CLEANSTACK policy flag (Core: ExecuteWitnessScript's own stack.size()==1
+    check, not the optional consensus/policy flag), so every intermediate
+    push must be dropped rather than left piled up the way the legacy
+    resource-limit probes can get away with.
+
+    Padding is done with PUSH bytes, never opcodes: MAX_OPS_PER_SCRIPT (201)
+    applies to WITNESS_V0 exactly like a bare script (it is tapscript, not
+    v0, that is exempt), and this function's whole point is to isolate the
+    SIZE boundary from the OPCODE-COUNT boundary -- padding with something
+    that quietly also spent the opcode budget would make a 10000-byte
+    script fail for the wrong reason and prove nothing about the byte
+    limit specifically. A push (any of OP_0..OP_16, or a length-prefixed
+    data push) never counts against the 201 limit; only the trailing DROP
+    that clears it does, and one DROP per chunk stays far under the budget
+    for a script sized in single-digit thousands of bytes."""
+    chunk = pushdata(b'\x2a' * 520) + bytes([OP_DROP])     # 524 bytes, net stack effect 0
+    body = b''
+    while len(body) + len(chunk) <= target_len - 3:
+        body += chunk
+    rem = target_len - len(body)
+    # The final element: no trailing DROP, so it is what survives on the
+    # stack (any nonzero-length byte string CastToBool()s true). Uses
+    # OP_PUSHDATA2 with a FIXED 3-byte header regardless of payload size --
+    # not the file's own pushdata(), which switches encodings by length and
+    # leaves a genuine gap (a 76-byte direct push and a 78-byte PUSHDATA1
+    # push both exist minimally; nothing minimally-encoded is exactly 77).
+    # Non-minimal pushes are legal under consensus flags (MINIMALDATA is
+    # policy only), so a fixed 3-byte header covering every remainder from
+    # 3 bytes up is simpler and gapless, at the cost of not being minimal --
+    # a property this filler has no reason to care about.
+    if rem == 1:
+        body += bytes([OP_1])                       # pushes the single byte 0x01
+    elif rem == 2:
+        body += pushdata(b'\x2a')                    # direct push, 1 data byte
+    else:
+        n = rem - 3
+        body += bytes([0x4d, n & 0xff, (n >> 8) & 0xff]) + b'\x2a' * n
+    assert len(body) == target_len, (len(body), target_len)
+    return body
+
+def synth_p2wsh_script_size(name, target_len, expect_accept):
+    """P2WSH's witnessScript is NOT bounded by MAX_SCRIPT_ELEMENT_SIZE (520
+    bytes) the way a P2SH redeemScript is -- and the reason is structural,
+    not a special case written for witness scripts. A P2SH redeemScript has
+    to reach the interpreter as a scriptSig PUSH, so the generic push-size
+    limit caps it at 520 bytes before it can even be considered. A P2WSH
+    witnessScript instead arrives as the LAST item of the witness stack,
+    POPPED OFF (VerifyWitnessProgram's SpanPopBack) before Core's "no witness
+    stack item over 520 bytes" check ever runs over what remains -- so the
+    script itself is invisible to that check, and its only ceiling is the
+    generic 10,000-byte MAX_SCRIPT_SIZE that also bounds a bare script.
+
+    A hand-rolled reimplementation that applies "witness items are capped at
+    520 bytes" uniformly -- treating the popped script the same as the
+    arguments still on the stack -- would reject a P2WSH spend Core accepts.
+    sv_verify_witness_v0 (bitcoin_witness_v0.c) gets this right by excluding
+    index nwit-1 from its per-item size loop; this is the differential that
+    checks it against Core rather than only against a reading of the file."""
+    script = _p2wsh_script_of_size(target_len)
+    h = hashlib.sha256(script).digest()
+    spk = b'\x00\x20' + h
+    ins = [(outpoint(0), 0xfffffffd)]
+    outs = [(DEST_VAL, DEST_SPK)]
+    tx = serialize_tx(2, [(outpoint(0), b'', 0xfffffffd)], outs, 0, [[script]])
+    return Case('limit/' + name, 'v0', F_ALL, spk.hex(), tx.hex(), '', IN_VAL,
+               [(IN_VAL, spk.hex())], expect_accept=expect_accept)
+
 def synth_p2sh_wrapped(variant):
     """P2SH-wrapped witness: the scriptSig is ONE push of the witness program,
     and the real program lives in the redeemScript. Both engines must agree on
@@ -1278,6 +1439,26 @@ def all_cases():
     for name, ht in [('DEFAULT', 0x00)] + SIGHASH_NAMES:
         cs.append(synth_sighash_taproot(name, ht))
     cs.append(synth_sighash_single_bug())
+    # ---- SIGHASH_SINGLE-no-matching-output: THREE engines, three answers ----
+    # (2026-09-03) legacy substitutes the whole sighash with a constant;
+    # BIP143/v0 zero-fills one field; BIP341/taproot refuses to compute a
+    # sighash at all. Only the legacy case had a differential before now --
+    # the taproot case is a regression test for a real, already-fixed
+    # consensus false-accept with no other coverage anywhere in the tree.
+    cs.append(synth_sighash_single_v0_no_output())
+    cs.append(synth_sighash_single_taproot_no_output())
+    # ---- resource limits: P2WSH's exemption from the 520-byte item cap ----
+    # (2026-09-03) a P2SH redeemScript is capped at 520 bytes because it must
+    # arrive as a scriptSig PUSH; a P2WSH witnessScript is popped off the
+    # witness stack before the "no witness item over 520 bytes" check runs,
+    # so its only ceiling is the generic 10,000-byte script-size limit.
+    # Untested against Core before now.
+    cs.append(synth_p2wsh_script_size('p2wsh witnessScript 521 bytes (over the P2SH cap) is legal',
+                                      521, True))
+    cs.append(synth_p2wsh_script_size('p2wsh witnessScript exactly 10000 bytes is legal',
+                                      10000, True))
+    cs.append(synth_p2wsh_script_size('p2wsh witnessScript 10001 bytes is rejected',
+                                      10001, False))
     cs += tapscript_cases()
     cs += resource_tapscript_cases()
     for k in range(0, 15):

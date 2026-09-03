@@ -1,8 +1,8 @@
 Synthesized feature-depth differential vs Core
-generated: 2026-09-03T13:58:06Z  elapsed: 0.3s
+generated: 2026-09-03T14:36:38Z  elapsed: 0.3s
 
-cases: 74  accept-parity ok: 74
-rule mutations: 95 (agree 95)
+cases: 79  accept-parity ok: 79
+rule mutations: 96 (agree 96)
 interpreter probes: 7805 (agree 7805, of which Core accepts 5641)
 per feature (accept / mutations-agreed / divergences):
   budget/tapscript 1 sigops accept=1  mut_ok=0  div=0
@@ -24,6 +24,9 @@ per feature (accept / mutations-agreed / divergences):
   codesep                  accept=1  mut_ok=2  div=0
   csv                      accept=1  mut_ok=3  div=0
   leafver/0xc2 unknown version, invalid script accept=1  mut_ok=0  div=0
+  limit/p2wsh witnessScript 10001 bytes is rejected accept=1  mut_ok=0  div=0
+  limit/p2wsh witnessScript 521 bytes (over the P2SH cap) is legal accept=1  mut_ok=0  div=0
+  limit/p2wsh witnessScript exactly 10000 bytes is legal accept=1  mut_ok=0  div=0
   limit/tapscript 300 opcodes is legal accept=1  mut_ok=0  div=0
   limit/tapscript >10000 bytes is legal accept=1  mut_ok=0  div=0
   limit/tapscript OP_CHECKMULTISIG is disabled accept=1  mut_ok=0  div=0
@@ -65,12 +68,14 @@ per feature (accept / mutations-agreed / divergences):
   sighash-taproot-NONE     accept=1  mut_ok=2  div=0
   sighash-taproot-NONE|ACP accept=1  mut_ok=2  div=0
   sighash-taproot-SINGLE   accept=1  mut_ok=3  div=0
+  sighash-taproot-SINGLE-bug accept=1  mut_ok=0  div=0
   sighash-taproot-SINGLE|ACP accept=1  mut_ok=3  div=0
   sighash-v0-ALL           accept=1  mut_ok=3  div=0
   sighash-v0-ALL|ACP       accept=1  mut_ok=2  div=0
   sighash-v0-NONE          accept=1  mut_ok=2  div=0
   sighash-v0-NONE|ACP      accept=1  mut_ok=1  div=0
   sighash-v0-SINGLE        accept=1  mut_ok=3  div=0
+  sighash-v0-SINGLE-bug    accept=1  mut_ok=1  div=0
   sighash-v0-SINGLE|ACP    accept=1  mut_ok=2  div=0
   taproot-scriptpath       accept=1  mut_ok=3  div=0
   taproot-scriptpath-annex accept=1  mut_ok=4  div=0
