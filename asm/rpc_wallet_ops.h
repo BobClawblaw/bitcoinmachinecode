@@ -100,6 +100,17 @@ int  rpc_wops_own_coin_spk(const void* wseed, const unsigned char txid_wire[32],
 
 int rpc_wops_wallet_coins(const void* wallet_seed, rpc_wops_coin* out, int cap);
 
+/* getaddressinfo's ismine/iswatchonly/ischange/pubkey, checked against the
+ * real wallet key window (the same one listunspent/rescan search) rather
+ * than hardcoded false/empty. spk is the address's OWN scriptPubKey; on a
+ * match pubkey_out/has_pubkey_out are only filled for a spendable LEGACY
+ * (P2PKH) key, matching what getaddressinfo already tries to report a
+ * pubkey for. Returns 1 always (the address may simply not be ours);
+ * check *is_mine_out / *is_watchonly_out for the answer. */
+int rpc_wops_address_ownership(const rpc_wallet* w, const unsigned char* spk, unsigned long spklen,
+                               int* is_mine_out, int* is_watchonly_out, int* is_change_out,
+                               unsigned char pubkey_out[33], int* has_pubkey_out);
+
 /* master key fingerprint as 8 hex chars (2026-09-01: taproot PSBT derivation matching) */
 int rpc_wops_master_fp(const void* seed, char out[9]);
 

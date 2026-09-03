@@ -1051,3 +1051,18 @@ void node_config_log(void){
 
 /* -acceptstalefeeestimates for daemon/mempool_cfg.c (weakly bound there). */
 int node_config_accept_stale_fee(void){ return g_cfg.acceptstalefeeestimates; }
+
+/* Small accessor for callers that link this file only weakly (rpc_node.c's
+ * getnetworkinfo needs g_cfg's proxy fields, but bitcoin_cli -- a pure HTTP
+ * client that never executes that RPC's implementation -- does not link
+ * this file at all). Exporting one narrow function keeps g_cfg itself out
+ * of that weak-symbol surface, which matters because g_cfg is a struct
+ * object, not a pointer: an unresolved weak OBJECT has no clean "is this
+ * present" check the way a weak FUNCTION POINTER does (compared against
+ * NULL, the convention this file's callers already use for fest_estimate_*
+ * and g_chainp). */
+void node_config_get_proxy_info(const char** proxy, const char** onion_proxy,
+                                const char** i2psam, int* proxyrandomize){
+    *proxy = g_cfg.proxy; *onion_proxy = g_cfg.onion_proxy;
+    *i2psam = g_cfg.i2psam; *proxyrandomize = g_cfg.proxyrandomize;
+}

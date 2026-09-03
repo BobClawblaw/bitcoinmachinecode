@@ -477,6 +477,7 @@ int main(void){
       rj_free(r);
 
       /* createwalletdescriptor: Core's codes, by argument */
+      char bech32m_addr[128] = "";  /* captured below for the getaddressinfo checks further down */
       { rj_val* p1 = P("[\"nonsense\"]");
         D("createwalletdescriptor", p1);
         ck("createwalletdescriptor unknown type -> -5", rc == 0 && ec == -5 &&
@@ -505,6 +506,7 @@ int main(void){
           rj_free(r);
           rj_val* p2 = P("[\"\", \"bech32m\"]"); DX("getnewaddress", p2);
           char a[128] = ""; if (rc == 1 && r && r->typ == RJ_STR) snprintf(a, sizeof a, "%s", r->str);
+          snprintf(bech32m_addr, sizeof bech32m_addr, "%s", a);
           ck("getnewaddress bech32m -> a bc1p address", !strncmp(a, "bc1p", 4));
           extern int rpc_desc_address_at(const char*, long, char*, long, char*, unsigned long);
           char da[128] = {0}, derr[128];
@@ -517,8 +519,60 @@ int main(void){
           ck("createwalletdescriptor p2sh-segwit -> sh(wpkh([../49h/..]))", rc == 1 && r && rj_obj_get(r, "descs") && !strncmp(rj_obj_get(r, "descs")->items[0]->str, "sh(wpkh([", 9));
           rj_free(r); rj_free(p4);
           rj_val* p5 = P("[\"\", \"p2sh-segwit\"]"); DX("getnewaddress", p5);
-          ck("getnewaddress p2sh-segwit -> a 3... address", rc == 1 && r && r->typ == RJ_STR && r->str[0] == '3');
-          rj_free(r); rj_free(p5); } }
+          char p2sh_addr[128] = ""; if (rc == 1 && r && r->typ == RJ_STR) snprintf(p2sh_addr, sizeof p2sh_addr, "%s", r->str);
+          ck("getnewaddress p2sh-segwit -> a 3... address", p2sh_addr[0] == '3');
+          rj_free(r); rj_free(p5);
+
+          /* ---- getaddressinfo: real ismine/iswatchonly/ischange/pubkey ----
+           * (2026-09-03 audit finding: these four fields used to be
+           * hardcoded false/empty for EVERY address). Reuses the addresses
+           * this same wallet just derived above, across every active type,
+           * plus a fresh legacy activation for the pubkey check -- the one
+           * field the RPC has ever tried to populate. */
+          { rj_val* pl = P("[\"legacy\"]"); D("createwalletdescriptor", pl); rj_free(r); rj_free(pl); }
+          rj_val* p6 = P("[\"\", \"legacy\"]"); DX("getnewaddress", p6);
+          char legacy_addr[128] = ""; if (rc == 1 && r && r->typ == RJ_STR) snprintf(legacy_addr, sizeof legacy_addr, "%s", r->str);
+          ck("getnewaddress legacy -> a 1... address", legacy_addr[0] == '1');
+          rj_free(r); rj_free(p6);
+
+          rj_val* p7 = P("[\"\"]"); DX("getrawchangeaddress", p7);
+          char change_addr[128] = ""; if (rc == 1 && r && r->typ == RJ_STR) snprintf(change_addr, sizeof change_addr, "%s", r->str);
+          ck("getrawchangeaddress -> a bech32 address", !strncmp(change_addr, "bc1q", 4));
+          rj_free(r); rj_free(p7);
+
+          { char qj0[160]; snprintf(qj0, sizeof qj0, "[\"%s\"]", bech32m_addr); rj_val* q = P(qj0); DX("getaddressinfo", q);
+            ck("getaddressinfo(our own taproot address): ismine=true",
+               rc == 1 && r && S(r, "ismine") && !strcmp(S(r, "ismine"), "1"));
+            ck("...ischange=false (it is a receive address)",
+               r && S(r, "ischange") && !strcmp(S(r, "ischange"), "0"));
+            rj_free(r); rj_free(q); }
+          { char qj1[160]; snprintf(qj1, sizeof qj1, "[\"%s\"]", p2sh_addr); rj_val* q = P(qj1); DX("getaddressinfo", q);
+            ck("getaddressinfo(our own p2sh-segwit address): ismine=true",
+               rc == 1 && r && S(r, "ismine") && !strcmp(S(r, "ismine"), "1"));
+            rj_free(r); rj_free(q); }
+          { char qj2[160]; snprintf(qj2, sizeof qj2, "[\"%s\"]", change_addr); rj_val* q = P(qj2); DX("getaddressinfo", q);
+            ck("getaddressinfo(our own CHANGE address): ismine=true",
+               rc == 1 && r && S(r, "ismine") && !strcmp(S(r, "ismine"), "1"));
+            ck("...ischange=true", r && S(r, "ischange") && !strcmp(S(r, "ischange"), "1"));
+            rj_free(r); rj_free(q); }
+          { char qj3[160]; snprintf(qj3, sizeof qj3, "[\"%s\"]", legacy_addr); rj_val* q = P(qj3); DX("getaddressinfo", q);
+            ck("getaddressinfo(our own legacy address): ismine=true",
+               rc == 1 && r && S(r, "ismine") && !strcmp(S(r, "ismine"), "1"));
+            const char* pk = S(r, "pubkey");
+            ck("...pubkey is now a REAL 33-byte compressed key (was always empty)",
+               pk && strlen(pk) == 66);
+            rj_free(r); rj_free(q); }
+          { /* a real mainnet address this wallet's seed never derived --
+             * from test_wrpc_addr.c's own known vectors, so it is not
+             * coincidentally one of ours */
+            rj_val* q = P("[\"1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH\"]"); DX("getaddressinfo", q);
+            ck("getaddressinfo(a real address NOT ours): ismine=false",
+               rc == 1 && r && S(r, "ismine") && !strcmp(S(r, "ismine"), "0"));
+            ck("...iswatchonly=false too (not imported either)",
+               r && S(r, "iswatchonly") && !strcmp(S(r, "iswatchonly"), "0"));
+            const char* pk = S(r, "pubkey");
+            ck("...pubkey stays empty for an address we cannot sign for", pk && pk[0] == 0);
+            rj_free(r); rj_free(q); } } }
       D("createwalletdescriptor", NULL);
       ck("createwalletdescriptor with no type -> -8", rc == 0 && ec == -8);
       rj_free(r);
