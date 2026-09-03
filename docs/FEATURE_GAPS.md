@@ -1973,3 +1973,119 @@ a misleading name.
 Full run after adding these: 79 synthesized cases (up from 74), 96 rule
 mutations, 7,805 interpreter probes, zero divergences, zero engine failures,
 zero synthesis errors.
+
+## Update 2026-09-03 — a full re-audit, requested after finding the document had drifted again
+
+This document has now self-corrected for drift twice before (2026-08-25,
+2026-08-27) and had drifted a third time. Four categories were re-audited
+from scratch — every "still open" / "absent" / "not implemented" claim was
+checked against the CURRENT source, not against this document's own prose,
+because the prose is exactly what was found unreliable.
+
+### The one finding that matters more than any doc correction
+
+**`assumevalid` is implemented and has been ACTIVE BY DEFAULT since
+2026-09-01** — `asm/daemon/utxo_live.c`'s `utxo_live_resolve_assumevalid`
+and `apply_block_at_inner`, defaulting to Core's own chain-default
+assumevalid hash rather than to `assumevalid=0`. Confirmed live on both the
+production-equivalent daemon and the fresh-install acceptance run currently
+in progress: both logged `assumevalid: block found at height 938343 --
+script evaluation skipped through it, resumed above` at boot. Every earlier
+passage in this document describing script verification as unconditional
+("this node verifies every script in every block", used to justify
+declining `assumevalid` as a "deliberate refusal") describes a true fact
+about 2026-08-21 that stopped being the default behavior on 2026-09-01, and
+was never corrected.
+
+**What this means for every "verified against Core, zero divergences"
+claim from a normal sync:** the UTXO set, proof-of-work, block structure,
+and every non-script consensus rule are still checked for the whole chain
+— those claims stand. But under the default config, ONLY the top ~27,000
+of ~965,000 blocks have their scripts independently checked against Core
+during that sync; the ~938,000 below the assumevalid height are trusted,
+exactly as real Core trusts them by default. The stronger claim —
+"every script in the whole chain, independently verified" — requires
+`assumevalid=0` explicitly, which is exactly what the item below still
+needs to prove.
+
+### Real bugs found (not documentation drift — actual defects)
+
+- **`gettxoutproof` still refuses without a block hash, citing "no
+  txindex"** (`asm/rpc_chain.c` around the `-5` error), even though
+  `txindex` has existed since 2026-08-26. The justification is false; the
+  refusal itself may or may not still be intended, but the STATED REASON
+  is wrong and should be fixed or restated.
+- **`getnetworkinfo` reports `proxy_randomize_credentials: false` and an
+  empty `proxy` string unconditionally** (`asm/rpc_node.c`'s `net_entry()`),
+  even though per-connection SOCKS5 credential randomization is real and
+  active (`asm/daemon/dialer.c`). The RPC answer misreports the node's own
+  configured behavior.
+- **`getaddressinfo`'s wallet-context fields are hardcoded stubs**
+  (`ismine`, `iswatchonly`, `ischange` always `false`, `pubkey` always
+  empty — `asm/rpc_commands.c`), regardless of whether the address is
+  actually the wallet's own. Filed under wallet gaps below as well, but
+  it is a correctness bug against a live wallet, not merely an absent
+  feature.
+
+### Confirmed genuinely still open (verified against source, not stale)
+
+- **Full-verification IBD benchmark vs Core** (`-assumevalid=0
+  -stopatheight`, second scratch datadir) — still never run. Now doubly
+  the point, given the finding above: this is the one way to get the
+  strong "every script, every block" claim rather than the default
+  "matches Core's own trust boundary" one.
+- `assumeutxo` / snapshot import — absent, large lift, no current need.
+- MuSig2 signing inside tapscript LEAF scripts (key-path MuSig2 is done;
+  a script-path leaf using MuSig2 is not signed — `asm/rpc_commands.c`).
+- `getaddressinfo` wallet-context stubs (see bugs above).
+- No keypool (`keypoolrefill` returns null) — deliberate, this node signs
+  on demand rather than pre-generating.
+- BIP331 package-relay WIRE NEGOTIATION (`sendpackages`/`pkgtxns`/
+  `ancpkginfo`) — package ACCEPTANCE (1p1c, the TRUC/ephemeral-dust rules)
+  is real and proven against Core; the separate wire protocol to announce
+  and request packages is not built. The project's own P2P summary row
+  overstates this as done; it is half-done.
+- Erlay/BIP330 reconciliation — negotiation only, wire-off, a deliberately
+  declared stopping point, unchanged since 2026-08-30.
+- REST interface, UPnP/NAT-PMP, `blockreconstructionextratxn`, `rpc.discover`
+  — all absent by explicit design, consistently described as such.
+- **Inbound-accepted transactions are not re-announced to this node's other
+  peer connections** (`asm/daemon/tx_relay.c`'s `txrelay_poll_leg` is only
+  ever called with outbound mux legs, `asm/daemon/main.c`). Distinct from
+  the 2026-09-03 own-transaction announcement work earlier today, which
+  fixed how WE originate an announcement, not how we relay one someone
+  else handed us onward past our outbound legs.
+
+### Confirmed CLOSED, contradicting older passages elsewhere in this file
+
+A representative sample, not exhaustive — each was independently confirmed
+against source before being listed here: BIP16/P2SH VerifyScript
+build-out; sigop/`bytespersigop` cost accounting (closed the same day, see
+above); pruning; MuSig2 key-path (BIP327); Branch-and-Bound coin selection
+(`asm/wallet_bnb.c`); `musig()` descriptors (BIP390); multipath descriptors
+(BIP389, `<a;b>`); PSBT v2 in the signer; `descriptorprocesspsbt` leaf/
+control-block synthesis; miniscript partial-signature extraction;
+`createwalletdescriptor`'s legacy/P2SH-segwit/bech32m activation;
+`-acceptstalefeeestimates`; `getrawtransaction` by bare txid;
+`coinstatsindex`'s RPC and live index; BIP23 `getblocktemplate` proposal
+mode; signet; roughly 27 keys in `config/bitcoin.sample.conf`'s own "CORE
+OPTIONS NOT SUPPORTED" table (that file, not this one, was the most
+out-of-date artifact found — it is described as authoritative and had not
+been updated to match `node_config.c` in some time); Tor/I2P/CJDNS address
+storage and re-gossip (BIP155/addrv2, all networks); Tor onion
+self-hosting; I2P inbound; CJDNS both directions; per-connection proxy
+randomization (the CODE is correct; only `getnetworkinfo`'s report of it
+is wrong, see bugs above); package relay ACCEPTANCE (distinct from the
+wire negotiation, still open, above).
+
+**Overall assessment.** This project is closer to Core parity than this
+document, even now, fully states — most of what it has called "open" in
+the last two weeks was already closed by the time it was read. The
+consensus interpreter, mempool/relay policy, wallet, RPC surface,
+indexing, and P2P networking are all substantially complete and checked
+against Core wherever a differential exists. What remains that is real:
+three small RPC-correctness bugs (above), a handful of deliberately
+declined features, the package-relay wire protocol, and — the one item
+worth treating as a priority — actually running a full, unconditional,
+`assumevalid=0` verification of this chain against Core, now that it is
+clear the routine sync path no longer does that by default.
