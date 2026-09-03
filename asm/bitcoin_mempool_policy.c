@@ -907,7 +907,8 @@ int mpol_last_replaced(unsigned char* out, int cap){
 static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                           const unsigned char* tx, unsigned long txlen,
                           const unsigned char txid[32], void* utxo,
-                          int commit, unsigned long long* fee_out){
+                          int commit, unsigned long long* fee_out,
+                          unsigned long long* vsize_out){
     static unsigned char prev[MPOL_MAX_IN][32];
     static uint32_t idx[MPOL_MAX_IN], seq[MPOL_MAX_IN];
     mpol_txmeta meta;
@@ -950,6 +951,12 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
           if (sw > adj_w) adj_w = sw;
           vsize = (adj_w + 3) / 4;
       } }
+    /* Published HERE, before any rejection can return: a package member that
+     * fails only on fee still contributes its size to the package total, and
+     * the caller has no other way to learn the sigop-adjusted figure -- the
+     * structural walker that hands it a vsize cannot count sigops, which need
+     * the UTXO view. */
+    if (vsize_out) *vsize_out = (unsigned long long)vsize;
 
     /* --- standardness (Core IsStandardTx order: before fees) --------------- */
     int n_dust = 0;
@@ -1561,15 +1568,17 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
 long mpool_policy_add(mpol_cfg* pol, void* st, void* mp,
                       const unsigned char* tx, unsigned long txlen,
                       const unsigned char txid[32], void* utxo){
-    return mpol_add_core(pol, st, mp, tx, txlen, txid, utxo, 1, NULL);
+    return mpol_add_core(pol, st, mp, tx, txlen, txid, utxo, 1, NULL, NULL);
 }
 
 long mpool_policy_test(mpol_cfg* pol, void* st, void* mp,
                        const unsigned char* tx, unsigned long txlen,
                        const unsigned char txid[32], void* utxo,
-                       unsigned long long* fee_out){
+                       unsigned long long* fee_out,
+                       unsigned long long* vsize_out){
     if (fee_out) *fee_out = 0;
-    return mpol_add_core(pol, st, mp, tx, txlen, txid, utxo, 0, fee_out);
+    if (vsize_out) *vsize_out = 0;
+    return mpol_add_core(pol, st, mp, tx, txlen, txid, utxo, 0, fee_out, vsize_out);
 }
 
 /* ========================================================================== */

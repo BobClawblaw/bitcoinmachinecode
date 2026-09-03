@@ -15,6 +15,9 @@
 #include "../mempool_entry.h"
 extern void mpool_policy_set_pending_sigops(unsigned long long);
 extern void mpool_policy_set_bytespersigop(unsigned long long);
+extern long mpool_policy_test(void*, void*, void*, const unsigned char*, unsigned long,
+                              const unsigned char*, void*, unsigned long long*,
+                              unsigned long long*);
 extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
 #include <string.h>
 #include <stdlib.h>
@@ -364,6 +367,64 @@ int main(void){
             okv(ei.size == 1252, "ceil(max(weight, sigops*bps)/4) -- 1252, not the truncated 1251");
         }
         mpool_policy_set_bytespersigop(20);      /* back to Core's default */
+    }
+
+    /* The package feerate is aggregated by daemon/main.c and tx_relay.c from
+     * what the DRY RUN reports, and Core computes it over entry sizes -- which
+     * are the sigop-adjusted ones. The structural walker that hands those
+     * callers a vsize cannot count sigops (they need the UTXO view), so the
+     * adjusted figure has to come back out of the policy layer. This is that
+     * contract: mpool_policy_test reports it, and reports it even when the
+     * transaction is REJECTED on fee, because a fee-reconsiderable member
+     * still contributes its size to the package total. */
+    {   printf("\n== the dry run reports the sigop-adjusted vsize ==\n");
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<20];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+        mpool_policy_state_init(stbuf, 256);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        unsigned char prev[32]; memset(prev, 0xC1, 32);
+        utxo_put(ux, prev, 0, 1000000ULL, 0, 0, (const unsigned char*)"\x51", 1);
+        unsigned char tx[128]; unsigned long n = 0;
+        tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0;
+        tx[n++]=1; memcpy(tx+n, prev, 32); n+=32; memset(tx+n,0,4); n+=4; tx[n++]=0; memset(tx+n,0xff,4); n+=4;
+        tx[n++]=1; { unsigned long long v = 1000000ULL - 200ULL; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+        tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n,0x33,20); n+=20;
+        memset(tx+n,0,4); n+=4;                     /* ~60 vB paying 200 sat */
+        unsigned char tid[32]; memset(tid, 0xC2, 32);
+
+        unsigned long long fee = 0, avs = 0;
+        mpool_policy_set_pending_sigops(80);        /* 80*20/4 = 400 vB */
+        long rv = mpool_policy_test(pol, stbuf, mp, tx, n, tid, ux, &fee, &avs);
+        okv(rv != 1, "200 sat over the adjusted 400 vB is under the 1 sat/vB floor");
+        okv(avs == 400, "the dry run still reports the ADJUSTED vsize on a fee rejection");
+
+        /* and on an accept, with enough fee to clear 400 vB */
+        unsigned char tx2[128]; unsigned long n2 = 0;
+        tx2[n2++]=2;tx2[n2++]=0;tx2[n2++]=0;tx2[n2++]=0;
+        tx2[n2++]=1; memcpy(tx2+n2, prev, 32); n2+=32; memset(tx2+n2,0,4); n2+=4; tx2[n2++]=0; memset(tx2+n2,0xff,4); n2+=4;
+        tx2[n2++]=1; { unsigned long long v = 1000000ULL - 5000ULL; for (int b=0;b<8;b++) tx2[n2++]=(unsigned char)(v>>(8*b)); }
+        tx2[n2++]=22; tx2[n2++]=0x00; tx2[n2++]=0x14; memset(tx2+n2,0x44,20); n2+=20;
+        memset(tx2+n2,0,4); n2+=4;
+        unsigned char tid2[32]; memset(tid2, 0xC3, 32);
+        fee = 0; avs = 0;
+        mpool_policy_set_pending_sigops(80);
+        long rv2 = mpool_policy_test(pol, stbuf, mp, tx2, n2, tid2, ux, &fee, &avs);
+        okv(rv2 == 1, "the better-paying one passes the dry run");
+        okv(avs == 400, "...and reports the adjusted vsize too");
+        okv(fee == 5000, "...with its fee");
+
+        /* no sigops parked: the plain BIP141 vsize comes back */
+        fee = 0; avs = 0;
+        long rv3 = mpool_policy_test(pol, stbuf, mp, tx2, n2, tid2, ux, &fee, &avs);
+        okv(rv3 == 1, "sigop-free dry run passes");
+        okv(avs > 0 && avs < 200, "...and reports the plain vsize when nothing is parked");
     }
 
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);

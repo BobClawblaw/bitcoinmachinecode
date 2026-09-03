@@ -1778,8 +1778,23 @@ submitted the transaction again, the duplicate was refused, and the case
 printed "ok" while quietly incrementing the failure count. It evaluates once
 now.
 
-Still unmatched: package effective-feerate aggregates (`pkg_vsize` in
-`daemon/main.c`) sum the plain BIP141 vsize rather than the adjusted one, so a
-sigop-dense member is priced slightly cheaply inside a package. Single-
-transaction admission, which is where `bytespersigop` is aimed, is correct.
+~~Still unmatched: package effective-feerate aggregates.~~ **CLOSED the same
+day.** Both aggregate sites — `daemon/main.c`'s `submitpackage` and
+`daemon/tx_relay.c`'s 1p1c relay — summed the plain BIP141 vsize from
+`mpol_package_well_formed`'s structural walker, which cannot count sigops
+because those need the UTXO view. Core aggregates over entry sizes, and an
+entry's size is the adjusted figure, so a sigop-dense member was priced
+slightly cheaply inside a package.
+
+The adjusted figure now comes back out of the dry run: `mpool_policy_test`
+gained a `vsize_out` alongside its existing `fee_out`, published as soon as the
+size is known and therefore reported even when the transaction is REJECTED —
+a member failing only on fee still contributes its size to the package total.
+Both callers use it, falling back to the walker's figure only for a member
+rejected before the policy layer ran, which never joins a total anyway.
+
+Deliberately a per-call out-parameter rather than another "last value" global.
+The bug fixed hours earlier in this same area was precisely a global set before
+a call and consumed later; adding a second one to carry the fix would have been
+the same mistake twice.
 
