@@ -43,6 +43,15 @@ Everything below is landed on `arm-port` and pushed. History lives in
       `make -C port/arm64 abi-a64-check` -- see the 2026-09-03 worklog for what
       it took (a frame walk, symbolic `.equ` frame maps, register-held fixed
       frames) and for the one function it still cannot see.
+- [ ] Boot's archive-gap phase is unexplained and varies 7x (21.87s / 85.46s /
+      148.71s; measured breakdown of the 86s: 16.0s to `139 confirmed-live
+      peer(s)` + 66.6s of silence until one peer answers `headers: already
+      current`). The phase's own comment claims a caught-up node "returns
+      almost instantly (pure disk reads, no network)", which the log
+      contradicts -- it opens peers and waits for a height answer. Find what
+      bounds that wait (or take the first `already current` instead of the
+      peer that happens to reply), then re-time it across three restarts before
+      calling anything settled.
 - [ ] Covering the last 6 unmodelled frames in the AArch64 ABI auditor needs
       offsets as RANGES: `point_scalar_mul_glv` bases its frame on `x28`
       (`mov x28,sp`, stores as `[x28,#TAB]`) and clamps sp to 16 through `x9`,
