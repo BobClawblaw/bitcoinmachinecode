@@ -152,31 +152,107 @@ mac_wal_drain_fd_pending:            /* drain to whichever fd owns the pending b
 	b    mac_wal_drain_fd
 
 /* ---------- mac_wr_log(st=x19, buf=x20, len=x21) -> 0 ok / -1, local.
- * DIRECT WRITE for now. The x86's 2026-09-01 buffered form (wal_buf 1 MB,
- * drains on owner-switch/cap/oversize) was ported and reverted: a subtle
- * stack corruption surfaced in test_utxo_wal_buffer (put's x19 became a
- * record byte 0x8d after the make-room drain path) that four gdb rounds
- * did not pin down; the buffering buys ~6% of replay CPU, not correctness.
- * log_len stays the LOGICAL length = file length here (fill is always 0).
- * mac_wal_drain_fd/mac_wal_drain_fd_pending/utxo_store_wal_drain below keep
- * the x86 SHAPE so the C callers and the drain sites stay valid; with fill
- * always zero they are no-ops. Clobbers x0-x8 only; preserves x19/x20/x21. */
+ * BUFFERED (main b3d47a9 ported): records are appended to the 1 MB wal_buf and
+ * land in utxo.dat one write(2) per drain; the per-record write() was ~6% of
+ * the live replay's CPU. log_len ([st+16]) is the LOGICAL length -- file bytes
+ * PLUS buffered bytes -- at all times.
+ *   owner switch (a different store's fd owns the buffer) -> drain theirs
+ *   fill + len > CAP                                        -> drain first
+ *   len > CAP                                               -> drain, then
+ *                                                             straight through
+ * REGISTER DISCIPLINE -- this is where the first attempt died. The callers
+ * (utxo_store_put/del) pass st/buf/len in x19/x20/x21 and keep x22/x23 live
+ * across the call, and every temporary here is a STACK ADDRESS inside
+ * utxo_store_put's frame: the last time this was buffered, the copy loop took
+ * its byte register from the callee-saved set and "put's x19 came back as a
+ * record byte (0x8d)" -- four gdb rounds, no answer, reverted. So: x0-x3 and
+ * x8-x11 ONLY, matching mac_wal_drain_fd's documented contract, and x19-x28
+ * are not touched by this routine or anything it calls. */
 mac_wr_log:
+	stp  x29,x30,[sp,#-16]!          /* IT CALLS NOW (the drains), so it is no
+	                                  * longer a leaf: x30 must survive or the
+	                                  * caller's `ret` goes nowhere. Exit only
+	                                  * through .wl_ret. */
+	ldr  x0,[x19]                    /* log_fd */
+	adrp x9, wal_fill
+	ldr  x9, [x9, :lo12:wal_fill]
+	cbz  x9, .wl_owner_ok
+	adrp x8, wal_fd
+	ldr  x8, [x8, :lo12:wal_fd]
+	subs x8, x0, x8
+	b.eq .wl_owner_ok
+	bl   mac_wal_drain_fd_pending    /* another store's bytes are pending: land
+	                                  * them on THEIR fd first */
+	cbnz x0, .wl_fail
+	ldr  x0,[x19]
+.wl_owner_ok:
+	adrp x8, wal_fd
+	str  x0, [x8, :lo12:wal_fd]
+	mov  x9, #WALBUF_CAP
+	cmp  x21, x9
+	b.hi .wl_direct
+	adrp x9, wal_fill
+	ldr  x9, [x9, :lo12:wal_fill]
+	add  x9, x9, x21
+	mov  x10, #WALBUF_CAP
+	cmp  x9, x10
+	b.ls .wl_append
+	bl   mac_wal_drain_fd            /* x0 = this fd: make room */
+	cbnz x0, .wl_fail
+.wl_append:
+	adrp x0, wal_buf
+	add  x0, x0, :lo12:wal_buf
+	adrp x3, wal_fill
+	ldr  x3, [x3, :lo12:wal_fill]
+	add  x0, x0, x3                  /* dst = wal_buf + fill */
+	mov  x1, x20                     /* src = the record */
+	mov  x2, x21                     /* len */
+.Lwl_w8:                             /* 8 at a time: plain LDR/STR allow
+	                                  * unaligned addresses architecturally,
+	                                  * and a WAL record is 44/59+slen bytes */
+	cmp  x2, #8
+	b.lt .Lwl_tail
+	ldr  x3, [x1], #8
+	str  x3, [x0], #8
+	sub  x2, x2, #8
+	b    .Lwl_w8
+.Lwl_tail:
+	cbz  x2, .Lwl_done
+	ldrb w3, [x1], #1
+	strb w3, [x0], #1
+	sub  x2, x2, #1
+	b    .Lwl_tail
+.Lwl_done:
+	adrp x0, wal_fill
+	ldr  x1, [x0, :lo12:wal_fill]
+	add  x1, x1, x21
+	str  x1, [x0, :lo12:wal_fill]
+	ldr  x2, [x19, #16]
+	add  x2, x2, x21
+	str  x2, [x19, #16]
+	mov  x0, #0
+	b    .wl_ret
+.wl_direct:                          /* larger than the buffer: drain, then write it straight through */
+	bl   mac_wal_drain_fd
+	cbnz x0, .wl_fail
 	ldr  x0,[x19]
 	mov  x1,x20
 	mov  x2,x21
 	mov  x8,#SYS_write
 	svc  #0
 	cmp  x0,x21
-	b.ne .wfail
+	b.ne .wl_fail
 	ldr  x2,[x19,#16]
 	add  x2,x2,x21
 	str  x2,[x19,#16]
 	mov  x0,#0
-	ret
-.wfail:
+	b    .wl_ret
+.wl_fail:
 	mov  x0,#-1
+.wl_ret:
+	ldp  x29,x30,[sp],#16
 	ret
+	.size mac_wr_log,.-mac_wr_log
 
 /* ---------- mac_fsync(fd=x0) -> 0/-1, local ---------- */
 mac_fsync:

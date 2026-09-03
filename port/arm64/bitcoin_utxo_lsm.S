@@ -1402,6 +1402,19 @@ mac_flush:
 	cbz  x9, .mf_nohook
 	blr  x9
 .mf_nohook:
+	/* THE FLUSH ENDS BY TRUNCATING THE WAL, so every buffered store-WAL byte
+	 * has to be in the file BEFORE anything here can fail -- the LSM's WAL *is*
+	 * utxo_store_put/utxo_store_del, so with mac_wr_log buffering (2026-09-02)
+	 * bytes still in wal_buf would otherwise be appended to the just-truncated
+	 * file and records the flush already wrote into a run would reappear on
+	 * replay. x86 bitcoin_utxo_lsm.asm:1897 has had this call all along; the
+	 * port had no reason to need it while fill was always zero, and
+	 * test_utxo_lsm's "reload tomb_n rebuilt" plus test_utxo_live_count's final
+	 * sweep are what catch its absence. */
+	mov  x0, x19
+	bl   utxo_store_wal_drain
+	cmp  x0, #-1
+	b.eq .fl_err
 	/* desc_cap/off_desc_b/off_bloom */
 	mov  x0, x19
 	bl   mac_calc_desc_cap
