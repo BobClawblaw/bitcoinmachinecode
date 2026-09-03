@@ -153,6 +153,15 @@ diff_target:
     ; if ecx < 0 skip (shift right not needed for real targets)
     test ecx, ecx
     js  .done
+    ; VAL-11 (audit 2026-09-03): with e3 >= 32 the LSB position rdi+31-e3
+    ; lands BELOW the buffer -- the old code wrote 1-3 bytes below target_be
+    ; (~220 below rbp for exponents near 0xff: a stack scribble driven by an
+    ; attacker-chosen nBits, and the enabler for VAL-7/VAL-8's free bogus
+    ; headers). Core's big-uint shift DISCARDS bits past 256, so the correct
+    ; clamped behaviour is to write nothing: the stored target stays 0. The
+    ; overflow itself is rejected by pow_check's range checks.
+    cmp ecx, 31
+    jg  .done
     ; LSB at target[31 - ecx]; write mantissa little-endian w/ carry up to 3
     ; bytes, provided index stays in range.
     lea r9, [rdi+31]
@@ -164,6 +173,11 @@ diff_target:
 .w:
     test r8, r8
     jz  .done
+    ; VAL-11 continued: stop at the buffer's top edge. Core's 256-bit shift
+    ; discards bits past bit 256 (that IS the overflow pow_check now rejects);
+    ; writing them below rdi is what corrupted the frame.
+    cmp r9, rdi
+    jb  .done
     mov al, r8b
     mov [r9], al
     shr r8, 8
@@ -193,13 +207,28 @@ diff_target:
 ;   same 0 mod 16 the nested calls saw before.
 ; ------------------------------------------------------------------------------
 global pow_check
+; VAL-11 (audit 2026-09-03): pow_pow_limit_bits -- the chain's powLimit as a
+; compact nBits, ARMED by chainparams_select (daemon/chainparams.c). 0 (the
+; default) means "powLimit check off": pow_check then only enforces Core's
+; nBits well-formedness (negative/zero/overflow), which keeps the harnesses
+; that mine against 0x207fffff without selecting a chain working. The daemon
+; arms it at boot, so the live validation path can never accept a header
+; whose claimed target exceeds the chain's powLimit (Core's CheckProofOfWork
+; rejects exactly that).
+global pow_pow_limit_bits
+section .data align=16
+pow_pow_limit_bits: dd 0
+section .text
 pow_check:
     push rbx
     push r12
     push r13
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0xb8         ; locals -0x30, -0x60, -0x90; 0xb8==8 mod16 -> aligned
+    sub  rsp, 0xc8         ; locals -0x30, -0x60, -0x90, and (VAL-11) the
+                           ; powLimit target at -0xc0; 0xc8==8 mod16 -> aligned
+                           ; (same residue as the old 0xb8: nested-call
+                           ; alignment unchanged)
 
     mov r12, rdi           ; hdr (caller-saved clobbered by block_hash->sha256d)
 
@@ -210,10 +239,81 @@ pow_check:
 
     ; bits = *(u32 LE)(hdr+72)
     mov eax, [r12+72]
+
+    ; ---- VAL-11 (audit 2026-09-03): Core's CheckProofOfWorkImpl range
+    ; checks, mirrored from arith_uint256::SetCompact's flags. Previously the
+    ; hash was compared against a target derived from WHATEVER nBits claimed,
+    ; with no fNegative / ==0 / fOverflow tests -- so nBits=0x207fffff made
+    ; PoW free (VAL-7's zero-cost bogus tip) and a negative or overflowing
+    ; compact was "valid" math rather than invalid PoW.
+    ;   nWord = bits & 0x007fffff ; nSize = bits >> 24
+    ;   fNegative = nWord != 0 && (bits & 0x00800000)
+    ;   fOverflow = nWord != 0 && (nSize > 34 ||
+    ;               (nSize > 33 && nWord > 0xff) || (nSize > 32 && nWord > 0xffff))
+    ; plus Core's bnTarget == 0 rejection.
+    mov  edx, eax
+    shr  edx, 24                   ; nSize
+    and  eax, 0x007fffff           ; nWord
+    test eax, eax
+    jz   .invalid                  ; mantissa 0 -> target 0 -> badPoW
+    test dword [r12+72], 0x00800000
+    jnz  .invalid                  ; fNegative (nWord != 0 proven above)
+    cmp  edx, 34
+    jg   .invalid                  ; fOverflow: nSize > 34
+    cmp  edx, 33
+    jbe  .ov2
+    cmp  eax, 0xff
+    jg   .invalid                  ; nSize > 33 && nWord > 0xff
+.ov2:
+    cmp  edx, 32
+    jbe  .ovdone
+    cmp  eax, 0xffff
+    jg   .invalid                  ; nSize > 32 && nWord > 0xffff
+.ovdone:
+
     ; target_be[32] = diff_target(bits)
     lea rdi, [rbp-0x90]
-    mov esi, eax
+    mov esi, [r12+72]
     call diff_target
+
+    ; target == 0? (exponent < 3 zeroes the stored target even with a
+    ; nonzero mantissa; Core rejects bnTarget == 0).
+    lea  r8, [rbp-0x90]
+    xor  ecx, ecx
+.zt:
+    cmp  qword [r8+rcx*8], 0
+    jne  .zok
+    inc  ecx
+    cmp  ecx, 4
+    jb   .zt
+    jmp  .invalid
+.zok:
+
+    ; powLimit comparison, ARMED only: pow_pow_limit_bits is set by
+    ; chainparams_select from the chain's pow_limit_bits and defaults to 0
+    ; (off), so harnesses that mine trivial PoW without selecting a chain
+    ; (test_cons, block generators) keep working; the daemon arms it at boot
+    ; and the live chain can never accept a target above its powLimit
+    ; (Core: bnTarget > powLimit -> invalid).
+    mov  eax, [rel pow_pow_limit_bits]
+    test eax, eax
+    jz   .lmdone
+    lea  rdi, [rbp-0xc0]
+    mov  esi, eax
+    call diff_target
+    lea  r8, [rbp-0x90]            ; claimed target
+    lea  r9, [rbp-0xc0]            ; powLimit target
+    xor  ecx, ecx
+.lcmp:
+    movzx eax, byte [r8+rcx]
+    movzx edx, byte [r9+rcx]
+    cmp  eax, edx
+    jb   .lmdone                   ; target < powLimit: in range
+    ja   .invalid                  ; target > powLimit
+    inc  ecx                       ; equal so far; keep scanning
+    cmp  ecx, 32
+    jne  .lcmp                     ; fully equal == in range (Core: >)
+.lmdone:
 
     ; hash_be[32] = reverse(hash[32])
     lea r8,  [rbp-0x30+31]  ; src = hash + 31 (last byte first)
@@ -249,7 +349,7 @@ pow_check:
 .invalid:
     xor eax, eax
 .out:
-    add rsp, 0xb8
+    add rsp, 0xc8
     pop rbp
     pop r13
     pop r12
