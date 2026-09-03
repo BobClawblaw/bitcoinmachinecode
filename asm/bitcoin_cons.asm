@@ -173,6 +173,14 @@ cons_verify:
     mov  rsi, [rbp-0x20]
     mov  edx, [rbp-0x34]
     call merkle_root
+    ; VAL-6 (audit 2026-09-03): Core computes BlockMerkleRoot(block, &mutated)
+    ; and rejects a mutated tree (CVE-2012-2459) with "bad-txns-duplicate"
+    ; WITHOUT invalidating the header -- a block [A,B,C,C] shares its root AND
+    ; its block hash with [A,B,C], so storing it (both serve paths store on
+    ; cons_verify success) would displace the genuine block forever and stall
+    ; UTXO tracking. merkle_root returns the flag in eax; stash it (rbp-0x48
+    ; is inside our 1MB+ frame, below the used locals, above txid_tmp).
+    mov  [rbp-0x48], al
     ; compare merkle_out vs header field block+36
     lea  rdi, [rbp-0xd8]
     mov  rsi, [rbp-0x10]
@@ -180,6 +188,8 @@ cons_verify:
     mov  rcx, 32
     repe cmpsb
     jne  .fail
+    cmp  byte [rbp-0x48], 0
+    jne  .fail                ; mutated -> reject (Core bad-txns-duplicate)
     mov  eax, 1
     jmp  .ret
 .fail:
