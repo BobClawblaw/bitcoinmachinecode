@@ -216,10 +216,12 @@ static mpol_node*  mpol_nodes_base(void* st){ size_t cap = *(uint32_t*)((char*)s
 
 /* an optional "forget this txid" callback (daemon/mempool_cfg.c clears its
  * arrival-time table with it); NULL in the standalone tests */
-/* bytespersigop (Core DEFAULT_BYTES_PER_SIGOP 20): a sigop-dense transaction
- * pays fees as if it were max(vsize, sigop_cost*5) vbytes. The accept caller
- * computes the cost BEFORE admission and parks it here for the next
- * mpol_accept; consumed once. */
+/* bytespersigop (Core DEFAULT_BYTES_PER_SIGOP 20). The accept caller computes
+ * the sigop cost BEFORE admission -- it needs the UTXO view for the P2SH and
+ * witness counts, which mpol_accept does not have -- and parks it here.
+ * mpol_accept reads AND clears it as its first act, so a rejection cannot
+ * leave it parked for the next transaction. See the note at the top of
+ * mpol_accept for what it then feeds. */
 static uint64_t mpol_pending_sigops;
 static uint64_t mpol_bytes_per_sigop = 20;          /* Core DEFAULT_BYTES_PER_SIGOP */
 void mpool_policy_set_pending_sigops(unsigned long long cost_x4){ mpol_pending_sigops = cost_x4; }
@@ -914,6 +916,41 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     if (n_in <= 0){ _mpol_last_reason = "malformed transaction"; return 0; }
     uint64_t vsize = meta.vsize;
 
+    /* ---- bytespersigop: the sigop-adjusted virtual size ---------------------
+     * Core does not keep a "real" vsize and adjust it at the fee check. The
+     * ADJUSTED figure *is* the entry's size -- CTxMemPoolEntry::GetTxSize() is
+     * GetVirtualTransactionSize(weight, sigOpCost, nBytesPerSigOp) -- so it is
+     * what the fee floors, the replacement arithmetic, the ancestor and
+     * descendant byte budgets, eviction, mining and getmempoolentry all see.
+     * Computing it once, here, is what makes those agree; adjusting only the
+     * fee floor (which is what this file used to do) left a sigop-dense
+     * transaction paying Core's price on entry while occupying a smaller
+     * footprint than Core in every limit that came after.
+     *
+     * Core's formula exactly: ceil(max(weight, sigop_cost * bytespersigop) / 4).
+     * The max is taken on the WEIGHT scale and the rounding happens once, at
+     * the end. Taking it after dividing -- max(ceil(weight/4), sigops*bps/4) --
+     * rounds the sigop term down and undercharges by a byte whenever
+     * sigop_cost * bytespersigop is not a multiple of 4.
+     *
+     * The count is consumed HERE, on every path. It arrives through a global
+     * that the caller parks before the call (daemon/tx_accept.c's prechecks,
+     * which is where the UTXO view needed to count P2SH and witness sigops is
+     * already open), and this function has eight rejection paths between here
+     * and the old clearing site. A transaction rejected on any of them used to
+     * leave its count parked, and the NEXT transaction -- a different one,
+     * possibly with no sigops at all -- was then priced as though it carried
+     * them. Reading and clearing in the same breath is what makes that
+     * impossible rather than merely unlikely. */
+    { uint64_t sigops_x = mpol_pending_sigops;
+      mpol_pending_sigops = 0;
+      if (sigops_x){
+          uint64_t adj_w = meta.weight;
+          uint64_t sw = sigops_x * mpol_bytes_per_sigop;
+          if (sw > adj_w) adj_w = sw;
+          vsize = (adj_w + 3) / 4;
+      } }
+
     /* --- standardness (Core IsStandardTx order: before fees) --------------- */
     int n_dust = 0;
     { const char* r = standard_checks(pol, tx, txlen, &meta, prev[0], idx[0], &n_dust);
@@ -995,11 +1032,8 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * amount of fee from a child changes that. */
     { uint64_t eff_fee   = g_pkg_vsize ? g_pkg_fee   : fee;
       uint64_t eff_vsize = g_pkg_vsize ? g_pkg_vsize : vsize;
-      /* min relay floor over VSIZE (Core "min relay fee not met") */
-      /* sigop-adjusted virtual size (Core GetVirtualTransactionSize with
-       * bytespersigop=20): max(vsize, sigop_cost*5) */
-      { uint64_t sv = mpol_pending_sigops * mpol_bytes_per_sigop / 4;   /* cost is x4 units; Core: sigops*bytespersigop/WITNESS_SCALE_FACTOR */
-        if (sv > eff_vsize) { eff_vsize = sv; } mpol_pending_sigops = 0; }
+      /* min relay floor over VSIZE (Core "min relay fee not met"). vsize is
+       * already the sigop-adjusted size -- see the top of this function. */
       if (eff_fee * 1000 < eff_vsize * pol->relay_fee_rate){      /* both sides sat/kvB-scaled */
           _mpol_last_reason = "min relay fee not met"; return 0; }
       /* dynamic floor (sat/kvB, rolling decay) -- Core "mempool min fee not met" */
@@ -1206,11 +1240,12 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * that is the reason surfaced here too -- a caller diffing reject-reason
      * against Core must see the same token.
      *
-     * KNOWN DELTA, stated rather than hidden: Core measures these against
-     * the SIGOP-ADJUSTED vsize, and this layer only has the BIP141 vsize at
-     * add time (sigop cost is recorded after the fact). The two differ only
-     * for sigop-dense transactions, where Core's figure is the larger, so
-     * this is marginally more permissive there -- never less. */
+     * These are measured against the SIGOP-ADJUSTED vsize, as Core measures
+     * them: vsize carries the adjustment from the top of this function, so a
+     * sigop-dense transaction meets the TRUC size caps on the same figure Core
+     * uses. (Until 2026-09-03 only the fee floors were adjusted and these caps
+     * saw the plain BIP141 vsize, which was marginally more permissive than
+     * Core for exactly those transactions.) */
     if (!pol->accept_nonstd){
         const int is_truc = (meta.version == TRUC_VERSION);
 
