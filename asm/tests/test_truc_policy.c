@@ -112,6 +112,10 @@ static int is_truc_reject(long rv){
     const char* r = mpool_policy_reason(pol);
     return rv != 1 && r && !strcmp(r, "TRUC-violation");
 }
+static int is_reject(long rv, const char* want){
+    const char* r = mpool_policy_reason(pol);
+    return rv != 1 && r && !strcmp(r, want);
+}
 
 int main(void){
     static unsigned char A[64<<10], B[64<<10], C[64<<10];
@@ -126,14 +130,47 @@ int main(void){
     lb = mk_tx(B, 3, ida, 0, 1, 900000, 2);
     ck("v3 child of a v3 parent accepted", add(B, lb, idb) == 1);
 
-    printf("\n== the parent gets exactly ONE child ==\n");
-    /* a second child, spending the parent's OTHER output: no input conflict
-     * with the first child, so only the TRUC descendant rule can catch it */
-    lc = mk_tx(C, 3, ida, 1, 1, 900000, 3);
-    { long rv = add(C, lc, idc);
-      ck("a second v3 child is refused", is_truc_reject(rv));
-      unsigned long ml;
-      ck("...and is not in the pool", mpool_get(mp, idc, &ml) == NULL); }
+    printf("\n== the parent gets exactly ONE child: SIBLING EVICTION ==\n");
+    /* A second child spending the parent's OTHER output has no input conflict
+     * with the first, so ordinary RBF cannot reach it -- only the TRUC
+     * descendant rule sees it at all. Core does not simply refuse: it offers
+     * the sibling up for eviction and lets the ordinary replacement
+     * arithmetic decide. Both outcomes matter, so both are checked.
+     *
+     * The existing child B pays 1000000-900000 = 100000 sat. */
+    {   /* (a) an equal-paying challenger loses, and the REASON matters: it is
+         * the fee arithmetic that refuses it now, not the topology. Getting
+         * "TRUC-violation" here would mean sibling eviction never ran. */
+        lc = mk_tx(C, 3, ida, 1, 1, 900000, 3);
+        long rv = add(C, lc, idc);
+        ck("an equal-paying second child is refused", rv != 1);
+        ck("...on fee, not on topology", is_reject(rv, "insufficient fee"));
+        unsigned long ml;
+        ck("...and is not in the pool", mpool_get(mp, idc, &ml) == NULL);
+        ck("...and the sibling survives", mpool_get(mp, idb, &ml) != NULL);
+    }
+    {   /* (b) a challenger that clears the sibling's fee plus its own
+         * incremental relay cost takes its place. 1000000-899000 = 101000 sat
+         * against the sibling's 100000, and the ~110 vB child needs only a
+         * few hundred sat of increment at 1 sat/vB. */
+        lc = mk_tx(C, 3, ida, 1, 1, 899000, 3);
+        long rv = add(C, lc, idc);
+        ck("a better-paying second child is ACCEPTED", rv == 1);
+        unsigned long ml;
+        ck("...it is in the pool", mpool_get(mp, idc, &ml) != NULL);
+        ck("...and the sibling was evicted", mpool_get(mp, idb, &ml) == NULL);
+        ck("...the parent is still there", mpool_get(mp, ida, &ml) != NULL);
+    }
+    {   /* (c) the parent still gets exactly one child: the winner is now the
+         * sibling, and a third child must fight it on the same terms rather
+         * than accumulating. */
+        static unsigned char D[64<<10]; unsigned char idd[32];
+        unsigned long ld = mk_tx(D, 3, ida, 1, 1, 899500, 4);
+        long rv = add(D, ld, idd);
+        ck("a third child paying less than the incumbent is refused", rv != 1);
+        unsigned long ml;
+        ck("...the incumbent still holds the slot", mpool_get(mp, idc, &ml) != NULL);
+    }
 
     printf("\n== TRUC and non-TRUC do not mix, in EITHER direction ==\n");
     world(0);

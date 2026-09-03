@@ -340,9 +340,9 @@ tables and the writers themselves.
   disagree. Proven against Core v31.99 on regtest
   (`validation/bumpfee_regtest_e2e.sh`, 46 checks).
 
-  STATED GAPS, both strictly more conservative than Core:
-  - **TRUC sibling eviction** is not implemented, so a second TRUC child is
-    refused rather than being allowed to replace its sibling under RBF rules.
+  STATED GAPS, strictly more conservative than Core:
+  - ~~**TRUC sibling eviction**~~ — **DONE 2026-09-03**, see the update at the
+    end of this file.
   - Core's `package-error` is `"TOKEN, debug detail"` naming the offending
     txid and wtxid in prose; ours carries the token alone. The verdict
     matches; the diagnostic string is shorter.
@@ -1692,3 +1692,43 @@ the invs following on the worker's next rotations; Core returns at the same
 point for the same reason. Still not matched: inbound peers are served by the
 serve process on its own schedule, so the 5 s inbound interval Core uses is not
 modelled separately, and BIP339 `wtxidrelay` announcement remains txid-based.
+
+## Update 2026-09-03 — TRUC sibling eviction
+
+A second TRUC child was refused outright. It spends a different output of the
+parent, so it double-spends nothing and ordinary RBF cannot reach it; only the
+TRUC descendant rule saw it at all, and that rule said no.
+
+Core does not simply refuse. `SingleTRUCChecks` returns the existing child
+alongside the error, and `MemPoolAccept` adds it to the to-be-replaced set so
+the ordinary replacement arithmetic decides. The reason is the point of TRUC:
+a parent's fee is meant to be raisable through its one child, and without
+sibling eviction a child sitting at a low feerate means the only party who can
+ever rescue that parent is whoever owns the child. That is the pin the
+topology exists to abolish.
+
+Implemented in `bitcoin_mempool_policy.c`, offered only in the narrow shape
+Core insists on, because a wider one needs a rule for CHOOSING which
+descendant dies and Core deliberately has none: the parent must have exactly
+itself and one child, and that child exactly itself and the parent. Reorgs can
+leave wider shapes behind and those are still refused, as are package contexts
+(Core allows sibling eviction for a single transaction only). The sibling then
+faces the same replacement cap and the same `PaysForRBF` arithmetic as any
+other conflict, priced over the whole to-be-replaced set. What is deliberately
+NOT asked of it is BIP125 signalling — Core skips that here and says why, since
+a TRUC transaction can only acquire a non-signalling descendant through a
+reorg.
+
+`test_truc_policy` covers both outcomes, since only having the refusal proves
+nothing: an equal-paying challenger is refused **on fee rather than on
+topology** (a `TRUC-violation` there would mean the eviction path never ran),
+a challenger clearing the sibling's fee plus its own incremental relay cost is
+accepted and the sibling leaves the pool, the parent survives, and a third
+child must then beat the new incumbent rather than accumulating.
+
+NOT yet done: a regtest differential against real Core for this path. Every
+other claim here is checked against Core's source rather than its running
+behaviour, which is weaker than this project's usual bar — the existing
+package/TRUC work was proven on regtest against v31.99. Worth adding before
+this is called finished.
+
