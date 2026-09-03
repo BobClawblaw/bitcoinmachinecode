@@ -2331,7 +2331,20 @@ interp_checksig:
 	 * were being rejected anyway: the accept path gains no scan. pub
 	 * (x22/x23) is dead on this path, so x22 carries the error code; .cs_end
 	 * restores the saved originals. x19-x26 survive both sighash helpers
-	 * (they are callee-saved there, same dependence the CMS strip loop has). */
+	 * (they are callee-saved there, same dependence the CMS strip loop has).
+	 * GATED ON BASE (2026-09-03): Core runs the strip only for
+	 * sigversion == BASE (both the EvalChecksigPreTapscript block and the
+	 * CHECKMULTISIG k-loop read `if (sigversion == SigVersion::BASE)`).
+	 * Reachability: this funnel is reached only from the taproot
+	 * script_eval (its sole caller, bitcoin_taproot_verify.S, always runs
+	 * sigversion=TAPSCRIPT), and no flag builder sets CONST_SCRIPTCODE for
+	 * taproot spends -- so the ungated strip was LATENT, never live; the
+	 * A/B driver reproduces identical codes pre/post on every reachable
+	 * path. The gate still matches Core for every sigversion and keeps any
+	 * future caller from stripping under WITNESS_V0/TAPSCRIPT. */
+	ldr  x0,[x20,#48]
+	cmp  x0,#SIGVERSION_BASE
+	b.ne .cs_enc_keep
 	ldr  x0,[x20,#56]
 	tst  x0,#SCRIPT_VERIFY_CONST_SCRIPTCODE
 	b.eq .cs_enc_keep

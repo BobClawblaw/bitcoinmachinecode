@@ -2903,6 +2903,18 @@ interp_checksig:
     ; being rejected anyway: the accept path gains no scan. pub (r14/r15) is
     ; dead on this path, so r14 carries the internal error code; .end pops
     ; the saved originals.
+    ; GATED ON BASE (2026-09-03): Core runs the strip only for
+    ; sigversion == BASE (both the EvalChecksigPreTapscript block and the
+    ; CHECKMULTISIG k-loop read `if (sigversion == SigVersion::BASE)`).
+    ; Reachability: this funnel is reached only from the taproot script_eval
+    ; (its sole caller always runs sigversion=TAPSCRIPT), and no flag
+    ; builder sets CONST_SCRIPTCODE for taproot spends -- so the ungated
+    ; strip was LATENT, never live. The gate still matches Core for every
+    ; sigversion and keeps any future caller from stripping under
+    ; WITNESS_V0/TAPSCRIPT.
+    mov   eax, dword [r12+48]
+    cmp   eax, SIGVERSION_BASE
+    jne   .enc_keep
     mov   rax, [r12+56]
     test  rax, SCRIPT_VERIFY_CONST_SCRIPTCODE
     jz    .enc_keep
