@@ -543,7 +543,12 @@ while IFS=$'\x1f' read -r name kind why argv args; do
 done < "$OUT/sweep_plan.tsv"
 
 echo "==================== summary ====================" >> "$OUT/results.tsv"
-awk -F'\t' 'NR>1 && !/^=/ {c[$1]++} END {for (k in c) printf "%-10s %d\n", k, c[k]}' "$OUT/results.tsv" \
+# Count every result row: results.tsv has NO header (row 1 is data -- the old
+# NR>1 silently dropped bench_abi_audit, printing bench-ok 11 for 12 rows),
+# and the space-formatted summary lines appended below must never be counted
+# as data (with -F'\t' they are single-field lines, $2 empty -- the old
+# recount printed them back as "bench-ok 11 1" rows).
+awk -F'\t' '$2 != "" && $2 !~ /^[0-9]/ && !/^=/ {c[$1]++} END {for (k in c) printf "%-10s %d\n", k, c[k]}' "$OUT/results.tsv" \
     | sort >> "$OUT/results.tsv"
 echo "sweep complete ($N plan rows): $OUT/results.tsv"
-awk -F'\t' 'NR>1 && !/^=/ {c[$1]++} END {for (k in c) printf "%-10s %d\n", k, c[k]}' "$OUT/results.tsv" | sort
+awk -F'\t' '$2 != "" && $2 !~ /^[0-9]/ && !/^=/ {c[$1]++} END {for (k in c) printf "%-10s %d\n", k, c[k]}' "$OUT/results.tsv" | sort
