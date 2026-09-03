@@ -1725,11 +1725,42 @@ a challenger clearing the sibling's fee plus its own incremental relay cost is
 accepted and the sibling leaves the pool, the parent survives, and a third
 child must then beat the new incumbent rather than accumulating.
 
-NOT yet done: a regtest differential against real Core for this path. Every
-other claim here is checked against Core's source rather than its running
-behaviour, which is weaker than this project's usual bar — the existing
-package/TRUC work was proven on regtest against v31.99. Worth adding before
-this is called finished.
+~~NOT yet done: a regtest differential against real Core for this path.~~
+**DONE 2026-09-03**, closing the gap the same day it was raised —
+`validation/truc_sibling_core_diff.sh`. See the update further down this file
+for what it proves and how it was checked against a deliberate regression.
+
+## Update 2026-09-03 — TRUC sibling eviction, proven against real Core on regtest
+
+The sibling-eviction implementation above was checked against Core's SOURCE,
+not its running behaviour — weaker than this project's usual bar for exactly
+this kind of policy work. `validation/truc_sibling_core_diff.sh` closes that
+the same day: two disconnected regtest nodes (severed with
+`setnetworkactive false` right after height sync, so relay cannot let one
+node's verdict leak into the other's mempool), Core acting as BOTH the
+transaction factory and the judge — it builds, signs, and broadcasts every
+transaction, so nothing in the proof depends on this project's own signer —
+and each transaction submitted to both nodes over their own RPC.
+
+15 checks, all agreeing: a version-3 parent with two spendable outputs; the
+one child TRUC allows; a second child paying the same as the first, refused by
+both (on fee, `insufficient fee` on ours, `insufficient fee (including sibling
+eviction)` on Core's — the topology is no longer the reason either node gives);
+a second child paying well over the incumbent's fee, ACCEPTED by both, with the
+incumbent gone from both mempools by direct query, not just by an overall
+match; a third child that would have beaten the ORIGINAL incumbent but not the
+new one, refused by both. Mempools are compared as full txid sets after every
+step, not just spot-checked at the end.
+
+Checked in both directions, not just that it passes: the same harness run
+against the pre-sibling-eviction code (`bitcoin_mempool_policy.c` from before
+c43f97c) reproduces exactly the shape of bug this exists to catch —
+`core=accept bmc=reject(TRUC-violation)` on the eviction case, and the
+divergence then cascades into a mempool mismatch and a wrong verdict on the
+third-child case, because that one's correctness depends on the eviction
+having happened. A differential that cannot be made to fail proves nothing;
+this one fails in exactly the place the feature exists to fix, and only
+there.
 
 ## Update 2026-09-03 — `bytespersigop`, and the sigop count that outlived its transaction
 
@@ -1778,8 +1809,283 @@ submitted the transaction again, the duplicate was refused, and the case
 printed "ok" while quietly incrementing the failure count. It evaluates once
 now.
 
-Still unmatched: package effective-feerate aggregates (`pkg_vsize` in
-`daemon/main.c`) sum the plain BIP141 vsize rather than the adjusted one, so a
-sigop-dense member is priced slightly cheaply inside a package. Single-
-transaction admission, which is where `bytespersigop` is aimed, is correct.
+~~Still unmatched: package effective-feerate aggregates.~~ **CLOSED the same
+day.** Both aggregate sites — `daemon/main.c`'s `submitpackage` and
+`daemon/tx_relay.c`'s 1p1c relay — summed the plain BIP141 vsize from
+`mpol_package_well_formed`'s structural walker, which cannot count sigops
+because those need the UTXO view. Core aggregates over entry sizes, and an
+entry's size is the adjusted figure, so a sigop-dense member was priced
+slightly cheaply inside a package.
 
+The adjusted figure now comes back out of the dry run: `mpool_policy_test`
+gained a `vsize_out` alongside its existing `fee_out`, published as soon as the
+size is known and therefore reported even when the transaction is REJECTED —
+a member failing only on fee still contributes its size to the package total.
+Both callers use it, falling back to the walker's figure only for a member
+rejected before the policy layer ran, which never joins a total anyway.
+
+Deliberately a per-call out-parameter rather than another "last value" global.
+The bug fixed hours earlier in this same area was precisely a global set before
+a call and consumed later; adding a second one to carry the fix would have been
+the same mistake twice.
+
+
+## Update 2026-09-03 — the false-accept differential oracle was silently dead for over a day
+
+Asked for targeted differential tests aimed at accept-direction bugs in the
+hand-written assembly — this project's own stated structural risk, the one
+finding across three audits marked "not closeable by a patch" — the first
+useful action was checking whether the infrastructure that already exists for
+exactly this purpose still worked. It did not.
+
+`validation/core_verify_oracle.cpp` is the ground-truth `VerifyScript` oracle
+for two mature harnesses: `spend_corpus_diff.py` (random real mainnet spends
+plus generic mutations) and `synth_corpus_diff.py` (rule-targeted synthesis
+for multisig, CLTV, CSV, taproot, and the numeric resource limits). Their own
+git history is a genuine record of what this class of testing is for: incident
+#18, incident #21, a BIP66 false accept above height 363,725, two BIP341
+sighash false accepts, and the CHECKMULTISIG opcode-budget bug. The 2026-09-02
+commit that gave `tests/fuzz_verify_diff.c` its own oracle commands (lowercase
+`key`/`verify`/`signecdsa`/`signschnorr`) **replaced this file wholesale**
+instead of extending it, silently deleting the uppercase `VERIFY`/`TAPVERIFY`
+protocol the two older harnesses depend on.
+
+Nothing caught it for over a day. The build script still produced a valid
+binary. Both harnesses still ran to completion, exit 0. Every case timed out
+waiting 20 seconds for an answer this binary no longer gave, was correctly
+counted as an "engine failure" (the harness's own honest name for exactly this
+situation), and the headline verdict — **ZERO DIVERGENCES** — was technically
+true and completely meaningless, because nothing had actually been compared.
+A vacuous pass looks exactly like success; the only tell was an "engine
+failures: 7879" line buried at the bottom of output nobody had read since.
+
+Restored `VERIFY` and `TAPVERIFY` into the current file, reusing its own
+helpers rather than the deleted file's separate ones, so both protocols now
+coexist: the lowercase commands `fuzz_verify_diff.c` needs are untouched
+(reconfirmed clean), and the restored uppercase ones unblock the two Python
+harnesses. One thing the naive restoration got wrong, caught only by actually
+running mutation cases rather than trusting a clean compile: a transaction
+mutated past the point of deserializing at all now threw an uncaught
+exception instead of the original code's graceful `OK 0 tx-decode-fail`
+verdict, silently routing a handful of otherwise-comparable cases into the
+same "engine failure" bucket the missing commands had caused — a smaller
+copy of the exact bug being fixed. Fixed by wrapping the decode step locally;
+confirmed by a targeted reproduction going from 3 failures to 0.
+
+**Run for real, at scale, for the first time in over a day:**
+
+| Harness | Cases | Mutations agreed | Divergences |
+|---|---|---|---|
+| `spend_corpus_diff.py` (real mainnet spends) | 1,670 | 10,019 | 0 |
+| `synth_corpus_diff.py` (synthesized features) | 74 (+7,805 interpreter probes) | 95 | 0 |
+| `tests/fuzz_verify_diff` (whole-input, real sigs) | 5,000 | — | 0 |
+| `tests/fuzz_script_diff` (raw EvalScript) | 20,000 | — | 0 |
+
+One residual engine failure in the largest `spend_corpus_diff.py` run (1 in
+~11,700 round trips), not reproduced on an isolated re-run of the identical
+seed and logic — consistent with the harness's 20-second read timeout under
+the concurrent CPU load of the full `make -k test` gate running at the same
+time, not a functional defect.
+
+**The lesson this leaves behind, independent of the specific bug:** a
+differential harness that reports "zero divergences" without also reporting
+"and I actually compared something" can go silently blind. Both harnesses
+already had the right instinct — counting engine failures separately from
+divergences rather than folding them into the same number — but neither put
+that count anywhere a human would see it before believing the headline.
+Worth a follow-up: make a high engine-failure rate fail the run's exit code,
+not just its own line in the report, so a repeat of this specific mistake
+cannot again pass silently for a day.
+
+## Update 2026-09-03 — new targeted mutations: the SIGHASH_SINGLE three-way split, and P2WSH's size exemption
+
+Asked to extend coverage specifically for resource-limit and sighash edge
+cases, on top of the oracle restoration above. Two genuinely new differential
+classes, both found by reading Core's source and this project's own code
+side by side rather than by guessing at likely bug shapes.
+
+**The SIGHASH_SINGLE-with-no-matching-output rule is not one rule with three
+implementations — it is three DIFFERENT rules, one per sigversion, and only
+one of them had a differential before now.** Legacy substitutes the whole
+sighash with the constant `uint256(1)` (`SignatureHash`'s own historic
+compatibility hack, gated `sigversion != WITNESS_V0`). BIP143/witness v0
+zero-fills only the `hashOutputs` mid-hash inside an otherwise ordinary
+preimage — a narrower, different substitution, excluded from the legacy path
+by that same guard. BIP341/taproot does neither: `SigningDataSighash` returns
+`false` outright, so the sighash cannot even be computed and the spend is
+unconditionally invalid. `synth_sighash_single_bug()` tested only the first
+of these. `synth_sighash_single_v0_no_output()` and
+`synth_sighash_single_taproot_no_output()` add the other two.
+
+The taproot case is a regression test for a REAL, ALREADY-FIXED consensus
+false accept (`bitcoin_taproot_sighash.c`, 2026-08-22): the taproot sighash
+used to carry BIP143's zero-fill behaviour over verbatim, computing a
+signable hash where Core computes none, and accepting spends Core has always
+rejected — 130 of 945 vectors in the corpus that caught it were this exact
+case on real mainnet transactions, not a constructed corner. That diagnostic
+script is gone and nothing else in the tree names this input shape, so the
+fix has had zero regression coverage against Core since the day it landed.
+The new test signs with the OLD, WRONG formula on purpose — not a garbage
+signature that would be rejected for any reason, but the exact bytes a
+regressed implementation would happily accept — confirmed by computing both
+formulas over the same otherwise-valid inputs and checking they produce
+materially different hashes, so the test is known to discriminate rather
+than accidentally coincide.
+
+**P2WSH's witnessScript is not bounded by the 520-byte push-size limit the
+way a P2SH redeemScript is, and the reason is structural rather than a
+special case written for witness scripts.** A P2SH redeemScript must arrive
+as a scriptSig push, so the generic `MAX_SCRIPT_ELEMENT_SIZE` caps it at 520
+bytes before it is even considered. A P2WSH witnessScript instead arrives as
+the LAST witness stack item, popped off (`VerifyWitnessProgram`'s
+`SpanPopBack`) before Core's "no witness item over 520 bytes" check ever runs
+over what remains — so the script itself is invisible to that check, and its
+only real ceiling is the generic 10,000-byte `MAX_SCRIPT_SIZE` that also
+bounds a bare script. A hand-rolled implementation that applies "witness
+items are capped at 520 bytes" uniformly, without excluding the one that got
+popped, would reject spends Core accepts.
+`sv_verify_witness_v0` (`bitcoin_witness_v0.c`) gets this right by excluding
+index `nwit-1` from its per-item size loop — confirmed correct by reading it
+before writing the test, and now checked against Core rather than only
+against a reading of the file: `synth_p2wsh_script_size` proves a 521-byte
+witnessScript (over the P2SH cap) and a 10,000-byte one are both legal, and
+10,001 bytes is rejected.
+
+**A third case was designed, built, found genuinely infeasible, and dropped
+rather than shipped anyway.** The witness stack's own item-count check
+(`nstack > MAX_STACK` in `sv_verify_witness_v0`, evaluated before the script
+ever runs — distinct from `EvalScript`'s execution-time
+`stack.size()+altstack.size()` accumulation) looks like a candidate for the
+same treatment: 1000 pre-supplied witness arguments accepted, 1001 rejected.
+The reject side is trivially constructible (an empty or trivial witnessScript
+with too many leftover items fails the implicit witness-cleanstack rule
+regardless of the reason). The accept side is not: consuming anywhere near
+1000 pre-existing stack items down to the required single element costs more
+opcodes than the 201-opcode budget allows by any mechanism Bitcoin Script
+has — `OP_2DROP` needs 500 calls for 1000 items, and `OP_CHECKMULTISIG`
+charges its own pubkey count against the same budget it would need to spend,
+so large-N consumption is not just hard here but appears to be structurally
+impossible to construct as a genuinely valid spend at all. Confirmed
+numerically (402 items is the most `OP_2DROP` alone could ever clear within
+budget) before writing anything that would have tested the wrong thing under
+a misleading name.
+
+Full run after adding these: 79 synthesized cases (up from 74), 96 rule
+mutations, 7,805 interpreter probes, zero divergences, zero engine failures,
+zero synthesis errors.
+
+## Update 2026-09-03 — a full re-audit, requested after finding the document had drifted again
+
+This document has now self-corrected for drift twice before (2026-08-25,
+2026-08-27) and had drifted a third time. Four categories were re-audited
+from scratch — every "still open" / "absent" / "not implemented" claim was
+checked against the CURRENT source, not against this document's own prose,
+because the prose is exactly what was found unreliable.
+
+### The one finding that matters more than any doc correction
+
+**`assumevalid` is implemented and has been ACTIVE BY DEFAULT since
+2026-09-01** — `asm/daemon/utxo_live.c`'s `utxo_live_resolve_assumevalid`
+and `apply_block_at_inner`, defaulting to Core's own chain-default
+assumevalid hash rather than to `assumevalid=0`. Confirmed live on both the
+production-equivalent daemon and the fresh-install acceptance run currently
+in progress: both logged `assumevalid: block found at height 938343 --
+script evaluation skipped through it, resumed above` at boot. Every earlier
+passage in this document describing script verification as unconditional
+("this node verifies every script in every block", used to justify
+declining `assumevalid` as a "deliberate refusal") describes a true fact
+about 2026-08-21 that stopped being the default behavior on 2026-09-01, and
+was never corrected.
+
+**What this means for every "verified against Core, zero divergences"
+claim from a normal sync:** the UTXO set, proof-of-work, block structure,
+and every non-script consensus rule are still checked for the whole chain
+— those claims stand. But under the default config, ONLY the top ~27,000
+of ~965,000 blocks have their scripts independently checked against Core
+during that sync; the ~938,000 below the assumevalid height are trusted,
+exactly as real Core trusts them by default. The stronger claim —
+"every script in the whole chain, independently verified" — requires
+`assumevalid=0` explicitly, which is exactly what the item below still
+needs to prove.
+
+### Real bugs found (not documentation drift — actual defects)
+
+- **`gettxoutproof` still refuses without a block hash, citing "no
+  txindex"** (`asm/rpc_chain.c` around the `-5` error), even though
+  `txindex` has existed since 2026-08-26. The justification is false; the
+  refusal itself may or may not still be intended, but the STATED REASON
+  is wrong and should be fixed or restated.
+- **`getnetworkinfo` reports `proxy_randomize_credentials: false` and an
+  empty `proxy` string unconditionally** (`asm/rpc_node.c`'s `net_entry()`),
+  even though per-connection SOCKS5 credential randomization is real and
+  active (`asm/daemon/dialer.c`). The RPC answer misreports the node's own
+  configured behavior.
+- **`getaddressinfo`'s wallet-context fields are hardcoded stubs**
+  (`ismine`, `iswatchonly`, `ischange` always `false`, `pubkey` always
+  empty — `asm/rpc_commands.c`), regardless of whether the address is
+  actually the wallet's own. Filed under wallet gaps below as well, but
+  it is a correctness bug against a live wallet, not merely an absent
+  feature.
+
+### Confirmed genuinely still open (verified against source, not stale)
+
+- **Full-verification IBD benchmark vs Core** (`-assumevalid=0
+  -stopatheight`, second scratch datadir) — still never run. Now doubly
+  the point, given the finding above: this is the one way to get the
+  strong "every script, every block" claim rather than the default
+  "matches Core's own trust boundary" one.
+- `assumeutxo` / snapshot import — absent, large lift, no current need.
+- MuSig2 signing inside tapscript LEAF scripts (key-path MuSig2 is done;
+  a script-path leaf using MuSig2 is not signed — `asm/rpc_commands.c`).
+- `getaddressinfo` wallet-context stubs (see bugs above).
+- No keypool (`keypoolrefill` returns null) — deliberate, this node signs
+  on demand rather than pre-generating.
+- BIP331 package-relay WIRE NEGOTIATION (`sendpackages`/`pkgtxns`/
+  `ancpkginfo`) — package ACCEPTANCE (1p1c, the TRUC/ephemeral-dust rules)
+  is real and proven against Core; the separate wire protocol to announce
+  and request packages is not built. The project's own P2P summary row
+  overstates this as done; it is half-done.
+- Erlay/BIP330 reconciliation — negotiation only, wire-off, a deliberately
+  declared stopping point, unchanged since 2026-08-30.
+- REST interface, UPnP/NAT-PMP, `blockreconstructionextratxn`, `rpc.discover`
+  — all absent by explicit design, consistently described as such.
+- **Inbound-accepted transactions are not re-announced to this node's other
+  peer connections** (`asm/daemon/tx_relay.c`'s `txrelay_poll_leg` is only
+  ever called with outbound mux legs, `asm/daemon/main.c`). Distinct from
+  the 2026-09-03 own-transaction announcement work earlier today, which
+  fixed how WE originate an announcement, not how we relay one someone
+  else handed us onward past our outbound legs.
+
+### Confirmed CLOSED, contradicting older passages elsewhere in this file
+
+A representative sample, not exhaustive — each was independently confirmed
+against source before being listed here: BIP16/P2SH VerifyScript
+build-out; sigop/`bytespersigop` cost accounting (closed the same day, see
+above); pruning; MuSig2 key-path (BIP327); Branch-and-Bound coin selection
+(`asm/wallet_bnb.c`); `musig()` descriptors (BIP390); multipath descriptors
+(BIP389, `<a;b>`); PSBT v2 in the signer; `descriptorprocesspsbt` leaf/
+control-block synthesis; miniscript partial-signature extraction;
+`createwalletdescriptor`'s legacy/P2SH-segwit/bech32m activation;
+`-acceptstalefeeestimates`; `getrawtransaction` by bare txid;
+`coinstatsindex`'s RPC and live index; BIP23 `getblocktemplate` proposal
+mode; signet; roughly 27 keys in `config/bitcoin.sample.conf`'s own "CORE
+OPTIONS NOT SUPPORTED" table (that file, not this one, was the most
+out-of-date artifact found — it is described as authoritative and had not
+been updated to match `node_config.c` in some time); Tor/I2P/CJDNS address
+storage and re-gossip (BIP155/addrv2, all networks); Tor onion
+self-hosting; I2P inbound; CJDNS both directions; per-connection proxy
+randomization (the CODE is correct; only `getnetworkinfo`'s report of it
+is wrong, see bugs above); package relay ACCEPTANCE (distinct from the
+wire negotiation, still open, above).
+
+**Overall assessment.** This project is closer to Core parity than this
+document, even now, fully states — most of what it has called "open" in
+the last two weeks was already closed by the time it was read. The
+consensus interpreter, mempool/relay policy, wallet, RPC surface,
+indexing, and P2P networking are all substantially complete and checked
+against Core wherever a differential exists. What remains that is real:
+three small RPC-correctness bugs (above), a handful of deliberately
+declined features, the package-relay wire protocol, and — the one item
+worth treating as a priority — actually running a full, unconditional,
+`assumevalid=0` verification of this chain against Core, now that it is
+clear the routine sync path no longer does that by default.
