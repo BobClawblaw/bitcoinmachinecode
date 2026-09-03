@@ -124,6 +124,24 @@ int main(void){
     cki("  scriptlen(0xfd path)", (long)ti.in0_script_len, 8);
     cki("  n_out==0", ti.n_out, 0);
 
+    /* The VAL-8 wrapping-CompactSize / SER-2 over-read class is proven in
+     * tests/test_tx_bounds_fuzz.c -- the guard-page harness (this asm cannot
+     * be ASan-instrumented, so the only way to make a one-byte over-read a
+     * hard failure is a PROT_NONE page abutting the buffer). The MAX_SIZE
+     * cap and the version-only truncation are cheap return-value checks kept
+     * here. */
+    {
+        u8 w[16]; size_t n=0;
+        u32 one=1; memcpy(w+n,&one,4); n+=4;
+        w[n++]=0xfe;
+        u32 big=0x02000001u; memcpy(w+n,&big,4); n+=4;
+        cki("tx_parse rejects n_in above MAX_SIZE", tx_parse((u64*)&ti, w, n), 0);
+    }
+    {
+        u8 four[4]; u32 one=1; memcpy(four,&one,4);
+        cki("tx_parse rejects version-only tx (4 bytes)", tx_parse((u64*)&ti, four, 4), 0);
+    }
+
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }
