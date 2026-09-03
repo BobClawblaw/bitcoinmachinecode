@@ -33,6 +33,11 @@ typedef struct {
      * script_eval. Without it, an empty pubkey pushes false and a script like
      * `OP_CHECKSIG OP_DROP OP_1` SUCCEEDS where Core fails it. */
     int hard_fail;
+    /* Core's exact ScriptError for the hard failure (SCR-3, audit
+     * 2026-09-03): EMPTY_PUBKEY vs VALIDATION_WEIGHT vs VERIFY matter to
+     * the error code reported to RPC/accept; the verdict (fail) does not
+     * change. 0 = not set. */
+    int hard_err;
 } taproot_checksig_ctx;
 
 extern uint64_t taproot_checksig_fn(void*, const uint8_t*, size_t,

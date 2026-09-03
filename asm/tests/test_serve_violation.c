@@ -159,6 +159,45 @@ int main(void){
     g_want_reason = "oversized message announcement";
     g_cmd = "inv";
 
+    printf("== getblocktxn index bounds (audit 2026-09-03 NET-1) ==\n");
+    /* NET-1: the old parser wrote one u16 per announced count into s_idxbuf
+     * (512 entries) with no capacity check and no payload-length bound, so a
+     * getblocktxn with count 0xfd 0xff 0xff sprayed 131 KB of attacker bytes
+     * over .data and re-read stale bytes from earlier traffic. Core answers
+     * Misbehaving(100) and sends nothing. A malformed index vector must now
+     * score the peer; a count above the s_idxbuf capacity must too. */
+    { g_cmd = "getblocktxn"; g_want_reason = "getblocktxn with malformed or out-of-bounds tx indices";
+      /* the handler reads a payload >= 33 bytes; the count and diffs live at
+       * pl_buf+32, so every vector below is padded with 32 hash bytes. */
+      static unsigned char gt[32 + 3 + 512*2];
+      memset(gt, 0xAA, 32);                 /* blockhash (won't match; see note) */
+      /* (a) count 0xffff but NO index bytes at all: every diff read runs off
+       * the announced payload -> scores (the old code read stale pl_buf). */
+      gt[32] = 0xfd; gt[33] = 0xff; gt[34] = 0xff;
+      g_body = gt; g_blen = 35;
+      int rc = run_case(35, 0);
+      ck("count 0xffff with no index bytes scores a violation", rc == 70);
+      if (rc == 72) printf("        fired with the wrong reason\n");
+      if (rc == 71) printf("        the loop dropped it WITHOUT reporting\n");
+      /* (b) count 0xfd 0x0201 = 513 entries (one past s_idxbuf), all diffs 0:
+       * the old code wrote 513 u16 -> 1026 bytes over a 1024-byte buffer. */
+      gt[32] = 0xfd; gt[33] = 0x01; gt[34] = 0x02;
+      for (int i = 0; i < 513; i++) gt[35 + i] = 0x00;   /* 1-byte diffs, idx 0 */
+      g_blen = 35 + 513;
+      rc = run_case(g_blen, 0);
+      ck("513 indexes (past s_idxbuf capacity) scores a violation", rc == 70);
+      if (rc == 72) printf("        fired with the wrong reason\n");
+      if (rc == 71) printf("        the loop dropped it WITHOUT reporting\n");
+      /* (c) the bound must NOT fire on an ordinary vector: 3 one-byte diffs */
+      gt[32] = 3;
+      gt[33] = 0; gt[34] = 0; gt[35] = 0;
+      g_blen = 36;
+      ck("a 3-index request reports nothing (block miss is silent, not scored)",
+         run_case(g_blen, 0) == 71);
+      g_body = 0; g_blen = 0; g_cmd = "inv"; }
+    g_want_reason = "oversized message announcement";
+    g_cmd = "inv";
+
     printf("== the boundary ==\n");
     { int rc = run_case(4000001u, 0);
       ck("one byte over the limit reports", rc == 70); }

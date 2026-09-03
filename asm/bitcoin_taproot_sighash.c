@@ -15,6 +15,7 @@
  */
 #include <stdint.h>
 #include "bitcoin_taproot_ctx.h"
+#include "script_error_codes.h"
 #include <string.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -751,17 +752,31 @@ uint64_t taproot_checksig_fn(void* cptr, const uint8_t* sig, size_t siglen,
     /* BIP342, in Core's order (EvalChecksigTapscript). `success` is simply
      * "a signature was supplied"; the pubkey-size rules are evaluated
      * REGARDLESS of it, which is why the empty-signature case cannot return
-     * early here. */
+     * early here. (SCR-3, audit 2026-09-03: the interpreter's empty-sig
+     * shortcut used to skip this callback entirely under tapscript, so the
+     * publen==0 rule below never fired and `OP_0 OP_0 OP_CHECKSIG OP_NOT`
+     * was accepted where Core fails the script with
+     * TAPSCRIPT_EMPTY_PUBKEY. The interpreter now routes tapscript CHECKSIG/
+     * CHECKSIGADD here unconditionally.) */
     int success = (siglen != 0);
     if (success) {
         c->weight_left -= 50;
-        if (c->weight_left < 0) { c->hard_fail = 1; return 0; }  /* budget exceeded */
+        if (c->weight_left < 0) { c->hard_fail = 1; c->hard_err = SCRIPT_ERR_TAPSCRIPT_VALIDATION_WEIGHT; return 0; }  /* budget exceeded */
     }
 
     if (publen == 0) {
-        /* Core: SCRIPT_ERR_PUBKEYTYPE -- the script is invalid, not false. */
+        /* Core: SCRIPT_ERR_TAPSCRIPT_EMPTY_PUBKEY -- the script is invalid,
+         * not false. The script FAILS even with an empty signature. (SCR-3,
+         * audit 2026-09-03.) */
         c->hard_fail = 1;
-        return 0;
+        c->hard_err = SCRIPT_ERR_TAPSCRIPT_EMPTY_PUBKEY;
+        return 1;   /* rax = 1 = the interpreter's "checker call SUCCEEDED"
+                     * protocol bit (sv_checksig returns 1 for a well-formed
+                     * call, verdict in the ctx; taproot_verify_input fails
+                     * the script on hard_fail regardless). 0 would be
+                     * misread as "script failed" by the CHECKSIG arm and
+                     * turn CHECKSIG into a pushed-false, the exact bug
+                     * this rule exists to prevent. */
     }
 
     if (publen != 32) {
