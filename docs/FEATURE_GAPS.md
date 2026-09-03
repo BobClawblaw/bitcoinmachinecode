@@ -1829,3 +1829,70 @@ The bug fixed hours earlier in this same area was precisely a global set before
 a call and consumed later; adding a second one to carry the fix would have been
 the same mistake twice.
 
+
+## Update 2026-09-03 — the false-accept differential oracle was silently dead for over a day
+
+Asked for targeted differential tests aimed at accept-direction bugs in the
+hand-written assembly — this project's own stated structural risk, the one
+finding across three audits marked "not closeable by a patch" — the first
+useful action was checking whether the infrastructure that already exists for
+exactly this purpose still worked. It did not.
+
+`validation/core_verify_oracle.cpp` is the ground-truth `VerifyScript` oracle
+for two mature harnesses: `spend_corpus_diff.py` (random real mainnet spends
+plus generic mutations) and `synth_corpus_diff.py` (rule-targeted synthesis
+for multisig, CLTV, CSV, taproot, and the numeric resource limits). Their own
+git history is a genuine record of what this class of testing is for: incident
+#18, incident #21, a BIP66 false accept above height 363,725, two BIP341
+sighash false accepts, and the CHECKMULTISIG opcode-budget bug. The 2026-09-02
+commit that gave `tests/fuzz_verify_diff.c` its own oracle commands (lowercase
+`key`/`verify`/`signecdsa`/`signschnorr`) **replaced this file wholesale**
+instead of extending it, silently deleting the uppercase `VERIFY`/`TAPVERIFY`
+protocol the two older harnesses depend on.
+
+Nothing caught it for over a day. The build script still produced a valid
+binary. Both harnesses still ran to completion, exit 0. Every case timed out
+waiting 20 seconds for an answer this binary no longer gave, was correctly
+counted as an "engine failure" (the harness's own honest name for exactly this
+situation), and the headline verdict — **ZERO DIVERGENCES** — was technically
+true and completely meaningless, because nothing had actually been compared.
+A vacuous pass looks exactly like success; the only tell was an "engine
+failures: 7879" line buried at the bottom of output nobody had read since.
+
+Restored `VERIFY` and `TAPVERIFY` into the current file, reusing its own
+helpers rather than the deleted file's separate ones, so both protocols now
+coexist: the lowercase commands `fuzz_verify_diff.c` needs are untouched
+(reconfirmed clean), and the restored uppercase ones unblock the two Python
+harnesses. One thing the naive restoration got wrong, caught only by actually
+running mutation cases rather than trusting a clean compile: a transaction
+mutated past the point of deserializing at all now threw an uncaught
+exception instead of the original code's graceful `OK 0 tx-decode-fail`
+verdict, silently routing a handful of otherwise-comparable cases into the
+same "engine failure" bucket the missing commands had caused — a smaller
+copy of the exact bug being fixed. Fixed by wrapping the decode step locally;
+confirmed by a targeted reproduction going from 3 failures to 0.
+
+**Run for real, at scale, for the first time in over a day:**
+
+| Harness | Cases | Mutations agreed | Divergences |
+|---|---|---|---|
+| `spend_corpus_diff.py` (real mainnet spends) | 1,670 | 10,019 | 0 |
+| `synth_corpus_diff.py` (synthesized features) | 74 (+7,805 interpreter probes) | 95 | 0 |
+| `tests/fuzz_verify_diff` (whole-input, real sigs) | 5,000 | — | 0 |
+| `tests/fuzz_script_diff` (raw EvalScript) | 20,000 | — | 0 |
+
+One residual engine failure in the largest `spend_corpus_diff.py` run (1 in
+~11,700 round trips), not reproduced on an isolated re-run of the identical
+seed and logic — consistent with the harness's 20-second read timeout under
+the concurrent CPU load of the full `make -k test` gate running at the same
+time, not a functional defect.
+
+**The lesson this leaves behind, independent of the specific bug:** a
+differential harness that reports "zero divergences" without also reporting
+"and I actually compared something" can go silently blind. Both harnesses
+already had the right instinct — counting engine failures separately from
+divergences rather than folding them into the same number — but neither put
+that count anywhere a human would see it before believing the headline.
+Worth a follow-up: make a high engine-failure rate fail the run's exit code,
+not just its own line in the report, so a repeat of this specific mistake
+cannot again pass silently for a day.
