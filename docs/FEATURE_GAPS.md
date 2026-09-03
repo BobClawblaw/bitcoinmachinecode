@@ -340,9 +340,9 @@ tables and the writers themselves.
   disagree. Proven against Core v31.99 on regtest
   (`validation/bumpfee_regtest_e2e.sh`, 46 checks).
 
-  STATED GAPS, both strictly more conservative than Core:
-  - **TRUC sibling eviction** is not implemented, so a second TRUC child is
-    refused rather than being allowed to replace its sibling under RBF rules.
+  STATED GAPS, strictly more conservative than Core:
+  - ~~**TRUC sibling eviction**~~ — **DONE 2026-09-03**, see the update at the
+    end of this file.
   - Core's `package-error` is `"TOKEN, debug detail"` naming the offending
     txid and wtxid in prose; ours carries the token alone. The verdict
     matches; the diagnostic string is shorter.
@@ -477,11 +477,10 @@ example moved to `whitebind`, which is still genuinely unimplemented. An
 example that has quietly become false is the same defect this section is
 about.)*
 
-*Deliberately not done, and why.* `bytespersigop` needs Core's
-`max(weight, sigop_cost x bytes_per_sigop)` at fee-check time, but this
-node's `vsize` comes from weight alone and the sigop cost is recorded after
-acceptance — implementing it means restructuring when that cost is computed,
-and a half-wired fee policy is worse than an absent option.
+*Deliberately not done, and why.* ~~`bytespersigop`~~ — **DONE 2026-09-03**,
+see the update at the end of this file; the restructuring this paragraph
+called for turned out to be small, and finding it half-wired was worse than
+either state.
 `persistmempool`'s machinery (`mempool_dump_write`/`read`) is written and
 tested but called from nowhere; wiring the save path touches shutdown, which
 must stay fast for the SIGKILL window. `fixedseeds` gates a hardcoded IP seed
@@ -1643,3 +1642,144 @@ not how many headers follow. (3) The download workers' dead-weight rule
 (bytes per second only) banned honest peers serving the tiny early blocks;
 it now also requires a low block rate. The run continues from a fresh clone of the
 fixed tree; `phase.log` / `progress.log` / `RESULT` in the run directory.
+
+## Update 2026-09-03 — our own transactions now announce like Core's, instead of being pushed
+
+Transactions this node originates (`sendrawtransaction`, and every wallet send,
+which routes through it) went out as an unsolicited `tx` message written to
+every peer leg in the same instant. Relay-*received* transactions had used the
+proper `inv` path since 2026-08-26; own transactions never joined them, and the
+gap was not written down here before now.
+
+Both halves of the old behaviour identified this node as the origin. An
+unsolicited transaction is not what a relaying node sends: anything merely
+passing one along announces the txid and waits for `getdata`, so a peer handed
+the bytes unprompted can tell it is talking to the source. And Core spreads
+announcements over an independent Poisson timer per peer precisely because
+simultaneous delivery on every leg is the signature of the node a transaction
+started at — a relayer's announcements have already been smeared by the hop
+that reached it.
+
+The justification in `daemon/tx_submit.c` was that the download worker runs no
+serve loop to answer a follow-up `getdata`. That had stopped being true:
+`daemon/tx_relay.c`'s drain answers `getdata(MSG_TX/MSG_WITNESS_TX)` from the
+shared mempool, which is how relayed transactions already propagate. Own
+transactions now use the same announce queue.
+
+The queue gained a per-leg timer to match Core: each leg draws its own
+next-send time from an exponential with mean 2 s (`m_next_inv_send_time`,
+`OUTBOUND_INVENTORY_BROADCAST_INTERVAL`), starting the moment the leg appears
+so the first announcement of a session is staggered too. The deviate is
+computed without `libm`, which nothing in this build links: for uniform 64-bit
+`r`, `-ln(r/2^64)` is `(clz+1)*ln2` minus the log of the normalised mantissa,
+taken from a 65-entry table with linear interpolation. `test_tx_relay` holds it
+to the distribution rather than the mean alone — over 200,000 draws, measured
+mean 1998.3 ms against 2000, `P(>m)` 0.3678 against `1/e`, `P(>2m)` 0.1352
+against `1/e²`.
+
+One defect surfaced only because the test went looking. A descriptor is
+recycled the instant a leg closes, so a re-dialled leg inherited the previous
+peer's slot — including a timer already due, announcing to the new peer at once
+and defeating the stagger exactly when legs churn most. `txrelay_leg_reset` is
+called from all three sites that hand a leg a fresh descriptor, and
+`txrelay_announce` independently re-arms any descriptor absent on the previous
+call, so a dial site added later and left unwired cannot degrade the stagger
+silently.
+
+`sendrawtransaction` now returns once the transaction is in the mempool, with
+the invs following on the worker's next rotations; Core returns at the same
+point for the same reason. Still not matched: inbound peers are served by the
+serve process on its own schedule, so the 5 s inbound interval Core uses is not
+modelled separately, and BIP339 `wtxidrelay` announcement remains txid-based.
+
+## Update 2026-09-03 — TRUC sibling eviction
+
+A second TRUC child was refused outright. It spends a different output of the
+parent, so it double-spends nothing and ordinary RBF cannot reach it; only the
+TRUC descendant rule saw it at all, and that rule said no.
+
+Core does not simply refuse. `SingleTRUCChecks` returns the existing child
+alongside the error, and `MemPoolAccept` adds it to the to-be-replaced set so
+the ordinary replacement arithmetic decides. The reason is the point of TRUC:
+a parent's fee is meant to be raisable through its one child, and without
+sibling eviction a child sitting at a low feerate means the only party who can
+ever rescue that parent is whoever owns the child. That is the pin the
+topology exists to abolish.
+
+Implemented in `bitcoin_mempool_policy.c`, offered only in the narrow shape
+Core insists on, because a wider one needs a rule for CHOOSING which
+descendant dies and Core deliberately has none: the parent must have exactly
+itself and one child, and that child exactly itself and the parent. Reorgs can
+leave wider shapes behind and those are still refused, as are package contexts
+(Core allows sibling eviction for a single transaction only). The sibling then
+faces the same replacement cap and the same `PaysForRBF` arithmetic as any
+other conflict, priced over the whole to-be-replaced set. What is deliberately
+NOT asked of it is BIP125 signalling — Core skips that here and says why, since
+a TRUC transaction can only acquire a non-signalling descendant through a
+reorg.
+
+`test_truc_policy` covers both outcomes, since only having the refusal proves
+nothing: an equal-paying challenger is refused **on fee rather than on
+topology** (a `TRUC-violation` there would mean the eviction path never ran),
+a challenger clearing the sibling's fee plus its own incremental relay cost is
+accepted and the sibling leaves the pool, the parent survives, and a third
+child must then beat the new incumbent rather than accumulating.
+
+NOT yet done: a regtest differential against real Core for this path. Every
+other claim here is checked against Core's source rather than its running
+behaviour, which is weaker than this project's usual bar — the existing
+package/TRUC work was proven on regtest against v31.99. Worth adding before
+this is called finished.
+
+## Update 2026-09-03 — `bytespersigop`, and the sigop count that outlived its transaction
+
+This was recorded above as deliberately not done, on the grounds that vsize
+came from weight alone and the sigop cost was recorded after acceptance. Half
+of that had already stopped being true. A `mpol_pending_sigops` hook existed,
+`daemon/tx_accept.c` set it from its prechecks (where the UTXO view needed for
+the P2SH and witness counts is already open), and the two entry fee floors were
+already using `max(vsize, sigops*bytespersigop/4)`. The option was neither
+absent nor implemented, which is the state the paragraph above rightly called
+worse than either.
+
+**Three things were wrong, and the third was a live bug.**
+
+*The adjustment reached only the fee floors.* Core does not keep a real vsize
+and adjust it at the fee gate: `CTxMemPoolEntry::GetTxSize()` **is** the
+adjusted figure, so the replacement arithmetic, the ancestor and descendant
+byte budgets, the TRUC size caps, eviction, mining and `getmempoolentry` all
+see it. Ours saw the plain BIP141 vsize everywhere after the fee check, so a
+sigop-dense transaction paid Core's price to get in and then occupied a smaller
+footprint than Core in every limit that followed. The adjustment is now
+computed once, at the top of `mpol_accept`, and is the entry's size.
+
+*The rounding was Core's formula rearranged.* Core takes the max on the
+**weight** scale and rounds once at the end:
+`ceil(max(weight, sigop_cost * bytespersigop) / 4)`. Taking the max after
+dividing rounds the sigop term down and undercharges by a byte whenever
+`sigop_cost * bytespersigop` is not a multiple of 4. Invisible at the default
+`bytespersigop` of 20, which is itself a multiple of 4 — so the test uses a
+value that is not.
+
+*A rejected transaction left its sigop count parked for the next one.* The
+count arrives through a global that the caller sets before the call, and it was
+cleared at the fee gate — with eight rejection paths between the top of the
+function and that point. A sigop-dense transaction rejected on any of them left
+its count behind, and the next transaction, a different one that might carry no
+sigops at all, was priced as though it did. `mpol_accept` now reads and clears
+it in the same breath, as its first act. The test proves the bug rather than
+the fix: run it against the previous code and the follow-up transaction is
+refused with "min relay fee not met".
+
+Also fixed while here: `test_mempool_policy`'s `okv` macro evaluated its
+condition **twice**, once for the label and once for the counter. A check whose
+condition had a side effect ran it twice, so `okv(mpool_policy_add(...) == 1)`
+submitted the transaction again, the duplicate was refused, and the case
+printed "ok" while quietly incrementing the failure count. It evaluates once
+now.
+
+Still unmatched: package effective-feerate aggregates (`pkg_vsize` in
+`daemon/main.c`) sum the plain BIP141 vsize rather than the adjusted one, so a
+sigop-dense member is priced slightly cheaply inside a package. Single-
+transaction admission, which is where `bytespersigop` is aimed, is correct.
+

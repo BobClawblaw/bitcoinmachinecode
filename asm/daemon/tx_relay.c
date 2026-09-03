@@ -46,6 +46,8 @@
 #include <stdlib.h>
 #include <poll.h>
 #include <time.h>
+#include <fcntl.h>     /* /dev/urandom seed for the per-leg announce timer */
+#include <unistd.h>
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -280,21 +282,120 @@ static long txr_orph_parked, txr_orph_resolved, txr_orph_dropped;   /* counters 
 static long txr_drop_ttl, txr_drop_evict, txr_drop_reject, txr_parent_req;   /* why they dropped; how many parents we asked for */
 
 /* ---- announce queue ------------------------------------------------------
- * A relay-received transaction we accepted should propagate onward: queue
- * its txid (with the fd it CAME from, so the sender is not told about its
- * own tx) and let txrelay_announce -- called once per worker rotation --
- * send one inv per leg covering everything accepted since the last call.
+ * A transaction we accepted should propagate onward: queue its txid (with
+ * the fd it CAME from, so the sender is not told about its own tx) and let
+ * txrelay_announce -- called once per worker rotation -- send invs out.
  * Announcements use MSG_TX (type 1): we do not negotiate BIP339, so txid-
  * based announcement is the correct dialect, and a peer that wants the tx
  * asks with getdata -- which the drain below now answers from the pool
  * (the pool stores the full witness serialization we validated). Bounded:
  * a rotation that accepts more than the queue holds simply announces the
  * first TXR_ANN_MAX; the rest still propagate through every other node
- * that accepted them. */
-#define TXR_ANN_MAX 64
+ * that accepted them.
+ *
+ * WHEN each leg is told is as load-bearing as whether it is told, and this
+ * is why the flush below is per-leg and not one pass over all of them.
+ * Announcing the same txid to every peer in the same instant is the
+ * signature of the node that ORIGINATED it: a relayer's announcements are
+ * already spread out by the hop that reached it, so simultaneous delivery
+ * on every leg says "this started here". Core spreads its announcements
+ * with an independent Poisson timer per peer (PeerManagerImpl's
+ * m_next_inv_send_time, mean OUTBOUND_INVENTORY_BROADCAST_INTERVAL = 2 s
+ * outbound), which is memoryless: seeing one announcement tells an observer
+ * nothing about when the next is due. We do the same, per leg, from the
+ * moment the leg appears -- so the first transaction of a session is
+ * staggered too, rather than fanning out to everything at once.
+ *
+ * The exponential deviate is computed WITHOUT libm, which nothing in this
+ * build links: for a uniform 64-bit r, u = r/2^64 lies in
+ * [2^-(k+1), 2^-k) where k = clz(r), and -ln(u) = (k+1)*ln2 - ln(m) for the
+ * normalised mantissa m = (r << k)/2^63 in [1,2). ln(m) comes from a
+ * 65-entry table with linear interpolation, which is far finer than a jitter
+ * timer needs. */
+#define TXR_ANN_MAX  64
+#define TXR_ANN_LEGS 64            /* matches main.c's MUX_MAX_OUT */
+#define TXR_ANN_MEAN_MS 2000       /* Core OUTBOUND_INVENTORY_BROADCAST_INTERVAL */
 static u8  txr_ann[TXR_ANN_MAX][32];
 static int txr_ann_src[TXR_ANN_MAX];
 static int txr_ann_n;
+
+static long long txr_now_ms(void);
+
+/* per-leg pending announcements and the leg's own next-send time */
+static int       txr_leg_fd[TXR_ANN_LEGS];
+static long long txr_leg_next[TXR_ANN_LEGS];
+static u8        txr_leg_pend[TXR_ANN_LEGS][TXR_ANN_MAX][32];
+static int       txr_leg_pend_n[TXR_ANN_LEGS];
+static int       txr_leg_ready;          /* slots initialised (fd 0 is legal) */
+
+/* Mean of the per-leg timer. 0 makes every flush immediate, which is how the
+ * tests get a deterministic announcement without sleeping; production never
+ * calls this and keeps Core's 2 s. */
+static long txr_ann_mean_ms = TXR_ANN_MEAN_MS;
+void txrelay_test_set_announce_mean_ms(long ms){
+    txr_ann_mean_ms = ms < 0 ? 0 : ms;
+    /* re-arm every live slot against the new mean, so a test that shortens
+     * the interval is not held up by a timer drawn under the old one */
+    if (txr_ann_mean_ms == 0)
+        for (int i = 0; i < TXR_ANN_LEGS; i++) txr_leg_next[i] = 0;
+}
+
+static unsigned long long txr_rng_s;
+static unsigned long long txr_rng64(void){
+    if (!txr_rng_s){
+        int fd = open("/dev/urandom", O_RDONLY);
+        if (fd >= 0){ if (read(fd, &txr_rng_s, 8) != 8) txr_rng_s = 0; close(fd); }
+        if (!txr_rng_s) txr_rng_s = (unsigned long long)txr_now_ms() * 6364136223846793005ULL + 1;
+    }
+    unsigned long long z = (txr_rng_s += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+/* ln(1 + j/64) for j = 0..64 */
+static const double txr_ln_tab[65] = {
+    0, 0.015504186535965254, 0.030771658666753687, 0.045809536031294201,
+    0.06062462181643484, 0.075223421237587532, 0.089612158689687138, 0.10379679368164356,
+    0.11778303565638346, 0.13157635778871926, 0.14518200984449789, 0.15860503017663857,
+    0.17185025692665923, 0.18492233849401199, 0.19782574332991987, 0.21056476910734964,
+    0.22314355131420976, 0.23556607131276691, 0.24783616390458127, 0.25995752443692605,
+    0.27193371548364176, 0.28376817313064462, 0.2954642128938359, 0.30702503529491187,
+    0.31845373111853459, 0.32975328637246798, 0.34092658697059319, 0.3519764231571782,
+    0.36290549368936847, 0.37371640979358406, 0.38441169891033206, 0.39499380824086899,
+    0.40546510810816438, 0.41582789514371099, 0.42608439531090009, 0.43623676677491807,
+    0.44628710262841953, 0.45623743348158757, 0.46608972992459924, 0.47584590486996392,
+    0.48550781578170082, 0.49507726679785152, 0.50455601075239531, 0.51394575110223428,
+    0.52324814376454787, 0.53246479886947184, 0.54159728243274441, 0.5506471179526623,
+    0.55961578793542266, 0.56850473535266877, 0.57731536503482361, 0.58604904500357824,
+    0.59470710774669278, 0.60329085143808425, 0.61180154110599294, 0.62024040975185757,
+    0.62860865942237409, 0.63690746223706918, 0.6451379613735847, 0.65330127201274568,
+    0.66139848224536502, 0.66943065394262924, 0.67739882359180614, 0.68530400309891937,
+    0.69314718055994529
+};
+
+/* an exponentially distributed delay with the given mean, in milliseconds */
+static long long txr_exp_ms(long mean_ms){
+    if (mean_ms <= 0) return 0;
+    unsigned long long r = txr_rng64();
+    if (!r) r = 1;
+    int k = __builtin_clzll(r);
+    unsigned long long n = r << k;              /* MSB set: m = n/2^63 in [1,2) */
+    /* 6 bits of table index, the next 16 bits interpolate between entries */
+    unsigned idx  = (unsigned)((n >> 57) & 63);
+    unsigned frac = (unsigned)((n >> 41) & 0xFFFF);
+    double lnm = txr_ln_tab[idx] +
+                 (txr_ln_tab[idx+1] - txr_ln_tab[idx]) * ((double)frac / 65536.0);
+    double d = ((double)(k + 1) * 0.69314718055994531 - lnm) * (double)mean_ms;
+    if (d < 0) d = 0;
+    if (d > (double)mean_ms * 20.0) d = (double)mean_ms * 20.0;   /* bound the tail */
+    return (long long)d;
+}
+
+/* test hook: one raw draw from the announce timer's distribution, so a test
+ * can check the shape of it (exponential, mean as asked) rather than only
+ * the behaviour that rides on it. */
+long long txrelay_test_exp_draw(long mean_ms){ return txr_exp_ms(mean_ms); }
 
 static void txr_ann_add(const u8 txid[32], int src_fd){
     if (txr_ann_n >= TXR_ANN_MAX) return;
@@ -303,26 +404,111 @@ static void txr_ann_add(const u8 txid[32], int src_fd){
     txr_ann_n++;
 }
 
-/* announce everything queued since the last call to every live leg except
- * each tx's own source; returns entries flushed */
-long txrelay_announce(const int* fds, int nfds){
-    if (!txr_ann_n) return 0;
-    static u8 inv[1 + TXR_ANN_MAX*36];
-    long flushed = txr_ann_n;
+/* A transaction WE originated: no source leg to hold back from, so it is
+ * announced on every one. Called by daemon/tx_submit.c, which reaches it
+ * through a weak stub so the socketpair unit test links without this TU. */
+void txrelay_announce_own(const u8 txid[32]){ txr_ann_add(txid, -1); }
+
+/* find (or claim) this leg's slot; -1 when the table is full */
+static int txr_leg_slot(int fd, long long now){
+    if (!txr_leg_ready){
+        for (int i = 0; i < TXR_ANN_LEGS; i++) txr_leg_fd[i] = -1;
+        txr_leg_ready = 1;
+    }
+    for (int i = 0; i < TXR_ANN_LEGS; i++) if (txr_leg_fd[i] == fd) return i;
+    for (int i = 0; i < TXR_ANN_LEGS; i++) if (txr_leg_fd[i] < 0){
+        txr_leg_fd[i] = fd; txr_leg_pend_n[i] = 0;
+        /* a NEW leg starts its own timer immediately, so the first
+         * announcement of a session is already staggered against the others */
+        txr_leg_next[i] = now + txr_exp_ms(txr_ann_mean_ms);
+        return i;
+    }
+    return -1;
+}
+
+/* Forget everything we knew about this fd. The dial sites call it the moment
+ * an outbound leg is (re)connected, because a descriptor is recycled the
+ * instant the old leg closes: without this the NEW peer inherits the OLD
+ * peer's timer -- typically one already due -- and gets announced to at once,
+ * which is precisely the fan-out the per-leg timer exists to prevent. It also
+ * inherits pending txids that were queued for someone else. */
+void txrelay_leg_reset(int fd){
+    if (!txr_leg_ready || fd < 0) return;
+    for (int i = 0; i < TXR_ANN_LEGS; i++)
+        if (txr_leg_fd[i] == fd){ txr_leg_fd[i] = -1; txr_leg_pend_n[i] = 0; }
+}
+
+/* The fd set seen on the previous call, so a leg that was absent and is now
+ * present is treated as new even if nobody called txrelay_leg_reset. That is
+ * belt and braces on purpose: a dial site added later and not wired up would
+ * otherwise degrade the stagger silently, with nothing failing. */
+static int txr_leg_prev[TXR_ANN_LEGS];
+static int txr_leg_prev_n;
+
+/* drop slots whose fd is no longer among the live legs, and re-arm any fd
+ * that has just appeared */
+static void txr_leg_reap(const int* fds, int nfds){
+    if (!txr_leg_ready) return;
+    for (int i = 0; i < TXR_ANN_LEGS; i++){
+        if (txr_leg_fd[i] < 0) continue;
+        int live = 0;
+        for (int f = 0; f < nfds; f++) if (fds[f] == txr_leg_fd[i]){ live = 1; break; }
+        if (!live){ txr_leg_fd[i] = -1; txr_leg_pend_n[i] = 0; }
+    }
     for (int f = 0; f < nfds; f++){
         if (fds[f] < 0) continue;
-        unsigned n = 0;
+        int seen = 0;
+        for (int i = 0; i < txr_leg_prev_n; i++) if (txr_leg_prev[i] == fds[f]){ seen = 1; break; }
+        if (!seen) txrelay_leg_reset(fds[f]);
+    }
+    txr_leg_prev_n = 0;
+    for (int f = 0; f < nfds && txr_leg_prev_n < TXR_ANN_LEGS; f++)
+        if (fds[f] >= 0) txr_leg_prev[txr_leg_prev_n++] = fds[f];
+}
+
+/* Distribute anything queued since the last call into the per-leg pending
+ * sets, then send an inv to each leg whose own timer has come due. Returns
+ * the number of queue entries taken in (not the number of legs written). */
+long txrelay_announce(const int* fds, int nfds){
+    long long now = txr_now_ms();
+    txr_leg_reap(fds, nfds);
+
+    long taken = txr_ann_n;
+    for (int f = 0; f < nfds; f++){
+        if (fds[f] < 0) continue;
+        int sl = txr_leg_slot(fds[f], now);
+        if (sl < 0) continue;
         for (int i = 0; i < txr_ann_n; i++){
-            if (txr_ann_src[i] == fds[f]) continue;    /* not back to the sender */
+            if (txr_ann_src[i] == fds[f]) continue;      /* not back to the sender */
+            if (txr_leg_pend_n[sl] >= TXR_ANN_MAX) break;
+            int dup = 0;                                  /* same tx twice in one window */
+            for (int j = 0; j < txr_leg_pend_n[sl]; j++)
+                if (!memcmp(txr_leg_pend[sl][j], txr_ann[i], 32)){ dup = 1; break; }
+            if (dup) continue;
+            memcpy(txr_leg_pend[sl][txr_leg_pend_n[sl]], txr_ann[i], 32);
+            txr_leg_pend_n[sl]++;
+        }
+    }
+    txr_ann_n = 0;
+
+    static u8 inv[1 + TXR_ANN_MAX*36];
+    for (int f = 0; f < nfds; f++){
+        if (fds[f] < 0) continue;
+        int sl = txr_leg_slot(fds[f], now);
+        if (sl < 0 || !txr_leg_pend_n[sl]) continue;
+        if (now < txr_leg_next[sl]) continue;             /* this leg's turn has not come */
+        unsigned n = 0;
+        for (int i = 0; i < txr_leg_pend_n[sl]; i++){
             u8* e = inv + 1 + n*36;
-            e[0] = 1; e[1] = 0; e[2] = 0; e[3] = 0;    /* MSG_TX */
-            memcpy(e + 4, txr_ann[i], 32);
+            e[0] = 1; e[1] = 0; e[2] = 0; e[3] = 0;       /* MSG_TX */
+            memcpy(e + 4, txr_leg_pend[sl][i], 32);
             n++;
         }
         if (n){ inv[0] = (u8)n; p2p_write(fds[f], "inv", 3, inv, 1 + n*36); }
+        txr_leg_pend_n[sl] = 0;
+        txr_leg_next[sl] = now + txr_exp_ms(txr_ann_mean_ms);
     }
-    txr_ann_n = 0;
-    return flushed;
+    return taken;
 }
 
 static long long txr_now_ms(void){

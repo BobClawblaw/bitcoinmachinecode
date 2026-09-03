@@ -41,8 +41,9 @@
  *      mpool_policy_remove_expired).
  *   8. fee-rate estimator (EMA of accepted feerates, sat/kvB).
  *
- * KNOWN DELTAS, stated (LOG.md): TRUC/v3 topology rules, package relay,
- * ephemeral anchors, sibling eviction are not implemented; Core v31's
+ * KNOWN DELTAS, stated (LOG.md): this list is older than the file. TRUC/v3
+ * topology, package relay, ephemeral anchors and (2026-09-03) TRUC sibling
+ * eviction ARE implemented now; what remains is that Core v31's
  * cluster-mempool TrimToSize evicts linearization chunks and its chain
  * limits are cluster limits -- this file implements the classic
  * ancestor/descendant model the node's config knobs expose. BIP125
@@ -215,10 +216,12 @@ static mpol_node*  mpol_nodes_base(void* st){ size_t cap = *(uint32_t*)((char*)s
 
 /* an optional "forget this txid" callback (daemon/mempool_cfg.c clears its
  * arrival-time table with it); NULL in the standalone tests */
-/* bytespersigop (Core DEFAULT_BYTES_PER_SIGOP 20): a sigop-dense transaction
- * pays fees as if it were max(vsize, sigop_cost*5) vbytes. The accept caller
- * computes the cost BEFORE admission and parks it here for the next
- * mpol_accept; consumed once. */
+/* bytespersigop (Core DEFAULT_BYTES_PER_SIGOP 20). The accept caller computes
+ * the sigop cost BEFORE admission -- it needs the UTXO view for the P2SH and
+ * witness counts, which mpol_accept does not have -- and parks it here.
+ * mpol_accept reads AND clears it as its first act, so a rejection cannot
+ * leave it parked for the next transaction. See the note at the top of
+ * mpol_accept for what it then feeds. */
 static uint64_t mpol_pending_sigops;
 static uint64_t mpol_bytes_per_sigop = 20;          /* Core DEFAULT_BYTES_PER_SIGOP */
 void mpool_policy_set_pending_sigops(unsigned long long cost_x4){ mpol_pending_sigops = cost_x4; }
@@ -913,6 +916,41 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     if (n_in <= 0){ _mpol_last_reason = "malformed transaction"; return 0; }
     uint64_t vsize = meta.vsize;
 
+    /* ---- bytespersigop: the sigop-adjusted virtual size ---------------------
+     * Core does not keep a "real" vsize and adjust it at the fee check. The
+     * ADJUSTED figure *is* the entry's size -- CTxMemPoolEntry::GetTxSize() is
+     * GetVirtualTransactionSize(weight, sigOpCost, nBytesPerSigOp) -- so it is
+     * what the fee floors, the replacement arithmetic, the ancestor and
+     * descendant byte budgets, eviction, mining and getmempoolentry all see.
+     * Computing it once, here, is what makes those agree; adjusting only the
+     * fee floor (which is what this file used to do) left a sigop-dense
+     * transaction paying Core's price on entry while occupying a smaller
+     * footprint than Core in every limit that came after.
+     *
+     * Core's formula exactly: ceil(max(weight, sigop_cost * bytespersigop) / 4).
+     * The max is taken on the WEIGHT scale and the rounding happens once, at
+     * the end. Taking it after dividing -- max(ceil(weight/4), sigops*bps/4) --
+     * rounds the sigop term down and undercharges by a byte whenever
+     * sigop_cost * bytespersigop is not a multiple of 4.
+     *
+     * The count is consumed HERE, on every path. It arrives through a global
+     * that the caller parks before the call (daemon/tx_accept.c's prechecks,
+     * which is where the UTXO view needed to count P2SH and witness sigops is
+     * already open), and this function has eight rejection paths between here
+     * and the old clearing site. A transaction rejected on any of them used to
+     * leave its count parked, and the NEXT transaction -- a different one,
+     * possibly with no sigops at all -- was then priced as though it carried
+     * them. Reading and clearing in the same breath is what makes that
+     * impossible rather than merely unlikely. */
+    { uint64_t sigops_x = mpol_pending_sigops;
+      mpol_pending_sigops = 0;
+      if (sigops_x){
+          uint64_t adj_w = meta.weight;
+          uint64_t sw = sigops_x * mpol_bytes_per_sigop;
+          if (sw > adj_w) adj_w = sw;
+          vsize = (adj_w + 3) / 4;
+      } }
+
     /* --- standardness (Core IsStandardTx order: before fees) --------------- */
     int n_dust = 0;
     { const char* r = standard_checks(pol, tx, txlen, &meta, prev[0], idx[0], &n_dust);
@@ -994,11 +1032,8 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * amount of fee from a child changes that. */
     { uint64_t eff_fee   = g_pkg_vsize ? g_pkg_fee   : fee;
       uint64_t eff_vsize = g_pkg_vsize ? g_pkg_vsize : vsize;
-      /* min relay floor over VSIZE (Core "min relay fee not met") */
-      /* sigop-adjusted virtual size (Core GetVirtualTransactionSize with
-       * bytespersigop=20): max(vsize, sigop_cost*5) */
-      { uint64_t sv = mpol_pending_sigops * mpol_bytes_per_sigop / 4;   /* cost is x4 units; Core: sigops*bytespersigop/WITNESS_SCALE_FACTOR */
-        if (sv > eff_vsize) { eff_vsize = sv; } mpol_pending_sigops = 0; }
+      /* min relay floor over VSIZE (Core "min relay fee not met"). vsize is
+       * already the sigop-adjusted size -- see the top of this function. */
       if (eff_fee * 1000 < eff_vsize * pol->relay_fee_rate){      /* both sides sat/kvB-scaled */
           _mpol_last_reason = "min relay fee not met"; return 0; }
       /* dynamic floor (sat/kvB, rolling decay) -- Core "mempool min fee not met" */
@@ -1021,6 +1056,10 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     }
     static unsigned char evict_set[MPOL_MAX_REPLACEMENTS + MPOL_PKG_MAX][32];
     int n_evict = 0;
+    /* Fees of everything this transaction would remove. Hoisted out of the
+     * conflict block below because TRUC sibling eviction can add to the set
+     * later, and Core prices the whole to-be-replaced set together. */
+    uint64_t removed_fees = 0;
     if (n_conf > 0){
         mpol_node* t = mpol_nodes_base(st);
         /* rule 1 (classic; skipped under fullrbf): each REPLACED tx must
@@ -1042,7 +1081,6 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             }
         }
         /* build the full eviction set: conflicts + their descendants */
-        uint64_t removed_fees = 0;
         for (int k=0;k<n_conf;k++){
             int ci = (int)conf_claimers[k];
             if (n_evict >= MPOL_MAX_REPLACEMENTS){
@@ -1202,11 +1240,12 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * that is the reason surfaced here too -- a caller diffing reject-reason
      * against Core must see the same token.
      *
-     * KNOWN DELTA, stated rather than hidden: Core measures these against
-     * the SIGOP-ADJUSTED vsize, and this layer only has the BIP141 vsize at
-     * add time (sigop cost is recorded after the fact). The two differ only
-     * for sigop-dense transactions, where Core's figure is the larger, so
-     * this is marginally more permissive there -- never less. */
+     * These are measured against the SIGOP-ADJUSTED vsize, as Core measures
+     * them: vsize carries the adjustment from the top of this function, so a
+     * sigop-dense transaction meets the TRUC size caps on the same figure Core
+     * uses. (Until 2026-09-03 only the fee floors were adjusted and these caps
+     * saw the plain BIP141 vsize, which was marginally more permissive than
+     * Core for exactly those transactions.) */
     if (!pol->accept_nonstd){
         const int is_truc = (meta.version == TRUC_VERSION);
 
@@ -1263,12 +1302,56 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                 }
                 /* desc_cnt includes the parent itself */
                 if ((uint64_t)pn->desc_cnt + 1 > TRUC_DESCENDANT_LIMIT && !child_replaced){
-                    /* Core would additionally consider evicting the sibling
-                     * under RBF rules (sibling eviction) and accepting this
-                     * one; that is not implemented here, so a second child
-                     * is refused. Strictly more conservative than Core:
-                     * nothing is accepted that Core would reject. */
-                    _mpol_last_reason = "TRUC-violation"; return 0;
+                    /* SIBLING EVICTION -- the second return value of Core's
+                     * SingleTRUCChecks, applied by MemPoolAccept.
+                     *
+                     * The parent already has a child, and this transaction
+                     * does not double-spend it, so ordinary RBF cannot reach
+                     * it: nothing conflicts. Core still offers the swap, and
+                     * for a good reason. A TRUC parent's whole promise is that
+                     * its fee can be raised through its one child; if that
+                     * child sits at a low feerate, without sibling eviction
+                     * the only party who can ever rescue the parent is
+                     * whoever owns that child. That is the pin the topology
+                     * was meant to abolish.
+                     *
+                     * Offered ONLY in the narrow shape Core insists on,
+                     * because anything wider needs a rule for CHOOSING which
+                     * descendant dies and Core deliberately has none: the
+                     * parent must have exactly itself and one child, and that
+                     * child exactly itself and the parent. Reorgs can leave
+                     * wider shapes behind and those are still refused. Package
+                     * contexts are excluded as well -- Core allows this only
+                     * for a single transaction (m_allow_sibling_eviction), and
+                     * the in-package sibling case is caught by the walk below. */
+                    int evicted_sibling = 0;
+                    if (g_pkg_n <= 1 && pn->desc_cnt == 2){
+                        static unsigned char sibs[MPOL_PKG_MAX][32];
+                        int nsib = collect_descendant_txids(st, par_idx[0], sibs, MPOL_PKG_MAX);
+                        int si = (nsib == 1) ? find_node(st, sibs[0]) : -1;
+                        if (si >= 0 && t[si].anc_cnt == 2){
+                            /* The sibling joins the to-be-replaced set and the
+                             * ORDINARY replacement arithmetic decides, which is
+                             * exactly what Core does. Note what is NOT asked of
+                             * it: BIP125 signalling. Core skips that check here
+                             * and says why -- a TRUC transaction can only have a
+                             * non-signalling descendant through a reorg. */
+                            if (n_evict >= MPOL_MAX_REPLACEMENTS){
+                                _mpol_last_reason = "too many potential replacements"; return 0; }
+                            uint64_t total_removed = removed_fees + t[si].fee;
+                            uint64_t need = pol->incremental_fee * vsize / 1000;
+                            if (need == 0) need = 1;
+                            if (fee < total_removed){
+                                _mpol_last_reason = "insufficient fee"; return 0; }
+                            if (fee - total_removed < need){
+                                _mpol_last_reason = "insufficient fee"; return 0; }
+                            memcpy(evict_set[n_evict++], t[si].txid, 32);
+                            removed_fees = total_removed;
+                            evicted_sibling = 1;
+                        }
+                    }
+                    if (!evicted_sibling){
+                        _mpol_last_reason = "TRUC-violation"; return 0; }
                 }
             }
             /* Within a package, the sibling and grandchild cases have no
