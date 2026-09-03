@@ -2812,21 +2812,75 @@ interp_checksig:
     je    .enc_highs
     cmp   rax, -2
     je    .enc_badht
-    mov   rax, -1             ; SCRIPT_ERR_SIG_DER
-    jmp   .end
+    mov   r14, -1             ; SCRIPT_ERR_SIG_DER (internal; full 64-bit so
+                                ; the caller's cmp rax,-1 still matches)
+    jmp   .enc_err
 .enc_highs:
-    mov   rax, -3             ; SCRIPT_ERR_SIG_HIGH_S
-    jmp   .end
+    mov   r14, -3             ; SCRIPT_ERR_SIG_HIGH_S
+    jmp   .enc_err
 .enc_badht:
-    mov   rax, -4             ; SCRIPT_ERR_SIG_HASHTYPE
-    jmp   .end
+    mov   r14, -4             ; SCRIPT_ERR_SIG_HASHTYPE
+    jmp   .enc_err
 .encoding_ok:
     mov   rdi, r14            ; publen
     mov   rsi, r15            ; pubdata
     call  interp_pubkey_encoding_ok
     test  rax, rax
     jnz   .pubenc_ok
-    mov   rax, -2             ; SCRIPT_ERR_PUBKEYTYPE (the caller maps it)
+    mov   r14, -2             ; SCRIPT_ERR_PUBKEYTYPE (the caller maps it)
+    jmp   .enc_err
+.enc_err:
+    ; 2026-09-03, findanddelete ordering (FEATURE_GAPS "SIG_FINDANDDELETE is
+    ; answered second where Core answers it first"): Core's
+    ; EvalChecksigPreTapscript strips the signature from the scriptCode
+    ; (FindAndDelete) BEFORE CheckSignatureEncoding / CheckPubKeyEncoding,
+    ; and finding it under CONST_SCRIPTCODE is SIG_FINDANDDELETE -- even
+    ; when the signature is ALSO encoding-invalid, and for an empty
+    ; signature (needle = OP_0, which the C checker already handles on the
+    ; accept path). Our encoding checks run before the checker callback, so
+    ; on this already-failing path run Core's strip here and report -5 (the
+    ; caller maps -5 to SCRIPT_ERR_SIG_FINDANDDELETE) when it lands, keeping
+    ; the encoding error otherwise. Same helpers and scratch the
+    ; CHECKMULTISIG strip loop uses; CHECKSIG never runs inside that loop,
+    ; so cms_needle/cms_scstrip0 are free here. Bounded to scripts that were
+    ; being rejected anyway: the accept path gains no scan. pub (r14/r15) is
+    ; dead on this path, so r14 carries the internal error code; .end pops
+    ; the saved originals.
+    mov   rax, [r12+56]
+    test  rax, SCRIPT_VERIFY_CONST_SCRIPTCODE
+    jz    .enc_keep
+    mov   rdx, [rbp-0x20]     ; scriptCode = [pbegincodehash, pend)
+    mov   rcx, [rbp-0x18]
+    sub   rcx, rdx
+    cmp   rcx, 10000
+    ja    .enc_keep           ; the C checker never strips past 10000 either
+    test  ebx, ebx
+    jz    .enc_fad_op0
+    TLS_ADDR rdi, cms_needle
+    mov   rsi, 600
+    mov   ecx, ebx            ; siglen
+    call  script_push_encode   ; rdi=dst rsi=dstcap rdx=data rcx=datalen -> rax=outlen
+    jmp   .enc_fad_have
+.enc_fad_op0:
+    TLS_ADDR rdi, cms_needle
+    mov   byte [rdi], 0x00    ; CScript() << empty = OP_0
+    mov   eax, 1
+.enc_fad_have:
+    mov   r9, rax             ; needlelen
+    TLS_ADDR rdi, cms_scstrip0
+    mov   rsi, 10008
+    mov   rdx, [rbp-0x20]
+    mov   rcx, [rbp-0x18]
+    sub   rcx, rdx
+    TLS_ADDR r8, cms_needle
+    call  script_find_and_delete ; -> rax = stripped length
+    mov   rcx, [rbp-0x18]
+    sub   rcx, [rbp-0x20]
+    cmp   rax, rcx            ; shorter than the source = the signature WAS in the scriptCode
+    jge   .enc_keep
+    mov   r14, -5             ; SV_CB_ERR_FINDANDDELETE
+.enc_keep:
+    mov   rax, r14
     jmp   .end
 .pubenc_ok:
     ; Empty signature -> false. EXCEPT under CONST_SCRIPTCODE (2026-09-02):

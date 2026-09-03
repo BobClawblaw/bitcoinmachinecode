@@ -2295,24 +2295,80 @@ interp_checksig:
 	b.eq .cs_enc_highs
 	cmp  x0,#-2
 	b.eq .cs_enc_badht
-	mov  x0,#-1                     /* FULL 64-bit -1: script_eval compares
+	mov  x22,#-1                    /* FULL 64-bit -1: script_eval compares
 	                                 * cmp x0,#-1 (the x86 returns rax=-1);
 	                                 * a w0 write zero-extends and the SIG_DER
 	                                 * error read as checksig-TRUE, accepting
 	                                 * non-strict signatures post-activation */
-	b    .cs_end
+	b    .cs_enc_err
 .cs_enc_highs:
-	mov  x0,#-3
-	b    .cs_end
+	mov  x22,#-3
+	b    .cs_enc_err
 .cs_enc_badht:
-	mov  x0,#-4
-	b    .cs_end
+	mov  x22,#-4
+	b    .cs_enc_err
 .cs_enc_ok:
 	mov  x0,x22		/* publen */
 	mov  x1,x23		/* pubdata */
 	bl   interp_pubkey_encoding_ok
 	cbnz x0,.cs_pubenc_ok
-	mov  x0,#-2		/* SCRIPT_ERR_PUBKEYTYPE (script_eval maps it) */
+	mov  x22,#-2		/* SCRIPT_ERR_PUBKEYTYPE (script_eval maps it) */
+	b    .cs_enc_err
+.cs_enc_err:
+	/* 2026-09-03, findanddelete ordering (FEATURE_GAPS "SIG_FINDANDDELETE is
+	 * answered second where Core answers it first"): Core's
+	 * EvalChecksigPreTapscript strips the signature from the scriptCode
+	 * (FindAndDelete) BEFORE CheckSignatureEncoding / CheckPubKeyEncoding,
+	 * and finding it under CONST_SCRIPTCODE is SIG_FINDANDDELETE -- even
+	 * when the signature is ALSO encoding-invalid, and for an empty
+	 * signature (needle = OP_0, which the C checker already handles on the
+	 * accept path). Our encoding checks run before the checker callback, so
+	 * on this already-failing path run Core's strip here and answer -5
+	 * (script_eval maps -5 to SCRIPT_ERR_SIG_FINDANDDELETE) when it lands,
+	 * keeping the encoding error otherwise. Same helpers and scratch the
+	 * CHECKMULTISIG strip loop uses; CHECKSIG never runs inside that loop,
+	 * so cms_needle/cms_scstrip0 are free here. Bounded to scripts that
+	 * were being rejected anyway: the accept path gains no scan. pub
+	 * (x22/x23) is dead on this path, so x22 carries the error code; .cs_end
+	 * restores the saved originals. x19-x26 survive both sighash helpers
+	 * (they are callee-saved there, same dependence the CMS strip loop has). */
+	ldr  x0,[x20,#56]
+	tst  x0,#SCRIPT_VERIFY_CONST_SCRIPTCODE
+	b.eq .cs_enc_keep
+	ldr  x2,[x24,#SL_BECH]	/* scriptCode = [pbegincodehash, pend) */
+	ldr  x3,[x24,#SL_PEND]
+	sub  x3,x3,x2
+	mov  x9,#10000
+	cmp  x3,x9
+	b.hi .cs_enc_keep	/* the C checker never strips past 10000 either */
+	cbnz w19,.cs_enc_fad_sig
+	TLS_ADDR x4, cms_needle
+	strb wzr,[x4]		/* CScript() << empty = OP_0 */
+	mov  x0,#1		/* needlelen */
+	b    .cs_enc_fad_have
+.cs_enc_fad_sig:
+	TLS_ADDR x0, cms_needle
+	mov  x1,#600
+	add  x2,x21,#ELEM_DATA_OFF
+	mov  x3,x19		/* siglen (w19 zero-extends) */
+	bl   script_push_encode	/* x0=dst x1=dstcap x2=data x3=datalen -> x0=outlen */
+	TLS_ADDR x4, cms_needle
+.cs_enc_fad_have:
+	mov  x5,x0		/* needlelen */
+	TLS_ADDR x0, cms_scstrip0
+	mov  x1,#10008
+	ldr  x2,[x24,#SL_BECH]
+	ldr  x3,[x24,#SL_PEND]
+	sub  x3,x3,x2
+	bl   script_find_and_delete	/* -> x0 = stripped length */
+	ldr  x1,[x24,#SL_BECH]
+	ldr  x2,[x24,#SL_PEND]
+	sub  x2,x2,x1
+	cmp  x0,x2		/* shorter than the source = the signature WAS in the scriptCode */
+	b.ge .cs_enc_keep
+	mov  x22,#-5		/* SIG_FINDANDDELETE via script_eval's -5 arm */
+.cs_enc_keep:
+	mov  x0,x22
 	b    .cs_end
 .cs_pubenc_ok:
 	/* Empty signature -> false. EXCEPT under CONST_SCRIPTCODE (2026-09-02):
