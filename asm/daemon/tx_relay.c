@@ -77,7 +77,8 @@ extern void mpol_package_context(const u8* const* txs, const unsigned long* lens
 extern void txacc_package_overlay(const u8* const* txs, const unsigned long* lens,
                                   const u8* txids, int n);
 extern long tx_accept_test_reason(void* mp, const u8* txid, const u8* tx, unsigned long len,
-                                  char* reason, unsigned long rcap, unsigned long long* fee);
+                                  char* reason, unsigned long rcap, unsigned long long* fee,
+                                  unsigned long long* vsize_out);
 extern int  txacc_fee_reconsiderable(const char* reason);
 
 #define TXR_MSG_TX          1u
@@ -657,9 +658,13 @@ static int txr_submit_1p1c(void* mp, const u8* parent, unsigned long plen,
     mpol_package_context(txs, lens, txids, 2);
     txacc_package_overlay(txs, lens, txids, 2);
     for (int i = 0; i < 2; i++){
-        char r[128]; r[0] = 0; unsigned long long fee = 0;
-        long rc = tx_accept_test_reason(mp, txids + i*32, txs[i], lens[i], r, sizeof r, &fee);
-        if (rc == 1 || txacc_fee_reconsiderable(r)){ tot_fee += fee; tot_vsize += vsz[i]; }
+        char r[128]; r[0] = 0; unsigned long long fee = 0, avs = 0;
+        long rc = tx_accept_test_reason(mp, txids + i*32, txs[i], lens[i], r, sizeof r, &fee, &avs);
+        /* the SIGOP-ADJUSTED vsize, as Core's package feerate uses: vsz[] is
+         * the structural walker's figure and cannot count sigops (they need
+         * the UTXO view), so it only stands in when the policy layer was
+         * never reached -- and that member is not counted below anyway. */
+        if (rc == 1 || txacc_fee_reconsiderable(r)){ tot_fee += fee; tot_vsize += (avs ? avs : vsz[i]); }
         else { all_ok = 0; break; }     /* not something a package can rescue */
     }
     txacc_package_overlay(NULL, NULL, NULL, 0);

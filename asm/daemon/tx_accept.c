@@ -1011,11 +1011,16 @@ long tx_accept_validate_reason(void* mp_area, const u8 txid[32], const u8* tx,
  * does not have. *fee_out (satoshis) is filled when the fee was computed. */
 long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
                            unsigned long txlen, char* reason, unsigned long rcap,
-                           unsigned long long* fee_out){
+                           unsigned long long* fee_out, unsigned long long* vsize_out){
     extern long mpool_policy_test(void*, void*, void*, const unsigned char*, unsigned long,
-                                  const unsigned char*, void*, unsigned long long*);
+                                  const unsigned char*, void*, unsigned long long*,
+                                  unsigned long long*);
     if (reason && rcap) reason[0] = 0;
     if (fee_out) *fee_out = 0;
+    /* The SIGOP-ADJUSTED vsize, for callers aggregating a package feerate.
+     * Zero unless the policy layer was reached; a member rejected before it
+     * never joins a package total anyway. */
+    if (vsize_out) *vsize_out = 0;
     if (!g_ready || !g_pol_ready){ if (reason && rcap) snprintf(reason, rcap, "mempool not initialized"); return -4; }
     void* placeholder_utxo = (void*)1;
     { const char* pre = txacc_prechecks(mp_area, tx, txlen);
@@ -1030,7 +1035,7 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
     }
     mp_lock();
     long pt = mpool_policy_test(g_pol, g_pol_state, mp_area, tx, txlen, txid,
-                                placeholder_utxo, fee_out);
+                                placeholder_utxo, fee_out, vsize_out);
     mp_unlock();
     if (pt != 1){
         const char* r = mpool_policy_reason(g_pol);

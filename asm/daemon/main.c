@@ -2275,9 +2275,9 @@ static void pb_rotation(void){
         int st[PB_MAX_TX]; int ns = pb_queue_stale(now, st, PB_MAX_TX);
         for(int k = 0; k < ns; k++){
             const pb_tx_t* t = pb_queue_at(st[k]); if(!t) continue;
-            extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*, unsigned long, char*, unsigned long, unsigned long long*);
+            extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*, unsigned long, char*, unsigned long, unsigned long long*, unsigned long long*);
             char reason[128]; reason[0] = 0; unsigned long long fee = 0;
-            long ok = tx_accept_test_reason(txsub_pool(), t->txid, t->tx, t->len, reason, sizeof reason, &fee);
+            long ok = tx_accept_test_reason(txsub_pool(), t->txid, t->tx, t->len, reason, sizeof reason, &fee, NULL);
             if(ok == 1){ g_pb_num_to_open++; fprintf(stderr, "[privbcast] reattempting broadcast of a stale transaction (%d peer(s) so far)\n", t->npeers); }
             else { fprintf(stderr, "[privbcast] giving up broadcast attempts: %s\n", reason[0] ? reason : "no longer acceptable"); pb_queue_remove(t->txid); g_pb_given_up++; }
             g_pb_dirty = 1;
@@ -3911,7 +3911,8 @@ static int txsub_package(char* msg, unsigned long mcap){
     extern void txacc_package_overlay(const unsigned char* const*, const unsigned long*,
                                       const unsigned char*, int);
     extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*,
-                                      unsigned long, char*, unsigned long, unsigned long long*);
+                                      unsigned long, char*, unsigned long, unsigned long long*,
+                                      unsigned long long*);
     extern int  tx_parse(void* info, const unsigned char* tx, unsigned long txlen);
     extern int  txacc_fee_reconsiderable(const char* reason);
     node_status_t* st = g_node_status;
@@ -3960,11 +3961,17 @@ static int txsub_package(char* msg, unsigned long mcap){
     mpol_package_context(txs, lens, txids, n);
     txacc_package_overlay(txs, lens, txids, n);
     for (int i = 0; i < n; i++){
-        char r[128]; r[0] = 0; unsigned long long fee = 0;
+        char r[128]; r[0] = 0; unsigned long long fee = 0, avs = 0;
         long rc = tx_accept_test_reason(txsub_pool(), txids + i*32, txs[i], lens[i],
-                                        r, sizeof r, &fee);
+                                        r, sizeof r, &fee, &avs);
         st->pkg_fee[i] = fee;
-        st->pkg_vsize[i] = vsz[i];        /* BIP141 vsize, from the policy walker */
+        /* The SIGOP-ADJUSTED vsize, which is what Core's package feerate is
+         * computed over: its members are mempool entries and an entry's size
+         * IS the adjusted figure. vsz[] comes from the structural walker,
+         * which cannot count sigops -- those need the UTXO view -- so it is
+         * only the fallback for a member rejected before the policy layer
+         * ran, and such a member never joins the total below. */
+        st->pkg_vsize[i] = avs ? avs : vsz[i];
         if (rc == 1){
             st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0;
             tot_fee += fee; tot_vsize += st->pkg_vsize[i];
@@ -4020,7 +4027,7 @@ static int txsub_package(char* msg, unsigned long mcap){
         for (int i = 0; i < n; i++){
             char r[128]; r[0] = 0; unsigned long long fee = 0;
             long rc = tx_accept_test_reason(txsub_pool(), txids + i*32, txs[i], lens[i],
-                                            r, sizeof r, &fee);
+                                            r, sizeof r, &fee, NULL);
             if (rc == 1){
                 st->pkg_result[i] = 1; st->pkg_reason[i][0] = 0; st->pkg_fee[i] = fee;
             } else {
@@ -4870,7 +4877,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     /* testmempoolaccept: same checks, no insertion, no relay */
                     extern long tx_accept_test_reason(void*, const unsigned char*,
                                      const unsigned char*, unsigned long, char*,
-                                     unsigned long, unsigned long long*);
+                                     unsigned long, unsigned long long*,
+                                     unsigned long long*);
                     extern int tx_txid(unsigned char* out, const unsigned char* tx, unsigned long txlen, unsigned char* scratch, unsigned long scratchcap);
                     static unsigned char tscratch[2000*81 + 8];
                     unsigned char tid[32];
@@ -4881,7 +4889,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     } else {
                         result = (int)tx_accept_test_reason(txsub_pool(), tid,
                                      (const unsigned char*)g_node_status->tx_submit_buf, tlen,
-                                     reason, sizeof reason, &fee);
+                                     reason, sizeof reason, &fee, NULL);
                     }
                     g_node_status->tx_submit_fee = fee;
                 }
@@ -4892,12 +4900,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     else {
                         /* Core BroadcastTransaction(NO_MEMPOOL_PRIVATE_BROADCAST): test-accept
                          * first (its rejection is the RPC's), then queue -- never the mempool */
-                        extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*, unsigned long, char*, unsigned long, unsigned long long*);
+                        extern long tx_accept_test_reason(void*, const unsigned char*, const unsigned char*, unsigned long, char*, unsigned long, unsigned long long*, unsigned long long*);
                         extern int tx_txid(unsigned char* out, const unsigned char* tx, unsigned long txlen, unsigned char* scratch, unsigned long scratchcap);
                         static unsigned char pscratch[2000*81 + 8]; unsigned char tid[32]; unsigned long long fee = 0;
                         if(!tx_txid(tid, (const unsigned char*)g_node_status->tx_submit_buf, tlen, pscratch, sizeof pscratch)){ result = -22; snprintf(reason, sizeof reason, "TX decode failed"); }
                         else {
-                            result = (int)tx_accept_test_reason(txsub_pool(), tid, (const unsigned char*)g_node_status->tx_submit_buf, tlen, reason, sizeof reason, &fee);
+                            result = (int)tx_accept_test_reason(txsub_pool(), tid, (const unsigned char*)g_node_status->tx_submit_buf, tlen, reason, sizeof reason, &fee, NULL);
                             if(result == 1){
                                 int ar = pb_queue_add((const unsigned char*)g_node_status->tx_submit_buf, tlen, pb_wall_s());
                                 if(ar == 1){ g_pb_num_to_open += PB_NUM_PER_TX; pb_publish();   /* the RPC's next getprivatebroadcastinfo must already see it */
