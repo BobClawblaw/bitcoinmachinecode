@@ -12,6 +12,10 @@
  * the verified asm mempool + asm utxo). A mismatch with the oracle is a bug.
  */
 #include <stdio.h>
+#include "../mempool_entry.h"
+extern void mpool_policy_set_pending_sigops(unsigned long long);
+extern void mpool_policy_set_bytespersigop(unsigned long long);
+extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
 #include <string.h>
 #include <stdlib.h>
 #include "mempool_policy_vec.h"
@@ -101,7 +105,13 @@ int main(void){
 
     failures += test_bare_multisig();
 
-#define okv(c, msg) do{ printf("  %s %s\n", (c)?"ok ":"FAIL", (msg)); if(!(c)) failures++; }while(0)
+/* Evaluates the condition ONCE. It used to appear twice in the body -- once
+ * for the label, once for the counter -- so any check whose condition had a
+ * side effect ran it twice. A `okv(mpool_policy_add(...) == 1, ...)` then
+ * submitted the transaction a second time, the duplicate was refused, and the
+ * case reported "ok" while quietly incrementing the failure count. */
+#define okv(c, msg) do{ int _okv = (c) ? 1 : 0; \
+    printf("  %s %s\n", _okv?"ok ":"FAIL", (msg)); if(!_okv) failures++; }while(0)
     printf("== Core v31 cluster limits (too-large-cluster) ==\n");
     {
         static unsigned char pol[128];
@@ -227,7 +237,6 @@ int main(void){
         tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n, 0x88, 20); n+=20;
         memset(tx+n, 0, 4); n+=4;                                   /* ~60 vB paying 200 sat: 3.3 sat/vB */
         unsigned char tid[32]; memset(tid, 0x7B, 32);
-        extern void mpool_policy_set_pending_sigops(unsigned long long);
         mpool_policy_set_pending_sigops(80);                        /* 80 x4-units -> eff vsize max(60, 400) = 400 -> 0.5 sat/vB */
         long r = mpool_policy_add(pol, stbuf, mp, tx, n, tid, ux);
         okv(r != 1 && strstr(mpool_policy_reason(pol), "min relay fee") != NULL,
@@ -235,6 +244,126 @@ int main(void){
         mpool_policy_set_pending_sigops(0);
         r = mpool_policy_add(pol, stbuf, mp, tx, n, tid, ux);
         okv(r == 1, "the same tx without the sigop load is fine at 3.3 sat/vB");
+
+        /* The adjustment is the ENTRY's size, not a number used once at the
+         * fee gate: Core's GetTxSize() is the sigop-adjusted vsize, so the
+         * chain-limit budgets, replacement arithmetic, eviction and
+         * getmempoolentry all see it. Read it back off the accepted entry. */
+        {   struct mp_entry_info ei;
+            okv(mpool_policy_entry_info(stbuf, tid, &ei) == 1, "entry readable");
+            okv(ei.size > 0 && ei.size < 200, "a sigop-free entry keeps its BIP141 vsize");
+            unsigned long long plain = ei.size;
+
+            /* same transaction, now carrying sigops and paying enough to get
+             * in: its recorded size must be the ADJUSTED one */
+            memset(stbuf, 0, sizeof stbuf);
+            mpool_policy_state_init(stbuf, 256);
+            mpool_init(mp, 4096, mblob, sizeof mblob);
+            utxo_init(ux, 4096, ublob, sizeof ublob);
+            utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk, 1);
+            unsigned char tx2[128]; unsigned long n2 = 0;
+            tx2[n2++]=2;tx2[n2++]=0;tx2[n2++]=0;tx2[n2++]=0;
+            tx2[n2++]=1; memcpy(tx2+n2, prev, 32); n2+=32; memset(tx2+n2,0,4); n2+=4; tx2[n2++]=0; memset(tx2+n2,0xff,4); n2+=4;
+            tx2[n2++]=1; { unsigned long long v = 1000000ULL - 5000ULL; for (int b=0;b<8;b++) tx2[n2++]=(unsigned char)(v>>(8*b)); }
+            tx2[n2++]=22; tx2[n2++]=0x00; tx2[n2++]=0x14; memset(tx2+n2,0x88,20); n2+=20;
+            memset(tx2+n2,0,4); n2+=4;                       /* 5000 sat: clears 400 vB at 1 sat/vB */
+            unsigned char tid2[32]; memset(tid2, 0x7C, 32);
+            mpool_policy_set_pending_sigops(80);
+            okv(mpool_policy_add(pol, stbuf, mp, tx2, n2, tid2, ux) == 1,
+               "sigop-dense tx paying the adjusted price is accepted");
+            okv(mpool_policy_entry_info(stbuf, tid2, &ei) == 1, "its entry is readable");
+            okv(ei.size == 400, "the ENTRY records the sigop-adjusted vsize (80*20/4 = 400)");
+            okv(ei.size > plain, "...which is larger than the BIP141 vsize it would have had");
+        }
+    }
+
+    /* A rejected transaction must not price the next one. The count is parked
+     * in a global by the caller before the call; there are rejection paths
+     * between the top of mpol_accept and the fee gate, and one of them used to
+     * leave the count parked for whatever came next. */
+    {   printf("\n== a rejected tx does not leave its sigop count behind ==\n");
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<20];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+        mpool_policy_state_init(stbuf, 256);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        unsigned char prev[32]; memset(prev, 0x9A, 32);
+        unsigned char spk[2] = { 0x51, 0x00 };
+        utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk, 1);
+
+        /* (1) a heavy sigop load parked, on a tx that dies EARLY -- it spends
+         * an input that does not exist, which is refused well before the fee
+         * gate where the count used to be cleared. */
+        unsigned char miss[32]; memset(miss, 0xDD, 32);
+        unsigned char bad[128]; unsigned long bn = 0;
+        bad[bn++]=2;bad[bn++]=0;bad[bn++]=0;bad[bn++]=0;
+        bad[bn++]=1; memcpy(bad+bn, miss, 32); bn+=32; memset(bad+bn,0,4); bn+=4; bad[bn++]=0; memset(bad+bn,0xff,4); bn+=4;
+        bad[bn++]=1; { unsigned long long v = 1000ULL; for (int b=0;b<8;b++) bad[bn++]=(unsigned char)(v>>(8*b)); }
+        bad[bn++]=22; bad[bn++]=0x00; bad[bn++]=0x14; memset(bad+bn,0x77,20); bn+=20;
+        memset(bad+bn,0,4); bn+=4;
+        unsigned char bid[32]; memset(bid, 0x9B, 32);
+        mpool_policy_set_pending_sigops(4000);          /* 4000*20/4 = 20000 vB if it ever applied */
+        okv(mpool_policy_add(pol, stbuf, mp, bad, bn, bid, ux) != 1,
+           "the sigop-laden tx is rejected before the fee gate");
+
+        /* (2) now an ordinary, sigop-FREE transaction, with nothing parked.
+         * It pays 200 sat on ~60 vB, comfortably over the 1 sat/vB floor --
+         * unless it inherits the 4000 sigops from the corpse above, which
+         * would price it at 20000 vB and refuse it. */
+        unsigned char ok2[128]; unsigned long on = 0;
+        ok2[on++]=2;ok2[on++]=0;ok2[on++]=0;ok2[on++]=0;
+        ok2[on++]=1; memcpy(ok2+on, prev, 32); on+=32; memset(ok2+on,0,4); on+=4; ok2[on++]=0; memset(ok2+on,0xff,4); on+=4;
+        ok2[on++]=1; { unsigned long long v = 1000000ULL - 200ULL; for (int b=0;b<8;b++) ok2[on++]=(unsigned char)(v>>(8*b)); }
+        ok2[on++]=22; ok2[on++]=0x00; ok2[on++]=0x14; memset(ok2+on,0x66,20); on+=20;
+        memset(ok2+on,0,4); on+=4;
+        unsigned char oid[32]; memset(oid, 0x9C, 32);
+        long rr = mpool_policy_add(pol, stbuf, mp, ok2, on, oid, ux);
+        okv(rr == 1, "the NEXT tx is judged on its own sigops, not the dead one's");
+        if (rr != 1) printf("     (reason: %s)\n", mpool_policy_reason(pol));
+    }
+
+    /* Core takes the max on the WEIGHT scale and rounds once, at the end:
+     * ceil(max(weight, sigops*bytespersigop) / 4). Rounding first and taking
+     * the max after loses a byte whenever sigops*bytespersigop is not a
+     * multiple of 4 -- invisible at the default bytespersigop of 20, which is
+     * itself a multiple of 4, so this uses a value that is not. */
+    {   printf("\n== the adjustment rounds the way Core rounds ==\n");
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<20];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+        mpool_policy_state_init(stbuf, 256);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+        unsigned char prev[32]; memset(prev, 0xB1, 32);
+        unsigned char spk[2] = { 0x51, 0x00 };
+        utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk, 1);
+        unsigned char tx[128]; unsigned long n = 0;
+        tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0;
+        tx[n++]=1; memcpy(tx+n, prev, 32); n+=32; memset(tx+n,0,4); n+=4; tx[n++]=0; memset(tx+n,0xff,4); n+=4;
+        tx[n++]=1; { unsigned long long v = 1000000ULL - 90000ULL; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+        tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n,0x55,20); n+=20;
+        memset(tx+n,0,4); n+=4;
+        unsigned char tid[32]; memset(tid, 0xB2, 32);
+        mpool_policy_set_bytespersigop(5);
+        mpool_policy_set_pending_sigops(1001);   /* 1001*5 = 5005 weight units */
+        okv(mpool_policy_add(pol, stbuf, mp, tx, n, tid, ux) == 1, "accepted");
+        {   struct mp_entry_info ei;
+            okv(mpool_policy_entry_info(stbuf, tid, &ei) == 1, "entry readable");
+            /* ceil(5005/4) = 1252, not 5005/4 = 1251 */
+            okv(ei.size == 1252, "ceil(max(weight, sigops*bps)/4) -- 1252, not the truncated 1251");
+        }
+        mpool_policy_set_bytespersigop(20);      /* back to Core's default */
     }
 
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
