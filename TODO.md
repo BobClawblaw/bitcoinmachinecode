@@ -34,13 +34,18 @@ Everything below is landed on `arm-port` and pushed. History lives in
       interleaves per-signature (an encoding-invalid sig 0 preempts a later
       signature's FAD in Core, not here) — verdict-safe, BASE-only gate, and
       only reachable when no earlier signature's encoding check has fired.
-- [ ] `validation/spend_corpus_diff.py` has never run on this port: it needs a
-      synced Bitcoin Core over RPC (`BMC_ORACLE_RPC_PORT`/`BMC_ORACLE_COOKIE`)
-      and this box has no Core datadir. `synth_corpus_diff.py` needs neither,
-      only `coincurve` (installed in a venv here) and, as of today,
-      `BMC_ORACLE_COOKIE` pointed at any readable file — both harnesses
-      compute the RPC auth at import time even though the synth one never
-      makes an RPC call. Worth making that lazy so the harness runs anywhere.
+- [x] The auth half of this item is done: `synth_corpus_diff.py` imports
+      `spend_corpus_diff.py` for Engine/ORACLE/SHIM, so spend's module-level
+      `_AUTH = _auth()` ran at synth's import time and the synth harness
+      demanded `BMC_ORACLE_COOKIE` just to start. The auth is now computed on
+      first real rpc() use (spend still needs credentials when it runs; the
+      synth run needs nothing) — verified by running the synth harness with no
+      cookie env var at all: exit 0, 158/158 rows div=0.
+- [ ] `validation/spend_corpus_diff.py` itself has still never run on this
+      port: it needs a synced Bitcoin Core over RPC
+      (`BMC_ORACLE_RPC_PORT`/`BMC_ORACLE_COOKIE`) and this box has no Core
+      datadir. `synth_corpus_diff.py` needs neither, only `coincurve`
+      (installed in a venv here).
 - [ ] env-only, documented, no action: `bench_checkblock` / `bench_hashidx` /
       `bench_idxscan` / `bench_taproot_block` need production data files
       (`block413567.raw`, `./index.dat` in the scratch dir);

@@ -91,13 +91,25 @@ def _auth():
             raise RuntimeError('no oracle RPC credentials (cookie or conf)')
         cookie = '%s:%s' % (u, p)
     return 'Basic ' + base64.b64encode(cookie.encode()).decode()
-_AUTH = _auth()
+
+# Lazy, on purpose: synth_corpus_diff.py imports THIS module for Engine/ORACLE/
+# SHIM and never makes an RPC call, so the auth used to be computed at import
+# time and the synth harness demanded BMC_ORACLE_COOKIE pointing at any
+# readable file just to start. Compute on first real rpc() use instead --
+# spend still needs the credentials when it runs, nothing else pays for them.
+_AUTH = None
+
+def _rpc_auth():
+    global _AUTH
+    if _AUTH is None:
+        _AUTH = _auth()
+    return _AUTH
 
 def rpc(method, params=None):
     body = json.dumps({'jsonrpc':'1.0','id':'x','method':method,'params':params or []})
     c = http.client.HTTPConnection(RPC_HOST, RPC_PORT, timeout=300)
     try:
-        c.request('POST', '/', body, headers={'Authorization':_AUTH, 'Content-Type':'application/json'})
+        c.request('POST', '/', body, headers={'Authorization':_rpc_auth(), 'Content-Type':'application/json'})
         r = c.getresponse(); raw = r.read()
     finally:
         c.close()

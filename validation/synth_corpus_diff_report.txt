@@ -1,5 +1,5 @@
 Synthesized feature-depth differential vs Core
-generated: 2026-09-03T18:56:03Z  elapsed: 0.5s
+generated: 2026-09-03T19:31:13Z  elapsed: 0.7s
 
 cases: 79  accept-parity ok: 79
 rule mutations: 96 (agree 96)
