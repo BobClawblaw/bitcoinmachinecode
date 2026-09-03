@@ -942,6 +942,17 @@ int tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
  * approximately nothing).
  * ============================================================================ */
 
+/* VAL-1 fees ledger (audit 2026-09-03): per-tx input sums for the LAST
+ * tx_verify_block_connect_all call. File-scope like every other arena here
+ * (same single-threaded Phase-1 discipline); the caller reads it through
+ * txvb_last_tx_in_sums immediately after a successful call. */
+static u64* g_tx_in_sums = 0;    static u64 g_tx_in_sums_cap = 0;
+static u64 g_tx_in_sums_n = 0;
+const u64* txvb_last_tx_in_sums(u64* n_out){
+    if (n_out) *n_out = g_tx_in_sums_n;
+    return g_tx_in_sums;
+}
+
 /* bidx_get: exported by daemon/utxo_live.c -- same argument/return shape as
  * utxo_lsm_get, plus the CALLING tx's own 0-based block position. Returns
  * 1 hit / 0 miss (not resolvable in-block; caller falls back to
@@ -1441,6 +1452,17 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
     static char g_rbuf[64];
     unsigned long long flags = script_flags_for_block((unsigned long long)height, block_hash32);
 
+    /* VAL-1 fees ledger (audit 2026-09-03): per-tx input sums, exported to
+     * the caller's ConnectBlock fee/subsidy check through
+     * txvb_last_tx_in_sums. Sized and zeroed on EVERY call before any return
+     * (the total_nin==0 early exit below must still read as "zero fees"). */
+    {
+        u64* p = grow_arena((void**)&g_tx_in_sums, &g_tx_in_sums_cap, ntx * sizeof(u64));
+        if (!p){ *reason = "out of memory"; *fail_tx_index = 0; return 0; }
+        memset(g_tx_in_sums, 0, ntx * sizeof(u64));
+        g_tx_in_sums_n = ntx;
+    }
+
     u64 total_nin = 0;
     for (u64 t=1; t<ntx; t++) total_nin += txs[t].pn_in;
     if (total_nin == 0) return 1;
@@ -1506,6 +1528,11 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         if (bx) r = bidx_get(bx, (u32)in->tx_index, in->outpoint, index, &value, &uheight, &ucb, &spk, &spklen);
         if (r != 1) r = utxo_lsm_get(lst, u, in->outpoint, index, &value, &uheight, &ucb, &spk, &spklen);
         if (r != 1) { *reason = "input references a missing/already-spent UTXO"; *fail_tx_index = in->tx_index; goto fail; }
+        /* VAL-1 fees ledger: every non-coinbase input's resolved value lands
+         * in its transaction's input sum. A u64 CAmount can never overflow
+         * this accumulator (see the VAL_MAX_MONEY bound the caller applies
+         * against the resulting fee). */
+        if (in->tx_index < g_tx_in_sums_n) g_tx_in_sums[in->tx_index] += value;
         if (!txvb_classify(in, height, flags, value, uheight, ucb, spk, spklen,
                            &g_spk_pool, &has_taproot, reason)) {
             *fail_tx_index = in->tx_index; goto fail;
