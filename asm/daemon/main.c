@@ -920,6 +920,7 @@ static unsigned char mux_out_loc[MUX_MAX_OUT][32];  /* per-peer locator (tip) */
 static char  mux_out_host[MUX_MAX_OUT][128]   /* "host:port" of a v3 onion is 67 bytes; 64 truncated it and broke the top-up dedupe (2026-09-01) */;
 static int   g_in_dial_helper = 0;          /* set in a dial-helper child: no book writes, no shared-status writes */
 static int   mux_n_out = 0;
+extern void txrelay_leg_reset(int fd);   /* a (re)dialled leg starts its own announce timer */
 static int   mux_out_peer[MUX_MAX_OUT];     /* index into the peer pool (for re-dial rotation) */
 static long long mux_out_nextretry[MUX_MAX_OUT];
 /* consecutive failed sync passes per leg; surfaced in the heartbeat as
@@ -2387,7 +2388,7 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
     int fd = outbound_connect(peers[p], 300, out_port);
     if(fd<0){ fprintf(stderr,"[mux:%d] next peer %s unreachable: %s (leg stays down)\n",
                      i, peers[p], dial_fail_reason()); return; }
-    mux_out_fd[i]=fd;
+    mux_out_fd[i]=fd; txrelay_leg_reset(fd);
     mux_out_wants_v2[i]=(unsigned char)g_peer_wants_addrv2;
     strncpy(mux_out_host[i], peers[p], 127);
     anchor_locator(mux_out_loc[i]);
@@ -4918,7 +4919,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         static long srt_last, srt_muted;
                         long now_s = (long)time(NULL);
                         if(now_s - srt_last >= 300){   /* 1/5min: reload streams made 1/5s a metronome */
-                            fprintf(stderr,"[dl] sendrawtransaction accepted, relayed to %d/%d legs%s\n",
+                            fprintf(stderr,"[dl] sendrawtransaction accepted, queued for announcement to %d/%d legs%s\n",
                                     relayed, mux_n_out,
                                     srt_muted ? " (repeats muted; +N shows in the tx_accept summary)" : "");
                             srt_last = now_s; srt_muted = 1;
@@ -5607,7 +5608,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 int nfd=outbound_connect(srcpool[ci], 300, out_port);
                 if(nfd>=0){
                     strncpy(mux_out_host[mux_n_out], srcpool[ci], 127);
-                    mux_out_fd[mux_n_out]=nfd;
+                    mux_out_fd[mux_n_out]=nfd; txrelay_leg_reset(nfd);
                     mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
                     mux_out_peer[mux_n_out]=ci;
                     anchor_locator(mux_out_loc[mux_n_out]);
@@ -6207,7 +6208,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         int fd=outbound_connect(peers[i], 300, out_port);
         if(fd<0){ fprintf(stderr,"[mux] outbound %s failed: %s\n", peers[i], dial_fail_reason()); continue; }
         strncpy(mux_out_host[mux_n_out], peers[i], 127);
-        mux_out_fd[mux_n_out]=fd;
+        mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd);
         mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
         mux_out_peer[mux_n_out]=i;
         anchor_locator(mux_out_loc[mux_n_out]);
