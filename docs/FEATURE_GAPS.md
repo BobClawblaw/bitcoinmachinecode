@@ -1725,11 +1725,42 @@ a challenger clearing the sibling's fee plus its own incremental relay cost is
 accepted and the sibling leaves the pool, the parent survives, and a third
 child must then beat the new incumbent rather than accumulating.
 
-NOT yet done: a regtest differential against real Core for this path. Every
-other claim here is checked against Core's source rather than its running
-behaviour, which is weaker than this project's usual bar — the existing
-package/TRUC work was proven on regtest against v31.99. Worth adding before
-this is called finished.
+~~NOT yet done: a regtest differential against real Core for this path.~~
+**DONE 2026-09-03**, closing the gap the same day it was raised —
+`validation/truc_sibling_core_diff.sh`. See the update further down this file
+for what it proves and how it was checked against a deliberate regression.
+
+## Update 2026-09-03 — TRUC sibling eviction, proven against real Core on regtest
+
+The sibling-eviction implementation above was checked against Core's SOURCE,
+not its running behaviour — weaker than this project's usual bar for exactly
+this kind of policy work. `validation/truc_sibling_core_diff.sh` closes that
+the same day: two disconnected regtest nodes (severed with
+`setnetworkactive false` right after height sync, so relay cannot let one
+node's verdict leak into the other's mempool), Core acting as BOTH the
+transaction factory and the judge — it builds, signs, and broadcasts every
+transaction, so nothing in the proof depends on this project's own signer —
+and each transaction submitted to both nodes over their own RPC.
+
+15 checks, all agreeing: a version-3 parent with two spendable outputs; the
+one child TRUC allows; a second child paying the same as the first, refused by
+both (on fee, `insufficient fee` on ours, `insufficient fee (including sibling
+eviction)` on Core's — the topology is no longer the reason either node gives);
+a second child paying well over the incumbent's fee, ACCEPTED by both, with the
+incumbent gone from both mempools by direct query, not just by an overall
+match; a third child that would have beaten the ORIGINAL incumbent but not the
+new one, refused by both. Mempools are compared as full txid sets after every
+step, not just spot-checked at the end.
+
+Checked in both directions, not just that it passes: the same harness run
+against the pre-sibling-eviction code (`bitcoin_mempool_policy.c` from before
+c43f97c) reproduces exactly the shape of bug this exists to catch —
+`core=accept bmc=reject(TRUC-violation)` on the eviction case, and the
+divergence then cascades into a mempool mismatch and a wrong verdict on the
+third-child case, because that one's correctness depends on the eviction
+having happened. A differential that cannot be made to fail proves nothing;
+this one fails in exactly the place the feature exists to fix, and only
+there.
 
 ## Update 2026-09-03 — `bytespersigop`, and the sigop count that outlived its transaction
 
