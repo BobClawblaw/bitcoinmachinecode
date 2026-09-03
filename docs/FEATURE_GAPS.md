@@ -2089,3 +2089,50 @@ declined features, the package-relay wire protocol, and — the one item
 worth treating as a priority — actually running a full, unconditional,
 `assumevalid=0` verification of this chain against Core, now that it is
 clear the routine sync path no longer does that by default.
+
+## Update 2026-09-03 — `SIG_FINDANDDELETE` is answered second where Core answers it first
+
+The AArch64 verify differential (60,000 whole-input cases on three fresh
+seeds, run against the oracles rebuilt natively for aarch64) came back with
+zero verdict mismatches and one error-code mismatch, and it is a real ordering
+gap rather than noise: `validation/findanddelete_order_repro.sh` reproduces it
+in one line on either architecture.
+
+The case is a bare CSV-guarded P2PK, `025faf00 b2 75 21<pubkey> ac`, whose
+scriptSig pushes the 2-byte value `5faf`. The `CSV`/`OP_DROP` pair leaves that
+value sitting in the signature slot at `OP_CHECKSIG`, so it is not a signature
+and the spend must fail -- the only question is which rule says so. The value
+is also a literal of the script being executed, three bytes from its start,
+and that is what Core trips on first:
+
+    CScript scriptCode(pbegincodehash, pend);
+    int found = FindAndDelete(scriptCode, CScript() << vchSig);
+    if (found > 0 && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE))
+        return set_error(serror, SCRIPT_ERR_SIG_FINDANDDELETE);   /* interpreter.cpp:330 */
+
+Core performs that search BEFORE `CheckSignatureEncoding`, at
+`EvalChecksigPreTapscript`'s top, for `OP_CHECKSIG` and (per its own loop,
+`interpreter.cpp:1146`) for every signature of an `OP_CHECKMULTISIG`. Ours
+performs it inside the checker callback, `asm/bitcoin_scriptverify.c:186`,
+which the interpreter reaches only after `interp_sig_encoding_ok` and
+`interp_pubkey_encoding_ok` have both returned. So a signature that is invalid
+by encoding AND present inside its own scriptCode is reported as `SIG_DER`
+where Core reports `SIG_FINDANDDELETE`. Both reject; the verdict, and therefore
+consensus, is unaffected -- this is a diagnostic-order gap, in the same class
+as the error-code gaps that brought NULLFAIL, LOW_S and CONST_SCRIPTCODE into
+the interpreter on 2026-09-02.
+
+NOT a port bug. `asm/bitcoin_interp.asm`'s `interp_checksig` has the identical
+order and the search itself is shared C, so x86 answers `SIG_DER` too; the ARM
+run found it only because these three seeds had not been run before.
+
+The fix is confined to the failing arm of the interpreter, which is why it has
+not been made on one architecture alone: when the encoding checks PASS, the
+callback's existing `-5` already produces Core's answer, so only the ERROR
+path needs the search -- under `CONST_SCRIPTCODE` with a non-empty signature,
+run the strip over `[pbegincodehash, pend)` before reporting `SIG_DER`,
+`SIG_HIGH_S`, `SIG_HASHTYPE` or `PUBKEYTYPE`, and report `SIG_FINDANDDELETE`
+if it lands. Cost is bounded to scripts that were already being rejected, and
+the accept path -- the one that runs on every block -- does not gain a scan.
+That is observably Core's ordering without paying Core's redundant work,
+since our callback strips the scriptCode again anyway for the sighash.
