@@ -1896,3 +1896,80 @@ that count anywhere a human would see it before believing the headline.
 Worth a follow-up: make a high engine-failure rate fail the run's exit code,
 not just its own line in the report, so a repeat of this specific mistake
 cannot again pass silently for a day.
+
+## Update 2026-09-03 — new targeted mutations: the SIGHASH_SINGLE three-way split, and P2WSH's size exemption
+
+Asked to extend coverage specifically for resource-limit and sighash edge
+cases, on top of the oracle restoration above. Two genuinely new differential
+classes, both found by reading Core's source and this project's own code
+side by side rather than by guessing at likely bug shapes.
+
+**The SIGHASH_SINGLE-with-no-matching-output rule is not one rule with three
+implementations — it is three DIFFERENT rules, one per sigversion, and only
+one of them had a differential before now.** Legacy substitutes the whole
+sighash with the constant `uint256(1)` (`SignatureHash`'s own historic
+compatibility hack, gated `sigversion != WITNESS_V0`). BIP143/witness v0
+zero-fills only the `hashOutputs` mid-hash inside an otherwise ordinary
+preimage — a narrower, different substitution, excluded from the legacy path
+by that same guard. BIP341/taproot does neither: `SigningDataSighash` returns
+`false` outright, so the sighash cannot even be computed and the spend is
+unconditionally invalid. `synth_sighash_single_bug()` tested only the first
+of these. `synth_sighash_single_v0_no_output()` and
+`synth_sighash_single_taproot_no_output()` add the other two.
+
+The taproot case is a regression test for a REAL, ALREADY-FIXED consensus
+false accept (`bitcoin_taproot_sighash.c`, 2026-08-22): the taproot sighash
+used to carry BIP143's zero-fill behaviour over verbatim, computing a
+signable hash where Core computes none, and accepting spends Core has always
+rejected — 130 of 945 vectors in the corpus that caught it were this exact
+case on real mainnet transactions, not a constructed corner. That diagnostic
+script is gone and nothing else in the tree names this input shape, so the
+fix has had zero regression coverage against Core since the day it landed.
+The new test signs with the OLD, WRONG formula on purpose — not a garbage
+signature that would be rejected for any reason, but the exact bytes a
+regressed implementation would happily accept — confirmed by computing both
+formulas over the same otherwise-valid inputs and checking they produce
+materially different hashes, so the test is known to discriminate rather
+than accidentally coincide.
+
+**P2WSH's witnessScript is not bounded by the 520-byte push-size limit the
+way a P2SH redeemScript is, and the reason is structural rather than a
+special case written for witness scripts.** A P2SH redeemScript must arrive
+as a scriptSig push, so the generic `MAX_SCRIPT_ELEMENT_SIZE` caps it at 520
+bytes before it is even considered. A P2WSH witnessScript instead arrives as
+the LAST witness stack item, popped off (`VerifyWitnessProgram`'s
+`SpanPopBack`) before Core's "no witness item over 520 bytes" check ever runs
+over what remains — so the script itself is invisible to that check, and its
+only real ceiling is the generic 10,000-byte `MAX_SCRIPT_SIZE` that also
+bounds a bare script. A hand-rolled implementation that applies "witness
+items are capped at 520 bytes" uniformly, without excluding the one that got
+popped, would reject spends Core accepts.
+`sv_verify_witness_v0` (`bitcoin_witness_v0.c`) gets this right by excluding
+index `nwit-1` from its per-item size loop — confirmed correct by reading it
+before writing the test, and now checked against Core rather than only
+against a reading of the file: `synth_p2wsh_script_size` proves a 521-byte
+witnessScript (over the P2SH cap) and a 10,000-byte one are both legal, and
+10,001 bytes is rejected.
+
+**A third case was designed, built, found genuinely infeasible, and dropped
+rather than shipped anyway.** The witness stack's own item-count check
+(`nstack > MAX_STACK` in `sv_verify_witness_v0`, evaluated before the script
+ever runs — distinct from `EvalScript`'s execution-time
+`stack.size()+altstack.size()` accumulation) looks like a candidate for the
+same treatment: 1000 pre-supplied witness arguments accepted, 1001 rejected.
+The reject side is trivially constructible (an empty or trivial witnessScript
+with too many leftover items fails the implicit witness-cleanstack rule
+regardless of the reason). The accept side is not: consuming anywhere near
+1000 pre-existing stack items down to the required single element costs more
+opcodes than the 201-opcode budget allows by any mechanism Bitcoin Script
+has — `OP_2DROP` needs 500 calls for 1000 items, and `OP_CHECKMULTISIG`
+charges its own pubkey count against the same budget it would need to spend,
+so large-N consumption is not just hard here but appears to be structurally
+impossible to construct as a genuinely valid spend at all. Confirmed
+numerically (402 items is the most `OP_2DROP` alone could ever clear within
+budget) before writing anything that would have tested the wrong thing under
+a misleading name.
+
+Full run after adding these: 79 synthesized cases (up from 74), 96 rule
+mutations, 7,805 interpreter probes, zero divergences, zero engine failures,
+zero synthesis errors.
