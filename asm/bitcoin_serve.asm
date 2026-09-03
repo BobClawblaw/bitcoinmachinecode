@@ -122,9 +122,20 @@ cn_feeflt: db "feefilter",0
 viol_txrelay: db "transaction sent in violation of protocol",0          ; Core net_processing.cpp
 viol_invtx:   db "transaction inv sent in violation of protocol",0
 viol_mempool: db "mempool request with bloom filters disabled",0
+viol_gbtidx:  db "getblocktxn with malformed or out-of-bounds tx indices",0  ; Core: Misbehaving(100)
 ; BIP152 output buffer (blocktxn / cmpctblock assembly) + per-connection state.
 align 16
 bt_buf:    times (8<<20) db 0     ; compact-block output buffer
+s_btend:   dq 0                   ; NET-1: bt_buf + capacity (exclusive). The
+                                  ; blocktxn writer accumulated [s_p] with no
+                                  ; bound against the 8 MiB buffer; a malicious
+                                  ; index vector repeating the largest tx could
+                                  ; run past it into the .bss that follows.
+gbt_payload_end: dq 0             ; NET-1: pl_buf + s_plen (exclusive) while
+                                  ; .do_getblocktxn parses; r10/r11 are free in
+                                  ; this handler (verified against every call
+                                  ; site in the branch), so the bound lives in
+                                  ; a named slot to survive the callee below.
 ; A getdata we cannot satisfy must be ANSWERED. Core replies `notfound`;
 ; this path used to say nothing at all, so the peer sat waiting for its own
 ; timeout on every miss -- and a peer that times out on us asks someone else
@@ -281,6 +292,11 @@ node_serve_loop:
     mov  [s_htidx], rcx      ; keep a stable copy (a downstream callee clobbers r15)
     mov  [s_st], rdx         ; stable copy of st
     mov  qword [s_served], 0 ; served count
+    ; NET-1: one-past-the-end of the blocktxn assembly buffer, checked by the
+    ; writer below before every append.
+    lea  rax, [bt_buf]
+    add  rax, (8<<20)
+    mov  [s_btend], rax
 
     ; init the tx-relay mempool once (static; shared across connections)
     cmp  byte [mp_initdone], 1
@@ -1442,24 +1458,34 @@ node_serve_loop:
     ; payload: blockhash(32) || count(varint) || indexes (DifferenceFormatter
     ; encoded: stored[i]=idx-shift; shift=idx+1). We serve a blocktxn reply with
     ; exactly the requested txs (witness included) from the stored block.
+    ;
+    ; NET-1 fix (audit 2026-09-03): every byte this path parses is
+    ; attacker-chosen. The old code (a) read varint bytes with no bound against
+    ; the payload length, so a short message parsed stale bytes from earlier
+    ; traffic in pl_buf, and (b) wrote one u16 per count into s_idxbuf (512
+    ; entries) with no capacity check -- count 0xffff wrote 65535 u16 = 131 KB
+    ; over .data, and the corrupted s_blen_spill then fed block_tx_at a bogus
+    ; bound whose output memcpy_len sprayed into bt_buf. Core caps each index
+    ; at MAX_SIZE and Misbehaving(100)s req.indexes.size() > block.vtx.size().
+    ; Our equivalent, enforced BEFORE the block is even looked up (a peer may
+    ; probe our store inventory for free; it may not spray past it): the count
+    ; must fit s_idxbuf, every varint byte must lie inside the announced
+    ; payload, malformed diff forms score the peer, and any breach answers
+    ; nothing.
     mov  rax, [s_plen]
     cmp  rax, 33
     jb   .next
-    ; load the requested block by hash into sb_buf
-    ; node_serve_block_by_hash(st, hash, out, cap) -> len
-    mov  rdi, [s_st]
-    lea  rsi, [pl_buf]
-    lea  rdx, [sb_buf]
-    mov  rcx, (8<<20)
-    call node_serve_block_by_hash
-    mov  [s_blen_spill], rax   ; block length (preserved)
-    test rax, rax
-    jle  .next
-    ; parse indexes (DifferenceFormatter) from pl_buf+33...
-    mov  qword [s_idxn], 0
-    mov  qword [s_diffshift], 0
+    ; ---- parse the index vector FIRST (bounds only; see NET-1 above) ----
+    ; payload cursor bound: pl_buf + s_plen in a named slot (rbx/rcx/rdx/rsi
+    ; are clobbered by the block lookup below; the slot survives it and any
+    ; future callee).
+    lea  rax, [pl_buf + rax]
+    mov  [gbt_payload_end], rax
     ; count varint at pl_buf+32
     lea  rbx, [pl_buf+32]      ; cursor (rbx is free, outer counter in r15/rbp)
+    lea  rax, [rbx+1]
+    cmp  rax, [gbt_payload_end]
+    ja   .gbkt_done            ; payload ends before the count byte
     xor  ecx, ecx
     mov  cl, byte [rbx]
     cmp  cl, 0xfd
@@ -1468,21 +1494,37 @@ node_serve_loop:
     jmp  .gbtx_cnthave
 .gbtx_bigcnt:
     cmp  cl, 0xfd
-    jne  .gbkt_done            ; unsupported varint form -> bail (send nothing)
+    jne  .gbkt_done            ; unsupported varint form (0xfe/0xff) -> bail
+    lea  rax, [rbx+3]
+    cmp  rax, [gbt_payload_end]
+    ja   .gbkt_done            ; 3-byte varint runs past the payload
     movzx rcx, word [rbx+1]
     add  rbx, 3
 .gbtx_cnthave:
+    ; rcx = number of indexes. It must fit s_idxbuf (512 entries; the same
+    ; cap Core's MAX_SIZE + ProcessGetBlockTxn enforcement imposes on a
+    ; real block: no block we can answer for has more). Oversize -> score.
+    cmp  rcx, 512
+    ja   .gbkt_viol
     ; rcx = number of indexes. Parse each diff varint.
+    mov  qword [s_idxn], 0
+    mov  qword [s_diffshift], 0
 .gbtx_idxloop:
     test rcx, rcx
-    jz   .gbkt_build
+    jz   .gbtx_parsed
     ; parse a varint diff value at rbx
     xor  edx, edx
+    lea  rax, [rbx+1]
+    cmp  rax, [gbt_payload_end]
+    ja   .gbkt_viol            ; diff byte runs past the payload
     mov  dl, byte [rbx]
     cmp  dl, 0xfd
     jb   .gbtx_d1
     cmp  dl, 0xfd
-    jne  .gbkt_done
+    jne  .gbkt_viol            ; 0xfe/0xff form is malformed here
+    lea  rax, [rbx+3]
+    cmp  rax, [gbt_payload_end]
+    ja   .gbkt_viol            ; 3-byte diff runs past the payload
     movzx rdx, word [rbx+1]
     add  rbx, 3
     jmp  .gbtx_dhave
@@ -1492,7 +1534,9 @@ node_serve_loop:
     ; index = shift + diff
     mov  rax, [s_diffshift]
     add  rax, rdx
-    ; store index (u16) in s_idxbuf[ idxn*2 ]
+    ; store index (u16) in s_idxbuf[ idxn*2 ]. idxn < 512 is guaranteed: rcx
+    ; entered <= 512 and decrements per store (Core rejects an index >=
+    ; block.vtx.size() at reply time; block_tx_at below fails the same way).
     mov  rdx, [s_idxn]
     mov  word [s_idxbuf + rdx*2], ax
     inc  qword [s_idxn]
@@ -1501,6 +1545,18 @@ node_serve_loop:
     mov  [s_diffshift], rax
     dec  rcx
     jmp  .gbtx_idxloop
+.gbtx_parsed:
+    ; ---- vector is well-formed; NOW look the block up ----
+    ; load the requested block by hash into sb_buf
+    ; node_serve_block_by_hash(st, hash, out, cap) -> len
+    mov  rdi, [s_st]
+    lea  rsi, [pl_buf]
+    lea  rdx, [sb_buf]
+    mov  rcx, (8<<20)
+    call node_serve_block_by_hash
+    mov  [s_blen_spill], rax   ; block length (preserved)
+    test rax, rax
+    jle  .next                 ; not our block -> answer nothing (not scored)
 .gbkt_build:
     ; Build blocktxn into bt_buf = blockhash(32) + count(varint) + concat txs.
     ; blockhash = original request's pl_buf[0:32] (echoed back)
@@ -1539,6 +1595,13 @@ node_serve_loop:
     lea  rdi, [bt_buf + rax]
     mov  rsi, [s_txptr]
     mov  rdx, [s_txlen]
+    ; NET-1: the append must fit bt_buf. dst and dst+n are both checked
+    ; (dst >= bt_buf is automatic; the n < 2^31 bound from block_tx_at makes
+    ; dst+n non-wrapping) before a single byte is written.
+    add  rax, rdx
+    lea  rcx, [s_btend]
+    cmp  rax, [rcx]
+    ja   .gbkt_done          ; would overrun the assembly buffer -> answer nothing
     push rbx
     push rbx                 ; 2nd push = padding: keep RSP 16-byte aligned
     call memcpy_len
@@ -1566,6 +1629,13 @@ node_serve_loop:
     jmp  .next
 .gbkt_done:
     jmp  .next
+; NET-1: a malformed or over-capacity getblocktxn index vector. Core answers
+; Misbehaving(100) ("getblocktxn with out-of-bounds tx indices") and sends
+; nothing; we score via the shared violation hook and stay silent, like the
+; other parse-failure classes. rdi = reason, tail shared with .viol_report_next.
+.gbkt_viol:
+    lea  rdi, [viol_gbtidx]
+    jmp  .viol_report_next
 
 .next:
     ; ---- tip-watch: if the stored tip advanced past what we last announced,

@@ -554,9 +554,20 @@ bech32_decode:
     xor  r15, r15          ; running string length
     xor  r8,  r8           ; position of last '1' (0 = none yet)
 .sep_scan:
+    ; BIP173: a bech32(/bech32m) string is at most 90 characters. Reject the
+    ; over-length form HERE, before the data loop below: that loop converts
+    ; every character after the separator into WS+300, whose data region runs
+    ; WS+300..WS+389 (90 bytes max). The checksum path then uses WS+0 for
+    ; hrp_expand (2*hrp_len+1 <= 35 at hrp_cap<=17) + data5 + 6 zeros --
+    ; 35 + 90 + 6 fits WS (512) with room to spare. Without this cap a
+    ; ~300-char address argument (any address-taking RPC, e.g. validateaddress
+    ; via wallet_validate_address) overflowed WS into the following .bss --
+    ; audit SER-1/WAL-1 (2026-09-03). The scan bounds the input read too.
     movzx eax, byte [r14 + r15]
     test al, al
     jz   .sep_scan_done
+    cmp  r15, 90
+    jae  .err             ; >= 90 with no NUL yet -> over-length
     cmp  al, '1'
     jne  .not_sep
     mov  r8, r15
@@ -571,6 +582,12 @@ bech32_decode:
     ; HRP must fit the caller buffer.
     cmp  r15, r13
     jae  .err
+    ; NOTE: no separate hrp_cap bound is needed here. The total scan above
+    ; caps the whole string at 90, and the data region is strictly shorter,
+    ; so .data_conv writes at most 89 bytes into WS+300 (capacity 212). The
+    ; HRP's own bound is the caller's hrp_cap (checked just above); the
+    ; checksum helpers size their workspace from the caller's hrp argument,
+    ; not from hrp_cap, so no decode-time cap is correct for hrp length.
     ; validate every HRP char is printable US-ASCII (0x21..0x7e)
     xor  rcx, rcx
 .hrp_check:
@@ -598,6 +615,12 @@ bech32_decode:
     movzx eax, byte [rsi + r9]
     test al, al
     jz   .data_done
+    ; the total-length cap above makes this bound unreachable for any
+    ; NUL-terminated input; kept as a hard belt so .data_conv can never
+    ; write past its 212-byte WS region even if a caller hands a
+    ; non-NUL-terminated buffer (it would read OOB, but never write OOB).
+    cmp  r9, 90
+    jae  .err
     movzx ecx, byte [CHAR2IDX + rax]
     cmp  cl, 0xFF
     je   .err

@@ -48,6 +48,9 @@
  *     block-relaying node; stop's reply names this project, not Core.
  */
 #include "rpc_chain.h"
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
 #include "bitcoin_pow_rules.h"
 #include "rpc_node.h"     /* rpc_mempool_hooks: getblocktemplate reads the shared pool */
 #include "script_flags_consts.h"
@@ -260,6 +263,7 @@ int rpc_chain_open(const char* dir){
 /* Records are keyed by their raw (wire-order) bytes; an RPC hash string is
  * display order, so reverse it to look up. */
 static int height_by_hash(const u8 display[32], long* h){
+    if (!g_idx) return 0;   /* no index built: treat as not-found, never crash */
     u8 wire[32]; for (int i = 0; i < 32; i++) wire[i] = display[31-i];
     return idx_get(g_idx, wire, h) == 1;
 }
@@ -1875,7 +1879,9 @@ static void pmt_extract(pmt_extract_t* e, u32 ntx, int height, u32 pos, u8 out[3
 }
 
 /* small compactsize writer (values here are small) */
-static int pmt_put_cs(u8* d, u64 v){
+static int pmt_put_cs(u8* d, u64 v);   /* fwd */
+static int pmt_put_cs_pad(u8* d, u64 v, int force_fd){
+    if (force_fd && v <= 0xffff){ d[0]=0xfd; d[1]=(u8)v; d[2]=(u8)(v>>8); return 3; }
     if (v < 0xfd){ d[0]=(u8)v; return 1; }
     if (v <= 0xffff){ d[0]=0xfd; d[1]=(u8)v; d[2]=(u8)(v>>8); return 3; }
     d[0]=0xfe; d[1]=(u8)v; d[2]=(u8)(v>>8); d[3]=(u8)(v>>16); d[4]=(u8)(v>>24); return 5;
@@ -1908,6 +1914,133 @@ int pmt_test_roundtrip(const u8 (*leaves)[32], u32 ntx, u32 idx, u8 out_root[32]
     return ok;
 }
 
+/* merkle root for the crafted proofs (display hex), set by the test from
+ * its own block-100,000 vector so the serializer's header stamp matches the
+ * tree the proof carries */
+static char g_pmt_root_hex[65] = "0000000000000000000000000000000000000000000000000000000000000000";
+void pmt_test_set_root(const char* hex64){
+    if (hex64 && strlen(hex64) == 64) memcpy(g_pmt_root_hex, hex64, 64), g_pmt_root_hex[64] = 0;
+}
+/* When armed via pmt_test_set_root, the crafted header carries the REAL
+ * block-100,000 root: then an honest proof passes the root check and even
+ * reaches the (empty, guarded) archive step -- the strongest possible proof
+ * that the tightened bounds did NOT reject a legitimate serialization. */
+static void pmt_root_wire(u8 out[32]){
+    for (int i = 0; i < 32; i++){
+        char b[3] = { g_pmt_root_hex[i*2], g_pmt_root_hex[i*2+1], 0 };
+        out[31-i] = (u8)strtol(b, 0, 16);
+    }
+}
+/* RPX-1 regression hooks (audit 2026-09-03). pmt_test_verify calls
+ * cmd_verifytxoutproof DIRECTLY, bypassing the dispatcher's g_open archive
+ * gate: for parse-level decisions the command is a pure function of its hex
+ * argument -- the archive only participates in the final "block must be in
+ * our chain" step, which merely turns an otherwise-valid proof into an empty
+ * result array and cannot mask a parse accept/reject. (An empty archive
+ * cannot reach the parse path at all: with tip=-1 every proof dies at the
+ * "block not found" gate before the hex is walked -- which is why an earlier
+ * version of this hook, routed through rpc_chain_dispatch against an empty
+ * store, silently PASSED against the buggy code. The negative control for
+ * these vectors -- run with the fix reverted and watch them FAIL -- is
+ * mandatory, not optional.) */
+static int cmd_verifytxoutproof(const rj_val* params, rj_val** res, long* ec, const char** em);
+
+const char* pmt_test_verify_msg(const char* proof_hex, long* ec_out);
+
+long pmt_test_verify(const char* proof_hex){
+    long ec = 0;
+    pmt_test_verify_msg(proof_hex, &ec);
+    return (ec < 0) ? ec : 0;
+}
+
+/* same call, but ALSO hands back the error string: vectors that only assert
+ * "ec == -8" cannot tell a parse-bound rejection from a coincidental one,
+ * and this test suite has been burned by exactly that class of false pass */
+const char* pmt_test_verify_msg(const char* proof_hex, long* ec_out){
+    rj_val* params = rj_arr();
+    rj_arr_push(params, rj_str(proof_hex));
+    rj_val* res = 0; long ec = 0; const char* em = 0;
+    int ok = cmd_verifytxoutproof(params, &res, &ec, &em);
+    (void)ok; (void)res;
+    *ec_out = ec;
+    return em ? em : "";
+}
+
+/* Shared serializer for the crafted proofs: the same CPartialMerkleTree the
+ * real command builds, but with ATTACKER-CHOSEN ntx / nhash / nFlagsBytes
+ * fields (0 = the honest value) and the payload zero-padded to the lie.
+ * This is the only way to construct the RPX-1 attack input: a proof-shaped
+ * serialization whose nTransactions field exceeds PMT_MAX_TX while its
+ * nHashes drives the copy loop past the hashes[] allocation. */
+static int pmt_serialize_lie2(const u8 (*leaves)[32], u32 ntx, u32 ntx_field,
+                              u32 nhash_field, u32 nfb_field, u32 idx,
+                              int pad_cs, char* out, size_t outcap){
+    if (idx >= ntx) return 0;
+    u8* match = calloc(ntx, 1); if (!match) return 0; match[idx] = 1;
+    u8 (*hashes)[32] = malloc(sizeof(*hashes)*((size_t)ntx+64));
+    u8* bits = malloc((size_t)ntx*2 + 64);
+    if (!hashes || !bits){ free(match); free(hashes); free(bits); return 0; }
+    pmt_build_t b = { leaves, match, ntx, hashes, 0, bits, 0 };
+    pmt_build(&b, pmt_height(ntx), 0);
+    free(match);
+    u32 nhf = nhash_field ? nhash_field : b.nhash;
+    u32 nbf = nfb_field   ? nfb_field   : (b.nbits+7)/8;
+    if (nhf < b.nhash || nbf*8 < b.nbits){ free(hashes); free(bits); return 0; }
+    size_t need = 80 + 4 + 9 + (size_t)nhf*32 + 9 + (size_t)nbf;
+    u8* big = malloc(need + 16); if (!big){ free(hashes); free(bits); return 0; }
+    memset(big, 0, need + 16);
+    /* byte-exact unaligned writes (no aliasing/alignment assumptions) */
+    size_t o = 0; u32 v;
+    v = 1;           memcpy(big+o, &v, 4); o += 4;   /* version */
+    o += 32;                                          /* hashPrevBlock */
+    /* the tree's merkle root, stamped into the header: honest proofs then
+     * pass the root==header check, while the ntx/nhash lies remain the only
+     * variables under test. Computed straight from the caller's leaves --
+     * NOT the test's TXID_DISP (the serializer has no access to it; an
+     * earlier version stamped the vector root and the tree computed a
+     * different one, which is why every crafted proof hit "Invalid proof").
+     * The test may ALSO arm the real block-100,000 root via
+     * pmt_test_set_root for byte-exact vectors. */
+    u8 root[32];
+    pmt_calc_hash(leaves, ntx, pmt_height(ntx), 0, root);
+    if (g_pmt_root_hex[0] != '0') pmt_root_wire(root);
+    memcpy(big+o, root, 32); o += 32;   /* header merkleRoot field */
+    v = 1300000000u; memcpy(big+o, &v, 4); o += 4;   /* time */
+    v = 0x1d00ffffu; memcpy(big+o, &v, 4); o += 4;   /* bits */
+    v = 0;           memcpy(big+o, &v, 4); o += 4;   /* nonce */
+    v = (ntx_field ? ntx_field : ntx); memcpy(big+o, &v, 4); o += 4;  /* the attacked field */
+    o += (size_t)pmt_put_cs_pad(big+o, nhf, pad_cs);
+    for (u32 i=0;i<b.nhash;i++){ memcpy(big+o, hashes[i], 32); o += 32; }
+    o += (size_t)(nhf - b.nhash) * 32;               /* zero-pad to the lie */
+    o += (size_t)pmt_put_cs_pad(big+o, nbf, pad_cs);
+    memset(big+o, 0, nbf);
+    for (u32 i=0;i<b.nbits;i++) if (bits[i]) big[o + i/8] |= (u8)(1u << (i%8));
+    o += nbf;
+    if (o*2 + 1 > outcap){ free(big); free(hashes); free(bits); return 0; }
+    hex_of(out, big, o);
+    free(big); free(hashes); free(bits);
+    return 1;
+}
+
+/* honest-shaped proof with only the ntx field inflated (or 0 for honest) */
+int pmt_test_build_hex(const u8 (*leaves)[32], u32 ntx, u32 ntx_field, u32 idx, char* out, size_t outcap){
+    return pmt_serialize_lie2(leaves, ntx, ntx_field, 0, 0, idx, 0, out, outcap);
+}
+/* full attacker fields: ntx, nhash and nFlagsBytes all lie */
+int pmt_test_build_hex_atk(const u8 (*leaves)[32], u32 ntx, u32 ntx_field,
+                           u32 nhash_field, u32 nfb_field, u32 idx, char* out, size_t outcap){
+    return pmt_serialize_lie2(leaves, ntx, ntx_field, nhash_field, nfb_field, idx, 0, out, outcap);
+}
+/* like _atk but the nhash/nfb compactsize fields use the 0xfd two-byte form
+ * for a value < 0xfd: LEGAL to this parser (like Core's, minus Core's
+ * non-canonical throw -- that divergence is SER-3, tracked separately), so
+ * it lets the payload carry past 0xff=255 hash slots while a naive
+ * single-byte-field builder could not. */
+int pmt_test_build_hex_pad(const u8 (*leaves)[32], u32 ntx, u32 ntx_field,
+                           u32 nhash_field, u32 nfb_field, u32 idx, char* out, size_t outcap){
+    return pmt_serialize_lie2(leaves, ntx, ntx_field, nhash_field, nfb_field, idx, 1, out, outcap);
+}
+
 /* collect ordered wire-order txids of block h into leaves (caller-sized);
  * returns ntx, or -1 on decode error. */
 static long pmt_block_txids(long h, u8 (*leaves)[32], u32 cap){
@@ -1928,6 +2061,68 @@ static long pmt_block_txids(long h, u8 (*leaves)[32], u32 cap){
 }
 
 #define PMT_MAX_TX 100000
+
+/* RPX-1 canary: a guard page immediately after the hashes[] allocation, so
+ * any copy past the buffer END faults instead of corrupting the heap. The
+ * command's hashes[] is a lazily malloc'd static, so the only way to arm
+ * the guard before the copy runs is to install an allocation hook the
+ * command consults on its FIRST hashes[] allocation: g_rpx1_alloc replaces
+ * malloc there. The canary mapping is [data 32*(PMT_MAX_TX+64) | PROT_NONE
+ * page], so hashes[PMT_MAX_TX+64] -- the exact overflow entry -- hits the
+ * guard page and SIGSEGVs. pmt_test_verify(CANARY) therefore behaves as:
+ * fixed code: returns -8 before the copy, child never faults;
+ * buggy code: the copy faults (caller sees a forked-child fault, reported
+ * by pmt_test_verify_guarded). Production builds never set the hook. */
+static void* (*g_rpx1_alloc)(size_t) = 0;
+#define RPX1_HASH_ENTRIES (PMT_MAX_TX + 64)
+static u8* g_rpx1_canary_base = 0;     /* mmap region (for munmap) */
+static size_t g_rpx1_canary_sz = 0;
+static int  g_rpx1_armed = 0;
+
+static void* rpx1_canary_malloc(size_t n){
+    size_t need = RPX1_HASH_ENTRIES * 32;
+    if (n < need) return malloc(n);
+    size_t pagesz = 4096;
+    size_t sz = ((need + pagesz - 1) / pagesz) * pagesz + pagesz;
+    u8* m = mmap(0, sz, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (m == MAP_FAILED) return malloc(n);
+    mprotect(m + sz - pagesz, pagesz, PROT_NONE);
+    g_rpx1_canary_base = m; g_rpx1_canary_sz = sz;
+    return m;
+}
+
+void pmt_test_arm_hashes_guard(int on){
+    if (on){ g_rpx1_alloc = rpx1_canary_malloc; g_rpx1_armed = 1; }
+    else   { g_rpx1_alloc = 0; g_rpx1_armed = 0; }
+}
+
+/* run the command with the guard-page canary armed, in a forked child so a
+ * real overflow fault is observable rather than fatal. Returns the child's
+ * outcome: 0 = exited with ec (in *ec_out), -SIG = killed by signal
+ * (SIGSEGV = the copy wrote past the allocation). */
+const char* pmt_test_verify_msg(const char* proof_hex, long* ec_out);
+long pmt_test_verify_guarded(const char* proof_hex, int* sig_out){
+    /* arm IN THE CHILD so the canary buffer is this process's to fault on */
+    int pipefd[2]; if (pipe(pipefd) != 0) return -1;
+    pid_t pid = fork();
+    if (pid == 0){
+        close(pipefd[0]);
+        g_rpx1_alloc = rpx1_canary_malloc;
+        long ec = 0; pmt_test_verify_msg(proof_hex, &ec);
+        long out = (ec < 0) ? ec : 0;
+        ssize_t w = write(pipefd[1], &out, sizeof out); (void)w;
+        _exit(0);
+    }
+    close(pipefd[1]);
+    long out = 0;
+    ssize_t r = read(pipefd[0], &out, sizeof out); (void)r;
+    close(pipefd[0]);
+    int st = 0; waitpid(pid, &st, 0);
+    if (WIFSIGNALED(st)){ if (sig_out) *sig_out = WTERMSIG(st); return -WTERMSIG(st); }
+    if (sig_out) *sig_out = 0;
+    return (r == (ssize_t)sizeof out) ? out : -1;
+}
+
 static int cmd_gettxoutproof(const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_ARR){
         *ec = -8; *em = "Invalid parameter, expected array of txids"; return 0; }
@@ -2025,16 +2220,27 @@ static int cmd_verifytxoutproof(const rj_val* params, rj_val** res, long* ec, co
     if (p + 84 > end){ free(buf); *ec=-8; *em="Invalid proof"; return 0; }
     const u8* hdr = p; p += 80;
     u32 ntx = rd32(p); p += 4;
-    u64 c; u64 nhash = read_varint(p, end, &c); if (!c || nhash > ntx + 64){ free(buf); *ec=-8; *em="Invalid proof"; return 0; } p += c;
+    /* RPX-1 fix (audit 2026-09-03): cap ntx BEFORE anything derived from it
+     * is read or copied. nhash is bounded by ntx below, and the copy loop
+     * writes into a PMT_MAX_TX+64 entry buffer, so an unbounded ntx let a
+     * caller with ntx > PMT_MAX_TX drive the copy past the allocation
+     * (nhash <= ntx+64 admitted PMT_MAX_TX+65 entries). Core rejects
+     * nTransactions > MAX_SIZE at deserialisation and nHashes >
+     * nTransactions at the CPartialMerkleTree level; our equivalents are
+     * PMT_MAX_TX and nhash > ntx, both enforced before the reads
+     * (merkleblock.cpp never sizes a buffer to the untrusted count). */
+    if (ntx == 0 || ntx > PMT_MAX_TX){ free(buf); *ec=-8; *em="Invalid proof"; return 0; }
+    u64 c; u64 nhash = read_varint(p, end, &c); if (!c || nhash > ntx){ free(buf); *ec=-8; *em="Invalid proof"; return 0; } p += c;
     if (p + nhash*32 > end){ free(buf); *ec=-8; *em="Invalid proof"; return 0; }
-    static u8 (*hashes)[32]; if(!hashes){ hashes=malloc(sizeof(*hashes)*(PMT_MAX_TX+64)); }
+    static u8 (*hashes)[32];
+    if(!hashes){ hashes = (g_rpx1_alloc ? (u8(*)[32])g_rpx1_alloc(sizeof(*hashes)*(PMT_MAX_TX+64))
+                                        : malloc(sizeof(*hashes)*(PMT_MAX_TX+64))); }
     for (u64 i=0;i<nhash;i++){ memcpy(hashes[i], p, 32); p += 32; }
     u64 nfb = read_varint(p, end, &c); if (!c){ free(buf); *ec=-8; *em="Invalid proof"; return 0; } p += c;
     if (p + nfb > end || nfb*8 > PMT_MAX_TX*2+64){ free(buf); *ec=-8; *em="Invalid proof"; return 0; }
     static u8* bits; if(!bits){ bits=malloc(PMT_MAX_TX*2+64); }
     u32 nbits = (u32)(nfb*8);
     for (u32 i=0;i<nbits;i++) bits[i] = (p[i/8] >> (i%8)) & 1;
-    if (ntx == 0 || ntx > PMT_MAX_TX){ free(buf); *ec=-8; *em="Invalid proof"; return 0; }
     static u8 (*matched)[32]; if(!matched){ matched=malloc(sizeof(*matched)*(PMT_MAX_TX)); }
     pmt_extract_t e = { (const u8(*)[32])hashes, (u32)nhash, 0, bits, nbits, 0, matched, 0, 0 };
     u8 root[32]; pmt_extract(&e, ntx, pmt_height(ntx), 0, root);
@@ -4069,3 +4275,5 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "verifytxoutproof")) return cmd_verifytxoutproof(params, res, ec, em);
     return -1;
 }
+
+static int pmt_put_cs(u8* d, u64 v){ return pmt_put_cs_pad(d, v, 0); }

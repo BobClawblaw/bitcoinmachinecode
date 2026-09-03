@@ -183,6 +183,39 @@ int main(void) {
         if (!ok) failures++;
     }
 
+    /* === audit 2026-09-03 SER-1/WAL-1: over-length inputs must be rejected
+     * WITHOUT writing past the decode scratch. bech32_decode had no length cap
+     * at all: a ~300-char address on any address-taking RPC overflowed the
+     * module's .bss workspace with attacker-chosen bytes. The BIP173 cap is
+     * 90 chars total; the 90-char vectors above are valid, so the boundary is
+     * "reject at 91+". The d5buf the harness passes is only 256 bytes, so
+     * before the fix these inputs corrupted .bss past WS -- a PASS here means
+     * the decode failed cleanly, exactly as Core's bech32::Decode rejects. */
+    {
+        char long91[96], long300[384], longhrp[256];
+        /* 91 chars, otherwise well-formed (hrp "a", valid charset) */
+        memset(long91, 'q', 91); long91[1] = '1'; long91[91] = 0;
+        /* 300-char junk of valid charset chars after a real hrp */
+        strcpy(long300, "bc1");
+        memset(long300+3, 'q', 297); long300[300] = 0;
+        /* a 95-char hrp with 6 data chars: hrp_len alone exceeds hrp_cap-1
+         * (95) and the total blows BIP173's 90 -- must be rejected. (A
+         * well-formed 80+6 string is NOT invalid: the BIP173 cap is 90.) */
+        memset(longhrp, 'a', 95); longhrp[95] = '1'; strcpy(longhrp+96, "qqqqqq"); longhrp[102] = 0;
+        struct { const char* what; const char* s; } lv[] = {
+            {"91-char string rejected",        long91},
+            {"300-char string rejected",       long300},
+            {"95-char hrp rejected (hrp_cap)", longhrp},
+        };
+        for (int i = 0; i < 3; i++) {
+            char nm[64]; snprintf(nm, sizeof nm, "overlength %s", lv[i].what);
+            long long n = bech32_decode(d5buf, hrpbuf, 95, lv[i].s);
+            int ok = (n < 0);
+            printf(ok ? "PASS %s\n" : "FAIL %s (n=%lld)\n", nm, n);
+            if (!ok) failures++;
+        }
+    }
+
     printf(failures ? "FAILURES %d\n" : "ALL TESTS PASSED (0 failures)\n", failures);
     return failures ? 1 : 0;
 }
