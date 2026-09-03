@@ -1,4 +1,4 @@
-# TODO — arm-port state after the 2026-09-03 session
+# TODO — arm-port state after the 2026-09-03 session (sync 6 deployed as arm-5)
 
 Everything below is landed on `arm-port` and pushed. History lives in
 `worklog/2026-09-0{1,2,3}.md`; the per-module port status is
@@ -11,8 +11,10 @@ Everything below is landed on `arm-port` and pushed. History lives in
       appends to `wal_buf`, `mac_flush` drains before it truncates), and it is
       live — the LSM reloaded to the identical live count after two restarts.
       There is now NO functional failure on the board. 92e441e
-- [x] Syncs 4 and 5 merged (12 + 10 commits, all arch-neutral C), deployed as
-      arm-3 and arm-4.
+- [x] Syncs 4, 5 and 6 merged (12 + 10 + 2 commits, all arch-neutral C),
+      deployed as arm-3, arm-4 and arm-5 (2026-09-03 18:00 UTC, rollback
+      `bitcoind.pre-sync6-20260903`; live=241272739 identical on the fourth
+      restart running, 0 invalid / 0 policy, tip advanced in ~6 min).
 - [x] Core's oracles rebuilt natively for aarch64 from main's restored
       `core_verify_oracle.cpp`, and `validation/synth_corpus_diff.py` run
       against the ARM interpreter for the first time: 79 cases / 96 rule
@@ -44,14 +46,14 @@ Everything below is landed on `arm-port` and pushed. History lives in
       it took (a frame walk, symbolic `.equ` frame maps, register-held fixed
       frames) and for the one function it still cannot see.
 - [ ] Boot's archive-gap phase is unexplained and varies 7x (21.87s / 85.46s /
-      148.71s; measured breakdown of the 86s: 16.0s to `139 confirmed-live
-      peer(s)` + 66.6s of silence until one peer answers `headers: already
-      current`). The phase's own comment claims a caught-up node "returns
-      almost instantly (pure disk reads, no network)", which the log
-      contradicts -- it opens peers and waits for a height answer. Find what
-      bounds that wait (or take the first `already current` instead of the
-      peer that happens to reply), then re-time it across three restarts before
-      calling anything settled.
+      148.71s / 49.97s on arm-5; each measured boot splits into ~16-18s to
+      `confirmed-live peer(s)` plus tens of seconds of silence until ONE peer
+      answers `headers: already current`). The phase's own comment claims a
+      caught-up node "returns almost instantly (pure disk reads, no network)",
+      which the logs contradict -- it opens peers and waits for a height
+      answer. Find what bounds that wait (or take the first `already current`
+      instead of the peer that happens to reply), then re-time it across three
+      restarts before calling anything settled.
 - [ ] Covering the last 6 unmodelled frames in the AArch64 ABI auditor needs
       offsets as RANGES: `point_scalar_mul_glv` bases its frame on `x28`
       (`mov x28,sp`, stores as `[x28,#TAB]`) and clamps sp to 16 through `x9`,
@@ -60,6 +62,8 @@ Everything below is landed on `arm-port` and pushed. History lives in
       checkable; until then `--list-unmodelled` names them with the reason.
 - [ ] Also worth a look: the gate's own reporting. Twice on 2026-09-03 main
       produced a green report that had compared nothing (link-check gating `test`
-      into silence, and the dead VERIFY/TAPVERIFY oracle). The ARM sweep has
-      the same shape — it separates `skip` and `built` from `fail` but prints no
-      "compared N of M" line, so the same mistake would pass here unnoticed.
+      into silence, and the dead VERIFY/TAPVERIFY oracle). The ARM sweep had the
+      same shape — its summary dropped the first result row (NR>1 header
+      assumption) and recounted its own summary lines as data; both fixed in
+      aed6533, but it still prints no "compared N of M" line, so a sweep that
+      built nothing and ran nothing would still look green here.
