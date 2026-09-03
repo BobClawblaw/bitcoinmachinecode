@@ -1643,3 +1643,52 @@ not how many headers follow. (3) The download workers' dead-weight rule
 (bytes per second only) banned honest peers serving the tiny early blocks;
 it now also requires a low block rate. The run continues from a fresh clone of the
 fixed tree; `phase.log` / `progress.log` / `RESULT` in the run directory.
+
+## Update 2026-09-03 — our own transactions now announce like Core's, instead of being pushed
+
+Transactions this node originates (`sendrawtransaction`, and every wallet send,
+which routes through it) went out as an unsolicited `tx` message written to
+every peer leg in the same instant. Relay-*received* transactions had used the
+proper `inv` path since 2026-08-26; own transactions never joined them, and the
+gap was not written down here before now.
+
+Both halves of the old behaviour identified this node as the origin. An
+unsolicited transaction is not what a relaying node sends: anything merely
+passing one along announces the txid and waits for `getdata`, so a peer handed
+the bytes unprompted can tell it is talking to the source. And Core spreads
+announcements over an independent Poisson timer per peer precisely because
+simultaneous delivery on every leg is the signature of the node a transaction
+started at — a relayer's announcements have already been smeared by the hop
+that reached it.
+
+The justification in `daemon/tx_submit.c` was that the download worker runs no
+serve loop to answer a follow-up `getdata`. That had stopped being true:
+`daemon/tx_relay.c`'s drain answers `getdata(MSG_TX/MSG_WITNESS_TX)` from the
+shared mempool, which is how relayed transactions already propagate. Own
+transactions now use the same announce queue.
+
+The queue gained a per-leg timer to match Core: each leg draws its own
+next-send time from an exponential with mean 2 s (`m_next_inv_send_time`,
+`OUTBOUND_INVENTORY_BROADCAST_INTERVAL`), starting the moment the leg appears
+so the first announcement of a session is staggered too. The deviate is
+computed without `libm`, which nothing in this build links: for uniform 64-bit
+`r`, `-ln(r/2^64)` is `(clz+1)*ln2` minus the log of the normalised mantissa,
+taken from a 65-entry table with linear interpolation. `test_tx_relay` holds it
+to the distribution rather than the mean alone — over 200,000 draws, measured
+mean 1998.3 ms against 2000, `P(>m)` 0.3678 against `1/e`, `P(>2m)` 0.1352
+against `1/e²`.
+
+One defect surfaced only because the test went looking. A descriptor is
+recycled the instant a leg closes, so a re-dialled leg inherited the previous
+peer's slot — including a timer already due, announcing to the new peer at once
+and defeating the stagger exactly when legs churn most. `txrelay_leg_reset` is
+called from all three sites that hand a leg a fresh descriptor, and
+`txrelay_announce` independently re-arms any descriptor absent on the previous
+call, so a dial site added later and left unwired cannot degrade the stagger
+silently.
+
+`sendrawtransaction` now returns once the transaction is in the mempool, with
+the invs following on the worker's next rotations; Core returns at the same
+point for the same reason. Still not matched: inbound peers are served by the
+serve process on its own schedule, so the 5 s inbound interval Core uses is not
+modelled separately, and BIP339 `wtxidrelay` announcement remains txid-based.
