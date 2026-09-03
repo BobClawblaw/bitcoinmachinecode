@@ -1474,6 +1474,16 @@ int main(void){
          r2 == NULL && e2 == -5 && m2 && strstr(m2, "txindex"));
       rj_free(r2); }
 
+    { /* gettxoutproof without a blockhash, no index yet: the fix (2026-09-03
+       * audit) is the REASON it refuses -- it must no longer claim "a
+       * blockhash is required with no txindex" now that the daemon can
+       * build one; that claim was simply false since 2026-08-26. */
+      char pj[160]; snprintf(pj, sizeof pj, "[[\"%s\"]]", g_tx1_txid);
+      long e2; const char* m2; rj_val* r2 = call("gettxoutproof", pj, &e2, &m2);
+      ck("with no index, gettxoutproof refuses without the old false claim",
+         r2 == NULL && e2 == -5 && m2 && !strstr(m2, "with no txindex") && strstr(m2, "index"));
+      rj_free(r2); }
+
     build_fixture_txindex(2, 3);   /* base covers 0..2; height 3 lives in the TAIL */
     /* no reopen needed: txi_open latches on success, so the index is picked
      * up on the next lookup -- which is also what an operator building the
@@ -1495,6 +1505,37 @@ int main(void){
       }
       ck("every fixture tx resolves by txid alone", all);
       ck("...and byte-identically to the blockhash path (one render path)", same); }
+
+    { /* gettxoutproof by txid alone, via the txid index -- the audit fix.
+       * Must resolve to the SAME proof bytes the explicit-blockhash path
+       * produces (one render path, not two that could drift), and that
+       * proof must itself round-trip through verifytxoutproof. */
+      char pj_noh[160];  snprintf(pj_noh,  sizeof pj_noh,  "[[\"%s\"]]", g_tx1_txid);
+      char pj_hash[200]; snprintf(pj_hash, sizeof pj_hash, "[[\"%s\"],\"%s\"]", g_tx1_txid, g_hash[3]);
+      rj_val* pa = call("gettxoutproof", pj_noh,  &ec, &em);
+      rj_val* pb = call("gettxoutproof", pj_hash, &ec, &em);
+      ck("gettxoutproof by txid alone now succeeds (index resolves the block)",
+         pa && pa->str && pa->str[0]);
+      ck("...byte-identical to the explicit-blockhash proof",
+         pa && pb && pa->str && pb->str && !strcmp(pa->str, pb->str));
+      if (pa && pa->str){
+          char vpj[8192]; snprintf(vpj, sizeof vpj, "[\"%s\"]", pa->str);
+          rj_val* v = call("verifytxoutproof", vpj, &ec, &em);
+          ck("...and the resolved proof verifies to a non-empty txid array",
+             v && v->typ == RJ_ARR && v->nitems == 1 && v->items[0]->str &&
+             !strcmp(v->items[0]->str, g_tx1_txid));
+          rj_free(v);
+      }
+      rj_free(pa); rj_free(pb); }
+
+    { /* a txid the index does not hold: still an honest error, not a crash */
+      long e2; const char* m2;
+      rj_val* r2 = call("gettxoutproof",
+                        "[[\"00000000000000000000000000000000000000000000000000000000deadbeef\"]]",
+                        &e2, &m2);
+      ck("gettxoutproof on an unindexed txid reports the index's covered range",
+         r2 == NULL && e2 == -5 && m2 && strstr(m2, "heights"));
+      rj_free(r2); }
 
     { /* verbosity 1 through the index carries the block context */
       char pj[96]; snprintf(pj, sizeof pj, "[\"%s\",1]", g_tx2_txid);

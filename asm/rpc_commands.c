@@ -271,7 +271,7 @@ static int cmd_getnewaddr(const char* method, const rj_val* params, const rpc_wa
 }
 
 /* ---- validateaddress / getaddressinfo ---- */
-static int cmd_validate(const char* method, const rj_val* params, long* ec, const char** em, rj_val** result) {
+static int cmd_validate(const char* method, const rj_val* params, const rpc_wallet* w, long* ec, const char** em, rj_val** result) {
     const char* addr = rpc_param_str(params, 0, ec, em);
     if (!addr) return 0;
     int type; unsigned char ver, h160[20], prog32[32];
@@ -281,19 +281,25 @@ static int cmd_validate(const char* method, const rj_val* params, long* ec, cons
      * unknown base58 version passes the checksum but is not a valid address
      * (Core: isvalid=false), matching DecodeDestination. */
     int valid = ok && type >= WAL_ADDR_P2PKH && type <= WAL_ADDR_P2TR;
+    /* The scriptPubKey the address decodes to -- built once here rather
+     * than only inside the validateaddress branch, because getaddressinfo's
+     * real ismine/iswatchonly/ischange (below) need it too, to look the
+     * address up in the wallet's own key window by the SAME identity the
+     * wallet uses everywhere else. */
+    unsigned char s[34]; size_t sl = 0;
+    if (valid){
+        switch (type) {
+            case WAL_ADDR_P2PKH:  s[0]=0x76;s[1]=0xa9;s[2]=0x14;memcpy(s+3,h160,20);s[23]=0x88;s[24]=0xac; sl=25; break;
+            case WAL_ADDR_P2SH:   s[0]=0xa9;s[1]=0x14;memcpy(s+2,h160,20);s[22]=0x87;                     sl=23; break;
+            case WAL_ADDR_P2WPKH: s[0]=0x00;s[1]=0x14;memcpy(s+2,h160,20);                                sl=22; break;
+            case WAL_ADDR_P2WSH:  s[0]=0x00;s[1]=0x20;memcpy(s+2,prog32,32);                              sl=34; break;
+            case WAL_ADDR_P2TR:   s[0]=0x51;s[1]=0x20;memcpy(s+2,prog32,32);                              sl=34; break;
+        }
+    }
     rj_val* o = rj_obj();
     rj_obj_set(o, "isvalid", rj_bool(valid));
     if (!strcmp(method, "validateaddress")) {
         if (valid) {
-            /* scriptPubKey for the destination (P2PKH/P2SH/P2WPKH/P2WSH/P2TR) */
-            unsigned char s[34]; size_t sl = 0;
-            switch (type) {
-                case WAL_ADDR_P2PKH:  s[0]=0x76;s[1]=0xa9;s[2]=0x14;memcpy(s+3,h160,20);s[23]=0x88;s[24]=0xac; sl=25; break;
-                case WAL_ADDR_P2SH:   s[0]=0xa9;s[1]=0x14;memcpy(s+2,h160,20);s[22]=0x87;                     sl=23; break;
-                case WAL_ADDR_P2WPKH: s[0]=0x00;s[1]=0x14;memcpy(s+2,h160,20);                                sl=22; break;
-                case WAL_ADDR_P2WSH:  s[0]=0x00;s[1]=0x20;memcpy(s+2,prog32,32);                              sl=34; break;
-                case WAL_ADDR_P2TR:   s[0]=0x51;s[1]=0x20;memcpy(s+2,prog32,32);                              sl=34; break;
-            }
             /* Core echoes the CANONICAL encoding (bech32 lower-cased) */
             char canon[128]; canon[0] = 0; wallet_script_to_address(canon, sizeof canon, s, (long)sl);
             rj_obj_set(o, "address", rj_str(canon[0] ? canon : addr));
@@ -321,16 +327,24 @@ static int cmd_validate(const char* method, const rj_val* params, long* ec, cons
     } else { /* getaddressinfo */
         rj_obj_set(o, "address", rj_str(addr));
         if (valid) {
+            /* Real wallet lookup (audit finding, 2026-09-03: these four
+             * fields were hardcoded false/empty regardless of the actual
+             * wallet -- a correctness bug against a live wallet, not merely
+             * an absent feature). */
+            int is_mine = 0, is_watchonly = 0, is_change = 0, has_pub = 0;
+            unsigned char pub[33];
+            rpc_wops_address_ownership(w, s, (unsigned long)sl, &is_mine, &is_watchonly, &is_change, pub, &has_pub);
             if (type == WAL_ADDR_P2PKH) {
                 char pubhex[68]; pubhex[0] = 0;
+                if (has_pub) bin_to_hex(pubhex, pub, 33);
                 rj_obj_set(o, "pubkey", rj_str(pubhex));
                 rj_obj_set(o, "iscompressed", rj_bool(1));
             }
             rj_obj_set(o, "iswitness", rj_bool(type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH || type == WAL_ADDR_P2TR));
             rj_obj_set(o, "witness_version", rj_numf("%u", (type == WAL_ADDR_P2TR) ? 1 : 0));
-            rj_obj_set(o, "ismine", rj_bool(0));
-            rj_obj_set(o, "iswatchonly", rj_bool(0));
-            rj_obj_set(o, "ischange", rj_bool(0));
+            rj_obj_set(o, "ismine", rj_bool(is_mine));
+            rj_obj_set(o, "iswatchonly", rj_bool(is_watchonly));
+            rj_obj_set(o, "ischange", rj_bool(is_change));
         }
     }
     *result = o;
@@ -4477,7 +4491,7 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_getnewaddr(method, params, w, err_code, err_msg, result);
     }
     if (!strcmp(method, "validateaddress") || !strcmp(method, "getaddressinfo"))
-        return cmd_validate(method, params, err_code, err_msg, result);
+        return cmd_validate(method, params, w, err_code, err_msg, result);
     if (!strcmp(method, "gettxout"))
         return cmd_gettxout_w(params, w, err_code, err_msg, result);
     if (!strcmp(method, "listunspent"))
