@@ -2136,3 +2136,22 @@ if it lands. Cost is bounded to scripts that were already being rejected, and
 the accept path -- the one that runs on every block -- does not gain a scan.
 That is observably Core's ordering without paying Core's redundant work,
 since our callback strips the scriptCode again anyway for the sighash.
+
+**CLOSED 2026-09-03, both architectures in one commit (f7d28ce).** The four
+encoding-error arms of `interp_checksig` now funnel through one error site
+that, under `CONST_SCRIPTCODE`, runs the same strip the CHECKMULTISIG loop
+already uses (`script_push_encode` + `script_find_and_delete` over
+`[pbegincodehash, pend)`, the `cms_needle`/`cms_scstrip0` scratch -- free
+here, since CHECKSIG never runs inside that loop) and answers `-5`
+(`SIG_FINDANDDELETE`) when the stripped length comes back shorter than the
+source, keeping the encoding error otherwise. An empty signature strips with
+the `OP_0` needle exactly as the C checker does on the accept path, and the
+scriptCode is capped at 10000 bytes like the checker's own guard. Nothing on
+the accept path moves. Verified on AArch64: the repro exits 0 (ours 54 =
+Core 54); `fuzz_verify_diff` 3 seeds x 20,000 cases now reports
+VERDICT-MISMATCHES=0 **code-only-mismatches=0** (the one standing error-code
+divergence is gone); `fuzz_script_diff` 100,000 cases 0 mismatches;
+`synth_corpus_diff` 79/96/zero-divergences unchanged; native sweep round 19
+green. The x86 twin is the same transform and assembles clean under
+`nasm -Werror`; its execution gate runs with main's suite. The repro script
+stays in `validation/` as a permanent regression check.

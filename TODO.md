@@ -21,14 +21,19 @@ Everything below is landed on `arm-port` and pushed. History lives in
       mutations / 7,805 interpreter probes, 0 divergences, 0 engine failures.
 
 ## Open (next sessions)
-- [ ] `SIG_FINDANDDELETE` ordering — ours answers `SIG_DER` where Core answers
-      `SIG_FINDANDDELETE`, because Core's `FindAndDelete` under
-      `CONST_SCRIPTCODE` precedes `CheckSignatureEncoding` and ours sits in the
-      C checker callback behind it. Verdict-safe (both reject), present in the
-      x86 `interp_checksig` too, so it is a main-side fix that then merges
-      down: see `docs/FEATURE_GAPS.md` (Update 2026-09-03) and
-      `validation/findanddelete_order_repro.sh`, which exits 0 once fixed and
-      can go straight into a regression run.
+- [x] `SIG_FINDANDDELETE` ordering — fixed 2026-09-03 on both architectures in
+      one commit (f7d28ce): the CHECKSIG encoding-error arms run Core's
+      CONST_SCRIPTCODE strip before reporting SIG_DER / SIG_HIGH_S /
+      SIG_HASHTYPE / PUBKEYTYPE and answer SIG_FINDANDDELETE when it lands.
+      The repro exits 0; fuzz_verify_diff now reports 0 code-only mismatches
+      over 3 seeds x 20,000 cases; see docs/FEATURE_GAPS.md (Update
+      2026-09-03, CLOSED). The repro stays in validation/ as a regression
+      check. Left for a later session, found while implementing: the
+      CHECKMULTISIG up-front strip raises SIG_FINDANDDELETE for ANY on-stack
+      signature found in the scriptCode BEFORE the matching loop, where Core
+      interleaves per-signature (an encoding-invalid sig 0 preempts a later
+      signature's FAD in Core, not here) — verdict-safe, BASE-only gate, and
+      only reachable when no earlier signature's encoding check has fired.
 - [ ] `validation/spend_corpus_diff.py` has never run on this port: it needs a
       synced Bitcoin Core over RPC (`BMC_ORACLE_RPC_PORT`/`BMC_ORACLE_COOKIE`)
       and this box has no Core datadir. `synth_corpus_diff.py` needs neither,
