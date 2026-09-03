@@ -84,14 +84,33 @@ static int net_reach(int bmc_id, int dflt){
     return g_net_reachable_fn ? (g_net_reachable_fn(bmc_id) ? 1 : 0) : dflt;
 }
 
-/* one entry of getnetworkinfo.networks */
-static rj_val* net_entry(const char* name, int reachable){
+/* one entry of getnetworkinfo.networks.
+ *
+ * `proxy` and `proxy_randomize_credentials` used to be hardcoded empty/false
+ * for every network regardless of the actual config -- Core's own
+ * GetProxy(network)->m_tor_stream_isolation reports the REAL configured
+ * proxy per network, and per-connection SOCKS5 credential randomization is
+ * genuinely active here (daemon/dialer.c) whenever -proxyrandomize is on, so
+ * this RPC was misreporting the node's own behaviour (audit finding,
+ * 2026-09-03). Matches Core's exact per-network wiring
+ * (init.cpp SetProxy calls): -proxyrandomize applies to ipv4/ipv6/onion
+ * (each a real SOCKS5 proxy, Tor stream isolation being the point of
+ * randomizing credentials); it does NOT apply to i2p (the SAM bridge has no
+ * such concept -- Core constructs its Proxy with the plain, non-isolating
+ * constructor) or to cjdns (no proxy at all, a direct native network).
+ *
+ * node_config.c is linked weakly here: bitcoin_cli (a pure HTTP client)
+ * links this whole file but never executes cmd_getnetworkinfo, and does not
+ * link node_config.c at all -- the NULL check is what keeps that build
+ * working rather than needing a config parser it has no use for. */
+extern void node_config_get_proxy_info(const char**, const char**, const char**, int*) __attribute__((weak));
+static rj_val* net_entry(const char* name, int reachable, const char* proxy, int randomize){
     rj_val* o = rj_obj();
     rj_obj_set(o, "name", rj_str(name));
     rj_obj_set(o, "limited", rj_bool(0));
     rj_obj_set(o, "reachable", rj_bool(reachable));
-    rj_obj_set(o, "proxy", rj_str(""));
-    rj_obj_set(o, "proxy_randomize_credentials", rj_bool(0));
+    rj_obj_set(o, "proxy", rj_str(proxy ? proxy : ""));
+    rj_obj_set(o, "proxy_randomize_credentials", rj_bool((proxy && proxy[0]) ? randomize : 0));
     return o;
 }
 
@@ -120,11 +139,14 @@ static int cmd_getnetworkinfo(rj_val** res){
     rj_obj_set(o, "connections_in", rj_numf("%d", n_in));
     rj_obj_set(o, "connections_out", rj_numf("%d", n_out));
     { rj_val* nets = rj_arr();
-      rj_arr_push(nets, net_entry("ipv4",  net_reach(1, 1)));
-      rj_arr_push(nets, net_entry("ipv6",  net_reach(2, 1)));
-      rj_arr_push(nets, net_entry("onion", net_reach(4, 0)));
-      rj_arr_push(nets, net_entry("i2p",   net_reach(5, 0)));
-      rj_arr_push(nets, net_entry("cjdns", net_reach(6, 0)));
+      const char* proxy = NULL; const char* onion_proxy_raw = NULL; const char* i2psam = NULL; int proxyrandomize = 0;
+      if (node_config_get_proxy_info) node_config_get_proxy_info(&proxy, &onion_proxy_raw, &i2psam, &proxyrandomize);
+      const char* onion_proxy = (onion_proxy_raw && onion_proxy_raw[0]) ? onion_proxy_raw : proxy;  /* Core: -onion falls back to -proxy */
+      rj_arr_push(nets, net_entry("ipv4",  net_reach(1, 1), proxy,        proxyrandomize));
+      rj_arr_push(nets, net_entry("ipv6",  net_reach(2, 1), proxy,        proxyrandomize));
+      rj_arr_push(nets, net_entry("onion", net_reach(4, 0), onion_proxy,  proxyrandomize));
+      rj_arr_push(nets, net_entry("i2p",   net_reach(5, 0), i2psam,       0));  /* SAM: no stream isolation */
+      rj_arr_push(nets, net_entry("cjdns", net_reach(6, 0), NULL,         0));  /* direct network, no proxy */
       rj_obj_set(o, "networks", nets); }
     rj_obj_set(o, "relayfee", rj_numf("%.8f", 0.00001000));
     rj_obj_set(o, "incrementalfee", rj_numf("%.8f", 0.00001000));
