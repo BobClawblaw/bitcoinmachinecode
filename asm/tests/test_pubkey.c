@@ -79,6 +79,39 @@ int main(void){
     for(int i=0;i<65;i++){ unsigned int v; sscanf(uh+2*i,"%2x",&v); u[i]=(unsigned char)v; }
     cki("off-curve uncompressed rejected", pubkey_parse(u,65,qx,qy), 0);
 
+    /* ---- CRY-2 (audit 2026-09-03): HYBRID public keys (prefix 0x06/0x07).
+     * libsecp256k1 (Core's CPubKey::Verify path) ACCEPTS these; the parse
+     * only checks the redundant parity byte. Core never sets STRICTENC for
+     * block validation, so a legacy/P2SH/P2WSH-v0 spend with a valid
+     * signature under a hybrid key is consensus-VALID in Core. The old parser
+     * accepted only 0x04 -> false reject. G's y is even (ends 0xb8). ---- */
+    {
+        /* 0x06 || Gx || Gy : even prefix, Gy even -> parity MATCHES -> accept */
+        unsigned char hy[65];
+        const char* h06="0679be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                        "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+        for(int i=0;i<65;i++){ unsigned int v; sscanf(h06+2*i,"%2x",&v); hy[i]=(unsigned char)v; }
+        unsigned long long hx[4],hyq[4];
+        int hr = pubkey_parse(hy,65,hx,hyq);
+        cki("hybrid 0x06 with correct (even) parity ACCEPTS", hr, 1);
+        if(hr){
+            unsigned char xb[32],yb[32]; limbs2be(hx,xb); limbs2be(hyq,yb);
+            unsigned char gx[32]={0x79,0xbe,0x66,0x7e,0xf9,0xdc,0xbb,0xac,0x55,0xa0,0x62,0x95,
+                0xce,0x87,0x0b,0x07,0x02,0x9b,0xfc,0xdb,0x2d,0xce,0x28,0xd9,0x59,0xf2,0x81,0x5b,
+                0x16,0xf8,0x17,0x98};
+            unsigned char gy[32]={0x48,0x3a,0xda,0x77,0x26,0xa3,0xc4,0x65,0x5d,0xa4,0xfb,0xfc,
+                0x0e,0x11,0x08,0xa8,0xfd,0x17,0xb4,0x48,0xa6,0x85,0x54,0x19,0x9c,0x47,0xd0,0x8f,
+                0xfb,0x10,0xd4,0xb8};
+            cki("  hybrid 0x06 x-coord == Gx", memcmp(xb,gx,32)==0, 1);
+            cki("  hybrid 0x06 y-coord == Gy", memcmp(yb,gy,32)==0, 1);
+        }
+        /* 0x07 || Gx || Gy : odd prefix, Gy even -> parity MISMATCHES -> reject */
+        const char* h07="0779be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
+                        "483ada7726a3c4655da4fbfc0e1108a8fd17b448a68554199c47d08ffb10d4b8";
+        for(int i=0;i<65;i++){ unsigned int v; sscanf(h07+2*i,"%2x",&v); hy[i]=(unsigned char)v; }
+        cki("hybrid 0x07 with mismatched parity rejected", pubkey_parse(hy,65,hx,hyq), 0);
+    }
+
     printf("\n%s (%d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", fails);
     return fails?1:0;
 }

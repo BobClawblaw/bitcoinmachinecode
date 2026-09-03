@@ -304,9 +304,32 @@ pubkey_parse:
     jmp   .done
 
 .chk_uncomp:
+    ; CRY-2 (audit 2026-09-03): libsecp256k1's pubkey parse -- which Core's
+    ; CPubKey::Verify uses -- accepts 65-byte keys with prefix 0x04, 0x06,
+    ; 0x07. 0x06/0x07 are HYBRID encodings: the prefix carries the y parity
+    ; redundantly, and the parse requires (prefix & 1) == (y_last_byte & 1)
+    ; before the on-curve check. Core only rejects hybrids under
+    ; SCRIPT_VERIFY_STRICTENC, a policy flag NEVER set for block validation
+    ; (IsCompressedOrUncompressedPubKey is likewise policy-only), so a valid
+    ; signature under a hybrid-encoded key is consensus-valid in Core for
+    ; legacy/P2PK/P2SH/P2WSH-v0 spends. The old branch accepted only 0x04 ->
+    ; a FALSE REJECT against the live chain.
     movzx eax, byte [r12]
     cmp   al, 0x04
+    je    .uncomp_ok
+    cmp   al, 0x06
+    je    .hybrid_parity
+    cmp   al, 0x07
     jne   .bad_ret
+.hybrid_parity:
+    ; (prefix & 1) must equal the parity of the last byte of y (pub[64]).
+    movzx ecx, byte [r12+64]
+    mov   edx, eax
+    and   edx, 1
+    and   ecx, 1
+    cmp   edx, ecx
+    jne   .bad_ret
+.uncomp_ok:
     ; x = bytes 1..32, y = bytes 33..64
     ; copy x to [rbp-0x50], y to [rbp-0x90]
     mov   rcx, 32
