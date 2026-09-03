@@ -20,7 +20,11 @@ core to AArch64 so the project builds and runs NATIVELY on ARM64 hosts.
 - port/arm64/<name>.S  — AArch64 GNU-as rewrite of asm/<name>.asm, SAME public
                          symbols so shared C harnesses/daemon link unchanged.
 - port/arm64/Makefile  — builds each port + runs its harness (add targets per
-                         module).
+                         module). `make -C port/arm64 abi-a64-check` gates the
+                         AArch64 ABI auditor (callee-saved preservation and
+                         save-area aliasing over the whole .S tree);
+                         `abi-a64-audit` prints the findings plus, per function,
+                         the reason any frame was not followed.
 - port/PORT_ROADMAP.md  — per-module port status + verification method.
 
 ## Pushing to GitHub

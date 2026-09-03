@@ -306,6 +306,26 @@ fuzz: so fuzz_sc fuzz_point fuzz_ecdsa fuzz_schnorr t_sighash
 test-all: harness fuzz
 	@echo "ALL PORTED HASHING + NETWORK MODULES VERIFIED NATIVELY"
 
+# ---------------------------------------------------------------------------
+# Static ABI audit of the ported assembly.  AArch64 twin of asm/Makefile's
+# `callee-saved-check`.  UNSAVED-CLOBBER (a callee-saved register written and
+# never restored -- fatal under this tree's native -O2 C callers) and
+# SAVE-AREA-ALIAS (a statically-addressed store landing on a live save slot --
+# the GLV TAB[8] class) both gate.  The last line names how many functions the
+# frame walk actually followed and how many it could not, so a green run states
+# its own coverage instead of implying perfection.
+# ---------------------------------------------------------------------------
+abi-a64-check:
+	@python3 ../../scripts/abi_callee_saved_audit_a64.py --selftest
+	@python3 ../../scripts/abi_callee_saved_audit_a64.py --check \
+	    --format summary > /dev/null
+
+abi-a64-selftest:
+	@python3 ../../scripts/abi_callee_saved_audit_a64.py --selftest
+
+abi-a64-audit:
+	@python3 ../../scripts/abi_callee_saved_audit_a64.py --list-unmodelled
+
 clean:
 	rm -f *.o *.so test_sha256 test_sha512 test_ripemd160 t_ripemd \
 	       test_net test_p2p test_p2p_inv test_headers live_handshake live_download headers.dat

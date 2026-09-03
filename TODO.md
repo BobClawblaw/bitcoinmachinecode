@@ -38,9 +38,17 @@ Everything below is landed on `arm-port` and pushed. History lives in
       `bench_idxscan` / `bench_taproot_block` need production data files
       (`block413567.raw`, `./index.dat` in the scratch dir);
       `test_net_timeouts` needs >600s.
-- [ ] Optional hardening: port the x86 auditor's SAVE-AREA-ALIAS check; the
-      two untouched perf ports (buffered WAL — done — and `mac_flush`'s 1 MB
-      record writer).
+- [x] Optional hardening: the x86 auditor's SAVE-AREA-ALIAS check is ported to
+      `scripts/abi_callee_saved_audit_a64.py` and gated with
+      `make -C port/arm64 abi-a64-check` -- see the 2026-09-03 worklog for what
+      it took (a frame walk, symbolic `.equ` frame maps, register-held fixed
+      frames) and for the one function it still cannot see.
+- [ ] Covering the last 6 unmodelled frames in the AArch64 ABI auditor needs
+      offsets as RANGES: `point_scalar_mul_glv` bases its frame on `x28`
+      (`mov x28,sp`, stores as `[x28,#TAB]`) and clamps sp to 16 through `x9`,
+      and five `bitcoin_cli` commands size a buffer from an argument. Report
+      only an overlap that holds for every value in the range and both become
+      checkable; until then `--list-unmodelled` names them with the reason.
 - [ ] Also worth a look: the gate's own reporting. Twice on 2026-09-03 main
       produced a green report that had compared nothing (link-check gating `test`
       into silence, and the dead VERIFY/TAPVERIFY oracle). The ARM sweep has
