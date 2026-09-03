@@ -25,6 +25,8 @@
  */
 #include "genesis_skip.h"
 #include "chainparams.h"
+#include "../script_flags_consts.h"   /* per-chain BIP34 activation heights
+                                       * (VAL-1: coinbase height push) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,6 +129,11 @@ extern unsigned long long script_flags_for_block(unsigned long long height, cons
 extern int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
                                        const u8 block_hash32[32], void* lst, void* u, void* bx,
                                        u64* fail_tx_index, const char** reason);
+/* VAL-1 fees ledger (audit 2026-09-03): per-tx input sums (index = block tx
+ * position) gathered by tx_verify_block_connect_all's Phase 1 resolve pass,
+ * valid for the immediately preceding call. Returns NULL + n=0 if no call
+ * has run. */
+extern const u64* txvb_last_tx_in_sums(u64* n_out);
 extern void block_hash(u8 out[32], const u8 hdr[80]);
 
 /* Rolling undo-data retention window. Stage A's own design note calls for
@@ -859,10 +866,22 @@ static int bspent_claim(bspent_t* bs, const u8 key[36]){
     return 1;
 }
 
+/* VAL-2 (audit 2026-09-03): Core's CAmount MAX_MONEY. Defined here (before
+ * both the in-block index builder's value accumulators and the apply-path
+ * helpers) so the file has ONE definition of the money ceiling. */
+#define VAL_MAX_MONEY 2100000000000000ULL
 typedef struct {
     bidx_t* bx; bspent_t* bs;
     const u8* txid; u32 tx_index;
     int dup_found;
+    /* ---- VAL-1/VAL-2 accumulators (audit 2026-09-03) ----
+     * ic is built fresh per transaction, so tx_out_sum is the per-tx running
+     * output total (Core's txouttotal-toolarge checks exactly this running
+     * sum). ptx_out points at a block-scope per-tx output-total array owned
+     * by apply_block_inner -- the fees ledger's sum(out) side. */
+    u64  tx_out_sum;
+    int  money_bad;              /* output value or per-tx sum out of range */
+    u64* ptx_out;
 } idxbuild_ctx_t;
 
 static void idxbuild_on_input(void* ctxv, const u8 txid[32], u32 index){
@@ -882,6 +901,24 @@ static void idxbuild_on_output(void* ctxv, u32 out_index, u64 value, const u8* s
     idxbuild_ctx_t* c = (idxbuild_ctx_t*)ctxv;
     u8 key[36]; memcpy(key, c->txid, 32); memcpy(key+32, &out_index, 4);
     bidx_insert(c->bx, key, value, script, slen, c->tx_index, (u8)(c->tx_index==0));
+    /* VAL-2 (audit 2026-09-03): Core's CheckTransaction runs MoneyRange on
+     * every output value and on the running per-tx output total
+     * (bad-txns-vout-negative / -vout-toolarge / -txouttotal-toolarge). A
+     * u64 read of a signed CAmount puts "negative" values at >= 2^63, so
+     * > MAX_MONEY rejects exactly what Core rejects on both arms. */
+    if (value > VAL_MAX_MONEY) c->money_bad = 1;
+    else {
+        c->tx_out_sum += value;
+        if (c->tx_out_sum > VAL_MAX_MONEY) c->money_bad = 1;
+    }
+    /* VAL-1 (fees ledger): block fees = sum over the NON-coinbase txs of
+     * (sum(in) - sum(out)). sum(out) accumulates per tx here; sum(in) is
+     * exported by tx_verify.c after Phase 1, which already resolved every
+     * prevout's value for the script check. Overflow: value <= MAX_MONEY
+     * and ptx_out[t] counts one tx's outputs -- a tx's own total cannot
+     * exceed MAX_MONEY without money_bad already firing, and ntx x
+     * MAX_MONEY still fits u64 for any ntx a 4 MB block can carry. */
+    if (c->ptx_out) c->ptx_out[c->tx_index] += value;
 }
 
 /* Apply every tx's puts/dels in one block. Returns 1 on a clean apply, 0 on
@@ -1094,6 +1131,149 @@ static int powr_hdr_from_store(void* ctx, long h, u8 hdr[80]){
     return pread(fd, hdr, 80, (off_t)meta[0] + 8) == 80 ? 1 : 0;
 }
 
+/* ========================================================================
+ * VAL-1 / VAL-2 (audit 2026-09-03) -- CheckTransaction's value rules, the
+ * coinbase consensus rules, and ConnectBlock's fees/subsidy cap. Until this
+ * commit the connect path verified signatures and nothing else about VALUES:
+ * a mined block could print money (no MAX_MONEY / MoneyRange / in>=out), a
+ * coinbase could name a real outpoint and have Phase 5 delete that coin, and
+ * the coinbase output total was never capped at subsidy + fees. Core's rules
+ * ported here (CheckTransaction tx_check.cpp, CheckBlock/ContextualCheckBlock
+ * /ConnectBlock validation.cpp):
+ *
+ *   - per-output value in [0, MAX_MONEY], per-tx output sum <= MAX_MONEY;
+ *   - no duplicate inputs per tx (CVE-2018-17144; the whole-block
+ *     duplicate-outpoint pass skips coinbase inputs, so per-tx it was
+ *     unchecked);
+ *   - only tx 0 may have a null prevout (bad-txns-prevout-null);
+ *   - tx 0: exactly one input, null prevout, scriptSig 2..100 bytes,
+ *     sequence ignored;
+ *   - BIP34 (per-chain activation height): tx 0 scriptSig starts with the
+ *     CScript height push;
+ *   - per non-coinbase tx: input sum <= MAX_MONEY and in >= out
+ *     (bad-txns-inputvalues-outofrange / bad-txns-in-belowout); the surplus
+ *     accumulates as the block's fees;
+ *   - coinbase outputs <= subsidy(height) + fees (bad-cb-amount), with
+ *     Core's halvings>=64 -> 0 rule.
+ *
+ * The height/MTP-dependent contextual rules (finality, BIP68, time) are NOT
+ * here -- they go in the accept-time gate where headers.dat is authoritative
+ * (test harnesses mine year-2027-timestamped blocks into the store directly;
+ * enforcing now+2h here would break every apply-path fixture for a rule that
+ * is an admission rule in Core too).
+ * ------------------------------------------------------------------------ */
+static long val_bip34_height(void){
+    switch (g_chainp ? g_chainp->id : CHAIN_MAIN){
+        case CHAIN_REGTEST:  return SFC_R_HEIGHT_BIP34;
+        case CHAIN_TESTNET4: return SFC_T_HEIGHT_BIP34;
+        case CHAIN_SIGNET:   return SFC_S_HEIGHT_BIP34;
+        default:             return SFC_HEIGHT_BIP34;
+    }
+}
+static u64 val_subsidy(long height){
+    if (!g_chainp || g_chainp->halving_interval <= 0) return 5000000000ULL;
+    long halvings = height / g_chainp->halving_interval;
+    if (halvings >= 64) return 0;                    /* Core's rule */
+    return 5000000000ULL >> halvings;
+}
+/* Read a serialized tx's structural fields straight from its bytes (same
+ * walk utxo_walk_tx_io does). Used by Phase 0.75, which needs the scriptSig
+ * bounds and input shape that tx_parse's info struct does not carry.
+ * (Duplicate inputs need no check here: the whole-block duplicate-outpoint
+ * pass claims every non-null prevout via bspent_claim, which fires on a
+ * same-tx repeat too -- the CVE-2018-17144 shape is already rejected.) */
+typedef struct {
+    const u8* in0_script; u64 in0_slen;
+    int coinbase_shape;          /* exactly one input with the null prevout */
+    int null_prevout;            /* any input after the first carries the
+                                    null outpoint (Core: bad-txns-prevout-null) */
+    int bad_shape;               /* truncated (a 0-input tx cannot even be
+                                    walked by the merkle pass either) */
+    u64 in_count;
+    u32 locktime;                /* trailing 4 bytes (IsFinalTx, BIP68) */
+    u32 version;                 /* BIP68's version>=2 gate */
+    const u32* seqs; u32 nseqs;  /* per-input sequences (up to SEQ_CAP; a tx
+                                    with more inputs reports nseqs=SEQ_CAP and
+                                    the BIP68 pass treats the surplus as
+                                    FINAL -- see the note in the pass) */
+} val_txinfo_t;
+#define VAL_SEQ_CAP 2048
+static u32 g_val_seqs[VAL_SEQ_CAP];    /* single-buffer scratch: val_read_tx
+                                        * has exactly one live consumer at a
+                                        * time (all check loops finish one tx
+                                        * before starting the next) */
+static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
+    memset(vi, 0, sizeof *vi);
+    const u8* p = tx; const u8* end = tx + txlen;
+    if (p + 5 > end) { vi->bad_shape = 1; return 0; }
+    memcpy(&vi->version, tx, 4);
+    p += 4;                                        /* version */
+    int segwit = (p + 2 <= end && p[0] == 0x00 && p[1] == 0x01);
+    if (segwit) p += 2;                            /* segwit marker */
+    u64 used;
+    u64 nin = utxo_walk_read_varint(p, end, &used); if (!used){ vi->bad_shape=1; return 0; }
+    p += used; vi->in_count = nin;
+    if (nin == 0) { vi->bad_shape = 1; return 0; }
+    vi->seqs = g_val_seqs;
+    for (u64 i = 0; i < nin; i++){
+        if (p + 36 > end) { vi->bad_shape = 1; return 0; }
+        u32 idx; memcpy(&idx, p+32, 4);
+        int is_null = (memcmp(p, ZERO32, 32) == 0) && idx == 0xFFFFFFFFu;
+        if (i == 0) vi->coinbase_shape = is_null && nin == 1;
+        /* ANY null prevout, at any input position. Core's CheckTransaction
+         * checks every vin of a non-coinbase tx (a coinbase's own null input
+         * is only ever legal as tx0's vin[0]); the Phase 0.15 loop rejects
+         * null_prevout for every tx after the coinbase, whichever position
+         * it sits in. */
+        if (is_null) vi->null_prevout = 1;
+        u64 sl = utxo_walk_read_varint(p + 36, end, &used);
+        if (!used){ vi->bad_shape=1; return 0; }
+        const u8* sp = p + 36 + used;
+        p = sp + sl;
+        if ((u64)(end - p) < 4){ vi->bad_shape=1; return 0; }
+        if (i == 0){ vi->in0_script = sp; vi->in0_slen = sl; }
+        if (vi->nseqs < VAL_SEQ_CAP){ memcpy(&g_val_seqs[vi->nseqs], p, 4); vi->nseqs++; }
+        else vi->nseqs = VAL_SEQ_CAP;              /* truncation flag (see the
+                                                    * BIP68 pass: surplus
+                                                    * inputs default FINAL,
+                                                    * never FALSE) */
+        p += 4;                                    /* sequence */
+    }
+    /* segwit marker seen -> skip the witness sections (n_in stacks of
+     * varint-count + varint-len items) before the trailing locktime.
+     * tx_parse has ALREADY validated this exact structure (the tx passed
+     * its walk to get here); this pass just locates the locktime, so a
+     * decode disagreement is a bad_shape reject, never a skip. */
+    if (segwit){
+        for (u64 i = 0; i < nin; i++){
+            u64 nitems = utxo_walk_read_varint(p, end, &used);
+            if (!used){ vi->bad_shape=1; return 0; }
+            p += used;
+            for (u64 j = 0; j < nitems; j++){
+                u64 il = utxo_walk_read_varint(p, end, &used);
+                if (!used){ vi->bad_shape=1; return 0; }
+                p += used;
+                if ((u64)(end - p) < il){ vi->bad_shape=1; return 0; }
+                p += il;
+            }
+        }
+    }
+    if ((u64)(end - p) < 4){ vi->bad_shape=1; return 0; }
+    memcpy(&vi->locktime, p, 4);                   /* locktime */
+    return 1;
+}
+/* CScript() << height, exactly Core's CScriptNum(h).serialize: OP_1..OP_16
+ * for h<=16, else push-length + minimal little-endian bytes with the 0x00
+ * sign pad. Returns the total byte length written to want. */
+static int val_build_height_push(u64 h, u8* want){
+    if (h >= 1 && h <= 16){ want[0] = (u8)(0x50 + (u8)h); return 1; }
+    int n = 0; u64 vn = h;
+    while (vn > 0){ want[1+n] = (u8)(vn & 0xff); vn >>= 8; n++; }
+    if (want[1+n-1] & 0x80){ want[1+n] = 0; n++; }
+    want[0] = (u8)n;
+    return 1 + n;
+}
+
 static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     g_last_reject = "";
     if (blocklen < 81) return 0;
@@ -1168,6 +1348,40 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         tx_txid(txs[t].txid, q, txlen, txid_scratch, sizeof txid_scratch);
         total_nin += pn_in; total_nout += pn_out;
         q += txlen;
+    }
+
+    /* ---- Phase 0.15 (VAL-1/VAL-2, audit 2026-09-03): CheckTransaction's
+     * structural coinbase rules + bad-txns-prevout-null. Context-free, so
+     * it runs on the dry-run too -- submitblock answers Core's exact reasons
+     * without touching state. tx_parse already bounded every read these
+     * checks need (a tx whose input section is malformed never gets here);
+     * val_read_tx re-walks for the fields info does not carry (scriptSig
+     * extent, prevout nullness). ---- */
+    {
+        val_txinfo_t vi0, vix;
+        if (!val_read_tx(txs[0].ptr, txs[0].len, &vi0) || !vi0.coinbase_shape){
+            g_last_reject = "bad-cb-missing"; return 0;
+        }
+        for (u64 t=1; t<ntx; t++){
+            if (!val_read_tx(txs[t].ptr, txs[t].len, &vix) || vix.null_prevout){
+                g_last_reject = "bad-txns-prevout-null"; return 0;
+            }
+        }
+        /* CheckBlock: coinbase scriptSig 2..100 bytes (pre-BIP34 history
+         * included -- 2 is the floor even for the genesis-era free-form
+         * extranonce blocks; Core checks size() < 2 || size() > 100). */
+        if (vi0.in0_slen < 2 || vi0.in0_slen > 100){
+            g_last_reject = "bad-cb-length"; return 0;
+        }
+        /* BIP34 (ContextualCheckBlock, per-chain activation height): the
+         * scriptSig must START with the serialized block-height push. */
+        if (g_apply_height >= val_bip34_height()){
+            u8 want[8];
+            int wlen = val_build_height_push((u64)g_apply_height, want);
+            if (vi0.in0_slen < (u64)wlen || memcmp(vi0.in0_script, want, (size_t)wlen) != 0){
+                g_last_reject = "bad-cb-height"; return 0;
+            }
+        }
     }
 
     /* ---- Phase 0.25: BIP141 witness commitment (Core CheckWitnessMalleation).
@@ -1249,9 +1463,17 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
     static bspent_t bs = {0};
     bidx_reset(&bx, total_nout);
     bspent_reset(&bs, total_nin);
+    /* VAL-1 fees ledger: per-tx output totals (sum(out) side; the sum(in)
+     * side arrives from tx_verify.c's export). Persistent arena like bx/bs. */
+    static u64* g_ptx_out = 0; static u64 g_ptx_out_cap = 0;
+    u64* ptx_out = grow_arena((void**)&g_ptx_out, &g_ptx_out_cap, ntx * sizeof(u64));
+    if (!ptx_out) return 0;
+    memset(ptx_out, 0, ntx * sizeof(u64));
     int dup = 0;
+    int money_bad = 0;
     for (u64 t=0; t<ntx && !dup; t++){
         idxbuild_ctx_t ic = { &bx, &bs, txs[t].txid, (u32)t, 0 };
+        ic.ptx_out = ptx_out;
         u64 wnin=0, wnout=0;
         int wok = utxo_walk_tx_io(txs[t].ptr, txs[t].ptr+txs[t].len, &ic,
                                   idxbuild_on_input, idxbuild_on_output, &wnin, &wnout);
@@ -1262,11 +1484,18 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
              * verification/apply work happens, so still no rollback). */
             return 0;
         }
+        if (ic.money_bad) money_bad = 1;   /* keep walking: dup detection
+                                              still owes its reject string */
         dup = ic.dup_found;
     }
     if (dup) {
         fprintf(stderr, "[utxo_live] REJECT h=%ld: in-block double-spend (duplicate outpoint)\n", g_apply_height);
         g_last_reject = "bad-txns-inputs-duplicate";
+        return 0;
+    }
+    if (money_bad) {
+        fprintf(stderr, "[utxo_live] REJECT h=%ld: transaction output value out of range\n", g_apply_height);
+        g_last_reject = "bad-txns-vout-toolarge";
         return 0;
     }
 
@@ -1279,6 +1508,41 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         fprintf(stderr, "[utxo_live] REJECT h=%ld tx=%lu: %s\n", g_apply_height, (unsigned long)fail_tx, reason);
         g_last_reject = reason;    /* tx_verify's own string, verbatim */
         return 0;
+    }
+
+    /* ---- Phase 4.5 (VAL-1/VAL-2, audit 2026-09-03): ConnectBlock's value
+     * ledger. fees = sum over the NON-coinbase txs of (in - out); every
+     * per-tx in >= out and both sums within MAX_MONEY (Core's
+     * bad-txns-in-belowout / -inputvalues-outofrange), and the coinbase's
+     * outputs capped at subsidy + fees (bad-cb-amount). The per-tx input
+     * sums come from tx_verify.c's Phase 1 (every prevout value it resolved
+     * for the script check); the output sums from the Phase 0.5 walk. The
+     * export array must match this block's ntx -- a shorter array means the
+     * Phase-1 export could not be trusted, and refusing is the only safe
+     * answer (same rule as every -1 header read in this module). ---- */
+    {
+        u64 in_n = 0;
+        const u64* tx_in = txvb_last_tx_in_sums(&in_n);
+        if (!tx_in || in_n < ntx){
+            fprintf(stderr, "[utxo_live] REJECT h=%ld: internal: fee ledger export missing\n", g_apply_height);
+            g_last_reject = "internal: fee ledger export missing";
+            return 0;
+        }
+        u64 fees = 0;
+        for (u64 t=1; t<ntx; t++){
+            u64 in_t = tx_in[t], out_t = ptx_out[t];
+            if (in_t > VAL_MAX_MONEY){ g_last_reject = "bad-txns-inputvalues-outofrange"; return 0; }
+            if (in_t < out_t)       { g_last_reject = "bad-txns-in-belowout";        return 0; }
+            fees += in_t - out_t;
+            if (fees > VAL_MAX_MONEY)  { g_last_reject = "bad-txns-fee-outofrange";  return 0; }
+        }
+        u64 cap = val_subsidy(g_apply_height) + fees;
+        if (ptx_out[0] > cap){
+            fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-cb-amount (cb out %llu > subsidy+fees %llu)\n",
+                    g_apply_height, (unsigned long long)ptx_out[0], (unsigned long long)cap);
+            g_last_reject = "bad-cb-amount";
+            return 0;
+        }
     }
 
     /* Dry-run stops HERE: every verification phase has passed and the next
