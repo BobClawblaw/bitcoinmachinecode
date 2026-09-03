@@ -471,6 +471,25 @@ sha256d64:
     cmp r11, r14
     jae %%dup                  ; no sibling -> duplicate the left node
     add r10, 32
+    ; VAL-6 (audit 2026-09-03, CVE-2012-2459): Core's ComputeMerkleRoot sets
+    ; `mutated` when a REAL sibling pair at any level is byte-identical --
+    ; the duplicate-tail-fold ambiguity means such a tree can be built from a
+    ; DIFFERENT tx list with the same root and the same block hash. Only the
+    ; real-sibling path counts (the odd-tail duplicate below is legitimate).
+    mov rax, [r10+0]
+    cmp rax, [r10-32]
+    jne %%nomut
+    mov rax, [r10+8]
+    cmp rax, [r10-24]
+    jne %%nomut
+    mov rax, [r10+16]
+    cmp rax, [r10-16]
+    jne %%nomut
+    mov rax, [r10+24]
+    cmp rax, [r10-8]
+    jne %%nomut
+    mov byte [rbp-0x480], 1
+%%nomut:
 %%dup:
     mov rax, [r10+0]
     mov [r9+32], rax
@@ -498,14 +517,16 @@ merkle_root:
     push r13
     push r14
     push r15
-    sub  rsp, 0x448        ; concat[MK_STAGE*64] at [rbp-0x460..-0x61], write
-                           ; offset at -0x468, staged count at -0x470; all
-                           ; BELOW the save area [rbp-0x08..-0x28].
-                           ; 0x448==8 mod16 -> rsp 0 mod16 at nested calls.
+    sub  rsp, 0x458        ; concat[MK_STAGE*64] at [rbp-0x460..-0x61], write
+                           ; offset at -0x468, staged count at -0x470, and the
+                           ; VAL-6 mutation flag at -0x480; all BELOW the save
+                           ; area [rbp-0x08..-0x28].
+                           ; 0x458==8 mod16 -> rsp 0 mod16 at nested calls.
 
     mov r13, rdi           ; out
     mov rbx, rsi           ; hashes
     mov r12, rdx           ; n
+    mov byte [rbp-0x480], 0    ; VAL-6 mutation flag (stack-local: thread-safe)
 
 .next_level:
     cmp r12, 1
@@ -569,8 +590,11 @@ merkle_root:
     mov [r13+16], rax
     mov rax, [rbx+24]
     mov [r13+24], rax
+    ; VAL-6: return the mutation flag in eax. C callers declared `void` ignore
+    ; it; cons_verify reads it to reject a CVE-2012-2459 mutated block.
+    movzx eax, byte [rbp-0x480]
 
-    add rsp, 0x448
+    add rsp, 0x458
     pop r15
     pop r14
     pop r13
