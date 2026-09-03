@@ -41,8 +41,9 @@
  *      mpool_policy_remove_expired).
  *   8. fee-rate estimator (EMA of accepted feerates, sat/kvB).
  *
- * KNOWN DELTAS, stated (LOG.md): TRUC/v3 topology rules, package relay,
- * ephemeral anchors, sibling eviction are not implemented; Core v31's
+ * KNOWN DELTAS, stated (LOG.md): this list is older than the file. TRUC/v3
+ * topology, package relay, ephemeral anchors and (2026-09-03) TRUC sibling
+ * eviction ARE implemented now; what remains is that Core v31's
  * cluster-mempool TrimToSize evicts linearization chunks and its chain
  * limits are cluster limits -- this file implements the classic
  * ancestor/descendant model the node's config knobs expose. BIP125
@@ -1021,6 +1022,10 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     }
     static unsigned char evict_set[MPOL_MAX_REPLACEMENTS + MPOL_PKG_MAX][32];
     int n_evict = 0;
+    /* Fees of everything this transaction would remove. Hoisted out of the
+     * conflict block below because TRUC sibling eviction can add to the set
+     * later, and Core prices the whole to-be-replaced set together. */
+    uint64_t removed_fees = 0;
     if (n_conf > 0){
         mpol_node* t = mpol_nodes_base(st);
         /* rule 1 (classic; skipped under fullrbf): each REPLACED tx must
@@ -1042,7 +1047,6 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             }
         }
         /* build the full eviction set: conflicts + their descendants */
-        uint64_t removed_fees = 0;
         for (int k=0;k<n_conf;k++){
             int ci = (int)conf_claimers[k];
             if (n_evict >= MPOL_MAX_REPLACEMENTS){
@@ -1263,12 +1267,56 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                 }
                 /* desc_cnt includes the parent itself */
                 if ((uint64_t)pn->desc_cnt + 1 > TRUC_DESCENDANT_LIMIT && !child_replaced){
-                    /* Core would additionally consider evicting the sibling
-                     * under RBF rules (sibling eviction) and accepting this
-                     * one; that is not implemented here, so a second child
-                     * is refused. Strictly more conservative than Core:
-                     * nothing is accepted that Core would reject. */
-                    _mpol_last_reason = "TRUC-violation"; return 0;
+                    /* SIBLING EVICTION -- the second return value of Core's
+                     * SingleTRUCChecks, applied by MemPoolAccept.
+                     *
+                     * The parent already has a child, and this transaction
+                     * does not double-spend it, so ordinary RBF cannot reach
+                     * it: nothing conflicts. Core still offers the swap, and
+                     * for a good reason. A TRUC parent's whole promise is that
+                     * its fee can be raised through its one child; if that
+                     * child sits at a low feerate, without sibling eviction
+                     * the only party who can ever rescue the parent is
+                     * whoever owns that child. That is the pin the topology
+                     * was meant to abolish.
+                     *
+                     * Offered ONLY in the narrow shape Core insists on,
+                     * because anything wider needs a rule for CHOOSING which
+                     * descendant dies and Core deliberately has none: the
+                     * parent must have exactly itself and one child, and that
+                     * child exactly itself and the parent. Reorgs can leave
+                     * wider shapes behind and those are still refused. Package
+                     * contexts are excluded as well -- Core allows this only
+                     * for a single transaction (m_allow_sibling_eviction), and
+                     * the in-package sibling case is caught by the walk below. */
+                    int evicted_sibling = 0;
+                    if (g_pkg_n <= 1 && pn->desc_cnt == 2){
+                        static unsigned char sibs[MPOL_PKG_MAX][32];
+                        int nsib = collect_descendant_txids(st, par_idx[0], sibs, MPOL_PKG_MAX);
+                        int si = (nsib == 1) ? find_node(st, sibs[0]) : -1;
+                        if (si >= 0 && t[si].anc_cnt == 2){
+                            /* The sibling joins the to-be-replaced set and the
+                             * ORDINARY replacement arithmetic decides, which is
+                             * exactly what Core does. Note what is NOT asked of
+                             * it: BIP125 signalling. Core skips that check here
+                             * and says why -- a TRUC transaction can only have a
+                             * non-signalling descendant through a reorg. */
+                            if (n_evict >= MPOL_MAX_REPLACEMENTS){
+                                _mpol_last_reason = "too many potential replacements"; return 0; }
+                            uint64_t total_removed = removed_fees + t[si].fee;
+                            uint64_t need = pol->incremental_fee * vsize / 1000;
+                            if (need == 0) need = 1;
+                            if (fee < total_removed){
+                                _mpol_last_reason = "insufficient fee"; return 0; }
+                            if (fee - total_removed < need){
+                                _mpol_last_reason = "insufficient fee"; return 0; }
+                            memcpy(evict_set[n_evict++], t[si].txid, 32);
+                            removed_fees = total_removed;
+                            evicted_sibling = 1;
+                        }
+                    }
+                    if (!evicted_sibling){
+                        _mpol_last_reason = "TRUC-violation"; return 0; }
                 }
             }
             /* Within a package, the sibling and grandchild cases have no
