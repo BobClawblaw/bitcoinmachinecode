@@ -61,6 +61,10 @@ static int  book_has(const char* hp, unsigned char* port_bytes){
     if (b && bmc_addr_from_string_port(&a, hp, 0)){ long i = ab2_find(b, &a); ok = i >= 0 && ab2_get(b, i, &r); if (ok && port_bytes){ port_bytes[0] = (unsigned char)(r.a.port >> 8); port_bytes[1] = (unsigned char)r.a.port; } }
     ab2_close(b); return ok; }
 extern long txrelay_announce(const int* fds, int nfds);
+extern void txrelay_test_set_announce_mean_ms(long ms);
+extern long long txrelay_test_exp_draw(long mean_ms);
+extern void txrelay_announce_own(const unsigned char txid[32]);
+extern void txrelay_leg_reset(int fd);
 extern void tx_accept_set_tip(long tip);
 extern long wallet_send_tx(unsigned char* out_tx, long cap,
                            const unsigned char toutid[][32], const unsigned long* tidx,
@@ -458,6 +462,9 @@ int main(void){
         int spB[2];
         ck("second leg pair", socketpair(AF_UNIX, SOCK_STREAM, 0, spB) == 0);
         drain_peer(sp[1]);
+        /* announcements are staggered per leg in production; pin the timer to
+         * zero so THIS case tests who gets told, not when */
+        txrelay_test_set_announce_mean_ms(0);
         txrelay_announce(NULL, 0);   /* discard announcements queued by earlier cases */
         /* deliver a fresh acceptable tx on leg A: modern_spends[1]'s VALID
          * form (its corrupted twin was rejected in case 3; the valid bytes
@@ -474,6 +481,66 @@ int main(void){
                                 && pl4[1] == 1 && memcmp(pl4+5, txid2v, 32) == 0);
         ck("leg A (the source) got nothing", no_bytes_pending(sp[1]));
         close(spB[0]); close(spB[1]);
+    }
+
+    /* ---- 8b: the announcement timer -----------------------------------
+     * Announcing the same txid to every peer at the same instant is what
+     * marks a node as the ORIGIN of a transaction, so each leg carries its
+     * own Poisson timer (Core's m_next_inv_send_time, mean 2 s outbound).
+     * Two claims are worth pinning: the timer really holds an announcement
+     * back, and the delay really is exponential rather than merely random. */
+    printf("\n== 8b: per-leg announcement timer holds, and is exponential ==\n");
+    {
+        int spC[2];
+        ck("third leg pair", socketpair(AF_UNIX, SOCK_STREAM, 0, spC) == 0);
+        /* The closed leg B almost always hands its descriptor number straight
+         * back to leg C, which is exactly what happens in production when a
+         * leg drops and re-dials. The dial sites call txrelay_leg_reset for
+         * that reason, and so does this test: without it the new leg inherits
+         * leg B's timer, which is already due, and is announced to at once. */
+        txrelay_leg_reset(spC[0]);
+        /* An hour's mean: the chance of a draw under a millisecond is about
+         * 3e-10, so "nothing yet" here is deterministic in practice. */
+        txrelay_test_set_announce_mean_ms(3600000);
+        int fdsC[1] = { spC[0] };
+        txrelay_announce(fdsC, 1);              /* arms the leg's timer */
+        u8 fake[32]; memset(fake, 0xA7, 32);
+        txrelay_announce_own(fake);
+        ck("queued the txid", txrelay_announce(fdsC, 1) == 1);
+        ck("leg C told nothing while its timer is pending", no_bytes_pending(spC[1]));
+        /* releasing the timer delivers the SAME queued txid: held, not lost */
+        txrelay_test_set_announce_mean_ms(0);
+        txrelay_announce(fdsC, 1);
+        char cmdC[13]; static u8 plC[4096];
+        int plenC = read_msg(spC[1], cmdC, plC, sizeof plC);
+        ck("held announcement is delivered once the timer comes due",
+           plenC == 37 && strcmp(cmdC, "inv") == 0
+           && plC[1] == 1 && memcmp(plC+5, fake, 32) == 0);
+        close(spC[0]); close(spC[1]);
+
+        /* Shape of the delay. For an exponential with mean m, the fraction of
+         * draws above m is 1/e and above 2m is 1/e^2; a uniform jitter would
+         * miss both badly. 200k draws keeps the sampling noise far under the
+         * tolerances below. */
+        const long mean = 2000; const int N = 200000;
+        double sum = 0; int over1 = 0, over2 = 0; long long mx = 0;
+        for (int i = 0; i < N; i++){
+            long long d = txrelay_test_exp_draw(mean);
+            sum += (double)d;
+            if (d > mean) over1++;
+            if (d > 2*mean) over2++;
+            if (d > mx) mx = d;
+        }
+        double avg = sum / N, f1 = (double)over1 / N, f2 = (double)over2 / N;
+        printf("     mean=%.1f ms (want ~%ld), P(>m)=%.4f (want ~0.3679), "
+               "P(>2m)=%.4f (want ~0.1353), max=%lld ms\n", avg, mean, f1, f2, mx);
+        ck("sample mean within 3% of the requested mean",
+           avg > mean*0.97 && avg < mean*1.03);
+        ck("P(delay > mean) ~ 1/e", f1 > 0.355 && f1 < 0.381);
+        ck("P(delay > 2*mean) ~ 1/e^2", f2 > 0.125 && f2 < 0.146);
+        ck("tail is bounded at 20 means", mx <= 20*mean);
+        ck("a zero mean is immediate", txrelay_test_exp_draw(0) == 0);
+        txrelay_test_set_announce_mean_ms(0);   /* leave later cases deterministic */
     }
 
     /* ---- 1p1c package relay -------------------------------------------

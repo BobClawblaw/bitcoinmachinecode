@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <fcntl.h>
+#include <errno.h>
 #include "modern_spend.h"
 #include "test_tmpdir.h"
 
@@ -56,6 +57,13 @@ struct lsm_state {
 static u8 mp_area[40 + 1024*48 + 8];
 static u8 mp_blob[2<<20];
 static int g_fails = 0, g_checks = 0;
+/* Strong definition of the announce hook: overrides the weak stub in
+ * daemon/tx_submit.c, so this test can prove WHICH txid was queued without
+ * linking daemon/tx_relay.c. The real queue is exercised in test_tx_relay. */
+static u8  ann_txid[32];
+static int ann_calls;
+void txrelay_announce_own(const u8 txid[32]){ memcpy(ann_txid, txid, 32); ann_calls++; }
+
 static void ck(const char* name, int cond){
     g_checks++;
     if (cond) printf("  ok  %s\n", name);
@@ -85,11 +93,6 @@ static void seed_utxos(const msend_t** specs, int n){
 }
 
 /* read exactly n bytes (socketpair is reliable + already buffered post-write) */
-static int read_n(int fd, u8* buf, int n){
-    int got = 0;
-    while (got < n){ int r = (int)read(fd, buf+got, n-got); if (r <= 0) break; got += r; }
-    return got;
-}
 
 int main(void){
     tt_isolate();
@@ -108,26 +111,26 @@ int main(void){
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0){ perror("socketpair"); return 1; }
     { struct timeval tv = {2,0}; setsockopt(sp[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); }
 
-    printf("== valid spend: accept + relay a framed 'tx' message ==\n");
+    printf("== valid spend: accept, queue an announcement, push NOTHING ==\n");
     { int fds[1] = { sp[0] };
       char reason[128]; int relayed = -1;
+      ann_calls = 0; memset(ann_txid, 0, 32);
       int r = txsub_accept_and_relay(mp_area, s->tx, (unsigned long)s->txlen, fds, 1, reason, sizeof reason, &relayed);
       ck("valid tx accepted (result==1)", r == 1);
-      ck("relayed to the 1 live leg", relayed == 1);
+      ck("queued for the 1 live leg", relayed == 1);
       u8 txid[32], tb[4096]; tx_txid(txid, s->tx, (unsigned long)s->txlen, tb, sizeof tb);
       unsigned long mlen=0; const u8* found = mpool_get(mp_area, txid, &mlen);
       ck("accepted tx stored in mempool", found != NULL && mlen == (unsigned long)s->txlen);
-      /* verify the wire frame on the peer socket: 24-byte header + payload */
-      u8 hdr[24]; int gh = read_n(sp[1], hdr, 24);
-      ck("read 24-byte p2p header", gh == 24);
-      ck("magic = mainnet 0xd9b4bef9", hdr[0]==0xf9 && hdr[1]==0xbe && hdr[2]==0xb4 && hdr[3]==0xd9);
-      ck("command = 'tx'", memcmp(hdr+4, "tx\0\0\0\0\0\0\0\0\0\0", 12) == 0);
-      unsigned plen = (unsigned)hdr[16] | ((unsigned)hdr[17]<<8) | ((unsigned)hdr[18]<<16) | ((unsigned)hdr[19]<<24);
-      ck("framed length == txlen", plen == (unsigned)s->txlen);
-      u8* pl = malloc(plen ? plen : 1); int gp = read_n(sp[1], pl, (int)plen);
-      ck("read full payload", gp == (int)plen);
-      ck("payload bytes == raw tx", plen == (unsigned)s->txlen && memcmp(pl, s->tx, plen) == 0);
-      free(pl);
+      ck("announce hook called exactly once", ann_calls == 1);
+      ck("announced the accepted txid", memcmp(ann_txid, txid, 32) == 0);
+      /* The whole point of the change: an accepted transaction must NOT be
+       * pushed at the peer unasked. The socket has to be silent -- Core
+       * announces the txid and waits for getdata, and so do we now. */
+      { int fl = fcntl(sp[1], F_GETFL, 0); fcntl(sp[1], F_SETFL, fl | O_NONBLOCK);
+        u8 spill[64]; ssize_t got = read(sp[1], spill, sizeof spill);
+        ck("nothing written to the peer socket (no unsolicited push)",
+           got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+        fcntl(sp[1], F_SETFL, fl); }
     }
 
     printf("\n== corrupted-signature spend: reject, NOTHING relayed ==\n");
@@ -141,7 +144,8 @@ int main(void){
       int r = txsub_accept_and_relay(mp_area, badtx, (unsigned long)badlen, fds, 1, reason, sizeof reason, &relayed);
       ck("corrupted-sig tx rejected (result<0)", r < 0);
       ck("reject reason is non-empty", reason[0] != 0);
-      ck("nothing relayed on reject", relayed == 0);
+      ck("nothing queued on reject", relayed == 0);
+      ck("announce hook NOT called on reject", ann_calls == 1);
       /* peer socket must have no new bytes: set non-blocking, expect EAGAIN */
       int fl = fcntl(sp[1], F_GETFL, 0); fcntl(sp[1], F_SETFL, fl | O_NONBLOCK);
       u8 junk[8]; int r2 = (int)read(sp[1], junk, sizeof junk);
@@ -150,7 +154,7 @@ int main(void){
       printf("     (reject reason: %s)\n", reason);
     }
 
-    printf("\n== mixed peer_fds: only live legs receive the relay ==\n");
+    printf("\n== mixed peer_fds: only live legs are counted ==\n");
     { int sp2[2]; socketpair(AF_UNIX, SOCK_STREAM, 0, sp2);
       { struct timeval tv = {2,0}; setsockopt(sp2[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); }
       /* Use the OTHER valid fixture (s2): the global mempool-policy state has
@@ -161,8 +165,13 @@ int main(void){
       char reason[128]; int relayed=-1;
       int r = txsub_accept_and_relay(mp_area, s2->tx, (unsigned long)s2->txlen, fds, 3, reason, sizeof reason, &relayed);
       ck("valid s2 accepted", r == 1);
-      ck("relayed only to the 1 live leg among {-1, fd, -1}", relayed == 1);
-      u8 hdr[24]; ck("live leg got the frame", read_n(sp2[1], hdr, 24) == 24 && memcmp(hdr+4,"tx\0",3)==0);
+      ck("counted only the 1 live leg among {-1, fd, -1}", relayed == 1);
+      ck("announce hook called for s2", ann_calls == 2);
+      /* still nothing pushed: the announcement is tx_relay.c's to send */
+      { int fl = fcntl(sp2[1], F_GETFL, 0); fcntl(sp2[1], F_SETFL, fl | O_NONBLOCK);
+        u8 spill[64]; ssize_t got = read(sp2[1], spill, sizeof spill);
+        ck("live leg received no unsolicited push",
+           got < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)); }
       close(sp2[0]); close(sp2[1]);
     }
 
