@@ -1421,7 +1421,7 @@ tests/test_compact_leveled: tests/test_compact_leveled.c daemon/lsm_manifest.c $
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I daemon -o $@ tests/test_compact_leveled.c daemon/lsm_manifest.c $(UTXOLSMOBJS)
 
 # A/B benchmark for the flush+compaction path (not a test; see its header).
-tests/bench_lsm_compact: tests/bench_lsm_compact.c $(UTXOLSMOBJS) 
+tests/bench_lsm_compact: tests/bench_lsm_compact.c $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/bench_lsm_compact.c $(UTXOLSMOBJS)
 
 # A/B of the compaction policy: classic (oldest runs) vs leveled (size-ratio tail). Not a test.

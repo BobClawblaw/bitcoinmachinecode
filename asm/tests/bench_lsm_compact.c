@@ -2,12 +2,18 @@
  * (2^16 memtable, flush every 2*slots ops, compact at 12 runs), so the cost
  * of flush+compaction over a growing set can be A/B'd between two builds of
  * bitcoin_utxo_lsm.o. Not a test: prints timings and the resulting run count.
- * Run in a throwaway dir (writes utxo.dat, runs, manifest in cwd). */
+ * Run in a throwaway dir (writes utxo.dat, runs, manifest in cwd) -- which is
+ * why it calls tt_isolate() itself below: `make test` and the ARM sweep both
+ * run the runner lines with cwd = asm/, so trusting the caller to have moved
+ * meant 2 million puts and ~177 MB of utxo.dat/utxo_run_*.dat landed IN THE
+ * SOURCE TREE on every gate run (found 2026-09-02 tracking down cross-test
+ * contamination; the file is gitignored, which is exactly why nobody noticed). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <time.h>
+#include "test_tmpdir.h"
 typedef uint8_t u8; typedef uint32_t u32;
 extern long utxo_struct_size(unsigned long slots);
 extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long long blob_cap);
@@ -28,6 +34,7 @@ struct lsm_state {
 #define SCRIPT_MAX_BYTES 65536
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return t.tv_sec+t.tv_nsec/1e9; }
 int main(int argc, char** argv){
+    tt_isolate();                     /* private dir: see the header comment */
     long N = argc > 1 ? atol(argv[1]) : 2000000;
     unsigned long slots = 1UL<<16;
     void* table = malloc((size_t)utxo_struct_size(slots)); void* blob = malloc(64UL<<20);
