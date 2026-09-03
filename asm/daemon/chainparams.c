@@ -14,6 +14,11 @@
 #include <sys/stat.h>
 #include "chainparams.h"
 
+/* VAL-11 (audit 2026-09-03): pow_check's powLimit global (bitcoin_hash.asm),
+ * armed per-chain below. pow_check is assembly and cannot include this
+ * header's struct, so the limit travels as a plain compact-bits word. */
+extern unsigned int pow_pow_limit_bits;
+
 typedef unsigned char u8;
 
 /* sha256d, bitcoin_hash.asm -- the same hash every block goes through */
@@ -258,6 +263,7 @@ int chainparams_select(const char* name){
         g_chainp = &PARAMS_MAIN;
         net_magic = PARAMS_MAIN.magic;
         sfc_chain = 0;
+        pow_pow_limit_bits = PARAMS_MAIN.pow_limit_bits;
         return 1;
     }
     if (!strcmp(name, "regtest")){
@@ -275,6 +281,7 @@ int chainparams_select(const char* name){
         g_chainp = &PARAMS_REGTEST;
         net_magic = PARAMS_REGTEST.magic;
         sfc_chain = 1;
+        pow_pow_limit_bits = PARAMS_REGTEST.pow_limit_bits;
         return 1;
     }
     if (!strcmp(name, "testnet4")){
@@ -288,6 +295,7 @@ int chainparams_select(const char* name){
         g_chainp = &PARAMS_TESTNET4;
         net_magic = PARAMS_TESTNET4.magic;
         sfc_chain = 2;
+        pow_pow_limit_bits = PARAMS_TESTNET4.pow_limit_bits;
         return 1;
     }
     if (!strcmp(name, "signet")){
@@ -322,6 +330,7 @@ int chainparams_select(const char* name){
          * by running a real sync. Signet has its own arm, with its own heights
          * read from Core. */
         sfc_chain = 3;
+        pow_pow_limit_bits = PARAMS_SIGNET.pow_limit_bits;
         fprintf(stderr, "[chain] signet: %s challenge (%ld bytes), magic %02x %02x %02x %02x\n",
                 signet_challenge_custom ? "custom" : "default", signet_challenge_len,
                 PARAMS_SIGNET.magic & 0xff, (PARAMS_SIGNET.magic >> 8) & 0xff,
