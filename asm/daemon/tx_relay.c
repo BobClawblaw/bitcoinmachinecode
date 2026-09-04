@@ -97,6 +97,59 @@ extern int  txacc_fee_reconsiderable(const char* reason);
 static u8  txr_ring[TXR_RING][8];
 static long long txr_ring_t[TXR_RING];
 static unsigned txr_ring_w;
+
+/* ---- MEM-9 (audit 2026-09-03): index both hot tables ----------------------
+ *
+ * txr_ring_has scanned all TXR_RING (4,096) entries and txr_want_find all
+ * TXR_WANT_MAX (4,096), and BOTH ran for every entry of every inv -- up to
+ * ~58,000 in a 2 MB message -- BEFORE the `want < TXR_MAX_REQ` cap could
+ * take effect, because an entry that is already known or already requested
+ * `continue`s without counting. That is on the order of 10^8 byte-compares
+ * per message; TXR_MAX_MSGS allows 64 per pass, and the drain runs in the
+ * single-threaded download worker between block-sync passes, so tip-following
+ * stalled for minutes. A peer needs no privilege to send it: any leg we dial,
+ * or anyone who gets us to dial them.
+ *
+ * Both tables get a chained hash index keyed on the first 8 bytes of the
+ * hash. Chaining rather than open addressing because both tables DELETE --
+ * the ring overwrites slots on wrap, the want table evicts the oldest slot
+ * and txr_want_clear removes by hash -- and tombstones in an open-addressed
+ * table of this size degrade into the linear scan they replace. Chains are
+ * short: 4,096 entries over 8,192 buckets.
+ *
+ * The index is a pure accelerator. Every mutation goes through the helpers
+ * below, and the tables themselves keep their exact previous contents and
+ * eviction behaviour, so nothing about WHICH entry is evicted changes. */
+#define TXR_HBUCKETS 8192u
+static int txr_ring_head[TXR_HBUCKETS];
+static int txr_ring_next[TXR_RING];
+static int txr_hash_ready;
+static unsigned txr_h8(const u8* p){
+    /* FNV-1a over 8 bytes, the model bitcoin_mempool.asm already uses. */
+    unsigned h = 2166136261u;
+    for (int i = 0; i < 8; i++){ h ^= p[i]; h *= 16777619u; }
+    return h & (TXR_HBUCKETS - 1u);
+}
+static void txr_hash_init(void){
+    if (txr_hash_ready) return;
+    for (unsigned i = 0; i < TXR_HBUCKETS; i++) txr_ring_head[i] = -1;
+    for (unsigned i = 0; i < TXR_RING; i++) txr_ring_next[i] = -1;
+    txr_hash_ready = 1;
+}
+static void txr_ring_unlink(unsigned slot){
+    unsigned b = txr_h8(txr_ring[slot]);
+    int* pp = &txr_ring_head[b];
+    unsigned guard = 0;
+    while (*pp >= 0 && guard++ < TXR_RING){
+        if ((unsigned)*pp == slot){ *pp = txr_ring_next[slot]; txr_ring_next[slot] = -1; return; }
+        pp = &txr_ring_next[*pp];
+    }
+}
+static void txr_ring_link(unsigned slot){
+    unsigned b = txr_h8(txr_ring[slot]);
+    txr_ring_next[slot] = txr_ring_head[b];
+    txr_ring_head[b] = (int)slot;
+}
 static long long txr_req_ttl_ms = TXR_REQ_TTL_MS;
 static long txr_req_refetch;            /* announcements re-requested because the earlier request timed out */
 static long long txr_now_ms(void);
@@ -106,8 +159,20 @@ static long long txr_now_ms(void);
  * tx until 4,096 other requests aged the entry out (~14 minutes at 5 tx/s),
  * and every child announced meanwhile died as an orphan. Core forgets a
  * request after 60 s and asks the next announcer. */
+/* Every chain walk is bounded by the table size.
+ *
+ * A chain can only be corrupted by a link without a matching unlink, which
+ * this file never does -- but the bound is not there for this file's own
+ * correctness. A self-link makes next[slot] == slot and the walk never
+ * terminates: an INFINITE LOOP in the download worker, reached from data a
+ * peer sends. Discovered by the negative control for this fix, which hung
+ * instead of reporting a mismatch. A bound turns the worst case of a future
+ * mistake back into the linear scan this index replaced -- slow, which is
+ * survivable, rather than wedged, which is not. */
 static int txr_ring_has(const u8* txid){
-    for (unsigned i = 0; i < TXR_RING; i++)
+    txr_hash_init();
+    unsigned guard = 0;
+    for (int i = txr_ring_head[txr_h8(txid)]; i >= 0 && guard < TXR_RING; i = txr_ring_next[i], guard++)
         if (!memcmp(txr_ring[i], txid, 8)){
             if (txr_now_ms() - txr_ring_t[i] < txr_req_ttl_ms) return 1;
             txr_req_refetch++;
@@ -116,11 +181,21 @@ static int txr_ring_has(const u8* txid){
     return 0;
 }
 static void txr_ring_add(const u8* txid){
-    memcpy(txr_ring[txr_ring_w % TXR_RING], txid, 8);
-    txr_ring_t[txr_ring_w % TXR_RING] = txr_now_ms();
+    txr_hash_init();
+    unsigned slot = txr_ring_w % TXR_RING;
+    /* MEM-9: the slot being overwritten still carries the previous key's
+     * index entry. Unlink before the memcpy or the chain keeps pointing at a
+     * slot whose bytes no longer match, and txr_ring_has starts missing
+     * entries that are genuinely present -- which would re-request every
+     * transaction and be far worse than the scan this replaces. */
+    txr_ring_unlink(slot);
+    memcpy(txr_ring[slot], txid, 8);
+    txr_ring_t[slot] = txr_now_ms();
+    txr_ring_link(slot);
     txr_ring_w++;
 }
 void txrelay_test_set_req_ttl_ms(long long ms){ txr_req_ttl_ms = ms; }   /* tests shrink the 60 s */
+
 /* A `notfound` for something we asked for: forget that we asked, so the
  * next announcement (or the next orphan wanting it as a parent) requests it
  * again. Core does the same by dropping the in-flight entry. Without this,
@@ -130,8 +205,17 @@ void txrelay_test_set_req_ttl_ms(long long ms){ txr_req_ttl_ms = ms; }   /* test
  * expired -- production 2026-08-31: 6,324 parked, 538 resolved, 5,530 dropped
  * in one hour AFTER the fee-floor fix. */
 static void txr_ring_del(const u8* txid){
-    for (unsigned i = 0; i < TXR_RING; i++)
-        if (!memcmp(txr_ring[i], txid, 8)) memset(txr_ring[i], 0xff, 8);   /* never a real prefix in practice */
+    txr_hash_init();
+    unsigned guard = 0;
+    for (int i = txr_ring_head[txr_h8(txid)]; i >= 0 && guard < TXR_RING; guard++){
+        int nxt = txr_ring_next[i];
+        if (!memcmp(txr_ring[i], txid, 8)){
+            txr_ring_unlink((unsigned)i);
+            memset(txr_ring[i], 0xff, 8);   /* never a real prefix in practice */
+            txr_ring_link((unsigned)i);     /* the 0xff key still occupies the slot */
+        }
+        i = nxt;
+    }
 }
 static long txr_notfound_seen;              /* counter for the stats line */
 
@@ -912,14 +996,52 @@ static void txr_note_leg(int fd){
     }
     if (free_i >= 0){ txr_legs[free_i].fd = fd; txr_legs[free_i].t = now; }
 }
+/* MEM-9: the same chained index over the want table, keyed on the first 8
+ * bytes of the 32-byte hash. A bucket hit still compares all 32, so an 8-byte
+ * collision costs one extra memcmp and never a wrong answer. */
+static int txr_want_head[TXR_HBUCKETS];
+static int txr_want_next[TXR_WANT_MAX];
+static int txr_want_hash_ready;
+static void txr_want_hash_init(void){
+    if (txr_want_hash_ready) return;
+    for (unsigned i = 0; i < TXR_HBUCKETS; i++) txr_want_head[i] = -1;
+    for (int i = 0; i < TXR_WANT_MAX; i++) txr_want_next[i] = -1;
+    txr_want_hash_ready = 1;
+}
+static void txr_want_unlink(int slot){
+    unsigned b = txr_h8(txr_want_tab[slot].hash);
+    int* pp = &txr_want_head[b];
+    int guard = 0;
+    while (*pp >= 0 && guard++ < TXR_WANT_MAX){
+        if (*pp == slot){ *pp = txr_want_next[slot]; txr_want_next[slot] = -1; return; }
+        pp = &txr_want_next[*pp];
+    }
+}
+static void txr_want_link(int slot){
+    unsigned b = txr_h8(txr_want_tab[slot].hash);
+    txr_want_next[slot] = txr_want_head[b];
+    txr_want_head[b] = slot;
+}
 static txr_want_t* txr_want_find(const u8* h){
-    for (int i = 0; i < TXR_WANT_MAX; i++)
+    txr_want_hash_init();
+    int guard = 0;
+    for (int i = txr_want_head[txr_h8(h)]; i >= 0 && guard < TXR_WANT_MAX; i = txr_want_next[i], guard++)
         if (txr_want_tab[i].used && !memcmp(txr_want_tab[i].hash, h, 32)) return &txr_want_tab[i];
     return 0;
 }
+/* MEM-9: the ONE way to retire a want entry. Every site that used to write
+ * `memset(w, 0, sizeof *w)` goes through this, because clearing the bytes
+ * without unlinking leaves the chain pointing at a slot whose hash no longer
+ * matches -- txr_want_find would then walk a chain of stale slots, and a
+ * later entry hashing to the same bucket could be shadowed by one of them. */
+static void txr_want_forget(txr_want_t* w){
+    if (!w) return;
+    int slot = (int)(w - txr_want_tab);
+    if (w->used) txr_want_unlink(slot);
+    memset(w, 0, sizeof *w);
+}
 static void txr_want_clear(const u8* h){
-    txr_want_t* w = txr_want_find(h);
-    if (w) memset(w, 0, sizeof *w);
+    txr_want_forget(txr_want_find(h));
 }
 static void txr_want_note(const u8* h, u32 rtype, int fd, int requested){
     txr_want_t* w = txr_want_find(h);
@@ -929,8 +1051,14 @@ static void txr_want_note(const u8* h, u32 rtype, int fd, int requested){
             if (!txr_want_tab[i].used){ slot = i; break; }
             if (slot < 0 || txr_want_tab[i].t_seen < oldest || i == 0){ if (i == 0 || txr_want_tab[i].t_seen < oldest){ oldest = txr_want_tab[i].t_seen; slot = i; } }
         }
-        w = &txr_want_tab[slot]; memset(w, 0, sizeof *w);
+        w = &txr_want_tab[slot];
+        /* MEM-9: unlink the evicted entry's key before its bytes are
+         * replaced, and link the new one after. Which slot is chosen is
+         * unchanged -- this only keeps the index honest about it. */
+        if (w->used) txr_want_unlink(slot);
+        memset(w, 0, sizeof *w);
         memcpy(w->hash, h, 32); w->rtype = rtype; w->used = 1;
+        txr_want_link(slot);
     }
     w->t_seen = txr_now_ms();
     int have = 0;
@@ -972,9 +1100,9 @@ static int txr_want_pick(txr_want_t* w){
  * try budget run out -- a later announcement recreates it. */
 static void txr_want_failover(txr_want_t* w){
     for (;;){
-        if (w->tries >= TXR_WANT_TRIES){ txr_want_gaveup++; memset(w, 0, sizeof *w); return; }
+        if (w->tries >= TXR_WANT_TRIES){ txr_want_gaveup++; txr_want_forget(w); return; }
         int fd = txr_want_pick(w);
-        if (fd < 0){ txr_want_gaveup++; memset(w, 0, sizeof *w); return; }
+        if (fd < 0){ txr_want_gaveup++; txr_want_forget(w); return; }
         if (w->ntried < 6) w->tried_fd[w->ntried++] = fd;
         u8 gd[37]; gd[0] = 1;
         gd[1] = (u8)w->rtype; gd[2] = (u8)(w->rtype >> 8); gd[3] = (u8)(w->rtype >> 16); gd[4] = (u8)(w->rtype >> 24);
@@ -999,7 +1127,7 @@ static void txr_retry_timeouts(void* mp){
         if (!w->used || !w->inflight) continue;
         if (now - w->t_req < txr_req_retry_ms) continue;
         unsigned long got_len;
-        if (w->rtype == TXR_MSG_WITNESS_TX && mpool_get(mp, w->hash, &got_len)){ memset(w, 0, sizeof *w); continue; }
+        if (w->rtype == TXR_MSG_WITNESS_TX && mpool_get(mp, w->hash, &got_len)){ txr_want_forget(w); continue; }
         txr_want_failover(w);
     }
 }
@@ -1073,7 +1201,28 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
             /* getdata payload: count(1) + 36 per entry */
             static u8 gd[1 + TXR_MAX_REQ*36];
             unsigned want = 0;
-            for (unsigned long i = 0; i < n && want < TXR_MAX_REQ; i++){
+            /* ---- MEM-9: Core's own bounds on how much inv work a peer can
+             * ask for ----
+             *
+             * MAX_INV_SZ is 50,000 and Core treats an oversize vector as
+             * misbehaviour; MAX_PEER_TX_ANNOUNCEMENTS caps at 5,000 the
+             * announcements it will track from one peer. This loop had
+             * neither, and the `want < TXR_MAX_REQ` cap below does not bound
+             * it either, because an entry that is already known or already
+             * requested `continue`s WITHOUT counting -- so the per-entry work
+             * ran for all ~58,000 entries of a 2 MB message.
+             *
+             * The indexed lookups above make each entry cheap; these bounds
+             * make the COUNT bounded too, which is the half an index cannot
+             * fix. Both are needed: 58,000 cheap lookups, 64 messages per
+             * pass, is still work a peer chose for us. */
+            if (n > 50000UL){
+                fprintf(stderr, "[txrelay] inv from fd %d announces %lu entries (Core MAX_INV_SZ is 50000): ignoring the message\n",
+                        fd, n);
+                continue;
+            }
+            unsigned long scanned_cap = n < 5000UL ? n : 5000UL;
+            for (unsigned long i = 0; i < scanned_cap && want < TXR_MAX_REQ; i++){
                 if (outstanding + (int)want >= 100) break;     /* Core's per-peer in-flight cap */
                 const u8* e = pl + cc + i*36;
                 if (e + 36 > pl + plen) break;
@@ -1261,4 +1410,38 @@ long txrelay_stats(long* parked, long* resolved, long* dropped,
     if (p1c_fail) *p1c_fail = txr_1p1c_fail;
     if (orphans_held) *orphans_held = held;
     return txr_orph_parked || txr_1p1c_ok || txr_1p1c_fail || held;
+}
+
+/* ---- MEM-9 test hooks ----------------------------------------------------
+ * The request ring and the want table are file-local, and their hash index is
+ * a pure accelerator: it must answer EXACTLY what the linear scan answered.
+ * That is a property worth pinning directly rather than inferring from the
+ * relay's end-to-end behaviour, so these expose the four operations. They are
+ * the same shape as txrelay_test_set_req_ttl_ms and txrelay_debug_dump above:
+ * test-only entry points, no state of their own. */
+int  txrelay_test_ring_has(const u8* h){ return txr_ring_has(h); }
+void txrelay_test_ring_add(const u8* h){ txr_ring_add(h); }
+void txrelay_test_ring_del(const u8* h){ txr_ring_del(h); }
+int  txrelay_test_ring_size(void){ return (int)TXR_RING; }
+int  txrelay_test_want_present(const u8* h){ return txr_want_find(h) != 0; }
+void txrelay_test_want_note(const u8* h, int fd){ txr_want_note(h, TXR_MSG_WITNESS_TX, fd, 0); }
+void txrelay_test_want_clear(const u8* h){ txr_want_clear(h); }
+int  txrelay_test_want_max(void){ return (int)TXR_WANT_MAX; }
+/* The ORIGINAL linear scans, kept for the differential in
+ * tests/test_txrelay_invscale.c. The whole claim of MEM-9's index is that it
+ * answers exactly what these answered, so the test compares them on every
+ * query of a randomized workload rather than trying to hand-construct the
+ * one interleaving that would break a chain. */
+int txrelay_test_ring_has_linear(const u8* txid){
+    for (unsigned i = 0; i < TXR_RING; i++)
+        if (!memcmp(txr_ring[i], txid, 8)){
+            if (txr_now_ms() - txr_ring_t[i] < txr_req_ttl_ms) return 1;
+            return 0;
+        }
+    return 0;
+}
+int txrelay_test_want_present_linear(const u8* h){
+    for (int i = 0; i < TXR_WANT_MAX; i++)
+        if (txr_want_tab[i].used && !memcmp(txr_want_tab[i].hash, h, 32)) return 1;
+    return 0;
 }
