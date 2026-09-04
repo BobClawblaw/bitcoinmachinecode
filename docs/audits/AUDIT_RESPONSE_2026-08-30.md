@@ -100,7 +100,7 @@ Three separate inline copies of the old lookup existed — one in
 `daemon/wallet_pass.c`, so the boot path and the RPC path cannot disagree
 about which secret protects the wallet.
 
-Deployed as `/etc/bmc/wallet.pass`, `root:svc`, mode `0640` — readable by the
+Deployed as `/etc/bmc/wallet.pass`, `root:<service-group>`, mode `0640` — readable by the
 service account, writable only by root, outside any datadir backup.
 `data/bmcwallet.dat.pass` was removed after byte-comparing the contents.
 The CLI keeps `<store>.pass` for development: that is a human at a terminal,

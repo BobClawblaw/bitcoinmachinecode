@@ -796,7 +796,7 @@ the list from the start).
 
 ## Policy parity vs Core v30/v31, round two (2026-08-31, later)
 
-Verified live against the local Core v31 node (`/home/svc/bitcoin`, mainnet,
+Verified live against the local Core v31 node (the operator's Core checkout, mainnet,
 txindex): **production's whole UTXO set is muhash-identical to Core at height
 964914** -- the first mainnet oracle comparison since 963967.
 

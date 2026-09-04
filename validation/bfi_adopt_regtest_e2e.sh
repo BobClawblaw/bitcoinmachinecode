@@ -19,7 +19,7 @@ CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
 BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bitcoind}
 BUILDER=${BUILDER:-/storage/bitcoinmachinecode/asm/daemon/build_block_filters}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/wallet_cli}
-WORK=/tmp/claude-1000/-home-svc/c494c801-4ae7-4e41-b4e1-dcbe7bc81270/scratchpad/bfi-proof-$$
+WORK=${TMPDIR:-/tmp}/bmc-bfi-proof-$$
 CORE_DIR=$WORK/core; BMC_DIR=$WORK/bmc
 CORE_P2P=19644; CORE_RPC=19660; BMC_P2P=19655; BMC_RPC=19646
 FAILURES=0
