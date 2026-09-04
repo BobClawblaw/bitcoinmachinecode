@@ -61,6 +61,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
+#include <stdlib.h>          /* MEM-2: realloc for the evictor working arrays */
 #include <time.h>
 
 /* ---------------- asm glue (declared; resolved at link) ------------------- */
@@ -858,8 +859,55 @@ static int worst_chunk(void* st, mpol_chunk* out){
     mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
     if (n == 0) return 0;
-    static uint32_t child_head[65536], child_next[65536], mark[65536];
-    if (n > 65536) return 0;
+    /* MEM-2 (audit 2026-09-03): the working arrays GROW; they no longer cap
+     * the evictor at 64K entries.
+     *
+     * These were `static uint32_t child_head[65536] ...` with `if (n > 65536)
+     * return 0;` in front. The structural pool and the policy graph are sized
+     * for ~1M entries (mempool_cfg.c sizes slots to blob_cap/512 -- 1,048,576
+     * for the default 300 MB maxmempool), so the evictor hard-failed at a
+     * sixteenth of the pool's capacity. At ~400 raw bytes per transaction the
+     * pool holds more than 64K entries at ~26 MB, long before the blob is
+     * full.
+     *
+     * What that produced: mpool_put returns 2 when fill + txlen > blob_cap,
+     * and `fill` only shrinks in mpool_compact, which the accept path calls
+     * only AFTER a successful eviction. So once the blob filled, worst_chunk
+     * returned 0, the accept loop reported "mempool full" and returned, and
+     * every subsequent accept at ANY feerate failed. No eviction, no
+     * compaction, no floor_bump -- getmempoolinfo went on reporting
+     * mempoolminfee 0 while rejecting everything. Recovery needed n to fall
+     * back to 65,536 through confirmation or the 336-hour expiry, and the
+     * low-fee filler that causes it is exactly what does not confirm. An
+     * attacker reaches it for the price of 300 MB at the 0.1 sat/vB floor,
+     * because the floor never rises until an eviction happens.
+     *
+     * Growing on demand rather than sizing to a compile-time maximum: the
+     * arrays are 12 bytes per entry together, so a 1M-entry pool costs 12 MB
+     * -- worth allocating when the pool actually gets there, not worth
+     * reserving in .bss for every process that links this file (bitcoin_cli
+     * links it too). A failed grow degrades exactly the way the old ceiling
+     * did, which is the honest fallback: the caller's `worst_chunk() == 0`
+     * arm is still there. */
+    static uint32_t *child_head, *child_next, *mark;
+    static uint32_t work_cap;
+    if (n > work_cap){
+        uint32_t want = work_cap ? work_cap : 65536;
+        while (want < n){
+            if (want > 0x80000000u){ want = n; break; }   /* no overflow on the doubling */
+            want *= 2;
+        }
+        uint32_t* nh = realloc(child_head, (size_t)want * sizeof *nh);
+        uint32_t* nn = realloc(child_next, (size_t)want * sizeof *nn);
+        uint32_t* nm = realloc(mark,       (size_t)want * sizeof *nm);
+        /* Keep whichever grew: realloc'ing the survivors on a partial failure
+         * would leak the ones that succeeded, and the arrays are independent. */
+        if (nh) child_head = nh;
+        if (nn) child_next = nn;
+        if (nm) mark       = nm;
+        if (!nh || !nn || !nm) return 0;                  /* as before: caller reports "mempool full" */
+        work_cap = want;
+    }
     for (uint32_t i = 0; i < n; i++){ child_head[i] = 0xFFFFFFFFu; child_next[i] = 0xFFFFFFFFu; mark[i] = 0; }
     for (uint32_t i = 0; i < n; i++)
         for (uint32_t k = 0; k < t[i].n_parents; k++){
