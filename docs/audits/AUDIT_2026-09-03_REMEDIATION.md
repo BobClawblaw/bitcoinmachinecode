@@ -6,7 +6,7 @@ what has not, and what was found along the way.
 
 **Status as of 2026-09-04 (third pass): all 29 CRITICAL+HIGH closed** --
 MEM-3, the last one, on branch `mem3-parent-overflow` -- **and 39 of the 44
-MEDIUM addressed (35 closed outright, 4 partial).** VAL-5 and UTX-4, both
+MEDIUM addressed (37 closed outright, 2 partial).** VAL-5 and UTX-4, both
 previously partial, are now complete apart from UTX-4's undo-file fsync. LOW
 and INFO are untouched.
 
@@ -321,8 +321,10 @@ replacement -- the invalid-block path.
 ### 4.3 MEDIUM and below
 
 44 MEDIUM, 68 LOW, 33 INFO in the audit. **Thirty-nine MEDIUM have been
-addressed: 35 closed outright, and 4 partial** -- SER-3, CRY-4, WAL-3 and
-NET-9, each with its residual named in the row or the note below it. LOW and
+addressed: 37 closed outright, and 2 partial** -- WAL-3 and NET-9, each with
+its residual named in the row or the note below it. CRY-4 is now complete, and
+SER-3's remaining piece is `bitcoin_tx.asm`'s structural walker, which both
+acceptance gates in front of it now cover. LOW and
 INFO are untouched.
 
 (VAL-5 is a HIGH and is accounted for in §4.2, not here, even though its
@@ -370,6 +372,8 @@ remaining half landed in the same pass.)
 | NET-9 (part) | The one-byte BIP152 tx count was SER-4; the documentation claiming "both directions" is corrected here. The RECEIVE side has never existed and is a feature, not a fix -- `bitcoin_serve.asm` writes `cmpctblock`/`blocktxn` and has no inbound handler for either | `4cd988c` + docs |
 | MEM-9 | Inv processing was O(entries x table) with no per-peer bound: ~10^8 byte-compares per message, 64 messages per pass, in the download worker | `045ef64` |
 | MEM-12 | Policy tables hash-indexed (accepts flat, 250x at 80k) and block connect batched (O(n) not O(n*m), 5x at 260k) | `44f6064`, `6f89c24` |
+| CRY-4 | SHA-512's schedule and HMAC's key block were process-global .bss: two threads corrupted each other silently | `54aa254` |
+| SER-3 | The mempool admission reader accepted non-canonical CompactSize, so a transaction Core cannot deserialize could be relayed from here | `fdea2f1` |
 
 **MEM-12 is now fully closed**, and the numbers scope both halves. The audit's
 verdict was "CONFIRMED for complexity; timings PLAUSIBLE (not measured)", so
