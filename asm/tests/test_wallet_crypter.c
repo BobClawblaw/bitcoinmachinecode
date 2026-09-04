@@ -76,6 +76,63 @@ int main(void){
     blob[bl/2] ^= 0xff;
     ck("a corrupted container is not 'encrypted'", !wcrypt_is_encrypted(blob, bl));
 
+    /* ---- WAL-7 (audit 2026-09-03): the WHOLE passphrase is hashed ----
+     * The KDF truncated at 96 bytes -- a bound that existed only to fit a
+     * 128-byte static scratch -- so any two passphrases sharing a 96-byte
+     * prefix derived the same key and BOTH unlocked the wallet. Core's
+     * BytesToKeySHA512AES hashes the entire string. */
+    {
+        static char p96a[160], p96b[160];
+        memset(p96a, 'a', 96); memcpy(p96a + 96, "secret", 7);   /* 102 bytes + NUL */
+        memset(p96b, 'a', 96); memcpy(p96b + 96, "wrong!", 7);
+        long la = 102, lb = 102;
+
+        u8 seed[32]; for (int i = 0; i < 32; i++) seed[i] = (u8)(i * 7 + 1);
+        static u8 blob[4096];
+        long bl = wcrypt_seal(p96a, la, seed, 32, blob, sizeof blob);
+        ck("WAL-7 seal under a 102-byte passphrase", bl > 0);
+
+        u8 got[64];
+        long r1 = wcrypt_open(p96a, la, blob, bl, got, sizeof got);
+        ck("WAL-7 the correct long passphrase opens it", r1 == 32 && !memcmp(got, seed, 32));
+
+        /* THE BUG: differing only past byte 96, this used to open too. */
+        long r2 = wcrypt_open(p96b, lb, blob, bl, got, sizeof got);
+        ck("WAL-7 a passphrase differing only PAST byte 96 does NOT open it", r2 == 0);
+
+        /* the two derivations must actually differ */
+        u8 salt[8]; for (int i = 0; i < 8; i++) salt[i] = (u8)i;
+        u8 ka[32], ia[16], kb[32], ib[16];
+        wcrypt_derive(p96a, la, salt, 8, ka, ia);
+        wcrypt_derive(p96b, lb, salt, 8, kb, ib);
+        ck("WAL-7 the derived keys differ past byte 96", memcmp(ka, kb, 32) != 0);
+
+        /* <= 96 bytes must derive EXACTLY as before, or every existing
+         * wallet becomes unopenable. Pinned against the legacy routine. */
+        extern void wcrypt_derive_legacy96(const char*, long, const u8*, u32, u8*, u8*);
+        const char* shortp = "correct horse battery staple";
+        u8 kn[32], in_[16], kl[32], il[16];
+        wcrypt_derive(shortp, (long)strlen(shortp), salt, 8, kn, in_);
+        wcrypt_derive_legacy96(shortp, (long)strlen(shortp), salt, 8, kl, il);
+        ck("WAL-7 a short passphrase derives bit-for-bit as before",
+           !memcmp(kn, kl, 32) && !memcmp(in_, il, 16));
+
+        /* a pre-fix container (legacy key) must still open, so the fix is
+         * not a data-loss event for a wallet already encrypted long */
+        u8 lk[32], liv[16];
+        wcrypt_derive_legacy96(p96a, la, salt, 8, lk, liv);
+        ck("WAL-7 legacy and modern derivations differ for a long passphrase",
+           memcmp(lk, ka, 32) != 0);
+
+        /* a passphrase longer than the stack scratch still works */
+        static char huge[1200];
+        memset(huge, 'z', sizeof huge - 1); huge[sizeof huge - 1] = 0;
+        long bl2 = wcrypt_seal(huge, (long)sizeof huge - 1, seed, 32, blob, sizeof blob);
+        ck("WAL-7 seal under a 1199-byte passphrase (heap scratch)", bl2 > 0);
+        long r3 = wcrypt_open(huge, (long)sizeof huge - 1, blob, bl2, got, sizeof got);
+        ck("WAL-7 and it opens again", r3 == 32 && !memcmp(got, seed, 32));
+    }
+
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

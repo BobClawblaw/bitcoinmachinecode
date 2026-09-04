@@ -100,6 +100,52 @@ int main(void){
     mp_lock(); mp_unlock();
     ck("lock still usable in parent", 1);
 
+    /* ---- MEM-20 (audit 2026-09-03): a holder that DIES must not wedge the
+     * node.
+     *
+     * The shared mutex was PTHREAD_PROCESS_SHARED but not
+     * PTHREAD_MUTEX_ROBUST. Every accept in every inbound serve child holds
+     * it across mpool_policy_add and the worker holds it across block
+     * connect, so a crash in any of those processes left it held forever:
+     * the mempool stopped accepting in EVERY process and RPC readers that
+     * take it hung. The processes are separate precisely so one can die
+     * without taking the node down.
+     *
+     * The child below takes the lock and _exit()s still holding it -- the
+     * exact shape of a crash in a critical section. The parent must then be
+     * able to lock. An alarm is the assertion: without ROBUST this call
+     * blocks forever and the alarm kills the test, which is what makes this
+     * a control rather than a restatement. */
+    {
+        extern int mp_lock_is_robust(void);
+        ck("MEM-20 the shared lock is ROBUST", mp_lock_is_robust() == 1);
+
+        pid_t dp = fork();
+        if (dp == 0){
+            mp_lock();          /* take it and die still holding it */
+            _exit(0);
+        }
+        int dst = -1; waitpid(dp, &dst, 0);
+        ck("MEM-20 the child exited while holding the lock",
+           WIFEXITED(dst) && WEXITSTATUS(dst) == 0);
+
+        /* If the lock were not robust this blocks forever. */
+        alarm(10);
+        mp_lock();
+        mp_unlock();
+        alarm(0);
+        ck("MEM-20 the parent still acquires the lock after the holder died", 1);
+
+        /* and it is still usable afterwards, i.e. consistent() really ran --
+         * a mutex left EOWNERDEAD-but-not-made-consistent goes
+         * ENOTRECOVERABLE and every later lock fails for good. */
+        alarm(10);
+        mp_lock();
+        mp_unlock();
+        alarm(0);
+        ck("MEM-20 and remains usable on the next acquisition", 1);
+    }
+
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);
     return fails?1:0;
 }

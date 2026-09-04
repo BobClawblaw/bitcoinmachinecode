@@ -594,6 +594,45 @@ p2p_read:
     jne  .eof_or_err           ; short read
 .no_copy:
 
+    ; ---- NET-11 (audit 2026-09-03): VERIFY THE PAYLOAD CHECKSUM ----
+    ; The header's checksum[4] at rbp-0x44 was read into the frame and never
+    ; compared with sha256d(payload)[0:4], so a corrupted or deliberately
+    ; mis-checksummed message was processed as if it were sound. Core's
+    ; V1Transport::GetMessage rejects it ("Checksum mismatch") and disconnects,
+    ; so a mismatch here goes to .eof_or_err -- the same exit a bad magic
+    ; takes, which is exactly the audit's suggestion.
+    ;
+    ; ONLY when the whole payload was kept. If `announced` exceeded the
+    ; caller's cap the excess is drained below and never lands in the buffer,
+    ; and a digest over the prefix would be a guaranteed false mismatch; the
+    ; message is already reported as truncated in that case.
+    ;
+    ; An EMPTY payload is checked too, not skipped: Core verifies the
+    ; sha256d("") prefix on verack and friends, and a peer sending garbage
+    ; there is as wrong as one sending garbage anywhere else.
+    ;
+    ; cksum4 lives in this same file (it is what p2p_write uses to PRODUCE the
+    ; field) and sha256d was already an extern here, so this adds no link
+    ; dependency to any of the sixty-odd targets that carry bitcoin_net.o --
+    ; the concern that shaped the v2 dispatch table above.
+    ;
+    ; The 4-byte output sits at rbp-0x60, an already-reserved gap between
+    ; tocopy@-0x68 and hdr[24]@-0x58, so the frame and its alignment are
+    ; unchanged. cksum4 preserves r12-r14 itself and sha256d honours the SysV
+    ; callee-saved set (proven by the callee-saved-check audit), so fd, cmd,
+    ; payload, cap and plen_out all survive the call.
+    mov  eax, [rbp-0x64]       ; announced
+    cmp  eax, r15d             ; cap
+    ja   .cksum_done           ; truncated -- cannot verify what we did not keep
+    lea  rdi, [rbp-0x60]
+    mov  rsi, r14
+    mov  edx, eax
+    call cksum4
+    mov  eax, [rbp-0x60]
+    cmp  eax, [rbp-0x44]
+    jne  .eof_or_err           ; Core: "Checksum mismatch" -> drop the peer
+.cksum_done:
+
     ; --- drain excess (announced - tocopy) if any ---
     mov  eax, [rbp-0x64]       ; announced
     mov  ecx, [rbp-0x68]       ; tocopy
