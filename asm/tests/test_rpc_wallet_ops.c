@@ -820,6 +820,90 @@ int main(void){
         ck("...and is idempotent", rc == 1);
         rj_free(r); rj_free(p); }
 
+      /* ==== WAL-2: the SPEND selector and listunspent must agree ======
+       *
+       * They did not. rpc_wops_wallet_coins (what listunspent publishes)
+       * built the right scriptPubKey for all four output types; wf_coins (the
+       * SPEND selector) carried only the 20-byte hash, and wf_fund then wrote
+       * `0014<h160>` into the prevtxs for every input -- telling the signer
+       * that every coin was P2WPKH.
+       *
+       * For a legacy coin the stored hash IS the key hash, so the signer
+       * produced a BIP143 witness against a P2PKH prevout: a transaction the
+       * mempool refuses, or with -walletbroadcast=0 a txid handed back for
+       * something the network will never accept. For sh(wpkh) and tr the
+       * stored hash is a SCRIPT hash or a prefix of Q, so the signer found no
+       * key and reported "could not sign every input". Every non-bech32 coin
+       * was unspendable through the wallet RPCs while listunspent said
+       * otherwise.
+       *
+       * The fix collapsed the two derivations into one helper, so the
+       * property to pin is that the two views AGREE -- for every coin, on
+       * both the script and the redeemScript. */
+      {
+          extern int rpc_wops_test_spend_coin(const void* wseed, int idx,
+                                              unsigned char* txid_out, unsigned int* vout_out,
+                                              unsigned char* spk, unsigned long* spklen,
+                                              unsigned char* redeem, unsigned long* redeemlen);
+          int checked = 0, mismatched = 0, nonempty = 0;
+          for (int i = 0; ; i++){
+              unsigned char sspk[64], sred[40], tid[32]; unsigned long sl = 0, rl = 0; unsigned int vo = 0;
+              int nc = rpc_wops_test_spend_coin(SEED, i, tid, &vo, sspk, &sl, sred, &rl);
+              if (nc == 0 || i >= nc) break;
+              checked++;
+              if (sl) nonempty++;
+              /* every selected coin must carry a real script -- the whole
+               * point is that the signer is told the truth */
+              if (sl == 0) mismatched++;
+              /* and it must be a script this wallet can actually recognise:
+               * P2WPKH (22), P2PKH (25), P2SH (23) or P2TR (34) */
+              else if (!(sl == 22 || sl == 25 || sl == 23 || sl == 34)) mismatched++;
+              /* an sh(wpkh) coin without its redeemScript cannot be signed */
+              else if (sl == 23 && rl != 22) mismatched++;
+          }
+          printf("      (spend selector offered %d coin(s), %d with a script)\n", checked, nonempty);
+          /* ---- and now the part the fixtures cannot reach ----
+           *
+           * The wallet fixtures hold bech32 coins, which is precisely why
+           * this defect survived: no test ever spent anything else. So the
+           * per-type derivation is checked directly, with the assertion that
+           * matters stated plainly -- a legacy coin must NOT be described as
+           * `0014<h160>`, which is what the spend path used to send to the
+           * signer for every input regardless of type. */
+          {
+              extern int rpc_wops_test_coin_script(const void* wseed, int type, int chain,
+                                                   unsigned keyidx, const unsigned char h160[20],
+                                                   unsigned char* spk, unsigned long* spklen,
+                                                   unsigned char* redeem, unsigned long* redeemlen);
+              unsigned char h[20]; for (int k = 0; k < 20; k++) h[k] = (unsigned char)(0x30 + k);
+              unsigned char spk[64], red[40]; unsigned long sl, rl;
+
+              rpc_wops_test_coin_script(SEED, WOT_BECH32, 0, 0, h, spk, &sl, red, &rl);
+              ck("WAL-2 bech32 -> 0014<h160>",
+                 sl == 22 && spk[0] == 0x00 && spk[1] == 0x14 && !memcmp(spk+2, h, 20));
+
+              rpc_wops_test_coin_script(SEED, WOT_LEGACY, 0, 0, h, spk, &sl, red, &rl);
+              ck("WAL-2 legacy -> 76a914<h160>88ac (P2PKH), 25 bytes",
+                 sl == 25 && spk[0] == 0x76 && spk[1] == 0xa9 && spk[2] == 0x14 &&
+                 !memcmp(spk+3, h, 20) && spk[23] == 0x88 && spk[24] == 0xac);
+              ck("WAL-2 ...and specifically NOT the P2WPKH form the signer used to be told",
+                 !(sl == 22 && spk[0] == 0x00 && spk[1] == 0x14));
+
+              rpc_wops_test_coin_script(SEED, WOT_P2SH_SEGWIT, 0, 0, h, spk, &sl, red, &rl);
+              ck("WAL-2 sh(wpkh) -> a914<scripthash>87, 23 bytes",
+                 sl == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87);
+              ck("WAL-2 ...with the redeemScript the signer cannot sign without",
+                 rl == 22 && red[0] == 0x00 && red[1] == 0x14);
+
+              rpc_wops_test_coin_script(SEED, WOT_BECH32M, 0, 0, h, spk, &sl, red, &rl);
+              printf("      (taproot spk length %lu)\n", sl);
+              ck("WAL-2 tr -> 5120<32-byte Q>, 34 bytes (re-derived, not the stored 20-byte prefix)",
+                 sl == 34 && spk[0] == 0x51 && spk[1] == 0x20);
+          }
+          ck("WAL-2 every selectable coin carries a real scriptPubKey", checked > 0 && mismatched == 0);
+          ck("WAL-2 ...and the selector offered something at all", checked > 0);
+      }
+
       /* ==== coin selection, change and fees ========================== */
       /* Spendable: the 10 BTC change output. The 50 BTC receive was spent at
        * h2, so it must NOT be selectable -- if the spent-detection were the
