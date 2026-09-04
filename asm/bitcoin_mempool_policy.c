@@ -481,8 +481,18 @@ static int classify_spk(const unsigned char* s, unsigned long n){
 static uint64_t dust_threshold(unsigned long spk_len, int spk_type, uint64_t rate_kvb){
     /* serialized txout size: 8 (value) + compactsize(spk_len) + spk_len */
     uint64_t sz = 8 + (spk_len < 0xfd ? 1 : 3) + spk_len;
+    /* MEM-11 (audit 2026-09-03): SPK_ANCHOR belongs in this set. P2A is
+     * witness version 1 with a 2-byte program, so Core's IsWitnessProgram
+     * returns true for it and GetDustThreshold charges the WITNESS spend size.
+     * Leaving it out charged the non-witness size instead: 3000 sat/kvB x 161
+     * bytes = 483 sat rather than x 80 = 240. A P2A output between 240 and
+     * 482 sat is not dust to Core and was dust here -- and while one dust
+     * output is tolerated at standardness, the ephemeral-dust rule then fires
+     * on any transaction with a non-zero fee. LN anchor outputs sit squarely
+     * in that range, so this node rejected transactions Core accepts. */
     int witness = (spk_type == SPK_WITNESS_V0_KEY || spk_type == SPK_WITNESS_V0_SCRIPT ||
-                   spk_type == SPK_WITNESS_V1_TAP || spk_type == SPK_WITNESS_UNKNOWN);
+                   spk_type == SPK_WITNESS_V1_TAP || spk_type == SPK_WITNESS_UNKNOWN ||
+                   spk_type == SPK_ANCHOR);
     sz += witness ? (32 + 4 + 1 + (107/4) + 4) : (32 + 4 + 1 + 107 + 4);
     uint64_t fee = rate_kvb * sz / 1000;
     if (fee == 0 && rate_kvb > 0) fee = 1;

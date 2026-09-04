@@ -570,8 +570,18 @@ int main(void){
                rc == 1 && r && S(r, "ismine") && !strcmp(S(r, "ismine"), "0"));
             ck("...iswatchonly=false too (not imported either)",
                r && S(r, "iswatchonly") && !strcmp(S(r, "iswatchonly"), "0"));
+            /* RPX-3 (audit 2026-09-03): UPDATED. This asserted that pubkey
+             * came back as an EMPTY STRING for an address we cannot sign for
+             * -- pinning the defect. Core's DescribeAddress emits pubkey and
+             * iscompressed only under ismine, and never emits an empty
+             * pubkey; the old behaviour also asserted "iscompressed": true
+             * about a key the node does not have. The field must now be
+             * ABSENT. */
             const char* pk = S(r, "pubkey");
-            ck("...pubkey stays empty for an address we cannot sign for", pk && pk[0] == 0);
+            ck("RPX-3 ...pubkey is ABSENT for an address we cannot sign for "
+               "(Core omits it; it used to be an empty string)", pk == 0);
+            ck("RPX-3 ...and so is iscompressed (it used to claim true)",
+               S(r, "iscompressed") == 0);
             rj_free(r); rj_free(q); } } }
       D("createwalletdescriptor", NULL);
       ck("createwalletdescriptor with no type -> -8", rc == 0 && ec == -8);

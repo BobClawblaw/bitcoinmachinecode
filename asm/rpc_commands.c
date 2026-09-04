@@ -334,11 +334,29 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
             int is_mine = 0, is_watchonly = 0, is_change = 0, has_pub = 0;
             unsigned char pub[33];
             rpc_wops_address_ownership(w, s, (unsigned long)sl, &is_mine, &is_watchonly, &is_change, pub, &has_pub);
-            if (type == WAL_ADDR_P2PKH) {
-                char pubhex[68]; pubhex[0] = 0;
-                if (has_pub) bin_to_hex(pubhex, pub, 33);
+            /* RPX-3 (audit 2026-09-03): pubkey/iscompressed ONLY when the
+             * wallet actually holds the key.
+             *
+             * This used to emit "pubkey" for any valid P2PKH address --
+             * empty when has_pub was 0 -- and "iscompressed": true
+             * unconditionally. So getaddressinfo on an address the node does
+             * not own answered `"pubkey":"", "iscompressed":true`: a
+             * compressed-key claim about a key it does not have, and an empty
+             * string where Core emits no field at all.
+             *
+             * Core's DescribeAddress emits both only under ismine, with a
+             * real KeyOriginInfo. 699e244 fixed ismine/iswatchonly/ischange to
+             * use a real ownership lookup and left this pair behind; the
+             * audit's diff review flagged it then and it was still here.
+             *
+             * iscompressed is derived from the key itself -- 33 bytes
+             * compressed, 65 uncompressed -- rather than asserted. */
+            if (type == WAL_ADDR_P2PKH && has_pub) {
+                char pubhex[136];
+                int plen = (pub[0] == 0x04) ? 65 : 33;
+                bin_to_hex(pubhex, pub, plen);
                 rj_obj_set(o, "pubkey", rj_str(pubhex));
-                rj_obj_set(o, "iscompressed", rj_bool(1));
+                rj_obj_set(o, "iscompressed", rj_bool(plen == 33));
             }
             rj_obj_set(o, "iswitness", rj_bool(type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH || type == WAL_ADDR_P2TR));
             rj_obj_set(o, "witness_version", rj_numf("%u", (type == WAL_ADDR_P2TR) ? 1 : 0));

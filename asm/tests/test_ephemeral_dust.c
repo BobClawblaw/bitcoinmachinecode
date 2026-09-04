@@ -65,6 +65,9 @@ static void ck(const char* l, int c){
 #define DUSTY   100ull
 #define SOLID   50000ull
 
+/* MEM-11: when >= 0, that output index is built as a P2A anchor. */
+static int g_p2a_out = -1;
+
 static unsigned long mk_tx(unsigned char* out, unsigned ver,
                            const unsigned char prevs[][32], const unsigned* vouts, int n_in,
                            const unsigned long long* vals, int n_out, unsigned char tag){
@@ -82,8 +85,15 @@ static unsigned long mk_tx(unsigned char* out, unsigned ver,
     *p++ = (unsigned char)n_out;
     for (int i=0;i<n_out;i++){
         for (int k=0;k<8;k++) *p++ = (unsigned char)(vals[i] >> (8*k));
-        *p++ = 22; *p++ = 0x00; *p++ = 0x14;
-        for (int k=0;k<20;k++) *p++ = (unsigned char)(k + i + tag);
+        if (g_p2a_out >= 0 && i == g_p2a_out){
+            /* MEM-11: P2A (Core v28+) is OP_1 followed by a 2-byte push
+             * 0x4e73 -- witness version 1 with a 2-byte program, which Core's
+             * IsWitnessProgram accepts, so it gets the WITNESS dust size. */
+            *p++ = 4; *p++ = 0x51; *p++ = 0x02; *p++ = 0x4e; *p++ = 0x73;
+        } else {
+            *p++ = 22; *p++ = 0x00; *p++ = 0x14;
+            for (int k=0;k<20;k++) *p++ = (unsigned char)(k + i + tag);
+        }
     }
     p[0]=0;p[1]=0;p[2]=0;p[3]=0; p += 4;
     return (unsigned long)(p - out);
@@ -181,6 +191,35 @@ int main(void){
     la = mk_tx(A, 3, prevs, vouts, 1, vals, 2, 1);
     ck("a fee-paying transaction with dust is accepted under the escape hatch",
        add(A, la, ida) == 1);
+
+    /* ---- MEM-11: a P2A output gets the WITNESS dust threshold ----
+     * P2A is witness version 1 with a 2-byte program, so Core's
+     * IsWitnessProgram returns true and GetDustThreshold charges the witness
+     * spend size: 3000 sat/kvB x 80 bytes = 240 sat. This node omitted
+     * SPK_ANCHOR from its witness set and charged the NON-witness size
+     * instead -- x 161 bytes = 483 sat -- so anything between 240 and 482 sat
+     * on a P2A output was dust here and is not dust to Core.
+     *
+     * That is not a harmless difference: one dust output is tolerated at
+     * standardness, but the ephemeral-dust rule then fires on any transaction
+     * paying a non-zero fee. LN anchor outputs sit squarely in that range, so
+     * this node rejected transactions Core accepts.
+     *
+     * 300 sat is inside the window. The check is that a FEE-PAYING
+     * transaction carrying it is ACCEPTED -- if the output still counted as
+     * dust, the ephemeral rule would refuse it. */
+    world(0);
+    { unsigned long long v2[2];
+      v2[0] = FUND - 300 - 1000;      /* a normal fee */
+      v2[1] = 300;                    /* P2A, inside 240..482 */
+      g_p2a_out = 1;
+      unsigned char P[512]; unsigned char idp[32];
+      unsigned long lp = mk_tx(P, 3, prevs, vouts, 1, v2, 2, 9);
+      long r = add(P, lp, idp);
+      g_p2a_out = -1;
+      if (r != 1) printf("      (reason: %s)\n", mpool_policy_reason(pol));
+      ck("MEM-11 a 300-sat P2A output is not dust (witness threshold is 240)",
+         r == 1); }
 
     printf("\n%s (%d checks, %d failures)\n",
            failures ? "TESTS FAILED" : "ALL TESTS PASSED", checks, failures);
