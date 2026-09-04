@@ -539,6 +539,13 @@ long archive_prune_height_for_budget(long long budget_bytes){
 }
 
 
+/* STO-4: highest height index.dat has a slot for. One stat, no scan. */
+static long archive_index_tip(void){
+    struct stat st;
+    if (stat("index.dat", &st) != 0) return -1;
+    return (long)(st.st_size / 48) - 1;
+}
+
 /* archive_prune_decide(): should we delete anything, and if so below what
  * height? Pure decision, no side effects -- SEPARATE FROM THE DELETION on
  * purpose.
@@ -563,12 +570,44 @@ archive_prune_verdict_t archive_prune_decide(long long budget_bytes,
 
     if (out_height) *out_height = ph;
 
-    long badh = archive_layout_monotonic(ph);
+    /* STO-4 (audit 2026-09-03): the guards must cover the WHOLE index, not
+     * just the heights below the prune boundary.
+     *
+     * store_prune unlinks every file below the boundary file F and then walks
+     * h = ph, ph+1, ... re-packing records while rec.file_no == F, finally
+     * ftruncate(F, new_off). That walk assumes every height stored in F
+     * appears as ONE CONTIGUOUS RUN starting at ph -- an assumption about the
+     * layout ABOVE ph. These two guards were called with `ph`, so they
+     * validated only the part store_prune does not walk.
+     *
+     * What that costs, with a hole at H > ph (a sync-in-progress archive is
+     * normally full of them -- the 09-01 incident log records "282 holes in
+     * [0,968954]" as an ordinary state): at h = H the record reads all-zero,
+     * file_no = 0 != F, the walk stops, and ftruncate(F, new_off) destroys
+     * every block of F stored after H's slot WHILE ITS INDEX RECORD STILL
+     * POINTS INTO F. Catch-up then reads a short block at the first destroyed
+     * height and stops, and the hole-fill cannot re-fetch it because the
+     * record is non-zero. If F happens to be blk00000.dat then F == 0
+     * "matches" the zero record and an 8-byte frame from offset 0 is copied
+     * over the compacted stream instead.
+     *
+     * A non-monotonic run above ph does the same thing: heights ph..ph+k in
+     * F, ph+k+1 in F+1, ph+k+2 back in F (ordinary parallel-downloader
+     * interleaving) stops the walk at ph+k+1 and truncates away ph+k+2.
+     *
+     * Scanning to the index tip rather than to ph costs one more sequential
+     * pass over index.dat and turns both cases into a REFUSE verdict, which
+     * main.c already routes to archive_prune_file_granular -- whole-file
+     * deletion, which is what Core does and needs neither assumption. */
+    long tip = archive_index_tip();
+    if (tip < ph) tip = ph;          /* nothing above the boundary to check */
+
+    long badh = archive_layout_monotonic(tip);
     if (badh >= 0){
         if (out_detail) *out_detail = badh;
         return ARCHIVE_PRUNE_REFUSE_LAYOUT;
     }
-    long hole = archive_first_hole(ph);
+    long hole = archive_first_hole(tip);
     if (hole >= 0){
         if (out_detail) *out_detail = hole;
         return ARCHIVE_PRUNE_REFUSE_HOLE;
