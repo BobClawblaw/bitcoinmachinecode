@@ -557,6 +557,32 @@ extern long utxo_store_wal_drain(void* st);
 static int persist_applied_height(long h){
     /* the height claims every op through h is in the WAL: land the buffer first */
     if (utxo_store_wal_drain(&g_utxo_lst) != 0) return 0;
+    /* ---- UTX-4 (audit 2026-09-03): and make it DURABLE before claiming it.
+     *
+     * The drain is write(2) only. The height file below is written to a tmp,
+     * fsynced, renamed, and the directory fsynced -- so the CHECKPOINT was
+     * durable while the WAL data it certifies was merely in the page cache.
+     * The design notes in utxo_store.asm and further down this file cover
+     * same-machine process death, where the page cache survives; they do not
+     * cover power loss or a kernel crash.
+     *
+     * On those, the 12-byte checkpoint can survive while the WAL pages for
+     * the blocks it covers do not. The reloaded set is then BEHIND the
+     * checkpoint, catch-up resumes at applied+1, and the lost blocks' spends
+     * resurrect while their outputs vanish -- silently, because the ghost
+     * guard reads undo files that were never fsynced either.
+     *
+     * Ordering, not extra work: the fsync has to precede the checkpoint that
+     * asserts it. One fsync per CHECKPOINT, not per block -- ckpt_now is
+     * driven by utxo_live_ckpt_due (a block batch and a time bound), so this
+     * costs one flush per batch on a path that already does three fsyncs
+     * (tmp file, and the directory) plus a rename. */
+    if (g_utxo_lst.log_fd >= 0 && fsync((int)g_utxo_lst.log_fd) != 0){
+        fprintf(stderr, "[utxo_live] fsync WAL before checkpoint failed: %s "
+                        "-- refusing to record an applied height the data may not back\n",
+                strerror(errno));
+        return 0;
+    }
     u8 buf[12];
     u32 magic = UTXO_APPLIED_HEIGHT_MAGIC;
     memcpy(buf, &magic, 4);
