@@ -94,6 +94,9 @@ static int cf_hash_fd(cf_files* f, long h, u8 out[32]){
 
 #define CF_BASIC        0            /* BIP158 basic filter type */
 #define CF_MAX_RANGE    1000         /* Core MAX_GETCFILTERS_SIZE */
+/* STO-6: cfheaders has its own, larger cap in Core -- MAX_GETCFHEADERS_SIZE.
+ * Using the cfilters number for both silently truncated legitimate requests. */
+#define CF_MAX_HDR_RANGE 2000        /* Core MAX_GETCFHEADERS_SIZE */
 #define CF_MAX_FILTER   (1u << 20)
 
 static unsigned cf_put_varint(u8* p, unsigned long long v){
@@ -129,7 +132,24 @@ int serve_cfilters(int fd, int kind, const u8* pl, unsigned long plen){
         for (int i = 0; i < 4; i++) s32 |= (unsigned int)pl[1+i] << (8*i);
         start = (long)s32;
         if (start > stop) return 0;
-        if (stop - start + 1 > CF_MAX_RANGE) stop = start + CF_MAX_RANGE - 1;
+        /* ---- STO-6 (audit 2026-09-03): REFUSE an oversize range, do not
+         * clamp it ----
+         *
+         * The reply carries the REQUESTED stop_hash, and BIP157 says the
+         * reply covers exactly [start, stop]. A compliant client checks
+         * count == stop_height - start_height + 1 against the height it
+         * resolved stop_hash to; a clamped reply fails that check and the
+         * client disconnects us. Core does not clamp either -- it treats an
+         * oversize request as misbehaviour and disconnects the requester.
+         * Answering nothing is the closest this serve path can get to that
+         * without a misbehaviour channel, and it is strictly better than
+         * sending a reply we know will be rejected. */
+        long lim = (kind == 1) ? CF_MAX_HDR_RANGE : CF_MAX_RANGE;
+        if (stop - start + 1 > lim){
+            fprintf(stderr, "[cf] refusing getcf%s for %ld..%ld: %ld blocks exceeds the %ld-block limit (Core disconnects for this)\n",
+                    kind == 1 ? "headers" : "ilters", start, stop, stop - start + 1, lim);
+            return 0;
+        }
     }
 
     static u8 fbuf[CF_MAX_FILTER];
@@ -166,8 +186,20 @@ int serve_cfilters(int fd, int kind, const u8* pl, unsigned long plen){
         if (start > 0){
             unsigned long pl2; u8 ph[32];
             /* the previous block's filter HEADER is the running hash we
-             * chain from; zero at height 0, exactly as BIP157 defines it */
-            if (cf_read(&ff, start - 1, fbuf, sizeof fbuf, &pl2, ph)) memcpy(prev, ph, 32);
+             * chain from; zero at height 0, exactly as BIP157 defines it.
+             *
+             * STO-6: a MISS here used to leave prev all-zero, which is the
+             * legitimate value only at height 0. A client chaining headers
+             * from a zero prev computes a different header for every block in
+             * the range and concludes our filter index is corrupt. Refuse
+             * instead -- we genuinely cannot answer this request. */
+            if (!cf_read(&ff, start - 1, fbuf, sizeof fbuf, &pl2, ph)){
+                fprintf(stderr, "[cf] refusing getcfheaders for %ld..%ld: no filter at %ld to chain the previous header from\n",
+                        start, stop, start - 1);
+                cf_close(&ff);
+                return 0;
+            }
+            memcpy(prev, ph, 32);
         }
         unsigned w = 0;
         out[w++] = CF_BASIC;
@@ -184,11 +216,27 @@ int serve_cfilters(int fd, int kind, const u8* pl, unsigned long plen){
             sha256d(out + p, fbuf, flen);   /* the filter hash, not the header */
             p += 32; got++;
         }
-        if (got != n){
-            /* answer only what we actually have, with an honest count */
-            cf_put_varint(out + w, (unsigned long long)got);
-        }
         cf_close(&ff);
+        if (got != n){
+            /* ---- STO-6: REFUSE a short answer; do NOT rewrite the count ----
+             *
+             * This used to call cf_put_varint(out + w, got) to patch the count
+             * in place. The hashes had already been laid down at hdr_end =
+             * w + nw, so when n >= 253 and got < 253 the new varint was ONE
+             * byte and two stale bytes of the old three-byte varint stayed
+             * between it and the first hash: a payload no peer can parse.
+             * Reachable whenever the filter index lags the tip by more than
+             * the range, which happens while an adoption is pending.
+             *
+             * Even with the layout fixed, a short answer is wrong: BIP157
+             * requires the reply to cover exactly [start, stop], and the
+             * reply carries the requested stop_hash. Core's
+             * ProcessGetCFHeaders likewise sends nothing when its index
+             * cannot supply the whole range. */
+            fprintf(stderr, "[cf] refusing getcfheaders for %ld..%ld: index has only %ld of %ld filters\n",
+                    start, stop, got, n);
+            return 0;
+        }
         return p2p_write(fd, "cfheaders", 9, out, p) > 0;
     }
 
@@ -207,8 +255,14 @@ int serve_cfilters(int fd, int kind, const u8* pl, unsigned long plen){
             if (p + 32 > sizeof out) break;
             memcpy(out + p, header, 32); p += 32; got++;
         }
-        if (got != n) cf_put_varint(out + w, (unsigned long long)got);
         cf_close(&ff);
+        if (got != n){
+            /* STO-6: same in-place count rewrite, same corruption, same rule
+             * -- a checkpoint list must run all the way to stop_hash. */
+            fprintf(stderr, "[cf] refusing getcfcheckpt to height %ld: index has only %ld of %ld checkpoints\n",
+                    stop, got, n);
+            return 0;
+        }
         return p2p_write(fd, "cfcheckpt", 9, out, p) > 0;
     }
 }
