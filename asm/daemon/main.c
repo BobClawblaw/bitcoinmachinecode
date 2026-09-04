@@ -3003,6 +3003,24 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
                     dlc_headers_rollback(hst, have0); return -1;
                 }
             } else {
+                /* VAL-5 (audit 2026-09-03): this used to append whatever a
+                 * peer sent after only checking linkage -- no pow_check at
+                 * all, so up to 2,000 x 1,000 headers of garbage from the
+                 * first live peer landed in headers.dat by height, and the
+                 * block downloader then requested blocks for hashes nothing
+                 * ever revalidates. Core validates CheckProofOfWork on every
+                 * header before storing. The nBits range/PoW check now runs
+                 * BEFORE hst_append (pow_check carries the VAL-11 nBits
+                 * range gates + the armed chain powLimit). The remaining
+                 * VAL-5 scope (MTP / now+2h / legacy-version rules here and
+                 * in the apply path) is tracked as open in the audit doc's
+                 * remediation log -- those need per-chain activation heights
+                 * and must not gate harness paths that never arm them. */
+                if(!pow_check(h)){
+                    fprintf(stderr,"[dlc] header at height %ld from %s fails its own PoW -- discarding the page\n",
+                            pos + (long)i, cand);
+                    dlc_headers_rollback(hst, have0); return -1;
+                }
                 if(hst_append(hst, h, bh) < 0){ dlc_headers_rollback(hst, have0); return -1; }
                 added++;
             }
