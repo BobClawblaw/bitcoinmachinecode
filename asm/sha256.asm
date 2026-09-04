@@ -191,22 +191,35 @@ sha256_block:
     ; sha256_block_shani (bit-identical output, much faster). The scalar body
     ; below remains the portable fallback on CPUs without SHA-NI, and is
     ; exercised by the differential/KAT tests. Lazy one-time CPUID probe;
-    ; result cached in the global shani_ready flag (zero-init => first call
-    ; probes).
-    cmp  byte [rel shani_ready], 0
-    jne  .shani_known
-    ; probe CPUID.1:ECX bit 29 (SHA). CPUID clobbers EBX, a callee-saved reg
-    ; the caller owns here, so preserve it across the probe.
-    push rbx
-    mov  eax, 0x1
-    cpuid
-    bt   ecx, 29
-    setb byte [rel shani_ready]     ; 1 if SHA-NI present
+    ; result cached in the global shani_ready flag as a TRI-state --
+    ;   0 = not probed yet, 1 = SHA-NI present, 2 = absent (cached too: the
+    ;   old code cached only "present", re-probing CPUID on every single call
+    ;   of an absent -- fully correct but needlessly slow -- configuration).
+    ;
+    ; CRY-1 (audit 2026-09-03): the probe used to be CPUID.(EAX=1):ECX bit
+    ; 29 -- which is F16C (half-precision conversion), NOT the SHA extension.
+    ; The SHA flag is CPUID.(EAX=7,ECX=0):EBX bit 29, exactly what
+    ; sha256_nia.asm's cpu_has_sha_ni checks (the two had drifted). On every
+    ; Intel core from Ivy Bridge to Comet Lake -- F16C yes, SHA-NI no -- the
+    ; old probe jumped into sha256_block_shani and SIGILL'd on the first
+    ; sha256rnds2, i.e. on the FIRST hash of any binary in the tree. The fix
+    ; probes the correct leaf through the shared exported probe below, so
+    ; dispatcher and test can never disagree again.
+    movzx eax, byte [rel shani_ready]
+    test al, al
+    jz   .probe
+    cmp  al, 1
+    jne  .scalar                     ; 2 (or any other value) -> scalar
+    jmp  sha256_block_shani          ; tail-call accelerator (rdi/rsi already set)
+.probe:
+    push rbx                         ; CPUID clobbers EBX, a callee-saved reg
+    call sha256_cpu_has_sha
     pop  rbx
-.shani_known:
-    cmp  byte [rel shani_ready], 0
-    je   .scalar
-    jmp  sha256_block_shani         ; tail-call accelerator (rdi/rsi already set)
+    mov  byte [rel shani_ready], 2   ; default: absent (cached)
+    test eax, eax
+    jz   .scalar
+    mov  byte [rel shani_ready], 1
+    jmp  sha256_block_shani
 .scalar:
     ; ----- prologue: set up a fixed frame base and preserve callee-saved ----
     push rbp
@@ -742,6 +755,39 @@ palignr xmm4, xmm1, 0x8
 movdqu [rdi], xmm0
 movdqu [rdi+16], xmm4
 ret
+
+
+; ============================================================================
+; sha256_cpu_has_sha() -> eax = 1 if the SHA extensions are present.
+;   CRY-1 (audit 2026-09-03). The flag is CPUID.(EAX=7,ECX=0):EBX bit 29 --
+;   NOT CPUID.1:ECX bit 29, which is F16C. (sha256.asm's dispatcher read the
+;   F16C bit and jumped into the SHA-NI path on every Intel Ivy Bridge ->
+;   Comet Lake core, SIGILL'ing on the first sha256rnds2.) Leaf 7 must be
+;   probed only when the max leaf (CPUID.0:EAX) is >= 7. Kept here (not
+;   imported from sha256_nia.asm's equivalent cpu_has_sha_ni) so sha256.o has
+;   no link-time dependency on the NIA module, which some binaries in the tree
+;   do not link. Both encodings are exercised identical by tests/test_sha256.
+; ============================================================================
+global sha256_cpu_has_sha
+section .text
+sha256_cpu_has_sha:
+    push rbx
+    xor  eax, eax
+    cpuid
+    cmp  eax, 7
+    jb   .no
+    mov  eax, 7
+    xor  ecx, ecx
+    cpuid
+    shr  ebx, 29
+    and  ebx, 1
+    mov  eax, ebx
+    pop  rbx
+    ret
+.no:
+    xor  eax, eax
+    pop  rbx
+    ret
 
 
 
