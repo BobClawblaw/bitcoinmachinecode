@@ -2709,7 +2709,7 @@ DAEMONSRCS := daemon/main.c daemon/private_broadcast.c daemon/fee_estimator.c da
     daemon/net_policy.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/chainparams.c daemon/mempool_cfg.c daemon/upload_cap.c daemon/tx_submit.c daemon/tx_relay.c daemon/tx_index_tail.c daemon/txosp_tail.c daemon/blk_submit.c daemon/utxo_setinfo_rpc.c daemon/coinstats_index.c daemon/addr_self.c daemon/bfilter_index.c daemon/serve_cfilters.c daemon/serve_addr.c daemon/serve_rejects.c daemon/addr_index_tail.c daemon/block_strip.c wallet_store.c \
     bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
     daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_witness_v0.c wallet_msgsign.c \
-    daemon/serve_invbounds.c daemon/serve_rejects.c daemon/relay_policy.c daemon/wallet_pass.c daemon/v2transport.c crypto_bip324_transport.c crypto_bip324.c crypto_bip324_fs.c \
+    daemon/serve_invbounds.c daemon/relay_policy.c daemon/wallet_pass.c daemon/v2transport.c crypto_bip324_transport.c crypto_bip324.c crypto_bip324_fs.c \
     crypto_chacha20.c crypto_poly1305.c crypto_ellswift_ecdh.c \
     crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c
 # Embedded RPC server (docs/RPC_LIVE_NODE.md): DAEMON_RPCOBJS is defined near
