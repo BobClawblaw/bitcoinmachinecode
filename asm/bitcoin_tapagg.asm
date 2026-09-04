@@ -46,7 +46,7 @@ extern taproot_verify_input           ; C (bitcoin_taproot_sighash.c) -- later s
 %define BP_BUF   0
 
 section .rodata
-t_spkbig: db "prevout script too large for taproot aggregate sighash",0
+t_spkbig: db "prevout script too large",0
 t_oom:    db "out of memory",0
 t_moved:  db "internal: taproot arena moved during build",0
 t_sizing: db "internal: taproot arena sizing pass disagreed",0
@@ -84,7 +84,15 @@ tapagg_build_asm:
     mov  [rbp-0x50], r8                  ; nin
     mov  [rbp-0x58], r9                  ; tx
 
-    ; ---- sizing pass: splen = sum(1 + sl), reject sl >= 0xfd ----
+    ; ---- sizing pass: splen = sum(cslen(sl) + sl); reject sl > 10000 ----
+    ; SCR-5 (audit 2026-09-03): the run carries a REAL minimal CompactSize
+    ; per entry (1 byte under 0xfd, 3 bytes up to 0xffff), exactly like the
+    ; C twin in daemon/tx_verify.c and Core's ser_compactsize. The old
+    ; `sl >= 0xfd -> reject` made every taproot spend with a >= 253-byte
+    ; co-input script a false reject vs the live chain. The cap mirrors
+    ; TXV_SPK_CAP = consensus MAX_SCRIPT_SIZE (the C caller enforces it too;
+    ; the twins must reject identically).
+    %define TA_SPK_CAP 10000
     xor  eax, eax
     mov  [rbp-0x60], rax                 ; splen = 0
     mov  [rbp-0x68], rax                 ; k = 0
@@ -100,9 +108,14 @@ tapagg_build_asm:
     lea  r9,  [rbp-0x88]                 ; &sl
     call qword [rbp-0x40]
     mov  eax, [rbp-0x88]                 ; sl (u32)
+    cmp  eax, TA_SPK_CAP
+    ja   .r_spkbig
+    mov  ecx, 1                          ; cslen: 1 byte under 0xfd ...
     cmp  eax, 0xfd
-    jae  .r_spkbig
-    inc  eax                             ; 1 + sl
+    jb   .sz1
+    mov  ecx, 3                          ; ... 3 bytes up to 0xffff
+.sz1:
+    add  eax, ecx                        ; cslen + sl
     add  [rbp-0x60], rax
     inc  qword [rbp-0x68]
     jmp  .size_loop
@@ -161,12 +174,18 @@ tapagg_build_asm:
     mov  rax, [rbp-0x30]
     cmp  r12, [rax+BP_BUF]
     jne  .r_moved
-    ; invariant 2: sl < 0xfd and w + 1 + sl <= splen
+    ; invariant 2: sl <= cap and w + cslen(sl) + sl <= splen (SCR-5)
     mov  eax, [rbp-0x88]                 ; sl
+    cmp  eax, TA_SPK_CAP
+    ja   .r_sizing
+    mov  ecx, 1
     cmp  eax, 0xfd
-    jae  .r_sizing
-    mov  rcx, [rbp-0x90]                 ; w
-    lea  rdx, [rcx+rax+1]                ; w + 1 + sl
+    jb   .wr1
+    mov  ecx, 3
+.wr1:
+    mov  rdx, [rbp-0x90]                 ; w
+    add  rdx, rax                        ; + sl
+    add  rdx, rcx                        ; + cslen
     cmp  rdx, [rbp-0x60]
     ja   .r_sizing
     ; po[k*36] = op (36 bytes)
@@ -180,14 +199,23 @@ tapagg_build_asm:
     mov  rax, [rbp-0x68]
     mov  rcx, [rbp-0x78]                 ; v
     mov  [r14+rax*8], rcx
-    ; sp[w++] = sl; memcpy(sp+w, spk, sl); w += sl
+    ; sp[w++] = compactsize(sl); memcpy(sp+w, spk, sl); w += sl  (SCR-5)
     mov  rcx, [rbp-0x90]                 ; w
     mov  eax, [rbp-0x88]                 ; sl
-    mov  [r15+rcx], al
+    cmp  eax, 0xfd
+    jae  .wr_big
+    mov  [r15+rcx], al                   ; 1-byte length
     inc  rcx
+    jmp  .wr_copy
+.wr_big:
+    mov  byte [r15+rcx], 0xfd             ; 0xfd + LE16 length (sl <= 10000
+    mov  [r15+rcx+1], ax                  ; by invariant 2, so LE16 fits)
+    add  rcx, 3
+.wr_copy:
     lea  rdi, [r15+rcx]
     mov  rsi, [rbp-0x80]                 ; spk
-    add  rcx, rax                        ; w' = w + 1 + sl
+    mov  eax, [rbp-0x88]                 ; sl
+    add  rcx, rax                        ; w' = w + cslen + sl
     mov  [rbp-0x90], rcx
     mov  ecx, eax
     rep  movsb
