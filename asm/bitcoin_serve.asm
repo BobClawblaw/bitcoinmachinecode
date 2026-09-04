@@ -37,6 +37,7 @@ extern serve_mempool_msg
 extern serve_policy_disconnect_log
     extern serve_idx_topup
     extern serve_cfilters
+    extern serve_reject_has          ; MEM-10: daemon/serve_rejects.c
     extern idx_put
     extern store_append
     extern block_strip_witness
@@ -570,6 +571,25 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     test rax, rax
     jnz  .inv_next
+    ; ---- MEM-10 (audit 2026-09-03): have we already REFUSED this? ----
+    ;
+    ; Everything above answers "do we have it"; nothing answered "did we
+    ; already decide no". So an inbound peer could announce the txid of a
+    ; valid-signature, policy-rejected transaction once per second and every
+    ; announcement was fetched and fully re-verified -- thousands of ECDSA and
+    ; Schnorr checks each, in this serve child, which also takes mp_lock for
+    ; the policy pass. Core's AlreadyHaveTx consults m_recent_rejects before
+    ; asking for anything.
+    ;
+    ; The filter holds FINAL verdicts only: a fee-only failure stays
+    ; re-announceable, because a CPFP child can overturn it. It is shared
+    ; across serve children, so one child's refusal spares all of them.
+    mov  [s_ptr], rbx
+    lea  rdi, [rbx+4]
+    call serve_reject_has
+    mov  rbx, [s_ptr]
+    test eax, eax
+    jnz  .inv_next           ; already refused: do not fetch it again
 .inv_txann_req:
     ; getdata: [1][type][hash]; MSG_TX is asked for as MSG_WITNESS_TX (0x40000001),
     ; MSG_WTX echoed (the getdata carries the wtxid)

@@ -169,6 +169,22 @@ int mempool_configure(void){
      * accumulate ghosts of txs the pool no longer holds. */
     mpool_policy_set_forget_cb(mempool_forget);
 
+    /* MEM-10: the shared "already refused" memory, allocated BEFORE the serve
+     * children fork so a transaction one child refused is not re-fetched by
+     * the next. Weakly referenced so the tools that link this file without
+     * the serve path still build. */
+    { extern unsigned long serve_rejects_size(void) __attribute__((weak));
+      extern void serve_rejects_attach(void*) __attribute__((weak));
+      if (serve_rejects_size && serve_rejects_attach){
+          unsigned long rsz = serve_rejects_size();
+          void* rj = mmap(0, rsz, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+          if (rj != MAP_FAILED){
+              serve_rejects_attach(rj);
+              fprintf(stderr,"[mempool] recent-rejects filter: %lu KB shared "
+                             "(inbound announcements of an already-refused tx cost nothing)\n", rsz >> 10);
+          }
+      } }
+
     /* Shared fee estimator (Core CBlockPolicyEstimator): sized for the pool's
      * slots, seeded from fee_estimates.dat when the file is younger than
      * Core's MAX_FILE_AGE (60 h). Only when the estimator is linked. */

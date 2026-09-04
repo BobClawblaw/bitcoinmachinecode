@@ -945,6 +945,13 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
             if (r && strstr(r, "missing/already-spent")){ g_alog.rej_missing++; return -25; }
             g_alog.rej_invalid++;
             snprintf(g_alog.last_invalid, sizeof g_alog.last_invalid, "%s", r ? r : "?");
+            /* MEM-10: a script failure is FINAL -- no descendant makes an
+             * invalid parent valid -- and it is the expensive verdict, the
+             * one an attacker wants recomputed. Missing inputs (-25) are NOT
+             * recorded: that transaction becomes valid the moment its parent
+             * arrives, and the orphan pool exists to re-try it. */
+            { extern void serve_reject_note(const u8*) __attribute__((weak));
+              if (serve_reject_note) serve_reject_note(txid); }
             return -26;
         }
     }
@@ -956,6 +963,13 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
         g_alog.rej_policy++;
         const char* r = mpool_policy_reason(g_pol);
         if (r && txacc_fee_reconsiderable(r)) return -28;
+        /* MEM-10: remember the refusal so the next announcement of this txid
+         * costs nothing. Deliberately NOT for the -28 class above: Core keeps
+         * fee-only failures in a separate filter because a CPFP child can
+         * overturn them, and suppressing their re-announcement would break
+         * the 1p1c relay this file goes to some trouble to support. */
+        { extern void serve_reject_note(const u8*) __attribute__((weak));
+          if (serve_reject_note) serve_reject_note(txid); }
         return -26;
     }
     g_alog.acc++;
