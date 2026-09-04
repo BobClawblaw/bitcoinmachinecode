@@ -4,13 +4,14 @@ Companion to `CODEBASE_AUDIT_2026-09-03.md` (182 findings; 29 distinct
 CRITICAL+HIGH after de-duplication). This file records what has been fixed,
 what has not, and what was found along the way.
 
-**Status as of 2026-09-04: 18 of the 29 CRITICAL+HIGH closed, 3 partial, 8
-open. Everything MEDIUM and below is untouched** (one MEDIUM, UTX-3, was
+**Status as of 2026-09-04 (overnight pass): 24 of the 29 CRITICAL+HIGH
+closed, 2 partial, 3 open. Everything MEDIUM and below is untouched except
+UTX-3** (one MEDIUM, UTX-3, was
 closed because it sits on the same silent-coin-loss path as the HIGHs around
 it).
 
-Counted against the audit's own §2 priority ranks: closed are ranks 1-5, 8,
-11-19, 24, 27, 28; partial are 6, 9, 10; open are 7, 20-23, 25, 26, 29.
+Counted against the audit's own §2 priority ranks: closed are ranks 1-5, 6,
+8, 11-19, 20-22, 24-28; partial are 7 and 10; open are 9 (in part), 23, 29.
 
 This log is honest about the remainder rather than rounding it off; §4
 enumerates every open item.
@@ -87,6 +88,36 @@ header matches Core's. **No rebuild of `bfilters.dat` is needed.** A second
 ceiling restored, 919 consecutive "mempool full" refusals starting at entry
 67,081, with `mempoolminfee` still reporting 0 — the audit's exact signature.
 
+### Closed in the overnight pass (2026-09-04)
+
+| Finding | Sev | What it was | Commit |
+|---|---|---|---|
+| VAL-3 | HIGH | No block weight or serialized-size limit; a 6M-weight block was accepted here and rejected by Core | `c432c67` |
+| VAL-4 (half) | HIGH | `IsFinalTx` / `bad-txns-nonfinal` absent from block connect; BIP113 median-time-past cutoff | `ead4067` |
+| UTX-2 | HIGH | A WAL reload that overfilled the memtable counted as success; the next flush made the truncation permanent | `8e19d09` |
+| UTX-1 | HIGH | Merge tie-breaks used generation, not manifest index: spent coins resurrected after a partial compaction | `1e25b02` |
+| STO-3 | HIGH | A missing undo file read as "no spends": filters and the address index silently wrong | `36bcbbe` |
+| STO-4 | HIGH | Prune guards checked only below the gate, the region `store_prune` never walks | `d725cc6` |
+| NET-3 | HIGH | No inbound inactivity bound; 189 idle sockets refused every honest peer | `05c979b` |
+
+Every one carries a regression test and a verified negative control. Two are
+worth singling out because the control reproduced the audit's own figures
+exactly: UTX-2 returned `-2` with a count of 64, and UTX-1's walk visited 65
+entries while the counter said 64, with key A returning live at value 999999
+after a second compaction.
+
+Two results found while fixing, not in the audit:
+
+* **`val_read_tx` never walked the output section** (§1) — the segwit-block
+  regression, found while scoping VAL-3.
+* **`val_read_tx`'s `seqs[]` cap is unsafe for finality.** Its truncation rule
+  treats surplus inputs as FINAL, which is right for BIP68 and exactly
+  backwards for `IsFinalTx`, where missing a non-final input means accepting a
+  block Core rejects. Finality now uses an exact flag set during the walk
+  instead of reading the capped array.
+
+---
+
 ---
 
 ## 3. Closed earlier (2026-09-03, before this pass)
@@ -102,37 +133,27 @@ not in the audit.
 
 ### 4.1 Partial
 
-* **VAL-3** — the sigop budget landed as SCR-6 (`bad-blk-sigops`), but there
-  is still **no block weight or serialized-size limit**. `MAX_BLOCK_WEIGHT`
-  appears nowhere on the connect path. A 6,000,000-weight block is accepted
-  here and rejected by Core: chain split.
-* **VAL-5** — the boot header fetch now PoW-gates (`141c786`), but the MTP
+* **VAL-4** — `IsFinalTx` is enforced (`ead4067`); BIP68 `SequenceLocks` is
+  not, on either the block or the mempool path. Doing BIP68 first would have
+  been actively wrong: it is built on `vi->locktime`, which was returning
+  bytes from the output section until `b0c4231`.
+* **VAL-5** — the boot header fetch PoW-gates (`141c786`), but the MTP
   time-too-old / now+2h / legacy-version rules are still unenforced, in the
-  fetch and in `reorg_analyze`. `141c786`'s own message says so.
-* **VAL-7 / NET-5 / NET-6** — the header half is closed with a test
-  (`test_pow_check`) and `pow_check_bits` runs on the apply path. Whether the
-  raw archive-append of an inbound `block` push is gated has not been
-  confirmed.
+  fetch and in `reorg_analyze`. Note the MTP machinery now exists:
+  `val_mtp()` landed with VAL-4 and is Core's `GetMedianTimePast`.
+* **NET-3** — the inactivity bound is in (`05c979b`), so the DoS is capped at
+  20 minutes per slot. Core's `AttemptToEvictConnection` is NOT implemented,
+  so at capacity this node still refuses rather than evicting. `-peertimeout`
+  also remains unwired: it is Core's CONNECT timeout, and repurposing it as an
+  idle interval would be a fresh divergence rather than a fix (DMN-3).
 
 ### 4.2 Open, CRITICAL+HIGH
 
 | Finding | One line |
 |---|---|
-| VAL-4 / MEM-1 | No `nLockTime` finality or BIP68 sequence-lock check in block connect **or** mempool admission. Verified absent: `utxo_live.c:1194` parses the locktime with a comment naming `IsFinalTx`/BIP68, and nothing consumes it. Non-final txs enter GBT. |
-| NET-3 / DMN-3 | No inbound inactivity timeout or eviction; `-peertimeout` unused. |
-| UTX-1 | Generation tie-break resurrects spent coins after a partial prefix compaction (reproduced in the audit). |
-| UTX-2 | A WAL reload that overfills the memtable is accepted as success; the first flush makes the loss permanent (reproduced). |
+| VAL-4 (BIP68 half) / MEM-1 | The relative-timelock half: `SequenceLocks` over prevout heights for version >= 2 transactions at or after CSVHeight, on the block path; and the same rule on mempool admission (MEM-1). The nLockTime half is done. |
 | STO-1 | Crash mid-reorg leaves the UTXO set rewound with an old applied height and no undo files; coinstats adopts it. |
-| STO-3 | A missing undo file is read as "no spends": filter and address indexes go silently wrong after a >200-block catch-up burst. |
-| STO-4 | Prune compaction assumes a monotonic layout above the prune height; a violation truncates retained block data. |
 | MEM-3 / 4 / 5 | Parent links truncated at 24; claims/outreg tables drop entries when full; `TrimToSize` evicts the incoming tx's own parent. The pool holds txs whose inputs no longer exist, and GBT includes them. |
-
-**VAL-4/MEM-1 is the one to do next.** It is the last remaining consensus
-divergence of the "we accept what Core rejects" kind, it affects both the
-block path and mempool admission, and `val_read_tx`'s locktime — the field it
-would be built on — was returning garbage until `b0c4231`. Building
-`IsFinalTx` on top of the pre-`b0c4231` walk would have produced a
-confidently-wrong answer.
 
 ### 4.3 Open, MEDIUM and below
 
