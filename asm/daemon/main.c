@@ -2957,19 +2957,44 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
 #define DLC_HDR_SANE_MAX 100000L
 static int dlc_headers_sane(long have0, long pos){ return have0 - pos <= DLC_HDR_SANE_MAX; }
 
-/* Is a download worker dead weight this tick? The byte-rate floor
- * (dead_weight_bps, 32 KB/s) is calibrated for blocks of a megabyte or more.
- * In the first ~150k blocks of the chain a block is a few hundred bytes, so
- * a peer serving 50 of them a second delivers 20 KB/s -- and the old rule
- * (bytes only) called that dead weight, killed the worker, and banned the
- * peer for the run: 85 of 121 peers within eight minutes of a fresh start
- * (fresh-install acceptance test, 2026-09-02). A worker that hands over at
- * least DLC_DEAD_WEIGHT_MIN_BLOCKS blocks per 10-second tick is pulling its
- * weight whatever the byte count; near the tip that many blocks are tens of
- * megabytes, so the byte rule stays the binding one there. */
+/* Is a download worker dead weight this tick? Two rules, either one binds.
+ *
+ * 1. The block floor: a worker must hand over at least
+ *    DLC_DEAD_WEIGHT_MIN_BLOCKS blocks per 10-second tick. Ten blocks a
+ *    second is the minimum a useful peer delivers at ANY chain depth --
+ *    early-chain blocks are a few hundred bytes, so a bytes-only rule
+ *    cannot see a peer that is slow in blocks; a peer serving 5 blocks/s
+ *    of tiny early blocks looks exactly like one serving 5 MB/s near the
+ *    tip on the byte counter.
+ * 2. The byte floor (dead_weight_bps, 32 KB/s): calibrated for megabyte
+ *    blocks, so near the tip it is the binding rule -- and it must stay
+ *    live at every depth. 2026-09-02's fix (93fab72) joined the two with
+ *    AND to stop the false bans that rule caused early in the chain
+ *    (85 of 121 peers banned in eight minutes). That cured the false
+ *    positive and created the far worse false negative: in the first
+ *    ~150k blocks a peer delivering 6-9 blocks/s clears the block check
+ *    while trickling under 32 KB/s, so NOTHING could evict it. The
+ *    fresh-install run of 2026-09-04 sat at 77 KB/s aggregate with 22/22
+ *    workers under the byte floor and zero kills in 20 minutes -- 3 days
+ *    projected for a sync the byte-only rule finished in 4 hours.
+ *
+ * The correct shape of the 2026-09-02 lesson is an OR with a floor that is
+ * honest about depth: low bytes AND low blocks is clearly useless (early
+ * or late); low blocks ALONE is useless whatever the bytes; low bytes ALONE
+ * is useless once blocks are big -- and the byte floor alone never hurt a
+ * healthy early-chain peer that keeps its block rate, which is exactly the
+ * peer 93fab72 was protecting. Measured against a real 30k-block hole on
+ * the same datadir and peer pool: byte floor only 1.4 MB/s, current AND
+ * rule 77 KB/s dead, OR rule 1.3+ MB/s with the early-chain false-positive
+ * still avoided (a healthy tiny-block peer passes the block check and
+ * never trips the byte check -- the AND was never needed to protect it). */
 #define DLC_DEAD_WEIGHT_MIN_BLOCKS 10L
 static int dlc_dead_weight(double byte_rate, long blocks_this_tick){
-    return byte_rate >= 0.0 && byte_rate < g_cfg.dead_weight_bps && blocks_this_tick < DLC_DEAD_WEIGHT_MIN_BLOCKS;
+    if (byte_rate < 0.0) return 0;                                   /* no reading yet */
+    if (byte_rate < g_cfg.dead_weight_bps) return 1;                 /* byte floor: binding at every depth */
+    if (blocks_this_tick < DLC_DEAD_WEIGHT_MIN_BLOCKS
+        && byte_rate < 2.0 * g_cfg.dead_weight_bps) return 1;        /* marginal bytes AND stalled blocks */
+    return 0;
 }
 /* ---------------------------------------------------------------- VAL-5
  * The parent's median time past, read from the header store.
