@@ -23,17 +23,12 @@
  */
 #include <stdio.h>
 
-extern long long val_seq_min_height(unsigned long coin_height, unsigned seq);
-extern long long val_seq_min_time(unsigned long coin_mtp, unsigned seq);
-extern int       val_seq_locks_ok(long long min_height, long long min_time,
-                                  long height, unsigned long tip_mtp);
-
-/* the tx_verify.c / utxo_live.c link island needs this symbol */
-long mempool_resolve_confirmed_utxo(void* u, const unsigned char* t, unsigned long i,
-                                    unsigned long long* v, const unsigned char** s,
-                                    unsigned long* l){
-    (void)u;(void)t;(void)i;(void)v;(void)s;(void)l; return 0;
-}
+/* The arithmetic under test is header-only (static inline) so the block path
+ * and the mempool path share ONE definition without a common link island --
+ * see daemon/seqlocks.h. Including it is therefore the only way to reach it,
+ * and it also means this test compiles standalone: no daemon objects, no
+ * stub symbols, nothing that can drift from what the daemon actually runs. */
+#include "../daemon/seqlocks.h"
 
 static int fails = 0, checks = 0;
 static void ck(const char* w, long long got, long long want){

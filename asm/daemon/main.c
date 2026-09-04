@@ -38,6 +38,9 @@
 #include <stdbool.h>
 #include <fcntl.h>
 #include <sys/file.h>          /* DMN-1: flock() for the datadir lock */
+
+/* MEM-1: defined below, called from the tip-change hook above it. */
+static void mempool_refresh_seqlocks(void* store_buf, long now_tip);
 #include <sys/mman.h>
 #include "log_ts.h"
 #include "log_phase.h"
@@ -5595,6 +5598,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             /* keep mempool admission's maturity/flag anchor on the tip --
              * unconditionally, not only when a publisher is active */
             { extern void tx_accept_set_tip(long); tx_accept_set_tip(now_tip); }
+            mempool_refresh_seqlocks(store_buf, now_tip);   /* MEM-1 */
             last_seen_tip = now_tip;
         }
         /* Drain transactions staged by the serve children (and by this
@@ -6627,6 +6631,54 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
  * Called after the per-chain chdir, so ".lock" lands in <datadir>/<chain>,
  * which is the directory that actually gets written. */
 static int datadir_lock_fd = -1;
+/* ---------------------------------------------------------------- MEM-1
+ * Chain context for the mempool's finality rules, refreshed on every tip
+ * change beside tx_accept_set_tip.
+ *
+ * Core's PreChecks evaluates CheckFinalTxAtTip and CheckSequenceLocks against
+ * the NEXT block's height and the tip's median time past (BIP113). The policy
+ * layer cannot read headers or the UTXO set, so both are pushed in from here:
+ * the MTP through the same 11-header window pow_check_bits already relies on,
+ * and the prevout heights through a resolver that reads the live LSM.
+ *
+ * A transaction whose parent is still in the MEMPOOL has no confirmation
+ * height; mpol_add_core substitutes the next block's height for those, which
+ * is where such a parent would confirm. */
+extern int  utxo_live_median_time_past(long height, unsigned long* out);
+extern long utxo_live_lsm_get(const unsigned char txid_wire[32], unsigned int vout,
+                              unsigned long long* value, unsigned long* height,
+                              unsigned long* is_coinbase, const unsigned char** script,
+                              unsigned long* slen);
+static void* g_seq_store;
+static long mempool_seq_height(const unsigned char txid[32], unsigned long index,
+                               unsigned long long* out_height){
+    unsigned long long value = 0; unsigned long h = 0, cb = 0, sl = 0;
+    const unsigned char* spk = 0;
+    if (utxo_live_lsm_get(txid, (unsigned)index, &value, &h, &cb, &spk, &sl) != 1)
+        return 0;
+    *out_height = (unsigned long long)h;
+    return 1;
+}
+static void mempool_refresh_seqlocks(void* store_buf, long now_tip){
+    extern void mpool_policy_set_seqlocks(long, unsigned long, int,
+                                          long (*)(const unsigned char*, unsigned long,
+                                                   unsigned long long*));
+    g_seq_store = store_buf;
+    unsigned long mtp = 0;
+    if (!utxo_live_median_time_past(now_tip, &mtp)){
+        /* No readable header window: leave the rules UNCONFIGURED rather than
+         * enforce against a zero time, which would reject every transaction
+         * carrying a time-based nLockTime. */
+        mpool_policy_set_seqlocks(-1, 0, 0, 0);
+        return;
+    }
+    unsigned char bh[32]; int csv = 0;
+    { extern unsigned long long script_flags_for_block(unsigned long long, const unsigned char*);
+      memset(bh, 0, 32);
+      csv = (int)((script_flags_for_block((unsigned long long)(now_tip + 1), bh) >> 10) & 1ULL); }
+    mpool_policy_set_seqlocks(now_tip + 1, mtp, csv, mempool_seq_height);
+}
+
 static int datadir_lock_acquire(const char* effdir){
     datadir_lock_fd = open(".lock", O_RDWR|O_CREAT, 0600);
     if(datadir_lock_fd < 0){
