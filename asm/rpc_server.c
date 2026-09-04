@@ -12,6 +12,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <time.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <fcntl.h>
@@ -39,6 +41,21 @@
 
 /* ---- server state (single instance) ---- */
 static int  g_listen_fd = -1;
+
+/* DMN-6 (audit 2026-09-03): let a forked child drop the RPC listener.
+ *
+ * Every inbound serve child inherits it across fork(). After the parent exits
+ * -- `bitcoin-cli stop` outside systemd, or a crash -- the socket stays bound
+ * by those children, so the NEXT instance's rpc_server_start fails with
+ * "bind() failed". That failure is deliberately non-fatal, so the new node
+ * comes up with no RPC and no cookie: unstoppable by `stop`, and invisible to
+ * monitoring, until the last old child happens to die.
+ *
+ * The child has no business serving RPC, so it closes the descriptor
+ * outright. Called immediately after fork, beside the other listener closes. */
+void rpc_server_close_listener_in_child(void){
+    if (g_listen_fd >= 0){ close(g_listen_fd); g_listen_fd = -1; }
+}
 static volatile int g_run = 0;
 static pthread_t    g_thread;
 static const rpc_wallet* g_wallet;
@@ -486,7 +503,20 @@ static void handle_request(int cfd, const char* body, size_t blen) {
         "Content-Length: %ld\r\n"
         "\r\n",
         status, status_text(status), bodylen);
-    if (write_all(cfd, hdr, (size_t)hl) != 0) return;   /* peer gone: nothing to send the body to */
+    if (write_all(cfd, hdr, (size_t)hl) != 0) {
+        /* RPC-1 (audit 2026-09-03): this used to `return` -- leaking BOTH the
+         * client descriptor and respbody, which for getblock verbosity 2 is
+         * many megabytes. Every other exit in this function frees and closes.
+         *
+         * Reachable by any authenticated client: send a request and reset the
+         * connection, or simply never read a large reply so the 30s
+         * SO_SNDTIMEO fires. Loop that and the process runs out of
+         * descriptors -- at which point the RPC listener AND the P2P inbound
+         * listener in the same process both stop accepting. */
+        free(respbody);
+        close(cfd);
+        return;
+    }
     for (long off = 0; respbody && off < bodylen; ) {   /* full write, handles short writes */
         ssize_t wr = write(cfd, respbody + off, (size_t)(bodylen - off));
         if (wr <= 0) break;
@@ -691,7 +721,25 @@ static void* server_thread(void* arg) {
     while (g_run) {
         struct sockaddr_in cli; socklen_t cl = sizeof cli;
         int c = accept(g_listen_fd, (struct sockaddr*)&cli, &cl);
-        if (c < 0) continue;
+        if (c < 0) {
+            /* RPC-1: `continue` with no pause spun a core whenever accept
+             * kept failing -- and the failure that matters is EMFILE/ENFILE,
+             * where the condition persists until a descriptor is released, so
+             * the spin is unbounded. Back off briefly on the
+             * out-of-descriptors cases (and log once, since a silently
+             * degraded RPC listener is how this stays unnoticed); other
+             * errors are transient per-connection and retry immediately. */
+            if (errno == EMFILE || errno == ENFILE) {
+                static int said = 0;
+                if (!said++)
+                    fprintf(stderr, "[rpc] accept: out of file descriptors (%s) -- "
+                                    "backing off; the RPC listener is degraded\n",
+                            strerror(errno));
+                struct timespec ts = { 0, 50 * 1000 * 1000 };   /* 50 ms */
+                nanosleep(&ts, NULL);
+            }
+            continue;
+        }
         /* Core InitHTTPAllowList: the ACL is checked on every connection, not
          * inferred from the bind address. A node bound to 0.0.0.0 with a
          * narrow allow list must still refuse everyone else. */
