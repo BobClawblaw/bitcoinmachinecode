@@ -1197,6 +1197,8 @@ typedef struct {
     int bad_shape;               /* truncated (a 0-input tx cannot even be
                                     walked by the merkle pass either) */
     u64 in_count;
+    u64 out_count;               /* filled by the output walk the locktime
+                                    read depends on being correct */
     u32 locktime;                /* trailing 4 bytes (IsFinalTx, BIP68) */
     u32 version;                 /* BIP68's version>=2 gate */
     const u32* seqs; u32 nseqs;  /* per-input sequences (up to SEQ_CAP; a tx
@@ -1246,6 +1248,42 @@ static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
                                                     * never FALSE) */
         p += 4;                                    /* sequence */
     }
+    /* ---- the OUTPUT section.
+     *
+     * This walk used to jump straight from the inputs to the witness
+     * sections, skipping the outputs entirely (introduced with Phase 0.15 in
+     * the VAL-1/VAL-2 remediation, 2026-09-03). The wire order is
+     *   version | [marker flag] | n_in | inputs | n_out | outputs |
+     *   [witness] | locktime
+     * so omitting the outputs left `p` pointing at the output COUNT. For a
+     * NON-segwit transaction that made vi->locktime the first four bytes of
+     * the output section rather than the locktime. For a SEGWIT transaction
+     * the witness walk below then tried to decode the output section as
+     * witness stacks, which runs off the end and returns bad_shape -- and
+     * Phase 0.15 turns a bad_shape into "bad-txns-prevout-null" and REJECTS
+     * THE BLOCK. Every block containing a segwit transaction, i.e. every
+     * mainnet block since 481,824.
+     *
+     * Verified rather than reasoned: a real 223-byte mainnet segwit
+     * transaction from block 700,038 returned 0 from this function. No test
+     * caught it because nothing in the suite drives a real segwit block
+     * through apply_block_inner's Phase 0.15 -- the audit's own section 8
+     * observation ("the test suite pins happy paths") landing on the
+     * remediation for that same audit. tests/test_val_read_tx.c now does. */
+    {
+        u64 nout = utxo_walk_read_varint(p, end, &used);
+        if (!used){ vi->bad_shape=1; return 0; }
+        p += used; vi->out_count = nout;
+        for (u64 i = 0; i < nout; i++){
+            if ((u64)(end - p) < 8){ vi->bad_shape=1; return 0; }
+            p += 8;                                /* value */
+            u64 sl = utxo_walk_read_varint(p, end, &used);
+            if (!used){ vi->bad_shape=1; return 0; }
+            p += used;
+            if ((u64)(end - p) < sl){ vi->bad_shape=1; return 0; }
+            p += sl;
+        }
+    }
     /* segwit marker seen -> skip the witness sections (n_in stacks of
      * varint-count + varint-len items) before the trailing locktime.
      * tx_parse has ALREADY validated this exact structure (the tx passed
@@ -1269,6 +1307,16 @@ static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
     memcpy(&vi->locktime, p, 4);                   /* locktime */
     return 1;
 }
+/* Test seam for tests/test_val_read_tx.c. val_read_tx is static and is not
+ * reachable from a harness otherwise; exporting a thin alias (the same
+ * convention bitcoin_scriptverify.c's sv_checksig_export uses) lets the test
+ * drive the REAL function rather than a copy that could drift from it --
+ * which matters here, because a copy is exactly what would have kept passing
+ * while the real walk skipped the output section. */
+int val_read_tx_probe(const u8* tx, u64 txlen, val_txinfo_t* vi){
+    return val_read_tx(tx, txlen, vi);
+}
+
 /* CScript() << height, exactly Core's CScriptNum(h).serialize: OP_1..OP_16
  * for h<=16, else push-length + minimal little-endian bytes with the 0x00
  * sign pad. Returns the total byte length written to want. */
