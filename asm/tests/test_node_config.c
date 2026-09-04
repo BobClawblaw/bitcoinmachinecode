@@ -5,6 +5,7 @@
  * stalled a live sync on 2026-08-18. A typo must not be able to reproduce
  * that. */
 #include <stdio.h>
+#include <time.h>
 #include <string.h>
 #include <stdlib.h>
 #include "node_config.h"
@@ -479,6 +480,53 @@ int main(void){
     else { printf("FAIL: DMN-4 predicates\n"); failures++; }
 
     node_config_load("/nonexistent/reset.conf");
+
+    /* ---- DMN-9 (audit 2026-09-03): integer parsing wraps before clamping ----
+     *
+     * Every numeric key went through atoi, which truncates strtol's long to
+     * an int, so maxconnections=4294967496 wrapped to 200 -- a plausible
+     * value that passed the clamp meant to catch exactly this. And bantime
+     * was atol with only a `> 0` test: main.c computes time(NULL) + bantime,
+     * so a huge value wraps NEGATIVE and every automatic ban expires on the
+     * next check. That one is FAIL-OPEN -- banning quietly turns itself off.
+     *
+     * The controls are the wrapped values themselves: 4294967496 must not
+     * read as 200, and a saturating bantime must not read as something that
+     * makes time()+bantime negative. */
+    node_config_load("/nonexistent/reset.conf");
+    /* 4294967373 = 2^32 + 77, so atoi's truncation yields 77 -- an entirely
+     * legal value that passes the clamp. NOT the audit's own 4294967496,
+     * which wraps to exactly 200: that is also the DEFAULT, so "wrapped" and
+     * "rejected, default kept" are indistinguishable and the assertion would
+     * pass either way. (It did, on the first run of this test.) */
+    wr("dmn9_a.conf", "maxconnections=4294967373\n");
+    node_config_load("dmn9_a.conf");
+    if (g_cfg.max_connections != 77)
+        printf("PASS DMN-9: maxconnections=2^32+77 did not wrap to 77 (got %d)\n",
+               g_cfg.max_connections);
+    else { printf("FAIL DMN-9: maxconnections=2^32+77 wrapped to 77\n"); failures++; }
+
+    node_config_load("/nonexistent/reset.conf");
+    wr("dmn9_b.conf", "bantime=9223372036854775807\n");
+    node_config_load("dmn9_b.conf");
+    { long long until = (long long)time(NULL) + (long long)g_cfg.bantime;
+      if (g_cfg.bantime > 0 && until > (long long)time(NULL))
+          printf("PASS DMN-9: a saturating bantime still yields a FUTURE expiry (bantime=%ld)\n",
+                 (long)g_cfg.bantime);
+      else { printf("FAIL DMN-9: bantime=%ld makes the ban expire immediately (until=%lld)\n",
+                    (long)g_cfg.bantime, until); failures++; } }
+
+    node_config_load("/nonexistent/reset.conf");
+    wr("dmn9_c.conf", "bantime=3600\n");
+    node_config_load("dmn9_c.conf");
+    if (g_cfg.bantime == 3600) printf("PASS DMN-9: an ordinary bantime is untouched\n");
+    else { printf("FAIL DMN-9: bantime=3600 read as %ld\n", (long)g_cfg.bantime); failures++; }
+
+    node_config_load("/nonexistent/reset.conf");
+    wr("dmn9_d.conf", "maxconnections=64\n");
+    node_config_load("dmn9_d.conf");
+    if (g_cfg.max_connections == 64) printf("PASS DMN-9: an ordinary maxconnections is untouched\n");
+    else { printf("FAIL DMN-9: maxconnections=64 read as %d\n", g_cfg.max_connections); failures++; }
 
     printf("\n");
     node_config_log();

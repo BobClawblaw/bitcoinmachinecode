@@ -626,6 +626,48 @@ int main(void){
         ck("B gone (conflicted)", mpool_get(mp, B, &l) == NULL);
         ck("B's child gone WITH it", mpool_get(mp, Bchild, &l) == NULL); }
 
+    printf("\n== 5b: MEM-17 -- a confirmed parent stops counting as an ancestor ==\n");
+    /* remove_node cleared a child's parent ref but never fixed the child's
+     * anc_cnt/anc_bytes, and anc_cnt gates TRUC (limit 2, counting self).
+     * So: v3 P -> v3 C in the pool; a v3 grandchild G is a 3-deep chain and
+     * MUST be refused (that is the control -- it proves the limit is live).
+     * Then a block confirms P. Core: C now has 0 mempool ancestors, so G is
+     * fine. Here C still said anc_cnt == 2 and G stayed "TRUC-violation". */
+    RESET(0);   /* standardness ON: the TRUC rules live under !accept_nonstd */
+    { txout_t oS = { .v=1000000-500, .spk=SPK_WPKH, .spklen=22 };
+      u8 P[32], C[32], G[32];
+      static u8 ptx[256], gtx[256]; long plen, glen;
+      plen = mk(ptx, &(txin_t){ .tag=3, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+      ptx[0] = 3;                                          /* nVersion 3: TRUC */
+      tx_txid(P, ptx, plen, sc, sizeof sc);
+      ck("MEM-17 P (v3) in", mpool_policy_add(pol, st, mp, ptx, plen, P, ux) == 1);
+      oS.v = 1000000-500-500;
+      n = mk(tx, &(txin_t){ .previd=P, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+      tx[0] = 3; tx_txid(C, tx, n, sc, sizeof sc);
+      ck("MEM-17 C (v3, child of P) in", mpool_policy_add(pol, st, mp, tx, n, C, ux) == 1);
+      oS.v = 1000000-500-500-500;
+      glen = mk(gtx, &(txin_t){ .previd=C, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+      gtx[0] = 3; tx_txid(G, gtx, glen, sc, sizeof sc);
+      r = mpool_policy_add(pol, st, mp, gtx, glen, G, ux);
+      ck("MEM-17 control: G refused while P is still unconfirmed (3-deep v3 chain)", r == 0);
+      ckr("...as", pol, "TRUC-violation");
+
+      /* the block: coinbase + P */
+      static u8 blk[4096]; long bl = 0; memset(blk, 0, 80); bl = 80; blk[bl++] = 2;
+      { static u8 zero32[32];
+        txout_t oc = { .v=5000000000ULL, .spk=SPK_WPKH, .spklen=22 };
+        static const u8 ssc[1] = { 0x51 };
+        txin_t cb = { .previd=zero32, .idx=0xffffffffu, .seq=0xffffffffu, .ss=ssc, .sslen=1 };
+        bl += mk(blk+bl, &cb, 1, &oc, 1); }
+      memcpy(blk+bl, ptx, plen); bl += plen;
+      long rm = mpool_policy_block_connect(st, mp, blk, (unsigned long)bl);
+      ck("MEM-17 the block removed exactly P", rm == 1);
+      { unsigned long l; ck("MEM-17 C survives P's confirmation", mpool_get(mp, C, &l) != NULL); }
+
+      r = mpool_policy_add(pol, st, mp, gtx, glen, G, ux);
+      ck("MEM-17 G ACCEPTED once P has confirmed (Core: C has no unconfirmed ancestor)", r == 1);
+      if (r != 1) printf("      refused as: %s\n", mpool_policy_reason(pol)); }
+
       /* rolling decay: bump the floor, then time-travel the last-update
        * stamp back 25h (white-box poke at st+56; layout documented in the
        * policy header) -- after a block the floor must have decayed by
