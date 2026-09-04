@@ -2501,8 +2501,44 @@ int utxo_live_init(const char* dir){
     long r = have_prior_state
         ? utxo_lsm_reload(&g_utxo_lst, g_utxo_table)
         : utxo_lsm_init(&g_utxo_lst);
-    int ok = have_prior_state ? (r != -1) : (r == 1);
-    if (!ok) { fprintf(stderr, "[utxo_live] utxo_lsm_%s failed\n", have_prior_state ? "reload" : "init"); return 0; }
+    /* UTX-2 (audit 2026-09-03): ANY negative reload is fatal, not just -1.
+     *
+     * utxo_store_reload returns -2 when the WAL replay hits utxo_put == 2 --
+     * the memtable is full -- and it stops there, holding only the records up
+     * to the fill point. utxo_lsm_reload propagates that -2 unchanged. This
+     * check tested `r != -1`, so -2 counted as SUCCESS and was then logged as
+     * a plausible "live=N".
+     *
+     * What followed made the loss permanent rather than merely wrong. The
+     * memtable is at or above fill_threshold, so the very next utxo_lsm_put
+     * -- the first block's coinbase, or a ghost-rollback restore -- runs
+     * mac_flush immediately, which writes the TRUNCATED memtable to a run,
+     * publishes the manifest, and ftruncates the WAL. Every record past the
+     * fill point is then gone from the only place it existed, and later
+     * blocks spending those outputs are rejected as "missing UTXO" forever:
+     * classified as a consensus reject, retried from the checkpoint, never
+     * halted. The audit reproduced it -- 300 WAL records into a 64-slot
+     * table returned -2 with a count of 64.
+     *
+     * The window is real: a bulk catch-up killed mid-flight leaves a large
+     * WAL that a steady-state-sized boot cannot hold. Refusing to start is
+     * the only safe answer, so the message names the two ways out rather than
+     * leaving an operator to guess. */
+    int ok = have_prior_state ? (r >= 0) : (r == 1);
+    if (!ok) {
+        fprintf(stderr, "[utxo_live] utxo_lsm_%s failed (r=%ld)\n",
+                have_prior_state ? "reload" : "init", r);
+        if (have_prior_state && r == -2)
+            fprintf(stderr,
+                "[utxo_live] FATAL: the WAL tail does not fit this memtable "
+                "(utxo_store_reload hit a full table and stopped).\n"
+                "[utxo_live]   Starting anyway would flush the TRUNCATED set "
+                "and ftruncate the WAL, losing every record past the fill "
+                "point permanently.\n"
+                "[utxo_live]   Fix: re-run with bulk sizing so the whole tail "
+                "fits, or drain the tail first with daemon/flush_wal_tail.\n");
+        return 0;
+    }
 
     /* A reloaded manifest can already be at or near UTXO_LIVE_MANIFEST_CAP --
      * e.g. a batch-scale seed (build_utxo.c, much larger manifest_cap) can
