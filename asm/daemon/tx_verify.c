@@ -236,13 +236,36 @@ typedef struct {
 } txv_rawin_t;
 static txv_rawin_t g_txv_in[TXV_MAX_INPUTS];
 
+/* ---- VAL-10 / SER-3 (audit 2026-09-03): CANONICAL CompactSize ----
+ *
+ * Core's ReadCompactSize (serialize.h) throws "non-canonical
+ * ReadCompactSize()" when a value is encoded in a wider form than it needs,
+ * and "ReadCompactSize(): size too large" above MAX_SIZE (0x02000000). Every
+ * decoder here accepted `fd 01 00` for 1, so a block containing such a
+ * transaction parsed cleanly HERE and is undeserializable to every Core node
+ * on the network -- and since txids are computed over the verbatim bytes, the
+ * merkle root still matches, so nothing else caught it. A miner producing one
+ * would split this node onto a chain no one else can follow.
+ *
+ * The minimum a width may encode: 0xfd for the 3-byte form, 0x10000 for the
+ * 5-byte form, 0x100000000 for the 9-byte form. Nothing valid is lost --
+ * a canonical encoder never emits the wider form -- and nothing already in
+ * the archive can be affected, because a non-canonical transaction could
+ * never have been relayed to us by a Core node in the first place. */
+#define TXV_CS_MAX_SIZE 0x02000000ULL
 static u64 txv_rd_cs(const u8** p, const u8* end, int* ok){
     if (*p >= end) { *ok = 0; return 0; }
     const u8* b = *p; u8 f = b[0];
     if (f < 0xfd) { *p = b+1; return f; }
-    if (f == 0xfd){ if (b+3>end){*ok=0;return 0;} u64 v=b[1]|((u64)b[2]<<8); *p=b+3; return v; }
-    if (f == 0xfe){ if (b+5>end){*ok=0;return 0;} u64 v=0; for(int i=0;i<4;i++) v|=(u64)b[1+i]<<(8*i); *p=b+5; return v; }
-    if (b+9>end){*ok=0;return 0;} u64 v=0; for(int i=0;i<8;i++) v|=(u64)b[1+i]<<(8*i); *p=b+9; return v;
+    if (f == 0xfd){ if (b+3>end){*ok=0;return 0;} u64 v=b[1]|((u64)b[2]<<8);
+                    if (v < 0xfdULL){*ok=0;return 0;}                       /* non-canonical */
+                    *p=b+3; if (v > TXV_CS_MAX_SIZE){*ok=0;return 0;} return v; }
+    if (f == 0xfe){ if (b+5>end){*ok=0;return 0;} u64 v=0; for(int i=0;i<4;i++) v|=(u64)b[1+i]<<(8*i);
+                    if (v <= 0xffffULL){*ok=0;return 0;}                    /* non-canonical */
+                    *p=b+5; if (v > TXV_CS_MAX_SIZE){*ok=0;return 0;} return v; }
+    if (b+9>end){*ok=0;return 0;} u64 v=0; for(int i=0;i<8;i++) v|=(u64)b[1+i]<<(8*i);
+    if (v <= 0xffffffffULL){*ok=0;return 0;}                                /* non-canonical */
+    *p=b+9; if (v > TXV_CS_MAX_SIZE){*ok=0;return 0;} return v;
 }
 
 /* Witness-item pool: (ptr-into-tx, len) pairs for every input's stack, so an

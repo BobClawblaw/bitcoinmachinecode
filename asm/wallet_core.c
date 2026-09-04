@@ -1212,8 +1212,19 @@ int  wallet_mnemonic_generate(char out[256]) {
 }
 
 /* Derive the 64-byte BIP39 seed from a mnemonic + optional passphrase. */
+/* CRY-4 (audit 2026-09-03): the passphrase has a hard limit, because the
+ * BIP39 salt buffer does. bip39_mnemonic_to_seed now refuses anything longer
+ * rather than writing past m39_salt; this mirrors the bound in C so callers
+ * that check only this function's return still get the right answer, and so
+ * the limit is visible to anyone reading the wallet API rather than only to
+ * someone reading the assembly. 504 is the assembly's real capacity, not a
+ * smaller round number: a shorter limit would make a wallet whose passphrase
+ * is longer than the new limit but shorter than the old capacity permanently
+ * unopenable. */
+#define WALLET_MAX_PASSPHRASE 504
 int  wallet_mnemonic_seed(unsigned char seed[64], const char* mn,
                           const char* pass, long passlen) {
+    if (passlen < 0 || passlen > WALLET_MAX_PASSPHRASE) return 0;
     return bip39_mnemonic_to_seed(seed, mn, pass, passlen);
 }
 

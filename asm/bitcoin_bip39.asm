@@ -729,6 +729,28 @@ bip39_mnemonic_to_seed:
     mov  [rbp-0x20], rdx             ; passphrase (may be NULL)
     mov  [rbp-0x28], rcx             ; passlen
 
+    ; ---- CRY-4 (audit 2026-09-03): BOUND THE PASSPHRASE ----
+    ;
+    ; The salt is built as "mnemonic" || passphrase into m39_salt, which is
+    ; 512 bytes -- so a passphrase over 504 bytes wrote past it into m39_msg,
+    ; and the copy had no bound at all. Reachable without any RPC: the wallet
+    ; store reads BMC_WALLET_PASS with strlen and daemon/wallet_cli.c takes
+    ; the passphrase as a command-line argument, neither of which was capped.
+    ; (hmac_sha512's own `tmp` scratch has 1032 bytes of room for the message,
+    ; so THIS buffer is the one that goes first.)
+    ;
+    ; 504 is the real capacity, not a smaller round number: anything that
+    ; derived a seed correctly before must still derive the SAME seed, or a
+    ; wallet becomes unopenable. Everything past it produced corruption, and
+    ; now produces a clean 0.
+    ;
+    ; A negative length is refused for the same reason -- the copy loop's
+    ; bound is a signed compare.
+    cmp  rcx, 0
+    jl   .b39s_toolong
+    cmp  rcx, 504
+    jg   .b39s_toolong
+
     ; ---- mnemonic length (HMAC key) ----
     mov  rdi, rsi
     call bip39_strlen
@@ -865,6 +887,10 @@ bip39_mnemonic_to_seed:
     jnz  .se
 
     mov  eax, 1
+    jmp  .b39s_ret
+.b39s_toolong:
+    xor  eax, eax                    ; CRY-4: passphrase over m39_salt capacity
+.b39s_ret:
     add  rsp, 0x40
     pop  rbp
     pop  r15

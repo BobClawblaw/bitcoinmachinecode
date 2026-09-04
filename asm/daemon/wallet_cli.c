@@ -535,7 +535,14 @@ static int seed_address(const char* mn, const char* pass, char* addr, int cap,
     if (nw <= 0) return 0;
     unsigned char seed[64];
     long pl = pass ? (long)strlen(pass) : 0;
-    wallet_mnemonic_seed(seed, mn, pass, pl);
+    /* CRY-4 (audit 2026-09-03): the passphrase arrives here as a command-line
+     * argument with no cap. It used to be copied into the BIP39 salt buffer
+     * unbounded; wallet_mnemonic_seed now refuses an over-long one, and its
+     * return has to be checked or `seed` is uninitialised stack. */
+    if (wallet_mnemonic_seed(seed, mn, pass, pl) != 1){
+        fprintf(stderr, "wallet: passphrase too long (limit 504 bytes)\n");
+        return 0;
+    }
     if (seed_out) memcpy(seed_out, seed, 64);
     return wallet_seed_bip44_address(addr, seed) ? 1 : 0;
 }

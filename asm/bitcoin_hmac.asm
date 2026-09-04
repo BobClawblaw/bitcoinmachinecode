@@ -181,6 +181,35 @@ hmac_sha512:
     pop  rsi
     pop  rdi
 
+    ; ---- CRY-4 (audit 2026-09-03): zeroise the secret-derived scratch ----
+    ;
+    ; kpad holds the padded HMAC KEY -- a BIP32 parent chain code on the
+    ; derivation path, the mnemonic itself under BIP39's PBKDF2 -- and
+    ; tmp[192..255] holds the inner digest. Both are .bss, so both survived
+    ; for the lifetime of the process, and any memory-disclosure bug
+    ; elsewhere in the daemon read them straight out. Core's equivalents live
+    ; in the CHMAC_SHA512 object and go through memory_cleanse.
+    ;
+    ; Only kpad and the key-block prefix of tmp are cleared. The rest of tmp
+    ; is message bytes, which are not secret here, and clearing the whole
+    ; 1160 bytes on every HMAC would cost real time in PBKDF2's 2,048
+    ; iterations. All registers used are caller-saved and already dead.
+    lea  rdi, [kpad]
+    xor  eax, eax
+    mov  rcx, 128
+.zk:
+    mov  byte [rdi], al
+    inc  rdi
+    dec  rcx
+    jnz  .zk
+    lea  rdi, [tmp]
+    mov  rcx, 256                    ; key block (128) + stashed inner digest
+.zt:
+    mov  byte [rdi], al
+    inc  rdi
+    dec  rcx
+    jnz  .zt
+
     add  rsp, 0x80
     pop  r15
     pop  r14
