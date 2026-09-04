@@ -38,6 +38,14 @@ typedef struct {
     volatile int              relaytxes;
     volatile unsigned         perms;
     volatile int              pid;
+    /* RPC-3 (audit 2026-09-03): the id getpeerinfo publishes and
+     * disconnectnode keys on. Core's NodeId is unique for the life of the
+     * process and never reused; getpeerinfo used to report a COUNTER over
+     * live slots while the worker matched the raw outbound leg index, so the
+     * two agreed only while every slot below was occupied. Assigned from
+     * next_nodeid at slot claim by both the worker (outbound) and each
+     * inbound child. */
+    volatile long long        nodeid;
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
@@ -87,6 +95,11 @@ typedef struct {
     volatile long long tip_height;   /* current chain tip    (download worker) */
     volatile long long start_time;   /* node start, unix secs (parent, once)   */
     rpc_peer_t         peers[RPC_MAX_PEERS];  /* outbound peer table (worker)   */
+    /* RPC-3: monotonic source for rpc_peer_t.nodeid. Bumped with an atomic
+     * fetch-and-add because inbound children and the worker claim slots
+     * concurrently in separate processes sharing this mapping. Starts at 0
+     * so the first peer is id 0, as Core's does. */
+    volatile long long next_nodeid;
 
     /* sendrawtransaction submission channel (parent RPC thread -> download
      * worker). The parent stages one tx at a time under g_submit_lock: fill
