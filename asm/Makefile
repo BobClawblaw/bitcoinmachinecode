@@ -615,10 +615,6 @@ tests/test_tx_bounds_fuzz: tests/test_tx_bounds_fuzz.o bitcoin_tx.o bitcoin_hash
 # diff_target guard-page bounds + the armed powLimit.
 tests/test_pow_check: tests/test_pow_check.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(CFLAGS) -o $@ $^ $(LDLIBS)
-# test_scr5_spkrun -- SCR-5 (audit 2026-09-03): the BIP341 spks run with a
-# >= 253-byte co-input, pinned against validation/scr5_spkrun_oracle.py.
-tests/test_scr5_spkrun: tests/test_scr5_spkrun.c $(TAPSIGHASHOBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_scr5_spkrun.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o,$(TAPSIGHASHOBJS))
 # test_scr7_cms_bounds -- SCR-7 (audit 2026-09-03): OP_CHECKMULTISIG's
 # below-stack reads, proven against a guard page under main_elems.
 tests/test_scr7_cms_bounds: tests/test_scr7_cms_bounds.o bitcoin_interp.o bitcoin_scriptcodec.o sha256.o sha1.o ripemd160.o bitcoin_hash.o bitcoin_sighash.o
@@ -1923,6 +1919,18 @@ TAPSIGHASHOBJS := bitcoin_taproot_sighash.c secp256k1_schnorr.o secp256k1_taproo
     bitcoin_interp.o bitcoin_scriptcodec.o ripemd160.o bitcoin_hash.o sha1.o \
     bitcoin_sighash.o \
     $(TAPRIMSOBJS)
+
+# NOTE: this rule must sit AFTER TAPSIGHASHOBJS is defined. Make expands a
+# PREREQUISITE list immediately when the rule is read (recipes expand
+# lazily), so placed earlier the prerequisites collapsed to just the .c file:
+# the test linked correctly but never rebuilt when any of the 17 objects it
+# links changed, and it could run stale against a changed interpreter. This
+# is what prereq-check reports as OBJ-NOT-PREREQ, and those 17 findings were
+# blocking `make test` entirely -- prereq-check is the gate's first target.
+# test_scr5_spkrun -- SCR-5 (audit 2026-09-03): the BIP341 spks run with a
+# >= 253-byte co-input, pinned against validation/scr5_spkrun_oracle.py.
+tests/test_scr5_spkrun: tests/test_scr5_spkrun.c $(TAPSIGHASHOBJS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_scr5_spkrun.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o,$(TAPSIGHASHOBJS))
 tests/test_taproot_sighash: tests/test_taproot_sighash.c tests/taproot_spend.h tests/taproot_vec.h $(TAPSIGHASHOBJS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_taproot_sighash.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o,$(TAPSIGHASHOBJS))
 
