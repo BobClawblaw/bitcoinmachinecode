@@ -1,26 +1,26 @@
 {
- "spends": 1670,
- "accept_ok": 1670,
+ "spends": 253,
+ "accept_ok": 253,
  "both_reject": 0,
- "muts": 10019,
- "mut_agree": 10019,
- "mut_both_accept": 543,
- "engine_fail": 1,
+ "muts": 2024,
+ "mut_agree": 2024,
+ "mut_both_accept": 133,
+ "engine_fail": 0,
  "skipped_unsupported": 0,
  "skipped_detail": {},
  "accept_div": [],
  "mut_div": [],
  "false_accept": [],
  "by_epoch": {
-  "pre-bip16": 93,
-  "bip16-dersig": 318,
-  "dersig-csv": 307,
-  "csv-segwit": 320,
-  "segwit-taproot": 312,
-  "taproot-tip": 320
+  "pre-bip16": 21,
+  "bip16-dersig": 48,
+  "dersig-csv": 44,
+  "csv-segwit": 48,
+  "segwit-taproot": 44,
+  "taproot-tip": 48
  },
  "skipped_v0_witness": 0,
- "elapsed": 41.4,
- "tip": 965323,
- "seed": 20260825
+ "elapsed": 17.6,
+ "tip": 965408,
+ "seed": 20260904
 }

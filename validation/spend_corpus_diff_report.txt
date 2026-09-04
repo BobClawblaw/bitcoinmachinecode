@@ -1,12 +1,12 @@
 Differential SCRIPT-EXECUTION corpus vs Core
-generated: 2026-09-03T14:00:08Z  tip: 965323  elapsed: 41.4s  seed: 20260825
+generated: 2026-09-04T01:23:09Z  tip: 965408  elapsed: 17.6s  seed: 20260904
 
-spends: 1670 (accept-parity ok 1670, both-reject 0)
-mutations: 10019 (agree 10019, did-not-flip 543)
-by epoch: {"pre-bip16": 93, "bip16-dersig": 318, "dersig-csv": 307, "csv-segwit": 320, "segwit-taproot": 312, "taproot-tip": 320}
+spends: 253 (accept-parity ok 253, both-reject 0)
+mutations: 2024 (agree 2024, did-not-flip 133)
+by epoch: {"pre-bip16": 21, "bip16-dersig": 48, "dersig-csv": 44, "csv-segwit": 48, "segwit-taproot": 44, "taproot-tip": 48}
 routing: v1/taproot -> TAPVERIFY both sides;
          v0 (native + P2SH-wrapped) -> Core TAPVERIFY vs ASM WITVERIFY;
          pure non-witness -> VERIFY both sides.
-engine failures: 1
+engine failures: 0
 
 ZERO DIVERGENCES across real mainnet spends and their mutations.
