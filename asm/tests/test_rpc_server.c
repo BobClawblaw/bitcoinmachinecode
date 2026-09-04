@@ -467,6 +467,51 @@ int main(void) {
         close(sfd);
     }
 
+    /* ---- RPC-5 (audit 2026-09-03): only a real getblocktemplate longpolls,
+     * and the waiters are bounded.
+     *
+     * The path used to be chosen by searching the RAW BODY for the substrings
+     * "longpollid" and "getblocktemplate" before any parsing, so ANY method
+     * carrying those bytes reached it -- and the path returns before the
+     * worker slot is released, so -rpcthreads and -rpcworkqueue do not bound
+     * it: a detached 64 MiB-stack thread and an fd per request, held up to
+     * 60 s. Thousands exhaust `ulimit -u`, and then fork() for inbound P2P
+     * fails.
+     *
+     * NOT tested over HTTP, deliberately. A decoy request answers identically
+     * whether or not it was handled off-thread, because the cost is the SPAWN
+     * and not the latency -- a timing assertion written first here PASSED with
+     * the fix reverted. The two mechanisms are therefore exercised directly. */
+    {
+        extern int rpc_lp_is_gbt(const char* body, unsigned long blen);
+        extern int rpc_lp_try_take(void);
+        extern void rpc_lp_release(void);
+        extern int rpc_lp_max_waiters(void);
+        extern int rpc_lp_waiters_inflight(void);
+
+        const char* decoy =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getbestblockhash\",\"params\":[],"
+            "\"decoy\":{\"longpollid\":\"aa\",\"also\":\"getblocktemplate\"}}";
+        const char* real =
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getblocktemplate\","
+            "\"params\":[{\"longpollid\":\"aa\"}]}";
+        ck("RPC-5 a decoy body carrying both tokens is NOT a getblocktemplate",
+           rpc_lp_is_gbt(decoy, strlen(decoy)) == 0);
+        ck("RPC-5 a real getblocktemplate still is",
+           rpc_lp_is_gbt(real, strlen(real)) == 1);
+
+        /* the cap: exactly LP_MAX_WAITERS may be in flight, then no more */
+        int cap = rpc_lp_max_waiters();
+        int got = 0;
+        for (int i = 0; i < cap + 8; i++) if (rpc_lp_try_take()) got++;
+        ck("RPC-5 the waiter count is bounded, not unbounded", got == cap);
+        ck("RPC-5   and the counter agrees", rpc_lp_waiters_inflight() == cap);
+        rpc_lp_release();
+        ck("RPC-5 releasing one frees exactly one slot", rpc_lp_try_take() == 1);
+        for (int i = 0; i < cap; i++) rpc_lp_release();
+        ck("RPC-5 all slots return when the waiters finish", rpc_lp_waiters_inflight() == 0);
+    }
+
     /* ---- teardown ---- */
     kill(srv, SIGTERM);
     waitpid(srv, NULL, 0);
