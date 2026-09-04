@@ -82,9 +82,45 @@ extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
 
 /* ---------------- limits --------------------------------------------------- */
 #define MPOL_MAX_IN     2048      /* inputs walked per tx (matches MV_MAX_IN) */
-#define MPOL_MAX_PARENTS  24      /* direct in-pool parents tracked per node.
-                                   * Core allows up to limitancestorcount(25)-1
-                                   * distinct direct parents; 24 covers it. */
+/* ---- MEM-3 (audit 2026-09-03): parents are stored OUT OF LINE ------------
+ *
+ * The cap used to be 24, inline, and mpol_collect_parents silently dropped
+ * everything past it. parent[] is the ONLY record of the graph -- descendants
+ * are discovered by walking it (collect_descendant_txids, the cluster walk,
+ * remove_node) -- so a dropped parent did not exist as far as every later
+ * operation was concerned, and anc_cnt, computed from the truncated list,
+ * under-reported so the ancestor and cluster limits both passed. Broadcast 30
+ * low-feerate parents and a child spending all 30, RBF-replace the 30th, and
+ * the child stayed in the pool spending an output the replacement had
+ * conflicted -- with getblocktemplate happily including it, because every
+ * REGISTERED ancestor was present.
+ *
+ * The comment justifying 24 was itself the error: it cites Core's pre-v31
+ * 25-ancestor CHAIN limit, but this node implements v31 CLUSTER limits (64
+ * transactions), under which a child of 63 parents forming a 64-cluster is
+ * legal and Core accepts it. So the cap has to be 63, not 24.
+ *
+ * Storing 63 inline was measured, not estimated: mpol_node grows 184 -> 336
+ * bytes, i.e. +152 MB at the default 1,048,576-node sizing, in a MAP_SHARED
+ * region several processes map. So the list is SPLIT: the first
+ * MPOL_INLINE_PARENTS live in the node, and the rare node that needs more
+ * borrows a fixed-size block from a shared overflow pool. Real transactions
+ * have one to three in-pool parents, so the pool is almost never touched.
+ *
+ * The node gets SMALLER as a result -- parent[24] (96 bytes) becomes
+ * parent[8] plus a 4-byte block index, 60 bytes less per node, about -60 MB
+ * at the default sizing -- and the pool costs a few MB. Net: less memory than
+ * before AND the cap Core actually permits.
+ *
+ * When the pool is exhausted the transaction is REJECTED
+ * ("too-long-mempool-chain"), never truncated. That is the invariant the
+ * whole finding is about: either every parent link is recorded, or the
+ * transaction does not enter the pool. */
+#define MPOL_INLINE_PARENTS 8
+#define MPOL_MAX_PARENTS   63     /* v31 cluster limit: a 64-node cluster has
+                                   * at most 63 distinct direct parents */
+#define MPOL_OVF_SLOTS     (MPOL_MAX_PARENTS - MPOL_INLINE_PARENTS)
+#define MPOL_OVF_NONE      0xFFFFFFFFu
 #define MPOL_MAX_REPLACEMENTS 100 /* Core MAX_REPLACEMENT_CANDIDATES */
 
 /* ---- BIP431 TRUC (topologically restricted until confirmation) ------------
@@ -180,7 +216,9 @@ typedef struct {
  *   +48 rolling minfee floor, sat/kvB     +56 floor last-update (unix s)
  *   +64 pool raw bytes currently stored   +72 pool blob capacity
  *   +80 flags: bit0 = a block has connected since the floor last rose
- *              (Core blockSinceLastRollingFeeBump; decay gate)          */
+ *              (Core blockSinceLastRollingFeeBump; decay gate)
+ *   +88 MEM-3 overflow free-list head (block index, MPOL_OVF_NONE = empty)
+ *   +92 MEM-3 overflow block count                                      */
 typedef struct { unsigned char txid[32]; uint32_t index; uint32_t _p; uint64_t value; } mpol_out;
 typedef struct { unsigned char prev[32]; uint32_t index; uint32_t claimer; } mpol_claim;
 typedef struct {
@@ -196,7 +234,13 @@ typedef struct {
                                   (mining-polish graft at the 2026-08-27
                                   policy-parity merge)                       */
     uint32_t n_parents;
-    uint32_t parent[MPOL_MAX_PARENTS];
+    /* MEM-3: the first MPOL_INLINE_PARENTS entries live here; entry k >=
+     * MPOL_INLINE_PARENTS lives at slot (k - MPOL_INLINE_PARENTS) of the
+     * overflow block `povf`. Read them through mpol_par_at / mpol_par_set --
+     * never touch parent[] directly, or the k >= 8 entries become invisible
+     * exactly the way the old truncation made them invisible. */
+    uint32_t parent[MPOL_INLINE_PARENTS];
+    uint32_t povf;             /* overflow block index, or MPOL_OVF_NONE */
     uint32_t version;          /* nVersion. BIP431 TRUC rules turn on a
                                   PARENT's version, so it must outlive the
                                   parent's own acceptance -- there is nowhere
@@ -215,6 +259,77 @@ static mpol_claim* mpol_claims_base(void* st){ size_t cap = *(uint32_t*)((char*)
 static mpol_node*  mpol_nodes_base(void* st){ size_t cap = *(uint32_t*)((char*)st+4);
     return (mpol_node*)((char*)st + MPOL_HDR + 4*cap + cap*sizeof(mpol_out)
                         + cap*sizeof(mpol_claim)); }
+
+/* ---- MEM-3 overflow pool ------------------------------------------------
+ *
+ * Appended AFTER the node array, so every existing base pointer keeps its
+ * arithmetic. How many blocks: one per 64 nodes plus a floor of 64, because
+ * a node needs one only when it has more than MPOL_INLINE_PARENTS in-pool
+ * parents.
+ *
+ * One block per EIGHT nodes, plus a floor of 64. That is already a wildly
+ * pessimistic ratio -- it says one transaction in eight has more than eight
+ * unconfirmed parents, where real pools are dominated by one- and two-parent
+ * spends -- and it is chosen that way because exhaustion, while handled
+ * safely (a clean reject, never a truncated list), is the one outcome that
+ * costs a legitimate transaction its place in the pool. The cluster limit
+ * does NOT bound this on its own: many-parent transactions can sit in many
+ * different clusters, so the count is bounded by n, not by 64.
+ *
+ * At the default 1,048,576-node sizing that is 131,136 blocks = 27.5 MB,
+ * against the 64 MB the shrunken node gives back: still a net saving on the
+ * layout it replaces, and 156 MB less than storing 63 parents inline. */
+static uint32_t mpol_ovf_nblocks_for(unsigned n){ return n/8u + 64u; }
+static uint32_t mpol_ovf_nblocks(void* st){ return *(uint32_t*)((char*)st+92); }
+static uint32_t* mpol_ovf_base(void* st){ size_t cap = *(uint32_t*)((char*)st+4);
+    return (uint32_t*)((char*)st + MPOL_HDR + 4*cap + cap*sizeof(mpol_out)
+                       + cap*sizeof(mpol_claim) + cap*sizeof(mpol_node)); }
+static uint32_t* mpol_ovf_block(void* st, uint32_t blk){
+    /* Bounds-checked because this index comes out of a MAP_SHARED region that
+     * several processes write: a corrupted or stale povf must not become an
+     * out-of-region pointer. NULL makes every caller fail closed. */
+    if (blk >= mpol_ovf_nblocks(st)) return 0;
+    return mpol_ovf_base(st) + (size_t)blk * MPOL_OVF_SLOTS; }
+
+/* Entry k of a node's parent list, wherever it lives. */
+static uint32_t mpol_par_at(void* st, const mpol_node* nd, uint32_t k){
+    if (k < MPOL_INLINE_PARENTS) return nd->parent[k];
+    if (nd->povf == MPOL_OVF_NONE) return MPOL_OVF_NONE;   /* cannot happen; fail closed */
+    { const uint32_t* b = mpol_ovf_block(st, nd->povf);
+      if (!b || k - MPOL_INLINE_PARENTS >= MPOL_OVF_SLOTS) return MPOL_OVF_NONE;
+      return b[k - MPOL_INLINE_PARENTS]; }
+}
+static void mpol_par_set(void* st, mpol_node* nd, uint32_t k, uint32_t v){
+    if (k < MPOL_INLINE_PARENTS){ nd->parent[k] = v; return; }
+    if (nd->povf == MPOL_OVF_NONE) return;
+    { uint32_t* b = mpol_ovf_block(st, nd->povf);
+      if (!b || k - MPOL_INLINE_PARENTS >= MPOL_OVF_SLOTS) return;
+      b[k - MPOL_INLINE_PARENTS] = v; }
+}
+/* Claim a block for a node that needs more than the inline slots. 1 on
+ * success, 0 when the pool is exhausted -- the caller then REFUSES the
+ * transaction rather than recording a short list. The free list threads
+ * through slot 0 of each free block. */
+static int mpol_par_reserve(void* st, mpol_node* nd, uint32_t n_par){
+    if (n_par <= MPOL_INLINE_PARENTS) return 1;
+    if (nd->povf != MPOL_OVF_NONE) return 1;
+    uint32_t* head = (uint32_t*)((char*)st+88);
+    if (*head == MPOL_OVF_NONE) return 0;
+    uint32_t blk = *head;
+    uint32_t* b = mpol_ovf_block(st, blk);
+    if (!b){ *head = MPOL_OVF_NONE; return 0; }   /* corrupt head: stop, do not truncate */
+    *head = b[0];
+    nd->povf = blk;
+    for (uint32_t i = 0; i < MPOL_OVF_SLOTS; i++) b[i] = MPOL_OVF_NONE;
+    return 1;
+}
+static void mpol_par_release(void* st, mpol_node* nd){
+    if (nd->povf == MPOL_OVF_NONE) return;
+    uint32_t* head = (uint32_t*)((char*)st+88);
+    uint32_t* b = mpol_ovf_block(st, nd->povf);
+    if (b){ b[0] = *head; *head = nd->povf; }
+    nd->povf = MPOL_OVF_NONE;
+}
 
 /* an optional "forget this txid" callback (daemon/mempool_cfg.c clears its
  * arrival-time table with it); NULL in the standalone tests */
@@ -237,13 +352,22 @@ void mpool_policy_set_forget_cb(void (*fn)(const unsigned char*)){ g_forget_cb =
 
 size_t mpool_policy_state_size(unsigned n){
     return MPOL_HDR + (size_t)4*n + (size_t)n*sizeof(mpol_out)
-           + (size_t)n*sizeof(mpol_claim) + (size_t)n*sizeof(mpol_node);
+           + (size_t)n*sizeof(mpol_claim) + (size_t)n*sizeof(mpol_node)
+           + (size_t)mpol_ovf_nblocks_for(n) * MPOL_OVF_SLOTS * sizeof(uint32_t);
 }
 
 void mpool_policy_state_init(void* st, unsigned n){
     memset(st, 0, mpool_policy_state_size(n));
     *(uint32_t*)st = MPOL_MAGIC;
     *(uint32_t*)((char*)st+4) = n;
+    /* MEM-3: thread the overflow free list. cap must be set FIRST -- every
+     * base pointer is computed from it. A zeroed header would otherwise mean
+     * "block 0 is free and its next is block 0", an instant cycle. */
+    { uint32_t nb = mpol_ovf_nblocks_for(n);
+      *(uint32_t*)((char*)st+92) = nb;
+      *(uint32_t*)((char*)st+88) = nb ? 0u : MPOL_OVF_NONE;
+      for (uint32_t i = 0; i < nb; i++)
+          mpol_ovf_block(st, i)[0] = (i + 1 < nb) ? (i + 1) : MPOL_OVF_NONE; }
 }
 
 void mpool_policy_init(mpol_cfg* pol, uint64_t relay_fee_rate,
@@ -595,34 +719,22 @@ static int find_node(void* st, const unsigned char txid[32]){
 
 /* Collect the DISTINCT in-pool parents of a transaction.
  *
- * MEM-3 (audit 2026-09-03) is that this list is CAPPED at MPOL_MAX_PARENTS
- * (24) and the surplus is dropped silently, while descendants are discovered
- * only through parent[]. A transaction with 30 in-pool parents is accepted
- * linked to 24 of them; replace, evict or expire the 30th and
- * collect_descendant_txids finds no child, so the child stays in the pool
- * spending a now-conflicted output and getblocktemplate includes it.
+ * MEM-3 (audit 2026-09-03) was that this list was capped at 24 and the
+ * surplus dropped SILENTLY, while descendants are discovered only through
+ * parent[]. A transaction with 30 in-pool parents was accepted linked to 24
+ * of them; replace, evict or expire the 30th and collect_descendant_txids
+ * found no child, so the child stayed in the pool spending a now-conflicted
+ * output and getblocktemplate included it.
  *
- * IT IS NOT FIXED HERE, and the reason is worth recording because the audit's
- * first suggested fix -- "reject when a tx has more in-pool parents than can
- * be recorded (Core's pre-v31 too-long-mempool-chain would fire at 25
- * anyway)" -- does not hold for this codebase. This node implements Core
- * v31's CLUSTER limits (64 transactions / 101 kvB), not the pre-v31
- * 25-ancestor chain limit, so a child of 63 parents forming a 64-cluster is
- * LEGAL and is accepted by Core. Rejecting at 24 was tried and it fails this
- * project's own test_mempool_policy case "child C joins them: cluster of
- * exactly 64 accepted" -- i.e. it turns a silent corruption into a false
- * reject and a relay divergence, which is a worse trade.
+ * Both halves are fixed. The cap is now MPOL_MAX_PARENTS = 63, the real v31
+ * cluster limit rather than the pre-v31 chain limit the old comment cited,
+ * and the storage is out of line (see MPOL_INLINE_PARENTS) so raising it
+ * costs less memory than the old inline array, not more. And `*truncated`
+ * is now CONSULTED: the accept path refuses a transaction whose parent list
+ * would not fit, instead of storing a short one.
  *
- * Raising the cap to 63 was measured rather than estimated: mpol_node grows
- * from 184 to 336 bytes, so the policy state grows +152 MB at the default
- * 1,048,576-node sizing (184 MB -> 336 MB). That is not a silent change to a
- * MAP_SHARED region several processes map.
- *
- * The real fix is the audit's second option -- store parents out of line --
- * which is a layout change to that shared region and wants its own pass.
- * Tracked as open in docs/audits/AUDIT_2026-09-03_REMEDIATION.md.
- *
- * `*truncated` reports the overflow so callers can at least see it. */
+ * `*truncated` may be NULL at the call sites that RE-collect after a
+ * removal, where the count can only have shrunk. */
 static int mpol_collect_parents(void* st, const unsigned char (*prev)[32],
                                 int n_in, int* par_idx, int* truncated){
     int n_par = 0;
@@ -674,7 +786,7 @@ static int collect_descendant_txids(void* st, int ci,
         for (uint32_t i = 0; i < n; i++){
             int is_child = 0;
             for (uint32_t k = 0; k < t[i].n_parents; k++)
-                if (t[i].parent[k] == cur){ is_child = 1; break; }
+                if (mpol_par_at(st, &t[i], k) == cur){ is_child = 1; break; }
             if (!is_child) continue;
             int seen = 0;
             for (int k = 0; k < nseen; k++) if (seenidx[k] == i){ seen = 1; break; }
@@ -698,7 +810,7 @@ static void decr_ancestors(void* st, int ci, uint32_t vsz, uint64_t fee){
     memset(seen, 0, n);
     uint32_t stack[512]; int sp = 0;
     for (uint32_t k=0;k<t[ci].n_parents && sp<512;k++){
-        uint32_t p = t[ci].parent[k];
+        uint32_t p = mpol_par_at(st, &t[ci], k);
         if (p < n && !seen[p]){ seen[p]=1; stack[sp++]=p; }
     }
     while (sp){
@@ -707,7 +819,7 @@ static void decr_ancestors(void* st, int ci, uint32_t vsz, uint64_t fee){
         if (t[a].desc_bytes >= vsz) t[a].desc_bytes -= vsz; else t[a].desc_bytes = 0;
         if (t[a].desc_fee >= fee) t[a].desc_fee -= fee; else t[a].desc_fee = 0;
         for (uint32_t k=0;k<t[a].n_parents && sp<512;k++){
-            uint32_t p = t[a].parent[k];
+            uint32_t p = mpol_par_at(st, &t[a], k);
             if (p < n && !seen[p]){ seen[p]=1; stack[sp++]=p; }
         }
     }
@@ -735,7 +847,16 @@ static void remove_node(void* st, void* mp, int ci){
     { uint32_t n = *nptr;
       for (uint32_t j=0;j<n;j++)
           for (uint32_t k=0;k<t[j].n_parents;k++)
-              if (t[j].parent[k]==(uint32_t)ci) t[j].parent[k]=0xFFFFFFFFu; }
+              if (mpol_par_at(st, &t[j], k)==(uint32_t)ci)
+                  mpol_par_set(st, &t[j], k, 0xFFFFFFFFu); }
+    /* MEM-3: hand this node's overflow block back BEFORE the slot is
+     * overwritten by the swap below, or the block leaks and the pool bleeds
+     * away one entry per removal until it is exhausted -- at which point
+     * every transaction with more than MPOL_INLINE_PARENTS parents would be
+     * refused. The swap then carries `last`'s own povf into slot ci with the
+     * rest of the struct, which is exactly right: the block belongs to the
+     * node, and the node has simply moved. */
+    mpol_par_release(st, &t[ci]);
     uint32_t last = *nptr - 1;
     t[ci] = t[last];
     (*nptr)--;
@@ -743,7 +864,8 @@ static void remove_node(void* st, void* mp, int ci){
         uint32_t n = *nptr;
         for (uint32_t j=0;j<n;j++)
             for (uint32_t k=0;k<t[j].n_parents;k++)
-                if (t[j].parent[k]==last) t[j].parent[k]=(uint32_t)ci;
+                if (mpol_par_at(st, &t[j], k)==last)
+                    mpol_par_set(st, &t[j], k, (uint32_t)ci);
         { mpol_claim* c = mpol_claims_base(st);
           uint32_t ncl = *(uint32_t*)((char*)st+12);
           for (uint32_t i=0;i<ncl;i++) if (c[i].claimer==last) c[i].claimer=(uint32_t)ci; }
@@ -891,7 +1013,7 @@ static int cluster_members(void* st, uint32_t seed, const uint32_t* child_head, 
         if (n >= cap) return -1;
         out[n++] = cur;
         for (uint32_t k = 0; k < t[cur].n_parents; k++){
-            uint32_t pp = t[cur].parent[k];
+            uint32_t pp = mpol_par_at(st, &t[cur], k);
             if (pp == 0xFFFFFFFFu || stamp_mark[pp] == stamp) continue;
             if (sp >= CHUNK_MAX_CLUSTER) return -1;
             stamp_mark[pp] = stamp; stack[sp++] = pp;
@@ -925,7 +1047,7 @@ static int cluster_last_chunk(void* st, const uint32_t* mem, int n, mpol_chunk* 
                 int cur = (int)stk[--sp];
                 f += t[mem[cur]].fee; sz += t[mem[cur]].size; cnt++;
                 for (uint32_t k = 0; k < t[mem[cur]].n_parents; k++){
-                    uint32_t pp = t[mem[cur]].parent[k];
+                    uint32_t pp = mpol_par_at(st, &t[mem[cur]], k);
                     if (pp == 0xFFFFFFFFu) continue;
                     for (int q = 0; q < n; q++) if (mem[q] == pp && !done[q] && !inset[q]){ inset[q] = 1; stk[sp++] = (uint32_t)q; }
                 }
@@ -1021,7 +1143,7 @@ static int worst_chunk_excl(void* st, mpol_chunk* out,
     for (uint32_t i = 0; i < n; i++){ child_head[i] = 0xFFFFFFFFu; child_next[i] = 0xFFFFFFFFu; mark[i] = 0; }
     for (uint32_t i = 0; i < n; i++)
         for (uint32_t k = 0; k < t[i].n_parents; k++){
-            uint32_t pp = t[i].parent[k];
+            uint32_t pp = mpol_par_at(st, &t[i], k);
             if (pp == 0xFFFFFFFFu || pp >= n) continue;
             child_next[i] = child_head[pp]; child_head[pp] = i;   /* a node may be pushed once per parent link: harmless for the walk */
         }
@@ -1402,7 +1524,48 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         }
     }
 
-    n_par = mpol_collect_parents(st, prev, n_in, par_idx, 0);
+    /* ---- MEM-3: more in-pool parents than can exist in a legal cluster ----
+     *
+     * Now that the cap is the REAL limit -- v31 allows a 64-transaction
+     * cluster, so at most 63 distinct direct parents -- overflowing it means
+     * the transaction could not form a legal cluster anyway, and Core would
+     * refuse it at the cluster-count check. Refusing here is therefore not a
+     * relay divergence, which is what made the same refusal wrong while the
+     * cap was 24 (that rejected shapes Core accepts, and failed this
+     * project's own "cluster of exactly 64 accepted" case).
+     *
+     * The point is that the list is never silently SHORTENED again: parent[]
+     * is the only record of the graph, so a dropped link made a child
+     * invisible to every descendant walk, and the child survived its
+     * parent's eviction spending an output that no longer existed. */
+    { int truncated = 0;
+      n_par = mpol_collect_parents(st, prev, n_in, par_idx, &truncated);
+      if (truncated){
+          /* Core's string, and the accurate one: more than 63 DISTINCT direct
+           * in-pool parents means the cluster containing this transaction has
+           * at least 65 members, so the cluster-count check below is the rule
+           * it actually violates -- this refusal simply reaches the same
+           * verdict earlier, before a parent list that cannot be recorded in
+           * full is built. Reporting "too-long-mempool-chain" here (as the
+           * first draft did) changed the reason on the existing
+           * "a child joining 64 independent parents is refused" case, whose
+           * point is precisely that the CLUSTER limit is what catches it. */
+          _mpol_last_reason = "too-large-cluster";
+          return 0;
+      }
+      /* MEM-3 + MEM-6: if this transaction will need an overflow block,
+       * establish NOW that one is available. The reservation itself happens
+       * at the store site, which is AFTER the RBF evictions in step 1a --
+       * failing there would destroy the transactions this one conflicts
+       * with and then refuse it, which is precisely the atomicity defect
+       * MEM-6 fixed. Between this check and the reservation the only pool
+       * traffic is remove_node RELEASING blocks, so availability can improve
+       * but never worsen: the check is sound, not merely optimistic. */
+      if ((uint32_t)n_par > MPOL_INLINE_PARENTS &&
+          *(uint32_t*)((char*)st+88) == MPOL_OVF_NONE){
+          _mpol_last_reason = "too-long-mempool-chain";
+          return 0;
+      } }
 
     uint32_t anc_list[MPOL_MAX_IN + 32]; uint32_t n_anc = 0;
     uint32_t stack[MPOL_MAX_IN + 16]; int sp = 0;
@@ -1415,7 +1578,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         anc_list[n_anc++] = cur;
         mpol_node* cn = &t[cur];
         for (uint32_t k=0; k<cn->n_parents; k++){
-            uint32_t gp = cn->parent[k];
+            uint32_t gp = mpol_par_at(st, cn, k);
             if (gp != 0xFFFFFFFFu && mark[gp] != stamp){
                 mark[gp] = stamp; stack[sp++] = gp;
             }
@@ -1465,8 +1628,8 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             uint32_t cur = bfs[--sp];
             for (uint32_t i = 0; i < nn && !too_big; i++){
                 int linked = 0;
-                for (uint32_t k = 0; k < t[i].n_parents; k++) if (t[i].parent[k] == cur){ linked = 1; break; }
-                if (!linked) for (uint32_t k = 0; k < t[cur].n_parents; k++) if (t[cur].parent[k] == i){ linked = 1; break; }
+                for (uint32_t k = 0; k < t[i].n_parents; k++) if (mpol_par_at(st, &t[i], k) == cur){ linked = 1; break; }
+                if (!linked) for (uint32_t k = 0; k < t[cur].n_parents; k++) if (mpol_par_at(st, &t[cur], k) == i){ linked = 1; break; }
                 if (!linked) continue;
                 if (MPOL_CL_EVICTED(i)) continue;        /* leaves the pool if this tx is accepted */
                 int dup = 0;
@@ -1559,7 +1722,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                     int ei = find_node(st, evict_set[e]);
                     if (ei < 0) continue;
                     for (uint32_t q=0; q<t[ei].n_parents; q++)
-                        if (t[ei].parent[q] == (uint32_t)par_idx[0]){ child_replaced = 1; break; }
+                        if (mpol_par_at(st, &t[ei], q) == (uint32_t)par_idx[0]){ child_replaced = 1; break; }
                 }
                 /* desc_cnt includes the parent itself */
                 if ((uint64_t)pn->desc_cnt + 1 > TRUC_DESCENDANT_LIMIT && !child_replaced){
@@ -1805,7 +1968,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             uint32_t cur = stack[--sp];
             anc_list[n_anc++] = cur;
             for (uint32_t k=0; k<t[cur].n_parents; k++){
-                uint32_t gp = t[cur].parent[k];
+                uint32_t gp = mpol_par_at(st, &t[cur], k);
                 if (gp != 0xFFFFFFFFu && mark[gp] != stamp){
                     mark[gp] = stamp; stack[sp++] = gp;
                 }
@@ -1906,7 +2069,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
           uint32_t cur = stack[--sp];
           anc_list[n_anc++] = cur;
           for (uint32_t k=0; k<t[cur].n_parents; k++){
-              uint32_t gp = t[cur].parent[k];
+              uint32_t gp = mpol_par_at(st, &t[cur], k);
               if (gp != 0xFFFFFFFFu && mark[gp] != stamp){
                   mark[gp] = stamp; stack[sp++] = gp;
               }
@@ -1964,12 +2127,30 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         t2[myidx].anc_bytes = (uint32_t)anc_bytes;
         t2[myidx].desc_cnt = 1;
         t2[myidx].desc_bytes = (uint32_t)vsize;
-        t2[myidx].n_parents = (uint32_t)n_par;
         t2[myidx].version = meta.version;
-        for (int k=0;k<MPOL_MAX_PARENTS;k++)
+        /* MEM-3: reserve an overflow block BEFORE recording anything. The
+         * slot was memset to zero by state_init, so povf must be set to
+         * MPOL_OVF_NONE explicitly -- 0 is a valid block index. On
+         * exhaustion the transaction is refused rather than stored with a
+         * short parent list, which is the whole point of the finding. */
+        t2[myidx].povf = MPOL_OVF_NONE;
+        t2[myidx].n_parents = 0;
+        if (!mpol_par_reserve(st, &t2[myidx], (uint32_t)n_par)){
+            /* Distinct from the cluster refusal above: this is a RESOURCE
+             * limit of this implementation, not a rule the transaction
+             * breaks. The pool is sized so that reaching it means an
+             * extraordinary number of many-parent transactions are resident
+             * at once. Refusing is still the right answer -- the alternative
+             * is the silent short parent list this whole finding is about --
+             * but the reason should not claim the transaction is malformed. */
+            _mpol_last_reason = "too-long-mempool-chain";
+            return 0;
+        }
+        t2[myidx].n_parents = (uint32_t)n_par;
+        for (uint32_t k=0;k<MPOL_INLINE_PARENTS;k++)
             t2[myidx].parent[k] = 0xFFFFFFFFu;
         for (int k=0;k<n_par && k<MPOL_MAX_PARENTS;k++)
-            t2[myidx].parent[k] = (uint32_t)par_idx[k];
+            mpol_par_set(st, &t2[myidx], (uint32_t)k, (uint32_t)par_idx[k]);
         (*((uint32_t*)((char*)st+16)))++;
         for (uint32_t k=0;k<n_anc;k++){
             t2[anc_list[k]].desc_cnt++;
@@ -2144,7 +2325,7 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
                                                reads the accept-time cost back */
 
     for (uint32_t k=0; k<t[self].n_parents && out->n_depends<MPE_MAX_SET; k++){
-        uint32_t p = t[self].parent[k];
+        uint32_t p = mpol_par_at(st, &t[self], k);
         if (p >= n) continue;
         if (!mpe_seen(out->depends, out->n_depends, t[p].txid))
             memcpy(out->depends[out->n_depends++], t[p].txid, 32);
@@ -2152,7 +2333,7 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
     for (uint32_t i=0; i<n && out->n_spentby<MPE_MAX_SET; i++){
         if ((long)i == self) continue;
         for (uint32_t k=0; k<t[i].n_parents; k++)
-            if (t[i].parent[k] == (uint32_t)self){
+            if (mpol_par_at(st, &t[i], k) == (uint32_t)self){
                 if (!mpe_seen(out->spentby, out->n_spentby, t[i].txid))
                     memcpy(out->spentby[out->n_spentby++], t[i].txid, 32);
                 break;
@@ -2166,7 +2347,7 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
       while (sp > 0){
           uint32_t cur = stack[--sp];
           for (uint32_t k=0; k<t[cur].n_parents; k++){
-              uint32_t p = t[cur].parent[k];
+              uint32_t p = mpol_par_at(st, &t[cur], k);
               if (p >= n || mpe_seen(out->anc, out->n_anc, t[p].txid)) continue;
               if (out->n_anc >= MPE_MAX_SET) break;
               memcpy(out->anc[out->n_anc++], t[p].txid, 32);
@@ -2184,7 +2365,7 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
               if (mpe_seen(out->desc, out->n_desc, t[i].txid)) continue;
               int child = 0;
               for (uint32_t k=0; k<t[i].n_parents; k++)
-                  if (t[i].parent[k] == cur){ child = 1; break; }
+                  if (mpol_par_at(st, &t[i], k) == cur){ child = 1; break; }
               if (!child) continue;
               if (out->n_desc >= MPE_MAX_SET) break;
               memcpy(out->desc[out->n_desc++], t[i].txid, 32);
