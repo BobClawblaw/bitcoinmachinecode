@@ -958,7 +958,14 @@ static int cluster_last_chunk(void* st, const uint32_t* mem, int n, mpol_chunk* 
 /* The worst chunk across all clusters: 1 with *out filled, 0 if the pool is
  * empty. Clusters beyond CHUNK_MAX_CLUSTER contribute their per-leaf worst
  * (the old score) as a one-member chunk. */
-static int worst_chunk(void* st, mpol_chunk* out){
+/* MEM-6: `excl`/`n_excl` name transactions the caller is ABOUT to remove.
+ * Any chunk containing one of them is skipped, so the answer is the worst
+ * chunk that would still be there afterwards. Skipping errs upward -- the
+ * reported chunk is never cheaper than the truth -- which makes a caller
+ * using this for an early refusal strictly more permissive, never less.
+ * worst_chunk() passes NULL and behaves exactly as before. */
+static int worst_chunk_excl(void* st, mpol_chunk* out,
+                            const unsigned char (*excl)[32], int n_excl){
     mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
     if (n == 0) return 0;
@@ -1031,10 +1038,20 @@ static int worst_chunk(void* st, mpol_chunk* out){
             int w = (int)i; uint64_t wf, ws; node_score(&t[i], &wf, &ws);
             c.n = 1; c.idx[0] = (uint32_t)w; c.fee = wf; c.size = ws;
         } else if (!cluster_last_chunk(st, mem, cn, &c)) continue;
+        if (n_excl > 0){
+            int hit = 0;
+            for (int q = 0; q < c.n && !hit; q++)
+                for (int e = 0; e < n_excl; e++)
+                    if (!memcmp(t[c.idx[q]].txid, excl[e], 32)){ hit = 1; break; }
+            if (hit) continue;
+        }
         if (!have || (unsigned __int128)c.fee * best.size < (unsigned __int128)best.fee * c.size){ best = c; have = 1; }
     }
     if (have) *out = best;
     return have;
+}
+static int worst_chunk(void* st, mpol_chunk* out){
+    return worst_chunk_excl(st, out, NULL, 0);
 }
 
 /* ========================================================================== */
@@ -1272,6 +1289,39 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             int i = unconf_in[u];
             if (find_claim(st, prev[i], idx[i]) < 0){
                 _mpol_last_reason = "replacement-adds-unconfirmed"; return 0; }
+        }
+        /* ---- MEM-7 (audit 2026-09-03): Core's PaysMoreThanConflicts ----
+         *
+         * Rules 3+4 below are ABSOLUTE-fee rules: pay everything you evict,
+         * plus a bit more. On their own they let a replacement that is far
+         * WORSE for a miner win. The audit's example: T is 200 vB paying
+         * 2,000 sat (10 sat/vB); R is 100,000 vB -- the standard maximum --
+         * paying 102,000 sat, which is 1.02 sat/vB. R pays more in total, so
+         * rules 3+4 passed, T was evicted, and 100 kvB of 1 sat/vB traffic
+         * was relayed in place of a 200 vB transaction at ten times the
+         * feerate. That is miner-incentive-incompatible and Core has rejected
+         * it in every version: PaysMoreThanConflicts pre-v31, and the
+         * feerate-diagram check under the v31 cluster mempool.
+         *
+         * Core compares the replacement's feerate against EACH DIRECT
+         * conflict's, not against the eviction set as a whole (rbf.cpp
+         * iterates iters_conflicting), and rejects unless it is strictly
+         * greater. Descendants are covered by rules 3+4's absolute total.
+         *
+         * Cross-multiplied so there is no division and no rounding: the
+         * comparison fee/vsize > c.fee/c.size becomes fee*c.size >
+         * c.fee*vsize. Both fees are satoshi counts under MAX_MONEY and both
+         * sizes are under 100,000, so the products cannot overflow 64 bits.
+         * A conflict recorded with size 0 would make the comparison
+         * meaningless, so it is treated as unreplaceable rather than as
+         * infinitely cheap. */
+        for (int k=0;k<n_conf;k++){
+            const mpol_node* c = &t[conf_claimers[k]];
+            if (c->size == 0 ||
+                (unsigned long long)fee * c->size <= (unsigned long long)c->fee * vsize){
+                _mpol_last_reason = "insufficient fee";   /* Core's own reason string */
+                return 0;
+            }
         }
         /* rules 3+4 (Core PaysForRBF): pay all replaced fees, and the
          * increment must cover the replacement's own vsize at the
@@ -1641,6 +1691,74 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     }
 
 
+    /* ---- MEM-6 (audit 2026-09-03): decide "mempool full" BEFORE evicting ----
+     *
+     * This file's header claims "Accept is atomic: on any policy failure both
+     * the structural mempool and this state are untouched." Step 1a broke
+     * that claim: it removed every conflict (and its descendants) and
+     * recorded them in _mpol_replaced, and only THEN did step 1b call
+     * mpool_put, which can return 2 on a byte-full pool and end in
+     * "mempool full" with nothing stored. The replaced transactions were
+     * gone, the replacement was not in, and submitpackage still reported
+     * `replaced-transactions` for an accept that never happened. Because RBF
+     * needs signing authority over the original's inputs, the practical
+     * victim is a two-party construction -- an LN counterparty's commitment
+     * dropped from this node while Core nodes keep it.
+     *
+     * The check is deliberately CONSERVATIVE: it can only turn an accept that
+     * was already doomed into an earlier refusal, never refuse something that
+     * would have succeeded.
+     *
+     *  - It runs only when the incoming bytes do not fit even after crediting
+     *    every byte the eviction set would free. If they do fit, mpool_put
+     *    cannot return 2 and there is nothing to pre-empt.
+     *  - It compacts first, so MEM-13's dead bytes are not mistaken for a
+     *    full pool.
+     *  - It refuses only if the worst chunk is NOT itself in the eviction
+     *    set. If the worst chunk is one of the conflicts, the loop in 1b
+     *    would evict it as part of this replacement and could then succeed,
+     *    so refusing here would be a new false reject. */
+    if (n_evict > 0){
+        /* bitcoin_mempool.asm's documented layout: +24 blob_cap, +32 fill.
+         * daemon/reorg.c reads the same fields the same way. */
+        unsigned char* mm = (unsigned char*)mp;
+        unsigned long long blob_cap = 0, fill = 0;
+        memcpy(&blob_cap, mm + 24, 8);
+        memcpy(&fill,     mm + 32, 8);
+        unsigned long long freed = 0;
+        for (int e = 0; e < n_evict; e++){
+            int ei2 = find_node(st, evict_set[e]);
+            if (ei2 >= 0) freed += mpol_nodes_base(st)[ei2].raw_len;
+        }
+        if (fill + txlen > blob_cap + freed){
+            mpool_compact(mp);
+            memcpy(&fill, mm + 32, 8);
+        }
+        if (fill + txlen > blob_cap + freed){
+            /* The chunk 1b's loop would score AFTER this replacement's own
+             * evictions -- so the eviction set is excluded. Scoring without
+             * that exclusion would usually name one of the conflicts itself
+             * (a transaction being replaced is typically the cheapest thing
+             * in the pool), and comparing against something we are about to
+             * delete answers the wrong question. */
+            mpol_chunk wc;
+            if (!worst_chunk_excl(st, &wc, (const unsigned char (*)[32])evict_set, n_evict)
+                || wc.n == 0){
+                /* Nothing left to evict once the conflicts are gone, and the
+                 * replacement still does not fit. */
+                _mpol_last_reason = "mempool full"; return 0;
+            }
+            uint64_t ws2 = wc.size ? wc.size : 1;
+            if ((unsigned __int128)fee * ws2 <= (unsigned __int128)wc.fee * vsize){
+                /* The same verdict 1b would reach, reached WITHOUT having
+                 * destroyed the transactions this one conflicts with. */
+                floor_bump(st, wc.fee * 1000 / ws2 + pol->incremental_fee);
+                _mpol_last_reason = "mempool full";
+                return 0;
+            }
+        }
+    }
+
     /* 1a. RBF eviction (packages: conflicts + descendants, snapshotted) */
     for (int e=0;e<n_evict;e++){
         int ci = find_node(st, evict_set[e]);
@@ -1700,6 +1818,30 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * = removed package feerate + incrementalrelayfee. If the incoming tx
      * itself would be the worst, reject it as "mempool full". */
     { long put = mpool_put(mp, txid, tx, txlen);
+      if (put == 2){
+          /* ---- MEM-13 (audit 2026-09-03): reclaim dead bytes BEFORE scoring ----
+           *
+           * mpool_del leaves the removed transaction's bytes in the blob and
+           * does not move `fill`; only daemon/mempool_compact.c reclaims them,
+           * and it was called ONLY from inside the eviction loop below --
+           * after an eviction had already happened. Removals that are not
+           * evictions (remove_confirmed at every block connect, expiry, RBF)
+           * therefore left the blob permanently "full" of bytes nothing
+           * referenced.
+           *
+           * The consequence is a spurious eviction plus a floor bump: once
+           * fill has ever reached blob_cap, blocks can confirm away most of
+           * the pool and `put` still returns 2, so the next accept scored the
+           * worst chunk, evicted it (or refused the newcomer) and called
+           * floor_bump -- raising mempoolminfee for 12+ hours -- while the
+           * space it needed was already free.
+           *
+           * Compacting on the FIRST 2 and retrying costs one compaction on a
+           * path that was about to do one anyway, and the eviction loop below
+           * is entered only if the pool is genuinely full. */
+          mpool_compact(mp);
+          put = mpool_put(mp, txid, tx, txlen);
+      }
       while (put == 2){
           /* Core v31: evict the worst CHUNK of all clusters, not the worst leaf */
           mpol_chunk wc;

@@ -246,8 +246,8 @@ None.
 
 ### 4.3 MEDIUM and below
 
-44 MEDIUM, 68 LOW, 33 INFO in the audit. **Eleven MEDIUM are now closed**;
-the rest, and everything LOW/INFO, are untouched.
+44 MEDIUM, 68 LOW, 33 INFO in the audit. **Twenty-two MEDIUM are now
+closed**; the rest, and everything LOW/INFO, are untouched.
 
 | Finding | What it was | Commit |
 |---|---|---|
@@ -265,6 +265,36 @@ the rest, and everything LOW/INFO, are untouched.
 | RPX-3 | `getaddressinfo` emitted a fabricated `pubkey`/`iscompressed` | `dccaa57` |
 | RPC-1 | fd + response body leaked; `accept()` spun on EMFILE | `5f2a3e0` |
 | DMN-6 | Serve children held the RPC listener and ignored SIGTERM | `5f2a3e0` |
+| SER-4 | BIP152 read the tx count as one byte: no block with >=253 txs could be served | `4cd988c` |
+| STO-8 | `getblockfilter` fell back to a prevout-less filter | `4cd988c` |
+| WAL-4 | Wallet writes were not atomic and the temp file was world-readable | `cf57efa` |
+| RPC-2 | The authenticated user was a process global across RPC threads | `cf57efa` |
+| STO-7 | The mempool was never reconciled after a reorg: `reorg_mempool_reconcile` had no caller | `cbaeff6` |
+| UTX-5 | A failed manifest publish deleted the merged run memory was already pointing at | `8bb4950` |
+| STO-6 | `cfheaders`/`cfcheckpt` rewrote the count varint in place, producing an unparseable reply | `60d58c7` |
+| UTX-6 | An unreadable or over-capacity manifest read as "no runs" and returned success | `a0cda89` |
+| RPC-3 | `getpeerinfo.id` and `disconnectnode` used different numbering | `6e0c4ec` |
+| RPC-4 | A slow, unauthenticated sender pinned an RPC worker indefinitely | `d13c7ea` |
+| (unlisted) | `find_header` never saw the last header line: a body in a second segment was a parse error, and an Authorization header sent last got 401 | `d13c7ea` |
+
+**NET-6 needs no separate change: VAL-11 closed it.** The audit asked for
+Core's four `CheckProofOfWork` checks and a clamp on `diff_target`'s
+out-of-buffer write; VAL-11 implemented all five (`fNegative`, mantissa 0,
+`fOverflow` in each of its three forms, the armed chain `powLimit`, and the
+`e3 >= 32` clamp) and `tests/test_pow_check.c` pins them. NET-6 also listed
+three callers that skipped the schedule: the boot header fetch is PoW-gated by
+VAL-5 (`141c786`), `reorg.c`'s `headers_chain_valid` calls `pow_check`
+directly, and `.do_block` reaches it through `cons_verify`. Recorded here
+rather than left in the open column, because "closed by another finding's fix"
+is a different thing from "not done".
+
+**DMN-2 is materially closed by the same work.** Its failure scenario -- a
+peer answering the boot `getheaders` with 2,000,000 zero-work headers -- needs
+headers that pass no PoW check, and VAL-5 now gates every one before
+`hst_append` with the armed mainnet `powLimit`. Forging that many headers at
+mainnet difficulty is not a thing an attacker does. What DMN-2 asked for and
+is still absent: the nBits retarget schedule on the boot path, and a
+second-peer cross-check before extending `index.dat` by a large span.
 
 Each has a regression test and a verified negative control, on the same terms
 as the CRITICAL+HIGH work.

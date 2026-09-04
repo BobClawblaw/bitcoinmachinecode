@@ -29,6 +29,7 @@ extern void   mpool_policy_state_init(void* st, unsigned n);
 extern long   mpool_policy_add(void* pol, void* st, void* mp, const u8* tx, unsigned long txlen, const u8 txid[32], void* utxo);
 extern const char* mpool_policy_reason(void* pol);
 extern u64    mpool_policy_min_fee(void* st);
+extern long   mpool_policy_remove_package(void* st, void* mp, const u8 txid[32]);
 extern void   tx_txid_helper(u8 out[32], const u8* tx, unsigned long len);   /* maybe absent */
 extern int    tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* buf, unsigned long buflen);
 
@@ -119,6 +120,151 @@ int main(void){
       ck("...and it is NOT in the pool", mpool_get(mp, id, &l) == NULL);
       ck("...survivors still resolvable (graph intact)",
          mpool_get(mp, ids[4], &l) != NULL && mpool_get(mp, ids[1], &l) != NULL); }
+
+    /* ==================================================================
+     * MEM-13 (audit 2026-09-03): dead blob bytes caused a spurious
+     * eviction and a mempoolminfee bump.
+     *
+     * mpool_del leaves the removed transaction's bytes in the blob and does
+     * not move `fill`; only daemon/mempool_compact.c reclaims them, and it
+     * used to be called ONLY from inside the eviction loop -- that is, only
+     * AFTER an eviction had already happened. Removals that are not
+     * evictions (remove_confirmed at every block connect, expiry, RBF) left
+     * the blob permanently "full" of bytes nothing referenced.
+     *
+     * So once `fill` had ever reached blob_cap, blocks could confirm away
+     * most of the pool and the next accept still saw put == 2: it scored the
+     * worst chunk, refused the newcomer (or evicted a survivor) and called
+     * floor_bump, raising mempoolminfee for 12+ hours, while the room it
+     * needed was already free.
+     *
+     * A FRESH pool and policy state, so the floor from the eviction case
+     * above cannot be mistaken for this one's.
+     * ================================================================== */
+    printf("\n== MEM-13: confirmed-away bytes are reclaimed before scoring ==\n");
+    {
+        static u8 st2[1<<20]; memset(st2, 0, sizeof st2);
+        mpool_policy_state_init(st2, 256);
+        static u8 mp2[40 + 64*48 + 8];
+        static u8 mblob2[300];
+        mpool_init(mp2, 64, mblob2, sizeof mblob2);
+
+        u8 fid[4][32];
+        int nin2 = 0;
+        for (int i=0;i<4;i++){
+            u8 tx[128]; long n = mk_tx(tx, (u8)(i+1), 1000000ULL, fees[i], 0);
+            tx_txid(fid[i], tx, n, sc, sizeof sc);
+            if (mpool_policy_add(pol, st2, mp2, tx, n, fid[i], ux) == 1) nin2++;
+        }
+        ck("MEM-13 fresh pool filled to capacity", nin2 == 4);
+        ck("MEM-13 floor still 0 (nothing evicted yet)", mpool_policy_min_fee(st2) == 0);
+
+        /* Confirm three of them away. This is a NON-eviction removal: it is
+         * what a block connect does, and it is the case that used to leave
+         * the blob full of bytes nothing referenced. */
+        int removed = 0;
+        for (int i=0;i<3;i++) removed += (int)mpool_policy_remove_package(st2, mp2, fid[i]);
+        ck("MEM-13 three transactions confirmed away", removed >= 3);
+        { unsigned long l;
+          ck("MEM-13 ...and they really are gone from the pool",
+             mpool_get(mp2, fid[0], &l) == NULL && mpool_get(mp2, fid[2], &l) == NULL); }
+
+        /* A newcomer CHEAPER than the one survivor (fee 400). Under the old
+         * code put == 2 was still returned, the survivor was the worst chunk,
+         * the newcomer lost the feerate comparison against it, and the accept
+         * became "mempool full" + floor_bump -- with three quarters of the
+         * blob actually free. */
+        { u8 tx[128]; long n = mk_tx(tx, 7, 1000000ULL, 150, 0);
+          u8 id[32]; tx_txid(id, tx, n, sc, sizeof sc);
+          long r = mpool_policy_add(pol, st2, mp2, tx, n, id, ux);
+          printf("      (add fee=150 into a 3/4-freed pool -> %ld, floor %llu)\n",
+                 r, (unsigned long long)mpool_policy_min_fee(st2));
+          ck("MEM-13 a modest-fee tx is ACCEPTED into the freed space", r == 1);
+          unsigned long l;
+          ck("MEM-13 ...it is actually stored", mpool_get(mp2, id, &l) != NULL);
+          ck("MEM-13 ...the fee=400 survivor was NOT evicted for it",
+             mpool_get(mp2, fid[3], &l) != NULL);
+          ck("MEM-13 ...and mempoolminfee did NOT bump (no eviction happened)",
+             mpool_policy_min_fee(st2) == 0); }
+    }
+
+    /* ==================================================================
+     * MEM-6 (audit 2026-09-03): the RBF eviction is not applied unless
+     * the replacement can actually be stored.
+     *
+     * Step 1a removed every conflict (and its descendants) and recorded them
+     * in _mpol_replaced; step 1b then called mpool_put, which on a byte-full
+     * pool can end in "mempool full" with nothing stored. The original was
+     * gone, the replacement was not in, and this file's own header claim --
+     * "Accept is atomic: on any policy failure both the structural mempool
+     * and this state are untouched" -- was false. Because RBF requires
+     * signing authority over the original's inputs, the practical victim is
+     * a two-party construction: an LN counterparty's commitment transaction
+     * dropped from this node while Core nodes keep it.
+     *
+     * The fixture: a full pool of cheap transactions, plus a dearer original
+     * O to replace. The replacement pays more than O in total AND more per
+     * byte (so it clears RBF and MEM-7's PaysMoreThanConflicts), but its
+     * feerate is below the worst chunk, so the store cannot succeed. What is
+     * asserted is not the refusal -- that was always the outcome -- but that
+     * O SURVIVES it.
+     * ================================================================== */
+    printf("\n== MEM-6: a refused replacement does not destroy what it conflicts with ==\n");
+    {
+        static u8 st3[1<<20]; memset(st3, 0, sizeof st3);
+        mpool_policy_state_init(st3, 256);
+        static u8 mp3[40 + 64*48 + 8];
+        static u8 mblob3[300];
+        mpool_init(mp3, 64, mblob3, sizeof mblob3);
+
+        /* Three expensive residents, so the worst chunk is dear. */
+        u8 rid[3][32];
+        int rin = 0;
+        for (int i=0;i<3;i++){
+            u8 tx[128]; long n = mk_tx(tx, (u8)(i+1), 1000000ULL, 50000, 0);
+            tx_txid(rid[i], tx, n, sc, sizeof sc);
+            if (mpool_policy_add(pol, st3, mp3, tx, n, rid[i], ux) == 1) rin++;
+        }
+        /* The original to be replaced: cheap enough that it is the pool's
+         * worst, dear enough to be worth replacing. */
+        u8 oid[32];
+        { u8 tx[128]; long n = mk_tx(tx, 4, 1000000ULL, 300, 0);
+          tx_txid(oid, tx, n, sc, sizeof sc);
+          rin += (mpool_policy_add(pol, st3, mp3, tx, n, oid, ux) == 1); }
+        ck("MEM-6 fixture: pool filled", rin == 4);
+        { unsigned long l; ck("MEM-6 the original O is in the pool", mpool_get(mp3, oid, &l) != NULL); }
+
+        /* R conflicts with O (same prevout, tag 4), pays 800 > 300 and at a
+         * higher feerate than O, so RBF rules 3+4 and MEM-7 all pass -- but
+         * the pool is byte-full of 50,000-sat residents, so the store cannot
+         * succeed and the accept ends "mempool full". */
+        { /* R is PADDED to ~200 bytes. Evicting O frees only ~70, and
+           * MEM-13's compaction reclaims only what is genuinely dead, so the
+           * store still cannot fit -- which is the whole point: without the
+           * pre-check, O would be destroyed on the way to that failure.
+           * R pays 10,000 sat over ~200 vB = ~50 sat/vB: far above O's ~4
+           * (so RBF and MEM-7 pass) and far below the 50,000-sat residents'
+           * ~700 (so it loses the worst-chunk comparison and cannot be
+           * stored). */
+          u8 tx[512]; long n = mk_tx(tx, 4, 1000000ULL, 10000, 130);
+          u8 id[32]; tx_txid(id, tx, n, sc, sizeof sc);
+          long r = mpool_policy_add(pol, st3, mp3, tx, n, id, ux);
+          printf("      (replacement -> %ld, reason %s)\n", r,
+                 r == 1 ? "accepted" : mpool_policy_reason(pol));
+          unsigned long l;
+          if (r == 1){
+              /* It fit after all -- then O must be gone, which is the correct
+               * outcome and not what this case is about. Say so rather than
+               * assert a property the fixture did not reach. */
+              ck("MEM-6 (fixture did not reach a full pool; replacement accepted, O evicted)",
+                 mpool_get(mp3, oid, &l) == NULL);
+          } else {
+              ck("MEM-6 the REFUSED replacement is not in the pool",
+                 mpool_get(mp3, id, &l) == NULL);
+              ck("MEM-6 ...and the original it conflicted with SURVIVED",
+                 mpool_get(mp3, oid, &l) != NULL);
+          } }
+    }
 
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
