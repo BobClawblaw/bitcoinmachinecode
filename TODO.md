@@ -63,7 +63,23 @@ Everything below is landed on `arm-port` and pushed. History lives in
       test_redial independently -- confirming this port's stale-fixture
       diagnosis. The arena single-252 reject quirk (unset reason) remains
       pinned for a future session.
-- [x] `validation/spend_corpus_diff.py` ran for the FIRST time on this port
+- [ ] **UTXO store rebuild — the 965018 hole is HEALED but the rebuild's
+      tail loses coins (NEXT SESSION, priority):** the store was rebuilt
+      offline from the blk archives with the UTX-1/UTX-3-fixed binary
+      (build_utxo, 2.6 h, 165,404,120 live entries vs the damaged store's
+      241,272,739 — ~76M phantom entries from the old resurrection bug).
+      Swapped with full backup (data/main/rollback-store-20260904/); the
+      daemon booted the full set via its mmap path and the catch-up PASSED
+      965018 (deep history clean through 965495). The rebuild's tail after
+      its last durable flush (~h=964890) LOSES coins — apply now fails at
+      h=965496 (missing input; the old failure point is gone). Fresh-reload
+      validation tools (utxo_probe_one/utxo_reload_check) crash or need
+      multi-hours+6GB at 165M scale — only the daemon's mmap boot consumes
+      the store. NEXT: re-rebuild with `build_utxo <scratch> 23 1.5 0 964000`
+      (~2.5 h), applied_height=964000, swap, and let the daemon's own
+      catch-up apply 964001..tip through the battle-tested apply path; fix
+      the swap script's unqualified globs first. Full details in the 22:30
+      UTC worklog entry; backups intact.- [x] `validation/spend_corpus_diff.py` ran for the FIRST time on this port
       2026-09-04 01:25 UTC, against a real synced Core over the LAN
       (Umbrel node 192.168.5.69:8332, txindex on, verificationprogress=1):
       zero divergences, accept-parity 253/253 real mainnet spends and 2024/2024
