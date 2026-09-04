@@ -2674,6 +2674,13 @@ long mpool_policy_block_connect(void* st, void* mp,
         p += txlen;
     }
     if (batch) removed += mpol_remove_marked(st, mp, n_nodes);
+    /* MEM-10: Core resets m_recent_rejects on every new block, because a
+     * block can make a previously-invalid transaction valid -- its missing
+     * input just confirmed -- and a stale "no" would stop us ever fetching
+     * it. Weakly referenced so the tools that link this file without the
+     * serve path still build. */
+    { extern void serve_rejects_clear(void) __attribute__((weak));
+      if (serve_rejects_clear) serve_rejects_clear(); }
     note_block_connected(st);
     return removed;
 }
