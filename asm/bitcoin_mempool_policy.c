@@ -1032,6 +1032,205 @@ static void remove_node(void* st, void* mp, int ci){
     if (g_forget_cb) g_forget_cb(ct);
 }
 
+/* ==========================================================================
+ * MEM-12 (second half): BATCH REMOVAL
+ *
+ * remove_node is O(n) whatever the lookups cost, because three of its steps
+ * are full sweeps rather than lookups: clearing children's parent references
+ * to the departing node, renumbering references to the node that swap-with-
+ * last moved, and renumbering claims' `claimer`. Indexing find_node,
+ * find_outreg and find_claim made ACCEPTS flat and left this untouched --
+ * measured, not assumed: with the indices in place, block connect still went
+ * 2.3 -> 8.6 -> 17.9 -> 158 ms as the pool grew 10k -> 40k -> 80k -> 260k.
+ *
+ * mpool_policy_block_connect removes MANY nodes at once -- every transaction
+ * the block confirmed, plus any it conflicts with -- and it did so one at a
+ * time: m removals each costing O(n), so O(n*m). A 3,000-transaction block
+ * against a full 300 MB pool (~750k entries) is on the order of SECONDS,
+ * under mp_lock, in the download worker.
+ *
+ * Removing them together turns that into ONE sweep: O(n + links) total. The
+ * whole trick is a single remap array. Compaction assigns every surviving
+ * node its new index and every removed node MPOL_IDX_NONE, and then one pass
+ * over the survivors' parent lists does BOTH jobs the old code did with two
+ * separate sweeps per removal -- a parent that moved is renumbered, a parent
+ * that is gone becomes 0xFFFFFFFF -- because "cleared" and "renumbered" are
+ * the same operation once the remap says so.
+ *
+ * Compaction is STABLE (order-preserving), not swap-with-last. That is not
+ * cosmetic: the chunk scorer and the cluster walk read the node array in
+ * order, and tests pin the resulting eviction order, so reordering survivors
+ * would change which transaction gets evicted under pressure.
+ *
+ * Per-node bookkeeping that is NOT positional -- ancestor decrements, the
+ * structural mpool_del, the pool byte counter, the forget callback -- still
+ * runs once per removed node, before anything moves, exactly as
+ * remove_node does it. Only the POSITIONAL work is batched.
+ * ========================================================================== */
+/* Batch removal is on by default. The switch exists so the test suite can run
+ * the SAME block connect both ways from an identical starting state and
+ * compare the resulting pool -- the claim a batch makes is not "it is fast"
+ * but "it leaves the pool in exactly the state the per-transaction path
+ * would have", and that is worth checking directly rather than inferring from
+ * a handful of hand-built cases. It is also the fallback if the scratch
+ * cannot be sized: a block connect must not be skippable on an allocation. */
+static int g_batch_connect = 1;
+void mpool_policy_set_batch_connect(int on){ g_batch_connect = on ? 1 : 0; }
+
+/* Growable scratch, same pattern worst_chunk uses: sized on demand rather
+ * than reserved in .bss for every process that links this file. */
+static uint8_t*  g_rm_mark;
+static uint32_t* g_rm_remap;
+static uint32_t  g_rm_cap;
+static int mpol_rm_reserve(uint32_t n){
+    if (n <= g_rm_cap) return 1;
+    uint32_t want = g_rm_cap ? g_rm_cap : 1024;
+    while (want < n){ if (want > 0x40000000u){ want = n; break; } want *= 2; }
+    uint8_t*  m = realloc(g_rm_mark,  want);
+    uint32_t* r = realloc(g_rm_remap, (size_t)want * sizeof *r);
+    if (m) g_rm_mark = m;
+    if (r) g_rm_remap = r;
+    if (!m || !r) return 0;
+    g_rm_cap = want;
+    return 1;
+}
+
+/* Remove every node whose mark byte is set, in one compaction.
+ * Returns how many were removed. `mark` is g_rm_mark, valid for n entries. */
+static long mpol_remove_marked(void* st, void* mp, uint32_t n){
+    mpol_node* t = mpol_nodes_base(st);
+    uint8_t* mark = g_rm_mark;
+    uint32_t* remap = g_rm_remap;
+
+    /* ---- 1. per-node bookkeeping, while indices are still valid ---- */
+    long nremoved = 0;
+    for (uint32_t i = 0; i < n; i++){
+        if (!mark[i]) continue;
+        nremoved++;
+        unsigned char ct[32]; memcpy(ct, t[i].txid, 32);
+        decr_ancestors(st, (int)i, (uint32_t)t[i].size, t[i].fee);
+        mpool_del(mp, ct);
+        { uint64_t* pb = (uint64_t*)((char*)st+64);
+          if (*pb >= t[i].raw_len) *pb -= t[i].raw_len; else *pb = 0; }
+        mpol_par_release(st, &t[i]);       /* MEM-3 overflow block back to the pool */
+        if (g_forget_cb) g_forget_cb(ct);
+    }
+    if (!nremoved) return 0;
+
+    /* ---- 2. claims: drop those a removed node claimed, keep order ---- */
+    { mpol_claim* c = mpol_claims_base(st);
+      uint32_t* ncl = (uint32_t*)((char*)st+12);
+      uint32_t w = 0;
+      for (uint32_t i = 0; i < *ncl; i++){
+          uint32_t cl = c[i].claimer;
+          if (cl < n && mark[cl]) continue;          /* its claimer is leaving */
+          if (w != i) c[w] = c[i];
+          w++;
+      }
+      *ncl = w; }
+
+    /* ---- 3. outreg: drop the outputs of removed transactions.
+     * The node index still answers, so this is a lookup per entry rather
+     * than a scan per removed node. ---- */
+    { mpol_out* o = mpol_outreg_base(st);
+      uint32_t* no = (uint32_t*)((char*)st+8);
+      uint32_t w = 0;
+      for (uint32_t i = 0; i < *no; i++){
+          int owner = find_node(st, o[i].txid);
+          if (owner >= 0 && mark[owner]) continue;
+          if (w != i) o[w] = o[i];
+          w++;
+      }
+      *no = w; }
+
+    /* ---- 4. compact the nodes, building the remap ---- */
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < n; i++){
+        if (mark[i]){ remap[i] = MPOL_IDX_NONE; continue; }
+        remap[i] = w;
+        if (w != i) t[w] = t[i];
+        w++;
+    }
+    *(uint32_t*)((char*)st+16) = w;
+
+    /* ---- 5. ONE pass over the survivors' parent lists. A parent that moved
+     * is renumbered; a parent that is gone becomes 0xFFFFFFFF. The old code
+     * needed a full sweep for each of those, per removal. ---- */
+    for (uint32_t i = 0; i < w; i++){
+        for (uint32_t k = 0; k < t[i].n_parents; k++){
+            uint32_t pv = mpol_par_at(st, &t[i], k);
+            if (pv == 0xFFFFFFFFu) continue;         /* already cleared */
+            uint32_t nv = (pv < n) ? remap[pv] : MPOL_IDX_NONE;
+            mpol_par_set(st, &t[i], k, nv == MPOL_IDX_NONE ? 0xFFFFFFFFu : nv);
+        }
+    }
+    /* ---- 6. claims' claimer field follows the same remap ---- */
+    { mpol_claim* c = mpol_claims_base(st);
+      uint32_t ncl = *(uint32_t*)((char*)st+12);
+      for (uint32_t i = 0; i < ncl; i++){
+          uint32_t cl = c[i].claimer;
+          c[i].claimer = (cl < n && remap[cl] != MPOL_IDX_NONE) ? remap[cl] : cl;
+      } }
+
+    /* ---- 7. rebuild the three indices. Every array moved, so patching each
+     * chain would cost more than starting again -- and starting again cannot
+     * leave a stale link behind, which is the failure mode that matters. ---- */
+    { uint32_t nb = mpol_nbuckets(st);
+      uint32_t cap = *(uint32_t*)((char*)st+4);
+      memset(mpol_node_head(st), 0xFF, (size_t)(nb + cap) * sizeof(uint32_t));
+      memset(mpol_out_head(st),  0xFF, (size_t)(nb + cap) * sizeof(uint32_t));
+      memset(mpol_clm_head(st),  0xFF, (size_t)(nb + cap) * sizeof(uint32_t));
+      for (uint32_t i = 0; i < w; i++) mpol_node_idx_link(st, i);
+      { uint32_t no = *(uint32_t*)((char*)st+8);
+        for (uint32_t i = 0; i < no; i++) mpol_out_idx_link(st, i); }
+      { uint32_t ncl = *(uint32_t*)((char*)st+12);
+        for (uint32_t i = 0; i < ncl; i++) mpol_clm_idx_link(st, i); } }
+
+    return nremoved;
+}
+
+/* Mark a node and every in-pool DESCENDANT of it, for batch removal.
+ * Sweeps to a fixpoint rather than walking children, because there is no
+ * child index: a node is a descendant if any of its parents is marked, so
+ * repeating the sweep until nothing new is marked closes the set. The round
+ * bound is 128 -- twice the 64-transaction cluster limit, so it can never cut
+ * a legitimate closure short, and it still terminates if the graph is ever
+ * malformed. Only reached when a block actually conflicts with something in
+ * the pool, which is the rare case. */
+/* TWO MARK LEVELS, and the distinction is the whole correctness of the batch:
+ *
+ *   1 = this node leaves ALONE. A transaction the block CONFIRMED: its
+ *       children are still valid, they just have one fewer unconfirmed
+ *       ancestor, and Core keeps them (removeForBlock, not removeRecursive).
+ *   2 = this node leaves WITH its descendants. A transaction the block
+ *       CONFLICTED with: everything spending its outputs is now unspendable.
+ *
+ * Propagation follows level 2 only. The first version of this used a single
+ * mark and swept "a node is a descendant if any parent is marked", which
+ * quietly took the children of every CONFIRMED transaction too -- caught by
+ * test_mempool_core_parity's "A's child SURVIVES", which is exactly the case
+ * that distinguishes the two removal kinds.
+ *
+ * A node already marked 1 that turns out to be a descendant of a conflict is
+ * upgraded to 2: it is leaving either way, but its own descendants must then
+ * follow it. */
+static void mpol_mark_with_descendants(void* st, uint32_t n, uint32_t root){
+    if (root >= n || g_rm_mark[root] == 2) return;
+    g_rm_mark[root] = 2;
+    mpol_node* t = mpol_nodes_base(st);
+    int changed = 1, rounds = 0;
+    while (changed && rounds++ <= 128){
+        changed = 0;
+        for (uint32_t i = 0; i < n; i++){
+            if (g_rm_mark[i] == 2) continue;
+            for (uint32_t k = 0; k < t[i].n_parents; k++){
+                uint32_t pv = mpol_par_at(st, &t[i], k);
+                if (pv < n && g_rm_mark[pv] == 2){ g_rm_mark[i] = 2; changed = 1; break; }
+            }
+        }
+    }
+}
+
 /* Remove a tx AND its whole in-pool descendant set (by txid). Returns the
  * number of entries removed (0 if absent). */
 long mpool_policy_remove_package(void* st, void* mp, const unsigned char txid[32]){
@@ -2387,18 +2586,39 @@ long mpool_policy_block_connect(void* st, void* mp,
     if (!ok) return -1;
     long removed = 0;
     static unsigned char scratch[1<<20];
+
+    /* ---- MEM-12 (second half): mark everything, then remove it ONCE ----
+     *
+     * This used to call remove_confirmed (and, on a conflict,
+     * mpool_policy_remove_package) per transaction, each O(n), giving O(n*m)
+     * for an m-transaction block. Marking first and compacting once is
+     * O(n + links) for the whole block.
+     *
+     * If the scratch cannot be sized the old per-transaction path still
+     * works, so the fallback is the previous behaviour rather than a
+     * failure -- a block connect must not be skippable on an allocation. */
+    uint32_t n_nodes = *(uint32_t*)((char*)st+16);
+    int batch = (n_nodes > 0) && g_batch_connect && mpol_rm_reserve(n_nodes);
+    if (batch) memset(g_rm_mark, 0, n_nodes);
+
     for (uint64_t j = 0; j < ntx; j++){
         unsigned char info[64];
-        if (tx_parse(info, p, (unsigned long)(end - p)) != 1) return removed;
+        if (tx_parse(info, p, (unsigned long)(end - p)) != 1) break;
         uint64_t txlen; memcpy(&txlen, info, 8);
         unsigned char txid[32];
         /* a txid we could not compute must not be used to evict anything */
-        if (tx_txid(txid, p, (unsigned long)txlen, scratch, sizeof scratch) != 1) return removed;
+        if (tx_txid(txid, p, (unsigned long)txlen, scratch, sizeof scratch) != 1) break;
         if (mpol_confirmed_hook) mpol_confirmed_hook(txid);
         if (j > 0){
             /* the confirmed tx leaves alone; txs CONFLICTING with its spends
              * leave with their descendants */
-            removed += remove_confirmed(st, mp, txid);
+            int self_ci = -1;
+            if (batch){
+                self_ci = find_node(st, txid);
+                if (self_ci >= 0) g_rm_mark[self_ci] = 1;   /* confirmed: alone */
+            } else {
+                removed += remove_confirmed(st, mp, txid);
+            }
             static unsigned char cprev[MPOL_MAX_IN][32];
             static uint32_t cidx[MPOL_MAX_IN], cseq[MPOL_MAX_IN];
             mpol_txmeta cm;
@@ -2406,14 +2626,36 @@ long mpool_policy_block_connect(void* st, void* mp,
             for (int i = 0; i < cn; i++){
                 int cl = find_claim(st, cprev[i], cidx[i]);
                 if (cl >= 0){
-                    unsigned char ct[32];
-                    memcpy(ct, mpol_nodes_base(st)[cl].txid, 32);
-                    removed += mpool_policy_remove_package(st, mp, ct);
+                    if (batch){
+                        /* A CONFIRMED transaction claims its own inputs, so
+                         * find_claim answers with the transaction itself --
+                         * which is not a conflict, it is the very transaction
+                         * the block confirmed. The per-transaction path never
+                         * saw this because remove_confirmed had already
+                         * deleted those claims by the time it looked; the
+                         * batch defers every removal, so the claim is still
+                         * there and has to be recognised.
+                         *
+                         * Missing it marked the confirmed transaction as a
+                         * conflict ROOT, which took its children with it --
+                         * caught by test_mempool_core_parity's
+                         * "A's child SURVIVES". Nothing is lost by skipping:
+                         * the accept path allows at most one claimer per
+                         * outpoint, so if this transaction is the claimer,
+                         * no other in-pool transaction is. */
+                        if (cl != self_ci)
+                            mpol_mark_with_descendants(st, n_nodes, (uint32_t)cl);
+                    } else {
+                        unsigned char ct[32];
+                        memcpy(ct, mpol_nodes_base(st)[cl].txid, 32);
+                        removed += mpool_policy_remove_package(st, mp, ct);
+                    }
                 }
             }
         }
         p += txlen;
     }
+    if (batch) removed += mpol_remove_marked(st, mp, n_nodes);
     note_block_connected(st);
     return removed;
 }
