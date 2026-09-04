@@ -378,10 +378,11 @@ static int ts_agg_hashes(const tapctx_t* c, const txview_t* t,
      * then hash it in place.
      *
      * This run is NOT wire data: it is built by this codebase from resolved
-     * UTXOs (daemon/tx_verify.c and bitcoin_txval_modern.c both write one
-     * single-byte compactsize per entry and refuse a scriptPubKey >= 253
-     * bytes outright). It therefore has no `end` to bound against, and the
-     * API gives none. Rather than trust that, the walk carries its own hard
+     * UTXOs (daemon/tx_verify.c, bitcoin_tapagg.asm and bitcoin_txval_modern.c
+     * each write a minimal CompactSize per entry, capped at MAX_SCRIPT_SIZE
+     * -- SCR-5, audit 2026-09-03: the pre-fix single-byte encoding refused a
+     * scriptPubKey >= 253 bytes outright, a false reject vs Core). It
+     * therefore has no `end` to bound against, and the API gives none. Rather than trust that, the walk carries its own hard
      * ceiling: TS_SPK_RUN_CAP bytes total, checked before every advance, so a
      * corrupted length cannot run away even though it cannot be proven
      * in-bounds. The real fix is an spks_len parameter; that is an ABI change

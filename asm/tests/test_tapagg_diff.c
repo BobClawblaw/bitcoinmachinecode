@@ -57,7 +57,7 @@ static void fail(const char* what, long tag){
 }
 
 /* the adapter: per-input records from plain arrays */
-typedef struct { u8 op[36]; u64 v; u8 spk[300]; u32 sl; } inrec_t;
+typedef struct { u8 op[36]; u64 v; u8 spk[10001]; u32 sl; } inrec_t;   /* SCR-5: up to MAX_SCRIPT_SIZE */
 static void get_in(void* ctxv, u64 k, const u8** op, u64* v, const u8** spk, u32* sl){
     inrec_t* r = &((inrec_t*)ctxv)[k];
     *op = r->op; *v = r->v; *spk = r->spk; *sl = r->sl;
@@ -110,13 +110,38 @@ int main(void){
         if (memcmp(pc.buf, pa.buf, pc.used)){ fail("arena bytes", tag); break; }
         tag++;
     }
-    { /* sl == 0xfd rejects in the sizing pass, identically */
-        recs[0].sl = 0xfd;
+    { /* SCR-5 (audit 2026-09-03): a co-input script >= 0xfd now ENCODES
+       * (3-byte compactsize length) instead of rejecting -- identically in
+       * both twins, byte-for-byte. And > MAX_SCRIPT_SIZE (10000) still
+       * rejects, with the same reason string. */
+        static const u32 bigs[4] = { 0xfd, 0x100, 531, 10000 };
+        for (int q = 0; q < 4; q++){
+            recs[0].sl = bigs[q];
+            for (u32 b=0;b<recs[0].sl;b++) recs[0].spk[b] = (u8)(b*7+q);
+            bytepool_t q1, q2; memset(&q1,0,sizeof q1); memset(&q2,0,sizeof q2);
+            tapagg_t dc, da; const char *rc_="", *ra_="";
+            int  c = txv_test_tapagg_build(&q1, &dc, get_in, recs, 1, tx, build_tx(tx,1), &rc_);
+            long a = tapagg_build_asm(&q2, &da, get_in, recs, 1, tx, build_tx(tx,1), &ra_);
+            compared++;
+            if (c != (int)a || c != 1){ fail("big-spk accept", ++tag); continue; }
+            if (memcmp(&dc, &da, sizeof dc) || q1.used != q2.used ||
+                memcmp(q1.buf, q2.buf, q1.used)) fail("big-spk arena bytes", ++tag);
+            /* the run's first bytes (at sp_off) must be the minimal
+             * compactsize 0xfd LE16 */
+            const u8* run = q1.buf + dc.sp_off;
+            if (run[0] != 0xfd || (u32)(run[1] | (run[2]<<8)) != bigs[q])
+                fail("big-spk compactsize header", ++tag);
+            free(q1.buf); free(q2.buf);
+        }
+        recs[0].sl = 10001;
+        recs[0].spk[10000] = 0x42;
+        bytepool_t q3, q4; memset(&q3,0,sizeof q3); memset(&q4,0,sizeof q4);
         tapagg_t dc, da; const char *rc_="", *ra_="";
-        int  c = txv_test_tapagg_build(&pc, &dc, get_in, recs, 1, tx, build_tx(tx,1), &rc_);
-        long a = tapagg_build_asm(&pa, &da, get_in, recs, 1, tx, build_tx(tx,1), &ra_);
+        int  c = txv_test_tapagg_build(&q3, &dc, get_in, recs, 1, tx, build_tx(tx,1), &rc_);
+        long a = tapagg_build_asm(&q4, &da, get_in, recs, 1, tx, build_tx(tx,1), &ra_);
         compared++;
-        if (c != (int)a || c != 0 || strcmp(rc_, ra_)) fail("oversized-spk reject", ++tag);
+        if (c != (int)a || c != 0 || strcmp(rc_, ra_)) fail("over-cap reject", ++tag);
+        free(q3.buf); free(q4.buf);
         recs[0].sl = 30;
     }
     { /* malformed tx -> strip failure, identically (after arena writes) */

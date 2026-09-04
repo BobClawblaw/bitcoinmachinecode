@@ -339,15 +339,23 @@ int txval_modern(const uint8_t* tx, int64_t txlen, void* utxo){
              * safe and also stop burning ~160 KB of stack per call. */
             static uint8_t po[MV_MAX_IN*36];
             static uint8_t am[MV_MAX_IN*8];
-            static uint8_t sp[MV_MAX_IN*(1+PREV_SPK_BUF_MAX)];
+            /* SCR-5 (audit 2026-09-03): 3-byte slots -- a CompactSize length
+             * is 1 or 3 bytes for any prev_spklen <= PREV_SPK_BUF_MAX. */
+            static uint8_t sp[MV_MAX_IN*(3+PREV_SPK_BUF_MAX)];
             for (uint64_t k=0;k<T.nin;k++){ memcpy(po+k*36, T.in[k].outpoint, 36);
                 uint64_t a=T.in[k].amount; for(int b=0;b<8;b++) am[k*8+b]=(uint8_t)(a>>(8*b));
             }
             {
                 int off=0;
                 for (uint64_t k=0;k<T.nin;k++){
-                    if (T.in[k].prev_spklen < 0xfd) sp[off++]=(uint8_t)T.in[k].prev_spklen;
-                    else { g_reason = "taproot spend with a >252-byte co-input prevout script (unsupported)"; return 0; }
+                    /* SCR-5: emit a real minimal CompactSize (Core's
+                     * ser_compactsize in PrecomputedTransactionData::Init);
+                     * the old code REJECTED a >=253-byte co-input script --
+                     * a false reject vs Core for e.g. a 531-byte bare-
+                     * multisig co-input spending alongside a P2TR input. */
+                    uint32_t slk = T.in[k].prev_spklen;
+                    if (slk < 0xfd) sp[off++]=(uint8_t)slk;
+                    else { sp[off++]=0xfd; sp[off++]=(uint8_t)(slk&0xff); sp[off++]=(uint8_t)(slk>>8); }
                     memcpy(sp+off, T.in[k].prev_spk, T.in[k].prev_spklen);
                     off += T.in[k].prev_spklen;
                 }

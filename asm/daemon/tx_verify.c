@@ -389,12 +389,19 @@ static int tapagg_build(bytepool_t* pool, tapagg_t* d,
     u64 splen = 0;
     for (u64 k=0;k<nin;k++){
         get(ctx, k, &op, &v, &spk, &sl);
-        /* BIP341's aggregate scriptPubKey array encodes each entry's length
-         * in ONE byte, so a >=0xfd prevout script cannot be expressed in it.
-         * An independent literal, deliberately NOT derived from TXV_SPK_CAP
-         * (which is the consensus MAX_SCRIPT_SIZE and much larger). */
-        if (sl >= 0xfd) { *reason = "prevout script too large for taproot aggregate sighash"; return 0; }
-        splen += 1u + sl;
+        /* SCR-5 (audit 2026-09-03): BIP341's sha_scriptpubkeys hashes each
+         * spent scriptPubKey prefixed by a CompactSize length -- Core's
+         * PrecomputedTransactionData::Init uses ser_compactsize, and a
+         * scriptPubKey up to MAX_SCRIPT_SIZE (10000) is consensus-spendable.
+         * This run previously encoded the length in ONE byte and REJECTED any
+         * co-input script >= 253 -- a false reject against the live chain
+         * (a bare multisig co-input + a P2TR input = whole tx refused, block
+         * rejected, node stalls on a fork Core accepts). The reader
+         * (ts_agg_hashes) already walks a proper minimality-checked
+         * compactsize; the writers were the drift. sl is already capped at
+         * TXV_SPK_CAP = MAX_SCRIPT_SIZE < 0x10000, so 1 or 3 bytes suffice. */
+        if (sl > TXV_SPK_CAP) { *reason = "prevout script too large"; return 0; }
+        splen += (sl < 0xfd ? 1u : 3u) + sl;
     }
     /* strip_witness never grows a transaction (it only drops the marker/flag
      * and the witness section, and re-serializes everything else verbatim),
@@ -429,11 +436,13 @@ static int tapagg_build(bytepool_t* pool, tapagg_t* d,
          * adapter that allocated would dangle po/am/sp/ns, and this catches it
          * before the first write of the iteration rather than after. */
         if (pool->buf != base) { *reason = "internal: taproot arena moved during build"; return 0; }
-        if (sl >= 0xfd || w + 1u + sl > splen) { *reason = "internal: taproot arena sizing pass disagreed"; return 0; }
-        memcpy(po + k*36, op, 36);
-        for (int b=0;b<8;b++) am[k*8+b] = (u8)(v>>(8*b));
-        sp[w++] = (u8)sl;
-        memcpy(sp + w, spk, sl); w += sl;
+        { u64 csl = (sl < 0xfd ? 1u : 3u);
+          if (sl > TXV_SPK_CAP || w + csl + sl > splen) { *reason = "internal: taproot arena sizing pass disagreed"; return 0; }
+          memcpy(po + k*36, op, 36);
+          for (int b=0;b<8;b++) am[k*8+b] = (u8)(v>>(8*b));
+          if (sl < 0xfd){ sp[w++] = (u8)sl; }
+          else { sp[w++] = 0xfd; sp[w++] = (u8)(sl & 0xff); sp[w++] = (u8)(sl >> 8); }
+          memcpy(sp + w, spk, sl); w += sl; }
     }
     long nslen = strip_witness(tx, (int64_t)txlen, ns, (long)txlen);
     if (nslen <= 0) { *reason = "malformed witness (strip failed)"; return 0; }
