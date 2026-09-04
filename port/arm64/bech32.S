@@ -442,6 +442,14 @@ bech32_decode:
 .dc_scan:
 	ldrb w10, [x22, x23]
 	cbz  w10, .dc_scan_done
+	/* SER-1/WAL-1 (audit 2026-09-03): BIP173 caps a bech32(/m) string at
+	 * 90 characters. Reject the over-length form HERE, before the data loop
+	 * below converts unbounded input into the output buffers. On x86 the
+	 * workspace overflowed WS into the following .bss; here out5's capacity
+	 * is caller-sized, but the cap is consensus-visible anyway (Core rejects
+	 * >90-char addresses), so both engines must answer -1 identically. */
+	cmp  x23, #90
+	b.hs .dc_err
 	cmp  w10, #'1'
 	b.ne .dc_notsep
 	mov  x24, x23
@@ -481,6 +489,12 @@ bech32_decode:
 .dc_data:
 	ldrb w10, [x26, x25]
 	cbz  w10, .dc_data_done
+	/* hard belt (SER-1/WAL-1): the 90-char scan cap above makes this
+	 * unreachable for NUL-terminated input; kept so the data loop can never
+	 * outgrow its destination even for a non-NUL-terminated caller buffer
+	 * (x86 carries the same belt). */
+	cmp  x25, #90
+	b.hs .dc_err
 	ldrb w11, [x12, x10]
 	cmp  w11, #0xff
 	b.eq .dc_err

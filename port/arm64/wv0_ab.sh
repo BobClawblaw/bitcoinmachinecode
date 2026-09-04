@@ -2,7 +2,7 @@
 # Build + run the WITNESS_V0 FAD A/B driver against a chosen bitcoin_interp.S.
 # Usage: wv0_ab.sh <interp.S-path> <tag>
 set -e
-cd /repo/port/arm64
+cd "$(dirname "$(readlink -f "$0")")"
 P=. A=../../asm
 gcc -march=armv8.2-a+sha2 -c -o bitcoin_interp.o "$1"
 REALC="$A/daemon/lsm_manifest.c $A/daemon/netperm.c $A/daemon/subnet.c $A/daemon/chainparams.c $A/daemon/signet_block.c $A/daemon/signet_verify.c $A/daemon/signet.c $A/daemon/minchainwork.c $A/daemon/locator_build.c $A/daemon/archive_verify.c $A/daemon/reorg.c $A/daemon/mempool_persist.c $A/daemon/mempool_compact.c $A/daemon/mempool_cfg.c $A/daemon/fee_hooks.c $A/daemon/fee_estimator.c $A/daemon/zmq_notify.c $A/daemon/zmq_pub.c $A/bitcoin_taproot_sighash.c $A/bitcoin_pow_rules.c $A/daemon/utxo_live.c $A/daemon/block_witness.c $A/daemon/undo_log.c $A/daemon/node_config.c $A/daemon/tx_verify.c $A/bitcoin_scriptverify.c $A/bitcoin_txval_modern.c $A/bitcoin_witness_v0.c $A/bitcoin_segwit.c $A/wallet_core.c $A/bitcoin_mempool_policy.c $A/daemon/tx_submit.c $A/daemon/tx_relay.c $A/daemon/tx_index_tail.c $A/daemon/blk_submit.c $A/daemon/txosp_tail.c $A/daemon/tx_accept.c"

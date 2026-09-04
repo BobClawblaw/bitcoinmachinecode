@@ -78,6 +78,9 @@ s_lasttip:   .zero 8
 s_idxn:      .zero 8
 s_idxbuf:    .zero (512*2)
 s_diffshift: .zero 8
+s_btend:     .zero 8                    /* NET-1: bt_buf + capacity (exclusive); the
+                                         * blocktxn writer checks every append
+                                         * against it (x86 80f03d4) */
 s_blen_spill: .zero 8
 s_txptr:     .zero 8
 s_txlen:     .zero 8
@@ -134,6 +137,7 @@ viol_invtx:    .ascii "transaction inv sent in violation of protocol\0"
 viol_mempool:  .ascii "mempool request with bloom filters disabled\0"
 viol_txparse:  .ascii "malformed tx payload (parse failure)\0"
 viol_blkshort: .ascii "malformed block payload (shorter than a header)\0"
+viol_gbtidx:   .ascii "getblocktxn with malformed or out-of-bounds tx indices\0"  /* Core: Misbehaving(100) */
 cn_getbtxn:.ascii "getblocktxn\0"
 cn_btxn:   .ascii "blocktxn\0"
 cn_cmpct:  .ascii "cmpctblock\0"
@@ -272,6 +276,12 @@ node_serve_loop:
 	str  x3, [x23]
 	LOADADDR x23, s_served
 	str  xzr, [x23]
+	/* NET-1: one-past-the-end of the blocktxn assembly buffer, checked by
+	 * the .do_getblocktxn writer before every append. */
+	LOADADDR x23, bt_buf
+	add  x9, x23, #(8<<20)
+	LOADADDR x23, s_btend
+	str  x9, [x23]
 	mov  x20, x1                      /* lfd */
 	mov  x21, x2                      /* st */
 	mov  x22, x3                      /* ht_idx */
@@ -1426,43 +1436,65 @@ node_serve_loop:
 	ldr  x9, [x9]
 	cmp  x9, #33
 	b.lo .next
-	/* node_serve_block_by_hash(st, pl_buf, sb_buf, cap) */
-	mov  x0, x21
-	LOADADDR x1, pl_buf
-	LOADADDR x2, sb_buf
-	mov  x3, #(8<<20)
-	bl   node_serve_block_by_hash
-	LOADADDR x9, s_blen_spill
-	str  x0, [x9]
-	cmp  x0, #0
-	b.le .next
-	/* parse indexes (DifferenceFormatter) from pl_buf+32 */
-	LOADADDR x9, s_idxn
-	str  xzr, [x9]
-	LOADADDR x9, s_diffshift
-	str  xzr, [x9]
+	/* NET-1 fix (audit 2026-09-03, x86 80f03d4): every byte this path parses
+	 * is attacker-chosen. The old code read varint bytes with no bound
+	 * against the payload length (a short message parsed stale bytes from
+	 * earlier traffic in pl_buf) and wrote one u16 per count into s_idxbuf
+	 * (512 entries) with no capacity check -- count 0xffff wrote 65535 u16 =
+	 * 131 KB over .bss. Core caps each index at MAX_SIZE and
+	 * Misbehaving(100)s req.indexes.size() > block.vtx.size(). Our
+	 * equivalent, enforced BEFORE the block is even looked up (a peer may
+	 * probe our store inventory for free; it may not spray past it): the
+	 * count must fit s_idxbuf, every varint byte must lie inside the
+	 * announced payload, malformed diff forms score the peer, and any
+	 * breach answers nothing. The parse bound lives in x16 across the loop
+	 * (no calls happen inside the parse); the writer bound below lives in
+	 * the s_btend slot because the tx loop makes calls. */
 	LOADADDR x10, pl_buf
-	add  x10, x10, #32                /* cursor */
+	add  x16, x10, x9                 /* payload end = pl_buf + s_plen */
+	add  x10, x10, #32                /* cursor: count varint */
+	add  x9, x10, #1
+	cmp  x9, x16
+	b.hi .gbkt_done                   /* payload ends before the count byte */
 	ldrb w11, [x10]                   /* count varint */
 	cmp  w11, #0xfd
 	b.hs .gbtx_bigcnt
 	add  x10, x10, #1
-	mov  x12, x11                      /* rcx = count */
+	mov  x12, x11                      /* count (1-byte form) */
 	b    .gbtx_cnthave
 .gbtx_bigcnt:
 	cmp  w11, #0xfd
-	b.ne .gbkt_done
+	b.ne .gbkt_done                    /* 0xfe/0xff unsupported form -> bail */
+	add  x9, x10, #3
+	cmp  x9, x16
+	b.hi .gbkt_done                    /* 3-byte varint runs past the payload */
 	ldrh w12, [x10, #1]
 	add  x10, x10, #3
-	mov  x12, x12
 .gbtx_cnthave:
+	/* count must fit s_idxbuf (512 entries; the same cap Core's MAX_SIZE +
+	 * ProcessGetBlockTxn enforcement imposes on a real block). Oversize ->
+	 * score the peer (x86 .gbkt_viol). s_idxn/s_diffshift are initialised
+	 * only after this check, matching the x86 layout. */
+	cmp  x12, #512
+	b.hi .gbkt_viol
+	LOADADDR x9, s_idxn
+	str  xzr, [x9]
+	LOADADDR x9, s_diffshift
+	str  xzr, [x9]
 .LSV_gbtx_idxloop:
-	cbz  x12, .gbkt_build
-	ldrb w13, [x10]                   /* diff varint */
+	cbz  x12, .gbtx_parsed
+	/* diff varint at x10 -- bounded against the payload first */
+	add  x9, x10, #1
+	cmp  x9, x16
+	b.hi .gbkt_viol                    /* diff byte runs past the payload */
+	ldrb w13, [x10]
 	cmp  w13, #0xfd
 	b.lo .gbtx_d1
 	cmp  w13, #0xfd
-	b.ne .gbkt_done
+	b.ne .gbkt_viol                    /* 0xfe/0xff form is malformed here */
+	add  x9, x10, #3
+	cmp  x9, x16
+	b.hi .gbkt_viol                    /* 3-byte diff runs past the payload */
 	ldrh w14, [x10, #1]
 	add  x10, x10, #3
 	mov  w13, w14
@@ -1486,6 +1518,18 @@ node_serve_loop:
 	str  x9, [x15]                    /* diffshift = index+1 */
 	sub  x12, x12, #1
 	b    .LSV_gbtx_idxloop
+.gbtx_parsed:
+	/* ---- vector is well-formed; NOW look the block up ----
+	 * node_serve_block_by_hash(st, pl_buf, sb_buf, cap) */
+	mov  x0, x21
+	LOADADDR x1, pl_buf
+	LOADADDR x2, sb_buf
+	mov  x3, #(8<<20)
+	bl   node_serve_block_by_hash
+	LOADADDR x9, s_blen_spill
+	str  x0, [x9]
+	cmp  x0, #0
+	b.le .next                         /* not our block -> answer nothing (not scored) */
 .gbkt_build:
 	/* bt_buf = blockhash(32) + countvarint + txs */
 	LOADADDR x0, bt_buf
@@ -1524,12 +1568,24 @@ node_serve_loop:
 	/* memcpy(bt_buf+s_p, s_txptr, s_txlen) */
 	LOADADDR x9, s_p
 	ldr  x9, [x9]
+	LOADADDR x10, s_txlen
+	ldr  x2, [x10]
+	/* NET-1: the append must fit bt_buf -- check s_p + s_txlen against
+	 * s_btend (dst >= bt_buf is automatic; s_txlen comes from block_tx_at
+	 * so it is sane) before a single byte is written. */
+	add  x9, x9, x2
+	LOADADDR x10, bt_buf
+	add  x9, x9, x10                   /* abs one-past-write address */
+	LOADADDR x10, s_btend
+	ldr  x10, [x10]
+	cmp  x9, x10
+	b.hi .gbkt_done                    /* would overrun the assembly buffer */
+	LOADADDR x9, s_p
+	ldr  x9, [x9]
 	LOADADDR x10, bt_buf
 	add  x0, x10, x9
 	LOADADDR x1, s_txptr
 	ldr  x1, [x1]
-	LOADADDR x2, s_txlen
-	ldr  x2, [x2]
 	bl   .Ls_memcpy_len
 	LOADADDR x9, s_p
 	ldr  x10, [x9]
@@ -1557,6 +1613,14 @@ node_serve_loop:
 	b    .next
 .gbkt_done:
 	b    .next
+/* NET-1: a malformed or over-capacity getblocktxn index vector. Core answers
+ * Misbehaving(100) ("getblocktxn with out-of-bounds tx indices") and sends
+ * nothing; we score via the shared violation hook and stay silent, like the
+ * other parse-failure classes. x0 = reason, tail shared with
+ * .viol_report_next. */
+.gbkt_viol:
+	LOADADDR x0, viol_gbtidx
+	b    .viol_report_next
 
 .next:
 	/* tip-watch: announce a newly-advanced tip exactly once */

@@ -1959,7 +1959,12 @@ script_eval:
 	mov  x23,x0		/* scriptSequence */
 	ldr  w2,[x20,#112]	/* tx_version */
 	cmp  w2,#2
-	b.lt .csv_unsatisfied
+	/* SCR-4 fix (audit 2026-09-03): CTransaction::version is uint32_t and
+	 * CheckSequence does `txTo->version < 2` UNSIGNED (interpreter.cpp). A
+	 * transaction with nVersion >= 0x80000000 HAS BIP68 enforced by Core;
+	 * the signed b.lt read it as negative and false-rejected every CSV spend
+	 * in such a tx. b.lo compares the zero-extended u32 unsigned. */
+	b.lo .csv_unsatisfied
 	ldr  w2,[x20,#108]	/* in_sequence */
 	tst  w2,#0x80000000
 	b.ne .csv_unsatisfied
@@ -2278,6 +2283,21 @@ interp_checksig:
 	bl   stack_second_ptr
 	mov  x21,x0		/* sig elem */
 	ldr  w19,[x21]		/* siglen */
+	/* SCR-3 (audit 2026-09-03): under SIGVERSION_TAPSCRIPT the ENTIRE
+	 * pre-tapscript arm is wrong (Core routes tapscript through
+	 * EvalChecksigTapscript): no sig-encoding checks, no pubkey-encoding
+	 * checks -- and no empty-signature shortcut before the pubkey rules.
+	 * Gate straight into the callback, which implements Core's sequence
+	 * (weight charge only for a non-empty sig; publen == 0 -> hard fail
+	 * REGARDLESS of the signature; publen != 32 -> upgradable success).
+	 * (x86 reads the sigversion through a per-thread interp_state slot;
+	 * here the state IS x20 by this file's convention -- the same
+	 * provenance the CONST_SCRIPTCODE gate below and the encoding helpers
+	 * already rely on. script_eval's .op_checksigadd is BAD_OPCODE outside
+	 * tapscript, so only interp_checksig needs the gate.) */
+	ldr  w2,[x20,#48]
+	cmp  w2,#SIGVERSION_TAPSCRIPT
+	b.eq .cs_call
 	/* Core's order at the top of EvalChecksigPreTapscript (2026-09-02, the
 	 * differential): SIGNATURE encoding (an empty sig passes it), then PUBLIC
 	 * KEY encoding (STRICTENC), THEN the empty-sig -> false shortcut. The
@@ -2442,7 +2462,13 @@ interp_checksig_add:
 	bl   stack_third_ptr
 	mov  x21,x0		/* sig elem (sp-3) */
 	ldr  w19,[x21]
-	cbz  w19,.csa_false
+	/* SCR-3 (audit 2026-09-03): the empty-signature shortcut must NOT skip
+	 * the callback under tapscript -- Core's EvalChecksigTapscript evaluates
+	 * the pubkey rules regardless of the signature, and an empty pubkey is a
+	 * hard script failure (TAPSCRIPT_EMPTY_PUBKEY), not a pushed 0. The C
+	 * callback implements Core's full sequence. Reached only from
+	 * .op_checksigadd, which is BAD_OPCODE outside tapscript, so the callback
+	 * runs unconditionally (mirrors the x86 shortcut removal in 7f9aac6). */
 	ldr  x0,[x20,#96]
 	cbz  x0,.csa_false
 	TLS_ADDR x12, interp_slice

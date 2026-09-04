@@ -1,4 +1,4 @@
-# TODO — arm-port state after the 2026-09-03 session (sync 6 deployed as arm-5)
+# TODO — arm-port state after the 2026-09-03/04 session (audit-remediation parity landed, deployed as arm-8)
 
 Everything below is landed on `arm-port` and pushed. History lives in
 `worklog/2026-09-0{1,2,3}.md`; the per-module port status is
@@ -28,12 +28,11 @@ Everything below is landed on `arm-port` and pushed. History lives in
       The repro exits 0; fuzz_verify_diff now reports 0 code-only mismatches
       over 3 seeds x 20,000 cases; see docs/FEATURE_GAPS.md (Update
       2026-09-03, CLOSED). The repro stays in validation/ as a regression
-      check. Left for a later session, found while implementing: the
-      CHECKMULTISIG up-front strip raises SIG_FINDANDDELETE for ANY on-stack
-      signature found in the scriptCode BEFORE the matching loop, where Core
-      interleaves per-signature (an encoding-invalid sig 0 preempts a later
-      signature's FAD in Core, not here) — verdict-safe, BASE-only gate, and
-      only reachable when no earlier signature's encoding check has fired.
+      check. NOTE (2026-09-04, VOID per aa70c08): the "left for a later
+      session" CHECKMULTISIG strip-interleaving concern below is DEAD —
+      Core v31's k-loop strips ALL signatures before the matching loop (the
+      same structure the port has); the "Core interleaves per-signature"
+      claim misread interpreter.cpp:1146. Nothing to redesign.
 - [x] The auth half of this item is done: `synth_corpus_diff.py` imports
       `spend_corpus_diff.py` for Engine/ORACLE/SHIM, so spend's module-level
       `_AUTH = _auth()` ran at synth's import time and the synth harness
@@ -41,6 +40,14 @@ Everything below is landed on `arm-port` and pushed. History lives in
       first real rpc() use (spend still needs credentials when it runs; the
       synth run needs nothing) — verified by running the synth harness with no
       cookie env var at all: exit 0, 158/158 rows div=0.
+- [x] Archive-gap re-timing: CLOSED 2026-09-03 23:40 UTC — connect bound
+      honest but not effective (62.74s / 18.24s / 118.93s vs pre-fix
+      20/148/86/50/20); slow boots are the tip-moved boots, residual is the
+      catch-up-worker spin-up downstream of connect. Details in the worklog.
+- [x] Merge-carried audit parity (SCR-3/SCR-4, SER-1/WAL-1, NET-1) ported to
+      ARM 2026-09-04, sweep round 22 green (pass 309 / fail 4 env-only),
+      deployed as arm-8 with aa70c08. RPX-1 was arch-neutral C (arrived with
+      the merge, nothing to port).
 - [ ] `validation/spend_corpus_diff.py` itself has still never run on this
       port: it needs a synced Bitcoin Core over RPC
       (`BMC_ORACLE_RPC_PORT`/`BMC_ORACLE_COOKIE`) and this box has no Core
@@ -55,15 +62,20 @@ Everything below is landed on `arm-port` and pushed. History lives in
       `make -C port/arm64 abi-a64-check` -- see the 2026-09-03 worklog for what
       it took (a frame walk, symbolic `.equ` frame maps, register-held fixed
       frames) and for the one function it still cannot see.
-- [ ] Boot's archive-gap phase is unexplained and varies 7x (21.87s / 85.46s /
-      148.71s / 49.97s on arm-5; each measured boot splits into ~16-18s to
-      `confirmed-live peer(s)` plus tens of seconds of silence until ONE peer
-      answers `headers: already current`). The phase's own comment claims a
-      caught-up node "returns almost instantly (pure disk reads, no network)",
-      which the logs contradict -- it opens peers and waits for a height
-      answer. Find what bounds that wait (or take the first `already current`
-      instead of the peer that happens to reply), then re-time it across three
-      restarts before calling anything settled.
+- [x] Boot's archive-gap phase — CLOSED 2026-09-03 23:40 UTC after the three
+      owed arm-7 re-timing restarts: 62.74s / 18.24s / 118.93s vs pre-fix
+      20/148/86/50/20 — the 8s connect bound did NOT collapse the phase
+      (distribution unchanged). But the slow boots are now explained: boot 3
+      is the first where `already current` NEVER arrives because the tip
+      genuinely moved under us (booted 965389, network 965391) — the check
+      isn't stalled, the network isn't current. The ~100s residual is the
+      catch-up worker spin-up: 16 workers print `(connecting)` for ~102s with
+      153 confirmed-live peers available, one 1-block span fetched in 0.03s
+      once headers land. Connect is bounded; the stall is the handshake /
+      SO_RCVTIMEO=15s reads / sequential per-try structure downstream of
+      connect. Next lever (optional): bound the workers' first usable peer or
+      reuse a confirmed-live peer for tiny spans. Details in the 23:40 UTC
+      worklog entry.
 - [ ] Covering the last 6 unmodelled frames in the AArch64 ABI auditor needs
       offsets as RANGES: `point_scalar_mul_glv` bases its frame on `x28`
       (`mov x28,sp`, stores as `[x28,#TAB]`) and clamps sp to 16 through `x9`,
