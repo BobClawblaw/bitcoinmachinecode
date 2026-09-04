@@ -4,8 +4,8 @@ Companion to `CODEBASE_AUDIT_2026-09-03.md` (182 findings; 29 distinct
 CRITICAL+HIGH after de-duplication). This file records what has been fixed,
 what has not, and what was found along the way.
 
-**Status as of 2026-09-04 (overnight pass): 25 of the 29 CRITICAL+HIGH
-closed, 4 partial, 0 fully untouched.
+**Status as of 2026-09-04 (second pass): 28 of the 29 CRITICAL+HIGH closed,
+1 partial (MEM-3), 0 open.
 Full gate: 218 test binaries pass; 1 fails on a stale fixture (below). Everything MEDIUM and below is untouched except
 UTX-3** (one MEDIUM, UTX-3, was
 closed because it sits on the same silent-coin-loss path as the HIGHs around
@@ -121,6 +121,35 @@ Two results found while fixing, not in the audit:
 
 ---
 
+### Closed in the second pass (2026-09-04)
+
+| Finding | Sev | What it was | Commit |
+|---|---|---|---|
+| VAL-4 (BIP68) | HIGH | Relative timelocks absent from block connect; the nLockTime half was `ead4067` | `c954682` |
+| MEM-1 | HIGH | `nLockTime` never decoded on the admission path; no finality or BIP68 in the mempool | `6079099` |
+| VAL-5 (rest) | HIGH | No timestamp floor, 2-hour ceiling or legacy-version rules on headers | `a456bd4` |
+| STO-1 (rest) | HIGH | Disconnect persisted its applied height once, after the loop; a crash left an unrepairable state | `355c37e` |
+| MEM-4 | HIGH | Full claims/outreg tables silently registered nothing, so double-spends went undetected | `13b4a65` |
+
+**VAL-4 and MEM-1 together close the last "we accept what Core rejects"
+divergence of the finality kind**, on both the block and the mempool path,
+sharing one implementation (`daemon/seqlocks.h`) so the two cannot drift.
+
+Three of these needed a test correction that the negative control caught:
+
+* **MEM-4's first fixture was vacuous.** With 1-input transactions the node
+  table and the claims table fill together, so the node-slot check refused
+  first and disabling the fix changed nothing. Four-input transactions make
+  claims outrun nodes, which is the actual shape of the defect; the control
+  then shows 6 transactions accepted with only 8 of their 24 inputs
+  registered.
+* **STO-1's first fixture was coinbase-only**, so it wrote no undo files at
+  all and could not reach the state under test while appearing to run.
+* **MEM-4's first placement stole other rules' reasons**, breaking
+  `test_truc_policy`; it belongs at the commit boundary, not in the prechecks.
+
+---
+
 ### Two gate defects found by running `make test` end to end
 
 Both predate this pass, and each was hiding the other.
@@ -191,53 +220,29 @@ not in the audit.
 
 ### 4.1 Partial
 
-* **VAL-4** — `IsFinalTx` is enforced (`ead4067`); BIP68 `SequenceLocks` is
-  not, on either the block or the mempool path. Doing BIP68 first would have
-  been actively wrong: it is built on `vi->locktime`, which was returning
-  bytes from the output section until `b0c4231`.
-* **VAL-5** — the boot header fetch PoW-gates (`141c786`), but the MTP
-  time-too-old / now+2h / legacy-version rules are still unenforced, in the
-  fetch and in `reorg_analyze`. Note the MTP machinery now exists:
-  `val_mtp()` landed with VAL-4 and is Core's `GetMedianTimePast`.
-* **MEM-3 / MEM-4** — MEM-5 is fixed (`9510813`); MEM-3 and MEM-4 are not,
-  and the reason is a finding in itself. **The audit's first suggested fix for
-  MEM-3 is wrong for this codebase.** It proposes rejecting a transaction with
-  more in-pool parents than can be recorded, "Core's pre-v31
-  `too-long-mempool-chain` would fire at 25 anyway" — but this node implements
-  Core v31 **cluster** limits (64 transactions / 101 kvB), not the 25-ancestor
-  chain limit, so a child of 63 parents forming a 64-cluster is legal and Core
-  accepts it. Implemented, it fails this project's own `test_mempool_policy`
-  case *"child C joins them: cluster of exactly 64 accepted"* — a silent
-  corruption traded for a false reject and a relay divergence.
-
-  Raising `MPOL_MAX_PARENTS` to 63 was **measured, not estimated**:
-  `mpol_node` grows 184 → 336 bytes, so the policy state grows **+152 MB** at
-  the default 1,048,576-node sizing (184 MB → 336 MB) — not a silent change to
-  a `MAP_SHARED` region several processes map. The real fix is the audit's
-  second option, storing parents out of line, which is a shared-memory layout
-  change and wants its own pass. MEM-4 (claims/outreg overflow) is the same
-  shape and belongs with it.
-
-* **STO-1** — the boot guard is in (`4f0da7b`): an applied height ahead of the
-  archive tip halts loudly instead of appending a branch it never applies. The
-  per-block ordering the audit asks for — `persist_applied_height(h-1)` →
-  `unapply(h)` → `undo_discard(h)`, with an idempotent replay over the
-  retained undo file — is NOT done. It changes the durability ordering of the
-  UTXO set and needs a crash-injection test. The other crash window (applied =
-  T with undo already discarded, so the set is at T−k while `tip == applied`
-  and nothing looks wrong) is not detected by the guard and needs that
-  ordering fix.
+* **MEM-3** — the only CRITICAL+HIGH not closed. The 24-parent cap silently
+  truncates `parent[]`, and descendants are discovered only through it, so
+  replacing or evicting the 25th parent orphans the child in the pool. **The
+  audit's first suggested fix is wrong for this codebase** — see §2 — and the
+  naive alternative was measured, not estimated: raising `MPOL_MAX_PARENTS` to
+  63 grows `mpol_node` from 184 to 336 bytes, **+152 MB** of shared policy
+  state at the default 1,048,576-node sizing. The real fix is out-of-line
+  parent storage, a layout change to a `MAP_SHARED` region several processes
+  map, and it wants its own pass. MEM-4, the sibling table-overflow defect,
+  is closed (`13b4a65`).
 
 * **NET-3** — the inactivity bound is in (`05c979b`), so the DoS is capped at
   20 minutes per slot. Core's `AttemptToEvictConnection` is NOT implemented,
-  so at capacity this node still refuses rather than evicting. `-peertimeout`
-  also remains unwired: it is Core's CONNECT timeout, and repurposing it as an
-  idle interval would be a fresh divergence rather than a fix (DMN-3).
+  so at capacity this node still refuses rather than evicting.
+  `-peertimeout` also remains unwired: it is Core's CONNECT timeout, and
+  repurposing it as an idle interval would be a fresh divergence (DMN-3).
+
+* **VAL-5** — the fetch path enforces all of it (`a456bd4`); `reorg_analyze`
+  is not yet wired to the same rules.
 
 ### 4.2 Open, CRITICAL+HIGH
 
-None outright. STO-1 is partial (below) and MEM-3/MEM-4 are partial; nothing
-in the 29 is now completely untouched.
+None.
 
 ### 4.3 Open, MEDIUM and below
 
