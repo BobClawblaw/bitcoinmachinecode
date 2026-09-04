@@ -1017,8 +1017,16 @@ Missing:
 
 Confirmed genuinely wired into the real serve loop (`bitcoin_serve.asm`),
 not just present as unused/tested-in-isolation code:
-- **BIP152 compact blocks** — both directions (`cmpctblock_build`,
-  `p2p_blocktxn_build`, full message handling).
+- **BIP152 compact blocks — SERVE SIDE ONLY** (`cmpctblock_build`,
+  `p2p_blocktxn_build`). This node answers `MSG_CMPCT_BLOCK` getdata and
+  `getblocktxn`, and negotiates `sendcmpct`. It does NOT receive compact
+  blocks: `bitcoin_serve.asm` writes `cmpctblock` and `blocktxn` and has no
+  inbound handler for either, so a peer's compact block is ignored and the
+  block is fetched in full. NET-9 (audit 2026-09-03) found this entry
+  claiming "both directions … full message handling"; the send side is real
+  and now handles any transaction count (SER-4 fixed the one-byte count that
+  had capped it at 252, i.e. at almost every mainnet block), but the receive
+  side has never existed. Corrected rather than left overstating the surface.
 - **wtxid relay, feefilter, sendheaders** — all genuinely
   implemented and exchanged during real handshakes.
 - **Witness transport (BIP144) — FIXED 2026-08-22** (`31eac9a`, `fe3addb`):
