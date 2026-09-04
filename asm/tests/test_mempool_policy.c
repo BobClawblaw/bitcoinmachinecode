@@ -72,6 +72,30 @@ long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32], unsig
 static int hex_in(unsigned char* out, const char* h);
 
 static int failures = 0;
+
+/* ---- state buffers must be big enough, and SAY SO when they are not ----
+ *
+ * These buffers are fixed-size statics and mpool_policy_state_init memsets
+ * the whole state, so one that is too small overflows into whatever follows
+ * -- silently. This file had been doing exactly that: at n=4096 the state has
+ * always needed more than the 1 MB the buffers declared (1,163,360 bytes
+ * before the MEM-3/MEM-12 layout work, 1,126,240 after), so ~114 KB was being
+ * written past the end on every run. Nothing visible broke until a layout
+ * change moved which static landed in the overflow -- and then it was the
+ * failure counter itself, which is how a passing suite reported "-1
+ * failures".
+ *
+ * Every state_init in this file goes through this macro, so the next time a
+ * layout grows past a buffer the suite fails with the two numbers rather than
+ * corrupting itself. */
+#define POLICY_STATE_INIT(buf, n) do { \
+    size_t _need = mpool_policy_state_size((unsigned)(n)); \
+    if (_need > sizeof (buf)) { \
+        printf("FAIL: policy state buffer too small for n=%u: need %zu, have %zu\n", \
+               (unsigned)(n), _need, sizeof (buf)); \
+        failures++; \
+    } else mpool_policy_state_init((buf), (unsigned)(n)); \
+} while (0)
 #define MAXTX 4096
 
 static int run_scenario(int si,
@@ -119,14 +143,14 @@ int main(void){
     printf("== Core v31 cluster limits (too-large-cluster) ==\n");
     {
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000, 200, 10100000, 200, 10100000, 1);  /* anc/desc limits out of the way */
-        mpool_policy_state_init(stbuf, 4096);
+        POLICY_STATE_INIT(stbuf, 4096);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         /* 64 INDEPENDENT parents (cluster of 1 each), then one child spending
@@ -181,14 +205,14 @@ int main(void){
     printf("== MEM-3: a 30-parent child keeps every parent link ==\n");
     {
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000, 200, 10100000, 200, 10100000, 1);
-        mpool_policy_state_init(stbuf, 4096);
+        POLICY_STATE_INIT(stbuf, 4096);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
 
@@ -258,14 +282,14 @@ int main(void){
     printf("== cluster limit is measured POST-eviction for a replacement ==\n");
     {
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000, 200, 10100000, 200, 10100000, 1);
-        mpool_policy_state_init(stbuf, 4096);
+        POLICY_STATE_INIT(stbuf, 4096);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         /* 63 independent parents, one child C spending all of them: a
@@ -316,14 +340,14 @@ int main(void){
     printf("== bytespersigop: sigop-dense feerate (Core DEFAULT_BYTES_PER_SIGOP 20) ==\n");
     {
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);   /* 1 sat/vB floor */
-        mpool_policy_state_init(stbuf, 256);
+        POLICY_STATE_INIT(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         unsigned char prev[32]; memset(prev, 0x7A, 32);
@@ -356,7 +380,7 @@ int main(void){
             /* same transaction, now carrying sigops and paying enough to get
              * in: its recorded size must be the ADJUSTED one */
             memset(stbuf, 0, sizeof stbuf);
-            mpool_policy_state_init(stbuf, 256);
+            POLICY_STATE_INIT(stbuf, 256);
             mpool_init(mp, 4096, mblob, sizeof mblob);
             utxo_init(ux, 4096, ublob, sizeof ublob);
             utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk, 1);
@@ -382,14 +406,14 @@ int main(void){
      * leave the count parked for whatever came next. */
     {   printf("\n== a rejected tx does not leave its sigop count behind ==\n");
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
-        mpool_policy_state_init(stbuf, 256);
+        POLICY_STATE_INIT(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         unsigned char prev[32]; memset(prev, 0x9A, 32);
@@ -434,14 +458,14 @@ int main(void){
      * itself a multiple of 4, so this uses a value that is not. */
     {   printf("\n== the adjustment rounds the way Core rounds ==\n");
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
-        mpool_policy_state_init(stbuf, 256);
+        POLICY_STATE_INIT(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         unsigned char prev[32]; memset(prev, 0xB1, 32);
@@ -475,14 +499,14 @@ int main(void){
      * still contributes its size to the package total. */
     {   printf("\n== the dry run reports the sigop-adjusted vsize ==\n");
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
-        mpool_policy_state_init(stbuf, 256);
+        POLICY_STATE_INIT(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         unsigned char prev[32]; memset(prev, 0xC1, 32);
@@ -569,7 +593,7 @@ static int test_bare_multisig(void){
 
     for (int permit = 1; permit >= 0; permit--){
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
@@ -577,7 +601,7 @@ static int test_bare_multisig(void){
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 1);
         mpool_policy_set_baremultisig(pol, (unsigned)permit);
-        mpool_policy_state_init(stbuf, 256);
+        POLICY_STATE_INIT(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         /* fund it generously so the fee is never the reason for a rejection */
@@ -616,14 +640,14 @@ static int run_scenario(int si,
                         const unsigned long long* step_arg){
     /* policy config + state */
     static unsigned char pol[128];
-    static unsigned char stbuf[1<<20];
+    static unsigned char stbuf[1<<21];
     memset(stbuf, 0, sizeof stbuf);
     mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, max_anc, max_anc_bytes, max_desc, max_desc_bytes, rbf);
     /* fixtures are synthetic, deliberately non-standard txs: run under
      * Core's own regtest escape hatch (-acceptnonstdtxn) so this test
      * keeps exercising fee/graph mechanics, not IsStandardTx. */
     mpool_policy_set_acceptnonstd(pol, 1);
-    mpool_policy_state_init(stbuf, 256);
+    POLICY_STATE_INIT(stbuf, 256);
 
     /* structural mempool */
     static unsigned char mp[40 + 4096*48 + 8];

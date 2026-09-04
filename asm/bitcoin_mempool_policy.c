@@ -310,6 +310,125 @@ static void mpol_par_set(void* st, mpol_node* nd, uint32_t k, uint32_t v){
  * success, 0 when the pool is exhausted -- the caller then REFUSES the
  * transaction rather than recording a short list. The free list threads
  * through slot 0 of each free block. */
+/* ========================================================================== */
+/* MEM-12 (audit 2026-09-03): hash indices over the three linear tables       */
+/*                                                                            */
+/* find_node, find_outreg and find_claim were linear over up to a million     */
+/* entries and are called PER INPUT PER ACCEPT. The audit's verdict was       */
+/* "CONFIRMED for complexity; timings PLAUSIBLE (not measured)", so they were */
+/* measured first (tests/bench_mempool_scale.c), and the cost is exactly      */
+/* linear in pool size:                                                       */
+/*                                                                            */
+/*     entries   us/accept   block-connect (200 tx)                           */
+/*      10,000       12.6        4.0 ms                                       */
+/*      20,000       39.5        7.9 ms                                       */
+/*      40,000       74.6       15.8 ms                                       */
+/*      80,000      151.6       33.4 ms                                       */
+/*                                                                            */
+/* At the default 1,048,576-entry sizing that extrapolates to ~2.0 ms PER     */
+/* ACCEPT and ~6.6 s for a 3,000-transaction block connect -- all under       */
+/* mp_lock, in the download worker, blocking every accept in every process.   */
+/* The attacker's cost is the relay floor.                                    */
+/*                                                                            */
+/* Chained hashing, the same shape as the MEM-9 fix in daemon/tx_relay.c:     */
+/* head[] per bucket, next[] per entry, both living in the shared state so    */
+/* every process that maps it sees one index. Chaining rather than open       */
+/* addressing because all three tables remove by SWAP-WITH-LAST, which        */
+/* relocates a surviving entry -- tombstones would accumulate on exactly the  */
+/* churn a mempool is made of.                                                */
+/*                                                                            */
+/* A bucket hit always re-verifies the full key, so a hash collision costs an */
+/* extra compare and never a wrong answer. Every walk is bounded by the entry */
+/* count: a corrupted chain must degrade to the scan it replaced, not hang    */
+/* the worker -- the lesson MEM-9's negative control taught, where a missing  */
+/* unlink produced an infinite loop rather than a wrong answer.               */
+/* ========================================================================== */
+#define MPOL_IDX_NONE 0xFFFFFFFFu
+static uint32_t mpol_nbuckets_for(unsigned n){
+    uint32_t b = 64; while (b < n) b <<= 1; return b;
+}
+static uint32_t mpol_nbuckets(void* st){ return mpol_nbuckets_for(*(uint32_t*)((char*)st+4)); }
+/* The six arrays sit after the overflow pool: three head[] of nbuckets and
+ * three next[] of cap, in the order node, outreg, claim. */
+static uint32_t* mpol_idx_base(void* st){
+    size_t cap = *(uint32_t*)((char*)st+4);
+    return (uint32_t*)((char*)mpol_ovf_base(st)
+                       + (size_t)mpol_ovf_nblocks(st) * MPOL_OVF_SLOTS * sizeof(uint32_t));
+    (void)cap;
+}
+static uint32_t* mpol_node_head(void* st){ return mpol_idx_base(st); }
+static uint32_t* mpol_node_next(void* st){ return mpol_node_head(st) + mpol_nbuckets(st); }
+static uint32_t* mpol_out_head(void* st){ return mpol_node_next(st) + *(uint32_t*)((char*)st+4); }
+static uint32_t* mpol_out_next(void* st){ return mpol_out_head(st) + mpol_nbuckets(st); }
+static uint32_t* mpol_clm_head(void* st){ return mpol_out_next(st) + *(uint32_t*)((char*)st+4); }
+static uint32_t* mpol_clm_next(void* st){ return mpol_clm_head(st) + mpol_nbuckets(st); }
+
+static uint32_t mpol_fnv(const unsigned char* p, size_t n, uint32_t extra){
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < n; i++){ h ^= p[i]; h *= 16777619u; }
+    for (int i = 0; i < 4; i++){ h ^= (unsigned char)(extra >> (8*i)); h *= 16777619u; }
+    return h;
+}
+static uint32_t mpol_h_node(void* st, const unsigned char txid[32]){
+    return mpol_fnv(txid, 32, 0) & (mpol_nbuckets(st) - 1u); }
+static uint32_t mpol_h_out(void* st, const unsigned char txid[32], uint32_t idx){
+    return mpol_fnv(txid, 32, idx) & (mpol_nbuckets(st) - 1u); }
+static uint32_t mpol_h_clm(void* st, const unsigned char prev[32], uint32_t idx){
+    return mpol_fnv(prev, 32, idx) & (mpol_nbuckets(st) - 1u); }
+
+/* Generic chain ops. `head`/`next` name the table; `slot` is its array index. */
+static void mpol_chain_link(uint32_t* head, uint32_t* next, uint32_t bucket, uint32_t slot){
+    next[slot] = head[bucket];
+    head[bucket] = slot;
+}
+static void mpol_chain_unlink(uint32_t* head, uint32_t* next, uint32_t bucket,
+                              uint32_t slot, uint32_t bound){
+    uint32_t* pp = &head[bucket];
+    uint32_t guard = 0;
+    while (*pp != MPOL_IDX_NONE && guard++ <= bound){
+        if (*pp == slot){ *pp = next[slot]; next[slot] = MPOL_IDX_NONE; return; }
+        pp = &next[*pp];
+    }
+}
+
+/* Node index: key is the 32-byte txid, slot is the node array index. */
+static void mpol_node_idx_link(void* st, uint32_t slot){
+    mpol_node* t = mpol_nodes_base(st);
+    mpol_chain_link(mpol_node_head(st), mpol_node_next(st),
+                    mpol_h_node(st, t[slot].txid), slot);
+}
+static void mpol_node_idx_unlink(void* st, uint32_t slot){
+    mpol_node* t = mpol_nodes_base(st);
+    mpol_chain_unlink(mpol_node_head(st), mpol_node_next(st),
+                      mpol_h_node(st, t[slot].txid), slot,
+                      *(uint32_t*)((char*)st+4));
+}
+/* Outreg index: key is (txid, index). */
+static void mpol_out_idx_link(void* st, uint32_t slot){
+    mpol_out* o = mpol_outreg_base(st);
+    mpol_chain_link(mpol_out_head(st), mpol_out_next(st),
+                    mpol_h_out(st, o[slot].txid, o[slot].index), slot);
+}
+static void mpol_out_idx_unlink(void* st, uint32_t slot){
+    mpol_out* o = mpol_outreg_base(st);
+    mpol_chain_unlink(mpol_out_head(st), mpol_out_next(st),
+                      mpol_h_out(st, o[slot].txid, o[slot].index), slot,
+                      *(uint32_t*)((char*)st+4));
+}
+/* Claim index: key is (prev, index). `claimer` is payload, not key, so the
+ * renumbering pass in remove_node does not touch the index. */
+static void mpol_clm_idx_link(void* st, uint32_t slot){
+    mpol_claim* c = mpol_claims_base(st);
+    mpol_chain_link(mpol_clm_head(st), mpol_clm_next(st),
+                    mpol_h_clm(st, c[slot].prev, c[slot].index), slot);
+}
+static void mpol_clm_idx_unlink(void* st, uint32_t slot){
+    mpol_claim* c = mpol_claims_base(st);
+    mpol_chain_unlink(mpol_clm_head(st), mpol_clm_next(st),
+                      mpol_h_clm(st, c[slot].prev, c[slot].index), slot,
+                      *(uint32_t*)((char*)st+4));
+}
+
 static int mpol_par_reserve(void* st, mpol_node* nd, uint32_t n_par){
     if (n_par <= MPOL_INLINE_PARENTS) return 1;
     if (nd->povf != MPOL_OVF_NONE) return 1;
@@ -353,7 +472,9 @@ void mpool_policy_set_forget_cb(void (*fn)(const unsigned char*)){ g_forget_cb =
 size_t mpool_policy_state_size(unsigned n){
     return MPOL_HDR + (size_t)4*n + (size_t)n*sizeof(mpol_out)
            + (size_t)n*sizeof(mpol_claim) + (size_t)n*sizeof(mpol_node)
-           + (size_t)mpol_ovf_nblocks_for(n) * MPOL_OVF_SLOTS * sizeof(uint32_t);
+           + (size_t)mpol_ovf_nblocks_for(n) * MPOL_OVF_SLOTS * sizeof(uint32_t)
+           /* MEM-12: three chained indices -- head[nbuckets] + next[n] each */
+           + 3u * ((size_t)mpol_nbuckets_for(n) + (size_t)n) * sizeof(uint32_t);
 }
 
 void mpool_policy_state_init(void* st, unsigned n){
@@ -368,6 +489,12 @@ void mpool_policy_state_init(void* st, unsigned n){
       *(uint32_t*)((char*)st+88) = nb ? 0u : MPOL_OVF_NONE;
       for (uint32_t i = 0; i < nb; i++)
           mpol_ovf_block(st, i)[0] = (i + 1 < nb) ? (i + 1) : MPOL_OVF_NONE; }
+    /* MEM-12: an empty chain is MPOL_IDX_NONE, not 0 -- slot 0 is a real
+     * entry, so a zeroed head array would claim every bucket holds it. */
+    { uint32_t nb = mpol_nbuckets_for(n);
+      memset(mpol_node_head(st), 0xFF, (size_t)(nb + n) * sizeof(uint32_t));
+      memset(mpol_out_head(st),  0xFF, (size_t)(nb + n) * sizeof(uint32_t));
+      memset(mpol_clm_head(st),  0xFF, (size_t)(nb + n) * sizeof(uint32_t)); }
 }
 
 void mpool_policy_init(mpol_cfg* pol, uint64_t relay_fee_rate,
@@ -713,7 +840,10 @@ static const char* standard_checks(const mpol_cfg* pol, const unsigned char* tx,
 static int find_node(void* st, const unsigned char txid[32]){
     mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
-    for (uint32_t i=0;i<n;i++) if (memcmp(t[i].txid, txid, 32)==0) return (int)i;
+    uint32_t guard = 0;
+    for (uint32_t i = mpol_node_head(st)[mpol_h_node(st, txid)];
+         i != MPOL_IDX_NONE && guard++ <= n; i = mpol_node_next(st)[i])
+        if (i < n && memcmp(t[i].txid, txid, 32)==0) return (int)i;
     return -1;
 }
 
@@ -755,15 +885,19 @@ static long find_outreg(void* st, const unsigned char txid[32], uint32_t index,
                         uint64_t* value){
     mpol_out* o = mpol_outreg_base(st);
     uint32_t n = *(uint32_t*)((char*)st+8);
-    for (uint32_t i=0;i<n;i++)
-        if (o[i].index==index && memcmp(o[i].txid, txid, 32)==0){ *value=o[i].value; return 1; }
+    uint32_t guard = 0;
+    for (uint32_t i = mpol_out_head(st)[mpol_h_out(st, txid, index)];
+         i != MPOL_IDX_NONE && guard++ <= n; i = mpol_out_next(st)[i])
+        if (i < n && o[i].index==index && memcmp(o[i].txid, txid, 32)==0){ *value=o[i].value; return 1; }
     return 0;
 }
 static int find_claim(void* st, const unsigned char prev[32], uint32_t index){
     mpol_claim* c = mpol_claims_base(st);
     uint32_t n = *(uint32_t*)((char*)st+12);
-    for (uint32_t i=0;i<n;i++)
-        if (c[i].index==index && memcmp(c[i].prev, prev, 32)==0) return (int)c[i].claimer;
+    uint32_t guard = 0;
+    for (uint32_t i = mpol_clm_head(st)[mpol_h_clm(st, prev, index)];
+         i != MPOL_IDX_NONE && guard++ <= n; i = mpol_clm_next(st)[i])
+        if (i < n && c[i].index==index && memcmp(c[i].prev, prev, 32)==0) return (int)c[i].claimer;
     return -1;
 }
 
@@ -837,12 +971,33 @@ static void remove_node(void* st, void* mp, int ci){
     mpool_del(mp, ct);
     { uint64_t* pb = (uint64_t*)((char*)st+64);
       if (*pb >= t[ci].raw_len) *pb -= t[ci].raw_len; else *pb = 0; }
+    /* MEM-12: every swap-with-last below relocates a SURVIVING entry, so the
+     * index has to be told twice -- unlink the entry being dropped, unlink
+     * the entry that is about to move, then re-link it at its new slot. Doing
+     * the unlinks before either struct is overwritten matters: the unlink
+     * hashes the entry's CURRENT key to find its bucket, so once the bytes
+     * are copied over, the chain node can no longer be found and the table
+     * silently keeps a dangling reference. */
     { mpol_claim* c = mpol_claims_base(st);
       uint32_t* ncl = (uint32_t*)((char*)st+12);
-      for (uint32_t i=0;i<*ncl;){ if (c[i].claimer==(uint32_t)ci){ c[i]=c[*ncl-1]; (*ncl)--; } else i++; } }
+      for (uint32_t i=0;i<*ncl;){
+          if (c[i].claimer==(uint32_t)ci){
+              uint32_t last_c = *ncl - 1;
+              mpol_clm_idx_unlink(st, i);
+              if (last_c != i) mpol_clm_idx_unlink(st, last_c);
+              c[i]=c[last_c]; (*ncl)--;
+              if (last_c != i) mpol_clm_idx_link(st, i);
+          } else i++; } }
     { mpol_out* o = mpol_outreg_base(st);
       uint32_t* no = (uint32_t*)((char*)st+8);
-      for (uint32_t i=0;i<*no;){ if (memcmp(o[i].txid,ct,32)==0){ o[i]=o[*no-1]; (*no)--; } else i++; } }
+      for (uint32_t i=0;i<*no;){
+          if (memcmp(o[i].txid,ct,32)==0){
+              uint32_t last_o = *no - 1;
+              mpol_out_idx_unlink(st, i);
+              if (last_o != i) mpol_out_idx_unlink(st, last_o);
+              o[i]=o[last_o]; (*no)--;
+              if (last_o != i) mpol_out_idx_link(st, i);
+          } else i++; } }
     /* clear children's parent references to ci */
     { uint32_t n = *nptr;
       for (uint32_t j=0;j<n;j++)
@@ -858,8 +1013,12 @@ static void remove_node(void* st, void* mp, int ci){
      * node, and the node has simply moved. */
     mpol_par_release(st, &t[ci]);
     uint32_t last = *nptr - 1;
+    /* MEM-12: same two-unlink dance for the node table. */
+    mpol_node_idx_unlink(st, (uint32_t)ci);
+    if (last != (uint32_t)ci) mpol_node_idx_unlink(st, last);
     t[ci] = t[last];
     (*nptr)--;
+    if (last != (uint32_t)ci) mpol_node_idx_link(st, (uint32_t)ci);
     if ((uint32_t)ci != last){
         uint32_t n = *nptr;
         for (uint32_t j=0;j<n;j++)
@@ -2094,6 +2253,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                 o[no_idx].index = (uint32_t)i;
                 o[no_idx].value = v;
                 (*((uint32_t*)((char*)st+8)))++;
+                mpol_out_idx_link(st, no_idx);          /* MEM-12 */
             }
         }
     }
@@ -2110,6 +2270,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
                 c[nc].index = idx[i];
                 c[nc].claimer = myidx;
                 (*((uint32_t*)((char*)st+12)))++;
+                mpol_clm_idx_link(st, nc);              /* MEM-12 */
             }
         }
     }
@@ -2152,6 +2313,10 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         for (int k=0;k<n_par && k<MPOL_MAX_PARENTS;k++)
             mpol_par_set(st, &t2[myidx], (uint32_t)k, (uint32_t)par_idx[k]);
         (*((uint32_t*)((char*)st+16)))++;
+        mpol_node_idx_link(st, myidx);                  /* MEM-12: after the
+                                                         * count, so the slot
+                                                         * is live when the
+                                                         * chain names it */
         for (uint32_t k=0;k<n_anc;k++){
             t2[anc_list[k]].desc_cnt++;
             t2[anc_list[k]].desc_bytes += (uint32_t)vsize;
