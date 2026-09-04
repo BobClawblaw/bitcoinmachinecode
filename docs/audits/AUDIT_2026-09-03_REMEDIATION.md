@@ -4,11 +4,23 @@ Companion to `CODEBASE_AUDIT_2026-09-03.md` (182 findings; 29 distinct
 CRITICAL+HIGH after de-duplication). This file records what has been fixed,
 what has not, and what was found along the way.
 
-**Status as of 2026-09-04 (third pass): all 29 CRITICAL+HIGH closed** --
-MEM-3, the last one, on branch `mem3-parent-overflow` -- **and 39 of the 44
-MEDIUM addressed (37 closed outright, 2 partial).** VAL-5 and UTX-4, both
-previously partial, are now complete apart from UTX-4's undo-file fsync. LOW
-and INFO are untouched.
+**Status as of 2026-09-04 (third pass): all 29 CRITICAL+HIGH closed, and 43
+of the 44 MEDIUM addressed (41 closed outright, 2 partial).** MEM-3, the last
+CRITICAL+HIGH, is on branch `mem3-parent-overflow`. VAL-5 and UTX-4, both
+previously partial, are complete apart from UTX-4's undo-file fsync.
+
+**The remainder is larger than those numbers suggest, and this log should say
+so plainly.** The audit has 182 findings. The 29 CRITICAL+HIGH and 44 MEDIUM
+are 73 of them; **the 65 LOW and 32 INFO -- 97 findings, more than half the
+audit -- have never been examined at all.** "All CRITICAL+HIGH and 43 of 44
+MEDIUM" is true and is also the flattering way to say it.
+
+The one MEDIUM still open is **NET-10** (the address manager has no bucketed
+structure), which is a design change rather than a defect fix: Core's addrman
+keeps separate tried/new tables, buckets `new` by source group so no single
+source can fill more than a bounded fraction, and resolves collisions by
+test-before-evict. This node has one flat 65,536-entry array evicting by
+peer-supplied timestamp.
 
 The full gate passes end to end. Two tests are quarantined with reasons a
 reader can check (`test_outbound_mux`, `test_redial` -- both feed
@@ -371,6 +383,10 @@ remaining half landed in the same pass.)
 | UTX-4 (rest) | A torn WAL tail was never truncated, so every later append landed after it and every future reload stopped there | `51447cb` |
 | NET-9 (part) | The one-byte BIP152 tx count was SER-4; the documentation claiming "both directions" is corrected here. The RECEIVE side has never existed and is a feature, not a fix -- `bitcoin_serve.asm` writes `cmpctblock`/`blocktxn` and has no inbound handler for either | `4cd988c` + docs |
 | MEM-9 | Inv processing was O(entries x table) with no per-peer bound: ~10^8 byte-compares per message, 64 messages per pass, in the download worker | `045ef64` |
+| MEM-10 | Inbound peers could force unbounded re-fetch and re-verification: no memory of an already-refused transaction | `4989ff0` |
+| WAL-2 | The spend path told the signer every coin was P2WPKH, so every non-bech32 coin was unspendable while listunspent said otherwise | `f04a52b` |
+| WAL-3 | Secrets survived `walletlock` in `.bss`, and could reach swap, hibernation or a core file | `cf57efa`, `9f992b6` |
+| STO-5 | `submitblock` and an inbound serve child appended through the UNLOCKED `store_append`, at a cached file position | (this commit) |
 | MEM-12 | Policy tables hash-indexed (accepts flat, 250x at 80k) and block connect batched (O(n) not O(n*m), 5x at 260k) | `44f6064`, `6f89c24` |
 | CRY-4 | SHA-512's schedule and HMAC's key block were process-global .bss: two threads corrupted each other silently | `54aa254` |
 | SER-3 | The mempool admission reader accepted non-canonical CompactSize, so a transaction Core cannot deserialize could be relayed from here | `fdea2f1` |
