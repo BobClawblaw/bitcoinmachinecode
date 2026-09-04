@@ -64,13 +64,19 @@ WHAT IT REPORTS
           sp, and any other write to one forgets the value.
 
       What it still cannot see, named per function by --list-unmodelled: a
-      register used as a second frame base (`mov x28, sp` then `[x28,#TAB]`),
-      an alignment-clamped sp (`mov x9,sp / and x9,x9,#-16 / mov sp,x9` --
-      point_scalar_mul_glv, the GLV function itself, is in that set), and a
-      buffer whose size really is an argument.  Covering those needs offsets as
-      ranges and a report only on overlap-for-every-value; until then the
-      coverage line states the followed/unfollowed counts, so silence means
-      "checked", never "the analysis gave up quietly".  A label merely reached
+      computed branch (`br xN`), and anything else walk_frame's reasons name.
+      What it used to give up on, and now models, are the three shapes this
+      tree actually writes: a register used as a second frame base (`mov x28,
+      sp` then `[x28,#TAB]` -- point_scalar_mul_glv), an alignment-clamped sp
+      (`mov x9,sp / and x9,x9,#-16 / mov sp,x9` -- the GLV function again;
+      the AND mask is followed as a constant), and a buffer whose size really
+      is an argument (`sub sp, sp, x9` -- five bitcoin_cli commands).  The
+      last one is handled as a PHANTOM step, not a known delta: every anchor
+      computed after it carries the phantom history it was born under, and
+      two anchors compare only when their histories are equal -- so a
+      SAVE-AREA-ALIAS report always holds for every value of the
+      argument-sized frame, and phantom-dependent pairs are skipped rather
+      than guessed.  A label merely reached
       at two stack depths is NOT a give-up: both states are walked
       independently, which is what makes loops and multi-exit epilogues
       checkable instead of skipped.
@@ -522,13 +528,16 @@ def eval_expr(text, syms):
 
 def mem_operand(expr, syms=None):
     """'[x29, #-8]!' -> ('x29', -8, True); '[sp], #16' handled by the caller.
-    None when the base is a general register or the offset cannot be resolved."""
+    Register-held frame bases (x19-x28, seeded by `mov xN, sp`) also model:
+    '[x28, #TAB]' -> ('x28', TAB, False) -- walk_frame resolves them through
+    its `bases` map and tags them with the base's capture lineage.  None when
+    the base is a plain pointer register or the offset cannot be resolved."""
     m = MEM_RE.search(expr)
     if not m:
         return None
     inner = re.sub(r'\b(byte|halfword|word|doubleword|quadword)\b', '',
                    m.group(1), flags=re.I).strip()
-    mm = re.match(r'^(sp|x29)\s*(?:,\s*(#-?[^,]*))?$', inner)
+    mm = re.match(r'^(sp|x29|x(?:1[9]|2[0-8]))\s*(?:,\s*(#-?[^,]*))?$', inner)
     if not mm:
         return None
     base = mm.group(1)
@@ -717,10 +726,20 @@ def _lsl_value(ops_tail):
 
 
 def _track_consts(op, ops, writes, consts, sp_regs, syms):
-    """Follow a literal into the registers that move sp, and forget it the
-    moment anything else touches them.  Nothing is ever assumed: an
-    instruction that could compute a value is a forgetting event, not a
-    chance to guess one."""
+    """Follow a literal into the registers that move sp -- or into a register a
+    `mov xN, sp` has seeded (walk_frame seeds those itself; this function must
+    keep it) -- and forget it the moment anything else touches them.  Nothing
+    is ever assumed: an instruction that could compute a value is a forgetting
+    event, not a chance to guess one.
+
+    Values carry the phantom tag they were captured under: (value, tag).  The
+    tag is walk_frame's phantom history at capture time; a consumer must use a
+    captured value only when its tag equals the current phantom history, so a
+    value never bridges an unknown-magnitude sp move.  `movk` combines,
+    same-register add/sub of an immediate shifts, and `and xN, xN, #-16` (the
+    alignment clamp point_scalar_mul_glv applies before `mov sp, x9`, because
+    AArch64 cannot AND the SP directly) aligns -- all preserving the tag.
+    Everything else forgets."""
     out = dict(consts)
     if not out and not sp_regs:
         return out
@@ -735,14 +754,18 @@ def _track_consts(op, ops, writes, consts, sp_regs, syms):
         src = ops[1].strip()
         shift = _lsl_value(ops[2:])
         val = _imm_value(src, syms) if src.startswith('#') else None
+        tag = 0
         if val is None and op == 'mov':
             src_reg = plain_reg(src)
-            val = out.get(src_reg) if src_reg else None   # `mov xN, xM`
+            if src_reg == 'sp':
+                return out                 # walk_frame seeded it: keep the tag
+            if src_reg and src_reg in out:
+                val, tag = out[src_reg]    # `mov xN, xM`: copy value AND tag
             shift = 0
         if val is None or shift is None:
             out.pop(dst, None)
         else:
-            out[dst] = (val << shift) & ((1 << 64) - 1)   # movz zeroes the rest
+            out[dst] = ((val << shift) & ((1 << 64) - 1), tag)   # movz zeroes
         return out
     if op == 'movk' and len(ops) >= 2:
         shift = _lsl_value(ops[2:])
@@ -753,8 +776,32 @@ def _track_consts(op, ops, writes, consts, sp_regs, syms):
             # `1 << 16 - 1 << shift` is NOT ((1<<16)-1)<<shift: Python binds
             # '-' tighter than '<<'.  Build the 16-bit window explicitly.
             mask = ((1 << 16) - 1) << shift
-            out[dst] = ((out[dst] & ~mask) | ((val & 0xffff) << shift)) \
-                & ((1 << 64) - 1)
+            out[dst] = (((out[dst][0] & ~mask) | ((val & 0xffff) << shift))
+                        & ((1 << 64) - 1), out[dst][1])
+        return out
+    if op in ('add', 'sub') and len(ops) == 3 and dst in out and \
+            plain_reg(ops[1]) == dst:
+        k = _imm_value(ops[2], syms)
+        if k is None:
+            out.pop(dst, None)
+        else:
+            out[dst] = ((out[dst][0] + k) if op == 'add'
+                        else (out[dst][0] - k), out[dst][1])
+        return out
+    if op == 'and' and len(ops) == 3 and dst in out and \
+            plain_reg(ops[1]) == dst:
+        imm = _imm_value(ops[2], syms)
+        k = None
+        if imm is not None:
+            for b in range(0, 64):
+                if imm == -(1 << b) or imm == (1 << 64) - (1 << b):
+                    k = b                  # an alignment mask -(1<<b)
+                    break
+        if k is None:
+            out.pop(dst, None)             # not an alignment mask: no guess
+        else:
+            out[dst] = (out[dst][0] & ~((1 << k) - 1) & ((1 << 64) - 1),
+                        out[dst][1])
         return out
     out.pop(dst, None)
     return out
@@ -763,24 +810,51 @@ def _track_consts(op, ops, writes, consts, sp_regs, syms):
 def walk_frame(items, named, numeric, syms=None, sp_macros=(),
                limit=20000):
     """-> (findings, modelled) where findings are (lineno, text, detail) and
-    modelled is False if the frame could not be followed with certainty."""
+    modelled is False if the frame could not be followed with certainty.
+
+    sp is tracked as an ASSUMED entry-relative delta plus a PHANTOM history:
+    an sp move of unknown magnitude (`sub sp, sp, x9` with x9 sized from an
+    argument -- five bitcoin_cli commands allocate buffers that way) counts as
+    a phantom step, not a give-up.  The assumed delta is unchanged by the
+    step; every anchor (save slot or store address) is tagged with the phantom
+    history it was computed under.  Two anchors with the SAME tag have a true
+    difference that is phantom-invariant, so they compare exactly; anchors
+    with different tags really do depend on the unknown magnitudes, and are
+    skipped -- a report only ever fires when it holds for every value of
+    every argument-sized frame.  `mov x29, sp` / `mov sp, x29` carry the tag
+    through the frame pointer, so an epilogue that restores sp from x29
+    resumes its pre-phantom lineage exactly.  A register held as a second
+    frame base (`mov x28, sp`, then `[x28, #TAB]` in point_scalar_mul_glv) is
+    tracked in `bases` with its own capture tag, and forgotten the moment
+    anything rewrites it."""
     findings = []
     def give(why):
         return findings, False, why
     modelled = True
-    # Which registers move sp dynamically (`sub sp, sp, xN`)?  Only those get
-    # constants tracked, and only by the literal-materialisation idiom this
-    # tree uses.  cons_verify is `mov x26,#0x0100 / movk x26,#0x0010,lsl #16 /
-    # sub sp, sp, x26` -- a fixed 1 MiB + 256 frame wearing a register's
-    # clothes; treating it as unknowable skipped the consensus entry point
-    # entirely, which is precisely where a frame overlap would be worst.
+    # Registers that move sp dynamically (`sub sp, sp, xN`), plus registers a
+    # `mov xN, sp` seeds (they flow back into `mov sp, xN` -- the
+    # alignment-clamp round-trip point_scalar_mul_glv needs, since AArch64
+    # cannot AND the SP in place).  Only those get constants tracked, and only
+    # by the literal-materialisation idioms this tree uses.  cons_verify is
+    # `mov x26,#0x0100 / movk x26,#0x0010,lsl #16 / sub sp, sp, x26` -- a fixed
+    # 1 MiB + 256 frame wearing a register's clothes; treating it as unknowable
+    # skipped the consensus entry point entirely, which is precisely where a
+    # frame overlap would be worst.
     sp_regs = set()
     for it in items:
-        if it[0] == 'ins' and it[1].op in ('add', 'sub') and len(it[1].ops) == 3 \
-                and it[1].ops[0].strip().lower() == 'sp' \
-                and it[1].ops[1].strip().lower() == 'sp':
-            r = plain_reg(it[1].ops[2])
+        if it[0] != 'ins':
+            continue
+        ins = it[1]
+        if ins.op in ('add', 'sub') and len(ins.ops) == 3 \
+                and ins.ops[0].strip().lower() == 'sp' \
+                and ins.ops[1].strip().lower() == 'sp':
+            r = plain_reg(ins.ops[2])
             if r:
+                sp_regs.add(r)
+        elif ins.op == 'mov' and len(ins.ops) == 2 \
+                and ins.ops[1].strip().lower() == 'sp':
+            r = plain_reg(ins.ops[0])
+            if r and r != 'x29':
                 sp_regs.add(r)
     start = None
     for i, it in enumerate(items):
@@ -790,17 +864,21 @@ def walk_frame(items, named, numeric, syms=None, sp_macros=(),
         break
     if start is None:
         return [], True, None
-    # state = (spdelta, fpdelta, live-slots, known-constants)
+    # state = (idx, spd, fpd, fpd_tag, ph, live, consts, bases); live entries
+    # are (reg, offset, size, tag); consts values are (value, tag); bases map
+    # reg -> (offset, tag).  A tag is the phantom-history tuple at the time the
+    # anchor was computed -- equal tags, exact compare; unequal, skip.
     seen = set()
-    work = [(start, 0, None, (), ())]
+    work = [(start, 0, None, (), (), (), frozenset(), frozenset())]
     budget = limit
     while work:
         budget -= 1
         if budget <= 0:
             return give('walk budget exhausted (function too large to follow)')
-        idx, spd, fpd, live, consts_t = work.pop()
+        idx, spd, fpd, fpd_tag, ph, live, consts_t, bases_t = work.pop()
         consts = dict(consts_t)
-        key = (idx, spd, fpd, live, consts_t)
+        bases = dict(bases_t)
+        key = (idx, spd, fpd, fpd_tag, ph, live, consts_t, bases_t)
         if key in seen:
             continue
         seen.add(key)
@@ -817,17 +895,48 @@ def walk_frame(items, named, numeric, syms=None, sp_macros=(),
             if sp_regs:
                 consts = _track_consts(op, ops, ins.writes, consts, sp_regs, syms)
                 consts_t = frozenset(consts.items())
-                key2 = (idx, spd, fpd, live, consts_t)
+                key2 = (idx, spd, fpd, fpd_tag, ph, live, consts_t, bases_t)
                 if key2 in seen:
                     break
                 seen.add(key2)
+            # Retire register-held frame bases that this instruction rewrites,
+            # EXCEPT the writeback base of a memory access -- that one is
+            # updated in place by the store/load handler below (ins.writes
+            # carries it via _writeback, so without this exception a bounded
+            # `str x0, [x28, #8]!` would drop its own base before use).
+            wb_base = None
+            if op in STORE_OPS or op in LOAD_OPS:
+                for o in ops:
+                    if re.search(r'\]\s*!', o or ''):
+                        inner = re.search(r'\[([^\]]*)\]', o or '')
+                        if inner:
+                            cand = plain_reg(inner.group(1).split(',')[0])
+                            if cand:
+                                wb_base = cand
+                        break
+            for w in ins.writes:
+                if w != wb_base:
+                    bases.pop(w, None)
+            bases_t = frozenset(bases.items())
             # ---- frame-pointer anchor ------------------------------------
             if op == 'mov' and len(ops) == 2 and \
                     ops[0].strip().lower() in ('x29', 'fp') and \
                     ops[1].strip().lower() == 'sp':
                 fpd = spd
+                fpd_tag = ph
                 idx += 1
                 continue
+            # ---- register-held frame base (`mov x28, sp`) ----------------
+            if op == 'mov' and len(ops) == 2 and \
+                    ops[1].strip().lower() == 'sp':
+                r = plain_reg(ops[0])
+                if r and r != 'x29':
+                    consts[r] = (spd, ph)
+                    bases[r] = (spd, ph)
+                    consts_t = frozenset(consts.items())
+                    bases_t = frozenset(bases.items())
+                    idx += 1
+                    continue
             # ---- explicit sp moves ---------------------------------------
             if op in ('add', 'sub') and ops and ops[0].strip().lower() == 'sp':
                 if len(ops) == 3 and ops[1].strip().lower() == 'sp':
@@ -838,11 +947,19 @@ def walk_frame(items, named, numeric, syms=None, sp_macros=(),
                     except ValueError:
                         imm = eval_expr(raw, syms or {})   # `sub sp, sp, #FRAME`
                     if imm is None:
-                        imm = consts.get(plain_reg(ops[2]) or '')
-                    if imm is None:
-                        return give('dynamic frame: add/sub sp, sp, <register>')
-                    spd = spd + imm if op == 'add' else spd - imm
-                    live = tuple(e for e in live if e[1] >= spd)
+                        imm_t = consts.get(plain_reg(ops[2]) or '')
+                        if imm_t is not None and imm_t[1] == ph:
+                            imm = imm_t[0]     # same lineage: an exact move
+                        else:
+                            imm = None
+                    if imm is not None:
+                        spd = spd + imm if op == 'add' else spd - imm
+                        live = tuple(e for e in live if e[1] >= spd)
+                    else:
+                        # Unknown magnitude -- a phantom step, not a give-up:
+                        # the assumed delta stays, the history grows, and the
+                        # alias test below skips anchors across the step.
+                        ph = ph + (1,) if op == 'sub' else ph + (0,)
                     idx += 1
                     continue
                 return give('unrecognised sp arithmetic')
@@ -850,7 +967,16 @@ def walk_frame(items, named, numeric, syms=None, sp_macros=(),
                 src = ops[1].strip().lower()
                 if src in ('x29', 'fp') and fpd is not None:
                     spd = fpd
-                    live = tuple(e for e in live if e[1] >= spd)
+                    ph = fpd_tag
+                    live = tuple(e for e in live
+                                 if e[3] == ph and e[1] >= spd)
+                    idx += 1
+                    continue
+                iv = consts.get(plain_reg(ops[1]) or '')
+                if iv is not None and iv[1] == ph:
+                    spd = iv[0]                # same lineage: an exact restore
+                    live = tuple(e for e in live
+                                 if e[3] == ph and e[1] >= spd)
                     idx += 1
                     continue
                 return give('mov sp, <register>: frame set outside the model')
@@ -864,11 +990,28 @@ def walk_frame(items, named, numeric, syms=None, sp_macros=(),
                             idx += 1
                             continue      # no frame anchor yet: address unknown
                         anchor = fpd + off        # fixed, however far sp has moved
-                    else:
+                        atag = fpd_tag
+                    elif base == 'sp':
                         anchor = spd + off        # pre-index writes at sp+off too
+                        atag = ph
+                    elif base in bases:
+                        anchor = bases[base][0] + off
+                        atag = bases[base][1]     # the base's capture lineage
+                    else:
+                        # A general register we never saw seeded: an ordinary
+                        # pointer, not a frame base.  The store has no
+                        # modelled address, so it cannot alias by construction
+                        # -- and its writeback (if any) moves THAT register,
+                        # not sp, so unlike an unparseable-shape writeback it
+                        # is no reason to refuse: skip, exactly as the old
+                        # unparseable-base path did.
+                        idx += 1
+                        continue
                     for reg, within, sz in writes:
                         lo = anchor + within
-                        for sreg, soff, ssz in live:
+                        for sreg, soff, ssz, stag in live:
+                            if stag != atag:
+                                continue    # across a phantom: not judgeable
                             if lo < soff + ssz and soff < lo + sz:
                                 if sreg == reg and soff == lo and ssz == sz:
                                     continue            # the register's own slot
@@ -890,13 +1033,17 @@ def walk_frame(items, named, numeric, syms=None, sp_macros=(),
                         # slot, 48 bytes higher, disappeared from the model.
                         if any(e[0] == reg for e in live):
                             continue
-                        live = live + ((reg, anchor + within, sz),)
-                    if wb:
-                        spd = spd + off
-                    elif post:
-                        spd = spd + post
+                        live = live + ((reg, anchor + within, sz, atag),)
                     if wb or post:
-                        live = tuple(e for e in live if e[1] >= spd)
+                        d = off if wb else post
+                        if base == 'sp':
+                            spd = spd + d
+                            live = tuple(e for e in live if e[1] >= spd)
+                        elif base == 'x29':
+                            fpd = fpd + d
+                        elif base in bases:
+                            bases[base] = (bases[base][0] + d, bases[base][1])
+                            bases_t = frozenset(bases.items())
                     idx += 1
                     continue
                 # unmodelled store shape: it cannot alias by construction
@@ -915,24 +1062,45 @@ def walk_frame(items, named, numeric, syms=None, sp_macros=(),
                     if mo is not None and mem_i + 1 < len(ops) and \
                             re.match(r'^#?-?\d', ops[mem_i + 1] or ''):
                         try:
-                            post = int(ops[mem_i + 1].lstrip('#').replace(' ', ''), 0)
+                            post = int(ops[mem_i + 1].lstrip('#')
+                                       .replace(' ', ''), 0)
                         except ValueError:
                             return give('post-index offset is not a literal')
                     # A load from an UNMODELLED address ([x1,#8]) is not
                     # necessarily a restore, so it does not get to retire a
                     # slot -- dropping one there would hide a real alias.
+                    # Register-held frame bases model ADDRESSES, not save
+                    # slots' lineage: only sp/x29-based loads retire.
                     if mo is not None:
-                        regs = [norm_reg(o) for o in ops[:2]] if op in (
-                            'ldp', 'ldnp') else [norm_reg(ops[0])] if ops else []
-                        for r in regs:
-                            if r:
-                                live = tuple(e for e in live if e[0] != r)
+                        if mo[0] in ('sp', 'x29'):
+                            regs = [norm_reg(o) for o in ops[:2]] if op in (
+                                'ldp', 'ldnp') else [norm_reg(ops[0])] if ops                                 else []
+                            for r in regs:
+                                if r:
+                                    live = tuple(e for e in live
+                                                 if e[0] != r)
                         if mo[2]:
-                            spd = spd + mo[1]
-                            live = tuple(e for e in live if e[1] >= spd)
+                            d = mo[1]
+                            if mo[0] == 'sp':
+                                spd = spd + d
+                                live = tuple(e for e in live if e[1] >= spd)
+                            elif mo[0] == 'x29' and fpd is not None:
+                                fpd = fpd + d
+                            elif mo[0] in bases:
+                                bases[mo[0]] = (bases[mo[0]][0] + d,
+                                                bases[mo[0]][1])
+                                bases_t = frozenset(bases.items())
                         elif post:
-                            spd = spd + post
-                            live = tuple(e for e in live if e[1] >= spd)
+                            d = post
+                            if mo[0] == 'sp':
+                                spd = spd + d
+                                live = tuple(e for e in live if e[1] >= spd)
+                            elif mo[0] == 'x29' and fpd is not None:
+                                fpd = fpd + d
+                            elif mo[0] in bases:
+                                bases[mo[0]] = (bases[mo[0]][0] + d,
+                                                bases[mo[0]][1])
+                                bases_t = frozenset(bases.items())
                     elif any(re.search(r'\]\s*!', o) for o in ops):
                         return give('load writeback at an unmodelled address')
                 idx += 1
@@ -949,17 +1117,21 @@ def walk_frame(items, named, numeric, syms=None, sp_macros=(),
                     if op == 'br':
                         return give('computed branch (br <reg>)')
                     break                             # tail call out of the file
-                work.append((tgt, spd, fpd, live, consts_t))
+                work.append((tgt, spd, fpd, fpd_tag, ph, live, consts_t,
+                             bases_t))
                 if op != 'b' and op != 'br':
-                    work.append((idx + 1, spd, fpd, live, consts_t))
+                    work.append((idx + 1, spd, fpd, fpd_tag, ph, live,
+                                 consts_t, bases_t))
                 break
             if op in ('cbz', 'cbnz', 'tbz', 'tbnz'):
                 tgt = resolve(items, named, numeric,
                               ops[-1] if ops else '', idx)
                 if tgt is None:
                     return give('branch target is not a label in this function')
-                work.append((tgt, spd, fpd, live, consts_t))
-                work.append((idx + 1, spd, fpd, live, consts_t))
+                work.append((tgt, spd, fpd, fpd_tag, ph, live, consts_t,
+                             bases_t))
+                work.append((idx + 1, spd, fpd, fpd_tag, ph, live, consts_t,
+                             bases_t))
                 break
             idx += 1
     return findings, True, None
@@ -1156,9 +1328,11 @@ def main():
             print(f'SAVE-AREA-EXPOSED {os.path.basename(path)}:{ln}: '
                   f'{f}: {text[:90]}')
     print(f'# frame model followed: {total_modelled} function(s); '
-          f'{total_unmodelled} not modelled (dynamic sp, an unknown sp move, or '
-          f'a computed branch) in {unmodelled_files} file(s) -- those are NOT '
-          f'checked for aliasing; --list-unmodelled names them with the reason')
+          f'{total_unmodelled} not modelled (a computed branch, or an sp move '
+          f'walk_frame cannot judge) in {unmodelled_files} file(s) -- those are NOT '
+          f'checked for aliasing; --list-unmodelled names them with the reason. '
+          f'Argument-sized frames are modelled as phantom steps: anchors across '
+          f'a phantom boundary are skipped, never guessed.')
     if args.check and (total_offenders or total_alias):
         print(f'--check: {total_offenders} UNSAVED-CLOBBER and '
               f'{total_alias} SAVE-AREA-ALIAS violation(s)', file=sys.stderr)

@@ -80,16 +80,16 @@ Everything below is landed on `arm-port` and pushed. History lives in
       connect. Next lever (optional): bound the workers' first usable peer or
       reuse a confirmed-live peer for tiny spans. Details in the 23:40 UTC
       worklog entry.
-- [ ] Covering the last 6 unmodelled frames in the AArch64 ABI auditor needs
-      offsets as RANGES: `point_scalar_mul_glv` bases its frame on `x28`
-      (`mov x28,sp`, stores as `[x28,#TAB]`) and clamps sp to 16 through `x9`,
-      and five `bitcoin_cli` commands size a buffer from an argument. Report
-      only an overlap that holds for every value in the range and both become
-      checkable; until then `--list-unmodelled` names them with the reason.
-- [ ] Also worth a look: the gate's own reporting. Twice on 2026-09-03 main
-      produced a green report that had compared nothing (link-check gating `test`
-      into silence, and the dead VERIFY/TAPVERIFY oracle). The ARM sweep had the
-      same shape — its summary dropped the first result row (NR>1 header
-      assumption) and recounted its own summary lines as data; both fixed in
-      aed6533, but it still prints no "compared N of M" line, so a sweep that
-      built nothing and ran nothing would still look green here.
+- [x] The last 6 unmodelled frames — CLOSED 2026-09-04: the auditor follows
+      register-held frame bases (`mov x28,sp` -> `[x28,#TAB]`), alignment-
+      clamped sp (`and x9,x9,#-16` as a tracked constant), and argument-sized
+      frames as PHANTOM steps (anchors carry the phantom history; two anchors
+      compare exactly only when their histories are equal, so every report
+      holds for every value of the argument). 761/761 frames followed, zero
+      unmodelled; full-tree findings byte-identical to the pre-change
+      baseline; abi-a64-check green.
+- [x] The gate's own reporting — CLOSED 2026-09-04: parity_sweep.sh now counts
+      VERDICT rows (pass+fail+bench-ok), prints and appends
+      `compared: X of N plan rows`, and exits 2 when X is 0 — a sweep that
+      built and ran nothing can no longer look green. The line is single-field
+      so the counting awk can never recount it (the aed6533 class).

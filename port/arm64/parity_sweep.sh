@@ -550,5 +550,18 @@ echo "==================== summary ====================" >> "$OUT/results.tsv"
 # recount printed them back as "bench-ok 11 1" rows).
 awk -F'\t' '$2 != "" && $2 !~ /^[0-9]/ && !/^=/ {c[$1]++} END {for (k in c) printf "%-10s %d\n", k, c[k]}' "$OUT/results.tsv" \
     | sort >> "$OUT/results.tsv"
+# The aed6533 lesson, generalised: a summary that only counts statuses cannot
+# distinguish "checked everything" from "built nothing, ran nothing" -- both
+# print zeros.  COMPARED counts VERDICT rows (pass/fail/bench-ok: results that
+# actually executed); skip/built/build-fail are bookkeeping, not verdicts.
+# The single-field line below is invisible to the counting awk ($2 empty), and
+# results.tsv is truncated at the top of every run, so nothing accumulates.
+COMPARED=$(awk -F'\t' '($1=="pass" || $1=="fail" || $1=="bench-ok") && $2 != "" && $2 !~ /^[0-9]/ && !/^=/' "$OUT/results.tsv" | wc -l)
+echo "compared: $COMPARED of $N plan rows (verdict rows: pass+fail+bench-ok; skip/built/build-fail are not verdicts)" >> "$OUT/results.tsv"
 echo "sweep complete ($N plan rows): $OUT/results.tsv"
 awk -F'\t' '$2 != "" && $2 !~ /^[0-9]/ && !/^=/ {c[$1]++} END {for (k in c) printf "%-10s %d\n", k, c[k]}' "$OUT/results.tsv" | sort
+echo "compared: $COMPARED of $N plan rows"
+if [ "$COMPARED" -eq 0 ]; then
+    echo "WARNING: compared NOTHING of $N plan rows -- a sweep that built and ran nothing is not a green sweep"
+    exit 2
+fi
