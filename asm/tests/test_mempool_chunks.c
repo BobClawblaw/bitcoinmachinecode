@@ -91,6 +91,51 @@ int main(void){
     ck("C2 (its own chunk, the worst) was evicted", !present(mp, C2));
     ck("P and C1 (one chunk at ~5.5 sat/vB) stayed", present(mp, P) && present(mp, C));
 
+    printf("== 5. MEM-5: a child must not evict its own parent and be stored unlinked ==\n");
+    /* THE DEFECT. On put == 2 (pool byte-full) worst_chunk is scored over the
+     * EXISTING graph -- the incoming transaction is not in it yet. So a
+     * high-feerate child arriving at a full pool can evict the very parent it
+     * spends: mpol_policy_remove_package drops P, par_idx is recomputed from
+     * what is left, and C is stored with n_parents = 0, its fee computed from
+     * P's output value, spending an output that exists in neither the UTXO
+     * set nor the mempool. getblocktemplate then includes C (every REGISTERED
+     * ancestor is "present") and peers orphan it.
+     *
+     * Core adds the transaction FIRST and trims with it included, so {P,C} is
+     * scored as one chunk, then returns "mempool full" if the transaction was
+     * itself trimmed. Rejecting C reaches the same end state without
+     * restructuring the accept path around a speculative insert.
+     *
+     * Fixture: fillers + a poor leaf P fill the blob, so P's chunk is the
+     * worst. Then C spends P at a feerate that beats it. */
+    RESET();
+    { u8 F1[32], F2[32], F3[32];
+      n = mk(tx, coin[3], 1000000, 500, 0); tx_txid(F1, tx, n, sc, sizeof sc);
+      ck("filler 1 accepted", mpool_policy_add(pol, st, mp, tx, n, F1, ux) == 1);
+      n = mk(tx, coin[4], 1000000, 500, 0); tx_txid(F2, tx, n, sc, sizeof sc);
+      ck("filler 2 accepted", mpool_policy_add(pol, st, mp, tx, n, F2, ux) == 1);
+      n = mk(tx, coin[5], 1000000, 500, 0); tx_txid(F3, tx, n, sc, sizeof sc);
+      ck("filler 3 accepted", mpool_policy_add(pol, st, mp, tx, n, F3, ux) == 1);
+      /* P: the poorest thing in the pool, and a leaf, so its chunk is worst */
+      n = mk(tx, coin[1], 1000000, 70, 0);  tx_txid(P, tx, n, sc, sizeof sc);
+      ck("P (poor leaf) accepted", mpool_policy_add(pol, st, mp, tx, n, P, ux) == 1);
+
+      /* C spends P and pays well: without the fix it evicts P and is stored
+       * spending a vanished output. */
+      n = mk(tx, P, 1000000-70, 600, 0);    tx_txid(C, tx, n, sc, sizeof sc);
+      long r = mpool_policy_add(pol, st, mp, tx, n, C, ux);
+      printf("  C returned %ld (%s)\n", r, r == 1 ? "accepted" : mpool_policy_reason(pol));
+
+      /* The property, stated so it cannot pass for the wrong reason: C must
+       * NEVER be in the pool while the output it spends is not. Either C is
+       * refused, or C and P are both present -- anything else is the bug. */
+      int c_in = present(mp, C), p_in = present(mp, P);
+      ck("MEM-5 C is never in the pool without the parent it spends",
+         !c_in || p_in);
+      if (c_in && !p_in)
+        printf("  C is in the pool spending an output that exists nowhere -- this IS the defect\n");
+    }
+
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

@@ -536,6 +536,53 @@ static int find_node(void* st, const unsigned char txid[32]){
     for (uint32_t i=0;i<n;i++) if (memcmp(t[i].txid, txid, 32)==0) return (int)i;
     return -1;
 }
+
+/* Collect the DISTINCT in-pool parents of a transaction.
+ *
+ * MEM-3 (audit 2026-09-03) is that this list is CAPPED at MPOL_MAX_PARENTS
+ * (24) and the surplus is dropped silently, while descendants are discovered
+ * only through parent[]. A transaction with 30 in-pool parents is accepted
+ * linked to 24 of them; replace, evict or expire the 30th and
+ * collect_descendant_txids finds no child, so the child stays in the pool
+ * spending a now-conflicted output and getblocktemplate includes it.
+ *
+ * IT IS NOT FIXED HERE, and the reason is worth recording because the audit's
+ * first suggested fix -- "reject when a tx has more in-pool parents than can
+ * be recorded (Core's pre-v31 too-long-mempool-chain would fire at 25
+ * anyway)" -- does not hold for this codebase. This node implements Core
+ * v31's CLUSTER limits (64 transactions / 101 kvB), not the pre-v31
+ * 25-ancestor chain limit, so a child of 63 parents forming a 64-cluster is
+ * LEGAL and is accepted by Core. Rejecting at 24 was tried and it fails this
+ * project's own test_mempool_policy case "child C joins them: cluster of
+ * exactly 64 accepted" -- i.e. it turns a silent corruption into a false
+ * reject and a relay divergence, which is a worse trade.
+ *
+ * Raising the cap to 63 was measured rather than estimated: mpol_node grows
+ * from 184 to 336 bytes, so the policy state grows +152 MB at the default
+ * 1,048,576-node sizing (184 MB -> 336 MB). That is not a silent change to a
+ * MAP_SHARED region several processes map.
+ *
+ * The real fix is the audit's second option -- store parents out of line --
+ * which is a layout change to that shared region and wants its own pass.
+ * Tracked as open in docs/audits/AUDIT_2026-09-03_REMEDIATION.md.
+ *
+ * `*truncated` reports the overflow so callers can at least see it. */
+static int mpol_collect_parents(void* st, const unsigned char (*prev)[32],
+                                int n_in, int* par_idx, int* truncated){
+    int n_par = 0;
+    if (truncated) *truncated = 0;
+    for (int i = 0; i < n_in; i++){
+        int p = find_node(st, prev[i]);
+        if (p < 0) continue;
+        int seen = 0;
+        for (int k = 0; k < n_par; k++) if (par_idx[k] == p){ seen = 1; break; }
+        if (seen) continue;
+        if (n_par >= MPOL_MAX_PARENTS){ if (truncated) *truncated = 1; break; }
+        par_idx[n_par++] = p;
+    }
+    return n_par;
+}
+
 static long find_outreg(void* st, const unsigned char txid[32], uint32_t index,
                         uint64_t* value){
     mpol_out* o = mpol_outreg_base(st);
@@ -1191,12 +1238,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     *(uint32_t*)((char*)st+20) = stamp;
 
     int par_idx[MPOL_MAX_IN]; int n_par = 0;
-    for (int i=0;i<n_in;i++){
-        if (n_par >= MPOL_MAX_PARENTS) break;
-        int p = find_node(st, prev[i]);
-        int seen = 0; for (int k=0;k<n_par;k++) if (par_idx[k]==p) seen=1;
-        if (p>=0 && !seen) par_idx[n_par++] = p;
-    }
+    n_par = mpol_collect_parents(st, prev, n_in, par_idx, 0);
 
     uint32_t anc_list[MPOL_MAX_IN + 32]; uint32_t n_anc = 0;
     uint32_t stack[MPOL_MAX_IN + 16]; int sp = 0;
@@ -1452,12 +1494,25 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * re-found below by txid via prev[] when linking, so recompute par_idx. */
     if (n_evict){
         t = mpol_nodes_base(st);
-        n_par = 0;
-        for (int i=0;i<n_in;i++){
-            if (n_par >= MPOL_MAX_PARENTS) break;
-            int p = find_node(st, prev[i]);
-            int seen = 0; for (int k=0;k<n_par;k++) if (par_idx[k]==p) seen=1;
-            if (p>=0 && !seen) par_idx[n_par++] = p;
+        int n_par_before = n_par;
+        n_par = mpol_collect_parents(st, prev, n_in, par_idx, 0);
+        /* MEM-5 (audit 2026-09-03): the eviction must not have removed one of
+         * THIS transaction's parents. worst_chunk is scored over the existing
+         * graph, which does not yet contain the incoming transaction, so a
+         * high-feerate child arriving at a byte-full pool could evict the very
+         * parent it spends: the child was then stored with n_parents = 0, its
+         * fee computed from that parent's output value, spending an output
+         * present in neither the UTXO set nor the mempool. GBT includes it
+         * (every registered ancestor is "present") and peers orphan it.
+         *
+         * Core adds the transaction to the pool FIRST and trims with it
+         * included, so {parent, child} is scored as one chunk, then returns
+         * "mempool full" if the transaction itself was trimmed. Rejecting here
+         * reaches the same outcome from the other direction, without
+         * restructuring the accept path around a speculative insert. */
+        if (n_par < n_par_before){
+            _mpol_last_reason = "mempool full";
+            return 0;
         }
         /* re-collect ancestors for the desc-aggregate bump below */
         stamp = *(uint32_t*)((char*)st+20) + 1;
@@ -1500,6 +1555,34 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
           for (int q = 0; q < wn; q++) memcpy(wt[q], mpol_nodes_base(st)[wc.idx[q]].txid, 32);
           floor_bump(st, wf * 1000 / ws + pol->incremental_fee);
           for (int q = 0; q < wn; q++) mpool_policy_remove_package(st, mp, wt[q]);   /* descendants live in the chunk too; a gone txid is a no-op */
+          /* MEM-5 (audit 2026-09-03): the chunk just evicted must not have
+           * contained one of THIS transaction's parents -- and the check has
+           * to happen BEFORE mpool_put, or the transaction ends up stored in
+           * the structural pool while the policy layer refuses it, which is
+           * worse than the bug.
+           *
+           * worst_chunk is scored over the EXISTING graph, which does not yet
+           * contain the incoming transaction. So a high-feerate child
+           * arriving at a byte-full pool can evict the very parent it spends:
+           * par_idx is then recomputed from what is left, and the child is
+           * stored with n_parents = 0, its fee computed from the parent's
+           * output value, spending an output present in neither the UTXO set
+           * nor the mempool. getblocktemplate includes it (every REGISTERED
+           * ancestor is present) and peers orphan it.
+           *
+           * Core adds the transaction FIRST and trims with it included, so
+           * {parent, child} is scored as one chunk, then returns "mempool
+           * full" if the transaction was itself trimmed. Rejecting reaches
+           * the same end state without restructuring the accept path around
+           * a speculative insert. The parent stays evicted either way, which
+           * is what Core does too. */
+          { int n_par_before = n_par;
+            n_par = mpol_collect_parents(st, prev, n_in, par_idx, 0);
+            if (n_par < n_par_before){
+                mpool_compact(mp);
+                _mpol_last_reason = "mempool full";
+                return 0;
+            } }
           mpool_compact(mp);
           put = mpool_put(mp, txid, tx, txlen);
       }
@@ -1508,13 +1591,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
       /* trimming may have shifted node indices: recompute parent/ancestor
        * lists one more time before linking */
       t = mpol_nodes_base(st);
-      n_par = 0;
-      for (int i=0;i<n_in;i++){
-          if (n_par >= MPOL_MAX_PARENTS) break;
-          int p = find_node(st, prev[i]);
-          int seen = 0; for (int k=0;k<n_par;k++) if (par_idx[k]==p) seen=1;
-          if (p>=0 && !seen) par_idx[n_par++] = p;
-      }
+      n_par = mpol_collect_parents(st, prev, n_in, par_idx, 0);
       stamp = *(uint32_t*)((char*)st+20) + 1;
       if (stamp == 0xFFFFFFFFu) stamp = 1;
       *(uint32_t*)((char*)st+20) = stamp;
