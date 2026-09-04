@@ -227,6 +227,13 @@ extern int  net_feeler_probe(const char* ip_str);                             /*
 extern unsigned net_netgroup_v4(unsigned ip);                                 /* daemon/net_policy.c */
 extern long p2p_addr_count(const void* pl, long plen);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
+/* STO-5: the CONCURRENT-SAFE appender. store_append above is single-writer
+ * only -- it seeks to a cached cur_file_pos and takes no flock -- so every
+ * live writer in this daemon uses this one instead. Returns the height, -1 on
+ * error, or -2 when the block does not link to the current tip (which means
+ * another writer stored one first). */
+extern long idxscan_append_locked(void* st, const unsigned char hash32[32],
+                                  const void* raw, long len);
 extern long store_get_tip(void* st, long out_meta[3]);   /* -> 1 ok / -1 empty; a one-arg call SEGVs (2026-09-01 r boot) */
 extern int  store_get_tip_hash(void* st, unsigned char out[32]);   /* bitcoin_store.asm */
 /* ZMQ notifications: publisher (daemon/zmq_pub.c) + the cross-process
@@ -811,8 +818,20 @@ static int serve_loop(int fd, int lfd){
                                 static unsigned char scratch[2048];
                                 if(cons_verify(blk,bl,scratch,64)==1){
                                     unsigned char hdr[32]; block_hash(hdr,blk);
-                                    store_append(store_buf,hdr,blk,bl);
-                                    node_log_event(lfd, L_BLOCK, (unsigned)bl, 1, i);
+                                    /* STO-5 (audit 2026-09-03): this is a forked
+                                     * serve CHILD appending to the shared archive,
+                                     * so it must use the locked appender like every
+                                     * other live writer. store_append seeks to the
+                                     * in-memory cur_file_pos and takes NO flock, so
+                                     * two writers that both believe the tip is T
+                                     * write the same file offset -- and if one block
+                                     * is larger, its tail overruns the next frame and
+                                     * that height's index record points at rubbish.
+                                     * -2 means the block does not link to the current
+                                     * tip, which here just means somebody else got
+                                     * there first: not an error, nothing to log. */
+                                    long ar = idxscan_append_locked(store_buf,hdr,blk,bl);
+                                    if (ar >= 0) node_log_event(lfd, L_BLOCK, (unsigned)bl, 1, i);
                                 }
                             }
                         }
@@ -5230,9 +5249,27 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                          * pass after the dry run; same undo/checkpoint
                          * crash-safety as any network block). */
                         unsigned char bh[32]; sha256d(bh, sblk, 80);
-                        if (store_append(store_buf, bh, sblk, (long)slen) < 0){
+                        /* STO-5 (audit 2026-09-03): the miner's block goes in
+                         * through the SAME locked appender the worker legs and
+                         * the inbound serve children use. store_append writes
+                         * at a cached cur_file_pos without taking append.lock,
+                         * so a serve child that appended network block T+1 a
+                         * moment earlier -- while this worker still believed
+                         * the tip was T -- had its frame overwritten, and a
+                         * larger submitted block overran the frame after it.
+                         *
+                         * -2 is its own answer, not a generic failure: the
+                         * block no longer links to the tip, meaning the chain
+                         * moved under us between the dry run and here. That is
+                         * exactly the race, and saying so beats "rejected". */
+                        long ar_sb = idxscan_append_locked(store_buf, bh, sblk, (long)slen);
+                        if (ar_sb == -2){
+                            snprintf(reason, sizeof reason, "inconclusive");
+                            fprintf(stderr,"[dl] submitblock: the tip moved between the dry run and the append "
+                                           "(another writer stored a block first) -- not connecting\n");
+                        } else if (ar_sb < 0){
                             snprintf(reason, sizeof reason, "rejected");
-                            fprintf(stderr,"[dl] submitblock: store_append FAILED\n");
+                            fprintf(stderr,"[dl] submitblock: locked append FAILED\n");
                         } else {
                             long ar = utxo_live_catchup(store_buf);
                             if (ar < 0){

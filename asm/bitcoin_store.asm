@@ -955,6 +955,28 @@ write_idx_rec:
     ret
 
 ; ============================================================================
+; ---- STO-5 (audit 2026-09-03): SINGLE-WRITER ONLY ----------------------------
+;
+; This function seeks to the in-memory cur_file_pos (st+32) and takes NO
+; flock. It is therefore safe ONLY where one process owns the archive: the
+; batch tools (daemon/merge_only.c, daemon/paribd_asm.c), genesis injection
+; into an empty store, and the tests.
+;
+; It is NOT safe for the live daemon, and it was being used there in two
+; places -- an inbound serve child's opportunistic block fetch, and the
+; miner's submitblock. Both have moved to idxscan_append_locked. The failure
+; was not theoretical: cur_file_pos is refreshed only by store_reload,
+; store_append and store_truncate_to, so a worker whose last reload predates a
+; serve child's append still believes the tip is T, writes block T+1 at the
+; offset the child already used, and -- if the submitted block is larger --
+; runs its tail over the frame after it, leaving that height's index record
+; pointing at rubbish. With no lock the two writes can also interleave
+; byte-wise.
+;
+; Every live writer uses idxscan_append_locked, which makes "read the true tip,
+; then write" one critical section under append.lock (st+40). Anything new in
+; the daemon that appends a block must use that, not this.
+;
 ; store_append(st, hash[32], raw, len)
 ; ============================================================================
 global store_append
