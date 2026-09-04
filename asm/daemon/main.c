@@ -3378,7 +3378,14 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
     if(lfd<0){ fprintf(stderr,"[dlc w%d] no lock\n",w); return 1; }
     static unsigned char st[4096]; store_init(st);
     *(int*)((char*)st+40)=lfd;
-    *(int*)((char*)st+36)=0xd9b4bef9;   /* magic */
+    /* NET-15 (audit 2026-09-03): this hardcoded MAINNET's magic into every
+     * frame the catch-up worker wrote, on every chain, while every other
+     * writer uses net_magic -- so a testnet4/signet/regtest archive carried
+     * mainnet frames. The frame magic is never read back today (see the note
+     * at the store's own frame writer), so it was an inconsistency rather
+     * than a fault, but it is exactly what a future frame-magic check or an
+     * external reindex tool would trip over. */
+    { extern unsigned int net_magic; *(int*)((char*)st+36) = (int)net_magic; }
     *(int*)((char*)st+28)=0;            /* cur_file_no=0 */
     *(int*)((char*)st+0)=-1;            /* no blk fd yet */
     static unsigned char buf[24<<20]; static unsigned char scratch[8<<20];
@@ -5476,7 +5483,15 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                      * this peer fRelay=0 (-blocksonly) and it relayed anyway */
                     fprintf(stderr,"[mux:%d] %s sent transactions in -blocksonly: violation, disconnecting\n", i, mux_out_host[i]);
                     mux_next_peer(i, peers, pool_len, out_port);
-                    mux_out_nextretry[i] = (long long)(clock() * 1000.0 / CLOCKS_PER_SEC) + REDIAL_BACKOFF_MS;
+                    /* DMN-7 (audit 2026-09-03): clock() is process CPU time,
+                     * not wall time. Compared against now_ms (CLOCK_MONOTONIC,
+                     * a much larger number) this retry stamp was already in
+                     * the past the moment it was written, so there was NO
+                     * backoff: on a -blocksonly node a peer that relayed a tx
+                     * was disconnected and the slot re-dialled immediately,
+                     * over and over. dh_now_ms() is the monotonic clock every
+                     * other timestamp here uses. */
+                    mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
                     continue;
                 }
                 { extern void txrelay_publish_orphans(void); txrelay_publish_orphans(); }
@@ -6856,7 +6871,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
          * inserted, so every leg read the PREVIOUS leg's revents and the
          * last leg's was never examined (2026-08-28 pre-deploy review). */
         int poll_idx=legs_start;
-        long long now_ms = (long long)(clock() * 1000.0 / CLOCKS_PER_SEC);
+        /* DMN-7: clock() is CPU time, which in the mux parent advances at a
+         * small fraction of wall time -- REDIAL_BACKOFF_MS (30 s) became a
+         * 30-CPU-second gap, i.e. minutes of wall clock. Monotonic, like
+         * every other timestamp in this file. */
+        long long now_ms = dh_now_ms();
         for(int i=0;i<mux_n_out;i++){
             if(mux_out_fd[i]<0){                          /* dead slot: re-dial (rate-limited) */
                 if(now_ms >= mux_out_nextretry[i]){ mux_next_peer(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }

@@ -830,11 +830,14 @@ long wallet_createrawtx(unsigned char* out_tx, long cap,
 
     unsigned char* t = out_tx;
     long pos = 0;
-    /* version */
-    t[pos++] = (unsigned char)(locktime & 0xff);
-    t[pos++] = (unsigned char)((locktime >> 8) & 0xff);
-    t[pos++] = (unsigned char)((locktime >> 16) & 0xff);
-    t[pos++] = (unsigned char)((locktime >> 24) & 0xff);
+    /* nVersion. WAL-18 (audit 2026-09-03): this wrote LOCKTIME into the
+     * version field -- under a comment that said "version" -- so an ordinary
+     * `wallet_cli send` (locktime 0) produced a VERSION-0 transaction. Core's
+     * IsStandardTx rejects nVersion < 1 ("version"), so it would never relay
+     * through a Core peer. Version 2 to match the RPC builder
+     * (wf_build_unsigned), which is what every other path here produces.
+     * The real locktime is written at the END of the transaction, below. */
+    t[pos++] = 2; t[pos++] = 0; t[pos++] = 0; t[pos++] = 0;
     /* vin count */
     pos += put_varint(t + pos, n);
     for (unsigned long i = 0; i < n && pos + 41 < cap; i++) {

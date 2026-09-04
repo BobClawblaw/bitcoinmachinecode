@@ -113,7 +113,12 @@ static void rj_append_escaped(char** out, size_t* cap, size_t* len, const char* 
             case '\r': esc = "\\r";  break;
             case '\t': esc = "\\t";  break;
             default:
-                if (*p < 0x20) {
+                /* RPC-11 (audit 2026-09-03): 0x7f (DEL) too. UniValue's
+                 * generated escape table has escapes['\x7f'] = "\\u007f",
+                 * so Core emits it escaped and this writer emitted it raw.
+                 * Reachable through operator-supplied strings (labels,
+                 * comments); peer user agents are sanitised at ingest. */
+                if (*p < 0x20 || *p == 0x7f) {
                     /* \uXXXX with lowercase hex, 4 digits */
                     char buf[8];
                     snprintf(buf, sizeof buf, "\\u%04x", (unsigned)*p);

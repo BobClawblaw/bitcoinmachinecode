@@ -553,6 +553,7 @@ bech32_decode:
     ; after it are from the charset (never '1'), so the last '1' is the split.
     xor  r15, r15          ; running string length
     xor  r8,  r8           ; position of last '1' (0 = none yet)
+    xor  r9,  r9           ; SER-5: case bitmap -- 1 = saw lower, 2 = saw upper
 .sep_scan:
     ; BIP173: a bech32(/bech32m) string is at most 90 characters. Reject the
     ; over-length form HERE, before the data loop below: that loop converts
@@ -568,6 +569,26 @@ bech32_decode:
     jz   .sep_scan_done
     cmp  r15, 90
     jae  .err             ; >= 90 with no NUL yet -> over-length
+    ; ---- SER-5 / WAL-9 (audit 2026-09-03): reject MIXED case ----
+    ; bech32_init maps upper-case letters to the same values as lower, so the
+    ; decoder folded case and accepted a string BIP173 forbids: "the string
+    ; must be either all lowercase or all uppercase". validateaddress on
+    ; bc1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4 answered isvalid:true where
+    ; Core's bech32::Decode answers false. All-upper and all-lower both stay
+    ; valid, which BIP173 also requires -- only the mixture is refused.
+    cmp  al, 'a'
+    jb   .cs_upper
+    cmp  al, 'z'
+    ja   .cs_upper
+    or   r9, 1
+    jmp  .cs_done
+.cs_upper:
+    cmp  al, 'A'
+    jb   .cs_done
+    cmp  al, 'Z'
+    ja   .cs_done
+    or   r9, 2
+.cs_done:
     cmp  al, '1'
     jne  .not_sep
     mov  r8, r15
@@ -575,6 +596,8 @@ bech32_decode:
     inc  r15
     jmp  .sep_scan
 .sep_scan_done:
+    cmp  r9, 3             ; SER-5: both cases present -> not a bech32 string
+    je   .err
     ; r8 = separator index. Must exist and be < total len.
     test r8, r8
     jz   .err             ; no separator, or separator at position 0 (empty HRP)

@@ -192,6 +192,28 @@ int main(void) {
         ck("rj_clone(NULL) is NULL, not a crash", rj_clone(NULL) == NULL);
     }
 
+    /* ---- RPC-11 (audit 2026-09-03): DEL is escaped ----
+     * rj_append_escaped handled the named escapes and bytes < 0x20 but
+     * emitted 0x7f raw. UniValue's generated table has
+     * escapes['\x7f'] = "\\u007f", so Core escapes it. Reachable through
+     * operator-supplied strings such as labels and comments.
+     *
+     * The control is the pair: 0x7e must stay RAW. An implementation that
+     * escaped everything >= 0x7e would pass a DEL-only test while mangling
+     * ordinary printable output. */
+    {
+        rj_val* o = rj_obj();
+        rj_obj_set(o, "label", rj_str("a\x7f" "b"));
+        char b[256]; rj_write(b, sizeof b, o, 2); rj_free(o);
+        ck_str("RPC-11 DEL is escaped as \\u007f", b, "{\n  \"label\": \"a\\u007fb\"\n}");
+    }
+    {
+        rj_val* o = rj_obj();
+        rj_obj_set(o, "label", rj_str("a\x7e" "b"));
+        char b[256]; rj_write(b, sizeof b, o, 2); rj_free(o);
+        ck_str("RPC-11 0x7e (~) stays raw", b, "{\n  \"label\": \"a~b\"\n}");
+    }
+
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }
