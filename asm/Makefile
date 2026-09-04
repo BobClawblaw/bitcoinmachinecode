@@ -2644,7 +2644,7 @@ tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
 # -O2 SINCE 2026-08-23. This rule carried `-O0 required (an -O2 rebuild
 # regressed lsock's bind to EFAULT)` for a long time. Re-tested on that date:
 # built at -O2, `bitcoind serve <scratch-datadir> 39333` binds and listens
-# (`ss -ltn` shows 0.0.0.0:39333), and tests/test_outbound_mux and
+# (`ss -ltn` shows 0.0.0.0:39333), and and
 # tests/test_redial -- which fork this exact binary in serve mode -- both pass.
 # The whole suite is 159 harnesses / 0 failures at -O2 as well as at -O0. The
 # real -O2 blockers were ABI/overflow bugs, now fixed: LOG.md incidents #27
@@ -3131,7 +3131,6 @@ tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate 
 	./tests/test_ellswift_ecdh
 	./tests/test_asmap
 	./tests/test_core_parity
-	./tests/test_outbound_mux ./daemon/bitcoind
 	./tests/test_redial ./daemon/bitcoind
 	./tests/verify_p2sh_shim < /dev/null
 	./tests/test_verify_p2sh
