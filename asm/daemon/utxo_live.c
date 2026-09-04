@@ -707,7 +707,13 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
         fprintf(stderr, "[utxo_live] WARNING h=%ld: non-coinbase duplicate outpoint declined (Core's AddCoin would throw here)\n",
                 g_apply_height);
     }
-    if (r == -1 || r == 2) ctx->fatal = 1; /* -1 I/O error, 2 table full (undersized memtable) */
+    /* UTX-3 (audit 2026-09-03): `r < 0`, not `r == -1`. utxo_lsm_put used to
+     * truncate utxo_store_put's 64-bit -1 through a 32-bit register, so a
+     * failed WAL drain arrived here as 4294967295 and this check let the
+     * block continue with the coin written nowhere. The asm now sign-extends;
+     * testing the SIGN rather than one exact value means a future widening
+     * cannot silently reopen it. */
+    if (r < 0 || r == 2) ctx->fatal = 1;   /* <0 I/O error, 2 table full (undersized memtable) */
 }
 
 /* rollback_partial_apply(): undo whatever apply_block_inner already
@@ -1796,7 +1802,7 @@ static int undo_restore_cb(void* ctx, const u8 txid[32], u32 index, u64 value,
     int* fatal = (int*)ctx;
     long r = utxo_lsm_put(&g_utxo_lst, g_utxo_table, txid, index, value,
                           (u64)height, (u64)is_coinbase, script, (u32)slen);
-    if (r == -1 || r == 2) { *fatal = 1; return 0; }
+    if (r < 0 || r == 2) { *fatal = 1; return 0; }   /* UTX-3: sign, not one value */
     if (r == 1 && g_csi_add)
         g_csi_add(txid, index, value, (u64)height, (u64)is_coinbase, script, (unsigned long)slen);
     return 1;

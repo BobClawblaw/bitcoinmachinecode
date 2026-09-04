@@ -1411,6 +1411,14 @@ tests/test_lsm_lost_tombstones_bad: tests/test_lsm_lost_tombstones.c tests/bitco
 # test_utxo_lost_tombstones -- incident 2026-09-01 at the daemon layer (see
 # the file); _bad links tests/bitcoin_utxo_lsm_badsparse.o in place of the
 # shipped LSM object and must reproduce the flush-time rejects and the loss.
+# test_utxo_put_wal_fail -- UTX-3 (audit 2026-09-03): a failed WAL drain must
+# reach utxo_lsm_put's callers as a NEGATIVE status, not the zero-extended
+# 0xFFFFFFFF that daemon/utxo_live.c's `r == -1` test silently ignored,
+# dropping the created coin from both the memtable and the WAL. Injects the
+# failure with a read-only WAL fd, as the audit's own repro did.
+tests/test_utxo_put_wal_fail: tests/test_utxo_put_wal_fail.c $(REORGOBJS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ tests/test_utxo_put_wal_fail.c $(REORGOBJS) -lpthread
+
 LOSTTOMBSRCS := $(patsubst tests/test_utxo_ghost_resume.c,tests/test_utxo_lost_tombstones.c,$(GHOSTRESUMESRCS))
 REORGOBJS_BADSPARSE := $(patsubst bitcoin_utxo_lsm.o,tests/bitcoin_utxo_lsm_badsparse.o,$(REORGOBJS))
 tests/test_utxo_lost_tombstones: $(LOSTTOMBSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
