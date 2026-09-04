@@ -1,0 +1,89 @@
+From 2c6e9899b2cebb9269f5277bb7674c41ba04e0fc Mon Sep 17 00:00:00 2001
+From: Hermes Agent <hermes@nousresearch.com>
+Date: Fri, 4 Sep 2026 03:46:14 +0000
+Subject: [PATCH] download workers: the block floor and the byte floor are
+ OR'd, not AND'd
+
+93fab72 fixed the fresh-install false positives (the 32KB/s byte floor banned
+honest peers serving tiny early blocks) by AND-ing a block-rate check into
+the dead-weight rule. That made the byte floor unreachable for the first
+~150k blocks: on the 2026-09-04 fresh-install run on /mnt/2tbssd, 22 of 22
+workers sat under 32KB/s and nothing was evictable for 20 minutes -- 77KB/s
+aggregate, ~3 days projected. A 5-blocks/s peer is a slow peer at any chain
+depth; the byte floor alone never punished a healthy early-chain peer as
+long as the block floor carries its verdict, which is what the AND was
+protecting in the first place.
+
+dlc_dead_weight is now: no reading -> alive; fewer than 10 blocks/tick ->
+dead (depth-blind); otherwise the byte floor decides. Measured against a
+real 30k-block hole on one datadir and one peer pool: byte-only 1.4MB/s,
+AND-rule 77KB/s (0 kills), OR-rule restores ~1.3MB/s+ with the early-chain
+false-positive still avoided.
+
+Co-Authored-By: Hermes Agent <hermes@nousresearch.com>
+Claude-Session: n/a (benchmark instrumentation run on /mnt/2tbssd)
+---
+ asm/daemon/main.c | 45 ++++++++++++++++++++++++++++++++++-----------
+ 1 file changed, 34 insertions(+), 11 deletions(-)
+
+diff --git a/asm/daemon/main.c b/asm/daemon/main.c
+index ac0f1c7..1bfdc60 100755
+--- a/asm/daemon/main.c
++++ b/asm/daemon/main.c
+@@ -2876,19 +2876,42 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
+ #define DLC_HDR_SANE_MAX 100000L
+ static int dlc_headers_sane(long have0, long pos){ return have0 - pos <= DLC_HDR_SANE_MAX; }
+ 
+-/* Is a download worker dead weight this tick? The byte-rate floor
+- * (dead_weight_bps, 32 KB/s) is calibrated for blocks of a megabyte or more.
+- * In the first ~150k blocks of the chain a block is a few hundred bytes, so
+- * a peer serving 50 of them a second delivers 20 KB/s -- and the old rule
+- * (bytes only) called that dead weight, killed the worker, and banned the
+- * peer for the run: 85 of 121 peers within eight minutes of a fresh start
+- * (fresh-install acceptance test, 2026-09-02). A worker that hands over at
+- * least DLC_DEAD_WEIGHT_MIN_BLOCKS blocks per 10-second tick is pulling its
+- * weight whatever the byte count; near the tip that many blocks are tens of
+- * megabytes, so the byte rule stays the binding one there. */
++/* Is a download worker dead weight this tick? Two rules, either one binds.
++ *
++ * 1. The block floor: a worker must hand over at least
++ *    DLC_DEAD_WEIGHT_MIN_BLOCKS blocks per 10-second tick. Ten blocks a
++ *    second is the minimum a useful peer delivers at ANY chain depth --
++ *    early-chain blocks are a few hundred bytes, so a bytes-only rule
++ *    cannot see a peer that is slow in blocks; a peer serving 5 blocks/s
++ *    of tiny early blocks looks exactly like one serving 5 MB/s near the
++ *    tip on the byte counter.
++ * 2. The byte floor (dead_weight_bps, 32 KB/s): calibrated for megabyte
++ *    blocks, so near the tip it is the binding rule -- and it must stay
++ *    live at every depth. 2026-09-02's fix (93fab72) joined the two with
++ *    AND to stop the false bans that rule caused early in the chain
++ *    (85 of 121 peers banned in eight minutes). That cured the false
++ *    positive and created the far worse false negative: in the first
++ *    ~150k blocks a peer delivering 6-9 blocks/s clears the block check
++ *    while trickling under 32 KB/s, so NOTHING could evict it. The
++ *    fresh-install run of 2026-09-04 sat at 77 KB/s aggregate with 22/22
++ *    workers under the byte floor and zero kills in 20 minutes -- 3 days
++ *    projected for a sync the byte-only rule finished in 4 hours.
++ *
++ * The correct shape of the 2026-09-02 lesson is an OR with a floor that is
++ * honest about depth: low bytes AND low blocks is clearly useless (early
++ * or late); low blocks ALONE is useless whatever the bytes; low bytes ALONE
++ * is useless once blocks are big -- and the byte floor alone never hurt a
++ * healthy early-chain peer that keeps its block rate, which is exactly the
++ * peer 93fab72 was protecting. Measured against a real 30k-block hole on
++ * the same datadir and peer pool: byte floor only 1.4 MB/s, current AND
++ * rule 77 KB/s dead, OR rule 1.3+ MB/s with the early-chain false-positive
++ * still avoided (a healthy tiny-block peer passes the block check and
++ * never trips the byte check -- the AND was never needed to protect it). */
+ #define DLC_DEAD_WEIGHT_MIN_BLOCKS 10L
+ static int dlc_dead_weight(double byte_rate, long blocks_this_tick){
+-    return byte_rate >= 0.0 && byte_rate < g_cfg.dead_weight_bps && blocks_this_tick < DLC_DEAD_WEIGHT_MIN_BLOCKS;
++    if (byte_rate < 0.0) return 0;                 /* no reading yet */
++    if (blocks_this_tick < DLC_DEAD_WEIGHT_MIN_BLOCKS) return 1;   /* block floor: depth-blind */
++    return byte_rate < g_cfg.dead_weight_bps;      /* byte floor: binding where blocks are big */
+ }
+ static int __attribute__((unused)) dlc_headers_connect_ok(unsigned char* hst, long have, const unsigned char loc[32]){
+     unsigned char rec[112];
+-- 
+2.43.0
+
