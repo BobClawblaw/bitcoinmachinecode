@@ -9,14 +9,37 @@ typedef uint8_t u8; typedef uint64_t u64;
 extern void merkle_root(u8 out[32], u8* hashes, u64 n);           /* bitcoin_hash.asm: IN PLACE on hashes */
 extern void sha256d(u8 out[32], const void* msg, int64_t len);    /* bitcoin_hash.asm */
 
+/* ---- VAL-10 / SER-3 (audit 2026-09-03): CANONICAL CompactSize ----
+ *
+ * Core's ReadCompactSize (serialize.h) throws "non-canonical
+ * ReadCompactSize()" when a value is encoded in a wider form than it needs,
+ * and "ReadCompactSize(): size too large" above MAX_SIZE (0x02000000). Every
+ * decoder here accepted `fd 01 00` for 1, so a block containing such a
+ * transaction parsed cleanly HERE and is undeserializable to every Core node
+ * on the network -- and since txids are computed over the verbatim bytes, the
+ * merkle root still matches, so nothing else caught it. A miner producing one
+ * would split this node onto a chain no one else can follow.
+ *
+ * The minimum a width may encode: 0xfd for the 3-byte form, 0x10000 for the
+ * 5-byte form, 0x100000000 for the 9-byte form. Nothing valid is lost --
+ * a canonical encoder never emits the wider form -- and nothing already in
+ * the archive can be affected, because a non-canonical transaction could
+ * never have been relayed to us by a Core node in the first place. */
+#define BW_CS_MAX_SIZE 0x02000000ULL
 static int rd_varint(const u8* p, const u8* end, u64* v, u64* used){
     if (p >= end) return 0;
     u8 b = p[0];
     if (b < 0xfd) { *v = b; *used = 1; return 1; }
-    if (b == 0xfd){ if (p+3>end) return 0; *v = p[1] | ((u64)p[2]<<8); *used=3; return 1; }
-    if (b == 0xfe){ if (p+5>end) return 0; *v = p[1]|((u64)p[2]<<8)|((u64)p[3]<<16)|((u64)p[4]<<24); *used=5; return 1; }
+    if (b == 0xfd){ if (p+3>end) return 0; *v = p[1] | ((u64)p[2]<<8);
+                    if (*v < 0xfdULL) return 0;                             /* non-canonical */
+                    *used=3; return *v <= BW_CS_MAX_SIZE; }
+    if (b == 0xfe){ if (p+5>end) return 0; *v = p[1]|((u64)p[2]<<8)|((u64)p[3]<<16)|((u64)p[4]<<24);
+                    if (*v <= 0xffffULL) return 0;                          /* non-canonical */
+                    *used=5; return *v <= BW_CS_MAX_SIZE; }
     if (p+9>end) return 0;
-    *v = 0; for (int i=0;i<8;i++) *v |= (u64)p[1+i] << (8*i); *used = 9; return 1;
+    *v = 0; for (int i=0;i<8;i++) *v |= (u64)p[1+i] << (8*i);
+    if (*v <= 0xffffffffULL) return 0;                                      /* non-canonical */
+    *used = 9; return *v <= BW_CS_MAX_SIZE;
 }
 
 /* Wire form: version(4) [00 01] vin vout [witness] locktime(4).
@@ -75,6 +98,18 @@ int bw_walk_tx(const u8* tx, u64 len, int* has_witness,
             }
             if (nitems) *has_witness = 1;
         }
+        /* VAL-10 (audit 2026-09-03): "Superfluous witness record".
+         *
+         * Core's UnserializeTransaction throws when the marker+flag are
+         * present but every input's witness stack is empty -- the transaction
+         * must then have been serialized WITHOUT the marker. Here such a
+         * transaction parsed cleanly, has_witness stayed 0, and a legacy-input
+         * transaction with an `00 01` marker and all-empty stacks verified
+         * through legacy_tx_view. Since txids are taken over the verbatim
+         * bytes the merkle root still matched, so nothing downstream noticed
+         * -- and every Core node on the network refuses the block message
+         * outright. */
+        if (!*has_witness) return 0;
     }
     if (p + 4 > end) return 0;
     p += 4;                                        /* locktime */

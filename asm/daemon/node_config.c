@@ -196,6 +196,60 @@ int nodecfg_unimplemented(const char* key){
     return r != NULL && *r != 0;
 }
 
+/* ---- DMN-4 (audit 2026-09-03) helpers ---------------------------------- */
+
+/* Does a `[section]` header name the selected chain?
+ *
+ * Core's section names are the chain's own name, with one exception: [test]
+ * is testnet3. This build refuses testnet3 outright (see the k_noeffect table
+ * entry for "testnet"), so a [test] section can never match and its keys are
+ * always skipped -- which is the correct outcome, not an oversight.
+ * Comparison is exact and case-sensitive, as Core's is. */
+int nodecfg_section_is(const char* section, const char* chain){
+    if (!section || !chain) return 0;
+    if (!strcmp(section, chain)) return 1;
+    /* Core writes the mainnet section as [main] and the chain as "main". */
+    return 0;
+}
+
+/* The options Core refuses to read from the base section on a non-main chain
+ * (common/args.cpp's "-only-applies-to" set): anything that names a port, an
+ * address, or a peer, because such a value written without a section is
+ * almost always the mainnet one and would silently move the test node onto
+ * it. */
+int nodecfg_is_network_specific(const char* key){
+    static const char* net_keys[] = {
+        "port", "rpcport", "bind", "rpcbind", "rpcallowip",
+        "addnode", "connect", "seednode", "whitebind", "externalip",
+        "onion", "proxy", "torcontrol", "i2psam", "zmqpubrawblock",
+        "zmqpubrawtx", "zmqpubhashblock", "zmqpubhashtx", "zmqpubsequence",
+        NULL };
+    for (int i = 0; net_keys[i]; i++) if (!strcmp(key, net_keys[i])) return 1;
+    return 0;
+}
+
+/* Is `key` a name this parser applies (as opposed to an unknown key it
+ * ignores)? Used only to decide whether a leading "no" is Core's negation
+ * prefix or part of a genuine option name, so a future option actually
+ * called "noXYZ" cannot be silently rewritten into "XYZ". */
+int nodecfg_known_key(const char* key){
+    static const char* known[] = {
+        "maxconnections","dbcache","maxmempool","mempoolexpiry","minrelaytxfee",
+        "incrementalrelayfee","dustrelayfee","blockmintxfee","datacarrier",
+        "datacarriersize","permitbaremultisig","acceptnonstdtxn","blocksonly",
+        "whitelistrelay","whitelistforcerelay","listen","discover","dnsseed",
+        "upnp","natpmp","peerbloomfilters","peerblockfilters","blockfilterindex",
+        "txindex","coinstatsindex","addressindex","spentindex","timestampindex",
+        "prune","par","checkblockindex","checkmempool","checkaddrman",
+        "capturemessages","stopafterblockimport","persistmempool","rest",
+        "server","daemon","logips","logtimestamps","debuglogfile","printtoconsole",
+        "reindex","reindex-chainstate","fixedseeds","forcednsseed","i2pacceptincoming",
+        "v2transport","networkactive","rpccookieperms","deprecatedrpc",
+        NULL };
+    for (int i = 0; known[i]; i++) if (!strcmp(key, known[i])) return 1;
+    return 0;
+}
+
 static void set_defaults(void){
     g_cfg.max_connections       = 200;   /* Core v31 default */
     g_cfg.max_outbound          = 8;
@@ -428,6 +482,58 @@ long node_config_load(const char* path){
         return 0;
     }
     long applied = 0; int bad = 0; int unimpl = 0;
+    /* ---- DMN-4 (audit 2026-09-03): SECTIONS and NEGATION ----
+     *
+     * A `[section]` line has no `=`, so the loop below used to `continue`
+     * past it and then apply every following key unconditionally. That is
+     * not a cosmetic gap. An operator who reuses a Core bitcoin.conf holding
+     * the common dev block
+     *
+     *     [regtest]
+     *     rpcallowip=0.0.0.0/0
+     *     rpcbind=0.0.0.0
+     *
+     * while running mainnet gets, in Core, three inert lines. Here they were
+     * applied: rpc_acl_add("0.0.0.0/0") succeeded, rpcbind was honoured
+     * because rpc_acl_configured() > 0, and the MAINNET RPC server bound
+     * every interface and accepted every source. `[regtest] connect=...`
+     * likewise pinned a mainnet node to a loopback peer.
+     *
+     * Core scopes keys under [main], [test], [testnet4], [signet] and
+     * [regtest] to that chain. Doing the same needs the chain BEFORE the
+     * keys are applied, and the chain itself comes from this file -- so the
+     * file is read twice: once for the chain selectors in the base section
+     * (which is the only place Core honours them), then once for real. */
+    char cur_section[32] = "";
+    {
+        char l0[1024]; char sec0[32] = "";
+        while(fgets(l0, sizeof l0, f)){
+            char* q = l0;
+            while(*q==' '||*q=='\t') q++;
+            if(*q=='#'||*q=='\n'||*q==0) continue;
+            if(*q=='['){
+                char* e = strchr(q, ']');
+                if(e){ size_t n2 = (size_t)(e - q - 1); if(n2 >= sizeof sec0) n2 = sizeof sec0 - 1;
+                       memcpy(sec0, q+1, n2); sec0[n2] = 0; }
+                continue;
+            }
+            if(sec0[0]) continue;                 /* chain selectors: base section only */
+            char* e2 = strchr(q,'='); if(!e2) continue;
+            *e2 = 0;
+            char* k0 = q; char* v0 = e2+1;
+            size_t vl0 = strlen(v0);
+            while(vl0 && (v0[vl0-1]=='\n'||v0[vl0-1]=='\r'||v0[vl0-1]==' '||v0[vl0-1]=='\t')) v0[--vl0]=0;
+            size_t kl0 = strlen(k0);
+            while(kl0 && (k0[kl0-1]==' '||k0[kl0-1]=='\t')) k0[--kl0]=0;
+            int b0 = atoi(v0);
+            if     (!strcmp(k0,"chain")   && *v0)  snprintf(g_cfg.chain,sizeof g_cfg.chain,"%s",v0);
+            else if(!strcmp(k0,"regtest") && b0==1) snprintf(g_cfg.chain,sizeof g_cfg.chain,"regtest");
+            else if(!strcmp(k0,"signet")  && b0==1) snprintf(g_cfg.chain,sizeof g_cfg.chain,"signet");
+            else if(!strcmp(k0,"testnet4")&& b0==1) snprintf(g_cfg.chain,sizeof g_cfg.chain,"testnet4");
+        }
+        rewind(f);
+    }
+
     /* -connect implies -dnsseed=0 and -listen=0 in Core, but only when those
      * were not set explicitly. The implication therefore has to run AFTER the
      * whole file is read: `listen=1` may appear on a line BELOW `connect=`,
@@ -438,6 +544,16 @@ long node_config_load(const char* path){
         char* p = line;
         while(*p==' '||*p=='\t') p++;
         if(*p=='#'||*p=='\n'||*p==0) continue;
+        /* DMN-4: a section header changes which chain the following keys
+         * belong to. Previously it fell through the `no =` test and was
+         * simply ignored, taking its scoping with it. */
+        if(*p=='['){
+            char* e = strchr(p, ']');
+            if(e){ size_t n2 = (size_t)(e - p - 1); if(n2 >= sizeof cur_section) n2 = sizeof cur_section - 1;
+                   memcpy(cur_section, p+1, n2); cur_section[n2] = 0; }
+            else fprintf(stderr,"[config] malformed section header (no ']'): %s", p);
+            continue;
+        }
         char* eq = strchr(p,'='); if(!eq) continue;
         *eq = 0;
         char* key = p; char* val = eq+1;
@@ -445,6 +561,36 @@ long node_config_load(const char* path){
         while(vl && (val[vl-1]=='\n'||val[vl-1]=='\r'||val[vl-1]==' '||val[vl-1]=='\t')) val[--vl]=0;
         size_t kl = strlen(key);
         while(kl && (key[kl-1]==' '||key[kl-1]=='\t')) key[--kl]=0;
+
+        /* DMN-4: apply a sectioned key only on its own chain. */
+        if(cur_section[0] && !nodecfg_section_is(cur_section, g_cfg.chain)){
+            continue;
+        }
+        /* DMN-4: Core IGNORES network-specific options that appear outside
+         * any section when the selected chain is not main, with a warning --
+         * because a bare `port=` in a file that also has a [regtest] block
+         * almost always means the mainnet port and would silently move the
+         * test node. Same rule, same reason, said out loud. */
+        if(!cur_section[0] && strcmp(g_cfg.chain, "main") != 0 && nodecfg_is_network_specific(key)){
+            fprintf(stderr,"[config] %s= is network-specific and appears outside any section "
+                           "while chain=%s: ignoring it (Core does the same; put it under [%s] to apply it)\n",
+                    key, g_cfg.chain, g_cfg.chain);
+            continue;
+        }
+        /* DMN-4: Core's negation. `-noX` is `-X=0`, so `noX=1` means X=0 and
+         * `noX=0` means X=1. Rewritten here into the key/value the chain
+         * below already understands, so every boolean option gets it at once
+         * rather than one at a time. Only applied when the remainder is a key
+         * this parser knows, so a genuine option starting with "no" -- there
+         * is none today, but there could be -- is not silently mangled. */
+        char negbuf[128];
+        if(kl > 2 && key[0]=='n' && key[1]=='o' && nodecfg_known_key(key+2)){
+            snprintf(negbuf, sizeof negbuf, "%s", key+2);
+            int on = atoi(val) ? 0 : 1;                 /* noX=1 -> X=0 */
+            fprintf(stderr,"[config] %s=%s -> %s=%d (Core negation)\n", key, val, negbuf, on);
+            key = negbuf; kl = strlen(negbuf);
+            val = on ? (char*)"1" : (char*)"0";
+        }
 
         int iv = atoi(val); int t;
 

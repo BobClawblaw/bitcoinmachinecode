@@ -20,14 +20,39 @@ typedef unsigned long u64;
 typedef unsigned int u32;
 
 /* ---- varint reader, matching tx_parse's own CompactSize decode exactly ---- */
+/* ---- VAL-10 / SER-3 (audit 2026-09-03): CANONICAL CompactSize ----
+ *
+ * Core's ReadCompactSize (serialize.h) throws "non-canonical
+ * ReadCompactSize()" when a value is encoded in a wider form than it needs,
+ * and "ReadCompactSize(): size too large" above MAX_SIZE (0x02000000). Every
+ * decoder here accepted `fd 01 00` for 1, so a block containing such a
+ * transaction parsed cleanly HERE and is undeserializable to every Core node
+ * on the network -- and since txids are computed over the verbatim bytes, the
+ * merkle root still matches, so nothing else caught it. A miner producing one
+ * would split this node onto a chain no one else can follow.
+ *
+ * The minimum a width may encode: 0xfd for the 3-byte form, 0x10000 for the
+ * 5-byte form, 0x100000000 for the 9-byte form. Nothing valid is lost --
+ * a canonical encoder never emits the wider form -- and nothing already in
+ * the archive can be affected, because a non-canonical transaction could
+ * never have been relayed to us by a Core node in the first place. */
+#define UTXO_WALK_CS_MAX_SIZE 0x02000000ULL
 static inline u64 utxo_walk_read_varint(const u8* p, const u8* end, u64* consumed){
     if (p >= end) { *consumed = 0; return (u64)-1; }
     u8 c = p[0];
     if (c < 0xfd) { *consumed = 1; return c; }
-    if (c == 0xfd) { if (p+3 > end) { *consumed=0; return (u64)-1; } *consumed=3; return (u64)p[1] | ((u64)p[2]<<8); }
-    if (c == 0xfe) { if (p+5 > end) { *consumed=0; return (u64)-1; } *consumed=5; u32 v; memcpy(&v,p+1,4); return v; }
+    if (c == 0xfd) { if (p+3 > end) { *consumed=0; return (u64)-1; }
+                     u64 v = (u64)p[1] | ((u64)p[2]<<8);
+                     if (v < 0xfdULL || v > UTXO_WALK_CS_MAX_SIZE) { *consumed=0; return (u64)-1; }
+                     *consumed=3; return v; }
+    if (c == 0xfe) { if (p+5 > end) { *consumed=0; return (u64)-1; }
+                     u32 v32; memcpy(&v32,p+1,4); u64 v = v32;
+                     if (v <= 0xffffULL || v > UTXO_WALK_CS_MAX_SIZE) { *consumed=0; return (u64)-1; }
+                     *consumed=5; return v; }
     if (p+9 > end) { *consumed=0; return (u64)-1; }
-    *consumed=9; u64 v; memcpy(&v,p+1,8); return v;
+    u64 v; memcpy(&v,p+1,8);
+    if (v <= 0xffffffffULL || v > UTXO_WALK_CS_MAX_SIZE) { *consumed=0; return (u64)-1; }
+    *consumed=9; return v;
 }
 
 typedef void (*utxo_walk_input_cb)(void* ctx, const u8 txid[32], u32 index);
