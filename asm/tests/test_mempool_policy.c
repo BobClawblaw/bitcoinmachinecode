@@ -52,6 +52,7 @@ extern long   mpool_policy_add(void* pol, void* st, void* mp,
                                const unsigned char txid[32], void* utxo);
 extern unsigned long long mpool_policy_estimate_feerate(void* st);
 extern const char* mpool_policy_reason(void* pol);
+extern long mpool_policy_n_parents(void* st, const unsigned char txid[32]);
 
 /* bitcoin_mempool_policy.c now calls mempool_resolve_confirmed_utxo instead
  * of utxo_get directly (see its own extern's comment) -- this harness still
@@ -159,6 +160,101 @@ int main(void){
         okv(r != 1, "a child joining 64 independent parents is refused");
         okv(r != 1 && strstr(mpool_policy_reason(pol), "too-large-cluster") != NULL, "...as too-large-cluster (anc/desc limits alone would have let it in)");
     }
+    /* ================================================================
+     * MEM-3 (audit 2026-09-03): the parent list is no longer truncated.
+     *
+     * MPOL_MAX_PARENTS was 24 and mpol_collect_parents dropped everything
+     * past it SILENTLY. parent[] is the only record of the graph --
+     * descendants are found by walking it -- so a dropped parent did not
+     * exist as far as eviction, expiry and RBF were concerned. The audit's
+     * scenario: 30 low-feerate parents and a child spending all 30; the child
+     * is stored linked to 24; RBF-replace the 30th (your own coin) and
+     * collect_descendant_txids finds no child, so the child stays in the pool
+     * spending an output the replacement has conflicted -- and
+     * getblocktemplate includes it, because every REGISTERED ancestor is
+     * present. An invalid block.
+     *
+     * 30 parents is the shape that matters: comfortably past the old cap of
+     * 24, comfortably inside the 63 that v31's 64-transaction cluster limit
+     * allows, so it must be ACCEPTED and fully linked.
+     * ================================================================ */
+    printf("== MEM-3: a 30-parent child keeps every parent link ==\n");
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<20];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 200, 10100000, 200, 10100000, 1);
+        mpool_policy_state_init(stbuf, 4096);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+
+        enum { NP = 30 };
+        static unsigned char ptxid[NP][32];
+        unsigned char spk[2] = { 0x51, 0x00 };
+        int all_ok = 1;
+        for (int i = 0; i < NP; i++){
+            unsigned char prev[32]; memset(prev, 0xC0 + (i & 15), 32); prev[0] = (unsigned char)i;
+            utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk, 1);
+            unsigned char tx[128]; unsigned long n = 0;
+            tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0;
+            tx[n++]=1; memcpy(tx+n, prev, 32); n+=32; memset(tx+n, 0, 4); n+=4; tx[n++]=0;
+            tx[n]=1; tx[n+1]=0; tx[n+2]=0; tx[n+3]=0; n+=4;      /* seq 1: replaceable */
+            tx[n++]=1; { unsigned long long v = 900000ULL; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+            tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n, 0x41+i, 20); n+=20;
+            memset(tx+n, 0, 4); n+=4;
+            memset(ptxid[i], 0xD0, 32); ptxid[i][0] = (unsigned char)i;
+            if (mpool_policy_add(pol, stbuf, mp, tx, n, ptxid[i], ux) != 1) all_ok = 0;
+        }
+        okv(all_ok, "MEM-3 30 independent parents accepted");
+
+        static unsigned char ctx[NP*41 + 64]; unsigned long n = 0;
+        ctx[n++]=2;ctx[n++]=0;ctx[n++]=0;ctx[n++]=0;
+        ctx[n++]=NP;
+        for (int i = 0; i < NP; i++){ memcpy(ctx+n, ptxid[i], 32); n+=32; memset(ctx+n, 0, 4); n+=4; ctx[n++]=0;
+            memset(ctx+n,0xff,4); n+=4; }
+        ctx[n++]=1; { unsigned long long v = (unsigned long long)NP*900000ULL - 50000ULL;
+                      for (int b=0;b<8;b++) ctx[n++]=(unsigned char)(v>>(8*b)); }
+        ctx[n++]=22; ctx[n++]=0x00; ctx[n++]=0x14; memset(ctx+n, 0x79, 20); n+=20;
+        memset(ctx+n, 0, 4); n+=4;
+        unsigned char ctid[32]; memset(ctid, 0xDF, 32);
+        { long rC = mpool_policy_add(pol, stbuf, mp, ctx, n, ctid, ux);
+          okv(rC == 1, "MEM-3 the 30-parent child is accepted"); }
+
+        /* THE ASSERTION THAT MATTERS. Every parent must be recorded, so the
+         * pool must report 30 -- with the old inline cap it reported 24 and
+         * the six beyond it were invisible to every descendant walk. */
+        { long np = mpool_policy_n_parents(stbuf, ctid);
+          printf("      (child reports %ld parents; 30 expected, old cap was 24)\n", np);
+          okv(np == NP, "MEM-3 the child records ALL 30 parents, not 24"); }
+
+        /* And the consequence: replacing the LAST parent -- the one the old
+         * cap dropped -- must take the child with it. Under the truncation
+         * the child survived, spending an output that no longer existed. */
+        {
+            unsigned char prev[32]; memset(prev, 0xC0 + ((NP-1) & 15), 32); prev[0] = (unsigned char)(NP-1);
+            unsigned char rtx[128]; unsigned long m = 0;
+            rtx[m++]=2;rtx[m++]=0;rtx[m++]=0;rtx[m++]=0;
+            rtx[m++]=1; memcpy(rtx+m, prev, 32); m+=32; memset(rtx+m, 0, 4); m+=4; rtx[m++]=0; memset(rtx+m,0xff,4); m+=4;
+            rtx[m++]=1; { unsigned long long v = 500000ULL; for (int b=0;b<8;b++) rtx[m++]=(unsigned char)(v>>(8*b)); }
+            rtx[m++]=22; rtx[m++]=0x00; rtx[m++]=0x14; memset(rtx+m, 0x7A, 20); m+=20;
+            memset(rtx+m, 0, 4); m+=4;
+            unsigned char rtid[32]; memset(rtid, 0xEE, 32);
+            long rr = mpool_policy_add(pol, stbuf, mp, rtx, m, rtid, ux);
+            printf("      (replacement of parent %d -> %ld %s)\n", NP-1, rr,
+                   rr == 1 ? "accepted" : mpool_policy_reason(pol));
+            okv(rr == 1, "MEM-3 a replacement of the LAST parent is accepted");
+            unsigned long l;
+            okv(mpool_get(mp, ptxid[NP-1], &l) == NULL,
+                "MEM-3 ...the replaced parent is gone");
+            okv(mpool_get(mp, ctid, &l) == NULL,
+                "MEM-3 ...and the child went WITH it (the link was recorded)");
+        }
+    }
+
     printf("== cluster limit is measured POST-eviction for a replacement ==\n");
     {
         static unsigned char pol[128];
