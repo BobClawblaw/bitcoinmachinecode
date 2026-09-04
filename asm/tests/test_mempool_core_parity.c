@@ -271,6 +271,45 @@ int main(void){
      * what the batch has to keep apart: a CONFIRMED transaction leaves alone
      * (its children stay), a CONFLICTED one leaves with its descendants.
      * ================================================================ */
+    /* ================================================================
+     * SER-3 / VAL-10: a transaction Core cannot deserialize must not enter
+     * the pool, and must not be relayed from it.
+     *
+     * The block-connect and witness readers were fixed earlier, closing the
+     * consensus hole. This is the reader the MEMPOOL uses, so leaving it lax
+     * meant such a transaction could still be accepted here and relayed --
+     * to peers that all refuse it.
+     *
+     * `fd 01 00` is 1 encoded in the 3-byte form: legal bytes, illegal
+     * encoding. Core's ReadCompactSize throws "non-canonical
+     * ReadCompactSize()".
+     * ================================================================ */
+    printf("\n== SER-3: a non-canonical CompactSize is refused by the pool ==\n");
+    {
+        RESET(1);
+        txout_t o = { .v=1000000-500, .spk=SPK_WPKH, .spklen=22 };
+        /* control: the same transaction, canonically encoded, is accepted */
+        n = mk(tx, &(txin_t){ .tag=1, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &o, 1);
+        tx_txid(id, tx, n, sc, sizeof sc);
+        ck("SER-3 control: the canonical form is accepted",
+           mpool_policy_add(pol, st, mp, tx, n, id, ux) == 1);
+
+        /* Now rebuild it with n_in written as `fd 01 00` instead of `01`.
+         * Everything after the count shifts by two bytes. */
+        RESET(1);
+        u8 bad[512]; unsigned long bn = 0;
+        memcpy(bad, tx, 4); bn = 4;                    /* version */
+        bad[bn++] = 0xfd; bad[bn++] = 0x01; bad[bn++] = 0x00;   /* n_in = 1, WIDE */
+        memcpy(bad + bn, tx + 5, (size_t)(n - 5)); bn += (unsigned long)(n - 5);
+        u8 bid[32]; tx_txid(bid, bad, bn, sc, sizeof sc);
+        long rbad = mpool_policy_add(pol, st, mp, bad, bn, bid, ux);
+        printf("      (non-canonical n_in -> %ld %s)\n", rbad,
+               rbad == 1 ? "ACCEPTED" : mpool_policy_reason(pol));
+        ck("SER-3 a non-canonical n_in is REFUSED", rbad != 1);
+        { unsigned long l; ck("SER-3 ...and is not in the pool",
+                              mpool_get(mp, bid, &l) == NULL); }
+    }
+
     printf("\n== MEM-12: batch block connect == per-transaction block connect ==\n");
     {
         extern void mpool_policy_set_batch_connect(int on);
