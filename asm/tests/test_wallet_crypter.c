@@ -14,12 +14,14 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef unsigned char u8;
 typedef unsigned int u32;
 
 extern void wcrypt_derive(const char* pass, long passlen, const u8 salt[8],
                           u32 iters, u8 key[32], u8 iv[16]);
+extern void sha256_full(u8 out[32], const void* msg, unsigned long len);
 extern long wcrypt_seal(const char* pass, long passlen, const u8* seed, long seedlen, u8* out, long cap);
 extern long wcrypt_open(const char* pass, long passlen, const u8* blob, long len, u8* seed_out, long cap);
 extern long wcrypt_rewrap(const char* oldp, long oldlen, const char* newp, long newlen,
@@ -131,6 +133,52 @@ int main(void){
         ck("WAL-7 seal under a 1199-byte passphrase (heap scratch)", bl2 > 0);
         long r3 = wcrypt_open(huge, (long)sizeof huge - 1, blob, bl2, got, sizeof got);
         ck("WAL-7 and it opens again", r3 == 32 && !memcmp(got, seed, 32));
+    }
+
+    /* ---- WAL-16 (audit 2026-09-03): a tampered iteration count is refused
+     * `iters` is read straight out of the file. An attacker with write access
+     * to bmcwallet.enc could set 0xffffffff and the next walletpassphrase
+     * would spin ~4e9 SHA-512 rounds -- hours on the RPC thread, behind the
+     * exec lock. Core inherits the same DoS from CMasterKey; nothing forces
+     * us to.
+     *
+     * The control is the pair: an ordinary container (WC_ITERS) must still
+     * open. A cap that refused everything would pass a tamper-only test while
+     * bricking every real wallet. */
+    {
+        u8 seed[32]; for (int i = 0; i < 32; i++) seed[i] = (u8)(0xA0 + i);
+        static u8 blob[4096];
+        long bl = wcrypt_seal("pw", 2, seed, 32, blob, sizeof blob);
+        ck("WAL-16 sealed a container", bl > 0);
+
+        u8 got[64];
+        ck("WAL-16 the untampered container opens",
+           wcrypt_open("pw", 2, blob, bl, got, sizeof got) == 32);
+
+        /* iters lives at offset 8+WC_SALT = 16, little-endian u32 */
+        static u8 t[4096]; memcpy(t, blob, (size_t)bl);
+        unsigned it = 0xffffffffu; memcpy(t + 8 + 8, &it, 4);
+        /* the file checksum is a plain sha256 anyone can recompute, which is
+         * the point of the finding -- so recompute it, exactly as an attacker
+         * would, and prove the cap is what stops this rather than the digest */
+        sha256_full(t + bl - 32, t, (unsigned long)(bl - 32));
+        ck("WAL-16 the tampered container still passes its own checksum",
+           wcrypt_is_encrypted(t, bl) == 1);
+        /* An alarm, not just an assertion: without the cap this call GRINDS
+         * ~4e9 SHA-512 rounds instead of returning, so a regression would
+         * hang the suite rather than fail it. 30 s is thousands of times the
+         * fraction of a second a capped open takes. */
+        alarm(30);
+        long r = wcrypt_open("pw", 2, t, bl, got, sizeof got);
+        alarm(0);
+        ck("WAL-16 but a 4-billion-iteration container is REFUSED, not run", r < 0);
+
+        /* a zero count is refused too */
+        memcpy(t, blob, (size_t)bl);
+        it = 0; memcpy(t + 8 + 8, &it, 4);
+        sha256_full(t + bl - 32, t, (unsigned long)(bl - 32));
+        ck("WAL-16 a zero iteration count is refused",
+           wcrypt_open("pw", 2, t, bl, got, sizeof got) < 0);
     }
 
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
