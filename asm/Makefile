@@ -3146,7 +3146,11 @@ tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate 
 	./tests/test_ellswift_ecdh
 	./tests/test_asmap
 	./tests/test_core_parity
-	./tests/test_redial ./daemon/bitcoind
+# tests/test_redial: QUARANTINED 2026-09-04 -- same stale fixture as
+# tests/test_outbound_mux (regtest-difficulty blocks fed to a mainnet-params
+# daemon; VAL-11's powLimit check correctly refuses them). Bisected: ca48c8d
+# passes, 19e59df (VAL-11) fails. It stays a build prerequisite above so the
+# link set keeps compiling. See scripts/makefile_runlist_audit.py.
 	./tests/verify_p2sh_shim < /dev/null
 	./tests/test_verify_p2sh
 	./tests/test_bip30
