@@ -20,10 +20,18 @@
 BITS 64
 DEFAULT REL
 
-section .bss
-align 16
-kpad:  resb 128        ; XOR-adjusted key block (ipad/opad)
-tmp:   resb (128+8+1024) ; concatenation scratch (key block + msg / inner)
+; ---- CRY-4 (audit 2026-09-03): kpad and tmp were .bss, i.e. ONE buffer
+; shared by every caller in the process. Two threads computing an HMAC
+; concurrently overwrote each other's key block and concatenation scratch and
+; both returned wrong MACs, silently -- the same class of defect as the
+; schnorr false-reject incident, and latent here only because every caller
+; happens to run under rpc_server.c's g_exec_lock. Nothing enforced that, and
+; BIP32/BIP39 derivation from a worker thread would have produced wrong child
+; keys.
+;
+; Both now live in hmac_sha512's own frame, so each call has its own. They are
+; still zeroised before return (WAL-3): stack memory outlives the call just as
+; .bss does, and the key block is a BIP32 chain code or the mnemonic itself.
 
 section .text
 
@@ -41,7 +49,11 @@ hmac_sha512:
     push r13
     push r14
     push r15
-    sub  rsp, 0x80           ; local slots (below save area)
+    ; CRY-4: 0x80 of scalar locals, then kpad (128) at [rbp-0x128] and tmp
+    ; (1160) at [rbp-0x5B0]. 0x590 keeps the reservation a multiple of 16, so
+    ; RSP has the same residue at the sha512_full call sites that abi-check
+    ; already verifies -- growing it by the raw 1288 would have shifted them.
+    sub  rsp, 0x590          ; local slots + kpad + tmp (below save area)
     mov  [rbp-0x48], rdi     ; out
     mov  [rbp-0x50], rsi     ; key
     mov  [rbp-0x58], rdx     ; keylen
@@ -56,7 +68,7 @@ hmac_sha512:
     push rsi
     push rcx
     push r8
-    lea  rdi, [tmp]
+    lea  rdi, [rbp-0x5B0]
     mov  rsi, [rbp-0x50]
     mov  rdx, [rbp-0x58]
     call sha512_full
@@ -65,14 +77,14 @@ hmac_sha512:
     pop  rsi
     pop  rdi
     mov  qword [rbp-0x58], 64   ; effective keylen = 64
-    lea  rax, [tmp]
+    lea  rax, [rbp-0x5B0]
     mov  [rbp-0x50], rax        ; effective key = tmp (raw digest)
 .keyok:
 
     ; ---- Build K' (key right-padded to 128) into a local key buffer ----
     ; use kpad as the key buffer first
-    lea  r12, [kpad]            ; keybuf
-    lea  r13, [tmp]             ; concat buffer
+    lea  r12, [rbp-0x128]            ; keybuf
+    lea  r13, [rbp-0x5B0]             ; concat buffer
     mov  rcx, [rbp-0x58]        ; effective keylen
     mov  rsi, [rbp-0x50]
     xor  rdi, rdi
@@ -126,8 +138,8 @@ hmac_sha512:
     push rsi
     push rcx
     push r8
-    lea  rdi, [tmp]
-    lea  rsi, [tmp]
+    lea  rdi, [rbp-0x5B0]
+    lea  rsi, [rbp-0x5B0]
     mov  rdx, rax
     call sha512_full
     pop  r8
@@ -136,7 +148,7 @@ hmac_sha512:
     pop  rdi
     ; inner digest is now at tmp[0..63]. Move it to tmp[192..255] BEFORE the
     ; opad block overwrites tmp[0..127].
-    lea  r13, [tmp]
+    lea  r13, [rbp-0x5B0]
     xor  rcx, rcx
 .stash:
     cmp  rcx, 64
@@ -174,7 +186,7 @@ hmac_sha512:
     push rsi
     push rcx
     mov  rdi, [rbp-0x48]
-    lea  rsi, [tmp]
+    lea  rsi, [rbp-0x5B0]
     mov  rdx, 192
     call sha512_full
     pop  rcx
@@ -194,7 +206,7 @@ hmac_sha512:
     ; is message bytes, which are not secret here, and clearing the whole
     ; 1160 bytes on every HMAC would cost real time in PBKDF2's 2,048
     ; iterations. All registers used are caller-saved and already dead.
-    lea  rdi, [kpad]
+    lea  rdi, [rbp-0x128]
     xor  eax, eax
     mov  rcx, 128
 .zk:
@@ -202,7 +214,7 @@ hmac_sha512:
     inc  rdi
     dec  rcx
     jnz  .zk
-    lea  rdi, [tmp]
+    lea  rdi, [rbp-0x5B0]
     mov  rcx, 256                    ; key block (128) + stashed inner digest
 .zt:
     mov  byte [rdi], al
@@ -210,7 +222,7 @@ hmac_sha512:
     dec  rcx
     jnz  .zt
 
-    add  rsp, 0x80
+    add  rsp, 0x590          ; CRY-4: must match the reservation
     pop  r15
     pop  r14
     pop  r13
