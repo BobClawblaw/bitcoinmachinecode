@@ -30,6 +30,8 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <stdlib.h>
 
 typedef unsigned char u8;
@@ -103,9 +105,25 @@ long mempool_dump_write(const char* path,
     { u8 cs[9]; int cl = put_cs(cs, 0);
       if (fwrite(cs, 1, (size_t)cl, f) != (size_t)cl) goto fail; }
 
+    /* MEM-19 (audit 2026-09-03): fflush only pushes stdio's buffer into the
+     * kernel -- it does not put the bytes on the disk. The rename was then
+     * durable while the CONTENT was not, so a power loss shortly after
+     * savemempool or a shutdown left mempool.dat renamed but empty or torn,
+     * and the next boot reported a parse error on a file it had just written.
+     * Core's DumpMempool calls FileCommit before RenameOver;
+     * fee_estimator.c's writer in this same tree already does the fsync. The
+     * DIRECTORY fsync matters too: without it the rename itself can be lost,
+     * leaving the old file (or none) after a crash. */
     if (fflush(f) != 0) goto fail;
+    if (fsync(fileno(f)) != 0) goto fail;
     fclose(f);
     if (rename(tmp, path) != 0){ remove(tmp); return -1; }
+    { /* fsync the containing directory so the rename survives a power loss */
+      char dir[1024]; snprintf(dir, sizeof dir, "%s", path);
+      char* slash = strrchr(dir, '/');
+      if (slash){ *slash = 0; } else { dir[0] = '.'; dir[1] = 0; }
+      int dfd = open(dir, O_RDONLY | O_DIRECTORY);
+      if (dfd >= 0){ fsync(dfd); close(dfd); } }
     return n;
 fail:
     fclose(f); remove(tmp);

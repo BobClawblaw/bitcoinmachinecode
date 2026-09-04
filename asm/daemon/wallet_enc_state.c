@@ -193,6 +193,36 @@ int wenc_unlock(const char* pass, long plen, long seconds){
     const char* mn = (char*)payload;
     const char* mp = nl ? nl + 1 : "";
     if (nl) *nl = 0;
+    /* ---- WAL-16 (audit 2026-09-03): prove the plaintext before installing it
+     *
+     * The container's integrity field is a plain SHA-256 over the file, which
+     * anyone with write access can recompute, and wrong-passphrase detection
+     * is the PKCS#7 pad of the 48-byte wrapped master key. The SEED ciphertext
+     * itself is only pad-checked, so flipped bits there decrypt to garbage
+     * that passes (probability ~1/256 per try, or always when the last block
+     * is untouched), wenc_unlock derived a seed from that garbage, and the
+     * wallet then generated addresses nobody holds the keys for -- silent
+     * fund loss, reported as a successful unlock.
+     *
+     * The stored plaintext is a BIP39 mnemonic, which carries its own
+     * checksum, so validating it is a cheap MAC over the part that matters.
+     * This cannot lock anyone out of a genuine wallet: bip39_parse verifies
+     * the checksum on every path that can put a mnemonic into the store, so a
+     * mnemonic that got in validates coming out.
+     *
+     * Core's analogue is DecryptKey checking that the decrypted key
+     * reproduces the stored pubkey. A real HMAC over the container, keyed
+     * from the master key, would be better still and needs a format change. */
+    { extern int bip39_validate(const char* mnemonic);
+      if (bip39_validate(mn) <= 0){
+          fprintf(stderr,
+              "[wallet]  UNLOCK REFUSED: the passphrase was accepted but the decrypted\n"
+              "[wallet]           mnemonic fails its own BIP39 checksum, so " WENC_FILE " has\n"
+              "[wallet]           been altered or corrupted. Deriving from it would produce\n"
+              "[wallet]           addresses whose keys nobody holds. Restore from a backup.\n");
+          secure_zero(payload, sizeof payload);
+          return 0;
+      } }
     wallet_mnemonic_seed(g_seed, mn, mp[0] ? mp : 0, mp[0] ? (long)strlen(mp) : 0);
     secure_zero(payload, sizeof payload);
     g_unlocked = 1;
