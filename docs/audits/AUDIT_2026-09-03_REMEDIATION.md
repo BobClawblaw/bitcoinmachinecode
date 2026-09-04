@@ -4,8 +4,8 @@ Companion to `CODEBASE_AUDIT_2026-09-03.md` (182 findings; 29 distinct
 CRITICAL+HIGH after de-duplication). This file records what has been fixed,
 what has not, and what was found along the way.
 
-**Status as of 2026-09-04 (overnight pass): 24 of the 29 CRITICAL+HIGH
-closed, 2 partial, 3 open. Everything MEDIUM and below is untouched except
+**Status as of 2026-09-04 (overnight pass): 25 of the 29 CRITICAL+HIGH
+closed, 3 partial, 1 open. Everything MEDIUM and below is untouched except
 UTX-3** (one MEDIUM, UTX-3, was
 closed because it sits on the same silent-coin-loss path as the HIGHs around
 it).
@@ -99,6 +99,7 @@ ceiling restored, 919 consecutive "mempool full" refusals starting at entry
 | STO-3 | HIGH | A missing undo file read as "no spends": filters and the address index silently wrong | `36bcbbe` |
 | STO-4 | HIGH | Prune guards checked only below the gate, the region `store_prune` never walks | `d725cc6` |
 | NET-3 | HIGH | No inbound inactivity bound; 189 idle sockets refused every honest peer | `05c979b` |
+| MEM-5 | HIGH | A high-feerate child could evict the parent it spends and be stored unlinked | `9510813` |
 
 Every one carries a regression test and a verified negative control. Two are
 worth singling out because the control reproduced the audit's own figures
@@ -141,6 +142,25 @@ not in the audit.
   time-too-old / now+2h / legacy-version rules are still unenforced, in the
   fetch and in `reorg_analyze`. Note the MTP machinery now exists:
   `val_mtp()` landed with VAL-4 and is Core's `GetMedianTimePast`.
+* **MEM-3 / MEM-4** — MEM-5 is fixed (`9510813`); MEM-3 and MEM-4 are not,
+  and the reason is a finding in itself. **The audit's first suggested fix for
+  MEM-3 is wrong for this codebase.** It proposes rejecting a transaction with
+  more in-pool parents than can be recorded, "Core's pre-v31
+  `too-long-mempool-chain` would fire at 25 anyway" — but this node implements
+  Core v31 **cluster** limits (64 transactions / 101 kvB), not the 25-ancestor
+  chain limit, so a child of 63 parents forming a 64-cluster is legal and Core
+  accepts it. Implemented, it fails this project's own `test_mempool_policy`
+  case *"child C joins them: cluster of exactly 64 accepted"* — a silent
+  corruption traded for a false reject and a relay divergence.
+
+  Raising `MPOL_MAX_PARENTS` to 63 was **measured, not estimated**:
+  `mpol_node` grows 184 → 336 bytes, so the policy state grows **+152 MB** at
+  the default 1,048,576-node sizing (184 MB → 336 MB) — not a silent change to
+  a `MAP_SHARED` region several processes map. The real fix is the audit's
+  second option, storing parents out of line, which is a shared-memory layout
+  change and wants its own pass. MEM-4 (claims/outreg overflow) is the same
+  shape and belongs with it.
+
 * **NET-3** — the inactivity bound is in (`05c979b`), so the DoS is capped at
   20 minutes per slot. Core's `AttemptToEvictConnection` is NOT implemented,
   so at capacity this node still refuses rather than evicting. `-peertimeout`
@@ -151,9 +171,7 @@ not in the audit.
 
 | Finding | One line |
 |---|---|
-| VAL-4 (BIP68 half) / MEM-1 | The relative-timelock half: `SequenceLocks` over prevout heights for version >= 2 transactions at or after CSVHeight, on the block path; and the same rule on mempool admission (MEM-1). The nLockTime half is done. |
-| STO-1 | Crash mid-reorg leaves the UTXO set rewound with an old applied height and no undo files; coinstats adopts it. |
-| MEM-3 / 4 / 5 | Parent links truncated at 24; claims/outreg tables drop entries when full; `TrimToSize` evicts the incoming tx's own parent. The pool holds txs whose inputs no longer exist, and GBT includes them. |
+| STO-1 | Crash mid-reorg leaves the UTXO set rewound with an old applied height and no undo files; coinstats adopts it. Not started. |
 
 ### 4.3 Open, MEDIUM and below
 
