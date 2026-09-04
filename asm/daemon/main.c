@@ -38,6 +38,11 @@
 #include <stdbool.h>
 #include <fcntl.h>
 #include <sys/file.h>          /* DMN-1: flock() for the datadir lock */
+#include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
+/* VAL-5 / MEM-1: the generated per-height script-flag mask
+ * (bitcoin_script_flags.asm, from validation/gen_script_flags.py). */
+extern unsigned long long script_flags_for_block(unsigned long long height,
+                                                 const unsigned char blockhash[32]);
 
 /* MEM-1: defined below, called from the tip-change hook above it. */
 static void mempool_refresh_seqlocks(void* store_buf, long now_tip);
@@ -2943,6 +2948,46 @@ static int dlc_headers_sane(long have0, long pos){ return have0 - pos <= DLC_HDR
 static int dlc_dead_weight(double byte_rate, long blocks_this_tick){
     return byte_rate >= 0.0 && byte_rate < g_cfg.dead_weight_bps && blocks_this_tick < DLC_DEAD_WEIGHT_MIN_BLOCKS;
 }
+/* ---------------------------------------------------------------- VAL-5
+ * The parent's median time past, read from the header store.
+ *
+ * Core's GetMedianTimePast is the median nTime of the up-to-11 blocks ending
+ * at `height`. The store keeps 112-byte records whose first 80 bytes are the
+ * raw header, so nTime is at record offset 68.
+ *
+ * Returns 0 when any record in the window is unreadable. The caller then
+ * SKIPS the timestamp floor for that header rather than evaluating it against
+ * a partial window -- an incomplete median is not a weaker rule, it is a
+ * different one, and at the start of a fetch it would reject honest headers. */
+static int hst_median_time_past(void* hst, long height, unsigned long* out){
+    unsigned int ts[11];
+    int n = 0;
+    for (long k = height; k > height - 11 && k >= 0; k--){
+        unsigned char rec[112];
+        if (hst_get_at(hst, (unsigned long long)k, rec) != 1) return 0;
+        memcpy(&ts[n++], rec + 68, 4);
+    }
+    if (n == 0) return 0;
+    for (int i = 1; i < n; i++){
+        unsigned int v = ts[i]; int j = i - 1;
+        while (j >= 0 && ts[j] > v){ ts[j+1] = ts[j]; j--; }
+        ts[j+1] = v;
+    }
+    *out = (unsigned long)ts[n / 2];
+    return 1;
+}
+
+/* BIP34's activation height for the running chain. Core keys one of the
+ * legacy-version rules on it, and unlike BIP66/BIP65 it has no script flag to
+ * read it from -- BIP34 is not a script rule. Mainnet's is 227,931; every
+ * other chain in this tree activates it at or before genesis, which the
+ * comparison `height >= h` then satisfies for every block. */
+static long dlc_bip34_height(void){
+    extern const chainparams_t* g_chainp;
+    if (g_chainp && g_chainp->id == CHAIN_MAIN) return 227931L;
+    return 0L;
+}
+
 static int __attribute__((unused)) dlc_headers_connect_ok(unsigned char* hst, long have, const unsigned char loc[32]){
     unsigned char rec[112];
     if(have <= 0) return 1;                                   /* fresh store: nothing to connect to */
@@ -3063,18 +3108,39 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
                  * first live peer landed in headers.dat by height, and the
                  * block downloader then requested blocks for hashes nothing
                  * ever revalidates. Core validates CheckProofOfWork on every
-                 * header before storing. The nBits range/PoW check now runs
+                 * header before storing. The nBits range/PoW check runs
                  * BEFORE hst_append (pow_check carries the VAL-11 nBits
-                 * range gates + the armed chain powLimit). The remaining
-                 * VAL-5 scope (MTP / now+2h / legacy-version rules here and
-                 * in the apply path) is tracked as open in the audit doc's
-                 * remediation log -- those need per-chain activation heights
-                 * and must not gate harness paths that never arm them. */
+                 * range gates + the armed chain powLimit), and VAL-5's
+                 * remaining rules -- ContextualCheckBlockHeader's timestamp
+                 * floor, its 2-hour ceiling and the legacy-version rules --
+                 * run right after it, from daemon/hdrrules.h. */
                 if(!pow_check(h)){
                     fprintf(stderr,"[dlc] header at height %ld from %s fails its own PoW -- discarding the page\n",
                             pos + (long)i, cand);
                     dlc_headers_rollback(hst, have0); return -1;
                 }
+                /* ---- VAL-5: the non-PoW header rules -------------------
+                 * The timestamp FLOOR needs the parent's median-time-past.
+                 * At the very start of a fetch the parent is whatever the
+                 * store already holds; within a page it is the window this
+                 * loop has just appended. hst_median_time_past reads the
+                 * store, so it is only consulted for a height whose 11
+                 * ancestors are already there -- otherwise the floor is
+                 * skipped for that header rather than evaluated against a
+                 * window that does not exist. The ceiling and the version
+                 * rules need no ancestors and always run. */
+                { long hh = pos + (long)i;
+                  const char* why = "?";
+                  unsigned long pmtp = 0;
+                  if (hh >= 11) (void)hst_median_time_past(hst, hh - 1, &pmtp);
+                  unsigned long long hflags =
+                      script_flags_for_block((unsigned long long)hh, bh);
+                  if(!hdr_contextual_ok(hh, h, pmtp, (long)time(NULL),
+                                        hflags, dlc_bip34_height(), &why)){
+                      fprintf(stderr,"[dlc] header at height %ld from %s rejected: %s -- discarding the page\n",
+                              hh, cand, why);
+                      dlc_headers_rollback(hst, have0); return -1;
+                  } }
                 if(hst_append(hst, h, bh) < 0){ dlc_headers_rollback(hst, have0); return -1; }
                 added++;
             }
@@ -6673,8 +6739,7 @@ static void mempool_refresh_seqlocks(void* store_buf, long now_tip){
         return;
     }
     unsigned char bh[32]; int csv = 0;
-    { extern unsigned long long script_flags_for_block(unsigned long long, const unsigned char*);
-      memset(bh, 0, 32);
+    { memset(bh, 0, 32);
       csv = (int)((script_flags_for_block((unsigned long long)(now_tip + 1), bh) >> 10) & 1ULL); }
     mpool_policy_set_seqlocks(now_tip + 1, mtp, csv, mempool_seq_height);
 }
