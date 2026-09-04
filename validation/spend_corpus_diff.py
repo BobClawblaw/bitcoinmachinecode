@@ -71,7 +71,7 @@ REPORT_JSON = os.path.join(HERE, 'spend_corpus_diff_report.json')
 REPORT_TXT  = os.path.join(HERE, 'spend_corpus_diff_report.txt')
 
 # --- Core RPC (same pattern as corpus_diff.py) --------------------------------
-RPC_HOST = '127.0.0.1'
+RPC_HOST = os.environ.get('BMC_ORACLE_RPC_HOST', '127.0.0.1')
 RPC_PORT = int(os.environ.get('BMC_ORACLE_RPC_PORT', '8335'))
 COOKIE_PATH = os.environ.get('BMC_ORACLE_COOKIE', '/storage/core-oracle/.cookie')
 

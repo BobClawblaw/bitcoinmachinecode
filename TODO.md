@@ -48,11 +48,14 @@ Everything below is landed on `arm-port` and pushed. History lives in
       ARM 2026-09-04, sweep round 22 green (pass 309 / fail 4 env-only),
       deployed as arm-8 with aa70c08. RPX-1 was arch-neutral C (arrived with
       the merge, nothing to port).
-- [ ] `validation/spend_corpus_diff.py` itself has still never run on this
-      port: it needs a synced Bitcoin Core over RPC
-      (`BMC_ORACLE_RPC_PORT`/`BMC_ORACLE_COOKIE`) and this box has no Core
-      datadir. `synth_corpus_diff.py` needs neither, only `coincurve`
-      (installed in a venv here).
+- [x] `validation/spend_corpus_diff.py` ran for the FIRST time on this port
+      2026-09-04 01:25 UTC, against a real synced Core over the LAN
+      (Umbrel node 192.168.5.69:8332, txindex on, verificationprogress=1):
+      zero divergences, accept-parity 253/253 real mainnet spends and 2024/2024
+      mutations across all six epochs (default-seed run also green: 99/99 +
+      594/594). Harness change: RPC_HOST now env-configurable
+      (`BMC_ORACLE_RPC_HOST`, default 127.0.0.1). Recipe in the worklog;
+      credentials in /tmp/oracle-umbrel.cookie (mode 600, /tmp is ephemeral).
 - [ ] env-only, documented, no action: `bench_checkblock` / `bench_hashidx` /
       `bench_idxscan` / `bench_taproot_block` need production data files
       (`block413567.raw`, `./index.dat` in the scratch dir);
