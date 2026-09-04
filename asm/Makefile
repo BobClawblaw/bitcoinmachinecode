@@ -330,6 +330,12 @@ tests/test_bip152: tests/test_bip152.c $(CMPCTOBJS) tests/bip152_vectors.h
 tests/bench_store_read: tests/bench_store_read.c bitcoin_store.o bitcoin_store_fast.o
 	$(CC) $(CFLAGS) -o $@ tests/bench_store_read.c bitcoin_store.o bitcoin_store_fast.o
 
+# bench_ckeys -- throughput of the C crypto primitives that still have
+# no asm twin (chacha20, poly1305, AEAD, sha3-256), against the asm sha256
+# reference. Scoping input for any conversion decision (2026-09-04).
+tests/bench_ckeys: tests/bench_ckeys.c crypto_chacha20.c crypto_poly1305.c bitcoin_sha3.c sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I. -o $@ tests/bench_ckeys.c crypto_chacha20.c crypto_poly1305.c bitcoin_sha3.c sha256.o
+
 # bench_ecdsa -- signature verifications/sec on one core. Scoping input for
 # block script verification: the chain needs ~1e9 of these, so this rate
 # decides whether assumevalid is a prerequisite or just an optimisation.
