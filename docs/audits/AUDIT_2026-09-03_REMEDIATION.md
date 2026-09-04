@@ -386,7 +386,11 @@ makes four tests found this pass that encoded behaviour a later fix had
 deliberately changed (SCR-5's 253-byte reject, VAL-11's powLimit fixture,
 `test_outbound_mux`'s difficulty, and this one).
 
-**Partial:** UTX-4's second half — a torn WAL tail is never truncated, so every
-later append lands after it and every future reload stops there — is in
-`bitcoin_utxo_store.asm`'s reload path and is not fixed. Undo files are still
-unsynced.
+**UTX-4's second half is now closed too.** A torn WAL tail is truncated on
+reload: the replay records where each record starts, and on the path taken by
+a short prefix, a short body or an unrecognised op byte it sets `log_len` to
+that offset and `ftruncate`s the file there. Truncating to the CONSUMED offset
+would not have worked -- a record whose 8-byte prefix reads cleanly and whose
+op byte is unrecognised has already advanced the counter past itself, so the
+cut would keep the very bytes that break every future replay. Undo files are
+still unsynced, which is the remaining piece of UTX-4.

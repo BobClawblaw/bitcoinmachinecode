@@ -1007,6 +1007,14 @@ utxo_store_reload:
     mov  rax, [rbp-0x150]  ; consumed
     cmp  rax, rbx          ; vs log end
     jae  .rep_done
+    ; UTX-4: remember where THIS record starts. The torn-tail truncate below
+    ; has to cut back to the start of the record it could not finish, not to
+    ; the consumed offset -- a record whose 8-byte prefix read cleanly and
+    ; whose op byte is unrecognised has already advanced `consumed` past
+    ; itself, so truncating there would keep the very bytes that break every
+    ; future replay. [rbp-0x158] is the first slot below the consumed counter
+    ; and is otherwise unused in this frame.
+    mov  [rbp-0x158], rax
     ; read 8-byte prefix [magic u32][op u8][pad3] into [rbp-0x100]
     mov  rdi, r14
     lea  rsi, [rbp-0x100]
@@ -1081,6 +1089,41 @@ utxo_store_reload:
     inc  r15
     jmp  .rep_loop
 .rep_close:
+    ; ---- UTX-4 (audit 2026-09-03), second half: TRUNCATE A TORN TAIL ----
+    ;
+    ; This label is reached when the replay cannot go on: a short read of a
+    ; record prefix, a short read of a record body, or an unrecognised op
+    ; byte. All three mean the bytes from [rbp-0x150] (the consumed offset)
+    ; to log_len are a PARTIALLY WRITTEN record -- the tail of a write that
+    ; power loss or a kernel crash cut in half.
+    ;
+    ; Nothing used to be done about it. log_len was set from SEEK_END, i.e.
+    ; the physical file size, so the daemon went on appending AFTER the torn
+    ; record; and every future reload stopped at that same record, silently
+    ; dropping everything appended since. One torn write therefore made the
+    ; WAL permanently unreplayable past that point, and the store went on
+    ; looking healthy because reload returned a plausible count.
+    ;
+    ; log_len is set to the consumed offset and the file truncated there, so
+    ; the next append lands exactly where the good data ends. The truncate
+    ; goes through st->log_fd, which is the WRITABLE descriptor -- r14 here is
+    ; the O_RDONLY replay fd and ftruncate on it would fail with EBADF.
+    ;
+    ; Only when there IS a torn tail: .rep_done jumps to .rep_close_clean
+    ; below, past this block, because consuming the whole log is not a
+    ; truncation event and ftruncate to the same length would still bump the
+    ; inode's mtime for no reason.
+    mov  rax, [rbp-0x158]           ; start of the record that failed
+    cmp  rax, [r12+16]              ; vs log_len
+    jae  .rep_close_clean           ; nothing torn after all
+    mov  [r12+16], rax              ; log_len = that offset: appends land here
+    mov  rdi, [r12+0]               ; st->log_fd (writable)
+    cmp  rdi, 0
+    jl   .rep_close_clean
+    mov  rsi, rax
+    mov  eax, 77                    ; ftruncate
+    syscall                         ; a failure leaves log_len correct anyway
+.rep_close_clean:
     mov  rdi, r14
     mov  eax, 3
     syscall
@@ -1094,7 +1137,8 @@ utxo_store_reload:
     pop  rbp
     ret
 .rep_done:
-    jmp  .rep_close
+    ; The whole log was consumed: no torn tail, so skip the truncate block.
+    jmp  .rep_close_clean
 .full:
     ; The memtable filled while replaying. Before 2026-08-23 both reload-path
     ; utxo_put calls discarded the return, so a tail bigger than the table was
