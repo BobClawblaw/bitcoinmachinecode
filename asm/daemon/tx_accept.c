@@ -769,6 +769,28 @@ int tx_policy_init(void){
     return 1;
 }
 
+/* STO-7: expose the SAME policy config and state the accept path uses, so the
+ * reorg path can rebuild the pool through mpool_policy_add rather than against
+ * a second, divergent policy object. Returns 0 (and touches nothing) until
+ * tx_policy_init has run -- reorg.c then simply skips reconciliation, which is
+ * the behaviour that existed before this was wired at all.
+ *
+ * n is the capacity the state buffer was init'd with. When the shared pre-fork
+ * state is in play it was sized by mempool_configure, so report ITS capacity;
+ * reorg_mempool_reconcile passes this straight to mpool_policy_state_init and
+ * re-initing a shared buffer at the wrong capacity would corrupt every other
+ * process's view of it. */
+int tx_accept_policy_view(void** out_pol, void** out_state, unsigned* out_n){
+    extern unsigned long mp_ext_polstate_n;
+    extern void* mp_ext_polstate;
+    if (!g_pol_ready || !g_pol_state) return 0;
+    if (out_pol)   *out_pol   = (void*)g_pol;
+    if (out_state) *out_state = g_pol_state;
+    if (out_n)     *out_n = (g_pol_state == mp_ext_polstate && mp_ext_polstate_n)
+                            ? (unsigned)mp_ext_polstate_n : TXACC_POLICY_STATE_N;
+    return 1;
+}
+
 /* tx_accept_validate(mp_area, txid, tx, txlen) -> 1 accepted+stored in the
  * structural mempool, 0 rejected. Called from bitcoin_serve.asm's .do_tx
  * in place of its previous unconditional mpool_put. Fails open to "reject"

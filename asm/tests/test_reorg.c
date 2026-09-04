@@ -1073,6 +1073,81 @@ static void case_mempool(void){
 }
 
 /* ======================================================================== */
+/* CASE (STO-7): reorg_execute reconciles the mempool BY ITSELF once one is  */
+/*       registered -- no manual reorg_mempool_reconcile call.               */
+/*                                                                          */
+/* case_mempool above proves the reconcile function is correct. This proves  */
+/* it is actually REACHED, which is the whole of STO-7: the function was     */
+/* implemented and tested but had no caller outside the test suite, so a     */
+/* real reorg left the pool holding transactions the new branch had          */
+/* invalidated. It also proves reorg_execute captured the disconnected       */
+/* blocks itself -- nothing here hands it the losing branch's bytes, and     */
+/* archive_truncate_safe has unlinked them by the time reconciliation runs.  */
+/* ======================================================================== */
+static void case_mempool_wired(void){
+    const long nbase = 6, nlose = 2, nwin = 3;
+    build_base(nbase, 0x207fffffu);
+    build_branch(lose, nlose, nbase, 0x20000000u, 0x207fffffu);
+    build_branch(win,  nwin,  nbase, 0x30000000u, 0x207fffffu);
+
+    harness_open();
+    store_chain(nbase, nlose);
+
+    static u8 mp[40 + 1024*48 + 8];
+    static u8 mpblob[1<<20];
+    mpool_init(mp, 1024, mpblob, sizeof mpblob);
+    static u8 pol[128];
+    mpool_policy_init(pol, 0, 25, 101000, 25, 101000, 1);
+    { extern void mpool_policy_set_acceptnonstd(void*, unsigned);
+      mpool_policy_set_acceptnonstd(pol, 1); }
+    unsigned pol_n = 512;
+    void* pol_state = malloc(mpool_policy_state_size(pol_n));
+    mpool_policy_state_init(pol_state, pol_n);
+
+    /* Same two fixtures as case_mempool: one that survives the reorg, one
+     * that spends an output only the losing branch ever created. */
+    tx_t survivor; mk_spend(&survivor, base[nbase-2].tx[0].txid, 0, 40000000ULL);
+    ck("wired: survivor accepted into mempool",
+       mpool_policy_add(pol, pol_state, mp, survivor.raw, survivor.len, survivor.txid, (void*)1), 1);
+    tx_t doomed; mk_spend(&doomed, lose[nlose-1].tx[0].txid, 0, 40000000ULL);
+    ck("wired: doomed accepted into mempool",
+       mpool_policy_add(pol, pol_state, mp, doomed.raw, doomed.len, doomed.txid, (void*)1), 1);
+    ck("wired: mempool holds 2 before the reorg", mpool_count(mp), 2);
+
+    /* THE WIRING UNDER TEST. Nothing below passes disconnected blocks. */
+    reorg_mempool_t rm = { mp, pol, pol_state, pol_n, (void*)1 };
+    reorg_set_mempool(&rm);
+
+    static reorg_cand_t c; memset(&c,0,sizeof c);
+    reorg_build_locator(store_buf, &c);
+    cand_from_blocks(&c, win, nwin);
+    ck("wired: analyze", reorg_analyze(store_buf,&c), 2);
+    memsrc_t src = { win, nwin };
+    ck("wired: reorg_execute", reorg_execute(store_buf, c.fork_height, nwin, memsrc, &src), 1);
+
+    unsigned long l;
+    ckm("wired: reorg_execute EVICTED the losing-branch-only tx with no manual reconcile",
+        mpool_get(mp, doomed.txid, &l) == NULL);
+    ckm("wired: reorg_execute KEPT the still-valid tx",
+        mpool_get(mp, survivor.txid, &l) != NULL);
+    /* The losing branch's own spend txs were captured by reorg_execute and
+     * offered back; both spend outputs the winner also spent or vanished, so
+     * neither may re-enter. If the capture had been skipped entirely these
+     * would also be absent -- which is why the eviction assertion above, not
+     * these, is what proves the wiring. */
+    ckm("wired: no disconnected coinbase entered the mempool",
+        mpool_get(mp, lose[0].tx[0].txid, &l) == NULL);
+
+    /* Second half of STO-7: the daemon reads this to rewind its new-block
+     * choke-point baseline, so replacement blocks at or below the old tip
+     * still reach tx_accept_block_connect_h. */
+    ck("wired: reorg_last_fork_height reports the fork", (int)reorg_last_fork_height(), (int)c.fork_height);
+
+    reorg_set_mempool(NULL);   /* leave the later cases unarmed */
+    utxo_live_close();
+}
+
+/* ======================================================================== */
 /* CASE: fake peer -- the real multi-hash locator finds the true common      */
 /*       ancestor where the old single-hash locator could not.               */
 /* ======================================================================== */
@@ -1458,6 +1533,7 @@ int main(void){
     total += run_case("nBits schedule wired into analyze", case_bad_diffbits_wired);
     total += run_case("undo pre-flight gate",           case_undo_preflight_gate);
     total += run_case("mempool reconciliation",         case_mempool);
+    total += run_case("mempool reconcile is WIRED (STO-7)", case_mempool_wired);
     total += run_case("fake peer locator + reorg",      case_fakepeer_locator_and_reorg);
     total += run_case("node_sync_multi (asm frame)",    case_node_sync_multi);
     total += run_case("append-lock scope + prevhash gate", case_append_lock_scope);
