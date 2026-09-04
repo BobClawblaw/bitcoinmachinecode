@@ -22,6 +22,7 @@
 #include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include "test_tmpdir.h"
 #include "lsm_state.h"
 #include "lsm_manifest.h"
@@ -146,6 +147,41 @@ int main(void){
     /* back to the parent's view; reserve the child's number as the parent does */
     memcpy(lst.manifest_buf, pbuf, pn*16); lst.manifest_n = pn; lst.total_live = p_live; lst.next_gen = p_gen + 1; lst.next_run_no = p_run + 1;
     ok(merged_run == p_run, "child used the run number the parent reserved for it");
+
+    /* ---- UTX-5: a FAILED publish must leave memory untouched ----
+     *
+     * Before the fix, adopt_child copied the union into lst->manifest_buf and
+     * only then published; a publish failure returned -1 with memory already
+     * naming the child's merged run and no longer naming the inputs, while
+     * the caller (daemon/utxo_live.c compact_adopt) unlinked that very run.
+     * Every lookup through it then failed and the next flush published a
+     * manifest naming a deleted run.
+     *
+     * Failure is injected without a hook: utxo_manifest.dat.pub is created as
+     * a DIRECTORY, so publish's open(O_WRONLY|O_CREAT) fails with EISDIR.
+     * The child manifest is not consumed on failure, so step 5 below can
+     * still perform the real adoption afterwards. */
+    {
+        unsigned char snap[4096]; uint64_t snap_n = lst.manifest_n;
+        uint64_t snap_live = lst.total_live;
+        memcpy(snap, lst.manifest_buf, (size_t)snap_n * 16);
+        ok(mkdir("utxo_manifest.dat.pub", 0755) == 0, "publish target blocked (created as a directory)");
+        uint64_t junk = ~0ULL;
+        ok(lsm_manifest_adopt_child(&lst, in, nin, is_full, fork_base, &junk) != 0,
+           "adopt_child FAILS when the publish cannot be written");
+        ok(lst.manifest_n == snap_n && memcmp(lst.manifest_buf, snap, (size_t)snap_n * 16) == 0,
+           "UTX-5: in-memory manifest is byte-identical after the failed publish");
+        ok(lst.total_live == snap_live, "UTX-5: the live counter did not move either");
+        int names_merged = 0, names_all_inputs = 1;
+        for (uint64_t j = 0; j < lst.manifest_n; j++) if (entry_run(&lst,j) == merged_run) names_merged = 1;
+        for (int i = 0; i < nin; i++){ int f = 0;
+            for (uint64_t j = 0; j < lst.manifest_n; j++) if (entry_run(&lst,j) == in[i]) f = 1;
+            if (!f) names_all_inputs = 0; }
+        ok(!names_merged, "UTX-5: memory does NOT name the merged run the caller is about to unlink");
+        ok(names_all_inputs, "UTX-5: memory still names every input run");
+        ok(access("utxo_manifest.child", F_OK) == 0, "the child manifest survives a failed adoption");
+        ok(rmdir("utxo_manifest.dat.pub") == 0, "publish target unblocked");
+    }
     long interim_from = 2000000; long addedi = 0;
     while (lst.manifest_n == pn && addedi < 400000){ if (fill(&lst, table, interim_from+addedi, 5000)){ fprintf(stderr,"put failed\n"); return 1; } addedi += 5000; }
     ok(lst.manifest_n == pn + 1, "an interim flush added a run to the parent's manifest");
