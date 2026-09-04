@@ -166,12 +166,17 @@ int main(void){
       ok(dlc_headers_sane(965018, 965018 - 100000), "an answer 100k below the tip is still a continuation");
       ok(!dlc_headers_sane(965018, 1), "the incident: an answer from genesis against 965k held is refused");
       ok(!dlc_headers_sane(965018, 965018 - 100001), "...as is one more than DLC_HDR_SANE_MAX below the tip");
-      /* dead weight (2026-09-02): the byte floor alone banned honest peers serving tiny early blocks */
-      g_cfg.dead_weight_bps = 32768.0;
+      /* dead weight (2026-09-02): the byte floor alone banned honest peers
+       * serving tiny early blocks. Retuned 2026-09-04 to an OR: the block
+       * floor (<10 blocks/tick) binds at every chain depth, and the byte
+       * floor decides once the block floor is satisfied. */
       ok(dlc_dead_weight(2000.0, 0), "2 KB/s and no blocks this tick: dead weight");
-      ok(dlc_dead_weight(2000.0, 9), "2 KB/s and 9 blocks: still dead weight (below the block floor)");
-      ok(!dlc_dead_weight(2000.0, 50), "2 KB/s but 50 tiny blocks a tick: pulling its weight, not banned");
+      ok(dlc_dead_weight(2000.0, 9), "2 KB/s and 9 blocks: still dead weight (byte floor binds at any depth)");
+      ok(dlc_dead_weight(2000.0, 50), "2 KB/s and 50 blocks: dead weight too (a block rate can launder bytes)");
+      ok(!dlc_dead_weight(50000.0, 50), "50 KB/s and 50 blocks: pulling its weight, not banned");
       ok(!dlc_dead_weight(1500000.0, 1), "1.5 MB/s and one block: fine near the tip");
+      ok(dlc_dead_weight(40000.0, 1), "40 KB/s and one block: marginal bytes AND stalled blocks");
+      ok(!dlc_dead_weight(200000.0, 1), "200 KB/s and one block: big blocks, not stalled");
       ok(!dlc_dead_weight(-1.0, 0), "no rate sample yet: not judged");
       if (cwd0[0]) (void)!chdir(cwd0); }
 
