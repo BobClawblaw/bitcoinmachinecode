@@ -455,7 +455,8 @@ REORGOBJS := bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.
     bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o secp256k1_ecdsa.o \
     secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o \
     secp256k1_scalar_c.o secp256k1_schnorr.o secp256k1_taproot.o ripemd160.o \
-    bitcoin_addr.o sha1.o bitcoin_utxo_stats.o bitcoin_muhash.o
+    bitcoin_addr.o sha1.o bitcoin_utxo_stats.o bitcoin_muhash.o \
+    bitcoin_sigops.o
 # reorg_drill -- REAL-DATA reorg exercise (tools, not part of `make test`:
 # it needs a real datadir COPY, which CI does not have). Same sources as
 # test_reorg so it drives the identical production paths.
