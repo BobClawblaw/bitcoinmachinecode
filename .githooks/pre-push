@@ -1,0 +1,54 @@
+#!/bin/sh
+# pre-push -- the last gate before anything becomes public.
+#
+# pre-commit only sees the commit being made. This sees everything about to
+# leave the machine, including commits made before the hooks existed, commits
+# pulled from elsewhere, and rebased or cherry-picked history. That matters:
+# the 2026-09-04 incident put nine already-made commits on GitHub, and no
+# per-commit check would have caught the push of a branch created earlier.
+#
+# Checks every commit in the push range for:
+#   1. an author or committer identity that is not the project pseudonym;
+#   2. a commit MESSAGE matching the local privacy blocklist.
+#
+# Blocklist: .git/privacy-blocklist, untracked (a tracked file listing the
+# strings to hide would publish them). Absent => message check skipped.
+
+WANT="BobClawblaw <BobClawblaw@users.noreply.github.com>"
+BLOCKLIST="$(git rev-parse --git-dir)/privacy-blocklist"
+rc=0
+
+while read -r _local_ref local_sha _remote_ref remote_sha; do
+    [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue
+    if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then
+        range="$local_sha --not --remotes"
+    else
+        range="$remote_sha..$local_sha"
+    fi
+
+    bad=$(git log --format='%H %an <%ae>%n%H %cn <%ce>' $range 2>/dev/null \
+          | grep -v " $WANT$" | awk '{print $1}' | sort -u)
+    if [ -n "$bad" ]; then
+        echo "pre-push: REFUSED -- commits with a non-pseudonymous identity:" >&2
+        for c in $bad; do
+            echo "  $(git log -1 --format='%h  A:%an <%ae>  C:%cn <%ce>' "$c")" >&2
+        done
+        echo "Rewrite them before pushing; a force-push after the fact does not" >&2
+        echo "remove them from GitHub (orphaned commits stay reachable by SHA)." >&2
+        rc=1
+    fi
+
+    if [ -f "$BLOCKLIST" ]; then
+        msgs=$(git log --format='%H%n%B' $range 2>/dev/null)
+        while IFS= read -r pat; do
+            case "$pat" in ''|'#'*) continue ;; esac
+            if printf '%s' "$msgs" | grep -Ei -- "$pat" >/dev/null 2>&1; then
+                echo "pre-push: REFUSED -- a commit message matches a blocked pattern." >&2
+                echo "  pattern: $pat" >&2
+                rc=1
+            fi
+        done < "$BLOCKLIST"
+    fi
+done
+
+exit $rc
