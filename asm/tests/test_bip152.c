@@ -209,6 +209,58 @@ int main(void){
            exercised through cmpctblock_build; just ensure it returns 32B. */
     }
 
+    /* ---- SER-4: a block with >= 253 transactions ----
+     * All three BIP152 helpers read the block's tx-count CompactSize as a
+     * SINGLE BYTE and started the transaction walk at block+81. For 253 or
+     * more transactions -- a 3, 5 or 9-byte varint -- the count was taken as
+     * the marker byte (253/254/255) and the cursor was 2/4/8 bytes short, so
+     * every transaction boundary was misparsed.
+     *
+     * cons_verify, the consensus path, reads it correctly, so only the
+     * SERVING helpers were affected -- but they were affected on every modern
+     * block: a peer asking for a cmpctblock or getblocktxn got the .gd_miss
+     * path and nothing at all. Compact-block relay was effectively off.
+     *
+     * The block below is synthetic and minimal -- 253 one-input, one-output
+     * transactions -- because what is under test is the COUNT PARSE and the
+     * cursor it produces, not transaction contents. It asserts the count is
+     * read as 253 (not 0xfd = the marker) and that the LAST transaction is
+     * reachable, which is only true if the cursor started at the right offset
+     * and every boundary since was right. */
+    {
+        enum { N253 = 253 };
+        static unsigned char b2[80 + 3 + N253 * 64];
+        long o = 0;
+        memset(b2, 0x33, 80); o = 80;
+        b2[o++] = 0xfd; b2[o++] = (unsigned char)(N253 & 0xff);
+        b2[o++] = (unsigned char)(N253 >> 8);
+        long first_off = o, last_off = 0;
+        for (int i = 0; i < N253; i++){
+            long txs = o;
+            if (i == N253 - 1) last_off = txs;
+            b2[o++]=2; b2[o++]=0; b2[o++]=0; b2[o++]=0;      /* version */
+            b2[o++]=1;                                        /* 1 input  */
+            for (int k=0;k<32;k++) b2[o++]=(unsigned char)(i+k);
+            b2[o++]=0; b2[o++]=0; b2[o++]=0; b2[o++]=0;      /* vout */
+            b2[o++]=0;                                        /* scriptSig */
+            b2[o++]=0xff;b2[o++]=0xff;b2[o++]=0xff;b2[o++]=0xff;
+            b2[o++]=1;                                        /* 1 output */
+            for (int k=0;k<8;k++) b2[o++]=0;
+            b2[o++]=1; b2[o++]=0x51;
+            b2[o++]=0; b2[o++]=0; b2[o++]=0; b2[o++]=0;      /* locktime */
+        }
+        (void)first_off;
+
+        cki("SER-4 block_txcount reads a 3-byte CompactSize (253, not 0xfd)",
+            block_txcount(b2, o), N253);
+
+        unsigned char* tp = 0; long tl = 0;
+        long r = block_tx_at(b2, o, N253 - 1, &tp, &tl);
+        cki("SER-4 block_tx_at reaches the LAST transaction of a 253-tx block", r, 1);
+        cki("  ...and lands on its real offset (cursor started past the varint)",
+            (long)(tp - b2), last_off);
+    }
+
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }

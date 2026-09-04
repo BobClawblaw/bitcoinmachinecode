@@ -3342,6 +3342,63 @@ static int gbf_cb(void* ctxp, const u8* txid, u32 index, u64 value, u32 height,
     return 1;
 }
 
+/* STO-8 (audit 2026-09-03): how many prevouts this block spends.
+ *
+ * Same shape as STO-3's bfi_count_spends. undo_replay returns 0 for an ABSENT
+ * file, which is indistinguishable from a block that genuinely spends nothing,
+ * so the getblockfilter fallback below built a filter from OUTPUT scripts only
+ * and returned it with a header computed from the wrong filter -- while its
+ * own error text promises "no filter is served rather than a wrong one".
+ *
+ * Returns -1 on a malformed block, which the caller treats as unavailable. */
+static long gbf_count_spends(const u8* blk, unsigned long blen){
+    const u8* p = blk + 80; const u8* end = blk + blen;
+    u64 cc;
+    u64 ntx = read_varint(p, end, &cc); if (!cc) return -1;
+    p += cc;
+    long spends = 0;
+    for (u64 t = 0; t < ntx; t++){
+        if (p + 4 > end) return -1;
+        p += 4;
+        int sw = (p + 2 <= end && p[0] == 0x00 && p[1] == 0x01);
+        if (sw) p += 2;
+        u64 nin = read_varint(p, end, &cc); if (!cc) return -1;
+        p += cc;
+        for (u64 i = 0; i < nin; i++){
+            if (p + 36 > end) return -1;
+            if (t != 0) spends++;
+            p += 36;
+            u64 sl = read_varint(p, end, &cc); if (!cc) return -1;
+            p += cc + sl + 4;
+            if (p > end) return -1;
+        }
+        u64 nout = read_varint(p, end, &cc); if (!cc) return -1;
+        p += cc;
+        for (u64 i = 0; i < nout; i++){
+            if (p + 8 > end) return -1;
+            p += 8;
+            u64 sl = read_varint(p, end, &cc); if (!cc) return -1;
+            p += cc;
+            if (p + sl > end) return -1;
+            p += sl;
+        }
+        if (sw){
+            for (u64 i = 0; i < nin; i++){
+                u64 items = read_varint(p, end, &cc); if (!cc) return -1;
+                p += cc;
+                for (u64 k = 0; k < items; k++){
+                    u64 il = read_varint(p, end, &cc); if (!cc) return -1;
+                    p += cc + il;
+                    if (p > end) return -1;
+                }
+            }
+        }
+        if (p + 4 > end) return -1;
+        p += 4;
+    }
+    return spends;
+}
+
 static int cmd_getblockfilter(const rj_val* params, rj_val** res, long* ec, const char** em){
     long h;
     if (!lookup_block_param(params, 0, 1, &h, ec, em)) return 0;
@@ -3379,6 +3436,14 @@ static int cmd_getblockfilter(const rj_val* params, rj_val** res, long* ec, cons
     long ur = g_undo_replay ? g_undo_replay(h, gbf_cb, &c) : -1;
     /* h == 0 is the one height with legitimately no undo data (the genesis
      * coinbase spends nothing), so an absent file there is not a gap */
+    /* STO-8: an ABSENT undo file returns 0, exactly like a block that spends
+     * nothing. The block itself says how many prevouts to expect; fewer undo
+     * records than that means the data is missing or short, and this path
+     * must then serve NOTHING rather than a filter without its prevout
+     * elements. Core's getblockfilter errors "Filter not found" when the
+     * index has no entry; it never constructs one ad hoc. */
+    long want_sp = gbf_count_spends(g_blockbuf, (unsigned long)blen);
+    if (want_sp < 0 || (ur >= 0 && ur < want_sp)) ur = -1;
     if ((ur < 0 && h != 0) || c.overflow){
         free(c.v); free(c.buf);
         *ec = -1;

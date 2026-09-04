@@ -510,6 +510,62 @@ cmpctblock_shorttxid:
 ; block_txcount(blockbuf=rdi, blen=rsi) -> # txs or -1
 ; ============================================================================
 global block_txcount
+; ============================================================================
+; cs_read(ptr, end) -> rax = value, rdx = width in bytes (0 = malformed)
+;
+; SER-4 (audit 2026-09-03). All three BIP152 helpers read a block's tx-count
+; CompactSize as a SINGLE BYTE and started the transaction walk at block+81.
+; For any block with 253 or more transactions -- a 3, 5 or 9-byte varint --
+; the count was taken as the marker byte (253/254/255) and the cursor was
+; 2/4/8 bytes short, so every transaction boundary was misparsed.
+;
+; cons_verify, the consensus path, reads it correctly, so only the BIP152
+; SERVING helpers were affected: a peer asking for a cmpctblock or getblocktxn
+; on any modern block got the .gd_miss path and nothing at all. Compact-block
+; relay was effectively off for every real block.
+;
+; One reader, used by all three, rather than three more hand-written varints.
+; Bounds-checked against `end`: a truncated field returns width 0.
+; ============================================================================
+cs_read:
+    xor  edx, edx
+    cmp  rdi, rsi
+    jae  .csr_bad
+    movzx rax, byte [rdi]
+    cmp  al, 0xfd
+    jae  .csr_wide
+    mov  edx, 1
+    ret
+.csr_wide:
+    cmp  al, 0xfd
+    jne  .csr_fe
+    lea  rcx, [rdi+3]
+    cmp  rcx, rsi
+    ja   .csr_bad
+    movzx rax, word [rdi+1]
+    mov  edx, 3
+    ret
+.csr_fe:
+    cmp  al, 0xfe
+    jne  .csr_ff
+    lea  rcx, [rdi+5]
+    cmp  rcx, rsi
+    ja   .csr_bad
+    mov  eax, [rdi+1]
+    mov  edx, 5
+    ret
+.csr_ff:
+    lea  rcx, [rdi+9]
+    cmp  rcx, rsi
+    ja   .csr_bad
+    mov  rax, [rdi+1]
+    mov  edx, 9
+    ret
+.csr_bad:
+    xor  eax, eax
+    xor  edx, edx
+    ret
+
 block_txcount:
     push rbp
     mov  rbp, rsp
@@ -518,11 +574,16 @@ block_txcount:
     mov  r12, rsi          ; blen
     cmp  rsi, 81
     jb   .err
-    mov  al, [rdi+80]
-    movzx rax, al
-    cmp  al, 0xfd
-    jb   .ok
-    mov  rax, -1           ; only single-byte tx count supported here (blocks <253 txs)
+    ; SER-4: a real CompactSize, bounded by blen
+    push rdi
+    lea  rax, [rdi+80]
+    lea  rsi, [rdi+rsi]    ; end = blk + blen
+    mov  rdi, rax
+    call cs_read
+    pop  rdi
+    test rdx, rdx
+    jnz  .ok
+    mov  rax, -1
     jmp  .ret
 .ok:
     pop  r12
@@ -561,13 +622,18 @@ block_tx_at:
     mov  r14, rdx          ; index
     mov  r15, rcx          ; out_ptr
     mov  rbx, r8           ; out_len
-    ; header(80) + txcount varint(1 byte)
+    ; SER-4: header(80) + a REAL txcount CompactSize (1/3/5/9 bytes)
     cmp  r13, 82
     jb   .fail
-    movzx rax, byte [r12+80]
+    lea  rdi, [r12+80]
+    lea  rsi, [r12+r13]    ; end = blk + blen
+    call cs_read
+    test rdx, rdx
+    jz   .fail
     mov  [rbp-0x90], rax   ; ntx
     mov  qword [rbp-0x88], 0 ; i = 0  (loop counter, survives nested calls)
-    lea  rcx, [r12+81]     ; cursor = first tx
+    lea  rcx, [r12+80]
+    add  rcx, rdx          ; cursor = first tx, past the real varint
     ; (rcx = cursor must survive the tx_parse call -> keep it in a local too)
     mov  [rbp-0x80+0x40], rcx ; keep cursor@rbp-0x40 (empty slot below txinfo)
 .walk:
@@ -676,8 +742,17 @@ cmpctblock_build:
     pop  rbx
     ; nonce LE8
     mov  [r12+80], r15
-    ; ntx = blockbuf[80] ; nshort = ntx-1 (single-byte varint, ntx<=253)
-    movzx rax, byte [r13+80]
+    ; SER-4: ntx from a REAL CompactSize; nshort = ntx-1
+    push r12
+    push r15
+    lea  rdi, [r13+80]
+    mov  rsi, [rbp-0x58]   ; blen (stashed by the caller prologue)
+    add  rsi, r13          ; end = blk + blen
+    call cs_read
+    pop  r15
+    pop  r12
+    test rdx, rdx
+    jz   .cb_fail
     mov  [rbp-0x50], rax   ; ntx
     lea  rax, [rax-1]
     mov  byte [r12+88], al
