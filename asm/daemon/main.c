@@ -6075,6 +6075,26 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       wenc_set_mnemonic_provider(provide_wallet_mnemonic);
       { extern void wenc_set_mnemonic_forget(void (*)(void));
         wenc_set_mnemonic_forget(forget_wallet_mnemonic); }
+    /* WAL-3 (rest): the wallet secrets are statics that live for the life of
+     * the process, so lock them out of swap and out of any core file before
+     * anything is written into them. Said out loud either way: an operator
+     * whose RLIMIT_MEMLOCK is too low should know the seed can reach swap,
+     * and a line saying it succeeded is the only evidence that it did. */
+    { int a = secure_lock(g_wallet_seed, sizeof g_wallet_seed);
+      int b = secure_lock(g_wallet_mnemonic, sizeof g_wallet_mnemonic);
+      int c = secure_lock(g_wallet_bip39pass, sizeof g_wallet_bip39pass);
+      extern int wenc_lock_secrets(void);
+      int d = wenc_lock_secrets();
+      if (a && b && c && d)
+          fprintf(stderr,"[wallet] seed, mnemonic and passphrase locked into RAM "
+                         "(mlock) and excluded from core dumps\n");
+      else
+          fprintf(stderr,"[wallet] WARNING: could not lock wallet secrets into RAM "
+                         "(seed=%d mnemonic=%d passphrase=%d container=%d) -- they may "
+                         "reach swap or a hibernation image. Raise RLIMIT_MEMLOCK "
+                         "(LimitMEMLOCK= in the unit file) to fix.\n", a, b, c, d);
+    }
+
       /* multi-wallet (rpc_wallet_ops.c): loadwallet/createwallet install the
        * switched-to wallet's seed through the SAME installer the encryption
        * unlock path uses -- one seed slot, one way to write it. */

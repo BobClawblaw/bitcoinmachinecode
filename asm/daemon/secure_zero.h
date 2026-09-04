@@ -13,10 +13,9 @@
  * so the preceding stores are live and cannot be dropped. This is the same
  * mechanism as Core's memory_cleanse.
  *
- * This does NOT address swap or hibernation -- that needs mlock and
- * MADV_DONTDUMP, which are not done here and remain open under WAL-3.
- * It closes the narrower and much more common case: a secret still sitting in
- * a process's own memory long after the code believed it had erased it.
+ * secure_lock below is the other half: mlock keeps a secret out of swap and
+ * off a hibernation image, and MADV_DONTDUMP keeps it out of a core file.
+ * Together they cover the three ways a "cleared" secret was still readable.
  *
  * header-only: it must inline into every caller, and a link-time function
  * would be one more thing for a caller to forget to link.
@@ -26,11 +25,42 @@
 
 #include <string.h>
 #include <stddef.h>
+#include <sys/mman.h>
 
 static inline void secure_zero(void* p, size_t n){
     if (!p || !n) return;
     memset(p, 0, n);
     __asm__ __volatile__("" : : "r"(p) : "memory");
+}
+
+/* WAL-3 (rest): keep a secret out of swap, off a hibernation image, and out
+ * of a core file.
+ *
+ * secure_zero closes the in-process case; this closes the three that outlive
+ * the process. An attacker with a swap partition or a hibernation image
+ * recovers the whole wallet from a node whose operator believes it is locked,
+ * and no amount of zeroing on shutdown helps once the page has been paged
+ * out. The 2026-09-02 host hardening (LimitCORE=0) removed the core-dump
+ * route only, and only for that unit -- MADV_DONTDUMP makes it a property of
+ * the memory rather than of the service file.
+ *
+ * BEST EFFORT, and deliberately so: mlock is bounded by RLIMIT_MEMLOCK, which
+ * an operator may have set low, and MADV_DONTDUMP does not exist on every
+ * kernel. A wallet that refuses to start because it could not lock a page is
+ * worse than one that starts and says so, and the caller logs the failure
+ * once rather than silently continuing. Returns 1 if the memory was locked.
+ *
+ * Both operate on whole pages, so the lock covers whatever else shares the
+ * page. That is harmless here -- the neighbours are other wallet statics --
+ * and it is the reason the amount locked is a few KB rather than a few
+ * hundred bytes. */
+static inline int secure_lock(void* p, size_t n){
+    if (!p || !n) return 0;
+    int locked = (mlock(p, n) == 0);
+#ifdef MADV_DONTDUMP
+    (void)madvise(p, n, MADV_DONTDUMP);   /* independent of the lock succeeding */
+#endif
+    return locked;
 }
 
 #endif
