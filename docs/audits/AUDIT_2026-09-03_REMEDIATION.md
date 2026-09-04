@@ -486,3 +486,86 @@ would not have worked -- a record whose 8-byte prefix reads cleanly and whose
 op byte is unrecognised has already advanced the counter past itself, so the
 cut would keep the very bytes that break every future replay. Undo files are
 still unsynced, which is the remaining piece of UTX-4.
+
+---
+
+## 2026-09-04 — the last untouched HIGH, and a corrected accounting
+
+This log had drifted from the tree. Three IDs (`DMN-1`, `MEM-2`, `UTX-1`)
+appeared in the table while a second check listed them as outstanding, and
+fixes that had landed (`SCR-6`, `CRY-1`) were never recorded here at all. The
+authoritative check is git history, not this file. Re-running the 180 findings
+against it, every CRITICAL and HIGH carries a commit except three:
+
+| ID | Severity | Status after this pass |
+|----|----------|------------------------|
+| VAL-9 | HIGH | ALREADY CLOSED by SCR-5 (`17bf36b`) -- the same defect filed under two IDs. `daemon/tx_verify.c:416-424` writes a real CompactSize for the spent scriptPubKey run. Two comments (lines 376, 395) still say "one length byte" and are now stale. |
+| NET-4 | HIGH | SUBSTANTIALLY CLOSED by `141c786` plus VAL-5/VAL-11: `dlc_fetch_headers` PoW-gates every header before `hst_append`, checks the nBits range, applies the contextual rules, and bounds both the page count (`cnt > DLC_HDR_PAGE`) and the round count (1000). The zero-work chain the finding describes cannot be built once each header must carry real work. The minimum-chain-work floor is enforced on the reorg/connect path (`daemon/minchainwork.c`). |
+| NET-5 | HIGH | FIXED HERE. |
+
+### NET-5 — contextual header rules on the inbound-block path
+
+`bitcoin_serve.asm`'s `.do_block` wrote a peer-pushed block to the durable
+archive after exactly two gates: `cons_verify`, which is entirely context-FREE
+(PoW against the header's own nBits, every tx parses, first tx is a coinbase,
+merkle root matches), and `store_validates_prevhash`, which only asks that the
+block extend our tip. Core refuses a header far earlier, in
+`ContextualCheckBlockHeader`: the nBits RETARGET SCHEDULE for the height, the
+median-time-past floor, the 2-hour future ceiling, and the BIP34/66/65
+version rules.
+
+Consensus was never at risk -- `daemon/utxo_live.c` re-checks the schedule when
+a block is CONNECTED and would refuse it there. The ARCHIVE was. A block has to
+extend our tip to reach this path, so a header Core rejects became our durable
+tip at a height it can never connect at, and the node stalls behind it. That
+stall is the confirmed half of the finding.
+
+`serve_block_ctx_ok` (new `daemon/serve_hdrctx.c`) applies all four rules
+before the append, and is INJECTED and default-OFF exactly like
+`reorg_set_pow_rules` / `reorg_set_header_rules`, for the same reason: the
+hermetic serve suites build synthetic chains with arbitrary bits, timestamps
+and versions. `daemon/main.c` arms it after `chainparams_select`. A rejected
+block is dropped and NEVER scored -- our verifier is not the reference, so a
+false reject here must not ban an honest peer, the same reasoning the
+`cons_verify` result above it already carries.
+
+Gated by `tests/test_serve_block_ctx`: all four rejections with Core's own
+reason strings, two accepts, and it OPENS with the unarmed negative control
+(every rejected header is accepted while the rules are off), so removing the
+gate makes the suite fail rather than pass vacuously.
+
+**Two build-structure notes, both caught by the audits and not by review.**
+The code first went into `daemon/tx_accept.c`, which pulled `pow_check_bits`,
+`store_get_at` and `store_rd_fd` into nine unrelated targets -- `link-check`
+named all nine. Splitting it into its own file fixed that. The object is built
+at the REPO ROOT rather than in `daemon/` because
+`scripts/makefile_link_audit.py:220` globs `*.o` and not `daemon/*.o`, so a
+`daemon/`-local object is invisible to the link audit.
+
+**And one self-inflicted regression.** Adding `bitcoin_pow_rules.o` to
+`DAEMONOBJS` put it on nine link lines twice (`multiple definition of
+pow_retarget_bits` and friends) -- straight past the Makefile comment at line
+170 that says the object "lives HERE ONLY" in `DAEMON_RPCOBJS` for precisely
+this reason. `link-check` stayed GREEN through it: it verifies every needed
+symbol is supplied, not that none is supplied twice. Only the clean build
+caught it, the second time this pass that a duplicate listing was invisible to
+both incremental builds and the audits. It now lives in `DAEMON_RPCOBJS` and
+`SERVEOBJS` (whose targets link no `DAEMON_RPCOBJS`), plus the two
+`test_bitcoind*` rules, which link neither bundle.
+
+Clean gate: 284 suites, 0 failures. prereq-check 461 rules, runlist-check 338
+gated, link-check 412 rules, abi-check, callee-saved-check and clean-check OK.
+
+### What remains
+
+No CRITICAL, HIGH or MEDIUM finding is now unaddressed except `NET-10`, which
+is scoped and deliberately not started (`docs/audits/NET-10_ADDRMAN_SCOPE.md`).
+**67 LOW and 33 INFO findings have never been examined.**
+
+`MEM-10` needs revisiting: `serve_rejects_attach` and `serve_rejects_clear`
+have production call sites, but `serve_rejects_has` and `serve_rejects_note`
+have NONE outside tests. The recent-rejects filter is allocated, attached and
+cleared on every block connect, and never consulted or populated -- so the
+startup line `[mempool] recent-rejects filter: 128 KB shared` currently
+reports a filter that does nothing. This is pre-existing on `main`, not a
+merge casualty.
