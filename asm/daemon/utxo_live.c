@@ -1138,6 +1138,39 @@ static int powr_hdr_from_store(void* ctx, long h, u8 hdr[80]){
     return pread(fd, hdr, 80, (off_t)meta[0] + 8) == 80 ? 1 : 0;
 }
 
+/* ---------------------------------------------------------------- VAL-4
+ * Core's GetMedianTimePast: the median nTime of the up-to-11 blocks ending at
+ * `h` (nMedianTimeSpan = 11). BIP113 makes this the time reference for
+ * nLockTime once CSV is active, which is why it has to be exact rather than
+ * "close enough": using the block's own timestamp instead would accept a
+ * transaction Core rejects, in a direction a miner controls.
+ *
+ * Returns 0 if any header in the window is unreadable. Refusing to evaluate
+ * is the safe answer -- the caller rejects rather than guessing -- and every
+ * legitimate path has its ancestors stored (the same argument
+ * pow_check_bits already relies on).
+ *
+ * Short chains: Core collects however many ancestors exist and takes the
+ * median of those, so a chain under 11 blocks is not a special case. */
+static int val_mtp(long h, u32* out){
+    u32 ts[11];
+    int n = 0;
+    for (long k = h; k > h - 11 && k >= 0; k--){
+        u8 hdr[80];
+        if (!powr_hdr_from_store(g_bip30_store, k, hdr)) return 0;
+        memcpy(&ts[n++], hdr + 68, 4);
+    }
+    if (n == 0) return 0;
+    for (int i = 1; i < n; i++){                 /* insertion sort, n <= 11 */
+        u32 v = ts[i]; int j = i - 1;
+        while (j >= 0 && ts[j] > v){ ts[j+1] = ts[j]; j--; }
+        ts[j+1] = v;
+    }
+    *out = ts[n / 2];
+    return 1;
+}
+
+
 /* ========================================================================
  * VAL-1 / VAL-2 (audit 2026-09-03) -- CheckTransaction's value rules, the
  * coinbase consensus rules, and ConnectBlock's fees/subsidy cap. Until this
@@ -1196,6 +1229,15 @@ typedef struct {
                                     null outpoint (Core: bad-txns-prevout-null) */
     int bad_shape;               /* truncated (a 0-input tx cannot even be
                                     walked by the merkle pass either) */
+    int any_nonfinal_seq;        /* VAL-4: ANY input with nSequence !=
+                                    0xffffffff. Tracked as a flag during the
+                                    walk rather than read back out of seqs[],
+                                    because seqs[] is capped at VAL_SEQ_CAP
+                                    and its truncation rule treats the surplus
+                                    as FINAL -- safe for BIP68, but the WRONG
+                                    direction for IsFinalTx, where missing a
+                                    non-final input means accepting a block
+                                    Core rejects. */
     u64 in_count;
     u64 out_count;               /* filled by the output walk the locktime
                                     read depends on being correct */
@@ -1245,6 +1287,7 @@ static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
         p = sp + sl;
         if ((u64)(end - p) < 4){ vi->bad_shape=1; return 0; }
         if (i == 0){ vi->in0_script = sp; vi->in0_slen = sl; }
+        { u32 sq; memcpy(&sq, p, 4); if (sq != 0xFFFFFFFFu) vi->any_nonfinal_seq = 1; }
         if (vi->nseqs < VAL_SEQ_CAP){ memcpy(&g_val_seqs[vi->nseqs], p, 4); vi->nseqs++; }
         else vi->nseqs = VAL_SEQ_CAP;              /* truncation flag (see the
                                                     * BIP68 pass: surplus
@@ -1318,6 +1361,26 @@ static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
     memcpy(&vi->locktime, p, 4);                   /* locktime */
     return 1;
 }
+/* Core's IsFinalTx (consensus/tx_verify.cpp), verbatim in structure:
+ *
+ *     if (tx.nLockTime == 0) return true;
+ *     if ((int64_t)tx.nLockTime <
+ *           ((int64_t)tx.nLockTime < LOCKTIME_THRESHOLD ? nBlockHeight : nBlockTime))
+ *         return true;
+ *     for (txin : tx.vin) if (txin.nSequence != SEQUENCE_FINAL) return false;
+ *     return true;
+ *
+ * LOCKTIME_THRESHOLD (500,000,000) is what decides whether nLockTime means a
+ * height or a UNIX time -- the same constant CLTV uses. */
+#define VAL_LOCKTIME_THRESHOLD 500000000UL
+static int val_is_final_tx(const val_txinfo_t* vi, long height, u32 timecutoff){
+    if (vi->locktime == 0) return 1;
+    long long cutoff = ((unsigned long)vi->locktime < VAL_LOCKTIME_THRESHOLD)
+                     ? (long long)height : (long long)(unsigned long)timecutoff;
+    if ((long long)(unsigned long)vi->locktime < cutoff) return 1;
+    return !vi->any_nonfinal_seq;
+}
+
 /* Test seam for tests/test_val_read_tx.c. val_read_tx is static and is not
  * reachable from a harness otherwise; exporting a thin alias (the same
  * convention bitcoin_scriptverify.c's sv_checksig_export uses) lets the test
@@ -1532,6 +1595,65 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
             fprintf(stderr, "[utxo_live] REJECT h=%ld: %s\n", g_apply_height, wreason);
             g_last_reject = "bad-witness-merkle-match";
             return 0;
+        }
+    }
+
+    /* ---- Phase 0.30 (VAL-4, audit 2026-09-03): ContextualCheckBlock's
+     * nLockTime finality rule.
+     *
+     * Core rejects any transaction that is not IsFinalTx(tx, nHeight,
+     * nLockTimeCutoff) with "bad-txns-nonfinal". This node implemented the
+     * CLTV/CSV script OPCODES but never the TRANSACTION-level rule, so a
+     * mined block carrying a transaction with nLockTime = height+100 and a
+     * non-final nSequence was accepted here and rejected by Core. Signatures
+     * are valid in that block; the split is purely over finality.
+     *
+     * nLockTimeCutoff follows Core exactly (validation.cpp):
+     *     DeploymentActiveAfter(pindexPrev, CSV) ? pindexPrev->GetMedianTimePast()
+     *                                            : block.GetBlockTime()
+     * i.e. BIP113 moves the time reference from the block's own timestamp --
+     * which a miner picks -- to the median of the previous eleven. Getting
+     * that wrong in the permissive direction is a miner-controlled split, so
+     * an unreadable ancestor window rejects rather than falling back.
+     *
+     * The coinbase is included: Core loops over every tx in the block, and a
+     * coinbase has a single input with nSequence usually 0xffffffff, so it is
+     * final in practice -- but the rule is not written to exclude it, and
+     * neither is this. ---- */
+    {
+        unsigned long long bflags30 = script_flags_for_block((unsigned long long)g_apply_height, blk_hash);
+        /* SFC_BIT_CSV in script_flags_consts.inc, generated from Core's
+         * chainparams (CSVHeight). Cross-checked at runtime below against a
+         * height either side of activation, so a regenerated .inc cannot
+         * silently move the bit out from under this. */
+        #define VAL_SFC_BIT_CSV 10
+        int csv_active = (int)((bflags30 >> VAL_SFC_BIT_CSV) & 1ULL);
+
+        u32 timecutoff;
+        if (csv_active){
+            if (g_apply_height < 1 || !val_mtp(g_apply_height - 1, &timecutoff)){
+                g_last_reject = "bad-txns-nonfinal";   /* cannot evaluate -> refuse */
+                fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-txns-nonfinal "
+                                "(median-time-past window unreadable)\n", g_apply_height);
+                return 0;
+            }
+        } else {
+            memcpy(&timecutoff, blockbuf + 68, 4);     /* the block's own nTime */
+        }
+
+        val_txinfo_t vif;
+        for (u64 t = 0; t < ntx; t++){
+            if (!val_read_tx(txs[t].ptr, txs[t].len, &vif)){
+                g_last_reject = "bad-txns-prevout-null"; return 0;
+            }
+            if (!val_is_final_tx(&vif, g_apply_height, timecutoff)){
+                fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-txns-nonfinal "
+                                "(tx %llu, nLockTime %lu, cutoff %lu)\n",
+                        g_apply_height, (unsigned long long)t,
+                        (unsigned long)vif.locktime, (unsigned long)timecutoff);
+                g_last_reject = "bad-txns-nonfinal";
+                return 0;
+            }
         }
     }
 
