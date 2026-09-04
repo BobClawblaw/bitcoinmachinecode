@@ -1,0 +1,51 @@
+#!/bin/sh
+# pre-commit -- identity and privacy gate.
+#
+# WHY THIS EXISTS. On 2026-09-04 a commit was made with `git -c
+# user.email=<personal address>`, overriding the repo's configured GitHub
+# noreply identity, and pushed. GitHub attributes commits by email, so those
+# commits were re-attributed to the account owning that address --
+# deanonymising the pseudonymous account. Nine commits, public, requiring a
+# history rewrite and a force-push to undo.
+#
+# Two rules, both fail-closed:
+#   1. the commit identity MUST be the project pseudonym;
+#   2. no staged content may match the local privacy blocklist.
+#
+# The blocklist lives at .git/privacy-blocklist -- deliberately NOT tracked,
+# because a tracked file listing the strings to hide would publish them. One
+# extended-regex per line, blank lines and # comments ignored. If the file is
+# absent the content check is skipped (a fresh clone has nothing to leak yet);
+# the identity check always runs.
+
+WANT_NAME="BobClawblaw"
+WANT_EMAIL="BobClawblaw@users.noreply.github.com"
+
+name=$(git var GIT_AUTHOR_IDENT | sed 's/ <.*//')
+email=$(git var GIT_AUTHOR_IDENT | sed 's/.*<//; s/>.*//')
+
+if [ "$name" != "$WANT_NAME" ] || [ "$email" != "$WANT_EMAIL" ]; then
+    echo "pre-commit: REFUSED -- wrong commit identity." >&2
+    echo "  got:  $name <$email>" >&2
+    echo "  want: $WANT_NAME <$WANT_EMAIL>" >&2
+    echo "Do not pass -c user.email / -c user.name. Fix the repo config:" >&2
+    echo "  git config user.name  '$WANT_NAME'" >&2
+    echo "  git config user.email '$WANT_EMAIL'" >&2
+    exit 1
+fi
+
+BLOCKLIST="$(git rev-parse --git-dir)/privacy-blocklist"
+[ -f "$BLOCKLIST" ] || exit 0
+
+rc=0
+while IFS= read -r pat; do
+    case "$pat" in ''|'#'*) continue ;; esac
+    if git diff --cached -U0 | grep -Ei -- "$pat" >/dev/null 2>&1; then
+        echo "pre-commit: REFUSED -- staged content matches a blocked pattern." >&2
+        echo "  pattern: $pat" >&2
+        rc=1
+    fi
+done < "$BLOCKLIST"
+
+[ "$rc" -ne 0 ] && echo "Blocklist: $BLOCKLIST (untracked, edit locally)." >&2
+exit $rc
