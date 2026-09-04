@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <pthread.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include "node_config.h"
 
@@ -81,9 +82,49 @@ __attribute__((weak)) void fest_on_forget(const unsigned char* txid){ (void)txid
 unsigned long mp_ext_polstate_n = 0;
 
 static pthread_mutex_t* g_mp_mutex = 0;   /* in its own shared page */
+static int g_mp_robust = 0;               /* MEM-20: PTHREAD_MUTEX_ROBUST armed */
 
-void mp_lock(void){   if (g_mp_mutex) pthread_mutex_lock(g_mp_mutex); }
+/* ---------------------------------------------------------------- MEM-20
+ * (audit 2026-09-03) A process-shared mutex that is not ROBUST turns any
+ * crash inside its critical section into a permanent, node-wide outage.
+ *
+ * Every accept in every inbound serve child holds this across
+ * mpool_policy_add, and the download worker holds it across block connect.
+ * If ANY of those processes dies in there -- and they are separate processes
+ * precisely so one can die without taking the node with it -- the lock stays
+ * held forever: the mempool stops accepting in every process, and RPC readers
+ * that take it (getblocktemplate's g_gbt_mph.lock) hang rather than answer.
+ * MEM-12's longer critical sections widen that window.
+ *
+ * With ROBUST the kernel hands the next locker EOWNERDEAD instead. The state
+ * the dead process was midway through IS rebuildable -- reorg_mempool_reconcile
+ * already reconstructs the pool against the chain -- so the right move is to
+ * take ownership, say so loudly, and let the node keep serving, rather than
+ * wedge. It is NOT silent: a mempool that may have a half-applied entry in it
+ * is a thing an operator must know about.
+ *
+ * Best-effort by design: a platform without robust process-shared mutexes
+ * keeps exactly today's behaviour rather than failing mempool_configure and
+ * dropping the node to the built-in 2 MiB pool.
+ */
+void mp_lock(void){
+    if (!g_mp_mutex) return;
+    int r = pthread_mutex_lock(g_mp_mutex);
+    if (r == EOWNERDEAD){
+        /* the previous holder died inside the critical section */
+        pthread_mutex_consistent(g_mp_mutex);
+        fprintf(stderr,
+            "[mempool] WARNING: a process died holding the mempool lock; the lock has\n"
+            "[mempool]          been recovered and the node keeps running, but the pool\n"
+            "[mempool]          may hold a partially-applied entry. It is rebuilt from\n"
+            "[mempool]          the chain on the next reorg reconcile; restart if you\n"
+            "[mempool]          want it rebuilt now.\n");
+    }
+}
 void mp_unlock(void){ if (g_mp_mutex) pthread_mutex_unlock(g_mp_mutex); }
+
+/* for the test: 1 when the shared lock was created ROBUST */
+int mp_lock_is_robust(void){ return g_mp_robust; }
 
 /* ---- expiry bookkeeping -------------------------------------------------
  * Open-addressed, same shape as the mempool itself so the two stay in step.
@@ -138,8 +179,18 @@ int mempool_configure(void){
     { void* pg = mmap(0, sizeof(pthread_mutex_t), PROT_READ|PROT_WRITE,
                       MAP_SHARED|MAP_ANONYMOUS, -1, 0);
       pthread_mutexattr_t at;
+      /* MEM-20: ROBUST is requested but NOT required -- see mp_lock above. */
+      int rb = 0;
+      if (pg!=MAP_FAILED && pthread_mutexattr_init(&at)==0){
+          if (pthread_mutexattr_setpshared(&at, PTHREAD_PROCESS_SHARED)==0 &&
+              pthread_mutexattr_setrobust(&at, PTHREAD_MUTEX_ROBUST)==0)
+              rb = 1;
+          pthread_mutexattr_destroy(&at);
+      }
+      g_mp_robust = rb;
       if (pg==MAP_FAILED || pthread_mutexattr_init(&at)!=0 ||
           pthread_mutexattr_setpshared(&at, PTHREAD_PROCESS_SHARED)!=0 ||
+          (rb && pthread_mutexattr_setrobust(&at, PTHREAD_MUTEX_ROBUST)!=0) ||
           pthread_mutex_init((pthread_mutex_t*)pg, &at)!=0){
           if (pg!=MAP_FAILED) munmap(pg, sizeof(pthread_mutex_t));
           munmap(area, struct_sz); munmap(blob, (size_t)blob_cap);

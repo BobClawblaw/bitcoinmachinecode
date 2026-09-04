@@ -2372,15 +2372,34 @@ mac_flush:
     syscall
 
 .fl_finish_reset:
+    ; ---- UTX-8 (audit 2026-09-03): the WAL reset must SUCCEED ----
+    ; Both syscalls below had their results discarded and log_len was then set
+    ; to 0 regardless. On EIO the old generation stays in utxo.dat while new
+    ; records are written from offset 0 over it, and a later reload replays
+    ; the new records and then whatever stale bytes follow -- a misparse, or,
+    ; at an aligned boundary, stale PUSHes applied on top of newer DELs.
+    ;
+    ; A failure now returns -1 (a flush error) BEFORE log_len, the memtable
+    ; and the tomb hash are cleared, so the caller still holds the same state
+    ; it had before the flush and can retry or halt. Every fd opened above is
+    ; already closed on both paths into this label, so .fl_err leaks nothing.
+    ;
+    ; ftruncate returns 0 on success and lseek returns the new offset, which
+    ; is 0 here -- so a NEGATIVE result is the error in both cases, the same
+    ; sign test the rename above already uses.
     mov  rdi, [r12+0]
     xor  esi, esi
     mov  eax, 77                         ; ftruncate
     syscall
+    test rax, rax
+    js   .fl_err
     mov  rdi, [r12+0]
     xor  esi, esi
     xor  edx, edx
     mov  eax, 8                           ; lseek SEEK_SET 0
     syscall
+    test rax, rax
+    js   .fl_err
     mov  qword [r12+16], 0
     mov  rdi, r13
     call mac_clear_memtable
