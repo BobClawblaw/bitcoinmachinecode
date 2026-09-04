@@ -45,6 +45,12 @@
  * and take, per block, the first segwit and first legacy transaction whose
  * locktime is not zero, with its hex, locktime, vin count and vout count.
  *
+ * The stripped-length column is VAL-3's input: Core's GetBlockWeight is
+ * 3*stripped + total, so a wrong stripped length is a wrong block weight and
+ * a chain split. The expected values are derived from Core's OWN numbers --
+ * decoderawtransaction reports size and weight, and stripped = (weight-size)/3
+ * -- so this pins our arithmetic against Core rather than against itself.
+ *
  * Usage: ./test_val_read_tx
  */
 #include <stdio.h>
@@ -65,6 +71,7 @@ typedef struct {
     int bad_shape;
     u64 in_count;
     u64 out_count;
+    u64 stripped_len;
     u32 locktime;
     u32 version;
     const u32* seqs; u32 nseqs;
@@ -86,9 +93,9 @@ static void ck(const char* w, int c){
 
 static const struct {
     const char* kind; unsigned height; unsigned long locktime;
-    unsigned nin, nout; const char* hex;
+    unsigned nin, nout; unsigned long stripped; const char* hex;
 } VECTORS[] = {
-    { "SEGWIT", 700038, 700036, 1, 2,
+    { "SEGWIT", 700038, 700036, 1, 2, 113,
       "02000000000101545461dccaba1f4e6a3d16b0b64bcb6af4cc6445f195694d42eee38942"
       "9bff430100000000fdffffff02eed0010000000000160014b3869df6828ceb64c06e3588"
       "49eb14b2390de7fd9e45200000000000160014c1b390ca99aa1eedb680cab2150f7a6143"
@@ -96,7 +103,7 @@ static const struct {
       "c954455ad0022004e853ed6c69c093379e16bb4408fdcb654a939eb26dc39a2fc3db493c"
       "6d20ed012103cec16d9c111ff924a2e7933331dc9e707d4d54caa14cf2de304f65e38ffa"
       "5b3b84ae0a00" },
-    { "LEGACY", 700038, 700036, 1, 3,
+    { "LEGACY", 700038, 700036, 1, 3, 259,
       "0200000001731250dfe062b82d2f6a1938a9a05e45d6040b8b26af2fd0d729e1079f580e"
       "0d010000006a47304402205310691c42b1ea74296c9d2e0f1f904945d2d059e5ee2e2fb2"
       "e7d8e150ee98cf0220140da7930e37132f3c6240b8bad6ea14601557336232eb584e9adc"
@@ -105,7 +112,7 @@ static const struct {
       "1facbcfcf988ac12b52e00000000001976a91421673b34291bba64857b7f81fc50840438"
       "4cf27f88ac54d53000000000001976a9143eeee23dd837e1dedf8ab67887108868b0d9ce"
       "7b88ac84ae0a00" },
-    { "SEGWIT", 840000, 839999, 1, 3,
+    { "SEGWIT", 840000, 839999, 1, 3, 186,
       "0200000000010177d935289cc2842f174134a04bb4874a2918e5008a8d84f2a8d02c281b"
       "af49c90000000000050000000349080000000000002251205de2a22fff8aa73e310ac705"
       "c04e77c1788a967eea36b5b0f756254190324d6e10270000000000002251208bbcb4f001"
@@ -116,7 +123,7 @@ static const struct {
       "73d24818d7e0153a2beaf7c49fa2f91e6b3cbc0393606a86509e57752bf44ab4ac006303"
       "6f7264010200010d08f3cf3645d0d2e71a6821c073d24818d7e0153a2beaf7c49fa2f91e"
       "6b3cbc0393606a86509e57752bf44ab43fd10c00" },
-    { "LEGACY", 840000, 839994, 1, 3,
+    { "LEGACY", 840000, 839994, 1, 3, 259,
       "02000000014345700245ae5a4dafd275af35f00096e65ddee779cfa1033469a2caaa6d0d"
       "34030000006a4730440220692cab87be8d7deb3809e66add0194cba4031942e95ba0780b"
       "4d045487dbed690220132a3916143e6925172993470cd58ee7f937280f8078ab88b41f2d"
@@ -125,7 +132,7 @@ static const struct {
       "6a900f7ba988ac30c40700000000001976a914714e963814df67a41b178d08144b900d42"
       "a34da688acf0adc600000000001976a9140dc745fda37ac42883dc8dcfaa35a3c8e202d7"
       "9d88ac3ad10c00" },
-    { "SEGWIT", 500000, 499999, 3, 2,
+    { "SEGWIT", 500000, 499999, 3, 2, 270,
       "020000000001030641e403935fc70c30bcffafd0bbd024f4cc73e65e0c8e15e015a30b50"
       "17e20500000000171600142ec0e073e8b9617b288425467476f1f12edb19b8feffffffeb"
       "eae261ecfcfd0f544b2c325ed1ac8391abcea579d0d951b356e6e67fe24e8a0000000017"
@@ -143,7 +150,7 @@ static const struct {
       "f027d8532f7dd14f257132961fc9adf0ea02205745b63ab265406e2cb31848d6d4a99ed9"
       "2f89c025ea4dcc4103f7b50b8ffcc5012102790f97673d3ea3b3f06c45d23df99115ea07"
       "01134eaae2c95da5c495232c96021fa10700" },
-    { "LEGACY", 500000, 499989, 2, 1,
+    { "LEGACY", 500000, 499989, 2, 1, 339,
       "020000000200f0b766f005a605f5f9537e726b4b1749a87ac34fae1edfe5a3b1a121bc6c"
       "0d000000006a47304402203f198d9695a293c41d2124e790d473e68f4b35a09ece5517c7"
       "adfffc797f91760220304feb1cc2829d3c937665bcb4b7f9735acbcac50e9169bc53c9e6"
@@ -189,6 +196,14 @@ int main(void){
         snprintf(lbl, sizeof lbl, "  %s h=%u OUTPUT count is %u (the section that was skipped)",
                  kind, height, nout);
         ck(lbl, vi.out_count == nout);
+
+        snprintf(lbl, sizeof lbl,
+                 "  %s h=%u VAL-3 stripped length is %lu, matching Core's own weight arithmetic",
+                 kind, height, VECTORS[v].stripped);
+        ck(lbl, (unsigned long)vi.stripped_len == VECTORS[v].stripped);
+        if ((unsigned long)vi.stripped_len != VECTORS[v].stripped)
+            printf("        got stripped %lu, want %lu\n",
+                   (unsigned long)vi.stripped_len, VECTORS[v].stripped);
 
         snprintf(lbl, sizeof lbl, "  %s h=%u locktime is %lu, not four bytes of the output section",
                  kind, height, lt);

@@ -116,6 +116,57 @@ static long mk_and_mine_spend(u8* raw, u8 hash[32], const u8 prev[32],
 }
 
 
+/* VAL-3 (audit 2026-09-03): a block whose STRIPPED size exceeds
+ * MAX_BLOCK_WEIGHT/4. Core's CheckBlock rejects
+ * GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR >
+ * MAX_BLOCK_WEIGHT as "bad-blk-length"; this node had no size or weight rule
+ * at all on the connect path -- the only 4,000,000 in the tree was the P2P
+ * frame cap and GBT -- so a miner could produce a block accepted here and
+ * rejected by Core, which is a chain split.
+ *
+ * Built non-segwit on purpose. For a witness-free block total == stripped, so
+ * weight == 4*stripped and the length rule fires first, exactly as Core
+ * orders CheckBlock before ContextualCheckBlock. The distinct bad-blk-weight
+ * arm needs witness bytes with segwit active, which this fixture chain (early
+ * heights, mainnet params) cannot express; its arithmetic is pinned instead
+ * by test_val_read_tx's stripped-length vectors, which are checked against
+ * Core's own size/weight numbers.
+ *
+ * The bulk is one enormous coinbase output script. Consensus caps scriptSig
+ * at 100 bytes but places no limit on an output script's length at block
+ * level (MAX_SCRIPT_SIZE applies when a script is EXECUTED), so this is a
+ * structurally valid block that is simply too big. */
+static long mk_and_mine_oversize(u8* raw, u8 hash[32], const u8 prev[32],
+                                 u32 tag, u32 tstamp, unsigned long spk_len){
+    u8* q = raw + 80;
+    *q++ = 1;                                     /* ntx = 1 */
+    u8* txstart = q;
+    put32(q,1); q+=4;
+    *q++ = 1;                                     /* 1 input */
+    memset(q,0,32); q+=32; put32(q,0xffffffffu); q+=4;
+    *q++ = 4; put32(q, tag); q+=4; put32(q,0xffffffffu); q+=4;
+    *q++ = 1;                                     /* 1 output */
+    put64(q, 50000000ULL); q+=8;
+    /* CompactSize(spk_len), then that many OP_NOP bytes */
+    *q++ = 0xfe; put32(q, (u32)spk_len); q+=4;
+    memset(q, 0x61, spk_len); q += spk_len;       /* OP_NOP filler */
+    put32(q,0); q+=4;                             /* locktime */
+    long txlen = (long)(q - txstart);
+
+    u8 txid[32];
+    static u8 big_scratch[1 << 21];
+    tx_txid(txid, txstart, (unsigned long)txlen, big_scratch, sizeof big_scratch);
+
+    put32(raw,1);
+    memcpy(raw+4, prev, 32);
+    memcpy(raw+36, txid, 32);                     /* merkle root == the one txid */
+    put32(raw+68, tstamp); put32(raw+72, 0x207fffffu); put32(raw+76, 0);
+    u32 nonce = 0;
+    while (!pow_check(raw)) { nonce++; put32(raw+76, nonce); }
+    block_hash(hash, raw);
+    return (long)(q - raw);
+}
+
 static u8 store_buf[4096];
 
 int main(void){
@@ -162,6 +213,31 @@ int main(void){
     ck("applied height now 150", utxo_live_applied_height(), n1);
     /* net UTXO change: +1 coinbase out, -1 spent height-0 out, +1 tx1 out */
     ck("UTXO count = before + 1", utxo_live_count(), count0 + 1);
+
+    /* ---- VAL-3: an oversized block is refused, and changes nothing ---- */
+    { static u8 big[1200000]; u8 bhash[32];
+      /* 1,000,600 bytes of output script puts the stripped size just over
+       * MAX_BLOCK_WEIGHT/4 = 1,000,000, so 4*stripped > 4,000,000. */
+      long blen = mk_and_mine_oversize(big, bhash, prev, 0x70000000u, 1800200000u, 1000600UL);
+      printf("oversize block: %ld bytes serialized (weight %ld)\n", blen, 4*blen);
+      long count_before = utxo_live_count();
+      long applied_before = utxo_live_applied_height();
+      ck("VAL-3 dry run of the oversized block -> 0",
+         utxo_live_dryrun_block(big, (u64)blen, utxo_live_applied_height()+1), 0);
+      const char* rr = utxo_live_last_reject();
+      printf("VAL-3 reject reason: [%s]\n", rr ? rr : "(null)");
+      ck("VAL-3 reason is a SIZE rule, not something incidental",
+         rr && (!strcmp(rr,"bad-blk-length") || !strcmp(rr,"bad-blk-weight")), 1);
+      ck("VAL-3 UTXO count unchanged", utxo_live_count(), count_before);
+      ck("VAL-3 applied height unchanged", utxo_live_applied_height(), applied_before); }
+
+    /* and a block just UNDER the limit must still be accepted, so the rule
+     * is a limit rather than a blanket refusal of large blocks */
+    { static u8 ok[1200000]; u8 ohash[32];
+      long olen = mk_and_mine_oversize(ok, ohash, prev, 0x71000000u, 1800200001u, 900000UL);
+      printf("under-limit block: %ld bytes (weight %ld)\n", olen, 4*olen);
+      ck("VAL-3 a large-but-legal block still passes the size rules",
+         utxo_live_dryrun_block(ok, (u64)olen, utxo_live_applied_height()+1), 1); }
 
     utxo_live_close();
     printf("\n%s (%d failures)\n", failures==0 ? "ALL TESTS PASSED" : "TESTS FAILED", failures);
