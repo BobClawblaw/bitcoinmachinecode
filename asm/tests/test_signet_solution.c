@@ -90,6 +90,37 @@ int main(void){
           fails++;
       } else printf("  ok  the stripped script keeps a SHORTENED header push, byte for byte\n"); }
 
+    printf("== VAL-13: a truncated push after the solution is dropped, not fatal ==\n");
+    /* Core's FetchAndClearCommitmentSection loops `while (GetOp(...))`; a
+     * failing GetOp ends the loop and the truncated tail is simply absent
+     * from the replacement script, so the signature is validated over the
+     * truncated form. This node returned -1 ("bad-signet-commitment-
+     * malformed") and rejected a block Core accepts. Signer-controlled only,
+     * but a divergence on a consensus path. */
+    { unsigned char c[256]; unsigned long cl = mk_commitment(c);
+      unsigned char payload[9] = {0xde,0xad,0xbe,0xef,1,2,3,4,5};
+      cl = add_solution(c, cl, payload, sizeof payload);
+      /* the expected stripped script: everything that parsed, i.e. the same
+       * shortened-header form as the clean case -- and NOT the tail */
+      unsigned char want[64]; unsigned long wl = mk_commitment(want);
+      want[wl++] = 4;
+      want[wl++] = SIGNET_HEADER_0; want[wl++] = SIGNET_HEADER_1;
+      want[wl++] = SIGNET_HEADER_2; want[wl++] = SIGNET_HEADER_3;
+      /* a dangling OP_PUSHDATA2 announcing 0xffff bytes with none present */
+      c[cl++] = 0x4d; c[cl++] = 0xff; c[cl++] = 0xff;
+      int r = signet_extract_solution(c, cl, sol, &sl, strip, &stl, sizeof sol);
+      ck("VAL-13 the solution is still found (1, not -1)", r == 1);
+      ck("VAL-13   and it is the same payload", sl == sizeof payload && !memcmp(sol, payload, sizeof payload));
+      ck("VAL-13   and the stripped script omits the truncated tail (Core's replacement)",
+         stl == wl && !memcmp(strip, want, wl));
+      /* the same tail with NO header anywhere: no solution, script unchanged
+       * -- Core leaves the original bytes alone when nothing was found */
+      unsigned char d[64]; unsigned long dl = mk_commitment(d);
+      d[dl++] = 0x4d; d[dl++] = 0xff; d[dl++] = 0xff;
+      r = signet_extract_solution(d, dl, sol, &sl, strip, &stl, sizeof sol);
+      ck("VAL-13 a truncated push with no solution reports 0, not -1", r == 0);
+      ck("VAL-13   and the script is returned unchanged", stl == dl && !memcmp(strip, d, dl)); }
+
     printf("== no solution is not an error ==\n");
     /* A trivial challenge such as OP_TRUE needs no signature at all, so a
      * commitment without a signet push is valid and must be reported as
@@ -122,13 +153,23 @@ int main(void){
       ck("  the second signet-looking push is left alone",
          memmem(strip, stl, p2, sizeof p2) != NULL); }
 
-    printf("== malformed scripts are refused, not walked off the end ==\n");
+    printf("== malformed scripts END the walk, they do not fail it (VAL-13) ==\n");
+    /* These two used to assert -1. That was this node's behaviour, not
+     * Core's: FetchAndClearCommitmentSection stops at a failing GetOp and
+     * keeps whatever parsed. Updated with the VAL-13 fix -- and they still
+     * assert the thing that actually matters, that the walk does not run off
+     * the end: it stops, reports "no solution", and returns the original
+     * script untouched. */
     { unsigned char c[64]; unsigned long cl = mk_commitment(c);
       c[cl++] = 40;                          /* claims 40 bytes, none follow */
-      ck("a truncated push is -1", signet_extract_solution(c, cl, sol, &sl, strip, &stl, sizeof sol) == -1); }
+      int r = signet_extract_solution(c, cl, sol, &sl, strip, &stl, sizeof sol);
+      ck("a truncated push stops the walk and reports no solution", r == 0);
+      ck("  and the script is returned unchanged", stl == cl && !memcmp(strip, c, cl)); }
     { unsigned char c[64]; unsigned long cl = mk_commitment(c);
       c[cl++] = 0x4c;                        /* PUSHDATA1 with no length byte */
-      ck("a truncated PUSHDATA1 is -1", signet_extract_solution(c, cl, sol, &sl, strip, &stl, sizeof sol) == -1); }
+      int r = signet_extract_solution(c, cl, sol, &sl, strip, &stl, sizeof sol);
+      ck("a truncated PUSHDATA1 stops the walk and reports no solution", r == 0);
+      ck("  and the script is returned unchanged", stl == cl && !memcmp(strip, c, cl)); }
 
     printf("== a solution too large for the caller's buffer is refused ==\n");
     { unsigned char c[512]; unsigned long cl = mk_commitment(c);

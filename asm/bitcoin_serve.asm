@@ -1011,11 +1011,43 @@ node_serve_loop:
     test rax, rax
     jle  .gd_miss
     mov  [s_blen_spill], rax
-    ; choose/rotate the nonce (fixed seed is fine for deterministic tests)
+    ; ---- NET-14 (audit 2026-09-03): a FRESH nonce per block ----
+    ; This was the constant 0x0123456789abcdef, drawn once and then cached in
+    ; s_cmpct_nonce for the life of the connection -- so every compact block
+    ; this node ever served used the same SipHash key. Core draws a fresh
+    ; nonce for every CBlockHeaderAndShortTxIDs precisely so an adversary
+    ; cannot precompute transactions whose 6-byte short ids collide: with a
+    ; predictable nonce they can be planted in receivers' mempools ahead of
+    ; time, forcing reconstruction to fail and every peer we serve to fall
+    ; back to a full block.
+    ;
+    ; getrandom(2) inline rather than a helper: bitcoin_net.o/bitcoin_serve.o
+    ; are linked into sixty-odd targets and this file goes out of its way not
+    ; to add link dependencies (see the v2 dispatch table). The syscall
+    ; clobbers rcx and r11, neither of which is live here; r12-r15 (fd, lfd,
+    ; st) and rbx are untouched by it.
+    ;
+    ; If getrandom is unavailable the fallback is rdtsc, which is at least not
+    ; a compile-time constant. `or rax,1` keeps it nonzero: a zero nonce is
+    ; what the old code used as its "unset" sentinel and test_bip152_loop
+    ; still asserts the served nonce is nonzero.
+    lea  rdi, [s_cmpct_nonce]
+    mov  rsi, 8
+    xor  edx, edx
+    mov  eax, 318                  ; SYS_getrandom
+    syscall
+    cmp  rax, 8
+    je   .gc_nonce_rdy
+    rdtsc                          ; fallback: never a fixed constant
+    shl  rdx, 32
+    or   rax, rdx
+    or   rax, 1
+    mov  [s_cmpct_nonce], rax
+.gc_nonce_rdy:
     mov  rcx, [s_cmpct_nonce]
     test rcx, rcx
     jnz  .gc_nonce_ok
-    mov  rcx, 0x0123456789abcdef
+    mov  rcx, 1                    ; never hand cmpctblock_build a zero nonce
     mov  [s_cmpct_nonce], rcx
 .gc_nonce_ok:
     ; cmpctblock_build(bt_buf, sb_buf, blen, nonce)

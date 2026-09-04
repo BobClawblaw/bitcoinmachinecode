@@ -977,6 +977,72 @@ static void decr_ancestors(void* st, int ci, uint32_t vsz, uint64_t fee){
     }
 }
 
+/* ---------------------------------------------------------------- MEM-17
+ * (audit 2026-09-03) A node's WITH-ANCESTORS aggregates went stale the moment
+ * an ancestor left the pool.
+ *
+ * remove_node cleared a child's parent[k] to 0xFFFFFFFF and decr_ancestors
+ * fixed the departing node's ANCESTORS' desc_* -- but nothing touched the
+ * DESCENDANTS' anc_cnt/anc_bytes. So after a v3 parent P confirmed, its v3
+ * child C still carried anc_cnt == 2 (P plus itself) although it now had no
+ * unconfirmed ancestor at all, and C's own v3 child G was refused
+ * "TRUC-violation" where Core accepts it (C has 0 mempool ancestors). The
+ * same stale count feeds the ordinary ancestor limit at admission
+ * ("too-long-mempool-chain"), so a long-lived chain whose head kept
+ * confirming looked longer and longer to this node. RPC readers walk the
+ * links rather than the counters, which is why getmempoolentry looked right
+ * and hid it. Core: UpdateForRemoveFromMempool / UpdateAncestorsOf.
+ *
+ * Rather than decrement transitively on the way DOWN -- there is no child
+ * index, so finding descendants is a sweep -- a survivor's aggregates are
+ * RECOMPUTED by walking UP its parent refs, exactly as admission first
+ * computed them (anc_cnt = 1 + ancestors, anc_bytes = vsize + their vsizes).
+ * Going up is cheap: parents are indexed, and Core's cluster limit bounds an
+ * ancestor set at 63, so the linear seen-list below never fills. If it ever
+ * did, the count saturates HIGH, which is the refusing direction -- a stale
+ * count can only ever over-admit.
+ *
+ * Both removal paths call the pass, and both skip it when no survivor lost a
+ * parent, which is the common case for an RBF eviction (descendants leave
+ * with the evicted tx) and keeps the O(survivors) cost off that path. */
+#define MPOL_ANC_SEEN_MAX 128
+static void mpol_recompute_anc(void* st, uint32_t i){
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    uint32_t seen[MPOL_ANC_SEEN_MAX]; int nseen = 0;
+    uint32_t stack[MPOL_ANC_SEEN_MAX]; int sp = 0;
+    uint64_t cnt = 1, bytes = t[i].size;
+    int saturated = 0;
+    for (uint32_t k = 0; k < t[i].n_parents; k++){
+        uint32_t p = mpol_par_at(st, &t[i], k);
+        if (p >= n) continue;                      /* 0xFFFFFFFF: parent is gone */
+        if (nseen >= MPOL_ANC_SEEN_MAX){ saturated = 1; break; }
+        seen[nseen++] = p; stack[sp++] = p;
+    }
+    while (sp && !saturated){
+        uint32_t a = stack[--sp];
+        cnt++; bytes += t[a].size;
+        for (uint32_t k = 0; k < t[a].n_parents; k++){
+            uint32_t p = mpol_par_at(st, &t[a], k);
+            if (p >= n) continue;
+            int dup = 0; for (int q = 0; q < nseen; q++) if (seen[q] == p){ dup = 1; break; }
+            if (dup) continue;
+            if (nseen >= MPOL_ANC_SEEN_MAX){ saturated = 1; break; }
+            seen[nseen++] = p; stack[sp++] = p;
+        }
+    }
+    if (saturated){ cnt = 0xFFFFFFFFu; bytes = 0xFFFFFFFFu; }   /* refuse, never over-admit */
+    t[i].anc_cnt   = (uint32_t)(cnt   > 0xFFFFFFFFu ? 0xFFFFFFFFu : cnt);
+    t[i].anc_bytes = (uint32_t)(bytes > 0xFFFFFFFFu ? 0xFFFFFFFFu : bytes);
+}
+static void mpol_recompute_anc_all(void* st){
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    for (uint32_t i = 0; i < n; i++)
+        if (t[i].n_parents) mpol_recompute_anc(st, i);
+        /* a node with no parents has anc_cnt 1 / anc_bytes == size already */
+}
+
 /* Remove ONE node (by current index): structural delete + graph unlink.
  * Children keep their nodes; their reference to this node is cleared (the
  * parent left the pool -- confirmed or evicted-with-package, in which case
@@ -1016,12 +1082,15 @@ static void remove_node(void* st, void* mp, int ci){
               o[i]=o[last_o]; (*no)--;
               if (last_o != i) mpol_out_idx_link(st, i);
           } else i++; } }
-    /* clear children's parent references to ci */
+    /* clear children's parent references to ci. MEM-17: remember whether
+     * any child lost a parent here, so its aggregates get recomputed once
+     * the indices are final (bottom of this function). */
+    uint32_t orphaned = 0;
     { uint32_t n = *nptr;
       for (uint32_t j=0;j<n;j++)
           for (uint32_t k=0;k<t[j].n_parents;k++)
-              if (mpol_par_at(st, &t[j], k)==(uint32_t)ci)
-                  mpol_par_set(st, &t[j], k, 0xFFFFFFFFu); }
+              if (mpol_par_at(st, &t[j], k)==(uint32_t)ci){
+                  mpol_par_set(st, &t[j], k, 0xFFFFFFFFu); orphaned++; } }
     /* MEM-3: hand this node's overflow block back BEFORE the slot is
      * overwritten by the swap below, or the block leaks and the pool bleeds
      * away one entry per removal until it is exhausted -- at which point
@@ -1047,6 +1116,7 @@ static void remove_node(void* st, void* mp, int ci){
           uint32_t ncl = *(uint32_t*)((char*)st+12);
           for (uint32_t i=0;i<ncl;i++) if (c[i].claimer==last) c[i].claimer=(uint32_t)ci; }
     }
+    if (orphaned) mpol_recompute_anc_all(st);      /* MEM-17 */
     if (g_forget_cb) g_forget_cb(ct);
 }
 
@@ -1174,11 +1244,13 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
     /* ---- 5. ONE pass over the survivors' parent lists. A parent that moved
      * is renumbered; a parent that is gone becomes 0xFFFFFFFF. The old code
      * needed a full sweep for each of those, per removal. ---- */
+    uint32_t orphaned = 0;                          /* MEM-17 */
     for (uint32_t i = 0; i < w; i++){
         for (uint32_t k = 0; k < t[i].n_parents; k++){
             uint32_t pv = mpol_par_at(st, &t[i], k);
             if (pv == 0xFFFFFFFFu) continue;         /* already cleared */
             uint32_t nv = (pv < n) ? remap[pv] : MPOL_IDX_NONE;
+            if (nv == MPOL_IDX_NONE) orphaned++;
             mpol_par_set(st, &t[i], k, nv == MPOL_IDX_NONE ? 0xFFFFFFFFu : nv);
         }
     }
@@ -1203,6 +1275,10 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
         for (uint32_t i = 0; i < no; i++) mpol_out_idx_link(st, i); }
       { uint32_t ncl = *(uint32_t*)((char*)st+12);
         for (uint32_t i = 0; i < ncl; i++) mpol_clm_idx_link(st, i); } }
+
+    /* MEM-17: every survivor that lost a parent -- and everything below it --
+     * now carries a stale with-ancestors count. One pass, walking up. */
+    if (orphaned) mpol_recompute_anc_all(st);
 
     return nremoved;
 }
@@ -1707,8 +1783,22 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
       uint64_t eff_vsize = g_pkg_vsize ? g_pkg_vsize : vsize;
       /* min relay floor over VSIZE (Core "min relay fee not met"). vsize is
        * already the sigop-adjusted size -- see the top of this function. */
-      if (eff_fee * 1000 < eff_vsize * pol->relay_fee_rate){      /* both sides sat/kvB-scaled */
-          _mpol_last_reason = "min relay fee not met"; return 0; }
+      /* MEM-16 (audit 2026-09-03): this was `eff_fee * 1000 < eff_vsize *
+       * rate`, which is fee < rate*vsize/1000 computed EXACTLY -- i.e. a
+       * ceiling. Core's CFeeRate::GetFee truncates and only then floors at 1:
+       *
+       *     nFee = nSatoshisPerK * num_bytes / 1000;
+       *     if (nFee == 0 && num_bytes != 0 && nSatoshisPerK > 0) nFee = 1;
+       *
+       * At minrelaytxfee 100 sat/kvB and vsize 115 that is 11 sat for Core
+       * and was 12 here, so this node refused to relay transactions Core
+       * relays. The dynamic floor immediately below ALREADY used Core's
+       * rounding, so the two floors disagreed with each other -- which is the
+       * clearest sign this was an oversight rather than a choice. */
+      { uint64_t need = (uint64_t)pol->relay_fee_rate * eff_vsize / 1000;
+        if (need == 0 && eff_vsize != 0 && pol->relay_fee_rate > 0) need = 1;
+        if (eff_fee < need){
+            _mpol_last_reason = "min relay fee not met"; return 0; } }
       /* dynamic floor (sat/kvB, rolling decay) -- Core "mempool min fee not met" */
       uint64_t fl = mpool_policy_min_fee_ex(st, pol->incremental_fee);
       if (fl > 0){

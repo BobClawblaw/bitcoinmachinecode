@@ -5242,26 +5242,23 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                  * catch-up the honest answer stays "inconclusive". */
                 extern long utxo_live_dryrun_block(const unsigned char*, unsigned long long, long);
                 extern const char* utxo_live_last_reject(void);
-                extern unsigned int rpc_chain_retarget(unsigned int, long);
                 long applied = utxo_live_ok ? utxo_live_applied_height() : -1;
                 static unsigned char hb[4u<<20];   /* store_read_at scratch */
                 if (applied != tip){
                     snprintf(reason, sizeof reason, "inconclusive");
                 } else {
-                    /* next-work check: a block whose header meets its OWN bits
-                     * but not the CHAIN's required bits must not connect. */
-                    unsigned int want_bits = 0, blk_bits =
-                        (unsigned)sblk[72] | ((unsigned)sblk[73]<<8) | ((unsigned)sblk[74]<<16) | ((unsigned)sblk[75]<<24);
-                    unsigned int tip_time = 0;
-                    if (store_read_at(store_buf, (u64)tip, hb, sizeof hb) >= 80){
-                        unsigned int tip_bits = (unsigned)hb[72]|((unsigned)hb[73]<<8)|((unsigned)hb[74]<<16)|((unsigned)hb[75]<<24);
-                        tip_time = (unsigned)hb[68]|((unsigned)hb[69]<<8)|((unsigned)hb[70]<<16)|((unsigned)hb[71]<<24);
-                        if ((tip + 1) % 2016 != 0) want_bits = tip_bits;
-                        else if (store_read_at(store_buf, (u64)(tip - 2015), hb, sizeof hb) >= 80){
-                            unsigned int first_time = (unsigned)hb[68]|((unsigned)hb[69]<<8)|((unsigned)hb[70]<<16)|((unsigned)hb[71]<<24);
-                            want_bits = rpc_chain_retarget(tip_bits, (long)tip_time - (long)first_time);
-                        }
-                    }
+                    /* VAL-14 (audit 2026-09-03): there used to be a next-work
+                     * pre-check here -- rpc_chain_retarget(tip_bits, span) with
+                     * a bare `(tip+1) % 2016` -- i.e. MAINNET'S schedule only:
+                     * no testnet4 20-minute min-difficulty walk-back, no BIP94
+                     * first-block base. On testnet4 a valid min-difficulty block
+                     * submitted here was answered "bad-diffbits"; on a BIP94
+                     * boundary the expected bits were simply wrong. The dry run
+                     * below already runs pow_check_bits with THIS chain's rules
+                     * (utxo_live_set_pow_rules, armed after chainparams_select)
+                     * and answers the same "bad-diffbits", so the pre-check was
+                     * a second, less correct opinion. Removed; the timestamp
+                     * rules that follow are chain-agnostic and stay. */
                     /* median time past of the last 11 headers */
                     unsigned int mtp = 0;
                     { unsigned int tt[11]; int nn = 0;
@@ -5273,9 +5270,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                           if (tt[b2] < tt[a2]){ unsigned int sw=tt[a2]; tt[a2]=tt[b2]; tt[b2]=sw; }
                       if (nn) mtp = tt[nn/2]; }
                     unsigned int blk_time = (unsigned)sblk[68]|((unsigned)sblk[69]<<8)|((unsigned)sblk[70]<<16)|((unsigned)sblk[71]<<24);
-                    if (!want_bits || blk_bits != want_bits){
-                        snprintf(reason, sizeof reason, "bad-diffbits");
-                    } else if (blk_time <= mtp){
+                    if (blk_time <= mtp){
                         snprintf(reason, sizeof reason, "time-too-old");
                     } else if ((long long)blk_time > (long long)time(NULL) + 7200){
                         snprintf(reason, sizeof reason, "time-too-new");

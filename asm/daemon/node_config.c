@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include "log_ts.h"
 #include <stdlib.h>
+#include <limits.h>
+#define NODECFG_BANTIME_MAX (100LL*365*24*3600)   /* DMN-9: 100 years */
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 #include "node_config.h"
@@ -448,6 +451,45 @@ int node_config_is_manual(const char* ip){
  * should not be able to reproduce the peer-starvation stall that a bad
  * eviction threshold caused on 2026-08-18. */
 static int hexval(int c){ return c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:-1; }
+/* ---------------------------------------------------------------- DMN-9
+ * (audit 2026-09-03) Bounded integer parsing.
+ *
+ * Every numeric key went through `atoi`, which truncates strtol's long to an
+ * int: `maxconnections=4294967496` wrapped to 200 and sailed straight through
+ * the clamp that exists to catch exactly that, so a typo silently produced a
+ * plausible-looking wrong setting. Core's LocaleIndependentAtoi returns 0 for
+ * anything it cannot represent, which the clamp below then reports.
+ *
+ * Returns 0 (and warns) on overflow, trailing garbage or an empty value, so
+ * an unusable setting is visible instead of being quietly reinterpreted. */
+static long long nodecfg_strtoll(const char* s, const char* key, int* overflowed){
+    if (overflowed) *overflowed = 0;
+    if (!s || !*s) return 0;
+    errno = 0;
+    char* end = 0;
+    long long v = strtoll(s, &end, 10);
+    if (errno == ERANGE || end == s || (end && *end)){
+        if (overflowed) *overflowed = 1;
+        fprintf(stderr, "[config] %s=%s is not a usable number -- reading it as 0\n",
+                key ? key : "?", s);
+        return 0;
+    }
+    return v;
+}
+
+/* The int-width form: out-of-range is 0, as Core's LocaleIndependentAtoi. */
+static int nodecfg_atoi(const char* s, const char* key){
+    int ovf = 0;
+    long long v = nodecfg_strtoll(s, key, &ovf);
+    if (ovf) return 0;
+    if (v > INT_MAX || v < INT_MIN){
+        fprintf(stderr, "[config] %s=%s does not fit an int -- reading it as 0\n",
+                key ? key : "?", s);
+        return 0;
+    }
+    return (int)v;
+}
+
 static int clamp_int(int v, int lo, int hi, const char* key, int* bad){
     if(v < lo || v > hi){
         fprintf(stderr,"[config] %s=%d out of range [%d,%d] -- ignoring\n", key, v, lo, hi);
@@ -586,13 +628,13 @@ long node_config_load(const char* path){
         char negbuf[128];
         if(kl > 2 && key[0]=='n' && key[1]=='o' && nodecfg_known_key(key+2)){
             snprintf(negbuf, sizeof negbuf, "%s", key+2);
-            int on = atoi(val) ? 0 : 1;                 /* noX=1 -> X=0 */
+            int on = nodecfg_atoi(val, key) ? 0 : 1;    /* noX=1 -> X=0 (DMN-9: bounded) */
             fprintf(stderr,"[config] %s=%s -> %s=%d (Core negation)\n", key, val, negbuf, on);
             key = negbuf; kl = strlen(negbuf);
             val = on ? (char*)"1" : (char*)"0";
         }
 
-        int iv = atoi(val); int t;
+        int iv = nodecfg_atoi(val, key); int t;   /* DMN-9: bounded, not atoi */
 
         /* ---- keys Bitcoin Core actually defines: same name, same units ----
          * A real bitcoin.conf must work here unchanged, and our file must not
@@ -711,7 +753,19 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"listenonion")){
             g_cfg.listenonion = iv?1:0; applied++; }
         else if(!strcmp(key,"bantime")){      /* Core -bantime, seconds      */
-            { long bv = atol(val); if(bv > 0) g_cfg.bantime = bv; } applied++; }
+            /* DMN-9: an unbounded bantime is FAIL-OPEN. main.c computes
+             * time(NULL) + bantime, so bantime=9223372036854775807 wraps
+             * negative and every automatic ban expires on the very next
+             * check -- banning silently switches itself off. Core has no cap
+             * but adds an int64 to GetTime(); a hundred years is longer than
+             * any real ban and cannot overflow that sum. */
+            { long long bv = nodecfg_strtoll(val, key, 0);
+              if(bv > NODECFG_BANTIME_MAX){
+                  fprintf(stderr,"[config] bantime=%s exceeds the %lld-second cap -- using the cap\n",
+                          val, (long long)NODECFG_BANTIME_MAX);
+                  bv = NODECFG_BANTIME_MAX;
+              }
+              if(bv > 0) g_cfg.bantime = (long)bv; } applied++; }
         else if(!strcmp(key,"blockfilterindex")){
             /* Core takes "basic"/"0"/"1"; "basic" is the only index type
              * that exists in Core either, so treat it as on. */
@@ -995,9 +1049,9 @@ long node_config_load(const char* path){
                 fprintf(stderr,"[config] %s=%s: expected legacy, p2sh-segwit, bech32 or bech32m -- ignoring\n", key, val); bad++; }
             else { snprintf(!strcmp(key,"addresstype") ? g_cfg.addresstype : g_cfg.changetype, 16, "%s", val); applied++; } }
         else if(!strcmp(key,"maxtipage")){
-            long lv = atol(val);
+            long long lv = nodecfg_strtoll(val, key, 0);   /* DMN-9: bounded */
             if(lv < 0){ fprintf(stderr,"[config] maxtipage=%s out of range -- ignoring\n", val); bad++; }
-            else { g_cfg.maxtipage = lv; applied++; } }
+            else { g_cfg.maxtipage = (long)lv; applied++; } }
         else if(!strcmp(key,"inboundrelaypercent")){
             t=clamp_int(iv,0,100,key,&bad); if(t>=0){ g_cfg.inboundrelaypercent=t; applied++; } }
         else if(!strcmp(key,"whitelistrelay")){ g_cfg.whitelistrelay = iv?1:0; g_cfg.whitelistrelay_explicit = 1; applied++; }

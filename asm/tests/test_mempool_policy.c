@@ -547,6 +547,47 @@ int main(void){
         okv(avs > 0 && avs < 200, "...and reports the plain vsize when nothing is parked");
     }
 
+    printf("== MEM-16: min-relay fee rounds like Core's CFeeRate::GetFee ==\n");
+    /* The check was `fee*1000 < vsize*rate`, i.e. fee < rate*vsize/1000
+     * EXACTLY -- a ceiling. Core truncates and floors at 1. The tx below is
+     * non-segwit, so vsize == its serialized length, which is 82 bytes:
+     * at 100 sat/kvB Core needs 100*82/1000 = 8 sat, the old code needed
+     * ceil(8.2) = 9. So 8 sat must be ACCEPTED (the fix) and 7 sat must still
+     * be REFUSED (the floor still binds) -- the pair is the control. */
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<21];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        mpool_policy_set_pending_sigops(0);
+        unsigned char prev[32]; memset(prev, 0x6C, 32);
+        unsigned char spk[2] = { 0x51, 0x00 };
+        for (int fee = 8; fee >= 7; fee--){
+            memset(stbuf, 0, sizeof stbuf);
+            mpool_policy_init(pol, 100, 25, 101000, 25, 101000, 1);   /* 100 sat/kvB */
+            POLICY_STATE_INIT(stbuf, 256);
+            mpool_init(mp, 4096, mblob, sizeof mblob);
+            utxo_init(ux, 4096, ublob, sizeof ublob);
+            utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk, 1);
+            unsigned char tx[128]; unsigned long n = 0;
+            tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0;
+            tx[n++]=1; memcpy(tx+n, prev, 32); n+=32; memset(tx+n, 0, 4); n+=4; tx[n++]=0; memset(tx+n,0xff,4); n+=4;
+            tx[n++]=1; { unsigned long long v = 1000000ULL - (unsigned long long)fee; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+            tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n, 0x66, 20); n+=20;
+            memset(tx+n, 0, 4); n+=4;
+            okv(n == 82, "the boundary tx is 82 bytes (so Core's floor is 8 sat at 100 sat/kvB)");
+            unsigned char tid[32]; memset(tid, 0x6D, 32); tid[0] = (unsigned char)fee;
+            long r = mpool_policy_add(pol, stbuf, mp, tx, n, tid, ux);
+            if (fee == 8)
+                okv(r == 1, "8 sat over 82 vB at 100 sat/kvB is ACCEPTED (Core: 100*82/1000 = 8)");
+            else
+                okv(r != 1 && strstr(mpool_policy_reason(pol), "min relay fee") != NULL,
+                    "7 sat over 82 vB is still REFUSED (the floor binds; not simply disabled)");
+        }
+    }
+
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }
