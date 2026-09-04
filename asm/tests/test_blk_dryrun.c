@@ -116,6 +116,38 @@ static long mk_and_mine_spend(u8* raw, u8 hash[32], const u8 prev[32],
 }
 
 
+/* VAL-4: coinbase + one spend of `spend_txid:0`, with the spend's nLockTime
+ * and nSequence chosen by the caller. Mirrors mk_and_mine_spend exactly apart
+ * from those two fields, so a rejection can only be about finality. */
+static long mk_and_mine_locktime(u8* raw, u8 hash[32], const u8 prev[32],
+                                 const u8 spend_txid[32], u32 tag, u32 tstamp,
+                                 u32 locktime, u32 sequence){
+    u8 cb[80], cb_txid[32];
+    long cblen = mk_coinbase(cb, cb_txid, tag);
+    u8 tx1[128], tx1_txid[32];
+    u8* q = tx1;
+    put32(q,1); q+=4; *q++ = 1;
+    memcpy(q, spend_txid, 32); q+=32; put32(q,0); q+=4;
+    *q++ = 0; put32(q, sequence); q+=4;
+    *q++ = 1; put64(q, 40000000ULL); q+=8; *q++ = 1; *q++ = 0x51;
+    put32(q, locktime); q+=4;
+    long tx1len = q - tx1;
+    tx_txid(tx1_txid, tx1, (unsigned long)tx1len, g_txid_scratch, sizeof g_txid_scratch);
+    u8 pair[64], root[32];
+    memcpy(pair, cb_txid, 32); memcpy(pair+32, tx1_txid, 32); sha256d(root, pair, 64);
+    u8* o = raw;
+    put32(o,1); o+=4; memcpy(o, prev, 32); o+=32; memcpy(o, root, 32); o+=32;
+    put32(o, tstamp); o+=4; put32(o, 0x207fffffu); o+=4; put32(o, 0); o+=4;
+    *o++ = 2;
+    memcpy(o, cb, (size_t)cblen); o += cblen;
+    memcpy(o, tx1, (size_t)tx1len); o += tx1len;
+    long len = o - raw;
+    u32 nonce = 0;
+    while (!pow_check(raw)) { nonce++; put32(raw+76, nonce); }
+    block_hash(hash, raw);
+    return len;
+}
+
 /* VAL-3 (audit 2026-09-03): a block whose STRIPPED size exceeds
  * MAX_BLOCK_WEIGHT/4. Core's CheckBlock rejects
  * GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR >
@@ -178,11 +210,13 @@ int main(void){
     long n1 = 150;
     u8 prev[32]; memset(prev,0,32);
     u8 height0_txid[32];
+    u8 height1_txid[32];   /* VAL-4: a coinbase output the earlier spend does NOT consume */
     for (long h=0; h<n1; h++){
         u8 raw[256], hash[32];
         long len = mk_and_mine(raw, hash, prev, 0x50000000u+(u32)h, 1800000000u+(u32)h);
         if (store_append(store_buf, hash, raw, len) != h){ printf("FAIL append h=%ld\n",h); failures++; }
         if (h==0) memcpy(height0_txid, raw+36, 32);
+        if (h==1) memcpy(height1_txid, raw+36, 32);
         memcpy(prev, hash, 32);
     }
     ck("catch-up applied 0..149", utxo_live_catchup(store_buf), n1);
@@ -213,6 +247,55 @@ int main(void){
     ck("applied height now 150", utxo_live_applied_height(), n1);
     /* net UTXO change: +1 coinbase out, -1 spent height-0 out, +1 tx1 out */
     ck("UTXO count = before + 1", utxo_live_count(), count0 + 1);
+
+    /* ---- VAL-4: a NON-FINAL transaction makes the block invalid ----
+     * Core's ContextualCheckBlock rejects any tx that is not IsFinalTx(tx,
+     * nHeight, nLockTimeCutoff) with "bad-txns-nonfinal". This node had the
+     * CLTV/CSV script OPCODES but never the transaction-level rule, so a
+     * block carrying a valid-signature tx with a future nLockTime and a
+     * non-final nSequence was accepted here and rejected by Core: a split
+     * with no invalid signature anywhere in it.
+     *
+     * Finality needs BOTH halves to fail, and the test pins both directions:
+     *   - future nLockTime + non-final nSequence  -> non-final, rejected;
+     *   - future nLockTime + nSequence 0xffffffff -> FINAL, accepted (this
+     *     is the arm that catches an implementation that rejects on
+     *     nLockTime alone, which would refuse a great many real mainnet
+     *     transactions);
+     *   - nLockTime 0 + non-final nSequence       -> FINAL, accepted.
+     * Only the first is a rejection, and a test that checked it alone would
+     * pass against a rule that is far too aggressive. */
+    { static u8 nf[512]; u8 nfhash[32];
+      long h_next = utxo_live_applied_height() + 1;
+      long count_before = utxo_live_count();
+
+      /* height-based nLockTime in the FUTURE (well under LOCKTIME_THRESHOLD,
+       * so it is read as a height), with a non-final sequence */
+      long nflen = mk_and_mine_locktime(nf, nfhash, prev, height1_txid,
+                                        0x80000000u, 1800300000u,
+                                        (u32)(h_next + 100), 0xfffffffeu);
+      ck("VAL-4 non-final tx (future nLockTime + non-final nSequence) -> 0",
+         utxo_live_dryrun_block(nf, (u64)nflen, h_next), 0);
+      { const char* rr = utxo_live_last_reject();
+        printf("VAL-4 reject reason: [%s]\n", rr ? rr : "(null)");
+        ck("VAL-4 reason is bad-txns-nonfinal",
+           rr && !strcmp(rr, "bad-txns-nonfinal"), 1); }
+      ck("VAL-4 nothing applied", utxo_live_count(), count_before);
+
+      /* same future nLockTime, but every input FINAL -> Core accepts */
+      long finlen = mk_and_mine_locktime(nf, nfhash, prev, height1_txid,
+                                         0x81000000u, 1800300001u,
+                                         (u32)(h_next + 100), 0xffffffffu);
+      { long r = utxo_live_dryrun_block(nf, (u64)finlen, h_next);
+        if (r != 1) printf("      (reason: %s)\n", utxo_live_last_reject());
+        ck("VAL-4 future nLockTime with FINAL sequences is still valid", r, 1); }
+
+      /* nLockTime 0 short-circuits: non-final sequence is irrelevant */
+      long z = mk_and_mine_locktime(nf, nfhash, prev, height1_txid,
+                                    0x82000000u, 1800300002u, 0u, 0xfffffffeu);
+      { long r = utxo_live_dryrun_block(nf, (u64)z, h_next);
+        if (r != 1) printf("      (reason: %s)\n", utxo_live_last_reject());
+        ck("VAL-4 nLockTime 0 is final regardless of nSequence", r, 1); } }
 
     /* ---- VAL-3: an oversized block is refused, and changes nothing ---- */
     { static u8 big[1200000]; u8 bhash[32];
