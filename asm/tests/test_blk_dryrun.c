@@ -148,6 +148,40 @@ static long mk_and_mine_locktime(u8* raw, u8 hash[32], const u8 prev[32],
     return len;
 }
 
+/* VAL-4/BIP68: coinbase + one spend with a chosen tx nVersion and input
+ * nSequence. Identical to mk_and_mine_locktime apart from those two fields,
+ * so a rejection can only be about relative finality. nLockTime stays 0,
+ * which short-circuits IsFinalTx and keeps the two halves of VAL-4
+ * independent -- otherwise a BIP68 test could pass on the nLockTime rule. */
+static long mk_and_mine_seq(u8* raw, u8 hash[32], const u8 prev[32],
+                            const u8 spend_txid[32], u32 tag, u32 tstamp,
+                            u32 version, u32 sequence){
+    u8 cb[80], cb_txid[32];
+    long cblen = mk_coinbase(cb, cb_txid, tag);
+    u8 tx1[128], tx1_txid[32];
+    u8* q = tx1;
+    put32(q, version); q+=4; *q++ = 1;
+    memcpy(q, spend_txid, 32); q+=32; put32(q,0); q+=4;
+    *q++ = 0; put32(q, sequence); q+=4;
+    *q++ = 1; put64(q, 40000000ULL); q+=8; *q++ = 1; *q++ = 0x51;
+    put32(q, 0); q+=4;                       /* nLockTime 0 */
+    long tx1len = q - tx1;
+    tx_txid(tx1_txid, tx1, (unsigned long)tx1len, g_txid_scratch, sizeof g_txid_scratch);
+    u8 pair[64], root[32];
+    memcpy(pair, cb_txid, 32); memcpy(pair+32, tx1_txid, 32); sha256d(root, pair, 64);
+    u8* o = raw;
+    put32(o,1); o+=4; memcpy(o, prev, 32); o+=32; memcpy(o, root, 32); o+=32;
+    put32(o, tstamp); o+=4; put32(o, 0x207fffffu); o+=4; put32(o, 0); o+=4;
+    *o++ = 2;
+    memcpy(o, cb, (size_t)cblen); o += cblen;
+    memcpy(o, tx1, (size_t)tx1len); o += tx1len;
+    long len = o - raw;
+    u32 nonce = 0;
+    while (!pow_check(raw)) { nonce++; put32(raw+76, nonce); }
+    block_hash(hash, raw);
+    return len;
+}
+
 /* VAL-3 (audit 2026-09-03): a block whose STRIPPED size exceeds
  * MAX_BLOCK_WEIGHT/4. Core's CheckBlock rejects
  * GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR >
@@ -296,6 +330,45 @@ int main(void){
       { long r = utxo_live_dryrun_block(nf, (u64)z, h_next);
         if (r != 1) printf("      (reason: %s)\n", utxo_live_last_reject());
         ck("VAL-4 nLockTime 0 is final regardless of nSequence", r, 1); } }
+
+    /* ---- VAL-4 (BIP68 half): the ACTIVATION GATE ----
+     * BIP68 applies only at or after CSVHeight -- 419,328 on mainnet -- and
+     * this fixture chain runs at height ~150. So what can be proved HERE is
+     * the gate, not the rule: below CSVHeight nothing is enforced, however
+     * large the relative lock. That is the false-reject direction, and it is
+     * the one that matters at this height: enforcing BIP68 early would reject
+     * pre-BIP68 mainnet history outright.
+     *
+     * The arithmetic the rule performs above CSVHeight is pinned separately,
+     * against hand-computed values from the BIP, in tests/test_bip68_locks.c.
+     * Building a 419k-block fixture to reach three lines of arithmetic would
+     * be theatre; saying so is better than a test that looks end-to-end and
+     * silently exercises nothing.
+     *
+     * All four are ACCEPTS. A version of this that expected a rejection
+     * passed for the wrong reason during development -- the transaction was
+     * refused for a spent prevout, not for BIP68 -- which is why every case
+     * here prints the reject reason when it fails. */
+    { static u8 sq[512]; u8 sqhash[32];
+      long h_next = utxo_live_applied_height() + 1;
+
+      struct { u32 version; u32 seq; const char* what; } cases[] = {
+        { 2u, 1000u,                 "v2, 1000-block relative lock" },
+        { 2u, 10u,                   "v2, 10-block relative lock" },
+        { 1u, 1000u,                 "v1 (BIP68 keys on nVersion >= 2)" },
+        { 2u, 0x80000000u | 1000u,   "v2 with the DISABLE flag set" },
+      };
+      for (unsigned ci = 0; ci < sizeof cases / sizeof cases[0]; ci++){
+          long n = mk_and_mine_seq(sq, sqhash, prev, height1_txid,
+                                   0x90000000u + (ci << 24), 1800400000u + ci,
+                                   cases[ci].version, cases[ci].seq);
+          long r = utxo_live_dryrun_block(sq, (u64)n, h_next);
+          if (r != 1) printf("      (reason: %s)\n", utxo_live_last_reject());
+          char lbl[160];
+          snprintf(lbl, sizeof lbl,
+                   "VAL-4 below CSVHeight BIP68 is not enforced: %s", cases[ci].what);
+          ck(lbl, r, 1);
+      } }
 
     /* ---- VAL-3: an oversized block is refused, and changes nothing ---- */
     { static u8 big[1200000]; u8 bhash[32];
