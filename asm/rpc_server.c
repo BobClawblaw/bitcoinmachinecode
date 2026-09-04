@@ -267,7 +267,22 @@ void rpc_cookie_remove(void) {
 }
 
 /* Verify Authorization: Basic <user:pass> against the configured credentials. */
-static char g_last_auth_user[64];   /* who auth_ok accepted (rpcwhitelist keys on it); one connection at a time per worker */
+/* RPC-2 (audit 2026-09-03): THREAD-LOCAL, not process-global.
+ *
+ * The old comment -- "one connection at a time per worker" -- described the
+ * invariant this needs, and the variable did not have it. Since the 16-thread
+ * RPC pool landed on 2026-09-01, up to 16 workers run service_conn ->
+ * auth_ok -> the wl_forbidden copy concurrently, with nothing between the
+ * write here and the read there but a return. Thread A authenticating as
+ * `alice` (whitelist: getblockcount) while thread B authenticates as `admin`
+ * could copy B's name, or the empty string B cleared it to, and evaluate A's
+ * whitelist for the wrong principal -- in either direction.
+ *
+ * __thread makes the stated invariant real: each worker gets its own, and the
+ * write and the read are the same thread's. Threading an out-parameter
+ * through auth_ok's four call sites would do the same thing with more
+ * surface; this is the smaller change and the comment now matches the code. */
+static __thread char g_last_auth_user[64];
 static int auth_ok(const char* headers, size_t hlen,
                    const char* user, const char* pass) {
     g_last_auth_user[0] = 0;

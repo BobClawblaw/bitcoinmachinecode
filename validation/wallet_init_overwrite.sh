@@ -44,6 +44,30 @@ forced=$(md5sum "$W" | cut -d' ' -f1)
 [ "$before" != "$forced" ]
 ck "--force does replace it (scripted re-init still possible)" $?
 
+# ---- WAL-4: the write is durable and never world-readable ----------------
+# store_write_atomic had no fsync at all, and the plaintext branch did not use
+# it: it fopen()ed the FINAL path and chmod'ed 0600 only AFTER writing the
+# mnemonic. So the seed phrase existed world-readable, and a power loss during
+# the unattended v2->v3 upgrade at boot could leave a zero-length wallet where
+# the only copy had been.
+W2="$D/w2.dat"
+if command -v strace >/dev/null 2>&1; then
+    strace -f -e trace=fsync,rename,openat -o "$D/tr.txt"         "$BIN" init "" "$W2" >/dev/null 2>&1
+    grep -q 'fsync' "$D/tr.txt"
+    ck "WAL-4 the wallet write issues fsync (it used to issue none)" $?
+    grep -qE 'openat.*w2\.dat\.tmp.*0600' "$D/tr.txt"
+    ck "WAL-4 the temp file is created 0600, not chmod'ed after the write" $?
+    # fsync must come before the rename that publishes it
+    fl=$(grep -n 'fsync' "$D/tr.txt" | head -1 | cut -d: -f1)
+    rl=$(grep -n 'rename' "$D/tr.txt" | head -1 | cut -d: -f1)
+    [ -n "$fl" ] && [ -n "$rl" ] && [ "$fl" -lt "$rl" ]
+    ck "WAL-4 the fsync precedes the rename that publishes it" $?
+else
+    echo "skip: strace unavailable -- cannot observe the syscalls"
+fi
+[ "$(stat -c '%a' "$W2" 2>/dev/null)" = "600" ]
+ck "WAL-4 the finished wallet is mode 0600" $?
+
 echo
 if [ "$fails" = "0" ]; then echo "ALL CHECKS PASSED"; exit 0; fi
 echo "$fails CHECK(S) FAILED"; exit 1
