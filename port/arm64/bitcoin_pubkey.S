@@ -229,8 +229,30 @@ pubkey_parse:
 
 .Lpc_uncomp:
 	ldrb w4, [x19]
+	/* CRY-2 (audit 2026-09-03): libsecp256k1's pubkey parse -- which Core's
+	 * CPubKey::Verify uses -- accepts 65-byte keys with prefix 0x04, 0x06,
+	 * 0x07. 0x06/0x07 are HYBRID encodings: the prefix carries the y parity
+	 * redundantly, and the parse requires (prefix & 1) == (y_last_byte & 1)
+	 * before the on-curve check. Core only rejects hybrids under
+	 * SCRIPT_VERIFY_STRICTENC, a policy flag NEVER set for block validation,
+	 * so a valid signature under a hybrid-encoded key is consensus-valid.
+	 * The old branch accepted only 0x04 -> a FALSE REJECT against the live
+	 * chain. */
 	cmp  w4, #0x04
+	b.eq .Lpc_uncomp_ok
+	cmp  w4, #0x06
+	b.eq .Lpc_hybrid
+	cmp  w4, #0x07
+	b.eq .Lpc_hybrid
+	b    .Lp_bad
+.Lpc_hybrid:
+	/* (prefix & 1) must equal the parity of the last byte of y (pub[64]). */
+	ldrb w5, [x19, #64]
+	ubfx w6, w4, #0, #1             /* prefix & 1 */
+	ubfx w5, w5, #0, #1             /* y[64] & 1 */
+	cmp  w6, w5
 	b.ne .Lp_bad
+.Lpc_uncomp_ok:
 	/* x limbs @sp+32 from pub[1..32]; y limbs @sp+160 from pub[33..64] */
 	add  x8, x19, #1
 	ldr  x5, [x8, #24]

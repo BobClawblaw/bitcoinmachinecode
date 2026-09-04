@@ -1,4 +1,4 @@
-# TODO — arm-port state after the 2026-09-03/04 session (audit-remediation parity landed, deployed as arm-8)
+# TODO — arm-port state after 2026-09-04 (the 276-commit main batch merged + ported, deployed as arm-9)
 
 Everything below is landed on `arm-port` and pushed. History lives in
 `worklog/2026-09-0{1,2,3}.md`; the per-module port status is
@@ -48,6 +48,13 @@ Everything below is landed on `arm-port` and pushed. History lives in
       ARM 2026-09-04, sweep round 22 green (pass 309 / fail 4 env-only),
       deployed as arm-8 with aa70c08. RPX-1 was arch-neutral C (arrived with
       the merge, nothing to port).
+- [x] The NEXT main batch (276 commits, SCR-5/6/7, CRY-1/2, VAL-5/6/8/11)
+      merged and ported 2026-09-04: round 24 green (pass 313 / fail 4
+      env-only, compared 330 of 363), deployed as arm-9. Sweep gained a `$^`
+      deps injector; test_sha256 skipped (x86 CPUID inline asm). Two upstream
+      items surfaced and handled: serve-test disarms the powLimit (harness
+      principle), arena FAIL-5 updated to the SCR-5 contract with the 252
+      single-reject quirk pinned. Details in the worklog.
 - [x] `validation/spend_corpus_diff.py` ran for the FIRST time on this port
       2026-09-04 01:25 UTC, against a real synced Core over the LAN
       (Umbrel node 192.168.5.69:8332, txindex on, verificationprogress=1):

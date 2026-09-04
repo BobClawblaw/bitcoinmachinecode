@@ -28,6 +28,15 @@
  * uses w17 (first byte), x15 (bound), then sets curs. Numeric locals 41-44.
  * ------------------------------------------------------------------------- */
 	.macro VARINTP rd, curs, end, fail
+	/* VAL-8 (audit 2026-09-03): bound the first byte -- the caller's prior
+	 * checks can leave the cursor exactly at end -- and cap EVERY decoded
+	 * count/length at Core's MAX_SIZE (0x02000000, serialize.h's
+	 * ReadCompactSize range check; n == MAX_SIZE is legal, > fails) so the
+	 * length applications below cannot be defeated by a wrapping 8-byte
+	 * varint (an 0xff scriptlen of -2^40 put the reconstructed cursor 1 TiB
+	 * below the buffer on x86 -- SER-2). */
+	cmp  \curs, \end
+	b.hs \fail
 	ldrb w17, [\curs]
 	cmp  w17, #0xfd
 	b.lo 41f
@@ -60,6 +69,9 @@
 	mov  w\rd, w17
 	add  \curs, \curs, #1
 44:
+	movz x15, #0x200, lsl #16	/* 0x02000000 = MAX_SIZE */
+	cmp  x\rd, x15
+	b.hi \fail
 	.endm
 
 /* ============================================================================
@@ -267,8 +279,13 @@ tx_txid:
 .Lid_next_in:
 	cbz  x13, .Lid_ins_done
 	/* input: prevout(32) index(4) varint scriptlen script seq(4) */
-	add  x14, x10, #36      /* ptr to scriptlen varint */
-	VARINTP 12, x14, x9, .Lid_fail  /* len -> x12 */
+	/* VAL-8: bound the 36 fixed bytes BEFORE the scriptlen varint at +36
+	 * (the old macro peeked [x10+36] with no bound on the fixed field -- up
+	 * to 35 bytes past end on a truncated buffer). */
+	add  x14, x10, #36	/* ptr to scriptlen varint */
+	cmp  x14, x9
+	b.hs .Lid_fail
+	VARINTP 12, x14, x9, .Lid_fail	/* len -> x12 */
 	add  x15, x14, x12
 	add  x15, x15, #4       /* + seq */
 	cmp  x15, x9
@@ -284,7 +301,10 @@ tx_txid:
 .Lid_next_out:
 	cbz  x13, .Lid_outs_done
 	/* output: value(8) varint scriptlen script */
-	add  x14, x10, #8       /* ptr to scriptlen varint */
+	/* VAL-8: bound the value(8) field before the scriptlen varint at +8. */
+	add  x14, x10, #8	/* ptr to scriptlen varint */
+	cmp  x14, x9
+	b.hs .Lid_fail
 	VARINTP 12, x14, x9, .Lid_fail
 	add  x15, x14, x12
 	cmp  x15, x9

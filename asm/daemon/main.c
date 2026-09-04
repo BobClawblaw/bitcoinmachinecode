@@ -7490,6 +7490,15 @@ int main(int argc, char** argv){
          * isolation (no network dependency). Same ONE poll() loop, same
          * node_sync-from-tip + node_announce_tip outbound legs, same forked
          * inbound serving. */
+        /* VAL-11 harness follow-up: chainparams_select above armed the MAINNET
+         * powLimit, but this mode exists for fixtures whose synthetic blocks
+         * mine 0x207fffff (the regtest powLimit -- real mainnet-difficulty PoW
+         * is ~2e9 nonces/block, not a harness cost). Per the VAL-5 remediation
+         * principle -- harness paths that never arm a rule must not be gated
+         * by it -- disarm the powLimit COMPARE here only. The VAL-11 nBits
+         * range gates (fNegative / zero / overflow) stay: they are free and
+         * consensus. The live serve path keeps the fully armed check. */
+        { extern unsigned int pow_pow_limit_bits; pow_pow_limit_bits = 0; }
         int port = atoi(argv[3]);
         const char* peer[] = { argv[4] };
         int out_port = atoi(argv[5]);

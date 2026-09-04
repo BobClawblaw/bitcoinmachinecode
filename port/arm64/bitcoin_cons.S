@@ -149,6 +149,8 @@ cons_verify:
 	mov  x1, x21
 	mov  x2, x25
 	bl   merkle_root
+	strb w0, [sp, #16]              /* VAL-6: merkle_root's mutation flag
+	                                * (CVE-2012-2459); sp+16..63 are unused */
 	/* compare mkout vs block+36 (32 bytes) */
 	add  x9, sp, #96
 	add  x10, x19, #36
@@ -164,6 +166,13 @@ cons_verify:
 	b.ne .Lcn_fail
 	cmp  x3, x5
 	b.ne .Lcn_fail
+	/* VAL-6: a mutated tree (a real sibling pair byte-identical at any
+	 * level) shares its root AND its block hash with the genuine block --
+	 * storing it would displace the real block forever and stall UTXO
+	 * tracking. Core rejects bad-txns-duplicate WITHOUT invalidating the
+	 * header: a plain fail here, .Lcn_fail's w0=0 path. */
+	ldrb w9, [sp, #16]
+	cbnz w9, .Lcn_fail
 	mov  w0, #1
 	b    .Lcn_ret
 .Lcn_fail:

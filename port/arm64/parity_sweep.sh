@@ -237,6 +237,11 @@ NAMED_SKIP = {
                   "4 bytes into a 1-byte slot -- trips the stack canary under "
                   "the AAPCS64 frame layout; the module itself verified correct "
                   "(BIP32 vector 1 byte-exact via a canary-free harness)",
+    "test_sha256": "CRY-1's dispatch probe is x86 CPUID inline asm (leaves "
+                  "0/1/7 -- impossible constraint on AArch64); the ARM sha256 "
+                  "dispatch probes ID_AA64ISAR0_EL1.SHA2 directly, and its "
+                  "block-level equivalence is pinned by fuzz_sha256 vs "
+                  "hashlib plus the KAT/taproot suites (all green)",
 }
 
 def map_incdir(d):
@@ -285,6 +290,17 @@ for tgt, r in sorted(rules.items()):
     name = tgt.split("/", 1)[1]
     # NOTE: $@ is NOT pre-substituted -- map_token turns it into -o parity_out/name
     recipe = expand(" ".join(r["recipe"]))
+    # The 2026-09-04 batch introduced the first $^ recipes in the Makefile's
+    # history (test_tx_bounds_fuzz/test_pow_check/test_scr7_cms_bounds).  The
+    # sweep has no automatic deps injector -- map_token($^) only returns None
+    # -- so substitute the mapped dependency list into the recipe BEFORE
+    # tokenising ($< the same way, for the first dependency).
+    if "$^" in recipe or "$<" in recipe:
+        dep_argv = [m for m in (map_token(d, name, problems)
+                                for d in expand(r["deps"]).split())
+                    if m is not None]
+        recipe = recipe.replace("$^", " ".join(dep_argv))
+        recipe = recipe.replace("$<", dep_argv[0] if dep_argv else "")
     if "$(NASM)" in recipe or " nasm " in " %s " % recipe:
         out_rows.append((name, "skip", "x86 nasm rule", "", ""))
         continue

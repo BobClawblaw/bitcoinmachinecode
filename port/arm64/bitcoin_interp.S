@@ -2519,6 +2519,14 @@ interp_checkmultisig:
 	/* cache sp value */
 	ldr  x2,[x20,#8]
 	str  x2,[sp,#0x38]	/* spval */
+	/* SCR-7 check 1 (Core's `(int)stack.size() < i` before reading n): the n
+	 * element must exist BEFORE stack_elem_ptr indexes it -- on a shallow
+	 * stack it happily multiplies a NEGATIVE index and hands back a record
+	 * below main_elems, whose garbage length then drives scriptnum_decode
+	 * across whatever precedes the 528,000-byte stack buffer. */
+	ldr  x2,[sp,#0x38]
+	cmp  x2,#1
+	b.lt .cms_err_stackop
 	/* ---- nKeys = stacktop(1) ---- */
 	ldr  x2,[sp,#0x38]
 	sub  x2,x2,#1
@@ -2553,6 +2561,15 @@ interp_checkmultisig:
 	mov  w0,#SE_OP_COUNT
 	b    .err_set
 1:
+	/* SCR-7 check 2 (Core's `i += nKeysCount; if (stack.size() < i)`): the m
+	 * element must exist BEFORE it is read -- placed exactly where Core
+	 * places it, after the opcount charge, before the nSigs decode. */
+	ldr  w2,[sp,#0x48]
+	add  w2,w2,#2
+	ldr  x3,[sp,#0x38]
+	cmp  x3,x2
+	b.lt .cms_err_stackop
+2:
 	/* ---- nSigs = stacktop(nkeys+2) ---- */
 	ldr  w2,[sp,#0x48]
 	add  w2,w2,#2
@@ -2827,6 +2844,10 @@ interp_checkmultisig:
 	b    .err_set
 .err_nulldummy:
 	mov  w0,#SE_SIG_NULLDUMMY
+	b    .err_set
+.cms_err_stackop:
+	/* SCR-7: Core's INVALID_STACK_OPERATION for a missing n/m element. */
+	mov  w0,#SE_INVALID_STACK_OPERATION
 	b    .err_set
 .cms_err_sigder:
 	mov  w0,#SE_SIG_DER

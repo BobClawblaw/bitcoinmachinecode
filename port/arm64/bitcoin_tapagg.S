@@ -40,7 +40,7 @@
 .set BP_BUF, 0
 
     .section .rodata
-t_spkbig: .string "prevout script too large for taproot aggregate sighash"
+t_spkbig: .string "prevout script too large"
 t_oom:    .string "out of memory"
 t_moved:  .string "internal: taproot arena moved during build"
 t_sizing: .string "internal: taproot arena sizing pass disagreed"
@@ -83,7 +83,14 @@ tapagg_build_asm:
     mov  x25, x6      /* txlen */
     mov  x26, x7      /* reason */
 
-    /* ---- sizing pass: splen = sum(1 + sl); reject sl >= 0xfd ---- */
+    /* ---- sizing pass: splen = sum(cslen(sl) + sl); reject sl > 10000 ----
+     * SCR-5 (audit 2026-09-03): the run carries a REAL minimal CompactSize
+     * per entry (1 byte under 0xfd, 3 bytes up to 0xffff), exactly like the
+     * C twin in daemon/tx_verify.c and Core's ser_compactsize. The old
+     * `sl >= 0xfd -> reject` made every taproot spend with a >= 253-byte
+     * co-input script a false reject vs the live chain. The cap mirrors
+     * TXV_SPK_CAP = consensus MAX_SCRIPT_SIZE (the C caller enforces it too;
+     * the twins must reject identically). */
     str  xzr, [sp, #L_SPLEN]
     str  xzr, [sp, #L_K]
 .size_loop:
@@ -98,9 +105,17 @@ tapagg_build_asm:
     add  x5, sp, #L_SL
     blr  x21
     ldr  w9, [sp, #L_SL]
+    mov  w11, #10000                /* TA_SPK_CAP = MAX_SCRIPT_SIZE */
+    cmp  w9, w11
+    b.hi .r_spkbig
+    mov  x11, #1                    /* cslen: 1 byte under 0xfd ... */
     cmp  w9, #0xfd
-    b.hs .r_spkbig
-    add  x9, x9, #1
+    b.hs .ta_sz3
+    add  x9, x9, x11                /* cslen + sl */
+    b    .ta_szdone
+.ta_sz3:
+    add  x9, x9, #3                 /* ... 3 bytes up to 0xffff (cap 10000) */
+.ta_szdone:
     ldr  x10, [sp, #L_SPLEN]
     add  x10, x10, x9
     str  x10, [sp, #L_SPLEN]
@@ -173,13 +188,21 @@ tapagg_build_asm:
     ldr  x10, [sp, #L_BASE]
     cmp  x9, x10
     b.ne .r_moved
-    /* invariant 2: sl < 0xfd && w + 1 + sl <= splen */
+    /* invariant 2: sl <= cap && w + cslen(sl) + sl <= splen (SCR-5) */
     ldr  w9, [sp, #L_SL]
-    cmp  w9, #0xfd
-    b.hs .r_sizing
+    mov  x12, #10000                /* TA_SPK_CAP */
+    cmp  w9, w12
+    b.hi .r_sizing
     ldr  x10, [sp, #L_W]
     add  x10, x10, x9
-    add  x10, x10, #1
+    mov  x11, #1
+    cmp  w9, #0xfd
+    b.hs .ta_wr3
+    add  x10, x10, x11              /* + cslen (1) */
+    b    .ta_wr4
+.ta_wr3:
+    add  x10, x10, #3               /* + cslen (3) */
+.ta_wr4:
     ldr  x11, [sp, #L_SPLEN]
     cmp  x10, x11
     b.hi .r_sizing
@@ -204,12 +227,24 @@ tapagg_build_asm:
     ldr  x12, [sp, #L_AM]
     ldr  x13, [sp, #L_V]
     str  x13, [x12, x10, lsl #3]
-    /* sp[w++] = sl ; memcpy(sp+w, spk, sl) ; w += sl */
+    /* sp[w++] = compactsize(sl); memcpy(sp+w, spk, sl); w += sl  (SCR-5) */
     ldr  x12, [sp, #L_SP]
     ldr  w13, [sp, #L_SL]
     ldr  x10, [sp, #L_W]
-    strb w13, [x12, x10]
+    cmp  w13, #0xfd
+    b.hs .ta_wrbig
+    strb w13, [x12, x10]            /* 1-byte length */
     add  x10, x10, #1
+    b    .ta_wrcopy
+.ta_wrbig:
+    mov  w15, #0xfd
+    strb w15, [x12, x10]            /* 0xfd prefix; sl <= 10000 by invariant
+    /* 2, so the LE16 length below fits */
+    add  x16, x12, x10
+    add  x16, x16, #1
+    strh w13, [x16]
+    add  x10, x10, #3
+.ta_wrcopy:
     ldr  x14, [sp, #L_SPK]
     mov  x16, #0
 .spk_loop:
