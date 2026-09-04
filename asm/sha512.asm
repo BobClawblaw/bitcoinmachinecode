@@ -72,10 +72,6 @@ H512:
     dq 0x510e527fade682d1, 0x9b05688c2b3e6c1f
     dq 0x1f83d9abfb41bd6b, 0x5be0cd19137e2179
 
-section .bss
-align 16
-Wbuf: resb 80*8
-
 section .text
 
 ; ============================================================================
@@ -125,10 +121,28 @@ sha512_block:
     push r15
     push rbp
     mov  rbp, rsp
-    sub  rsp, 0x20                 ; [rbp-8]=T1, [rbp-16]=tmp, [rbp-24]=Maj
+    ; ---- CRY-4 (audit 2026-09-03): the 80-word schedule lives on the STACK.
+    ;
+    ; It was `Wbuf: resb 80*8` in .bss -- one buffer shared by every caller in
+    ; the process. Two threads hashing concurrently overwrote each other's
+    ; schedule mid-round and both produced wrong digests, silently. That is
+    ; exactly the class of defect behind the schnorr false-reject incident
+    ; (secp256k1_schnorr.asm), and it was latent here only because every
+    ; SHA-512 user -- BIP32 and BIP39 derivation, wallet_crypter, wallet_store,
+    ; the RPC key paths -- happens to run under rpc_server.c's g_exec_lock.
+    ; Nothing enforced that, and a future caller from a tx_verify worker or
+    ; the ZMQ/i2p threads would have got wrong child keys: getnewaddress
+    ; handing out an address nobody can spend.
+    ;
+    ; 640 bytes is a multiple of 16, so RSP keeps the residue the old
+    ; reservation gave it -- entry 8 -> 5 pushes -> 0 -> push rbp -> 8 ->
+    ; sub -> 8 -- and this function makes no calls in any case. The scalar
+    ; locals stay where they were at [rbp-8], [rbp-16], [rbp-24]; the schedule
+    ; sits BELOW them and the two regions do not overlap.
+    sub  rsp, 0x2A0                ; 0x20 locals + 0x280 (80*8) schedule
     mov  r12, rdi                ; state
     mov  r13, rsi                ; block
-    lea  rbx, [Wbuf]             ; W base
+    lea  rbx, [rbp-0x2A0]        ; W base -- per-call, not per-process
 
     ; ---- W[0..15] = big-endian words ----
     xor  rcx, rcx
@@ -259,7 +273,7 @@ sha512_block:
     add  [r12+40], rsi
     add  [r12+48], rdi
     add  [r12+56], r8
-    add  rsp, 0x20
+    add  rsp, 0x2A0                ; CRY-4: must match the reservation above
     pop  rbp                       ; save area is ABOVE rbp -- rbp pops first
     pop  r15
     pop  r14
