@@ -2265,6 +2265,54 @@ long utxo_live_recover_partial_block(void* store_buf){
 long utxo_live_recover_at_boot(void* store_buf){
     if (g_recovery_checked) return g_recovery_result;
     g_recovery_checked = 1;
+
+    /* ---------------------------------------------------------------- STO-1
+     * The applied height must never be AHEAD of the archive tip.
+     *
+     * reorg_execute unapplies heights tip..fork+1 one at a time -- each
+     * utxo_live_unapply_block is durable immediately through the WAL -- but
+     * rewrites the persisted applied height only AFTER the whole loop, in
+     * utxo_live_rewind_to. Nothing marks "disconnect in progress". A crash
+     * between archive_truncate_safe and utxo_live_rewind_to therefore leaves
+     * index tip = fork while applied = the old tip T.
+     *
+     * utxo_live_catchup's guard is `tip <= g_applied_height`, which conflates
+     * "caught up" with "applied is ahead of the archive" and returns 0 for
+     * both. The node then appends the new branch's blocks and NEVER APPLIES
+     * ANY OF THEM: permanent divergence, and the audit's own note is that it
+     * happens "with no log line".
+     *
+     * Detecting it HERE rather than in catchup is deliberate. Mid-reorg,
+     * tip < applied is a legitimate transient -- archive_truncate_safe lowers
+     * the tip before utxo_live_rewind_to lowers applied -- so a check in
+     * catchup could fire spuriously and invent a new way to stop a healthy
+     * node. At boot no reorg can be in flight, so the condition is
+     * unambiguous.
+     *
+     * This does NOT fix STO-1. The per-block ordering the audit asks for
+     * (persist_applied_height(h-1) -> unapply(h) -> undo_discard(h), with an
+     * idempotent replay over the retained undo file) is a change to the
+     * durability ordering of the UTXO set and needs a crash-injection test;
+     * it stays open. What this does is turn the silent half into a loud,
+     * fail-closed halt, so the divergence is announced instead of served. */
+    {
+        long tip = *(int*)((char*)store_buf + 24);
+        if (tip >= 0 && g_applied_height > tip){
+            fprintf(stderr,
+                "[utxo_live] FATAL: applied height %ld is AHEAD of the archive tip %ld.\n"
+                "[utxo_live]   This is the signature of a crash during a reorg, between the\n"
+                "[utxo_live]   archive truncation and the applied-height rewind (audit STO-1).\n"
+                "[utxo_live]   Continuing would append the new branch and apply none of it,\n"
+                "[utxo_live]   diverging permanently and silently. Refusing to start.\n"
+                "[utxo_live]   Recover with: reindex-chainstate (rebuilds the set from the\n"
+                "[utxo_live]   archive), or restore the datadir from a snapshot.\n",
+                g_applied_height, tip);
+            g_halted = 1;
+            g_recovery_result = -1;
+            return -1;
+        }
+    }
+
     g_recovery_result = utxo_live_recover_partial_block(store_buf);
     return g_recovery_result;
 }
