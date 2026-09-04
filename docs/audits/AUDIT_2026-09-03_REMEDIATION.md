@@ -562,10 +562,15 @@ No CRITICAL, HIGH or MEDIUM finding is now unaddressed except `NET-10`, which
 is scoped and deliberately not started (`docs/audits/NET-10_ADDRMAN_SCOPE.md`).
 **67 LOW and 33 INFO findings have never been examined.**
 
-`MEM-10` needs revisiting: `serve_rejects_attach` and `serve_rejects_clear`
-have production call sites, but `serve_rejects_has` and `serve_rejects_note`
-have NONE outside tests. The recent-rejects filter is allocated, attached and
-cleared on every block connect, and never consulted or populated -- so the
-startup line `[mempool] recent-rejects filter: 128 KB shared` currently
-reports a filter that does nothing. This is pre-existing on `main`, not a
-merge casualty.
+**Correction (same day).** An earlier revision of this section, and the commit
+message of `13d2317`, claimed `MEM-10` was half-wired -- that its filter was
+attached and cleared but never consulted or populated. That was WRONG, and the
+error was a grep for the wrong symbol names: the functions are
+`serve_reject_has` / `serve_reject_note` (singular), not `serve_rejects_*`.
+MEM-10 is fully wired and matches Core's `AlreadyHaveTx` / `m_recent_rejects`
+semantics: `bitcoin_serve.asm:591` consults the filter before sending a
+getdata, and `daemon/tx_accept.c` records a refusal at both final-verdict
+sites (script failure, line 953; final policy failure, line 971), while
+deliberately NOT recording the reconsiderable fee class (-28, which a CPFP
+child can overturn) or missing inputs (-25, which the orphan pool re-tries).
+The startup line reports a filter that does exactly what it says.
