@@ -1269,6 +1269,15 @@ POLICYOBJS := bitcoin_mempool.o bitcoin_utxo.o
 tests/test_mempool_evict: tests/test_mempool_evict.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_evict.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 
+# test_mempool_evict_64k -- MEM-2 (audit 2026-09-03): the chunk evictor's
+# working arrays used to be fixed 65,536-entry statics behind `if (n > 65536)
+# return 0;`, while the pool and policy graph are sized for ~1M entries. Once
+# the blob filled with more than 64K entries in it, every accept failed
+# "mempool full" at any feerate, with no eviction and no floor bump. Runs a
+# 90,000-entry pool, so it costs a few seconds.
+tests/test_mempool_evict_64k: tests/test_mempool_evict_64k.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_evict_64k.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+
 tests/test_mempool_chunks: tests/test_mempool_chunks.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_chunks.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 
