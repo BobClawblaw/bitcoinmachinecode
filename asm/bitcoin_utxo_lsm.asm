@@ -1180,7 +1180,18 @@ utxo_lsm_put:
     mov  [rsp+16], r11
     call utxo_store_put
     add  rsp, 0x18
-    mov  r14d, eax
+    ; UTX-3 (audit 2026-09-03): SIGN-EXTEND the callee's status.
+    ;   utxo_store_put returns a 64-bit -1 on a failed WAL drain (.fail: mov
+    ;   rax,-1). `mov r14d, eax` zero-extends it, so the -1 reached callers as
+    ;   4294967295: utxo_live.c's `if (r == -1 || r == 2) ctx->fatal = 1` was
+    ;   false, the block kept going, and the created output was in neither the
+    ;   memtable nor the WAL. The block-boundary drain then retried the
+    ;   EARLIER buffered bytes, succeeded once the disk recovered, and the
+    ;   checkpoint landed with the coin permanently absent -- a silent
+    ;   divergence from Core's chainstate, which is the one failure mode this
+    ;   store exists to make impossible. utxo_lsm_del had exactly this bug and
+    ;   exactly this fix already; this is the sibling it left behind.
+    movsxd r14, eax
     cmp  r14d, 1
     jne  .lp_no_live_inc
     inc  qword [r12+88]
@@ -1203,7 +1214,7 @@ utxo_lsm_put:
 .lp_skip_flush:
     cmp  r15d, 1
     je   .lp_err
-    mov  eax, r14d
+    mov  rax, r14                 ; UTX-3: return the full 64-bit status
     jmp  .lp_done
 .lp_err:
     mov  rax, -1
