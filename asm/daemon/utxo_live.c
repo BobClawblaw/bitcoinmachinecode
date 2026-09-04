@@ -134,6 +134,7 @@ extern int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long heig
  * valid for the immediately preceding call. Returns NULL + n=0 if no call
  * has run. */
 extern const u64* txvb_last_tx_in_sums(u64* n_out);
+extern unsigned long long* txvb_last_tx_sigops(unsigned long long* n);   /* SCR-6 */
 extern void block_hash(u8 out[32], const u8 hdr[80]);
 
 /* Rolling undo-data retention window. Stage A's own design note calls for
@@ -1542,6 +1543,32 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
                     g_apply_height, (unsigned long long)ptx_out[0], (unsigned long long)cap);
             g_last_reject = "bad-cb-amount";
             return 0;
+        }
+    }
+
+    /* ---- Phase 4.6 (SCR-6, audit 2026-09-03): ConnectBlock's sigop budget.
+     * Core accumulates GetTransactionSigOpCost(tx, view, flags) per tx in the
+     * SAME loop as CheckTxInputs and rejects bad-blk-sigops the moment the
+     * running total exceeds MAX_BLOCK_SIGOPS_COST (80,000). Order between
+     * that and the value ledger above cannot change WHICH blocks are rejected
+     * (both are block-level rejections before any apply), so this runs as its
+     * own pass over tx_verify.c's per-tx cost export. -- */
+    {
+        unsigned long long sgn = 0;
+        const u64* tx_sigops = (const u64*)txvb_last_tx_sigops(&sgn);
+        if (!tx_sigops || sgn < ntx){
+            g_last_reject = "internal: sigop ledger export missing";
+            return 0;
+        }
+        u64 sigops_cost = 0;
+        for (u64 t=0; t<ntx; t++){
+            sigops_cost += tx_sigops[t];
+            if (sigops_cost > 80000ULL){
+                fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-blk-sigops (%llu > 80000)\n",
+                        g_apply_height, (unsigned long long)sigops_cost);
+                g_last_reject = "bad-blk-sigops";
+                return 0;
+            }
         }
     }
 

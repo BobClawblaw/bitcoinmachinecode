@@ -241,6 +241,46 @@ int main(void){
     ck("coinbase with real prevout rejected", utxo_live_dryrun_block(blk, (u64)blen, n1), 0);
     ck_reason("reason bad-cb-missing", "bad-cb-missing");
 
+    /* ---- SCR-6 (audit 2026-09-03): block sigop budget. A spend tx whose
+     * OUTPUT script is 1001 OP_CHECKMULTISIG bytes: the inaccurate legacy
+     * count charges 20 each = 20020, times WITNESS_SCALE_FACTOR 4 = 80080 >
+     * MAX_BLOCK_SIGOPS_COST (80,000). The output script is only CREATED (never
+     * executed), so the spend itself stays valid and every earlier gate
+     * passes -- the sigop budget is the only reason to refuse. Pre-fix there
+     * is no budget at all and the block dry-runs clean (the negative control). */
+    {
+        /* build coinbase (valid h push) + a spend whose output script is fat.
+         * Mirrors build_block's layout exactly; only tx1's output script and
+         * the merkle root change. */
+        u8 cb[96], cbtxid[32];
+        long cblen = mk_coinbase_h(cb, cbtxid, n1, 50000000ULL);
+        u8 sp[2048], sptxid[32];
+        u8* q = sp;
+        put32(q,1); q+=4; *q++ = 1;                       /* version, 1 input */
+        memcpy(q, h0_cbtxid, 32); q+=32; put32(q,0); q+=4;/* prevout = h0 cb:0 */
+        *q++ = 0; put32(q,0xffffffffu); q+=4;             /* empty scriptSig, seq */
+        *q++ = 1; put64(q, 40000000ULL); q+=8;            /* 1 output, value */
+        *q++ = 0xfd; *q++ = 0xe9; *q++ = 0x03;            /* script len 1001 (0x03e9) LE16 */
+        memset(q, 0xae, 1001); q += 1001;                 /* 1001 OP_CHECKMULTISIG */
+        put32(q,0); q+=4;                                 /* locktime */
+        long splen = q - sp;
+        tx_txid(sptxid, sp, (unsigned long)splen, g_txid_scratch, sizeof g_txid_scratch);
+        u8 pair[64], root[32];
+        memcpy(pair, cbtxid, 32); memcpy(pair+32, sptxid, 32); sha256d(root, pair, 64);
+        static u8 fat[4096];
+        u8* p = fat;
+        put32(p,1); p+=4; memcpy(p, prev, 32); p+=32; memcpy(p, root, 32); p+=32;
+        put32(p, 1800000000u+(u32)n1); p+=4; put32(p,0x207fffffu); p+=4; put32(p,0); p+=4;
+        *p++ = 2; memcpy(p, cb, (size_t)cblen); p += cblen;
+        memcpy(p, sp, (size_t)splen); p += splen;
+        long flen = p - fat;
+        u32 nonce=0; while (!pow_check(fat)) { nonce++; put32(fat+76, nonce); }
+        u8 fhash[32]; block_hash(fhash, fat);
+        ck("SCR-6: block with 80,080 sigop-cost rejected",
+           utxo_live_dryrun_block(fat, (u64)flen, n1), 0);
+        ck_reason("reason bad-blk-sigops", "bad-blk-sigops");
+    }
+
     /* PURITY: every reject above mutated nothing */
     ck("UTXO count unchanged", utxo_live_count(), count0);
     ck("applied height unchanged", utxo_live_applied_height(), n1 - 1);
