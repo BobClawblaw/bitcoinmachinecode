@@ -947,13 +947,52 @@ static int psbt_field_hex(rj_val* o, const char* name, const unsigned char* v, u
     char* h=malloc(n*2+1); if (!h) return 0; bin_to_hex(h,v,n); rj_obj_set(o,name,rj_str(h)); free(h); return 1;
 }
 typedef struct { const unsigned char* k; unsigned long kl; const unsigned char* v; unsigned long vl; } psbt_kv;
+/* WAL-14 (audit 2026-09-03): the identical unbounded shape psbt_update.c's
+ * parse_map had. srw_varint reads up to NINE bytes from a bare pointer, and
+ * this walked `p` forward by lengths it never compared with blen, so a PSBT
+ * with a 0xff-varint key length ran past the buffer and every later read came
+ * from wherever it landed. Bounded the same way.
+ *
+ * A malformed map reports ZERO entries and consumes the rest of the buffer,
+ * rather than the -1 psbt_update.c's parse_map returns. That is deliberate:
+ * this function has twenty-four call sites with several different failure
+ * conventions, and threading a new negative return through all of them is a
+ * far larger and more error-prone change than the bounds themselves. Zero
+ * entries lands every caller in its own "missing required field" path, which
+ * is the correct answer for a malformed PSBT, and setting *pp to the end
+ * stops a later map being parsed from a stale offset. */
+static int psbt_srw_varint_b(const unsigned char* p, unsigned long avail,
+                             unsigned long* out, unsigned long* cc){
+    if (avail < 1) return 0;
+    if (p[0] < 0xfd){ *cc=1; *out=p[0]; return 1; }
+    if (p[0]==0xfd){ if (avail < 3) return 0; *cc=3;
+        *out=(unsigned long)p[1]|((unsigned long)p[2]<<8); return 1; }
+    if (p[0]==0xfe){ if (avail < 5) return 0; *cc=5;
+        *out=(unsigned long)p[1]|((unsigned long)p[2]<<8)|
+             ((unsigned long)p[3]<<16)|((unsigned long)p[4]<<24); return 1; }
+    if (avail < 9) return 0;
+    *cc=9;
+    { unsigned long v=0; for(int i=0;i<8;i++) v|=((unsigned long)p[1+i])<<(8*i); *out=v; }
+    return 1;
+}
 static int psbt_parse_map(const unsigned char* buf, long blen, long* pp, psbt_kv* kvs, int cap){
     int n=0; long p=*pp;
-    while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if(kl==0){ *pp=p; return n; }
-        const unsigned char* k=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* v=buf+p; p+=vl;
+    if (p < 0 || p > blen){ *pp = blen; return 0; }
+    while (p<blen){
+        unsigned long cc, kl, vl;
+        if (!psbt_srw_varint_b(buf+p, (unsigned long)(blen-p), &kl, &cc)) goto bad;
+        p += (long)cc;
+        if (kl==0){ *pp=p; return n; }
+        if (kl > (unsigned long)(blen-p)) goto bad;
+        const unsigned char* k=buf+p; p += (long)kl;
+        if (!psbt_srw_varint_b(buf+p, (unsigned long)(blen-p), &vl, &cc)) goto bad;
+        p += (long)cc;
+        if (vl > (unsigned long)(blen-p)) goto bad;
+        const unsigned char* v=buf+p; p += (long)vl;
         if(n<cap){ kvs[n].k=k;kvs[n].kl=kl;kvs[n].v=v;kvs[n].vl=vl;n++; }
     }
-    *pp=p; return n;
+bad:
+    *pp = blen; return 0;
 }
 static int psbt_union(psbt_kv* dst, int dn, int dcap, const psbt_kv* src, int sn){
     for(int i=0;i<sn && dn<dcap;i++){
