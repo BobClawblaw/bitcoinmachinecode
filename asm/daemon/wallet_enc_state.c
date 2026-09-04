@@ -62,6 +62,14 @@ void wenc_set_mnemonic_provider(int (*fn)(char*, long, char*, long)){ g_mn_provi
  * this module keeps no knowledge of where the daemon holds them. */
 static void (*g_mn_forget)(void);
 void wenc_set_mnemonic_forget(void (*fn)(void)){ g_mn_forget = fn; }
+
+/* WAL-3 (rest): g_seed holds the unlocked wallet's seed for as long as the
+ * wallet is unlocked, so it gets the same treatment as the daemon's own
+ * copies -- out of swap, out of core files. Called once from main.c, which
+ * reports the result; this module has no logging of its own to lose. */
+int wenc_lock_secrets(void){
+    return secure_lock(g_seed, sizeof g_seed);
+}
 int wenc_current_mnemonic(char* out, long cap, char* pass_out, long pcap){
     return g_mn_provider ? g_mn_provider(out, cap, pass_out, pcap) : 0;
 }
