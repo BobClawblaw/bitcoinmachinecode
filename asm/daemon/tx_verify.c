@@ -1357,6 +1357,81 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
     }
 }
 
+/* SCR-6 (audit 2026-09-03): per-tx sigop COST for the LAST
+ * tx_verify_block_connect_all call -- the exact quantity Core's ConnectBlock
+ * accumulates (nSigOpsCost += GetTransactionSigOpCost(tx, view, flags);
+ * reject bad-blk-sigops above MAX_BLOCK_SIGOPS_COST=80,000). Same file-scope
+ * single-threaded export discipline as the VAL-1 fees ledger. */
+static u64* g_tx_sigops = 0;  static u64 g_tx_sigops_cap = 0;  static u64 g_tx_sigops_n = 0;
+unsigned long long* txvb_last_tx_sigops(unsigned long long* n){ if(n) *n = g_tx_sigops_n; return (unsigned long long*)g_tx_sigops; }
+
+/* The last data push of a scriptSig (Core's subscript source for both the
+ * P2SH accurate sigop count and the P2SH-wrapped witness lookup). Mirrors
+ * daemon/tx_accept.c's sgc_last_push: any non-push opcode (opcode > OP_16)
+ * yields 0, exactly like CScript::GetSigOpCount(const CScript&). */
+static int txv_sgc_last_push(const u8* sc, unsigned long sl, const u8** out, unsigned long* outl){
+    const u8* p = sc; const u8* end = sc + sl;
+    const u8* last = 0; unsigned long lastl = 0;
+    while (p < end){
+        u8 op = *p++;
+        unsigned long n;
+        if (op <= 0x4b) n = op;
+        else if (op == 0x4c){ if (p >= end) return 0; n = *p++; }
+        else if (op == 0x4d){ if (p+2 > end) return 0; n = (unsigned long)p[0] | ((unsigned long)p[1]<<8); p += 2; }
+        else if (op == 0x4e){ if (p+4 > end) return 0; n = (unsigned long)p[0]|((unsigned long)p[1]<<8)|((unsigned long)p[2]<<16)|((unsigned long)p[3]<<24); p += 4; }
+        else if (op <= 0x60) { last = p; lastl = 0; continue; }   /* OP_1NEGATE/OP_N */
+        else return 0;                                            /* opcode > OP_16 */
+        if ((unsigned long)(end - p) < n) return 0;
+        last = p; lastl = n; p += n;
+    }
+    if (!last) return 0;
+    *out = last; *outl = lastl;
+    return 1;
+}
+
+extern long tx_legacy_sigops(const u8* tx, unsigned long txlen);
+extern long script_sigops_accurate(const u8* script, unsigned long len);
+
+/* Core WitnessSigOps for one witness program. */
+static u64 txv_witness_sigops(int wver, unsigned long proglen, const u8* wit_last, unsigned long wit_lastl){
+    if (wver != 0 || !wit_last) return 0;
+    if (proglen == 20) return 1;                              /* P2WPKH */
+    if (proglen == 32) return (u64)script_sigops_accurate(wit_last, wit_lastl);  /* P2WSH */
+    return 0;
+}
+
+/* GetTransactionSigOpCost for ONE non-coinbase tx, from the Phase-1-resolved
+ * flat entries. All reads are of data Phase 1 already bounded. */
+static u64 txv_sigop_cost_tx(const u8* tx, u64 txlen, const txvb_in_t* flat,
+                             u64 lo, u64 hi, u64 flags){
+    u64 cost = (u64)tx_legacy_sigops(tx, (unsigned long)txlen) * 4ULL;   /* WITNESS_SCALE_FACTOR */
+    for (u64 gi = lo; gi < hi; gi++){
+        const txvb_in_t* in = &flat[gi];
+        const u8* spk = g_spk_pool.buf + in->spk_off;
+        unsigned long spkl = in->spklen;
+        int is_p2sh = (spkl == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87);
+        const u8* red = 0; unsigned long redl = 0;
+        if (is_p2sh && (flags & (1ULL<<0)) /* SCRIPT_VERIFY_P2SH, Core bit */
+            && in->scriptSiglen &&
+            txv_sgc_last_push(in->scriptSig, in->scriptSiglen, &red, &redl) && red)
+            cost += (u64)script_sigops_accurate(red, redl) * 4ULL;
+        if (flags & TXV_FLAG_WITNESS){
+            /* native witness program on the prevout spk... */
+            const u8* ws = spk; unsigned long wsl = spkl;
+            if (is_p2sh){ ws = red; wsl = redl; }              /* ...or P2SH-wrapped */
+            if (ws && wsl >= 4 && wsl <= 42 &&
+                (ws[0] == 0x00 || (ws[0] >= 0x51 && ws[0] <= 0x60)) &&
+                (unsigned long)ws[1] + 2 == wsl && ws[1] >= 2 && ws[1] <= 40){
+                int wver = ws[0] == 0x00 ? 0 : ws[0] - 0x50;
+                const u8* wlast = in->nwit ? in->wit[in->nwit-1] : 0;
+                unsigned long wlastl = in->nwit ? in->witlen[in->nwit-1] : 0;
+                cost += txv_witness_sigops(wver, ws[1], wlast, wlastl);
+            }
+        }
+    }
+    return cost;
+}
+
 /* tx_verify_block_connect_all(txs, ntx, height, block_hash32, lst, u, bx,
  * &fail_tx_index, &reason) -> 1 accept / 0 reject. txs[0] MUST be the
  * coinbase (skipped entirely -- matches Bitcoin's own "coinbase is always
@@ -1474,7 +1549,24 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
 
     u64 total_nin = 0;
     for (u64 t=1; t<ntx; t++) total_nin += txs[t].pn_in;
-    if (total_nin == 0) return 1;
+
+    /* SCR-6 ledger sizing + the coinbase's legacy cost, BEFORE the total_nin
+     * early-return, so the exported array is valid on EVERY success path (the
+     * caller sums it unconditionally). With zero non-coinbase inputs no tx has
+     * a P2SH/witness addend (those need resolved inputs), so the whole block's
+     * cost is just the legacy per-tx scan. */
+    {
+        u64* p = grow_arena((void**)&g_tx_sigops, &g_tx_sigops_cap, ntx * sizeof(u64));
+        if (!p){ *reason = "out of memory"; *fail_tx_index = 0; return 0; }
+        memset(g_tx_sigops, 0, ntx * sizeof(u64));
+        g_tx_sigops_n = ntx;
+        g_tx_sigops[0] = (u64)tx_legacy_sigops(txs[0].ptr, (unsigned long)txs[0].len) * 4ULL;
+        if (total_nin == 0){
+            for (u64 t=1; t<ntx; t++)
+                g_tx_sigops[t] = (u64)tx_legacy_sigops(txs[t].ptr, (unsigned long)txs[t].len) * 4ULL;
+            return 1;
+        }
+    }
 
     static txvb_in_t* g_flat = 0;        static u64 g_flat_cap = 0;
     static txvb_result_t* g_res = 0;     static u64 g_res_cap = 0;
@@ -1547,6 +1639,17 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
             *fail_tx_index = in->tx_index; goto fail;
         }
     }
+
+    /* ---- SCR-6 (audit 2026-09-03): finish the per-tx sigop COST ledger
+     * (sized at the top of this function; the coinbase's legacy cost is
+     * already in g_tx_sigops[0]). Core's ConnectBlock accumulates
+     * GetTransactionSigOpCost(tx, view, flags) per tx and rejects
+     * bad-blk-sigops above MAX_BLOCK_SIGOPS_COST=80,000; the gate itself
+     * runs in the caller (apply_block_inner), next to the fee/subsidy check,
+     * so the dry-run path (submitblock / GBT proposal) answers it too. -- */
+    for (u64 t=1; t<ntx; t++)
+        g_tx_sigops[t] = txv_sigop_cost_tx(txs[t].ptr, txs[t].len, flat,
+                                           ranges[t].lo, ranges[t].hi, flags);
 
     /* ---- Phase 1.5 (taproot phase A): sequential, cheap, and the whole
      * reason Phase 2 can now take taproot. For every transaction with at
