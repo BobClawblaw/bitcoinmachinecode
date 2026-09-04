@@ -100,6 +100,7 @@ ceiling restored, 919 consecutive "mempool full" refusals starting at entry
 | STO-4 | HIGH | Prune guards checked only below the gate, the region `store_prune` never walks | `d725cc6` |
 | NET-3 | HIGH | No inbound inactivity bound; 189 idle sockets refused every honest peer | `05c979b` |
 | MEM-5 | HIGH | A high-feerate child could evict the parent it spends and be stored unlinked | `9510813` |
+| STO-1 (part) | HIGH | An applied height ahead of the archive tip now halts loudly at boot instead of diverging silently | `4f0da7b` |
 
 Every one carries a regression test and a verified negative control. Two are
 worth singling out because the control reproduced the audit's own figures
@@ -116,6 +117,33 @@ Two results found while fixing, not in the audit:
   backwards for `IsFinalTx`, where missing a non-final input means accepting a
   block Core rejects. Finality now uses an exact flag set during the walk
   instead of reading the capped array.
+
+---
+
+### Two gate defects found by running `make test` end to end
+
+Both predate this pass, and each was hiding the other.
+
+* **`make test` was unrunnable.** `prereq-check` is the gate's FIRST target
+  and had been failing since SCR-5 landed (`17bf36b`). All 17 findings were
+  one rule: `tests/test_scr5_spkrun` uses `$(TAPSIGHASHOBJS)` 1,300 lines
+  before it is defined, and Make expands a prerequisite list immediately while
+  recipes expand lazily — so its prerequisites collapsed to just the `.c`
+  file. It linked and passed while never rebuilding when the interpreter
+  changed. Fixed in `bbb8990`; `prereq-check` now passes across all 443 rules
+  for the first time.
+
+* **SCR-5 left a stale assertion.** With the gate running, `make test` failed
+  on `test_taproot_parallel_arena` section 5, which asserted that a
+  >= 253-byte co-input prevout script is REFUSED — precisely the false reject
+  SCR-5 removed as a consensus defect. Verified pre-existing by running it
+  against `f725cb7` in a throwaway worktree, where it fails identically. The
+  assertion was updated to the SCR-5 behaviour and inverted so a regression to
+  the one-byte encoding fires it (`6021e94`). **No code changed.**
+
+The pairing is worth stating plainly: a consensus fix shipped with a test that
+contradicted it, and the tool that would have caught that was itself broken by
+the same commit.
 
 ---
 
@@ -161,6 +189,16 @@ not in the audit.
   change and wants its own pass. MEM-4 (claims/outreg overflow) is the same
   shape and belongs with it.
 
+* **STO-1** — the boot guard is in (`4f0da7b`): an applied height ahead of the
+  archive tip halts loudly instead of appending a branch it never applies. The
+  per-block ordering the audit asks for — `persist_applied_height(h-1)` →
+  `unapply(h)` → `undo_discard(h)`, with an idempotent replay over the
+  retained undo file — is NOT done. It changes the durability ordering of the
+  UTXO set and needs a crash-injection test. The other crash window (applied =
+  T with undo already discarded, so the set is at T−k while `tip == applied`
+  and nothing looks wrong) is not detected by the guard and needs that
+  ordering fix.
+
 * **NET-3** — the inactivity bound is in (`05c979b`), so the DoS is capped at
   20 minutes per slot. Core's `AttemptToEvictConnection` is NOT implemented,
   so at capacity this node still refuses rather than evicting. `-peertimeout`
@@ -169,9 +207,8 @@ not in the audit.
 
 ### 4.2 Open, CRITICAL+HIGH
 
-| Finding | One line |
-|---|---|
-| STO-1 | Crash mid-reorg leaves the UTXO set rewound with an old applied height and no undo files; coinstats adopts it. Not started. |
+None outright. STO-1 is partial (below) and MEM-3/MEM-4 are partial; nothing
+in the 29 is now completely untouched.
 
 ### 4.3 Open, MEDIUM and below
 
