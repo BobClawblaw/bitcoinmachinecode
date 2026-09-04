@@ -23,6 +23,7 @@
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include "secure_zero.h"   /* WAL-3: a memset the optimiser may not delete */
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -52,6 +53,16 @@ void wcrypt_derive(const char* pass, long passlen, const u8 salt[WC_SALT],
     for (u32 i = 0; i + 1 < iters; i++) sha512_full(d, d, 64);
     memcpy(key, d, 32);
     memcpy(iv, d + 32, 16);
+    /* WAL-3 (audit 2026-09-03): `buf` is STATIC, so the wallet passphrase (and
+     * the salt) stayed in .bss for the life of the process after every KDF
+     * call -- including after walletlock had zeroed the seed and the operator
+     * believed nothing sensitive was resident. `d` is the derived key and iv,
+     * equally worth clearing once it has been copied out.
+     *
+     * secure_zero, not memset: both are dead afterwards, so a plain memset is
+     * exactly the store an optimiser is allowed to delete. */
+    secure_zero(buf, sizeof buf);
+    secure_zero(d, sizeof d);
 }
 
 static int wc_rand(u8* out, long n){

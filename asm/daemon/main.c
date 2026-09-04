@@ -38,6 +38,7 @@
 #include <stdbool.h>
 #include <fcntl.h>
 #include <sys/file.h>          /* DMN-1: flock() for the datadir lock */
+#include "secure_zero.h"    /* WAL-3: a memset the optimiser may not delete */
 #include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
 /* VAL-5 / MEM-1: the generated per-height script-flag mask
  * (bitcoin_script_flags.asm, from validation/gen_script_flags.py). */
@@ -5944,6 +5945,20 @@ static int provide_wallet_mnemonic(char* out, long cap, char* pass_out, long pca
     snprintf(pass_out, (size_t)pcap, "%s", g_wallet_bip39pass);
     return 1;
 }
+/* WAL-3 (audit 2026-09-03): registered with wallet_enc_state.c and called once
+ * encryptwallet has sealed the mnemonic AND verified the container opens. From
+ * that moment the container is the source of truth -- wenc_unlock re-derives
+ * the seed from it -- so these two must not outlive it. They used to sit here
+ * for the life of the process: `walletlock` zeroed the seed and reported a
+ * locked wallet while the provider went on serving the mnemonic and its BIP39
+ * passphrase, both readable from /proc/<pid>/mem, a swap partition or a
+ * hibernation image. secure_zero, because a plain memset on a buffer that is
+ * dead afterwards is exactly the store -O2 may delete. */
+static void forget_wallet_mnemonic(void){
+    secure_zero(g_wallet_mnemonic, sizeof g_wallet_mnemonic);
+    secure_zero(g_wallet_bip39pass, sizeof g_wallet_bip39pass);
+    fprintf(stderr, "[wallet] mnemonic sealed and verified: plaintext copy cleared from memory\n");
+}
 
 /* -persistmempool reload on its own thread (see serve_start_rpc). */
 static pthread_t g_mempool_reload_thread;
@@ -6058,6 +6073,8 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern int  wenc_boot(const char*);
       wenc_set_seed_installer(wenc_install_seed);
       wenc_set_mnemonic_provider(provide_wallet_mnemonic);
+      { extern void wenc_set_mnemonic_forget(void (*)(void));
+        wenc_set_mnemonic_forget(forget_wallet_mnemonic); }
       /* multi-wallet (rpc_wallet_ops.c): loadwallet/createwallet install the
        * switched-to wallet's seed through the SAME installer the encryption
        * unlock path uses -- one seed slot, one way to write it. */
@@ -6104,7 +6121,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
               /* keep the mnemonic available so encryptwallet can seal it */
               snprintf(g_wallet_mnemonic, sizeof g_wallet_mnemonic, "%s", mn);
               snprintf(g_wallet_bip39pass, sizeof g_wallet_bip39pass, "%s", wpass);
-              memset(mn, 0, sizeof mn);
+              secure_zero(mn, sizeof mn);      /* WAL-3 */
               fprintf(stderr, "[rpc] wallet store %s loaded (wallet RPCs live)\n", cand[wi]);
           } else {
               fprintf(stderr, "[rpc] wallet store %s present but not loadable "

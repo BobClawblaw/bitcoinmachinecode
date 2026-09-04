@@ -15,6 +15,7 @@
  * seed access already makes.
  */
 #include <stdio.h>
+#include "secure_zero.h"   /* WAL-3: a memset the optimiser may not delete */
 #include "log_ts.h"   /* timestamped fprintf(stderr), like every other daemon line */
 #include <string.h>
 #include <fcntl.h>
@@ -51,6 +52,16 @@ void wenc_set_seed_installer(void (*fn)(const u8*)){ g_set_live_seed = fn; }
  * daemon entry point. NULL provider (e.g. tests that never encrypt) => 0. */
 static int (*g_mn_provider)(char*, long, char*, long);
 void wenc_set_mnemonic_provider(int (*fn)(char*, long, char*, long)){ g_mn_provider = fn; }
+/* WAL-3 (audit 2026-09-03): once encryptwallet has sealed the mnemonic and
+ * verified the container, the daemon's plaintext copy is no longer the source
+ * of truth -- wenc_unlock re-derives everything from the container -- and it
+ * must not outlive the sealing. It used to sit in main.c statics for the life
+ * of the process, so a node the operator believed locked still served the
+ * mnemonic and its BIP39 passphrase through the provider, and both were
+ * readable from /proc/<pid>/mem. Injected the same way the provider is, so
+ * this module keeps no knowledge of where the daemon holds them. */
+static void (*g_mn_forget)(void);
+void wenc_set_mnemonic_forget(void (*fn)(void)){ g_mn_forget = fn; }
 int wenc_current_mnemonic(char* out, long cap, char* pass_out, long pcap){
     return g_mn_provider ? g_mn_provider(out, cap, pass_out, pcap) : 0;
 }
@@ -103,7 +114,7 @@ int wenc_encrypt(const char* mn, const char* mn_pass, const char* wallet_pass, l
     /* kept only until the container has been verified below, then wiped */
     static char payload_check[WENC_MNMAX*2];
     memcpy(payload_check, payload, (size_t)(pl < (long)sizeof payload_check ? pl : (long)sizeof payload_check));
-    memset(payload, 0, sizeof payload);
+    secure_zero(payload, sizeof payload);
     if (n < 0) return 0;
     char p[600]; wenc_path(p, sizeof p);
     char tmp[640]; snprintf(tmp, sizeof tmp, "%s.tmp", p);
@@ -138,21 +149,26 @@ int wenc_encrypt(const char* mn, const char* mn_pass, const char* wallet_pass, l
               if (gl == pl && !memcmp(got, payload_check, (size_t)pl)) ok = 1;
           }
       }
-      memset(got, 0, sizeof got);
-      memset(back, 0, sizeof back);
+      secure_zero(got, sizeof got);
+      secure_zero(back, sizeof back);
       if (!ok){
           unlink(p);                       /* discard the unverified container */
-          memset(payload_check, 0, sizeof payload_check);
+          secure_zero(payload_check, sizeof payload_check);
           return 0;                        /* plaintext store deliberately kept */
       } }
 
     /* verified -- now the plaintext store can go (both candidate locations) */
     { char d1[600]; snprintf(d1, sizeof d1, "%s/bmcwallet.dat", g_enc_dir[0]?g_enc_dir:"."); unlink(d1);
       unlink("bmcwallet.dat"); }
-    memset(payload_check, 0, sizeof payload_check);
+    secure_zero(payload_check, sizeof payload_check);
     memcpy(g_blob, seal, n); g_bloblen = n;
     g_encrypted = 1; g_unlocked = 0;
-    memset(g_seed, 0, sizeof g_seed);
+    secure_zero(g_seed, sizeof g_seed);
+    /* WAL-3: `seal` is ciphertext and may stay, but everything upstream of it
+     * must go. The plaintext store is unlinked above; the daemon's in-memory
+     * copy of the mnemonic goes here, at the one point where the container is
+     * proven to open. */
+    if (g_mn_forget) g_mn_forget();
     if (g_set_live_seed) g_set_live_seed(0);
     return 1;
 }
@@ -170,7 +186,7 @@ int wenc_unlock(const char* pass, long plen, long seconds){
     const char* mp = nl ? nl + 1 : "";
     if (nl) *nl = 0;
     wallet_mnemonic_seed(g_seed, mn, mp[0] ? mp : 0, mp[0] ? (long)strlen(mp) : 0);
-    memset(payload, 0, sizeof payload);
+    secure_zero(payload, sizeof payload);
     g_unlocked = 1;
     g_unlock_until = seconds > 0 ? (long)time(NULL) + seconds : 0;
     if (g_set_live_seed) g_set_live_seed(g_seed);
@@ -178,7 +194,7 @@ int wenc_unlock(const char* pass, long plen, long seconds){
 }
 
 void wenc_lock(void){
-    memset(g_seed, 0, sizeof g_seed);
+    secure_zero(g_seed, sizeof g_seed);
     g_unlocked = 0; g_unlock_until = 0;
     if (g_set_live_seed) g_set_live_seed(0);
 }

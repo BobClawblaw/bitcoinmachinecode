@@ -242,12 +242,40 @@ not in the audit.
 
 ### 4.2 Open, CRITICAL+HIGH
 
-None.
+**MEM-3 (HIGH) -- the 24-parent cap.** Still open, and this pass established
+why neither cheap option works, so the next person does not have to rediscover
+it:
+
+* *Reject when a transaction has more in-pool parents than can be recorded*
+  (the audit's first suggestion) was implemented and then reverted. It rests
+  on Core's pre-v31 25-ancestor chain limit, but this node implements v31's
+  CLUSTER limits (64 transactions / 101 kvB), under which a child of 63
+  parents is legal and Core accepts it. Refusing turns a silent corruption
+  into a false reject and fails this project's own `test_mempool_policy` case
+  "child C joins them: cluster of exactly 64 accepted".
+
+* *Raise the cap to 63* was measured, not estimated: `mpol_node` grows from
+  184 to 336 bytes, so the policy state goes from 184 MB to 336 MB at the
+  default 1,048,576-node sizing -- **+152 MB** in a MAP_SHARED region several
+  processes map.
+
+* *Have getblocktemplate verify each input resolves* (the audit's other
+  suggestion) would close the dangerous OUTCOME rather than the cause, but
+  GBT has no UTXO view: `rpc_chain.c` reaches the mempool through injected
+  hooks and has no way to tell "this parent confirmed" from "this parent
+  vanished", which is exactly the distinction the check needs. Adding one
+  means the RPC thread reading the live UTXO store the download worker owns.
+
+That leaves the audit's remaining option -- **store parents out of line** --
+as the real fix. It is a layout change to the shared policy state plus a
+rework of every walker that reads `parent[]` (`collect_descendant_txids`, the
+cluster walk, `remove_node`'s relink and index renumbering), and it wants its
+own pass with its own gate run rather than being appended to this one.
 
 ### 4.3 MEDIUM and below
 
-44 MEDIUM, 68 LOW, 33 INFO in the audit. **Twenty-two MEDIUM are now
-closed**; the rest, and everything LOW/INFO, are untouched.
+44 MEDIUM, 68 LOW, 33 INFO in the audit. **Thirty MEDIUM are now closed**;
+the rest, and everything LOW/INFO, are untouched.
 
 | Finding | What it was | Commit |
 |---|---|---|
@@ -276,6 +304,14 @@ closed**; the rest, and everything LOW/INFO, are untouched.
 | RPC-3 | `getpeerinfo.id` and `disconnectnode` used different numbering | `6e0c4ec` |
 | RPC-4 | A slow, unauthenticated sender pinned an RPC worker indefinitely | `d13c7ea` |
 | (unlisted) | `find_header` never saw the last header line: a body in a second segment was a parse error, and an Authorization header sent last got 401 | `d13c7ea` |
+| MEM-7 | RBF accepted a replacement paying more in total at a fraction of the feerate | `204b9d8` |
+| MEM-6 | The RBF eviction was applied even when the replacement could not be stored | `204b9d8` |
+| MEM-13 | Dead blob bytes forced a spurious eviction and a 12-hour mempoolminfee bump | `204b9d8` |
+| MEM-8 | Reorg reconcile left ghosts above 8,192 transactions | `204b9d8` |
+| VAL-10 | Non-canonical CompactSize and a superfluous witness record both parsed | `e99bd1c` |
+| SER-3 (part) | The shared C readers now enforce canonical CompactSize and MAX_SIZE | `e99bd1c` |
+| CRY-4 (part) | The BIP39 passphrase had no bound; the HMAC key stayed in .bss | `e99bd1c` |
+| DMN-4 | Config sections and `no` negation were not implemented | `e99bd1c` |
 
 **NET-6 needs no separate change: VAL-11 closed it.** The audit asked for
 Core's four `CheckProofOfWork` checks and a clamp on `diff_target`'s

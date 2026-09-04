@@ -887,9 +887,63 @@ bip39_mnemonic_to_seed:
     jnz  .se
 
     mov  eax, 1
-    jmp  .b39s_ret
+    jmp  .b39s_wipe
+    ; ---- WAL-3 (audit 2026-09-03): the derivation leaves the SEED behind ----
+    ;
+    ; m39_acc IS the 64-byte seed -- the copy above hands the caller a duplicate
+    ; and the original stayed in .bss for the life of the process. m39_prev and
+    ; m39_cur hold PBKDF2 intermediates derived from it, m39_salt holds
+    ; "mnemonic" || the BIP39 passphrase, and m39_msg holds the same plus the
+    ; block index. So `walletlock` could zero g_seed and still leave the seed
+    ; and the passphrase readable through /proc/<pid>/mem, a swap partition or
+    ; a hibernation image.
+    ;
+    ; Cleared unconditionally on the way out, including the refusal path --
+    ; on which m39_salt already holds the prefix of an over-long passphrase.
 .b39s_toolong:
     xor  eax, eax                    ; CRY-4: passphrase over m39_salt capacity
+.b39s_wipe:
+    push rax
+    xor  eax, eax
+    lea  rdi, [m39_salt]
+    mov  rcx, 512
+.zs1:
+    mov  byte [rdi], al
+    inc  rdi
+    dec  rcx
+    jnz  .zs1
+    lea  rdi, [m39_msg]
+    mov  rcx, 520
+.zs2:
+    mov  byte [rdi], al
+    inc  rdi
+    dec  rcx
+    jnz  .zs2
+    ; Each by name rather than one sweep over the three: they are declared
+    ; consecutively today, but nothing enforces that, and a future `align`
+    ; between them would silently turn one sweep into a partial wipe.
+    lea  rdi, [m39_prev]
+    mov  rcx, 64
+.zs3:
+    mov  byte [rdi], al
+    inc  rdi
+    dec  rcx
+    jnz  .zs3
+    lea  rdi, [m39_cur]
+    mov  rcx, 64
+.zs4:
+    mov  byte [rdi], al
+    inc  rdi
+    dec  rcx
+    jnz  .zs4
+    lea  rdi, [m39_acc]
+    mov  rcx, 64
+.zs5:
+    mov  byte [rdi], al
+    inc  rdi
+    dec  rcx
+    jnz  .zs5
+    pop  rax
 .b39s_ret:
     add  rsp, 0x40
     pop  rbp
