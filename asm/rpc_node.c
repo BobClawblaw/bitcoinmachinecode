@@ -190,13 +190,20 @@ static void services_names(unsigned long long s, rj_val* arr){
 static int cmd_getpeerinfo(rj_val** res){
     rj_val* arr = rj_arr();
     if (g_status){
-        int id = 0;
         for (int i = 0; i < RPC_MAX_PEERS; i++){
             const rpc_peer_t* p = &g_status->peers[i];
             if (!p->used) continue;
             if (p->inbound && p->pid > 0 && kill((pid_t)p->pid, 0) != 0 && errno == ESRCH) continue;   /* a serve child that died with its slot */
             rj_val* o = rj_obj();
-            rj_obj_set(o, "id", rj_numf("%d", id++));
+            /* RPC-3 (audit 2026-09-03): report the peer's OWN monotonic
+             * nodeid, not a counter over the live slots. The counter and the
+             * worker's disconnect matcher (which used the raw outbound leg
+             * index) agreed only while every slot below was occupied and no
+             * inbound slot came first; after any leg churn an operator who
+             * read `id: 5` here and ran `disconnectnode "" 5` dropped a
+             * different, healthy peer and got success back. Core's NodeId is
+             * unique for the process lifetime and never reused; so is this. */
+            rj_obj_set(o, "id", rj_numf("%lld", (long long)p->nodeid));
             rj_obj_set(o, "addr", rj_str(p->addr));
             { char h[17]; snprintf(h, sizeof h, "%016llx", (unsigned long long)p->services);
               rj_obj_set(o, "services", rj_str(h)); }

@@ -213,7 +213,13 @@ int main(void){
     st.peers[0].conn_time = 1700000000LL;
     st.peers[0].bytes_sent = 4096; st.peers[0].bytes_recv = 1048576;
     st.peers[0].last_send = 1700000100LL; st.peers[0].last_recv = 1700000200LL;
+    st.peers[0].nodeid = 0;
+    /* RPC-3: a deliberately NON-contiguous slot with a NON-contiguous nodeid.
+     * Slots 1 and 2 are free -- the state left by ordinary leg churn -- so the
+     * old counter would have called this peer "1" while the worker's
+     * disconnect matcher meant leg index 3. Both now say 7. */
     st.peers[3].used = 1; strcpy(st.peers[3].addr, "5.6.7.8:8333"); st.peers[3].proto = 70016;
+    st.peers[3].nodeid = 7;
     rpc_node_set_status(&st);
     r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
     ck("getpeerinfo dispatched to array", rc == 1 && r && r->typ == RJ_ARR);
@@ -230,9 +236,20 @@ int main(void){
       ck("peer0 lastrecv", p0 && S(p0,"lastrecv") && !strcmp(S(p0,"lastrecv"), "1700000200"));
       rj_val* sn = p0 ? rj_obj_get(p0,"servicesnames") : 0;
       ck("peer0 servicesnames NETWORK+WITNESS+NETWORK_LIMITED", sn && sn->typ==RJ_ARR && sn->nitems==3); }
-    /* second peer should get id 1 (contiguous ids, not the slot index) */
+    /* ---- RPC-3 (audit 2026-09-03) ----
+     *
+     * This used to assert "peer1 id 1", with a comment reading "contiguous
+     * ids, not the slot index". That pinned the defect: getpeerinfo counted
+     * live entries while daemon/main.c's RPC_CTL_DISCONNECT matched the raw
+     * outbound leg index, so with slots 1 and 2 free an operator who read
+     * `id: 1` and ran `disconnectnode "" 1` dropped leg 1 -- a different peer,
+     * or nothing -- and got success back. getpeerinfo now reports the peer's
+     * own monotonic, never-reused nodeid, which is what the worker matches. */
     { rj_val* p1 = (r && r->nitems>1) ? r->items[1] : 0;
-      ck("peer1 id 1", p1 && S(p1,"id") && !strcmp(S(p1,"id"), "1")); }
+      ck("RPC-3 peer in slot 3 reports its own nodeid 7, not the position 1",
+         p1 && S(p1,"id") && !strcmp(S(p1,"id"), "7"));
+      ck("RPC-3 ...and it is NOT the old contiguous counter",
+         !(p1 && S(p1,"id") && !strcmp(S(p1,"id"), "1"))); }
     rj_free(r);
     memset(st.peers, 0, sizeof st.peers);   /* reset for the remaining checks */
 

@@ -2022,6 +2022,9 @@ static void rpc_fill_peer_slot(int slot, const char* host){
     }
     { extern int rp_version_frelay(const unsigned char*, long);
       pr->relaytxes = rp_version_frelay(p, len) != 0; }   /* Core relaytxes: the peer's fRelay */
+    /* RPC-3: a fresh, never-reused id for this connection. Assigned before
+     * `used` so a reader that sees the slot live always sees a real id. */
+    pr->nodeid = __sync_fetch_and_add(&g_node_status->next_nodeid, 1);
     pr->used = 1;   /* publish last: readers see a fully-formed slot */
 }
 
@@ -4871,16 +4874,51 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 fprintf(stderr,"[ctl] ping queued to %d leg(s)\n", sent);
                 result = 1;
             } else if(op == RPC_CTL_DISCONNECT){
+                /* ---- RPC-3 (audit 2026-09-03) ----
+                 *
+                 * This matched `num` against the raw outbound leg index i,
+                 * while getpeerinfo published a COUNTER over live slots. The
+                 * two agree only while every slot below is occupied and no
+                 * inbound slot precedes, so after any churn (slot 1 free,
+                 * slots 0/2/3 live) the operator's chosen id named a
+                 * different peer -- and the RPC still returned success.
+                 * Inbound peers could not be disconnected at all: the loop
+                 * ran to mux_n_out, and the address branch compared only
+                 * outbound hosts.
+                 *
+                 * Both sides now key on rpc_peer_t.nodeid, which is unique
+                 * for the life of the process, and the search covers every
+                 * slot. An inbound slot is a forked serve child, so it is
+                 * dropped with SIGTERM on its published pid -- the same
+                 * signal the parent uses at shutdown. */
                 char want[128]; ctl_ip_only(arg, want, sizeof want);
-                for(int i = 0; i < mux_n_out; i++){
-                    if(mux_out_fd[i] < 0) continue;
-                    char have[128]; ctl_ip_only(mux_out_host[i], have, sizeof have);
+                if(g_node_status) for(int i = 0; i < RPC_MAX_PEERS; i++){
+                    rpc_peer_t* q = &g_node_status->peers[i];
+                    if(!q->used) continue;
+                    char have[128]; ctl_ip_only(q->addr, have, sizeof have);
                     int hit = (want[0] && !strcmp(have, want)) ||
-                              (!want[0] && num == (long long)i);
+                              (!want[0] && num == (long long)q->nodeid);
                     if(!hit) continue;
-                    fprintf(stderr,"[ctl] disconnecting %s (leg %d)\n", mux_out_host[i], i);
+                    if(q->inbound){
+                        if(q->pid > 0 && kill((pid_t)q->pid, SIGTERM) == 0){
+                            fprintf(stderr,"[ctl] disconnecting inbound %s (nodeid %lld, pid %d)\n",
+                                    q->addr, (long long)q->nodeid, q->pid);
+                            q->used = 0; result = 1;
+                        } else {
+                            fprintf(stderr,"[ctl] inbound %s (nodeid %lld) has no live child to signal\n",
+                                    q->addr, (long long)q->nodeid);
+                        }
+                        break;
+                    }
+                    if(i >= mux_n_out || mux_out_fd[i] < 0){
+                        fprintf(stderr,"[ctl] outbound nodeid %lld (slot %d) is no longer connected\n",
+                                (long long)q->nodeid, i);
+                        q->used = 0; break;
+                    }
+                    fprintf(stderr,"[ctl] disconnecting %s (nodeid %lld, leg %d)\n",
+                            mux_out_host[i], (long long)q->nodeid, i);
                     bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1;
-                    if(g_node_status) g_node_status->peers[i].used = 0;
+                    q->used = 0;
                     result = 1; break;
                 }
             } else if(op == RPC_CTL_ADDNODE){
