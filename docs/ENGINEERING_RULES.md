@@ -310,7 +310,7 @@ See the repo README for the full topology. The traps that recur:
 
 - `pkill -f <pattern>` matches the ssh command line itself and kills the
   session. Use explicit PIDs.
-- `/tmp` on the host is not writable by `svc`.
+- `/tmp` on the host is not writable by the service account.
 - Heredocs inside single-quoted ssh commands break on quoting. Write the
   script locally, `scp` it, run it, delete it.
 - macOS `sed -i` requires a backup-suffix argument. A failed `sed` in an

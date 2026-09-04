@@ -292,8 +292,28 @@ systemctl is-active bmc-bitcoind
 `config/logrotate-bmc.conf` rotates `logs/*/*.log` when a file exceeds
 **`size 2M`** (the knob), keeps 60 compressed rotations, and uses
 `copytruncate` so systemd's append descriptor stays valid. It is driven by
-`bmc-logrotate.timer` (5 min after boot, then every 15 min) whose service
-runs `logrotate -s /var/lib/logrotate/bmc-status <repo>/config/logrotate-bmc.conf`.
+`bmc-logrotate.timer` (5 min after boot, then every 15 min).
+
+**The timer reads `/etc/bmc/logrotate-bmc.conf`, not the repo copy.**
+logrotate 3.21 refuses a config that is group-writable or not root-owned, so
+a file inside the service-user-owned checkout can never be the live config --
+pointing the timer at the repo copy is why rotation silently did nothing for
+a week (audit 2026-09-02, N6).
+
+The repo copy is the SOURCE. Its `su` line carries a `__SVCUSER__`
+placeholder rather than a hard-coded account name, because the account name
+is host configuration and committing it publishes who runs the node.
+Substitute and install in one deliberate step, run AS the service user so
+`id -un` resolves to the right account:
+
+```
+sudo sed "s/__SVCUSER__/$(id -un)/g" config/logrotate-bmc.conf \
+  | sudo install -m 0644 -o root -g root /dev/stdin /etc/bmc/logrotate-bmc.conf
+```
+
+A leftover `__SVCUSER__` makes logrotate fail loudly on the next tick, which
+is the safe direction -- a wrong-but-plausible username would quietly rotate
+as the wrong account.
 
 ## Upgrading and rollback
 

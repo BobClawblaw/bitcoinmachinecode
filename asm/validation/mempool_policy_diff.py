@@ -19,7 +19,7 @@ CORE = "/storage/bitcoin-core-source/build/bin/bitcoind"
 CLI  = "/storage/bitcoin-core-source/build/bin/bitcoin-cli"
 HERE = os.path.dirname(os.path.abspath(__file__))
 BMCD = os.path.join(HERE, "..", "daemon", "bitcoind")
-WORK = "/tmp/claude-1000/-home-svc/29c98d46-9392-4daf-90ad-daa99f7f277c/scratchpad/mpolicy-diff"
+WORK = os.path.join(os.environ.get("TMPDIR", "/tmp"), "bmc-mpolicy-diff")
 CORE_DIR = WORK + "/core"; BMC_DIR = WORK + "/bmc"
 # Core binds its tor TARGET on P2P+1 even with listenonion=0 (the same
 # collision DEPLOYMENT.md records for 18445) -- keep P2P+1 free.
