@@ -74,10 +74,32 @@ static unsigned long long bf_map(unsigned long long h, unsigned long long nm){
 
 /* ---- bit writer --------------------------------------------------------- */
 typedef struct { unsigned char* out; unsigned long cap; unsigned long bitpos; int overflow; } bf_bw;
+/* STO-2 (audit 2026-09-03): the writer OWNS every byte it touches.
+ *
+ * This used to OR into a buffer the CALLER was expected to have zeroed, and
+ * bf_basic_build zeroed only the first 64 KiB of it (see the removed memset
+ * below). Every caller passes a REUSED buffer -- bfilter_index.c's static
+ * BFI_MAX_FILTER malloc, build_block_filters.c's `static u8 filter[1u<<20]`,
+ * rpc_chain.c's `static unsigned char flt[1<<20]` -- so any filter whose
+ * bitstream ran past 65,536 bytes came out as `previous_filter_bits |
+ * this_filter_bits`. A basic filter is ~2.6 bytes per element, so ~25k
+ * distinct scripts in one block crosses the line, which consolidation-era and
+ * inscription-era mainnet blocks do. The stored filter, its sha256d, and
+ * every bf_header after it then diverge from Core permanently.
+ *
+ * Clearing the byte on FIRST TOUCH removes the caller contract entirely: the
+ * bitstream no longer depends on the buffer's prior contents at any size, so
+ * there is no zeroing window left to get wrong. It is also strictly cheaper
+ * than the memset it replaces -- O(bytes actually written) instead of
+ * O(cap) -- which matters because cap is 1 MiB and a typical filter is a few
+ * KiB. The trailing bits of the final partial byte are zero for the same
+ * reason: that byte was cleared when its first bit was written. */
 static void bw_bit(bf_bw* w, int bit){
     unsigned long byte = w->bitpos >> 3;
+    unsigned bitidx = (unsigned)(w->bitpos & 7);
     if (byte >= w->cap){ w->overflow = 1; return; }
-    if (bit) w->out[byte] |= (unsigned char)(0x80u >> (w->bitpos & 7));
+    if (bitidx == 0) w->out[byte] = 0;
+    if (bit) w->out[byte] |= (unsigned char)(0x80u >> bitidx);
     w->bitpos++;
 }
 static void bw_bits(bf_bw* w, unsigned long long v, int n){
@@ -219,7 +241,7 @@ long bf_basic_build(const unsigned char* block, unsigned long blocklen,
         for (int i = 0; i < 4; i++) out[o++] = (unsigned char)(n >> (8*i));
     }
     bf_bw w = { out + o, cap - o, 0, 0 };
-    memset(out + o, 0, cap - o > 65536 ? 65536 : cap - o);   /* bits OR in */
+    /* No memset: bw_bit clears each byte on first touch (STO-2). */
     unsigned long long prev = 0;
     for (unsigned long i = 0; i < n; i++){
         unsigned long long d = h[i] - prev;

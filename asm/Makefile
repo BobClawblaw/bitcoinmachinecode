@@ -1277,6 +1277,15 @@ POLICYOBJS := bitcoin_mempool.o bitcoin_utxo.o
 tests/test_mempool_evict: tests/test_mempool_evict.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_evict.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 
+# test_mempool_evict_64k -- MEM-2 (audit 2026-09-03): the chunk evictor's
+# working arrays used to be fixed 65,536-entry statics behind `if (n > 65536)
+# return 0;`, while the pool and policy graph are sized for ~1M entries. Once
+# the blob filled with more than 64K entries in it, every accept failed
+# "mempool full" at any feerate, with no eviction and no floor bump. Runs a
+# 90,000-entry pool, so it costs a few seconds.
+tests/test_mempool_evict_64k: tests/test_mempool_evict_64k.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_evict_64k.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+
 tests/test_mempool_chunks: tests/test_mempool_chunks.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_chunks.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 
@@ -1419,6 +1428,14 @@ tests/test_lsm_lost_tombstones_bad: tests/test_lsm_lost_tombstones.c tests/bitco
 # test_utxo_lost_tombstones -- incident 2026-09-01 at the daemon layer (see
 # the file); _bad links tests/bitcoin_utxo_lsm_badsparse.o in place of the
 # shipped LSM object and must reproduce the flush-time rejects and the loss.
+# test_utxo_put_wal_fail -- UTX-3 (audit 2026-09-03): a failed WAL drain must
+# reach utxo_lsm_put's callers as a NEGATIVE status, not the zero-extended
+# 0xFFFFFFFF that daemon/utxo_live.c's `r == -1` test silently ignored,
+# dropping the created coin from both the memtable and the WAL. Injects the
+# failure with a read-only WAL fd, as the audit's own repro did.
+tests/test_utxo_put_wal_fail: tests/test_utxo_put_wal_fail.c $(REORGOBJS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ tests/test_utxo_put_wal_fail.c $(REORGOBJS) -lpthread
+
 LOSTTOMBSRCS := $(patsubst tests/test_utxo_ghost_resume.c,tests/test_utxo_lost_tombstones.c,$(GHOSTRESUMESRCS))
 REORGOBJS_BADSPARSE := $(patsubst bitcoin_utxo_lsm.o,tests/bitcoin_utxo_lsm_badsparse.o,$(REORGOBJS))
 tests/test_utxo_lost_tombstones: $(LOSTTOMBSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)

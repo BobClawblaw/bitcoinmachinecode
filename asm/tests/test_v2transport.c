@@ -10,6 +10,9 @@
  * sides at once and a single process would deadlock against itself.
  */
 #include <stdio.h>
+#include <sys/resource.h>
+#include <time.h>
+#include <signal.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -176,6 +179,64 @@ int main(void){
       close(fd);
       int st = 0; waitpid(pid, &st, 0);
       ck("  the v1 peer wrote its version message", WIFEXITED(st) && WEXITSTATUS(st) == 0); }
+
+    printf("== NET-2: a partial v1 prefix must time out, not spin a core ==\n");
+    /* THE DEFECT. The responder's detection loop peeks rather than reads, so
+     * the bytes it has seen stay in the receive queue: poll() reports POLLIN
+     * again immediately, recv(MSG_PEEK) returns the same n, and the
+     * `n <= peeked` arm used to `continue` without charging the timeout. One
+     * core pinned, one of the ~189 inbound slots held, forever. A peer needs
+     * to send eight bytes -- the v1 magic plus "vers" -- and then stop.
+     *
+     * Two things are asserted, and BOTH are needed. Only checking that the
+     * handshake returns would pass on a build that spins at 100% until the
+     * timeout finally trips; only checking CPU would pass on a build that
+     * returns instantly for the wrong reason. So: it must fail within a
+     * bounded wall-clock window AND it must have consumed almost no CPU
+     * while waiting. */
+    { int sv[2];
+      socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+      pid_t pid = fork();
+      if (pid == 0){
+          close(sv[0]);
+          /* mainnet magic + the first four bytes of "version", then silence.
+           * bip324_t_feed keeps the transport in BIP324_RECV_MAYBE_V1: it
+           * matches the v1 prefix so far but is short of the 16 bytes needed
+           * to decide. */
+          unsigned char partial[8] = { 0xf9,0xbe,0xb4,0xd9, 'v','e','r','s' };
+          ssize_t w = write(sv[1], partial, sizeof partial); (void)w;
+          /* hold the socket open -- a closed peer would end the loop for a
+           * reason that has nothing to do with the defect */
+          sleep(6);
+          _exit(0);
+      }
+      close(sv[1]);
+      int fd = sv[0];
+
+      struct timespec w0, w1; struct rusage r0, r1;
+      clock_gettime(CLOCK_MONOTONIC, &w0);
+      getrusage(RUSAGE_SELF, &r0);
+      int hs = bmc_v2_handshake(fd, 0, 1500);       /* 1.5 s budget */
+      getrusage(RUSAGE_SELF, &r1);
+      clock_gettime(CLOCK_MONOTONIC, &w1);
+
+      double wall = (double)(w1.tv_sec - w0.tv_sec)
+                  + 1e-9 * (double)(w1.tv_nsec - w0.tv_nsec);
+      double cpu = (double)(r1.ru_utime.tv_sec - r0.ru_utime.tv_sec)
+                 + 1e-6 * (double)(r1.ru_utime.tv_usec - r0.ru_utime.tv_usec)
+                 + (double)(r1.ru_stime.tv_sec - r0.ru_stime.tv_sec)
+                 + 1e-6 * (double)(r1.ru_stime.tv_usec - r0.ru_stime.tv_usec);
+      printf("        partial-prefix handshake: rc=%d wall=%.2fs cpu=%.3fs\n", hs, wall, cpu);
+
+      ck("the handshake gives up rather than hanging", hs == -1);
+      ck("  it ends within twice its timeout", wall < 3.5);
+      /* The spin burns wall-clock worth of CPU; a correct wait burns almost
+       * none. A tenth of the wall time is far above a sleeping loop's cost
+       * and far below a spinning one's. */
+      ck("  and it SLEEPS rather than spinning (cpu << wall)", cpu < wall * 0.10);
+
+      close(fd);
+      kill(pid, SIGKILL); int st = 0; waitpid(pid, &st, 0); }
 
     printf("== an initiator does not silently fall back ==\n");
     /* It has already put 64 random bytes on the wire; a v1 peer would reject

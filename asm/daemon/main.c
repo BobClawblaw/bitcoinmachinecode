@@ -37,6 +37,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <fcntl.h>
+#include <sys/file.h>          /* DMN-1: flock() for the datadir lock */
 #include <sys/mman.h>
 #include "log_ts.h"
 #include "log_phase.h"
@@ -6543,6 +6544,56 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
 }
 
 
+/* ---------------------------------------------------------------- DMN-1
+ * Single-instance guard on the per-chain datadir (audit 2026-09-03).
+ *
+ * Core takes an exclusive lock on <datadir>/.lock in LockDataDirectory()
+ * before touching anything, and aborts with "Cannot obtain a lock on data
+ * directory". This daemon had no equivalent. append.lock is flock'ed only
+ * around individual appends, never held for the process lifetime, and the
+ * only thing that could fail on a co-resident instance was the P2P bind --
+ * and only with listen=1 on the same port. The RPC bind failure is
+ * deliberately non-fatal, so the second instance simply carried on.
+ *
+ * The audit reproduced two full boots on one datadir. That is not a
+ * theoretical race: boot runs archive_trim_derived_tails, which truncate()s
+ * the index.dat / headers.dat / chainwork.dat tails computed from a snapshot
+ * of the index, then zeroes duplicate records, then forks a worker that owns
+ * the single-writer LSM UTXO set. Instance B doing that under instance A's
+ * writer is how 2026-08-31's "a stale co-resident daemon was SIGKILLed and
+ * the survivor stopped applying blocks" (main.c's own note) happens.
+ *
+ * The fd is deliberately LEAKED for the process lifetime -- that is what
+ * holds the lock. It is not FD_CLOEXEC and it is not closed on any path:
+ *   - forked children (the download worker, inbound serve children, the
+ *     compaction child) share the same open file description, so they hold
+ *     the same lock rather than contending for it. An ORPHANED worker
+ *     therefore keeps the datadir locked, which is correct: it is still
+ *     writing to it, and that orphan is one of the ways the audit's failure
+ *     arises.
+ *   - the kernel releases it when the last holder exits, so a SIGKILLed
+ *     daemon leaves no stale lock to clean up.
+ * Called after the per-chain chdir, so ".lock" lands in <datadir>/<chain>,
+ * which is the directory that actually gets written. */
+static int datadir_lock_fd = -1;
+static int datadir_lock_acquire(const char* effdir){
+    datadir_lock_fd = open(".lock", O_RDWR|O_CREAT, 0600);
+    if(datadir_lock_fd < 0){
+        fprintf(stderr,"[boot] FATAL: cannot open %s/.lock: %s\n", effdir, strerror(errno));
+        return 0;
+    }
+    if(flock(datadir_lock_fd, LOCK_EX|LOCK_NB) != 0){
+        if(errno == EWOULDBLOCK)
+            fprintf(stderr,"[boot] FATAL: cannot obtain a lock on data directory %s. "
+                           "bmc-bitcoind is probably already running.\n", effdir);
+        else
+            fprintf(stderr,"[boot] FATAL: cannot lock %s/.lock: %s\n", effdir, strerror(errno));
+        close(datadir_lock_fd); datadir_lock_fd = -1;
+        return 0;
+    }
+    return 1;
+}
+
 int main(int argc, char** argv){
     signal(SIGPIPE, SIG_IGN);   /* broken peer connections must not kill the node */
     /* counting reaper instead of SIG_IGN: we must know how many inbound
@@ -6774,6 +6825,11 @@ int main(int argc, char** argv){
      * caught on the first migrated boot (cookie "enabled" yet unreadable to
      * the CLI, and the 10k-entry mempool.dat silently not reloaded). */
     if(chdir(effdir)!=0){ fprintf(stderr,"[boot] chdir(%s) failed: %s\n", effdir, strerror(errno)); return 1; }
+    /* DMN-1: before ANYTHING touches the datadir -- archive_trim_derived_tails
+     * truncates, genesis seeding writes, the worker fork owns the LSM. */
+    if(!datadir_lock_acquire(effdir)) return 1;
+    /* DMN-1: before ANYTHING touches the datadir -- archive_trim_derived_tails
+     * truncates, genesis seeding writes, the worker fork owns the LSM. */
     if(g_chainp->id != CHAIN_MAIN){
         if(!g_cfg.port_explicit) g_cfg.port = g_chainp->default_port;
         if(!g_chainp->dns_seeds) g_cfg.dnsseed = 0;
