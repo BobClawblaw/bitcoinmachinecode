@@ -7172,6 +7172,18 @@ int main(int argc, char** argv){
        * if it won, every one of its blocks was connected. */
       { extern void reorg_set_header_rules(long);
         reorg_set_header_rules(dlc_bip34_height()); }
+      /* NET-5: the same rules on the INBOUND-BLOCK path. bitcoin_serve.asm's
+       * .do_block appended a peer-pushed block after cons_verify (context-
+       * free) and a prev-hash check only, so a header Core rejects at
+       * ContextualCheckBlockHeader became the durable archive tip at a
+       * height it can never connect at. One call arms all four rules there;
+       * see serve_block_ctx_ok in daemon/tx_accept.c. */
+      { extern void serve_set_header_rules(int, int, int, unsigned int, long);
+        serve_set_header_rules(g_chainp->pow_no_retargeting,
+                               g_chainp->allow_min_difficulty,
+                               g_chainp->enforce_bip94,
+                               g_chainp->pow_limit_bits,
+                               dlc_bip34_height()); }
       /* SAY SO. The check is injected and default-off, so an inert one is
        * indistinguishable from a working one by observing accepted blocks --
        * every block is accepted either way. test_reorg proves the wiring in

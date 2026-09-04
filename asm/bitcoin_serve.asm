@@ -35,6 +35,8 @@ extern serve_tx_gate
 extern serve_inv_gate
 extern serve_mempool_msg
 extern serve_policy_disconnect_log
+; NET-5: contextual header rules for a peer-pushed block (daemon/tx_accept.c)
+extern serve_block_ctx_ok
     extern serve_idx_topup
     extern serve_cfilters
     extern serve_reject_has          ; MEM-10: daemon/serve_rejects.c
@@ -810,6 +812,34 @@ node_serve_loop:
     mov  r14, [s_st]
     jmp  .next                ; does not chain to our tip -> drop
 .blk_chains:
+    ; ---- NET-5 (audit 2026-09-03): the CONTEXTUAL header rules ------------
+    ; Everything above this point is context-free (cons_verify: PoW against
+    ; the header's own nBits, parses, coinbase, merkle root) plus "it extends
+    ; our tip". Core also requires the nBits RETARGET SCHEDULE for this
+    ; height, the median-time-past floor, the 2-hour future ceiling and the
+    ; BIP34/66/65 version rules -- none of which were checked before the
+    ; block was written to the durable archive. Consensus was not at risk
+    ; (utxo_live.c re-checks the schedule at CONNECT), but the archive was: a
+    ; header Core rejects became our tip at a height it can never connect at,
+    ; and the node stalls behind it.
+    ;
+    ; Dropped, never scored -- same reasoning as the cons_verify result
+    ; above: our verifier is not the reference, so a false reject here must
+    ; not ban an honest peer.
+    ;
+    ; serve_block_ctx_ok(st, hdr80) -> 1 accept / 0 reject. Returns 1
+    ; unchanged when the daemon has not armed the rules, so the hermetic
+    ; serve suites and their synthetic chains are unaffected.
+    mov  rdi, [s_st]
+    lea  rsi, [pl_buf]
+    call serve_block_ctx_ok
+    ; restore the loop's live registers from their stable statics, exactly as
+    ; the cons_verify and store_validates_prevhash calls above already do
+    mov  r12, [s_fd]
+    mov  r13, [s_lfd]
+    mov  r14, [s_st]
+    test eax, eax
+    jz   .next
     ; idxscan_append_locked(st, hash, pl_buf, s_plen) -- an inbound peer can
     ; push a block directly (or in response to our own .do_inv-triggered
     ; getdata) in ANY forked serve child, concurrently with the download
