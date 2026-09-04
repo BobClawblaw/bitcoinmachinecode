@@ -63,7 +63,17 @@ static void fake_header_peer(int cfd){
         }
     }
 }
-static void mk_hdr(unsigned char h[80], const unsigned char prev[32], int tag){ memset(h,0,80); h[0]=1; memcpy(h+4,prev,32); h[36]=(unsigned char)tag; }
+static void mk_hdr(unsigned char h[80], const unsigned char prev[32], int tag){ memset(h,0,80); h[0]=1; memcpy(h+4,prev,32); h[36]=(unsigned char)tag;
+    /* VAL-5 (audit 2026-09-03): dlc_fetch_headers now pow_check-gates every
+     * header before hst_append -- these fixtures exercise the FETCH logic, so
+     * mine a nonce until the header satisfies its own (regtest-powLimit)
+     * target. The harness never selects a chain, so pow_pow_limit_bits stays
+     * disarmed and only the hash-vs-target comparison is in play. */
+    h[72]=0xff; h[73]=0xff; h[74]=0x7f; h[75]=0x20;   /* LE 0x207fffff */
+    for (unsigned nz=0; nz<4000000u; nz++){
+        h[76]=nz; h[77]=nz>>8; h[78]=nz>>16; h[79]=nz>>24;
+        if (pow_check(h)) return;
+    } }
 static void mk_page(int ping, int n, unsigned char (*hdrs)[80]){ unsigned o=0; g_hpage[o++]= ping?0xff:0x00; g_hpage[o++]=(unsigned char)n; for(int i=0;i<n;i++){ memcpy(g_hpage+o,hdrs[i],80); o+=80; g_hpage[o++]=0; } g_hpage_len=o; }
 
 int main(void){
@@ -197,6 +207,22 @@ int main(void){
       { /* a fork: overlaps our height 2 with a DIFFERENT block */
         unsigned char f2[80]; mk_hdr(f2, hh1, 0x99); unsigned char fp_[1][80]; memcpy(fp_[0], f2, 80);
         HFETCH(0, 1, fp_, "a page that forks from our chain at a held height: refused, store unchanged (count 4)", res == -1 && hst_count(hst) == 4); }
+      { /* VAL-5 (audit 2026-09-03): a header that CHAINS to our tip but fails
+         * its own PoW must never be appended. Deterministic construction:
+         * nBits exponent 4 / mantissa 1 -> target = 256, i.e. ~2^-248 of all
+         * hashes pass, so nonce 0 fails and no realistic mining succeeds;
+         * the nBits itself is well-formed (passes the VAL-11 range gates --
+         * this exercises the hash-vs-target rejection, not a malformed-bits
+         * one). Before the fix this header was hst_append'ed on linkage
+         * alone: the first live peer could fill headers.dat with garbage. */
+        unsigned char top_rec[112];
+        if (hst_get_at(hst, (unsigned long long)(hst_count(hst) - 1), top_rec) == 1){
+          unsigned char bad[80]; memset(bad, 0, 80);
+          bad[0]=1; memcpy(bad+4, top_rec+80, 32); bad[36]=0x77;
+          bad[72]=0x01; bad[73]=0x00; bad[74]=0x00; bad[75]=0x04;   /* 0x04000001: target=256 */
+          unsigned char bp_[1][80]; memcpy(bp_[0], bad, 80);
+          HFETCH(0, 1, bp_, "a tip-chaining header with FAILING PoW: refused, store unchanged (count 4)", res == -1 && hst_count(hst) == 4);
+        } }
       #undef HFETCH
       if (cwd1[0]) (void)!chdir(cwd1); }
 
