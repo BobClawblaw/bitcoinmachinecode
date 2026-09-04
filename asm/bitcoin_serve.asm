@@ -29,6 +29,7 @@ default rel
 extern g_peer_wants_addrv2
     extern idx_get
     extern serve_inv_bounds
+    extern serve_locator_from
 extern node_relay_flag
 extern serve_tx_gate
 extern serve_inv_gate
@@ -198,6 +199,7 @@ src_buf:   times (1000*18) db 0
 align 16
 s_plen:   dq 0
 s_fh:     dq 0
+s_ghstop: dq -1        ; NET-8: hashStop height for getheaders, -1 = absent/unknown
 s_cmd:    times 16 db 0
 s_cnt:    dq 0
 s_nf:     dq 0        ; notfound entries accumulated for THIS getdata
@@ -1152,33 +1154,42 @@ node_serve_loop:
     jne  .next
     cmp  dword [s_cmd+7], 0x00737265 ; "ers\0"
     jne  .next
-    ; locator hash at pl+5 -> resolve via idx
-    mov  rax, [s_plen]
-    cmp  rax, 5
-    jb   .gh_zero
-    lea  rsi, [pl_buf+5]
-    ; idx_get(ht_idx, pl+5, &fh)
-    mov  rdi, [s_htidx]      ; stable copy
-    ; rsi already = pl+5
-    lea  rdx, [s_fh]
-    call idx_get
-    test rax, rax
-    jz   .gh_from0
-    mov  rax, [s_fh]
-    inc  rax                 ; from = fh+1
-    jmp  .gh_havefrom
-.gh_from0:
-    xor  eax, eax            ; from = 0
-.gh_havefrom:
-    mov  [s_fh], rax     ; from
-    jmp  .gh_build
-.gh_zero:
-    ; unknown locator / empty -> serve from genesis (headers with count 0 means
-    ; "i have nothing"; but reference clients expect headers from the locator).
+    ; ---- NET-8 (audit 2026-09-03): walk the WHOLE locator, honour hashStop.
+    ;
+    ; This used to look up pl+5 -- the FIRST locator hash -- and serve from
+    ; height 0 on a miss, ignoring every other entry and the stop hash, with
+    ; only `plen >= 5` checked (so a 5-byte message read a stale hash out of
+    ; the receive buffer). Every peer one block ahead of us starts its locator
+    ; with a hash we do not have, which the incident report calls "common, not
+    ; rare" -- so each getheaders was answered with 2000 headers from genesis,
+    ; 162 KB, that a Core peer discards as already known.
+    ;
+    ; serve_locator_from does the CompactSize, the bounds and the walk (Core's
+    ; FindForkInGlobalIndex), in C for the same reason serve_inv_bounds is:
+    ; hand-writing a second varint walk in assembly is how the first one went
+    ; wrong. rax = 1 ok / 0 malformed.
+    lea  rdi, [pl_buf]
+    mov  rsi, [s_plen]
+    mov  rdx, [s_htidx]
+    lea  rcx, [s_fh]         ; out_from
+    lea  r8,  [s_ghstop]     ; out_stop (-1 = none/unknown)
+    call serve_locator_from
+    test eax, eax
+    jz   .next               ; malformed: drop, as the inv path does
 .gh_build:
     ; tip = st[24]
     mov  eax, [r14+24]
     mov  [s_cnt], rax     ; tip
+    ; NET-8: hashStop, when it names a height we hold, caps the range Core
+    ; would send. Only ever LOWERS the bound -- a stop above our tip is not a
+    ; request to invent headers.
+    mov  rax, [s_ghstop]
+    cmp  rax, 0
+    jl   .gh_nostop
+    cmp  rax, [s_cnt]
+    jae  .gh_nostop
+    mov  [s_cnt], rax
+.gh_nostop:
     mov  rax, [s_fh]
     cmp  rax, [s_cnt]
     ja   .gh_empty
