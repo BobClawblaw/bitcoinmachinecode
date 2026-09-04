@@ -55,6 +55,14 @@ Everything below is landed on `arm-port` and pushed. History lives in
       items surfaced and handled: serve-test disarms the powLimit (harness
       principle), arena FAIL-5 updated to the SCR-5 contract with the 252
       single-reject quirk pinned. Details in the worklog.
+- [x] The 49-commit batch after the upstream history rewrite (STO-6/7/8,
+      UTX-1/3/5, NET-7/8, SER-4, WAL-4, RPC-2, test_redial quarantine)
+      merged and ported 2026-09-04: round 25 green (pass 322 / fail 4
+      env-only, compared 339 of 374), deployed as arm-10. Upstream also
+      rewrote both branches (noreply emails + svc rename) and quarantined
+      test_redial independently -- confirming this port's stale-fixture
+      diagnosis. The arena single-252 reject quirk (unset reason) remains
+      pinned for a future session.
 - [x] `validation/spend_corpus_diff.py` ran for the FIRST time on this port
       2026-09-04 01:25 UTC, against a real synced Core over the LAN
       (Umbrel node 192.168.5.69:8332, txindex on, verificationprogress=1):

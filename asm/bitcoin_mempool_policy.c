@@ -61,6 +61,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
+#include <stdlib.h>
+#include "daemon/seqlocks.h"          /* MEM-2: realloc for the evictor working arrays */
 #include <time.h>
 
 /* ---------------- asm glue (declared; resolved at link) ------------------- */
@@ -328,6 +330,11 @@ typedef struct {
     unsigned long n_out;
     const unsigned char* out_start;   /* first output record */
     const unsigned char* in_start;    /* first input record  */
+    uint32_t locktime;   /* MEM-1: the trailing 4 bytes. parse_tx read every
+                            other field of the transaction and skipped this
+                            one, because nothing consumed it -- the audit's
+                            note that "the 4-byte nLockTime is never decoded
+                            on the admission path at all". */
 } mpol_txmeta;
 
 static int parse_tx(const unsigned char* tx, unsigned long txlen,
@@ -373,11 +380,51 @@ static int parse_tx(const unsigned char* tx, unsigned long txlen,
         if (end - p < 4) return -1;
         wit_len = (uint64_t)(end - p) - 4;
     }
+    m->locktime = (uint32_t)(end[-4] | (end[-3]<<8) | (end[-2]<<16) | ((uint32_t)end[-1]<<24));
     m->nonwit_len = m->is_segwit ? (txlen - 2 - wit_len) : txlen;
     m->weight = m->nonwit_len * 3 + txlen;
     m->vsize  = (m->weight + 3) / 4;
     m->n_in = (int)n_in;
     return (int)n_in;
+}
+
+/* ---------------------------------------------------------------- MEM-1
+ * Chain context for the finality rules (audit 2026-09-03).
+ *
+ * Core's MemPoolAccept::PreChecks rejects !CheckFinalTxAtTip ("non-final")
+ * and !CheckSequenceLocks ("non-BIP68-final") using STANDARD_LOCKTIME_VERIFY_
+ * FLAGS, i.e. against the NEXT block's height and the tip's median time past.
+ * This layer had neither: parse_tx read the sequences only for BIP125
+ * signalling and never decoded nLockTime at all.
+ *
+ * What that let through: a transaction with nLockTime = tip+500, or a v2 with
+ * a relative lock against a freshly confirmed input, passed every check,
+ * entered the shared pool, was announced to every peer (Core peers reject it
+ * as non-final and keep it in recent-rejects), and was selected by
+ * getblocktemplate -- so a miner on this template produces a block Core
+ * rejects.
+ *
+ * The arithmetic is daemon/seqlocks.h, shared with the block-connect path so
+ * the two points cannot drift.
+ *
+ * NOT CONFIGURED => NOT ENFORCED, deliberately. next_height < 0 means the
+ * embedder has not supplied chain context, which is the case for every unit
+ * test that drives this layer with synthetic transactions and no chain. The
+ * daemon wires it at every tip change. Enforcing with a zero height would
+ * reject everything. */
+static long           g_seq_next_height = -1;
+static unsigned long  g_seq_tip_mtp     = 0;
+static int            g_seq_csv_active  = 0;
+static long (*g_seq_height_fn)(const unsigned char txid[32], unsigned long index,
+                               unsigned long long* out_height) = 0;
+
+void mpool_policy_set_seqlocks(long next_height, unsigned long tip_mtp, int csv_active,
+                               long (*height_fn)(const unsigned char*, unsigned long,
+                                                 unsigned long long*)){
+    g_seq_next_height = next_height;
+    g_seq_tip_mtp     = tip_mtp;
+    g_seq_csv_active  = csv_active;
+    g_seq_height_fn   = height_fn;
 }
 
 /* ========================================================================== */
@@ -434,8 +481,18 @@ static int classify_spk(const unsigned char* s, unsigned long n){
 static uint64_t dust_threshold(unsigned long spk_len, int spk_type, uint64_t rate_kvb){
     /* serialized txout size: 8 (value) + compactsize(spk_len) + spk_len */
     uint64_t sz = 8 + (spk_len < 0xfd ? 1 : 3) + spk_len;
+    /* MEM-11 (audit 2026-09-03): SPK_ANCHOR belongs in this set. P2A is
+     * witness version 1 with a 2-byte program, so Core's IsWitnessProgram
+     * returns true for it and GetDustThreshold charges the WITNESS spend size.
+     * Leaving it out charged the non-witness size instead: 3000 sat/kvB x 161
+     * bytes = 483 sat rather than x 80 = 240. A P2A output between 240 and
+     * 482 sat is not dust to Core and was dust here -- and while one dust
+     * output is tolerated at standardness, the ephemeral-dust rule then fires
+     * on any transaction with a non-zero fee. LN anchor outputs sit squarely
+     * in that range, so this node rejected transactions Core accepts. */
     int witness = (spk_type == SPK_WITNESS_V0_KEY || spk_type == SPK_WITNESS_V0_SCRIPT ||
-                   spk_type == SPK_WITNESS_V1_TAP || spk_type == SPK_WITNESS_UNKNOWN);
+                   spk_type == SPK_WITNESS_V1_TAP || spk_type == SPK_WITNESS_UNKNOWN ||
+                   spk_type == SPK_ANCHOR);
     sz += witness ? (32 + 4 + 1 + (107/4) + 4) : (32 + 4 + 1 + 107 + 4);
     uint64_t fee = rate_kvb * sz / 1000;
     if (fee == 0 && rate_kvb > 0) fee = 1;
@@ -535,6 +592,53 @@ static int find_node(void* st, const unsigned char txid[32]){
     for (uint32_t i=0;i<n;i++) if (memcmp(t[i].txid, txid, 32)==0) return (int)i;
     return -1;
 }
+
+/* Collect the DISTINCT in-pool parents of a transaction.
+ *
+ * MEM-3 (audit 2026-09-03) is that this list is CAPPED at MPOL_MAX_PARENTS
+ * (24) and the surplus is dropped silently, while descendants are discovered
+ * only through parent[]. A transaction with 30 in-pool parents is accepted
+ * linked to 24 of them; replace, evict or expire the 30th and
+ * collect_descendant_txids finds no child, so the child stays in the pool
+ * spending a now-conflicted output and getblocktemplate includes it.
+ *
+ * IT IS NOT FIXED HERE, and the reason is worth recording because the audit's
+ * first suggested fix -- "reject when a tx has more in-pool parents than can
+ * be recorded (Core's pre-v31 too-long-mempool-chain would fire at 25
+ * anyway)" -- does not hold for this codebase. This node implements Core
+ * v31's CLUSTER limits (64 transactions / 101 kvB), not the pre-v31
+ * 25-ancestor chain limit, so a child of 63 parents forming a 64-cluster is
+ * LEGAL and is accepted by Core. Rejecting at 24 was tried and it fails this
+ * project's own test_mempool_policy case "child C joins them: cluster of
+ * exactly 64 accepted" -- i.e. it turns a silent corruption into a false
+ * reject and a relay divergence, which is a worse trade.
+ *
+ * Raising the cap to 63 was measured rather than estimated: mpol_node grows
+ * from 184 to 336 bytes, so the policy state grows +152 MB at the default
+ * 1,048,576-node sizing (184 MB -> 336 MB). That is not a silent change to a
+ * MAP_SHARED region several processes map.
+ *
+ * The real fix is the audit's second option -- store parents out of line --
+ * which is a layout change to that shared region and wants its own pass.
+ * Tracked as open in docs/audits/AUDIT_2026-09-03_REMEDIATION.md.
+ *
+ * `*truncated` reports the overflow so callers can at least see it. */
+static int mpol_collect_parents(void* st, const unsigned char (*prev)[32],
+                                int n_in, int* par_idx, int* truncated){
+    int n_par = 0;
+    if (truncated) *truncated = 0;
+    for (int i = 0; i < n_in; i++){
+        int p = find_node(st, prev[i]);
+        if (p < 0) continue;
+        int seen = 0;
+        for (int k = 0; k < n_par; k++) if (par_idx[k] == p){ seen = 1; break; }
+        if (seen) continue;
+        if (n_par >= MPOL_MAX_PARENTS){ if (truncated) *truncated = 1; break; }
+        par_idx[n_par++] = p;
+    }
+    return n_par;
+}
+
 static long find_outreg(void* st, const unsigned char txid[32], uint32_t index,
                         uint64_t* value){
     mpol_out* o = mpol_outreg_base(st);
@@ -858,8 +962,55 @@ static int worst_chunk(void* st, mpol_chunk* out){
     mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
     if (n == 0) return 0;
-    static uint32_t child_head[65536], child_next[65536], mark[65536];
-    if (n > 65536) return 0;
+    /* MEM-2 (audit 2026-09-03): the working arrays GROW; they no longer cap
+     * the evictor at 64K entries.
+     *
+     * These were `static uint32_t child_head[65536] ...` with `if (n > 65536)
+     * return 0;` in front. The structural pool and the policy graph are sized
+     * for ~1M entries (mempool_cfg.c sizes slots to blob_cap/512 -- 1,048,576
+     * for the default 300 MB maxmempool), so the evictor hard-failed at a
+     * sixteenth of the pool's capacity. At ~400 raw bytes per transaction the
+     * pool holds more than 64K entries at ~26 MB, long before the blob is
+     * full.
+     *
+     * What that produced: mpool_put returns 2 when fill + txlen > blob_cap,
+     * and `fill` only shrinks in mpool_compact, which the accept path calls
+     * only AFTER a successful eviction. So once the blob filled, worst_chunk
+     * returned 0, the accept loop reported "mempool full" and returned, and
+     * every subsequent accept at ANY feerate failed. No eviction, no
+     * compaction, no floor_bump -- getmempoolinfo went on reporting
+     * mempoolminfee 0 while rejecting everything. Recovery needed n to fall
+     * back to 65,536 through confirmation or the 336-hour expiry, and the
+     * low-fee filler that causes it is exactly what does not confirm. An
+     * attacker reaches it for the price of 300 MB at the 0.1 sat/vB floor,
+     * because the floor never rises until an eviction happens.
+     *
+     * Growing on demand rather than sizing to a compile-time maximum: the
+     * arrays are 12 bytes per entry together, so a 1M-entry pool costs 12 MB
+     * -- worth allocating when the pool actually gets there, not worth
+     * reserving in .bss for every process that links this file (bitcoin_cli
+     * links it too). A failed grow degrades exactly the way the old ceiling
+     * did, which is the honest fallback: the caller's `worst_chunk() == 0`
+     * arm is still there. */
+    static uint32_t *child_head, *child_next, *mark;
+    static uint32_t work_cap;
+    if (n > work_cap){
+        uint32_t want = work_cap ? work_cap : 65536;
+        while (want < n){
+            if (want > 0x80000000u){ want = n; break; }   /* no overflow on the doubling */
+            want *= 2;
+        }
+        uint32_t* nh = realloc(child_head, (size_t)want * sizeof *nh);
+        uint32_t* nn = realloc(child_next, (size_t)want * sizeof *nn);
+        uint32_t* nm = realloc(mark,       (size_t)want * sizeof *nm);
+        /* Keep whichever grew: realloc'ing the survivors on a partial failure
+         * would leak the ones that succeeded, and the arrays are independent. */
+        if (nh) child_head = nh;
+        if (nn) child_next = nn;
+        if (nm) mark       = nm;
+        if (!nh || !nn || !nm) return 0;                  /* as before: caller reports "mempool full" */
+        work_cap = want;
+    }
     for (uint32_t i = 0; i < n; i++){ child_head[i] = 0xFFFFFFFFu; child_next[i] = 0xFFFFFFFFu; mark[i] = 0; }
     for (uint32_t i = 0; i < n; i++)
         for (uint32_t k = 0; k < t[i].n_parents; k++){
@@ -1143,12 +1294,65 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     *(uint32_t*)((char*)st+20) = stamp;
 
     int par_idx[MPOL_MAX_IN]; int n_par = 0;
-    for (int i=0;i<n_in;i++){
-        if (n_par >= MPOL_MAX_PARENTS) break;
-        int p = find_node(st, prev[i]);
-        int seen = 0; for (int k=0;k<n_par;k++) if (par_idx[k]==p) seen=1;
-        if (p>=0 && !seen) par_idx[n_par++] = p;
+    /* ---- MEM-1 (audit 2026-09-03): Core's finality prechecks -------------
+     * PreChecks rejects !CheckFinalTxAtTip ("non-final") and
+     * !CheckSequenceLocks ("non-BIP68-final"), evaluated against the NEXT
+     * block's height and the tip's median time past (BIP113). Placed here,
+     * before the transaction is linked into the graph and before any
+     * eviction can run, so a refusal costs nothing and mutates nothing.
+     *
+     * The arithmetic is daemon/seqlocks.h -- the same functions the
+     * block-connect path uses (VAL-4) -- so admission and connection cannot
+     * disagree. A mempool that admits what the block path rejects fills the
+     * pool with transactions that can never confirm and then hands them to
+     * getblocktemplate. */
+    if (g_seq_next_height >= 0){
+        int any_nonfinal = 0;
+        for (int i = 0; i < n_in; i++)
+            if (seq[i] != VAL_SEQUENCE_FINAL){ any_nonfinal = 1; break; }
+
+        if (!val_is_final((unsigned long)meta.locktime, any_nonfinal,
+                          g_seq_next_height, g_seq_tip_mtp)){
+            _mpol_last_reason = "non-final";
+            return 0;
+        }
+
+        /* BIP68 needs each input's prevout CREATION HEIGHT, which this layer
+         * does not resolve itself. When the embedder supplies no height
+         * resolver the rule is skipped rather than guessed -- guessing would
+         * mean inventing a confirmation depth, which is the one number the
+         * rule turns on. */
+        if (g_seq_csv_active && g_seq_height_fn && meta.version >= 2){
+            long long min_height = -1, min_time = -1;
+            int evaluable = 1;
+            for (int i = 0; i < n_in; i++){
+                if (seq[i] & VAL_SEQ_DISABLE) continue;
+                unsigned long long coin_h = 0;
+                if (g_seq_height_fn(prev[i], idx[i], &coin_h) != 1){
+                    /* an unconfirmed (in-mempool) parent has no height: Core
+                     * uses the NEXT block's height for those, since that is
+                     * where the parent would confirm. */
+                    coin_h = (unsigned long long)g_seq_next_height;
+                }
+                if (seq[i] & VAL_SEQ_TYPE){
+                    /* time-based locks need the MTP at the coin's height,
+                     * which this layer cannot read. Refuse to evaluate
+                     * rather than approximate it with the tip's. */
+                    evaluable = 0; break;
+                }
+                long long cand = val_seq_min_height((unsigned long)coin_h, seq[i]);
+                if (cand > min_height) min_height = cand;
+            }
+            if (evaluable &&
+                !val_seq_locks_ok(min_height, min_time,
+                                  g_seq_next_height, g_seq_tip_mtp)){
+                _mpol_last_reason = "non-BIP68-final";
+                return 0;
+            }
+        }
     }
+
+    n_par = mpol_collect_parents(st, prev, n_in, par_idx, 0);
 
     uint32_t anc_list[MPOL_MAX_IN + 32]; uint32_t n_anc = 0;
     uint32_t stack[MPOL_MAX_IN + 16]; int sp = 0;
@@ -1391,6 +1595,52 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     /* ================= commit ============================================ */
     if (!commit) return 1;
 
+    /* ---- MEM-4 (audit 2026-09-03): refuse rather than register nothing ---
+     *
+     * The claims and outreg tables have one slot per NODE but hold one entry
+     * per INPUT and per OUTPUT. With the pool sized at ~1M nodes the claims
+     * table fills once the pool holds ~1M inputs, which is roughly 400-500K
+     * ordinary transactions -- well inside a 300 MB raw pool, since Core's
+     * 300 MB is DynamicMemoryUsage (~3x serialized) and this pool holds
+     * roughly 3x Core's count.
+     *
+     * Both insertion loops used to test `if (n < cap)` and, when full,
+     * silently do nothing. The consequences differ and only one is
+     * conservative:
+     *   * claims full -> the transaction's inputs are never registered, so
+     *     find_claim misses them. A LATER transaction spending the same
+     *     output finds no conflict and is accepted: two conflicting
+     *     transactions in the pool, both relayed, both eligible for the
+     *     block template, which does not check conflicts. An invalid block.
+     *   * outreg full -> children are rejected as missing-inputs, which is
+     *     merely wrong rather than dangerous, but silently breaks CPFP.
+     *
+     * Checked at the COMMIT BOUNDARY: after every policy rule has had its
+     * say, so a transaction that is also non-standard or TRUC-invalid still
+     * reports THAT reason rather than "mempool full" (an earlier placement
+     * did exactly that and broke test_truc_policy's "an oversized v3 tx is
+     * refused"), and before anything is stored or linked, so a refusal costs
+     * nothing -- the same placement MEM-5 needed. "mempool full" is
+     * Core's reason for an admission that cannot be housed, and it is
+     * honest: the pool genuinely has no room left to register this
+     * transaction safely.
+     *
+     * This does not RESIZE the tables, which is the audit's other half and a
+     * capacity-tuning change to a MAP_SHARED region. It closes the
+     * correctness hole: the node can no longer accept a transaction it has
+     * not registered. */
+    {
+        uint32_t cap_    = *(uint32_t*)((char*)st+4);
+        uint32_t n_out_r = *(uint32_t*)((char*)st+8);   /* outreg entries used */
+        uint32_t n_clm   = *(uint32_t*)((char*)st+12);  /* claims  entries used */
+        if ((uint64_t)n_clm + (uint64_t)n_in > (uint64_t)cap_ ||
+            (uint64_t)n_out_r + (uint64_t)meta.n_out > (uint64_t)cap_){
+            _mpol_last_reason = "mempool full";
+            return 0;
+        }
+    }
+
+
     /* 1a. RBF eviction (packages: conflicts + descendants, snapshotted) */
     for (int e=0;e<n_evict;e++){
         int ci = find_node(st, evict_set[e]);
@@ -1404,12 +1654,25 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
      * re-found below by txid via prev[] when linking, so recompute par_idx. */
     if (n_evict){
         t = mpol_nodes_base(st);
-        n_par = 0;
-        for (int i=0;i<n_in;i++){
-            if (n_par >= MPOL_MAX_PARENTS) break;
-            int p = find_node(st, prev[i]);
-            int seen = 0; for (int k=0;k<n_par;k++) if (par_idx[k]==p) seen=1;
-            if (p>=0 && !seen) par_idx[n_par++] = p;
+        int n_par_before = n_par;
+        n_par = mpol_collect_parents(st, prev, n_in, par_idx, 0);
+        /* MEM-5 (audit 2026-09-03): the eviction must not have removed one of
+         * THIS transaction's parents. worst_chunk is scored over the existing
+         * graph, which does not yet contain the incoming transaction, so a
+         * high-feerate child arriving at a byte-full pool could evict the very
+         * parent it spends: the child was then stored with n_parents = 0, its
+         * fee computed from that parent's output value, spending an output
+         * present in neither the UTXO set nor the mempool. GBT includes it
+         * (every registered ancestor is "present") and peers orphan it.
+         *
+         * Core adds the transaction to the pool FIRST and trims with it
+         * included, so {parent, child} is scored as one chunk, then returns
+         * "mempool full" if the transaction itself was trimmed. Rejecting here
+         * reaches the same outcome from the other direction, without
+         * restructuring the accept path around a speculative insert. */
+        if (n_par < n_par_before){
+            _mpol_last_reason = "mempool full";
+            return 0;
         }
         /* re-collect ancestors for the desc-aggregate bump below */
         stamp = *(uint32_t*)((char*)st+20) + 1;
@@ -1452,6 +1715,34 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
           for (int q = 0; q < wn; q++) memcpy(wt[q], mpol_nodes_base(st)[wc.idx[q]].txid, 32);
           floor_bump(st, wf * 1000 / ws + pol->incremental_fee);
           for (int q = 0; q < wn; q++) mpool_policy_remove_package(st, mp, wt[q]);   /* descendants live in the chunk too; a gone txid is a no-op */
+          /* MEM-5 (audit 2026-09-03): the chunk just evicted must not have
+           * contained one of THIS transaction's parents -- and the check has
+           * to happen BEFORE mpool_put, or the transaction ends up stored in
+           * the structural pool while the policy layer refuses it, which is
+           * worse than the bug.
+           *
+           * worst_chunk is scored over the EXISTING graph, which does not yet
+           * contain the incoming transaction. So a high-feerate child
+           * arriving at a byte-full pool can evict the very parent it spends:
+           * par_idx is then recomputed from what is left, and the child is
+           * stored with n_parents = 0, its fee computed from the parent's
+           * output value, spending an output present in neither the UTXO set
+           * nor the mempool. getblocktemplate includes it (every REGISTERED
+           * ancestor is present) and peers orphan it.
+           *
+           * Core adds the transaction FIRST and trims with it included, so
+           * {parent, child} is scored as one chunk, then returns "mempool
+           * full" if the transaction was itself trimmed. Rejecting reaches
+           * the same end state without restructuring the accept path around
+           * a speculative insert. The parent stays evicted either way, which
+           * is what Core does too. */
+          { int n_par_before = n_par;
+            n_par = mpol_collect_parents(st, prev, n_in, par_idx, 0);
+            if (n_par < n_par_before){
+                mpool_compact(mp);
+                _mpol_last_reason = "mempool full";
+                return 0;
+            } }
           mpool_compact(mp);
           put = mpool_put(mp, txid, tx, txlen);
       }
@@ -1460,13 +1751,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
       /* trimming may have shifted node indices: recompute parent/ancestor
        * lists one more time before linking */
       t = mpol_nodes_base(st);
-      n_par = 0;
-      for (int i=0;i<n_in;i++){
-          if (n_par >= MPOL_MAX_PARENTS) break;
-          int p = find_node(st, prev[i]);
-          int seen = 0; for (int k=0;k<n_par;k++) if (par_idx[k]==p) seen=1;
-          if (p>=0 && !seen) par_idx[n_par++] = p;
-      }
+      n_par = mpol_collect_parents(st, prev, n_in, par_idx, 0);
       stamp = *(uint32_t*)((char*)st+20) + 1;
       if (stamp == 0xFFFFFFFFu) stamp = 1;
       *(uint32_t*)((char*)st+20) = stamp;

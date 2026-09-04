@@ -291,6 +291,42 @@ int main(void){
         if (pwrite(xf, r0, 48, 0)!=48) printf("FAIL: restore after hole\n");
         close(xf);
 
+        /* STO-4 (audit 2026-09-03): a hole ABOVE the gate is just as fatal,
+         * and used to pass.
+         *
+         * store_prune unlinks every file below the boundary file F, then
+         * walks h = ph, ph+1, ... re-packing while rec.file_no == F, and
+         * finally ftruncate(F, new_off). That walk is entirely about the
+         * layout ABOVE ph -- but archive_prune_decide called both guards with
+         * `ph`, validating only the region store_prune never walks.
+         *
+         * With a hole at H > ph the walk reads an all-zero record at H,
+         * file_no 0 != F, stops, and truncates away every block of F stored
+         * after H's slot while their index records still point into F.
+         * Catch-up then reads a short block there and stops, and the
+         * hole-fill cannot re-fetch it because the record is non-zero.
+         *
+         * A sync-in-progress archive is normally full of holes -- the
+         * 2026-09-01 incident log records "282 holes in [0,968954]" as an
+         * ordinary state -- so this is the default shape of this project's
+         * own datadir, not an exotic one.
+         *
+         * Budget 285 with a hole at height 2: the walk skips the hole (it
+         * occupies no bytes), fits height 1, breaks at height 0, so the gate
+         * lands at 1 and the hole sits ABOVE it. */
+        { unsigned char zero2[48]; memset(zero2,0,48);
+          xf = open("index.dat", O_RDWR);
+          if (pwrite(xf, zero2, 48, 96)!=48) printf("FAIL: hole above the gate\n");
+          close(xf);
+          ph=-7; det=-7;
+          cki("STO-4 verdict: hole ABOVE the gate -> REFUSE_HOLE",
+              archive_prune_decide(285, &ph, &det), ARCHIVE_PRUNE_REFUSE_HOLE);
+          cki("  STO-4 names the offending height above the gate", det, 2);
+          cki("  STO-4 the gate it would have used is below it", ph, 1);
+          xf = open("index.dat", O_RDWR);
+          if (pwrite(xf, r2, 48, 96)!=48) printf("FAIL: restore height 2\n");
+          close(xf); }
+
         /* non-monotonic layout is refused BEFORE the hole check, so it wins
          * even on an archive that also has holes */
         unsigned char bad[48]; memcpy(bad, r1, 48);

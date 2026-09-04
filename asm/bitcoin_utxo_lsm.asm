@@ -1180,7 +1180,18 @@ utxo_lsm_put:
     mov  [rsp+16], r11
     call utxo_store_put
     add  rsp, 0x18
-    mov  r14d, eax
+    ; UTX-3 (audit 2026-09-03): SIGN-EXTEND the callee's status.
+    ;   utxo_store_put returns a 64-bit -1 on a failed WAL drain (.fail: mov
+    ;   rax,-1). `mov r14d, eax` zero-extends it, so the -1 reached callers as
+    ;   4294967295: utxo_live.c's `if (r == -1 || r == 2) ctx->fatal = 1` was
+    ;   false, the block kept going, and the created output was in neither the
+    ;   memtable nor the WAL. The block-boundary drain then retried the
+    ;   EARLIER buffered bytes, succeeded once the disk recovered, and the
+    ;   checkpoint landed with the coin permanently absent -- a silent
+    ;   divergence from Core's chainstate, which is the one failure mode this
+    ;   store exists to make impossible. utxo_lsm_del had exactly this bug and
+    ;   exactly this fix already; this is the sibling it left behind.
+    movsxd r14, eax
     cmp  r14d, 1
     jne  .lp_no_live_inc
     inc  qword [r12+88]
@@ -1203,7 +1214,7 @@ utxo_lsm_put:
 .lp_skip_flush:
     cmp  r15d, 1
     je   .lp_err
-    mov  eax, r14d
+    mov  rax, r14                 ; UTX-3: return the full 64-bit status
     jmp  .lp_done
 .lp_err:
     mov  rax, -1
@@ -3220,14 +3231,24 @@ mac_lsm_recount:
     je   .rc_find_setbest
     cmp  eax, 1
     jne  .rc_find_next
-    ; equal keys: this wins the tie only on a strictly higher generation
-    mov  rax, [rdx+8]             ; this.gen
-    mov  rcx, [rbp-0x48]
-    imul rcx, rcx, COMPACT_SLOT_SIZE
-    add  rcx, r15
-    mov  rcx, [rcx+8]            ; best.gen
-    cmp  rax, rcx
-    jbe  .rc_find_next
+    ; UTX-1 (audit 2026-09-03): equal keys are broken by MANIFEST INDEX, the
+    ; way utxo_lsm_get does it, NOT by generation.
+    ;
+    ; utxo_lsm_get scans the manifest from its highest index down and takes
+    ; the first hit, so a higher index wins. This merge used to prefer the
+    ; higher GENERATION instead, and the two orderings disagree after a
+    ; PARTIAL compaction: the merged run is placed at index 0 (correct, it is
+    ; the oldest) but is assigned a FRESH generation, higher than every
+    ; survivor's. A key with a PUSH in the merged run and a DEL in a survivor
+    ; then resolved to the stale PUSH here, while the lookup path correctly
+    ; saw it as spent -- and the NEXT compaction wrote that resurrection into
+    ; the new run, at which point the spent coin is genuinely back on disk.
+    ;
+    ; .rc_open_loop opens "manifest entry lo+i -> slot i", so slot index is
+    ; manifest order, and this scan runs i ascending. `best` is therefore
+    ; always at a LOWER index than `this` when a tie is reached, so `this`
+    ; always wins: fall straight through to setbest. No comparison needed --
+    ; and expressing it as a comparison on gen is what hid the bug.
 .rc_find_setbest:
     mov  rax, [rbp-0x40]
     mov  [rbp-0x48], rax
@@ -3818,14 +3839,24 @@ utxo_lsm_compact:
     je   .cc_find_setbest
     cmp  eax, 1
     jne  .cc_find_next
-    ; equal keys -- this wins the tie only if its gen is strictly higher
-    mov  rax, [rdx+8]                         ; this.gen
-    mov  rcx, [rbp-0xA0]
-    imul rcx, rcx, COMPACT_SLOT_SIZE
-    add  rcx, r13
-    mov  rcx, [rcx+8]                           ; best.gen
-    cmp  rax, rcx
-    jbe  .cc_find_next
+    ; UTX-1 (audit 2026-09-03): equal keys are broken by MANIFEST INDEX, the
+    ; way utxo_lsm_get does it, NOT by generation.
+    ;
+    ; utxo_lsm_get scans the manifest from its highest index down and takes
+    ; the first hit, so a higher index wins. This merge used to prefer the
+    ; higher GENERATION instead, and the two orderings disagree after a
+    ; PARTIAL compaction: the merged run is placed at index 0 (correct, it is
+    ; the oldest) but is assigned a FRESH generation, higher than every
+    ; survivor's. A key with a PUSH in the merged run and a DEL in a survivor
+    ; then resolved to the stale PUSH here, while the lookup path correctly
+    ; saw it as spent -- and the NEXT compaction wrote that resurrection into
+    ; the new run, at which point the spent coin is genuinely back on disk.
+    ;
+    ; .cc_open_loop opens "manifest entry lo+i -> slot i", so slot index is
+    ; manifest order, and this scan runs i ascending. `best` is therefore
+    ; always at a LOWER index than `this` when a tie is reached, so `this`
+    ; always wins: fall straight through to setbest. No comparison needed --
+    ; and expressing it as a comparison on gen is what hid the bug.
 .cc_find_setbest:
     mov  rax, [rbp-0x78]
     mov  [rbp-0xA0], rax

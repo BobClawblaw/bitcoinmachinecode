@@ -138,6 +138,94 @@ int main(void){
     ck("a truncated block returns -1, not garbage",
        bf_basic_build(blk, 100, hash, NULL, 0, flt, sizeof flt) == -1);
 
+    /* ---------------------------------------------------------------- STO-2
+     * A filter whose bitstream runs past 64 KiB must not depend on what was
+     * in the output buffer beforehand.
+     *
+     * bf_basic_build used to zero only the first 65,536 bytes of the caller's
+     * buffer and then OR the Golomb-Rice bits in, and every caller in the
+     * tree passes a REUSED buffer. So a filter longer than that came out as
+     * `previous_filter_bits | this_filter_bits` -- a permanent divergence
+     * from Core in bfilters.dat and in every bf_header chained after it.
+     *
+     * The elements are supplied as PREVOUTS rather than as block outputs so
+     * the fixture stays small: 40,000 distinct scripts at BIP158's ~2.6
+     * bytes each is ~104 KB of bitstream, comfortably past the old window,
+     * with a 100-byte block. The block still has to parse, so it carries one
+     * transaction whose single output is an OP_RETURN (skipped as an element
+     * by BIP158, so it contributes nothing and the element set stays exactly
+     * the 40,000 prevouts).
+     *
+     * Both probes are differential -- clean buffer vs dirty buffer -- so they
+     * need no frozen Core vector to have teeth. Against the pre-fix builder
+     * the first probe fails on every byte past offset 65,536. */
+    {
+        enum { NEL = 40000 };
+        static bf_script big[NEL];
+        static unsigned char scripts[NEL][22];
+        for (int i = 0; i < NEL; i++){
+            /* distinct P2WPKH-shaped scripts: OP_0 PUSH20 <20 bytes> */
+            scripts[i][0] = 0x00; scripts[i][1] = 0x14;
+            for (int b = 0; b < 20; b++)
+                scripts[i][2+b] = (unsigned char)((i * 2654435761u) >> ((b % 4) * 8));
+            scripts[i][2] = (unsigned char)(i & 0xff);
+            scripts[i][3] = (unsigned char)((i >> 8) & 0xff);
+            scripts[i][4] = (unsigned char)((i >> 16) & 0xff);
+            big[i].script = scripts[i];
+            big[i].len = 22;
+        }
+
+        /* minimal parseable block: header, 1 tx, 1 input, 1 OP_RETURN output */
+        unsigned char sb[200]; unsigned long sn = 0;
+        memset(sb, 0x11, 80); sn = 80;
+        sb[sn++] = 1;                                  /* ntx = 1 */
+        sb[sn++] = 2; sb[sn++] = 0; sb[sn++] = 0; sb[sn++] = 0;   /* version */
+        sb[sn++] = 1;                                  /* 1 input */
+        memset(sb + sn, 0, 32); sn += 32;              /* prevout hash */
+        sb[sn++] = 0xff; sb[sn++] = 0xff; sb[sn++] = 0xff; sb[sn++] = 0xff;
+        sb[sn++] = 0;                                  /* empty scriptSig */
+        sb[sn++] = 0xff; sb[sn++] = 0xff; sb[sn++] = 0xff; sb[sn++] = 0xff;
+        sb[sn++] = 1;                                  /* 1 output */
+        memset(sb + sn, 0, 8); sn += 8;                /* value */
+        sb[sn++] = 1; sb[sn++] = 0x6a;                 /* OP_RETURN: not an element */
+        sb[sn++] = 0; sb[sn++] = 0; sb[sn++] = 0; sb[sn++] = 0;   /* locktime */
+
+        unsigned char bh[32];
+        for (int i = 0; i < 32; i++) bh[i] = (unsigned char)(i * 7 + 3);
+
+        static unsigned char clean[1 << 20], dirty[1 << 20];
+        memset(clean, 0x00, sizeof clean);
+        memset(dirty, 0xff, sizeof dirty);
+
+        long lc = bf_basic_build(sb, sn, bh, big, NEL, clean, sizeof clean);
+        long ld = bf_basic_build(sb, sn, bh, big, NEL, dirty, sizeof dirty);
+
+        ck("STO-2 fixture really does exceed the old 64 KiB zeroing window",
+           lc > 65536);
+        ck("STO-2 a >64 KiB filter is identical from a dirty and a clean buffer",
+           lc > 0 && lc == ld && !memcmp(clean, dirty, (size_t)lc));
+
+        /* A third fill pattern, because 0xff and 0x00 alone cannot tell a
+         * correct writer from one that happens to OR with all-ones. 0x5a
+         * differs from the filter in both directions, bit by bit. */
+        static unsigned char patt[1 << 20];
+        memset(patt, 0x5a, sizeof patt);
+        long lp = bf_basic_build(sb, sn, bh, big, NEL, patt, sizeof patt);
+        ck("STO-2 a third fill pattern gives the same filter, to the last byte",
+           lp == lc && !memcmp(clean, patt, (size_t)lc));
+
+        /* The audit's own reproduction: two big filters through the SAME
+         * buffer, back to back. The second must equal a fresh-buffer build. */
+        for (int i = 0; i < NEL; i++) scripts[i][21] ^= 0xa5;   /* a different set */
+        static unsigned char fresh[1 << 20];
+        memset(fresh, 0x00, sizeof fresh);
+        long l2reuse = bf_basic_build(sb, sn, bh, big, NEL, dirty, sizeof dirty);
+        long l2fresh = bf_basic_build(sb, sn, bh, big, NEL, fresh, sizeof fresh);
+        ck("STO-2 a reused buffer gives the same filter as a fresh one",
+           l2reuse > 65536 && l2reuse == l2fresh &&
+           !memcmp(dirty, fresh, (size_t)l2reuse));
+    }
+
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
 }

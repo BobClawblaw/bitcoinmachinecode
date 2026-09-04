@@ -143,6 +143,45 @@ extern void mpool_policy_state_init(void* st, unsigned n);
 static void (*g_index_rebuild)(void) = 0;
 void reorg_set_index_rebuild(void (*cb)(void)){ g_index_rebuild = cb; }
 
+/* ---- STO-7: the mempool this process should reconcile after a reorg ----
+ *
+ * INJECTED, exactly like g_index_rebuild, and default-OFF. The hermetic
+ * suites drive reorg_mempool_reconcile directly with their own objects and
+ * must not have reorg_execute reach into a pool they never built; only the
+ * daemon, which knows the shared mempool exists in this process, registers
+ * one (main.c, once the policy layer is up). */
+static reorg_mempool_t g_reorg_mp;
+static int             g_reorg_mp_set = 0;
+void reorg_set_mempool(const reorg_mempool_t* m){
+    if (!m || !m->mp){ g_reorg_mp_set = 0; return; }
+    g_reorg_mp = *m; g_reorg_mp_set = 1;
+}
+
+/* Disconnected-block capture for that reconciliation. Core bounds its
+ * DisconnectedBlockTransactions the same way (MAX_DISCONNECTED_TX_POOL_BYTES,
+ * 20 MB) and, on overflow, drops the whole thing rather than re-offering an
+ * arbitrary subset -- a partial re-offer is worse than none because it looks
+ * complete. Same choice here.
+ *
+ * The buffer is allocated once and KEPT. A reorg is rare and this is the
+ * single-threaded worker, so caching costs one 20 MB mapping in a process
+ * that already maps far more, and it buys freedom from having to free on
+ * each of reorg_execute's many fatal return paths -- a leak on exactly the
+ * path where the operator most needs the log, not the heap, to be right. */
+#define REORG_DISC_MAX_BYTES  (20u << 20)
+#define REORG_DISC_MAX_BLOCKS 256
+static unsigned char* g_disc_buf = 0;
+
+/* STO-7 (second half): the fork height of the most recently COMPLETED reorg,
+ * -1 if none. daemon/main.c's new-block choke point processes only heights
+ * last_seen_tip+1..now_tip, so after a reorg the replacement blocks at or
+ * below the old tip would never reach tx_accept_block_connect_h -- and a
+ * same-height replacement (possible across a retarget boundary) would fire
+ * nothing at all, since now_tip never exceeds last_seen_tip. The daemon reads
+ * this and rewinds its baseline to the fork so those heights are replayed. */
+static long g_last_fork_height = -1;
+long reorg_last_fork_height(void){ return g_last_fork_height; }
+
 /* Has reorg_chainwork_open succeeded in THIS process? Every chainwork entry
  * point below refuses to act until it has, and this is not a nicety: the
  * chainwork fd lives at store_buf+144, and an unopened store_buf is all
@@ -683,6 +722,25 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         }
     }
 
+    /* STO-7: capture the blocks about to be disconnected so their
+     * transactions can be re-offered to the mempool once the new branch is
+     * connected (Core's disconnectpool). Captured HERE and not re-read
+     * afterwards because archive_truncate_safe below unlinks the bytes. */
+    size_t         disc_off[REORG_DISC_MAX_BLOCKS];
+    uint32_t       disc_len[REORG_DISC_MAX_BLOCKS];
+    long           ndisc = 0;
+    size_t         disc_used = 0;
+    int            disc_overflow = 0;
+    if (g_reorg_mp_set){
+        if (!g_disc_buf) g_disc_buf = (unsigned char*)malloc(REORG_DISC_MAX_BYTES);
+        if (!g_disc_buf){
+            disc_overflow = 1;
+            fprintf(stderr, "[reorg] disconnect capture: %u-byte buffer allocation failed; "
+                            "the disconnected branch's transactions will not be re-offered\n",
+                    REORG_DISC_MAX_BYTES);
+        }
+    }
+
     /* ------------------------ point of no return ------------------------ */
     for (long h = tip; h > fork_height; h--){
         long len = read_stored_block(st, h, blkbuf, sizeof blkbuf);
@@ -695,6 +753,64 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         unsigned char bh[32]; block_hash(bh, blkbuf);
         char hs[17]; hash_short(hs, bh);
         fprintf(stderr, "[reorg] disconnecting height %ld hash=%s..\n", h, hs);
+        if (g_reorg_mp_set && !disc_overflow){
+            if (ndisc >= REORG_DISC_MAX_BLOCKS ||
+                disc_used + (size_t)len > REORG_DISC_MAX_BYTES){
+                disc_overflow = 1;
+                fprintf(stderr, "[reorg] disconnect capture exceeded %u bytes / %d blocks at height %ld; "
+                                "dropping the whole capture -- a partial re-offer would read as complete\n",
+                        REORG_DISC_MAX_BYTES, REORG_DISC_MAX_BLOCKS, h);
+            } else {
+                memcpy(g_disc_buf + disc_used, blkbuf, (size_t)len);
+                disc_off[ndisc] = disc_used;
+                disc_len[ndisc] = (uint32_t)len;
+                ndisc++;
+                disc_used += (size_t)len;
+            }
+        }
+        /* ---- STO-1 (audit 2026-09-03): CLAIM h-1 BEFORE doing the work ----
+         *
+         * Each utxo_live_unapply_block is durable the instant it returns --
+         * its restores and deletes go through the WAL -- but the persisted
+         * applied height used to be rewritten only ONCE, after the whole
+         * loop. Nothing marked "disconnect in progress". A crash partway
+         * through left the set at T-k while utxo_applied_height.dat still
+         * said T, with the undo files for those heights already discarded:
+         * boot's recovery looked for undo_(T+1), found nothing, reported
+         * "nothing to do", and catch-up saw tip <= applied and did nothing
+         * either. Coins spent in T-k+1..T were live again, and nothing said
+         * so -- the failure was silent because tip == applied, so even the
+         * boot guard added earlier cannot see it.
+         *
+         * Persisting h-1 FIRST inverts which way a crash can leave things.
+         * The window becomes "applied says h-1, the set still has h applied,
+         * and undo_h is still on disk" -- which is exactly the state
+         * utxo_live_recover_partial_block already repairs: it scans upward
+         * from applied+1 for undo files and rolls those heights back,
+         * descending. This reuses that machinery rather than adding a second
+         * recovery path.
+         *
+         * It needs unapply to be IDEMPOTENT, because a crash between the
+         * unapply and its undo_discard leaves undo_h present and recovery
+         * will replay it. It is: del_created_on_output looks the output up
+         * and no-ops when it is absent (its own comment covers exactly this
+         * "already spent / never created" case), and undo_restore_cb treats
+         * a duplicate put (r == 0) as success. Both were written for the
+         * crash-mid-APPLY path and hold here unchanged.
+         *
+         * A failed persist is fatal rather than a warning: continuing would
+         * unapply h with applied still claiming h, which is the very state
+         * this ordering exists to make unreachable. */
+        if (!utxo_live_rewind_to(h - 1)){
+            fprintf(stderr, "[reorg] FATAL: could not persist applied height %ld before "
+                            "disconnecting %ld -- refusing to unapply, because a crash now "
+                            "would leave the set rewound with a stale applied height\n",
+                    h - 1, h);
+            reorg_alert("applied-height-persist-failed-before-disconnect");
+            if (locked) flock(lfd, LOCK_UN);
+            hdr_fd_close();
+            return -1;
+        }
         if (!utxo_live_unapply_block(blkbuf, (uint64_t)len, h)){
             fprintf(stderr, "[reorg] FATAL: unapply failed at height %ld -- UTXO set is now PARTIALLY rewound and must be rebuilt from the archive\n", h);
         reorg_alert("utxo-partially-rewound-rebuild-required");
@@ -744,6 +860,12 @@ long reorg_execute(void* st, long fork_height, long nblocks,
      * and the reason store_rd_close documents itself as "shutdown / post-prune
      * invalidation". */
     store_rd_close(st);
+    /* STO-1: the applied height was already walked down to fork_height one
+     * block at a time by the loop above, each step persisted BEFORE its
+     * unapply. This call is now a confirmation rather than the only commit --
+     * kept because the loop does not run at all when tip == fork_height, and
+     * because a redundant write of the value it already holds costs nothing
+     * and keeps the invariant obvious at the end of the disconnect. */
     if (!utxo_live_rewind_to(fork_height)){
         fprintf(stderr, "[reorg] WARNING: could not persist the rewound applied height %ld (next boot may re-apply from an older height, which is safe)\n", fork_height);
     }
@@ -809,18 +931,55 @@ long reorg_execute(void* st, long fork_height, long nblocks,
 
     if (g_index_rebuild) g_index_rebuild();
 
-    /* MEMPOOL RECONCILIATION IS NOT DONE HERE, AND THAT IS DELIBERATE.
-     * bitcoin_serve.asm's mempool (mp_area) is a private BSS object that is
-     * mpool_init'd once per node_serve_loop process -- i.e. it lives in each
-     * forked INBOUND connection child, not in the download worker that owns
-     * the reorg decision, and it is not even an exported symbol. There is
-     * therefore no mempool in this process to reconcile. reorg_mempool_reconcile
-     * is implemented and fully tested (tests/test_reorg.c drives eviction,
-     * reinjection and survival against the real policy layer) and is ready for
-     * whatever stage gives the node a shared, process-spanning mempool -- it
-     * just has nothing to act on today. Say so out loud rather than let the
-     * absence of a log line read as "reconciled successfully". */
-    fprintf(stderr, "[reorg] mempool NOT reconciled: no mempool exists in this process (bitcoin_serve.asm's is per-inbound-connection). Any inbound child's mempool may briefly hold transactions that the new branch invalidates.\n");
+    /* ---- STO-7: MEMPOOL RECONCILIATION ----
+     *
+     * The old note here said there was no mempool in this process to
+     * reconcile, because bitcoin_serve.asm's mp_area is a private BSS object
+     * per inbound child. That stopped being true when the shared pool landed:
+     * mempool_configure allocates mp_ext_area/mp_ext_polstate before the fork
+     * and the download worker -- this process, the one that owns the reorg
+     * decision -- writes to it through tx_accept. The stale rationale was
+     * leaving a real gap: transactions confirmed only on the losing branch
+     * were dropped from relay, and transactions the replacement blocks
+     * confirmed at heights <= last_seen_tip were never removed from the pool,
+     * so getblocktemplate could build a block spending already-spent prevouts.
+     *
+     * reorg_mempool_reconcile does a full rebuild against the CURRENT
+     * confirmed UTXO set -- which is why it runs HERE, after the reconnect
+     * loop has applied every replacement block, and not between the disconnect
+     * and the reconnect. Transactions the new branch confirmed simply fail to
+     * re-add (their prevouts are spent); transactions only the losing branch
+     * held are offered from the capture above and re-enter if they are still
+     * valid. Both directions fall out of the one rebuild.
+     *
+     * Blocks are offered oldest-first, so an intra-branch parent is seen
+     * before its child. */
+    if (g_reorg_mp_set){
+        const unsigned char* dptr[REORG_DISC_MAX_BLOCKS];
+        uint32_t             dlen[REORG_DISC_MAX_BLOCKS];
+        long                 n = disc_overflow ? 0 : ndisc;
+        /* The capture loop ran newest-first (h descending); reverse it. */
+        for (long i = 0; i < n; i++){
+            dptr[i] = g_disc_buf + disc_off[n - 1 - i];
+            dlen[i] = disc_len[n - 1 - i];
+        }
+        long after = reorg_mempool_reconcile(&g_reorg_mp, n ? dptr : NULL, n ? dlen : NULL, n);
+        if (after < 0){
+            /* Not fatal: the chain is already correct and durable. A failed
+             * rebuild leaves the pool possibly holding now-invalid entries,
+             * which the accept path and the next block connect will shed. */
+            fprintf(stderr, "[reorg] WARNING: mempool reconcile failed (allocation); the pool may briefly hold transactions the new branch invalidates\n");
+        } else {
+            fprintf(stderr, "[reorg] mempool reconciled: %ld transaction(s) remain%s\n",
+                    after,
+                    disc_overflow ? " (disconnected branch NOT re-offered: capture overflowed)"
+                                  : "");
+        }
+    } else {
+        fprintf(stderr, "[reorg] mempool NOT reconciled: no mempool registered in this process (reorg_set_mempool was never called). Any pool in this process may hold transactions that the new branch invalidates.\n");
+    }
+
+    g_last_fork_height = fork_height;
 
     unsigned char tiph[32]; char hs[17] = "(none)";
     if (store_get_tip_hash(st, tiph) == 1) hash_short(hs, tiph);

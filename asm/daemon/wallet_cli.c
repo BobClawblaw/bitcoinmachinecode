@@ -680,6 +680,41 @@ static int cmd_init(int argc, char** argv) {
      *   wallet_cli init [passphrase] [path]   (path defaults to data/bmcwallet.dat) */
     const char* pass = (argc >= 3) ? argv[2] : NULL;
     const char* path = (argc >= 4) ? argv[3] : default_wallet_path();
+
+    /* ---- WAL-5 (audit 2026-09-03): refuse to overwrite an existing wallet.
+     *
+     * init generated a fresh mnemonic and truncated the destination
+     * UNCONDITIONALLY. On the encrypted branch wallet_store.c opens the file
+     * "w" and then remove()s it BEFORE the sealed write, so a failure there --
+     * /dev/urandom unavailable, disk full -- left no wallet at all.
+     *
+     * An operator re-running `wallet_cli init` out of muscle memory, from a
+     * script, or to "re-encrypt" a funded wallet lost the old mnemonic with
+     * no prompt and no backup. createwallet over RPC already checks for
+     * existence (rpc_wallet_ops.c); the CLI did not, and the CLI is the one
+     * a human runs by hand.
+     *
+     * Core's equivalent refuses with "Database already exists". --force is
+     * the deliberate escape, so scripted re-initialisation is still possible
+     * but has to say so. */
+    { const char* fpos = (argc >= 3 && !strcmp(argv[2], "--force")) ? argv[2] : NULL;
+      int forced = 0;
+      for (int i = 2; i < argc; i++) if (!strcmp(argv[i], "--force")) forced = 1;
+      (void)fpos;
+      struct stat wsb;
+      if (!forced && stat(path, &wsb) == 0) {
+          fprintf(stderr,
+              "init: %s already exists -- refusing to overwrite it.\n"
+              "      A wallet file holds the ONLY copy of its mnemonic; init\n"
+              "      would replace it with a fresh one and the old keys would\n"
+              "      be unrecoverable.\n"
+              "      Back it up and remove it first, or pass --force if you\n"
+              "      are certain.\n", path);
+          return 1;
+      }
+      if (forced && stat(path, &wsb) == 0)
+          fprintf(stderr, "init: --force given; replacing the existing wallet at %s\n", path);
+    }
     /* 2026-09-02: no passphrase argument and a terminal on stdin -> ask for
      * one, twice, echo off; a passphrase entered this way is NOT persisted
      * in a .pass file (that is the point of typing it). Enter nothing to

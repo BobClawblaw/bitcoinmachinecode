@@ -41,6 +41,7 @@
 #include <sys/stat.h>
 #include "node_config.h"
 #include "utxo_walk.h"
+#include "seqlocks.h"
 #include "log_ts.h"
 
 extern long store_reload(void* st);
@@ -153,6 +154,11 @@ extern int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long heig
  * has run. */
 extern const u64* txvb_last_tx_in_sums(u64* n_out);
 extern unsigned long long* txvb_last_tx_sigops(unsigned long long* n);   /* SCR-6 */
+/* VAL-4 / BIP68: per-input prevout creation heights, flat and in block order,
+ * with each input's owning transaction index alongside. Filled by the same
+ * resolve loop that applies the bidx-then-LSM precedence, so an in-block spend
+ * carries the current height rather than a stale one. */
+extern unsigned long long* txvb_last_in_heights(unsigned long long* n, unsigned int** txidx);
 extern void block_hash(u8 out[32], const u8 hdr[80]);
 
 /* Rolling undo-data retention window. Stage A's own design note calls for
@@ -279,7 +285,15 @@ static void compact_adopt(int st){
         if (lsm_manifest_adopt_child(&g_utxo_lst, g_cmp_inputs, g_cmp_nin, g_cmp_is_full, g_cmp_old_base, &nbase) != 0){
             /* keep the old manifest: its runs are all still on disk (unlink
              * was deferred), so this process stays consistent. The child's
-             * output is an orphan; drop it now rather than at next boot. */
+             * output is an orphan; drop it now rather than at next boot.
+             *
+             * UTX-5: this unlink is only safe because lsm_manifest_adopt_child
+             * publishes BEFORE committing the union to memory. On any non-zero
+             * return -- reconciliation mismatch or a failed publish alike --
+             * g_utxo_lst still names the input runs and has never named
+             * g_cmp_child_run, so removing it cannot strand a manifest entry.
+             * When the order was the other way round this line deleted a run
+             * the in-memory manifest was actively pointing at. */
             unlink_run(g_cmp_child_run); unlink(LSM_MANIFEST_CHILD);
             fprintf(stderr, "[utxo_live] background compaction finished in %.1fs but its manifest did not reconcile with ours -- discarded (run %lu), old run set kept\n",
                     secs, (unsigned long)g_cmp_child_run);
@@ -575,6 +589,32 @@ extern long utxo_store_wal_drain(void* st);
 static int persist_applied_height(long h){
     /* the height claims every op through h is in the WAL: land the buffer first */
     if (utxo_store_wal_drain(&g_utxo_lst) != 0) return 0;
+    /* ---- UTX-4 (audit 2026-09-03): and make it DURABLE before claiming it.
+     *
+     * The drain is write(2) only. The height file below is written to a tmp,
+     * fsynced, renamed, and the directory fsynced -- so the CHECKPOINT was
+     * durable while the WAL data it certifies was merely in the page cache.
+     * The design notes in utxo_store.asm and further down this file cover
+     * same-machine process death, where the page cache survives; they do not
+     * cover power loss or a kernel crash.
+     *
+     * On those, the 12-byte checkpoint can survive while the WAL pages for
+     * the blocks it covers do not. The reloaded set is then BEHIND the
+     * checkpoint, catch-up resumes at applied+1, and the lost blocks' spends
+     * resurrect while their outputs vanish -- silently, because the ghost
+     * guard reads undo files that were never fsynced either.
+     *
+     * Ordering, not extra work: the fsync has to precede the checkpoint that
+     * asserts it. One fsync per CHECKPOINT, not per block -- ckpt_now is
+     * driven by utxo_live_ckpt_due (a block batch and a time bound), so this
+     * costs one flush per batch on a path that already does three fsyncs
+     * (tmp file, and the directory) plus a rename. */
+    if (g_utxo_lst.log_fd >= 0 && fsync((int)g_utxo_lst.log_fd) != 0){
+        fprintf(stderr, "[utxo_live] fsync WAL before checkpoint failed: %s "
+                        "-- refusing to record an applied height the data may not back\n",
+                strerror(errno));
+        return 0;
+    }
     u8 buf[12];
     u32 magic = UTXO_APPLIED_HEIGHT_MAGIC;
     memcpy(buf, &magic, 4);
@@ -731,7 +771,13 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
         fprintf(stderr, "[utxo_live] WARNING h=%ld: non-coinbase duplicate outpoint declined (Core's AddCoin would throw here)\n",
                 g_apply_height);
     }
-    if (r == -1 || r == 2) ctx->fatal = 1; /* -1 I/O error, 2 table full (undersized memtable) */
+    /* UTX-3 (audit 2026-09-03): `r < 0`, not `r == -1`. utxo_lsm_put used to
+     * truncate utxo_store_put's 64-bit -1 through a 32-bit register, so a
+     * failed WAL drain arrived here as 4294967295 and this check let the
+     * block continue with the coin written nowhere. The asm now sign-extends;
+     * testing the SIGN rather than one exact value means a future widening
+     * cannot silently reopen it. */
+    if (r < 0 || r == 2) ctx->fatal = 1;   /* <0 I/O error, 2 table full (undersized memtable) */
 }
 
 /* rollback_partial_apply(): undo whatever apply_block_inner already
@@ -1150,6 +1196,21 @@ void utxo_live_set_pow_rules(int no_retarget, int allow_min_diff,
  * powr_hdr_from_store_consensus below, which runs the retarget schedule on
  * consensus heights -- see its comment for the -1 store-height shift.) */
 
+/* Plain daemon-height getter (main's val_mtp / MTP window reader): record r
+ * holds real block r+1 under the same +1 genesis bias, but MTP over the last
+ * 11 headers is height-symmetric, so no -1 translation is needed here. Kept
+ * separate from the consensus-height variant below, which shifts by one for
+ * the retarget schedule. */
+static int powr_hdr_from_store(void* ctx, long h, u8 hdr[80]){
+    u64 meta[3];
+    if (!ctx || store_get_at(ctx, (u64)h, meta) != 1) return 0;
+    int fd = store_rd_fd(ctx, (unsigned)meta[2]);
+    if (fd < 0) return 0;
+    /* +8 skips the [len][magic] frame header -- store_read_meta's own
+     * pread does exactly this (bitcoin_store_fast.asm) */
+    return pread(fd, hdr, 80, (off_t)meta[0] + 8) == 80 ? 1 : 0;
+}
+
 /* Consensus-height GETTER for the difficulty schedule. pow_expected_bits /
  * pow_check_bits (bitcoin_pow_rules.c, shared, x86-correct) address ancestors
  * by CONSENSUS height. Our archive store is daemon-height-indexed: record r
@@ -1178,6 +1239,39 @@ static int powr_hdr_from_store_consensus(void* ctx, long real_h, u8 hdr[80]){
     if (fd < 0) return 0;
     return pread(fd, hdr, 80, (off_t)meta[0] + 8) == 80 ? 1 : 0;
 }
+
+/* ---------------------------------------------------------------- VAL-4
+ * Core's GetMedianTimePast: the median nTime of the up-to-11 blocks ending at
+ * `h` (nMedianTimeSpan = 11). BIP113 makes this the time reference for
+ * nLockTime once CSV is active, which is why it has to be exact rather than
+ * "close enough": using the block's own timestamp instead would accept a
+ * transaction Core rejects, in a direction a miner controls.
+ *
+ * Returns 0 if any header in the window is unreadable. Refusing to evaluate
+ * is the safe answer -- the caller rejects rather than guessing -- and every
+ * legitimate path has its ancestors stored (the same argument
+ * pow_check_bits already relies on).
+ *
+ * Short chains: Core collects however many ancestors exist and takes the
+ * median of those, so a chain under 11 blocks is not a special case. */
+static int val_mtp(long h, u32* out){
+    u32 ts[11];
+    int n = 0;
+    for (long k = h; k > h - 11 && k >= 0; k--){
+        u8 hdr[80];
+        if (!powr_hdr_from_store(g_bip30_store, k, hdr)) return 0;
+        memcpy(&ts[n++], hdr + 68, 4);
+    }
+    if (n == 0) return 0;
+    for (int i = 1; i < n; i++){                 /* insertion sort, n <= 11 */
+        u32 v = ts[i]; int j = i - 1;
+        while (j >= 0 && ts[j] > v){ ts[j+1] = ts[j]; j--; }
+        ts[j+1] = v;
+    }
+    *out = ts[n / 2];
+    return 1;
+}
+
 
 /* ========================================================================
  * VAL-1 / VAL-2 (audit 2026-09-03) -- CheckTransaction's value rules, the
@@ -1237,7 +1331,22 @@ typedef struct {
                                     null outpoint (Core: bad-txns-prevout-null) */
     int bad_shape;               /* truncated (a 0-input tx cannot even be
                                     walked by the merkle pass either) */
+    int any_nonfinal_seq;        /* VAL-4: ANY input with nSequence !=
+                                    0xffffffff. Tracked as a flag during the
+                                    walk rather than read back out of seqs[],
+                                    because seqs[] is capped at VAL_SEQ_CAP
+                                    and its truncation rule treats the surplus
+                                    as FINAL -- safe for BIP68, but the WRONG
+                                    direction for IsFinalTx, where missing a
+                                    non-final input means accepting a block
+                                    Core rejects. */
     u64 in_count;
+    u64 out_count;               /* filled by the output walk the locktime
+                                    read depends on being correct */
+    u64 stripped_len;            /* VAL-3: serialized length with the marker,
+                                    flag and witness sections removed, i.e.
+                                    Core's GetSerializeSize(TX_NO_WITNESS(tx)).
+                                    Equals txlen for a non-segwit tx. */
     u32 locktime;                /* trailing 4 bytes (IsFinalTx, BIP68) */
     u32 version;                 /* BIP68's version>=2 gate */
     const u32* seqs; u32 nseqs;  /* per-input sequences (up to SEQ_CAP; a tx
@@ -1280,6 +1389,7 @@ static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
         p = sp + sl;
         if ((u64)(end - p) < 4){ vi->bad_shape=1; return 0; }
         if (i == 0){ vi->in0_script = sp; vi->in0_slen = sl; }
+        { u32 sq; memcpy(&sq, p, 4); if (sq != 0xFFFFFFFFu) vi->any_nonfinal_seq = 1; }
         if (vi->nseqs < VAL_SEQ_CAP){ memcpy(&g_val_seqs[vi->nseqs], p, 4); vi->nseqs++; }
         else vi->nseqs = VAL_SEQ_CAP;              /* truncation flag (see the
                                                     * BIP68 pass: surplus
@@ -1287,11 +1397,48 @@ static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
                                                     * never FALSE) */
         p += 4;                                    /* sequence */
     }
+    /* ---- the OUTPUT section.
+     *
+     * This walk used to jump straight from the inputs to the witness
+     * sections, skipping the outputs entirely (introduced with Phase 0.15 in
+     * the VAL-1/VAL-2 remediation, 2026-09-03). The wire order is
+     *   version | [marker flag] | n_in | inputs | n_out | outputs |
+     *   [witness] | locktime
+     * so omitting the outputs left `p` pointing at the output COUNT. For a
+     * NON-segwit transaction that made vi->locktime the first four bytes of
+     * the output section rather than the locktime. For a SEGWIT transaction
+     * the witness walk below then tried to decode the output section as
+     * witness stacks, which runs off the end and returns bad_shape -- and
+     * Phase 0.15 turns a bad_shape into "bad-txns-prevout-null" and REJECTS
+     * THE BLOCK. Every block containing a segwit transaction, i.e. every
+     * mainnet block since 481,824.
+     *
+     * Verified rather than reasoned: a real 223-byte mainnet segwit
+     * transaction from block 700,038 returned 0 from this function. No test
+     * caught it because nothing in the suite drives a real segwit block
+     * through apply_block_inner's Phase 0.15 -- the audit's own section 8
+     * observation ("the test suite pins happy paths") landing on the
+     * remediation for that same audit. tests/test_val_read_tx.c now does. */
+    {
+        u64 nout = utxo_walk_read_varint(p, end, &used);
+        if (!used){ vi->bad_shape=1; return 0; }
+        p += used; vi->out_count = nout;
+        for (u64 i = 0; i < nout; i++){
+            if ((u64)(end - p) < 8){ vi->bad_shape=1; return 0; }
+            p += 8;                                /* value */
+            u64 sl = utxo_walk_read_varint(p, end, &used);
+            if (!used){ vi->bad_shape=1; return 0; }
+            p += used;
+            if ((u64)(end - p) < sl){ vi->bad_shape=1; return 0; }
+            p += sl;
+        }
+    }
     /* segwit marker seen -> skip the witness sections (n_in stacks of
      * varint-count + varint-len items) before the trailing locktime.
      * tx_parse has ALREADY validated this exact structure (the tx passed
      * its walk to get here); this pass just locates the locktime, so a
      * decode disagreement is a bad_shape reject, never a skip. */
+    const u8* wit_begin = p;
     if (segwit){
         for (u64 i = 0; i < nin; i++){
             u64 nitems = utxo_walk_read_varint(p, end, &used);
@@ -1307,9 +1454,45 @@ static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
         }
     }
     if ((u64)(end - p) < 4){ vi->bad_shape=1; return 0; }
+    /* VAL-3: the stripped length Core weighs the block with. The witness
+     * section runs from wit_begin to p; dropping it plus the 2 marker/flag
+     * bytes is exactly TX_NO_WITNESS serialization. Computed from the walk
+     * that is already happening rather than by re-serializing into a buffer,
+     * which is what strip_witness would cost per transaction. */
+    vi->stripped_len = segwit ? txlen - 2 - (u64)(p - wit_begin) : txlen;
     memcpy(&vi->locktime, p, 4);                   /* locktime */
     return 1;
 }
+/* MEM-1: val_mtp exported for the mempool's finality context. The policy
+ * layer cannot read headers, so daemon/main.c pushes the tip's median time
+ * past in at every tip change; this is the one implementation, shared with
+ * the block-connect path so the two cannot disagree by a second. */
+int utxo_live_median_time_past(long height, unsigned long* out){
+    u32 v;
+    if (height < 0 || !val_mtp(height, &v)) return 0;
+    *out = (unsigned long)v;
+    return 1;
+}
+
+/* VAL-4: IsFinalTx over a val_txinfo_t. The predicate itself is in
+ * daemon/seqlocks.h, shared with the mempool path (MEM-1) so the two cannot
+ * drift; this is only the adapter that supplies its arguments. */
+static int val_is_final_tx(const val_txinfo_t* vi, long height, u32 timecutoff){
+    return val_is_final((unsigned long)vi->locktime, vi->any_nonfinal_seq,
+                        height, (unsigned long)timecutoff);
+}
+
+
+/* Test seam for tests/test_val_read_tx.c. val_read_tx is static and is not
+ * reachable from a harness otherwise; exporting a thin alias (the same
+ * convention bitcoin_scriptverify.c's sv_checksig_export uses) lets the test
+ * drive the REAL function rather than a copy that could drift from it --
+ * which matters here, because a copy is exactly what would have kept passing
+ * while the real walk skipped the output section. */
+int val_read_tx_probe(const u8* tx, u64 txlen, val_txinfo_t* vi){
+    return val_read_tx(tx, txlen, vi);
+}
+
 /* CScript() << height, exactly Core's CScriptNum(h).serialize: OP_1..OP_16
  * for h<=16, else push-length + minimal little-endian bytes with the 0x00
  * sign pad. Returns the total byte length written to want. */
@@ -1398,6 +1581,67 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         q += txlen;
     }
 
+    /* ---- Phase 0.10 (VAL-3, audit 2026-09-03): CheckBlock's size rules and
+     * ContextualCheckBlock's weight rule.
+     *
+     * The only 4,000,000 in this node was the P2P frame cap
+     * (bitcoin_net.asm) and GBT. That bounds the SERIALIZED size but is not
+     * the weight rule: a 3.9 MB block with 1.5 MB of non-witness bytes has
+     * weight 3*1.5M + 3.9M = 8.4M and was accepted here while Core rejects
+     * it. A miner producing one would split the chain.
+     *
+     * Core, exactly:
+     *   CheckBlock            vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+     *                         GetSerializeSize(TX_NO_WITNESS(block)) * 4 > MAX_BLOCK_WEIGHT
+     *                           -> "bad-blk-length"
+     *   ContextualCheckBlock  GetBlockWeight(block) > MAX_BLOCK_WEIGHT
+     *                           -> "bad-blk-weight"
+     * where GetBlockWeight = 3 * stripped_size + total_size.
+     *
+     * The stripped size is the 80-byte header, the tx-count CompactSize, and
+     * each transaction's TX_NO_WITNESS length -- which val_read_tx now
+     * reports from the walk it already performs, so no transaction is
+     * re-serialized to measure it.
+     *
+     * Context-free, so it runs on the dry run too: submitblock and a GBT
+     * proposal answer Core's exact reason without touching state. Placed
+     * before Phase 0.15 because a block that fails a size rule should be
+     * refused on that rule, the way Core orders CheckBlock. ---- */
+    {
+        const u64 MAX_BLOCK_WEIGHT = 4000000ULL;
+        const u64 WITNESS_SCALE_FACTOR = 4ULL;
+
+        if (ntx * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT){
+            fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-blk-length (%llu txs)\n",
+                    g_apply_height, (unsigned long long)ntx);
+            g_last_reject = "bad-blk-length"; return 0;
+        }
+
+        /* header + CompactSize(ntx); `consumed` is that CompactSize's width,
+         * read at the top of this function. */
+        u64 stripped = 80 + consumed;
+        val_txinfo_t vw;
+        for (u64 t = 0; t < ntx; t++){
+            if (!val_read_tx(txs[t].ptr, txs[t].len, &vw)){
+                g_last_reject = "bad-txns-prevout-null"; return 0;   /* same reason Phase 0.15 gives */
+            }
+            stripped += vw.stripped_len;
+        }
+
+        if (stripped * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT){
+            fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-blk-length (stripped %llu B)\n",
+                    g_apply_height, (unsigned long long)stripped);
+            g_last_reject = "bad-blk-length"; return 0;
+        }
+
+        u64 weight = 3ULL * stripped + blocklen;
+        if (weight > MAX_BLOCK_WEIGHT){
+            fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-blk-weight (%llu > 4000000)\n",
+                    g_apply_height, (unsigned long long)weight);
+            g_last_reject = "bad-blk-weight"; return 0;
+        }
+    }
+
     /* ---- Phase 0.15 (VAL-1/VAL-2, audit 2026-09-03): CheckTransaction's
      * structural coinbase rules + bad-txns-prevout-null. Context-free, so
      * it runs on the dry-run too -- submitblock answers Core's exact reasons
@@ -1453,6 +1697,65 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
             fprintf(stderr, "[utxo_live] REJECT h=%ld: %s\n", g_apply_height, wreason);
             g_last_reject = "bad-witness-merkle-match";
             return 0;
+        }
+    }
+
+    /* ---- Phase 0.30 (VAL-4, audit 2026-09-03): ContextualCheckBlock's
+     * nLockTime finality rule.
+     *
+     * Core rejects any transaction that is not IsFinalTx(tx, nHeight,
+     * nLockTimeCutoff) with "bad-txns-nonfinal". This node implemented the
+     * CLTV/CSV script OPCODES but never the TRANSACTION-level rule, so a
+     * mined block carrying a transaction with nLockTime = height+100 and a
+     * non-final nSequence was accepted here and rejected by Core. Signatures
+     * are valid in that block; the split is purely over finality.
+     *
+     * nLockTimeCutoff follows Core exactly (validation.cpp):
+     *     DeploymentActiveAfter(pindexPrev, CSV) ? pindexPrev->GetMedianTimePast()
+     *                                            : block.GetBlockTime()
+     * i.e. BIP113 moves the time reference from the block's own timestamp --
+     * which a miner picks -- to the median of the previous eleven. Getting
+     * that wrong in the permissive direction is a miner-controlled split, so
+     * an unreadable ancestor window rejects rather than falling back.
+     *
+     * The coinbase is included: Core loops over every tx in the block, and a
+     * coinbase has a single input with nSequence usually 0xffffffff, so it is
+     * final in practice -- but the rule is not written to exclude it, and
+     * neither is this. ---- */
+    {
+        unsigned long long bflags30 = script_flags_for_block((unsigned long long)g_apply_height, blk_hash);
+        /* SFC_BIT_CSV in script_flags_consts.inc, generated from Core's
+         * chainparams (CSVHeight). Cross-checked at runtime below against a
+         * height either side of activation, so a regenerated .inc cannot
+         * silently move the bit out from under this. */
+        #define VAL_SFC_BIT_CSV 10
+        int csv_active = (int)((bflags30 >> VAL_SFC_BIT_CSV) & 1ULL);
+
+        u32 timecutoff;
+        if (csv_active){
+            if (g_apply_height < 1 || !val_mtp(g_apply_height - 1, &timecutoff)){
+                g_last_reject = "bad-txns-nonfinal";   /* cannot evaluate -> refuse */
+                fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-txns-nonfinal "
+                                "(median-time-past window unreadable)\n", g_apply_height);
+                return 0;
+            }
+        } else {
+            memcpy(&timecutoff, blockbuf + 68, 4);     /* the block's own nTime */
+        }
+
+        val_txinfo_t vif;
+        for (u64 t = 0; t < ntx; t++){
+            if (!val_read_tx(txs[t].ptr, txs[t].len, &vif)){
+                g_last_reject = "bad-txns-prevout-null"; return 0;
+            }
+            if (!val_is_final_tx(&vif, g_apply_height, timecutoff)){
+                fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-txns-nonfinal "
+                                "(tx %llu, nLockTime %lu, cutoff %lu)\n",
+                        g_apply_height, (unsigned long long)t,
+                        (unsigned long)vif.locktime, (unsigned long)timecutoff);
+                g_last_reject = "bad-txns-nonfinal";
+                return 0;
+            }
         }
     }
 
@@ -1590,6 +1893,121 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
                     g_apply_height, (unsigned long long)ptx_out[0], (unsigned long long)cap);
             g_last_reject = "bad-cb-amount";
             return 0;
+        }
+    }
+
+    /* ---- Phase 4.55 (VAL-4, BIP68 half, audit 2026-09-03): ConnectBlock's
+     * relative-timelock rule.
+     *
+     * Core rejects "bad-txns-nonBIP68-final" for any transaction whose
+     * SequenceLocks are not satisfied, for nVersion >= 2 at or after
+     * CSVHeight. This node had the CSV script OPCODE but never the
+     * transaction-level rule, and the opcode only runs when a script uses it.
+     * So a v2 transaction with a relative lock of 1000 blocks against a fresh
+     * prevout was accepted here and rejected by Core: every signature valid,
+     * the split purely over relative finality.
+     *
+     * consensus/tx_verify.cpp, CalculateSequenceLocks, mirrored exactly:
+     *   enforce only when tx.nVersion >= 2 AND the CSV deployment is active
+     *   per input:
+     *     SEQUENCE_LOCKTIME_DISABLE_FLAG (1<<31) set  -> input is exempt
+     *     SEQUENCE_LOCKTIME_TYPE_FLAG    (1<<22) set  -> TIME-based:
+     *         coinTime = MTP of the block at max(coinHeight-1, 0)
+     *         minTime  = max(minTime, coinTime + ((seq & 0xffff) << 9) - 1)
+     *     otherwise                                   -> HEIGHT-based:
+     *         minHeight = max(minHeight, coinHeight + (seq & 0xffff) - 1)
+     *   EvaluateSequenceLocks: fail if minHeight >= this height
+     *                             or minTime  >= MTP(prev)
+     *
+     * The 1<<9 shift is BIP68's 512-second granularity, and the -1 is Core's:
+     * the lock is satisfied AT the boundary, not one past it. Both are the
+     * kind of off-by-one that produces a chain split rather than a test
+     * failure, so they are transcribed rather than reasoned about.
+     *
+     * WHERE THE INPUTS COME FROM. The per-input prevout creation heights are
+     * exported by tx_verify.c's resolve loop (txvb_last_in_heights), which is
+     * the only place that applies the bidx-then-LSM precedence -- a spend of
+     * an output created earlier in the SAME block resolves through bidx_get
+     * and carries this height. Re-resolving them here would duplicate that
+     * precedence rule. The per-input sequences come from val_read_tx.
+     *
+     * THE seqs[] CAP IS SAFE HERE, unlike for IsFinalTx. val_read_tx records
+     * at most VAL_SEQ_CAP sequences and its truncation rule treats the
+     * surplus as FINAL. For BIP68 "final" means nSequence 0xffffffff, which
+     * has the DISABLE flag set, so a surplus input is treated as exempt --
+     * it can only make us MORE permissive on a transaction with more than
+     * 2,048 inputs, never less. That direction is wrong in principle, so the
+     * truncation is refused outright below rather than relied upon. ---- */
+    {
+        unsigned long long bflags68 = script_flags_for_block((unsigned long long)g_apply_height, blk_hash);
+        int csv_active68 = (int)((bflags68 >> VAL_SFC_BIT_CSV) & 1ULL);
+        if (csv_active68 && ntx > 1){
+            unsigned long long nin_tot = 0; unsigned int* in_txidx = 0;
+            const u64* in_h = (const u64*)txvb_last_in_heights(&nin_tot, &in_txidx);
+            if (!in_h || !in_txidx){
+                g_last_reject = "internal: bip68 height ledger missing"; return 0;
+            }
+            u32 tip_mtp;
+            if (g_apply_height < 1 || !val_mtp(g_apply_height - 1, &tip_mtp)){
+                g_last_reject = "bad-txns-nonBIP68-final";   /* cannot evaluate -> refuse */
+                return 0;
+            }
+
+            val_txinfo_t vib;
+            u64 gi = 0;                       /* walks the flat input ledger */
+            for (u64 t = 0; t < ntx; t++){
+                if (!val_read_tx(txs[t].ptr, txs[t].len, &vib)){
+                    g_last_reject = "bad-txns-prevout-null"; return 0;
+                }
+                if (t == 0) continue;         /* the coinbase has no prevouts */
+
+                if (vib.nseqs >= VAL_SEQ_CAP && vib.in_count > VAL_SEQ_CAP){
+                    /* see the note above: proceeding would be permissive */
+                    fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-txns-nonBIP68-final "
+                                    "(tx %llu has %llu inputs, past the sequence window)\n",
+                            g_apply_height, (unsigned long long)t,
+                            (unsigned long long)vib.in_count);
+                    g_last_reject = "bad-txns-nonBIP68-final"; return 0;
+                }
+
+                long long min_height = -1, min_time = -1;
+                int enforce = (vib.version >= 2);
+
+                for (u64 k = 0; k < vib.in_count; k++){
+                    /* the flat ledger is in block order, so advance with it */
+                    if (gi >= nin_tot || in_txidx[gi] != (unsigned)t){
+                        g_last_reject = "internal: bip68 ledger desync"; return 0;
+                    }
+                    u64 coin_h = in_h[gi];
+                    unsigned seq = (k < vib.nseqs) ? vib.seqs[k] : 0xFFFFFFFFu;
+                    gi++;
+                    if (!enforce) continue;
+                    if (seq & VAL_SEQ_DISABLE) continue;
+                    if (seq & VAL_SEQ_TYPE){
+                        long anc = (long)coin_h - 1; if (anc < 0) anc = 0;
+                        u32 coin_mtp;
+                        if (!val_mtp(anc, &coin_mtp)){
+                            g_last_reject = "bad-txns-nonBIP68-final"; return 0;
+                        }
+                        long long cand = val_seq_min_time(coin_mtp, seq);
+                        if (cand > min_time) min_time = cand;
+                    } else {
+                        long long cand = val_seq_min_height((unsigned long)coin_h, seq);
+                        if (cand > min_height) min_height = cand;
+                    }
+                }
+
+                if (enforce &&
+                    !val_seq_locks_ok(min_height, min_time,
+                                      g_apply_height, (unsigned long)tip_mtp)){
+                    fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-txns-nonBIP68-final "
+                                    "(tx %llu, minHeight %lld vs %ld, minTime %lld vs %lu)\n",
+                            g_apply_height, (unsigned long long)t, min_height,
+                            g_apply_height, min_time, (unsigned long)tip_mtp);
+                    g_last_reject = "bad-txns-nonBIP68-final";
+                    return 0;
+                }
+            }
         }
     }
 
@@ -1843,7 +2261,7 @@ static int undo_restore_cb(void* ctx, const u8 txid[32], u32 index, u64 value,
     int* fatal = (int*)ctx;
     long r = utxo_lsm_put(&g_utxo_lst, g_utxo_table, txid, index, value,
                           (u64)height, (u64)is_coinbase, script, (u32)slen);
-    if (r == -1 || r == 2) { *fatal = 1; return 0; }
+    if (r < 0 || r == 2) { *fatal = 1; return 0; }   /* UTX-3: sign, not one value */
     if (r == 1 && g_csi_add)
         g_csi_add(txid, index, value, (u64)height, (u64)is_coinbase, script, (unsigned long)slen);
     return 1;
@@ -2064,6 +2482,54 @@ long utxo_live_recover_partial_block(void* store_buf){
 long utxo_live_recover_at_boot(void* store_buf){
     if (g_recovery_checked) return g_recovery_result;
     g_recovery_checked = 1;
+
+    /* ---------------------------------------------------------------- STO-1
+     * The applied height must never be AHEAD of the archive tip.
+     *
+     * reorg_execute unapplies heights tip..fork+1 one at a time -- each
+     * utxo_live_unapply_block is durable immediately through the WAL -- but
+     * rewrites the persisted applied height only AFTER the whole loop, in
+     * utxo_live_rewind_to. Nothing marks "disconnect in progress". A crash
+     * between archive_truncate_safe and utxo_live_rewind_to therefore leaves
+     * index tip = fork while applied = the old tip T.
+     *
+     * utxo_live_catchup's guard is `tip <= g_applied_height`, which conflates
+     * "caught up" with "applied is ahead of the archive" and returns 0 for
+     * both. The node then appends the new branch's blocks and NEVER APPLIES
+     * ANY OF THEM: permanent divergence, and the audit's own note is that it
+     * happens "with no log line".
+     *
+     * Detecting it HERE rather than in catchup is deliberate. Mid-reorg,
+     * tip < applied is a legitimate transient -- archive_truncate_safe lowers
+     * the tip before utxo_live_rewind_to lowers applied -- so a check in
+     * catchup could fire spuriously and invent a new way to stop a healthy
+     * node. At boot no reorg can be in flight, so the condition is
+     * unambiguous.
+     *
+     * This does NOT fix STO-1. The per-block ordering the audit asks for
+     * (persist_applied_height(h-1) -> unapply(h) -> undo_discard(h), with an
+     * idempotent replay over the retained undo file) is a change to the
+     * durability ordering of the UTXO set and needs a crash-injection test;
+     * it stays open. What this does is turn the silent half into a loud,
+     * fail-closed halt, so the divergence is announced instead of served. */
+    {
+        long tip = *(int*)((char*)store_buf + 24);
+        if (tip >= 0 && g_applied_height > tip){
+            fprintf(stderr,
+                "[utxo_live] FATAL: applied height %ld is AHEAD of the archive tip %ld.\n"
+                "[utxo_live]   This is the signature of a crash during a reorg, between the\n"
+                "[utxo_live]   archive truncation and the applied-height rewind (audit STO-1).\n"
+                "[utxo_live]   Continuing would append the new branch and apply none of it,\n"
+                "[utxo_live]   diverging permanently and silently. Refusing to start.\n"
+                "[utxo_live]   Recover with: reindex-chainstate (rebuilds the set from the\n"
+                "[utxo_live]   archive), or restore the datadir from a snapshot.\n",
+                g_applied_height, tip);
+            g_halted = 1;
+            g_recovery_result = -1;
+            return -1;
+        }
+    }
+
     g_recovery_result = utxo_live_recover_partial_block(store_buf);
     return g_recovery_result;
 }
@@ -2327,8 +2793,44 @@ int utxo_live_init(const char* dir){
         ? utxo_lsm_reload(&g_utxo_lst, g_utxo_table)
         : utxo_lsm_init(&g_utxo_lst);
     UTXO_LSM_BARRIER();   /* reload may clobber callee-saved regs (ARM) */
-    int ok = have_prior_state ? (r != -1) : (r == 1);
-    if (!ok) { fprintf(stderr, "[utxo_live] utxo_lsm_%s failed\n", have_prior_state ? "reload" : "init"); return 0; }
+    /* UTX-2 (audit 2026-09-03): ANY negative reload is fatal, not just -1.
+     *
+     * utxo_store_reload returns -2 when the WAL replay hits utxo_put == 2 --
+     * the memtable is full -- and it stops there, holding only the records up
+     * to the fill point. utxo_lsm_reload propagates that -2 unchanged. This
+     * check tested `r != -1`, so -2 counted as SUCCESS and was then logged as
+     * a plausible "live=N".
+     *
+     * What followed made the loss permanent rather than merely wrong. The
+     * memtable is at or above fill_threshold, so the very next utxo_lsm_put
+     * -- the first block's coinbase, or a ghost-rollback restore -- runs
+     * mac_flush immediately, which writes the TRUNCATED memtable to a run,
+     * publishes the manifest, and ftruncates the WAL. Every record past the
+     * fill point is then gone from the only place it existed, and later
+     * blocks spending those outputs are rejected as "missing UTXO" forever:
+     * classified as a consensus reject, retried from the checkpoint, never
+     * halted. The audit reproduced it -- 300 WAL records into a 64-slot
+     * table returned -2 with a count of 64.
+     *
+     * The window is real: a bulk catch-up killed mid-flight leaves a large
+     * WAL that a steady-state-sized boot cannot hold. Refusing to start is
+     * the only safe answer, so the message names the two ways out rather than
+     * leaving an operator to guess. */
+    int ok = have_prior_state ? (r >= 0) : (r == 1);
+    if (!ok) {
+        fprintf(stderr, "[utxo_live] utxo_lsm_%s failed (r=%ld)\n",
+                have_prior_state ? "reload" : "init", r);
+        if (have_prior_state && r == -2)
+            fprintf(stderr,
+                "[utxo_live] FATAL: the WAL tail does not fit this memtable "
+                "(utxo_store_reload hit a full table and stopped).\n"
+                "[utxo_live]   Starting anyway would flush the TRUNCATED set "
+                "and ftruncate the WAL, losing every record past the fill "
+                "point permanently.\n"
+                "[utxo_live]   Fix: re-run with bulk sizing so the whole tail "
+                "fits, or drain the tail first with daemon/flush_wal_tail.\n");
+        return 0;
+    }
 
     /* A reloaded manifest can already be at or near UTXO_LIVE_MANIFEST_CAP --
      * e.g. a batch-scale seed (build_utxo.c, much larger manifest_cap) can

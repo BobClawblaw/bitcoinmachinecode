@@ -397,20 +397,83 @@ cmpctblock_shorttxid:
     ret
     .size cmpctblock_shorttxid,.-cmpctblock_shorttxid
 
+/* ======= cs_read(ptr=x0, end=x1) -> x0 = value, x1 = width (0 = malformed) =======
+ * SER-4 (audit 2026-09-03). All three BIP152 helpers read a block's tx-count
+ * CompactSize as a SINGLE BYTE and started the transaction walk at block+81.
+ * For any block with 253 or more transactions -- a 3, 5 or 9-byte varint --
+ * the count was taken as the marker byte (253/254/255) and the cursor was
+ * 2/4/8 bytes short, so every transaction boundary was misparsed.
+ *
+ * cons_verify, the consensus path, reads it correctly, so only the BIP152
+ * SERVING helpers were affected: a peer asking for a cmpctblock or
+ * getblocktxn on any modern block got the miss path and nothing at all.
+ * Compact-block relay was effectively off for every real block.
+ *
+ * One reader, used by all three, rather than three more hand-written
+ * varints. Bounds-checked against end: a truncated field returns width 0.
+ * Leaf: x0/x1 only. */
+cs_read:
+	cmp  x0, x1
+	b.hs .Lcsrb
+	ldrb w9, [x0]
+	cmp  w9, #0xfd
+	b.hs .Lcsrw
+	mov  w0, w9			/* the 1-byte value itself */
+	mov  x1, #1
+	ret
+.Lcsrw:
+	cmp  w9, #0xfd
+	b.eq 1f
+	cmp  w9, #0xfe
+	b.eq 2f
+	/* 0xff -> 8 bytes */
+	add  x2, x0, #9
+	cmp  x2, x1
+	b.hi .Lcsrb
+	ldr  x0, [x0, #1]
+	mov  x1, #9
+	ret
+1:	/* 0xfd -> 2 bytes */
+	add  x2, x0, #3
+	cmp  x2, x1
+	b.hi .Lcsrb
+	ldrh w9, [x0, #1]
+	mov  x0, x9
+	mov  x1, #3
+	ret
+2:	/* 0xfe -> 4 bytes */
+	add  x2, x0, #5
+	cmp  x2, x1
+	b.hi .Lcsrb
+	ldr  w9, [x0, #1]
+	mov  x0, x9
+	mov  x1, #5
+	ret
+.Lcsrb:
+	mov  x0, #0
+	mov  x1, #0
+	ret
+
 /* ======= block_txcount(blockbuf=x0, blen=x1) -> n / -1 ======= */
     .global block_txcount
     .type block_txcount,%function
 block_txcount:
-    cmp  x1,#81
-    b.lo .Lbtce
-    ldrb w9,[x0,#80]
-    cmp  w9,#0xfd
-    b.hs .Lbtce
-    mov  w0,w9
-    ret
+	stp  x29,x30,[sp,#-16]!
+	cmp  x1,#81
+	b.lo .Lbtce
+	/* SER-4: a real CompactSize, bounded by blen */
+	add  x2,x0,#80
+	add  x3,x0,x1		/* end = blk + blen */
+	mov  x0,x2
+	mov  x1,x3
+	bl   cs_read
+	cbz  x1,.Lbtce		/* width 0 = malformed/truncated */
+	ldp  x29,x30,[sp],#16
+	ret
 .Lbtce:
-    mov  x0,#-1
-    ret
+	mov  x0,#-1
+	ldp  x29,x30,[sp],#16
+	ret
     .size block_txcount,.-block_txcount
 
 /* ======= tx_wtxid(out=x0, tx=x1, txlen=x2) ======= */
@@ -441,11 +504,16 @@ block_tx_at:
     mov  x23,x4
     cmp  x20,#82
     b.lo .Lbtf
-    ldrb w9,[x19,#80]
-    str  x9,[sp]               /* ntx */
+    /* SER-4: header(80) + a REAL txcount CompactSize (1/3/5/9 bytes) */
+    add  x0,x19,#80
+    add  x1,x19,x20		/* end = blk + blen */
+    bl   cs_read
+    cbz  x1,.Lbtf		/* malformed/truncated count */
+    str  x0,[sp]		/* ntx */
     str  xzr,[sp,#8]           /* i */
-    add  x9,x19,#81
-    str  x9,[sp,#16]           /* cursor */
+    add  x9,x19,#80
+    add  x9,x9,x1              /* cursor = first tx, past the real varint */
+    str  x9,[sp,#16]
 .Lbtw:
     ldr  x9,[sp,#8]
     ldr  x10,[sp]
@@ -512,14 +580,18 @@ cmpctblock_build:
     mov  x2,#80
     bl   __cp                  /* header -> out */
     str  x22,[x19,#80]         /* nonce LE8 */
-    ldrb w9,[x20,#80]          /* ntx */
-    sub  w10,w9,#1
+    /* SER-4: ntx from a REAL CompactSize; nshort = ntx-1 */
+    add  x0,x20,#80
+    add  x1,x20,x21		/* end = blk + blen */
+    bl   cs_read
+    cbz  x1,.Lcbf		/* malformed/truncated count */
+    mov  x25,x0			/* ntx (callee-saved, loop bound) */
+    sub  w10,w25,#1
     strb w10,[x19,#88]         /* nshort */
     add  x23,x19,#89           /* sid ptr */
     mov  x24,#1                /* i */
 .Lcbl:
-    ldrb w9,[x20,#80]
-    cmp  x24,x9
+    cmp  x24,x25
     b.hs .Lcbp
     mov  x0,x20
     mov  x1,x21

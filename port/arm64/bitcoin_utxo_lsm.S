@@ -834,7 +834,17 @@ utxo_lsm_put:
 .lp_skip_flush:
 	cmp  w24, #1
 	b.eq .lp_err
-	ldr  w0, [sp, #0x00]
+	/* UTX-3 (audit 2026-09-03): SIGN-EXTEND the callee's status. utxo_store_put
+	 * returns a 64-bit -1 on a failed WAL drain (.p_fail: mov x0,#-1); the
+	 * 32-bit slot store/load below zero-extended it, so -1 reached callers as
+	 * 4294967295: utxo_live.c's fatal tests were false, the block kept going,
+	 * and the created output was in neither the memtable nor the WAL. The
+	 * block-boundary drain then retried the EARLIER buffered bytes, succeeded
+	 * once the disk recovered, and the checkpoint landed with the coin
+	 * permanently absent -- a silent divergence from Core's chainstate.
+	 * utxo_lsm_del had exactly this bug and exactly this fix already; this is
+	 * the sibling it left behind. (x86: movsxd r14,eax / mov rax,r14.) */
+	ldrsw x0, [sp, #0x00]
 	b    .lp_done
 .lp_err:
 	mov  x0, #-1
@@ -2521,10 +2531,23 @@ mac_lsm_recount:
 	b.eq .rc_find_setbest
 	cmp  w0, #1
 	b.ne .rc_find_next
-	ldr  x0, [x26, #8]              /* this.gen */
-	ldr  x1, [x27, #8]              /* best.gen */
-	cmp  x0, x1
-	b.ls .rc_find_next
+	/* UTX-1 (audit 2026-09-03): equal keys are broken by MANIFEST INDEX, the
+	 * way utxo_lsm_get does it, NOT by generation. utxo_lsm_get scans the
+	 * manifest from its highest index down and takes the first hit, so a
+	 * higher index wins. This merge used to prefer the higher GENERATION,
+	 * and the two orderings disagree after a PARTIAL compaction: the merged
+	 * run is placed at index 0 (correct, it is the oldest) but is assigned a
+	 * FRESH generation, higher than every survivor's. A key with a PUSH in
+	 * the merged run and a DEL in a survivor then resolved to the stale PUSH
+	 * here, while the lookup path correctly saw it as spent -- and the NEXT
+	 * compaction wrote that resurrection into the new run, at which point
+	 * the spent coin is genuinely back on disk.
+	 *
+	 * .rc_open_loop opens "manifest entry lo+i -> slot i", so slot index is
+	 * manifest order, and this scan runs i ascending. `best` is therefore
+	 * always at a LOWER index than `this` when a tie is reached, so `this`
+	 * always wins: fall straight through to setbest. No comparison needed --
+	 * and expressing it as a comparison on gen is what hid the bug. */
 .rc_find_setbest:
 	str  x25, [x28, #0x18]
 .rc_find_next:
@@ -3201,10 +3224,11 @@ utxo_lsm_compact:
 	b.eq .cc_find_setbest
 	cmp  w0, #1
 	b.ne .cc_find_next
-	ldr  x0, [x26, #8]               /* this.gen */
-	ldr  x1, [x27, #8]               /* best.gen */
-	cmp  x0, x1
-	b.ls .cc_find_next
+	/* UTX-1 (audit 2026-09-03): the same gen-vs-manifest-index tie-break bug
+	 * as the .rc_ merge loop above -- equal keys fall through to setbest,
+	 * because this scan runs i ascending and `best` is always at a lower
+	 * index than `this` at a tie. A gen comparison here resurrected spent
+	 * coins into the next compaction. */
 .cc_find_setbest:
 	str  x25, [x28, #0x58]
 .cc_find_next:

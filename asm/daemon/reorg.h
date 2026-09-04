@@ -122,6 +122,19 @@ typedef struct {
  * re-entry. Returns the number of transactions in the mempool afterwards, or
  * -1 on allocation failure. See the .c for why a full rebuild is used rather
  * than a surgical unregister. */
+/* STO-7: register the mempool that reorg_execute should reconcile once a
+ * reorg has completed. INJECTED and default-OFF -- the hermetic suites drive
+ * reorg_mempool_reconcile themselves and must not have reorg_execute reach
+ * into a pool they never built. Pass NULL (or a struct with a NULL .mp) to
+ * disarm. The struct is copied. */
+void reorg_set_mempool(const reorg_mempool_t* m);
+
+/* STO-7: fork height of the most recently completed reorg, or -1 if none has
+ * run in this process. The daemon rewinds its new-block choke-point baseline
+ * to this so the replacement blocks -- which may sit at or below the old tip
+ * -- are still fed to the mempool's block-connect path. */
+long reorg_last_fork_height(void);
+
 long reorg_mempool_reconcile(reorg_mempool_t* m,
                              const unsigned char* const* disc_blocks,
                              const uint32_t* disc_lens, long ndisc);

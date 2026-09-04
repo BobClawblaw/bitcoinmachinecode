@@ -66,3 +66,71 @@ int serve_inv_bounds(const unsigned char* pl, long plen,
     *count = c; *off = o;
     return 1;
 }
+
+/* ---------------------------------------------------------------- NET-8
+ * getheaders: walk the WHOLE locator, not just its first hash.
+ *
+ * bitcoin_serve.asm looked up pl+5 alone and, on a miss, served from height
+ * 0. It also checked only `plen >= 5`, so a 5-byte message read a stale hash
+ * out of the receive buffer.
+ *
+ * Every peer that is one block ahead of us starts its locator with a hash we
+ * do not have -- the incident report calls that "common, not rare" -- so each
+ * getheaders was answered with 2000 headers from genesis, 162 KB, which a
+ * Core peer discards as already known. Pure waste on every announcement, and
+ * a fingerprint.
+ *
+ * Core's FindForkInGlobalIndex walks every locator entry and serves from the
+ * first one on the active chain, falling back to genesis only when none
+ * matches, and honours hashStop.
+ *
+ * Payload: version(4) | CompactSize(count) | count*32 locator | 32 stop.
+ *
+ * Returns 1 with *out_from set to the height to serve FROM, and *out_stop set
+ * to the stop hash's height or -1 when the stop hash is zero/unknown.
+ * Returns 0 when the message is malformed, which the caller drops. In C for
+ * the same reason the inv bounds are: a second hand-written varint walk in
+ * assembly is how the first one went wrong.
+ */
+extern int idx_get(void* idx, const unsigned char hash[32], long* height);
+
+int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
+                       long* out_from, long* out_stop){
+    *out_from = 0;
+    *out_stop = -1;
+    if (!pl || !htidx) return 0;
+    if (plen < 4 + 1) return 0;
+
+    unsigned long p = 4;                       /* skip nVersion */
+    unsigned long long n = 0;
+    unsigned char c = pl[p];
+    if (c < 0xfd)      { n = c;                                    p += 1; }
+    else if (c == 0xfd){ if (plen < p+3) return 0;
+                         n = (unsigned long long)pl[p+1] | ((unsigned long long)pl[p+2] << 8);
+                         p += 3; }
+    else if (c == 0xfe){ if (plen < p+5) return 0;
+                         n = 0; for (int i=0;i<4;i++) n |= (unsigned long long)pl[p+1+i] << (8*i);
+                         p += 5; }
+    else               { if (plen < p+9) return 0;
+                         n = 0; for (int i=0;i<8;i++) n |= (unsigned long long)pl[p+1+i] << (8*i);
+                         p += 9; }
+
+    /* Core's MAX_LOCATOR_SZ is 101; anything larger is a malformed request.
+     * The bound also stops an absurd count from making the walk expensive. */
+    if (n > 101) return 0;
+    if (plen < p + n * 32u + 32u) return 0;    /* locator + the stop hash */
+
+    /* first locator entry we know wins, in the order the peer sent them --
+     * they run newest-first, so this is the most recent common block */
+    for (unsigned long long i = 0; i < n; i++){
+        long h = 0;
+        if (idx_get(htidx, pl + p + i * 32u, &h) == 1){ *out_from = h + 1; break; }
+    }
+
+    /* hashStop: all-zero means "as many as you have" */
+    { const unsigned char* stop = pl + p + n * 32u;
+      int zero = 1;
+      for (int i = 0; i < 32; i++) if (stop[i]){ zero = 0; break; }
+      if (!zero){ long sh = 0; if (idx_get(htidx, stop, &sh) == 1) *out_stop = sh; } }
+    return 1;
+}

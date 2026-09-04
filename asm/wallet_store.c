@@ -48,6 +48,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <sys/stat.h>
 
@@ -64,12 +66,47 @@ static int hex_val(char c);
 /* write `body` to path atomically (tmp + rename), mode 0600 */
 static int store_write_atomic(const char* path, const char* body){
     char tmp[4096]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
-    FILE* f = fopen(tmp, "w"); if (!f) return -1;
+    /* WAL-4: 0600 from CREATION, not chmod'ed afterwards. fopen(tmp,"w")
+     * creates at 0666 & ~umask, so the mnemonic was briefly world-readable
+     * under the tmp name -- the same window the old plaintext path had under
+     * the real name, just less obvious. */
+    int tfd = open(tmp, O_WRONLY|O_CREAT|O_TRUNC, 0600);
+    if (tfd < 0) return -1;
+    FILE* f = fdopen(tfd, "w"); if (!f){ close(tfd); remove(tmp); return -1; }
     int ok = fputs(body, f) >= 0 && fflush(f) == 0;
+    /* ---- WAL-4 (audit 2026-09-03): fsync the file, then the directory.
+     *
+     * This was fputs + fflush + rename with no fsync at all, while EVERY
+     * other store in this module already does it -- wallet_enc_state.c,
+     * wallet_scan.c, wallet_labels.c, wallet_txlog.c. fflush only moves bytes
+     * from stdio's buffer into the page cache; nothing puts them on disk.
+     *
+     * That matters here more than anywhere else in the tree. The legacy
+     * v2 -> v3 upgrade rewrites the store on EVERY successful open, and runs
+     * unattended at daemon boot -- so it replaces the only copy of the wallet.
+     * On any filesystem without ext4's rename-triggered flush (xfs, btrfs,
+     * ext4 with noauto_da_alloc, most network filesystems) a power loss right
+     * after leaves the directory entry pointing at a zero-length or partial
+     * file, and the mnemonic is gone.
+     *
+     * The directory fsync is what makes the RENAME durable, not just the
+     * bytes: without it the new name can be lost even though the file is
+     * intact. */
+    if (ok && fflush(f) == 0){
+        int fd = fileno(f);
+        if (fd >= 0 && fsync(fd) != 0) ok = 0;
+    }
     fclose(f);
     if (!ok){ remove(tmp); return -1; }
-    chmod(tmp, 0600);
     if (rename(tmp, path) != 0){ remove(tmp); return -1; }
+    { /* durability of the rename itself */
+        char dir[4096];
+        snprintf(dir, sizeof dir, "%s", path);
+        char* slash = strrchr(dir, '/');
+        if (slash){ *slash = 0; } else { dir[0] = '.'; dir[1] = 0; }
+        int dfd = open(dir[0] ? dir : ".", O_RDONLY);
+        if (dfd >= 0){ fsync(dfd); close(dfd); }
+    }
     return 0;
 }
 /* "<magic>\n" BMCWAL_FORMAT_WCRYPT "\n<hex of the sealed container>\n"; -1 on failure */
@@ -178,17 +215,25 @@ static void make_tag(unsigned char tag[32], const unsigned char K[64],
 int wallet_store_create(const char* path, const char* mnemonic, const char* pass) {
     if (!path || !mnemonic) return -1;
     int plain = (!pass || !pass[0]);   /* no secret -> V1 plaintext */
-    FILE* f = fopen(path, "w");
-    if (!f) return -1;
-    if (plain) {
-        fprintf(f, BMCWAL_MAGIC_V1 "\n");
-        fprintf(f, "%s\n", mnemonic);
-    } else {
-        fclose(f); remove(path);
+    if (!plain)
         return store_write_sealed(path, BMCWAL_MAGIC_V3, pass, mnemonic);   /* the strong container, never v2 again */
-    }
-    fclose(f);
-    chmod(path, 0600);
+
+    /* ---- WAL-4 (audit 2026-09-03): the plaintext branch goes through
+     * store_write_atomic like every other write in this file.
+     *
+     * It used to fopen(path, "w") the FINAL path directly, write the
+     * mnemonic, and only then chmod 0600 -- so the seed phrase existed
+     * world-readable for the length of that window, and a failure partway
+     * left a truncated wallet where a complete one had been. Neither was
+     * true of the sealed branch, which already used the tmp+rename helper.
+     *
+     * store_write_atomic creates the tmp at 0600 from the start, fsyncs the
+     * file and then the directory, so the mnemonic is never world-readable at
+     * any point and the file is either wholly the old one or wholly the new. */
+    { char body[4096];
+      int n = snprintf(body, sizeof body, BMCWAL_MAGIC_V1 "\n%s\n", mnemonic);
+      if (n < 0 || (size_t)n >= sizeof body) return -1;
+      if (store_write_atomic(path, body) != 0) return -1; }
     return 0;
 }
 

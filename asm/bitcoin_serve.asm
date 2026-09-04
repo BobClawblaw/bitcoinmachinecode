@@ -29,6 +29,7 @@ default rel
 extern g_peer_wants_addrv2
     extern idx_get
     extern serve_inv_bounds
+    extern serve_locator_from
 extern node_relay_flag
 extern serve_tx_gate
 extern serve_inv_gate
@@ -198,6 +199,7 @@ src_buf:   times (1000*18) db 0
 align 16
 s_plen:   dq 0
 s_fh:     dq 0
+s_ghstop: dq -1        ; NET-8: hashStop height for getheaders, -1 = absent/unknown
 s_cmd:    times 16 db 0
 s_cnt:    dq 0
 s_nf:     dq 0        ; notfound entries accumulated for THIS getdata
@@ -859,11 +861,58 @@ node_serve_loop:
     ; here rather than per connection so a long-lived peer cannot go stale.
     call serve_idx_topup
     mov  qword [s_nf], 0      ; no misses yet for this getdata
-    ; cnt = pl[0] (single-byte varint)
-    movzx rax, byte [pl_buf]
-    mov  [s_cnt], rax     ; item counter
-    lea  rax, [pl_buf+1]
-    mov  [s_ptr], rax     ; item pointer (do NOT clobber the outer rbx counter)
+    ; ---- NET-7 (audit 2026-09-03): parse the count as a real CompactSize,
+    ; bounded against the payload, exactly as .do_inv already does.
+    ;
+    ; The count used to be `movzx rax, byte [pl_buf]` with only `plen >= 37`
+    ; checked. Two consequences, and the first is the one that hurts every
+    ; day: Core's MAX_GETDATA_SZ is 1000, so a request for 253 or more
+    ; transactions starts with 0xfd, which was read as the count 253 and left
+    ; every entry misaligned by two bytes -- we answered ~50 notfounds for
+    ; garbage hashes and served nothing. The 2026-09-02 audit response claimed
+    ; "inv/getdata above MAX_INV_SZ scored"; that was true of inv only.
+    ;
+    ; Second, a 37-byte getdata with count byte 0xff walked up to 255 entries
+    ; out of whatever an earlier, larger message left in the 8 MB receive
+    ; buffer -- the peer-steered nonsense serve_invbounds.c was written to
+    ; stop. No memory-safety impact (the buffer is ours and 8 MB), but the
+    ; hashes came from the peer's earlier traffic.
+    ;
+    ; serve_inv_bounds does the varint and the bounds for both message types
+    ; now; writing a second parser in assembly would only trade one subtle
+    ; parser for another.
+    ;   rax =  1 ok, 0 malformed/short (drop), -1 over MAX_INV_SZ (score it)
+    lea  rdi, [pl_buf]
+    mov  rsi, [s_plen]
+    lea  rdx, [s_ivn]
+    lea  rcx, [s_ivo]
+    call serve_inv_bounds
+    movsxd rax, eax           ; SysV: only EAX is defined for an int return
+    cmp  rax, -1
+    je   .gd_toobig
+    test rax, rax
+    jle  .next                ; malformed or short: drop quietly, as inv does
+    mov  rax, [s_ivn]
+    mov  [s_cnt], rax         ; item counter (validated entry count)
+    mov  rax, [s_ivo]
+    add  rax, pl_buf
+    mov  [s_ptr], rax         ; first entry (past the real CompactSize)
+    jmp  .gd_loop
+.gd_toobig:
+    ; Core: `if (vInv.size() > MAX_INV_SZ) Misbehaving`. Exactly the treatment
+    ; .inv_toobig gives -- the same violation hook and the same reason string,
+    ; because it is the same protocol rule on a sibling message.
+    mov  rax, [g_serve_violation_hook]
+    test rax, rax
+    je   .next
+    lea  rdi, [viol_invsz]
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16
+    call rax
+    mov  rsp, rbp
+    pop  rbp
+    jmp  .next
 .gd_loop:
     mov  rax, [s_cnt]
     test rax, rax
@@ -1105,33 +1154,42 @@ node_serve_loop:
     jne  .next
     cmp  dword [s_cmd+7], 0x00737265 ; "ers\0"
     jne  .next
-    ; locator hash at pl+5 -> resolve via idx
-    mov  rax, [s_plen]
-    cmp  rax, 5
-    jb   .gh_zero
-    lea  rsi, [pl_buf+5]
-    ; idx_get(ht_idx, pl+5, &fh)
-    mov  rdi, [s_htidx]      ; stable copy
-    ; rsi already = pl+5
-    lea  rdx, [s_fh]
-    call idx_get
-    test rax, rax
-    jz   .gh_from0
-    mov  rax, [s_fh]
-    inc  rax                 ; from = fh+1
-    jmp  .gh_havefrom
-.gh_from0:
-    xor  eax, eax            ; from = 0
-.gh_havefrom:
-    mov  [s_fh], rax     ; from
-    jmp  .gh_build
-.gh_zero:
-    ; unknown locator / empty -> serve from genesis (headers with count 0 means
-    ; "i have nothing"; but reference clients expect headers from the locator).
+    ; ---- NET-8 (audit 2026-09-03): walk the WHOLE locator, honour hashStop.
+    ;
+    ; This used to look up pl+5 -- the FIRST locator hash -- and serve from
+    ; height 0 on a miss, ignoring every other entry and the stop hash, with
+    ; only `plen >= 5` checked (so a 5-byte message read a stale hash out of
+    ; the receive buffer). Every peer one block ahead of us starts its locator
+    ; with a hash we do not have, which the incident report calls "common, not
+    ; rare" -- so each getheaders was answered with 2000 headers from genesis,
+    ; 162 KB, that a Core peer discards as already known.
+    ;
+    ; serve_locator_from does the CompactSize, the bounds and the walk (Core's
+    ; FindForkInGlobalIndex), in C for the same reason serve_inv_bounds is:
+    ; hand-writing a second varint walk in assembly is how the first one went
+    ; wrong. rax = 1 ok / 0 malformed.
+    lea  rdi, [pl_buf]
+    mov  rsi, [s_plen]
+    mov  rdx, [s_htidx]
+    lea  rcx, [s_fh]         ; out_from
+    lea  r8,  [s_ghstop]     ; out_stop (-1 = none/unknown)
+    call serve_locator_from
+    test eax, eax
+    jz   .next               ; malformed: drop, as the inv path does
 .gh_build:
     ; tip = st[24]
     mov  eax, [r14+24]
     mov  [s_cnt], rax     ; tip
+    ; NET-8: hashStop, when it names a height we hold, caps the range Core
+    ; would send. Only ever LOWERS the bound -- a stop above our tip is not a
+    ; request to invent headers.
+    mov  rax, [s_ghstop]
+    cmp  rax, 0
+    jl   .gh_nostop
+    cmp  rax, [s_cnt]
+    jae  .gh_nostop
+    mov  [s_cnt], rax
+.gh_nostop:
     mov  rax, [s_fh]
     cmp  rax, [s_cnt]
     ja   .gh_empty

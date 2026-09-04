@@ -16,6 +16,7 @@
 	.extern p2p_read
 	.extern p2p_write
 	.extern serve_inv_bounds
+	.extern serve_locator_from
 	.extern serve_getaddr
 	.extern g_peer_wants_addrv2
 	.extern amr_init
@@ -96,6 +97,8 @@ ah_buf:      .zero (1000*30+8)
 src_buf:     .zero (1000*18)
 s_plen:      .zero 8
 s_fh:        .zero 8
+s_ghstop:    .zero 8                    /* NET-8: hashStop height for getheaders,
+                                         * -1 = absent/unknown (prologue-inited) */
 s_cmd:       .zero 16
 s_cnt:       .zero 8
 s_ptr:       .zero 8
@@ -276,6 +279,10 @@ node_serve_loop:
 	str  x3, [x23]
 	LOADADDR x23, s_served
 	str  xzr, [x23]
+	/* NET-8: the hashStop sentinel: -1 = absent/unknown. */
+	LOADADDR x23, s_ghstop
+	mov  x9, #-1
+	str  x9, [x23]
 	/* NET-1: one-past-the-end of the blocktxn assembly buffer, checked by
 	 * the .do_getblocktxn writer before every append. */
 	LOADADDR x23, bt_buf
@@ -798,13 +805,37 @@ node_serve_loop:
 	bl   serve_idx_topup
 	LOADADDR x10, s_nf
 	str  xzr, [x10]                   /* no misses yet for this getdata */
-	LOADADDR x9, pl_buf
-	ldrb w10, [x9]                    /* cnt */
+	/* NET-7 (audit 2026-09-03): parse the count as a real CompactSize,
+	 * bounded against the payload, exactly as .inv does via the shared
+	 * serve_inv_bounds helper. The count used to be pl_buf[0] with only
+	 * plen >= 37 checked. Two consequences: Core's MAX_GETDATA_SZ is 1000,
+	 * so a request for 253 or more transactions starts with 0xfd, which was
+	 * read as the count 253 and left every entry misaligned by two bytes --
+	 * we answered ~50 notfounds for garbage hashes and served nothing. And
+	 * a 37-byte getdata with count byte 0xff walked up to 255 entries out
+	 * of whatever an earlier, larger message left in the 8 MB receive
+	 * buffer -- the peer-steered nonsense serve_invbounds.c was written to
+	 * stop.   x0 = 1 ok, 0 malformed/short (drop), -1 over MAX_INV_SZ. */
+	LOADADDR x0, pl_buf
+	LOADADDR x9, s_plen
+	ldr  x1, [x9]
+	LOADADDR x2, s_ivn
+	LOADADDR x3, s_ivo
+	bl   serve_inv_bounds
+	cmp  x0, #-1
+	b.eq .gd_toobig
+	cmp  x0, #1
+	b.lt .next			/* malformed or short: drop quietly, as inv does */
+	LOADADDR x9, s_ivn
+	ldr  x10, [x9]
 	LOADADDR x11, s_cnt
-	str  x10, [x11]
+	str  x10, [x11]			/* item counter (validated entry count) */
+	LOADADDR x9, s_ivo
+	ldr  x10, [x9]
+	LOADADDR x11, pl_buf
+	add  x10, x10, x11
 	LOADADDR x11, s_ptr
-	add  x10, x9, #1
-	str  x10, [x11]                   /* s_ptr = pl_buf+1 */
+	str  x10, [x11]			/* first entry (past the real CompactSize) */
 .LSV_gd_loop:
 	LOADADDR x9, s_cnt
 	ldr  x9, [x9]
@@ -976,6 +1007,16 @@ node_serve_loop:
 	mov  x4, x11
 	bl   p2p_write
 	b    .next
+/* getdata vector above MAX_INV_SZ: score it the way Core does -- the same
+ * violation hook and the same reason string as .inv_toobig, because it is
+ * the same protocol rule on a sibling message (x86 .gd_toobig). */
+.gd_toobig:
+	LOADADDR x9, g_serve_violation_hook
+	ldr  x9, [x9]
+	cbz  x9, .next
+	LOADADDR x0, viol_invsz
+	blr  x9
+	b    .next
 
 .gd_next:
 	LOADADDR x9, s_ptr
@@ -1034,27 +1075,43 @@ node_serve_loop:
 	b.ne .next
 	LOADADDR x9, s_plen
 	ldr  x9, [x9]
-	cmp  x9, #5
-	b.lo .gh_build
-	mov  x0, x22
-	LOADADDR x1, pl_buf
-	add  x1, x1, #5
-	LOADADDR x2, s_fh
-	bl   idx_get
-	cbz  x0, .gh_from0
-	LOADADDR x9, s_fh
-	ldr  x9, [x9]
-	add  x9, x9, #1                   /* from = fh+1 */
-	LOADADDR x10, s_fh
-	str  x9, [x10]
-	b    .gh_build
-.gh_from0:
-	LOADADDR x9, s_fh
-	str  xzr, [x9]
+	/* NET-8 (audit 2026-09-03): walk the WHOLE locator, honour hashStop.
+	 * This used to look up pl+5 -- the FIRST locator hash -- and serve from
+	 * height 0 on a miss, ignoring every other entry and the stop hash, with
+	 * only plen >= 5 checked (so a 5-byte message read a stale hash out of
+	 * the receive buffer). Every peer one block ahead of us starts its
+	 * locator with a hash we do not have -- so each getheaders was answered
+	 * with 2000 headers from genesis, 162 KB, that a Core peer discards as
+	 * already known.
+	 * serve_locator_from does the CompactSize, the bounds and the walk
+	 * (Core's FindForkInGlobalIndex), in C for the same reason
+	 * serve_inv_bounds is: hand-writing a second varint walk in assembly is
+	 * how the first one went wrong.   x0 = 1 ok / 0 malformed. */
+	LOADADDR x0, pl_buf
+	LOADADDR x9, s_plen
+	ldr  x1, [x9]
+	mov  x2, x22                      /* htidx */
+	LOADADDR x3, s_fh		/* out_from */
+	LOADADDR x4, s_ghstop		/* out_stop (-1 = none/unknown) */
+	bl   serve_locator_from
+	cbz  x0, .next			/* malformed: drop, as the inv path does */
 .gh_build:
 	ldr  w9, [x21, #24]               /* tip = st[24] */
 	LOADADDR x10, s_cnt
 	str  x9, [x10]
+	/* NET-8: hashStop, when it names a height we hold, caps the range Core
+	 * would send. Only ever LOWERS the bound -- a stop above our tip is not
+	 * a request to invent headers. */
+	LOADADDR x9, s_ghstop
+	ldr  x10, [x9]
+	cmp  x10, #0
+	b.lt .gh_nostop
+	LOADADDR x11, s_cnt
+	ldr  x11, [x11]
+	cmp  x10, x11
+	b.hs .gh_nostop
+	str  x10, [x11]
+.gh_nostop:
 	LOADADDR x9, s_fh
 	ldr  x9, [x9]
 	LOADADDR x10, s_cnt

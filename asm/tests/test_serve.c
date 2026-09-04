@@ -174,6 +174,118 @@ int main(void){
     }
     cki("multi-inv getdata: all blocks byte-exact", mall, 1);
 
+    /* ---- NET-8: getheaders must walk the WHOLE locator ----
+     * The handler used to look up only the FIRST locator hash and, on a miss,
+     * serve from height 0 -- ignoring every other entry. A peer one block
+     * ahead of us starts its locator with a hash we do not have, which is the
+     * common case, not the rare one, so every getheaders was answered with
+     * 2000 headers from genesis that a Core peer discards as already known.
+     *
+     * The locator here is [unknown, bhash[3], bhash[0]] -- newest-first, as
+     * Core builds them. The first entry is a hash that cannot exist; the
+     * second is real. A correct walk serves from height 4. The old one served
+     * from 0.
+     *
+     * Asserting the FIRST HEADER'S BYTES rather than a count: serving from
+     * genesis also returns headers, just the wrong ones, so a count check
+     * would pass against the defect. */
+    {
+        unsigned char gh[4 + 1 + 3*32 + 32];
+        int gp = 0;
+        gh[gp++]=1; gh[gp++]=0; gh[gp++]=0; gh[gp++]=0;   /* nVersion */
+        gh[gp++]=3;                                        /* locator count */
+        memset(gh+gp, 0xAB, 32); gp += 32;                 /* unknown */
+        memcpy(gh+gp, bhash[3], 32); gp += 32;             /* known: height 3 */
+        memcpy(gh+gp, bhash[0], 32); gp += 32;             /* known: height 0 */
+        memset(gh+gp, 0, 32); gp += 32;                    /* hashStop = none */
+        p2p_write(fd, "getheaders", 10, gh, (unsigned)gp);
+
+        char c7[12]; static unsigned char hb[1<<20]; unsigned hl = 0;
+        int rr = p2p_read(fd, c7, hb, sizeof hb, &hl);
+        int ok8 = 0;
+        if (rr > 0 && !strncmp(c7, "headers", 7) && hl >= 1 + 81){
+            /* count varint (small here), then 80-byte headers each followed
+             * by a 0 txn_count byte */
+            unsigned off = (hb[0] < 0xfd) ? 1u : 3u;
+            if (hl >= off + 80)
+                ok8 = (memcmp(hb + off, blk[4], 80) == 0);   /* height 4 first */
+        }
+        cki("NET-8 a locator whose first hash is unknown serves from the next "
+            "KNOWN one, not from genesis", ok8, 1);
+
+        /* resync, for the same reason NET-7 does: leave the stream where the
+         * next case expects it regardless of what the server chose to send. */
+        { uint64_t nonce = 0x4e455438beefull;
+          p2p_write(fd, "ping", 4, &nonce, 8);
+          for (int k = 0; k < 64; k++){
+              char c8[12]; static unsigned char rb8[1<<20]; unsigned rl8 = 0;
+              if (p2p_read(fd, c8, rb8, sizeof rb8, &rl8) <= 0) break;
+              if (!strncmp(c8, "pong", 4)) break;
+          } }
+    }
+
+    /* ---- NET-7: a getdata whose count needs a 3-byte CompactSize ----
+     * Core's MAX_GETDATA_SZ is 1000, so it routinely asks for 253 or more
+     * items in one message -- and 253 is the first count that does not fit a
+     * single byte. The handler used to read `movzx rax, byte [pl_buf]`, so
+     * the 0xfd prefix was taken AS the count and every entry after it was
+     * misaligned by two bytes: this node answered ~50 notfounds for garbage
+     * hashes and served nothing. Every large getdata from every Core peer.
+     *
+     * The request below asks for 253 items: the TEST_NB real blocks followed
+     * by filler entries with hashes that cannot exist. A correct parser
+     * serves the real ones and reports the rest notfound. The old one-byte
+     * parser cannot even find the first entry.
+     *
+     * What is asserted is that the REAL blocks come back byte-exact -- not a
+     * count of replies -- because a misaligned walk still produces replies,
+     * just about the wrong hashes.
+     *
+     * It RESYNCS the stream afterwards with a ping, discarding whatever
+     * notfound replies remain, so its position among the other cases does not
+     * matter. The first draft left them queued and broke the ping/pong check
+     * that followed; moving it to the end then broke ITSELF, because the
+     * checks before it leave their own state. A test whose result depends on
+     * where it sits is not pinning what it claims to. */
+    {
+        enum { GD_N = 253 };
+        static unsigned char big[8 + GD_N*36];
+        int bp = 0;
+        big[bp++] = 0xfd;                       /* CompactSize: 3-byte form */
+        big[bp++] = (unsigned char)(GD_N & 0xff);
+        big[bp++] = (unsigned char)(GD_N >> 8);
+        for (int i = 0; i < GD_N; i++){
+            unsigned char iv[36]; memset(iv, 0, 36);
+            iv[0] = 2;                          /* MSG_BLOCK */
+            if (i < TEST_NB) memcpy(iv+4, bhash[i], 32);
+            else { iv[4] = 0xee; iv[5] = (unsigned char)i; }   /* cannot exist */
+            memcpy(big+bp, iv, 36); bp += 36;
+        }
+        p2p_write(fd, "getdata", 7, big, (unsigned)bp);
+
+        int got_real = 0, got_nf = 0;
+        for (int r = 0; r < GD_N + 8; r++){
+            char c5[12]; static unsigned char rb[1<<20]; unsigned rl = 0;
+            if (p2p_read(fd, c5, rb, sizeof rb, &rl) <= 0) break;
+            if (!strncmp(c5, "block", 5)){
+                for (int j = 0; j < TEST_NB; j++)
+                    if ((long)rl == blen[j] && !memcmp(rb, blk[j], (size_t)rl)){ got_real++; break; }
+            } else if (!strncmp(c5, "notfound", 8)) got_nf++;
+            if (got_real >= TEST_NB) break;
+        }
+        cki("NET-7 a 253-entry getdata (3-byte CompactSize) serves the real blocks",
+            got_real, TEST_NB);
+
+        /* resync: ping, then discard everything until the pong comes back */
+        { uint64_t nonce = 0x4e455437beefull;
+          p2p_write(fd, "ping", 4, &nonce, 8);
+          for (int k = 0; k < GD_N + 16; k++){
+              char c6[12]; static unsigned char rb6[1<<20]; unsigned rl6 = 0;
+              if (p2p_read(fd, c6, rb6, sizeof rb6, &rl6) <= 0) break;
+              if (!strncmp(c6, "pong", 4)) break;
+          } }
+    }
+
     /* ---- STRESS: repeated ping/pong after serving (loop-continuation sanity) ---- */
     int pingok=1;
     for(int k=0;k<25;k++){
@@ -186,6 +298,7 @@ int main(void){
     cki("25x ping/pong after multi-getdata (loop stable)", pingok, 1);
 
     close(fd); waitpid(pid,0,0); close(ls);
+
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }

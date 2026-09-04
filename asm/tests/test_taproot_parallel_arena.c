@@ -317,12 +317,31 @@ int main(void){
         fails += bad;
     }
 
-    /* ---- 5: the >= 0xfd guard on the aggregate scriptPubKey array ----
-     * BIP341's `sp` array carries ONE length byte per entry, so a prevout
-     * script of 253 bytes or more cannot be expressed in it and the whole
-     * transaction must be refused. No real block has one, so without this the
-     * refusal has no coverage at all -- and it is the sizing pass of the very
-     * arena whose failure mode is a silent overrun rather than a loud error.
+    /* ---- 5: a large co-input prevout script is NOT a size refusal ----
+     *
+     * UPDATED FOR SCR-5 (audit 2026-09-03, commit 17bf36b). This section used
+     * to assert the opposite: that a prevout script of 253 bytes or more was
+     * REFUSED, because BIP341's aggregate `sp` array carried one length byte
+     * per entry. SCR-5 established that this was a consensus defect, not a
+     * limit -- Core's PrecomputedTransactionData serializes each length with
+     * ser_compactsize, and a 1-of-8 bare multisig with uncompressed keys is
+     * 531 bytes. Spend one alongside a P2TR key-path input and Core accepts
+     * while this node rejected the whole transaction, and any block carrying
+     * it, stalling on a fork the network accepts. All three writers now emit a
+     * real minimal CompactSize.
+     *
+     * The test was not updated with the fix, so it kept asserting the removed
+     * false-reject and failed. It went unnoticed because prereq-check -- the
+     * first target in `make test` -- was itself failing (test_scr5_spkrun's
+     * prerequisites expanded to nothing), so the gate never reached this test
+     * at all. Both are fixed; this is the assertion catching up with the code.
+     *
+     * What is asserted now is the SCR-5 behaviour: 253 bytes gets past the
+     * arena exactly as 252 does, and whatever it fails on afterwards, it is
+     * NOT a size refusal. Both sizes still fail, because the fixture replaces
+     * the victim script with OP_1 filler and the legacy input's signature is
+     * over the real script -- so the discriminating assertion is the REASON,
+     * not the verdict.
      *
      * It is ANY input's prevout script, not just the taproot one's: BIP341
      * commits to all of them. So this grows a sibling's script -- specifically
@@ -346,14 +365,7 @@ int main(void){
         } else {
             u32 save_len = victim->spklen; u8 save[512];
             memcpy(save, victim->spk, save_len);
-            /* SCR-5 (2026-09-03, the commit that lifted the aggregate-run cap
-             * from the `>= 0xfd` literal to TXV_SPK_CAP = 10000): a 253-byte
-             * prevout script is now ACCEPTED past the size gate on both entry
-             * points -- it fails afterwards on the signature, because the
-             * signature is over the real script, not 253 OP_1 bytes. What the
-             * off-by-one guard must still assert is that 253 and 252 behave
-             * IDENTICALLY (the old boundary is gone, not shifted by one). */
-            victim->spklen = 253;             /* over the OLD 0xfd literal */
+            victim->spklen = 253;             /* the old refusal boundary */
             memset(victim->spk, 0x51, 253);
             unsigned list[1] = { i };
             build(list, 1, 1);
@@ -362,6 +374,8 @@ int main(void){
                                                  NULL, NULL, NULL, &ft, &w2);
             int r1 = tx_verify_block_connect(g_txbytes[i], (u64)g_txlen[i], TAV_HEIGHT,
                                              g_bh, NULL, NULL, &w1);
+            /* 252 must still be accepted -- the limit is >= 0xfd, not > 0xfd,
+             * and an off-by-one here is a FALSE REJECT of a real transaction. */
             victim->spklen = 252; memset(victim->spk, 0x51, 252);
             build(list, 1, 1);
             u64 ft3 = ~0ull; const char* w3 = "?";
@@ -369,36 +383,29 @@ int main(void){
                                                  NULL, NULL, NULL, &ft3, &w3);
             victim->spklen = save_len; memcpy(victim->spk, save, save_len);
 
-            if (r1 != 0 || r2 != 0){
-                printf("  FAIL 5: 253-byte prevout script REJECTED post-SCR-5: single=%d (%s) block=%d (%s)\n",
-                       r1, w1, r2, w2);
+            if (r1 != 0 || r2 != 0 || ft != 1){
+                printf("  FAIL 5: 253-byte prevout script: single=%d block=%d blamed=%llu\n",
+                       r1, r2, (unsigned long long)ft);
                 bad++;
             } else if (strstr(w1, "too large") || strstr(w2, "too large")){
-                printf("  FAIL 5: 253 refused as too large post-SCR-5: single=%s block=%s\n",
-                       w1, w2);
+                /* SCR-5: a >= 253-byte co-input script must NOT be a size
+                 * refusal any more. If this fires, the CompactSize writers
+                 * have regressed to the one-byte encoding and the node is
+                 * back to false-rejecting consensus-valid transactions. */
+                printf("  FAIL 5: 253-byte prevout script refused as too large "
+                       "(SCR-5 regression): single=%s block=%s\n", w1, w2);
                 bad++;
             }
-            /* 252: the BLOCK path accepts it exactly like 253 (the reason
-             * string may carry over from the 253 run -- stale, ignore it).
-             * The SINGLE path still REJECTS 252 with an UNSET reason -- a
-             * pre-existing quirk that predates SCR-5 (the old test passed
-             * this arm the same way); it is pinned here so any movement in
-             * either direction is visible. */
-            if (r3 != 0){
-                printf("  FAIL 5: block path refuses 252 (%s)\n", w3);
+            /* At 252 the aggregate array is representable, so the transaction
+             * must get past the arena. It still fails afterwards -- the legacy
+             * input's signature is over the real script, not 252 OP_1 bytes --
+             * so what is asserted is that the reason is NOT the size refusal. */
+            if (r3 == 0 && strstr(w3, "too large")){
+                printf("  FAIL 5: 252-byte prevout script refused as too large: %s\n", w3);
                 bad++;
-            }
-            { u64 ft4 = ~0ull; const char* w4 = "?";
-              int r4 = tx_verify_block_connect(g_txbytes[i], (u64)g_txlen[i], TAV_HEIGHT,
-                                               g_bh, NULL, NULL, &w4);
-              if (r4 == 0){
-                  printf("  FAIL 5: single path now ACCEPTS 252 -- the pre-existing reject moved (%s)\n", w4);
-                  bad++;
-              }
-              (void)ft4; (void)w4;
             }
             if (!bad)
-                printf("  5  253-byte prevout spk  accepted on both entry points post-SCR-5; 252 block-accept / single-reject (pre-existing quirk, pinned)   ok\n");
+                printf("  5  large prevout spk   253 and 252 both past the arena (SCR-5), both paths   ok\n");
         }
         fails += bad;
     }

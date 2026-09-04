@@ -37,6 +37,15 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <fcntl.h>
+#include <sys/file.h>          /* DMN-1: flock() for the datadir lock */
+#include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
+/* VAL-5 / MEM-1: the generated per-height script-flag mask
+ * (bitcoin_script_flags.asm, from validation/gen_script_flags.py). */
+extern unsigned long long script_flags_for_block(unsigned long long height,
+                                                 const unsigned char blockhash[32]);
+
+/* MEM-1: defined below, called from the tip-change hook above it. */
+static void mempool_refresh_seqlocks(void* store_buf, long now_tip);
 #include <sys/mman.h>
 #include "log_ts.h"
 #include "log_phase.h"
@@ -461,6 +470,56 @@ static void peer_sock_buffers(int fd){
         int v = g_cfg.maxsendbuffer_kb * 1000;
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &v, sizeof v);
     }
+}
+
+/* ---------------------------------------------------------------- NET-3
+ * An inactivity bound on an ACCEPTED socket.
+ *
+ * An accepted socket had no SO_RCVTIMEO, no alarm, and no per-child deadline,
+ * and fd_read_full (bitcoin_net.asm) blocks in read(2) with no poll. So a
+ * peer that completed the version handshake and then went silent held its
+ * inbound slot and its forked child forever. CFG_INBOUND_LIMIT() such
+ * connections -- 189 by default -- and the parent logs "inbound at capacity"
+ * and refuses every honest peer until the attacker closes. The cost to the
+ * attacker is 189 idle sockets.
+ *
+ * Core's CConnman::InactivityCheck uses TIMEOUT_INTERVAL, 20 minutes, and
+ * that is what this mirrors. It is safe against real peers precisely because
+ * Core PINGS every 2 minutes: any live peer resets the timer an order of
+ * magnitude before it expires. Our serve loop answers pings but never
+ * initiates them (bitcoin_serve.asm), so this bound is what stands in for the
+ * liveness check we do not perform.
+ *
+ * fd_read_full returns -1 on any read error, EAGAIN included, and does not
+ * retry -- so the timeout propagates as a read failure and the child exits
+ * its serve loop. No change is needed in the assembly.
+ *
+ * SO_SNDTIMEO too: a peer that stops reading stalls us in write(2) exactly
+ * the same way, and holds the same slot.
+ *
+ * INBOUND ONLY. Applying this to outbound would be wrong: an outbound sync
+ * leg is legitimately quiet while waiting on blocks, and dropping it would
+ * damage the thing that keeps this node following the chain.
+ *
+ * BMC_PEER_IDLE_SECS overrides it, following the BMC_LSM_MMAP /
+ * BMC_ECDSA_GLV kill-switch idiom, so tests can drive the path in seconds.
+ * Note this is NOT Core's -peertimeout, which is a CONNECT timeout;
+ * g_cfg.peer_timeout_s is still unwired and is tracked separately rather than
+ * silently repurposed here, which would be a fresh divergence from Core. */
+#define PEER_IDLE_SECS_DEFAULT 1200      /* Core TIMEOUT_INTERVAL, 20 minutes */
+static void peer_inbound_deadline(int fd){
+    if (fd < 0) return;
+    long secs = PEER_IDLE_SECS_DEFAULT;
+    const char* e = getenv("BMC_PEER_IDLE_SECS");
+    if (e && *e){
+        long v = atol(e);
+        if (v > 0) secs = v;
+    }
+    struct timeval tv;
+    tv.tv_sec = (time_t)secs;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
 }
 
 static int lsock_onion(int want_port, int* got_port){
@@ -2905,6 +2964,46 @@ static int dlc_headers_sane(long have0, long pos){ return have0 - pos <= DLC_HDR
 static int dlc_dead_weight(double byte_rate, long blocks_this_tick){
     return byte_rate >= 0.0 && byte_rate < g_cfg.dead_weight_bps && blocks_this_tick < DLC_DEAD_WEIGHT_MIN_BLOCKS;
 }
+/* ---------------------------------------------------------------- VAL-5
+ * The parent's median time past, read from the header store.
+ *
+ * Core's GetMedianTimePast is the median nTime of the up-to-11 blocks ending
+ * at `height`. The store keeps 112-byte records whose first 80 bytes are the
+ * raw header, so nTime is at record offset 68.
+ *
+ * Returns 0 when any record in the window is unreadable. The caller then
+ * SKIPS the timestamp floor for that header rather than evaluating it against
+ * a partial window -- an incomplete median is not a weaker rule, it is a
+ * different one, and at the start of a fetch it would reject honest headers. */
+static int hst_median_time_past(void* hst, long height, unsigned long* out){
+    unsigned int ts[11];
+    int n = 0;
+    for (long k = height; k > height - 11 && k >= 0; k--){
+        unsigned char rec[112];
+        if (hst_get_at(hst, (unsigned long long)k, rec) != 1) return 0;
+        memcpy(&ts[n++], rec + 68, 4);
+    }
+    if (n == 0) return 0;
+    for (int i = 1; i < n; i++){
+        unsigned int v = ts[i]; int j = i - 1;
+        while (j >= 0 && ts[j] > v){ ts[j+1] = ts[j]; j--; }
+        ts[j+1] = v;
+    }
+    *out = (unsigned long)ts[n / 2];
+    return 1;
+}
+
+/* BIP34's activation height for the running chain. Core keys one of the
+ * legacy-version rules on it, and unlike BIP66/BIP65 it has no script flag to
+ * read it from -- BIP34 is not a script rule. Mainnet's is 227,931; every
+ * other chain in this tree activates it at or before genesis, which the
+ * comparison `height >= h` then satisfies for every block. */
+static long dlc_bip34_height(void){
+    extern const chainparams_t* g_chainp;
+    if (g_chainp && g_chainp->id == CHAIN_MAIN) return 227931L;
+    return 0L;
+}
+
 static int __attribute__((unused)) dlc_headers_connect_ok(unsigned char* hst, long have, const unsigned char loc[32]){
     unsigned char rec[112];
     if(have <= 0) return 1;                                   /* fresh store: nothing to connect to */
@@ -3025,18 +3124,39 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
                  * first live peer landed in headers.dat by height, and the
                  * block downloader then requested blocks for hashes nothing
                  * ever revalidates. Core validates CheckProofOfWork on every
-                 * header before storing. The nBits range/PoW check now runs
+                 * header before storing. The nBits range/PoW check runs
                  * BEFORE hst_append (pow_check carries the VAL-11 nBits
-                 * range gates + the armed chain powLimit). The remaining
-                 * VAL-5 scope (MTP / now+2h / legacy-version rules here and
-                 * in the apply path) is tracked as open in the audit doc's
-                 * remediation log -- those need per-chain activation heights
-                 * and must not gate harness paths that never arm them. */
+                 * range gates + the armed chain powLimit), and VAL-5's
+                 * remaining rules -- ContextualCheckBlockHeader's timestamp
+                 * floor, its 2-hour ceiling and the legacy-version rules --
+                 * run right after it, from daemon/hdrrules.h. */
                 if(!pow_check(h)){
                     fprintf(stderr,"[dlc] header at height %ld from %s fails its own PoW -- discarding the page\n",
                             pos + (long)i, cand);
                     dlc_headers_rollback(hst, have0); return -1;
                 }
+                /* ---- VAL-5: the non-PoW header rules -------------------
+                 * The timestamp FLOOR needs the parent's median-time-past.
+                 * At the very start of a fetch the parent is whatever the
+                 * store already holds; within a page it is the window this
+                 * loop has just appended. hst_median_time_past reads the
+                 * store, so it is only consulted for a height whose 11
+                 * ancestors are already there -- otherwise the floor is
+                 * skipped for that header rather than evaluated against a
+                 * window that does not exist. The ceiling and the version
+                 * rules need no ancestors and always run. */
+                { long hh = pos + (long)i;
+                  const char* why = "?";
+                  unsigned long pmtp = 0;
+                  if (hh >= 11) (void)hst_median_time_past(hst, hh - 1, &pmtp);
+                  unsigned long long hflags =
+                      script_flags_for_block((unsigned long long)hh, bh);
+                  if(!hdr_contextual_ok(hh, h, pmtp, (long)time(NULL),
+                                        hflags, dlc_bip34_height(), &why)){
+                      fprintf(stderr,"[dlc] header at height %ld from %s rejected: %s -- discarding the page\n",
+                              hh, cand, why);
+                      dlc_headers_rollback(hst, have0); return -1;
+                  } }
                 if(hst_append(hst, h, bh) < 0){ dlc_headers_rollback(hst, have0); return -1; }
                 added++;
             }
@@ -4478,6 +4598,28 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         fprintf(stderr,"[dl] live UTXO tracking is off -- fork detection stays on but REORGS ARE DISABLED (no undo data)\n");
     }
     reorg_set_index_rebuild(rebuild_hash_index_after_reorg);
+    /* STO-7: hand reorg.c the SHARED mempool and the accept path's own policy
+     * objects, so a completed reorg rebuilds the pool against the new branch
+     * instead of leaving it holding transactions the new branch invalidated.
+     * Deliberately after tx_policy_init has had a chance to run: if the policy
+     * layer is not up (maxmempool=0, or the static per-process fallback with
+     * no shared area) nothing is registered and reorg.c says so in its log
+     * rather than reconciling against a half-built pool. */
+    { extern void* mp_ext_area;
+      extern int tx_accept_policy_view(void**, void**, unsigned*);
+      static reorg_mempool_t rmp;
+      void* pol = 0; void* pst = 0; unsigned pn = 0;
+      if (mp_ext_area && tx_accept_policy_view(&pol, &pst, &pn)){
+          rmp.mp = mp_ext_area; rmp.pol = pol; rmp.pol_state = pst; rmp.pol_n = pn;
+          /* mempool_resolve_confirmed_utxo ignores this argument -- same
+           * placeholder daemon/tx_accept.c passes on the accept path. */
+          rmp.utxo_arg = (void*)1;
+          reorg_set_mempool(&rmp);
+          fprintf(stderr,"[reorg] mempool reconciliation armed (shared pool, policy capacity %u)\n", pn);
+      } else {
+          fprintf(stderr,"[reorg] mempool reconciliation NOT armed: no shared mempool/policy state in this process\n");
+      }
+    }
     /* ---- BOOTSTRAP + DISCOVER (seeds are bootstrap-only) ----
      * Real nodes use DNS seeds once to learn reachable peers, then connect to
      * those -- never downloading from the seeds themselves. We resolve each
@@ -5171,6 +5313,26 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             /* fee_estimates.dat (Core Flush()) -- weak: the dial/sync test
              * harnesses that link this file do not carry daemon/fee_hooks.c */
             { extern void fest_shutdown_flush(void); fest_shutdown_flush(); }
+            /* ---- DMN-5 (audit 2026-09-03): close the UTXO layer -----------
+             * utxo_live_close() checkpoints a pending batch, shuts the
+             * background compaction child down, and closes the LSM. It had no
+             * caller here at all, so the ONLY shutdown-aware code in the UTXO
+             * path was utxo_live_catchup's own block-boundary checkpoint. A
+             * SIGTERM anywhere else in the worker's rotation -- leg sync,
+             * relay drain, txsub linger, heartbeat -- exited with blocks
+             * applied but un-checkpointed and a compaction child still
+             * merging and writing run files behind the exiting parent.
+             *
+             * The un-checkpointed tail is safe (the WAL is the truth) but the
+             * next boot replays it, which main.c's own note measures in
+             * MINUTES on a large tail. The orphaned child is the worse half:
+             * it keeps writing into a datadir whose owner has gone.
+             *
+             * Weak-linked like fest_shutdown_flush above, and for the same
+             * reason: several dial/sync harnesses link this file without
+             * daemon/utxo_live.c. */
+            { extern void utxo_live_close(void) __attribute__((weak));
+              if (utxo_live_close) utxo_live_close(); }
             _exit(0);
         }
         long long now_ms = 0;
@@ -5355,6 +5517,18 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                      * a UTXO catch-up pass this rotation. */
                     anchor_locator(mux_out_loc[i]);
                     did = 1;
+                    /* STO-7: rewind the new-block choke-point baseline to the
+                     * fork. The replacement blocks can sit at or below the old
+                     * tip -- and a same-height replacement leaves now_tip ==
+                     * last_seen_tip, firing nothing at all -- so without this
+                     * the pool never sees the connects that should evict the
+                     * transactions the new branch just confirmed. */
+                    { long fh = reorg_last_fork_height();
+                      if(fh >= 0 && fh < (long)last_seen_tip){
+                          fprintf(stderr,"[dl] reorg to fork height %ld: replaying the new-block choke point from %ld (was %d)\n",
+                                  fh, fh + 1, last_seen_tip);
+                          last_seen_tip = (int)fh;
+                      } }
                 } else if(pr < 0){
                     fprintf(stderr,"[reorg] probe of %s rejected a candidate chain (no action taken)\n", mux_out_host[i]);
                 }
@@ -5614,6 +5788,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             /* keep mempool admission's maturity/flag anchor on the tip --
              * unconditionally, not only when a publisher is active */
             { extern void tx_accept_set_tip(long); tx_accept_set_tip(now_tip); }
+            mempool_refresh_seqlocks(store_buf, now_tip);   /* MEM-1 */
             last_seen_tip = now_tip;
         }
         /* Drain transactions staged by the serve children (and by this
@@ -6501,6 +6676,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
              * no-op. Without this each child re-scans everything appended
              * since boot, and says so in the log once per connection. */
             if(c>=0) peer_sock_buffers(c);
+            if(c>=0) peer_inbound_deadline(c);        /* NET-3: idle peers cannot hold a slot forever */
             if(c>=0) serve_idx_topup();
             if(c>=0 && upload_note_and_check(0)){
                 /* over -maxuploadtarget for this 24h window -- unless the
@@ -6541,6 +6717,25 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 pid_t w=fork();
                 if(w==0){
                     close(l);
+                    /* DMN-6 (audit 2026-09-03): drop the RPC listener too.
+                     * A serve child inherited it across fork and kept the
+                     * port bound after the parent exited, so the NEXT
+                     * instance's rpc_server_start failed with "bind() failed"
+                     * -- and that failure is non-fatal, so the new node ran
+                     * with no RPC and no cookie until the last old child
+                     * died. Weak-linked: several harnesses link main.c
+                     * without rpc_server.c. */
+                    { extern void rpc_server_close_listener_in_child(void) __attribute__((weak));
+                      if (rpc_server_close_listener_in_child)
+                          rpc_server_close_listener_in_child(); }
+                    /* ...and take the default SIGTERM disposition back. The
+                     * parent installed a flag-setting handler that nothing in
+                     * bitcoin_serve.asm ever reads, so a child ignored
+                     * shutdown entirely and was stopped only by its peer
+                     * hanging up or by SIGKILL -- which is why a stop with N
+                     * inbound peers waited for all N (systemd: up to 900 s). */
+                    signal(SIGTERM, SIG_DFL);
+                    signal(SIGINT,  SIG_DFL);
                     /* This child serves exactly one peer, so the permissions
                      * its listener granted are simply this process's. No
                      * shared table, no fd keying, nothing to clean up when the
@@ -6637,6 +6832,103 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
     return 0;
 }
 
+
+/* ---------------------------------------------------------------- DMN-1
+ * Single-instance guard on the per-chain datadir (audit 2026-09-03).
+ *
+ * Core takes an exclusive lock on <datadir>/.lock in LockDataDirectory()
+ * before touching anything, and aborts with "Cannot obtain a lock on data
+ * directory". This daemon had no equivalent. append.lock is flock'ed only
+ * around individual appends, never held for the process lifetime, and the
+ * only thing that could fail on a co-resident instance was the P2P bind --
+ * and only with listen=1 on the same port. The RPC bind failure is
+ * deliberately non-fatal, so the second instance simply carried on.
+ *
+ * The audit reproduced two full boots on one datadir. That is not a
+ * theoretical race: boot runs archive_trim_derived_tails, which truncate()s
+ * the index.dat / headers.dat / chainwork.dat tails computed from a snapshot
+ * of the index, then zeroes duplicate records, then forks a worker that owns
+ * the single-writer LSM UTXO set. Instance B doing that under instance A's
+ * writer is how 2026-08-31's "a stale co-resident daemon was SIGKILLed and
+ * the survivor stopped applying blocks" (main.c's own note) happens.
+ *
+ * The fd is deliberately LEAKED for the process lifetime -- that is what
+ * holds the lock. It is not FD_CLOEXEC and it is not closed on any path:
+ *   - forked children (the download worker, inbound serve children, the
+ *     compaction child) share the same open file description, so they hold
+ *     the same lock rather than contending for it. An ORPHANED worker
+ *     therefore keeps the datadir locked, which is correct: it is still
+ *     writing to it, and that orphan is one of the ways the audit's failure
+ *     arises.
+ *   - the kernel releases it when the last holder exits, so a SIGKILLed
+ *     daemon leaves no stale lock to clean up.
+ * Called after the per-chain chdir, so ".lock" lands in <datadir>/<chain>,
+ * which is the directory that actually gets written. */
+static int datadir_lock_fd = -1;
+/* ---------------------------------------------------------------- MEM-1
+ * Chain context for the mempool's finality rules, refreshed on every tip
+ * change beside tx_accept_set_tip.
+ *
+ * Core's PreChecks evaluates CheckFinalTxAtTip and CheckSequenceLocks against
+ * the NEXT block's height and the tip's median time past (BIP113). The policy
+ * layer cannot read headers or the UTXO set, so both are pushed in from here:
+ * the MTP through the same 11-header window pow_check_bits already relies on,
+ * and the prevout heights through a resolver that reads the live LSM.
+ *
+ * A transaction whose parent is still in the MEMPOOL has no confirmation
+ * height; mpol_add_core substitutes the next block's height for those, which
+ * is where such a parent would confirm. */
+extern int  utxo_live_median_time_past(long height, unsigned long* out);
+extern long utxo_live_lsm_get(const unsigned char txid_wire[32], unsigned int vout,
+                              unsigned long long* value, unsigned long* height,
+                              unsigned long* is_coinbase, const unsigned char** script,
+                              unsigned long* slen);
+static void* g_seq_store;
+static long mempool_seq_height(const unsigned char txid[32], unsigned long index,
+                               unsigned long long* out_height){
+    unsigned long long value = 0; unsigned long h = 0, cb = 0, sl = 0;
+    const unsigned char* spk = 0;
+    if (utxo_live_lsm_get(txid, (unsigned)index, &value, &h, &cb, &spk, &sl) != 1)
+        return 0;
+    *out_height = (unsigned long long)h;
+    return 1;
+}
+static void mempool_refresh_seqlocks(void* store_buf, long now_tip){
+    extern void mpool_policy_set_seqlocks(long, unsigned long, int,
+                                          long (*)(const unsigned char*, unsigned long,
+                                                   unsigned long long*));
+    g_seq_store = store_buf;
+    unsigned long mtp = 0;
+    if (!utxo_live_median_time_past(now_tip, &mtp)){
+        /* No readable header window: leave the rules UNCONFIGURED rather than
+         * enforce against a zero time, which would reject every transaction
+         * carrying a time-based nLockTime. */
+        mpool_policy_set_seqlocks(-1, 0, 0, 0);
+        return;
+    }
+    unsigned char bh[32]; int csv = 0;
+    { memset(bh, 0, 32);
+      csv = (int)((script_flags_for_block((unsigned long long)(now_tip + 1), bh) >> 10) & 1ULL); }
+    mpool_policy_set_seqlocks(now_tip + 1, mtp, csv, mempool_seq_height);
+}
+
+static int datadir_lock_acquire(const char* effdir){
+    datadir_lock_fd = open(".lock", O_RDWR|O_CREAT, 0600);
+    if(datadir_lock_fd < 0){
+        fprintf(stderr,"[boot] FATAL: cannot open %s/.lock: %s\n", effdir, strerror(errno));
+        return 0;
+    }
+    if(flock(datadir_lock_fd, LOCK_EX|LOCK_NB) != 0){
+        if(errno == EWOULDBLOCK)
+            fprintf(stderr,"[boot] FATAL: cannot obtain a lock on data directory %s. "
+                           "bmc-bitcoind is probably already running.\n", effdir);
+        else
+            fprintf(stderr,"[boot] FATAL: cannot lock %s/.lock: %s\n", effdir, strerror(errno));
+        close(datadir_lock_fd); datadir_lock_fd = -1;
+        return 0;
+    }
+    return 1;
+}
 
 int main(int argc, char** argv){
     signal(SIGPIPE, SIG_IGN);   /* broken peer connections must not kill the node */
@@ -6869,6 +7161,11 @@ int main(int argc, char** argv){
      * caught on the first migrated boot (cookie "enabled" yet unreadable to
      * the CLI, and the 10k-entry mempool.dat silently not reloaded). */
     if(chdir(effdir)!=0){ fprintf(stderr,"[boot] chdir(%s) failed: %s\n", effdir, strerror(errno)); return 1; }
+    /* DMN-1: before ANYTHING touches the datadir -- archive_trim_derived_tails
+     * truncates, genesis seeding writes, the worker fork owns the LSM. */
+    if(!datadir_lock_acquire(effdir)) return 1;
+    /* DMN-1: before ANYTHING touches the datadir -- archive_trim_derived_tails
+     * truncates, genesis seeding writes, the worker fork owns the LSM. */
     if(g_chainp->id != CHAIN_MAIN){
         if(!g_cfg.port_explicit) g_cfg.port = g_chainp->default_port;
         if(!g_chainp->dns_seeds) g_cfg.dnsseed = 0;
