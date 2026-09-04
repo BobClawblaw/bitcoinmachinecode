@@ -243,6 +243,41 @@ int main(void){
     int cs=run_checksig_true();
     printf("checksig_true exec=%d\n", cs);
 
+    /* ---- SCR-7 (audit 2026-09-03): OP_CHECKMULTISIG on a shallow stack.
+     * Core checks `stack.size() < i` BEFORE each operand read and returns
+     * SCRIPT_ERR_INVALID_STACK_OPERATION (18); the pre-fix interpreter read
+     * stacktop(1) and stacktop(nKeys+2) unguarded, so a negative index
+     * multiplied into a record BELOW main_elems and scriptnum_decode walked
+     * garbage lengths across whatever preceded the stack buffer -- a
+     * SIGSEGV reachable from any dust P2WSH. The assertions pin the ERROR
+     * CODE (18), not just failure: an accidental PUBKEY_COUNT/SIG_COUNT/
+     * SCRIPTNUM error instead means the garbage read still happened. ---- */
+    {
+        int r = run_script("60ae", NULL,NULL,0,0,0,0); /* OP_16 OP_CHECKMULTISIG, EMPTY stack */
+        if(r==0 && g_err==18) printf("ok  : CHECKMULTISIG, empty stack -> INVALID_STACK_OPERATION\n");
+        else { printf("FAIL: CHECKMULTISIG empty stack r=%d err=%llu (want 0/18)\n", r,(unsigned long long)g_err); g_fails++; bad++; }
+    }
+    {   /* stack [1] (CScriptNum value 1 -> nKeys=1), script CHECKMULTISIG:
+         * n reads fine, but m (stacktop(3)) does not exist -- Core check #2
+         * (i += nKeysCount). NB: data is 0x01 (value 1), NOT 0x51 -- 0x51 is
+         * CScriptNum 81, which would take the PUBKEY_COUNT arm (correct in
+         * both fixed and broken code, so it would not discriminate). */
+        const char* init[1] = { "01" }; int li[1] = { 1 };
+        int r = run_script("ae", init, li, 1, 0,0,0);
+        if(r==0 && g_err==18) printf("ok  : CHECKMULTISIG, 1-of-N with no m -> INVALID_STACK_OPERATION\n");
+        else { printf("FAIL: CHECKMULTISIG sp=1 r=%d err=%llu (want 0/18)\n", r,(unsigned long long)g_err); g_fails++; bad++; }
+    }
+    {   /* the legitimate degenerate n=0 case must NOT become INVALID_STACK:
+         * stack [] with OP_0 OP_CHECKMULTISIG reads n=OP_0 at stacktop(1)...
+         * that needs ONE element, so use stack [''] (one empty element):
+         * n=0, then m at stacktop(2) missing -> still 18; the fully valid
+         * 0-of-0 shape (dummy m pub n = 4 items) is test_multisig's job. */
+        const char* init[1] = { "" }; int li[1] = { 0 };
+        int r = run_script("51ae", init, li, 1, 0,0,0);   /* OP_1 pushes 1 more; sp=2; n=1; m@stacktop(3) missing */
+        if(r==0 && g_err==18) printf("ok  : CHECKMULTISIG after OP_1 on 1 elem -> INVALID_STACK_OPERATION\n");
+        else { printf("FAIL: CHECKMULTISIG OP_1+ae r=%d err=%llu (want 0/18)\n", r,(unsigned long long)g_err); g_fails++; bad++; }
+    }
+
     printf("exec-vectors: %d pass, %d fail\n", ok, bad);
     printf(g_fails? "%s\n":"%s\n", g_fails?"SOME FAILURES":"BUILT AND RAN");
     return bad?1:0;
