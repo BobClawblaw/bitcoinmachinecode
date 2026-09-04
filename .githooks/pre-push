@@ -14,7 +14,19 @@
 # Blocklist: .git/privacy-blocklist, untracked (a tracked file listing the
 # strings to hide would publish them). Absent => message check skipped.
 
-WANT="BobClawblaw <BobClawblaw@users.noreply.github.com>"
+# WHAT THIS BLOCKS. The personal identity -- and ONLY that. An earlier cut
+# required every commit to be exactly BobClawblaw <...noreply...>, i.e. an
+# allow-list of one. That silently refused every push of this repo's real
+# history, which legitimately contains other identities: Claude
+# <noreply@anthropic.com> on AI-authored commits, bobclawblaw@protonmail.com,
+# and the ARM box's own. The hook rejected 26 such commits on a routine push
+# and printed its complaint into a discarded stream, so it looked like the
+# push had simply not happened. A gate that blocks correct work is worse than
+# no gate: it gets disabled.
+#
+# So the test is a DENY-list, matched against the same untracked blocklist
+# pre-commit uses. Absent blocklist => identity check skipped (a fresh clone
+# has nothing to leak); the file is the single source of what must not escape.
 BLOCKLIST="$(git rev-parse --git-dir)/privacy-blocklist"
 rc=0
 
@@ -26,29 +38,32 @@ while read -r _local_ref local_sha _remote_ref remote_sha; do
         range="$remote_sha..$local_sha"
     fi
 
-    bad=$(git log --format='%H %an <%ae>%n%H %cn <%ce>' $range 2>/dev/null \
-          | grep -v " $WANT$" | awk '{print $1}' | sort -u)
-    if [ -n "$bad" ]; then
-        echo "pre-push: REFUSED -- commits with a non-pseudonymous identity:" >&2
-        for c in $bad; do
-            echo "  $(git log -1 --format='%h  A:%an <%ae>  C:%cn <%ce>' "$c")" >&2
-        done
-        echo "Rewrite them before pushing; a force-push after the fact does not" >&2
-        echo "remove them from GitHub (orphaned commits stay reachable by SHA)." >&2
-        rc=1
-    fi
+    [ -f "$BLOCKLIST" ] || continue
 
-    if [ -f "$BLOCKLIST" ]; then
-        msgs=$(git log --format='%H%n%B' $range 2>/dev/null)
-        while IFS= read -r pat; do
-            case "$pat" in ''|'#'*) continue ;; esac
-            if printf '%s' "$msgs" | grep -Ei -- "$pat" >/dev/null 2>&1; then
-                echo "pre-push: REFUSED -- a commit message matches a blocked pattern." >&2
-                echo "  pattern: $pat" >&2
-                rc=1
-            fi
-        done < "$BLOCKLIST"
-    fi
+    idents=$(git log --format='%H %an <%ae>%n%H %cn <%ce>' $range 2>/dev/null)
+    msgs=$(git log --format='%H%n%B' $range 2>/dev/null)
+
+    while IFS= read -r pat; do
+        case "$pat" in ''|'#'*) continue ;; esac
+
+        bad=$(printf '%s' "$idents" | grep -Ei -- "$pat" | awk '{print $1}' | sort -u)
+        if [ -n "$bad" ]; then
+            echo "pre-push: REFUSED -- commits whose author/committer matches a blocked pattern:" >&2
+            echo "  pattern: $pat" >&2
+            for c in $bad; do
+                echo "  $(git log -1 --format='%h  A:%an <%ae>  C:%cn <%ce>' "$c")" >&2
+            done
+            echo "Rewrite them before pushing; a force-push after the fact does not" >&2
+            echo "remove them from GitHub (orphaned commits stay reachable by SHA)." >&2
+            rc=1
+        fi
+
+        if printf '%s' "$msgs" | grep -Ei -- "$pat" >/dev/null 2>&1; then
+            echo "pre-push: REFUSED -- a commit message matches a blocked pattern." >&2
+            echo "  pattern: $pat" >&2
+            rc=1
+        fi
+    done < "$BLOCKLIST"
 done
 
 exit $rc
