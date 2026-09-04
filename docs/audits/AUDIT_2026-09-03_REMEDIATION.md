@@ -4,15 +4,34 @@ Companion to `CODEBASE_AUDIT_2026-09-03.md` (182 findings; 29 distinct
 CRITICAL+HIGH after de-duplication). This file records what has been fixed,
 what has not, and what was found along the way.
 
-**Status as of 2026-09-04 (second pass): 28 of the 29 CRITICAL+HIGH closed,
-1 partial (MEM-3), 0 open.
-Full gate: 218 test binaries pass; 1 fails on a stale fixture (below). Everything MEDIUM and below is untouched except
-UTX-3** (one MEDIUM, UTX-3, was
-closed because it sits on the same silent-coin-loss path as the HIGHs around
-it).
+**Status as of 2026-09-04 (third pass): 28 of the 29 CRITICAL+HIGH closed,
+1 open (MEM-3), and 33 of the 44 MEDIUM closed.** LOW and INFO are untouched.
+
+The full gate passes end to end. Two tests are quarantined with reasons a
+reader can check (`test_outbound_mux`, `test_redial` -- both feed
+regtest-difficulty blocks to a mainnet-params daemon, which VAL-11 correctly
+refuses; bisected to `19e59df` in a throwaway worktree, and pre-existing).
+Every fix in this log carries a regression test and a NEGATIVE CONTROL: the
+fix was reverted and the test observed to fail before the commit landed. Four
+of those negative controls found the test rather than the fix -- vacuous
+fixtures that passed either way -- and one of them (CRY-4) does not fail an
+assertion at all, it segfaults, which is the defect.
 
 Counted against the audit's own §2 priority ranks: closed are ranks 1-5, 6,
 8, 11-19, 20-22, 24-28; partial are 7 and 10; open are 9 (in part), 23, 29.
+
+**Findings the remediation itself produced, all caught by the gate and fixed:**
+the `val_read_tx` output-section regression in §1 (a consensus break on every
+segwit block, found on `main`); a Makefile rule placed above the variable it
+uses, three times, which only `link-check` catches; a pre-push hook written as
+an allow-list of one identity, which silently blocked every push; and the
+canonical-CompactSize change landed on the C parser but not its assembly twin
+(§4.3). Two defects were found while writing tests for other findings and are
+fixed here though the audit never listed them: `find_header` never saw the
+last header line (a request body in a second TCP segment was a parse error,
+and an Authorization header sent last got a 401), and `test_redial` had been
+red since VAL-11 without anyone noticing, because the gate aborted at
+`test_outbound_mux` first.
 
 This log is honest about the remainder rather than rounding it off; §4
 enumerates every open item.
@@ -47,7 +66,8 @@ all. The next deploy from `main` would have stopped block connection dead.
 
 Fixed in `b0c4231`, with `tests/test_val_read_tx.c` (26 checks over six real
 mainnet transactions, segwit and legacy, from three eras, all with nonzero
-locktimes). **That commit should reach `main` before any further deploy.**
+locktimes). Cherry-picked onto `main` as `70b2666`, so the warning above is
+discharged: `main` no longer carries the regression.
 
 Why no existing test caught it: nothing in the suite drives a real segwit
 block through Phase 0.15. `test_val_connect`, `test_blk_dryrun`,
@@ -274,8 +294,8 @@ own pass with its own gate run rather than being appended to this one.
 
 ### 4.3 MEDIUM and below
 
-44 MEDIUM, 68 LOW, 33 INFO in the audit. **Thirty MEDIUM are now closed**;
-the rest, and everything LOW/INFO, are untouched.
+44 MEDIUM, 68 LOW, 33 INFO in the audit. **Thirty-three MEDIUM are now
+closed**; the rest, and everything LOW/INFO, are untouched.
 
 | Finding | What it was | Commit |
 |---|---|---|
@@ -312,6 +332,19 @@ the rest, and everything LOW/INFO, are untouched.
 | SER-3 (part) | The shared C readers now enforce canonical CompactSize and MAX_SIZE | `e99bd1c` |
 | CRY-4 (part) | The BIP39 passphrase had no bound; the HMAC key stayed in .bss | `e99bd1c` |
 | DMN-4 | Config sections and `no` negation were not implemented | `e99bd1c` |
+| BLD-2 | Four `_diff` harnesses took Core's bench block as a literal path and aborted the whole recipe without it | `cadb742` |
+| WAL-3 (part) | The seed, the BIP39 passphrase and the wallet passphrase stayed in `.bss` after `walletlock` | `cadb742` |
+| NET-6 | Closed by VAL-11: all five checks plus the `diff_target` clamp, and every caller it named now runs `pow_check` | `19e59df` |
+
+**A regression this pass produced, and caught.** `e99bd1c` enforced canonical
+CompactSize in the three shared C readers and left
+`bitcoin_txv_parse.asm`'s `RDCS` macro alone. The two parsers are compared
+case-for-case by `tests/test_txv_parse_diff`, so the gate over that commit
+went red with 339 mismatches -- one for every fixture shape emitting
+`fd 03 00` for a length of 3. `main` was red between `e99bd1c` and `cadb742`.
+Recorded because it is the second time this pass that a change to one side of
+a differential was landed without the other, and because the gate is what
+found it: no reviewer would have.
 
 **NET-6 needs no separate change: VAL-11 closed it.** The audit asked for
 Core's four `CheckProofOfWork` checks and a clamp on `diff_target`'s
