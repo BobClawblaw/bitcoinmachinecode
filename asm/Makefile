@@ -596,6 +596,14 @@ tests/test_blk_dryrun: $(DRYRUNSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPD
 # ConnectBlock money ledger in>=out / MAX_MONEY / bad-cb-amount). Same fixture
 # object set as the dry-run test.
 VALCONNECTSRCS := $(patsubst tests/test_apply_block_rollback.c,tests/test_val_connect.c,$(ROLLBACKSRCS))
+# test_val_read_tx -- val_read_tx (Phase 0.15's per-tx walk) must skip the
+# OUTPUT section. It did not: a segwit tx then failed to parse at all, and
+# Phase 0.15 turns that into "bad-txns-prevout-null" and rejects the BLOCK --
+# every mainnet block since 481,824. Real mainnet transactions with NONZERO
+# locktimes, segwit and legacy, from three eras.
+tests/test_val_read_tx: tests/test_val_read_tx.c $(REORGSRCS_NOMAIN) $(REORGOBJS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -I tests -o $@ tests/test_val_read_tx.c $(REORGSRCS_NOMAIN) $(REORGOBJS) -lpthread
+
 tests/test_val_connect: $(VALCONNECTSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ $(VALCONNECTSRCS) $(REORGOBJS) -lpthread
 
