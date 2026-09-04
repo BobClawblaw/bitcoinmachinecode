@@ -1094,15 +1094,8 @@ long reorg_mempool_reconcile(reorg_mempool_t* m,
                              const uint32_t* disc_lens, long ndisc){
     if (!m || !m->mp) return 0;
 
-    rtx_t* cand = (rtx_t*)malloc(sizeof(rtx_t) * REORG_MEMPOOL_MAX_TX);
     unsigned char* arena = (unsigned char*)malloc(REORG_MEMPOOL_ARENA);
-    /* The mempool's own blob is about to be logically emptied, and the policy
-     * rebuild re-adds through mpool_put, which copies into that same blob at
-     * a fresh `fill` offset. Snapshotted transaction bytes must therefore be
-     * copied OUT first, not referenced in place. */
-    unsigned char* snap_arena = (unsigned char*)malloc(REORG_MEMPOOL_ARENA);
-    if (!cand || !arena || !snap_arena){
-        free(cand); free(arena); free(snap_arena);
+    if (!arena){
         fprintf(stderr, "[reorg] mempool reconcile: allocation failed\n");
         return -1;
     }
@@ -1114,10 +1107,55 @@ long reorg_mempool_reconcile(reorg_mempool_t* m,
      * would see a half-emptied pool. mp_lock is a no-op for the per-process
      * static fallback. */
     mp_lock();
-    long ncand = mempool_snapshot(m->mp, cand, REORG_MEMPOOL_MAX_TX);
+
+    /* ---- MEM-8 (audit 2026-09-03): size the snapshot from the POOL ----
+     *
+     * The candidate array was a fixed 8,192 entries and the copy arena a
+     * fixed 16 MB, and both truncated silently. A pool holding more than that
+     * left the surplus as GHOSTS: still present in the structural mempool
+     * (mpool_del was called only for the snapshotted prefix) but with no
+     * registry node, no outreg and no claims after
+     * mpool_policy_state_init wiped the graph. Ghosts are served to getdata,
+     * counted by mpool_count, never expire (mempool_forget is only reached
+     * through the registry, so mempool_expire_now just clears their arrival
+     * time), never evict, and -- because their inputs are unclaimed -- a
+     * later double-spend of those inputs is admitted alongside them.
+     *
+     * Both are now sized from the live pool: the array from mpool_count and
+     * the arena from the actual snapshot bytes. The mempool contribution can
+     * no longer truncate, so no live entry is ever left behind. The
+     * DISCONNECTED-block contribution keeps a constant bound -- truncating
+     * there only means a transaction is not re-offered, which costs relay
+     * reach, not pool integrity -- and is reported when it bites.
+     *
+     * Every allocation happens before a single mpool_del, so a failure
+     * leaves the pool exactly as it was. */
+    long pool_n = mpool_count(m->mp);
+    if (pool_n < 0) pool_n = 0;
+    long cand_cap = pool_n + REORG_MEMPOOL_MAX_TX;
+    rtx_t* cand = (rtx_t*)malloc(sizeof(rtx_t) * (size_t)(cand_cap ? cand_cap : 1));
+    if (!cand){
+        mp_unlock(); free(arena);
+        fprintf(stderr, "[reorg] mempool reconcile: candidate array (%ld entries) allocation failed\n", cand_cap);
+        return -1;
+    }
+    long ncand = mempool_snapshot(m->mp, cand, cand_cap);
+    /* The pool's own bytes, measured rather than assumed. */
+    size_t snap_need = 0;
+    for (long i = 0; i < ncand; i++) snap_need += cand[i].len;
+    /* The mempool's own blob is about to be logically emptied, and the policy
+     * rebuild re-adds through mpool_put, which copies into that same blob at
+     * a fresh `fill` offset. Snapshotted transaction bytes must therefore be
+     * copied OUT first, not referenced in place. */
+    unsigned char* snap_arena = (unsigned char*)malloc(snap_need ? snap_need : 1);
+    if (!snap_arena){
+        mp_unlock(); free(cand); free(arena);
+        fprintf(stderr, "[reorg] mempool reconcile: snapshot arena (%zu bytes for %ld tx) allocation failed\n",
+                snap_need, ncand);
+        return -1;
+    }
     size_t snap_used = 0;
     for (long i = 0; i < ncand; i++){
-        if (snap_used + cand[i].len > REORG_MEMPOOL_ARENA){ ncand = i; break; }
         memcpy(snap_arena + snap_used, cand[i].tx, cand[i].len);
         cand[i].tx = snap_arena + snap_used;
         snap_used += cand[i].len;
@@ -1128,8 +1166,16 @@ long reorg_mempool_reconcile(reorg_mempool_t* m,
      * naturally offered before its in-block child. */
     for (long b = 0; b < ndisc; b++){
         ncand = collect_block_txs(disc_blocks[b], disc_lens[b], cand,
-                                  REORG_MEMPOOL_MAX_TX, ncand, arena,
+                                  cand_cap, ncand, arena,
                                   REORG_MEMPOOL_ARENA, &arena_used);
+    }
+    if (ncand >= cand_cap || arena_used >= REORG_MEMPOOL_ARENA){
+        /* MEM-8: only the disconnected-block contribution can hit these
+         * bounds now -- say so, because it means some losing-branch
+         * transactions are not being re-offered. */
+        fprintf(stderr, "[reorg] mempool reconcile: disconnected-branch candidates truncated "
+                        "(%ld of %ld slots, %zu of %u arena bytes); some transactions will not be re-offered\n",
+                ncand, cand_cap, arena_used, REORG_MEMPOOL_ARENA);
     }
 
     /* Empty the structural mempool and reset the policy graph. */

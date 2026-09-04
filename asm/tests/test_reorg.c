@@ -107,6 +107,7 @@ extern long p2p_headers_count(const void* pl, long plen);
 
 extern size_t mpool_struct_size(unsigned long slots);
 extern void   mpool_init(void* mp, unsigned long slots, void* blob, unsigned long cap);
+extern long   mpool_put(void* mp, const u8 txid[32], const u8* tx, unsigned long len);
 extern long   mpool_count(void* mp);
 extern const u8* mpool_get(void* mp, const u8 txid[32], unsigned long* out_len);
 extern void   mpool_policy_init(void* pol, u64 relay, unsigned ma, unsigned mab,
@@ -1073,6 +1074,72 @@ static void case_mempool(void){
 }
 
 /* ======================================================================== */
+/* CASE (MEM-8): the reconcile snapshot is sized from the POOL, so a pool     */
+/*       larger than the old fixed bound leaves no ghosts.                   */
+/*                                                                          */
+/* reorg_mempool_reconcile snapshotted at most REORG_MEMPOOL_MAX_TX (8,192)  */
+/* entries into a fixed 16 MB arena, and called mpool_del only for the       */
+/* snapshotted prefix. Everything past the bound stayed in the structural    */
+/* pool while mpool_policy_state_init wiped the graph out from under it:     */
+/* present to getdata and to mpool_count, but with no registry node, no      */
+/* outreg and no claims. Such an entry never expires (mempool_forget is only */
+/* reached through the registry), never evicts, and leaves its inputs        */
+/* unclaimed -- so a later double-spend of those inputs is admitted next to  */
+/* it.                                                                      */
+/*                                                                          */
+/* The fixture puts 8,193 transactions straight into the STRUCTURAL pool     */
+/* with mpool_put -- which is where ghosts live, and which is fast, unlike   */
+/* driving 8,193 accepts through the policy layer. None of them resolves     */
+/* against the UTXO set, so every candidate is refused on re-offer and a     */
+/* correct reconcile must leave the pool EMPTY. The old code left exactly    */
+/* the entries it never snapshotted.                                        */
+/* ======================================================================== */
+static void case_mempool_ghosts(void){
+    enum { NGHOST = 8193 };          /* one past the old REORG_MEMPOOL_MAX_TX */
+    /* The re-offer pass runs the real mpool_policy_add, which resolves inputs
+     * through the live UTXO store -- so that store has to be open even though
+     * every lookup here is expected to miss. */
+    build_base(3, 0x207fffffu);
+    harness_open();
+    static u8 mp[40 + 16384*48 + 8];
+    static u8* mpblob;
+    if (!mpblob) mpblob = (u8*)malloc(32u<<20);
+    ckm("ghost fixture blob allocated", mpblob != NULL);
+    if (!mpblob) return;
+    mpool_init(mp, 16384, mpblob, 32u<<20);
+
+    static u8 pol[128];
+    mpool_policy_init(pol, 0, 25, 101000, 25, 101000, 1);
+    { extern void mpool_policy_set_acceptnonstd(void*, unsigned);
+      mpool_policy_set_acceptnonstd(pol, 1); }
+    unsigned pol_n = 512;
+    void* pol_state = malloc(mpool_policy_state_size(pol_n));
+    mpool_policy_state_init(pol_state, pol_n);
+
+    long stored = 0;
+    for (int i = 0; i < NGHOST; i++){
+        tx_t t; u8 prev[32];
+        memset(prev, 0, 32);
+        prev[0] = (u8)i; prev[1] = (u8)(i >> 8); prev[2] = 0xc7;
+        mk_spend(&t, prev, 0, 10000ULL);
+        if (mpool_put(mp, t.txid, t.raw, (unsigned long)t.len) == 1) stored++;
+    }
+    ck("MEM-8 fixture: pool holds more than the old 8192-entry bound", (int)(stored > 8192), 1);
+
+    reorg_mempool_t rm = { mp, pol, pol_state, pol_n, (void*)1 };
+    long after = reorg_mempool_reconcile(&rm, NULL, NULL, 0);
+    long left = mpool_count(mp);
+    printf("      (stored %ld, reconcile returned %ld, pool now %ld)\n", stored, after, left);
+    ckm("MEM-8 reconcile returned a count", after >= 0);
+    /* None of these transactions can resolve its input, so every one must be
+     * refused on re-offer and NOTHING may remain. */
+    ck("MEM-8 no entry survives the rebuild unsnapshotted (no ghosts)", (int)left, 0);
+    ck("MEM-8 ...and the returned count agrees with the pool", (int)after, (int)left);
+    free(pol_state);
+    utxo_live_close();
+}
+
+/* ======================================================================== */
 /* CASE (STO-7): reorg_execute reconciles the mempool BY ITSELF once one is  */
 /*       registered -- no manual reorg_mempool_reconcile call.               */
 /*                                                                          */
@@ -1534,6 +1601,7 @@ int main(void){
     total += run_case("undo pre-flight gate",           case_undo_preflight_gate);
     total += run_case("mempool reconciliation",         case_mempool);
     total += run_case("mempool reconcile is WIRED (STO-7)", case_mempool_wired);
+    total += run_case("reconcile leaves no ghosts (MEM-8)", case_mempool_ghosts);
     total += run_case("fake peer locator + reorg",      case_fakepeer_locator_and_reorg);
     total += run_case("node_sync_multi (asm frame)",    case_node_sync_multi);
     total += run_case("append-lock scope + prevhash gate", case_append_lock_scope);

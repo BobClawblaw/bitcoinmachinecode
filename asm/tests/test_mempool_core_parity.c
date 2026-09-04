@@ -109,7 +109,8 @@ int main(void){
             utxo_put(ux, t, 0, 1000000ULL, 0, 0, SPK_WPKH, sizeof SPK_WPKH); } \
     } while(0)
 
-    u8 tx[8192]; u8 id[32]; long n, r;
+    /* MEM-7's bloated replacement is ~6.4 kB; 8192 was too tight. */
+    static u8 tx[65536]; u8 id[32]; long n, r;
     static const u8 EMPTY[1] = {0};
 
     printf("== 1: standardness, Core reject strings ==\n");
@@ -310,6 +311,56 @@ int main(void){
       { unsigned long l;
         ck("P evicted", mpool_get(mp, p1, &l) == NULL);
         ck("C evicted WITH P (descendant)", mpool_get(mp, c1, &l) == NULL); }
+
+      /* ---- MEM-7 (audit 2026-09-03): PaysMoreThanConflicts ----
+       *
+       * Rules 3+4 above are ABSOLUTE-fee rules. On their own a replacement
+       * that pays more in TOTAL but far less PER BYTE wins, which is worse
+       * for a miner than what it evicted and is what Core's
+       * PaysMoreThanConflicts (pre-v31) and feerate-diagram check (v31)
+       * exist to refuse.
+       *
+       * The fixture is the audit's, scaled to this harness: a small original
+       * at a high feerate, and a replacement bloated with outputs so that it
+       * pays MORE in total -- clearing rules 3 and 4 -- at a much lower
+       * feerate. If only the absolute rules were in force it would be
+       * accepted and the original evicted. */
+      { u8 sm[32];
+        oS.v = 1000000 - 5000;                       /* fee 5000 over ~110 vB */
+        n = mk(tx, &(txin_t){ .tag=9, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+        tx_txid(sm, tx, n, sc, sizeof sc);
+        ck("MEM-7 small high-feerate original in", mpool_policy_add(pol, st, mp, tx, n, sm, ux) == 1);
+
+        /* 200 outputs of 31 bytes each: ~6.3 kB of extra vsize. */
+        enum { NBLOAT = 200 };
+        static txout_t big[NBLOAT];
+        /* fee 12,000: comfortably above the 1 sat/vB relay floor for ~6.4 kvB
+         * (so the refusal below cannot be the floor), above the 5,000 it
+         * replaces (so rules 3+4 pass), and ~1.9 sat/vB against the
+         * original's ~45 (so only PaysMoreThanConflicts can refuse it). */
+        big[0].v = 1000000 - 12000; big[0].spk = SPK_WPKH; big[0].spklen = 22;
+        for (int q = 1; q < NBLOAT; q++){ big[q].v = 0; big[q].spk = SPK_WPKH; big[q].spklen = 22; }
+        n = mk(tx, &(txin_t){ .tag=9, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, big, NBLOAT);
+        tx_txid(id, tx, n, sc, sizeof sc);
+        r = mpool_policy_add(pol, st, mp, tx, n, id, ux);
+        /* Rules 3+4 alone would let this through: it pays 12,000 against the
+         * 5,000 it replaces, and the 7,000 increment covers its own ~6.4 kvB
+         * at the incremental rate. */
+        ck("MEM-7 a bigger-but-cheaper-per-byte replacement is REFUSED", r == 0);
+        ckr("...as", pol, "insufficient fee");
+        { unsigned long l;
+          ck("MEM-7 the original was NOT evicted by the refused replacement",
+             mpool_get(mp, sm, &l) != NULL); }
+
+        /* Control: the same replacement at a feerate ABOVE the original is
+         * accepted, so the new rule is not simply refusing large txs. */
+        big[0].v = 1000000 - 400000;                 /* fee 400000 over ~6.4 kvB */
+        n = mk(tx, &(txin_t){ .tag=9, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, big, NBLOAT);
+        tx_txid(id, tx, n, sc, sizeof sc);
+        r = mpool_policy_add(pol, st, mp, tx, n, id, ux);
+        ck("MEM-7 the same replacement at a HIGHER feerate is accepted", r == 1);
+        { unsigned long l;
+          ck("MEM-7 ...and then the original is evicted", mpool_get(mp, sm, &l) == NULL); } }
 
       /* disjointness: replacement double-spends U's prevout AND spends U's
        * own output -> "bad-txns-spends-conflicting-tx" */
