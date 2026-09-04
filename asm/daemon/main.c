@@ -5221,6 +5221,26 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             /* fee_estimates.dat (Core Flush()) -- weak: the dial/sync test
              * harnesses that link this file do not carry daemon/fee_hooks.c */
             { extern void fest_shutdown_flush(void); fest_shutdown_flush(); }
+            /* ---- DMN-5 (audit 2026-09-03): close the UTXO layer -----------
+             * utxo_live_close() checkpoints a pending batch, shuts the
+             * background compaction child down, and closes the LSM. It had no
+             * caller here at all, so the ONLY shutdown-aware code in the UTXO
+             * path was utxo_live_catchup's own block-boundary checkpoint. A
+             * SIGTERM anywhere else in the worker's rotation -- leg sync,
+             * relay drain, txsub linger, heartbeat -- exited with blocks
+             * applied but un-checkpointed and a compaction child still
+             * merging and writing run files behind the exiting parent.
+             *
+             * The un-checkpointed tail is safe (the WAL is the truth) but the
+             * next boot replays it, which main.c's own note measures in
+             * MINUTES on a large tail. The orphaned child is the worse half:
+             * it keeps writing into a datadir whose owner has gone.
+             *
+             * Weak-linked like fest_shutdown_flush above, and for the same
+             * reason: several dial/sync harnesses link this file without
+             * daemon/utxo_live.c. */
+            { extern void utxo_live_close(void) __attribute__((weak));
+              if (utxo_live_close) utxo_live_close(); }
             _exit(0);
         }
         long long now_ms = 0;
