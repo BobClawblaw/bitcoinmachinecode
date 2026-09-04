@@ -457,6 +457,56 @@ static void peer_sock_buffers(int fd){
     }
 }
 
+/* ---------------------------------------------------------------- NET-3
+ * An inactivity bound on an ACCEPTED socket.
+ *
+ * An accepted socket had no SO_RCVTIMEO, no alarm, and no per-child deadline,
+ * and fd_read_full (bitcoin_net.asm) blocks in read(2) with no poll. So a
+ * peer that completed the version handshake and then went silent held its
+ * inbound slot and its forked child forever. CFG_INBOUND_LIMIT() such
+ * connections -- 189 by default -- and the parent logs "inbound at capacity"
+ * and refuses every honest peer until the attacker closes. The cost to the
+ * attacker is 189 idle sockets.
+ *
+ * Core's CConnman::InactivityCheck uses TIMEOUT_INTERVAL, 20 minutes, and
+ * that is what this mirrors. It is safe against real peers precisely because
+ * Core PINGS every 2 minutes: any live peer resets the timer an order of
+ * magnitude before it expires. Our serve loop answers pings but never
+ * initiates them (bitcoin_serve.asm), so this bound is what stands in for the
+ * liveness check we do not perform.
+ *
+ * fd_read_full returns -1 on any read error, EAGAIN included, and does not
+ * retry -- so the timeout propagates as a read failure and the child exits
+ * its serve loop. No change is needed in the assembly.
+ *
+ * SO_SNDTIMEO too: a peer that stops reading stalls us in write(2) exactly
+ * the same way, and holds the same slot.
+ *
+ * INBOUND ONLY. Applying this to outbound would be wrong: an outbound sync
+ * leg is legitimately quiet while waiting on blocks, and dropping it would
+ * damage the thing that keeps this node following the chain.
+ *
+ * BMC_PEER_IDLE_SECS overrides it, following the BMC_LSM_MMAP /
+ * BMC_ECDSA_GLV kill-switch idiom, so tests can drive the path in seconds.
+ * Note this is NOT Core's -peertimeout, which is a CONNECT timeout;
+ * g_cfg.peer_timeout_s is still unwired and is tracked separately rather than
+ * silently repurposed here, which would be a fresh divergence from Core. */
+#define PEER_IDLE_SECS_DEFAULT 1200      /* Core TIMEOUT_INTERVAL, 20 minutes */
+static void peer_inbound_deadline(int fd){
+    if (fd < 0) return;
+    long secs = PEER_IDLE_SECS_DEFAULT;
+    const char* e = getenv("BMC_PEER_IDLE_SECS");
+    if (e && *e){
+        long v = atol(e);
+        if (v > 0) secs = v;
+    }
+    struct timeval tv;
+    tv.tv_sec = (time_t)secs;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+}
+
 static int lsock_onion(int want_port, int* got_port){
     int l = socket(AF_INET,SOCK_STREAM,0);
     if(l < 0) return -1;
@@ -6407,6 +6457,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
              * no-op. Without this each child re-scans everything appended
              * since boot, and says so in the log once per connection. */
             if(c>=0) peer_sock_buffers(c);
+            if(c>=0) peer_inbound_deadline(c);        /* NET-3: idle peers cannot hold a slot forever */
             if(c>=0) serve_idx_topup();
             if(c>=0 && upload_note_and_check(0)){
                 /* over -maxuploadtarget for this 24h window -- unless the
