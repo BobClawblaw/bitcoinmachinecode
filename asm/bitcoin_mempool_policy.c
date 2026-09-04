@@ -1585,6 +1585,52 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     /* ================= commit ============================================ */
     if (!commit) return 1;
 
+    /* ---- MEM-4 (audit 2026-09-03): refuse rather than register nothing ---
+     *
+     * The claims and outreg tables have one slot per NODE but hold one entry
+     * per INPUT and per OUTPUT. With the pool sized at ~1M nodes the claims
+     * table fills once the pool holds ~1M inputs, which is roughly 400-500K
+     * ordinary transactions -- well inside a 300 MB raw pool, since Core's
+     * 300 MB is DynamicMemoryUsage (~3x serialized) and this pool holds
+     * roughly 3x Core's count.
+     *
+     * Both insertion loops used to test `if (n < cap)` and, when full,
+     * silently do nothing. The consequences differ and only one is
+     * conservative:
+     *   * claims full -> the transaction's inputs are never registered, so
+     *     find_claim misses them. A LATER transaction spending the same
+     *     output finds no conflict and is accepted: two conflicting
+     *     transactions in the pool, both relayed, both eligible for the
+     *     block template, which does not check conflicts. An invalid block.
+     *   * outreg full -> children are rejected as missing-inputs, which is
+     *     merely wrong rather than dangerous, but silently breaks CPFP.
+     *
+     * Checked at the COMMIT BOUNDARY: after every policy rule has had its
+     * say, so a transaction that is also non-standard or TRUC-invalid still
+     * reports THAT reason rather than "mempool full" (an earlier placement
+     * did exactly that and broke test_truc_policy's "an oversized v3 tx is
+     * refused"), and before anything is stored or linked, so a refusal costs
+     * nothing -- the same placement MEM-5 needed. "mempool full" is
+     * Core's reason for an admission that cannot be housed, and it is
+     * honest: the pool genuinely has no room left to register this
+     * transaction safely.
+     *
+     * This does not RESIZE the tables, which is the audit's other half and a
+     * capacity-tuning change to a MAP_SHARED region. It closes the
+     * correctness hole: the node can no longer accept a transaction it has
+     * not registered. */
+    {
+        uint32_t cap_    = *(uint32_t*)((char*)st+4);
+        uint32_t n_out_r = *(uint32_t*)((char*)st+8);   /* outreg entries used */
+        uint32_t n_clm   = *(uint32_t*)((char*)st+12);  /* claims  entries used */
+        if ((uint64_t)n_clm + (uint64_t)n_in > (uint64_t)cap_ ||
+            (uint64_t)n_out_r + (uint64_t)meta.n_out > (uint64_t)cap_){
+            _mpol_last_reason = "mempool full";
+            return 0;
+        }
+    }
+
+
     /* 1a. RBF eviction (packages: conflicts + descendants, snapshotted) */
     for (int e=0;e<n_evict;e++){
         int ci = find_node(st, evict_set[e]);
