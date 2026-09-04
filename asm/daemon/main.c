@@ -6588,6 +6588,25 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 pid_t w=fork();
                 if(w==0){
                     close(l);
+                    /* DMN-6 (audit 2026-09-03): drop the RPC listener too.
+                     * A serve child inherited it across fork and kept the
+                     * port bound after the parent exited, so the NEXT
+                     * instance's rpc_server_start failed with "bind() failed"
+                     * -- and that failure is non-fatal, so the new node ran
+                     * with no RPC and no cookie until the last old child
+                     * died. Weak-linked: several harnesses link main.c
+                     * without rpc_server.c. */
+                    { extern void rpc_server_close_listener_in_child(void) __attribute__((weak));
+                      if (rpc_server_close_listener_in_child)
+                          rpc_server_close_listener_in_child(); }
+                    /* ...and take the default SIGTERM disposition back. The
+                     * parent installed a flag-setting handler that nothing in
+                     * bitcoin_serve.asm ever reads, so a child ignored
+                     * shutdown entirely and was stopped only by its peer
+                     * hanging up or by SIGKILL -- which is why a stop with N
+                     * inbound peers waited for all N (systemd: up to 900 s). */
+                    signal(SIGTERM, SIG_DFL);
+                    signal(SIGINT,  SIG_DFL);
                     /* This child serves exactly one peer, so the permissions
                      * its listener granted are simply this process's. No
                      * shared table, no fd keying, nothing to clean up when the
