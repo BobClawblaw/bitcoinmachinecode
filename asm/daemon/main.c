@@ -3383,7 +3383,22 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
     *(int*)((char*)st+0)=-1;            /* no blk fd yet */
     static unsigned char buf[24<<20]; static unsigned char scratch[8<<20];
     unsigned cap=(unsigned)(sizeof scratch/32);
-    char hp_[64]; snprintf(hp_,sizeof hp_,"/tmp/dlc_hdr_%d.dat",getpid());
+    /* ---- DMN-8 (audit 2026-09-03): the per-chunk header scratch ----
+     * This was "/tmp/dlc_hdr_<pid>.dat", opened O_RDWR|O_CREAT|O_TRUNC with
+     * no O_EXCL and no O_NOFOLLOW, and never unlinked: a classic symlink race
+     * in a world-writable directory, plus a file left behind on every boot.
+     * PrivateTmp=yes hides it on the live host, but not for the runbook's
+     * manual invocation or any other host.
+     *
+     * It now lives in the DATADIR -- main() has already chdir'd there, which
+     * is why headers.dat below opens relatively -- so no other user can
+     * pre-create the path. It is created exclusively, never followed through
+     * a symlink, and unlinked IMMEDIATELY after the open: the fd is all this
+     * code ever uses, so from that point the file is anonymous, cannot be
+     * opened by anyone else, and cannot survive the process. The unlink
+     * before the open clears a stale file from a crashed run that happened to
+     * hold this pid. */
+    char hp_[64]; snprintf(hp_,sizeof hp_,"dlc_hdr_%d.dat",getpid());
     static unsigned char hst[64]; static unsigned char rec[112];
     int slot=slot0; long total=0; long stalled=0;
     int fd=-1; int held=-1;   /* index into live[]/claimed[] currently held, or -1 */
@@ -3394,8 +3409,10 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
         long hi=lo+DLC_CHUNK_BLOCKS-1; if(hi>end_h) hi=end_h;
         if(dlc_chunk_all_present(lo,hi)) continue;
 
-        int hfd=open(hp_,O_RDWR|O_CREAT|O_TRUNC,0644);
+        unlink(hp_);                       /* DMN-8: stale file from a crashed run */
+        int hfd=open(hp_,O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
         if(hfd<0){ if(fd>=0) close(fd); DLC_RELEASE(); break; }
+        unlink(hp_);                       /* DMN-8: anonymous from here on */
         *(int*)((char*)hst+0)=hfd; *(long*)((char*)hst+8)=0;
         long n=0; FILE* mf=fopen("headers.dat","rb");
         for(long k=lo;k<=hi;k++){

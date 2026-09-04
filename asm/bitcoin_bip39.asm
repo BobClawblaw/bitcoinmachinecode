@@ -46,6 +46,15 @@ m39_prev: resb 64
 m39_cur:  resb 64
 m39_acc:  resb 64
 m39_nw:   resq 1                     ; parsed word count (bip39_parse)
+; WAL-11 canary. The overflow this module used to allow ran FORWARD from
+; m39_idx through every buffer above, so the only way to observe it from C is
+; to give it something to land in past the last of them: 400 words wrote 1,600
+; bytes where m39_idx..m39_nw is 1,328. Exported so tests/test_bip39.c can
+; assert it stays zero -- remove the `cmp r13, 24` bound in bip39_parse and
+; that assertion fails, which is what makes the test a real control rather
+; than a restatement of the word-count check.
+global m39_guard
+m39_guard: resb 512
 
 section .text
 extern sha256_full
@@ -428,6 +437,16 @@ bip39_parse:
     pop  r13
     cmp  eax, -1
     je   .invalid                   ; unknown word (or degenerate empty token)
+    ; ---- WAL-11 (audit 2026-09-03): BOUND THE INDEX ARRAY ----
+    ; m39_idx holds 24 dwords (96 bytes) and the 12/15/18/21/24 word-count
+    ; check is at .tok_done, i.e. AFTER this loop -- so a 25th valid word
+    ; wrote past the array, and `wallet_cli seed "<400 valid words>"` walked
+    ; 1.6 KB through m39_salt, m39_msg and into the next object's .bss. The
+    ; count check cannot move earlier (it needs the final total), so the
+    ; bound belongs here. A mnemonic longer than 24 words can never be valid,
+    ; so refusing it early loses nothing.
+    cmp  r13, 24
+    jae  .invalid
     mov  rcx, r13
     mov  [m39_idx + rcx*4], eax
     inc  r13

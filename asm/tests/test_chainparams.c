@@ -192,6 +192,52 @@ int main(void){
       ck("...but only at height 0",       !bmc_is_genesis_block(1, mainh));
       chainparams_select("main"); }
 
+    /* ---- VAL-12 (audit 2026-09-03): the minimum-chain-work floors ----
+     * testnet4 carried SIGNET's floor -- byte-identical to it, and about 4e9
+     * times lower than Core's -- so a low-work testnet4 fork cleared
+     * reorg_work_meets_minimum when it should not. This file asserted genesis
+     * hashes only, so the paste was invisible. Pinning all four against Core
+     * catches the next one, and the DISTINCTNESS check is what actually
+     * fails on a copy-paste: an equality test against a wrong-but-consistent
+     * constant would not.
+     *
+     * RUNS BEFORE the signet section below, deliberately. That section
+     * selects a CUSTOM signet, and chainparams_select clears
+     * PARAMS_SIGNET.min_chain_work_hex (and its seeds) for a custom
+     * challenge -- correctly, per Core -- but PARAMS_SIGNET is a mutable
+     * static that is never restored, so a later chainparams_select("signet")
+     * still reads the cleared floor. Harmless for the daemon, which selects
+     * one chain at boot and never goes back, but it means this block reads ""
+     * for signet if it runs afterwards. */
+    {
+        printf("\n== minimum chain work (Core kernel/chainparams.cpp) ==\n");
+        struct { const char* chain; const char* want; } W[] = {
+            { "main",     "0000000000000000000000000000000000000001128750f82f4c366153a3a030" },
+            { "testnet4", "0000000000000000000000000000000000000000000009a0fe15d0177d086304" },
+            { "signet",   "00000000000000000000000000000000000000000000000000000b463ea0a4b8" },
+            { "regtest",  "" },
+        };
+        char seen[4][80];
+        for (unsigned i = 0; i < sizeof W / sizeof W[0]; i++){
+            char lbl[128];
+            seen[i][0] = 0;
+            if (chainparams_select(W[i].chain) != 1){
+                snprintf(lbl, sizeof lbl, "%s selects", W[i].chain); ck(lbl, 0); continue;
+            }
+            const char* got = g_chainp->min_chain_work_hex ? g_chainp->min_chain_work_hex : "";
+            snprintf(seen[i], sizeof seen[i], "%s", got);
+            snprintf(lbl, sizeof lbl, "%s min_chain_work == Core's", W[i].chain);
+            ck(lbl, strcmp(got, W[i].want) == 0);
+            if (strcmp(got, W[i].want) != 0)
+                printf("        got  %s\n        want %s\n", got, W[i].want);
+        }
+        /* the ACTUAL values, not the two expected constants -- comparing
+         * those would be tautological and pass however wrong the tree is */
+        ck("testnet4's floor is NOT signet's (the VAL-12 paste)",
+           strcmp(seen[1], seen[2]) != 0);
+        chainparams_select("main");
+    }
+
     printf("== signet (BIP325) ==\n");
     {
         ck("select(signet)", chainparams_select("signet") == 1);
