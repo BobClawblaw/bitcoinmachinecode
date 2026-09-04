@@ -8,7 +8,10 @@
 
 extern int  cons_verify(const void* block, unsigned long len, void* txid_scratch, unsigned long cap);
 extern void sha256d(unsigned char out[32], const void *msg, long len);
-extern void merkle_root(unsigned char out[32], unsigned char hashes[], unsigned long n);
+/* VAL-6: merkle_root now RETURNS the mutation flag (CVE-2012-2459) in eax.
+ * The .asm never had a declared return type here; callers that ignore it are
+ * unaffected (SysV: eax is caller-saved scratch either way). */
+extern long merkle_root(unsigned char out[32], unsigned char hashes[], unsigned long n);
 extern int  pow_check(const unsigned char hdr[80]);
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
 extern int tx_parse(unsigned long long info[8], const void* tx, unsigned long long txlen);
@@ -105,6 +108,94 @@ int main(void){
 
     /* capacity too small (cap=1, but 2 txs) -> reject */
     cki("cons_verify cap too small rejected", cons_verify(block, blen, scratch, 1), 0);
+
+    /* ---- VAL-6 (audit 2026-09-03): CVE-2012-2459 merkle mutation. ----
+     * A 3-leaf tree [A,B,C] folds C with a duplicate of itself: root =
+     * H(H(A,B), H(C,C)). A 4-leaf list [A,B,C,C] folds (C,C) as a REAL
+     * sibling pair and gets the SAME root -- so a 4-tx block [cb,n1,n2,n2]
+     * shares both the merkle root and the block hash of the genuine 3-tx
+     * block [cb,n1,n2]. Core computes BlockMerkleRoot(block,&mutated) and
+     * rejects the mutated variant with bad-txns-duplicate WITHOUT
+     * invalidating the header, so the genuine block can still arrive.
+     * Our store paths store on cons_verify success, so before this fix the
+     * mutated block was ARCHIVED under the real hash and permanently
+     * displaced the genuine one. */
+    {
+        unsigned char cb2[128], n1[128], n2[128];
+        unsigned long cbl2 = mk_coinbase(cb2, 0x11);
+        unsigned char cbid2[32]; sha256d(cbid2, cb2, cbl2);
+        unsigned long n1l = mk_normal(n1, cbid2);
+        unsigned char n1id[32]; sha256d(n1id, n1, n1l);
+        unsigned long n2l = mk_normal(n2, n1id);
+        unsigned char n2id[32]; sha256d(n2id, n2, n2l);
+
+        /* merkle root of the genuine 3-leaf tree (via the function itself is
+         * circular for ACCEPTANCE, so pin the premise non-circularly first:
+         * root == H(H(CB,N1), H(N2,N2)) computed with sha256d directly). */
+        unsigned char AB[64], CC[64], ABC_root[32];
+        memcpy(AB, cbid2, 32); memcpy(AB+32, n1id, 32);
+        sha256d(AB, AB, 64);                       /* P = H(CB||N1) */
+        memcpy(CC, n2id, 32); memcpy(CC+32, n2id, 32);
+        sha256d(CC, CC, 64);                       /* Q = H(N2||N2) */
+        memcpy(AB+32, CC, 32);
+        sha256d(ABC_root, AB, 64);                 /* root = H(P||Q) */
+
+        /* header with that root; mine a nonce under 0x207fffff */
+        unsigned char h2[80]; memset(h2,0,80);
+        put_u32(h2,1);
+        memcpy(h2+36, ABC_root, 32);
+        put_u32(h2+68, 1700000001);
+        put_u32(h2+72, 0x207fffff);
+        unsigned long nn = 0;
+        while (!pow_check(h2) && nn < 200000000UL){ put_u32(h2+76,(unsigned)nn); nn++; }
+        cki("mutation fixture: mined a PoW-valid header", pow_check(h2), 1);
+
+        /* genuine 3-tx block */
+        static unsigned char blk3[4096], blk4[4096];
+        memcpy(blk3, h2, 80);
+        unsigned long o3 = 80;
+        blk3[o3++] = 3;
+        memcpy(blk3+o3, cb2, cbl2); o3 += cbl2;
+        memcpy(blk3+o3, n1, n1l);   o3 += n1l;
+        memcpy(blk3+o3, n2, n2l);   o3 += n2l;
+        static unsigned char scratch2[64*32];
+        cki("cons_verify accepts the genuine 3-tx block",
+            cons_verify(blk3, o3, scratch2, 64), 1);
+
+        /* mutated 4-tx variant: SAME header (same hash!), tx list + one
+         * duplicate of the tail tx. Its merkle root equals the 3-tx root --
+         * verify that premise first (the CVE), then require the reject. */
+        memcpy(blk4, h2, 80);
+        unsigned long o4 = 80;
+        blk4[o4++] = 4;
+        memcpy(blk4+o4, cb2, cbl2); o4 += cbl2;
+        memcpy(blk4+o4, n1, n1l);   o4 += n1l;
+        memcpy(blk4+o4, n2, n2l);   o4 += n2l;
+        memcpy(blk4+o4, n2, n2l);   o4 += n2l;
+        unsigned char leaves[4*32], root4[32];
+        memcpy(leaves+0, cbid2, 32); memcpy(leaves+32, n1id, 32);
+        memcpy(leaves+64, n2id, 32); memcpy(leaves+96, n2id, 32);
+        merkle_root(root4, leaves, 4);
+        cki("CVE premise: 4-leaf mutated tree has the SAME root",
+            memcmp(root4, ABC_root, 32)==0, 1);
+        cki("cons_verify REJECTS the mutated 4-tx block (bad-txns-duplicate)",
+            cons_verify(blk4, o4, scratch2, 64), 0);
+
+        /* the mutation flag itself: [A,B,A,B] -> level-1 identical pair */
+        unsigned char L[4*32], R[32];
+        memset(L+0, 0x11, 32); memset(L+32, 0x22, 32);
+        memcpy(L+64, L+0, 32);   memcpy(L+96, L+32, 32);
+        long mut = (long)merkle_root(R, L, 4);
+        cki("merkle_root flags [A,B,A,B] as mutated", mut, 1);
+        unsigned char L2[2*32];
+        memset(L2, 0x11, 32); memset(L2+32, 0x22, 32);
+        mut = (long)merkle_root(R, L2, 2);
+        cki("merkle_root does NOT flag [A,B]", mut, 0);
+        unsigned char L3[3*32];
+        memset(L3, 0x11, 32); memset(L3+32, 0x22, 32); memset(L3+64, 0x33, 32);
+        mut = (long)merkle_root(R, L3, 3);
+        cki("merkle_root does NOT flag the legitimate odd tail [A,B,C]", mut, 0);
+    }
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;

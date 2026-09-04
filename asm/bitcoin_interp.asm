@@ -3096,6 +3096,18 @@ interp_checkmultisig:
     mov   rax, [r12+8]
     mov   [rsp+8], rax           ; sp value (cached)
 
+    ; SCR-7 (audit 2026-09-03): Core checks `(int)stack.size() < i` BEFORE
+    ; each operand read (interpreter.cpp, i = 1, then nKeys+2, then the full
+    ; need+1 that the check further below already mirrors). This function had
+    ; only the third check, AFTER two unguarded reads: on a shallow stack
+    ; stack_elem_ptr happily multiplies a NEGATIVE index and hands back a
+    ; record below main_elems -- garbage whose length field then drives
+    ; scriptnum_decode across whatever memory precedes the 528,000-byte
+    ; stack buffer (a worker SIGSEGV via a dust P2WSH of `OP_16
+    ; OP_CHECKMULTISIG`). Check 1: stacktop(1) exists.
+    cmp   dword [rsp+8], 1
+    jl    .err_stackop
+
     ; ---- 1. nKeys = CScriptNum(stacktop(1)), validate 0..20. Core's real
     ; check is `nKeysCount < 0 || nKeysCount > MAX_PUBKEYS_PER_MULTISIG`
     ; (interpreter.cpp) -- nKeys=0 (a degenerate 0-of-0 multisig, real
@@ -3153,6 +3165,13 @@ interp_checkmultisig:
     ja    .err_opcount
 
     ; stacktop(nkeys+2) = m
+    ; SCR-7 check 2 (Core's `i += nKeysCount; if (stack.size() < i)`): the m
+    ; element must exist BEFORE it is read (placed exactly where Core places
+    ; it -- after the opcount charge, before the nSigs decode).
+    mov   eax, [rsp+24]
+    add   eax, 2
+    cmp   [rsp+8], eax
+    jl    .err_stackop
     mov   eax, [rsp+24]
     add   eax, 2
     mov   rcx, [rsp+8]

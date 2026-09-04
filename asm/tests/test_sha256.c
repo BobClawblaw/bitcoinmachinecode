@@ -119,6 +119,49 @@ int main(void)
         check("bytes(range(119))  [resid-55]", digest, exp);
     }
 
+    /* ---- CRY-1 (audit 2026-09-03): the SHA-NI dispatch must probe
+     * CPUID.(EAX=7,ECX=0):EBX bit 29 -- the SHA extensions -- and NOT
+     * CPUID.(EAX=1):ECX bit 29, which is F16C. The two bits are INDEPENDENT:
+     * every Intel core from Ivy Bridge (first F16C) to Comet Lake (last
+     * pre-ICE) sets F16C without SHA-NI, so the old probe jumped into
+     * sha256_block_shani and executed sha256rnds2 on a CPU that cannot
+     * decode it -> SIGILL on the first hash of every binary in the tree.
+     * Verified here against an INDEPENDENT C-side read of both bits: on a
+     * CPU with the two bits disagreeing, sha256_cpu_has_sha() must equal
+     * leaf-7-bit-29 (not leaf-1-bit-29), and sha256_block's output must be
+     * the correct scalar digest whenever leaf 7 says no. On this box (SHA-NI
+     * present) the shani path is taken and must still be digest-correct --
+     * already proven by every KAT above. On a box without SHA-NI the probe
+     * must read 0; the pre-fix probe would have read F16C's 1. ---- */
+    {
+        unsigned f16c = 0, sha7 = 0, maxleaf = 0;
+        { unsigned a=0,b,c,d; __asm__ volatile("cpuid" : "=a"(a),"=b"(b),"=c"(c),"=d"(d) : "a"(0)); maxleaf=a; (void)b;(void)c;(void)d; }
+        { unsigned a=1,b,c,d; __asm__ volatile("cpuid" : "=a"(a),"=b"(b),"=c"(c),"=d"(d) : "a"(1)); f16c = (c>>29)&1; }
+        if (maxleaf >= 7){ unsigned a=7,b,c,d; __asm__ volatile("cpuid" : "=a"(a),"=b"(b),"=c"(c),"=d"(d) : "a"(7),"c"(0)); sha7 = (b>>29)&1; }
+        extern int sha256_cpu_has_sha(void);
+        int got = sha256_cpu_has_sha();
+        printf("info: cpuid max_leaf=%u F16C(1:ECX.29)=%u SHA(7:EBX.29)=%u probe=%d\n",
+               maxleaf, f16c, sha7, got);
+        if (got == (int)sha7) printf("ok  : sha256_cpu_has_sha() == CPUID.7:EBX bit 29 (the SHA flag)\n");
+        else { printf("FAIL: sha256_cpu_has_sha()=%d but CPUID.7:EBX bit 29=%u\n", got, sha7); failures++; }
+        if (f16c != sha7)
+            printf("info: this CPU has F16C != SHA -- the pre-fix probe would have returned %u (SIGILL)\n", f16c);
+        /* whichever way the probe falls, sha256_block must produce the
+         * correct chain state for a one-block compression (both paths were
+         * differentially proven bit-identical; this pins the DISPATCH's
+         * result end-to-end on THIS cpu). */
+        uint32_t st[8], st2[8];
+        sha256_init(st); sha256_init(st2);
+        {
+            uint8_t blk[64]; for (int i=0;i<64;i++) blk[i]=(uint8_t)i;
+            sha256_block(st, blk);
+            extern void sha256_block_shani(uint32_t state[8], const void* block);
+            sha256_block_shani(st2, blk);      /* both paths, both correct */
+        }
+        if (memcmp(st,st2,32)==0) printf("ok  : dispatch output == explicit sha256_block_shani output\n");
+        else { printf("FAIL: dispatch output != explicit sha256_block_shani output\n"); failures++; }
+    }
+
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }

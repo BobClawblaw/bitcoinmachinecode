@@ -389,12 +389,19 @@ static int tapagg_build(bytepool_t* pool, tapagg_t* d,
     u64 splen = 0;
     for (u64 k=0;k<nin;k++){
         get(ctx, k, &op, &v, &spk, &sl);
-        /* BIP341's aggregate scriptPubKey array encodes each entry's length
-         * in ONE byte, so a >=0xfd prevout script cannot be expressed in it.
-         * An independent literal, deliberately NOT derived from TXV_SPK_CAP
-         * (which is the consensus MAX_SCRIPT_SIZE and much larger). */
-        if (sl >= 0xfd) { *reason = "prevout script too large for taproot aggregate sighash"; return 0; }
-        splen += 1u + sl;
+        /* SCR-5 (audit 2026-09-03): BIP341's sha_scriptpubkeys hashes each
+         * spent scriptPubKey prefixed by a CompactSize length -- Core's
+         * PrecomputedTransactionData::Init uses ser_compactsize, and a
+         * scriptPubKey up to MAX_SCRIPT_SIZE (10000) is consensus-spendable.
+         * This run previously encoded the length in ONE byte and REJECTED any
+         * co-input script >= 253 -- a false reject against the live chain
+         * (a bare multisig co-input + a P2TR input = whole tx refused, block
+         * rejected, node stalls on a fork Core accepts). The reader
+         * (ts_agg_hashes) already walks a proper minimality-checked
+         * compactsize; the writers were the drift. sl is already capped at
+         * TXV_SPK_CAP = MAX_SCRIPT_SIZE < 0x10000, so 1 or 3 bytes suffice. */
+        if (sl > TXV_SPK_CAP) { *reason = "prevout script too large"; return 0; }
+        splen += (sl < 0xfd ? 1u : 3u) + sl;
     }
     /* strip_witness never grows a transaction (it only drops the marker/flag
      * and the witness section, and re-serializes everything else verbatim),
@@ -429,11 +436,13 @@ static int tapagg_build(bytepool_t* pool, tapagg_t* d,
          * adapter that allocated would dangle po/am/sp/ns, and this catches it
          * before the first write of the iteration rather than after. */
         if (pool->buf != base) { *reason = "internal: taproot arena moved during build"; return 0; }
-        if (sl >= 0xfd || w + 1u + sl > splen) { *reason = "internal: taproot arena sizing pass disagreed"; return 0; }
-        memcpy(po + k*36, op, 36);
-        for (int b=0;b<8;b++) am[k*8+b] = (u8)(v>>(8*b));
-        sp[w++] = (u8)sl;
-        memcpy(sp + w, spk, sl); w += sl;
+        { u64 csl = (sl < 0xfd ? 1u : 3u);
+          if (sl > TXV_SPK_CAP || w + csl + sl > splen) { *reason = "internal: taproot arena sizing pass disagreed"; return 0; }
+          memcpy(po + k*36, op, 36);
+          for (int b=0;b<8;b++) am[k*8+b] = (u8)(v>>(8*b));
+          if (sl < 0xfd){ sp[w++] = (u8)sl; }
+          else { sp[w++] = 0xfd; sp[w++] = (u8)(sl & 0xff); sp[w++] = (u8)(sl >> 8); }
+          memcpy(sp + w, spk, sl); w += sl; }
     }
     long nslen = strip_witness(tx, (int64_t)txlen, ns, (long)txlen);
     if (nslen <= 0) { *reason = "malformed witness (strip failed)"; return 0; }
@@ -942,6 +951,17 @@ int tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
  * approximately nothing).
  * ============================================================================ */
 
+/* VAL-1 fees ledger (audit 2026-09-03): per-tx input sums for the LAST
+ * tx_verify_block_connect_all call. File-scope like every other arena here
+ * (same single-threaded Phase-1 discipline); the caller reads it through
+ * txvb_last_tx_in_sums immediately after a successful call. */
+static u64* g_tx_in_sums = 0;    static u64 g_tx_in_sums_cap = 0;
+static u64 g_tx_in_sums_n = 0;
+const u64* txvb_last_tx_in_sums(u64* n_out){
+    if (n_out) *n_out = g_tx_in_sums_n;
+    return g_tx_in_sums;
+}
+
 /* bidx_get: exported by daemon/utxo_live.c -- same argument/return shape as
  * utxo_lsm_get, plus the CALLING tx's own 0-based block position. Returns
  * 1 hit / 0 miss (not resolvable in-block; caller falls back to
@@ -1337,6 +1357,81 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
     }
 }
 
+/* SCR-6 (audit 2026-09-03): per-tx sigop COST for the LAST
+ * tx_verify_block_connect_all call -- the exact quantity Core's ConnectBlock
+ * accumulates (nSigOpsCost += GetTransactionSigOpCost(tx, view, flags);
+ * reject bad-blk-sigops above MAX_BLOCK_SIGOPS_COST=80,000). Same file-scope
+ * single-threaded export discipline as the VAL-1 fees ledger. */
+static u64* g_tx_sigops = 0;  static u64 g_tx_sigops_cap = 0;  static u64 g_tx_sigops_n = 0;
+unsigned long long* txvb_last_tx_sigops(unsigned long long* n){ if(n) *n = g_tx_sigops_n; return (unsigned long long*)g_tx_sigops; }
+
+/* The last data push of a scriptSig (Core's subscript source for both the
+ * P2SH accurate sigop count and the P2SH-wrapped witness lookup). Mirrors
+ * daemon/tx_accept.c's sgc_last_push: any non-push opcode (opcode > OP_16)
+ * yields 0, exactly like CScript::GetSigOpCount(const CScript&). */
+static int txv_sgc_last_push(const u8* sc, unsigned long sl, const u8** out, unsigned long* outl){
+    const u8* p = sc; const u8* end = sc + sl;
+    const u8* last = 0; unsigned long lastl = 0;
+    while (p < end){
+        u8 op = *p++;
+        unsigned long n;
+        if (op <= 0x4b) n = op;
+        else if (op == 0x4c){ if (p >= end) return 0; n = *p++; }
+        else if (op == 0x4d){ if (p+2 > end) return 0; n = (unsigned long)p[0] | ((unsigned long)p[1]<<8); p += 2; }
+        else if (op == 0x4e){ if (p+4 > end) return 0; n = (unsigned long)p[0]|((unsigned long)p[1]<<8)|((unsigned long)p[2]<<16)|((unsigned long)p[3]<<24); p += 4; }
+        else if (op <= 0x60) { last = p; lastl = 0; continue; }   /* OP_1NEGATE/OP_N */
+        else return 0;                                            /* opcode > OP_16 */
+        if ((unsigned long)(end - p) < n) return 0;
+        last = p; lastl = n; p += n;
+    }
+    if (!last) return 0;
+    *out = last; *outl = lastl;
+    return 1;
+}
+
+extern long tx_legacy_sigops(const u8* tx, unsigned long txlen);
+extern long script_sigops_accurate(const u8* script, unsigned long len);
+
+/* Core WitnessSigOps for one witness program. */
+static u64 txv_witness_sigops(int wver, unsigned long proglen, const u8* wit_last, unsigned long wit_lastl){
+    if (wver != 0 || !wit_last) return 0;
+    if (proglen == 20) return 1;                              /* P2WPKH */
+    if (proglen == 32) return (u64)script_sigops_accurate(wit_last, wit_lastl);  /* P2WSH */
+    return 0;
+}
+
+/* GetTransactionSigOpCost for ONE non-coinbase tx, from the Phase-1-resolved
+ * flat entries. All reads are of data Phase 1 already bounded. */
+static u64 txv_sigop_cost_tx(const u8* tx, u64 txlen, const txvb_in_t* flat,
+                             u64 lo, u64 hi, u64 flags){
+    u64 cost = (u64)tx_legacy_sigops(tx, (unsigned long)txlen) * 4ULL;   /* WITNESS_SCALE_FACTOR */
+    for (u64 gi = lo; gi < hi; gi++){
+        const txvb_in_t* in = &flat[gi];
+        const u8* spk = g_spk_pool.buf + in->spk_off;
+        unsigned long spkl = in->spklen;
+        int is_p2sh = (spkl == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87);
+        const u8* red = 0; unsigned long redl = 0;
+        if (is_p2sh && (flags & (1ULL<<0)) /* SCRIPT_VERIFY_P2SH, Core bit */
+            && in->scriptSiglen &&
+            txv_sgc_last_push(in->scriptSig, in->scriptSiglen, &red, &redl) && red)
+            cost += (u64)script_sigops_accurate(red, redl) * 4ULL;
+        if (flags & TXV_FLAG_WITNESS){
+            /* native witness program on the prevout spk... */
+            const u8* ws = spk; unsigned long wsl = spkl;
+            if (is_p2sh){ ws = red; wsl = redl; }              /* ...or P2SH-wrapped */
+            if (ws && wsl >= 4 && wsl <= 42 &&
+                (ws[0] == 0x00 || (ws[0] >= 0x51 && ws[0] <= 0x60)) &&
+                (unsigned long)ws[1] + 2 == wsl && ws[1] >= 2 && ws[1] <= 40){
+                int wver = ws[0] == 0x00 ? 0 : ws[0] - 0x50;
+                const u8* wlast = in->nwit ? in->wit[in->nwit-1] : 0;
+                unsigned long wlastl = in->nwit ? in->witlen[in->nwit-1] : 0;
+                cost += txv_witness_sigops(wver, ws[1], wlast, wlastl);
+            }
+        }
+    }
+    return cost;
+}
+
 /* tx_verify_block_connect_all(txs, ntx, height, block_hash32, lst, u, bx,
  * &fail_tx_index, &reason) -> 1 accept / 0 reject. txs[0] MUST be the
  * coinbase (skipped entirely -- matches Bitcoin's own "coinbase is always
@@ -1441,9 +1536,37 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
     static char g_rbuf[64];
     unsigned long long flags = script_flags_for_block((unsigned long long)height, block_hash32);
 
+    /* VAL-1 fees ledger (audit 2026-09-03): per-tx input sums, exported to
+     * the caller's ConnectBlock fee/subsidy check through
+     * txvb_last_tx_in_sums. Sized and zeroed on EVERY call before any return
+     * (the total_nin==0 early exit below must still read as "zero fees"). */
+    {
+        u64* p = grow_arena((void**)&g_tx_in_sums, &g_tx_in_sums_cap, ntx * sizeof(u64));
+        if (!p){ *reason = "out of memory"; *fail_tx_index = 0; return 0; }
+        memset(g_tx_in_sums, 0, ntx * sizeof(u64));
+        g_tx_in_sums_n = ntx;
+    }
+
     u64 total_nin = 0;
     for (u64 t=1; t<ntx; t++) total_nin += txs[t].pn_in;
-    if (total_nin == 0) return 1;
+
+    /* SCR-6 ledger sizing + the coinbase's legacy cost, BEFORE the total_nin
+     * early-return, so the exported array is valid on EVERY success path (the
+     * caller sums it unconditionally). With zero non-coinbase inputs no tx has
+     * a P2SH/witness addend (those need resolved inputs), so the whole block's
+     * cost is just the legacy per-tx scan. */
+    {
+        u64* p = grow_arena((void**)&g_tx_sigops, &g_tx_sigops_cap, ntx * sizeof(u64));
+        if (!p){ *reason = "out of memory"; *fail_tx_index = 0; return 0; }
+        memset(g_tx_sigops, 0, ntx * sizeof(u64));
+        g_tx_sigops_n = ntx;
+        g_tx_sigops[0] = (u64)tx_legacy_sigops(txs[0].ptr, (unsigned long)txs[0].len) * 4ULL;
+        if (total_nin == 0){
+            for (u64 t=1; t<ntx; t++)
+                g_tx_sigops[t] = (u64)tx_legacy_sigops(txs[t].ptr, (unsigned long)txs[t].len) * 4ULL;
+            return 1;
+        }
+    }
 
     static txvb_in_t* g_flat = 0;        static u64 g_flat_cap = 0;
     static txvb_result_t* g_res = 0;     static u64 g_res_cap = 0;
@@ -1506,11 +1629,27 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         if (bx) r = bidx_get(bx, (u32)in->tx_index, in->outpoint, index, &value, &uheight, &ucb, &spk, &spklen);
         if (r != 1) r = utxo_lsm_get(lst, u, in->outpoint, index, &value, &uheight, &ucb, &spk, &spklen);
         if (r != 1) { *reason = "input references a missing/already-spent UTXO"; *fail_tx_index = in->tx_index; goto fail; }
+        /* VAL-1 fees ledger: every non-coinbase input's resolved value lands
+         * in its transaction's input sum. A u64 CAmount can never overflow
+         * this accumulator (see the VAL_MAX_MONEY bound the caller applies
+         * against the resulting fee). */
+        if (in->tx_index < g_tx_in_sums_n) g_tx_in_sums[in->tx_index] += value;
         if (!txvb_classify(in, height, flags, value, uheight, ucb, spk, spklen,
                            &g_spk_pool, &has_taproot, reason)) {
             *fail_tx_index = in->tx_index; goto fail;
         }
     }
+
+    /* ---- SCR-6 (audit 2026-09-03): finish the per-tx sigop COST ledger
+     * (sized at the top of this function; the coinbase's legacy cost is
+     * already in g_tx_sigops[0]). Core's ConnectBlock accumulates
+     * GetTransactionSigOpCost(tx, view, flags) per tx and rejects
+     * bad-blk-sigops above MAX_BLOCK_SIGOPS_COST=80,000; the gate itself
+     * runs in the caller (apply_block_inner), next to the fee/subsidy check,
+     * so the dry-run path (submitblock / GBT proposal) answers it too. -- */
+    for (u64 t=1; t<ntx; t++)
+        g_tx_sigops[t] = txv_sigop_cost_tx(txs[t].ptr, txs[t].len, flat,
+                                           ranges[t].lo, ranges[t].hi, flags);
 
     /* ---- Phase 1.5 (taproot phase A): sequential, cheap, and the whole
      * reason Phase 2 can now take taproot. For every transaction with at
