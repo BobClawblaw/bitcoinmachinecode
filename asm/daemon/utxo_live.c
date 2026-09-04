@@ -41,6 +41,7 @@
 #include <sys/stat.h>
 #include "node_config.h"
 #include "utxo_walk.h"
+#include "seqlocks.h"
 #include "log_ts.h"
 
 extern long store_reload(void* st);
@@ -1366,58 +1367,25 @@ static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
     memcpy(&vi->locktime, p, 4);                   /* locktime */
     return 1;
 }
-/* Core's IsFinalTx (consensus/tx_verify.cpp), verbatim in structure:
- *
- *     if (tx.nLockTime == 0) return true;
- *     if ((int64_t)tx.nLockTime <
- *           ((int64_t)tx.nLockTime < LOCKTIME_THRESHOLD ? nBlockHeight : nBlockTime))
- *         return true;
- *     for (txin : tx.vin) if (txin.nSequence != SEQUENCE_FINAL) return false;
- *     return true;
- *
- * LOCKTIME_THRESHOLD (500,000,000) is what decides whether nLockTime means a
- * height or a UNIX time -- the same constant CLTV uses. */
-#define VAL_LOCKTIME_THRESHOLD 500000000UL
-static int val_is_final_tx(const val_txinfo_t* vi, long height, u32 timecutoff){
-    if (vi->locktime == 0) return 1;
-    long long cutoff = ((unsigned long)vi->locktime < VAL_LOCKTIME_THRESHOLD)
-                     ? (long long)height : (long long)(unsigned long)timecutoff;
-    if ((long long)(unsigned long)vi->locktime < cutoff) return 1;
-    return !vi->any_nonfinal_seq;
-}
-
-/* ---------------------------------------------------------------- VAL-4
- * BIP68's three pieces of arithmetic, split out because this is where a
- * chain split would come from and nothing else about the rule is subtle.
- *
- * consensus/tx_verify.cpp, CalculateSequenceLocks:
- *     height-based:  minHeight = max(minHeight, coinHeight + (seq & MASK) - 1)
- *     time-based:    minTime   = max(minTime,
- *                                    coinMTP + ((seq & MASK) << 9) - 1)
- * and EvaluateSequenceLocks:
- *     satisfied iff  minHeight < nBlockHeight  AND  minTime < MTP(prev)
- *
- * The << 9 is BIP68's 512-second granularity and the -1 is Core's: the lock
- * is satisfied AT the boundary, not one past it. Both are off-by-ones that
- * produce a chain split rather than a test failure, so they are transcribed
- * and then pinned by tests/test_bip68_locks.c against hand-computed values. */
-#define VAL_SEQ_DISABLE (1u << 31)
-#define VAL_SEQ_TYPE    (1u << 22)
-#define VAL_SEQ_MASK    0x0000ffffu
-
-long long val_seq_min_height(unsigned long coin_height, unsigned seq){
-    return (long long)coin_height + (long long)(seq & VAL_SEQ_MASK) - 1;
-}
-long long val_seq_min_time(unsigned long coin_mtp, unsigned seq){
-    return (long long)coin_mtp
-         + (long long)(((unsigned long long)(seq & VAL_SEQ_MASK)) << 9) - 1;
-}
-int val_seq_locks_ok(long long min_height, long long min_time,
-                     long height, unsigned long tip_mtp){
-    if (min_height >= (long long)height) return 0;
-    if (min_time   >= (long long)tip_mtp) return 0;
+/* MEM-1: val_mtp exported for the mempool's finality context. The policy
+ * layer cannot read headers, so daemon/main.c pushes the tip's median time
+ * past in at every tip change; this is the one implementation, shared with
+ * the block-connect path so the two cannot disagree by a second. */
+int utxo_live_median_time_past(long height, unsigned long* out){
+    u32 v;
+    if (height < 0 || !val_mtp(height, &v)) return 0;
+    *out = (unsigned long)v;
     return 1;
 }
+
+/* VAL-4: IsFinalTx over a val_txinfo_t. The predicate itself is in
+ * daemon/seqlocks.h, shared with the mempool path (MEM-1) so the two cannot
+ * drift; this is only the adapter that supplies its arguments. */
+static int val_is_final_tx(const val_txinfo_t* vi, long height, u32 timecutoff){
+    return val_is_final((unsigned long)vi->locktime, vi->any_nonfinal_seq,
+                        height, (unsigned long)timecutoff);
+}
+
 
 /* Test seam for tests/test_val_read_tx.c. val_read_tx is static and is not
  * reachable from a harness otherwise; exporting a thin alias (the same

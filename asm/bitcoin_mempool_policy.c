@@ -61,7 +61,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stddef.h>
-#include <stdlib.h>          /* MEM-2: realloc for the evictor working arrays */
+#include <stdlib.h>
+#include "daemon/seqlocks.h"          /* MEM-2: realloc for the evictor working arrays */
 #include <time.h>
 
 /* ---------------- asm glue (declared; resolved at link) ------------------- */
@@ -329,6 +330,11 @@ typedef struct {
     unsigned long n_out;
     const unsigned char* out_start;   /* first output record */
     const unsigned char* in_start;    /* first input record  */
+    uint32_t locktime;   /* MEM-1: the trailing 4 bytes. parse_tx read every
+                            other field of the transaction and skipped this
+                            one, because nothing consumed it -- the audit's
+                            note that "the 4-byte nLockTime is never decoded
+                            on the admission path at all". */
 } mpol_txmeta;
 
 static int parse_tx(const unsigned char* tx, unsigned long txlen,
@@ -374,11 +380,51 @@ static int parse_tx(const unsigned char* tx, unsigned long txlen,
         if (end - p < 4) return -1;
         wit_len = (uint64_t)(end - p) - 4;
     }
+    m->locktime = (uint32_t)(end[-4] | (end[-3]<<8) | (end[-2]<<16) | ((uint32_t)end[-1]<<24));
     m->nonwit_len = m->is_segwit ? (txlen - 2 - wit_len) : txlen;
     m->weight = m->nonwit_len * 3 + txlen;
     m->vsize  = (m->weight + 3) / 4;
     m->n_in = (int)n_in;
     return (int)n_in;
+}
+
+/* ---------------------------------------------------------------- MEM-1
+ * Chain context for the finality rules (audit 2026-09-03).
+ *
+ * Core's MemPoolAccept::PreChecks rejects !CheckFinalTxAtTip ("non-final")
+ * and !CheckSequenceLocks ("non-BIP68-final") using STANDARD_LOCKTIME_VERIFY_
+ * FLAGS, i.e. against the NEXT block's height and the tip's median time past.
+ * This layer had neither: parse_tx read the sequences only for BIP125
+ * signalling and never decoded nLockTime at all.
+ *
+ * What that let through: a transaction with nLockTime = tip+500, or a v2 with
+ * a relative lock against a freshly confirmed input, passed every check,
+ * entered the shared pool, was announced to every peer (Core peers reject it
+ * as non-final and keep it in recent-rejects), and was selected by
+ * getblocktemplate -- so a miner on this template produces a block Core
+ * rejects.
+ *
+ * The arithmetic is daemon/seqlocks.h, shared with the block-connect path so
+ * the two points cannot drift.
+ *
+ * NOT CONFIGURED => NOT ENFORCED, deliberately. next_height < 0 means the
+ * embedder has not supplied chain context, which is the case for every unit
+ * test that drives this layer with synthetic transactions and no chain. The
+ * daemon wires it at every tip change. Enforcing with a zero height would
+ * reject everything. */
+static long           g_seq_next_height = -1;
+static unsigned long  g_seq_tip_mtp     = 0;
+static int            g_seq_csv_active  = 0;
+static long (*g_seq_height_fn)(const unsigned char txid[32], unsigned long index,
+                               unsigned long long* out_height) = 0;
+
+void mpool_policy_set_seqlocks(long next_height, unsigned long tip_mtp, int csv_active,
+                               long (*height_fn)(const unsigned char*, unsigned long,
+                                                 unsigned long long*)){
+    g_seq_next_height = next_height;
+    g_seq_tip_mtp     = tip_mtp;
+    g_seq_csv_active  = csv_active;
+    g_seq_height_fn   = height_fn;
 }
 
 /* ========================================================================== */
@@ -1238,6 +1284,64 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     *(uint32_t*)((char*)st+20) = stamp;
 
     int par_idx[MPOL_MAX_IN]; int n_par = 0;
+    /* ---- MEM-1 (audit 2026-09-03): Core's finality prechecks -------------
+     * PreChecks rejects !CheckFinalTxAtTip ("non-final") and
+     * !CheckSequenceLocks ("non-BIP68-final"), evaluated against the NEXT
+     * block's height and the tip's median time past (BIP113). Placed here,
+     * before the transaction is linked into the graph and before any
+     * eviction can run, so a refusal costs nothing and mutates nothing.
+     *
+     * The arithmetic is daemon/seqlocks.h -- the same functions the
+     * block-connect path uses (VAL-4) -- so admission and connection cannot
+     * disagree. A mempool that admits what the block path rejects fills the
+     * pool with transactions that can never confirm and then hands them to
+     * getblocktemplate. */
+    if (g_seq_next_height >= 0){
+        int any_nonfinal = 0;
+        for (int i = 0; i < n_in; i++)
+            if (seq[i] != VAL_SEQUENCE_FINAL){ any_nonfinal = 1; break; }
+
+        if (!val_is_final((unsigned long)meta.locktime, any_nonfinal,
+                          g_seq_next_height, g_seq_tip_mtp)){
+            _mpol_last_reason = "non-final";
+            return 0;
+        }
+
+        /* BIP68 needs each input's prevout CREATION HEIGHT, which this layer
+         * does not resolve itself. When the embedder supplies no height
+         * resolver the rule is skipped rather than guessed -- guessing would
+         * mean inventing a confirmation depth, which is the one number the
+         * rule turns on. */
+        if (g_seq_csv_active && g_seq_height_fn && meta.version >= 2){
+            long long min_height = -1, min_time = -1;
+            int evaluable = 1;
+            for (int i = 0; i < n_in; i++){
+                if (seq[i] & VAL_SEQ_DISABLE) continue;
+                unsigned long long coin_h = 0;
+                if (g_seq_height_fn(prev[i], idx[i], &coin_h) != 1){
+                    /* an unconfirmed (in-mempool) parent has no height: Core
+                     * uses the NEXT block's height for those, since that is
+                     * where the parent would confirm. */
+                    coin_h = (unsigned long long)g_seq_next_height;
+                }
+                if (seq[i] & VAL_SEQ_TYPE){
+                    /* time-based locks need the MTP at the coin's height,
+                     * which this layer cannot read. Refuse to evaluate
+                     * rather than approximate it with the tip's. */
+                    evaluable = 0; break;
+                }
+                long long cand = val_seq_min_height((unsigned long)coin_h, seq[i]);
+                if (cand > min_height) min_height = cand;
+            }
+            if (evaluable &&
+                !val_seq_locks_ok(min_height, min_time,
+                                  g_seq_next_height, g_seq_tip_mtp)){
+                _mpol_last_reason = "non-BIP68-final";
+                return 0;
+            }
+        }
+    }
+
     n_par = mpol_collect_parents(st, prev, n_in, par_idx, 0);
 
     uint32_t anc_list[MPOL_MAX_IN + 32]; uint32_t n_anc = 0;
