@@ -244,24 +244,39 @@ not in the audit.
 
 None.
 
-### 4.3 Open, MEDIUM and below
+### 4.3 MEDIUM and below
 
-**All 145 of them** (44 MEDIUM, 68 LOW, 33 INFO). Nothing in this pass or the
-2026-09-03 pass touched any. The audit's §5 step 9 — "everything MEDIUM and
-below in the module reports" — has not been started.
+44 MEDIUM, 68 LOW, 33 INFO in the audit. **Eleven MEDIUM are now closed**;
+the rest, and everything LOW/INFO, are untouched.
 
----
+| Finding | What it was | Commit |
+|---|---|---|
+| SCR-7 | CHECKMULTISIG read below the stack bottom | `c0941c2` |
+| VAL-11 | `pow_check` had no powLimit / negative / overflow test | `19e59df` |
+| SER-2 | `tx_parse` read length bytes before bounding the cursor | `fb96a89` |
+| UTX-3 | `utxo_lsm_put` returned the zero-extended `0xFFFFFFFF` | `aadd750` |
+| UTX-4 (part) | Checkpoint fsynced before the WAL it certifies | `82f10a8` |
+| BLD-1 | `make clean` deleted a tracked source | `0c97799` |
+| DMN-5 | Worker shutdown skipped `utxo_live_close()` | `aacd678` |
+| WAL-5 | `wallet_cli init` overwrote an existing wallet silently | `aacd678` |
+| NET-7 | `getdata` count parsed as one byte, unbounded walk | `9766158` |
+| NET-8 | `getheaders` answered from genesis on an unknown first locator hash | `ed665fb` |
+| MEM-11 | P2A outputs got the non-witness dust threshold | `dccaa57` |
+| RPX-3 | `getaddressinfo` emitted a fabricated `pubkey`/`iscompressed` | `dccaa57` |
+| RPC-1 | fd + response body leaked; `accept()` spun on EMFILE | `5f2a3e0` |
+| DMN-6 | Serve children held the RPC listener and ignored SIGTERM | `5f2a3e0` |
 
-## 5. The audit's §8 observation, restated
+Each has a regression test and a verified negative control, on the same terms
+as the CRITICAL+HIGH work.
 
-The audit wrote: *"no HIGH finding in this audit has a test."* That is now
-partly false — every finding closed on 09-03 and 09-04 gained one. But the
-eight open HIGHs in §4.2 still have none, and the regression in §1 is direct
-evidence that the gap is not academic: a change written specifically to close
-audit findings broke block connection for every segwit block, and 313 gated
-harnesses did not notice.
+**A fourth stale assertion turned up here.** `test_rpc_wallet_ops` asserted
+*"pubkey stays empty for an address we cannot sign for"* — pinning RPX-3's
+defect rather than Core's behaviour, which is to omit the field entirely. That
+makes four tests found this pass that encoded behaviour a later fix had
+deliberately changed (SCR-5's 253-byte reject, VAL-11's powLimit fixture,
+`test_outbound_mux`'s difficulty, and this one).
 
-The cheapest structural fix remains the one the audit named: drive **real
-mainnet blocks** through `apply_block_inner` in the gate, not just through the
-script verifier. `test_val_read_tx.c` is one transaction-level step toward
-that; a block-level equivalent would have caught this in minutes.
+**Partial:** UTX-4's second half — a torn WAL tail is never truncated, so every
+later append lands after it and every future reload stops there — is in
+`bitcoin_utxo_store.asm`'s reload path and is not fixed. Undo files are still
+unsynced.
