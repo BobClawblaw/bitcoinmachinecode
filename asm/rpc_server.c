@@ -622,6 +622,73 @@ static int lp_tip_hash(unsigned char out[32]){
     return ok;
 }
 
+/* ---------------------------------------------------------------- RPC-5
+ * (audit 2026-09-03) The longpoll path used to be chosen by searching the RAW
+ * BODY for the substrings "longpollid" and "getblocktemplate", before any
+ * JSON parsing -- so a request like
+ *   {"method":"getrawtransaction","params":["...longpollid...getblocktemplate..."]}
+ * took it, and ANY authenticated caller could reach it with any method name.
+ * The path then returns before the worker slot is released, so -rpcthreads
+ * and -rpcworkqueue do not bound it: every such request cost a detached
+ * thread with a 64 MiB stack, an fd, and up to 9 MiB of held buffer for up to
+ * 60 seconds. Thousands of them exhaust `ulimit -u`, at which point fork()
+ * for inbound P2P connections fails -- an RPC client taking down the node's
+ * networking.
+ *
+ * Two changes: the method is read with the JSON parser instead of a substring
+ * (so only a real getblocktemplate can take the path), and the number of
+ * waiters in flight is capped. Over the cap the request falls through to the
+ * ordinary serial handler, which answers correctly -- just without waiting for
+ * a tip change -- so a flood degrades to normal service instead of exhausting
+ * the process.
+ *
+ * Core waits on a condition variable inside the handler, bounded by
+ * -rpcthreads; this keeps the off-thread shape and bounds the count.
+ */
+#define LP_MAX_WAITERS 16
+static volatile int g_lp_waiters;                 /* guarded by g_lp_count_lock */
+static pthread_mutex_t g_lp_count_lock = PTHREAD_MUTEX_INITIALIZER;
+static int lp_waiters_take(void){
+    int ok = 0;
+    pthread_mutex_lock(&g_lp_count_lock);
+    if (g_lp_waiters < LP_MAX_WAITERS){ g_lp_waiters++; ok = 1; }
+    pthread_mutex_unlock(&g_lp_count_lock);
+    return ok;
+}
+static void lp_waiters_release(void){
+    pthread_mutex_lock(&g_lp_count_lock);
+    if (g_lp_waiters > 0) g_lp_waiters--;
+    pthread_mutex_unlock(&g_lp_count_lock);
+}
+/* Test hooks. The longpoll path cannot be observed over HTTP -- the decoy
+ * request below answers identically whether or not it was handled off-thread,
+ * because the cost is the SPAWN, not the latency. (A timing assertion here
+ * passed with the fix reverted, which is how that was found.) So the two
+ * mechanisms are exercised directly instead. */
+int rpc_lp_waiters_inflight(void){
+    pthread_mutex_lock(&g_lp_count_lock);
+    int n = g_lp_waiters;
+    pthread_mutex_unlock(&g_lp_count_lock);
+    return n;
+}
+int rpc_lp_max_waiters(void){ return LP_MAX_WAITERS; }
+int rpc_lp_try_take(void){ return lp_waiters_take(); }
+void rpc_lp_release(void){ lp_waiters_release(); }
+
+/* RPC-5: is this genuinely a getblocktemplate? Parsed, not grepped. */
+static int lp_is_gbt(const char* body, size_t blen){
+    rj_val* req = rj_parse(body, blen);
+    if (!req) return 0;
+    int yes = 0;
+    if (req->typ == RJ_OBJ){
+        rj_val* m = rj_obj_get(req, "method");
+        if (m && m->typ == RJ_STR && m->str && !strcmp(m->str, "getblocktemplate")) yes = 1;
+    }
+    rj_free(req);
+    return yes;
+}
+int rpc_lp_is_gbt(const char* body, unsigned long blen){ return lp_is_gbt(body, (size_t)blen); }
+
 typedef struct { int cfd; char* buf; size_t body_off, blen; unsigned char prev[32]; int have_prev; } lp_req_t;
 
 static void* lp_waiter(void* arg){
@@ -638,6 +705,7 @@ static void* lp_waiter(void* arg){
     handle_request(r->cfd, r->buf + r->body_off, r->blen);
     pthread_mutex_unlock(&g_exec_lock);
     free(r->buf); free(r);
+    lp_waiters_release();                          /* RPC-5 */
     return NULL;
 }
 
@@ -773,9 +841,12 @@ static void service_conn(int cfd) {
       for (size_t i = 0; !is_lp && i + 12 <= blen; i++)
           if (!memcmp(body + i, "\"longpollid\"", 12)) is_lp = 1;
       if (is_lp){
-          int has_gbt = 0;
-          for (size_t i = 0; !has_gbt && i + 16 <= blen; i++)
-              if (!memcmp(body + i, "getblocktemplate", 16)) has_gbt = 1;
+          /* RPC-5: the METHOD decides, read with the parser. The substring
+           * scan above is only a cheap pre-filter to avoid parsing every
+           * request twice; a body without a longpollid cannot be a longpoll
+           * whatever its method says. */
+          int has_gbt = lp_is_gbt(body, blen);
+          if (has_gbt && !lp_waiters_take()) has_gbt = 0;   /* RPC-5: at the cap */
           if (has_gbt){
               lp_req_t* r = malloc(sizeof *r);
               if (r){
@@ -788,6 +859,7 @@ static void service_conn(int cfd) {
                   }
                   free(r);                           /* fall through: serial */
               }
+              lp_waiters_release();                  /* RPC-5: spawn failed */
           }
       } }
     pthread_mutex_lock(&g_exec_lock);
