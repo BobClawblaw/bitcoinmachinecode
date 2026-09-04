@@ -65,6 +65,31 @@ static const char* g_pass;
 
 /* ---- -rpcthreads / -rpcworkqueue / -rpcservertimeout (2026-09-01) ---- */
 static int g_threads = 16, g_workqueue = 64, g_timeout_s = 30;
+
+/* ---- RPC-4 (audit 2026-09-03): a TOTAL deadline for reading one request ----
+ *
+ * -rpcservertimeout is a PER-ACTIVITY timeout (SO_RCVTIMEO), in Core as here,
+ * and that part is faithful. What is not faithful is where the reading
+ * happens: Core reads requests non-blockingly on the libevent thread and hands
+ * only COMPLETE requests to the -rpcthreads pool, so a slow sender costs
+ * memory (bounded by MAX_SIZE), not a thread. Here service_conn does the
+ * reading, on a pool worker, BEFORE authentication -- so a client that sends
+ * one byte every g_timeout_s - 1 seconds resets the timeout forever and holds
+ * a worker with no credentials at all. Sixteen such sockets (the default
+ * rpcthreads) take the whole pool, the next 64 connections queue unanswered,
+ * everything after that gets 503, and the operator's own `bitcoin-cli stop`
+ * queues behind them.
+ *
+ * Restructuring onto a non-blocking accept-thread reader is the real fix and
+ * is a larger change than this audit item warrants. A total wall-clock budget
+ * for the pre-dispatch read closes the unbounded hold, which is the part that
+ * makes this reachable by an unauthenticated client: a request that has not
+ * arrived within the budget gets 408 and the worker is freed. The budget is
+ * deliberately several times the per-activity timeout so that a legitimate
+ * client on a slow link is unaffected -- RPC_REQ_MAX is a few hundred KB, and
+ * a real client sends that in one burst. */
+#define RPC_REQ_DEADLINE_DEFAULT 60
+static long g_req_deadline_s = RPC_REQ_DEADLINE_DEFAULT;
 #define RPC_QUEUE_CAP 4096
 static int g_q[RPC_QUEUE_CAP]; static int g_q_head, g_q_tail, g_q_n;
 static pthread_mutex_t g_q_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -148,14 +173,33 @@ static const char* find_header(const char* headers, size_t hlen,
     const char* p = headers;
     const char* end = headers + hlen;
     while (p < end) {
+        /* ---- The LAST header line has no '\r' inside `hlen` ----
+         *
+         * Callers pass hlen = hdrend - buf, where hdrend points AT the '\r'
+         * of the terminating CRLFCRLF -- which is the final header line's own
+         * terminator. So memchr found nothing for that line and this loop used
+         * to `break`, making the last header invisible.
+         *
+         * Two live consequences, both found while building the RPC-4 slow
+         * client test. (1) Content-Length is the last header in the request
+         * this server's own make_post builds, so it was never found, nv stayed
+         * -1, and the read loop stopped WITHOUT waiting for the body: any
+         * client that writes headers and body in separate segments -- which is
+         * ordinary, and unavoidable once the body exceeds one segment -- got
+         * "Parse error". It only ever worked because a small request arrives in
+         * one read(). (2) An Authorization header sent last was invisible to
+         * auth_ok, so a correctly credentialed client got 401.
+         *
+         * Treat end-of-buffer as a line end instead of giving up on the line. */
         const char* le = memchr(p, '\r', (size_t)(end - p));
-        if (!le) break;
+        if (!le) le = end;
         size_t linelen = (size_t)(le - p);
         if (linelen >= namelen + 2 && strncasecmp(p, name, namelen) == 0 && p[namelen] == ':') {
             const char* v = p + namelen + 1;
             while (v < le && (*v == ' ' || *v == '\t')) v++;
             return v;
         }
+        if (le == end) break;
         p = le + 2;
     }
     return NULL;
@@ -625,6 +669,9 @@ static void service_conn(int cfd) {
     { struct timeval tv = { g_timeout_s, 0 };            /* -rpcservertimeout */
       setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
       setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv); }
+    /* RPC-4: the whole request must arrive within this budget, however much
+     * activity keeps the per-read timeout alive. */
+    struct timespec t_start; clock_gettime(CLOCK_MONOTONIC, &t_start);
     size_t cap = 262144;
     char* buf = malloc(cap);
     if (!buf) { close(cfd); return; }
@@ -639,6 +686,24 @@ static void service_conn(int cfd) {
             if (!nb) { free(buf); close(cfd); return; }
             if (hdrend) hdrend = nb + hoff;   /* pointer survives realloc */
             buf = nb; cap = ncap;
+        }
+        /* RPC-4: enforce the total budget, and never block past it. The
+         * per-read timeout is shrunk to whatever remains, so a read that
+         * begins just under the deadline cannot overshoot it by another
+         * g_timeout_s seconds. */
+        if (g_req_deadline_s > 0){
+            struct timespec now_ts; clock_gettime(CLOCK_MONOTONIC, &now_ts);
+            long elapsed = (long)(now_ts.tv_sec - t_start.tv_sec);
+            long left = g_req_deadline_s - elapsed;
+            if (left <= 0){
+                const char* e = "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\r\n";
+                (void)write_all(cfd, e, strlen(e));
+                free(buf); close(cfd); return;
+            }
+            if (left < g_timeout_s){
+                struct timeval tv = { left, 0 };
+                setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            }
         }
         ssize_t n = read(cfd, buf + got, cap - 1 - got);
         if (n <= 0) break;
@@ -842,6 +907,24 @@ int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
     g_threads   = cfg->threads   > 0 ? (cfg->threads > 256 ? 256 : cfg->threads) : 16;
     g_workqueue = cfg->workqueue > 0 ? (cfg->workqueue > RPC_QUEUE_CAP ? RPC_QUEUE_CAP : cfg->workqueue) : 64;
     g_timeout_s = cfg->timeout_s > 0 ? cfg->timeout_s : 30;
+    /* RPC-4: the total-read budget. Env-overridable so an operator on a
+     * pathological link can raise it, or set it to 0 to restore the old
+     * unbounded behaviour deliberately rather than by accident. */
+    { const char* e = getenv("BMC_RPC_REQ_DEADLINE_SECS");
+      long v = -1;
+      if (e && *e) v = strtol(e, NULL, 10);
+      if (v >= 0){
+          /* An explicit value wins outright, including one below
+           * -rpcservertimeout (which then means a single stalled read can end
+           * the request) and 0, which restores the old unbounded behaviour
+           * deliberately rather than by accident. */
+          g_req_deadline_s = v;
+      } else {
+          /* Default: never shorter than the per-read timeout, or a request
+           * that legitimately blocks once would be cut off mid-flight. */
+          g_req_deadline_s = RPC_REQ_DEADLINE_DEFAULT;
+          if (g_req_deadline_s < g_timeout_s) g_req_deadline_s = g_timeout_s;
+      } }
     g_q_head = g_q_tail = g_q_n = 0;
     g_run = 1;
     g_n_workers = 0;

@@ -24,6 +24,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h>
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -162,6 +163,9 @@ int main(void) {
         char* argv[] = { (char*)"daemon/bitcoin_rpcd", NULL };
         /* TEST_RPC_PORT=0 -> HTTP server binds an ephemeral port (see daemon) */
         setenv("TEST_RPC_PORT", "0", 1);
+        /* RPC-4: a short total-read budget so the slow-client case below
+         * finishes in seconds rather than the 60s production default. */
+        setenv("BMC_RPC_REQ_DEADLINE_SECS", "3", 1);
         execv(argv[0], argv);
         _exit(127);
     }
@@ -326,6 +330,142 @@ int main(void) {
       ck("600KB request parsed past the old 256KB cap (-32601, not a parse error)",
          has_substr(raw_out, "Method not found"));
       free(req); free(body); free(bigp); }
+
+    /* ==== a request whose BODY arrives in a second segment must still work ==
+     *
+     * find_header was passed hlen = hdrend - buf, where hdrend points at the
+     * '\r' of the terminating CRLFCRLF -- the last header line's own
+     * terminator. memchr therefore found no line end for that header and the
+     * scan gave up on it, so Content-Length (the last header this server's own
+     * make_post emits) was never found: the read loop stopped without waiting
+     * for the body and the client got "Parse error". It worked only because a
+     * small request arrives in a single read(). The same blindness made an
+     * Authorization header sent last invisible to auth_ok, i.e. a 401 for a
+     * correctly credentialed client.
+     *
+     * Found while building the RPC-4 case below -- until it was fixed, a
+     * trickled BODY was answered immediately and could not have pinned
+     * anything, which would have made that test vacuous. */
+    {
+        int sfd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET; sa.sin_port = htons((unsigned short)port);
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ck("split-request client connected", sfd >= 0 && connect(sfd, (struct sockaddr*)&sa, sizeof sa) == 0);
+        /* The request is built BY HAND, not with make_post: make_post emits
+         * "Connection: close" after Content-Length, so Content-Length is not
+         * the last header there and the blind spot never shows. Real clients
+         * routinely end their header block with Content-Length. */
+        char whole[4096];
+        const char* b88 = "{\"id\":88,\"method\":\"getblockcount\",\"params\":[]}";
+        int wl = snprintf(whole, sizeof whole,
+            "POST / HTTP/1.1\r\n"
+            "Host: 127.0.0.1:%d\r\n"
+            "Authorization: Basic Yml0Y29pbjpiaXRjb2lu\r\n"     /* bitcoin:bitcoin */
+            "Content-Type: application/json\r\n"
+            "Content-Length: %zu\r\n"                            /* LAST header */
+            "\r\n%s", port, strlen(b88), b88);
+        const char* split = strstr(whole, "\r\n\r\n");
+        size_t hlen = split ? (size_t)(split - whole) + 4 : (size_t)wl;
+        ck("request ends its header block with Content-Length", split != NULL);
+        (void)!send(sfd, whole, hlen, MSG_NOSIGNAL);          /* headers only */
+        { struct timespec ts = { 0, 400*1000*1000 }; nanosleep(&ts, NULL); }
+        (void)!send(sfd, whole + hlen, (size_t)wl - hlen, MSG_NOSIGNAL);  /* body */
+        char rb[4096]; size_t rn = 0;
+        { struct timeval tv = { 5, 0 }; setsockopt(sfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); }
+        for (;;){ ssize_t r = recv(sfd, rb + rn, sizeof rb - 1 - rn, 0); if (r <= 0) break; rn += (size_t)r; if (rn >= sizeof rb - 1) break; }
+        rb[rn] = 0;
+        ck("a body sent in a SECOND segment is not a parse error",
+           rn > 0 && !strstr(rb, "Parse error"));
+        ck("...and the request is actually answered (id echoed)",
+           strstr(rb, "\"id\":88") != NULL);
+        close(sfd);
+    }
+
+    /* An Authorization header sent LAST must authenticate. Same blind spot:
+     * auth_ok scans the same range, so a correctly credentialed client whose
+     * Authorization line ended the header block got 401. */
+    {
+        char req2[4096];
+        const char* b89 = "{\"id\":89,\"method\":\"getblockcount\",\"params\":[]}";
+        snprintf(req2, sizeof req2,
+            "POST / HTTP/1.1\r\n"
+            "Host: 127.0.0.1:%d\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %zu\r\n"
+            "Authorization: Basic Yml0Y29pbjpiaXRjb2lu\r\n"     /* LAST header */
+            "\r\n%s", port, strlen(b89), b89);
+        raw_exchange(port, req2, strlen(req2));
+        ck("Authorization sent as the LAST header still authenticates (not 401)",
+           !has_substr(raw_out, "401 Unauthorized"));
+    }
+
+    /* ============ RPC-4: a slow sender cannot pin a worker forever ========
+     *
+     * THE BUG. -rpcservertimeout is a PER-READ timeout (SO_RCVTIMEO) and is
+     * reset by every byte, and service_conn does its reading on a pool worker
+     * BEFORE authentication. A client that trickles one byte per interval
+     * therefore held a worker indefinitely with no credentials. Sixteen such
+     * sockets (the default rpcthreads) take the whole pool, the next 64
+     * connections queue unanswered and the rest get 503 -- including the
+     * operator's own `bitcoin-cli stop`.
+     *
+     * WHAT IS ASSERTED. A connection that announces a large Content-Length and
+     * then trickles is dropped within the total budget (3s here, set in the
+     * child's environment above), and -- the part that matters -- an ordinary
+     * authenticated request still succeeds while it is in flight, proving the
+     * worker was not held. The trickle interval is 1s, comfortably under the
+     * 30s per-read timeout, so the OLD code would have kept resetting it and
+     * never returned. */
+    {
+        int sfd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET; sa.sin_port = htons((unsigned short)port);
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ck("RPC-4 slow client connected", sfd >= 0 && connect(sfd, (struct sockaddr*)&sa, sizeof sa) == 0);
+        /* An INCOMPLETE header block: the blank line that ends the headers is
+         * never sent, so the server's read loop can never decide the request
+         * is complete and keeps reading. This is the case only a total budget
+         * closes -- a trickled BODY would also be held, but bounding that
+         * relies on Content-Length parsing, and the point here is the loop
+         * that has no bound at all. */
+        const char* head = "POST / HTTP/1.1\r\nContent-Type: application/json\r\n";
+        (void)!write(sfd, head, strlen(head));
+
+        struct timespec s0; clock_gettime(CLOCK_MONOTONIC, &s0);
+        int closed = 0;
+        for (int i = 0; i < 12 && !closed; i++){
+            struct timespec ts = { 1, 0 }; nanosleep(&ts, NULL);
+            /* MSG_NOSIGNAL: once the server drops us this write hits a
+             * closed peer, and a SIGPIPE would kill the harness instead of
+             * reporting the very behaviour under test. Header bytes, so the
+             * request stays syntactically incomplete however long we go on. */
+            if (send(sfd, "X", 1, MSG_NOSIGNAL) < 0) { closed = 1; break; }
+            /* Is the server done with us? A closed peer shows up as a read of
+             * 0 (its 408 arrives first, which also counts as "answered"). */
+            char probe[256];
+            struct timeval z = { 0, 1000 };
+            setsockopt(sfd, SOL_SOCKET, SO_RCVTIMEO, &z, sizeof z);
+            ssize_t r = recv(sfd, probe, sizeof probe, 0);
+            if (r == 0) closed = 1;
+            else if (r > 0){ probe[r < 255 ? r : 255] = 0; if (strstr(probe, "408")) closed = 1; }
+            if (i == 0 && !closed){
+                /* mid-trickle: the pool must still answer someone else */
+                char r2[8192];
+                make_post(r2, sizeof r2, port, "bitcoin", "bitcoin",
+                          "{\"id\":77,\"method\":\"getblockcount\",\"params\":[]}", NULL);
+                raw_exchange(port, r2, strlen(r2));
+                ck("RPC-4 an ordinary request is answered while a slow client is mid-request",
+                   has_substr(raw_out, "\"id\":77") || has_substr(raw_out, "result"));
+            }
+        }
+        struct timespec s1; clock_gettime(CLOCK_MONOTONIC, &s1);
+        long took = (long)(s1.tv_sec - s0.tv_sec);
+        printf("      (slow client released after ~%lds, budget 3s)\n", took);
+        ck("RPC-4 the trickling client is released, not held indefinitely", closed);
+        ck("RPC-4 ...and released near the total budget, not after 12 resets", took <= 8);
+        close(sfd);
+    }
 
     /* ---- teardown ---- */
     kill(srv, SIGTERM);
