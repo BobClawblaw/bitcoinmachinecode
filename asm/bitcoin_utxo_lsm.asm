@@ -3231,14 +3231,24 @@ mac_lsm_recount:
     je   .rc_find_setbest
     cmp  eax, 1
     jne  .rc_find_next
-    ; equal keys: this wins the tie only on a strictly higher generation
-    mov  rax, [rdx+8]             ; this.gen
-    mov  rcx, [rbp-0x48]
-    imul rcx, rcx, COMPACT_SLOT_SIZE
-    add  rcx, r15
-    mov  rcx, [rcx+8]            ; best.gen
-    cmp  rax, rcx
-    jbe  .rc_find_next
+    ; UTX-1 (audit 2026-09-03): equal keys are broken by MANIFEST INDEX, the
+    ; way utxo_lsm_get does it, NOT by generation.
+    ;
+    ; utxo_lsm_get scans the manifest from its highest index down and takes
+    ; the first hit, so a higher index wins. This merge used to prefer the
+    ; higher GENERATION instead, and the two orderings disagree after a
+    ; PARTIAL compaction: the merged run is placed at index 0 (correct, it is
+    ; the oldest) but is assigned a FRESH generation, higher than every
+    ; survivor's. A key with a PUSH in the merged run and a DEL in a survivor
+    ; then resolved to the stale PUSH here, while the lookup path correctly
+    ; saw it as spent -- and the NEXT compaction wrote that resurrection into
+    ; the new run, at which point the spent coin is genuinely back on disk.
+    ;
+    ; .rc_open_loop opens "manifest entry lo+i -> slot i", so slot index is
+    ; manifest order, and this scan runs i ascending. `best` is therefore
+    ; always at a LOWER index than `this` when a tie is reached, so `this`
+    ; always wins: fall straight through to setbest. No comparison needed --
+    ; and expressing it as a comparison on gen is what hid the bug.
 .rc_find_setbest:
     mov  rax, [rbp-0x40]
     mov  [rbp-0x48], rax
@@ -3829,14 +3839,24 @@ utxo_lsm_compact:
     je   .cc_find_setbest
     cmp  eax, 1
     jne  .cc_find_next
-    ; equal keys -- this wins the tie only if its gen is strictly higher
-    mov  rax, [rdx+8]                         ; this.gen
-    mov  rcx, [rbp-0xA0]
-    imul rcx, rcx, COMPACT_SLOT_SIZE
-    add  rcx, r13
-    mov  rcx, [rcx+8]                           ; best.gen
-    cmp  rax, rcx
-    jbe  .cc_find_next
+    ; UTX-1 (audit 2026-09-03): equal keys are broken by MANIFEST INDEX, the
+    ; way utxo_lsm_get does it, NOT by generation.
+    ;
+    ; utxo_lsm_get scans the manifest from its highest index down and takes
+    ; the first hit, so a higher index wins. This merge used to prefer the
+    ; higher GENERATION instead, and the two orderings disagree after a
+    ; PARTIAL compaction: the merged run is placed at index 0 (correct, it is
+    ; the oldest) but is assigned a FRESH generation, higher than every
+    ; survivor's. A key with a PUSH in the merged run and a DEL in a survivor
+    ; then resolved to the stale PUSH here, while the lookup path correctly
+    ; saw it as spent -- and the NEXT compaction wrote that resurrection into
+    ; the new run, at which point the spent coin is genuinely back on disk.
+    ;
+    ; .cc_open_loop opens "manifest entry lo+i -> slot i", so slot index is
+    ; manifest order, and this scan runs i ascending. `best` is therefore
+    ; always at a LOWER index than `this` when a tie is reached, so `this`
+    ; always wins: fall straight through to setbest. No comparison needed --
+    ; and expressing it as a comparison on gen is what hid the bug.
 .cc_find_setbest:
     mov  rax, [rbp-0x78]
     mov  [rbp-0xA0], rax
