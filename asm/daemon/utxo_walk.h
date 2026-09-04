@@ -77,7 +77,9 @@ static inline int utxo_walk_tx_io(const u8* tx, const u8* end, void* ctx,
         if (icb) icb(ctx, txid, index);
         p += 36;
         u64 slen = utxo_walk_read_varint(p, end, &consumed); if(!consumed) return 0; p += consumed;
-        if ((u64)(end - p) < slen + 4) return 0;
+        /* VAL-15 (audit 2026-09-03): split so `slen + 4` cannot wrap. */
+        { u64 avail = (u64)(end - p);
+          if (slen > avail || avail - slen < 4) return 0; }
         p += slen + 4; /* script + sequence */
     }
     u64 n_out = utxo_walk_read_varint(p, end, &consumed); if(!consumed) return 0; p += consumed;

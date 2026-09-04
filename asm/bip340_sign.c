@@ -56,15 +56,33 @@ static void jac_to_x_parity(u8 x32[32], int* odd, const uint64_t J[12]){
     fe_mul(x, J, zi2); fe_mul(y, J + 4, zi3);
     limbs_to_be32(x32, x); *odd = (int)(y[0] & 1);
 }
-static void tagged(u8 out[32], const char* tag, const u8* a, unsigned long al, const u8* b, unsigned long bl, const u8* c, unsigned long cl){
+/* ---------------------------------------------------------------- CRY-5
+ * (audit 2026-09-03) This returned VOID and, on overflow, returned WITHOUT
+ * WRITING `out`. bip340_sign uses it for the nonce and the challenge, so for
+ * msglen past the buffer both kh and eh were uninitialised stack: k0 and e
+ * came from whatever happened to be there, and the signature was emitted
+ * anyway -- computed with an attacker-unknown but non-random nonce. Two such
+ * calls with the same stack state give the same k, which with known messages
+ * is the classic private-key recovery; what prevents it today is that `e` is
+ * garbage too, and that every current caller passes a 32-byte sighash. That
+ * is luck and a footgun for the next caller, since BIP340 explicitly allows
+ * messages of any length.
+ *
+ * It now returns a status and bip340_sign FAILS rather than signing with
+ * uninitialised material. (Streaming the tagged hash would lift the length
+ * limit entirely and is the better long-term shape; refusing is the change
+ * that removes the danger without touching the hash path.) */
+static int tagged(u8 out[32], const char* tag, const u8* a, unsigned long al, const u8* b, unsigned long bl, const u8* c, unsigned long cl){
     u8 th[32]; sha256_full(th, tag, strlen(tag));
     u8 buf[64 + 32 + 32 + 4096]; unsigned long n = 0;
-    if (al + bl + cl > sizeof buf - 64) return;
+    if (al > sizeof buf || bl > sizeof buf || cl > sizeof buf ||
+        al + bl + cl > sizeof buf - 64) return 0;
     memcpy(buf, th, 32); memcpy(buf + 32, th, 32); n = 64;
     memcpy(buf + n, a, al); n += al;
     if (b){ memcpy(buf + n, b, bl); n += bl; }
     if (c){ memcpy(buf + n, c, cl); n += cl; }
     sha256_full(out, buf, n);
+    return 1;
 }
 
 /* x-only public key of a private key, and whether its Y was odd (the
@@ -87,17 +105,17 @@ int bip340_sign(u8 sig[64], const u8* msg, unsigned long msglen, const u8 priv_b
     if (podd) neg_n(d, d0); else memcpy(d, d0, 32);
     u8 dbe[32]; limbs_to_be32(dbe, d);
     /* t = d xor TaggedHash("BIP0340/aux", a) */
-    u8 t[32]; tagged(t, "BIP0340/aux", aux, 32, NULL, 0, NULL, 0);
+    u8 t[32]; if (!tagged(t, "BIP0340/aux", aux, 32, NULL, 0, NULL, 0)) return 0;
     for (int i = 0; i < 32; i++) t[i] ^= dbe[i];
     /* k0 = int(TaggedHash("BIP0340/nonce", t || P || m)) mod n */
-    u8 kh[32]; tagged(kh, "BIP0340/nonce", t, 32, px, 32, msg, msglen);
+    u8 kh[32]; if (!tagged(kh, "BIP0340/nonce", t, 32, px, 32, msg, msglen)) return 0;
     uint64_t k0r[4], k0[4]; be32_to_limbs(k0r, kh); reduce_n(k0, k0r);
     if (is_zero(k0)) return 0;
     uint64_t R[12]; point_scalar_mul_ct(R, G_AFF, k0);
     u8 rx[32]; int rodd; jac_to_x_parity(rx, &rodd, R);
     uint64_t k[4]; if (rodd) neg_n(k, k0); else memcpy(k, k0, 32);
     /* e = int(TaggedHash("BIP0340/challenge", R || P || m)) mod n */
-    u8 eh[32]; tagged(eh, "BIP0340/challenge", rx, 32, px, 32, msg, msglen);
+    u8 eh[32]; if (!tagged(eh, "BIP0340/challenge", rx, 32, px, 32, msg, msglen)) return 0;
     uint64_t er[4], e[4]; be32_to_limbs(er, eh); reduce_n(e, er);
     /* s = (k + e*d) mod n */
     uint64_t ed[4], s[4]; sc_mul(ed, e, d); sc_add(s, k, ed);

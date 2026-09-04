@@ -374,7 +374,13 @@ static int txacc_tx_output(const u8* tx, unsigned long txlen, u32 index,
         if (p + 36 > end) return 0;
         p += 36;
         u64 sl = txacc_varint(&p, end, &cc); if (!cc) return 0;
-        if ((u64)(end - p) < sl + 4) return 0;
+        /* VAL-15 (audit 2026-09-03): `< sl + 4` wraps for sl near 2^64 and
+         * moves p backwards rather than refusing. This one runs on a
+         * mempool parent that has already passed tx_verify_mempool, so a
+         * wrapping length cannot reach it today -- which is a reason to
+         * write it correctly, not a reason to leave it. */
+        { u64 avail = (u64)(end - p);
+          if (sl > avail || avail - sl < 4) return 0; }
         p += sl + 4;
     }
     u64 nout = txacc_varint(&p, end, &cc); if (!cc || index >= nout) return 0;

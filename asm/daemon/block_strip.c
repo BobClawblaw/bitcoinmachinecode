@@ -48,7 +48,12 @@ static long bs_tx_len(const u8* p, const u8* end){
         p += 36;
         unsigned long sl = bs_varint(p, end, &cc); if (!cc) return 0;
         p += cc;
-        if ((unsigned long)(end - p) < sl + 4) return 0;
+        /* VAL-15 (audit 2026-09-03): `< sl + 4` WRAPS for sl in
+         * [2^64-4, 2^64-1], moving p BACKWARDS by 0..4 bytes instead of
+         * refusing. Split so neither side can overflow -- the same form
+         * tx_verify.c already uses. */
+        { unsigned long avail = (unsigned long)(end - p);
+          if (sl > avail || avail - sl < 4) return 0; }
         p += sl + 4;
     }
     unsigned long nout = bs_varint(p, end, &cc); if (!cc) return 0;
