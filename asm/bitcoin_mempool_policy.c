@@ -555,15 +555,33 @@ const char* mpool_policy_reason(void* pol){ (void)pol; return _mpol_last_reason;
 /* wire walks                                                                 */
 /* ========================================================================== */
 
+/* SER-3 / VAL-10 (audit 2026-09-03): CANONICAL CompactSize on the ADMISSION
+ * path too.
+ *
+ * Core's ReadCompactSize throws "non-canonical ReadCompactSize()" for a value
+ * encoded in a wider form than it needs, and "size too large" above MAX_SIZE
+ * (0x02000000). The block-connect and witness readers were fixed earlier
+ * (daemon/tx_verify.c, daemon/block_witness.c, daemon/utxo_walk.h,
+ * bitcoin_txv_parse.asm), which closed the CONSENSUS hole. This reader is the
+ * one the MEMPOOL uses -- parse_tx for every admission, and the transaction
+ * count in block_connect -- so leaving it lax meant a transaction Core cannot
+ * deserialize could still enter this node's pool and be RELAYED from it. A
+ * relay divergence rather than a chain split, but the same defect.
+ *
+ * The minimum each width may encode: 0xfd for the 3-byte form, 0x10000 for
+ * the 5-byte, 0x100000000 for the 9-byte. Nothing valid is lost, because a
+ * canonical encoder never emits the wider form. */
+#define MPOL_CS_MAX_SIZE 0x02000000ULL
 static uint64_t rd_varint(const unsigned char** p, const unsigned char* end, int* ok){
     const unsigned char* b = *p; *ok = 0;
     if (b >= end) return 0;
     unsigned char f = *b++;
-    uint64_t v;
-    if (f < 0xfd) v = f;
-    else if (f == 0xfd){ if (end-b < 2) return 0; v = (uint64_t)b[0]|((uint64_t)b[1]<<8); b += 2; }
-    else if (f == 0xfe){ if (end-b < 4) return 0; v=0; for(int i=0;i<4;i++) v|=(uint64_t)b[i]<<(8*i); b += 4; }
-    else { if (end-b < 8) return 0; v=0; for(int i=0;i<8;i++) v|=(uint64_t)b[i]<<(8*i); b += 8; }
+    uint64_t v, minimum;
+    if (f < 0xfd){ *ok = 1; *p = b; return f; }
+    else if (f == 0xfd){ if (end-b < 2) return 0; v = (uint64_t)b[0]|((uint64_t)b[1]<<8); b += 2; minimum = 0xfdULL; }
+    else if (f == 0xfe){ if (end-b < 4) return 0; v=0; for(int i=0;i<4;i++) v|=(uint64_t)b[i]<<(8*i); b += 4; minimum = 0x10000ULL; }
+    else { if (end-b < 8) return 0; v=0; for(int i=0;i<8;i++) v|=(uint64_t)b[i]<<(8*i); b += 8; minimum = 0x100000000ULL; }
+    if (v < minimum || v > MPOL_CS_MAX_SIZE) return 0;   /* non-canonical, or over MAX_SIZE */
     *ok = 1; *p = b;
     return v;
 }
