@@ -1199,6 +1199,10 @@ typedef struct {
     u64 in_count;
     u64 out_count;               /* filled by the output walk the locktime
                                     read depends on being correct */
+    u64 stripped_len;            /* VAL-3: serialized length with the marker,
+                                    flag and witness sections removed, i.e.
+                                    Core's GetSerializeSize(TX_NO_WITNESS(tx)).
+                                    Equals txlen for a non-segwit tx. */
     u32 locktime;                /* trailing 4 bytes (IsFinalTx, BIP68) */
     u32 version;                 /* BIP68's version>=2 gate */
     const u32* seqs; u32 nseqs;  /* per-input sequences (up to SEQ_CAP; a tx
@@ -1289,6 +1293,7 @@ static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
      * tx_parse has ALREADY validated this exact structure (the tx passed
      * its walk to get here); this pass just locates the locktime, so a
      * decode disagreement is a bad_shape reject, never a skip. */
+    const u8* wit_begin = p;
     if (segwit){
         for (u64 i = 0; i < nin; i++){
             u64 nitems = utxo_walk_read_varint(p, end, &used);
@@ -1304,6 +1309,12 @@ static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
         }
     }
     if ((u64)(end - p) < 4){ vi->bad_shape=1; return 0; }
+    /* VAL-3: the stripped length Core weighs the block with. The witness
+     * section runs from wit_begin to p; dropping it plus the 2 marker/flag
+     * bytes is exactly TX_NO_WITNESS serialization. Computed from the walk
+     * that is already happening rather than by re-serializing into a buffer,
+     * which is what strip_witness would cost per transaction. */
+    vi->stripped_len = segwit ? txlen - 2 - (u64)(p - wit_begin) : txlen;
     memcpy(&vi->locktime, p, 4);                   /* locktime */
     return 1;
 }
@@ -1403,6 +1414,67 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         tx_txid(txs[t].txid, q, txlen, txid_scratch, sizeof txid_scratch);
         total_nin += pn_in; total_nout += pn_out;
         q += txlen;
+    }
+
+    /* ---- Phase 0.10 (VAL-3, audit 2026-09-03): CheckBlock's size rules and
+     * ContextualCheckBlock's weight rule.
+     *
+     * The only 4,000,000 in this node was the P2P frame cap
+     * (bitcoin_net.asm) and GBT. That bounds the SERIALIZED size but is not
+     * the weight rule: a 3.9 MB block with 1.5 MB of non-witness bytes has
+     * weight 3*1.5M + 3.9M = 8.4M and was accepted here while Core rejects
+     * it. A miner producing one would split the chain.
+     *
+     * Core, exactly:
+     *   CheckBlock            vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+     *                         GetSerializeSize(TX_NO_WITNESS(block)) * 4 > MAX_BLOCK_WEIGHT
+     *                           -> "bad-blk-length"
+     *   ContextualCheckBlock  GetBlockWeight(block) > MAX_BLOCK_WEIGHT
+     *                           -> "bad-blk-weight"
+     * where GetBlockWeight = 3 * stripped_size + total_size.
+     *
+     * The stripped size is the 80-byte header, the tx-count CompactSize, and
+     * each transaction's TX_NO_WITNESS length -- which val_read_tx now
+     * reports from the walk it already performs, so no transaction is
+     * re-serialized to measure it.
+     *
+     * Context-free, so it runs on the dry run too: submitblock and a GBT
+     * proposal answer Core's exact reason without touching state. Placed
+     * before Phase 0.15 because a block that fails a size rule should be
+     * refused on that rule, the way Core orders CheckBlock. ---- */
+    {
+        const u64 MAX_BLOCK_WEIGHT = 4000000ULL;
+        const u64 WITNESS_SCALE_FACTOR = 4ULL;
+
+        if (ntx * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT){
+            fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-blk-length (%llu txs)\n",
+                    g_apply_height, (unsigned long long)ntx);
+            g_last_reject = "bad-blk-length"; return 0;
+        }
+
+        /* header + CompactSize(ntx); `consumed` is that CompactSize's width,
+         * read at the top of this function. */
+        u64 stripped = 80 + consumed;
+        val_txinfo_t vw;
+        for (u64 t = 0; t < ntx; t++){
+            if (!val_read_tx(txs[t].ptr, txs[t].len, &vw)){
+                g_last_reject = "bad-txns-prevout-null"; return 0;   /* same reason Phase 0.15 gives */
+            }
+            stripped += vw.stripped_len;
+        }
+
+        if (stripped * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT){
+            fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-blk-length (stripped %llu B)\n",
+                    g_apply_height, (unsigned long long)stripped);
+            g_last_reject = "bad-blk-length"; return 0;
+        }
+
+        u64 weight = 3ULL * stripped + blocklen;
+        if (weight > MAX_BLOCK_WEIGHT){
+            fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-blk-weight (%llu > 4000000)\n",
+                    g_apply_height, (unsigned long long)weight);
+            g_last_reject = "bad-blk-weight"; return 0;
+        }
     }
 
     /* ---- Phase 0.15 (VAL-1/VAL-2, audit 2026-09-03): CheckTransaction's
