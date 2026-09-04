@@ -263,7 +263,15 @@ static void compact_adopt(int st){
         if (lsm_manifest_adopt_child(&g_utxo_lst, g_cmp_inputs, g_cmp_nin, g_cmp_is_full, g_cmp_old_base, &nbase) != 0){
             /* keep the old manifest: its runs are all still on disk (unlink
              * was deferred), so this process stays consistent. The child's
-             * output is an orphan; drop it now rather than at next boot. */
+             * output is an orphan; drop it now rather than at next boot.
+             *
+             * UTX-5: this unlink is only safe because lsm_manifest_adopt_child
+             * publishes BEFORE committing the union to memory. On any non-zero
+             * return -- reconciliation mismatch or a failed publish alike --
+             * g_utxo_lst still names the input runs and has never named
+             * g_cmp_child_run, so removing it cannot strand a manifest entry.
+             * When the order was the other way round this line deleted a run
+             * the in-memory manifest was actively pointing at. */
             unlink_run(g_cmp_child_run); unlink(LSM_MANIFEST_CHILD);
             fprintf(stderr, "[utxo_live] background compaction finished in %.1fs but its manifest did not reconcile with ours -- discarded (run %lu), old run set kept\n",
                     secs, (unsigned long)g_cmp_child_run);

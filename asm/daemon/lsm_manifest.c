@@ -133,13 +133,36 @@ int lsm_manifest_adopt_child(struct lsm_state* lst, const uint64_t* inputs, int 
         nbase = cbase + (base_now - base_at_fork);
         heal  = cbase - base_at_fork;
     } else nbase = ~0ULL;                       /* unknown: OLD header, reload recounts */
-    /* commit to memory, publish, then clean up */
+    /* ---- UTX-5 (audit 2026-09-03): PUBLISH FIRST, COMMIT TO MEMORY ONLY
+     * ON SUCCESS ----
+     *
+     * This used to commit to memory, then publish, with a comment claiming a
+     * publish failure was "harmless: inputs still exist". It was not. Once
+     * lst->manifest_n named the child's merged run M and no longer named the
+     * inputs, a failed publish (ENOSPC or EIO on the .pub file -- plausible
+     * precisely here, right after a compaction temporarily doubled disk
+     * usage) left memory pointing at M while the caller, daemon/utxo_live.c's
+     * compact_adopt, unlinked M on the non-zero return. Every lookup through
+     * M then failed, and the next mac_flush published the in-memory manifest
+     * -- naming a deleted run and dropping the still-present inputs as
+     * orphans. Reload fails on the next boot and recovery means hand-editing
+     * the manifest.
+     *
+     * Publishing from a temporary view of the state inverts that: on failure
+     * nothing in memory ever referenced M, so the caller's unlink is correct
+     * and the store is exactly as it was before the adopt. The temporary
+     * copies the whole struct so publish sees identical values for every
+     * field it reads; only manifest_buf/manifest_n differ. */
+    struct lsm_state pubview = *lst;
+    pubview.manifest_buf = nb;
+    pubview.manifest_n   = total;
+    if (lsm_manifest_publish(&pubview, nbase) != 0){ free(nb); free(c); return -1; }
+    /* Durable on disk. Only now may memory name the merged run. */
     memcpy(lst->manifest_buf, nb, (size_t)total * 16);
     lst->manifest_n = total;
     lst->total_live += heal;
     advance_counters(lst);
     free(nb); free(c);
-    if (lsm_manifest_publish(lst, nbase) != 0) return -1;   /* memory now ahead of disk; harmless: inputs still exist */
     unlink(LSM_MANIFEST_CHILD);
     if (new_persisted) *new_persisted = nbase;
     return 0;
