@@ -2740,6 +2740,29 @@ int utxo_live_init(const char* dir){
                 "point permanently.\n"
                 "[utxo_live]   Fix: re-run with bulk sizing so the whole tail "
                 "fits, or drain the tail first with daemon/flush_wal_tail.\n");
+        /* UTX-6 (audit 2026-09-03): -1 with a manifest present is now also
+         * reachable for a reason an operator can actually fix, so name it.
+         * The reload used to treat an unreadable or over-capacity manifest as
+         * "no runs" and return success; it now fails. The most likely cause
+         * by far is a capacity mismatch -- build_utxo and the migration tool
+         * size manifest_cap at 8192 and the read-only tools at 4096, while
+         * the daemon uses UTXO_LIVE_MANIFEST_CAP -- so a store seeded in bulk
+         * can carry more runs than the daemon will accept. That used to boot
+         * "successfully" with an empty run set and then sweep every real run
+         * as an orphan on the boot after next. */
+        if (have_prior_state && r == -1 && has_manifest)
+            fprintf(stderr,
+                "[utxo_live] FATAL: %s exists but could not be read into a "
+                "%u-entry manifest (bad magic, truncated, unreadable, or more "
+                "runs than this build accepts).\n"
+                "[utxo_live]   Starting anyway would treat the store as having "
+                "NO runs, publish a manifest naming only the new one, and let "
+                "the next boot sweep every real run away.\n"
+                "[utxo_live]   Fix: if the store was seeded by build_utxo or "
+                "the migration tool, compact it with those tools (they size "
+                "manifest_cap at 8192) until it holds at most %u runs.\n",
+                "utxo_manifest.dat", (unsigned)UTXO_LIVE_MANIFEST_CAP,
+                (unsigned)UTXO_LIVE_MANIFEST_CAP);
         return 0;
     }
 
