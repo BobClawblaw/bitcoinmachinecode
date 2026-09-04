@@ -4542,6 +4542,28 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         fprintf(stderr,"[dl] live UTXO tracking is off -- fork detection stays on but REORGS ARE DISABLED (no undo data)\n");
     }
     reorg_set_index_rebuild(rebuild_hash_index_after_reorg);
+    /* STO-7: hand reorg.c the SHARED mempool and the accept path's own policy
+     * objects, so a completed reorg rebuilds the pool against the new branch
+     * instead of leaving it holding transactions the new branch invalidated.
+     * Deliberately after tx_policy_init has had a chance to run: if the policy
+     * layer is not up (maxmempool=0, or the static per-process fallback with
+     * no shared area) nothing is registered and reorg.c says so in its log
+     * rather than reconciling against a half-built pool. */
+    { extern void* mp_ext_area;
+      extern int tx_accept_policy_view(void**, void**, unsigned*);
+      static reorg_mempool_t rmp;
+      void* pol = 0; void* pst = 0; unsigned pn = 0;
+      if (mp_ext_area && tx_accept_policy_view(&pol, &pst, &pn)){
+          rmp.mp = mp_ext_area; rmp.pol = pol; rmp.pol_state = pst; rmp.pol_n = pn;
+          /* mempool_resolve_confirmed_utxo ignores this argument -- same
+           * placeholder daemon/tx_accept.c passes on the accept path. */
+          rmp.utxo_arg = (void*)1;
+          reorg_set_mempool(&rmp);
+          fprintf(stderr,"[reorg] mempool reconciliation armed (shared pool, policy capacity %u)\n", pn);
+      } else {
+          fprintf(stderr,"[reorg] mempool reconciliation NOT armed: no shared mempool/policy state in this process\n");
+      }
+    }
     /* ---- BOOTSTRAP + DISCOVER (seeds are bootstrap-only) ----
      * Real nodes use DNS seeds once to learn reachable peers, then connect to
      * those -- never downloading from the seeds themselves. We resolve each
@@ -5425,6 +5447,18 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                      * a UTXO catch-up pass this rotation. */
                     anchor_locator(mux_out_loc[i]);
                     did = 1;
+                    /* STO-7: rewind the new-block choke-point baseline to the
+                     * fork. The replacement blocks can sit at or below the old
+                     * tip -- and a same-height replacement leaves now_tip ==
+                     * last_seen_tip, firing nothing at all -- so without this
+                     * the pool never sees the connects that should evict the
+                     * transactions the new branch just confirmed. */
+                    { long fh = reorg_last_fork_height();
+                      if(fh >= 0 && fh < (long)last_seen_tip){
+                          fprintf(stderr,"[dl] reorg to fork height %ld: replaying the new-block choke point from %ld (was %d)\n",
+                                  fh, fh + 1, last_seen_tip);
+                          last_seen_tip = (int)fh;
+                      } }
                 } else if(pr < 0){
                     fprintf(stderr,"[reorg] probe of %s rejected a candidate chain (no action taken)\n", mux_out_host[i]);
                 }
