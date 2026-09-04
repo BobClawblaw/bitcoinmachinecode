@@ -859,11 +859,58 @@ node_serve_loop:
     ; here rather than per connection so a long-lived peer cannot go stale.
     call serve_idx_topup
     mov  qword [s_nf], 0      ; no misses yet for this getdata
-    ; cnt = pl[0] (single-byte varint)
-    movzx rax, byte [pl_buf]
-    mov  [s_cnt], rax     ; item counter
-    lea  rax, [pl_buf+1]
-    mov  [s_ptr], rax     ; item pointer (do NOT clobber the outer rbx counter)
+    ; ---- NET-7 (audit 2026-09-03): parse the count as a real CompactSize,
+    ; bounded against the payload, exactly as .do_inv already does.
+    ;
+    ; The count used to be `movzx rax, byte [pl_buf]` with only `plen >= 37`
+    ; checked. Two consequences, and the first is the one that hurts every
+    ; day: Core's MAX_GETDATA_SZ is 1000, so a request for 253 or more
+    ; transactions starts with 0xfd, which was read as the count 253 and left
+    ; every entry misaligned by two bytes -- we answered ~50 notfounds for
+    ; garbage hashes and served nothing. The 2026-09-02 audit response claimed
+    ; "inv/getdata above MAX_INV_SZ scored"; that was true of inv only.
+    ;
+    ; Second, a 37-byte getdata with count byte 0xff walked up to 255 entries
+    ; out of whatever an earlier, larger message left in the 8 MB receive
+    ; buffer -- the peer-steered nonsense serve_invbounds.c was written to
+    ; stop. No memory-safety impact (the buffer is ours and 8 MB), but the
+    ; hashes came from the peer's earlier traffic.
+    ;
+    ; serve_inv_bounds does the varint and the bounds for both message types
+    ; now; writing a second parser in assembly would only trade one subtle
+    ; parser for another.
+    ;   rax =  1 ok, 0 malformed/short (drop), -1 over MAX_INV_SZ (score it)
+    lea  rdi, [pl_buf]
+    mov  rsi, [s_plen]
+    lea  rdx, [s_ivn]
+    lea  rcx, [s_ivo]
+    call serve_inv_bounds
+    movsxd rax, eax           ; SysV: only EAX is defined for an int return
+    cmp  rax, -1
+    je   .gd_toobig
+    test rax, rax
+    jle  .next                ; malformed or short: drop quietly, as inv does
+    mov  rax, [s_ivn]
+    mov  [s_cnt], rax         ; item counter (validated entry count)
+    mov  rax, [s_ivo]
+    add  rax, pl_buf
+    mov  [s_ptr], rax         ; first entry (past the real CompactSize)
+    jmp  .gd_loop
+.gd_toobig:
+    ; Core: `if (vInv.size() > MAX_INV_SZ) Misbehaving`. Exactly the treatment
+    ; .inv_toobig gives -- the same violation hook and the same reason string,
+    ; because it is the same protocol rule on a sibling message.
+    mov  rax, [g_serve_violation_hook]
+    test rax, rax
+    je   .next
+    lea  rdi, [viol_invsz]
+    push rbp
+    mov  rbp, rsp
+    and  rsp, -16
+    call rax
+    mov  rsp, rbp
+    pop  rbp
+    jmp  .next
 .gd_loop:
     mov  rax, [s_cnt]
     test rax, rax
