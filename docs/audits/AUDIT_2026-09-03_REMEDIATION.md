@@ -6,7 +6,7 @@ what has not, and what was found along the way.
 
 **Status as of 2026-09-04 (third pass): all 29 CRITICAL+HIGH closed** --
 MEM-3, the last one, on branch `mem3-parent-overflow` -- **and 39 of the 44
-MEDIUM addressed (34 closed outright, 5 partial).** VAL-5 and UTX-4, both
+MEDIUM addressed (35 closed outright, 4 partial).** VAL-5 and UTX-4, both
 previously partial, are now complete apart from UTX-4's undo-file fsync. LOW
 and INFO are untouched.
 
@@ -321,8 +321,8 @@ replacement -- the invalid-block path.
 ### 4.3 MEDIUM and below
 
 44 MEDIUM, 68 LOW, 33 INFO in the audit. **Thirty-nine MEDIUM have been
-addressed: 34 closed outright, and 5 partial** -- SER-3, CRY-4, WAL-3, NET-9
-and MEM-12, each with its residual named in the row or the note below it. LOW and
+addressed: 35 closed outright, and 4 partial** -- SER-3, CRY-4, WAL-3 and
+NET-9, each with its residual named in the row or the note below it. LOW and
 INFO are untouched.
 
 (VAL-5 is a HIGH and is accounted for in §4.2, not here, even though its
@@ -369,46 +369,54 @@ remaining half landed in the same pass.)
 | UTX-4 (rest) | A torn WAL tail was never truncated, so every later append landed after it and every future reload stopped there | `51447cb` |
 | NET-9 (part) | The one-byte BIP152 tx count was SER-4; the documentation claiming "both directions" is corrected here. The RECEIVE side has never existed and is a feature, not a fix -- `bitcoin_serve.asm` writes `cmpctblock`/`blocktxn` and has no inbound handler for either | `4cd988c` + docs |
 | MEM-9 | Inv processing was O(entries x table) with no per-peer bound: ~10^8 byte-compares per message, 64 messages per pass, in the download worker | `045ef64` |
-| MEM-12 (part) | The three policy tables are hash-indexed: accepts go from linear-in-pool-size to FLAT (250x at 80k entries). Block connect is NOT fixed -- see below | `44f6064` |
+| MEM-12 | Policy tables hash-indexed (accepts flat, 250x at 80k) and block connect batched (O(n) not O(n*m), 5x at 260k) | `44f6064`, `6f89c24` |
 
-**MEM-12's remaining half, with the numbers that scope it.** The audit's
-verdict was "timings PLAUSIBLE (not measured)", so `tests/bench_mempool_scale.c`
-was written first. Before, cost was exactly linear in pool size; after
-indexing, accepts are flat and block connect is unchanged in ORDER:
+**MEM-12 is now fully closed**, and the numbers scope both halves. The audit's
+verdict was "CONFIRMED for complexity; timings PLAUSIBLE (not measured)", so
+`tests/bench_mempool_scale.c` was written first.
 
-| entries | us/accept before | us/accept after | block-connect before | after |
-|---|---|---|---|---|
-| 10,000 | 12.6 | **0.7** | 4.0 ms | 2.3 ms |
-| 40,000 | 74.6 | **0.6** | 15.8 ms | 8.6 ms |
-| 80,000 | 151.6 | **0.6** | 33.4 ms | 17.9 ms |
-| 260,000 | (~490 extrapolated) | **0.7** | -- | 158 ms |
+*Accepts* were exactly linear in pool size and are now flat -- 250x at 80,000
+entries, and the gap widens with every entry added:
 
-Block connect is not dominated by the three lookups but by `remove_node`'s own
-full scans: clearing children's parent references, renumbering the moved
-node's references, and renumbering claims' `claimer` field. None is a lookup
-an index can serve, and `mpool_policy_block_connect` calls `remove_node` once
-per confirmed transaction -- so a 3,000-transaction block against a full
-300 MB pool (~750k entries) is on the order of SECONDS, under `mp_lock`.
+| entries | us/accept before | after |
+|---|---|---|
+| 10,000 | 12.6 | **0.7** |
+| 40,000 | 74.6 | **0.6** |
+| 80,000 | 151.6 | **0.6** |
+| 260,000 | (~490 extrapolated) | **0.7** |
 
-Two ways out, neither free, and the choice is a real trade rather than an
-oversight:
+*Block connect* needed a different fix, and the middle column below is why:
+indexing the lookups barely helped, because `remove_node` is O(n) whatever the
+lookups cost -- three of its steps are full sweeps, not lookups -- and it ran
+once per confirmed transaction, so an m-transaction block cost O(n*m). Marking
+the whole block and compacting ONCE makes it O(n + links):
 
-* **A persistent child index** (the reverse of `parent[]`, which
-  `worst_chunk` already builds on the fly each call). Turns all three loops
-  into O(degree). Threading it through the existing parent slots needs a
-  parallel `next` array of the same shape, which doubles the parent storage:
-  the node grows 128 -> 160 bytes and the overflow pool 27.5 -> 55 MB, about
-  +60 MB at the default sizing -- erasing the 12.5 MB the MEM-3/MEM-12 work
-  currently saves.
+| entries | original | indexed only | **batch** |
+|---|---|---|---|
+| 10,000 | 4.02 ms | 2.31 ms | **0.99 ms** |
+| 40,000 | 15.77 ms | 8.55 ms | **4.80 ms** |
+| 80,000 | 33.41 ms | 17.92 ms | **8.04 ms** |
+| 260,000 | (~107 ms) | 158.14 ms | **31.02 ms** |
 
-* **Batch removal.** `block_connect` removes MANY transactions at once, so
-  instead of m removals each O(n), mark them all and compact in ONE sweep:
-  O(n + links) total rather than O(n*m). No new storage at all, and for the
-  case above roughly a thousandfold. It is the better answer, and it is a
-  rewrite of `remove_node`'s semantics on the block-connect path -- every
-  piece of its bookkeeping (ancestor decrements, claims, outreg, the forget
-  callback, index maintenance) has to be correct in batch form. That wants
-  its own pass and its own gate runs, exactly like MEM-3 did.
+The O(n) claim is checked directly rather than asserted: a TEN TIMES larger
+block costs the same -- 7.91 ms for 200 transactions against 8.03 ms for
+2,000, at 80,000 entries.
+
+The batch had to preserve the distinction between Core's `removeForBlock` (a
+CONFIRMED transaction leaves alone; its children stay) and `removeRecursive`
+(a CONFLICTED one leaves with its descendants). Two bugs came from getting
+that wrong, both caught by the existing suite: a single-level mark swept the
+children of every confirmed transaction, and -- less obvious -- a confirmed
+transaction CLAIMS ITS OWN INPUTS, so `find_claim` answers with the
+transaction itself. The per-transaction path never saw the second, because
+`remove_confirmed` had already deleted those claims by the time it looked.
+
+The child-index alternative was costed and not taken: threading a reverse
+index through the existing parent slots needs a parallel `next` array of the
+same shape, growing the node 128 -> 160 bytes and the overflow pool 27.5 ->
+55 MB -- about +60 MB, erasing the saving this work otherwise makes. Batch
+removal needs no new storage at all.
+
 
 
 **A regression this pass produced, and caught.** `e99bd1c` enforced canonical
