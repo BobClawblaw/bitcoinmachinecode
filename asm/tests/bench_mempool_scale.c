@@ -75,6 +75,13 @@ static void mk_prev(u8 p[32], unsigned i){ memset(p, 0x22, 32);
 
 int main(int argc, char** argv){
     unsigned maxn = argc > 1 ? (unsigned)strtoul(argv[1], 0, 10) : 200000u;
+    /* Block size, so the O(n) vs O(n*m) claim can be checked directly: with
+     * per-transaction removal the block-connect column scales with BOTH the
+     * pool and the block; with batch removal it should scale with the pool
+     * only. */
+    unsigned blk_tx = argc > 2 ? (unsigned)strtoul(argv[2], 0, 10) : 200u;
+    if (blk_tx < 2) blk_tx = 2;
+    if (blk_tx > 3000) blk_tx = 3000;
 
     static u8 pol[128];
     mpool_policy_init(pol, 0, 100000, 101000000, 100000, 101000000, 1);
@@ -96,6 +103,7 @@ int main(int argc, char** argv){
 
     u8 spk1[2] = { 0x51, 0x00 };
     printf("MEM-12 scale: linear-scan cost in the policy layer\n");
+    printf("(block size for the connect column: %u transactions)\n", blk_tx);
     printf("%10s %12s %12s %14s\n", "entries", "accepts/s", "us/accept", "blk-connect ms");
 
     unsigned next_report = 10000;
@@ -125,10 +133,11 @@ int main(int argc, char** argv){
              * assembled: 80-byte header, tx count, coinbase, then 199 of the
              * transactions actually in the pool -- which is what makes the
              * find_claim / remove_confirmed work real. */
-            unsigned ntx = 200; if (ntx > i+1) ntx = i+1;
-            static u8 blk[200*128 + 256]; unsigned long bn = 0;
+            unsigned ntx = blk_tx; if (ntx > i+1) ntx = i+1;
+            static u8 blk[3000*128 + 256]; unsigned long bn = 0;
             memset(blk, 0, 80); bn = 80;
-            blk[bn++] = (u8)ntx;                       /* < 253: one byte */
+            if (ntx < 253) blk[bn++] = (u8)ntx;
+            else { blk[bn++] = 0xfd; blk[bn++] = (u8)ntx; blk[bn++] = (u8)(ntx >> 8); }
             /* coinbase */
             blk[bn++]=2;blk[bn++]=0;blk[bn++]=0;blk[bn++]=0;
             blk[bn++]=1; memset(blk+bn,0,32); bn+=32; memset(blk+bn,0xff,4); bn+=4;
