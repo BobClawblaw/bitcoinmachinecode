@@ -45,10 +45,15 @@ extern long bfi_probe_count(void);
 /* stub undo_replay: serves one fixed prevout script per height, so the
  * expected filter is computable independently */
 static u8 g_stub_spk[25];
+/* STO-3: 1 = serve a prevout (normal), 0 = serve NOTHING, which is what an
+ * absent or pruned undo file looks like to undo_replay -- it returns 0 and
+ * cannot distinguish that from a block that genuinely spends nothing. */
+static int g_stub_serve = 1;
 long undo_replay(long height,
                  int (*cb)(void*, const u8*, u32, u64, u32, u8, const u8*, unsigned short),
                  void* ctx){
     (void)height;
+    if (!g_stub_serve) return 0;               /* absent/pruned undo file */
     static u8 tid[32];
     memset(tid, 0x11, 32);
     cb(ctx, tid, 0, 1000, 1, 0, g_stub_spk, 25);
@@ -79,6 +84,29 @@ static long mk_block(u8* b, int tag){
     b[o]=0x76; b[o+1]=0xa9; b[o+2]=0x14; memset(b+o+3, 0x60+tag, 20);
     b[o+23]=0x88; b[o+24]=0xac; o += 25;
     b[o++]=0; b[o++]=0; b[o++]=0; b[o++]=0;      /* locktime */
+    return o;
+}
+
+/* STO-3: coinbase + ONE non-coinbase spend, so the block genuinely needs an
+ * undo record. mk_block's single transaction is the coinbase, which spends
+ * nothing, so it can never exercise the missing-undo path. */
+static long mk_block_with_spend(u8* b, int tag){
+    memset(b, (u8)tag, 80);
+    b[80] = 2;                                   /* ntx = coinbase + 1 */
+    long o = 81;
+    for (int t = 0; t < 2; t++){
+        b[o++]=1; b[o++]=0; b[o++]=0; b[o++]=0;  /* version */
+        b[o++]=1;                                /* nin */
+        memset(b+o, (u8)(0x50+tag+t), 36); o += 36;
+        b[o++]=0;                                /* scriptSig */
+        b[o++]=0xff; b[o++]=0xff; b[o++]=0xff; b[o++]=0xff;
+        b[o++]=1;                                /* nout */
+        memset(b+o, 1, 8); o += 8;
+        b[o++]=25;
+        b[o]=0x76; b[o+1]=0xa9; b[o+2]=0x14; memset(b+o+3, (u8)(0x60+tag+t), 20);
+        b[o+23]=0x88; b[o+24]=0xac; o += 25;
+        b[o++]=0; b[o++]=0; b[o++]=0; b[o++]=0;  /* locktime */
+    }
     return o;
 }
 
@@ -165,6 +193,38 @@ int main(void){
       ck("prev record header read", bfi_get(4, got, sizeof got, &gl, h4) == 1);
       bf_header(ef, (unsigned long)efl, h4, h5b);
       ck("chained header identical after the reorg round-trip", !memcmp(h5a, h5b, 32)); }
+
+    printf("\n== 5: STO-3 a block that spends must not be indexed without its undo ==\n");
+    /* An ABSENT undo file returns 0 from undo_replay, exactly like a block
+     * that genuinely spends nothing. The index used to proceed, storing a
+     * filter built from OUTPUT scripts only -- missing every spent-prevout
+     * element. Core's BlockFilterIndex::CustomAppend FAILS the index when
+     * undo is unavailable; it never emits a partial filter, because a partial
+     * one diverges from Core permanently through the header chain and tells a
+     * light client those blocks do not touch its coins.
+     *
+     * Reachable with no operator error: utxo_live_catchup applies to the
+     * archive tip in one call and prunes undo below applied-199 BEFORE the
+     * choke point that feeds this tail runs. */
+    { long before = bfi_count();
+      static u8 sb[4096];
+      long sblen = mk_block_with_spend(sb, 6);
+
+      g_stub_serve = 0;                          /* undo file "pruned" */
+      bfi_on_block(store_buf, before, sb, (unsigned long)sblen);
+      /* The refusal path CLOSES the index rather than storing a partial
+       * filter -- this module's stated contract, and the right one: a filter
+       * missing its prevout elements diverges from Core permanently through
+       * the bf_header chain, so taking the index down until
+       * build_block_filters is re-run is strictly better than serving it. */
+      ck("STO-3 a spending block with NO undo does not get indexed",
+         bfi_active() == 0);
+      ck("STO-3 and no record was written for it", bfi_count() != before + 1);
+
+      g_stub_serve = 1;                          /* undo available again */
+      bfi_on_block(store_buf, before, sb, (unsigned long)sblen);
+      ck("STO-3 the same block IS indexed once its undo is available",
+         bfi_count() == before + 1); }
 
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;

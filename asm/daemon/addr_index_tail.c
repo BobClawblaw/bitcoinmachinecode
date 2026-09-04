@@ -202,7 +202,32 @@ static int axt_append_block(long h, const u8* blk, long blen){
     if (!txi_walk_block(blk, blen, axt_tx_cb, &c) || !c.ok) return 0;
     if (!g_undo_replay_fn) return 0;
     long ur = g_undo_replay_fn(h, axt_undo_cb_fn, &c);
-    if (ur < 0 || !c.ok) return 0;              /* undo pruned/torn: cannot index */
+    if (ur < 0 || !c.ok) return 0;              /* undo torn: cannot index */
+    /* STO-3 (audit 2026-09-03): an ABSENT undo file returns 0, exactly like a
+     * block that genuinely spends nothing -- undo_replay cannot tell "pruned"
+     * from "empty", and chose to proceed. A block whose undo file has been
+     * pruned then indexed as ADDs with no DELs, so getaddressbalance
+     * over-reported every address spent in it, silently and permanently.
+     *
+     * The block itself is the authority on how many spends to expect:
+     * txi_walk_block already counted them into c.nspends. Fewer undo records
+     * than spends means the undo data is missing or short, whatever the
+     * reason, so refuse rather than write a half-indexed height. Catching it
+     * here also covers a truncated-but-not-torn undo file, which the ur < 0
+     * check above cannot see.
+     *
+     * Reachable without any operator error: utxo_live_catchup applies every
+     * block to the archive tip in one call and then prunes undo below
+     * applied-199, all before the choke point that feeds this tail. A node
+     * more than 200 blocks behind -- an outage, a long compaction, or the
+     * parallel downloader -- closes the gap and prunes the undo it is about
+     * to need. */
+    if (ur < c.nspends){
+        fprintf(stderr, "[axt] h=%ld: undo has %ld records but the block spends %ld "
+                        "-- refusing to index a height with missing spends\n",
+                h, ur, c.nspends);
+        return 0;
+    }
     long want = c.n * AXF_TAIL_REC;
     if (want && write(g_fd, c.recs, (size_t)want) != want) return 0;
     g_covered = h;

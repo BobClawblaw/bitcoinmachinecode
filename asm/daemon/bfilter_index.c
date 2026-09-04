@@ -233,6 +233,75 @@ static int bfi_prev_cb(void* ctxv, const u8* txid, u32 index, u64 value,
     return 1;
 }
 
+/* CompactSize reader for the walk below. Sets *consumed to 0 on a truncated
+ * or out-of-range field so every caller can treat that as "malformed". */
+static u64 bfi_rd_varint(const u8* p, const u8* end, unsigned long* consumed){
+    *consumed = 0;
+    if (p >= end) return 0;
+    u8 c = *p;
+    if (c < 0xfd){ *consumed = 1; return c; }
+    if (c == 0xfd){ if (p + 3 > end) return 0; *consumed = 3;
+                    return (u64)p[1] | ((u64)p[2] << 8); }
+    if (c == 0xfe){ if (p + 5 > end) return 0; *consumed = 5;
+                    u64 v = 0; for (int i=0;i<4;i++) v |= (u64)p[1+i] << (8*i); return v; }
+    if (p + 9 > end) return 0;
+    *consumed = 9;
+    { u64 v = 0; for (int i=0;i<8;i++) v |= (u64)p[1+i] << (8*i); return v; }
+}
+
+/* STO-3: how many prevouts this block spends, i.e. how many undo records the
+ * filter needs. Local varint walk rather than a shared helper, because
+ * tests/test_bfilter_index does not link daemon/undo_log.c and adding that
+ * dependency to read one number would be the wrong trade. Returns -1 on a
+ * malformed block, which the caller treats as "cannot build". */
+static long bfi_count_spends(const u8* blk, unsigned long blen){
+    const u8* p = blk + 80; const u8* end = blk + blen;
+    unsigned long cc;
+    u64 ntx = bfi_rd_varint(p, end, &cc); if (!cc) return -1;
+    p += cc;
+    long spends = 0;
+    for (u64 t = 0; t < ntx; t++){
+        if (p + 4 > end) return -1;
+        p += 4;
+        int sw = (p + 2 <= end && p[0] == 0x00 && p[1] == 0x01);
+        if (sw) p += 2;
+        u64 nin = bfi_rd_varint(p, end, &cc); if (!cc) return -1;
+        p += cc;
+        for (u64 i = 0; i < nin; i++){
+            if (p + 36 > end) return -1;
+            if (t != 0) spends++;                 /* the coinbase spends nothing */
+            p += 36;
+            u64 sl = bfi_rd_varint(p, end, &cc); if (!cc) return -1;
+            p += cc + sl + 4;
+            if (p > end) return -1;
+        }
+        u64 nout = bfi_rd_varint(p, end, &cc); if (!cc) return -1;
+        p += cc;
+        for (u64 i = 0; i < nout; i++){
+            if (p + 8 > end) return -1;
+            p += 8;
+            u64 sl = bfi_rd_varint(p, end, &cc); if (!cc) return -1;
+            p += cc;
+            if (p + sl > end) return -1;
+            p += sl;
+        }
+        if (sw){
+            for (u64 i = 0; i < nin; i++){
+                u64 items = bfi_rd_varint(p, end, &cc); if (!cc) return -1;
+                p += cc;
+                for (u64 k = 0; k < items; k++){
+                    u64 il = bfi_rd_varint(p, end, &cc); if (!cc) return -1;
+                    p += cc + il;
+                    if (p > end) return -1;
+                }
+            }
+        }
+        if (p + 4 > end) return -1;
+        p += 4;
+    }
+    return spends;
+}
+
 /* build + append the filter for height h from block bytes + undo records.
  * 1 ok / 0 failed (the index closes rather than storing a wrong filter). */
 static int bfi_append_from_undo(long h, const u8* blk, unsigned long blen){
@@ -244,7 +313,33 @@ static int bfi_append_from_undo(long h, const u8* blk, unsigned long blen){
     if (!g_undo_replay_fn) return 0;
     bfi_prev_ctx c = { v, pbuf, 0, 0, 0 };
     long ur = g_undo_replay_fn(h, bfi_prev_cb, &c);
-    if ((ur < 0 && h != 0) || c.overflow) return 0;   /* undo pruned/torn: cannot build */
+    if ((ur < 0 && h != 0) || c.overflow) return 0;   /* undo torn: cannot build */
+    /* STO-3 (audit 2026-09-03): an ABSENT undo file returns 0, exactly like a
+     * block that genuinely spends nothing -- undo_replay cannot tell "pruned"
+     * from "empty", and chose to proceed. A block whose undo file had been
+     * pruned then produced a filter built from OUTPUT scripts only, missing
+     * every spent-prevout element. Core's BlockFilterIndex::CustomAppend
+     * FAILS the index when undo is unavailable; it never emits a partial
+     * filter. A partial one is worse than none: its sha256d and every
+     * bf_header chained after it diverge from Core permanently, and a light
+     * client is told those blocks do not touch its coins.
+     *
+     * The block is the authority on how many prevouts to expect. Fewer undo
+     * records than spends means the data is missing or short, whatever the
+     * reason -- which also covers a truncated-but-not-torn file that the
+     * ur < 0 check cannot see.
+     *
+     * Reachable without operator error: utxo_live_catchup applies to the
+     * archive tip in one call and prunes undo below applied-199, before the
+     * choke point that feeds this tail runs. */
+    { long want = bfi_count_spends(blk, blen);
+      if (want < 0) return 0;
+      if (ur < want){
+          fprintf(stderr, "[bfi] h=%ld: undo has %ld records but the block spends %ld "
+                          "-- refusing to store a filter missing its prevout elements\n",
+                  h, ur, want);
+          return 0;
+      } }
     u8 hash[32];
     sha256d(hash, blk, 80);
     long fl = bf_basic_build(blk, blen, hash, v, c.n, filter, BFI_MAX_FILTER);
