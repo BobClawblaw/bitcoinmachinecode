@@ -5,7 +5,8 @@ CRITICAL+HIGH after de-duplication). This file records what has been fixed,
 what has not, and what was found along the way.
 
 **Status as of 2026-09-04 (third pass): 28 of the 29 CRITICAL+HIGH closed,
-1 open (MEM-3), and 33 of the 44 MEDIUM closed.** LOW and INFO are untouched.
+1 open (MEM-3), and 33 of the 44 MEDIUM closed.** VAL-5, previously partial,
+is now complete. LOW and INFO are untouched.
 
 The full gate passes end to end. Two tests are quarantined with reasons a
 reader can check (`test_outbound_mux`, `test_redial` -- both feed
@@ -261,6 +262,16 @@ not in the audit.
   is not yet wired to the same rules.
 
 ### 4.2 Open, CRITICAL+HIGH
+
+**VAL-5 is now fully closed.** Its remaining half -- Core's
+ContextualCheckBlockHeader trio on the REORG path -- landed after the boot
+fetch and block-connect halves. `reorg_analyze` checked PoW, linkage and the
+nBits schedule but not time-too-old, time-too-new or bad-version, so a
+candidate chain carrying such a header was judged on WORK alone and, if it
+won, every one of its blocks was connected. Armed by the daemon next to
+`reorg_set_pow_rules` and default-off for the hermetic suites, with the
+median-time-past read through the same composite header reader
+`pow_check_bits` already uses for the retarget window.
 
 **MEM-3 (HIGH) -- the 24-parent cap.** Still open, and this pass established
 why neither cheap option works, so the next person does not have to rediscover

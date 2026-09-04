@@ -1074,6 +1074,108 @@ static void case_mempool(void){
 }
 
 /* ======================================================================== */
+/* CASE (VAL-5 rest): reorg_analyze enforces ContextualCheckBlockHeader.      */
+/*                                                                          */
+/* reorg_analyze checked PoW, linkage and the nBits schedule, but not Core's */
+/* trio: time-too-old (nTime <= the parent's median-time-past), time-too-new */
+/* (nTime > now + 2h) and bad-version (a legacy nVersion at or above a       */
+/* BIP34/66/65 activation). A candidate chain carrying such a header was     */
+/* judged on WORK alone -- and if it won, every one of its blocks was        */
+/* connected, blocks Core rejects outright.                                  */
+/*                                                                          */
+/* The rules are injected and default-off, so each case here arms them,      */
+/* runs, and disarms -- leaving the other cases (which build synthetic       */
+/* chains with arbitrary timestamps) untouched.                              */
+/* ======================================================================== */
+/* Re-stamp a branch with sane, ascending timestamps and rechain it.
+ *
+ * build_branch stamps blocks at 1700000000 + tagbase + i, and tagbase is
+ * 0x30000000 -- about the year 2049. Those values are TAGS, not times, and
+ * every other case ignores them. Under Core's 2-hour ceiling every such
+ * header is "time-too-new", so a case that exercises the time rules has to
+ * give the branch real times first or the control cannot pass. Each block's
+ * prevhash depends on the one before, so the whole branch is rechained. */
+static void restamp_branch(blk_t* b, long n, const u8 prev0[32], unsigned t0){
+    u8 prev[32]; memcpy(prev, prev0, 32);
+    for (long i = 0; i < n; i++){
+        mk_block(&b[i], prev, t0 + (unsigned)i);
+        memcpy(prev, b[i].hash, 32);
+    }
+}
+
+static void case_reorg_header_rules(void){
+    /* 14 base blocks so a candidate at height 15 has a full 11-header window
+     * behind it -- rg_mtp_at returns 0 for a short window and the floor is
+     * then skipped, which would make the time-too-old assertion vacuous. */
+    const long nbase = 14, nlose = 2, nwin = 3;
+    build_base(nbase, 0x207fffffu);
+    build_branch(lose, nlose, nbase, 0x20000000u, 0x207fffffu);
+    build_branch(win,  nwin,  nbase, 0x30000000u, 0x207fffffu);
+    /* The losing branch is STORED, so it has to carry sane times too: its
+     * headers are part of the median window the candidate is judged against. */
+    unsigned base_t = 1600000000u + (unsigned)nbase;
+    restamp_branch(lose, nlose, base[nbase-1].hash, base_t + 1);
+    harness_open();
+    store_chain(nbase, nlose);
+
+    /* BIP34 armed ABOVE every height this harness reaches. The version rules
+     * of the same predicate are pinned directly by tests/test_hdr_contextual.c
+     * against real headers; arming them here would reject every block the
+     * chain builder makes (it stamps nVersion 1) and would say nothing about
+     * whether reorg_analyze consults the predicate at all. What IS under test
+     * here is the pair of TIME rules, which the builder can drive exactly. */
+    reorg_set_header_rules(1000000);
+
+    /* Control first: a well-formed candidate must still be accepted with the
+     * rules armed. Without it, "reject everything" would pass the negatives.
+     * The store is not touched again -- each scenario differs only in the
+     * candidate headers it presents. */
+    unsigned good_t = (unsigned)time(NULL) - 3600u;
+    restamp_branch(win, nwin, base[nbase-1].hash, good_t);
+    {
+        static reorg_cand_t c; memset(&c,0,sizeof c);
+        reorg_build_locator(store_buf, &c);
+        cand_from_blocks(&c, win, nwin);
+        ck("VAL-5 armed: a well-formed candidate is still accepted",
+           reorg_analyze(store_buf,&c), 2);
+    }
+
+    /* time-too-new: the last header 4 hours ahead of now. */
+    { restamp_branch(win, nwin, base[nbase-1].hash, good_t);
+      mk_block(&win[nwin-1], win[nwin-2].hash, (unsigned)time(NULL) + 4*3600u);
+      static reorg_cand_t c; memset(&c,0,sizeof c);
+      reorg_build_locator(store_buf, &c);
+      cand_from_blocks(&c, win, nwin);
+      ck("VAL-5 a header 4h in the future is REJECTED", reorg_analyze(store_buf,&c), -1); }
+
+    /* time-too-old: the FIRST candidate header at the epoch, far below the
+     * median-time-past of the 11 stored headers behind it. */
+    { restamp_branch(win, nwin, base[nbase-1].hash, good_t);
+      mk_block(&win[0], base[nbase-1].hash, 1);
+      { u8 prev[32]; memcpy(prev, win[0].hash, 32);
+        for (long i = 1; i < nwin; i++){ mk_block(&win[i], prev, good_t + (unsigned)i); memcpy(prev, win[i].hash, 32); } }
+      static reorg_cand_t c; memset(&c,0,sizeof c);
+      reorg_build_locator(store_buf, &c);
+      cand_from_blocks(&c, win, nwin);
+      ck("VAL-5 a header at 1970 (below the parent MTP) is REJECTED",
+         reorg_analyze(store_buf,&c), -1); }
+
+    /* And with the rules DISARMED that same candidate is accepted again --
+     * which is what shows the rejection came from this predicate and not from
+     * the timestamp disturbing work, linkage or PoW. */
+    reorg_set_header_rules(-1);
+    {
+        static reorg_cand_t c; memset(&c,0,sizeof c);
+        reorg_build_locator(store_buf, &c);
+        cand_from_blocks(&c, win, nwin);
+        ck("VAL-5 disarmed: the SAME 1970 candidate is accepted again",
+           reorg_analyze(store_buf,&c), 2);
+    }
+
+    utxo_live_close();
+}
+
+/* ======================================================================== */
 /* CASE (MEM-8): the reconcile snapshot is sized from the POOL, so a pool     */
 /*       larger than the old fixed bound leaves no ghosts.                   */
 /*                                                                          */
@@ -1602,6 +1704,7 @@ int main(void){
     total += run_case("mempool reconciliation",         case_mempool);
     total += run_case("mempool reconcile is WIRED (STO-7)", case_mempool_wired);
     total += run_case("reconcile leaves no ghosts (MEM-8)", case_mempool_ghosts);
+    total += run_case("reorg header rules (VAL-5 rest)", case_reorg_header_rules);
     total += run_case("fake peer locator + reorg",      case_fakepeer_locator_and_reorg);
     total += run_case("node_sync_multi (asm frame)",    case_node_sync_multi);
     total += run_case("append-lock scope + prevhash gate", case_append_lock_scope);
