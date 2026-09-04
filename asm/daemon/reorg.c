@@ -695,6 +695,49 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         unsigned char bh[32]; block_hash(bh, blkbuf);
         char hs[17]; hash_short(hs, bh);
         fprintf(stderr, "[reorg] disconnecting height %ld hash=%s..\n", h, hs);
+        /* ---- STO-1 (audit 2026-09-03): CLAIM h-1 BEFORE doing the work ----
+         *
+         * Each utxo_live_unapply_block is durable the instant it returns --
+         * its restores and deletes go through the WAL -- but the persisted
+         * applied height used to be rewritten only ONCE, after the whole
+         * loop. Nothing marked "disconnect in progress". A crash partway
+         * through left the set at T-k while utxo_applied_height.dat still
+         * said T, with the undo files for those heights already discarded:
+         * boot's recovery looked for undo_(T+1), found nothing, reported
+         * "nothing to do", and catch-up saw tip <= applied and did nothing
+         * either. Coins spent in T-k+1..T were live again, and nothing said
+         * so -- the failure was silent because tip == applied, so even the
+         * boot guard added earlier cannot see it.
+         *
+         * Persisting h-1 FIRST inverts which way a crash can leave things.
+         * The window becomes "applied says h-1, the set still has h applied,
+         * and undo_h is still on disk" -- which is exactly the state
+         * utxo_live_recover_partial_block already repairs: it scans upward
+         * from applied+1 for undo files and rolls those heights back,
+         * descending. This reuses that machinery rather than adding a second
+         * recovery path.
+         *
+         * It needs unapply to be IDEMPOTENT, because a crash between the
+         * unapply and its undo_discard leaves undo_h present and recovery
+         * will replay it. It is: del_created_on_output looks the output up
+         * and no-ops when it is absent (its own comment covers exactly this
+         * "already spent / never created" case), and undo_restore_cb treats
+         * a duplicate put (r == 0) as success. Both were written for the
+         * crash-mid-APPLY path and hold here unchanged.
+         *
+         * A failed persist is fatal rather than a warning: continuing would
+         * unapply h with applied still claiming h, which is the very state
+         * this ordering exists to make unreachable. */
+        if (!utxo_live_rewind_to(h - 1)){
+            fprintf(stderr, "[reorg] FATAL: could not persist applied height %ld before "
+                            "disconnecting %ld -- refusing to unapply, because a crash now "
+                            "would leave the set rewound with a stale applied height\n",
+                    h - 1, h);
+            reorg_alert("applied-height-persist-failed-before-disconnect");
+            if (locked) flock(lfd, LOCK_UN);
+            hdr_fd_close();
+            return -1;
+        }
         if (!utxo_live_unapply_block(blkbuf, (uint64_t)len, h)){
             fprintf(stderr, "[reorg] FATAL: unapply failed at height %ld -- UTXO set is now PARTIALLY rewound and must be rebuilt from the archive\n", h);
         reorg_alert("utxo-partially-rewound-rebuild-required");
@@ -744,6 +787,12 @@ long reorg_execute(void* st, long fork_height, long nblocks,
      * and the reason store_rd_close documents itself as "shutdown / post-prune
      * invalidation". */
     store_rd_close(st);
+    /* STO-1: the applied height was already walked down to fork_height one
+     * block at a time by the loop above, each step persisted BEFORE its
+     * unapply. This call is now a confirmation rather than the only commit --
+     * kept because the loop does not run at all when tip == fork_height, and
+     * because a redundant write of the value it already holds costs nothing
+     * and keeps the invariant obvious at the end of the disconnect. */
     if (!utxo_live_rewind_to(fork_height)){
         fprintf(stderr, "[reorg] WARNING: could not persist the rewound applied height %ld (next boot may re-apply from an older height, which is safe)\n", fork_height);
     }
