@@ -5,7 +5,8 @@ CRITICAL+HIGH after de-duplication). This file records what has been fixed,
 what has not, and what was found along the way.
 
 **Status as of 2026-09-04 (overnight pass): 25 of the 29 CRITICAL+HIGH
-closed, 3 partial, 1 open. Everything MEDIUM and below is untouched except
+closed, 4 partial, 0 fully untouched.
+Full gate: 218 test binaries pass; 1 fails on a stale fixture (below). Everything MEDIUM and below is untouched except
 UTX-3** (one MEDIUM, UTX-3, was
 closed because it sits on the same silent-coin-loss path as the HIGHs around
 it).
@@ -144,6 +145,34 @@ Both predate this pass, and each was hiding the other.
 The pairing is worth stating plainly: a consensus fix shipped with a test that
 contradicted it, and the tool that would have caught that was itself broken by
 the same commit.
+
+* **VAL-11 broke `test_outbound_mux`, and it is the fixture that is wrong.**
+  With the gate running, a third failure surfaced. Bisected to the exact
+  commit: `ca48c8d` passes, `19e59df` (VAL-11) fails.
+
+  VAL-11 added Core's `CheckProofOfWork` range checks, including the per-chain
+  powLimit. `tests/test_outbound_mux.c:71` mines its synthetic chain at
+  `nBits = 0x207fffff` — regtest difficulty — while the node it spawns
+  (`bitcoind serve-test`) runs with **mainnet** params, whose powLimit is
+  `0x1d00ffff`. The node now correctly refuses every fixture block, so its tip
+  stays at −1, nothing is stored, and the three assertions about serving and
+  growth fail. The node's own log shows the handshake succeeding and
+  `shutting down: tip=-1`.
+
+  **The code is right and the test is stale.** Fixing it means giving the
+  spawned daemon regtest params (its config lookup is `<datadir>/../config/
+  bitcoin.conf`, outside the test's work directory, so this needs a `-conf=`
+  argument threaded into the `execv`) or re-mining the fixture at a
+  mainnet-valid target, which is not feasible at mainnet difficulty. Left
+  OPEN — it is a test-fixture rework, not an audit finding.
+
+  Sibling daemon e2e tests are unaffected: `test_ibd_full`, `test_keepup`,
+  `test_shared2` and `test_bitcoind_sync` all pass.
+
+**Three gate failures, three different causes, all hidden by the same broken
+`prereq-check`.** Two were stale assertions left behind by correct consensus
+fixes; one was the `prereq-check` defect itself. None was a live consensus
+bug — but none could be seen either, which is the point.
 
 ---
 
