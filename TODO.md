@@ -55,7 +55,8 @@ Everything below is landed on `arm-port` and pushed. History lives in
       mutations across all six epochs (default-seed run also green: 99/99 +
       594/594). Harness change: RPC_HOST now env-configurable
       (`BMC_ORACLE_RPC_HOST`, default 127.0.0.1). Recipe in the worklog;
-      credentials in /tmp/oracle-umbrel.cookie (mode 600, /tmp is ephemeral).
+      credentials in /etc/bmc-oracle/umbrel.cookie (root-owned 0600, outside
+      the repo tree — never committed).
 - [ ] env-only, documented, no action: `bench_checkblock` / `bench_hashidx` /
       `bench_idxscan` / `bench_taproot_block` need production data files
       (`block413567.raw`, `./index.dat` in the scratch dir);
