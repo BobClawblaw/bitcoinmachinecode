@@ -163,9 +163,25 @@ int main(int argc, char** argv){
     memset(&wa, 0, sizeof wa);
     long tag = 0, real_txs = 0;
 
+    if (argc <= 1)
+        /* BLD-2: the Makefile passes $(CORE_BENCH_BLOCK), which is a
+         * $(wildcard) and so expands to nothing when Core's bench fixture is
+         * not on this host. Say so, rather than quietly running only the
+         * synthetic corpus and looking identical to a full run. */
+        printf("SKIP real-block corpus: no path given (set CORE_BENCH_BLOCK to Core's block413567.raw)\n");
     if (argc > 1){
         FILE* f = fopen(argv[1], "rb");
-        if (!f){ perror(argv[1]); return 1; }
+        if (!f){
+            /* BLD-2 (audit 2026-09-03): the real-block corpus is Core's own
+             * bench fixture, which lives outside this repo. It used to be
+             * passed as a literal path in the Makefile recipe, so on any host
+             * without a Core checkout this exited 1, make aborted the recipe,
+             * and the ~60 tests listed after it never ran at all -- while the
+             * README presented `make test` as the full gate. SKIP loudly and
+             * carry on with the synthetic corpus below, the way
+             * test_taproot_block_diff already does for its own fixtures. */
+            printf("SKIP real-block corpus: %s not present (Core bench fixture, optional)\n", argv[1]);
+        } else {
         fseek(f, 0, SEEK_END); long bl = ftell(f); fseek(f, 0, SEEK_SET);
         u8* blk = malloc(bl);
         if (!blk || (long)fread(blk, 1, bl, f) != bl) return 1;
@@ -182,7 +198,8 @@ int main(int argc, char** argv){
             p += span; real_txs++;
         }
         free(blk);
-    }
+            }
+}
 
     /* synthetic segwit + block-path specifics */
     static u8 tx[1<<16];
