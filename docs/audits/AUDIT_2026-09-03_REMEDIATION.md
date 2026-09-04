@@ -4,9 +4,9 @@ Companion to `CODEBASE_AUDIT_2026-09-03.md` (182 findings; 29 distinct
 CRITICAL+HIGH after de-duplication). This file records what has been fixed,
 what has not, and what was found along the way.
 
-**Status as of 2026-09-04 (third pass): 28 of the 29 CRITICAL+HIGH closed,
-1 open (MEM-3), and 36 of the 44 MEDIUM addressed (32 closed outright, 4
-partial).** VAL-5 and UTX-4, both previously partial, are now complete apart
+**Status as of 2026-09-04 (third pass): all 29 CRITICAL+HIGH closed** --
+MEM-3, the last one, on branch `mem3-parent-overflow` -- **and 36 of the 44
+MEDIUM addressed (32 closed outright, 4 partial).** VAL-5 and UTX-4, both previously partial, are now complete apart
 from UTX-4's undo-file fsync. LOW and INFO are untouched.
 
 The full gate passes end to end. Two tests are quarantined with reasons a
@@ -262,7 +262,7 @@ not in the audit.
 * **VAL-5** — the fetch path enforces all of it (`a456bd4`); `reorg_analyze`
   is not yet wired to the same rules.
 
-### 4.2 Open, CRITICAL+HIGH
+### 4.2 CRITICAL+HIGH: none open
 
 **VAL-5 is now fully closed.** Its remaining half -- Core's
 ContextualCheckBlockHeader trio on the REORG path -- landed after the boot
@@ -274,35 +274,48 @@ won, every one of its blocks was connected. Armed by the daemon next to
 median-time-past read through the same composite header reader
 `pow_check_bits` already uses for the retarget window.
 
-**MEM-3 (HIGH) -- the 24-parent cap.** Still open, and this pass established
-why neither cheap option works, so the next person does not have to rediscover
-it:
+**MEM-3 (HIGH) -- the 24-parent cap. CLOSED** on branch
+`mem3-parent-overflow` (`80f66c6`), kept off the main batch branch because it
+changes a MAP_SHARED layout and deserves to be reviewed on its own.
+
+The two cheap options were both tried and both fail, which is why the finding
+sat open through the earlier passes:
 
 * *Reject when a transaction has more in-pool parents than can be recorded*
-  (the audit's first suggestion) was implemented and then reverted. It rests
-  on Core's pre-v31 25-ancestor chain limit, but this node implements v31's
-  CLUSTER limits (64 transactions / 101 kvB), under which a child of 63
-  parents is legal and Core accepts it. Refusing turns a silent corruption
-  into a false reject and fails this project's own `test_mempool_policy` case
-  "child C joins them: cluster of exactly 64 accepted".
+  rests on Core's PRE-v31 25-ancestor CHAIN limit -- which is what the old
+  code comment cited. This node implements v31 CLUSTER limits (64
+  transactions), under which a child of 63 parents is legal and Core accepts
+  it. Implemented, and reverted: it fails this project's own
+  `test_mempool_policy` case "child C joins them: cluster of exactly 64
+  accepted".
 
-* *Raise the cap to 63* was measured, not estimated: `mpol_node` grows from
-  184 to 336 bytes, so the policy state goes from 184 MB to 336 MB at the
-  default 1,048,576-node sizing -- **+152 MB** in a MAP_SHARED region several
-  processes map.
+* *Raise the cap to 63 inline* was measured, not estimated: `mpol_node` grows
+  192 -> 348 bytes, **+156 MB** at the default 1,048,576-node sizing.
 
-* *Have getblocktemplate verify each input resolves* (the audit's other
-  suggestion) would close the dangerous OUTCOME rather than the cause, but
-  GBT has no UTXO view: `rpc_chain.c` reaches the mempool through injected
-  hooks and has no way to tell "this parent confirmed" from "this parent
-  vanished", which is exactly the distinction the check needs. Adding one
-  means the RPC thread reading the live UTXO store the download worker owns.
+* *Have getblocktemplate verify each input resolves* would close the dangerous
+  OUTCOME rather than the cause, but `rpc_chain.c` reaches the mempool through
+  injected hooks and has no UTXO view -- it cannot tell "this parent
+  confirmed" from "this parent vanished", which is exactly the distinction the
+  check needs.
 
-That leaves the audit's remaining option -- **store parents out of line** --
-as the real fix. It is a layout change to the shared policy state plus a
-rework of every walker that reads `parent[]` (`collect_descendant_txids`, the
-cluster walk, `remove_node`'s relink and index renumbering), and it wants its
-own pass with its own gate run rather than being appended to this one.
+**What landed instead:** the audit's remaining option, out-of-line storage.
+The first 8 parents stay in the node and the rare node needing more borrows a
+fixed block from a pool appended after the node array. The node SHRINKS
+192 -> 128 bytes, and the pool (one block per eight nodes, a deliberately
+pessimistic ratio) costs 27.5 MB -- a **net 36.5 MB saving** against the
+layout it replaces, and 192 MB cheaper than 63 inline. All twenty `parent[]`
+access sites go through accessors; overflowing 63 is refused as
+`too-large-cluster`, which is the rule such a transaction actually breaks.
+
+Three things each cost a debugging round and are worth knowing before touching
+this again: the block must be released BEFORE `remove_node`'s swap-with-last
+overwrites the slot; the availability check must run BEFORE the RBF evictions
+in step 1a, or a failure repeats MEM-6's atomicity defect; and the refusal
+reason matters, because the existing 64-parent case pins it.
+
+The negative control reproduces the finding as an executable claim: against
+the previous file the child reports 24 parents and SURVIVES its parent's
+replacement -- the invalid-block path.
 
 ### 4.3 MEDIUM and below
 
