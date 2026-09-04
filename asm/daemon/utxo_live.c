@@ -135,6 +135,11 @@ extern int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long heig
  * has run. */
 extern const u64* txvb_last_tx_in_sums(u64* n_out);
 extern unsigned long long* txvb_last_tx_sigops(unsigned long long* n);   /* SCR-6 */
+/* VAL-4 / BIP68: per-input prevout creation heights, flat and in block order,
+ * with each input's owning transaction index alongside. Filled by the same
+ * resolve loop that applies the bidx-then-LSM precedence, so an in-block spend
+ * carries the current height rather than a stale one. */
+extern unsigned long long* txvb_last_in_heights(unsigned long long* n, unsigned int** txidx);
 extern void block_hash(u8 out[32], const u8 hdr[80]);
 
 /* Rolling undo-data retention window. Stage A's own design note calls for
@@ -1381,6 +1386,39 @@ static int val_is_final_tx(const val_txinfo_t* vi, long height, u32 timecutoff){
     return !vi->any_nonfinal_seq;
 }
 
+/* ---------------------------------------------------------------- VAL-4
+ * BIP68's three pieces of arithmetic, split out because this is where a
+ * chain split would come from and nothing else about the rule is subtle.
+ *
+ * consensus/tx_verify.cpp, CalculateSequenceLocks:
+ *     height-based:  minHeight = max(minHeight, coinHeight + (seq & MASK) - 1)
+ *     time-based:    minTime   = max(minTime,
+ *                                    coinMTP + ((seq & MASK) << 9) - 1)
+ * and EvaluateSequenceLocks:
+ *     satisfied iff  minHeight < nBlockHeight  AND  minTime < MTP(prev)
+ *
+ * The << 9 is BIP68's 512-second granularity and the -1 is Core's: the lock
+ * is satisfied AT the boundary, not one past it. Both are off-by-ones that
+ * produce a chain split rather than a test failure, so they are transcribed
+ * and then pinned by tests/test_bip68_locks.c against hand-computed values. */
+#define VAL_SEQ_DISABLE (1u << 31)
+#define VAL_SEQ_TYPE    (1u << 22)
+#define VAL_SEQ_MASK    0x0000ffffu
+
+long long val_seq_min_height(unsigned long coin_height, unsigned seq){
+    return (long long)coin_height + (long long)(seq & VAL_SEQ_MASK) - 1;
+}
+long long val_seq_min_time(unsigned long coin_mtp, unsigned seq){
+    return (long long)coin_mtp
+         + (long long)(((unsigned long long)(seq & VAL_SEQ_MASK)) << 9) - 1;
+}
+int val_seq_locks_ok(long long min_height, long long min_time,
+                     long height, unsigned long tip_mtp){
+    if (min_height >= (long long)height) return 0;
+    if (min_time   >= (long long)tip_mtp) return 0;
+    return 1;
+}
+
 /* Test seam for tests/test_val_read_tx.c. val_read_tx is static and is not
  * reachable from a harness otherwise; exporting a thin alias (the same
  * convention bitcoin_scriptverify.c's sv_checksig_export uses) lets the test
@@ -1791,6 +1829,121 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
                     g_apply_height, (unsigned long long)ptx_out[0], (unsigned long long)cap);
             g_last_reject = "bad-cb-amount";
             return 0;
+        }
+    }
+
+    /* ---- Phase 4.55 (VAL-4, BIP68 half, audit 2026-09-03): ConnectBlock's
+     * relative-timelock rule.
+     *
+     * Core rejects "bad-txns-nonBIP68-final" for any transaction whose
+     * SequenceLocks are not satisfied, for nVersion >= 2 at or after
+     * CSVHeight. This node had the CSV script OPCODE but never the
+     * transaction-level rule, and the opcode only runs when a script uses it.
+     * So a v2 transaction with a relative lock of 1000 blocks against a fresh
+     * prevout was accepted here and rejected by Core: every signature valid,
+     * the split purely over relative finality.
+     *
+     * consensus/tx_verify.cpp, CalculateSequenceLocks, mirrored exactly:
+     *   enforce only when tx.nVersion >= 2 AND the CSV deployment is active
+     *   per input:
+     *     SEQUENCE_LOCKTIME_DISABLE_FLAG (1<<31) set  -> input is exempt
+     *     SEQUENCE_LOCKTIME_TYPE_FLAG    (1<<22) set  -> TIME-based:
+     *         coinTime = MTP of the block at max(coinHeight-1, 0)
+     *         minTime  = max(minTime, coinTime + ((seq & 0xffff) << 9) - 1)
+     *     otherwise                                   -> HEIGHT-based:
+     *         minHeight = max(minHeight, coinHeight + (seq & 0xffff) - 1)
+     *   EvaluateSequenceLocks: fail if minHeight >= this height
+     *                             or minTime  >= MTP(prev)
+     *
+     * The 1<<9 shift is BIP68's 512-second granularity, and the -1 is Core's:
+     * the lock is satisfied AT the boundary, not one past it. Both are the
+     * kind of off-by-one that produces a chain split rather than a test
+     * failure, so they are transcribed rather than reasoned about.
+     *
+     * WHERE THE INPUTS COME FROM. The per-input prevout creation heights are
+     * exported by tx_verify.c's resolve loop (txvb_last_in_heights), which is
+     * the only place that applies the bidx-then-LSM precedence -- a spend of
+     * an output created earlier in the SAME block resolves through bidx_get
+     * and carries this height. Re-resolving them here would duplicate that
+     * precedence rule. The per-input sequences come from val_read_tx.
+     *
+     * THE seqs[] CAP IS SAFE HERE, unlike for IsFinalTx. val_read_tx records
+     * at most VAL_SEQ_CAP sequences and its truncation rule treats the
+     * surplus as FINAL. For BIP68 "final" means nSequence 0xffffffff, which
+     * has the DISABLE flag set, so a surplus input is treated as exempt --
+     * it can only make us MORE permissive on a transaction with more than
+     * 2,048 inputs, never less. That direction is wrong in principle, so the
+     * truncation is refused outright below rather than relied upon. ---- */
+    {
+        unsigned long long bflags68 = script_flags_for_block((unsigned long long)g_apply_height, blk_hash);
+        int csv_active68 = (int)((bflags68 >> VAL_SFC_BIT_CSV) & 1ULL);
+        if (csv_active68 && ntx > 1){
+            unsigned long long nin_tot = 0; unsigned int* in_txidx = 0;
+            const u64* in_h = (const u64*)txvb_last_in_heights(&nin_tot, &in_txidx);
+            if (!in_h || !in_txidx){
+                g_last_reject = "internal: bip68 height ledger missing"; return 0;
+            }
+            u32 tip_mtp;
+            if (g_apply_height < 1 || !val_mtp(g_apply_height - 1, &tip_mtp)){
+                g_last_reject = "bad-txns-nonBIP68-final";   /* cannot evaluate -> refuse */
+                return 0;
+            }
+
+            val_txinfo_t vib;
+            u64 gi = 0;                       /* walks the flat input ledger */
+            for (u64 t = 0; t < ntx; t++){
+                if (!val_read_tx(txs[t].ptr, txs[t].len, &vib)){
+                    g_last_reject = "bad-txns-prevout-null"; return 0;
+                }
+                if (t == 0) continue;         /* the coinbase has no prevouts */
+
+                if (vib.nseqs >= VAL_SEQ_CAP && vib.in_count > VAL_SEQ_CAP){
+                    /* see the note above: proceeding would be permissive */
+                    fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-txns-nonBIP68-final "
+                                    "(tx %llu has %llu inputs, past the sequence window)\n",
+                            g_apply_height, (unsigned long long)t,
+                            (unsigned long long)vib.in_count);
+                    g_last_reject = "bad-txns-nonBIP68-final"; return 0;
+                }
+
+                long long min_height = -1, min_time = -1;
+                int enforce = (vib.version >= 2);
+
+                for (u64 k = 0; k < vib.in_count; k++){
+                    /* the flat ledger is in block order, so advance with it */
+                    if (gi >= nin_tot || in_txidx[gi] != (unsigned)t){
+                        g_last_reject = "internal: bip68 ledger desync"; return 0;
+                    }
+                    u64 coin_h = in_h[gi];
+                    unsigned seq = (k < vib.nseqs) ? vib.seqs[k] : 0xFFFFFFFFu;
+                    gi++;
+                    if (!enforce) continue;
+                    if (seq & VAL_SEQ_DISABLE) continue;
+                    if (seq & VAL_SEQ_TYPE){
+                        long anc = (long)coin_h - 1; if (anc < 0) anc = 0;
+                        u32 coin_mtp;
+                        if (!val_mtp(anc, &coin_mtp)){
+                            g_last_reject = "bad-txns-nonBIP68-final"; return 0;
+                        }
+                        long long cand = val_seq_min_time(coin_mtp, seq);
+                        if (cand > min_time) min_time = cand;
+                    } else {
+                        long long cand = val_seq_min_height((unsigned long)coin_h, seq);
+                        if (cand > min_height) min_height = cand;
+                    }
+                }
+
+                if (enforce &&
+                    !val_seq_locks_ok(min_height, min_time,
+                                      g_apply_height, (unsigned long)tip_mtp)){
+                    fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-txns-nonBIP68-final "
+                                    "(tx %llu, minHeight %lld vs %ld, minTime %lld vs %lu)\n",
+                            g_apply_height, (unsigned long long)t, min_height,
+                            g_apply_height, min_time, (unsigned long)tip_mtp);
+                    g_last_reject = "bad-txns-nonBIP68-final";
+                    return 0;
+                }
+            }
         }
     }
 

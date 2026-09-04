@@ -1365,6 +1365,25 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
 static u64* g_tx_sigops = 0;  static u64 g_tx_sigops_cap = 0;  static u64 g_tx_sigops_n = 0;
 unsigned long long* txvb_last_tx_sigops(unsigned long long* n){ if(n) *n = g_tx_sigops_n; return (unsigned long long*)g_tx_sigops; }
 
+/* VAL-4 / BIP68 (audit 2026-09-03): the per-input prevout CREATION HEIGHTS,
+ * flat and in the same order as `flat`, with each input's owning transaction
+ * index alongside.
+ *
+ * CalculateSequenceLocks needs prevHeights[] -- one height per input -- and
+ * this loop is the only place that resolves them (bidx_get for a spend of an
+ * output created earlier in the SAME block, utxo_lsm_get otherwise). Exporting
+ * them costs one array write per input on a path that already did the lookup;
+ * re-resolving them in the caller would mean duplicating the bidx/LSM
+ * precedence rule, which is exactly the kind of second implementation that
+ * drifts. Same seam as txvb_last_tx_sigops. */
+static u64* g_in_height = 0;  static u64 g_in_height_cap = 0;  static u64 g_in_height_n = 0;
+static u32* g_in_txidx  = 0;  static u64 g_in_txidx_cap  = 0;
+unsigned long long* txvb_last_in_heights(unsigned long long* n, unsigned int** txidx){
+    if (n) *n = g_in_height_n;
+    if (txidx) *txidx = g_in_txidx;
+    return (unsigned long long*)g_in_height;
+}
+
 /* The last data push of a scriptSig (Core's subscript source for both the
  * P2SH accurate sigop count and the P2SH-wrapped witness lookup). Mirrors
  * daemon/tx_accept.c's sgc_last_push: any non-push opcode (opcode > OP_16)
@@ -1556,6 +1575,18 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
      * a P2SH/witness addend (those need resolved inputs), so the whole block's
      * cost is just the legacy per-tx scan. */
     {
+        { /* VAL-4/BIP68: one slot per INPUT, sized here alongside the sigop ledger */
+          u64* hp = grow_arena((void**)&g_in_height, &g_in_height_cap, total_nin * sizeof(u64));
+          u32* xp = grow_arena((void**)&g_in_txidx,  &g_in_txidx_cap,  total_nin * sizeof(u32));
+          /* total_nin == 0 is a coinbase-only block: grow_arena returns NULL
+           * for a zero-byte request, which is not a failure. Only a genuine
+           * allocation failure is. */
+          if (total_nin && (!hp || !xp)){ *reason = "oom: bip68 height ledger"; return 0; }
+          if (total_nin){
+              memset(g_in_height, 0, total_nin * sizeof(u64));
+              memset(g_in_txidx,  0, total_nin * sizeof(u32));
+          }
+          g_in_height_n = total_nin; }
         u64* p = grow_arena((void**)&g_tx_sigops, &g_tx_sigops_cap, ntx * sizeof(u64));
         if (!p){ *reason = "out of memory"; *fail_tx_index = 0; return 0; }
         memset(g_tx_sigops, 0, ntx * sizeof(u64));
@@ -1634,6 +1665,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
          * this accumulator (see the VAL_MAX_MONEY bound the caller applies
          * against the resulting fee). */
         if (in->tx_index < g_tx_in_sums_n) g_tx_in_sums[in->tx_index] += value;
+        if (gi < g_in_height_n){ g_in_height[gi] = uheight; g_in_txidx[gi] = (u32)in->tx_index; }
         if (!txvb_classify(in, height, flags, value, uheight, ucb, spk, spklen,
                            &g_spk_pool, &has_taproot, reason)) {
             *fail_tx_index = in->tx_index; goto fail;
