@@ -30,6 +30,35 @@ static unsigned long rd_varint(const u8* p, unsigned long* cc){
     if (p[0] == 0xfe){ *cc = 5; return (unsigned long)p[1] | ((unsigned long)p[2] << 8) | ((unsigned long)p[3] << 16) | ((unsigned long)p[4] << 24); }
     *cc = 9; unsigned long v = 0; for (int i = 0; i < 8; i++) v |= (unsigned long)p[1+i] << (8*i); return v;
 }
+/* ---------------------------------------------------------------- WAL-14
+ * (audit 2026-09-03) A CompactSize read that cannot leave the buffer.
+ *
+ * rd_varint above takes a bare pointer and reads up to NINE bytes from it,
+ * so it runs off the end whenever it is called near the buffer's tail -- and
+ * parse_map called it exactly there, then advanced by the length it returned
+ * without comparing that length to what remained. A PSBT with a 0xff-varint
+ * key length walked `p` far past `blen`, and ser_map/has_key then read from
+ * wherever it landed. The audit rated this PLAUSIBLE because reachability
+ * depends on how completely psbt_v2_normalize validates first; a parser that
+ * is only safe because of what runs before it is one refactor away from not
+ * being safe, so it is bounded here regardless.
+ *
+ * Returns 1 and fills the value and consumed-count, or 0 if the encoding
+ * would read past `avail`.
+ */
+static int rd_varint_b(const u8* p, unsigned long avail, unsigned long* out, unsigned long* cc){
+    if (avail < 1) return 0;
+    if (p[0] < 0xfd){ *cc = 1; *out = p[0]; return 1; }
+    if (p[0] == 0xfd){ if (avail < 3) return 0; *cc = 3;
+        *out = (unsigned long)p[1] | ((unsigned long)p[2] << 8); return 1; }
+    if (p[0] == 0xfe){ if (avail < 5) return 0; *cc = 5;
+        *out = (unsigned long)p[1] | ((unsigned long)p[2] << 8) |
+               ((unsigned long)p[3] << 16) | ((unsigned long)p[4] << 24); return 1; }
+    if (avail < 9) return 0;
+    *cc = 9;
+    { unsigned long v = 0; for (int i = 0; i < 8; i++) v |= (unsigned long)p[1+i] << (8*i); *out = v; }
+    return 1;
+}
 static long wr_varint(u8* o, unsigned long long v){
     if (v < 0xfd){ o[0] = (u8)v; return 1; }
     if (v <= 0xffff){ o[0] = 0xfd; o[1] = (u8)v; o[2] = (u8)(v >> 8); return 3; }
@@ -55,12 +84,28 @@ static void b64enc(char* out, const u8* in, long n){
         out[o++] = B[v >> 18]; out[o++] = B[(v >> 12) & 63]; out[o++] = i+1 < n ? B[(v >> 6) & 63] : '='; out[o++] = i+2 < n ? B[v & 63] : '='; }
     out[o] = 0;
 }
+/* WAL-14: every read below is bounded by `blen`, and a malformed map is
+ * reported as -1 rather than as a count. The callers check it: letting a
+ * negative flow into their loops happens to be harmless today (find_kv with
+ * n < 0 iterates zero times) but that is luck, not design. */
 static int parse_map(const u8* buf, long blen, long* pp, kv_t* kvs, int cap){
     int n = 0; long p = *pp;
-    while (p < blen){ unsigned long cc; unsigned long kl = rd_varint(buf+p, &cc); p += cc; if (kl == 0){ *pp = p; return n; }
-        const u8* k = buf+p; p += kl; unsigned long vl = rd_varint(buf+p, &cc); p += cc; const u8* v = buf+p; p += vl;
-        if (n < cap){ kvs[n].k = k; kvs[n].kl = kl; kvs[n].v = v; kvs[n].vl = vl; n++; } }
-    *pp = p; return n;
+    if (p < 0 || p > blen) return -1;
+    while (p < blen){
+        unsigned long cc, kl, vl;
+        unsigned long avail = (unsigned long)(blen - p);
+        if (!rd_varint_b(buf + p, avail, &kl, &cc)) return -1;
+        p += (long)cc;
+        if (kl == 0){ *pp = p; return n; }            /* 0x00 terminates the map */
+        if (kl > (unsigned long)(blen - p)) return -1;
+        const u8* k = buf + p; p += (long)kl;
+        if (!rd_varint_b(buf + p, (unsigned long)(blen - p), &vl, &cc)) return -1;
+        p += (long)cc;
+        if (vl > (unsigned long)(blen - p)) return -1;
+        const u8* v = buf + p; p += (long)vl;
+        if (n < cap){ kvs[n].k = k; kvs[n].kl = kl; kvs[n].v = v; kvs[n].vl = vl; n++; }
+    }
+    return -1;                                        /* ran out with no terminator */
 }
 static long ser_map(u8* out, const kv_t* kvs, int n){
     long o = 0;
@@ -85,10 +130,31 @@ static int walk_tx(const u8* tx, unsigned long len, tin_t* ins, int icap, int* n
     if (len < 10) return 0;
     unsigned long p = 4, cc;
     if (tx[4] == 0 && tx[5] == 1) p = 6;
-    unsigned long ni = rd_varint(tx+p, &cc); p += cc; if (ni > (unsigned long)icap) return 0;
-    for (unsigned long i = 0; i < ni; i++){ if (p + 36 > len) return 0; ins[i].op = tx+p; p += 36; unsigned long sl = rd_varint(tx+p, &cc); p += cc + sl + 4; if (p > len) return 0; }
-    unsigned long no = rd_varint(tx+p, &cc); p += cc; if (no > (unsigned long)ocap) return 0;
-    for (unsigned long i = 0; i < no; i++){ if (p + 9 > len) return 0; outs[i].value = tx+p; p += 8; unsigned long sl = rd_varint(tx+p, &cc); p += cc; outs[i].spk = tx+p; outs[i].len = sl; p += sl; if (p > len) return 0; }
+    unsigned long ni;
+    if (!rd_varint_b(tx+p, len - p, &ni, &cc)) return 0;
+    p += cc; if (ni > (unsigned long)icap) return 0;
+    for (unsigned long i = 0; i < ni; i++){
+        if (p + 36 > len) return 0;
+        ins[i].op = tx+p; p += 36;
+        unsigned long sl;
+        if (!rd_varint_b(tx+p, len - p, &sl, &cc)) return 0;
+        p += cc;
+        /* VAL-15 shape: `p += cc + sl + 4; if (p > len)` WRAPS for sl near
+         * 2^64 and passes the check on a wrapped pointer. Split so neither
+         * side can overflow. */
+        if (sl > len - p || len - p - sl < 4) return 0;
+        p += sl + 4; }
+    unsigned long no;
+    if (!rd_varint_b(tx+p, len - p, &no, &cc)) return 0;
+    p += cc; if (no > (unsigned long)ocap) return 0;
+    for (unsigned long i = 0; i < no; i++){
+        if (p + 9 > len) return 0;
+        outs[i].value = tx+p; p += 8;
+        unsigned long sl;
+        if (!rd_varint_b(tx+p, len - p, &sl, &cc)) return 0;
+        p += cc;
+        if (sl > len - p) return 0;                   /* VAL-15 shape, split */
+        outs[i].spk = tx+p; outs[i].len = sl; p += sl; }
     *nin = (int)ni; *nout = (int)no; return 1;
 }
 /* the input's scriptPubKey: witness_utxo, else the non-witness parent's output */
@@ -211,13 +277,14 @@ long psbt_update_bytes_from_descs(const u8* buf, long blen, pu_desc_t* dv, int n
     if (blen < 5 || memcmp(buf, "psbt\xff", 5)) return -1;
     long p = 5;
     static kv_t gkv[PU_MAXKV]; int gn = parse_map(buf, blen, &p, gkv, PU_MAXKV);
+    if (gn < 0) return -1;                            /* WAL-14: malformed map */
     const kv_t* utx = find_kv(gkv, gn, 0x00); if (!utx) return -1;
     static tin_t ins[PU_MAXIO]; static tout_t outs[PU_MAXIO]; int n_in, n_out;
     if (!walk_tx(utx->v, utx->vl, ins, PU_MAXIO, &n_in, outs, PU_MAXIO, &n_out)) return -1;
     static kv_t ikv[PU_MAXIO][PU_MAXKV]; static int in_n[PU_MAXIO];
     static kv_t okv[PU_MAXIO][PU_MAXKV]; static int out_n[PU_MAXIO];
-    for (int i = 0; i < n_in; i++) in_n[i] = parse_map(buf, blen, &p, ikv[i], PU_MAXKV);
-    for (int i = 0; i < n_out; i++) out_n[i] = parse_map(buf, blen, &p, okv[i], PU_MAXKV);
+    for (int i = 0; i < n_in; i++){ in_n[i] = parse_map(buf, blen, &p, ikv[i], PU_MAXKV); if (in_n[i] < 0) return -1; }
+    for (int i = 0; i < n_out; i++){ out_n[i] = parse_map(buf, blen, &p, okv[i], PU_MAXKV); if (out_n[i] < 0) return -1; }
     static u8 arena[8u << 20]; g_arena = arena; g_arena_n = 0; g_arena_cap = sizeof arena;
     int changed = 0;
     for (int i = 0; i < n_in; i++){
