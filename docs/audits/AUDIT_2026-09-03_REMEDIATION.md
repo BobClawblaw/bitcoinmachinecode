@@ -5,9 +5,10 @@ CRITICAL+HIGH after de-duplication). This file records what has been fixed,
 what has not, and what was found along the way.
 
 **Status as of 2026-09-04 (third pass): all 29 CRITICAL+HIGH closed** --
-MEM-3, the last one, on branch `mem3-parent-overflow` -- **and 36 of the 44
-MEDIUM addressed (32 closed outright, 4 partial).** VAL-5 and UTX-4, both previously partial, are now complete apart
-from UTX-4's undo-file fsync. LOW and INFO are untouched.
+MEM-3, the last one, on branch `mem3-parent-overflow` -- **and 37 of the 44
+MEDIUM addressed (33 closed outright, 4 partial).** VAL-5 and UTX-4, both
+previously partial, are now complete apart from UTX-4's undo-file fsync. LOW
+and INFO are untouched.
 
 The full gate passes end to end. Two tests are quarantined with reasons a
 reader can check (`test_outbound_mux`, `test_redial` -- both feed
@@ -319,8 +320,8 @@ replacement -- the invalid-block path.
 
 ### 4.3 MEDIUM and below
 
-44 MEDIUM, 68 LOW, 33 INFO in the audit. **Thirty-six MEDIUM have been
-addressed: 32 closed outright, and 4 partial** -- SER-3, CRY-4, WAL-3 and
+44 MEDIUM, 68 LOW, 33 INFO in the audit. **Thirty-seven MEDIUM have been
+addressed: 33 closed outright, and 4 partial** -- SER-3, CRY-4, WAL-3 and
 NET-9, each with its residual named in the row or the note below it. LOW and
 INFO are untouched.
 
@@ -367,6 +368,7 @@ remaining half landed in the same pass.)
 | NET-6 | Closed by VAL-11: all five checks plus the `diff_target` clamp, and every caller it named now runs `pow_check` | `19e59df` |
 | UTX-4 (rest) | A torn WAL tail was never truncated, so every later append landed after it and every future reload stopped there | `51447cb` |
 | NET-9 (part) | The one-byte BIP152 tx count was SER-4; the documentation claiming "both directions" is corrected here. The RECEIVE side has never existed and is a feature, not a fix -- `bitcoin_serve.asm` writes `cmpctblock`/`blocktxn` and has no inbound handler for either | `4cd988c` + docs |
+| MEM-9 | Inv processing was O(entries x table) with no per-peer bound: ~10^8 byte-compares per message, 64 messages per pass, in the download worker | `045ef64` |
 
 **A regression this pass produced, and caught.** `e99bd1c` enforced canonical
 CompactSize in the three shared C readers and left
