@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <time.h>            /* NET-2: a real-time deadline on the handshake */
 #include <sys/socket.h>
 #include "v2transport.h"
 #include "../crypto_bip324_transport.h"
@@ -153,6 +154,15 @@ static void install_hooks(void){
     g_v2_hook_read  = v2_read_hook;
 }
 
+/* NET-2: elapsed wall time since t0, against the handshake budget. */
+static int hs_deadline_passed(const struct timespec* t0, int timeout_ms){
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long ms = (long)(now.tv_sec - t0->tv_sec) * 1000L
+            + (long)(now.tv_nsec - t0->tv_nsec) / 1000000L;
+    return ms >= (long)timeout_ms;
+}
+
 int bmc_v2_handshake(int fd, int initiator, int timeout_ms){
     if (fd < 0 || fd >= V2_FD_MAX) return -1;
     bmc_v2_close(fd);                       /* never inherit a stale session */
@@ -187,6 +197,25 @@ int bmc_v2_handshake(int fd, int initiator, int timeout_ms){
 
     int elapsed = 0;
     const int slice = 200;
+    /* NET-2 (audit 2026-09-03): a REAL-TIME deadline for the whole handshake.
+     *
+     * `elapsed` is only advanced on a poll timeout, so every path that
+     * `continue`s without poll returning 0 was invisible to it. The v1
+     * detection loop below has such a path -- peeked bytes stay in the
+     * receive queue, so once a peer sends a partial v1 prefix and stops,
+     * poll returns POLLIN immediately and forever, recv(MSG_PEEK) returns
+     * the same n every time, and `n <= peeked` continues without charging
+     * anything. One core pinned, an inbound slot held, no timeout. A peer
+     * needs to send 8 bytes -- `f9beb4d9 76657273` -- and then nothing.
+     * N connections pin N cores and take N of the ~189 inbound slots.
+     *
+     * A wall-clock deadline is checked on EVERY iteration regardless of what
+     * poll did, so it bounds the paths that exist today and the ones a
+     * future edit adds. The per-slice `elapsed` accounting is left in place
+     * because it is what the non-spinning paths already use. */
+    struct timespec hs_t0;
+    clock_gettime(CLOCK_MONOTONIC, &hs_t0);
+    #define HS_EXPIRED() (hs_deadline_passed(&hs_t0, timeout_ms))
 
     /* ---- responder: decide v1 or v2 WITHOUT consuming anything ----------
      *
@@ -205,6 +234,7 @@ int bmc_v2_handshake(int fd, int initiator, int timeout_ms){
     if (!initiator){
         unsigned long peeked = 0;
         while (c->t.recv_state == BIP324_RECV_MAYBE_V1){
+            if (HS_EXPIRED()){ conn_free(fd); return -1; }   /* NET-2 */
             struct pollfd pf = { fd, POLLIN, 0 };
             int pr = poll(&pf, 1, slice);
             if (pr < 0){
@@ -223,7 +253,19 @@ int bmc_v2_handshake(int fd, int initiator, int timeout_ms){
                 if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) continue;
                 conn_free(fd); return -1;
             }
-            if ((unsigned long)n <= peeked) continue;        /* nothing new yet */
+            if ((unsigned long)n <= peeked){
+                /* NET-2: nothing new. The bytes we peeked are still queued,
+                 * so poll() will say POLLIN again immediately -- looping
+                 * here is a busy spin, not a wait. Sleep the poll slice
+                 * instead, and let the deadline below end it. A legitimate
+                 * v1 peer whose version header is split across TCP segments
+                 * lands within a slice or two; a peer that sends a partial
+                 * prefix and stops is dropped at timeout_ms. */
+                if (HS_EXPIRED()){ conn_free(fd); return -1; }
+                struct timespec ts = { slice / 1000, (long)(slice % 1000) * 1000000L };
+                nanosleep(&ts, NULL);
+                continue;
+            }
             if (!bip324_t_feed(&c->t, pk + peeked, (unsigned long)n - peeked)){
                 conn_free(fd); return -1;
             }
