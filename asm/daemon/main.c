@@ -7082,6 +7082,14 @@ int main(int argc, char** argv){
                           g_chainp->allow_min_difficulty,
                           g_chainp->enforce_bip94,
                           g_chainp->pow_limit_bits);
+      /* VAL-5 (rest): the same arming for ContextualCheckBlockHeader's trio
+       * on the reorg path. The boot header fetch and block connect already
+       * enforce them; reorg_analyze checked PoW, linkage and the nBits
+       * schedule but not time-too-old / time-too-new / bad-version, so a
+       * candidate chain carrying such a header was judged on work alone and,
+       * if it won, every one of its blocks was connected. */
+      { extern void reorg_set_header_rules(long);
+        reorg_set_header_rules(dlc_bip34_height()); }
       /* SAY SO. The check is injected and default-off, so an inert one is
        * indistinguishable from a working one by observing accepted blocks --
        * every block is accepted either way. test_reorg proves the wiring in
