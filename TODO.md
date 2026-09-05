@@ -115,10 +115,24 @@ Everything below is landed on `arm-port` and pushed. History lives in
       165,361,670 and 20079766.75835718 BTC also equal) — the rebuilt
       store is entry-for-entry Core's chainstate, the first full parity
       check this port has ever completed on mainnet;
-      (b) the daemon's running tally is drifted ~208k high (persisted in the
-      checkpoint trailer, survives restart, trips gettxoutsetinfo's guard —
-      walk is right, counter is wrong; offline utxo_setinfo self-consistent).
-      Also: tag/deploy this build as arm-11 through the sweep (built ad-hoc).
+      (b) [CLOSED same session] re-anchor the daemon's running tally —
+      recount_anchor.c (recount from content + flush publishing the honest
+      count into the manifest header): the boot now prints live=165356287
+      (was ~165.59M), and the bookkeeping verified honest afterward
+      (heartbeat tally vs offline walk: one block's net apart, drift zero).
+      Origin established by walking the v2 scratch store at h=964000:
+      txouts=165718352 == the builder's tally exactly — the builder was
+      honest; the fossil entered in the pre-fix daemon era;
+      (c) [CLOSED same session] .rl_manifest_bad hardened: any manifest-load
+      failure (unreadable/over-cap) now returns -3 — both arches — instead
+      of silently proceeding with zero runs; pinned by
+      tests/test_lsm_manifest_cap.c (8 checks); utxo_live names the
+      compaction remedy for -3;
+      (d) [CLOSED same session] sweep round 26 GREEN (pass 322 / fail 4
+      env-only / compared 339 of 375) = the arm-11 cycle: the running
+      binary carries the BIP68 streaming fix, the hardened reload, and the
+      builder BIP30 replace; the node is at tip, mempool admitting, 0
+      invalid, and the full-store muhash parity is GREEN (965598).
 - [ ] Standing hazard (small, from the same session): bitcoin_utxo_lsm.S
       `.rl_manifest_haveN` still silently ZEROES the run table when a store's
       manifest exceeds the caller's manifest_cap (`.rl_manifest_bad` returns
