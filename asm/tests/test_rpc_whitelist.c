@@ -117,6 +117,60 @@ int main(void){
     post(req, sizeof req, port, "bitcoin", "bitcoin", "help"); raw_exchange(port, req);
     ck("unlisted user answers 200 with rpcwhitelistdefault=0", status_of() == 200);
     stop(s);
+    /* ---- RPC-14: rpcwhitelistdefault=1 with NO rpcwhitelist entries --------
+     * Core: g_rpc_whitelist_default is an explicit -rpcwhitelistdefault when
+     * given, else "some whitelist exists". With it set to 1 and no entries,
+     * NO user has a whitelist, so every user is "not allowed to call any
+     * methods" and every request is 403 -- before the body is even parsed.
+     *
+     * This node returned 1 (allow) from rpc_whitelist_allows the moment the
+     * entry count was zero, so the strictest-looking configuration available
+     * allowed EVERYTHING. A fail-open on a security control, which is why
+     * this INFO finding was worth doing first. */
+    printf("== 3b. RPC-14: rpcwhitelistdefault=1 with NO entries denies everyone ==\n");
+    s = spawn(NULL, "1", NULL, NULL, &port);
+    ck("server up", port > 0); if (port <= 0) return 1;
+    post(req, sizeof req, port, "bitcoin", "bitcoin", "help"); raw_exchange(port, req);
+    ck("RPC-14: a listed-nowhere user is refused 403, not allowed", status_of() == 403);
+    ck("...with an empty body, like Core", strstr(raw_out, "Content-Length: 0") != NULL);
+    post(req, sizeof req, port, "bitcoin", "bitcoin", "getblockcount"); raw_exchange(port, req);
+    ck("RPC-14: a second method is refused too (it is not per-method)", status_of() == 403);
+    /* the 403 must not depend on the body parsing: Core decides before it
+     * looks. An unparseable body from this user is still 403, not -32700. */
+    { char cred[64] = "bitcoin:bitcoin"; (void)cred;
+      char raw[512];
+      /* reuse post() for the headers, then overwrite the body with junk */
+      post(req, sizeof req, port, "bitcoin", "bitcoin", "help");
+      char* bodyp = strstr(req, "\r\n\r\n");
+      if (bodyp){
+          snprintf(raw, sizeof raw, "%.*s\r\n\r\n", (int)(bodyp - req), req);
+          /* Content-Length no longer matches; the server reads what arrives.
+           * What matters is that no JSON body follows at all. */
+          raw_exchange(port, raw);
+          ck("RPC-14: even an EMPTY body from that user is 403, not a parse error",
+             status_of() == 403);
+          if (status_of() != 403) printf("      got status %d\n", status_of()); }
+    }
+    stop(s);
+
+    /* THE OPPOSITE HALF: with the default explicitly 0 and no entries, the
+     * server must still serve everyone -- the fix must not deny by default. */
+    printf("== 3c. rpcwhitelistdefault=0 with no entries still allows ==\n");
+    s = spawn(NULL, "0", NULL, NULL, &port);
+    ck("server up", port > 0); if (port <= 0) return 1;
+    post(req, sizeof req, port, "bitcoin", "bitcoin", "help"); raw_exchange(port, req);
+    ck("rpcwhitelistdefault=0 with no entries answers 200", status_of() == 200);
+    stop(s);
+
+    /* and with NEITHER set, the historical behaviour is unchanged: no
+     * whitelist configured at all means no whitelisting. */
+    printf("== 3d. no whitelist and no default: unchanged ==\n");
+    s = spawn(NULL, NULL, NULL, NULL, &port);
+    ck("server up", port > 0); if (port <= 0) return 1;
+    post(req, sizeof req, port, "bitcoin", "bitcoin", "help"); raw_exchange(port, req);
+    ck("an unconfigured server still answers 200", status_of() == 200);
+    stop(s);
+
     printf("== 4. a 2-thread pool with a 4-deep queue serves a burst ==\n");
     s = spawn(NULL, NULL, "2", "4", &port);
     ck("server up", port > 0); if (port <= 0) return 1;
