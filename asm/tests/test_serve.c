@@ -111,6 +111,27 @@ int main(void){
     bind(ls,(struct sockaddr*)&a,sizeof a); socklen_t al=sizeof a; getsockname(ls,(struct sockaddr*)&a,&al);
     listen(ls,2);
 
+    /* ---- STO-10 fixture: a STALE hash -> height mapping, installed BEFORE the
+     * fork. It has to be here: the serve side runs in a forked child, so an
+     * idx_put made afterwards lands only in the parent's copy-on-write pages
+     * and the child never sees it. The first version of this test did exactly
+     * that -- the fixture assertions passed in the parent, the child answered
+     * notfound because the entry was simply ABSENT, and the case passed with
+     * the fix reverted. A vacuous test, caught by reverting.
+     *
+     * `ghost` is not any stored block's hash, mapped to height 0: exactly the
+     * shape a serve child's table has after a reorg it never learned about. */
+    static unsigned char ghost[32];
+    memset(ghost, 0xd0, sizeof ghost);
+    ghost[0] = 0xd1;
+    { int collides = 0;
+      for (int i = 0; i < TEST_NB; i++) if (!memcmp(ghost, bhash[i], 32)) collides = 1;
+      cki("STO-10 fixture: the ghost hash is not a real block hash", collides, 0); }
+    idx_put(idx, ghost, 0);
+    { long gh = -1; extern int idx_get(void* ix, const unsigned char h[32], long* height);
+      cki("STO-10 fixture: the stale mapping is in the index BEFORE the fork",
+          idx_get(idx, ghost, &gh) == 1 && gh == 0, 1); }
+
     pid_t pid=fork();
     if(pid==0){
         int c=accept(ls,0,0);
@@ -173,6 +194,36 @@ int main(void){
         if(matched<0) mall=0;
     }
     cki("multi-inv getdata: all blocks byte-exact", mall, 1);
+
+    /* ---- STO-10: never serve a block that is not the one requested --------
+     * ht_idx maps hash -> height and is built once, at process start.
+     * serve_idx_topup only ADDS heights, so a serve child forked before a
+     * reorg still maps the LOSING branch's hashes to fork+1..old_tip and
+     * never learns the replacements. The lookup then succeeds with a stale
+     * height and the archive returns whatever block now occupies it -- the
+     * WRONG block for the requested hash. Core drops a block it did not ask
+     * for and may score the peer for sending it.
+     *
+     * The stale mapping is reproduced directly: a hash that is NOT any stored
+     * block's hash is inserted pointing at height 0, which is exactly the
+     * shape a post-reorg child's table has. The request must come back
+     * notfound, not as block 0.
+     *
+     * This leaves the real entries untouched, so the assertions above keep
+     * their meaning. */
+    {
+      unsigned char gd[64]; long l = p2p_getdata_block(gd, ghost);
+      p2p_write(fd, "getdata", 7, gd, (unsigned)l);
+      char c5[12]; static unsigned char nbuf[1<<20]; unsigned nl = 0;
+      int r5 = p2p_read(fd, c5, nbuf, sizeof nbuf, &nl);
+      cki("STO-10: a hash whose index entry is stale is answered notfound",
+          r5 > 0 && strncmp(c5, "notfound", 8) == 0, 1);
+      if (r5 > 0 && strncmp(c5, "notfound", 8) != 0)
+          printf("      got cmd=%.8s len=%u (block 0 len=%ld) -- served the WRONG block\n",
+                 c5, nl, blen[0]);
+      cki("STO-10: and specifically NOT block 0's bytes",
+          !(nl == (unsigned)blen[0] && !memcmp(nbuf, blk[0], nl)), 1); }
+
 
     /* ---- NET-8: getheaders must walk the WHOLE locator ----
      * The handler used to look up only the FIRST locator hash and, on a miss,
