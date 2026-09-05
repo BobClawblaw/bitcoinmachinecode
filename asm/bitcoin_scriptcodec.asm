@@ -56,6 +56,32 @@ alignb 16                 ; alignb, not align: this is .tbss, padding bytes cann
 VFEXEC_MAX equ 5*1024*1024
 vfexec:     resb VFEXEC_MAX
 vfexec_sp:  resq 1
+; ---- IR-6 (INTERP_REVIEW_2026-09-05): position -> slot handle table -------
+; stack_erase_index shifted whole 524-byte records to close a hole, so a
+; tapscript of `<998> OP_ROLL` repeated cost O(rolls x records) in bytes
+; moved (~445 GB, ~10 s, for a 3.4 MB leaf -- a denial of service by a
+; consensus-VALID block). Core moves a 24-byte vector header instead.
+;
+; Records now stay put and POSITIONS move: hnd_tab[p] is the slot holding the
+; element at position p, so a roll rotates 4-byte handles. hnd_tab is always a
+; permutation of [0, MAX_STACK_SIZE), which is what lets pop/push reuse slots
+; without a free list: pop leaves its slot at hnd_tab[sp], push takes it back.
+;
+; The table belongs to ONE arena, hnd_base -- the MAIN stack, the only one
+; that rolls. Any other arena (the alt stack, and every caller outside
+; script_eval) matches nothing, falls through to identity, and behaves exactly
+; as it did before this change.
+;
+; script_eval registers the table on entry and, ONLY IF hnd_dirty, applies the
+; permutation to the records on exit, so every reader outside still finds
+; element p at elems + p*ELEM_SIZE with its data inline -- the ABI that
+; bitcoin_scriptverify.c's sv_rec/sv_len/sv_dat and five test harnesses use.
+; A script that never rolls leaves hnd_dirty clear and pays nothing, which is
+; what keeps IR-7's removal of the per-input arena traffic intact.
+global hnd_base, hnd_dirty, hnd_tab   ; TLS_ADDR's gottpoff needs them global
+hnd_base:   resq 1
+hnd_dirty:  resq 1
+hnd_tab:    resd MAX_STACK_SIZE
 ; IR-4 (INTERP_REVIEW_2026-09-05): Core's ConditionStack keeps the position
 ; of the FIRST false entry (or NO_FALSE), so "is every entry true" is one
 ; compare. vfexec_all_true used to scan the whole buffer on every opcode --
@@ -112,6 +138,144 @@ snum_overflow_addr:
 ; ============================================================================
 ; stack_depth(&sp) -> rax = *sp
 ; ============================================================================
+; ---- IR-6 handle layer ---------------------------------------------------
+; hnd_addr(rsi=elems, rdx=position) -> rax = that element's record address.
+; Falls back to elems + position*ELEM_SIZE when this arena has no table.
+; Clobbers rax only.
+hnd_addr:
+    push  rcx
+    push  rdx
+    TLS_ADDR rcx, hnd_base
+    cmp   rsi, [rcx]
+    jne   .direct
+    TLS_ADDR rcx, hnd_tab
+    mov   ecx, [rcx + rdx*4]
+    mov   rdx, rcx
+.direct:
+    imul  rdx, ELEM_SIZE
+    lea   rax, [rsi + rdx]
+    pop   rdx
+    pop   rcx
+    ret
+
+; hnd_of(rsi=elems) -> rax = table address, or 0 when this arena has none.
+hnd_of:
+    push  rcx
+    TLS_ADDR rcx, hnd_base
+    cmp   rsi, [rcx]
+    jne   .none
+    TLS_ADDR rax, hnd_tab
+    pop   rcx
+    ret
+.none:
+    xor   eax, eax
+    pop   rcx
+    ret
+
+; hnd_begin(rdi=main_elems) -> rax = 1 if this call registered the table (the
+; caller must pair it with hnd_end), 0 if a table was already registered --
+; a nested script_eval, which then simply runs on identity like the old code.
+global hnd_begin
+hnd_begin:
+    push  rcx
+    push  rdx
+    TLS_ADDR rcx, hnd_base
+    cmp   qword [rcx], 0
+    jne   .busy
+    mov   [rcx], rdi
+    TLS_ADDR rcx, hnd_dirty
+    mov   qword [rcx], 0
+    TLS_ADDR rcx, hnd_tab
+    xor   edx, edx
+.init:
+    mov   [rcx + rdx*4], edx
+    inc   rdx
+    cmp   rdx, MAX_STACK_SIZE
+    jb    .init
+    mov   eax, 1
+    pop   rdx
+    pop   rcx
+    ret
+.busy:
+    xor   eax, eax
+    pop   rdx
+    pop   rcx
+    ret
+
+; hnd_end(rdi=&sp, rsi=main_elems) -- put the records back in position order
+; (only if anything rolled) and unregister. Cycle-following: every record is
+; moved at most once, at most sp swaps, and only for a script that rolled.
+global hnd_end
+hnd_end:
+    push  rbx
+    push  r12
+    push  r13
+    push  r14
+    push  r15
+    TLS_ADDR rax, hnd_dirty
+    cmp   qword [rax], 0
+    je    .clear
+    mov   r12, [rdi]              ; sp
+    mov   r13, rsi                ; elems
+    TLS_ADDR r14, hnd_tab
+    xor   r15, r15                ; i
+    ; Apply the permutation in place: slot p must end up holding the record
+    ; for position p, and hnd_tab[p] says where that record is now. Walk each
+    ; cycle once, carrying one record in elem_tmp0, and mark visited entries
+    ; by setting hnd_tab[j] = j -- so every record moves at most once.
+    ;
+    ; (The first draft swapped hnd_tab[p] with hnd_tab[q] alongside the record
+    ; swap. That is wrong: exchanging the CONTENTS of slots p and q has to
+    ; update whichever entries HOLD the values p and q, not the entries AT
+    ; indices p and q. It produced the mirrored permutation -- the IR-6
+    ; vectors caught it, which is what they were written for.)
+.outer:
+    cmp   r15, r12
+    jae   .clear
+    mov   eax, [r14 + r15*4]
+    cmp   rax, r15
+    je    .nexti                  ; already home
+    mov   rax, r15
+    imul  rax, ELEM_SIZE
+    lea   rsi, [r13 + rax]
+    TLS_ADDR rdi, elem_tmp0
+    call  elem_move               ; carry = rec[i]
+    mov   rbx, r15                ; j = i
+.cyc:
+    mov   eax, [r14 + rbx*4]      ; k = hnd_tab[j]
+    mov   [r14 + rbx*4], ebx      ; hnd_tab[j] = j  (visited)
+    cmp   rax, r15
+    je    .cycend
+    mov   rcx, rax                ; k survives elem_move (it preserves rcx)
+    imul  rax, ELEM_SIZE
+    lea   rsi, [r13 + rax]        ; &rec[k]
+    mov   rax, rbx
+    imul  rax, ELEM_SIZE
+    lea   rdi, [r13 + rax]        ; &rec[j]
+    call  elem_move               ; rec[j] = rec[k]
+    mov   rbx, rcx                ; j = k
+    jmp   .cyc
+.cycend:
+    mov   rax, rbx
+    imul  rax, ELEM_SIZE
+    lea   rdi, [r13 + rax]
+    TLS_ADDR rsi, elem_tmp0
+    call  elem_move               ; rec[j] = carry
+.nexti:
+    inc   r15
+    jmp   .outer
+.clear:
+    TLS_ADDR rax, hnd_base
+    mov   qword [rax], 0
+    TLS_ADDR rax, hnd_dirty
+    mov   qword [rax], 0
+    pop   r15
+    pop   r14
+    pop   r13
+    pop   r12
+    pop   rbx
+    ret
+
 global stack_depth
 stack_depth:
     mov   rax, [rdi]
@@ -122,10 +286,11 @@ stack_depth:
 ; ============================================================================
 global stack_top_ptr
 stack_top_ptr:
-    mov   rax, [rdi]
-    sub   rax, 1
-    imul  rax, ELEM_SIZE
-    add   rax, rsi
+    push  rdx                  ; IR-6: position -> slot
+    mov   rdx, [rdi]
+    sub   rdx, 1
+    call  hnd_addr
+    pop   rdx
     ret
 
 ; ============================================================================
@@ -133,10 +298,11 @@ stack_top_ptr:
 ; ============================================================================
 global stack_second_ptr
 stack_second_ptr:
-    mov   rax, [rdi]
-    sub   rax, 2
-    imul  rax, ELEM_SIZE
-    add   rax, rsi
+    push  rdx                  ; IR-6: position -> slot
+    mov   rdx, [rdi]
+    sub   rdx, 2
+    call  hnd_addr
+    pop   rdx
     ret
 
 ; ============================================================================
@@ -144,10 +310,11 @@ stack_second_ptr:
 ; ============================================================================
 global stack_third_ptr
 stack_third_ptr:
-    mov   rax, [rdi]
-    sub   rax, 3
-    imul  rax, ELEM_SIZE
-    add   rax, rsi
+    push  rdx                  ; IR-6: position -> slot
+    mov   rdx, [rdi]
+    sub   rdx, 3
+    call  hnd_addr
+    pop   rdx
     ret
 
 ; ============================================================================
@@ -156,8 +323,9 @@ stack_third_ptr:
 ; ============================================================================
 global stack_elem_ptr
 stack_elem_ptr:
-    imul  rdx, ELEM_SIZE
-    lea   rax, [rsi+rdx]
+    sub   rsp, 8               ; IR-6
+    call  hnd_addr
+    add   rsp, 8
     ret
 
 ; ============================================================================
@@ -181,34 +349,34 @@ stack_push:
     push  r12
     push  r13
     push  r14
+    push  r15
     mov   r12, rdi            ; &sp
     mov   r13, rsi            ; elems
+    mov   r14, rdx            ; data
+    mov   r15, rcx            ; len
     mov   rax, [r12]
     cmp   rax, MAX_STACK_SIZE
     jae   .fail
-    imul  rax, ELEM_SIZE
-    add   rax, r13
-    mov   [rax], ecx          ; len
+    mov   rdx, rax            ; IR-6: the record for position sp
+    mov   rsi, r13
+    sub   rsp, 8
+    call  hnd_addr
+    add   rsp, 8
+    mov   [rax], r15d         ; len
     lea   rdi, [rax+ELEM_DATA_OFF]
-    mov   r14, rcx
-    test  r14, r14
-    jz    .copied
-.copy:
-    mov   r8b, byte [rdx]
-    mov   [rdi], r8b
-    inc   rdi
-    inc   rdx
-    dec   r14
-    jnz   .copy
-.copied:
+    mov   rsi, r14
+    mov   rcx, r15            ; rep movsb with rcx==0 is a no-op
+    rep   movsb
     inc   qword [r12]
     mov   eax, 1
+    pop   r15
     pop   r14
     pop   r13
     pop   r12
     ret
 .fail:
     xor   eax, eax
+    pop   r15
     pop   r14
     pop   r13
     pop   r12
@@ -223,27 +391,34 @@ stack_push_copy:
     push  r12
     push  r13
     push  r14
+    push  r15
     mov   r12, rdi
     mov   r13, rsi
+    mov   r15, rdx            ; src record (already an address)
     mov   rax, [r12]
     cmp   rax, MAX_STACK_SIZE
     jae   .fail
-    imul  rax, ELEM_SIZE
-    add   rax, r13
-    mov   r14d, [rdx]
+    mov   rdx, rax            ; IR-6
+    mov   rsi, r13
+    sub   rsp, 8
+    call  hnd_addr
+    add   rsp, 8
+    mov   r14d, [r15]
     mov   [rax], r14d
     lea   rdi, [rax+ELEM_DATA_OFF]
-    lea   rsi, [rdx+ELEM_DATA_OFF]
+    lea   rsi, [r15+ELEM_DATA_OFF]
     mov   rcx, r14
     rep movsb
     inc   qword [r12]
     mov   eax, 1
+    pop   r15
     pop   r14
     pop   r13
     pop   r12
     ret
 .fail:
     xor   eax, eax
+    pop   r15
     pop   r14
     pop   r13
     pop   r12
@@ -287,6 +462,27 @@ stack_swap_two:
                                 ; growing it moves neither operand.)
     mov   r12, rdi
     mov   r13, rsi
+    ; IR-6: with a handle table, swapping two POSITIONS is swapping two
+    ; 4-byte handles; the records do not move.
+    mov   rsi, r13
+    call  hnd_of
+    test  rax, rax
+    jz    .records
+    mov   rcx, [r12]
+    mov   edx, [rax + rcx*4 - 4]      ; handles[sp-1]
+    mov   r8d, [rax + rcx*4 - 8]      ; handles[sp-2]
+    mov   [rax + rcx*4 - 4], r8d
+    mov   [rax + rcx*4 - 8], edx
+    TLS_ADDR rax, hnd_dirty
+    mov   qword [rax], 1
+    add   rsp, 24
+    pop   r15
+    pop   r14
+    pop   r13
+    pop   r12
+    ret
+.records:
+    mov   rsi, r13
     TLS_ADDR rax, elem_tmp0
     mov   [rsp+0], rax
     TLS_ADDR rax, elem_tmp1
@@ -866,32 +1062,40 @@ stack_dup_index:
     push  r12
     push  r13
     push  r14
+    push  r15
     mov   r12, rdi
     mov   r13, rsi
+    mov   r15, rdx            ; raw_index
     mov   rax, [r12]
     cmp   rax, MAX_STACK_SIZE
     jae   .fail
-    ; src record = elems + raw_index*ELEM_SIZE
-    imul  rdx, ELEM_SIZE
-    add   rdx, r13            ; src
-    ; dst record = elems + sp*ELEM_SIZE
-    mov   rax, [r12]
-    imul  rax, ELEM_SIZE
-    add   rax, r13            ; dst
-    mov   r14d, [rdx]
+    mov   rdx, r15            ; IR-6: src is position raw_index
+    mov   rsi, r13
+    sub   rsp, 8
+    call  hnd_addr
+    add   rsp, 8
+    mov   r15, rax            ; src address
+    mov   rdx, [r12]          ; dst is position sp
+    mov   rsi, r13
+    sub   rsp, 8
+    call  hnd_addr
+    add   rsp, 8
+    mov   r14d, [r15]
     mov   [rax], r14d
     lea   rdi, [rax+ELEM_DATA_OFF]
-    lea   rsi, [rdx+ELEM_DATA_OFF]
+    lea   rsi, [r15+ELEM_DATA_OFF]
     mov   rcx, r14
     rep movsb
     inc   qword [r12]
     mov   eax, 1
+    pop   r15
     pop   r14
     pop   r13
     pop   r12
     ret
 .fail:
     xor   eax, eax
+    pop   r15
     pop   r14
     pop   r13
     pop   r12
@@ -910,6 +1114,38 @@ stack_erase_index:
     mov   r12, rdi
     mov   r13, rsi
     mov   r14, rdx            ; raw_index
+    ; IR-6: THE finding. Closing the hole used to shift every record above
+    ; the index -- 524 bytes each. With a table it shifts handles, 4 bytes
+    ; each, and the erased slot lands at handles[sp-1] where the next push
+    ; picks it up (the table stays a permutation of [0, MAX_STACK_SIZE)).
+    mov   rsi, r13
+    sub   rsp, 8
+    call  hnd_of
+    add   rsp, 8
+    test  rax, rax
+    jz    .records
+    mov   r11d, [rax + r14*4]         ; h = handles[idx]
+    mov   r8, [r12]
+    dec   r8                          ; last = sp-1
+    mov   r9, r14                     ; j = idx
+.hshift:
+    cmp   r9, r8
+    jae   .hdone
+    mov   edx, [rax + r9*4 + 4]
+    mov   [rax + r9*4], edx
+    inc   r9
+    jmp   .hshift
+.hdone:
+    mov   [rax + r8*4], r11d
+    TLS_ADDR rax, hnd_dirty
+    mov   qword [rax], 1
+    dec   qword [r12]
+    pop   r15
+    pop   r14
+    pop   r13
+    pop   r12
+    ret
+.records:
     mov   rax, [r12]          ; sp
     sub   rax, 1              ; last index
     ; move each element at index j in [raw+1 .. sp-1] down to j-1
@@ -968,6 +1204,43 @@ stack_insert_index:
     mov   rax, [r12]
     cmp   rax, MAX_STACK_SIZE
     jae   .fail
+    ; IR-6: opening the hole shifts handles, and the new element is written
+    ; into handles[sp] -- the slot the last pop/erase freed.
+    mov   rsi, r13
+    call  hnd_of
+    test  rax, rax
+    jz    .records
+    mov   r9, [r12]                   ; sp
+    mov   r11d, [rax + r9*4]          ; h = the free slot
+    mov   r10, r9                     ; j = sp
+.ishift:
+    cmp   r10, r14
+    jbe   .idone
+    mov   edx, [rax + r10*4 - 4]
+    mov   [rax + r10*4], edx
+    dec   r10
+    jmp   .ishift
+.idone:
+    mov   [rax + r14*4], r11d
+    mov   edx, r11d
+    imul  rdx, ELEM_SIZE
+    lea   rdi, [r13 + rdx]
+    mov   [rdi], r15d                 ; len
+    add   rdi, ELEM_DATA_OFF
+    mov   rsi, rbx
+    mov   rcx, r15
+    rep   movsb
+    TLS_ADDR rax, hnd_dirty
+    mov   qword [rax], 1
+    inc   qword [r12]
+    mov   eax, 1
+    pop   rbx
+    pop   r15
+    pop   r14
+    pop   r13
+    pop   r12
+    ret
+.records:
     ; j from sp-1 down to raw_index
     mov   rax, [r12]
     sub   rax, 1
