@@ -23,7 +23,11 @@ corner + the live re-run of the exact benchmark gate that caught it.
   branch; coordinate via main.
 
 ## TODO on this branch (my lane — disjoint files)
-- TXOQ-1: gettxout "not ready, retry shortly" persists on a quiesced store.
+- ~~TXOQ-1~~ FIXED e72e05d: root cause (CORRECTED from the sketch's guess) was
+  txoq_service sitting AFTER utxo_live_catchup in the worker loop -- a minutes-long
+  pass refused every 2s-timeout query. Between-block hook added (checkpoint-safe
+  boundary, reload reentrancy guarded); live proof rides the next sync.
+  (Old sketch line follows, struck:)
   Evidence: 2026-09-05 04:42-04:52, after clean restart + catch-up 100%,
   gettxout answered not-ready for 10+ min while heartbeats showed txouts
   live. Root cause (sketch rpc2-offline-open-no-exit + txoq1-*): the
@@ -33,8 +37,8 @@ corner + the live re-run of the exact benchmark gate that caught it.
   the live set). Files: asm/daemon/main.c (IPC), possibly utxo_live.c.
   Test: regtest — restart mid-WAL, gettxout answers within one service
   beat after catch-up. Benchmark gate: gettxout answers on quiesced store.
-- SC1: inbound child accepted during shutdown-window forks into a dying
-  parent -> child store_init race -> peer gets silence, child dies once.
+- ~~SC1~~ FIXED 5ba6c00: refuses accepts once g_shutdown_requested (Core's
+  close-listeners-then-drain shape), rate-limited log. Live proof: next stop.
   Fix: refuse accepts once g_shutdown_requested set; log errno in the
   store_init failure path. Files: asm/daemon/main.c accept site + child
   bootstrap (child is compiled into main.c; the sketch's "serve_child.c"
@@ -47,7 +51,7 @@ corner + the live re-run of the exact benchmark gate that caught it.
   (message already exists in utxo_setinfo_rpc.c but the params path
   bypasses it). Test: RPC call with height param -> error, not tip data.
   This is a WRONG-ANSWER bug: highest correctness priority on this list.
-- CSI-2 (NEW today): coinstats.dat stores ONE record (896 bytes, tip only)
+- ~~CSI-1~~ FIXED a936421 (refusal + 2 corners). CSI-2 (design): coinstats.dat stores ONE record (896 bytes, tip only)
   while getindexinfo claims synced=true — Core's index stores per-height
   digests (O(1) historical queries). Minimal fix: the index DOES store the
   per-height muhash it already computes incrementally — check the file
@@ -59,6 +63,8 @@ corner + the live re-run of the exact benchmark gate that caught it.
 - probe tool (D2 fixed), the store-open exit(1) items — those live with
   whichever session owns reload_ro snapshot semantics (RPC-3 sketch filed)
 
-## Order of attack
-CSI-1 (correctness, tiny) -> TXOQ-1 (benchmark gate) -> SC1 (small, racy
-test) -> CSI-2 (design decision, needs audit session).
+## Status at 2026-09-05 15:20 UTC
+CSI-1 DONE a936421 | TXOQ-1 DONE e72e05d (live proof deferred) | SC1 DONE
+5ba6c00 (live proof deferred) | RPC-1 IN-FLIGHT (audit session, rpc_server.c)
+| CSI-2 DOCUMENTED as limitation w/ seam (this push); implementation is a
+feature decision for the audit session (430 MB vs undo-replay design).
