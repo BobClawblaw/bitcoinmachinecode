@@ -956,6 +956,30 @@ static int g_txv_mempool_standard = 1;
 void txv_set_mempool_standard(int on){ g_txv_mempool_standard = on ? 1 : 0; }
 int  txv_get_mempool_standard(void){ return g_txv_mempool_standard; }
 
+/* tx_verify_at_height -- the CONSENSUS verifier at a given height, driven by
+ * a caller-supplied resolver.
+ *
+ * tx_verify_block_connect does this but resolves through the LSM, so it needs
+ * a live UTXO store; tx_verify_mempool takes a resolver but applies MEMPOOL
+ * flags (SCR-9's policy bits on top of the consensus set). Neither shape lets
+ * a test verify a historical transaction against the flags of ITS OWN block,
+ * which is exactly what the mined-transaction corpus
+ * (tests/test_txaccept_corpus.c) needs: a 2011 transaction has to be judged by
+ * 2011's rules, and several real ones would be rejected under today's.
+ *
+ * Same body, same flag source, same maturity anchor as the block-connect path
+ * -- only the resolver differs. The block-hash argument to
+ * script_flags_for_block matters for exactly one mainnet block (Core's
+ * taproot exception at 692,261); callers that care pass it, and the corpus
+ * avoids that height rather than pretend zeros are right there.
+ */
+int tx_verify_at_height(const u8* tx, u64 txlen, long height,
+                        txv_resolve_fn rf, void* rctx, const char** reason){
+    static const u8 zero32[32];
+    unsigned long long flags = script_flags_for_block((unsigned long long)height, zero32);
+    return txv_connect_body(tx, txlen, height, flags, rf, rctx, reason);
+}
+
 int tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
                       txv_resolve_fn rf, void* rctx, const char** reason){
     static const u8 zero32[32];
