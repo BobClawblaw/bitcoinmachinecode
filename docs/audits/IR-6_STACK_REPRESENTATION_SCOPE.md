@@ -3,7 +3,7 @@
 Scoping report, 2026-09-05. Companion to `INTERP_REVIEW_2026-09-05.md` (IR-6,
 HIGH) — the one finding of that review still open.
 
-**Status: scoped, correctness pinned, not started.** The fix is a change to the
+**Status: CLOSED (`4efb0c4`).** This document is kept as the reasoning behind the design that was chosen; the sections below were written before the change and describe why it had to be shaped this way. The fix is a change to the
 stack representation, and the representation is part of an ABI the daemon's C
 verifier and five test harnesses depend on. It wants its own branch, the
 differential harnesses extended first, and its own review.
