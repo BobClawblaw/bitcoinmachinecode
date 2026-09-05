@@ -333,9 +333,24 @@ long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen,
         if (pos > s->len) return LSM_MM_FALLBACK;   /* corrupt sparse offset */
     }
 
-    /* ---- linear scan forward from `pos` (records are sorted) ---- */
+    /* ---- linear scan forward from `pos` (records are sorted) ----
+     *
+     * UTX-9 (audit 2026-09-03): the bound was s->len, the whole MAPPING, not
+     * the records region. For a target greater than every key in the run --
+     * reached whenever the bloom passes, and a saturated 4 MiB filter on a
+     * 30M-record bulk run passes almost always -- the scan ran off the end of
+     * the records and into the SPARSE-INDEX TRAILER, parsing 44-byte index
+     * entries as records and skipping by whatever their bytes happened to say
+     * `slen` was. It stayed inside the mapping, so nothing was ever read out
+     * of bounds; the cost was wasted I/O and a false hit needing a 36-byte
+     * match at a garbage-aligned position. But "in bounds by luck of the
+     * layout" is not an invariant worth keeping.
+     *
+     * The records end where the sparse index begins; a run written without a
+     * sparse index has no trailer, so the mapping end is correct there. */
+    const u64 rec_end = s->sparse_off ? s->sparse_off : s->len;
     for (;;) {
-        if (pos + 37 > s->len) return LSM_MM_ABSENT;
+        if (pos + 37 > rec_end) return LSM_MM_ABSENT;
         const u8 *rec  = s->base + pos;
         int c    = cmp_key(rec, key);
         u8  kind = rec[36];
@@ -345,11 +360,11 @@ long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen,
             /* PUSH: value(8) slen(2) [height(4) is_coinbase(1) if rec_v2] */
             u64 vp = pos + 37;
             u64 vlen = s->rec_v2 ? 15 : 10;
-            if (vp + vlen > s->len) return LSM_MM_FALLBACK;
+            if (vp + vlen > rec_end) return LSM_MM_FALLBACK;   /* UTX-9 */
             const u8 *v = s->base + vp;
             u32 slen = (u32)(v[8] | (v[9] << 8));
             if (slen > SCRIPT_MAX_BYTES) return LSM_MM_FALLBACK;
-            if (vp + vlen + slen > s->len) return LSM_MM_FALLBACK;
+            if (vp + vlen + slen > rec_end) return LSM_MM_FALLBACK;   /* UTX-9 */
 
             *out_value = rd64(v);
             if (s->rec_v2) {
@@ -370,7 +385,7 @@ long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen,
         if (kind != 1) { pos += 37; continue; }      /* tombstone: header only */
         u64 vp = pos + 37;
         u64 vlen = s->rec_v2 ? 15 : 10;
-        if (vp + vlen > s->len) return LSM_MM_ABSENT;
+        if (vp + vlen > rec_end) return LSM_MM_ABSENT;   /* UTX-9 */
         const u8 *v = s->base + vp;
         u32 slen = (u32)(v[8] | (v[9] << 8));
         pos = vp + vlen + slen;

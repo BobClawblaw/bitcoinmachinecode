@@ -409,6 +409,41 @@ static void rebuild_hash_index_after_reorg(void){
         g_htidx_next = htidx_file_heights();
         fprintf(stderr,"[reorg] hash index rebuilt: %ld heights\n", (long)idx_count(ht_idx));
     }
+    /* ---- STO-9 (audit 2026-09-03): rewind headers.dat too ----
+     * Nothing here touched the header mirror, so after a reorg it kept the
+     * LOSING branch's headers at fork+1..old_tip, and dl_header_mirror_topup
+     * only ever appends above hst_count -- so the new blocks landed above the
+     * stale ones, with a prev that does not link to the record beneath them.
+     * archive_trim_derived_tails repairs it on the NEXT BOOT, which means a
+     * long-running node carries a mirror that disagrees with its own archive
+     * until it restarts.
+     *
+     * Truncating the file is enough: the top-up re-derives everything above
+     * what remains. Only the file is touched, not a mirror buffer -- unlike
+     * dlc_headers_rollback below, which also reloads the download worker's
+     * hst, and which this path has no handle for.
+     *
+     * The store tip IS the fork height on the mid-reorg invocation (the same
+     * property the watermark comment below relies on), so (tip+1)*112 is the
+     * record count to keep. Guarded by a size check so the post-reconnect
+     * invocation, where the mirror is already shorter, does nothing.
+     *
+     * Same process as the top-up and the connect path, so no writer races
+     * this truncate. */
+    { long rtip = (long)*(int*)((char*)store_buf + 24);
+      if (rtip >= 0){
+          off_t want = (off_t)(rtip + 1) * 112;
+          struct stat hst_stt;
+          if (stat("headers.dat", &hst_stt) == 0 && hst_stt.st_size > want){
+              if (truncate("headers.dat", want) != 0)
+                  fprintf(stderr, "[reorg] WARNING: could not roll headers.dat back to %ld records: %s -- the mirror keeps the losing branch until the next boot's self-heal\n",
+                          rtip + 1, strerror(errno));
+              else
+                  fprintf(stderr, "[reorg] headers.dat rolled back to %ld records (dropped %lld bytes of the losing branch)\n",
+                          rtip + 1, (long long)(hst_stt.st_size - want));
+          }
+      } }
+
     /* the txid-index tail's covered-height watermark must follow a
      * truncation too, or the reconnected blocks would be skipped as
      * already-indexed (fires with tip == fork height on the mid-reorg
