@@ -333,6 +333,8 @@ be_to_limbs:
 parse_varint:
     push  r12
     push  r13
+    push  rcx                 ; IR-10: `mov cl, r13b` below clobbered the
+                              ; caller's rcx -- verify_p2pkh counts inputs in it
     cmp   rdi, rsi
     jae   .pv_fail
     movzx eax, byte [rdi]
@@ -375,6 +377,7 @@ parse_varint:
 .pv_fail:
     xor   eax, eax
 .pv_ret:
+    pop   rcx
     pop   r13
     pop   r12
     ret
@@ -449,34 +452,77 @@ verify_p2pkh:
     cmp   [rbp-0x40], rax
     jae   .fail
     ; rdi = cursor at first input's prevout
+    ; IR-10 (INTERP_REVIEW_2026-09-05): every cursor advance is bounded by
+    ; the tx end (r14), and the two pushes by the scriptSig end (r11). Before
+    ; this, an empty scriptSig on the target input read sequence[0] = 0xff as
+    ; the sig length and walked ~250 bytes past the buffer; a first push byte
+    ; larger than the scriptSig, or an OP_PUSHDATA1 sig, fed a fabricated
+    ; length to der_parse_sig. Only direct pushes (1..75) are accepted --
+    ; anything else is refused, never misparsed.
     xor   ecx, ecx
 .walk:
     mov   r11, [rbp-0x40]
     cmp   rcx, r11
     jae   .found
-    add   rdi, 36            ; prevout+index
+    lea   rax, [rdi+36]
+    cmp   rax, r14
+    ja    .fail              ; prevout+index must fit
+    add   rdi, 36
     mov   rsi, r14
-    call  parse_varint       ; scriptSig len (rdi advanced past varint)
-    add   rdi, rax           ; skip scriptSig bytes
-    add   rdi, 4             ; sequence
+    call  parse_varint       ; scriptSig len (rdi advanced past varint; rcx preserved)
+    mov   r11, r14
+    sub   r11, rdi
+    cmp   rax, r11
+    ja    .fail              ; scriptSig must fit
+    add   rdi, rax
+    lea   rax, [rdi+4]
+    cmp   rax, r14
+    ja    .fail              ; sequence must fit
+    add   rdi, 4
     inc   rcx
     jmp   .walk
 .found:
     ; rdi = cursor at target input's prevout
+    lea   rax, [rdi+36]
+    cmp   rax, r14
+    ja    .fail
     add   rdi, 36            ; -> scriptSig varint
     mov   rsi, r14
     call  parse_varint       ; scriptSig len, rdi at script bytes
+    mov   r11, r14
+    sub   r11, rdi
+    cmp   rax, r11
+    ja    .fail              ; scriptSig must fit in the tx
     mov   [rbp-0x78], rdi    ; script bytes start
     mov   [rbp-0x80], rax    ; scriptSig len
-    ; parse push0 (sig): <len> sig
+    lea   r11, [rdi+rax]     ; r11 = scriptSig end (bound for both pushes)
+    ; parse push0 (sig): <len> sig, direct push only
+    cmp   rdi, r11
+    jae   .fail
     movzx ecx, byte [rdi]
+    test  ecx, ecx
+    jz    .fail
+    cmp   ecx, 75
+    ja    .fail
+    lea   rax, [rdi+rcx+1]
+    cmp   rax, r11
+    ja    .fail
     mov   [rbp-0x88], rcx     ; sig len
     lea   rax, [rdi+1]
     mov   [rbp-0x90], rax     ; sig bytes
     add   rdi, rcx
     add   rdi, 1
-    ; push1 (pubkey): <len> pubkey ; we only need pub key bytes+len
+    ; push1 (pubkey): <len> pubkey, direct push only
+    cmp   rdi, r11
+    jae   .fail
     movzx ecx, byte [rdi]
+    test  ecx, ecx
+    jz    .fail
+    cmp   ecx, 75
+    ja    .fail
+    lea   rax, [rdi+rcx+1]
+    cmp   rax, r11
+    ja    .fail
     mov   [rbp-0x98], rcx     ; pub len
     lea   rax, [rdi+1]
     mov   [rbp-0xa0], rax     ; pub bytes
