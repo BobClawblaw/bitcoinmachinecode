@@ -7033,6 +7033,25 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
              * since boot, and says so in the log once per connection. */
             if(c>=0) peer_sock_buffers(c);
             if(c>=0) peer_inbound_deadline(c);        /* NET-3: idle peers cannot hold a slot forever */
+            if(c>=0 && g_shutdown_requested){
+                /* SC1 (2026-09-05, /mnt/2tbssd bmc-vs-Core benchmark): the
+                 * stop sequence was observed forking a child into a parent
+                 * that was already tearing down -- the accept fired in the
+                 * window between SIGTERM and the listener closing, and the
+                 * child inherited a half-torn-down address space. Core
+                 * closes its listeners first, then drains; we now refuse at
+                 * the accept the same way: one clean close, no fork, the
+                 * peer reconnects to whatever comes up next. Rate-limited:
+                 * a shutdown racing a connect flood must not flood the log. */
+                static long long last_stop_log_ms = 0;
+                long long nms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+                                 nms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
+                if(nms - last_stop_log_ms > 1000){
+                    fprintf(stderr,"[serve] shutting down -- refusing inbound %s\n", peerdesc);
+                    last_stop_log_ms = nms;
+                }
+                close(c); c = -1;
+            }
             if(c>=0) serve_idx_topup();
             if(c>=0 && upload_note_and_check(0)){
                 /* over -maxuploadtarget for this 24h window -- unless the
