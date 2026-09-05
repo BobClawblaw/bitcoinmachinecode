@@ -83,3 +83,5 @@ build_migrate_compact
 flush_wal_tail
 utxo_probe_one
 live_blocks
+repair_bip30_heights
+utxo_setinfo
