@@ -512,6 +512,47 @@ int main(void) {
         ck("RPC-5 all slots return when the waiters finish", rpc_lp_waiters_inflight() == 0);
     }
 
+    /* ---- RPC-10 (audit 2026-09-03): Core's reply framing ----
+     * Core appends "\n" to every reply body and this server did not, so the
+     * "bit-exact" claim was off by one byte. And it closes after every reply
+     * while never saying so, which makes an HTTP/1.1 keep-alive client
+     * (http.client, requests) see an unexpected EOF on its NEXT request.
+     *
+     * The newline is gated on there BEING a body -- section 11 above asserts a
+     * v2 notification's response ends exactly at the header terminator, and an
+     * unconditional append would emit a 1-byte body on a 204 and break it.
+     * That existing assertion is the guard, so it must keep passing. */
+    {
+        char req[512];
+        make_post(req, sizeof req, port, "bitcoin", "bitcoin",
+                  "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getblockcount\",\"params\":[]}", NULL);
+        int n = raw_exchange(port, req, strlen(req));
+        /* A 401 has no body and ends with the header terminator, so it
+         * satisfies "ends with a newline" and "Content-Length 0 == 0" for
+         * free -- the first draft of this used the wrong credentials and two
+         * of its three assertions passed vacuously on exactly that. Pin the
+         * 200 first so the rest cannot. */
+        ck("RPC-10 the reply still arrives", n > 0);
+        /* "jsonrpc", not "result": on a freshly-started daemon this answers
+         * -28 "Loading block index...", which is a perfectly real 200 body
+         * with no result key. Matching on "result" made this fail for the
+         * wrong reason. */
+        ck("RPC-10 ...as a 200 with a real body (not a 401)",
+           has_prefix(raw_out, "HTTP/1.1 200 OK") && has_substr(raw_out, "\"jsonrpc\""));
+        ck("RPC-10 Connection: close is announced", has_substr(raw_out, "Connection: close"));
+        ck("RPC-10 the body ends with Core's newline",
+           n > 0 && raw_out[strlen(raw_out) - 1] == '\n');
+        /* and the length header agrees with what was sent -- an appended byte
+         * that Content-Length did not count would hang a conforming client */
+        { const char* cl = strstr(raw_out, "Content-Length: ");
+          const char* be = strstr(raw_out, "\r\n\r\n");
+          if (cl && be){
+              long want = atol(cl + 16);
+              long got  = (long)strlen(be + 4);
+              ck("RPC-10 Content-Length counts the newline", want == got);
+          } else ck("RPC-10 Content-Length present", 0); }
+    }
+
     /* ---- teardown ---- */
     kill(srv, SIGTERM);
     waitpid(srv, NULL, 0);
