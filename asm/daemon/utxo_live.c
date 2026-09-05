@@ -2205,7 +2205,10 @@ static int undo_restore_cb(void* ctx, const u8 txid[32], u32 index, u64 value,
     return 1;
 }
 
-typedef struct { const u8* txid; int fatal; } del_created_ctx_t;
+/* UTX-10 (audit 2026-09-03): `skipped` counts created outputs the lookup
+ * below said were absent, so a rollback that silently removed nothing leaves
+ * a signal. See del_created_on_output. */
+typedef struct { const u8* txid; int fatal; long skipped; long seen; } del_created_ctx_t;
 
 extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index, u64* value,
                          unsigned long* height, unsigned long* is_coinbase,
@@ -2238,7 +2241,35 @@ static void del_created_on_output(void* ctxv, u32 out_index, u64 value,
         if (utxo_lsm_del(&g_utxo_lst, g_utxo_table, c->txid, out_index) < 0) c->fatal = 1;
         return;
     }
-    if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, c->txid, out_index, &v, &hh, &cb, &sc, &sl) != 1) return;
+    c->seen++;
+    if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, c->txid, out_index, &v, &hh, &cb, &sc, &sl) != 1){
+        /* ---- UTX-10 (audit 2026-09-03) ----
+         * The get-gate above is deliberate and stays: utxo_lsm_del tombstones
+         * and decrements the live counter unconditionally, so deleting an
+         * output that was never created (a partial apply that died before
+         * that tx's outputs landed) or already spent left the tally one low
+         * each time. Deleting unconditionally would reintroduce exactly the
+         * drift the comment above records fixing.
+         *
+         * But the gate also TRUSTS the lookup, and the 2026-09-01 incident
+         * was a lookup that lied. On that path a miss means "never created"
+         * and the delete is skipped in silence, which would leave a
+         * disconnected block's outputs live -- phantom coins -- with no
+         * signal at all unless g_store_inconsistent happened to be set
+         * already. Counting the skips does not change the tally and gives
+         * the callers something to report.
+         *
+         * The three callers word it differently ON PURPOSE. Ghost rollback
+         * exists precisely because an apply died partway through, so some
+         * created outputs never landed and absence is the NORMAL case --
+         * tests/test_utxo_crash_recovery hits it every run (4 of 4, 3 of 6).
+         * Crying "the lookup is lying" there would be noise on a healthy
+         * crash recovery. The reorg rollback and unapply paths take a block
+         * that was FULLY applied, so every created output should still be
+         * present and a skip there is the incident's shape. */
+        c->skipped++;
+        return;
+    }
     /* copy the script BEFORE the del: get()'s pointer is only valid until
      * the next LSM call, and the remove-event needs the exact bytes */
     static u8 scbuf[10000];
@@ -2286,12 +2317,15 @@ static int rollback_unapplied_block(const u8* blockbuf, u64 blocklen, long h){
 
     int fatal = 0, torn = 0;
     long r = undo_replay_tolerant(h, undo_restore_cb, &fatal, &torn);
-    del_created_ctx_t dc = { 0, 0 };
+    del_created_ctx_t dc = { 0, 0, 0, 0 };
     int ok = walk_block_txs(blockbuf, blocklen, &dc, 0, del_created_on_output, &dc.txid, (u64)-1);
 
     g_undo_enabled = saved;
     g_apply_height = saved_apply;
 
+    if (dc.skipped)   /* UTX-10 */
+        fprintf(stderr, "[utxo_live] ghost-rollback h=%ld: %ld of %ld created outputs were already absent (expected -- the apply died partway through)\n",
+                h, dc.skipped, dc.seen);
     if (r < 0 || fatal || !ok || dc.fatal) {
         fprintf(stderr, "[utxo_live] ghost-rollback FAILED at height %ld: restore r=%ld fatal=%d walk ok=%d del_fatal=%d -- state may be inconsistent\n",
                 h, r, fatal, ok, dc.fatal);
@@ -2314,10 +2348,13 @@ static void rollback_partial_apply(const u8* blockbuf, u64 blocklen, u64 upto_t_
         fprintf(stderr, "[utxo_live] rollback h=%ld: undo replay failed (r=%ld fatal=%d) -- state may be inconsistent\n",
                 height, r, fatal);
 
-    del_created_ctx_t dc = { 0, 0 };
+    del_created_ctx_t dc = { 0, 0, 0, 0 };
     int ok = walk_block_txs(blockbuf, blocklen, &dc, 0, del_created_on_output,
                             &dc.txid, upto_t_inclusive + 1);
     g_undo_enabled = saved;
+    if (dc.skipped)   /* UTX-10 */
+        fprintf(stderr, "[utxo_live] rollback h=%ld: %ld of %ld created outputs were ALREADY ABSENT and were not deleted -- if this is not a partial apply, the lookup is lying and the set may hold phantom coins\n",
+                height, dc.skipped, dc.seen);
     if (!ok || dc.fatal)
         fprintf(stderr, "[utxo_live] rollback h=%ld: created-output removal failed (ok=%d fatal=%d) -- state may be inconsistent\n",
                 height, ok, dc.fatal);
@@ -2492,10 +2529,13 @@ int utxo_live_unapply_block(const void* blockbuf, u64 blocklen, long height){
         return 0;
     }
 
-    del_created_ctx_t dc = { 0, 0 };
+    del_created_ctx_t dc = { 0, 0, 0, 0 };
     int ok = walk_block_txs((const u8*)blockbuf, blocklen, &dc, 0,
                             del_created_on_output, &dc.txid, (u64)-1);
     g_undo_enabled = saved;
+    if (dc.skipped)   /* UTX-10 */
+        fprintf(stderr, "[utxo_live] unapply h=%ld: %ld of %ld created outputs were ALREADY ABSENT and were not deleted -- if this is not a partial apply, the lookup is lying and the set may hold phantom coins\n",
+                height, dc.skipped, dc.seen);
     if (!ok || dc.fatal){
         fprintf(stderr, "[utxo_live] unapply height %ld: created-output removal failed (ok=%d fatal=%d)\n", height, ok, dc.fatal);
         return 0;
