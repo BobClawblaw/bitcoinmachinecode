@@ -158,6 +158,30 @@ int main(void){
             ab2_close(b2);
         }
     }
+    /* ---- a READ-ONLY opener of a v2 file must still work -------------- */
+    unlink("peers2.dat");
+    {
+        int fd = open("peers2.dat", O_RDWR|O_CREAT|O_TRUNC, 0644);
+        unsigned char h[16]; memset(h, 0, sizeof h); memcpy(h, "BMCADBK2", 8);
+        const int N = 5; h[8] = (unsigned char)N;
+        if (write(fd, h, 16) != 16){ printf("FAIL: ro v2 header\n"); return 1; }
+        for (int i = 0; i < N; i++){
+            unsigned char o[48]; memset(o, 0, sizeof o);
+            o[0] = BMC_NET_IPV4; o[1] = 4; o[2] = 9; o[3] = 9; o[4] = 0; o[5] = (unsigned char)i;
+            o[34] = 0x20; o[35] = 0x8d; o[36] = 1;
+            for (int k = 0; k < 4; k++) o[44+k] = (unsigned char)(FRESH >> (8*k));
+            if (write(fd, o, 48) != 48){ printf("FAIL: ro v2 record\n"); return 1; }
+        }
+        close(fd);
+        ab2_t* ro = ab2_open(".", 0);          /* read-only, file still v2 */
+        ck("read-only: a v2 file still opens (no upgrade, no NULL)", ro != NULL);
+        ck("read-only: every record is visible", ro && ab2_count(ro) == N);
+        if (ro){ bmc_addr_t a = v4(9,9,0,2,8333); ck("read-only: addresses are findable", ab2_find(ro, &a) >= 0); ab2_close(ro); }
+        /* and the file was NOT rewritten by the reader */
+        int fd2 = open("peers2.dat", O_RDONLY); unsigned char m[8];
+        ck("read-only: the reader left the file at v2", fd2 >= 0 && read(fd2, m, 8) == 8 && !memcmp(m, "BMCADBK2", 8));
+        if (fd2 >= 0) close(fd2);
+    }
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
 }
