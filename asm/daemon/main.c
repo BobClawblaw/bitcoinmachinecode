@@ -2133,6 +2133,23 @@ static void format_peer_version_info(char* out, size_t cap){
  *
  * Either way `pr->used = 1` at the end remains the publication point. */
 static void rpc_fill_peer_slot(int slot, const char* host){
+    /* NET-10: an OUTBOUND leg we established is a peer we have actually
+     * connected to -- Core's `tried`. Marking it here is what makes rule 2
+     * mean anything on a node with no legacy book to migrate: without it
+     * nothing would ever be tried, and eviction would have nothing to
+     * protect. Every caller of THIS wrapper is an outbound fill (the
+     * background dial, the initial pool fill, and the top-up).
+     *
+     * Deliberately NOT in rpc_fill_peer_slot_ex: the inbound path claims its
+     * slot through _ex directly, and marking an inbound peer tried would let
+     * anyone who dials US immunise their own address against eviction --
+     * exactly the capability NET-10 exists to remove. */
+    { ab2_t* b = addr_book();
+      if(b){
+          bmc_addr_t a;
+          if(bmc_addr_from_string_port(&a, host, 0) && bmc_addr_is_routable(&a))
+              ab2_mark_tried(b, &a);
+      } }
     rpc_fill_peer_slot_ex(slot, host, 0);
 }
 static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claimed){

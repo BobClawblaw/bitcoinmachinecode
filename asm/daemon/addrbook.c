@@ -134,10 +134,39 @@ static int upgrade_v2(ab2_t* b){
     return 1;
 }
 
+/* A READ-ONLY opener of a not-yet-upgraded v2 file parses it in memory at the
+ * v2 stride instead of failing. Without this, on the single boot where the
+ * file is still v2 the serve children and the RPC parent would get NULL from
+ * ab2_open (no address book at all) until the writer got round to upgrading
+ * -- a real, if brief, degradation for a format change that is supposed to be
+ * invisible. Nothing is written here; the writer still performs the upgrade. */
+static long load_v2_readonly(ab2_t* b, const unsigned char h[AB2_HDR]){
+    struct stat st; if (fstat(b->fd, &st) != 0) return -1;
+    long by_size = (st.st_size - AB2_HDR) / AB2_REC_V2;
+    long by_hdr = (long)h[8] | ((long)h[9] << 8) | ((long)h[10] << 16) | ((long)h[11] << 24);
+    long n = by_hdr < by_size ? by_hdr : by_size;
+    if (n > AB2_MAX) n = AB2_MAX;
+    if (n < 0) n = 0;
+    b->n = 0;
+    for (long i = 0; i < n; i++){
+        unsigned char o[AB2_REC]; memset(o, 0, sizeof o);
+        if (pread(b->fd, o, AB2_REC_V2, AB2_HDR + i * AB2_REC_V2) != AB2_REC_V2) break;
+        if (!rec_unpack(&b->recs[b->n], o)) continue;   /* the v3 tail reads as zero */
+        if (ab2_find(b, &b->recs[b->n].a) >= 0) continue;
+        if (b->recs[b->n].a.net == BMC_NET_IPV4 && i < AB2_V2_TRIED_HEAD)
+            b->recs[b->n].flags |= AB2_F_TRIED;         /* same head rule as the upgrade */
+        hash_insert(b, b->n); b->n++;
+    }
+    return b->n;
+}
+
 static long load(ab2_t* b){
     unsigned char h[AB2_HDR];
     if (pread(b->fd, h, AB2_HDR, 0) != AB2_HDR) return -1;
-    if (!memcmp(h, AB2_MAGIC_V2, 8) && b->rw && !upgrade_v2(b)) return -1;
+    if (!memcmp(h, AB2_MAGIC_V2, 8)){
+        if (!b->rw) return load_v2_readonly(b, h);
+        if (!upgrade_v2(b)) return -1;
+    }
     if (pread(b->fd, h, AB2_HDR, 0) != AB2_HDR || memcmp(h, AB2_MAGIC, 8)) return -1;
     struct stat st; if (fstat(b->fd, &st) != 0) return -1;
     long by_size = (st.st_size - AB2_HDR) / AB2_REC;
