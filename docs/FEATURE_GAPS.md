@@ -2102,3 +2102,87 @@ declined features, the package-relay wire protocol, and — the one item
 worth treating as a priority — actually running a full, unconditional,
 `assumevalid=0` verification of this chain against Core, now that it is
 clear the routine sync path no longer does that by default.
+
+## Update 2026-09-05 — the four audit LOWs that are design gaps, not defects
+
+The 2026-09-03 audit's LOW tier is now closed. Four of its findings resisted
+being "fixed" because they are not defects — they are consequences of design
+decisions this node has made, and the right remediation is to state them
+plainly rather than patch around them. Each was re-verified against the code
+before being written down here; none is a restatement of the audit's text.
+
+### `prioritisetransaction` deltas are display-only (MEM-18)
+
+`prioritisetransaction` records a fee delta and `getprioritisedtransactions`
+lists it back, but the delta reaches **nothing that makes a decision**.
+`pri_delta_of` (`rpc_node.c:1531`) has exactly three consumers: `:1220`, where
+`getmempoolentry` reports `fees.modified`, and `:1661`/`:1687`, where the
+listing prints the deltas. Core applies `GetModifiedFee` to block assembly,
+eviction, RBF and the fee floors; here the policy layer has no delta concept at
+all, and the block template (`rpc_chain.c:1035`) uses `infs[i].fee`, the base
+fee.
+
+There is a second reason it could not work as-is even if the policy layer
+consulted it: the delta table is **parent-local**. It lives in the RPC process,
+while the download worker owns mempool admission and template construction, so
+a delta set over RPC is not visible to the process that would have to honour
+it. Wiring this properly means putting the deltas in the shared mempool state,
+not adding a lookup.
+
+An operator prioritising a transaction on this node changes what
+`getmempoolentry` prints and nothing else. That is the whole behaviour.
+
+### One execution lock behind every long wait (RPC-12)
+
+Every request runs `handle_request` under `g_exec_lock` (`rpc_server.c:808`
+and `:969`), so the RPC surface executes strictly one call at a time. The
+serial model is deliberate and is what the longpoll design is built on. The
+consequence that was never written down is what happens when the call in
+progress is a **slow** one:
+
+- `submitblock` waits up to 90 s for the worker;
+- `sendrawtransaction` likewise;
+- `importmempool` waits up to 90 s **per entry**, with no bound on entries;
+- `walletdisplayaddress` `popen`s HWI (`rpc_signer.c:80`) and waits for a
+  **human to press a button on a hardware wallet**.
+
+For the duration, every other RPC blocks — including `getblockcount` and
+including `stop`. A wedged worker turns the whole surface into a sequence of
+90-second timeouts. Core runs handlers concurrently on `-rpcthreads` and takes
+specific locks around specific state.
+
+This is not being changed here. Moving the signer or the channel waits outside
+the lock means those handlers execute concurrently with others against wallet
+and mempool state that the serial model currently protects for free, and that
+is a design change with its own correctness argument to make — not audit
+cleanup. What was wrong was that the cost was undocumented.
+
+### The wallet has no reorg awareness (WAL-13)
+
+`wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`
+(the format comment at `:36`). **There is no block hash.** A record therefore
+cannot be checked against the chain it came from: if a reorg replaces the block
+at that height, nothing in the wallet can notice.
+
+The visible consequence: until the operator re-runs `rescanblockchain`,
+`getbalance` and `listunspent` report an orphaned coin as confirmed, with a
+confirmation count that keeps *growing*, and a spend of it fails at broadcast.
+The file's own header explains why the scan runs forward in height order; it
+does not say what happens when history changes underneath it.
+
+Two things would have to change together: store the block hash per record and
+drop records whose `(height, hash)` no longer matches the header chain on read.
+Separately, `rescanblockchain` walks the whole archive on the single RPC thread
+— hours on mainnet, and per RPC-12 above, with the entire RPC surface blocked
+for the duration.
+
+### Inbound peer-slot claim race (RPC-13) — FIXED, not documented
+
+Listed here only to close the set: this one was a real defect and is fixed in
+code. `inbound_slot_claim` CAS'd `used` 0→1 to take a slot, and then
+`rpc_fill_peer_slot`'s `memset` zeroed `used` again for the duration of the
+fill — advertising the slot as free, so a sibling child could claim the same
+one. The loser's later `used = 0` would free the *winner's* entry.
+`rpc_fill_peer_slot_ex` now preserves an existing claim across the memset. The
+outbound path, which is not claimed by CAS and where zeroing `used` first is
+what stops a reader seeing a half-filled record, keeps the old behaviour.
