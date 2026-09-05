@@ -78,4 +78,8 @@ ibd_lsm
 ibd_backfill
 ibd_par
 build_utxo
+build_utxo_mt
+build_migrate_compact
+flush_wal_tail
+utxo_probe_one
 live_blocks

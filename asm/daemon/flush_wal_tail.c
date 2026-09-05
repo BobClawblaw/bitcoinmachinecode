@@ -63,7 +63,10 @@ int main(int argc, char** argv){
      * bookkeeping entirely (it applies records via the raw in-memory
      * primitives, bitcoin_utxo.asm), so op_count stays 0 after reload no
      * matter how many records were replayed. */
-    int slots_log2 = 22;
+    int slots_log2 = 24;   /* was 22: a build_utxo-scale WAL tail (~6M records)
+                            * exceeds 2^22's fill threshold (3.1M) and the
+                            * reload would stop at -2 with a truncated set.
+                            * 2^24 (fill 12.6M) holds any builder-scale tail. */
     unsigned long slots = 1UL << slots_log2;
     u64 blob_cap = 2UL*1024*1024*1024;
     long ustruct = utxo_struct_size(slots);
