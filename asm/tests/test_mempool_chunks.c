@@ -46,6 +46,7 @@ static int present(void* mp, const u8 id[32]){ unsigned long l; return mpool_get
 int main(void){
     static u8 pol[128], st[1<<20], mp[40 + 64*48 + 8], mblob[300], ux[40 + 256*48 + 8], ublob[1<<14];   /* the blob holds four ~70-byte txs */
     #define RESET() do{ memset(st,0,sizeof st); mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1); mpool_policy_set_acceptnonstd(pol, 1); \
+        { extern void mpol_policy_set_min_size(void*, unsigned); mpol_policy_set_min_size(pol, 0); } /* MEM-23: test-only, see test_mempool_policy.c */ \
         mpool_policy_state_init(st, 256); mpool_init(mp, 64, mblob, sizeof mblob); utxo_init(ux, 256, ublob, sizeof ublob); \
         for (int i=1;i<=8;i++){ u8 t[32]; memset(t,(u8)i,32); utxo_put(ux, t, 0, 1000000ULL, 0, 0, (const u8*)"\x51", 1); } }while(0)
     u8 coin[9][32]; for (int i=1;i<=8;i++) memset(coin[i], (u8)i, 32);

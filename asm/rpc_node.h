@@ -58,6 +58,17 @@ typedef struct {
  * whole package always fits in this buffer; a single transaction is bounded
  * far below it by MAX_STANDARD_TX_WEIGHT. */
 #define RPC_TXSUBMIT_MAX 404000
+/* RPC-20 (audit 2026-09-03): tx_txid needs a scratch buffer at least as large
+ * as the transaction's UNWITNESSED length (bitcoin_tx.asm). Three call sites
+ * in rpc_node.c sized it 2000*81+8 = 162,008 bytes while the staging buffer
+ * they read from is RPC_TXSUBMIT_MAX = 404,000 -- so a transaction between
+ * those two sizes failed tx_txid and was reported as -22 "TX decode failed"
+ * instead of reaching the worker and getting its real policy verdict. Only
+ * non-standard sizes are affected, and submitpackage already used a 1 MiB
+ * scratch (the correct example, sitting in the same file).
+ *
+ * Tied to the staging cap so the two cannot drift apart again. */
+#define RPC_TXID_SCRATCH (RPC_TXSUBMIT_MAX + 8)
 #define RPC_PKG_MAX      25          /* Core MAX_PACKAGE_COUNT */
 /* Core MAX_REPLACEMENT_CANDIDATES is the per-transaction ceiling; a package
  * of 25 could in principle displace more, but the list is diagnostic and a

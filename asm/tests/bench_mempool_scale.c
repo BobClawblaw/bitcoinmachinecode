@@ -86,6 +86,15 @@ int main(int argc, char** argv){
     static u8 pol[128];
     mpool_policy_init(pol, 0, 100000, 101000000, 100000, 101000000, 1);
     mpool_policy_set_acceptnonstd(pol, 1);
+    /* MEM-23 (2026-09-05): Core's 65-non-witness-byte floor is UNCONDITIONAL
+     * -- it mitigates CVE-2017-12842, so -acceptnonstdtxn does not switch it
+     * off, and as of that change neither does ours. These fixtures are
+     * ~60-byte synthetic transactions exercising mempool mechanics, not the
+     * size rule, so the floor is disabled HERE, explicitly and test-only,
+     * rather than by weakening the production path. No config option reaches
+     * this setter. */
+    { extern void mpol_policy_set_min_size(void*, unsigned);
+      mpol_policy_set_min_size(pol, 0); }
 
     unsigned cap = maxn + 1024;
     void* st = malloc(mpool_policy_state_size(cap));

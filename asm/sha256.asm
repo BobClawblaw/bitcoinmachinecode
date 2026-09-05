@@ -199,7 +199,8 @@ sha256_block:
     ; CRY-1 (audit 2026-09-03): the probe used to be CPUID.(EAX=1):ECX bit
     ; 29 -- which is F16C (half-precision conversion), NOT the SHA extension.
     ; The SHA flag is CPUID.(EAX=7,ECX=0):EBX bit 29, exactly what
-    ; sha256_nia.asm's cpu_has_sha_ni checks (the two had drifted). On every
+    ; the then-separate sha256_nia.asm's cpu_has_sha_ni checked (the two had
+    ; drifted -- that file is deleted as of CRY-6). On every
     ; Intel core from Ivy Bridge to Comet Lake -- F16C yes, SHA-NI no -- the
     ; old probe jumped into sha256_block_shani and SIGILL'd on the first
     ; sha256rnds2, i.e. on the FIRST hash of any binary in the tree. The fix
@@ -584,6 +585,32 @@ sha256_full:
 ; code must not run from data pages.
 ; ----------------------------------------------------------------------------
 
+; ============================================================================
+; sha256_force_path(int p) -- CRY-6 (audit 2026-09-03): pin the dispatcher.
+;   p = 0 -> re-probe on the next call (the normal, unprobed state)
+;   p = 1 -> SHA-NI accelerator
+;   p = 2 -> scalar sha256_block
+;
+; WHY THIS EXISTS. shani_ready is set once, from CPUID, and every hash in the
+; tree then takes one path for the life of the process. On a machine WITH the
+; SHA extensions -- which the gate box has -- the scalar body is therefore
+; never executed by `make test` at all, so a regression in it would ship
+; undetected. That is CRY-6's real point, and it cannot be closed by reading
+; the code: it needs the gate to run both bodies over the same vectors.
+;
+; Test-only. Nothing in the daemon calls it, and the default (0/unprobed) is
+; what every production start-up sees.
+; ============================================================================
+global sha256_force_path
+sha256_force_path:
+    mov  byte [rel shani_ready], dil
+    ret
+
+global sha256_current_path
+sha256_current_path:
+    movzx eax, byte [rel shani_ready]
+    ret
+
 global sha256_block_shani
 sha256_block_shani:
 movdqu xmm2, [rdi]
@@ -764,7 +791,8 @@ ret
 ;   F16C bit and jumped into the SHA-NI path on every Intel Ivy Bridge ->
 ;   Comet Lake core, SIGILL'ing on the first sha256rnds2.) Leaf 7 must be
 ;   probed only when the max leaf (CPUID.0:EAX) is >= 7. Kept here (not
-;   imported from sha256_nia.asm's equivalent cpu_has_sha_ni) so sha256.o has
+;   imported from the since-deleted sha256_nia.asm's cpu_has_sha_ni) so
+;   sha256.o has
 ;   no link-time dependency on the NIA module, which some binaries in the tree
 ;   do not link. Both encodings are exercised identical by tests/test_sha256.
 ; ============================================================================

@@ -260,6 +260,20 @@ static int wop_hdk_parse(const char* xprv, unsigned char k[32], unsigned char c[
                        ((unsigned)dec[2]<<8)|dec[3];
       if (v != 0x0488ADE4u && v != 0x04358394u) return 0; }
     if (dec[45] != 0x00) return 0;               /* private keys are 0x00-prefixed */
+    /* WAL-19 (audit 2026-09-03): the 32-byte scalar was accepted WITHOUT a
+     * range check, so an xprv whose key is 0 or >= n parsed as well-formed.
+     * Core rejects it -- CExtKey::Decode builds a CKey and IsValid() requires
+     * 0 < k < n -- and a key outside that range cannot sign, so importing one
+     * produces exactly the unspendable-but-reported-spendable coins the
+     * version check above this line exists to prevent.
+     *
+     * Unlike the rest of WAL-19 (an unreduced z, an unchecked k == 0), this is
+     * not a 2^-128 accident: the scalar comes straight from an operator- or
+     * attacker-supplied string, so the invalid case is reachable by simply
+     * typing it. scalar_small_nonzero (bitcoin_keys.asm) is the tree's
+     * existing 0 < k < n predicate, already used by bip32_ckd_priv. */
+    { extern int scalar_small_nonzero(const unsigned char k[32]);
+      if (!scalar_small_nonzero(dec + 46)) return 0; }
     memcpy(c, dec + 13, 32);
     memcpy(k, dec + 46, 32);
     return 1;

@@ -460,6 +460,19 @@ static int addr_idx_build_script(unsigned char type_tag, const unsigned char has
 #define ADDR_IDX_MAX_MATCHES 200000
 
 #define WOP_COIN_CAP 200000
+
+/* RPX-9 (audit 2026-09-03): decoderawtransaction / converttopsbt /
+ * simulaterawtransaction refused anything over 200,000 bytes with
+ * "TX decode failed". Core decodes up to the block serialized-size limit
+ * (MAX_BLOCK_SERIALIZED_SIZE, consensus/consensus.h = 4,000,000), so a
+ * transaction Core happily decodes was rejected here as malformed -- and the
+ * error said DECODE FAILED, which is a claim about the bytes rather than
+ * about a limit, so a caller had no way to tell the two apart.
+ *
+ * These are pure DECODE paths: they inspect bytes and return JSON, admitting
+ * nothing to the mempool and relaying nothing, so the cap was never a policy
+ * bound. It is the consensus ceiling now. */
+#define RPC_DECODE_MAX_TX 4000000
 /* Core matures a coinbase at 100 confirmations; everything else is spendable
  * as soon as it is in a block, and the scan only records confirmed outputs.
  * A scan file older than format 3 carries no coinbase flag (wscan_flags_known
@@ -611,7 +624,8 @@ static int cmd_decoderaw(const rj_val* params, long* ec, const char** em, rj_val
     const char* hexstr = rpc_param_str(params, 0, ec, em);
     if (!hexstr) return 0;
     size_t hl = strlen(hexstr);
-    if (hl % 2 || hl / 2 < 10 || hl / 2 > 200000) { *ec = -22; *em = "TX decode failed"; return 0; }
+    if (hl % 2 || hl / 2 < 10 || hl / 2 > RPC_DECODE_MAX_TX) {   /* RPX-9 */
+        *ec = -22; *em = "TX decode failed"; return 0; }
     unsigned char* tx = malloc(hl / 2);
     if (!tx) { *ec = -7; *em = "out of memory"; return 0; }
     if (!hex_to_bytes(tx, hexstr, hl)) { free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
@@ -1036,6 +1050,16 @@ static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_va
 static int cmd_converttopsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     const char* hex = rpc_param_str(params,0,ec,em); if (!hex) return 0;
     size_t hl=strlen(hex);
+    /* RPX-9: this cap is NOT raised to RPC_DECODE_MAX_TX with
+     * decoderawtransaction's, deliberately. Everything below writes into the
+     * fixed `utx` buffer -- version, per-input stubs, the copied output
+     * region, locktime -- with no bounds check anywhere; the 200,000 ceiling
+     * IS the bound. Raising the input limit here without first bounds-checking
+     * the builder would convert a rejected-too-large into a .bss overrun,
+     * which is the SCR-10 shape exactly. decoderawtransaction could be raised
+     * safely because it mallocs to size and hands the bytes to rpc_chain's
+     * bounds-checked decoder; this one cannot, and bounding the builder is a
+     * separate change with its own test. */
     if ((hl&1)||hl/2<10||hl/2>200000){ *ec=-22; *em="TX decode failed"; return 0; }
     unsigned long txlen=(unsigned long)(hl/2);
     static unsigned char raw[200000];

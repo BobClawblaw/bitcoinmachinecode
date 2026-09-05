@@ -980,7 +980,16 @@ static void case_mempool(void){
     /* synthetic reorg fixtures are non-standard by construction: run under
      * Core's own regtest escape hatch (-acceptnonstdtxn). */
     { extern void mpool_policy_set_acceptnonstd(void*, unsigned);
-      mpool_policy_set_acceptnonstd(pol, 1); }
+      mpool_policy_set_acceptnonstd(pol, 1);
+    /* MEM-23 (2026-09-05): Core's 65-non-witness-byte floor is UNCONDITIONAL
+     * -- it mitigates CVE-2017-12842, so -acceptnonstdtxn does not switch it
+     * off, and as of that change neither does ours. These fixtures are
+     * ~60-byte synthetic transactions exercising mempool mechanics, not the
+     * size rule, so the floor is disabled HERE, explicitly and test-only,
+     * rather than by weakening the production path. No config option reaches
+     * this setter. */
+    { extern void mpol_policy_set_min_size(void*, unsigned);
+      mpol_policy_set_min_size(pol, 0); } }
     unsigned pol_n = 512;
     void* pol_state = malloc(mpool_policy_state_size(pol_n));
     mpool_policy_state_init(pol_state, pol_n);
@@ -1214,6 +1223,10 @@ static void case_mempool_ghosts(void){
     mpool_policy_init(pol, 0, 25, 101000, 25, 101000, 1);
     { extern void mpool_policy_set_acceptnonstd(void*, unsigned);
       mpool_policy_set_acceptnonstd(pol, 1); }
+    /* MEM-23: test-only floor opt-out -- see the note at the first policy
+     * setup in this file. */
+    { extern void mpol_policy_set_min_size(void*, unsigned);
+      mpol_policy_set_min_size(pol, 0); }
     unsigned pol_n = 512;
     void* pol_state = malloc(mpool_policy_state_size(pol_n));
     mpool_policy_state_init(pol_state, pol_n);
@@ -1269,6 +1282,10 @@ static void case_mempool_wired(void){
     mpool_policy_init(pol, 0, 25, 101000, 25, 101000, 1);
     { extern void mpool_policy_set_acceptnonstd(void*, unsigned);
       mpool_policy_set_acceptnonstd(pol, 1); }
+    /* MEM-23: test-only floor opt-out -- see the note at the first policy
+     * setup in this file. */
+    { extern void mpol_policy_set_min_size(void*, unsigned);
+      mpol_policy_set_min_size(pol, 0); }
     unsigned pol_n = 512;
     void* pol_state = malloc(mpool_policy_state_size(pol_n));
     mpool_policy_state_init(pol_state, pol_n);

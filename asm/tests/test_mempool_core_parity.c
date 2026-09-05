@@ -102,6 +102,7 @@ int main(void){
         memset(st,0,sizeof st); \
         mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 1); \
         if (nonstd) mpool_policy_set_acceptnonstd(pol, 1); \
+        { extern void mpol_policy_set_min_size(void*, unsigned); mpol_policy_set_min_size(pol, 0); } /* MEM-23: test-only, see test_mempool_policy.c */ \
         mpool_policy_state_init(st, 512); \
         mpool_init(mp, 256, mblob, sizeof mblob); \
         utxo_init(ux, 256, ublob, sizeof ublob); \

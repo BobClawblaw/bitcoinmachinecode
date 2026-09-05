@@ -561,6 +561,12 @@ static void peer_inbound_deadline(int fd){
 
 static int lsock_onion(int want_port, int* got_port){
     int l = socket(AF_INET,SOCK_STREAM,0);
+    /* DMN-14 (audit 2026-09-03): socket() was never checked. On failure `l` is
+     * -1, bind(-1) fails with EBADF, and the operator is told "bind failed" --
+     * a diagnosis pointing at the address and port when the real cause is fd
+     * exhaustion or an unavailable address family. Two minutes of the wrong
+     * investigation, for one branch. */
+    if (l < 0){ fprintf(stderr,"[net] socket() failed: %s\n", strerror(errno)); return -1; }
     if(l < 0) return -1;
     int one=1; setsockopt(l,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
     struct sockaddr_in a; memset(&a,0,sizeof a);
@@ -593,6 +599,12 @@ static int lsock_onion(int want_port, int* got_port){
 
 static int lsock(int port){
     int l = socket(AF_INET,SOCK_STREAM,0);
+    /* DMN-14 (audit 2026-09-03): socket() was never checked. On failure `l` is
+     * -1, bind(-1) fails with EBADF, and the operator is told "bind failed" --
+     * a diagnosis pointing at the address and port when the real cause is fd
+     * exhaustion or an unavailable address family. Two minutes of the wrong
+     * investigation, for one branch. */
+    if (l < 0){ fprintf(stderr,"[net] socket() failed: %s\n", strerror(errno)); return -1; }
     struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_port=htons((unsigned short)port);
     /* Core -bind: listen on one address instead of every interface. Empty (the
      * default) keeps the previous INADDR_ANY behaviour. A malformed value is
@@ -6620,6 +6632,37 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     if(g_cfg.n_rpcwhitelist)
         fprintf(stderr,"[rpc] %d rpcwhitelist entr%s; users without one may call %s\n", g_cfg.n_rpcwhitelist,
                 g_cfg.n_rpcwhitelist == 1 ? "y" : "ies", g_cfg.rpcwhitelistdefault == 0 ? "anything" : "nothing (rpcwhitelistdefault)");
+    /* RPC-15 (audit 2026-09-03): CREDENTIALS BEFORE THE LISTENER.
+     * These two blocks used to run AFTER rpc_server_start, leaving a window in
+     * which the port was accepting but no rpcauth entry was registered and no
+     * cookie had been written -- so a client with valid rpcauth credentials
+     * got 401, and only rpcuser/rpcpassword worked. Fail-closed, but wrong.
+     *
+     * It also removes a data race for free: g_rpcauth[] was being written
+     * while worker threads could already be reading it, unsynchronised. With
+     * the writes before the server starts, no worker exists yet.
+     *
+     * This is Core's own order -- InitRPCAuthentication() (cookie generation
+     * and rpcauth loading) runs at the top of StartHTTPRPC(), before
+     * RegisterHTTPHandler. The pidfile and startupnotify stay AFTER the bind,
+     * deliberately: their whole point is to signal that the node is up. */
+    /* -rpcauth: hashed credentials, so a fixed password need not sit in the
+     * config in plaintext. A malformed entry is REPORTED, never dropped. */
+    for (int i = 0; i < g_cfg.n_rpcauth; i++){
+        if (!rpc_auth_add(g_cfg.rpcauth[i]))
+            fprintf(stderr,"[rpc] rpcauth entry %d is malformed (want user:salt$hash) -- ignored\n", i + 1);
+    }
+    if (rpc_auth_count())
+        fprintf(stderr,"[rpc] %d rpcauth credential(s) loaded\n", rpc_auth_count());
+    if (g_cfg.rpccookie){
+        const char* cpath = g_cfg.rpccookiefile[0] ? g_cfg.rpccookiefile : ".cookie";
+        if (rpc_cookie_write(cpath))
+            fprintf(stderr, "[rpc] cookie authentication enabled (%s, mode 0600)\n", cpath);
+        else
+            fprintf(stderr, "[rpc] could not write the cookie file %s: %s -- "
+                            "rpcuser/rpcpassword remains the only way in\n", cpath, strerror(errno));
+    }
+
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){
         fprintf(stderr, "[rpc] server start failed: %s\n", err);
@@ -6640,22 +6683,6 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
         else     fprintf(stderr,"[boot] could not write -pid=%s: %s\n", g_cfg.pidfile, strerror(errno));
     }
     if (g_cfg.startupnotify[0]) notify_run(g_cfg.startupnotify, "", "startupnotify");
-    /* -rpcauth: hashed credentials, so a fixed password need not sit in the
-     * config in plaintext. A malformed entry is REPORTED, never dropped. */
-    for (int i = 0; i < g_cfg.n_rpcauth; i++){
-        if (!rpc_auth_add(g_cfg.rpcauth[i]))
-            fprintf(stderr,"[rpc] rpcauth entry %d is malformed (want user:salt$hash) -- ignored\n", i + 1);
-    }
-    if (rpc_auth_count())
-        fprintf(stderr,"[rpc] %d rpcauth credential(s) loaded\n", rpc_auth_count());
-    if (g_cfg.rpccookie){
-        const char* cpath = g_cfg.rpccookiefile[0] ? g_cfg.rpccookiefile : ".cookie";
-        if (rpc_cookie_write(cpath))
-            fprintf(stderr, "[rpc] cookie authentication enabled (%s, mode 0600)\n", cpath);
-        else
-            fprintf(stderr, "[rpc] could not write the cookie file %s: %s -- "
-                            "rpcuser/rpcpassword remains the only way in\n", cpath, strerror(errno));
-    }
     /* -persistmempool: reload the dump the previous run left behind. Same
      * code the importmempool RPC uses, so the two cannot drift apart on the
      * format. A missing file is the ordinary case -- a fresh datadir, or a

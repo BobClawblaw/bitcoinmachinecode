@@ -23,12 +23,24 @@
  *   [topic] [body] [sequence u32 LE]
  * with the sequence counted PER TOPIC, so a subscriber can detect a drop.
  *
- * DROPPING IS CORRECT. A PUB socket must never stall its producer: this node
- * is a consensus daemon and a slow subscriber must not be able to hold up
- * block connection. Sockets are non-blocking and a subscriber whose buffer
- * is full has the message DROPPED, which is exactly what libzmq's PUB does
- * -- and why the per-topic sequence number exists, so the subscriber can see
- * that it happened.
+ * NOT STALLING IS CORRECT, and this node goes further than libzmq. A PUB
+ * socket must never hold up its producer: this is a consensus daemon and a
+ * slow subscriber must not be able to delay block connection. Sockets are
+ * non-blocking.
+ *
+ * MEM-22 (audit 2026-09-03): this paragraph used to say a full subscriber
+ * "has the message DROPPED, which is exactly what libzmq's PUB does". That
+ * is NOT what happens here. zp_publish (see the send failure below) CLOSES
+ * the subscriber's socket and drops the connection entirely; libzmq's PUB
+ * discards the individual message and keeps the peer attached.
+ *
+ * The behaviour is defensible -- a subscriber that cannot keep up would
+ * otherwise need unbounded buffering, and disconnection is a signal it can
+ * actually detect -- but it is a REAL DIVERGENCE from Core's ZMQ semantics,
+ * and a subscriber written against Core's will see its connection vanish
+ * rather than a gap in the per-topic sequence number. Recorded here and in
+ * docs/FEATURE_GAPS.md rather than left implied by a comment claiming the
+ * opposite.
  */
 #include <stdio.h>
 #include "log_ts.h"   /* timestamped fprintf(stderr), like every other daemon line */

@@ -566,6 +566,12 @@ because they were absent *checks* rather than absent features:
 - **no consensus `MAX_MONEY` check anywhere** — output values were summed as
   raw `u64` off the wire with no per-output or running bound (CVE-2010-5139
   shape). Now matching Core, verified against 1,172 real mainnet transactions.
+  *(VAL-16 flagged this line and README's matching claim as contradicting the
+  code. It did when the audit was written on 2026-09-03 — the check existed on
+  the mempool/RPC parser only, not the BLOCK path. VAL-2 closed that gap;
+  `daemon/utxo_live.c:916-955` now applies Core's `MAX_MONEY` on both arms of
+  the apply path. Re-verified 2026-09-05: the claim is true as written, so it
+  is left standing rather than corrected.)*
 - **no P2P message-size limit** — the framer acted on the announced length
   unbounded, so `0xFFFFFFFF` ground a serve child through ~4 GB of reads.
 - **inbound `inv`/`getdata` counts read as a single byte**, silently
@@ -1336,7 +1342,7 @@ that served BIP157 before this change must now set it explicitly.
 | `par` | Set the number of script verification threads (0 = auto, up to 15, <0 = leave that many cores free, default: 0… | implemented |
 | `peerblockfilters` | Serve compact block filters to peers per BIP 157 (default: 0) | implemented |
 | `peerbloomfilters` | Support filtering of blocks and transaction with bloom filters (default: 0) | accepted, no effect: BIP37 bloom filtering is not implemented; NODE_BLOOM is never advertised (Core's default is 0 too) |
-| `peertimeout` | Specify a p2p connection timeout delay in seconds. After connecting to a peer, wait this amount of time before… | implemented |
+| `peertimeout` | Specify a p2p connection timeout delay in seconds. After connecting to a peer, wait this amount of time before… | **NOT implemented** (DMN-14, 2026-09-05: this said "implemented". `daemon/main.c:543` states plainly that the timeout it *does* have is NOT Core's `-peertimeout`, which is a CONNECT timeout; nothing reads the option. See DMN-3.) |
 | `permitbaremultisig` | Relay transactions creating non-P2SH multisig outputs (default: 1) | implemented |
 | `persistmempool` | Whether to save the mempool on shutdown and load on restart (default: 1) | implemented |
 | `persistmempoolv1` | Whether a mempool.dat file created by -persistmempool or the savemempool RPC will be written in the legacy for… | accepted, no effect: mempool.dat is written in the current format only |
@@ -1415,8 +1421,8 @@ that served BIP157 before this change must now set it explicitly.
 | `zmqpubrawblockhwm` | Set publish raw block outbound message high water mark (default: 1000) | implemented |
 | `zmqpubrawtx` | Enable publish raw transaction in <address> | implemented |
 | `zmqpubrawtxhwm` | Set publish raw transaction outbound message high water mark (default: 1000) | implemented |
-| `zmqpubsequence` | Enable publish hash block and tx sequence in <address> | implemented |
-| `zmqpubsequencehwm` | Set publish hash sequence message high water mark (default: 1000) | implemented |
+| `zmqpubsequence` | Enable publish hash block and tx sequence in <address> | **REFUSED** (MEM-22, 2026-09-05: this said "implemented"; `node_config.c:950` rejects the option outright, and `zmq_pub.c` never publishes the topic. See the refusal's own comment for why: Core's `sequence` carries A/R alongside C/D, and this node has no single choke point for "removed" -- eviction, expiry and reorg each call `mpool_del` independently.) |
+| `zmqpubsequencehwm` | Set publish hash sequence message high water mark (default: 1000) | parsed, but inert -- the topic it sizes is refused (MEM-22) |
 ## Update 2026-09-01 — Miniscript and `musig()` descriptors
 
 Closed: **Miniscript** (`asm/miniscript.c/.h`, Core's `script/miniscript.h`
@@ -2013,7 +2019,10 @@ was never corrected.
 **What this means for every "verified against Core, zero divergences"
 claim from a normal sync:** the UTXO set, proof-of-work, block structure,
 and every non-script consensus rule are still checked for the whole chain
-— those claims stand. But under the default config, ONLY the top ~27,000
+— those claims stand. *(VAL-16, 2026-09-03, disputed this on the strength of
+VAL-1..VAL-6, which were open at the time. All six are closed as of the
+2026-09-05 remediation, so the sentence is accurate again; re-verified rather
+than re-worded.)* But under the default config, ONLY the top ~27,000
 of ~965,000 blocks have their scripts independently checked against Core
 during that sync; the ~938,000 below the assumevalid height are trusted,
 exactly as real Core trusts them by default. The stronger claim —

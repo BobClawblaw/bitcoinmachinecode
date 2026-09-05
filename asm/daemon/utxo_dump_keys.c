@@ -26,7 +26,17 @@ static void emit(void* ctx, const u8 key36[36], unsigned long value, unsigned lo
     char line[128]; int o = 0;
     for (int i = 31; i >= 0; i--){ line[o++] = H[key36[i] >> 4]; line[o++] = H[key36[i] & 15]; }
     unsigned vout = (unsigned)key36[32] | ((unsigned)key36[33] << 8) | ((unsigned)key36[34] << 16) | ((unsigned)key36[35] << 24);
-    int spendable = !(slen == 0 || (slen > 0 && script[0] == 0x6a) || slen > 10000);
+    /* UTX-11 (audit 2026-09-03): this carried an extra `slen == 0` term, so an
+     * EMPTY script was reported unspendable. Core's CScript::IsUnspendable
+     * (script/script.h) is
+     *     (size() > 0 && *begin() == OP_RETURN) || (size() > MAX_SCRIPT_SIZE)
+     * under which a zero-length script is SPENDABLE -- the first clause is
+     * guarded on size() > 0 precisely so it does not fire on the empty case.
+     * This tree's own bitcoin_utxo_stats.asm already agreed with Core, so the
+     * DIFF TOOL disagreed with the thing it audits, which is the worst place
+     * for a divergence to live: it would have reported a real mismatch as
+     * agreement, or invented one. */
+    int spendable = !((slen > 0 && script[0] == 0x6a) || slen > 10000);
     o += snprintf(line + o, sizeof line - o, " %u %lu %lu %d\n", vout, value, code >> 1, spendable);
     fwrite(line, 1, (size_t)o, stdout);
     if (++g_n % 20000000 == 0) fprintf(stderr, "[dump_keys] %ldM coins\n", g_n / 1000000);

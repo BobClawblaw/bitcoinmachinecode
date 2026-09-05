@@ -45,6 +45,7 @@ extern strip_witness_asm              ; slice 6 twin
 extern tapagg_verify_asm              ; slice 7 twin
 extern sv_verify_witness_v0           ; C (bitcoin_witness_v0.c) -- later slice
 extern sv_verify_script               ; C (bitcoin_scriptverify.c) -- later slice
+extern g_txv_script_checks            ; VAL-16: assumevalid short-circuit (daemon/tx_verify.c)
 
 %define LTV_CAP       (1 << 20)
 
@@ -185,6 +186,22 @@ txvb_verify_one_asm:
     mov  r15, [rax+BP_BUF]
     add  r15, [rbx+IN_SPKOFF]
 
+    ; ---- VAL-16 (audit 2026-09-03): the assumevalid short-circuit ----------
+    ; daemon/tx_verify.c:607 opens the equivalent C function with
+    ;     if (!g_txv_script_checks) return 1;
+    ; and this twin did not have it. Nothing in production drives this file
+    ; today -- tests/test_txv_dispatch_diff is its only caller -- so there was
+    ; no behavioural difference to observe. But the whole POINT of a
+    ; differential twin is that it answers identically to the original, and
+    ; the first differential run with assumevalid ON would have diverged on
+    ; every input: the C side returning 1 without evaluating, this side
+    ; evaluating. A twin that disagrees with its original under a documented
+    ; configuration is worse than no twin, because the diff is trusted.
+    cmp  dword [rel g_txv_script_checks], 0
+    jne  .checks_on
+    mov  eax, 1                          ; assumevalid: accept without evaluating
+    jmp  .out
+.checks_on:
     movzx eax, byte [rbx+IN_SHAPE]
     cmp  eax, SHAPE_P2TR
     je   .p2tr

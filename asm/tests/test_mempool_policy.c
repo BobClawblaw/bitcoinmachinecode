@@ -140,6 +140,60 @@ int main(void){
  * case reported "ok" while quietly incrementing the failure count. */
 #define okv(c, msg) do{ int _okv = (c) ? 1 : 0; \
     printf("  %s %s\n", _okv?"ok ":"FAIL", (msg)); if(!_okv) failures++; }while(0)
+    /* ---- MEM-23: the size floor binds in the PRODUCTION shape --------------
+     * The harness below turns the 65-non-witness-byte floor off so its ~60-byte
+     * synthetic fixtures still work. That escape hatch needs its own guard, or
+     * "the floor is unconditional" would be a claim nothing checks.
+     *
+     * Here: -acceptnonstdtxn ON, the test knob UNTOUCHED (its default), which
+     * is exactly what a node running with -acceptnonstdtxn looks like. A
+     * sub-65-byte transaction must still be refused. Before this change,
+     * accept_nonstd returned before the floor was ever consulted, so this
+     * would have been ACCEPTED -- Core rejects it, because the floor mitigates
+     * CVE-2017-12842 rather than expressing a standardness preference. */
+    printf("== MEM-23: the 65-byte floor is not switched off by -acceptnonstdtxn ==\n");
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<21];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 200, 10100000, 200, 10100000, 1);
+        mpool_policy_set_acceptnonstd(pol, 1);      /* and NOT set_min_size(0) */
+        POLICY_STATE_INIT(stbuf, 256);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        mpool_init(ux, 4096, ublob, sizeof ublob);
+
+        /* the smallest well-formed 1-in/1-out transaction: 60 non-witness
+         * bytes, i.e. under Core's floor */
+        unsigned char tiny[64]; int t = 0;
+        tiny[t++]=2;tiny[t++]=0;tiny[t++]=0;tiny[t++]=0;
+        tiny[t++]=1; memset(tiny+t, 0x33, 32); t += 32;
+        tiny[t++]=0;tiny[t++]=0;tiny[t++]=0;tiny[t++]=0;
+        tiny[t++]=0;
+        tiny[t++]=0xff;tiny[t++]=0xff;tiny[t++]=0xff;tiny[t++]=0xff;
+        tiny[t++]=1; memset(tiny+t, 0, 8); t += 8;
+        tiny[t++]=0;
+        tiny[t++]=0;tiny[t++]=0;tiny[t++]=0;tiny[t++]=0;
+        okv(t < 65, "MEM-23 fixture is under the 65-byte floor");
+
+        unsigned char tid[32]; memset(tid, 0x44, 32);
+        long r = mpool_policy_add(pol, stbuf, mp, tiny, (unsigned long)t, tid, ux);
+        /* NOTE: `r != 1` alone does NOT discriminate -- this synthetic tx is
+         * refused with the floor removed too, for an unrelated reason (its
+         * prevout is not in the injected UTXO set). Verified by reverting.
+         * The REASON is the assertion that matters, and it is the one that
+         * fails without the fix. Keeping the weaker check as a sanity guard,
+         * labelled so nobody reads it as evidence. */
+        okv(r != 1, "MEM-23: refused (does not discriminate on its own -- see below)");
+        okv(strstr(mpool_policy_reason(pol), "tx-size-small") != NULL,
+            "MEM-23: ...and the reason is tx-size-small (THIS is the discriminating check)");
+        if (strstr(mpool_policy_reason(pol), "tx-size-small") == NULL)
+            printf("      reason was \"%s\" -- the floor was skipped\n", mpool_policy_reason(pol));
+    }
+
     printf("== Core v31 cluster limits (too-large-cluster) ==\n");
     {
         static unsigned char pol[128];
@@ -740,6 +794,15 @@ static int run_scenario(int si,
      * Core's own regtest escape hatch (-acceptnonstdtxn) so this test
      * keeps exercising fee/graph mechanics, not IsStandardTx. */
     mpool_policy_set_acceptnonstd(pol, 1);
+    /* MEM-23 (2026-09-05): the 65-non-witness-byte floor is UNCONDITIONAL in
+     * Core -- it mitigates CVE-2017-12842, so -acceptnonstdtxn does not switch
+     * it off, and as of this change neither does ours. These fixtures are
+     * ~60-byte synthetic transactions whose whole purpose is fee and
+     * package-graph mechanics, so the floor is turned off HERE, explicitly,
+     * rather than by weakening the production rule. No config option reaches
+     * this; it is test-only. */
+    { extern void mpol_policy_set_min_size(void*, unsigned);
+      mpol_policy_set_min_size(pol, 0); }
     POLICY_STATE_INIT(stbuf, 256);
 
     /* structural mempool */
