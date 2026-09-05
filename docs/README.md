@@ -41,6 +41,7 @@ response to it.
 | [`audits/NET-10_ADDRMAN_SCOPE.md`](audits/NET-10_ADDRMAN_SCOPE.md) | scope note for the address-manager finding |
 | [`audits/IR-6_STACK_REPRESENTATION_SCOPE.md`](audits/IR-6_STACK_REPRESENTATION_SCOPE.md) | scope note for the interpreter review's one open finding: why OP_ROLL's cost is a representation change, and the order of work |
 | [`audits/INTERP_REVIEW_2026-09-05.md`](audits/INTERP_REVIEW_2026-09-05.md) | in-session code review of the script interpreter slice: 17 findings (1 CRITICAL, 5 HIGH), two live consensus false-accepts and three valid-block DoS shapes; all OPEN and unreproduced, with the order and discipline for closing them |
+| [`audits/DOCS_REVIEW_2026-09-05.md`](audits/DOCS_REVIEW_2026-09-05.md) | documentation consistency review of PR #11: 7 confirmed, all closed the same day; the reference systemd unit was publishing `LimitCORE=infinity` |
 
 ## Reports
 
