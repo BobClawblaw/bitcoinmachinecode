@@ -390,6 +390,33 @@ long strip_witness(const uint8_t* tx, int64_t txlen, uint8_t* out, long cap){
  * tests/test_bip143_diff.c to drive it beside the asm twin. */
 int swtx_parse_export(void* t, uint32_t* off){ return swtx_parse((swtx_t*)t, off); }
 
+/* ---- IR-5 (INTERP_REVIEW_2026-09-05): per-transaction sighash session ----
+ * Core's PrecomputedTransactionData computes hashPrevouts / hashSequence /
+ * hashOutputs ONCE per transaction. This function used to re-parse the tx and
+ * recompute all three on EVERY signature check: O(tx size) per signature,
+ * ~8.5 GB of SHA-256 per block from one valid 4 MWU transaction of ~14,600
+ * P2WPKH inputs.
+ *
+ * The memo is per-thread and scoped by a SESSION KEY the caller supplies --
+ * tx_verify.c hands every transaction a fresh 64-bit key when it lays it out
+ * and begins the session with that key before each of its inputs. The key,
+ * not the buffer address, is the identity: a different transaction placed at
+ * the same address (block buffers are reused) carries a different key and is
+ * a miss by construction. No session (key 0) means no caching, so a caller
+ * that never begins one is merely slower, never wrong. Any parse that is not
+ * stored invalidates the memo, because the parsed view points into the
+ * thread's offset table that the parse just overwrote. */
+static __thread uint64_t sw_session_key;
+void swsig_session_begin(uint64_t key){ sw_session_key = key; }
+void swsig_session_end(void){ sw_session_key = 0; }
+typedef struct {
+    uint64_t key; const uint8_t* tx; int64_t txlen;
+    swtx_t t;
+    int have_hp, have_hs, have_ho;
+    uint8_t hp[32], hs[32], ho[32];
+} sw_cache_t;
+static __thread sw_cache_t sw_cache;
+
 long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
                        int64_t n_in, uint32_t nHashType, uint64_t amount,
                        const uint8_t* scriptCode, uint64_t scriptcode_len,
@@ -410,7 +437,18 @@ long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
     static __thread uint32_t* soff; BMC_TLS_BUF(soff, SW_OFF_ENTRIES * sizeof(uint32_t));
 
     swtx_t t; t.tx = tx; t.txlen = txlen;
-    if (!swtx_parse(&t, soff)) return 0;
+    const uint64_t key = sw_session_key;
+    int cache_ok = (key != 0) && sw_cache.key == key && sw_cache.tx == tx && sw_cache.txlen == txlen;
+    if (cache_ok) t = sw_cache.t;                 /* offsets still in soff: no other parse since */
+    else {
+        if (!swtx_parse(&t, soff)) { sw_cache.key = 0; return 0; }
+        sw_cache.key = 0;                          /* soff overwritten: whatever was memoised is void */
+        if (key){
+            sw_cache.key = key; sw_cache.tx = tx; sw_cache.txlen = txlen; sw_cache.t = t;
+            sw_cache.have_hp = sw_cache.have_hs = sw_cache.have_ho = 0;
+            cache_ok = 1;
+        }
+    }
     if (n_in < 0 || n_in >= t.nin) return 0;
 
     uint32_t htype = nHashType & 0x1f;
@@ -425,23 +463,31 @@ long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
         /* hashPrevouts -- one indexed pass, 36 bytes per input, no parsing.
          * The cap check is the same one it always was (36*nin <= 4 MiB), just
          * hoisted out of the loop now that the count is known up front. */
-        if ((uint64_t)t.nin * 36u > SW_MIDSTATE_CAP) return 0;
-        size_t n = 0;
-        for (int64_t i=0;i<t.nin;i++){
-            memcpy(mbuf+n, sw_prevout(&t,i), 36); n += 36;
+        if (cache_ok && sw_cache.have_hp) memcpy(hashPrevouts, sw_cache.hp, 32);   /* IR-5 */
+        else {
+            if ((uint64_t)t.nin * 36u > SW_MIDSTATE_CAP) return 0;
+            size_t n = 0;
+            for (int64_t i=0;i<t.nin;i++){
+                memcpy(mbuf+n, sw_prevout(&t,i), 36); n += 36;
+            }
+            sha256d(hashPrevouts, mbuf, n);
+            if (cache_ok){ memcpy(sw_cache.hp, hashPrevouts, 32); sw_cache.have_hp = 1; }
         }
-        sha256d(hashPrevouts, mbuf, n);
         /* hashSequence -- likewise, 4 bytes per input straight out of the
          * transaction. Little-endian on the wire and little-endian in the
          * preimage, so w32le(...sw_seq()) is a copy; keep it written as the
          * decode/encode pair it is rather than assuming host byte order. */
         if (htype != SIGHASH_SINGLE && htype != SIGHASH_NONE){
-            if ((uint64_t)t.nin * 4u > SW_MIDSTATE_CAP) return 0;
-            n = 0;
-            for (int64_t i=0;i<t.nin;i++){
-                w32le(mbuf+n, sw_seq(&t,i)); n += 4;
+            if (cache_ok && sw_cache.have_hs) memcpy(hashSequence, sw_cache.hs, 32);   /* IR-5 */
+            else {
+                if ((uint64_t)t.nin * 4u > SW_MIDSTATE_CAP) return 0;
+                size_t n = 0;
+                for (int64_t i=0;i<t.nin;i++){
+                    w32le(mbuf+n, sw_seq(&t,i)); n += 4;
+                }
+                sha256d(hashSequence, mbuf, n);
+                if (cache_ok){ memcpy(sw_cache.hs, hashSequence, 32); sw_cache.have_hs = 1; }
             }
-            sha256d(hashSequence, mbuf, n);
         }
     }
     /* hashOutputs, hashed IN PLACE out of the transaction. An output's BIP143
@@ -455,9 +501,13 @@ long segwit_v0_sighash(uint8_t out32[32], const uint8_t* tx, int64_t txlen,
      * 4 MiB is above MAX_BLOCK_SERIALIZED_SIZE, so no transaction a valid
      * block can carry is refused. */
     if (htype != SIGHASH_SINGLE && htype != SIGHASH_NONE){
-        uint64_t olen; const uint8_t* obytes = sw_txout_range(&t, 0, t.nout, &olen);
-        if (olen > SW_MIDSTATE_CAP) return 0;
-        sha256d(hashOutputs, obytes, (int64_t)olen);
+        if (cache_ok && sw_cache.have_ho) memcpy(hashOutputs, sw_cache.ho, 32);   /* IR-5 */
+        else {
+            uint64_t olen; const uint8_t* obytes = sw_txout_range(&t, 0, t.nout, &olen);
+            if (olen > SW_MIDSTATE_CAP) return 0;
+            sha256d(hashOutputs, obytes, (int64_t)olen);
+            if (cache_ok){ memcpy(sw_cache.ho, hashOutputs, 32); sw_cache.have_ho = 1; }
+        }
     } else if (htype == SIGHASH_SINGLE && n_in < t.nout){
         uint64_t olen; const uint8_t* obytes = sw_txout_range(&t, n_in, n_in+1, &olen);
         if (olen > SW_MIDSTATE_CAP) return 0;
