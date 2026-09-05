@@ -419,6 +419,40 @@ static int ts_agg_hashes(const tapctx_t* c, const txview_t* t,
 /* Phase 2 slice 13b seams (2026-08-24): tx_parse and tx_seq are static;
  * exported so bitcoin_bip341.asm's twins use the SAME parse and the same
  * sequence accessor, isolating the serialization under test. */
+/* ---- IR-5 (INTERP_REVIEW_2026-09-05): per-transaction sighash session ----
+ * BIP341's four aggregates (sha_prevouts, sha_amounts, sha_scriptpubkeys,
+ * sha_sequences) are per TRANSACTION; ts_agg_hashes recomputed them, and
+ * tx_parse re-walked the tx, on every signature. Same scheme as
+ * bitcoin_segwit.c's: a per-thread memo keyed by the caller's session key
+ * (unique per transaction, handed out by tx_verify.c), never by address;
+ * key 0 = no caching. The parsed view points into ts_off, so any parse that
+ * is not memoised invalidates the memo. */
+static __thread uint64_t tap_session_key;
+void tapsig_session_begin(uint64_t key){ tap_session_key = key; }
+void tapsig_session_end(void){ tap_session_key = 0; }
+typedef struct {
+    uint64_t key; const uint8_t* tx; int64_t txlen; int64_t num_inputs;
+    txview_t t; int have_agg;
+    uint8_t hp[32], ha[32], hs[32], hq[32];
+} tap_cache_t;
+static __thread tap_cache_t tap_cache;
+
+/* scriptPubKey of input n_in in the packed list -- the one per-input value
+ * ts_agg_hashes produced alongside the aggregates. A compactsize walk, no
+ * hashing. */
+static int ts_spk_at_nin(const tapctx_t* c, const uint8_t** sp, uint64_t* sl){
+    const uint8_t* p = c->spks;
+    const uint8_t* run_end = c->spks + TS_SPK_RUN_CAP;
+    int ok = 1;
+    for (int64_t i = 0; i < c->num_inputs; i++){
+        uint64_t l = read_cs(&p, run_end, &ok);
+        if (!ok || ts_avail(p, run_end) < l) return 0;
+        if (i == c->n_in){ *sp = p; *sl = l; return 1; }
+        p += l;
+    }
+    return 0;
+}
+
 int ts_tx_parse_export(void* t, uint32_t* off){ return tx_parse((txview_t*)t, off); }
 uint32_t ts_tx_seq_export(const void* t, int64_t i){ return tx_seq((const txview_t*)t, i); }
 int ts_agg_hashes_export(const void* c, const void* t, uint8_t hp[32], uint8_t ha[32],
@@ -440,14 +474,37 @@ long taproot_sighash(uint8_t* out32, const tapctx_t* c, uint8_t* pre, long cap)
     BMC_TLS_BUF(ts_off, TS_OFF_ENTRIES * sizeof(uint32_t));
 
     txview_t t; t.tx = c->tx; t.txlen = c->txlen;
-    if (!tx_parse(&t, ts_off)) return 0;
+    const uint64_t key = tap_session_key;
+    int cache_ok = (key != 0) && tap_cache.key == key && tap_cache.tx == c->tx &&
+                   tap_cache.txlen == c->txlen && tap_cache.num_inputs == c->num_inputs;
+    if (cache_ok) t = tap_cache.t;
+    else {
+        if (!tx_parse(&t, ts_off)) { tap_cache.key = 0; return 0; }
+        tap_cache.key = 0;
+        if (key){
+            tap_cache.key = key; tap_cache.tx = c->tx; tap_cache.txlen = c->txlen;
+            tap_cache.num_inputs = c->num_inputs; tap_cache.t = t; tap_cache.have_agg = 0;
+            cache_ok = 1;
+        }
+    }
     if (c->n_in < 0 || c->n_in >= t.nin) return 0;
     if (c->n_in >= c->num_inputs) return 0;
 
     uint8_t h_prev[32], h_amt[32], h_spk[32], h_seq[32];
     const uint8_t* spk_nin = NULL; uint64_t spk_nin_len = 0;
-    if (!ts_agg_hashes(c, &t, h_prev, h_amt, h_spk, h_seq, &spk_nin, &spk_nin_len))
-        return 0;
+    if (cache_ok && tap_cache.have_agg){                                          /* IR-5 */
+        memcpy(h_prev, tap_cache.hp, 32); memcpy(h_amt, tap_cache.ha, 32);
+        memcpy(h_spk,  tap_cache.hs, 32); memcpy(h_seq, tap_cache.hq, 32);
+        if (!ts_spk_at_nin(c, &spk_nin, &spk_nin_len)) return 0;
+    } else {
+        if (!ts_agg_hashes(c, &t, h_prev, h_amt, h_spk, h_seq, &spk_nin, &spk_nin_len))
+            return 0;
+        if (cache_ok){
+            memcpy(tap_cache.hp, h_prev, 32); memcpy(tap_cache.ha, h_amt, 32);
+            memcpy(tap_cache.hs, h_spk, 32);  memcpy(tap_cache.hq, h_seq, 32);
+            tap_cache.have_agg = 1;
+        }
+    }
     if (!spk_nin) return 0;
 
     uint8_t ht = c->hash_type;

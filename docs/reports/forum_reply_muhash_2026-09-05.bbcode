@@ -1,0 +1,27 @@
+You are right about the substance, and I would rather show the numbers than argue the point.
+
+[b]What happened.[/b] On 2026-09-04 the fresh-install script compared our [tt]gettxoutsetinfo muhash[/tt] to Core's and printed PASS. Both values were empty strings. [tt][ "" = "" ][/tt] is true. The script was corrected the same day so that an empty side is a FAIL and never a PASS, but that alone did not re-make the comparison with two real values -- which is the gap you named.
+
+[b]What the claim actually rests on now.[/b] Core's oracle here runs [tt]coinstatsindex=1[/tt], so it can answer [tt]gettxoutsetinfo muhash <height>[/tt] for any height. That makes the comparison repeatable, and it has been repeated today against two independently synced datadirs -- the 2026-09-04 fresh-install benchmark node and the long-running node -- both at height 965,651:
+
+[code]
+height        965651
+muhash        f027b72a53c6c512fb1db2fb6b02e83981faf5705220ca26e90d96a50c7f29ce
+txouts        165342875
+total_amount  20079932.38323404
+[/code]
+
+Identical to Core on both, all fields. The check is now a script anyone with an oracle can run, [tt]validation/muhash_vs_core.sh[/tt]: it fetches both sides, refuses to compare if either is empty, and exits non-zero on any difference. It is in the tree and indexed from the docs.
+
+[b]On 963,967 specifically.[/b] That was the 2026-08-25 quiesced-height comparison. What was recorded then for this node -- muhash [tt]1e3c77ad25f40961f1f757a77960b7c49a5c7bd091597bd925d561a5c202c118[/tt], 165,726,554 txouts, 20,074,669.88462591 BTC -- is exactly what Core's oracle returns for height 963,967 today. What cannot be redone is [i]our[/i] side at that height from a live index: our coinstats index stores only the tip record, which is a documented limitation (CSI-2), not a hidden one. The fresh-sync result at 965,651 is the answer to "can it be re-established from nothing": yes, from a clean datadir, in the benchmark run.
+
+[b]Negative testing.[/b] Agreed, and it is the rule now rather than an idea: a test in this tree is not trusted until the fix is reverted and the test is watched to fail. Six tests were found this week that passed against the code they were written to catch; they were rewritten. Two more today were green for the wrong reason (a rejection for a different cause than the one claimed) and now assert the reason string as well as the verdict.
+
+[b]Your other points.[/b]
+[list]
+[li][b]Stranger handshake[/b] -- a raw probe that sends [tt]version[/tt] to the benchmark node receives [tt]version, wtxidrelay, sendaddrv2, verack[/tt] within the read window; the node answers strangers. Two separate things were wrong on our side: the probe tool in the tree is slow enough to be mistaken for a hang, and the long-running node on the host was started without a port of its own next to a Core node that holds 8333, so it has no inbound listener at all. The first is a tool defect, the second an operator error; neither is the protocol code, and both are being fixed as such.[/li]
+[li][b]Building from a fresh clone[/b] -- this was real. The gate's link audit only knew symbols from objects that already existed, so a fresh clone failed [tt]make test[/tt] before running a single test. Fixed today: the audit now reads unbuilt objects through the sources their make rules name; a fresh clone passes it in 2.3 seconds.[/li]
+[li][b]Commit squashing[/b] -- the history is not rewritten: every commit since the audit names its finding, its test and the result of reverting the fix, and the closure documents are derived from those messages. What changes is how work lands: from this batch on, each batch is one merge commit, so [tt]git log --first-parent main[/tt] reads as one line per batch, milestones carry annotated tags, and a short note per batch sits in [tt]docs/releases/[/tt]. The summary you want exists; the evidence under it stays.[/li]
+[/list]
+
+Everything above is in the public tree with the commands that produced it, so it can be checked rather than believed.
