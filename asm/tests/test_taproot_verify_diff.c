@@ -68,6 +68,23 @@ static u64 mk_tx(u8* o){
     return n;
 }
 
+
+/* both twins must return `want` (used where the verdict itself is the point) */
+static void expect(const char* nm, const u8* spk, const u8* const* wit, const u32* wl, u32 nwit,
+                   int want, const char* want_reason){
+    const char *rc_ = "", *ra_ = "";
+    int  c = taproot_verify_input(spk, wit, wl, nwit, txb, (int64_t)txl, 0, prevouts, amounts, spks, 1, &rc_);
+    long a = taproot_verify_input_asm(spk, wit, wl, nwit, txb, (int64_t)txl, 0, prevouts, amounts, spks, 1, &ra_);
+    compared++;
+    /* a rejection for the WRONG reason is a failure: the first draft of the
+     * empty-pubkey vector was "rejected" for control-block parity and looked
+     * green while testing nothing of what it claimed. */
+    int ok = (c == want) && (a == (long)want) &&
+             (want || (!strcmp(rc_, want_reason) && !strcmp(ra_, want_reason)));
+    if (ok) printf("ok: %s -> %d%s%s\n", nm, want, want ? "" : " ", want ? "" : rc_);
+    else { printf("FAIL %s: want %d '%s', C=%d ('%s') asm=%ld ('%s')\n", nm, want, want_reason?want_reason:"", c, rc_, a, ra_); fails++; }
+}
+
 int main(void){
     txl = mk_tx(txb);
     memset(prevouts, 0x31, sizeof prevouts);
@@ -136,6 +153,54 @@ int main(void){
             spk4[0]=0x51; spk4[1]=0x20; memcpy(spk4+2, q4, 32);
             const u8* wf[2] = { leaff, ctrl }; u32 wlf[2] = { 1, 33 };
             diff("tapscript evaluates false", spk4, wf, wlf, 2, 0, 1);
+        }
+        /* ---- IR-3 (INTERP_REVIEW_2026-09-05): the asm twin never read
+         * taproot_checksig_ctx.hard_fail after script_eval (and sized a
+         * 96-byte frame slot for a 104-byte ctx, so hard_fail landed in the
+         * dead err slot). Core's EvalChecksigTapscript FAILS THE SCRIPT for an
+         * invalid non-empty signature or an empty pubkey; only an empty sig
+         * with a non-empty pubkey pushes false. With an OP_NOT tail the stack
+         * ends truthy, so only the hard_fail read separates accept from
+         * reject. The C twin rejects; the asm twin accepted. */
+        {
+            /* leaf A: <32B x-only pk> OP_CHECKSIG OP_NOT, witness [bad sig64] */
+            static u8 leafA[35]; leafA[0]=0x20; memcpy(leafA+1, ipk, 32); leafA[33]=0xac; leafA[34]=0x91;
+            u8 lhA[32], mrA[32], qA[32]; static u8 spkA[34]; long twA;
+            static u8 ctrlA[33]; memcpy(ctrlA, ctrl, 33);
+            if (tap_leaf_hash(lhA, 0xc0, leafA, 35) == 1 &&
+                tap_merkle_root(mrA, lhA, 1, ctrlA, 33) == 1 &&
+                (twA = taproot_tweak_pubkey(qA, ipk, mrA)) >= 1){
+                ctrlA[0] = 0xc0 | (twA == 2);            /* BIP341 parity bit */
+                spkA[0]=0x51; spkA[1]=0x20; memcpy(spkA+2, qA, 32);
+                memcpy(spks+1, spkA, 34); memcpy(spks+36, spkA, 34);
+                static u8 badsig[64]; memset(badsig, 0x01, 64);
+                const u8* wA[3] = { badsig, leafA, ctrlA }; u32 wlA[3] = { 64, 35, 33 };
+                expect("IR-3 invalid sig + OP_NOT (hard fail, truthy stack)", spkA, wA, wlA, 3, 0, "p2tr tapscript checksig invalid");
+                /* control: EMPTY sig, same pubkey -> Core pushes false, OP_NOT
+                 * makes it true -> ACCEPT. Both twins must accept. */
+                const u8* wC[3] = { badsig, leafA, ctrlA }; u32 wlC[3] = { 0, 35, 33 };
+                expect("IR-3 control: empty sig + OP_NOT accepts", spkA, wC, wlC, 3, 1, NULL);
+            } else { printf("FAIL: IR-3 fixture A\n"); fails++; }
+            /* leaf B: OP_0 OP_0 OP_CHECKSIG OP_NOT -> empty pubkey is a hard
+             * fail in Core regardless of the signature. NOT an IR-3 vector,
+             * though the review listed it as one: the INTERPRETER refuses an
+             * empty tapscript pubkey itself (SCR-3, audit 2026-09-03), so
+             * script_eval returns 0 and the callback's hard_fail is never the
+             * deciding read. Kept as a control: both twins reject, and for
+             * the same reason. */
+            static u8 leafB[4] = {0x00, 0x00, 0xac, 0x91};
+            u8 lhB[32], mrB[32], qB[32]; static u8 spkB[34]; long twB;
+            static u8 ctrlB[33]; memcpy(ctrlB, ctrl, 33);
+            if (tap_leaf_hash(lhB, 0xc0, leafB, 4) == 1 &&
+                tap_merkle_root(mrB, lhB, 1, ctrlB, 33) == 1 &&
+                (twB = taproot_tweak_pubkey(qB, ipk, mrB)) >= 1){
+                ctrlB[0] = 0xc0 | (twB == 2);            /* BIP341 parity bit */
+                spkB[0]=0x51; spkB[1]=0x20; memcpy(spkB+2, qB, 32);
+                memcpy(spks+1, spkB, 34); memcpy(spks+36, spkB, 34);
+                const u8* wB[2] = { leafB, ctrlB }; u32 wlB[2] = { 4, 33 };
+                expect("IR-3 control: empty pubkey + OP_NOT rejected in the interpreter (SCR-3)", spkB, wB, wlB, 2, 0, "p2tr tapscript execution failed");
+            } else { printf("FAIL: IR-3 fixture B\n"); fails++; }
+            memcpy(spks+1, spk_ok, 34); memcpy(spks+36, spk_ok, 34);
         }
     } else { printf("FAIL: could not build the real taproot fixture\n"); fails++; }
 
