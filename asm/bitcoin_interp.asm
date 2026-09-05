@@ -1014,6 +1014,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_depth
@@ -1023,6 +1026,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_3dup:
@@ -1039,6 +1045,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_depth
@@ -1048,6 +1057,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_depth
@@ -1057,6 +1069,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_2over:
@@ -1073,6 +1088,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_depth
@@ -1082,6 +1100,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_2rot:
@@ -1140,6 +1161,9 @@ script_eval:
     add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
                                 ; wrote, not at it -- see op_toalt's comment
     call  stack_push
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, [rbp-0x98]
@@ -1151,6 +1175,9 @@ script_eval:
     add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
                                 ; wrote, not at it -- see op_toalt's comment
     call  stack_push
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_2swap:
@@ -1225,6 +1252,9 @@ script_eval:
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_depth:
@@ -1263,6 +1293,9 @@ script_eval:
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_nip:
@@ -1293,6 +1326,9 @@ script_eval:
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_pick:
@@ -1366,12 +1402,18 @@ script_eval:
     add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
                                 ; wrote, not at it -- see op_toalt's comment
     call  stack_push
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 .pkdup:
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, r14
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 .pk_fail:
     mov   rax, SCRIPT_ERR_INVALID_STACK_OPERATION
@@ -1471,6 +1513,9 @@ script_eval:
     add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
                                 ; wrote, not at it -- see op_toalt's comment
     call  stack_push
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, [rbp-0xA8]
@@ -1482,6 +1527,9 @@ script_eval:
     add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
                                 ; wrote, not at it -- see op_toalt's comment
     call  stack_push
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, [rbp-0xA0]
@@ -1493,6 +1541,9 @@ script_eval:
     add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
                                 ; wrote, not at it -- see op_toalt's comment
     call  stack_push
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_size:
