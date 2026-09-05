@@ -1422,6 +1422,17 @@ tests/test_lsm_flush_sparse: tests/test_lsm_flush_sparse.c $(UTXOLSMOBJS)
 # the tombstones. Both are gated: a repro that stops reproducing is news.
 tests/bitcoin_utxo_lsm_badsparse.o: bitcoin_utxo_lsm.asm
 	$(NASM) $(NASMFLAGS) -DLSM_REPRO_BAD_SPARSE -o $@ $<
+# test_lsm_manifest_cap -- 2026-09-05, the 964001 DEGRADED class: the reload's
+# manifest loader silently ZEROED the run table when the file's entry count
+# exceeded the caller's manifest_cap (424-run store vs the daemon's cap of
+# 256 -- three boots where every lookup missed). The loader now returns -3
+# (distinct from -1 I/O and -2 WAL-tail-over-fill) on any manifest-load
+# failure; utxo_live's UTX-2 check treats it as fatal with a message naming
+# the compaction remedy. Pins both directions: over-cap reload fails -3, the
+# same store under a sufficient cap loads fully.
+tests/test_lsm_manifest_cap: tests/test_lsm_manifest_cap.c $(UTXOLSMOBJS)
+	$(CC) $(CFLAGS) -o $@ tests/test_lsm_manifest_cap.c $(UTXOLSMOBJS) -lpthread
+
 tests/test_lsm_lost_tombstones: tests/test_lsm_lost_tombstones.c $(UTXOLSMOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/test_lsm_lost_tombstones.c $(UTXOLSMOBJS) -lpthread
 tests/test_lsm_lost_tombstones_bad: tests/test_lsm_lost_tombstones.c tests/bitcoin_utxo_lsm_badsparse.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o

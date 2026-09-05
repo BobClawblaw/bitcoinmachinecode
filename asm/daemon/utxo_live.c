@@ -2908,6 +2908,17 @@ int utxo_live_init(const char* dir){
                 "point permanently.\n"
                 "[utxo_live]   Fix: re-run with bulk sizing so the whole tail "
                 "fits, or drain the tail first with daemon/flush_wal_tail.\n");
+        if (have_prior_state && r == -3)
+            fprintf(stderr,
+                "[utxo_live] FATAL: the store's manifest could not be loaded "
+                "(unreadable, or more runs than this daemon's manifest cap of "
+                "%d).\n"
+                "[utxo_live]   Starting would mean a store with ZERO runs: "
+                "every lookup would miss -- the 2026-09-05 964001 failure "
+                "class.\n"
+                "[utxo_live]   Fix: compact first with "
+                "daemon/build_migrate_compact <datadir> <slots_log2> <blob_gb>.\n",
+                UTXO_LIVE_MANIFEST_CAP);
         return 0;
     }
 

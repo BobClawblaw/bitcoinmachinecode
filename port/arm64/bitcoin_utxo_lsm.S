@@ -2058,7 +2058,18 @@ mac_lsm_reload_impl:
 	str  xzr, [x19, #120]
 	str  xzr, [x19, #96]
 	str  xzr, [x19, #144]
-	b    .rl_manifest_done
+	/* Fail LOUDLY, not silently: this path means the manifest could not be
+	 * loaded (unreadable, magic mismatch, short read, or more entries than
+	 * the caller's manifest_cap -- e.g. a build_utxo-scale store handed to a
+	 * daemon sized for steady state). Falling through used to "succeed"
+	 * with manifest_n=0: every later lookup scanned ZERO runs and missed,
+	 * which surfaced as "missing/already-spent UTXO" at the first spend of
+	 * the first block (2026-09-05, store with 424 runs vs cap 256). -3 is
+	 * distinct from -1 (I/O) and -2 (WAL tail over fill): utxo_live's UTX-2
+	 * check treats any negative as fatal, and its message names the
+	 * compaction remedy. */
+	mov  x0, #-3
+	b    .rl_ret
 .rl_no_manifest:
 	str  xzr, [x19, #120]
 	str  xzr, [x19, #96]

@@ -2583,7 +2583,14 @@ mac_lsm_reload_impl:
     mov  qword [r12+120], 0
     mov  qword [r12+96], 0
     mov  qword [r12+144], 0
-    jmp  .rl_manifest_done
+    ; Fail LOUDLY, not silently: this path means the manifest could not be
+    ; loaded (unreadable, magic mismatch, short read, or more entries than
+    ; the caller's manifest_cap). Falling through used to "succeed" with
+    ; manifest_n=0: every later lookup scanned ZERO runs and missed -- the
+    ; 2026-09-05 964001 failure class (424-run store vs daemon cap 256).
+    ; -3 is distinct from -1 (I/O) and -2 (WAL tail over fill).
+    mov  rax, -3
+    jmp  .rl_ret
 .rl_no_manifest:
     mov  qword [r12+120], 0
     mov  qword [r12+96], 0
