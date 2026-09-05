@@ -25,6 +25,9 @@ extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned cha
 #include "rpc_wallet_ops.h"   /* output types: rpc_wops_type_path / rpc_wops_type_spk / rpc_wops_active_types */
 extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[64], unsigned index);
 extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20], unsigned char prog32[32]);
+extern int  wallet_validate_address_ex(const char* str, int* type_, unsigned char* version,
+                                      unsigned char h160[20], unsigned char* prog,
+                                      unsigned long progcap, unsigned long* proglen, int* witver);
 extern int  wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen);
 extern long wallet_decoderawtx(char* out, long cap, const unsigned char* tx, unsigned long txlen);
 extern int  wallet_base58check_decode(unsigned char* out, long cap, long* outlen, const char* str);
@@ -60,6 +63,8 @@ extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsig
 #define WAL_ADDR_P2SH    3
 #define WAL_ADDR_P2WSH   4
 #define WAL_ADDR_P2TR    5
+#define WAL_ADDR_UNKNOWN 6
+#define WAL_ADDR_WITNESS_UNKNOWN 7   /* WAL-9: bech32m witness v2..16 */
 
 static void* g_utxo_lst = NULL;
 static void* g_utxo_u = NULL;
@@ -275,19 +280,28 @@ static int cmd_getnewaddr(const char* method, const rj_val* params, const rpc_wa
 static int cmd_validate(const char* method, const rj_val* params, const rpc_wallet* w, long* ec, const char** em, rj_val** result) {
     const char* addr = rpc_param_str(params, 0, ec, em);
     if (!addr) return 0;
-    int type; unsigned char ver, h160[20], prog32[32];
-    memset(prog32, 0, 32);
-    int ok = wallet_validate_address(addr, &type, &ver, h160, prog32);
+    int type; unsigned char ver, h160[20], prog32[40];
+    unsigned long wprog_len = 0; int witver = -1;
+    memset(prog32, 0, sizeof prog32);
+    int ok = wallet_validate_address_ex(addr, &type, &ver, h160, prog32,
+                                        sizeof prog32, &wprog_len, &witver);
     /* Only P2PKH/P2SH/P2WPKH/P2WSH/P2TR are decodable destinations; an
      * unknown base58 version passes the checksum but is not a valid address
-     * (Core: isvalid=false), matching DecodeDestination. */
-    int valid = ok && type >= WAL_ADDR_P2PKH && type <= WAL_ADDR_P2TR;
+     * (Core: isvalid=false), matching DecodeDestination.
+     *
+     * WAL-9 (audit 2026-09-03): a bech32m address for witness version 2..16
+     * IS a valid destination to Core (WitnessUnknown), and this node answered
+     * isvalid:false -- a definite wrong answer about a well-formed address.
+     * It is accepted here now, and the scriptPubKey below is built the way
+     * Core's GetScriptForDestination builds it: OP_n PUSH<program>. */
+    int valid = ok && ((type >= WAL_ADDR_P2PKH && type <= WAL_ADDR_P2TR) ||
+                       type == WAL_ADDR_WITNESS_UNKNOWN);
     /* The scriptPubKey the address decodes to -- built once here rather
      * than only inside the validateaddress branch, because getaddressinfo's
      * real ismine/iswatchonly/ischange (below) need it too, to look the
      * address up in the wallet's own key window by the SAME identity the
      * wallet uses everywhere else. */
-    unsigned char s[34]; size_t sl = 0;
+    unsigned char s[42]; size_t sl = 0;   /* WAL-9: OP_n + len + up to 40 */
     if (valid){
         switch (type) {
             case WAL_ADDR_P2PKH:  s[0]=0x76;s[1]=0xa9;s[2]=0x14;memcpy(s+3,h160,20);s[23]=0x88;s[24]=0xac; sl=25; break;
@@ -295,6 +309,16 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
             case WAL_ADDR_P2WPKH: s[0]=0x00;s[1]=0x14;memcpy(s+2,h160,20);                                sl=22; break;
             case WAL_ADDR_P2WSH:  s[0]=0x00;s[1]=0x20;memcpy(s+2,prog32,32);                              sl=34; break;
             case WAL_ADDR_P2TR:   s[0]=0x51;s[1]=0x20;memcpy(s+2,prog32,32);                              sl=34; break;
+            case WAL_ADDR_WITNESS_UNKNOWN:
+                if (witver >= 2 && witver <= 16 && wprog_len >= 2 && wprog_len <= 40){
+                    s[0] = (unsigned char)(0x50 + witver);           /* OP_2 .. OP_16 */
+                    s[1] = (unsigned char)wprog_len;
+                    memcpy(s + 2, prog32, wprog_len);
+                    sl = wprog_len + 2;
+                } else {
+                    valid = 0;                                       /* cannot render it: not a destination */
+                }
+                break;
         }
     }
     rj_val* o = rj_obj();
@@ -303,20 +327,38 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
         if (valid) {
             /* Core echoes the CANONICAL encoding (bech32 lower-cased) */
             char canon[128]; canon[0] = 0; wallet_script_to_address(canon, sizeof canon, s, (long)sl);
+            /* WAL-9: wallet_script_to_address has no witness v2..16 arm, so it
+             * returns nothing for those and the raw input would be echoed --
+             * uppercase and all, where Core echoes the canonical form. bech32's
+             * canonical form IS all-lowercase (BIP173), and the string already
+             * passed a checksum that only verifies in one case, so lowering it
+             * is the canonical encoding rather than a guess at one. */
+            if (!canon[0] && type == WAL_ADDR_WITNESS_UNKNOWN){
+                size_t ci = 0;
+                for (; addr[ci] && ci + 1 < sizeof canon; ci++)
+                    canon[ci] = (addr[ci] >= 'A' && addr[ci] <= 'Z') ? (char)(addr[ci] + 32) : addr[ci];
+                canon[ci] = 0;
+            }
             rj_obj_set(o, "address", rj_str(canon[0] ? canon : addr));
             char spkhex[128]; bin_to_hex(spkhex, s, sl);
             rj_obj_set(o, "scriptPubKey", rj_str(spkhex));
             /* DescribeAddress: P2SH/P2WSH/P2TR are scripts; witness types carry
              * the program (P2WSH/P2TR use the 32-byte prog, not h160). */
+            /* WAL-9: Core reports isscript:false for WitnessUnknown -- it is
+             * not a script destination, it is an unrecognised witness output. */
             int isscript = (type == WAL_ADDR_P2SH || type == WAL_ADDR_P2WSH || type == WAL_ADDR_P2TR);
-            int isw      = (type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH || type == WAL_ADDR_P2TR);
+            int isw      = (type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH ||
+                            type == WAL_ADDR_P2TR   || type == WAL_ADDR_WITNESS_UNKNOWN);
             rj_obj_set(o, "isscript", rj_bool(isscript));
             rj_obj_set(o, "iswitness", rj_bool(isw));
             if (isw) {
                 const unsigned char* prog = (type == WAL_ADDR_P2WPKH) ? h160 : prog32;
-                size_t plen = (type == WAL_ADDR_P2WPKH) ? 20 : 32;
-                rj_obj_set(o, "witness_version", rj_numf("%u", (type == WAL_ADDR_P2TR) ? 1u : 0u));
-                char proghex[66]; bin_to_hex(proghex, prog, plen);
+                size_t plen = (type == WAL_ADDR_P2WPKH) ? 20
+                            : (type == WAL_ADDR_WITNESS_UNKNOWN) ? (size_t)wprog_len : 32;
+                unsigned wv = (type == WAL_ADDR_WITNESS_UNKNOWN) ? (unsigned)witver
+                            : (type == WAL_ADDR_P2TR) ? 1u : 0u;
+                rj_obj_set(o, "witness_version", rj_numf("%u", wv));
+                char proghex[82]; bin_to_hex(proghex, prog, plen);
                 rj_obj_set(o, "witness_program", rj_str(proghex));
             }
         } else {
@@ -710,8 +752,21 @@ static int cmd_verifymessage(const rj_val* params, long* ec, const char** em, rj
  * 0xfffffffe, else 0xffffffff. */
 enum { CRT_P2PKH=1, CRT_P2WPKH=2, CRT_P2SH=3, CRT_P2WSH=4, CRT_P2TR=5 };
 static long crt_addr_to_spk(const char* addr, unsigned char* spk){
-    int type=0; unsigned char ver=0, h160[20], prog[32];
-    if (!wallet_validate_address(addr, &type, &ver, h160, prog)) return 0;
+    int type=0; unsigned char ver=0, h160[20], prog[40];
+    unsigned long plen=0; int wv=-1;
+    if (!wallet_validate_address_ex(addr, &type, &ver, h160, prog, sizeof prog, &plen, &wv)) return 0;
+    /* WAL-9: a witness v2..16 output is OP_n PUSH<program>, exactly what Core's
+     * WitnessUnknown GetScriptForDestination emits. Refusing to build it is why
+     * sendtoaddress answered -5 for an address Core pays. Callers pass a
+     * 40-byte spk buffer; OP_n + push-len + 40 is 42, so the two long programs
+     * are bounded out rather than overrunning it. */
+    if (type == WAL_ADDR_WITNESS_UNKNOWN){
+        if (wv < 2 || wv > 16 || plen < 2 || plen > 38) return 0;
+        spk[0] = (unsigned char)(0x50 + wv);          /* OP_2 .. OP_16 */
+        spk[1] = (unsigned char)plen;
+        memcpy(spk + 2, prog, plen);
+        return (long)plen + 2;
+    }
     switch (type){
         case CRT_P2PKH:  spk[0]=0x76;spk[1]=0xa9;spk[2]=0x14;memcpy(spk+3,h160,20);spk[23]=0x88;spk[24]=0xac;return 25;
         case CRT_P2SH:   spk[0]=0xa9;spk[1]=0x14;memcpy(spk+2,h160,20);spk[22]=0x87;return 23;
