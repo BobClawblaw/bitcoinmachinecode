@@ -661,9 +661,27 @@ void txv_set_bulk_mode(int on){ (void)on; }
 typedef struct { u8 ok; char reason[64]; } txv_result_t;
 static txv_result_t g_txv_results[TXV_MAX_INPUTS];
 
+/* IR-5: per-transaction sighash session. Each transaction gets a fresh key
+ * when it is laid out; every per-input verify begins the session with it, so
+ * the BIP143 / BIP341 aggregate hashes and the parsed views are computed once
+ * per transaction per thread instead of once per signature. The key -- never
+ * the buffer address -- is the identity (bitcoin_segwit.c has the rationale). */
+extern void swsig_session_begin(u64 key);  extern void swsig_session_end(void);
+extern void tapsig_session_begin(u64 key); extern void tapsig_session_end(void);
+static u64  txv_fresh_tx_key(void){ static u64 ctr; return __atomic_add_fetch(&ctr, 1, __ATOMIC_RELAXED); }
+static void txv_session_begin(u64 k){ swsig_session_begin(k); tapsig_session_begin(k); }
+static void txv_session_end(void){ swsig_session_end(); tapsig_session_end(); }
+/* The block batch keys a transaction as (round << 32) | tx_index: the flat
+ * record already carries tx_index, so the record layout -- which the asm
+ * parse twin and its differential mirror byte for byte -- stays unchanged.
+ * The round id is drawn from the same counter, so it is >= 1 and the batch
+ * keys never collide with the plain per-tx keys txv_verify_all hands out. */
+static u64 g_txvb_round;
+
 typedef struct {
     const u8* tx; u64 txlen; unsigned long long flags;
     u64 lo, hi;
+    u64 key;                     /* IR-5: this transaction's session key */
 } txv_worker_arg_t;
 
 static void* txv_worker_thread(void* argp){
@@ -677,12 +695,14 @@ static void* txv_worker_thread(void* argp){
                                           * class of bug
                                           * test_scriptverify_thread_stress.c
                                           * was built to catch). */
+    txv_session_begin(a->key);                                   /* IR-5 */
     for (u64 i=a->lo;i<a->hi;i++){
         const char* r = 0;
         int ok = txv_verify_one(a->tx, a->txlen, i, a->flags, sv_work, 1<<20, &r);
         g_txv_results[i].ok = ok ? 1 : 0;
         if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(g_txv_results[i].reason, r, n); g_txv_results[i].reason[n]=0; }
     }
+    txv_session_end();
     return 0;
 }
 
@@ -698,15 +718,18 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
     if (nverify == 0) return 1;
 
     static char rbuf[64];
+    const u64 key = txv_fresh_tx_key();                            /* IR-5: one key per transaction */
 
     if (nverify < TXV_PARALLEL_MIN){
         static u8 sv_work[1<<20];
+        txv_session_begin(key);
         for (u64 i=0;i<nin;i++){
             const char* r = 0;
             if (!txv_verify_one(tx, txlen, i, flags, sv_work, 1<<20, &r)) {
-                *reason = r; return 0;
+                *reason = r; txv_session_end(); return 0;
             }
         }
+        txv_session_end();
         return 1;
     }
 
@@ -726,6 +749,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
         if (lo >= hi) break;
         args[spawned].tx = tx; args[spawned].txlen = txlen; args[spawned].flags = flags;
         args[spawned].lo = lo; args[spawned].hi = hi;
+        args[spawned].key = key;                                   /* IR-5 */
         if (bmc_pthread_create(&tids[spawned], txv_worker_thread, &args[spawned]) != 0){
             /* thread creation failed partway: whatever didn't get a thread
              * (including this one) stays at its zeroed g_txv_results slot
@@ -739,6 +763,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
 
     static u8 sv_work_main[1<<20];
     int all_ok = 1;
+    txv_session_begin(key);                                        /* IR-5: the inline sweep */
     for (u64 i=0;i<nin;i++){
         if (g_txv_results[i].ok) continue;
         if (g_txv_results[i].reason[0] != 0){
@@ -755,6 +780,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
             all_ok = 0; break;
         }
     }
+    txv_session_end();
     if (!all_ok) *reason = rbuf;
     return all_ok;
 }
@@ -1290,6 +1316,7 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
      * the spk pool for this block, so pool->buf is stable for the whole
      * verification pass. */
     const u8* spk = spk_pool->buf + in->spk_off;
+    txv_session_begin(((u64)g_txvb_round << 32) | in->tx_index);  /* IR-5 */
     if (!g_txv_script_checks) return 1;   /* assumevalid: the block-connect batch path skips evaluation too (missed on the first cut, 2026-09-01 13:10) */
     switch (in->shape){
     case TXV_SHAPE_P2TR: {
@@ -1395,6 +1422,7 @@ static void* txvb_worker_loop(void* argp){
             w->res[i].ok = ok ? 1 : 0;
             if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(w->res[i].reason, r, n); w->res[i].reason[n]=0; }
         }
+        txv_session_end();      /* IR-5: never leave a key set past the scope that owns it */
         sem_post(&g_txvb_done_sem);
     }
     return 0;   /* unreachable -- for(;;) above never exits, see this
@@ -1442,6 +1470,7 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
             res[i].ok = ok?1:0;
             if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(res[i].reason,r,n); res[i].reason[n]=0; }
         }
+        txv_session_end();      /* IR-5 */
         return;
     }
 
@@ -1477,6 +1506,7 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
         res[i].ok = ok ? 1 : 0;
         if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(res[i].reason, r, n); res[i].reason[n]=0; }
     }
+    txv_session_end();          /* IR-5 */
 }
 
 /* SCR-6 (audit 2026-09-03): per-tx sigop COST for the LAST
@@ -1737,6 +1767,8 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
     g_spk_pool.used = 0;   /* bump-reset: safe, every byte handed out below
                             * this call is freshly memcpy'd before any read */
     g_wit_pool.used = 0;   /* bump-reset the witness-item pool for this block */
+
+    g_txvb_round = txv_fresh_tx_key();   /* IR-5: this round's id, written before any worker is posted */
 
     /* ---- Phase 0/parse: expand every tx's inputs into the flat array. ---- */
     u64 base = 0;
