@@ -61,6 +61,9 @@ blast radius as B.
 
 ## What is already done
 
+The safety net is in place at both levels: directly through `script_eval`
+(below) and through `sv_run_v` in `test_checksig_diff` (step 1).
+
 `test_scr_interp_bounds` pins the correctness the change must preserve, so the
 refactor has a safety net before it starts:
 
@@ -77,9 +80,18 @@ representation change, and gets the revert-the-fix treatment then.
 
 ## The order of work
 
-1. Extend `test_svs_drv_diff` and `test_wv0_drv_diff` to compare **stack
-   contents** after rolling scripts, not only verdicts — the C and asm drivers
-   must stay byte-identical across the change.
+1. ~~Extend the driver differentials to compare stack contents.~~ **Corrected,
+   and done differently.** `test_svs_drv_diff` and `test_wv0_drv_diff` compare
+   verdicts only, and cannot do otherwise: `sv_verify_script` owns its stacks
+   internally, and both "drivers" call the same asm interpreter, so a change
+   inside the primitives moves both sides identically. The differential that
+   *does* compare stack contents byte for byte is `test_checksig_diff`, whose
+   `diff_run` memcmps `sp * ELEM_SIZE` after running a script through
+   `sv_run_v` with a caller-owned stack. Six rolling vectors (roll, roll+swap,
+   roll x3, tuck-after-roll, pick-after-roll, and the depth-0 no-op) were added
+   there, so the ABI contract the change must preserve — element `p` readable
+   at `elems + p*ELEM_SIZE`, data inline, after rolling — is asserted at that
+   level too, not only through `script_eval` directly.
 2. Decide A-with-normalisation versus B on the evidence of (1); B is closer to
    Core and admits an easier differential.
 3. Change the representation and every direct indexer in one branch.
