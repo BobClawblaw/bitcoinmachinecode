@@ -7,7 +7,7 @@
 **Counts:** 36 candidates → 22 after de-duplication → **17 kept** (14 CONFIRMED, 3 PLAUSIBLE, per the review's own verifier) → **5 refuted**.
 
 **Severity scale:** CRITICAL / HIGH / MEDIUM / LOW / INFO — assigned here by the project, not by the review tool.
-**Status:** every finding below is **OPEN and UNREPRODUCED in this tree.** The review's verifier is not the same thing as a failing test here. This tree has already shown that findings from careful reviewers can be already-fixed, understated, or come with a fix that introduces a bug; each one is to be reproduced with a test that is watched to FAIL before any code moves, per `docs/ENGINEERING_RULES.md`.
+**Status (as written, 2026-09-05 morning):** every finding below was OPEN and UNREPRODUCED. **See §7 for closure by ID** -- 12 of 17 closed the same day, each reproduced with a test watched to fail first. The review's verifier is not the same thing as a failing test here. This tree has already shown that findings from careful reviewers can be already-fixed, understated, or come with a fix that introduces a bug; each one is to be reproduced with a test that is watched to FAIL before any code moves, per `docs/ENGINEERING_RULES.md`.
 
 ---
 
@@ -159,3 +159,42 @@ These are listed so that a future pass does not re-raise them without new eviden
 **Close by ID.** When a finding closes, its commit message names it (`IR-1`), so `comm` against this file's ID list re-derives what is open. Narrative status tracking has already dropped a finding once (STO-10).
 
 **Don't trust this document more than the code.** Three of the 2026-09-03 audit's premises were false and four of its suggested fixes would have introduced bugs. Expect the same rate here.
+
+---
+
+## 7. Closure log
+
+Every closure below was reproduced with a test that was watched to FAIL against
+the unfixed object before the fix went in, then watched to pass, and the test is
+in the gate. Commits name the finding ID so `comm` against this file re-derives
+what is open.
+
+| ID | Status | Commit | Proof |
+|---|---|---|---|
+| IR-1 | **CLOSED** | `9952a1c` | 14 of 14 growing-op vectors accepted at the cap before; `STACK_SIZE` after. **17 sites, not 14** -- the review missed `OP_2ROT`'s two pushes and `OP_PICK`'s second path; the net-zero ops got the check too, since a refused push there is silent corruption |
+| IR-2 | **CLOSED** | `406a1b6` | a genuinely valid 70-byte DER with S ending in 0x01 and no hashtype byte verified on both twins, legacy and witness v0, before; rejected after; the 71-byte control still verifies. **Eleven caller sites, not three** -- `bitcoin_segwit.c` ×3, `bitcoin_checksig.asm` ×2, `bitcoin_multisig.asm`, the parity oracle and `verify_p2pkh`; callers that relied on the parser's optional-hashtype detection now read `sig[siglen-1]` themselves, as Core does |
+| IR-3 | **CLOSED** | `9df5e95` | `rc 0 vs 1` on the invalid-signature leaf before; both twins reject with the same reason after; the empty-signature control still accepts. **The empty-pubkey vector the review listed is not an IR-3 vector** -- the interpreter refuses it itself (SCR-3) before `hard_fail` is ever read; kept as a control |
+| IR-4 | **CLOSED** | `71b6de1` | 250,000-deep nested IF: **16,684 ms → 6.3 ms**. Core's `ConditionStack` (cached first-false position); the byte buffer stays as the SCR-2 backstop |
+| IR-7 | **CLOSED** | `1138aed` | proven dead rather than asserted: the arena was filled with `0xAA` instead of zero and 16 suites through `sv_verify_script` stayed green; then the memset went and the copies narrowed to `sp × ELEM_SIZE`, in C and the asm driver identically |
+| IR-8 | **CLOSED** | `fe3fb99` | unexecuted-branch and executed `OP_CODESEPARATOR` both admitted to the standard mempool before; refused after; witness v0 with the same flag still accepts (the sigversion gate); an IF/ENDIF without `0xab` accepts everywhere |
+| IR-9 | **CLOSED** | `3fcdbe8` | non-minimal-push and `OP_SUCCESSx` leaves admitted to the standard mempool before; refused after, consensus and `-acceptnonstdtxn` unchanged. New `taproot_verify_input_flags`; the 12-argument symbol stays as a zero-flags wrapper so the asm callers' stack frames remain valid. Only `MINIMALDATA` and `DISCOURAGE_OP_SUCCESS` pass through |
+| IR-10 | **CLOSED** | `a7c16c7` | empty-scriptSig tx flush against a `PROT_NONE` page: killed by signal 11 before, returns 0 after; a signed 3-input tx with a 253-byte scriptSig on input 0 fails to reach input 2 before, verifies after. `parse_varint` saves `rcx` itself |
+| IR-12 | **CLOSED** | `b7455a8` | `mov eax, edi` |
+| IR-13 | **CLOSED** | `b7455a8` | `S == N` reported `HIGH_S` (27) before, `NULLFAIL` (32) after -- Core's lax parser overflows `S >= N` to a zero signature; the `N/2+1 → HIGH_S` and `N/2 → low` controls hold |
+| IR-14 | **CLOSED** | `b7455a8` | oracle now Core's `CheckSignatureEncoding`; the parity test still agrees with the code under test |
+| IR-17 | **CLOSED** | `b7455a8` | header corrected after confirming `script_sigops_accurate` is the one that sets `accurate = true` |
+| IR-11 | tracked elsewhere | -- | all three functions already sit in `docs/ABI_STACK_ALIGNMENT.md`'s NEEDS-ENTRY-0 table (rows 156, 157, 170); not re-fixed here |
+| IR-15 | **accepted** | -- | the FindAndDelete in `sv_checksig` is required for plain `OP_CHECKSIG` (Core does it in the opcode handler) and is a no-op over an already-stripped slice inside `CHECKMULTISIG` (`bitcoin_interp.asm:3324-3336` strips every signature once, BASE only, as Core does). Removing the redundancy needs a "called from multisig" flag through the checksig callback ABI, for at most 20×20 scans per multisig. Correct; not worth the surface |
+| IR-16 | deferred | -- | a jump table is a dispatch-loop rewrite; the 73-compare chain costs on the order of 100 ns per opcode worst case and no valid-block shape makes it dominant. Its own change |
+| IR-5 | **OPEN** | -- | design scoped: the aggregate hashes are per-transaction but `sv_ctx` is built per input, so the cache must be a per-thread memo scoped by an explicit per-tx session that the block-connect and mempool entry points open -- an implicit (pointer, length) key could hit a stale entry from a different transaction at the same address, which is a false reject of a valid block. Touches `bitcoin_bip143.asm`'s aggregate section and `ts_agg_hashes` |
+| IR-6 | **OPEN** | -- | design scoped: a handle/index array over records so erase/insert/swap move 8-byte slots is a change to the stack representation every opcode touches; it wants the differential harnesses extended first |
+
+**12 of 17 closed; 2 accepted or tracked; 1 deferred; 2 open (both scoped).**
+
+## 8. Found while closing
+
+- **A fresh clone cannot pass `make test`.** The `link-check` prerequisite resolves "who defines symbol X" with `nm` over `*.o` files that exist; in a fresh checkout the asm objects do not exist yet and it does not assemble them itself, so every rule with an asm `.o` prerequisite looks unsatisfied and the gate aborts before running a test (observed twice, in two scratch worktrees, one with the daemon pre-built). The gate is only green on a warm tree. `scripts/makefile_link_audit.py`; its own lane.
+- **The gate log had no `MAKE_EXIT` line** because `make -j8 test` was launched bare; `scripts/gate_log_audit.py` rightly refuses to call that a finished run. Launch with `; echo MAKE_EXIT=$?` appended. The "crash report" it also flagged is `test_rpc_signer`'s deliberate *device wedged* child, present in every gate log.
+- **Two vectors in this closure were green for the wrong reason before they were caught**: the first IR-3 empty-pubkey control was rejected for control-block parity (a hard-coded `0xc0` where the tweak had odd parity), and IR-10's existing vector-5 case passed only because the bytes past the buffer happened to be mapped. `expect()` in `test_taproot_verify_diff` now fails a rejection for the wrong reason, and every taproot fixture derives its parity bit from the tweak.
+- **`pkill -f` / `pgrep -f` matches the shell issuing it.** Cost one killed session mid-cleanup. Match by pid and `/proc/<pid>/cwd`.
+- **An unquoted heredoc executed this document's code spans as shell** on the first attempt to write this section (every backtick span became a command substitution). Harmless in effect, caught by the noise it made, and the reason the section was rewritten through a quoted heredoc. Text that contains backticks is never passed through an unquoted heredoc.
