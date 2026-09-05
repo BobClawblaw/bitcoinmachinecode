@@ -971,15 +971,19 @@ means *nobody had dialled in*, not *nothing is listening*; and I read the
 different mistakes pointing the same wrong way. See the entry below.
 
 **Incidental audit resolution.** `docs/releases/2026-09-05-audits-closed.md`
-recorded `LimitCORE`/systemd hardening as an operator attestation that could
-not be checked from the tree, because no `.service` unit is in the repository.
+had, at that point, recorded `LimitCORE`/systemd hardening as an operator
+attestation not checkable from the tree, because no `.service` unit is in the
+repository.
 It can be checked from the *host*, and now has been: `systemctl show` reports
 `LimitCORE=0`, `NoNewPrivileges=yes`, `ProtectSystem=full`,
 `ProtectHome=read-only`, `PrivateTmp=yes` — the base unit's
 `LimitCORE=infinity` is overridden by the `50-hardening.conf` drop-in — and
 the running process shows `Max core file size 0` in `/proc/<pid>/limits`. The
 09-03 audit's closure was correct. The unit remaining outside version control
-is the real residual observation.
+was noted as the residual; later the same day the operator ruled it a local
+artifact, deliberately not vendored, and it is closed by that decision
+(`releases/2026-09-05-audits-closed.md`). `docs/OPERATIONS.md`'s reference
+unit now carries the hardening block so a node built from the docs gets it.
 
 
 ## 2026-09-05 (later): P2P moved to 8433 — and a correction, plus a config-precedence defect
