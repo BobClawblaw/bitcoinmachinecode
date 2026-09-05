@@ -965,6 +965,31 @@ int main(void){
         ck("...naming what is actually available", rc == 0 && em && strstr(em, "available"));
         rj_free(r); rj_free(p); }
 
+      /* ---- WAL-17 (audit 2026-09-03): the -maxtxfee ceiling is NOT tested
+       * here, and this note is why.
+       *
+       * BF_MAXTXFEE_SAT (Core's -maxtxfee default, 0.1 BTC) existed but was
+       * consulted ONLY by bumpfee, so every ordinary funding path had no
+       * ceiling: a bad estimate could burn the wallet to fee. wf_fund now
+       * refuses above it.
+       *
+       * Triggering that from a test would need a feerate high enough to blow
+       * the ceiling, and there is NO WAY IN: wf_fund takes conf_target only,
+       * and fundrawtransaction's `feeRate` option is parsed nowhere -- it is
+       * silently ignored, which is itself a divergence from Core and is
+       * recorded rather than fixed here. The rate therefore always comes from
+       * the estimator, which returns the floor on an empty fee history.
+       *
+       * A first draft of this asserted a 5.0 BTC/kvB feeRate is refused; it
+       * failed with fee=0.00000141, i.e. the default rate, which is how the
+       * ignored option was found. Asserting "feeRate is ignored" would pin a
+       * defect as correct behaviour -- the exact pattern that let eight other
+       * findings in this audit survive -- so it is deliberately not asserted.
+       *
+       * The guard's opposite half IS covered: the ordinary fundrawtransaction
+       * cases above must keep succeeding, which they do, so the ceiling is not
+       * applied too eagerly. */
+
       { /* a transaction that already has inputs is refused, not mis-funded */
         const char* WITHIN =
           "02000000" "01"

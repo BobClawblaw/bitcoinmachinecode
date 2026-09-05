@@ -2826,6 +2826,17 @@ static void wf_hex(char* out, const unsigned char* b, long n){
 /* Fund a set of outputs: select coins, add change, return the unsigned hex
  * plus the prevtxs array signrawtransactionwithwallet needs for BIP143.
  * Returns 1, or 0 with *ec / *em set. */
+/* WAL-17 (audit 2026-09-03): moved up from the bumpfee section -- the fee
+ * ceiling now guards the ORDINARY funding path too, not just bumpfee. */
+#define BF_MAXTXFEE_SAT 10000000ULL         /* Core -maxtxfee default, 0.1 BTC */
+/* Core's FormatMoney: BTC with trailing zeros stripped ("0.00001"). */
+static void bf_fmt_money(long long sat, char* out, size_t cap){
+    snprintf(out, cap, "%lld.%08lld", sat/100000000LL, sat%100000000LL);
+    size_t l = strlen(out);
+    while (l && out[l-1] == '0') out[--l] = 0;
+    if (l && out[l-1] == '.') out[--l] = 0;
+}
+
 static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
                    int conf_target, char** hex_out, rj_val** prevtxs_out,
                    unsigned long long* fee_out, int* changepos_out,
@@ -2981,6 +2992,25 @@ static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
         { char am[32]; rpc_amounts((long long)c->value, am, sizeof am);
           rj_obj_set(e, "amount", rj_numf("%s", am)); }
         rj_arr_push(pv, e);
+    }
+    /* ---- WAL-17 (audit 2026-09-03): the -maxtxfee guard ----
+     * BF_MAXTXFEE_SAT (Core's -maxtxfee default, 0.1 BTC) existed but was
+     * consulted ONLY by bumpfee. Every ordinary funding path -- sendtoaddress,
+     * sendmany, send, fundrawtransaction -- had no ceiling at all, so a bad
+     * feerate estimate or a hostile feeRate argument could burn the wallet to
+     * fee with nothing to stop it. This is the one item in the batch that
+     * loses money outright.
+     *
+     * Refuse rather than clamp: silently paying less than asked would produce
+     * a transaction the caller did not request, and Core raises here too. */
+    if (fee > BF_MAXTXFEE_SAT){
+        static char e[192]; char a[32], b[32];
+        bf_fmt_money((long long)fee, a, sizeof a);
+        bf_fmt_money((long long)BF_MAXTXFEE_SAT, b, sizeof b);
+        snprintf(e, sizeof e,
+                 "Fee (%s) exceeds the maximum fee (%s) -- raise -maxtxfee or lower the feerate", a, b);
+        free(hx); if (pv) rj_free(pv);
+        return wop_err(ec, em, -4, e);
     }
     *hex_out = hx; *prevtxs_out = pv; *fee_out = fee;
     return 1;
@@ -3169,7 +3199,25 @@ static int cmd_sendall(const rj_val* params, const rpc_wallet* w,
     static wf_coin coins[4096];
     int nc = wf_coins(w, coins, 4096, 1);
     if (nc == 0) return wop_err(ec, em, -6, "Insufficient funds: nothing spendable to sweep");
-    if (nc > WF_MAX_IN) nc = WF_MAX_IN;
+    /* ---- WAL-17 (audit 2026-09-03): "sendall" that does not send all ----
+     * This silently clamped to the first WF_MAX_IN coins and then reported
+     * complete:true, so a wallet with more than 64 spendable outputs was
+     * partially swept while the RPC said it had swept everything. The caller
+     * only discovers the remainder by looking at the balance afterwards.
+     *
+     * Refusing is the honest answer: Core's sendall sweeps the whole wallet,
+     * and there is no partial-sweep contract to fall back on. The message
+     * names the limit and the remedy so the operator can sweep in batches
+     * with `inputs`. */
+    int nc_all = nc;
+    if (nc > WF_MAX_IN){
+        static char e[192];
+        snprintf(e, sizeof e,
+                 "sendall would sweep %d spendable outputs but this builder is limited to %d; "
+                 "sweep in batches using the `inputs` argument",
+                 nc_all, WF_MAX_IN);
+        return wop_err(ec, em, -4, e);
+    }
     unsigned long long sum = 0;
     int pick[WF_MAX_IN];
     for (int i = 0; i < nc; i++){ pick[i] = i; sum += coins[i].value; }
@@ -3388,15 +3436,7 @@ static int cmd_walletcreatefundedpsbt(const rj_val* params, const rpc_wallet* w,
  * `original_change_index` options are refused, not half-implemented. */
 
 #define BF_WALLET_INCREMENTAL_KVB 5000ULL   /* Core WALLET_INCREMENTAL_RELAY_FEE */
-#define BF_MAXTXFEE_SAT 10000000ULL         /* Core -maxtxfee default, 0.1 BTC */
 
-/* Core's FormatMoney: BTC with trailing zeros stripped ("0.00001"). */
-static void bf_fmt_money(long long sat, char* out, size_t cap){
-    snprintf(out, cap, "%lld.%08lld", sat/100000000LL, sat%100000000LL);
-    size_t l = strlen(out);
-    while (l && out[l-1] == '0') out[--l] = 0;
-    if (l && out[l-1] == '.') out[--l] = 0;
-}
 
 /* one dispatched call, result freed by caller; 0 on dispatch error (ec/em set) */
 static int bf_call(const char* method, rj_val* params, const rpc_wallet* w,
