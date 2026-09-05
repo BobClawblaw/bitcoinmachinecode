@@ -226,6 +226,75 @@ int main(void){
            !memcmp(dirty, fresh, (size_t)l2reuse));
     }
 
+    /* ==== STO-14: the ELEMENT SET is what gets de-duplicated ==============
+     * Core holds its elements in
+     *   std::unordered_set<std::vector<unsigned char>, ByteVectorHash>
+     * so N -- which scales the Golomb-Rice range, N * M -- is the count of
+     * distinct ELEMENTS. This used to de-duplicate the 64-bit SipHash
+     * instead. The two disagree only when two DISTINCT scripts collide on
+     * 64 bits (~2^-40 per block), which cannot be constructed on demand, so
+     * what is pinned here is the SEMANTICS the change is about:
+     *
+     *   - repeated identical scripts collapse to ONE element;
+     *   - distinct scripts each count, however similar;
+     *   - N is visible in the encoded filter's leading CompactSize, so the
+     *     count is checked directly rather than inferred from the length.
+     *
+     * The prevout list is used as the element source because it feeds the
+     * builder without needing a hand-built block. */
+    printf("\n---- STO-14: element-set de-duplication ----\n");
+    {
+        unsigned char minimal[81];
+        memset(minimal, 0, sizeof minimal);
+        minimal[80] = 0;                       /* 80-byte header + 0 txs */
+        unsigned char key[32]; memset(key, 0x5a, sizeof key);
+
+        /* three P2WPKH scripts: two IDENTICAL, one distinct */
+        static unsigned char A[22] = {0x00,0x14, 1,2,3,4,5,6,7,8,9,10,
+                                      11,12,13,14,15,16,17,18,19,20};
+        static unsigned char B[22] = {0x00,0x14, 1,2,3,4,5,6,7,8,9,10,
+                                      11,12,13,14,15,16,17,18,19,99};
+        unsigned char f1[256], f2[256];
+
+        bf_script dup3[3] = { {A,22}, {A,22}, {A,22} };
+        long n1 = bf_basic_build(minimal, 81, key, dup3, 3, f1, sizeof f1);
+        ck("STO-14: three identical elements build a filter", n1 > 0);
+        ck("STO-14: ...and N is 1, not 3", n1 > 0 && f1[0] == 1);
+        if (n1 > 0 && f1[0] != 1) printf("      N was %u\n", f1[0]);
+
+        bf_script two[2] = { {A,22}, {B,22} };
+        long n2 = bf_basic_build(minimal, 81, key, two, 2, f2, sizeof f2);
+        ck("STO-14: two elements differing in ONE byte both count (N=2)",
+           n2 > 0 && f2[0] == 2);
+        if (n2 > 0 && f2[0] != 2) printf("      N was %u\n", f2[0]);
+
+        /* order must not matter: a SET has no order, so the same elements
+         * presented differently must produce the same bytes */
+        unsigned char f3[256];
+        bf_script rev[2] = { {B,22}, {A,22} };
+        long n3 = bf_basic_build(minimal, 81, key, rev, 2, f3, sizeof f3);
+        ck("STO-14: element ORDER does not change the filter (it is a set)",
+           n3 == n2 && n2 > 0 && !memcmp(f2, f3, (size_t)n2));
+
+        /* and duplicates mixed among distinct ones collapse correctly */
+        unsigned char f4[256];
+        bf_script mixed[5] = { {A,22}, {B,22}, {A,22}, {B,22}, {A,22} };
+        long n4 = bf_basic_build(minimal, 81, key, mixed, 5, f4, sizeof f4);
+        ck("STO-14: duplicates interleaved with distinct elements give N=2",
+           n4 > 0 && f4[0] == 2);
+        ck("STO-14: ...and the SAME bytes as the deduplicated pair",
+           n4 == n2 && n2 > 0 && !memcmp(f4, f2, (size_t)n2));
+
+        /* an element that differs only in LENGTH is a different element */
+        static unsigned char Ashort[21] = {0x00,0x13, 1,2,3,4,5,6,7,8,9,10,
+                                           11,12,13,14,15,16,17,18,19};
+        unsigned char f5[256];
+        bf_script lens[2] = { {A,22}, {Ashort,21} };
+        long n5 = bf_basic_build(minimal, 81, key, lens, 2, f5, sizeof f5);
+        ck("STO-14: a prefix of another element is still a distinct element",
+           n5 > 0 && f5[0] == 2);
+    }
+
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
 }

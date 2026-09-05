@@ -2690,6 +2690,12 @@ USNAP_PUBKEY := bitcoin_pubkey.o secp256k1_fe.o
 tests/test_utxo_snapshot: tests/test_utxo_snapshot.c utxo_snapshot.o utxo_snapshot.h tests/snap_kats_gen.h $(USNAP_PUBKEY)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_utxo_snapshot.c utxo_snapshot.o $(USNAP_PUBKEY)
 
+# STO-14: the driver for validation/blockfilter_diff.py. A binary, not a
+# shared object -- this tree's asm is non-relocatable (-no-pie), so there is
+# nothing to dlopen. Declared manual: it needs the oracle.
+tests/bfilter_shim: tests/bfilter_shim.c block_filter.o bitcoin_hash.o sha256.o
+	$(CC) $(CFLAGS) -o $@ tests/bfilter_shim.c block_filter.o bitcoin_hash.o sha256.o
+
 tests/test_block_filter: tests/test_block_filter.c block_filter.o bitcoin_hash.o sha256.o \
     block_filter.h $(TEST_TMPDIR_H) tests/fixtures/blk_501726.bin tests/fixtures/blk_700038.bin \
     tests/fixtures/prevouts_700038.txt tests/fixtures/filter_700038.txt
