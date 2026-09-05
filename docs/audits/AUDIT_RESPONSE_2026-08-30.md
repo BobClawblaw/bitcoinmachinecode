@@ -14,10 +14,12 @@
 >   Makefile rule, rules outside the gate) is now *enforced* rather than
 >   surveyed — `make runlist-check` requires every `test_*.c` to be in the gate
 >   or to carry a written reason for not being, and it is green;
-> * **`LimitCORE`/systemd hardening** is recorded closed by the 09-03 audit,
->   but on the deployment host: **no `.service` unit is in this repository**, so
->   that closure cannot be verified from the tree. Treat it as an operator
->   attestation, not a code fact.
+> * **`LimitCORE`/systemd hardening** is recorded closed by the 09-03 audit on
+>   the deployment host, and was **verified there on 2026-09-05**
+>   (`LimitCORE=0` effective, `Max core file size 0` on the running process).
+>   No `.service` unit is in this repository **by operator decision** — it is a
+>   local artifact — and `docs/OPERATIONS.md`'s reference unit carries the same
+>   hardening block. Closed; see `releases/2026-09-05-audits-closed.md`.
 
 Response to `SECURITY_AUDIT_2026-08-29.md` (11 findings).
 
