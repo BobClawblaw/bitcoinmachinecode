@@ -334,7 +334,18 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
              * an absent feature). */
             int is_mine = 0, is_watchonly = 0, is_change = 0, has_pub = 0;
             unsigned char pub[33];
-            rpc_wops_address_ownership(w, s, (unsigned long)sl, &is_mine, &is_watchonly, &is_change, pub, &has_pub);
+            int own = rpc_wops_address_ownership(w, s, (unsigned long)sl,
+                                                 &is_mine, &is_watchonly, &is_change, pub, &has_pub);
+            /* WAL-6 (audit 2026-09-03): -1 means the wallet CANNOT ANSWER --
+             * the seed is locked and no watch-only descriptors are loaded --
+             * as distinct from a confident "not yours". Reporting
+             * ismine:false there is a definite answer the wallet has not
+             * earned. Core has no such state (it always holds its keyset), so
+             * there is no field to copy; the fields are omitted, which is at
+             * least not a false claim, and the reason is said in the log. */
+            if (own < 0)
+                fprintf(stderr, "[wallet]  getaddressinfo: the wallet is locked and has no watch-only "
+                                "descriptors, so ownership cannot be determined for this address\n");
             /* RPX-3 (audit 2026-09-03): pubkey/iscompressed ONLY when the
              * wallet actually holds the key.
              *
@@ -361,9 +372,13 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
             }
             rj_obj_set(o, "iswitness", rj_bool(type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH || type == WAL_ADDR_P2TR));
             rj_obj_set(o, "witness_version", rj_numf("%u", (type == WAL_ADDR_P2TR) ? 1 : 0));
-            rj_obj_set(o, "ismine", rj_bool(is_mine));
-            rj_obj_set(o, "iswatchonly", rj_bool(is_watchonly));
-            rj_obj_set(o, "ischange", rj_bool(is_change));
+            /* WAL-6: omitted rather than answered false when the wallet
+             * cannot tell (own < 0). See the note above. */
+            if (own >= 0){
+                rj_obj_set(o, "ismine", rj_bool(is_mine));
+                rj_obj_set(o, "iswatchonly", rj_bool(is_watchonly));
+                rj_obj_set(o, "ischange", rj_bool(is_change));
+            }
         }
     }
     *result = o;

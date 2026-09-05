@@ -809,6 +809,16 @@ typedef struct { char desc[512]; long range; long next; int script; } wop_desc_t
 static wop_desc_t g_wd[WOP_MAX_DESCS];
 static int  g_wd_n = -1;                  /* -1 = not loaded from file */
 static wscan_key* g_wk;                   /* descriptor-derived key window */
+/* WAL-6 (audit 2026-09-03): which DESCRIPTOR each window entry came from.
+ * This used to be crammed into wscan_key.branch, whose bits mean something
+ * else entirely -- WOT_CHAIN reads bit 0 as receive/change and WOT_TYPE reads
+ * bits 4-5 as the address type -- so getaddressinfo reported `ischange` for a
+ * watch-only wallet as the IMPORT-ORDER PARITY of the descriptor slot, and
+ * `type` as whatever bits 4-5 of the slot index happened to be. A parallel
+ * array rather than a new wscan_key field: that struct is shared with the
+ * scanner and its records are persisted, so widening it is a format change
+ * for a value only this window needs. */
+static unsigned char* g_wk_desc;          /* descriptor slot per window entry */
 static int  g_wk_n = -1;
 static void wop_watch_keys_invalidate(void){ g_wd_n = -1; g_wk_n = -1; }
 
@@ -1689,6 +1699,7 @@ static int wop_watch_keyset(const wscan_key** out){
     if (g_wk_n >= 0){ *out = g_wk; return g_wk_n; }
     int nd = wop_descs_load();
     if (!g_wk) g_wk = malloc((size_t)(WOP_SCAN_KEYS*2) * sizeof *g_wk);
+    if (!g_wk_desc) g_wk_desc = malloc((size_t)(WOP_SCAN_KEYS*2));   /* WAL-6 */
     if (!g_wk){ *out = NULL; return 0; }
     g_wk_n = 0;
     static unsigned char h[WOP_SCAN_KEYS*2][20];
@@ -1702,7 +1713,12 @@ static int wop_watch_keyset(const wscan_key** out){
         for (long i = 0; i < n; i++){
             memcpy(g_wk[g_wk_n].h160, h[i], 20);
             g_wk[g_wk_n].keyidx = (unsigned)i;
-            g_wk[g_wk_n].branch = (unsigned char)sdx;
+            /* WAL-6: branch keeps its documented meaning. An imported
+             * descriptor carries no receive/change distinction of its own --
+             * `internal` is not honoured (WAL-15) -- so 0 is the honest
+             * answer, not the slot index. */
+            g_wk[g_wk_n].branch = 0;
+            if (g_wk_desc) g_wk_desc[g_wk_n] = (unsigned char)sdx;
             g_wk_n++;
         }
     }
@@ -1952,7 +1968,14 @@ int rpc_wops_address_ownership(const rpc_wallet* w, const unsigned char* spk, un
     const unsigned char* h20;
     if (!wscan_spk_h160(spk, spklen, &h20)) return 1;   /* not an address shape we track ownership for at all */
     const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
-    if (nk <= 0) return 1;
+    /* ---- WAL-6 (audit 2026-09-03): "no keys" is not "not mine" ----
+     * An empty keyset means the seed is LOCKED and no watch-only descriptors
+     * are imported -- the wallet cannot answer the question. Returning 1 with
+     * every output zeroed made getaddressinfo report ismine:false, which reads
+     * as a definitive "this address is not yours" when the honest answer is
+     * "ask again when unlocked". A caller deciding whether an address is safe
+     * to spend to gets the same reply for "not yours" and "cannot tell". */
+    if (nk <= 0) return (w && w->seed) ? 1 : -1;
     int spending = (w && w->seed) ? 1 : 0;
     for (int i = 0; i < nk; i++){
         if (memcmp(keys[i].h160, h20, 20) != 0) continue;
