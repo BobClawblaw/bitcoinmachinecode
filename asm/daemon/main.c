@@ -7033,6 +7033,25 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
              * since boot, and says so in the log once per connection. */
             if(c>=0) peer_sock_buffers(c);
             if(c>=0) peer_inbound_deadline(c);        /* NET-3: idle peers cannot hold a slot forever */
+            if(c>=0 && g_shutdown_requested){
+                /* SC1 (2026-09-05, /mnt/2tbssd bmc-vs-Core benchmark): the
+                 * stop sequence was observed forking a child into a parent
+                 * that was already tearing down -- the accept fired in the
+                 * window between SIGTERM and the listener closing, and the
+                 * child inherited a half-torn-down address space. Core
+                 * closes its listeners first, then drains; we now refuse at
+                 * the accept the same way: one clean close, no fork, the
+                 * peer reconnects to whatever comes up next. Rate-limited:
+                 * a shutdown racing a connect flood must not flood the log. */
+                static long long last_stop_log_ms = 0;
+                long long nms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+                                 nms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
+                if(nms - last_stop_log_ms > 1000){
+                    fprintf(stderr,"[serve] shutting down -- refusing inbound %s\n", peerdesc);
+                    last_stop_log_ms = nms;
+                }
+                close(c); c = -1;
+            }
             if(c>=0) serve_idx_topup();
             if(c>=0 && upload_note_and_check(0)){
                 /* over -maxuploadtarget for this 24h window -- unless the
@@ -8178,6 +8197,14 @@ int main(int argc, char** argv){
         pid_t dl = fork();
         if(dl==0){
             if(g_txoq_parent >= 0){ close(g_txoq_parent); g_txoq_parent = -1; }
+            /* TXOQ-1 (2026-09-05 benchmark): register the between-block
+             * service hook before the worker's first utxo_live_catchup, so a
+             * long catch-up pass answers gettxout queries at its block
+             * boundaries instead of refusing them all until it returns. */
+            if(g_txoq_worker >= 0){
+                extern void utxo_live_set_apply_hook(void (*)(void));
+                utxo_live_set_apply_hook(txoq_service);
+            }
             serve_download_worker(dir, (const char**)g_seed_hosts, g_n_seed_hosts, g_chainp->default_port);
             _exit(0);
         }
