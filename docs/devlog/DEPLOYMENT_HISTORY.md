@@ -925,3 +925,55 @@ Three rounds against console-log noise, each gated and deployed alone:
 Result: ~60 lines/min -> ~17 lines/min of real events (heartbeat, summaries,
 dial/leg churn, tor/i2p/cjdns state). The `size 2M` rotation now covers
 hours instead of minutes.
+
+## 2026-09-05 (evening): deploy a — the audit-closure build, and NET-10 migrating a live address book
+
+`bitcoind.deploy-20260905a`, main @ `9d9e93c`. The node had been running
+`deploy-20260904a` for 26 hours: a build that predated CSI-1 (it answered
+`gettxoutsetinfo muhash <height>` with the TIP set for a historical query) and
+every consensus fix of the 2026-09-05 interpreter review.
+
+What this build carries: IR-1 through IR-14 and IR-17 (two consensus
+false-accepts, three valid-block DoS shapes, two policy divergences, a latent
+memory-unsafety), IR-5's per-transaction sighash memo, IR-6's handle-based
+stack, CSI-1, SCR-9/SCR-10, and NET-10.
+
+**The rollout doubled as NET-10's first real migration.** `peers2.dat` was
+`BMCADBK2`, 46,079 records; the writer upgraded it in place on first open.
+Measured against a backup taken immediately before
+(`/storage/peers2.dat.pre-net10-20260905-2039`):
+
+| | |
+|---|---|
+| before | 2,211,808 bytes = 46,079 records at 48 B (v2) |
+| after | 2,582,064 bytes = 46,108 records at 56 B (v3) |
+| header count field | 46,108 — matches the file size exactly |
+| marked tried | **4,096** — exactly `AB2_V2_TRIED_HEAD`, the head the dialer already trusted |
+| carrying a source netgroup | 1 within the first minutes (gossip is rate-limited to 0.1 addr/s per leg) |
+
+The 29-record difference is gossip the old process accepted between the backup
+and the stop. Nothing was lost, and the head that `DL_POOL_V4_WINDOW` depends
+on is now protected by a flag rather than by insertion order.
+
+**Verified after restart:** clean stop ("Deactivated successfully", no
+timeout), height 965,665 — **the same block as the Core oracle** — with
+`headers == blocks` and `initialblockdownload false`; peers climbing from 0 to
+4 within a minute; zero FATAL/SEGV/HALTED lines; `NRestarts=0`.
+
+**Still true and not fixed here:** the node has **no inbound P2P listener**.
+It binds no `port=` and the default 8333 is held on this host by the Core
+oracle's loopback aliases, so `connections_in` is 0 and stays 0. Giving it its
+own `port=` in `data/bitcoin.conf` is a one-line change and a second restart;
+it was out of scope for "restart on the new build" and is left as the
+operator's call.
+
+**Incidental audit resolution.** `docs/releases/2026-09-05-audits-closed.md`
+recorded `LimitCORE`/systemd hardening as an operator attestation that could
+not be checked from the tree, because no `.service` unit is in the repository.
+It can be checked from the *host*, and now has been: `systemctl show` reports
+`LimitCORE=0`, `NoNewPrivileges=yes`, `ProtectSystem=full`,
+`ProtectHome=read-only`, `PrivateTmp=yes` — the base unit's
+`LimitCORE=infinity` is overridden by the `50-hardening.conf` drop-in — and
+the running process shows `Max core file size 0` in `/proc/<pid>/limits`. The
+09-03 audit's closure was correct. The unit remaining outside version control
+is the real residual observation.
