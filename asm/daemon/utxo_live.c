@@ -1351,8 +1351,10 @@ typedef struct {
     u32 version;                 /* BIP68's version>=2 gate */
     const u32* seqs; u32 nseqs;  /* per-input sequences (up to SEQ_CAP; a tx
                                     with more inputs reports nseqs=SEQ_CAP and
-                                    the BIP68 pass treats the surplus as
-                                    FINAL -- see the note in the pass) */
+                                    the BIP68 pass STREAMS the surplus from
+                                    the tx bytes (val_seq_walk_*) instead of
+                                    trusting the truncation -- see the note
+                                    in the pass) */
 } val_txinfo_t;
 #define VAL_SEQ_CAP 2048
 static u32 g_val_seqs[VAL_SEQ_CAP];    /* single-buffer scratch: val_read_tx
@@ -1503,6 +1505,64 @@ static int val_build_height_push(u64 h, u8* want){
     if (want[1+n-1] & 0x80){ want[1+n] = 0; n++; }
     want[0] = (u8)n;
     return 1 + n;
+}
+
+/* Streaming per-input nSequence reader for transactions with more than
+ * VAL_SEQ_CAP inputs. val_read_tx buffers at most VAL_SEQ_CAP sequences and
+ * its truncation rule ("surplus inputs are FINAL") would make BIP68 MORE
+ * permissive than Core on an oversized tx; refusing the tx outright is
+ * equally wrong (Core applies real 5,000+-input consolidations). This
+ * walker re-reads the INPUT SECTION ONLY of a tx that val_read_tx already
+ * fully validated (same walk, inputs in order) and delivers every
+ * nSequence one call at a time -- no buffer, no cap, no truncation -- so
+ * the BIP68 pass in apply_block_inner evaluates oversized txs exactly like
+ * Core's CalculateSequenceLocks: over ALL inputs. A walk failure on a
+ * fully-validated tx is an internal error (the BIP68 pass maps it to
+ * "internal: bip68 seq walk ...", the same class as the ledger-desync
+ * guard), never a consensus reject. */
+typedef struct {
+    const u8* p;      /* cursor: just past the last delivered sequence */
+    const u8* end;
+    u64 remaining;    /* inputs left to deliver */
+} val_seq_walk_t;
+
+static int val_seq_walk_init(const u8* tx, u64 txlen, val_seq_walk_t* w){
+    const u8* p = tx; const u8* end = tx + txlen;
+    if (txlen < 5) return 0;
+    p += 4;                                        /* version (validated) */
+    if (p + 2 <= end && p[0] == 0x00 && p[1] == 0x01) p += 2;  /* segwit marker */
+    u64 used;
+    u64 nin = utxo_walk_read_varint(p, end, &used);
+    if (!used) return 0;
+    p += used;
+    w->p = p; w->end = end; w->remaining = nin;
+    return 1;
+}
+
+static int val_seq_walk_next(val_seq_walk_t* w, u32* seq_out){
+    if (w->remaining == 0) return 0;
+    const u8* p = w->p; const u8* end = w->end;
+    if (p + 36 > end) return 0;
+    u64 used;
+    u64 sl = utxo_walk_read_varint(p + 36, end, &used);
+    if (!used) return 0;
+    p += 36 + used + sl;                           /* skip prevout + scriptSig */
+    if ((u64)(end - p) < 4) return 0;
+    u32 sq; memcpy(&sq, p, 4);
+    p += 4;
+    w->p = p; w->remaining--;
+    *seq_out = sq;
+    return 1;
+}
+
+/* Same seam convention as val_read_tx_probe: test_val_read_tx.c drives the
+ * REAL walkers, not a copy that could drift from what apply_block_inner
+ * actually runs. */
+int val_seq_walk_probe_init(const u8* tx, u64 txlen, val_seq_walk_t* w){
+    return val_seq_walk_init(tx, txlen, w);
+}
+int val_seq_walk_probe_next(val_seq_walk_t* w, u32* seq_out){
+    return val_seq_walk_next(w, seq_out);
 }
 
 static int apply_block_inner(const u8* blockbuf, u64 blocklen){
@@ -1931,13 +1991,20 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * and carries this height. Re-resolving them here would duplicate that
      * precedence rule. The per-input sequences come from val_read_tx.
      *
-     * THE seqs[] CAP IS SAFE HERE, unlike for IsFinalTx. val_read_tx records
-     * at most VAL_SEQ_CAP sequences and its truncation rule treats the
-     * surplus as FINAL. For BIP68 "final" means nSequence 0xffffffff, which
-     * has the DISABLE flag set, so a surplus input is treated as exempt --
-     * it can only make us MORE permissive on a transaction with more than
-     * 2,048 inputs, never less. That direction is wrong in principle, so the
-     * truncation is refused outright below rather than relied upon. ---- */
+     * THE seqs[] CAP. val_read_tx records at most VAL_SEQ_CAP sequences and
+     * its truncation rule treats the surplus as FINAL (nSequence 0xffffffff,
+     * DISABLE flag set), which would make us MORE permissive than Core on a
+     * transaction with more than 2,048 inputs, never less. Permissiveness is
+     * the wrong direction, but refusing the tx outright is wrong too: Core
+     * computes SequenceLocks over EVERY input, and real consolidation
+     * transactions exceed 2,048 inputs (first seen live: block 964092,
+     * tx 840 with 5,226 inputs -- in Core's chain, so a false
+     * "bad-txns-nonBIP68-final" here is a chain split, not a safety net).
+     * For an oversized tx the pass therefore streams the sequences straight
+     * from the input section (val_seq_walk_*, below) -- no buffering, no
+     * truncation, no refusal -- and runs the same math over all of them.
+     * The walker only ever sees a tx val_read_tx already fully validated,
+     * so a walk failure is an internal error, not a consensus event. ---- */
     {
         unsigned long long bflags68 = script_flags_for_block((unsigned long long)g_apply_height, blk_hash);
         int csv_active68 = (int)((bflags68 >> VAL_SFC_BIT_CSV) & 1ULL);
@@ -1961,13 +2028,18 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
                 }
                 if (t == 0) continue;         /* the coinbase has no prevouts */
 
-                if (vib.nseqs >= VAL_SEQ_CAP && vib.in_count > VAL_SEQ_CAP){
-                    /* see the note above: proceeding would be permissive */
-                    fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-txns-nonBIP68-final "
-                                    "(tx %llu has %llu inputs, past the sequence window)\n",
-                            g_apply_height, (unsigned long long)t,
-                            (unsigned long long)vib.in_count);
-                    g_last_reject = "bad-txns-nonBIP68-final"; return 0;
+                val_seq_walk_t swk;
+                int seq_streamed = 0;
+                if (vib.in_count > VAL_SEQ_CAP){
+                    /* Core evaluates SequenceLocks over EVERY input; see the
+                     * cap note above. Stream the sequences for an oversized
+                     * tx instead of refusing it (the old guard rejected any
+                     * tx past 2,048 inputs as "bad-txns-nonBIP68-final",
+                     * which Core's own chain proves false). */
+                    if (!val_seq_walk_init(txs[t].ptr, txs[t].len, &swk)){
+                        g_last_reject = "internal: bip68 seq walk init failed"; return 0;
+                    }
+                    seq_streamed = 1;
                 }
 
                 long long min_height = -1, min_time = -1;
@@ -1979,7 +2051,14 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
                         g_last_reject = "internal: bip68 ledger desync"; return 0;
                     }
                     u64 coin_h = in_h[gi];
-                    unsigned seq = (k < vib.nseqs) ? vib.seqs[k] : 0xFFFFFFFFu;
+                    unsigned seq;
+                    if (seq_streamed){
+                        if (!val_seq_walk_next(&swk, &seq)){
+                            g_last_reject = "internal: bip68 seq walk short"; return 0;
+                        }
+                    } else {
+                        seq = (k < vib.nseqs) ? vib.seqs[k] : 0xFFFFFFFFu;
+                    }
                     gi++;
                     if (!enforce) continue;
                     if (seq & VAL_SEQ_DISABLE) continue;
