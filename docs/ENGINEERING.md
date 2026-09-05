@@ -418,10 +418,10 @@ listtransactions [path]                # alias of history
 
 Run bare to print the full one-line usage summary.
 
-### 3.4 `bitcoin_cli` — Core-compatible JSON-RPC *client*
+### 3.4 `bmc_cli` — Core-compatible JSON-RPC *client*
 
 ```
-bitcoin_cli [-rpcport=<n>] [-rpcuser=<u>] [-rpcpassword=<p>]
+bmc_cli [-rpcport=<n>] [-rpcuser=<u>] [-rpcpassword=<p>]
             [-rpcconnect=<host>] <method> [params...]
 ```
 
@@ -448,7 +448,7 @@ Production server side of the RPC transport. Loads `rpcport`/`rpcuser`/
 socket + accept thread, and serves Core-bit-exact HTTP + JSON-RPC (405 on
 non-POST, 401 + `WWW-Authenticate`, `-32700` parse error, V2/V1 envelopes with
 id echo, V2-notification 204). Runs until SIGINT/SIGTERM. All dispatch goes
-through the same `rpc_dispatch()` as `bitcoin_cli`.
+through the same `rpc_dispatch()` as `bmc_cli`.
 
 ### 3.6 Standalone / ops tools (`asm/daemon/`)
 
@@ -488,8 +488,8 @@ instead of relying on these:
 
 ```
 scripts/start.sh        # systemctl start bmc-bitcoind, else `bitcoind -datadir=<d> serve`
-scripts/status.sh       # systemctl status + bitcoin_cli getblockchaininfo
-scripts/stop.sh         # systemctl stop bmc-bitcoind, else `bitcoin_cli stop`
+scripts/status.sh       # systemctl status + bmc_cli getblockchaininfo
+scripts/stop.sh         # systemctl stop bmc-bitcoind, else `bmc_cli stop`
 scripts/worklog.sh [YYYY-MM-DD]   # open (create+seed) today's daily worklog
 ```
 
@@ -572,7 +572,7 @@ config without a `chain` key is byte-identical to before this existed.
 
 ```
 +---------------------------------------------------------------+
-| CLI/RPC layer   wallet_cli · bitcoin_cli · bitcoin_rpcd · cli  |
+| CLI/RPC layer   wallet_cli · bmc_cli · bitcoin_rpcd · cli  |
 |                 (JSON-RPC transport: rpc_json/rpc_net/         |
 |                  rpc_commands/rpc_server)                      |
 +---------------------------------------------------------------+
@@ -761,7 +761,7 @@ Use the JSON-RPC layer (start server, then query with the client):
 
 ```bash
 ./bitcoin_rpcd &                       # reads config/bitcoin.conf
-./bitcoin_cli getnewaddress  # ...  (against 127.0.0.1:8332)
+./bmc_cli getnewaddress  # ...  (against 127.0.0.1:8332)
 ```
 
 Health / integrity / progress:

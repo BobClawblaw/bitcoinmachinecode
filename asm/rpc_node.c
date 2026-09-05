@@ -99,7 +99,7 @@ static int net_reach(int bmc_id, int dflt){
  * such concept -- Core constructs its Proxy with the plain, non-isolating
  * constructor) or to cjdns (no proxy at all, a direct native network).
  *
- * node_config.c is linked weakly here: bitcoin_cli (a pure HTTP client)
+ * node_config.c is linked weakly here: bmc_cli (a pure HTTP client)
  * links this whole file but never executes cmd_getnetworkinfo, and does not
  * link node_config.c at all -- the NULL check is what keeps that build
  * working rather than needing a config parser it has no use for. */
@@ -880,7 +880,7 @@ static int cmd_setban(const rj_val* params, rj_val** res, long* ec, const char**
      * setban runs LookupSubNet first and raises -30.
      *
      * WEAK, following the node_config_get_proxy_info pattern documented above:
-     * bitcoin_cli links this whole file as a pure HTTP client and does not
+     * bmc_cli links this whole file as a pure HTTP client and does not
      * link daemon/subnet.c. A NULL check keeps that build working rather than
      * forcing a subnet parser into a binary that only speaks HTTP -- and
      * tests/test_rpc_node is the one other target that links rpc_node.o

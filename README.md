@@ -175,7 +175,7 @@ cases) after a set of static audits that run in the first seconds:
 | `runlist-check` | every test is either in the gate or declared manual with a reason |
 | `gate-log-check LOG=<file>` | a saved gate log shows make exiting 0 and every gated test actually executed |
 
-Other binaries built under `asm/daemon/`: `bitcoin_cli` (Core-compatible
+Other binaries built under `asm/daemon/`: `bmc_cli` (Core-compatible
 JSON-RPC client), `cli` (query the stored chain directly), `wallet_cli`,
 and the archive tools (`check_chain`, `verify`, `dumpblock`, `unified_ibd`,
 `chainctl`).
@@ -217,11 +217,11 @@ and the archive tools (`check_chain`, `verify`, `dumpblock`, `unified_ibd`,
 
 3. **Talk to it.** Cookie authentication is on by default:
    `<datadir>/<chain>/.cookie` is written (mode 0600) at startup and deleted
-   at shutdown. `bitcoin_cli` resolves the port and cookie from the datadir:
+   at shutdown. `bmc_cli` resolves the port and cookie from the datadir:
 
    ```sh
-   asm/daemon/bitcoin_cli -datadir=/path/to/datadir getblockchaininfo
-   asm/daemon/bitcoin_cli -datadir=/path/to/datadir -signet getblockcount
+   asm/daemon/bmc_cli -datadir=/path/to/datadir getblockchaininfo
+   asm/daemon/bmc_cli -datadir=/path/to/datadir -signet getblockcount
    ```
 
    Any JSON-RPC client works, including Bitcoin Core's `bitcoin-cli` and

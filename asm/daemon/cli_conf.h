@@ -1,9 +1,9 @@
-/* daemon/cli_conf.h -- where bitcoin_cli finds the port and the credentials.
+/* daemon/cli_conf.h -- where bmc_cli finds the port and the credentials.
  *
- * WHY THIS EXISTS. bitcoin_cli hardcoded port 8332 and the credentials
+ * WHY THIS EXISTS. bmc_cli hardcoded port 8332 and the credentials
  * "bitcoin"/"bitcoin", and read neither the config file nor the cookie the
  * daemon writes. Against this node's own live configuration -- RPC on 8331,
- * P2P on 8332, cookie auth -- a bare `bitcoin_cli getblockcount` therefore
+ * P2P on 8332, cookie auth -- a bare `bmc_cli getblockcount` therefore
  * opened an HTTP POST against the P2P LISTENER and reported
  *
  *     error: malformed HTTP reply

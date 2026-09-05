@@ -1196,9 +1196,9 @@ tests/test_wallet_store: tests/test_wallet_store.c wallet_store.c daemon/wallet_
 
 # test_cli_prompt -- 2026-09-02: manual wallet decryption with no passphrase on
 # disk: wallet_cli prompts (echo off on a pty) or reads one line from a pipe;
-# bitcoin_cli -stdinwalletpassphrase / -stdin (Core semantics). Drives the
+# bmc_cli -stdinwalletpassphrase / -stdin (Core semantics). Drives the
 # real binaries, so they are prerequisites.
-tests/test_cli_prompt: tests/test_cli_prompt.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c bitcoin_bip39.o sha512.o sha256.o bitcoin_hmac.o daemon/wallet_cli daemon/bitcoin_cli
+tests/test_cli_prompt: tests/test_cli_prompt.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c bitcoin_bip39.o sha512.o sha256.o bitcoin_hmac.o daemon/wallet_cli daemon/bmc_cli
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ tests/test_cli_prompt.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c bitcoin_bip39.o sha512.o sha256.o bitcoin_hmac.o -lutil
 
 # Branch-and-Bound coin selection (Core SelectCoinsBnB semantics), pure.
@@ -2350,8 +2350,8 @@ rpc_chain.o: rpc_chain.c rpc_chain.h bitcoin_pow_rules.h rpc_json.h rpc_commands
 rpc_node.o: rpc_node.c rpc_node.h rpc_json.h version_gen.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_node.c
 
-daemon/bitcoin_cli: daemon/bitcoin_cli.c daemon/cli_conf.c daemon/cli_conf.h rpc_net.o rpc_commands.o rpc_json.o $(RPCLIBS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/bitcoin_cli.c daemon/cli_conf.c rpc_net.o rpc_commands.o rpc_json.o $(RPCLIBS)
+daemon/bmc_cli: daemon/bmc_cli.c daemon/cli_conf.c daemon/cli_conf.h rpc_net.o rpc_commands.o rpc_json.o $(RPCLIBS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/bmc_cli.c daemon/cli_conf.c rpc_net.o rpc_commands.o rpc_json.o $(RPCLIBS)
 
 tests/test_rpc_json: tests/test_rpc_json.c rpc_json.o rpc_commands.o $(RPCLIBS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_json.c rpc_json.o rpc_commands.o $(RPCLIBS)
@@ -2362,7 +2362,7 @@ tests/test_rpc_json: tests/test_rpc_json.c rpc_json.o rpc_commands.o $(RPCLIBS)
 tests/test_rpc_amount: tests/test_rpc_amount.c rpc_json.o rpc_commands.o $(RPCLIBS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_amount.c rpc_json.o rpc_commands.o $(RPCLIBS)
 
-tests/test_rpc_transport: tests/test_rpc_transport.c rpc_net.o rpc_commands.o rpc_json.o daemon/bitcoin_cli $(RPCLIBS)
+tests/test_rpc_transport: tests/test_rpc_transport.c rpc_net.o rpc_commands.o rpc_json.o daemon/bmc_cli $(RPCLIBS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_transport.c rpc_net.o rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
 
 # ============================================================================
@@ -2370,7 +2370,7 @@ tests/test_rpc_transport: tests/test_rpc_transport.c rpc_net.o rpc_commands.o rp
 # sockets/threads + Core-faithful HTTP/JSON-RPC behavior; daemon/bitcoin_rpcd
 # is the production server binary (loads config/bitcoin.conf);
 # tests/test_rpc_server tests/test_rpc_whitelist forks+execs the REAL bitcoin_rpcd and drives it with
-# the REAL bitcoin_cli + raw sockets. Shared render path = rpc_dispatch().
+# the REAL bmc_cli + raw sockets. Shared render path = rpc_dispatch().
 # ============================================================================
 crypto_chacha20.o: crypto_chacha20.c crypto_chacha20.h
 	$(CC) $(WARNFLAGS) -O2 -c -o $@ crypto_chacha20.c
@@ -2394,7 +2394,7 @@ daemon/bitcoin_rpcd: daemon/bitcoin_rpcd.c rpc_server.o daemon/rpc_acl.c daemon/
 tests/test_core_parity: tests/test_core_parity.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/chainparams.c daemon/minchainwork.c daemon/notify.c rpc_server.o daemon/rpc_acl.c crypto_hkdf.o rpc_net.o rpc_commands.o rpc_json.o bitcoin_hash.o sha256.o bitcoin_script_flags.o bitcoin_net.o $(RPCLIBS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_core_parity.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/chainparams.c daemon/minchainwork.c daemon/notify.c rpc_server.o daemon/rpc_acl.c crypto_hkdf.o rpc_net.o rpc_commands.o rpc_json.o bitcoin_script_flags.o bitcoin_net.o $(RPCLIBS) -lpthread
 
-tests/test_rpc_server: tests/test_rpc_server.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o daemon/bitcoin_cli daemon/bitcoin_rpcd $(RPCLIBS)
+tests/test_rpc_server: tests/test_rpc_server.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o daemon/bmc_cli daemon/bitcoin_rpcd $(RPCLIBS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_server.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o $(RPCLIBS) -lpthread
 
 # -rpcwhitelist/-rpcwhitelistdefault/-rpcthreads/-rpcworkqueue on the real server (2026-09-01)
@@ -2420,7 +2420,7 @@ tests/test_misbehavior_shared: tests/test_misbehavior_shared.c rpc_node.h
 # BIP330 sendtxrcncl negotiation (Erlay, negotiation half).
 # -persistmempool is actually wired (Core parity follow-up).
 # -reindex-chainstate: the drop, and the one-shot guard around it.
-# Where bitcoin_cli finds its port and credentials (it used to hardcode both).
+# Where bmc_cli finds its port and credentials (it used to hardcode both).
 tests/test_cli_conf: tests/test_cli_conf.c daemon/cli_conf.c daemon/cli_conf.h $(TEST_TMPDIR_H)
 	$(CC) $(WARNFLAGS) -D_GNU_SOURCE -O2 -Wall -I. -I daemon -I tests -o $@ tests/test_cli_conf.c daemon/cli_conf.c
 
@@ -2653,7 +2653,7 @@ tests/test_rpc_wallet_ops: tests/test_rpc_wallet_ops.c rpc_commands.o rpc_json.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_wallet_ops.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
 
 # RPC-8 (audit 2026-09-03): daemon/subnet.c is linked here because cmd_setban
-# validates through subnet_parse. It is a WEAK reference (bitcoin_cli links
+# validates through subnet_parse. It is a WEAK reference (bmc_cli links
 # rpc_node.o without a subnet parser), so omitting it here silently skipped
 # the validation and the test asserted nothing.
 tests/test_rpc_node: addrbook.a tests/test_rpc_node.c daemon/fee_estimator.c rpc_node.o daemon/subnet.c rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o bitcoin_mempool_policy.c daemon/mempool_compact.c daemon/mempool_persist.c mempool_entry.h
@@ -3343,4 +3343,4 @@ clean-check:
 	echo "CLEAN CHECK OK: no operand of \`make clean\` is a tracked file."
 
 clean:
-	rm -f $(OBJS) serve_hdrctx.o secp256k1_taproot.o secp256k1_schnorr.o bitcoind.o sha512.o bitcoin_hmac.o bitcoin_keys.o bitcoin_bip39.o ripemd160.o bitcoin_addr.o tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip32_ckdpub tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_wal_buffer tests/test_utxo_lsm tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_tx_submit tests/test_tx_relay tests/test_mempool_consensus_verify tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_whitelist tests/test_rpc_msg tests/test_rpc_rawtx tests/test_rpc_signraw tests/test_rpc_miniscript_sign rpc_json.o rpc_net.o rpc_commands.o rpc_server.o daemon/bitcoin_cli daemon/bitcoin_rpcd daemon/wallet_cli tests/bip30_shim tests/test_bip30 bitcoin_chainwork.o daemon/locator_build.o daemon/undo_log.o tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg
+	rm -f $(OBJS) serve_hdrctx.o secp256k1_taproot.o secp256k1_schnorr.o bitcoind.o sha512.o bitcoin_hmac.o bitcoin_keys.o bitcoin_bip39.o ripemd160.o bitcoin_addr.o tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip32_ckdpub tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_wal_buffer tests/test_utxo_lsm tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_tx_submit tests/test_tx_relay tests/test_mempool_consensus_verify tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_whitelist tests/test_rpc_msg tests/test_rpc_rawtx tests/test_rpc_signraw tests/test_rpc_miniscript_sign rpc_json.o rpc_net.o rpc_commands.o rpc_server.o daemon/bmc_cli daemon/bitcoin_rpcd daemon/wallet_cli tests/bip30_shim tests/test_bip30 bitcoin_chainwork.o daemon/locator_build.o daemon/undo_log.o tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg
