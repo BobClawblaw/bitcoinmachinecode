@@ -341,6 +341,7 @@ extern const char* txval_modern_reason(void);
 typedef int (*txv_resolve_fn)(void* ctx, const u8 outpoint[36], u32 index,
                               u64* value, u64* height, u64* is_coinbase,
                               const u8** spk, unsigned long* spklen);
+extern void txv_set_mempool_standard(int on);   /* SCR-9 */
 extern int tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
                              txv_resolve_fn rf, void* rctx, const char** reason);
 extern const u8* mpool_get(void* mp, const u8 txid[32], unsigned long* out_len);
@@ -374,7 +375,13 @@ static int txacc_tx_output(const u8* tx, unsigned long txlen, u32 index,
         if (p + 36 > end) return 0;
         p += 36;
         u64 sl = txacc_varint(&p, end, &cc); if (!cc) return 0;
-        if ((u64)(end - p) < sl + 4) return 0;
+        /* VAL-15 (audit 2026-09-03): `< sl + 4` wraps for sl near 2^64 and
+         * moves p backwards rather than refusing. This one runs on a
+         * mempool parent that has already passed tx_verify_mempool, so a
+         * wrapping length cannot reach it today -- which is a reason to
+         * write it correctly, not a reason to leave it. */
+        { u64 avail = (u64)(end - p);
+          if (sl > avail || avail - sl < 4) return 0; }
         p += sl + 4;
     }
     u64 nout = txacc_varint(&p, end, &cc); if (!cc || index >= nout) return 0;
@@ -518,7 +525,15 @@ static long txacc_sigop_cost(void* mp_area, const u8* tx, unsigned long txlen){
         }
     }
 
-    long cost = tx_legacy_sigops(tx, txlen) * 4;
+    /* SCR-10: tx_legacy_sigops now bounds every read and returns -1 on a
+     * truncated or malformed transaction. Treating that as a reject rather
+     * than as a cost keeps the sigop limit fail-CLOSED: a 0 would have said
+     * "no sigops" and passed the budget. This path already parsed the
+     * transaction above, so -1 is unreachable here today -- which is exactly
+     * why it must not be silently absorbed if that ever stops being true. */
+    long legacy_sigops = tx_legacy_sigops(tx, txlen);
+    if (legacy_sigops < 0) return -1;
+    long cost = legacy_sigops * 4;
     for (u64 i = 0; i < nin; i++){
         u64 v, h, cb; const u8* spk; unsigned long spkl;
         if (!txacc_resolve_verify(mp_area, in[i].prev, in[i].idx, &v, &h, &cb, &spk, &spkl))
@@ -658,8 +673,16 @@ static const char* txacc_prechecks(void* mp_area, const u8* tx, unsigned long tx
     if (lc > 2500) return "bad-txns-legacy-sigops";              /* MAX_TX_LEGACY_SIGOPS, Core v30 */
     long sc = txacc_sigop_cost(mp_area, tx, txlen);
     if (sc > 16000) return "bad-txns-too-many-sigops";           /* MAX_STANDARD_TX_SIGOPS_COST */
-    const char* wr = txacc_witness_standard(mp_area, tx, txlen);
-    if (wr) return wr;
+    /* MEM-23: Core gates IsWitnessStandard on require_standard
+     * (validation.cpp:909, `tx.HasWitness() && require_standard && ...`).
+     * This ran it unconditionally, so -acceptnonstdtxn did not actually
+     * accept every non-standard witness -- the opposite direction from the
+     * tx-size-small case above, and both were wrong the same way: the switch
+     * was applied where Core does not and not applied where Core does. */
+    if (!g_cfg.acceptnonstdtxn){
+        const char* wr = txacc_witness_standard(mp_area, tx, txlen);
+        if (wr) return wr;
+    }
     mpool_policy_set_pending_sigops(sc > 0 ? (unsigned long long)sc : 0ULL);
     return 0;
 }
@@ -750,6 +773,9 @@ int tx_policy_init(void){
       mpool_policy_set_datacarrier(g_pol, g_cfg.datacarrier
           ? (unsigned long long)g_cfg.datacarriersize : 0ULL);
       if (g_cfg.acceptnonstdtxn) mpool_policy_set_acceptnonstd(g_pol, 1);
+      /* SCR-9: the same switch has to reach the SCRIPT flags, not just the
+       * standardness checks above. Core's require_standard gates both. */
+      txv_set_mempool_standard(g_cfg.acceptnonstdtxn ? 0 : 1);
       /* -permitbaremultisig: getmempoolinfo has always REPORTED this as 1
        * while nothing could change it. It is a real gate now. */
       mpool_policy_set_baremultisig(g_pol, g_cfg.permitbaremultisig ? 1u : 0u); }
@@ -945,6 +971,13 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
             if (r && strstr(r, "missing/already-spent")){ g_alog.rej_missing++; return -25; }
             g_alog.rej_invalid++;
             snprintf(g_alog.last_invalid, sizeof g_alog.last_invalid, "%s", r ? r : "?");
+            /* MEM-10: a script failure is FINAL -- no descendant makes an
+             * invalid parent valid -- and it is the expensive verdict, the
+             * one an attacker wants recomputed. Missing inputs (-25) are NOT
+             * recorded: that transaction becomes valid the moment its parent
+             * arrives, and the orphan pool exists to re-try it. */
+            { extern void serve_reject_note(const u8*) __attribute__((weak));
+              if (serve_reject_note) serve_reject_note(txid); }
             return -26;
         }
     }
@@ -956,6 +989,13 @@ long tx_accept_validate_p2p(void* mp_area, const u8 txid[32], const u8* tx,
         g_alog.rej_policy++;
         const char* r = mpool_policy_reason(g_pol);
         if (r && txacc_fee_reconsiderable(r)) return -28;
+        /* MEM-10: remember the refusal so the next announcement of this txid
+         * costs nothing. Deliberately NOT for the -28 class above: Core keeps
+         * fee-only failures in a separate filter because a CPFP child can
+         * overturn them, and suppressing their re-announcement would break
+         * the 1p1c relay this file goes to some trouble to support. */
+        { extern void serve_reject_note(const u8*) __attribute__((weak));
+          if (serve_reject_note) serve_reject_note(txid); }
         return -26;
     }
     g_alog.acc++;

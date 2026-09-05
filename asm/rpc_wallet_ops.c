@@ -39,6 +39,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+/* WAL-8: Core rpcwallet.cpp MAX_SLEEP_TIME */
+#define WOP_MAX_SLEEP_TIME 100000000LL
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -257,6 +260,20 @@ static int wop_hdk_parse(const char* xprv, unsigned char k[32], unsigned char c[
                        ((unsigned)dec[2]<<8)|dec[3];
       if (v != 0x0488ADE4u && v != 0x04358394u) return 0; }
     if (dec[45] != 0x00) return 0;               /* private keys are 0x00-prefixed */
+    /* WAL-19 (audit 2026-09-03): the 32-byte scalar was accepted WITHOUT a
+     * range check, so an xprv whose key is 0 or >= n parsed as well-formed.
+     * Core rejects it -- CExtKey::Decode builds a CKey and IsValid() requires
+     * 0 < k < n -- and a key outside that range cannot sign, so importing one
+     * produces exactly the unspendable-but-reported-spendable coins the
+     * version check above this line exists to prevent.
+     *
+     * Unlike the rest of WAL-19 (an unreduced z, an unchecked k == 0), this is
+     * not a 2^-128 accident: the scalar comes straight from an operator- or
+     * attacker-supplied string, so the invalid case is reachable by simply
+     * typing it. scalar_small_nonzero (bitcoin_keys.asm) is the tree's
+     * existing 0 < k < n predicate, already used by bip32_ckd_priv. */
+    { extern int scalar_small_nonzero(const unsigned char k[32]);
+      if (!scalar_small_nonzero(dec + 46)) return 0; }
     memcpy(c, dec + 13, 32);
     memcpy(k, dec + 46, 32);
     return 1;
@@ -806,6 +823,16 @@ typedef struct { char desc[512]; long range; long next; int script; } wop_desc_t
 static wop_desc_t g_wd[WOP_MAX_DESCS];
 static int  g_wd_n = -1;                  /* -1 = not loaded from file */
 static wscan_key* g_wk;                   /* descriptor-derived key window */
+/* WAL-6 (audit 2026-09-03): which DESCRIPTOR each window entry came from.
+ * This used to be crammed into wscan_key.branch, whose bits mean something
+ * else entirely -- WOT_CHAIN reads bit 0 as receive/change and WOT_TYPE reads
+ * bits 4-5 as the address type -- so getaddressinfo reported `ischange` for a
+ * watch-only wallet as the IMPORT-ORDER PARITY of the descriptor slot, and
+ * `type` as whatever bits 4-5 of the slot index happened to be. A parallel
+ * array rather than a new wscan_key field: that struct is shared with the
+ * scanner and its records are persisted, so widening it is a format change
+ * for a value only this window needs. */
+static unsigned char* g_wk_desc;          /* descriptor slot per window entry */
 static int  g_wk_n = -1;
 static void wop_watch_keys_invalidate(void){ g_wd_n = -1; g_wk_n = -1; }
 
@@ -1447,8 +1474,38 @@ static int cmd_walletpassphrase(const rj_val* params, long* ec, const char** em)
         params->items[0]->typ != RJ_STR || params->items[1]->typ != RJ_NUM)
         return wop_err(ec, em, -8, "walletpassphrase(passphrase, timeout)");
     const char* pass = params->items[0]->str;
-    long secs = atol(params->items[1]->str);
-    if (secs <= 0) return wop_err(ec, em, -8, "Timeout must be a positive integer");
+    /* ---- WAL-8 (audit 2026-09-03): Core's timeout semantics ----
+     * This was atol with `secs <= 0` refused under a non-Core message. Three
+     * divergences: Core ACCEPTS 0 (unlock, then relock at once), Core CLAMPS
+     * at MAX_SLEEP_TIME rather than trusting the number, and atol of a huge
+     * value saturates to LONG_MAX so time(NULL) + seconds OVERFLOWED --
+     * wrapping negative in practice, which made wenc_seed() treat the wallet
+     * as already expired on the very next access while this call had returned
+     * success. The user was told the wallet was unlocked for 68 years and it
+     * was locked immediately. */
+    errno = 0;
+    char* tend = 0;
+    long long secs_ll = strtoll(params->items[1]->str, &tend, 10);
+    if (tend && *tend) return wop_err(ec, em, -8, "Timeout must be a positive integer");
+    if (secs_ll < 0 || errno == ERANGE)
+        return wop_err(ec, em, -8, "Timeout cannot be negative.");
+    if (secs_ll > WOP_MAX_SLEEP_TIME) secs_ll = WOP_MAX_SLEEP_TIME;   /* Core clamps */
+    long secs = (long)secs_ll;
+    /* WAL-8: a zero timeout is handled HERE, not by passing 0 down.
+     * wenc_unlock reads seconds<=0 as "no timer, stay unlocked", and
+     * daemon/main.c's BOOT unlock relies on exactly that -- passing Core's 0
+     * through would have left the wallet unlocked forever instead of
+     * relocking, the precise opposite of what was asked. Core unlocks and
+     * schedules the relock for now, so with 0 the passphrase is verified and
+     * the wallet ends up locked. */
+    if (secs == 0){
+        extern void wenc_lock(void);
+        if (wenc_unlock(pass, (long)strlen(pass), 1) != 1)
+            return wop_err(ec, em, -14,
+                "Error: The wallet passphrase entered was incorrect.");
+        wenc_lock();
+        return 1;
+    }
     if (wenc_unlock(pass, (long)strlen(pass), secs) != 1)
         return wop_err(ec, em, -14,
             "Error: The wallet passphrase entered was incorrect.");
@@ -1515,14 +1572,36 @@ static int cmd_backupwallet(const rj_val* params, long* ec, const char** em, rj_
     const char* dest = wop_str_arg(params, 0);
     if (!dest || !dest[0]) return wop_err(ec, em, -8, "backupwallet requires a destination");
     char pb[512];
-    if (!wop_exists(WOP_WALLET_REL)) return wop_err(ec, em, -4, "No wallet file to back up");
-    const char* src = wop_path(WOP_WALLET_REL, pb, sizeof pb);
+    /* ---- WAL-12 (audit 2026-09-03): back up the wallet that EXISTS ----
+     * This looked only for bmcwallet.dat. encryptwallet writes bmcwallet.enc
+     * and UNLINKS the plaintext, so `encryptwallet x; backupwallet /mnt/w.bak`
+     * answered -4 "No wallet file to back up" on a wallet that plainly exists.
+     *
+     * The second half is worse and is the reason this is not merely an error
+     * message: walletkeys.dat holds the xprvs added by addhdkey, and nothing
+     * here ever copied it. A backup of such a wallet was accepted, reported
+     * success, and SILENTLY OMITTED keys -- the operator learns that only when
+     * restoring. Silent partial backups are the failure mode a backup command
+     * must not have. */
+    const char* primary_rel = wop_exists("bmcwallet.enc") ? "bmcwallet.enc"
+                            : (wop_exists(WOP_WALLET_REL) ? WOP_WALLET_REL : NULL);
+    if (!primary_rel) return wop_err(ec, em, -4, "No wallet file to back up");
+    int have_keys = wop_exists(WOP_HDKEYS_REL);
+    const char* src = wop_path(primary_rel, pb, sizeof pb);
     /* Core accepts a directory and writes <dir>/<walletname> into it. */
     char out[1024]; struct stat sb;
-    if (stat(dest, &sb) == 0 && S_ISDIR(sb.st_mode))
-        snprintf(out, sizeof out, "%s/%s", dest, WOP_WALLET_NAME);
+    int dest_is_dir = (stat(dest, &sb) == 0 && S_ISDIR(sb.st_mode));
+    if (dest_is_dir)
+        snprintf(out, sizeof out, "%s/%s", dest, primary_rel);
     else
         snprintf(out, sizeof out, "%s", dest);
+    /* WAL-12: a single-file destination cannot carry the companion keys, so
+     * say so instead of writing an incomplete backup. A directory can, and
+     * does, below. */
+    if (have_keys && !dest_is_dir)
+        return wop_err(ec, em, -8,
+            "this wallet has added HD keys (walletkeys.dat) that a single-file backup "
+            "cannot carry -- pass a DIRECTORY as the destination so every file is copied");
     FILE* in = fopen(src, "rb");
     if (!in) return wop_err(ec, em, -4, "Cannot open the wallet file for reading");
     FILE* o = fopen(out, "wb");
@@ -1535,6 +1614,26 @@ static int cmd_backupwallet(const rj_val* params, long* ec, const char** em, rj_
     if (fclose(o) != 0) bad = 1;
     fclose(in);
     if (bad){ remove(out); return wop_err(ec, em, -4, "Backup failed while copying; destination removed"); }
+    /* WAL-12: the companion files, when the destination is a directory. */
+    if (dest_is_dir && have_keys){
+        char kp[512], kout[1024];
+        const char* ksrc = wop_path(WOP_HDKEYS_REL, kp, sizeof kp);
+        snprintf(kout, sizeof kout, "%s/%s", dest, WOP_HDKEYS_REL);
+        FILE* ki = fopen(ksrc, "rb");
+        if (!ki){ remove(out); return wop_err(ec, em, -4, "Cannot open walletkeys.dat for reading"); }
+        FILE* ko = fopen(kout, "wb");
+        if (!ko){ fclose(ki); remove(out);
+                  return wop_err(ec, em, -4, "Cannot write walletkeys.dat to the backup directory"); }
+        char kb[16384]; size_t kn; int kbad = 0;
+        while ((kn = fread(kb, 1, sizeof kb, ki)) > 0)
+            if (fwrite(kb, 1, kn, ko) != kn){ kbad = 1; break; }
+        if (ferror(ki)) kbad = 1;
+        if (fflush(ko) != 0) kbad = 1;
+        if (fclose(ko) != 0) kbad = 1;
+        fclose(ki);
+        if (kbad){ remove(kout); remove(out);
+                   return wop_err(ec, em, -4, "Backup failed while copying walletkeys.dat; destination removed"); }
+    }
     *res = rj_null();
     return 1;
 }
@@ -1614,6 +1713,7 @@ static int wop_watch_keyset(const wscan_key** out){
     if (g_wk_n >= 0){ *out = g_wk; return g_wk_n; }
     int nd = wop_descs_load();
     if (!g_wk) g_wk = malloc((size_t)(WOP_SCAN_KEYS*2) * sizeof *g_wk);
+    if (!g_wk_desc) g_wk_desc = malloc((size_t)(WOP_SCAN_KEYS*2));   /* WAL-6 */
     if (!g_wk){ *out = NULL; return 0; }
     g_wk_n = 0;
     static unsigned char h[WOP_SCAN_KEYS*2][20];
@@ -1627,7 +1727,12 @@ static int wop_watch_keyset(const wscan_key** out){
         for (long i = 0; i < n; i++){
             memcpy(g_wk[g_wk_n].h160, h[i], 20);
             g_wk[g_wk_n].keyidx = (unsigned)i;
-            g_wk[g_wk_n].branch = (unsigned char)sdx;
+            /* WAL-6: branch keeps its documented meaning. An imported
+             * descriptor carries no receive/change distinction of its own --
+             * `internal` is not honoured (WAL-15) -- so 0 is the honest
+             * answer, not the slot index. */
+            g_wk[g_wk_n].branch = 0;
+            if (g_wk_desc) g_wk_desc[g_wk_n] = (unsigned char)sdx;
             g_wk_n++;
         }
     }
@@ -1877,7 +1982,14 @@ int rpc_wops_address_ownership(const rpc_wallet* w, const unsigned char* spk, un
     const unsigned char* h20;
     if (!wscan_spk_h160(spk, spklen, &h20)) return 1;   /* not an address shape we track ownership for at all */
     const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
-    if (nk <= 0) return 1;
+    /* ---- WAL-6 (audit 2026-09-03): "no keys" is not "not mine" ----
+     * An empty keyset means the seed is LOCKED and no watch-only descriptors
+     * are imported -- the wallet cannot answer the question. Returning 1 with
+     * every output zeroed made getaddressinfo report ismine:false, which reads
+     * as a definitive "this address is not yours" when the honest answer is
+     * "ask again when unlocked". A caller deciding whether an address is safe
+     * to spend to gets the same reply for "not yours" and "cannot tell". */
+    if (nk <= 0) return (w && w->seed) ? 1 : -1;
     int spending = (w && w->seed) ? 1 : 0;
     for (int i = 0; i < nk; i++){
         if (memcmp(keys[i].h160, h20, 20) != 0) continue;
@@ -1990,6 +2102,56 @@ int rpc_wops_own_coin(const void* wseed, const unsigned char txid_wire[32], unsi
  * Returns -1 when no rescan has completed. A caller must NOT turn that into
  * 0.00000000: "I have not looked" and "you have nothing" are different
  * answers, and only one of them is true. */
+/* ---- WAL-2 (audit 2026-09-03): ONE place that turns a scan record into the
+ * scriptPubKey (and redeemScript) the coin is actually locked to.
+ *
+ * There were two derivations of this. rpc_wops_wallet_coins built the right
+ * script for all four output types -- which is why `listunspent` reported
+ * legacy, sh(wpkh) and tr coins as spendable -- while wf_coins, the SPEND
+ * selector, carried only the 20-byte hash and wf_fund then wrote
+ * `0014<h160>` for every input. So the signer was told every prevout was
+ * P2WPKH.
+ *
+ * For a legacy coin the stored hash IS the key hash, so the signer produced a
+ * BIP143 witness against a P2PKH prevout: a transaction the mempool refuses,
+ * or -- with -walletbroadcast=0 -- a txid handed back for something the
+ * network will never accept. For sh(wpkh) and tr the stored hash is a SCRIPT
+ * hash or the first 20 bytes of Q, so the signer found no key at all and
+ * reported "could not sign every input". Either way every non-bech32 coin was
+ * unspendable through the wallet RPCs while listunspent said otherwise.
+ *
+ * Two copies of this logic is what let them drift, so there is now one. */
+static void wop_coin_scripts(const void* wseed, const wscan_rec* r,
+                             const unsigned char h160[20],
+                             unsigned char* spk, unsigned long* spklen,
+                             unsigned char* redeem, unsigned long* redeemlen){
+    *spklen = 0; *redeemlen = 0;
+    int t = WOT_TYPE(r->branch);
+    if (t == WOT_BECH32M){
+        /* the key window holds 20 of Q's 32 bytes: re-derive the full key */
+        unsigned path[5]; rpc_wops_type_path(t, r->keyidx, WOT_CHAIN(r->branch), path);
+        unsigned char kk[32], cc[32], pub[33], h20[20];
+        if (r->hdkey == 0 && wseed && bip32_derive_path(kk, cc, (const unsigned char*)wseed, 64, path, 5) == 1){
+            scalar_to_pubkey(pub, kk);
+            rpc_wops_type_spk(t, pub, spk, spklen, h20);
+        }
+    } else if (t == WOT_LEGACY){
+        spk[0]=0x76; spk[1]=0xa9; spk[2]=0x14; memcpy(spk+3, h160, 20);
+        spk[23]=0x88; spk[24]=0xac; *spklen = 25;
+    } else if (t == WOT_P2SH_SEGWIT){
+        spk[0]=0xa9; spk[1]=0x14; memcpy(spk+2, h160, 20); spk[22]=0x87; *spklen = 23;
+        /* redeemScript = 0 <hash160(pub)>; the signer needs it to sign at all */
+        unsigned path[5]; rpc_wops_type_path(t, r->keyidx, WOT_CHAIN(r->branch), path);
+        unsigned char kk[32], cc[32], pub[33], kh[20];
+        if (r->hdkey == 0 && wseed && bip32_derive_path(kk, cc, (const unsigned char*)wseed, 64, path, 5) == 1){
+            scalar_to_pubkey(pub, kk); hash160(kh, pub, 33);
+            redeem[0]=0x00; redeem[1]=0x14; memcpy(redeem+2, kh, 20); *redeemlen = 22;
+        }
+    } else {
+        spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, h160, 20); *spklen = 22;
+    }
+}
+
 int rpc_wops_wallet_coins(const void* wseed, rpc_wops_coin* out, int cap){
     if (!out || cap <= 0) return 0;
     rpc_wallet w; memset(&w, 0, sizeof w); w.seed = (const unsigned char*)wseed;
@@ -2014,20 +2176,8 @@ int rpc_wops_wallet_coins(const void* wseed, rpc_wops_coin* out, int cap){
         c->is_coinbase = recs[i].is_coinbase ? 1 : 0;
         c->branch = recs[i].branch;
         memset(c->h160, 0, 20); c->spklen = 0; c->redeemlen = 0;
-        if (keys && wop_rec_h160(keys, nk, &recs[i], c->h160)){
-            int t = WOT_TYPE(c->branch);
-            if (t == WOT_BECH32M){                       /* the window holds 20 of Q's 32 bytes: re-derive */
-                unsigned path[5]; rpc_wops_type_path(t, recs[i].keyidx, WOT_CHAIN(c->branch), path);
-                unsigned char kk[32], cc[32], pub[33], h20[20];
-                if (recs[i].hdkey == 0 && bip32_derive_path(kk, cc, w.seed, 64, path, 5) == 1){ scalar_to_pubkey(pub, kk); rpc_wops_type_spk(t, pub, c->spk, &c->spklen, h20); }
-            } else if (t == WOT_LEGACY){ c->spk[0]=0x76;c->spk[1]=0xa9;c->spk[2]=0x14;memcpy(c->spk+3,c->h160,20);c->spk[23]=0x88;c->spk[24]=0xac; c->spklen=25; }
-            else if (t == WOT_P2SH_SEGWIT){ c->spk[0]=0xa9;c->spk[1]=0x14;memcpy(c->spk+2,c->h160,20);c->spk[22]=0x87; c->spklen=23;
-                /* redeemScript = 0 <hash160(pub)> from the key at this index */
-                unsigned path[5]; rpc_wops_type_path(t, recs[i].keyidx, WOT_CHAIN(c->branch), path);
-                unsigned char kk[32], cc[32], pub[33], kh[20];
-                if (recs[i].hdkey == 0 && bip32_derive_path(kk, cc, w.seed, 64, path, 5) == 1){ scalar_to_pubkey(pub, kk); hash160(kh, pub, 33); c->redeem[0]=0x00; c->redeem[1]=0x14; memcpy(c->redeem+2, kh, 20); c->redeemlen = 22; } }
-            else { c->spk[0]=0x00; c->spk[1]=0x14; memcpy(c->spk+2, c->h160, 20); c->spklen = 22; }
-        }
+        if (keys && wop_rec_h160(keys, nk, &recs[i], c->h160))
+            wop_coin_scripts(wseed, &recs[i], c->h160, c->spk, &c->spklen, c->redeem, &c->redeemlen);
         m++;
     }
     return m;
@@ -2454,6 +2604,18 @@ extern int rpc_dispatch(const char* method, const rj_val* params, const rpc_wall
  * is the only input form the selector will pick. */
 #define WF_IN_BASE_WU   (41 * 4)     /* outpoint 36 + empty scriptSig 1 + seq 4 */
 #define WF_IN_WIT_WU    108          /* count 1 + (1+72) sig + (1+33) pubkey */
+/* WAL-2: an input's weight depends on its TYPE. Charging every input the
+ * P2WPKH figure under-paid a legacy input by 80 vB and over-paid a taproot
+ * one by 10.5 -- and the comment above used to assert P2WPKH was "the only
+ * input form the selector will pick", which was the same false premise that
+ * made those coins unspendable. Core's DummySignTx sizes each input by its
+ * own script; these are the resulting vsizes: 148, 91, 68, 57.5. */
+static long wf_in_wu(int type){
+    if (type == WOT_LEGACY)      return 148 * 4;        /* scriptSig sig+pubkey, no witness */
+    if (type == WOT_P2SH_SEGWIT) return 64 * 4 + 108;   /* 22-byte redeem push + witness  */
+    if (type == WOT_BECH32M)     return 41 * 4 + 66;    /* 64-byte schnorr sig, no pubkey */
+    return WF_IN_BASE_WU + WF_IN_WIT_WU;                /* P2WPKH */
+}
 #define WF_OVERHEAD_WU  (10 * 4 + 2) /* version+locktime+2 varints, + marker/flag */
 
 static long wf_out_wu(unsigned long spklen){
@@ -2475,6 +2637,14 @@ typedef struct {
     unsigned int  keyidx;
     unsigned char branch;
     unsigned char h160[20];
+    /* WAL-2: the script the coin is ACTUALLY locked to, and for sh(wpkh) the
+     * redeemScript the signer cannot sign without. Previously the selector
+     * carried only h160 and every input was described to the signer as
+     * P2WPKH. */
+    unsigned char spk[64];
+    unsigned long spklen;
+    unsigned char redeem[40];
+    unsigned long redeemlen;
 } wf_coin;
 
 static int wf_coins(const rpc_wallet* w, wf_coin* out, int cap, int minconf){
@@ -2511,9 +2681,57 @@ static int wf_coins(const rpc_wallet* w, wf_coin* out, int cap, int minconf){
         out[m].keyidx = recs[i].keyidx;
         out[m].branch = recs[i].branch;
         if (!wop_rec_h160(keys, nk, &recs[i], out[m].h160)) continue;
+        wop_coin_scripts(w->seed, &recs[i], out[m].h160,
+                         out[m].spk, &out[m].spklen,
+                         out[m].redeem, &out[m].redeemlen);
+        /* A coin whose script we cannot reconstruct must not be selected:
+         * spending it would mean signing against a scriptPubKey we guessed.
+         * The only way here is a taproot or sh(wpkh) key outside the
+         * derivation window, which is the same condition wf_sign already
+         * reports as "an input was selected whose key is outside the window". */
+        if (out[m].spklen == 0) continue;
         m++;
     }
     return m;
+}
+
+/* ---- WAL-2 test hook -----------------------------------------------------
+ * The SPEND selector is static, and the defect WAS that its view of a coin
+ * disagreed with the one `listunspent` publishes: the same output, described
+ * to the signer as P2WPKH when it is P2PKH, sh(wpkh) or P2TR. So the property
+ * worth pinning is not "wf_coins produces script X" but "wf_coins and
+ * rpc_wops_wallet_coins agree, for every coin, always" -- which is what a
+ * caller can check once it can see both. Same convention as the test hooks in
+ * daemon/tx_relay.c. */
+int rpc_wops_test_spend_coin(const void* wseed, int idx,
+                             unsigned char* txid_out, unsigned int* vout_out,
+                             unsigned char* spk, unsigned long* spklen,
+                             unsigned char* redeem, unsigned long* redeemlen){
+    static wf_coin coins[4096];
+    rpc_wallet w; memset(&w, 0, sizeof w); w.seed = (const unsigned char*)wseed;
+    int nc = wf_coins(&w, coins, 4096, 0);
+    if (idx < 0 || idx >= nc) return 0;
+    if (txid_out) memcpy(txid_out, coins[idx].txid, 32);
+    if (vout_out) *vout_out = coins[idx].vout;
+    if (spk){ memcpy(spk, coins[idx].spk, coins[idx].spklen); *spklen = coins[idx].spklen; }
+    if (redeem){ memcpy(redeem, coins[idx].redeem, coins[idx].redeemlen); *redeemlen = coins[idx].redeemlen; }
+    return nc;
+}
+
+/* WAL-2: the per-type script derivation, reachable with a synthetic record so
+ * a test can check all four output types without needing four kinds of coin
+ * in a chain fixture. The wallet fixtures hold bech32 coins, which is exactly
+ * why the defect survived -- no test spent anything else. */
+int rpc_wops_test_coin_script(const void* wseed, int type, int chain, unsigned keyidx,
+                              const unsigned char h160[20],
+                              unsigned char* spk, unsigned long* spklen,
+                              unsigned char* redeem, unsigned long* redeemlen){
+    wscan_rec r; memset(&r, 0, sizeof r);
+    r.branch = (unsigned char)WOT_BRANCH(type, chain);
+    r.keyidx = keyidx;
+    r.hdkey  = 0;
+    wop_coin_scripts(wseed, &r, h160, spk, spklen, redeem, redeemlen);
+    return *spklen != 0;
 }
 
 /* ---- fee rate -----------------------------------------------------------
@@ -2599,20 +2817,21 @@ static int wf_select(wf_coin* coins, int ncoins, unsigned long long target,
     }
     unsigned long long sum = 0;
     int n = 0;
+    long in_wu = 0;                                   /* WAL-2: weight of the inputs picked so far */
     for (int i = 0; i < ncoins && n < WF_MAX_IN; i++){
         pick[n++] = i;
         sum += coins[i].value;
         /* fee for this input count, WITH a change output -- assume change
          * until we find we do not need it, so we never under-pay */
-        long wu = WF_OVERHEAD_WU + (long)n * (WF_IN_BASE_WU + WF_IN_WIT_WU)
-                  + out_wu + wf_out_wu(22);
+        in_wu += wf_in_wu(WOT_TYPE(coins[i].branch));      /* WAL-2: per type */
+        long wu = WF_OVERHEAD_WU + in_wu + out_wu + wf_out_wu(22);
         unsigned long long fee = ((unsigned long long)wf_vsize(wu) * feerate_kvb + 999) / 1000;
         if (sum < target + fee) continue;
         unsigned long long change = sum - target - fee;
         if (change < dust){
             /* drop the change output: recompute the fee without it and give
              * the remainder to the miner rather than creating dust */
-            long wu2 = WF_OVERHEAD_WU + (long)n * (WF_IN_BASE_WU + WF_IN_WIT_WU) + out_wu;
+            long wu2 = WF_OVERHEAD_WU + in_wu + out_wu;
             unsigned long long fee2 = ((unsigned long long)wf_vsize(wu2) * feerate_kvb + 999) / 1000;
             if (sum < target + fee2) continue;
             *fee_out = sum - target;      /* everything left over is the fee */
@@ -2686,6 +2905,17 @@ static void wf_hex(char* out, const unsigned char* b, long n){
 /* Fund a set of outputs: select coins, add change, return the unsigned hex
  * plus the prevtxs array signrawtransactionwithwallet needs for BIP143.
  * Returns 1, or 0 with *ec / *em set. */
+/* WAL-17 (audit 2026-09-03): moved up from the bumpfee section -- the fee
+ * ceiling now guards the ORDINARY funding path too, not just bumpfee. */
+#define BF_MAXTXFEE_SAT 10000000ULL         /* Core -maxtxfee default, 0.1 BTC */
+/* Core's FormatMoney: BTC with trailing zeros stripped ("0.00001"). */
+static void bf_fmt_money(long long sat, char* out, size_t cap){
+    snprintf(out, cap, "%lld.%08lld", sat/100000000LL, sat%100000000LL);
+    size_t l = strlen(out);
+    while (l && out[l-1] == '0') out[--l] = 0;
+    if (l && out[l-1] == '.') out[--l] = 0;
+}
+
 static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
                    int conf_target, char** hex_out, rj_val** prevtxs_out,
                    unsigned long long* fee_out, int* changepos_out,
@@ -2722,11 +2952,16 @@ static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
         extern long wallet_bnb_select(const unsigned long long*, const long long*, int,
                                       unsigned long long, unsigned long long, int*, int);
         static int order[4096]; static unsigned long long eff[4096];
-        unsigned long long in_fee =
-            ((unsigned long long)wf_vsize(WF_IN_BASE_WU + WF_IN_WIT_WU) * rate + 999) / 1000;
+        /* WAL-2: effective value is value minus the cost of SPENDING THIS
+         * COIN, and that cost depends on its type -- a legacy input costs
+         * more than twice a taproot one. A flat figure made large legacy
+         * coins look better than they are and small taproot ones worse. */
         int ne = 0;
-        for (int i = 0; i < nc && ne < 4096; i++)
+        for (int i = 0; i < nc && ne < 4096; i++){
+            unsigned long long in_fee =
+                ((unsigned long long)wf_vsize(wf_in_wu(WOT_TYPE(coins[i].branch))) * rate + 999) / 1000;
             if (coins[i].value > in_fee){ order[ne] = i; eff[ne] = coins[i].value - in_fee; ne++; }
+        }
         for (int i = 1; i < ne; i++){                     /* sort DESCENDING by eff */
             int oi = order[i]; unsigned long long ei = eff[i]; int j = i - 1;
             while (j >= 0 && eff[j] < ei){ order[j+1] = order[j]; eff[j+1] = eff[j]; j--; }
@@ -2763,7 +2998,7 @@ static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
             if (picked) continue;
             int same = 0; for (int k = 0; k < nin; k++) if (!memcmp(coins[pick[k]].h160, coins[i].h160, 20)){ same = 1; break; }
             if (!same) continue;
-            unsigned long long f1 = ((unsigned long long)wf_vsize(WF_IN_BASE_WU + WF_IN_WIT_WU) * rate + 999) / 1000;
+            unsigned long long f1 = ((unsigned long long)wf_vsize(wf_in_wu(WOT_TYPE(coins[i].branch))) * rate + 999) / 1000;
             if (g_wdef.maxapsfee_sat >= 0 && extra_fee + f1 > (unsigned long long)g_wdef.maxapsfee_sat && !g_wdef.avoidpartialspends) break;
             if (g_wdef.maxapsfee_sat >= 0 && g_wdef.avoidpartialspends && extra_fee + f1 > (unsigned long long)g_wdef.maxapsfee_sat && g_wdef.maxapsfee_sat > 0) break;
             pick[nin + added++] = i; extra_fee += f1; extra_val += coins[i].value;
@@ -2819,13 +3054,42 @@ static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
         tx[64] = 0;
         rj_obj_set(e, "txid", rj_str(tx));
         rj_obj_set(e, "vout", rj_numf("%u", c->vout));
-        { char spkh[64]; unsigned char spk[22];
-          spk[0]=0x00; spk[1]=0x14; memcpy(spk+2, c->h160, 20);
-          wf_hex(spkh, spk, 22);
+        /* WAL-2: the script the coin is ACTUALLY locked to. This used to
+         * write 0014<h160> unconditionally, so the signer was told every
+         * prevout was P2WPKH -- and signrawtransactionwithwallet lets a
+         * caller-supplied prevtx WIN over the correct one it would otherwise
+         * synthesise, so the wrong answer was the one used. */
+        { char spkh[160];
+          wf_hex(spkh, c->spk, c->spklen);
           rj_obj_set(e, "scriptPubKey", rj_str(spkh)); }
+        /* sh(wpkh) cannot be signed without its redeemScript. */
+        if (c->redeemlen){
+            char rsh[96];
+            wf_hex(rsh, c->redeem, c->redeemlen);
+            rj_obj_set(e, "redeemScript", rj_str(rsh));
+        }
         { char am[32]; rpc_amounts((long long)c->value, am, sizeof am);
           rj_obj_set(e, "amount", rj_numf("%s", am)); }
         rj_arr_push(pv, e);
+    }
+    /* ---- WAL-17 (audit 2026-09-03): the -maxtxfee guard ----
+     * BF_MAXTXFEE_SAT (Core's -maxtxfee default, 0.1 BTC) existed but was
+     * consulted ONLY by bumpfee. Every ordinary funding path -- sendtoaddress,
+     * sendmany, send, fundrawtransaction -- had no ceiling at all, so a bad
+     * feerate estimate or a hostile feeRate argument could burn the wallet to
+     * fee with nothing to stop it. This is the one item in the batch that
+     * loses money outright.
+     *
+     * Refuse rather than clamp: silently paying less than asked would produce
+     * a transaction the caller did not request, and Core raises here too. */
+    if (fee > BF_MAXTXFEE_SAT){
+        static char e[192]; char a[32], b[32];
+        bf_fmt_money((long long)fee, a, sizeof a);
+        bf_fmt_money((long long)BF_MAXTXFEE_SAT, b, sizeof b);
+        snprintf(e, sizeof e,
+                 "Fee (%s) exceeds the maximum fee (%s) -- raise -maxtxfee or lower the feerate", a, b);
+        free(hx); if (pv) rj_free(pv);
+        return wop_err(ec, em, -4, e);
     }
     *hex_out = hx; *prevtxs_out = pv; *fee_out = fee;
     return 1;
@@ -3014,12 +3278,31 @@ static int cmd_sendall(const rj_val* params, const rpc_wallet* w,
     static wf_coin coins[4096];
     int nc = wf_coins(w, coins, 4096, 1);
     if (nc == 0) return wop_err(ec, em, -6, "Insufficient funds: nothing spendable to sweep");
-    if (nc > WF_MAX_IN) nc = WF_MAX_IN;
+    /* ---- WAL-17 (audit 2026-09-03): "sendall" that does not send all ----
+     * This silently clamped to the first WF_MAX_IN coins and then reported
+     * complete:true, so a wallet with more than 64 spendable outputs was
+     * partially swept while the RPC said it had swept everything. The caller
+     * only discovers the remainder by looking at the balance afterwards.
+     *
+     * Refusing is the honest answer: Core's sendall sweeps the whole wallet,
+     * and there is no partial-sweep contract to fall back on. The message
+     * names the limit and the remedy so the operator can sweep in batches
+     * with `inputs`. */
+    int nc_all = nc;
+    if (nc > WF_MAX_IN){
+        static char e[192];
+        snprintf(e, sizeof e,
+                 "sendall would sweep %d spendable outputs but this builder is limited to %d; "
+                 "sweep in batches using the `inputs` argument",
+                 nc_all, WF_MAX_IN);
+        return wop_err(ec, em, -4, e);
+    }
     unsigned long long sum = 0;
     int pick[WF_MAX_IN];
     for (int i = 0; i < nc; i++){ pick[i] = i; sum += coins[i].value; }
     unsigned long long rate = wf_feerate_sat_kvb(6);
-    long wu = WF_OVERHEAD_WU + (long)nc * (WF_IN_BASE_WU + WF_IN_WIT_WU) + wf_out_wu(slen);
+    long wu = WF_OVERHEAD_WU + wf_out_wu(slen);
+    for (int i = 0; i < nc; i++) wu += wf_in_wu(WOT_TYPE(coins[i].branch));   /* WAL-2 */
     unsigned long long fee = ((unsigned long long)wf_vsize(wu) * rate + 999) / 1000;
     if (sum <= fee)
         return wop_err(ec, em, -6, "Insufficient funds: the sweep would not cover its own fee");
@@ -3232,15 +3515,7 @@ static int cmd_walletcreatefundedpsbt(const rj_val* params, const rpc_wallet* w,
  * `original_change_index` options are refused, not half-implemented. */
 
 #define BF_WALLET_INCREMENTAL_KVB 5000ULL   /* Core WALLET_INCREMENTAL_RELAY_FEE */
-#define BF_MAXTXFEE_SAT 10000000ULL         /* Core -maxtxfee default, 0.1 BTC */
 
-/* Core's FormatMoney: BTC with trailing zeros stripped ("0.00001"). */
-static void bf_fmt_money(long long sat, char* out, size_t cap){
-    snprintf(out, cap, "%lld.%08lld", sat/100000000LL, sat%100000000LL);
-    size_t l = strlen(out);
-    while (l && out[l-1] == '0') out[--l] = 0;
-    if (l && out[l-1] == '.') out[--l] = 0;
-}
 
 /* one dispatched call, result freed by caller; 0 on dispatch error (ec/em set) */
 static int bf_call(const char* method, rj_val* params, const rpc_wallet* w,

@@ -120,6 +120,53 @@ int main(void) {
         }
     }
 
+    /* ---- WAL-11 (audit 2026-09-03): an over-long mnemonic must not write
+     * past m39_idx.
+     *
+     * bip39_parse stored every valid word it found into m39_idx (24 dwords,
+     * 96 bytes) and only checked the 12/15/18/21/24 word count AFTERWARDS, so
+     * `wallet_cli seed "<400 valid words>"` ran 1,600 bytes forward through
+     * m39_salt, m39_msg, m39_prev/cur/acc and m39_nw into the next object's
+     * .bss. Reachable from the CLI and from a hand-edited store, not over RPC
+     * (the mnemonic is capped there).
+     *
+     * The RETURN VALUE cannot detect this: 400 words was refused before the
+     * fix too, at the word-count check, after doing the damage. So the
+     * assertion is on m39_guard, the .bss canary sitting past the last of
+     * those buffers. Delete the `cmp r13, 24` bound in bip39_parse and this
+     * fails; that is what makes it a control and not a restatement. */
+    {
+        extern unsigned char m39_guard[512];
+        /* 400 VALID words, so nothing short-circuits on an unknown word.
+         * "zoo" and NOT "abandon": abandon is wordlist index 0, so the
+         * overflow writes zeros and a zero-initialised canary still reads
+         * clean -- the first version of this test used it and passed with
+         * the bound removed. zoo is index 2047, which is visible. */
+        static char longm[400 * 4 + 1];
+        char* w = longm;
+        for (int i = 0; i < 400; i++){ memcpy(w, i ? " zoo" : "zoo", i ? 4 : 3); w += i ? 4 : 3; }
+        *w = 0;
+
+        int guard_was_clean = 1;
+        for (int i = 0; i < 512; i++) if (m39_guard[i]) guard_was_clean = 0;
+        if (!guard_was_clean){ printf("FAIL WAL-11 canary dirty before the call\n"); failures++; }
+
+        int nw = bip39_validate(longm);
+        if (nw != -1){ printf("FAIL WAL-11 400-word mnemonic accepted (%d)\n", nw); failures++; }
+        else printf("PASS WAL-11 400-word mnemonic rejected\n");
+
+        int dirty = 0;
+        for (int i = 0; i < 512; i++) if (m39_guard[i]) dirty++;
+        if (dirty){ printf("FAIL WAL-11 parse wrote %d bytes past its buffers\n", dirty); failures++; }
+        else printf("PASS WAL-11 nothing written past m39_idx (canary clean)\n");
+
+        /* and the module still works afterwards */
+        int ok = bip39_validate("abandon abandon abandon abandon abandon abandon "
+                                "abandon abandon abandon abandon abandon about");
+        if (ok != 12){ printf("FAIL WAL-11 valid 12-word mnemonic broken after (%d)\n", ok); failures++; }
+        else printf("PASS WAL-11 a valid mnemonic still parses afterwards\n");
+    }
+
     printf(failures ? "FAILURES %d\n" : "ALL TESTS PASSED (0 failures)\n", failures);
     return failures ? 1 : 0;
 }

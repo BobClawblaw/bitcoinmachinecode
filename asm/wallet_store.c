@@ -166,8 +166,18 @@ static int hex_decode(unsigned char* out, const char* in) {
 /* Derive a 64-byte encryption key from the secret passphrase via PBKDF2
  * (reusing the verified BIP39 mnemonic->seed primitive: mnemonic="" is the
  * password, "", the salt). */
-static void deriv_key(unsigned char K[64], const char* pass) {
-    bip39_mnemonic_to_seed(K, "", pass, (long)strlen(pass));
+/* CRY-4: this is one of the two paths that reach the BIP39 salt buffer with
+ * an operator-supplied length -- `pass` here is BMC_WALLET_PASS, read with
+ * strlen and never capped. bip39_mnemonic_to_seed refuses an over-long
+ * passphrase now instead of writing past m39_salt, and it returns 0 when it
+ * does; K is zeroed on that path so a caller that ignores the return cannot
+ * proceed with stack garbage as a key. */
+static int deriv_key(unsigned char K[64], const char* pass) {
+    if (bip39_mnemonic_to_seed(K, "", pass, (long)strlen(pass)) != 1){
+        memset(K, 0, 64);
+        return 0;
+    }
+    return 1;
 }
 
 /* CTR stream: encrypt/decrypt n bytes of `in` into `out` (may alias) with a
@@ -293,7 +303,8 @@ int wallet_store_load(const char* path, char* mnemonic_out, int cap,
         if (pass_out && pcap > 0 && pass_out[0]) sec = pass_out;   /* caller pre-filled */
         if (!sec) sec = getenv("BMC_WALLET_PASS");
         if (!sec || !sec[0]) { if (pass_out && pcap>0) pass_out[0] = 0; return -1; }
-        unsigned char K[64]; deriv_key(K, sec);
+        unsigned char K[64];
+        if (!deriv_key(K, sec)) return -1;    /* CRY-4: over-long passphrase */
         int ctlen = (int)(strlen(cthex)/2); if (ctlen <= 0) return -1;
         /* first pass validate hex length (must be even) */
         if ((int)strlen(cthex) & 1) return -1;
@@ -378,7 +389,9 @@ int wallet_secret_read(const char* path, const char* magic,
     unsigned char want[32];
     if (!ct || hex_decode(ct, cthex) != ctn || hex_decode(want, taghex) != 32){
         free(ct); free(cthex); return -1; }
-    unsigned char K[64]; deriv_key(K, pass);
+    unsigned char K[64];
+    if (!deriv_key(K, pass)){                 /* CRY-4: over-long passphrase */
+        free(ct); free(cthex); return -1; }
     unsigned char tag[32];
     make_tag(tag, K, ct, ctn);
     if (memcmp(tag, want, 32) != 0){          /* wrong passphrase, or tampering */

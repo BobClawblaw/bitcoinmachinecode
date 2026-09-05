@@ -108,6 +108,13 @@ void reorg_set_index_rebuild(void (*cb)(void));
 void reorg_set_pow_rules(int no_retarget, int allow_min_diff,
                          int enforce_bip94, unsigned int pow_limit_bits);
 
+/* VAL-5 (rest): arm Core's ContextualCheckBlockHeader trio -- time-too-old,
+ * time-too-new and bad-version -- in reorg_analyze. INJECTED and default-OFF
+ * for the same reason as the pow rules: the hermetic suites build synthetic
+ * chains with arbitrary timestamps and versions. Only the daemon calls it,
+ * next to reorg_set_pow_rules. A NEGATIVE bip34_height disarms. */
+void reorg_set_header_rules(long bip34_height);
+
 /* ---- mempool reconciliation (step 7) ---- */
 typedef struct {
     void*    mp;         /* bitcoin_mempool.asm object */

@@ -1,4 +1,4 @@
-/* tests/test_cli_conf.c -- where bitcoin_cli finds its port and credentials.
+/* tests/test_cli_conf.c -- where bmc_cli finds its port and credentials.
  *
  * The bug this pins: the CLI hardcoded port 8332 and "bitcoin"/"bitcoin", so
  * against this node's own shipped config (RPC 8331, P2P 8332, cookie auth) a

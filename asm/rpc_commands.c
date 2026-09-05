@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <time.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -24,6 +25,12 @@ extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned cha
 #include "rpc_wallet_ops.h"   /* output types: rpc_wops_type_path / rpc_wops_type_spk / rpc_wops_active_types */
 extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[64], unsigned index);
 extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20], unsigned char prog32[32]);
+extern long rpc_chain_tip_height(void);
+extern int  rpc_chain_hash_at(long height, unsigned char out[32]);      /* RPX-4 */
+extern rj_val* rpc_chain_script_pubkey_json(const unsigned char* sc, unsigned long n); /* RPX-4 */
+extern int  wallet_validate_address_ex(const char* str, int* type_, unsigned char* version,
+                                      unsigned char h160[20], unsigned char* prog,
+                                      unsigned long progcap, unsigned long* proglen, int* witver);
 extern int  wallet_script_to_address(char* out, long cap, const unsigned char* script, long slen);
 extern long wallet_decoderawtx(char* out, long cap, const unsigned char* tx, unsigned long txlen);
 extern int  wallet_base58check_decode(unsigned char* out, long cap, long* outlen, const char* str);
@@ -59,6 +66,8 @@ extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsig
 #define WAL_ADDR_P2SH    3
 #define WAL_ADDR_P2WSH   4
 #define WAL_ADDR_P2TR    5
+#define WAL_ADDR_UNKNOWN 6
+#define WAL_ADDR_WITNESS_UNKNOWN 7   /* WAL-9: bech32m witness v2..16 */
 
 static void* g_utxo_lst = NULL;
 static void* g_utxo_u = NULL;
@@ -228,17 +237,17 @@ int rpc_param_i64(const rj_val* params, size_t i, long long* out, long* ec, cons
     return 1;
 }
 
-/* ---- scriptPubKey-type name for a wallet address type (Core "type" field) ---- */
-static const char* spk_type(int t) {
-    switch (t) {
-        case WAL_ADDR_P2PKH: return "pubkeyhash";
-        case WAL_ADDR_P2WPKH: return "witness_v0_keyhash";
-        case WAL_ADDR_P2SH: return "scripthash";
-        case WAL_ADDR_P2WSH: return "witness_v0_scripthash";
-        case WAL_ADDR_P2TR: return "witness_v1_taproot";
-        default: return "nonstandard";
-    }
-}
+/* RPX-4 (audit 2026-09-03): spk_type() lived here to name the "type" field
+ * for gettxout's hand-built scriptPubKey. gettxout now uses
+ * rpc_chain_script_pubkey_json -- the SAME builder every other output shape
+ * goes through -- which derives the type from the script itself rather than
+ * from a wallet address classification.
+ *
+ * That is not just deduplication: this table mapped anything it did not
+ * recognise to "nonstandard", where rpc_chain's script_type distinguishes
+ * the real Core names (pubkey, multisig, nulldata, witness_unknown, ...).
+ * Deleted rather than kept as a second opinion that can drift from the first.
+ */
 
 /* ---- getnewaddress / getrawchangeaddress ---- */
 /* getnewaddress ( "label" "address_type" ) / getrawchangeaddress ( "address_type" ):
@@ -274,19 +283,28 @@ static int cmd_getnewaddr(const char* method, const rj_val* params, const rpc_wa
 static int cmd_validate(const char* method, const rj_val* params, const rpc_wallet* w, long* ec, const char** em, rj_val** result) {
     const char* addr = rpc_param_str(params, 0, ec, em);
     if (!addr) return 0;
-    int type; unsigned char ver, h160[20], prog32[32];
-    memset(prog32, 0, 32);
-    int ok = wallet_validate_address(addr, &type, &ver, h160, prog32);
+    int type; unsigned char ver, h160[20], prog32[40];
+    unsigned long wprog_len = 0; int witver = -1;
+    memset(prog32, 0, sizeof prog32);
+    int ok = wallet_validate_address_ex(addr, &type, &ver, h160, prog32,
+                                        sizeof prog32, &wprog_len, &witver);
     /* Only P2PKH/P2SH/P2WPKH/P2WSH/P2TR are decodable destinations; an
      * unknown base58 version passes the checksum but is not a valid address
-     * (Core: isvalid=false), matching DecodeDestination. */
-    int valid = ok && type >= WAL_ADDR_P2PKH && type <= WAL_ADDR_P2TR;
+     * (Core: isvalid=false), matching DecodeDestination.
+     *
+     * WAL-9 (audit 2026-09-03): a bech32m address for witness version 2..16
+     * IS a valid destination to Core (WitnessUnknown), and this node answered
+     * isvalid:false -- a definite wrong answer about a well-formed address.
+     * It is accepted here now, and the scriptPubKey below is built the way
+     * Core's GetScriptForDestination builds it: OP_n PUSH<program>. */
+    int valid = ok && ((type >= WAL_ADDR_P2PKH && type <= WAL_ADDR_P2TR) ||
+                       type == WAL_ADDR_WITNESS_UNKNOWN);
     /* The scriptPubKey the address decodes to -- built once here rather
      * than only inside the validateaddress branch, because getaddressinfo's
      * real ismine/iswatchonly/ischange (below) need it too, to look the
      * address up in the wallet's own key window by the SAME identity the
      * wallet uses everywhere else. */
-    unsigned char s[34]; size_t sl = 0;
+    unsigned char s[42]; size_t sl = 0;   /* WAL-9: OP_n + len + up to 40 */
     if (valid){
         switch (type) {
             case WAL_ADDR_P2PKH:  s[0]=0x76;s[1]=0xa9;s[2]=0x14;memcpy(s+3,h160,20);s[23]=0x88;s[24]=0xac; sl=25; break;
@@ -294,6 +312,16 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
             case WAL_ADDR_P2WPKH: s[0]=0x00;s[1]=0x14;memcpy(s+2,h160,20);                                sl=22; break;
             case WAL_ADDR_P2WSH:  s[0]=0x00;s[1]=0x20;memcpy(s+2,prog32,32);                              sl=34; break;
             case WAL_ADDR_P2TR:   s[0]=0x51;s[1]=0x20;memcpy(s+2,prog32,32);                              sl=34; break;
+            case WAL_ADDR_WITNESS_UNKNOWN:
+                if (witver >= 2 && witver <= 16 && wprog_len >= 2 && wprog_len <= 40){
+                    s[0] = (unsigned char)(0x50 + witver);           /* OP_2 .. OP_16 */
+                    s[1] = (unsigned char)wprog_len;
+                    memcpy(s + 2, prog32, wprog_len);
+                    sl = wprog_len + 2;
+                } else {
+                    valid = 0;                                       /* cannot render it: not a destination */
+                }
+                break;
         }
     }
     rj_val* o = rj_obj();
@@ -302,20 +330,38 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
         if (valid) {
             /* Core echoes the CANONICAL encoding (bech32 lower-cased) */
             char canon[128]; canon[0] = 0; wallet_script_to_address(canon, sizeof canon, s, (long)sl);
+            /* WAL-9: wallet_script_to_address has no witness v2..16 arm, so it
+             * returns nothing for those and the raw input would be echoed --
+             * uppercase and all, where Core echoes the canonical form. bech32's
+             * canonical form IS all-lowercase (BIP173), and the string already
+             * passed a checksum that only verifies in one case, so lowering it
+             * is the canonical encoding rather than a guess at one. */
+            if (!canon[0] && type == WAL_ADDR_WITNESS_UNKNOWN){
+                size_t ci = 0;
+                for (; addr[ci] && ci + 1 < sizeof canon; ci++)
+                    canon[ci] = (addr[ci] >= 'A' && addr[ci] <= 'Z') ? (char)(addr[ci] + 32) : addr[ci];
+                canon[ci] = 0;
+            }
             rj_obj_set(o, "address", rj_str(canon[0] ? canon : addr));
             char spkhex[128]; bin_to_hex(spkhex, s, sl);
             rj_obj_set(o, "scriptPubKey", rj_str(spkhex));
             /* DescribeAddress: P2SH/P2WSH/P2TR are scripts; witness types carry
              * the program (P2WSH/P2TR use the 32-byte prog, not h160). */
+            /* WAL-9: Core reports isscript:false for WitnessUnknown -- it is
+             * not a script destination, it is an unrecognised witness output. */
             int isscript = (type == WAL_ADDR_P2SH || type == WAL_ADDR_P2WSH || type == WAL_ADDR_P2TR);
-            int isw      = (type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH || type == WAL_ADDR_P2TR);
+            int isw      = (type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH ||
+                            type == WAL_ADDR_P2TR   || type == WAL_ADDR_WITNESS_UNKNOWN);
             rj_obj_set(o, "isscript", rj_bool(isscript));
             rj_obj_set(o, "iswitness", rj_bool(isw));
             if (isw) {
                 const unsigned char* prog = (type == WAL_ADDR_P2WPKH) ? h160 : prog32;
-                size_t plen = (type == WAL_ADDR_P2WPKH) ? 20 : 32;
-                rj_obj_set(o, "witness_version", rj_numf("%u", (type == WAL_ADDR_P2TR) ? 1u : 0u));
-                char proghex[66]; bin_to_hex(proghex, prog, plen);
+                size_t plen = (type == WAL_ADDR_P2WPKH) ? 20
+                            : (type == WAL_ADDR_WITNESS_UNKNOWN) ? (size_t)wprog_len : 32;
+                unsigned wv = (type == WAL_ADDR_WITNESS_UNKNOWN) ? (unsigned)witver
+                            : (type == WAL_ADDR_P2TR) ? 1u : 0u;
+                rj_obj_set(o, "witness_version", rj_numf("%u", wv));
+                char proghex[82]; bin_to_hex(proghex, prog, plen);
                 rj_obj_set(o, "witness_program", rj_str(proghex));
             }
         } else {
@@ -333,7 +379,18 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
              * an absent feature). */
             int is_mine = 0, is_watchonly = 0, is_change = 0, has_pub = 0;
             unsigned char pub[33];
-            rpc_wops_address_ownership(w, s, (unsigned long)sl, &is_mine, &is_watchonly, &is_change, pub, &has_pub);
+            int own = rpc_wops_address_ownership(w, s, (unsigned long)sl,
+                                                 &is_mine, &is_watchonly, &is_change, pub, &has_pub);
+            /* WAL-6 (audit 2026-09-03): -1 means the wallet CANNOT ANSWER --
+             * the seed is locked and no watch-only descriptors are loaded --
+             * as distinct from a confident "not yours". Reporting
+             * ismine:false there is a definite answer the wallet has not
+             * earned. Core has no such state (it always holds its keyset), so
+             * there is no field to copy; the fields are omitted, which is at
+             * least not a false claim, and the reason is said in the log. */
+            if (own < 0)
+                fprintf(stderr, "[wallet]  getaddressinfo: the wallet is locked and has no watch-only "
+                                "descriptors, so ownership cannot be determined for this address\n");
             /* RPX-3 (audit 2026-09-03): pubkey/iscompressed ONLY when the
              * wallet actually holds the key.
              *
@@ -360,9 +417,13 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
             }
             rj_obj_set(o, "iswitness", rj_bool(type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH || type == WAL_ADDR_P2TR));
             rj_obj_set(o, "witness_version", rj_numf("%u", (type == WAL_ADDR_P2TR) ? 1 : 0));
-            rj_obj_set(o, "ismine", rj_bool(is_mine));
-            rj_obj_set(o, "iswatchonly", rj_bool(is_watchonly));
-            rj_obj_set(o, "ischange", rj_bool(is_change));
+            /* WAL-6: omitted rather than answered false when the wallet
+             * cannot tell (own < 0). See the note above. */
+            if (own >= 0){
+                rj_obj_set(o, "ismine", rj_bool(is_mine));
+                rj_obj_set(o, "iswatchonly", rj_bool(is_watchonly));
+                rj_obj_set(o, "ischange", rj_bool(is_change));
+            }
         }
     }
     *result = o;
@@ -399,6 +460,19 @@ static int addr_idx_build_script(unsigned char type_tag, const unsigned char has
 #define ADDR_IDX_MAX_MATCHES 200000
 
 #define WOP_COIN_CAP 200000
+
+/* RPX-9 (audit 2026-09-03): decoderawtransaction / converttopsbt /
+ * simulaterawtransaction refused anything over 200,000 bytes with
+ * "TX decode failed". Core decodes up to the block serialized-size limit
+ * (MAX_BLOCK_SERIALIZED_SIZE, consensus/consensus.h = 4,000,000), so a
+ * transaction Core happily decodes was rejected here as malformed -- and the
+ * error said DECODE FAILED, which is a claim about the bytes rather than
+ * about a limit, so a caller had no way to tell the two apart.
+ *
+ * These are pure DECODE paths: they inspect bytes and return JSON, admitting
+ * nothing to the mempool and relaying nothing, so the cap was never a policy
+ * bound. It is the consensus ceiling now. */
+#define RPC_DECODE_MAX_TX 4000000
 /* Core matures a coinbase at 100 confirmations; everything else is spendable
  * as soon as it is in a block, and the scan only records confirmed outputs.
  * A scan file older than format 3 carries no coinbase flag (wscan_flags_known
@@ -550,7 +624,8 @@ static int cmd_decoderaw(const rj_val* params, long* ec, const char** em, rj_val
     const char* hexstr = rpc_param_str(params, 0, ec, em);
     if (!hexstr) return 0;
     size_t hl = strlen(hexstr);
-    if (hl % 2 || hl / 2 < 10 || hl / 2 > 200000) { *ec = -22; *em = "TX decode failed"; return 0; }
+    if (hl % 2 || hl / 2 < 10 || hl / 2 > RPC_DECODE_MAX_TX) {   /* RPX-9 */
+        *ec = -22; *em = "TX decode failed"; return 0; }
     unsigned char* tx = malloc(hl / 2);
     if (!tx) { *ec = -7; *em = "out of memory"; return 0; }
     if (!hex_to_bytes(tx, hexstr, hl)) { free(tx); *ec = -22; *em = "TX decode failed"; return 0; }
@@ -622,34 +697,49 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
         return 0;
     }
     if (r != 1) { *result = rj_null(); return 1; }
-    (void)height; /* "confirmations" below is still a hardcoded placeholder,
-                   * like "bestblock" -- wiring those to the real chain tip
-                   * is RPC completeness, out of scope for Stage D. */
 
     char amt[24]; rpc_amounts((long long)value, amt, sizeof amt);
-    char addr[96]; addr[0] = 0;
-    int t = slen ? wallet_script_to_address(addr, 96, script, (long)slen) : WAL_ADDR_INVALID;
-    char* scripthex = malloc((size_t)slen * 2 + 1);
-    if (!scripthex) { *ec = -32603; *em = "out of memory"; return 0; }
-    if (slen) bin_to_hex(scripthex, script, slen); else scripthex[0] = 0;
 
     rj_val* o = rj_obj();
-    rj_obj_set(o, "bestblock", rj_str("0000000000000000000000000000000000000000000000000000000000000000"));
-    rj_obj_set(o, "confirmations", rj_numf("%d", 0));
+    /* RPX-4 (audit 2026-09-03): bestblock was the all-zero hash and
+     * confirmations was 0, both marked out-of-scope -- while the height the
+     * answer needs was already returned by the UTXO query and thrown away
+     * ((void)height), and rpc_chain has had the index open the whole time.
+     * A caller reading either got a definite wrong value, not a missing one.
+     *
+     * Core's semantics: bestblock is the tip hash the answer is relative to,
+     * and confirmations is tip - height + 1, with 0 for an output that is
+     * still in the mempool. This node's gettxout only ever answers from the
+     * confirmed set, so the mempool case cannot arise here.
+     *
+     * If the chain index is not open (rpc_chain_open has not run, or is still
+     * loading) the tip is unavailable. Rather than reinstate a zero that reads
+     * as a real answer, the two fields are OMITTED -- the same choice WAL-6
+     * made for ismine when the wallet cannot answer. */
+    { long tip = rpc_chain_tip_height();
+      if (tip >= 0 && (long)height <= tip){
+          unsigned char th[32];
+          if (rpc_chain_hash_at(tip, th)){
+              char hx[65]; for (int i = 0; i < 32; i++) sprintf(hx + i*2, "%02x", th[31 - i]);
+              hx[64] = 0;
+              rj_obj_set(o, "bestblock", rj_str(hx));
+          }
+          rj_obj_set(o, "confirmations", rj_numf("%ld", tip - (long)height + 1));
+      } }
     /* a NUMBER, not a string: Core's ValueFromAmount emits UniValue VNUM and
      * every other amount in this file already uses rj_numf. gettxout was the
      * one holdout, which stayed invisible while it only ever returned null --
      * the first real diff against Core caught it. */
     rj_obj_set(o, "value", rj_numf("%s", amt));
-    rj_val* sp = rj_obj();
-    rj_obj_set(sp, "asm", rj_str(""));
-    rj_obj_set(sp, "desc", rj_str(""));
-    rj_obj_set(sp, "hex", rj_str(scripthex));
-    if (addr[0]) rj_obj_set(sp, "address", rj_str(addr));
-    rj_obj_set(sp, "type", rj_str(spk_type(t)));
-    rj_obj_set(o, "scriptPubKey", sp);
+    /* RPX-4: asm and desc were empty strings, though rpc_chain has rendered
+     * both for every other output shape since decodepsbt. This is the SAME
+     * builder those use (ScriptToUniv with include_hex/include_address and the
+     * inferred descriptor), so gettxout's scriptPubKey cannot drift from
+     * getrawtransaction's for the same script. */
+    rj_obj_set(o, "scriptPubKey",
+               slen ? rpc_chain_script_pubkey_json(script, (unsigned long)slen)
+                    : rj_obj());
     rj_obj_set(o, "coinbase", rj_bool(is_coinbase != 0));
-    free(scripthex);
     *result = o;
     return 1;
 }
@@ -694,8 +784,21 @@ static int cmd_verifymessage(const rj_val* params, long* ec, const char** em, rj
  * 0xfffffffe, else 0xffffffff. */
 enum { CRT_P2PKH=1, CRT_P2WPKH=2, CRT_P2SH=3, CRT_P2WSH=4, CRT_P2TR=5 };
 static long crt_addr_to_spk(const char* addr, unsigned char* spk){
-    int type=0; unsigned char ver=0, h160[20], prog[32];
-    if (!wallet_validate_address(addr, &type, &ver, h160, prog)) return 0;
+    int type=0; unsigned char ver=0, h160[20], prog[40];
+    unsigned long plen=0; int wv=-1;
+    if (!wallet_validate_address_ex(addr, &type, &ver, h160, prog, sizeof prog, &plen, &wv)) return 0;
+    /* WAL-9: a witness v2..16 output is OP_n PUSH<program>, exactly what Core's
+     * WitnessUnknown GetScriptForDestination emits. Refusing to build it is why
+     * sendtoaddress answered -5 for an address Core pays. Callers pass a
+     * 40-byte spk buffer; OP_n + push-len + 40 is 42, so the two long programs
+     * are bounded out rather than overrunning it. */
+    if (type == WAL_ADDR_WITNESS_UNKNOWN){
+        if (wv < 2 || wv > 16 || plen < 2 || plen > 38) return 0;
+        spk[0] = (unsigned char)(0x50 + wv);          /* OP_2 .. OP_16 */
+        spk[1] = (unsigned char)plen;
+        memcpy(spk + 2, prog, plen);
+        return (long)plen + 2;
+    }
     switch (type){
         case CRT_P2PKH:  spk[0]=0x76;spk[1]=0xa9;spk[2]=0x14;memcpy(spk+3,h160,20);spk[23]=0x88;spk[24]=0xac;return 25;
         case CRT_P2SH:   spk[0]=0xa9;spk[1]=0x14;memcpy(spk+2,h160,20);spk[22]=0x87;return 23;
@@ -753,20 +856,37 @@ static long crt_varint(unsigned char* o, unsigned long long v){
 /* Build the unsigned tx (empty scriptSigs) shared by createrawtransaction and
  * createpsbt. Fills tx (cap >= 131072), sets *out_n / *out_nin / *out_nout.
  * Returns 1, or 0 with *ec / *em. */
-static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long* out_n,
+/* `cap` is the size of `tx`. RPX-5 (audit 2026-09-03): this function wrote into
+ * a 131072-byte caller buffer with NO capacity check anywhere -- safe only
+ * because every field it emitted was itself capped, which the OP_RETURN change
+ * below removes. The bound is now explicit and covers the inputs too, so a
+ * request with enough of them cannot run off the end either. */
+#define CRT_NEED(k) do{ if ((long)(k) < 0 || n + (long)(k) > cap){ \
+        *ec=-8; *em="Transaction too large for this node's builder"; return 0; } }while(0)
+static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long cap, long* out_n,
                               size_t* out_nin, size_t* out_nout, long* ec, const char** em){
     if (!params || params->typ!=RJ_ARR || params->nitems<2 || params->items[0]->typ!=RJ_ARR){
         *ec=-8; *em="Invalid parameters, expected an inputs array and outputs"; return 0; }
     const rj_val* ins = params->items[0];
     const rj_val* outs = params->items[1];
-    long locktime=0;
-    if (params->nitems>=3 && params->items[2]->typ==RJ_NUM) locktime=strtol(params->items[2]->str,0,10);
+    long long locktime=0;
+    if (params->nitems>=3 && params->items[2]->typ==RJ_NUM){
+        /* RPX-6 (audit 2026-09-03): this was strtol with no bounds, so a value
+         * outside [0, 0xffffffff] was silently truncated to 32 bits and a
+         * negative wrapped. Core errors instead. */
+        errno = 0;
+        char* lend = 0;
+        locktime = strtoll(params->items[2]->str, &lend, 10);
+        if (errno == ERANGE || (lend && *lend) || locktime < 0 || locktime > 0xffffffffLL){
+            *ec=-8; *em="Invalid parameter, locktime out of range"; return 0; }
+    }
     int replaceable=1;   /* modern Core defaults to opt-in RBF (replaceable=true) */
     if (params->nitems>=4 && params->items[3]->typ==RJ_BOOL) replaceable=(params->items[3]->str[0]=='1');
     unsigned long defseq = replaceable ? 0xfffffffdUL : (locktime!=0 ? 0xfffffffeUL : 0xffffffffUL);
 
     long n=0;
     tx[n++]=2; tx[n++]=0; tx[n++]=0; tx[n++]=0;                 /* version 2 LE */
+    CRT_NEED(9);
     n += crt_varint(tx+n, (unsigned long long)ins->nitems);
     for (size_t i=0;i<ins->nitems;i++){
         const rj_val* in=ins->items[i];
@@ -776,6 +896,7 @@ static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long* out
             *ec=-8; *em="Invalid parameter, missing/invalid txid or vout"; return 0; }
         unsigned char id[32];
         if (!hex_to_bytes(id,tid->str,64)){ *ec=-8; *em="txid must be hexadecimal string"; return 0; }
+        CRT_NEED(32+4+1+4);
         for (int k=0;k<32;k++) tx[n+k]=id[31-k];               /* display -> wire */
         n+=32;
         unsigned long vo=strtoul(vout->str,0,10);
@@ -791,6 +912,7 @@ static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long* out
     if (outs->typ==RJ_OBJ){ omem=outs->members; onm=outs->nmembers; }
     else if (outs->typ==RJ_ARR){ oarr=outs; onm=outs->nitems; }
     else { *ec=-8; *em="Invalid parameter, expected outputs object or array"; return 0; }
+    CRT_NEED(9);
     n += crt_varint(tx+n, (unsigned long long)onm);
     for (size_t i=0;i<onm;i++){
         const char* key; const rj_val* val;
@@ -801,22 +923,65 @@ static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long* out
         if (!strcmp(key,"data")){
             if (val->typ!=RJ_STR){ *ec=-8; *em="Data is not a valid hex-encoded value"; return 0; }
             size_t dl=strlen(val->str); if (dl&1){ *ec=-8; *em="Data hex has odd length"; return 0; }
-            size_t db=dl/2; if (db>80){ *ec=-8; *em="Data too long for OP_RETURN"; return 0; }
-            unsigned char data[80]; if (db && !hex_to_bytes(data,val->str,dl)){ *ec=-8; *em="Invalid data hex"; return 0; }
+            /* RPX-5 (audit 2026-09-03): the 80-byte cap was wrong HERE. Core's
+             * createrawtransaction builds OP_RETURN <data> for any size --
+             * the 80-byte limit is RELAY POLICY, enforced when a transaction
+             * is accepted, not by the builder. A raw tx Core will happily
+             * construct (to be signed or inspected offline) was refused.
+             *
+             * The bound is now the caller's buffer, which is what actually
+             * constrains us, and the push opcode widens with the data:
+             * direct push to 75, PUSHDATA1 to 255, PUSHDATA2 beyond. The old
+             * code emitted PUSHDATA1 for anything over 75 and would have
+             * written a truncated length byte past 255 -- unreachable then
+             * because of the cap it is paired with, which is exactly why both
+             * change together. */
+            size_t db=dl/2;
+            long pfx = (db<=75) ? 1 : (db<=255 ? 2 : 3);
+            CRT_NEED(8 + 9 + 1 + pfx + (long)db);
+            unsigned char* data = (unsigned char*)malloc(db ? db : 1);
+            if (!data){ *ec=-7; *em="oom"; return 0; }
+            if (db && !hex_to_bytes(data,val->str,dl)){ free(data); *ec=-8; *em="Invalid data hex"; return 0; }
             for (int k=0;k<8;k++) tx[n++]=0;                   /* value 0 */
-            unsigned char spk[100]; long sl=0; spk[sl++]=0x6a; /* OP_RETURN */
-            if (db<=75){ spk[sl++]=(unsigned char)db; } else { spk[sl++]=0x4c; spk[sl++]=(unsigned char)db; }
+            unsigned char* spk = (unsigned char*)malloc((size_t)pfx + 1 + db);
+            if (!spk){ free(data); *ec=-7; *em="oom"; return 0; }
+            long sl=0; spk[sl++]=0x6a;                          /* OP_RETURN */
+            if (db<=75){ spk[sl++]=(unsigned char)db; }
+            else if (db<=255){ spk[sl++]=0x4c; spk[sl++]=(unsigned char)db; }
+            else { spk[sl++]=0x4d; spk[sl++]=(unsigned char)(db&0xff); spk[sl++]=(unsigned char)(db>>8); }
             memcpy(spk+sl,data,db); sl+=db;
             n+=crt_varint(tx+n,(unsigned long long)sl); memcpy(tx+n,spk,sl); n+=sl;
+            free(spk); free(data);
         } else {
             long long sat=(val->typ==RJ_NUM)?crt_amount_to_sat(val->str):-1;
             if (sat<0){ *ec=-3; *em="Invalid amount"; return 0; }
             unsigned char spk[40]; long sl=crt_addr_to_spk(key,spk);
             if (sl==0){ static char e[128]; snprintf(e,sizeof e,"Invalid Bitcoin address: %s",key); *ec=-5; *em=e; return 0; }
+            /* RPX-6 (audit 2026-09-03): Core rejects a repeated address. The
+             * OBJECT form cannot express one (JSON keys are unique after the
+             * parser), but the ARRAY-of-single-key-objects form can, and this
+             * emitted the output twice. Quadratic over the outputs, which is
+             * what Core does too and is nothing beside the per-output address
+             * decode above. Only addresses are compared: several `data`
+             * outputs are legal, in Core as here. */
+            for (size_t q=0;q<i;q++){
+                const char* pk;
+                if (omem) pk=omem[q].key;
+                else { const rj_val* pe=oarr->items[q];
+                       if (pe->typ!=RJ_OBJ||pe->nmembers<1) continue;
+                       pk=pe->members[0].key; }
+                if (!strcmp(pk,"data")) continue;
+                if (!strcmp(pk,key)){
+                    static char e2[160];
+                    snprintf(e2,sizeof e2,"Invalid parameter, duplicated address: %s",key);
+                    *ec=-8; *em=e2; return 0; }
+            }
+            CRT_NEED(8 + 9 + sl);
             for (int k=0;k<8;k++) tx[n++]=(unsigned char)((unsigned long long)sat>>(8*k));
             n+=crt_varint(tx+n,(unsigned long long)sl); memcpy(tx+n,spk,sl); n+=sl;
         }
     }
+    CRT_NEED(4);
     tx[n++]=(unsigned char)locktime;tx[n++]=(unsigned char)(locktime>>8);tx[n++]=(unsigned char)(locktime>>16);tx[n++]=(unsigned char)(locktime>>24);
     *out_n=n; *out_nin=ins->nitems; *out_nout=onm;
     return 1;
@@ -824,7 +989,7 @@ static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long* out
 
 static int cmd_createrawtransaction(const rj_val* params, long* ec, const char** em, rj_val** result){
     static unsigned char tx[131072]; long n; size_t nin, nout;
-    if (!crt_build_unsigned(params, tx, &n, &nin, &nout, ec, em)) return 0;
+    if (!crt_build_unsigned(params, tx, (long)sizeof tx, &n, &nin, &nout, ec, em)) return 0;
     char* hex=malloc((size_t)n*2+1); if (!hex){ *ec=-7; *em="oom"; return 0; }
     bin_to_hex(hex,tx,(size_t)n); *result=rj_str(hex); free(hex);
     return 1;
@@ -867,7 +1032,7 @@ static int psbt_version_arg(const rj_val* params, unsigned long idx, int* ver, l
 static char* psbt_wrap_version(const unsigned char* tx, long n, size_t nin, size_t nout, int ver);
 static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     static unsigned char tx[131072]; long n; size_t nin, nout;
-    if (!crt_build_unsigned(params, tx, &n, &nin, &nout, ec, em)) return 0;
+    if (!crt_build_unsigned(params, tx, (long)sizeof tx, &n, &nin, &nout, ec, em)) return 0;
     if (params->nitems >= 5 && params->items[4]->typ == RJ_NUM){                /* Core: tx version */
         long v = strtol(params->items[4]->str, 0, 10);
         if (v < 1 || v > 0x7fffffffL){ *ec = -8; *em = "Invalid parameter, version must be between 1 and 2147483647"; return 0; }
@@ -885,6 +1050,16 @@ static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_va
 static int cmd_converttopsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     const char* hex = rpc_param_str(params,0,ec,em); if (!hex) return 0;
     size_t hl=strlen(hex);
+    /* RPX-9: this cap is NOT raised to RPC_DECODE_MAX_TX with
+     * decoderawtransaction's, deliberately. Everything below writes into the
+     * fixed `utx` buffer -- version, per-input stubs, the copied output
+     * region, locktime -- with no bounds check anywhere; the 200,000 ceiling
+     * IS the bound. Raising the input limit here without first bounds-checking
+     * the builder would convert a rejected-too-large into a .bss overrun,
+     * which is the SCR-10 shape exactly. decoderawtransaction could be raised
+     * safely because it mallocs to size and hands the bytes to rpc_chain's
+     * bounds-checked decoder; this one cannot, and bounding the builder is a
+     * separate change with its own test. */
     if ((hl&1)||hl/2<10||hl/2>200000){ *ec=-22; *em="TX decode failed"; return 0; }
     unsigned long txlen=(unsigned long)(hl/2);
     static unsigned char raw[200000];
@@ -947,13 +1122,52 @@ static int psbt_field_hex(rj_val* o, const char* name, const unsigned char* v, u
     char* h=malloc(n*2+1); if (!h) return 0; bin_to_hex(h,v,n); rj_obj_set(o,name,rj_str(h)); free(h); return 1;
 }
 typedef struct { const unsigned char* k; unsigned long kl; const unsigned char* v; unsigned long vl; } psbt_kv;
+/* WAL-14 (audit 2026-09-03): the identical unbounded shape psbt_update.c's
+ * parse_map had. srw_varint reads up to NINE bytes from a bare pointer, and
+ * this walked `p` forward by lengths it never compared with blen, so a PSBT
+ * with a 0xff-varint key length ran past the buffer and every later read came
+ * from wherever it landed. Bounded the same way.
+ *
+ * A malformed map reports ZERO entries and consumes the rest of the buffer,
+ * rather than the -1 psbt_update.c's parse_map returns. That is deliberate:
+ * this function has twenty-four call sites with several different failure
+ * conventions, and threading a new negative return through all of them is a
+ * far larger and more error-prone change than the bounds themselves. Zero
+ * entries lands every caller in its own "missing required field" path, which
+ * is the correct answer for a malformed PSBT, and setting *pp to the end
+ * stops a later map being parsed from a stale offset. */
+static int psbt_srw_varint_b(const unsigned char* p, unsigned long avail,
+                             unsigned long* out, unsigned long* cc){
+    if (avail < 1) return 0;
+    if (p[0] < 0xfd){ *cc=1; *out=p[0]; return 1; }
+    if (p[0]==0xfd){ if (avail < 3) return 0; *cc=3;
+        *out=(unsigned long)p[1]|((unsigned long)p[2]<<8); return 1; }
+    if (p[0]==0xfe){ if (avail < 5) return 0; *cc=5;
+        *out=(unsigned long)p[1]|((unsigned long)p[2]<<8)|
+             ((unsigned long)p[3]<<16)|((unsigned long)p[4]<<24); return 1; }
+    if (avail < 9) return 0;
+    *cc=9;
+    { unsigned long v=0; for(int i=0;i<8;i++) v|=((unsigned long)p[1+i])<<(8*i); *out=v; }
+    return 1;
+}
 static int psbt_parse_map(const unsigned char* buf, long blen, long* pp, psbt_kv* kvs, int cap){
     int n=0; long p=*pp;
-    while (p<blen){ unsigned long cc; unsigned long kl=srw_varint(buf+p,&cc); p+=cc; if(kl==0){ *pp=p; return n; }
-        const unsigned char* k=buf+p; p+=kl; unsigned long vl=srw_varint(buf+p,&cc); p+=cc; const unsigned char* v=buf+p; p+=vl;
+    if (p < 0 || p > blen){ *pp = blen; return 0; }
+    while (p<blen){
+        unsigned long cc, kl, vl;
+        if (!psbt_srw_varint_b(buf+p, (unsigned long)(blen-p), &kl, &cc)) goto bad;
+        p += (long)cc;
+        if (kl==0){ *pp=p; return n; }
+        if (kl > (unsigned long)(blen-p)) goto bad;
+        const unsigned char* k=buf+p; p += (long)kl;
+        if (!psbt_srw_varint_b(buf+p, (unsigned long)(blen-p), &vl, &cc)) goto bad;
+        p += (long)cc;
+        if (vl > (unsigned long)(blen-p)) goto bad;
+        const unsigned char* v=buf+p; p += (long)vl;
         if(n<cap){ kvs[n].k=k;kvs[n].kl=kl;kvs[n].v=v;kvs[n].vl=vl;n++; }
     }
-    *pp=p; return n;
+bad:
+    *pp = blen; return 0;
 }
 static int psbt_union(psbt_kv* dst, int dn, int dcap, const psbt_kv* src, int sn){
     for(int i=0;i<sn && dn<dcap;i++){

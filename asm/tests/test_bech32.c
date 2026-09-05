@@ -216,6 +216,53 @@ int main(void) {
         }
     }
 
+    /* === SER-5 / WAL-9 (audit 2026-09-03): BIP173 case rules === */
+    /* bech32_init maps upper-case letters to the same values as lower, so the
+     * decoder folded case and accepted a MIXED-case string, which BIP173
+     * forbids ("must be either all lowercase or all uppercase"). Core's
+     * bech32::Decode rejects it, so validateaddress answered isvalid:true
+     * where Core says false.
+     *
+     * The control is the pair: all-lower and all-UPPER must both still decode
+     * -- an implementation that simply rejected any upper-case character
+     * would pass a mixed-case-only test while breaking valid addresses. */
+    {
+        static const char* LOWER = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        static const char* UPPER = "BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4";
+        long long n;
+
+        n = bech32_decode(d5buf, hrpbuf, 95, LOWER);
+        printf(n > 0 ? "PASS SER-5 all-lowercase decodes\n"
+                     : "FAIL SER-5 all-lowercase decodes (n=%lld)\n", n);
+        if (n <= 0) failures++;
+
+        n = bech32_decode(d5buf, hrpbuf, 95, UPPER);
+        printf(n > 0 ? "PASS SER-5 all-UPPERCASE decodes (BIP173 allows it)\n"
+                     : "FAIL SER-5 all-UPPERCASE decodes (n=%lld)\n", n);
+        if (n <= 0) failures++;
+
+        /* mixed in the DATA part */
+        static const char* MIX1 = "bc1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4";
+        n = bech32_decode(d5buf, hrpbuf, 95, MIX1);
+        printf(n < 0 ? "PASS SER-5 mixed case (lower hrp, UPPER data) is refused\n"
+                     : "FAIL SER-5 mixed case (lower hrp, UPPER data) accepted (n=%lld)\n", n);
+        if (n >= 0) failures++;
+
+        /* mixed in the HRP part */
+        static const char* MIX2 = "BC1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";
+        n = bech32_decode(d5buf, hrpbuf, 95, MIX2);
+        printf(n < 0 ? "PASS SER-5 mixed case (UPPER hrp, lower data) is refused\n"
+                     : "FAIL SER-5 mixed case (UPPER hrp, lower data) accepted (n=%lld)\n", n);
+        if (n >= 0) failures++;
+
+        /* a single stray capital is enough */
+        static const char* MIX3 = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3T4";
+        n = bech32_decode(d5buf, hrpbuf, 95, MIX3);
+        printf(n < 0 ? "PASS SER-5 one stray capital is still mixed case\n"
+                     : "FAIL SER-5 one stray capital accepted (n=%lld)\n", n);
+        if (n >= 0) failures++;
+    }
+
     printf(failures ? "FAILURES %d\n" : "ALL TESTS PASSED (0 failures)\n", failures);
     return failures ? 1 : 0;
 }

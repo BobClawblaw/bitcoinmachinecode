@@ -107,6 +107,24 @@ int main(void){
     long rawlen=wallet_createrawtx(raw,sizeof raw,tid,tidx,tval,2,to_scr,900000ULL,chg,1000ULL,0);
     ck("unsigned raw built (2-in/1-out)", rawlen>0,1);
 
+    /* ---- WAL-18 (audit 2026-09-03): nVersion, not the locktime ----
+     * wallet_createrawtx wrote LOCKTIME into the version field, under a
+     * comment that said "version". An ordinary `wallet_cli send` uses
+     * locktime 0, so it produced a VERSION-0 transaction, which Core's
+     * IsStandardTx rejects ("version", nVersion < 1) -- it would never relay
+     * through a Core peer. This file built with that function and never
+     * looked at the first four bytes.
+     *
+     * The locktime is written separately at the END of the transaction, so
+     * asserting BOTH is what proves the fix put a version there rather than
+     * moving the locktime. */
+    { unsigned int ver = (unsigned)raw[0] | ((unsigned)raw[1]<<8) |
+                         ((unsigned)raw[2]<<16) | ((unsigned)raw[3]<<24);
+      ck("WAL-18 nVersion is 2, not the locktime", ver==2, 1);
+      unsigned int lt = (unsigned)raw[rawlen-4] | ((unsigned)raw[rawlen-3]<<8) |
+                        ((unsigned)raw[rawlen-2]<<16) | ((unsigned)raw[rawlen-1]<<24);
+      ck("WAL-18 the locktime is still at the end (0)", lt==0, 1); }
+
     /* VALID: sign both inputs with the owning keys K0,K1 */
     {
         unsigned char signed_k[1024]; unsigned char mask[8]={0,0,0,0,0,0,0,0};

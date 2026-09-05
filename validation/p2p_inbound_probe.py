@@ -54,23 +54,34 @@ class Peer:
                 # several protocol violations (handshake-only messages after
                 # verack) and a report that could not tell that from "ignored"
                 # would call both nodes equal when they are not.
-                return '<disconnected>', b''
+                return '<peer-closed>', b''
             self.buf += chunk
 
     def drain(self, secs=1.5):
-        """collect everything that arrives within `secs`"""
+        """collect everything that arrives within `secs`, answering keepalive
+        pings as we go (PROBE-4, 2026-09-05): a tip-synced node pings a fresh
+        inbound peer immediately; a probe that never pongs is timed out by
+        the node (~72s) and the socket dies mid-report -- reproduced against
+        bmc AND Core alike. Answering pong is what any real client does."""
         out, deadline = [], time.time() + secs
         while True:
             cmd, pl = self.recv_one(deadline)
             if cmd is None: return out
+            if cmd == 'ping':
+                self.send('pong', pl)
             out.append((cmd, pl))
-            if cmd == '<disconnected>': return out
+            if cmd == '<peer-closed>': return out
 
 def version_payload(magic):
     return (struct.pack('<iQq', 70016, 9, int(time.time()))
             + b'\x00'*26 + b'\x00'*26
             + struct.pack('<Q', 0x1234) + b'\x00'
-            + struct.pack('<i', 0) + b'\x01')
+            + struct.pack('<i', 0) + b'\x00')   # PROBE-1: relay=false --
+            # the probe is an observer. relay=true presents it as a relaying
+            # full node with a zeroed addr_recv, which Core's version handler
+            # treats as non-connectible+relaying (drop candidate). Not the
+            # 2026-09-05 hang cause (PROBE-4 was), but still wrong for a
+            # stranger probe; bmc's own outbound legs send relay=false.
 
 def handshake(host, port, magic, pre_verack=()):
     """connect and complete the handshake; `pre_verack` messages are sent in
@@ -160,6 +171,16 @@ def probe(host, port, magic, tip_hash_le=ZERO32, tip_height=0, wait=2.0):
 
 if __name__ == '__main__':
     host, port, magic = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+    # PROBE-2 (2026-09-05): bytes.fromhex("f9beb4d9") is ALREADY wire order;
+    # the byte-reversed form d9 be b4 f9 is instantly rejected with a silent
+    # disconnect by every node -- an operator then reads "node ignores
+    # strangers" from a healthy node. Refuse it loudly.
+    if magic.lower() in ("d9beb4f9",):
+        print("ERROR: magic is byte-reversed (d9 be b4 f9). Use f9beb4d9 -- "
+              "bytes.fromhex gives wire order directly. Every node drops a "
+              "reversed-magic connection with NO log line; that is the probe "
+              "inviting, not a node defect.", file=sys.stderr)
+        sys.exit(2)
     # optional: a REAL block to ask about, as display hex + height
     tip = ZERO32; th = 0
     if len(sys.argv) > 5 and not sys.argv[4].startswith('--'):

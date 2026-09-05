@@ -475,6 +475,24 @@ static int   g_undo_enabled = 1;
  * a plain undo_prune(tip,window) per block is not viable at mainnet depth. */
 static long  g_undo_prune_cursor = 0;
 
+/* TXOQ-1 (2026-09-05 benchmark): between-block quiescent hook -- set once by
+ * the download worker in main.c (txoq_service). Fires in utxo_live_catchup's
+ * per-block loop right after a block is applied AND its checkpoint persisted:
+ * the same kill-safe moment the TEST crash hook uses, and exactly the
+ * quiescence the get()/flush() invariant requires. NULL outside the worker
+ * (tests, tools) -- one pointer load per block, effectively free. */
+static void (*g_utxo_apply_hook)(void) = 0;
+void utxo_live_set_apply_hook(void (*fn)(void)){ g_utxo_apply_hook = fn; }
+
+/* Re-entrancy guard (TXOQ-1): txoq_service -> utxo_live_lsm_get -> (on a run
+ * miss) utxo_lsm_reload, and utxo_live_catchup itself may call reload from
+ * other points. A hook reentry while a reload is already on this stack would
+ * reenter the writer with a query mid-reload -- never serve a query in that
+ * window; the next block boundary is ~0.1s away. One flag set/cleared around
+ * the reload call below; checked by the catchup loop's hook site. */
+static int g_utxo_in_reload = 0;
+int  utxo_live_in_reload(void){ return g_utxo_in_reload; }
+
 /* TEST-ONLY crash injection (default disabled, -1). When armed (>=0),
  * utxo_live_catchup's per-block loop calls _exit(1) the instant `applied`
  * (this call's own count of newly-applied blocks) reaches the armed value --
@@ -2346,7 +2364,10 @@ static int undo_restore_cb(void* ctx, const u8 txid[32], u32 index, u64 value,
     return 1;
 }
 
-typedef struct { const u8* txid; int fatal; } del_created_ctx_t;
+/* UTX-10 (audit 2026-09-03): `skipped` counts created outputs the lookup
+ * below said were absent, so a rollback that silently removed nothing leaves
+ * a signal. See del_created_on_output. */
+typedef struct { const u8* txid; int fatal; long skipped; long seen; } del_created_ctx_t;
 
 extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index, u64* value,
                          unsigned long* height, unsigned long* is_coinbase,
@@ -2379,7 +2400,35 @@ static void del_created_on_output(void* ctxv, u32 out_index, u64 value,
         if (utxo_lsm_del(&g_utxo_lst, g_utxo_table, c->txid, out_index) < 0) c->fatal = 1;
         return;
     }
-    if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, c->txid, out_index, &v, &hh, &cb, &sc, &sl) != 1) return;
+    c->seen++;
+    if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, c->txid, out_index, &v, &hh, &cb, &sc, &sl) != 1){
+        /* ---- UTX-10 (audit 2026-09-03) ----
+         * The get-gate above is deliberate and stays: utxo_lsm_del tombstones
+         * and decrements the live counter unconditionally, so deleting an
+         * output that was never created (a partial apply that died before
+         * that tx's outputs landed) or already spent left the tally one low
+         * each time. Deleting unconditionally would reintroduce exactly the
+         * drift the comment above records fixing.
+         *
+         * But the gate also TRUSTS the lookup, and the 2026-09-01 incident
+         * was a lookup that lied. On that path a miss means "never created"
+         * and the delete is skipped in silence, which would leave a
+         * disconnected block's outputs live -- phantom coins -- with no
+         * signal at all unless g_store_inconsistent happened to be set
+         * already. Counting the skips does not change the tally and gives
+         * the callers something to report.
+         *
+         * The three callers word it differently ON PURPOSE. Ghost rollback
+         * exists precisely because an apply died partway through, so some
+         * created outputs never landed and absence is the NORMAL case --
+         * tests/test_utxo_crash_recovery hits it every run (4 of 4, 3 of 6).
+         * Crying "the lookup is lying" there would be noise on a healthy
+         * crash recovery. The reorg rollback and unapply paths take a block
+         * that was FULLY applied, so every created output should still be
+         * present and a skip there is the incident's shape. */
+        c->skipped++;
+        return;
+    }
     /* copy the script BEFORE the del: get()'s pointer is only valid until
      * the next LSM call, and the remove-event needs the exact bytes */
     static u8 scbuf[10000];
@@ -2427,12 +2476,15 @@ static int rollback_unapplied_block(const u8* blockbuf, u64 blocklen, long h){
 
     int fatal = 0, torn = 0;
     long r = undo_replay_tolerant(h, undo_restore_cb, &fatal, &torn);
-    del_created_ctx_t dc = { 0, 0 };
+    del_created_ctx_t dc = { 0, 0, 0, 0 };
     int ok = walk_block_txs(blockbuf, blocklen, &dc, 0, del_created_on_output, &dc.txid, (u64)-1);
 
     g_undo_enabled = saved;
     g_apply_height = saved_apply;
 
+    if (dc.skipped)   /* UTX-10 */
+        fprintf(stderr, "[utxo_live] ghost-rollback h=%ld: %ld of %ld created outputs were already absent (expected -- the apply died partway through)\n",
+                h, dc.skipped, dc.seen);
     if (r < 0 || fatal || !ok || dc.fatal) {
         fprintf(stderr, "[utxo_live] ghost-rollback FAILED at height %ld: restore r=%ld fatal=%d walk ok=%d del_fatal=%d -- state may be inconsistent\n",
                 h, r, fatal, ok, dc.fatal);
@@ -2455,10 +2507,13 @@ static void rollback_partial_apply(const u8* blockbuf, u64 blocklen, u64 upto_t_
         fprintf(stderr, "[utxo_live] rollback h=%ld: undo replay failed (r=%ld fatal=%d) -- state may be inconsistent\n",
                 height, r, fatal);
 
-    del_created_ctx_t dc = { 0, 0 };
+    del_created_ctx_t dc = { 0, 0, 0, 0 };
     int ok = walk_block_txs(blockbuf, blocklen, &dc, 0, del_created_on_output,
                             &dc.txid, upto_t_inclusive + 1);
     g_undo_enabled = saved;
+    if (dc.skipped)   /* UTX-10 */
+        fprintf(stderr, "[utxo_live] rollback h=%ld: %ld of %ld created outputs were ALREADY ABSENT and were not deleted -- if this is not a partial apply, the lookup is lying and the set may hold phantom coins\n",
+                height, dc.skipped, dc.seen);
     if (!ok || dc.fatal)
         fprintf(stderr, "[utxo_live] rollback h=%ld: created-output removal failed (ok=%d fatal=%d) -- state may be inconsistent\n",
                 height, ok, dc.fatal);
@@ -2633,10 +2688,13 @@ int utxo_live_unapply_block(const void* blockbuf, u64 blocklen, long height){
         return 0;
     }
 
-    del_created_ctx_t dc = { 0, 0 };
+    del_created_ctx_t dc = { 0, 0, 0, 0 };
     int ok = walk_block_txs((const u8*)blockbuf, blocklen, &dc, 0,
                             del_created_on_output, &dc.txid, (u64)-1);
     g_undo_enabled = saved;
+    if (dc.skipped)   /* UTX-10 */
+        fprintf(stderr, "[utxo_live] unapply h=%ld: %ld of %ld created outputs were ALREADY ABSENT and were not deleted -- if this is not a partial apply, the lookup is lying and the set may hold phantom coins\n",
+                height, dc.skipped, dc.seen);
     if (!ok || dc.fatal){
         fprintf(stderr, "[utxo_live] unapply height %ld: created-output removal failed (ok=%d fatal=%d)\n", height, ok, dc.fatal);
         return 0;
@@ -2869,7 +2927,7 @@ int utxo_live_init(const char* dir){
      * REPLAYED RECORD COUNT / -1 err (not literally 1) -- different
      * contracts, so they need different success checks. */
     long r = have_prior_state
-        ? utxo_lsm_reload(&g_utxo_lst, g_utxo_table)
+        ? (g_utxo_in_reload = 1, utxo_lsm_reload(&g_utxo_lst, g_utxo_table), g_utxo_in_reload = 0)
         : utxo_lsm_init(&g_utxo_lst);
     UTXO_LSM_BARRIER();   /* reload may clobber callee-saved regs (ARM) */
     /* UTX-2 (audit 2026-09-03): ANY negative reload is fatal, not just -1.
@@ -2919,6 +2977,29 @@ int utxo_live_init(const char* dir){
                 "[utxo_live]   Fix: compact first with "
                 "daemon/build_migrate_compact <datadir> <slots_log2> <blob_gb>.\n",
                 UTXO_LIVE_MANIFEST_CAP);
+        /* UTX-6 (audit 2026-09-03): -1 with a manifest present is now also
+         * reachable for a reason an operator can actually fix, so name it.
+         * The reload used to treat an unreadable or over-capacity manifest as
+         * "no runs" and return success; it now fails. The most likely cause
+         * by far is a capacity mismatch -- build_utxo and the migration tool
+         * size manifest_cap at 8192 and the read-only tools at 4096, while
+         * the daemon uses UTXO_LIVE_MANIFEST_CAP -- so a store seeded in bulk
+         * can carry more runs than the daemon will accept. That used to boot
+         * "successfully" with an empty run set and then sweep every real run
+         * as an orphan on the boot after next. */
+        if (have_prior_state && r == -1 && has_manifest)
+            fprintf(stderr,
+                "[utxo_live] FATAL: %s exists but could not be read into a "
+                "%u-entry manifest (bad magic, truncated, unreadable, or more "
+                "runs than this build accepts).\n"
+                "[utxo_live]   Starting anyway would treat the store as having "
+                "NO runs, publish a manifest naming only the new one, and let "
+                "the next boot sweep every real run away.\n"
+                "[utxo_live]   Fix: if the store was seeded by build_utxo or "
+                "the migration tool, compact it with those tools (they size "
+                "manifest_cap at 8192) until it holds at most %u runs.\n",
+                "utxo_manifest.dat", (unsigned)UTXO_LIVE_MANIFEST_CAP,
+                (unsigned)UTXO_LIVE_MANIFEST_CAP);
         return 0;
     }
 
@@ -3115,6 +3196,20 @@ long utxo_live_catchup(void* store_buf){
         }
         UTXO_LIVE_TEST_CRASH_HOOK(applied);
 
+        /* TXOQ-1 (2026-09-05, /mnt/2tbssd bmc-vs-Core benchmark): the quiescent
+         * gettxout service point in main.c fires only AFTER a catch-up call
+         * returns -- but a call runs for minutes on a large gap, so the
+         * parent's 2s query timeout refused every gettxout for the whole pass
+         * ("not ready, retry shortly" for 10+ minutes on a node whose
+         * heartbeat showed a healthy tip-synced set). The same moment the
+         * TEST crash hook above treats as kill-safe is exactly safe for a
+         * query: block h applied AND its checkpoint persisted, no put/del in
+         * flight, still single-threaded within this process (the
+         * get()/flush()-never-overlap invariant holds by construction -- this
+         * is not a thread reentry, it is the same thread pausing between
+         * blocks). A query answered here sees the set as of a committed,
+         * checkpointed block -- never a torn state. */
+        if (g_utxo_apply_hook && !g_utxo_in_reload) g_utxo_apply_hook();
         /* SIGTERM/SIGINT arrived: block h is applied AND checkpointed, so
          * this is a clean boundary. Stop here -- do not start the next block
          * and do not begin a compaction -- and return the count applied so

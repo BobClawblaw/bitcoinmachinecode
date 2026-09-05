@@ -172,7 +172,12 @@ static const chainparams_t PARAMS_REGTEST = {
 
 static const chainparams_t PARAMS_TESTNET4 = {
     .id = CHAIN_TESTNET4, .name = "testnet4",
-    .min_chain_work_hex = "00000000000000000000000000000000000000000000000000000b463ea0a4b8",
+    /* VAL-12 (audit 2026-09-03): this was SIGNET's floor, byte-identical to
+     * PARAMS_SIGNET below -- about 4e9 times lower than Core's, so a low-work
+     * testnet4 fork cleared reorg_work_meets_minimum when it should not.
+     * Core kernel/chainparams.cpp testnet4 nMinimumChainWork. No mainnet
+     * effect; testnet4 anti-DoS only. */
+    .min_chain_work_hex = "0000000000000000000000000000000000000000000009a0fe15d0177d086304",
     .magic = 0x283f161cu,            /* 1c 16 3f 28 on the wire            */
     .default_port = 48333, .default_rpc_port = 48332,
     .genesis = GENESIS_T4, .genesis_len = 261,

@@ -24,6 +24,7 @@ extern int  node_handshake(int fd);
 extern long node_serve_loop(int fd, int lfd, void* st, void* ht_idx, void* out, long cap);
 extern int  tcp_connect_ip(unsigned ip_le, unsigned short port_be);
 extern unsigned int net_magic;
+extern void sha256d(unsigned char out[32], const void* in, unsigned long len);
 extern void (*g_serve_violation_hook)(const char*);
 
 static int fails = 0;
@@ -70,18 +71,36 @@ static int run_case(unsigned announced, int send_payload){
     struct timeval tv = {8, 0}; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     if (node_handshake(fd) != 1){ close(fd); close(ls); return -2; }
 
+    /* ---- NET-11 (audit 2026-09-03): the checksum must be REAL ----
+     * This builder used to write four zero bytes here, which was fine while
+     * p2p_read ignored the field. It verifies it now, as Core does, so a
+     * zero checksum is rejected by the FRAMER and the serve loop never sees
+     * the message -- every violation case below then failed with "the loop
+     * dropped it WITHOUT reporting". A real peer sending an over-long inv or
+     * an unparseable tx computes a correct checksum, so the scoring
+     * behaviour these cases test is unchanged; only the fixture was stale.
+     * (The oversized-announcement cases are refused on SIZE before the
+     * checksum is looked at, so they pass either way.)
+     *
+     * The digest covers exactly the bytes written as the payload below. */
+    unsigned char* body = 0; unsigned long bodylen = 0; int body_owned = 0;
+    if (g_body && g_blen){ body = (unsigned char*)g_body; bodylen = (unsigned long)g_blen; }
+    else if (send_payload && announced){
+        body = calloc(1, announced);
+        if (body){ bodylen = announced; body_owned = 1; }
+    }
+
     unsigned char h[24];
     memcpy(h, &net_magic, 4);
     memset(h + 4, 0, 12); memcpy(h + 4, g_cmd, strlen(g_cmd));
     h[16] = (unsigned char)announced;         h[17] = (unsigned char)(announced >> 8);
     h[18] = (unsigned char)(announced >> 16); h[19] = (unsigned char)(announced >> 24);
-    memset(h + 20, 0, 4);
+    { unsigned char d[32]; sha256d(d, body ? (const void*)body : (const void*)"", bodylen);
+      memcpy(h + 20, d, 4); }
+
     ssize_t w = write(fd, h, 24); (void)w;
-    if (g_body && g_blen){ w = write(fd, g_body, g_blen); }
-    else if (send_payload && announced){
-        unsigned char* p = calloc(1, announced);
-        if (p){ w = write(fd, p, announced); free(p); }
-    }
+    if (body && bodylen) w = write(fd, body, bodylen);
+    if (body_owned) free(body);
     shutdown(fd, SHUT_WR);
     int st = 0; waitpid(pid, &st, 0);
     close(fd); close(ls);

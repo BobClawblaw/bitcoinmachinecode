@@ -28,6 +28,25 @@
 #include "utxo_snapshot.h"
 #include <string.h>
 
+/* UTX-7 (audit 2026-09-03): Core compresses a 65-byte uncompressed P2PK only
+ * when the key is FULLY VALID -- IsToPubKey (compressor.cpp) ends the 67-byte
+ * arm with `return pubkey.IsFullyValid();`, and an invalid key falls through
+ * to the raw VARINT(len+6) encoding.
+ *
+ * Note the asymmetry, which is Core's and is reproduced exactly below: the
+ * 33-byte COMPRESSED arm is NOT gated. Compression there only relabels the
+ * prefix byte, so DecompressScript reproduces the original bytes whatever the
+ * key was. The uncompressed arm throws y away and keeps a parity bit, so
+ * decompression has to RECOVER y by solving the curve equation -- which is
+ * impossible if the point was never on the curve. That is the whole reason
+ * the gate exists on one arm and not the other.
+ *
+ * pubkey_parse (bitcoin_pubkey.asm) is this tree's equivalent probe: for a
+ * 65-byte 0x04 key it checks y^2 == x^3 + 7 (mod p), which is what
+ * secp256k1_ec_pubkey_parse checks behind IsFullyValid. */
+extern int pubkey_parse(const unsigned char* pub, unsigned long publen,
+                        unsigned long long qx[4], unsigned long long qy[4]);
+
 static long us_compact(unsigned char* o, unsigned long long v){
     if (v < 0xfd){ o[0] = (unsigned char)v; return 1; }
     if (v <= 0xffff){ o[0]=0xfd; o[1]=(unsigned char)v; o[2]=(unsigned char)(v>>8); return 3; }
@@ -69,6 +88,13 @@ unsigned long long usnap_compress_amount(unsigned long long n){
  * not a "reasonable" one. */
 #define USNAP_MAX_SCRIPT 10000
 
+/* UTX-7: Core's IsFullyValid for the 65-byte uncompressed form. `pub` points
+ * at the 0x04 prefix (65 bytes). */
+static int usnap_pubkey_fully_valid(const unsigned char* pub){
+    unsigned long long qx[4], qy[4];
+    return pubkey_parse(pub, 65, qx, qy) == 1;
+}
+
 long usnap_coin(unsigned int vout, unsigned long height, int coinbase,
                 unsigned long long value,
                 const unsigned char* spk, unsigned long spklen,
@@ -90,7 +116,14 @@ long usnap_coin(unsigned int vout, unsigned long height, int coinbase,
                spk[34]==0xac){
         o += us_varint(buf + o, spk[1]);          /* kind = the key's prefix */
         memcpy(buf + o, spk + 2, 32); o += 32;
-    } else if (spklen == 67 && spk[0]==65 && spk[1]==0x04 && spk[66]==0xac){
+    } else if (spklen == 67 && spk[0]==65 && spk[1]==0x04 && spk[66]==0xac &&
+               usnap_pubkey_fully_valid(spk + 1)){
+        /* UTX-7: the on-curve gate. Without it a bare P2PK output carrying a
+         * non-curve 0x04 key -- these exist in mainnet's UTXO set -- was
+         * written as kind 4/5 + x, which Core's DecompressScript cannot undo
+         * (there is no y to recover), so loadtxoutset would fail to
+         * deserialize or hash differently. Such keys now fall through to the
+         * raw arm below, exactly as they do in Core. */
         o += us_varint(buf + o, 4 | (spk[65] & 1));
         memcpy(buf + o, spk + 2, 32); o += 32;    /* x-coord only */
     } else {
