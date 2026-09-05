@@ -79,7 +79,15 @@ Everything below is landed on `arm-port` and pushed. History lives in
       (~2.5 h), applied_height=964000, swap, and let the daemon's own
       catch-up apply 964001..tip through the battle-tested apply path; fix
       the swap script's unqualified globs first. Full details in the 22:30
-      UTC worklog entry; backups intact.- [x] `validation/spend_corpus_diff.py` ran for the FIRST time on this port
+      UTC worklog entry; backups intact.
+      STATUS 2026-09-04 ~20:15 UTC: v2 rebuild (0..964000) running, ~91%;
+      globs fixed + data/swap_rebuilt_store_v2.sh written (v1's files are
+      deleted after daemon-stop so v2 fits; rollback-store-20260904 stays
+      the standing fallback; applied_height=964000 written pre-swap).
+      BONUS: build_utxo gained a VERIFIED -j N pipeline (2654b0d9) —
+      byte-identical stores vs serial (the only table delta is a per-run
+      CLOCK_MONOTONIC header stamp that serial runs don't share either),
+      ~1.2x under I/O contention, serial default unchanged.- [x] `validation/spend_corpus_diff.py` ran for the FIRST time on this port
       2026-09-04 01:25 UTC, against a real synced Core over the LAN
       (Umbrel node 192.168.5.69:8332, txindex on, verificationprogress=1):
       zero divergences, accept-parity 253/253 real mainnet spends and 2024/2024
