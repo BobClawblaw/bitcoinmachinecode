@@ -1870,12 +1870,41 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
             for (int e=0;e<n_evict;e++)
                 if (!memcmp(prev[i], evict_set[e], 32)){
                     _mpol_last_reason = "bad-txns-spends-conflicting-tx"; return 0; }
-        /* rule 2 (classic): no NEW unconfirmed inputs -- every unconfirmed
-         * input must already be double-spent (claimed) by a conflict; an
-         * unclaimed unconfirmed input is new. */
+        /* rule 2 (classic): no NEW unconfirmed inputs.
+         *
+         * MEM-14 (audit 2026-09-03): this demanded that the exact OUTPOINT be
+         * claimed by a conflict. Core's HasNoNewUnconfirmed builds
+         * `parents_of_conflicts` -- a set of TXIDs, the parents of the direct
+         * conflicts -- and accepts an unconfirmed input whose prevout txid is
+         * in that set, whatever its index.
+         *
+         * The difference bites a common wallet operation. Unconfirmed parent P
+         * has outputs 0 and 1; the original spends P:0, and a bumpfee
+         * replacement re-selects and spends P:1 as well. P:1 is unconfirmed and
+         * unclaimed, so this refused a replacement Core accepts.
+         *
+         * Loosening only: an input that was already accepted still is, so this
+         * cannot newly reject anything. Confirmed inputs never reach here --
+         * the loop walks n_unconf. Cost is O(conflicts x parents) inside a
+         * path already O(conflicts), under mp_lock. */
         for (int u=0;u<n_unconf;u++){
             int i = unconf_in[u];
-            if (find_claim(st, prev[i], idx[i]) < 0){
+            if (find_claim(st, prev[i], idx[i]) >= 0) continue;   /* the outpoint itself is claimed */
+            /* MEM-14: else the prevout's TX must be a parent of some conflict */
+            int from_conflict_parent = 0;
+            { mpol_node* tt = mpol_nodes_base(st);
+              uint32_t nn = *(uint32_t*)((char*)st+16);
+              for (int k=0; k<n_conf && !from_conflict_parent; k++){
+                  uint32_t ci2 = conf_claimers[k];
+                  if (ci2 >= nn) continue;
+                  const mpol_node* cn = &tt[ci2];
+                  for (uint32_t q=0; q<cn->n_parents && !from_conflict_parent; q++){
+                      uint32_t pi = mpol_par_at(st, cn, q);
+                      if (pi < nn && !memcmp(tt[pi].txid, prev[i], 32))
+                          from_conflict_parent = 1;
+                  }
+              } }
+            if (!from_conflict_parent){
                 _mpol_last_reason = "replacement-adds-unconfirmed"; return 0; }
         }
         /* ---- MEM-7 (audit 2026-09-03): Core's PaysMoreThanConflicts ----

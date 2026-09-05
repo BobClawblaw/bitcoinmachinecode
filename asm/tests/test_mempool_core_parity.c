@@ -551,6 +551,45 @@ int main(void){
         r = mpool_policy_add(pol, st, mp, tx, n, id, ux);
         ck("new-unconfirmed-input replacement refused", r == 0);
         ckr("...as", pol, "replacement-adds-unconfirmed"); }
+
+      /* ---- MEM-14 (audit 2026-09-03): a SIBLING output of a conflict's own
+       * parent is not a "new" unconfirmed input.
+       *
+       * Rule 2 demanded that the exact OUTPOINT be claimed by a conflict.
+       * Core's HasNoNewUnconfirmed tests membership in parents_of_conflicts,
+       * a set of TXIDs -- so an input spending a DIFFERENT output of a tx that
+       * a conflict already spends is fine.
+       *
+       * The shape is an ordinary bumpfee: unconfirmed parent P pays two
+       * outputs; the original spends P:0; the replacement re-selects and
+       * spends P:0 AND P:1. P:1 is unconfirmed and unclaimed, so this was
+       * refused where Core accepts.
+       *
+       * The case above is the control's other half and must keep failing: an
+       * input from an UNRELATED pool tx is still new, and a fix that simply
+       * stopped checking would let it through. */
+      { u8 P2[32], C2[32];
+        txout_t two[2] = { { .v=400000, .spk=SPK_WPKH, .spklen=22 },
+                           { .v=400000, .spk=SPK_WPKH, .spklen=22 } };
+        n = mk(tx, &(txin_t){ .tag=6, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, two, 2);
+        tx_txid(P2, tx, n, sc, sizeof sc);
+        ck("MEM-14 parent P with two outputs in", mpool_policy_add(pol, st, mp, tx, n, P2, ux) == 1);
+
+        txout_t oc = { .v=390000, .spk=SPK_WPKH, .spklen=22 };
+        n = mk(tx, &(txin_t){ .previd=P2, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oc, 1);
+        tx_txid(C2, tx, n, sc, sizeof sc);
+        ck("MEM-14 child C spending P:0 in", mpool_policy_add(pol, st, mp, tx, n, C2, ux) == 1);
+
+        /* the replacement: conflicts with C on P:0, and ALSO spends P:1 */
+        txin_t rep[2] = {
+            { .previd=P2, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 },  /* conflicts with C */
+            { .previd=P2, .idx=1, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }   /* sibling output */
+        };
+        txout_t orp = { .v=700000, .spk=SPK_WPKH, .spklen=22 };
+        n = mk(tx, rep, 2, &orp, 1); tx_txid(id, tx, n, sc, sizeof sc);
+        r = mpool_policy_add(pol, st, mp, tx, n, id, ux);
+        ck("MEM-14 spending a SIBLING output of the conflict's parent is ACCEPTED", r == 1);
+        if (r != 1) printf("      refused as: %s\n", mpool_policy_reason(pol)); }
     }
 
     printf("\n== 4b: classic signaling when fullrbf is OFF ==\n");

@@ -5088,13 +5088,29 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                             result = 1; break;
                         }
                 } else {
-                    /* refuse a subnet form the matcher cannot enforce */
-                    const char* sl = strchr(arg, '/');
-                    if(sl && (atoi(sl+1) % 8 || atoi(sl+1) < 8 || atoi(sl+1) > 32)){
+                    /* ---- RPC-8 (audit 2026-09-03) ----
+                     * This used to refuse any prefix that was not a multiple
+                     * of 8 in [8,32], claiming the matcher could not enforce
+                     * it. That was true of the OLD string-comparing matcher
+                     * and has been false since subnet.c landed:
+                     * subnet_parse/subnet_covers handle any prefix 0..128 for
+                     * both families, and ctl_ban_covers is a one-line
+                     * passthrough to them. tests/test_subnet.c already proves
+                     * /28, /12, /20 and IPv6 including ::/0.
+                     *
+                     * Worse, the rule read the prefix without looking at the
+                     * family, so it ACCEPTED 2001:db8::/32 while refusing
+                     * ::1/128 and 2001:db8::/64 -- the exact inversion the
+                     * comment above ctl_ban_covers says was fixed.
+                     *
+                     * Now: parse it. An unparseable spec is refused (Core
+                     * raises -30 at the RPC, which cmd_setban also does now);
+                     * anything the matcher can actually evaluate is allowed. */
+                    subnet_t sn_probe;
+                    if(!subnet_parse(arg, &sn_probe)){
                         result = -1;
                         snprintf(reason, sizeof reason,
-                                 "this node enforces only /8, /16, /24 and /32 subnets; "
-                                 "a prefix it cannot match would be stored and never enforced");
+                                 "not a valid IP or subnet: %s", arg);
                     } else {
                         int dup = 0, slot = -1;
                         for(int i = 0; i < RPC_MAX_BANS; i++){
