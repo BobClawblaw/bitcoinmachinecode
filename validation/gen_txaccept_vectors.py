@@ -43,7 +43,9 @@ WANTED = [
     ("f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16",
      "h=170: the first ever P2PK->P2PK spend (Satoshi to Hal)"),
     ("6f7cf9580f1c2dfb3c4d5d043cdbb128c640e3f20161245aa7372e9666168516",
-     "h=728: early P2PKH"),
+     "h=728: spends two bare P2PK outputs and CREATES the P2PKH shape that "
+     "became ordinary. The interesting type is in the OUTPUT -- what this "
+     "vector exercises on the input side is P2PK"),
     ("fb0a1d8d34fa5537e461ac384bac761125e1bfa7fec286fa72511240fa66864d",
      "h=124276: NON-MINIMAL DER -- 34-byte r AND s (two leading zero pad bytes "
      "each). The case bitcoin_script.asm's 2026-08-19 fix exists for; a parser "
@@ -53,9 +55,13 @@ WANTED = [
     ("60a20bd93aa49ab4b28d514ec10b06e1829ce6818ec06cd3aabd013ebcdc4bb1",
      "FindAndDelete: a signature that appears inside its own scriptCode"),
     ("eb3b82c0884e3efa6d8b0be55b4915eb20be124c9766245bcc7f34fdac32bccb",
-     "h=170060-ish: bare multisig (P2MS) output"),
+     "h=163685: creates a bare multisig (P2MS) output; its second input "
+     "spends PUSH20 <data> OP_NOP2 OP_DROP -- an anyone-can-spend script that "
+     "was a pair of NOPs at this height (CLTV only took OP_NOP2 at 388381)"),
     ("9c08a4d78931342b37fd5f72900fb9983087e6f46c4a097d8a1f52c74e28eaf6",
-     "P2SH: an early pay-to-script-hash spend"),
+     "h=170052: CREATES an early P2SH output while spending P2PK. It cannot "
+     "be a P2SH spend -- BIP16 activated at 173805, AFTER this block. P2SH "
+     "REDEMPTION is covered by the h=481824 and h=550000 vectors, not here"),
     ("dfcec48bb8491856c353306ab5febeb7e99e4d783eedf3de98f3ee0812b92bad",
      "h=481824: the FIRST segwit (P2WPKH) spend, in the activation block"),
     ("f91d0a8a78462bc59398f2c5d7a84fcff491c26ba54c4833478b202796c8aafd",
@@ -77,7 +83,11 @@ WANTED = [
     ("965f866bf8623bbf956c1b2aeec1efc1ad162fd428ab7fb89f128a0754ebbc32",
      "h=800000: taproot SCRIPT-path spend (BIP342) -- 33-byte control block"),
     ("b10c0000004da5a9d1d9b4ae32e09f0b3e62d21a5cce5428d4ad714fb444eb5d",
-     "h=850000: ANCHOR output (P2A) -- Core v28's new output type"),
+     "h=850000: 10 inputs spending SEVEN script types in one transaction "
+     "(P2PK, P2PKH, bare multisig, P2SH x3, P2WPKH, P2WSH, P2TR x2) and 9 "
+     "outputs covering nine, including the P2A ANCHOR (Core v28) and "
+     "nulldata. The single widest vector in the corpus, and the ONLY one "
+     "that spends bare multisig"),
 ]
 
 def prevouts_for(txj):

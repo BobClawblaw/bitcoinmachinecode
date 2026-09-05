@@ -4,15 +4,16 @@ Seventeen real transactions taken from the main chain, each replayed
 against the script flags of *its own block*. The full-archive replay,
 reduced to a test that runs in milliseconds.
 
-17 transactions, 25 KB of vectors, heights 170 through 850,000, 17/17
-accepted.
+17 transactions, 26 KB of vectors, 8,695 bytes of transaction across 32
+resolved inputs, heights 170 through 850,000. 17/17 accepted, 68 checks,
+0 failures.
 
 Every transaction here was mined into the main chain, so each is
 consensus-valid under the flags active at its own height. That is the
 entire claim, and it is deliberately a narrow one. The transactions were
 chosen because they broke someone's assumption, not because they are
-common: a thousand ordinary P2PKH spends would test less than the eleven
-odd ones below.
+common: a thousand ordinary P2PKH spends would test less than any one of
+the odd ones below.
 
 ## Scope
 
@@ -23,27 +24,98 @@ asked for a policy verdict on a transaction whose inputs are long spent.
 Conflating the two would produce a confident wrong answer, so policy is
 tested separately.
 
-## What is in it
+## The transactions
 
 Height is load-bearing, not decoration. DERSIG activates at 363,725, CLTV
-at 388,381, CSV at 419,328, segwit at 481,824, taproot at 709,632. A
-transaction from 2011 must be judged by 2011's rules, and several of these
-are rejected under today's. Each vector therefore carries its own height.
+at 388,381, CSV at 419,328, segwit at 481,824, taproot at 709,632; P2SH
+took effect at 173,805. A transaction from 2011 must be judged by 2011's
+rules, and two of these are rejected outright under today's. Each vector
+therefore carries its own height.
 
-| Height | What makes it interesting |
+"Spends" is the script type of the *inputs* — what the verifier actually
+had to execute. It is not always what the transaction is famous for, and
+that distinction turned out to matter (see below).
+
+| Height | Transaction | Spends | What makes it unique |
+|---|---|---|---|
+| 170 | `f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16` | P2PK | **First P2PK spend in history.** Satoshi to Hal Finney. A bare public key in the output, no hash. The oldest spend the chain has. |
+| 728 | `6f7cf9580f1c2dfb3c4d5d043cdbb128c640e3f20161245aa7372e9666168516` | P2PKx2 | **Creates the P2PKH shape.** Spends two bare P2PK outputs. The novelty is in the output, not the input — on the spend side this is P2PK. |
+| 124,276 | `fb0a1d8d34fa5537e461ac384bac761125e1bfa7fec286fa72511240fa66864d` | P2PKH | **Non-minimal DER: 34-byte r AND s.** Two leading zero pad bytes on each of r and s. A parser that strips only one rejects this real, mined transaction. The case the 2026-08-19 signature fix exists for. |
+| 163,685 | `eb3b82c0884e3efa6d8b0be55b4915eb20be124c9766245bcc7f34fdac32bccb` | P2PKH+NOP-script | **Anyone-can-spend NOP script.** Creates a bare multisig output; its second input spends PUSH20 <data> OP_NOP2 OP_DROP — valid because OP_NOP2 was still a NOP here. CLTV only claimed that opcode at 388,381. |
+| 164,467 | `60a20bd93aa49ab4b28d514ec10b06e1829ce6818ec06cd3aabd013ebcdc4bb1` | P2PKHx3 | **FindAndDelete.** A signature that appears inside its own scriptCode and must be removed before hashing. Three P2PKH inputs, 759 bytes. |
+| 170,052 | `9c08a4d78931342b37fd5f72900fb9983087e6f46c4a097d8a1f52c74e28eaf6` | P2PK | **Creates an early P2SH output.** It cannot be a P2SH spend: BIP16 activated at 173,805, after this block. It spends P2PK. |
+| 247,939 | `315ac7d4c26d69668129cc352851d9389b4a6868f1509c6c8b66bead11e2619f` | P2PKHx2 | **The SIGHASH_SINGLE bug.** Input index ≥ output count, so the sighash is the literal value 1. Mined, and must still validate forever. |
+| 481,824 | `461e8a4aa0a0e75c06602c505bd7aa06e7116ba5cd98fd6e046e8cbeb00379d6` | P2PKHx2 | **Creates a P2WSH output.** In the segwit activation block. Spends two P2PKH inputs — no witness of its own. |
+| 481,824 | `8f907925d2ebe48765103e6845c06f1f2bb77c6adc1cc002865865eb5cfd5c1c` | P2SH | **P2SH-wrapped P2WPKH.** scriptSig AND witness both populated, the only shape where both are non-empty. |
+| 481,824 | `dfcec48bb8491856c353306ab5febeb7e99e4d783eedf3de98f3ee0812b92bad` | P2SH | **The first segwit spend in history.** In the activation block itself. |
+| 481,824 | `f91d0a8a78462bc59398f2c5d7a84fcff491c26ba54c4833478b202796c8aafd` | P2WPKH | **Native P2WPKH spend.** Activation block. |
+| 550,000 | `73965c0ab96fa518f47df4f3e7201e0a36f163c4857fc28150d277caa8589259` | P2WSH | **Native P2WSH multisig.** Four witness items. |
+| 550,000 | `9cf007aa4ed2216c6ca42ba593558cb6ce4df9c5417677d7ca96a7b2be6d807b` | P2SH | **P2SH-wrapped P2WSH.** Four witness items, redeemed through the P2SH wrapper. |
+| 550,000 | `bdcb08cd977e229482f295345893405882a08132f1675beb844de8548007915f` | P2PKH | **Creates a bare multisig output.** Consensus-valid, non-standard to relay today. Spends P2PKH. |
+| 750,000 | `4c9fe4ad5923fd41074da3f92da6359cbafbd96ecbb758481d6c1f106242703e` | P2TR | **Taproot key-path (BIP341).** A single witness item. The cheapest spend the chain allows. |
+| 800,000 | `965f866bf8623bbf956c1b2aeec1efc1ad162fd428ab7fb89f128a0754ebbc32` | P2TR | **Taproot script-path (BIP342).** With a real 33-byte control block. |
+| 850,000 | `b10c0000004da5a9d1d9b4ae32e09f0b3e62d21a5cce5428d4ad714fb444eb5d` | P2PK+P2PKH+P2MS+P2SHx3+P2WPKH+P2WSH+P2TRx2 | **Seven script types in one transaction.** 10 inputs spending P2PK, P2PKH, bare multisig, P2SH×3, P2WPKH, P2WSH and P2TR×2; 9 outputs covering nine types including the P2A anchor and nulldata. The widest vector in the corpus — and the only one that spends bare multisig. |
+
+Every txid above is real and on the main chain; each can be looked up
+with `getrawtransaction <txid>` against any archival node.
+
+## What the corpus actually covers
+
+Counting by the script type each vector *spends*:
+
+| Spend type | Vectors exercising it |
 |---|---|
-| 170 | first P2PK→P2PK spend, Satoshi to Hal Finney: a bare public key, no hash |
-| 728 | early P2PKH, the shape that became ordinary |
-| 124,276 | non-minimal DER: a 34-byte `r` *and* `s`, two leading zero pad bytes each. A parser that strips only one rejects this real, mined transaction |
-| 163,685 | bare multisig (P2MS): consensus-valid, non-standard to relay today |
-| 164,467 | `FindAndDelete`: a signature appearing inside its own scriptCode |
-| 170,052 | early P2SH, shortly after BIP16 |
-| 247,939 | the `SIGHASH_SINGLE` bug: input index ≥ output count, so the sighash is the literal value 1. Mined, and must still validate |
-| 481,824 | the segwit activation block, four vectors: native P2WPKH, P2SH-wrapped P2WPKH (scriptSig *and* witness), and P2WSH |
-| 550,000 | witness script paths, three vectors: native P2WSH multisig, P2SH-wrapped P2WSH, bare multisig output |
-| 750,000 | taproot key-path (BIP341), a single witness item |
-| 800,000 | taproot script-path (BIP342), with a real 33-byte control block |
-| 850,000 | anchor output (P2A), Core v28's new output type: exactly one instance in the entire survey |
+| P2PKH | 7 |
+| P2PK | 4 |
+| P2SH | 4 |
+| P2TR | 3 |
+| P2WPKH | 2 |
+| P2WSH | 2 |
+| bare multisig (P2MS) | **1** |
+| `OP_NOP2 OP_DROP` anyone-can-spend | 1 |
+
+Two things follow, and neither was visible before the txids were laid out
+this way:
+
+**Four vectors are output-shape only.** `6f7cf958`, `9c08a4d7`,
+`bdcb08cd` and `461e8a4a` are named for a type that appears in their
+*outputs*; on the input side they spend ordinary P2PK or P2PKH. They
+assert that a transaction creating that output is accepted — they do not
+exercise redemption of it.
+
+**Bare multisig redemption rests on a single vector.** Two vectors are
+named "bare multisig" and neither spends one; the only P2MS input in the
+whole corpus is one of the ten in `b10c0000…`. Drop that transaction and
+P2MS verification loses all coverage while the corpus still appears to
+have two vectors for it.
+
+`b10c0000…` is the most valuable transaction here by a wide margin: ten
+inputs across seven script types, nine outputs across nine, spanning
+every consensus era from bare P2PK to the P2A anchor in one 3,500-byte
+transaction.
+
+## Labels that were wrong
+
+Three vectors carried descriptions that did not survive checking the
+prevouts, and are corrected in the generator:
+
+| Vector | Said | Actually |
+|---|---|---|
+| `9c08a4d7` (170,052) | "an early pay-to-script-hash spend" | spends **P2PK**. It cannot be a P2SH spend — BIP16 activated at 173,805, *after* this block. It creates a P2SH output |
+| `6f7cf958` (728) | "early P2PKH" | spends two bare **P2PK** outputs; P2PKH is the output shape |
+| `eb3b82c0` (163,685) | "h=170060-ish" | is at **163,685**, and its second input is an anyone-can-spend `PUSH20 <data> OP_NOP2 OP_DROP` |
+
+These were descriptive strings, not assertions, so no test was passing on
+a false premise — but the report built on them, and a reader would have
+concluded P2SH redemption was covered from block 170,052 when it is not.
+
+## One wanted transaction is not in the corpus
+
+`da917699942e4a96272401b534381a75512eeebe8403084500bd637bd47168b3`
+(h=481,824, an OP_RETURN nulldata output) is in the generator's `WANTED`
+list but skipped: its prevouts are unresolvable from the oracle. The list
+asks for 18; 17 ship. Nulldata output creation is still covered
+incidentally, as one of the nine outputs of `b10c0000…`.
 
 ## The controls
 
