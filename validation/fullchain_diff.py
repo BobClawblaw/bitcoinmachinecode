@@ -104,10 +104,13 @@ STORAGE_HEADER = 8
 MUT_WIN = 256
 
 def _auth_header():
-    try:
-        cookie = open(COOKIE_PATH).read().strip()
-    except Exception:
-        cookie = 'bitcoinrpc:e85a0d86221666b1005b00805048c11d'
+    # BLD-3 (audit 2026-09-03): this used to fall back to a HARD-CODED
+    # bitcoinrpc:<password> pair for the Core oracle when the cookie could not
+    # be read -- a live credential committed to the repository since 2026-08-16.
+    # Deleting it does not un-publish it; the password must be rotated out of
+    # band. Failing loudly is also simply better here: a silent fallback to the
+    # wrong credential produced a 401 that looked like an oracle outage.
+    cookie = open(COOKIE_PATH).read().strip()
     return 'Basic ' + base64.b64encode(cookie.encode()).decode()
 _AUTH = _auth_header()
 

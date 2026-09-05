@@ -112,6 +112,55 @@ int main(void){
         cki("hybrid 0x07 with mismatched parity rejected", pubkey_parse(hy,65,hx,hyq), 0);
     }
 
+    /* ---- CRY-3 (audit 2026-09-03): a field element >= p is not a key ----
+     * pubkey_parse converted 32 big-endian bytes straight to limbs with no
+     * compare against p. Core refuses these: secp256k1_fe_set_b32_limit for
+     * ECDSA keys, lift_x for BIP340. Two consequences, the second live today:
+     * a hypothetical discrete log on one of the ~2^31 values with x >= p would
+     * be a false ACCEPT (we follow a chain Core rejects), and a non-canonical
+     * x was being returned into point_add_mixed / ecdsa_verify, whose doubling
+     * and opposite detection compare limbs and assume canonical operands.
+     *
+     * x' = 1 IS on the curve (y^2 = 8, and p = 7 mod 8 makes 8 a QR), so
+     * 0x02 || BE(p+1) is a key that parses successfully TODAY and must not.
+     * That is what makes this a control rather than a restatement.
+     *
+     * The control's other half: p-1 is the largest CANONICAL x and must still
+     * be attempted (it is not on the curve, so parse fails for that reason --
+     * what matters is that the range check is < p and not <= p, which an
+     * off-by-one would break silently). */
+    {
+        unsigned char k[65]; unsigned long long qx[4], qy[4];
+
+        /* p+1: non-canonical, and its reduced form x'=1 IS on the curve */
+        static const char* PP1 =
+            "02FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC30";
+        for (int i = 0; i < 33; i++){ unsigned v; sscanf(PP1 + 2*i, "%2x", &v); k[i] = (unsigned char)v; }
+        cki("CRY-3 compressed x = p+1 (reduces to on-curve x=1) is REFUSED", pubkey_parse(k, 33, qx, qy), 0);
+
+        /* p itself: non-canonical, reduces to 0 */
+        static const char* PEXACT =
+            "02FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F";
+        for (int i = 0; i < 33; i++){ unsigned v; sscanf(PEXACT + 2*i, "%2x", &v); k[i] = (unsigned char)v; }
+        cki("CRY-3 compressed x = p exactly is REFUSED", pubkey_parse(k, 33, qx, qy), 0);
+
+        /* uncompressed: a canonical x with a NON-canonical y must also go */
+        static const char* UNC_BADY =
+            "04"
+            "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798"
+            "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC30";
+        for (int i = 0; i < 65; i++){ unsigned v; sscanf(UNC_BADY + 2*i, "%2x", &v); k[i] = (unsigned char)v; }
+        cki("CRY-3 uncompressed y >= p is REFUSED", pubkey_parse(k, 65, qx, qy), 0);
+
+        /* THE CONTROL'S OTHER HALF: the generator must still parse. A range
+         * check written <= p instead of < p, or applied to the wrong limb
+         * order, breaks this immediately. */
+        static const char* GEN =
+            "0279BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798";
+        for (int i = 0; i < 33; i++){ unsigned v; sscanf(GEN + 2*i, "%2x", &v); k[i] = (unsigned char)v; }
+        cki("CRY-3 the generator still parses (range check is < p, not <= p)", pubkey_parse(k, 33, qx, qy), 1);
+    }
+
     printf("\n%s (%d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", fails);
     return fails?1:0;
 }

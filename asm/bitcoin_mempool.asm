@@ -309,8 +309,41 @@ mpool_get:
     inc  r8
     jmp  .gprobe
 .hit:
-    mov  rax, [r11]          ; len -> *out_len
-    mov  [r14], rax
+    ; ---- MEM-21 (audit 2026-09-03): the len/blob_off pair must be COHERENT ----
+    ; This returned blob+blob_off with the slot's len and validated neither.
+    ; The mempool is MAP_SHARED and the verification path in daemon/tx_accept.c
+    ; reads it WITHOUT mp_lock (txacc_resolve_verify, before the lock is taken),
+    ; so a concurrent mpool_del or mpool_compact in another process can be
+    ; mid-move when this reader matches.
+    ;
+    ; mpool_del's backward shift copies a whole 48-byte record with one mcopy,
+    ; and the txid sits at +8..39 while blob_off sits at +40 -- so there is a
+    ; window where the txid bytes of the NEW occupant have landed but its
+    ; blob_off has not. The reader then pairs the new `len` with the STALE
+    ; `blob_off` of the slot being emptied. Each field is individually < cap;
+    ; their SUM is not, which is why "both fields are < cap" is not the
+    ; safety argument it looks like. The read then runs off the end of the
+    ; blob mapping -- a SIGSEGV in a forked serve child parsing untrusted P2P
+    ; input, not merely a wrong verdict.
+    ;
+    ; mpool_put is NOT implicated: it writes len, then blob_off, then the txid
+    ; LAST, so under x86 TSO a txid match implies both fields are published.
+    ; del and compact are the whole problem.
+    ;
+    ; Refusing an incoherent pair as a MISS is the right answer at every call
+    ; site: a miss falls back to the confirmed set or re-requests, which is
+    ; what happens for a transaction that was evicted a microsecond earlier
+    ; anyway. Taking mp_lock here instead would hold a node-wide, process-
+    ; shared lock across full script verification -- turning a rare race into
+    ; an attacker-triggerable stall of every serve child, the download worker
+    ; and GBT at once. That trade is strictly worse.
+    mov  rax, [r11]          ; len
+    mov  rdx, [r11+40]       ; blob_off
+    add  rdx, rax            ; blob_off + len  (neither is attacker-huge alone)
+    jc   .miss               ; wrapped: incoherent, treat as absent
+    cmp  rdx, [r12+24]       ; blob_cap
+    ja   .miss               ; would read past the blob mapping
+    mov  [r14], rax          ; len -> *out_len
     mov  rax, [r11+40]       ; blob_off
     mov  rdx, [r12+16]       ; blob base
     add  rax, rdx            ; -> tx pointer
