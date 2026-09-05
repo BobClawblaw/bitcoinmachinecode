@@ -135,7 +135,7 @@ sv_checksig_asm:
     mov  [rbp-0x70], eax
     ; der_parse_sig(sig, siglen, r, s, &dht)
     mov  rdi, rsi
-    mov  rsi, rdx
+    lea  rsi, [rdx-1]                    ; IR-2: hashtype popped first (read above), parser sees siglen-1 -- as Core
     lea  rdx, [rbp-0x90]                 ; r[4]
     lea  rcx, [rbp-0xb0]                 ; s[4]
     lea  r8,  [rbp-0x134]                ; &dht (dword)
@@ -244,7 +244,7 @@ sv_checksig_witness_v0_asm:
     movzx eax, byte [rax-1]
     mov  [rbp-0x70], eax                 ; ht
     mov  rdi, rsi
-    mov  rsi, rdx
+    lea  rsi, [rdx-1]                    ; IR-2: hashtype popped first (read above), parser sees siglen-1 -- as Core
     lea  rdx, [rbp-0x90]
     lea  rcx, [rbp-0xb0]
     lea  r8,  [rbp-0x134]

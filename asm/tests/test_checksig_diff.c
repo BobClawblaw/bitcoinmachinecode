@@ -184,6 +184,56 @@ int main(void){
         } else { printf("FAIL: could not build BIP143 sighash\n"); fails++; }
     }
 
+
+    /* ---- IR-2 (INTERP_REVIEW_2026-09-05): der_parse_sig bounded the S
+     * INTEGER against the full push length, and every consensus caller passed
+     * siglen INCLUDING the trailing hashtype byte. Core pops the hashtype
+     * BEFORE ecdsa_signature_parse_der_lax, so its bound is one byte tighter.
+     *
+     * Vector: a VALID 70-byte DER signature (30 44 02 20 R[32] 02 20 S[32])
+     * whose S happens to end in 0x01, pushed with NO separate hashtype byte.
+     *   Core : pops 0x01 as the hashtype, lax-parses 69 bytes, S claims 32
+     *          with 31 remaining -> parse fails -> CHECKSIG false.
+     *   here : S ended exactly at the push end (`ja` accepted equality), the
+     *          hashtype read from sig[69] was 0x01 = SIGHASH_ALL, the digest
+     *          matched, verify TRUE -> consensus false accept (pre-BIP66 reach;
+     *          masked above the DERSIG height by der_sig_strict).
+     * Control: the same DER with an explicit 0x01 appended (71 bytes) MUST
+     * verify -- proving the signature is genuine and the rejection is the
+     * parse bound, not the signature. Both twins, legacy and witness v0.
+     * The signer is deterministic, so the MESSAGE is ground: the tx locktime
+     * (covered by both sighash algorithms) is varied until S's low byte is 0x01
+     * and r,s are both exactly 32 unpadded bytes. */
+    for (int wv0 = 0; wv0 <= 1; wv0++){
+        static u8 txm[128]; memcpy(txm, tx, txlen);
+        static u8 d70[80]; int found = 0; u32 tries;
+        const u64 amt = wv0 ? 100000ULL : 0;
+        for (tries = 0; tries < 300000 && !found; tries++){
+            txm[txlen-4] = (u8)tries; txm[txlen-3] = (u8)(tries>>8); txm[txlen-2] = (u8)(tries>>16);
+            u8 zz[32];
+            if (wv0) { if (segwit_v0_sighash(zz, txm, (int64_t)txlen, 0, 1, amt, spk, 25, pre, sizeof pre) <= 0) break; }
+            else     { if (!legacy_sighash(zz, txm, txlen, 0, spk, 25, 1, pre, sizeof pre)) break; }
+            u64 gr[4], gs[4]; wallet_ecdsa_sign(gr, gs, zz, priv);
+            int gl = der_signature(d70, gr, gs);
+            if (gl == 70 && d70[1] == 0x44 && d70[69] == 0x01) found = 1;
+        }
+        if (!found){ printf("FAIL: IR-2 %s: no 70-byte sig ending in 0x01 after %u tries\n", wv0?"wv0":"legacy", tries); fails++; continue; }
+        struct sv_ctx cc = { txm, txlen, 0, workc, sizeof workc, 0,0,0, amt };
+        struct sv_ctx ca = { txm, txlen, 0, worka, sizeof worka, 0,0,0, amt };
+        sv_get_locktime_context(txm, txlen, 0, &cc.tx_version, &cc.tx_locktime, &cc.in_sequence);
+        sv_get_locktime_context(txm, txlen, 0, &ca.tx_version, &ca.tx_locktime, &ca.in_sequence);
+        struct { const u8* p; size_t n; } slice = { spk, 25 };
+        cs_fn fc = wv0 ? sv_checksig_witness_v0_export : sv_checksig_export;
+        cs_fn fa = wv0 ? sv_checksig_witness_v0_asm    : sv_checksig_asm;
+        static u8 d71[96]; memcpy(d71, d70, 70); d71[70] = 0x01;
+        u64 c1 = fc(&cc, d71, 71, pub, 33, &slice), a1 = fa(&ca, d71, 71, pub, 33, &slice);
+        u64 c0 = fc(&cc, d70, 70, pub, 33, &slice), a0 = fa(&ca, d70, 70, pub, 33, &slice);
+        const char* nm = wv0 ? "witness-v0" : "legacy";
+        if (c1 == 1 && a1 == 1) printf("ok: IR-2 %s control: DER+0x01 (71 B) verifies in C and asm (ground in %u tries)\n", nm, tries);
+        else { printf("FAIL: IR-2 %s control: C=%llu asm=%llu (want 1/1 -- the signature itself must be valid)\n", nm, (unsigned long long)c1, (unsigned long long)a1); fails++; }
+        if (c0 == 0 && a0 == 0) printf("ok: IR-2 %s: 70 B DER with S ending in 0x01 and NO hashtype byte is REJECTED (Core: lax parse fails)\n", nm);
+        else { printf("FAIL: IR-2 %s: C=%llu asm=%llu (want 0/0 -- S consumed the hashtype byte; Core pops it first)\n", nm, (unsigned long long)c0, (unsigned long long)a0); fails++; }
+    }
     printf("compared %ld checksig runs; %ld mismatch(es)\n", compared, fails);
     printf("%s (%ld failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;

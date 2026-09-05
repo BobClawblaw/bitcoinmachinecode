@@ -206,12 +206,19 @@ multisig_verify:
     ; ---- Step 3: der_parse_sig ----
     mov   rdi, [rbp-0x38]   ; sig start
     mov   rsi, [rbp-0x30]   ; sigLen
+    test  rsi, rsi
+    jz    .fail             ; empty sig
+    dec   rsi               ; IR-2: hashtype popped first (read above), parser sees siglen-1 -- as Core
     lea   rdx, [rbp-0x140]  ; r_out
     lea   rcx, [rbp-0x180]  ; s_out
-    lea   r8,  [rbp-0x160]  ; hashtype
+    lea   r8,  [rbp-0x160]  ; (parser's optional-hashtype slot, overwritten below)
     call  der_parse_sig
     test  eax, eax
     jz    .fail
+    mov   rax, [rbp-0x38]
+    add   rax, [rbp-0x30]
+    movzx eax, byte [rax-1] ; hashtype = sig[sigLen-1], read by the caller as Core does
+    mov   [rbp-0x160], eax
     mov   eax, [rbp-0x160]
     cmp   eax, 1
     jne   .fail

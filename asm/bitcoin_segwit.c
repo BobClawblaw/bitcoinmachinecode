@@ -546,8 +546,10 @@ int p2wpkh_verify(const uint8_t* tx, int64_t txlen, int64_t n_in,
     if (n <= 0) return 0;
 
     /* parse DER signature + hashtype */
-    uint64_t r[4], s[4]; uint32_t ht = 0;
-    if (!der_parse_sig(vchSig, (unsigned long)siglen, r, s, &ht)) return 0;
+    if (!siglen) return 0;
+    uint32_t ht = vchSig[siglen-1];   /* IR-2: hashtype popped first, as Core; parse siglen-1 */
+    uint64_t r[4], s[4]; uint32_t dht = 0;
+    if (!der_parse_sig(vchSig, (unsigned long)siglen - 1, r, s, &dht)) return 0;
     if (ht != (uint32_t)SIGHASH_ALL) return 0;      /* our vectors sign ALL */
 
     /* z = bip143 sighash (32 bytes big-endian -> limbs) */
@@ -562,8 +564,10 @@ int p2wpkh_verify(const uint8_t* tx, int64_t txlen, int64_t n_in,
  * byte) over a 32-byte digest against a compressed pubkey. */
 static int _ecdsa_verify_digest(const uint8_t* digest, const uint8_t* sig,
                                 uint64_t siglen, const uint8_t* pub){
-    uint64_t r[4], s[4]; uint32_t ht = 0;
-    if (!der_parse_sig(sig, (unsigned long)siglen, r, s, &ht)) return 0;
+    if (!siglen) return 0;
+    uint32_t ht = sig[siglen-1];      /* IR-2: hashtype popped first, as Core; parse siglen-1 */
+    uint64_t r[4], s[4]; uint32_t dht = 0;
+    if (!der_parse_sig(sig, (unsigned long)siglen - 1, r, s, &dht)) return 0;
     if (ht != (uint32_t)SIGHASH_ALL) return 0;
     uint64_t z[4]; be_to_limbs(z, digest, 32);
     uint64_t Qx[4], Qy[4];
@@ -622,8 +626,10 @@ int p2wsh_verify_checksig(const uint8_t* tx, int64_t txlen, int64_t n_in,
     long n = segwit_v0_sighash(sighash, tx, txlen, n_in, SIGHASH_ALL,
                                amount, witness_script, wslen, pre, sizeof(pre));
     if (n <= 0) return 0;
-    uint64_t r[4], s[4]; uint32_t ht = 0;
-    if (!der_parse_sig(vchSig, (unsigned long)siglen, r, s, &ht)) return 0;
+    if (!siglen) return 0;
+    uint32_t ht = vchSig[siglen-1];   /* IR-2: hashtype popped first, as Core; parse siglen-1 */
+    uint64_t r[4], s[4]; uint32_t dht = 0;
+    if (!der_parse_sig(vchSig, (unsigned long)siglen - 1, r, s, &dht)) return 0;
     if (ht != (uint32_t)SIGHASH_ALL) return 0;
     uint64_t z[4]; be_to_limbs(z, sighash, 32);
     uint64_t Qx[4], Qy[4];

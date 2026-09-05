@@ -484,12 +484,19 @@ verify_p2pkh:
     ; ---- step 3: der_parse_sig(sig, slen, &r@-0x1c0, &s@-0x180, &htype@-0x68)
     mov   rdi, [rbp-0x90]
     mov   rsi, [rbp-0x88]
+    test  rsi, rsi
+    jz    .fail             ; empty sig
+    dec   rsi               ; IR-2: hashtype popped first (read above), parser sees siglen-1 -- as Core
     lea   rdx, [rbp-0x1c0]
     lea   rcx, [rbp-0x180]
     lea   r8,  [rbp-0x68]
     call  der_parse_sig
     test  eax, eax
     jz    .fail
+    mov   rax, [rbp-0x90]
+    add   rax, [rbp-0x88]
+    movzx eax, byte [rax-1] ; htype = sig[slen-1], read by the caller as Core does
+    mov   [rbp-0x68], eax
     mov   eax, [rbp-0x68]
     cmp   eax, 1
     jne   .fail
