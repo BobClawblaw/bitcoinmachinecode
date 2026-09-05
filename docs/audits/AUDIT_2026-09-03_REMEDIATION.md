@@ -15,7 +15,7 @@ are 73 of them; **the 65 LOW and 32 INFO -- 97 findings, more than half the
 audit -- have never been examined at all.** "All CRITICAL+HIGH and 43 of 44
 MEDIUM" is true and is also the flattering way to say it.
 
-The one MEDIUM still open is **NET-10** (the address manager has no bucketed
+(Closed 2026-09-05.) The last MEDIUM was **NET-10** (the address manager has no bucketed
 structure), which is a design change rather than a defect fix: Core's addrman
 keeps separate tried/new tables, buckets `new` by source group so no single
 source can fill more than a bounded fraction, and resolves collisions by
@@ -558,8 +558,12 @@ gated, link-check 412 rules, abi-check, callee-saved-check and clean-check OK.
 
 ### What remains
 
-No CRITICAL, HIGH or MEDIUM finding is now unaddressed except `NET-10`, which
-is scoped and deliberately not started (`docs/audits/NET-10_ADDRMAN_SCOPE.md`).
+**No CRITICAL, HIGH or MEDIUM finding is unaddressed.** `NET-10` — the last
+one — closed on 2026-09-05 (`6e31e58`): the address book stores the source
+netgroup and a tried flag, caps live entries per source, and never evicts a
+peer we have connected to. Its negative control reproduces the finding (with
+the cap off, a flood evicts every honest record; with it on, none).
+`docs/audits/NET-10_ADDRMAN_SCOPE.md` records what was deliberately left out.
 **67 LOW and 33 INFO findings have never been examined.**
 
 **Correction (same day).** An earlier revision of this section, and the commit

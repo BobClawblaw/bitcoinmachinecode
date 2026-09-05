@@ -1320,6 +1320,33 @@ static void serve_violation_report(const char* reason){
 /* audit 2026-09-02 N3: the download worker's legs report by fd (tx_relay.c
  * declares this weak; the daemon supplies it). Map the fd to its leg's
  * "host:port", strip the port, and score it like a serve-side violation. */
+static void ctl_ip_only(const char* hostport, char* out, size_t cap);   /* defined below */
+extern unsigned net_netgroup_v4(unsigned ip);                          /* daemon/net_policy.c */
+
+/* NET-10: which source netgroup is the peer on this fd? Same fd -> leg
+ * "host:port" map the violation hook below uses. IPv4 gets Core's /16
+ * grouping (net_netgroup_v4); anything else -- onion, i2p, cjdns, or a host
+ * we cannot parse -- gets a hash of the host string with the top bit set, so
+ * it is stable per source and cannot collide with a /16 value. 0 means
+ * "unknown", which ab2_add_from never caps. */
+unsigned txr_source_group_fd(int fd){
+    for(int k = 0; k < mux_n_out; k++){
+        if(mux_out_fd[k] != fd) continue;
+        char ip[128]; ctl_ip_only(mux_out_host[k], ip, sizeof ip);
+        if(!ip[0]) return 0;
+        unsigned o0, o1, o2, o3;
+        if(sscanf(ip, "%u.%u.%u.%u", &o0, &o1, &o2, &o3) == 4 && o0 < 256 && o1 < 256 && o2 < 256 && o3 < 256){
+            unsigned v4 = o0 | (o1 << 8) | (o2 << 16) | (o3 << 24);   /* byte 0 = first octet */
+            unsigned g = net_netgroup_v4(v4);
+            return g ? g : 1u;                 /* never hand back 0 = "unknown" */
+        }
+        unsigned h = 2166136261u;
+        for(const char* p = ip; *p; p++){ h ^= (unsigned char)*p; h *= 16777619u; }
+        return h | 0x80000000u;
+    }
+    return 0;
+}
+
 void txr_report_violation_fd(int fd, const char* reason){
     for(int k = 0; k < mux_n_out; k++){
         if(mux_out_fd[k] != fd) continue;
@@ -2106,6 +2133,23 @@ static void format_peer_version_info(char* out, size_t cap){
  *
  * Either way `pr->used = 1` at the end remains the publication point. */
 static void rpc_fill_peer_slot(int slot, const char* host){
+    /* NET-10: an OUTBOUND leg we established is a peer we have actually
+     * connected to -- Core's `tried`. Marking it here is what makes rule 2
+     * mean anything on a node with no legacy book to migrate: without it
+     * nothing would ever be tried, and eviction would have nothing to
+     * protect. Every caller of THIS wrapper is an outbound fill (the
+     * background dial, the initial pool fill, and the top-up).
+     *
+     * Deliberately NOT in rpc_fill_peer_slot_ex: the inbound path claims its
+     * slot through _ex directly, and marking an inbound peer tried would let
+     * anyone who dials US immunise their own address against eviction --
+     * exactly the capability NET-10 exists to remove. */
+    { ab2_t* b = addr_book();
+      if(b){
+          bmc_addr_t a;
+          if(bmc_addr_from_string_port(&a, host, 0) && bmc_addr_is_routable(&a))
+              ab2_mark_tried(b, &a);
+      } }
     rpc_fill_peer_slot_ex(slot, host, 0);
 }
 static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claimed){
