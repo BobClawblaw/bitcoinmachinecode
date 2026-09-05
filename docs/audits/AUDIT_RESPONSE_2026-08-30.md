@@ -1,5 +1,24 @@
 # AUDIT RESPONSE — 2026-08-30
 
+
+> **Superseded, 2026-09-05.** Every finding in this document was re-verified by
+> `CODEBASE_AUDIT_2026-09-03.md` §3, which folded whatever was still open into
+> its own numbered findings — and all 182 of those are now closed, accepted or
+> deferred with reasons (`AUDIT_2026-09-03_REMEDIATION.md`, and
+> `NET-10_ADDRMAN_SCOPE.md` for the last MEDIUM). Where a line below still
+> reads "open" or "not started", check §3 of that audit before acting on it:
+> the item either has an ID there or was closed on the way. Two carry-overs
+> are worth naming explicitly:
+>
+> * the **test-wiring survey** (built-but-never-run targets, files with no
+>   Makefile rule, rules outside the gate) is now *enforced* rather than
+>   surveyed — `make runlist-check` requires every `test_*.c` to be in the gate
+>   or to carry a written reason for not being, and it is green;
+> * **`LimitCORE`/systemd hardening** is recorded closed by the 09-03 audit,
+>   but on the deployment host: **no `.service` unit is in this repository**, so
+>   that closure cannot be verified from the tree. Treat it as an operator
+>   attestation, not a code fact.
+
 Response to `SECURITY_AUDIT_2026-08-29.md` (11 findings).
 
 **Disposition: 8 resolved, 1 partially resolved, 1 config-only, 1 structural
