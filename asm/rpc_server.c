@@ -553,6 +553,21 @@ static void handle_request(int cfd, const char* body, size_t blen) {
         respbody = rj_write_alloc(reply, 0, &bodylen);
         rj_free(reply);
         if (bodylen < 0) bodylen = 0;
+        /* RPC-10 (audit 2026-09-03): Core appends a newline to every reply
+         * body -- httprpc.cpp's `req->WriteReply(HTTP_OK, reply.write() + "\n")`
+         * -- so "Core-bit-exact" was off by one byte. Gated on `reply` ON
+         * PURPOSE: a v2 notification takes the 204 path above with no body at
+         * all, and test_rpc_server's "no body" case asserts the response ends
+         * at the header terminator. Appending unconditionally would emit a
+         * 1-byte body on a 204 and break it.
+         *
+         * Safe for every consumer: rj_parse skips leading and trailing
+         * whitespace before its end-of-input check, and every test assertion
+         * on a body is a prefix or substring match. */
+        if (respbody && bodylen > 0) {
+            char* nb = realloc(respbody, (size_t)bodylen + 2);
+            if (nb) { respbody = nb; respbody[bodylen++] = '\n'; respbody[bodylen] = 0; }
+        }
     }
 
     char hdr[192];
@@ -560,6 +575,10 @@ static void handle_request(int cfd, const char* body, size_t blen) {
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: %ld\r\n"
+        /* RPC-10: the server closes after every reply, but said so nowhere --
+         * an HTTP/1.1 client that keeps the connection alive (http.client,
+         * requests) saw an unexpected EOF on its NEXT request. */
+        "Connection: close\r\n"
         "\r\n",
         status, status_text(status), bodylen);
     if (write_all(cfd, hdr, (size_t)hl) != 0) {

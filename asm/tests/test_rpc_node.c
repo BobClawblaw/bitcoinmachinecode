@@ -1287,6 +1287,47 @@ int main(void){
         #undef MKTX
     }
 
+    /* ---- RPC-9 (audit 2026-09-03): getnetworkinfo's fee fields were literals
+     *
+     * relayfee and incrementalfee were hardcoded 0.00001000 while the real
+     * floors default to 100 sat/kvB, so getnetworkinfo.relayfee and
+     * getmempoolinfo.minrelaytxfee DISAGREED BY 10x ON A STOCK NODE -- not
+     * only with a non-default floor, as the audit states. main.c calls
+     * rpc_node_set_relay_floors at boot, so the configured value was
+     * available at that line all along.
+     *
+     * The assertion is CONSISTENCY between the two RPCs rather than a literal,
+     * so it survives any future change to the default -- and the second half
+     * moves the floors and re-checks, which a re-hardcoded constant cannot
+     * satisfy. */
+    {
+        rj_val* a = NULL; rj_val* b = NULL;
+        rpc_node_dispatch("getnetworkinfo", NULL, &a, &ec, &em);
+        rpc_node_dispatch("getmempoolinfo", NULL, &b, &ec, &em);
+        ck("RPC-9 both RPCs answer", a && b);
+        if (a && b){
+            ck("RPC-9 getnetworkinfo.relayfee == getmempoolinfo.minrelaytxfee",
+               S(a,"relayfee") && S(b,"minrelaytxfee") &&
+               !strcmp(S(a,"relayfee"), S(b,"minrelaytxfee")));
+            if (S(a,"relayfee") && S(b,"minrelaytxfee") && strcmp(S(a,"relayfee"), S(b,"minrelaytxfee")))
+                printf("      relayfee=%s minrelaytxfee=%s\n", S(a,"relayfee"), S(b,"minrelaytxfee"));
+            ck("RPC-9 incrementalfee is reported too",
+               S(a,"incrementalfee") && !strcmp(S(a,"incrementalfee"), "0.00000100"));
+        }
+        rj_free(a); rj_free(b);
+
+        /* move the floors and confirm the field FOLLOWS -- a literal cannot */
+        extern void rpc_node_set_relay_floors(unsigned long long, unsigned long long);
+        rpc_node_set_relay_floors(500, 700);
+        a = NULL; rpc_node_dispatch("getnetworkinfo", NULL, &a, &ec, &em);
+        ck("RPC-9 relayfee follows a configured floor (500 sat/kvB)",
+           a && S(a,"relayfee") && !strcmp(S(a,"relayfee"), "0.00000500"));
+        ck("RPC-9 incrementalfee follows its own floor (700 sat/kvB)",
+           a && S(a,"incrementalfee") && !strcmp(S(a,"incrementalfee"), "0.00000700"));
+        rj_free(a);
+        rpc_node_set_relay_floors(100, 100);   /* restore for any later case */
+    }
+
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);
     return fails ? 1 : 0;
 }

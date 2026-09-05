@@ -114,6 +114,17 @@ static rj_val* net_entry(const char* name, int reachable, const char* proxy, int
     return o;
 }
 
+/* RPC-9 (audit 2026-09-03): moved up from the mempool section --
+ * getnetworkinfo reports these floors too, and used to hardcode them. */
+/* The configured relay floors, sat/kvB; main.c sets them from bitcoin.conf
+ * (rpc_node_set_relay_floors). Defaults are Core v30's: 100 = 0.1 sat/vB. */
+static unsigned long long g_minrelay_satkvb = 100, g_incremental_satkvb = 100;
+void rpc_node_set_relay_floors(unsigned long long minrelay_satkvb, unsigned long long incremental_satkvb){
+    if (minrelay_satkvb) g_minrelay_satkvb = minrelay_satkvb;
+    if (incremental_satkvb) g_incremental_satkvb = incremental_satkvb;
+}
+#define MEMPOOL_MINFEE_BTC ((double)g_minrelay_satkvb / 1e8)      /* min relay fee, BTC/kvB */
+
 static int cmd_getnetworkinfo(rj_val** res){
     int n_out = g_status ? g_status->n_out : 0;
     int n_in  = g_status ? g_status->n_inbound : 0;
@@ -148,8 +159,14 @@ static int cmd_getnetworkinfo(rj_val** res){
       rj_arr_push(nets, net_entry("i2p",   net_reach(5, 0), i2psam,       0));  /* SAM: no stream isolation */
       rj_arr_push(nets, net_entry("cjdns", net_reach(6, 0), NULL,         0));  /* direct network, no proxy */
       rj_obj_set(o, "networks", nets); }
-    rj_obj_set(o, "relayfee", rj_numf("%.8f", 0.00001000));
-    rj_obj_set(o, "incrementalfee", rj_numf("%.8f", 0.00001000));
+    /* RPC-9 (audit 2026-09-03): these were the literal 0.00001000, while the
+     * real floors default to 100 sat/kvB -- so getnetworkinfo.relayfee and
+     * getmempoolinfo.minrelaytxfee DISAGREED BY 10x ON A STOCK NODE, not only
+     * with a non-default floor as the audit states. main.c calls
+     * rpc_node_set_relay_floors at boot, so the configured values were
+     * available here all along. Rendered exactly as getmempoolinfo does. */
+    rj_obj_set(o, "relayfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));
+    rj_obj_set(o, "incrementalfee", rj_numf("%.8f", (double)g_incremental_satkvb / 1e8));
     { rj_val* la = rj_arr();
       if (g_onion_local[0]){
           rj_val* e = rj_obj();
@@ -599,14 +616,6 @@ static int cmd_net_unsupported(const char* msg, long* ec, const char** em){
  * no pool injected (standalone rpcd, static fallback) they still report the
  * empty pool, exactly as before. */
 #define MEMPOOL_MAXBYTES   300000000LL     /* 300 MB default (config default) */
-/* The configured relay floors, sat/kvB; main.c sets them from bitcoin.conf
- * (rpc_node_set_relay_floors). Defaults are Core v30's: 100 = 0.1 sat/vB. */
-static unsigned long long g_minrelay_satkvb = 100, g_incremental_satkvb = 100;
-void rpc_node_set_relay_floors(unsigned long long minrelay_satkvb, unsigned long long incremental_satkvb){
-    if (minrelay_satkvb) g_minrelay_satkvb = minrelay_satkvb;
-    if (incremental_satkvb) g_incremental_satkvb = incremental_satkvb;
-}
-#define MEMPOOL_MINFEE_BTC ((double)g_minrelay_satkvb / 1e8)      /* min relay fee, BTC/kvB */
 
 static rpc_mempool_hooks g_mph;      /* zeroed = no pool injected */
 
