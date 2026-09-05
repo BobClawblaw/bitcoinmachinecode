@@ -105,9 +105,16 @@ Everything below is landed on `arm-port` and pushed. History lives in
       to Core v31's TxOutSer, so it is a real content delta invisible to
       count/sum/bogosize — likely a height/coinbase-byte class on coins
       unspent since the rebuild). TWO OPEN ITEMS for next session:
-      (a) localize the muhash delta (probe sampled coins' height/coinbase vs
-      Core confirmations; review build_utxo's height assignment at the
-      genesis/BIP30-duplicate boundaries and the cb_skip coinbase flagging);
+      (a) [CLOSED same session] localize the muhash delta — FOUND: build_utxo
+      no-op'd on duplicate-outpoint puts, so the two BIP30 duplicate
+      coinbases kept the FIRST appearance's height (91812/91722 vs Core's
+      91842/91880); fixed in both builder paths (a69e166a), the live store
+      repaired in place by repair_bip30_heights.c (4 WAL records, no
+      rebuild), and the closing check is GREEN: **muhash
+      9b3acac6…33fd7 IDENTICAL to Core at height 965598** (txouts
+      165,361,670 and 20079766.75835718 BTC also equal) — the rebuilt
+      store is entry-for-entry Core's chainstate, the first full parity
+      check this port has ever completed on mainnet;
       (b) the daemon's running tally is drifted ~208k high (persisted in the
       checkpoint trailer, survives restart, trips gettxoutsetinfo's guard —
       walk is right, counter is wrong; offline utxo_setinfo self-consistent).
