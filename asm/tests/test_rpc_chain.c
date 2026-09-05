@@ -538,12 +538,35 @@ int main(void){
        *   tx[1] legacy_spend: 1 input worth 50.0 BTC  -> fee 0.01 (out 49.99)
        *   tx[2] segwit_spend: 1 input worth 49.99 BTC -> fee 49.98999 (out 1000 sat)
        * Record: txid[32] idx(u32) value(u64@36) height(u32) is_coinbase(u8@48) slen(u16@49) */
-      { unsigned char rec[102]; memset(rec, 0, sizeof rec);
-        put_u64(rec+36, 5000000000ULL);      /* record 0 value */
-        put_u64(rec+51+36, 4999000000ULL);   /* record 1 value */
+      /* RPX-2: the records now carry the height, coinbase flag and
+       * scriptPubKey they always could -- the undo format has had all three
+       * since Stage D. The VALUES are unchanged, so getblock v2's fee
+       * assertions below are unaffected; the extra fields are what
+       * getrawtransaction verbosity 2's `prevout` reports.
+       *   record 0: height 1, GENERATED (coinbase), P2WPKH script
+       *   record 1: height 2, not generated,        P2PKH script */
+      { static const unsigned char SPK_WPKH[22] = {
+            0x00,0x14, 0x75,0x1e,0x76,0xe8,0x19,0x91,0x96,0xd4,0x54,0x94,
+            0x1c,0x45,0xd1,0xb3,0xa3,0x23,0xf1,0x43,0x3b,0xd6 };
+        static const unsigned char SPK_PKH[25] = {
+            0x76,0xa9,0x14, 0x75,0x1e,0x76,0xe8,0x19,0x91,0x96,0xd4,0x54,0x94,
+            0x1c,0x45,0xd1,0xb3,0xa3,0x23,0xf1,0x43,0x3b,0xd6, 0x88,0xac };
+        unsigned char rec[51+22 + 51+25]; memset(rec, 0, sizeof rec);
+        unsigned char* r0 = rec;
+        put_u64(r0+36, 5000000000ULL);                 /* value  */
+        r0[44] = 1;                                    /* height 1 (u32 LE) */
+        r0[48] = 1;                                    /* is_coinbase */
+        r0[49] = 22; r0[50] = 0;                       /* script_len */
+        memcpy(r0+51, SPK_WPKH, 22);
+        unsigned char* r1 = rec + 51 + 22;
+        put_u64(r1+36, 4999000000ULL);                 /* value  */
+        r1[44] = 2;                                    /* height 2 */
+        r1[48] = 0;                                    /* not generated */
+        r1[49] = 25; r1[50] = 0;
+        memcpy(r1+51, SPK_PKH, 25);
         FILE* uf = fopen("undo_3.dat", "wb");
         ck("undo_3.dat opened", uf != NULL);
-        if (uf){ fwrite(rec, 1, 102, uf); fclose(uf); }
+        if (uf){ fwrite(rec, 1, sizeof rec, uf); fclose(uf); }
       }
       snprintf(p, sizeof p, "[\"%s\", 2]", g_hash[3]);
       r = call("getblock", p, &ec, &em);
@@ -710,6 +733,55 @@ int main(void){
       ck_str("grt.blocktime", S(r,"blocktime"), "1231008305");
       ck("grt: blockhash comes after hex (Core TxToJSON order)", r && r->nmembers > 5 && !strcmp(r->members[r->nmembers-5].key, "hex") && !strcmp(r->members[r->nmembers-4].key, "blockhash") && !strcmp(r->members[r->nmembers-1].key, "blocktime"));
       rj_free(r);
+      /* ---- RPX-2: verbosity 2 adds fee and per-input prevout --------------
+       * Core's TxToUniv with TxVerbosity::SHOW_DETAILS. This node passed
+       * in_total = -1 for EVERY verbosity, so verbosity 2 was byte-identical
+       * to verbosity 1 and a caller asking for the details got the shape
+       * without them -- silently, which is why nothing caught it.
+       *
+       * tx[1] is block 3's legacy spend: one input worth 50.0 BTC against
+       * 49.99 BTC of outputs, so fee 0.01 -- the same undo record getblock v2
+       * already computes that fee from. */
+      snprintf(p, sizeof p, "[\"%s\", 2, \"%s\"]", g_tx1_txid, g_hash[3]);
+      r = call("getrawtransaction", p, &ec, &em);
+      ck("grt verbosity 2 returns an object", r && r->typ == RJ_OBJ);
+      ck_str("RPX-2: verbosity 2 carries a fee", S(r,"fee"), "0.01000000");
+      { rj_val* vin = G(r,"vin");
+        rj_val* i0  = vin && vin->nitems ? vin->items[0] : NULL;
+        rj_val* pv  = i0 ? G(i0,"prevout") : NULL;
+        ck("RPX-2: the input carries a prevout object", pv && pv->typ == RJ_OBJ);
+        ck_str("prevout.value is the spent output's value", S(pv,"value"), "50.00000000");
+        ck_str("prevout.height is the spent output's OWN height", S(pv,"height"), "1");
+        ck_str("prevout.generated is true (it spent a coinbase)", S(pv,"generated"), "1");
+        rj_val* pspk = pv ? G(pv,"scriptPubKey") : NULL;
+        ck("prevout.scriptPubKey is rendered", pspk && pspk->typ == RJ_OBJ);
+        ck_str("prevout.scriptPubKey.hex", S(pspk,"hex"),
+               "0014751e76e8199196d454941c45d1b3a323f1433bd6");
+        ck_str("prevout.scriptPubKey.type comes from the script",
+               S(pspk,"type"), "witness_v0_keyhash"); }
+      rj_free(r);
+
+      /* THE OPPOSITE HALF: verbosity 1 must stay EXACTLY as it was. If the
+       * new fields leaked into it, verbosity 2 would still be "identical to
+       * verbosity 1" -- just in the other direction. */
+      snprintf(p, sizeof p, "[\"%s\", 1, \"%s\"]", g_tx1_txid, g_hash[3]);
+      r = call("getrawtransaction", p, &ec, &em);
+      ck("verbosity 1 still has NO fee", r && G(r,"fee") == NULL);
+      { rj_val* vin = G(r,"vin");
+        rj_val* i0  = vin && vin->nitems ? vin->items[0] : NULL;
+        ck("verbosity 1 still has NO prevout", i0 && G(i0,"prevout") == NULL); }
+      rj_free(r);
+
+      /* the COINBASE spends nothing, so it gets no prevout at any verbosity */
+      snprintf(p, sizeof p, "[\"%s\", 2, \"%s\"]", g_cb_txid[3], g_hash[3]);
+      r = call("getrawtransaction", p, &ec, &em);
+      { rj_val* vin = G(r,"vin");
+        rj_val* i0  = vin && vin->nitems ? vin->items[0] : NULL;
+        ck("a coinbase input has no prevout even at verbosity 2",
+           i0 && G(i0,"prevout") == NULL);
+        ck("...and the coinbase has no fee", r && G(r,"fee") == NULL); }
+      rj_free(r);
+
       snprintf(p, sizeof p, "[\"%s\", 1, \"%s\"]", g_tx1_txid, g_hash[1]);
       expect_err("getrawtransaction wrong block", "getrawtransaction", p, -5, "No such transaction found in the provided block. Use gettransaction for wallet transactions.");
       snprintf(p, sizeof p, "[\"%s\"]", g_tx1_txid);
