@@ -352,6 +352,21 @@ int main(void){
             fails++;
         }
     }
+    /* --- IR-8 sigversion gate: CONST_SCRIPTCODE rejects OP_CODESEPARATOR only
+     * for SIGVERSION_BASE. The same script under WITNESS_V0 (sigv 1) must
+     * still pass -- Core's check names the sigversion explicitly. */
+    {
+        static uint8_t scr0[5] = { 0x00, 0x63, 0xab, 0x68, 0x51 };   /* OP_0 OP_IF OP_CODESEPARATOR OP_ENDIF OP_1 */
+        g_err = 999; int rb = run(scr0, 5, 0, (1ULL<<16), 1, 0, 0);
+        if (rb == 0 && g_err == 53) printf("ok: IR-8 BASE + CONST_SCRIPTCODE: unexecuted OP_CODESEPARATOR -> SCRIPT_ERR_OP_CODESEPARATOR\n");
+        else { printf("FAIL: IR-8 BASE got r=%d err=%llu (want r=0 err=53)\n", rb, (unsigned long long)g_err); fails++; }
+        g_err = 999; int rw = run(scr0, 5, 1, (1ULL<<16), 1, 0, 0);
+        if (rw == 1) printf("ok: IR-8 WITNESS_V0 + CONST_SCRIPTCODE: same script accepted (sigversion gate)\n");
+        else { printf("FAIL: IR-8 WITNESS_V0 got r=%d err=%llu (want r=1)\n", rw, (unsigned long long)g_err); fails++; }
+        g_err = 999; int rn = run(scr0, 5, 0, 0, 1, 0, 0);
+        if (rn == 1) printf("ok: IR-8 BASE without the flag: accepted (consensus)\n");
+        else { printf("FAIL: IR-8 BASE no-flag got r=%d err=%llu (want r=1)\n", rn, (unsigned long long)g_err); fails++; }
+    }
     printf(fails?"\nFAILURES %d\n":"\nALL TESTS PASSED (0 failures)\n",fails);
     return fails?1:0;
 }

@@ -33,6 +33,10 @@ extern int  tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
                               int (*rf)(void*, const u8[36], u32, u64*, u64*, u64*,
                                         const u8**, unsigned long*),
                               void* rctx, const char** reason);
+extern int  tx_verify_at_height(const u8* tx, u64 txlen, long height,
+                                int (*rf)(void*, const u8[36], u32, u64*, u64*, u64*,
+                                          const u8**, unsigned long*),
+                                void* rctx, const char** reason);
 extern void txv_set_mempool_standard(int on);
 extern int  txv_get_mempool_standard(void);
 extern int  tx_dispatch_init(void);
@@ -53,6 +57,15 @@ static int resolve_op1(void* ctx, const u8 outpoint[36], u32 index,
     *value = 100000; *height = 1; *is_coinbase = 0;
     *spk = SPK_ANYONE; *spklen = sizeof SPK_ANYONE;
     return 1;
+}
+
+/* ---- IR-8: a resolver whose prevout script the vector chooses ---- */
+static const u8* g_spk; static unsigned long g_spklen;
+static int resolve_cfg(void* ctx, const u8 outpoint[36], u32 index,
+                       u64* value, u64* height, u64* is_coinbase,
+                       const u8** spk, unsigned long* spklen){
+    (void)ctx; (void)outpoint; (void)index;
+    *value = 100000; *height = 1; *is_coinbase = 0; *spk = g_spk; *spklen = g_spklen; return 1;
 }
 
 /* ---- a one-in one-out transaction with a caller-chosen scriptSig ---- */
@@ -125,6 +138,41 @@ int main(void){
     txv_set_mempool_standard(0);
     reason = NULL;
     ck("...and under consensus flags too", verify(CLEAN, 0, &reason) == 1);
+
+    /* ---- IR-8 (INTERP_REVIEW_2026-09-05): Core rejects OP_CODESEPARATOR in a
+     * SIGVERSION_BASE script under SCRIPT_VERIFY_CONST_SCRIPTCODE BEFORE the
+     * fExec gate -- so even inside an unexecuted OP_IF branch. Here the opcode
+     * was only reached through the post-fExec dispatch, so a legacy tx
+     * carrying 0xab entered the mempool and was relayed where Core refuses it
+     * (non-mandatory-script-verify-flag). Policy only: not a block flag. */
+    printf("\n== IR-8: OP_CODESEPARATOR under CONST_SCRIPTCODE ==\n");
+    {
+        static const u8 SPK_UNEXEC[4] = { 0x63, 0xab, 0x68, 0x51 };  /* OP_IF OP_CODESEPARATOR OP_ENDIF OP_1 */
+        static const u8 SPK_EXEC[5]   = { 0x51, 0x63, 0xab, 0x68, 0x51 };
+        static const u8 SPK_IFONLY[3] = { 0x63, 0x68, 0x51 };        /* same shape, no 0xab: control */
+        static const u8 SS_FALSE[1]   = { 0x00 };                    /* OP_0 -> IF branch not taken */
+        struct { const char* nm; const u8* spk; unsigned long spklen; const u8* ss; u32 ssl; int want_mempool; } v[] = {
+            { "unexecuted-branch CODESEPARATOR", SPK_UNEXEC, 4, SS_FALSE, 1, 0 },
+            { "executed CODESEPARATOR",          SPK_EXEC,   5, NULL,     0, 0 },
+            { "control: IF/ENDIF without 0xab",  SPK_IFONLY, 3, SS_FALSE, 1, 1 },
+        };
+        for (unsigned i = 0; i < sizeof v/sizeof v[0]; i++){
+            g_spk = v[i].spk; g_spklen = v[i].spklen;
+            u8 tx[256]; u64 len = build_tx(tx, v[i].ss, v[i].ssl);
+            char lbl[128];
+            reason = NULL; int cons = tx_verify_at_height(tx, len, 900000, resolve_cfg, NULL, &reason);
+            snprintf(lbl, sizeof lbl, "IR-8 %s: consensus ACCEPTS", v[i].nm); ck(lbl, cons == 1);
+            txv_set_mempool_standard(1);
+            reason = NULL; int mp = tx_verify_mempool(tx, len, 900000, resolve_cfg, NULL, &reason);
+            snprintf(lbl, sizeof lbl, "IR-8 %s: standard mempool %s", v[i].nm, v[i].want_mempool ? "ACCEPTS" : "REJECTS");
+            ck(lbl, mp == v[i].want_mempool);
+            if (mp == 0 && reason) printf("      (reason: %s)\n", reason);
+            txv_set_mempool_standard(0);
+            reason = NULL; int ns = tx_verify_mempool(tx, len, 900000, resolve_cfg, NULL, &reason);
+            snprintf(lbl, sizeof lbl, "IR-8 %s: acceptnonstdtxn ACCEPTS", v[i].nm); ck(lbl, ns == 1);
+            txv_set_mempool_standard(1);
+        }
+    }
 
     printf("\n%s (%d checks, %d failures)\n",
            fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
