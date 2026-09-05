@@ -28,6 +28,8 @@
 #include "test_tmpdir.h"
 
 extern long archive_check(long nblocks, int level);
+extern long archive_check_collect(long nblocks, int level, long* bad, long bad_cap, long* bad_n);
+extern long archive_repair_bad_bodies(long nblocks, int level);   /* STO-11 */
 extern long archive_first_hole(long upto);
 extern long archive_prune_height_for_budget(long long budget_bytes);
 #include "archive_verify.h"
@@ -196,6 +198,60 @@ int main(void){
     bf = open("blk00000.dat", O_RDWR);
     if (flip_byte(bf, POS1+4)!=0) printf("FAIL: restore magic\n");
     close(bf);
+
+    /* 5d. STO-11: DETECTION IS NOT REPAIR. test_archive_check has always
+     *     pinned that a bad frame is caught; nothing pinned what happens
+     *     next, and the answer was "nothing" -- the record stayed, and
+     *     catch-up stalled at that height on every boot forever.
+     *
+     *     archive_repair_bad_bodies zeroes the record so the height becomes an
+     *     ordinary hole for the catch-up/hole-fill path to refill. It must NOT
+     *     truncate: the assertions below check that the index keeps its LENGTH
+     *     (so every later height survives) while the one bad record becomes
+     *     all-zero. */
+    { bf = open("blk00000.dat", O_RDWR);
+      if (flip_byte(bf, POS1+4)!=0) printf("FAIL: re-poison magic\n");
+      close(bf);
+
+      long bad[8], nbad = -1;
+      long probs = archive_check_collect(1, 3, bad, 8, &nbad);
+      cki("collect reports the same problem count as archive_check", probs, 1);
+      cki("collect names exactly one height", nbad, 1);
+      cki("...and it is height 1 (the poisoned frame)", nbad == 1 ? bad[0] : -1, 1);
+
+      int ifd = open("index.dat", O_RDONLY);
+      off_t before = lseek(ifd, 0, SEEK_END); close(ifd);
+
+      cki("archive_repair_bad_bodies repairs exactly that one height",
+          archive_repair_bad_bodies(1, 3), 1);
+
+      ifd = open("index.dat", O_RDONLY);
+      off_t after = lseek(ifd, 0, SEEK_END);
+      unsigned char rec[48];
+      ssize_t got = pread(ifd, rec, 48, 48);       /* height 1's record */
+      close(ifd);
+      cki("index.dat was NOT truncated (length unchanged)", after == before, 1);
+      { int allzero = (got == 48);
+        for (int i = 0; allzero && i < 48; i++) if (rec[i]) allzero = 0;
+        cki("height 1's record is now an all-zero HOLE", allzero, 1); }
+
+      /* the hole is the repaired state: the check now reports it as a hole,
+       * not a problem, which is what lets catch-up refill it */
+      cki("checklevel=3 is clean again after the repair", archive_check(1,3), 0);
+      cki("a second repair pass finds nothing left to do",
+          archive_repair_bad_bodies(1, 3), 0);
+
+      /* THE OPPOSITE HALF: a clean archive must not be "repaired" at all. */
+      cki("repair on a clean archive changes nothing", archive_repair_bad_bodies(0, 3), 0);
+
+      /* restore the frame and the record so later sections see the archive
+       * they expect */
+      bf = open("blk00000.dat", O_RDWR);
+      if (flip_byte(bf, POS1+4)!=0) printf("FAIL: restore magic again\n");
+      close(bf);
+      ifd = open("index.dat", O_RDWR);
+      if (pwrite(ifd, r1, 48, 48) != 48) printf("FAIL: restore index record\n");
+      close(ifd); }
 
     { unsigned bogus = 999;                    /* frame length != index size */
       bf = open("blk00000.dat", O_RDWR);

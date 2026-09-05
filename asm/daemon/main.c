@@ -179,6 +179,7 @@ static long live_utxo_disp(void){ long c = utxo_live_count(); return c < 0 ? 0 :
 extern long utxo_live_applied_height(void);              /* daemon/utxo_live.c */
 extern long utxo_live_recover(void);                     /* daemon/utxo_live.c */
 extern int  archive_verify_and_repair(void* store_buf, int repair); /* daemon/archive_verify.c */
+extern long archive_repair_bad_bodies(long nblocks, int level);  /* STO-11 */
 extern long archive_drop_utxo_state(void);                /* daemon/archive_verify.c */
 #include "archive_verify.h"                               /* archive_* + prune verdict */
 extern int  store_set_prune(void* st, int h);             /* bitcoin_store.asm       */
@@ -7688,9 +7689,40 @@ int main(int argc, char** argv){
         if(g_cfg.checklevel > 0){
             phase_timer_t chk_pt; phase_start(&chk_pt);
             long probs = archive_check(g_cfg.checkblocks, g_cfg.checklevel);
-            if(probs > 0)
+            if(probs > 0){
                 fprintf(stderr,"[boot] archive check found %ld problem(s) in %.2fs -- see [check] lines above\n",
                         probs, phase_elapsed(&chk_pt));
+                /* STO-11: the check used to stop here. A record pointing at
+                 * bytes that never reached disk (the crash window store_append
+                 * now closes with fdatasync) was detected on every boot and
+                 * repaired on none, so catch-up stalled at that height
+                 * forever.
+                 *
+                 * archive_repair_bad_bodies ZEROES those index records, which
+                 * turns each into an ordinary never-fetched hole for the
+                 * catch-up path to refill. It does NOT truncate -- see its own
+                 * comment, and archive_layout_monotonic's, for why that
+                 * distinction is load-bearing here. This is the same mechanism
+                 * archive_repair_duplicates already uses, on the same file,
+                 * under the same fsync.
+                 *
+                 * The comment above about archive_check not acting still
+                 * holds for the DESTRUCTIVE repair: archive_verify_and_repair
+                 * keeps its own narrower trigger and is untouched. */
+                if(g_cfg.checklevel >= 3){
+                    long healed = archive_repair_bad_bodies(g_cfg.checkblocks, g_cfg.checklevel);
+                    if(healed > 0)
+                        fprintf(stderr,"[boot] archive self-heal: %ld height(s) marked for re-download\n",
+                                healed);
+                    else if(healed < 0)
+                        fprintf(stderr,"[boot] archive self-heal FAILED -- the bad height(s) remain; "
+                                       "catch-up will stall there\n");
+                } else {
+                    fprintf(stderr,"[boot] checklevel=%d is below 3, so the frame/body check that "
+                                   "drives self-heal did not run -- problems are reported only\n",
+                            g_cfg.checklevel);
+                }
+            }
             else if(probs == 0)
                 fprintf(stderr,"[boot] archive check clean (%.2fs)\n", phase_elapsed(&chk_pt));
         } else {

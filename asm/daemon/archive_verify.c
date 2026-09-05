@@ -370,7 +370,27 @@ extern int  cons_verify(const void* block, long len, void* scratch, unsigned cap
  * archive, for a property the genesis check already provides. */
 #define ARCHIVE_MAGIC     0xd9b4bef9u
 
+/* STO-11 (audit 2026-09-03): archive_check_collect() is archive_check() with
+ * an out-list. Every height whose BODY cannot be trusted -- missing block
+ * file, unreadable or wrong-magic frame, frame length disagreeing with the
+ * index, short read, or a body whose hash is not the one the record claims --
+ * is appended to `bad`, so a caller can repair exactly those heights.
+ *
+ * Deliberately NOT collected: a cons_verify (PoW/merkle) failure at level 4.
+ * That is a statement about the CHAIN, not about whether the bytes on disk are
+ * the block the record names, and refetching the same height from a peer
+ * cannot fix it. Holes (all-zero records) are already the repaired state.
+ *
+ * archive_check() is now a thin wrapper, so the single scan and every log line
+ * stay exactly as they were. */
+long archive_check_collect(long nblocks, int level, long* bad, long bad_cap, long* bad_n);
+
 long archive_check(long nblocks, int level){
+    return archive_check_collect(nblocks, level, NULL, 0, NULL);
+}
+
+long archive_check_collect(long nblocks, int level, long* bad, long bad_cap, long* bad_n){
+    if (bad_n) *bad_n = 0;
     if (level <= 0) return 0;
 
     int ifd = open("index.dat", O_RDONLY);
@@ -423,7 +443,9 @@ long archive_check(long nblocks, int level){
             cur_file = (int)fno;
             if (cur_fd < 0){
                 fprintf(stderr,"[check] height %ld: %s missing (pruned or lost)\n", h, nm);
-                problems++; cur_file = -1; continue;
+                problems++; cur_file = -1;
+                if (bad && bad_n && *bad_n < bad_cap) bad[(*bad_n)++] = h;
+                continue;
             }
         }
         {
@@ -431,7 +453,9 @@ long archive_check(long nblocks, int level){
             if (pread(cur_fd, fr, ARCHIVE_FRAME_LEN, (off_t)pos) != (ssize_t)ARCHIVE_FRAME_LEN){
                 fprintf(stderr,"[check] height %ld: cannot read frame at blk%05u.dat+%llu\n",
                         h, fno, (unsigned long long)pos);
-                problems++; continue;
+                problems++;
+                if (bad && bad_n && *bad_n < bad_cap) bad[(*bad_n)++] = h;
+                continue;
             }
             unsigned flen, fmagic;
             memcpy(&flen,   fr,     4);
@@ -439,24 +463,32 @@ long archive_check(long nblocks, int level){
             if (fmagic != ARCHIVE_MAGIC){
                 fprintf(stderr,"[check] height %ld: bad frame magic 0x%08x at blk%05u.dat+%llu\n",
                         h, fmagic, fno, (unsigned long long)pos);
-                problems++; continue;
+                problems++;
+                if (bad && bad_n && *bad_n < bad_cap) bad[(*bad_n)++] = h;
+                continue;
             }
             if (flen != dsz){
                 fprintf(stderr,"[check] height %ld: frame length %u disagrees with index data_size %u\n",
                         h, flen, dsz);
-                problems++; continue;
+                problems++;
+                if (bad && bad_n && *bad_n < bad_cap) bad[(*bad_n)++] = h;
+                continue;
             }
         }
         if (pread(cur_fd, body, dsz, (off_t)pos + ARCHIVE_FRAME_LEN) != (ssize_t)dsz){
             fprintf(stderr,"[check] height %ld: short read at blk%05u.dat+%llu (%u bytes)\n",
                     h, fno, (unsigned long long)(pos + ARCHIVE_FRAME_LEN), dsz);
-            problems++; continue;
+            problems++;
+                if (bad && bad_n && *bad_n < bad_cap) bad[(*bad_n)++] = h;
+            continue;
         }
         unsigned char got[32];
         block_hash(got, body);
         if (memcmp(got, rec, 32) != 0){
             fprintf(stderr,"[check] height %ld: body hash does not match the index record\n", h);
-            problems++; continue;
+            problems++;
+                if (bad && bad_n && *bad_n < bad_cap) bad[(*bad_n)++] = h;
+            continue;
         }
         if (level < 4) continue;
 
@@ -890,6 +922,69 @@ int archive_verify_and_repair(void* store_buf, int repair){
     return 0;
 }
 
+
+/* archive_repair_bad_bodies() -- STO-11 (audit 2026-09-03).
+ *
+ * The defect: store_append wrote the block frame and the index record to two
+ * different files with no ordering between them, so a power loss could leave
+ * a durable record pointing at bytes that never reached disk. store_append
+ * now fdatasync()s the block file first, which stops NEW damage -- but an
+ * archive already carrying such a record still stalls catch-up at that height
+ * on every boot: archive_check DETECTED it and only logged,
+ * archive_trim_derived_tails only validates records above the chainwork
+ * count, and reorg_chainwork_sync adds zero work for an all-zero header, so
+ * nothing ever cut the record.
+ *
+ * The repair reuses archive_repair_duplicates' mechanism EXACTLY, and for the
+ * same reason: zero the index record so the height becomes an ordinary hole
+ * and the already-proven catch-up/hole-fill path re-downloads the real block.
+ *
+ * It does NOT truncate. That is the whole point. Truncation additionally
+ * requires monotonic (file_no, data_pos) layout below the cut -- a
+ * precondition this archive can genuinely fail on well-formed data, and this
+ * file's header records that enforcing it once prevented a truncate from
+ * destroying ~600GB. Zeroing specific existing records never deletes or
+ * reorders anything, so it is safe regardless of layout and touches only the
+ * heights actually found bad.
+ *
+ * Returns heights repaired (0 for a clean archive), or -1 on error. */
+#define ARCHIVE_REPAIR_MAX_BAD 65536
+long archive_repair_bad_bodies(long nblocks, int level){
+    static long heights[ARCHIVE_REPAIR_MAX_BAD];
+    long nbad = 0;
+    /* level is clamped to 3: level 3 is what validates frame+body hash, which
+     * is exactly the class this repairs. Level 4 adds cons_verify, whose
+     * failures are deliberately NOT collected -- refetching cannot fix them. */
+    long probs = archive_check_collect(nblocks, level < 3 ? 3 : level,
+                                       heights, ARCHIVE_REPAIR_MAX_BAD, &nbad);
+    if (probs < 0) return -1;
+    if (nbad <= 0) return 0;
+
+    int fd = open("index.dat", O_RDWR);
+    if (fd < 0){
+        fprintf(stderr, "[archive] body-repair: could not open index.dat for writing: %s\n",
+                strerror(errno));
+        return -1;
+    }
+    static const unsigned char zero48[48] = {0};
+    long fixed = 0;
+    for (long i = 0; i < nbad; i++){
+        long h = heights[i];
+        if (pwrite(fd, zero48, 48, (off_t)h * 48) != 48){
+            fprintf(stderr, "[archive] body-repair: pwrite failed at height %ld: %s\n",
+                    h, strerror(errno));
+            continue;
+        }
+        fixed++;
+    }
+    /* Durable before the boot catch-up's own hole scan trusts the file --
+     * same reasoning as the duplicate repair above. */
+    fsync(fd);
+    close(fd);
+    fprintf(stderr, "[archive] body-repair: marked %ld height(s) as holes; normal catch-up will "
+                    "re-download them\n", fixed);
+    return fixed;
+}
 
 /* ---------------------------------------------------------------------------
  * BOOT SELF-HEAL OF THE DERIVED FILES (incident 2026-09-01)
