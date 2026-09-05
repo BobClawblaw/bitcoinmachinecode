@@ -247,6 +247,74 @@ int main(void){
             printf("ok: SCR-3 control: BASE sigversion keeps the empty-sig shortcut (no call)\n");
         else { printf("FAIL: SCR-3 BASE control: calls=%d r=%d (want 0/1)\n", g_probe.calls,r); fails++; }
     }
+    /* --- IR-1 (INTERP_REVIEW_2026-09-05): every net-growing stack op
+     * discarded the 0 "stack full" return of stack_dup_index/stack_push.
+     * At exactly 1000 elements the op silently became a no-op, the post-op
+     * combined check saw 1000 (not > 1000) and PASSED, where Core pushes to
+     * 1001 and fails with SCRIPT_ERR_STACK_SIZE. A script Core rejects was
+     * ACCEPTED -- consensus false accept, any sigversion.
+     *
+     * Each vector fills the stack with OP_1s to (1000 - growth + 1) so the
+     * op is the one that would cross 1000, then runs the op. Both BASE (OP_1
+     * is not counted toward the 201-op limit; 1001 bytes < 10000) and
+     * TAPSCRIPT. Controls: the same op one element short MUST pass, and the
+     * net-zero ops at exactly 1000 MUST pass. */
+    for (int sigv = 0; sigv <= SIGV_TAPSCRIPT; sigv += SIGV_TAPSCRIPT) {
+        struct { const char* name; int fill; uint8_t op; int want_reject; } v[] = {
+            { "OP_DUP  @1000", 1000, 0x76, 1 },
+            { "OP_OVER @1000", 1000, 0x78, 1 },
+            { "OP_IFDUP@1000", 1000, 0x73, 1 },
+            { "OP_TUCK @1000", 1000, 0x7d, 1 },
+            { "OP_2DUP @999",   999, 0x6e, 1 },
+            { "OP_2OVER@999",   999, 0x70, 1 },
+            { "OP_3DUP @998",   998, 0x6f, 1 },
+            { "OP_SIZE @1000", 1000, 0x82, 1 },
+            { "OP_DEPTH@1000", 1000, 0x74, 1 },
+            /* controls: one short of the cap, must pass */
+            { "OP_DUP  @999",   999, 0x76, 0 },
+            { "OP_2DUP @998",   998, 0x6e, 0 },
+            { "OP_3DUP @997",   997, 0x6f, 0 },
+            /* controls: net-zero ops AT the cap, must pass */
+            { "OP_SWAP @1000", 1000, 0x7c, 0 },
+            { "OP_2ROT @1000", 1000, 0x71, 0 },
+            { "OP_ROT  @1000", 1000, 0x7b, 0 },
+        };
+        for (size_t i = 0; i < sizeof v / sizeof v[0]; i++) {
+            static uint8_t scr[4096]; size_t n = 0;
+            for (int k = 0; k < v[i].fill; k++) scr[n++] = 0x51;
+            scr[n++] = v[i].op;
+            /* tapscript requires exactly one element at the end (CLEANSTACK is
+             * consensus there): drain to one. If the op silently no-ops, the
+             * drain runs and the script PASSES -- the same false accept BASE
+             * shows without the drain. */
+            if (sigv == SIGV_TAPSCRIPT) for (int k = 0; k < 999; k++) scr[n++] = 0x75;
+            g_err = 999;
+            int r = run(scr, n, sigv, 0, 1, 0, 0);
+            if (v[i].want_reject) {
+                if (r == 0 && g_err == SCRIPT_ERR_STACK_SIZE)
+                    printf("ok: IR-1 sigv%d %s rejected with STACK_SIZE\n", sigv, v[i].name);
+                else { printf("FAIL: IR-1 sigv%d %s got r=%d err=%llu (want r=0 err=8: Core pushes to 1001 and rejects)\n",
+                              sigv, v[i].name, r, (unsigned long long)g_err); fails++; }
+            } else {
+                if (r == 1)
+                    printf("ok: IR-1 control sigv%d %s passes\n", sigv, v[i].name);
+                else { printf("FAIL: IR-1 control sigv%d %s got r=%d err=%llu (want r=1)\n",
+                              sigv, v[i].name, r, (unsigned long long)g_err); fails++; }
+            }
+        }
+        /* OP_PICK with n=0 at 999+index: pops the index, pushes a copy ->
+         * exactly 1000, must pass (net zero). */
+        {
+            static uint8_t scr[4096]; size_t n = 0;
+            for (int k = 0; k < 999; k++) scr[n++] = 0x51;
+            scr[n++] = 0x00; scr[n++] = 0x79;
+            if (sigv == SIGV_TAPSCRIPT) for (int k = 0; k < 999; k++) scr[n++] = 0x75;
+            g_err = 999;
+            int r = run(scr, n, sigv, 0, 1, 0, 0);
+            if (r == 1) printf("ok: IR-1 control sigv%d <0> OP_PICK at 999 -> 1000 passes\n", sigv);
+            else { printf("FAIL: IR-1 control sigv%d OP_PICK got r=%d err=%llu (want r=1)\n", sigv, r, (unsigned long long)g_err); fails++; }
+        }
+    }
     printf(fails?"\nFAILURES %d\n":"\nALL TESTS PASSED (0 failures)\n",fails);
     return fails?1:0;
 }
