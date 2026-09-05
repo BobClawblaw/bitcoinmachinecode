@@ -25,6 +25,9 @@ extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned cha
 #include "rpc_wallet_ops.h"   /* output types: rpc_wops_type_path / rpc_wops_type_spk / rpc_wops_active_types */
 extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[64], unsigned index);
 extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20], unsigned char prog32[32]);
+extern long rpc_chain_tip_height(void);
+extern int  rpc_chain_hash_at(long height, unsigned char out[32]);      /* RPX-4 */
+extern rj_val* rpc_chain_script_pubkey_json(const unsigned char* sc, unsigned long n); /* RPX-4 */
 extern int  wallet_validate_address_ex(const char* str, int* type_, unsigned char* version,
                                       unsigned char h160[20], unsigned char* prog,
                                       unsigned long progcap, unsigned long* proglen, int* witver);
@@ -234,17 +237,17 @@ int rpc_param_i64(const rj_val* params, size_t i, long long* out, long* ec, cons
     return 1;
 }
 
-/* ---- scriptPubKey-type name for a wallet address type (Core "type" field) ---- */
-static const char* spk_type(int t) {
-    switch (t) {
-        case WAL_ADDR_P2PKH: return "pubkeyhash";
-        case WAL_ADDR_P2WPKH: return "witness_v0_keyhash";
-        case WAL_ADDR_P2SH: return "scripthash";
-        case WAL_ADDR_P2WSH: return "witness_v0_scripthash";
-        case WAL_ADDR_P2TR: return "witness_v1_taproot";
-        default: return "nonstandard";
-    }
-}
+/* RPX-4 (audit 2026-09-03): spk_type() lived here to name the "type" field
+ * for gettxout's hand-built scriptPubKey. gettxout now uses
+ * rpc_chain_script_pubkey_json -- the SAME builder every other output shape
+ * goes through -- which derives the type from the script itself rather than
+ * from a wallet address classification.
+ *
+ * That is not just deduplication: this table mapped anything it did not
+ * recognise to "nonstandard", where rpc_chain's script_type distinguishes
+ * the real Core names (pubkey, multisig, nulldata, witness_unknown, ...).
+ * Deleted rather than kept as a second opinion that can drift from the first.
+ */
 
 /* ---- getnewaddress / getrawchangeaddress ---- */
 /* getnewaddress ( "label" "address_type" ) / getrawchangeaddress ( "address_type" ):
@@ -680,34 +683,49 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
         return 0;
     }
     if (r != 1) { *result = rj_null(); return 1; }
-    (void)height; /* "confirmations" below is still a hardcoded placeholder,
-                   * like "bestblock" -- wiring those to the real chain tip
-                   * is RPC completeness, out of scope for Stage D. */
 
     char amt[24]; rpc_amounts((long long)value, amt, sizeof amt);
-    char addr[96]; addr[0] = 0;
-    int t = slen ? wallet_script_to_address(addr, 96, script, (long)slen) : WAL_ADDR_INVALID;
-    char* scripthex = malloc((size_t)slen * 2 + 1);
-    if (!scripthex) { *ec = -32603; *em = "out of memory"; return 0; }
-    if (slen) bin_to_hex(scripthex, script, slen); else scripthex[0] = 0;
 
     rj_val* o = rj_obj();
-    rj_obj_set(o, "bestblock", rj_str("0000000000000000000000000000000000000000000000000000000000000000"));
-    rj_obj_set(o, "confirmations", rj_numf("%d", 0));
+    /* RPX-4 (audit 2026-09-03): bestblock was the all-zero hash and
+     * confirmations was 0, both marked out-of-scope -- while the height the
+     * answer needs was already returned by the UTXO query and thrown away
+     * ((void)height), and rpc_chain has had the index open the whole time.
+     * A caller reading either got a definite wrong value, not a missing one.
+     *
+     * Core's semantics: bestblock is the tip hash the answer is relative to,
+     * and confirmations is tip - height + 1, with 0 for an output that is
+     * still in the mempool. This node's gettxout only ever answers from the
+     * confirmed set, so the mempool case cannot arise here.
+     *
+     * If the chain index is not open (rpc_chain_open has not run, or is still
+     * loading) the tip is unavailable. Rather than reinstate a zero that reads
+     * as a real answer, the two fields are OMITTED -- the same choice WAL-6
+     * made for ismine when the wallet cannot answer. */
+    { long tip = rpc_chain_tip_height();
+      if (tip >= 0 && (long)height <= tip){
+          unsigned char th[32];
+          if (rpc_chain_hash_at(tip, th)){
+              char hx[65]; for (int i = 0; i < 32; i++) sprintf(hx + i*2, "%02x", th[31 - i]);
+              hx[64] = 0;
+              rj_obj_set(o, "bestblock", rj_str(hx));
+          }
+          rj_obj_set(o, "confirmations", rj_numf("%ld", tip - (long)height + 1));
+      } }
     /* a NUMBER, not a string: Core's ValueFromAmount emits UniValue VNUM and
      * every other amount in this file already uses rj_numf. gettxout was the
      * one holdout, which stayed invisible while it only ever returned null --
      * the first real diff against Core caught it. */
     rj_obj_set(o, "value", rj_numf("%s", amt));
-    rj_val* sp = rj_obj();
-    rj_obj_set(sp, "asm", rj_str(""));
-    rj_obj_set(sp, "desc", rj_str(""));
-    rj_obj_set(sp, "hex", rj_str(scripthex));
-    if (addr[0]) rj_obj_set(sp, "address", rj_str(addr));
-    rj_obj_set(sp, "type", rj_str(spk_type(t)));
-    rj_obj_set(o, "scriptPubKey", sp);
+    /* RPX-4: asm and desc were empty strings, though rpc_chain has rendered
+     * both for every other output shape since decodepsbt. This is the SAME
+     * builder those use (ScriptToUniv with include_hex/include_address and the
+     * inferred descriptor), so gettxout's scriptPubKey cannot drift from
+     * getrawtransaction's for the same script. */
+    rj_obj_set(o, "scriptPubKey",
+               slen ? rpc_chain_script_pubkey_json(script, (unsigned long)slen)
+                    : rj_obj());
     rj_obj_set(o, "coinbase", rj_bool(is_coinbase != 0));
-    free(scripthex);
     *result = o;
     return 1;
 }
