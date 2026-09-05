@@ -276,12 +276,91 @@ int main(void) {
     ck("V2 error envelope bit-exact (jsonrpc+error+id, no result)",
        has_substr(raw_out, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":7}"));
 
-    /* ============ 10. non-object request -> -32600 (raw) ==================== */
-    make_post(req, sizeof req, port, "bitcoin", "bitcoin", "[1,2,3]", NULL);
+    /* ============ 10. non-object, NON-ARRAY top level -> -32700 (raw) ======
+     * This section used to send "[1,2,3]" and assert HTTP 500. That was the
+     * RPC-6 defect written down as expected behaviour: an array is a BATCH to
+     * Core, not a malformed request, and the 500 was the thing to fix. The
+     * top-level parse error is real -- it just belongs to a top level that is
+     * neither an object nor an array, which is what is sent now. The batch
+     * cases moved to section 10b. */
+    make_post(req, sizeof req, port, "bitcoin", "bitcoin", "\"hello\"", NULL);
     raw_exchange(port, req, strlen(req));
-    ck("non-object HTTP 500 parse path", has_prefix(raw_out, "HTTP/1.1 500"));
-    ck("non-object -32700 parse error",
+    ck("bare string top level -> HTTP 500 parse path", has_prefix(raw_out, "HTTP/1.1 500"));
+    ck("bare string top level -> -32700 top-level parse error",
        has_substr(raw_out, "\"message\":\"Top-level object parse error\""));
+    make_post(req, sizeof req, port, "bitcoin", "bitcoin", "42", NULL);
+    raw_exchange(port, req, strlen(req));
+    ck("bare number top level -> -32700 too",
+       has_prefix(raw_out, "HTTP/1.1 500") &&
+       has_substr(raw_out, "\"message\":\"Top-level object parse error\""));
+
+    /* ============ 10b. RPC-6: batch requests (raw) =========================
+     * Core (httprpc.cpp, valRequest.isArray()): HTTP 200, one reply per
+     * element, per-element failures as error OBJECTS inside the array,
+     * notifications executed but omitted, all-notification batch -> 204,
+     * empty array -> "[]" at 200. */
+    make_post(req, sizeof req, port, "bitcoin", "bitcoin",
+              "[{\"method\":\"getblockcount\",\"id\":1},"
+              "{\"method\":\"getbestblockhash\",\"id\":2}]", NULL);
+    raw_exchange(port, req, strlen(req));
+    ck("batch of two -> HTTP 200 (was 500 before RPC-6)",
+       has_prefix(raw_out, "HTTP/1.1 200 OK"));
+    ck("batch reply is a JSON ARRAY", has_substr(raw_out, "\r\n\r\n["));
+    ck("batch echoes BOTH ids",
+       has_substr(raw_out, "\"id\":1") && has_substr(raw_out, "\"id\":2"));
+    ck("batch did not answer a top-level parse error",
+       !has_substr(raw_out, "Top-level object parse error"));
+
+    /* a failing element is an error object IN the array, not an HTTP error */
+    make_post(req, sizeof req, port, "bitcoin", "bitcoin",
+              "[{\"method\":\"getblockcount\",\"id\":1},"
+              "{\"method\":\"nosuchmethod\",\"id\":2}]", NULL);
+    raw_exchange(port, req, strlen(req));
+    ck("batch with a failing member is STILL HTTP 200",
+       has_prefix(raw_out, "HTTP/1.1 200 OK"));
+    ck("the failing member carries -32601 inside the array",
+       has_substr(raw_out, "\"code\":-32601"));
+
+    /* a non-object member is Core's -32600 "Invalid Request object", per
+     * element -- NOT the top-level -32700, and not an HTTP error */
+    make_post(req, sizeof req, port, "bitcoin", "bitcoin",
+              "[1,2,3]", NULL);
+    raw_exchange(port, req, strlen(req));
+    ck("[1,2,3] is a batch of three INVALID requests, HTTP 200",
+       has_prefix(raw_out, "HTTP/1.1 200 OK"));
+    ck("[1,2,3] members answer -32600 Invalid Request object",
+       has_substr(raw_out, "\"code\":-32600") &&
+       has_substr(raw_out, "\"message\":\"Invalid Request object\""));
+
+    /* all-notification batch -> 204, no body */
+    make_post(req, sizeof req, port, "bitcoin", "bitcoin",
+              "[{\"jsonrpc\":\"2.0\",\"method\":\"getblockcount\"}]", NULL);
+    raw_exchange(port, req, strlen(req));
+    ck("all-notification batch -> HTTP 204", has_prefix(raw_out, "HTTP/1.1 204"));
+
+    /* but an EMPTY array is "[]" at 200, not 204 (Core's deliberate
+     * back-compat divergence from the JSON-RPC 2.0 spec) */
+    make_post(req, sizeof req, port, "bitcoin", "bitcoin", "[]", NULL);
+    raw_exchange(port, req, strlen(req));
+    ck("empty batch -> HTTP 200, not 204", has_prefix(raw_out, "HTTP/1.1 200 OK"));
+    ck("empty batch body is []", has_substr(raw_out, "\r\n\r\n[]"));
+
+    /* THE OPPOSITE HALF. Adding the batch branch must not turn a single
+     * request into a one-element batch: the reply body has to stay a bare
+     * OBJECT, and the single-request HTTP status mapping has to survive.
+     * This daemon is deliberately not warmed up, so getblockcount answers
+     * -28 "Loading block index..." -> HTTP 500 on the V1 path; that is the
+     * status the pre-RPC-6 code sent for this body too, and asserting it
+     * here is what would catch exec_one having lost the status mapping. */
+    make_post(req, sizeof req, port, "bitcoin", "bitcoin",
+              "{\"method\":\"getblockcount\",\"id\":9}", NULL);
+    raw_exchange(port, req, strlen(req));
+    { const char* b = strstr(raw_out, "\r\n\r\n");
+      ck("a single request is still answered as a bare OBJECT, not an array",
+         b && b[4] == '{');
+      ck("a single request still echoes its id", has_substr(raw_out, "\"id\":9"));
+      ck("a single request keeps its own HTTP status mapping (not forced 200)",
+         has_prefix(raw_out, "HTTP/1.1 500")); }
 
     /* ============ 11. V2 notification -> 204 no body (raw) =================
      * getbalance FAILS on this server (no rescan), which makes this the
