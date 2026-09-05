@@ -94,9 +94,39 @@ def make_db(asmdir):
         rules[tgt] = pre
     return rules
 
+RULES_FOR_SOURCES = {}   # set by main(): the make database, for source_for_object
+
+def source_for_object(asmdir, path):
+    """A rule may list foo.o before foo.o has ever been built (a fresh clone,
+    or a target that is only made by some other rule). Its symbols are
+    still knowable from its source. The object's OWN rule in the make
+    database names that source (serve_hdrctx.o is built from
+    daemon/serve_hdrctx.c, not from a file beside it); failing that, foo.asm
+    or foo.c beside it. Returns the source path, or None. (2026-09-05: a
+    fresh clone failed `make test` at this audit because every asm object
+    was "missing" and every rule that linked one looked unsatisfied -- the
+    gate was only green on a warm tree.)"""
+    if not path.endswith('.o'):
+        return None
+    for p in RULES_FOR_SOURCES.get(path, []):
+        if p.endswith(('.asm', '.c')) and os.path.exists(os.path.join(asmdir, p)):
+            return p
+    base = path[:-2]
+    for ext in ('.asm', '.c'):
+        if os.path.exists(os.path.join(asmdir, base + ext)):
+            return base + ext
+    return None
+
 def sym_of(asmdir, path, cache_dir):
-    """(defined, undefined) for one .c or .o, cached by content mtime+size."""
+    """(defined, undefined) for one .c, .asm or .o, cached by content mtime+size.
+    A .o that does not exist is read through its source (see
+    source_for_object): assembled or compiled into the cache."""
     full = os.path.join(asmdir, path)
+    if path.endswith('.o') and not os.path.exists(full):
+        src = source_for_object(asmdir, path)
+        if src is None:
+            return None
+        path, full = src, os.path.join(asmdir, src)
     try:
         st = os.stat(full)
     except OSError:
@@ -134,6 +164,12 @@ def sym_of(asmdir, path, cache_dir):
             _, err, rc = run(['gcc'] + flags + ['-c', path, '-o', obj], cwd=asmdir)
             if rc == 0:
                 break
+        if rc != 0:
+            return None
+    elif path.endswith('.asm'):
+        obj = os.path.join(cache_dir, key + '.o')
+        inc = ['-I.'] + (['-Itests/'] if path.startswith('tests/') else [])
+        _, err, rc = run(['nasm', '-f', 'elf64'] + inc + ['-Werror', '-o', obj, path], cwd=asmdir)
         if rc != 0:
             return None
     else:
@@ -206,6 +242,7 @@ def main():
     os.makedirs(cache_dir, exist_ok=True)
 
     rules = make_db(asmdir)
+    RULES_FOR_SOURCES.update(rules)
     # Every linkable file any rule mentions, PLUS every source in the tree.
     # The tree scan is not redundant: a file that appears in no rule at all
     # can still be the one that DEFINES a symbol some rule needs, and without
@@ -220,13 +257,45 @@ def main():
     for pat in ('*.c', 'daemon/*.c', 'tests/*.c', '*.o', '*.a'):
         for f in glob.glob(os.path.join(asmdir, pat)):
             files.add(os.path.relpath(f, asmdir))
-    files = sorted(f for f in files if os.path.exists(os.path.join(asmdir, f)))
+    files = sorted(f for f in files if os.path.exists(os.path.join(asmdir, f))
+                   or source_for_object(asmdir, f) is not None
+                   or (f.endswith('.a') and f in rules))     # an archive not yet built
 
+    # Fresh-clone support (2026-09-05). Nothing is built in a fresh clone, so:
+    #   - a .o that does not exist is read through its source (.asm or .c),
+    #   - an archive that does not exist is the union of its members' symbols
+    #     (undefined ignored, as a real archive is read above),
+    #   - each SOURCE is compiled exactly once and shared by every name that
+    #     resolves to it -- a .c from the tree scan and its unbuilt .o must not
+    #     race each other into the same cache object (they did: the loser was
+    #     reported "could not be compiled" and its rule looked unsatisfied).
+    unbuilt_archives = [f for f in files if f.endswith('.a')
+                        and not os.path.exists(os.path.join(asmdir, f)) and f in rules]
+    wanted = [f for f in files if f not in unbuilt_archives]
+    for a in unbuilt_archives:
+        for m in rules[a]:
+            if m.endswith('.o') and m not in wanted:
+                wanted.append(m)
+    def resolve(f):
+        if os.path.exists(os.path.join(asmdir, f)):
+            return f
+        return source_for_object(asmdir, f)
+    resolved = {f: resolve(f) for f in wanted}
+    sources = sorted({r for r in resolved.values() if r is not None})
     syms, skipped = {}, []
+    src_syms = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
-        for f, r in zip(files, ex.map(lambda f: sym_of(asmdir, f, cache_dir), files)):
-            if r is None: skipped.append(f)
-            else: syms[f] = r
+        for src, r in zip(sources, ex.map(lambda f: sym_of(asmdir, f, cache_dir), sources)):
+            src_syms[src] = r
+    for f in wanted:
+        r = src_syms.get(resolved[f]) if resolved[f] is not None else None
+        if r is None: skipped.append(f)
+        else: syms[f] = r
+    for a in unbuilt_archives:
+        dfn = set()
+        for m in rules[a]:
+            if m in syms: dfn |= syms[m][0]
+        syms[a] = (dfn, set())
 
     # symbol -> the project files that define it
     provider = {}
