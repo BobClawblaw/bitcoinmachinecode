@@ -277,10 +277,12 @@ static int check_sig(const Ref* sig, const Ref* pub,
     int ra = sighash_all(sighash, tx, txlen, nIn, sc, sc_len, work, workcap-64);
     if (!ra) return 0;
     uint64_t r[4], s[4]; uint32_t ht;
-    /* der_parse_sig expects the full DER+hashtype byte (sig->n), and returns the
-       trailing SIGHASH byte as ht. */
-    if (!der_parse_sig(sig->d, sig->n, r, s, &ht)) return 0;
-    if (ht!=1) return 0;
+    /* IR-2: the hashtype (hb, read above) is popped BEFORE the DER parse, as
+       Core does; the parser sees sig->n-1 bytes. Passing the full length let S
+       end on the hashtype byte, making this oracle one byte looser than the
+       code it exists to check. */
+    if (!der_parse_sig(sig->d, sig->n-1, r, s, &ht)) return 0;
+    (void)ht;
     uint64_t z[4];
     be_to_limbs(z, sighash, 32);
     uint64_t qx[4], qy[4];
