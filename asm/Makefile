@@ -2602,8 +2602,12 @@ tests/test_taproot_parity: tests/test_taproot_parity.c tests/taproot_parity_vec.
 tests/test_rpc_signer: tests/test_rpc_signer.c rpc_signer.o rpc_json.o rpc_signer.h $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_signer.c rpc_signer.o rpc_json.o
 
-tests/test_utxo_snapshot: tests/test_utxo_snapshot.c utxo_snapshot.o utxo_snapshot.h tests/snap_kats_gen.h
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_utxo_snapshot.c utxo_snapshot.o
+# UTX-7: utxo_snapshot.c now calls pubkey_parse (bitcoin_pubkey.asm) to gate
+# the uncompressed-P2PK arm on the key being ON THE CURVE, so the field and
+# point objects it pulls in have to be linked here too.
+USNAP_PUBKEY := bitcoin_pubkey.o secp256k1_fe.o
+tests/test_utxo_snapshot: tests/test_utxo_snapshot.c utxo_snapshot.o utxo_snapshot.h tests/snap_kats_gen.h $(USNAP_PUBKEY)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_utxo_snapshot.c utxo_snapshot.o $(USNAP_PUBKEY)
 
 tests/test_block_filter: tests/test_block_filter.c block_filter.o bitcoin_hash.o sha256.o \
     block_filter.h $(TEST_TMPDIR_H) tests/fixtures/blk_501726.bin tests/fixtures/blk_700038.bin \
