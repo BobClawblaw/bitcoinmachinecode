@@ -234,6 +234,29 @@ int main(void){
         if (c0 == 0 && a0 == 0) printf("ok: IR-2 %s: 70 B DER with S ending in 0x01 and NO hashtype byte is REJECTED (Core: lax parse fails)\n", nm);
         else { printf("FAIL: IR-2 %s: C=%llu asm=%llu (want 0/0 -- S consumed the hashtype byte; Core pops it first)\n", nm, (unsigned long long)c0, (unsigned long long)a0); fails++; }
     }
+    /* ---- IR-6 (INTERP_REVIEW_2026-09-05) safety net at the sv_run_v level.
+     * diff_run compares the FINAL STACK BYTE FOR BYTE (memcmp over
+     * sp*ELEM_SIZE) as well as the verdict, so a rolling script here asserts
+     * the contract the pending stack-representation change must preserve:
+     * after OP_ROLL/OP_SWAP/OP_TUCK the caller still reads element p at
+     * elems + p*ELEM_SIZE with its data inline. The driver differentials
+     * cannot cover this -- sv_verify_script owns its stacks internally and
+     * only its verdict is observable. */
+    {
+        static const u8 A[4] = {0xa1,0xa2,0xa3,0xa4}, B[4] = {0xb1,0xb2,0xb3,0xb4};
+        static const u8 C_[4] = {0xc1,0xc2,0xc3,0xc4}, D[4] = {0xd1,0xd2,0xd3,0xd4};
+        const u8* init[4] = { A, B, C_, D }; u32 il[4] = { 4,4,4,4 };
+        struct { const char* nm; const u8* scr; size_t n; } v[] = {
+            { "IR-6 roll depth 3",        (const u8*)"\x53\x7a", 2 },              /* OP_3 OP_ROLL */
+            { "IR-6 roll depth 0 (no-op)",(const u8*)"\x00\x7a", 2 },
+            { "IR-6 roll then swap",      (const u8*)"\x53\x7a\x7c", 3 },
+            { "IR-6 roll x3",             (const u8*)"\x53\x7a\x53\x7a\x53\x7a", 6 },
+            { "IR-6 tuck after roll",     (const u8*)"\x53\x7a\x7d", 3 },
+            { "IR-6 over/pick after roll",(const u8*)"\x53\x7a\x52\x79", 4 },      /* OP_2 OP_PICK */
+        };
+        for (unsigned i = 0; i < sizeof v/sizeof v[0]; i++)
+            diff_run(v[i].nm, v[i].scr, v[i].n, init, il, 4, tx, txlen, 0, 0);
+    }
     printf("compared %ld checksig runs; %ld mismatch(es)\n", compared, fails);
     printf("%s (%ld failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;

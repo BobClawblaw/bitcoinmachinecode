@@ -62,6 +62,8 @@
     ; BIP66 strict-DER signature encoding (bitcoin_scriptcodec.asm) -- Core's
     ; IsValidSignatureEncoding. See the CheckSignatureEncoding note below.
     extern der_sig_strict
+    extern hnd_begin                 ; IR-6
+    extern hnd_end                   ; IR-6
     ; cross-file TLS accessors (bitcoin_scriptcodec.asm) -- see that file's
     ; header note by their definitions for why these are function calls
     ; rather than direct wrt ..gottpoff references to an extern symbol.
@@ -352,7 +354,11 @@ script_eval:
     push  r15
     push  rbp
     mov   rbp, rsp
-    sub   rsp, 0x108          ; ODD multiple of 8, on purpose -- SysV alignment.
+    sub   rsp, 0x118          ; ODD multiple of 8, on purpose -- SysV alignment.
+                              ; (IR-6 took it from 0x108 to 0x118 for the
+                              ;  handle-registration flag at [rbp-0x110];
+                              ;  0x118 is 8 mod 16 too, so the property the
+                              ;  paragraph below describes still holds.)
                               ;   Entry RSP == 8 mod16; `push rbp` -> 0 mod16;
                               ;   the 5 callee-saved pushes -> 8 mod16 again.
                               ;   The reservation must therefore be 8 mod16 to
@@ -371,6 +377,15 @@ script_eval:
                               ; All locals here are rbp-relative, so growing the
                               ;   reservation by 8 moves no operand.
     mov   r12, rdi            ; state
+    ; IR-6: register the position->slot handle table for the MAIN stack, so
+    ; a roll rotates handles instead of shifting 524-byte records. Returns 0
+    ; if a table is already registered (a nested script_eval) -- then no
+    ; table applies here, every primitive falls back to identity, and this
+    ; evaluation behaves exactly as it did before IR-6.
+    mov   rdi, [r12+0]        ; main_elems
+    call  hnd_begin
+    mov   [rbp-0x110], rax
+    mov   rdi, r12
     ; SCR-3: interp_checksig/_add run in their own frames (their own r12); the
     ; tapscript empty-pubkey rule gates on sigversion, so stash the state
     ; pointer in a per-thread slot they can reach. Written straight through
@@ -2541,7 +2556,20 @@ script_eval:
 .ret0:
     xor   eax, eax
 .done:
-    add   rsp, 0x108          ; must match the prologue reservation above
+    ; IR-6: put the records back in position order (only if something
+    ; rolled) and unregister, so every reader outside still finds element p
+    ; at elems + p*ELEM_SIZE with its data inline. rax holds the verdict.
+    push  rax
+    push  rax                 ; keeps rsp 16-aligned for the call
+    cmp   qword [rbp-0x110], 0
+    je    .no_hnd_end
+    lea   rdi, [r12+8]        ; &main_sp
+    mov   rsi, [r12+0]        ; main_elems
+    call  hnd_end
+.no_hnd_end:
+    pop   rax
+    pop   rax
+    add   rsp, 0x118          ; must match the prologue reservation above
     pop   rbp                 ; save area is ABOVE rbp -- rbp pops first
     pop   r15
     pop   r14

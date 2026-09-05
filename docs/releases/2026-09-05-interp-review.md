@@ -10,8 +10,11 @@ documents it points to.
   false-accepts (`IR-1` stack cap, `IR-2` DER hashtype bound), one latent
   (`IR-3`), three valid-block DoS shapes (`IR-4` O(1) condition stack,
   `IR-5` per-transaction sighash memo, `IR-7`), two policy gaps, one
-  memory-unsafety, four LOWs. `IR-6` (stack representation) is open and
-  scoped; `IR-15`/`IR-16` accepted or deferred with reasons.
+  memory-unsafety, four LOWs, and `IR-6` -- the stack representation, closed
+  last: rolls now rotate 4-byte handles instead of 524-byte records
+  (2203 ms -> 49 ms on a 200,000-roll storm) with the external stack ABI
+  untouched. `IR-11`/`IR-15`/`IR-16` are tracked, accepted or deferred with
+  reasons. Nothing from that review is open.
 - **MuHash** (`validation/muhash_vs_core.sh`): the "byte-identical to Core"
   claim re-made from two independently synced datadirs at 965,651 and made
   re-runnable; the 963,967 record of 2026-08-25 confirmed against Core today.

@@ -333,6 +333,8 @@ int main(void){
         for (int i = 0; i < N; i++){ big[n++] = 0x51; big[n++] = 0x63; }
         for (int i = 0; i < N; i++)  big[n++] = 0x68;
         big[n++] = 0x51;
+        fflush(stdout);   /* stdout is a pipe under the gate: flush BEFORE forking or
+                           * the parent's buffered lines are inherited and printed twice */
         pid_t pid = fork();
         if (pid == 0){
             alarm(30);
@@ -402,6 +404,69 @@ int main(void){
             g_err=999; int r = script_eval(&st);
             if (r == 0 && (int)g_err == v[i].want_err) printf("ok: IR-13 %s\n", v[i].nm);
             else { printf("FAIL: IR-13 %s: got r=%d err=%llu (want r=0 err=%d)\n", v[i].nm, r, (unsigned long long)g_err, v[i].want_err); fails++; }
+        }
+    }
+    /* --- IR-6 (INTERP_REVIEW_2026-09-05): OP_ROLL shifts whole 524-byte
+     * records where Core moves a 24-byte header, so a valid tapscript of
+     * `<998> OP_ROLL` repeated costs O(rolls x records) in bytes moved. These
+     * vectors assert BOTH halves of the fix: the final order is exactly what
+     * a rotate produces (whatever the internal storage), and the storm runs in
+     * O(1) record moves per roll rather than O(records). The handle layer
+     * (bitcoin_scriptcodec.asm) rotates 4-byte handles and puts the records
+     * back in position order once, at script_eval's exit, only if anything
+     * rolled -- so the ABI every external reader uses, element p at
+     * elems + p*ELEM_SIZE with data inline, is unchanged.
+     *
+     * OP_ROLL(n) lifts the element n deep to the top, so <998> OP_ROLL over
+     * 999 items rotates the whole stack by one: model[i] = (i + R) mod 999. */
+    {   /* (a) BASE, small: the FULL final order is checkable (no CLEANSTACK) */
+        enum { N = 10, RR = 25 };
+        static uint8_t scr[2*RR]; size_t n = 0;
+        for (int i = 0; i < RR; i++){ scr[n++] = 0x59; scr[n++] = 0x7a; }      /* OP_9 OP_ROLL */
+        memset(main_elems, 0, sizeof main_elems);
+        for (int i = 0; i < N; i++){ uint8_t* rec = main_elems + (size_t)i*ELEM_SIZE; *(uint32_t*)rec = 4; *(uint32_t*)(rec+4) = (uint32_t)(i+1); }
+        struct script_state st; memset(&st,0,sizeof st);
+        st.main_elems=main_elems; st.main_sp=N; st.alt_elems=alt_elems; st.alt_sp=0;
+        st.script=scr; st.script_len=n; st.sigversion=0; st.flags=0;
+        st.work=work; st.work_cap=sizeof work; st.error_out=&g_err;
+        g_err=999; int r = script_eval(&st);
+        int ok = (r==1) && (st.main_sp==(size_t)N); int bad=-1;
+        for (int i=0;i<N && ok;i++){ uint8_t* rec=main_elems+(size_t)i*ELEM_SIZE; if (*(uint32_t*)(rec+4) != (uint32_t)(((i+RR)%N)+1)){ ok=0; bad=i; } }
+        if (ok) printf("ok: IR-6 %d rolls over %d items: full final order exact\n", RR, N);
+        else { printf("FAIL: IR-6 BASE roll order wrong at pos %d (r=%d sp=%zu err=%llu)\n", bad, r, st.main_sp, (unsigned long long)g_err); fails++; }
+    }
+    {   /* (b) tapscript, large: the storm the finding is about. Drained to one
+         * element -- CLEANSTACK is consensus there -- and the survivor is the
+         * old bottom, model[0] = R mod 999, a precise check on the rotation. */
+        enum { R = 200000, ITEMS = 999, ILEN = 520 };
+        static uint8_t scr[4*R + ITEMS + 8]; size_t n = 0;
+        for (int i = 0; i < R; i++){ scr[n++]=0x02; scr[n++]=0xE6; scr[n++]=0x03; scr[n++]=0x7a; }   /* <998> OP_ROLL */
+        for (int i = 0; i < ITEMS-1; i++) scr[n++] = 0x75;                                          /* OP_DROP x 998 */
+        fflush(stdout);   /* see the IR-4 note: flush before fork, not just before _exit */
+        pid_t pid = fork();
+        if (pid == 0){
+            alarm(120);
+            memset(main_elems, 0, sizeof main_elems);
+            for (int i = 0; i < ITEMS; i++){ uint8_t* rec = main_elems + (size_t)i*ELEM_SIZE; *(uint32_t*)rec = ILEN; memset(rec+4,0x5a,ILEN); *(uint32_t*)(rec+4) = (uint32_t)i; }
+            struct script_state st; memset(&st,0,sizeof st);
+            st.main_elems=main_elems; st.main_sp=ITEMS; st.alt_elems=alt_elems; st.alt_sp=0;
+            st.script=scr; st.script_len=n; st.sigversion=SIGV_TAPSCRIPT; st.flags=0;
+            st.work=work; st.work_cap=sizeof work; st.error_out=&g_err;
+            struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+            g_err=999; int r = script_eval(&st);
+            clock_gettime(CLOCK_MONOTONIC,&t1);
+            double ms=(t1.tv_sec-t0.tv_sec)*1e3+(t1.tv_nsec-t0.tv_nsec)/1e6;
+            if (r!=1){ printf("FAIL: IR-6 valid roll storm rejected (r=%d err=%llu)\n", r,(unsigned long long)g_err); fflush(stdout); _exit(2); }
+            uint32_t got = *(uint32_t*)(main_elems+4), want = (uint32_t)(R % ITEMS);
+            if (st.main_sp!=1 || got!=want){ printf("FAIL: IR-6 survivor is %u, want %u (sp=%zu)\n", got, want, st.main_sp); fflush(stdout); _exit(4); }
+            printf("ok: IR-6 %d rolls over %d x %d-byte items: survivor exact, %.0f ms\n", R, ITEMS, ILEN, ms);
+            fflush(stdout); _exit(ms > 400.0 ? 5 : 0);
+        }
+        int st_=0; waitpid(pid,&st_,0);
+        if (!(WIFEXITED(st_) && WEXITSTATUS(st_)==0)){
+            if (WIFSIGNALED(st_)) printf("FAIL: IR-6 child killed by signal %d\n", WTERMSIG(st_));
+            else if (WEXITSTATUS(st_)==5) printf("FAIL: IR-6 roll storm over 400 ms -- records are being shifted per roll again\n");
+            fails++;
         }
     }
     printf(fails?"\nFAILURES %d\n":"\nALL TESTS PASSED (0 failures)\n",fails);
