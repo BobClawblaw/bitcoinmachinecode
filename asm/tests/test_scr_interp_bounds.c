@@ -367,6 +367,43 @@ int main(void){
         if (rn == 1) printf("ok: IR-8 BASE without the flag: accepted (consensus)\n");
         else { printf("FAIL: IR-8 BASE no-flag got r=%d err=%llu (want r=1)\n", rn, (unsigned long long)g_err); fails++; }
     }
+    /* --- IR-13 (INTERP_REVIEW_2026-09-05): the LOW_S arm reported SIG_HIGH_S
+     * for S >= N. Core's CheckLowS lax-parses the signature; an S >= N
+     * overflows to a ZERO signature, which is not high, so the check passes
+     * and the failure surfaces from verification as NULLFAIL (or false) --
+     * never HIGH_S. The verdict is the same (reject); the error code that
+     * reaches RPC differs. Probe checksig returns 0 so verification fails. */
+    {
+        static const uint8_t N_BE[32]  = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
+                                          0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41};
+        static const uint8_t HALF[32]  = {0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+                                          0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0};
+        uint8_t half1[32]; memcpy(half1, HALF, 32); half1[31] = 0xA1;          /* N/2 + 1: high, below N */
+        struct { const char* nm; const uint8_t* s; int want_err; } v[] = {
+            { "S == N     -> NULLFAIL (Core: lax parse overflows to a zero sig)", N_BE, 32 },
+            { "S == N/2+1 -> HIGH_S  (control)",                                 half1, 27 },
+            { "S == N/2   -> low, verification fails -> NULLFAIL (control)",     HALF,  32 },
+        };
+        for (unsigned i = 0; i < 3; i++){
+            uint8_t sig[80]; size_t n = 0; int pad = (v[i].s[0] & 0x80) ? 1 : 0;
+            sig[n++] = 0x30; sig[n++] = (uint8_t)(4 + 32 + 32 + pad);
+            sig[n++] = 0x02; sig[n++] = 32; sig[n++] = 0x7f; for (int k = 1; k < 32; k++) sig[n++] = 0x11;   /* R */
+            sig[n++] = 0x02; sig[n++] = (uint8_t)(32 + pad); if (pad) sig[n++] = 0x00; memcpy(sig + n, v[i].s, 32); n += 32;
+            sig[n++] = 0x01;                                                                                     /* SIGHASH_ALL */
+            static uint8_t scr[160]; size_t m = 0;
+            scr[m++] = (uint8_t)n; memcpy(scr + m, sig, n); m += n;
+            scr[m++] = 33; scr[m++] = 0x02; for (int k = 0; k < 32; k++) scr[m++] = 0x22; scr[m++] = 0xac;   /* <pub> OP_CHECKSIG */
+            memset(main_elems,0,sizeof main_elems); memset(alt_elems,0,sizeof alt_elems);
+            struct script_state st; memset(&st,0,sizeof st);
+            st.main_elems=main_elems; st.alt_elems=alt_elems; st.script=scr; st.script_len=m;
+            st.sigversion=0; st.flags=(1ULL<<2)|(1ULL<<3)|(1ULL<<14);   /* DERSIG | LOW_S | NULLFAIL */
+            st.work=work; st.work_cap=sizeof work; st.error_out=&g_err;
+            g_probe=(probe_t){0,0,0,0}; st.checksig_ctx=&g_probe; st.checksig_fn=probe_fn;
+            g_err=999; int r = script_eval(&st);
+            if (r == 0 && (int)g_err == v[i].want_err) printf("ok: IR-13 %s\n", v[i].nm);
+            else { printf("FAIL: IR-13 %s: got r=%d err=%llu (want r=0 err=%d)\n", v[i].nm, r, (unsigned long long)g_err, v[i].want_err); fails++; }
+        }
+    }
     printf(fails?"\nFAILURES %d\n":"\nALL TESTS PASSED (0 failures)\n",fails);
     return fails?1:0;
 }

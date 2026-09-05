@@ -1,9 +1,13 @@
 ; ============================================================================
 ; bitcoin_sigops.asm -- sigop accounting (matches Bitcoin Core exactly).
 ;
-;   long script_sigops(const u8* script, ulong len)                  [accurate]
-;       Core CScript::GetSigOpCount(fAccurate=true): OP_CHECKSIG/VERIFY = 1,
-;       OP_CHECKMULTISIG/VERIFY = DecodeOP_N(following OP_1..16) or 20.
+;   long script_sigops(const u8* script, ulong len)                  [INACCURATE]
+;       Core CScript::GetSigOpCount(fAccurate=false): OP_CHECKSIG/VERIFY = 1,
+;       OP_CHECKMULTISIG/VERIFY = 20 (MAX_PUBKEYS_PER_MULTISIG), always.
+;   long script_sigops_accurate(const u8* script, ulong len)         [accurate]
+;       fAccurate=true: OP_CHECKMULTISIG/VERIFY = DecodeOP_N(preceding
+;       OP_1..16), else 20. (IR-17: the header had these two inverted --
+;       script_sigops defaults `accurate = false`, see the entry below.)
 ;
 ;   long tx_legacy_sigops(const u8* tx, ulong txlen)
 ;       Core GetLegacySigOpCount(tx): for EVERY input,

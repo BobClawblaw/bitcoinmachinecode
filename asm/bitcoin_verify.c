@@ -242,18 +242,23 @@ static int der_valid(const unsigned char* sig, size_t n){
 }
 
 static int check_sig_encoding(const Ref* v, uint64_t flags, int* err){
-    if ((flags & (SCRIPT_VERIFY_DERSIG|SCRIPT_VERIFY_STRICTENC))==0) return 1;
+    /* IR-14 (INTERP_REVIEW_2026-09-05): Core's CheckSignatureEncoding.
+       IsValidSignatureEncoding is gated by DERSIG|LOW_S|STRICTENC and a
+       1-byte signature (hashtype only) fails it; IsDefinedHashtypeSignature is
+       gated by STRICTENC alone and requires (hashtype & ~ANYONECANPAY) in
+       ALL..SINGLE (1..3). The old rule tested the low five bits against
+       0x1c..0x1e, only when 0x80 was set, and under DERSIG too -- not Core's
+       rule in any reading. Never exercised, which is how it survived; an
+       oracle looser than the code it checks masks the code's own defects.
+       LOW_S itself is still not checked here (the oracle predates it). */
+    if ((flags & (SCRIPT_VERIFY_DERSIG|SCRIPT_VERIFY_LOW_S|SCRIPT_VERIFY_STRICTENC))==0) return 1;
     if (v->n==0) return 1;
     unsigned char hb = v->d[v->n-1];
     size_t siglen = v->n-1;
-    if ((flags & SCRIPT_VERIFY_DERSIG) && siglen>0)
-        if (!der_valid(v->d, siglen)){ *err=ERR_SIG_DER; return 0; }
-    if ((flags & SCRIPT_VERIFY_STRICTENC)){
-        if (siglen<8 || siglen>72){ *err=ERR_SIG_DER; return 0; }
-    }
-    if ((flags & (SCRIPT_VERIFY_DERSIG|SCRIPT_VERIFY_STRICTENC))){
-        if ((hb & 0x80) && (hb&0x1f)!=0x1c && (hb&0x1f)!=0x1d && (hb&0x1f)!=0x1e)
-            { *err=ERR_SIG_HASHTYPE; return 0; }
+    if (!der_valid(v->d, siglen)){ *err=ERR_SIG_DER; return 0; }
+    if (flags & SCRIPT_VERIFY_STRICTENC){
+        unsigned t = hb & 0x7f;
+        if (t < 1 || t > 3){ *err=ERR_SIG_HASHTYPE; return 0; }
     }
     return 1;
 }
