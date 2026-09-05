@@ -56,7 +56,15 @@ alignb 16                 ; alignb, not align: this is .tbss, padding bytes cann
 VFEXEC_MAX equ 5*1024*1024
 vfexec:     resb VFEXEC_MAX
 vfexec_sp:  resq 1
-global vfexec, vfexec_sp
+; IR-4 (INTERP_REVIEW_2026-09-05): Core's ConditionStack keeps the position
+; of the FIRST false entry (or NO_FALSE), so "is every entry true" is one
+; compare. vfexec_all_true used to scan the whole buffer on every opcode --
+; O(depth) per opcode, O(N^2) per script, and tapscript has no opcode or
+; script-size cap: a valid ~4 MB leaf of nested OP_IF took tens of minutes.
+; The byte buffer stays (memory-safety backstop, SCR-2 tests); this caches.
+vfexec_ff:  resq 1        ; index of first false, or VFEXEC_NO_FALSE
+global vfexec, vfexec_sp, vfexec_ff
+VFEXEC_NO_FALSE equ -1
 
     section .text
 
@@ -748,6 +756,13 @@ vfexec_push:
     jae   .full
     TLS_ADDR rdx, vfexec
     mov   [rdx+rcx], dil
+    test  dil, dil
+    jnz   .ff_done
+    TLS_ADDR rdx, vfexec_ff       ; IR-4: first false, if none yet
+    cmp   qword [rdx], VFEXEC_NO_FALSE
+    jne   .ff_done
+    mov   [rdx], rcx
+.ff_done:
     inc   qword [r8]
     xor   eax, eax
     inc   rax
@@ -762,12 +777,19 @@ vfexec_push:
 ; vfexec_pop()
 global vfexec_pop
 vfexec_pop:
+    push  rdx
     TLS_ADDR rcx, vfexec_sp
     mov   rax, [rcx]
     test  rax, rax
     jz    .empty
     dec   qword [rcx]
+    mov   rax, [rcx]              ; new depth == index of the popped slot
+    TLS_ADDR rdx, vfexec_ff       ; IR-4: popping the first false clears it
+    cmp   [rdx], rax
+    jne   .empty
+    mov   qword [rdx], VFEXEC_NO_FALSE
 .empty:
+    pop   rdx
     ret
 ; vfexec_depth() -> rax
 global vfexec_depth
@@ -792,6 +814,19 @@ vfexec_toggle_top:
     movzx eax, byte [r9+rcx-1]
     xor   eax, 1
     mov   [r9+rcx-1], al
+    ; IR-4: Core's ConditionStack::toggle_top -- if nothing was false the top
+    ; just became the first false; if the top WAS the first false it is now
+    ; true and nothing is false; a false below the top leaves it unchanged.
+    dec   rcx                     ; index of top
+    TLS_ADDR rdx, vfexec_ff
+    cmp   qword [rdx], VFEXEC_NO_FALSE
+    jne   .tt_had_false
+    mov   [rdx], rcx
+    jmp   .empty
+.tt_had_false:
+    cmp   [rdx], rcx
+    jne   .empty
+    mov   qword [rdx], VFEXEC_NO_FALSE
 .empty:
     pop   r9
     pop   r8
@@ -804,19 +839,12 @@ global vfexec_all_true
 vfexec_all_true:
     push  rcx
     push  rdx
-    TLS_ADDR rcx, vfexec_sp
-    mov   rcx, [rcx]
-    TLS_ADDR rdx, vfexec
-    test  rcx, rcx
-    jz    .yes
-    xor   eax, eax
-.scan:
-    movzx r8d, byte [rdx+rax]
-    test  r8b, r8b
-    jz    .no
-    inc   rax
-    cmp   rax, rcx
-    jb    .scan
+    ; IR-4: one compare against the cached first-false position (Core's
+    ; ConditionStack::all_true). The byte scan this replaced is what made a
+    ; deeply nested tapscript quadratic.
+    TLS_ADDR rcx, vfexec_ff
+    cmp   qword [rcx], VFEXEC_NO_FALSE
+    jne   .no
     jmp   .yes
 .no:
     xor   eax, eax
@@ -1015,6 +1043,8 @@ global vfexec_sp_reset
 vfexec_sp_reset:
     TLS_ADDR rax, vfexec_sp
     mov   qword [rax], 0
+    TLS_ADDR rax, vfexec_ff
+    mov   qword [rax], VFEXEC_NO_FALSE   ; IR-4
     ret
 
 ; SECURITY (audit 2026-08-29 finding 9): without this note the linker
