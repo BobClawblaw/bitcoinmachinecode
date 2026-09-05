@@ -142,7 +142,7 @@ download worker) and makes concurrent serving reads safe.
 ### 2.1 Toolchain requirements
 
 - `nasm` (the Makefile drives `nasm -f elf64`) — repo verified with 2.16.01.
-- `gcc` (System V AMD64; `-no-pie -O0/-O2`) — 13.3 used.
+- `gcc` (System V AMD64; `-no-pie -O2` throughout) — 13.3 used.
 - `GNU ld` (2.42), Linux x86_64. Python 3 for the oracles/tests.
 - Optional: CUDA toolchain (`nvcc`) + an NVIDIA GPU only for the optional
   `asm/cuda/` tier; the dispatcher itself builds and runs with zero CUDA
@@ -164,7 +164,9 @@ make asm            # assemble all .asm sources only
 make clean          # remove generated objects + binaries
 ```
 
-`make test` builds and runs **146 harness invocations**. Check that count --
+`make test` builds and runs **348 harness invocations** (BLD-5, 2026-09-05: this
+said 146, and drifts every time a test is added -- `grep -c '^\t\./tests/' asm/Makefile`
+is the number that cannot go stale). Check that count --
 `grep -cE '^\t\./' asm/Makefile` -- whenever the suite is green but you did not
 expect it to be: a test that stops running looks identical to a test that
 passes, and this repository has been bitten by exactly that. **Exit code 0
@@ -173,8 +175,14 @@ harnesses are
 deliberately large/network-dependent and are **not** part of the default
 `test` target (e.g. `tests/test_ibd_scale`, the outbound-mux soak harness,
 live-network probes). Several networked/binary-glue harnesses are built at
-`-O0` because gcc `-O2` interacts badly with the deep asm call chain — the
-assembly is identical; do not "fix" these to `-O2` without re-verifying.
+`-O0`, because gcc `-O2` interacts badly with the deep asm call chain.
+**BLD-5 (2026-09-05): NO RULE IN THIS TREE BUILDS AT `-O0` ANY MORE.** The
+pins came off on 2026-08-23 once the real `-O2` blockers were fixed (they were
+ABI and overflow bugs, not an optimiser fault -- LOG.md incidents #27, #31).
+`grep -P '^\t.*\s-O0(\s|$)' asm/Makefile` matches nothing. Five Makefile
+comments still open "Built at -O0" above an `-O2` recipe; they have been
+annotated in place rather than deleted, so the reasoning that once justified
+each pin stays readable beside the rule it no longer governs.
 
 #### Test working directories
 
@@ -213,7 +221,7 @@ targets — the daemon binary must be rebuilt by hand:
 
 ```bash
 cd /storage/bitcoinmachinecode/asm
-gcc -no-pie -O0 -o daemon/bitcoind daemon/main.c sha256.o bitcoin_hash.o \
+gcc -no-pie -O2 -o daemon/bitcoind daemon/main.c sha256.o bitcoin_hash.o \
     bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o \
     bitcoind.o node_log.o bitcoin_headers.o
 ```
@@ -642,7 +650,8 @@ generators.
 - Concurrent appends are serialized by `flock(append.lock)` with per-worker
   fds (flock belongs to the open-file-description, not the path).
 - Any operation logs to the all-asm leveled logger (`bitcoind.log`) via
-  `node_log_*`; the daemon is `-O0`-linked and signal-hardened
+  `node_log_*`; the daemon is `-O2`-linked (BLD-5 2026-09-05: this said
+  `-O0`; the pin came off 2026-08-23) and signal-hardened
   (`SIGPIPE`/`SIGCHLD` ignored).
 
 ---

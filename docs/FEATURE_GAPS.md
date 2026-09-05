@@ -291,17 +291,21 @@ tables and the writers themselves.
   -stopatheight`, second scratch datadir) — **still never run.** The one
   like-for-like end-to-end speed comparison, and the only item here that is
   purely a measurement rather than a capability.
-- **`assumevalid`** — parsed and then IGNORED, with a loud `[config]` line
-  saying so. This node verifies every script in every block
-  (`tx_verify_block_connect_all`, called from `daemon/utxo_live.c`'s apply
-  path ahead of any UTXO write, and proven by the full-archive replay);
-  honouring assumevalid would mean *skipping* that, so it is a deliberate
-  refusal rather than an unimplemented feature. Small to wire if ever wanted.
-  *(The `[config]` line itself was STALE until 2026-08-28 — it claimed block
-  connection did no script verification at all, describing the node as it was
-  before Stage D. It was believed over the code and briefly propagated into
-  this file. Log strings that explain a decision age exactly like refusal
-  strings do; see the wallet refusals deleted 2026-08-27.)*
+- **`assumevalid`** — IMPLEMENTED 2026-09-01, both modes. `node_config.c`
+  parses it into `assumevalid_mode` (1 = skip script evaluation at or below the
+  given block, Core's semantics; 2 = `assumevalid=0`, evaluate everything), the
+  per-chain defaults come from `chainparams.c`, and `tx_verify.c`'s script
+  switch is what `utxo_live.c` turns off per block while applying at or below
+  the height. Every other consensus check still runs at every height.
+
+  *(This entry read "parsed and then IGNORED, with a loud `[config]` line
+  saying so" until 2026-09-05 — BLD-5. It sat in the "REMAINING gaps, precisely
+  (this is the real backlog)" section describing a refusal the code had stopped
+  making. The `[config]` line beside it had ALREADY been corrected once, on
+  2026-08-28, for claiming block connection did no script verification at all;
+  the prose outlived that correction by another week. Documentation that
+  explains a deliberate refusal ages exactly like the refusal string does.)*
+
 - **`assumeutxo` / `loadtxoutset`** — refuses BY DESIGN. Every parity claim
   this project makes rests on locally-validated coins, and importing a
   snapshot would hollow that out. `dumptxoutset` is real (proven at full
@@ -473,7 +477,8 @@ asserts the list and the implementation move together in **both** directions.
 *(`whitelist` was the example here until 2026-08-30, when it stopped being
 true: it is implemented now — `noban` only, and every other Core permission
 token is a startup error naming the token rather than an accepted no-op. The
-example moved to `whitebind`, which is still genuinely unimplemented. An
+example moved to `whitebind`, which was implemented on 2026-09-01
+(node_config.c calls netperm_whitebind_add; see the table below). An
 example that has quietly become false is the same defect this section is
 about.)*
 
