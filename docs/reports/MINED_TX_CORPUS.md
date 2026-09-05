@@ -38,26 +38,27 @@ that distinction turned out to matter (see below).
 
 | Height | Transaction | Spends | What makes it unique |
 |---|---|---|---|
-| 170 | `f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16` | P2PK | **First P2PK spend in history.** Satoshi to Hal Finney. A bare public key in the output, no hash. The oldest spend the chain has. |
-| 728 | `6f7cf9580f1c2dfb3c4d5d043cdbb128c640e3f20161245aa7372e9666168516` | P2PKx2 | **Creates the P2PKH shape.** Spends two bare P2PK outputs. The novelty is in the output, not the input — on the spend side this is P2PK. |
-| 124,276 | `fb0a1d8d34fa5537e461ac384bac761125e1bfa7fec286fa72511240fa66864d` | P2PKH | **Non-minimal DER: 34-byte r AND s.** Two leading zero pad bytes on each of r and s. A parser that strips only one rejects this real, mined transaction. The case the 2026-08-19 signature fix exists for. |
-| 163,685 | `eb3b82c0884e3efa6d8b0be55b4915eb20be124c9766245bcc7f34fdac32bccb` | P2PKH+NOP-script | **Anyone-can-spend NOP script.** Creates a bare multisig output; its second input spends PUSH20 <data> OP_NOP2 OP_DROP — valid because OP_NOP2 was still a NOP here. CLTV only claimed that opcode at 388,381. |
-| 164,467 | `60a20bd93aa49ab4b28d514ec10b06e1829ce6818ec06cd3aabd013ebcdc4bb1` | P2PKHx3 | **FindAndDelete.** A signature that appears inside its own scriptCode and must be removed before hashing. Three P2PKH inputs, 759 bytes. |
-| 170,052 | `9c08a4d78931342b37fd5f72900fb9983087e6f46c4a097d8a1f52c74e28eaf6` | P2PK | **Creates an early P2SH output.** It cannot be a P2SH spend: BIP16 activated at 173,805, after this block. It spends P2PK. |
-| 247,939 | `315ac7d4c26d69668129cc352851d9389b4a6868f1509c6c8b66bead11e2619f` | P2PKHx2 | **The SIGHASH_SINGLE bug.** Input index ≥ output count, so the sighash is the literal value 1. Mined, and must still validate forever. |
-| 481,824 | `461e8a4aa0a0e75c06602c505bd7aa06e7116ba5cd98fd6e046e8cbeb00379d6` | P2PKHx2 | **Creates a P2WSH output.** In the segwit activation block. Spends two P2PKH inputs — no witness of its own. |
-| 481,824 | `8f907925d2ebe48765103e6845c06f1f2bb77c6adc1cc002865865eb5cfd5c1c` | P2SH | **P2SH-wrapped P2WPKH.** scriptSig AND witness both populated, the only shape where both are non-empty. |
-| 481,824 | `dfcec48bb8491856c353306ab5febeb7e99e4d783eedf3de98f3ee0812b92bad` | P2SH | **The first segwit spend in history.** In the activation block itself. |
-| 481,824 | `f91d0a8a78462bc59398f2c5d7a84fcff491c26ba54c4833478b202796c8aafd` | P2WPKH | **Native P2WPKH spend.** Activation block. |
-| 550,000 | `73965c0ab96fa518f47df4f3e7201e0a36f163c4857fc28150d277caa8589259` | P2WSH | **Native P2WSH multisig.** Four witness items. |
-| 550,000 | `9cf007aa4ed2216c6ca42ba593558cb6ce4df9c5417677d7ca96a7b2be6d807b` | P2SH | **P2SH-wrapped P2WSH.** Four witness items, redeemed through the P2SH wrapper. |
-| 550,000 | `bdcb08cd977e229482f295345893405882a08132f1675beb844de8548007915f` | P2PKH | **Creates a bare multisig output.** Consensus-valid, non-standard to relay today. Spends P2PKH. |
-| 750,000 | `4c9fe4ad5923fd41074da3f92da6359cbafbd96ecbb758481d6c1f106242703e` | P2TR | **Taproot key-path (BIP341).** A single witness item. The cheapest spend the chain allows. |
-| 800,000 | `965f866bf8623bbf956c1b2aeec1efc1ad162fd428ab7fb89f128a0754ebbc32` | P2TR | **Taproot script-path (BIP342).** With a real 33-byte control block. |
-| 850,000 | `b10c0000004da5a9d1d9b4ae32e09f0b3e62d21a5cce5428d4ad714fb444eb5d` | P2PK+P2PKH+P2MS+P2SHx3+P2WPKH+P2WSH+P2TRx2 | **Seven script types in one transaction.** 10 inputs spending P2PK, P2PKH, bare multisig, P2SH×3, P2WPKH, P2WSH and P2TR×2; 9 outputs covering nine types including the P2A anchor and nulldata. The widest vector in the corpus — and the only one that spends bare multisig. |
+| 170 | [`f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16`](https://mempool.space/tx/f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16) | P2PK | **First P2PK spend in history.** Satoshi to Hal Finney. A bare public key in the output, no hash. The oldest spend the chain has. |
+| 728 | [`6f7cf9580f1c2dfb3c4d5d043cdbb128c640e3f20161245aa7372e9666168516`](https://mempool.space/tx/6f7cf9580f1c2dfb3c4d5d043cdbb128c640e3f20161245aa7372e9666168516) | P2PKx2 | **Creates the P2PKH shape.** Spends two bare P2PK outputs. The novelty is in the output, not the input — on the spend side this is P2PK. |
+| 124,276 | [`fb0a1d8d34fa5537e461ac384bac761125e1bfa7fec286fa72511240fa66864d`](https://mempool.space/tx/fb0a1d8d34fa5537e461ac384bac761125e1bfa7fec286fa72511240fa66864d) | P2PKH | **Non-minimal DER: 34-byte r AND s.** Two leading zero pad bytes on each of r and s. A parser that strips only one rejects this real, mined transaction. The case the 2026-08-19 signature fix exists for. |
+| 163,685 | [`eb3b82c0884e3efa6d8b0be55b4915eb20be124c9766245bcc7f34fdac32bccb`](https://mempool.space/tx/eb3b82c0884e3efa6d8b0be55b4915eb20be124c9766245bcc7f34fdac32bccb) | P2PKH+NOP-script | **Anyone-can-spend NOP script.** Creates a bare multisig output; its second input spends PUSH20 <data> OP_NOP2 OP_DROP — valid because OP_NOP2 was still a NOP here. CLTV only claimed that opcode at 388,381. |
+| 164,467 | [`60a20bd93aa49ab4b28d514ec10b06e1829ce6818ec06cd3aabd013ebcdc4bb1`](https://mempool.space/tx/60a20bd93aa49ab4b28d514ec10b06e1829ce6818ec06cd3aabd013ebcdc4bb1) | P2PKHx3 | **FindAndDelete.** A signature that appears inside its own scriptCode and must be removed before hashing. Three P2PKH inputs, 759 bytes. |
+| 170,052 | [`9c08a4d78931342b37fd5f72900fb9983087e6f46c4a097d8a1f52c74e28eaf6`](https://mempool.space/tx/9c08a4d78931342b37fd5f72900fb9983087e6f46c4a097d8a1f52c74e28eaf6) | P2PK | **Creates an early P2SH output.** It cannot be a P2SH spend: BIP16 activated at 173,805, after this block. It spends P2PK. |
+| 247,939 | [`315ac7d4c26d69668129cc352851d9389b4a6868f1509c6c8b66bead11e2619f`](https://mempool.space/tx/315ac7d4c26d69668129cc352851d9389b4a6868f1509c6c8b66bead11e2619f) | P2PKHx2 | **The SIGHASH_SINGLE bug.** Input index ≥ output count, so the sighash is the literal value 1. Mined, and must still validate forever. |
+| 481,824 | [`461e8a4aa0a0e75c06602c505bd7aa06e7116ba5cd98fd6e046e8cbeb00379d6`](https://mempool.space/tx/461e8a4aa0a0e75c06602c505bd7aa06e7116ba5cd98fd6e046e8cbeb00379d6) | P2PKHx2 | **Creates a P2WSH output.** In the segwit activation block. Spends two P2PKH inputs — no witness of its own. |
+| 481,824 | [`8f907925d2ebe48765103e6845c06f1f2bb77c6adc1cc002865865eb5cfd5c1c`](https://mempool.space/tx/8f907925d2ebe48765103e6845c06f1f2bb77c6adc1cc002865865eb5cfd5c1c) | P2SH | **P2SH-wrapped P2WPKH.** scriptSig AND witness both populated, the only shape where both are non-empty. |
+| 481,824 | [`dfcec48bb8491856c353306ab5febeb7e99e4d783eedf3de98f3ee0812b92bad`](https://mempool.space/tx/dfcec48bb8491856c353306ab5febeb7e99e4d783eedf3de98f3ee0812b92bad) | P2SH | **The first segwit spend in history.** In the activation block itself. |
+| 481,824 | [`f91d0a8a78462bc59398f2c5d7a84fcff491c26ba54c4833478b202796c8aafd`](https://mempool.space/tx/f91d0a8a78462bc59398f2c5d7a84fcff491c26ba54c4833478b202796c8aafd) | P2WPKH | **Native P2WPKH spend.** Activation block. |
+| 550,000 | [`73965c0ab96fa518f47df4f3e7201e0a36f163c4857fc28150d277caa8589259`](https://mempool.space/tx/73965c0ab96fa518f47df4f3e7201e0a36f163c4857fc28150d277caa8589259) | P2WSH | **Native P2WSH multisig.** Four witness items. |
+| 550,000 | [`9cf007aa4ed2216c6ca42ba593558cb6ce4df9c5417677d7ca96a7b2be6d807b`](https://mempool.space/tx/9cf007aa4ed2216c6ca42ba593558cb6ce4df9c5417677d7ca96a7b2be6d807b) | P2SH | **P2SH-wrapped P2WSH.** Four witness items, redeemed through the P2SH wrapper. |
+| 550,000 | [`bdcb08cd977e229482f295345893405882a08132f1675beb844de8548007915f`](https://mempool.space/tx/bdcb08cd977e229482f295345893405882a08132f1675beb844de8548007915f) | P2PKH | **Creates a bare multisig output.** Consensus-valid, non-standard to relay today. Spends P2PKH. |
+| 750,000 | [`4c9fe4ad5923fd41074da3f92da6359cbafbd96ecbb758481d6c1f106242703e`](https://mempool.space/tx/4c9fe4ad5923fd41074da3f92da6359cbafbd96ecbb758481d6c1f106242703e) | P2TR | **Taproot key-path (BIP341).** A single witness item. The cheapest spend the chain allows. |
+| 800,000 | [`965f866bf8623bbf956c1b2aeec1efc1ad162fd428ab7fb89f128a0754ebbc32`](https://mempool.space/tx/965f866bf8623bbf956c1b2aeec1efc1ad162fd428ab7fb89f128a0754ebbc32) | P2TR | **Taproot script-path (BIP342).** With a real 33-byte control block. |
+| 850,000 | [`b10c0000004da5a9d1d9b4ae32e09f0b3e62d21a5cce5428d4ad714fb444eb5d`](https://mempool.space/tx/b10c0000004da5a9d1d9b4ae32e09f0b3e62d21a5cce5428d4ad714fb444eb5d) | P2PK+P2PKH+P2MS+P2SHx3+P2WPKH+P2WSH+P2TRx2 | **Seven script types in one transaction.** 10 inputs spending P2PK, P2PKH, bare multisig, P2SH×3, P2WPKH, P2WSH and P2TR×2; 9 outputs covering nine types including the P2A anchor and nulldata. The widest vector in the corpus — and the only one that spends bare multisig. |
 
-Every txid above is real and on the main chain; each can be looked up
-with `getrawtransaction <txid>` against any archival node.
+Every txid above is real and on the main chain and links to
+mempool.space; each can equally be looked up with
+`getrawtransaction <txid>` against any archival node.
 
 ## What the corpus actually covers
 
@@ -111,7 +112,7 @@ concluded P2SH redemption was covered from block 170,052 when it is not.
 
 ## One wanted transaction is not in the corpus
 
-`da917699942e4a96272401b534381a75512eeebe8403084500bd637bd47168b3`
+[`da917699942e4a96272401b534381a75512eeebe8403084500bd637bd47168b3`](https://mempool.space/tx/da917699942e4a96272401b534381a75512eeebe8403084500bd637bd47168b3)
 (h=481,824, an OP_RETURN nulldata output) is in the generator's `WANTED`
 list but skipped: its prevouts are unresolvable from the oracle. The list
 asks for 18; 17 ship. Nulldata output creation is still covered
