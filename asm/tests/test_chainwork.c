@@ -26,6 +26,7 @@ typedef unsigned char u8;
 
 extern void block_work(u8 work[16], unsigned int bits);
 extern void chainwork_add(u8 out[16], const u8 a[16], const u8 b[16]);
+extern int  chainwork_cmp(const u8 a[16], const u8 b[16]);   /* STO-13 */
 extern void u256_div(u8 q[32], const u8 a[32], const u8 b[32]);
 extern int  store_chainwork_init(void* st);
 extern int  store_chainwork_append(void* st, long height, const u8 work[16]);
@@ -199,6 +200,47 @@ int main(void) {
         }
         ckm("replayed persisted records strictly increasing end-to-end", ok_replay);
         ckm("final replayed cumulative == running total", resum == running);
+    }
+
+    /* ---- STO-13: chainwork_add saturates rather than wrapping -------------
+     * Unreachable at real difficulty -- mainnet cumulative work is ~2^97 and
+     * pow_check rejects the targets that would be needed. It matters anyway
+     * because chainwork_cmp is the FORK-CHOICE predicate: a silent wrap would
+     * not corrupt a logged number, it would make a lighter chain compare
+     * heavier and the node would reorganise onto it with no error anywhere. */
+    {
+        unsigned char a[16], b[16], out[16];
+        /* 2^128-1 + 1 must stay 2^128-1, not become 0 */
+        memset(a, 0xff, 16);
+        memset(b, 0, 16); b[0] = 1;
+        chainwork_add(out, a, b);
+        int all_ff = 1; for (int i = 0; i < 16; i++) if (out[i] != 0xff) all_ff = 0;
+        ckm("STO-13: max + 1 saturates instead of wrapping to zero", all_ff);
+        if (!all_ff){
+            printf("      got ");
+            for (int i = 15; i >= 0; i--) printf("%02x", out[i]);
+            printf("\n");
+        }
+        /* and the saturated value must still compare as the HEAVIEST thing */
+        { unsigned char big[16]; memset(big, 0xfe, 16);
+          ckm("STO-13: the saturated value still compares heaviest",
+              chainwork_cmp(out, big) > 0); }
+        /* THE OPPOSITE HALF: an ordinary add is untouched */
+        { unsigned char x[16], y[16], z[16];
+          memset(x, 0, 16); memset(y, 0, 16);
+          x[0] = 5; y[0] = 7;
+          chainwork_add(z, x, y);
+          int ok = (z[0] == 12); for (int i = 1; i < 16; i++) if (z[i]) ok = 0;
+          ckm("STO-13: 5 + 7 is still 12 (no clamping on ordinary values)", ok); }
+        /* a carry ACROSS the limb boundary must still propagate normally */
+        { unsigned char x[16], y[16], z[16];
+          memset(x, 0, 16); memset(y, 0, 16);
+          for (int i = 0; i < 8; i++) x[i] = 0xff;      /* low limb all ones */
+          y[0] = 1;
+          chainwork_add(z, x, y);
+          int ok = (z[8] == 1);
+          for (int i = 0; i < 8; i++) if (z[i]) ok = 0;
+          ckm("STO-13: a carry into the high limb still propagates", ok); }
     }
 
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);

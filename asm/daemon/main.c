@@ -1335,6 +1335,25 @@ void txr_report_violation_fd(int fd, const char* reason){
 /* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
 int ctl_ban_add(const char* subnet, long long until){
     if(!g_node_status || !subnet || !*subnet) return 0;
+    /* NET-17 (audit 2026-09-03): refuse a key enforcement can never match.
+     *
+     * An onion or I2P inbound sets g_cur_peer_ip from the peer DESCRIPTOR --
+     * "onion-inbound", or a base32 address -- and a protocol violation then
+     * called this with that string. subnet_parse rejects it wherever bans are
+     * ENFORCED, so the entry could never ban anything; but it occupied one of
+     * RPC_MAX_BANS slots, and once the list is full this function returns 0
+     * silently ("list full: no silent evict" below). Onion violations could
+     * therefore crowd out REAL IP bans -- the list filling with entries that
+     * do nothing, while the ones that would have worked are refused.
+     *
+     * Gated on the same parser enforcement uses, so the two cannot disagree
+     * about what is bannable. */
+    { subnet_t probe;
+      if(!subnet_parse(subnet, &probe)){
+          fprintf(stderr, "[ban] not an IP or subnet, so nothing could enforce it: %s "
+                          "(onion/I2P peers are dropped on violation, not banned)\n", subnet);
+          return 0;
+      } }
     int slot = -1;
     for(int i = 0; i < RPC_MAX_BANS; i++){
         if(g_node_status->bans[i].until &&

@@ -1,6 +1,19 @@
 #!/bin/bash
 # Live view of the UTXO rebuild running inside bmc-bitcoind.service.
 #
+# BLD-9 (audit 2026-09-03): `set -u` and a pipefail are on now -- this had
+# neither, so a typo'd variable read as empty and a failing stage in a
+# pipeline was invisible. NOT `set -e`: the loop below is meant to survive a
+# transient read failure and keep watching, so a blanket exit-on-error would
+# change what the tool is for.
+#
+# It reads live process memory with `sudo dd if=/proc/<pid>/mem` and resolves
+# symbols with `sudo nm`. That is a root read of a running daemon's address
+# space: acceptable for a developer box, and stated here rather than
+# discovered at the sudo prompt.
+set -u
+set -o pipefail
+#
 # NOTE: this used to watch build_utxo_seed.log, the log of a separate,
 # one-off standalone seeding tool (daemon/build_utxo) -- not what actually
 # runs day to day. The live daemon logs its own catchup progress to

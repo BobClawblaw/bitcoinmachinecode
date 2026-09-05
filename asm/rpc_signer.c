@@ -18,6 +18,8 @@
 
 #include "rpc_signer.h"
 #include <stdio.h>
+#include <errno.h>
+#include <sys/wait.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -68,9 +70,31 @@ static rj_val* signer_run(const char* args, long* ec, const char** em){
     out[n] = 0;
     int rc = pclose(p);
     if (rc != 0){
-        snprintf(errbuf, sizeof errbuf,
-                 "the signer exited with status %d%s%.120s", rc,
-                 n ? "; output: " : "", n ? out : "");
+        /* RPC-17 (audit 2026-09-03): pclose returns a WAIT STATUS, not an
+         * exit code. Printing it raw told the operator "the signer exited
+         * with status 256" when HWI had exited 1, and said nothing at all
+         * about a signal -- so a signer killed by SIGPIPE or SIGSEGV was
+         * reported as a mystery number. Decoded here into what actually
+         * happened, because this string is the ONLY thing the operator sees:
+         * the child's stderr goes to the daemon's, not into the RPC reply. */
+        if (rc < 0){
+            snprintf(errbuf, sizeof errbuf,
+                     "could not run the signer: %s%s%.120s", strerror(errno),
+                     n ? "; output: " : "", n ? out : "");
+        } else if (WIFSIGNALED(rc)){
+            snprintf(errbuf, sizeof errbuf,
+                     "the signer was killed by signal %d (%s)%s%.120s",
+                     WTERMSIG(rc), strsignal(WTERMSIG(rc)),
+                     n ? "; output: " : "", n ? out : "");
+        } else if (WIFEXITED(rc)){
+            snprintf(errbuf, sizeof errbuf,
+                     "the signer exited %d%s%.120s", WEXITSTATUS(rc),
+                     n ? "; output: " : "", n ? out : "");
+        } else {
+            snprintf(errbuf, sizeof errbuf,
+                     "the signer ended abnormally (wait status 0x%x)%s%.120s", rc,
+                     n ? "; output: " : "", n ? out : "");
+        }
         *ec = -1; *em = errbuf;
         return NULL;
     }

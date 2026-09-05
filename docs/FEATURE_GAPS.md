@@ -261,6 +261,17 @@ tables and the writers themselves.
   **byte-identical** to Core's for the same request. Requires the filter
   index to have been built (`daemon/build_block_filters`), exactly as Core
   requires `-blockfilterindex`.
+
+  *One stated caveat on "byte-identical" (STO-14, audit 2026-09-03):
+  `block_filter.c` de-duplicates elements on the 64-bit SipHash, where Core's
+  `GCSFilter` de-duplicates the byte-wise element SET before hashing. If two
+  distinct scripts in one block ever collided on 64 bits, N would be one less
+  than Core's -- and since N scales the Golomb-Rice range, the WHOLE filter
+  would differ, not one entry. That is ~n²/2^65 per block, about 2^-40 at a
+  few thousand elements. Left as-is deliberately: byte-wise dedup means
+  sorting (pointer, length) pairs by content inside a KAT-backed generator
+  whose output peers consume, which is a worse trade than carrying a 2^-40
+  divergence knowingly. Recorded so the parity claim above is read with it.*
 - ~~**addrv2 (BIP155) is parsed but never NEGOTIATED.**~~ — **CLOSED
   2026-08-28.** Both handshake roles offer `sendaddrv2` after version and
   before verack, gated on peer protocol >= 70016 as Core does, and remember
@@ -2195,3 +2206,104 @@ one. The loser's later `used = 0` would free the *winner's* entry.
 `rpc_fill_peer_slot_ex` now preserves an existing claim across the memset. The
 outbound path, which is not claimed by CAS and where zeroing `used` first is
 what stops a reader seeing a half-filled record, keeps the old behaviour.
+
+## Update 2026-09-05 — the audit's INFO tier: what was fixed, and what was decided
+
+The 2026-09-03 audit's 33 INFO findings are worked through. Most became code
+(see the commits naming each ID). This section records the ones whose right
+answer was a DECISION rather than a patch, so nobody re-opens them expecting a
+fix — and the two that turned out to be already-closed.
+
+### Decisions, not defects
+
+**NET-16 — the node introduces itself as software it is not.** The feeler and
+block-relay-only handshakes send `/Satoshi:25.0.0/` (`net_policy.c:97`), and
+the seednode/getaddr path sends `/Satoshi:0.18.0/` with a fabricated
+`start_height` of 789000 (`addr_ingest.c:180`). Neither matches the daemon's
+own `node_ua_buf`, which carries this project's real user agent.
+
+This is not laziness and it is not an oversight — someone chose it, and the
+reason is real: a node advertising an unknown user agent is treated
+differently by peers and by crawlers, so borrowing Core's string makes those
+paths behave like everyone else's. But it also means this node is
+**misreporting itself to the network**, including to the crawlers that publish
+node-population statistics, and that is a choice the project should make out
+loud rather than leave sitting in two string literals.
+
+**Recorded, not changed.** Changing it is a one-line edit either way; what it
+needs is a decision about how this node wants to appear, taken deliberately.
+Until that decision is made, the current behaviour stands and is documented
+here rather than implied.
+
+**RPC-18 — the RPC listener is IPv4-only.** `rpc_server.c` creates an
+`AF_INET` socket and parses `-rpcbind` with `inet_pton(AF_INET)`, so
+`rpcbind=::1` is a startup error and every IPv6 `-rpcallowip` entry is
+unreachable. `rpc_acl.c` seeds `::1` into the default allow list, where it can
+never match.
+
+Adding `AF_INET6` is a contained change (socket, `inet_pton`, and
+`server_thread`'s peer formatting), but it is a feature with its own testing —
+dual-stack binding, v4-mapped addresses, and the ACL semantics for both — not
+audit cleanup. **The dead `::1` seed is kept**, because it is the correct
+default the moment the listener learns IPv6 and deleting it would silently
+narrow the default from "loopback, both families" to "IPv4 loopback only" at
+exactly that moment. It is now annotated as inert at the line itself.
+
+### Accepted risks, closed
+
+**CRY-8 — AES timing and the lazy S-box.** The inverse S-box is built lazily
+through an idempotent racy write (benign on x86: every writer stores the same
+bytes), and both the S-box lookups and the PKCS#7 padding check are
+variable-time. Correctly scoped out: this AES decrypts the wallet at rest, and
+no attacker-chosen ciphertext is decrypted online, so there is no oracle to
+time. Closed with no change.
+
+**SCR-11 — CONST_SCRIPTCODE check ordering.** `bitcoin_interp.asm` runs the
+signature and pubkey encoding checks before the FindAndDelete callback, where
+Core's `EvalChecksigPreTapscript` runs FindAndDelete first. Both reject the
+same scripts; only the reported error differs when a script trips both, and
+the flag is policy-only. Reordering consensus-adjacent interpreter code to
+change which of two rejections is named is not a trade worth making. Closed.
+
+**BLD-6 — the gate is one recipe with ~350 command lines**, and a recipe stops
+at its first failing line even under `-k`, so an early failure skips every
+later test. That is real, understood, and already mitigated: `gate-log-check`
+exists precisely to detect a truncated run and is itself gated. No change.
+
+**BLD-10 — repo hygiene**, re-verified 2026-09-05: 1,070 tracked files,
+largest is `validation/corpus_diff_report.json` at 2.6 MB, `git status` clean.
+No key material in tracked files other than BLD-3. No action.
+
+### Already closed by other findings
+
+**UTX-13** claimed the 32-bit `mov eax, -1` error-return defect was "live in
+`utxo_lsm_put`". It is not, as of UTX-3 in this same audit round: both
+`utxo_lsm_put` (`.lp_err`) and `utxo_lsm_del` (`.ld_err`) return a full 64-bit
+`mov rax, -1`. The stale explanation in `daemon/flush_wal_tail.c` has been
+corrected — the test there compares against the SUCCESS value, which is why it
+kept working when the convention changed underneath it.
+
+**UTX-12's premise no longer holds.** It says a non-empty WAL tail at boot
+forces a full `mac_lsm_recount` "because the v2 manifest cannot say whether the
+tail is folded", and recommends adding a folded-through field. That field
+exists: `MAGIC_MANIFEST2` ("UMN2") carries a trailing `total_live` qword, and
+`bitcoin_utxo_lsm.asm:198-205` states its contract — the persisted value is the
+RUNS-ONLY count with WAL and memtable excluded, precisely so reload can add the
+current tail's net (pushes − dels) on top without double-counting. The full
+recount is the fallback for an OLD-format (`MAGIC_MANIFEST`) manifest only.
+Verified 2026-09-05; no change needed.
+
+**WAL-20** was a re-verification request, and it verifies. `wallet_store.c`
+marks the v2 format legacy/read-only; every write path goes through
+`store_write_sealed` → `wcrypt_seal`, and v2 files are decrypted on load and
+immediately rewritten as v3. It remains subject to WAL-4 (that rewrite is not
+fsynced), which is tracked under its own ID.
+
+**BLD-9's headline** — ops scripts driving a *system* `bitcoind`, with a
+`killall bitcoind` fallback — was fixed under DMN-11 earlier in this
+remediation; they point at `asm/daemon/bitcoind` now. Its remaining items are
+done here: `utxo_progress.sh` gains `set -u` and `pipefail` (not `set -e`: the
+watch loop is meant to survive a transient read failure), with its `sudo dd
+if=/proc/<pid>/mem` root-read of live process memory stated at the top rather
+than discovered at the sudo prompt; `signer_core_diff.sh`'s `rm -rf $TMP` is
+quoted.

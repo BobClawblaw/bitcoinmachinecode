@@ -107,9 +107,35 @@ int main(void){
       char cmd[1100]; snprintf(cmd, sizeof cmd, "%s/badexit", tt_workdir());
       rpc_signer_set_cmd(cmd);
       r = NULL; ec = 0;
-      ck("a signer that exits nonzero -> error naming the status",
+      /* RPC-17 (2026-09-05): this used to assert the message contains the word
+       * "status", which it did -- by printing pclose's raw WAIT STATUS. For a
+       * script exiting 3 that read "the signer exited with status 768". The
+       * assertion is now the EXIT CODE itself, which is what an operator can
+       * act on and what HWI documents. */
+      ck("a signer that exits nonzero -> error naming the real exit code",
          rpc_signer_enumerate(&r, &ec, &em) == 0 && ec == -1 &&
-         em && strstr(em, "status"));
+         em && strstr(em, "exited 3"));
+      if (em && !strstr(em, "exited 3")) printf("      got: %s\n", em);
+      rj_free(r); }
+    /* RPC-17: a signer killed by a signal.
+     *
+     * popen() runs the command through a SHELL, so when the script is killed
+     * the shell survives and exits 128+signal -- WIFSIGNALED describes the
+     * shell, not the signer, and is therefore false here. 139 = 128 + SIGSEGV
+     * is the honest report, and the point of the fix is that it now reads
+     * "exited 139" instead of the raw wait status 35584. (WIFSIGNALED is
+     * still handled in rpc_signer.c for the case where the SHELL itself is
+     * killed -- rarer, and previously indistinguishable from anything else.) */
+    { write_script("killed", "kill -SEGV $$\n");
+      char cmd[1100]; snprintf(cmd, sizeof cmd, "%s/killed", tt_workdir());
+      rpc_signer_set_cmd(cmd);
+      r = NULL; ec = 0;
+      int rc2 = rpc_signer_enumerate(&r, &ec, &em);
+      ck("RPC-17: a signer killed by a signal is refused",
+         rc2 == 0 && ec == -1);
+      ck("RPC-17: ...reported as 128+signal, not a raw wait status",
+         em && strstr(em, "exited 139") && !strstr(em, "35584"));
+      if (em && !strstr(em, "exited 139")) printf("      got: %s\n", em);
       rj_free(r); }
     { write_script("notjson", "echo 'i am not json'\n");
       char cmd[1100]; snprintf(cmd, sizeof cmd, "%s/notjson", tt_workdir());

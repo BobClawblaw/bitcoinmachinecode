@@ -15,6 +15,16 @@ void rpc_acl_reset(void){
     /* Core: "always allow IPv4 local subnet" -- note it is 127.0.0.0/8, not
      * /32, so a service bound to 127.0.0.2 still reaches it. Then ::1. */
     if (subnet_parse("127.0.0.0/8", &g_acl[g_n])) g_n++;
+    /* RPC-18 (audit 2026-09-03): the ::1 seed is DEAD as things stand -- the
+     * RPC listener is AF_INET only (rpc_server.c), so server_thread never
+     * formats an IPv6 peer and no address can ever match this entry.
+     *
+     * Kept rather than deleted, deliberately: it is the correct default the
+     * moment the listener learns AF_INET6, and removing it would silently
+     * change the default from "loopback, both families" to "IPv4 loopback
+     * only" at that point. What was wrong was that nothing said it is
+     * currently inert -- a reader would reasonably conclude IPv6 loopback
+     * works. See docs/FEATURE_GAPS.md for the decision. */
     if (subnet_parse("::1", &g_acl[g_n])) g_n++;
 }
 

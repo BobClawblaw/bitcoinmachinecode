@@ -203,6 +203,36 @@ int main(void){
         }
     }
 
+    /* ---- CRY-7: the signer's scalar-range guards -------------------------
+     * z is a message hash fed straight to sc_add, whose contract is that both
+     * operands are already < n. A hash >= n is ~2^-128 -- but the failure mode
+     * is a signature computed from a mis-reduced scalar, which simply does not
+     * verify, indistinguishable from an ordinary failure. The reduction makes
+     * the case impossible instead of unlikely.
+     *
+     * The largest possible z, all-0xff, is well above n, so it exercises the
+     * reduction directly rather than waiting 2^128 signatures for it. */
+    {
+        extern int wallet_ecdsa_sign(unsigned long long out_r[4], unsigned long long out_s[4],
+                                     const unsigned char z_be[32], const unsigned char priv_be[32]);
+        unsigned long long r[4], sg[4];
+        unsigned char zmax[32], priv[32];
+        memset(zmax, 0xff, 32);                       /* far above n */
+        memset(priv, 0x11, 32);
+        int rc = wallet_ecdsa_sign(r, sg, zmax, priv);
+        ck("CRY-7: an over-large z still signs (reduced, not rejected)", rc, 1);
+        ck("CRY-7: ...and r is non-zero", (r[0]|r[1]|r[2]|r[3]) != 0, 1);
+        ck("CRY-7: ...and s is non-zero", (sg[0]|sg[1]|sg[2]|sg[3]) != 0, 1);
+
+        /* THE OPPOSITE HALF: an ordinary hash is unaffected by the reduction */
+        unsigned char zord[32];
+        memset(zord, 0x42, 32);
+        unsigned long long r2[4], s2[4];
+        ck("CRY-7: an ordinary z still signs", wallet_ecdsa_sign(r2, s2, zord, priv), 1);
+        ck("CRY-7: ...and gives a DIFFERENT signature than the reduced one",
+           memcmp(r, r2, 32) != 0, 1);
+    }
+
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }
