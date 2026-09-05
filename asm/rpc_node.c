@@ -104,6 +104,11 @@ static int net_reach(int bmc_id, int dflt){
  * link node_config.c at all -- the NULL check is what keeps that build
  * working rather than needing a config parser it has no use for. */
 extern void node_config_get_proxy_info(const char**, const char**, const char**, int*) __attribute__((weak));
+/* RPC-8: the REAL subnet_t, not a hand-mirrored copy -- daemon/subnet.h's own
+ * header comment records that two spellings of one rule is how they drift.
+ * Redeclared weak after the include for the reason above. */
+#include "daemon/subnet.h"
+extern int subnet_parse(const char* spec, subnet_t* out) __attribute__((weak));
 static rj_val* net_entry(const char* name, int reachable, const char* proxy, int randomize){
     rj_val* o = rj_obj();
     rj_obj_set(o, "name", rj_str(name));
@@ -869,6 +874,23 @@ static int cmd_setban(const rj_val* params, rj_val** res, long* ec, const char**
     const char* cmd    = (params && params->typ == RJ_ARR && params->nitems >= 2 &&
                           params->items[1]->typ == RJ_STR) ? params->items[1]->str : NULL;
     if (!subnet || !cmd){ *ec = -8; *em = "setban requires a subnet and a command"; return 0; }
+    /* ---- RPC-8 (audit 2026-09-03): validate the subnet HERE ----
+     * The string was never parsed before storage, so `setban "not-an-ip" add`
+     * succeeded, appeared in listbanned, and never matched anything. Core's
+     * setban runs LookupSubNet first and raises -30.
+     *
+     * WEAK, following the node_config_get_proxy_info pattern documented above:
+     * bitcoin_cli links this whole file as a pure HTTP client and does not
+     * link daemon/subnet.c. A NULL check keeps that build working rather than
+     * forcing a subnet parser into a binary that only speaks HTTP -- and
+     * tests/test_rpc_node is the one other target that links rpc_node.o
+     * without it. Where the parser is absent the old behaviour stands, which
+     * is why the worker keeps its own guard too. */
+    { subnet_t probe;
+      if (subnet_parse){
+          if (!subnet_parse(subnet, &probe)){
+              *ec = -30; *em = "Error: Invalid IP/Subnet"; return 0; }
+      } }
     int add;
     if      (!strcmp(cmd, "add"))    add = 1;
     else if (!strcmp(cmd, "remove")) add = 0;

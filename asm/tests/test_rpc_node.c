@@ -1328,6 +1328,44 @@ int main(void){
         rpc_node_set_relay_floors(100, 100);   /* restore for any later case */
     }
 
+    /* ---- RPC-8 (audit 2026-09-03): setban validates its argument ----
+     * The subnet string was never parsed before storage, so `setban
+     * "not-an-ip" add` succeeded, was listed by listbanned, and never matched
+     * anything -- a ban the operator believes is in force and is not. Core
+     * runs LookupSubNet first and raises -30.
+     *
+     * The worker ALSO refused any prefix that was not a multiple of 8 in
+     * [8,32], claiming the matcher could not enforce it -- false since
+     * subnet.c landed, and inverted for IPv6 (it accepted 2001:db8::/32 while
+     * refusing ::1/128). That half is exercised by test_subnet.c directly;
+     * what this file can reach is the RPC-side parse.
+     *
+     * Both directions are asserted: garbage must be refused AND ordinary
+     * forms must still be accepted, so a validator that rejects everything
+     * fails just as loudly as none at all. */
+    {
+        rj_val* p = P("[\"not-an-ip\",\"add\"]");
+        D("setban", p);
+        ck("RPC-8 an unparseable subnet is refused with Core's -30",
+           rc == 0 && ec == -30 && em && strstr(em, "Invalid IP/Subnet"));
+        rj_free(r); rj_free(p);
+
+        p = P("[\"192.168.1.16/28\",\"add\"]");
+        D("setban", p);
+        ck("RPC-8 a /28 (not a multiple of 8) reaches the worker", rc != 0 || ec != -30);
+        rj_free(r); rj_free(p);
+
+        p = P("[\"2001:db8::/64\",\"add\"]");
+        D("setban", p);
+        ck("RPC-8 an IPv6 /64 reaches the worker", rc != 0 || ec != -30);
+        rj_free(r); rj_free(p);
+
+        p = P("[\"5.6.7.8\",\"add\"]");
+        D("setban", p);
+        ck("RPC-8 a bare IPv4 address is still accepted", rc != 0 || ec != -30);
+        rj_free(r); rj_free(p);
+    }
+
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);
     return fails ? 1 : 0;
 }
