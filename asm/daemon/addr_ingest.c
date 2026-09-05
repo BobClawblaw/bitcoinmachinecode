@@ -47,7 +47,8 @@ extern unsigned net_netgroup_v4(unsigned ip);           /* daemon/net_policy.c *
 typedef struct { unsigned ng[AI_MAX_PER_RESPONSE]; int cnt[AI_MAX_PER_RESPONSE]; int n; int taken;
                  long limit; /* > 0: consider at most this many records (caller's token budget) */
                  int* viol;  /* audit 2026-09-02 N3: set to 1 when the payload is a protocol violation
-                              * (malformed, or a count above MAX_ADDR_TO_SEND); NULL = nobody asked */ } ai_quota_t;
+                              * (malformed, or a count above MAX_ADDR_TO_SEND); NULL = nobody asked */     unsigned src_group;   /* NET-10: netgroup of the peer that sent this response */
+} ai_quota_t;
 #define AI_VIOL(q) do { if ((q)->viol) *(q)->viol = 1; } while (0)
 
 
@@ -99,7 +100,10 @@ static long ai_ingest_one(ab2_t* b, const bmc_addr_t* a, unsigned long long svc,
     /* Core: a time in the future or before 2001 is replaced by now-5d */
     unsigned now = (unsigned)time(NULL);
     if(tm > now + 600 || tm < 100000000u) tm = now - 5*24*3600;
-    return ab2_add(b, a, svc, tm) > 0 ? 1 : 0;
+    /* NET-10: attribute the address to the netgroup of the peer that sent
+     * it, so the per-source cap can bound how much of the book one source
+     * owns. 0 when the caller could not identify the leg -- never capped. */
+    return ab2_add_from(b, a, svc, tm, q->src_group) > 0 ? 1 : 0;
 }
 /* legacy `addr`: CompactSize count, then 30-byte records; IPv4 arrives
  * ::ffff:-mapped, IPv6 native (see netaddr.c). Before 2026-08-28 this read
@@ -147,13 +151,18 @@ static long ai_ingest_addrv2(void* unused, const unsigned char* pl, long plen, a
  * `limit` records (0 = all; the caller's token budget). Public so the parsers
  * can be tested on Core's own bytes and so the outbound legs
  * (daemon/tx_relay.c) share them. The `ab` argument is legacy and ignored. */
-long addr_ingest_msg_v(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit, int* viol){
+long addr_ingest_msg_vg(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit,
+                        int* viol, unsigned src_group){
     (void)ab;
     ai_quota_t quota; memset(&quota,0,sizeof quota); quota.limit = limit; quota.viol = viol;
+    quota.src_group = src_group;      /* NET-10 */
     if(viol) *viol = 0;
     if(!strncmp(cmd,"addrv2",6)) return ai_ingest_addrv2(NULL, pl, plen, &quota);
     if(!strncmp(cmd,"addr",4))   return ai_ingest_addr1(NULL, pl, plen, &quota);
     return 0;
+}
+long addr_ingest_msg_v(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit, int* viol){
+    return addr_ingest_msg_vg(ab, cmd, pl, plen, limit, viol, 0);
 }
 long addr_ingest_msg_n(void* ab, const char* cmd, const unsigned char* pl, long plen, long limit){
     return addr_ingest_msg_v(ab, cmd, pl, plen, limit, NULL);
