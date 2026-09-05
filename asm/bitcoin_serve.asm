@@ -217,6 +217,10 @@ s_tip:    dq 0
 s_from:   dq 0
 s_htidx:  dq 0     ; stable copy of ht_idx (a callee clobbers r15; store it once)
 s_txid:   times 32 db 0 ; inbound tx's computed BIP141 txid
+s_gdbh:   times 32 db 0 ; STO-10: hash of the block getdata is about to send
+s_gdlen:  dq 0          ; STO-10: node_serve_block's length across the block_hash call
+                        ; (its OWN slot, not s_n: s_n is the getheaders/cfilter
+                        ;  counter and aliasing it here would be a latent trap)
 s_st:     dq 0     ; stable copy of the store context (r14 also at risk)
 s_fd:     dq 0     ; stable copy of the peer fd (r12 at risk: cons_verify clobbers it)
 s_lfd:    dq 0     ; stable copy of the log fd (r13 at risk)
@@ -1091,6 +1095,45 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     test rax, rax
     jle  .gd_miss
+    ; ---- STO-10 (audit 2026-09-03): SERVE THE BLOCK THAT WAS ASKED FOR -----
+    ; ht_idx maps hash -> height and was built when this process started.
+    ; serve_idx_topup only ADDS heights >= g_htidx_next, so a child forked
+    ; before a reorg still maps the LOSING branch's hashes to fork+1..old_tip
+    ; and never learns the replacements. The lookup above then succeeds with a
+    ; stale height and node_serve_block happily returns whatever block now
+    ; occupies it -- the WRONG block for the requested hash. Core drops a
+    ; block it did not request and may score the peer for it.
+    ;
+    ; Hashing the block we are about to send and comparing it to the requested
+    ; hash makes that impossible, whatever the index believes. It is the
+    ; audit's second suggestion rather than its first (a generation counter in
+    ; shared status) because it is FAIL-CLOSED and self-contained: it needs no
+    ; cross-process protocol, and it also catches an index/archive
+    ; disagreement arising from anything other than a reorg.
+    ;
+    ; Cost is one sha256d over the 80-byte header, against sending up to 8 MB.
+    ; A mismatch falls into .gd_miss, which is the notfound path -- exactly
+    ; what an honest node says when it cannot serve what was asked.
+    mov  [s_ptr], rbx
+    mov  [s_gdlen], rax         ; node_serve_block's length, across the call
+    lea  rdi, [s_gdbh]
+    lea  rsi, [sb_buf]
+    call block_hash
+    mov  rbx, [s_ptr]
+    mov  rax, [s_gdlen]
+    ; memcmp(s_gdbh, rbx+4, 32) -- four qword compares, no call
+    mov  rcx, [s_gdbh]
+    cmp  rcx, [rbx+4]
+    jne  .gd_miss
+    mov  rcx, [s_gdbh+8]
+    cmp  rcx, [rbx+12]
+    jne  .gd_miss
+    mov  rcx, [s_gdbh+16]
+    cmp  rcx, [rbx+20]
+    jne  .gd_miss
+    mov  rcx, [s_gdbh+24]
+    cmp  rcx, [rbx+28]
+    jne  .gd_miss
     ; BIP144: a bare MSG_BLOCK (witness flag 0x40000000 CLEAR) from a strict
     ; pre-segwit peer wants the STRIPPED serialization -- it cannot parse the
     ; segwit marker/flag bytes in the full form. The type u32 is still at
