@@ -3,10 +3,34 @@
 Scoping report, 2026-09-04. Companion to `CODEBASE_AUDIT_2026-09-03.md`
 (NET-10, MEDIUM) and `AUDIT_2026-09-03_REMEDIATION.md`.
 
-**Status: scoped, not started.** This is the last open MEDIUM. It is a design
-change to the file that decides who this node connects to, and the failure
-mode of getting it wrong is the very thing the finding is about — an eclipse.
-It wants its own branch and its own review.
+**Status: CLOSED (`6e31e58`), Phase 1 as recommended below.** The format bump and
+the three rules are in, with the negative control reproducing the finding.
+This document is kept as the reasoning behind the design; the sections below
+were written before the change and describe why it had to be shaped this way.
+
+What landed, against §4.3's list:
+
+1. **Source-netgroup cap** — `AB2_SRC_CAP` = `AB2_MAX/16`, the same share Core
+   gives one source group (64 of 1024 new buckets). The source reaches the
+   book through a weak `txr_source_group_fd(fd)` that `main.c` supplies,
+   mirroring `txr_report_violation_fd`, and rides to `ab2_add_from` inside the
+   existing `ai_quota_t` — so 66 of the 68 `ab2_*` call sites were untouched.
+2. **A tried flag eviction never touches** — and if every entry is tried the
+   insert is refused rather than dropping a peer we have connected to.
+3. **Eviction by (tried, terrible, age)** — "terrible" is unseen for a
+   fortnight, consulted only for untried entries, so a gossiped timestamp can
+   never condemn a peer we actually connected to.
+
+Two deliberate omissions, both argued below and unchanged:
+
+* **Test-before-evict stays out** (§5): it needs a connection attempt inside
+  the insert path, which this forked, file-backed design has nowhere to put.
+* **`DL_POOL_V4_WINDOW` stays in `dl_pool_from_book`.** §2 argued a real
+  `tried` table would let the dialer drop the positional heuristic. It can
+  now — the v2→v3 upgrade marks exactly that head tried — but the window is
+  harmless once the head cannot be evicted, and changing what this node dials
+  is a separate change with its own failure mode. Left as a follow-up, no
+  longer load-bearing for security.
 
 ---
 
