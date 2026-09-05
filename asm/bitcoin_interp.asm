@@ -581,6 +581,26 @@ script_eval:
     mov   rax, SCRIPT_ERR_STACK_SIZE
     jmp   .err_ret0
 .not_push:
+    ; IR-8 (INTERP_REVIEW_2026-09-05) -- Core, EvalScript, placed BEFORE the
+    ; fExec gate so it fires even in an unexecuted branch:
+    ;   if (opcode == OP_CODESEPARATOR && sigversion == SigVersion::BASE &&
+    ;       (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE))
+    ;       return set_error(serror, SCRIPT_ERR_OP_CODESEPARATOR);
+    ; Policy only (CONST_SCRIPTCODE is a STANDARD flag, not a block flag), but
+    ; without it a legacy tx carrying 0xab in an OP_IF branch entered the
+    ; mempool and was relayed where Core refuses it.
+    mov   rax, [rbp-0x38]
+    cmp   rax, OP_CODESEPARATOR
+    jne   .cs_const_ok
+    mov   eax, dword [r12+48]        ; sigversion: BASE == 0
+    test  eax, eax
+    jnz   .cs_const_ok
+    mov   rax, [r12+56]
+    test  rax, SCRIPT_VERIFY_CONST_SCRIPTCODE
+    jz    .cs_const_ok
+    mov   rax, SCRIPT_ERR_OP_CODESEPARATOR
+    jmp   .err_ret0
+.cs_const_ok:
     ; if not executing and not IF..ENDIF, skip
     mov   rax, [rbp-0x08]
     test  rax, rax
