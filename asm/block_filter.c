@@ -211,9 +211,25 @@ long bf_basic_build(const unsigned char* block, unsigned long blocklen,
     }
 
     /* de-duplicate AFTER hashing: BIP158 de-duplicates the element set, and
-     * SipHash is injective enough here that equal hashes with the same key
-     * mean equal scripts for any realistic block. Sort first anyway (the
-     * encoding needs sorted values), then drop equal neighbours. */
+     * STO-14 (audit 2026-09-03): this dedups on the 64-bit SIPHASH, where
+     * Core's GCSFilter dedups the byte-wise ELEMENT SET before hashing.
+     *
+     * The difference is observable only when two DISTINCT scripts in one
+     * block collide on 64 bits: N would then be one less than Core's, and
+     * since N scales the Golomb-Rice range (N * 784931 below), the entire
+     * filter would differ -- not one entry. Probability is ~n^2 / 2^65 per
+     * block; at a few thousand elements that is around 2^-40.
+     *
+     * DELIBERATELY NOT "FIXED". Byte-wise dedup means collecting every
+     * element as a (pointer, length) pair, sorting by content and comparing
+     * with memcmp, inside filter generation -- a KAT-backed path whose output
+     * peers consume. Rewriting it to avoid a 2^-40 event is a worse trade
+     * than carrying the divergence knowingly, so it is recorded here and in
+     * docs/FEATURE_GAPS.md rather than left as an unstated caveat on the
+     * "byte-identical to Core" claim.
+     *
+     * Sort first anyway (the encoding needs sorted values), then drop equal
+     * neighbours. */
     {
         /* map to [0, N*M) -- but N is the DE-DUPLICATED count, so dedup the
          * raw hashes first, then map. Dedup on the raw 64-bit hash. */

@@ -208,6 +208,28 @@ int wallet_ecdsa_sign(uint64_t out_r[4], uint64_t out_s[4],
 
     be32_to_limbs(d, priv_be);
     be32_to_limbs(z, z_be);
+    /* CRY-7 (audit 2026-09-03): REDUCE z mod n before it reaches sc_add.
+     *
+     * sc_add's contract is that both operands are already < n; z comes
+     * straight from a 32-byte message hash, which exceeds n with probability
+     * ~2^-128. Astronomically unlikely, but the consequence is not a wrong
+     * answer that fails loudly -- it is a signature computed from a
+     * mis-reduced scalar, which simply does not verify, on a path with no
+     * way to tell that from an ordinary failure. One conditional subtract
+     * removes the case. */
+    if (limb_cmp(z, N_LIMBS) >= 0) {
+        uint64_t c = 0;
+        for (int i = 0; i < 4; i++) {
+            uint64_t t = z[i] - N_LIMBS[i] - c;
+            c = (z[i] < N_LIMBS[i] + c) ? 1 : 0;
+            z[i] = t;
+        }
+    }
+    /* CRY-7: k == 0 makes k^-1 meaningless and R the point at infinity. The
+     * nonce is sha256d output, so this is ~2^-256 -- but an unchecked zero
+     * would produce a garbage signature rather than a refusal, and refusing
+     * is free. */
+    if ((k[0] | k[1] | k[2] | k[3]) == 0) return 0;
 
     /* R = k*G (Jacobian 12 limbs) -- CONSTANT TIME in k (FINDING 1) */
     point_scalar_mul_ct(R, G_AFF, k);
@@ -233,6 +255,12 @@ int wallet_ecdsa_sign(uint64_t out_r[4], uint64_t out_s[4],
     sc_inv(k, k);               /* k^-1 */
     sc_mul(out_s, zrd, k);
     memcpy(out_r, r, 32);
+
+    /* CRY-7: r == 0 or s == 0 is not a valid ECDSA signature -- Core's
+     * verifier rejects both, so emitting one would produce a transaction that
+     * cannot be spent. Each is ~2^-256; the check is two ORs. */
+    if ((r[0] | r[1] | r[2] | r[3]) == 0) return 0;
+    if ((out_s[0] | out_s[1] | out_s[2] | out_s[3]) == 0) return 0;
 
     /* low-S normalization: if s > n/2 then s = n - s */
     if (limb_cmp(out_s, N_HALF) > 0) {

@@ -1572,6 +1572,23 @@ static const u8* g_txi_tail;
 static u64 g_txi_tail_sz;          /* mapped size, bytes (whole records only) */
 static long g_txi_tail_maxh = -1;  /* highest height among mapped records */
 
+/* RPX-8 (audit 2026-09-03): the txid-index coverage range, in one place.
+ *
+ * getrawtransaction and gettxoutproof both tell a caller which heights the
+ * index covers when a lookup misses, because "not found" from a PARTIAL index
+ * is a different fact from "not found" on the whole chain. The two had
+ * near-identical copies of the range computation and the wording, which is a
+ * maintenance hazard exactly where accuracy matters: if the coverage rule ever
+ * changed, one of them would keep saying the old thing.
+ *
+ * The MESSAGES stay separate -- Core's texts differ between the two methods
+ * and each names what its own caller should do -- but the range they quote now
+ * comes from one function. */
+static long txi_coverage_to(void){
+    return g_txi_tail_maxh > g_txi_to ? g_txi_tail_maxh : g_txi_to;
+}
+
+
 static void txi_tail_refresh(void){
     struct stat sb;
     if (stat("txindex.tail", &sb) != 0 || (u64)sb.st_size < TXI_REC) return;
@@ -1829,7 +1846,7 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
                  * covers: "not found" from a PARTIAL index is a different
                  * fact from "not found" on the whole chain, and a caller who
                  * cannot tell them apart will draw the wrong conclusion. */
-                long cov_to = g_txi_tail_maxh > g_txi_to ? g_txi_tail_maxh : g_txi_to;
+                long cov_to = txi_coverage_to();     /* RPX-8 */
                 snprintf(nomsg, sizeof nomsg,
                          "No such mempool or blockchain transaction. The txid index "
                          "covers heights %ld..%ld; if the transaction is outside that "
@@ -2279,7 +2296,7 @@ static int cmd_gettxoutproof(const rj_val* params, rj_val** res, long* ec, const
             txi_open();
             if (g_txi){
                 static char nomsg[288];
-                long cov_to = g_txi_tail_maxh > g_txi_to ? g_txi_tail_maxh : g_txi_to;
+                long cov_to = txi_coverage_to();     /* RPX-8 */
                 snprintf(nomsg, sizeof nomsg,
                          "Transaction not found in the txid index (covers heights %ld..%ld); "
                          "if the transaction is outside that range, rebuild the index over it "
