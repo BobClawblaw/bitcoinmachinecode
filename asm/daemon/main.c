@@ -1320,6 +1320,33 @@ static void serve_violation_report(const char* reason){
 /* audit 2026-09-02 N3: the download worker's legs report by fd (tx_relay.c
  * declares this weak; the daemon supplies it). Map the fd to its leg's
  * "host:port", strip the port, and score it like a serve-side violation. */
+static void ctl_ip_only(const char* hostport, char* out, size_t cap);   /* defined below */
+extern unsigned net_netgroup_v4(unsigned ip);                          /* daemon/net_policy.c */
+
+/* NET-10: which source netgroup is the peer on this fd? Same fd -> leg
+ * "host:port" map the violation hook below uses. IPv4 gets Core's /16
+ * grouping (net_netgroup_v4); anything else -- onion, i2p, cjdns, or a host
+ * we cannot parse -- gets a hash of the host string with the top bit set, so
+ * it is stable per source and cannot collide with a /16 value. 0 means
+ * "unknown", which ab2_add_from never caps. */
+unsigned txr_source_group_fd(int fd){
+    for(int k = 0; k < mux_n_out; k++){
+        if(mux_out_fd[k] != fd) continue;
+        char ip[128]; ctl_ip_only(mux_out_host[k], ip, sizeof ip);
+        if(!ip[0]) return 0;
+        unsigned o0, o1, o2, o3;
+        if(sscanf(ip, "%u.%u.%u.%u", &o0, &o1, &o2, &o3) == 4 && o0 < 256 && o1 < 256 && o2 < 256 && o3 < 256){
+            unsigned v4 = o0 | (o1 << 8) | (o2 << 16) | (o3 << 24);   /* byte 0 = first octet */
+            unsigned g = net_netgroup_v4(v4);
+            return g ? g : 1u;                 /* never hand back 0 = "unknown" */
+        }
+        unsigned h = 2166136261u;
+        for(const char* p = ip; *p; p++){ h ^= (unsigned char)*p; h *= 16777619u; }
+        return h | 0x80000000u;
+    }
+    return 0;
+}
+
 void txr_report_violation_fd(int fd, const char* reason){
     for(int k = 0; k < mux_n_out; k++){
         if(mux_out_fd[k] != fd) continue;

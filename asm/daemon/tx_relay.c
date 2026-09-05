@@ -863,6 +863,12 @@ extern long p2p_addr_count(const void* pl, long plen);
  * table and the shared misbehaviour table, so it supplies the strong
  * definition. A weak reference resolves to NULL in the standalone tests. */
 extern void txr_report_violation_fd(int fd, const char* reason) __attribute__((weak));
+/* NET-10: the netgroup of the peer on this fd, so ingested addresses can be
+ * attributed to their source and capped. Weak, and supplied by the daemon
+ * exactly like the violation hook above; 0 (never capped) when absent. */
+extern unsigned txr_source_group_fd(int fd) __attribute__((weak));
+extern long addr_ingest_msg_vg(void* ab, const char* cmd, const unsigned char* pl, long plen,
+                               long limit, int* viol, unsigned src_group) __attribute__((weak));
 #define TXR_ADDR_VIOL_REASON "malformed addr/addrv2 payload or count above MAX_ADDR_TO_SEND"
 /* weak default: targets that link tx_relay.c without daemon/addr_ingest.c
  * (a strong definition anywhere in the link wins) */
@@ -919,7 +925,9 @@ static long txr_addr_ingest(int fd, const char* cmd, const u8* pl, unsigned plen
     else txr_addr_gossip_limited += n - budget;         /* the tail Core would drop too */
     *tk -= (double)budget;
     int viol = 0;
-    long added = addr_ingest_msg_v(NULL, cmd, pl, (long)plen, budget, &viol);
+    unsigned srcg = txr_source_group_fd ? txr_source_group_fd(fd) : 0u;      /* NET-10 */
+    long added = addr_ingest_msg_vg ? addr_ingest_msg_vg(NULL, cmd, pl, (long)plen, budget, &viol, srcg)
+                                    : addr_ingest_msg_v(NULL, cmd, pl, (long)plen, budget, &viol);
     if (viol && txr_report_violation_fd) txr_report_violation_fd(fd, TXR_ADDR_VIOL_REASON);
     txr_addr_gossip_msgs++;
     if (added > 0) txr_addr_gossip_added += added;
