@@ -2251,6 +2251,15 @@ exactly that moment. It is now annotated as inert at the line itself.
 
 ### Accepted risks, closed
 
+**08-29 #11 / 09-02 N5 — systemd unit not in version control.** The hardening
+itself is applied and verified on the host (`LimitCORE=0`, `NoNewPrivileges`,
+`ProtectSystem=full`, `ProtectHome=read-only`, `PrivateTmp`; `Max core file
+size 0` on the running process, 2026-09-05). The unit file stays a local
+deployment artifact by operator decision and is deliberately not vendored;
+`docs/OPERATIONS.md`'s reference unit carries the same block so a node built
+from the docs is hardened. Closed by decision, 2026-09-05 —
+`releases/2026-09-05-audits-closed.md`. Do not re-file.
+
 **CRY-8 — AES timing and the lazy S-box.** The inverse S-box is built lazily
 through an idempotent racy write (benign on x86: every writer stores the same
 bytes), and both the S-box lookups and the PKCS#7 padding check are
