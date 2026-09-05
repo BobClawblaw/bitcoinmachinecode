@@ -121,8 +121,32 @@ static int wl_entry_has(const char* list, const char* method){
     }
     return 0;
 }
+/* RPC-14 (audit 2026-09-03): Core's effective default is
+ *   g_rpc_whitelist_default = GetBoolArg("-rpcwhitelistdefault",
+ *                                        !GetArgs("-rpcwhitelist").empty())
+ * -- i.e. an EXPLICIT -rpcwhitelistdefault wins, and otherwise the default is
+ * "deny users with no entry" exactly when some whitelist exists.
+ * g_wl_default is -1 when unset, 0 or 1 when given. */
+static int wl_default_effective(void){
+    return g_wl_default >= 0 ? g_wl_default : (g_wl_n > 0);
+}
+/* RPC-14: does this user have a whitelist entry at all? Core's
+ * `user_has_whitelist`, which it tests BEFORE parsing the body. */
+int rpc_whitelist_user_has(const char* user){
+    for (int i = 0; i < g_wl_n; i++)
+        if (!strcmp(g_wl[i].user, user ? user : "")) return 1;
+    return 0;
+}
+int rpc_whitelist_denies_everything(const char* user){
+    return !rpc_whitelist_user_has(user) && wl_default_effective();
+}
 int rpc_whitelist_allows(const char* user, const char* method){
-    if (g_wl_n == 0) return 1;
+    /* RPC-14: this used to `return 1` whenever no -rpcwhitelist entry existed,
+     * which FAILS OPEN. With -rpcwhitelistdefault=1 and no entries Core denies
+     * EVERY user ("not allowed to call any methods"); this node allowed
+     * everyone -- on a configuration an operator would reasonably read as the
+     * strictest one available. */
+    if (g_wl_n == 0) return !wl_default_effective();
     int seen = 0;
     for (int i = 0; i < g_wl_n; i++){
         if (strcmp(g_wl[i].user, user ? user : "")) continue;
@@ -131,7 +155,7 @@ int rpc_whitelist_allows(const char* user, const char* method){
     }
     if (seen) return 1;
     /* no whitelist for this user: Core denies unless rpcwhitelistdefault=0 */
-    return g_wl_default == 0;
+    return !wl_default_effective();
 }
 
 /* ---- -rpccookieperms ---- */
@@ -466,6 +490,14 @@ static int wl_forbidden(const char* user, const char* body, size_t blen){
     /* -rpcwhitelist: Core answers HTTP 403 with an empty body when the
      * authenticated user may not call the method. Checked on the raw body
      * before parsing so a forbidden call never reaches the dispatcher. */
+    /* RPC-14: Core tests `user_has_whitelist` FIRST and answers 403 before it
+     * parses anything -- a user with no entry is not allowed to call ANY
+     * method, so the body is irrelevant. This node parsed first and only
+     * forbade a well-formed object naming a disallowed method, so the same
+     * user sending an unparseable body, or an object whose `method` is
+     * missing or not a string, got a parse/-32600 error instead of the 403
+     * Core sends. Same verdict for every body now, decided before the parse. */
+    if (rpc_whitelist_denies_everything(user)) return 1;
     if (g_wl_n == 0) return 0;
     rj_val* req = rj_parse(body, blen);
     if (!req) return 0;

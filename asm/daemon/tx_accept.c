@@ -525,7 +525,15 @@ static long txacc_sigop_cost(void* mp_area, const u8* tx, unsigned long txlen){
         }
     }
 
-    long cost = tx_legacy_sigops(tx, txlen) * 4;
+    /* SCR-10: tx_legacy_sigops now bounds every read and returns -1 on a
+     * truncated or malformed transaction. Treating that as a reject rather
+     * than as a cost keeps the sigop limit fail-CLOSED: a 0 would have said
+     * "no sigops" and passed the budget. This path already parsed the
+     * transaction above, so -1 is unreachable here today -- which is exactly
+     * why it must not be silently absorbed if that ever stops being true. */
+    long legacy_sigops = tx_legacy_sigops(tx, txlen);
+    if (legacy_sigops < 0) return -1;
+    long cost = legacy_sigops * 4;
     for (u64 i = 0; i < nin; i++){
         u64 v, h, cb; const u8* spk; unsigned long spkl;
         if (!txacc_resolve_verify(mp_area, in[i].prev, in[i].idx, &v, &h, &cb, &spk, &spkl))

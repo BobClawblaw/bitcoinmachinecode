@@ -65,6 +65,12 @@ int  rpc_whitelist_add(const char* spec);
 void rpc_whitelist_set_default(int deny_unlisted);   /* -1 = Core's rule */
 void rpc_whitelist_clear(void);
 int  rpc_whitelist_allows(const char* user, const char* method);
+/* RPC-14: Core's `user_has_whitelist` and its pre-parse "no methods at all"
+ * verdict. rpc_whitelist_denies_everything() is true when the user has no
+ * entry AND the effective -rpcwhitelistdefault denies -- answer 403 without
+ * looking at the body, as Core does. */
+int  rpc_whitelist_user_has(const char* user);
+int  rpc_whitelist_denies_everything(const char* user);
 /* -rpccookieperms: 0 owner (0600), 1 group (0640), 2 all (0644). */
 void rpc_cookie_set_perms(int perms);
 

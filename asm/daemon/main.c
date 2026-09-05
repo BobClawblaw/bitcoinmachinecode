@@ -6093,7 +6093,14 @@ static void serve_rpc_read_creds(const char* cfgpath, int* port,
  * resolve. A LOWER BOUND, documented in PARITY_PLAN; never fabricated. */
 static long gbt_sigops_legacy4(const unsigned char* tx, unsigned long len){
     extern long tx_legacy_sigops(const unsigned char*, unsigned long);
-    return tx_legacy_sigops(tx, len) * 4;
+    long n = tx_legacy_sigops(tx, len);
+    /* SCR-10: -1 means the transaction did not parse. Every transaction in a
+     * template came from the mempool and was parsed to get there, so this is
+     * unreachable; it is clamped rather than propagated because "sigops" is a
+     * COUNT in the template JSON and a negative one would be a worse lie than
+     * a zero. The clamp is about the field's type, not a judgment that the
+     * transaction is fine. */
+    return n < 0 ? 0 : n * 4;
 }
 
 /* wallet-encryption glue: the live seed the RPC wallet points at, and the
