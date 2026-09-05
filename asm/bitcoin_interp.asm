@@ -2606,7 +2606,9 @@ is_opsuccess:
 ; tail-calls into the rax-based is_opsuccess logic above. Used by C harnesses.
 global is_opsuccess_c
 is_opsuccess_c:
-    mov   rax, rdi
+    mov   eax, edi            ; IR-12: the argument is a C `int`; SysV leaves the
+                              ; upper 32 bits of rdi undefined, and is_opsuccess
+                              ; compares all 64 bits of rax. Zero-extend.
     jmp   is_opsuccess
 
 ; ============================================================================
@@ -2820,10 +2822,31 @@ interp_sig_encoding_ok:
     movzx ecx, byte [rdi+3]
     movzx r8d, byte [rdi+5+rcx]      ; lenS
     cmp   r8d, 33
-    je    .sigenc_highs
+    je    .sigenc_s33
     cmp   r8d, 32
     jb    .sigenc_ht
     lea   r9, [rdi+6+rcx]            ; S, 32 bytes big-endian
+    jmp   .sigenc_s_n
+.sigenc_s33:
+    lea   r9, [rdi+7+rcx]            ; 33-byte S: skip the 0x00 pad (strict DER holds)
+.sigenc_s_n:
+    ; IR-13 (INTERP_REVIEW_2026-09-05): Core's CheckLowS lax-parses the
+    ; signature, and an S >= N overflows to a ZERO signature -- which is not
+    ; high -- so Core never reports SIG_HIGH_S for it; verification then
+    ; fails and NULLFAIL/false is what surfaces. Compare against N first and
+    ; fall through to the same path for S >= N.
+    lea   rcx, [rel order_n]
+    xor   r8d, r8d
+.sigenc_ncmp:
+    movzx eax, byte [r9+r8]
+    cmp   al, byte [rcx+r8]
+    jb    .sigenc_below_n
+    ja    .sigenc_ht                 ; S > N
+    inc   r8d
+    cmp   r8d, 32
+    jb    .sigenc_ncmp
+    jmp   .sigenc_ht                 ; S == N
+.sigenc_below_n:
     lea   rcx, [rel half_order_n]
     xor   r8d, r8d
 .sigenc_cmp:
@@ -2860,6 +2883,9 @@ interp_sig_encoding_ok:
 ; IsLowDERSignature). Read-only data kept next to its only reader.
 half_order_n: db 0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
               db 0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
+; secp256k1 group order N, big-endian (IR-13: the S >= N comparison)
+order_n: db 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE
+         db 0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41
 
 ; interp_pubkey_encoding_ok(rdi = publen, rsi = pubdata) -> rax = 1 ok / 0 = the
 ; script must fail with SCRIPT_ERR_PUBKEYTYPE. r12 = script_state.
