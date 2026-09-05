@@ -14,15 +14,16 @@ Two things are **not** closed, and neither is a defect:
 - **Hand-written consensus assembly** (08-30 Finding 3) is a standing property
   of the codebase, answered continuously by the C↔asm differentials and the
   gate, not by a patch.
-- **`LimitCORE`/systemd hardening** — **verified on the host, 2026-09-05**
+- **`LimitCORE`/systemd hardening** — **closed by operator decision, 2026-09-05: the
+  unit is a local deployment concern and is deliberately not vendored into this
+  repository.** Do not re-raise it as a project gap. Verified on the host the
+  same day
   during the deploy-a rollout: `systemctl show` gives `LimitCORE=0`,
   `NoNewPrivileges=yes`, `ProtectSystem=full`, `ProtectHome=read-only`,
   `PrivateTmp=yes` (the base unit's `LimitCORE=infinity` is overridden by the
   `50-hardening.conf` drop-in), and the running process shows
-  `Max core file size 0`. The 09-03 audit's closure was correct. What remains
-  is not a security gap but a provenance one: **no `.service` unit is in this
-  repository**, so the hardening cannot be reviewed or regression-checked from
-  the tree — it lives only in `/etc/systemd/system/`.
+  `Max core file size 0`. The 09-03 audit's closure was correct. The unit lives
+  only in `/etc/systemd/system/` and its four drop-ins, by choice.
 
 Milestone tags: `audit-2026-09-03-all-closed`,
 `interp-review-2026-09-05-complete`.
