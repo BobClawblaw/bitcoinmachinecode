@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <time.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -753,20 +754,37 @@ static long crt_varint(unsigned char* o, unsigned long long v){
 /* Build the unsigned tx (empty scriptSigs) shared by createrawtransaction and
  * createpsbt. Fills tx (cap >= 131072), sets *out_n / *out_nin / *out_nout.
  * Returns 1, or 0 with *ec / *em. */
-static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long* out_n,
+/* `cap` is the size of `tx`. RPX-5 (audit 2026-09-03): this function wrote into
+ * a 131072-byte caller buffer with NO capacity check anywhere -- safe only
+ * because every field it emitted was itself capped, which the OP_RETURN change
+ * below removes. The bound is now explicit and covers the inputs too, so a
+ * request with enough of them cannot run off the end either. */
+#define CRT_NEED(k) do{ if ((long)(k) < 0 || n + (long)(k) > cap){ \
+        *ec=-8; *em="Transaction too large for this node's builder"; return 0; } }while(0)
+static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long cap, long* out_n,
                               size_t* out_nin, size_t* out_nout, long* ec, const char** em){
     if (!params || params->typ!=RJ_ARR || params->nitems<2 || params->items[0]->typ!=RJ_ARR){
         *ec=-8; *em="Invalid parameters, expected an inputs array and outputs"; return 0; }
     const rj_val* ins = params->items[0];
     const rj_val* outs = params->items[1];
-    long locktime=0;
-    if (params->nitems>=3 && params->items[2]->typ==RJ_NUM) locktime=strtol(params->items[2]->str,0,10);
+    long long locktime=0;
+    if (params->nitems>=3 && params->items[2]->typ==RJ_NUM){
+        /* RPX-6 (audit 2026-09-03): this was strtol with no bounds, so a value
+         * outside [0, 0xffffffff] was silently truncated to 32 bits and a
+         * negative wrapped. Core errors instead. */
+        errno = 0;
+        char* lend = 0;
+        locktime = strtoll(params->items[2]->str, &lend, 10);
+        if (errno == ERANGE || (lend && *lend) || locktime < 0 || locktime > 0xffffffffLL){
+            *ec=-8; *em="Invalid parameter, locktime out of range"; return 0; }
+    }
     int replaceable=1;   /* modern Core defaults to opt-in RBF (replaceable=true) */
     if (params->nitems>=4 && params->items[3]->typ==RJ_BOOL) replaceable=(params->items[3]->str[0]=='1');
     unsigned long defseq = replaceable ? 0xfffffffdUL : (locktime!=0 ? 0xfffffffeUL : 0xffffffffUL);
 
     long n=0;
     tx[n++]=2; tx[n++]=0; tx[n++]=0; tx[n++]=0;                 /* version 2 LE */
+    CRT_NEED(9);
     n += crt_varint(tx+n, (unsigned long long)ins->nitems);
     for (size_t i=0;i<ins->nitems;i++){
         const rj_val* in=ins->items[i];
@@ -776,6 +794,7 @@ static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long* out
             *ec=-8; *em="Invalid parameter, missing/invalid txid or vout"; return 0; }
         unsigned char id[32];
         if (!hex_to_bytes(id,tid->str,64)){ *ec=-8; *em="txid must be hexadecimal string"; return 0; }
+        CRT_NEED(32+4+1+4);
         for (int k=0;k<32;k++) tx[n+k]=id[31-k];               /* display -> wire */
         n+=32;
         unsigned long vo=strtoul(vout->str,0,10);
@@ -791,6 +810,7 @@ static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long* out
     if (outs->typ==RJ_OBJ){ omem=outs->members; onm=outs->nmembers; }
     else if (outs->typ==RJ_ARR){ oarr=outs; onm=outs->nitems; }
     else { *ec=-8; *em="Invalid parameter, expected outputs object or array"; return 0; }
+    CRT_NEED(9);
     n += crt_varint(tx+n, (unsigned long long)onm);
     for (size_t i=0;i<onm;i++){
         const char* key; const rj_val* val;
@@ -801,22 +821,65 @@ static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long* out
         if (!strcmp(key,"data")){
             if (val->typ!=RJ_STR){ *ec=-8; *em="Data is not a valid hex-encoded value"; return 0; }
             size_t dl=strlen(val->str); if (dl&1){ *ec=-8; *em="Data hex has odd length"; return 0; }
-            size_t db=dl/2; if (db>80){ *ec=-8; *em="Data too long for OP_RETURN"; return 0; }
-            unsigned char data[80]; if (db && !hex_to_bytes(data,val->str,dl)){ *ec=-8; *em="Invalid data hex"; return 0; }
+            /* RPX-5 (audit 2026-09-03): the 80-byte cap was wrong HERE. Core's
+             * createrawtransaction builds OP_RETURN <data> for any size --
+             * the 80-byte limit is RELAY POLICY, enforced when a transaction
+             * is accepted, not by the builder. A raw tx Core will happily
+             * construct (to be signed or inspected offline) was refused.
+             *
+             * The bound is now the caller's buffer, which is what actually
+             * constrains us, and the push opcode widens with the data:
+             * direct push to 75, PUSHDATA1 to 255, PUSHDATA2 beyond. The old
+             * code emitted PUSHDATA1 for anything over 75 and would have
+             * written a truncated length byte past 255 -- unreachable then
+             * because of the cap it is paired with, which is exactly why both
+             * change together. */
+            size_t db=dl/2;
+            long pfx = (db<=75) ? 1 : (db<=255 ? 2 : 3);
+            CRT_NEED(8 + 9 + 1 + pfx + (long)db);
+            unsigned char* data = (unsigned char*)malloc(db ? db : 1);
+            if (!data){ *ec=-7; *em="oom"; return 0; }
+            if (db && !hex_to_bytes(data,val->str,dl)){ free(data); *ec=-8; *em="Invalid data hex"; return 0; }
             for (int k=0;k<8;k++) tx[n++]=0;                   /* value 0 */
-            unsigned char spk[100]; long sl=0; spk[sl++]=0x6a; /* OP_RETURN */
-            if (db<=75){ spk[sl++]=(unsigned char)db; } else { spk[sl++]=0x4c; spk[sl++]=(unsigned char)db; }
+            unsigned char* spk = (unsigned char*)malloc((size_t)pfx + 1 + db);
+            if (!spk){ free(data); *ec=-7; *em="oom"; return 0; }
+            long sl=0; spk[sl++]=0x6a;                          /* OP_RETURN */
+            if (db<=75){ spk[sl++]=(unsigned char)db; }
+            else if (db<=255){ spk[sl++]=0x4c; spk[sl++]=(unsigned char)db; }
+            else { spk[sl++]=0x4d; spk[sl++]=(unsigned char)(db&0xff); spk[sl++]=(unsigned char)(db>>8); }
             memcpy(spk+sl,data,db); sl+=db;
             n+=crt_varint(tx+n,(unsigned long long)sl); memcpy(tx+n,spk,sl); n+=sl;
+            free(spk); free(data);
         } else {
             long long sat=(val->typ==RJ_NUM)?crt_amount_to_sat(val->str):-1;
             if (sat<0){ *ec=-3; *em="Invalid amount"; return 0; }
             unsigned char spk[40]; long sl=crt_addr_to_spk(key,spk);
             if (sl==0){ static char e[128]; snprintf(e,sizeof e,"Invalid Bitcoin address: %s",key); *ec=-5; *em=e; return 0; }
+            /* RPX-6 (audit 2026-09-03): Core rejects a repeated address. The
+             * OBJECT form cannot express one (JSON keys are unique after the
+             * parser), but the ARRAY-of-single-key-objects form can, and this
+             * emitted the output twice. Quadratic over the outputs, which is
+             * what Core does too and is nothing beside the per-output address
+             * decode above. Only addresses are compared: several `data`
+             * outputs are legal, in Core as here. */
+            for (size_t q=0;q<i;q++){
+                const char* pk;
+                if (omem) pk=omem[q].key;
+                else { const rj_val* pe=oarr->items[q];
+                       if (pe->typ!=RJ_OBJ||pe->nmembers<1) continue;
+                       pk=pe->members[0].key; }
+                if (!strcmp(pk,"data")) continue;
+                if (!strcmp(pk,key)){
+                    static char e2[160];
+                    snprintf(e2,sizeof e2,"Invalid parameter, duplicated address: %s",key);
+                    *ec=-8; *em=e2; return 0; }
+            }
+            CRT_NEED(8 + 9 + sl);
             for (int k=0;k<8;k++) tx[n++]=(unsigned char)((unsigned long long)sat>>(8*k));
             n+=crt_varint(tx+n,(unsigned long long)sl); memcpy(tx+n,spk,sl); n+=sl;
         }
     }
+    CRT_NEED(4);
     tx[n++]=(unsigned char)locktime;tx[n++]=(unsigned char)(locktime>>8);tx[n++]=(unsigned char)(locktime>>16);tx[n++]=(unsigned char)(locktime>>24);
     *out_n=n; *out_nin=ins->nitems; *out_nout=onm;
     return 1;
@@ -824,7 +887,7 @@ static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long* out
 
 static int cmd_createrawtransaction(const rj_val* params, long* ec, const char** em, rj_val** result){
     static unsigned char tx[131072]; long n; size_t nin, nout;
-    if (!crt_build_unsigned(params, tx, &n, &nin, &nout, ec, em)) return 0;
+    if (!crt_build_unsigned(params, tx, (long)sizeof tx, &n, &nin, &nout, ec, em)) return 0;
     char* hex=malloc((size_t)n*2+1); if (!hex){ *ec=-7; *em="oom"; return 0; }
     bin_to_hex(hex,tx,(size_t)n); *result=rj_str(hex); free(hex);
     return 1;
@@ -867,7 +930,7 @@ static int psbt_version_arg(const rj_val* params, unsigned long idx, int* ver, l
 static char* psbt_wrap_version(const unsigned char* tx, long n, size_t nin, size_t nout, int ver);
 static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     static unsigned char tx[131072]; long n; size_t nin, nout;
-    if (!crt_build_unsigned(params, tx, &n, &nin, &nout, ec, em)) return 0;
+    if (!crt_build_unsigned(params, tx, (long)sizeof tx, &n, &nin, &nout, ec, em)) return 0;
     if (params->nitems >= 5 && params->items[4]->typ == RJ_NUM){                /* Core: tx version */
         long v = strtol(params->items[4]->str, 0, 10);
         if (v < 1 || v > 0x7fffffffL){ *ec = -8; *em = "Invalid parameter, version must be between 1 and 2147483647"; return 0; }
