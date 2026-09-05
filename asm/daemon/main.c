@@ -8178,6 +8178,14 @@ int main(int argc, char** argv){
         pid_t dl = fork();
         if(dl==0){
             if(g_txoq_parent >= 0){ close(g_txoq_parent); g_txoq_parent = -1; }
+            /* TXOQ-1 (2026-09-05 benchmark): register the between-block
+             * service hook before the worker's first utxo_live_catchup, so a
+             * long catch-up pass answers gettxout queries at its block
+             * boundaries instead of refusing them all until it returns. */
+            if(g_txoq_worker >= 0){
+                extern void utxo_live_set_apply_hook(void (*)(void));
+                utxo_live_set_apply_hook(txoq_service);
+            }
             serve_download_worker(dir, (const char**)g_seed_hosts, g_n_seed_hosts, g_chainp->default_port);
             _exit(0);
         }

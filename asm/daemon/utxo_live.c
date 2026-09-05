@@ -451,6 +451,24 @@ static int   g_undo_enabled = 1;
  * a plain undo_prune(tip,window) per block is not viable at mainnet depth. */
 static long  g_undo_prune_cursor = 0;
 
+/* TXOQ-1 (2026-09-05 benchmark): between-block quiescent hook -- set once by
+ * the download worker in main.c (txoq_service). Fires in utxo_live_catchup's
+ * per-block loop right after a block is applied AND its checkpoint persisted:
+ * the same kill-safe moment the TEST crash hook uses, and exactly the
+ * quiescence the get()/flush() invariant requires. NULL outside the worker
+ * (tests, tools) -- one pointer load per block, effectively free. */
+static void (*g_utxo_apply_hook)(void) = 0;
+void utxo_live_set_apply_hook(void (*fn)(void)){ g_utxo_apply_hook = fn; }
+
+/* Re-entrancy guard (TXOQ-1): txoq_service -> utxo_live_lsm_get -> (on a run
+ * miss) utxo_lsm_reload, and utxo_live_catchup itself may call reload from
+ * other points. A hook reentry while a reload is already on this stack would
+ * reenter the writer with a query mid-reload -- never serve a query in that
+ * window; the next block boundary is ~0.1s away. One flag set/cleared around
+ * the reload call below; checked by the catchup loop's hook site. */
+static int g_utxo_in_reload = 0;
+int  utxo_live_in_reload(void){ return g_utxo_in_reload; }
+
 /* TEST-ONLY crash injection (default disabled, -1). When armed (>=0),
  * utxo_live_catchup's per-block loop calls _exit(1) the instant `applied`
  * (this call's own count of newly-applied blocks) reaches the armed value --
@@ -2742,7 +2760,7 @@ int utxo_live_init(const char* dir){
      * REPLAYED RECORD COUNT / -1 err (not literally 1) -- different
      * contracts, so they need different success checks. */
     long r = have_prior_state
-        ? utxo_lsm_reload(&g_utxo_lst, g_utxo_table)
+        ? (g_utxo_in_reload = 1, utxo_lsm_reload(&g_utxo_lst, g_utxo_table), g_utxo_in_reload = 0)
         : utxo_lsm_init(&g_utxo_lst);
     /* UTX-2 (audit 2026-09-03): ANY negative reload is fatal, not just -1.
      *
@@ -2990,6 +3008,20 @@ long utxo_live_catchup(void* store_buf){
         }
         UTXO_LIVE_TEST_CRASH_HOOK(applied);
 
+        /* TXOQ-1 (2026-09-05, /mnt/2tbssd bmc-vs-Core benchmark): the quiescent
+         * gettxout service point in main.c fires only AFTER a catch-up call
+         * returns -- but a call runs for minutes on a large gap, so the
+         * parent's 2s query timeout refused every gettxout for the whole pass
+         * ("not ready, retry shortly" for 10+ minutes on a node whose
+         * heartbeat showed a healthy tip-synced set). The same moment the
+         * TEST crash hook above treats as kill-safe is exactly safe for a
+         * query: block h applied AND its checkpoint persisted, no put/del in
+         * flight, still single-threaded within this process (the
+         * get()/flush()-never-overlap invariant holds by construction -- this
+         * is not a thread reentry, it is the same thread pausing between
+         * blocks). A query answered here sees the set as of a committed,
+         * checkpointed block -- never a torn state. */
+        if (g_utxo_apply_hook && !g_utxo_in_reload) g_utxo_apply_hook();
         /* SIGTERM/SIGINT arrived: block h is applied AND checkpointed, so
          * this is a clean boundary. Stop here -- do not start the next block
          * and do not begin a compaction -- and return the count applied so
