@@ -559,6 +559,20 @@ static long archive_index_tip(void){
  *
  * out_height receives the first height to RETAIN; out_detail receives the
  * offending height for the refusal verdicts (-1 otherwise). */
+/* STO-12: Core's MIN_BLOCKS_TO_KEEP. 288 > UTXO_UNDO_WINDOW (200) >
+ * REORG_MAX_DEPTH (100), so this one number subsumes both windows.
+ *
+ * INJECTABLE, and that is not test-only convenience. The prune verdicts are
+ * exercised on a two- or three-block fixture precisely so all five outcomes
+ * can be reached without a 550 MiB archive (see the note in
+ * tests/test_archive_check.c). A hard 288 makes every one of those verdicts
+ * NOTHING -- correct for a two-block archive, and useless for testing the
+ * gate. Lowering the floor lets the suite exercise BOTH the floor itself and
+ * the verdicts it sits in front of. Production never calls the setter. */
+static long g_min_blocks_to_keep = 288;
+void archive_set_min_blocks_to_keep(long n){ g_min_blocks_to_keep = n < 0 ? 0 : n; }
+long archive_get_min_blocks_to_keep(void){ return g_min_blocks_to_keep; }
+
 archive_prune_verdict_t archive_prune_decide(long long budget_bytes,
                                              long* out_height, long* out_detail){
     if (out_height) *out_height = 0;
@@ -567,6 +581,40 @@ archive_prune_verdict_t archive_prune_decide(long long budget_bytes,
     long ph = archive_prune_height_for_budget(budget_bytes);
     if (ph < 0)  return ARCHIVE_PRUNE_ERROR;
     if (ph == 0) return ARCHIVE_PRUNE_NOTHING;   /* budget covers the archive */
+
+    /* ---- STO-12 (audit 2026-09-03): a minimum-retention floor ----
+     * Pruning was purely budget-driven, so a small -prune could delete inside
+     * the windows the node needs to stay correct: REORG_MAX_DEPTH (100) for a
+     * reorg's disconnect, and UTXO_UNDO_WINDOW (200) for the undo files. Core
+     * keeps MIN_BLOCKS_TO_KEEP = 288 for exactly this, which subsumes both.
+     *
+     * It fails CLOSED today -- read_stored_block returns -1/-3 and the reorg
+     * pre-flight refuses -- so the cost is a node that cannot reorg rather
+     * than one that corrupts itself. That is still a node that stops doing its
+     * job, on a setting an operator chose freely.
+     *
+     * Applied HERE and not inside archive_prune_height_for_budget: that
+     * function is a pure budget->height mapping and flooring it would change
+     * its meaning for any other caller. The `ph <= 0` re-check matters -- on a
+     * short archive the floor drives ph to zero or below, and falling through
+     * with ph == 0 would call store_prune(0) and arm the prune gate for
+     * nothing. Retaining MORE than the budget asked is Core's behaviour, and
+     * it is said out loud rather than done silently. */
+    {
+        long tip = archive_index_tip();
+        if (tip >= 0){
+            long floor_h = tip - g_min_blocks_to_keep + 1;
+            if (floor_h < 0) floor_h = 0;
+            if (ph > floor_h){
+                fprintf(stderr,
+                    "[archive] prune budget wants height %ld but the last %d blocks are "
+                    "retained regardless (reorg depth %d, undo window %d) -- pruning below %ld\n",
+                    ph, (int)g_min_blocks_to_keep, 100, 200, floor_h);
+                ph = floor_h;
+            }
+            if (ph <= 0) return ARCHIVE_PRUNE_NOTHING;
+        }
+    }
 
     if (out_height) *out_height = ph;
 

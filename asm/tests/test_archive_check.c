@@ -244,6 +244,26 @@ int main(void){
      *    function precisely so all five outcomes can be exercised here on a
      *    two-block fixture instead of needing a 550 MiB one. */
     { long ph=-7, det=-7;
+      extern void archive_set_min_blocks_to_keep(long n);
+      extern long archive_get_min_blocks_to_keep(void);
+
+      /* ---- STO-12 (audit 2026-09-03): the minimum-retention floor ----
+       * Pruning was purely budget-driven, so a small -prune could delete
+       * inside the reorg window (REORG_MAX_DEPTH 100) and the undo window
+       * (UTXO_UNDO_WINDOW 200). Core keeps MIN_BLOCKS_TO_KEEP = 288, which
+       * subsumes both. It fails CLOSED today -- the reorg pre-flight refuses
+       * on a missing block -- so the cost is a node that cannot reorg, on a
+       * setting the operator chose freely.
+       *
+       * With the production floor of 288 this two-block fixture retains
+       * everything, which is CORRECT and makes every verdict below NOTHING.
+       * The floor is therefore injectable: assert it at its real value, prove
+       * it bites, then lower it so the verdicts it guards stay reachable. */
+      cki("STO-12 the floor defaults to Core's 288", (int)archive_get_min_blocks_to_keep(), 288);
+      ph=-7; det=-7;
+      cki("STO-12 a one-block budget under the 288 floor retains everything",
+          archive_prune_decide(285, &ph, &det), ARCHIVE_PRUNE_NOTHING);
+      archive_set_min_blocks_to_keep(1);   /* fixture-sized, so the gate is reachable */
 
       /* budget covers everything -> nothing to do */
       cki("verdict: budget covers the archive -> NOTHING",

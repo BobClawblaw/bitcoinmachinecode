@@ -34,8 +34,9 @@ HARDEN_CC  := -fstack-protector-strong -D_FORTIFY_SOURCE=2
 # build failure, not a line in a log nobody reads -- the 2026-08-26 slen ABI
 # bug (incident #49) was an -Wincompatible-pointer-types warning that had
 # scrolled past for weeks. Appended wherever HARDEN_CC is, so the daemon, the
-# tools and the tests are all held to it. nasm warnings are NOT yet errors
-# (six kinds remain, see docs/FEATURE_GAPS.md).
+# tools and the tests are all held to it. (BLD-4, audit 2026-09-03: this used
+# to add "nasm warnings are NOT yet errors (six kinds remain)" -- stale since
+# 2026-09-02, when NASMFLAGS gained -Werror. See the note above it.)
 WARNFLAGS  := -Wall -Werror
 # HARDENFLAGS: full RELRO + BIND_NOW on every SHIPPED binary (not just the
 # daemon). Audit 2026-09-02 found daemon/wallet_cli -- the binary that decrypts
@@ -285,7 +286,7 @@ tests/bench_fe: tests/bench_fe.c secp256k1_fe.o
 # field, so any difference they report is a difference in the point layer.
 # tests/point_ref.asm needs -Itests/ for its renamed comb table.
 tests/point_ref.o: tests/point_ref.asm tests/g_comb_table_ref.inc
-	$(NASM) -f elf64 -Itests/ -o $@ tests/point_ref.asm
+	$(NASM) $(NASMFLAGS) -Itests/ -o $@ tests/point_ref.asm
 tests/point_ct_ref.o: tests/point_ct_ref.asm
 	$(NASM) $(NASMFLAGS) -o $@ tests/point_ct_ref.asm
 PTREPROBJS := secp256k1_point.o secp256k1_point_ct.o tests/point_ref.o \
@@ -1943,8 +1944,10 @@ tests/test_utxo_unspendable: tests/test_utxo_unspendable.c $(REORGSRCS_NOMAIN) $
 tests/test_bip30_daemon: tests/test_bip30_daemon.c $(REORGSRCS_NOMAIN) $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -I tests -o $@ tests/test_bip30_daemon.c $(REORGSRCS_NOMAIN) $(REORGOBJS) -lpthread
 
+# BLD-4 (audit 2026-09-03): a CONSENSUS object that was never -Werror'd --
+# this rule used a bare `nasm -f elf64` instead of $(NASMFLAGS).
 bitcoin_sigops.o: bitcoin_sigops.asm bitcoin_scriptcodec.asm
-	$(NASM) -f elf64 -o $@ bitcoin_sigops.asm
+	$(NASM) $(NASMFLAGS) -o $@ bitcoin_sigops.asm
 
 # test_sigops: was pinned to -O1. 2026-09-02 (audit N1): rebuilt at -O2 and run
 # -- passes; the pin is lifted so the gate exercises the production codegen.
