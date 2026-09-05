@@ -1025,3 +1025,46 @@ back on `127.0.0.1:8331` with `bmc_cli` needing no flags; height 965,669 —
 `NRestarts=0`, no FAILURE/FATAL lines. The v3 address book carries 46,274
 records, 4,096 tried, and 154 with a source netgroup attributed since the
 upgrade — NET-10's attribution path working in production.
+
+
+## 2026-09-05 (night): rolled back to 8332, and the config-precedence defect fixed
+
+**Rolled back.** `data/bitcoin.conf` was deleted and the node restarted, so it
+is back on the repo-level `config/bitcoin.conf`: **P2P `0.0.0.0:8332` and
+`[::]:8332`, RPC `127.0.0.1:8331`** — the arrangement it had before this
+evening. Verified: a raw stranger handshake on 8332 returns
+`version, wtxidrelay, sendaddrv2, verack`; 8433 is closed; `bmc_cli` needs no
+flags; height 965,669 with `headers == blocks` and `ibd false`; `NRestarts=0`,
+no FAILURE lines. The 8433 config is kept at
+`/storage/bitcoin.conf.8433-rollback-20260905-2126` if it is ever wanted.
+
+**Why the rollback was right, and my 8433 change wrong-headed.** I moved the
+listener to avoid a clash with Core. There was no clash to avoid, and the
+existing arrangement was already designed around Core:
+
+| | Core (pid 106094) | BMC |
+|---|---|---|
+| P2P | 8333, bound to sixteen *specific* aliases `127.0.0.1`–`127.0.0.16` | 8332 on `0.0.0.0` + `[::]` |
+| RPC | 8335 (`rpcbind=127.0.0.1`) | 8331 |
+
+Core never binds `0.0.0.0`. That is precisely why BMC cannot take
+`0.0.0.0:8333` — a wildcard bind collides with any specific bind on the same
+port — and why the repo config puts BMC's P2P on 8332. The port sets are
+disjoint and always were.
+
+**The defect the episode surfaced is real and is now fixed** (`d0bc1c2`). The
+daemon reads exactly ONE config file — `$BITCOIN_CONF`, else
+`<datadir>/bitcoin.conf` when readable, else `<datadir>/../config/bitcoin.conf`
+— and never merges (`node_config.c`, `node_config_path`), which matches Core.
+`cli_conf.c`'s `conf_lookup` resolved *per key* across both, so a datadir
+config setting `port` but not `rpcport` left the daemon on its own default
+while the CLI still read the repo file's `rpcport`. The CLI now resolves the
+file once with the daemon's precedence, with a regression test watched to fail
+first.
+
+**What this cost, stated plainly:** three restarts of a production node and two
+published claims that were wrong (a listener that was never missing, and a
+clash that never existed). The node was never in danger — every restart was
+clean and it returned to the tip each time — but the diagnosis should have
+started with `ss -ltnp` read carefully and `config/bitcoin.conf` read at all,
+before anything was changed.

@@ -1,5 +1,6 @@
 /* daemon/cli_conf.c -- see cli_conf.h. */
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include "cli_conf.h"
@@ -43,12 +44,30 @@ static int conf_get(const char* path, const char* key, char* out, long cap){
 }
 
 /* The daemon looks in the datadir and then in ../config (node_config.c). */
+/* Which config file the DAEMON would read for this datadir. It picks exactly
+ * one -- $BITCOIN_CONF, else <datadir>/bitcoin.conf when readable, else
+ * <datadir>/../config/bitcoin.conf -- and never merges them
+ * (node_config.c, node_config_path). This must agree, key for key.
+ *
+ * It used not to. conf_lookup resolved PER KEY across both files, so a datadir
+ * config that set `port` but not `rpcport` left the daemon on its own default
+ * while the CLI still read rpcport from ../config. On the live node
+ * (2026-09-05) that put the daemon's RPC on 8332 and bmc_cli on 8331, and the
+ * CLI could not reach its own node without -rpcport=. Neither side was wrong
+ * alone; they disagreed about what a second file means. The daemon matches
+ * Core (defaults + one conf), so the CLI is the side that moves. */
+static void conf_file_for(const char* datadir, char* out, long cap){
+    const char* env = getenv("BITCOIN_CONF");
+    if (env && *env){ snprintf(out, (size_t)cap, "%s", env); return; }
+    snprintf(out, (size_t)cap, "%s/bitcoin.conf", datadir);
+    if (access(out, R_OK) == 0) return;
+    snprintf(out, (size_t)cap, "%s/../config/bitcoin.conf", datadir);
+}
+
 static int conf_lookup(const char* datadir, const char* key, char* out, long cap){
     char p[512];
     if (!datadir || !*datadir) return 0;
-    snprintf(p, sizeof p, "%s/bitcoin.conf", datadir);
-    if (conf_get(p, key, out, cap)) return 1;
-    snprintf(p, sizeof p, "%s/../config/bitcoin.conf", datadir);
+    conf_file_for(datadir, p, sizeof p);
     return conf_get(p, key, out, cap);
 }
 
