@@ -1274,6 +1274,7 @@ void serve_policy_disconnect_log(const char* reason){
 /* claim a shared peer-table slot for this inbound child (64..127; a dead
  * child's slot is reused) and publish what getpeerinfo shows */
 static void rpc_fill_peer_slot(int slot, const char* host);
+static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claimed);
 static int inbound_slot_claim(const char* peerdesc){
     if(!g_node_status) return -1;
     for(int i = RPC_MAX_PEERS - 1; i >= MUX_MAX_OUT; i--){
@@ -1282,7 +1283,13 @@ static int inbound_slot_claim(const char* peerdesc){
             __sync_bool_compare_and_swap(&q->used, 1, 0);
         if(q->used) continue;
         if(!__sync_bool_compare_and_swap(&q->used, 0, 1)) continue;
-        rpc_fill_peer_slot(i, peerdesc);
+        /* RPC-13 (audit 2026-09-03): the slot is ALREADY CLAIMED -- the CAS
+         * above took it 0 -> 1. rpc_fill_peer_slot's memset zeroes the whole
+         * record including `used`, which handed the slot back to any sibling
+         * child scanning for a free one; the loser's later `used = 0` would
+         * then free the winner's entry and getpeerinfo would under-report.
+         * The _ex form preserves the claim across the memset. */
+        rpc_fill_peer_slot_ex(i, peerdesc, 1);
         q->inbound = 1; q->pid = (int)getpid(); q->perms = g_conn_perms_all;
         q->relaytxes = node_relay_flag && g_peer_relays_txs;
         return i;
@@ -2052,10 +2059,30 @@ static void format_peer_version_info(char* out, size_t cap){
  * (g_peer_version_payload, set by the just-completed handshake) + the host
  * string. Mirrors format_peer_version_info's parse but into structured fields.
  * Safe to call with g_node_status==NULL (no-op). */
+/* RPC-13: `already_claimed` says the caller has ALREADY won this slot with a
+ * CAS on `used` (the inbound path). The two callers genuinely want different
+ * behaviour here, which is why this is a parameter and not a blanket change:
+ *
+ *   inbound  -- the slot was claimed 0 -> 1 before the fill. Zeroing `used`
+ *               mid-fill advertises it as free again, so a sibling child can
+ *               claim the same slot; the loser's later `used = 0` then frees
+ *               the WINNER's entry. Keeping the claim closes that window, at
+ *               the cost of a reader briefly seeing a partly-filled record --
+ *               display-only, where the race corrupts ownership.
+ *   outbound -- the slot at mux_n_out is not claimed by CAS at all; the fill
+ *               IS the claim. Zeroing `used` first is what keeps a reader
+ *               from seeing a half-filled record, and must stay.
+ *
+ * Either way `pr->used = 1` at the end remains the publication point. */
 static void rpc_fill_peer_slot(int slot, const char* host){
+    rpc_fill_peer_slot_ex(slot, host, 0);
+}
+static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claimed){
     if (!g_node_status || slot < 0 || slot >= RPC_MAX_PEERS) return;
     rpc_peer_t* pr = &g_node_status->peers[slot];
+    int keep_used = already_claimed ? pr->used : 0;   /* RPC-13: `used` is a volatile int */
     memset(pr, 0, sizeof *pr);
+    pr->used = keep_used;
     strncpy(pr->addr, host ? host : "", sizeof pr->addr - 1);
     pr->inbound = 0;
     pr->conn_time = (long long)time(NULL);
