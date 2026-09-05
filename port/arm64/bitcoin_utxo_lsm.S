@@ -1872,17 +1872,31 @@ mac_flush:
 	mov  x8, #SYS_close
 	svc  #0
 .fl_finish_reset:
-	/* ftruncate(log_fd, 0) */
+	/* ---- UTX-8 (audit 2026-09-03): the WAL reset must SUCCEED ----
+	 * Both syscalls below used to have their results discarded and log_len
+	 * was then set to 0 regardless. On EIO the old generation stays in
+	 * utxo.dat while new records are written from offset 0 over it, and a
+	 * later reload replays the new records and then whatever stale bytes
+	 * follow -- a misparse, or, at an aligned boundary, stale PUSHes
+	 * applied on top of newer DELs.
+	 *
+	 * ftruncate returns 0 on success and lseek returns the new offset, which
+	 * is 0 here -- so a NEGATIVE result is the error in both cases, the same
+	 * sign test the rename above already uses. A failure returns -1 (a flush
+	 * error) BEFORE log_len, the memtable and the tomb hash are cleared, so
+	 * the caller still holds the same state it had before the reset. */
 	ldr  x0, [x19, #0]
 	mov  x1, #0
 	mov  x8, #SYS_ftruncate
 	svc  #0
+	tbnz x0, #63, .fl_err
 	/* lseek(log_fd, 0, SEEK_SET) */
 	ldr  x0, [x19, #0]
 	mov  x1, #0
 	mov  x2, #0
 	mov  x8, #SYS_lseek
 	svc  #0
+	tbnz x0, #63, .fl_err
 	str  xzr, [x19, #16]             /* log_len = 0 */
 	mov  x0, x20
 	bl   mac_clear_memtable
@@ -1974,7 +1988,7 @@ mac_lsm_reload_impl:
 	mov  x3, #0
 	mov  x8, #SYS_openat
 	svc  #0
-	tbnz x0, #63, .rl_no_manifest
+	tbnz x0, #63, .rl_open_fail
 	mov  x22, x0                    /* manifest fd */
 	mov  x0, x22
 	add  x1, x28, #0x40
@@ -2068,6 +2082,22 @@ mac_lsm_reload_impl:
 	 * distinct from -1 (I/O) and -2 (WAL tail over fill): utxo_live's UTX-2
 	 * check treats any negative as fatal, and its message names the
 	 * compaction remedy. */
+	mov  x0, #-3
+	b    .rl_ret
+.rl_open_fail:
+	/* UTX-6 (audit 2026-09-03): only ENOENT means "no manifest". A fresh
+	 * store has no utxo_manifest.dat and must reload as WAL-only; any OTHER
+	 * open error -- EACCES after a bad chown, EIO, EMFILE, ENOMEM -- used to
+	 * take the same path and report success with zero runs, which is
+	 * indistinguishable from a fresh store and is how a full run set gets
+	 * swept as orphans on the boot after next. Fail the reload instead
+	 * (x86: cmp rax,-2 / je .rl_no_manifest / jmp .rl_fail). */
+	mov  x9, #-2                    /* -ENOENT */
+	cmp  x0, x9
+	b.eq .rl_no_manifest
+	str  xzr, [x19, #120]
+	str  xzr, [x19, #96]
+	str  xzr, [x19, #144]
 	mov  x0, #-3
 	b    .rl_ret
 .rl_no_manifest:
