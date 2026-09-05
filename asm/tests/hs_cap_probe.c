@@ -7,7 +7,7 @@
 #include <unistd.h>
 extern long node_handshake(int fd);
 extern int  tcp_connect_ip(unsigned be_ip, unsigned short be_port);
-extern unsigned char g_peer_version_payload[256];
+extern unsigned char g_peer_version_payload[512];   /* NET-13 */
 extern long g_peer_version_len;
 int main(int argc, char** argv){
     for (int a = 1; a < argc; a++){

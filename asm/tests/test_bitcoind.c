@@ -19,7 +19,7 @@
 
 extern long node_make_version(unsigned char* out);
 extern int  node_handshake(int fd);
-extern unsigned char g_peer_version_payload[256];
+extern unsigned char g_peer_version_payload[512];
 extern long g_peer_version_len;
 extern int  tcp_connect_ip(unsigned ip_le, unsigned short port_be);
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen);
@@ -30,6 +30,12 @@ static int failures=0;
 static void cki(const char*l,long g,long e){ if(g==e)printf("PASS %s (got %ld)\n",l,g); else{printf("FAIL %s got=%ld exp=%ld\n",l,g,e);failures++;} }
 static int g_saw_wtxidrelay = 0;   /* set by fake_peer: BIP339 msg seen before verack */
 static int g_saw_sendaddrv2 = 0;   /* set by fake_peer: BIP155 offer seen before verack */
+/* NET-13 (audit 2026-09-03): when set, fake_peer sends a version with a
+ * 255-byte user agent (~341 bytes total) instead of the 102-byte one. Core
+ * permits a 256-byte UA, so this is an ORDINARY peer, not a hostile one --
+ * the read caps were 256, so p2p_read returned -2 and the whole handshake
+ * failed. We were silently refusing every peer with a long -uacomment. */
+static int g_long_ua = 0;
 
 static void fake_peer(int cfd){
     char cmd[12]; unsigned char rbuf[1024]; unsigned plen=0;
@@ -41,7 +47,7 @@ static void fake_peer(int cfd){
      * that broke the capture against every real peer (real versions are
      * 102-125B and trampled node_handshake's cmd buffer). Real-sized payload
      * or the test proves nothing. */
-    unsigned char v[102];
+    unsigned char v[512];
     unsigned char* p=v;
     p[0]=0x80;p[1]=0x11;p[2]=0x01;p[3]=0x00;                 /* version */
     memset(p+4,0,8); p[4]=9;                                  /* services=NETWORK|WITNESS */
@@ -50,7 +56,18 @@ static void fake_peer(int cfd){
     memset(p+72,0,8); v[72]=0x99;                             /* nonce */
     v[80]=16; memcpy(v+81, "/Satoshi:27.1.0/", 16);          /* UA */
     memset(p+97,0,4+1);                                       /* start_height, relay */
-    p2p_write(cfd, "version", 7, v, 102);
+    unsigned long vlen = 102;
+    if (g_long_ua){
+        /* NET-13: rebuild with a 255-byte UA. CompactSize 255 is 0xfd 0xff 0x00
+         * (3 bytes), so the payload is 80 + 3 + 255 + 5 = 343. */
+        v[80]=0xfd; v[81]=0xff; v[82]=0x00;
+        memset(v+83, 'x', 255);
+        memcpy(v+83, "/Satoshi:27.1.0(", 16);
+        v[83+254]=')';
+        memset(v+338,0,4+1);
+        vlen = 343;
+    }
+    p2p_write(cfd, "version", 7, v, vlen);
     p2p_write(cfd, "verack", 6, "", 0);
     /* read the client's post-version messages: BIP339 wtxidrelay must
      * arrive BEFORE its verack */
@@ -113,6 +130,52 @@ int main(void){
       cki("BIP155: sendaddrv2 offered after version, before verack (peer is 70016)",
           WIFEXITED(st) && (WEXITSTATUS(st) & 2)==0, 1); }
     close(ls);
+
+    /* ---- NET-13 / DMN-12 (audit 2026-09-03): a long user agent must not
+     * kill the handshake.
+     *
+     * The read caps in node_handshake and node_accept_handshake were 256, and
+     * p2p_read returns -2 when the announced payload exceeds the cap, which
+     * every handshake caller treats as fatal. Core permits a 256-byte UA on
+     * its own, so an ORDINARY peer running -uacomment sends a ~343-byte
+     * version and we refused the connection outright. This is the only finding
+     * in the batch that costs the node real peers.
+     *
+     * The two audit entries are the SAME defect (NET-13 and DMN-12 cite the
+     * same two call sites); there is also a third capped read, the post-verack
+     * drain, that neither mentions.
+     *
+     * Raising a cap without growing g_peer_version_payload would have turned
+     * this into a .bss overrun on the inbound serve path -- the capture does a
+     * rep movsb of g_peer_version_len bytes into it. Hence the assertion on
+     * the captured tail below, not just on the return value. */
+    {
+        g_long_ua = 1;
+        g_saw_wtxidrelay = 0; g_saw_sendaddrv2 = 0;
+        g_peer_version_len = 0;
+        memset(g_peer_version_payload, 0, 512);
+
+        int ls2=socket(AF_INET,SOCK_STREAM,0);
+        struct sockaddr_in a2; memset(&a2,0,sizeof a2); a2.sin_family=AF_INET;
+        a2.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+        bind(ls2,(struct sockaddr*)&a2,sizeof a2);
+        socklen_t al2=sizeof a2; getsockname(ls2,(struct sockaddr*)&a2,&al2);
+        listen(ls2,1);
+        pid_t pid2=fork();
+        if(pid2==0){ int c=accept(ls2,0,0); fake_peer(c); close(c); _exit(0); }
+        int fd2 = tcp_connect_ip(htonl(INADDR_LOOPBACK), a2.sin_port);
+        cki("NET-13 connect (long-UA peer)", fd2>=0, 1);
+        int r2 = node_handshake(fd2);
+        cki("NET-13 a 343-byte version completes the handshake", r2, 1);
+        cki("NET-13 the whole payload was captured, not truncated",
+            (int)g_peer_version_len, 343);
+        cki("NET-13 the 255-byte UA length survived", g_peer_version_payload[80], 0xfd);
+        /* the LAST byte of the UA -- proves the capture buffer really is 512
+         * and the rep movsb did not run off a 256-byte global */
+        cki("NET-13 the UA's final byte is intact", g_peer_version_payload[83+254], ')');
+        close(fd2); waitpid(pid2,0,0); close(ls2);
+        g_long_ua = 0;
+    }
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;

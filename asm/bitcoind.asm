@@ -104,7 +104,19 @@ node_handshake:
                            ;   slot held 120 B). 0x28+0x538 = 0x560: aligned.
                            ; cmd[12]      @ rbp-0xe0 (-0xe0..-0xd5)
                            ; plen(4)      @ rbp-0xc8
-                           ; payload buf  @ rbp-0x2e0 (cap 0x100=256)
+                           ; payload buf  @ rbp-0x2e0 (cap 0x200=512)
+                           ;
+                           ; NET-13 (audit 2026-09-03): the cap was 256, so a
+                           ; version message of 257..512 bytes failed the WHOLE
+                           ; handshake (p2p_read -2 -> .fail) -- Core allows a
+                           ; 256-byte UA alone, i.e. ~350-byte versions, so we
+                           ; silently refused those peers. 512 EXACTLY fills the
+                           ; gap to cmd: the buffer spans rbp-0x2e0..rbp-0xe0 and
+                           ; cmd begins at rbp-0xe0. Abutting, not overlapping --
+                           ; but there is ZERO slack, so anything placed between
+                           ; them later must move the buffer, not shrink the gap.
+                           ; (rbp-0xa0 in the note above is stale: nothing lives
+                           ; there any more.)
                            ;
                            ; LAYOUT IS LOAD-BEARING (2026-08-25). The old
                            ; frame had TWO overlaps of the incident-#11/#31
@@ -153,7 +165,7 @@ node_handshake:
     mov  rdi, r12
     lea  rsi, [rbp-0xe0]    ; cmd
     lea  rdx, [rbp-0x2e0]   ; payload (256B, clear of cmd/plen -- see above)
-    mov  ecx, 0x100
+    mov  ecx, 0x200         ; NET-13: 512, see the frame note above
     lea  r8, [rbp-0xc8]     ; plen (4 bytes, OUTSIDE cmd)
     call p2p_read
     cmp  rax, 0
@@ -167,7 +179,7 @@ node_handshake:
     jne  .nh_not_version
     mov  eax, dword [rbp-0xc8]  ; plen is a u32 -- the old 8-byte load
                                 ; dragged in 4 adjacent garbage bytes
-    cmp  rax, 256
+    cmp  rax, 512
     jbe  .nh_len_ok
     mov  rax, 256
 .nh_len_ok:
@@ -280,7 +292,12 @@ node_accept_handshake:
                            ; cmd[12]        @ rbp-0x48
                            ; plen(4)        @ rbp-0x54
                            ; our version[128] @ rbp-0x180
-                           ; recv[256]      @ rbp-0x300
+                           ; recv[512]      @ rbp-0x300  (NET-13: was 256;
+                           ;   spans rbp-0x300..rbp-0x100, clear of cmd@-0x48
+                           ;   and plen@-0x54. The "our version[128] @ rbp-0x180"
+                           ;   line above is STALE -- ours moved to rbp-0x600 on
+                           ;   2026-09-01 and nothing occupies -0x180 now, which
+                           ;   is what leaves room for this.)
     mov  r12, rdi          ; fd (callee-saved)
     mov  qword [rel g_peer_wants_addrv2], 0   ; per-handshake reset (see node_handshake)
 .read_peer_version:
@@ -289,7 +306,7 @@ node_accept_handshake:
     mov  rdi, r12
     lea  rsi, [rbp-0x48]   ; cmd
     lea  rdx, [rbp-0x300]  ; payload
-    mov  ecx, 256
+    mov  ecx, 512          ; NET-13: was 256
     lea  r8,  [rbp-0x54]   ; plen
     call p2p_read
     cmp  rax, 0
@@ -317,7 +334,7 @@ node_accept_handshake:
     ; capture the peer's raw version payload (side-effect only; actual
     ; field parsing happens in C -- see g_peer_version_payload's comment)
     mov  eax, dword [rbp-0x54]  ; plen u32 (8-byte load read garbage)
-    cmp  rax, 256
+    cmp  rax, 512
     jbe  .gv_len_ok
     mov  rax, 256
 .gv_len_ok:
@@ -382,7 +399,7 @@ node_accept_handshake:
     mov  rdi, r12
     lea  rsi, [rbp-0x48]
     lea  rdx, [rbp-0x300]
-    mov  ecx, 256
+    mov  ecx, 512          ; NET-13: the post-verack drain, same cap
     lea  r8,  [rbp-0x54]
     call p2p_read
     cmp  rax, 0
@@ -2168,7 +2185,11 @@ node_services: dq 9
 ; unchanged either way, this is a side-effect capture only. */
 global g_peer_version_payload
 global g_peer_version_len
-g_peer_version_payload: times 256 db 0
+; NET-13 (audit 2026-09-03): 512, matching the read caps. Raising a cap
+; WITHOUT growing this would have turned a connectivity bug into a .bss
+; overrun on the inbound serve path -- the rep movsb below copies
+; g_peer_version_len bytes in here.
+g_peer_version_payload: times 512 db 0
 g_peer_version_len:     dq 0
 ; ---- BIP155: did the peer send `sendaddrv2` before verack? 1/0, reset at
 ; the start of every handshake in both roles. Read by bitcoin_serve.asm
