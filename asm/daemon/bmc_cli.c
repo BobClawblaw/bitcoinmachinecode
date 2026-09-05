@@ -1,12 +1,12 @@
-/* daemon/bitcoin_cli.c -- the bitcoin-cli network-layer client.
+/* daemon/bmc_cli.c -- the bitcoin-cli network-layer client.
  *
  * Bit-for-bit behaves like Bitcoin Core's bitcoin-cli against a local
  * HTTP JSON-RPC endpoint:
  *
  *   usage:
- *     bitcoin_cli [-rpcport=<p>] [-rpcconnect=<host>] [-rpcuser=<u>]
+ *     bmc_cli [-rpcport=<p>] [-rpcconnect=<host>] [-rpcuser=<u>]
  *                 [-rpcpassword=<p>] <method> [param...]
- *     bitcoin_cli getblockchaininfo | getnewaddress | getbalance | ...
+ *     bmc_cli getblockchaininfo | getnewaddress | getbalance | ...
  *
  * It frames a JSON-RPC 2.0 request, POSTs it over a local socket with HTTP
  * Basic auth, parses the reply and renders it exactly as bitcoin-cli does:
@@ -75,13 +75,13 @@ int main(int argc, char** argv) {
     if (argi >= argc) {
         fprintf(stderr,
             "Bitcoin Core RPC client\n\n"
-            "usage: bitcoin_cli [-datadir=<dir>] [-chain=<c>|-signet|-testnet4|-regtest]\n"
+            "usage: bmc_cli [-datadir=<dir>] [-chain=<c>|-signet|-testnet4|-regtest]\n"
             "                   [-rpcport=<n>] [-rpcuser=<u>] [-rpcpassword=<p>]\n"
             "                   [-stdinwalletpassphrase] [-stdin] <method> [params...]\n\n"
             "-stdinwalletpassphrase reads the wallet passphrase as the first line of\n"
             "standard input (echo off on a terminal) and passes it as the first\n"
             "parameter, so it never appears on the command line, in `ps`, or in the\n"
-            "shell history:   bitcoin_cli -stdinwalletpassphrase walletpassphrase 60\n"
+            "shell history:   bmc_cli -stdinwalletpassphrase walletpassphrase 60\n"
             "-stdin reads the remaining parameters from standard input, one per line.\n\n"
             "With -datadir the port and credentials come from that datadir's\n"
             "bitcoin.conf and .cookie, so no flags are usually needed.\n\n"

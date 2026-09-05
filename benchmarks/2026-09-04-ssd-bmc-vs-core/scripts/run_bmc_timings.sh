@@ -6,7 +6,7 @@ set -u
 DEST=/mnt/2tbssd/bmc-bench
 cd "$DEST" || exit 2
 TL=timings.log; P2P=8462; RPC=8461
-CLI="src/asm/daemon/bitcoin_cli -datadir=$DEST/data"
+CLI="src/asm/daemon/bmc_cli -datadir=$DEST/data"
 say(){ echo "$(date -u +%FT%TZ) $*" | tee -a "$TL"; }
 say "=== bmc timing monitor start ==="
 probe(){

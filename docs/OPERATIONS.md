@@ -22,7 +22,7 @@ own subdirectory of it: `<datadir>/main`, `<datadir>/signet`,
 datadir root (or `../config/bitcoin.conf`); all other state is per chain, so
 two chains never share block, UTXO or wallet state.
 
-The companion client is `asm/daemon/bitcoin_cli`. With `-datadir=<dir>` it
+The companion client is `asm/daemon/bmc_cli`. With `-datadir=<dir>` it
 reads the chain, RPC port and credentials from that datadir's `bitcoin.conf`
 and cookie, so no other flags are usually needed.
 
@@ -47,7 +47,7 @@ and cookie, so no other flags are usually needed.
 ```sh
 cd /path/to/repo/asm
 make daemon/bitcoind              # the daemon (about 31 MB)
-make daemon/bitcoin_cli           # the RPC client
+make daemon/bmc_cli           # the RPC client
 make tests/tool_archive_relayout  # archive maintenance tool (optional)
 ```
 
@@ -373,7 +373,7 @@ about a minute. Check, in order:
 ```sh
 systemctl is-active bmc-bitcoind
 ss -ltnp | grep bitcoind             # P2P, RPC, onion target, ZMQ endpoints
-daemon/bitcoin_cli -datadir=/path/to/repo/data getblockcount
+daemon/bmc_cli -datadir=/path/to/repo/data getblockcount
 ```
 
 Expected lines in `logs/<chain>/bitcoin.<chain>.log`, in order:
@@ -430,9 +430,9 @@ service line appears a few minutes after start.
 ### RPC access
 
 ```sh
-daemon/bitcoin_cli -datadir=/path/to/repo/data getblockchaininfo
-daemon/bitcoin_cli -datadir=/path/to/repo/data -chain=signet getblockcount
-daemon/bitcoin_cli -rpcport=<n> -rpcuser=<u> -rpcpassword=<p> <method> [params...]
+daemon/bmc_cli -datadir=/path/to/repo/data getblockchaininfo
+daemon/bmc_cli -datadir=/path/to/repo/data -chain=signet getblockcount
+daemon/bmc_cli -rpcport=<n> -rpcuser=<u> -rpcpassword=<p> <method> [params...]
 ```
 
 `gettxoutsetinfo` and `scantxoutset` refuse while the UTXO set is being
@@ -546,7 +546,7 @@ rollback. The scratch copy needs as much space as the archive.
 
 | symptom | cause and action |
 |---|---|
-| `bitcoin_cli` connection refused right after start | RPC is not up yet. Boot runs config, the tx-validation snapshot (tens of seconds), archive load and check, catch-up check and hash index before starting RPC (about a minute). Wait for `[rpc] JSON-RPC server on ...`. |
+| `bmc_cli` connection refused right after start | RPC is not up yet. Boot runs config, the tx-validation snapshot (tens of seconds), archive load and check, catch-up check and hash index before starting RPC (about a minute). Wait for `[rpc] JSON-RPC server on ...`. |
 | active service, but no RPC ever | `rpcport` equals `port` (the RPC bind is lost), or no credential source exists. Read the `[rpc]` lines. |
 | bind failure at start / node exits | The port is in use. `ss -ltnp \| grep :<port>` shows the PID holding it: a stale daemon from a previous run or another node. Stop that PID. |
 | `systemctl stop` stalls | See *Shutdown*. After `TimeoutStopSec` systemd SIGKILLs; boot recovery repairs the interrupted write. |
@@ -575,7 +575,7 @@ configuration:
    root, and each daemon reads its own configuration.
 
 Ports must not collide between daemons. Each daemon writes its own `.cookie`
-in its chain directory, so `bitcoin_cli -datadir=<that datadir>` resolves
+in its chain directory, so `bmc_cli -datadir=<that datadir>` resolves
 the right one. Regtest and testnet4 configurations usually pin peers with
 `connect=<ip:port>`, which disables discovery and DNS seeding.
 
@@ -663,7 +663,7 @@ and take precedence when present.
 - `wallet_cli init` with no passphrase argument asks twice; a passphrase
   entered this way is **not** written to a `.pass` file. Enter nothing for a
   plaintext wallet, as before.
-- The RPC client follows Core: `bitcoin_cli -stdinwalletpassphrase
+- The RPC client follows Core: `bmc_cli -stdinwalletpassphrase
   walletpassphrase 60` reads the passphrase as the first line of stdin (echo
   off on a terminal) and sends it as the first parameter, so it never appears
   in `ps` or the shell history; `-stdin` reads the remaining parameters one

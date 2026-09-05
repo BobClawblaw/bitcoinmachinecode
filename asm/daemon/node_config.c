@@ -1253,7 +1253,7 @@ void node_config_log(void){
 int node_config_accept_stale_fee(void){ return g_cfg.acceptstalefeeestimates; }
 
 /* Small accessor for callers that link this file only weakly (rpc_node.c's
- * getnetworkinfo needs g_cfg's proxy fields, but bitcoin_cli -- a pure HTTP
+ * getnetworkinfo needs g_cfg's proxy fields, but bmc_cli -- a pure HTTP
  * client that never executes that RPC's implementation -- does not link
  * this file at all). Exporting one narrow function keeps g_cfg itself out
  * of that weak-symbol surface, which matters because g_cfg is a struct

@@ -1585,7 +1585,7 @@ pass, then `-Werror`**.
 - **Manual wallet decryption:** `wallet_cli` now asks for the passphrase
   (echo off) when nothing supplied it and the wallet is encrypted, reads it
   from a pipe when stdin is not a terminal, and `init` asks twice and stores
-  no `.pass` file for a typed passphrase. `bitcoin_cli` gained Core's
+  no `.pass` file for a typed passphrase. `bmc_cli` gained Core's
   `-stdinwalletpassphrase` and `-stdin`. Pinned by `tests/test_cli_prompt`
   (a real pty). Parity attestation heights are now published in
   `docs/PARITY_ATTESTATION.md` (audit recommendation 8).

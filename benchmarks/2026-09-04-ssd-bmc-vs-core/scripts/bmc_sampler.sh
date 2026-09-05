@@ -3,7 +3,7 @@
 set -u
 DEST=/mnt/2tbssd/bmc-bench
 cd "$DEST" || exit 2
-CLI="src/asm/daemon/bitcoin_cli -datadir=$DEST/data"
+CLI="src/asm/daemon/bmc_cli -datadir=$DEST/data"
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
 while :; do
   sleep 600

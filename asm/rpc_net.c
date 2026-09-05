@@ -82,7 +82,7 @@ static int sock_connect_loopback(int port) {
     a.sin_port = htons((unsigned short)port);
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     /* client-side timeouts (2026-08-31): a stuck server used to hang the CLI
-     * forever -- a timeout-less bitcoin_cli deadlocked a whole diagnostic
+     * forever -- a timeout-less bmc_cli deadlocked a whole diagnostic
      * sweep. 10 s to connect, 60 s per read/write. */
     { struct timeval tv = { 60, 0 };
       setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);

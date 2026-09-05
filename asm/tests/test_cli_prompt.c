@@ -2,7 +2,7 @@
  * passphrase on disk. wallet_cli asks for the passphrase when nothing supplied
  * it and the wallet is encrypted: echo OFF on a terminal (proved here with a
  * pty: the typed passphrase must not come back in the output), one line from
- * a pipe otherwise. bitcoin_cli gains Core's -stdinwalletpassphrase / -stdin,
+ * a pipe otherwise. bmc_cli gains Core's -stdinwalletpassphrase / -stdin,
  * so `walletpassphrase` never carries the secret in argv. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -39,7 +39,7 @@ static int run_pty(const char* answer, char* out, int cap, int* saw_prompt){
 int main(void){
     const char* MN = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     char cwd[512]; if (!getcwd(cwd, sizeof cwd)) return 1;
-    snprintf(WCLI, sizeof WCLI, "%s/daemon/wallet_cli", cwd); snprintf(BCLI, sizeof BCLI, "%s/daemon/bitcoin_cli", cwd);
+    snprintf(WCLI, sizeof WCLI, "%s/daemon/wallet_cli", cwd); snprintf(BCLI, sizeof BCLI, "%s/daemon/bmc_cli", cwd);
     char tmpl[] = "/tmp/cliprompt.XXXXXX"; char* d = mkdtemp(tmpl); if (!d) return 1; snprintf(DIR, sizeof DIR, "%s", d);
     char path[1400]; snprintf(path, sizeof path, "%s/data", DIR); mkdir(path, 0700);
     snprintf(path, sizeof path, "%s/data/bmcwallet.dat", DIR);
@@ -91,7 +91,7 @@ int main(void){
       snprintf(cmd, sizeof cmd, "cd %s && printf 's3cret\\n' | %s getaddress 2>&1", d2, WCLI);
       rc = run_sh(cmd, out, sizeof out);
       ck("it opens with the typed passphrase", rc == 0 && strstr(out, "bc1q") != NULL); }
-    printf("== bitcoin_cli: -stdinwalletpassphrase / -stdin (Core semantics) ==\n");
+    printf("== bmc_cli: -stdinwalletpassphrase / -stdin (Core semantics) ==\n");
     snprintf(cmd, sizeof cmd, "printf 'hunter2\\n' | BMC_CLI_DRYRUN=1 %s -stdinwalletpassphrase -rpcport=1 -rpcuser=u -rpcpassword=p walletpassphrase 60 2>&1", BCLI);
     rc = run_sh(cmd, out, sizeof out);
     ck("the passphrase from stdin is the FIRST param, the timeout a number", rc == 0 && strstr(out, "\"params\":[\"hunter2\",60]") != NULL);

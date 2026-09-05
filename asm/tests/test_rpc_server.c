@@ -10,7 +10,7 @@
  *        - -32700 "Parse error" envelope (HTTP 500) for non-JSON bodies
  *        - -32600 for a non-object request
  *        - bit-exact V2 success/error JSON-RPC envelopes with id echo
- *   2. by exec'ing the ACTUAL daemon/bitcoin_cli against it (the paired
+ *   2. by exec'ing the ACTUAL daemon/bmc_cli against it (the paired
  *      client), asserting the printed output matches bitcoind/bitcoin-cli.
  *
  * Complements test_rpc_transport (client side) and closes the RPC-transport
@@ -47,7 +47,7 @@ static int run_cli(int port, const char* user, const char* pass,
     snprintf(uarg, sizeof uarg, "-rpcuser=%s", user);
     snprintf(parg, sizeof parg, "-rpcpassword=%s", pass);
     char* argv[16]; int ac = 0;
-    argv[ac++] = (char*)"daemon/bitcoin_cli";
+    argv[ac++] = (char*)"daemon/bmc_cli";
     argv[ac++] = portarg;
     argv[ac++] = uarg;
     argv[ac++] = parg;
@@ -190,16 +190,16 @@ int main(void) {
 
     char req[8192];
 
-    /* ============ 1. correct auth -> getnewaddress via real bitcoin_cli ===== */
+    /* ============ 1. correct auth -> getnewaddress via real bmc_cli ===== */
     extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64], unsigned index);
     unsigned char seed[64]; for (int i = 0; i < 64; i++) seed[i] = (unsigned char)(0x10 + i);
     char addr[96]; wallet_derive_p2wpkh_address(addr, 96, seed, 0);
     char expect[128]; snprintf(expect, sizeof expect, "%s\n", addr);
     run_cli(port, "bitcoin", "bitcoin", "getnewaddress", NULL);
-    ck("bitcoin_cli getnewaddress exit 0", last_exit == 0);
+    ck("bmc_cli getnewaddress exit 0", last_exit == 0);
     ck_out("getnewaddress prints raw address (real server)", expect);
 
-    /* ============ 2. getbalance via real bitcoin_cli ======================= */
+    /* ============ 2. getbalance via real bmc_cli ======================= */
     /* getbalance answers from the real scriptPubKey->UTXO address index
      * (asm/daemon/build_addr_index.c) now, not the wallet's own fake
      * utxo_* arrays. This harness never launches bitcoin_rpcd with
@@ -213,7 +213,7 @@ int main(void) {
     ck("getbalance without a rescan errors naming rescanblockchain (real server)",
        strstr(err_buf, "-4") && strstr(err_buf, "rescanblockchain"));
 
-    /* ============ 3. unknown method -> bitcoin_cli stderr ------------------ */
+    /* ============ 3. unknown method -> bmc_cli stderr ------------------ */
     run_cli(port, "bitcoin", "bitcoin", "nosuchmethod", NULL);
     ck("unknown method exit 1", last_exit == 1);
     ck("unknown method stderr bit-exact",

@@ -32,7 +32,7 @@ else
 t0=$(date +%s); git clone -q "$REPO" src || { ph "FAIL clone"; echo FAIL > RESULT; exit 1; }
 ph "CLONE done $(( $(date +%s)-t0 ))s commit=$(git -C src rev-parse --short HEAD)"
 # 2. build -- exactly the README's target
-t0=$(date +%s); ( cd src/asm && make -s daemon/bitcoind daemon/bitcoin_cli ) > build.log 2>&1 || { ph "FAIL build (see build.log)"; echo FAIL > RESULT; exit 1; }
+t0=$(date +%s); ( cd src/asm && make -s daemon/bitcoind daemon/bmc_cli ) > build.log 2>&1 || { ph "FAIL build (see build.log)"; echo FAIL > RESULT; exit 1; }
 ph "BUILD done $(( $(date +%s)-t0 ))s warnings=$(grep -c warning build.log)"
 # 3. configuration -- the sample, plus the three things a second node on one box must set
 mkdir -p data
@@ -60,7 +60,7 @@ kill -0 "$(cat daemon.pid)" 2>/dev/null || { ph "FAIL daemon exited at once (con
 grep -q "no config file" console.log && { ph "FAIL the daemon did not find the configuration (see console.log)"; kill "$(cat daemon.pid)"; echo FAIL > RESULT; exit 1; }
 ph "DAEMON pid=$(cat daemon.pid) $(grep -m1 '\[config\] net' console.log | sed 's/.*net  : //')"
 # 5. monitor until the tip, then judge
-CLI="src/asm/daemon/bitcoin_cli -datadir=$DEST/data"
+CLI="src/asm/daemon/bmc_cli -datadir=$DEST/data"
 last_phase=""
 while :; do
     sleep 600

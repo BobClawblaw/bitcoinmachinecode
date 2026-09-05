@@ -11,7 +11,7 @@
  *
  * The daemon blocks serving requests until SIGINT/SIGTERM. For integration
  * tests the TEST_RPC_PORT env overrides the port so the harness can bind the
- * real server on an ephemeral port and exec the real bitcoin_cli against it.
+ * real server on an ephemeral port and exec the real bmc_cli against it.
  */
 #include "../rpc_server.h"
 #include "../rpc_json.h"

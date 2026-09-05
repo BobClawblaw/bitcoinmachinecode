@@ -2,7 +2,7 @@
  *
  * Proves the REAL JSON-RPC transport path: a minimal loopback HTTP/1.1
  * JSON-RPC responder (pthread) dispatches requests through the shared
- * rpc_dispatch() render path, and the ACTUAL daemon/bitcoin_cli client binary
+ * rpc_dispatch() render path, and the ACTUAL daemon/bmc_cli client binary
  * is exec'd against it over a real local socket. Asserts:
  *   1. the client sends a byte-exact JSON-RPC 2.0 framed HTTP request,
  *   2. the reply the client prints is the bit-exact Core rendering
@@ -176,12 +176,12 @@ static void stop_server(void) {
                               * test process is exiting immediately anyway. */
 }
 
-/* Run the real bitcoin_cli binary; capture stdout/stderr/exit. */
+/* Run the real bmc_cli binary; capture stdout/stderr/exit. */
 static char out_buf[65536], err_buf[16384];
 static int run_cli(const char* portarg, ...) {
-    /* build argv: bitcoin_cli <portarg> method params... */
+    /* build argv: bmc_cli <portarg> method params... */
     char* argv[32]; int ac = 0;
-    argv[ac++] = (char*)"daemon/bitcoin_cli";
+    argv[ac++] = (char*)"daemon/bmc_cli";
     argv[ac++] = (char*)portarg;
     /* Credentials are passed EXPLICITLY. They used to be implicit: the client
      * hardcoded "bitcoin"/"bitcoin" and this harness relied on it silently.

@@ -33,7 +33,7 @@ echo $! > daemon.pid; sleep 5
 kill -0 "$(cat daemon.pid)" 2>/dev/null || { ph "FAIL daemon exited at once"; echo FAIL > RESULT; exit 1; }
 grep -q "no config file" console.log && { ph "FAIL daemon did not find config"; kill "$(cat daemon.pid)"; echo FAIL > RESULT; exit 1; }
 ph "DAEMON pid=$(cat daemon.pid) $(grep -m1 '\[config\] net' console.log | sed 's/.*net  : //')"
-CLI="src/asm/daemon/bitcoin_cli -datadir=$DEST/data"
+CLI="src/asm/daemon/bmc_cli -datadir=$DEST/data"
 while :; do
     sleep 600
     hb=$(grep '\[dl\] heartbeat' console.log | tail -1 | sed 's/.*heartbeat: //')

@@ -32,15 +32,15 @@ while :; do
     if [ -n "$ours" ] && [ -n "$theirs" ] && [ "$ours" -ge $((theirs-1)) ]; then
       ph "TIP reached: ours=$ours oracle=$theirs fixed-run-elapsed=$(( $(date +%s)-T0 ))s"
       sleep 120
-      O=$($SRC/asm/daemon/bitcoin_cli -datadir=$BENCH/data gettxoutsetinfo muhash 2>/dev/null)
+      O=$($SRC/asm/daemon/bmc_cli -datadir=$BENCH/data gettxoutsetinfo muhash 2>/dev/null)
       H=$(echo "$O" | python3 -c "import sys,json; print(json.load(sys.stdin)['height'])" 2>/dev/null)
       OM=$(echo "$O" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['muhash'], r['txouts'])" 2>/dev/null)
       CM=$($ORACLE gettxoutsetinfo muhash "$H" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['muhash'], r['txouts'])" 2>/dev/null)
       ph "MUHASH h=$H ours=$OM oracle=$CM"
       if [ "$OM" = "$CM" ]; then ph "PASS muhash identical at $H"; echo "PASS $H" > RESULT
       else ph "FAIL muhash differs at $H"; echo FAIL > RESULT; fi
-      $SRC/asm/daemon/bitcoin_cli -datadir=$BENCH/data getblockchaininfo > rpc_getblockchaininfo.json 2>&1
-      $SRC/asm/daemon/bitcoin_cli -datadir=$BENCH/data getnetworkinfo > rpc_getnetworkinfo.json 2>&1
+      $SRC/asm/daemon/bmc_cli -datadir=$BENCH/data getblockchaininfo > rpc_getblockchaininfo.json 2>&1
+      $SRC/asm/daemon/bmc_cli -datadir=$BENCH/data getnetworkinfo > rpc_getnetworkinfo.json 2>&1
       # P2P inbound probe: stranger handshake + getheaders answer
       out=$(timeout 20 python3 $SRC/validation/p2p_inbound_probe.py 127.0.0.1 8462 f9beb4d9 2>&1 | tail -12)
       ph "P2P inbound probe: $(echo "$out" | grep -icE 'verack|headers') relevant replies"
