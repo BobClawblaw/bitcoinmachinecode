@@ -461,7 +461,20 @@ long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[6
 
 /* Reported address type from wallet_validate_address. */
 enum wal_addr_type { WAL_ADDR_INVALID = 0, WAL_ADDR_P2PKH, WAL_ADDR_P2WPKH,
-                     WAL_ADDR_P2SH, WAL_ADDR_P2WSH, WAL_ADDR_P2TR, WAL_ADDR_UNKNOWN };
+                     WAL_ADDR_P2SH, WAL_ADDR_P2WSH, WAL_ADDR_P2TR, WAL_ADDR_UNKNOWN,
+                     /* WAL-9 (audit 2026-09-03): a checksum-valid bech32m address for
+                      * witness version 2..16. Core's IsValidDestination accepts these
+                      * (WitnessUnknown) -- validateaddress reports isvalid:true with the
+                      * version and program, and sendtoaddress PAYS them. This node
+                      * answered isvalid:false, which is a definite wrong answer about a
+                      * well-formed address, not a missing feature.
+                      *
+                      * Reachable ONLY through wallet_validate_address_ex. The old
+                      * entry point still reports these INVALID, deliberately: it hands
+                      * back a fixed 32-byte program buffer and a v2..16 program is
+                      * 2..40 bytes (BIP141), so a caller that did not ask for the
+                      * length cannot be handed one safely. */
+                     WAL_ADDR_WITNESS_UNKNOWN };
 
 /* Parse + validate an address string. Fills:
  *   *type_   - WAL_ADDR_P2PKH / WAL_ADDR_P2WPKH / WAL_ADDR_P2SH / WAL_ADDR_P2WSH
@@ -473,8 +486,12 @@ enum wal_addr_type { WAL_ADDR_INVALID = 0, WAL_ADDR_P2PKH, WAL_ADDR_P2WPKH,
  *                P2WSH script-hash) / key for P2TR. For P2TR this is the
  *                x-only output key (BIP341).
  * Returns 1 if the string is a CHECKSUM-VALID address (any recognized type), 0 if not. */
-int wallet_validate_address(const char* str, int* type_, unsigned char* version,
-                            unsigned char h160[20], unsigned char prog32[32]) {
+int wallet_validate_address_ex(const char* str, int* type_, unsigned char* version,
+                               unsigned char h160[20], unsigned char* prog,
+                               unsigned long progcap, unsigned long* proglen,
+                               int* witver) {
+    if (proglen) *proglen = 0;
+    if (witver)  *witver  = -1;
     long plen;
     unsigned char pay[128];
     /* try base58check first */
@@ -506,7 +523,7 @@ int wallet_validate_address(const char* str, int* type_, unsigned char* version,
                 unsigned char bytes[64];
                 long long bl = bech32_convert_bits(bytes, d5 + 1, n5 - 7, 5, 8, 0);
                 if (bl == 32) {
-                    if (prog32) memcpy(prog32, bytes, 32);
+                    if (prog) memcpy(prog, bytes, 32);
                     *type_ = WAL_ADDR_P2TR;
                     return 1;
                 }
@@ -522,8 +539,27 @@ int wallet_validate_address(const char* str, int* type_, unsigned char* version,
                     return 1;
                 }
                 if (bl == 32) {                         /* P2WSH */
-                    if (prog32) memcpy(prog32, bytes, 32);
+                    if (prog) memcpy(prog, bytes, 32);
                     *type_ = WAL_ADDR_P2WSH;
+                    return 1;
+                }
+            }
+            /* WAL-9: witness versions 2..16, bech32m. d5[0] is the version
+             * as a 5-bit group; BIP350 requires bech32m (spec 1) for every
+             * version but 0, and BIP141 bounds the program at 2..40 bytes. */
+            if (d5[0] >= 2 && d5[0] <= 16 &&
+                bech32_verify_checksum(hrp, hrplen, d5, n5, 1) == 1) {
+                unsigned char bytes[64];
+                long long bl = bech32_convert_bits(bytes, d5 + 1, n5 - 7, 5, 8, 0);
+                if (bl >= 2 && bl <= 40) {
+                    if (witver) *witver = (int)d5[0];
+                    if (prog && progcap >= (unsigned long)bl) {
+                        memcpy(prog, bytes, (size_t)bl);
+                        if (proglen) *proglen = (unsigned long)bl;
+                    } else if (proglen) {
+                        *proglen = (unsigned long)bl;   /* report the size even if it did not fit */
+                    }
+                    *type_ = WAL_ADDR_WITNESS_UNKNOWN;
                     return 1;
                 }
             }
@@ -531,6 +567,24 @@ int wallet_validate_address(const char* str, int* type_, unsigned char* version,
     }
     *type_ = WAL_ADDR_INVALID;
     return 0;
+}
+
+/* The pre-WAL-9 entry point, unchanged for every caller that uses it: a
+ * 32-byte program buffer and no length. Witness v2..16 is reported INVALID
+ * here exactly as it was, because those programs are 2..40 bytes and this
+ * signature cannot describe one. Callers that want them (validateaddress,
+ * getaddressinfo, and the address->scriptPubKey builder) go through
+ * wallet_validate_address_ex. */
+int wallet_validate_address(const char* str, int* type_, unsigned char* version,
+                            unsigned char h160[20], unsigned char prog32[32]) {
+    unsigned char prog[40];
+    unsigned long plen = 0;
+    int wv = -1;
+    int ok = wallet_validate_address_ex(str, type_, version, h160, prog,
+                                        sizeof prog, &plen, &wv);
+    if (ok && *type_ == WAL_ADDR_WITNESS_UNKNOWN){ *type_ = WAL_ADDR_INVALID; return 0; }
+    if (ok && prog32 && plen && plen <= 32) memcpy(prog32, prog, plen);
+    return ok;
 }
 
 /* ---- UTXO-query surface: gettxout / listunspent -------------------------- */
