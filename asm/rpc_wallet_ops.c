@@ -1548,14 +1548,36 @@ static int cmd_backupwallet(const rj_val* params, long* ec, const char** em, rj_
     const char* dest = wop_str_arg(params, 0);
     if (!dest || !dest[0]) return wop_err(ec, em, -8, "backupwallet requires a destination");
     char pb[512];
-    if (!wop_exists(WOP_WALLET_REL)) return wop_err(ec, em, -4, "No wallet file to back up");
-    const char* src = wop_path(WOP_WALLET_REL, pb, sizeof pb);
+    /* ---- WAL-12 (audit 2026-09-03): back up the wallet that EXISTS ----
+     * This looked only for bmcwallet.dat. encryptwallet writes bmcwallet.enc
+     * and UNLINKS the plaintext, so `encryptwallet x; backupwallet /mnt/w.bak`
+     * answered -4 "No wallet file to back up" on a wallet that plainly exists.
+     *
+     * The second half is worse and is the reason this is not merely an error
+     * message: walletkeys.dat holds the xprvs added by addhdkey, and nothing
+     * here ever copied it. A backup of such a wallet was accepted, reported
+     * success, and SILENTLY OMITTED keys -- the operator learns that only when
+     * restoring. Silent partial backups are the failure mode a backup command
+     * must not have. */
+    const char* primary_rel = wop_exists("bmcwallet.enc") ? "bmcwallet.enc"
+                            : (wop_exists(WOP_WALLET_REL) ? WOP_WALLET_REL : NULL);
+    if (!primary_rel) return wop_err(ec, em, -4, "No wallet file to back up");
+    int have_keys = wop_exists(WOP_HDKEYS_REL);
+    const char* src = wop_path(primary_rel, pb, sizeof pb);
     /* Core accepts a directory and writes <dir>/<walletname> into it. */
     char out[1024]; struct stat sb;
-    if (stat(dest, &sb) == 0 && S_ISDIR(sb.st_mode))
-        snprintf(out, sizeof out, "%s/%s", dest, WOP_WALLET_NAME);
+    int dest_is_dir = (stat(dest, &sb) == 0 && S_ISDIR(sb.st_mode));
+    if (dest_is_dir)
+        snprintf(out, sizeof out, "%s/%s", dest, primary_rel);
     else
         snprintf(out, sizeof out, "%s", dest);
+    /* WAL-12: a single-file destination cannot carry the companion keys, so
+     * say so instead of writing an incomplete backup. A directory can, and
+     * does, below. */
+    if (have_keys && !dest_is_dir)
+        return wop_err(ec, em, -8,
+            "this wallet has added HD keys (walletkeys.dat) that a single-file backup "
+            "cannot carry -- pass a DIRECTORY as the destination so every file is copied");
     FILE* in = fopen(src, "rb");
     if (!in) return wop_err(ec, em, -4, "Cannot open the wallet file for reading");
     FILE* o = fopen(out, "wb");
@@ -1568,6 +1590,26 @@ static int cmd_backupwallet(const rj_val* params, long* ec, const char** em, rj_
     if (fclose(o) != 0) bad = 1;
     fclose(in);
     if (bad){ remove(out); return wop_err(ec, em, -4, "Backup failed while copying; destination removed"); }
+    /* WAL-12: the companion files, when the destination is a directory. */
+    if (dest_is_dir && have_keys){
+        char kp[512], kout[1024];
+        const char* ksrc = wop_path(WOP_HDKEYS_REL, kp, sizeof kp);
+        snprintf(kout, sizeof kout, "%s/%s", dest, WOP_HDKEYS_REL);
+        FILE* ki = fopen(ksrc, "rb");
+        if (!ki){ remove(out); return wop_err(ec, em, -4, "Cannot open walletkeys.dat for reading"); }
+        FILE* ko = fopen(kout, "wb");
+        if (!ko){ fclose(ki); remove(out);
+                  return wop_err(ec, em, -4, "Cannot write walletkeys.dat to the backup directory"); }
+        char kb[16384]; size_t kn; int kbad = 0;
+        while ((kn = fread(kb, 1, sizeof kb, ki)) > 0)
+            if (fwrite(kb, 1, kn, ko) != kn){ kbad = 1; break; }
+        if (ferror(ki)) kbad = 1;
+        if (fflush(ko) != 0) kbad = 1;
+        if (fclose(ko) != 0) kbad = 1;
+        fclose(ki);
+        if (kbad){ remove(kout); remove(out);
+                   return wop_err(ec, em, -4, "Backup failed while copying walletkeys.dat; destination removed"); }
+    }
     *res = rj_null();
     return 1;
 }

@@ -449,7 +449,46 @@ int main(void){
       p = P("[]");
       D("backupwallet", p);
       ck("backupwallet with no destination -> -8", rc == 0 && ec == -8);
-      rj_free(r); rj_free(p); }
+      rj_free(r); rj_free(p);
+
+      /* ---- WAL-12 (audit 2026-09-03): companion files, and encrypted wallets
+       *
+       * backupwallet looked only for bmcwallet.dat. encryptwallet writes
+       * bmcwallet.enc and UNLINKS the plaintext, so backing up an encrypted
+       * wallet answered -4 "No wallet file to back up" on a wallet that
+       * plainly exists.
+       *
+       * The worse half: walletkeys.dat holds the xprvs from addhdkey and was
+       * NEVER copied. The backup reported success and silently omitted keys --
+       * discovered only when restoring. A single-file destination cannot carry
+       * it, so that is now refused with an instruction rather than written
+       * incomplete; a directory destination copies both.
+       *
+       * The control's other half is the plain case above, which must keep
+       * working: a wallet with no companion keys still backs up to a single
+       * file exactly as before. */
+      { FILE* kf = fopen("walletkeys.dat", "wb");
+        if (kf){ fputs("BMCKEYS v1 test", kf); fclose(kf); }
+
+        p = P("[\"single-file-backup.dat\"]");
+        D("backupwallet", p);
+        ck("WAL-12 a single-file destination is REFUSED when HD keys exist",
+           rc == 0 && ec == -8 && em && strstr(em, "DIRECTORY"));
+        rj_free(r); rj_free(p);
+
+        mkdir("bkdir", 0700);
+        p = P("[\"bkdir\"]");
+        D("backupwallet", p);
+        ck("WAL-12 a directory destination succeeds", rc == 1);
+        rj_free(r); rj_free(p);
+        { struct stat s1, s2;
+          ck("WAL-12   ...and carries the wallet file",
+             stat("bkdir/bmcwallet.dat", &s1) == 0 && s1.st_size > 0);
+          ck("WAL-12   ...AND walletkeys.dat, which used to be omitted silently",
+             stat("bkdir/walletkeys.dat", &s2) == 0 && s2.st_size > 0); }
+
+        remove("walletkeys.dat");   /* restore the fixture for later cases */
+      } }
 
     /* ---- the refusals: every one errors with a reason, none no-ops ----- */
     {   /* Nothing is refused wholesale any more. addhdkey was the last, and
