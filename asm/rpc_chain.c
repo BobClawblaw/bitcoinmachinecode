@@ -4273,6 +4273,20 @@ void rpc_chain_set_utxosetinfo(long (*run)(int, void*, char*, unsigned long)){
 }
 static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
     static char embuf[256];   /* >= msg[256]: the snprintf below copies it whole */
+    /* CSI-1 (2026-09-05, /mnt/2tbssd bmc-vs-Core benchmark): Core's second
+     * argument selects a HEIGHT or BLOCKHASH and is ONLY valid with
+     * coinstatsindex, whose per-height digests make the query O(1). This
+     * node's index persists the running digest for the APPLIED tip only
+     * (coinstats.dat: one record), and the LSM walk has no height history.
+     * The previous behavior accepted the parameter and returned the TIP set
+     * -- a silently wrong answer: the caller asked for 963,967 and received
+     * 965,626 with the right "height" field but the wrong data for what
+     * they actually queried. Core's own error text, same meaning. */
+    if (params && params->typ == RJ_ARR && params->nitems >= 2){
+        *ec = -8;
+        *em = "coinstatsindex does not support querying at historical heights";
+        return 0;
+    }
     int want_muhash = 1;   /* OUR default (documented divergence, see above) */
     if (params && params->typ == RJ_ARR && params->nitems >= 1){
         if (params->items[0]->typ != RJ_STR){

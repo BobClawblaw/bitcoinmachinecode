@@ -1283,6 +1283,16 @@ int main(void){
                  "hash_serialized_3 hash type not implemented (this node computes muhash)");
       expect_err("usi bad hash_type -> Core message shape", "gettxoutsetinfo",
                  "[\"bogus\"]", -8, "'bogus' is not a valid hash_type");
+      /* CSI-1 (2026-09-05 benchmark): height/blockhash as param 2 is NOT
+       * honored (no per-height history) and must be REFUSED, Core's own
+       * message -- previously the arg was ignored and the tip set returned,
+       * silently answering a different question than was asked. */
+      expect_err("usi height arg -> refused (no historical queries)", "gettxoutsetinfo",
+                 "[\"muhash\", 3]", -8,
+                 "coinstatsindex does not support querying at historical heights");
+      expect_err("usi blockhash arg -> refused (no historical queries)", "gettxoutsetinfo",
+                 "[\"muhash\", \"0f9188f13cb7b2c71f2a335e3a4fc325bf174ffcf8ff03b2a4c6f0e2e2f3f4f5\"]", -8,
+                 "coinstatsindex does not support querying at historical heights");
       g_usi_stub_busy = 1;
       { long e1; const char* m1; rj_val* r1 = NULL;
         rj_val* p1 = rj_parse("[]", 2);
