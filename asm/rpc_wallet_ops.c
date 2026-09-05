@@ -39,6 +39,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+/* WAL-8: Core rpcwallet.cpp MAX_SLEEP_TIME */
+#define WOP_MAX_SLEEP_TIME 100000000LL
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -1447,8 +1450,38 @@ static int cmd_walletpassphrase(const rj_val* params, long* ec, const char** em)
         params->items[0]->typ != RJ_STR || params->items[1]->typ != RJ_NUM)
         return wop_err(ec, em, -8, "walletpassphrase(passphrase, timeout)");
     const char* pass = params->items[0]->str;
-    long secs = atol(params->items[1]->str);
-    if (secs <= 0) return wop_err(ec, em, -8, "Timeout must be a positive integer");
+    /* ---- WAL-8 (audit 2026-09-03): Core's timeout semantics ----
+     * This was atol with `secs <= 0` refused under a non-Core message. Three
+     * divergences: Core ACCEPTS 0 (unlock, then relock at once), Core CLAMPS
+     * at MAX_SLEEP_TIME rather than trusting the number, and atol of a huge
+     * value saturates to LONG_MAX so time(NULL) + seconds OVERFLOWED --
+     * wrapping negative in practice, which made wenc_seed() treat the wallet
+     * as already expired on the very next access while this call had returned
+     * success. The user was told the wallet was unlocked for 68 years and it
+     * was locked immediately. */
+    errno = 0;
+    char* tend = 0;
+    long long secs_ll = strtoll(params->items[1]->str, &tend, 10);
+    if (tend && *tend) return wop_err(ec, em, -8, "Timeout must be a positive integer");
+    if (secs_ll < 0 || errno == ERANGE)
+        return wop_err(ec, em, -8, "Timeout cannot be negative.");
+    if (secs_ll > WOP_MAX_SLEEP_TIME) secs_ll = WOP_MAX_SLEEP_TIME;   /* Core clamps */
+    long secs = (long)secs_ll;
+    /* WAL-8: a zero timeout is handled HERE, not by passing 0 down.
+     * wenc_unlock reads seconds<=0 as "no timer, stay unlocked", and
+     * daemon/main.c's BOOT unlock relies on exactly that -- passing Core's 0
+     * through would have left the wallet unlocked forever instead of
+     * relocking, the precise opposite of what was asked. Core unlocks and
+     * schedules the relock for now, so with 0 the passphrase is verified and
+     * the wallet ends up locked. */
+    if (secs == 0){
+        extern void wenc_lock(void);
+        if (wenc_unlock(pass, (long)strlen(pass), 1) != 1)
+            return wop_err(ec, em, -14,
+                "Error: The wallet passphrase entered was incorrect.");
+        wenc_lock();
+        return 1;
+    }
     if (wenc_unlock(pass, (long)strlen(pass), secs) != 1)
         return wop_err(ec, em, -14,
             "Error: The wallet passphrase entered was incorrect.");

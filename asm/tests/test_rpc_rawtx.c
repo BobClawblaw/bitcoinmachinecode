@@ -364,6 +364,75 @@ int main(void){
     { rj_val* r=call("[[{\"txid\":\"deadbeef\",\"vout\":0}],[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.1}]]",&ec,&em);
       ck("short txid -> -8", r==NULL && ec==-8); rj_free(r); }
 
+    /* ---- RPX-5 (audit 2026-09-03): the 80-byte OP_RETURN cap was wrong HERE
+     * Core's createrawtransaction builds OP_RETURN <data> for ANY size -- the
+     * 80-byte limit is relay policy, applied when a transaction is accepted,
+     * not by the builder. A raw tx Core will happily construct (to sign or
+     * inspect offline) was refused with "Data too long for OP_RETURN".
+     *
+     * 100 bytes needs PUSHDATA1 (0x4c 0x64); 300 needs PUSHDATA2, which the
+     * OLD code could not encode at all -- it emitted PUSHDATA1 with a
+     * truncated length byte, unreachable only because of the cap it sat
+     * behind. Both had to change together, so both are checked. */
+    { long ec; const char* em;
+      char pj[2048]; char hex200[201]; memset(hex200,'a',200); hex200[200]=0;
+      snprintf(pj,sizeof pj,"[[{\"txid\":\"" T "\",\"vout\":0}],[{\"data\":\"%s\"}]]",hex200);
+      rj_val* r=call(pj,&ec,&em);
+      ck("RPX-5 a 100-byte OP_RETURN is BUILT, not refused", r && r->typ==RJ_STR);
+      if (r && r->typ==RJ_STR)
+          ck("RPX-5   and uses PUSHDATA1 (6a4c64)", strstr(r->str,"6a4c64")!=NULL);
+      rj_free(r); }
+    { long ec; const char* em;
+      char pj[2048]; char hex600[601]; memset(hex600,'b',600); hex600[600]=0;
+      snprintf(pj,sizeof pj,"[[{\"txid\":\"" T "\",\"vout\":0}],[{\"data\":\"%s\"}]]",hex600);
+      rj_val* r=call(pj,&ec,&em);
+      ck("RPX-5 a 300-byte OP_RETURN is BUILT", r && r->typ==RJ_STR);
+      if (r && r->typ==RJ_STR)
+          ck("RPX-5   and uses PUSHDATA2 (6a4d2c01)", strstr(r->str,"6a4d2c01")!=NULL);
+      rj_free(r); }
+    /* the control: an 80-byte payload must still encode exactly as before */
+    { long ec; const char* em;
+      char pj[512]; char hex160[161]; memset(hex160,'c',160); hex160[160]=0;
+      snprintf(pj,sizeof pj,"[[{\"txid\":\"" T "\",\"vout\":0}],[{\"data\":\"%s\"}]]",hex160);
+      rj_val* r=call(pj,&ec,&em);
+      ck("RPX-5 an 80-byte OP_RETURN still uses PUSHDATA1 (6a4c50)",
+         r && r->typ==RJ_STR && strstr(r->str,"6a4c50")!=NULL);
+      rj_free(r); }
+
+    /* ---- RPX-6 (audit 2026-09-03): duplicate address, and locktime range ---- */
+    { long ec=0; const char* em=NULL;
+      rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],"
+                     "[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001},"
+                     "{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.002}]]",&ec,&em);
+      ck("RPX-6 a repeated address is refused, as Core does", r==NULL && ec==-8);
+      rj_free(r); }
+    { long ec=0; const char* em=NULL;   /* two DIFFERENT addresses stay legal */
+      rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],"
+                     "[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001},"
+                     "{\"3P14159f73E4gFr7JterCCQh9QjiTjiZrG\":0.002}]]",&ec,&em);
+      ck("RPX-6 two different addresses are still accepted", r && r->typ==RJ_STR);
+      rj_free(r); }
+    { long ec=0; const char* em=NULL;   /* several data outputs stay legal */
+      rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],"
+                     "[{\"data\":\"aabb\"},{\"data\":\"ccdd\"}]]",&ec,&em);
+      ck("RPX-6 repeated `data` outputs are still accepted", r && r->typ==RJ_STR);
+      rj_free(r); }
+    { long ec=0; const char* em=NULL;
+      rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],"
+                     "[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001}],4294967296]",&ec,&em);
+      ck("RPX-6 a locktime past 0xffffffff is refused, not truncated", r==NULL && ec==-8);
+      rj_free(r); }
+    { long ec=0; const char* em=NULL;
+      rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],"
+                     "[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001}],-1]",&ec,&em);
+      ck("RPX-6 a negative locktime is refused, not wrapped", r==NULL && ec==-8);
+      rj_free(r); }
+    { long ec=0; const char* em=NULL;   /* the boundary itself is legal */
+      rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],"
+                     "[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001}],4294967295]",&ec,&em);
+      ck("RPX-6 locktime 0xffffffff (the boundary) is accepted", r && r->typ==RJ_STR);
+      rj_free(r); }
+
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);
     return fails?1:0;
 }
