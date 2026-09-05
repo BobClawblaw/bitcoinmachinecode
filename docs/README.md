@@ -34,6 +34,19 @@ response to it.
 | [`audits/AUDIT_RESPONSE_2026-08-30_ADDENDUM.md`](audits/AUDIT_RESPONSE_2026-08-30_ADDENDUM.md) | follow-up: 2 more closed, 2 corrections |
 | [`audits/SECURITY_AUDIT_2026-09-02.md`](audits/SECURITY_AUDIT_2026-09-02.md) | second independent audit: prior fixes re-verified, 11 new findings |
 | [`audits/CODEBASE_AUDIT_2026-09-03.md`](audits/CODEBASE_AUDIT_2026-09-03.md) | full module-by-module code audit, 13 modules, 182 findings (5 CRITICAL, 32 HIGH); consolidated priority list and prior-audit re-verification |
+| [`audits/AUDIT_2026-09-03_REMEDIATION.md`](audits/AUDIT_2026-09-03_REMEDIATION.md) | the remediation record for that audit: every finding dispositioned by id, including the ones declined and why |
+| [`audits/INFO_REMEDIATION_2026-09-05.md`](audits/INFO_REMEDIATION_2026-09-05.md) | the INFO tier worked through: what was fixed, what was accepted as risk, and the reasoning for each closure |
+| [`audits/BLD-3_CREDENTIAL_ROTATION_2026-09-05.md`](audits/BLD-3_CREDENTIAL_ROTATION_2026-09-05.md) | credential rotation record: what was rotated, how the old credential was proven dead, and the history caveat that stands |
+| [`audits/NET-10_ADDRMAN_SCOPE.md`](audits/NET-10_ADDRMAN_SCOPE.md) | scope note for the address-manager finding |
+
+## Reports
+
+[`reports/`](reports/) holds findings written to be read outside the
+project, in Markdown, HTML and BBCode forms of the same text.
+
+| | |
+|---|---|
+| [`reports/MINED_TX_CORPUS.md`](reports/MINED_TX_CORPUS.md) | the mined-transaction corpus: 17 real chain transactions replayed at their own heights as a consensus-acceptance test, the two controls that prove the corpus discriminates, and the gap those controls left named |
 
 ## Development history
 

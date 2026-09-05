@@ -137,6 +137,20 @@ static int bf_cmp_u64(const void* a, const void* b){
     return x < y ? -1 : x > y ? 1 : 0;
 }
 
+/* STO-14: order two elements by CONTENT, so equal elements land adjacent and
+ * can be dropped. Core keeps its elements in
+ * `std::unordered_set<std::vector<unsigned char>>`, which de-duplicates by
+ * VALUE; sorting is this implementation's way of reaching the same set
+ * without a hash table. The particular order does not matter -- only that
+ * equal elements compare equal -- so length first (cheap, and it makes the
+ * memcmp safe) then bytes. */
+static int bf_cmp_el(const void* a, const void* b){
+    const bf_script* x = (const bf_script*)a;
+    const bf_script* y = (const bf_script*)b;
+    if (x->len != y->len) return x->len < y->len ? -1 : 1;
+    return memcmp(x->script, y->script, x->len);
+}
+
 long bf_basic_build(const unsigned char* block, unsigned long blocklen,
                     const unsigned char block_hash[32],
                     const bf_script* prevouts, unsigned long n_prevouts,
@@ -148,20 +162,26 @@ long bf_basic_build(const unsigned char* block, unsigned long blocklen,
 
     /* worst case: every output plus every prevout is an element */
     unsigned long max_el = n_prevouts + blocklen / 9 + 16;
+    /* STO-14 (audit 2026-09-03): collect the ELEMENTS, de-duplicate them by
+     * content, and only then hash -- which is what Core does. See the block
+     * below the walk for why the old order (hash first, de-duplicate the
+     * hashes) was not equivalent. */
+    bf_script* el = malloc(max_el * sizeof *el);
     unsigned long long* h = malloc(max_el * sizeof *h);
-    if (!h) return -1;
+    if (!el || !h){ free(el); free(h); return -1; }
     unsigned long n = 0;
 
     for (unsigned long i = 0; i < n_prevouts; i++)
-        if (bf_element_ok(prevouts[i].script, prevouts[i].len) && n < max_el)
-            h[n++] = bf_siphash(k0, k1, prevouts[i].script, prevouts[i].len);
+        if (bf_element_ok(prevouts[i].script, prevouts[i].len) && n < max_el){
+            el[n].script = prevouts[i].script; el[n].len = prevouts[i].len; n++;
+        }
 
     /* walk the block's transactions for output scripts */
     const unsigned char* p = block + 80;
     const unsigned char* end = block + blocklen;
     unsigned long cc;
     unsigned long ntx = bf_varint(p, end, &cc);
-    if (cc == 0){ free(h); return -1; }
+    if (cc == 0){ free(el); free(h); return -1; }
     p += cc;
     for (unsigned long t = 0; t < ntx; t++){
         if (p + 4 > end) goto malformed;
@@ -189,8 +209,9 @@ long bf_basic_build(const unsigned char* block, unsigned long blocklen,
             if (cc == 0) goto malformed;
             p += cc;
             if (p + sl > end) goto malformed;
-            if (bf_element_ok(p, sl) && n < max_el)
-                h[n++] = bf_siphash(k0, k1, p, sl);
+            if (bf_element_ok(p, sl) && n < max_el){
+                el[n].script = p; el[n].len = sl; n++;      /* STO-14 */
+            }
             p += sl;
         }
         if (segwit){
@@ -210,49 +231,57 @@ long bf_basic_build(const unsigned char* block, unsigned long blocklen,
         p += 4;
     }
 
-    /* de-duplicate AFTER hashing: BIP158 de-duplicates the element set, and
-     * STO-14 (audit 2026-09-03): this dedups on the 64-bit SIPHASH, where
-     * Core's GCSFilter dedups the byte-wise ELEMENT SET before hashing.
+    /* ---- STO-14 (audit 2026-09-03): de-duplicate the ELEMENT SET, as Core
+     * does, and then hash. --------------------------------------------------
      *
-     * The difference is observable only when two DISTINCT scripts in one
-     * block collide on 64 bits: N would then be one less than Core's, and
-     * since N scales the Golomb-Rice range (N * 784931 below), the entire
-     * filter would differ -- not one entry. Probability is ~n^2 / 2^65 per
-     * block; at a few thousand elements that is around 2^-40.
+     * This used to hash first and de-duplicate the 64-bit SipHash values.
+     * That is NOT equivalent to Core, in two ways, and both are fixed here:
      *
-     * DELIBERATELY NOT "FIXED". Byte-wise dedup means collecting every
-     * element as a (pointer, length) pair, sorting by content and comparing
-     * with memcmp, inside filter generation -- a KAT-backed path whose output
-     * peers consume. Rewriting it to avoid a 2^-40 event is a worse trade
-     * than carrying the divergence knowingly, so it is recorded here and in
-     * docs/FEATURE_GAPS.md rather than left as an unstated caveat on the
-     * "byte-identical to Core" claim.
+     *  1. THE DEDUP KEY. Core holds its elements in
+     *       std::unordered_set<std::vector<unsigned char>, ByteVectorHash>
+     *     (blockfilter.h), so N is the count of distinct ELEMENTS. Hashing
+     *     first makes N the count of distinct HASHES. Those agree until two
+     *     DISTINCT scripts collide on 64 bits, at which point our N was one
+     *     lower -- and since N scales the Golomb-Rice range (N * M below),
+     *     the WHOLE filter changed, not one entry.
      *
-     * Sort first anyway (the encoding needs sorted values), then drop equal
-     * neighbours. */
-    {
-        /* map to [0, N*M) -- but N is the DE-DUPLICATED count, so dedup the
-         * raw hashes first, then map. Dedup on the raw 64-bit hash. */
-        qsort(h, n, sizeof *h, bf_cmp_u64);
-        unsigned long w = 0;
-        for (unsigned long i = 0; i < n; i++){
-            if (w > 0 && h[w-1] == h[i]) continue;
-            h[w++] = h[i];
-        }
-        n = w;
-    }
+     *  2. CORE DOES NOT DE-DUPLICATE AFTER HASHING. BuildHashedSet maps every
+     *     element through HashToRange and sorts; it never drops equal values.
+     *     So when two distinct elements DO collide, Core emits both (the
+     *     second as a zero delta). Dropping one, as we did, is a second
+     *     divergence hiding behind the first. There is deliberately no dedup
+     *     of `h` below.
+     *
+     * Identical scripts still collapse to one element, exactly as before and
+     * exactly as Core -- equal bytes are equal in the set. The behaviour that
+     * changes is only the collision case.
+     *
+     * Cost: one extra sort over (pointer, length) pairs. The elements are not
+     * copied; el[] points into the block and the caller's prevout scripts,
+     * both of which outlive this function. */
+    qsort(el, n, sizeof *el, bf_cmp_el);
+    { unsigned long w = 0;
+      for (unsigned long i = 0; i < n; i++){
+          if (w > 0 && el[w-1].len == el[i].len &&
+              memcmp(el[w-1].script, el[i].script, el[i].len) == 0) continue;
+          el[w++] = el[i];
+      }
+      n = w; }
+    for (unsigned long i = 0; i < n; i++)
+        h[i] = bf_siphash(k0, k1, el[i].script, el[i].len);
+
     unsigned long long nm = (unsigned long long)n * 784931ULL;
     for (unsigned long i = 0; i < n; i++) h[i] = bf_map(h[i], nm);
     qsort(h, n, sizeof *h, bf_cmp_u64);
 
     /* serialize: CompactSize(N) then the Golomb-Rice stream */
     unsigned long o = 0;
-    if (n < 0xfd){ if (o >= cap){ free(h); return -1; } out[o++] = (unsigned char)n; }
+    if (n < 0xfd){ if (o >= cap){ free(el); free(h); return -1; } out[o++] = (unsigned char)n; }
     else if (n <= 0xffff){
-        if (o + 3 > cap){ free(h); return -1; }
+        if (o + 3 > cap){ free(el); free(h); return -1; }
         out[o++] = 0xfd; out[o++] = (unsigned char)n; out[o++] = (unsigned char)(n >> 8);
     } else {
-        if (o + 5 > cap){ free(h); return -1; }
+        if (o + 5 > cap){ free(el); free(h); return -1; }
         out[o++] = 0xfe;
         for (int i = 0; i < 4; i++) out[o++] = (unsigned char)(n >> (8*i));
     }
@@ -267,12 +296,12 @@ long bf_basic_build(const unsigned char* block, unsigned long blocklen,
         bw_bit(&w, 0);
         bw_bits(&w, d & ((1ULL << 19) - 1), 19);
     }
-    free(h);
+    free(el); free(h);
     if (w.overflow) return -1;
     return (long)(o + ((w.bitpos + 7) >> 3));
 
 malformed:
-    free(h);
+    free(el); free(h);
     return -1;
 }
 
