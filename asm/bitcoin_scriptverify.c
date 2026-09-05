@@ -349,7 +349,13 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
      * which is the safe direction to fail in. */
     sv_get_locktime_context(tx, txlen, nIn, &ctx.tx_version, &ctx.tx_locktime, &ctx.in_sequence);
 
-    memset(main_e, 0, MAX_STACK*ELEM_SIZE);
+    /* IR-7 (INTERP_REVIEW_2026-09-05): no per-call zeroing of the 528,000-byte
+     * arena. No reader touches a record beyond [rec+4, rec+4+len) -- the
+     * witness drivers run the same interpreter on never-zeroed arenas -- and
+     * st.sp = 0 makes every record dead. Proven by running the whole
+     * interpreter suite with the arena POISONED (0xAA) instead of zeroed. This
+     * memset plus the two whole-arena copies below cost ~1.06 MB of dead memory
+     * traffic per legacy input, ~1.6 MB per P2SH spend. */
 
     if ((flags & SV_SIGPUSHONLY) && !sv_push_only(scriptSig, ssl))
         return SCRIPT_ERR_SIG_PUSHONLY;
@@ -358,7 +364,7 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
         return err;
 
     if (flags & SV_P2SH){
-        memcpy(copy_e, main_e, MAX_STACK*ELEM_SIZE);
+        memcpy(copy_e, main_e, st.sp*ELEM_SIZE);   /* IR-7: live records only */
         cp.sp = st.sp;
     }
 
@@ -379,7 +385,7 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
         memcpy(redeem, sv_dat(&cp, cp.sp-1), rl);
 
         cp.sp--;                          /* pop the serialised script */
-        memcpy(main_e, copy_e, MAX_STACK*ELEM_SIZE);
+        memcpy(main_e, copy_e, cp.sp*ELEM_SIZE);   /* IR-7: live records only */
         st.sp = cp.sp;
 
         if (!sv_run(redeem, rl, &st, flags, &ctx, &err))

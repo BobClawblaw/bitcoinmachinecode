@@ -236,11 +236,8 @@ sv_verify_script_asm:
     lea  r9,  [rbp-0xa8+CTX_SEQUENCE]
     call sv_get_locktime_context
 
-    ; memset(main_e, 0, ARENA_BYTES) -- the C's per-call zeroing
-    mov  rdi, [rbp-0xb8]
-    xor  eax, eax
-    mov  ecx, ARENA_BYTES
-    rep  stosb
+    ; IR-7: the C twin no longer zeroes the arena per call (dead traffic; no
+    ; reader touches bytes beyond a record's len). Mirrored exactly.
 
     ; SIGPUSHONLY gate
     test r14, SV_SIGPUSHONLY
@@ -265,7 +262,8 @@ sv_verify_script_asm:
     jz   .run_spk
     mov  rdi, [rbp-0xc0]                 ; copy_e
     mov  rsi, [rbp-0xb8]                 ; main_e
-    mov  ecx, ARENA_BYTES
+    mov  rcx, [rbp-0x50]                 ; IR-7: st.sp live records only
+    imul rcx, ELEM_SIZE
     rep  movsb
     mov  rax, [rbp-0x50]
     mov  [rbp-0x60], rax                 ; cp.sp = st.sp
@@ -327,7 +325,8 @@ sv_verify_script_asm:
     dec  qword [rbp-0x60]
     mov  rdi, [rbp-0xb8]
     mov  rsi, [rbp-0xc0]
-    mov  ecx, ARENA_BYTES
+    mov  rcx, [rbp-0x60]                 ; IR-7: cp.sp live records only
+    imul rcx, ELEM_SIZE
     rep  movsb
     mov  rax, [rbp-0x60]
     mov  [rbp-0x50], rax
