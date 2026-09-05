@@ -42,11 +42,12 @@
  *   - getblockchaininfo "verificationprogress" is blocks/headers, not Core's
  *     tx-count-weighted GuessVerificationProgress. "initialblockdownload" is
  *     "tip older than 24h" (Core also requires min chainwork).
- *   - getblock verbosity 3 behaves like 2. RPX-2 (2026-09-05): the reason
- *     given here was "no undo data => no prevout/fee", which was never true --
- *     getblock v2 has computed fees from undo_<h>.dat all along, and
- *     getrawtransaction verbosity 2 now reads prevouts from the same file.
- *     getblock v3's prevouts are simply not wired yet; the data is there.
+ *   - getblock verbosity 3 now carries Core's per-input `prevout`
+ *     {generated, height, value, scriptPubKey}, from the same undo_<h>.dat
+ *     the v2 fees come from. (RPX-2 corrected the old claim here that v3
+ *     behaved like v2 for want of undo data -- never true; the fees beside it
+ *     always came from that file. Wired 2026-09-05.) When the undo file is
+ *     pruned the fields are omitted, which is what Core does too.
  *   - uptime/stop apply to THIS RPC process (bitcoin_rpcd), which is not the
  *     block-relaying node; stop's reply names this project, not Core.
  */
@@ -1406,6 +1407,21 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
      * (fee omitted, honest -- we keep only a recent-heights window). */
     static u64 undo_vals[600000]; long undo_n = -1, undo_cur = 0;
     if (verbosity >= 2) undo_n = undo_block_values(h, undo_vals, (long)(sizeof undo_vals / sizeof undo_vals[0]));
+    /* verbosity 3 additionally carries Core's per-input `prevout`
+     * {generated, height, value, scriptPubKey}. Same undo file the fees above
+     * come from -- undo_block_load reads the WHOLE record (value, height,
+     * coinbase flag and the scriptPubKey) where undo_block_values keeps only
+     * the value.
+     *
+     * This file's own header used to explain verbosity 3 behaving like 2 as
+     * "no undo data => no prevout/fee". That was never the reason -- the fees
+     * beside it have always come from undo_<h>.dat. RPX-2 corrected the
+     * comment and wired getRAWtransaction's verbosity 2; this wires getblock's
+     * verbosity 3, from the same loader. */
+    static undo_prevout_t undo_pv[600000]; long undo_pn = -1;
+    u8* undo_raw = NULL;
+    if (verbosity >= 3)
+        undo_pn = undo_block_load(h, undo_pv, (long)(sizeof undo_pv / sizeof undo_pv[0]), &undo_raw);
     for (u64 i = 0; i < ntx; i++){
         txw_t w;
         if (!tx_walk(p, end, &w)){ rj_free(txs); if (cb) rj_free(cb); rj_free(o); *ec = -1; *em = "Block decode failed"; return 0; }
@@ -1433,11 +1449,20 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
                 in_total = 0;
                 for (u64 k = 0; k < w.n_in; k++) in_total += (long long)undo_vals[undo_cur + k];
             }
+            /* the prevout slice for THIS transaction starts where the fee
+             * accumulator is, since both walk the same undo file in the same
+             * block order -- read it before undo_cur advances below. */
+            const undo_prevout_t* pv = NULL; long pvn = 0;
+            if (verbosity >= 3 && i > 0 && undo_pn >= 0 &&
+                undo_cur + (long)w.n_in <= undo_pn){
+                pv = undo_pv + undo_cur; pvn = (long)w.n_in;
+            }
             if (i > 0 && undo_n >= 0) undo_cur += (long)w.n_in;   /* advance even if capped */
-            rj_arr_push(txs, tx_to_json(p, &w, in_total));
+            rj_arr_push(txs, tx_to_json_pv(p, &w, in_total, pv, pvn));
         }
         p += w.len;
     }
+    free(undo_raw);                      /* verbosity 3 prevout backing store */
     rj_obj_set(o, "strippedsize", rj_numf("%zu", stripped));
     rj_obj_set(o, "size", rj_numf("%ld", len));
     rj_obj_set(o, "weight", rj_numf("%zu", stripped * 3 + (size_t)len));

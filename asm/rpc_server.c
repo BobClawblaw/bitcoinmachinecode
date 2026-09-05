@@ -1022,7 +1022,9 @@ static void service_conn(int cfd) {
 static void* server_thread(void* arg) {
     (void)arg;
     while (g_run) {
-        struct sockaddr_in cli; socklen_t cl = sizeof cli;
+        /* RPC-18: sockaddr_storage, so an IPv6 peer's address is not
+         * truncated into a sockaddr_in and then formatted as nonsense. */
+        struct sockaddr_storage cli; socklen_t cl = sizeof cli;
         int c = accept(g_listen_fd, (struct sockaddr*)&cli, &cl);
         if (c < 0) {
             /* RPC-1: `continue` with no pause spun a core whenever accept
@@ -1048,7 +1050,15 @@ static void* server_thread(void* arg) {
          * narrow allow list must still refuse everyone else. */
         if (g_allows){
             char ip[64] = {0};
-            inet_ntop(AF_INET, &cli.sin_addr, ip, sizeof ip);
+            /* RPC-18: format from the family the peer actually arrived on.
+             * The listener is never dual-stack (IPV6_V6ONLY is forced), so
+             * this is always the honest form for that socket -- no v4-mapped
+             * ::ffff:127.0.0.1 that an IPv4 ACL rule would then fail to
+             * match. */
+            if (cli.ss_family == AF_INET6)
+                inet_ntop(AF_INET6, &((struct sockaddr_in6*)&cli)->sin6_addr, ip, sizeof ip);
+            else
+                inet_ntop(AF_INET, &((struct sockaddr_in*)&cli)->sin_addr, ip, sizeof ip);
             if (!g_allows(ip)){
                 fprintf(stderr, "[rpc] refused connection from %s "
                                 "(not in -rpcallowip)\n", ip);
@@ -1093,39 +1103,83 @@ int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
     /* never die from a peer closing a socket mid-write (SIGPIPE) */
     signal(SIGPIPE, SIG_IGN);
 
-    g_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    /* RPC-18 (audit 2026-09-03): the listener was AF_INET only, so
+     * `rpcbind=::1` was a startup error, every IPv6 -rpcallowip entry was
+     * unreachable, and rpc_acl.c's ::1 default could never match. It binds
+     * either family now.
+     *
+     * WHICH FAMILY: decided by the CONFIGURED ADDRESS, not by a flag. An
+     * address containing ':' is IPv6; anything else is tried as IPv4 first
+     * and then as IPv6, so a malformed value still fails with one clear
+     * message instead of two confusing ones. With no -rpcbind the default is
+     * IPv4 loopback, unchanged -- this must not quietly start listening
+     * somewhere new on an existing deployment.
+     *
+     * NOT dual-stack on one socket. A v6 socket with IPV6_V6ONLY off would
+     * accept v4 as v4-mapped addresses (::ffff:127.0.0.1), which the ACL
+     * would then have to special-case to match a plain 127.0.0.1 rule --
+     * exactly the kind of address-shape bug this audit round has been
+     * removing. One family per socket, V6ONLY forced on, and the peer string
+     * the ACL sees is the honest one for that family. */
+    struct sockaddr_storage ss; memset(&ss, 0, sizeof ss);
+    socklen_t sslen;
+    int family = AF_INET;
+    const char* baddr = (cfg->bind_addr && cfg->bind_addr[0]) ? cfg->bind_addr : NULL;
+
+    if (baddr && strchr(baddr, ':')) family = AF_INET6;
+
+    if (family == AF_INET){
+        struct sockaddr_in* a4 = (struct sockaddr_in*)&ss;
+        a4->sin_family = AF_INET;
+        a4->sin_port = htons((unsigned short)cfg->port);
+        a4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (baddr && inet_pton(AF_INET, baddr, &a4->sin_addr) != 1){
+            snprintf(errmsg, errcap,
+                     "rpcbind=%s is not a valid IP address (IPv4 expected; an "
+                     "IPv6 address must contain ':')", baddr);
+            return -1;
+        }
+        sslen = sizeof *a4;
+    } else {
+        struct sockaddr_in6* a6 = (struct sockaddr_in6*)&ss;
+        a6->sin6_family = AF_INET6;
+        a6->sin6_port = htons((unsigned short)cfg->port);
+        a6->sin6_addr = in6addr_loopback;
+        if (baddr && inet_pton(AF_INET6, baddr, &a6->sin6_addr) != 1){
+            snprintf(errmsg, errcap, "rpcbind=%s is not a valid IPv6 address", baddr);
+            return -1;
+        }
+        sslen = sizeof *a6;
+    }
+
+    g_listen_fd = socket(family, SOCK_STREAM, 0);
     if (g_listen_fd < 0) {
-        if (errmsg && errcap) snprintf(errmsg, errcap, "socket() failed");
+        if (errmsg && errcap) snprintf(errmsg, errcap, "socket() failed: %s", strerror(errno));
         return -1;
     }
     int one = 1;
     setsockopt(g_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in a; memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_port = htons((unsigned short)cfg->port);
-    /* Core -rpcbind. Loopback unless an address is configured AND the caller
-     * satisfied Core's rule that -rpcbind without -rpcallowip is ignored. */
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (cfg->bind_addr && cfg->bind_addr[0]){
-        if (inet_pton(AF_INET, cfg->bind_addr, &a.sin_addr) != 1){
-            snprintf(errmsg, errcap, "rpcbind=%s is not a valid IPv4 address",
-                     cfg->bind_addr);
-            close(g_listen_fd); g_listen_fd = -1; return -1;
-        }
+    if (family == AF_INET6){
+        /* see the note above: no v4-mapped addresses reaching the ACL */
+        setsockopt(g_listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
     }
-    if (bind(g_listen_fd, (struct sockaddr*)&a, sizeof a) < 0) {
-        if (errmsg && errcap) snprintf(errmsg, errcap, "bind() failed on port %d", cfg->port);
+    if (bind(g_listen_fd, (struct sockaddr*)&ss, sslen) < 0) {
+        if (errmsg && errcap)
+            snprintf(errmsg, errcap, "bind() failed on %s port %d: %s",
+                     family == AF_INET6 ? "IPv6" : "IPv4", cfg->port, strerror(errno));
         close(g_listen_fd); g_listen_fd = -1;
         return -1;
     }
     if (listen(g_listen_fd, 16) < 0) {
-        if (errmsg && errcap) snprintf(errmsg, errcap, "listen() failed");
+        if (errmsg && errcap) snprintf(errmsg, errcap, "listen() failed: %s", strerror(errno));
         close(g_listen_fd); g_listen_fd = -1;
         return -1;
     }
-    socklen_t al = sizeof a;
-    getsockname(g_listen_fd, (struct sockaddr*)&a, &al);
-    if (actual_port) *actual_port = ntohs(a.sin_port);
+    { socklen_t al = sizeof ss;
+      if (getsockname(g_listen_fd, (struct sockaddr*)&ss, &al) == 0 && actual_port)
+          *actual_port = ntohs(family == AF_INET6
+                               ? ((struct sockaddr_in6*)&ss)->sin6_port
+                               : ((struct sockaddr_in*)&ss)->sin_port); }
 
     g_threads   = cfg->threads   > 0 ? (cfg->threads > 256 ? 256 : cfg->threads) : 16;
     g_workqueue = cfg->workqueue > 0 ? (cfg->workqueue > RPC_QUEUE_CAP ? RPC_QUEUE_CAP : cfg->workqueue) : 64;

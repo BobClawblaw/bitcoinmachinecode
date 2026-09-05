@@ -1705,6 +1705,48 @@ int main(void){
       ck("getindexinfo(unknown) -> {}", r && r->typ == RJ_OBJ && r->nmembers == 0);
       rj_free(r); }
 
+    /* ---- getblock verbosity 3: Core's per-input prevout -------------------
+     * v3 used to be identical to v2. The undo file that v2's fees come from
+     * carries the whole record -- value, height, coinbase flag AND the
+     * scriptPubKey -- so the data was always present; only the wiring was
+     * missing. undo_3.dat (written above for the fee test) has record 0 as a
+     * GENERATED coin at height 1 with a P2WPKH script. */
+    printf("\n---- getblock verbosity 3: prevout ----\n");
+    { char p3[128]; snprintf(p3, sizeof p3, "[\"%s\", 3]", g_hash[3]);
+      rj_val* r3 = call("getblock", p3, &ec, &em);
+      ck("getblock v3 returns an object", r3 && r3->typ == RJ_OBJ);
+      rj_val* tx3 = G(r3, "tx");
+      rj_val* t1 = tx3 && tx3->nitems > 1 ? tx3->items[1] : NULL;
+      /* fees must still be there -- v3 is v2 PLUS prevouts, not instead of */
+      ck_str("v3 keeps v2's fee", S(t1, "fee"), "0.01000000");
+      rj_val* vin = t1 ? G(t1, "vin") : NULL;
+      rj_val* i0  = vin && vin->nitems ? vin->items[0] : NULL;
+      rj_val* pv  = i0 ? G(i0, "prevout") : NULL;
+      ck("v3: the input carries a prevout object", pv && pv->typ == RJ_OBJ);
+      ck_str("v3 prevout.value", S(pv, "value"), "50.00000000");
+      ck_str("v3 prevout.height", S(pv, "height"), "1");
+      ck_str("v3 prevout.generated (it spent a coinbase)", S(pv, "generated"), "1");
+      { rj_val* pspk = pv ? G(pv, "scriptPubKey") : NULL;
+        ck_str("v3 prevout.scriptPubKey.hex", S(pspk, "hex"),
+               "0014751e76e8199196d454941c45d1b3a323f1433bd6"); }
+      /* the coinbase spends nothing, so it gets no prevout at any verbosity */
+      { rj_val* cbv = tx3 && tx3->nitems ? G(tx3->items[0], "vin") : NULL;
+        rj_val* cbi = cbv && cbv->nitems ? cbv->items[0] : NULL;
+        ck("v3: the coinbase input has no prevout", cbi && G(cbi, "prevout") == NULL); }
+      rj_free(r3); }
+
+    /* THE OPPOSITE HALF: verbosity 2 must NOT have gained prevouts. If it had,
+     * v3 would still be "identical to v2" -- just in the other direction. */
+    { char p2b[128]; snprintf(p2b, sizeof p2b, "[\"%s\", 2]", g_hash[3]);
+      rj_val* r2 = call("getblock", p2b, &ec, &em);
+      rj_val* tx2 = G(r2, "tx");
+      rj_val* u1  = tx2 && tx2->nitems > 1 ? tx2->items[1] : NULL;
+      rj_val* v2v = u1 ? G(u1, "vin") : NULL;
+      rj_val* v2i = v2v && v2v->nitems ? v2v->items[0] : NULL;
+      ck("verbosity 2 still has NO prevout", v2i && G(v2i, "prevout") == NULL);
+      ck_str("...but still has its fee", S(u1, "fee"), "0.01000000");
+      rj_free(r2); }
+
     /* ---- RPX-4: gettxout's four hardcoded fields --------------------------
      * bestblock was the all-zero hash, confirmations was 0, and asm/desc were
      * empty strings -- each a definite WRONG value rather than a missing one,
