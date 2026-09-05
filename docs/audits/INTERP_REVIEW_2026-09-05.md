@@ -187,9 +187,9 @@ what is open.
 | IR-15 | **accepted** | -- | the FindAndDelete in `sv_checksig` is required for plain `OP_CHECKSIG` (Core does it in the opcode handler) and is a no-op over an already-stripped slice inside `CHECKMULTISIG` (`bitcoin_interp.asm:3324-3336` strips every signature once, BASE only, as Core does). Removing the redundancy needs a "called from multisig" flag through the checksig callback ABI, for at most 20×20 scans per multisig. Correct; not worth the surface |
 | IR-16 | deferred | -- | a jump table is a dispatch-loop rewrite; the 73-compare chain costs on the order of 100 ns per opcode worst case and no valid-block shape makes it dominant. Its own change |
 | IR-5 | **CLOSED** | `f3730ab` | per-thread memo scoped by a per-transaction session key handed out by `tx_verify.c` (never the buffer address; key 0 = no caching); 14,000 real P2WPKH signatures on one core: **5,288 ms → 565 ms**; session digests equal uncached digests for every input × hashtype; a new transaction over the same buffer under a new key yields its own digest. The first control ran across 8 SHA-NI cores and did not fail -- the recompute hid under ECDSA -- so the test pins one core, which is the cost the finding is about
-| IR-6 | **OPEN** | -- | design scoped: a handle/index array over records so erase/insert/swap move 8-byte slots is a change to the stack representation every opcode touches; it wants the differential harnesses extended first |
+| IR-6 | **OPEN** | -- | scoped in `docs/audits/IR-6_STACK_REPRESENTATION_SCOPE.md`. Correctness is now pinned (`test_scr_interp_bounds`: full final order under BASE, and a 60,000-roll tapscript storm over 999 x 520-byte items whose survivor is checked), and the cost model is confirmed at 669 ms / ~31 GB moved -- scaling to the review's ~10 s for a 3.4 MB leaf. Not closeable in a batch: `elems + p*ELEM_SIZE` with inline data is an ABI the daemon's C verifier and five harnesses read directly, so both candidate representations break it. Differentials first |
 
-**13 of 17 closed; 2 accepted or tracked; 1 deferred; 1 open (scoped).**
+**13 of 17 closed; 2 accepted or tracked; 1 deferred; 1 open (IR-6, scoped in its own document).**
 
 ## 8. Found while closing
 
