@@ -35,6 +35,63 @@
 
 section .text
 
+; ============================================================================
+; DER_LONG_LEN %1 -- SCR-8: decode a long-form DER length, mirroring Core's
+;   ecdsa_signature_parse_der_lax INTEGER arm exactly.
+;
+;   A MACRO, not a function, and deliberately so: it advances the CURSOR, and
+;   the cursor lives in rbx. A callee that returns with rbx changed violates
+;   the SysV contract `callee-saved-check` enforces over this whole tree --
+;   which is exactly what that audit caught when this was first written as a
+;   `call`. The same thing happened to CRY-3's FE_REQUIRE_LT_P earlier in this
+;   remediation. Inlining sidesteps the question rather than arguing with it,
+;   and there are only two use sites.
+;
+;   in : ecx = the length header byte (high bit already known set)
+;        rbx = cursor, just past that byte
+;        r12 = sig base, r13 = sig length
+;   out: rcx = the decoded length, rbx advanced past the length bytes
+;        jumps to %1 on malformed input
+;
+;   Core's rules, in order: subtract 0x80; reject if that exceeds the bytes
+;   remaining; skip leading ZERO length bytes; reject at >= 4 remaining
+;   significant bytes; accumulate the rest big-endian.
+;
+;   Clobbers rax, rcx, rdx, r8.
+; ============================================================================
+%macro DER_LONG_LEN 1
+    and   ecx, 0x7f
+    lea   rax, [r12+r13]       ; end of sig
+    mov   rdx, rax
+    sub   rdx, rbx             ; bytes remaining
+    cmp   rcx, rdx
+    ja    %1
+%%skip0:
+    test  rcx, rcx
+    jz    %%acc
+    cmp   byte [rbx], 0x00
+    jne   %%acc
+    inc   rbx
+    dec   rcx
+    jmp   %%skip0
+%%acc:
+    cmp   rcx, 4               ; Core: `if (lenbyte >= 4) return 0;`
+    jae   %1
+    xor   r8, r8               ; accumulator
+%%loop:
+    test  rcx, rcx
+    jz    %%done
+    shl   r8, 8
+    movzx eax, byte [rbx]
+    add   r8, rax
+    inc   rbx
+    dec   rcx
+    jmp   %%loop
+%%done:
+    mov   rcx, r8
+%endmacro
+
+
 der_parse_sig:
     push  rbp
     mov   rbp, rsp
@@ -56,16 +113,58 @@ der_parse_sig:
     jb    .fail
     cmp   byte [r12], 0x30
     jne   .fail
-    ; len byte (r12+1): sequence length; must satisfy 2+seq_len <= slen
-    ; (best-effort; we still rely on explicit 0x02 markers)
-    ; ---- r: expect 0x02 rlen ----
-    cmp   byte [r12+2], 0x02
+    ; ---- SCR-8 (audit 2026-09-03): LONG-FORM DER lengths ------------------
+    ; Core verifies ECDSA through ecdsa_signature_parse_der_lax (pubkey.cpp),
+    ; which accepts a long-form length (0x81 xx, 0x82 xx xx, ...) for the
+    ; SEQUENCE and for each INTEGER. This parser read every length as one
+    ; byte, so a signature Core ACCEPTS was rejected here.
+    ;
+    ; That direction matters: rejecting what Core accepts means refusing a
+    ; block Core connects, i.e. a chain split -- not a missed feature. It is
+    ; unreachable once DERSIG is active (height >= 363,725) because
+    ; der_sig_strict runs first and forbids long form, so this is about
+    ; pre-BIP66 history replayed with assumevalid=0 -- exactly what a full
+    ; validating replay from genesis does.
+    ;
+    ; rbx = cursor. Core's shape is followed exactly, including the parts that
+    ; look odd: a long-form SEQUENCE length is SKIPPED without being checked
+    ; (Core does `pos += lenbyte` and never reads the value), while a
+    ; long-form INTEGER length has its leading zero bytes skipped, is rejected
+    ; at >= 4 significant bytes, and is then accumulated big-endian.
+    lea   rbx, [r12+1]         ; cursor -> sequence length byte
+    movzx ecx, byte [rbx]
+    inc   rbx
+    test  ecx, 0x80
+    jz    .seq_done
+    and   ecx, 0x7f            ; number of length bytes to skip
+    ; lenbyte > inputlen - pos  ->  reject (Core's bound)
+    lea   rax, [r12+r13]       ; end of sig
+    mov   rdx, rax
+    sub   rdx, rbx             ; remaining
+    cmp   rcx, rdx
+    ja    .fail
+    add   rbx, rcx             ; Core skips the value entirely
+.seq_done:
+    ; ---- r: expect 0x02 then a short- or long-form length ----
+    lea   rax, [r12+r13]
+    cmp   rbx, rax
+    jae   .fail
+    cmp   byte [rbx], 0x02
     jne   .fail
-    movzx ecx, byte [r12+3]    ; rlen
+    inc   rbx
+    cmp   rbx, rax
+    jae   .fail
+    movzx ecx, byte [rbx]
+    inc   rbx
+    test  ecx, 0x80
+    jz    .r_len_short
+    DER_LONG_LEN .fail
+    jmp   .r_len_done
+.r_len_short:
+.r_len_done:
     test  ecx, ecx
     jz    .fail
-    lea   rdx, [r12+4]         ; r value base
-    mov   r14, rdx             ; r base
+    mov   r14, rbx             ; r value base
     mov   r15, rcx             ; r len
     ; ensure within slen
     lea   rax, [r12+r13]
@@ -98,14 +197,25 @@ der_parse_sig:
     mov   rsi, r14
     mov   rdx, r15
     call  be_to_limbs          ; (out=rdi, bytes=rsi, len=rdx); preserves rbx,r12-r15
-    ; ---- s: 0x02 slen at [r14+r15] ----
+    ; ---- s: 0x02 then a short- or long-form length, at [r14+r15] ----
     lea   rbx, [r14+r15]       ; s marker
+    lea   rax, [r12+r13]
+    cmp   rbx, rax
+    jae   .fail
     cmp   byte [rbx], 0x02
     jne   .fail
-    movzx ecx, byte [rbx+1]    ; slen
+    inc   rbx
+    cmp   rbx, rax
+    jae   .fail
+    movzx ecx, byte [rbx]      ; slen (short form) or the long-form header
+    inc   rbx
+    test  ecx, 0x80
+    jz    .s_len_done
+    DER_LONG_LEN .fail
+.s_len_done:
     test  ecx, ecx
     jz    .fail
-    lea   rdx, [rbx+2]         ; s value base
+    mov   rdx, rbx             ; s value base
     lea   rax, [rdx+rcx]       ; end of s (ORIGINAL, unstripped -- the later
                                ; hashtype lookup needs this exact position)
     ; ensure within slen
