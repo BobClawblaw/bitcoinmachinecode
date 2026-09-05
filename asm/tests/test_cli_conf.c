@@ -23,6 +23,9 @@ static void wr(const char* rel, const char* body){
     FILE* f = fopen(p, "w"); if (!f){ perror(p); exit(2); }
     fputs(body, f); fclose(f);
 }
+static void unlink_datadir_conf(void){
+    char p[512]; snprintf(p, sizeof p, "%s/data/bitcoin.conf", DIR); unlink(p);
+}
 static void mk(const char* rel){
     char p[512]; snprintf(p, sizeof p, "%s/%s", DIR, rel); mkdir(p, 0755);
 }
@@ -81,6 +84,28 @@ int main(void){
     { char dd[512]; snprintf(dd, sizeof dd, "%s/data", DIR);
       ok(cli_conf_resolve(dd, 0, &c, &err) == 1 && c.port == 7777,
          "<datadir>/../config/bitcoin.conf is consulted"); }
+
+    printf("== the daemon reads ONE config file; so must the CLI (2026-09-05) ==\n");
+    {
+        /* The datadir config sets port but NOT rpcport, while the repo-level
+         * file sets rpcport. node_config.c's node_config_path picks the datadir
+         * file and never reads the other, so the daemon serves RPC on its
+         * DEFAULT. Resolving per key here would return 7777 and the CLI would
+         * dial a port nothing is listening on -- exactly what happened on the
+         * live node when a datadir config was added with only port/listen:
+         * the daemon went to 8332, bmc_cli went to 8331, and the CLI could not
+         * reach its own node without -rpcport=. Same file, same precedence. */
+        wr("config/bitcoin.conf", "rpcport=7777\n");
+        wr("data/bitcoin.conf", "port=8433\nlisten=1\nchain=main\n");
+        char dd[512]; snprintf(dd, sizeof dd, "%s/data", DIR);
+        ok(cli_conf_resolve(dd, 0, &c, &err) == 1 && c.port == 8332,
+           "a datadir config without rpcport does NOT inherit it from ../config");
+        /* and the datadir file's own keys are still honoured */
+        wr("data/bitcoin.conf", "rpcport=8331\nport=8433\nchain=main\n");
+        ok(cli_conf_resolve(dd, 0, &c, &err) == 1 && c.port == 8331,
+           "...and rpcport IS taken when the datadir config states it");
+        unlink_datadir_conf();
+    }
 
     printf("== failures say what to do, rather than sending bitcoin/bitcoin ==\n");
     ok(cli_conf_resolve(0, 0, &c, &err) == 0 && err && strstr(err, "-datadir"),
