@@ -547,6 +547,58 @@ int main(void){
         okv(avs > 0 && avs < 200, "...and reports the plain vsize when nothing is parked");
     }
 
+    printf("== MEM-15: a v0 witness program of the wrong length is NONSTANDARD ==\n");
+    /* classify_spk's "other witness programs" arm accepted version 0 at any
+     * program length 2..40. Core's Solver accepts v0 ONLY at 20 or 32 bytes
+     * (both matched earlier in the function) and returns NONSTANDARD
+     * otherwise. Wrong twice over: such an output is consensus-UNSPENDABLE, so
+     * relaying it only adds permanent UTXO bloat -- and SPK_WITNESS_UNKNOWN
+     * earns the WITNESS dust discount, so it was also CHEAPER to create than
+     * Core permits.
+     *
+     * Versions 1..16 are the control's other half: those are genuinely
+     * upgrade-reserved, Core relays them, and they must stay standard. */
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<21];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        mpool_policy_set_pending_sigops(0);
+        unsigned char prev[32]; memset(prev, 0x5E, 32);
+        unsigned char spk1[2] = { 0x51, 0x00 };
+        struct { int ver; int plen; int want_ok; const char* what; } V[] = {
+            { 0x00, 30, 0, "v0 with a 30-byte program (Core: NONSTANDARD)" },
+            { 0x00,  2, 0, "v0 with a 2-byte program (Core: NONSTANDARD)" },
+            { 0x52, 30, 1, "v2 with a 30-byte program (upgrade-reserved, relayed)" },
+            { 0x60, 40, 1, "v16 with a 40-byte program (upgrade-reserved, relayed)" },
+        };
+        for (unsigned vi = 0; vi < sizeof V / sizeof V[0]; vi++){
+            memset(stbuf, 0, sizeof stbuf);
+            mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+            POLICY_STATE_INIT(stbuf, 256);
+            mpool_init(mp, 4096, mblob, sizeof mblob);
+            utxo_init(ux, 4096, ublob, sizeof ublob);
+            utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk1, 1);
+            unsigned char tx[160]; unsigned long n = 0;
+            tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0;
+            tx[n++]=1; memcpy(tx+n, prev, 32); n+=32; memset(tx+n, 0, 4); n+=4; tx[n++]=0; memset(tx+n,0xff,4); n+=4;
+            tx[n++]=1; { unsigned long long v = 900000ULL; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+            tx[n++]=(unsigned char)(2 + V[vi].plen);
+            tx[n++]=(unsigned char)V[vi].ver; tx[n++]=(unsigned char)V[vi].plen;
+            memset(tx+n, 0x77, (size_t)V[vi].plen); n += (unsigned long)V[vi].plen;
+            memset(tx+n, 0, 4); n+=4;
+            unsigned char tid[32]; memset(tid, 0x5F, 32); tid[0]=(unsigned char)vi;
+            long r = mpool_policy_add(pol, stbuf, mp, tx, n, tid, ux);
+            char lbl[140]; snprintf(lbl, sizeof lbl, "MEM-15 %s", V[vi].what);
+            if (V[vi].want_ok) okv(r == 1, lbl);
+            else okv(r != 1 && strstr(mpool_policy_reason(pol), "scriptpubkey") != NULL, lbl);
+            if (V[vi].want_ok != (r == 1))
+                printf("      r=%ld reason=%s\n", r, mpool_policy_reason(pol));
+        }
+    }
+
     printf("== MEM-16: min-relay fee rounds like Core's CFeeRate::GetFee ==\n");
     /* The check was `fee*1000 < vsize*rate`, i.e. fee < rate*vsize/1000
      * EXACTLY -- a ceiling. Core truncates and floors at 1. The tx below is

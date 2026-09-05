@@ -727,8 +727,19 @@ static int classify_spk(const unsigned char* s, unsigned long n){
     if (n == 34 && s[0]==0x51 && s[1]==0x20) return SPK_WITNESS_V1_TAP;
     if (n == 4 && s[0]==0x51 && s[1]==0x02 && s[2]==0x4e && s[3]==0x73)
         return SPK_ANCHOR;                        /* P2A (Core v28+) */
-    /* other witness programs: 1 version op + 1 push of 2..40 bytes */
-    if (n >= 4 && n <= 42 && (s[0]==0x00 || (s[0]>=0x51 && s[0]<=0x60)) &&
+    /* Other witness programs: 1 version op + 1 push of 2..40 bytes.
+     *
+     * MEM-15 (audit 2026-09-03): VERSION 0 IS EXCLUDED. Core's Solver accepts a
+     * v0 program only at exactly 20 or 32 bytes (both matched above) and
+     * returns NONSTANDARD for every other length; this arm accepted them as
+     * "unknown witness", which is wrong twice over. Such an output is
+     * consensus-UNSPENDABLE -- a v0 program of any other length fails witness
+     * validation -- so relaying it only adds permanent UTXO bloat. And
+     * SPK_WITNESS_UNKNOWN earns the WITNESS dust discount in dust_threshold
+     * below (107/4 rather than 107), so these were also CHEAPER to create than
+     * Core permits. Versions 1..16 stay here: those are genuinely
+     * upgrade-reserved and Core does relay them. */
+    if (n >= 4 && n <= 42 && (s[0]>=0x51 && s[0]<=0x60) &&
         s[1] == n-2 && s[1] >= 2 && s[1] <= 40)
         return SPK_WITNESS_UNKNOWN;
     if (n >= 1 && s[0] == 0x6a){                  /* OP_RETURN ... */
@@ -1569,7 +1580,7 @@ static int worst_chunk_excl(void* st, mpol_chunk* out,
      * Growing on demand rather than sizing to a compile-time maximum: the
      * arrays are 12 bytes per entry together, so a 1M-entry pool costs 12 MB
      * -- worth allocating when the pool actually gets there, not worth
-     * reserving in .bss for every process that links this file (bitcoin_cli
+     * reserving in .bss for every process that links this file (bmc_cli
      * links it too). A failed grow degrades exactly the way the old ceiling
      * did, which is the honest fallback: the caller's `worst_chunk() == 0`
      * arm is still there. */
