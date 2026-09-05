@@ -50,6 +50,16 @@ project, in Markdown, HTML and BBCode forms of the same text.
 |---|---|
 | [`reports/MINED_TX_CORPUS.md`](reports/MINED_TX_CORPUS.md) | the mined-transaction corpus: 17 real chain transactions replayed at their own heights as a consensus-acceptance test, the two controls that prove the corpus discriminates, and the gap those controls left named |
 
+## Milestones
+
+[`releases/`](releases/) holds one short note per landed batch -- the
+paragraph behind each `git log --first-parent main` line. Milestones are
+also annotated tags.
+
+| | |
+|---|---|
+| [`releases/2026-09-05-interp-review.md`](releases/2026-09-05-interp-review.md) | interpreter review closed (13 of 17), MuHash re-verified and scripted, fresh clone builds, the mined-transaction corpus |
+
 ## Development history
 
 [`devlog/`](devlog/) and [`../worklog/`](../worklog/) are the working
