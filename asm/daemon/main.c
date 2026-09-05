@@ -122,7 +122,7 @@ static node_status_t* g_node_status;  /* MAP_SHARED live status, NULL if mmap fa
 
 /* --- assembly node core (bitcoind.asm / bitcoin_*.asm) --- */
 extern long node_handshake(int fd);
-extern unsigned char g_peer_version_payload[256]; /* bitcoind.asm: raw capture, see its header comment */
+extern unsigned char g_peer_version_payload[512]; /* bitcoind.asm: raw capture, see its header comment (NET-13: 512) */
 extern long g_peer_version_len;
 extern long node_accept_handshake(int fd);
 extern long g_peer_wants_addrv2;   /* bitcoind.asm: peer sent sendaddrv2 before verack (per handshake) */
@@ -2215,7 +2215,9 @@ typedef struct { int sp; pid_t pid; char host[128]; int net; long long t0; } dh_
 static dh_slot_t g_dh[DH_MAX];
 static long long g_dh_timeout_ms = 120000;
 /* g_in_dial_helper is declared with the leg tables above */
-typedef struct { int ok; unsigned char wants_addrv2; long vlen; unsigned char vpayload[256]; char why[128]; } dh_result_t;
+/* NET-13: vpayload MUST match g_peer_version_payload -- a smaller field here
+ * silently truncates the capture across the dial-helper socketpair. */
+typedef struct { int ok; unsigned char wants_addrv2; long vlen; unsigned char vpayload[512]; char why[128]; } dh_result_t;
 void dial_helper_test_set_timeout_ms(long long ms){ g_dh_timeout_ms = ms; }
 static int leg_net_of(const char* hostport){
     bmc_addr_t a; return bmc_addr_from_string_port(&a, hostport, 0) ? (int)a.net : BMC_NET_IPV4;
