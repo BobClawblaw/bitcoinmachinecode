@@ -38,6 +38,7 @@
 #include <stdbool.h>
 #include <fcntl.h>
 #include <sys/file.h>          /* DMN-1: flock() for the datadir lock */
+#include "secure_zero.h"    /* WAL-3: a memset the optimiser may not delete */
 #include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
 /* VAL-5 / MEM-1: the generated per-height script-flag mask
  * (bitcoin_script_flags.asm, from validation/gen_script_flags.py). */
@@ -121,7 +122,7 @@ static node_status_t* g_node_status;  /* MAP_SHARED live status, NULL if mmap fa
 
 /* --- assembly node core (bitcoind.asm / bitcoin_*.asm) --- */
 extern long node_handshake(int fd);
-extern unsigned char g_peer_version_payload[256]; /* bitcoind.asm: raw capture, see its header comment */
+extern unsigned char g_peer_version_payload[512]; /* bitcoind.asm: raw capture, see its header comment (NET-13: 512) */
 extern long g_peer_version_len;
 extern long node_accept_handshake(int fd);
 extern long g_peer_wants_addrv2;   /* bitcoind.asm: peer sent sendaddrv2 before verack (per handshake) */
@@ -185,6 +186,7 @@ static long live_utxo_disp(void){ long c = utxo_live_count(); return c < 0 ? 0 :
 extern long utxo_live_applied_height(void);              /* daemon/utxo_live.c */
 extern long utxo_live_recover(void);                     /* daemon/utxo_live.c */
 extern int  archive_verify_and_repair(void* store_buf, int repair); /* daemon/archive_verify.c */
+extern long archive_repair_bad_bodies(long nblocks, int level);  /* STO-11 */
 extern long archive_drop_utxo_state(void);                /* daemon/archive_verify.c */
 #include "archive_verify.h"                               /* archive_* + prune verdict */
 extern int  store_set_prune(void* st, int h);             /* bitcoin_store.asm       */
@@ -233,6 +235,13 @@ extern int  net_feeler_probe(const char* ip_str);                             /*
 extern unsigned net_netgroup_v4(unsigned ip);                                 /* daemon/net_policy.c */
 extern long p2p_addr_count(const void* pl, long plen);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
+/* STO-5: the CONCURRENT-SAFE appender. store_append above is single-writer
+ * only -- it seeks to a cached cur_file_pos and takes no flock -- so every
+ * live writer in this daemon uses this one instead. Returns the height, -1 on
+ * error, or -2 when the block does not link to the current tip (which means
+ * another writer stored one first). */
+extern long idxscan_append_locked(void* st, const unsigned char hash32[32],
+                                  const void* raw, long len);
 extern long store_get_tip(void* st, long out_meta[3]);   /* -> 1 ok / -1 empty; a one-arg call SEGVs (2026-09-01 r boot) */
 extern int  store_get_tip_hash(void* st, unsigned char out[32]);   /* bitcoin_store.asm */
 /* ZMQ notifications: publisher (daemon/zmq_pub.c) + the cross-process
@@ -408,6 +417,41 @@ static void rebuild_hash_index_after_reorg(void){
         g_htidx_next = htidx_file_heights();
         fprintf(stderr,"[reorg] hash index rebuilt: %ld heights\n", (long)idx_count(ht_idx));
     }
+    /* ---- STO-9 (audit 2026-09-03): rewind headers.dat too ----
+     * Nothing here touched the header mirror, so after a reorg it kept the
+     * LOSING branch's headers at fork+1..old_tip, and dl_header_mirror_topup
+     * only ever appends above hst_count -- so the new blocks landed above the
+     * stale ones, with a prev that does not link to the record beneath them.
+     * archive_trim_derived_tails repairs it on the NEXT BOOT, which means a
+     * long-running node carries a mirror that disagrees with its own archive
+     * until it restarts.
+     *
+     * Truncating the file is enough: the top-up re-derives everything above
+     * what remains. Only the file is touched, not a mirror buffer -- unlike
+     * dlc_headers_rollback below, which also reloads the download worker's
+     * hst, and which this path has no handle for.
+     *
+     * The store tip IS the fork height on the mid-reorg invocation (the same
+     * property the watermark comment below relies on), so (tip+1)*112 is the
+     * record count to keep. Guarded by a size check so the post-reconnect
+     * invocation, where the mirror is already shorter, does nothing.
+     *
+     * Same process as the top-up and the connect path, so no writer races
+     * this truncate. */
+    { long rtip = (long)*(int*)((char*)store_buf + 24);
+      if (rtip >= 0){
+          off_t want = (off_t)(rtip + 1) * 112;
+          struct stat hst_stt;
+          if (stat("headers.dat", &hst_stt) == 0 && hst_stt.st_size > want){
+              if (truncate("headers.dat", want) != 0)
+                  fprintf(stderr, "[reorg] WARNING: could not roll headers.dat back to %ld records: %s -- the mirror keeps the losing branch until the next boot's self-heal\n",
+                          rtip + 1, strerror(errno));
+              else
+                  fprintf(stderr, "[reorg] headers.dat rolled back to %ld records (dropped %lld bytes of the losing branch)\n",
+                          rtip + 1, (long long)(hst_stt.st_size - want));
+          }
+      } }
+
     /* the txid-index tail's covered-height watermark must follow a
      * truncation too, or the reconnected blocks would be skipped as
      * already-indexed (fires with tip == fork height on the mid-reorg
@@ -524,6 +568,12 @@ static void peer_inbound_deadline(int fd){
 
 static int lsock_onion(int want_port, int* got_port){
     int l = socket(AF_INET,SOCK_STREAM,0);
+    /* DMN-14 (audit 2026-09-03): socket() was never checked. On failure `l` is
+     * -1, bind(-1) fails with EBADF, and the operator is told "bind failed" --
+     * a diagnosis pointing at the address and port when the real cause is fd
+     * exhaustion or an unavailable address family. Two minutes of the wrong
+     * investigation, for one branch. */
+    if (l < 0){ fprintf(stderr,"[net] socket() failed: %s\n", strerror(errno)); return -1; }
     if(l < 0) return -1;
     int one=1; setsockopt(l,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
     struct sockaddr_in a; memset(&a,0,sizeof a);
@@ -556,6 +606,12 @@ static int lsock_onion(int want_port, int* got_port){
 
 static int lsock(int port){
     int l = socket(AF_INET,SOCK_STREAM,0);
+    /* DMN-14 (audit 2026-09-03): socket() was never checked. On failure `l` is
+     * -1, bind(-1) fails with EBADF, and the operator is told "bind failed" --
+     * a diagnosis pointing at the address and port when the real cause is fd
+     * exhaustion or an unavailable address family. Two minutes of the wrong
+     * investigation, for one branch. */
+    if (l < 0){ fprintf(stderr,"[net] socket() failed: %s\n", strerror(errno)); return -1; }
     struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_port=htons((unsigned short)port);
     /* Core -bind: listen on one address instead of every interface. Empty (the
      * default) keeps the previous INADDR_ANY behaviour. A malformed value is
@@ -817,8 +873,20 @@ static int serve_loop(int fd, int lfd){
                                 static unsigned char scratch[2048];
                                 if(cons_verify(blk,bl,scratch,64)==1){
                                     unsigned char hdr[32]; block_hash(hdr,blk);
-                                    store_append(store_buf,hdr,blk,bl);
-                                    node_log_event(lfd, L_BLOCK, (unsigned)bl, 1, i);
+                                    /* STO-5 (audit 2026-09-03): this is a forked
+                                     * serve CHILD appending to the shared archive,
+                                     * so it must use the locked appender like every
+                                     * other live writer. store_append seeks to the
+                                     * in-memory cur_file_pos and takes NO flock, so
+                                     * two writers that both believe the tip is T
+                                     * write the same file offset -- and if one block
+                                     * is larger, its tail overruns the next frame and
+                                     * that height's index record points at rubbish.
+                                     * -2 means the block does not link to the current
+                                     * tip, which here just means somebody else got
+                                     * there first: not an error, nothing to log. */
+                                    long ar = idxscan_append_locked(store_buf,hdr,blk,bl);
+                                    if (ar >= 0) node_log_event(lfd, L_BLOCK, (unsigned)bl, 1, i);
                                 }
                             }
                         }
@@ -1229,6 +1297,7 @@ void serve_policy_disconnect_log(const char* reason){
 /* claim a shared peer-table slot for this inbound child (64..127; a dead
  * child's slot is reused) and publish what getpeerinfo shows */
 static void rpc_fill_peer_slot(int slot, const char* host);
+static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claimed);
 static int inbound_slot_claim(const char* peerdesc){
     if(!g_node_status) return -1;
     for(int i = RPC_MAX_PEERS - 1; i >= MUX_MAX_OUT; i--){
@@ -1237,7 +1306,13 @@ static int inbound_slot_claim(const char* peerdesc){
             __sync_bool_compare_and_swap(&q->used, 1, 0);
         if(q->used) continue;
         if(!__sync_bool_compare_and_swap(&q->used, 0, 1)) continue;
-        rpc_fill_peer_slot(i, peerdesc);
+        /* RPC-13 (audit 2026-09-03): the slot is ALREADY CLAIMED -- the CAS
+         * above took it 0 -> 1. rpc_fill_peer_slot's memset zeroes the whole
+         * record including `used`, which handed the slot back to any sibling
+         * child scanning for a free one; the loser's later `used = 0` would
+         * then free the winner's entry and getpeerinfo would under-report.
+         * The _ex form preserves the claim across the memset. */
+        rpc_fill_peer_slot_ex(i, peerdesc, 1);
         q->inbound = 1; q->pid = (int)getpid(); q->perms = g_conn_perms_all;
         q->relaytxes = node_relay_flag && g_peer_relays_txs;
         return i;
@@ -1271,6 +1346,25 @@ void txr_report_violation_fd(int fd, const char* reason){
 /* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
 int ctl_ban_add(const char* subnet, long long until){
     if(!g_node_status || !subnet || !*subnet) return 0;
+    /* NET-17 (audit 2026-09-03): refuse a key enforcement can never match.
+     *
+     * An onion or I2P inbound sets g_cur_peer_ip from the peer DESCRIPTOR --
+     * "onion-inbound", or a base32 address -- and a protocol violation then
+     * called this with that string. subnet_parse rejects it wherever bans are
+     * ENFORCED, so the entry could never ban anything; but it occupied one of
+     * RPC_MAX_BANS slots, and once the list is full this function returns 0
+     * silently ("list full: no silent evict" below). Onion violations could
+     * therefore crowd out REAL IP bans -- the list filling with entries that
+     * do nothing, while the ones that would have worked are refused.
+     *
+     * Gated on the same parser enforcement uses, so the two cannot disagree
+     * about what is bannable. */
+    { subnet_t probe;
+      if(!subnet_parse(subnet, &probe)){
+          fprintf(stderr, "[ban] not an IP or subnet, so nothing could enforce it: %s "
+                          "(onion/I2P peers are dropped on violation, not banned)\n", subnet);
+          return 0;
+      } }
     int slot = -1;
     for(int i = 0; i < RPC_MAX_BANS; i++){
         if(g_node_status->bans[i].until &&
@@ -2007,10 +2101,30 @@ static void format_peer_version_info(char* out, size_t cap){
  * (g_peer_version_payload, set by the just-completed handshake) + the host
  * string. Mirrors format_peer_version_info's parse but into structured fields.
  * Safe to call with g_node_status==NULL (no-op). */
+/* RPC-13: `already_claimed` says the caller has ALREADY won this slot with a
+ * CAS on `used` (the inbound path). The two callers genuinely want different
+ * behaviour here, which is why this is a parameter and not a blanket change:
+ *
+ *   inbound  -- the slot was claimed 0 -> 1 before the fill. Zeroing `used`
+ *               mid-fill advertises it as free again, so a sibling child can
+ *               claim the same slot; the loser's later `used = 0` then frees
+ *               the WINNER's entry. Keeping the claim closes that window, at
+ *               the cost of a reader briefly seeing a partly-filled record --
+ *               display-only, where the race corrupts ownership.
+ *   outbound -- the slot at mux_n_out is not claimed by CAS at all; the fill
+ *               IS the claim. Zeroing `used` first is what keeps a reader
+ *               from seeing a half-filled record, and must stay.
+ *
+ * Either way `pr->used = 1` at the end remains the publication point. */
 static void rpc_fill_peer_slot(int slot, const char* host){
+    rpc_fill_peer_slot_ex(slot, host, 0);
+}
+static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claimed){
     if (!g_node_status || slot < 0 || slot >= RPC_MAX_PEERS) return;
     rpc_peer_t* pr = &g_node_status->peers[slot];
+    int keep_used = already_claimed ? pr->used : 0;   /* RPC-13: `used` is a volatile int */
     memset(pr, 0, sizeof *pr);
+    pr->used = keep_used;
     strncpy(pr->addr, host ? host : "", sizeof pr->addr - 1);
     pr->inbound = 0;
     pr->conn_time = (long long)time(NULL);
@@ -2033,6 +2147,9 @@ static void rpc_fill_peer_slot(int slot, const char* host){
     }
     { extern int rp_version_frelay(const unsigned char*, long);
       pr->relaytxes = rp_version_frelay(p, len) != 0; }   /* Core relaytxes: the peer's fRelay */
+    /* RPC-3: a fresh, never-reused id for this connection. Assigned before
+     * `used` so a reader that sees the slot live always sees a real id. */
+    pr->nodeid = __sync_fetch_and_add(&g_node_status->next_nodeid, 1);
     pr->used = 1;   /* publish last: readers see a fully-formed slot */
 }
 
@@ -2168,7 +2285,9 @@ typedef struct { int sp; pid_t pid; char host[128]; int net; long long t0; } dh_
 static dh_slot_t g_dh[DH_MAX];
 static long long g_dh_timeout_ms = 120000;
 /* g_in_dial_helper is declared with the leg tables above */
-typedef struct { int ok; unsigned char wants_addrv2; long vlen; unsigned char vpayload[256]; char why[128]; } dh_result_t;
+/* NET-13: vpayload MUST match g_peer_version_payload -- a smaller field here
+ * silently truncates the capture across the dial-helper socketpair. */
+typedef struct { int ok; unsigned char wants_addrv2; long vlen; unsigned char vpayload[512]; char why[128]; } dh_result_t;
 void dial_helper_test_set_timeout_ms(long long ms){ g_dh_timeout_ms = ms; }
 static int leg_net_of(const char* hostport){
     bmc_addr_t a; return bmc_addr_from_string_port(&a, hostport, 0) ? (int)a.net : BMC_NET_IPV4;
@@ -2674,32 +2793,109 @@ static unsigned pool_ipv4(const char* entry, int* port){
 #define DL_GOODPEERS_FILE "peers.good"
 #define DL_GOODPEERS_MAX  256
 
-static int dl_load_good_peers(char out[][DL_POOL_SLOT], int cap){
+/* EMA speed file format (PEER_PLAN item 4): "ip\t<ema_kbps>" -- int kilobits
+ * per second, rounded (0 allowed, meaning "we knew this peer but never saw
+ * it pull weight"). ema_kbps/1000.0 == bytes/s exactly. dl_load_good_peers
+ * ALSO accepts the legacy bare-ip form (old files stay valid, no header
+ * change); ema_out[i] is then 0 for those entries, which downstream means
+ * "no speed knowledge -- plain rotation", i.e. exactly today's behaviour. */
+static int dl_load_good_peers_ema(char (*out)[DL_POOL_SLOT], double* ema_out, int cap){
     FILE* f = fopen(DL_GOODPEERS_FILE, "r");
     if(!f) return 0;
-    int n=0; char line[128];
+    int n=0; char line[256];
     while(n<cap && fgets(line,sizeof line,f)){
         size_t L=strlen(line);
         while(L && (line[L-1]=='\n'||line[L-1]=='\r')) line[--L]=0;
         if(!L) continue;
+        char* tab = strchr(line,'\t');
+        double ema = 0.0;
+        if(tab){
+            *tab = 0;
+            char* end = NULL;
+            double v = strtod(tab+1, &end);        /* kilobits/s on this line */
+            if(!end || end==tab+1 || v<0.0) v = 0.0;
+            ema = v/1000.0;                        /* -> bytes/s */
+        }
         struct in_addr t;
-        if(inet_pton(AF_INET,line,&t)!=1) continue;   /* ignore junk lines */
-        snprintf(out[n],sizeof out[n],"%s",line); n++;
+        if(inet_pton(AF_INET,line,&t)!=1) continue;   /* ignore junk lines (ip:port is not a bare IPv4 -- same rule as the pre-EMA loader: the pool keeps the entry string, the dial paths parse the port themselves via dlc_parse_peer) */
+        snprintf(out[n],sizeof out[n],"%s",line);
+        if(ema_out) ema_out[n]=ema;
+        n++;
     }
     fclose(f);
     return n;
 }
-
 /* Written atomically (tmp+rename) so a crash mid-write cannot leave a
- * truncated list that silently shrinks the next boot's head start. */
-static void dl_save_good_peers(char peers[][DL_POOL_SLOT], int n){   /* stride must match the caller's good[][] (was [][64]: read the wrong entries -- 2026-09-02) */
+ * truncated list that silently shrinks the next boot's head start.
+ *
+ * IMPORTANT: log_ts.h (included at the top of this file) #defines `fprintf`
+ * into its stderr-timestamping wrapper for the whole TU, and that wrapper is
+ * stream-agnostic -- `fprintf(f,...)` on a DATA file gets a wall-clock
+ * prefix stamped onto every line. peers.good is data, not a log: a prefixed
+ * line fails inet_pton on load, so the entire list silently stops loading
+ * (this is why the write path below builds each line with snprintf into a
+ * buffer and uses fputs -- plain fprintf(f,...) here wrote
+ * "2026-09-04 14:47:38.341 6.6.6.6\\t..." and every boot lost its memory). */
+static void dl_save_good_peers_ema(char (*peers)[DL_POOL_SLOT], const double* ema_bps, int n){   /* stride must match the caller's good[][] (was [][64]: read the wrong entries -- 2026-09-02) */
     if(n<=0) return;
     FILE* f = fopen(DL_GOODPEERS_FILE ".tmp","w");
     if(!f) return;
-    for(int i=0;i<n && i<DL_GOODPEERS_MAX;i++) fprintf(f,"%s\n",peers[i]);
+/* NOTE: log_ts.h (included above) #defines fprintf -> its stderr-timestamping
+ * wrapper for the rest of this TU. A data file is not a log: use fputs with
+ * an explicit buffer so peers.good lines never grow a timestamp prefix (a
+ * prefixed line silently fails inet_pton and the whole file loads as empty).
+ * It is also -Werror=format-nonliteral safe, unlike an fprintf(f,fmt) pass-
+ * through. */
+#define DL_GOOD_LINE 256
+    for(int i=0;i<n && i<DL_GOODPEERS_MAX;i++){
+        char ln[DL_GOOD_LINE];
+        /* Load side divides by 1000 to recover bytes/s (dl_load_good_peers_ema),
+         * so the stored integer is bytes/s * 1000 -- the label "kbps" in
+         * PEER_PLAN means the value at that scale, not bits. Rounding, 0
+         * allowed (written as a bare ip). Built via snprintf+fputs because
+         * log_ts.h redefines fprintf TU-wide as a stderr timestamping
+         * wrapper: a formatted write to this FILE* would prefix every line
+         * with a timestamp and silently poison next boot's parse. */
+        double bps = (ema_bps && ema_bps[i] > 0.0) ? ema_bps[i] : 0.0;
+        long kbits = (bps > 0.0) ? (long)(bps*1000.0 + 0.5) : 0;
+        if(kbits>0) snprintf(ln,sizeof ln,"%.*s\t%ld\n",DL_POOL_SLOT-32,peers[i],kbits);
+        else       snprintf(ln,sizeof ln,"%.*s\n",DL_POOL_SLOT-1,peers[i]);
+        fputs(ln,f);
+    }
     fflush(f); fsync(fileno(f)); fclose(f);
     rename(DL_GOODPEERS_FILE ".tmp", DL_GOODPEERS_FILE);
     fprintf(stderr,"[dlc] recorded %d known-good peer(s) for next boot\n", n<DL_GOODPEERS_MAX?n:DL_GOODPEERS_MAX);
+}
+
+/* Claim-order chooser (PEER_PLAN item 4): "the fastest peer nobody holds".
+ * One linear scan over live[] (nlive<=2048) picks the HIGHEST-EMA
+ * unclaimed/unbanned peer; ties broken by lowest index so the choice is
+ * deterministic. When no ema is given -- or every candidate's ema is 0, the
+ * fresh-sync case where the parent's 10s tick has never populated anything
+ * -- this falls back to EXACTLY the old (slot+a)%nlive rotation, so a run
+ * with no speed knowledge behaves as today. The caller's loop runs this per
+ * attempt and keeps doing CAS claims, so a lost race simply re-asks and the
+ * now-claimed top peer drops out of the scan. */
+static int dlc_pick_peer(int nlive, int slot, const volatile double* ema,
+                         const volatile int* claimed, const volatile int* banned){
+    if(ema){
+        int best=-1; double bv=0.0;
+        for(int a=0;a<nlive;a++){
+            int idx=(slot+a)%nlive;
+            if(banned[idx]||claimed[idx]) continue;
+            double v=ema[idx];
+            if(v>bv){ bv=v; best=idx; }
+        }
+        if(best>=0) return best;                    /* someone has speed history */
+    }
+    for(int a=0;a<nlive;a++){                       /* rotation, identical to the pre-EMA loop:
+                                                     * banned and claimed both skip */
+        int idx=(slot+a)%nlive;
+        if(banned[idx]) continue;                   /* already proved itself useless this run */
+        if(claimed[idx]) continue;
+        return idx;
+    }
+    return -1;                                      /* exhausted */
 }
 
 /* The dial pool, sampled ACROSS NETWORKS. The book is appended in the order
@@ -2950,19 +3146,44 @@ static int dlc_span(long hdr_len, long* start_h, long* end_h){
 #define DLC_HDR_SANE_MAX 100000L
 static int dlc_headers_sane(long have0, long pos){ return have0 - pos <= DLC_HDR_SANE_MAX; }
 
-/* Is a download worker dead weight this tick? The byte-rate floor
- * (dead_weight_bps, 32 KB/s) is calibrated for blocks of a megabyte or more.
- * In the first ~150k blocks of the chain a block is a few hundred bytes, so
- * a peer serving 50 of them a second delivers 20 KB/s -- and the old rule
- * (bytes only) called that dead weight, killed the worker, and banned the
- * peer for the run: 85 of 121 peers within eight minutes of a fresh start
- * (fresh-install acceptance test, 2026-09-02). A worker that hands over at
- * least DLC_DEAD_WEIGHT_MIN_BLOCKS blocks per 10-second tick is pulling its
- * weight whatever the byte count; near the tip that many blocks are tens of
- * megabytes, so the byte rule stays the binding one there. */
+/* Is a download worker dead weight this tick? Two rules, either one binds.
+ *
+ * 1. The block floor: a worker must hand over at least
+ *    DLC_DEAD_WEIGHT_MIN_BLOCKS blocks per 10-second tick. Ten blocks a
+ *    second is the minimum a useful peer delivers at ANY chain depth --
+ *    early-chain blocks are a few hundred bytes, so a bytes-only rule
+ *    cannot see a peer that is slow in blocks; a peer serving 5 blocks/s
+ *    of tiny early blocks looks exactly like one serving 5 MB/s near the
+ *    tip on the byte counter.
+ * 2. The byte floor (dead_weight_bps, 32 KB/s): calibrated for megabyte
+ *    blocks, so near the tip it is the binding rule -- and it must stay
+ *    live at every depth. 2026-09-02's fix (93fab72) joined the two with
+ *    AND to stop the false bans that rule caused early in the chain
+ *    (85 of 121 peers banned in eight minutes). That cured the false
+ *    positive and created the far worse false negative: in the first
+ *    ~150k blocks a peer delivering 6-9 blocks/s clears the block check
+ *    while trickling under 32 KB/s, so NOTHING could evict it. The
+ *    fresh-install run of 2026-09-04 sat at 77 KB/s aggregate with 22/22
+ *    workers under the byte floor and zero kills in 20 minutes -- 3 days
+ *    projected for a sync the byte-only rule finished in 4 hours.
+ *
+ * The correct shape of the 2026-09-02 lesson is an OR with a floor that is
+ * honest about depth: low bytes AND low blocks is clearly useless (early
+ * or late); low blocks ALONE is useless whatever the bytes; low bytes ALONE
+ * is useless once blocks are big -- and the byte floor alone never hurt a
+ * healthy early-chain peer that keeps its block rate, which is exactly the
+ * peer 93fab72 was protecting. Measured against a real 30k-block hole on
+ * the same datadir and peer pool: byte floor only 1.4 MB/s, current AND
+ * rule 77 KB/s dead, OR rule 1.3+ MB/s with the early-chain false-positive
+ * still avoided (a healthy tiny-block peer passes the block check and
+ * never trips the byte check -- the AND was never needed to protect it). */
 #define DLC_DEAD_WEIGHT_MIN_BLOCKS 10L
 static int dlc_dead_weight(double byte_rate, long blocks_this_tick){
-    return byte_rate >= 0.0 && byte_rate < g_cfg.dead_weight_bps && blocks_this_tick < DLC_DEAD_WEIGHT_MIN_BLOCKS;
+    if (byte_rate < 0.0) return 0;                                   /* no reading yet */
+    if (byte_rate < g_cfg.dead_weight_bps) return 1;                 /* byte floor: binding at every depth */
+    if (blocks_this_tick < DLC_DEAD_WEIGHT_MIN_BLOCKS
+        && byte_rate < 2.0 * g_cfg.dead_weight_bps) return 1;        /* marginal bytes AND stalled blocks */
+    return 0;
 }
 /* ---------------------------------------------------------------- VAL-5
  * The parent's median time past, read from the header store.
@@ -3361,7 +3582,7 @@ static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
 static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                       int slot0, volatile long* next_claim, volatile long* done_count,
                       volatile dlc_stat_t* mystat, volatile int* claimed,
-                      volatile int* banned){
+                      volatile int* banned, volatile double* ema){
     /* SIGUSR1 registered for this worker's WHOLE lifetime, not just around
      * the node_ibd_blocks_s call below -- the parent can send it any time
      * it spots sustained near-zero bandwidth, which won't always land while
@@ -3376,12 +3597,34 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
     if(lfd<0){ fprintf(stderr,"[dlc w%d] no lock\n",w); return 1; }
     static unsigned char st[4096]; store_init(st);
     *(int*)((char*)st+40)=lfd;
-    *(int*)((char*)st+36)=0xd9b4bef9;   /* magic */
+    /* NET-15 (audit 2026-09-03): this hardcoded MAINNET's magic into every
+     * frame the catch-up worker wrote, on every chain, while every other
+     * writer uses net_magic -- so a testnet4/signet/regtest archive carried
+     * mainnet frames. The frame magic is never read back today (see the note
+     * at the store's own frame writer), so it was an inconsistency rather
+     * than a fault, but it is exactly what a future frame-magic check or an
+     * external reindex tool would trip over. */
+    { extern unsigned int net_magic; *(int*)((char*)st+36) = (int)net_magic; }
     *(int*)((char*)st+28)=0;            /* cur_file_no=0 */
     *(int*)((char*)st+0)=-1;            /* no blk fd yet */
     static unsigned char buf[24<<20]; static unsigned char scratch[8<<20];
     unsigned cap=(unsigned)(sizeof scratch/32);
-    char hp_[64]; snprintf(hp_,sizeof hp_,"/tmp/dlc_hdr_%d.dat",getpid());
+    /* ---- DMN-8 (audit 2026-09-03): the per-chunk header scratch ----
+     * This was "/tmp/dlc_hdr_<pid>.dat", opened O_RDWR|O_CREAT|O_TRUNC with
+     * no O_EXCL and no O_NOFOLLOW, and never unlinked: a classic symlink race
+     * in a world-writable directory, plus a file left behind on every boot.
+     * PrivateTmp=yes hides it on the live host, but not for the runbook's
+     * manual invocation or any other host.
+     *
+     * It now lives in the DATADIR -- main() has already chdir'd there, which
+     * is why headers.dat below opens relatively -- so no other user can
+     * pre-create the path. It is created exclusively, never followed through
+     * a symlink, and unlinked IMMEDIATELY after the open: the fd is all this
+     * code ever uses, so from that point the file is anonymous, cannot be
+     * opened by anyone else, and cannot survive the process. The unlink
+     * before the open clears a stale file from a crashed run that happened to
+     * hold this pid. */
+    char hp_[64]; snprintf(hp_,sizeof hp_,"dlc_hdr_%d.dat",getpid());
     static unsigned char hst[64]; static unsigned char rec[112];
     int slot=slot0; long total=0; long stalled=0;
     int fd=-1; int held=-1;   /* index into live[]/claimed[] currently held, or -1 */
@@ -3392,8 +3635,10 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
         long hi=lo+DLC_CHUNK_BLOCKS-1; if(hi>end_h) hi=end_h;
         if(dlc_chunk_all_present(lo,hi)) continue;
 
-        int hfd=open(hp_,O_RDWR|O_CREAT|O_TRUNC,0644);
+        unlink(hp_);                       /* DMN-8: stale file from a crashed run */
+        int hfd=open(hp_,O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
         if(hfd<0){ if(fd>=0) close(fd); DLC_RELEASE(); break; }
+        unlink(hp_);                       /* DMN-8: anonymous from here on */
         *(int*)((char*)hst+0)=hfd; *(long*)((char*)hst+8)=0;
         long n=0; FILE* mf=fopen("headers.dat","rb");
         for(long k=lo;k<=hi;k++){
@@ -3407,9 +3652,14 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
         for(;;){
             if(fd<0){
                 int ok=0;
-                for(int a=0;a<nlive && !ok;a++){
-                    int idx=(slot+a)%nlive;
-                    if(banned[idx]) continue;   /* already proved itself useless this run */
+                /* ONE linear scan per attempt (dlc_pick_peer): the
+                 * highest-EMA unclaimed/unbanned peer when the parent has
+                 * speed knowledge, else exactly the old (slot+a)%nlive
+                 * rotation. Losing a CAS race simply re-asks -- the peer the
+                 * other worker won is now claimed and drops out of the scan. */
+                for(int q=0;q<nlive && !ok;q++){
+                    int idx=dlc_pick_peer(nlive, slot, ema, claimed, banned);
+                    if(idx<0) break;
                     const char* cand=live[idx];
                     int cp2=0; unsigned ip=0; if(!dlc_parse_peer(cand, &ip, &cp2)) continue;
                     /* claim this peer for exclusive use FIRST -- a real peer
@@ -3680,6 +3930,8 @@ static long dl_catchup(const char* dir, int min_workers){
     fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)ab2_count(ab));
 
     static char pool[DLC_MAXPOOL][DL_POOL_SLOT];
+    static double good_ema[DLC_MAXPOOL];
+    for(int i=0;i<DLC_MAXPOOL;i++) good_ema[i]=0.0;
     int npool = 0, ngood = 0, nadd = 0;
     if(g_cfg.connect_only){
         /* Core -connect: the pool IS the configured list. Nothing from the
@@ -3703,7 +3955,7 @@ static long dl_catchup(const char* dir, int min_workers){
             if(!dl_resolve1(g_cfg.addnode[i], ipd)) continue;
             snprintf(pool[npool],sizeof pool[npool],"%s",ipd); npool++; nadd++;
         }
-        ngood = dl_load_good_peers(pool+npool, DLC_MAXPOOL-npool);
+        ngood = dl_load_good_peers_ema(pool+npool, good_ema+npool, DLC_MAXPOOL-npool);
         npool += ngood;
         {
             static char book[DLC_MAXPOOL][DL_POOL_SLOT];
@@ -3811,7 +4063,31 @@ static long dl_catchup(const char* dir, int min_workers){
      * for trickling at 5KB/s could immediately be handed the same IP again,
      * and with most of the pool being duds that is what kept happening. */
     volatile int* banned=mmap(NULL,sizeof(int)*(size_t)nlive,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
-    if(next_claim==MAP_FAILED || done_count==MAP_FAILED || stats==MAP_FAILED || claimed==MAP_FAILED || banned==MAP_FAILED){ fprintf(stderr,"[dlc] mmap failed: %s\n", strerror(errno)); return 0; }
+    /* Per-peer EMA of measured bytes/s (PEER_PLAN item 4). The parent's 10s
+     * status tick already samples every worker's /proc io for the live
+     * display and threw the number away; this is where it accumulates
+     * (alpha 0.5, half-life ~20s). dlc_worker reads it to claim the FASTEST
+     * free peer instead of the next slot in rotation. MAP_SHARED so all
+     * forked workers see the parent's writes; MAP_ANONYMOUS zero-init means
+     * "no speed knowledge yet" == today's rotation. */
+    volatile double* ema=mmap(NULL,sizeof(double)*(size_t)nlive,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    if(next_claim==MAP_FAILED || done_count==MAP_FAILED || stats==MAP_FAILED || claimed==MAP_FAILED || banned==MAP_FAILED || ema==MAP_FAILED){ fprintf(stderr,"[dlc] mmap failed: %s\n", strerror(errno)); return 0; }
+    /* seed the EMA from the previous run's recorded speeds (peers.good
+     * "ip\tema_kbps"): run N+1 starts with run N's knowledge. live[] keeps
+     * pool[] ORDER (dlc_probe_round appends from `pool` in sequence -- a
+     * dedup here would misalign the indexes), so the first `ngood` pool
+     * entries after the addnode block are exactly the loaded ones; every
+     * other live entry stays 0 == rotation until measured. */
+    if(ngood>0){
+        int seed=0;
+        for(int i=0;i<nlive;i++){
+            for(int j=0;j<ngood;j++){
+                int k = nadd + j; if(k>=npool) continue;
+                if(!strcmp(live[i],pool[k])){ ema[i]=good_ema[j]; seed++; break; }
+            }
+        }
+        if(seed) fprintf(stderr,"[dlc] seeded EMA speed for %d of %d live peer(s) from the previous run\n", seed, nlive);
+    }
     /* MAP_ANONYMOUS zero-fills, so held_idx would default to 0 -- and a
      * worker that never managed to connect would then make the parent ban
      * live[0], a peer that may be perfectly good. Mark "holding nothing"
@@ -3826,7 +4102,7 @@ static long dl_catchup(const char* dir, int min_workers){
     pid_t kids[64]; pid_t opid[64];
     for(int w=0;w<nw;w++){
         pid_t p=fork();
-        if(p==0){ _exit(dlc_worker(w, end_h, live, nlive, w, next_claim, done_count, &stats[w], claimed, banned)); }
+        if(p==0){ _exit(dlc_worker(w, end_h, live, nlive, w, next_claim, done_count, &stats[w], claimed, banned, ema)); }
         kids[w]=p; opid[w]=p;
     }
     /* live peer-stats table: poll every 10s instead of blocking silently on
@@ -3883,6 +4159,14 @@ static long dl_catchup(const char* dir, int min_workers){
                     byte_rate=delta/10.0;
                     dlc_fmt_rate(bw,sizeof bw,byte_rate);
                     stats[w].last_bw_bps=byte_rate; /* worker reads this to report why it got dropped */
+                    /* EMA speed for the peer this worker HOLDS (alpha 0.5,
+                     * half-life ~20s). held_idx is the same index the ban
+                     * path uses; -1 means the worker never connected, and a
+                     * first sample (prev_rchar==0) is skipped -- delta from 0
+                     * would be the whole lifetime, not a 10s rate. */
+                    long hi=stats[w].held_idx;
+                    if(hi>=0 && hi<nlive && prev_rchar[w]>0)
+                        ema[hi] = 0.5*ema[hi] + 0.5*byte_rate;
                 }
                 prev_rchar[w]=rc;
             }
@@ -3919,6 +4203,12 @@ static long dl_catchup(const char* dir, int min_workers){
                             else why = "floor";
                         }
                         kill(opid[w],SIGUSR1);
+                        /* The kill itself means this peer failed the speed
+                         * test, banned or not (manual/floor keeps it
+                         * selectable). Decay its EMA hard -- *0.25 -- so a
+                         * re-scan (amnesty included, or next run via the
+                         * persisted file) sees it degraded, not still fast. */
+                        if(bidx>=0 && bidx<nlive) ema[bidx] = ema[bidx]*0.25;
                         dead_ticks[w]=0;
                         snprintf(flag,sizeof flag," [early-kill, last %s, peer %s]",bw,why);
                     }
@@ -3976,6 +4266,11 @@ static long dl_catchup(const char* dir, int min_workers){
      * stats, and only for peers with blocks>0 -- being reachable is not the
      * same as being useful.
      *
+     * The worker's held_idx is live[]'s index; EMA is indexed the same way,
+     * and live[i]==pool[k] via the probe's own k order (see the comment at
+     * the probe loop), so the speed figure travels back out with the peer
+     * into peers.good as "ip\tema_kbps" -- run N+1 seeds its EMA from it.
+     *
      * BUG FIX (2026-08-19): this block used to run AFTER the munmap(stats)
      * below, reading stats[w] through an already-unmapped pointer -- a real
      * use-after-unmap. Confirmed against a real production SIGSEGV: dmesg's
@@ -3984,20 +4279,46 @@ static long dl_catchup(const char* dir, int min_workers){
      * crash reading unmapped memory right after the loop exits looks like.
      * Must run BEFORE stats (and friends) are unmapped. */
     {
-        static char good[64][DL_POOL_SLOT]; int ngood=0;
-        for(int w=0; w<nw && ngood<64; w++){
-            if(stats[w].blocks<=0) continue;
-            const char* ip=(const char*)stats[w].peer;
-            if(!ip[0]) continue;
-            int dup=0; for(int j=0;j<ngood;j++) if(!strcmp(good[j],ip)){ dup=1; break; }
-            if(dup) continue;
-            strncpy(good[ngood],ip,63); good[ngood][63]=0; ngood++;
+        /* Persist the good list (pool[nadd..nadd+ngood), the entries loaded
+         * from last run's peers.good) that survived the liveness probe, each
+         * with its measured EMA.
+         *
+         * The deliverer criterion (some worker holds this peer and delivered
+         * blocks>0, i.e. the old stats[w].peer rule) is only SOUND when there
+         * is exactly one pool entry per live IP: claimed[] guarantees a worker
+         * never shares a peer, but a bare-ip pool entry and the same ip:port
+         * from the book are TWO live slots, and a worker could hold A while
+         * the credit landed on entry B. So the EMA attached to a good peer is
+         * taken from EVERY live slot with the same IP, worst case: if the
+         * worker holding that IP was rotated off it (held_idx moved on), the
+         * seed value from last run is re-emitted instead of a made-up number.
+         * (An IP-based match is right wherever a slot matches: a banned slot
+         * can never be a worker's held slot, and the same IP elsewhere in
+         * live[] is either the same peer under a second port or dead.) */
+        static char good[64][DL_POOL_SLOT]; static double good_e[64]; int ng=0;
+        for(int j=0;j<ngood && ng<64;j++){
+            const char* gi=pool[nadd+j];
+            int ip4=0; unsigned gip=pool_ipv4(gi,&ip4);
+            if(!gip) continue;                          /* not a dialable IPv4 -- cannot track EMA */
+            long bi=-1; int held_delivered=0;
+            for(int i=0;i<nlive;i++){
+                int p2=0; unsigned ip=0;
+                if(!dlc_parse_peer(live[i],&ip,&p2) || ip!=gip) continue;
+                if(bi<0) bi=i;
+                for(int w=0; w<nw; w++)
+                    if(stats[w].held_idx==i && stats[w].blocks>0){ held_delivered=1; break; }
+            }
+            if(bi<0) continue;                          /* did not survive the probe: not live this run */
+            good_e[ng] = held_delivered ? ema[bi] : good_ema[nadd+j];  /* fresh reading, else carry last run's seed */
+            strncpy(good[ng],gi,63); good[ng][63]=0; ng++;
         }
-        dl_save_good_peers(good, ngood);
+        dl_save_good_peers_ema(good, good_e, ng);
     }
     munmap((void*)next_claim,sizeof(long)); munmap((void*)done_count,sizeof(long));
     munmap((void*)stats,sizeof(dlc_stat_t)*(size_t)nw);
     munmap((void*)claimed,sizeof(int)*(size_t)nlive);
+    munmap((void*)banned,sizeof(int)*(size_t)nlive);
+    munmap((void*)ema,sizeof(double)*(size_t)nlive);
     fprintf(stderr,"[dlc] catch-up done: %ld new blocks written\n", total);
     return total;
 }
@@ -4927,16 +5248,51 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 fprintf(stderr,"[ctl] ping queued to %d leg(s)\n", sent);
                 result = 1;
             } else if(op == RPC_CTL_DISCONNECT){
+                /* ---- RPC-3 (audit 2026-09-03) ----
+                 *
+                 * This matched `num` against the raw outbound leg index i,
+                 * while getpeerinfo published a COUNTER over live slots. The
+                 * two agree only while every slot below is occupied and no
+                 * inbound slot precedes, so after any churn (slot 1 free,
+                 * slots 0/2/3 live) the operator's chosen id named a
+                 * different peer -- and the RPC still returned success.
+                 * Inbound peers could not be disconnected at all: the loop
+                 * ran to mux_n_out, and the address branch compared only
+                 * outbound hosts.
+                 *
+                 * Both sides now key on rpc_peer_t.nodeid, which is unique
+                 * for the life of the process, and the search covers every
+                 * slot. An inbound slot is a forked serve child, so it is
+                 * dropped with SIGTERM on its published pid -- the same
+                 * signal the parent uses at shutdown. */
                 char want[128]; ctl_ip_only(arg, want, sizeof want);
-                for(int i = 0; i < mux_n_out; i++){
-                    if(mux_out_fd[i] < 0) continue;
-                    char have[128]; ctl_ip_only(mux_out_host[i], have, sizeof have);
+                if(g_node_status) for(int i = 0; i < RPC_MAX_PEERS; i++){
+                    rpc_peer_t* q = &g_node_status->peers[i];
+                    if(!q->used) continue;
+                    char have[128]; ctl_ip_only(q->addr, have, sizeof have);
                     int hit = (want[0] && !strcmp(have, want)) ||
-                              (!want[0] && num == (long long)i);
+                              (!want[0] && num == (long long)q->nodeid);
                     if(!hit) continue;
-                    fprintf(stderr,"[ctl] disconnecting %s (leg %d)\n", mux_out_host[i], i);
+                    if(q->inbound){
+                        if(q->pid > 0 && kill((pid_t)q->pid, SIGTERM) == 0){
+                            fprintf(stderr,"[ctl] disconnecting inbound %s (nodeid %lld, pid %d)\n",
+                                    q->addr, (long long)q->nodeid, q->pid);
+                            q->used = 0; result = 1;
+                        } else {
+                            fprintf(stderr,"[ctl] inbound %s (nodeid %lld) has no live child to signal\n",
+                                    q->addr, (long long)q->nodeid);
+                        }
+                        break;
+                    }
+                    if(i >= mux_n_out || mux_out_fd[i] < 0){
+                        fprintf(stderr,"[ctl] outbound nodeid %lld (slot %d) is no longer connected\n",
+                                (long long)q->nodeid, i);
+                        q->used = 0; break;
+                    }
+                    fprintf(stderr,"[ctl] disconnecting %s (nodeid %lld, leg %d)\n",
+                            mux_out_host[i], (long long)q->nodeid, i);
                     bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1;
-                    if(g_node_status) g_node_status->peers[i].used = 0;
+                    q->used = 0;
                     result = 1; break;
                 }
             } else if(op == RPC_CTL_ADDNODE){
@@ -5000,19 +5356,36 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                             result = 1; break;
                         }
                 } else {
-                    /* refuse a subnet form the matcher cannot enforce */
-                    const char* sl = strchr(arg, '/');
-                    if(sl && (atoi(sl+1) % 8 || atoi(sl+1) < 8 || atoi(sl+1) > 32)){
+                    /* ---- RPC-8 (audit 2026-09-03) ----
+                     * This used to refuse any prefix that was not a multiple
+                     * of 8 in [8,32], claiming the matcher could not enforce
+                     * it. That was true of the OLD string-comparing matcher
+                     * and has been false since subnet.c landed:
+                     * subnet_parse/subnet_covers handle any prefix 0..128 for
+                     * both families, and ctl_ban_covers is a one-line
+                     * passthrough to them. tests/test_subnet.c already proves
+                     * /28, /12, /20 and IPv6 including ::/0.
+                     *
+                     * Worse, the rule read the prefix without looking at the
+                     * family, so it ACCEPTED 2001:db8::/32 while refusing
+                     * ::1/128 and 2001:db8::/64 -- the exact inversion the
+                     * comment above ctl_ban_covers says was fixed.
+                     *
+                     * Now: parse it. An unparseable spec is refused (Core
+                     * raises -30 at the RPC, which cmd_setban also does now);
+                     * anything the matcher can actually evaluate is allowed. */
+                    subnet_t sn_probe;
+                    if(!subnet_parse(arg, &sn_probe)){
                         result = -1;
                         snprintf(reason, sizeof reason,
-                                 "this node enforces only /8, /16, /24 and /32 subnets; "
-                                 "a prefix it cannot match would be stored and never enforced");
+                                 "not a valid IP or subnet: %s", arg);
                     } else if(strlen(arg) >= sizeof g_node_status->bans[0].subnet){
-                        /* 2026-09-02 (-Wall -Werror audit): the argument is 127
-                         * chars and the slot is 64. Truncating here would store a
-                         * SHORTER subnet, and subnet_covers_str() matches a
-                         * truncated prefix BROADLY -- a setban of one host would
-                         * ban a whole /8. Refuse instead. */
+                        /* 2026-09-02 (-Werror audit, kept through the
+                         * subnet_parse rework): the argument is up to 127
+                         * chars and the slot is 64. Truncating here would
+                         * store a SHORTER subnet, and subnet_covers_str()
+                         * matches a truncated prefix BROADLY -- a setban of
+                         * one host would ban a whole /8. Refuse instead. */
                         result = -1;
                         snprintf(reason, sizeof reason,
                                  "that subnet is too long for the ban table (%u bytes); "
@@ -5212,26 +5585,23 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                  * catch-up the honest answer stays "inconclusive". */
                 extern long utxo_live_dryrun_block(const unsigned char*, unsigned long long, long);
                 extern const char* utxo_live_last_reject(void);
-                extern unsigned int rpc_chain_retarget(unsigned int, long);
                 long applied = utxo_live_ok ? utxo_live_applied_height() : -1;
                 static unsigned char hb[4u<<20];   /* store_read_at scratch */
                 if (applied != tip){
                     snprintf(reason, sizeof reason, "inconclusive");
                 } else {
-                    /* next-work check: a block whose header meets its OWN bits
-                     * but not the CHAIN's required bits must not connect. */
-                    unsigned int want_bits = 0, blk_bits =
-                        (unsigned)sblk[72] | ((unsigned)sblk[73]<<8) | ((unsigned)sblk[74]<<16) | ((unsigned)sblk[75]<<24);
-                    unsigned int tip_time = 0;
-                    if (store_read_at(store_buf, (u64)tip, hb, sizeof hb) >= 80){
-                        unsigned int tip_bits = (unsigned)hb[72]|((unsigned)hb[73]<<8)|((unsigned)hb[74]<<16)|((unsigned)hb[75]<<24);
-                        tip_time = (unsigned)hb[68]|((unsigned)hb[69]<<8)|((unsigned)hb[70]<<16)|((unsigned)hb[71]<<24);
-                        if ((tip + 1) % 2016 != 0) want_bits = tip_bits;
-                        else if (store_read_at(store_buf, (u64)(tip - 2015), hb, sizeof hb) >= 80){
-                            unsigned int first_time = (unsigned)hb[68]|((unsigned)hb[69]<<8)|((unsigned)hb[70]<<16)|((unsigned)hb[71]<<24);
-                            want_bits = rpc_chain_retarget(tip_bits, (long)tip_time - (long)first_time);
-                        }
-                    }
+                    /* VAL-14 (audit 2026-09-03): there used to be a next-work
+                     * pre-check here -- rpc_chain_retarget(tip_bits, span) with
+                     * a bare `(tip+1) % 2016` -- i.e. MAINNET'S schedule only:
+                     * no testnet4 20-minute min-difficulty walk-back, no BIP94
+                     * first-block base. On testnet4 a valid min-difficulty block
+                     * submitted here was answered "bad-diffbits"; on a BIP94
+                     * boundary the expected bits were simply wrong. The dry run
+                     * below already runs pow_check_bits with THIS chain's rules
+                     * (utxo_live_set_pow_rules, armed after chainparams_select)
+                     * and answers the same "bad-diffbits", so the pre-check was
+                     * a second, less correct opinion. Removed; the timestamp
+                     * rules that follow are chain-agnostic and stay. */
                     /* median time past of the last 11 headers */
                     unsigned int mtp = 0;
                     { unsigned int tt[11]; int nn = 0;
@@ -5243,9 +5613,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                           if (tt[b2] < tt[a2]){ unsigned int sw=tt[a2]; tt[a2]=tt[b2]; tt[b2]=sw; }
                       if (nn) mtp = tt[nn/2]; }
                     unsigned int blk_time = (unsigned)sblk[68]|((unsigned)sblk[69]<<8)|((unsigned)sblk[70]<<16)|((unsigned)sblk[71]<<24);
-                    if (!want_bits || blk_bits != want_bits){
-                        snprintf(reason, sizeof reason, "bad-diffbits");
-                    } else if (blk_time <= mtp){
+                    if (blk_time <= mtp){
                         snprintf(reason, sizeof reason, "time-too-old");
                     } else if ((long long)blk_time > (long long)time(NULL) + 7200){
                         snprintf(reason, sizeof reason, "time-too-new");
@@ -5261,9 +5629,27 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                          * pass after the dry run; same undo/checkpoint
                          * crash-safety as any network block). */
                         unsigned char bh[32]; sha256d(bh, sblk, 80);
-                        if (store_append(store_buf, bh, sblk, (long)slen) < 0){
+                        /* STO-5 (audit 2026-09-03): the miner's block goes in
+                         * through the SAME locked appender the worker legs and
+                         * the inbound serve children use. store_append writes
+                         * at a cached cur_file_pos without taking append.lock,
+                         * so a serve child that appended network block T+1 a
+                         * moment earlier -- while this worker still believed
+                         * the tip was T -- had its frame overwritten, and a
+                         * larger submitted block overran the frame after it.
+                         *
+                         * -2 is its own answer, not a generic failure: the
+                         * block no longer links to the tip, meaning the chain
+                         * moved under us between the dry run and here. That is
+                         * exactly the race, and saying so beats "rejected". */
+                        long ar_sb = idxscan_append_locked(store_buf, bh, sblk, (long)slen);
+                        if (ar_sb == -2){
+                            snprintf(reason, sizeof reason, "inconclusive");
+                            fprintf(stderr,"[dl] submitblock: the tip moved between the dry run and the append "
+                                           "(another writer stored a block first) -- not connecting\n");
+                        } else if (ar_sb < 0){
                             snprintf(reason, sizeof reason, "rejected");
-                            fprintf(stderr,"[dl] submitblock: store_append FAILED\n");
+                            fprintf(stderr,"[dl] submitblock: locked append FAILED\n");
                         } else {
                             long ar = utxo_live_catchup(store_buf);
                             if (ar < 0){
@@ -5433,7 +5819,15 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                      * this peer fRelay=0 (-blocksonly) and it relayed anyway */
                     fprintf(stderr,"[mux:%d] %s sent transactions in -blocksonly: violation, disconnecting\n", i, mux_out_host[i]);
                     mux_next_peer(i, peers, pool_len, out_port);
-                    mux_out_nextretry[i] = (long long)(clock() * 1000.0 / CLOCKS_PER_SEC) + REDIAL_BACKOFF_MS;
+                    /* DMN-7 (audit 2026-09-03): clock() is process CPU time,
+                     * not wall time. Compared against now_ms (CLOCK_MONOTONIC,
+                     * a much larger number) this retry stamp was already in
+                     * the past the moment it was written, so there was NO
+                     * backoff: on a -blocksonly node a peer that relayed a tx
+                     * was disconnected and the slot re-dialled immediately,
+                     * over and over. dh_now_ms() is the monotonic clock every
+                     * other timestamp here uses. */
+                    mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
                     continue;
                 }
                 { extern void txrelay_publish_orphans(void); txrelay_publish_orphans(); }
@@ -5954,7 +6348,14 @@ static void serve_rpc_read_creds(const char* cfgpath, int* port,
  * resolve. A LOWER BOUND, documented in PARITY_PLAN; never fabricated. */
 static long gbt_sigops_legacy4(const unsigned char* tx, unsigned long len){
     extern long tx_legacy_sigops(const unsigned char*, unsigned long);
-    return tx_legacy_sigops(tx, len) * 4;
+    long n = tx_legacy_sigops(tx, len);
+    /* SCR-10: -1 means the transaction did not parse. Every transaction in a
+     * template came from the mempool and was parsed to get there, so this is
+     * unreachable; it is clamped rather than propagated because "sigops" is a
+     * COUNT in the template JSON and a negative one would be a worse lie than
+     * a zero. The clamp is about the field's type, not a judgment that the
+     * transaction is fine. */
+    return n < 0 ? 0 : n * 4;
 }
 
 /* wallet-encryption glue: the live seed the RPC wallet points at, and the
@@ -5975,6 +6376,20 @@ static int provide_wallet_mnemonic(char* out, long cap, char* pass_out, long pca
     snprintf(out, (size_t)cap, "%s", g_wallet_mnemonic);
     snprintf(pass_out, (size_t)pcap, "%s", g_wallet_bip39pass);
     return 1;
+}
+/* WAL-3 (audit 2026-09-03): registered with wallet_enc_state.c and called once
+ * encryptwallet has sealed the mnemonic AND verified the container opens. From
+ * that moment the container is the source of truth -- wenc_unlock re-derives
+ * the seed from it -- so these two must not outlive it. They used to sit here
+ * for the life of the process: `walletlock` zeroed the seed and reported a
+ * locked wallet while the provider went on serving the mnemonic and its BIP39
+ * passphrase, both readable from /proc/<pid>/mem, a swap partition or a
+ * hibernation image. secure_zero, because a plain memset on a buffer that is
+ * dead afterwards is exactly the store -O2 may delete. */
+static void forget_wallet_mnemonic(void){
+    secure_zero(g_wallet_mnemonic, sizeof g_wallet_mnemonic);
+    secure_zero(g_wallet_bip39pass, sizeof g_wallet_bip39pass);
+    fprintf(stderr, "[wallet] mnemonic sealed and verified: plaintext copy cleared from memory\n");
 }
 
 /* -persistmempool reload on its own thread (see serve_start_rpc). */
@@ -6090,6 +6505,28 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern int  wenc_boot(const char*);
       wenc_set_seed_installer(wenc_install_seed);
       wenc_set_mnemonic_provider(provide_wallet_mnemonic);
+      { extern void wenc_set_mnemonic_forget(void (*)(void));
+        wenc_set_mnemonic_forget(forget_wallet_mnemonic); }
+    /* WAL-3 (rest): the wallet secrets are statics that live for the life of
+     * the process, so lock them out of swap and out of any core file before
+     * anything is written into them. Said out loud either way: an operator
+     * whose RLIMIT_MEMLOCK is too low should know the seed can reach swap,
+     * and a line saying it succeeded is the only evidence that it did. */
+    { int a = secure_lock(g_wallet_seed, sizeof g_wallet_seed);
+      int b = secure_lock(g_wallet_mnemonic, sizeof g_wallet_mnemonic);
+      int c = secure_lock(g_wallet_bip39pass, sizeof g_wallet_bip39pass);
+      extern int wenc_lock_secrets(void);
+      int d = wenc_lock_secrets();
+      if (a && b && c && d)
+          fprintf(stderr,"[wallet] seed, mnemonic and passphrase locked into RAM "
+                         "(mlock) and excluded from core dumps\n");
+      else
+          fprintf(stderr,"[wallet] WARNING: could not lock wallet secrets into RAM "
+                         "(seed=%d mnemonic=%d passphrase=%d container=%d) -- they may "
+                         "reach swap or a hibernation image. Raise RLIMIT_MEMLOCK "
+                         "(LimitMEMLOCK= in the unit file) to fix.\n", a, b, c, d);
+    }
+
       /* multi-wallet (rpc_wallet_ops.c): loadwallet/createwallet install the
        * switched-to wallet's seed through the SAME installer the encryption
        * unlock path uses -- one seed slot, one way to write it. */
@@ -6136,7 +6573,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
               /* keep the mnemonic available so encryptwallet can seal it */
               snprintf(g_wallet_mnemonic, sizeof g_wallet_mnemonic, "%s", mn);
               snprintf(g_wallet_bip39pass, sizeof g_wallet_bip39pass, "%s", wpass);
-              memset(mn, 0, sizeof mn);
+              secure_zero(mn, sizeof mn);      /* WAL-3 */
               fprintf(stderr, "[rpc] wallet store %s loaded (wallet RPCs live)\n", cand[wi]);
           } else {
               fprintf(stderr, "[rpc] wallet store %s present but not loadable "
@@ -6285,6 +6722,37 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     if(g_cfg.n_rpcwhitelist)
         fprintf(stderr,"[rpc] %d rpcwhitelist entr%s; users without one may call %s\n", g_cfg.n_rpcwhitelist,
                 g_cfg.n_rpcwhitelist == 1 ? "y" : "ies", g_cfg.rpcwhitelistdefault == 0 ? "anything" : "nothing (rpcwhitelistdefault)");
+    /* RPC-15 (audit 2026-09-03): CREDENTIALS BEFORE THE LISTENER.
+     * These two blocks used to run AFTER rpc_server_start, leaving a window in
+     * which the port was accepting but no rpcauth entry was registered and no
+     * cookie had been written -- so a client with valid rpcauth credentials
+     * got 401, and only rpcuser/rpcpassword worked. Fail-closed, but wrong.
+     *
+     * It also removes a data race for free: g_rpcauth[] was being written
+     * while worker threads could already be reading it, unsynchronised. With
+     * the writes before the server starts, no worker exists yet.
+     *
+     * This is Core's own order -- InitRPCAuthentication() (cookie generation
+     * and rpcauth loading) runs at the top of StartHTTPRPC(), before
+     * RegisterHTTPHandler. The pidfile and startupnotify stay AFTER the bind,
+     * deliberately: their whole point is to signal that the node is up. */
+    /* -rpcauth: hashed credentials, so a fixed password need not sit in the
+     * config in plaintext. A malformed entry is REPORTED, never dropped. */
+    for (int i = 0; i < g_cfg.n_rpcauth; i++){
+        if (!rpc_auth_add(g_cfg.rpcauth[i]))
+            fprintf(stderr,"[rpc] rpcauth entry %d is malformed (want user:salt$hash) -- ignored\n", i + 1);
+    }
+    if (rpc_auth_count())
+        fprintf(stderr,"[rpc] %d rpcauth credential(s) loaded\n", rpc_auth_count());
+    if (g_cfg.rpccookie){
+        const char* cpath = g_cfg.rpccookiefile[0] ? g_cfg.rpccookiefile : ".cookie";
+        if (rpc_cookie_write(cpath))
+            fprintf(stderr, "[rpc] cookie authentication enabled (%s, mode 0600)\n", cpath);
+        else
+            fprintf(stderr, "[rpc] could not write the cookie file %s: %s -- "
+                            "rpcuser/rpcpassword remains the only way in\n", cpath, strerror(errno));
+    }
+
     int actual = 0; char err[256];
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){
         fprintf(stderr, "[rpc] server start failed: %s\n", err);
@@ -6305,22 +6773,6 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
         else     fprintf(stderr,"[boot] could not write -pid=%s: %s\n", g_cfg.pidfile, strerror(errno));
     }
     if (g_cfg.startupnotify[0]) notify_run(g_cfg.startupnotify, "", "startupnotify");
-    /* -rpcauth: hashed credentials, so a fixed password need not sit in the
-     * config in plaintext. A malformed entry is REPORTED, never dropped. */
-    for (int i = 0; i < g_cfg.n_rpcauth; i++){
-        if (!rpc_auth_add(g_cfg.rpcauth[i]))
-            fprintf(stderr,"[rpc] rpcauth entry %d is malformed (want user:salt$hash) -- ignored\n", i + 1);
-    }
-    if (rpc_auth_count())
-        fprintf(stderr,"[rpc] %d rpcauth credential(s) loaded\n", rpc_auth_count());
-    if (g_cfg.rpccookie){
-        const char* cpath = g_cfg.rpccookiefile[0] ? g_cfg.rpccookiefile : ".cookie";
-        if (rpc_cookie_write(cpath))
-            fprintf(stderr, "[rpc] cookie authentication enabled (%s, mode 0600)\n", cpath);
-        else
-            fprintf(stderr, "[rpc] could not write the cookie file %s: %s -- "
-                            "rpcuser/rpcpassword remains the only way in\n", cpath, strerror(errno));
-    }
     /* -persistmempool: reload the dump the previous run left behind. Same
      * code the importmempool RPC uses, so the two cannot drift apart on the
      * format. A missing file is the ordinary case -- a fresh datadir, or a
@@ -6677,6 +7129,25 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
              * since boot, and says so in the log once per connection. */
             if(c>=0) peer_sock_buffers(c);
             if(c>=0) peer_inbound_deadline(c);        /* NET-3: idle peers cannot hold a slot forever */
+            if(c>=0 && g_shutdown_requested){
+                /* SC1 (2026-09-05, /mnt/2tbssd bmc-vs-Core benchmark): the
+                 * stop sequence was observed forking a child into a parent
+                 * that was already tearing down -- the accept fired in the
+                 * window between SIGTERM and the listener closing, and the
+                 * child inherited a half-torn-down address space. Core
+                 * closes its listeners first, then drains; we now refuse at
+                 * the accept the same way: one clean close, no fork, the
+                 * peer reconnects to whatever comes up next. Rate-limited:
+                 * a shutdown racing a connect flood must not flood the log. */
+                static long long last_stop_log_ms = 0;
+                long long nms; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+                                 nms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
+                if(nms - last_stop_log_ms > 1000){
+                    fprintf(stderr,"[serve] shutting down -- refusing inbound %s\n", peerdesc);
+                    last_stop_log_ms = nms;
+                }
+                close(c); c = -1;
+            }
             if(c>=0) serve_idx_topup();
             if(c>=0 && upload_note_and_check(0)){
                 /* over -maxuploadtarget for this 24h window -- unless the
@@ -6802,7 +7273,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
          * inserted, so every leg read the PREVIOUS leg's revents and the
          * last leg's was never examined (2026-08-28 pre-deploy review). */
         int poll_idx=legs_start;
-        long long now_ms = (long long)(clock() * 1000.0 / CLOCKS_PER_SEC);
+        /* DMN-7: clock() is CPU time, which in the mux parent advances at a
+         * small fraction of wall time -- REDIAL_BACKOFF_MS (30 s) became a
+         * 30-CPU-second gap, i.e. minutes of wall clock. Monotonic, like
+         * every other timestamp in this file. */
+        long long now_ms = dh_now_ms();
         for(int i=0;i<mux_n_out;i++){
             if(mux_out_fd[i]<0){                          /* dead slot: re-dial (rate-limited) */
                 if(now_ms >= mux_out_nextretry[i]){ mux_next_peer(i, peers, pool_len, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
@@ -6987,6 +7462,29 @@ int main(int argc, char** argv){
         fprintf(stderr,"usage: %s [-datadir=<dir>] [-conf=<file>] sync <dir> | ibd <dir> | follow <dir> | serve <dir> <port> | server-test <dir>\n", argv[0]);
         return 2; }
     const char* mode = argv[1];
+    /* ---- DMN-10 (audit 2026-09-03): validate the MODE before doing work ----
+     * `bitcoind -datadir=/x serve` is documented as equivalent to the
+     * positional form, and it is not: stripping the flag leaves argc == 2, the
+     * usage check below passes on flag_datadir, and the serve branch far below
+     * is gated on argc >= 3 -- so the process resolved the datadir, chdir'd,
+     * loaded the config, trimmed derived tails, opened the store and
+     * self-seeded genesis, and only THEN fell off the end and returned 2 with
+     * no message. An unknown mode did the same.
+     *
+     * Checking the mode here costs nothing and turns both into an immediate,
+     * explained exit. The serve branch's own argc gate is widened to accept
+     * the flag form separately; everything it reads past argv[2] is already
+     * guarded by its own argc checks. */
+    { static const char* const MODES[] = {
+          "sync", "ibd", "follow", "serve", "server-test", "serve-test" };
+      int known = 0;
+      for (unsigned mi = 0; mi < sizeof MODES / sizeof MODES[0]; mi++)
+          if (!strcmp(mode, MODES[mi])){ known = 1; break; }
+      if (!known){
+          fprintf(stderr, "%s: unknown mode \"%s\"\n", argv[0], mode);
+          fprintf(stderr,"usage: %s [-datadir=<dir>] [-conf=<file>] sync <dir> | ibd <dir> | follow <dir> | serve <dir> <port> | server-test <dir>\n", argv[0]);
+          return 2;
+      } }
     const char* dir = flag_datadir ? flag_datadir : argv[2];
     /* Resolve <dir> to an ABSOLUTE path before chdir so the store opens in the
      * right directory regardless of the caller's cwd (soak analysis found a
@@ -7122,6 +7620,26 @@ int main(int argc, char** argv){
                           g_chainp->allow_min_difficulty,
                           g_chainp->enforce_bip94,
                           g_chainp->pow_limit_bits);
+      /* VAL-5 (rest): the same arming for ContextualCheckBlockHeader's trio
+       * on the reorg path. The boot header fetch and block connect already
+       * enforce them; reorg_analyze checked PoW, linkage and the nBits
+       * schedule but not time-too-old / time-too-new / bad-version, so a
+       * candidate chain carrying such a header was judged on work alone and,
+       * if it won, every one of its blocks was connected. */
+      { extern void reorg_set_header_rules(long);
+        reorg_set_header_rules(dlc_bip34_height()); }
+      /* NET-5: the same rules on the INBOUND-BLOCK path. bitcoin_serve.asm's
+       * .do_block appended a peer-pushed block after cons_verify (context-
+       * free) and a prev-hash check only, so a header Core rejects at
+       * ContextualCheckBlockHeader became the durable archive tip at a
+       * height it can never connect at. One call arms all four rules there;
+       * see serve_block_ctx_ok in daemon/tx_accept.c. */
+      { extern void serve_set_header_rules(int, int, int, unsigned int, long);
+        serve_set_header_rules(g_chainp->pow_no_retargeting,
+                               g_chainp->allow_min_difficulty,
+                               g_chainp->enforce_bip94,
+                               g_chainp->pow_limit_bits,
+                               dlc_bip34_height()); }
       /* SAY SO. The check is injected and default-off, so an inert one is
        * indistinguishable from a working one by observing accepted blocks --
        * every block is accepted either way. test_reorg proves the wiring in
@@ -7473,7 +7991,11 @@ int main(int argc, char** argv){
         return failures?1:0;
     }
 
-    if(strcmp(mode,"serve")==0 && argc>=3){
+    /* DMN-10: `-datadir=<dir> serve` leaves argc == 2, so the flag form has to
+     * be accepted here too. The port and worker counts below already default
+     * from g_cfg / argc, and every argv[3..] read is guarded by its own argc
+     * check, so nothing downstream needs argc >= 3. */
+    if(strcmp(mode,"serve")==0 && (argc>=3 || flag_datadir)){
         /* Port precedence: CLI arg > bitcoin.conf `port` > Core default 8333.
          * The CLI arg is now OPTIONAL so the config file can genuinely own
          * the node's network identity -- previously it was required, so the
@@ -7533,9 +8055,40 @@ int main(int argc, char** argv){
         if(g_cfg.checklevel > 0){
             phase_timer_t chk_pt; phase_start(&chk_pt);
             long probs = archive_check(g_cfg.checkblocks, g_cfg.checklevel);
-            if(probs > 0)
+            if(probs > 0){
                 fprintf(stderr,"[boot] archive check found %ld problem(s) in %.2fs -- see [check] lines above\n",
                         probs, phase_elapsed(&chk_pt));
+                /* STO-11: the check used to stop here. A record pointing at
+                 * bytes that never reached disk (the crash window store_append
+                 * now closes with fdatasync) was detected on every boot and
+                 * repaired on none, so catch-up stalled at that height
+                 * forever.
+                 *
+                 * archive_repair_bad_bodies ZEROES those index records, which
+                 * turns each into an ordinary never-fetched hole for the
+                 * catch-up path to refill. It does NOT truncate -- see its own
+                 * comment, and archive_layout_monotonic's, for why that
+                 * distinction is load-bearing here. This is the same mechanism
+                 * archive_repair_duplicates already uses, on the same file,
+                 * under the same fsync.
+                 *
+                 * The comment above about archive_check not acting still
+                 * holds for the DESTRUCTIVE repair: archive_verify_and_repair
+                 * keeps its own narrower trigger and is untouched. */
+                if(g_cfg.checklevel >= 3){
+                    long healed = archive_repair_bad_bodies(g_cfg.checkblocks, g_cfg.checklevel);
+                    if(healed > 0)
+                        fprintf(stderr,"[boot] archive self-heal: %ld height(s) marked for re-download\n",
+                                healed);
+                    else if(healed < 0)
+                        fprintf(stderr,"[boot] archive self-heal FAILED -- the bad height(s) remain; "
+                                       "catch-up will stall there\n");
+                } else {
+                    fprintf(stderr,"[boot] checklevel=%d is below 3, so the frame/body check that "
+                                   "drives self-heal did not run -- problems are reported only\n",
+                            g_cfg.checklevel);
+                }
+            }
             else if(probs == 0)
                 fprintf(stderr,"[boot] archive check clean (%.2fs)\n", phase_elapsed(&chk_pt));
         } else {
@@ -7758,6 +8311,14 @@ int main(int argc, char** argv){
         pid_t dl = fork();
         if(dl==0){
             if(g_txoq_parent >= 0){ close(g_txoq_parent); g_txoq_parent = -1; }
+            /* TXOQ-1 (2026-09-05 benchmark): register the between-block
+             * service hook before the worker's first utxo_live_catchup, so a
+             * long catch-up pass answers gettxout queries at its block
+             * boundaries instead of refusing them all until it returns. */
+            if(g_txoq_worker >= 0){
+                extern void utxo_live_set_apply_hook(void (*)(void));
+                utxo_live_set_apply_hook(txoq_service);
+            }
             serve_download_worker(dir, (const char**)g_seed_hosts, g_n_seed_hosts, g_chainp->default_port);
             _exit(0);
         }

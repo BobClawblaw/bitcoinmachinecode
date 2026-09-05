@@ -483,7 +483,10 @@ That makes a cross-module test possible for the first time:
 that reached a table but never got a line in its module's dispatch ladder
 would be advertised, reported known, and then fail — and no per-module test
 can see that, because it needs all four modules linked together. The sweep
-currently covers 155 methods. (`stop` and the `waitfor*` family are skipped
+currently covers 162 methods (BLD-5 2026-09-05: this said 155, and the
+README's method count was copied from here, so one stale number became two --
+the live figure is the deduplicated union of the four tables, which is what
+`help` prints in its header). (`stop` and the `waitfor*` family are skipped
 by name — one fires the shutdown handler, the others block for their
 timeout; both are exercised in their own tests.)
 
@@ -493,6 +496,38 @@ implementations by hand, and a usage string that has drifted from its method
 is worse than none. `help "<method>"` says whether the method is served and
 points at this document; an unknown command gets Core's exact
 `help: unknown command: <x>`.
+
+### Batch requests (RPC-6, 2026-09-05)
+A top-level JSON array is a **batch**, matching Core's `ExecuteHTTPRPC`:
+HTTP 200, one reply per element, and per-element failures carried as error
+*objects inside the array* rather than as an HTTP error ("Batches never throw
+HTTP errors" -- `httprpc.cpp`). Core's three tail rules are reproduced
+exactly:
+
+- V2 notifications (no `id`) are executed but omitted from the reply array;
+- a batch that is entirely notifications answers **204** with no body;
+- but an **empty** array answers `[]` at 200, not 204. Core takes that
+  divergence from the JSON-RPC 2.0 spec deliberately, for back-compat with
+  clients that predate the spec, and says so in a comment; this node follows
+  Core rather than the spec here.
+
+A top level that is neither an object nor an array (a bare string, number or
+boolean) is still `-32700 "Top-level object parse error"` at HTTP 500 -- that
+error is real, it just never belonged to arrays.
+
+`-rpcwhitelist` is applied to **every member** of a batch before anything
+executes, as Core does; one forbidden method gives the whole batch 403 with
+an empty body. That check is what stops a forbidden method being smuggled in
+beside a permitted one, and it is asserted directly
+(`tests/test_rpc_whitelist.c`) -- with the batch branch in place but the
+per-element whitelist check removed, `getnewaddress` executes for a user
+whose whitelist does not include it.
+
+*(Until this landed, every array was answered `-32700` at HTTP 500, and the
+code comment attributed that behaviour to Core -- the opposite of what Core
+does. `tests/test_rpc_server.c` pinned the 500 with `[1,2,3]`, so the
+divergence was recorded as intended behaviour and was invisible to these
+parity docs. Real tooling batches: electrs, python-bitcoinrpc's `batch_`.)*
 
 ### `getrpcinfo`
 `active_commands` is a one-element array naming `getrpcinfo` itself. That is

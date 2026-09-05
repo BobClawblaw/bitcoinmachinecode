@@ -50,6 +50,7 @@
 #include <time.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include "hdrrules.h"      /* VAL-5: ContextualCheckBlockHeader rules */
 #include "reorg.h"
 #include "../bitcoin_pow_rules.h"
 #include "utxo_walk.h"
@@ -94,6 +95,7 @@ void reorg_alert(const char* msg){ if (g_alert_fn && msg) g_alert_fn(msg); }
 
 
 
+extern unsigned long long script_flags_for_block(unsigned long long height, const unsigned char hash32[32]);
 extern int  pow_check(const unsigned char hdr[80]);
 extern int  cons_verify(const void* block, long len, void* scratch, unsigned cap);
 extern long locator_build(void* store_buf, unsigned char* out_hashes); /* [REORG_LOCATOR_MAX*32] */
@@ -480,6 +482,34 @@ void reorg_set_pow_rules(int no_retarget, int allow_min_diff,
     g_rg_bip94 = enforce_bip94; g_rg_lim = pow_limit_bits;
     g_rg_powr_enabled = 1;
 }
+
+/* ---- VAL-5 (rest): the non-PoW header rules on the REORG path ----
+ *
+ * VAL-5 was closed for the boot header fetch (daemon/main.c) and for block
+ * connect, and left open here: reorg_analyze checked PoW, linkage and the
+ * nBits schedule, but not Core's ContextualCheckBlockHeader trio --
+ * "time-too-old" (nTime <= the parent's median-time-past), "time-too-new"
+ * (nTime > now + 2h) and "bad-version" (a legacy nVersion at or above a
+ * BIP34/66/65 activation). A candidate chain carrying such a header was
+ * evaluated on work alone, and if it won, every one of its blocks was
+ * connected -- blocks Core rejects outright.
+ *
+ * INJECTED and default-OFF, exactly like the pow rules and for the same
+ * reason: the hermetic suites build synthetic chains with arbitrary
+ * timestamps and versions, and only the daemon knows the chain. */
+static long g_rg_bip34_h = -1;
+static int  g_rg_hdrrules_enabled = 0;
+/* A NEGATIVE bip34_height disarms, so a caller that armed the rules can put
+ * them back exactly as they were. Without that, "disarm" would have to be
+ * spelled as some sentinel height, and a bip34_h of -1 with the rules still
+ * on means `height >= -1` for every header -- i.e. the version rules firing
+ * on chains that have no BIP34 at all. */
+void reorg_set_header_rules(long bip34_height){
+    if (bip34_height < 0){ g_rg_hdrrules_enabled = 0; return; }
+    g_rg_bip34_h = bip34_height;
+    g_rg_hdrrules_enabled = 1;
+}
+
 /* composite header reader for a candidate: heights above base_height come
  * from the candidate's own header run, everything at or below it from the
  * archive (80-byte pread via the cached read fds). */
@@ -500,6 +530,29 @@ static int rg_hdr_at(void* vctx, long h, unsigned char hdr[80]){
     /* +8 skips the [len][magic] frame header -- store_read_meta's own
      * pread does exactly this (bitcoin_store_fast.asm) */
     return pread(fd, hdr, 80, (off_t)meta[0] + 8) == 80 ? 1 : 0;
+}
+
+/* Median-time-past of the 11 headers ENDING at `h`, read through the
+ * composite reader so ancestors come from the candidate run above the attach
+ * point and from the archive at or below it -- the same view pow_check_bits
+ * uses for the retarget window. Returns 0 if the window is not fully
+ * readable, and the caller then skips the floor for that header rather than
+ * evaluating it against a window that does not exist. */
+static unsigned long rg_mtp_at(void* vctx, long h){
+    unsigned int t[11];
+    int n = 0;
+    for (long k = h; k > h - 11 && k >= 0; k--){
+        unsigned char hdr[80];
+        if (!rg_hdr_at(vctx, k, hdr)) return 0;
+        memcpy(&t[n++], hdr + 68, 4);
+    }
+    if (n < 11) return 0;
+    for (int a2 = 1; a2 < n; a2++){                    /* insertion sort, n = 11 */
+        unsigned int v = t[a2]; int j = a2 - 1;
+        while (j >= 0 && t[j] > v){ t[j+1] = t[j]; j--; }
+        t[j+1] = v;
+    }
+    return (unsigned long)t[n/2];
 }
 
 long reorg_analyze(void* st, reorg_cand_t* c){
@@ -559,6 +612,22 @@ long reorg_analyze(void* st, reorg_cand_t* c){
                                     g_rg_no_rt, g_rg_mindiff, g_rg_bip94, g_rg_lim);
             if (pr != 1){
                 fprintf(stderr, "[reorg] candidate REJECTED: header %ld (height %ld) bad-diffbits\n", i, h);
+                return -1;
+            }
+        }
+    }
+
+    /* ---- VAL-5 (rest): ContextualCheckBlockHeader on every candidate ---- */
+    if (g_rg_hdrrules_enabled){
+        rg_powr_ctx x = { st, c };
+        long now = (long)time(NULL);
+        for (long i = 0; i < c->n; i++){
+            long h = c->base_height + 1 + i;
+            const char* why = "?";
+            unsigned long pmtp = rg_mtp_at(&x, h - 1);
+            unsigned long long hflags = script_flags_for_block((unsigned long long)h, c->hash[i]);
+            if (!hdr_contextual_ok(h, c->hdr[i], pmtp, now, hflags, g_rg_bip34_h, &why)){
+                fprintf(stderr, "[reorg] candidate REJECTED: header %ld (height %ld) %s\n", i, h, why);
                 return -1;
             }
         }
@@ -1094,15 +1163,8 @@ long reorg_mempool_reconcile(reorg_mempool_t* m,
                              const uint32_t* disc_lens, long ndisc){
     if (!m || !m->mp) return 0;
 
-    rtx_t* cand = (rtx_t*)malloc(sizeof(rtx_t) * REORG_MEMPOOL_MAX_TX);
     unsigned char* arena = (unsigned char*)malloc(REORG_MEMPOOL_ARENA);
-    /* The mempool's own blob is about to be logically emptied, and the policy
-     * rebuild re-adds through mpool_put, which copies into that same blob at
-     * a fresh `fill` offset. Snapshotted transaction bytes must therefore be
-     * copied OUT first, not referenced in place. */
-    unsigned char* snap_arena = (unsigned char*)malloc(REORG_MEMPOOL_ARENA);
-    if (!cand || !arena || !snap_arena){
-        free(cand); free(arena); free(snap_arena);
+    if (!arena){
         fprintf(stderr, "[reorg] mempool reconcile: allocation failed\n");
         return -1;
     }
@@ -1114,10 +1176,55 @@ long reorg_mempool_reconcile(reorg_mempool_t* m,
      * would see a half-emptied pool. mp_lock is a no-op for the per-process
      * static fallback. */
     mp_lock();
-    long ncand = mempool_snapshot(m->mp, cand, REORG_MEMPOOL_MAX_TX);
+
+    /* ---- MEM-8 (audit 2026-09-03): size the snapshot from the POOL ----
+     *
+     * The candidate array was a fixed 8,192 entries and the copy arena a
+     * fixed 16 MB, and both truncated silently. A pool holding more than that
+     * left the surplus as GHOSTS: still present in the structural mempool
+     * (mpool_del was called only for the snapshotted prefix) but with no
+     * registry node, no outreg and no claims after
+     * mpool_policy_state_init wiped the graph. Ghosts are served to getdata,
+     * counted by mpool_count, never expire (mempool_forget is only reached
+     * through the registry, so mempool_expire_now just clears their arrival
+     * time), never evict, and -- because their inputs are unclaimed -- a
+     * later double-spend of those inputs is admitted alongside them.
+     *
+     * Both are now sized from the live pool: the array from mpool_count and
+     * the arena from the actual snapshot bytes. The mempool contribution can
+     * no longer truncate, so no live entry is ever left behind. The
+     * DISCONNECTED-block contribution keeps a constant bound -- truncating
+     * there only means a transaction is not re-offered, which costs relay
+     * reach, not pool integrity -- and is reported when it bites.
+     *
+     * Every allocation happens before a single mpool_del, so a failure
+     * leaves the pool exactly as it was. */
+    long pool_n = mpool_count(m->mp);
+    if (pool_n < 0) pool_n = 0;
+    long cand_cap = pool_n + REORG_MEMPOOL_MAX_TX;
+    rtx_t* cand = (rtx_t*)malloc(sizeof(rtx_t) * (size_t)(cand_cap ? cand_cap : 1));
+    if (!cand){
+        mp_unlock(); free(arena);
+        fprintf(stderr, "[reorg] mempool reconcile: candidate array (%ld entries) allocation failed\n", cand_cap);
+        return -1;
+    }
+    long ncand = mempool_snapshot(m->mp, cand, cand_cap);
+    /* The pool's own bytes, measured rather than assumed. */
+    size_t snap_need = 0;
+    for (long i = 0; i < ncand; i++) snap_need += cand[i].len;
+    /* The mempool's own blob is about to be logically emptied, and the policy
+     * rebuild re-adds through mpool_put, which copies into that same blob at
+     * a fresh `fill` offset. Snapshotted transaction bytes must therefore be
+     * copied OUT first, not referenced in place. */
+    unsigned char* snap_arena = (unsigned char*)malloc(snap_need ? snap_need : 1);
+    if (!snap_arena){
+        mp_unlock(); free(cand); free(arena);
+        fprintf(stderr, "[reorg] mempool reconcile: snapshot arena (%zu bytes for %ld tx) allocation failed\n",
+                snap_need, ncand);
+        return -1;
+    }
     size_t snap_used = 0;
     for (long i = 0; i < ncand; i++){
-        if (snap_used + cand[i].len > REORG_MEMPOOL_ARENA){ ncand = i; break; }
         memcpy(snap_arena + snap_used, cand[i].tx, cand[i].len);
         cand[i].tx = snap_arena + snap_used;
         snap_used += cand[i].len;
@@ -1128,8 +1235,16 @@ long reorg_mempool_reconcile(reorg_mempool_t* m,
      * naturally offered before its in-block child. */
     for (long b = 0; b < ndisc; b++){
         ncand = collect_block_txs(disc_blocks[b], disc_lens[b], cand,
-                                  REORG_MEMPOOL_MAX_TX, ncand, arena,
+                                  cand_cap, ncand, arena,
                                   REORG_MEMPOOL_ARENA, &arena_used);
+    }
+    if (ncand >= cand_cap || arena_used >= REORG_MEMPOOL_ARENA){
+        /* MEM-8: only the disconnected-block contribution can hit these
+         * bounds now -- say so, because it means some losing-branch
+         * transactions are not being re-offered. */
+        fprintf(stderr, "[reorg] mempool reconcile: disconnected-branch candidates truncated "
+                        "(%ld of %ld slots, %zu of %u arena bytes); some transactions will not be re-offered\n",
+                ncand, cand_cap, arena_used, REORG_MEMPOOL_ARENA);
     }
 
     /* Empty the structural mempool and reset the policy graph. */

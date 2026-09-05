@@ -457,6 +457,43 @@ int main(void){
                                                   && memcmp(pl3+5, nope, 32) == 0);
     }
 
+    printf("\n== 7b: MEM-24 -- a bare MSG_TX gets the NON-WITNESS form ==\n");
+    {
+        /* Core serializes TX_NO_WITNESS for a getdata entry whose witness bit
+         * (0x40000000) is clear. This path served the stored WITNESS bytes to
+         * everyone, which a strict pre-segwit peer -- the only kind that asks
+         * with type 1 -- cannot parse.
+         *
+         * Section 7 above already asked with the witness type and got the
+         * stored bytes back verbatim; that is the opposite half, and it must
+         * keep working. Here the same pooled transaction is requested with
+         * the BARE type and must come back shorter, with no segwit
+         * marker/flag. */
+        drain_peer(sp[1]);
+        u8 txid1[32]; tx_txid(txid1, s->tx, (unsigned long)s->txlen, tb, sizeof tb);
+        int is_segwit = s->txlen > 6 && s->tx[4] == 0x00 && s->tx[5] == 0x01;
+        ck("MEM-24 fixture: the pooled tx really is segwit", is_segwit);
+
+        u8 gd[1 + 36]; gd[0] = 1;
+        gd[1]=0x01; gd[2]=0; gd[3]=0; gd[4]=0x00;      /* MSG_TX, witness bit CLEAR */
+        memcpy(gd+5, txid1, 32);
+        p2p_write(sp[1], "getdata", 7, gd, sizeof gd);
+        txrelay_poll_leg(sp[0], mp_area, 200);
+        char cmd[13]; static u8 pl7[8192];
+        int plen = read_msg(sp[1], cmd, pl7, sizeof pl7);
+        ck("MEM-24: a bare MSG_TX is still answered with a 'tx'",
+           plen > 0 && strcmp(cmd, "tx") == 0);
+        ck("MEM-24: the reply is SHORTER than the stored witness form",
+           plen > 0 && plen < s->txlen);
+        ck("MEM-24: the reply carries no segwit marker/flag",
+           plen > 6 && !(pl7[4] == 0x00 && pl7[5] == 0x01));
+        ck("MEM-24: and it is NOT the stored bytes",
+           !(plen == s->txlen && memcmp(pl7, s->tx, (size_t)plen) == 0));
+        if (plen > 0 && plen >= s->txlen)
+            printf("      served %d bytes for a %ld-byte witness tx -- NOT stripped\n",
+                   plen, (long)s->txlen);
+    }
+
     printf("\n== 8: accepted txs are announced to OTHER legs, not the source ==\n");
     {
         int spB[2];

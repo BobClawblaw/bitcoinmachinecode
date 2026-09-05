@@ -81,7 +81,17 @@ int signet_extract_solution(const unsigned char* spk, unsigned long spk_len,
     while (pos < spk_len){
         const unsigned char* d; unsigned long dl;
         long used = script_next(spk, spk_len, pos, &d, &dl);
-        if (used < 0) return -1;
+        /* VAL-13 (audit 2026-09-03): a truncated push used to be a hard
+         * reject (-1 -> "bad-signet-commitment-malformed"). Core's
+         * FetchAndClearCommitmentSection loops `while (GetOp(...))`: a
+         * failing GetOp simply ENDS the loop, and if a header was already
+         * found the truncated tail is dropped from the replacement script --
+         * the signature is validated over the truncated form. A signer whose
+         * commitment output ends with a dangling `4d ff ff` after a valid
+         * solution push therefore produces a block Core accepts and this node
+         * rejected. Stop here, exactly as GetOp does; `wo` already holds
+         * only the ops that parsed, which IS Core's replacement. */
+        if (used < 0) break;
         if (used == 0) break;
 
         if (dl > 0){

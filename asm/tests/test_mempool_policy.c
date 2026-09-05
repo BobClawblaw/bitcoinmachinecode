@@ -52,6 +52,7 @@ extern long   mpool_policy_add(void* pol, void* st, void* mp,
                                const unsigned char txid[32], void* utxo);
 extern unsigned long long mpool_policy_estimate_feerate(void* st);
 extern const char* mpool_policy_reason(void* pol);
+extern long mpool_policy_n_parents(void* st, const unsigned char txid[32]);
 
 /* bitcoin_mempool_policy.c now calls mempool_resolve_confirmed_utxo instead
  * of utxo_get directly (see its own extern's comment) -- this harness still
@@ -71,6 +72,30 @@ long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32], unsig
 static int hex_in(unsigned char* out, const char* h);
 
 static int failures = 0;
+
+/* ---- state buffers must be big enough, and SAY SO when they are not ----
+ *
+ * These buffers are fixed-size statics and mpool_policy_state_init memsets
+ * the whole state, so one that is too small overflows into whatever follows
+ * -- silently. This file had been doing exactly that: at n=4096 the state has
+ * always needed more than the 1 MB the buffers declared (1,163,360 bytes
+ * before the MEM-3/MEM-12 layout work, 1,126,240 after), so ~114 KB was being
+ * written past the end on every run. Nothing visible broke until a layout
+ * change moved which static landed in the overflow -- and then it was the
+ * failure counter itself, which is how a passing suite reported "-1
+ * failures".
+ *
+ * Every state_init in this file goes through this macro, so the next time a
+ * layout grows past a buffer the suite fails with the two numbers rather than
+ * corrupting itself. */
+#define POLICY_STATE_INIT(buf, n) do { \
+    size_t _need = mpool_policy_state_size((unsigned)(n)); \
+    if (_need > sizeof (buf)) { \
+        printf("FAIL: policy state buffer too small for n=%u: need %zu, have %zu\n", \
+               (unsigned)(n), _need, sizeof (buf)); \
+        failures++; \
+    } else mpool_policy_state_init((buf), (unsigned)(n)); \
+} while (0)
 #define MAXTX 4096
 
 static int run_scenario(int si,
@@ -115,17 +140,71 @@ int main(void){
  * case reported "ok" while quietly incrementing the failure count. */
 #define okv(c, msg) do{ int _okv = (c) ? 1 : 0; \
     printf("  %s %s\n", _okv?"ok ":"FAIL", (msg)); if(!_okv) failures++; }while(0)
+    /* ---- MEM-23: the size floor binds in the PRODUCTION shape --------------
+     * The harness below turns the 65-non-witness-byte floor off so its ~60-byte
+     * synthetic fixtures still work. That escape hatch needs its own guard, or
+     * "the floor is unconditional" would be a claim nothing checks.
+     *
+     * Here: -acceptnonstdtxn ON, the test knob UNTOUCHED (its default), which
+     * is exactly what a node running with -acceptnonstdtxn looks like. A
+     * sub-65-byte transaction must still be refused. Before this change,
+     * accept_nonstd returned before the floor was ever consulted, so this
+     * would have been ACCEPTED -- Core rejects it, because the floor mitigates
+     * CVE-2017-12842 rather than expressing a standardness preference. */
+    printf("== MEM-23: the 65-byte floor is not switched off by -acceptnonstdtxn ==\n");
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<21];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 200, 10100000, 200, 10100000, 1);
+        mpool_policy_set_acceptnonstd(pol, 1);      /* and NOT set_min_size(0) */
+        POLICY_STATE_INIT(stbuf, 256);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        mpool_init(ux, 4096, ublob, sizeof ublob);
+
+        /* the smallest well-formed 1-in/1-out transaction: 60 non-witness
+         * bytes, i.e. under Core's floor */
+        unsigned char tiny[64]; int t = 0;
+        tiny[t++]=2;tiny[t++]=0;tiny[t++]=0;tiny[t++]=0;
+        tiny[t++]=1; memset(tiny+t, 0x33, 32); t += 32;
+        tiny[t++]=0;tiny[t++]=0;tiny[t++]=0;tiny[t++]=0;
+        tiny[t++]=0;
+        tiny[t++]=0xff;tiny[t++]=0xff;tiny[t++]=0xff;tiny[t++]=0xff;
+        tiny[t++]=1; memset(tiny+t, 0, 8); t += 8;
+        tiny[t++]=0;
+        tiny[t++]=0;tiny[t++]=0;tiny[t++]=0;tiny[t++]=0;
+        okv(t < 65, "MEM-23 fixture is under the 65-byte floor");
+
+        unsigned char tid[32]; memset(tid, 0x44, 32);
+        long r = mpool_policy_add(pol, stbuf, mp, tiny, (unsigned long)t, tid, ux);
+        /* NOTE: `r != 1` alone does NOT discriminate -- this synthetic tx is
+         * refused with the floor removed too, for an unrelated reason (its
+         * prevout is not in the injected UTXO set). Verified by reverting.
+         * The REASON is the assertion that matters, and it is the one that
+         * fails without the fix. Keeping the weaker check as a sanity guard,
+         * labelled so nobody reads it as evidence. */
+        okv(r != 1, "MEM-23: refused (does not discriminate on its own -- see below)");
+        okv(strstr(mpool_policy_reason(pol), "tx-size-small") != NULL,
+            "MEM-23: ...and the reason is tx-size-small (THIS is the discriminating check)");
+        if (strstr(mpool_policy_reason(pol), "tx-size-small") == NULL)
+            printf("      reason was \"%s\" -- the floor was skipped\n", mpool_policy_reason(pol));
+    }
+
     printf("== Core v31 cluster limits (too-large-cluster) ==\n");
     {
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000, 200, 10100000, 200, 10100000, 1);  /* anc/desc limits out of the way */
-        mpool_policy_state_init(stbuf, 4096);
+        POLICY_STATE_INIT(stbuf, 4096);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         /* 64 INDEPENDENT parents (cluster of 1 each), then one child spending
@@ -159,17 +238,112 @@ int main(void){
         okv(r != 1, "a child joining 64 independent parents is refused");
         okv(r != 1 && strstr(mpool_policy_reason(pol), "too-large-cluster") != NULL, "...as too-large-cluster (anc/desc limits alone would have let it in)");
     }
-    printf("== cluster limit is measured POST-eviction for a replacement ==\n");
+    /* ================================================================
+     * MEM-3 (audit 2026-09-03): the parent list is no longer truncated.
+     *
+     * MPOL_MAX_PARENTS was 24 and mpol_collect_parents dropped everything
+     * past it SILENTLY. parent[] is the only record of the graph --
+     * descendants are found by walking it -- so a dropped parent did not
+     * exist as far as eviction, expiry and RBF were concerned. The audit's
+     * scenario: 30 low-feerate parents and a child spending all 30; the child
+     * is stored linked to 24; RBF-replace the 30th (your own coin) and
+     * collect_descendant_txids finds no child, so the child stays in the pool
+     * spending an output the replacement has conflicted -- and
+     * getblocktemplate includes it, because every REGISTERED ancestor is
+     * present. An invalid block.
+     *
+     * 30 parents is the shape that matters: comfortably past the old cap of
+     * 24, comfortably inside the 63 that v31's 64-transaction cluster limit
+     * allows, so it must be ACCEPTED and fully linked.
+     * ================================================================ */
+    printf("== MEM-3: a 30-parent child keeps every parent link ==\n");
     {
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000, 200, 10100000, 200, 10100000, 1);
-        mpool_policy_state_init(stbuf, 4096);
+        POLICY_STATE_INIT(stbuf, 4096);
+        mpool_init(mp, 4096, mblob, sizeof mblob);
+        utxo_init(ux, 4096, ublob, sizeof ublob);
+
+        enum { NP = 30 };
+        static unsigned char ptxid[NP][32];
+        unsigned char spk[2] = { 0x51, 0x00 };
+        int all_ok = 1;
+        for (int i = 0; i < NP; i++){
+            unsigned char prev[32]; memset(prev, 0xC0 + (i & 15), 32); prev[0] = (unsigned char)i;
+            utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk, 1);
+            unsigned char tx[128]; unsigned long n = 0;
+            tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0;
+            tx[n++]=1; memcpy(tx+n, prev, 32); n+=32; memset(tx+n, 0, 4); n+=4; tx[n++]=0;
+            tx[n]=1; tx[n+1]=0; tx[n+2]=0; tx[n+3]=0; n+=4;      /* seq 1: replaceable */
+            tx[n++]=1; { unsigned long long v = 900000ULL; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+            tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n, 0x41+i, 20); n+=20;
+            memset(tx+n, 0, 4); n+=4;
+            memset(ptxid[i], 0xD0, 32); ptxid[i][0] = (unsigned char)i;
+            if (mpool_policy_add(pol, stbuf, mp, tx, n, ptxid[i], ux) != 1) all_ok = 0;
+        }
+        okv(all_ok, "MEM-3 30 independent parents accepted");
+
+        static unsigned char ctx[NP*41 + 64]; unsigned long n = 0;
+        ctx[n++]=2;ctx[n++]=0;ctx[n++]=0;ctx[n++]=0;
+        ctx[n++]=NP;
+        for (int i = 0; i < NP; i++){ memcpy(ctx+n, ptxid[i], 32); n+=32; memset(ctx+n, 0, 4); n+=4; ctx[n++]=0;
+            memset(ctx+n,0xff,4); n+=4; }
+        ctx[n++]=1; { unsigned long long v = (unsigned long long)NP*900000ULL - 50000ULL;
+                      for (int b=0;b<8;b++) ctx[n++]=(unsigned char)(v>>(8*b)); }
+        ctx[n++]=22; ctx[n++]=0x00; ctx[n++]=0x14; memset(ctx+n, 0x79, 20); n+=20;
+        memset(ctx+n, 0, 4); n+=4;
+        unsigned char ctid[32]; memset(ctid, 0xDF, 32);
+        { long rC = mpool_policy_add(pol, stbuf, mp, ctx, n, ctid, ux);
+          okv(rC == 1, "MEM-3 the 30-parent child is accepted"); }
+
+        /* THE ASSERTION THAT MATTERS. Every parent must be recorded, so the
+         * pool must report 30 -- with the old inline cap it reported 24 and
+         * the six beyond it were invisible to every descendant walk. */
+        { long np = mpool_policy_n_parents(stbuf, ctid);
+          printf("      (child reports %ld parents; 30 expected, old cap was 24)\n", np);
+          okv(np == NP, "MEM-3 the child records ALL 30 parents, not 24"); }
+
+        /* And the consequence: replacing the LAST parent -- the one the old
+         * cap dropped -- must take the child with it. Under the truncation
+         * the child survived, spending an output that no longer existed. */
+        {
+            unsigned char prev[32]; memset(prev, 0xC0 + ((NP-1) & 15), 32); prev[0] = (unsigned char)(NP-1);
+            unsigned char rtx[128]; unsigned long m = 0;
+            rtx[m++]=2;rtx[m++]=0;rtx[m++]=0;rtx[m++]=0;
+            rtx[m++]=1; memcpy(rtx+m, prev, 32); m+=32; memset(rtx+m, 0, 4); m+=4; rtx[m++]=0; memset(rtx+m,0xff,4); m+=4;
+            rtx[m++]=1; { unsigned long long v = 500000ULL; for (int b=0;b<8;b++) rtx[m++]=(unsigned char)(v>>(8*b)); }
+            rtx[m++]=22; rtx[m++]=0x00; rtx[m++]=0x14; memset(rtx+m, 0x7A, 20); m+=20;
+            memset(rtx+m, 0, 4); m+=4;
+            unsigned char rtid[32]; memset(rtid, 0xEE, 32);
+            long rr = mpool_policy_add(pol, stbuf, mp, rtx, m, rtid, ux);
+            printf("      (replacement of parent %d -> %ld %s)\n", NP-1, rr,
+                   rr == 1 ? "accepted" : mpool_policy_reason(pol));
+            okv(rr == 1, "MEM-3 a replacement of the LAST parent is accepted");
+            unsigned long l;
+            okv(mpool_get(mp, ptxid[NP-1], &l) == NULL,
+                "MEM-3 ...the replaced parent is gone");
+            okv(mpool_get(mp, ctid, &l) == NULL,
+                "MEM-3 ...and the child went WITH it (the link was recorded)");
+        }
+    }
+
+    printf("== cluster limit is measured POST-eviction for a replacement ==\n");
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<21];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        memset(stbuf, 0, sizeof stbuf);
+        mpool_policy_init(pol, 1000, 200, 10100000, 200, 10100000, 1);
+        POLICY_STATE_INIT(stbuf, 4096);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         /* 63 independent parents, one child C spending all of them: a
@@ -220,14 +394,14 @@ int main(void){
     printf("== bytespersigop: sigop-dense feerate (Core DEFAULT_BYTES_PER_SIGOP 20) ==\n");
     {
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);   /* 1 sat/vB floor */
-        mpool_policy_state_init(stbuf, 256);
+        POLICY_STATE_INIT(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         unsigned char prev[32]; memset(prev, 0x7A, 32);
@@ -260,7 +434,7 @@ int main(void){
             /* same transaction, now carrying sigops and paying enough to get
              * in: its recorded size must be the ADJUSTED one */
             memset(stbuf, 0, sizeof stbuf);
-            mpool_policy_state_init(stbuf, 256);
+            POLICY_STATE_INIT(stbuf, 256);
             mpool_init(mp, 4096, mblob, sizeof mblob);
             utxo_init(ux, 4096, ublob, sizeof ublob);
             utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk, 1);
@@ -286,14 +460,14 @@ int main(void){
      * leave the count parked for whatever came next. */
     {   printf("\n== a rejected tx does not leave its sigop count behind ==\n");
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
-        mpool_policy_state_init(stbuf, 256);
+        POLICY_STATE_INIT(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         unsigned char prev[32]; memset(prev, 0x9A, 32);
@@ -338,14 +512,14 @@ int main(void){
      * itself a multiple of 4, so this uses a value that is not. */
     {   printf("\n== the adjustment rounds the way Core rounds ==\n");
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
-        mpool_policy_state_init(stbuf, 256);
+        POLICY_STATE_INIT(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         unsigned char prev[32]; memset(prev, 0xB1, 32);
@@ -379,14 +553,14 @@ int main(void){
      * still contributes its size to the package total. */
     {   printf("\n== the dry run reports the sigop-adjusted vsize ==\n");
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
-        mpool_policy_state_init(stbuf, 256);
+        POLICY_STATE_INIT(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         unsigned char prev[32]; memset(prev, 0xC1, 32);
@@ -425,6 +599,99 @@ int main(void){
         long rv3 = mpool_policy_test(pol, stbuf, mp, tx2, n2, tid2, ux, &fee, &avs);
         okv(rv3 == 1, "sigop-free dry run passes");
         okv(avs > 0 && avs < 200, "...and reports the plain vsize when nothing is parked");
+    }
+
+    printf("== MEM-15: a v0 witness program of the wrong length is NONSTANDARD ==\n");
+    /* classify_spk's "other witness programs" arm accepted version 0 at any
+     * program length 2..40. Core's Solver accepts v0 ONLY at 20 or 32 bytes
+     * (both matched earlier in the function) and returns NONSTANDARD
+     * otherwise. Wrong twice over: such an output is consensus-UNSPENDABLE, so
+     * relaying it only adds permanent UTXO bloat -- and SPK_WITNESS_UNKNOWN
+     * earns the WITNESS dust discount, so it was also CHEAPER to create than
+     * Core permits.
+     *
+     * Versions 1..16 are the control's other half: those are genuinely
+     * upgrade-reserved, Core relays them, and they must stay standard. */
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<21];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        mpool_policy_set_pending_sigops(0);
+        unsigned char prev[32]; memset(prev, 0x5E, 32);
+        unsigned char spk1[2] = { 0x51, 0x00 };
+        struct { int ver; int plen; int want_ok; const char* what; } V[] = {
+            { 0x00, 30, 0, "v0 with a 30-byte program (Core: NONSTANDARD)" },
+            { 0x00,  2, 0, "v0 with a 2-byte program (Core: NONSTANDARD)" },
+            { 0x52, 30, 1, "v2 with a 30-byte program (upgrade-reserved, relayed)" },
+            { 0x60, 40, 1, "v16 with a 40-byte program (upgrade-reserved, relayed)" },
+        };
+        for (unsigned vi = 0; vi < sizeof V / sizeof V[0]; vi++){
+            memset(stbuf, 0, sizeof stbuf);
+            mpool_policy_init(pol, 1000, 25, 101000, 25, 101000, 1);
+            POLICY_STATE_INIT(stbuf, 256);
+            mpool_init(mp, 4096, mblob, sizeof mblob);
+            utxo_init(ux, 4096, ublob, sizeof ublob);
+            utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk1, 1);
+            unsigned char tx[160]; unsigned long n = 0;
+            tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0;
+            tx[n++]=1; memcpy(tx+n, prev, 32); n+=32; memset(tx+n, 0, 4); n+=4; tx[n++]=0; memset(tx+n,0xff,4); n+=4;
+            tx[n++]=1; { unsigned long long v = 900000ULL; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+            tx[n++]=(unsigned char)(2 + V[vi].plen);
+            tx[n++]=(unsigned char)V[vi].ver; tx[n++]=(unsigned char)V[vi].plen;
+            memset(tx+n, 0x77, (size_t)V[vi].plen); n += (unsigned long)V[vi].plen;
+            memset(tx+n, 0, 4); n+=4;
+            unsigned char tid[32]; memset(tid, 0x5F, 32); tid[0]=(unsigned char)vi;
+            long r = mpool_policy_add(pol, stbuf, mp, tx, n, tid, ux);
+            char lbl[140]; snprintf(lbl, sizeof lbl, "MEM-15 %s", V[vi].what);
+            if (V[vi].want_ok) okv(r == 1, lbl);
+            else okv(r != 1 && strstr(mpool_policy_reason(pol), "scriptpubkey") != NULL, lbl);
+            if (V[vi].want_ok != (r == 1))
+                printf("      r=%ld reason=%s\n", r, mpool_policy_reason(pol));
+        }
+    }
+
+    printf("== MEM-16: min-relay fee rounds like Core's CFeeRate::GetFee ==\n");
+    /* The check was `fee*1000 < vsize*rate`, i.e. fee < rate*vsize/1000
+     * EXACTLY -- a ceiling. Core truncates and floors at 1. The tx below is
+     * non-segwit, so vsize == its serialized length, which is 82 bytes:
+     * at 100 sat/kvB Core needs 100*82/1000 = 8 sat, the old code needed
+     * ceil(8.2) = 9. So 8 sat must be ACCEPTED (the fix) and 7 sat must still
+     * be REFUSED (the floor still binds) -- the pair is the control. */
+    {
+        static unsigned char pol[128];
+        static unsigned char stbuf[1<<21];
+        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mblob[1<<20];
+        static unsigned char ux[40 + 4096*48 + 8];
+        static unsigned char ublob[1<<16];
+        mpool_policy_set_pending_sigops(0);
+        unsigned char prev[32]; memset(prev, 0x6C, 32);
+        unsigned char spk[2] = { 0x51, 0x00 };
+        for (int fee = 8; fee >= 7; fee--){
+            memset(stbuf, 0, sizeof stbuf);
+            mpool_policy_init(pol, 100, 25, 101000, 25, 101000, 1);   /* 100 sat/kvB */
+            POLICY_STATE_INIT(stbuf, 256);
+            mpool_init(mp, 4096, mblob, sizeof mblob);
+            utxo_init(ux, 4096, ublob, sizeof ublob);
+            utxo_put(ux, prev, 0, 1000000ULL, 0, 0, spk, 1);
+            unsigned char tx[128]; unsigned long n = 0;
+            tx[n++]=2;tx[n++]=0;tx[n++]=0;tx[n++]=0;
+            tx[n++]=1; memcpy(tx+n, prev, 32); n+=32; memset(tx+n, 0, 4); n+=4; tx[n++]=0; memset(tx+n,0xff,4); n+=4;
+            tx[n++]=1; { unsigned long long v = 1000000ULL - (unsigned long long)fee; for (int b=0;b<8;b++) tx[n++]=(unsigned char)(v>>(8*b)); }
+            tx[n++]=22; tx[n++]=0x00; tx[n++]=0x14; memset(tx+n, 0x66, 20); n+=20;
+            memset(tx+n, 0, 4); n+=4;
+            okv(n == 82, "the boundary tx is 82 bytes (so Core's floor is 8 sat at 100 sat/kvB)");
+            unsigned char tid[32]; memset(tid, 0x6D, 32); tid[0] = (unsigned char)fee;
+            long r = mpool_policy_add(pol, stbuf, mp, tx, n, tid, ux);
+            if (fee == 8)
+                okv(r == 1, "8 sat over 82 vB at 100 sat/kvB is ACCEPTED (Core: 100*82/1000 = 8)");
+            else
+                okv(r != 1 && strstr(mpool_policy_reason(pol), "min relay fee") != NULL,
+                    "7 sat over 82 vB is still REFUSED (the floor binds; not simply disabled)");
+        }
     }
 
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
@@ -473,7 +740,7 @@ static int test_bare_multisig(void){
 
     for (int permit = 1; permit >= 0; permit--){
         static unsigned char pol[128];
-        static unsigned char stbuf[1<<20];
+        static unsigned char stbuf[1<<21];
         static unsigned char mp[40 + 4096*48 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
@@ -481,7 +748,7 @@ static int test_bare_multisig(void){
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 1);
         mpool_policy_set_baremultisig(pol, (unsigned)permit);
-        mpool_policy_state_init(stbuf, 256);
+        POLICY_STATE_INIT(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
         /* fund it generously so the fee is never the reason for a rejection */
@@ -520,14 +787,23 @@ static int run_scenario(int si,
                         const unsigned long long* step_arg){
     /* policy config + state */
     static unsigned char pol[128];
-    static unsigned char stbuf[1<<20];
+    static unsigned char stbuf[1<<21];
     memset(stbuf, 0, sizeof stbuf);
     mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, max_anc, max_anc_bytes, max_desc, max_desc_bytes, rbf);
     /* fixtures are synthetic, deliberately non-standard txs: run under
      * Core's own regtest escape hatch (-acceptnonstdtxn) so this test
      * keeps exercising fee/graph mechanics, not IsStandardTx. */
     mpool_policy_set_acceptnonstd(pol, 1);
-    mpool_policy_state_init(stbuf, 256);
+    /* MEM-23 (2026-09-05): the 65-non-witness-byte floor is UNCONDITIONAL in
+     * Core -- it mitigates CVE-2017-12842, so -acceptnonstdtxn does not switch
+     * it off, and as of this change neither does ours. These fixtures are
+     * ~60-byte synthetic transactions whose whole purpose is fee and
+     * package-graph mechanics, so the floor is turned off HERE, explicitly,
+     * rather than by weakening the production rule. No config option reaches
+     * this; it is test-only. */
+    { extern void mpol_policy_set_min_size(void*, unsigned);
+      mpol_policy_set_min_size(pol, 0); }
+    POLICY_STATE_INIT(stbuf, 256);
 
     /* structural mempool */
     static unsigned char mp[40 + 4096*48 + 8];

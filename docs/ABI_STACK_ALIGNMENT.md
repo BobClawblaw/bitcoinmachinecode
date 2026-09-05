@@ -71,6 +71,12 @@ this branch.
 | misaligned, asm→asm (latent) | 511 | 262 |
 | misaligned, leaves asm (can fault) | **5** | **0** |
 
+> BLD-5 (2026-09-05): the figures in this table are the SNAPSHOT taken when
+> the alignment work landed, not a live count. `make abi-check` today reports
+> 1,234 reachable call sites and 252 latent asm→asm ones — the tree has moved.
+> The audit tool is the authority; this document explains the reasoning, and
+> its numbers are historical by construction.
+
 The five that could fault before: two `lsm_mm_invalidate_all` calls from
 `utxo_lsm_init` / `utxo_lsm_reload`, and three indirect `checksig_fn` calls
 from `interp_checksig` / `interp_checksig_add` / `interp_checkmultisig`. The

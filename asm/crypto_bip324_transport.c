@@ -240,8 +240,22 @@ static int advance(bip324_transport_t* t){
             if (!ok){ free(plain); return 0; }
 
             if (t->recv_state == BIP324_RECV_VERSION){
+                /* NET-12 (audit 2026-09-03): the transition was unconditional,
+                 * so a DECOY packet arriving here was promoted to "the version
+                 * packet" and the real one was then decoded as an application
+                 * message -- its first plaintext byte read as a short message
+                 * id. Core's V2Transport::ProcessReceivedPacketBytes clears the
+                 * AAD after the first packet but only advances on a NON-decoy.
+                 *
+                 * Benign today only because our version packet is empty and an
+                 * empty packet is dropped just below; a future non-empty
+                 * version would be delivered to the caller as garbage.
+                 *
+                 * The buf_free stays UNCONDITIONAL: it sets p=NULL/len=0, so
+                 * subsequent packets get empty AAD either way, which is what
+                 * Core does. Only the state advance is gated. */
                 buf_free(&t->recv_garbage);
-                t->recv_state = BIP324_RECV_APP;
+                if (!ignore) t->recv_state = BIP324_RECV_APP;
                 free(plain);                       /* contents reserved; ignored */
                 break;
             }

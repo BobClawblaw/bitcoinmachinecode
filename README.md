@@ -84,7 +84,11 @@ testnet4, signet (public or custom) and regtest.
 - BIP339 `wtxidrelay`, BIP144 witness transport with witness-only peer
   preference, stripped-block serving to legacy peers, `sendheaders`,
   `feefilter`.
-- BIP152 compact blocks in both directions.
+- BIP152 compact blocks, SERVE side only: this node answers
+  `MSG_CMPCT_BLOCK` getdata and `getblocktxn`, and negotiates `sendcmpct`.
+  It does not RECEIVE compact blocks -- there is no inbound `cmpctblock` or
+  `blocktxn` handler -- so blocks always arrive in full. (NET-9, audit
+  2026-09-03: this line used to read "in both directions".)
 - BIP157/158 compact block filter serving (`getcfilters`, `getcfheaders`,
   `getcfcheckpt`) backed by the whole-chain filter index.
 - BIP324 v2 encrypted transport, inbound and outbound, with in-band v1
@@ -115,8 +119,14 @@ testnet4, signet (public or custom) and regtest.
 
 **RPC, indexes and notifications**
 
-- Bitcoin Core's JSON-RPC method set (155 methods; only `rpc.discover` is
-  absent), with Core's result shapes, error codes and messages. See
+- Bitcoin Core's JSON-RPC method set (162 methods, the deduplicated union of
+  the four dispatch tables -- ask the node itself with `help`, which is
+  generated from those tables rather than hand-maintained). Three of the 162
+  are listed but refuse with an explanation: `getopenrpcinfo` and
+  `rpc.discover` (no OpenRPC service description is published) and
+  `exportasmap` (this node uses no asmap). `help` itself answers with the
+  method list, not Core's per-method usage text. Otherwise Core's result
+  shapes, error codes and messages. See
   [`docs/RPC_LIVE_NODE.md`](docs/RPC_LIVE_NODE.md).
 - `txindex, txospenderindex`, `coinstatsindex` (incremental MuHash, so `gettxoutsetinfo`
   answers without a UTXO walk) and `blockfilterindex` (BIP158 basic filters
@@ -158,10 +168,12 @@ make daemon/bitcoind      # the node daemon (asm/daemon/bitcoind)
 make test                 # the full gate: audits + every test harness
 ```
 
-`make` with no target is `make test`. The gate runs about 290 test binaries
-(crypto vectors, consensus differentials against Bitcoin Core, mempool
-policy, P2P codecs, BIP324 vectors, RPC shapes, storage and crash-recovery
-cases) after a set of static audits that run in the first seconds:
+`make` with no target is `make test`. The gate builds 353 test binaries and
+makes 348 harness invocations (crypto vectors, consensus differentials against
+Bitcoin Core, mempool policy, P2P codecs, BIP324 vectors, RPC shapes, storage
+and crash-recovery cases) after a set of static audits. BLD-5 (2026-09-05):
+this said "about 290 test binaries"; the live figure is
+`grep -cP '^\t\./tests/' asm/Makefile`.
 
 | audit | checks |
 |---|---|
@@ -171,7 +183,7 @@ cases) after a set of static audits that run in the first seconds:
 | `runlist-check` | every test is either in the gate or declared manual with a reason |
 | `gate-log-check LOG=<file>` | a saved gate log shows make exiting 0 and every gated test actually executed |
 
-Other binaries built under `asm/daemon/`: `bitcoin_cli` (Core-compatible
+Other binaries built under `asm/daemon/`: `bmc_cli` (Core-compatible
 JSON-RPC client), `cli` (query the stored chain directly), `wallet_cli`,
 and the archive tools (`check_chain`, `verify`, `dumpblock`, `unified_ibd`,
 `chainctl`).
@@ -213,11 +225,11 @@ and the archive tools (`check_chain`, `verify`, `dumpblock`, `unified_ibd`,
 
 3. **Talk to it.** Cookie authentication is on by default:
    `<datadir>/<chain>/.cookie` is written (mode 0600) at startup and deleted
-   at shutdown. `bitcoin_cli` resolves the port and cookie from the datadir:
+   at shutdown. `bmc_cli` resolves the port and cookie from the datadir:
 
    ```sh
-   asm/daemon/bitcoin_cli -datadir=/path/to/datadir getblockchaininfo
-   asm/daemon/bitcoin_cli -datadir=/path/to/datadir -signet getblockcount
+   asm/daemon/bmc_cli -datadir=/path/to/datadir getblockchaininfo
+   asm/daemon/bmc_cli -datadir=/path/to/datadir -signet getblockcount
    ```
 
    Any JSON-RPC client works, including Bitcoin Core's `bitcoin-cli` and
@@ -390,7 +402,7 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   set, each as a one-shot request.
 - **Mempool eviction is per-leaf.** `TrimToSize` evicts the lowest-feerate
   leaf transaction and works inward, where Core evicts by linearization
-  chunk. Sibling eviction is not implemented.
+  chunk. TRUC sibling eviction landed 2026-09-03 (see FEATURE_GAPS).
 - **`assumevalid`** uses Core v31's built-in block (938343 on mainnet); newer
   Core releases move it, this node's table is updated with the oracle.
 - **`gettxoutsetinfo` defaults to `muhash`**; `hash_serialized_3` is refused,

@@ -25,6 +25,7 @@ extern long utxo_lsm_put(void* lst, void* u, const unsigned char txid[32],
                           unsigned long height, unsigned long is_coinbase,
                           const unsigned char* script, unsigned slen);
 extern long utxo_lsm_del(void* lst, void* u, const unsigned char txid[32], unsigned index);
+extern long utxo_lsm_flush(void* lst, void* u);
 extern long utxo_lsm_get(void* lst, void* u, const unsigned char txid[32], unsigned index,
                           unsigned long long* value, unsigned long* height,
                           unsigned long* is_coinbase,
@@ -197,6 +198,36 @@ int main(void) {
     ck("get B7 absent (spent before flush)", utxo_lsm_get(&lst, g_ux, tB, 7, &v, &h, &cb, &s, &sl), 0);
     unsigned char tZ[32]; make_txid(tZ, 0x99, 9);
     ck("get tZ absent (never existed)", utxo_lsm_get(&lst, g_ux, tZ, 0, &v, &h, &cb, &s, &sl), 0);
+
+    /* ---- UTX-9 (audit 2026-09-03): the run scan stops at the records end
+     *
+     * The linear scan was bounded by the whole MAPPING rather than by
+     * sparse_off, so a lookup for a key past every record in the run walked
+     * on into the sparse-index trailer and parsed 44-byte index entries as
+     * records, skipping by whatever their bytes said `slen` was. It stayed
+     * inside the mapping (no OOB) and still answered ABSENT, so the cost was
+     * wasted I/O and a fragile invariant -- which is why the assertion that
+     * matters here is the OTHER direction.
+     *
+     * Tightening a bound risks cutting off the LAST record, and a
+     * highest-sorting key that stopped being found would be silent data loss.
+     * make_txid puts the low byte of `i` first, so 0xff sorts above every key
+     * written above; storing and reading it back proves the new bound admits
+     * the final record rather than excluding it. (tZ above is the past-the-end
+     * case, and it must stay absent.) */
+    { unsigned char tMax[32]; make_txid(tMax, 0x11, 0xff);
+      unsigned char scrMax[6] = {9,8,7,6,5,4};
+      ck("UTX-9 store a key that sorts LAST",
+         utxo_lsm_put(&lst, g_ux, tMax, 0, 4242ULL, 777, 0, scrMax, 6) >= 0, 1);
+      ck("UTX-9 flush it into a run", utxo_lsm_flush(&lst, g_ux), 1);
+      sl = 0;
+      ck("UTX-9 the last record in the run is still FOUND (bound not too tight)",
+         utxo_lsm_get(&lst, g_ux, tMax, 0, &v, &h, &cb, &s, &sl), 1);
+      ck("UTX-9   with its value intact", v, 4242ULL);
+      ck("UTX-9   and its script length", (long long)sl, 6);
+      ckm("UTX-9   and its script bytes", memcmp(s, scrMax, 6) == 0);
+      ck("UTX-9 a key past the last record is still absent",
+         utxo_lsm_get(&lst, g_ux, tZ, 0, &v, &h, &cb, &s, &sl), 0); }
 
     /* ---------- phase 3: tombstone-shadowing across generations ---------- */
     /* A0 currently lives in run 0. Spend it now (memtable miss -> tombstone

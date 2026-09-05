@@ -125,7 +125,10 @@ static long find_commitment(const u8* tx, u64 len, const u8** spk, u64* spk_len)
         if (end - p < 36) return -2;
         p += 36;
         if (!rd_cs(&p, end, &v)) return -2;
-        if ((u64)(end - p) < v + 4) return -2;
+        /* VAL-15 (audit 2026-09-03): `< v + 4` wraps for v near 2^64 and
+         * moves p backwards instead of refusing. Split. */
+        { u64 avail = (u64)(end - p);
+          if (v > avail || avail - v < 4) return -2; }
         p += v + 4;
     }
     if (!rd_cs(&p, end, &nout)) return -2;

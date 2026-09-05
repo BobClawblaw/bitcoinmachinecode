@@ -46,6 +46,15 @@ m39_prev: resb 64
 m39_cur:  resb 64
 m39_acc:  resb 64
 m39_nw:   resq 1                     ; parsed word count (bip39_parse)
+; WAL-11 canary. The overflow this module used to allow ran FORWARD from
+; m39_idx through every buffer above, so the only way to observe it from C is
+; to give it something to land in past the last of them: 400 words wrote 1,600
+; bytes where m39_idx..m39_nw is 1,328. Exported so tests/test_bip39.c can
+; assert it stays zero -- remove the `cmp r13, 24` bound in bip39_parse and
+; that assertion fails, which is what makes the test a real control rather
+; than a restatement of the word-count check.
+global m39_guard
+m39_guard: resb 512
 
 section .text
 extern sha256_full
@@ -428,6 +437,16 @@ bip39_parse:
     pop  r13
     cmp  eax, -1
     je   .invalid                   ; unknown word (or degenerate empty token)
+    ; ---- WAL-11 (audit 2026-09-03): BOUND THE INDEX ARRAY ----
+    ; m39_idx holds 24 dwords (96 bytes) and the 12/15/18/21/24 word-count
+    ; check is at .tok_done, i.e. AFTER this loop -- so a 25th valid word
+    ; wrote past the array, and `wallet_cli seed "<400 valid words>"` walked
+    ; 1.6 KB through m39_salt, m39_msg and into the next object's .bss. The
+    ; count check cannot move earlier (it needs the final total), so the
+    ; bound belongs here. A mnemonic longer than 24 words can never be valid,
+    ; so refusing it early loses nothing.
+    cmp  r13, 24
+    jae  .invalid
     mov  rcx, r13
     mov  [m39_idx + rcx*4], eax
     inc  r13
@@ -729,6 +748,28 @@ bip39_mnemonic_to_seed:
     mov  [rbp-0x20], rdx             ; passphrase (may be NULL)
     mov  [rbp-0x28], rcx             ; passlen
 
+    ; ---- CRY-4 (audit 2026-09-03): BOUND THE PASSPHRASE ----
+    ;
+    ; The salt is built as "mnemonic" || passphrase into m39_salt, which is
+    ; 512 bytes -- so a passphrase over 504 bytes wrote past it into m39_msg,
+    ; and the copy had no bound at all. Reachable without any RPC: the wallet
+    ; store reads BMC_WALLET_PASS with strlen and daemon/wallet_cli.c takes
+    ; the passphrase as a command-line argument, neither of which was capped.
+    ; (hmac_sha512's own `tmp` scratch has 1032 bytes of room for the message,
+    ; so THIS buffer is the one that goes first.)
+    ;
+    ; 504 is the real capacity, not a smaller round number: anything that
+    ; derived a seed correctly before must still derive the SAME seed, or a
+    ; wallet becomes unopenable. Everything past it produced corruption, and
+    ; now produces a clean 0.
+    ;
+    ; A negative length is refused for the same reason -- the copy loop's
+    ; bound is a signed compare.
+    cmp  rcx, 0
+    jl   .b39s_toolong
+    cmp  rcx, 504
+    jg   .b39s_toolong
+
     ; ---- mnemonic length (HMAC key) ----
     mov  rdi, rsi
     call bip39_strlen
@@ -865,6 +906,64 @@ bip39_mnemonic_to_seed:
     jnz  .se
 
     mov  eax, 1
+    jmp  .b39s_wipe
+    ; ---- WAL-3 (audit 2026-09-03): the derivation leaves the SEED behind ----
+    ;
+    ; m39_acc IS the 64-byte seed -- the copy above hands the caller a duplicate
+    ; and the original stayed in .bss for the life of the process. m39_prev and
+    ; m39_cur hold PBKDF2 intermediates derived from it, m39_salt holds
+    ; "mnemonic" || the BIP39 passphrase, and m39_msg holds the same plus the
+    ; block index. So `walletlock` could zero g_seed and still leave the seed
+    ; and the passphrase readable through /proc/<pid>/mem, a swap partition or
+    ; a hibernation image.
+    ;
+    ; Cleared unconditionally on the way out, including the refusal path --
+    ; on which m39_salt already holds the prefix of an over-long passphrase.
+.b39s_toolong:
+    xor  eax, eax                    ; CRY-4: passphrase over m39_salt capacity
+.b39s_wipe:
+    push rax
+    xor  eax, eax
+    lea  rdi, [m39_salt]
+    mov  rcx, 512
+.zs1:
+    mov  byte [rdi], al
+    inc  rdi
+    dec  rcx
+    jnz  .zs1
+    lea  rdi, [m39_msg]
+    mov  rcx, 520
+.zs2:
+    mov  byte [rdi], al
+    inc  rdi
+    dec  rcx
+    jnz  .zs2
+    ; Each by name rather than one sweep over the three: they are declared
+    ; consecutively today, but nothing enforces that, and a future `align`
+    ; between them would silently turn one sweep into a partial wipe.
+    lea  rdi, [m39_prev]
+    mov  rcx, 64
+.zs3:
+    mov  byte [rdi], al
+    inc  rdi
+    dec  rcx
+    jnz  .zs3
+    lea  rdi, [m39_cur]
+    mov  rcx, 64
+.zs4:
+    mov  byte [rdi], al
+    inc  rdi
+    dec  rcx
+    jnz  .zs4
+    lea  rdi, [m39_acc]
+    mov  rcx, 64
+.zs5:
+    mov  byte [rdi], al
+    inc  rdi
+    dec  rcx
+    jnz  .zs5
+    pop  rax
+.b39s_ret:
     add  rsp, 0x40
     pop  rbp
     pop  r15

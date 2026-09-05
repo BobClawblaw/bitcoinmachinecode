@@ -261,6 +261,17 @@ tables and the writers themselves.
   **byte-identical** to Core's for the same request. Requires the filter
   index to have been built (`daemon/build_block_filters`), exactly as Core
   requires `-blockfilterindex`.
+
+  *One stated caveat on "byte-identical" (STO-14, audit 2026-09-03):
+  `block_filter.c` de-duplicates elements on the 64-bit SipHash, where Core's
+  `GCSFilter` de-duplicates the byte-wise element SET before hashing. If two
+  distinct scripts in one block ever collided on 64 bits, N would be one less
+  than Core's -- and since N scales the Golomb-Rice range, the WHOLE filter
+  would differ, not one entry. That is ~n²/2^65 per block, about 2^-40 at a
+  few thousand elements. Left as-is deliberately: byte-wise dedup means
+  sorting (pointer, length) pairs by content inside a KAT-backed generator
+  whose output peers consume, which is a worse trade than carrying a 2^-40
+  divergence knowingly. Recorded so the parity claim above is read with it.*
 - ~~**addrv2 (BIP155) is parsed but never NEGOTIATED.**~~ — **CLOSED
   2026-08-28.** Both handshake roles offer `sendaddrv2` after version and
   before verack, gated on peer protocol >= 70016 as Core does, and remember
@@ -291,17 +302,21 @@ tables and the writers themselves.
   -stopatheight`, second scratch datadir) — **still never run.** The one
   like-for-like end-to-end speed comparison, and the only item here that is
   purely a measurement rather than a capability.
-- **`assumevalid`** — parsed and then IGNORED, with a loud `[config]` line
-  saying so. This node verifies every script in every block
-  (`tx_verify_block_connect_all`, called from `daemon/utxo_live.c`'s apply
-  path ahead of any UTXO write, and proven by the full-archive replay);
-  honouring assumevalid would mean *skipping* that, so it is a deliberate
-  refusal rather than an unimplemented feature. Small to wire if ever wanted.
-  *(The `[config]` line itself was STALE until 2026-08-28 — it claimed block
-  connection did no script verification at all, describing the node as it was
-  before Stage D. It was believed over the code and briefly propagated into
-  this file. Log strings that explain a decision age exactly like refusal
-  strings do; see the wallet refusals deleted 2026-08-27.)*
+- **`assumevalid`** — IMPLEMENTED 2026-09-01, both modes. `node_config.c`
+  parses it into `assumevalid_mode` (1 = skip script evaluation at or below the
+  given block, Core's semantics; 2 = `assumevalid=0`, evaluate everything), the
+  per-chain defaults come from `chainparams.c`, and `tx_verify.c`'s script
+  switch is what `utxo_live.c` turns off per block while applying at or below
+  the height. Every other consensus check still runs at every height.
+
+  *(This entry read "parsed and then IGNORED, with a loud `[config]` line
+  saying so" until 2026-09-05 — BLD-5. It sat in the "REMAINING gaps, precisely
+  (this is the real backlog)" section describing a refusal the code had stopped
+  making. The `[config]` line beside it had ALREADY been corrected once, on
+  2026-08-28, for claiming block connection did no script verification at all;
+  the prose outlived that correction by another week. Documentation that
+  explains a deliberate refusal ages exactly like the refusal string does.)*
+
 - **`assumeutxo` / `loadtxoutset`** — refuses BY DESIGN. Every parity claim
   this project makes rests on locally-validated coins, and importing a
   snapshot would hollow that out. `dumptxoutset` is real (proven at full
@@ -473,7 +488,8 @@ asserts the list and the implementation move together in **both** directions.
 *(`whitelist` was the example here until 2026-08-30, when it stopped being
 true: it is implemented now — `noban` only, and every other Core permission
 token is a startup error naming the token rather than an accepted no-op. The
-example moved to `whitebind`, which is still genuinely unimplemented. An
+example moved to `whitebind`, which was implemented on 2026-09-01
+(node_config.c calls netperm_whitebind_add; see the table below). An
 example that has quietly become false is the same defect this section is
 about.)*
 
@@ -561,6 +577,12 @@ because they were absent *checks* rather than absent features:
 - **no consensus `MAX_MONEY` check anywhere** — output values were summed as
   raw `u64` off the wire with no per-output or running bound (CVE-2010-5139
   shape). Now matching Core, verified against 1,172 real mainnet transactions.
+  *(VAL-16 flagged this line and README's matching claim as contradicting the
+  code. It did when the audit was written on 2026-09-03 — the check existed on
+  the mempool/RPC parser only, not the BLOCK path. VAL-2 closed that gap;
+  `daemon/utxo_live.c:916-955` now applies Core's `MAX_MONEY` on both arms of
+  the apply path. Re-verified 2026-09-05: the claim is true as written, so it
+  is left standing rather than corrected.)*
 - **no P2P message-size limit** — the framer acted on the announced length
   unbounded, so `0xFFFFFFFF` ground a serve child through ~4 GB of reads.
 - **inbound `inv`/`getdata` counts read as a single byte**, silently
@@ -1017,8 +1039,16 @@ Missing:
 
 Confirmed genuinely wired into the real serve loop (`bitcoin_serve.asm`),
 not just present as unused/tested-in-isolation code:
-- **BIP152 compact blocks** — both directions (`cmpctblock_build`,
-  `p2p_blocktxn_build`, full message handling).
+- **BIP152 compact blocks — SERVE SIDE ONLY** (`cmpctblock_build`,
+  `p2p_blocktxn_build`). This node answers `MSG_CMPCT_BLOCK` getdata and
+  `getblocktxn`, and negotiates `sendcmpct`. It does NOT receive compact
+  blocks: `bitcoin_serve.asm` writes `cmpctblock` and `blocktxn` and has no
+  inbound handler for either, so a peer's compact block is ignored and the
+  block is fetched in full. NET-9 (audit 2026-09-03) found this entry
+  claiming "both directions … full message handling"; the send side is real
+  and now handles any transaction count (SER-4 fixed the one-byte count that
+  had capped it at 252, i.e. at almost every mainnet block), but the receive
+  side has never existed. Corrected rather than left overstating the surface.
 - **wtxid relay, feefilter, sendheaders** — all genuinely
   implemented and exchanged during real handshakes.
 - **Witness transport (BIP144) — FIXED 2026-08-22** (`31eac9a`, `fe3addb`):
@@ -1323,7 +1353,7 @@ that served BIP157 before this change must now set it explicitly.
 | `par` | Set the number of script verification threads (0 = auto, up to 15, <0 = leave that many cores free, default: 0… | implemented |
 | `peerblockfilters` | Serve compact block filters to peers per BIP 157 (default: 0) | implemented |
 | `peerbloomfilters` | Support filtering of blocks and transaction with bloom filters (default: 0) | accepted, no effect: BIP37 bloom filtering is not implemented; NODE_BLOOM is never advertised (Core's default is 0 too) |
-| `peertimeout` | Specify a p2p connection timeout delay in seconds. After connecting to a peer, wait this amount of time before… | implemented |
+| `peertimeout` | Specify a p2p connection timeout delay in seconds. After connecting to a peer, wait this amount of time before… | **NOT implemented** (DMN-14, 2026-09-05: this said "implemented". `daemon/main.c:543` states plainly that the timeout it *does* have is NOT Core's `-peertimeout`, which is a CONNECT timeout; nothing reads the option. See DMN-3.) |
 | `permitbaremultisig` | Relay transactions creating non-P2SH multisig outputs (default: 1) | implemented |
 | `persistmempool` | Whether to save the mempool on shutdown and load on restart (default: 1) | implemented |
 | `persistmempoolv1` | Whether a mempool.dat file created by -persistmempool or the savemempool RPC will be written in the legacy for… | accepted, no effect: mempool.dat is written in the current format only |
@@ -1402,8 +1432,8 @@ that served BIP157 before this change must now set it explicitly.
 | `zmqpubrawblockhwm` | Set publish raw block outbound message high water mark (default: 1000) | implemented |
 | `zmqpubrawtx` | Enable publish raw transaction in <address> | implemented |
 | `zmqpubrawtxhwm` | Set publish raw transaction outbound message high water mark (default: 1000) | implemented |
-| `zmqpubsequence` | Enable publish hash block and tx sequence in <address> | implemented |
-| `zmqpubsequencehwm` | Set publish hash sequence message high water mark (default: 1000) | implemented |
+| `zmqpubsequence` | Enable publish hash block and tx sequence in <address> | **REFUSED** (MEM-22, 2026-09-05: this said "implemented"; `node_config.c:950` rejects the option outright, and `zmq_pub.c` never publishes the topic. See the refusal's own comment for why: Core's `sequence` carries A/R alongside C/D, and this node has no single choke point for "removed" -- eviction, expiry and reorg each call `mpool_del` independently.) |
+| `zmqpubsequencehwm` | Set publish hash sequence message high water mark (default: 1000) | parsed, but inert -- the topic it sizes is refused (MEM-22) |
 ## Update 2026-09-01 — Miniscript and `musig()` descriptors
 
 Closed: **Miniscript** (`asm/miniscript.c/.h`, Core's `script/miniscript.h`
@@ -1577,7 +1607,7 @@ pass, then `-Werror`**.
 - **Manual wallet decryption:** `wallet_cli` now asks for the passphrase
   (echo off) when nothing supplied it and the wallet is encrypted, reads it
   from a pipe when stdin is not a terminal, and `init` asks twice and stores
-  no `.pass` file for a typed passphrase. `bitcoin_cli` gained Core's
+  no `.pass` file for a typed passphrase. `bmc_cli` gained Core's
   `-stdinwalletpassphrase` and `-stdin`. Pinned by `tests/test_cli_prompt`
   (a real pty). Parity attestation heights are now published in
   `docs/PARITY_ATTESTATION.md` (audit recommendation 8).
@@ -2000,7 +2030,10 @@ was never corrected.
 **What this means for every "verified against Core, zero divergences"
 claim from a normal sync:** the UTXO set, proof-of-work, block structure,
 and every non-script consensus rule are still checked for the whole chain
-— those claims stand. But under the default config, ONLY the top ~27,000
+— those claims stand. *(VAL-16, 2026-09-03, disputed this on the strength of
+VAL-1..VAL-6, which were open at the time. All six are closed as of the
+2026-09-05 remediation, so the sentence is accurate again; re-verified rather
+than re-worded.)* But under the default config, ONLY the top ~27,000
 of ~965,000 blocks have their scripts independently checked against Core
 during that sync; the ~938,000 below the assumevalid height are trusted,
 exactly as real Core trusts them by default. The stronger claim —
@@ -2090,68 +2123,187 @@ worth treating as a priority — actually running a full, unconditional,
 `assumevalid=0` verification of this chain against Core, now that it is
 clear the routine sync path no longer does that by default.
 
-## Update 2026-09-03 — `SIG_FINDANDDELETE` is answered second where Core answers it first
+## Update 2026-09-05 — the four audit LOWs that are design gaps, not defects
 
-The AArch64 verify differential (60,000 whole-input cases on three fresh
-seeds, run against the oracles rebuilt natively for aarch64) came back with
-zero verdict mismatches and one error-code mismatch, and it is a real ordering
-gap rather than noise: `validation/findanddelete_order_repro.sh` reproduces it
-in one line on either architecture.
+The 2026-09-03 audit's LOW tier is now closed. Four of its findings resisted
+being "fixed" because they are not defects — they are consequences of design
+decisions this node has made, and the right remediation is to state them
+plainly rather than patch around them. Each was re-verified against the code
+before being written down here; none is a restatement of the audit's text.
 
-The case is a bare CSV-guarded P2PK, `025faf00 b2 75 21<pubkey> ac`, whose
-scriptSig pushes the 2-byte value `5faf`. The `CSV`/`OP_DROP` pair leaves that
-value sitting in the signature slot at `OP_CHECKSIG`, so it is not a signature
-and the spend must fail -- the only question is which rule says so. The value
-is also a literal of the script being executed, three bytes from its start,
-and that is what Core trips on first:
+### `prioritisetransaction` deltas are display-only (MEM-18)
 
-    CScript scriptCode(pbegincodehash, pend);
-    int found = FindAndDelete(scriptCode, CScript() << vchSig);
-    if (found > 0 && (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE))
-        return set_error(serror, SCRIPT_ERR_SIG_FINDANDDELETE);   /* interpreter.cpp:330 */
+`prioritisetransaction` records a fee delta and `getprioritisedtransactions`
+lists it back, but the delta reaches **nothing that makes a decision**.
+`pri_delta_of` (`rpc_node.c:1531`) has exactly three consumers: `:1220`, where
+`getmempoolentry` reports `fees.modified`, and `:1661`/`:1687`, where the
+listing prints the deltas. Core applies `GetModifiedFee` to block assembly,
+eviction, RBF and the fee floors; here the policy layer has no delta concept at
+all, and the block template (`rpc_chain.c:1035`) uses `infs[i].fee`, the base
+fee.
 
-Core performs that search BEFORE `CheckSignatureEncoding`, at
-`EvalChecksigPreTapscript`'s top, for `OP_CHECKSIG` and (per its own loop,
-`interpreter.cpp:1146`) for every signature of an `OP_CHECKMULTISIG`. Ours
-performs it inside the checker callback, `asm/bitcoin_scriptverify.c:186`,
-which the interpreter reaches only after `interp_sig_encoding_ok` and
-`interp_pubkey_encoding_ok` have both returned. So a signature that is invalid
-by encoding AND present inside its own scriptCode is reported as `SIG_DER`
-where Core reports `SIG_FINDANDDELETE`. Both reject; the verdict, and therefore
-consensus, is unaffected -- this is a diagnostic-order gap, in the same class
-as the error-code gaps that brought NULLFAIL, LOW_S and CONST_SCRIPTCODE into
-the interpreter on 2026-09-02.
+There is a second reason it could not work as-is even if the policy layer
+consulted it: the delta table is **parent-local**. It lives in the RPC process,
+while the download worker owns mempool admission and template construction, so
+a delta set over RPC is not visible to the process that would have to honour
+it. Wiring this properly means putting the deltas in the shared mempool state,
+not adding a lookup.
 
-NOT a port bug. `asm/bitcoin_interp.asm`'s `interp_checksig` has the identical
-order and the search itself is shared C, so x86 answers `SIG_DER` too; the ARM
-run found it only because these three seeds had not been run before.
+An operator prioritising a transaction on this node changes what
+`getmempoolentry` prints and nothing else. That is the whole behaviour.
 
-The fix is confined to the failing arm of the interpreter, which is why it has
-not been made on one architecture alone: when the encoding checks PASS, the
-callback's existing `-5` already produces Core's answer, so only the ERROR
-path needs the search -- under `CONST_SCRIPTCODE` with a non-empty signature,
-run the strip over `[pbegincodehash, pend)` before reporting `SIG_DER`,
-`SIG_HIGH_S`, `SIG_HASHTYPE` or `PUBKEYTYPE`, and report `SIG_FINDANDDELETE`
-if it lands. Cost is bounded to scripts that were already being rejected, and
-the accept path -- the one that runs on every block -- does not gain a scan.
-That is observably Core's ordering without paying Core's redundant work,
-since our callback strips the scriptCode again anyway for the sighash.
+### One execution lock behind every long wait (RPC-12)
 
-**CLOSED 2026-09-03, both architectures in one commit (f7d28ce).** The four
-encoding-error arms of `interp_checksig` now funnel through one error site
-that, under `CONST_SCRIPTCODE`, runs the same strip the CHECKMULTISIG loop
-already uses (`script_push_encode` + `script_find_and_delete` over
-`[pbegincodehash, pend)`, the `cms_needle`/`cms_scstrip0` scratch -- free
-here, since CHECKSIG never runs inside that loop) and answers `-5`
-(`SIG_FINDANDDELETE`) when the stripped length comes back shorter than the
-source, keeping the encoding error otherwise. An empty signature strips with
-the `OP_0` needle exactly as the C checker does on the accept path, and the
-scriptCode is capped at 10000 bytes like the checker's own guard. Nothing on
-the accept path moves. Verified on AArch64: the repro exits 0 (ours 54 =
-Core 54); `fuzz_verify_diff` 3 seeds x 20,000 cases now reports
-VERDICT-MISMATCHES=0 **code-only-mismatches=0** (the one standing error-code
-divergence is gone); `fuzz_script_diff` 100,000 cases 0 mismatches;
-`synth_corpus_diff` 79/96/zero-divergences unchanged; native sweep round 19
-green. The x86 twin is the same transform and assembles clean under
-`nasm -Werror`; its execution gate runs with main's suite. The repro script
-stays in `validation/` as a permanent regression check.
+Every request runs `handle_request` under `g_exec_lock` (`rpc_server.c:808`
+and `:969`), so the RPC surface executes strictly one call at a time. The
+serial model is deliberate and is what the longpoll design is built on. The
+consequence that was never written down is what happens when the call in
+progress is a **slow** one:
+
+- `submitblock` waits up to 90 s for the worker;
+- `sendrawtransaction` likewise;
+- `importmempool` waits up to 90 s **per entry**, with no bound on entries;
+- `walletdisplayaddress` `popen`s HWI (`rpc_signer.c:80`) and waits for a
+  **human to press a button on a hardware wallet**.
+
+For the duration, every other RPC blocks — including `getblockcount` and
+including `stop`. A wedged worker turns the whole surface into a sequence of
+90-second timeouts. Core runs handlers concurrently on `-rpcthreads` and takes
+specific locks around specific state.
+
+This is not being changed here. Moving the signer or the channel waits outside
+the lock means those handlers execute concurrently with others against wallet
+and mempool state that the serial model currently protects for free, and that
+is a design change with its own correctness argument to make — not audit
+cleanup. What was wrong was that the cost was undocumented.
+
+### The wallet has no reorg awareness (WAL-13)
+
+`wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`
+(the format comment at `:36`). **There is no block hash.** A record therefore
+cannot be checked against the chain it came from: if a reorg replaces the block
+at that height, nothing in the wallet can notice.
+
+The visible consequence: until the operator re-runs `rescanblockchain`,
+`getbalance` and `listunspent` report an orphaned coin as confirmed, with a
+confirmation count that keeps *growing*, and a spend of it fails at broadcast.
+The file's own header explains why the scan runs forward in height order; it
+does not say what happens when history changes underneath it.
+
+Two things would have to change together: store the block hash per record and
+drop records whose `(height, hash)` no longer matches the header chain on read.
+Separately, `rescanblockchain` walks the whole archive on the single RPC thread
+— hours on mainnet, and per RPC-12 above, with the entire RPC surface blocked
+for the duration.
+
+### Inbound peer-slot claim race (RPC-13) — FIXED, not documented
+
+Listed here only to close the set: this one was a real defect and is fixed in
+code. `inbound_slot_claim` CAS'd `used` 0→1 to take a slot, and then
+`rpc_fill_peer_slot`'s `memset` zeroed `used` again for the duration of the
+fill — advertising the slot as free, so a sibling child could claim the same
+one. The loser's later `used = 0` would free the *winner's* entry.
+`rpc_fill_peer_slot_ex` now preserves an existing claim across the memset. The
+outbound path, which is not claimed by CAS and where zeroing `used` first is
+what stops a reader seeing a half-filled record, keeps the old behaviour.
+
+## Update 2026-09-05 — the audit's INFO tier: what was fixed, and what was decided
+
+The 2026-09-03 audit's 33 INFO findings are worked through. Most became code
+(see the commits naming each ID). This section records the ones whose right
+answer was a DECISION rather than a patch, so nobody re-opens them expecting a
+fix — and the two that turned out to be already-closed.
+
+### Decisions, not defects
+
+**NET-16 — the node introduces itself as software it is not.** The feeler and
+block-relay-only handshakes send `/Satoshi:25.0.0/` (`net_policy.c:97`), and
+the seednode/getaddr path sends `/Satoshi:0.18.0/` with a fabricated
+`start_height` of 789000 (`addr_ingest.c:180`). Neither matches the daemon's
+own `node_ua_buf`, which carries this project's real user agent.
+
+This is not laziness and it is not an oversight — someone chose it, and the
+reason is real: a node advertising an unknown user agent is treated
+differently by peers and by crawlers, so borrowing Core's string makes those
+paths behave like everyone else's. But it also means this node is
+**misreporting itself to the network**, including to the crawlers that publish
+node-population statistics, and that is a choice the project should make out
+loud rather than leave sitting in two string literals.
+
+**Recorded, not changed.** Changing it is a one-line edit either way; what it
+needs is a decision about how this node wants to appear, taken deliberately.
+Until that decision is made, the current behaviour stands and is documented
+here rather than implied.
+
+**RPC-18 — the RPC listener is IPv4-only.** `rpc_server.c` creates an
+`AF_INET` socket and parses `-rpcbind` with `inet_pton(AF_INET)`, so
+`rpcbind=::1` is a startup error and every IPv6 `-rpcallowip` entry is
+unreachable. `rpc_acl.c` seeds `::1` into the default allow list, where it can
+never match.
+
+Adding `AF_INET6` is a contained change (socket, `inet_pton`, and
+`server_thread`'s peer formatting), but it is a feature with its own testing —
+dual-stack binding, v4-mapped addresses, and the ACL semantics for both — not
+audit cleanup. **The dead `::1` seed is kept**, because it is the correct
+default the moment the listener learns IPv6 and deleting it would silently
+narrow the default from "loopback, both families" to "IPv4 loopback only" at
+exactly that moment. It is now annotated as inert at the line itself.
+
+### Accepted risks, closed
+
+**CRY-8 — AES timing and the lazy S-box.** The inverse S-box is built lazily
+through an idempotent racy write (benign on x86: every writer stores the same
+bytes), and both the S-box lookups and the PKCS#7 padding check are
+variable-time. Correctly scoped out: this AES decrypts the wallet at rest, and
+no attacker-chosen ciphertext is decrypted online, so there is no oracle to
+time. Closed with no change.
+
+**SCR-11 — CONST_SCRIPTCODE check ordering.** `bitcoin_interp.asm` runs the
+signature and pubkey encoding checks before the FindAndDelete callback, where
+Core's `EvalChecksigPreTapscript` runs FindAndDelete first. Both reject the
+same scripts; only the reported error differs when a script trips both, and
+the flag is policy-only. Reordering consensus-adjacent interpreter code to
+change which of two rejections is named is not a trade worth making. Closed.
+
+**BLD-6 — the gate is one recipe with ~350 command lines**, and a recipe stops
+at its first failing line even under `-k`, so an early failure skips every
+later test. That is real, understood, and already mitigated: `gate-log-check`
+exists precisely to detect a truncated run and is itself gated. No change.
+
+**BLD-10 — repo hygiene**, re-verified 2026-09-05: 1,070 tracked files,
+largest is `validation/corpus_diff_report.json` at 2.6 MB, `git status` clean.
+No key material in tracked files other than BLD-3. No action.
+
+### Already closed by other findings
+
+**UTX-13** claimed the 32-bit `mov eax, -1` error-return defect was "live in
+`utxo_lsm_put`". It is not, as of UTX-3 in this same audit round: both
+`utxo_lsm_put` (`.lp_err`) and `utxo_lsm_del` (`.ld_err`) return a full 64-bit
+`mov rax, -1`. The stale explanation in `daemon/flush_wal_tail.c` has been
+corrected — the test there compares against the SUCCESS value, which is why it
+kept working when the convention changed underneath it.
+
+**UTX-12's premise no longer holds.** It says a non-empty WAL tail at boot
+forces a full `mac_lsm_recount` "because the v2 manifest cannot say whether the
+tail is folded", and recommends adding a folded-through field. That field
+exists: `MAGIC_MANIFEST2` ("UMN2") carries a trailing `total_live` qword, and
+`bitcoin_utxo_lsm.asm:198-205` states its contract — the persisted value is the
+RUNS-ONLY count with WAL and memtable excluded, precisely so reload can add the
+current tail's net (pushes − dels) on top without double-counting. The full
+recount is the fallback for an OLD-format (`MAGIC_MANIFEST`) manifest only.
+Verified 2026-09-05; no change needed.
+
+**WAL-20** was a re-verification request, and it verifies. `wallet_store.c`
+marks the v2 format legacy/read-only; every write path goes through
+`store_write_sealed` → `wcrypt_seal`, and v2 files are decrypted on load and
+immediately rewritten as v3. It remains subject to WAL-4 (that rewrite is not
+fsynced), which is tracked under its own ID.
+
+**BLD-9's headline** — ops scripts driving a *system* `bitcoind`, with a
+`killall bitcoind` fallback — was fixed under DMN-11 earlier in this
+remediation; they point at `asm/daemon/bitcoind` now. Its remaining items are
+done here: `utxo_progress.sh` gains `set -u` and `pipefail` (not `set -e`: the
+watch loop is meant to survive a transient read failure), with its `sudo dd
+if=/proc/<pid>/mem` root-read of live process memory stated at the top rather
+than discovered at the sudo prompt; `signer_core_diff.sh`'s `rm -rf $TMP` is
+quoted.

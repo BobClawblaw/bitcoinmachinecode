@@ -326,6 +326,13 @@ void node_config_set_conf_path(const char* path);
  * warn instead of silently accepting it. */
 int nodecfg_unimplemented(const char* key);
 
+/* DMN-4 (audit 2026-09-03): config-file section scoping and Core's `no`
+ * negation. Exposed so the test suite can pin them directly rather than only
+ * through the file parser's aggregate effect. */
+int nodecfg_section_is(const char* section, const char* chain);
+int nodecfg_is_network_specific(const char* key);
+int nodecfg_known_key(const char* key);
+
 /* getnetworkinfo's per-network proxy fields (rpc_node.c), exported narrowly
  * rather than exposing g_cfg itself to callers that link this file only
  * weakly -- see the definition in node_config.c for why. */

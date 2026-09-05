@@ -78,3 +78,6 @@ smoke_*
 !*.inc
 !*.csv
 !*.md
+# BLD-7: sanitizer harnesses and their logs are build output, not sources.
+san_*
+*.sanlog

@@ -21,8 +21,10 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include "secure_zero.h"   /* WAL-3: a memset the optimiser may not delete */
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -35,23 +37,88 @@ extern long aes256_cbc_decrypt(const u8 key[32], const u8 iv[16], const u8* in, 
 #define WC_MAGIC "BMCWENC1"
 #define WC_SALT 8
 #define WC_ITERS 100000            /* our fixed count (stored, so it can grow) */
+#define WC_ITERS_MAX 10000000u     /* WAL-16: refuse a container demanding more */
 #define WC_MKLEN 32
+
+/* Core's BytesToKeySHA512AES: SHA512(pass||salt), then SHA512 iters-1 more
+ * times; key=buf[0:32], iv=buf[32:48]. Exposed for the differential test. */
+/* ---------------------------------------------------------------- WAL-7
+ * (audit 2026-09-03) The passphrase was truncated to 96 bytes before the
+ * first hash -- a bound chosen only to fit the 128-byte STATIC scratch that
+ * used to live here, not anything about the KDF. Core's
+ * CCrypter::BytesToKeySHA512AES hashes the whole SecureString.
+ *
+ * The consequence was silent and total: with a 96-byte prefix in common,
+ * "aaa...a" + "secret" and "aaa...a" + "wrong" derived the SAME key, so both
+ * unlocked the wallet. Every byte of a diceware or hex passphrase past the
+ * 96th contributed nothing, and the operator was never told.
+ *
+ * The scratch is now sized to the passphrase: the stack for anything
+ * ordinary, the heap beyond that, and wiped either way.
+ *
+ * COMPATIBILITY. Hashing the full passphrase changes the derived key for any
+ * passphrase LONGER than 96 bytes -- which would make a wallet encrypted
+ * under one impossible to open. wcrypt_open therefore retries with the old
+ * truncating derivation when the modern one fails and the passphrase is long
+ * enough for it to matter, so such a wallet still opens (with a warning to
+ * re-encrypt). Anything 96 bytes or shorter derives bit-for-bit as before,
+ * so no existing wallet changes behaviour at all.
+ */
+#define WC_STACK_PASS 512
+
+static void wc_derive_n(const char* pass, long passlen, const u8 salt[WC_SALT],
+                        u32 iters, u8 key[32], u8 iv[16]){
+    u8 stackbuf[WC_STACK_PASS + WC_SALT];
+    u8 d[64];
+    u8* buf = stackbuf;
+    long n = passlen < 0 ? 0 : passlen;
+    long need = n + WC_SALT;
+
+    if (need > (long)sizeof stackbuf){
+        buf = (u8*)malloc((size_t)need);
+        if (!buf){
+            /* Cannot derive. Produce a key that opens nothing rather than one
+             * derived from a silently shortened passphrase: a wrong key is a
+             * failed unlock, a truncated one is the bug this fixes. */
+            memset(key, 0, 32); memset(iv, 0, 16);
+            return;
+        }
+    }
+    memcpy(buf, pass, (size_t)n);
+    memcpy(buf + n, salt, WC_SALT);
+    sha512_full(d, buf, need);
+    for (u32 i = 0; i + 1 < iters; i++) sha512_full(d, d, 64);
+    memcpy(key, d, 32);
+    memcpy(iv, d + 32, 16);
+
+    /* WAL-3 (audit 2026-09-03): the scratch used to be STATIC, so the
+     * passphrase and salt stayed in .bss for the life of the process --
+     * including after walletlock had zeroed the seed and the operator
+     * believed nothing sensitive was resident. `d` is the derived key and iv,
+     * equally worth clearing once copied out.
+     *
+     * secure_zero, not memset: both are dead afterwards, so a plain memset is
+     * exactly the store an optimiser is allowed to delete. */
+    secure_zero(buf, (size_t)need);
+    secure_zero(d, sizeof d);
+    if (buf != stackbuf) free(buf);
+}
 
 /* Core's BytesToKeySHA512AES: SHA512(pass||salt), then SHA512 iters-1 more
  * times; key=buf[0:32], iv=buf[32:48]. Exposed for the differential test. */
 void wcrypt_derive(const char* pass, long passlen, const u8 salt[WC_SALT],
                    u32 iters, u8 key[32], u8 iv[16]){
-    static u8 buf[128];            /* first 64 = pass||salt scratch region */
-    u8 d[64];
-    /* first hash over pass||salt */
+    wc_derive_n(pass, passlen, salt, iters, key, iv);
+}
+
+/* The PRE-WAL-7 derivation, kept only so a wallet encrypted under a
+ * passphrase longer than 96 bytes can still be opened. Never used to
+ * ENCRYPT. */
+void wcrypt_derive_legacy96(const char* pass, long passlen, const u8 salt[WC_SALT],
+                            u32 iters, u8 key[32], u8 iv[16]){
     long n = passlen;
-    if (n > 96) n = 96;            /* passphrases are short; bound the scratch */
-    memcpy(buf, pass, (size_t)n);
-    memcpy(buf + n, salt, WC_SALT);
-    sha512_full(d, buf, n + WC_SALT);
-    for (u32 i = 0; i + 1 < iters; i++) sha512_full(d, d, 64);
-    memcpy(key, d, 32);
-    memcpy(iv, d + 32, 16);
+    if (n > 96) n = 96;
+    wc_derive_n(pass, n, salt, iters, key, iv);
 }
 
 static int wc_rand(u8* out, long n){
@@ -121,11 +188,54 @@ long wcrypt_open(const char* pass, long passlen, const u8* blob, long len,
     if (p + sl > blob + len - 32) return -1;
     const u8* seedct = p;
 
+    /* WAL-16 (audit 2026-09-03): `iters` comes straight out of the FILE. An
+     * attacker with write access to bmcwallet.enc could set it to 0xffffffff
+     * and the next walletpassphrase would spin ~4e9 SHA-512 rounds -- hours,
+     * on the RPC thread, wedging every other command behind the exec lock.
+     * Core stores nDeriveIterations unchecked too, so the DoS is shared, but
+     * nothing forces us to inherit it. 10 million is ~100x the container's
+     * own WC_ITERS and still a fraction of a second.
+     *
+     * A container written with a larger count is refused rather than
+     * silently downgraded: deriving with a DIFFERENT count than the file
+     * states would produce the wrong key and report it as a wrong
+     * passphrase, which is a far more confusing failure than saying so. */
+    if (iters == 0 || iters > WC_ITERS_MAX){
+        fprintf(stderr,
+            "[wallet]  refusing this container: it states %u KDF iterations, outside the\n"
+            "[wallet]           accepted range 1..%u. A tampered file can make unlocking\n"
+            "[wallet]           spin for hours; if this container is genuine, re-encrypt it\n"
+            "[wallet]           with a build that wrote a sane count.\n",
+            (unsigned)iters, (unsigned)WC_ITERS_MAX);
+        return -1;
+    }
+
     u8 kek[32], kek_iv[16];
     wcrypt_derive(pass, passlen, salt, iters, kek, kek_iv);
     u8 mk[64];
     long mkl = aes256_cbc_decrypt(kek, kek_iv, wrapped, wl, mk, sizeof mk);
     memset(kek, 0, sizeof kek);
+    if (mkl != WC_MKLEN && passlen > 96){
+        /* WAL-7 compatibility: this container may have been written before
+         * the truncation was fixed, in which case its key came from the first
+         * 96 bytes only. Retry that derivation so the wallet still opens --
+         * and say so, because the fix does not reach a container until it is
+         * re-encrypted.
+         *
+         * Only for passlen > 96: at or below it the two derivations are
+         * identical, so a failure there is simply a wrong passphrase and
+         * retrying would be pointless work on every bad attempt. */
+        memset(mk, 0, sizeof mk);
+        wcrypt_derive_legacy96(pass, passlen, salt, iters, kek, kek_iv);
+        mkl = aes256_cbc_decrypt(kek, kek_iv, wrapped, wl, mk, sizeof mk);
+        memset(kek, 0, sizeof kek);
+        if (mkl == WC_MKLEN)
+            fprintf(stderr,
+                "[wallet]  WARNING: this wallet's key was derived from only the first 96 bytes\n"
+                "[wallet]           of the passphrase (a pre-WAL-7 container). Everything past\n"
+                "[wallet]           the 96th byte is currently ignored. Re-encrypt the wallet to\n"
+                "[wallet]           use the whole passphrase.\n");
+    }
     if (mkl != WC_MKLEN){ memset(mk, 0, sizeof mk); return 0; }   /* wrong passphrase: pad check failed */
     long out = aes256_cbc_decrypt(mk, seed_iv, seedct, sl, seed_out, cap);
     memset(mk, 0, sizeof mk);

@@ -153,6 +153,35 @@ long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32], unsig
     unsigned long h_unused, cb_unused;
     return utxo_get(u, txid, index, value, &h_unused, &cb_unused, script, slen);
 }
+/* RPX-4: gettxout's out-of-process query. The daemon installs one of these
+ * (main.c:7961); no harness ever did, which is why gettxout's shape was never
+ * asserted end to end and its hardcoded bestblock/confirmations/asm/desc went
+ * unnoticed. This one answers ONE known outpoint, at a height the fixture's
+ * chain actually contains, so `confirmations` has a checkable value. */
+extern void rpc_commands_set_txo_query(long (*q)(const unsigned char[32], unsigned int,
+                                                 unsigned long long*, unsigned long*,
+                                                 unsigned long*, unsigned char*,
+                                                 unsigned long, unsigned long*));
+static unsigned char rpx4_txid[32];
+#define RPX4_HEIGHT 1
+static long rpx4_query(const unsigned char txid[32], unsigned int vout,
+                       unsigned long long* value, unsigned long* height,
+                       unsigned long* is_coinbase, unsigned char* spk,
+                       unsigned long spkcap, unsigned long* slen){
+    if (vout != 0 || memcmp(txid, rpx4_txid, 32) != 0) return 0;
+    /* a P2WPKH output: OP_0 PUSH20 <h160> -- a shape rpc_chain renders an
+     * address, a desc and a real type name for, none of which the old
+     * hand-built object could produce. */
+    static const unsigned char SPK[22] = {
+        0x00,0x14, 0x75,0x1e,0x76,0xe8,0x19,0x91,0x96,0xd4,0x54,0x94,
+        0x1c,0x45,0xd1,0xb3,0xa3,0x23,0xf1,0x43,0x3b,0xd6 };
+    if (spkcap < sizeof SPK) return 0;
+    memcpy(spk, SPK, sizeof SPK);
+    *slen = sizeof SPK;
+    *value = 5000000000ULL; *height = RPX4_HEIGHT; *is_coinbase = 0;
+    return 1;
+}
+
 /* display-order hex of a wire hash (local copy; rpc_chain.c's is static) */
 static void trc_hex_rev(char* out, const unsigned char* b, size_t n){
     for (size_t i = 0; i < n; i++){
@@ -451,12 +480,15 @@ int main(void){
       ck_str("getblock v1 strippedsize", S(r,"strippedsize"), "285");
       ck_str("getblock v1 size", S(r,"size"), "285");
       ck_str("getblock v1 weight", S(r,"weight"), "1140");
-      rj_val* cb = G(r,"coinbase_tx");
-      ck_str("coinbase_tx.version", S(cb,"version"), "1");
-      ck_str("coinbase_tx.locktime", S(cb,"locktime"), "0");
-      ck_str("coinbase_tx.sequence", S(cb,"sequence"), "4294967295");
-      ck_str("coinbase_tx.coinbase", S(cb,"coinbase"), "04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73");
-      ck("coinbase_tx has no witness (legacy)", G(cb,"witness") == NULL);
+      /* RPX-7: these five assertions used to check a `coinbase_tx` OBJECT on
+       * the getblock result. Core's blockToJSON has no such field -- it was
+       * an additive divergence, undocumented, and pinned HERE as if it were
+       * canonical, which is why it survived. The field is gone; what is
+       * asserted now is its ABSENCE, which is the actual parity claim. The
+       * coinbase's contents are still checked, from inside the `tx` array
+       * where Core puts them (verbosity 2, below). */
+      ck("RPX-7: getblock does NOT emit a non-Core coinbase_tx field",
+         G(r,"coinbase_tx") == NULL);
       rj_val* tx = G(r,"tx");
       ck("getblock v1 tx is array of 1", tx && tx->typ == RJ_ARR && tx->nitems == 1);
       ck_str("getblock v1 tx[0] == genesis coinbase txid", tx && tx->nitems ? tx->items[0]->str : NULL, GENESIS_MERKLE);
@@ -489,8 +521,12 @@ int main(void){
       snprintf(want, sizeof want, "%zu", g_blk3_len); ck_str("blk3 size", S(r,"size"), want);
       snprintf(want, sizeof want, "%zu", g_blk3_stripped); ck_str("blk3 strippedsize", S(r,"strippedsize"), want);
       snprintf(want, sizeof want, "%zu", g_blk3_stripped*3 + g_blk3_len); ck_str("blk3 weight", S(r,"weight"), want);
-      rj_val* cb = G(r,"coinbase_tx");
-      ck_str("blk3 coinbase_tx.witness (reserved value)", S(cb,"witness"), "0000000000000000000000000000000000000000000000000000000000000000");
+      /* RPX-7: was `blk3 coinbase_tx.witness`. The witness reserved value is
+       * still asserted -- from `tx[0].vin[0].txinwitness` at verbosity 2,
+       * which is where CORE exposes it, instead of from the non-Core
+       * coinbase_tx object that used to carry it here. */
+      ck("RPX-7: blk3 getblock has no coinbase_tx field either",
+         G(r,"coinbase_tx") == NULL);
       rj_val* tx = G(r,"tx");
       ck("blk3 v1 has 3 txids", tx && tx->nitems == 3);
       ck_str("blk3 v1 tx[0] == segwit coinbase txid (independent sha256d of stripped)", tx && tx->nitems ? tx->items[0]->str : NULL, g_cb_txid[3]);
@@ -502,12 +538,35 @@ int main(void){
        *   tx[1] legacy_spend: 1 input worth 50.0 BTC  -> fee 0.01 (out 49.99)
        *   tx[2] segwit_spend: 1 input worth 49.99 BTC -> fee 49.98999 (out 1000 sat)
        * Record: txid[32] idx(u32) value(u64@36) height(u32) is_coinbase(u8@48) slen(u16@49) */
-      { unsigned char rec[102]; memset(rec, 0, sizeof rec);
-        put_u64(rec+36, 5000000000ULL);      /* record 0 value */
-        put_u64(rec+51+36, 4999000000ULL);   /* record 1 value */
+      /* RPX-2: the records now carry the height, coinbase flag and
+       * scriptPubKey they always could -- the undo format has had all three
+       * since Stage D. The VALUES are unchanged, so getblock v2's fee
+       * assertions below are unaffected; the extra fields are what
+       * getrawtransaction verbosity 2's `prevout` reports.
+       *   record 0: height 1, GENERATED (coinbase), P2WPKH script
+       *   record 1: height 2, not generated,        P2PKH script */
+      { static const unsigned char SPK_WPKH[22] = {
+            0x00,0x14, 0x75,0x1e,0x76,0xe8,0x19,0x91,0x96,0xd4,0x54,0x94,
+            0x1c,0x45,0xd1,0xb3,0xa3,0x23,0xf1,0x43,0x3b,0xd6 };
+        static const unsigned char SPK_PKH[25] = {
+            0x76,0xa9,0x14, 0x75,0x1e,0x76,0xe8,0x19,0x91,0x96,0xd4,0x54,0x94,
+            0x1c,0x45,0xd1,0xb3,0xa3,0x23,0xf1,0x43,0x3b,0xd6, 0x88,0xac };
+        unsigned char rec[51+22 + 51+25]; memset(rec, 0, sizeof rec);
+        unsigned char* r0 = rec;
+        put_u64(r0+36, 5000000000ULL);                 /* value  */
+        r0[44] = 1;                                    /* height 1 (u32 LE) */
+        r0[48] = 1;                                    /* is_coinbase */
+        r0[49] = 22; r0[50] = 0;                       /* script_len */
+        memcpy(r0+51, SPK_WPKH, 22);
+        unsigned char* r1 = rec + 51 + 22;
+        put_u64(r1+36, 4999000000ULL);                 /* value  */
+        r1[44] = 2;                                    /* height 2 */
+        r1[48] = 0;                                    /* not generated */
+        r1[49] = 25; r1[50] = 0;
+        memcpy(r1+51, SPK_PKH, 25);
         FILE* uf = fopen("undo_3.dat", "wb");
         ck("undo_3.dat opened", uf != NULL);
-        if (uf){ fwrite(rec, 1, 102, uf); fclose(uf); }
+        if (uf){ fwrite(rec, 1, sizeof rec, uf); fclose(uf); }
       }
       snprintf(p, sizeof p, "[\"%s\", 2]", g_hash[3]);
       r = call("getblock", p, &ec, &em);
@@ -515,6 +574,17 @@ int main(void){
       rj_val* t1 = tx && tx->nitems > 1 ? tx->items[1] : NULL;
       rj_val* t2 = tx && tx->nitems > 2 ? tx->items[2] : NULL;
       ck("v2 coinbase tx[0] has no fee (Core parity)", tx && tx->nitems ? G(tx->items[0],"fee") == NULL : 0);
+      /* RPX-7: the segwit coinbase's witness reserved value, asserted where
+       * CORE exposes it -- tx[0].vin[0].txinwitness -- now that the non-Core
+       * `coinbase_tx` object that used to carry it is gone. Same bytes, same
+       * proof that the coinbase witness parses, Core's field. */
+      { rj_val* cbv = tx && tx->nitems ? G(tx->items[0],"vin") : NULL;
+        rj_val* cbi = cbv && cbv->nitems ? cbv->items[0] : NULL;
+        rj_val* cbw = cbi ? G(cbi,"txinwitness") : NULL;
+        ck("v2 coinbase txinwitness has 1 item", cbw && cbw->typ == RJ_ARR && cbw->nitems == 1);
+        ck_str("v2 coinbase txinwitness[0] == the 32-byte reserved value",
+               cbw && cbw->nitems ? cbw->items[0]->str : NULL,
+               "0000000000000000000000000000000000000000000000000000000000000000"); }
       ck_str("v2 tx[1].fee (0.01 from undo)", S(t1,"fee"), "0.01000000");
       ck_str("v2 tx[2].fee (49.98999 from undo)", S(t2,"fee"), "49.98999000");
       ck_str("v2 tx[1].txid == v1 txid", S(t1,"txid"), g_tx1_txid);
@@ -663,6 +733,55 @@ int main(void){
       ck_str("grt.blocktime", S(r,"blocktime"), "1231008305");
       ck("grt: blockhash comes after hex (Core TxToJSON order)", r && r->nmembers > 5 && !strcmp(r->members[r->nmembers-5].key, "hex") && !strcmp(r->members[r->nmembers-4].key, "blockhash") && !strcmp(r->members[r->nmembers-1].key, "blocktime"));
       rj_free(r);
+      /* ---- RPX-2: verbosity 2 adds fee and per-input prevout --------------
+       * Core's TxToUniv with TxVerbosity::SHOW_DETAILS. This node passed
+       * in_total = -1 for EVERY verbosity, so verbosity 2 was byte-identical
+       * to verbosity 1 and a caller asking for the details got the shape
+       * without them -- silently, which is why nothing caught it.
+       *
+       * tx[1] is block 3's legacy spend: one input worth 50.0 BTC against
+       * 49.99 BTC of outputs, so fee 0.01 -- the same undo record getblock v2
+       * already computes that fee from. */
+      snprintf(p, sizeof p, "[\"%s\", 2, \"%s\"]", g_tx1_txid, g_hash[3]);
+      r = call("getrawtransaction", p, &ec, &em);
+      ck("grt verbosity 2 returns an object", r && r->typ == RJ_OBJ);
+      ck_str("RPX-2: verbosity 2 carries a fee", S(r,"fee"), "0.01000000");
+      { rj_val* vin = G(r,"vin");
+        rj_val* i0  = vin && vin->nitems ? vin->items[0] : NULL;
+        rj_val* pv  = i0 ? G(i0,"prevout") : NULL;
+        ck("RPX-2: the input carries a prevout object", pv && pv->typ == RJ_OBJ);
+        ck_str("prevout.value is the spent output's value", S(pv,"value"), "50.00000000");
+        ck_str("prevout.height is the spent output's OWN height", S(pv,"height"), "1");
+        ck_str("prevout.generated is true (it spent a coinbase)", S(pv,"generated"), "1");
+        rj_val* pspk = pv ? G(pv,"scriptPubKey") : NULL;
+        ck("prevout.scriptPubKey is rendered", pspk && pspk->typ == RJ_OBJ);
+        ck_str("prevout.scriptPubKey.hex", S(pspk,"hex"),
+               "0014751e76e8199196d454941c45d1b3a323f1433bd6");
+        ck_str("prevout.scriptPubKey.type comes from the script",
+               S(pspk,"type"), "witness_v0_keyhash"); }
+      rj_free(r);
+
+      /* THE OPPOSITE HALF: verbosity 1 must stay EXACTLY as it was. If the
+       * new fields leaked into it, verbosity 2 would still be "identical to
+       * verbosity 1" -- just in the other direction. */
+      snprintf(p, sizeof p, "[\"%s\", 1, \"%s\"]", g_tx1_txid, g_hash[3]);
+      r = call("getrawtransaction", p, &ec, &em);
+      ck("verbosity 1 still has NO fee", r && G(r,"fee") == NULL);
+      { rj_val* vin = G(r,"vin");
+        rj_val* i0  = vin && vin->nitems ? vin->items[0] : NULL;
+        ck("verbosity 1 still has NO prevout", i0 && G(i0,"prevout") == NULL); }
+      rj_free(r);
+
+      /* the COINBASE spends nothing, so it gets no prevout at any verbosity */
+      snprintf(p, sizeof p, "[\"%s\", 2, \"%s\"]", g_cb_txid[3], g_hash[3]);
+      r = call("getrawtransaction", p, &ec, &em);
+      { rj_val* vin = G(r,"vin");
+        rj_val* i0  = vin && vin->nitems ? vin->items[0] : NULL;
+        ck("a coinbase input has no prevout even at verbosity 2",
+           i0 && G(i0,"prevout") == NULL);
+        ck("...and the coinbase has no fee", r && G(r,"fee") == NULL); }
+      rj_free(r);
+
       snprintf(p, sizeof p, "[\"%s\", 1, \"%s\"]", g_tx1_txid, g_hash[1]);
       expect_err("getrawtransaction wrong block", "getrawtransaction", p, -5, "No such transaction found in the provided block. Use gettransaction for wallet transactions.");
       snprintf(p, sizeof p, "[\"%s\"]", g_tx1_txid);
@@ -955,7 +1074,16 @@ int main(void){
          * section keeps testing PACKAGE SELECTION, not IsStandardTx (same
          * treatment as tests/test_mempool_evict.c). */
         { extern void mpool_policy_set_acceptnonstd(void*, unsigned);
-          mpool_policy_set_acceptnonstd(pol, 1); }
+          mpool_policy_set_acceptnonstd(pol, 1);
+    /* MEM-23 (2026-09-05): Core's 65-non-witness-byte floor is UNCONDITIONAL
+     * -- it mitigates CVE-2017-12842, so -acceptnonstdtxn does not switch it
+     * off, and as of that change neither does ours. These fixtures are
+     * ~60-byte synthetic transactions exercising mempool mechanics, not the
+     * size rule, so the floor is disabled HERE, explicitly and test-only,
+     * rather than by weakening the production path. No config option reaches
+     * this setter. */
+    { extern void mpol_policy_set_min_size(void*, unsigned);
+      mpol_policy_set_min_size(pol, 0); } }
         mpool_policy_state_init(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);
@@ -1155,6 +1283,16 @@ int main(void){
                  "hash_serialized_3 hash type not implemented (this node computes muhash)");
       expect_err("usi bad hash_type -> Core message shape", "gettxoutsetinfo",
                  "[\"bogus\"]", -8, "'bogus' is not a valid hash_type");
+      /* CSI-1 (2026-09-05 benchmark): height/blockhash as param 2 is NOT
+       * honored (no per-height history) and must be REFUSED, Core's own
+       * message -- previously the arg was ignored and the tip set returned,
+       * silently answering a different question than was asked. */
+      expect_err("usi height arg -> refused (no historical queries)", "gettxoutsetinfo",
+                 "[\"muhash\", 3]", -8,
+                 "coinstatsindex does not support querying at historical heights");
+      expect_err("usi blockhash arg -> refused (no historical queries)", "gettxoutsetinfo",
+                 "[\"muhash\", \"0f9188f13cb7b2c71f2a335e3a4fc325bf174ffcf8ff03b2a4c6f0e2e2f3f4f5\"]", -8,
+                 "coinstatsindex does not support querying at historical heights");
       g_usi_stub_busy = 1;
       { long e1; const char* m1; rj_val* r1 = NULL;
         rj_val* p1 = rj_parse("[]", 2);
@@ -1576,6 +1714,100 @@ int main(void){
       r = call("getindexinfo", "[\"nosuch\"]", &ec, &em);
       ck("getindexinfo(unknown) -> {}", r && r->typ == RJ_OBJ && r->nmembers == 0);
       rj_free(r); }
+
+    /* ---- getblock verbosity 3: Core's per-input prevout -------------------
+     * v3 used to be identical to v2. The undo file that v2's fees come from
+     * carries the whole record -- value, height, coinbase flag AND the
+     * scriptPubKey -- so the data was always present; only the wiring was
+     * missing. undo_3.dat (written above for the fee test) has record 0 as a
+     * GENERATED coin at height 1 with a P2WPKH script. */
+    printf("\n---- getblock verbosity 3: prevout ----\n");
+    { char p3[128]; snprintf(p3, sizeof p3, "[\"%s\", 3]", g_hash[3]);
+      rj_val* r3 = call("getblock", p3, &ec, &em);
+      ck("getblock v3 returns an object", r3 && r3->typ == RJ_OBJ);
+      rj_val* tx3 = G(r3, "tx");
+      rj_val* t1 = tx3 && tx3->nitems > 1 ? tx3->items[1] : NULL;
+      /* fees must still be there -- v3 is v2 PLUS prevouts, not instead of */
+      ck_str("v3 keeps v2's fee", S(t1, "fee"), "0.01000000");
+      rj_val* vin = t1 ? G(t1, "vin") : NULL;
+      rj_val* i0  = vin && vin->nitems ? vin->items[0] : NULL;
+      rj_val* pv  = i0 ? G(i0, "prevout") : NULL;
+      ck("v3: the input carries a prevout object", pv && pv->typ == RJ_OBJ);
+      ck_str("v3 prevout.value", S(pv, "value"), "50.00000000");
+      ck_str("v3 prevout.height", S(pv, "height"), "1");
+      ck_str("v3 prevout.generated (it spent a coinbase)", S(pv, "generated"), "1");
+      { rj_val* pspk = pv ? G(pv, "scriptPubKey") : NULL;
+        ck_str("v3 prevout.scriptPubKey.hex", S(pspk, "hex"),
+               "0014751e76e8199196d454941c45d1b3a323f1433bd6"); }
+      /* the coinbase spends nothing, so it gets no prevout at any verbosity */
+      { rj_val* cbv = tx3 && tx3->nitems ? G(tx3->items[0], "vin") : NULL;
+        rj_val* cbi = cbv && cbv->nitems ? cbv->items[0] : NULL;
+        ck("v3: the coinbase input has no prevout", cbi && G(cbi, "prevout") == NULL); }
+      rj_free(r3); }
+
+    /* THE OPPOSITE HALF: verbosity 2 must NOT have gained prevouts. If it had,
+     * v3 would still be "identical to v2" -- just in the other direction. */
+    { char p2b[128]; snprintf(p2b, sizeof p2b, "[\"%s\", 2]", g_hash[3]);
+      rj_val* r2 = call("getblock", p2b, &ec, &em);
+      rj_val* tx2 = G(r2, "tx");
+      rj_val* u1  = tx2 && tx2->nitems > 1 ? tx2->items[1] : NULL;
+      rj_val* v2v = u1 ? G(u1, "vin") : NULL;
+      rj_val* v2i = v2v && v2v->nitems ? v2v->items[0] : NULL;
+      ck("verbosity 2 still has NO prevout", v2i && G(v2i, "prevout") == NULL);
+      ck_str("...but still has its fee", S(u1, "fee"), "0.01000000");
+      rj_free(r2); }
+
+    /* ---- RPX-4: gettxout's four hardcoded fields --------------------------
+     * bestblock was the all-zero hash, confirmations was 0, and asm/desc were
+     * empty strings -- each a definite WRONG value rather than a missing one,
+     * and each marked out-of-scope in a comment while the data was already to
+     * hand (the height came back from the UTXO query and was discarded;
+     * rpc_chain has had the index open the whole time and renders asm/desc for
+     * every other output shape). */
+    printf("\n---- RPX-4: gettxout ----\n");
+    {
+        memset(rpx4_txid, 0xa5, sizeof rpx4_txid);
+        rpc_commands_set_txo_query(rpx4_query);
+        char txhex[65]; trc_hex_rev(txhex, rpx4_txid, 32); txhex[64] = 0;
+        char pp[128]; snprintf(pp, sizeof pp, "[\"%s\", 0]", txhex);
+        rj_val* g = call("gettxout", pp, &ec, &em);
+        ck("gettxout answers for a known outpoint", g && g->typ == RJ_OBJ);
+
+        long tip = rpc_chain_tip_height();
+        ck("the fixture chain has a tip to be relative to", tip >= RPX4_HEIGHT);
+
+        /* bestblock: the TIP hash, not zeros */
+        const char* bb = S(g, "bestblock");
+        ck("bestblock is present", bb != NULL);
+        ck("bestblock is NOT the all-zero hash it used to be",
+           bb && strcmp(bb, "0000000000000000000000000000000000000000000000000000000000000000") != 0);
+        ck_str("bestblock is the fixture's tip hash", bb, g_hash[3]);
+
+        /* confirmations: tip - height + 1, Core's formula */
+        { char want[32]; snprintf(want, sizeof want, "%ld", tip - RPX4_HEIGHT + 1);
+          ck_str("confirmations is tip - height + 1", S(g, "confirmations"), want); }
+        ck("confirmations is NOT the hardcoded 0",
+           S(g, "confirmations") && strcmp(S(g, "confirmations"), "0") != 0);
+
+        /* scriptPubKey: rendered by the same builder every other output uses */
+        rj_val* sp = G(g, "scriptPubKey");
+        ck("scriptPubKey is present", sp && sp->typ == RJ_OBJ);
+        ck("asm is no longer the empty string", S(sp, "asm") && S(sp, "asm")[0] != 0);
+        ck_str("asm decodes the P2WPKH program",
+               S(sp, "asm"), "0 751e76e8199196d454941c45d1b3a323f1433bd6");
+        ck("desc is no longer the empty string", S(sp, "desc") && S(sp, "desc")[0] != 0);
+        ck_str("type comes from the SCRIPT, not a wallet-address table",
+               S(sp, "type"), "witness_v0_keyhash");
+        ck_str("hex still round-trips the script",
+               S(sp, "hex"), "0014751e76e8199196d454941c45d1b3a323f1433bd6");
+
+        /* THE OPPOSITE HALF: an outpoint the query does not know is still null */
+        rj_free(g);
+        g = call("gettxout", "[\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\", 0]", &ec, &em);
+        ck("an unknown outpoint is still null", g && g->typ == RJ_NULL);
+        rj_free(g);
+        rpc_commands_set_txo_query(NULL);
+    }
 
     /* ---- uptime / stop ---- */
     r = call("uptime", "[]", &ec, &em); ck("uptime is a non-negative number", r && r->typ == RJ_NUM && atol(r->str) >= 0); rj_free(r);

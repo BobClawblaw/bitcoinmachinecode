@@ -33,6 +33,6 @@ except Exception: print("ERR")')
   want=$([ "$comp" = "1" ] && echo true || echo false)
   if [ "$got" = "$want" ]; then pass=$((pass+1)); echo "OK   $label -> Core complete=$got"; else fail=$((fail+1)); echo "FAIL $label -> Core: $got (ours: complete=$comp $err)"; fi
 done < $TMP/cases.txt
-$CLI stop >/dev/null 2>&1; wait $PID 2>/dev/null; rm -rf $TMP
+$CLI stop >/dev/null 2>&1; wait $PID 2>/dev/null; rm -rf "$TMP"   # BLD-9: quote it
 echo "RESULT: $pass ok, $fail fail"
 [ "$fail" = 0 ]

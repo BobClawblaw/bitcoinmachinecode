@@ -2372,15 +2372,34 @@ mac_flush:
     syscall
 
 .fl_finish_reset:
+    ; ---- UTX-8 (audit 2026-09-03): the WAL reset must SUCCEED ----
+    ; Both syscalls below had their results discarded and log_len was then set
+    ; to 0 regardless. On EIO the old generation stays in utxo.dat while new
+    ; records are written from offset 0 over it, and a later reload replays
+    ; the new records and then whatever stale bytes follow -- a misparse, or,
+    ; at an aligned boundary, stale PUSHes applied on top of newer DELs.
+    ;
+    ; A failure now returns -1 (a flush error) BEFORE log_len, the memtable
+    ; and the tomb hash are cleared, so the caller still holds the same state
+    ; it had before the flush and can retry or halt. Every fd opened above is
+    ; already closed on both paths into this label, so .fl_err leaks nothing.
+    ;
+    ; ftruncate returns 0 on success and lseek returns the new offset, which
+    ; is 0 here -- so a NEGATIVE result is the error in both cases, the same
+    ; sign test the rename above already uses.
     mov  rdi, [r12+0]
     xor  esi, esi
     mov  eax, 77                         ; ftruncate
     syscall
+    test rax, rax
+    js   .fl_err
     mov  rdi, [r12+0]
     xor  esi, esi
     xor  edx, edx
     mov  eax, 8                           ; lseek SEEK_SET 0
     syscall
+    test rax, rax
+    js   .fl_err
     mov  qword [r12+16], 0
     mov  rdi, r13
     call mac_clear_memtable
@@ -2502,7 +2521,17 @@ mac_lsm_reload_impl:
     mov  eax, 2
     syscall
     test rax, rax
-    jl   .rl_no_manifest
+    jns  .rl_manifest_open
+    ; ---- UTX-6 (audit 2026-09-03): only ENOENT means "no manifest" ----
+    ; A fresh store has no utxo_manifest.dat and must reload as WAL-only.
+    ; Any OTHER open error -- EACCES after a bad chown, EIO, EMFILE, ENOMEM
+    ; -- used to take the same path and report success with zero runs, which
+    ; is indistinguishable from a fresh store and is how a full run set gets
+    ; swept as orphans on the boot after next. Fail the reload instead.
+    cmp  rax, -2                    ; -ENOENT
+    je   .rl_no_manifest
+    jmp  .rl_fail
+.rl_manifest_open:
     mov  r14, rax
     lea  rsi, [rbp-0x80]
     mov  rdi, r14
@@ -2577,6 +2606,29 @@ mac_lsm_reload_impl:
     inc  qword [r12+144]
     jmp  .rl_manifest_done
 .rl_manifest_bad:
+    ; ---- UTX-6: a manifest that EXISTS but cannot be read is a HARD FAILURE.
+    ;
+    ; This label is reached from four places: a short read of the 12-byte
+    ; prefix, a bad magic, a manifest_n larger than the caller's manifest_cap,
+    ; and a short read of the entry array. All four used to zero manifest_n /
+    ; next_gen / next_run_no and fall through to .rl_manifest_done, so the
+    ; reload RETURNED SUCCESS -- the WAL replay count -- with the store
+    ; believing it has no runs at all.
+    ;
+    ; In the daemon that is not merely a wrong answer. utxo_live_init logs a
+    ; plausible line; boot's ghost rollback then issues puts and dels that can
+    ; cross fill_threshold and trigger mac_flush, which publishes a manifest
+    ; naming ONLY the new run. Every real run is now an orphan, and the next
+    ; boot's lsm_manifest_sweep_orphans -- which requires on-disk and
+    ; in-memory to agree, and now they do -- deletes them for real. In the
+    ; read-only tools (utxo_setinfo, scantxoutset, dumptxoutset,
+    ; utxo_dump_keys) it answers from the WAL tail alone and reports
+    ; "consistent: true".
+    ;
+    ; The over-capacity case is the most likely of the four in practice: the
+    ; daemon passes manifest_cap 256, tools pass 4096, and build_utxo/migrate
+    ; write up to 8192 entries. Reading such a manifest with the daemon's cap
+    ; is a configuration mismatch, not an empty store.
     mov  rdi, r14
     mov  eax, 3
     syscall

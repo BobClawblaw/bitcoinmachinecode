@@ -153,6 +153,26 @@ int main(void){
             bip152_shortid(sid, BLOCK_RAW, nonce, wtxid);
             ck("cmpctblock shortid[0] == bip152_shortid(wtxid(tx1))", memcmp(buf+89, sid, 6)==0);
             ck("cmpctblock has coinbase prefilled (nprefill=1)", buf[89+6*(BLOCK_NTX-1)]==1);
+
+            /* ---- NET-14 (audit 2026-09-03): the nonce must be FRESH ----
+             * s_cmpct_nonce was the constant 0x0123456789abcdef, drawn once
+             * and cached for the connection, so every compact block shared
+             * one SipHash key and an adversary could precompute colliding
+             * short ids. "nonzero" above cannot see that; asking for the SAME
+             * block twice and comparing can. */
+            unsigned long long nonce1 = *(unsigned long long*)(buf+80);
+            ck("NET-14 the nonce is not the old fixed constant",
+               nonce1 != 0x0123456789abcdefULL);
+            ck("write getdata cmpct (second time)", p2p_write(fd,"getdata",7,gd,37)>0);
+            unsigned bl2=0; char cmd2[12];
+            int r2=p2p_read(fd,cmd2,buf,sizeof buf,&bl2);
+            ck("recv second cmpctblock", r2>0 && !strncmp(cmd2,"cmpctblock",10));
+            if(r2>0 && !strncmp(cmd2,"cmpctblock",10)){
+                unsigned long long nonce2 = *(unsigned long long*)(buf+80);
+                ck("NET-14 a second cmpctblock uses a DIFFERENT nonce", nonce2 != nonce1);
+                if (nonce2 == nonce1)
+                    printf("        both were %016llx\n", nonce1);
+            }
         }
     }
 
