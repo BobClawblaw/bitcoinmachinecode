@@ -214,6 +214,43 @@ int main(void) {
         ck_str("RPC-11 0x7e (~) stays raw", b, "{\n  \"label\": \"a~b\"\n}");
     }
 
+    /* ---- RPC-7 (audit 2026-09-03): the parser was laxer than UniValue ----
+     * Bodies Core rejects with -32700 were dispatched here and produced
+     * method-level errors instead, so error-code fidelity diverged on exactly
+     * the inputs a client uses to detect malformed JSON.
+     *
+     * (a) a raw byte below 0x20 inside a string -- UniValue's getJsonToken
+     *     returns JTOK_ERR; this passed it straight through.
+     * (d) the number grammar: `-` alone passed (the sign consume alone made
+     *     p != start), and so did `01`, `1.` and `1e`.
+     *
+     * Every case is paired with its legal twin, so a parser that simply got
+     * stricter fails too: the ESCAPED control characters must still parse, and
+     * 0, -0, 1.0 and 1e5 are all valid JSON. */
+    {
+        { const char* j = "[\"a\x01" "b\"]";
+          ck("RPC-7 a raw control byte in a string is refused", rj_parse(j, strlen(j)) == NULL); }
+        { const char* j = "[\"a\x1f" "b\"]";
+          ck("RPC-7 a raw NUL-adjacent byte (0x1f) is refused", rj_parse(j, strlen(j)) == NULL); }
+        { const char* j = "[\"a\\nb\"]"; rj_val* v = rj_parse(j, strlen(j));
+          ck("RPC-7   ...but the ESCAPED form still parses", v != NULL);
+          rj_free(v); }
+        { const char* j = "[\"a\\u0009b\"]"; rj_val* v = rj_parse(j, strlen(j));
+          ck("RPC-7   ...and so does \\u0009", v != NULL);
+          rj_free(v); }
+
+        ck("RPC-7 a bare minus is not a number", rj_parse("[-]", 3) == NULL);
+        ck("RPC-7 a leading zero is refused (01)", rj_parse("[01]", 4) == NULL);
+        ck("RPC-7 a trailing decimal point is refused (1.)", rj_parse("[1.]", 4) == NULL);
+        ck("RPC-7 an empty exponent is refused (1e)", rj_parse("[1e]", 4) == NULL);
+        ck("RPC-7 an empty signed exponent is refused (1e+)", rj_parse("[1e+]", 5) == NULL);
+
+        { const char* j = "[0,-0,1.0,1e5,-1.5e-3,10]"; rj_val* v = rj_parse(j, strlen(j));
+          ck("RPC-7   ...but every legal number still parses",
+             v != NULL && v->typ == RJ_ARR && v->nitems == 6);
+          rj_free(v); }
+    }
+
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

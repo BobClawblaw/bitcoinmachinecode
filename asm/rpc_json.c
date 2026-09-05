@@ -311,9 +311,14 @@ static rj_val* p_string_core(pctx* c, char** out) {
                     }
                     if (c->err) break;
                     c->p += 4;
-                    /* Encode as UTF-8 (BMP only; surrogate pairs are a rare
-                     * escape that Core's parser handles, kept simple here but
-                     * validated below via re-parse in callers if needed). */
+                    /* Encode as UTF-8, BMP only. RPC-7 (audit 2026-09-03):
+                     * the previous note claimed surrogate pairs were
+                     * "validated below via re-parse in callers if needed" --
+                     * NO CALLER RE-PARSES, so that was simply false and is
+                     * removed rather than left to mislead. A surrogate half is
+                     * still encoded as-is (CESU-8) where UniValue combines a
+                     * pair into one 4-byte code point and rejects a lone half;
+                     * that remains open, and is the (b) part of RPC-7. */
                     char utf[4]; int ul = 0;
                     if (cp < 0x80) { utf[ul++] = (char)cp; }
                     else if (cp < 0x800) { utf[ul++] = (char)(0xC0 | (cp >> 6)); utf[ul++] = (char)(0x80 | (cp & 0x3F)); }
@@ -327,6 +332,13 @@ static rj_val* p_string_core(pctx* c, char** out) {
             c->p++;
             continue;
         }
+        /* RPC-7 (audit 2026-09-03): a raw byte below 0x20 is not legal inside a
+         * JSON string. UniValue's getJsonToken returns JTOK_ERR for it; this
+         * accepted it and passed it through, so a body Core rejects with
+         * -32700 was dispatched here and produced a method-level error
+         * instead. Note the ESCAPED forms are unaffected -- \n, \t and
+         * \u0009 are handled above; this is only the literal byte. */
+        if ((unsigned char)ch < 0x20) { c->err = 1; break; }
         sb_push(&s, &ch, 1);
         c->p++;
     }
@@ -344,15 +356,31 @@ static rj_val* p_string(pctx* c) {
     return v;
 }
 
+/* RPC-7 (audit 2026-09-03): the JSON number grammar, which this used to
+ * approximate. `-` alone passed (the sign consume alone made p != start), and
+ * so did `01`, `1.` and `1e` -- every one of which UniValue rejects. Each
+ * component now requires at least one digit, and a leading zero may not be
+ * followed by another digit (RFC 8259: int = zero / digit1-9 *DIGIT). */
 static rj_val* p_number(pctx* c) {
     const char* start = c->p;
     if (c->p < c->end && *c->p == '-') c->p++;
-    while (c->p < c->end && (*c->p >= '0' && *c->p <= '9')) c->p++;
-    if (c->p < c->end && *c->p == '.') { c->p++; while (c->p < c->end && (*c->p >= '0' && *c->p <= '9')) c->p++; }
+    /* integer part: at least one digit, and no leading zero followed by more */
+    { const char* ds = c->p;
+      while (c->p < c->end && (*c->p >= '0' && *c->p <= '9')) c->p++;
+      if (c->p == ds) { c->err = 1; return NULL; }
+      if (c->p - ds > 1 && ds[0] == '0') { c->err = 1; return NULL; } }
+    if (c->p < c->end && *c->p == '.') {
+        c->p++;
+        const char* fs = c->p;
+        while (c->p < c->end && (*c->p >= '0' && *c->p <= '9')) c->p++;
+        if (c->p == fs) { c->err = 1; return NULL; }        /* "1." */
+    }
     if (c->p < c->end && (*c->p == 'e' || *c->p == 'E')) {
         c->p++;
         if (c->p < c->end && (*c->p == '+' || *c->p == '-')) c->p++;
+        const char* es = c->p;
         while (c->p < c->end && (*c->p >= '0' && *c->p <= '9')) c->p++;
+        if (c->p == es) { c->err = 1; return NULL; }        /* "1e", "1e+" */
     }
     if (c->p == start) { c->err = 1; return NULL; }
     rj_val* v = rj_num(xstrndup(start, (size_t)(c->p - start)));
