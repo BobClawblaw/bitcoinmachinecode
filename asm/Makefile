@@ -26,8 +26,10 @@ CC         := gcc
 #                             family, which needs an optimizer, hence its
 #                             placement only on the -O2 rules below.
 # Appended to the hardcoded `-no-pie -O2` rules too, so the daemon, the tools
-# and the tests are all built the same way; the handful of -O0/-O1 harnesses
-# are left alone (FORTIFY warns without optimization).
+# and the tests are all built the same way. This clause used to except "the
+# handful of -O0/-O1 harnesses" (FORTIFY warns without optimization);
+# BLD-5 2026-09-05: there are none left -- `grep -P '^\t.*\s-O0(\s|$)'` on
+# this file matches nothing, so every rule is hardened.
 HARDEN_CC  := -fstack-protector-strong -D_FORTIFY_SOURCE=2
 # WARNFLAGS (audit 2026-09-02 N7, applied the same day after a 287-site
 # cleanup): every C compile in this tree is -Wall -Werror. A warning is a
@@ -377,6 +379,8 @@ tests/bench_point: tests/bench_point.c secp256k1_point.o secp256k1_glv_c.o secp2
 tests/bench_idxscan: tests/bench_idxscan.c bitcoin_idxscan.o bitcoin_store.o
 	$(CC) $(CFLAGS) -o $@ tests/bench_idxscan.c bitcoin_idxscan.o bitcoin_store.o
 
+# BLD-5 (2026-09-05): this rule is -O2 NOW -- the note below is history, not
+# current state, and read as current until the audit checked it.
 # This rule was pinned to -O0 with the note "-O2 miscompiles this harness
 # (fread called with a NULL buffer per gdb)". Re-tested 2026-08-23 against a
 # real 130,001-record index.dat: at -O2 it builds both tables, reports
@@ -448,7 +452,8 @@ tests/test_undo_asm_diff: tests/test_undo_asm_diff.c tests/undo_log_ref.o bitcoi
 # tests/test_reorg.c drives the REAL production modules (daemon/reorg.c,
 # daemon/utxo_live.c daemon/lsm_manifest.c daemon/block_witness.c, daemon/undo_log.c, daemon/locator_build.c and the real bitcoin_cmpct.o
 # mempool policy layer) against the real block store, the real LSM UTXO store
-# and a real loopback fake peer. Built at -O0 for the same reason
+# and a real loopback fake peer. (BLD-5 2026-09-05: -O2 now; the -O0 note
+# below describes why it USED to be pinned.) Formerly built at -O0 for the same reason
 # daemon/bitcoind is: the deep asm call chain (cons_verify -> tx_parse /
 # sha256d) is documented in this Makefile as misbehaving under aggressive C
 # optimisation, and this harness sits directly on top of it.
@@ -1018,7 +1023,7 @@ tests/test_bitcoind: tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS) bitco
 	$(CC) $(CFLAGS) -o $@ tests/test_bitcoind.c $(SERVETXVALSRCS) $(DAEMONOBJS) bitcoin_pow_rules.o
 
 # Full IBD client (node_sync): handshake + headers + getdata + validate + store.
-# Built at -O0: the deep asm hash call chain (node_sync -> cons_verify ->
+# BLD-5 (2026-09-05): -O2 now. Formerly -O0: the deep asm hash call chain (node_sync -> cons_verify ->
 # pow_check -> block_hash -> sha256d -> sha256_full) provably works at -O0, but
 # gcc -O2's main register/stack layout triggers a latent sha256_full deep-frame-
 # overlap crash in this specific networked harness. The asm is identical.
@@ -1026,7 +1031,7 @@ tests/test_bitcoind_sync: tests/test_bitcoind_sync.c $(SERVETXVALSRCS) $(DAEMONO
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_bitcoind_sync.c $(SERVETXVALSRCS) $(DAEMONOBJS) bitcoin_pow_rules.o
 
 # all-asm leveled logger (uses fd_write_all from bitcoin_net.asm)
-# Built at -O0: same gcc -O2 vs deep-asm-call-chain interaction as the sync
+# BLD-5 (2026-09-05): -O2 now. Formerly -O0: same gcc -O2 vs deep-asm-call-chain interaction as the sync
 # harness; the asm logger is identical and correct at -O0.
 LOGOBJS := node_log.o bitcoin_net.o bitcoin_hash.o sha256.o
 tests/test_log: tests/test_log.c $(LOGOBJS) $(TEST_TMPDIR_H)
@@ -1058,7 +1063,8 @@ tests/test_ibd_headers: tests/test_ibd_headers.c $(IBDOBJS) $(TEST_TMPDIR_H)
 
 # Block-body download off the persisted header chain (bitcoind.asm node_ibd_blocks).
 # node_ibd_blocks calls cons_verify/block_hash/store_append/hst_*; bitcoind.o pulls
-# the transitive cons/tx symbols too. Built at -O0 (deep-asm-call-chain convention).
+# the transitive cons/tx symbols too. (BLD-5 2026-09-05: -O2 now; formerly -O0,
+# by the deep-asm-call-chain convention.)
 tests/test_ibd_blocks: tests/test_ibd_blocks.c $(IBDOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_ibd_blocks.c $(IBDOBJS)
 
@@ -2845,9 +2851,11 @@ tests/test_abi_stack_align: tests/test_abi_stack_align.c $(ABIALIGNOBJS)
 # functions had it, always the same mistake: the callee-saved pushes came AFTER
 # `mov rbp,rsp`, so the save area sat at [rbp-0x08 ...] with the locals
 # underneath it, and a buffer addressed from the low end wrote up through it.
-# Nothing had failed in production only because every C file on that path is
-# pinned to -O0 below, and -O0 keeps nothing live in a callee-saved register
-# across a call. That is accidental protection; these two targets replace it.
+# Nothing had failed in production only because every C file on that path WAS
+# pinned to -O0 at the time, and -O0 keeps nothing live in a callee-saved
+# register across a call. That was accidental protection, and it is now gone:
+# the tree builds at -O2 throughout (BLD-5 2026-09-05). These two targets are
+# what stands in its place.
 #
 #   callee-saved-check  -- static, whole tree. abstract-interprets each
 #                          function's frame and fails on any register left

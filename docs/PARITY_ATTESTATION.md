@@ -11,6 +11,13 @@ latest ones (audit 2026-09-02, recommendation 8: publish the height).
 | Date (UTC) | Height | Coins | muhash (prefix) | Occasion |
 |---|---|---|---|---|
 | 2026-09-02 07:04 | 965,135 | 165,632,732 | `4025abd64e518e80` | deploy ak (audit N3/N7) |
+
+> BLD-5 (2026-09-05): THIS TABLE IS BEHIND THE NODE. The last attestation is
+> 2026-09-02 at height 965,135; the node has since run past 965,500 across
+> several deploys with no row added. The procedure above says an attestation
+> follows every deploy -- that has not been happening, and the gap is recorded
+> here rather than left for the next reader to infer from dates.
+
 | 2026-09-02 06:41 | 965,134 | 165,633,295 | (exact, not recorded) | restart under the N5 sandbox |
 | 2026-09-02 05:51 | 965,125 | 165,663,594 | `4358215250dc1fc1` | private broadcast enabled |
 | 2026-09-02 05:45 | 965,124 | 165,662,711 | `aeed9ba506ff14a2` | deploy aj (private broadcast, wallet_store v3) |
