@@ -7113,6 +7113,29 @@ int main(int argc, char** argv){
         fprintf(stderr,"usage: %s [-datadir=<dir>] [-conf=<file>] sync <dir> | ibd <dir> | follow <dir> | serve <dir> <port> | server-test <dir>\n", argv[0]);
         return 2; }
     const char* mode = argv[1];
+    /* ---- DMN-10 (audit 2026-09-03): validate the MODE before doing work ----
+     * `bitcoind -datadir=/x serve` is documented as equivalent to the
+     * positional form, and it is not: stripping the flag leaves argc == 2, the
+     * usage check below passes on flag_datadir, and the serve branch far below
+     * is gated on argc >= 3 -- so the process resolved the datadir, chdir'd,
+     * loaded the config, trimmed derived tails, opened the store and
+     * self-seeded genesis, and only THEN fell off the end and returned 2 with
+     * no message. An unknown mode did the same.
+     *
+     * Checking the mode here costs nothing and turns both into an immediate,
+     * explained exit. The serve branch's own argc gate is widened to accept
+     * the flag form separately; everything it reads past argv[2] is already
+     * guarded by its own argc checks. */
+    { static const char* const MODES[] = {
+          "sync", "ibd", "follow", "serve", "server-test", "serve-test" };
+      int known = 0;
+      for (unsigned mi = 0; mi < sizeof MODES / sizeof MODES[0]; mi++)
+          if (!strcmp(mode, MODES[mi])){ known = 1; break; }
+      if (!known){
+          fprintf(stderr, "%s: unknown mode \"%s\"\n", argv[0], mode);
+          fprintf(stderr,"usage: %s [-datadir=<dir>] [-conf=<file>] sync <dir> | ibd <dir> | follow <dir> | serve <dir> <port> | server-test <dir>\n", argv[0]);
+          return 2;
+      } }
     const char* dir = flag_datadir ? flag_datadir : argv[2];
     /* Resolve <dir> to an ABSOLUTE path before chdir so the store opens in the
      * right directory regardless of the caller's cwd (soak analysis found a
@@ -7601,7 +7624,11 @@ int main(int argc, char** argv){
         return failures?1:0;
     }
 
-    if(strcmp(mode,"serve")==0 && argc>=3){
+    /* DMN-10: `-datadir=<dir> serve` leaves argc == 2, so the flag form has to
+     * be accepted here too. The port and worker counts below already default
+     * from g_cfg / argc, and every argv[3..] read is guarded by its own argc
+     * check, so nothing downstream needs argc >= 3. */
+    if(strcmp(mode,"serve")==0 && (argc>=3 || flag_datadir)){
         /* Port precedence: CLI arg > bitcoin.conf `port` > Core default 8333.
          * The CLI arg is now OPTIONAL so the config file can genuinely own
          * the node's network identity -- previously it was required, so the

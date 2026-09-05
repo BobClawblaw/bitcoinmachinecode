@@ -487,9 +487,9 @@ names); if you run the project's own binaries, invoke them directly (see 3.1)
 instead of relying on these:
 
 ```
-scripts/start.sh        # start daemon (-daemon -conf -datadir)
-scripts/status.sh       # pgrep + bitcoin-cli getblockchaininfo
-scripts/stop.sh         # bitcoin-cli stop || killall bitcoind
+scripts/start.sh        # systemctl start bmc-bitcoind, else `bitcoind -datadir=<d> serve`
+scripts/status.sh       # systemctl status + bitcoin_cli getblockchaininfo
+scripts/stop.sh         # systemctl stop bmc-bitcoind, else `bitcoin_cli stop`
 scripts/worklog.sh [YYYY-MM-DD]   # open (create+seed) today's daily worklog
 ```
 
