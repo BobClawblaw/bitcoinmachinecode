@@ -893,10 +893,74 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
  * and anchors the coinbase-maturity check. The block-hash argument to
  * script_flags_for_block exists only for Core's one historical taproot
  * exception block, which no future height can be -- zeros are correct. */
+/* SCR-9 (audit 2026-09-03): Core verifies a MEMPOOL candidate under
+ * STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h), not under the consensus set
+ * a block gets. This path passed consensus flags only, so the node accepted
+ * -- and RELAYED -- transactions Core calls non-standard.
+ *
+ * WHAT IS SET HERE, AND WHY IT IS NOT THE WHOLE STANDARD MASK.
+ *
+ * Core's STANDARD = MANDATORY | STRICTENC | MINIMALDATA |
+ * DISCOURAGE_UPGRADABLE_NOPS | CLEANSTACK | MINIMALIF | NULLFAIL | LOW_S |
+ * DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM | WITNESS_PUBKEYTYPE |
+ * CONST_SCRIPTCODE | DISCOURAGE_UPGRADABLE_TAPROOT_VERSION |
+ * DISCOURAGE_OP_SUCCESS | DISCOURAGE_UPGRADABLE_PUBKEYTYPE.
+ *
+ * Only the bits this tree's interpreter actually READS are set below. Setting
+ * a bit nothing tests would make the code claim a parity it does not have,
+ * which is the failure mode this audit round kept finding in the DOCS; there
+ * is no reason to import it into the source. Each bit here was traced to the
+ * instruction that tests it:
+ *
+ *   STRICTENC      (1)  bitcoin_interp.asm:2768, 2801
+ *   LOW_S          (3)  bitcoin_interp.asm:2731, 2744
+ *   MINIMALDATA    (6)  bitcoin_interp.asm:192 (SNUM_MAX), 561
+ *   CLEANSTACK     (8)  bitcoin_scriptverify.c:389
+ *   MINIMALIF     (13)  bitcoin_interp.asm:809
+ *   NULLFAIL      (14)  bitcoin_interp.asm:2089, 3414
+ *   CONST_SCRIPTCODE (16) bitcoin_scriptverify.c:121, 186-193
+ *   DISCOURAGE_OP_SUCCESS (19) bitcoin_interp.asm:457
+ *
+ * DELIBERATELY ABSENT:
+ *
+ *   DISCOURAGE_UPGRADABLE_NOPS (7) -- NOT an oversight. bitcoin_interp.asm:736
+ *     documents that NOP1/NOP4..NOP10 must stay no-ops: real, historically
+ *     mined mainnet transactions use OP_NOP1 in consensus-valid scripts, and
+ *     treating the range as bad opcodes rejects them. The interpreter is
+ *     shared with the block path, so there is no arm to switch on here.
+ *   DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM (12), WITNESS_PUBKEYTYPE (15),
+ *   DISCOURAGE_UPGRADABLE_TAPROOT_VERSION (18),
+ *   DISCOURAGE_UPGRADABLE_PUBKEYTYPE (20) -- no interpreter arm exists. These
+ *     are the "unknown witness versions" and "uncompressed keys in segwit"
+ *     cases SCR-9 names, and they stay open; see docs/FEATURE_GAPS.md.
+ *
+ * CLEANSTACK is safe to set unconditionally here because Core's own note
+ * ("should never be used without P2SH or WITNESS") is satisfied: P2SH has
+ * been in the consensus set since height 173,805 and every mempool candidate
+ * is verified at tip+1.
+ */
+#define TXV_MEMPOOL_POLICY_FLAGS ( (1ULL<<1)  /* STRICTENC        */ \
+                                 | (1ULL<<3)  /* LOW_S            */ \
+                                 | (1ULL<<6)  /* MINIMALDATA      */ \
+                                 | (1ULL<<8)  /* CLEANSTACK       */ \
+                                 | (1ULL<<13) /* MINIMALIF        */ \
+                                 | (1ULL<<14) /* NULLFAIL         */ \
+                                 | (1ULL<<16) /* CONST_SCRIPTCODE */ \
+                                 | (1ULL<<19) /* DISCOURAGE_OP_SUCCESS */ )
+
+/* Core's -acceptnonstdtxn drops back to the consensus set (its require_standard
+ * is false). Injectable rather than read from g_cfg here so this translation
+ * unit stays free of the daemon config -- daemon/tx_accept.c calls the setter
+ * beside the mpool_policy_set_acceptnonstd it already makes. */
+static int g_txv_mempool_standard = 1;
+void txv_set_mempool_standard(int on){ g_txv_mempool_standard = on ? 1 : 0; }
+int  txv_get_mempool_standard(void){ return g_txv_mempool_standard; }
+
 int tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
                       txv_resolve_fn rf, void* rctx, const char** reason){
     static const u8 zero32[32];
     unsigned long long flags = script_flags_for_block((unsigned long long)next_height, zero32);
+    if (g_txv_mempool_standard) flags |= TXV_MEMPOOL_POLICY_FLAGS;
     return txv_connect_body(tx, txlen, next_height, flags, rf, rctx, reason);
 }
 

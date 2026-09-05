@@ -451,12 +451,15 @@ int main(void){
       ck_str("getblock v1 strippedsize", S(r,"strippedsize"), "285");
       ck_str("getblock v1 size", S(r,"size"), "285");
       ck_str("getblock v1 weight", S(r,"weight"), "1140");
-      rj_val* cb = G(r,"coinbase_tx");
-      ck_str("coinbase_tx.version", S(cb,"version"), "1");
-      ck_str("coinbase_tx.locktime", S(cb,"locktime"), "0");
-      ck_str("coinbase_tx.sequence", S(cb,"sequence"), "4294967295");
-      ck_str("coinbase_tx.coinbase", S(cb,"coinbase"), "04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73");
-      ck("coinbase_tx has no witness (legacy)", G(cb,"witness") == NULL);
+      /* RPX-7: these five assertions used to check a `coinbase_tx` OBJECT on
+       * the getblock result. Core's blockToJSON has no such field -- it was
+       * an additive divergence, undocumented, and pinned HERE as if it were
+       * canonical, which is why it survived. The field is gone; what is
+       * asserted now is its ABSENCE, which is the actual parity claim. The
+       * coinbase's contents are still checked, from inside the `tx` array
+       * where Core puts them (verbosity 2, below). */
+      ck("RPX-7: getblock does NOT emit a non-Core coinbase_tx field",
+         G(r,"coinbase_tx") == NULL);
       rj_val* tx = G(r,"tx");
       ck("getblock v1 tx is array of 1", tx && tx->typ == RJ_ARR && tx->nitems == 1);
       ck_str("getblock v1 tx[0] == genesis coinbase txid", tx && tx->nitems ? tx->items[0]->str : NULL, GENESIS_MERKLE);
@@ -489,8 +492,12 @@ int main(void){
       snprintf(want, sizeof want, "%zu", g_blk3_len); ck_str("blk3 size", S(r,"size"), want);
       snprintf(want, sizeof want, "%zu", g_blk3_stripped); ck_str("blk3 strippedsize", S(r,"strippedsize"), want);
       snprintf(want, sizeof want, "%zu", g_blk3_stripped*3 + g_blk3_len); ck_str("blk3 weight", S(r,"weight"), want);
-      rj_val* cb = G(r,"coinbase_tx");
-      ck_str("blk3 coinbase_tx.witness (reserved value)", S(cb,"witness"), "0000000000000000000000000000000000000000000000000000000000000000");
+      /* RPX-7: was `blk3 coinbase_tx.witness`. The witness reserved value is
+       * still asserted -- from `tx[0].vin[0].txinwitness` at verbosity 2,
+       * which is where CORE exposes it, instead of from the non-Core
+       * coinbase_tx object that used to carry it here. */
+      ck("RPX-7: blk3 getblock has no coinbase_tx field either",
+         G(r,"coinbase_tx") == NULL);
       rj_val* tx = G(r,"tx");
       ck("blk3 v1 has 3 txids", tx && tx->nitems == 3);
       ck_str("blk3 v1 tx[0] == segwit coinbase txid (independent sha256d of stripped)", tx && tx->nitems ? tx->items[0]->str : NULL, g_cb_txid[3]);
@@ -515,6 +522,17 @@ int main(void){
       rj_val* t1 = tx && tx->nitems > 1 ? tx->items[1] : NULL;
       rj_val* t2 = tx && tx->nitems > 2 ? tx->items[2] : NULL;
       ck("v2 coinbase tx[0] has no fee (Core parity)", tx && tx->nitems ? G(tx->items[0],"fee") == NULL : 0);
+      /* RPX-7: the segwit coinbase's witness reserved value, asserted where
+       * CORE exposes it -- tx[0].vin[0].txinwitness -- now that the non-Core
+       * `coinbase_tx` object that used to carry it is gone. Same bytes, same
+       * proof that the coinbase witness parses, Core's field. */
+      { rj_val* cbv = tx && tx->nitems ? G(tx->items[0],"vin") : NULL;
+        rj_val* cbi = cbv && cbv->nitems ? cbv->items[0] : NULL;
+        rj_val* cbw = cbi ? G(cbi,"txinwitness") : NULL;
+        ck("v2 coinbase txinwitness has 1 item", cbw && cbw->typ == RJ_ARR && cbw->nitems == 1);
+        ck_str("v2 coinbase txinwitness[0] == the 32-byte reserved value",
+               cbw && cbw->nitems ? cbw->items[0]->str : NULL,
+               "0000000000000000000000000000000000000000000000000000000000000000"); }
       ck_str("v2 tx[1].fee (0.01 from undo)", S(t1,"fee"), "0.01000000");
       ck_str("v2 tx[2].fee (49.98999 from undo)", S(t2,"fee"), "49.98999000");
       ck_str("v2 tx[1].txid == v1 txid", S(t1,"txid"), g_tx1_txid);
