@@ -2751,32 +2751,109 @@ static unsigned pool_ipv4(const char* entry, int* port){
 #define DL_GOODPEERS_FILE "peers.good"
 #define DL_GOODPEERS_MAX  256
 
-static int dl_load_good_peers(char out[][DL_POOL_SLOT], int cap){
+/* EMA speed file format (PEER_PLAN item 4): "ip\t<ema_kbps>" -- int kilobits
+ * per second, rounded (0 allowed, meaning "we knew this peer but never saw
+ * it pull weight"). ema_kbps/1000.0 == bytes/s exactly. dl_load_good_peers
+ * ALSO accepts the legacy bare-ip form (old files stay valid, no header
+ * change); ema_out[i] is then 0 for those entries, which downstream means
+ * "no speed knowledge -- plain rotation", i.e. exactly today's behaviour. */
+static int dl_load_good_peers_ema(char (*out)[DL_POOL_SLOT], double* ema_out, int cap){
     FILE* f = fopen(DL_GOODPEERS_FILE, "r");
     if(!f) return 0;
-    int n=0; char line[128];
+    int n=0; char line[256];
     while(n<cap && fgets(line,sizeof line,f)){
         size_t L=strlen(line);
         while(L && (line[L-1]=='\n'||line[L-1]=='\r')) line[--L]=0;
         if(!L) continue;
+        char* tab = strchr(line,'\t');
+        double ema = 0.0;
+        if(tab){
+            *tab = 0;
+            char* end = NULL;
+            double v = strtod(tab+1, &end);        /* kilobits/s on this line */
+            if(!end || end==tab+1 || v<0.0) v = 0.0;
+            ema = v/1000.0;                        /* -> bytes/s */
+        }
         struct in_addr t;
-        if(inet_pton(AF_INET,line,&t)!=1) continue;   /* ignore junk lines */
-        snprintf(out[n],sizeof out[n],"%s",line); n++;
+        if(inet_pton(AF_INET,line,&t)!=1) continue;   /* ignore junk lines (ip:port is not a bare IPv4 -- same rule as the pre-EMA loader: the pool keeps the entry string, the dial paths parse the port themselves via dlc_parse_peer) */
+        snprintf(out[n],sizeof out[n],"%s",line);
+        if(ema_out) ema_out[n]=ema;
+        n++;
     }
     fclose(f);
     return n;
 }
-
 /* Written atomically (tmp+rename) so a crash mid-write cannot leave a
- * truncated list that silently shrinks the next boot's head start. */
-static void dl_save_good_peers(char peers[][DL_POOL_SLOT], int n){   /* stride must match the caller's good[][] (was [][64]: read the wrong entries -- 2026-09-02) */
+ * truncated list that silently shrinks the next boot's head start.
+ *
+ * IMPORTANT: log_ts.h (included at the top of this file) #defines `fprintf`
+ * into its stderr-timestamping wrapper for the whole TU, and that wrapper is
+ * stream-agnostic -- `fprintf(f,...)` on a DATA file gets a wall-clock
+ * prefix stamped onto every line. peers.good is data, not a log: a prefixed
+ * line fails inet_pton on load, so the entire list silently stops loading
+ * (this is why the write path below builds each line with snprintf into a
+ * buffer and uses fputs -- plain fprintf(f,...) here wrote
+ * "2026-09-04 14:47:38.341 6.6.6.6\\t..." and every boot lost its memory). */
+static void dl_save_good_peers_ema(char (*peers)[DL_POOL_SLOT], const double* ema_bps, int n){   /* stride must match the caller's good[][] (was [][64]: read the wrong entries -- 2026-09-02) */
     if(n<=0) return;
     FILE* f = fopen(DL_GOODPEERS_FILE ".tmp","w");
     if(!f) return;
-    for(int i=0;i<n && i<DL_GOODPEERS_MAX;i++) fprintf(f,"%s\n",peers[i]);
+/* NOTE: log_ts.h (included above) #defines fprintf -> its stderr-timestamping
+ * wrapper for the rest of this TU. A data file is not a log: use fputs with
+ * an explicit buffer so peers.good lines never grow a timestamp prefix (a
+ * prefixed line silently fails inet_pton and the whole file loads as empty).
+ * It is also -Werror=format-nonliteral safe, unlike an fprintf(f,fmt) pass-
+ * through. */
+#define DL_GOOD_LINE 256
+    for(int i=0;i<n && i<DL_GOODPEERS_MAX;i++){
+        char ln[DL_GOOD_LINE];
+        /* Load side divides by 1000 to recover bytes/s (dl_load_good_peers_ema),
+         * so the stored integer is bytes/s * 1000 -- the label "kbps" in
+         * PEER_PLAN means the value at that scale, not bits. Rounding, 0
+         * allowed (written as a bare ip). Built via snprintf+fputs because
+         * log_ts.h redefines fprintf TU-wide as a stderr timestamping
+         * wrapper: a formatted write to this FILE* would prefix every line
+         * with a timestamp and silently poison next boot's parse. */
+        double bps = (ema_bps && ema_bps[i] > 0.0) ? ema_bps[i] : 0.0;
+        long kbits = (bps > 0.0) ? (long)(bps*1000.0 + 0.5) : 0;
+        if(kbits>0) snprintf(ln,sizeof ln,"%.*s\t%ld\n",DL_POOL_SLOT-32,peers[i],kbits);
+        else       snprintf(ln,sizeof ln,"%.*s\n",DL_POOL_SLOT-1,peers[i]);
+        fputs(ln,f);
+    }
     fflush(f); fsync(fileno(f)); fclose(f);
     rename(DL_GOODPEERS_FILE ".tmp", DL_GOODPEERS_FILE);
     fprintf(stderr,"[dlc] recorded %d known-good peer(s) for next boot\n", n<DL_GOODPEERS_MAX?n:DL_GOODPEERS_MAX);
+}
+
+/* Claim-order chooser (PEER_PLAN item 4): "the fastest peer nobody holds".
+ * One linear scan over live[] (nlive<=2048) picks the HIGHEST-EMA
+ * unclaimed/unbanned peer; ties broken by lowest index so the choice is
+ * deterministic. When no ema is given -- or every candidate's ema is 0, the
+ * fresh-sync case where the parent's 10s tick has never populated anything
+ * -- this falls back to EXACTLY the old (slot+a)%nlive rotation, so a run
+ * with no speed knowledge behaves as today. The caller's loop runs this per
+ * attempt and keeps doing CAS claims, so a lost race simply re-asks and the
+ * now-claimed top peer drops out of the scan. */
+static int dlc_pick_peer(int nlive, int slot, const volatile double* ema,
+                         const volatile int* claimed, const volatile int* banned){
+    if(ema){
+        int best=-1; double bv=0.0;
+        for(int a=0;a<nlive;a++){
+            int idx=(slot+a)%nlive;
+            if(banned[idx]||claimed[idx]) continue;
+            double v=ema[idx];
+            if(v>bv){ bv=v; best=idx; }
+        }
+        if(best>=0) return best;                    /* someone has speed history */
+    }
+    for(int a=0;a<nlive;a++){                       /* rotation, identical to the pre-EMA loop:
+                                                     * banned and claimed both skip */
+        int idx=(slot+a)%nlive;
+        if(banned[idx]) continue;                   /* already proved itself useless this run */
+        if(claimed[idx]) continue;
+        return idx;
+    }
+    return -1;                                      /* exhausted */
 }
 
 /* The dial pool, sampled ACROSS NETWORKS. The book is appended in the order
@@ -3428,7 +3505,7 @@ static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
 static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                       int slot0, volatile long* next_claim, volatile long* done_count,
                       volatile dlc_stat_t* mystat, volatile int* claimed,
-                      volatile int* banned){
+                      volatile int* banned, volatile double* ema){
     /* SIGUSR1 registered for this worker's WHOLE lifetime, not just around
      * the node_ibd_blocks_s call below -- the parent can send it any time
      * it spots sustained near-zero bandwidth, which won't always land while
@@ -3498,9 +3575,14 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
         for(;;){
             if(fd<0){
                 int ok=0;
-                for(int a=0;a<nlive && !ok;a++){
-                    int idx=(slot+a)%nlive;
-                    if(banned[idx]) continue;   /* already proved itself useless this run */
+                /* ONE linear scan per attempt (dlc_pick_peer): the
+                 * highest-EMA unclaimed/unbanned peer when the parent has
+                 * speed knowledge, else exactly the old (slot+a)%nlive
+                 * rotation. Losing a CAS race simply re-asks -- the peer the
+                 * other worker won is now claimed and drops out of the scan. */
+                for(int q=0;q<nlive && !ok;q++){
+                    int idx=dlc_pick_peer(nlive, slot, ema, claimed, banned);
+                    if(idx<0) break;
                     const char* cand=live[idx];
                     int cp2=0; unsigned ip=0; if(!dlc_parse_peer(cand, &ip, &cp2)) continue;
                     /* claim this peer for exclusive use FIRST -- a real peer
@@ -3771,6 +3853,8 @@ static long dl_catchup(const char* dir, int min_workers){
     fprintf(stderr,"[dlc] discovered +%ld peers (book now %ld)\n", disc, (long)ab2_count(ab));
 
     static char pool[DLC_MAXPOOL][DL_POOL_SLOT];
+    static double good_ema[DLC_MAXPOOL];
+    for(int i=0;i<DLC_MAXPOOL;i++) good_ema[i]=0.0;
     int npool = 0, ngood = 0, nadd = 0;
     if(g_cfg.connect_only){
         /* Core -connect: the pool IS the configured list. Nothing from the
@@ -3794,7 +3878,7 @@ static long dl_catchup(const char* dir, int min_workers){
             if(!dl_resolve1(g_cfg.addnode[i], ipd)) continue;
             snprintf(pool[npool],sizeof pool[npool],"%s",ipd); npool++; nadd++;
         }
-        ngood = dl_load_good_peers(pool+npool, DLC_MAXPOOL-npool);
+        ngood = dl_load_good_peers_ema(pool+npool, good_ema+npool, DLC_MAXPOOL-npool);
         npool += ngood;
         {
             static char book[DLC_MAXPOOL][DL_POOL_SLOT];
@@ -3902,7 +3986,31 @@ static long dl_catchup(const char* dir, int min_workers){
      * for trickling at 5KB/s could immediately be handed the same IP again,
      * and with most of the pool being duds that is what kept happening. */
     volatile int* banned=mmap(NULL,sizeof(int)*(size_t)nlive,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
-    if(next_claim==MAP_FAILED || done_count==MAP_FAILED || stats==MAP_FAILED || claimed==MAP_FAILED || banned==MAP_FAILED){ fprintf(stderr,"[dlc] mmap failed: %s\n", strerror(errno)); return 0; }
+    /* Per-peer EMA of measured bytes/s (PEER_PLAN item 4). The parent's 10s
+     * status tick already samples every worker's /proc io for the live
+     * display and threw the number away; this is where it accumulates
+     * (alpha 0.5, half-life ~20s). dlc_worker reads it to claim the FASTEST
+     * free peer instead of the next slot in rotation. MAP_SHARED so all
+     * forked workers see the parent's writes; MAP_ANONYMOUS zero-init means
+     * "no speed knowledge yet" == today's rotation. */
+    volatile double* ema=mmap(NULL,sizeof(double)*(size_t)nlive,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    if(next_claim==MAP_FAILED || done_count==MAP_FAILED || stats==MAP_FAILED || claimed==MAP_FAILED || banned==MAP_FAILED || ema==MAP_FAILED){ fprintf(stderr,"[dlc] mmap failed: %s\n", strerror(errno)); return 0; }
+    /* seed the EMA from the previous run's recorded speeds (peers.good
+     * "ip\tema_kbps"): run N+1 starts with run N's knowledge. live[] keeps
+     * pool[] ORDER (dlc_probe_round appends from `pool` in sequence -- a
+     * dedup here would misalign the indexes), so the first `ngood` pool
+     * entries after the addnode block are exactly the loaded ones; every
+     * other live entry stays 0 == rotation until measured. */
+    if(ngood>0){
+        int seed=0;
+        for(int i=0;i<nlive;i++){
+            for(int j=0;j<ngood;j++){
+                int k = nadd + j; if(k>=npool) continue;
+                if(!strcmp(live[i],pool[k])){ ema[i]=good_ema[j]; seed++; break; }
+            }
+        }
+        if(seed) fprintf(stderr,"[dlc] seeded EMA speed for %d of %d live peer(s) from the previous run\n", seed, nlive);
+    }
     /* MAP_ANONYMOUS zero-fills, so held_idx would default to 0 -- and a
      * worker that never managed to connect would then make the parent ban
      * live[0], a peer that may be perfectly good. Mark "holding nothing"
@@ -3917,7 +4025,7 @@ static long dl_catchup(const char* dir, int min_workers){
     pid_t kids[64]; pid_t opid[64];
     for(int w=0;w<nw;w++){
         pid_t p=fork();
-        if(p==0){ _exit(dlc_worker(w, end_h, live, nlive, w, next_claim, done_count, &stats[w], claimed, banned)); }
+        if(p==0){ _exit(dlc_worker(w, end_h, live, nlive, w, next_claim, done_count, &stats[w], claimed, banned, ema)); }
         kids[w]=p; opid[w]=p;
     }
     /* live peer-stats table: poll every 10s instead of blocking silently on
@@ -3974,6 +4082,14 @@ static long dl_catchup(const char* dir, int min_workers){
                     byte_rate=delta/10.0;
                     dlc_fmt_rate(bw,sizeof bw,byte_rate);
                     stats[w].last_bw_bps=byte_rate; /* worker reads this to report why it got dropped */
+                    /* EMA speed for the peer this worker HOLDS (alpha 0.5,
+                     * half-life ~20s). held_idx is the same index the ban
+                     * path uses; -1 means the worker never connected, and a
+                     * first sample (prev_rchar==0) is skipped -- delta from 0
+                     * would be the whole lifetime, not a 10s rate. */
+                    long hi=stats[w].held_idx;
+                    if(hi>=0 && hi<nlive && prev_rchar[w]>0)
+                        ema[hi] = 0.5*ema[hi] + 0.5*byte_rate;
                 }
                 prev_rchar[w]=rc;
             }
@@ -4010,6 +4126,12 @@ static long dl_catchup(const char* dir, int min_workers){
                             else why = "floor";
                         }
                         kill(opid[w],SIGUSR1);
+                        /* The kill itself means this peer failed the speed
+                         * test, banned or not (manual/floor keeps it
+                         * selectable). Decay its EMA hard -- *0.25 -- so a
+                         * re-scan (amnesty included, or next run via the
+                         * persisted file) sees it degraded, not still fast. */
+                        if(bidx>=0 && bidx<nlive) ema[bidx] = ema[bidx]*0.25;
                         dead_ticks[w]=0;
                         snprintf(flag,sizeof flag," [early-kill, last %s, peer %s]",bw,why);
                     }
@@ -4067,6 +4189,11 @@ static long dl_catchup(const char* dir, int min_workers){
      * stats, and only for peers with blocks>0 -- being reachable is not the
      * same as being useful.
      *
+     * The worker's held_idx is live[]'s index; EMA is indexed the same way,
+     * and live[i]==pool[k] via the probe's own k order (see the comment at
+     * the probe loop), so the speed figure travels back out with the peer
+     * into peers.good as "ip\tema_kbps" -- run N+1 seeds its EMA from it.
+     *
      * BUG FIX (2026-08-19): this block used to run AFTER the munmap(stats)
      * below, reading stats[w] through an already-unmapped pointer -- a real
      * use-after-unmap. Confirmed against a real production SIGSEGV: dmesg's
@@ -4075,20 +4202,46 @@ static long dl_catchup(const char* dir, int min_workers){
      * crash reading unmapped memory right after the loop exits looks like.
      * Must run BEFORE stats (and friends) are unmapped. */
     {
-        static char good[64][DL_POOL_SLOT]; int ngood=0;
-        for(int w=0; w<nw && ngood<64; w++){
-            if(stats[w].blocks<=0) continue;
-            const char* ip=(const char*)stats[w].peer;
-            if(!ip[0]) continue;
-            int dup=0; for(int j=0;j<ngood;j++) if(!strcmp(good[j],ip)){ dup=1; break; }
-            if(dup) continue;
-            strncpy(good[ngood],ip,63); good[ngood][63]=0; ngood++;
+        /* Persist the good list (pool[nadd..nadd+ngood), the entries loaded
+         * from last run's peers.good) that survived the liveness probe, each
+         * with its measured EMA.
+         *
+         * The deliverer criterion (some worker holds this peer and delivered
+         * blocks>0, i.e. the old stats[w].peer rule) is only SOUND when there
+         * is exactly one pool entry per live IP: claimed[] guarantees a worker
+         * never shares a peer, but a bare-ip pool entry and the same ip:port
+         * from the book are TWO live slots, and a worker could hold A while
+         * the credit landed on entry B. So the EMA attached to a good peer is
+         * taken from EVERY live slot with the same IP, worst case: if the
+         * worker holding that IP was rotated off it (held_idx moved on), the
+         * seed value from last run is re-emitted instead of a made-up number.
+         * (An IP-based match is right wherever a slot matches: a banned slot
+         * can never be a worker's held slot, and the same IP elsewhere in
+         * live[] is either the same peer under a second port or dead.) */
+        static char good[64][DL_POOL_SLOT]; static double good_e[64]; int ng=0;
+        for(int j=0;j<ngood && ng<64;j++){
+            const char* gi=pool[nadd+j];
+            int ip4=0; unsigned gip=pool_ipv4(gi,&ip4);
+            if(!gip) continue;                          /* not a dialable IPv4 -- cannot track EMA */
+            long bi=-1; int held_delivered=0;
+            for(int i=0;i<nlive;i++){
+                int p2=0; unsigned ip=0;
+                if(!dlc_parse_peer(live[i],&ip,&p2) || ip!=gip) continue;
+                if(bi<0) bi=i;
+                for(int w=0; w<nw; w++)
+                    if(stats[w].held_idx==i && stats[w].blocks>0){ held_delivered=1; break; }
+            }
+            if(bi<0) continue;                          /* did not survive the probe: not live this run */
+            good_e[ng] = held_delivered ? ema[bi] : good_ema[nadd+j];  /* fresh reading, else carry last run's seed */
+            strncpy(good[ng],gi,63); good[ng][63]=0; ng++;
         }
-        dl_save_good_peers(good, ngood);
+        dl_save_good_peers_ema(good, good_e, ng);
     }
     munmap((void*)next_claim,sizeof(long)); munmap((void*)done_count,sizeof(long));
     munmap((void*)stats,sizeof(dlc_stat_t)*(size_t)nw);
     munmap((void*)claimed,sizeof(int)*(size_t)nlive);
+    munmap((void*)banned,sizeof(int)*(size_t)nlive);
+    munmap((void*)ema,sizeof(double)*(size_t)nlive);
     fprintf(stderr,"[dlc] catch-up done: %ld new blocks written\n", total);
     return total;
 }

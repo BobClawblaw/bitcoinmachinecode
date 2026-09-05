@@ -231,6 +231,74 @@ int main(void){
       #undef HFETCH
       if (cwd1[0]) (void)!chdir(cwd1); }
 
+    printf("== 7. EMA speed-ranked claim order + peers.good speed file ==\n");
+    { /* dlc_pick_peer is the whole claim-order decision; the CAS loop around
+       * it is unchanged, so the corners here are: fastest-first, claimed/
+       * banned skipped, and the fresh-sync fallback to plain rotation. */
+      volatile int cl[4] = {0,0,0,0}, bn[4] = {0,0,0,0};
+      volatile double em[4] = {10.0, 5.0, 9.0, 0.0};
+      ok(dlc_pick_peer(4, 0, em, cl, bn) == 0, "ema [10,5,9,0]: picks the fastest peer (0)");
+      cl[0] = 1;
+      ok(dlc_pick_peer(4, 0, em, cl, bn) == 2, "...then the second fastest once 0 is claimed (2)");
+      bn[2] = 1; bn[3] = 1;
+      ok(dlc_pick_peer(4, 0, em, cl, bn) == 1, "claimed/banned slots are skipped even when the fallback runs: takes the only free one (1)");
+      bn[1] = 1;
+      ok(dlc_pick_peer(4, 0, em, cl, bn) == -1, "claimed+banned leaves nothing: exhausted");
+      cl[0]=0; bn[1]=0; bn[2]=0; bn[3]=0;
+      ok(dlc_pick_peer(4, 0, em, cl, bn) == 0, "unclaiming makes 0 pickable again");
+      /* slot rotation still breaks ties: 0 and 2 share the top ema, so from
+       * slot 3 the walk reaches 0 by wrap in (slot+a) order */
+      volatile double eq[4] = {9.0, 0.0, 9.0, 0.0};
+      ok(dlc_pick_peer(4, 3, eq, cl, bn) == 0, "tied top ema takes (slot+a) order first (slot 3 wraps to 0)");
+      volatile double zero[4] = {0.0,0.0,0.0,0.0};
+      ok(dlc_pick_peer(4, 2, zero, cl, bn) == 2, "all-zero ema (fresh sync) falls back to rotation from the slot");
+      bn[2] = 1;
+      ok(dlc_pick_peer(4, 2, zero, cl, bn) == 3, "...and the fallback skips banned exactly as the old loop did");
+      bn[2] = 0;
+      ok(dlc_pick_peer(4, 2, NULL, cl, bn) == 2, "no ema pointer at all behaves as today"); }
+    { char td3[] = "/tmp/bmc_goodpeers_XXXXXX"; if (!mkdtemp(td3)){ perror("mkdtemp"); return 1; }
+      char cwd2[512]; if (!getcwd(cwd2, sizeof cwd2)) cwd2[0] = 0;
+      if (chdir(td3) != 0){ perror("chdir"); return 1; }
+      /* old format only: bare ips, junk ignored, no ema anywhere. NOTE the
+       * bare-IPv4 rule (the same inet_pton gate as the pre-EMA loader): an
+       * "ip:port" line is NOT a bare IPv4 and is skipped -- dlc_parse_peer,
+       * not inet_pton, is what accepts ports on the dial path. */
+      FILE* g = fopen("peers.good", "w");
+      { const char* legacy = "1.1.1.1\nnot-an-ip\n2.2.2.2\n\n"; fwrite(legacy, 1, strlen(legacy), g); }
+      fclose(g);
+      static char gp[8][DL_POOL_SLOT]; static double ge[8];
+      for (int i = 0; i < 8; i++) ge[i] = -1.0;
+      for (int i = 0; i < 8; i++) gp[i][0]=0;
+      int gn = dl_load_good_peers_ema(gp, ge, 8);
+      ok(gn == 2 && !strcmp(gp[0],"1.1.1.1") && !strcmp(gp[1],"2.2.2.2"), "legacy bare-ip file parses (junk line skipped)");
+      ok(ge[0] == 0.0 && ge[1] == 0.0, "...with ema 0 for every entry (no speed knowledge)");
+      /* new format: ip<TAB>ema_kbps; the save side writes kilobits rounded,
+       * the load side must hand back bytes/s (kbps/1000.0) */
+      g = fopen("peers.good", "w");
+      fputs("3.3.3.3\t1200\n4.4.4.4\t0\n5.5.5.5\t\n", g);
+      fclose(g);
+      for (int i = 0; i < 8; i++) ge[i] = -1.0;
+      gn = dl_load_good_peers_ema(gp, ge, 8);
+      ok(gn == 3 && !strcmp(gp[0],"3.3.3.3") && !strcmp(gp[1],"4.4.4.4") && !strcmp(gp[2],"5.5.5.5"), "ip-tab-number lines parse (0 and empty number allowed)");
+      ok(ge[0] == 1.2 && ge[1] == 0.0 && ge[2] == 0.0, "ema_kbps/1000.0 == bytes/s (1200 kbps -> 1.2 B/s)");
+      /* round-trip: save with an EMA vector, reload, compare */
+      static char sp[3][DL_POOL_SLOT]; static double se[3];
+      snprintf(sp[0], sizeof sp[0], "6.6.6.6"); snprintf(sp[1], sizeof sp[1], "7.7.7.7"); snprintf(sp[2], sizeof sp[2], "8.8.8.8");
+      se[0] = 500.0; se[1] = 0.0; se[2] = 0.5;  /* 500000, bare (0), 500 -- all exact under *1000 round-trip */
+      dl_save_good_peers_ema(sp, se, 3);
+      for (int i = 0; i < 8; i++) ge[i] = -1.0;
+      gn = dl_load_good_peers_ema(gp, ge, 8);
+      ok(gn == 3 && !strcmp(gp[0],"6.6.6.6") && !strcmp(gp[1],"7.7.7.7") && !strcmp(gp[2],"8.8.8.8"), "save/load round-trips the peer list");
+      ok(ge[0] == 500.0 && ge[1] == 0.0 && ge[2] == 0.5, "...and the speeds (stored as int value*1000, 0 stored bare)");
+      { char buf[512]; FILE* rf = fopen("peers.good","r"); size_t rl = fread(buf,1,sizeof buf-1,rf); fclose(rf); buf[rl]=0;
+        ok(strstr(buf,"6.6.6.6\t500000") != 0 && strstr(buf,"7.7.7.7\n") != 0 && strstr(buf,"8.8.8.8\t500") != 0,
+           "on disk: ip<TAB>int-value*1000, zero written as a bare ip"); }
+      /* a NULL ema pointer (callers with no speed array) reads the file as a
+       * plain list -- the legacy behaviour */
+      gn = dl_load_good_peers_ema(gp, NULL, 8);
+      ok(gn == 3 && !strcmp(gp[2],"8.8.8.8"), "ema_out NULL reads any format as a plain list");
+      if (cwd2[0]) (void)!chdir(cwd2); }
+
     kill(fp, SIGKILL); waitpid(fp, NULL, 0); close(l);
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
