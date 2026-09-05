@@ -52,8 +52,35 @@ REPORT_JSON = os.path.join(HERE, 'corpus_diff_report.json')
 REPORT_TXT  = os.path.join(HERE, 'corpus_diff_report.txt')
 
 # --- Core RPC (persistent HTTP JSON-RPC, cookie auth) -------------------------
-RPC_HOST, RPC_PORT = '127.0.0.1', 8332
-COOKIE_PATH = '/storage/bitcoin/data/.cookie'
+# BLD-3 (2026-09-05): the oracle MOVED and these constants did not follow it.
+# It ran at /storage/bitcoin/data on port 8332 with a committed
+# bitcoinrpc:<password> fallback; it now runs from /storage/core-oracle on its
+# own rpcport with COOKIE auth only. Both values here were stale, so every run
+# died on a missing cookie file or a refused connection -- the "fail loudly"
+# behaviour working correctly against a target that no longer exists.
+#
+# Overridable by environment so a differently-sited oracle needs no edit:
+#   BMC_ORACLE_COOKIE   path to Core's .cookie   (default below)
+#   BMC_ORACLE_HOST / BMC_ORACLE_PORT
+import os as _os
+
+def _oracle_port():
+    p = _os.environ.get('BMC_ORACLE_PORT')
+    if p:
+        return int(p)
+    # read rpcport out of the oracle's own conf rather than hardcoding a second
+    # copy of it -- the conf is the one place that value is authoritative.
+    try:
+        for line in open(_os.path.join(_os.path.dirname(COOKIE_PATH), 'bitcoin.conf')):
+            if line.startswith('rpcport='):
+                return int(line.split('=', 1)[1].strip())
+    except Exception:
+        pass
+    return 8332
+
+COOKIE_PATH = _os.environ.get('BMC_ORACLE_COOKIE', '/storage/core-oracle/.cookie')
+RPC_HOST = _os.environ.get('BMC_ORACLE_HOST', '127.0.0.1')
+RPC_PORT = _oracle_port()
 
 def _auth_header():
     # BLD-3 (audit 2026-09-03): this used to fall back to a HARD-CODED
