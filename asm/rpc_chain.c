@@ -3752,6 +3752,12 @@ static int gdump_hash_at(long height, unsigned char out[32]){
     return 1;
 }
 
+/* RPX-4: the same lookup, exported. gettxout needs the tip hash for
+ * `bestblock` and the tip height for `confirmations`; both were hardcoded
+ * (all-zero hash, 0 confirmations) while this file already had the index
+ * open. Returns wire order, like the index record it reads. */
+int rpc_chain_hash_at(long height, unsigned char out[32]){ return gdump_hash_at(height, out); }
+
 static int cmd_dumptxoutset(const rj_val* params, rj_val** res, long* ec, const char** em){
     const char* path = rpc_param_str(params, 0, ec, em); if (!path) return 0;
     if (params->nitems >= 2 && params->items[1]->typ == RJ_STR &&

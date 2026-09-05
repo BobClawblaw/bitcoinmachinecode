@@ -153,6 +153,35 @@ long mempool_resolve_confirmed_utxo(void* u, const unsigned char txid[32], unsig
     unsigned long h_unused, cb_unused;
     return utxo_get(u, txid, index, value, &h_unused, &cb_unused, script, slen);
 }
+/* RPX-4: gettxout's out-of-process query. The daemon installs one of these
+ * (main.c:7961); no harness ever did, which is why gettxout's shape was never
+ * asserted end to end and its hardcoded bestblock/confirmations/asm/desc went
+ * unnoticed. This one answers ONE known outpoint, at a height the fixture's
+ * chain actually contains, so `confirmations` has a checkable value. */
+extern void rpc_commands_set_txo_query(long (*q)(const unsigned char[32], unsigned int,
+                                                 unsigned long long*, unsigned long*,
+                                                 unsigned long*, unsigned char*,
+                                                 unsigned long, unsigned long*));
+static unsigned char rpx4_txid[32];
+#define RPX4_HEIGHT 1
+static long rpx4_query(const unsigned char txid[32], unsigned int vout,
+                       unsigned long long* value, unsigned long* height,
+                       unsigned long* is_coinbase, unsigned char* spk,
+                       unsigned long spkcap, unsigned long* slen){
+    if (vout != 0 || memcmp(txid, rpx4_txid, 32) != 0) return 0;
+    /* a P2WPKH output: OP_0 PUSH20 <h160> -- a shape rpc_chain renders an
+     * address, a desc and a real type name for, none of which the old
+     * hand-built object could produce. */
+    static const unsigned char SPK[22] = {
+        0x00,0x14, 0x75,0x1e,0x76,0xe8,0x19,0x91,0x96,0xd4,0x54,0x94,
+        0x1c,0x45,0xd1,0xb3,0xa3,0x23,0xf1,0x43,0x3b,0xd6 };
+    if (spkcap < sizeof SPK) return 0;
+    memcpy(spk, SPK, sizeof SPK);
+    *slen = sizeof SPK;
+    *value = 5000000000ULL; *height = RPX4_HEIGHT; *is_coinbase = 0;
+    return 1;
+}
+
 /* display-order hex of a wire hash (local copy; rpc_chain.c's is static) */
 static void trc_hex_rev(char* out, const unsigned char* b, size_t n){
     for (size_t i = 0; i < n; i++){
@@ -1594,6 +1623,58 @@ int main(void){
       r = call("getindexinfo", "[\"nosuch\"]", &ec, &em);
       ck("getindexinfo(unknown) -> {}", r && r->typ == RJ_OBJ && r->nmembers == 0);
       rj_free(r); }
+
+    /* ---- RPX-4: gettxout's four hardcoded fields --------------------------
+     * bestblock was the all-zero hash, confirmations was 0, and asm/desc were
+     * empty strings -- each a definite WRONG value rather than a missing one,
+     * and each marked out-of-scope in a comment while the data was already to
+     * hand (the height came back from the UTXO query and was discarded;
+     * rpc_chain has had the index open the whole time and renders asm/desc for
+     * every other output shape). */
+    printf("\n---- RPX-4: gettxout ----\n");
+    {
+        memset(rpx4_txid, 0xa5, sizeof rpx4_txid);
+        rpc_commands_set_txo_query(rpx4_query);
+        char txhex[65]; trc_hex_rev(txhex, rpx4_txid, 32); txhex[64] = 0;
+        char pp[128]; snprintf(pp, sizeof pp, "[\"%s\", 0]", txhex);
+        rj_val* g = call("gettxout", pp, &ec, &em);
+        ck("gettxout answers for a known outpoint", g && g->typ == RJ_OBJ);
+
+        long tip = rpc_chain_tip_height();
+        ck("the fixture chain has a tip to be relative to", tip >= RPX4_HEIGHT);
+
+        /* bestblock: the TIP hash, not zeros */
+        const char* bb = S(g, "bestblock");
+        ck("bestblock is present", bb != NULL);
+        ck("bestblock is NOT the all-zero hash it used to be",
+           bb && strcmp(bb, "0000000000000000000000000000000000000000000000000000000000000000") != 0);
+        ck_str("bestblock is the fixture's tip hash", bb, g_hash[3]);
+
+        /* confirmations: tip - height + 1, Core's formula */
+        { char want[32]; snprintf(want, sizeof want, "%ld", tip - RPX4_HEIGHT + 1);
+          ck_str("confirmations is tip - height + 1", S(g, "confirmations"), want); }
+        ck("confirmations is NOT the hardcoded 0",
+           S(g, "confirmations") && strcmp(S(g, "confirmations"), "0") != 0);
+
+        /* scriptPubKey: rendered by the same builder every other output uses */
+        rj_val* sp = G(g, "scriptPubKey");
+        ck("scriptPubKey is present", sp && sp->typ == RJ_OBJ);
+        ck("asm is no longer the empty string", S(sp, "asm") && S(sp, "asm")[0] != 0);
+        ck_str("asm decodes the P2WPKH program",
+               S(sp, "asm"), "0 751e76e8199196d454941c45d1b3a323f1433bd6");
+        ck("desc is no longer the empty string", S(sp, "desc") && S(sp, "desc")[0] != 0);
+        ck_str("type comes from the SCRIPT, not a wallet-address table",
+               S(sp, "type"), "witness_v0_keyhash");
+        ck_str("hex still round-trips the script",
+               S(sp, "hex"), "0014751e76e8199196d454941c45d1b3a323f1433bd6");
+
+        /* THE OPPOSITE HALF: an outpoint the query does not know is still null */
+        rj_free(g);
+        g = call("gettxout", "[\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\", 0]", &ec, &em);
+        ck("an unknown outpoint is still null", g && g->typ == RJ_NULL);
+        rj_free(g);
+        rpc_commands_set_txo_query(NULL);
+    }
 
     /* ---- uptime / stop ---- */
     r = call("uptime", "[]", &ec, &em); ck("uptime is a non-negative number", r && r->typ == RJ_NUM && atol(r->str) >= 0); rj_free(r);

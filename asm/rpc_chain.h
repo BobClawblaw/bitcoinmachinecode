@@ -33,6 +33,8 @@ int rpc_chain_open(const char* dir);
  * handle the chain RPCs use -- not a second one over the same files. */
 long rpc_chain_read_block_at(long h, unsigned char* buf, long cap);
 long rpc_chain_tip_height(void);
+/* RPX-4: block hash at a height, WIRE order (reverse it for display). */
+int  rpc_chain_hash_at(long height, unsigned char out[32]);
 
 /* Attach the undo-data reader (daemon/undo_log.c's undo_replay), so
  * getblockfilter can include the spent-prevout elements BIP158 requires.
