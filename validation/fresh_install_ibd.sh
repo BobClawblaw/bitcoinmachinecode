@@ -81,10 +81,43 @@ while :; do
 done
 ph "TIP reached: ours=$ours oracle=$theirs -- comparing the UTXO set"
 sleep 120
-O=$($CLI gettxoutsetinfo muhash 2>/dev/null); H=$(echo "$O" | python3 -c "import sys,json; print(json.load(sys.stdin)['height'])")
-OM=$(echo "$O" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['muhash'], r['txouts'])")
-CM=$($ORACLE gettxoutsetinfo muhash "$H" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['muhash'], r['txouts'])")
-ph "MUHASH h=$H ours=$OM oracle=$CM"
-if [ "$OM" = "$CM" ]; then ph "PASS muhash identical at $H"; echo "PASS $H" > RESULT; else ph "FAIL muhash differs at $H"; echo FAIL > RESULT; fi
+# 2026-09-05: this comparison COULD NOT FAIL when both sides failed.
+#
+# Every step swallowed its own errors -- `2>/dev/null` on the CLI, and a
+# python3 that exits non-zero on empty stdin -- so an outage left H, OM and CM
+# all EMPTY. The test was then `[ "" = "" ]`, which is TRUE, and the run
+# recorded:
+#
+#     MUHASH h= ours= oracle=
+#     PASS muhash identical at
+#
+# with RESULT saying PASS. That is exactly what happened on the 2026-09-04 run:
+# a green result asserting that two empty strings are equal. The tip-height
+# comparison above it was real; this one proved nothing.
+#
+# Each value is now fetched, checked for emptiness, and the comparison only
+# runs when BOTH sides produced something. An unobtainable muhash is a FAIL --
+# not a pass, and not silence.
+O=$($CLI gettxoutsetinfo muhash 2>&1) || { ph "FAIL muhash: our gettxoutsetinfo failed: $(printf '%s' "$O" | head -1)"; echo FAIL > RESULT; O=""; }
+H=$(printf '%s' "$O" | python3 -c "import sys,json; print(json.load(sys.stdin)['height'])" 2>/dev/null || true)
+OM=$(printf '%s' "$O" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['muhash'], r['txouts'])" 2>/dev/null || true)
+if [ -z "$H" ] || [ -z "$OM" ]; then
+    ph "FAIL muhash: could not read our own gettxoutsetinfo (h='$H' ours='$OM')"
+    echo FAIL > RESULT
+else
+    CO=$($ORACLE gettxoutsetinfo muhash "$H" 2>&1) || CO=""
+    CM=$(printf '%s' "$CO" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['muhash'], r['txouts'])" 2>/dev/null || true)
+    ph "MUHASH h=$H ours=$OM oracle=$CM"
+    if [ -z "$CM" ]; then
+        ph "FAIL muhash: the ORACLE returned nothing at height $H -- nothing was compared"
+        echo FAIL > RESULT
+    elif [ "$OM" = "$CM" ]; then
+        ph "PASS muhash identical at $H ($OM)"
+        echo "PASS $H" > RESULT
+    else
+        ph "FAIL muhash differs at $H: ours='$OM' oracle='$CM'"
+        echo FAIL > RESULT
+    fi
+fi
 $CLI getblockchaininfo > rpc_getblockchaininfo.json 2>&1; $CLI getnetworkinfo > rpc_getnetworkinfo.json 2>&1
 ph "END"
