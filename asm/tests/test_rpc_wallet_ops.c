@@ -1335,6 +1335,62 @@ int main(void){
         ck("watch-only wallet sees the fixture's 50 BTC receive",
            rc == 1 && r && r->str && !strcmp(r->str, "50.00000000"));
         rj_free(r); rj_free(p2);
+
+        /* ---- WAL-6 (audit 2026-09-03): ischange on a watch-only wallet ----
+         * wop_watch_keyset stored the DESCRIPTOR SLOT INDEX in
+         * wscan_key.branch, whose bits mean something else: WOT_CHAIN reads
+         * bit 0 as receive/change. So `ischange` for a watch-only wallet was
+         * literally the IMPORT-ORDER PARITY of the descriptor -- the first
+         * import answered false, a second would answer true, for addresses
+         * that are receive addresses either way. (The same overload also fed
+         * WOT_TYPE from bits 4-5 of a slot index.)
+         *
+         * An imported descriptor carries no receive/change distinction of its
+         * own -- `internal` is not honoured, which is WAL-15 -- so false is
+         * the honest answer, and the slot now lives in its own array. */
+        { /* The first descriptor occupies SLOT 0, and WOT_CHAIN(0) is 0, so an
+           * address from it answers ischange:false with or without the fix --
+           * a first draft asserted exactly that and passed against the unfixed
+           * code. Importing a SECOND descriptor puts its keys in slot 1, and
+           * WOT_CHAIN(1) is 1: that is where the overload becomes visible. */
+          char req2[600];
+          snprintf(req2, sizeof req2,
+                   "[[{\"desc\":\"wpkh(%s/1/*)\",\"range\":5,\"timestamp\":\"now\"}]]", fxpub);
+          rj_val* pd2 = P(req2);
+          D("importdescriptors", pd2);
+          ck("WAL-6 a second descriptor imports (its keys land in slot 1)",
+             rc == 1 && r && r->nitems == 1);
+          rj_free(r); rj_free(pd2);
+
+          /* an address from the SECOND descriptor: m/1/0 of the same xpub.
+           * deriveaddresses REQUIRES a checksum (rpc_chain.c's rpcdesc_parse),
+           * so the canonical form comes from getdescriptorinfo first. */
+          char gq[700]; char canon[600] = "";
+          snprintf(gq, sizeof gq, "[\"wpkh(%s/1/0)\"]", fxpub);
+          { rj_val* qg = P(gq); DX("getdescriptorinfo", qg);
+            if (rc == 1 && r && S(r,"descriptor")) snprintf(canon, sizeof canon, "%s", S(r,"descriptor"));
+            rj_free(r); rj_free(qg); }
+          ck("WAL-6 got a checksummed descriptor for slot 1", canon[0] != 0);
+
+          char slot1[128] = "";
+          if (canon[0]){
+              char dq[700]; snprintf(dq, sizeof dq, "[\"%s\"]", canon);
+              rj_val* qd = P(dq); DX("deriveaddresses", qd);
+              if (rc == 1 && r && r->typ == RJ_ARR && r->nitems == 1 && r->items[0]->str)
+                  snprintf(slot1, sizeof slot1, "%s", r->items[0]->str);
+              rj_free(r); rj_free(qd);
+          }
+          ck("WAL-6 derived an address from the second descriptor", slot1[0] != 0);
+
+          if (slot1[0]){
+              char qc[200]; snprintf(qc, sizeof qc, "[\"%s\"]", slot1);
+              rj_val* qq = P(qc); DX("getaddressinfo", qq);
+              ck("WAL-6 an address from descriptor SLOT 1 is watch-only",
+                 rc == 1 && r && S(r,"iswatchonly") && !strcmp(S(r,"iswatchonly"), "1"));
+              ck("WAL-6 ...and ischange is FALSE, not the slot index's parity",
+                 rc == 1 && r && S(r,"ischange") && !strcmp(S(r,"ischange"), "0"));
+              rj_free(r); rj_free(qq);
+          } }
         rpc_wops_set_scanner(NULL, NULL, 0, NULL);
       }
 
