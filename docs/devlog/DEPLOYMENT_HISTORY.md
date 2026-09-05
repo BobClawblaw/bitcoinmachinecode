@@ -960,12 +960,15 @@ timeout), height 965,665 — **the same block as the Core oracle** — with
 `headers == blocks` and `initialblockdownload false`; peers climbing from 0 to
 4 within a minute; zero FATAL/SEGV/HALTED lines; `NRestarts=0`.
 
-**Still true and not fixed here:** the node has **no inbound P2P listener**.
-It binds no `port=` and the default 8333 is held on this host by the Core
-oracle's loopback aliases, so `connections_in` is 0 and stays 0. Giving it its
-own `port=` in `data/bitcoin.conf` is a one-line change and a second restart;
-it was out of scope for "restart on the new build" and is left as the
-operator's call.
+**~~Still true and not fixed here: the node has no inbound P2P listener.~~
+CORRECTED, same evening — the claim above was wrong.** The node *was*
+listening for inbound the whole time, on `0.0.0.0:8332`. There is no
+`data/bitcoin.conf`, but the repo-level fallback `config/bitcoin.conf` — which
+both the daemon and `bmc_cli` read — sets `port=8332` and `rpcport=8331`, and
+the daemon was using both. What I actually saw was `connections_in 0`, which
+means *nobody had dialled in*, not *nothing is listening*; and I read the
+`0.0.0.0:8332` line in `ss` as the RPC socket when it was the P2P one. Two
+different mistakes pointing the same wrong way. See the entry below.
 
 **Incidental audit resolution.** `docs/releases/2026-09-05-audits-closed.md`
 recorded `LimitCORE`/systemd hardening as an operator attestation that could
@@ -977,3 +980,48 @@ It can be checked from the *host*, and now has been: `systemctl show` reports
 the running process shows `Max core file size 0` in `/proc/<pid>/limits`. The
 09-03 audit's closure was correct. The unit remaining outside version control
 is the real residual observation.
+
+
+## 2026-09-05 (later): P2P moved to 8433 — and a correction, plus a config-precedence defect
+
+**The correction first.** The deploy-a entry above said this node had no
+inbound P2P listener. That was wrong. `config/bitcoin.conf` (the repo-level
+fallback both the daemon and `bmc_cli` consult) sets `port=8332` and
+`rpcport=8331`; with no datadir config, the node used them. It had been
+listening on `0.0.0.0:8332` for its whole life. The evidence I misread was
+`connections_in 0` — which says nobody had dialled in, not that nothing was
+listening — and an `ss` line for `0.0.0.0:8332` that I took for the RPC socket
+when it was P2P. The same wrong claim went into
+`docs/reports/forum_reply_muhash_2026-09-05.bbcode` and is corrected there.
+
+**What was actually done.** `data/bitcoin.conf` now sets `port=8433`,
+`rpcport=8331`, `listen=1`. Moving P2P off 8332 is still worth doing — 8332 is
+Bitcoin Core's *RPC* port, and running our P2P listener there is confusing to
+anyone reading `ss` output, as this episode demonstrates.
+
+**A real defect this surfaced: the daemon and the CLI resolve config
+differently.** The first attempt set only `port=` and `listen=`. Then:
+
+* the **daemon**, having found a datadir config, took its own default for
+  `rpcport` (8332) rather than the fallback file's 8331;
+* the **CLI** (`cli_conf.c`'s `conf_lookup`) resolves *per key*: absent from
+  the datadir config, `rpcport` fell back to `config/bitcoin.conf` → 8331.
+
+So the daemon served RPC on 8332 while `bmc_cli` dialled 8331, and the CLI
+could not reach its own node without `-rpcport=`. Neither component is wrong
+on its own; they simply disagree about what a second config file means. The
+workaround is to state `rpcport` explicitly in the datadir config, which the
+committed file now does and says why. **The fix is a code change and is not
+made here:** the two must agree on precedence, and choosing which semantics
+wins (Core merges a single conf with defaults; this tree searches two files)
+needs its own change and its own test. Worth filing before someone else loses
+an hour to it.
+
+**Verified after the restart:** P2P listening on `0.0.0.0:8433` and
+`[::]:8433`; a raw stranger handshake on 8433 returns
+`version, wtxidrelay, sendaddrv2, verack`, so inbound genuinely works; RPC
+back on `127.0.0.1:8331` with `bmc_cli` needing no flags; height 965,669 —
+**the same block as the Core oracle** — `headers == blocks`, `ibd false`;
+`NRestarts=0`, no FAILURE/FATAL lines. The v3 address book carries 46,274
+records, 4,096 tried, and 154 with a source netgroup attributed since the
+upgrade — NET-10's attribution path working in production.
