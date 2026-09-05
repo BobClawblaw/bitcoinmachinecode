@@ -149,10 +149,13 @@ int msg_verify(const unsigned char pub[33], const char* message,
     return ecdsa_verify(z, r, s, Qx, Qy);
 }
 
-int msg_match_address(const unsigned char pub[33], const char* address) {
+/* WAL-10 (audit 2026-09-03): the key may be 33 OR 65 bytes -- see
+ * msg_verify_core. The 33-byte entry point below is kept so existing callers
+ * and the header's documented prototype are unchanged. */
+int msg_match_address_n(const unsigned char* pub, int publen, const char* address) {
     unsigned char h[20];
     extern void hash160(unsigned char o[20], const void* in, long long len);
-    hash160(h, pub, 33);
+    hash160(h, pub, publen);
     /* decode the base58check address to (version || h160) and compare h160 */
     extern int wallet_base58check_decode(unsigned char* out, long cap,
                                          long* outlen, const char* str);
@@ -161,6 +164,9 @@ int msg_match_address(const unsigned char pub[33], const char* address) {
     if (!wallet_base58check_decode(adec, sizeof adec, &al, address)) return -1;
     if (al < 21) return -1;
     return memcmp(adec + al - 20, h, 20) == 0 ? 1 : 0;
+}
+int msg_match_address(const unsigned char pub[33], const char* address) {
+    return msg_match_address_n(pub, 33, address);
 }
 
 /* ======================================================================
@@ -526,10 +532,28 @@ int msg_verify_core(const char* address, const char* message, const char* sig_b6
     be_to_limbs(z, zbe, 32);
     uint64_t Qx[4], Qy[4];
     if (ecdsa_recover(r, ss, z, rec, Qx, Qy) != 0) return -1;
-    /* serialize recovered compressed pubkey and compare its hash160 to address */
-    unsigned char pub[33];
-    comp_pubkey_from_aff(pub, Qx, Qy);
-    return msg_match_address(pub, address);   /* 1 match / 0 no / -1 bad addr */
+    /* ---- WAL-10 (audit 2026-09-03): honour the COMPRESSED bit ----
+     * The header encodes it -- 27..30 uncompressed, 31..34 compressed -- and
+     * this read `rec = base & 3` and then ALWAYS serialised the recovered key
+     * compressed. A legacy uncompressed-key signature (header 27..30) is over
+     * an address that is the hash160 of the 65-BYTE key, so the comparison
+     * could never match and verifymessage returned false for a signature Core
+     * verifies. A real interop failure with any pre-segwit wallet.
+     *
+     * We still only PRODUCE compressed signatures (31..34); this is the verify
+     * side, which must accept what other implementations emit. */
+    if (base & 4){
+        unsigned char pub[33];
+        comp_pubkey_from_aff(pub, Qx, Qy);
+        return msg_match_address_n(pub, 33, address);
+    }
+    { unsigned char pub[65];
+      pub[0] = 0x04;
+      for (int i = 0; i < 32; i++)
+          pub[1 + i]  = (unsigned char)(Qx[3 - i / 8] >> (8 * (7 - i % 8)));
+      for (int i = 0; i < 32; i++)
+          pub[33 + i] = (unsigned char)(Qy[3 - i / 8] >> (8 * (7 - i % 8)));
+      return msg_match_address_n(pub, 65, address); }
 }
 
 /* end */

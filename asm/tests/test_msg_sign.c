@@ -129,6 +129,80 @@ int main(void){
         ck("interop: Core sig rejects a different address", msg_verify_core(oth, core_msg, core_sig), 0);
     }
 
+    /* ---- WAL-10 (audit 2026-09-03): an UNCOMPRESSED-key signature verifies
+     *
+     * Core's compact header encodes the key form: 27..30 uncompressed, 31..34
+     * compressed. msg_verify_core read `rec = base & 3` and then ALWAYS
+     * serialised the recovered key compressed, so a legacy uncompressed-key
+     * signature -- whose address is the hash160 of the 65-BYTE key -- could
+     * never match, and verifymessage returned false for signatures Core
+     * verifies. A real interop failure with any pre-segwit wallet.
+     *
+     * We only PRODUCE compressed signatures, so the vector is built from one:
+     * the header is rewritten down by 4, leaving r, s and the recovery id
+     * untouched -- only the key-form bit differs. That is exactly the on-wire
+     * shape an old wallet emits. The matching address is the uncompressed
+     * P2PKH for the same key, derived through pubkey_parse (which gives the
+     * full affine point) rather than by recovering it from the signature.
+     *
+     * The control's other half is the compressed address, which must keep
+     * verifying: a "fix" that simply always serialised uncompressed would pass
+     * a new-vector-only test while breaking every signature this node makes. */
+    {
+        extern void hash160(unsigned char o[20], const void* in, long long len);
+        extern void base58check_encode(char* out, const unsigned char* payload, int len);
+        extern int  pubkey_parse(const unsigned char* pub, unsigned long publen,
+                                 unsigned long long qx[4], unsigned long long qy[4]);
+        extern int  wallet_address(char out[64], const unsigned char priv_be[32]);
+
+        /* base64, local and minimal -- the file has no decoder of its own */
+        static const char* B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        unsigned char raw[80]; int rl = 0;
+        char b64[96], b64u[160], addr_c[64], addr_u[64];
+
+        unsigned char k[32]; for (int i = 0; i < 32; i++) k[i] = (unsigned char)(i + 3);
+        const char* MSG = "WAL-10 uncompressed round trip";
+
+        ck("WAL-10 signed (compressed header)", msg_sign_core(k, MSG, b64), 0);   /* 0 = success */
+        wallet_address(addr_c, k);
+        ck("WAL-10 the compressed signature still verifies (unchanged behaviour)",
+           msg_verify_core(addr_c, MSG, b64), 1);
+
+        { unsigned acc = 0; int bits = 0;              /* decode */
+          for (const char* q = b64; *q && *q != '='; q++){
+              const char* pos = strchr(B64, *q); if (!pos) continue;
+              acc = (acc << 6) | (unsigned)(pos - B64); bits += 6;
+              if (bits >= 8){ bits -= 8; if (rl < (int)sizeof raw) raw[rl++] = (unsigned char)((acc >> bits) & 0xff); } } }
+        ck("WAL-10 decoded the 65-byte compact signature", rl, 65);
+
+        if (rl == 65 && raw[0] >= 31){
+            raw[0] = (unsigned char)(raw[0] - 4);      /* 31..34 -> 27..30 */
+            { int o = 0;                                /* re-encode */
+              for (int i = 0; i < 65; i += 3){
+                  unsigned x = raw[i], y = (i+1 < 65) ? raw[i+1] : 0, z = (i+2 < 65) ? raw[i+2] : 0;
+                  b64u[o++] = B64[x >> 2];
+                  b64u[o++] = B64[((x & 3) << 4) | (y >> 4)];
+                  b64u[o++] = (i+1 < 65) ? B64[((y & 15) << 2) | (z >> 6)] : '=';
+                  b64u[o++] = (i+2 < 65) ? B64[z & 63] : '='; }
+              b64u[o] = 0; }
+
+            unsigned char pubc[33]; scalar_to_pubkey(pubc, k);
+            unsigned long long Qx[4], Qy[4];
+            ck("WAL-10 parsed the key to affine coordinates", pubkey_parse(pubc, 33, Qx, Qy), 1);
+            unsigned char pubu[65]; pubu[0] = 0x04;
+            for (int i = 0; i < 32; i++) pubu[1+i]  = (unsigned char)(Qx[3-i/8] >> (8*(7-i%8)));
+            for (int i = 0; i < 32; i++) pubu[33+i] = (unsigned char)(Qy[3-i/8] >> (8*(7-i%8)));
+            unsigned char h[20]; hash160(h, pubu, 65);
+            unsigned char pay[21]; pay[0] = 0x00; memcpy(pay + 1, h, 20);
+            base58check_encode(addr_u, pay, 21);
+
+            ck("WAL-10 an UNCOMPRESSED-key signature verifies against its own address",
+               msg_verify_core(addr_u, MSG, b64u), 1);
+            ck("WAL-10   and does NOT verify against the compressed address",
+               msg_verify_core(addr_c, MSG, b64u), 0);
+        }
+    }
+
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }
