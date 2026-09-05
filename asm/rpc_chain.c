@@ -1369,7 +1369,18 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
     rj_obj_set(o, "strippedsize", rj_numf("%zu", stripped));
     rj_obj_set(o, "size", rj_numf("%ld", len));
     rj_obj_set(o, "weight", rj_numf("%zu", stripped * 3 + (size_t)len));
-    if (cb) rj_obj_set(o, "coinbase_tx", cb);
+    /* RPX-7 (audit 2026-09-03): `coinbase_tx` is NOT a Core field.
+     * Core's blockToJSON has no such member -- the coinbase appears only
+     * inside the `tx` array, like every other transaction. An additive field
+     * is exactly what a strict field-set diff against Core flags, and this
+     * one was undocumented AND pinned by tests/test_rpc_chain.c as if it were
+     * canonical. Nothing outside that test ever read it. Dropped rather than
+     * documented as an extension: this node's whole claim is Core's result
+     * shapes, and an extra key is a divergence however convenient it is.
+     * The object is still BUILT above and freed here, because building it is
+     * what proves the coinbase parses; see the assertions in
+     * tests/test_rpc_chain.c that replaced the field checks. */
+    if (cb) rj_free(cb);
     rj_obj_set(o, "tx", txs);
     *res = o;
     return 1;

@@ -341,6 +341,7 @@ extern const char* txval_modern_reason(void);
 typedef int (*txv_resolve_fn)(void* ctx, const u8 outpoint[36], u32 index,
                               u64* value, u64* height, u64* is_coinbase,
                               const u8** spk, unsigned long* spklen);
+extern void txv_set_mempool_standard(int on);   /* SCR-9 */
 extern int tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
                              txv_resolve_fn rf, void* rctx, const char** reason);
 extern const u8* mpool_get(void* mp, const u8 txid[32], unsigned long* out_len);
@@ -756,6 +757,9 @@ int tx_policy_init(void){
       mpool_policy_set_datacarrier(g_pol, g_cfg.datacarrier
           ? (unsigned long long)g_cfg.datacarriersize : 0ULL);
       if (g_cfg.acceptnonstdtxn) mpool_policy_set_acceptnonstd(g_pol, 1);
+      /* SCR-9: the same switch has to reach the SCRIPT flags, not just the
+       * standardness checks above. Core's require_standard gates both. */
+      txv_set_mempool_standard(g_cfg.acceptnonstdtxn ? 0 : 1);
       /* -permitbaremultisig: getmempoolinfo has always REPORTED this as 1
        * while nothing could change it. It is a real gate now. */
       mpool_policy_set_baremultisig(g_pol, g_cfg.permitbaremultisig ? 1u : 0u); }
