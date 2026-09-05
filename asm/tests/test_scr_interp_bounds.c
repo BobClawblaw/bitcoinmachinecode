@@ -409,11 +409,13 @@ int main(void){
     /* --- IR-6 (INTERP_REVIEW_2026-09-05): OP_ROLL shifts whole 524-byte
      * records where Core moves a 24-byte header, so a valid tapscript of
      * `<998> OP_ROLL` repeated costs O(rolls x records) in bytes moved. These
-     * vectors PIN CORRECTNESS of rolling -- the safety net for the pending
-     * stack-representation change, which must leave elements exactly where a
-     * rotate puts them whatever the internal storage. The time figure is
-     * reported, and a generous ceiling guards against a pathological
-     * regression; the real perf assertion lands WITH the representation fix.
+     * vectors assert BOTH halves of the fix: the final order is exactly what
+     * a rotate produces (whatever the internal storage), and the storm runs in
+     * O(1) record moves per roll rather than O(records). The handle layer
+     * (bitcoin_scriptcodec.asm) rotates 4-byte handles and puts the records
+     * back in position order once, at script_eval's exit, only if anything
+     * rolled -- so the ABI every external reader uses, element p at
+     * elems + p*ELEM_SIZE with data inline, is unchanged.
      *
      * OP_ROLL(n) lifts the element n deep to the top, so <998> OP_ROLL over
      * 999 items rotates the whole stack by one: model[i] = (i + R) mod 999. */
@@ -436,7 +438,7 @@ int main(void){
     {   /* (b) tapscript, large: the storm the finding is about. Drained to one
          * element -- CLEANSTACK is consensus there -- and the survivor is the
          * old bottom, model[0] = R mod 999, a precise check on the rotation. */
-        enum { R = 60000, ITEMS = 999, ILEN = 520 };
+        enum { R = 200000, ITEMS = 999, ILEN = 520 };
         static uint8_t scr[4*R + ITEMS + 8]; size_t n = 0;
         for (int i = 0; i < R; i++){ scr[n++]=0x02; scr[n++]=0xE6; scr[n++]=0x03; scr[n++]=0x7a; }   /* <998> OP_ROLL */
         for (int i = 0; i < ITEMS-1; i++) scr[n++] = 0x75;                                          /* OP_DROP x 998 */
@@ -457,13 +459,13 @@ int main(void){
             if (r!=1){ printf("FAIL: IR-6 valid roll storm rejected (r=%d err=%llu)\n", r,(unsigned long long)g_err); fflush(stdout); _exit(2); }
             uint32_t got = *(uint32_t*)(main_elems+4), want = (uint32_t)(R % ITEMS);
             if (st.main_sp!=1 || got!=want){ printf("FAIL: IR-6 survivor is %u, want %u (sp=%zu)\n", got, want, st.main_sp); fflush(stdout); _exit(4); }
-            printf("ok: IR-6 %d rolls over %d items: survivor exact, %.0f ms (ceiling 8000; the O(1) assertion lands with the representation fix)\n", R, ITEMS, ms);
-            fflush(stdout); _exit(ms > 8000.0 ? 5 : 0);
+            printf("ok: IR-6 %d rolls over %d x %d-byte items: survivor exact, %.0f ms\n", R, ITEMS, ILEN, ms);
+            fflush(stdout); _exit(ms > 400.0 ? 5 : 0);
         }
         int st_=0; waitpid(pid,&st_,0);
         if (!(WIFEXITED(st_) && WEXITSTATUS(st_)==0)){
             if (WIFSIGNALED(st_)) printf("FAIL: IR-6 child killed by signal %d\n", WTERMSIG(st_));
-            else if (WEXITSTATUS(st_)==5) printf("FAIL: IR-6 roll storm over the 8 s ceiling\n");
+            else if (WEXITSTATUS(st_)==5) printf("FAIL: IR-6 roll storm over 400 ms -- records are being shifted per roll again\n");
             fails++;
         }
     }
