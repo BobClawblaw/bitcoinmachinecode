@@ -23,6 +23,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/wait.h>
 #define ELEM_SIZE 528
 #define MAX_STACK 1000
 #define SCRIPT_ERR_STACK_SIZE 8
@@ -313,6 +316,40 @@ int main(void){
             int r = run(scr, n, sigv, 0, 1, 0, 0);
             if (r == 1) printf("ok: IR-1 control sigv%d <0> OP_PICK at 999 -> 1000 passes\n", sigv);
             else { printf("FAIL: IR-1 control sigv%d OP_PICK got r=%d err=%llu (want r=1)\n", sigv, r, (unsigned long long)g_err); fails++; }
+        }
+    }
+    /* --- IR-4 (INTERP_REVIEW_2026-09-05): fExec was recomputed before every
+     * opcode by a byte-at-a-time scan of the whole condition stack. Tapscript
+     * has no opcode or script-size cap, so `OP_1 OP_IF` x N, `OP_ENDIF` x N,
+     * OP_1 -- a consensus-VALID leaf -- cost O(N^2): ~N^2 byte loads. At
+     * N=120,000 that is ~1.4e10 loads (10-20 s here; a ~4 MB leaf is
+     * 15-40 minutes) while Core's ConditionStack is O(1) per opcode. The
+     * vector must PASS (it is valid) and must do so in well under 3 s; it is
+     * run in a child under alarm() so a quadratic regression is a FAIL, not
+     * a hang. Watched against the unfixed object: ~12 s. */
+    {
+        enum { N = 250000 };
+        static uint8_t big[3*N + 1]; size_t n = 0;
+        for (int i = 0; i < N; i++){ big[n++] = 0x51; big[n++] = 0x63; }
+        for (int i = 0; i < N; i++)  big[n++] = 0x68;
+        big[n++] = 0x51;
+        pid_t pid = fork();
+        if (pid == 0){
+            alarm(30);
+            struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+            int r = run(big, n, SIGV_TAPSCRIPT, 0, 1, 0, 0);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double ms = (t1.tv_sec - t0.tv_sec)*1e3 + (t1.tv_nsec - t0.tv_nsec)/1e6;
+            /* stdout is a pipe under the gate: flush before _exit or the line is lost */
+            if (r != 1) { printf("FAIL: IR-4 valid %d-deep nested IF leaf rejected (r=%d err=%llu)\n", N, r, (unsigned long long)g_err); fflush(stdout); _exit(2); }
+            if (ms > 3000.0) { printf("FAIL: IR-4 %d-deep nested IF took %.0f ms (O(N^2) fExec scan; want O(1) per opcode)\n", N, ms); fflush(stdout); _exit(3); }
+            printf("ok: IR-4 %d-deep nested IF leaf accepted in %.1f ms\n", N, ms); fflush(stdout); _exit(0);
+        }
+        int st_ = 0; waitpid(pid, &st_, 0);
+        if (!(WIFEXITED(st_) && WEXITSTATUS(st_) == 0)){
+            if (WIFSIGNALED(st_)) printf("FAIL: IR-4 child killed by signal %d (alarm: quadratic scan)\n", WTERMSIG(st_));
+            else printf("FAIL: IR-4 child exit %d\n", WEXITSTATUS(st_));
+            fails++;
         }
     }
     printf(fails?"\nFAILURES %d\n":"\nALL TESTS PASSED (0 failures)\n",fails);
