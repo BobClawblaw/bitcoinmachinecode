@@ -7,7 +7,7 @@
 **Counts:** 36 candidates → 22 after de-duplication → **17 kept** (14 CONFIRMED, 3 PLAUSIBLE, per the review's own verifier) → **5 refuted**.
 
 **Severity scale:** CRITICAL / HIGH / MEDIUM / LOW / INFO — assigned here by the project, not by the review tool.
-**Status (as written, 2026-09-05 morning):** every finding below was OPEN and UNREPRODUCED. **See §7 for closure by ID** -- 12 of 17 closed the same day, each reproduced with a test watched to fail first. The review's verifier is not the same thing as a failing test here. This tree has already shown that findings from careful reviewers can be already-fixed, understated, or come with a fix that introduces a bug; each one is to be reproduced with a test that is watched to FAIL before any code moves, per `docs/ENGINEERING_RULES.md`.
+**Status (as written, 2026-09-05 morning):** every finding below was OPEN and UNREPRODUCED. **See §7 for closure by ID** -- all 14 real defects closed the same day, each reproduced with a test watched to fail first; the remaining three are accepted or deferred with reasons. The review's verifier is not the same thing as a failing test here. This tree has already shown that findings from careful reviewers can be already-fixed, understated, or come with a fix that introduces a bug; each one is to be reproduced with a test that is watched to FAIL before any code moves, per `docs/ENGINEERING_RULES.md`.
 
 ---
 
@@ -187,9 +187,9 @@ what is open.
 | IR-15 | **accepted** | -- | the FindAndDelete in `sv_checksig` is required for plain `OP_CHECKSIG` (Core does it in the opcode handler) and is a no-op over an already-stripped slice inside `CHECKMULTISIG` (`bitcoin_interp.asm:3324-3336` strips every signature once, BASE only, as Core does). Removing the redundancy needs a "called from multisig" flag through the checksig callback ABI, for at most 20×20 scans per multisig. Correct; not worth the surface |
 | IR-16 | deferred | -- | a jump table is a dispatch-loop rewrite; the 73-compare chain costs on the order of 100 ns per opcode worst case and no valid-block shape makes it dominant. Its own change |
 | IR-5 | **CLOSED** | `f3730ab` | per-thread memo scoped by a per-transaction session key handed out by `tx_verify.c` (never the buffer address; key 0 = no caching); 14,000 real P2WPKH signatures on one core: **5,288 ms → 565 ms**; session digests equal uncached digests for every input × hashtype; a new transaction over the same buffer under a new key yields its own digest. The first control ran across 8 SHA-NI cores and did not fail -- the recompute hid under ECDSA -- so the test pins one core, which is the cost the finding is about
-| IR-6 | **OPEN** | -- | design scoped: a handle/index array over records so erase/insert/swap move 8-byte slots is a change to the stack representation every opcode touches; it wants the differential harnesses extended first |
+| IR-6 | **CLOSED** | `4efb0c4` | records stay put, positions move: `hnd_tab[p]` is the slot for position p, so a roll rotates 4-byte handles and `script_eval` puts the records back in position order once on exit, only if anything rolled -- the `elems + p*ELEM_SIZE` inline-data ABI is untouched and no caller changed. 200,000 rolls over 999 x 520-byte items: **2203 ms -> 49 ms**, order exact. The first normalisation draft was wrong (it swapped the entries AT p and q instead of those HOLDING p and q) and the correctness vectors caught it |
 
-**13 of 17 closed; 2 accepted or tracked; 1 deferred; 1 open (scoped).**
+**14 of 17 closed; 2 accepted or tracked (IR-11, IR-15); 1 deferred with reasons (IR-16). Nothing open.**
 
 ## 8. Found while closing
 
