@@ -4260,7 +4260,20 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
  * extras (total_unspendable_amount, block_info) are absent -- we run no such
  * index, matching Core-without-the-index behavior. height is the UTXO
  * APPLIED height (the state the numbers describe), which on a catching-up
- * node intentionally lags the header tip. */
+ * node intentionally lags the header tip.
+ *
+ * CSI-2 (2026-09-05, /mnt/2tbssd benchmark): Core's height/blockhash second
+ * argument works ONLY with coinstatsindex because Core's index persists a
+ * digest at EVERY height. This index (coinstats.dat, CSI_MAGIC "BMCCSI1")
+ * persists ONE record: the running state at the applied tip. Computing
+ * historical digests would mean either persisting 448 bytes/height x 965k
+ * (~430 MB) or replaying undo from the tip backward -- both are genuine
+ * feature work, not a gap to paper over. Until then historical queries are
+ * REFUSED (the guard in cmd_gettxoutsetinfo, Core's own error text), which
+ * is why getindexinfo's coinstatsindex entry means "current-state O(1)",
+ * not Core's "any-height O(1)". The seam for the feature: append-per-height
+ * records in this file + the guard lifted for heights <= best_block_height
+ * of the index. */
 typedef struct {
     long height;
     unsigned long long txouts, bogosize, total_amount;
@@ -4273,6 +4286,20 @@ void rpc_chain_set_utxosetinfo(long (*run)(int, void*, char*, unsigned long)){
 }
 static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
     static char embuf[256];   /* >= msg[256]: the snprintf below copies it whole */
+    /* CSI-1 (2026-09-05, /mnt/2tbssd bmc-vs-Core benchmark): Core's second
+     * argument selects a HEIGHT or BLOCKHASH and is ONLY valid with
+     * coinstatsindex, whose per-height digests make the query O(1). This
+     * node's index persists the running digest for the APPLIED tip only
+     * (coinstats.dat: one record), and the LSM walk has no height history.
+     * The previous behavior accepted the parameter and returned the TIP set
+     * -- a silently wrong answer: the caller asked for 963,967 and received
+     * 965,626 with the right "height" field but the wrong data for what
+     * they actually queried. Core's own error text, same meaning. */
+    if (params && params->typ == RJ_ARR && params->nitems >= 2){
+        *ec = -8;
+        *em = "coinstatsindex does not support querying at historical heights";
+        return 0;
+    }
     int want_muhash = 1;   /* OUR default (documented divergence, see above) */
     if (params && params->typ == RJ_ARR && params->nitems >= 1){
         if (params->items[0]->typ != RJ_STR){
