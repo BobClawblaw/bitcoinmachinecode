@@ -116,6 +116,58 @@ int main(void){
       ck("decodepsbt tx decoded (has txid+version)", txo && rj_obj_get(txo,"txid") && rj_obj_get(txo,"version"));
       rj_free(res); rj_free(params); }
 
+    /* --- RPX-9: a transaction LARGER than the old 200,000-byte cap ---------
+     * decoderawtransaction refused anything over 200,000 bytes with
+     * "TX decode failed" -- a claim about the BYTES, not about a limit, so a
+     * caller could not tell the two apart. Core decodes up to
+     * MAX_BLOCK_SERIALIZED_SIZE (4,000,000).
+     *
+     * Built here as one input and enough P2PKH outputs to clear 200,000 bytes
+     * (each output is 34 bytes), so it is a genuinely well-formed transaction
+     * that the old cap rejected purely for its size. */
+    { long ec; const char* em;
+      const unsigned NOUT = 7000;                     /* ~238 KB of outputs */
+      size_t cap = 64 + (size_t)NOUT * 34 + 16;
+      unsigned char* tx = malloc(cap); ck("RPX-9 fixture alloc", tx != NULL);
+      if (tx){
+        size_t t = 0;
+        tx[t++]=2;tx[t++]=0;tx[t++]=0;tx[t++]=0;                    /* version 2 */
+        tx[t++]=1;                                                   /* 1 input   */
+        memset(tx+t, 0x11, 32); t += 32;
+        tx[t++]=0;tx[t++]=0;tx[t++]=0;tx[t++]=0;                    /* index 0   */
+        tx[t++]=0;                                                   /* empty ss  */
+        tx[t++]=0xfd;tx[t++]=0xff;tx[t++]=0xff;tx[t++]=0xff;        /* sequence  */
+        tx[t++]=0xfd; tx[t++]=(unsigned char)(NOUT & 0xff);
+        tx[t++]=(unsigned char)(NOUT >> 8);                          /* n_out CompactSize */
+        for (unsigned i = 0; i < NOUT; i++){
+            for (int k=0;k<8;k++) tx[t++] = 0;                       /* value 0 */
+            tx[t++]=25; tx[t++]=0x76; tx[t++]=0xa9; tx[t++]=0x14;
+            memset(tx+t, (int)(i & 0xff), 20); t += 20;
+            tx[t++]=0x88; tx[t++]=0xac;
+        }
+        tx[t++]=0;tx[t++]=0;tx[t++]=0;tx[t++]=0;                    /* locktime */
+        ck("RPX-9 fixture really exceeds the old 200000 cap", t > 200000);
+
+        char* hex = malloc(t*2 + 4); ck("RPX-9 hex alloc", hex != NULL);
+        if (hex){
+          static const char* H = "0123456789abcdef";
+          for (size_t i = 0; i < t; i++){ hex[i*2]=H[tx[i]>>4]; hex[i*2+1]=H[tx[i]&15]; }
+          hex[t*2]=0;
+          size_t pjl = t*2 + 8;
+          char* pj2 = malloc(pjl); 
+          if (pj2){
+            snprintf(pj2, pjl, "[\"%s\"]", hex);
+            rj_val* params = rj_parse(pj2, strlen(pj2));
+            rj_val* res = NULL; rpc_wallet w; memset(&w,0,sizeof w);
+            int rc2 = rpc_dispatch("decoderawtransaction", params, &w, &res, &ec, &em);
+            ck("RPX-9: a >200 KB transaction now DECODES instead of -22", rc2 == 1 && res != NULL);
+            if (rc2 != 1) printf("      got ec=%ld em=%s\n", ec, em ? em : "(null)");
+            ck("RPX-9: and reports all its outputs",
+               res && rj_obj_get(res,"vout") && rj_obj_get(res,"vout")->nitems == NOUT);
+            rj_free(res); rj_free(params); free(pj2); }
+          free(hex); }
+        free(tx); } }
+
     /* --- decoderawtransaction now returns the FULL Core shape (was minimal
      * {locktime,vin,vout}); has txid/version/size/vsize/weight, no "hex". --- */
     { long ec; const char* em;

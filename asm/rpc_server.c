@@ -412,11 +412,19 @@ int rpc_auth_ok_for_test(const char* hdrs, unsigned long hlen,
 }
 
 /* Deep-copy an rj_val via the serializer round-trip. */
+/* RPC-16 (audit 2026-09-03): this used to round-trip the value through a
+ * 64 KiB stack buffer -- rj_write into tmp[65536], then rj_parse back -- and
+ * returned NULL for anything larger. The only caller is build_reply's `id`
+ * echo, and the request cap is 9 MiB, so a client sending a legitimately
+ * large id got its id silently replaced with `null` in the reply. A JSON-RPC
+ * client that matches replies to requests by id then cannot match its own
+ * reply.
+ *
+ * rj_clone does the same job structurally, with no buffer and no cap, and has
+ * been in rpc_json.c the whole time. The serialise-and-reparse was doing
+ * strictly more work to achieve strictly less. */
 static rj_val* rj_dup(const rj_val* v) {
-    char tmp[65536];
-    long w = rj_write(tmp, sizeof tmp, v, 0);
-    if (w <= 0 || w >= (long)sizeof tmp) return NULL;
-    return rj_parse(tmp, (size_t)w);
+    return rj_clone(v);
 }
 
 /* Build a JSON-RPC reply per Core JSONRPCReplyObj. `result` is consumed on
@@ -732,8 +740,15 @@ static void handle_request(int cfd, const char* body, size_t blen) {
 #define RPC_REQ_MAX (9u<<20)     /* 8MB hex block + JSON + headers, with margin */
 
 /* ---- getblocktemplate longpoll (BIP22) -------------------------------------
- * The accept loop is deliberately SERIAL (one request at a time; the wallet
- * and chain handlers are not concurrent-safe), so a longpoll request cannot
+ * EXECUTION is deliberately SERIAL -- every handler runs under g_exec_lock,
+ * because the wallet and chain handlers are not concurrent-safe. The ACCEPT
+ * side is not: it has been a worker pool since 2026-09-01, so connections are
+ * accepted and read concurrently and only the dispatch is serialised.
+ * (RPC-19, audit 2026-09-03: this said "the accept loop is deliberately
+ * serial", which stopped being true when the pool landed. The distinction
+ * matters -- RPC-12 is about how long that ONE execution lock is held, and a
+ * reader who believes accepting is serial too will look for the wrong
+ * bottleneck.) A longpoll request therefore cannot
  * simply block inside its handler -- it would stall every other RPC. Instead
  * a request whose body carries a "longpollid" is handed to a detached waiter
  * thread that (a) polls the CHAIN TIP through a shared-state-free primitive

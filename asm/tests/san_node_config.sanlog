@@ -1,0 +1,322 @@
+2026-09-05 13:06:18.172 [config] no config file at /nonexistent/bitcoin.conf -- using compiled defaults
+2026-09-05 13:06:18.172 [config] loaded /storage/bitcoinmachinecode/asm/../config/bitcoin.sample.conf: 0 setting(s) applied
+2026-09-05 13:06:18.172 [config] chain=main is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] uacomment= contains unsafe characters -- ignoring
+2026-09-05 13:06:18.172 [config] acceptstalefeeestimates=0  # read fee_estimates.dat however old (regtest tooling; Core: regtest only) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] listen=1                   # accept inbound connections is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] bind=                      # address[:port] to listen on; empty = all interfaces is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] whitebind=                 # [perms@]addr:port -- an extra listener whose peers get those permissions (max 8) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] whitebind=                 # [perms@]addr:port -- an extra listener whose peers get those permissions (max 8) rejected: unknown permission
+2026-09-05 13:06:18.172 [config] maxconnections=200         # total connection budget (Core before v31: 125); range 16..4096 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] maxconnections=0 out of range [16,4096] -- ignoring
+2026-09-05 13:06:18.172 [config] signetseednode= rejected
+2026-09-05 13:06:18.172 [config] connect=                   # dial ONLY these peers; disables discovery (repeatable) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] connect=                   # dial ONLY these peers; disables discovery (repeatable) too long (max 63) -- ignoring
+2026-09-05 13:06:18.172 [config] addnode=                   # also dial and keep these, alongside discovery (repeatable) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] addnode=                   # also dial and keep these, alongside discovery (repeatable) too long (max 63) -- ignoring
+2026-09-05 13:06:18.172 [config] seednode=                  # ask these for addresses once, then drop (repeatable) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] seednode=                  # ask these for addresses once, then drop (repeatable) too long (max 63) -- ignoring
+2026-09-05 13:06:18.172 [config] dnsseed=1                  # query the chain's DNS seeds when short of peers is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] timeout=5000               # connect timeout, ms (1000..120000) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] timeout=0 out of range [1000,120000] -- ignoring
+2026-09-05 13:06:18.172 [config] peertimeout=60             # drop a peer silent this long, seconds (5..3600) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] peertimeout=0 out of range [5,3600] -- ignoring
+2026-09-05 13:06:18.172 [config] maxreceivebuffer=5000      # per-peer receive buffer, x1000 bytes is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] maxreceivebuffer=0 out of range [64,262144] -- ignoring
+2026-09-05 13:06:18.172 [config] maxsendbuffer=1000         # per-peer send buffer, x1000 bytes is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] maxsendbuffer=0 out of range [1,1000000] -- ignoring
+2026-09-05 13:06:18.172 [config] proxy=                     # SOCKS5 for every network, ip:port (e.g. 127.0.0.1:9050) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] onion=                     # SOCKS5 for .onion only; empty = same as proxy; "0" disables onion is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] proxyrandomize=1           # fresh SOCKS5 credentials per connection = one Tor circuit each is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] dns=1                      # allow the system resolver at all (0 = never) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] discover=1                 # learn and announce our own address (0 = never; use behind Tor) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] externalip=                # announce this IPv4 address instead of a discovered one is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] onlynet=                   # restrict to these networks (repeatable, max 6): ipv4 ipv6 onion i2p cjdns is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] torcontrol=127.0.0.1:9051  # tor control port is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] torpassword=               # only if your tor uses HashedControlPassword is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] listenonion=1              # create an onion service for inbound is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] i2psam=                    # SAM bridge, ip:port (e.g. 127.0.0.1:7656); empty = I2P off is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] i2pacceptincoming=1        # accept inbound I2P streams on our session (needs listen=1 and i2psam=) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] txindex=0                  # informational only, see above is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] addrindex=0                # EXTENSION: live address index for the getaddress* RPCs is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] blockfilterindex=1         # BIP157/158 basic filters (also accepts "basic") is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] coinstatsindex=1           # gettxoutsetinfo without a full UTXO walk is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] prune=0                    # 0 off, 1 manual-only, >=550 target size in MiB (2..549 refused, as in Core) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] dbcache=1024               # UTXO cache, MiB (4..262144); older Core releases default to 450 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] dbcache=0 out of range [4,262144] -- ignoring
+2026-09-05 13:06:18.172 [config] limitclustersize=101       # kvB is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] limitclustersize=0 out of range [1,100000] -- ignoring
+2026-09-05 13:06:18.172 [config] maxmempool=300             # MiB (1..65536); eviction and dynamic minfee kick in above this is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] maxmempool=0 out of range [1,65536] -- ignoring
+2026-09-05 13:06:18.172 [config] mempoolexpiry=336          # hours (0..8760) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] persistmempool=1           # write mempool.dat at shutdown, reload it at boot is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] minrelaytxfee=0.000001 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] incrementalrelayfee=0.000001 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] dustrelayfee=0.00003 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] limitancestorsize=101      # kvB is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] limitancestorsize=0 out of range [1,100000] -- ignoring
+2026-09-05 13:06:18.172 [config] limitdescendantsize=101    # kvB is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] limitdescendantsize=0 out of range [1,100000] -- ignoring
+2026-09-05 13:06:18.172 [config] datacarriersize=100000     # vbytes (Core v31 default) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] bytespersigop=20           # fee rate is judged against max(vsize, sigop_cost * bytespersigop / 4) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] bytespersigop=0 out of range [1,100000] -- ignoring
+2026-09-05 13:06:18.172 [config] blocksonly=0               # 1 = do not relay transactions (relay=0 on every outbound leg) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] assumevalid=0: every script of every block is evaluated (Core's default skips them below its built-in block)
+2026-09-05 13:06:18.172 [config] checkblocks=6              # blocks verified at start-up; 0 = all is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] checklevel=3               # 0..4 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] stopatheight=0             # shut down after connecting this height; 0 = never is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] maxuploadtarget=0          # MiB per 24h; 0 = no limit is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] par=0                      # script-verification / catch-up worker threads: 0 auto, negative = leave that many cores free (-64..64) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] zmqpubhashblock=           # e.g. tcp://127.0.0.1:28332 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] zmqpubhashtx=              # e.g. tcp://127.0.0.1:28333 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] zmqpubsequence is NOT supported: this node has no single mempool-removal choke point, so it could publish adds but not removes -- a subscriber tracking membership from that would drift silently. Use zmqpubrawtx/zmqpubhashtx for arrivals.
+2026-09-05 13:06:18.172 [config] zmqpubsequencehwm=1000     # parsed for compatibility; the topic itself is refused is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] addresstype=bech32 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] changetype=: expected legacy, p2sh-segwit, bech32 or bech32m -- ignoring
+2026-09-05 13:06:18.172 [config] txconfirmtarget=6          # default confirmation target for fee estimation is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] txconfirmtarget=0 out of range [1,1008] -- ignoring
+2026-09-05 13:06:18.172 [config] walletrbf=1                # 0 builds final (non-replaceable) transactions is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] walletbroadcast=1          # 0 builds and signs but never broadcasts (the txid is returned) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] mintxfee=0.00001 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] discardfee=0.0001 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] consolidatefeerate=0.0001 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] spendzeroconfchange=1      # 0 keeps unconfirmed change out of coin selection is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] keypool=1000               # accepted; a descriptor-derived wallet has no keypool is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] keypool=0 out of range [1,1000000] -- ignoring
+2026-09-05 13:06:18.172 [config] signer=                    # external signer command (Core -signer / HWI) for enumeratesigners, walletdisplayaddress is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] walletpassfile=            # e.g. /etc/bmc/wallet.pass; empty = environment only is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] minimumchainwork=          # 64 hex digits, big-endian (Core's uint256 spelling) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] minimumchainwork=          # 64 hex digits, big-endian (Core's uint256 spelling) is not a hex number -- ignoring
+2026-09-05 13:06:18.172 [config] asmap=                     # e.g. asmap.raw is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] bantime=86400              # seconds (24h) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] bantime=86400              # seconds (24h) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] whitelist=                 # [noban@]addr[/prefix], IPv4 or IPv6 (repeatable) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] whitelist=                 # [noban@]addr[/prefix], IPv4 or IPv6 (repeatable) rejected: unknown permission
+2026-09-05 13:06:18.172 [config] blockmaxweight=4000000     # template weight cap (4000..4000000) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] blockmaxweight=0 out of range [4000,4000000] -- ignoring
+2026-09-05 13:06:18.172 [config] blockreservedweight=8000   # kept free for the header and the miner's coinbase is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] blockreservedweight=0 out of range [2000,4000000] -- ignoring
+2026-09-05 13:06:18.172 [config] blockmintxfee=0.00000001   # BTC/kvB; a chunk paying less is left out of the template is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] blockversion=0             # 0 = 0x20000000; any other value overrides (test forks) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] printpriority=0            # log each template chunk's fee rate is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] logtimestamps=1            # prefix every line with the UTC time is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] logtimemicros=0            # ...to the microsecond is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] logthreadnames=0           # prefix the writing thread's name is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] logsourcelocations=0       # prefix file:line of the log call is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] shrinkdebugfile=1          # truncate a debuglogfile over 10 MB to its last 200 KB at start-up is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] includeconf= rejected
+2026-09-05 13:06:18.172 [config] networkactive=1            # 0 starts with networking off (as setnetworkactive false) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] forcednsseed=0             # 1 queries the DNS seeds even when dnsseed=0 or peers are plentiful is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] pid=                       # write our pid here once the RPC port is bound; empty = no pid file is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] debuglogfile=logs/bitcoind.log is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] walletnotify=              # %s = txid, on mempool arrival and again on confirmation is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] blocknotify=               # %s = block hash is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] alertnotify=               # %s = a short machine-readable reason is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] startupnotify=             # no substitution is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] shutdownnotify=            # no substitution; runs before the cookie and pid file are removed is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] loaded uncommented.conf: 97 setting(s) applied (some rejected -- see above)
+2026-09-05 13:06:18.172 [config] loaded dbcache.conf: 1 setting(s) applied
+2026-09-05 13:06:18.172 [config] no config file at /nonexistent/reset.conf -- using compiled defaults
+2026-09-05 13:06:18.172 [config] maxconnections=2 out of range [16,4096] -- ignoring
+2026-09-05 13:06:18.172 [config] bmc.peerminusable=0 out of range [1,256] -- ignoring
+2026-09-05 13:06:18.172 [config] bmc.peerpool=-5 out of range [16,8192] -- ignoring
+2026-09-05 13:06:18.172 [config] loaded bmc_t1.conf: 0 setting(s) applied (some rejected -- see above)
+2026-09-05 13:06:18.172 [config] outbound classes (35) >= maxconnections (16) -- would leave no inbound slots; reverting connection budget to defaults
+2026-09-05 13:06:18.172 [config] loaded bmc_t2.conf: 2 setting(s) applied (some rejected -- see above)
+2026-09-05 13:06:18.172 [config] debuglogfile=/tmp/bmc-test.log is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] walletdir=/tmp/bmc-wallets is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] loaded bmc_t5.conf: 5 setting(s) applied
+2026-09-05 13:06:18.172 [config] bytespersigop=0 out of range [1,100000] -- ignoring
+2026-09-05 13:06:18.172 [config] loaded bmc_t6.conf: 0 setting(s) applied (some rejected -- see above)
+2026-09-05 13:06:18.172 [config] loaded bmc_t3.conf: 3 setting(s) applied
+2026-09-05 13:06:18.172 [config] rpcuser=x is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] rpcpassword=y is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] txindex=1 has no effect -- the txid index is built OFFLINE (daemon/build_tx_index <datadir>) and is used automatically when txindex.dat is present; this daemon does not build or update it
+2026-09-05 13:06:18.172 [config] whitelist=rpc is not a usable number -- reading it as 0
+2026-09-05 13:06:18.172 [config] whitelist=rpc rejected: not an IPv4 or IPv6 address (or a bad prefix length)
+2026-09-05 13:06:18.172 [config] loaded bmc_t4.conf: 2 setting(s) applied (some rejected -- see above)
+2026-09-05 13:06:18.172 [config] loaded bmc_t5.conf: 1 setting(s) applied
+2026-09-05 13:06:18.172 [config] addnode=1.2.3.4 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=5.6.7.8 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=1.2.3.4 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] seednode=9.9.9.9 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] loaded bmc_t6.conf: 3 setting(s) applied
+2026-09-05 13:06:18.173 [config] connect=10.0.0.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] connect=10.0.0.2 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] connect= set -- disabling dnsseed (Core does the same; set dnsseed=1 to override)
+2026-09-05 13:06:18.173 [config] connect= set -- disabling listen (Core does the same; set listen=1 to override)
+2026-09-05 13:06:18.173 [config] loaded bmc_t7.conf: 2 setting(s) applied
+2026-09-05 13:06:18.173 [config] connect=10.0.0.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] loaded bmc_t8.conf: 3 setting(s) applied
+2026-09-05 13:06:18.173 [config] connect= set -- disabling dnsseed (Core does the same; set dnsseed=1 to override)
+2026-09-05 13:06:18.173 [config] connect= set -- disabling listen (Core does the same; set listen=1 to override)
+2026-09-05 13:06:18.173 [config] loaded bmc_t9.conf: 1 setting(s) applied
+2026-09-05 13:06:18.173 [config] addnode=1.1.1.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] connect=2.2.2.2 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] connect= set -- disabling dnsseed (Core does the same; set dnsseed=1 to override)
+2026-09-05 13:06:18.173 [config] connect= set -- disabling listen (Core does the same; set listen=1 to override)
+2026-09-05 13:06:18.173 [config] loaded bmc_t10.conf: 2 setting(s) applied
+2026-09-05 13:06:18.173 [config] addnode=4.4.4.4:8333 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=5.5.5.5:18333 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=6.6.6.6 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] loaded bmc_t11.conf: 3 setting(s) applied
+2026-09-05 13:06:18.173 [config] addnode=7.7.7.7:0 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=7.7.7.7:0 port out of range (1-65535) -- ignoring
+2026-09-05 13:06:18.173 [config] addnode=8.8.8.8:70000 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=8.8.8.8:70000 port out of range (1-65535) -- ignoring
+2026-09-05 13:06:18.173 [config] addnode=9.9.9.9:abc is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=9.9.9.9:abc has a non-numeric port -- ignoring
+2026-09-05 13:06:18.173 [config] loaded bmc_t11b.conf: 0 setting(s) applied (some rejected -- see above)
+2026-09-05 13:06:18.173 [config] addnode=10.1.0.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.1.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.2.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.3.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.4.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.5.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.6.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.7.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.8.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.9.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.10.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.11.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.12.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.13.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.14.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.15.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.16.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.17.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.18.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.19.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.20.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.21.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.22.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.23.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.24.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.25.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.26.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.27.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.28.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.29.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.30.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.31.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.32.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.32.1 ignored -- at most 32 entries per key
+2026-09-05 13:06:18.173 [config] addnode=10.1.33.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.33.1 ignored -- at most 32 entries per key
+2026-09-05 13:06:18.173 [config] addnode=10.1.34.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.34.1 ignored -- at most 32 entries per key
+2026-09-05 13:06:18.173 [config] addnode=10.1.35.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.35.1 ignored -- at most 32 entries per key
+2026-09-05 13:06:18.173 [config] addnode=10.1.36.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.36.1 ignored -- at most 32 entries per key
+2026-09-05 13:06:18.173 [config] addnode=10.1.37.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.37.1 ignored -- at most 32 entries per key
+2026-09-05 13:06:18.173 [config] addnode=10.1.38.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.38.1 ignored -- at most 32 entries per key
+2026-09-05 13:06:18.173 [config] addnode=10.1.39.1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addnode=10.1.39.1 ignored -- at most 32 entries per key
+2026-09-05 13:06:18.173 [config] loaded bmc_t12.conf: 32 setting(s) applied (some rejected -- see above)
+2026-09-05 13:06:18.173 [config] loaded bmc_t13.conf: 1 setting(s) applied
+2026-09-05 13:06:18.173 [config] loaded bmc_t14.conf: 1 setting(s) applied
+2026-09-05 13:06:18.173 [config] prune=100 out of range [550,1073741824] -- ignoring
+2026-09-05 13:06:18.173 [config] loaded bmc_t15.conf: 0 setting(s) applied (some rejected -- see above)
+2026-09-05 13:06:18.173 [config] loaded bmc_t16.conf: 1 setting(s) applied
+2026-09-05 13:06:18.173 [config] loaded bmc_t17.conf: 2 setting(s) applied
+2026-09-05 13:06:18.173 [config] checklevel=9 out of range [0,4] -- ignoring
+2026-09-05 13:06:18.173 [config] loaded bmc_t18.conf: 0 setting(s) applied (some rejected -- see above)
+2026-09-05 13:06:18.173 [config] loaded bmc_t19.conf: 1 setting(s) applied
+2026-09-05 13:06:18.173 [config] loaded bmc_t20.conf: 1 setting(s) applied
+2026-09-05 13:06:18.173 [config] txindex=1 has no effect -- the txid index is built OFFLINE (daemon/build_tx_index <datadir>) and is used automatically when txindex.dat is present; this daemon does not build or update it
+2026-09-05 13:06:18.173 [config] assumevalid=00000000000000000008a89e854d57e5667df88f1cdef6fea2db3d5eeb8ea9c1 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] assumevalid=00000000000000000008a89e854d57e5667df88f1cdef6fea2db3d5eeb8ea9c1: script evaluation is skipped for blocks at or below it (Core semantics); every other consensus check still runs
+2026-09-05 13:06:18.173 [config] loaded bmc_t21.conf: 2 setting(s) applied
+2026-09-05 13:06:18.173 [config] assumevalid=0: every script of every block is evaluated (Core's default skips them below its built-in block)
+2026-09-05 13:06:18.173 [config] loaded bmc_t22.conf: 1 setting(s) applied
+2026-09-05 13:06:18.173 [config] assumevalid=notahash is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] assumevalid: not a 64-hex block hash -- ignored
+2026-09-05 13:06:18.173 [config] loaded bmc_t23.conf: 0 setting(s) applied (some rejected -- see above)
+2026-09-05 13:06:18.173 [config] uacomment=hello is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] uacomment=bad(paren) is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] uacomment=bad(paren) contains unsafe characters -- ignoring
+2026-09-05 13:06:18.173 [config] uacomment=second one is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] blockmintxfee=0.00001 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] mintxfee=0.00002 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] fallbackfee=0.0002 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] discardfee=0.00005 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] consolidatefeerate=0.00003 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] walletnotify=/bin/true %s is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] wallet=alpha is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] wallet=beta is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] wallet=has/slash is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] wallet=has/slash: a wallet NAME (no path), max 63 chars -- ignoring
+2026-09-05 13:06:18.173 [config] addresstype=legacy is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] changetype=bech32m is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] rpcwhitelist=alice:getblockcount,getbestblockhash is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] rpcwhitelist=nocolon is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] rpcwhitelist=nocolon: expected <user>:<rpc1>,<rpc2>,... -- ignoring
+2026-09-05 13:06:18.173 [config] rpccookieperms=group is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addresstype=nonsense is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] addresstype=nonsense: expected legacy, p2sh-segwit, bech32 or bech32m -- ignoring
+2026-09-05 13:06:18.173 [config] txconfirmtarget=5000 out of range [1,1008] -- ignoring
+2026-09-05 13:06:18.173 [config] blockmaxweight=1 out of range [4000,4000000] -- ignoring
+2026-09-05 13:06:18.173 [config] loaded cs1.conf: 42 setting(s) applied (some rejected -- see above)
+2026-09-05 13:06:18.173 [config] includeconf=inc_a.conf is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] includeconf: reading inc_a.conf
+2026-09-05 13:06:18.173 [config] includeconf=inc_b.conf is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] includeconf inside an included file is not allowed (Core rule) -- ignoring inc_b.conf
+2026-09-05 13:06:18.173 [config] loaded inc_a.conf: 2 setting(s) applied (some rejected -- see above)
+2026-09-05 13:06:18.173 [config] loaded inc_main.conf: 4 setting(s) applied
+2026-09-05 13:06:18.173 [config] signetseednode=1.2.3.4:38333 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] chain=signet is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] loaded sig1.conf: 2 setting(s) applied
+2026-09-05 13:06:18.173 [config] signetseednode=1.2.3.4:38333 is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] chain=main is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] loaded sig2.conf: 2 setting(s) applied
+2026-09-05 13:06:18.173 [config] no config file at /nonexistent/reset.conf -- using compiled defaults
+2026-09-05 13:06:18.173 [config] chain=main is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] loaded sec_foreign.conf: 2 setting(s) applied
+2026-09-05 13:06:18.173 [config] loaded sec_match.conf: 3 setting(s) applied
+2026-09-05 13:06:18.173 [config] loaded sec_selector.conf: 1 setting(s) applied
+2026-09-05 13:06:18.173 [config] loaded sec_order.conf: 3 setting(s) applied
+2026-09-05 13:06:18.173 [config] chain=main is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] loaded sec_audit.conf: 1 setting(s) applied
+2026-09-05 13:06:18.173 [config] chain=main is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] nolisten=1 -> listen=0 (Core negation)
+2026-09-05 13:06:18.173 [config] loaded neg1.conf: 3 setting(s) applied
+2026-09-05 13:06:18.173 [config] chain=main is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] nolisten=0 -> listen=1 (Core negation)
+2026-09-05 13:06:18.173 [config] loaded neg2.conf: 2 setting(s) applied
+2026-09-05 13:06:18.173 [config] chain=regtest is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] port= is network-specific and appears outside any section while chain=regtest: ignoring it (Core does the same; put it under [regtest] to apply it)
+2026-09-05 13:06:18.173 [config] loaded netspec.conf: 1 setting(s) applied
+2026-09-05 13:06:18.173 [config] chain=main is not a usable number -- reading it as 0
+2026-09-05 13:06:18.173 [config] loaded netspec2.conf: 2 setting(s) applied
+2026-09-05 13:06:18.173 [config] no config file at /nonexistent/reset.conf -- using compiled defaults
+2026-09-05 13:06:18.173 [config] no config file at /nonexistent/reset.conf -- using compiled defaults
+2026-09-05 13:06:18.173 [config] maxconnections=4294967373 does not fit an int -- reading it as 0
+2026-09-05 13:06:18.173 [config] maxconnections=0 out of range [16,4096] -- ignoring
+2026-09-05 13:06:18.173 [config] loaded dmn9_a.conf: 0 setting(s) applied (some rejected -- see above)
+2026-09-05 13:06:18.173 [config] no config file at /nonexistent/reset.conf -- using compiled defaults
+2026-09-05 13:06:18.173 [config] bantime=9223372036854775807 does not fit an int -- reading it as 0
+2026-09-05 13:06:18.173 [config] bantime=9223372036854775807 exceeds the 3153600000-second cap -- using the cap
+2026-09-05 13:06:18.174 [config] loaded dmn9_b.conf: 1 setting(s) applied
+2026-09-05 13:06:18.174 [config] no config file at /nonexistent/reset.conf -- using compiled defaults
+2026-09-05 13:06:18.174 [config] loaded dmn9_c.conf: 1 setting(s) applied
+2026-09-05 13:06:18.174 [config] no config file at /nonexistent/reset.conf -- using compiled defaults
+2026-09-05 13:06:18.174 [config] loaded dmn9_d.conf: 1 setting(s) applied
+2026-09-05 13:06:18.174 [config] conns: max=64 outbound=11 (full=8 blockrelay=2 feeler=1) inbound=53 feeler_every=120s
+2026-09-05 13:06:18.174 [config] peers: min_bps=32768 ticks=3 min_usable=8 pool=2048
+2026-09-05 13:06:18.174 [config] addr : max_per_response=256 max_per_netgroup=16
+2026-09-05 13:06:18.174 [config] utxo : dbcache=1024MB -> bulk_slots=2^22 bulk_blob=1024MB bulk_gap=50000 compact_at=12
+2026-09-05 13:06:18.174 [config] pool : maxmempool=300MB mempoolexpiry=336h maxuploadtarget=0MB
+2026-09-05 13:06:18.174 [config] mpol : minrelay=100 inc=100 sat/vB, anc=64/101kvB desc=64/101kvB fullrbf=1
+2026-09-05 13:06:18.174 [config] res  : par=0 (auto) maxreceivebuffer=5000*1000B
+2026-09-05 13:06:18.174 [config] net  : port=8333 bind=0.0.0.0 listen=1 blocksonly=0 timeout=5000ms peertimeout=60s
+2026-09-05 13:06:18.174 [config] src  : dnsseed=1 seednode=0 addnode=0 connect=0
+2026-09-05 13:06:18.174 [config] chain: prune=off checkblocks=n checklevel=3 stopatheight=none
+2026-09-05 13:06:18.174 [config] chain:   checking last 6 block(s)
+2026-09-05 13:06:18.174 [config] mine : blockmaxweight=4000000 reserved=8000 blockmintxfee=1 sat/kvB version=0x20000000 printpriority=0
+2026-09-05 13:06:18.174 [config] wallet: addresstype=bech32 changetype=(auto) txconfirmtarget=6 walletrbf=1 broadcast=1 mintxfee=1000 fallbackfee=0 discardfee=10000 consolidate=10000 sat/kvB aps=0/0 zeroconfchange=1 wallets=0
+2026-09-05 13:06:18.174 [config] rpc  : threads=16 workqueue=64 timeout=30s whitelists=0(default=auto) cookieperms=owner
+2026-09-05 13:06:18.174 [config] log  : timestamps=1 micros=0 threadnames=0 sourcelocations=0 shrink=1
+2026-09-05 13:06:18.174 [config] peers: maxtipage=86400s inboundrelay=50% whitelistrelay=1 forcerelay=0 peerblockfilters=0 uacomment=0

@@ -1159,7 +1159,20 @@ long node_config_load(const char* path){
     if(!g_include_depth && !strcmp(g_cfg.chain, "signet"))
         for(int i = 0; i < g_cfg.n_signetseednode; i++){
             if(g_cfg.n_seednode >= CFG_MAX_NODES) break;
-            snprintf(g_cfg.seednode[g_cfg.n_seednode++], sizeof g_cfg.seednode[0], "%s", g_cfg.signetseednode[i]);
+            /* BLD-7 (2026-09-05): was snprintf(..., "%s", ...). Both operands
+             * are members of g_cfg, so -Wrestrict cannot prove they do not
+             * overlap and warns -- and at -Werror that is a build failure the
+             * moment anything compiles this file at -O1 (the sanitizer build
+             * added this commit does). They are distinct fixed arrays, so
+             * there is no real overlap, but a bounded COPY is what this line
+             * always meant; snprintf with a bare "%s" was the wrong tool for
+             * it. Note the destination (64) is SMALLER than the source (80),
+             * so the truncation is deliberate and now explicit. */
+            { char* dst = g_cfg.seednode[g_cfg.n_seednode++];
+              const char* src = g_cfg.signetseednode[i];
+              size_t cap = sizeof g_cfg.seednode[0];
+              size_t l = strnlen(src, cap - 1);
+              memcpy(dst, src, l); dst[l] = 0; }
         }
     /* -connect's implications, applied once the whole file has been seen. */
     if(g_cfg.connect_only){

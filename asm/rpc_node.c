@@ -41,6 +41,15 @@ void rpc_node_set_localrelay(int on){ g_localrelay = on ? 1 : 0; }
 
 /* txid of a raw tx (BIP141: hash of the no-witness serialization); worker
  * recomputes independently for the mempool. */
+/* RPC-20 (audit 2026-09-03): tx_txid's scratch must cover any transaction the
+ * staging buffers can hold, or a large-but-valid transaction is reported as
+ * "TX decode failed" instead of getting its real policy verdict. Asserted at
+ * COMPILE TIME because the failure mode is silent at runtime and the two
+ * constants sat in different files: this is the check that would have caught
+ * the original 162,008-vs-404,000 mismatch the moment it was written. */
+_Static_assert(RPC_TXID_SCRATCH >= RPC_TXSUBMIT_MAX,
+               "RPC-20: tx_txid scratch is smaller than the staging cap");
+
 extern int tx_txid(unsigned char out[32], const unsigned char* tx, unsigned long txlen,
                    unsigned char* scratch, unsigned long scratchcap);
 
@@ -269,9 +278,16 @@ static int cmd_getpeerinfo(rj_val** res){
  * (bitcoin_addrmgr.asm, 18-byte records) -- so none of them invents data.
  *
  * Where a capability genuinely does not exist here, the method says so
- * rather than pretending: this node has no ban list, no addnode list, and
- * no runtime network-disable switch, so listbanned/getaddednodeinfo return
- * empty (exactly as Core does when nothing is banned or added) while
+ * rather than pretending.
+ *
+ * RPC-19 (audit 2026-09-03): this paragraph used to claim "this node has no
+ * ban list, no addnode list, and no runtime network-disable switch". All
+ * three arrived and the sentence did not move. cmd_listbanned (:935) walks a
+ * REAL ban table in shared status (g_status->bans[]) with expiry; the addnode
+ * list is g_addnode; setnetworkactive crosses the ctl_* channel like its
+ * siblings. listbanned/getaddednodeinfo return empty only when there is
+ * genuinely nothing to report -- which is Core's answer too, but for the
+ * ordinary reason rather than the absence of the feature. What remains true:
  * setban/addnode/disconnectnode/setnetworkactive are REAL as of 2026-08-26:
  * they cross the ctl_* channel to the download worker, which owns the peer
  * legs and is the only thing that may touch them. Each reports what it
@@ -598,15 +614,22 @@ static int cmd_getaddednodeinfo(const rj_val* params, rj_val** res){
     return 1;
 }
 
-/* listbanned: this node keeps no ban list. Core returns an empty array when
- * nothing is banned, so an empty array here is the SAME answer, not a stub;
- * the divergence is that nothing can ever populate it (see setban). */
+/* listbanned: reads the shared ban table (g_status->bans[], expiry-checked)
+ * that setban populates over the ctl_* channel.
+ *
+ * RPC-19: this comment used to say "this node keeps no ban list ... nothing
+ * can ever populate it". Both halves were false by the time it was read --
+ * setban has crossed to the worker since 2026-08-26 and cmd_listbanned below
+ * has always walked the table. An empty array now means nothing is banned,
+ * which is exactly Core's meaning. */
 
 /* ping -- Core queues a ping to every peer and returns null immediately;
  * the result shows up in getpeerinfo's pingtime. This node's peer legs are
- * driven by the download worker, which sends its own keepalives; there is
- * no RPC-triggered ping path, so this reports unavailable rather than
- * returning null and doing nothing. */
+ * driven by the download worker, which sends its own keepalives.
+ *
+ * RPC-19: "there is no RPC-triggered ping path" is stale -- cmd_ping (:964)
+ * sends RPC_CTL_PING across the ctl_* channel and daemon/main.c:5155 handles
+ * it. The comment survived the wiring. */
 static int cmd_net_unsupported(const char* msg, long* ec, const char** em){
     *ec = -1; *em = msg; return 0;
 }
@@ -1733,7 +1756,7 @@ static int mpd_collect_sink(void* vctx, const unsigned char* tx, unsigned long l
     if (c->n == c->cap){ long nc = c->cap ? c->cap * 2 : 256; mpd_ent* nv = realloc(c->v, (size_t)nc * sizeof *nv); if (!nv){ c->oom = 1; return -1; } c->v = nv; c->cap = nc; }
     unsigned char* cp = malloc(len); if (!cp){ c->oom = 1; return -1; }
     memcpy(cp, tx, len);
-    static unsigned char scratch[2000*81 + 8];
+    static unsigned char scratch[RPC_TXID_SCRATCH];   /* RPC-20 */
     mpd_ent* e = &c->v[c->n]; e->tx = cp; e->len = len; e->t = t; e->d = d;
     if (!tx_txid(e->txid, cp, len, scratch, sizeof scratch)) memset(e->txid, 0, 32);
     c->n++; return 0;
@@ -1908,7 +1931,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     if (!okhex){ pthread_mutex_unlock(&g_submit_lock); *ec=-22; *em="TX decode failed"; return 0; }
 
     /* txid for the success result (display order) */
-    { unsigned char id[32]; static unsigned char scratch[2000*81+8];
+    { unsigned char id[32]; static unsigned char scratch[RPC_TXID_SCRATCH];   /* RPC-20 */
       if (!tx_txid(id, stage, n, scratch, sizeof scratch)){ pthread_mutex_unlock(&g_submit_lock); *ec=-22; *em="TX decode failed"; return 0; }
       static const char* HEXD = "0123456789abcdef";
       for (int i=0;i<32;i++){ unsigned char b=id[31-i]; txidhex[i*2]=HEXD[b>>4]; txidhex[i*2+1]=HEXD[b&15]; }
@@ -2279,7 +2302,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
         for (int i = 0; i < n; i++){
             rj_val* e = rj_obj();
             unsigned char id[32], wid[32];
-            static unsigned char sc[2000*81+8];
+            static unsigned char sc[RPC_TXID_SCRATCH];   /* RPC-20 */
             char hx[65];
             if (tx_txid(id, raw + off[i], lens[i], sc, sizeof sc) == 1){
                 for (int k=0;k<32;k++){ unsigned char b=id[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
@@ -2333,7 +2356,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
     for (size_t i = 0; i < list->nitems; i++){
         rj_val* e = rj_obj();
         unsigned char id[32], wid[32];
-        static unsigned char scratch[2000*81+8];
+        static unsigned char scratch[RPC_TXID_SCRATCH];   /* RPC-20 */
         int have_id = tx_txid(id, stage[i], lens[i], scratch, sizeof scratch) == 1;
         char hx[65];
         if (have_id){

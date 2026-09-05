@@ -383,7 +383,22 @@ static rj_val* p_number(pctx* c) {
         if (c->p == es) { c->err = 1; return NULL; }        /* "1e", "1e+" */
     }
     if (c->p == start) { c->err = 1; return NULL; }
-    rj_val* v = rj_num(xstrndup(start, (size_t)(c->p - start)));
+    /* BLD-7 (2026-09-05): this was
+     *     rj_val* v = rj_num(xstrndup(start, len));
+     * and it LEAKED the xstrndup result on every number parsed. rj_num does
+     * `v->str = xstrdup(s)` -- it makes its OWN copy -- so the argument was a
+     * second allocation nothing ever owned or freed.
+     *
+     * rpc_json parses untrusted JSON-RPC bodies on a long-lived server, so
+     * this is a few bytes per NUMBER per REQUEST, forever: a slow
+     * memory-exhaustion vector rather than untidiness. Every params array
+     * with a number in it -- which is most of them -- hit it.
+     *
+     * Found by the SAN=1 build this commit adds, on the first harness run:
+     * parsing the single character "1" leaks 2 bytes. */
+    char* txt = xstrndup(start, (size_t)(c->p - start));
+    rj_val* v = rj_num(txt);
+    free(txt);
     return v;
 }
 

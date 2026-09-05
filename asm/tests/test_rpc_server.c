@@ -294,6 +294,36 @@ int main(void) {
        has_prefix(raw_out, "HTTP/1.1 500") &&
        has_substr(raw_out, "\"message\":\"Top-level object parse error\""));
 
+    /* ============ 10a. RPC-16: a large `id` must be ECHOED, not nulled =====
+     * rj_dup round-tripped the id through a 64 KiB stack buffer -- rj_write
+     * into tmp[65536], then rj_parse back -- and returned NULL above that.
+     * build_reply's only use of it is the id echo, and the request cap is
+     * 9 MiB, so a client sending a legitimately large id got `"id":null` back
+     * and could no longer match the reply to its own request. rj_clone does
+     * the same job structurally with no cap, and was already in rpc_json.c.
+     *
+     * The id here is a ~70 KiB string: comfortably over the old buffer, well
+     * under the request cap. */
+    {
+        static char bigreq[200000];
+        static char bigid[70000];
+        memset(bigid, 'z', sizeof bigid - 1); bigid[sizeof bigid - 1] = 0;
+        static char body[160000];
+        snprintf(body, sizeof body,
+                 "{\"jsonrpc\":\"2.0\",\"id\":\"%s\",\"method\":\"getblockcount\",\"params\":[]}", bigid);
+        make_post(bigreq, sizeof bigreq, port, "bitcoin", "bitcoin", body, NULL);
+        raw_exchange(port, bigreq, strlen(bigreq));
+        ck("RPC-16: a 70 KiB id does NOT come back as null",
+           !has_substr(raw_out, "\"id\":null"));
+        ck("RPC-16: the id is echoed (a long run of the id's own bytes appears)",
+           has_substr(raw_out, "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"));
+        /* the opposite half: a SMALL id still echoes exactly as before */
+        make_post(bigreq, sizeof bigreq, port, "bitcoin", "bitcoin",
+                  "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"getblockcount\",\"params\":[]}", NULL);
+        raw_exchange(port, bigreq, strlen(bigreq));
+        ck("RPC-16: a small numeric id still echoes verbatim", has_substr(raw_out, "\"id\":41"));
+    }
+
     /* ============ 10b. RPC-6: batch requests (raw) =========================
      * Core (httprpc.cpp, valRequest.isArray()): HTTP 200, one reply per
      * element, per-element failures as error OBJECTS inside the array,

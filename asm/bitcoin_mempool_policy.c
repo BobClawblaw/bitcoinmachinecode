@@ -200,6 +200,7 @@ typedef struct {
                                   without the replaced tx signaling BIP125.
                                   0 => replaced tx must signal (classic). */
     uint32_t accept_nonstd;    /* Core -acceptnonstdtxn: skip standardness */
+    uint32_t no_min_size;      /* MEM-23: TEST-ONLY, see mpol_policy_set_min_size */
     uint64_t incremental_fee;  /* incrementalrelayfee, sat/kvB */
     uint64_t dust_relay_kvb;   /* -dustrelayfee, sat/kvB (Core default 3000) */
     uint64_t datacarrier_bytes;/* -datacarriersize budget (Core v31: 100000) */
@@ -508,6 +509,7 @@ void mpool_policy_init(mpol_cfg* pol, uint64_t relay_fee_rate,
     pol->max_desc_bytes  = max_desc_bytes;
     pol->rbf_enabled     = rbf_enabled;
     pol->accept_nonstd   = 0;
+    pol->no_min_size     = 0;   /* MEM-23: the floor is ON by default */
     pol->incremental_fee = relay_fee_rate;          /* sat/kvB, same unit */
     pol->dust_relay_kvb  = 3000;                    /* Core DUST_RELAY_TX_FEE */
     pol->datacarrier_bytes = 100000;                /* Core v31 default */
@@ -532,6 +534,27 @@ unsigned mpool_policy_get_baremultisig(const void* polv){
 }
 void mpool_policy_set_acceptnonstd(void* polv, unsigned v){
     ((mpol_cfg*)polv)->accept_nonstd = v ? 1u : 0u;
+}
+/* MEM-23 (audit 2026-09-03): TEST-ONLY escape hatch for the 65-non-witness-byte
+ * floor.
+ *
+ * That floor is UNCONDITIONAL in Core -- validation.cpp PreChecks gates
+ * IsStandardTx on require_standard and then applies the size check on the very
+ * next line, because it mitigates CVE-2017-12842 rather than expressing a
+ * standardness preference. Production must therefore apply it even under
+ * -acceptnonstdtxn, which is what this commit fixes.
+ *
+ * tests/test_mempool_policy.c is the one caller: its fixtures are hardcoded
+ * hex blobs of ~60-byte synthetic transactions, used to exercise fee and
+ * package-graph mechanics. Padding them all past 65 bytes would shift every
+ * txid, fee and expected verdict in the file -- a large, risky rewrite of a
+ * policy test to accommodate a rule it is not testing. Turning the floor off
+ * explicitly, in the harness, says what is happening.
+ *
+ * This is deliberately NOT reachable from -acceptnonstdtxn or any config
+ * option: no operator can switch the mitigation off. */
+void mpol_policy_set_min_size(void* polv, unsigned on){
+    ((mpol_cfg*)polv)->no_min_size = on ? 0u : 1u;
 }
 /* the structural pool's blob capacity, for the decay speed-up thresholds */
 void mpool_policy_set_poolcap(void* st, unsigned long long cap){
@@ -817,7 +840,23 @@ static const char* standard_checks(const mpol_cfg* pol, const unsigned char* tx,
     /* a coinbase is never valid as a pool tx (Core: "coinbase") */
     { int nullprev = 1; for (int i=0;i<32;i++) if (prev0[i]) { nullprev = 0; break; }
       if (nullprev && idx0 == 0xffffffffu) return "coinbase"; }
-    if (pol->accept_nonstd) return 0;
+    /* MEM-23 (audit 2026-09-03): tx-size-small is NOT gated on
+     * -acceptnonstdtxn in Core. validation.cpp PreChecks gates IsStandardTx on
+     * require_standard, then runs the 65-non-witness-byte floor
+     * UNCONDITIONALLY on the next line -- it mitigates CVE-2017-12842, which
+     * is not a standardness preference. Returning here first meant
+     * -acceptnonstdtxn (a test-network option) also switched that mitigation
+     * off, which Core never does.
+     *
+     * Hoisted above the early return so it applies either way. The comment at
+     * its old position -- that Core runs it AFTER IsStandardTx, so a tiny tx
+     * with a nonstandard output reports "scriptpubkey" rather than
+     * "tx-size-small" -- still holds and is preserved below: this copy only
+     * fires when the standardness block was skipped entirely. */
+    if (pol->accept_nonstd){
+        if (!pol->no_min_size && m->nonwit_len < 65) return "tx-size-small";
+        return 0;
+    }
     if (m->version < 1 || m->version > 3) return "version";  /* TX_MAX_STANDARD_VERSION 3 */
     if (m->weight > 400000) return "tx-size";                /* MAX_STANDARD_TX_WEIGHT */
     /* inputs: scriptsig size + push-only */
@@ -859,7 +898,7 @@ static const char* standard_checks(const mpol_cfg* pol, const unsigned char* tx,
       if (nd > MPOL_MAX_DUST_OUTPUTS) return "dust"; }
     /* PreChecks' own size floor runs AFTER IsStandardTx in Core, so a tiny
      * tx with a nonstandard output still reports "scriptpubkey". */
-    if (m->nonwit_len < 65) return "tx-size-small";          /* MIN_STANDARD_TX_NONWITNESS_SIZE */
+    if (!pol->no_min_size && m->nonwit_len < 65) return "tx-size-small";  /* MIN_STANDARD_TX_NONWITNESS_SIZE */
     return 0;
 }
 

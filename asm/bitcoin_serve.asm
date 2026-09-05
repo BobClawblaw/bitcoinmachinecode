@@ -43,6 +43,7 @@ extern serve_block_ctx_ok
     extern idx_put
     extern store_append
     extern block_strip_witness
+    extern strip_witness              ; MEM-24: the TX equivalent
     extern idxscan_append_locked
     extern store_validates_prevhash
     extern cons_verify
@@ -1188,12 +1189,35 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     test rax, rax
     jz   .gd_miss
+    ; ---- MEM-24 (audit 2026-09-03): serve the FORM that was requested ------
+    ; A bare MSG_TX (witness bit 0x40000000 CLEAR) asks for the non-witness
+    ; serialization; Core sends TX_NO_WITNESS for it. This arm served the
+    ; stored witness bytes whatever was asked, which a strict pre-segwit peer
+    ; cannot parse. The BLOCK arm below has always got this right -- see
+    ; .gd_block's identical `test ecx, 0x40000000` -- so the two agree now.
+    ; A strip failure serves NOTHING (never the wrong form), as the block arm
+    ; also does.
+    mov  ecx, [rbx]              ; the inv entry's type u32
+    test ecx, 0x40000000
+    jnz  .gdtx_have              ; witness requested: the stored form is right
+    mov  [s_ptr], rbx
+    mov  rdi, rax                ; tx
+    mov  rsi, [s_n]              ; txlen
+    lea  rdx, [bt_buf]           ; out (free in this arm, as in .gd_block)
+    mov  rcx, (8<<20)
+    call strip_witness
+    mov  rbx, [s_ptr]
+    test rax, rax
+    jle  .gd_miss                ; strip failed -> notfound
+    mov  [s_n], rax              ; stripped length
+    lea  rax, [bt_buf]
+.gdtx_have:
     ; p2p_write(fd,"tx",2, ptr, len)
     mov  [s_ptr], rbx
     mov  rdi, r12
     lea  rsi, [cn_tx]
     mov  rdx, 2
-    mov  rcx, rax            ; tx bytes (mp_blob ptr)
+    mov  rcx, rax            ; tx bytes (mp_blob ptr, or bt_buf when stripped)
     mov  r8, [s_n]           ; length
     push rbx
     push rbx                 ; 2nd push = padding: keep RSP 16-byte aligned

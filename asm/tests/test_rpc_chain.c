@@ -1074,7 +1074,16 @@ int main(void){
          * section keeps testing PACKAGE SELECTION, not IsStandardTx (same
          * treatment as tests/test_mempool_evict.c). */
         { extern void mpool_policy_set_acceptnonstd(void*, unsigned);
-          mpool_policy_set_acceptnonstd(pol, 1); }
+          mpool_policy_set_acceptnonstd(pol, 1);
+    /* MEM-23 (2026-09-05): Core's 65-non-witness-byte floor is UNCONDITIONAL
+     * -- it mitigates CVE-2017-12842, so -acceptnonstdtxn does not switch it
+     * off, and as of that change neither does ours. These fixtures are
+     * ~60-byte synthetic transactions exercising mempool mechanics, not the
+     * size rule, so the floor is disabled HERE, explicitly and test-only,
+     * rather than by weakening the production path. No config option reaches
+     * this setter. */
+    { extern void mpol_policy_set_min_size(void*, unsigned);
+      mpol_policy_set_min_size(pol, 0); } }
         mpool_policy_state_init(stbuf, 256);
         mpool_init(mp, 4096, mblob, sizeof mblob);
         utxo_init(ux, 4096, ublob, sizeof ublob);

@@ -22,15 +22,22 @@
  * MSG_WITNESS_BLOCK.
  *
  * WHAT THIS DOES NOT DO, deliberately, stated rather than implied:
- *   - no re-announcement of accepted transactions to other peers (Core
- *     trickles invs; our user-originated txs are pushed by tx_submit.c --
- *     the propagation duty for txs that exist nowhere else. A relay-received
- *     tx already propagates through the peers who sent it);
- *   - no BIP339 wtxidrelay negotiation (announcements reach us fine as
- *     txids; wtxid-based dedupe would need per-connection negotiation state
- *     in the handshake);
  *   - block-type inv entries are ignored here exactly as the sync drains
  *     ignore them today -- block keep-up is headers-driven per rotation.
+ *
+ * MEM-22 (audit 2026-09-03): this list used to open with two more items --
+ * "no re-announcement of accepted transactions" and "no BIP339 wtxidrelay
+ * negotiation" -- and BOTH were implemented, one of them in this very file:
+ *
+ *   - re-announcement is txrelay_announce (:562), called once per worker
+ *     rotation from daemon/main.c:5837;
+ *   - wtxidrelay IS negotiated -- bitcoind.asm:370 sends it after version and
+ *     before verack on outbound, bitcoin_serve.asm:433 accepts it inbound --
+ *     and TXR_MSG_WTX (:91) is handled on both the request and serve paths.
+ *
+ * A "what this does not do" list is the most load-bearing kind of comment in
+ * this tree, because it is what a reader trusts INSTEAD of reading the code.
+ * These two had been false since the features landed.
  *
  * A getdata's replies may not all arrive within this pass's budget; the
  * remainder are read -- and discarded -- by the next sync pass's drain.
@@ -81,6 +88,11 @@ extern long tx_accept_test_reason(void* mp, const u8* txid, const u8* tx, unsign
                                   unsigned long long* vsize_out);
 extern int  txacc_fee_reconsiderable(const char* reason);
 
+extern long strip_witness(const unsigned char* tx, long long txlen,
+                          unsigned char* out, long cap);   /* MEM-24 */
+/* MEM-24: a stripped tx is never larger than the witness form it came
+ * from, so the mempool's own per-tx cap bounds this. */
+#define TXR_MAX_TX_BYTES (400*1000)
 #define TXR_MSG_TX          1u
 #define TXR_MSG_WITNESS_TX  0x40000001u
 #define TXR_MSG_WTX         5u          /* BIP339: wtxid-based tx inv/getdata */
@@ -1345,7 +1357,31 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 unsigned long got_len = 0;
                 const u8* bytes = mpool_get(mp, e + 4, &got_len);
                 if (bytes && got_len){
-                    p2p_write(fd, "tx", 2, bytes, (unsigned)got_len);
+                    /* MEM-24 (audit 2026-09-03): a bare MSG_TX (witness bit
+                     * CLEAR) asks for the NON-WITNESS serialization. Core
+                     * serializes TX_NO_WITNESS for it; this served the stored
+                     * witness bytes to everyone, which a strict pre-segwit
+                     * peer -- the only kind that asks with type 1 -- cannot
+                     * parse.
+                     *
+                     * This file's own header states the rule from the other
+                     * side: "requesting type 1 hands back the WITNESS-STRIPPED
+                     * serialization" is why the FETCH path asks for
+                     * MSG_WITNESS_TX. The receive half knew what type 1 means;
+                     * the serve half did not.
+                     *
+                     * Same shape as the block arm in bitcoin_serve.asm, which
+                     * has always stripped for a bare MSG_BLOCK. A strip
+                     * failure serves NOTHING rather than the wrong form. */
+                    if (type == TXR_MSG_TX){
+                        static u8 stripped[TXR_MAX_TX_BYTES];
+                        long sl = strip_witness(bytes, (long long)got_len,
+                                                stripped, (long)sizeof stripped);
+                        if (sl > 0) p2p_write(fd, "tx", 2, stripped, (unsigned)sl);
+                        else { memcpy(nf + 1 + nmiss*36, e, 36); nmiss++; }
+                    } else {
+                        p2p_write(fd, "tx", 2, bytes, (unsigned)got_len);
+                    }
                 } else {
                     memcpy(nf + 1 + nmiss*36, e, 36);
                     nmiss++;

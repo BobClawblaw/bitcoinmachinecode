@@ -673,8 +673,16 @@ static const char* txacc_prechecks(void* mp_area, const u8* tx, unsigned long tx
     if (lc > 2500) return "bad-txns-legacy-sigops";              /* MAX_TX_LEGACY_SIGOPS, Core v30 */
     long sc = txacc_sigop_cost(mp_area, tx, txlen);
     if (sc > 16000) return "bad-txns-too-many-sigops";           /* MAX_STANDARD_TX_SIGOPS_COST */
-    const char* wr = txacc_witness_standard(mp_area, tx, txlen);
-    if (wr) return wr;
+    /* MEM-23: Core gates IsWitnessStandard on require_standard
+     * (validation.cpp:909, `tx.HasWitness() && require_standard && ...`).
+     * This ran it unconditionally, so -acceptnonstdtxn did not actually
+     * accept every non-standard witness -- the opposite direction from the
+     * tx-size-small case above, and both were wrong the same way: the switch
+     * was applied where Core does not and not applied where Core does. */
+    if (!g_cfg.acceptnonstdtxn){
+        const char* wr = txacc_witness_standard(mp_area, tx, txlen);
+        if (wr) return wr;
+    }
     mpool_policy_set_pending_sigops(sc > 0 ? (unsigned long long)sc : 0ULL);
     return 0;
 }

@@ -1,7 +1,7 @@
 /* rpc_server.h -- HTTP JSON-RPC 2.0 server endpoint (daemon side).
  *
- * The production counterpart to the bitcoin-cli client card (t_8e5be37f).
- * Where the client POSTs JSON-RPC requests over a loopback socket, this module
+ * The production counterpart to the bmc_cli client card (t_8e5be37f).
+ * Where the client POSTs JSON-RPC requests over a socket, this module
  * LISTENS on a TCP port, authenticates (HTTP Basic rpcuser/rpcpassword per
  * Bitcoin Core), parses a JSON-RPC 2.0 request, routes it through the SAME
  * rpc_dispatch() used client-side, and writes back a Core-bit-exact JSON-RPC
@@ -42,7 +42,12 @@ typedef struct {
     const char* user;           /* rpcuser */
     const char* pass;           /* rpcpassword */
     const rpc_wallet* wallet;   /* wallet state the requests resolve against */
-    /* Core -rpcbind. NULL/empty keeps the loopback-only bind, which is both
+    /* RPC-19 (audit 2026-09-03): this header used to describe a
+     * LOOPBACK-ONLY server. -rpcbind and -rpcallowip are both real, so it
+     * can bind elsewhere; loopback is the DEFAULT, not the limit. Note
+     * RPC-18: the listener is IPv4-only, so an IPv6 -rpcbind is refused.
+     *
+     * Core -rpcbind. NULL/empty keeps the loopback-only bind, which is both
      * the default and what you get when no -rpcallowip was configured. */
     const char* bind_addr;
     /* Core's HTTP allow list. NULL means loopback-only, enforced by the
