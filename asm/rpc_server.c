@@ -473,10 +473,98 @@ static int wl_forbidden(const char* user, const char* body, size_t blen){
     if (req->typ == RJ_OBJ){
         rj_val* m = rj_obj_get(req, "method");
         if (m && m->typ == RJ_STR && m->str && !rpc_whitelist_allows(user, m->str)) forbid = 1;
+    } else if (req->typ == RJ_ARR){
+        /* RPC-6: a batch is checked ELEMENT BY ELEMENT, as Core does
+         * (httprpc.cpp: "Check authorization for each request's method").
+         * One forbidden member forbids the whole batch -- the 403 is written
+         * before anything executes, so a whitelisted method cannot be smuggled
+         * past by burying it in an array with a permitted one. A non-object
+         * member is left alone here; it becomes a per-element error object in
+         * the batch reply below, at HTTP 200. */
+        for (size_t i = 0; i < req->nitems && !forbid; i++){
+            const rj_val* e = req->items[i];
+            if (!e || e->typ != RJ_OBJ) continue;
+            rj_val* m = rj_obj_get(e, "method");
+            if (m && m->typ == RJ_STR && m->str && !rpc_whitelist_allows(user, m->str)) forbid = 1;
+        }
     }
     rj_free(req);
     return forbid;
 }
+/* Execute ONE JSON-RPC request object and build its reply.
+ *
+ * Split out of handle_request for RPC-6 so the batch path can reuse it. Two
+ * contracts differ from the old inline code and matter to the caller:
+ *
+ *   - it does NOT free `req`. A batch element is owned by the array around
+ *     it, and freeing it here would double-free at the end of handle_request.
+ *   - *status is the status the SINGLE-request path would send. A batch
+ *     ignores it: Core answers every batch HTTP 200 and carries each
+ *     element's failure as an error OBJECT inside the array ("Batches never
+ *     throw HTTP errors, they are always just included in HTTP OK
+ *     responses" -- httprpc.cpp).
+ *
+ * A non-object where a request belongs is Core's RPC_INVALID_REQUEST
+ * "Invalid Request object" (rpc/request.cpp JSONRPCRequest::parse), NOT the
+ * top-level -32700; only a top level that is neither object nor array gets
+ * that one.
+ */
+static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
+    *status = HTTP_OK;
+    *is_notification = 0;
+    if (!req || req->typ != RJ_OBJ) {
+        *status = HTTP_BAD_REQUEST;
+        return build_reply(NULL, 1, RPC_INVALID_REQUEST,
+                           "Invalid Request object", /*v2*/0, NULL, 1);
+    }
+    rj_val* reply = NULL;
+    int invalid_version = 0;
+    int v2 = request_is_v2(req, &invalid_version);
+    rj_val* id = rj_obj_get(req, "id");
+    int has_id = (id != NULL);
+
+    if (invalid_version) {
+        reply = build_reply(NULL, 1, RPC_INVALID_REQUEST,
+                            "JSON-RPC version not supported", /*v2*/0, id, has_id);
+        *status = HTTP_BAD_REQUEST;
+    } else {
+        const char* method = NULL; const rj_val* params = NULL;
+        long ec = 0; const char* em = NULL;
+        if (!parse_method(req, &method, &params, &ec, &em)) {
+            reply = build_reply(NULL, 1, ec, em, /*v2*/0, id, has_id);
+            *status = HTTP_BAD_REQUEST; /* -32600 -> 400 */
+        } else {
+            rj_val* result = NULL; long dec = 0; const char* dem = NULL;
+            int ok = rpc_dispatch(method, params, g_wallet, &result, &dec, &dem);
+            /* A V2 NOTIFICATION (no id) gets no response whatever the
+             * method did. This flag used to be set only on the success
+             * path, so a notification whose method FAILED was answered
+             * with a full error body -- a spec violation that stayed
+             * invisible while the only method the tests notified with
+             * always succeeded. Core decides the same way, after
+             * execution and regardless of outcome (httprpc.cpp: "Even
+             * though we do execute notifications, we do not respond to
+             * them"). */
+            if (v2 && !has_id) *is_notification = 1;
+            if (ok) {
+                reply = build_reply(result, 0, 0, NULL, v2, id, has_id);
+                *status = HTTP_OK;
+            } else {
+                if (v2) {
+                    reply = build_reply(NULL, 1, dec, dem, 1, id, has_id);
+                    *status = HTTP_OK; /* V2 catches errors as HTTP 200 */
+                } else {
+                    reply = build_reply(NULL, 1, dec, dem, 0, id, has_id);
+                    if (dec == RPC_METHOD_NOT_FOUND) *status = HTTP_NOT_FOUND;
+                    else if (dec == RPC_INVALID_REQUEST) *status = HTTP_BAD_REQUEST;
+                    else *status = HTTP_INTERNAL_SERVER_ERROR;
+                }
+            }
+        }
+    }
+    return reply;
+}
+
 static void handle_request(int cfd, const char* body, size_t blen) {
     rj_val* req = rj_parse(body, blen);
     int status = HTTP_OK;
@@ -487,57 +575,54 @@ static void handle_request(int cfd, const char* body, size_t blen) {
         /* non-parseable body: version unknown -> V1 reply, HTTP 500 */
         reply = build_reply(NULL, 1, RPC_PARSE_ERROR, "Parse error", /*v2*/0, NULL, 1);
         status = HTTP_INTERNAL_SERVER_ERROR;
-    } else if (req->typ != RJ_OBJ) {
-        /* parseable but not an object (e.g. array/string): Core throws
-         * RPC_PARSE_ERROR "Top-level object parse error" -> HTTP 500 */
-        reply = build_reply(NULL, 1, RPC_PARSE_ERROR, "Top-level object parse error", /*v2*/0, NULL, 1);
-        status = HTTP_INTERNAL_SERVER_ERROR;
+    } else if (req->typ == RJ_OBJ) {
+        reply = exec_one(req, &status, &is_v2_notification);
+        rj_free(req); req = NULL;
+    } else if (req->typ == RJ_ARR) {
+        /* RPC-6: a top-level array is a BATCH.
+         *
+         * This branch used to not exist: every array fell into the
+         * "not an object" case below and was answered -32700 "Top-level
+         * object parse error" at HTTP 500, with a comment attributing that
+         * to Core. Core does the opposite -- httprpc.cpp dispatches
+         * `valRequest.isArray()` to a batch loop and reserves the top-level
+         * parse error for a top level that is neither object nor array.
+         * Real tooling batches (electrs, python-bitcoinrpc's `batch_`), and
+         * a 500 there reads as a broken node.
+         *
+         * Core's three tail rules, all reproduced below:
+         *   - notifications (V2, no id) are EXECUTED but omitted from the
+         *     reply array;
+         *   - an all-notification batch (nothing left to say) is HTTP 204
+         *     with no body;
+         *   - but an EMPTY request array answers `[]` at HTTP 200, not 204.
+         *     Core takes that divergence from the JSON-RPC 2.0 spec on
+         *     purpose, for back-compat with clients predating the spec, and
+         *     says so in a comment. Hence the `req->nitems > 0` guard --
+         *     without it an empty batch would 204 and the parity would be
+         *     lost on exactly the case Core went out of its way to keep. */
+        rj_val* arr = rj_arr();
+        for (size_t i = 0; i < req->nitems; i++) {
+            int st = HTTP_OK, notif = 0;
+            rj_val* r = exec_one(req->items[i], &st, &notif);
+            if (notif) { if (r) rj_free(r); continue; }
+            rj_arr_push(arr, r ? r : rj_null());
+        }
+        status = HTTP_OK;
+        if (arr->nitems == 0 && req->nitems > 0) {
+            rj_free(arr);
+            reply = NULL;
+            status = HTTP_NO_CONTENT;
+        } else {
+            reply = arr;
+        }
         rj_free(req); req = NULL;
     } else {
-        int invalid_version = 0;
-        int v2 = request_is_v2(req, &invalid_version);
-        rj_val* id = rj_obj_get(req, "id");
-        int has_id = (id != NULL);
-
-        if (invalid_version) {
-            reply = build_reply(NULL, 1, RPC_INVALID_REQUEST,
-                                "JSON-RPC version not supported", /*v2*/0, id, has_id);
-            status = HTTP_BAD_REQUEST;
-        } else {
-            const char* method = NULL; const rj_val* params = NULL;
-            long ec = 0; const char* em = NULL;
-            if (!parse_method(req, &method, &params, &ec, &em)) {
-                reply = build_reply(NULL, 1, ec, em, /*v2*/0, id, has_id);
-                status = HTTP_BAD_REQUEST; /* -32600 -> 400 */
-            } else {
-                rj_val* result = NULL; long dec = 0; const char* dem = NULL;
-                int ok = rpc_dispatch(method, params, g_wallet, &result, &dec, &dem);
-                /* A V2 NOTIFICATION (no id) gets no response whatever the
-                 * method did. This flag used to be set only on the success
-                 * path, so a notification whose method FAILED was answered
-                 * with a full error body -- a spec violation that stayed
-                 * invisible while the only method the tests notified with
-                 * always succeeded. Core decides the same way, after
-                 * execution and regardless of outcome (httprpc.cpp: "Even
-                 * though we do execute notifications, we do not respond to
-                 * them"). */
-                if (v2 && !has_id) is_v2_notification = 1;
-                if (ok) {
-                    reply = build_reply(result, 0, 0, NULL, v2, id, has_id);
-                    status = HTTP_OK;
-                } else {
-                    if (v2) {
-                        reply = build_reply(NULL, 1, dec, dem, 1, id, has_id);
-                        status = HTTP_OK; /* V2 catches errors as HTTP 200 */
-                    } else {
-                        reply = build_reply(NULL, 1, dec, dem, 0, id, has_id);
-                        if (dec == RPC_METHOD_NOT_FOUND) status = HTTP_NOT_FOUND;
-                        else if (dec == RPC_INVALID_REQUEST) status = HTTP_BAD_REQUEST;
-                        else status = HTTP_INTERNAL_SERVER_ERROR;
-                    }
-                }
-            }
-        }
+        /* parseable, but neither an object nor an array (a string, a number,
+         * a bare true/null): Core throws RPC_PARSE_ERROR "Top-level object
+         * parse error" -> HTTP 500 */
+        reply = build_reply(NULL, 1, RPC_PARSE_ERROR, "Top-level object parse error", /*v2*/0, NULL, 1);
+        status = HTTP_INTERNAL_SERVER_ERROR;
         rj_free(req); req = NULL;
     }
 
