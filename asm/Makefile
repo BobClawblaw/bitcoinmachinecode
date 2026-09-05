@@ -760,7 +760,7 @@ daemon/build_txospender_index: daemon/build_txospender_index.c daemon/txosp_form
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_txospender_index.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 
 daemon/build_utxo: daemon/build_utxo.c $(BUILDUTXOOBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_utxo.c $(BUILDUTXOOBJS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_utxo.c $(BUILDUTXOOBJS) -lpthread
 
 # chainwork_build -- regenerate chainwork.dat from headers.dat (block_work sum).
 # Fixes the post-segwit chainwork.dat corruption; block_work itself is correct.
