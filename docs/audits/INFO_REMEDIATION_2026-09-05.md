@@ -99,5 +99,10 @@ Not recommended: RFC 6979 adoption, IPv6 RPC, and `gettxoutproof`'s coinsview
 fallback — each is real work for a benefit that should be argued on its own
 merits rather than inherited from an audit checklist.
 
-**Out of band and still open:** BLD-3. The Core oracle node's RPC password is in
-git history. Rotation is manual work on that host and no code change closes it.
+**Out of band — CLOSED later the same day:** BLD-3. The Core oracle node's RPC
+password was in git history; rotation was manual work on that host and no code
+change closed it. Done and recorded in
+`docs/audits/BLD-3_CREDENTIAL_ROTATION_2026-09-05.md`, with the exposed pair
+proven dead against the live node (cookie auth 200, leaked pair 401). The
+history caveat stands: the old value remains in git and cannot be removed
+without a rewrite.
