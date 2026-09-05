@@ -14,8 +14,9 @@
  * only tell was an "orphan sweep skipped -- manifest file and memory
  * disagree" line nobody had wired to an alarm.
  *
- * The fix returns -3 (distinct from -1 I/O and -2 WAL-tail-over-fill) on
- * every manifest-load failure: unreadable file, magic mismatch, short read,
+ * The fix fails the reload on
+ * every manifest-load failure with -1 (upstream UTX-6; this port briefly
+ * used a distinct -3, reverted for cross-arch test parity): unreadable file, magic mismatch, short read,
  * or entry count over the caller's cap. utxo_live's UTX-2 check treats any
  * negative reload as fatal, so an over-cap store now refuses to boot with a
  * message naming the compaction remedy instead of silently going blind.
@@ -125,7 +126,7 @@ int main(int argc, char** argv){
         lst.scratch_buf = malloc(scratch_cap); lst.scratch_cap = scratch_cap;
 
         long r = utxo_lsm_reload(&lst, u);
-        ck("phase 2: over-cap manifest reload returns -3 (was: silent zero runs)", r, -3);
+        ck("phase 2: over-cap manifest reload returns -1 (was: silent zero runs; upstream UTX-6 pins -1)", r, -1);
         ck("phase 2: no runs registered", (long)lst.manifest_n, 0);
     }
 

@@ -2081,8 +2081,10 @@ mac_lsm_reload_impl:
 	 * the first block (2026-09-05, store with 424 runs vs cap 256). -3 is
 	 * distinct from -1 (I/O) and -2 (WAL tail over fill): utxo_live's UTX-2
 	 * check treats any negative as fatal, and its message names the
-	 * compaction remedy. */
-	mov  x0, #-3
+	 * compaction remedy (x86 returns -1 here; this port did too, after
+	 * briefly trying a distinct -3 -- upstream's test_utxo_manifest_bad pins
+	 * -1, and one code must answer on both arches). */
+	mov  x0, #-1
 	b    .rl_ret
 .rl_open_fail:
 	/* UTX-6 (audit 2026-09-03): only ENOENT means "no manifest". A fresh
@@ -2098,7 +2100,7 @@ mac_lsm_reload_impl:
 	str  xzr, [x19, #120]
 	str  xzr, [x19, #96]
 	str  xzr, [x19, #144]
-	mov  x0, #-3
+	mov  x0, #-1
 	b    .rl_ret
 .rl_no_manifest:
 	str  xzr, [x19, #120]
