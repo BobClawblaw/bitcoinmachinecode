@@ -1,0 +1,85 @@
+[size=16pt][b]Mined Transaction Corpus — consensus acceptance from real chain history[/b][/size]
+
+Seventeen real transactions taken from the main chain, each replayed against the script flags of [i]its own block[/i]. The full-archive replay, reduced to a test that runs in milliseconds.
+
+[b]17[/b] transactions · [b]25 KB[/b] of vectors · heights [b]170[/b]–[b]850,000[/b] · [b]17/17[/b] accepted
+
+Every transaction here was mined into the main chain, so each is consensus-valid [i]under the flags active at its own height[/i]. That is the entire claim, and it is deliberately narrow. They were chosen because they broke someone's assumption, not because they are common — a thousand ordinary P2PKH spends would test less than the eleven odd ones below.
+
+[hr]
+
+[size=12pt][b]Scope, stated up front[/b][/size]
+
+This asserts [b]consensus[/b] acceptance only. It does [b]not[/b] assert mempool standardness. Several of these are consensus-valid and [i]non-standard today[/i] — bare multisig, uncompressed keys, high-S signatures — and Core cannot be asked for a policy verdict on a transaction whose inputs are long spent. Conflating the two would produce a confident wrong answer, so policy is tested separately.
+
+[hr]
+
+[size=12pt][b]1. What is in it — ordered by chain time, because the rules change[/b][/size]
+
+Height is load-bearing, not decoration. DERSIG activates at 363,725, CLTV at 388,381, CSV at 419,328, segwit at 481,824, taproot at 709,632. A transaction from 2011 must be judged by 2011's rules — and several of these are [b]rejected under today's[/b]. Each vector therefore carries its own height.
+
+[table]
+[tr][td][b]Height[/b][/td][td][b]What makes it interesting[/b][/td][/tr]
+[tr][td]170[/td][td]First P2PK -> P2PK spend (Satoshi to Hal Finney). Bare public key, no hash.[/td][/tr]
+[tr][td]728[/td][td]Early P2PKH — the shape that became ordinary.[/td][/tr]
+[tr][td]124,276[/td][td][b]Non-minimal DER[/b] — 34-byte r [i]and[/i] s, two leading zero pad bytes each. A parser that strips only one rejects this real, mined transaction.[/td][/tr]
+[tr][td]163,685[/td][td]Bare multisig (P2MS). Consensus-valid; non-standard to relay today.[/td][/tr]
+[tr][td]164,467[/td][td][b]FindAndDelete[/b] — a signature appearing inside its own scriptCode.[/td][/tr]
+[tr][td]170,052[/td][td]Early P2SH, shortly after BIP16.[/td][/tr]
+[tr][td]247,939[/td][td][b]SIGHASH_SINGLE bug[/b] — input index >= output count, so the sighash is the literal value 1. Mined, and must still validate.[/td][/tr]
+[tr][td]481,824[/td][td]Segwit activation block, four vectors: native P2WPKH, P2SH-wrapped P2WPKH (scriptSig [i]and[/i] witness), P2WSH.[/td][/tr]
+[tr][td]550,000[/td][td]Witness script paths, three vectors: native P2WSH multisig, P2SH-wrapped P2WSH, bare multisig output.[/td][/tr]
+[tr][td]750,000[/td][td]Taproot key-path (BIP341), single witness item.[/td][/tr]
+[tr][td]800,000[/td][td]Taproot script-path (BIP342), with a real 33-byte control block.[/td][/tr]
+[tr][td]850,000[/td][td][b]Anchor output (P2A)[/b] — Core v28's new output type. Exactly one instance in the entire survey.[/td][/tr]
+[/table]
+
+[hr]
+
+[size=12pt][b]2. Evidence — two controls, because passing proves nothing on its own[/b][/size]
+
+A corpus that accepts everything is indistinguishable from a verifier that accepts everything. Both controls revert something real and confirm the corpus notices.
+
+[b]Control A — wrong height: 2 of 17 rejected.[/b]
+Verifying every transaction at h=900,000 instead of its own. Both failures are pre-BIP66, refused under modern DERSIG with [tt]legacy script verification failed[/tt]. Height is not decoration.
+
+[b]Control B — DER regression: 8 of 17 rejected.[/b]
+Removing the leading-zero tolerance from the signature parser. Failures span P2WPKH, P2WSH [i]and[/i] legacy paths — the corpus reaches all three verifier arms, not just one.
+
+[hr]
+
+[size=12pt][b]The first version of this corpus was too weak, and the control proved it[/b][/size]
+
+Before the 124,276 vector existed, Control B rejected [b]nothing[/b] — all sixteen transactions still passed with the DER tolerance narrowed. The corpus looked thorough and covered that fix not at all.
+
+The tree's own comment named a real mined transaction with a 34-byte r and s. Finding it (fb0a1d8d..., height 124,276) and adding it is what gave the corpus its second set of teeth. Without running the control, a corpus that tested nothing of the sort would have shipped.
+
+[size=12pt][b]One control was itself faulty — stated rather than quietly fixed[/b][/size]
+
+The first attempt at Control B narrowed the strip bound from 32 to 33 and was described as reverting the pre-2026-08-19 behaviour. It is not: stripping to 33 bytes still works downstream, so it rejected nothing.
+
+The honest reading is that [b]that specific off-by-one remains uncovered[/b]. What the corpus does catch is the wholesale loss of leading-zero tolerance. A gap named is worth more than a gap implied.
+
+[hr]
+
+[size=12pt][b]3. How it runs[/b][/size]
+
+[code]
+validation/gen_txaccept_vectors.py   pulls each tx + its spent prevouts from the
+                                     oracle (txindex, 965,629 blocks) and freezes
+                                     them with the height they were mined at
+
+asm/tests/txaccept_vec.h             17 vectors, 25 KB
+
+asm/tests/test_txaccept_corpus.c     gated; asserts each tx verifies at its own
+                                     height, and that EVERY input was resolved
+[/code]
+
+One supporting addition was needed: [tt]tx_verify_at_height()[/tt], the consensus verifier at a given height driven by a caller-supplied resolver. [tt]tx_verify_block_connect[/tt] needs a live LSM handle; [tt]tx_verify_mempool[/tt] takes a resolver but applies policy flags. Neither shape lets a test judge a historical transaction by its own block's rules.
+
+The resolver hands prevouts back [i]in input order[/i], and the harness asserts every input was resolved — so a verifier that silently skipped one would fail rather than pass with less work done.
+
+[hr]
+
+17/17 accepted · 68 assertions · eight static audits GREEN · full gate GREEN
+Vectors regenerate from the oracle; the corpus is extended by adding a txid and a reason.

@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>html{color-scheme:light dark}body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+<title>Mined Transaction Corpus</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=Public+Sans:wght@400;500;700&display=swap">
+<style>
+  :root{
+    --paper:#F4F5F7;
+    --surface:#FFFFFF;
+    --sunk:#EAECEF;
+    --ink:#14171C;
+    --muted:#59616D;
+    --faint:#858D99;
+    --rule:#DCDFE4;
+    --rule-soft:#E7E9ED;
+    --accent:#186A5E;
+    --accent-ink:#0E4A41;
+    --alarm:#B3321E;
+    /* era ramp -- early chain to modern, used on the height spine */
+    --e1:#5C5A8A;
+    --e2:#3F6E8C;
+    --e3:#186A5E;
+    --e4:#8A6A18;
+    --shadow:0 1px 2px rgba(20,23,28,.06);
+    --display:'Fraunces',Georgia,serif;
+    --body:'Public Sans','Helvetica Neue',Arial,sans-serif;
+    --mono:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --paper:#101318; --surface:#181C22; --sunk:#1E232A;
+      --ink:#E6E9ED; --muted:#9AA3AF; --faint:#767F8B;
+      --rule:#2B313A; --rule-soft:#232830;
+      --accent:#5FBFAC; --accent-ink:#8FD6C7; --alarm:#E8735C;
+      --e1:#9895C8; --e2:#7FADCB; --e3:#5FBFAC; --e4:#D3AE52;
+      --shadow:0 1px 2px rgba(0,0,0,.45);
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#101318; --surface:#181C22; --sunk:#1E232A;
+    --ink:#E6E9ED; --muted:#9AA3AF; --faint:#767F8B;
+    --rule:#2B313A; --rule-soft:#232830;
+    --accent:#5FBFAC; --accent-ink:#8FD6C7; --alarm:#E8735C;
+    --e1:#9895C8; --e2:#7FADCB; --e3:#5FBFAC; --e4:#D3AE52;
+    --shadow:0 1px 2px rgba(0,0,0,.45);
+  }
+
+  *{box-sizing:border-box}
+  body{background:var(--paper);color:var(--ink);font-family:var(--body);
+       font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:940px;margin:0 auto;padding:44px 26px 90px}
+
+  header{border-bottom:2px solid var(--ink);padding-bottom:22px;margin-bottom:34px}
+  .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.15em;
+           text-transform:uppercase;color:var(--accent);margin:0 0 12px;font-weight:600}
+  h1{font-family:var(--display);font-weight:700;font-size:clamp(32px,5vw,48px);
+     line-height:1.05;letter-spacing:-.015em;margin:0 0 14px;text-wrap:balance}
+  .stand{font-size:18px;color:var(--muted);max-width:60ch;margin:0 0 22px}
+  .facts{display:flex;flex-wrap:wrap;gap:10px 30px;font-family:var(--mono);
+         font-size:11.5px;color:var(--faint)}
+  .facts b{color:var(--ink);font-weight:600}
+
+  h2{font-family:var(--display);font-weight:700;font-size:25px;letter-spacing:-.01em;
+     margin:44px 0 6px;text-wrap:balance}
+  h2 .num{font-family:var(--mono);font-size:12px;color:var(--accent);
+          font-weight:600;display:block;letter-spacing:.12em;margin-bottom:6px;
+          text-transform:uppercase}
+  p{max-width:66ch;margin:0 0 15px}
+  code{font-family:var(--mono);font-size:.85em;background:var(--sunk);
+       padding:.12em .34em;border-radius:2px;word-break:break-word}
+  strong{font-weight:700}
+  em{font-style:italic;color:var(--muted)}
+
+  /* ---- the height spine ---- */
+  .spine{list-style:none;margin:22px 0 0;padding:0;position:relative}
+  .spine::before{content:"";position:absolute;left:96px;top:6px;bottom:6px;
+                 width:2px;background:var(--rule)}
+  .spine li{display:grid;grid-template-columns:88px 26px minmax(0,1fr);
+            gap:0 14px;align-items:start;padding:9px 0}
+  .h{font-family:var(--mono);font-size:12.5px;font-weight:600;text-align:right;
+     color:var(--era);padding-top:2px;font-variant-numeric:tabular-nums}
+  .dot{position:relative;height:100%}
+  .dot::after{content:"";position:absolute;left:3px;top:7px;width:11px;height:11px;
+              border-radius:50%;background:var(--paper);
+              border:2.5px solid var(--era)}
+  .what{min-width:0}
+  .what b{font-weight:700;display:block;line-height:1.35}
+  .what span{color:var(--muted);font-size:14.5px}
+  .flag{display:inline-block;font-family:var(--mono);font-size:10px;font-weight:600;
+        letter-spacing:.08em;text-transform:uppercase;color:var(--era);
+        border:1px solid var(--era);border-radius:2px;padding:1px 5px;
+        margin-left:7px;vertical-align:2px}
+  @media (max-width:620px){
+    .spine::before{left:70px}
+    .spine li{grid-template-columns:62px 26px minmax(0,1fr)}
+    .h{font-size:11.5px}
+  }
+
+  /* ---- controls ---- */
+  .ctl{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));
+       gap:16px;margin:20px 0 6px}
+  .ctl > div{background:var(--surface);border:1px solid var(--rule);
+             border-radius:5px;padding:16px 17px;box-shadow:var(--shadow)}
+  .ctl h3{font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+          text-transform:uppercase;color:var(--muted);margin:0 0 10px;font-weight:600}
+  .big{font-family:var(--display);font-size:34px;font-weight:700;line-height:1;
+       color:var(--alarm);letter-spacing:-.02em}
+  .big small{font-family:var(--body);font-size:14px;font-weight:400;color:var(--muted);
+             letter-spacing:0;margin-left:6px}
+  .ctl p{font-size:14px;margin:10px 0 0;color:var(--muted);max-width:none}
+
+  pre{background:var(--surface);border:1px solid var(--rule);border-radius:5px;
+      padding:13px 15px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;
+      line-height:1.55;margin:16px 0;box-shadow:var(--shadow)}
+
+  .note{border-left:3px solid var(--alarm);background:var(--surface);
+        padding:15px 18px;border-radius:0 5px 5px 0;margin:22px 0;
+        box-shadow:var(--shadow)}
+  .note h4{font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+           text-transform:uppercase;color:var(--alarm);margin:0 0 8px;font-weight:600}
+  .note p{margin:0 0 10px;font-size:15px}
+  .note p:last-child{margin:0}
+
+  .scope{border-left:3px solid var(--accent);background:var(--surface);
+         padding:15px 18px;border-radius:0 5px 5px 0;margin:22px 0;box-shadow:var(--shadow)}
+  .scope h4{font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+            text-transform:uppercase;color:var(--accent);margin:0 0 8px;font-weight:600}
+  .scope p{margin:0;font-size:15px}
+
+  footer{margin-top:52px;padding-top:18px;border-top:1px solid var(--rule);
+         font-family:var(--mono);font-size:11.5px;color:var(--faint);line-height:1.7}
+  a{color:var(--accent)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">bitcoinmachinecode · consensus acceptance</p>
+  <h1>Mined Transaction Corpus</h1>
+  <p class="stand">Seventeen real transactions taken from the main chain, each replayed against
+    the script flags of its own block. The full-archive replay, reduced to a test that runs in
+    milliseconds.</p>
+  <div class="facts">
+    <span><b>17</b> transactions</span>
+    <span><b>25 KB</b> of vectors</span>
+    <span>heights <b>170</b> – <b>850,000</b></span>
+    <span><b>17/17</b> accepted</span>
+    <span>gate <b>GREEN</b></span>
+  </div>
+</header>
+
+<p>Every transaction here was mined into the main chain, so each is consensus-valid
+   <em>under the flags active at its own height</em>. That is the entire claim, and it is
+   deliberately a narrow one. The transactions were chosen because they broke someone's
+   assumption, not because they are common — a thousand ordinary P2PKH spends would test
+   less than the eleven odd ones below.</p>
+
+<div class="scope">
+  <h4>Scope, stated up front</h4>
+  <p>This asserts <strong>consensus</strong> acceptance only. It does not assert mempool
+     standardness. Several of these are consensus-valid and <em>non-standard today</em> —
+     bare multisig, uncompressed keys, high-S signatures — and Core cannot be asked for a
+     policy verdict on a transaction whose inputs are long spent. Conflating the two would
+     produce a confident wrong answer, so policy is tested separately.</p>
+</div>
+
+<h2><span class="num">01 · what is in it</span>Ordered by chain time, because the rules change</h2>
+
+<p>Height is load-bearing, not decoration. DERSIG activates at 363,725, CLTV at 388,381,
+   CSV at 419,328, segwit at 481,824, taproot at 709,632. A transaction from 2011 must be
+   judged by 2011's rules — and several of these are <strong>rejected under today's</strong>.
+   Each vector therefore carries its own height.</p>
+
+<ul class="spine">
+  <li style="--era:var(--e1)"><span class="h">170</span><span class="dot"></span>
+    <span class="what"><b>First P2PK → P2PK spend</b><span>Satoshi to Hal Finney. Bare public key, no hash.</span></span></li>
+  <li style="--era:var(--e1)"><span class="h">728</span><span class="dot"></span>
+    <span class="what"><b>Early P2PKH</b><span>The shape that became ordinary.</span></span></li>
+  <li style="--era:var(--e1)"><span class="h">124,276</span><span class="dot"></span>
+    <span class="what"><b>Non-minimal DER<span class="flag">edge</span></b><span>34-byte <code>r</code> <em>and</em> <code>s</code> — two leading zero pad bytes each. A parser that strips only one rejects this real, mined transaction.</span></span></li>
+  <li style="--era:var(--e1)"><span class="h">163,685</span><span class="dot"></span>
+    <span class="what"><b>Bare multisig (P2MS)</b><span>Consensus-valid; non-standard to relay today.</span></span></li>
+  <li style="--era:var(--e1)"><span class="h">164,467</span><span class="dot"></span>
+    <span class="what"><b>FindAndDelete<span class="flag">edge</span></b><span>A signature appearing inside its own scriptCode.</span></span></li>
+  <li style="--era:var(--e2)"><span class="h">170,052</span><span class="dot"></span>
+    <span class="what"><b>Early P2SH</b><span>Pay-to-script-hash, shortly after BIP16.</span></span></li>
+  <li style="--era:var(--e2)"><span class="h">247,939</span><span class="dot"></span>
+    <span class="what"><b>SIGHASH_SINGLE bug<span class="flag">edge</span></b><span>Input index ≥ output count, so the sighash is the literal value <code>1</code>. Mined, and must still validate.</span></span></li>
+  <li style="--era:var(--e3)"><span class="h">481,824</span><span class="dot"></span>
+    <span class="what"><b>Segwit activation block — four vectors</b><span>Native P2WPKH, P2SH-wrapped P2WPKH (scriptSig <em>and</em> witness), and P2WSH.</span></span></li>
+  <li style="--era:var(--e3)"><span class="h">550,000</span><span class="dot"></span>
+    <span class="what"><b>Witness script paths — three vectors</b><span>Native P2WSH multisig, P2SH-wrapped P2WSH, bare multisig output.</span></span></li>
+  <li style="--era:var(--e4)"><span class="h">750,000</span><span class="dot"></span>
+    <span class="what"><b>Taproot key-path</b><span>BIP341, a single witness item.</span></span></li>
+  <li style="--era:var(--e4)"><span class="h">800,000</span><span class="dot"></span>
+    <span class="what"><b>Taproot script-path</b><span>BIP342, with a real 33-byte control block.</span></span></li>
+  <li style="--era:var(--e4)"><span class="h">850,000</span><span class="dot"></span>
+    <span class="what"><b>Anchor output (P2A)<span class="flag">rare</span></b><span>Core v28's new output type. Exactly one instance in the entire survey.</span></span></li>
+</ul>
+
+<h2><span class="num">02 · evidence</span>Two controls, because passing proves nothing on its own</h2>
+
+<p>A corpus that accepts everything is indistinguishable from a verifier that accepts
+   everything. Both controls below revert something real and confirm the corpus notices.</p>
+
+<div class="ctl">
+  <div>
+    <h3>Control A — wrong height</h3>
+    <p class="big">2<small>of 17 rejected</small></p>
+    <p>Verifying every transaction at h=900,000 instead of its own. Both failures are
+       pre-BIP66, refused under modern DERSIG with <code>legacy script verification
+       failed</code>. Height is not decoration.</p>
+  </div>
+  <div>
+    <h3>Control B — DER regression</h3>
+    <p class="big">8<small>of 17 rejected</small></p>
+    <p>Removing the leading-zero tolerance from the signature parser. Failures span
+       P2WPKH, P2WSH <em>and</em> legacy paths — the corpus reaches all three verifier
+       arms, not just one.</p>
+  </div>
+</div>
+
+<div class="note">
+  <h4>The first version of this corpus was too weak, and the control proved it</h4>
+  <p>Before the 124,276 vector existed, Control B rejected <strong>nothing</strong> — all
+     sixteen transactions still passed with the DER tolerance narrowed. The corpus looked
+     thorough and covered that fix not at all.</p>
+  <p>The tree's own comment named a real mined transaction with a 34-byte <code>r</code> and
+     <code>s</code>. Finding it (<code>fb0a1d8d…</code>, height 124,276) and adding it is what
+     gave the corpus its second set of teeth. Without running the control, a corpus that
+     tested nothing of the sort would have shipped.</p>
+</div>
+
+<div class="note">
+  <h4>One control was itself faulty — stated rather than quietly fixed</h4>
+  <p>The first attempt at Control B narrowed the strip bound from 32 to 33 and was described
+     as reverting the pre-2026-08-19 behaviour. It is not: stripping to 33 bytes still works
+     downstream, so it rejected nothing.</p>
+  <p>The honest reading is that <strong>that specific off-by-one remains uncovered</strong>.
+     What the corpus does catch is the wholesale loss of leading-zero tolerance. A gap named
+     is worth more than a gap implied.</p>
+</div>
+
+<h2><span class="num">03 · how it runs</span>Three pieces</h2>
+
+<pre>validation/gen_txaccept_vectors.py   pulls each tx + its spent prevouts from the
+                                     oracle (txindex, 965,629 blocks) and freezes
+                                     them with the height they were mined at
+
+asm/tests/txaccept_vec.h             17 vectors, 25 KB
+
+asm/tests/test_txaccept_corpus.c     gated; asserts each tx verifies at its own
+                                     height, and that EVERY input was resolved</pre>
+
+<p>One supporting addition was needed: <code>tx_verify_at_height()</code>, the consensus
+   verifier at a given height driven by a caller-supplied resolver.
+   <code>tx_verify_block_connect</code> needs a live LSM handle;
+   <code>tx_verify_mempool</code> takes a resolver but applies policy flags. Neither shape
+   lets a test judge a historical transaction by its own block's rules.</p>
+
+<p>The resolver hands prevouts back <em>in input order</em>, and the harness asserts every
+   input was resolved — so a verifier that silently skipped one would fail rather than pass
+   with less work done.</p>
+
+<footer>
+  17/17 accepted · 68 assertions · eight static audits GREEN · full gate GREEN<br>
+  Vectors regenerate from the oracle; the corpus is extended by adding a txid and a reason.
+</footer>
+
+</div>
+</body>
+</html>
