@@ -948,12 +948,25 @@ void tap_txctx_export(const uint8_t* tx, int64_t txlen, int64_t n_in,
     }
 }
 
-int taproot_verify_input(const uint8_t* spk,
+/* IR-9 (INTERP_REVIEW_2026-09-05): the caller's script flags reach the
+ * tapscript leaf. Only the bits Core acts on under SIGVERSION_TAPSCRIPT are
+ * honoured -- MINIMALDATA (6) and DISCOURAGE_OP_SUCCESS (19). CLEANSTACK and
+ * MINIMALIF are unconditional consensus for tapscript and already enforced;
+ * the ECDSA-only bits (STRICTENC, LOW_S, NULLFAIL, CONST_SCRIPTCODE) have no
+ * meaning for a Schnorr leaf and are masked so a mempool candidate cannot be
+ * rejected for a rule Core never applies here. The zero-flags entry point
+ * below keeps the 12-argument ABI the asm callers (tapagg_verify_asm and the
+ * differential) push onto the stack: a 13th argument added to THAT symbol
+ * would be read from an unwritten stack slot. */
+#define TS_POLICY_FLAGS_MASK ((1ULL<<6) | (1ULL<<19))
+#define TS_FLAG_DISCOURAGE_OP_SUCCESS (1ULL<<19)
+
+int taproot_verify_input_flags(const uint8_t* spk,
                          const uint8_t* const* wit, const uint32_t* witlen, uint32_t nwit,
                          const uint8_t* tx, int64_t txlen, int64_t n_in,
                          const uint8_t* prevouts, const uint8_t* amounts,
                          const uint8_t* spks, int64_t num_inputs,
-                         const char** reason)
+                         const char** reason, uint64_t flags)
 {
     if (nwit == 0) { *reason = "p2tr empty witness"; return 0; }
 
@@ -1075,7 +1088,14 @@ int taproot_verify_input(const uint8_t* spk,
      *
      * Anything that fails these checks is rejected BEFORE a single byte is
      * copied onto the stack. ---- */
-    if (ts_has_op_success(script, slen)) return 1;   /* overrides everything below */
+    if (ts_has_op_success(script, slen)) {
+        /* Core: an OP_SUCCESSx leaf succeeds unconditionally under consensus;
+         * under STANDARD flags it is DISCOURAGE_OP_SUCCESS. The interpreter
+         * has the same arm (bitcoin_interp.asm:457) but this prescan returned
+         * before it could run -- and until IR-9 no flags reached it anyway. */
+        if (flags & TS_FLAG_DISCOURAGE_OP_SUCCESS) { *reason = "p2tr tapscript OP_SUCCESSx discouraged"; return 0; }
+        return 1;   /* overrides everything below */
+    }
     {
         uint32_t ninit = eff - 2;                     /* eff >= 2 checked above */
         if (ninit > TS_MAX_STACK) {
@@ -1134,7 +1154,8 @@ int taproot_verify_input(const uint8_t* spk,
      * serialization -- the same one taproot_sighash parses -- so the file's own
      * tx_parse/tx_seq read version/locktime/nSequence directly (keeping this
      * translation unit self-contained; no cross-object link dependency). */
-    st.flags = TS_SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY | TS_SCRIPT_VERIFY_CHECKSEQUENCEVERIFY;
+    st.flags = TS_SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY | TS_SCRIPT_VERIFY_CHECKSEQUENCEVERIFY
+             | (flags & TS_POLICY_FLAGS_MASK);        /* IR-9 */
     {
         /* Read version/locktime/nSequence out IMMEDIATELY and let the view
          * die here. taproot_sighash() owns the same per-thread offset table,
@@ -1163,4 +1184,16 @@ int taproot_verify_input(const uint8_t* spk,
      * SIGVERSION_TAPSCRIPT-specific cleanstack/empty-result rule (exactly
      * one truthy element left) passed -- nothing further to check here. */
     return 1;
+}
+
+/* Consensus entry point: the 12-argument ABI, no policy flags. */
+int taproot_verify_input(const uint8_t* spk,
+                         const uint8_t* const* wit, const uint32_t* witlen, uint32_t nwit,
+                         const uint8_t* tx, int64_t txlen, int64_t n_in,
+                         const uint8_t* prevouts, const uint8_t* amounts,
+                         const uint8_t* spks, int64_t num_inputs,
+                         const char** reason)
+{
+    return taproot_verify_input_flags(spk, wit, witlen, nwit, tx, txlen, n_in,
+                                      prevouts, amounts, spks, num_inputs, reason, 0);
 }

@@ -151,6 +151,13 @@ extern int  taproot_verify_input(const u8* spk,
                                  const u8* prevouts, const u8* amounts,
                                  const u8* spks, int64_t num_inputs,
                                  const char** reason);
+/* IR-9: same, with the caller's script flags (policy bits reach the leaf) */
+extern int taproot_verify_input_flags(const u8* spk,
+                                 const u8* const* wit, const u32* witlen, u32 nwit,
+                                 const u8* tx, int64_t txlen, int64_t n_in,
+                                 const u8* prevouts, const u8* amounts,
+                                 const u8* spks, int64_t num_inputs,
+                                 const char** reason, unsigned long long flags);
 
 /* ---- confirmed UTXO set (bitcoin_utxo_lsm.asm) ---- */
 extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
@@ -478,13 +485,15 @@ static int tapagg_build(bytepool_t* pool, tapagg_t* d,
  * index WITHIN ITS OWN TRANSACTION, which is what BIP341 commits to. */
 static int tapagg_verify(const bytepool_t* pool, const tapagg_t* d, const u8* spk,
                          const u8* const* wit, const u32* witlen, u32 nwit,
-                         u64 local_idx, const char** reason){
+                         u64 local_idx, unsigned long long flags, const char** reason){
     const u8* A = pool->buf;
     const char* r = "p2tr verify failed";
-    if (!taproot_verify_input(spk, wit, witlen, nwit,
+    /* IR-9: the WV0 and LEGACY arms forwarded `flags`; this one did not, so
+     * TXV_MEMPOOL_POLICY_FLAGS never reached a tapscript leaf. */
+    if (!taproot_verify_input_flags(spk, wit, witlen, nwit,
                               A + d->ns_off, (int64_t)d->nslen, (int64_t)local_idx,
                               A + d->po_off, A + d->am_off, A + d->sp_off,
-                              (int64_t)d->nin, &r)) { *reason = r; return 0; }
+                              (int64_t)d->nin, &r, flags)) { *reason = r; return 0; }
     return 1;
 }
 
@@ -612,7 +621,7 @@ static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long fla
          * from here on -- so this case is safe to run concurrently. */
         if (!g_t1_tap_built) { *reason = "internal: taproot aggregate not built"; return 0; }
         return tapagg_verify(&g_t1_tap_pool, &g_t1_tap, in->spk,
-                             in->wit, in->witlen, in->nwit, i, reason);
+                             in->wit, in->witlen, in->nwit, i, flags, reason);
     }
     case TXV_SHAPE_WV0: {
         int err = sv_verify_witness_v0(in->wprog, in->wproglen, in->wit, in->witlen, in->nwit,
@@ -919,7 +928,9 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
  *   MINIMALIF     (13)  bitcoin_interp.asm:809
  *   NULLFAIL      (14)  bitcoin_interp.asm:2089, 3414
  *   CONST_SCRIPTCODE (16) bitcoin_scriptverify.c:121, 186-193
- *   DISCOURAGE_OP_SUCCESS (19) bitcoin_interp.asm:457
+ *   DISCOURAGE_OP_SUCCESS (19) bitcoin_interp.asm:457, and the prescan in
+ *                              bitcoin_taproot_sighash.c that returns before
+ *                              it (IR-9: flags now reach the tapscript leaf)
  *
  * DELIBERATELY ABSENT:
  *
@@ -1289,7 +1300,7 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
          * (is_p2tr required spklen == 34). */
         if (in->tap_desc == ~0ull) { *reason = "internal: taproot aggregate not built"; return 0; }
         return tapagg_verify(tap_pool, &tapdesc[in->tap_desc], spk,
-                             in->wit, in->witlen, in->nwit, in->local_idx, reason);
+                             in->wit, in->witlen, in->nwit, in->local_idx, flags, reason);
     }
     case TXV_SHAPE_WV0: {
         const u8* wprog = in->wprog ? in->wprog : spk + in->wprog_off;
@@ -1599,7 +1610,7 @@ int txv_test_tapagg_build(bytepool_t* pool, tapagg_t* d, tapin_fn get, void* ctx
 int txv_test_tapagg_verify(const bytepool_t* pool, const tapagg_t* d, const u8* spk,
                            const u8* const* wit, const u32* witlen, u32 nwit,
                            u64 local_idx, const char** reason){
-    return tapagg_verify(pool, d, spk, wit, witlen, nwit, local_idx, reason);
+    return tapagg_verify(pool, d, spk, wit, witlen, nwit, local_idx, 0, reason);
 }
 /* slice 8 seam: the dispatch, explicit-state. */
 int txv_test_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long long flags,
