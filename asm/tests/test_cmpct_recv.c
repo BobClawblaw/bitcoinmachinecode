@@ -1,7 +1,12 @@
-/* tests/test_cmpct_recv.c -- CC-2: compact blocks are reconstructed from the mempool; the missing ones fetched with getblocktxn. */
+/* tests/test_cmpct_recv.c -- CC-2: compact blocks are reconstructed from the mempool; the missing ones fetched with getblocktxn.
+ * 2026-09-06 (mempool wtxid cache): reconstruction reads each pool entry's wtxid from the slot cache mpool_put fills
+ * and hashes ZERO entries; a 50,000-entry pool is timed cache-off vs cache-on on one pinned core; both give the same block. */
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sched.h>
+#include <time.h>
 #include "cmpct_recv.h"
 extern long cmpctblock_build(unsigned char* out, const unsigned char* blockbuf, unsigned long blen, unsigned long long nonce);
 extern long p2p_blocktxn_build(unsigned char* out, const unsigned char bh[32], const unsigned char* const* txs, const long* lens, long n);
@@ -11,6 +16,8 @@ extern unsigned long mpool_struct_size(unsigned long slots);
 extern void mpool_init(void* mp, unsigned long slots, void* blob, unsigned long blob_cap);
 extern long mpool_put(void* mp, const unsigned char txid[32], const unsigned char* tx, unsigned long txlen);
 extern long mpool_del(void* mp, const unsigned char txid[32]);
+extern long mpool_count(void* mp);
+static double now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1e3 + t.tv_nsec / 1e6; }
 static int checks, fails; static void ok(int c, const char* m){ checks++; if(!c) fails++; printf("  %s %s\n", c?"ok  :":"FAIL:", m); }
 static unsigned char cap[65536]; static unsigned long cap_n; static char cap_cmd[16]; static int writes;
 static long capw(int fd, const char* cmd, unsigned cl, const void* p, unsigned pl){ (void)fd; memcpy(cap_cmd, cmd, cl); cap_cmd[cl]=0; memcpy(cap, p, pl); cap_n = pl; writes++; return pl; }
@@ -50,6 +57,30 @@ int main(void){
     unsigned long r, need, fb; cmpct_recv_stats(&r, &need, &fb); ok(r == 2 && need >= 2 && fb == 2, "stats: 2 reconstructed, getblocktxn needed, 2 fallbacks");
     printf("== the inventory type we request with ==\n");
     ok(cmpct_getdata_type(1) == 4 && cmpct_getdata_type(0) == 0x40000002u, "a leg that negotiated sendcmpct is asked for MSG_CMPCT_BLOCK; one that did not, MSG_WITNESS_BLOCK");
+    printf("== the wtxid cache: reconstruction hashes no pool entry ==\n");
+    ok(cmpct_recv_hashed() == 0, "every reconstruction above took its wtxids from the slot cache: 0 tx_wtxid calls for pool entries");
+    printf("== 50,000-entry pool, one pinned core: cache off (pre-cache ht_build) vs on, same block ==\n");
+    { cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(0, &cs); if (sched_setaffinity(0, sizeof cs, &cs) != 0) printf("  (note: could not pin to cpu 0)\n");
+      enum { BIG_SLOTS = 131072, NBIG = 50000 };
+      unsigned char* big = calloc(1, mpool_struct_size(BIG_SLOTS)); static unsigned char bblob[8 << 20]; mpool_init(big, BIG_SLOTS, bblob, sizeof bblob);
+      for (int i = 1; i < 6; i++){ unsigned char id[32]; sha256d(id, tx[i], tl[i]); mpool_put(big, id, tx[i], tl[i]); }
+      { static unsigned char f[256]; for (unsigned k = 0; k < NBIG - 5; k++){ unsigned long fl = mktx(f, 6000 + k); unsigned char id[32]; sha256d(id, f, fl); if (mpool_put(big, id, f, fl) != 1){ printf("  put failed at %u\n", k); break; } } }
+      ok(mpool_count(big) == NBIG, "50,000 entries in the pool (the block's five among them)");
+      cmpct_recv_set_enabled(1); cmpct_recv_set_writer(capw);
+      unsigned long h0 = cmpct_recv_hashed(); double t_off = 1e30, t_on = 1e30; long n_off = -1, n_on = -1; static unsigned char out2[8192]; int same_off = 1, same_on = 1;
+      cmpct_recv_set_wtxid_cache(0);                                       /* the control runs FIRST */
+      for (int r = 0; r < 9; r++){ double a = now_ms(); writes = 0; n_off = cmpct_recv_cmpctblock(9, big, cb, (unsigned long)cl, out2, sizeof out2, bh); double b = now_ms() - a; if (b < t_off) t_off = b; if (n_off != (long)bo || memcmp(out2, blk, bo)) same_off = 0; }
+      unsigned long h_off = cmpct_recv_hashed() - h0;
+      cmpct_recv_set_wtxid_cache(1);
+      for (int r = 0; r < 9; r++){ double a = now_ms(); writes = 0; n_on = cmpct_recv_cmpctblock(9, big, cb, (unsigned long)cl, out2, sizeof out2, bh); double b = now_ms() - a; if (b < t_on) t_on = b; if (n_on != (long)bo || memcmp(out2, blk, bo)) same_on = 0; }
+      unsigned long h_on = cmpct_recv_hashed() - h0 - h_off;
+      printf("  cache off: min %.2f ms/block, %lu tx_wtxid calls over 9 runs\n  cache on : min %.2f ms/block, %lu tx_wtxid calls over 9 runs\n", t_off, h_off, t_on, h_on);
+      ok(h_off == 9UL * NBIG, "control: with the cache off ht_build hashes every entry -- 50,000 tx_wtxid calls per block");
+      ok(same_off, "control: and still reconstructs the identical block");
+      ok(h_on == 0, "cache on: zero tx_wtxid calls for pool entries");
+      ok(same_on, "cache on: the identical block");
+      ok(t_on * 1.2 < t_off, "cache on is faster than the per-block rehash of 50,000 transactions by more than 20% (the rest of the per-block cost is the 64 MiB short-id table clear, common to both)");
+      free(big); }
     printf("== negative control: receive disabled (the pre-CC-2 node) ==\n");
     cmpct_recv_set_enabled(0); writes = 0;
     ok(cmpct_getdata_type(1) == 0x40000002u, "control: every block is requested in full");

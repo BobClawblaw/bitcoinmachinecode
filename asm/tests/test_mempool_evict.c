@@ -81,7 +81,7 @@ int main(void){
     mpool_policy_state_init(st, 256);
 
     /* TINY pool: blob holds only ~4 of these ~70-byte txs */
-    static u8 mp[40 + 64*48 + 8];
+    static u8 mp[40 + 64*80 + 8];
     static u8 mblob[300];
     mpool_init(mp, 64, mblob, sizeof mblob);
 
@@ -154,7 +154,7 @@ int main(void){
     {
         static u8 st2[1<<20]; memset(st2, 0, sizeof st2);
         mpool_policy_state_init(st2, 256);
-        static u8 mp2[40 + 64*48 + 8];
+        static u8 mp2[40 + 64*80 + 8];
         static u8 mblob2[300];
         mpool_init(mp2, 64, mblob2, sizeof mblob2);
 
@@ -222,7 +222,7 @@ int main(void){
     {
         static u8 st3[1<<20]; memset(st3, 0, sizeof st3);
         mpool_policy_state_init(st3, 256);
-        static u8 mp3[40 + 64*48 + 8];
+        static u8 mp3[40 + 64*80 + 8];
         static u8 mblob3[300];
         mpool_init(mp3, 64, mblob3, sizeof mblob3);
 

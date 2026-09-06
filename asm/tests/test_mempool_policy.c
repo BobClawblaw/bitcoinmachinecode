@@ -155,7 +155,7 @@ int main(void){
     {
         static unsigned char pol[128];
         static unsigned char stbuf[1<<21];
-        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mp[40 + 4096*80 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
@@ -198,7 +198,7 @@ int main(void){
     {
         static unsigned char pol[128];
         static unsigned char stbuf[1<<21];
-        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mp[40 + 4096*80 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
@@ -260,7 +260,7 @@ int main(void){
     {
         static unsigned char pol[128];
         static unsigned char stbuf[1<<21];
-        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mp[40 + 4096*80 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
@@ -337,7 +337,7 @@ int main(void){
     {
         static unsigned char pol[128];
         static unsigned char stbuf[1<<21];
-        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mp[40 + 4096*80 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
@@ -395,7 +395,7 @@ int main(void){
     {
         static unsigned char pol[128];
         static unsigned char stbuf[1<<21];
-        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mp[40 + 4096*80 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
@@ -461,7 +461,7 @@ int main(void){
     {   printf("\n== a rejected tx does not leave its sigop count behind ==\n");
         static unsigned char pol[128];
         static unsigned char stbuf[1<<21];
-        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mp[40 + 4096*80 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
@@ -513,7 +513,7 @@ int main(void){
     {   printf("\n== the adjustment rounds the way Core rounds ==\n");
         static unsigned char pol[128];
         static unsigned char stbuf[1<<21];
-        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mp[40 + 4096*80 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
@@ -554,7 +554,7 @@ int main(void){
     {   printf("\n== the dry run reports the sigop-adjusted vsize ==\n");
         static unsigned char pol[128];
         static unsigned char stbuf[1<<21];
-        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mp[40 + 4096*80 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
@@ -615,7 +615,7 @@ int main(void){
     {
         static unsigned char pol[128];
         static unsigned char stbuf[1<<21];
-        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mp[40 + 4096*80 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
@@ -663,7 +663,7 @@ int main(void){
     {
         static unsigned char pol[128];
         static unsigned char stbuf[1<<21];
-        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mp[40 + 4096*80 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
@@ -741,7 +741,7 @@ static int test_bare_multisig(void){
     for (int permit = 1; permit >= 0; permit--){
         static unsigned char pol[128];
         static unsigned char stbuf[1<<21];
-        static unsigned char mp[40 + 4096*48 + 8];
+        static unsigned char mp[40 + 4096*80 + 8];
         static unsigned char mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8];
         static unsigned char ublob[1<<16];
@@ -806,7 +806,7 @@ static int run_scenario(int si,
     POLICY_STATE_INIT(stbuf, 256);
 
     /* structural mempool */
-    static unsigned char mp[40 + 4096*48 + 8];
+    static unsigned char mp[40 + 4096*80 + 8];
     static unsigned char mblob[1<<20];
     mpool_init(mp, 4096, mblob, sizeof mblob);
 

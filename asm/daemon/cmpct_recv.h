@@ -32,4 +32,10 @@ long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned l
 long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap);
 /* stats for the log */
 void cmpct_recv_stats(unsigned long* reconstructed, unsigned long* needed_txn, unsigned long* fell_back);
+/* The short-id table takes each pool entry's wtxid from the slot cache that
+ * mpool_put fills (bitcoin_mempool.asm, 2026-09-06). Off = hash every entry
+ * per block, the pre-cache behaviour; the test's negative control. */
+void cmpct_recv_set_wtxid_cache(int on);
+/* how many pool entries ht_build has hashed with tx_wtxid since start (0 with the cache on) */
+unsigned long cmpct_recv_hashed(void);
 #endif

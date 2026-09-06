@@ -57,7 +57,7 @@ extern long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, u
 extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* buf, unsigned long buflen);
 
 /* mirrors bitcoin_serve.asm's own mp_area sizing */
-static u8 mp_area[40 + 1024*48 + 8];
+static u8 mp_area[40 + 1024*80 + 8];
 static u8 mp_blob[2<<20];
 extern void mpool_init(void* mp, unsigned long slots, void* blob, unsigned long blob_cap);
 
