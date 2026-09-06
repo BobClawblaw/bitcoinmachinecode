@@ -1,10 +1,32 @@
-# TODO — arm-port state after 2026-09-04 (the 276-commit main batch merged + ported, deployed as arm-9)
+# TODO — arm-port state after 2026-09-06 (the 1019-commit main batch merged + the 2026-09-05 port batch done, round 29 green; arm-12 deploy next)
 
 Everything below is landed on `arm-port` and pushed. History lives in
 `worklog/2026-09-0{1,2,3}.md`; the per-module port status is
 `port/PORT_ROADMAP.md`.
 
 ## Done since the last TODO (details in the worklogs)
+- [x] **The 2026-09-05 upstream batch port — CLOSED 2026-09-06, round 29
+      green.** All 15 queued x86 files ported to the AArch64 twins, one
+      branch + PR each, merged on module-test green: bitcoin_serve (#45,
+      STO-10/NET-5/MEM-10/NET-14), bitcoin_mempool (#34, MEM-21),
+      bitcoin_net (#33, NET-11), bitcoin_pubkey (#31, CRY-3),
+      bitcoin_store (#44, STO-11), bitcoin_cmpct (SER-4 cs_read was
+      already present in the twin — verified, no branch needed),
+      bitcoin_hmac (#37, CRY-4/WAL-3), bitcoin_bip39 (#40, WAL-11/CRY-4),
+      bech32 (#30, SER-5/WAL-9), sha256 (#36, CRY-6), sha512 (#38),
+      bitcoin_txv_parse (#42, VAL-10/SER-3), bitcoin_txv_dispatch (#43,
+      VAL-16), bitcoin_chainwork (#35, STO-13), bitcoind (#46, NET-13/DMN-12
+      caps + SC1 verified via shared main.c + bmc_cli rename wiring).
+      Round-28 baseline (pass 323 / fail 21 / build-fail 5) → round 29
+      (pass 344 / fail 5 = the 4 standing env-only bench fails +
+      test_utxo_torn_tail, fixed in-sweep by porting UTX-4's second half —
+      the torn-WAL-tail truncate in utxo_store_reload, f4462185 — →
+      round-29b re-sweep green: pass 345 / fail 4 env-only). Sweep
+      round-28 extras root-caused: test_rpc_server, test_rpc_transport,
+      test_cli_prompt were the bmc_cli rename missing from
+      parity_sweep.sh's build+symlink set (fixed in #46); test_bitcoind was
+      the NET-13 port itself. MEM-3/MEM-23/SC1 rode in as arch-neutral C
+      with the merge. Details in worklog/2026-09-05.md.
 - [x] CHECKSIG cluster, test_keepup, the post-merge functional fails, the
       sweep's scratch-dir layout — all closed 2026-09-01.
 - [x] test_utxo_wal_buffer: the buffered WAL is ported for real (`mac_wr_log`

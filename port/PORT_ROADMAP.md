@@ -601,30 +601,44 @@ PORTED (this session):
 - [x] bitcoin_sigops.asm -> .S: SCR-10 bounded tx_legacy_sigops (SO_NEED/
       SO_VARINT, carry-checked, fail-closed -1). test_sigops green.
 
-QUEUE (upstream semantics verified against asm/<name>.asm; ARM twins pending):
-- [ ] bitcoin_serve.asm (+269): STO-10 (serve the REQUESTED block by hash --
+2026-09-05 BATCH QUEUE — ALL DONE 2026-09-05/06 (upstream semantics verified against asm/<name>.asm; each item its own branch + PR to arm-port, merged on module-test green):
+- [x] bitcoin_serve.asm (+269): STO-10 (serve the REQUESTED block by hash --
       ht_idx maps hash->height and a fork-stale child serves the wrong
       bytes), NET-5 (contextual header rules on peer-pushed blocks via
       serve_block_ctx_ok -- archive protection), MEM-10 (serve_reject_has --
-      shared final-verdict reject filter), NET-8 (getheaders walks the whole
-      locator + honours hashStop), NET-14 (nonce). BIGGEST item.
-- [ ] bitcoin_mempool.asm (+37): MEM-21 len/blob_off coherence for the
-      lock-free MAP_SHARED readers (live-node relevant).
-- [ ] bitcoin_net.asm (+39): NET-11 -- VERIFY the v1 payload checksum
+      shared final-verdict reject filter), NET-14 (nonce). BIGGEST item.
+      -> PR #45 (NET-8 getheaders full-locator+hashStop was already present
+      in the twin; +MEM-24 verified in passing).
+- [x] bitcoin_mempool.asm (+37): MEM-21 len/blob_off coherence for the
+      lock-free MAP_SHARED readers (live-node relevant). -> PR #34.
+- [x] bitcoin_net.asm (+39): NET-11 -- VERIFY the v1 payload checksum
       (sha256d(payload)[0:4]) and take the bad-magic exit on mismatch
-      (live-node relevant).
-- [ ] bitcoin_pubkey.asm (+48): CRY-3 -- FE_REQUIRE_LT_P, refuse a field
-      element >= p in key decoding (live-node relevant).
-- [ ] bitcoin_store.asm (+86), bitcoin_cmpct.asm (+95): review + port.
-- [ ] bitcoin_hmac.asm (+69), bitcoin_bip39.asm (+99), bech32.asm (+23,
-      SER-5/WAL-9 mixed-case refusal), sha256.asm (+32, CRY-6
-      sha256_force_path dispatcher pin; x86 sha256_nia.asm deleted -- the
-      ARM twin keeps the ID_AA64ISAR0 probe, needs the force-path
-      equivalent), sha512.asm (+28), bitcoin_txv_parse.asm (+30, VAL-10/SER-3
-      canonical CompactSize), bitcoin_txv_dispatch.asm (+17, VAL-16
-      assumevalid short-circuit in the differential twin), bitcoin_chainwork.asm
-      (+19, STO-13 saturation -- audited "correct as used"), bitcoind.asm
-      (+37, SC1 shutdown-refuse glue and the bmc_cli rename).
+      (live-node relevant). -> PR #33.
+- [x] bitcoin_pubkey.asm (+48): CRY-3 -- FE_REQUIRE_LT_P, refuse a field
+      element >= p in key decoding (live-node relevant). -> PR #31.
+- [x] bitcoin_store.asm (+86): STO-11 store_set_sync/store_get_sync
+      durability switch + fdatasync-before-index-record. -> PR #44.
+- [x] bitcoin_cmpct.asm (+95): SER-4 cs_read (real CompactSize tx-count in
+      the BIP152 serving helpers) -- ALREADY PRESENT in the ARM twin
+      (absorbed with the SER-4 batch); no port branch needed, verified by
+      test_bip152 + test_compact_async in the sweeps.
+- [x] bitcoin_hmac.asm (+69): CRY-4 scratch off .bss + WAL-3 zeroise. -> PR #37.
+- [x] bitcoin_bip39.asm (+99): WAL-11/CRY-4/WAL-3. -> PR #40.
+- [x] bech32.asm (+23, SER-5/WAL-9 mixed-case refusal). -> PR #30.
+- [x] sha256.asm (+32, CRY-6 sha256_force_path dispatcher pin; x86
+      sha256_nia.asm deleted -- the ARM twin keeps the ID_AA64ISAR0 probe,
+      force-path equivalent ported). -> PR #36.
+- [x] sha512.asm (+28): CRY-4 frame-resident W schedule. -> PR #38.
+- [x] bitcoin_txv_parse.asm (+30, VAL-10/SER-3 canonical CompactSize). -> PR #42.
+- [x] bitcoin_txv_dispatch.asm (+17, VAL-16 assumevalid short-circuit in
+      the differential twin). -> PR #43.
+- [x] bitcoin_chainwork.asm (+19, STO-13 saturation -- audited "correct as
+      used"). -> PR #35.
+- [x] bitcoind.asm (+37): NET-13/DMN-12 long-UA handshake caps 256->512
+      (the +37 delta; node_handshake frame 432->704, accept recv caps,
+      g_peer_version_payload .bss); SC1 shutdown-refuse verified already
+      live via shared main.c; bmc_cli rename wired into parity_sweep.sh.
+      -> PR #46.
 Also in the batch: MEM-3 fixed upstream (cap 63, out-of-line parents,
 *truncated consulted) -- arch-neutral C, merged; MEM-23 (the unconditional
 65-byte floor) -- C, merged; SC1 inbound-refuse-during-shutdown -- C,
