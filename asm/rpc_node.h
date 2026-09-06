@@ -108,6 +108,15 @@ typedef struct {
  * counted and reported, which is all a lossy PUB feed owes anyone. */
 #define RPC_ZMQ_RING           64
 #define RPC_ANN_RING           1024   /* CC-1 announce ring (see ann_ring) */
+/* Coinstats fold ring (see csi_ring): a few blocks' worth of coin records --
+ * a heavy block creates/spends ~10k coins, so 64k entries is 5-6 blocks of
+ * headroom before the connect thread has to wait for the worker. Entries
+ * are 192 bytes (12 MB shared); scripts longer than the inline part spill
+ * into continuation entries claimed with the same atomic increment. */
+#define RPC_CSI_RING           65536
+#define RPC_CSI_BODY           176
+#define RPC_CSI_HDR            52     /* key36 | value u64 | code u64 */
+#define RPC_CSI_INLINE         (RPC_CSI_BODY - RPC_CSI_HDR)   /* 124 script bytes inline */
 #define RPC_ZMQ_TXMAX          RPC_TXSUBMIT_MAX
 
 typedef struct {
@@ -323,6 +332,44 @@ typedef struct {
      * is off (or the worker has not reported yet): readers use the stored
      * tip, the pre-3.1 behaviour. -1 = tracking on, nothing connected yet. */
     volatile long long connected_tip;
+    /* ---- coinstats FOLD ring (2026-09-06, UTXO_INLINE_BUILD_PERF_SCOPE.md:
+     * "the MuHash fold is on the bulk connect path", lever 2) -------------
+     * Steady state used to fold every created output and spent input into
+     * the MuHash accumulators ON the connect thread (~17 ms per heavy block).
+     * Now the connect thread pushes a compact coin record here and a forked
+     * fold worker (daemon/coinstats_index.c csi_worker_start) drains it into
+     * the accumulators, which it alone owns from then on. MuHash is
+     * commutative, so order within a block is irrelevant; reorg removals go
+     * through the same ring in the same sequence, so they cancel exactly.
+     *
+     * Same claim/fill/ready discipline as ann_ring above. What differs is
+     * that a lost record here is a WRONG DIGEST, not a missed announcement:
+     * the producer therefore waits for room (csi_folded_seq is the worker's
+     * consumption cursor) up to a bound, and a lap the worker detects on its
+     * side is counted AND invalidates the index (re-seeded at the next boot).
+     *
+     * csi_pushed_height / csi_folded_height: the connect thread's commit
+     * marker for the applied height goes through the ring too, and the
+     * worker publishes coinstats.dat and then csi_folded_height only after
+     * it has folded everything before that marker -- the WATERMARK the
+     * parent's gettxoutsetinfo gates on (folded < pushed: wait, then
+     * refuse). csi_deferred: bulk catch-up, no index to serve at all. */
+    volatile unsigned long long csi_seq;            /* slots claimed (connect thread) */
+    volatile unsigned long long csi_folded_seq;     /* slots consumed (fold worker)   */
+    volatile long long          csi_pushed_height;  /* last commit marker pushed      */
+    volatile long long          csi_folded_height;  /* watermark: file written through here */
+    volatile unsigned long long csi_lapped;         /* records lost to overrun (worker side)  */
+    volatile unsigned long long csi_overrun;        /* pushes that gave up waiting (producer) */
+    volatile unsigned long long csi_folds;          /* elements the worker has folded */
+    volatile int                csi_deferred;       /* bulk catch-up: index seeds at caught-up */
+    volatile int                csi_pause;          /* test seam: the worker holds its cursor */
+    volatile int                csi_worker_pid;     /* 0 = no worker (inline folding) */
+    struct {
+        volatile unsigned long long ready;          /* seq+1 once filled; 0 = empty */
+        volatile unsigned int       kind;           /* CSI_K_* (coinstats_index.c) */
+        volatile unsigned int       slen;           /* full script length (head) / chunk length (cont) */
+        unsigned char               body[RPC_CSI_BODY];
+    } csi_ring[RPC_CSI_RING];
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 

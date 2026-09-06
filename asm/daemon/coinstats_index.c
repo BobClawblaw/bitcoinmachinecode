@@ -55,6 +55,11 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <signal.h>
+#include <errno.h>
+#include <sys/wait.h>
+#include <sys/prctl.h>
+#include "../rpc_node.h"   /* node_status_t: the shared fold ring (csi_ring) */
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -70,6 +75,74 @@ extern void utxo_stats_add(void* st, const u8 key36[36], unsigned long value,
 extern void sha256_full(unsigned char out[32], const void* data, unsigned long len);
 
 #include "muhash_p2.inc.h"
+
+/* ---- the fold worker (2026-09-06, UTXO_INLINE_BUILD_PERF_SCOPE.md lever 2)
+ *
+ * Steady state folded every coin event on the CONNECT THREAD: ~10k
+ * elements x 1.66 us = ~17 ms per heavy block. Now the connect thread pushes
+ * a compact record (outpoint, value, height|coinbase, script) onto the
+ * MAP_SHARED sequenced ring in the status block (rpc_node.h csi_ring, a
+ * sibling of ann_ring) and a FORKED fold worker drains it into the
+ * accumulators -- which the worker alone owns from the fork on. The
+ * per-block commit marker goes through the same ring, so the worker writes
+ * coinstats.dat for height h only after folding everything pushed before
+ * that marker, and then publishes h as the watermark (csi_folded_height)
+ * the parent's gettxoutsetinfo gates on. MuHash is commutative, so the
+ * order of records within a block is irrelevant; reorg removals (the undo
+ * observer) push to the same ring in the same sequence and cancel exactly.
+ *
+ * ROLES BY PROCESS:
+ *   connect process  g_ring_on=1: observers push; g_csi is STALE after the
+ *                    fork (csi_read_live is for in-process/test use only);
+ *   fold worker      g_in_worker=1: folds, persists, publishes the watermark;
+ *   serve parent     g_st set pre-fork, no worker: csi_rpc_run reads the
+ *                    file, gated on the watermark.
+ * No status block (tests, tools) or no worker: everything stays inline,
+ * exactly as before -- the negative control in test_coinstats_fold_ring.
+ *
+ * A LOST RECORD IS A WRONG DIGEST (unlike ann_ring's missed announcement),
+ * so the producer waits for room up to a bound before it laps the worker,
+ * and a lap the worker detects invalidates the index outright (counted in
+ * csi_lapped; re-seeded at the next boot). */
+#define CSI_K_ADD     1u
+#define CSI_K_REMOVE  2u
+#define CSI_K_CONT    3u   /* continuation of the previous record's script */
+#define CSI_K_COMMIT  4u   /* body: i64 height */
+#define CSI_K_INVAL   5u   /* body: reason (NUL-terminated) */
+#define CSI_K_STOP    6u
+#define CSI_SCRIPT_MAX 10000   /* MAX_SCRIPT_SIZE: anything longer never enters the set */
+
+static node_status_t* g_st;              /* the pre-fork MAP_SHARED status block; NULL = inline */
+static pid_t g_worker_pid;               /* connect process: the fold worker; 0 = none */
+static int   g_ring_on;                  /* connect process: observers push instead of folding */
+static int   g_in_worker;                /* this process IS the fold worker */
+static long  g_push_wait_ms = 60000;     /* backpressure bound before the producer overruns */
+static long  g_rpc_wait_ms  = 2000;      /* how long the RPC waits for the watermark */
+static u64   g_push_overruns;
+
+void csi_set_status(void* st){ g_st = (node_status_t*)st; }
+int  csi_worker_pid(void){ return (int)g_worker_pid; }
+int  csi_ring_on(void){ return g_ring_on; }
+void csi_test_set_push_wait_ms(long ms){ g_push_wait_ms = ms; }
+void csi_test_set_rpc_wait_ms(long ms){ g_rpc_wait_ms = ms; }
+void csi_test_ring_pause(int on){ if (g_st) g_st->csi_pause = on; }
+u64  csi_test_push_overruns(void){ return g_push_overruns; }
+
+static void sleep_us(long us){ struct timespec ts; ts.tv_sec = us / 1000000; ts.tv_nsec = (us % 1000000) * 1000; nanosleep(&ts, 0); }
+static long long mono_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000; }
+
+/* The worker is a fork of a process with threads (tx_verify's pool, the
+ * mempool reload thread): stdio's lock may be held at fork time, so the
+ * worker never touches stdio -- one vsnprintf + write(2) per line. */
+static void csi_logf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+static void csi_logf(const char* fmt, ...){
+    va_list ap; va_start(ap, fmt);
+    if (!g_in_worker){ log_vfprintf_at(NULL, 0, stderr, fmt, ap); va_end(ap); return; }
+    char buf[1024]; int n = vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
+    if (n < 0) return;
+    if (n > (int)sizeof buf) n = (int)sizeof buf;
+    (void)!write(2, buf, (size_t)n);
+}
 
 /* utxo_stats_t layout (bitcoin_utxo_stats.asm): counters at 0/8/16, the
  * 384-byte accumulator at offset 96, struct comfortably inside 512 bytes.
@@ -120,11 +193,33 @@ static void num3072_inv(u8 out[384], const u8 in[384]){
     }
 }
 
-void csi_invalidate(const char* why){
+static int csi_worker_dead(void);
+static int ring_push(unsigned kind, const u8* key36, u64 value, u64 code,
+                     const u8* script, unsigned long slen, const void* raw, unsigned rawlen);
+
+/* this process's own state: drop it and the file */
+static void csi_invalidate_local(const char* why){
     if (g_csi.valid)
-        fprintf(stderr, "[coinstats] index INVALIDATED (%s) -- will re-seed\n", why ? why : "?");
+        csi_logf("[coinstats] index INVALIDATED (%s) -- will re-seed\n", why ? why : "?");
     g_csi.valid = 0;
     unlink(CSI_FILE);
+}
+
+void csi_invalidate(const char* why){
+    if (g_ring_on && g_worker_pid && !csi_worker_dead()){
+        /* The worker owns the accumulators and the file: tell it, IN
+         * SEQUENCE after any commit marker already pushed, and stop feeding.
+         * Unlinking here would race the worker's tmp+rename of an earlier
+         * marker and resurrect the file. */
+        if (g_csi.valid){
+            csi_logf("[coinstats] index INVALIDATED (%s) -- will re-seed\n", why ? why : "?");
+            const char* r = why ? why : "?";
+            ring_push(CSI_K_INVAL, 0, 0, 0, 0, 0, r, (unsigned)strlen(r) + 1);
+        }
+        g_csi.valid = 0;
+        return;
+    }
+    csi_invalidate_local(why);
 }
 
 int csi_valid(void){ return g_csi.valid; }
@@ -137,6 +232,11 @@ void csi_on_add(const u8 txid[32], u32 index, u64 value, u64 height, u64 coinbas
     if (!g_csi.valid) return;
     u8 key[36]; memcpy(key, txid, 32);
     for (int i = 0; i < 4; i++) key[32+i] = (u8)(index >> (8*i));
+    if (g_ring_on){
+        if (ring_push(CSI_K_ADD, key, value, (height << 1) | coinbase, script, slen, 0, 0) < 0)
+            csi_invalidate("fold worker gone");
+        return;
+    }
     utxo_stats_add(g_csi.num, key, value, (height << 1) | coinbase, script, slen);
     g_csi_folds++;
 }
@@ -147,6 +247,11 @@ void csi_on_remove(const u8 txid[32], u32 index, u64 value, u64 height, u64 coin
     if (!g_csi.valid) return;
     u8 key[36]; memcpy(key, txid, 32);
     for (int i = 0; i < 4; i++) key[32+i] = (u8)(index >> (8*i));
+    if (g_ring_on){
+        if (ring_push(CSI_K_REMOVE, key, value, (height << 1) | coinbase, script, slen, 0, 0) < 0)
+            csi_invalidate("fold worker gone");
+        return;
+    }
     utxo_stats_add(g_csi.den, key, value, (height << 1) | coinbase, script, slen);
     g_csi_folds++;
 }
@@ -174,7 +279,7 @@ static long csi_serialize(u8* buf){
 /* Persist the state for `height`/`blockhash`. Called from the same per-block
  * durability point as utxo_applied_height.dat. Failure invalidates rather
  * than lying about coverage. */
-void csi_commit(long height){
+static void csi_persist(long height){
     if (!g_csi.valid) return;
     g_csi.height = height;
     memset(g_csi.blockhash, 0, 32);   /* the RPC resolves height->hash itself */
@@ -182,12 +287,25 @@ void csi_commit(long height){
     long n = csi_serialize(buf);
     sha256_full(buf + n, buf, (unsigned long)n);
     int fd = open(CSI_FILE ".tmp", O_WRONLY|O_CREAT|O_TRUNC, 0644);
-    if (fd < 0){ csi_invalidate("persist open failed"); return; }
+    if (fd < 0){ csi_invalidate_local("persist open failed"); return; }
     if (write(fd, buf, (size_t)(n + 32)) != n + 32 || fsync(fd) != 0){
-        close(fd); csi_invalidate("persist write failed"); return;
+        close(fd); csi_invalidate_local("persist write failed"); return;
     }
     close(fd);
-    if (rename(CSI_FILE ".tmp", CSI_FILE) != 0) csi_invalidate("persist rename failed");
+    if (rename(CSI_FILE ".tmp", CSI_FILE) != 0) csi_invalidate_local("persist rename failed");
+}
+void csi_commit(long height){
+    if (!g_csi.valid) return;
+    if (g_ring_on){
+        /* a marker in sequence: the worker persists when it gets there and
+         * then publishes the watermark; csi_pushed_height is what the RPC
+         * compares that watermark against */
+        long long h = height;
+        if (ring_push(CSI_K_COMMIT, 0, 0, 0, 0, 0, &h, 8) < 0){ csi_invalidate("fold worker gone"); return; }
+        g_st->csi_pushed_height = h;
+        return;
+    }
+    csi_persist(height);
 }
 
 /* Load persisted state; returns the stored height, or -1 when absent/bad.
@@ -250,7 +368,9 @@ static void csi_walk_add_prog(void* st, const u8 key36[36], unsigned long value,
     }
 }
 extern long utxo_lsm_count(void* lst);
+void csi_worker_stop(void);
 int csi_seed_from_walk(void* lst, void* u, long height){
+    if (g_worker_pid) csi_worker_stop();   /* the worker's accumulators are superseded by this walk */
     utxo_stats_init(g_csi.num, 1, 0);
     utxo_stats_init(g_csi.den, 1, 0);
     g_csi_walkprog.n = 0; g_csi_walkprog.next = 20000000; g_csi_walkprog.t0 = time(NULL);
@@ -278,6 +398,7 @@ void csi_defer_to_caught_up(void){
     g_csi.valid = 0;
     unlink(CSI_FILE);
     g_csi_deferred = 1;
+    if (g_st) g_st->csi_deferred = 1;   /* the parent's RPC refuses rather than walking */
     fprintf(stderr, "[coinstats] bulk catch-up: not folding per coin; the index seeds from a walk when the node is caught up\n");
 }
 
@@ -285,10 +406,13 @@ void csi_defer_to_caught_up(void){
  * the same thread, between blocks, after the batch checkpoint -- the
  * quiescence csi_seed_from_walk needs, by the same construction as boot.
  * A no-op unless the index was deferred. */
+int csi_worker_start(void);
 void csi_on_caught_up(void* lst, void* u, long height){
     if (!g_csi_deferred) return;
     g_csi_deferred = 0;
     csi_seed_from_walk(lst, u, height);
+    if (g_st) g_st->csi_deferred = 0;
+    csi_worker_start();                    /* steady state from here: fold off the connect thread */
 }
 
 /* Boot: adopt the persisted state iff it matches the applied height exactly;
@@ -352,9 +476,34 @@ int csi_read_file(long* height, unsigned char blockhash[32], unsigned char diges
 long csi_rpc_run(int want_muhash, void* outv, char* msg, unsigned long mcap){
     struct { long height; unsigned long long txouts, bogosize, total_amount;
              unsigned char muhash[32]; int muhash_valid; } *o = outv;
-    (void)msg; (void)mcap;
+#define MSG(...) do{ if (msg && mcap) snprintf(msg, mcap, __VA_ARGS__); }while(0)
+    if (msg && mcap) msg[0] = 0;
+    /* The watermark gate (2026-09-06). The file is written by the fold
+     * worker only after it has folded everything before the commit marker
+     * for that height, so a file behind csi_pushed_height is not stale --
+     * it is a few milliseconds early. Wait a bounded time for the worker to
+     * get there; refuse (-2: the caller does NOT fall back to the walk
+     * reader) if it does not. Deferred (bulk catch-up): nothing to serve. */
+    if (g_st){
+        if (g_st->csi_deferred){
+            MSG("coinstats index unavailable during bulk catch-up (it seeds from a walk when the node is caught up)");
+            return -2;
+        }
+        long long pushed = g_st->csi_pushed_height, folded = g_st->csi_folded_height;
+        if (folded < pushed){
+            long long t0 = mono_ms();
+            while ((folded = g_st->csi_folded_height) < (pushed = g_st->csi_pushed_height)){
+                if (mono_ms() - t0 >= g_rpc_wait_ms){
+                    MSG("coinstats index still folding (folded through height %lld, applied %lld) -- retry shortly", folded, pushed);
+                    return -2;
+                }
+                sleep_us(2000);
+            }
+        }
+    }
     long h; unsigned char digest[32]; u64 tx, amt, bg;
-    if (!csi_read_file(&h, NULL, digest, &tx, &amt, &bg)) return 0;
+    if (!csi_read_file(&h, NULL, digest, &tx, &amt, &bg)){ MSG("no valid coinstats index state"); return 0; }
+#undef MSG
     o->height = h; o->txouts = tx; o->total_amount = amt; o->bogosize = bg;
     if (want_muhash){
         /* PRESENTATION byte order: the raw finalize output is the exact
@@ -383,4 +532,218 @@ int csi_read_file(long* height, unsigned char blockhash[32], unsigned char diges
     }
     g_csi = save;
     return ok;
+}
+
+/* ---- the fold ring: producer side (connect process) --------------------- */
+/* 0 = still running; otherwise dead (reaped here, or auto-reaped by the
+ * download worker's SIGCHLD=SIG_IGN, in which case waitpid says ECHILD). */
+static int csi_worker_dead(void){
+    if (!g_worker_pid) return 1;
+    int st; pid_t r = waitpid(g_worker_pid, &st, WNOHANG);
+    if (r == 0) return 0;
+    csi_logf("[coinstats] fold worker pid %d is gone (%s) -- the index cannot be maintained\n",
+             (int)g_worker_pid, r < 0 ? "already reaped" : WIFSIGNALED(st) ? "signal" : "exited");
+    g_worker_pid = 0; g_ring_on = 0;
+    if (g_st) g_st->csi_worker_pid = 0;
+    return 1;
+}
+
+/* Wait for n free slots. 1 = room; 0 = bound hit (the push proceeds and laps
+ * the worker, which detects it and invalidates); -1 = the worker is gone. */
+static int ring_wait_room(unsigned long n){
+    node_status_t* st = g_st;
+    if (st->csi_seq + n - st->csi_folded_seq <= RPC_CSI_RING) return 1;
+    long long t0 = mono_ms(); long spins = 0;
+    for (;;){
+        if (st->csi_seq + n - st->csi_folded_seq <= RPC_CSI_RING) return 1;
+        if ((++spins & 255) == 0 && csi_worker_dead()) return -1;
+        if (mono_ms() - t0 >= g_push_wait_ms) return 0;
+        sleep_us(50);
+    }
+}
+
+static void slot_fill(u64 seq, unsigned kind, unsigned slen, const void* body, unsigned blen){
+    volatile typeof(g_st->csi_ring[0])* e = &g_st->csi_ring[seq % RPC_CSI_RING];
+    e->ready = 0;
+    __sync_synchronize();
+    e->kind = kind; e->slen = slen;
+    if (blen) memcpy((void*)e->body, body, blen);
+    __sync_synchronize();
+    e->ready = seq + 1;
+}
+
+/* One record = one head slot (+ continuation slots for a script longer than
+ * the inline part), all claimed with ONE atomic increment so they are
+ * consecutive in sequence. Returns 1 pushed / -1 worker gone. */
+static int ring_push(unsigned kind, const u8* key36, u64 value, u64 code,
+                     const u8* script, unsigned long slen, const void* raw, unsigned rawlen){
+    node_status_t* st = g_st;
+    if (!st) return -1;
+    unsigned long n = 1;
+    if ((kind == CSI_K_ADD || kind == CSI_K_REMOVE) && slen > RPC_CSI_INLINE)
+        n += (slen - RPC_CSI_INLINE + RPC_CSI_BODY - 1) / RPC_CSI_BODY;
+    int room = ring_wait_room(n);
+    if (room < 0) return -1;
+    if (room == 0){ g_push_overruns++; st->csi_overrun++; }
+    u64 seq = __sync_fetch_and_add(&st->csi_seq, (u64)n);
+    if (kind == CSI_K_ADD || kind == CSI_K_REMOVE){
+        u8 body[RPC_CSI_BODY];
+        memcpy(body, key36, 36); memcpy(body + 36, &value, 8); memcpy(body + 44, &code, 8);
+        unsigned long inl = slen < RPC_CSI_INLINE ? slen : RPC_CSI_INLINE;
+        if (inl) memcpy(body + RPC_CSI_HDR, script, inl);
+        slot_fill(seq, kind, (unsigned)slen, body, (unsigned)(RPC_CSI_HDR + inl));
+        unsigned long off = inl;
+        for (unsigned long i = 1; i < n; i++){
+            unsigned long c = slen - off; if (c > RPC_CSI_BODY) c = RPC_CSI_BODY;
+            slot_fill(seq + i, CSI_K_CONT, (unsigned)c, script + off, (unsigned)c);
+            off += c;
+        }
+    } else slot_fill(seq, kind, 0, raw, rawlen);
+    return 1;
+}
+
+/* ---- the fold worker ------------------------------------------------------ */
+static volatile sig_atomic_t g_w_stop;
+static void w_sig(int s){ (void)s; g_w_stop = 1; }
+
+static void worker_run(u64 cursor, pid_t parent){
+    node_status_t* st = g_st;
+    g_in_worker = 1; g_ring_on = 0;
+    g_csi_folds = 0;                            /* the worker's own count (the seed's stays with the parent) */
+    signal(SIGTERM, w_sig); signal(SIGINT, w_sig); signal(SIGCHLD, SIG_DFL); signal(SIGPIPE, SIG_IGN);
+    prctl(PR_SET_PDEATHSIG, SIGTERM);
+    if (getppid() != parent) g_w_stop = 1;      /* died between the fork and the prctl */
+    static u8 script[CSI_SCRIPT_MAX + RPC_CSI_BODY];
+    long long stalled_since = 0;
+    int stop = 0;
+    while (!stop){
+        if (st->csi_pause){ sleep_us(1000); continue; }
+        u64 head = st->csi_seq;
+        if (head - cursor > RPC_CSI_RING){
+            u64 lost = head - cursor - RPC_CSI_RING;
+            st->csi_lapped += lost;
+            cursor = head - RPC_CSI_RING;
+            csi_logf("[coinstats] fold ring LAPPED: %llu record(s) overwritten before they were folded\n", (unsigned long long)lost);
+            csi_invalidate_local("fold ring lapped");
+        }
+        int progressed = 0;
+        while (cursor < head){
+            volatile typeof(st->csi_ring[0])* e = &st->csi_ring[cursor % RPC_CSI_RING];
+            if (e->ready != cursor + 1) break;                 /* claimed, not yet filled (or lapped: re-check above) */
+            unsigned kind = e->kind, slen = e->slen;
+            u8 body[RPC_CSI_BODY]; memcpy(body, (const void*)e->body, RPC_CSI_BODY);
+            __sync_synchronize();
+            if (e->ready != cursor + 1) break;                 /* overwritten under us */
+            unsigned long n = 1;
+            int coin = (kind == CSI_K_ADD || kind == CSI_K_REMOVE);
+            if (coin && slen > CSI_SCRIPT_MAX){ csi_invalidate_local("fold ring: corrupt record"); slen = 0; coin = 0; }
+            if (coin){
+                unsigned long inl = slen < RPC_CSI_INLINE ? slen : RPC_CSI_INLINE;
+                memcpy(script, body + RPC_CSI_HDR, inl);
+                if (slen > RPC_CSI_INLINE){
+                    n += (slen - RPC_CSI_INLINE + RPC_CSI_BODY - 1) / RPC_CSI_BODY;
+                    if (head - cursor < n) break;              /* continuation not claimed yet */
+                    unsigned long off = inl; int ok = 1;
+                    for (unsigned long i = 1; i < n && ok; i++){
+                        volatile typeof(st->csi_ring[0])* c = &st->csi_ring[(cursor + i) % RPC_CSI_RING];
+                        if (c->ready != cursor + i + 1){ ok = 0; break; }
+                        unsigned cl = c->slen;
+                        if (c->kind != CSI_K_CONT || cl > RPC_CSI_BODY || off + cl > slen){ ok = -1; break; }
+                        memcpy(script + off, (const void*)c->body, cl);
+                        __sync_synchronize();
+                        if (c->ready != cursor + i + 1){ ok = 0; break; }
+                        off += cl;
+                    }
+                    if (ok <= 0){
+                        if (ok < 0){ csi_invalidate_local("fold ring: torn continuation"); }
+                        else break;                            /* not yet filled: come back */
+                    }
+                    if (ok > 0 && off != slen){ csi_invalidate_local("fold ring: short continuation"); ok = -1; }
+                    if (ok < 0) coin = 0;
+                }
+            }
+            if (coin && g_csi.valid){
+                u64 value, code; memcpy(&value, body + 36, 8); memcpy(&code, body + 44, 8);
+                utxo_stats_add(kind == CSI_K_ADD ? g_csi.num : g_csi.den, body, value, code, script, slen);
+                g_csi_folds++; st->csi_folds = g_csi_folds;
+            } else if (kind == CSI_K_COMMIT){
+                long long h; memcpy(&h, body, 8);
+                if (g_csi.valid) csi_persist((long)h);
+                __sync_synchronize();
+                st->csi_folded_height = h;                     /* the watermark: file (or its absence) is final for h */
+            } else if (kind == CSI_K_INVAL){
+                body[RPC_CSI_BODY - 1] = 0;
+                csi_invalidate_local((const char*)body);
+            } else if (kind == CSI_K_STOP){
+                stop = 1;
+            }
+            cursor += n;
+            st->csi_folded_seq = cursor;
+            progressed = 1;
+            if (stop) break;
+        }
+        if (!progressed){
+            long long now = mono_ms();
+            if (getppid() != parent) g_w_stop = 1;
+            if (g_w_stop){
+                if (st->csi_seq == cursor) break;              /* drained: nothing more can come */
+                if (!stalled_since) stalled_since = now;
+                else if (now - stalled_since > 2000) break;    /* a slot claimed by a dead producer: give up */
+            }
+            sleep_us(200);
+        } else stalled_since = 0;
+    }
+    csi_logf("[coinstats] fold worker exiting: folded %llu element(s), watermark height %lld%s\n",
+             (unsigned long long)g_csi_folds, (long long)st->csi_folded_height,
+             g_csi.valid ? "" : " (index invalid)");
+    _exit(0);
+}
+
+/* Fork the worker. Requires a status block and a VALID in-process state
+ * (adopted or seeded) -- the child inherits it. 1 = running (this process
+ * now pushes), 0 = inline folding continues (no block, fork failed, ...). */
+int csi_worker_start(void){
+    if (!g_st || g_worker_pid || g_in_worker || !g_csi.valid) return 0;
+    node_status_t* st = g_st;
+    u64 cursor = st->csi_seq;                 /* the child's start, fixed BEFORE the fork */
+    st->csi_folded_seq = cursor;
+    st->csi_folded_height = g_csi.height; st->csi_pushed_height = g_csi.height;
+    st->csi_lapped = 0; st->csi_overrun = 0; st->csi_pause = 0; st->csi_folds = 0;
+    g_w_stop = 0;
+    pid_t parent = getpid();
+    pid_t p = fork();
+    if (p < 0){
+        csi_logf("[coinstats] fork for the fold worker failed (%s) -- folding inline\n", strerror(errno));
+        return 0;
+    }
+    if (p == 0) worker_run(cursor, parent);   /* never returns */
+    g_worker_pid = p; g_ring_on = 1; st->csi_worker_pid = (int)p;
+    csi_logf("[coinstats] fold worker pid %d started at height %ld: the connect thread pushes coin records, the worker folds\n",
+             (int)p, g_csi.height);
+    return 1;
+}
+
+/* Stop the worker: a STOP marker in sequence (everything pushed before it,
+ * commit markers included, is folded and persisted first), then wait. The
+ * connect process's own accumulators have been stale since the fork, so
+ * they are marked invalid WITHOUT unlinking the worker's file. */
+void csi_worker_stop(void){
+    if (!g_worker_pid) return;
+    pid_t p = g_worker_pid;
+    if (!csi_worker_dead()){
+        ring_push(CSI_K_STOP, 0, 0, 0, 0, 0, 0, 0);
+        long long t0 = mono_ms();
+        while (!csi_worker_dead()){
+            if (mono_ms() - t0 > 15000){
+                csi_logf("[coinstats] fold worker pid %d did not stop in 15 s -- killing it (the index re-seeds if its last commit is missing)\n", (int)p);
+                kill(p, SIGKILL);
+                int st; while (waitpid(p, &st, 0) < 0 && errno == EINTR) {}
+                break;
+            }
+            sleep_us(1000);
+        }
+    }
+    g_worker_pid = 0; g_ring_on = 0;
+    if (g_st) g_st->csi_worker_pid = 0;
+    g_csi.valid = 0;
 }
