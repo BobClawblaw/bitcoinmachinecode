@@ -340,8 +340,28 @@ check_minimal_push:
 
 	.section .tbss,"awT",@nobits
 	.align 4
-vfexec:		.space 1024	/* condition stack (bytes) */
+/* vfExec condition stack. SCR-2 (audit 2026-09-03, x86 asm/bitcoin_scriptcodec.asm)
+ * was never ported here: Core has NO nesting limit under tapscript -- there is
+ * no opcode limit and no script-size limit for a leaf -- so OP_IF nesting runs
+ * to one conditional per script byte. This file still had the original 1024-byte
+ * buffer AND an unbounded vfexec_push, so the 1025th nested OP_IF wrote past
+ * vfexec into vfexec_sp and whatever else sits in the TLS block: an
+ * attacker-controlled out-of-bounds write from P2P input, plus a false accept of
+ * an unbalanced script. The ARM symptom was test_scr_interp_bounds' 250,000-deep
+ * IF vector dying on SIGSEGV inside vfexec_push. The buffer now covers 5 MiB of
+ * script bytes (more than the 4 MiB block witness limit can express) and
+ * vfexec_push refuses at the cap instead of writing.
+ * VFEXEC_MAX is a 12-bit<<12 cmp immediate (1280<<12), so the bound is one instruction. */
+.equ VFEXEC_MAX,5*1024*1024	/* GAS needs the dot; NASM's bare `equ` is a syntax error */
+vfexec:		.space VFEXEC_MAX	/* condition stack (bytes) */
 vfexec_sp:	.space 8
+/* IR-4 (x86 71b6de1f): Core's ConditionStack caches the position of the FIRST
+ * false entry (or VFEXEC_NO_FALSE), so "is every entry true" is ONE compare.
+ * vfexec_all_true used to scan the whole buffer before every opcode -- O(depth)
+ * per opcode, O(N^2) per script: a 250,000-deep leaf of OP_IF/OP_ENDIF pairs is
+ * ~6 x 10^10 byte loads, which is why that vector also needed the bound above. */
+vfexec_ff:	.space 8
+.equ VFEXEC_NO_FALSE,-1		/* stored as -1; tested as "< 0", never `cmp #-1` */
 
 /* ---- IR-6 (INTERP_REVIEW_2026-09-05, x86 4efb0c4a): position -> slot handle
  * table. stack_erase_index shifted whole 528-byte records to close a hole, so
@@ -997,18 +1017,40 @@ get_op:
 vfexec_sp_reset:
 	TLS_ADDR x0, vfexec_sp
 	str  xzr,[x0]
+	mov  x1,#-1			/* IR-4: no entry is false (VFEXEC_NO_FALSE).
+					   Clobbers x1 as well as x0 now -- the only caller
+					   is script_eval's prologue, where nothing is live. */
+	TLS_ADDR x0, vfexec_ff
+	str  x1,[x0]
 	ret
 	.size vfexec_sp_reset,.-vfexec_sp_reset
 
 	.global vfexec_push
 	.type vfexec_push,%function
-vfexec_push:				/* x0 = 0/1 */
-	TLS_ADDR x2, vfexec_sp
-	ldr  x3,[x2]
-	TLS_ADDR x4, vfexec
-	strb w0,[x4,x3]
-	add  x3,x3,#1
-	str  x3,[x2]
+vfexec_push:				/* x0 = 0/1 -> x0 = 1 accepted / 0 REFUSED */
+	TLS_ADDR x1, vfexec_sp
+	ldr  x2,[x1]
+	cmp  x2,#VFEXEC_MAX		/* SCR-2: bounded. Hitting the cap means the script
+					   is malformed -- refuse and let the interpreter fail it,
+					   never scribble past vfexec into vfexec_sp. */
+	b.hs .vpf_full
+	TLS_ADDR x3, vfexec
+	strb w0,[x3,x2]
+	add  x3,x2,#1
+	str  x3,[x1]
+	/* IR-4: the first false pushed while nothing is false yet sets the cache;
+	 * its index is the depth measured BEFORE the push (x2). */
+	cbnz w0,.vpf_done
+	TLS_ADDR x3, vfexec_ff
+	ldr  x4,[x3]
+	cmp  x4,xzr
+	b.ge .vpf_done			/* a first false is already cached */
+	str  x2,[x3]
+.vpf_done:
+	mov  w0,#1
+	ret
+.vpf_full:
+	mov  w0,#0
 	ret
 	.size vfexec_push,.-vfexec_push
 
@@ -1020,6 +1062,14 @@ vfexec_pop:
 	cbz  x2, 9f
 	sub  x2,x2,#1
 	str  x2,[x1]
+	/* IR-4: the slot just popped is the NEW depth; if it held the first false,
+	 * nothing below it can be false (it was the FIRST one), so clear the cache. */
+	TLS_ADDR x3, vfexec_ff
+	ldr  x4,[x3]
+	cmp  x4,x2
+	b.ne 9f
+	mov  x4,#-1
+	str  x4,[x3]
 9:	ret
 	.size vfexec_pop,.-vfexec_pop
 
@@ -1037,28 +1087,39 @@ vfexec_toggle_top:
 	TLS_ADDR x1, vfexec_sp
 	ldr  x2,[x1]
 	cbz  x2, 9f
+	sub  x2,x2,#1			/* index of the top */
 	TLS_ADDR x3, vfexec
-	sub  x2,x2,#1
 	ldrb w4,[x3,x2]
 	eor  w4,w4,#1
 	strb w4,[x3,x2]
+	/* IR-4: Core's ConditionStack::toggle_top. Flipping the top true->false
+	 * makes it the first false when nothing was false; flipping false->true
+	 * clears the cache only when the top WAS the first false (a false below
+	 * it stays the first false). */
+	TLS_ADDR x3, vfexec_ff
+	ldr  x4,[x3]
+	cmp  x4,xzr
+	b.ge .tt_had_false
+	str  x2,[x3]
+	b    9f
+.tt_had_false:
+	cmp  x4,x2
+	b.ne 9f
+	mov  x4,#-1
+	str  x4,[x3]
 9:	ret
 	.size vfexec_toggle_top,.-vfexec_toggle_top
 
 	.global vfexec_all_true
 	.type vfexec_all_true,%function
 vfexec_all_true:
-	TLS_ADDR x1, vfexec_sp
+	/* IR-4: one compare against the cached first-false position (Core's
+	 * ConditionStack::all_true). The byte scan this replaced -- and the O(depth)
+	 * per opcode it cost -- is what made a deeply nested tapscript quadratic. */
+	TLS_ADDR x1, vfexec_ff
 	ldr  x2,[x1]
-	TLS_ADDR x3, vfexec
-	mov  x4,#0
-1:	cmp  x4,x2
-	b.hs .vfa_yes
-	ldrb w5,[x3,x4]
-	cbz  w5,.vfa_no
-	add  x4,x4,#1
-	b    1b
-.vfa_no:
+	cmp  x2,xzr
+	b.lt .vfa_yes			/* == VFEXEC_NO_FALSE: nothing is false (empty too) */
 	mov  w0,#0
 	ret
 .vfa_yes:

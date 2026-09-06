@@ -80,6 +80,10 @@ is_opsuccess:
 	.global is_opsuccess_c
 	.type   is_opsuccess_c,%function
 is_opsuccess_c:
+	mov  w0,w0			/* IR-12 (x86 b7455a84): the argument is a C `int`, whose
+					   upper 32 bits the ABI leaves undefined, and
+					   is_opsuccess compares all 64 bits of x0. x86 wrote
+					   `mov eax, edi`; writing w0 is the same zero-extend. */
 	b is_opsuccess
 	.size is_opsuccess_c,.-is_opsuccess_c
 
@@ -166,6 +170,7 @@ interp_memeq:
 	.equ SE_TAPSCRIPT_CHECKMULTISIG,50
 	.equ SE_TAPSCRIPT_MINIMALIF,51
 	.equ SE_SIG_FINDANDDELETE,54
+	.equ SE_OP_CODESEPARATOR,53   /* IR-8 (x86 fe3fb996): Core's SCRIPT_ERR_OP_CODESEPARATOR */
 	.equ OP_1NEGATE,0x4f
 	.equ OP_RESERVED,0x50
 	.equ OP_1,0x51
@@ -554,6 +559,26 @@ script_eval:
 	mov  w0,#SE_STACK_SIZE
 	b    .err_ret0
 .not_push:
+	/* IR-8 (x86 fe3fb996) -- Core, EvalScript, placed BEFORE the fExec gate so it
+	 * fires even in an UNEXECUTED branch:
+	 *   if (opcode == OP_CODESEPARATOR && sigversion == SigVersion::BASE &&
+	 *       (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE))
+	 *       return set_error(serror, SCRIPT_ERR_OP_CODESEPARATOR);
+	 * Policy only (CONST_SCRIPTCODE is a standardness flag, never a block flag),
+	 * but without it a legacy tx carrying 0xab inside an OP_IF branch entered the
+	 * mempool and was relayed where Core refuses it. The .op_cs site below stays
+	 * reachable only through .dispatch, i.e. AFTER this gate. */
+	ldr  x2,[sp,#SL_OP]
+	cmp  x2,#OP_CODESEPARATOR
+	b.ne .cs_const_ok
+	ldr  w2,[x20,#48]		/* sigversion: BASE == 0 */
+	cbnz w2,.cs_const_ok
+	ldr  x2,[x20,#56]
+	tst  x2,#SCRIPT_VERIFY_CONST_SCRIPTCODE
+	b.eq .cs_const_ok
+	mov  w0,#SE_OP_CODESEPARATOR
+	b    .err_ret0
+.cs_const_ok:
 	/* if not executing and not IF..ENDIF, skip */
 	ldr  x2,[sp,#SL_FEXEC]
 	cbnz x2,.dispatch
@@ -784,11 +809,22 @@ script_eval:
 	eor  x22,x22,#1
 1:	mov  x0,x22
 	bl   vfexec_push
-	b    .next_op
+	cbnz x0,.next_op
+	b    .vfexec_full
 .if_notexec:
 	mov  x0,#0
 	bl   vfexec_push
-	b    .next_op
+	cbnz x0,.next_op
+	b    .vfexec_full
+.vfexec_full:
+	/* SCR-2 (audit 2026-09-03): vfexec is BOUNDED, so a refused push means the
+	 * script is malformed. Unreachable for anything that fits the 4 MiB
+	 * block-witness limit (the buffer covers 5 MiB of OP_IF), but if it ever
+	 * trips the answer is a hard script error, never a silent continue -- before
+	 * the bound the 1025th nested OP_IF wrote over vfexec_sp and the evaluation
+	 * carried on with a corrupted condition stack (and scribbled on TLS). */
+	mov  w0,#SE_UNKNOWN_ERROR
+	b    .err_ret0
 
 .op_else:
 	bl   vfexec_depth
@@ -915,12 +951,14 @@ script_eval:
 	mov  x2,x0
 	CSTK
 	bl   stack_dup_index
+	cbz  x0,.stack_size_err		/* IR-1 (x86 9952a1c4): a refused push is STACK_SIZE. */
 	CSTK
 	bl   stack_depth
 	sub  x0,x0,#2
 	mov  x2,x0
 	CSTK
 	bl   stack_dup_index
+	cbz  x0,.stack_size_err		/* IR-1 */
 	b    .next_op
 
 .op_3dup:
@@ -934,6 +972,7 @@ script_eval:
 	mov  x2,x0
 	CSTK
 	bl   stack_dup_index
+	cbz  x0,.stack_size_err		/* IR-1 (one loop body covers x86's three sites) */
 	subs x19,x19,#1
 	b.ne 1b
 	b    .next_op
@@ -949,6 +988,7 @@ script_eval:
 	mov  x2,x0
 	CSTK
 	bl   stack_dup_index
+	cbz  x0,.stack_size_err		/* IR-1 (one loop body covers x86's two sites) */
 	subs x19,x19,#1
 	b.ne 1b
 	b    .next_op
@@ -1040,12 +1080,14 @@ script_eval:
 	ldr  w3,[x3]
 	add  x2,x2,#ELEM_DATA_OFF
 	bl   stack_push
+	cbz  x0,.stack_size_err		/* IR-1 (x86 9952a1c4) */
 	CSTK
 	ldr  x2,[sp,#SL_ET1]
 	mov  x3,x2
 	ldr  w3,[x3]
 	add  x2,x2,#ELEM_DATA_OFF
 	bl   stack_push
+	cbz  x0,.stack_size_err		/* IR-1 */
 	b    .next_op
 
 .op_ifdup:
@@ -1067,6 +1109,7 @@ script_eval:
 	mov  x2,x0
 	CSTK
 	bl   stack_dup_index
+	cbz  x0,.stack_size_err		/* IR-1 (x86 9952a1c4) */
 	b    .next_op
 
 .op_depth:
@@ -1097,6 +1140,7 @@ script_eval:
 	mov  x2,x0
 	CSTK
 	bl   stack_dup_index
+	cbz  x0,.stack_size_err		/* IR-1 (x86 9952a1c4) */
 	b    .next_op
 
 .op_nip:
@@ -1121,6 +1165,7 @@ script_eval:
 	mov  x2,x0
 	CSTK
 	bl   stack_dup_index
+	cbz  x0,.stack_size_err		/* IR-1 (x86 9952a1c4) */
 	b    .next_op
 
 .op_pick:			/* OP_PICK / OP_ROLL */
@@ -1173,11 +1218,14 @@ script_eval:
 	ldr  w3,[x3]
 	add  x2,x2,#ELEM_DATA_OFF
 	bl   stack_push
+	cbz  x0,.stack_size_err		/* IR-1 (x86 9952a1c4): OP_ROLL is net-zero only when
+					   the push lands -- at the cap it is refused. */
 	b    .next_op
 .pkdup:
 	CSTK
 	mov  x2,x22
 	bl   stack_dup_index
+	cbz  x0,.stack_size_err		/* IR-1 (x86 9952a1c4) */
 	b    .next_op
 .pk_fail:
 	mov  w0,#SE_INVALID_STACK_OPERATION
@@ -1257,18 +1305,21 @@ script_eval:
 	ldr  w3,[x3]
 	add  x2,x2,#ELEM_DATA_OFF
 	bl   stack_push
+	cbz  x0,.stack_size_err		/* IR-1 (x86 9952a1c4) */
 	CSTK
 	ldr  x2,[sp,#SL_ET3]
 	mov  x3,x2
 	ldr  w3,[x3]
 	add  x2,x2,#ELEM_DATA_OFF
 	bl   stack_push
+	cbz  x0,.stack_size_err		/* IR-1 */
 	CSTK
 	ldr  x2,[sp,#SL_ET2]
 	mov  x3,x2
 	ldr  w3,[x3]
 	add  x2,x2,#ELEM_DATA_OFF
 	bl   stack_push
+	cbz  x0,.stack_size_err		/* IR-1 */
 	b    .next_op
 
 .op_size:
@@ -2058,6 +2109,14 @@ script_eval:
 	str  w3,[x2]
 1:	mov  w0,#1		/* success */
 	b    .done
+.stack_size_err:
+	/* IR-1 (x86 9952a1c4): at MAX_STACK_SIZE the push is REFUSED and Core -- which
+	 * lets size() reach 1001 and then fails -- answers SCRIPT_ERR_STACK_SIZE.
+	 * Every net-growing op (DUP/2DUP/3DUP/2OVER/IFDUP/OVER/PICK/TUCK/ROT/2ROT) now
+	 * reports it; before, the failed push was ignored and the op succeeded with a
+	 * stale top, a consensus false accept one element short. */
+	mov  w0,#SE_STACK_SIZE
+	b    .err_ret0
 .err_ret0:
 	/* x0 = err code */
 	ldr  x2,[x20,#80]
@@ -2216,12 +2275,37 @@ interp_sig_encoding_ok:
 	ldrb w2,[x12,#3]		/* lenR */
 	add  x3,x2,#5
 	ldrb w3,[x12,x3]		/* lenS */
-	cmp  w3,#33
-	b.eq .sigenc_highs
-	cmp  w3,#32
-	b.lt .sigenc_ht
 	add  x4,x12,#6
 	add  x4,x4,x2		/* S, 32 bytes big-endian */
+	cmp  w3,#33
+	b.ne .sigenc_s_len
+	add  x4,x4,#1		/* a 33-byte S carries a 0x00 pad before a >=0x80 byte
+					   (strict DER already holds) -- skip the pad and let the
+					   N compare decide; IR-13 replaced "33 => high". */
+	b    .sigenc_s_n
+.sigenc_s_len:
+	cmp  w3,#32
+	b.lt .sigenc_ht		/* shorter than 32: below 2^248, low */
+.sigenc_s_n:
+	/* IR-13 (x86 b7455a84): Core's CheckLowS LAX-parses the signature, so an
+	 * S >= N overflows to a ZERO signature -- which is not high -- and Core
+	 * never reports SIG_HIGH_S there. Verification fails and NULLFAIL/false is
+	 * what reaches the RPC; the VERDICT already agreed here, the ERROR CODE
+	 * reaching the RPC did not. Compare against N first, and take the same road
+	 * as "low" for S >= N. */
+	LAddr x5, order_n
+	mov  x6,xzr
+.sigenc_ncmp:
+	ldrb w7,[x4,x6]
+	ldrb w8,[x5,x6]
+	cmp  w7,w8
+	b.lo .sigenc_below_n	/* S < N: the N/2 compare still decides */
+	b.hi .sigenc_ht		/* S > N: Core sees a zero sig, not a high one */
+	add  x6,x6,#1
+	cmp  x6,#32
+	b.lt .sigenc_ncmp
+	b    .sigenc_ht		/* S == N: same */
+.sigenc_below_n:
 	LAddr x5, half_order_n
 	mov  x6,xzr
 .sigenc_cmp:
@@ -2265,6 +2349,11 @@ interp_sig_encoding_ok:
 half_order_n:
 	.byte 0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
 	.byte 0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
+/* secp256k1 group order N, big-endian (IR-13: the S >= N comparison above).
+ * Note the 0xFE at byte 16 -- the same constant x86 keeps next to its reader. */
+order_n:
+	.byte 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE
+	.byte 0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41
 	.text
 
 	/* interp_pubkey_encoding_ok(publen=x0, pubdata=x1) -> x0 = 1 ok / 0 = the
