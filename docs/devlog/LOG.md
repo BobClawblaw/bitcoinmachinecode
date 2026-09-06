@@ -7,6 +7,60 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-09-06 -- the 3-hour gap to Core, decomposed and mostly removed
+
+Eight branches landed today against `audits/UTXO_INLINE_BUILD_PERF_SCOPE.md`
+(PRs #24-#26 and the interleave PR; tags `utxo-modules-2026-09-06`). What
+was found on the way, how, and what each cost, in the order found:
+
+- **The MuHash fold ran per coin on the bulk connect path.** Found by the
+  step-0 instrumentation (PR #24): ~1.66 us per element x ~6.4 billion coin
+  events over a sync is ~3 h, the single largest term in the gap and not
+  in the scope's first draft at all. Fix: bulk catch-up folds nothing, the
+  index seeds once from a walk at caught-up; steady state folds in a forked
+  worker fed by a shared ring, with `gettxoutsetinfo` gated on the worker's
+  watermark so a caller can never read a digest the fold has not reached.
+- **Every input was looked up twice** (verify, then apply). Same
+  instrumentation; recorded in the scope, not yet removed.
+- **`num3072_mul` was a plain mul/adc loop.** BMI2/ADX and AVX-512 IFMA
+  bodies now dispatch on CPUID leaf 7: multiply 944 -> 603 -> 301 ns, element
+  1640 -> 1005 ns. After that the SHA256 + six ChaCha20 blocks are the larger
+  half of an element, so the next lever there is the keystream, not the
+  multiply.
+- **The flush's descriptor sort was a merge sort at 135 ns/key**; a radix
+  sort does the same 4M keys in 91 ms instead of 541 ms, and a gated diff
+  proves the run it writes is byte-identical.
+- **`UTXO_CACHE_MODEL_SCOPE.md` section 4.2 was stale**: it asked for tiered
+  compaction that 79d4c9c had landed six days earlier. Caught by the agent
+  measuring before implementing; the doc now says so. Cost: one scoped item
+  that was never real.
+- **Compact-block reconstruction sha256d'd the whole mempool per block**,
+  then memset a 64 MiB short-id table per block (10 ms of a 9.9 ms
+  reconstruction once the hashing was gone). The slot carries the wtxid and
+  the table is generation-stamped: 10.03 -> 1.45 ms per block.
+- **The boot-time `dl_catchup` cannot interleave** with the UTXO connect: it
+  runs in the parent before the writer exists. Only the worker's far-behind
+  run does. A fresh-clone benchmark of the interleave needs
+  `bmc.bootcatchup=0`; the boot log says so. Moving boot catch-up into the
+  worker is the next change on that path.
+- **Outbound sockets lack `TCP_NODELAY` and `p2p_write` is two writes**: a
+  loopback getdata cost ~45 ms until the fixture set `TCP_QUICKACK`, then
+  ~5 ms. Found by the interleave fixture, not fixed.
+- **Landing hazard, caught by a word count**: keeping both sides of the
+  Makefile `test:` conflict across seven picks left eight copies of the rule.
+  make merges repeated rules' prerequisites, so it built and passed; only
+  the 8x token count showed it. Collapsed to one union line before the gate.
+- **A standing false positive in `gate-log-check`**: every gate log carries
+  one `Segmentation fault (core dumped)` from `test_rpc_signer`'s
+  deliberately wedged fake device, so the auditor reports 1 crash on every
+  green run. Not fixed today; a red check nobody reads is worse than none.
+
+Process note: the branches were built by parallel agents in worktrees, each
+gated alone; the coordinator cherry-picked them onto one landing branch and
+ran ONE gate per merge. One agent's scratch files were overwritten by
+another's; nothing in the tree was touched, and scratch names are prefixed
+per agent since.
+
 ## 2026-08-29 -- a sample config, and what a proxy actually has to change
 
 config/bitcoin.sample.conf now lists EVERY key this node reads, commented
