@@ -1690,6 +1690,14 @@ tests/soak_lsm_mm: tests/soak_lsm_mm.c $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 tests/test_utxo_probe_bound: tests/test_utxo_probe_bound.c bitcoin_utxo.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ tests/test_utxo_probe_bound.c bitcoin_utxo.o bitcoin_hash.o sha256.o
 
+# bench_utxo_probe -- ns per utxo_get (hit/miss, with and without a preceding
+# utxo_prefetch) and the probe-length / cache-line histogram at 2^16, 2^22 and
+# 2^26 slots, 50% and 75% load: the measurement behind whether a cache-line-
+# aware probe is worth writing (UTXO_CACHE_MODEL_SCOPE.md 4.1). Manual: needs
+# ~6 GB and a quiet core. Run: make tests/bench_utxo_probe && tests/bench_utxo_probe
+tests/bench_utxo_probe: tests/bench_utxo_probe.c bitcoin_utxo.o
+	$(CC) $(CFLAGS) -o $@ tests/bench_utxo_probe.c bitcoin_utxo.o
+
 tests/test_utxo_lsm: tests/test_utxo_lsm.c $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_utxo_lsm.c $(UTXOLSMOBJS)
 
