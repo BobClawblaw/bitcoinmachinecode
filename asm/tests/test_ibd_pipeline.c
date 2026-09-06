@@ -44,7 +44,8 @@ static int   g_bad_prev;              /* corrupt one block's prevhash */
 static int   g_bad_consensus;         /* one block fails cons_verify */
 
 /* ---- externs the fetcher calls ---- */
-long p2p_write(int fd, const char* cmd, unsigned long cmdlen, const unsigned char* payload, unsigned len){
+long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned len){
+    const unsigned char* payload = pl;
     (void)fd; (void)cmdlen;
     if (!strncmp(cmd, "getdata", 7)){
         if (g_getdata_msgs == 0) g_getdata_entries = payload[0];
@@ -59,7 +60,8 @@ long p2p_write(int fd, const char* cmd, unsigned long cmdlen, const unsigned cha
     } else if (!strncmp(cmd, "pong", 4)) g_pongs++;
     return (long)len;
 }
-long p2p_read(int fd, char* cmd, unsigned char* buf, unsigned long cap, unsigned* outlen){
+int p2p_read(int fd, char cmd[12], void* pl, unsigned cap, unsigned* outlen){
+    unsigned char* buf = pl;
     (void)fd;
     if (g_inject_ping){ g_inject_ping = 0; memcpy(cmd, "ping\0\0\0\0\0\0\0", 12); memset(buf, 7, 8); *outlen = 8; return 8; }
     if (g_inject_unasked){ g_inject_unasked = 0;
@@ -81,8 +83,8 @@ int hst_get_at(void* hst, unsigned long long idx, void* rec112){
     hash_of(r + 80, (int)idx);                 /* the block hash the store keeps at +80 */
     return 1;
 }
-long cons_verify(const unsigned char* blk, unsigned long len){
-    (void)len; if (g_bad_consensus && blk[76] == (unsigned char)g_bad_consensus - 1) return 0; return 1;
+int cons_verify(const void* blkv, long len, void* scratch, unsigned cap){
+    const unsigned char* blk = blkv; (void)len; (void)scratch; (void)cap; if (g_bad_consensus && blk[76] == (unsigned char)g_bad_consensus - 1) return 0; return 1;
 }
 void block_hash(unsigned char out[32], const unsigned char* hdr80){ hash_of(out, hdr80[76]); }
 static long g_stored_h[NB]; static int g_nstored;
@@ -117,7 +119,7 @@ int main(void){
 
     printf("== the finding: ONE getdata carries the whole chunk ==\n");
     reset(); order_forward();
-    long r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, sizeof buf);
+    long r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
     ok(r == NB, "all 40 blocks stored");
     ok(g_getdata_msgs == 1, "exactly ONE getdata message was sent for 40 blocks");
     ok(g_getdata_entries == NB && ibd_pipeline_last_batch() == NB, "that message carried all 40 hashes (40 round trips become 1)");
@@ -126,7 +128,7 @@ int main(void){
 
     printf("== a peer may answer in ANY order: blocks are placed by hash ==\n");
     reset(); order_reverse();
-    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, sizeof buf);
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
     ok(r == NB, "reverse-order delivery still completes the chunk");
     { int seen[NB]; memset(seen, 0, sizeof seen); int okh = 1;
       for (int i = 0; i < NB; i++){ long h = g_stored_h[i] - LO; if (h < 0 || h >= NB || seen[h]++) okh = 0; }
@@ -135,23 +137,23 @@ int main(void){
 
     printf("== noise and abuse ==\n");
     reset(); order_forward(); g_inject_ping = 1;
-    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, sizeof buf);
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
     ok(r == NB && g_pongs == 1, "a ping mid-chunk is answered and does not disturb the fetch");
     reset(); order_forward(); g_inject_unasked = 1;
-    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, sizeof buf);
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
     ok(r == NB && g_nstored == NB, "a block we never asked for is drained, not stored");
     reset();                       /* deliver block 0 twice, then the rest: 41 messages for 40 blocks */
     g_norder = NB + 1; g_order[0] = 0; for (int i = 0; i < NB; i++) g_order[i + 1] = i;
-    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, sizeof buf);
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
     ok(r == NB && g_nstored == NB, "a duplicate delivery is ignored, not stored twice");
     reset(); order_forward(); g_bad_prev = 6;      /* block 5's prevhash corrupted */
-    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, sizeof buf);
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
     ok(r == -1, "a block whose prevhash breaks the header chain fails the chunk");
     reset(); order_forward(); g_bad_consensus = 4; /* block 3 fails cons_verify */
-    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, sizeof buf);
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
     ok(r == -1, "a block that fails cons_verify fails the chunk (same gate as the serial path)");
     reset(); g_norder = NB / 2; for (int i = 0; i < g_norder; i++) g_order[i] = i;
-    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, sizeof buf);
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
     ok(r == -1, "a peer that goes quiet half way does NOT report a complete chunk");
 
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);

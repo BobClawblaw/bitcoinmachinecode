@@ -4025,8 +4025,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
              * 16 real peers moved 0.23-1.2 MB/s each on the fresh-sync
              * benchmark. Core keeps 16 blocks in flight per peer for the same
              * reason. Same validation per block, block for block. */
-            (void)scratch; (void)cap;
-            long r=ibd_fetch_chunk_pipelined(fd, st, hst, lo, n, buf, sizeof buf);
+            long r=ibd_fetch_chunk_pipelined(fd, st, hst, lo, n, buf, (unsigned)sizeof buf, scratch, cap);
             alarm(0); sigaction(SIGALRM,&old,NULL);
             store_reload(st);
             guard++;

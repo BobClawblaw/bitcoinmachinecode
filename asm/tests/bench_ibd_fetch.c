@@ -25,14 +25,15 @@ static unsigned char hdr[NB][80];
 static void hash_of(unsigned char out[32], int i){ memset(out, (unsigned char)(0xA0 + i), 32); }
 /* the fetcher's externs: a socket peer on the other end of `g_fd` */
 static int g_fd;
-long p2p_write(int fd, const char* cmd, unsigned long cl, const unsigned char* p, unsigned len){
-    (void)cl; char h[16]; memset(h,0,16); strncpy(h,cmd,11);
+long p2p_write(int fd, const char* cmd, unsigned cl, const void* pv, unsigned len){
+    const unsigned char* p = pv; (void)cl; char h[16]; memset(h,0,16); strncpy(h,cmd,11);
     if (write(fd,h,16)!=16) return -1;
     if (write(fd,&len,4)!=4) return -1;
     unsigned off=0; while(off<len){ long w=write(fd,p+off,len-off); if(w<=0) return -1; off+=(unsigned)w; }
     return (long)len;
 }
-long p2p_read(int fd, char* cmd, unsigned char* buf, unsigned long cap, unsigned* outlen){
+int p2p_read(int fd, char cmd[12], void* pv, unsigned cap, unsigned* outlen){
+    unsigned char* buf = pv;
     char h[16]; unsigned len; unsigned off=0;
     long r=read(fd,h,16);
     if(r!=16) return -1;
@@ -43,7 +44,7 @@ long p2p_read(int fd, char* cmd, unsigned char* buf, unsigned long cap, unsigned
 }
 int hst_get_at(void* hst, unsigned long long i, void* rec){ (void)hst; if(i>=NB) return 0;
     unsigned char* r=rec; memset(r,0,112); memcpy(r,hdr[i],80); hash_of(r+80,(int)i); return 1; }
-long cons_verify(const unsigned char* b, unsigned long l){ (void)b;(void)l; return 1; }
+int cons_verify(const void* b, long l, void* sc, unsigned cap){ (void)b;(void)l;(void)sc;(void)cap; return 1; }
 void block_hash(unsigned char o[32], const unsigned char* h){ hash_of(o,h[76]); }
 long store_append_shared(void* st,long h,const unsigned char* hs,const unsigned char* raw,unsigned l){
     (void)st;(void)h;(void)hs;(void)raw;(void)l; return h; }
@@ -76,7 +77,7 @@ static double run(long wave, long delay_us){
     ibd_pipeline_set_wave(wave);
     static unsigned char buf[BLKLEN+1024];
     double t0 = now_ms();
-    long r = ibd_fetch_chunk_pipelined(sv[0], NULL, NULL, 500000, NB, buf, sizeof buf);
+    long r = ibd_fetch_chunk_pipelined(sv[0], NULL, NULL, 500000, NB, buf, (unsigned)sizeof buf, NULL, 0);
     double dt = now_ms()-t0;
     close(sv[0]); kill(p,15); waitpid(p,0,0);
     if (r != NB){ printf("FAIL: fetched %ld of %d\n", r, NB); exit(2); }
