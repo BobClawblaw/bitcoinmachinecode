@@ -1743,6 +1743,11 @@ tests/test_utxo_tiered_compact: tests/test_utxo_tiered_compact.c daemon/lsm_mani
 tests/bench_lsm_compact: tests/bench_lsm_compact.c $(UTXOLSMOBJS) 
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/bench_lsm_compact.c $(UTXOLSMOBJS)
 
+# bench_lsm_flush_sort: the flush's descriptor sort in isolation, one pinned
+# core, bulk-mode sized (4M descriptors). Built, never run by the gate.
+tests/bench_lsm_flush_sort: tests/bench_lsm_flush_sort.c $(UTXOLSMOBJS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/bench_lsm_flush_sort.c $(UTXOLSMOBJS)
+
 # A/B of the compaction policy: classic (oldest runs) vs leveled (size-ratio tail). Not a test.
 tests/bench_lsm_leveled: tests/bench_lsm_leveled.c daemon/lsm_manifest.c $(UTXOLSMOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I daemon -o $@ tests/bench_lsm_leveled.c daemon/lsm_manifest.c $(UTXOLSMOBJS)
