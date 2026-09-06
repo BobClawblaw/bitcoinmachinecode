@@ -1092,7 +1092,7 @@ int main(void){
         extern long   mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
 
         static unsigned char pol[128], stbuf[1<<20];
-        static unsigned char mp[40 + 4096*48 + 8], mblob[1<<20];
+        static unsigned char mp[40 + 4096*80 + 8], mblob[1<<20];
         static unsigned char ux[40 + 4096*48 + 8], ublob[1<<16];
         memset(stbuf, 0, sizeof stbuf);
         mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 1);

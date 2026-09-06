@@ -144,6 +144,23 @@ append → del), after the verify-side resolve already looked the same input
 up. Every input is looked up twice; the second is charged to `put`. Carrying
 the resolved coin from verify into apply is a lever in its own right, gated
 on the `get` share the breakdown reports.
+   *Measured (2026-09-06, `tests/bench_muhash`, one pinned core of this
+   host):* the BMI2/ADX body landed at **603 ns vs 944 ns** for the multiply
+   (1.57×, not the ~2× guessed above — the row chains are bounded by one
+   `mulx` per cycle and the two flag chains) and **1307 ns vs 1640 ns per
+   element** (1.25×): the multiply was 58% of an element, and the SHA256 +
+   six scalar ChaCha20 blocks are now the larger half of what remains.
+   The AVX-512 IFMA body (60 limbs of 52 bits, `vpmadd52luq/huq` column
+   sums into 64-bit lanes, one scalar carry pass, then the same fold as the
+   ADX body) followed at **301 ns** on the multiply (**3.28×**) and
+   **1005 ns per element** (**1.65×**); at that point the multiply is 30% of
+   an element and the SHA256 + ChaCha20 expansion is the rest, so the next
+   lever on the per-element cost is the ChaCha20 keystream, not the modmul.
+   Dispatch is `num3072_mul` in `bitcoin_muhash.asm` (CPUID leaf 7 — BMI2,
+   ADX, AVX512F, AVX512IFMA — plus OSXSAVE/XGETBV for the IFMA body, cached
+   exactly like `shani_ready`); the generic body is the fallback and
+   `tests/test_muhash_mul_diff` holds each accelerated body to it limb for
+   limb.
 
 ### Step 1 — connect inside the download loop (the structural fix)
 

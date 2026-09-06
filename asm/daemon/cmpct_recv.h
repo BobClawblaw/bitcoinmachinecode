@@ -32,4 +32,18 @@ long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned l
 long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap);
 /* stats for the log */
 void cmpct_recv_stats(unsigned long* reconstructed, unsigned long* needed_txn, unsigned long* fell_back);
+/* The short-id table takes each pool entry's wtxid from the slot cache that
+ * mpool_put fills (bitcoin_mempool.asm, 2026-09-06). Off = hash every entry
+ * per block, the pre-cache behaviour; the test's negative control. */
+void cmpct_recv_set_wtxid_cache(int on);
+/* how many pool entries ht_build has hashed with tx_wtxid since start (0 with the cache on) */
+unsigned long cmpct_recv_hashed(void);
+/* The short-id table (2026-09-06): entries are generation-stamped and the
+ * probe range is sized to the pool, so a build clears nothing. On = the
+ * pre-stamp build that memset the whole 2^21-entry table per block and
+ * probed at full width; the test's negative control. */
+void cmpct_recv_set_ht_clear(int on);
+unsigned cmpct_recv_ht_bits(void);                 /* the width the last build chose (12..21) */
+unsigned cmpct_recv_ht_gen(void);                  /* the last build's generation stamp */
+void cmpct_recv_ht_set_gen(unsigned g);            /* test seam: park the counter next to its wrap */
 #endif

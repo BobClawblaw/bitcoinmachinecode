@@ -80,7 +80,7 @@ static unsigned long mk_tx(unsigned char* out, unsigned ver,
 
 static unsigned char pol[128];
 static unsigned char stbuf[1<<20];
-static unsigned char mp[40 + 4096*48 + 8];
+static unsigned char mp[40 + 4096*80 + 8];
 static unsigned char mblob[4<<20];
 static unsigned char ux[40 + 4096*48 + 8];
 static unsigned char ublob[1<<16];

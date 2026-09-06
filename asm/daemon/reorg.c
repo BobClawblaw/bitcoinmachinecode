@@ -53,6 +53,7 @@
 #include "hdrrules.h"      /* VAL-5: ContextualCheckBlockHeader rules */
 #include "reorg.h"
 #include "../bitcoin_pow_rules.h"
+#include "../mempool_slot.h"   /* the structural mempool's slot layout */
 #include "utxo_walk.h"
 
 /* ---------------- externs: assembly + sibling C modules ------------------ */
@@ -1133,9 +1134,10 @@ long reorg_execute(void* st, long fork_height, long nblocks,
 
 typedef struct { unsigned char txid[32]; const unsigned char* tx; unsigned long len; } rtx_t;
 
-/* Enumerate the structural mempool directly. Layout per bitcoin_mempool.asm's
- * header comment: +0 n, +8 mask, +16 blob, +24 blob_cap, +32 fill, then
- * (mask+1) 48-byte slots at +40 -- [+0 len][+8 txid[32]][+40 blob_off], with
+/* Enumerate the structural mempool directly. Layout per mempool_slot.h and
+ * bitcoin_mempool.asm's header comment: +0 n, +8 mask, +16 blob, +24 blob_cap,
+ * +32 fill, then (mask+1) MPOOL_SLOT_BYTES slots at +40 -- [+0 len]
+ * [+8 txid[32]][+40 blob_off][+48 wtxid[32]], with
  * len == 0xFFFFFFFFFFFFFFFF marking an empty slot. mpool_del uses
  * backward-shift deletion (no tombstones), so "not EMPTY" is exactly "live". */
 static long mempool_snapshot(void* mp, rtx_t* out, long max){
@@ -1144,11 +1146,11 @@ static long mempool_snapshot(void* mp, rtx_t* out, long max){
     unsigned char* blob; memcpy(&blob, m+16, 8);
     long n = 0;
     for (unsigned long long i = 0; i <= mask && n < max; i++){
-        unsigned char* slot = m + 40 + i*48;
+        unsigned char* slot = MPOOL_SLOT_AT(m, i);
         unsigned long long len; memcpy(&len, slot, 8);
-        if (len == 0xFFFFFFFFFFFFFFFFULL) continue;
-        unsigned long long off; memcpy(&off, slot+40, 8);
-        memcpy(out[n].txid, slot+8, 32);
+        if (len == MPOOL_SLOT_EMPTY) continue;
+        unsigned long long off; memcpy(&off, slot+MPOOL_SLOT_OFF, 8);
+        memcpy(out[n].txid, slot+MPOOL_SLOT_TXID, 32);
         out[n].tx  = blob + off;
         out[n].len = (unsigned long)len;
         n++;

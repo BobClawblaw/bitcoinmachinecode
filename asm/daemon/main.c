@@ -43,6 +43,7 @@
 #include "peer_timeout.h"      /* CC-7: -peertimeout, the handshake deadline */
 #include "txann.h"             /* CC-1: tx announcement to and from inbound peers */
 #include "inbound_evict.h"     /* CC-3: Core AttemptToEvictConnection */
+#include "../mempool_slot.h"    /* the structural mempool's slot layout (80-byte slots) */
 #include "anchors.h"           /* CC-4: block-relay-only legs + anchors.dat */
 #include "hdr_lowwork.h"       /* CC-5: hold low-work header pages until the chain proves its work */
 #include "invalid_set.h"       /* CC-10: invalidateblock / reconsiderblock */
@@ -1307,10 +1308,10 @@ int serve_mempool_msg(int fd, void* mp){
     unsigned long long mask; memcpy(&mask, m+8, 8);
     static unsigned char inv[3 + 50000*36]; unsigned n = 0; long sent = 0;
     for(unsigned long long i = 0; i <= mask; i++){
-        unsigned char* sl = m + 40 + i*48;
+        unsigned char* sl = MPOOL_SLOT_AT(m, i);
         unsigned long long len; memcpy(&len, sl, 8);
-        if(len == 0xFFFFFFFFFFFFFFFFULL) continue;
-        unsigned char* e = inv + 3 + n*36; e[0]=1; e[1]=0; e[2]=0; e[3]=0; memcpy(e+4, sl+8, 32); n++;
+        if(len == MPOOL_SLOT_EMPTY) continue;
+        unsigned char* e = inv + 3 + n*36; e[0]=1; e[1]=0; e[2]=0; e[3]=0; memcpy(e+4, sl+MPOOL_SLOT_TXID, 32); n++;
         if(n == 50000){ inv[0]=0xfd; inv[1]=(unsigned char)n; inv[2]=(unsigned char)(n>>8); p2p_write(fd, "inv", 3, inv, 3 + n*36); sent += n; n = 0; }
     }
     if(n){ if(n < 0xfd){ inv[2]=(unsigned char)n; p2p_write(fd, "inv", 3, inv+2, 1 + n*36); }
@@ -4598,7 +4599,7 @@ extern int  txsub_accept_and_relay(void* mp_area, const unsigned char* tx, unsig
                                    const int* peer_fds, int n_fds,
                                    char* reason, unsigned long rcap, int* relayed_out);
 #define TXSUB_MP_SLOTS 1024
-static unsigned char txsub_mp_area[40 + TXSUB_MP_SLOTS*48 + 8];
+static unsigned char txsub_mp_area[MPOOL_AREA_BYTES(TXSUB_MP_SLOTS)];
 static unsigned char txsub_mp_blob[2u<<20];
 static int           txsub_ready = 0;   /* 0 uninit, 1 ready, -1 init failed */
 static unsigned long long txsub_last_seq = 0;
@@ -5127,11 +5128,29 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             extern void* utxo_live_lst(void);
             extern void* utxo_live_table(void);
             extern long utxo_live_applied_height(void);
+            extern int  utxo_live_bulk_mode(void);
+            extern void utxo_live_set_coinstats_caught_up(void (*)(void*, void*, long));
+            extern void csi_defer_to_caught_up(void);
+            extern void csi_on_caught_up(void*, void*, long);
             utxo_live_set_coinstats(csi_on_add, csi_on_remove, csi_invalidate, csi_commit);
             undo_set_coin_observer(csi_on_remove);
+            utxo_live_set_coinstats_caught_up(csi_on_caught_up);
             long ah = utxo_live_applied_height();
-            if (!csi_boot(ah))
-                csi_seed_from_walk(utxo_live_lst(), utxo_live_table(), ah);
+            /* Bulk catch-up (2026-09-06): far behind, the per-coin fold is
+             * the largest single cost on the connect thread (~3 h of a
+             * fresh sync). Skip it: the index stays invalid and seeds from
+             * ONE walk when utxo_live downshifts to steady state. */
+            if (utxo_live_bulk_mode())
+                csi_defer_to_caught_up();       /* csi_on_caught_up seeds AND starts the fold worker */
+            else {
+                extern int csi_worker_start(void);
+                if (!csi_boot(ah))
+                    csi_seed_from_walk(utxo_live_lst(), utxo_live_table(), ah);
+                /* Steady state: fold OFF the connect thread (lever 2). The
+                 * worker inherits the adopted/seeded state; from here the
+                 * observers push records to the shared ring. */
+                csi_worker_start();
+            }
         }
     }
     if(!archive_ok) fprintf(stderr,"[dl] refusing to build UTXO state on an archive that failed verification\n");
@@ -5974,6 +5993,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * daemon/utxo_live.c. */
             { extern void utxo_live_close(void) __attribute__((weak));
               if (utxo_live_close) utxo_live_close(); }
+            /* utxo_live_close's checkpoint pushed the last commit marker;
+             * now a STOP marker behind it and wait for the fold worker to
+             * persist coinstats.dat (bounded; a kill only costs a re-seed). */
+            { extern void csi_worker_stop(void) __attribute__((weak));
+              if (csi_worker_stop) csi_worker_stop(); }
             _exit(0);
         }
         long long now_ms = 0;
@@ -8620,6 +8644,12 @@ int main(int argc, char** argv){
          * publish nothing and report no error. */
         zmqn_set_status(g_node_status);
         txann_set_status(g_node_status);          /* CC-1: the announce ring lives in the same block */
+        /* the coinstats fold ring + watermark (2026-09-06): the worker
+         * pushes, its forked fold worker drains, THIS parent's
+         * gettxoutsetinfo gates on the watermark. Weak: the dial/sync
+         * harnesses that link this file omit daemon/coinstats_index.c. */
+        { extern void csi_set_status(void*) __attribute__((weak));
+          if (csi_set_status) csi_set_status(g_node_status); }
 
         /* gettxout IPC channel, created BEFORE the fork so both sides inherit
          * it: the RPC in this parent asks the worker, which owns the live

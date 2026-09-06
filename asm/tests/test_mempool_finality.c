@@ -110,7 +110,7 @@ static long mk_multi(u8* out, unsigned first_coin, u64 fee, unsigned nin){
 
 static u8 pol[128];
 static u8 st[1<<20];
-static u8 mp[40 + 64*48 + 8], mblob[4096];
+static u8 mp[40 + 64*80 + 8], mblob[4096];
 static u8 ux[40 + 256*48 + 8], ublob[1<<14];
 static int g_coin = 0;
 
