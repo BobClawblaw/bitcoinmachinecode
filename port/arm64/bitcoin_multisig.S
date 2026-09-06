@@ -128,15 +128,27 @@ multisig_verify:
     add  sp,sp,#16
     cbz  x0,.ms_fail
 
-    /* ---- Step 3: der_parse_sig ---- */
+    /* ---- Step 3: der_parse_sig(sigStart, sigLen-1, r, s, &ht) ---- */
     ldr  x0,[sp,#0x68]            /* sigStart */
-    ldr  x1,[sp,#0x70]            /* sigLen */
+    ldr  x1,[sp,#0x70]            /* sigLen (the push, hashtype byte included) */
+    cbz  x1,.ms_fail              /* IR-2: empty-sig guard (the -1 below would underflow) */
+    sub  x1,x1,#1                 /* IR-2 (x86 406a1b6e): hashtype popped BEFORE the DER
+                                   * parse, as Core -- parser bound sigLen-1. x86 did this
+                                   * in rsi (dec rsi); AAPCS64 arg1 is x1. */
     add  x2,sp,#0xA0              /* r_out */
     add  x3,sp,#0xC0              /* s_out */
-    add  x4,sp,#0x140             /* hashtype */
+    add  x4,sp,#0x140             /* (parser's optional-hashtype slot, overwritten below) */
     bl   der_parse_sig
     cbz  x0,.ms_fail
-    ldr  w8,[sp,#0x140]
+    ldr  x8,[sp,#0x68]            /* IR-2: the caller reads the hashtype itself, sig[sigLen-1],
+                                   * as Core does -- no longer trusting the parser's optional
+                                   * detection (which now sees one byte less). x8/x9 are
+                                   * caller-saved scratch; x29 holds the entry sp here, so the
+                                   * slots stay sp-addressed exactly as before. */
+    ldr  x9,[sp,#0x70]
+    add  x8,x8,x9
+    ldrb w8,[x8,#-1]
+    str  w8,[sp,#0x140]           /* u32 slot, same width the parser stored */
     cmp  w8,#1
     b.ne .ms_fail
 

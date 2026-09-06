@@ -89,9 +89,15 @@ sv_checksig_asm:
 	add  x11, x9, x10
 	ldrb w12, [x11, #-1]
 	str  w12, [x28, #K_HT]
-	/* der_parse_sig */
+	/* der_parse_sig(sig, siglen-1, r, s, &dht) */
 	mov  x0, x9
-	mov  x1, x10
+	sub  x1, x10, #1            /* IR-2 (x86 406a1b6e): the hashtype byte is popped
+	                             * BEFORE the DER parse, as Core does -- the parser's
+	                             * bound is siglen-1. Handing it the full push length
+	                             * let S end ON the hashtype byte (consensus false
+	                             * accept, pre-BIP66 reach). ht was read above from
+	                             * sig[siglen-1]; the cbz x2 guard above makes the -1
+	                             * safe. On AAPCS64 the length is x1, the x86's rsi. */
 	add  x2, x28, #K_R
 	add  x3, x28, #K_S
 	add  x4, x28, #K_DHT
@@ -193,9 +199,10 @@ sv_checksig_witness_v0_asm:
 	add  x11, x9, x10
 	ldrb w12, [x11, #-1]
 	str  w12, [x28, #K_HT]
-	/* der_parse_sig */
+	/* der_parse_sig(sig, siglen-1, r, s, &dht) */
 	mov  x0, x9
-	mov  x1, x10
+	sub  x1, x10, #1            /* IR-2 (x86 406a1b6e): hashtype popped first, parser
+	                             * sees siglen-1 -- as Core. See sv_checksig_asm above. */
 	add  x2, x28, #K_R
 	add  x3, x28, #K_S
 	add  x4, x28, #K_DHT

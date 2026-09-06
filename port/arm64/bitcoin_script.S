@@ -20,7 +20,9 @@
  *       1. sighash_all with prevout_script as the signing script
  *       2. walk the raw tx to input_index, locate its scriptSig, parse the
  *          two pushes: sig and pubkey
- *       3. der_parse_sig(sig) -> r,s,htype (require htype==1)
+ *       3. htype = sig[siglen-1] (IR-2, x86 406a1b6e: the hashtype is popped
+ *          BEFORE the parse, as Core) then der_parse_sig(sig, siglen-1) ->
+ *          r,s (require htype==1)
  *       4. z = be_to_limbs(sighash 32 BE)
  *       5. pubkey_parse -> Qx,Qy
  *       6. ecdsa_verify(z,r,s,Qx,Qy)   -> 1 verify / 0 otherwise
@@ -442,15 +444,25 @@ verify_p2pkh:
 	add  x3, x1, #1
 	str  x3, [sp, #0x160]             /* pub bytes */
 
-	/* ---- step 3: der_parse_sig(sig, siglen, r@0x040, s@0x080, ht@0x198) */
+	/* ---- step 3: der_parse_sig(sig, siglen-1, r@0x040, s@0x080, ht@0x198) ---- */
 	ldr  x0, [sp, #0x170]
 	ldr  x1, [sp, #0x178]
+	cbz  x1, .Lvp_fail             /* IR-2 (x86 406a1b6e): empty sig -- the -1 below would underflow */
+	sub  x1, x1, #1                /* IR-2: hashtype popped BEFORE the DER parse, as Core --
+	                                * parser bound siglen-1 (x86: dec rsi; AAPCS64 arg1 = x1) */
 	add  x2, sp, #0x040
 	add  x3, sp, #0x080
 	add  x4, sp, #0x198
 	bl   der_parse_sig
 	cbz  w0, .Lvp_fail
-	ldr  w2, [sp, #0x198]
+	ldr  x2, [sp, #0x170]          /* IR-2: the caller reads hashtype = sig[siglen-1] itself,
+	                                * as Core does, instead of relying on the parser's optional
+	                                * 0x01 detection (it now sees one byte less). x2/x3 are
+	                                * caller-saved scratch -- w0 (the parse verdict) is live. */
+	ldr  x3, [sp, #0x178]
+	add  x2, x2, x3
+	ldrb w2, [x2, #-1]
+	str  w2, [sp, #0x198]          /* u32 slot, same width the parser stored */
 	cmp  w2, #1
 	b.ne .Lvp_fail
 
