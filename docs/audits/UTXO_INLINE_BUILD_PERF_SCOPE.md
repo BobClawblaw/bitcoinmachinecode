@@ -144,6 +144,16 @@ append → del), after the verify-side resolve already looked the same input
 up. Every input is looked up twice; the second is charged to `put`. Carrying
 the resolved coin from verify into apply is a lever in its own right, gated
 on the `get` share the breakdown reports.
+   *Measured (2026-09-06, `tests/bench_muhash`, one pinned core of this
+   host):* the BMI2/ADX body landed at **603 ns vs 944 ns** for the multiply
+   (1.57×, not the ~2× guessed above — the row chains are bounded by one
+   `mulx` per cycle and the two flag chains) and **1307 ns vs 1640 ns per
+   element** (1.25×): the multiply was 58% of an element, and the SHA256 +
+   six scalar ChaCha20 blocks are now the larger half of what remains.
+   Dispatch is `num3072_mul` in `bitcoin_muhash.asm` (CPUID leaf 7, BMI2 and
+   ADX, cached tri-state exactly like `shani_ready`); the generic body is the
+   fallback and `tests/test_muhash_mul_diff` holds the two to each other
+   limb for limb.
 
 ### Step 1 — connect inside the download loop (the structural fix)
 

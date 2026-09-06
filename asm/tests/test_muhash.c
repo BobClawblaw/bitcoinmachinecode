@@ -35,8 +35,12 @@ extern void num3072_set_one(void* a);
 extern long num3072_is_overflow(const void* a);
 extern void num3072_full_reduce(void* a);
 extern void chacha20_keystream_k0(void* out, unsigned long blocks, const unsigned char key[32]);
+extern void num3072_mul_force_path(int p);   /* 0 re-probe, 1 ADX, 2 generic */
+extern int  num3072_mul_current_path(void);
+extern int  num3072_cpu_has_adx(void);
 
 static int g_fail = 0;
+static const char* g_path = "";   /* which num3072_mul body a check ran on */
 
 static size_t unhex(const char* h, unsigned char* out, size_t cap)
 {
@@ -55,9 +59,9 @@ static void expect_bytes(const char* what, int idx, const unsigned char* got,
 {
     unsigned char want[512];
     size_t wn = unhex(want_hex, want, sizeof want);
-    if (wn != n) { printf("FAIL %s[%d]: vector length %zu != %zu\n", what, idx, wn, n); g_fail++; return; }
+    if (wn != n) { printf("FAIL %s%s[%d]: vector length %zu != %zu\n", g_path, what, idx, wn, n); g_fail++; return; }
     if (memcmp(got, want, n) != 0) {
-        printf("FAIL %s[%d]: mismatch\n  got  ", what, idx);
+        printf("FAIL %s%s[%d]: mismatch\n  got  ", g_path, what, idx);
         for (size_t i = 0; i < n && i < 48; i++) printf("%02x", got[i]);
         printf("%s\n  want ", n > 48 ? "..." : "");
         for (size_t i = 0; i < n && i < 48; i++) printf("%02x", want[i]);
@@ -65,7 +69,7 @@ static void expect_bytes(const char* what, int idx, const unsigned char* got,
         g_fail++;
         return;
     }
-    printf("ok   %s[%d]\n", what, idx);
+    printf("ok   %s%s[%d]\n", g_path, what, idx);
 }
 
 /* Mirrors muhash_oracle.cpp's Splitmix, so the SET vectors' elements can be
@@ -110,6 +114,26 @@ int main(void)
         muhash_to_num3072(buf, data, dn);
         expect_bytes("to_num3072", (int)i, buf, MUHASH_ELEM[i].num, 384);
     }
+
+    /* ---- layers 3 and up run down EVERY num3072_mul body this CPU has ----
+     * num3072_mul dispatches once from CPUID and caches the answer. Without
+     * forcing, the gate box (which has BMI2/ADX) would never execute the
+     * generic body -- the fallback a CPU without ADX depends on -- and a host
+     * without ADX would never execute the ADX body. So Core's multiply and
+     * set vectors, the order-independence property and the x*1 identity are
+     * all run once per body, with the body's name prefixed to each line. */
+    struct { int path; const char* name; int avail; } paths[] = {
+        { 2, "generic/", 1 },
+        { 1, "adx/",     num3072_cpu_has_adx() },
+    };
+    for (size_t pi = 0; pi < sizeof paths / sizeof paths[0]; pi++) {
+    if (!paths[pi].avail) {
+        printf("SKIP %s: this CPU cannot run that num3072_mul body\n", paths[pi].name);
+        continue;
+    }
+    num3072_mul_force_path(paths[pi].path);
+    g_path = paths[pi].name;
+    printf("---- num3072_mul body: %s ----\n", g_path);
 
     /* ---- layer 3: Num3072::Multiply, reduction corner cases included ---- */
     for (size_t i = 0; i < sizeof(MUHASH_MUL) / sizeof(MUHASH_MUL[0]); i++) {
@@ -218,9 +242,19 @@ int main(void)
         x[383] &= 0x7f;
         memcpy(xc, x, sizeof x);
         num3072_mul(x, one);
-        if (memcmp(x, xc, 384) != 0) { printf("FAIL x*1 != x\n"); g_fail++; }
-        else printf("ok   x*1 == x\n");
+        if (memcmp(x, xc, 384) != 0) { printf("FAIL %sx*1 != x\n", g_path); g_fail++; }
+        else printf("ok   %sx*1 == x\n", g_path);
     }
+
+    /* the forced body must have stayed selected for the whole pass */
+    if (num3072_mul_current_path() != paths[pi].path) {
+        printf("FAIL %s: num3072_mul body did not stay selected (now %d)\n",
+               g_path, num3072_mul_current_path());
+        g_fail++;
+    }
+    }   /* for each num3072_mul body */
+    num3072_mul_force_path(0);
+    g_path = "";
 
     if (g_fail) { printf("\ntest_muhash: %d FAILURES\n", g_fail); return 1; }
     printf("\ntest_muhash: all checks passed\n");

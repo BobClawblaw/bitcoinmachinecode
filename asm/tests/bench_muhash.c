@@ -23,8 +23,11 @@
  * the MINIMUM is reported: the minimum is the least-disturbed run, and the
  * spread between min and max is printed so a noisy host is visible.
  *
- * There is one multiply body today (the mul/adc limb loop); its number here
- * is the baseline every later body is measured against.
+ * Every multiply body the CPU can run is timed in turn through the
+ * num3072_mul_force_path seam, so the table always carries a "generic" row:
+ * that body is what the daemon ran before the ADX body existed, and it is
+ * the negative control for any claimed speed-up (its number must match the
+ * baseline recorded when this tool was added: 949 ns / 1640 ns here).
  */
 #define _GNU_SOURCE
 #include <sched.h>
@@ -37,6 +40,9 @@
 extern void muhash_init(void* acc);
 extern void muhash_insert(void* acc, const void* data, unsigned long len);
 extern void num3072_mul(void* a, const void* b);
+extern void num3072_mul_force_path(int p);   /* 0 re-probe, 1 ADX, 2 generic */
+extern int  num3072_mul_current_path(void);
+extern int  num3072_cpu_has_adx(void);
 
 static double now_ns(void)
 {
@@ -121,15 +127,42 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    struct row r;
-    r.name   = "generic (mul/adc)";
+    /* every body this CPU can run, generic first: it is the pre-change
+     * daemon's path and is always present */
+    struct { int path; const char* name; int avail; } paths[] = {
+        { 2, "generic (mul/adc, pre-change)", 1 },
+        { 1, "bmi2/adx (mulx/adcx/adox)",     num3072_cpu_has_adx() },
+    };
+    struct row rows[sizeof paths / sizeof paths[0]];
+    int nrows = 0;
+
     printf("bench_muhash: N=%ld per measurement, min of %d, pinned to cpu %d\n",
            n, reps, cpu);
-    r.mul_ns = time_mul(n, reps, &r.mul_spread);
-    r.ins_ns = time_insert(n, reps, &r.ins_spread);
+    for (unsigned p = 0; p < sizeof paths / sizeof paths[0]; p++) {
+        if (!paths[p].avail) {
+            printf("  path %d (%s): not available on this CPU, skipped\n",
+                   paths[p].path, paths[p].name);
+            continue;
+        }
+        num3072_mul_force_path(paths[p].path);
+        struct row* r = &rows[nrows++];
+        r->name   = paths[p].name;
+        r->mul_ns = time_mul(n, reps, &r->mul_spread);
+        r->ins_ns = time_insert(n, reps, &r->ins_spread);
+        if (num3072_mul_current_path() != paths[p].path) {
+            printf("path %d did not stay selected\n", paths[p].path);
+            return 1;
+        }
+    }
+    num3072_mul_force_path(0);   /* back to the daemon's default: re-probe */
 
     printf("\n  %-34s %14s %14s\n", "path", "num3072_mul", "muhash_insert");
-    printf("  %-34s %9.1f ns   %9.1f ns   (spread %.1f / %.1f)\n",
-           r.name, r.mul_ns, r.ins_ns, r.mul_spread, r.ins_spread);
+    for (int i = 0; i < nrows; i++)
+        printf("  %-34s %9.1f ns   %9.1f ns   (spread %.1f / %.1f)\n",
+               rows[i].name, rows[i].mul_ns, rows[i].ins_ns,
+               rows[i].mul_spread, rows[i].ins_spread);
+    for (int i = 1; i < nrows; i++)
+        printf("  %-34s %8.2fx      %8.2fx     vs generic\n", rows[i].name,
+               rows[0].mul_ns / rows[i].mul_ns, rows[0].ins_ns / rows[i].ins_ns);
     return 0;
 }
