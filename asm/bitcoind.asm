@@ -25,9 +25,6 @@ extern p2p_write
 extern p2p_read
 extern p2p_getheaders
 extern p2p_getdata_block
-extern cmpct_getdata_type       ; CC-2: BIP152 receive (daemon/cmpct_recv.c)
-extern cmpct_recv_cmpctblock
-extern cmpct_recv_blocktxn
 extern p2p_headers_count
 extern block_hash
 extern cons_verify
@@ -781,9 +778,13 @@ node_sync_multi:
     mov  [rbp-0x5c], eax
     ; CC-2: MSG_CMPCT_BLOCK (4) when this leg's peer sent sendcmpct, else the
     ; MSG_WITNESS_BLOCK p2p_getdata_block wrote. The type is the int32 at +1.
+    mov  rax, [rel g_cmpct_hook_type]
+    test rax, rax
+    jz   .gd_type_done
     mov  rdi, [rel g_peer_sendcmpct]
-    call cmpct_getdata_type
+    call rax
     mov  [rbp-0xcf], eax
+.gd_type_done:
     ; send getdata
     mov  rdi, rbx
     lea  rsi, [rel _getdata]
@@ -842,6 +843,9 @@ node_sync_multi:
     mov  ecx, 11
     repe cmpsb
     jne  .blk_not_cmpct
+    mov  r10, [rel g_cmpct_hook_cmpct]
+    test r10, r10
+    jz   .blk_drain                 ; receive not installed: ignore, as before
     mov  rdi, rbx
     mov  rsi, [rel g_sync_mp]
     mov  rdx, r14
@@ -851,7 +855,7 @@ node_sync_multi:
     lea  rax, [rbp-0xa0]
     sub  rsp, 8
     push rax                        ; 7th argument, stack stays 16-aligned
-    call cmpct_recv_cmpctblock
+    call r10
     add  rsp, 16
     cmp  rax, 0
     jle  .blk_drain
@@ -863,12 +867,15 @@ node_sync_multi:
     mov  ecx, 9
     repe cmpsb
     jne  .blk_not_blocktxn
+    mov  r10, [rel g_cmpct_hook_blocktxn]
+    test r10, r10
+    jz   .blk_drain
     mov  rdi, rbx
     mov  rsi, r14
     mov  edx, [rbp-0x54]
     mov  rcx, r14
     mov  r8d, [rbp-0x48]
-    call cmpct_recv_blocktxn
+    call r10
     cmp  rax, 0
     jle  .blk_drain
     mov  [rbp-0x54], eax
@@ -2276,6 +2283,17 @@ global g_peer_sendcmpct
 g_peer_sendcmpct:       dq 0      ; CC-2: this leg's peer sent sendcmpct (main.c snapshots per leg)
 global g_sync_mp
 g_sync_mp:              dq 0      ; CC-2: the mempool the reconstruction draws on (set by main.c before node_sync_multi)
+; CC-2: the receive side lives in C (daemon/cmpct_recv.c) and is reached through
+; hook pointers main.c installs -- the same shape as bitcoin_serve.asm's
+; g_serve_* hooks -- so this object carries no undefined C symbol and no test
+; binary that links it has to know about compact blocks. NULL = not installed:
+; every block is requested and received in full, exactly as before.
+global g_cmpct_hook_type
+g_cmpct_hook_type:      dq 0      ; unsigned (*)(int leg_negotiated)
+global g_cmpct_hook_cmpct
+g_cmpct_hook_cmpct:     dq 0      ; long (*)(fd, mp, pl, plen, out, cap, want32)
+global g_cmpct_hook_blocktxn
+g_cmpct_hook_blocktxn:  dq 0      ; long (*)(fd, pl, plen, out, cap)
 
 section .rodata
 _version: db "version",0

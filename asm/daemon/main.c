@@ -4849,6 +4849,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     phase_timer_t dl_load_pt; phase_start(&dl_load_pt);
     { long ni = invset_load("invalid.dat"); if(ni) fprintf(stderr, "[chain] invalid.dat: %ld operator-invalidated block(s)\n", ni);   /* CC-10 */
       reorg_set_invalid_fn(invset_has); g_txoq_store = store_buf; }
+    { extern void* g_cmpct_hook_type; extern void* g_cmpct_hook_cmpct; extern void* g_cmpct_hook_blocktxn;   /* CC-2: bitcoind.asm reaches the receive side through these */
+      g_cmpct_hook_type = (void*)cmpct_getdata_type; g_cmpct_hook_cmpct = (void*)cmpct_recv_cmpctblock; g_cmpct_hook_blocktxn = (void*)cmpct_recv_blocktxn; }
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
     fprintf(stderr,"[dl] worker: chain archive reloaded: tip=%d (%.2fs)\n",
             *(int*)(store_buf+24), phase_elapsed(&dl_load_pt));
