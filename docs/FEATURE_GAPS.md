@@ -1352,7 +1352,7 @@ that served BIP157 before this change must now set it explicitly.
 | `par` | Set the number of script verification threads (0 = auto, up to 15, <0 = leave that many cores free, default: 0… | implemented |
 | `peerblockfilters` | Serve compact block filters to peers per BIP 157 (default: 0) | implemented |
 | `peerbloomfilters` | Support filtering of blocks and transaction with bloom filters (default: 0) | accepted, no effect: BIP37 bloom filtering is not implemented; NODE_BLOOM is never advertised (Core's default is 0 too) |
-| `peertimeout` | Specify a p2p connection timeout delay in seconds. After connecting to a peer, wait this amount of time before… | **NOT implemented** (DMN-14, 2026-09-05: this said "implemented". `daemon/main.c:543` states plainly that the timeout it *does* have is NOT Core's `-peertimeout`, which is a CONNECT timeout; nothing reads the option. See DMN-3.) |
+| `peertimeout` | Specify a p2p connection timeout delay in seconds. After connecting to a peer, wait this amount of time before… | implemented 2026-09-06 (CC-7, `c6598b5`): bounds the version handshake from socket open to verack on both paths, clamped [1, 600]; the 20-minute idle bound (NET-3) takes over after. DMN-14 closed. |
 | `permitbaremultisig` | Relay transactions creating non-P2SH multisig outputs (default: 1) | implemented |
 | `persistmempool` | Whether to save the mempool on shutdown and load on restart (default: 1) | implemented |
 | `persistmempoolv1` | Whether a mempool.dat file created by -persistmempool or the savemempool RPC will be written in the legacy for… | accepted, no effect: mempool.dat is written in the current format only |
