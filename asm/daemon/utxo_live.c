@@ -3155,15 +3155,18 @@ long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole){
  * So: hash what we read and compare it with the record. A mismatch is NOT a
  * consensus failure -- it is a not-ready archive -- so it stops the pass like
  * a hole and the next pass retries. One pread of a cached page per block. */
-static int g_arch_idx_fd = -1;
 static unsigned long long g_arch_mismatch = 0;
 unsigned long long utxo_live_archive_mismatches(void){ return g_arch_mismatch; }
+/* Opened per call, NOT cached in a static: a cached descriptor outlives the
+ * store it belonged to. test_utxo_catchup_shutdown runs two stores in one
+ * process, and a cached fd from the first made every block of the second
+ * mismatch, stopping the pass at zero blocks. Two syscalls per block against
+ * a cached page, on a path that already verifies every script in the block. */
 static int archive_hash_at(long h, unsigned char out[32]){
-    if (g_arch_idx_fd < 0){
-        g_arch_idx_fd = open("index.dat", O_RDONLY);
-        if (g_arch_idx_fd < 0) return 0;
-    }
-    ssize_t n = pread(g_arch_idx_fd, out, 32, (off_t)h * 48);
+    int fd = open("index.dat", O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = pread(fd, out, 32, (off_t)h * 48);
+    close(fd);
     return n == 32 ? 1 : 0;
 }
 static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
