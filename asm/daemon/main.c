@@ -3542,11 +3542,32 @@ static int dlc_headers_sane(long have0, long pos){ return have0 - pos <= DLC_HDR
  * still avoided (a healthy tiny-block peer passes the block check and
  * never trips the byte check -- the AND was never needed to protect it). */
 #define DLC_DEAD_WEIGHT_MIN_BLOCKS 10L
-static int dlc_dead_weight(double byte_rate, long blocks_this_tick){
+/* ---- the floor is RELATIVE to what the pool is achieving (2026-09-06) --------
+ * The absolute byte floor (32 KB/s) was calibrated for megabyte blocks. At
+ * height 50,000 a block is ~200 bytes and a serial fetch is bounded by the
+ * round trip, so a perfectly healthy worker moves ~9 KB/s -- and the floor
+ * declared every one of them dead. Measured on a fresh sync: 655 evictions
+ * in 30 minutes, 478 of them under 5 KB/s, 195 of them after ZERO chunks,
+ * with the whole 16-worker pool receiving 143 KB per tick. That is not
+ * finding bad peers, it is killing the pool for being early in the chain.
+ *
+ * So the floor is the smaller of the configured absolute floor and a quarter
+ * of the pool's median rate last tick. Early, when everyone is round-trip
+ * bound, only a worker far below its peers dies; later, when the median is
+ * hundreds of KB/s, the absolute floor takes over and the rule is what it
+ * was. A worker with no reading, or a pool with no median yet, is never
+ * killed on bytes -- the chunk budget still bounds a genuinely dead socket. */
+static double dlc_effective_floor(double median_bps){
+    double f = (double)g_cfg.dead_weight_bps;
+    if (median_bps > 0.0 && 0.25 * median_bps < f) f = 0.25 * median_bps;
+    if (f < 512.0) f = 512.0;                                        /* a truly dead socket still dies */
+    return f;
+}
+static int dlc_dead_weight(double byte_rate, long blocks_this_tick, double floor_bps){
     if (byte_rate < 0.0) return 0;                                   /* no reading yet */
-    if (byte_rate < g_cfg.dead_weight_bps) return 1;                 /* byte floor: binding at every depth */
+    if (byte_rate < floor_bps) return 1;                             /* under the pool-relative floor */
     if (blocks_this_tick < DLC_DEAD_WEIGHT_MIN_BLOCKS
-        && byte_rate < 2.0 * g_cfg.dead_weight_bps) return 1;        /* marginal bytes AND stalled blocks */
+        && byte_rate < 2.0 * floor_bps) return 1;                    /* marginal bytes AND stalled blocks */
     return 0;
 }
 /* ---------------------------------------------------------------- VAL-5
@@ -4358,6 +4379,90 @@ static void dlc_stop_workers_for_reject(long h){
     dlc_stop_workers(g_dlc_kids, g_dlc_nw, why);
 }
 
+/* ---- rank the live pool by a measured throughput sample (2026-09-06) --------
+ * dlc_probe_round measures ONE thing: whether a TCP connect succeeds. Every
+ * "confirmed-live" peer is then equal, and the 16 workers claim them in
+ * whatever order the DNS seeds happened to return. Measured on a fresh sync:
+ * 119 live peers, the first eviction at 249 s, hundreds of evictions after --
+ * four minutes of the phase that decides the wall clock, spent discovering
+ * by trial that most of the pool trickles at 2 KB/s. Being impatient about
+ * evicting was tried first and made it WORSE (4x fewer blocks in the same
+ * time): churn costs a handshake and abandons partial chunk work every time.
+ *
+ * So measure once, up front. Each live peer gets one getheaders for the
+ * 2,000 headers after genesis -- ~162 KB from any synced peer -- timed from
+ * request to reply; the pool is then sorted fastest-first, so the worker
+ * slots start on the best peers instead of finding them by elimination.
+ * Forked probes, 32 at a time, each under its own alarm(), writing into a
+ * shared page: the same shape dlc_worker uses, and nothing the parent does
+ * can hang on a silent peer. A peer that does not answer ranks last, which
+ * is where a peer that does not answer belongs. */
+#define RANK_BATCH 32
+#define RANK_TIMEOUT_S 10
+static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
+    if (nlive < 2) return;
+    double* rate = mmap(NULL, sizeof(double) * (size_t)nlive, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    if (rate == MAP_FAILED) return;
+    for (int i = 0; i < nlive; i++) rate[i] = -1.0;
+    unsigned char stop[32]; memset(stop, 0, 32);
+    struct timespec t_all0; clock_gettime(CLOCK_MONOTONIC, &t_all0);
+    for (int base = 0; base < nlive; base += RANK_BATCH){
+        int n = nlive - base; if (n > RANK_BATCH) n = RANK_BATCH;
+        pid_t kids[RANK_BATCH];
+        for (int k = 0; k < n; k++){
+            int i = base + k;
+            pid_t pid = fork();
+            if (pid < 0){ kids[k] = 0; continue; }
+            if (pid == 0){
+                alarm(RANK_TIMEOUT_S);                          /* nothing below may outlive this */
+                int pport = 0; unsigned ip = pool_ipv4(live[i], &pport);
+                if (!ip) _exit(0);
+                int cp = pport ? pport : node_config_peer_port(live[i]); if (!cp) cp = g_chainp->default_port;
+                int fd = tcp_connect_ip(ip, (unsigned short)htons((unsigned short)cp));
+                if (fd < 0) _exit(0);
+                struct timeval tv; tv.tv_sec = 5; tv.tv_usec = 0; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+                if (node_handshake(fd) != 1) _exit(0);
+                static unsigned char page[4096]; static unsigned char msg[2 << 20]; char cmd[12]; unsigned mlen = 0;
+                long plen = p2p_getheaders(page, g_chainp->genesis_hash, 1, stop);
+                struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+                if (plen <= 0 || p2p_write(fd, "getheaders", 10, page, (unsigned)plen) < 0) _exit(0);
+                long bytes = 0;
+                for (int q = 0; q < 40; q++){
+                    int r = p2p_read(fd, cmd, msg, sizeof msg, &mlen);
+                    if (r <= 0) break;
+                    if (!strncmp(cmd, "headers", 12)){ bytes = (long)mlen; break; }
+                    if (!strncmp(cmd, "ping", 12) && mlen == 8) p2p_write(fd, "pong", 4, msg, 8);
+                }
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                double secs = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+                if (bytes > 0 && secs > 0.0) rate[i] = (double)bytes / secs;
+                close(fd); _exit(0);
+            }
+            kids[k] = pid;
+        }
+        for (int k = 0; k < n; k++) if (kids[k] > 0){ int st; waitpid(kids[k], &st, 0); }
+    }
+    /* sort fastest first; a peer with no sample ranks last, ties keep order */
+    static int idx[DLC_MAXPOOL]; for (int i = 0; i < nlive; i++) idx[i] = i;
+    for (int i = 1; i < nlive; i++){
+        int v = idx[i]; int j = i - 1;
+        while (j >= 0 && rate[idx[j]] < rate[v]){ idx[j + 1] = idx[j]; j--; }
+        idx[j + 1] = v;
+    }
+    static char sorted[DLC_MAXPOOL][DL_POOL_SLOT];
+    for (int i = 0; i < nlive; i++) memcpy(sorted[i], live[idx[i]], DL_POOL_SLOT);
+    for (int i = 0; i < nlive; i++) memcpy(live[i], sorted[i], DL_POOL_SLOT);
+    int answered = 0; double best = 0.0, worst_answered = 0.0;
+    for (int i = 0; i < nlive; i++) if (rate[idx[i]] >= 0.0){ answered++; if (best == 0.0) best = rate[idx[i]]; worst_answered = rate[idx[i]]; }
+    double median = answered ? rate[idx[answered / 2]] : 0.0;
+    struct timespec t_all1; clock_gettime(CLOCK_MONOTONIC, &t_all1);
+    fprintf(stderr, "[dlc] ranked %d live peer(s) by a 2000-header sample in %.1fs: %d answered, best %.0f KB/s, median %.0f KB/s, slowest answering %.0f KB/s; the %d silent rank last\n",
+            nlive, (double)(t_all1.tv_sec - t_all0.tv_sec) + (double)(t_all1.tv_nsec - t_all0.tv_nsec) / 1e9,
+            answered, best / 1024.0, median / 1024.0, worst_answered / 1024.0, nlive - answered);
+    for (int i = 0; i < nlive && i < 3; i++)
+        fprintf(stderr, "[dlc]   #%d %-22s %.0f KB/s\n", i + 1, live[i], rate[idx[i]] > 0 ? rate[idx[i]] / 1024.0 : 0.0);
+    munmap(rate, sizeof(double) * (size_t)nlive);
+}
 static long dl_catchup(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
     ab2_t* ab = addr_book();
@@ -4463,6 +4568,7 @@ static long dl_catchup(const char* dir, int min_workers){
         }
     }
     if(nlive<=0){ fprintf(stderr,"[dlc] no live peers; skipping catch-up\n"); return 0; }
+    dlc_rank_by_throughput(live, nlive);      /* fastest first: the workers claim from the top */
     int nw = min_workers; if(nlive<nw) nw=nlive; if(nw<1) nw=1; if(nw>64) nw=64;
 
     long hdr_len = dlc_headers(live, nlive);
@@ -4663,6 +4769,14 @@ static long dl_catchup(const char* dir, int min_workers){
         }
         fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
         double tick_total_bytes=0.0, tick_total_write_bytes=0.0;
+        /* the pool's median rate from LAST tick, for the relative floor: one
+         * tick of lag is nothing against a 10 s tick and a 3-tick streak */
+        double median_bps = 0.0;
+        { double v[64]; int nv = 0;
+          for(int w=0;w<nw;w++) if(kids[w]!=0 && prev_rchar[w] > 0) v[nv++] = stats[w].last_bw_bps;   /* only workers with a real reading */
+          for(int i=1;i<nv;i++){ double x=v[i]; int j=i-1; while(j>=0 && v[j]>x){ v[j+1]=v[j]; j--; } v[j+1]=x; }
+          if(nv > 0) median_bps = v[nv/2]; }
+        double floor_bps = dlc_effective_floor(median_bps);
         for(int w=0;w<nw;w++){
             long b=stats[w].blocks; long blkrate=(long)((double)(b-prev_blocks[w])/tick_s);
             long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
@@ -4692,7 +4806,7 @@ static long dl_catchup(const char* dir, int min_workers){
             }
             char flag[48]="";
             if(kids[w]!=0 && byte_rate>=0.0){
-                if(dlc_dead_weight(byte_rate, b-prev_blocks[w])){
+                if(median_bps > 0.0 && dlc_dead_weight(byte_rate, b-prev_blocks[w], floor_bps)){
                     dead_ticks[w]++;
                     if(dead_ticks[w]>=g_cfg.dead_weight_ticks){
                         long bidx = stats[w].held_idx;
@@ -4770,6 +4884,8 @@ static long dl_catchup(const char* dir, int min_workers){
             char avgrbuf[16], avgwbuf[16];
             dlc_fmt_rate(avgrbuf,sizeof avgrbuf,cumulative_bytes/(double)elapsed_secs);
             dlc_fmt_rate(avgwbuf,sizeof avgwbuf,cumulative_write_bytes/(double)elapsed_secs);
+            fprintf(stderr,"[dlc] -- dead-weight floor this tick: %.1f KB/s (pool median %.1f KB/s, absolute %.1f KB/s) --\n",
+                    floor_bps/1024.0, median_bps/1024.0, (double)g_cfg.dead_weight_bps/1024.0);
             fprintf(stderr,"[dlc] -- peers banned this run: %ld of %d --\n", nbanned, nlive);
             { extern int peer_no_witness_count(void); extern unsigned long long peer_no_witness_skips(void);
               if(peer_no_witness_count())
