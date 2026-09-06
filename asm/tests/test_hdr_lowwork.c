@@ -29,14 +29,32 @@ int main(void){
     { const unsigned char* h; unsigned long c; long p; const unsigned char* pv; ok(lowwork_held(&L, 0, &h, &c, &p, &pv) && c == 2000 && p == 1 && !memcmp(pv, Z, 32) && lowwork_held(&L, 1, &h, &c, &p, &pv) && p == 2001 && !memcmp(pv, H1, 32) && !lowwork_held(&L, 2, &h, &c, &p, &pv), "held pages come back in order with their heights and their prev hashes");
       unsigned char th[32]; long tht; ok(lowwork_tail(&L, th, &tht) && !memcmp(th, H2, 32) && tht == 4000, "the tail (last held header) is where the next getheaders starts: hash H2, height 4000"); }
     lowwork_clear(&L); ok(lowwork_page(&L, page, 2000, 6001, Z, Z) == LOWWORK_APPEND, "above the floor: plain APPEND from then on");
-    printf("== a chain that never crosses the floor is abandoned, bounded ==\n");
+    printf("== the regression (2026-09-06 replay): an HONEST chain sits below the floor for many pages ==\n");
+    /* A fresh mainnet node's chain has less work than -minimumchainwork for
+     * its first ~880,000 headers (440 full pages); a node resuming at
+     * 250,913 needs ~315 more.  The first cut of this module abandoned any
+     * chain still below the floor after FOUR pages, so the replay's header
+     * phase gave up 0.3 s after it started and the node fell back to its
+     * serial leg.  Floor = 20,000 headers' work: crosses on the 10th page. */
     unsigned char low[16]; memset(low, 0, 16); lowwork_begin(&L, low, 1);
-    unsigned char weak[LOWWORK_PAGE_MAX*81]; mkpage(weak, 2000, 0x1d00ffffu);
-    /* raise the floor so 4 pages never reach it */
+    static unsigned char weak[LOWWORK_PAGE_MAX*81]; mkpage(weak, 2000, 0x1d00ffffu);
     memset(FLOOR, 0, 16); for (int i = 0; i < 20000; i++) chainwork_add(FLOOR, FLOOR, one);
+    { int r = 0, nhold = 0;
+      for (int i = 0; i < 9; i++){ r = lowwork_page(&L, weak, 2000, 1 + i*2000, Z, Z); if (r == LOWWORK_HOLD) nhold++; }
+      ok(r == LOWWORK_HOLD && nhold == 9 && L.held == 9, "nine full pages below the floor: every one HELD, none abandoned");
+      ok(lowwork_page(&L, weak, 2000, 18001, Z, Z) == LOWWORK_RELEASE && L.held == 9, "the tenth crosses the floor: RELEASE all nine held pages, in order");
+      const unsigned char* h; unsigned long c; long p; const unsigned char* pv; int inorder = 1;
+      for (int i = 0; i < 9; i++) if (!lowwork_held(&L, i, &h, &c, &p, &pv) || c != 2000 || p != 1 + i*2000 || memcmp(h, weak, 2000*81)) inorder = 0;
+      ok(inorder, "the nine held pages come back intact, at their heights, in order");
+      lowwork_clear(&L); }
+    printf("== a chain that never crosses the floor is abandoned, bounded ==\n");
+    lowwork_begin(&L, low, 1);
+    /* floor = 2^21 headers' worth: above anything LOWWORK_HOLD_PAGES pages can carry */
+    memcpy(FLOOR, one, 16); for (int i = 0; i < 21; i++) chainwork_add(FLOOR, FLOOR, FLOOR);
     int r = 0; for (int i = 0; i < LOWWORK_HOLD_PAGES; i++) r = lowwork_page(&L, weak, 2000, 1 + i*2000, Z, Z);
-    ok(r == LOWWORK_HOLD && L.held == LOWWORK_HOLD_PAGES, "four full low-work pages held (the scratch bound)");
-    ok(lowwork_page(&L, weak, 2000, 8001, Z, Z) == LOWWORK_ABANDON, "the fifth: ABANDON -- 8000 junk headers cost 648 KB of scratch and nothing on disk");
+    ok(r == LOWWORK_HOLD && L.held == LOWWORK_HOLD_PAGES, "LOWWORK_HOLD_PAGES full low-work pages held (the memory bound)");
+    ok(lowwork_page(&L, weak, 2000, 1 + LOWWORK_HOLD_PAGES*2000, Z, Z) == LOWWORK_ABANDON, "one more: ABANDON -- the junk cost RAM for one fetch and nothing on disk");
+    lowwork_clear(&L);
     printf("== a short page is the end of its chain: appended, as Core does ==\n");
     lowwork_begin(&L, low, 1); ok(lowwork_page(&L, weak, 1500, 1, Z, Z) == LOWWORK_APPEND, "1500-header page below the floor: APPEND (bounded by one page)");
     printf("== cumulative work from a store ==\n");

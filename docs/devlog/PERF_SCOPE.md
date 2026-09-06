@@ -3072,8 +3072,12 @@ full-verification replay (`/storage/bmc-fullverify`, `assumevalid=0`) is
 being restarted on it from its 233k-block archive; its wall-clock is the
 first whole-run number. Two caveats bound what that run can show: the
 boot-time catch-up cannot interleave (only the worker's far-behind run
-does — that is the path the replay is on), and the replay syncs from one
-loopback peer, so the download is round-trip bound, not bandwidth bound.
+does; the replay's FIRST download, 02:05–04:55Z, was the boot catch-up —
+its shutdown line said so — and its restart on `305c1b4` went straight to
+the worker), and the replay syncs from one loopback peer, so the download
+is round-trip bound, not bandwidth bound. The restart also found CC-5's
+four-page hold abandoning the header phase (fixed, `4c3e8fc`); the
+interleaved download is first exercised on the restart after that fix.
 
 **Next levers, in order:** the ChaCha20 keystream inside a MuHash element
 (now the larger half); `TCP_NODELAY` on outbound sockets and a single write

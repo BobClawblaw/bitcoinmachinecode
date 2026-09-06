@@ -9,15 +9,28 @@
  * minimum-chain-work floor was only consulted at reorg time.
  *
  * Stage 1, this module: a bounded HOLD. Full pages (2000 headers) whose
- * running cumulative work is still below the floor are held in a small
- * scratch instead of appended; when the chain crosses the floor the held
- * pages are released in order; a chain that stays below the floor for more
- * than LOWWORK_HOLD_PAGES full pages is abandoned. A short (non-full) page is
- * appended as Core does: it is the last of its chain, so it is bounded. */
+ * running cumulative work is still below the floor are held in a scratch
+ * instead of appended; when the chain crosses the floor the held pages are
+ * released in order; a chain that stays below the floor for more than
+ * LOWWORK_HOLD_PAGES full pages is abandoned. A short (non-full) page is
+ * appended as Core does: it is the last of its chain, so it is bounded.
+ *
+ * The bound is MEMORY, not a handful of pages. The first cut held four
+ * pages (648 KB) and abandoned on the fifth -- which abandoned every honest
+ * chain too: a fresh mainnet node's headers carry less work than
+ * -minimumchainwork for the first ~880,000 of them (440 full pages), and
+ * the 2026-09-06 replay, resuming at 250,913, had its header phase give up
+ * 0.3 s after it started and fell back to the serial leg. The hold is now
+ * an anonymous mapping of LOWWORK_HOLD_PAGES pages (2,000,000 headers,
+ * 162 MB), mapped lazily on the first held page and unmapped on release or
+ * abandon: an honest sync from genesis touches ~71 MB of it once; a peer
+ * feeding junk costs this process at most the full mapping for the one
+ * fetch it is given (candidates are fetched one at a time) and nothing on
+ * disk. Core's presync keeps commitments instead and re-downloads (stage 2). */
 #ifndef HDR_LOWWORK_H
 #define HDR_LOWWORK_H
 #define LOWWORK_PAGE_MAX   2000
-#define LOWWORK_HOLD_PAGES 4
+#define LOWWORK_HOLD_PAGES 1000              /* 2,000,000 headers; 162 MB mapped lazily */
 enum { LOWWORK_APPEND = 1, LOWWORK_HOLD = 2, LOWWORK_RELEASE = 3, LOWWORK_ABANDON = 4 };
 typedef struct {
     int armed;                       /* a floor is configured (mainnet); 0 = pass-through */
@@ -27,8 +40,9 @@ typedef struct {
     long held_pos[LOWWORK_HOLD_PAGES];
     unsigned char held_prev[LOWWORK_HOLD_PAGES][32];   /* hash of the header before each held page */
     unsigned char tail_hash[32]; long tail_height;        /* last held header: the next getheaders starts here */
-    unsigned char hold[LOWWORK_HOLD_PAGES][LOWWORK_PAGE_MAX * 81];
+    unsigned char* hold;             /* LOWWORK_HOLD_PAGES x LOWWORK_PAGE_MAX x 81, mmap'd on the first HOLD, unmapped by lowwork_clear */
 } lowwork_t;
+#define LOWWORK_HOLD_BYTES ((unsigned long)LOWWORK_HOLD_PAGES * LOWWORK_PAGE_MAX * 81)
 /* cumulative work of headers [0, upto] from a header store, via the caller's accessor (asm hst_get_at shape) */
 void lowwork_cum_from_store(unsigned char out[16], void* hst, long upto, int (*get_at)(void*, unsigned long long, void*));
 void lowwork_begin(lowwork_t* l, const unsigned char cum_at_fork[16], int armed);
