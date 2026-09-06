@@ -55,6 +55,7 @@ node_config_t g_cfg = {
     .blocksonly            = 0,
     .bind_addr             = "",     /* empty == INADDR_ANY */
     .par                   = 0,      /* Core -par default: auto              */
+    .catchup_workers       = 16,     /* bmc.catchupworkers: parallel download chunk workers */
     .maxrecvbuffer_kb      = 5000,   /* Core -maxreceivebuffer default       */
     .maxmempool_mb         = 300,    /* Core -maxmempool default (MB)        */
     .mempoolexpiry_h       = 336,    /* Core -mempoolexpiry default (2 weeks)*/
@@ -341,6 +342,7 @@ static void set_defaults(void){
     g_cfg.blocksonly            = 0;
     g_cfg.bind_addr[0]          = 0;
     g_cfg.par                   = 0;
+    g_cfg.catchup_workers       = 16;
     g_cfg.maxrecvbuffer_kb      = 5000;
     g_cfg.maxmempool_mb         = 300;
     g_cfg.mempoolexpiry_h       = 336;
@@ -694,6 +696,11 @@ long node_config_load(const char* path){
                        if(bp>0 && bp<65536){ g_cfg.port = bp; } }
             snprintf(g_cfg.bind_addr,sizeof g_cfg.bind_addr,"%s",tmp);
             applied++; }
+        else if(!strcmp(key,"bmc.catchupworkers")){
+            /* the PARALLEL DOWNLOAD chunk-worker ceiling. Not -par: that is
+             * Core's script-verification thread count and means exactly that
+             * here (2026-09-06). dl_catchup clamps this to the live peers. */
+            t=clamp_int(iv,1,64,key,&bad); if(t!=-1){ g_cfg.catchup_workers=t; applied++; } }
         else if(!strcmp(key,"par")){
             /* Core -par: worker threads. 0 = auto, and NEGATIVE means "leave
              * that many cores free", which is why the lower bound is not 0.
