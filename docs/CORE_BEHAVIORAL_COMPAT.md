@@ -1,0 +1,206 @@
+# Core behavioral compatibility — the complete list
+
+**Date:** 2026-09-06. **Reference:** Bitcoin Core v30/v31 default behavior.
+**Method:** every row below was checked against `asm/` source or the gate
+this morning, not copied from `FEATURE_GAPS.md` — where the two disagree,
+this file says so and `FEATURE_GAPS.md` is corrected in the same commit.
+
+**Status vocabulary**
+
+| | meaning |
+|---|---|
+| **DONE** | matches Core's observable behavior; proven against a real Core where the row says so |
+| **PARTIAL** | one direction or one mode present; the missing half is named |
+| **GAP** | Core does it, this node does not, and nothing has decided it away |
+| **DECIDED** | deliberately different, with the reasoning written down where the row points |
+| **PROOF** | the code is there; what is missing is the run that proves it |
+
+The **work list** at the end orders every GAP, PARTIAL and PROOF row.
+
+---
+
+## 1. Consensus and validation
+
+| Behavior | Core | This node | Status |
+|---|---|---|---|
+| Script interpreter, all sigversions | `EvalScript` | asm interpreter, differential-fuzzed against Core in the gate (`validation/`), 17-finding line review closed 2026-09-05 | **DONE** |
+| Stack size / ops / element limits | 1000 / 201 / 520 | same (IR-1 closed: 17 sites) | **DONE** |
+| DER / hashtype boundaries | `ecdsa_signature_parse_der_lax` pops hashtype first | same (IR-2: 11 sites) | **DONE** |
+| Taproot key-path, script-path, tapscript, sigops budget, annex | BIP341/342 | same; annex refused, sigop budget per witness size | **DONE** |
+| Segwit v0, nested segwit, witness commitment | BIP141/143/144 | same | **DONE** |
+| BIP30, BIP34, BIP65, BIP66, BIP68/112/113, nBits schedule | height/MTP activations | same; nBits replayed against every mainnet + testnet4 header | **DONE** |
+| `MAX_MONEY`, coinbase maturity, sigops per block (80,000) | | same (VAL-2, SCR-6) | **DONE** |
+| `assumevalid` | skip scripts at/below a pinned block; `=0` verifies all | both modes, per-chain defaults | **DONE** |
+| **Full-verification replay of mainnet** (`assumevalid=0`) | Core has been run this way by many parties | **never run here**. Two false-accepts found in 2026-09-05 sat *below* the assumevalid height — the region a default sync never executes | **PROOF** |
+| `assumeutxo` snapshot load | `loadtxoutset` | absent | **DECIDED** (`FEATURE_GAPS.md` "genuinely still open": large lift, no need) |
+| UTXO set identity | | MuHash byte-identical to Core at two heights on two datadirs; re-runnable (`validation/muhash_vs_core.sh`) | **DONE** |
+| Reorg handling, undo, crash consistency | | same; tested | **DONE** |
+| `invalidateblock` / `reconsiderblock` | operator tooling to force a reorg | absent | **GAP** (small; RPC-only) |
+| Chain selection | main / testnet4 / signet / regtest; testnet3 deprecated | same; testnet3 refused outright | **DONE** |
+
+## 2. Mempool policy
+
+| Behavior | Core | This node | Status |
+|---|---|---|---|
+| Standardness (`IsStandardTx`, script flags, dust, `bytespersigop`) | | same; STANDARD flags forwarded to tapscript (IR-9) | **DONE** |
+| Ancestor / descendant limits, package limits | 25 / 101 KvB | same | **DONE** |
+| RBF | full-RBF default (`mempoolfullrbf`) | config-driven, same default | **DONE** |
+| TRUC (v3) incl. sibling eviction, ephemeral dust | | same; proven against real Core on regtest | **DONE** |
+| Package acceptance (1p1c, `submitpackage`) | | same, effective feerate | **DONE** |
+| `TrimToSize`, `mempoolminfee`, expiry, persistence (`mempool.dat`) | | same | **DONE** |
+| Fee estimation | `CBlockPolicyEstimator` | same estimator, persisted | **DONE** |
+| `prioritisetransaction` affecting selection/eviction | delta changes ordering | delta is **display-only** (MEM-18) | **DECIDED** (`FEATURE_GAPS.md` §MEM-18) |
+| Orphan pool with limits and expiry | | same (`tx_relay.c`) | **DONE** |
+| Reject cache (`recentRejects` by wtxid) | | same (`serve_rejects.c`) | **DONE** |
+
+## 3. P2P wire protocol — messages
+
+| Message / BIP | Core | This node | Status |
+|---|---|---|---|
+| `version`/`verack`, protocol 70016, services bits | NETWORK, WITNESS, NETWORK_LIMITED, P2P_V2, COMPACT_FILTERS | same; `NODE_BLOOM` never advertised (Core default off too) | **DONE** |
+| BIP324 v2 encrypted transport | default on, inbound + outbound | same; v1 detected in band | **DONE** |
+| BIP339 `wtxidrelay`, BIP133 `feefilter`, BIP130 `sendheaders` | | same, both directions | **DONE** |
+| BIP155 `addrv2` / `sendaddrv2`, all five networks | | same; Core accepts our onion/i2p/cjdns entries | **DONE** |
+| `getaddr` / `addr` serving, self-advertisement (24 h, two-peer agreement) | | same | **DONE** |
+| `inv`/`getdata`/`notfound`, witness-typed fetch | | same | **DONE** |
+| `getheaders`/`headers` (2000, locator) | | same | **DONE** |
+| `getblocks` (legacy) | still answered | answered | **DONE** |
+| `mempool` (BIP35) gated by permission | | same (`NP_MEMPOOL`) | **DONE** |
+| **BIP152 compact blocks — serve side** | answers `MSG_CMPCT_BLOCK`, `getblocktxn`, negotiates `sendcmpct` | same | **DONE** |
+| **BIP152 compact blocks — receive side** | high- and low-bandwidth modes; reconstruct from mempool, `getblocktxn` for the rest, `blockreconstructionextratxn` | **absent**: `cmpctblock`/`blocktxn` are never handled inbound; the download path never sends `sendcmpct` and fetches every block as `MSG_BLOCK` (`main.c`, 4 sites). A peer's compact block is ignored. *`FEATURE_GAPS.md`'s config row for `blockreconstructionextratxn` said "reconstruction draws on the mempool only", implying it exists — corrected in this commit.* | **GAP** |
+| BIP157/158 `getcfilters`/`getcfheaders`/`getcfcheckpt` | when `-peerblockfilters` | same (`serve_cfilters.c`), service bit gated the same way | **DONE** |
+| BIP37 bloom (`filterload` etc.) | default off, `NODE_BLOOM` off | not implemented, bit never set | **DECIDED** (matches Core's default) |
+| BIP61 `reject` | removed in 0.20 | absent | **DONE** (parity by absence) |
+| BIP330 Erlay `sendtxrcncl` + reconciliation | negotiation + reconciliation (off by default) | negotiation only, wire-off | **DECIDED** (`FEATURE_GAPS.md` 2026-08-30 "deliberate stopping point") |
+| BIP331 package relay `sendpackages`/`pkgtxns`/`ancpkginfo` | wire negotiation + package fetch | acceptance is real; **wire protocol not built** | **PARTIAL** |
+| Misbehavior scoring + ban list | `Misbehaving()`, discouragement, `banlist.json` | scored for inv/getdata bounds, header rules, tx violations via `txr_report_violation`; shared file-backed ban list (`ctl_ban_add`) | **DONE** (verify: persistence across restart) |
+
+## 4. P2P behavior — connections and relay
+
+| Behavior | Core | This node | Status |
+|---|---|---|---|
+| Outbound full-relay legs | 8 | configurable, default 8 (`MUX_WANT_OUT`) | **DONE** |
+| **Block-relay-only outbound** | 2 extra legs that never relay tx/addr; eclipse resistance | **absent** (0 hits) | **GAP** |
+| **`anchors.dat`** | reconnect to last block-relay-only peers on restart | **absent** | **GAP** (pairs with the row above) |
+| Feeler connections | 1 short-lived every ~2 min, tests a book entry | same (`net_policy.c`) | **DONE** |
+| **Extra outbound when tip is stale** | +1 full-relay peer if no block in >30 min | **absent** | **GAP** |
+| Netgroup diversity in outbound selection | one per /16 (asmap) | same, asmap supported | **DONE** |
+| Tor / I2P / CJDNS outbound, `-onlynet`, stream isolation | | same; proven against Core over real tor, i2p, cjdroute | **DONE** |
+| **Inbound onion service** (`-listenonion`) | ADD_ONION at boot | parses; `torcontrol.c` exists and is tested; **not called at boot** | **PARTIAL** |
+| **Inbound I2P** (`i2pacceptincoming`) | SAM `STREAM ACCEPT` | implemented; **not wired to the serve loop** | **PARTIAL** |
+| Inbound slot limit, `-maxconnections`, per-connection permissions (`-whitelist`/`-whitebind`) | | same | **DONE** |
+| **Inbound eviction when full** (`AttemptToEvictConnection`) | protect by netgroup, ping, last block, last tx; evict the worst | **absent**: a 20-minute inactivity bound only (NET-3 residual). Under pressure, slots are held by whoever arrived first | **GAP** |
+| `-peertimeout` (connect timeout) | default 60 s | **not implemented** (DMN-14) — the timeout that exists is a different one | **GAP** (small) |
+| Inactivity disconnect | 20 min | same (NET-3) | **DONE** |
+| `-maxuploadtarget`, `-blocksonly` | | same | **DONE** |
+| Address manager: source-netgroup cap, tried/new, eviction never touching tried | `CAddrMan` buckets | v3 book: per-source cap, tried flag, terrible-then-oldest eviction (NET-10, 2026-09-05, migrated live) | **DONE** (design differs; behavior matches on the properties that matter) |
+| Addrman test-before-evict | probe incumbent before replacing | absent | **DECIDED** (`NET-10_ADDRMAN_SCOPE.md` §5: no place for a connect inside a file-backed insert) |
+| DNS seeds, `-seednode`, `-addnode`, `-connect` | + compiled-in fixed seeds | DNS seeds (13, all chains), the three options; **no fixed-seed list** | **DONE** (fixed seeds: DECIDED, config table) |
+| Transaction announcement to **outbound** legs | inv with per-peer queue, feefilter honored, wtxid | same (`tx_relay.c`, `main.c:5647`) | **DONE** |
+| **Transaction announcement to inbound peers** | every peer that negotiated relay gets invs (Poisson-timed) | **absent**: the inbound serve loop pushes no tx invs — it answers `mempool` and `getdata` only, and `txrelay_poll_leg` runs on outbound legs only (`main.c:5789`) | **GAP** |
+| **Re-announcement of transactions received from inbound peers** | relayed onward to all other peers | not relayed past the outbound legs (`FEATURE_GAPS.md` "genuinely still open") | **GAP** (same fix as the row above) |
+| Own-transaction announcement (`sendrawtransaction`) | announced like any other tx, not pushed | same (2026-09-03) | **DONE** |
+| Private broadcast (`-privatebroadcast`) | v30 | same | **DONE** |
+| Block announcement to peers (BIP130 headers, inv fallback) | to every peer | inbound: `node_announce_tip`; outbound: inv (`main.c:5647`) | **DONE** |
+| Transaction `getdata` service to inbound peers, witness-typed | | same | **DONE** |
+
+## 5. Headers sync and anti-DoS
+
+| Behavior | Core | This node | Status |
+|---|---|---|---|
+| Headers-first sync, PoW checked per header, contextual rules | | same; boot header fetch PoW-gates before append (VAL-5) | **DONE** |
+| **Minimum chain work / headers presync** | refuse to commit memory to a low-work headers chain (`nMinimumChainWork`, 2022 presync with commitments) | **absent** (0 hits) | **GAP** |
+| Checkpoints | still present for the early chain | present | **DONE** |
+| Stale-tip detection | warn + extra outbound | no extra outbound (row in §4) | **GAP** (same item) |
+| Time offset | v28+ no longer adjusts; warns on large peer skew | no adjustment | **DONE** (parity by absence; warning: verify) |
+| Per-message size caps, framer limits, inv/getdata bounds | | same; 4 MB cap before drain | **DONE** |
+
+## 6. Indexes and RPC
+
+| Behavior | Core | This node | Status |
+|---|---|---|---|
+| `txindex`, `blockfilterindex`, `txospenderindex`, address index | | same (address index is an extension) | **DONE** |
+| `coinstatsindex` at **any height** | one record per block | **tip only** (CSI-2); historical `gettxoutsetinfo muhash <h>` needs the oracle | **DECIDED** (`BENCH_DEFECT_LEDGER_2026-09-04.md`) |
+| RPC surface (~157 methods), cookie auth, `rpcauth`, `rpcwhitelist`, loopback default | | same, verified per method in `PARITY_PLAN.md` | **DONE** |
+| `getaddressinfo` wallet-context fields | | stubs for some | **PARTIAL** (`FEATURE_GAPS.md` bugs list) |
+| Long-running RPC concurrency | parallel workers | one execution lock (RPC-12) | **DECIDED** |
+| REST interface | `-rest` | absent | **DECIDED** |
+| ZMQ `hashblock`/`hashtx`/`rawblock`/`rawtx` | | same; `zmqpubsequence` refused (MEM-22) | **DONE** / sequence **DECIDED** |
+| `settings.json` persistence of RPC-set values | | absent | **DECIDED** (config table) |
+
+## 7. Wallet
+
+| Behavior | Core | This node | Status |
+|---|---|---|---|
+| Descriptor wallets, encryption (v3), PSBT create/sign/finalize/analyze/join, `bumpfee` | | same; `bumpfee` proven against real Core | **DONE** |
+| Miniscript, MuSig2 key-path, `musig()` descriptors | | same | **DONE** |
+| MuSig2 inside tapscript **leaf** scripts | signed | not signed | **PARTIAL** |
+| BIP389 multipath descriptors, PSBT Updater role, partial signatures | | absent | **GAP** |
+| Coin selection (BnB / knapsack / SRD, waste metric) | | basic | **PARTIAL** |
+| Keypool | pre-generated | derives on demand | **DECIDED** |
+| Reorg awareness in the wallet | rescans/updates on disconnect | none (WAL-13) | **DECIDED** |
+| Secrets hygiene (mlock, DONTDUMP) | | same (WAL-3) | **DONE** |
+
+## 8. Mining
+
+| Behavior | Core | This node | Status |
+|---|---|---|---|
+| `getblocktemplate` (frame, retarget, longpoll), `submitblock` end to end | | same; frame diffed against Core at the same tip | **DONE** |
+| BIP23 proposal mode | | absent | **GAP** (small) |
+| Stratum / pool interface | not in Core either | absent | **DONE** (parity by absence) |
+
+## 9. Configuration surface
+
+Every Core v31.99 option is classified in `FEATURE_GAPS.md` ("config surface",
+2026-09-01): implemented, accepted-no-effect with the reason, or refused. The
+behavioral ones that are *accepted with no effect* and are not already rows
+above: `peerbloomfilters` (BIP37), `txreconciliation` (Erlay), `natpmp`,
+`rest`, `fixedseeds`, `loadblock`, `blocksdir`/`blocksxor`, `debug`
+categories, `mocktime`, `maxsigcachesize` (no sig cache: verified once by
+the parallel verifier), `settings`. Each is a DECIDED row by reference.
+
+Config **file resolution** now matches Core: one file, `$BITCOIN_CONF`, else
+`<datadir>/bitcoin.conf`, else the repo fallback — daemon and CLI agree
+(`d0bc1c2`, 2026-09-05).
+
+## 10. Operations
+
+| Behavior | Core | This node | Status |
+|---|---|---|---|
+| Clean shutdown on SIGTERM during any phase; crash-consistent UTXO | | same | **DONE** |
+| Pruning by MiB budget | | same | **DONE** |
+| Log rotation, systemd hardening | operator's | same; unit local by decision | **DONE** |
+| `-checkblocks`/`-checklevel` | | same | **DONE** |
+
+---
+
+## Work list — every GAP, PARTIAL and PROOF row, in recommended order
+
+Ordering is by consequence to the network and to this node's safety, then
+by size. Each carries the test that would prove it.
+
+| # | Item | Why it is first | Size | Proof |
+|---|---|---|---|---|
+| 1 | **Transaction relay to and from inbound peers** (§4, two rows) | Inbound peers currently receive no tx invs from us and what they send us stops at our outbound legs. A node that takes relay and gives none back is a partial leech; it is also the behavior a peer-quality heuristic (Core's own eviction) would score us down for. | medium: a per-inbound-peer inv queue in the serve loop fed from the shared pool, Poisson-timed, feefilter-honoring; and `txrelay_poll_leg`'s announce fan-out extended to inbound fds | regtest against real Core as an *inbound* peer of ours: it must receive our mempool; and as an inbound peer of Core, a tx we take from a third node must reach Core |
+| 2 | **BIP152 compact block receive** (§3) | Every block is fetched in full today. Core's default propagation is compact; this is bandwidth and latency at every block, and a Core peer in high-bandwidth mode pushes `cmpctblock` unsolicited — which we drop and then fetch in full | medium-large: `sendcmpct` on the download legs, `cmpctblock` handler with short-id reconstruction from the mempool, `getblocktxn`/`blocktxn` round trip, `blockreconstructionextratxn` | regtest: Core mines; we must reconstruct without a full `getdata` when the mempool holds the txs, and fall back correctly when it does not |
+| 3 | **Inbound eviction** (`AttemptToEvictConnection`, §4) | Under slot pressure the node keeps whoever arrived first; Core keeps whoever is useful and diverse. This is the residual of a HIGH (NET-3) | medium: the protection rounds (netgroup, ping, last block, last tx, longest-connected) over the shared peer table, then evict | unit: a synthetic full table; the eviction victim matches Core's rule set on 20 fixtures |
+| 4 | **Block-relay-only outbound + `anchors.dat`** (§4) | Eclipse resistance: two legs that never leak tx/addr timing and reconnect first on restart | medium | regtest: the two legs negotiate no tx relay (`fRelay=0`, no `sendaddrv2` acceptance) and are the first redialed |
+| 5 | **Minimum chain work / headers presync** (§5) | Anti-DoS for headers sync; today a low-work headers chain of any length is stored | medium | unit: a 100k-header regtest chain below the threshold is not committed |
+| 6 | **Extra outbound on stale tip** (§4, §5) | Recovery from a partition | small | regtest: partition; +1 leg within the window |
+| 7 | **`-peertimeout`** (DMN-14) | Correctness of an option Core has | small | unit |
+| 8 | **Full-verification replay** (`assumevalid=0`, §1) | The one run that turns "matches Core's trust boundary" into "every script, every block" | wall-clock only; second scratch datadir | MuHash identical to Core at the stop height, and the log has no rejected block |
+| 9 | **Inbound onion service + inbound I2P** (§4) | Two implemented pieces not called at boot / not wired | small each | Core over tor dials *us*; Core over i2p dials us |
+| 10 | **BIP331 package relay wire** (§3) | Completes a half-done feature the summary overstates | medium | regtest: a 1p1c package announced by Core is fetched as a package |
+| 11 | `invalidateblock`/`reconsiderblock`, BIP23 proposal mode, `getaddressinfo` stubs, MuSig2 leaf signing, BIP389, coin selection | Tooling and wallet completeness | small–medium each | per-method oracle diff, as `PARITY_PLAN.md` does |
+
+Items 1–3 are the ones a Core node on the other end of a connection would
+notice. Items 4–6 are what protects *this* node. Item 8 is the proof. The
+rest is completeness.
+
+**Explicitly not on the list, by decision:** Erlay reconciliation, addrman
+test-before-evict, `assumeutxo`, REST, UPnP/NAT-PMP, BIP37 bloom, keypool,
+tip-only coinstats index (CSI-2), display-only `prioritisetransaction`
+(MEM-18), single RPC execution lock (RPC-12), wallet reorg awareness
+(WAL-13), opcode dispatch table (IR-16), systemd unit in version control.
+Each has its reasoning where the row points; reopen one by arguing with the
+reasoning, not by re-filing it.
