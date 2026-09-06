@@ -14,15 +14,15 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$HERE"
 
-# --- 1. Assemble all sources ------------------------------------------------
-echo "== Assembling all .asm sources =="
-for src in *.asm; do
-    obj="${src%.asm}.o"
-    echo "  nasm -f elf64 -o $obj $src"
-    nasm -f elf64 -o "$obj" "$src"
-done
-
-# --- 2. Build + run the full verification suite -----------------------------
+# --- 1. Build + run the full verification suite -----------------------------
+# BLD-4 (audit 2026-09-03): this used to hand-assemble every .asm with a bare
+# `nasm -f elf64`, which dropped BOTH -I. and -Werror -- so the whole tree was
+# built without the warning gate the Makefile defines in NASMFLAGS.
+#
+# Worse than the missing flags: the loop rewrote every .o with a FRESH mtime,
+# so the `make test` that followed found nothing to rebuild and the -Werror
+# path never ran at all. Removing the loop fixes both at once -- `make test`
+# already builds every object it needs, through the rules that carry the flags.
 echo "== make test =="
 make test
 

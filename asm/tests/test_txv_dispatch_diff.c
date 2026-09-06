@@ -224,6 +224,31 @@ int main(void){
         diff_case("unknown shape passes (default arm)", txp, np, &in, 0, 0);
     }
 
+    /* ---- VAL-16: the assumevalid short-circuit, on BOTH sides ------------
+     * daemon/tx_verify.c opens its dispatch with
+     *     if (!g_txv_script_checks) return 1;
+     * and the asm twin did not have it. Nothing in production drives the twin,
+     * so there was no behaviour to observe -- but a differential whose two
+     * sides disagree under a documented configuration is worse than no
+     * differential, because the comparison is what gets trusted.
+     *
+     * Every shape is re-run with script checks OFF. Both sides must accept
+     * without evaluating; if only one short-circuits, diff_case reports the
+     * mismatch. */
+    { extern int  tx_verify_script_checks(void);
+      extern void tx_verify_set_script_checks(int);
+      int saved = tx_verify_script_checks();
+      tx_verify_set_script_checks(0);
+      for (int shape = 0; shape <= 9; shape++){
+          txvb_in_t in; memset(&in, 0, sizeof in);
+          in.shape = (unsigned char)shape;
+          char lbl[96];
+          snprintf(lbl, sizeof lbl, "VAL-16 assumevalid: shape %d short-circuits on both sides", shape);
+          diff_case(lbl, txp, np, &in, 0, 0);
+      }
+      tx_verify_set_script_checks(saved);
+      printf("  (script checks restored to %d)\n", tx_verify_script_checks()); }
+
     printf("compared %ld dispatch cases; %ld mismatch(es)\n", compared, fails);
     printf("%s (%ld failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;

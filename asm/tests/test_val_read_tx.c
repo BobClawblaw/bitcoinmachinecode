@@ -77,7 +77,17 @@ typedef struct {
     const u32* seqs; u32 nseqs;
 } val_txinfo_t;
 
+/* val_seq_walk_t's real layout, mirrored on the same terms: three fields,
+ * ABI-compatible by construction with utxo_live.c's definition. */
+typedef struct {
+    const u8* p;
+    const u8* end;
+    u64 remaining;
+} val_seq_walk_t;
+
 extern int val_read_tx_probe(const u8* tx, u64 txlen, val_txinfo_t* vi);
+extern int val_seq_walk_probe_init(const u8* tx, u64 txlen, val_seq_walk_t* w);
+extern int val_seq_walk_probe_next(val_seq_walk_t* w, u32* seq_out);
 
 long mempool_resolve_confirmed_utxo(void* u, const u8* t, unsigned long i,
                                     u64* v, const u8** s, unsigned long* l){
@@ -215,6 +225,80 @@ int main(void){
     ck("the vectors carried both segwit and legacy shapes", n_segwit > 0 && n_legacy > 0);
     ck("the vector table was not empty", n_seen >= 4);
     printf("      %d transactions (%d segwit, %d legacy)\n", n_seen, n_segwit, n_legacy);
+
+    /* ---- the BIP68 oversized-tx sequence walker (val_seq_walk_*).
+     *
+     * apply_block_inner's BIP68 pass used to REJECT any transaction with
+     * more than VAL_SEQ_CAP (2048) inputs outright ("past the sequence
+     * window") -- a false bad-txns-nonBIP68-final on real consolidation
+     * transactions (first seen live: block 964092, tx 840 with 5,226
+     * inputs, applied by Core). The pass now streams the surplus sequences
+     * with these walkers, so the contract to pin is: EVERY nSequence, in
+     * input order, segwit marker or not, with no cap and no truncation,
+     * and a clean end-of-inputs signal. A synthetic 3,000-input tx (past
+     * the cap by design) is cheaper and more direct than a fixture. ---- */
+    {
+        enum { NIN = 3000, SURPLUS_NONFINAL_AT = NIN - 1 };
+        static u8 big[64 + NIN * 41 + 64];
+        u64 n = 0;
+        big[n++] = 2; big[n++] = 0; big[n++] = 0; big[n++] = 0;   /* version 2 */
+        big[n++] = 0xfd; big[n++] = (u8)(NIN & 0xff); big[n++] = (u8)(NIN >> 8);
+        for (int i = 0; i < NIN; i++){
+            for (int b = 0; b < 32; b++) big[n++] = (u8)((i * 7 + b) & 0xff); /* prevout txid */
+            big[n++] = (u8)(i & 0xff); big[n++] = 0; big[n++] = 0; big[n++] = 0; /* vout */
+            big[n++] = 0;                                          /* empty scriptSig */
+            /* all-final except the LAST surplus input, which carries a
+             * 100-block relative lock -- the value a truncated read would
+             * have replaced with 0xffffffff and silently exempted */
+            u32 sq = (i == SURPLUS_NONFINAL_AT) ? 0x00000064u : 0xFFFFFFFFu;
+            memcpy(big + n, &sq, 4); n += 4;
+        }
+        big[n++] = 1;                                              /* n_out */
+        memset(big + n, 0, 8); n += 8;                             /* value 0 */
+        big[n++] = 25;                                             /* spk len */
+        big[n++] = 0x76; big[n++] = 0xa9; big[n++] = 20;           /* dummy P2PKH-ish */
+        memset(big + n, 0x51, 20); n += 20;
+        big[n++] = 0x88; big[n++] = 0xac;
+        big[n++] = 0; big[n++] = 0; big[n++] = 0; big[n++] = 0;   /* locktime 0 */
+
+        val_seq_walk_t w;
+        ck("oversized tx (3000 in): walker initializes",
+           val_seq_walk_probe_init(big, n, &w) == 1);
+        int order_ok = 1, value_ok = 1, delivered = 0;
+        for (int i = 0; i < NIN; i++){
+            u32 sq;
+            if (!val_seq_walk_probe_next(&w, &sq)){ order_ok = 0; break; }
+            delivered++;
+            u32 want = (i == SURPLUS_NONFINAL_AT) ? 0x00000064u : 0xFFFFFFFFu;
+            if (sq != want) value_ok = 0;
+        }
+        u32 extra;
+        ck("oversized tx: all 3000 sequences delivered in order", order_ok && delivered == NIN);
+        ck("oversized tx: the surplus (past-cap) sequence is the real 0x64, not a truncated 0xffffffff",
+           value_ok);
+        ck("oversized tx: walker reports end-of-inputs after the last one",
+           val_seq_walk_probe_next(&w, &extra) == 0);
+
+        /* the same body with a segwit marker+flag: the walker must skip it */
+        static u8 swbig[64 + NIN * 41 + 64];
+        swbig[0] = 2; swbig[1] = 0; swbig[2] = 0; swbig[3] = 0;
+        swbig[4] = 0x00; swbig[5] = 0x01;
+        memcpy(swbig + 6, big + 4, n - 4);
+        ck("oversized segwit tx: walker skips the marker+flag and still delivers 3000",
+           val_seq_walk_probe_init(swbig, n + 2, &w) == 1);
+        int sw_ok = 1;
+        for (int i = 0; i < NIN; i++){
+            u32 sq;
+            if (!val_seq_walk_probe_next(&w, &sq)) { sw_ok = 0; break; }
+            u32 want = (i == SURPLUS_NONFINAL_AT) ? 0x00000064u : 0xFFFFFFFFu;
+            if (sq != want) sw_ok = 0;
+        }
+        ck("oversized segwit tx: all 3000 sequences, last one 0x64", sw_ok);
+
+        /* truncation: a 4-byte buffer cannot even carry a version */
+        ck("walker refuses a 4-byte buffer",
+           val_seq_walk_probe_init(big, 4, &w) == 0);
+    }
 
     printf("\n%s (%d checks, %d failures)\n",
            fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);

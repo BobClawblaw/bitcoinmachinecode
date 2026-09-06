@@ -42,8 +42,12 @@
  *   - getblockchaininfo "verificationprogress" is blocks/headers, not Core's
  *     tx-count-weighted GuessVerificationProgress. "initialblockdownload" is
  *     "tip older than 24h" (Core also requires min chainwork).
- *   - getblock verbosity 3 behaves like 2 (no undo data => no prevout/fee);
- *     this matches Core's own output when undo data is unavailable.
+ *   - getblock verbosity 3 now carries Core's per-input `prevout`
+ *     {generated, height, value, scriptPubKey}, from the same undo_<h>.dat
+ *     the v2 fees come from. (RPX-2 corrected the old claim here that v3
+ *     behaved like v2 for want of undo data -- never true; the fees beside it
+ *     always came from that file. Wired 2026-09-05.) When the undo file is
+ *     pruned the fields are omitted, which is what Core does too.
  *   - uptime/stop apply to THIS RPC process (bitcoin_rpcd), which is not the
  *     block-relaying node; stop's reply names this project, not Core.
  */
@@ -634,6 +638,55 @@ static rj_val* amount_json(u64 sats){ return rj_numf("%llu.%08llu", sats / 10000
  * value(8) height(4) is_coinbase(1) script_len(2) script[len] -- 51-byte
  * header + script. Returns count, or -1 if the file is absent/pruned (Core
  * always has undo; we keep only a window, so fees are recent-blocks-only). */
+/* RPX-2 (audit 2026-09-03): Core's getrawtransaction verbosity 2 adds `fee`
+ * and, per input, a `prevout` sub-object {generated, height, value,
+ * scriptPubKey}. This node passed in_total = -1 for every verbosity, so
+ * verbosity 2 was byte-identical to verbosity 1 and a caller asking for the
+ * details silently got the shape without them.
+ *
+ * Everything needed is already on disk. The undo record (daemon/undo_log.c)
+ * is txid[32] | index u32 | value u64 | height u32 | is_coinbase u8 |
+ * script_len u16 | script -- value, height, coinbase AND the scriptPubKey,
+ * which is exactly Core's prevout. undo_block_values already walks this file
+ * for getblock v2's fees and throws everything but the value away. */
+typedef struct {
+    u64 value;
+    u32 height;
+    u8  is_coinbase;
+    const u8* spk;
+    u32 spklen;
+} undo_prevout_t;
+
+/* Loads one block's undo file whole and points the entries INTO it. The
+ * caller frees *raw when done; entries are invalid after that. Returns the
+ * entry count, or -1 (absent/pruned/garbage) with *raw NULL. */
+static long undo_block_load(long h, undo_prevout_t* out, long cap, u8** raw){
+    *raw = NULL;
+    char path[64]; snprintf(path, sizeof path, "undo_%ld.dat", h);
+    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
+    struct stat sb; if (fstat(fd, &sb) != 0 || sb.st_size <= 0){ close(fd); return -1; }
+    u8* buf = malloc((size_t)sb.st_size); if (!buf){ close(fd); return -1; }
+    long got = 0; ssize_t rd;
+    while (got < sb.st_size && (rd = pread(fd, buf+got, (size_t)(sb.st_size-got), got)) > 0) got += rd;
+    close(fd);
+    if (got != sb.st_size){ free(buf); return -1; }
+    long n = 0, off = 0;
+    while (off + 51 <= sb.st_size && n < cap){
+        u32 slen = (u32)buf[off+49] | ((u32)buf[off+50] << 8);
+        if (off + 51 + (long)slen > sb.st_size) break;      /* truncated tail */
+        out[n].value       = rd64(buf + off + 36);
+        out[n].height      = (u32)rd32(buf + off + 44);
+        out[n].is_coinbase = buf[off + 48];
+        out[n].spk         = buf + off + 51;
+        out[n].spklen      = slen;
+        n++;
+        off += 51 + (long)slen;
+    }
+    if (off != sb.st_size){ free(buf); return -1; }         /* trailing garbage -> unusable */
+    *raw = buf;
+    return n;
+}
+
 static long undo_block_values(long h, u64* out, long cap){
     char path[64]; snprintf(path, sizeof path, "undo_%ld.dat", h);
     int fd = open(path, O_RDONLY); if (fd < 0) return -1;
@@ -677,7 +730,12 @@ static long undo_block_prevouts(long h, u64* vals, u32* slens, long cap){
     return (off == sb.st_size) ? n : -1;
 }
 
-static rj_val* tx_to_json(const u8* tx, const txw_t* w, long long in_total){
+/* RPX-2: `prevouts` (may be NULL) is this transaction's spent outputs in
+ * input order, from the block's undo file. When present each non-coinbase
+ * input gains Core's `prevout` sub-object. NULL keeps the pre-RPX-2 shape,
+ * which is what verbosity 1 and the mempool/decode paths still want. */
+static rj_val* tx_to_json_pv(const u8* tx, const txw_t* w, long long in_total,
+                             const undo_prevout_t* prevouts, long nprevouts){
     rj_val* o = rj_obj();
     u8 txid[32], wtxid[32]; char hx[65];
     u8* scratch = malloc(w->len ? w->len : 1);
@@ -727,6 +785,17 @@ static rj_val* tx_to_json(const u8* tx, const txw_t* w, long long in_total){
             }
         }
         rj_obj_set(in, "sequence", rj_numf("%u", seq));
+        /* RPX-2: Core's TxToUniv with TxVerbosity::SHOW_DETAILS. Coinbase
+         * inputs have no prevout to show -- they spend nothing. */
+        if (!coinbase && prevouts && (long)i < nprevouts){
+            const undo_prevout_t* pv = &prevouts[i];
+            rj_val* po = rj_obj();
+            rj_obj_set(po, "generated", rj_bool(pv->is_coinbase != 0));
+            rj_obj_set(po, "height", rj_numf("%u", pv->height));
+            rj_obj_set(po, "value", amount_json(pv->value));
+            rj_obj_set(po, "scriptPubKey", script_pubkey_json_x(pv->spk, pv->spklen, 1));
+            rj_obj_set(in, "prevout", po);
+        }
         rj_arr_push(vin, in);
     }
     rj_obj_set(o, "vin", vin);
@@ -752,6 +821,10 @@ static rj_val* tx_to_json(const u8* tx, const txw_t* w, long long in_total){
         rj_obj_set(o, "fee", amount_json((u64)in_total - out_total));
     char* h = malloc(w->len*2 + 1); if (h){ hex_of(h, tx, w->len); rj_obj_set(o, "hex", rj_str(h)); free(h); }
     return o;
+}
+/* The pre-RPX-2 shape: no prevouts. Every existing caller keeps it. */
+static rj_val* tx_to_json(const u8* tx, const txw_t* w, long long in_total){
+    return tx_to_json_pv(tx, w, in_total, NULL, 0);
 }
 
 /* ---- blockheaderToJSON ---- */
@@ -1334,6 +1407,21 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
      * (fee omitted, honest -- we keep only a recent-heights window). */
     static u64 undo_vals[600000]; long undo_n = -1, undo_cur = 0;
     if (verbosity >= 2) undo_n = undo_block_values(h, undo_vals, (long)(sizeof undo_vals / sizeof undo_vals[0]));
+    /* verbosity 3 additionally carries Core's per-input `prevout`
+     * {generated, height, value, scriptPubKey}. Same undo file the fees above
+     * come from -- undo_block_load reads the WHOLE record (value, height,
+     * coinbase flag and the scriptPubKey) where undo_block_values keeps only
+     * the value.
+     *
+     * This file's own header used to explain verbosity 3 behaving like 2 as
+     * "no undo data => no prevout/fee". That was never the reason -- the fees
+     * beside it have always come from undo_<h>.dat. RPX-2 corrected the
+     * comment and wired getRAWtransaction's verbosity 2; this wires getblock's
+     * verbosity 3, from the same loader. */
+    static undo_prevout_t undo_pv[600000]; long undo_pn = -1;
+    u8* undo_raw = NULL;
+    if (verbosity >= 3)
+        undo_pn = undo_block_load(h, undo_pv, (long)(sizeof undo_pv / sizeof undo_pv[0]), &undo_raw);
     for (u64 i = 0; i < ntx; i++){
         txw_t w;
         if (!tx_walk(p, end, &w)){ rj_free(txs); if (cb) rj_free(cb); rj_free(o); *ec = -1; *em = "Block decode failed"; return 0; }
@@ -1361,15 +1449,35 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
                 in_total = 0;
                 for (u64 k = 0; k < w.n_in; k++) in_total += (long long)undo_vals[undo_cur + k];
             }
+            /* the prevout slice for THIS transaction starts where the fee
+             * accumulator is, since both walk the same undo file in the same
+             * block order -- read it before undo_cur advances below. */
+            const undo_prevout_t* pv = NULL; long pvn = 0;
+            if (verbosity >= 3 && i > 0 && undo_pn >= 0 &&
+                undo_cur + (long)w.n_in <= undo_pn){
+                pv = undo_pv + undo_cur; pvn = (long)w.n_in;
+            }
             if (i > 0 && undo_n >= 0) undo_cur += (long)w.n_in;   /* advance even if capped */
-            rj_arr_push(txs, tx_to_json(p, &w, in_total));
+            rj_arr_push(txs, tx_to_json_pv(p, &w, in_total, pv, pvn));
         }
         p += w.len;
     }
+    free(undo_raw);                      /* verbosity 3 prevout backing store */
     rj_obj_set(o, "strippedsize", rj_numf("%zu", stripped));
     rj_obj_set(o, "size", rj_numf("%ld", len));
     rj_obj_set(o, "weight", rj_numf("%zu", stripped * 3 + (size_t)len));
-    if (cb) rj_obj_set(o, "coinbase_tx", cb);
+    /* RPX-7 (audit 2026-09-03): `coinbase_tx` is NOT a Core field.
+     * Core's blockToJSON has no such member -- the coinbase appears only
+     * inside the `tx` array, like every other transaction. An additive field
+     * is exactly what a strict field-set diff against Core flags, and this
+     * one was undocumented AND pinned by tests/test_rpc_chain.c as if it were
+     * canonical. Nothing outside that test ever read it. Dropped rather than
+     * documented as an extension: this node's whole claim is Core's result
+     * shapes, and an extra key is a divergence however convenient it is.
+     * The object is still BUILT above and freed here, because building it is
+     * what proves the coinbase parses; see the assertions in
+     * tests/test_rpc_chain.c that replaced the field checks. */
+    if (cb) rj_free(cb);
     rj_obj_set(o, "tx", txs);
     *res = o;
     return 1;
@@ -1488,6 +1596,23 @@ static void txi_open(void){
 static const u8* g_txi_tail;
 static u64 g_txi_tail_sz;          /* mapped size, bytes (whole records only) */
 static long g_txi_tail_maxh = -1;  /* highest height among mapped records */
+
+/* RPX-8 (audit 2026-09-03): the txid-index coverage range, in one place.
+ *
+ * getrawtransaction and gettxoutproof both tell a caller which heights the
+ * index covers when a lookup misses, because "not found" from a PARTIAL index
+ * is a different fact from "not found" on the whole chain. The two had
+ * near-identical copies of the range computation and the wording, which is a
+ * maintenance hazard exactly where accuracy matters: if the coverage rule ever
+ * changed, one of them would keep saying the old thing.
+ *
+ * The MESSAGES stay separate -- Core's texts differ between the two methods
+ * and each names what its own caller should do -- but the range they quote now
+ * comes from one function. */
+static long txi_coverage_to(void){
+    return g_txi_tail_maxh > g_txi_to ? g_txi_tail_maxh : g_txi_to;
+}
+
 
 static void txi_tail_refresh(void){
     struct stat sb;
@@ -1746,7 +1871,7 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
                  * covers: "not found" from a PARTIAL index is a different
                  * fact from "not found" on the whole chain, and a caller who
                  * cannot tell them apart will draw the wrong conclusion. */
-                long cov_to = g_txi_tail_maxh > g_txi_to ? g_txi_tail_maxh : g_txi_to;
+                long cov_to = txi_coverage_to();     /* RPX-8 */
                 snprintf(nomsg, sizeof nomsg,
                          "No such mempool or blockchain transaction. The txid index "
                          "covers heights %ld..%ld; if the transaction is outside that "
@@ -1794,7 +1919,44 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
              * above makes plainly wrong -- an unconfirmed transaction is in
              * no block at all. */
             if (have_blockhash) rj_obj_set(o, "in_active_chain", rj_bool(1));
-            rj_val* t = tx_to_json(p, &w, -1);   /* verbosity 1: no fee (Core parity) */
+            /* RPX-2: verbosity 2 adds `fee` and per-input `prevout`, from the
+             * block's undo file -- the same source getblock v2 already uses
+             * for its fees. Verbosity 1 stays exactly as it was: in_total -1
+             * and no prevouts, which is Core's verbosity-1 shape.
+             *
+             * When the undo file is absent (pruned, or below the retention
+             * window) the fields are simply omitted, which is also what Core
+             * does when it cannot reach the undo data. */
+            long long rt_in_total = -1;
+            undo_prevout_t rt_pv[1024];
+            long rt_npv = 0;
+            u8* rt_raw = NULL;
+            if (verbosity >= 2){   /* the mempool path returned far above */
+                long all = undo_block_load(h, rt_pv, (long)(sizeof rt_pv / sizeof rt_pv[0]), &rt_raw);
+                if (all > 0){
+                    /* the undo file covers the WHOLE block in input order, so
+                     * this transaction's slice starts after every earlier
+                     * non-coinbase input. Walk the block again to find it --
+                     * the same walk that located the transaction, so the cost
+                     * is one extra pass over a block already in memory. */
+                    long skip = 0; const u8* q = blk;
+                    for (u64 k = 0; k < i; k++){
+                        txw_t kw;
+                        if (!tx_walk(q, end, &kw)) break;
+                        if (k > 0) skip += (long)kw.n_in;      /* tx 0 is the coinbase */
+                        q += kw.len;
+                    }
+                    if (i > 0 && skip + (long)w.n_in <= all){
+                        rt_npv = (long)w.n_in;
+                        memmove(rt_pv, rt_pv + skip, (size_t)rt_npv * sizeof rt_pv[0]);
+                        rt_in_total = 0;
+                        for (long k = 0; k < rt_npv; k++) rt_in_total += (long long)rt_pv[k].value;
+                    }
+                }
+            }
+            rj_val* t = tx_to_json_pv(p, &w, rt_in_total,
+                                      rt_npv ? rt_pv : NULL, rt_npv);
+            free(rt_raw);
             /* splice TxToUniv's members into our object to keep Core's order */
             for (size_t k = 0; k < t->nmembers; k++){ rj_obj_set(o, t->members[k].key, t->members[k].val); t->members[k].val = NULL; }
             for (size_t k = 0; k < t->nmembers; k++) free(t->members[k].key);
@@ -2159,7 +2321,7 @@ static int cmd_gettxoutproof(const rj_val* params, rj_val** res, long* ec, const
             txi_open();
             if (g_txi){
                 static char nomsg[288];
-                long cov_to = g_txi_tail_maxh > g_txi_to ? g_txi_tail_maxh : g_txi_to;
+                long cov_to = txi_coverage_to();     /* RPX-8 */
                 snprintf(nomsg, sizeof nomsg,
                          "Transaction not found in the txid index (covers heights %ld..%ld); "
                          "if the transaction is outside that range, rebuild the index over it "
@@ -3741,6 +3903,12 @@ static int gdump_hash_at(long height, unsigned char out[32]){
     return 1;
 }
 
+/* RPX-4: the same lookup, exported. gettxout needs the tip hash for
+ * `bestblock` and the tip height for `confirmations`; both were hardcoded
+ * (all-zero hash, 0 confirmations) while this file already had the index
+ * open. Returns wire order, like the index record it reads. */
+int rpc_chain_hash_at(long height, unsigned char out[32]){ return gdump_hash_at(height, out); }
+
 static int cmd_dumptxoutset(const rj_val* params, rj_val** res, long* ec, const char** em){
     const char* path = rpc_param_str(params, 0, ec, em); if (!path) return 0;
     if (params->nitems >= 2 && params->items[1]->typ == RJ_STR &&
@@ -4092,7 +4260,20 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
  * extras (total_unspendable_amount, block_info) are absent -- we run no such
  * index, matching Core-without-the-index behavior. height is the UTXO
  * APPLIED height (the state the numbers describe), which on a catching-up
- * node intentionally lags the header tip. */
+ * node intentionally lags the header tip.
+ *
+ * CSI-2 (2026-09-05, /mnt/2tbssd benchmark): Core's height/blockhash second
+ * argument works ONLY with coinstatsindex because Core's index persists a
+ * digest at EVERY height. This index (coinstats.dat, CSI_MAGIC "BMCCSI1")
+ * persists ONE record: the running state at the applied tip. Computing
+ * historical digests would mean either persisting 448 bytes/height x 965k
+ * (~430 MB) or replaying undo from the tip backward -- both are genuine
+ * feature work, not a gap to paper over. Until then historical queries are
+ * REFUSED (the guard in cmd_gettxoutsetinfo, Core's own error text), which
+ * is why getindexinfo's coinstatsindex entry means "current-state O(1)",
+ * not Core's "any-height O(1)". The seam for the feature: append-per-height
+ * records in this file + the guard lifted for heights <= best_block_height
+ * of the index. */
 typedef struct {
     long height;
     unsigned long long txouts, bogosize, total_amount;
@@ -4105,6 +4286,20 @@ void rpc_chain_set_utxosetinfo(long (*run)(int, void*, char*, unsigned long)){
 }
 static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
     static char embuf[256];   /* >= msg[256]: the snprintf below copies it whole */
+    /* CSI-1 (2026-09-05, /mnt/2tbssd bmc-vs-Core benchmark): Core's second
+     * argument selects a HEIGHT or BLOCKHASH and is ONLY valid with
+     * coinstatsindex, whose per-height digests make the query O(1). This
+     * node's index persists the running digest for the APPLIED tip only
+     * (coinstats.dat: one record), and the LSM walk has no height history.
+     * The previous behavior accepted the parameter and returned the TIP set
+     * -- a silently wrong answer: the caller asked for 963,967 and received
+     * 965,626 with the right "height" field but the wrong data for what
+     * they actually queried. Core's own error text, same meaning. */
+    if (params && params->typ == RJ_ARR && params->nitems >= 2){
+        *ec = -8;
+        *em = "coinstatsindex does not support querying at historical heights";
+        return 0;
+    }
     int want_muhash = 1;   /* OUR default (documented divergence, see above) */
     if (params && params->typ == RJ_ARR && params->nitems >= 1){
         if (params->items[0]->typ != RJ_STR){

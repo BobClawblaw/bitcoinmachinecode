@@ -67,6 +67,26 @@ int main(void){
     ok(!cov("garbage/8", "1.2.3.4"),           "a malformed subnet covers nothing");
     ok(!cov("1.2.3.0/24", "garbage"),          "a malformed address is covered by nothing");
 
+    /* ---- NET-17: what the ban list may and may not hold -------------------
+     * ctl_ban_add (daemon/main.c) is gated on subnet_parse, because a key
+     * subnet_parse rejects is a key ENFORCEMENT can never match: the entry
+     * would sit in the fixed RPC_MAX_BANS list doing nothing, and once that
+     * list is full ctl_ban_add returns 0 silently -- so onion violations could
+     * crowd out real IP bans.
+     *
+     * ctl_ban_add itself lives beside main() and cannot be linked into a
+     * harness, so what is pinned here is the PROPERTY the gate rests on: the
+     * peer descriptors an onion/I2P inbound produces must not parse, and real
+     * addresses must. If subnet_parse ever started accepting these, the gate
+     * would silently stop gating. */
+    ok(!subnet_parse("onion-inbound", &n),     "NET-17: the onion peer descriptor is not a subnet");
+    ok(!subnet_parse("i2p-inbound", &n),       "NET-17: the i2p peer descriptor is not a subnet");
+    ok(!subnet_parse("vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion", &n),
+                                               "NET-17: a base32 onion address is not a subnet");
+    ok(subnet_parse("1.2.3.4", &n),            "NET-17: a real IPv4 peer still IS bannable");
+    ok(subnet_parse("2001:db8::1", &n),        "NET-17: a real IPv6 peer still IS bannable");
+    ok(subnet_parse("1.2.3.0/24", &n),         "NET-17: a real subnet still IS bannable");
+
     printf("\n%s (%d failure%s)\n", fails?"TESTS FAILED":"ALL TESTS PASSED",
            fails, fails==1?"":"s");
     return fails ? 1 : 0;

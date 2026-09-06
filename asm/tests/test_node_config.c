@@ -5,6 +5,7 @@
  * stalled a live sync on 2026-08-18. A typo must not be able to reproduce
  * that. */
 #include <stdio.h>
+#include <time.h>
 #include <string.h>
 #include <stdlib.h>
 #include "node_config.h"
@@ -359,6 +360,173 @@ int main(void){
     if (g_cfg.blockmaxweight==4000000 && g_cfg.txconfirmtarget==6 && g_cfg.walletrbf==1 && g_cfg.rpcthreads==16 && g_cfg.maxtipage==86400 && !strcmp(g_cfg.addresstype,"bech32") && g_cfg.n_uacomment==0)
         printf("PASS: Core defaults restored on reload\n");
     else { printf("FAIL: defaults after reload\n"); failures++; }
+
+    /* ================================================================
+     * DMN-4 (audit 2026-09-03): config-file SECTIONS and NEGATION.
+     *
+     * A `[section]` line has no `=`, so the parser skipped it and applied
+     * every following key unconditionally. The reachable consequence is the
+     * one Core's own scoping exists to prevent: an operator reusing a Core
+     * bitcoin.conf with the common dev block
+     *
+     *     [regtest]
+     *     rpcallowip=0.0.0.0/0
+     *     rpcbind=0.0.0.0
+     *
+     * while running MAINNET had those applied -- the mainnet RPC server bound
+     * every interface and accepted every source. And `no<key>` negation was
+     * not implemented at all, so `nolisten=1` was read as an unknown key and
+     * listening stayed on.
+     * ================================================================ */
+    printf("\n---- DMN-4: sections and negation ----\n");
+
+    /* (1) A key under a foreign section must NOT apply. */
+    wr("sec_foreign.conf",
+       "chain=main\n"
+       "maxconnections=200\n"
+       "[regtest]\n"
+       "maxconnections=999\n"
+       "port=18444\n");
+    node_config_load("sec_foreign.conf");
+    if (g_cfg.max_connections == 200 && g_cfg.port != 18444)
+        printf("PASS: [regtest] keys do NOT apply while chain=main\n");
+    else { printf("FAIL: [regtest] key leaked into main (conns=%d port=%d)\n",
+                  g_cfg.max_connections, g_cfg.port); failures++; }
+
+    /* (2) The SAME file on the chain it names must apply. This is what stops
+     * "ignore everything sectioned" from passing as a fix. */
+    wr("sec_match.conf",
+       "regtest=1\n"
+       "maxconnections=200\n"
+       "[regtest]\n"
+       "maxconnections=999\n");
+    node_config_load("sec_match.conf");
+    if (g_cfg.max_connections == 999 && !strcmp(g_cfg.chain, "regtest"))
+        printf("PASS: [regtest] keys DO apply when the chain is regtest\n");
+    else { printf("FAIL: [regtest] key ignored on regtest (conns=%d chain=%s)\n",
+                  g_cfg.max_connections, g_cfg.chain); failures++; }
+
+    /* (3a) A chain selector INSIDE a section does not select the chain. Core
+     * honours -chain/-regtest/-signet only in the base section, and it has to
+     * be that way: a [regtest] section that could switch the node to regtest
+     * would make every such section self-activating. */
+    wr("sec_selector.conf",
+       "maxconnections=200\n"
+       "[regtest]\n"
+       "chain=regtest\n"
+       "maxconnections=777\n");
+    node_config_load("sec_selector.conf");
+    if (!strcmp(g_cfg.chain, "main") && g_cfg.max_connections == 200)
+        printf("PASS: chain= inside a section does not select that chain\n");
+    else { printf("FAIL: sectioned chain selector (chain=%s conns=%d)\n",
+                  g_cfg.chain, g_cfg.max_connections); failures++; }
+
+    /* (3b) A base-section selector works wherever it sits in that section --
+     * including as its LAST line, below keys that depend on it. This is why
+     * the file is read twice; a file must not mean different things depending
+     * on line order. */
+    wr("sec_order.conf",
+       "maxconnections=200\n"
+       "regtest=1\n"
+       "[regtest]\n"
+       "maxconnections=777\n");
+    node_config_load("sec_order.conf");
+    if (g_cfg.max_connections == 777 && !strcmp(g_cfg.chain, "regtest"))
+        printf("PASS: a base-section selector governs sections that follow it\n");
+    else { printf("FAIL: section/chain ordering (conns=%d chain=%s)\n",
+                  g_cfg.max_connections, g_cfg.chain); failures++; }
+
+    /* (4) The audit's actual scenario, end to end. */
+    wr("sec_audit.conf",
+       "chain=main\n"
+       "[regtest]\n"
+       "rpcallowip=0.0.0.0/0\n"
+       "rpcbind=0.0.0.0\n"
+       "connect=127.0.0.1:18444\n");
+    node_config_load("sec_audit.conf");
+    if (g_cfg.rpcbind[0] == 0 && !g_cfg.connect_only)
+        printf("PASS: a [regtest] dev block does not open the MAINNET rpc or pin its peer\n");
+    else { printf("FAIL: [regtest] dev block applied to mainnet (rpcbind='%s' connect_only=%d)\n",
+                  g_cfg.rpcbind, g_cfg.connect_only); failures++; }
+
+    /* (5) Negation: noX=1 means X=0, noX=0 means X=1. */
+    wr("neg1.conf", "chain=main\nlisten=1\nnolisten=1\n");
+    node_config_load("neg1.conf");
+    if (g_cfg.listen == 0) printf("PASS: nolisten=1 turns listen off\n");
+    else { printf("FAIL: nolisten=1 ignored (listen=%d)\n", g_cfg.listen); failures++; }
+
+    wr("neg2.conf", "chain=main\nnolisten=0\n");
+    node_config_load("neg2.conf");
+    if (g_cfg.listen == 1) printf("PASS: nolisten=0 turns listen on (Core's -noX=0)\n");
+    else { printf("FAIL: nolisten=0 (listen=%d)\n", g_cfg.listen); failures++; }
+
+    /* (6) A network-specific key outside any section is ignored on a
+     * non-main chain, and honoured on main. */
+    wr("netspec.conf", "chain=regtest\nport=8333\n");
+    node_config_load("netspec.conf");
+    int rt_port = g_cfg.port_explicit;
+    wr("netspec2.conf", "chain=main\nport=8333\n");
+    node_config_load("netspec2.conf");
+    if (!rt_port && g_cfg.port == 8333)
+        printf("PASS: a bare port= is ignored off mainnet and honoured on it\n");
+    else { printf("FAIL: network-specific base-section rule (rt_explicit=%d main port=%d)\n",
+                  rt_port, g_cfg.port); failures++; }
+
+    /* (7) The predicates themselves, so a reader can see the rules. */
+    if (nodecfg_section_is("regtest","regtest") && !nodecfg_section_is("regtest","main")
+        && nodecfg_is_network_specific("rpcallowip") && !nodecfg_is_network_specific("dbcache")
+        && nodecfg_known_key("listen") && !nodecfg_known_key("nolisten"))
+        printf("PASS: section/network-specific/known-key predicates\n");
+    else { printf("FAIL: DMN-4 predicates\n"); failures++; }
+
+    node_config_load("/nonexistent/reset.conf");
+
+    /* ---- DMN-9 (audit 2026-09-03): integer parsing wraps before clamping ----
+     *
+     * Every numeric key went through atoi, which truncates strtol's long to
+     * an int, so maxconnections=4294967496 wrapped to 200 -- a plausible
+     * value that passed the clamp meant to catch exactly this. And bantime
+     * was atol with only a `> 0` test: main.c computes time(NULL) + bantime,
+     * so a huge value wraps NEGATIVE and every automatic ban expires on the
+     * next check. That one is FAIL-OPEN -- banning quietly turns itself off.
+     *
+     * The controls are the wrapped values themselves: 4294967496 must not
+     * read as 200, and a saturating bantime must not read as something that
+     * makes time()+bantime negative. */
+    node_config_load("/nonexistent/reset.conf");
+    /* 4294967373 = 2^32 + 77, so atoi's truncation yields 77 -- an entirely
+     * legal value that passes the clamp. NOT the audit's own 4294967496,
+     * which wraps to exactly 200: that is also the DEFAULT, so "wrapped" and
+     * "rejected, default kept" are indistinguishable and the assertion would
+     * pass either way. (It did, on the first run of this test.) */
+    wr("dmn9_a.conf", "maxconnections=4294967373\n");
+    node_config_load("dmn9_a.conf");
+    if (g_cfg.max_connections != 77)
+        printf("PASS DMN-9: maxconnections=2^32+77 did not wrap to 77 (got %d)\n",
+               g_cfg.max_connections);
+    else { printf("FAIL DMN-9: maxconnections=2^32+77 wrapped to 77\n"); failures++; }
+
+    node_config_load("/nonexistent/reset.conf");
+    wr("dmn9_b.conf", "bantime=9223372036854775807\n");
+    node_config_load("dmn9_b.conf");
+    { long long until = (long long)time(NULL) + (long long)g_cfg.bantime;
+      if (g_cfg.bantime > 0 && until > (long long)time(NULL))
+          printf("PASS DMN-9: a saturating bantime still yields a FUTURE expiry (bantime=%ld)\n",
+                 (long)g_cfg.bantime);
+      else { printf("FAIL DMN-9: bantime=%ld makes the ban expire immediately (until=%lld)\n",
+                    (long)g_cfg.bantime, until); failures++; } }
+
+    node_config_load("/nonexistent/reset.conf");
+    wr("dmn9_c.conf", "bantime=3600\n");
+    node_config_load("dmn9_c.conf");
+    if (g_cfg.bantime == 3600) printf("PASS DMN-9: an ordinary bantime is untouched\n");
+    else { printf("FAIL DMN-9: bantime=3600 read as %ld\n", (long)g_cfg.bantime); failures++; }
+
+    node_config_load("/nonexistent/reset.conf");
+    wr("dmn9_d.conf", "maxconnections=64\n");
+    node_config_load("dmn9_d.conf");
+    if (g_cfg.max_connections == 64) printf("PASS DMN-9: an ordinary maxconnections is untouched\n");
+    else { printf("FAIL DMN-9: maxconnections=64 read as %d\n", g_cfg.max_connections); failures++; }
 
     printf("\n");
     node_config_log();

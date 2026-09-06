@@ -65,6 +65,31 @@ static const char* g_pass;
 
 /* ---- -rpcthreads / -rpcworkqueue / -rpcservertimeout (2026-09-01) ---- */
 static int g_threads = 16, g_workqueue = 64, g_timeout_s = 30;
+
+/* ---- RPC-4 (audit 2026-09-03): a TOTAL deadline for reading one request ----
+ *
+ * -rpcservertimeout is a PER-ACTIVITY timeout (SO_RCVTIMEO), in Core as here,
+ * and that part is faithful. What is not faithful is where the reading
+ * happens: Core reads requests non-blockingly on the libevent thread and hands
+ * only COMPLETE requests to the -rpcthreads pool, so a slow sender costs
+ * memory (bounded by MAX_SIZE), not a thread. Here service_conn does the
+ * reading, on a pool worker, BEFORE authentication -- so a client that sends
+ * one byte every g_timeout_s - 1 seconds resets the timeout forever and holds
+ * a worker with no credentials at all. Sixteen such sockets (the default
+ * rpcthreads) take the whole pool, the next 64 connections queue unanswered,
+ * everything after that gets 503, and the operator's own `bitcoin-cli stop`
+ * queues behind them.
+ *
+ * Restructuring onto a non-blocking accept-thread reader is the real fix and
+ * is a larger change than this audit item warrants. A total wall-clock budget
+ * for the pre-dispatch read closes the unbounded hold, which is the part that
+ * makes this reachable by an unauthenticated client: a request that has not
+ * arrived within the budget gets 408 and the worker is freed. The budget is
+ * deliberately several times the per-activity timeout so that a legitimate
+ * client on a slow link is unaffected -- RPC_REQ_MAX is a few hundred KB, and
+ * a real client sends that in one burst. */
+#define RPC_REQ_DEADLINE_DEFAULT 60
+static long g_req_deadline_s = RPC_REQ_DEADLINE_DEFAULT;
 #define RPC_QUEUE_CAP 4096
 static int g_q[RPC_QUEUE_CAP]; static int g_q_head, g_q_tail, g_q_n;
 static pthread_mutex_t g_q_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -96,8 +121,32 @@ static int wl_entry_has(const char* list, const char* method){
     }
     return 0;
 }
+/* RPC-14 (audit 2026-09-03): Core's effective default is
+ *   g_rpc_whitelist_default = GetBoolArg("-rpcwhitelistdefault",
+ *                                        !GetArgs("-rpcwhitelist").empty())
+ * -- i.e. an EXPLICIT -rpcwhitelistdefault wins, and otherwise the default is
+ * "deny users with no entry" exactly when some whitelist exists.
+ * g_wl_default is -1 when unset, 0 or 1 when given. */
+static int wl_default_effective(void){
+    return g_wl_default >= 0 ? g_wl_default : (g_wl_n > 0);
+}
+/* RPC-14: does this user have a whitelist entry at all? Core's
+ * `user_has_whitelist`, which it tests BEFORE parsing the body. */
+int rpc_whitelist_user_has(const char* user){
+    for (int i = 0; i < g_wl_n; i++)
+        if (!strcmp(g_wl[i].user, user ? user : "")) return 1;
+    return 0;
+}
+int rpc_whitelist_denies_everything(const char* user){
+    return !rpc_whitelist_user_has(user) && wl_default_effective();
+}
 int rpc_whitelist_allows(const char* user, const char* method){
-    if (g_wl_n == 0) return 1;
+    /* RPC-14: this used to `return 1` whenever no -rpcwhitelist entry existed,
+     * which FAILS OPEN. With -rpcwhitelistdefault=1 and no entries Core denies
+     * EVERY user ("not allowed to call any methods"); this node allowed
+     * everyone -- on a configuration an operator would reasonably read as the
+     * strictest one available. */
+    if (g_wl_n == 0) return !wl_default_effective();
     int seen = 0;
     for (int i = 0; i < g_wl_n; i++){
         if (strcmp(g_wl[i].user, user ? user : "")) continue;
@@ -106,7 +155,7 @@ int rpc_whitelist_allows(const char* user, const char* method){
     }
     if (seen) return 1;
     /* no whitelist for this user: Core denies unless rpcwhitelistdefault=0 */
-    return g_wl_default == 0;
+    return !wl_default_effective();
 }
 
 /* ---- -rpccookieperms ---- */
@@ -148,14 +197,33 @@ static const char* find_header(const char* headers, size_t hlen,
     const char* p = headers;
     const char* end = headers + hlen;
     while (p < end) {
+        /* ---- The LAST header line has no '\r' inside `hlen` ----
+         *
+         * Callers pass hlen = hdrend - buf, where hdrend points AT the '\r'
+         * of the terminating CRLFCRLF -- which is the final header line's own
+         * terminator. So memchr found nothing for that line and this loop used
+         * to `break`, making the last header invisible.
+         *
+         * Two live consequences, both found while building the RPC-4 slow
+         * client test. (1) Content-Length is the last header in the request
+         * this server's own make_post builds, so it was never found, nv stayed
+         * -1, and the read loop stopped WITHOUT waiting for the body: any
+         * client that writes headers and body in separate segments -- which is
+         * ordinary, and unavoidable once the body exceeds one segment -- got
+         * "Parse error". It only ever worked because a small request arrives in
+         * one read(). (2) An Authorization header sent last was invisible to
+         * auth_ok, so a correctly credentialed client got 401.
+         *
+         * Treat end-of-buffer as a line end instead of giving up on the line. */
         const char* le = memchr(p, '\r', (size_t)(end - p));
-        if (!le) break;
+        if (!le) le = end;
         size_t linelen = (size_t)(le - p);
         if (linelen >= namelen + 2 && strncasecmp(p, name, namelen) == 0 && p[namelen] == ':') {
             const char* v = p + namelen + 1;
             while (v < le && (*v == ' ' || *v == '\t')) v++;
             return v;
         }
+        if (le == end) break;
         p = le + 2;
     }
     return NULL;
@@ -344,11 +412,19 @@ int rpc_auth_ok_for_test(const char* hdrs, unsigned long hlen,
 }
 
 /* Deep-copy an rj_val via the serializer round-trip. */
+/* RPC-16 (audit 2026-09-03): this used to round-trip the value through a
+ * 64 KiB stack buffer -- rj_write into tmp[65536], then rj_parse back -- and
+ * returned NULL for anything larger. The only caller is build_reply's `id`
+ * echo, and the request cap is 9 MiB, so a client sending a legitimately
+ * large id got its id silently replaced with `null` in the reply. A JSON-RPC
+ * client that matches replies to requests by id then cannot match its own
+ * reply.
+ *
+ * rj_clone does the same job structurally, with no buffer and no cap, and has
+ * been in rpc_json.c the whole time. The serialise-and-reparse was doing
+ * strictly more work to achieve strictly less. */
 static rj_val* rj_dup(const rj_val* v) {
-    char tmp[65536];
-    long w = rj_write(tmp, sizeof tmp, v, 0);
-    if (w <= 0 || w >= (long)sizeof tmp) return NULL;
-    return rj_parse(tmp, (size_t)w);
+    return rj_clone(v);
 }
 
 /* Build a JSON-RPC reply per Core JSONRPCReplyObj. `result` is consumed on
@@ -422,6 +498,14 @@ static int wl_forbidden(const char* user, const char* body, size_t blen){
     /* -rpcwhitelist: Core answers HTTP 403 with an empty body when the
      * authenticated user may not call the method. Checked on the raw body
      * before parsing so a forbidden call never reaches the dispatcher. */
+    /* RPC-14: Core tests `user_has_whitelist` FIRST and answers 403 before it
+     * parses anything -- a user with no entry is not allowed to call ANY
+     * method, so the body is irrelevant. This node parsed first and only
+     * forbade a well-formed object naming a disallowed method, so the same
+     * user sending an unparseable body, or an object whose `method` is
+     * missing or not a string, got a parse/-32600 error instead of the 403
+     * Core sends. Same verdict for every body now, decided before the parse. */
+    if (rpc_whitelist_denies_everything(user)) return 1;
     if (g_wl_n == 0) return 0;
     rj_val* req = rj_parse(body, blen);
     if (!req) return 0;
@@ -429,10 +513,98 @@ static int wl_forbidden(const char* user, const char* body, size_t blen){
     if (req->typ == RJ_OBJ){
         rj_val* m = rj_obj_get(req, "method");
         if (m && m->typ == RJ_STR && m->str && !rpc_whitelist_allows(user, m->str)) forbid = 1;
+    } else if (req->typ == RJ_ARR){
+        /* RPC-6: a batch is checked ELEMENT BY ELEMENT, as Core does
+         * (httprpc.cpp: "Check authorization for each request's method").
+         * One forbidden member forbids the whole batch -- the 403 is written
+         * before anything executes, so a whitelisted method cannot be smuggled
+         * past by burying it in an array with a permitted one. A non-object
+         * member is left alone here; it becomes a per-element error object in
+         * the batch reply below, at HTTP 200. */
+        for (size_t i = 0; i < req->nitems && !forbid; i++){
+            const rj_val* e = req->items[i];
+            if (!e || e->typ != RJ_OBJ) continue;
+            rj_val* m = rj_obj_get(e, "method");
+            if (m && m->typ == RJ_STR && m->str && !rpc_whitelist_allows(user, m->str)) forbid = 1;
+        }
     }
     rj_free(req);
     return forbid;
 }
+/* Execute ONE JSON-RPC request object and build its reply.
+ *
+ * Split out of handle_request for RPC-6 so the batch path can reuse it. Two
+ * contracts differ from the old inline code and matter to the caller:
+ *
+ *   - it does NOT free `req`. A batch element is owned by the array around
+ *     it, and freeing it here would double-free at the end of handle_request.
+ *   - *status is the status the SINGLE-request path would send. A batch
+ *     ignores it: Core answers every batch HTTP 200 and carries each
+ *     element's failure as an error OBJECT inside the array ("Batches never
+ *     throw HTTP errors, they are always just included in HTTP OK
+ *     responses" -- httprpc.cpp).
+ *
+ * A non-object where a request belongs is Core's RPC_INVALID_REQUEST
+ * "Invalid Request object" (rpc/request.cpp JSONRPCRequest::parse), NOT the
+ * top-level -32700; only a top level that is neither object nor array gets
+ * that one.
+ */
+static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
+    *status = HTTP_OK;
+    *is_notification = 0;
+    if (!req || req->typ != RJ_OBJ) {
+        *status = HTTP_BAD_REQUEST;
+        return build_reply(NULL, 1, RPC_INVALID_REQUEST,
+                           "Invalid Request object", /*v2*/0, NULL, 1);
+    }
+    rj_val* reply = NULL;
+    int invalid_version = 0;
+    int v2 = request_is_v2(req, &invalid_version);
+    rj_val* id = rj_obj_get(req, "id");
+    int has_id = (id != NULL);
+
+    if (invalid_version) {
+        reply = build_reply(NULL, 1, RPC_INVALID_REQUEST,
+                            "JSON-RPC version not supported", /*v2*/0, id, has_id);
+        *status = HTTP_BAD_REQUEST;
+    } else {
+        const char* method = NULL; const rj_val* params = NULL;
+        long ec = 0; const char* em = NULL;
+        if (!parse_method(req, &method, &params, &ec, &em)) {
+            reply = build_reply(NULL, 1, ec, em, /*v2*/0, id, has_id);
+            *status = HTTP_BAD_REQUEST; /* -32600 -> 400 */
+        } else {
+            rj_val* result = NULL; long dec = 0; const char* dem = NULL;
+            int ok = rpc_dispatch(method, params, g_wallet, &result, &dec, &dem);
+            /* A V2 NOTIFICATION (no id) gets no response whatever the
+             * method did. This flag used to be set only on the success
+             * path, so a notification whose method FAILED was answered
+             * with a full error body -- a spec violation that stayed
+             * invisible while the only method the tests notified with
+             * always succeeded. Core decides the same way, after
+             * execution and regardless of outcome (httprpc.cpp: "Even
+             * though we do execute notifications, we do not respond to
+             * them"). */
+            if (v2 && !has_id) *is_notification = 1;
+            if (ok) {
+                reply = build_reply(result, 0, 0, NULL, v2, id, has_id);
+                *status = HTTP_OK;
+            } else {
+                if (v2) {
+                    reply = build_reply(NULL, 1, dec, dem, 1, id, has_id);
+                    *status = HTTP_OK; /* V2 catches errors as HTTP 200 */
+                } else {
+                    reply = build_reply(NULL, 1, dec, dem, 0, id, has_id);
+                    if (dec == RPC_METHOD_NOT_FOUND) *status = HTTP_NOT_FOUND;
+                    else if (dec == RPC_INVALID_REQUEST) *status = HTTP_BAD_REQUEST;
+                    else *status = HTTP_INTERNAL_SERVER_ERROR;
+                }
+            }
+        }
+    }
+    return reply;
+}
+
 static void handle_request(int cfd, const char* body, size_t blen) {
     rj_val* req = rj_parse(body, blen);
     int status = HTTP_OK;
@@ -443,57 +615,54 @@ static void handle_request(int cfd, const char* body, size_t blen) {
         /* non-parseable body: version unknown -> V1 reply, HTTP 500 */
         reply = build_reply(NULL, 1, RPC_PARSE_ERROR, "Parse error", /*v2*/0, NULL, 1);
         status = HTTP_INTERNAL_SERVER_ERROR;
-    } else if (req->typ != RJ_OBJ) {
-        /* parseable but not an object (e.g. array/string): Core throws
-         * RPC_PARSE_ERROR "Top-level object parse error" -> HTTP 500 */
-        reply = build_reply(NULL, 1, RPC_PARSE_ERROR, "Top-level object parse error", /*v2*/0, NULL, 1);
-        status = HTTP_INTERNAL_SERVER_ERROR;
+    } else if (req->typ == RJ_OBJ) {
+        reply = exec_one(req, &status, &is_v2_notification);
+        rj_free(req); req = NULL;
+    } else if (req->typ == RJ_ARR) {
+        /* RPC-6: a top-level array is a BATCH.
+         *
+         * This branch used to not exist: every array fell into the
+         * "not an object" case below and was answered -32700 "Top-level
+         * object parse error" at HTTP 500, with a comment attributing that
+         * to Core. Core does the opposite -- httprpc.cpp dispatches
+         * `valRequest.isArray()` to a batch loop and reserves the top-level
+         * parse error for a top level that is neither object nor array.
+         * Real tooling batches (electrs, python-bitcoinrpc's `batch_`), and
+         * a 500 there reads as a broken node.
+         *
+         * Core's three tail rules, all reproduced below:
+         *   - notifications (V2, no id) are EXECUTED but omitted from the
+         *     reply array;
+         *   - an all-notification batch (nothing left to say) is HTTP 204
+         *     with no body;
+         *   - but an EMPTY request array answers `[]` at HTTP 200, not 204.
+         *     Core takes that divergence from the JSON-RPC 2.0 spec on
+         *     purpose, for back-compat with clients predating the spec, and
+         *     says so in a comment. Hence the `req->nitems > 0` guard --
+         *     without it an empty batch would 204 and the parity would be
+         *     lost on exactly the case Core went out of its way to keep. */
+        rj_val* arr = rj_arr();
+        for (size_t i = 0; i < req->nitems; i++) {
+            int st = HTTP_OK, notif = 0;
+            rj_val* r = exec_one(req->items[i], &st, &notif);
+            if (notif) { if (r) rj_free(r); continue; }
+            rj_arr_push(arr, r ? r : rj_null());
+        }
+        status = HTTP_OK;
+        if (arr->nitems == 0 && req->nitems > 0) {
+            rj_free(arr);
+            reply = NULL;
+            status = HTTP_NO_CONTENT;
+        } else {
+            reply = arr;
+        }
         rj_free(req); req = NULL;
     } else {
-        int invalid_version = 0;
-        int v2 = request_is_v2(req, &invalid_version);
-        rj_val* id = rj_obj_get(req, "id");
-        int has_id = (id != NULL);
-
-        if (invalid_version) {
-            reply = build_reply(NULL, 1, RPC_INVALID_REQUEST,
-                                "JSON-RPC version not supported", /*v2*/0, id, has_id);
-            status = HTTP_BAD_REQUEST;
-        } else {
-            const char* method = NULL; const rj_val* params = NULL;
-            long ec = 0; const char* em = NULL;
-            if (!parse_method(req, &method, &params, &ec, &em)) {
-                reply = build_reply(NULL, 1, ec, em, /*v2*/0, id, has_id);
-                status = HTTP_BAD_REQUEST; /* -32600 -> 400 */
-            } else {
-                rj_val* result = NULL; long dec = 0; const char* dem = NULL;
-                int ok = rpc_dispatch(method, params, g_wallet, &result, &dec, &dem);
-                /* A V2 NOTIFICATION (no id) gets no response whatever the
-                 * method did. This flag used to be set only on the success
-                 * path, so a notification whose method FAILED was answered
-                 * with a full error body -- a spec violation that stayed
-                 * invisible while the only method the tests notified with
-                 * always succeeded. Core decides the same way, after
-                 * execution and regardless of outcome (httprpc.cpp: "Even
-                 * though we do execute notifications, we do not respond to
-                 * them"). */
-                if (v2 && !has_id) is_v2_notification = 1;
-                if (ok) {
-                    reply = build_reply(result, 0, 0, NULL, v2, id, has_id);
-                    status = HTTP_OK;
-                } else {
-                    if (v2) {
-                        reply = build_reply(NULL, 1, dec, dem, 1, id, has_id);
-                        status = HTTP_OK; /* V2 catches errors as HTTP 200 */
-                    } else {
-                        reply = build_reply(NULL, 1, dec, dem, 0, id, has_id);
-                        if (dec == RPC_METHOD_NOT_FOUND) status = HTTP_NOT_FOUND;
-                        else if (dec == RPC_INVALID_REQUEST) status = HTTP_BAD_REQUEST;
-                        else status = HTTP_INTERNAL_SERVER_ERROR;
-                    }
-                }
-            }
-        }
+        /* parseable, but neither an object nor an array (a string, a number,
+         * a bare true/null): Core throws RPC_PARSE_ERROR "Top-level object
+         * parse error" -> HTTP 500 */
+        reply = build_reply(NULL, 1, RPC_PARSE_ERROR, "Top-level object parse error", /*v2*/0, NULL, 1);
+        status = HTTP_INTERNAL_SERVER_ERROR;
         rj_free(req); req = NULL;
     }
 
@@ -509,6 +678,21 @@ static void handle_request(int cfd, const char* body, size_t blen) {
         respbody = rj_write_alloc(reply, 0, &bodylen);
         rj_free(reply);
         if (bodylen < 0) bodylen = 0;
+        /* RPC-10 (audit 2026-09-03): Core appends a newline to every reply
+         * body -- httprpc.cpp's `req->WriteReply(HTTP_OK, reply.write() + "\n")`
+         * -- so "Core-bit-exact" was off by one byte. Gated on `reply` ON
+         * PURPOSE: a v2 notification takes the 204 path above with no body at
+         * all, and test_rpc_server's "no body" case asserts the response ends
+         * at the header terminator. Appending unconditionally would emit a
+         * 1-byte body on a 204 and break it.
+         *
+         * Safe for every consumer: rj_parse skips leading and trailing
+         * whitespace before its end-of-input check, and every test assertion
+         * on a body is a prefix or substring match. */
+        if (respbody && bodylen > 0) {
+            char* nb = realloc(respbody, (size_t)bodylen + 2);
+            if (nb) { respbody = nb; respbody[bodylen++] = '\n'; respbody[bodylen] = 0; }
+        }
     }
 
     char hdr[192];
@@ -516,6 +700,10 @@ static void handle_request(int cfd, const char* body, size_t blen) {
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: application/json\r\n"
         "Content-Length: %ld\r\n"
+        /* RPC-10: the server closes after every reply, but said so nowhere --
+         * an HTTP/1.1 client that keeps the connection alive (http.client,
+         * requests) saw an unexpected EOF on its NEXT request. */
+        "Connection: close\r\n"
         "\r\n",
         status, status_text(status), bodylen);
     if (write_all(cfd, hdr, (size_t)hl) != 0) {
@@ -552,8 +740,15 @@ static void handle_request(int cfd, const char* body, size_t blen) {
 #define RPC_REQ_MAX (9u<<20)     /* 8MB hex block + JSON + headers, with margin */
 
 /* ---- getblocktemplate longpoll (BIP22) -------------------------------------
- * The accept loop is deliberately SERIAL (one request at a time; the wallet
- * and chain handlers are not concurrent-safe), so a longpoll request cannot
+ * EXECUTION is deliberately SERIAL -- every handler runs under g_exec_lock,
+ * because the wallet and chain handlers are not concurrent-safe. The ACCEPT
+ * side is not: it has been a worker pool since 2026-09-01, so connections are
+ * accepted and read concurrently and only the dispatch is serialised.
+ * (RPC-19, audit 2026-09-03: this said "the accept loop is deliberately
+ * serial", which stopped being true when the pool landed. The distinction
+ * matters -- RPC-12 is about how long that ONE execution lock is held, and a
+ * reader who believes accepting is serial too will look for the wrong
+ * bottleneck.) A longpoll request therefore cannot
  * simply block inside its handler -- it would stall every other RPC. Instead
  * a request whose body carries a "longpollid" is handed to a detached waiter
  * thread that (a) polls the CHAIN TIP through a shared-state-free primitive
@@ -578,6 +773,73 @@ static int lp_tip_hash(unsigned char out[32]){
     return ok;
 }
 
+/* ---------------------------------------------------------------- RPC-5
+ * (audit 2026-09-03) The longpoll path used to be chosen by searching the RAW
+ * BODY for the substrings "longpollid" and "getblocktemplate", before any
+ * JSON parsing -- so a request like
+ *   {"method":"getrawtransaction","params":["...longpollid...getblocktemplate..."]}
+ * took it, and ANY authenticated caller could reach it with any method name.
+ * The path then returns before the worker slot is released, so -rpcthreads
+ * and -rpcworkqueue do not bound it: every such request cost a detached
+ * thread with a 64 MiB stack, an fd, and up to 9 MiB of held buffer for up to
+ * 60 seconds. Thousands of them exhaust `ulimit -u`, at which point fork()
+ * for inbound P2P connections fails -- an RPC client taking down the node's
+ * networking.
+ *
+ * Two changes: the method is read with the JSON parser instead of a substring
+ * (so only a real getblocktemplate can take the path), and the number of
+ * waiters in flight is capped. Over the cap the request falls through to the
+ * ordinary serial handler, which answers correctly -- just without waiting for
+ * a tip change -- so a flood degrades to normal service instead of exhausting
+ * the process.
+ *
+ * Core waits on a condition variable inside the handler, bounded by
+ * -rpcthreads; this keeps the off-thread shape and bounds the count.
+ */
+#define LP_MAX_WAITERS 16
+static volatile int g_lp_waiters;                 /* guarded by g_lp_count_lock */
+static pthread_mutex_t g_lp_count_lock = PTHREAD_MUTEX_INITIALIZER;
+static int lp_waiters_take(void){
+    int ok = 0;
+    pthread_mutex_lock(&g_lp_count_lock);
+    if (g_lp_waiters < LP_MAX_WAITERS){ g_lp_waiters++; ok = 1; }
+    pthread_mutex_unlock(&g_lp_count_lock);
+    return ok;
+}
+static void lp_waiters_release(void){
+    pthread_mutex_lock(&g_lp_count_lock);
+    if (g_lp_waiters > 0) g_lp_waiters--;
+    pthread_mutex_unlock(&g_lp_count_lock);
+}
+/* Test hooks. The longpoll path cannot be observed over HTTP -- the decoy
+ * request below answers identically whether or not it was handled off-thread,
+ * because the cost is the SPAWN, not the latency. (A timing assertion here
+ * passed with the fix reverted, which is how that was found.) So the two
+ * mechanisms are exercised directly instead. */
+int rpc_lp_waiters_inflight(void){
+    pthread_mutex_lock(&g_lp_count_lock);
+    int n = g_lp_waiters;
+    pthread_mutex_unlock(&g_lp_count_lock);
+    return n;
+}
+int rpc_lp_max_waiters(void){ return LP_MAX_WAITERS; }
+int rpc_lp_try_take(void){ return lp_waiters_take(); }
+void rpc_lp_release(void){ lp_waiters_release(); }
+
+/* RPC-5: is this genuinely a getblocktemplate? Parsed, not grepped. */
+static int lp_is_gbt(const char* body, size_t blen){
+    rj_val* req = rj_parse(body, blen);
+    if (!req) return 0;
+    int yes = 0;
+    if (req->typ == RJ_OBJ){
+        rj_val* m = rj_obj_get(req, "method");
+        if (m && m->typ == RJ_STR && m->str && !strcmp(m->str, "getblocktemplate")) yes = 1;
+    }
+    rj_free(req);
+    return yes;
+}
+int rpc_lp_is_gbt(const char* body, unsigned long blen){ return lp_is_gbt(body, (size_t)blen); }
+
 typedef struct { int cfd; char* buf; size_t body_off, blen; unsigned char prev[32]; int have_prev; } lp_req_t;
 
 static void* lp_waiter(void* arg){
@@ -594,6 +856,7 @@ static void* lp_waiter(void* arg){
     handle_request(r->cfd, r->buf + r->body_off, r->blen);
     pthread_mutex_unlock(&g_exec_lock);
     free(r->buf); free(r);
+    lp_waiters_release();                          /* RPC-5 */
     return NULL;
 }
 
@@ -625,6 +888,9 @@ static void service_conn(int cfd) {
     { struct timeval tv = { g_timeout_s, 0 };            /* -rpcservertimeout */
       setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
       setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv); }
+    /* RPC-4: the whole request must arrive within this budget, however much
+     * activity keeps the per-read timeout alive. */
+    struct timespec t_start; clock_gettime(CLOCK_MONOTONIC, &t_start);
     size_t cap = 262144;
     char* buf = malloc(cap);
     if (!buf) { close(cfd); return; }
@@ -639,6 +905,24 @@ static void service_conn(int cfd) {
             if (!nb) { free(buf); close(cfd); return; }
             if (hdrend) hdrend = nb + hoff;   /* pointer survives realloc */
             buf = nb; cap = ncap;
+        }
+        /* RPC-4: enforce the total budget, and never block past it. The
+         * per-read timeout is shrunk to whatever remains, so a read that
+         * begins just under the deadline cannot overshoot it by another
+         * g_timeout_s seconds. */
+        if (g_req_deadline_s > 0){
+            struct timespec now_ts; clock_gettime(CLOCK_MONOTONIC, &now_ts);
+            long elapsed = (long)(now_ts.tv_sec - t_start.tv_sec);
+            long left = g_req_deadline_s - elapsed;
+            if (left <= 0){
+                const char* e = "HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\r\n";
+                (void)write_all(cfd, e, strlen(e));
+                free(buf); close(cfd); return;
+            }
+            if (left < g_timeout_s){
+                struct timeval tv = { left, 0 };
+                setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+            }
         }
         ssize_t n = read(cfd, buf + got, cap - 1 - got);
         if (n <= 0) break;
@@ -708,9 +992,12 @@ static void service_conn(int cfd) {
       for (size_t i = 0; !is_lp && i + 12 <= blen; i++)
           if (!memcmp(body + i, "\"longpollid\"", 12)) is_lp = 1;
       if (is_lp){
-          int has_gbt = 0;
-          for (size_t i = 0; !has_gbt && i + 16 <= blen; i++)
-              if (!memcmp(body + i, "getblocktemplate", 16)) has_gbt = 1;
+          /* RPC-5: the METHOD decides, read with the parser. The substring
+           * scan above is only a cheap pre-filter to avoid parsing every
+           * request twice; a body without a longpollid cannot be a longpoll
+           * whatever its method says. */
+          int has_gbt = lp_is_gbt(body, blen);
+          if (has_gbt && !lp_waiters_take()) has_gbt = 0;   /* RPC-5: at the cap */
           if (has_gbt){
               lp_req_t* r = malloc(sizeof *r);
               if (r){
@@ -723,6 +1010,7 @@ static void service_conn(int cfd) {
                   }
                   free(r);                           /* fall through: serial */
               }
+              lp_waiters_release();                  /* RPC-5: spawn failed */
           }
       } }
     pthread_mutex_lock(&g_exec_lock);
@@ -734,7 +1022,9 @@ static void service_conn(int cfd) {
 static void* server_thread(void* arg) {
     (void)arg;
     while (g_run) {
-        struct sockaddr_in cli; socklen_t cl = sizeof cli;
+        /* RPC-18: sockaddr_storage, so an IPv6 peer's address is not
+         * truncated into a sockaddr_in and then formatted as nonsense. */
+        struct sockaddr_storage cli; socklen_t cl = sizeof cli;
         int c = accept(g_listen_fd, (struct sockaddr*)&cli, &cl);
         if (c < 0) {
             /* RPC-1: `continue` with no pause spun a core whenever accept
@@ -760,7 +1050,15 @@ static void* server_thread(void* arg) {
          * narrow allow list must still refuse everyone else. */
         if (g_allows){
             char ip[64] = {0};
-            inet_ntop(AF_INET, &cli.sin_addr, ip, sizeof ip);
+            /* RPC-18: format from the family the peer actually arrived on.
+             * The listener is never dual-stack (IPV6_V6ONLY is forced), so
+             * this is always the honest form for that socket -- no v4-mapped
+             * ::ffff:127.0.0.1 that an IPv4 ACL rule would then fail to
+             * match. */
+            if (cli.ss_family == AF_INET6)
+                inet_ntop(AF_INET6, &((struct sockaddr_in6*)&cli)->sin6_addr, ip, sizeof ip);
+            else
+                inet_ntop(AF_INET, &((struct sockaddr_in*)&cli)->sin_addr, ip, sizeof ip);
             if (!g_allows(ip)){
                 fprintf(stderr, "[rpc] refused connection from %s "
                                 "(not in -rpcallowip)\n", ip);
@@ -805,43 +1103,105 @@ int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
     /* never die from a peer closing a socket mid-write (SIGPIPE) */
     signal(SIGPIPE, SIG_IGN);
 
-    g_listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    /* RPC-18 (audit 2026-09-03): the listener was AF_INET only, so
+     * `rpcbind=::1` was a startup error, every IPv6 -rpcallowip entry was
+     * unreachable, and rpc_acl.c's ::1 default could never match. It binds
+     * either family now.
+     *
+     * WHICH FAMILY: decided by the CONFIGURED ADDRESS, not by a flag. An
+     * address containing ':' is IPv6; anything else is tried as IPv4 first
+     * and then as IPv6, so a malformed value still fails with one clear
+     * message instead of two confusing ones. With no -rpcbind the default is
+     * IPv4 loopback, unchanged -- this must not quietly start listening
+     * somewhere new on an existing deployment.
+     *
+     * NOT dual-stack on one socket. A v6 socket with IPV6_V6ONLY off would
+     * accept v4 as v4-mapped addresses (::ffff:127.0.0.1), which the ACL
+     * would then have to special-case to match a plain 127.0.0.1 rule --
+     * exactly the kind of address-shape bug this audit round has been
+     * removing. One family per socket, V6ONLY forced on, and the peer string
+     * the ACL sees is the honest one for that family. */
+    struct sockaddr_storage ss; memset(&ss, 0, sizeof ss);
+    socklen_t sslen;
+    int family = AF_INET;
+    const char* baddr = (cfg->bind_addr && cfg->bind_addr[0]) ? cfg->bind_addr : NULL;
+
+    if (baddr && strchr(baddr, ':')) family = AF_INET6;
+
+    if (family == AF_INET){
+        struct sockaddr_in* a4 = (struct sockaddr_in*)&ss;
+        a4->sin_family = AF_INET;
+        a4->sin_port = htons((unsigned short)cfg->port);
+        a4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (baddr && inet_pton(AF_INET, baddr, &a4->sin_addr) != 1){
+            snprintf(errmsg, errcap,
+                     "rpcbind=%s is not a valid IP address (IPv4 expected; an "
+                     "IPv6 address must contain ':')", baddr);
+            return -1;
+        }
+        sslen = sizeof *a4;
+    } else {
+        struct sockaddr_in6* a6 = (struct sockaddr_in6*)&ss;
+        a6->sin6_family = AF_INET6;
+        a6->sin6_port = htons((unsigned short)cfg->port);
+        a6->sin6_addr = in6addr_loopback;
+        if (baddr && inet_pton(AF_INET6, baddr, &a6->sin6_addr) != 1){
+            snprintf(errmsg, errcap, "rpcbind=%s is not a valid IPv6 address", baddr);
+            return -1;
+        }
+        sslen = sizeof *a6;
+    }
+
+    g_listen_fd = socket(family, SOCK_STREAM, 0);
     if (g_listen_fd < 0) {
-        if (errmsg && errcap) snprintf(errmsg, errcap, "socket() failed");
+        if (errmsg && errcap) snprintf(errmsg, errcap, "socket() failed: %s", strerror(errno));
         return -1;
     }
     int one = 1;
     setsockopt(g_listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-    struct sockaddr_in a; memset(&a, 0, sizeof a);
-    a.sin_family = AF_INET;
-    a.sin_port = htons((unsigned short)cfg->port);
-    /* Core -rpcbind. Loopback unless an address is configured AND the caller
-     * satisfied Core's rule that -rpcbind without -rpcallowip is ignored. */
-    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (cfg->bind_addr && cfg->bind_addr[0]){
-        if (inet_pton(AF_INET, cfg->bind_addr, &a.sin_addr) != 1){
-            snprintf(errmsg, errcap, "rpcbind=%s is not a valid IPv4 address",
-                     cfg->bind_addr);
-            close(g_listen_fd); g_listen_fd = -1; return -1;
-        }
+    if (family == AF_INET6){
+        /* see the note above: no v4-mapped addresses reaching the ACL */
+        setsockopt(g_listen_fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
     }
-    if (bind(g_listen_fd, (struct sockaddr*)&a, sizeof a) < 0) {
-        if (errmsg && errcap) snprintf(errmsg, errcap, "bind() failed on port %d", cfg->port);
+    if (bind(g_listen_fd, (struct sockaddr*)&ss, sslen) < 0) {
+        if (errmsg && errcap)
+            snprintf(errmsg, errcap, "bind() failed on %s port %d: %s",
+                     family == AF_INET6 ? "IPv6" : "IPv4", cfg->port, strerror(errno));
         close(g_listen_fd); g_listen_fd = -1;
         return -1;
     }
     if (listen(g_listen_fd, 16) < 0) {
-        if (errmsg && errcap) snprintf(errmsg, errcap, "listen() failed");
+        if (errmsg && errcap) snprintf(errmsg, errcap, "listen() failed: %s", strerror(errno));
         close(g_listen_fd); g_listen_fd = -1;
         return -1;
     }
-    socklen_t al = sizeof a;
-    getsockname(g_listen_fd, (struct sockaddr*)&a, &al);
-    if (actual_port) *actual_port = ntohs(a.sin_port);
+    { socklen_t al = sizeof ss;
+      if (getsockname(g_listen_fd, (struct sockaddr*)&ss, &al) == 0 && actual_port)
+          *actual_port = ntohs(family == AF_INET6
+                               ? ((struct sockaddr_in6*)&ss)->sin6_port
+                               : ((struct sockaddr_in*)&ss)->sin_port); }
 
     g_threads   = cfg->threads   > 0 ? (cfg->threads > 256 ? 256 : cfg->threads) : 16;
     g_workqueue = cfg->workqueue > 0 ? (cfg->workqueue > RPC_QUEUE_CAP ? RPC_QUEUE_CAP : cfg->workqueue) : 64;
     g_timeout_s = cfg->timeout_s > 0 ? cfg->timeout_s : 30;
+    /* RPC-4: the total-read budget. Env-overridable so an operator on a
+     * pathological link can raise it, or set it to 0 to restore the old
+     * unbounded behaviour deliberately rather than by accident. */
+    { const char* e = getenv("BMC_RPC_REQ_DEADLINE_SECS");
+      long v = -1;
+      if (e && *e) v = strtol(e, NULL, 10);
+      if (v >= 0){
+          /* An explicit value wins outright, including one below
+           * -rpcservertimeout (which then means a single stalled read can end
+           * the request) and 0, which restores the old unbounded behaviour
+           * deliberately rather than by accident. */
+          g_req_deadline_s = v;
+      } else {
+          /* Default: never shorter than the per-read timeout, or a request
+           * that legitimately blocks once would be cut off mid-flight. */
+          g_req_deadline_s = RPC_REQ_DEADLINE_DEFAULT;
+          if (g_req_deadline_s < g_timeout_s) g_req_deadline_s = g_timeout_s;
+      } }
     g_q_head = g_q_tail = g_q_n = 0;
     g_run = 1;
     g_n_workers = 0;

@@ -583,3 +583,49 @@ in-mem table). Added to Makefile MODULES + t_lsm/fuzz_lsm targets; roadmap [x].
 - NEXT: continue grinding the download toward tip with ibd_lsm into data/ (resumes at
   archive tip each run); grow LSM sizing before the segwit->tip leg (live UTXO -> ~80M
   outputs: slots 1<<27, multi-GB blob); MuHash parity vs Core.
+
+## 2026-09-05 batch — upstream merge f2558a2d (1019 commits since 7de98563;
+history-rewritten, so many are re-hashes of already-merged work) and the port
+queue it leaves. The x86 .asm files in the tree are upstream-current after the
+merge; the AArch64 twins below are the remaining port surface, by priority:
+
+PORTED (this session):
+- [x] bitcoin_utxo_lsm.asm -> .S: UTX-6 (only ENOENT means no-manifest; every
+      manifest-load failure fails the reload, ARM returns -3) + UTX-8 (WAL
+      reset ftruncate/lseek results checked, failure returns -1 before any
+      state is cleared). UTX-3 verified already present.
+- [x] bitcoin_script.asm -> .S: SCR-8 long-form DER lengths (cursor walk,
+      DER_LONG_LEN macro; sequence length skipped unchecked per Core's lax
+      parser; INTEGER lengths leading-zero-skip + >=4-byte refusal +
+      big-endian accumulate). test_scr8_der_lax 27/27.
+- [x] bitcoin_sigops.asm -> .S: SCR-10 bounded tx_legacy_sigops (SO_NEED/
+      SO_VARINT, carry-checked, fail-closed -1). test_sigops green.
+
+QUEUE (upstream semantics verified against asm/<name>.asm; ARM twins pending):
+- [ ] bitcoin_serve.asm (+269): STO-10 (serve the REQUESTED block by hash --
+      ht_idx maps hash->height and a fork-stale child serves the wrong
+      bytes), NET-5 (contextual header rules on peer-pushed blocks via
+      serve_block_ctx_ok -- archive protection), MEM-10 (serve_reject_has --
+      shared final-verdict reject filter), NET-8 (getheaders walks the whole
+      locator + honours hashStop), NET-14 (nonce). BIGGEST item.
+- [ ] bitcoin_mempool.asm (+37): MEM-21 len/blob_off coherence for the
+      lock-free MAP_SHARED readers (live-node relevant).
+- [ ] bitcoin_net.asm (+39): NET-11 -- VERIFY the v1 payload checksum
+      (sha256d(payload)[0:4]) and take the bad-magic exit on mismatch
+      (live-node relevant).
+- [ ] bitcoin_pubkey.asm (+48): CRY-3 -- FE_REQUIRE_LT_P, refuse a field
+      element >= p in key decoding (live-node relevant).
+- [ ] bitcoin_store.asm (+86), bitcoin_cmpct.asm (+95): review + port.
+- [ ] bitcoin_hmac.asm (+69), bitcoin_bip39.asm (+99), bech32.asm (+23,
+      SER-5/WAL-9 mixed-case refusal), sha256.asm (+32, CRY-6
+      sha256_force_path dispatcher pin; x86 sha256_nia.asm deleted -- the
+      ARM twin keeps the ID_AA64ISAR0 probe, needs the force-path
+      equivalent), sha512.asm (+28), bitcoin_txv_parse.asm (+30, VAL-10/SER-3
+      canonical CompactSize), bitcoin_txv_dispatch.asm (+17, VAL-16
+      assumevalid short-circuit in the differential twin), bitcoin_chainwork.asm
+      (+19, STO-13 saturation -- audited "correct as used"), bitcoind.asm
+      (+37, SC1 shutdown-refuse glue and the bmc_cli rename).
+Also in the batch: MEM-3 fixed upstream (cap 63, out-of-line parents,
+*truncated consulted) -- arch-neutral C, merged; MEM-23 (the unconditional
+65-byte floor) -- C, merged; SC1 inbound-refuse-during-shutdown -- C,
+merged.

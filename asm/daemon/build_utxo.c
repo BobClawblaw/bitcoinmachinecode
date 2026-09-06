@@ -167,7 +167,36 @@ static void on_output(void* ctxv, u32 out_index, u64 value, const u8* script, u3
     long r = utxo_lsm_put(&g_lst, g_utxo, ctx->txid, out_index, value,
                           ctx->height, ctx->is_coinbase, script, slen);
     if (r == 1) return;
-    if (r == 0) { g_put_dup++; return; } /* rare, real (e.g. BIP30-class) dup */
+    if (r == 0) {
+        /* A duplicate outpoint. Core's AddCoins on the connect path:
+         *     overwrite = check_for_overwrite ? HaveCoin(...) : fCoinbase
+         * i.e. a COINBASE output replaces the existing coin (the pre-BIP30
+         * duplicate coinbases: d5d27987...:0 at 91812 then 91842,
+         * e3bf3d07...:0 at 91722 then 91880 -- the later block's height is
+         * what Core's chainstate holds), while a NON-coinbase duplicate is
+         * thrown out by Core's AddCoin and must never reach here on valid
+         * chain data. A no-op here kept the FIRST appearance's height --
+         * found by the first full muhash parity check as an
+         * exactly-two-coin divergence while count/total_amount/bogosize
+         * stayed Core-exact (2026-09-05, repaired in place by
+         * repair_bip30_heights.c; the live path has had this overwrite since
+         * live_on_output's incident #29). Replace: tombstone the old
+         * generation, then insert fresh -- the same del+put sequence
+         * fuzz_lsm pins against the Python model. */
+        if (!ctx->is_coinbase) {
+            fprintf(stderr, "[build_utxo] WARNING h=%ld: non-coinbase duplicate outpoint declined (Core's AddCoin would throw here)\n",
+                    (long)ctx->height);
+            g_put_dup++;
+            return;
+        }
+        g_put_dup++;
+        long d = utxo_lsm_del(&g_lst, g_utxo, ctx->txid, out_index);
+        if (d == -1) { fprintf(stderr, "[build_utxo] FATAL: utxo_lsm_del I/O error (BIP30 replace)\n"); g_fatal = 1; return; }
+        r = utxo_lsm_put(&g_lst, g_utxo, ctx->txid, out_index, value,
+                         ctx->height, ctx->is_coinbase, script, slen);
+        if (r == 1) return;
+        /* a fresh insert after a del cannot legitimately return 0 */
+    }
     fprintf(stderr, "[build_utxo] FATAL: utxo_lsm_put returned %ld (2=table full -- memtable "
                      "undersized for the fill_threshold that should have flushed first; "
                      "-1=I/O error)\n", r);
@@ -406,12 +435,35 @@ static void run_pipeline(int n, long start_h, long end_h){
                     memcpy(txid, p+1, 32); memcpy(&index, p+33, 4); p += 37;
                     memcpy(&value, p, 8); p += 8; memcpy(&cb, p, 4); p += 4;
                     memcpy(&slen, p, 4); p += 4;
-                    long r = utxo_lsm_put(&g_lst, g_utxo, txid, index, value,
-                                          h, cb, p, slen);
+                    const unsigned char* spk = p;   /* script bytes, before advancing */
                     p += slen;
+                    long r = utxo_lsm_put(&g_lst, g_utxo, txid, index, value,
+                                          h, cb, spk, slen);
                     g_puts++;
                     if (r == 1) { }
-                    else if (r == 0) g_put_dup++;
+                    else if (r == 0) {
+                        /* Duplicate outpoint: Core's AddCoins overwrites iff
+                         * fCoinbase -- see on_output's r==0 comment (same
+                         * rule, same del+put repair; the -j applier must
+                         * agree with the serial path byte for byte). */
+                        g_put_dup++;
+                        if (!cb) {
+                            fprintf(stderr, "[build_utxo] WARNING h=%ld: non-coinbase duplicate outpoint declined\n", h);
+                        } else {
+                            long d = utxo_lsm_del(&g_lst, g_utxo, txid, index);
+                            if (d == -1) {
+                                fprintf(stderr, "[build_utxo] FATAL: utxo_lsm_del I/O error (BIP30 replace, -j applier)\n");
+                                g_fatal = 1;
+                            } else {
+                                r = utxo_lsm_put(&g_lst, g_utxo, txid, index, value,
+                                                 h, cb, spk, slen);
+                                if (r != 1) {
+                                    fprintf(stderr, "[build_utxo] FATAL: utxo_lsm_put returned %ld (h=%ld index=%u value=%llu cb=%u slen=%u)\n", r, h, index, (unsigned long long)value, cb, slen);
+                                    g_fatal = 1;
+                                }
+                            }
+                        }
+                    }
                     else { fprintf(stderr, "[build_utxo] FATAL: utxo_lsm_put returned %ld (h=%ld index=%u value=%llu cb=%u slen=%u)\n", r, h, index, (unsigned long long)value, cb, slen); g_fatal = 1; }
                 } else {
                     fprintf(stderr, "[build_utxo] FATAL: op arena framing corruption at h=%ld (tag=%u) -- aborting\n", h, *p);

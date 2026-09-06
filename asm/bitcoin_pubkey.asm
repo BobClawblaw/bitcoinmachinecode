@@ -49,6 +49,48 @@ section .data
 ; scratch area? none needed -- all locals live on the stack.
 
 section .text
+
+; ---------------------------------------------------------------- CRY-3
+; (audit 2026-09-03) FE_REQUIRE_LT_P: refuse a field element >= p.
+;
+; Key decoding accepted one. Core does not: secp256k1_fe_set_b32_limit
+; refuses it and BIP340's lift_x refuses x >= p. Two consequences, the
+; second live TODAY:
+;
+;   1. If a discrete log ever existed for one of the ~2^31 values with
+;      x >= p, the split would be a false ACCEPT -- we would follow a chain
+;      Core rejects. (The audit's "2^223 search" figure is wrong: x >= p
+;      forces x-p < 2^32+977, so multi-target rho is ~2^112. Still
+;      infeasible, so LOW stands, but not for the stated reason.)
+;   2. A non-canonical x was returned in the output limbs and fed to
+;      point_add_mixed / ecdsa_verify, whose doubling and opposite detection
+;      compare limbs and DOCUMENT an assumption that operands are canonical.
+;      Reachable from parse-only callers (rpc_chain.c, descriptor.c) with no
+;      signature involved at all.
+;
+; A MACRO, not a function: a `call` here would sit at an RSP the SysV
+; alignment audit rejects (it caught exactly that -- 3 reachable sites), and
+; this is four compares. %1 = address expression of the 4 LE limbs.
+; Clobbers rax only. Jumps to .bad_ret when the value is >= p.
+%macro FE_REQUIRE_LT_P 1
+    mov   rax, [%1 + 24]
+    cmp   rax, [P_LIMBS+24]
+    jb    %%ok
+    ja    .bad_ret
+    mov   rax, [%1 + 16]
+    cmp   rax, [P_LIMBS+16]
+    jb    %%ok
+    ja    .bad_ret
+    mov   rax, [%1 + 8]
+    cmp   rax, [P_LIMBS+8]
+    jb    %%ok
+    ja    .bad_ret
+    mov   rax, [%1 + 0]
+    cmp   rax, [P_LIMBS+0]
+    jae   .bad_ret
+%%ok:
+%endmacro
+
 ; ============================================================================
 ; fe_pow(out[4], base[4], exp[4]) -- square-and-multiply, exp != 0.
 ; ============================================================================
@@ -214,6 +256,8 @@ pubkey_parse:
     inc   rcx
     jmp   .xlimb
 .xlimb_done:
+    ; CRY-3: refuse a non-canonical x before it is used or returned.
+    FE_REQUIRE_LT_P rbp-0x118
     ; y = sqrt(x^3 + 7) mod p.
     ;   x2 = sqr(x)            ; x3 = mul(x2,x) ; t = add(x3,7)
     ;   y = t^((p+1)/4)        ; verify y^2 == t
@@ -369,6 +413,9 @@ pubkey_parse:
     inc   rcx
     jmp   .uconv
 .uconv_done:
+    ; CRY-3: both coordinates must be canonical, as Core checks both.
+    FE_REQUIRE_LT_P rbp-0x118
+    FE_REQUIRE_LT_P rbp-0x168
     ; check y^2 == x^3 + 7
     ; x2 = x^2 [rbp-0xc8]; x3 [rbp-0x90]; t [rbp-0x1b8]; y2 [rbp-0xc8]
     lea   rdi, [rbp-0xc8]
@@ -433,6 +480,7 @@ pubkey_parse:
 section .data
 align 16
 ; exported limb copy of p for the parity-flip subtraction
+
 P_LIMBS:
     dq 0xFFFFFFFEFFFFFC2F
     dq 0xFFFFFFFFFFFFFFFF
