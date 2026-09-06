@@ -119,7 +119,7 @@ $(VERSION_GEN_H): $(VERSION_INC) $(VERSION_GEN_PY)
 utxo_lsm_mm.o: utxo_lsm_mm.c
 	$(CC) $(CFLAGS) -c -o $@ utxo_lsm_mm.c
 
-OBJS := sha256.o sha1.o sha512.o bitcoin_hmac.o bitcoin_keys.o ripemd160.o bitcoin_addr.o bech32.o secp256k1_fe.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_store_fast.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o bitcoin_pubkey.o bitcoin_sighash.o bitcoin_script.o bitcoin_utxo.o bitcoin_utxo_store.o bitcoin_multisig.o bitcoin_bip39.o bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_script_flags.o daemon/cmpct_recv.c bitcoin_cmpct.o
+OBJS := sha256.o sha1.o sha512.o bitcoin_hmac.o bitcoin_keys.o ripemd160.o bitcoin_addr.o bech32.o secp256k1_fe.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_scalar.o secp256k1_scalar_c.o secp256k1_ecdsa.o bitcoin_hash.o bitcoin_tx.o bitcoin_net.o bitcoin_p2p.o bitcoin_store.o bitcoin_store_fast.o bitcoin_cons.o node_log.o bitcoin_cli.o bitcoind.o bitcoin_headers.o bitcoin_addrmgr.o bitcoin_idx.o bitcoin_serve.o bitcoin_mempool.o bitcoin_pubkey.o bitcoin_sighash.o bitcoin_script.o bitcoin_utxo.o bitcoin_utxo_store.o bitcoin_multisig.o bitcoin_bip39.o bitcoin_interp.o bitcoin_scriptcodec.o bitcoin_script_flags.o daemon/cmpct_recv.o bitcoin_cmpct.o
 # BIP152 compact blocks (bitcoin_cmpct.asm) needs sha256_full (single SHA256)
 # and tx_parse (block tx enumeration for getblocktxn/blocktxn serving).
 CMPCTOBJS := bitcoin_cmpct.o sha256.o bitcoin_hash.o bitcoin_tx.o
@@ -166,7 +166,7 @@ DAEMONOBJS := serve_hdrctx.o sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o
     secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o \
     bitcoin_addr.o bitcoin_chainwork.o bitcoin_interp.o bitcoin_scriptcodec.o \
     bitcoin_script_flags.o sha1.o \
-    bitcoin_utxo_stats.o bitcoin_muhash.o bitcoin_strip_witness.o daemon/cmpct_recv.c
+    bitcoin_utxo_stats.o bitcoin_muhash.o bitcoin_strip_witness.o daemon/cmpct_recv.o
 # C sources of the tx-accept / script-verify path linked into the serve and
 # daemon harnesses.
 # ADDRBOOK (2026-08-28): the generic BIP155 address type, the version-2 book,
@@ -552,7 +552,7 @@ REORGOBJS := bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.
     secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o \
     secp256k1_scalar_c.o secp256k1_schnorr.o secp256k1_taproot.o ripemd160.o \
     bitcoin_addr.o sha1.o bitcoin_utxo_stats.o bitcoin_muhash.o \
-    bitcoin_sigops.o daemon/cmpct_recv.c bitcoin_cmpct.o
+    bitcoin_sigops.o daemon/cmpct_recv.o bitcoin_cmpct.o
 # reorg_drill -- REAL-DATA reorg exercise (tools, not part of `make test`:
 # it needs a real datadir COPY, which CI does not have). Same sources as
 # test_reorg so it drives the identical production paths.
@@ -572,7 +572,7 @@ tests/test_block_481827_pool_stack: tests/test_block_481827_pool_stack.c daemon/
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ tests/test_block_481827_pool_stack.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c daemon/netperm.c daemon/subnet.c $(REORGOBJS) -lpthread bitcoin_pow_rules.o
 # NB: filter out the real LSM objects -- this test supplies its own adversarial
 # utxo_lsm_get (single reused return buffer) to pin the transient-spk contract.
-TXVBWPSOBJS := $(filter-out bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoind.o,$(REORGOBJS)) daemon/cmpct_recv.c bitcoin_cmpct.o bitcoin_tx.o bitcoin_hash.o
+TXVBWPSOBJS := $(filter-out bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoind.o,$(REORGOBJS)) daemon/cmpct_recv.o bitcoin_cmpct.o bitcoin_tx.o bitcoin_hash.o
 tests/test_txvb_wprog_stable: tests/test_txvb_wprog_stable.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(TXVBWPSOBJS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ tests/test_txvb_wprog_stable.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c $(TXVBWPSOBJS) -lpthread
 # test_taproot_exception_block -- LOG.md incident #22 regression: the ONE
@@ -1167,7 +1167,7 @@ tests/test_headers: tests/test_headers.c $(HEADOBJS) $(TEST_TMPDIR_H)
 # cons/store/tx symbols, so link the full DAEMONOBJS superset.
 IBDOBJS := sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o \
     bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o \
-    bitcoin_headers.o bitcoin_idxscan.o daemon/cmpct_recv.c bitcoin_cmpct.o
+    bitcoin_headers.o bitcoin_idxscan.o daemon/cmpct_recv.o bitcoin_cmpct.o
 tests/test_ibd_headers: tests/test_ibd_headers.c $(IBDOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_ibd_headers.c $(IBDOBJS)
 
@@ -1221,7 +1221,7 @@ SERVEOBJS := bitcoin_serve.o bitcoin_idx.o bitcoin_pow_rules.o bitcoin_store_fas
     secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o \
     secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o \
     secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o bitcoin_addr.o \
-    bitcoin_interp.o bitcoin_scriptcodec.o sha1.o bitcoin_sigops.o daemon/cmpct_recv.c
+    bitcoin_interp.o bitcoin_scriptcodec.o sha1.o bitcoin_sigops.o daemon/cmpct_recv.o
 # SERVETXVALSRCS is defined at the top of this file -- see the "expanded when read" note there.
 tests/test_serve: tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_serve.c $(SERVETXVALSRCS) $(SERVEOBJS)
