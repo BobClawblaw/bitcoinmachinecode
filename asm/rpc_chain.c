@@ -129,6 +129,21 @@ void rpc_chain_set_prune_mib(long mib){ g_prune_mib = mib; }
  * node_config.h). Defaults are Core's. */
 static long g_gbt_maxweight = 4000000, g_gbt_reserved = 8000, g_gbt_minfee_satkvb = 1;
 static int  g_gbt_version = 0, g_gbt_printpriority = 0;
+/* Core honours -blockversion ONLY where blocks are mined on demand:
+ *   node/miner.cpp:148  if (chainparams.MineBlocksOnDemand()) {
+ *                           pblock->nVersion = args.GetIntArg("-blockversion", ...); }
+ *   kernel/chainparams.h:107  MineBlocksOnDemand() { return consensus.fPowNoRetargeting; }
+ * so on mainnet, testnet and signet Core ignores the setting entirely. This
+ * node applied it on every chain until 2026-09-06, which let a mainnet
+ * operator change the version this node hands out in getblocktemplate where
+ * Core would not. Set from g_chainp->pow_no_retargeting at boot. */
+static int  g_gbt_mine_on_demand = 0;
+void rpc_chain_set_mine_on_demand(int on){ g_gbt_mine_on_demand = on ? 1 : 0; }
+/* the version getblocktemplate will report: -blockversion only where Core
+ * would honour it, else 0 meaning "the node decides" (0x20000000). */
+int rpc_chain_gbt_version_effective(void){
+    return g_gbt_mine_on_demand ? g_gbt_version : 0;
+}
 static long g_maxtipage = 86400;
 void rpc_chain_set_gbt_policy(long maxweight, long reserved, long minfee_satkvb, int version, int printpriority){
     if (maxweight < 4000) { maxweight = 4000; } if (maxweight > 4000000) { maxweight = 4000000; }
@@ -1079,7 +1094,8 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
     rj_val* o = rj_obj();
     { rj_val* caps = rj_arr(); rj_arr_push(caps, rj_str("proposal"));
       rj_obj_set(o, "capabilities", caps); }
-    rj_obj_set(o, "version", rj_numf("%d", g_gbt_version ? g_gbt_version : 536870912));  /* 0x20000000 unless -blockversion */
+    { int ev = rpc_chain_gbt_version_effective();
+      rj_obj_set(o, "version", rj_numf("%d", ev ? ev : 536870912)); }  /* 0x20000000 unless -blockversion, and only where Core honours it */
     { rj_val* rls = rj_arr();
       rj_arr_push(rls, rj_str("csv")); rj_arr_push(rls, rj_str("!segwit"));
       rj_arr_push(rls, rj_str("taproot"));
