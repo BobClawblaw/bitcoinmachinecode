@@ -1072,3 +1072,20 @@ clash that never existed). The node was never in danger — every restart was
 clean and it returned to the tip each time — but the diagnosis should have
 started with `ss -ltnp` read carefully and `config/bitcoin.conf` read at all,
 before anything was changed.
+
+## 2026-09-06: two things observed on the host while the replay ran
+
+Neither changed the live node. Both are recorded because the next person to
+see them should not have to rediscover them.
+
+- **The bench node (`/mnt/2tbssd/bmc-bench`) shut down cleanly at 01:50Z.**
+  Its cookie is gone and `mempool.dat` / `fee_estimates.dat` were written
+  that minute — the SIGTERM path, not a crash — and the kernel log has no
+  OOM or segfault. No console log survived (the harness redirects to a
+  `console.log` that is not there), so who sent the signal is unknown; every
+  kill this session issued was by the replay's exact process name or pid.
+- **The replay's leg to the live node blocked for ten minutes** in the boot
+  header fetch (40 silent reads at 15 s), while the live node answers a raw
+  `getheaders` probe with 253 headers instantly. Not reproduced. The replay
+  now syncs from the Core oracle. The ten-minute tolerance is filed against
+  the fetch, not the live node.
