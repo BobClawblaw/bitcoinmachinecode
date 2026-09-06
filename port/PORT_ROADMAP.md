@@ -643,3 +643,36 @@ Also in the batch: MEM-3 fixed upstream (cap 63, out-of-line parents,
 *truncated consulted) -- arch-neutral C, merged; MEM-23 (the unconditional
 65-byte floor) -- C, merged; SC1 inbound-refuse-during-shutdown -- C,
 merged.
+
+## 2026-09-06 second pull (130 commits, merge 93e85141) -- port state
+
+DONE:
+- [x] genesis-at-index-0 seeding (archive_seed.c) -- arch-neutral C, merged;
+      our archive hash-proven already genesis-at-index-0 (record 0 = the
+      mainnet genesis), so no data migration.
+- [x] bitcoin_mempool.S: the 80-byte slot layout + the cached wtxid
+      (sha256d once per put) + mpool_wtxid_at_slot + MEM-21 coherent-pair
+      reader. test_mempool 26/26.
+- [x] bitcoind.S: the CC-2 hook table as data symbols (the sendcmpct
+      announcement and hook-selected getdata type are queued below).
+- [x] the identity-heights retarget revert (3441651d) -- upstream's own
+      genesis-at-index-0 fix confirms identity is the upstream truth too.
+
+QUEUE (the interpreter review series, IR-1..IR-17, x86 commits enumerated;
+each has a pinning test that currently fails on the ARM twin):
+- [ ] IR-1: every net-growing stack op fails STACK_SIZE at the cap
+      (406a1b6e) -- test_interp / test_scr_interp_bounds.
+- [ ] IR-2: pop the hashtype byte BEFORE the DER parse (406a1b6e pair;
+      test_checksig_diff "C=0 asm=1 -- S consumed the hashtype byte").
+- [ ] IR-6: OP_ROLL rotates 4-byte handles, not 524-byte records (4efb0c4a).
+- [ ] IR-8: OP_CODESEPARATOR under CONST_SCRIPTCODE refused before the
+      fExec gate (fe3fb996) -- test_scr9_policy_flags.
+- [ ] IR-10: verify_p2pkh bounds every cursor advance (a7c16c7a) --
+      test_ir10_p2pkh_bounds.
+- [ ] IR-12/13/14/17: four LOWs from the interpreter review (b7455a84).
+- [ ] test_taproot_verify_diff SEGFAULTS on the unported twin (rc=139) --
+      expected to clear with the IR series.
+All in asm/bitcoin_interp.asm (+bitcoin_script.asm for IR-2/SCR-8 followups);
+the pinning tests are in the tree and green on x86. After the IR series:
+one sweep (round 31), then deploy arm-12 (the node currently runs the
+pre-130-merge build, which is round-29-green and safe).
