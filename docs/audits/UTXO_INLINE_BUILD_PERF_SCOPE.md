@@ -330,37 +330,49 @@ block had been applied once already, under an earlier height.
   AND absent — 600 blocks over 3 loopback peers is not enough concurrency to
   provoke it.
 
-**ROOT CAUSE, found 2026-09-06 16:00Z: the reader is stale, not the archive.**
-The experiment above was run — the pipelined build plus the archive guard —
-and it answered cleanly: **the guard fired (14 times, at height 2,845) and the
-false `bad-txns-BIP30` never appeared.** So the connect had been reading bytes
-that are not the block the index records, and applying them under that height
-is what mis-filed the coins.
+**ROOT CAUSE, corrected 2026-09-06 22:30Z: the ARCHIVE is wrong, written
+wrong. It is a writer race, not a stale reader.**
 
-The archive itself is correct. Parsing `index.dat` and `blk00000.dat` by hand
-at heights 2,843 to 2,847 (record = `[hash32][file_no u32][pos u64][size u32]`,
-body 8 bytes into the frame), every record's hash matches the body it points
-at and matches the Core oracle. Nothing on disk was wrong at any point.
+The 16:00Z conclusion below was mistaken and is kept here because the way it
+was wrong matters. It rested on hand-parsing a datadir at heights 2,843-2,847
+and finding record and body in agreement, and concluded the reader must be
+returning stale bytes. The fix that followed -- drop the fast reader's cached
+fd and mmap window on a mismatch and re-read -- was then run against a real
+sync (run 5, 22:12Z, the pipelined build with the archive guard):
 
-What is stale is the reader's own caches. `bitcoin_store_fast.asm` keeps, per
-blk file, a cached read fd and an mmap window (`store_rd_init`, `store_map_at`,
-four slots). `store_reload` — which `catchup_run` calls at the top of every
-pass — refreshes the index and the tip but drops NEITHER cache. So a pass that
-hits a stale window retries, reads the same stale bytes, and retries again: the
-connect sat at height 2,845 for 14 consecutive passes and never advanced. The
-serial downloader hit this rarely enough to run 494,074 blocks without tripping
-it; the pipelined one writes about 12x faster and trips it in minutes.
+* **Zero false `bad-txns-BIP30`**, past both heights where earlier pipelined
+  runs died. The guard works: nothing wrong is ever applied.
+* But the connect **wedged** at height 44,862 -- `applied` frozen while the
+  download ran on -- with 30 guard trips a minute at two heights, and
+  dropping the caches did not cure a single one.
 
-**The fix has two halves.** The first is landed (PR #49): the connect refuses a
-body that is not the block the index records, so stale bytes can no longer be
-applied — the false rejection and the mis-filed coins are both impossible now.
-The second is not landed: on a mismatch the connect should DROP the stale
-caches (`store_rd_close`, `store_map_close`, both of which exist and are
-already called together by `store_prune_safe` for exactly this reason) and
-re-read the same height rather than stall. That is written and sitting on
-`batch/2026-09-06-ibd-pipeline-v2`; it survived a ten-minute pipelined sync
-with zero stalls and zero rejections, but that run reached only 2,843 blocks
-before it was stopped, so it is NOT proven and NOT merged.
+Hand-parsing THAT archive settles it. At height 44,863:
+
+| | |
+|---|---|
+| index record's hash | `0000000014121f6d...` |
+| Core oracle's hash for 44,863 | `0000000014121f6d...` — the record is RIGHT |
+| hash of the body at the recorded position | `0000000012ad2107...` |
+| that body's real height, per the oracle | **44,888** |
+
+So the record correctly names block 44,863 and points at bytes belonging to
+block 44,888 -- another block from the SAME 40-block chunk. The archive is
+internally inconsistent, on disk, at rest. No reader could have been right.
+
+`store_append_shared` takes the block-file `flock`, computes the append
+position with `lseek(SEEK_END)`, writes the body, then writes the 48-byte
+record at `height*48`. Two blocks of one chunk ending up at overlapping
+positions is what happens if that sequence is not serialised in practice --
+one writer's bytes land where another's record already points. The serial
+downloader wrote roughly one block per network round trip and never hit it;
+the pipelined one writes a whole chunk per round trip, about 12x the rate,
+and hits it within minutes.
+
+**Next step, and it is a measurement, not a guess:** verify the lock is
+actually held across the position computation and both writes -- print the
+`flock` fd and the computed position per append under a debug flag, run the
+pipelined fetch, and look for two appends that computed the same position.
+Until that is answered the pipelined download stays off main.
 
 **The wider question this raises, which no test covers:** every other reader
 holding a store handle across writes by another process — the RPC block fetch,
