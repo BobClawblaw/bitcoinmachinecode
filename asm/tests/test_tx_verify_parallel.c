@@ -143,16 +143,19 @@ static int par_checks(void){
     int bad = 0;
     #define PAR_OK(c,m) do{ printf("  %s %s\n", (c)?"ok  :":"FAIL:", m); if(!(c)) bad++; }while(0)
     printf("== -par is the script-verification thread count (this box: %ld cores) ==\n", ncpu);
+    const int CAP = 16;   /* Core: MAX_SCRIPTCHECK_THREADS(15) workers + the calling thread */
+    int auto_expect = (int)ncpu < CAP ? (int)ncpu : CAP;
     par_set(0);  PAR_OK(par_get()==0, "the configured value is kept verbatim");
-                 PAR_OK(par_script_threads()==(int)ncpu, "par=0 -> every core, as Core's autodetect does");
+                 PAR_OK(par_script_threads()==auto_expect, "par=0 -> every core, clamped at Core's 15 workers + caller");
     par_set(8);  PAR_OK(par_script_threads()==8, "par=8 -> exactly 8 threads, whatever the box has");
     par_set(1);  PAR_OK(par_script_threads()==1, "par=1 -> single-threaded (the caller alone)");
-    par_set(-1); PAR_OK(par_script_threads()==(int)ncpu-1, "par=-1 -> one core left free");
-    par_set(-4); PAR_OK(par_script_threads()==(int)ncpu-4, "par=-4 -> four cores left free");
+    { int e1=(int)ncpu-1; if(e1>CAP) e1=CAP; par_set(-1); PAR_OK(par_script_threads()==e1, "par=-1 -> one core left free (then Core's clamp)"); }
+    { int e4=(int)ncpu-4; if(e4>CAP) e4=CAP; par_set(-4); PAR_OK(par_script_threads()==e4, "par=-4 -> four cores left free (then Core's clamp)"); }
+    par_set(64); PAR_OK(par_script_threads()==CAP, "par=64 -> clamped to Core's ceiling, not 64");
     par_set((int)-ncpu);       PAR_OK(par_script_threads()==1, "par=-<cores> cannot go below one thread");
     par_set((int)-ncpu-100);   PAR_OK(par_script_threads()==1, "an absurd negative still leaves one thread");
     { par_set(2); int a=par_script_threads(); par_set(0); int b=par_script_threads();
-      PAR_OK(a==2 && b==(int)ncpu && a!=b, "par=2 and par=0 differ on a multi-core box -- the setting is READ"); }
+      PAR_OK(a==2 && b==auto_expect && a!=b, "par=2 and par=0 differ on a multi-core box -- the setting is READ"); }
     par_set(0);                      /* leave the default for the rest of this test */
     #undef PAR_OK
     return bad;

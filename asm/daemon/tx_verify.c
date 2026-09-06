@@ -668,6 +668,7 @@ static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long fla
  * It lives HERE rather than in a module of its own because every link that
  * needs it already carries this file; a separate file had to be added to
  * seventeen source lists and arrived twice in several links. */
+#define MAX_SCRIPTCHECK_THREADS 15   /* Core validation.h */
 static int g_par = 0;
 void par_set(int par){ g_par = par; }
 int  par_get(void){ return g_par; }
@@ -676,6 +677,12 @@ int  par_script_threads(void){
     long t = g_par;
     if (t <= 0) t += ncpu;      /* 0 -> every core, -n -> leave n cores free */
     if (t < 1) t = 1;           /* a node always has one script-checking thread */
+    /* Core clamps the pool to MAX_SCRIPTCHECK_THREADS (validation.cpp:
+     * std::clamp(worker_threads_num, 0, MAX_SCRIPTCHECK_THREADS)), i.e. 15
+     * workers plus the calling thread. Its -par help says "0 = auto, up to
+     * 15". Matching it costs parallelism on a box with more than 16 cores and
+     * is deliberate: the flag behaves exactly as Core's does. */
+    if (t > MAX_SCRIPTCHECK_THREADS + 1) t = MAX_SCRIPTCHECK_THREADS + 1;
     return (int)t;
 }
 
