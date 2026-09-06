@@ -33,8 +33,16 @@ Fresh-install IBD + serve benchmark, bmc vs Bitcoin Core, on a dedicated
   first inbound getheaders/getblock answer with UTXO, muhash parity vs oracle
   -> monitor_fixed.sh stamps phases + writes RESULT PASS/FAIL
 - Core v31.1: run_core_bench.sh same contract (P2P 8563, RPC 8562, dbcache
-  8192, par 8, maxconnections 64); phases: RPC_READY, P2P_INBOUND_OK, TIP,
-  MUHASH parity; then compare block-for-block vs bmc
+  8192); phases: RPC_READY, P2P_INBOUND_OK, TIP, MUHASH parity; then compare
+  block-for-block vs bmc.
+  **CORRECTION 2026-09-06:** this originally also wrote `par=8` and
+  `maxconnections=64` for Core, with no reason recorded anywhere. Core's
+  defaults are par=0 (auto) and maxconnections=125, so the 21.0 h figure was
+  measured with Core held to eight script-verification threads on a 32-core
+  box and half its connection budget -- a handicap applied to one side only,
+  on the run this node was then compared against. Both lines are removed;
+  dbcache stays because BOTH sides get it. **The 21.0 h number should be
+  treated as a floor for Core, not a fair result.**
 
 ## Deliverable
 Consolidated report in /mnt/2tbssd/bench-repo (private repo

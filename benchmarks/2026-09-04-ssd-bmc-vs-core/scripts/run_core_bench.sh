@@ -21,9 +21,17 @@ port=$P2P
 rpcport=$RPC
 rpcbind=127.0.0.1
 rpcallowip=127.0.0.1
+# dbcache is the ONE deliberate deviation from Core's defaults, and it is
+# applied to BOTH sides (bmc gets dbcache=8192 too): the comparison is about
+# the sync engine, not about who was given more cache.
 dbcache=8192
-par=8
-maxconnections=64
+# Everything else is Core's default ON PURPOSE. This file used to write
+# par=8 and maxconnections=64 with no recorded reason (2026-09-04). Core's
+# defaults are par=0 (auto: cores, clamped to MAX_SCRIPTCHECK_THREADS=15,
+# plus the calling thread) and maxconnections=125, so that handicapped Core
+# to eight verification threads and half its connection budget on the very
+# run we compared ourselves against. Do not add settings here without
+# writing down why, and never ones that only one side gets.
 CONF
 BIN=$DEST/core/bin/bitcoind
 CLI="$DEST/core/bin/bitcoin-cli -datadir=$DEST/data"

@@ -424,7 +424,7 @@ service line appears a few minutes after start.
 
 - **Console log**: `logs/<chain>/bitcoin.<chain>.log` (systemd stdout/stderr):
   `[boot]`, `[config]`, `[rpc]`, `[dl]`, `[tx_accept]`, `[tor]`, `[zmq]`.
-- **Daemon's own leveled log**: `<datadir>/<chain>/logs/bitcoind.log`.
+- **Daemon's own leveled log**: `<datadir>/<chain>/debug.log` — Core's filename, in the per-chain directory, exactly where Core puts its own (2026-09-06; it was `logs/bitcoind.log` before).
 - `journalctl -u bmc-bitcoind` holds only systemd's lines (start, stop,
   `Killing` on a stop timeout).
 
@@ -622,7 +622,7 @@ Extra listeners: onion service target at chain default P2P port + 1
 | `bmcwallet.enc` / `bmcwallet.dat` (+ `.txlog`), `walletkeys.dat`, `walletscan.dat` | wallet container / plaintext store and journal, HD keys, rescan records |
 | `onion_v3_private_key`, `i2p_private_key` | persisted onion service key and I2P destination |
 | `txindex.dat` + `txindex.tail`, `addr_index.dat`, `bfilters.dat` + `bfilters.idx`, `coinstats.dat` | optional indexes |
-| `logs/bitcoind.log` | the daemon's own leveled log |
+| `debug.log` | the daemon's own leveled log (was `logs/bitcoind.log` before 2026-09-06) |
 
 Outside the chain directory: `<datadir>/bitcoin.conf` or
 `<repo>/config/bitcoin.conf`; `<repo>/logs/<chain>/bitcoin.<chain>.log`;
