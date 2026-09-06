@@ -1234,6 +1234,55 @@ const char* utxo_live_fail_kind_name(long k){
          : k == UTXO_FAIL_OTHER ? "archive/recovery" : "none";
 }
 
+/* ---- 3.3 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): a block that fails to
+ * connect is REJECTED, not fatal.
+ *
+ * Core marks a block whose ConnectBlock fails BLOCK_FAILED_VALID, never puts
+ * it in the active chain, and moves to the next-best candidate without human
+ * help. Here, until this, apply_block_at returning 0 for ANY reason stopped
+ * the catch-up ("FATAL: apply_block failed"), and main.c's rotation retried
+ * the same block from the checkpoint with backoff, for ever: the node sat
+ * one block below an invalid block another miner produced, with that block
+ * in its archive and (before 3.1) announced as its tip.
+ *
+ * The classification that already exists is what makes rejection safe to
+ * automate: ONLY UTXO_FAIL_REJECT -- a verification phase refused the block
+ * and named why in g_last_reject (bad script, bad amount, missing/spent
+ * input, bad coinbase, BIP30/34/68, sigops, weight...) -- is a candidate.
+ * UTXO_FAIL_STORE (a put/del/flush/WAL step failed, or the incident
+ * 2026-09-01 lookup inconsistency that sets g_halted) and UTXO_FAIL_OTHER (a
+ * hole/short block, partial-block recovery) keep their halt semantics: the
+ * block may be perfectly valid and the STORE is what is broken, and
+ * "invalidating" it would truncate a good chain.
+ *
+ * The rejection itself is not done here. utxo_live.c has no business
+ * touching invalid.dat or headers.dat; it calls the hook the worker
+ * registers (main.c -> chain_invalidate_block in reorg.c: invset mark,
+ * archive truncate to h-1 through the reorg module's own disconnect path,
+ * headers.dat rollback to h -- exactly what the operator's invalidateblock
+ * does). No hook registered (tests, tools, the offline build_utxo) means
+ * the pre-3.3 behaviour: -1, kind REJECT, the caller retries.
+ *
+ * KNOWN LIMIT, stated rather than hidden: a lookup that lies (b3d47a9's bad
+ * sparse samples, 2026-09-01) surfaces as a verification reject
+ * ("missing/already-spent UTXO") and is indistinguishable from a genuinely
+ * invalid block at this layer -- Core has the same exposure with a corrupt
+ * chainstate. Two things bound the damage: a mark is reversible
+ * (reconsiderblock) and costs re-downloading the truncated tail, never UTXO
+ * state; and a second automatic rejection within UTXO_REJECT_MIN_GAP blocks
+ * of the previous one is REFUSED and falls back to the halt path, because a
+ * real invalid block is a one-off and a lying store rejects everything. */
+typedef long (*utxo_reject_fn)(void* store_buf, long height, const unsigned char hash[32], const char* reason);
+static utxo_reject_fn g_reject_fn = 0;
+void utxo_live_set_reject_fn(utxo_reject_fn fn){ g_reject_fn = fn; }
+#define UTXO_REJECT_MIN_GAP 100
+static long g_last_rejected_height = -1;   /* last height the hook invalidated (this process) */
+static long g_rejected_total = 0;
+static long g_call_rejected = -1;          /* height rejected by the CURRENT/last catch-up call, -1 none */
+long utxo_live_last_rejected_height(void){ return g_last_rejected_height; }
+long utxo_live_rejected_count(void){ return g_rejected_total; }
+long utxo_live_call_rejected_height(void){ return g_call_rejected; }
+
 /* Point query against the LIVE UTXO set, for the gettxout IPC (daemon/main.c).
  * The RPC server runs in the serve PARENT and has no handle on this state --
  * the download worker (this process) owns it. Called ONLY from the worker's
@@ -3039,6 +3088,7 @@ static int ckpt_now(void){
 
 long utxo_live_catchup(void* store_buf){
     g_bip30_store = store_buf;   /* for BIP30's BIP34-ancestor test; see bip30_enforced */
+    g_call_rejected = -1;        /* 3.3: per-call report, cleared before any early return */
     store_reload(store_buf);
     long tip = *(int*)((char*)store_buf + 24);
 
@@ -3081,7 +3131,39 @@ long utxo_live_catchup(void* store_buf){
             break;
         }
         if (!apply_block_at(blockbuf, (u64)len, h)) {
-            fprintf(stderr, "[utxo_live] FATAL: apply_block failed at height %ld -- stopping catch-up\n", h);
+            /* 3.3: a VALIDATION failure rejects the block; see the reject
+             * hook's comment above for what qualifies and what does not. */
+            if (g_last_fail_kind == UTXO_FAIL_REJECT && !g_halted && g_reject_fn){
+                long gap = g_last_rejected_height < 0 ? -1 : labs(h - g_last_rejected_height);
+                unsigned char bh[32]; char hex[65];
+                block_hash(bh, blockbuf);
+                for (int b = 0; b < 32; b++) sprintf(hex + b*2, "%02x", bh[31-b]);
+                if (gap >= 0 && gap < UTXO_REJECT_MIN_GAP){
+                    fprintf(stderr, "[utxo_live] REJECT block at height %ld hash=%s: %s -- a second rejection within %ld blocks of the one at %ld: "
+                                    "NOT invalidating automatically (a lying store rejects everything; a real invalid block is a one-off). "
+                                    "Retrying from the checkpoint; operator: check the store, then invalidateblock/reconsiderblock by hand\n",
+                            h, hex, g_last_reject, gap, g_last_rejected_height);
+                    tm_lap(TM_WALL, tm_call_t0); if (g_tm_on) g_tm_total_blocks += (u64)applied;
+                    return -1;
+                }
+                fprintf(stderr, "[utxo_live] REJECT block at height %ld hash=%s: %s -- invalidating it (Core: BLOCK_FAILED_VALID); "
+                                "the chain stays at %ld until a heavier chain avoids it\n",
+                        h, hex, g_last_reject, h - 1);
+                long rr = g_reject_fn(store_buf, h, bh, g_last_reject);
+                if (rr == 1){
+                    g_last_rejected_height = h; g_rejected_total++; g_call_rejected = h;
+                    /* the archive was truncated to h-1 under us: `tip` is stale,
+                     * this call is done -- what was applied before h stands */
+                    store_reload(store_buf);
+                    break;
+                }
+                fprintf(stderr, "[utxo_live] REJECT at height %ld: invalidation %s -- falling back to the retry path\n",
+                        h, rr == 0 ? "refused (see the chain/reorg log)" : "FAILED PART WAY (see the reorg log)");
+                tm_lap(TM_WALL, tm_call_t0); if (g_tm_on) g_tm_total_blocks += (u64)applied;
+                return -1;
+            }
+            fprintf(stderr, "[utxo_live] FATAL: apply_block failed at height %ld (%s) -- stopping catch-up\n",
+                    h, utxo_live_fail_kind_name(g_last_fail_kind));
             tm_lap(TM_WALL, tm_call_t0); if (g_tm_on) g_tm_total_blocks += (u64)applied;
             return -1;
         }

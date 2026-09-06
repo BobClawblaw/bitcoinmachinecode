@@ -1405,16 +1405,64 @@ unsigned txr_source_group_fd(int fd){
     return 0;
 }
 
+/* "host:port" / "[v6]:port" -> the bare address the misbehaviour table keys on */
+static void host_strip_port(char* host){
+    if(host[0] == '['){ char* e = strchr(host, ']'); if(e) *e = 0; memmove(host, host + 1, strlen(host)); }
+    else { char* c = strrchr(host, ':'); if(c && c == strchr(host, ':')) *c = 0; }   /* exactly one ':' = host:port; a bare IPv6 has several and no port */
+}
 void txr_report_violation_fd(int fd, const char* reason){
     for(int k = 0; k < mux_n_out; k++){
         if(mux_out_fd[k] != fd) continue;
         char host[128]; snprintf(host, sizeof host, "%s", mux_out_host[k]);
-        if(host[0] == '['){ char* e = strchr(host, ']'); if(e) *e = 0; memmove(host, host + 1, strlen(host)); }
-        else { char* c = strrchr(host, ':'); if(c && c == strchr(host, ':')) *c = 0; }   /* exactly one ':' = host:port; a bare IPv6 has several and no port */
+        host_strip_port(host);
         if(!host[0]) return;
         peer_misbehaving(host, 100, reason ? reason : "protocol violation");
         return;
     }
+}
+
+/* ---- 3.3 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): who delivered a block ----
+ * A block is connected long after it was stored, by a different code path;
+ * when it fails to connect the worker needs to know which peer handed it
+ * over to score the consensus violation (Core: Misbehaving(100) from
+ * MaybePunishNodeForBlock, then disconnect). The leg sync knows (it logs
+ * "[block] stored height=N ... (via host)"), so it notes the host here, in
+ * a ring keyed by height. Blocks from the parallel downloader's chunk
+ * workers (separate processes, many peers per pass) and from an inbound
+ * child's .do_block are NOT noted: their source is logged as unknown. */
+#define BLK_SRC_RING 4096
+static struct { long h; char host[64]; } g_blk_src[BLK_SRC_RING];
+static void blk_src_note(long h, const char* host){
+    if(h < 0 || !host) return;
+    g_blk_src[h % BLK_SRC_RING].h = h;
+    snprintf(g_blk_src[h % BLK_SRC_RING].host, sizeof g_blk_src[0].host, "%s", host);
+}
+static const char* blk_src_lookup(long h){
+    if(h < 0) return NULL;
+    return g_blk_src[h % BLK_SRC_RING].h == h && g_blk_src[h % BLK_SRC_RING].host[0] ? g_blk_src[h % BLK_SRC_RING].host : NULL;
+}
+/* The reject hook utxo_live_catchup calls for a block that FAILED VALIDATION
+ * (never for a store error -- see utxo_live.c's classification): the same
+ * invalidate path the operator's invalidateblock takes (chain_invalidate_block:
+ * invalid.dat mark, archive truncated to h-1 through the reorg module's
+ * disconnect, headers.dat rolled back to h), then the delivering peer, when
+ * known, is scored 100 for a consensus violation. The worker's next rotation
+ * fetches headers from its peers and takes the heavier chain that avoids the
+ * mark: the chain moves on, no restart, no operator. */
+static long dl_reject_block(void* st, long h, const unsigned char hash[32], const char* reason){
+    extern long chain_invalidate_block(void*, long, const unsigned char[32]);
+    long r = chain_invalidate_block(st, h, hash);
+    if(r != 1) return r;
+    const char* src = blk_src_lookup(h);
+    char why[160]; snprintf(why, sizeof why, "block %ld failed to connect: %s", h, reason && reason[0] ? reason : "consensus reject");
+    if(src){
+        char host[128]; snprintf(host, sizeof host, "%s", src); host_strip_port(host);
+        fprintf(stderr,"[chain] rejected block %ld was delivered by %s -- scoring a consensus violation\n", h, src);
+        if(host[0]) peer_misbehaving(host, 100, why);
+    } else {
+        fprintf(stderr,"[chain] rejected block %ld: delivering peer unknown (parallel downloader or inbound push) -- no peer scored\n", h);
+    }
+    return 1;
 }
 
 /* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
@@ -1706,16 +1754,13 @@ static long txoq_mark_block(void* store_buf, const unsigned char hash[32], int o
     long n = hst_count(hb), h = -1; unsigned char rec[112];
     for(long k = n - 1; k >= 0; k--){ if(hst_get_at(hb, (unsigned long long)k, rec) != 1) break; if(!memcmp(rec + 80, hash, 32)){ h = k; break; } }
     if(h < 0) return 0;
-    if(invset_add(hash) < 0) return -1;
-    invset_save("invalid.dat");
-    long tip = *(int*)((unsigned char*)store_buf + 24);
-    if(h <= tip){
-        fprintf(stderr, "[chain] invalidateblock: height %ld is in the active chain (tip %ld) -- disconnecting %ld block(s)\n", h, tip, tip - h + 1);
-        extern long reorg_disconnect_to(void* st, long fork_height);
-        long r = reorg_disconnect_to(store_buf, h - 1);
-        if(r != 1){ fprintf(stderr, "[chain] invalidateblock: disconnect %s\n", r == 0 ? "refused (see the reorg log)" : "FAILED PART WAY -- see the reorg log"); return -1; }
-    }
-    if(n > h) dlc_headers_rollback(hb, h);
+    /* 3.3: the mark + disconnect + headers rollback is chain_invalidate_block
+     * (daemon/reorg.c) -- the same path the node takes on its own when a
+     * block fails to connect, so invalidateblock is that path invoked by the
+     * operator rather than a second implementation of it. */
+    extern long chain_invalidate_block(void*, long, const unsigned char[32]);
+    long r = chain_invalidate_block(store_buf, h, hash);
+    if(r != 1) return -1;
     fprintf(stderr, "[chain] invalidateblock: marked height %ld; headers rolled back to %ld; the chain stays below it until a heavier chain avoids it\n", h, h);
     *out_h = h; return 1;
 }
@@ -2420,6 +2465,7 @@ static long do_outbound_sync(int i){
         u64 consumed=0; u64 ntx = L>80 ? utxo_walk_read_varint(sb+80, sb+L, &consumed) : 0;
         if(!consumed) ntx = 0;
         fprintf(stderr,"[block] stored height=%d hash=%s.. bytes=%ld tx=%llu (via %s)\n", h, hs, L, (unsigned long long)ntx, mux_out_host[i]);
+        blk_src_note(h, mux_out_host[i]);   /* 3.3: remembered for the reject hook */
     }
     /* STAGE B: keep chainwork.dat in lockstep with index.dat for every block
      * that just landed. This is a CATCH-UP call, not a per-block hook: it
@@ -5126,6 +5172,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         fprintf(stderr,"[dl] live UTXO tracking is off -- fork detection stays on but REORGS ARE DISABLED (no undo data)\n");
     }
     reorg_set_index_rebuild(rebuild_hash_index_after_reorg);
+    /* 3.3: a block that fails VALIDATION in catch-up is rejected through
+     * dl_reject_block, not left in the archive as a fatal retry loop */
+    { extern void utxo_live_set_reject_fn(long (*)(void*, long, const unsigned char[32], const char*));
+      utxo_live_set_reject_fn(dl_reject_block); }
     /* STO-7: hand reorg.c the SHARED mempool and the accept path's own policy
      * objects, so a completed reorg rebuilds the pool against the new branch
      * instead of leaving it holding transactions the new branch invalidated.
@@ -6231,6 +6281,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(utxo_live_ok && now_ms >= utxo_retry_at_ms){
             phase_timer_t utxo_ct_pt; phase_start(&utxo_ct_pt);
             long ar = utxo_live_catchup(store_buf);
+            { extern long utxo_live_call_rejected_height(void);
+              long rj = utxo_live_call_rejected_height();
+              if(rj >= 0)
+                  fprintf(stderr,"[dl] block at height %ld REJECTED (%s) and invalidated -- archive at %d, connected %ld; the next rotation fetches the chain that avoids it\n",
+                          rj, utxo_live_last_reject(), *(int*)(store_buf+24), utxo_live_applied_height()); }
             if(ar < 0){
                 /* Incident 2026-09-01: recovery is no longer blind. Compaction
                  * runs ONLY when utxo_live says the failure is a store error
