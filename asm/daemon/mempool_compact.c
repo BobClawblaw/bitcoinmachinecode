@@ -11,12 +11,15 @@
  * so the freed bytes become usable again. Called by the policy layer's
  * eviction path right before it retries the store.
  *
- * Layout (bitcoin_mempool.asm header): +8 mask (slots-1), +16 blob base,
- * +24 blob_cap, +32 fill, +40 slots[48]: {+0 len, +8 txid[32], +40 off}.
+ * Layout (mempool_slot.h / bitcoin_mempool.asm header): +8 mask (slots-1),
+ * +16 blob base, +24 blob_cap, +32 fill, +40 slots[MPOOL_SLOT_BYTES]:
+ * {+0 len, +8 txid[32], +40 off, +48 wtxid[32]}. The wtxid is a function of
+ * the tx bytes, not of where they sit, so sliding the blob leaves it valid.
  * An empty slot has len == 0 or len == 0xFFFFFFFFFFFFFFFF.
  */
 #include <stdlib.h>
 #include <string.h>
+#include "../mempool_slot.h"
 
 typedef unsigned long u64;
 
@@ -30,7 +33,7 @@ void mpool_compact(void* mp){
     u64 mask;     memcpy(&mask, base + 8, 8);
     u64 slots = mask + 1;
     unsigned char* blob; memcpy(&blob, base + 16, 8);
-    unsigned char* slotbase = base + 40;
+    unsigned char* slotbase = base + MPOOL_HDR_BYTES;
 
     /* collect (blob_off, slot_index) of every live slot -- carrying the
      * index avoids re-searching for it after the sort (O(n log n) total) */
@@ -38,10 +41,10 @@ void mpool_compact(void* mp){
     if (!live) return;                                     /* no reclaim; caller still safe */
     u64 nlive = 0;
     for (u64 i = 0; i < slots; i++){
-        unsigned char* s = slotbase + i * 48;
+        unsigned char* s = slotbase + i * MPOOL_SLOT_BYTES;
         u64 len; memcpy(&len, s, 8);
-        if (len == 0 || len == 0xFFFFFFFFFFFFFFFFULL) continue;   /* empty */
-        u64 off; memcpy(&off, s + 40, 8);
+        if (len == 0 || len == MPOOL_SLOT_EMPTY) continue;   /* empty */
+        u64 off; memcpy(&off, s + MPOOL_SLOT_OFF, 8);
         live[nlive*2] = off; live[nlive*2+1] = i;
         nlive++;
     }
@@ -54,10 +57,10 @@ void mpool_compact(void* mp){
     u64 newfill = 0;
     for (u64 k = 0; k < nlive; k++){
         u64 off = live[k*2], idx = live[k*2+1];
-        unsigned char* s = slotbase + idx * 48;
+        unsigned char* s = slotbase + idx * MPOOL_SLOT_BYTES;
         u64 len; memcpy(&len, s, 8);
         if (off != newfill) memmove(blob + newfill, blob + off, (size_t)len);
-        memcpy(s + 40, &newfill, 8);
+        memcpy(s + MPOOL_SLOT_OFF, &newfill, 8);
         newfill += len;
     }
     memcpy(base + 32, &newfill, 8);   /* fill = compacted size */

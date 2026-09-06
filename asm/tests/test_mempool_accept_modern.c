@@ -83,7 +83,7 @@ int main(void){
     /* ---- mempool policy + structural mempool + confirmed UTXO set ---- */
     static unsigned char pol[128];
     static unsigned char stbuf[1<<20];
-    static unsigned char mpbuf[40 + 4096*48 + 8];
+    static unsigned char mpbuf[40 + 4096*80 + 8];
     static unsigned char mblob[1<<20];
     static unsigned char ux[40 + 4096*48 + 8];
     static unsigned char ublob[1<<16];

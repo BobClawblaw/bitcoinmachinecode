@@ -102,7 +102,7 @@ int main(int argc, char** argv){
     mpool_policy_state_init(st, cap);
 
     unsigned long mpslots = 1; while (mpslots < (unsigned long)cap*2) mpslots <<= 1;
-    void* mp = malloc(40 + mpslots*48 + 8);
+    void* mp = malloc(40 + mpslots*80 + 8);   /* mpool_struct_size: 80-byte slots */
     void* mblob = malloc((size_t)cap * 128 + (1u<<20));
     void* ux = malloc(40 + (size_t)mpslots*48 + 8);
     void* ublob = malloc((size_t)cap * 96 + (1u<<20));

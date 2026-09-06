@@ -96,7 +96,7 @@ static u8 sc[1<<16];
 int main(void){
     memset(SPK_WPKH, 0xab, sizeof SPK_WPKH); SPK_WPKH[0]=0x00; SPK_WPKH[1]=0x14;
     static u8 pol[192], st[1<<21];
-    static u8 mp[40 + 256*48 + 8]; static u8 mblob[1<<16];
+    static u8 mp[40 + 256*80 + 8]; static u8 mblob[1<<16];
     static u8 ux[40 + 256*48 + 8]; static u8 ublob[1<<15];
     #define RESET(nonstd) do{ \
         memset(st,0,sizeof st); \

@@ -62,6 +62,7 @@
                                    * Core's chainparams -- the SAME parse the
                                    * script-flag path assembles against */
 #include "mempool_entry.h"
+#include "mempool_slot.h"    /* the structural mempool's slot layout */
 #include "rpc_commands.h"
 #include "version_gen.h"
 
@@ -1019,11 +1020,11 @@ static long gbt_slot(void* mp, unsigned long i, gbt_ent* e){
     u8* m = (u8*)mp;
     unsigned long long mask; memcpy(&mask, m+8, 8);
     if (i > mask) return -1;
-    u8* sl = m + 40 + i*48;
+    u8* sl = MPOOL_SLOT_AT(m, i);
     unsigned long long len; memcpy(&len, sl, 8);
-    if (len == 0xFFFFFFFFFFFFFFFFULL) return 0;
+    if (len == MPOOL_SLOT_EMPTY) return 0;
     u8* blob; memcpy(&blob, m+16, 8);
-    unsigned long long off; memcpy(&off, sl+40, 8);
+    unsigned long long off; memcpy(&off, sl+MPOOL_SLOT_OFF, 8);
     e->txid = sl+8; e->tx = blob+off; e->len = (unsigned long)len;
     return 1;
 }

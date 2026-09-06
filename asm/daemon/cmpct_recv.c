@@ -1,5 +1,6 @@
 #include <string.h>
 #include "cmpct_recv.h"
+#include "../mempool_slot.h"
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen) __attribute__((weak));
 extern void bip152_shortid(unsigned char out[6], const unsigned char hdr[80], unsigned long long nonce, const unsigned char wtxid[32]);
 extern void tx_wtxid(unsigned char out[32], const unsigned char* tx, unsigned long txlen);
@@ -8,7 +9,10 @@ extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
 
 static int g_enabled = 1; static cmpct_writer_t g_write = 0;
 static unsigned long g_st_recon = 0, g_st_need = 0, g_st_fb = 0;
+static int g_wtxid_cache = 1; static unsigned long g_st_hashed = 0;
 void cmpct_recv_set_enabled(int on){ g_enabled = on; }
+void cmpct_recv_set_wtxid_cache(int on){ g_wtxid_cache = on; }
+unsigned long cmpct_recv_hashed(void){ return g_st_hashed; }
 int  cmpct_recv_enabled(void){ return g_enabled; }
 unsigned cmpct_getdata_type(int leg){ return (g_enabled && leg) ? MSG_CMPCT_BLOCK_T : MSG_WITNESS_BLOCK_T; }
 void cmpct_recv_set_writer(cmpct_writer_t w){ g_write = w; }
@@ -42,9 +46,16 @@ static struct {
 } S;
 
 /* shortid -> mempool tx: an open-addressing table over the pool's slot table
- * (bitcoin_mempool.asm layout: +0 count, +8 mask, +16 blob, +24 blob_cap,
- * +32 fill, +40 slots of 48: [len][txid32][blob_off]; empty len = ~0). A
- * short id that two pool entries share is dropped (Core: treated as missing). */
+ * (mempool_slot.h: +0 count, +8 mask, +16 blob, +24 blob_cap, +32 fill, +40
+ * slots of MPOOL_SLOT_BYTES: [len][txid32][blob_off][wtxid32]; empty len = ~0).
+ * A short id that two pool entries share is dropped (Core: treated as missing).
+ *
+ * The wtxid comes from the slot's cache (mpool_put hashed the tx once at
+ * admission), not from sha256d over the tx: with 50,000 entries this table
+ * was rebuilt with 50,000 double-SHA256s of whole transactions for every
+ * block. cmpct_recv_set_wtxid_cache(0) is the pre-cache behaviour, kept as
+ * the test's negative control and as the fallback should a pool ever be
+ * handed over without the cache (none is today: every writer is mpool_put). */
 #define HT_BITS 21
 static struct { unsigned long long sid; const unsigned char* tx; unsigned long len; unsigned char used, dup; } HT[1u << HT_BITS];
 static unsigned long ht_slot(unsigned long long sid){ return (unsigned long)((sid * 0x9e3779b97f4a7c15ULL) >> (64 - HT_BITS)); }
@@ -63,11 +74,16 @@ static void ht_build(void* mp, const unsigned char hdr[80], unsigned long long n
     if (!mp) return;
     const unsigned char* m = (const unsigned char*)mp;
     unsigned long long mask = *(const unsigned long long*)(m + 8); const unsigned char* blob = *(const unsigned char* const*)(m + 16);
+    unsigned long long blob_cap = *(const unsigned long long*)(m + 24);
     for (unsigned long long s = 0; s <= mask; s++){
-        const unsigned char* slot = m + 40 + s * 48; unsigned long long len = *(const unsigned long long*)slot;
-        if (len == ~0ULL || len == 0) continue;
-        const unsigned char* tx = blob + *(const unsigned long long*)(slot + 40);
-        unsigned char w[32], six[6]; tx_wtxid(w, tx, (unsigned long)len); bip152_shortid(six, hdr, nonce, w);
+        const unsigned char* slot = MPOOL_SLOT_AT(m, s); unsigned long long len = *(const unsigned long long*)slot;
+        if (len == MPOOL_SLOT_EMPTY || len == 0) continue;
+        unsigned long long off = *(const unsigned long long*)(slot + MPOOL_SLOT_OFF);
+        if (off + len < off || off + len > blob_cap) continue;   /* torn slot (MEM-21): a miss, never a read past the blob */
+        const unsigned char* tx = blob + off;
+        unsigned char w[32], six[6]; const unsigned char* wp = g_wtxid_cache ? mpool_wtxid_at_slot(mp, (unsigned long)s) : 0;
+        if (!wp){ tx_wtxid(w, tx, (unsigned long)len); g_st_hashed++; wp = w; }
+        bip152_shortid(six, hdr, nonce, wp);
         ht_put(sid_of(six), tx, (unsigned long)len);
     }
 }

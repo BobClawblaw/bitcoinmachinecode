@@ -13,6 +13,7 @@
 #include "rpc_node.h"
 #include "daemon/asmap.h"   /* mapped_as, when -asmap is loaded */
 #include "mempool_entry.h"
+#include "mempool_slot.h"    /* the structural mempool's slot layout */
 #include "version_gen.h"
 #include <signal.h>
 #include <errno.h>
@@ -670,19 +671,20 @@ long rpc_node_mempool_rawtx(const unsigned char txid_wire[32], unsigned char* ou
     return r;
 }
 
-/* Slot layout per bitcoin_mempool.asm's header (same walk daemon/reorg.c
- * uses): +0 n, +8 mask, +16 blob, then 48-byte slots at +40 --
- * [+0 len][+8 txid[32]][+40 blob_off], len==~0 marking empty. */
+/* Slot layout per mempool_slot.h / bitcoin_mempool.asm's header (same walk
+ * daemon/reorg.c uses): +0 n, +8 mask, +16 blob, then MPOOL_SLOT_BYTES slots
+ * at +40 -- [+0 len][+8 txid[32]][+40 blob_off][+48 wtxid[32]], len==~0
+ * marking empty. */
 typedef struct { const unsigned char* txid; const unsigned char* tx; unsigned long len; } mp_ent;
 static long mp_slot(void* mp, unsigned long i, mp_ent* e){
     unsigned char* m = (unsigned char*)mp;
     unsigned long long mask; memcpy(&mask, m+8, 8);
     if (i > mask) return -1;
-    unsigned char* s = m + 40 + i*48;
+    unsigned char* s = MPOOL_SLOT_AT(m, i);
     unsigned long long len; memcpy(&len, s, 8);
-    if (len == 0xFFFFFFFFFFFFFFFFULL) return 0;
+    if (len == MPOOL_SLOT_EMPTY) return 0;
     unsigned char* blob; memcpy(&blob, m+16, 8);
-    unsigned long long off; memcpy(&off, s+40, 8);
+    unsigned long long off; memcpy(&off, s+MPOOL_SLOT_OFF, 8);
     e->txid = s+8; e->tx = blob+off; e->len = (unsigned long)len;
     return 1;
 }
