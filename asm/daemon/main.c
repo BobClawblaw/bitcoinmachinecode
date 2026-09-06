@@ -7170,6 +7170,10 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern void rpc_chain_set_maxtipage(long);
       rpc_chain_set_gbt_policy(g_cfg.blockmaxweight, g_cfg.blockreservedweight, g_cfg.blockmintxfee_satkvb,
                                g_cfg.blockversion, g_cfg.printpriority);
+      { extern void rpc_chain_set_mine_on_demand(int);
+        /* Core: MineBlocksOnDemand() == consensus.fPowNoRetargeting -- so
+         * -blockversion is honoured on regtest and nowhere else. */
+        rpc_chain_set_mine_on_demand(g_chainp->pow_no_retargeting); }
       rpc_chain_set_maxtipage(g_cfg.maxtipage); }
     { extern void (*txr_on_accept)(const unsigned char*, const unsigned char*, unsigned long);
       txr_on_accept = g_cfg.walletnotify[0] ? txr_walletnotify_hook : 0; }

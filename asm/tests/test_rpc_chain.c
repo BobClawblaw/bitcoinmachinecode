@@ -390,6 +390,28 @@ static long pub_tip_one(void){ return 1; }
 static long pub_tip_untracked(void){ return -2; }
 
 int main(void){
+    /* ---- -blockversion is honoured ONLY where Core honours it (2026-09-06) --
+     * Core: node/miner.cpp:148 applies -blockversion under
+     * chainparams.MineBlocksOnDemand(), and kernel/chainparams.h:107 defines
+     * that as consensus.fPowNoRetargeting -- regtest, and nothing else. This
+     * node applied it on every chain, so a mainnet operator could change the
+     * version getblocktemplate hands out where Core would ignore them.
+     * Watched to fail first: with the gate removed, both "ignored" checks
+     * report the configured 5 instead of 0. */
+    { extern void rpc_chain_set_gbt_policy(long,long,long,int,int);
+      extern void rpc_chain_set_mine_on_demand(int);
+      extern int  rpc_chain_gbt_version_effective(void);
+      rpc_chain_set_gbt_policy(4000000, 8000, 1, 5 /* -blockversion=5 */, 0);
+      rpc_chain_set_mine_on_demand(0);
+      ck("-blockversion is IGNORED off a mine-on-demand chain (mainnet/testnet/signet)",
+         rpc_chain_gbt_version_effective() == 0);
+      rpc_chain_set_mine_on_demand(1);
+      ck("-blockversion is honoured on a mine-on-demand chain (regtest)",
+         rpc_chain_gbt_version_effective() == 5);
+      rpc_chain_set_gbt_policy(4000000, 8000, 1, 0 /* unset */, 0);
+      ck("unset -blockversion means the node decides, even on regtest",
+         rpc_chain_gbt_version_effective() == 0);
+      rpc_chain_set_mine_on_demand(0); }
     /* deterministic sig/pubkey bytes satisfying strict DER + compressed-prefix checks */
     SIG[0]=0x30; SIG[1]=0x44; SIG[2]=0x02; SIG[3]=0x20; for (int i = 0; i < 32; i++) SIG[4+i] = (unsigned char)(0x11 + i);
     SIG[36]=0x02; SIG[37]=0x20; for (int i = 0; i < 32; i++) SIG[38+i] = (unsigned char)(0x51 + i); SIG[70]=0x01;
