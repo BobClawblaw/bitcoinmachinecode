@@ -1178,6 +1178,7 @@ __attribute__((weak)) long serve_getaddr(int fd, int wants_v2){
  * hash32 is wire-order; block explorers/RPC display it byte-reversed, so
  * print that convention (short form: last 8 wire bytes = first 8 displayed). */
 void log_block_stored_inbound(const u8 hash32[32], long height, long bytes, const u8* block){
+    txann_note_block();                                   /* CC-3: eviction protects recent block senders */
     static const char hexd[]="0123456789abcdef";
     char hs[17];
     for(int k=0;k<8;k++){ u8 b=hash32[31-k]; hs[k*2]=hexd[b>>4]; hs[k*2+1]=hexd[b&0xf]; }

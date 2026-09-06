@@ -65,6 +65,14 @@ int main(void){
     txann_set_my_slot(-1); id(t,501); txann_push(t, 1000, 200);   /* the worker's own: already queued by tx_relay */
     drained_n = 0; txann_worker_drain(wcb);
     ok(drained_n == 1 && drained_ids[0] == 500, "the slot-7 (inbound) tx is handed to the outbound announcer; the worker's own is not duplicated");
+    printf("== CC-3: the evict flag ends the wait; accepts stamp the peer's last_tx_time ==\n");
+    txann_set_idle_secs(30); txann_set_my_slot(5); txann_child_init(5, 1);
+    st->peers[5].last_tx_time = 0; id(t,650); txann_push(t, 1000, 200);
+    ok(st->peers[5].last_tx_time > 0, "an accept from slot 5 stamps peers[5].last_tx_time");
+    st->peers[5].last_block_time = 0; txann_note_block(); ok(st->peers[5].last_block_time > 0, "a block from slot 5 stamps last_block_time");
+    st->peers[5].evict_requested = 1; t0 = ms(); r = txann_wait(sv[0], 0);
+    ok(r == 0 && ms()-t0 < 1500, "evict_requested: the wait returns 0 (the child exits) within a slice, not at the 30 s idle bound");
+    st->peers[5].evict_requested = 0; txann_set_my_slot(-1);
     printf("== relay not negotiated ==\n");
     txann_child_init(5, 0); id(t,600); txann_push(t, 1000, 200); cap_n = 0; n = txann_tick(9, ms()+1, 0);
     ok(n == 0 && cap_n == 0, "a peer that sent fRelay=0 gets nothing");
