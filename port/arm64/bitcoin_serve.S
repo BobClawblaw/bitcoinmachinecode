@@ -43,6 +43,10 @@
 	.extern log_block_stored_inbound
 	.extern tx_txid
 	.extern bip152_shortid
+	.extern node_relay_flag
+	.extern serve_reject_has          /* MEM-10: daemon/serve_rejects.c */
+	.extern serve_block_ctx_ok        /* NET-5: contextual header rules for a peer-pushed block (daemon/tx_accept.c) */
+	.extern strip_witness             /* MEM-24: the TX equivalent */
 	.extern block_tx_at
 	.extern block_txcount
 	.extern p2p_blocktxn_build
@@ -113,7 +117,11 @@ s_served:    .zero 8
 s_tip:       .zero 8
 s_from:      .zero 8
 s_htidx:     .zero 8
-s_txid:      .zero 32
+s_txid:      .zero 32                 /* inbound tx's computed BIP141 txid */
+s_gdbh:      .zero 32                 /* STO-10: hash of the block getdata is about to send */
+s_gdlen:     .zero 8                  /* STO-10: node_serve_block's length across the block_hash
+                                       * call (its OWN slot, not s_n: s_n is the getheaders/cfilter
+                                       * counter and aliasing it here would be a latent trap) */
 s_st:        .zero 8
 s_fd:        .zero 8
 s_lfd:       .zero 8
@@ -578,7 +586,14 @@ node_serve_loop:
 	ldr  x9, [x9]                     /* item ptr */
 	ldr  w10, [x9]                    /* type */
 	cmp  w10, #2                      /* MSG_BLOCK */
-	b.ne .LSV_inv_next
+	b.eq .LSV_inv_block
+	cmp  w10, #1                      /* MSG_TX  (2026-09-01: inbound peers' announcements are fetched
+	                                  *          when relay policy allows -- serve_inv_gate ran above) */
+	b.eq .LSV_inv_txann
+	cmp  w10, #5                      /* MSG_WTX (BIP339) */
+	b.eq .LSV_inv_txann
+	b    .LSV_inv_next
+.LSV_inv_block:
 	str  x9, [sp, #0]                 /* save item ptr across idx_get */
 	mov  x0, x22                      /* ht_idx */
 	add  x1, x9, #4                   /* hash */
@@ -605,6 +620,76 @@ node_serve_loop:
 	mov  x4, #37
 	bl   p2p_write
 	ldr  x9, [sp, #0]
+	b    .LSV_inv_next
+.LSV_inv_txann:
+	/* relay policy: we asked this peer for no relay (fRelay=0): ignore, do not fetch */
+	LOADADDR x10, node_relay_flag
+	ldrb w10, [x10]
+	cbz  w10, .LSV_inv_next
+	ldr  x9, [sp, #0]
+	/* no validation this connection: nothing to accept it into */
+	LOADADDR x10, tx_dv_ok
+	ldrb w10, [x10]
+	cmp  w10, #1
+	b.ne .LSV_inv_next
+	ldr  w13, [x9]                    /* type u32 */
+	cmp  w13, #1
+	b.ne .LSV_inv_txann_req           /* a wtxid cannot be looked up by txid: just ask */
+	/* already in the pool? mpool_get(mp_cur, hash, &s_fh) */
+	str  x9, [sp, #0]
+	LOADADDR x0, mp_cur
+	ldr  x0, [x0]
+	add  x1, x9, #4
+	LOADADDR x2, s_fh
+	bl   mpool_get
+	ldr  x9, [sp, #0]
+	cbnz x0, .LSV_inv_next            /* already have -> skip */
+	/* ---- MEM-10 (audit 2026-09-03): have we already REFUSED this? ----
+	 *
+	 * Everything above answers "do we have it"; nothing answered "did we
+	 * already decide no". So an inbound peer could announce the txid of a
+	 * valid-signature, policy-rejected transaction once per second and every
+	 * announcement was fetched and fully re-verified -- thousands of ECDSA and
+	 * Schnorr checks each, in this serve child, which also takes mp_lock for
+	 * the policy pass. Core's AlreadyHaveTx consults m_recent_rejects before
+	 * asking for anything.
+	 *
+	 * The filter holds FINAL verdicts only: a fee-only failure stays
+	 * re-announceable, because a CPFP child can overturn it. It is shared
+	 * across serve children, so one child's refusal spares all of them. */
+	str  x9, [sp, #0]
+	add  x0, x9, #4
+	bl   serve_reject_has
+	ldr  x9, [sp, #0]
+	cbnz x0, .LSV_inv_next            /* already refused: do not fetch it again */
+.LSV_inv_txann_req:
+	/* getdata: [1][type][hash]; MSG_TX is asked for as MSG_WITNESS_TX (0x40000001),
+	 * MSG_WTX echoed (the getdata carries the wtxid) */
+	LOADADDR x10, src_buf
+	mov  w11, #1
+	strb w11, [x10]
+	movz w11, #0x0001
+	movk w11, #0x4000, lsl #16        /* 0x40000001 */
+	str  w11, [x10, #1]
+	ldr  w13, [x9]                    /* type u32 */
+	cmp  w13, #5
+	b.eq 6f
+	b    7f
+6:	movz w11, #0x0005
+	str  w11, [x10, #1]
+7:	add  x0, x10, #5
+	add  x1, x9, #4
+	mov  x2, #32
+	bl   .Ls_memcpy_len
+	str  x9, [sp, #0]
+	mov  x0, x19
+	LOADADDR x1, cn_getdata
+	mov  x2, #7
+	LOADADDR x3, src_buf
+	mov  x4, #37
+	bl   p2p_write
+	ldr  x9, [sp, #0]
+	b    .LSV_inv_next
 .LSV_inv_next:
 	add  x9, x9, #36
 	LOADADDR x10, s_ptr
@@ -726,6 +811,39 @@ node_serve_loop:
 	ldr  x22, [x9]
 	b    .next
 .blk_chains:
+	/* ---- NET-5 (audit 2026-09-03): the CONTEXTUAL header rules ----------
+	 * Everything above this point is context-free (cons_verify: PoW against
+	 * the header's own nBits, parses, coinbase, merkle root) plus "it extends
+	 * our tip". Core also requires the nBits RETARGET SCHEDULE for this
+	 * height, the median-time-past floor, the 2-hour future ceiling and the
+	 * BIP34/66/65 version rules -- none of which were checked before the
+	 * block was written to the durable archive. Consensus was not at risk
+	 * (utxo_live.c re-checks the schedule at CONNECT), but the archive was: a
+	 * header Core rejects became our tip at a height it can never connect at,
+	 * and the node stalls behind it.
+	 *
+	 * Dropped, never scored -- same reasoning as the cons_verify result
+	 * above: our verifier is not the reference, so a false reject here must
+	 * not ban an honest peer.
+	 *
+	 * serve_block_ctx_ok(st, hdr80) -> 1 accept / 0 reject. Returns 1
+	 * unchanged when the daemon has not armed the rules, so the hermetic
+	 * serve suites and their synthetic chains are unaffected. */
+	LOADADDR x0, s_st
+	ldr  x0, [x0]
+	LOADADDR x1, pl_buf
+	bl   serve_block_ctx_ok
+	/* restore the loop's live registers from their stable statics, exactly as
+	 * the cons_verify and store_validates_prevhash calls above already do */
+	LOADADDR x9, s_fd
+	ldr  x19, [x9]
+	LOADADDR x9, s_lfd
+	ldr  x20, [x9]
+	LOADADDR x9, s_st
+	ldr  x21, [x9]
+	LOADADDR x9, s_htidx
+	ldr  x22, [x9]
+	cbz  w0, .next
 	/* idxscan_append_locked(st, hash, pl_buf, s_plen) */
 	mov  x0, x21
 	LOADADDR x1, sb_buf
@@ -876,14 +994,43 @@ node_serve_loop:
 	b.le .gd_miss
 	LOADADDR x10, s_blen_spill
 	str  x0, [x10]
-	/* choose/rotate nonce */
+	/* ---- NET-14 (audit 2026-09-03): a FRESH nonce per block ----
+	 * This was the constant 0x0123456789abcdef, drawn once and then cached in
+	 * s_cmpct_nonce for the life of the connection -- so every compact block
+	 * this node ever served used the same SipHash key. Core draws a fresh
+	 * nonce for every CBlockHeaderAndShortTxIDs precisely so an adversary
+	 * cannot precompute transactions whose 6-byte short ids collide: with a
+	 * predictable nonce they can be planted in receivers' mempools ahead of
+	 * time, forcing reconstruction to fail and every peer we serve to fall
+	 * back to a full block.
+	 *
+	 * getrandom(2) inline rather than a helper: bitcoin_net.o/bitcoin_serve.o
+	 * are linked into sixty-odd targets and this file goes out of its way not
+	 * to add link dependencies (see the v2 dispatch table). The syscall
+	 * clobbers nothing that is live here; the loop's stable statics and sp
+	 * slots are untouched.
+	 *
+	 * If getrandom is unavailable the fallback is CNTVCT_EL0 (the ARM generic
+	 * counter; the x86 fallback is rdtsc), which is at least not a compile-
+	 * time constant. `orr x0,x0,#1` keeps it nonzero: a zero nonce is what
+	 * the old code used as its "unset" sentinel and test_bip152_loop still
+	 * asserts the served nonce is nonzero. */
+	LOADADDR x0, s_cmpct_nonce
+	mov  x1, #8
+	mov  x2, #0
+	movz x8, #278                      /* SYS_getrandom (AArch64; x86_64 uses 318) */
+	svc  #0
+	cmp  x0, #8
+	b.eq .gc_nonce_rdy
+	mrs  x0, cntvct_el0                /* fallback: never a fixed constant */
+	orr  x0, x0, #1
+	LOADADDR x10, s_cmpct_nonce
+	str  x0, [x10]
+.gc_nonce_rdy:
 	LOADADDR x10, s_cmpct_nonce
 	ldr  x11, [x10]
 	cbnz x11, 7f
-	movz x11, #0x9abc
-	movk x11, #0xefde, lsl #16
-	movk x11, #0x4567, lsl #32
-	movk x11, #0x0123, lsl #48
+	mov  x11, #1                       /* never hand cmpctblock_build a zero nonce */
 	str  x11, [x10]
 7:	str  x9, [sp, #0]
 	LOADADDR x0, bt_buf
@@ -927,6 +1074,48 @@ node_serve_loop:
 	ldr  x9, [sp, #0]
 	cmp  x0, #0
 	b.le .gd_miss
+	/* ---- STO-10 (audit 2026-09-03): SERVE THE BLOCK THAT WAS ASKED FOR ---
+	 * ht_idx maps hash -> height and was built when this process started.
+	 * serve_idx_topup only ADDS heights >= g_htidx_next, so a child forked
+	 * before a reorg still maps the LOSING branch's hashes to fork+1..old_tip
+	 * and never learns the replacements. The lookup above then succeeds with a
+	 * stale height and node_serve_block happily returns whatever block now
+	 * occupies it -- the WRONG block for the requested hash. Core drops a
+	 * block it did not request and may score the peer for it.
+	 *
+	 * Hashing the block we are about to send and comparing it to the requested
+	 * hash makes that impossible, whatever the index believes. It is the
+	 * audit's second suggestion rather than its first (a generation counter in
+	 * shared status) because it is FAIL-CLOSED and self-contained: it needs no
+	 * cross-process protocol, and it also catches an index/archive
+	 * disagreement arising from anything other than a reorg. */
+	str  x9, [sp, #0]
+	LOADADDR x10, s_gdlen
+	str  x0, [x10]                     /* node_serve_block's length, across the call */
+	LOADADDR x0, s_gdbh
+	LOADADDR x1, sb_buf
+	bl   block_hash
+	ldr  x9, [sp, #0]
+	LOADADDR x10, s_gdlen
+	ldr  x0, [x10]
+	/* memcmp(s_gdbh, entry+4, 32) -- four qword compares, no call */
+	LOADADDR x10, s_gdbh
+	ldr  x11, [x10]
+	ldr  x12, [x9, #4]
+	cmp  x11, x12
+	b.ne .gd_miss
+	ldr  x11, [x10, #8]
+	ldr  x12, [x9, #12]
+	cmp  x11, x12
+	b.ne .gd_miss
+	ldr  x11, [x10, #16]
+	ldr  x12, [x9, #20]
+	cmp  x11, x12
+	b.ne .gd_miss
+	ldr  x11, [x10, #24]
+	ldr  x12, [x9, #28]
+	cmp  x11, x12
+	b.ne .gd_miss
 	mov  x4, x0                        /* block len */
 	str  x9, [sp, #0]
 	mov  x0, x19
@@ -951,6 +1140,31 @@ node_serve_loop:
 	ldr  x9, [sp, #0]
 	cbz  x0, .gd_miss
 	mov  x3, x0                        /* tx bytes ptr (mpool blob) */
+	/* ---- MEM-24 (audit 2026-09-03): serve the FORM that was requested ------
+	 * A bare MSG_TX (witness bit 0x40000000 CLEAR) asks for the non-witness
+	 * serialization; Core sends TX_NO_WITNESS for it. This arm served the
+	 * stored witness bytes whatever was asked, which a strict pre-segwit peer
+	 * cannot parse. The BLOCK arm below has always got this right -- see
+	 * .gd_block's identical witness-bit test -- so the two agree now.
+	 * A strip failure serves NOTHING (never the wrong form), as the block arm
+	 * also does. */
+	ldr  w10, [x9]                     /* the inv entry's type u32 */
+	tbnz w10, #30, .gdtx_have          /* witness requested: the stored form is right */
+	str  x9, [sp, #0]
+	mov  x0, x3                        /* tx */
+	LOADADDR x1, s_n
+	ldr  x1, [x1]                      /* txlen */
+	LOADADDR x2, bt_buf                /* out (free in this arm, as in .gd_block) */
+	movz x3, #0x0000
+	movk x3, #0x0080, lsl #16          /* 8<<20 */
+	bl   strip_witness
+	ldr  x9, [sp, #0]
+	cmp  x0, #0
+	b.le .gd_miss                      /* strip failed -> notfound */
+	LOADADDR x10, s_n
+	str  x0, [x10]                     /* stripped length */
+	LOADADDR x3, bt_buf
+.gdtx_have:
 	str  x9, [sp, #0]
 	mov  x0, x19
 	LOADADDR x1, cn_tx
