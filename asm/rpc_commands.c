@@ -3326,8 +3326,60 @@ static int fin_build(const psbt_kv* kv, int n, const unsigned char* spk, unsigne
     /* P2TR key path with PSBT_IN_TAP_KEY_SIG (a MuSig2 aggregate lands here): witness = [sig] */
     if (spklen == 34 && spk[0] == 0x51 && spk[1] == 0x20){
         const psbt_kv* ks = fin_find(kv, n, 0x13);
-        if (!ks || (ks->vl != 64 && ks->vl != 65)) return 0;
-        wit[0] = 0x01; wit[1] = (unsigned char)ks->vl; memcpy(wit + 2, ks->v, ks->vl); *witlen = 2 + ks->vl;
+        if (ks && (ks->vl == 64 || ks->vl == 65)){
+            wit[0] = 0x01; wit[1] = (unsigned char)ks->vl; memcpy(wit + 2, ks->v, ks->vl); *witlen = 2 + ks->vl;
+            return 1;
+        }
+        /* ---- P2TR SCRIPT path (BIP371), 2026-09-06 --------------------------
+         * PSBT_IN_TAP_SCRIPT_SIG  (0x14): key = 0x14 || xonly32 || leafhash32,
+         *                                 value = the 64- or 65-byte signature
+         * PSBT_IN_TAP_LEAF_SCRIPT (0x15): key = 0x15 || control block,
+         *                                 value = script || leaf_version
+         * The witness Core builds is exactly [sig, leaf script, control block]
+         * (verified against a regtest spend Core signed and finalized:
+         *  64-byte sig, 34-byte script, 65-byte control block, and
+         *  testmempoolaccept says allowed).
+         *
+         * We take the leaf whose hash the signature names, so a tree with
+         * several leaves finalizes on the one that was actually signed rather
+         * than on whichever entry happens to come first. Exactly one
+         * script-path signature is required: two would mean a multi-leaf
+         * policy this cannot assemble, and guessing there would produce an
+         * invalid witness rather than an honest refusal. */
+        /* A wallet that holds several leaf keys signs SEVERAL leaves: Core's own
+         * fixture carries two 0x14 signatures and two 0x15 leaves. Only ONE
+         * leaf is spent, so pick deterministically -- the CHEAPEST witness,
+         * i.e. the shortest control block (fewest merkle steps), and among
+         * equals the first in map order, which is PSBT's sorted key order and
+         * therefore the same on any implementation. */
+        const psbt_kv* sg = 0; const psbt_kv* leaf = 0; unsigned long best_ctrl = 0;
+        for (int a = 0; a < n; a++){
+            if (kv[a].k[0] != 0x14 || kv[a].kl != 1 + 32 + 32) continue;
+            if (kv[a].vl != 64 && kv[a].vl != 65) continue;
+            const unsigned char* want_leaf = kv[a].k + 1 + 32;
+            for (int q = 0; q < n; q++){
+                if (kv[q].kl < 1 + 33 || kv[q].k[0] != 0x15) continue;   /* control block is 33 + 32k */
+                if (kv[q].vl < 1) continue;
+                unsigned long sl2 = kv[q].vl - 1;                        /* value = script || leaf_ver */
+                unsigned char lh[32];
+                srw_tapleaf_hash(lh, kv[q].v[sl2], kv[q].v, sl2);
+                if (memcmp(lh, want_leaf, 32) != 0) continue;
+                unsigned long cl2 = kv[q].kl - 1;
+                if (cl2 < 33 || ((cl2 - 33) % 32) != 0) continue;        /* BIP341 control block shape */
+                if (!leaf || cl2 < best_ctrl){ sg = &kv[a]; leaf = &kv[q]; best_ctrl = cl2; }
+                break;
+            }
+        }
+        if (!sg || !leaf) return 0;                /* no signature with a matching leaf */
+        unsigned long clen = leaf->kl - 1;         /* the control block is the KEY tail */
+        unsigned long slen = leaf->vl - 1;         /* the script is the VALUE head */
+        if (clen < 33 || ((clen - 33) % 32) != 0) return 0;   /* BIP341 control block shape */
+        unsigned long o = 0;
+        wit[o++] = 0x03;                                    /* three witness items */
+        o += crt_varint(wit + o, (unsigned long long)sg->vl);   memcpy(wit + o, sg->v, sg->vl);       o += sg->vl;
+        o += crt_varint(wit + o, (unsigned long long)slen);     memcpy(wit + o, leaf->v, slen);       o += slen;
+        o += crt_varint(wit + o, (unsigned long long)clen);     memcpy(wit + o, leaf->k + 1, clen);   o += clen;
+        *witlen = o;
         return 1;
     }
     if (fin_count(kv, n, 0x02) != 1) return 0;        /* exactly one partial sig */
