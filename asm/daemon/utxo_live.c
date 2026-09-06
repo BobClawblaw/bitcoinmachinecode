@@ -3140,6 +3140,32 @@ long utxo_live_catchup(void* store_buf){ return catchup_run(store_buf, 0, 0); }
 long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole){
     return catchup_run(store_buf, max_ms, stop_at_hole);
 }
+
+/* ---- the body at height h must BE the block recorded at height h ----------
+ * The archive's index record is [hash32][file_no u32][pos u64][size u32] at
+ * height*48. The connect loop now runs INSIDE the download (2026-09-06), so
+ * it reads heights while 16 helper processes are appending to the same
+ * archive. If a read ever returns bytes that are not the block the record
+ * names -- for any reason, a racing writer included -- applying them inserts
+ * another block's coins under this height, and the next height is then
+ * refused with a FALSE bad-txns-BIP30 against a coin the node mis-filed
+ * itself. That is what a real sync hit at heights 48,585 and 74,765 with the
+ * pipelined downloader.
+ *
+ * So: hash what we read and compare it with the record. A mismatch is NOT a
+ * consensus failure -- it is a not-ready archive -- so it stops the pass like
+ * a hole and the next pass retries. One pread of a cached page per block. */
+static int g_arch_idx_fd = -1;
+static unsigned long long g_arch_mismatch = 0;
+unsigned long long utxo_live_archive_mismatches(void){ return g_arch_mismatch; }
+static int archive_hash_at(long h, unsigned char out[32]){
+    if (g_arch_idx_fd < 0){
+        g_arch_idx_fd = open("index.dat", O_RDONLY);
+        if (g_arch_idx_fd < 0) return 0;
+    }
+    ssize_t n = pread(g_arch_idx_fd, out, 32, (off_t)h * 48);
+    return n == 32 ? 1 : 0;
+}
 static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
     g_bip30_store = store_buf;   /* for BIP30's BIP34-ancestor test; see bip30_enforced */
     g_call_rejected = -1;        /* 3.3: per-call report, cleared before any early return */
@@ -3197,6 +3223,18 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
             g_last_stop_reason = UTXO_STOP_FAIL;
             break;
         }
+        /* the body must be the block the index names at this height */
+        { unsigned char want32[32], got32[32];
+          if (archive_hash_at(h, want32)){
+              block_hash(got32, blockbuf);
+              if (memcmp(want32, got32, 32) != 0){
+                  g_arch_mismatch++;
+                  fprintf(stderr, "[utxo_live] archive not ready at height %ld: the body is not the block the index records "
+                                  "-- stopping this pass, it retries (mismatch #%llu)\n", h, (unsigned long long)g_arch_mismatch);
+                  g_last_stop_reason = UTXO_STOP_HOLE;
+                  break;
+              }
+          } }
         if (!apply_block_at(blockbuf, (u64)len, h)) {
             /* 3.3: a VALIDATION failure rejects the block; see the reject
              * hook's comment above for what qualifies and what does not. */
