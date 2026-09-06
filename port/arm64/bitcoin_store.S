@@ -350,6 +350,55 @@ store_get_tip:
 	ret
 	.size store_get_tip, .-store_get_tip
 
+/* ==========================================================================
+ * ---- STO-5 (audit 2026-09-03): SINGLE-WRITER ONLY -------------------------
+ *
+ * This function seeks to the in-memory cur_file_pos (st+32) and takes NO
+ * flock. It is therefore safe ONLY where one process owns the archive: the
+ * batch tools (daemon/merge_only.c, daemon/paribd_asm.c), genesis injection
+ * into an empty store, and the tests.
+ *
+ * It is NOT safe for the live daemon, and it was being used there in two
+ * places -- an inbound serve child's opportunistic block fetch, and the
+ * miner's submitblock. Both have moved to idxscan_append_locked. The failure
+ * was not theoretical: cur_file_pos is refreshed only by store_reload,
+ * store_append and store_truncate_to, so a worker whose last reload predates a
+ * serve child's append still believes the tip is T, writes block T+1 at the
+ * offset the child already used, and -- if the submitted block is larger --
+ * runs its tail over the frame after it, leaving that height's index record
+ * pointing at rubbish. With no lock the two writes can also interleave
+ * byte-wise.
+ *
+ * Every live writer uses idxscan_append_locked, which makes "read the true
+ * tip, then write" one critical section under append.lock (st+40). Anything
+ * new in the daemon that appends a block must use that, not this.
+ *
+ * store_set_sync(int on) / store_get_sync(void) -- STO-11 durability switch.
+ * ========================================================================== */
+	.global store_set_sync
+	.type store_set_sync,%function
+store_set_sync:
+	cbz  w0,.Lss_off
+	mov  x9,#1
+	b    .Lss_set
+.Lss_off:
+	mov  x9,#0
+.Lss_set:
+	adrp x10,store_sync_enabled
+	add  x10,x10,:lo12:store_sync_enabled
+	str  x9,[x10]
+	ret
+	.size store_set_sync,.-store_set_sync
+
+	.global store_get_sync
+	.type store_get_sync,%function
+store_get_sync:
+	adrp x9,store_sync_enabled
+	add  x9,x9,:lo12:store_sync_enabled
+	ldr  x0,[x9]
+	ret
+	.size store_get_sync,.-store_get_sync
+
 /* ============================================================================
  * store_append(st, hash[32], raw, len) -> new height or -1 err
  * Writes frame [u32 len][u32 magic] + raw into the current blk file, appends a
@@ -443,6 +492,19 @@ store_append:
 	add  w9, w9, #8
 	add  w9, w9, w22
 	str  w9, [x19, #32]
+	/* ---- STO-11: the block bytes must be DURABLE before the index record
+	 * that points at them is written. Without this ordering a crash can leave
+	 * a record over zeros, which boot detects and never repairs. */
+	adrp x14,store_sync_enabled
+	add  x14,x14,:lo12:store_sync_enabled
+	ldr  x14,[x14]
+	cbz  x14,.Lap_nosync
+	mov  x8, #83              /* SYS_fdatasync -- 83 on AArch64 (x86_64 uses 75) */
+	ldr  x0, [x19, #0]        /* cur_blk_fd */
+	svc  #0
+	cmp  x0, #0
+	b.lt .Lap_err             /* a failed fdatasync is a failed append, not a warning */
+.Lap_nosync:
 	/* new height = idx_len / 48 */
 	ldr  x9, [x19, #16]
 	mov  x10, #48
@@ -624,6 +686,21 @@ store_append_shared_x:
     ldr  x9, [sp, #0]
     cmp  x0, x9
     b.ne .Sx_err
+    /* ---- STO-11: same ordering as store_append -- block bytes durable
+     * before the record that points at them. This path runs entirely under
+     * the append.lock flock, so the fdatasync is inside the lock and every
+     * worker's frame is durable before its record becomes visible to any of
+     * them. */
+    adrp x12,store_sync_enabled
+    add  x12,x12,:lo12:store_sync_enabled
+    ldr  x12,[x12]
+    cbz  x12,.Sx_nosync
+    mov  x8, #83              /* SYS_fdatasync -- 83 on AArch64 (x86_64 uses 75) */
+    ldr  x0, [x19, #0]        /* blk_fd */
+    svc  #0
+    cmp  x0, #0
+    b.lt .Sx_err
+.Sx_nosync:
     /* build index record [48] at sp+48: hash32 + file_no u32 + pos u64 + size u32 */
     add  x0, sp, #48
     mov  x1, x21
@@ -1076,6 +1153,34 @@ store_prune:
 	ldp  x19, x20, [sp], #16
 	ret
 	.size store_prune, .-store_prune
+
+	.section .data
+	.p2align 3
+/* ---------------------------------------------------------------------------
+ * STO-11 (audit 2026-09-03): archive durability.
+ *
+ * store_append writes the block frame to the BLOCK file and the 48-byte index
+ * record to INDEX.DAT -- two different files, with no ordering between them.
+ * On power loss the index record can reach disk while the block bytes do not,
+ * leaving a record pointing at zeros. archive_check detects that at boot
+ * ("bad frame magic" / hash mismatch) but only LOGS it; archive_trim_derived_
+ * tails only validates records above the chainwork count, and
+ * reorg_chainwork_sync happily adds zero work for an all-zero header, so the
+ * bad record is never cut. Catch-up then stops at that height every boot with
+ * no self-heal.
+ *
+ * The fix is an fdatasync of the block file BEFORE the index record is
+ * written, so a durable record always implies durable bytes. The reverse --
+ * block bytes on disk with no index record -- is already safe: the record is
+ * what makes a block visible, and re-appending simply overwrites the bytes.
+ *
+ * DEFAULT ON. store_set_sync(0) exists for bulk catch-up, where the caller
+ * has already accepted that an interrupted run is re-fetched: the cost is one
+ * fdatasync per block, negligible at tip rate (a block every ~10 minutes) and
+ * measurable during a multi-hundred-block-per-second replay. */
+	.global store_sync_enabled
+store_sync_enabled:
+	.quad 1
 
 	.section .rodata
 idxname:   .asciz "index.dat"
