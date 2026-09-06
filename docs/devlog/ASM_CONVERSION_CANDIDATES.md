@@ -11,6 +11,18 @@ rather than implying a number it does not have.
 touches the live verify or storage path is scoped now and landed later, not
 built into the running daemon on the strength of this document.
 
+**Status 2026-09-06.** Three assembly modules landed from a different list
+than this one — the levers `../audits/UTXO_INLINE_BUILD_PERF_SCOPE.md`
+measured on the UTXO path rather than the verify path: `num3072_mul` in
+`bitcoin_muhash.asm` gained BMI2/ADX and AVX-512 IFMA bodies (3.3x on the
+multiply), `bitcoin_utxo_lsm.asm` a radix sort for the flush (5.9x), and
+`bitcoin_mempool.asm` a cached wtxid per slot. The exclusion below for
+`crypto_chacha20.c` still stands for BIP324, but MuHash's own ChaCha20 in
+`bitcoin_muhash.asm` is now the larger half of an element (six scalar
+blocks per insert) and is the next target on that path — see
+`PERF_SCOPE.md` §15. Candidates 1-10 below are unchanged and still wait on
+the re-profile.
+
 ---
 
 ## The ordering constraint, stated first
