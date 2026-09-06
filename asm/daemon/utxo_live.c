@@ -3110,9 +3110,40 @@ static int ckpt_now(void){
     return 1;
 }
 
-long utxo_live_catchup(void* store_buf){
+/* ---- Step 1 of UTXO_INLINE_BUILD_PERF_SCOPE (2026-09-06): the bounded call.
+ * utxo_live_catchup_bounded(store_buf, max_ms, stop_at_hole) is the SAME
+ * per-block loop as utxo_live_catchup (one body, catchup_run, so the
+ * verify/apply/checkpoint/hook/shutdown sequence cannot drift between the
+ * two) with two differences the parallel downloader's monitor loop needs:
+ *   max_ms > 0     : return at the first block boundary at or past the
+ *                    budget (pending checkpoint landed, like any other exit);
+ *                    the caller runs it again on its next pass;
+ *   stop_at_hole   : a height store_read_at cannot serve (an all-zero index
+ *                    record -- the helpers fill heights out of order, so the
+ *                    contiguous prefix is what is connectable) is EXPECTED:
+ *                    stop quietly, no WARNING, no failure classification.
+ *                    The unbounded call keeps its behaviour: a hole is a
+ *                    short archive, logged and classed archive/recovery.
+ * The last call's exit is readable through utxo_live_last_stop_reason() so
+ * the monitor loop (and the tests) can tell "at the hole" from "out of
+ * budget" from "nothing to do". */
+#define UTXO_STOP_TIP       0   /* reached the stored tip (or nothing to do) */
+#define UTXO_STOP_HOLE      1   /* stop_at_hole: the next height is not on disk yet */
+#define UTXO_STOP_BUDGET    2   /* max_ms elapsed */
+#define UTXO_STOP_SHUTDOWN  3   /* the registered shutdown flag */
+#define UTXO_STOP_REJECT    4   /* 3.3: a block was rejected and invalidated */
+#define UTXO_STOP_FAIL      5   /* -1 return, a hole in the unbounded call, or a checkpoint persist failure */
+static int g_last_stop_reason = UTXO_STOP_TIP;
+long utxo_live_last_stop_reason(void){ return g_last_stop_reason; }
+static long catchup_run(void* store_buf, long max_ms, int stop_at_hole);
+long utxo_live_catchup(void* store_buf){ return catchup_run(store_buf, 0, 0); }
+long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole){
+    return catchup_run(store_buf, max_ms, stop_at_hole);
+}
+static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
     g_bip30_store = store_buf;   /* for BIP30's BIP34-ancestor test; see bip30_enforced */
     g_call_rejected = -1;        /* 3.3: per-call report, cleared before any early return */
+    g_last_stop_reason = UTXO_STOP_TIP;
     store_reload(store_buf);
     long tip = *(int*)((char*)store_buf + 24);
 
@@ -3126,14 +3157,18 @@ long utxo_live_catchup(void* store_buf){
         g_recovery_checked = 1;
         g_recovery_result = utxo_live_recover_partial_block(store_buf);
     }
-    if (g_recovery_result < 0) { g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = g_applied_height + 1; return -1; }
-    if (g_halted) return -1;          /* utxo_live_verify_after_recovery() found the set inconsistent */
+    if (g_recovery_result < 0) { g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = g_applied_height + 1; g_last_stop_reason = UTXO_STOP_FAIL; return -1; }
+    if (g_halted) { g_last_stop_reason = UTXO_STOP_FAIL; return -1; }   /* utxo_live_verify_after_recovery() found the set inconsistent */
     if (tip < 0 || tip <= g_applied_height) return 0;
     g_last_fail_kind = UTXO_FAIL_NONE;
 
     static u8 blockbuf[8<<20];
     long applied = 0;
-    time_t last_progress_log = 0;   /* 0 => the first block prints immediately (restart-visible) */
+    /* 0 => the first block prints immediately (restart-visible). A bounded
+     * call runs every few seconds for the whole download, so it carries the
+     * clock across calls: one progress line per ~30 s, not one per pass. */
+    static time_t s_bounded_last_log = 0;
+    time_t last_progress_log = max_ms > 0 ? s_bounded_last_log : 0;
     /* rate + ETA on the progress tick (2026-09-01): instantaneous rate over
      * the last tick interval, session-average rate since this call began
      * (the ETA uses the average -- flush pauses make the instantaneous
@@ -3150,8 +3185,16 @@ long utxo_live_catchup(void* store_buf){
         long len = store_read_at(store_buf, h, blockbuf, sizeof blockbuf);
         tm_lap(TM_READ, tm_r0);
         if (len < 81) {
+            if (stop_at_hole) {
+                /* the contiguous prefix ends here: the helpers have not
+                 * delivered height h yet. Not a failure -- the next pass
+                 * resumes at h once it lands. */
+                g_last_stop_reason = UTXO_STOP_HOLE;
+                break;
+            }
             fprintf(stderr, "[utxo_live] WARNING: hole/short block at height %ld (len=%ld) -- stopping catch-up short\n", h, len);
             g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = h;
+            g_last_stop_reason = UTXO_STOP_FAIL;
             break;
         }
         if (!apply_block_at(blockbuf, (u64)len, h)) {
@@ -3168,6 +3211,7 @@ long utxo_live_catchup(void* store_buf){
                                     "Retrying from the checkpoint; operator: check the store, then invalidateblock/reconsiderblock by hand\n",
                             h, hex, g_last_reject, gap, g_last_rejected_height);
                     tm_lap(TM_WALL, tm_call_t0); if (g_tm_on) g_tm_total_blocks += (u64)applied;
+                    g_last_stop_reason = UTXO_STOP_FAIL;
                     return -1;
                 }
                 fprintf(stderr, "[utxo_live] REJECT block at height %ld hash=%s: %s -- invalidating it (Core: BLOCK_FAILED_VALID); "
@@ -3176,6 +3220,7 @@ long utxo_live_catchup(void* store_buf){
                 long rr = g_reject_fn(store_buf, h, bh, g_last_reject);
                 if (rr == 1){
                     g_last_rejected_height = h; g_rejected_total++; g_call_rejected = h;
+                    g_last_stop_reason = UTXO_STOP_REJECT;
                     /* the archive was truncated to h-1 under us: `tip` is stale,
                      * this call is done -- what was applied before h stands */
                     store_reload(store_buf);
@@ -3184,11 +3229,13 @@ long utxo_live_catchup(void* store_buf){
                 fprintf(stderr, "[utxo_live] REJECT at height %ld: invalidation %s -- falling back to the retry path\n",
                         h, rr == 0 ? "refused (see the chain/reorg log)" : "FAILED PART WAY (see the reorg log)");
                 tm_lap(TM_WALL, tm_call_t0); if (g_tm_on) g_tm_total_blocks += (u64)applied;
+                g_last_stop_reason = UTXO_STOP_FAIL;
                 return -1;
             }
             fprintf(stderr, "[utxo_live] FATAL: apply_block failed at height %ld (%s) -- stopping catch-up\n",
                     h, utxo_live_fail_kind_name(g_last_fail_kind));
             tm_lap(TM_WALL, tm_call_t0); if (g_tm_on) g_tm_total_blocks += (u64)applied;
+            g_last_stop_reason = UTXO_STOP_FAIL;
             return -1;
         }
         /* Block h is now fully durable in the WAL but NOT yet checkpointed:
@@ -3244,6 +3291,7 @@ long utxo_live_catchup(void* store_buf){
              * a dead disk is a one-block ghost the guard rolls back. */
             fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld after block %ld -- stopping catch-up at this boundary (%ld block(s) applied this call)\n",
                     g_applied_height, h, applied);
+            g_last_stop_reason = UTXO_STOP_FAIL;
             break;
         }
         UTXO_LIVE_TEST_CRASH_HOOK(applied);
@@ -3271,6 +3319,17 @@ long utxo_live_catchup(void* store_buf){
         if (shutdown_requested()) {
             fprintf(stderr, "[utxo_live] shutdown requested -- stopping catch-up cleanly after height %ld (%ld block(s) applied this call, checkpoint persisted)\n",
                     h, applied);
+            g_last_stop_reason = UTXO_STOP_SHUTDOWN;
+            break;
+        }
+        /* The time budget, checked at the same boundary the shutdown flag
+         * is: block h applied, its checkpoint persisted or pending in the
+         * batch the loop exit lands. The check sits AFTER the block, never
+         * before it, so a bounded call always connects at least one block
+         * when one is connectable -- a budget below one block's cost still
+         * makes progress. */
+        if (max_ms > 0 && h < tip && mono_ms() - cu_t0 >= max_ms) {   /* h == tip: the loop ends as TIP */
+            g_last_stop_reason = UTXO_STOP_BUDGET;
             break;
         }
 
@@ -3330,11 +3389,14 @@ long utxo_live_catchup(void* store_buf){
      * would not be. */
     if (g_ckpt_since && !ckpt_now())          /* loop exit of any kind: land the pending batch */
         fprintf(stderr, "[utxo_live] WARNING: failed to persist the batched checkpoint at height %ld\n", g_applied_height);
+    if (max_ms > 0) s_bounded_last_log = last_progress_log;
     /* step-0 timing: the call's own breakdown, once. Two or more blocks so a
-     * steady-state one-block call (every ~10 min at the tip) stays one line. */
+     * steady-state one-block call (every ~10 min at the tip) stays one line.
+     * A bounded call prints none: it returns every few seconds for hours,
+     * and the 30 s progress heartbeat above already carries the breakdown. */
     { u64 tm_wall = tm_lap(TM_WALL, tm_call_t0) - tm_call_t0;
       if (g_tm_on) g_tm_total_blocks += (u64)applied;
-      if (applied >= 2) {
+      if (applied >= 2 && max_ms == 0) {
           u64 v[TM_N]; for (int k = 0; k < TM_N; k++) v[k] = g_tm_total[k] - tm_call0[k];
           char tmbuf[256]; tm_fmt(tmbuf, sizeof tmbuf, v, tm_wall, (u64)applied);
           fprintf(stderr, "[utxo_live] catchup timing: %ld block(s) %ld..%ld in %.1fs -- %s\n",

@@ -112,7 +112,15 @@ static node_status_t* g_node_status;  /* MAP_SHARED live status, NULL if mmap fa
 #define DL_BUDGET_SECS 60.0
 /* Blocks the archive may run ahead of the applied UTXO height before the
  * download worker stops syncing legs and applies instead. At the tip the
- * backlog is 0-2; a from-scratch or long-gap restart is tens of thousands. */
+ * backlog is 0-2; a from-scratch or long-gap restart is tens of thousands.
+ *
+ * RECOVERY PATH since step 1 of UTXO_INLINE_BUILD_PERF_SCOPE (2026-09-06):
+ * the parallel downloader now connects the UTXO set INSIDE its monitor loop
+ * (dl_catchup), so on the worker's own runs the backlog only grows past this
+ * line if connect is SLOWER than the download, or after a boot-time catch-up
+ * (which runs in the parent, before the UTXO engine exists) hands the worker
+ * a full archive. Both are exactly the cases this rule was written for:
+ * stop syncing legs, apply. It stays in place, unchanged. */
 #define DL_APPLY_FIRST_BACKLOG 500L
 /* STAGE B: minimum gap between fork probes across all outbound legs. A probe
  * is one extra getheaders round trip on an already-idle leg, so this only has
@@ -170,6 +178,9 @@ extern long store_init(void* st);
 extern long store_reload(void* st);
 extern int  utxo_live_init(const char* dir);           /* daemon/utxo_live.c */
 extern long utxo_live_catchup(void* store_buf);        /* daemon/utxo_live.c */
+extern long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole);   /* step 1: the interleaved connect */
+extern long utxo_live_last_stop_reason(void);           /* why the last catch-up call returned (UTXO_STOP_*) */
+extern long utxo_live_call_rejected_height(void);       /* 3.3: the height the last call rejected, or -1 */
 extern void utxo_live_set_shutdown_flag(const volatile sig_atomic_t* flag); /* daemon/utxo_live.c */
 extern long utxo_live_count(void);                      /* daemon/utxo_live.c */
 extern long utxo_live_recovery_applicable(void);         /* daemon/utxo_live.c: incident 2026-09-01 */
@@ -1450,8 +1461,22 @@ static const char* blk_src_lookup(long h){
  * known, is scored 100 for a consensus violation. The worker's next rotation
  * fetches headers from its peers and takes the heavier chain that avoids the
  * mark: the chain moves on, no restart, no operator. */
+static void dlc_stop_workers_for_reject(long h);   /* defined with dl_catchup below */
 static long dl_reject_block(void* st, long h, const unsigned char hash[32], const char* reason){
     extern long chain_invalidate_block(void*, long, const unsigned char[32]);
+    /* Step 1 (the interleaved connect, UTXO_INLINE_BUILD_PERF_SCOPE): when
+     * the parallel downloader's helpers are running, they are stopped FIRST.
+     * chain_invalidate_block truncates the archive to h-1 and rolls
+     * headers.dat back to h; helpers still writing would re-create the
+     * rejected chain above h in the truncated archive (every remaining chunk
+     * of theirs comes from the header chain that includes h), and the next
+     * connect pass would reject h again -- which the burst guard then refuses
+     * to invalidate. Stopping them is also what lets the chain move on:
+     * dl_catchup returns, the rotation's legs fetch headers and take the
+     * heavier chain that avoids the mark, and the far-behind trigger runs the
+     * parallel download again on THAT chain. A no-op when no helper is
+     * running (the rotation's own drain, the boot-time parent). */
+    dlc_stop_workers_for_reject(h);
     long r = chain_invalidate_block(st, h, hash);
     if(r != 1) return r;
     const char* src = blk_src_lookup(h);
@@ -4180,6 +4205,42 @@ static void dlc_scan_progress(long* out_tip, long* out_present){
     idxscan_progress(out_tip, out_present);
 }
 
+/* ---- Step 1 of docs/audits/UTXO_INLINE_BUILD_PERF_SCOPE.md (2026-09-06):
+ * the knobs of the interleaved connect, and the helper-stop used by both the
+ * shutdown path and a mid-download rejection. Plain statics rather than
+ * config: the budget/idle pair is a scheduling detail of one loop, and the
+ * tests (tests/test_dlc_interleave, which includes this TU) set them. */
+#define DLC_CONNECT_BUDGET_MS 8000L   /* one connect pass: the scope's ~8 s */
+#define DLC_IDLE_MS           2000L   /* nothing connectable: the scope's ~2 s */
+#define DLC_STATUS_MS        10000L   /* the peer-status table's cadence (was the loop's nanosleep) */
+#define DLC_CONNECT_RETRY_MS 30000L   /* after a connect FAILURE (not a hole): keep downloading, retry later */
+static int  g_dlc_interleave        = 1;                     /* test seam: 0 = the pre-step-1 loop */
+static long g_dlc_connect_budget_ms = DLC_CONNECT_BUDGET_MS;
+static long g_dlc_idle_ms           = DLC_IDLE_MS;
+static pid_t* g_dlc_kids = NULL;   /* dl_catchup's helper pids while it runs; NULL otherwise */
+static int    g_dlc_nw   = 0;
+static void dl_new_block_choke(void);   /* the 3.1 choke point, defined with the worker below */
+static long long dlc_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000LL; }
+/* Tell every live helper to stop, give it a moment, then kill and reap it.
+ * Workers inherit the flag-only SIGTERM handler, so SIGTERM is advisory and
+ * the SIGKILL a second later is what actually ends a helper blocked in a
+ * socket read. kids[w] is zeroed for every stopped helper. */
+static void dlc_stop_workers(pid_t* kids, int nw, const char* why){
+    int n = 0; for(int w=0;w<nw;w++) if(kids[w]) n++;
+    if(!n) return;
+    fprintf(stderr,"[dlc] %s -- stopping %d worker(s)\n", why, n);
+    for(int w=0;w<nw;w++) if(kids[w]) kill(kids[w], SIGTERM);
+    { struct timespec g={1,0}; nanosleep(&g,NULL); }
+    for(int w=0;w<nw;w++) if(kids[w]){ int stt; if(waitpid(kids[w],&stt,WNOHANG)==0){ kill(kids[w], SIGKILL); waitpid(kids[w],&stt,0); } kids[w]=0; }
+}
+/* The reject hook's half (see dl_reject_block): a no-op unless dl_catchup is
+ * running in this process right now. */
+static void dlc_stop_workers_for_reject(long h){
+    if(!g_dlc_kids || g_dlc_nw <= 0) return;
+    char why[96]; snprintf(why, sizeof why, "block %ld rejected mid-download", h);
+    dlc_stop_workers(g_dlc_kids, g_dlc_nw, why);
+}
+
 static long dl_catchup(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
     ab2_t* ab = addr_book();
@@ -4374,17 +4435,75 @@ static long dl_catchup(const char* dir, int min_workers){
     long nbanned=0;
     double cumulative_bytes=0.0;       /* running total network-received, across the whole call */
     double cumulative_write_bytes=0.0; /* running total actually written to disk, across the whole call */
+    /* ---- Step 1 of docs/audits/UTXO_INLINE_BUILD_PERF_SCOPE.md (2026-09-06):
+     * connect INSIDE the download loop. This loop used to nanosleep(10 s) and
+     * print for the whole download (19.5 h on the 2026-09-04 bench) while the
+     * 4.5 h of UTXO connect waited for it to return. Now each pass, when this
+     * process owns the UTXO set, connects the contiguous prefix the helpers
+     * have delivered -- utxo_live_catchup_bounded with a DLC_CONNECT_BUDGET_MS
+     * budget, stopping at the first hole -- and idles DLC_IDLE_MS only when
+     * nothing was connectable. Every block goes through the same loop body
+     * as the unbounded call (verify workers, LSM, checkpoint cadence, the
+     * apply hook that publishes the connected tip, the shutdown flag), and
+     * the new-block choke point fires after each pass, so announcements,
+     * ZMQ, the index tails and the mempool follow the CONNECTED tip during
+     * the download. The peer-status table, the dead-weight kills and the EMA
+     * keep their 10 s cadence (DLC_STATUS_MS) whatever a connect pass took,
+     * with every per-tick rate divided by the tick's REAL length.
+     *
+     * SINGLE WRITER, unchanged. The helpers write blocks and index records
+     * (store_append_shared under append.lock) and never touch the UTXO set;
+     * this process -- the download worker, the one and only utxo_lsm_put/del
+     * caller -- is what connects. The read side is a pread by height of a
+     * record a helper has already published under the lock, and the
+     * contiguous-prefix rule means no height is read while a helper is still
+     * writing it. The boot-time PARENT has no UTXO engine (utxo_live_init
+     * runs in the worker; g_utxo_live_on is 0 here), so a boot catch-up
+     * (bmc.bootcatchup=1) still connects afterwards through the worker's
+     * drain; the far-behind trigger's run in the worker interleaves.
+     * g_dlc_interleave is the test seam (test_dlc_interleave's control).
+     *
+     * A block REJECTED mid-download (3.3): the reject hook stops the helpers
+     * BEFORE chain_invalidate_block truncates the archive under them (see
+     * dl_reject_block), this loop reaps them and returns, the rotation's legs
+     * take the heavier chain that avoids the mark, and the far-behind trigger
+     * re-runs the parallel download on it if the node is still DL_PARALLEL_GAP
+     * behind. A connect FAILURE that is not a rejection (a store error, the
+     * halt) does NOT stop the download: connect backs off DLC_CONNECT_RETRY_MS
+     * and the rotation's recovery path owns the failure once the download is
+     * done, exactly as it did when connect only ran afterwards. */
+    int interleave = g_dlc_interleave && g_utxo_live_on;
+    g_dlc_kids = kids; g_dlc_nw = nw;
+    long conn_total = 0;                       /* blocks connected by this call's passes */
+    long long last_status_ms = dlc_now_ms(), connect_retry_ms = 0;
     int alive=nw;
     while(alive>0){
-        struct timespec ts={10,0}; nanosleep(&ts,NULL);
+        long done = 0;
+        if(interleave && dlc_now_ms() >= connect_retry_ms){
+            /* (store_reload is the bounded call's first act, so it sees the
+             * helpers' appends; a second one here would be redundant.) */
+            done = utxo_live_catchup_bounded(store_buf, g_dlc_connect_budget_ms, 1);
+            if(done > 0){ conn_total += done; dl_new_block_choke(); }
+            if(utxo_live_call_rejected_height() >= 0){
+                fprintf(stderr,"[dlc] block at height %ld REJECTED (%s) and invalidated mid-download -- helpers stopped, connected %ld; "
+                               "the rotation fetches the chain that avoids it\n",
+                        utxo_live_call_rejected_height(), utxo_live_last_reject(), utxo_live_applied_height());
+            } else if(done < 0){
+                fprintf(stderr,"[dlc] connect FAILED at height %ld (%s) -- the download continues; connect retries in %lds, "
+                               "the rotation's recovery path owns it after the download\n",
+                        utxo_live_applied_height()+1, utxo_live_fail_kind_name(utxo_live_last_fail_kind()), DLC_CONNECT_RETRY_MS/1000);
+                connect_retry_ms = dlc_now_ms() + DLC_CONNECT_RETRY_MS;
+            }
+        }
+        if(done <= 0){
+            long ms = interleave ? g_dlc_idle_ms : 10000L;   /* the pre-step-1 loop: sleep 10 s, print */
+            struct timespec ts={ms/1000,(ms%1000)*1000000L}; nanosleep(&ts,NULL);
+        }
         if(g_shutdown_requested){
             /* incident 2026-09-01: this loop ignored SIGTERM and the stop hung
              * until a SIGKILL. Workers inherit the flag-only handler, so they
              * are told, given a moment, then killed. */
-            fprintf(stderr,"[dlc] shutdown requested -- stopping %d worker(s)\n", alive);
-            for(int w=0;w<nw;w++) if(kids[w]) kill(kids[w], SIGTERM);
-            { struct timespec g={1,0}; nanosleep(&g,NULL); }
-            for(int w=0;w<nw;w++) if(kids[w]){ int stt; if(waitpid(kids[w],&stt,WNOHANG)==0){ kill(kids[w], SIGKILL); waitpid(kids[w],&stt,0); } kids[w]=0; }
+            dlc_stop_workers(kids, nw, "shutdown requested");
             alive=0; break;
         }
         alive=0;
@@ -4393,6 +4512,12 @@ static long dl_catchup(const char* dir, int min_workers){
             int stt; pid_t r=waitpid(kids[w],&stt,WNOHANG);
             if(r==0) alive++; else kids[w]=0;
         }
+        /* everything below is the 10 s status tick; a connect pass that
+         * returned early (a hole, or the idle sleep) does not add a tick */
+        long long now_ms = dlc_now_ms();
+        if(alive > 0 && now_ms - last_status_ms < DLC_STATUS_MS) continue;
+        double tick_s = (double)(now_ms - last_status_ms) / 1000.0; if(tick_s < 1.0) tick_s = 1.0;
+        last_status_ms = now_ms;
         {
             long cur_tip, present;
             dlc_scan_progress(&cur_tip, &present);
@@ -4400,13 +4525,24 @@ static long dl_catchup(const char* dir, int min_workers){
             double overall_pct = 100.0*(double)present/(double)(end_h+1);
             double span_pct = cur_tip>=0 ? 100.0*(double)present/(double)(cur_tip+1) : 0.0;
             char elapsed[32]; dlc_fmt_elapsed(elapsed,sizeof elapsed,(long)(time(NULL)-catchup_start));
-            fprintf(stderr,"[dlc] == elapsed %s | overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free) ==\n",
-                    elapsed, present, end_h+1, overall_pct, holes, cur_tip, span_pct);
+            /* applied = the connected tip; lag = blocks on disk in the
+             * contiguous prefix that connect has not reached yet (the only
+             * lag connect could close -- a hole is the download's, not ours) */
+            char connbuf[128];
+            if(g_utxo_live_on){
+                long applied = utxo_live_applied_height();
+                long fh = cur_tip>=0 ? dlc_first_hole(cur_tip) : -1;
+                long prefix = fh>=0 ? fh-1 : cur_tip;
+                long lag = prefix - applied; if(lag < 0) lag = 0;
+                snprintf(connbuf,sizeof connbuf," | applied=%ld lag=%ld%s", applied, lag, interleave ? "" : " (interleave off)");
+            } else snprintf(connbuf,sizeof connbuf," | connect deferred (no UTXO engine in this process)");
+            fprintf(stderr,"[dlc] == elapsed %s | overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free)%s ==\n",
+                    elapsed, present, end_h+1, overall_pct, holes, cur_tip, span_pct, connbuf);
         }
         fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
         double tick_total_bytes=0.0, tick_total_write_bytes=0.0;
         for(int w=0;w<nw;w++){
-            long b=stats[w].blocks; long blkrate=(b-prev_blocks[w])/10;
+            long b=stats[w].blocks; long blkrate=(long)((double)(b-prev_blocks[w])/tick_s);
             long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
             long wc=kids[w]!=0 ? dlc_proc_wbytes(opid[w]) : -1;
             char bw[16]="--"; double byte_rate=-1.0;
@@ -4414,7 +4550,7 @@ static long dl_catchup(const char* dir, int min_workers){
                 if(prev_rchar[w]>0){
                     double delta=(double)(rc-prev_rchar[w]);
                     tick_total_bytes+=delta;
-                    byte_rate=delta/10.0;
+                    byte_rate=delta/tick_s;
                     dlc_fmt_rate(bw,sizeof bw,byte_rate);
                     stats[w].last_bw_bps=byte_rate; /* worker reads this to report why it got dropped */
                     /* EMA speed for the peer this worker HOLDS (alpha 0.5,
@@ -4490,10 +4626,10 @@ static long dl_catchup(const char* dir, int min_workers){
             cumulative_write_bytes+=tick_total_write_bytes;
             char totbuf[16], aggbuf[16], cumbuf[16], wtotbuf[16], waggbuf[16], wcumbuf[16];
             dlc_fmt_bytes(totbuf,sizeof totbuf,tick_total_bytes);
-            dlc_fmt_rate(aggbuf,sizeof aggbuf,tick_total_bytes/10.0);
+            dlc_fmt_rate(aggbuf,sizeof aggbuf,tick_total_bytes/tick_s);
             dlc_fmt_bytes(cumbuf,sizeof cumbuf,cumulative_bytes);
             dlc_fmt_bytes(wtotbuf,sizeof wtotbuf,tick_total_write_bytes);
-            dlc_fmt_rate(waggbuf,sizeof waggbuf,tick_total_write_bytes/10.0);
+            dlc_fmt_rate(waggbuf,sizeof waggbuf,tick_total_write_bytes/tick_s);
             dlc_fmt_bytes(wcumbuf,sizeof wcumbuf,cumulative_write_bytes);
             /* two genuinely different numbers, shown separately rather than
              * conflated into one "aggregate": network-received (rchar) is
@@ -4516,6 +4652,18 @@ static long dl_catchup(const char* dir, int min_workers){
     fprintf(stderr,"[dlc] -- average since start: %s recv, %s write --\n",avgrbuf,avgwbuf);
         }
     }
+    g_dlc_kids = NULL; g_dlc_nw = 0;            /* the reject hook's stop is a no-op again */
+    /* One more pass now that every helper has exited: the blocks that landed
+     * between the last connect pass and the last reap (up to a chunk per
+     * helper) are connected here, budget-bounded like any pass, so the lag
+     * at the download gate is what one pass leaves, not a tick's worth of
+     * download. The rotation's drain still owns whatever remains. */
+    if(interleave && !g_shutdown_requested){
+        long done = utxo_live_catchup_bounded(store_buf, g_dlc_connect_budget_ms, 1);
+        if(done > 0){ conn_total += done; dl_new_block_choke(); }
+    }
+    if(interleave) fprintf(stderr,"[dlc] connected %ld block(s) during the download; connected tip %ld (the rotation drains the rest)\n",
+                           conn_total, utxo_live_applied_height());
     long total=*done_count;
     /* Remember who actually produced blocks. A peer that delivered is worth
      * trying first next boot; the address book alone only records that an IP
@@ -4886,6 +5034,141 @@ static int dl_should_parallel_fetch(long archive_tip, long best_peer_height,
     if(apply_backlog > DL_APPLY_FIRST_BACKLOG) return 0;
     if(last_run_s && now_s - last_run_s < DL_PARALLEL_REARM_S) return 0;
     return 1;
+}
+
+/* ---- the new-block choke point (3.1), as ONE function ---------------------
+ * Fires from two places now: the worker's rotation, once per pass, and the
+ * parallel downloader's monitor loop after every bounded connect (step 1 of
+ * UTXO_INLINE_BUILD_PERF_SCOPE, 2026-09-06) -- so a block connected while the
+ * helpers are still downloading is announced, published to ZMQ, folded into
+ * the index tails and reconciled against the mempool the moment it connects,
+ * not hours later when dl_catchup returns. The baseline (g_dl_last_seen_tip)
+ * is the worker's: set to the connected tip at the rotation top, rewound to
+ * the fork height by a reorg (STO-7), -1 in the boot-time parent, where the
+ * downloader runs before any UTXO engine exists and this is never called. */
+static int g_dl_last_seen_tip = -1;
+/* new-block choke point (3.1: watching the CONNECTED tip, not the
+ * store's). Everything the node says or does about a "new block"
+ * -- the log line, the outbound-leg announce, ZMQ hashblock/rawblock,
+ * the index tails, -blocknotify, the mempool's removeForBlock and
+ * its tip anchor -- fires here, once per block that utxo_live has
+ * connected. Before 3.1 this watched *(int*)(store+24) and every one
+ * of those consumers saw blocks this node had stored but never
+ * validated. Hash printed big-endian like Core logs it, so a line
+ * here greps against a Core debug.log. The tip can also go DOWN here
+ * (a reorg, a rejected block truncating the archive): nothing is
+ * announced for that, the baseline just follows. */
+static void dl_new_block_choke(void){
+    int now_tip = (int)node_public_tip(store_buf);
+    if(g_dl_last_seen_tip >= 0 && now_tip > g_dl_last_seen_tip){
+        static unsigned char thb[8u<<20]; unsigned char th[32]; char hex[65];
+        if(store_read_at(store_buf, (unsigned long)now_tip, thb, (long)sizeof thb) >= 80){
+            block_hash(th, thb);
+            for(int b=0;b<32;b++) sprintf(hex+b*2, "%02x", th[31-b]);
+            fprintf(stderr,"[dl] new block: height=%d hash=%s (+%d)%s\n",
+                    now_tip, hex, now_tip-g_dl_last_seen_tip,
+                    now_tip < *(int*)(store_buf+24) ? " [connected; archive is ahead]" : "");
+        } else {
+            fprintf(stderr,"[dl] new block: height=%d (+%d)\n",
+                    now_tip, now_tip-g_dl_last_seen_tip);
+        }
+        /* announce the CONNECTED tip to every outbound leg (inv
+         * MSG_BLOCK; node_announce_tip reads the public tip itself).
+         * This replaces the per-leg announce that used to fire at
+         * store time in the leg sync. */
+        { int announced = 0, legs = 0;
+          for(int i2=0; i2<mux_n_out; i2++){
+              if(mux_out_fd[i2] < 0) continue;
+              legs++;
+              if(node_announce_tip(mux_out_fd[i2], store_buf, ht_idx, 0) == 1) announced++;
+          }
+          if(legs) fprintf(stderr,"[dl] announced tip height=%d to %d/%d legs\n", now_tip, announced, legs); }
+        /* ZMQ hashblock/rawblock + the txid-index tail, from this
+         * same choke point for the same reason the log line is: it
+         * fires no matter which path appended the block.
+         *
+         * EVERY new block is handled, not just the tip. A catch-up
+         * burst advances the tip by many blocks at once, and a
+         * subscriber that received only the last one would silently
+         * miss the rest -- Core notifies per connected block, so this
+         * must too. The loop is bounded by the burst size and reads
+         * each block ONCE from the archive it was just written to,
+         * feeding both consumers. */
+        if (zmqpub_active() || txit_active() || 1 /* bfi probes cheaply */){
+            static unsigned char zb[RPC_BLKSUBMIT_MAX];
+            for (int zh = g_dl_last_seen_tip + 1; zh <= now_tip; zh++){
+                long bl = store_read_at(store_buf, (unsigned long)zh, zb, (long)sizeof zb);
+                if (bl <= 0){
+                    fprintf(stderr,"[zmq] block %d unreadable; not published\n", zh);
+                    continue;
+                }
+                /* txindex tail: append this block's txid records so
+                 * getrawtransaction-by-txid keeps up with the tip
+                 * (idempotent by height -- a replayed height is a
+                 * no-op) */
+                txit_on_block(store_buf, zh, zb, bl);
+                tsp_on_block(store_buf, zh, zb, bl);
+                /* filter index tail: adopt/append (cheap probe when
+                 * the backfill has not closed in yet) */
+                if (g_cfg.blockfilterindex)
+                    bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
+                /* address index (extension): ADDs from the block,
+                 * DELs/TOUCHes from its undo records */
+                axt_on_block(store_buf, zh, zb, bl);
+                /* -blocknotify: after the indexes have taken the
+                 * block, so a hook that queries us sees it. */
+                if (g_cfg.blocknotify[0]){
+                    unsigned char bh[32]; char hx[65];
+                    block_hash(bh, zb);
+                    for (int _i = 0; _i < 32; _i++)
+                        snprintf(hx + _i*2, 3, "%02x", bh[31-_i]);  /* display order */
+                    notify_run(g_cfg.blocknotify, hx, "blocknotify");
+                }
+                /* -walletnotify: one run per transaction in this block
+                 * that spends or pays this wallet (Core fires it on
+                 * confirmation as well as on mempool arrival) */
+                if (g_cfg.walletnotify[0] && g_rpc_wallet.seed) walletnotify_block(zb, (long)bl);
+                /* mempool reconciliation (Core removeForBlock):
+                 * confirmed txs leave pool+policy graph, txs
+                 * CONFLICTING with this block's spends leave with
+                 * their descendants, and the rolling minfee floor
+                 * may decay again. Before this call nothing removed
+                 * mined txs at all -- they lingered until
+                 * -mempoolexpiry (LOG.md 2026-08-27 survey #1).
+                 * This SUBSUMES mining-polish's plain mined-tx
+                 * mpool_del callback (it also cleans the policy
+                 * graph and counts conflicts) -- that callback path
+                 * was removed at the 2026-08-27 policy-parity merge. */
+                { extern long tx_accept_block_connect_h(void*, const unsigned char*, unsigned long, long);
+                  extern void tx_accept_set_tip_time(long, long);
+                  extern void* mp_ext_area;
+                  /* fee estimation's "chainstate is current": this block's time */
+                  { unsigned int bt; memcpy(&bt, zb + 68, 4); tx_accept_set_tip_time((long)bt, -1); }
+                  if (txsub_worker_ready() && mp_ext_area){
+                      long mr = tx_accept_block_connect_h(mp_ext_area, zb, (unsigned long)bl, (long)zh);
+                      if (mr > 0)
+                          fprintf(stderr,"[mempool] block %d: removed %ld pool tx (confirmed/conflicted)\n", zh, mr);
+                  } }
+                if (!zmqpub_active()) continue;
+                /* The block HASH is sha256d over the 80-byte
+                 * header, REVERSED: Core's notifier flips the bytes
+                 * (data[31-i] = hash.begin()[i]) so the hashblock
+                 * topic carries the DISPLAY-order hash getblockhash
+                 * prints. Verified against real archived blocks by
+                 * tests/zmq_realblock_check. */
+                unsigned char bh[32], bhr[32];
+                sha256d(bh, zb, 80);
+                for (int zi = 0; zi < 32; zi++) bhr[zi] = bh[31 - zi];
+                zmqpub_notify("hashblock", bhr, 32);
+                zmqpub_notify("rawblock", zb, (unsigned long)bl);
+            }
+        }
+    }
+    /* keep mempool admission's maturity/flag anchor on the tip --
+     * unconditionally, not only when a publisher is active */
+    { extern void tx_accept_set_tip(long); tx_accept_set_tip(now_tip); }
+    mempool_refresh_seqlocks(store_buf, now_tip);   /* MEM-1 */
+    g_dl_last_seen_tip = now_tip;
 }
 
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
@@ -5438,7 +5721,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     long long boot_ms = 0;
     { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); boot_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
     long long next_heartbeat_ms = boot_ms + DL_HEARTBEAT_MS;
-    int last_seen_tip = (int)node_public_tip(store_buf);   /* new-block choke-point baseline: the CONNECTED tip at boot (3.1), so the catch-up burst is published too */
+    g_dl_last_seen_tip = (int)node_public_tip(store_buf);   /* new-block choke-point baseline: the CONNECTED tip at boot (3.1), so the catch-up burst is published too */
     int last_seen_stored = *(int*)(store_buf+24);          /* archive high-water mark: keys the header mirror top-up only */
     /* STAGE B: next allowed fork probe (see the probe block in the rotation
      * below). Starts armed so a node booting onto a store that is already on
@@ -6203,10 +6486,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                      * the pool never sees the connects that should evict the
                      * transactions the new branch just confirmed. */
                     { long fh = reorg_last_fork_height();
-                      if(fh >= 0 && fh < (long)last_seen_tip){
+                      if(fh >= 0 && fh < (long)g_dl_last_seen_tip){
                           fprintf(stderr,"[dl] reorg to fork height %ld: replaying the new-block choke point from %ld (was %d)\n",
-                                  fh, fh + 1, last_seen_tip);
-                          last_seen_tip = (int)fh;
+                                  fh, fh + 1, g_dl_last_seen_tip);
+                          g_dl_last_seen_tip = (int)fh;
                       } }
                 } else if(pr < 0){
                     fprintf(stderr,"[reorg] probe of %s rejected a candidate chain (no action taken)\n", mux_out_host[i]);
@@ -6387,129 +6670,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 last_seen_stored = now_stored;
             }
         }
-        /* new-block choke point (3.1: watching the CONNECTED tip, not the
-         * store's). Everything the node says or does about a "new block"
-         * -- the log line, the outbound-leg announce, ZMQ hashblock/rawblock,
-         * the index tails, -blocknotify, the mempool's removeForBlock and
-         * its tip anchor -- fires here, once per block that utxo_live has
-         * connected. Before 3.1 this watched *(int*)(store+24) and every one
-         * of those consumers saw blocks this node had stored but never
-         * validated. Hash printed big-endian like Core logs it, so a line
-         * here greps against a Core debug.log. The tip can also go DOWN here
-         * (a reorg, a rejected block truncating the archive): nothing is
-         * announced for that, the baseline just follows. */
-        {
-            int now_tip = (int)node_public_tip(store_buf);
-            if(last_seen_tip >= 0 && now_tip > last_seen_tip){
-                static unsigned char thb[8u<<20]; unsigned char th[32]; char hex[65];
-                if(store_read_at(store_buf, (unsigned long)now_tip, thb, (long)sizeof thb) >= 80){
-                    block_hash(th, thb);
-                    for(int b=0;b<32;b++) sprintf(hex+b*2, "%02x", th[31-b]);
-                    fprintf(stderr,"[dl] new block: height=%d hash=%s (+%d)%s\n",
-                            now_tip, hex, now_tip-last_seen_tip,
-                            now_tip < *(int*)(store_buf+24) ? " [connected; archive is ahead]" : "");
-                } else {
-                    fprintf(stderr,"[dl] new block: height=%d (+%d)\n",
-                            now_tip, now_tip-last_seen_tip);
-                }
-                /* announce the CONNECTED tip to every outbound leg (inv
-                 * MSG_BLOCK; node_announce_tip reads the public tip itself).
-                 * This replaces the per-leg announce that used to fire at
-                 * store time in the leg sync. */
-                { int announced = 0, legs = 0;
-                  for(int i2=0; i2<mux_n_out; i2++){
-                      if(mux_out_fd[i2] < 0) continue;
-                      legs++;
-                      if(node_announce_tip(mux_out_fd[i2], store_buf, ht_idx, 0) == 1) announced++;
-                  }
-                  if(legs) fprintf(stderr,"[dl] announced tip height=%d to %d/%d legs\n", now_tip, announced, legs); }
-                /* ZMQ hashblock/rawblock + the txid-index tail, from this
-                 * same choke point for the same reason the log line is: it
-                 * fires no matter which path appended the block.
-                 *
-                 * EVERY new block is handled, not just the tip. A catch-up
-                 * burst advances the tip by many blocks at once, and a
-                 * subscriber that received only the last one would silently
-                 * miss the rest -- Core notifies per connected block, so this
-                 * must too. The loop is bounded by the burst size and reads
-                 * each block ONCE from the archive it was just written to,
-                 * feeding both consumers. */
-                if (zmqpub_active() || txit_active() || 1 /* bfi probes cheaply */){
-                    static unsigned char zb[RPC_BLKSUBMIT_MAX];
-                    for (int zh = last_seen_tip + 1; zh <= now_tip; zh++){
-                        long bl = store_read_at(store_buf, (unsigned long)zh, zb, (long)sizeof zb);
-                        if (bl <= 0){
-                            fprintf(stderr,"[zmq] block %d unreadable; not published\n", zh);
-                            continue;
-                        }
-                        /* txindex tail: append this block's txid records so
-                         * getrawtransaction-by-txid keeps up with the tip
-                         * (idempotent by height -- a replayed height is a
-                         * no-op) */
-                        txit_on_block(store_buf, zh, zb, bl);
-                        tsp_on_block(store_buf, zh, zb, bl);
-                        /* filter index tail: adopt/append (cheap probe when
-                         * the backfill has not closed in yet) */
-                        if (g_cfg.blockfilterindex)
-                            bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
-                        /* address index (extension): ADDs from the block,
-                         * DELs/TOUCHes from its undo records */
-                        axt_on_block(store_buf, zh, zb, bl);
-                        /* -blocknotify: after the indexes have taken the
-                         * block, so a hook that queries us sees it. */
-                        if (g_cfg.blocknotify[0]){
-                            unsigned char bh[32]; char hx[65];
-                            block_hash(bh, zb);
-                            for (int _i = 0; _i < 32; _i++)
-                                snprintf(hx + _i*2, 3, "%02x", bh[31-_i]);  /* display order */
-                            notify_run(g_cfg.blocknotify, hx, "blocknotify");
-                        }
-                        /* -walletnotify: one run per transaction in this block
-                         * that spends or pays this wallet (Core fires it on
-                         * confirmation as well as on mempool arrival) */
-                        if (g_cfg.walletnotify[0] && g_rpc_wallet.seed) walletnotify_block(zb, (long)bl);
-                        /* mempool reconciliation (Core removeForBlock):
-                         * confirmed txs leave pool+policy graph, txs
-                         * CONFLICTING with this block's spends leave with
-                         * their descendants, and the rolling minfee floor
-                         * may decay again. Before this call nothing removed
-                         * mined txs at all -- they lingered until
-                         * -mempoolexpiry (LOG.md 2026-08-27 survey #1).
-                         * This SUBSUMES mining-polish's plain mined-tx
-                         * mpool_del callback (it also cleans the policy
-                         * graph and counts conflicts) -- that callback path
-                         * was removed at the 2026-08-27 policy-parity merge. */
-                        { extern long tx_accept_block_connect_h(void*, const unsigned char*, unsigned long, long);
-                          extern void tx_accept_set_tip_time(long, long);
-                          extern void* mp_ext_area;
-                          /* fee estimation's "chainstate is current": this block's time */
-                          { unsigned int bt; memcpy(&bt, zb + 68, 4); tx_accept_set_tip_time((long)bt, -1); }
-                          if (txsub_worker_ready() && mp_ext_area){
-                              long mr = tx_accept_block_connect_h(mp_ext_area, zb, (unsigned long)bl, (long)zh);
-                              if (mr > 0)
-                                  fprintf(stderr,"[mempool] block %d: removed %ld pool tx (confirmed/conflicted)\n", zh, mr);
-                          } }
-                        if (!zmqpub_active()) continue;
-                        /* The block HASH is sha256d over the 80-byte
-                         * header, REVERSED: Core's notifier flips the bytes
-                         * (data[31-i] = hash.begin()[i]) so the hashblock
-                         * topic carries the DISPLAY-order hash getblockhash
-                         * prints. Verified against real archived blocks by
-                         * tests/zmq_realblock_check. */
-                        unsigned char bh[32], bhr[32];
-                        sha256d(bh, zb, 80);
-                        for (int zi = 0; zi < 32; zi++) bhr[zi] = bh[31 - zi];
-                        zmqpub_notify("hashblock", bhr, 32);
-                        zmqpub_notify("rawblock", zb, (unsigned long)bl);
-                    }
-                }
-            }
-            /* keep mempool admission's maturity/flag anchor on the tip --
-             * unconditionally, not only when a publisher is active */
-            { extern void tx_accept_set_tip(long); tx_accept_set_tip(now_tip); }
-            mempool_refresh_seqlocks(store_buf, now_tip);   /* MEM-1 */
-            last_seen_tip = now_tip;
-        }
+        dl_new_block_choke();   /* the 3.1 choke point; shared with the parallel downloader (step 1) */
         /* Drain transactions staged by the serve children (and by this
          * worker's own sendrawtransaction path) and service subscriber
          * handshakes. Both are cheap no-ops when ZMQ is unconfigured. */
@@ -8563,6 +8724,16 @@ int main(int argc, char** argv){
          * instantly (pure disk reads, no network) so it's safe to run on
          * every boot. */
         g_catchup_workers = catchup_workers;   /* the running worker re-uses it */
+        /* Step 1 of UTXO_INLINE_BUILD_PERF_SCOPE: dl_catchup connects the UTXO
+         * set while it downloads -- but only in the download WORKER, the one
+         * process that owns the set (utxo_live_init runs there, below). This
+         * boot-time call runs in the parent before that engine exists, so its
+         * blocks are connected afterwards, by the worker's drain. Say so: an
+         * operator who wants the interleaved path on a fresh node sets
+         * bmc.bootcatchup=0 and lets the worker's far-behind trigger run it. */
+        if(g_cfg.boot_catchup)
+            fprintf(stderr,"[boot] boot catch-up runs BEFORE the UTXO engine starts: its blocks are connected by the worker afterwards "
+                           "(bmc.bootcatchup=0 leaves the download to the worker, which connects while it downloads)\n");
         long caught = g_cfg.boot_catchup ? dl_catchup(dir, catchup_workers) : 0;
         if(!g_cfg.boot_catchup) fprintf(stderr,"[boot] bmc.bootcatchup=0 -- skipping the boot catch-up; the worker's far-behind trigger will run it if needed\n");
         fprintf(stderr,"[boot] catch-up check done: %ld block(s) written (%.2fs)\n",
