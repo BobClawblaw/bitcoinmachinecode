@@ -229,8 +229,40 @@ mpool_get:
     add  x23,x23,#1
     b    .mg_probe
 .mg_hit:
+    /* ---- MEM-21 (audit 2026-09-03): the len/blob_off pair must be COHERENT ----
+     * This returned blob+blob_off with the slot's len and validated neither.
+     * The mempool is MAP_SHARED and the verification path in daemon/tx_accept.c
+     * reads it WITHOUT mp_lock (txacc_resolve_verify, before the lock is
+     * taken), so a concurrent mpool_del or mpool_compact in another process
+     * can be mid-move when this reader matches.
+     *
+     * mpool_del's backward shift copies a whole 48-byte record with one
+     * memcpy, and the txid sits at +8..39 while blob_off sits at +40 -- so
+     * there is a window where the txid bytes of the NEW occupant have landed
+     * but its blob_off has not. The reader then pairs the new `len` with the
+     * STALE `blob_off` of the slot being emptied. Each field is individually
+     * < cap; their SUM is not, which is why "both fields are < cap" is not
+     * the safety argument it looks like. The read then runs off the end of
+     * the blob mapping -- a SIGSEGV in a forked serve child parsing
+     * untrusted P2P input, not merely a wrong verdict.
+     *
+     * mpool_put is NOT implicated: it writes len, then blob_off, then the
+     * txid LAST, so a txid match implies both fields are published. del and
+     * compact are the whole problem.
+     *
+     * Refusing an incoherent pair as a MISS is the right answer at every
+     * call site: a miss falls back to the confirmed set or re-requests, which
+     * is what happens for a transaction evicted a microsecond earlier anyway.
+     * Taking mp_lock here instead would hold a node-wide, process-shared lock
+     * across full script verification -- strictly worse than the defect. */
     ldr  x9,[x11]             /* len */
-    str  x9,[x21]
+    ldr  x10,[x11,#40]        /* blob_off */
+    adds x10,x10,x9           /* blob_off + len (neither is attacker-huge alone) */
+    b.hs .mg_miss             /* wrapped: incoherent, treat as absent */
+    ldr  x12,[x19,#24]        /* blob_cap */
+    cmp  x10,x12
+    b.hi .mg_miss             /* would read past the blob mapping */
+    str  x9,[x21]             /* len -> *out_len (coherent only) */
     ldr  x9,[x11,#40]         /* blob_off */
     ldr  x10,[x19,#16]        /* blob */
     add  x0,x9,x10
