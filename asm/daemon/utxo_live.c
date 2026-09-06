@@ -1210,15 +1210,15 @@ void utxo_live_set_pow_rules(int no_retarget, int allow_min_diff,
     g_powr_bip94 = enforce_bip94; g_powr_lim = pow_limit_bits;
     g_powr_enabled = 1;
 }
-/* (old daemon-height getter removed 2026-08-28: superseded by
- * powr_hdr_from_store_consensus below, which runs the retarget schedule on
- * consensus heights -- see its comment for the -1 store-height shift.) */
-
-/* Plain daemon-height getter (main's val_mtp / MTP window reader): record r
- * holds real block r+1 under the same +1 genesis bias, but MTP over the last
- * 11 headers is height-symmetric, so no -1 translation is needed here. Kept
- * separate from the consensus-height variant below, which shifts by one for
- * the retarget schedule. */
+/* Plain daemon-height getter (main's val_mtp / MTP window reader, and since
+ * 2026-09-06 the retarget schedule's reader too): the archive's record r
+ * holds real block r -- IDENTITY heights, hash-proven against a synced Core
+ * at 965662/965663. (The "+1 genesis bias" this comment used to describe was
+ * a regtest-harness artifact: synthetic fixture chains were self-consistently
+ * biased, mainnet's store never was. The 2026-08-28 consensus-height variant
+ * this comment once pointed at encoded that bias and failed bad-diffbits at
+ * the first real boundary it met, 965664 -- reverted same day.) MTP over the
+ * last 11 headers is height-symmetric, so no translation is needed here. */
 static int powr_hdr_from_store(void* ctx, long h, u8 hdr[80]){
     u64 meta[3];
     if (!ctx || store_get_at(ctx, (u64)h, meta) != 1) return 0;
@@ -1226,35 +1226,6 @@ static int powr_hdr_from_store(void* ctx, long h, u8 hdr[80]){
     if (fd < 0) return 0;
     /* +8 skips the [len][magic] frame header -- store_read_meta's own
      * pread does exactly this (bitcoin_store_fast.asm) */
-    return pread(fd, hdr, 80, (off_t)meta[0] + 8) == 80 ? 1 : 0;
-}
-
-/* Consensus-height GETTER for the difficulty schedule. pow_expected_bits /
- * pow_check_bits (bitcoin_pow_rules.c, shared, x86-correct) address ancestors
- * by CONSENSUS height. Our archive store is daemon-height-indexed: record r
- * holds real block r+1 (the headers.dat +1 genesis bias propagated into the
- * block store), so daemon heights are -1 from consensus. Running the scheduled
- * check on daemon heights misaligns the 2016-block retarget gate by one --
- * which is invisible while difficulty is frozen at its minimum (every early
- * retarget up to the first difficulty change), then rejects the FIRST real
- * retarget block (daemon 32255 = real 32256) with bad-diffbits because it
- * expects the previous epoch's bits. Fix: feed pow_check_bits consensus
- * heights (apply_height+1) and translate here: real block R lives at daemon
- * record R-1. Real block 0 (genesis) has no record -- only the very first
- * retarget (real 2016's window) ever asks for it, so synthesize the mainnet
- * genesis header (time 1231006505, bits 1d00ffff). */
-static int powr_hdr_from_store_consensus(void* ctx, long real_h, u8 hdr[80]){
-    if (real_h <= 0){
-        memset(hdr, 0, 80);
-        { u32 t = 1231006505u;       /* mainnet genesis time */
-          u32 b = 0x1d00ffffu;       /* mainnet genesis bits */
-          memcpy(hdr+68, &t, 4); memcpy(hdr+72, &b, 4); }
-        return 1;
-    }
-    u64 meta[3];
-    if (!ctx || store_get_at(ctx, (u64)(real_h - 1), meta) != 1) return 0;
-    int fd = store_rd_fd(ctx, (unsigned)meta[2]);
-    if (fd < 0) return 0;
     return pread(fd, hdr, 80, (off_t)meta[0] + 8) == 80 ? 1 : 0;
 }
 
@@ -1626,8 +1597,19 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * unreadable) also rejects: refusing to evaluate is safer than accepting
      * unevaluated, and every legitimate path has its ancestors stored. */
     if (g_powr_enabled && g_apply_height >= 1){
-        int pr = pow_check_bits(g_apply_height + 1, blockbuf,   /* consensus height */
-                                powr_hdr_from_store_consensus, g_bip30_store,
+        /* IDENTITY HEIGHTS (2026-09-06): the archive's record r holds real
+         * block r -- proven by hash comparison against a synced Core at
+         * 965662/965663 -- so the check runs at g_apply_height with the plain
+         * getter, exactly upstream's form. The 2026-08-28
+         * powr_hdr_from_store_consensus +1 translation assumed a +1 genesis
+         * bias that mainnet's store does not have; it survived because no
+         * retarget boundary occurred in its lifetime (963648 was crossed
+         * pre-fix, and the 965018-hole era blocked everything after) and
+         * failed bad-diffbits at the first one it met, 965664 = 479x2016.
+         * The 32256 validation that motivated it ran on a synthetic chain
+         * whose store was self-consistently biased. */
+        int pr = pow_check_bits(g_apply_height, blockbuf,
+                                powr_hdr_from_store, g_bip30_store,
                                 g_powr_no_rt, g_powr_mindiff,
                                 g_powr_bip94, g_powr_lim);
         if (pr != 1){ g_last_reject = "bad-diffbits"; return 0; }
