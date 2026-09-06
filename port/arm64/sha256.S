@@ -100,19 +100,42 @@ sha256_init:
 	.global sha256_block
 	.type sha256_block, %function
 sha256_block:
+	/* shani_ready: 0 = not probed yet, 1 = SHA2 extension present, 2 =
+	 * absent (cached too: the old code cached only "present", re-probing
+	 * ID_AA64ISAR0 on every single call of an absent -- fully correct but
+	 * needlessly slow -- configuration).
+	 *
+	 * CRY-6 (audit 2026-09-03): sha256_force_path/sha256_current_path pin
+	 * and report this byte so the gate can run BOTH bodies over the same
+	 * vectors; on a SHA2-capable box the scalar body would otherwise never
+	 * execute under `make test` at all, and a regression in it would ship
+	 * undetected. sha256_nia.asm -- the x86 tree's second implementation --
+	 * is deleted as of CRY-6; this module is the only SHA-256 implementation
+	 * on ARM. The probe goes through the shared exported sha256_cpu_has_sha
+	 * below, so dispatcher and test can never disagree. */
 	adrp  x2, :got:shani_ready
 	ldr   x2, [x2, :got_lo12:shani_ready]
 	ldrb  w3, [x2]
 	cbnz  w3, .Lsh_probed
-	/* probe ID_AA64ISAR0_EL1.SHA2 (bits [15:12]) >= 1 */
-	mrs   x4, ID_AA64ISAR0_EL1
-	ubfx  w3, w4, #12, #4
+	/* probe ID_AA64ISAR0_EL1.SHA2 (bits [15:12]) >= 1 through the shared
+	 * exported probe. The probe answers in w0/x0 (and so clobbers the state
+	 * pointer living there), and the tail-call below still needs x30 -- so
+	 * the block arguments and the return address are saved across the call,
+	 * exactly what the x86's push rbx around CPUID is for. */
+	stp   x0, x1, [sp, #-16]!
+	str   x30, [sp, #-16]!
+	bl    sha256_cpu_has_sha
+	ldr   x30, [sp], #16
+	ldp   x0, x1, [sp], #16
+	mov   w5, #2                     /* default: absent (cached) */
+	cbz   w0, .Lsh_probe_done
 	mov   w5, #1
-	cmp   w3, #1
-	csel  w3, w5, wzr, ge
-	strb  w3, [x2]
+.Lsh_probe_done:
+	strb  w5, [x2]
+	mov   w3, w5
 .Lsh_probed:
-	cbz   w3, .Lsh_scalar
+	cmp   w3, #1
+	b.ne  .Lsh_scalar                /* 2 (or any other value) -> scalar */
 	b     sha256_block_shani         /* tail-call; x0/x1 already set */
 .Lsh_scalar:
 	stp x29, x30, [sp, #-16]!
@@ -261,6 +284,60 @@ sha256_block:
 	ldp x29, x30, [sp], #16
 	ret
 	.size sha256_block, .-sha256_block
+
+/* ============================================================================
+ * sha256_force_path(int p) -- CRY-6 (audit 2026-09-03): pin the dispatcher.
+ *   p = 0 -> re-probe on the next call (the normal, unprobed state)
+ *   p = 1 -> ARMv8 SHA-2 crypto extension
+ *   p = 2 -> scalar sha256_block
+ *
+ * WHY THIS EXISTS. shani_ready is set once, from ID_AA64ISAR0, and every hash
+ * in the tree then takes one path for the life of the process. On a machine
+ * WITH the SHA extensions -- which this box has -- the scalar body is
+ * therefore never executed by `make test` at all, so a regression in it would
+ * ship undetected. That is CRY-6's real point, and it cannot be closed by
+ * reading the code: it needs the gate to run both bodies over the same
+ * vectors.
+ *
+ * Test-only. Nothing in the daemon calls it, and the default (0/unprobed) is
+ * what every production start-up sees.
+ * ========================================================================== */
+	.global sha256_force_path
+	.type   sha256_force_path, %function
+sha256_force_path:
+	adrp  x2, :got:shani_ready
+	ldr   x2, [x2, :got_lo12:shani_ready]
+	strb  w0, [x2]
+	ret
+	.size sha256_force_path, .-sha256_force_path
+
+/* int sha256_current_path(void) -- report the pinned/probed dispatcher byte
+ * (0 unprobed / 1 SHA2 extension / 2 scalar), as the x86 export does. */
+	.global sha256_current_path
+	.type   sha256_current_path, %function
+sha256_current_path:
+	adrp  x2, :got:shani_ready
+	ldr   x2, [x2, :got_lo12:shani_ready]
+	ldrb  w0, [x2]
+	ret
+	.size sha256_current_path, .-sha256_current_path
+
+/* int sha256_cpu_has_sha() -> 1 if the ARMv8 SHA-2 crypto extension is
+ * present. Shared by the lazy dispatcher above and the CRY-6 gate test, so
+ * dispatcher and test can never disagree (the x86 comment says the same about
+ * its CPUID probe). Reads ID_AA64ISAR0_EL1 directly: unlike x86 CPUID the MRS
+ * is unconditionally legal on ARMv8, so no max-leaf guard is needed. A normal
+ * AAPCS64 leaf: answers in w0 and may clobber caller-saved registers -- the
+ * dispatcher saves x0/x1/x30 around the call. */
+	.global sha256_cpu_has_sha
+	.type   sha256_cpu_has_sha, %function
+sha256_cpu_has_sha:
+	mrs   x4, ID_AA64ISAR0_EL1
+	ubfx  w4, w4, #12, #4        /* SHA2 field */
+	cmp   w4, #1
+	cset  w0, ge                 /* 1 if >= 1 else 0 */
+	ret
+	.size sha256_cpu_has_sha, .-sha256_cpu_has_sha
 
 /* ============================================================================
  * void sha256_block_shani(u32 state[8], const u8 block[64])
