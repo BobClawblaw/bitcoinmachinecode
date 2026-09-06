@@ -31,6 +31,7 @@ SYS_lseek = 62
 SYS_openat= 56
 SYS_close = 57
 SYS_fsync = 82
+SYS_ftruncate = 46
 
 logname:
 	.asciz "utxo.dat"
@@ -858,6 +859,14 @@ utxo_store_reload:
 	ldr  x9,[x25,#0xa8]
 	cmp  x9,x23
 	b.hs .rl_rep_done
+	/* UTX-4: remember where THIS record starts. The torn-tail truncate in
+	 * .rl_rep_close has to cut back to the start of the record it could not
+	 * finish, not to the consumed offset -- a record whose 8-byte prefix
+	 * read cleanly and whose op byte is unrecognised has already advanced
+	 * the cursor past itself, so truncating there would keep the very
+	 * bytes that break every future replay. [x25,#0xb0] is otherwise
+	 * unused in this frame. */
+	str  x9,[x25,#0xb0]
 	mov  x0,x21
 	add  x1,x25,#0x60
 	mov  x2,#8
@@ -927,13 +936,39 @@ utxo_store_reload:
 	add  x22,x22,#1
 	b    .rl_rep_loop
 .rl_rep_close:
+	/* ---- UTX-4 (audit 2026-09-03), second half: TRUNCATE A TORN TAIL ----
+	 * Reached when the replay cannot go on: a short read of a record
+	 * prefix, a short read of a record body, or an unrecognised op byte.
+	 * All three mean the bytes from the record start to log_len are a
+	 * PARTIALLY WRITTEN record -- the tail of a write that power loss or a
+	 * kernel crash cut in half. log_len is set to the record start and the
+	 * file truncated there, so the next append lands exactly where the
+	 * good data ends (a truncate failure leaves log_len correct anyway).
+	 * The truncate goes through st->log_fd, the WRITABLE descriptor -- x21
+	 * is the O_RDONLY replay fd and ftruncate on it would fail with EBADF.
+	 * Only when there IS a torn tail: .rl_rep_done branches past this
+	 * block to .rl_rep_close_clean, because consuming the whole log is not
+	 * a truncation event and ftruncate to the same length would still bump
+	 * the inode's mtime for no reason. */
+	ldr  x9,[x25,#0xb0]    /* start of the record that failed */
+	ldr  x10,[x19,#16]     /* log_len */
+	cmp  x9,x10
+	b.hs .rl_rep_close_clean
+	str  x9,[x19,#16]      /* log_len = that offset: appends land here */
+	ldr  x0,[x19]          /* st->log_fd (writable) */
+	cmp  x0,#0
+	b.lt .rl_rep_close_clean
+	mov  x1,x9
+	mov  x8,#SYS_ftruncate
+	svc  #0
+.rl_rep_close_clean:
 	mov  x0,x21
 	mov  x8,#SYS_close
 	svc  #0
 	mov  x0,x22
 	b    .rl_done
 .rl_rep_done:
-	b    .rl_rep_close
+	b    .rl_rep_close_clean
 .rl_full:
 	mov  x0,#-2
 	b    .rl_done
