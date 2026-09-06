@@ -136,6 +136,7 @@ static int fp_version(int cfd){
     v[o++]=1;                                                                     /* relay */
     return p2p_write(cfd,"version",7,v,(unsigned)o) > 0;
 }
+static int g_reverse = 0;   /* answer each getdata backwards (see the getdata handler) */
 static int find_hash(const unsigned char* h){ for(int k=0;k<NB;k++) if(!memcmp(bh[k],h,32)) return k; return -1; }
 /* one connection: handshake, header pages, blocks with a per-block delay */
 static void fp_serve(int cfd, long delay_us){
@@ -166,8 +167,19 @@ static void fp_serve(int cfd, long delay_us){
             p2p_write(cfd,"headers",7,out,(unsigned)o);
         } else if(!strncmp(cmd,"getdata",7)){
             if(plen < 1) continue;
-            unsigned cnt = rb[0]; const unsigned char* p = rb+1;
-            for(unsigned k=0;k<cnt && (p+36) <= rb+plen;k++,p+=36){
+            unsigned cnt = rb[0];
+            /* REVERSE mode (2026-09-06): a peer is free to answer a getdata in
+             * ANY order, and the BIP152/BIP130 rules say nothing about it. The
+             * downloader stored blocks in arrival order, so an out-of-order
+             * answer put block h+1 on disk while h was missing -- and the
+             * connect loop, which walks heights upward through those writes,
+             * then refused a valid block with a false bad-txns-BIP30 (a real
+             * sync died at height 48,585). Every fixture peer here used to
+             * answer in request order, which is why no test saw it. */
+            for(unsigned j=0;j<cnt;j++){
+                unsigned k = g_reverse ? (cnt-1-j) : j;
+                const unsigned char* p = rb + 1 + (size_t)k*36;
+                if(p+36 > rb+plen) continue;
                 int f = find_hash(p+4);
                 if(delay_us) usleep((useconds_t)delay_us);
                 p2p_write(cfd,"block",5, f>=0?blocks[f]:(const unsigned char*)"", f>=0?(unsigned)blen[f]:0);
@@ -181,6 +193,7 @@ static void fp_serve(int cfd, long delay_us){
 /* a listener on one loopback address (its own process group, so the whole
  * fixture -- listener + per-connection children -- dies with one kill) */
 static pid_t start_peer(unsigned ip_host, unsigned short* port_out, long delay_us){
+    g_reverse = getenv("BMC_TEST_PEER_REVERSE") ? 1 : 0;
     int ls=socket(AF_INET,SOCK_STREAM,0); int one=1; setsockopt(ls,SOL_SOCKET,SO_REUSEADDR,&one,sizeof one);
     struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(ip_host); a.sin_port=0;
     if(bind(ls,(struct sockaddr*)&a,sizeof a)!=0){ perror("bind"); return -1; }
