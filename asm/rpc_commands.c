@@ -85,6 +85,29 @@ typedef long (*rpc_txo_query_fn)(const unsigned char txid_wire[32], unsigned int
                                  unsigned long spk_cap, unsigned long* spk_len);
 static rpc_txo_query_fn g_txo_query = NULL;
 void rpc_commands_set_txo_query(rpc_txo_query_fn fn) { g_txo_query = fn; }
+/* CC-10: invalidateblock / reconsiderblock reach the download worker over the
+ * same channel gettxout uses. op 1 = invalidate, 2 = reconsider. Returns
+ * 1 done (height in *height), 0 block not found, -1 error (text in err). */
+typedef long (*rpc_block_mark_fn)(const unsigned char hash_wire[32], int op, long* height, char* err, unsigned long errcap);
+static rpc_block_mark_fn g_block_mark = NULL;
+static int hex_to_bytes(unsigned char* out, const char* hex, size_t hexlen);   /* defined below */
+void rpc_commands_set_block_mark(rpc_block_mark_fn fn) { g_block_mark = fn; }
+static int cmd_block_mark(const rj_val* params, int op, long* ec, const char** em, rj_val** result) {
+    const char* hex = rpc_param_str(params, 0, ec, em);
+    if (!hex) return 0;
+    if (strlen(hex) != 64) { *ec = -8; *em = "Invalid parameter: blockhash must be 64 hex chars"; return 0; }
+    unsigned char disp[32], wire[32];
+    if (!hex_to_bytes(disp, hex, 64)) { *ec = -8; *em = "Invalid parameter: blockhash must be hexadecimal"; return 0; }
+    for (int i = 0; i < 32; i++) wire[i] = disp[31 - i];
+    if (!g_block_mark) { *ec = -1; *em = "invalidateblock unavailable: no download worker channel"; return 0; }
+    static char err[160]; long h = -1;
+    long r = g_block_mark(wire, op, &h, err, sizeof err);
+    if (r == 0) { *ec = -5; *em = "Block not found"; return 0; }
+    if (r < 0) { *ec = -1; *em = err; return 0; }
+    *result = rj_null(); return 1;
+}
+static int cmd_invalidateblock(const rj_val* params, long* ec, const char** em, rj_val** result) { return cmd_block_mark(params, 1, ec, em, result); }
+static int cmd_reconsiderblock(const rj_val* params, long* ec, const char** em, rj_val** result) { return cmd_block_mark(params, 2, ec, em, result); }
 
 /* ---- scriptPubKey(hash) -> UTXO reverse index (asm/daemon/build_addr_
  * index.c) backing listunspent/getbalance. Same "opaque handle, separate
@@ -4505,7 +4528,7 @@ int rpc_cmd_descriptorprocesspsbt(const rj_val* params, long* ec, const char** e
  * one list, no second copy to fall out of step. */
 static const char* const WALLET_METHODS[] = {
         "getnewaddress","getrawchangeaddress","validateaddress","getaddressinfo",
-        "gettxout","listunspent","getbalance","decoderawtransaction",
+        "gettxout","invalidateblock","reconsiderblock","listunspent","getbalance","decoderawtransaction",
         "signmessagewithprivkey","verifymessage","createrawtransaction","signrawtransactionwithkey","createpsbt","decodepsbt","converttopsbt","combinepsbt","joinpsbts","analyzepsbt",
         "listtransactions","gettransaction","getwalletinfo","getbalances",
         "signrawtransactionwithwallet","simulaterawtransaction",
@@ -4726,6 +4749,10 @@ int rpc_dispatch(const char* method, const rj_val* params,
         return cmd_validate(method, params, w, err_code, err_msg, result);
     if (!strcmp(method, "gettxout"))
         return cmd_gettxout_w(params, w, err_code, err_msg, result);
+    if (!strcmp(method, "invalidateblock"))
+        return cmd_invalidateblock(params, err_code, err_msg, result);
+    if (!strcmp(method, "reconsiderblock"))
+        return cmd_reconsiderblock(params, err_code, err_msg, result);
     if (!strcmp(method, "listunspent"))
         return cmd_listunspent(params, w, err_code, err_msg, result);
     if (!strcmp(method, "getbalance"))
