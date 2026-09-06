@@ -41,6 +41,7 @@
 #include "secure_zero.h"    /* WAL-3: a memset the optimiser may not delete */
 #include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
 #include "peer_timeout.h"      /* CC-7: -peertimeout, the handshake deadline */
+#include "txann.h"             /* CC-1: tx announcement to and from inbound peers */
 /* VAL-5 / MEM-1: the generated per-height script-flag mask
  * (bitcoin_script_flags.asm, from validation/gen_script_flags.py). */
 extern unsigned long long script_flags_for_block(unsigned long long height,
@@ -5911,6 +5912,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * from the pool */
         if(txsub_worker_ready()){
             extern long txrelay_announce(const int* fds, int nfds);
+            /* CC-1: transactions accepted by inbound serve children are on the
+             * shared ring; hand them to the outbound announcer so they reach
+             * the outbound legs too (the worker's own accepts are already
+             * queued by tx_relay.c and are skipped by the drain). */
+            { extern void txrelay_announce_own(const unsigned char txid[32]);
+              txann_worker_drain(txrelay_announce_own); }
             txrelay_announce(mux_out_fd, mux_n_out);
         }
         { extern long addrself_maybe_announce_nets(const int*, const unsigned char*, const unsigned char*, int);
@@ -7208,6 +7215,10 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                     int hok = node_accept_handshake(c);
                     if(hok==1) peer_inbound_deadline(c);      /* NET-3: handshake done -> the 20-minute idle bound */
                     if(hok==1) g_inbound_slot = inbound_slot_claim(peerdesc);
+                    /* CC-1: this child's accepts are tagged with its slot (so it never
+                     * announces a tx back to the peer that sent it) and it starts
+                     * announcing to the peer if the peer negotiated relay. */
+                    if(hok==1){ txann_set_my_slot(g_inbound_slot); txann_child_init(g_inbound_slot, node_relay_flag && g_peer_relays_txs); }
                     char pv[256]; pv[0]=0; if(hok==1) format_peer_version_info(pv, sizeof pv);
                     close(l6 >= 0 ? l6 : l);
                     fprintf(stderr,"[serve] inbound %s %s [%s] (pid %d) %s\n", peerdesc,
@@ -8240,6 +8251,7 @@ int main(int argc, char** argv){
          * pointer -- a child that staged into its own private copy would
          * publish nothing and report no error. */
         zmqn_set_status(g_node_status);
+        txann_set_status(g_node_status);          /* CC-1: the announce ring lives in the same block */
 
         /* gettxout IPC channel, created BEFORE the fork so both sides inherit
          * it: the RPC in this parent asks the worker, which owns the live
