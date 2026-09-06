@@ -55,6 +55,7 @@
 #include <fcntl.h>
 #include <sys/uio.h>
 #include <stdint.h>
+#include <time.h>
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -325,6 +326,20 @@ void undo_set_coin_observer(void (*fn)(const u8*, u32, u64, u64, u64,
                                        const u8*, unsigned long)){
     g_undo_coin_obs = fn;
 }
+/* Step-0 cost instrumentation (UTXO_INLINE_BUILD_PERF_SCOPE, 2026-09-06):
+ * nanoseconds spent inside the observer (the coinstats MuHash fold, ~1.7 us
+ * per coin) since process start. daemon/utxo_live.c reads the delta across
+ * each block's apply walk and books it as its `csi` phase. Two clock reads
+ * per observed spend; undo_set_coin_observer_timing(0) skips them and the
+ * counter stays put. Nothing behavioural reads it. */
+static int g_undo_obs_timing = 1;
+static u64 g_undo_obs_ns = 0;
+void undo_set_coin_observer_timing(int on){ g_undo_obs_timing = on; }
+unsigned long long undo_coin_observer_ns(void){ return g_undo_obs_ns; }
+static inline u64 undo_clock_ns(void){
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (u64)t.tv_sec * 1000000000ULL + (u64)t.tv_nsec;
+}
 
 long undo_capture_and_del(void* lst, void* u, long height,
                            const u8 txid[32], u32 index){
@@ -342,7 +357,10 @@ long undo_capture_and_del(void* lst, void* u, long height,
     unsigned long scn = slen <= sizeof scbuf ? slen : 0;
     if (scn && g_undo_coin_obs) memcpy(scbuf, script, scn);
     long d = utxo_lsm_del(lst, u, txid, index);
-    if (d == 1 && g_undo_coin_obs && scn == slen)
+    if (d == 1 && g_undo_coin_obs && scn == slen){
+        u64 t0 = g_undo_obs_timing ? undo_clock_ns() : 0;
         g_undo_coin_obs(txid, index, value, (u64)utxo_height, (u64)is_coinbase, scbuf, slen);
+        if (g_undo_obs_timing) g_undo_obs_ns += undo_clock_ns() - t0;
+    }
     return d;
 }
