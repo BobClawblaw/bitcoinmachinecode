@@ -46,6 +46,15 @@ typedef struct {
      * next_nodeid at slot claim by both the worker (outbound) and each
      * inbound child. */
     volatile long long        nodeid;
+    /* CC-3 (2026-09-06): what Core's AttemptToEvictConnection protects by.
+     * Appended so every existing offset is unchanged; nothing in asm indexes
+     * this table. min_ping_us stays 0 (unmeasured: this node does not ping
+     * inbound peers), so the lowest-ping round protects nobody until it is. */
+    volatile unsigned         net_group;      /* Core /16 grouping, 0 = unknown */
+    volatile long long        last_tx_time;   /* unix secs: last tx WE ACCEPTED from this peer */
+    volatile long long        last_block_time;/* unix secs: last novel block from this peer */
+    volatile long long        min_ping_us;    /* 0 = unmeasured */
+    volatile int              evict_requested;/* set by the accept path; the child exits on its next tick */
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so

@@ -44,8 +44,15 @@ void txann_set_idle_secs(long s){ g_idle_secs = s; }
 void txann_set_enabled(int on){ g_enabled = on; }
 unsigned long long txann_lapped(void){ return g_lapped; }
 
+/* CC-3: eviction protects the peers that recently gave us a tx or a block. */
+static void note_peer_time(volatile long long* field){
+    if (g_st && g_my_slot >= 0 && g_my_slot < RPC_MAX_PEERS) *field = (long long)time(NULL);
+}
+void txann_note_block(void){ if (g_st && g_my_slot >= 0 && g_my_slot < RPC_MAX_PEERS) note_peer_time(&g_st->peers[g_my_slot].last_block_time); }
+
 void txann_push(const unsigned char txid[32], unsigned long long fee, unsigned long vsize){
     node_status_t* st = g_st; if (!st) return;
+    if (g_my_slot >= 0 && g_my_slot < RPC_MAX_PEERS) note_peer_time(&st->peers[g_my_slot].last_tx_time);
     unsigned long long seq = __sync_fetch_and_add(&st->ann_seq, 1ULL);
     unsigned k = (unsigned)(seq % RPC_ANN_RING);
     st->ann_ring[k].ready = 0;
@@ -117,6 +124,9 @@ long txann_wait(int fd, unsigned long long peer_feefilter){
         long long now = now_ms();
         long long idle_deadline = c_last_msg + (long long)g_idle_secs * 1000;
         if (now >= idle_deadline) return 0;
+        /* CC-3: the accept path asked this connection to make room for a
+         * newcomer (Core AttemptToEvictConnection). Leave cleanly. */
+        if (c_slot >= 0 && c_slot < RPC_MAX_PEERS && g_st->peers[c_slot].evict_requested) return 0;
         txann_tick(fd, now, peer_feefilter);
         long long until = c_next_send > now ? c_next_send - now : 0;
         long long t = idle_deadline - now; if (until > 0 && until < t) t = until; if (t > 1000) t = 1000; if (t < 1) t = 1;
