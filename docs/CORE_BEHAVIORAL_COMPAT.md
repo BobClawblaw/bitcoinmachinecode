@@ -73,14 +73,14 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | BIP61 `reject` | removed in 0.20 | absent | **DONE** (parity by absence) |
 | BIP330 Erlay `sendtxrcncl` + reconciliation | negotiation + reconciliation (off by default) | negotiation only, wire-off | **DECIDED** (`FEATURE_GAPS.md` 2026-08-30 "deliberate stopping point") |
 | BIP331 package relay `sendpackages`/`pkgtxns`/`ancpkginfo` | wire negotiation + package fetch | acceptance is real; **wire protocol not built** | **PARTIAL** |
-| Misbehavior scoring + ban list | `Misbehaving()`, discouragement, `banlist.json` | scored for inv/getdata bounds, header rules, tx violations via `txr_report_violation`; shared file-backed ban list (`ctl_ban_add`) | **DONE** (verify: persistence across restart) |
+| Misbehavior scoring + ban list | `Misbehaving()`, discouragement, `banlist.json` persisted | scored for inv/getdata bounds, header rules, tx violations via `txr_report_violation`; shared in-memory ban list (`ctl_ban_add`), **not persisted across restart** (re-grep 2026-09-06: no banlist file) | **PARTIAL** |
 
 ## 4. P2P behavior — connections and relay
 
 | Behavior | Core | This node | Status |
 |---|---|---|---|
 | Outbound full-relay legs | 8 | configurable, default 8 (`MUX_WANT_OUT`) | **DONE** |
-| **Block-relay-only outbound** | 2 extra legs that never relay tx/addr; eclipse resistance | **absent** (0 hits) | **GAP** |
+| **Block-relay-only outbound** | 2 extra legs that never relay tx/addr; eclipse resistance | **absent** as legs; the count is plumbed (`bmc.blockrelayonly`, default 2, `MAX_BLOCK_RELAY_ONLY` ceiling) and only subtracted from the inbound budget | **GAP** |
 | **`anchors.dat`** | reconnect to last block-relay-only peers on restart | **absent** | **GAP** (pairs with the row above) |
 | Feeler connections | 1 short-lived every ~2 min, tests a book entry | same (`net_policy.c`) | **DONE** |
 | Extra outbound when tip is stale | +1 full-relay peer if no block in >30 min | same (`stale_tip.c`, CC-6, `c6598b5`) | **DONE** |
@@ -97,8 +97,8 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | Addrman test-before-evict | probe incumbent before replacing | absent | **DECIDED** (`NET-10_ADDRMAN_SCOPE.md` §5: no place for a connect inside a file-backed insert) |
 | DNS seeds, `-seednode`, `-addnode`, `-connect` | + compiled-in fixed seeds | DNS seeds (13, all chains), the three options; **no fixed-seed list** | **DONE** (fixed seeds: DECIDED, config table) |
 | Transaction announcement to **outbound** legs | inv with per-peer queue, feefilter honored, wtxid | same (`tx_relay.c`, `main.c:5647`) | **DONE** |
-| **Transaction announcement to inbound peers** | every peer that negotiated relay gets invs (Poisson-timed) | **absent**: the inbound serve loop pushes no tx invs — it answers `mempool` and `getdata` only, and `txrelay_poll_leg` runs on outbound legs only (`main.c:5789`) | **GAP** |
-| **Re-announcement of transactions received from inbound peers** | relayed onward to all other peers | not relayed past the outbound legs (`FEATURE_GAPS.md` "genuinely still open") | **GAP** (same fix as the row above) |
+| Transaction announcement to inbound peers | every peer that negotiated relay gets invs (Poisson-timed) | same: a shared announce ring drained by each serve child before its read, Poisson 5 s, feefilter-honouring, never back to the sender (`txann.c`, CC-1, `612159c`) | **DONE** |
+| Re-announcement of transactions received from inbound peers | relayed onward to all other peers | same: the worker drains the ring into the outbound announcer (CC-1) | **DONE** |
 | Own-transaction announcement (`sendrawtransaction`) | announced like any other tx, not pushed | same (2026-09-03) | **DONE** |
 | Private broadcast (`-privatebroadcast`) | v30 | same | **DONE** |
 | Block announcement to peers (BIP130 headers, inv fallback) | to every peer | inbound: `node_announce_tip`; outbound: inv (`main.c:5647`) | **DONE** |
@@ -181,7 +181,6 @@ by size. Each carries the test that would prove it.
 
 | # | Item | Why it is first | Size | Scope |
 |---|---|---|---|---|
-| 1 | **Transaction relay to and from inbound peers** (§4, two rows) | Inbound peers receive no tx invs from us and what they send us stops at our outbound legs — a partial leech, and what a peer-quality heuristic would score us down for | medium | CC-1 |
 | 2 | **BIP152 compact block receive** (§3) | Every block fetched in full; a Core peer's pushed `cmpctblock` is dropped then refetched | medium-large | CC-2 |
 | 3 | **Inbound eviction** (`AttemptToEvictConnection`, §4) | Under slot pressure the node keeps whoever arrived first — and, found while scoping, *serves unrecorded* peers past the table's 64 slots | medium | CC-3 |
 | 4 | **Block-relay-only outbound + `anchors.dat`** (§4) | Eclipse resistance | medium | CC-4 |

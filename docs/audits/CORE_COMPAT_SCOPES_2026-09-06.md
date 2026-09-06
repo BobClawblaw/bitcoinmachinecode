@@ -42,6 +42,8 @@ Every claim about the tree was checked against `asm/` this morning.
 
 ## CC-1 — Transaction relay to and from inbound peers
 
+**Status: CLOSED (`612159c`).** As designed below, with one deviation: announces MSG_TX by txid rather than MSG_WTX, because the inbound handshake does not record whether the peer sent `wtxidrelay` (Core accepts either). Test `test_txann` gated, 16 checks; negative control = the switch off.
+
 **Core.** Every peer that negotiated relay (`fRelay`, `wtxidrelay`) gets
 `inv` announcements of every transaction accepted to the mempool, from a
 per-peer set flushed on a Poisson timer — mean 5 s for inbound
