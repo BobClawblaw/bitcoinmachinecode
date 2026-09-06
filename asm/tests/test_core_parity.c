@@ -156,8 +156,17 @@ int main(void){
     printf("== 3/4/5. config keys reach the fields main() reads ==\n");
     { const char* e="test_parity_empty.conf"; FILE* f=fopen(e,"w"); fputs("# empty\n",f); fclose(f); node_config_load(e); unlink(e); }
     ck("bantime defaults to Core's 24h", g_cfg.bantime == 86400);
-    ck("blockfilterindex defaults on", g_cfg.blockfilterindex == 1);
-    ck("coinstatsindex defaults on",   g_cfg.coinstatsindex == 1);
+    /* 2026-09-06: these asserted OUR divergence, not Core's behaviour. Core
+     * makes both indexes opt-in (help: "default: 0"), and a test in a file
+     * called core_parity was pinning the opposite. Building them by default
+     * cost disk and sync time a default Core node never pays. */
+    ck("blockfilterindex defaults OFF, as in Core", g_cfg.blockfilterindex == 0);
+    ck("coinstatsindex defaults OFF, as in Core",   g_cfg.coinstatsindex == 0);
+    ck("limitancestorcount defaults to Core's 25",   g_cfg.limitancestorcount == 25);
+    ck("limitdescendantcount defaults to Core's 25", g_cfg.limitdescendantcount == 25);
+    ck("dbcache defaults to Core's 1024 MiB",        g_cfg.dbcache_mb == 1024);
+    ck("maxconnections defaults to Core's 200",      g_cfg.max_connections == 200);
+    ck("par defaults to Core's 0 (auto)",            g_cfg.par == 0);
 
     { const char* tmp = "test_parity.conf";
       FILE* f = fopen(tmp, "w");
