@@ -3610,7 +3610,7 @@ for(; i < cnt; i++){
     }
     return (long)i;
 }
-static lowwork_t g_lw;                                   /* CC-5 hold: 648 KB, one per process */
+static lowwork_t g_lw;                                   /* CC-5 hold: 48 KB of bookkeeping; the page scratch is mmap'd per fetch */
 static int dlc_lw_get_at(void* hst, unsigned long long h, void* out){ return hst_get_at(hst, h, out); }
 extern int reorg_min_chain_work_set(void);
 static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
@@ -3668,7 +3668,7 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
         { unsigned char lasth[32]; block_hash(lasth, first + (cnt - 1) * 81);
           int lwv = lowwork_page(&g_lw, first, cnt, pos, prev, lasth);
           if(lwv == LOWWORK_ABANDON){
-              fprintf(stderr,"[dlc] headers from %s: %d full pages and still below -minimumchainwork -- abandoning this chain (nothing was stored)\n", cand, LOWWORK_HOLD_PAGES);
+              fprintf(stderr,"[dlc] headers from %s: %d full pages (%lu headers, the hold's memory bound) and still below -minimumchainwork -- abandoning this chain (nothing was stored)\n", cand, LOWWORK_HOLD_PAGES, (unsigned long)LOWWORK_HOLD_PAGES * LOWWORK_PAGE_MAX);
               lowwork_clear(&g_lw); dlc_headers_rollback(hst, have0); return -1;
           }
           if(lwv == LOWWORK_HOLD){
