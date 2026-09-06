@@ -4886,7 +4886,17 @@ static long dl_catchup(const char* dir, int min_workers){
             dlc_fmt_rate(avgwbuf,sizeof avgwbuf,cumulative_write_bytes/(double)elapsed_secs);
             fprintf(stderr,"[dlc] -- dead-weight floor this tick: %.1f KB/s (pool median %.1f KB/s, absolute %.1f KB/s) --\n",
                     floor_bps/1024.0, median_bps/1024.0, (double)g_cfg.dead_weight_bps/1024.0);
-            fprintf(stderr,"[dlc] -- peers banned this run: %ld of %d --\n", nbanned, nlive);
+            /* nbanned counts ban EVENTS, and the workers' amnesty path clears
+             * banned[] without decrementing it -- so this used to print
+             * "715 of 119", more bans than peers. Report both truthfully:
+             * how many are banned RIGHT NOW (scan the shared array the workers
+             * actually read) and how many ban events there have been. */
+            { long cur = 0; for(int q = 0; q < nlive; q++) if(banned[q]) cur++;
+              if(nbanned == cur)
+                  fprintf(stderr,"[dlc] -- peers banned: %ld of %d --\n", cur, nlive);
+              else
+                  fprintf(stderr,"[dlc] -- peers banned: %ld of %d now (%ld ban event(s) so far; the rest were handed back by amnesty) --\n",
+                          cur, nlive, nbanned); }
             { extern int peer_no_witness_count(void); extern unsigned long long peer_no_witness_skips(void);
               if(peer_no_witness_count())
                   fprintf(stderr,"[dlc] -- %d peer(s) dropped for lacking NODE_WITNESS; %llu redial(s) skipped since --\n",
