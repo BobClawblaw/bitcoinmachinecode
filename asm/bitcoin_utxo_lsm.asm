@@ -918,9 +918,20 @@ fmt_runname:
     pop  rbp
     ret
 
+; utxo_lsm_sort_desc(a=rdi, b=rsi, n=rdx) -- the flush's sort step, exported
+; so tests/bench_lsm_flush_sort.c can time it in isolation and a diff test can
+; compare implementations on the same descriptor array. Contract is
+; mac_sort_desc's: n 64-byte descriptors in a, b is scratch of >= n*64 bytes,
+; the sorted result is in a, and equal keys keep their input order (stable).
+global utxo_lsm_sort_desc
+utxo_lsm_sort_desc:
+    jmp  mac_sort_desc
+
 ; mac_sort_desc(a=rdi, b=rsi, n=rdx) -- bottom-up iterative merge sort of n
 ; fixed-64-byte records in a, comparing the first 36 bytes (mac_cmp_key), b
-; is scratch of equal size. Final sorted result always ends up in a.
+; is scratch of equal size. Final sorted result always ends up in a. STABLE:
+; on a key tie the left run's record is taken first (.sd_take_q only when
+; p > q), so equal keys keep their descriptor-build order.
 mac_sort_desc:
     push rbp
     mov  rbp, rsp
@@ -2044,7 +2055,7 @@ mac_flush:
     mov  rsi, [r12+128]
     add  rsi, [rbp-0x40]
     mov  rdx, [rbp-0x38]
-    call mac_sort_desc
+    call utxo_lsm_sort_desc
 
     ; ---- compute bloom_bits/bits_mask ----
     mov  rax, [rbp-0x38]
