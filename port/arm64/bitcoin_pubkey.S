@@ -18,6 +18,45 @@
 	add  \rd, \rd, :lo12:\sym
 	.endm
 
+	/* ---- CRY-3 (audit 2026-09-03) FE_REQUIRE_LT_P -------------------
+	 * Refuse a field element >= p. Key decoding converted 32 big-endian
+	 * bytes straight to limbs with no compare against p, which Core refuses
+	 * (secp256k1_fe_set_b32_limit, and lift_x for BIP340). Two consequences:
+	 * (1) a discrete log on an x >= p key would be a false ACCEPT -- we
+	 * would follow a chain Core rejects; (2) a non-canonical x was returned
+	 * in the output limbs and fed to point_add_mixed / ecdsa_verify, whose
+	 * doubling and opposite detection DOCUMENT an assumption that operands
+	 * are canonical -- reachable from parse-only callers (rpc_chain.c,
+	 * descriptor.c) with no signature involved at all.
+	 *
+	 * A MACRO, not a function, like the x86: this is four compares.
+	 * \off = sp offset of the 4 LE limbs (limb0 at \off .. limb3 at
+	 * \off+24). Clobbers x8,x9,x10,x11; jumps to .Lp_bad when >= p. */
+	.macro FE_REQUIRE_LT_P off
+	LAddr x8, P_LIMBS
+	add  x11, sp, #\off
+	ldr  x9, [x11, #24]
+	ldr  x10, [x8, #24]
+	cmp  x9, x10
+	b.lo .Lcr3ok\@
+	b.hi .Lp_bad
+	ldr  x9, [x11, #16]
+	ldr  x10, [x8, #16]
+	cmp  x9, x10
+	b.lo .Lcr3ok\@
+	b.hi .Lp_bad
+	ldr  x9, [x11, #8]
+	ldr  x10, [x8, #8]
+	cmp  x9, x10
+	b.lo .Lcr3ok\@
+	b.hi .Lp_bad
+	ldr  x9, [x11, #0]
+	ldr  x10, [x8, #0]
+	cmp  x9, x10
+	b.hs .Lp_bad
+.Lcr3ok\@:
+	.endm
+
 	.section .rodata
 	.balign 16
 P_LIMBS:
@@ -147,6 +186,8 @@ pubkey_parse:
 	ldr  x5, [x8, #0]
 	rev  x5, x5
 	str  x5, [sp, #56]
+	/* CRY-3: refuse a non-canonical x before it is used or returned. */
+	FE_REQUIRE_LT_P 32
 	/* x2 = x^2 @sp+64 */
 	add  x0, sp, #64
 	add  x1, sp, #32
@@ -280,6 +321,9 @@ pubkey_parse:
 	ldr  x5, [x8, #0]
 	rev  x5, x5
 	str  x5, [sp, #184]
+	/* CRY-3: both coordinates must be canonical, as Core checks both. */
+	FE_REQUIRE_LT_P 32
+	FE_REQUIRE_LT_P 160
 	/* verify y^2 == x^3 + 7 */
 	add  x0, sp, #64
 	add  x1, sp, #32
