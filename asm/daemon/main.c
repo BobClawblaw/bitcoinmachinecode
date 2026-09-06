@@ -159,13 +159,82 @@ extern long g_peer_wants_addrv2;   /* bitcoind.asm: peer sent sendaddrv2 before 
  * but it can still waste a leg failing every fetch, so refuse at dial time.
  * A version payload too short to carry services is refused the same way:
  * unknown is not "probably fine" on the path that feeds the archive. */
+/* ---- remember who lacks NODE_WITNESS (2026-09-06) --------------------------
+ * A peer without NODE_WITNESS is useless to us forever -- the bit does not
+ * come and go -- but nothing recorded that, so the dialler kept picking the
+ * same addresses out of the pool and re-handshaking them. Measured on a live
+ * benchmark: 7,891 of 8,630 log lines in nine minutes were this one message,
+ * 91% of the log, from 28 distinct addresses, one of them dialled 819 times.
+ * That is a wasted handshake each time, not just noise.
+ *
+ * So: a small per-run set of addresses already known to lack the bit. The
+ * message is printed ONCE per address; after that the peer is skipped before
+ * the socket is opened, and a periodic line reports the running count so the
+ * behaviour stays visible without drowning the log. Not persisted -- a node
+ * may be upgraded between runs, and Core re-learns services on every
+ * connection too. */
+#define NOWIT_MAX 512
+/* The download forks 16 helpers, so a per-process set is learned 16 times over
+ * and the message still repeats once per helper (measured: exactly 16). The
+ * set therefore lives in a MAP_SHARED page the parent creates before the fork,
+ * alongside claimed[] and banned[]; when it is absent (the parent's own dials
+ * before any download) the process-local arrays below are used instead. */
+typedef struct { volatile int n; char a[NOWIT_MAX][64]; volatile unsigned long long skips; } nowit_set_t;
+static nowit_set_t* g_nowit_sh = 0;
+void peer_nowit_attach(void* shared){ g_nowit_sh = (nowit_set_t*)shared; }
+unsigned long peer_nowit_bytes(void){ return (unsigned long)sizeof(nowit_set_t); }
+static char  g_nowit[NOWIT_MAX][64];
+static int   g_nowit_n = 0;
+static unsigned long long g_nowit_skips = 0;
+static void nowit_key(char* out, unsigned long n, const char* who){
+    snprintf(out, n, "%s", who ? who : "?");
+    char* c = strrchr(out, ':'); if (c && strchr(out, '.')) *c = 0;   /* strip :port, keep IPv6 */
+}
+/* 1 if this address already failed the witness check in this run */
+static int nowit_lookup(const char* k){
+    if (g_nowit_sh){
+        int n = g_nowit_sh->n; if (n > NOWIT_MAX) n = NOWIT_MAX;
+        for (int i = 0; i < n; i++) if (!strcmp(g_nowit_sh->a[i], k)) return 1;
+        return 0;
+    }
+    for (int i = 0; i < g_nowit_n; i++) if (!strcmp(g_nowit[i], k)) return 1;
+    return 0;
+}
+int peer_known_no_witness(const char* who){
+    char k[64]; nowit_key(k, sizeof k, who);
+    if (!nowit_lookup(k)) return 0;
+    if (g_nowit_sh) __sync_fetch_and_add(&g_nowit_sh->skips, 1ULL); else g_nowit_skips++;
+    return 1;
+}
+unsigned long long peer_no_witness_skips(void){ return g_nowit_sh ? g_nowit_sh->skips : g_nowit_skips; }
+int peer_no_witness_count(void){
+    if (!g_nowit_sh) return g_nowit_n;
+    int n = g_nowit_sh->n; return n > NOWIT_MAX ? NOWIT_MAX : n;
+}
+static void nowit_remember(const char* who){
+    char k[64]; nowit_key(k, sizeof k, who);
+    if (nowit_lookup(k)) return;
+    if (g_nowit_sh){
+        /* a duplicate here is harmless (the lookup is a scan), so a plain
+         * atomic claim of the next slot is enough -- no lock on a dial path. */
+        int slot = __sync_fetch_and_add(&g_nowit_sh->n, 1);
+        if (slot < NOWIT_MAX) snprintf(g_nowit_sh->a[slot], sizeof g_nowit_sh->a[0], "%s", k);
+        else __sync_fetch_and_sub(&g_nowit_sh->n, 1);
+        return;
+    }
+    if (g_nowit_n < NOWIT_MAX) snprintf(g_nowit[g_nowit_n++], sizeof g_nowit[0], "%s", k);
+}
 static int peer_has_witness(const char* who){
     unsigned long long services = 0;
     if (g_peer_version_len >= 12)
         memcpy(&services, g_peer_version_payload + 4, 8);
     if (services & 0x8ULL) return 1;
-    fprintf(stderr, "[dial] %s lacks NODE_WITNESS (services=0x%llx) -- dropping\n",
-            who ? who : "?", services);
+    char k[64]; nowit_key(k, sizeof k, who);
+    int known = nowit_lookup(k);
+    if (!known)
+        fprintf(stderr, "[dial] %s lacks NODE_WITNESS (services=0x%llx) -- dropping, and not dialling it again this run\n",
+                who ? who : "?", services);
+    nowit_remember(who);
     return 0;
 }
 extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, long* out_count);
@@ -3782,6 +3851,9 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
     int pport = 0; unsigned ip = 0;
     if(!dlc_parse_peer(cand, &ip, &pport)){ *why = DLC_HT_PARSE; return -1; }
     int cport = pport ? pport : node_config_peer_port(cand);
+    /* already known to lack NODE_WITNESS this run: do not spend a socket and a
+     * handshake to be told again (2026-09-06). */
+    if(peer_known_no_witness(cand)){ *why = DLC_HT_WITNESS; return -1; }
     int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cport ? cport : g_chainp->default_port)));
     if(fd<0){ *why = DLC_HT_CONNECT; return -1; }
     struct timeval tv; tv.tv_sec=15; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
@@ -3998,6 +4070,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                      * fallback for bare addresses (same rule as the header tries) */
                     { int cpc = cp2 ? cp2 : node_config_peer_port(cand); if(!cpc) cpc = g_chainp->default_port;   /* addnode=host:port keeps its port here too */
                       cp2 = cpc; }
+                    if(peer_known_no_witness(cand)){ claimed[idx]=0; slot=(idx+1)%nlive; continue; }   /* no witness bit: skip before the socket */
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)cp2));
                     if(fdc<0){ claimed[idx]=0; continue; }
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
@@ -4420,6 +4493,11 @@ static long dl_catchup(const char* dir, int min_workers){
      * "pick an unclaimed peer" atomic across all forked workers, so no two
      * workers ever share one peer's bandwidth while a distinct live peer
      * sits unused. */
+    /* the no-NODE_WITNESS set, shared with every forked helper so the bit is
+     * learned ONCE for the whole download rather than once per helper
+     * (2026-09-06: 16 helpers meant 16 identical log lines per address). */
+    { void* nw = mmap(NULL, peer_nowit_bytes(), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+      if (nw != MAP_FAILED){ memset(nw, 0, peer_nowit_bytes()); peer_nowit_attach(nw); } }
     volatile int* claimed=mmap(NULL,sizeof(int)*(size_t)nlive,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     /* Peers evicted for sustained uselessness are banned for the REST OF THE
      * RUN. Without this the replacement draw is memoryless: a worker killed
@@ -4693,6 +4771,10 @@ static long dl_catchup(const char* dir, int min_workers){
             dlc_fmt_rate(avgrbuf,sizeof avgrbuf,cumulative_bytes/(double)elapsed_secs);
             dlc_fmt_rate(avgwbuf,sizeof avgwbuf,cumulative_write_bytes/(double)elapsed_secs);
             fprintf(stderr,"[dlc] -- peers banned this run: %ld of %d --\n", nbanned, nlive);
+            { extern int peer_no_witness_count(void); extern unsigned long long peer_no_witness_skips(void);
+              if(peer_no_witness_count())
+                  fprintf(stderr,"[dlc] -- %d peer(s) dropped for lacking NODE_WITNESS; %llu redial(s) skipped since --\n",
+                          peer_no_witness_count(), peer_no_witness_skips()); }
     fprintf(stderr,"[dlc] -- average since start: %s recv, %s write --\n",avgrbuf,avgwbuf);
         }
     }
