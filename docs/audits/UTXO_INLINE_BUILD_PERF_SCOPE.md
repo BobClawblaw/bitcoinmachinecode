@@ -152,8 +152,8 @@ In order of expected yield, each gated on step 0's numbers:
 4. **Verify workers.** 16 today; the bench's parallel taproot figure says
    the host has headroom. A knob, not a change.
 
-Not on the list: replacing the LSM with an in-RAM cache flushed rarely
-(Core's model). It would be a rewrite of a tested, crash-consistent store
+Scoped separately, not on this list: adopting Core's cache-and-flush model
+(`UTXO_CACHE_MODEL_SCOPE.md`). It would be a rewrite of a tested, crash-consistent store
 for a gain that step 1 mostly captures without it. If step 0 shows the LSM
 writes themselves dominate at the tip end — not the fsyncs, not the gets —
 that conclusion changes, and the number will say so.
