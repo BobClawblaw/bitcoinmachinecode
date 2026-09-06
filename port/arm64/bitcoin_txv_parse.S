@@ -38,7 +38,12 @@
 	.global txvb_parse_tx_asm
 	.type txvb_parse_tx_asm, %function
 
-	.extern txv_witpool_reserve_asm
+	.extern txv_witpool_reserve
+/* The pool reserve is C (daemon/tx_verify.c), exactly as on x86: allocation is
+ * phase 3's boundary. (An ARM-native twin of it lives in bitcoin_txv_pools.S
+ * as txv_witpool_reserve_asm with the same contract, but the differential
+ * recipes link tx_verify.c, not bitcoin_txv_pools.o -- calling the C seam
+ * here is what makes test_txv_parse_diff/test_txvb_parse_diff link.) */
 
 /* --- load a symbol's address (adrp + :lo12:, range-safe) --- */
 	.macro LAddr rd, sym
@@ -60,14 +65,25 @@
 	add  x10, x26, #9
 	cmp  x10, x27
 	b.hi \fail
-	ldr  x9, [x26, #1]
-	add  x26, x26, #9
-	b    .Lrdone\@
+	/* ---- VAL-10 / SER-3 (audit 2026-09-03): the 8-byte form is ALWAYS
+	 * invalid, and that is not a shortcut: canonical requires a value above
+	 * 0xffffffff, MAX_SIZE caps at 0x02000000, and no value satisfies both.
+	 * The bytes are still bounds-checked first so a truncated 0xff varint
+	 * fails for its own reason rather than this one. */
+	b    \fail
 .Lr4\@:
 	add  x10, x26, #5
 	cmp  x10, x27
 	b.hi \fail
 	ldr  w9, [x26, #1]
+	/* VAL-10/SER-3: canonical 4-byte form -- must not fit the 3-byte form
+	 * and must not exceed MAX_SIZE (0x02000000). */
+	movz w10, #0xffff
+	cmp  w9, w10
+	b.ls \fail
+	movz w10, #0x0200, lsl #16          /* MAX_SIZE = 0x02000000 */
+	cmp  w9, w10
+	b.hi \fail
 	add  x26, x26, #5
 	b    .Lrdone\@
 .Lr2\@:
@@ -75,6 +91,9 @@
 	cmp  x10, x27
 	b.hi \fail
 	ldrh w9, [x26, #1]
+	/* VAL-10/SER-3: canonical 2-byte form -- must not fit the 1-byte form. */
+	cmp  w9, #0xfd
+	b.lo \fail
 	add  x26, x26, #3
 	b    .Lrdone\@
 .Lr1\@:
@@ -214,7 +233,7 @@ txv_parse_asm:
 	str  w9, [x25, #40]          /* nwit = (u32)nitems */
 	mov  x0, x24                 /* wp */
 	mov  x1, x9
-	bl   txv_witpool_reserve_asm
+	bl   txv_witpool_reserve
 	cmp  x0, #-1
 	b.eq .Tr_oom
 	str  x0, [sp, #0x20]         /* woff */
@@ -438,7 +457,7 @@ txvb_parse_tx_asm:
 	str  w9, [x25, #72]          /* nwit */
 	mov  x0, x24                 /* wp */
 	mov  x1, x9
-	bl   txv_witpool_reserve_asm
+	bl   txv_witpool_reserve
 	cmp  x0, #-1
 	b.eq .Tb_oom
 	str  x0, [sp, #0x20]         /* woff */
