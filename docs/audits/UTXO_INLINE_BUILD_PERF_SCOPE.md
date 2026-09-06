@@ -191,6 +191,51 @@ what makes the interleaving visible correctly to peers and RPC.
 **Expected result:** the 4.5 h phase disappears into the 19.5 h download;
 end to end ≈ download + tip lag.
 
+**Landed 2026-09-06 (branch `batch/2026-09-06-utxo-interleave`), with these
+deviations from the text above, each decided against the code as found:**
+
+- **The boot-time catch-up does not interleave.** `dl_catchup` runs twice:
+  from `main()` at boot (`bmc.bootcatchup=1`, the default) in the PARENT,
+  before `utxo_live_init` -- which runs in the download worker, the single
+  writer -- and from the worker's far-behind trigger. Only the worker's run
+  connects while it downloads (`g_utxo_live_on` gates it); the boot run
+  still hands a full archive to the worker's drain, and the boot log now
+  says so. A fresh-clone benchmark of this step must run with
+  `bmc.bootcatchup=0` so the worker's trigger does the download. Moving the
+  boot catch-up into the worker is a separate change (it would open the node
+  for service before the download).
+- **`store_reload` per pass is inside the bounded call**, not a separate
+  call in the loop; the loop's tick is now `connect (≤ 8 s) → idle 2 s only
+  if nothing connected → reap`, with the peer-status table, the dead-weight
+  kills and the EMA on their own 10 s cadence and every per-tick rate
+  divided by the tick's real length. One more bounded pass runs after the
+  last helper exits, so the gate lag is what one pass leaves.
+- **The unbounded call never "stopped at the hole by failing"**: it stops
+  at the hole, logs a WARNING, classes the stop archive/recovery and returns
+  the count applied (≥ 0). `test_utxo_catchup_bounded` pins that as the
+  negative control. The bounded call stops at the hole silently (reason
+  `HOLE`, no classification); `utxo_live_last_stop_reason()` names the exit.
+- **A rejection mid-download stops the helpers.** The reject hook stops
+  them BEFORE `chain_invalidate_block` truncates the archive under them
+  (their remaining chunks were all on the rejected chain); `dl_catchup`
+  returns, the rotation's legs take the heavier chain that avoids the mark,
+  and the far-behind trigger re-runs the parallel download on it. A connect
+  failure that is not a rejection (store error, halt) does not stop the
+  download: connect backs off 30 s and the rotation's recovery path owns it
+  after the download, as before.
+- **The new-block choke point** (3.1) is one function now, fired from the
+  rotation and from the download loop, so announce/ZMQ/index tails/mempool
+  follow the connected tip during the download.
+- `dlc_scan_progress` does not compute the contiguous prefix; the progress
+  line's `lag` uses `dlc_first_hole` (prefix end − applied).
+- Found while writing `test_dlc_interleave`, not fixed here: against a
+  loopback peer the per-block `getdata` round trip is ~45 ms (21 blk/s per
+  helper) until the peer ACKs immediately (`TCP_QUICKACK`), after which it
+  is ~5 ms (179 blk/s). The node's outbound sockets have no `TCP_NODELAY`,
+  and a message goes out as more than one segment, so Nagle holds the tail
+  for the peer's delayed ACK. On the real network the RTT hides most of it;
+  worth a look when the helpers' rate is next measured.
+
 ### Step 2 — the CPU budget
 
 The worker's process now does connect while 16 helpers download. The
