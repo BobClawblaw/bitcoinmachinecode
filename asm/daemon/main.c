@@ -40,6 +40,7 @@
 #include <sys/file.h>          /* DMN-1: flock() for the datadir lock */
 #include "secure_zero.h"    /* WAL-3: a memset the optimiser may not delete */
 #include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
+#include "peer_timeout.h"      /* CC-7: -peertimeout, the handshake deadline */
 /* VAL-5 / MEM-1: the generated per-height script-flag mask
  * (bitcoin_script_flags.asm, from validation/gen_script_flags.py). */
 extern unsigned long long script_flags_for_block(unsigned long long height,
@@ -540,9 +541,10 @@ static void peer_sock_buffers(int fd){
  *
  * BMC_PEER_IDLE_SECS overrides it, following the BMC_LSM_MMAP /
  * BMC_ECDSA_GLV kill-switch idiom, so tests can drive the path in seconds.
- * Note this is NOT Core's -peertimeout, which is a CONNECT timeout;
- * g_cfg.peer_timeout_s is still unwired and is tracked separately rather than
- * silently repurposed here, which would be a fresh divergence from Core. */
+ * Note this is NOT Core's -peertimeout, which bounds the HANDSHAKE: that one
+ * is g_cfg.peer_timeout_s, applied by peer_handshake_deadline() from socket
+ * open until verack (CC-7, 2026-09-06; it was parsed and unread before --
+ * DMN-14). Once the handshake completes this idle bound takes over. */
 #define PEER_IDLE_SECS_DEFAULT 1200      /* Core TIMEOUT_INTERVAL, 20 minutes */
 static void peer_inbound_deadline(int fd){
     if (fd < 0) return;
@@ -1797,7 +1799,7 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
               }
               int dfd = dialer_connect(&da, g_cfg.connect_timeout_ms > 0 ? g_cfg.connect_timeout_ms : 15000, &why);
               if (dfd < 0){ snprintf(g_dial_fail, sizeof g_dial_fail, "%s dial: %.60s", bmc_net_name(da.net), why); return -1; }
-              struct timeval tv; tv.tv_sec = 30; tv.tv_usec = 0;   /* onion/i2p round trips are slow */
+              struct timeval tv; tv.tv_sec = (time_t)peer_handshake_secs(g_cfg.peer_timeout_s); tv.tv_usec = 0;   /* CC-7: -peertimeout bounds the handshake (60 s default; onion/i2p round trips are slow) */
               setsockopt(dfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
               if (node_handshake(dfd) != 1 || !peer_has_witness(host)){
                   snprintf(g_dial_fail, sizeof g_dial_fail, "%s handshake failed", bmc_net_name(da.net));
@@ -6225,7 +6227,16 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 if(ci >= 0) dh_start(srcpool[ci], out_port);
             }
         }
-        if(mux_n_out - legs_anon() < MUX_WANT_OUT() && (rot % 8)==0){
+        /* CC-6: Core CheckForStaleTipAndEvictPeers -- when no block has arrived
+         * for 30 minutes and we are not catching up, want ONE extra full-relay
+         * leg so a partition is noticed (Core's m_try_another_outbound_peer).
+         * The extra leg is not torn down when the tip is fresh again: the
+         * want simply drops back and normal leg churn absorbs it. */
+        extern int tx_accept_stale_tip_extra(long now);
+        int stale_extra = tx_accept_stale_tip_extra((long)time(NULL));
+        { static int prev_stale = 0;
+          if(stale_extra != prev_stale){ fprintf(stderr, "[dial] tip %s: wanting %d outbound\n", stale_extra ? "stale for 30 min (no block seen)" : "fresh again", MUX_WANT_OUT() + stale_extra); prev_stale = stale_extra; } }
+        if(mux_n_out - legs_anon() < MUX_WANT_OUT() + stale_extra && (rot % 8)==0){
             /* ONE summary line per pass, not one per candidate: this loop walks
              * the whole live pool (up to nsrc) when nothing connects, so a
              * per-candidate log would flood exactly when the node is sickest. */
@@ -6237,7 +6248,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * (2026-09-01 01:34) and tripped the deploy guard; the next pass
              * (8 rotations later) fills the next slot. */
             int topup_filled = 0;
-            for(int ci=0; ci<nsrc && mux_n_out - legs_anon() < MUX_WANT_OUT() && mux_n_out<MUX_MAX_OUT; ci++){
+            for(int ci=0; ci<nsrc && mux_n_out - legs_anon() < MUX_WANT_OUT() + stale_extra && mux_n_out<MUX_MAX_OUT; ci++){
                 if(topup_filled >= 1 || topup_fail >= 4) break;
                 if(leg_is_anon_net(leg_net_of(srcpool[ci]))) continue;   /* the helper owns those */
                 int already=0;
@@ -7076,7 +7087,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
              * no-op. Without this each child re-scans everything appended
              * since boot, and says so in the log once per connection. */
             if(c>=0) peer_sock_buffers(c);
-            if(c>=0) peer_inbound_deadline(c);        /* NET-3: idle peers cannot hold a slot forever */
+            if(c>=0) peer_handshake_deadline(c, g_cfg.peer_timeout_s);   /* CC-7: -peertimeout until verack; the NET-3 idle bound is armed after the handshake */
             if(c>=0 && g_shutdown_requested){
                 /* SC1 (2026-09-05, /mnt/2tbssd bmc-vs-Core benchmark): the
                  * stop sequence was observed forking a child into a parent
@@ -7195,6 +7206,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                       memcpy(g_cur_peer_ip, peerdesc, n); g_cur_peer_ip[n] = 0; }
                     g_serve_violation_hook = serve_violation_report;
                     int hok = node_accept_handshake(c);
+                    if(hok==1) peer_inbound_deadline(c);      /* NET-3: handshake done -> the 20-minute idle bound */
                     if(hok==1) g_inbound_slot = inbound_slot_claim(peerdesc);
                     char pv[256]; pv[0]=0; if(hok==1) format_peer_version_info(pv, sizeof pv);
                     close(l6 >= 0 ? l6 : l);

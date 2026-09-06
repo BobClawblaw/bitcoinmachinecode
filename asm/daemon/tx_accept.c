@@ -100,6 +100,11 @@ void tx_accept_set_tip(long tip){ g_next_height = tip + 1; }
  * (the tip-age test alone then decides). */
 static long g_tip_time = 0, g_best_header = -1;
 void tx_accept_set_tip_time(long tip_time, long best_header){ g_tip_time = tip_time; g_best_header = best_header; }
+#include "stale_tip.h"
+/* CC-6: does the dialer want one extra outbound because the tip is stale? */
+int tx_accept_stale_tip_extra(long now){
+    return stale_tip_extra_outbound(now, g_tip_time, g_next_height - 1, g_best_header, 1);
+}
 int tx_accept_chainstate_current(void){
     long tip = g_next_height - 1;
     if (g_tip_time <= 0) return 0;

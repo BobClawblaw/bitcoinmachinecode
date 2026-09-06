@@ -322,6 +322,8 @@ chain *longer than ours*, not on time.
 
 ## CC-6 — Extra outbound on stale tip
 
+**Status: CLOSED (`c6598b5`).** As designed below; test `test_stale_tip` gated, negative control = the switch off.
+
 **Core.** If no block has arrived for >30 min (`TIP_STALE_TIMEOUT`... the
 check is "tip older than 3× the block interval"), open one extra full-relay
 outbound; drop it once the tip is fresh. (`net_processing.cpp`
@@ -347,6 +349,8 @@ folded into the want count at the top-up, and a matching drop of the
 ---
 
 ## CC-7 — `-peertimeout`
+
+**Status: CLOSED (`c6598b5`).** As designed below; test `test_peer_timeout` gated, negative control = no deadline (the silent peer holds the socket past the guard).
 
 **Core.** The time a peer has after connection to complete the version
 handshake before it is disconnected; default 60 s
