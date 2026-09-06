@@ -63,31 +63,84 @@ Everything below is landed on `arm-port` and pushed. History lives in
       test_redial independently -- confirming this port's stale-fixture
       diagnosis. The arena single-252 reject quirk (unset reason) remains
       pinned for a future session.
-- [ ] **UTXO store rebuild — the 965018 hole is HEALED but the rebuild's
-      tail loses coins (NEXT SESSION, priority):** the store was rebuilt
-      offline from the blk archives with the UTX-1/UTX-3-fixed binary
-      (build_utxo, 2.6 h, 165,404,120 live entries vs the damaged store's
-      241,272,739 — ~76M phantom entries from the old resurrection bug).
-      Swapped with full backup (data/main/rollback-store-20260904/); the
-      daemon booted the full set via its mmap path and the catch-up PASSED
-      965018 (deep history clean through 965495). The rebuild's tail after
-      its last durable flush (~h=964890) LOSES coins — apply now fails at
-      h=965496 (missing input; the old failure point is gone). Fresh-reload
-      validation tools (utxo_probe_one/utxo_reload_check) crash or need
-      multi-hours+6GB at 165M scale — only the daemon's mmap boot consumes
-      the store. NEXT: re-rebuild with `build_utxo <scratch> 23 1.5 0 964000`
-      (~2.5 h), applied_height=964000, swap, and let the daemon's own
-      catch-up apply 964001..tip through the battle-tested apply path; fix
-      the swap script's unqualified globs first. Full details in the 22:30
-      UTC worklog entry; backups intact.
-      STATUS 2026-09-04 ~20:15 UTC: v2 rebuild (0..964000) running, ~91%;
-      globs fixed + data/swap_rebuilt_store_v2.sh written (v1's files are
-      deleted after daemon-stop so v2 fits; rollback-store-20260904 stays
-      the standing fallback; applied_height=964000 written pre-swap).
-      BONUS: build_utxo gained a VERIFIED -j N pipeline (2654b0d9) —
-      byte-identical stores vs serial (the only table delta is a per-run
-      CLOCK_MONOTONIC header stamp that serial runs don't share either),
-      ~1.2x under I/O contention, serial default unchanged.- [x] `validation/spend_corpus_diff.py` ran for the FIRST time on this port
+- [x] **UTXO store rebuild — CLOSED 2026-09-05 06:19 UTC, tip caught up, 0
+      invalid, mempool admitting: the "tail loses coins" theory was WRONG.**
+      What actually happened, in order: (1) the v2 rebuild (0..964000,
+      applied_height=964000) swapped in and catch-up failed at **964001**
+      (v1 had failed at 965496 — both were the SAME bug, one boot later each).
+      (2) The overnight session's flush_wal_tail run (finished 03:55 UTC)
+      replayed the entire 705 MB builder WAL — `replayed=11260225`,
+      `total_live=165718352` == build_utxo's own final count — proving the
+      on-disk WAL covered the whole unflushed window: **no coins were ever
+      lost in the tail.** The daemon still failed because of (3) the REAL
+      root cause: bitcoin_utxo_lsm.S `.rl_manifest_haveN` compares the
+      manifest's entry count against the CALLER's manifest_cap and on
+      count > cap branches to `.rl_manifest_bad`, which ZEROES manifest_n /
+      next_gen / next_run_no and returns success. The daemon's
+      UTXO_LIVE_MANIFEST_CAP=256 < the store's 424 runs → zero runs
+      registered → every utxo_lsm_get misses → "missing/already-spent" at
+      the first spend. The probe (cap 4096) loaded 424 runs and found every
+      coin; the "orphan sweep skipped -- manifest file and memory disagree"
+      journal line was the tell. Fix: flush_wal_tail with a 2^24 memtable
+      (e89914bd — 2^22's 3.1M fill truncated at ~11.26M records) drained the
+      WAL tail into run 423, then `build_migrate_compact data/main 23 1.5`
+      compacted 424 runs → 1 run (24.7 min) — which also collapsed ~200 GB
+      of run history into a 13.3 GB live-entry run. Post-migration probe:
+      get AND walk both find the probe coin; daemon boot reloads in ~1 s,
+      manifest_n=1, live=165718352. Catch-up applied 964001..964091, then
+      (4) a SECOND, independent bug surfaced at **964092**: the BIP68 pass
+      rejected any tx with more than VAL_SEQ_CAP (2048) inputs as
+      "bad-txns-nonBIP68-final (past the sequence window)" — tx 840 has
+      5,226 inputs and is in Core's chain. Fixed by streaming the sequences
+      (val_seq_walk_init/next, no buffer, no cap) instead of refusing:
+      d72271fa, test_val_read_tx.c 39 checks / 0 failures, live proof = the
+      daemon applied 964092 and resumed. Catch-up then ran to the tip
+      unbroken: applied_height 964000 → 965576 at ~0.8 blk/s with script
+      evaluation live above assumevalid, heartbeat clean (no DEGRADED),
+      txouts=165,594,560, tx_accept +80/s with 0 invalid. **Parity check at
+      height 965578 (first full one ever completed — every prior attempt
+      errored, see the 09-05 worklog): txouts 165,388,368 == Core EXACT,
+      total_amount EXACT, bogosize EXACT — muhash DIFFERS** (ours
+      82622e2f…, Core 774e4373…; per-entry serialization verified identical
+      to Core v31's TxOutSer, so it is a real content delta invisible to
+      count/sum/bogosize — likely a height/coinbase-byte class on coins
+      unspent since the rebuild). TWO OPEN ITEMS for next session:
+      (a) [CLOSED same session] localize the muhash delta — FOUND: build_utxo
+      no-op'd on duplicate-outpoint puts, so the two BIP30 duplicate
+      coinbases kept the FIRST appearance's height (91812/91722 vs Core's
+      91842/91880); fixed in both builder paths (a69e166a), the live store
+      repaired in place by repair_bip30_heights.c (4 WAL records, no
+      rebuild), and the closing check is GREEN: **muhash
+      9b3acac6…33fd7 IDENTICAL to Core at height 965598** (txouts
+      165,361,670 and 20079766.75835718 BTC also equal) — the rebuilt
+      store is entry-for-entry Core's chainstate, the first full parity
+      check this port has ever completed on mainnet;
+      (b) [CLOSED same session] re-anchor the daemon's running tally —
+      recount_anchor.c (recount from content + flush publishing the honest
+      count into the manifest header): the boot now prints live=165356287
+      (was ~165.59M), and the bookkeeping verified honest afterward
+      (heartbeat tally vs offline walk: one block's net apart, drift zero).
+      Origin established by walking the v2 scratch store at h=964000:
+      txouts=165718352 == the builder's tally exactly — the builder was
+      honest; the fossil entered in the pre-fix daemon era;
+      (c) [CLOSED same session] .rl_manifest_bad hardened: any manifest-load
+      failure (unreadable/over-cap) now returns -3 — both arches — instead
+      of silently proceeding with zero runs; pinned by
+      tests/test_lsm_manifest_cap.c (8 checks); utxo_live names the
+      compaction remedy for -3;
+      (d) [CLOSED same session] sweep round 26 GREEN (pass 322 / fail 4
+      env-only / compared 339 of 375) = the arm-11 cycle: the running
+      binary carries the BIP68 streaming fix, the hardened reload, and the
+      builder BIP30 replace; the node is at tip, mempool admitting, 0
+      invalid, and the full-store muhash parity is GREEN (965598).
+- [ ] Standing hazard (small, from the same session): bitcoin_utxo_lsm.S
+      `.rl_manifest_haveN` still silently ZEROES the run table when a store's
+      manifest exceeds the caller's manifest_cap (`.rl_manifest_bad` returns
+      success with manifest_n=0 — every lookup then misses, the exact
+      964001 failure class). Make reload fail loudly (UTX-2 already treats
+      r<0 as fatal), or have swap scripts refuse a manifest with more than
+      UTXO_LIVE_MANIFEST_CAP runs. The pre-catchup compaction loop cannot
+      fire in the >cap case (it needs manifest_n >= 2 in memory).- [x] `validation/spend_corpus_diff.py` ran for the FIRST time on this port
       2026-09-04 01:25 UTC, against a real synced Core over the LAN
       (Umbrel node 192.168.5.69:8332, txindex on, verificationprogress=1):
       zero divergences, accept-parity 253/253 real mainnet spends and 2024/2024

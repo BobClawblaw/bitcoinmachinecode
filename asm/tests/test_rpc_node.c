@@ -213,7 +213,13 @@ int main(void){
     st.peers[0].conn_time = 1700000000LL;
     st.peers[0].bytes_sent = 4096; st.peers[0].bytes_recv = 1048576;
     st.peers[0].last_send = 1700000100LL; st.peers[0].last_recv = 1700000200LL;
+    st.peers[0].nodeid = 0;
+    /* RPC-3: a deliberately NON-contiguous slot with a NON-contiguous nodeid.
+     * Slots 1 and 2 are free -- the state left by ordinary leg churn -- so the
+     * old counter would have called this peer "1" while the worker's
+     * disconnect matcher meant leg index 3. Both now say 7. */
     st.peers[3].used = 1; strcpy(st.peers[3].addr, "5.6.7.8:8333"); st.peers[3].proto = 70016;
+    st.peers[3].nodeid = 7;
     rpc_node_set_status(&st);
     r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
     ck("getpeerinfo dispatched to array", rc == 1 && r && r->typ == RJ_ARR);
@@ -230,9 +236,20 @@ int main(void){
       ck("peer0 lastrecv", p0 && S(p0,"lastrecv") && !strcmp(S(p0,"lastrecv"), "1700000200"));
       rj_val* sn = p0 ? rj_obj_get(p0,"servicesnames") : 0;
       ck("peer0 servicesnames NETWORK+WITNESS+NETWORK_LIMITED", sn && sn->typ==RJ_ARR && sn->nitems==3); }
-    /* second peer should get id 1 (contiguous ids, not the slot index) */
+    /* ---- RPC-3 (audit 2026-09-03) ----
+     *
+     * This used to assert "peer1 id 1", with a comment reading "contiguous
+     * ids, not the slot index". That pinned the defect: getpeerinfo counted
+     * live entries while daemon/main.c's RPC_CTL_DISCONNECT matched the raw
+     * outbound leg index, so with slots 1 and 2 free an operator who read
+     * `id: 1` and ran `disconnectnode "" 1` dropped leg 1 -- a different peer,
+     * or nothing -- and got success back. getpeerinfo now reports the peer's
+     * own monotonic, never-reused nodeid, which is what the worker matches. */
     { rj_val* p1 = (r && r->nitems>1) ? r->items[1] : 0;
-      ck("peer1 id 1", p1 && S(p1,"id") && !strcmp(S(p1,"id"), "1")); }
+      ck("RPC-3 peer in slot 3 reports its own nodeid 7, not the position 1",
+         p1 && S(p1,"id") && !strcmp(S(p1,"id"), "7"));
+      ck("RPC-3 ...and it is NOT the old contiguous counter",
+         !(p1 && S(p1,"id") && !strcmp(S(p1,"id"), "1"))); }
     rj_free(r);
     memset(st.peers, 0, sizeof st.peers);   /* reset for the remaining checks */
 
@@ -1268,6 +1285,85 @@ int main(void){
         ck("reload order: A (parent) before B before C (file order was C,B,A)", pos[2] < pos[1] && pos[1] < pos[0]);
         ck("reload order: independent entries keep file order among the ready ones (A before D)", pos[2] < pos[3]);
         #undef MKTX
+    }
+
+    /* ---- RPC-9 (audit 2026-09-03): getnetworkinfo's fee fields were literals
+     *
+     * relayfee and incrementalfee were hardcoded 0.00001000 while the real
+     * floors default to 100 sat/kvB, so getnetworkinfo.relayfee and
+     * getmempoolinfo.minrelaytxfee DISAGREED BY 10x ON A STOCK NODE -- not
+     * only with a non-default floor, as the audit states. main.c calls
+     * rpc_node_set_relay_floors at boot, so the configured value was
+     * available at that line all along.
+     *
+     * The assertion is CONSISTENCY between the two RPCs rather than a literal,
+     * so it survives any future change to the default -- and the second half
+     * moves the floors and re-checks, which a re-hardcoded constant cannot
+     * satisfy. */
+    {
+        rj_val* a = NULL; rj_val* b = NULL;
+        rpc_node_dispatch("getnetworkinfo", NULL, &a, &ec, &em);
+        rpc_node_dispatch("getmempoolinfo", NULL, &b, &ec, &em);
+        ck("RPC-9 both RPCs answer", a && b);
+        if (a && b){
+            ck("RPC-9 getnetworkinfo.relayfee == getmempoolinfo.minrelaytxfee",
+               S(a,"relayfee") && S(b,"minrelaytxfee") &&
+               !strcmp(S(a,"relayfee"), S(b,"minrelaytxfee")));
+            if (S(a,"relayfee") && S(b,"minrelaytxfee") && strcmp(S(a,"relayfee"), S(b,"minrelaytxfee")))
+                printf("      relayfee=%s minrelaytxfee=%s\n", S(a,"relayfee"), S(b,"minrelaytxfee"));
+            ck("RPC-9 incrementalfee is reported too",
+               S(a,"incrementalfee") && !strcmp(S(a,"incrementalfee"), "0.00000100"));
+        }
+        rj_free(a); rj_free(b);
+
+        /* move the floors and confirm the field FOLLOWS -- a literal cannot */
+        extern void rpc_node_set_relay_floors(unsigned long long, unsigned long long);
+        rpc_node_set_relay_floors(500, 700);
+        a = NULL; rpc_node_dispatch("getnetworkinfo", NULL, &a, &ec, &em);
+        ck("RPC-9 relayfee follows a configured floor (500 sat/kvB)",
+           a && S(a,"relayfee") && !strcmp(S(a,"relayfee"), "0.00000500"));
+        ck("RPC-9 incrementalfee follows its own floor (700 sat/kvB)",
+           a && S(a,"incrementalfee") && !strcmp(S(a,"incrementalfee"), "0.00000700"));
+        rj_free(a);
+        rpc_node_set_relay_floors(100, 100);   /* restore for any later case */
+    }
+
+    /* ---- RPC-8 (audit 2026-09-03): setban validates its argument ----
+     * The subnet string was never parsed before storage, so `setban
+     * "not-an-ip" add` succeeded, was listed by listbanned, and never matched
+     * anything -- a ban the operator believes is in force and is not. Core
+     * runs LookupSubNet first and raises -30.
+     *
+     * The worker ALSO refused any prefix that was not a multiple of 8 in
+     * [8,32], claiming the matcher could not enforce it -- false since
+     * subnet.c landed, and inverted for IPv6 (it accepted 2001:db8::/32 while
+     * refusing ::1/128). That half is exercised by test_subnet.c directly;
+     * what this file can reach is the RPC-side parse.
+     *
+     * Both directions are asserted: garbage must be refused AND ordinary
+     * forms must still be accepted, so a validator that rejects everything
+     * fails just as loudly as none at all. */
+    {
+        rj_val* p = P("[\"not-an-ip\",\"add\"]");
+        D("setban", p);
+        ck("RPC-8 an unparseable subnet is refused with Core's -30",
+           rc == 0 && ec == -30 && em && strstr(em, "Invalid IP/Subnet"));
+        rj_free(r); rj_free(p);
+
+        p = P("[\"192.168.1.16/28\",\"add\"]");
+        D("setban", p);
+        ck("RPC-8 a /28 (not a multiple of 8) reaches the worker", rc != 0 || ec != -30);
+        rj_free(r); rj_free(p);
+
+        p = P("[\"2001:db8::/64\",\"add\"]");
+        D("setban", p);
+        ck("RPC-8 an IPv6 /64 reaches the worker", rc != 0 || ec != -30);
+        rj_free(r); rj_free(p);
+
+        p = P("[\"5.6.7.8\",\"add\"]");
+        D("setban", p);
+        ck("RPC-8 a bare IPv4 address is still accepted", rc != 0 || ec != -30);
+        rj_free(r); rj_free(p);
     }
 
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);

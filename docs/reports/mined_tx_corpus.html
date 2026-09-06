@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>html{color-scheme:light dark}body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+<title>Mined Transaction Corpus</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&family=Public+Sans:wght@400;500;700&display=swap">
+<style>
+  :root{
+    --paper:#F4F5F7;
+    --surface:#FFFFFF;
+    --sunk:#EAECEF;
+    --ink:#14171C;
+    --muted:#59616D;
+    --faint:#858D99;
+    --rule:#DCDFE4;
+    --rule-soft:#E7E9ED;
+    --accent:#186A5E;
+    --accent-ink:#0E4A41;
+    --alarm:#B3321E;
+    --shadow:0 1px 2px rgba(20,23,28,.06);
+    --display:'Fraunces',Georgia,serif;
+    --body:'Public Sans','Helvetica Neue',Arial,sans-serif;
+    --mono:'IBM Plex Mono',ui-monospace,Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root:not([data-theme="light"]){
+      --paper:#101318; --surface:#181C22; --sunk:#1E232A;
+      --ink:#E6E9ED; --muted:#9AA3AF; --faint:#767F8B;
+      --rule:#2B313A; --rule-soft:#232830;
+      --accent:#5FBFAC; --accent-ink:#8FD6C7; --alarm:#E8735C;
+      --shadow:0 1px 2px rgba(0,0,0,.45);
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#101318; --surface:#181C22; --sunk:#1E232A;
+    --ink:#E6E9ED; --muted:#9AA3AF; --faint:#767F8B;
+    --rule:#2B313A; --rule-soft:#232830;
+    --accent:#5FBFAC; --accent-ink:#8FD6C7; --alarm:#E8735C;
+    --shadow:0 1px 2px rgba(0,0,0,.45);
+  }
+
+  *{box-sizing:border-box}
+  body{background:var(--paper);color:var(--ink);font-family:var(--body);
+       font-size:16px;line-height:1.6;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:940px;margin:0 auto;padding:44px 26px 90px}
+
+  header{border-bottom:2px solid var(--ink);padding-bottom:22px;margin-bottom:34px}
+  .eyebrow{font-family:var(--mono);font-size:11px;letter-spacing:.15em;
+           text-transform:uppercase;color:var(--accent);margin:0 0 12px;font-weight:600}
+  h1{font-family:var(--display);font-weight:700;font-size:clamp(32px,5vw,48px);
+     line-height:1.05;letter-spacing:-.015em;margin:0 0 14px;text-wrap:balance}
+  .stand{font-size:18px;color:var(--muted);max-width:60ch;margin:0 0 22px}
+  .facts{display:flex;flex-wrap:wrap;gap:10px 30px;font-family:var(--mono);
+         font-size:11.5px;color:var(--faint)}
+  .facts b{color:var(--ink);font-weight:600}
+
+  h2{font-family:var(--display);font-weight:700;font-size:25px;letter-spacing:-.01em;
+     margin:44px 0 6px;text-wrap:balance}
+  h2 .num{font-family:var(--mono);font-size:12px;color:var(--accent);
+          font-weight:600;display:block;letter-spacing:.12em;margin-bottom:6px;
+          text-transform:uppercase}
+  p{max-width:66ch;margin:0 0 15px}
+  code{font-family:var(--mono);font-size:.85em;background:var(--sunk);
+       padding:.12em .34em;border-radius:2px;word-break:break-word}
+  strong{font-weight:700}
+  em{font-style:italic;color:var(--muted)}
+
+  /* ---- transaction table ---- */
+  .tablewrap{overflow-x:auto;margin:20px 0 8px;border:1px solid var(--rule);
+             border-radius:5px;background:var(--surface);box-shadow:var(--shadow)}
+  table.tx{border-collapse:collapse;width:100%;min-width:760px;font-size:14px}
+  table.tx th{font-family:var(--mono);font-size:10.5px;letter-spacing:.09em;
+              text-transform:uppercase;color:var(--muted);font-weight:600;
+              text-align:left;padding:11px 14px;border-bottom:1.5px solid var(--rule);
+              white-space:nowrap;background:var(--sunk)}
+  table.tx td{padding:11px 14px;border-bottom:1px solid var(--rule-soft);
+              vertical-align:top;line-height:1.5}
+  table.tx tr:last-child td{border-bottom:0}
+  td.hn{font-family:var(--mono);font-size:12.5px;font-weight:600;text-align:right;
+        font-variant-numeric:tabular-nums;white-space:nowrap;color:var(--accent-ink)}
+  td.txid{font-family:var(--mono);font-size:10.5px;line-height:1.45;color:var(--muted);
+          word-break:break-all;max-width:20ch}
+  td.sp{font-family:var(--mono);font-size:11px;white-space:nowrap;color:var(--ink)}
+  table.tx td b{font-weight:700}
+
+  td.txid a{color:var(--accent-ink);text-decoration:none;
+             border-bottom:1px solid color-mix(in srgb,var(--accent) 35%,transparent)}
+  td.txid a:hover{color:var(--accent);border-bottom-color:var(--accent)}
+
+  /* ---- controls ---- */
+  .ctl{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));
+       gap:16px;margin:20px 0 6px}
+  .ctl > div{background:var(--surface);border:1px solid var(--rule);
+             border-radius:5px;padding:16px 17px;box-shadow:var(--shadow)}
+  .ctl h3{font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+          text-transform:uppercase;color:var(--muted);margin:0 0 10px;font-weight:600}
+  .big{font-family:var(--display);font-size:34px;font-weight:700;line-height:1;
+       color:var(--alarm);letter-spacing:-.02em}
+  .big small{font-family:var(--body);font-size:14px;font-weight:400;color:var(--muted);
+             letter-spacing:0;margin-left:6px}
+  .ctl p{font-size:14px;margin:10px 0 0;color:var(--muted);max-width:none}
+
+  pre{background:var(--surface);border:1px solid var(--rule);border-radius:5px;
+      padding:13px 15px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;
+      line-height:1.55;margin:16px 0;box-shadow:var(--shadow)}
+
+  .note{border-left:3px solid var(--alarm);background:var(--surface);
+        padding:15px 18px;border-radius:0 5px 5px 0;margin:22px 0;
+        box-shadow:var(--shadow)}
+  .note h4{font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+           text-transform:uppercase;color:var(--alarm);margin:0 0 8px;font-weight:600}
+  .note p{margin:0 0 10px;font-size:15px}
+  .note p:last-child{margin:0}
+
+  .scope{border-left:3px solid var(--accent);background:var(--surface);
+         padding:15px 18px;border-radius:0 5px 5px 0;margin:22px 0;box-shadow:var(--shadow)}
+  .scope h4{font-family:var(--mono);font-size:11px;letter-spacing:.1em;
+            text-transform:uppercase;color:var(--accent);margin:0 0 8px;font-weight:600}
+  .scope p{margin:0;font-size:15px}
+
+  footer{margin-top:52px;padding-top:18px;border-top:1px solid var(--rule);
+         font-family:var(--mono);font-size:11.5px;color:var(--faint);line-height:1.7}
+  a{color:var(--accent)}
+  :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">bitcoinmachinecode · consensus acceptance</p>
+  <h1>Mined Transaction Corpus</h1>
+  <p class="stand">Seventeen real transactions taken from the main chain, each replayed against
+    the script flags of its own block. The full-archive replay, reduced to a test that runs in
+    milliseconds.</p>
+  <div class="facts">
+    <span><b>17</b> transactions</span>
+    <span><b>26 KB</b> of vectors</span>
+    <span><b>32</b> resolved inputs</span>
+    <span>heights <b>170</b> – <b>850,000</b></span>
+    <span><b>17/17</b> accepted</span>
+    <span>gate <b>GREEN</b></span>
+  </div>
+</header>
+
+<p>Every transaction here was mined into the main chain, so each is consensus-valid
+   <em>under the flags active at its own height</em>. That is the entire claim, and it is
+   deliberately a narrow one. The transactions were chosen because they broke someone's
+   assumption, not because they are common — a thousand ordinary P2PKH spends would test
+   less than any one of the odd ones below.</p>
+
+<div class="scope">
+  <h4>Scope, stated up front</h4>
+  <p>This asserts <strong>consensus</strong> acceptance only. It does not assert mempool
+     standardness. Several of these are consensus-valid and <em>non-standard today</em> —
+     bare multisig, uncompressed keys, high-S signatures — and Core cannot be asked for a
+     policy verdict on a transaction whose inputs are long spent. Conflating the two would
+     produce a confident wrong answer, so policy is tested separately.</p>
+</div>
+
+<h2><span class="num">01 · the transactions</span>Every one, with the reason it is here</h2>
+
+<p>Height is load-bearing, not decoration. DERSIG activates at 363,725, CLTV at 388,381,
+   CSV at 419,328, segwit at 481,824, taproot at 709,632; P2SH took effect at 173,805. A
+   transaction from 2011 must be judged by 2011's rules, and two of these are rejected
+   outright under today's.</p>
+
+<p><strong>Spends</strong> is the script type of the <em>inputs</em> — what the verifier
+   actually had to execute. It is not always what the transaction is famous for, and that
+   distinction turned out to matter.</p>
+
+<div class="tablewrap"><table class="tx"><thead><tr><th>Height</th><th>Transaction</th><th>Spends</th><th>What makes it unique</th></tr></thead><tbody>
+<tr><td class="hn">170</td><td class="txid"><a href="https://mempool.space/tx/f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16" target="_blank" rel="noopener noreferrer">f4184fc596403b9d638783cf57adfe4c75c605f6356fbc91338530e9831e9e16</a></td><td class="sp">P2PK</td><td><b>First P2PK spend in history.</b> Satoshi to Hal Finney. A bare public key in the output, no hash. The oldest spend the chain has.</td></tr>
+<tr><td class="hn">728</td><td class="txid"><a href="https://mempool.space/tx/6f7cf9580f1c2dfb3c4d5d043cdbb128c640e3f20161245aa7372e9666168516" target="_blank" rel="noopener noreferrer">6f7cf9580f1c2dfb3c4d5d043cdbb128c640e3f20161245aa7372e9666168516</a></td><td class="sp">P2PKx2</td><td><b>Creates the P2PKH shape.</b> Spends two bare P2PK outputs. The novelty is in the output, not the input — on the spend side this is P2PK.</td></tr>
+<tr><td class="hn">124,276</td><td class="txid"><a href="https://mempool.space/tx/fb0a1d8d34fa5537e461ac384bac761125e1bfa7fec286fa72511240fa66864d" target="_blank" rel="noopener noreferrer">fb0a1d8d34fa5537e461ac384bac761125e1bfa7fec286fa72511240fa66864d</a></td><td class="sp">P2PKH</td><td><b>Non-minimal DER: 34-byte r AND s.</b> Two leading zero pad bytes on each of r and s. A parser that strips only one rejects this real, mined transaction. The case the 2026-08-19 signature fix exists for.</td></tr>
+<tr><td class="hn">163,685</td><td class="txid"><a href="https://mempool.space/tx/eb3b82c0884e3efa6d8b0be55b4915eb20be124c9766245bcc7f34fdac32bccb" target="_blank" rel="noopener noreferrer">eb3b82c0884e3efa6d8b0be55b4915eb20be124c9766245bcc7f34fdac32bccb</a></td><td class="sp">P2PKH+NOP-script</td><td><b>Anyone-can-spend NOP script.</b> Creates a bare multisig output; its second input spends PUSH20 &lt;data&gt; OP_NOP2 OP_DROP — valid because OP_NOP2 was still a NOP here. CLTV only claimed that opcode at 388,381.</td></tr>
+<tr><td class="hn">164,467</td><td class="txid"><a href="https://mempool.space/tx/60a20bd93aa49ab4b28d514ec10b06e1829ce6818ec06cd3aabd013ebcdc4bb1" target="_blank" rel="noopener noreferrer">60a20bd93aa49ab4b28d514ec10b06e1829ce6818ec06cd3aabd013ebcdc4bb1</a></td><td class="sp">P2PKHx3</td><td><b>FindAndDelete.</b> A signature that appears inside its own scriptCode and must be removed before hashing. Three P2PKH inputs, 759 bytes.</td></tr>
+<tr><td class="hn">170,052</td><td class="txid"><a href="https://mempool.space/tx/9c08a4d78931342b37fd5f72900fb9983087e6f46c4a097d8a1f52c74e28eaf6" target="_blank" rel="noopener noreferrer">9c08a4d78931342b37fd5f72900fb9983087e6f46c4a097d8a1f52c74e28eaf6</a></td><td class="sp">P2PK</td><td><b>Creates an early P2SH output.</b> It cannot be a P2SH spend: BIP16 activated at 173,805, after this block. It spends P2PK.</td></tr>
+<tr><td class="hn">247,939</td><td class="txid"><a href="https://mempool.space/tx/315ac7d4c26d69668129cc352851d9389b4a6868f1509c6c8b66bead11e2619f" target="_blank" rel="noopener noreferrer">315ac7d4c26d69668129cc352851d9389b4a6868f1509c6c8b66bead11e2619f</a></td><td class="sp">P2PKHx2</td><td><b>The SIGHASH_SINGLE bug.</b> Input index ≥ output count, so the sighash is the literal value 1. Mined, and must still validate forever.</td></tr>
+<tr><td class="hn">481,824</td><td class="txid"><a href="https://mempool.space/tx/461e8a4aa0a0e75c06602c505bd7aa06e7116ba5cd98fd6e046e8cbeb00379d6" target="_blank" rel="noopener noreferrer">461e8a4aa0a0e75c06602c505bd7aa06e7116ba5cd98fd6e046e8cbeb00379d6</a></td><td class="sp">P2PKHx2</td><td><b>Creates a P2WSH output.</b> In the segwit activation block. Spends two P2PKH inputs — no witness of its own.</td></tr>
+<tr><td class="hn">481,824</td><td class="txid"><a href="https://mempool.space/tx/8f907925d2ebe48765103e6845c06f1f2bb77c6adc1cc002865865eb5cfd5c1c" target="_blank" rel="noopener noreferrer">8f907925d2ebe48765103e6845c06f1f2bb77c6adc1cc002865865eb5cfd5c1c</a></td><td class="sp">P2SH</td><td><b>P2SH-wrapped P2WPKH.</b> scriptSig AND witness both populated, the only shape where both are non-empty.</td></tr>
+<tr><td class="hn">481,824</td><td class="txid"><a href="https://mempool.space/tx/dfcec48bb8491856c353306ab5febeb7e99e4d783eedf3de98f3ee0812b92bad" target="_blank" rel="noopener noreferrer">dfcec48bb8491856c353306ab5febeb7e99e4d783eedf3de98f3ee0812b92bad</a></td><td class="sp">P2SH</td><td><b>The first segwit spend in history.</b> In the activation block itself.</td></tr>
+<tr><td class="hn">481,824</td><td class="txid"><a href="https://mempool.space/tx/f91d0a8a78462bc59398f2c5d7a84fcff491c26ba54c4833478b202796c8aafd" target="_blank" rel="noopener noreferrer">f91d0a8a78462bc59398f2c5d7a84fcff491c26ba54c4833478b202796c8aafd</a></td><td class="sp">P2WPKH</td><td><b>Native P2WPKH spend.</b> Activation block.</td></tr>
+<tr><td class="hn">550,000</td><td class="txid"><a href="https://mempool.space/tx/73965c0ab96fa518f47df4f3e7201e0a36f163c4857fc28150d277caa8589259" target="_blank" rel="noopener noreferrer">73965c0ab96fa518f47df4f3e7201e0a36f163c4857fc28150d277caa8589259</a></td><td class="sp">P2WSH</td><td><b>Native P2WSH multisig.</b> Four witness items.</td></tr>
+<tr><td class="hn">550,000</td><td class="txid"><a href="https://mempool.space/tx/9cf007aa4ed2216c6ca42ba593558cb6ce4df9c5417677d7ca96a7b2be6d807b" target="_blank" rel="noopener noreferrer">9cf007aa4ed2216c6ca42ba593558cb6ce4df9c5417677d7ca96a7b2be6d807b</a></td><td class="sp">P2SH</td><td><b>P2SH-wrapped P2WSH.</b> Four witness items, redeemed through the P2SH wrapper.</td></tr>
+<tr><td class="hn">550,000</td><td class="txid"><a href="https://mempool.space/tx/bdcb08cd977e229482f295345893405882a08132f1675beb844de8548007915f" target="_blank" rel="noopener noreferrer">bdcb08cd977e229482f295345893405882a08132f1675beb844de8548007915f</a></td><td class="sp">P2PKH</td><td><b>Creates a bare multisig output.</b> Consensus-valid, non-standard to relay today. Spends P2PKH.</td></tr>
+<tr><td class="hn">750,000</td><td class="txid"><a href="https://mempool.space/tx/4c9fe4ad5923fd41074da3f92da6359cbafbd96ecbb758481d6c1f106242703e" target="_blank" rel="noopener noreferrer">4c9fe4ad5923fd41074da3f92da6359cbafbd96ecbb758481d6c1f106242703e</a></td><td class="sp">P2TR</td><td><b>Taproot key-path (BIP341).</b> A single witness item. The cheapest spend the chain allows.</td></tr>
+<tr><td class="hn">800,000</td><td class="txid"><a href="https://mempool.space/tx/965f866bf8623bbf956c1b2aeec1efc1ad162fd428ab7fb89f128a0754ebbc32" target="_blank" rel="noopener noreferrer">965f866bf8623bbf956c1b2aeec1efc1ad162fd428ab7fb89f128a0754ebbc32</a></td><td class="sp">P2TR</td><td><b>Taproot script-path (BIP342).</b> With a real 33-byte control block.</td></tr>
+<tr><td class="hn">850,000</td><td class="txid"><a href="https://mempool.space/tx/b10c0000004da5a9d1d9b4ae32e09f0b3e62d21a5cce5428d4ad714fb444eb5d" target="_blank" rel="noopener noreferrer">b10c0000004da5a9d1d9b4ae32e09f0b3e62d21a5cce5428d4ad714fb444eb5d</a></td><td class="sp">P2PK+P2PKH+P2MS+P2SHx3+P2WPKH+P2WSH+P2TRx2</td><td><b>Seven script types in one transaction.</b> 10 inputs spending P2PK, P2PKH, bare multisig, P2SH×3, P2WPKH, P2WSH and P2TR×2; 9 outputs covering nine types including the P2A anchor and nulldata. The widest vector in the corpus — and the only one that spends bare multisig.</td></tr>
+</tbody></table></div>
+
+<p>Every txid above is real and on the main chain and links to mempool.space; each can
+   equally be looked up with <code>getrawtransaction &lt;txid&gt;</code> against any archival
+   node.</p>
+
+<h2><span class="num">02 · coverage</span>What the corpus actually reaches</h2>
+
+<p>Counting by the script type each vector <em>spends</em>:</p>
+
+<div class="ctl" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
+  <div><h3>P2PKH</h3><p class="big" style="color:var(--accent-ink)">7</p></div>
+  <div><h3>P2PK</h3><p class="big" style="color:var(--accent-ink)">4</p></div>
+  <div><h3>P2SH</h3><p class="big" style="color:var(--accent-ink)">4</p></div>
+  <div><h3>P2TR</h3><p class="big" style="color:var(--accent-ink)">3</p></div>
+  <div><h3>P2WPKH</h3><p class="big" style="color:var(--accent-ink)">2</p></div>
+  <div><h3>P2WSH</h3><p class="big" style="color:var(--accent-ink)">2</p></div>
+  <div><h3>bare multisig</h3><p class="big">1</p></div>
+</div>
+
+<div class="note">
+  <h4>Two findings the txid list made visible</h4>
+  <p><strong>Four vectors are output-shape only.</strong> <code>6f7cf958</code>,
+     <code>9c08a4d7</code>, <code>bdcb08cd</code> and <code>461e8a4a</code> are named for a
+     type that appears in their <em>outputs</em>; on the input side they spend ordinary P2PK
+     or P2PKH. They assert that a transaction creating that output is accepted — they do not
+     exercise redemption of it.</p>
+  <p><strong>Bare multisig redemption rests on a single vector.</strong> Two vectors are
+     named "bare multisig" and neither spends one; the only P2MS input in the whole corpus is
+     one of the ten in <code>b10c0000…</code>. Drop that transaction and P2MS verification
+     loses all coverage while the corpus still appears to have two vectors for it.</p>
+</div>
+
+<p><code>b10c0000…</code> is the most valuable transaction here by a wide margin: ten inputs
+   across seven script types, nine outputs across nine, spanning every consensus era from
+   bare P2PK to the P2A anchor in one 3,500-byte transaction.</p>
+
+<h2><span class="num">03 · corrections</span>Labels that were wrong</h2>
+
+<p>Three vectors carried descriptions that did not survive checking the prevouts. They are
+   corrected in the generator; the vectors themselves were byte-identical on regeneration.</p>
+
+<div class="tablewrap"><table class="tx"><thead><tr><th>Vector</th><th>Said</th><th>Actually</th></tr></thead><tbody>
+<tr><td class="sp">9c08a4d7<br>h=170,052</td><td>"an early pay-to-script-hash spend"</td><td>spends <b>P2PK</b>. It cannot be a P2SH spend — BIP16 activated at 173,805, <em>after</em> this block. It creates a P2SH output</td></tr>
+<tr><td class="sp">6f7cf958<br>h=728</td><td>"early P2PKH"</td><td>spends two bare <b>P2PK</b> outputs; P2PKH is the output shape</td></tr>
+<tr><td class="sp">eb3b82c0</td><td>"h=170060-ish"</td><td>is at <b>163,685</b>, and its second input is an anyone-can-spend <code>PUSH20 &lt;data&gt; OP_NOP2 OP_DROP</code> — valid because OP_NOP2 was still a NOP at that height</td></tr>
+</tbody></table></div>
+
+<p>These were descriptive strings, not assertions, so no test was passing on a false
+   premise — but the report built on them, and a reader would have concluded P2SH redemption
+   was covered from block 170,052 when it is not.</p>
+
+<p><strong>One wanted transaction is not in the corpus.</strong>
+   <a href="https://mempool.space/tx/da917699942e4a96272401b534381a75512eeebe8403084500bd637bd47168b3" target="_blank" rel="noopener noreferrer"><code style="word-break:break-all">da917699942e4a96272401b534381a75512eeebe8403084500bd637bd47168b3</code></a> (h=481,824, an OP_RETURN nulldata output) is in the generator's
+   <code>WANTED</code> list but skipped: its prevouts are unresolvable from the oracle. The
+   list asks for 18; 17 ship.</p>
+
+<h2><span class="num">04 · evidence</span>Two controls, because passing proves nothing on its own</h2>
+
+<p>A corpus that accepts everything is indistinguishable from a verifier that accepts
+   everything. Both controls below revert something real and confirm the corpus notices.</p>
+
+<div class="ctl">
+  <div>
+    <h3>Control A — wrong height</h3>
+    <p class="big">2<small>of 17 rejected</small></p>
+    <p>Verifying every transaction at h=900,000 instead of its own. Both failures are
+       pre-BIP66, refused under modern DERSIG with <code>legacy script verification
+       failed</code>. Height is not decoration.</p>
+  </div>
+  <div>
+    <h3>Control B — DER regression</h3>
+    <p class="big">8<small>of 17 rejected</small></p>
+    <p>Removing the leading-zero tolerance from the signature parser. Failures span
+       P2WPKH, P2WSH <em>and</em> legacy paths — the corpus reaches all three verifier
+       arms, not just one.</p>
+  </div>
+</div>
+
+<div class="note">
+  <h4>The first version of this corpus was too weak, and the control proved it</h4>
+  <p>Before the 124,276 vector existed, Control B rejected <strong>nothing</strong> — all
+     sixteen transactions still passed with the DER tolerance narrowed. The corpus looked
+     thorough and covered that fix not at all.</p>
+  <p>The tree's own comment named a real mined transaction with a 34-byte <code>r</code> and
+     <code>s</code>. Finding it (<code>fb0a1d8d…</code>, height 124,276) and adding it is what
+     gave the corpus its second set of teeth. Without running the control, a corpus that
+     tested nothing of the sort would have shipped.</p>
+</div>
+
+<div class="note">
+  <h4>One control was itself faulty — stated rather than quietly fixed</h4>
+  <p>The first attempt at Control B narrowed the strip bound from 32 to 33 and was described
+     as reverting the pre-2026-08-19 behaviour. It is not: stripping to 33 bytes still works
+     downstream, so it rejected nothing.</p>
+  <p>The honest reading is that <strong>that specific off-by-one remains uncovered</strong>.
+     What the corpus does catch is the wholesale loss of leading-zero tolerance. A gap named
+     is worth more than a gap implied.</p>
+</div>
+
+<h2><span class="num">05 · how it runs</span>Three pieces</h2>
+
+<pre>validation/gen_txaccept_vectors.py   pulls each tx + its spent prevouts from the
+                                     oracle (txindex, 965,629 blocks) and freezes
+                                     them with the height they were mined at
+
+asm/tests/txaccept_vec.h             17 vectors, 25 KB
+
+asm/tests/test_txaccept_corpus.c     gated; asserts each tx verifies at its own
+                                     height, and that EVERY input was resolved</pre>
+
+<p>One supporting addition was needed: <code>tx_verify_at_height()</code>, the consensus
+   verifier at a given height driven by a caller-supplied resolver.
+   <code>tx_verify_block_connect</code> needs a live LSM handle;
+   <code>tx_verify_mempool</code> takes a resolver but applies policy flags. Neither shape
+   lets a test judge a historical transaction by its own block's rules.</p>
+
+<p>The resolver hands prevouts back <em>in input order</em>, and the harness asserts every
+   input was resolved — so a verifier that silently skipped one would fail rather than pass
+   with less work done.</p>
+
+<footer>
+  17/17 accepted · 68 assertions · eight static audits GREEN · full gate GREEN<br>
+  Vectors regenerate from the oracle; the corpus is extended by adding a txid and a reason.
+</footer>
+
+</div>
+</body>
+</html>

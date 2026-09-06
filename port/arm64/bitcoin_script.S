@@ -142,6 +142,57 @@ be_to_limbs:
  * persistents: x19=sig x20=slen x21=r_out x22=s_out x23=ht_ptr
  *              x24=r base(original) x25=r len(stripped) x26=end-of-s(orig)
  * -------------------------------------------------------------------------- */
+/* ============================================================================
+ * DER_LONG_LEN \lbl -- SCR-8: decode a long-form DER length, mirroring Core's
+ *   ecdsa_signature_parse_der_lax INTEGER arm exactly (asm/bitcoin_script.asm's
+ *   x86 macro, register-mapped: cursor x4, header byte w2, result x25).
+ *
+ *   A MACRO, not a function, and deliberately so: it advances the CURSOR, and
+ *   the cursor lives in x4 -- a callee that returns with a live cursor changed
+ *   would need a scratch register contract nobody else in this tree documents.
+ *   Only two use sites.
+ *
+ *   in : w2 = the length header byte (high bit already known set)
+ *        x4 = cursor, just past that byte
+ *        x19 = sig base, x20 = sig length
+ *   out: x25 = the decoded length, x4 advanced past the length bytes
+ *        jumps to \lbl on malformed input
+ *
+ *   Core's rules, in order: subtract 0x80; reject if that exceeds the bytes
+ *   remaining; skip leading ZERO length bytes; reject at >= 4 remaining
+ *   significant bytes; accumulate the rest big-endian.
+ *
+ *   Clobbers x5, x6, w2.
+ * ========================================================================== */
+.macro DER_LONG_LEN lbl
+	ubfx w5, w2, #0, #7               /* the number of length bytes */
+	add  x6, x19, x20                 /* end of sig */
+	sub  x6, x6, x4                   /* bytes remaining */
+	cmp  x5, x6
+	b.hi \lbl
+.Ldp_dl_skip\@:
+	cbz  x5, .Ldp_dl_acc\@
+	ldrb w2, [x4]
+	cbnz w2, .Ldp_dl_acc\@
+	add  x4, x4, #1
+	sub  x5, x5, #1
+	b    .Ldp_dl_skip\@
+.Ldp_dl_acc\@:
+	cmp  x5, #4                       /* Core: `if (lenbyte >= 4) return 0;` */
+	b.hs \lbl
+	mov  x6, xzr                      /* accumulator */
+.Ldp_dl_loop\@:
+	cbz  x5, .Ldp_dl_done\@
+	lsl  x6, x6, #8
+	ldrb w2, [x4], #1
+	add  x6, x6, x2                   /* ldrb w2 zero-extends */
+	sub  x5, x5, #1
+	b    .Ldp_dl_loop\@
+.Ldp_dl_done\@:
+	mov  x5, x6                       /* the decoded length, per the x86 contract */
+.endm
+
+
 	.global der_parse_sig
 	.type   der_parse_sig, %function
 der_parse_sig:
@@ -161,16 +212,57 @@ der_parse_sig:
 	ldrb w2, [x19]
 	cmp  w2, #0x30
 	b.ne .Ldp_fail
-	/* r: expect 0x02 rlen */
-	ldrb w2, [x19, #2]
+	/* ---- SCR-8 (audit 2026-09-03): LONG-FORM DER lengths ----------------
+	 * Core verifies ECDSA through ecdsa_signature_parse_der_lax
+	 * (pubkey.cpp), which accepts a long-form length (0x81 xx,
+	 * 0x82 xx xx, ...) for the SEQUENCE and for each INTEGER. This parser
+	 * read every length as one byte, so a signature Core ACCEPTS was
+	 * rejected here -- refusing what Core accepts means refusing a block
+	 * Core connects, i.e. a chain split. Unreachable once DERSIG is active
+	 * (der_sig_strict forbids long form), so this is about pre-BIP66
+	 * history replayed with assumevalid=0 -- exactly what a full validating
+	 * replay from genesis does.
+	 *
+	 * x4 = cursor. Core's shape is followed exactly, including the parts
+	 * that look odd: a long-form SEQUENCE length is SKIPPED without being
+	 * checked (Core does pos += lenbyte and never reads the value), while a
+	 * long-form INTEGER length has its leading zero bytes skipped, is
+	 * rejected at >= 4 significant bytes, and is then accumulated
+	 * big-endian. ---- */
+	add  x4, x19, #1                  /* cursor -> the sequence length byte */
+	ldrb w2, [x4], #1
+	tbz  w2, #7, .Ldp_seq_done
+	ubfx w5, w2, #0, #7               /* the number of length bytes */
+	add  x6, x19, x20                 /* end of sig */
+	sub  x6, x6, x4                   /* remaining */
+	cmp  x5, x6
+	b.hi .Ldp_fail
+	add  x4, x4, x5                   /* Core skips the value entirely */
+.Ldp_seq_done:
+	/* ---- r: expect 0x02 then a short- or long-form length ---- */
+	add  x6, x19, x20
+	cmp  x4, x6
+	b.hs .Ldp_fail
+	ldrb w2, [x4], #1
 	cmp  w2, #0x02
 	b.ne .Ldp_fail
-	ldrb w25, [x19, #3]               /* rlen */
-	cbz  w25, .Ldp_fail
-	add  x24, x19, #4                 /* r value base (original) */
-	add  x4, x24, x25
+	cmp  x4, x6
+	b.hs .Ldp_fail
+	ldrb w2, [x4], #1
+	tbz  w2, #7, .Ldp_rlen_short
+	DER_LONG_LEN .Ldp_fail
+	b    .Ldp_rlen_done
+.Ldp_rlen_short:
+	mov  x25, x2                      /* the short-form byte IS the length */
+	b    .Ldp_rlen_zero
+.Ldp_rlen_done:
+	mov  x25, x5                      /* the decoded length */
+.Ldp_rlen_zero:
+	cbz  x25, .Ldp_fail
+	mov  x24, x4                      /* r value base (original) */
+	add  x26, x24, x25
 	add  x5, x19, x20
-	cmp  x4, x5
+	cmp  x26, x5
 	b.hi .Ldp_fail
 	/* strip ANY number of redundant leading 0x00 down to <=32 significant
 	 * bytes (x86 BUG FIX 2026-08-19; non-minimal DER INTEGER encodings are
@@ -192,16 +284,29 @@ der_parse_sig:
 	bl   be_to_limbs
 	/* s: 0x02 slen at [r base + r len] -- base+len is INVARIANT across the
 	 * strip (base moved up exactly as len moved down), so stripped_base +
-	 * stripped_len == original end of r. */
-	add  x4, x24, x25                  /* s marker */
-	ldrb w2, [x4]
+	 * stripped_len == original end of r. Short- or long-form length (SCR-8). */
+	add  x4, x24, x25                  /* s marker (cursor) */
+	add  x6, x19, x20
+	cmp  x4, x6
+	b.hs .Ldp_fail
+	ldrb w2, [x4], #1
 	cmp  w2, #0x02
 	b.ne .Ldp_fail
-	ldrb w25, [x4, #1]                /* slen (reuse the reg) */
-	cbz  w25, .Ldp_fail
-	add  x24, x4, #2                  /* s value base (moves while stripping) */
-	add  x26, x24, x25                /* end of s (ORIGINAL, unstripped --
-	                                   * the hashtype lookup needs this) */
+	cmp  x4, x6
+	b.hs .Ldp_fail
+	ldrb w2, [x4], #1                  /* slen (short form) or the long-form header */
+	tbz  w2, #7, .Ldp_slen_short
+	DER_LONG_LEN .Ldp_fail
+	mov  x25, x5                      /* the decoded length */
+	b    .Ldp_slen_zero
+.Ldp_slen_short:
+	mov  x25, x2
+	b    .Ldp_slen_zero
+.Ldp_slen_zero:
+	cbz  x25, .Ldp_fail
+	mov  x24, x4                       /* s value base (moves while stripping) */
+	add  x26, x24, x25                 /* end of s (ORIGINAL, unstripped --
+	                                    * the hashtype lookup needs this) */
 	add  x5, x19, x20
 	cmp  x26, x5
 	b.hi .Ldp_fail

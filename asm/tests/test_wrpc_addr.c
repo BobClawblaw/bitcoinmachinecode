@@ -14,13 +14,17 @@ extern long wallet_p2wpkh_address(char* out, long cap, const unsigned char h160[
 extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64], unsigned index);
 extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[64], unsigned index);
 extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20], unsigned char prog32[32]);
+extern int  wallet_validate_address_ex(const char* str, int* type_, unsigned char* version,
+                                       unsigned char h160[20], unsigned char* prog,
+                                       unsigned long progcap, unsigned long* proglen, int* witver);  /* WAL-9 */
 extern int  wallet_base58check_decode(unsigned char* out, long cap, long* outlen, const char* str);
 extern void wallet_key_h160(unsigned char h[20], const unsigned char priv_be[32]);
 extern int  wallet_address(char out[64], const unsigned char priv_be[32]);
 extern void base58check_encode(char* out, const unsigned char* payload, long long paylen);
 
 enum wal_addr_type { WAL_ADDR_INVALID = 0, WAL_ADDR_P2PKH, WAL_ADDR_P2WPKH,
-                     WAL_ADDR_P2SH, WAL_ADDR_P2WSH, WAL_ADDR_UNKNOWN };
+                     WAL_ADDR_P2SH, WAL_ADDR_P2WSH, WAL_ADDR_P2TR, WAL_ADDR_UNKNOWN,
+                     WAL_ADDR_WITNESS_UNKNOWN };
 
 static int fails = 0;
 static void ck(const char* label, int got, int expected) {
@@ -113,6 +117,88 @@ int main(void) {
         ck("prefix bc1q", strncmp(recv, "bc1q", 4) == 0, 1);
         printf("  derived: %s (idx0 receive)\n", recv);
         printf("  derived: %s (idx0 change)\n", chg);
+    }
+
+    /* ---- WAL-9: witness versions 2..16 (BIP350) --------------------------
+     * A checksum-valid bech32m address for witness v2..16 is a VALID
+     * destination to Core (WitnessUnknown): validateaddress reports
+     * isvalid:true with the version and program, and sendtoaddress pays it.
+     * This node answered isvalid:false -- a definite wrong answer about a
+     * well-formed address, not an absent feature.
+     *
+     * Both strings and both expected scriptPubKeys are BIP350's OWN vectors,
+     * not values derived from this implementation:
+     *
+     *   BC1SW50QGDZ25J                        -> 6002751e
+     *   bc1zw508d6qejxtdg4y5r3zarvaryvaxxpcs  -> 5210751e76e8199196d454941c45d1b3a323
+     *
+     * They bracket the range deliberately: v16 with the 2-byte minimum
+     * program, and v2 with a 16-byte one. The first is also UPPERCASE, which
+     * is what exercises the canonical-lowercase echo. */
+    printf("\n---- WAL-9: witness v2..16 (BIP350 vectors) ----\n");
+    {
+        int type = -1, wv = -1; unsigned char ver = 0, h160[20], prog[40];
+        unsigned long plen = 0;
+
+        int ok = wallet_validate_address_ex("BC1SW50QGDZ25J", &type, &ver, h160,
+                                            prog, sizeof prog, &plen, &wv);
+        ck("BIP350 v16 address is VALID (Core: isvalid true)", ok, 1);
+        ck("...classified WITNESS_UNKNOWN", type, WAL_ADDR_WITNESS_UNKNOWN);
+        ck("...witness version 16", wv, 16);
+        ck("...2-byte program", (int)plen, 2);
+        ck("...program is 751e", plen == 2 && prog[0] == 0x75 && prog[1] == 0x1e, 1);
+
+        type = -1; wv = -1; plen = 0;
+        ok = wallet_validate_address_ex("bc1zw508d6qejxtdg4y5r3zarvaryvaxxpcs",
+                                        &type, &ver, h160, prog, sizeof prog, &plen, &wv);
+        ck("BIP350 v2 address is VALID", ok, 1);
+        ck("...classified WITNESS_UNKNOWN", type, WAL_ADDR_WITNESS_UNKNOWN);
+        ck("...witness version 2", wv, 2);
+        ck("...16-byte program", (int)plen, 16);
+        { static const unsigned char want[16] =
+            {0x75,0x1e,0x76,0xe8,0x19,0x91,0x96,0xd4,0x54,0x94,0x1c,0x45,0xd1,0xb3,0xa3,0x23};
+          ck("...program matches BIP350's", plen == 16 && memcmp(prog, want, 16) == 0, 1); }
+
+        /* THE OLD ENTRY POINT MUST NOT CHANGE. It hands back a fixed 32-byte
+         * buffer with no length, and a v2..16 program is 2..40 bytes, so it
+         * still reports these INVALID -- deliberately. All thirty of its
+         * callers keep the behaviour they had. */
+        type = -1;
+        unsigned char prog32[32];
+        ck("the OLD wallet_validate_address still refuses v2..16 (30 callers unchanged)",
+           wallet_validate_address("BC1SW50QGDZ25J", &type, &ver, h160, prog32), 0);
+        ck("...reporting INVALID", type, WAL_ADDR_INVALID);
+
+        /* THE OPPOSITE HALF: the versions that were already right stay right. */
+        type = -1; wv = -1; plen = 0;
+        ok = wallet_validate_address_ex("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                                        &type, &ver, h160, prog, sizeof prog, &plen, &wv);
+        ck("a v0 P2WPKH is still P2WPKH, not WITNESS_UNKNOWN", ok && type == WAL_ADDR_P2WPKH, 1);
+        type = -1;
+        ok = wallet_validate_address_ex("bc1pqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqszqgpqyqs3rvz2j",
+                                        &type, &ver, h160, prog, sizeof prog, &plen, &wv);
+        ck("a v1 P2TR is still P2TR, not WITNESS_UNKNOWN",
+           !ok || type == WAL_ADDR_P2TR, 1);
+
+        /* SER-5/WAL-9's first half (closed earlier) must survive this change.
+         * BIP173: "the string must be either all lowercase or all uppercase".
+         *
+         * The first version of this assertion sent an ALL-UPPERCASE string and
+         * called it mixed case -- and it correctly came back VALID, so the
+         * test failed on its own mistake rather than on the code. All-upper is
+         * legal; the case rule is about MIXING. Both are asserted now. */
+        type = -1;
+        ck("an ALL-UPPERCASE bech32 address is valid (BIP173 allows it)",
+           wallet_validate_address_ex("BC1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
+                                      &type, &ver, h160, prog, sizeof prog, &plen, &wv), 1);
+        type = -1;
+        ck("a MIXED-case address is rejected (SER-5/WAL-9 first half)",
+           wallet_validate_address_ex("bc1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4",
+                                      &type, &ver, h160, prog, sizeof prog, &plen, &wv), 0);
+        type = -1;
+        ck("...and so is the other mixing (upper hrp, lower data)",
+           wallet_validate_address_ex("BC1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+                                      &type, &ver, h160, prog, sizeof prog, &plen, &wv), 0);
     }
 
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);

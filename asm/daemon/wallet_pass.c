@@ -37,6 +37,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <fcntl.h>   /* DMN-13: open(2), replacing the stdio read */
 #include "wallet_pass.h"
 
 /* Deliberately NOT read out of g_cfg. rpc_wallet_ops.o calls into here and is
@@ -50,6 +51,14 @@ void wallet_pass_set_file(const char* path){
     snprintf(g_passfile, sizeof g_passfile, "%s", path);
 }
 
+/* DMN-13: a wipe the optimiser may not delete. wallet_pass.c is deliberately
+ * dependency-free -- it is linked into 31 targets without node_config.o -- so
+ * this is a local three-liner rather than an include of secure_zero.h. */
+static void secure_wipe_local(void* p, size_t n){
+    volatile unsigned char* q = (volatile unsigned char*)p;
+    while (n--) *q++ = 0;
+}
+
 static int read_secret_file(const char* path, char* out, int cap, const char** why){
     struct stat sb;
     if (stat(path, &sb) != 0){ if (why) *why = "no such file"; return 0; }
@@ -59,14 +68,64 @@ static int read_secret_file(const char* path, char* out, int cap, const char** w
     if (sb.st_mode & 0007){ if (why) *why = "world-accessible (need mode 0640 or stricter)"; return 0; }
     if (sb.st_mode & 0020){ if (why) *why = "group-writable (need mode 0640 or stricter)"; return 0; }
 
-    FILE* f = fopen(path, "r");
-    if (!f){ if (why) *why = "unreadable by the service account"; return 0; }
+    /* ---- DMN-13 (audit 2026-09-03): read(2), and REFUSE rather than truncate
+     *
+     * This used fopen + fgets(out, cap, f). Two problems:
+     *
+     * 1. stdio allocates a buffer for the FILE and frees it WITHOUT clearing
+     *    it, so a copy of the passphrase outlived every call. WAL-3 locked and
+     *    wiped the destination globals; this was the copy nobody wiped.
+     *    read(2) into the caller's buffer has no such shadow.
+     *
+     * 2. fgets SILENTLY TRUNCATES at cap. Every caller passes 256. That was
+     *    invisible while the KDF truncated at 96 anyway -- and WAL-7 removed
+     *    that truncation, so the two paths now DISAGREE: a 300-byte passphrase
+     *    file seals with 300 bytes through one path and unlocks with 255
+     *    through this one, and the wallet simply will not open. The operator
+     *    is told "wrong passphrase" for a correct passphrase. Fixing WAL-7
+     *    made this reachable, which is the whole argument for refusing.
+     *
+     * Refuse on overflow rather than silently shortening: a passphrase the
+     * node cannot read in full is one it cannot use, and saying so is the only
+     * answer that does not lose funds behind a misleading error. */
+    int fd = open(path, O_RDONLY);
+    if (fd < 0){ if (why) *why = "unreadable by the service account"; return 0; }
     out[0] = 0;
-    if (!fgets(out, cap, f)){ fclose(f); out[0] = 0; if (why) *why = "empty"; return 0; }
-    fclose(f);
+    long got = 0;
+    for (;;){
+        ssize_t n = read(fd, out + got, (size_t)(cap - 1 - got));
+        if (n < 0){
+            close(fd);
+            secure_wipe_local(out, (size_t)cap);
+            if (why) *why = "unreadable by the service account";
+            return 0;
+        }
+        if (n == 0) break;
+        got += n;
+        if (got >= cap - 1){
+            /* is there more? one byte past the buffer decides truncate-vs-fits */
+            char probe;
+            ssize_t extra = read(fd, &probe, 1);
+            if (extra > 0){
+                close(fd); secure_wipe_local(out, (size_t)cap);
+                if (why) *why = "longer than this build can read (max 254 bytes before the newline)";
+                return 0;
+            }
+            break;
+        }
+    }
+    close(fd);
+    out[got] = 0;
+    /* the secret is the FIRST LINE, as before */
+    { char* nl = memchr(out, '\n', (size_t)got);
+      if (nl) *nl = 0; }
     size_t l = strlen(out);
     while (l && (out[l-1] == '\n' || out[l-1] == '\r')) out[--l] = 0;
-    if (!out[0]){ if (why) *why = "empty"; return 0; }
+    if (!out[0]){
+        secure_wipe_local(out, (size_t)cap);
+        if (why) *why = "empty";
+        return 0;
+    }
     return 1;
 }
 

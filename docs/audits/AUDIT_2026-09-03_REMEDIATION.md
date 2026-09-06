@@ -4,15 +4,49 @@ Companion to `CODEBASE_AUDIT_2026-09-03.md` (182 findings; 29 distinct
 CRITICAL+HIGH after de-duplication). This file records what has been fixed,
 what has not, and what was found along the way.
 
-**Status as of 2026-09-04 (second pass): 28 of the 29 CRITICAL+HIGH closed,
-1 partial (MEM-3), 0 open.
-Full gate: 218 test binaries pass; 1 fails on a stale fixture (below). Everything MEDIUM and below is untouched except
-UTX-3** (one MEDIUM, UTX-3, was
-closed because it sits on the same silent-coin-loss path as the HIGHs around
-it).
+**Status as of 2026-09-04 (third pass): all 29 CRITICAL+HIGH closed, and 43
+of the 44 MEDIUM addressed (41 closed outright, 2 partial).** MEM-3, the last
+CRITICAL+HIGH, is on branch `mem3-parent-overflow`. VAL-5 and UTX-4, both
+previously partial, are complete apart from UTX-4's undo-file fsync.
+
+**The remainder is larger than those numbers suggest, and this log should say
+so plainly.** The audit has 182 findings. The 29 CRITICAL+HIGH and 44 MEDIUM
+are 73 of them; **the 65 LOW and 32 INFO -- 97 findings, more than half the
+audit -- have never been examined at all.** "All CRITICAL+HIGH and 43 of 44
+MEDIUM" is true and is also the flattering way to say it.
+
+The one MEDIUM still open is **NET-10** (the address manager has no bucketed
+structure), which is a design change rather than a defect fix: Core's addrman
+keeps separate tried/new tables, buckets `new` by source group so no single
+source can fill more than a bounded fraction, and resolves collisions by
+test-before-evict. This node has one flat 65,536-entry array evicting by
+peer-supplied timestamp.
+
+The full gate passes end to end. Two tests are quarantined with reasons a
+reader can check (`test_outbound_mux`, `test_redial` -- both feed
+regtest-difficulty blocks to a mainnet-params daemon, which VAL-11 correctly
+refuses; bisected to `19e59df` in a throwaway worktree, and pre-existing).
+Every fix in this log carries a regression test and a NEGATIVE CONTROL: the
+fix was reverted and the test observed to fail before the commit landed. Four
+of those negative controls found the test rather than the fix -- vacuous
+fixtures that passed either way -- and one of them (CRY-4) does not fail an
+assertion at all, it segfaults, which is the defect.
 
 Counted against the audit's own §2 priority ranks: closed are ranks 1-5, 6,
 8, 11-19, 20-22, 24-28; partial are 7 and 10; open are 9 (in part), 23, 29.
+
+**Findings the remediation itself produced, all caught by the gate and fixed:**
+the `val_read_tx` output-section regression in §1 (a consensus break on every
+segwit block, found on `main`); a Makefile rule placed above the variable it
+uses, three times, which only `link-check` catches; a pre-push hook written as
+an allow-list of one identity, which silently blocked every push; and the
+canonical-CompactSize change landed on the C parser but not its assembly twin
+(§4.3). Two defects were found while writing tests for other findings and are
+fixed here though the audit never listed them: `find_header` never saw the
+last header line (a request body in a second TCP segment was a parse error,
+and an Authorization header sent last got a 401), and `test_redial` had been
+red since VAL-11 without anyone noticing, because the gate aborted at
+`test_outbound_mux` first.
 
 This log is honest about the remainder rather than rounding it off; §4
 enumerates every open item.
@@ -47,7 +81,8 @@ all. The next deploy from `main` would have stopped block connection dead.
 
 Fixed in `b0c4231`, with `tests/test_val_read_tx.c` (26 checks over six real
 mainnet transactions, segwit and legacy, from three eras, all with nonzero
-locktimes). **That commit should reach `main` before any further deploy.**
+locktimes). Cherry-picked onto `main` as `70b2666`, so the warning above is
+discharged: `main` no longer carries the regression.
 
 Why no existing test caught it: nothing in the suite drives a real segwit
 block through Phase 0.15. `test_val_connect`, `test_blk_dryrun`,
@@ -240,14 +275,72 @@ not in the audit.
 * **VAL-5** — the fetch path enforces all of it (`a456bd4`); `reorg_analyze`
   is not yet wired to the same rules.
 
-### 4.2 Open, CRITICAL+HIGH
+### 4.2 CRITICAL+HIGH: none open
 
-None.
+**VAL-5 is now fully closed.** Its remaining half -- Core's
+ContextualCheckBlockHeader trio on the REORG path -- landed after the boot
+fetch and block-connect halves. `reorg_analyze` checked PoW, linkage and the
+nBits schedule but not time-too-old, time-too-new or bad-version, so a
+candidate chain carrying such a header was judged on WORK alone and, if it
+won, every one of its blocks was connected. Armed by the daemon next to
+`reorg_set_pow_rules` and default-off for the hermetic suites, with the
+median-time-past read through the same composite header reader
+`pow_check_bits` already uses for the retarget window.
+
+**MEM-3 (HIGH) -- the 24-parent cap. CLOSED** on branch
+`mem3-parent-overflow` (`80f66c6`), kept off the main batch branch because it
+changes a MAP_SHARED layout and deserves to be reviewed on its own.
+
+The two cheap options were both tried and both fail, which is why the finding
+sat open through the earlier passes:
+
+* *Reject when a transaction has more in-pool parents than can be recorded*
+  rests on Core's PRE-v31 25-ancestor CHAIN limit -- which is what the old
+  code comment cited. This node implements v31 CLUSTER limits (64
+  transactions), under which a child of 63 parents is legal and Core accepts
+  it. Implemented, and reverted: it fails this project's own
+  `test_mempool_policy` case "child C joins them: cluster of exactly 64
+  accepted".
+
+* *Raise the cap to 63 inline* was measured, not estimated: `mpol_node` grows
+  192 -> 348 bytes, **+156 MB** at the default 1,048,576-node sizing.
+
+* *Have getblocktemplate verify each input resolves* would close the dangerous
+  OUTCOME rather than the cause, but `rpc_chain.c` reaches the mempool through
+  injected hooks and has no UTXO view -- it cannot tell "this parent
+  confirmed" from "this parent vanished", which is exactly the distinction the
+  check needs.
+
+**What landed instead:** the audit's remaining option, out-of-line storage.
+The first 8 parents stay in the node and the rare node needing more borrows a
+fixed block from a pool appended after the node array. The node SHRINKS
+192 -> 128 bytes, and the pool (one block per eight nodes, a deliberately
+pessimistic ratio) costs 27.5 MB -- a **net 36.5 MB saving** against the
+layout it replaces, and 192 MB cheaper than 63 inline. All twenty `parent[]`
+access sites go through accessors; overflowing 63 is refused as
+`too-large-cluster`, which is the rule such a transaction actually breaks.
+
+Three things each cost a debugging round and are worth knowing before touching
+this again: the block must be released BEFORE `remove_node`'s swap-with-last
+overwrites the slot; the availability check must run BEFORE the RBF evictions
+in step 1a, or a failure repeats MEM-6's atomicity defect; and the refusal
+reason matters, because the existing 64-parent case pins it.
+
+The negative control reproduces the finding as an executable claim: against
+the previous file the child reports 24 parents and SURVIVES its parent's
+replacement -- the invalid-block path.
 
 ### 4.3 MEDIUM and below
 
-44 MEDIUM, 68 LOW, 33 INFO in the audit. **Eleven MEDIUM are now closed**;
-the rest, and everything LOW/INFO, are untouched.
+44 MEDIUM, 68 LOW, 33 INFO in the audit. **Thirty-nine MEDIUM have been
+addressed: 37 closed outright, and 2 partial** -- WAL-3 and NET-9, each with
+its residual named in the row or the note below it. CRY-4 is now complete, and
+SER-3's remaining piece is `bitcoin_tx.asm`'s structural walker, which both
+acceptance gates in front of it now cover. LOW and
+INFO are untouched.
+
+(VAL-5 is a HIGH and is accounted for in §4.2, not here, even though its
+remaining half landed in the same pass.)
 
 | Finding | What it was | Commit |
 |---|---|---|
@@ -265,6 +358,115 @@ the rest, and everything LOW/INFO, are untouched.
 | RPX-3 | `getaddressinfo` emitted a fabricated `pubkey`/`iscompressed` | `dccaa57` |
 | RPC-1 | fd + response body leaked; `accept()` spun on EMFILE | `5f2a3e0` |
 | DMN-6 | Serve children held the RPC listener and ignored SIGTERM | `5f2a3e0` |
+| SER-4 | BIP152 read the tx count as one byte: no block with >=253 txs could be served | `4cd988c` |
+| STO-8 | `getblockfilter` fell back to a prevout-less filter | `4cd988c` |
+| WAL-4 | Wallet writes were not atomic and the temp file was world-readable | `cf57efa` |
+| RPC-2 | The authenticated user was a process global across RPC threads | `cf57efa` |
+| STO-7 | The mempool was never reconciled after a reorg: `reorg_mempool_reconcile` had no caller | `cbaeff6` |
+| UTX-5 | A failed manifest publish deleted the merged run memory was already pointing at | `8bb4950` |
+| STO-6 | `cfheaders`/`cfcheckpt` rewrote the count varint in place, producing an unparseable reply | `60d58c7` |
+| UTX-6 | An unreadable or over-capacity manifest read as "no runs" and returned success | `a0cda89` |
+| RPC-3 | `getpeerinfo.id` and `disconnectnode` used different numbering | `6e0c4ec` |
+| RPC-4 | A slow, unauthenticated sender pinned an RPC worker indefinitely | `d13c7ea` |
+| (unlisted) | `find_header` never saw the last header line: a body in a second segment was a parse error, and an Authorization header sent last got 401 | `d13c7ea` |
+| MEM-7 | RBF accepted a replacement paying more in total at a fraction of the feerate | `204b9d8` |
+| MEM-6 | The RBF eviction was applied even when the replacement could not be stored | `204b9d8` |
+| MEM-13 | Dead blob bytes forced a spurious eviction and a 12-hour mempoolminfee bump | `204b9d8` |
+| MEM-8 | Reorg reconcile left ghosts above 8,192 transactions | `204b9d8` |
+| VAL-10 | Non-canonical CompactSize and a superfluous witness record both parsed | `e99bd1c` |
+| SER-3 (part) | The shared C readers now enforce canonical CompactSize and MAX_SIZE | `e99bd1c` |
+| CRY-4 (part) | The BIP39 passphrase had no bound; the HMAC key stayed in .bss | `e99bd1c` |
+| DMN-4 | Config sections and `no` negation were not implemented | `e99bd1c` |
+| BLD-2 | Four `_diff` harnesses took Core's bench block as a literal path and aborted the whole recipe without it | `cadb742` |
+| WAL-3 (part) | The seed, the BIP39 passphrase and the wallet passphrase stayed in `.bss` after `walletlock` | `cadb742` |
+| NET-6 | Closed by VAL-11: all five checks plus the `diff_target` clamp, and every caller it named now runs `pow_check` | `19e59df` |
+| UTX-4 (rest) | A torn WAL tail was never truncated, so every later append landed after it and every future reload stopped there | `51447cb` |
+| NET-9 (part) | The one-byte BIP152 tx count was SER-4; the documentation claiming "both directions" is corrected here. The RECEIVE side has never existed and is a feature, not a fix -- `bitcoin_serve.asm` writes `cmpctblock`/`blocktxn` and has no inbound handler for either | `4cd988c` + docs |
+| MEM-9 | Inv processing was O(entries x table) with no per-peer bound: ~10^8 byte-compares per message, 64 messages per pass, in the download worker | `045ef64` |
+| MEM-10 | Inbound peers could force unbounded re-fetch and re-verification: no memory of an already-refused transaction | `4989ff0` |
+| WAL-2 | The spend path told the signer every coin was P2WPKH, so every non-bech32 coin was unspendable while listunspent said otherwise | `f04a52b` |
+| WAL-3 | Secrets survived `walletlock` in `.bss`, and could reach swap, hibernation or a core file | `cf57efa`, `9f992b6` |
+| STO-5 | `submitblock` and an inbound serve child appended through the UNLOCKED `store_append`, at a cached file position | (this commit) |
+| MEM-12 | Policy tables hash-indexed (accepts flat, 250x at 80k) and block connect batched (O(n) not O(n*m), 5x at 260k) | `44f6064`, `6f89c24` |
+| CRY-4 | SHA-512's schedule and HMAC's key block were process-global .bss: two threads corrupted each other silently | `54aa254` |
+| SER-3 | The mempool admission reader accepted non-canonical CompactSize, so a transaction Core cannot deserialize could be relayed from here | `fdea2f1` |
+
+**MEM-12 is now fully closed**, and the numbers scope both halves. The audit's
+verdict was "CONFIRMED for complexity; timings PLAUSIBLE (not measured)", so
+`tests/bench_mempool_scale.c` was written first.
+
+*Accepts* were exactly linear in pool size and are now flat -- 250x at 80,000
+entries, and the gap widens with every entry added:
+
+| entries | us/accept before | after |
+|---|---|---|
+| 10,000 | 12.6 | **0.7** |
+| 40,000 | 74.6 | **0.6** |
+| 80,000 | 151.6 | **0.6** |
+| 260,000 | (~490 extrapolated) | **0.7** |
+
+*Block connect* needed a different fix, and the middle column below is why:
+indexing the lookups barely helped, because `remove_node` is O(n) whatever the
+lookups cost -- three of its steps are full sweeps, not lookups -- and it ran
+once per confirmed transaction, so an m-transaction block cost O(n*m). Marking
+the whole block and compacting ONCE makes it O(n + links):
+
+| entries | original | indexed only | **batch** |
+|---|---|---|---|
+| 10,000 | 4.02 ms | 2.31 ms | **0.99 ms** |
+| 40,000 | 15.77 ms | 8.55 ms | **4.80 ms** |
+| 80,000 | 33.41 ms | 17.92 ms | **8.04 ms** |
+| 260,000 | (~107 ms) | 158.14 ms | **31.02 ms** |
+
+The O(n) claim is checked directly rather than asserted: a TEN TIMES larger
+block costs the same -- 7.91 ms for 200 transactions against 8.03 ms for
+2,000, at 80,000 entries.
+
+The batch had to preserve the distinction between Core's `removeForBlock` (a
+CONFIRMED transaction leaves alone; its children stay) and `removeRecursive`
+(a CONFLICTED one leaves with its descendants). Two bugs came from getting
+that wrong, both caught by the existing suite: a single-level mark swept the
+children of every confirmed transaction, and -- less obvious -- a confirmed
+transaction CLAIMS ITS OWN INPUTS, so `find_claim` answers with the
+transaction itself. The per-transaction path never saw the second, because
+`remove_confirmed` had already deleted those claims by the time it looked.
+
+The child-index alternative was costed and not taken: threading a reverse
+index through the existing parent slots needs a parallel `next` array of the
+same shape, growing the node 128 -> 160 bytes and the overflow pool 27.5 ->
+55 MB -- about +60 MB, erasing the saving this work otherwise makes. Batch
+removal needs no new storage at all.
+
+
+
+**A regression this pass produced, and caught.** `e99bd1c` enforced canonical
+CompactSize in the three shared C readers and left
+`bitcoin_txv_parse.asm`'s `RDCS` macro alone. The two parsers are compared
+case-for-case by `tests/test_txv_parse_diff`, so the gate over that commit
+went red with 339 mismatches -- one for every fixture shape emitting
+`fd 03 00` for a length of 3. `main` was red between `e99bd1c` and `cadb742`.
+Recorded because it is the second time this pass that a change to one side of
+a differential was landed without the other, and because the gate is what
+found it: no reviewer would have.
+
+**NET-6 needs no separate change: VAL-11 closed it.** The audit asked for
+Core's four `CheckProofOfWork` checks and a clamp on `diff_target`'s
+out-of-buffer write; VAL-11 implemented all five (`fNegative`, mantissa 0,
+`fOverflow` in each of its three forms, the armed chain `powLimit`, and the
+`e3 >= 32` clamp) and `tests/test_pow_check.c` pins them. NET-6 also listed
+three callers that skipped the schedule: the boot header fetch is PoW-gated by
+VAL-5 (`141c786`), `reorg.c`'s `headers_chain_valid` calls `pow_check`
+directly, and `.do_block` reaches it through `cons_verify`. Recorded here
+rather than left in the open column, because "closed by another finding's fix"
+is a different thing from "not done".
+
+**DMN-2 is materially closed by the same work.** Its failure scenario -- a
+peer answering the boot `getheaders` with 2,000,000 zero-work headers -- needs
+headers that pass no PoW check, and VAL-5 now gates every one before
+`hst_append` with the armed mainnet `powLimit`. Forging that many headers at
+mainnet difficulty is not a thing an attacker does. What DMN-2 asked for and
+is still absent: the nBits retarget schedule on the boot path, and a
+second-peer cross-check before extending `index.dat` by a large span.
 
 Each has a regression test and a verified negative control, on the same terms
 as the CRITICAL+HIGH work.
@@ -276,7 +478,99 @@ makes four tests found this pass that encoded behaviour a later fix had
 deliberately changed (SCR-5's 253-byte reject, VAL-11's powLimit fixture,
 `test_outbound_mux`'s difficulty, and this one).
 
-**Partial:** UTX-4's second half — a torn WAL tail is never truncated, so every
-later append lands after it and every future reload stops there — is in
-`bitcoin_utxo_store.asm`'s reload path and is not fixed. Undo files are still
-unsynced.
+**UTX-4's second half is now closed too.** A torn WAL tail is truncated on
+reload: the replay records where each record starts, and on the path taken by
+a short prefix, a short body or an unrecognised op byte it sets `log_len` to
+that offset and `ftruncate`s the file there. Truncating to the CONSUMED offset
+would not have worked -- a record whose 8-byte prefix reads cleanly and whose
+op byte is unrecognised has already advanced the counter past itself, so the
+cut would keep the very bytes that break every future replay. Undo files are
+still unsynced, which is the remaining piece of UTX-4.
+
+---
+
+## 2026-09-04 — the last untouched HIGH, and a corrected accounting
+
+This log had drifted from the tree. Three IDs (`DMN-1`, `MEM-2`, `UTX-1`)
+appeared in the table while a second check listed them as outstanding, and
+fixes that had landed (`SCR-6`, `CRY-1`) were never recorded here at all. The
+authoritative check is git history, not this file. Re-running the 180 findings
+against it, every CRITICAL and HIGH carries a commit except three:
+
+| ID | Severity | Status after this pass |
+|----|----------|------------------------|
+| VAL-9 | HIGH | ALREADY CLOSED by SCR-5 (`17bf36b`) -- the same defect filed under two IDs. `daemon/tx_verify.c:416-424` writes a real CompactSize for the spent scriptPubKey run. Two comments (lines 376, 395) still say "one length byte" and are now stale. |
+| NET-4 | HIGH | SUBSTANTIALLY CLOSED by `141c786` plus VAL-5/VAL-11: `dlc_fetch_headers` PoW-gates every header before `hst_append`, checks the nBits range, applies the contextual rules, and bounds both the page count (`cnt > DLC_HDR_PAGE`) and the round count (1000). The zero-work chain the finding describes cannot be built once each header must carry real work. The minimum-chain-work floor is enforced on the reorg/connect path (`daemon/minchainwork.c`). |
+| NET-5 | HIGH | FIXED HERE. |
+
+### NET-5 — contextual header rules on the inbound-block path
+
+`bitcoin_serve.asm`'s `.do_block` wrote a peer-pushed block to the durable
+archive after exactly two gates: `cons_verify`, which is entirely context-FREE
+(PoW against the header's own nBits, every tx parses, first tx is a coinbase,
+merkle root matches), and `store_validates_prevhash`, which only asks that the
+block extend our tip. Core refuses a header far earlier, in
+`ContextualCheckBlockHeader`: the nBits RETARGET SCHEDULE for the height, the
+median-time-past floor, the 2-hour future ceiling, and the BIP34/66/65
+version rules.
+
+Consensus was never at risk -- `daemon/utxo_live.c` re-checks the schedule when
+a block is CONNECTED and would refuse it there. The ARCHIVE was. A block has to
+extend our tip to reach this path, so a header Core rejects became our durable
+tip at a height it can never connect at, and the node stalls behind it. That
+stall is the confirmed half of the finding.
+
+`serve_block_ctx_ok` (new `daemon/serve_hdrctx.c`) applies all four rules
+before the append, and is INJECTED and default-OFF exactly like
+`reorg_set_pow_rules` / `reorg_set_header_rules`, for the same reason: the
+hermetic serve suites build synthetic chains with arbitrary bits, timestamps
+and versions. `daemon/main.c` arms it after `chainparams_select`. A rejected
+block is dropped and NEVER scored -- our verifier is not the reference, so a
+false reject here must not ban an honest peer, the same reasoning the
+`cons_verify` result above it already carries.
+
+Gated by `tests/test_serve_block_ctx`: all four rejections with Core's own
+reason strings, two accepts, and it OPENS with the unarmed negative control
+(every rejected header is accepted while the rules are off), so removing the
+gate makes the suite fail rather than pass vacuously.
+
+**Two build-structure notes, both caught by the audits and not by review.**
+The code first went into `daemon/tx_accept.c`, which pulled `pow_check_bits`,
+`store_get_at` and `store_rd_fd` into nine unrelated targets -- `link-check`
+named all nine. Splitting it into its own file fixed that. The object is built
+at the REPO ROOT rather than in `daemon/` because
+`scripts/makefile_link_audit.py:220` globs `*.o` and not `daemon/*.o`, so a
+`daemon/`-local object is invisible to the link audit.
+
+**And one self-inflicted regression.** Adding `bitcoin_pow_rules.o` to
+`DAEMONOBJS` put it on nine link lines twice (`multiple definition of
+pow_retarget_bits` and friends) -- straight past the Makefile comment at line
+170 that says the object "lives HERE ONLY" in `DAEMON_RPCOBJS` for precisely
+this reason. `link-check` stayed GREEN through it: it verifies every needed
+symbol is supplied, not that none is supplied twice. Only the clean build
+caught it, the second time this pass that a duplicate listing was invisible to
+both incremental builds and the audits. It now lives in `DAEMON_RPCOBJS` and
+`SERVEOBJS` (whose targets link no `DAEMON_RPCOBJS`), plus the two
+`test_bitcoind*` rules, which link neither bundle.
+
+Clean gate: 284 suites, 0 failures. prereq-check 461 rules, runlist-check 338
+gated, link-check 412 rules, abi-check, callee-saved-check and clean-check OK.
+
+### What remains
+
+No CRITICAL, HIGH or MEDIUM finding is now unaddressed except `NET-10`, which
+is scoped and deliberately not started (`docs/audits/NET-10_ADDRMAN_SCOPE.md`).
+**67 LOW and 33 INFO findings have never been examined.**
+
+**Correction (same day).** An earlier revision of this section, and the commit
+message of `13d2317`, claimed `MEM-10` was half-wired -- that its filter was
+attached and cleared but never consulted or populated. That was WRONG, and the
+error was a grep for the wrong symbol names: the functions are
+`serve_reject_has` / `serve_reject_note` (singular), not `serve_rejects_*`.
+MEM-10 is fully wired and matches Core's `AlreadyHaveTx` / `m_recent_rejects`
+semantics: `bitcoin_serve.asm:591` consults the filter before sending a
+getdata, and `daemon/tx_accept.c` records a refusal at both final-verdict
+sites (script failure, line 953; final policy failure, line 971), while
+deliberately NOT recording the reconsiderable fee class (-28, which a CPFP
+child can overturn) or missing inputs (-25, which the orphan pool re-tries).
+The startup line reports a filter that does exactly what it says.

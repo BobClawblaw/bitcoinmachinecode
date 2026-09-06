@@ -35,11 +35,15 @@ extern serve_tx_gate
 extern serve_inv_gate
 extern serve_mempool_msg
 extern serve_policy_disconnect_log
+; NET-5: contextual header rules for a peer-pushed block (daemon/tx_accept.c)
+extern serve_block_ctx_ok
     extern serve_idx_topup
     extern serve_cfilters
+    extern serve_reject_has          ; MEM-10: daemon/serve_rejects.c
     extern idx_put
     extern store_append
     extern block_strip_witness
+    extern strip_witness              ; MEM-24: the TX equivalent
     extern idxscan_append_locked
     extern store_validates_prevhash
     extern cons_verify
@@ -214,6 +218,10 @@ s_tip:    dq 0
 s_from:   dq 0
 s_htidx:  dq 0     ; stable copy of ht_idx (a callee clobbers r15; store it once)
 s_txid:   times 32 db 0 ; inbound tx's computed BIP141 txid
+s_gdbh:   times 32 db 0 ; STO-10: hash of the block getdata is about to send
+s_gdlen:  dq 0          ; STO-10: node_serve_block's length across the block_hash call
+                        ; (its OWN slot, not s_n: s_n is the getheaders/cfilter
+                        ;  counter and aliasing it here would be a latent trap)
 s_st:     dq 0     ; stable copy of the store context (r14 also at risk)
 s_fd:     dq 0     ; stable copy of the peer fd (r12 at risk: cons_verify clobbers it)
 s_lfd:    dq 0     ; stable copy of the log fd (r13 at risk)
@@ -570,6 +578,25 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     test rax, rax
     jnz  .inv_next
+    ; ---- MEM-10 (audit 2026-09-03): have we already REFUSED this? ----
+    ;
+    ; Everything above answers "do we have it"; nothing answered "did we
+    ; already decide no". So an inbound peer could announce the txid of a
+    ; valid-signature, policy-rejected transaction once per second and every
+    ; announcement was fetched and fully re-verified -- thousands of ECDSA and
+    ; Schnorr checks each, in this serve child, which also takes mp_lock for
+    ; the policy pass. Core's AlreadyHaveTx consults m_recent_rejects before
+    ; asking for anything.
+    ;
+    ; The filter holds FINAL verdicts only: a fee-only failure stays
+    ; re-announceable, because a CPFP child can overturn it. It is shared
+    ; across serve children, so one child's refusal spares all of them.
+    mov  [s_ptr], rbx
+    lea  rdi, [rbx+4]
+    call serve_reject_has
+    mov  rbx, [s_ptr]
+    test eax, eax
+    jnz  .inv_next           ; already refused: do not fetch it again
 .inv_txann_req:
     ; getdata: [1][type][hash]; MSG_TX is asked for as MSG_WITNESS_TX (0x40000001),
     ; MSG_WTX echoed (the getdata carries the wtxid)
@@ -790,6 +817,34 @@ node_serve_loop:
     mov  r14, [s_st]
     jmp  .next                ; does not chain to our tip -> drop
 .blk_chains:
+    ; ---- NET-5 (audit 2026-09-03): the CONTEXTUAL header rules ------------
+    ; Everything above this point is context-free (cons_verify: PoW against
+    ; the header's own nBits, parses, coinbase, merkle root) plus "it extends
+    ; our tip". Core also requires the nBits RETARGET SCHEDULE for this
+    ; height, the median-time-past floor, the 2-hour future ceiling and the
+    ; BIP34/66/65 version rules -- none of which were checked before the
+    ; block was written to the durable archive. Consensus was not at risk
+    ; (utxo_live.c re-checks the schedule at CONNECT), but the archive was: a
+    ; header Core rejects became our tip at a height it can never connect at,
+    ; and the node stalls behind it.
+    ;
+    ; Dropped, never scored -- same reasoning as the cons_verify result
+    ; above: our verifier is not the reference, so a false reject here must
+    ; not ban an honest peer.
+    ;
+    ; serve_block_ctx_ok(st, hdr80) -> 1 accept / 0 reject. Returns 1
+    ; unchanged when the daemon has not armed the rules, so the hermetic
+    ; serve suites and their synthetic chains are unaffected.
+    mov  rdi, [s_st]
+    lea  rsi, [pl_buf]
+    call serve_block_ctx_ok
+    ; restore the loop's live registers from their stable statics, exactly as
+    ; the cons_verify and store_validates_prevhash calls above already do
+    mov  r12, [s_fd]
+    mov  r13, [s_lfd]
+    mov  r14, [s_st]
+    test eax, eax
+    jz   .next
     ; idxscan_append_locked(st, hash, pl_buf, s_plen) -- an inbound peer can
     ; push a block directly (or in response to our own .do_inv-triggered
     ; getdata) in ANY forked serve child, concurrently with the download
@@ -961,11 +1016,43 @@ node_serve_loop:
     test rax, rax
     jle  .gd_miss
     mov  [s_blen_spill], rax
-    ; choose/rotate the nonce (fixed seed is fine for deterministic tests)
+    ; ---- NET-14 (audit 2026-09-03): a FRESH nonce per block ----
+    ; This was the constant 0x0123456789abcdef, drawn once and then cached in
+    ; s_cmpct_nonce for the life of the connection -- so every compact block
+    ; this node ever served used the same SipHash key. Core draws a fresh
+    ; nonce for every CBlockHeaderAndShortTxIDs precisely so an adversary
+    ; cannot precompute transactions whose 6-byte short ids collide: with a
+    ; predictable nonce they can be planted in receivers' mempools ahead of
+    ; time, forcing reconstruction to fail and every peer we serve to fall
+    ; back to a full block.
+    ;
+    ; getrandom(2) inline rather than a helper: bitcoin_net.o/bitcoin_serve.o
+    ; are linked into sixty-odd targets and this file goes out of its way not
+    ; to add link dependencies (see the v2 dispatch table). The syscall
+    ; clobbers rcx and r11, neither of which is live here; r12-r15 (fd, lfd,
+    ; st) and rbx are untouched by it.
+    ;
+    ; If getrandom is unavailable the fallback is rdtsc, which is at least not
+    ; a compile-time constant. `or rax,1` keeps it nonzero: a zero nonce is
+    ; what the old code used as its "unset" sentinel and test_bip152_loop
+    ; still asserts the served nonce is nonzero.
+    lea  rdi, [s_cmpct_nonce]
+    mov  rsi, 8
+    xor  edx, edx
+    mov  eax, 318                  ; SYS_getrandom
+    syscall
+    cmp  rax, 8
+    je   .gc_nonce_rdy
+    rdtsc                          ; fallback: never a fixed constant
+    shl  rdx, 32
+    or   rax, rdx
+    or   rax, 1
+    mov  [s_cmpct_nonce], rax
+.gc_nonce_rdy:
     mov  rcx, [s_cmpct_nonce]
     test rcx, rcx
     jnz  .gc_nonce_ok
-    mov  rcx, 0x0123456789abcdef
+    mov  rcx, 1                    ; never hand cmpctblock_build a zero nonce
     mov  [s_cmpct_nonce], rcx
 .gc_nonce_ok:
     ; cmpctblock_build(bt_buf, sb_buf, blen, nonce)
@@ -1009,6 +1096,45 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     test rax, rax
     jle  .gd_miss
+    ; ---- STO-10 (audit 2026-09-03): SERVE THE BLOCK THAT WAS ASKED FOR -----
+    ; ht_idx maps hash -> height and was built when this process started.
+    ; serve_idx_topup only ADDS heights >= g_htidx_next, so a child forked
+    ; before a reorg still maps the LOSING branch's hashes to fork+1..old_tip
+    ; and never learns the replacements. The lookup above then succeeds with a
+    ; stale height and node_serve_block happily returns whatever block now
+    ; occupies it -- the WRONG block for the requested hash. Core drops a
+    ; block it did not request and may score the peer for it.
+    ;
+    ; Hashing the block we are about to send and comparing it to the requested
+    ; hash makes that impossible, whatever the index believes. It is the
+    ; audit's second suggestion rather than its first (a generation counter in
+    ; shared status) because it is FAIL-CLOSED and self-contained: it needs no
+    ; cross-process protocol, and it also catches an index/archive
+    ; disagreement arising from anything other than a reorg.
+    ;
+    ; Cost is one sha256d over the 80-byte header, against sending up to 8 MB.
+    ; A mismatch falls into .gd_miss, which is the notfound path -- exactly
+    ; what an honest node says when it cannot serve what was asked.
+    mov  [s_ptr], rbx
+    mov  [s_gdlen], rax         ; node_serve_block's length, across the call
+    lea  rdi, [s_gdbh]
+    lea  rsi, [sb_buf]
+    call block_hash
+    mov  rbx, [s_ptr]
+    mov  rax, [s_gdlen]
+    ; memcmp(s_gdbh, rbx+4, 32) -- four qword compares, no call
+    mov  rcx, [s_gdbh]
+    cmp  rcx, [rbx+4]
+    jne  .gd_miss
+    mov  rcx, [s_gdbh+8]
+    cmp  rcx, [rbx+12]
+    jne  .gd_miss
+    mov  rcx, [s_gdbh+16]
+    cmp  rcx, [rbx+20]
+    jne  .gd_miss
+    mov  rcx, [s_gdbh+24]
+    cmp  rcx, [rbx+28]
+    jne  .gd_miss
     ; BIP144: a bare MSG_BLOCK (witness flag 0x40000000 CLEAR) from a strict
     ; pre-segwit peer wants the STRIPPED serialization -- it cannot parse the
     ; segwit marker/flag bytes in the full form. The type u32 is still at
@@ -1063,12 +1189,35 @@ node_serve_loop:
     mov  rbx, [s_ptr]
     test rax, rax
     jz   .gd_miss
+    ; ---- MEM-24 (audit 2026-09-03): serve the FORM that was requested ------
+    ; A bare MSG_TX (witness bit 0x40000000 CLEAR) asks for the non-witness
+    ; serialization; Core sends TX_NO_WITNESS for it. This arm served the
+    ; stored witness bytes whatever was asked, which a strict pre-segwit peer
+    ; cannot parse. The BLOCK arm below has always got this right -- see
+    ; .gd_block's identical `test ecx, 0x40000000` -- so the two agree now.
+    ; A strip failure serves NOTHING (never the wrong form), as the block arm
+    ; also does.
+    mov  ecx, [rbx]              ; the inv entry's type u32
+    test ecx, 0x40000000
+    jnz  .gdtx_have              ; witness requested: the stored form is right
+    mov  [s_ptr], rbx
+    mov  rdi, rax                ; tx
+    mov  rsi, [s_n]              ; txlen
+    lea  rdx, [bt_buf]           ; out (free in this arm, as in .gd_block)
+    mov  rcx, (8<<20)
+    call strip_witness
+    mov  rbx, [s_ptr]
+    test rax, rax
+    jle  .gd_miss                ; strip failed -> notfound
+    mov  [s_n], rax              ; stripped length
+    lea  rax, [bt_buf]
+.gdtx_have:
     ; p2p_write(fd,"tx",2, ptr, len)
     mov  [s_ptr], rbx
     mov  rdi, r12
     lea  rsi, [cn_tx]
     mov  rdx, 2
-    mov  rcx, rax            ; tx bytes (mp_blob ptr)
+    mov  rcx, rax            ; tx bytes (mp_blob ptr, or bt_buf when stripped)
     mov  r8, [s_n]           ; length
     push rbx
     push rbx                 ; 2nd push = padding: keep RSP 16-byte aligned

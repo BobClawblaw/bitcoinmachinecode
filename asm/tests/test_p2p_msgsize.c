@@ -34,7 +34,11 @@ static void put_header(unsigned char h[24], const char* cmd, unsigned len){
     memcpy(h + 4, cmd, strlen(cmd) < 12 ? strlen(cmd) : 12);
     h[16] = (unsigned char)len;        h[17] = (unsigned char)(len >> 8);
     h[18] = (unsigned char)(len >> 16); h[19] = (unsigned char)(len >> 24);
-    memset(h + 20, 0, 4);              /* checksum: unchecked on this path */
+    memset(h + 20, 0, 4);              /* NET-11: a ZERO checksum, i.e. wrong for
+                                        * any payload except by coincidence --
+                                        * every caller below either expects a
+                                        * refusal before the payload is read, or
+                                        * expects the checksum refusal itself */
 }
 
 static int try_len(unsigned announced, int* consumed_trailer){
@@ -114,6 +118,58 @@ int main(void){
       char l[120];
       snprintf(l, sizeof l, "returned in %.1f ms without waiting on the peer", ms);
       ck(l, r == -3 && ms < 500.0);
+      close(sv[0]); close(sv[1]); }
+
+    printf("== NET-11: the payload checksum is verified ==\n");
+    /* The header's checksum[4] was read into the frame and never compared
+     * with sha256d(payload)[0:4] -- see this file's own put_header, whose
+     * comment used to read "checksum: unchecked on this path". Core's
+     * V1Transport::GetMessage rejects a mismatch and disconnects.
+     *
+     * The frame is built by p2p_write, so the checksum is genuine, and the
+     * ONLY difference between the two cases below is one flipped bit in that
+     * field. That is what makes this a control: if the verification were
+     * removed both would be accepted, and the pair would fail rather than
+     * pass vacuously. */
+    { int sv[2];
+      socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+      unsigned char pl[8] = {9,8,7,6,5,4,3,2};
+      /* capture a REAL frame: write it, read the 32 bytes back off the wire */
+      p2p_write(sv[0], "ping", 4, pl, 8);
+      unsigned char frame[32];
+      ssize_t got = recv(sv[1], frame, sizeof frame, 0);
+      close(sv[0]); close(sv[1]);
+      ck("captured a 32-byte frame with a real checksum", got == 32);
+
+      /* (a) unmodified -> accepted */
+      socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+      ssize_t u1 = write(sv[1], frame, 32); (void)u1;
+      shutdown(sv[1], SHUT_WR);
+      { char cmd[12]; unsigned char buf[64]; unsigned plen = 0;
+        int r = p2p_read(sv[0], cmd, buf, sizeof buf, &plen);
+        ck("a frame with the CORRECT checksum is accepted",
+           r == 1 && plen == 8 && !memcmp(buf, pl, 8)); }
+      close(sv[0]); close(sv[1]);
+
+      /* (b) one bit flipped in the checksum field -> refused */
+      frame[20] ^= 0x01;
+      socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+      ssize_t u2 = write(sv[1], frame, 32); (void)u2;
+      shutdown(sv[1], SHUT_WR);
+      { char cmd[12]; unsigned char buf[64]; unsigned plen = 0;
+        int r = p2p_read(sv[0], cmd, buf, sizeof buf, &plen);
+        ck("the SAME frame with one checksum bit flipped is refused", r <= 0); }
+      close(sv[0]); close(sv[1]);
+
+      /* (c) an empty payload is checked too, as Core checks verack */
+      socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+      unsigned char h[24];
+      put_header(h, "verack", 0);            /* put_header zeroes the checksum */
+      ssize_t u3 = write(sv[1], h, 24); (void)u3;
+      shutdown(sv[1], SHUT_WR);
+      { char cmd[12]; unsigned char buf[64]; unsigned plen = 0;
+        int r = p2p_read(sv[0], cmd, buf, sizeof buf, &plen);
+        ck("an empty payload with a ZERO checksum is refused too", r <= 0); }
       close(sv[0]); close(sv[1]); }
 
     if (fails) printf("\nFAILURES: %d\n", fails);

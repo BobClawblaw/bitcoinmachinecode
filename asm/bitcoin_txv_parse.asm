@@ -96,17 +96,39 @@ section .text
     je   %%two
     cmp  al, 0xfe
     je   %%four
+    ; ---- VAL-10 / SER-3 (audit 2026-09-03): CANONICAL CompactSize ----
+    ;
+    ; Core's ReadCompactSize throws "non-canonical ReadCompactSize()" for a
+    ; value encoded in a wider form than it needs, and "size too large" above
+    ; MAX_SIZE (0x02000000). This macro accepted `fd 01 00` as 1, so a block
+    ; holding such a transaction parsed cleanly here and is undeserializable
+    ; to every Core node -- and because txids are taken over the verbatim
+    ; bytes the merkle root still matched. The equivalent C reader
+    ; (daemon/tx_verify.c's txv_rd_cs) enforces the same rule; the two are
+    ; compared case-for-case by tests/test_txv_parse_diff, so they have to
+    ; move together or that differential fails.
+    ;
+    ; A violation takes the SAME fail label as a truncation, so both parsers
+    ; report the same reason for the same bytes -- which is what the
+    ; differential compares once they agree on accept/reject.
+    ;
+    ; The 8-byte form is ALWAYS invalid, and that is not a shortcut: canonical
+    ; requires a value above 0xffffffff, MAX_SIZE caps at 0x02000000, and no
+    ; value satisfies both. The bytes are still bounds-checked first so a
+    ; truncated 0xff varint fails for its own reason rather than this one.
     lea  rcx, [rbx+9]                    ; 0xff: 8-byte value
     cmp  rcx, r12
     ja   %1
-    mov  rax, [rbx+1]
-    mov  rbx, rcx
-    jmp  %%done
+    jmp  %1                              ; > MAX_SIZE for every canonical value
 %%four:
     lea  rcx, [rbx+5]
     cmp  rcx, r12
     ja   %1
     mov  eax, [rbx+1]
+    cmp  eax, 0xffff
+    jbe  %1                              ; non-canonical: fits the 3-byte form
+    cmp  eax, 0x02000000
+    ja   %1                              ; > MAX_SIZE
     mov  rbx, rcx
     jmp  %%done
 %%two:
@@ -114,6 +136,8 @@ section .text
     cmp  rcx, r12
     ja   %1
     movzx eax, word [rbx+1]
+    cmp  eax, 0xfd
+    jb   %1                              ; non-canonical: fits the 1-byte form
     mov  rbx, rcx
     jmp  %%done
 %%one:

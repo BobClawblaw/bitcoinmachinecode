@@ -107,6 +107,7 @@ extern long p2p_headers_count(const void* pl, long plen);
 
 extern size_t mpool_struct_size(unsigned long slots);
 extern void   mpool_init(void* mp, unsigned long slots, void* blob, unsigned long cap);
+extern long   mpool_put(void* mp, const u8 txid[32], const u8* tx, unsigned long len);
 extern long   mpool_count(void* mp);
 extern const u8* mpool_get(void* mp, const u8 txid[32], unsigned long* out_len);
 extern void   mpool_policy_init(void* pol, u64 relay, unsigned ma, unsigned mab,
@@ -979,7 +980,16 @@ static void case_mempool(void){
     /* synthetic reorg fixtures are non-standard by construction: run under
      * Core's own regtest escape hatch (-acceptnonstdtxn). */
     { extern void mpool_policy_set_acceptnonstd(void*, unsigned);
-      mpool_policy_set_acceptnonstd(pol, 1); }
+      mpool_policy_set_acceptnonstd(pol, 1);
+    /* MEM-23 (2026-09-05): Core's 65-non-witness-byte floor is UNCONDITIONAL
+     * -- it mitigates CVE-2017-12842, so -acceptnonstdtxn does not switch it
+     * off, and as of that change neither does ours. These fixtures are
+     * ~60-byte synthetic transactions exercising mempool mechanics, not the
+     * size rule, so the floor is disabled HERE, explicitly and test-only,
+     * rather than by weakening the production path. No config option reaches
+     * this setter. */
+    { extern void mpol_policy_set_min_size(void*, unsigned);
+      mpol_policy_set_min_size(pol, 0); } }
     unsigned pol_n = 512;
     void* pol_state = malloc(mpool_policy_state_size(pol_n));
     mpool_policy_state_init(pol_state, pol_n);
@@ -1073,6 +1083,178 @@ static void case_mempool(void){
 }
 
 /* ======================================================================== */
+/* CASE (VAL-5 rest): reorg_analyze enforces ContextualCheckBlockHeader.      */
+/*                                                                          */
+/* reorg_analyze checked PoW, linkage and the nBits schedule, but not Core's */
+/* trio: time-too-old (nTime <= the parent's median-time-past), time-too-new */
+/* (nTime > now + 2h) and bad-version (a legacy nVersion at or above a       */
+/* BIP34/66/65 activation). A candidate chain carrying such a header was     */
+/* judged on WORK alone -- and if it won, every one of its blocks was        */
+/* connected, blocks Core rejects outright.                                  */
+/*                                                                          */
+/* The rules are injected and default-off, so each case here arms them,      */
+/* runs, and disarms -- leaving the other cases (which build synthetic       */
+/* chains with arbitrary timestamps) untouched.                              */
+/* ======================================================================== */
+/* Re-stamp a branch with sane, ascending timestamps and rechain it.
+ *
+ * build_branch stamps blocks at 1700000000 + tagbase + i, and tagbase is
+ * 0x30000000 -- about the year 2049. Those values are TAGS, not times, and
+ * every other case ignores them. Under Core's 2-hour ceiling every such
+ * header is "time-too-new", so a case that exercises the time rules has to
+ * give the branch real times first or the control cannot pass. Each block's
+ * prevhash depends on the one before, so the whole branch is rechained. */
+static void restamp_branch(blk_t* b, long n, const u8 prev0[32], unsigned t0){
+    u8 prev[32]; memcpy(prev, prev0, 32);
+    for (long i = 0; i < n; i++){
+        mk_block(&b[i], prev, t0 + (unsigned)i);
+        memcpy(prev, b[i].hash, 32);
+    }
+}
+
+static void case_reorg_header_rules(void){
+    /* 14 base blocks so a candidate at height 15 has a full 11-header window
+     * behind it -- rg_mtp_at returns 0 for a short window and the floor is
+     * then skipped, which would make the time-too-old assertion vacuous. */
+    const long nbase = 14, nlose = 2, nwin = 3;
+    build_base(nbase, 0x207fffffu);
+    build_branch(lose, nlose, nbase, 0x20000000u, 0x207fffffu);
+    build_branch(win,  nwin,  nbase, 0x30000000u, 0x207fffffu);
+    /* The losing branch is STORED, so it has to carry sane times too: its
+     * headers are part of the median window the candidate is judged against. */
+    unsigned base_t = 1600000000u + (unsigned)nbase;
+    restamp_branch(lose, nlose, base[nbase-1].hash, base_t + 1);
+    harness_open();
+    store_chain(nbase, nlose);
+
+    /* BIP34 armed ABOVE every height this harness reaches. The version rules
+     * of the same predicate are pinned directly by tests/test_hdr_contextual.c
+     * against real headers; arming them here would reject every block the
+     * chain builder makes (it stamps nVersion 1) and would say nothing about
+     * whether reorg_analyze consults the predicate at all. What IS under test
+     * here is the pair of TIME rules, which the builder can drive exactly. */
+    reorg_set_header_rules(1000000);
+
+    /* Control first: a well-formed candidate must still be accepted with the
+     * rules armed. Without it, "reject everything" would pass the negatives.
+     * The store is not touched again -- each scenario differs only in the
+     * candidate headers it presents. */
+    unsigned good_t = (unsigned)time(NULL) - 3600u;
+    restamp_branch(win, nwin, base[nbase-1].hash, good_t);
+    {
+        static reorg_cand_t c; memset(&c,0,sizeof c);
+        reorg_build_locator(store_buf, &c);
+        cand_from_blocks(&c, win, nwin);
+        ck("VAL-5 armed: a well-formed candidate is still accepted",
+           reorg_analyze(store_buf,&c), 2);
+    }
+
+    /* time-too-new: the last header 4 hours ahead of now. */
+    { restamp_branch(win, nwin, base[nbase-1].hash, good_t);
+      mk_block(&win[nwin-1], win[nwin-2].hash, (unsigned)time(NULL) + 4*3600u);
+      static reorg_cand_t c; memset(&c,0,sizeof c);
+      reorg_build_locator(store_buf, &c);
+      cand_from_blocks(&c, win, nwin);
+      ck("VAL-5 a header 4h in the future is REJECTED", reorg_analyze(store_buf,&c), -1); }
+
+    /* time-too-old: the FIRST candidate header at the epoch, far below the
+     * median-time-past of the 11 stored headers behind it. */
+    { restamp_branch(win, nwin, base[nbase-1].hash, good_t);
+      mk_block(&win[0], base[nbase-1].hash, 1);
+      { u8 prev[32]; memcpy(prev, win[0].hash, 32);
+        for (long i = 1; i < nwin; i++){ mk_block(&win[i], prev, good_t + (unsigned)i); memcpy(prev, win[i].hash, 32); } }
+      static reorg_cand_t c; memset(&c,0,sizeof c);
+      reorg_build_locator(store_buf, &c);
+      cand_from_blocks(&c, win, nwin);
+      ck("VAL-5 a header at 1970 (below the parent MTP) is REJECTED",
+         reorg_analyze(store_buf,&c), -1); }
+
+    /* And with the rules DISARMED that same candidate is accepted again --
+     * which is what shows the rejection came from this predicate and not from
+     * the timestamp disturbing work, linkage or PoW. */
+    reorg_set_header_rules(-1);
+    {
+        static reorg_cand_t c; memset(&c,0,sizeof c);
+        reorg_build_locator(store_buf, &c);
+        cand_from_blocks(&c, win, nwin);
+        ck("VAL-5 disarmed: the SAME 1970 candidate is accepted again",
+           reorg_analyze(store_buf,&c), 2);
+    }
+
+    utxo_live_close();
+}
+
+/* ======================================================================== */
+/* CASE (MEM-8): the reconcile snapshot is sized from the POOL, so a pool     */
+/*       larger than the old fixed bound leaves no ghosts.                   */
+/*                                                                          */
+/* reorg_mempool_reconcile snapshotted at most REORG_MEMPOOL_MAX_TX (8,192)  */
+/* entries into a fixed 16 MB arena, and called mpool_del only for the       */
+/* snapshotted prefix. Everything past the bound stayed in the structural    */
+/* pool while mpool_policy_state_init wiped the graph out from under it:     */
+/* present to getdata and to mpool_count, but with no registry node, no      */
+/* outreg and no claims. Such an entry never expires (mempool_forget is only */
+/* reached through the registry), never evicts, and leaves its inputs        */
+/* unclaimed -- so a later double-spend of those inputs is admitted next to  */
+/* it.                                                                      */
+/*                                                                          */
+/* The fixture puts 8,193 transactions straight into the STRUCTURAL pool     */
+/* with mpool_put -- which is where ghosts live, and which is fast, unlike   */
+/* driving 8,193 accepts through the policy layer. None of them resolves     */
+/* against the UTXO set, so every candidate is refused on re-offer and a     */
+/* correct reconcile must leave the pool EMPTY. The old code left exactly    */
+/* the entries it never snapshotted.                                        */
+/* ======================================================================== */
+static void case_mempool_ghosts(void){
+    enum { NGHOST = 8193 };          /* one past the old REORG_MEMPOOL_MAX_TX */
+    /* The re-offer pass runs the real mpool_policy_add, which resolves inputs
+     * through the live UTXO store -- so that store has to be open even though
+     * every lookup here is expected to miss. */
+    build_base(3, 0x207fffffu);
+    harness_open();
+    static u8 mp[40 + 16384*48 + 8];
+    static u8* mpblob;
+    if (!mpblob) mpblob = (u8*)malloc(32u<<20);
+    ckm("ghost fixture blob allocated", mpblob != NULL);
+    if (!mpblob) return;
+    mpool_init(mp, 16384, mpblob, 32u<<20);
+
+    static u8 pol[128];
+    mpool_policy_init(pol, 0, 25, 101000, 25, 101000, 1);
+    { extern void mpool_policy_set_acceptnonstd(void*, unsigned);
+      mpool_policy_set_acceptnonstd(pol, 1); }
+    /* MEM-23: test-only floor opt-out -- see the note at the first policy
+     * setup in this file. */
+    { extern void mpol_policy_set_min_size(void*, unsigned);
+      mpol_policy_set_min_size(pol, 0); }
+    unsigned pol_n = 512;
+    void* pol_state = malloc(mpool_policy_state_size(pol_n));
+    mpool_policy_state_init(pol_state, pol_n);
+
+    long stored = 0;
+    for (int i = 0; i < NGHOST; i++){
+        tx_t t; u8 prev[32];
+        memset(prev, 0, 32);
+        prev[0] = (u8)i; prev[1] = (u8)(i >> 8); prev[2] = 0xc7;
+        mk_spend(&t, prev, 0, 10000ULL);
+        if (mpool_put(mp, t.txid, t.raw, (unsigned long)t.len) == 1) stored++;
+    }
+    ck("MEM-8 fixture: pool holds more than the old 8192-entry bound", (int)(stored > 8192), 1);
+
+    reorg_mempool_t rm = { mp, pol, pol_state, pol_n, (void*)1 };
+    long after = reorg_mempool_reconcile(&rm, NULL, NULL, 0);
+    long left = mpool_count(mp);
+    printf("      (stored %ld, reconcile returned %ld, pool now %ld)\n", stored, after, left);
+    ckm("MEM-8 reconcile returned a count", after >= 0);
+    /* None of these transactions can resolve its input, so every one must be
+     * refused on re-offer and NOTHING may remain. */
+    ck("MEM-8 no entry survives the rebuild unsnapshotted (no ghosts)", (int)left, 0);
+    ck("MEM-8 ...and the returned count agrees with the pool", (int)after, (int)left);
+    free(pol_state);
+    utxo_live_close();
+}
+
+/* ======================================================================== */
 /* CASE (STO-7): reorg_execute reconciles the mempool BY ITSELF once one is  */
 /*       registered -- no manual reorg_mempool_reconcile call.               */
 /*                                                                          */
@@ -1100,6 +1282,10 @@ static void case_mempool_wired(void){
     mpool_policy_init(pol, 0, 25, 101000, 25, 101000, 1);
     { extern void mpool_policy_set_acceptnonstd(void*, unsigned);
       mpool_policy_set_acceptnonstd(pol, 1); }
+    /* MEM-23: test-only floor opt-out -- see the note at the first policy
+     * setup in this file. */
+    { extern void mpol_policy_set_min_size(void*, unsigned);
+      mpol_policy_set_min_size(pol, 0); }
     unsigned pol_n = 512;
     void* pol_state = malloc(mpool_policy_state_size(pol_n));
     mpool_policy_state_init(pol_state, pol_n);
@@ -1534,6 +1720,8 @@ int main(void){
     total += run_case("undo pre-flight gate",           case_undo_preflight_gate);
     total += run_case("mempool reconciliation",         case_mempool);
     total += run_case("mempool reconcile is WIRED (STO-7)", case_mempool_wired);
+    total += run_case("reconcile leaves no ghosts (MEM-8)", case_mempool_ghosts);
+    total += run_case("reorg header rules (VAL-5 rest)", case_reorg_header_rules);
     total += run_case("fake peer locator + reorg",      case_fakepeer_locator_and_reorg);
     total += run_case("node_sync_multi (asm frame)",    case_node_sync_multi);
     total += run_case("append-lock scope + prevhash gate", case_append_lock_scope);

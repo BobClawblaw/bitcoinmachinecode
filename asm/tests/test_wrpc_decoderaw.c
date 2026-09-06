@@ -45,7 +45,13 @@ int main(void) {
     if (dn > 0) printf("--- decoded ---\n%s--- end ---\n", dump);
 
     /* checks on the decoded output */
-    ck("reports version 0", strstr(dump, "version: 0") != NULL, 1);
+    /* WAL-18 (audit 2026-09-03): this asserted "version: 0" -- it was pinning
+     * the BUG. wallet_createrawtx wrote the locktime into the version field,
+     * so every tx it built came out version 0, which Core's IsStandardTx
+     * rejects ("version", nVersion < 1). The builder now writes 2, matching
+     * the RPC path, and the decoder correctly reports it. */
+    ck("reports version 2 (WAL-18: was the locktime, not a version)",
+       strstr(dump, "version: 2") != NULL, 1);
     ck("reports 3 inputs", strstr(dump, "num_inputs: 3") != NULL, 1);
     ck("reports 2 outputs", strstr(dump, "num_outputs: 2") != NULL, 1);
     ck("reports locktime 0", strstr(dump, "locktime: 0") != NULL, 1);

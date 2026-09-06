@@ -63,7 +63,10 @@ int main(int argc, char** argv){
      * bookkeeping entirely (it applies records via the raw in-memory
      * primitives, bitcoin_utxo.asm), so op_count stays 0 after reload no
      * matter how many records were replayed. */
-    int slots_log2 = 22;
+    int slots_log2 = 24;   /* was 22: a build_utxo-scale WAL tail (~6M records)
+                            * exceeds 2^22's fill threshold (3.1M) and the
+                            * reload would stop at -2 with a truncated set.
+                            * 2^24 (fill 12.6M) holds any builder-scale tail. */
     unsigned long slots = 1UL << slots_log2;
     u64 blob_cap = 2UL*1024*1024*1024;
     long ustruct = utxo_struct_size(slots);
@@ -111,10 +114,19 @@ int main(int argc, char** argv){
     long before_manifest = lst.manifest_n;
     u8 dummy_txid[32]; memset(dummy_txid, 0xEE, 32); /* guaranteed nonexistent key */
     long r = utxo_lsm_del(&lst, u, dummy_txid, 0xFFFFFFFEu);
-    /* utxo_lsm_del's error path is `mov eax, -1` (32-bit, bitcoin_utxo_lsm.asm
-     * .ld_err) which zero-extends to rax=0xFFFFFFFF, NOT 64-bit -1 -- so
-     * `r == -1` never matches here. Check against the success value (1)
-     * instead, which is unambiguous regardless of the register-width quirk. */
+    /* Check against the SUCCESS value (1), not against -1.
+     *
+     * UTX-13 (audit 2026-09-03): this comment used to explain that
+     * utxo_lsm_del's error path was `mov eax, -1` (32-bit), zero-extending to
+     * rax = 0xFFFFFFFF so that `r == -1` never matched. That was true when it
+     * was written; both utxo_lsm_del (.ld_err) and utxo_lsm_put (.lp_err) now
+     * return a full 64-bit `mov rax, -1` -- utxo_lsm_put's was UTX-3 in this
+     * same audit round.
+     *
+     * Comparing against 1 is still the right test and is kept: it is
+     * unambiguous whatever the error convention, which is exactly why it
+     * survived the convention changing underneath it. The REASON is corrected
+     * so nobody re-derives a register-width quirk that no longer exists. */
     if (r != 1) { fprintf(stderr, "FATAL: dummy del failed (r=%ld)\n", r); return 1; }
     fprintf(stderr, "after forced flush: manifest_n=%lu (was %ld) log_len=%lu\n",
             lst.manifest_n, before_manifest, lst.log_len);

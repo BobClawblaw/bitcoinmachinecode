@@ -116,6 +116,58 @@ int main(void){
       ck("decodepsbt tx decoded (has txid+version)", txo && rj_obj_get(txo,"txid") && rj_obj_get(txo,"version"));
       rj_free(res); rj_free(params); }
 
+    /* --- RPX-9: a transaction LARGER than the old 200,000-byte cap ---------
+     * decoderawtransaction refused anything over 200,000 bytes with
+     * "TX decode failed" -- a claim about the BYTES, not about a limit, so a
+     * caller could not tell the two apart. Core decodes up to
+     * MAX_BLOCK_SERIALIZED_SIZE (4,000,000).
+     *
+     * Built here as one input and enough P2PKH outputs to clear 200,000 bytes
+     * (each output is 34 bytes), so it is a genuinely well-formed transaction
+     * that the old cap rejected purely for its size. */
+    { long ec; const char* em;
+      const unsigned NOUT = 7000;                     /* ~238 KB of outputs */
+      size_t cap = 64 + (size_t)NOUT * 34 + 16;
+      unsigned char* tx = malloc(cap); ck("RPX-9 fixture alloc", tx != NULL);
+      if (tx){
+        size_t t = 0;
+        tx[t++]=2;tx[t++]=0;tx[t++]=0;tx[t++]=0;                    /* version 2 */
+        tx[t++]=1;                                                   /* 1 input   */
+        memset(tx+t, 0x11, 32); t += 32;
+        tx[t++]=0;tx[t++]=0;tx[t++]=0;tx[t++]=0;                    /* index 0   */
+        tx[t++]=0;                                                   /* empty ss  */
+        tx[t++]=0xfd;tx[t++]=0xff;tx[t++]=0xff;tx[t++]=0xff;        /* sequence  */
+        tx[t++]=0xfd; tx[t++]=(unsigned char)(NOUT & 0xff);
+        tx[t++]=(unsigned char)(NOUT >> 8);                          /* n_out CompactSize */
+        for (unsigned i = 0; i < NOUT; i++){
+            for (int k=0;k<8;k++) tx[t++] = 0;                       /* value 0 */
+            tx[t++]=25; tx[t++]=0x76; tx[t++]=0xa9; tx[t++]=0x14;
+            memset(tx+t, (int)(i & 0xff), 20); t += 20;
+            tx[t++]=0x88; tx[t++]=0xac;
+        }
+        tx[t++]=0;tx[t++]=0;tx[t++]=0;tx[t++]=0;                    /* locktime */
+        ck("RPX-9 fixture really exceeds the old 200000 cap", t > 200000);
+
+        char* hex = malloc(t*2 + 4); ck("RPX-9 hex alloc", hex != NULL);
+        if (hex){
+          static const char* H = "0123456789abcdef";
+          for (size_t i = 0; i < t; i++){ hex[i*2]=H[tx[i]>>4]; hex[i*2+1]=H[tx[i]&15]; }
+          hex[t*2]=0;
+          size_t pjl = t*2 + 8;
+          char* pj2 = malloc(pjl); 
+          if (pj2){
+            snprintf(pj2, pjl, "[\"%s\"]", hex);
+            rj_val* params = rj_parse(pj2, strlen(pj2));
+            rj_val* res = NULL; rpc_wallet w; memset(&w,0,sizeof w);
+            int rc2 = rpc_dispatch("decoderawtransaction", params, &w, &res, &ec, &em);
+            ck("RPX-9: a >200 KB transaction now DECODES instead of -22", rc2 == 1 && res != NULL);
+            if (rc2 != 1) printf("      got ec=%ld em=%s\n", ec, em ? em : "(null)");
+            ck("RPX-9: and reports all its outputs",
+               res && rj_obj_get(res,"vout") && rj_obj_get(res,"vout")->nitems == NOUT);
+            rj_free(res); rj_free(params); free(pj2); }
+          free(hex); }
+        free(tx); } }
+
     /* --- decoderawtransaction now returns the FULL Core shape (was minimal
      * {locktime,vin,vout}); has txid/version/size/vsize/weight, no "hex". --- */
     { long ec; const char* em;
@@ -363,6 +415,75 @@ int main(void){
       ck("amount >8 decimals -> -3", r==NULL && ec==-3); rj_free(r); }
     { rj_val* r=call("[[{\"txid\":\"deadbeef\",\"vout\":0}],[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.1}]]",&ec,&em);
       ck("short txid -> -8", r==NULL && ec==-8); rj_free(r); }
+
+    /* ---- RPX-5 (audit 2026-09-03): the 80-byte OP_RETURN cap was wrong HERE
+     * Core's createrawtransaction builds OP_RETURN <data> for ANY size -- the
+     * 80-byte limit is relay policy, applied when a transaction is accepted,
+     * not by the builder. A raw tx Core will happily construct (to sign or
+     * inspect offline) was refused with "Data too long for OP_RETURN".
+     *
+     * 100 bytes needs PUSHDATA1 (0x4c 0x64); 300 needs PUSHDATA2, which the
+     * OLD code could not encode at all -- it emitted PUSHDATA1 with a
+     * truncated length byte, unreachable only because of the cap it sat
+     * behind. Both had to change together, so both are checked. */
+    { long ec; const char* em;
+      char pj[2048]; char hex200[201]; memset(hex200,'a',200); hex200[200]=0;
+      snprintf(pj,sizeof pj,"[[{\"txid\":\"" T "\",\"vout\":0}],[{\"data\":\"%s\"}]]",hex200);
+      rj_val* r=call(pj,&ec,&em);
+      ck("RPX-5 a 100-byte OP_RETURN is BUILT, not refused", r && r->typ==RJ_STR);
+      if (r && r->typ==RJ_STR)
+          ck("RPX-5   and uses PUSHDATA1 (6a4c64)", strstr(r->str,"6a4c64")!=NULL);
+      rj_free(r); }
+    { long ec; const char* em;
+      char pj[2048]; char hex600[601]; memset(hex600,'b',600); hex600[600]=0;
+      snprintf(pj,sizeof pj,"[[{\"txid\":\"" T "\",\"vout\":0}],[{\"data\":\"%s\"}]]",hex600);
+      rj_val* r=call(pj,&ec,&em);
+      ck("RPX-5 a 300-byte OP_RETURN is BUILT", r && r->typ==RJ_STR);
+      if (r && r->typ==RJ_STR)
+          ck("RPX-5   and uses PUSHDATA2 (6a4d2c01)", strstr(r->str,"6a4d2c01")!=NULL);
+      rj_free(r); }
+    /* the control: an 80-byte payload must still encode exactly as before */
+    { long ec; const char* em;
+      char pj[512]; char hex160[161]; memset(hex160,'c',160); hex160[160]=0;
+      snprintf(pj,sizeof pj,"[[{\"txid\":\"" T "\",\"vout\":0}],[{\"data\":\"%s\"}]]",hex160);
+      rj_val* r=call(pj,&ec,&em);
+      ck("RPX-5 an 80-byte OP_RETURN still uses PUSHDATA1 (6a4c50)",
+         r && r->typ==RJ_STR && strstr(r->str,"6a4c50")!=NULL);
+      rj_free(r); }
+
+    /* ---- RPX-6 (audit 2026-09-03): duplicate address, and locktime range ---- */
+    { long ec=0; const char* em=NULL;
+      rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],"
+                     "[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001},"
+                     "{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.002}]]",&ec,&em);
+      ck("RPX-6 a repeated address is refused, as Core does", r==NULL && ec==-8);
+      rj_free(r); }
+    { long ec=0; const char* em=NULL;   /* two DIFFERENT addresses stay legal */
+      rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],"
+                     "[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001},"
+                     "{\"3P14159f73E4gFr7JterCCQh9QjiTjiZrG\":0.002}]]",&ec,&em);
+      ck("RPX-6 two different addresses are still accepted", r && r->typ==RJ_STR);
+      rj_free(r); }
+    { long ec=0; const char* em=NULL;   /* several data outputs stay legal */
+      rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],"
+                     "[{\"data\":\"aabb\"},{\"data\":\"ccdd\"}]]",&ec,&em);
+      ck("RPX-6 repeated `data` outputs are still accepted", r && r->typ==RJ_STR);
+      rj_free(r); }
+    { long ec=0; const char* em=NULL;
+      rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],"
+                     "[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001}],4294967296]",&ec,&em);
+      ck("RPX-6 a locktime past 0xffffffff is refused, not truncated", r==NULL && ec==-8);
+      rj_free(r); }
+    { long ec=0; const char* em=NULL;
+      rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],"
+                     "[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001}],-1]",&ec,&em);
+      ck("RPX-6 a negative locktime is refused, not wrapped", r==NULL && ec==-8);
+      rj_free(r); }
+    { long ec=0; const char* em=NULL;   /* the boundary itself is legal */
+      rj_val* r=call("[[{\"txid\":\"" T "\",\"vout\":0}],"
+                     "[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001}],4294967295]",&ec,&em);
+      ck("RPX-6 locktime 0xffffffff (the boundary) is accepted", r && r->typ==RJ_STR);
+      rj_free(r); }
 
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);
     return fails?1:0;

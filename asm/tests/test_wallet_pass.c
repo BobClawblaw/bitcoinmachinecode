@@ -101,6 +101,40 @@ int main(void){
     unlink(PF);
     ck("a missing file is not a passphrase", try_load(got, sizeof got) == 0);
 
+    /* ---- DMN-13 (audit 2026-09-03): refuse an over-long passphrase, never
+     * truncate it.
+     *
+     * read_secret_file used fgets(out, cap, f), which SILENTLY TRUNCATES at
+     * cap -- 256 for every caller. That was invisible while the KDF truncated
+     * at 96 anyway, and WAL-7 removed that truncation, so the two paths now
+     * DISAGREE: a long passphrase file seals with its full contents through
+     * one path and unlocks with 255 bytes through this one, and the wallet
+     * will not open. The operator is told "wrong passphrase" for a correct
+     * passphrase. Fixing WAL-7 is what made this reachable.
+     *
+     * The control's other half is the ordinary case, which must keep loading:
+     * a refusal applied too eagerly would lock every wallet out. */
+    { char big[600]; memset(big, 'p', sizeof big - 1); big[sizeof big - 1] = 0;
+      write_pass(PF, big, 0600);
+      wallet_pass_set_file(PF);
+      char out[256];
+      ck("DMN-13 a passphrase longer than the buffer is REFUSED, not truncated",
+         try_load(out, sizeof out) == 0);
+
+      /* and a passphrase that FITS still loads, byte for byte */
+      write_pass(PF, "correct horse battery staple", 0600);
+      ck("DMN-13 an ordinary passphrase still loads", try_load(out, sizeof out) == 1);
+      ck("DMN-13   ...with its exact bytes", strcmp(out, "correct horse battery staple") == 0);
+
+      /* exactly at the limit: 254 bytes plus the NUL must still fit */
+      { char edge[256]; memset(edge, 'q', 254); edge[254] = 0;
+        write_pass(PF, edge, 0600);
+        ck("DMN-13 a passphrase exactly at the limit still loads",
+           try_load(out, sizeof out) == 1 && strlen(out) == 254); }
+
+      wallet_pass_set_file(0);
+      unlink(PF); }
+
     rmdir(DIR);
     if (fails) printf("\nFAILURES: %d\n", fails);
     else printf("\nALL TESTS PASSED (0 failures)\n");

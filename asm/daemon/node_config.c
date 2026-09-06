@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include "log_ts.h"
 #include <stdlib.h>
+#include <limits.h>
+#define NODECFG_BANTIME_MAX (100LL*365*24*3600)   /* DMN-9: 100 years */
+#include <errno.h>
 #include <string.h>
 #include <unistd.h>
 #include "node_config.h"
@@ -194,6 +197,60 @@ const char* nodecfg_noeffect_reason(const char* key){
 int nodecfg_unimplemented(const char* key){
     const char* r = nodecfg_noeffect_reason(key);
     return r != NULL && *r != 0;
+}
+
+/* ---- DMN-4 (audit 2026-09-03) helpers ---------------------------------- */
+
+/* Does a `[section]` header name the selected chain?
+ *
+ * Core's section names are the chain's own name, with one exception: [test]
+ * is testnet3. This build refuses testnet3 outright (see the k_noeffect table
+ * entry for "testnet"), so a [test] section can never match and its keys are
+ * always skipped -- which is the correct outcome, not an oversight.
+ * Comparison is exact and case-sensitive, as Core's is. */
+int nodecfg_section_is(const char* section, const char* chain){
+    if (!section || !chain) return 0;
+    if (!strcmp(section, chain)) return 1;
+    /* Core writes the mainnet section as [main] and the chain as "main". */
+    return 0;
+}
+
+/* The options Core refuses to read from the base section on a non-main chain
+ * (common/args.cpp's "-only-applies-to" set): anything that names a port, an
+ * address, or a peer, because such a value written without a section is
+ * almost always the mainnet one and would silently move the test node onto
+ * it. */
+int nodecfg_is_network_specific(const char* key){
+    static const char* net_keys[] = {
+        "port", "rpcport", "bind", "rpcbind", "rpcallowip",
+        "addnode", "connect", "seednode", "whitebind", "externalip",
+        "onion", "proxy", "torcontrol", "i2psam", "zmqpubrawblock",
+        "zmqpubrawtx", "zmqpubhashblock", "zmqpubhashtx", "zmqpubsequence",
+        NULL };
+    for (int i = 0; net_keys[i]; i++) if (!strcmp(key, net_keys[i])) return 1;
+    return 0;
+}
+
+/* Is `key` a name this parser applies (as opposed to an unknown key it
+ * ignores)? Used only to decide whether a leading "no" is Core's negation
+ * prefix or part of a genuine option name, so a future option actually
+ * called "noXYZ" cannot be silently rewritten into "XYZ". */
+int nodecfg_known_key(const char* key){
+    static const char* known[] = {
+        "maxconnections","dbcache","maxmempool","mempoolexpiry","minrelaytxfee",
+        "incrementalrelayfee","dustrelayfee","blockmintxfee","datacarrier",
+        "datacarriersize","permitbaremultisig","acceptnonstdtxn","blocksonly",
+        "whitelistrelay","whitelistforcerelay","listen","discover","dnsseed",
+        "upnp","natpmp","peerbloomfilters","peerblockfilters","blockfilterindex",
+        "txindex","coinstatsindex","addressindex","spentindex","timestampindex",
+        "prune","par","checkblockindex","checkmempool","checkaddrman",
+        "capturemessages","stopafterblockimport","persistmempool","rest",
+        "server","daemon","logips","logtimestamps","debuglogfile","printtoconsole",
+        "reindex","reindex-chainstate","fixedseeds","forcednsseed","i2pacceptincoming",
+        "v2transport","networkactive","rpccookieperms","deprecatedrpc",
+        NULL };
+    for (int i = 0; known[i]; i++) if (!strcmp(key, known[i])) return 1;
+    return 0;
 }
 
 static void set_defaults(void){
@@ -394,6 +451,45 @@ int node_config_is_manual(const char* ip){
  * should not be able to reproduce the peer-starvation stall that a bad
  * eviction threshold caused on 2026-08-18. */
 static int hexval(int c){ return c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:-1; }
+/* ---------------------------------------------------------------- DMN-9
+ * (audit 2026-09-03) Bounded integer parsing.
+ *
+ * Every numeric key went through `atoi`, which truncates strtol's long to an
+ * int: `maxconnections=4294967496` wrapped to 200 and sailed straight through
+ * the clamp that exists to catch exactly that, so a typo silently produced a
+ * plausible-looking wrong setting. Core's LocaleIndependentAtoi returns 0 for
+ * anything it cannot represent, which the clamp below then reports.
+ *
+ * Returns 0 (and warns) on overflow, trailing garbage or an empty value, so
+ * an unusable setting is visible instead of being quietly reinterpreted. */
+static long long nodecfg_strtoll(const char* s, const char* key, int* overflowed){
+    if (overflowed) *overflowed = 0;
+    if (!s || !*s) return 0;
+    errno = 0;
+    char* end = 0;
+    long long v = strtoll(s, &end, 10);
+    if (errno == ERANGE || end == s || (end && *end)){
+        if (overflowed) *overflowed = 1;
+        fprintf(stderr, "[config] %s=%s is not a usable number -- reading it as 0\n",
+                key ? key : "?", s);
+        return 0;
+    }
+    return v;
+}
+
+/* The int-width form: out-of-range is 0, as Core's LocaleIndependentAtoi. */
+static int nodecfg_atoi(const char* s, const char* key){
+    int ovf = 0;
+    long long v = nodecfg_strtoll(s, key, &ovf);
+    if (ovf) return 0;
+    if (v > INT_MAX || v < INT_MIN){
+        fprintf(stderr, "[config] %s=%s does not fit an int -- reading it as 0\n",
+                key ? key : "?", s);
+        return 0;
+    }
+    return (int)v;
+}
+
 static int clamp_int(int v, int lo, int hi, const char* key, int* bad){
     if(v < lo || v > hi){
         fprintf(stderr,"[config] %s=%d out of range [%d,%d] -- ignoring\n", key, v, lo, hi);
@@ -428,6 +524,58 @@ long node_config_load(const char* path){
         return 0;
     }
     long applied = 0; int bad = 0; int unimpl = 0;
+    /* ---- DMN-4 (audit 2026-09-03): SECTIONS and NEGATION ----
+     *
+     * A `[section]` line has no `=`, so the loop below used to `continue`
+     * past it and then apply every following key unconditionally. That is
+     * not a cosmetic gap. An operator who reuses a Core bitcoin.conf holding
+     * the common dev block
+     *
+     *     [regtest]
+     *     rpcallowip=0.0.0.0/0
+     *     rpcbind=0.0.0.0
+     *
+     * while running mainnet gets, in Core, three inert lines. Here they were
+     * applied: rpc_acl_add("0.0.0.0/0") succeeded, rpcbind was honoured
+     * because rpc_acl_configured() > 0, and the MAINNET RPC server bound
+     * every interface and accepted every source. `[regtest] connect=...`
+     * likewise pinned a mainnet node to a loopback peer.
+     *
+     * Core scopes keys under [main], [test], [testnet4], [signet] and
+     * [regtest] to that chain. Doing the same needs the chain BEFORE the
+     * keys are applied, and the chain itself comes from this file -- so the
+     * file is read twice: once for the chain selectors in the base section
+     * (which is the only place Core honours them), then once for real. */
+    char cur_section[32] = "";
+    {
+        char l0[1024]; char sec0[32] = "";
+        while(fgets(l0, sizeof l0, f)){
+            char* q = l0;
+            while(*q==' '||*q=='\t') q++;
+            if(*q=='#'||*q=='\n'||*q==0) continue;
+            if(*q=='['){
+                char* e = strchr(q, ']');
+                if(e){ size_t n2 = (size_t)(e - q - 1); if(n2 >= sizeof sec0) n2 = sizeof sec0 - 1;
+                       memcpy(sec0, q+1, n2); sec0[n2] = 0; }
+                continue;
+            }
+            if(sec0[0]) continue;                 /* chain selectors: base section only */
+            char* e2 = strchr(q,'='); if(!e2) continue;
+            *e2 = 0;
+            char* k0 = q; char* v0 = e2+1;
+            size_t vl0 = strlen(v0);
+            while(vl0 && (v0[vl0-1]=='\n'||v0[vl0-1]=='\r'||v0[vl0-1]==' '||v0[vl0-1]=='\t')) v0[--vl0]=0;
+            size_t kl0 = strlen(k0);
+            while(kl0 && (k0[kl0-1]==' '||k0[kl0-1]=='\t')) k0[--kl0]=0;
+            int b0 = atoi(v0);
+            if     (!strcmp(k0,"chain")   && *v0)  snprintf(g_cfg.chain,sizeof g_cfg.chain,"%s",v0);
+            else if(!strcmp(k0,"regtest") && b0==1) snprintf(g_cfg.chain,sizeof g_cfg.chain,"regtest");
+            else if(!strcmp(k0,"signet")  && b0==1) snprintf(g_cfg.chain,sizeof g_cfg.chain,"signet");
+            else if(!strcmp(k0,"testnet4")&& b0==1) snprintf(g_cfg.chain,sizeof g_cfg.chain,"testnet4");
+        }
+        rewind(f);
+    }
+
     /* -connect implies -dnsseed=0 and -listen=0 in Core, but only when those
      * were not set explicitly. The implication therefore has to run AFTER the
      * whole file is read: `listen=1` may appear on a line BELOW `connect=`,
@@ -438,6 +586,16 @@ long node_config_load(const char* path){
         char* p = line;
         while(*p==' '||*p=='\t') p++;
         if(*p=='#'||*p=='\n'||*p==0) continue;
+        /* DMN-4: a section header changes which chain the following keys
+         * belong to. Previously it fell through the `no =` test and was
+         * simply ignored, taking its scoping with it. */
+        if(*p=='['){
+            char* e = strchr(p, ']');
+            if(e){ size_t n2 = (size_t)(e - p - 1); if(n2 >= sizeof cur_section) n2 = sizeof cur_section - 1;
+                   memcpy(cur_section, p+1, n2); cur_section[n2] = 0; }
+            else fprintf(stderr,"[config] malformed section header (no ']'): %s", p);
+            continue;
+        }
         char* eq = strchr(p,'='); if(!eq) continue;
         *eq = 0;
         char* key = p; char* val = eq+1;
@@ -446,7 +604,37 @@ long node_config_load(const char* path){
         size_t kl = strlen(key);
         while(kl && (key[kl-1]==' '||key[kl-1]=='\t')) key[--kl]=0;
 
-        int iv = atoi(val); int t;
+        /* DMN-4: apply a sectioned key only on its own chain. */
+        if(cur_section[0] && !nodecfg_section_is(cur_section, g_cfg.chain)){
+            continue;
+        }
+        /* DMN-4: Core IGNORES network-specific options that appear outside
+         * any section when the selected chain is not main, with a warning --
+         * because a bare `port=` in a file that also has a [regtest] block
+         * almost always means the mainnet port and would silently move the
+         * test node. Same rule, same reason, said out loud. */
+        if(!cur_section[0] && strcmp(g_cfg.chain, "main") != 0 && nodecfg_is_network_specific(key)){
+            fprintf(stderr,"[config] %s= is network-specific and appears outside any section "
+                           "while chain=%s: ignoring it (Core does the same; put it under [%s] to apply it)\n",
+                    key, g_cfg.chain, g_cfg.chain);
+            continue;
+        }
+        /* DMN-4: Core's negation. `-noX` is `-X=0`, so `noX=1` means X=0 and
+         * `noX=0` means X=1. Rewritten here into the key/value the chain
+         * below already understands, so every boolean option gets it at once
+         * rather than one at a time. Only applied when the remainder is a key
+         * this parser knows, so a genuine option starting with "no" -- there
+         * is none today, but there could be -- is not silently mangled. */
+        char negbuf[128];
+        if(kl > 2 && key[0]=='n' && key[1]=='o' && nodecfg_known_key(key+2)){
+            snprintf(negbuf, sizeof negbuf, "%s", key+2);
+            int on = nodecfg_atoi(val, key) ? 0 : 1;    /* noX=1 -> X=0 (DMN-9: bounded) */
+            fprintf(stderr,"[config] %s=%s -> %s=%d (Core negation)\n", key, val, negbuf, on);
+            key = negbuf; kl = strlen(negbuf);
+            val = on ? (char*)"1" : (char*)"0";
+        }
+
+        int iv = nodecfg_atoi(val, key); int t;   /* DMN-9: bounded, not atoi */
 
         /* ---- keys Bitcoin Core actually defines: same name, same units ----
          * A real bitcoin.conf must work here unchanged, and our file must not
@@ -565,7 +753,19 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"listenonion")){
             g_cfg.listenonion = iv?1:0; applied++; }
         else if(!strcmp(key,"bantime")){      /* Core -bantime, seconds      */
-            { long bv = atol(val); if(bv > 0) g_cfg.bantime = bv; } applied++; }
+            /* DMN-9: an unbounded bantime is FAIL-OPEN. main.c computes
+             * time(NULL) + bantime, so bantime=9223372036854775807 wraps
+             * negative and every automatic ban expires on the very next
+             * check -- banning silently switches itself off. Core has no cap
+             * but adds an int64 to GetTime(); a hundred years is longer than
+             * any real ban and cannot overflow that sum. */
+            { long long bv = nodecfg_strtoll(val, key, 0);
+              if(bv > NODECFG_BANTIME_MAX){
+                  fprintf(stderr,"[config] bantime=%s exceeds the %lld-second cap -- using the cap\n",
+                          val, (long long)NODECFG_BANTIME_MAX);
+                  bv = NODECFG_BANTIME_MAX;
+              }
+              if(bv > 0) g_cfg.bantime = (long)bv; } applied++; }
         else if(!strcmp(key,"blockfilterindex")){
             /* Core takes "basic"/"0"/"1"; "basic" is the only index type
              * that exists in Core either, so treat it as on. */
@@ -849,9 +1049,9 @@ long node_config_load(const char* path){
                 fprintf(stderr,"[config] %s=%s: expected legacy, p2sh-segwit, bech32 or bech32m -- ignoring\n", key, val); bad++; }
             else { snprintf(!strcmp(key,"addresstype") ? g_cfg.addresstype : g_cfg.changetype, 16, "%s", val); applied++; } }
         else if(!strcmp(key,"maxtipage")){
-            long lv = atol(val);
+            long long lv = nodecfg_strtoll(val, key, 0);   /* DMN-9: bounded */
             if(lv < 0){ fprintf(stderr,"[config] maxtipage=%s out of range -- ignoring\n", val); bad++; }
-            else { g_cfg.maxtipage = lv; applied++; } }
+            else { g_cfg.maxtipage = (long)lv; applied++; } }
         else if(!strcmp(key,"inboundrelaypercent")){
             t=clamp_int(iv,0,100,key,&bad); if(t>=0){ g_cfg.inboundrelaypercent=t; applied++; } }
         else if(!strcmp(key,"whitelistrelay")){ g_cfg.whitelistrelay = iv?1:0; g_cfg.whitelistrelay_explicit = 1; applied++; }
@@ -959,7 +1159,20 @@ long node_config_load(const char* path){
     if(!g_include_depth && !strcmp(g_cfg.chain, "signet"))
         for(int i = 0; i < g_cfg.n_signetseednode; i++){
             if(g_cfg.n_seednode >= CFG_MAX_NODES) break;
-            snprintf(g_cfg.seednode[g_cfg.n_seednode++], sizeof g_cfg.seednode[0], "%s", g_cfg.signetseednode[i]);
+            /* BLD-7 (2026-09-05): was snprintf(..., "%s", ...). Both operands
+             * are members of g_cfg, so -Wrestrict cannot prove they do not
+             * overlap and warns -- and at -Werror that is a build failure the
+             * moment anything compiles this file at -O1 (the sanitizer build
+             * added this commit does). They are distinct fixed arrays, so
+             * there is no real overlap, but a bounded COPY is what this line
+             * always meant; snprintf with a bare "%s" was the wrong tool for
+             * it. Note the destination (64) is SMALLER than the source (80),
+             * so the truncation is deliberate and now explicit. */
+            { char* dst = g_cfg.seednode[g_cfg.n_seednode++];
+              const char* src = g_cfg.signetseednode[i];
+              size_t cap = sizeof g_cfg.seednode[0];
+              size_t l = strnlen(src, cap - 1);
+              memcpy(dst, src, l); dst[l] = 0; }
         }
     /* -connect's implications, applied once the whole file has been seen. */
     if(g_cfg.connect_only){
@@ -1053,7 +1266,7 @@ void node_config_log(void){
 int node_config_accept_stale_fee(void){ return g_cfg.acceptstalefeeestimates; }
 
 /* Small accessor for callers that link this file only weakly (rpc_node.c's
- * getnetworkinfo needs g_cfg's proxy fields, but bitcoin_cli -- a pure HTTP
+ * getnetworkinfo needs g_cfg's proxy fields, but bmc_cli -- a pure HTTP
  * client that never executes that RPC's implementation -- does not link
  * this file at all). Exporting one narrow function keeps g_cfg itself out
  * of that weak-symbol surface, which matters because g_cfg is a struct

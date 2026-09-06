@@ -439,6 +439,7 @@ bech32_decode:
 	mov  x22, x3   /* in */
 	mov  x23, #0   /* running len */
 	mov  x24, #0   /* last '1' pos */
+	mov  x9, #0    /* SER-5: case bitmap -- 1 = saw lower, 2 = saw upper */
 .dc_scan:
 	ldrb w10, [x22, x23]
 	cbz  w10, .dc_scan_done
@@ -450,6 +451,26 @@ bech32_decode:
 	 * >90-char addresses), so both engines must answer -1 identically. */
 	cmp  x23, #90
 	b.hs .dc_err
+	/* ---- SER-5 / WAL-9 (audit 2026-09-03): reject MIXED case ----
+	 * CHAR2IDX maps upper-case letters to the same values as lower, so the
+	 * decoder folded case and accepted a string BIP173 forbids: "the string
+	 * must be either all lowercase or all uppercase". validateaddress on
+	 * bc1QW508D6QEJXTDG4Y5R3ZARVARY0C5XW7KV8F3T4 answered isvalid:true where
+	 * Core's bech32::Decode answers false. All-upper and all-lower both stay
+	 * valid, which BIP173 also requires -- only the mixture is refused. */
+	cmp  w10, #'a'
+	b.lo .dc_cs_upper
+	cmp  w10, #'z'
+	b.hi .dc_cs_upper
+	orr  x9, x9, #1
+	b    .dc_cs_done
+.dc_cs_upper:
+	cmp  w10, #'A'
+	b.lo .dc_cs_done
+	cmp  w10, #'Z'
+	b.hi .dc_cs_done
+	orr  x9, x9, #2
+.dc_cs_done:
 	cmp  w10, #'1'
 	b.ne .dc_notsep
 	mov  x24, x23
@@ -457,6 +478,8 @@ bech32_decode:
 	add  x23, x23, #1
 	b    .dc_scan
 .dc_scan_done:
+	cmp  x9, #3               /* SER-5: both cases present -> not a bech32 string */
+	b.eq .dc_err
 	cbz  x24, .dc_err
 	mov  x23, x24               /* hrp_len */
 	cmp  x23, x21

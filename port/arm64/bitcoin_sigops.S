@@ -150,6 +150,58 @@ script_sigops_ex:
  * Registers (all survive the `bl script_sigops` because it preserves x19-x28):
  *   x19 = cursor, x21 = total, x22 = n_in, x23 = n_out, x24 = slen, x26 = scratch.
  * -------------------------------------------------------------------------- */
+/* ----------------------------------------------------------------------------
+ * SCR-10 (audit 2026-09-03): tx_legacy_sigops walked the transaction with NO
+ * bounds checks at all -- the length was loaded once and never compared, and
+ * every varint read and every advance indexed unconditionally. It was
+ * unreachable only because both callers parse the transaction fully first:
+ * that is the "a distant function already checked this" pattern this tree's
+ * own comments warn about, one refactor away from being an out-of-bounds read
+ * on peer-supplied bytes. (asm/bitcoin_sigops.asm's x86 macros, register-
+ * mapped: cursor x19, end x25, base x26.)
+ *
+ * SO_NEED n -- require n more bytes at x19 within [x26, x25), else bail.
+ *   Checks the ADDITION for carry too (adds), so a varint claiming a huge
+ *   length cannot wrap the cursor past the end and land back inside the
+ *   buffer. Works with an immediate or a register operand.
+ *
+ * SO_VARINT dst -- read a CompactSize at x19 into dst, advancing x19, with
+ *   every read bounded.
+ * -------------------------------------------------------------------------- */
+.macro SO_NEED n
+	adds x6, x19, \n
+	b.cs .tlo_oob
+	cmp  x6, x25
+	b.hi .tlo_oob
+.endm
+
+.macro SO_VARINT dst
+	SO_NEED 1
+	ldrb w2, [x19]
+	cmp  w2, #0xfd
+	b.lo .Lsv_b\@
+	b.eq .Lsv_2\@
+	cmp  w2, #0xfe
+	b.eq .Lsv_4\@
+	SO_NEED 9
+	ldr  \dst, [x19, #1]
+	add  x19, x19, #9
+	b    .Lsv_d\@
+.Lsv_b\@:	add  x19, x19, #1
+	mov  \dst, x2              /* W write zero-extends */
+	b    .Lsv_d\@
+.Lsv_2\@:	SO_NEED 3
+	ldrh w2, [x19, #1]
+	add  x19, x19, #3
+	mov  \dst, x2
+	b    .Lsv_d\@
+.Lsv_4\@:	SO_NEED 5
+	ldr  w2, [x19, #1]
+	add  x19, x19, #5
+	mov  \dst, x2
+.Lsv_d\@:
+.endm
+
 	.global tx_legacy_sigops
 	.type tx_legacy_sigops,%function
 tx_legacy_sigops:
@@ -158,11 +210,14 @@ tx_legacy_sigops:
 	stp  x21,x22,[sp,#-16]!
 	stp  x23,x24,[sp,#-16]!
 	stp  x25,x26,[sp,#-16]!
-	mov  x26,x0			/* base (for initial cursor) */
+	mov  x26,x0			/* base */
 	mov  x21,xzr			/* total = 0 */
+	add  x25,x26,x1			/* end = base + txlen (SCR-10: the bound that
+					 * was loaded once and never compared) */
 	add  x19,x26,#4			/* cursor after version */
 
 	/* ---- skip SegWit marker+flag (0x00 0x01 after version) ---- */
+	SO_NEED 2
 	ldrb w0,[x19]
 	cbnz w0,.tlo_have_flags
 	ldrb w0,[x19,#1]
@@ -172,31 +227,38 @@ tx_legacy_sigops:
 .tlo_have_flags:
 
 	/* ---- n_in varint -> x22 ---- */
-	READ_VARINT x22, x19
+	SO_VARINT x22
 
 	/* ---- walk inputs ---- */
 .tlo_in_loop:
 	cbz  x22,.tlo_in_done
+	SO_NEED 36
 	add  x19,x19,#36		/* skip prevout */
-	READ_VARINT x24, x19	/* scriptSig len */
+	SO_VARINT x24			/* scriptSig len */
+	SO_NEED x24			/* the scriptSig bytes themselves must be in
+					 * the buffer before script_sigops is handed a
+					 * pointer and a length */
 	mov  x0,x19			/* script */
 	mov  x1,x24			/* len */
 	bl   script_sigops		/* inaccurate: multisig=20 */
 	add  x21,x21,x0
 	add  x19,x19,x24		/* past scriptSig */
-	add  x19,x19,#4			/* seq */
+	SO_NEED 4			/* sequence */
+	add  x19,x19,#4
 	sub  x22,x22,#1
 	b    .tlo_in_loop
 .tlo_in_done:
 
 	/* ---- n_out varint -> x23 ---- */
-	READ_VARINT x23, x19
+	SO_VARINT x23
 
 	/* ---- walk outputs ---- */
 .tlo_out_loop:
 	cbz  x23,.tlo_final
-	add  x19,x19,#8			/* skip value */
-	READ_VARINT x24, x19	/* scriptPubKey len */
+	SO_NEED 8			/* skip value */
+	add  x19,x19,#8
+	SO_VARINT x24			/* scriptPubKey len */
+	SO_NEED x24
 	mov  x0,x19			/* script */
 	mov  x1,x24			/* len */
 	bl   script_sigops		/* inaccurate */
@@ -204,6 +266,13 @@ tx_legacy_sigops:
 	add  x19,x19,x24		/* past scriptPubKey */
 	sub  x23,x23,#1
 	b    .tlo_out_loop
+.tlo_oob:
+	/* SCR-10: malformed / truncated. -1 rather than 0, because 0 is a
+	 * LEGITIMATE count and both callers add the result to a cost compared
+	 * against a limit -- returning 0 here would say "no sigops" and pass
+	 * the check, which is fail-open on exactly the input that earned the
+	 * refusal. */
+	mov  x21,#-1
 .tlo_final:
 	mov  x0,x21
 	ldp  x25,x26,[sp],#16

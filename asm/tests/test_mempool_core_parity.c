@@ -102,6 +102,7 @@ int main(void){
         memset(st,0,sizeof st); \
         mpool_policy_init(pol, 1000 /* sat/kvB: 1 sat/vB, as before */, 25, 101000, 25, 101000, 1); \
         if (nonstd) mpool_policy_set_acceptnonstd(pol, 1); \
+        { extern void mpol_policy_set_min_size(void*, unsigned); mpol_policy_set_min_size(pol, 0); } /* MEM-23: test-only, see test_mempool_policy.c */ \
         mpool_policy_state_init(st, 512); \
         mpool_init(mp, 256, mblob, sizeof mblob); \
         utxo_init(ux, 256, ublob, sizeof ublob); \
@@ -109,7 +110,8 @@ int main(void){
             utxo_put(ux, t, 0, 1000000ULL, 0, 0, SPK_WPKH, sizeof SPK_WPKH); } \
     } while(0)
 
-    u8 tx[8192]; u8 id[32]; long n, r;
+    /* MEM-7's bloated replacement is ~6.4 kB; 8192 was too tight. */
+    static u8 tx[65536]; u8 id[32]; long n, r;
     static const u8 EMPTY[1] = {0};
 
     printf("== 1: standardness, Core reject strings ==\n");
@@ -251,6 +253,158 @@ int main(void){
         ck("standalone survived (better score)", mpool_get(mp,sid,&l) != NULL);
         ck("incoming present", mpool_get(mp,hid,&l) != NULL); } }
 
+    /* ================================================================
+     * MEM-12 (second half): the BATCH block connect must leave the pool in
+     * exactly the state the per-transaction path would have.
+     *
+     * mpool_policy_block_connect used to call remove_confirmed (and, on a
+     * conflict, remove_package) once per transaction, each O(n) -- so O(n*m)
+     * for an m-transaction block, seconds for a real block against a full
+     * pool. It now marks everything and compacts once, O(n + links).
+     *
+     * A rewrite of removal on the block-connect path is exactly the kind of
+     * change where a handful of hand-built cases prove too little, so this
+     * runs the SAME block against two IDENTICAL pools -- one with batching
+     * on, one off -- and compares the survivors. Any divergence in what is
+     * removed, what is kept, or the fee/size bookkeeping shows up here.
+     *
+     * The fixture deliberately mixes the two removal kinds, because they are
+     * what the batch has to keep apart: a CONFIRMED transaction leaves alone
+     * (its children stay), a CONFLICTED one leaves with its descendants.
+     * ================================================================ */
+    /* ================================================================
+     * SER-3 / VAL-10: a transaction Core cannot deserialize must not enter
+     * the pool, and must not be relayed from it.
+     *
+     * The block-connect and witness readers were fixed earlier, closing the
+     * consensus hole. This is the reader the MEMPOOL uses, so leaving it lax
+     * meant such a transaction could still be accepted here and relayed --
+     * to peers that all refuse it.
+     *
+     * `fd 01 00` is 1 encoded in the 3-byte form: legal bytes, illegal
+     * encoding. Core's ReadCompactSize throws "non-canonical
+     * ReadCompactSize()".
+     * ================================================================ */
+    printf("\n== SER-3: a non-canonical CompactSize is refused by the pool ==\n");
+    {
+        RESET(1);
+        txout_t o = { .v=1000000-500, .spk=SPK_WPKH, .spklen=22 };
+        /* control: the same transaction, canonically encoded, is accepted */
+        n = mk(tx, &(txin_t){ .tag=1, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &o, 1);
+        tx_txid(id, tx, n, sc, sizeof sc);
+        ck("SER-3 control: the canonical form is accepted",
+           mpool_policy_add(pol, st, mp, tx, n, id, ux) == 1);
+
+        /* Now rebuild it with n_in written as `fd 01 00` instead of `01`.
+         * Everything after the count shifts by two bytes. */
+        RESET(1);
+        u8 bad[512]; unsigned long bn = 0;
+        memcpy(bad, tx, 4); bn = 4;                    /* version */
+        bad[bn++] = 0xfd; bad[bn++] = 0x01; bad[bn++] = 0x00;   /* n_in = 1, WIDE */
+        memcpy(bad + bn, tx + 5, (size_t)(n - 5)); bn += (unsigned long)(n - 5);
+        u8 bid[32]; tx_txid(bid, bad, bn, sc, sizeof sc);
+        long rbad = mpool_policy_add(pol, st, mp, bad, bn, bid, ux);
+        printf("      (non-canonical n_in -> %ld %s)\n", rbad,
+               rbad == 1 ? "ACCEPTED" : mpool_policy_reason(pol));
+        ck("SER-3 a non-canonical n_in is REFUSED", rbad != 1);
+        { unsigned long l; ck("SER-3 ...and is not in the pool",
+                              mpool_get(mp, bid, &l) == NULL); }
+    }
+
+    printf("\n== MEM-12: batch block connect == per-transaction block connect ==\n");
+    {
+        extern void mpool_policy_set_batch_connect(int on);
+        u8 surv_batch[64][32]; int n_batch = 0;
+        u8 surv_seq[64][32];   int n_seq = 0;
+        long rm_batch = 0, rm_seq = 0;
+        u8 blk[8192]; long bl = 0;
+
+        for (int pass = 0; pass < 2; pass++){
+            mpool_policy_set_batch_connect(pass == 0 ? 1 : 0);
+            RESET(1);
+
+            /* Six pool residents over three shapes:
+             *   A (confirmed) with a child;  B (conflicted) with a child;
+             *   S standalone, untouched;     D, a second child of A. */
+            u8 A[32], Ac[32], Ad[32], B[32], Bc[32], S[32];
+            txout_t oS = { .v=0, .spk=SPK_WPKH, .spklen=22 };
+            u8 atx[512]; long alen;
+
+            oS.v = 1000000-500;
+            alen = mk(atx, &(txin_t){ .tag=1, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+            tx_txid(A, atx, alen, sc, sizeof sc);
+            ck("batch-diff: A in", mpool_policy_add(pol, st, mp, atx, alen, A, ux) == 1);
+
+            oS.v = (1000000-500)-500;
+            n = mk(tx, &(txin_t){ .previd=A, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+            tx_txid(Ac, tx, n, sc, sizeof sc);
+            ck("batch-diff: A's child in", mpool_policy_add(pol, st, mp, tx, n, Ac, ux) == 1);
+
+            oS.v = (1000000-500)-500-500;
+            n = mk(tx, &(txin_t){ .previd=Ac, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+            tx_txid(Ad, tx, n, sc, sizeof sc);
+            ck("batch-diff: A's grandchild in", mpool_policy_add(pol, st, mp, tx, n, Ad, ux) == 1);
+
+            oS.v = 1000000-500;
+            n = mk(tx, &(txin_t){ .tag=2, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+            tx_txid(B, tx, n, sc, sizeof sc);
+            ck("batch-diff: B in", mpool_policy_add(pol, st, mp, tx, n, B, ux) == 1);
+
+            oS.v = (1000000-500)-500;
+            n = mk(tx, &(txin_t){ .previd=B, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+            tx_txid(Bc, tx, n, sc, sizeof sc);
+            ck("batch-diff: B's child in", mpool_policy_add(pol, st, mp, tx, n, Bc, ux) == 1);
+
+            oS.v = 1000000-500;
+            n = mk(tx, &(txin_t){ .tag=3, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+            tx_txid(S, tx, n, sc, sizeof sc);
+            ck("batch-diff: standalone in", mpool_policy_add(pol, st, mp, tx, n, S, ux) == 1);
+
+            /* The block: coinbase, A (confirmed), and a different spend of
+             * tag2 (conflicts with B). Built once, on the first pass, and
+             * replayed verbatim on the second. */
+            if (pass == 0){
+                bl = 0; memset(blk, 0, 80); bl = 80;
+                blk[bl++] = 3;
+                { static u8 zero32[32];
+                  txout_t oc = { .v=5000000000ULL, .spk=SPK_WPKH, .spklen=22 };
+                  static const u8 ssc[1] = { 0x51 };
+                  txin_t cb = { .previd=zero32, .idx=0xffffffffu, .seq=0xffffffffu, .ss=ssc, .sslen=1 };
+                  bl += mk(blk+bl, &cb, 1, &oc, 1); }
+                memcpy(blk+bl, atx, alen); bl += alen;
+                { txout_t ob = { .v=1000000-700, .spk=SPK_WPKH, .spklen=22 };
+                  static const u8 ssb[2] = { 0x51, 0x51 };
+                  txin_t ib = { .tag=2, .idx=0, .seq=0xffffffffu, .ss=ssb, .sslen=2 };
+                  bl += mk(blk+bl, &ib, 1, &ob, 1); }
+            }
+
+            long rm = mpool_policy_block_connect(st, mp, blk, (unsigned long)bl);
+            /* record the survivors of this pass */
+            const u8* all[6] = { A, Ac, Ad, B, Bc, S };
+            for (int q = 0; q < 6; q++){
+                unsigned long l;
+                if (mpool_get(mp, all[q], &l) != NULL){
+                    if (pass == 0) memcpy(surv_batch[n_batch++], all[q], 32);
+                    else           memcpy(surv_seq[n_seq++],   all[q], 32);
+                }
+            }
+            if (pass == 0) rm_batch = rm; else rm_seq = rm;
+        }
+        mpool_policy_set_batch_connect(1);          /* leave it as it ships */
+
+        printf("      (batch removed %ld, per-tx removed %ld; survivors %d vs %d)\n",
+               rm_batch, rm_seq, n_batch, n_seq);
+        ck("MEM-12 both paths report the same removal count", rm_batch == rm_seq);
+        ck("MEM-12 both paths leave the same number of survivors", n_batch == n_seq);
+        { int same = (n_batch == n_seq);
+          for (int q = 0; same && q < n_batch; q++)
+              if (memcmp(surv_batch[q], surv_seq[q], 32) != 0) same = 0;
+          ck("MEM-12 ...and exactly the same transactions, in the same order", same); }
+        /* And the outcome itself is the Core one, so a differential between
+         * two identically-WRONG paths cannot pass this. */
+        ck("MEM-12 the confirmed tx's descendants survived", n_batch == 3);
+    }
+
     printf("\n== 4: RBF, Core rules ==\n");
     RESET(1);
     { txout_t oS = { .v=0, .spk=SPK_WPKH, .spklen=22 };
@@ -311,6 +465,56 @@ int main(void){
         ck("P evicted", mpool_get(mp, p1, &l) == NULL);
         ck("C evicted WITH P (descendant)", mpool_get(mp, c1, &l) == NULL); }
 
+      /* ---- MEM-7 (audit 2026-09-03): PaysMoreThanConflicts ----
+       *
+       * Rules 3+4 above are ABSOLUTE-fee rules. On their own a replacement
+       * that pays more in TOTAL but far less PER BYTE wins, which is worse
+       * for a miner than what it evicted and is what Core's
+       * PaysMoreThanConflicts (pre-v31) and feerate-diagram check (v31)
+       * exist to refuse.
+       *
+       * The fixture is the audit's, scaled to this harness: a small original
+       * at a high feerate, and a replacement bloated with outputs so that it
+       * pays MORE in total -- clearing rules 3 and 4 -- at a much lower
+       * feerate. If only the absolute rules were in force it would be
+       * accepted and the original evicted. */
+      { u8 sm[32];
+        oS.v = 1000000 - 5000;                       /* fee 5000 over ~110 vB */
+        n = mk(tx, &(txin_t){ .tag=9, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+        tx_txid(sm, tx, n, sc, sizeof sc);
+        ck("MEM-7 small high-feerate original in", mpool_policy_add(pol, st, mp, tx, n, sm, ux) == 1);
+
+        /* 200 outputs of 31 bytes each: ~6.3 kB of extra vsize. */
+        enum { NBLOAT = 200 };
+        static txout_t big[NBLOAT];
+        /* fee 12,000: comfortably above the 1 sat/vB relay floor for ~6.4 kvB
+         * (so the refusal below cannot be the floor), above the 5,000 it
+         * replaces (so rules 3+4 pass), and ~1.9 sat/vB against the
+         * original's ~45 (so only PaysMoreThanConflicts can refuse it). */
+        big[0].v = 1000000 - 12000; big[0].spk = SPK_WPKH; big[0].spklen = 22;
+        for (int q = 1; q < NBLOAT; q++){ big[q].v = 0; big[q].spk = SPK_WPKH; big[q].spklen = 22; }
+        n = mk(tx, &(txin_t){ .tag=9, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, big, NBLOAT);
+        tx_txid(id, tx, n, sc, sizeof sc);
+        r = mpool_policy_add(pol, st, mp, tx, n, id, ux);
+        /* Rules 3+4 alone would let this through: it pays 12,000 against the
+         * 5,000 it replaces, and the 7,000 increment covers its own ~6.4 kvB
+         * at the incremental rate. */
+        ck("MEM-7 a bigger-but-cheaper-per-byte replacement is REFUSED", r == 0);
+        ckr("...as", pol, "insufficient fee");
+        { unsigned long l;
+          ck("MEM-7 the original was NOT evicted by the refused replacement",
+             mpool_get(mp, sm, &l) != NULL); }
+
+        /* Control: the same replacement at a feerate ABOVE the original is
+         * accepted, so the new rule is not simply refusing large txs. */
+        big[0].v = 1000000 - 400000;                 /* fee 400000 over ~6.4 kvB */
+        n = mk(tx, &(txin_t){ .tag=9, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, big, NBLOAT);
+        tx_txid(id, tx, n, sc, sizeof sc);
+        r = mpool_policy_add(pol, st, mp, tx, n, id, ux);
+        ck("MEM-7 the same replacement at a HIGHER feerate is accepted", r == 1);
+        { unsigned long l;
+          ck("MEM-7 ...and then the original is evicted", mpool_get(mp, sm, &l) == NULL); } }
+
       /* disjointness: replacement double-spends U's prevout AND spends U's
        * own output -> "bad-txns-spends-conflicting-tx" */
       { u8 u1[32];
@@ -348,6 +552,45 @@ int main(void){
         r = mpool_policy_add(pol, st, mp, tx, n, id, ux);
         ck("new-unconfirmed-input replacement refused", r == 0);
         ckr("...as", pol, "replacement-adds-unconfirmed"); }
+
+      /* ---- MEM-14 (audit 2026-09-03): a SIBLING output of a conflict's own
+       * parent is not a "new" unconfirmed input.
+       *
+       * Rule 2 demanded that the exact OUTPOINT be claimed by a conflict.
+       * Core's HasNoNewUnconfirmed tests membership in parents_of_conflicts,
+       * a set of TXIDs -- so an input spending a DIFFERENT output of a tx that
+       * a conflict already spends is fine.
+       *
+       * The shape is an ordinary bumpfee: unconfirmed parent P pays two
+       * outputs; the original spends P:0; the replacement re-selects and
+       * spends P:0 AND P:1. P:1 is unconfirmed and unclaimed, so this was
+       * refused where Core accepts.
+       *
+       * The case above is the control's other half and must keep failing: an
+       * input from an UNRELATED pool tx is still new, and a fix that simply
+       * stopped checking would let it through. */
+      { u8 P2[32], C2[32];
+        txout_t two[2] = { { .v=400000, .spk=SPK_WPKH, .spklen=22 },
+                           { .v=400000, .spk=SPK_WPKH, .spklen=22 } };
+        n = mk(tx, &(txin_t){ .tag=6, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, two, 2);
+        tx_txid(P2, tx, n, sc, sizeof sc);
+        ck("MEM-14 parent P with two outputs in", mpool_policy_add(pol, st, mp, tx, n, P2, ux) == 1);
+
+        txout_t oc = { .v=390000, .spk=SPK_WPKH, .spklen=22 };
+        n = mk(tx, &(txin_t){ .previd=P2, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oc, 1);
+        tx_txid(C2, tx, n, sc, sizeof sc);
+        ck("MEM-14 child C spending P:0 in", mpool_policy_add(pol, st, mp, tx, n, C2, ux) == 1);
+
+        /* the replacement: conflicts with C on P:0, and ALSO spends P:1 */
+        txin_t rep[2] = {
+            { .previd=P2, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 },  /* conflicts with C */
+            { .previd=P2, .idx=1, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }   /* sibling output */
+        };
+        txout_t orp = { .v=700000, .spk=SPK_WPKH, .spklen=22 };
+        n = mk(tx, rep, 2, &orp, 1); tx_txid(id, tx, n, sc, sizeof sc);
+        r = mpool_policy_add(pol, st, mp, tx, n, id, ux);
+        ck("MEM-14 spending a SIBLING output of the conflict's parent is ACCEPTED", r == 1);
+        if (r != 1) printf("      refused as: %s\n", mpool_policy_reason(pol)); }
     }
 
     printf("\n== 4b: classic signaling when fullrbf is OFF ==\n");
@@ -422,6 +665,48 @@ int main(void){
         ck("A's child SURVIVES", mpool_get(mp, Achild, &l) != NULL);
         ck("B gone (conflicted)", mpool_get(mp, B, &l) == NULL);
         ck("B's child gone WITH it", mpool_get(mp, Bchild, &l) == NULL); }
+
+    printf("\n== 5b: MEM-17 -- a confirmed parent stops counting as an ancestor ==\n");
+    /* remove_node cleared a child's parent ref but never fixed the child's
+     * anc_cnt/anc_bytes, and anc_cnt gates TRUC (limit 2, counting self).
+     * So: v3 P -> v3 C in the pool; a v3 grandchild G is a 3-deep chain and
+     * MUST be refused (that is the control -- it proves the limit is live).
+     * Then a block confirms P. Core: C now has 0 mempool ancestors, so G is
+     * fine. Here C still said anc_cnt == 2 and G stayed "TRUC-violation". */
+    RESET(0);   /* standardness ON: the TRUC rules live under !accept_nonstd */
+    { txout_t oS = { .v=1000000-500, .spk=SPK_WPKH, .spklen=22 };
+      u8 P[32], C[32], G[32];
+      static u8 ptx[256], gtx[256]; long plen, glen;
+      plen = mk(ptx, &(txin_t){ .tag=3, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+      ptx[0] = 3;                                          /* nVersion 3: TRUC */
+      tx_txid(P, ptx, plen, sc, sizeof sc);
+      ck("MEM-17 P (v3) in", mpool_policy_add(pol, st, mp, ptx, plen, P, ux) == 1);
+      oS.v = 1000000-500-500;
+      n = mk(tx, &(txin_t){ .previd=P, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+      tx[0] = 3; tx_txid(C, tx, n, sc, sizeof sc);
+      ck("MEM-17 C (v3, child of P) in", mpool_policy_add(pol, st, mp, tx, n, C, ux) == 1);
+      oS.v = 1000000-500-500-500;
+      glen = mk(gtx, &(txin_t){ .previd=C, .idx=0, .seq=0xffffffffu, .ss=EMPTY, .sslen=0 }, 1, &oS, 1);
+      gtx[0] = 3; tx_txid(G, gtx, glen, sc, sizeof sc);
+      r = mpool_policy_add(pol, st, mp, gtx, glen, G, ux);
+      ck("MEM-17 control: G refused while P is still unconfirmed (3-deep v3 chain)", r == 0);
+      ckr("...as", pol, "TRUC-violation");
+
+      /* the block: coinbase + P */
+      static u8 blk[4096]; long bl = 0; memset(blk, 0, 80); bl = 80; blk[bl++] = 2;
+      { static u8 zero32[32];
+        txout_t oc = { .v=5000000000ULL, .spk=SPK_WPKH, .spklen=22 };
+        static const u8 ssc[1] = { 0x51 };
+        txin_t cb = { .previd=zero32, .idx=0xffffffffu, .seq=0xffffffffu, .ss=ssc, .sslen=1 };
+        bl += mk(blk+bl, &cb, 1, &oc, 1); }
+      memcpy(blk+bl, ptx, plen); bl += plen;
+      long rm = mpool_policy_block_connect(st, mp, blk, (unsigned long)bl);
+      ck("MEM-17 the block removed exactly P", rm == 1);
+      { unsigned long l; ck("MEM-17 C survives P's confirmation", mpool_get(mp, C, &l) != NULL); }
+
+      r = mpool_policy_add(pol, st, mp, gtx, glen, G, ux);
+      ck("MEM-17 G ACCEPTED once P has confirmed (Core: C has no unconfirmed ancestor)", r == 1);
+      if (r != 1) printf("      refused as: %s\n", mpool_policy_reason(pol)); }
 
       /* rolling decay: bump the floor, then time-travel the last-update
        * stamp back 25h (white-box poke at st+56; layout documented in the

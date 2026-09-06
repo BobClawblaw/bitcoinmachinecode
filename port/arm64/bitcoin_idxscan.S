@@ -401,7 +401,15 @@ idxscan_append_locked:
     stp  x21,x22,[sp,#-16]!
     stp  x23,x24,[sp,#-16]!
     stp  x25,x26,[sp,#-16]!
-    sub  sp,sp,#0x20            /* tip-hash scratch @[sp,#8] (32B), clear of saves */
+    sub  sp,sp,#0x30            /* tip-hash scratch @[sp,#8] (32B): the 0x30
+                                 * reservation keeps the scratch's top byte
+                                 * clear of the saved x25/x26 pair at [sp,#32].
+                                 * The old 0x20 let the pread's last 8 bytes
+                                 * land ON the saved x25 -- every append with a
+                                 * live tip corrupted the caller's x25 across
+                                 * this call (found by upstream's incident-#46
+                                 * test, which keeps sp-derived pointers live in
+                                 * x25/x26 at -O2). */
     mov  x29,sp
     mov  x19,x0                /* st */
     mov  x20,x1                /* hash */
@@ -471,7 +479,7 @@ idxscan_append_locked:
 .al_refuse_done:
     mov  x0,#-2
 .al_ret:
-    add  sp,sp,#0x20
+    add  sp,sp,#0x30
     ldp  x25,x26,[sp],#16
     ldp  x23,x24,[sp],#16
     ldp  x21,x22,[sp],#16
