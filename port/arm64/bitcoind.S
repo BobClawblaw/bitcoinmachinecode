@@ -1984,4 +1984,36 @@ node_services:
 	.quad 9
 	.size node_services, 8
 
+/* CC-2 hook table (asm/bitcoind.asm's data symbols, ARM twin). The ARM
+ * mux does not yet CALL these (the sendcmpct announcement and the
+ * hook-selected getdata type are queued in port/PORT_ROADMAP.md) -- but
+ * main.c sets them at boot, so the symbols must exist for the daemon to
+ * link. Zero-initialized: with no caller the wire stream is unchanged. */
+	.align 3
+	.global g_peer_sendcmpct
+	.type g_peer_sendcmpct, %object
+g_peer_sendcmpct:
+	.quad 0
+	.size g_peer_sendcmpct, 8
+	.global g_sync_mp
+	.type g_sync_mp, %object
+g_sync_mp:
+	.quad 0
+	.size g_sync_mp, 8
+	.global g_cmpct_hook_type
+	.type g_cmpct_hook_type, %object
+g_cmpct_hook_type:
+	.quad 0
+	.size g_cmpct_hook_type, 8
+	.global g_cmpct_hook_cmpct
+	.type g_cmpct_hook_cmpct, %object
+g_cmpct_hook_cmpct:
+	.quad 0
+	.size g_cmpct_hook_cmpct, 8
+	.global g_cmpct_hook_blocktxn
+	.type g_cmpct_hook_blocktxn, %object
+g_cmpct_hook_blocktxn:
+	.quad 0
+	.size g_cmpct_hook_blocktxn, 8
+
 	.section .note.GNU-stack,"",%progbits
