@@ -3067,7 +3067,16 @@ and found a probe is one or two cache misses, not a sequence, so the
 cache-line-aware probe the scope imagined would have bought nothing.
 Tiered compaction, also in the scope, had already landed on 2026-08-31.
 
-**Not measured end to end.** No full sync has run on this code. The CC-8
+**Measured end to end: in progress.** A fresh full sync on the dedicated
+bench SSD started 2026-09-06 05:50Z from main `0151051`
+(`/mnt/2tbssd/bmc-bench`, 16 workers, `dbcache=8192`,
+`bmc.bootcatchup=0`, 965,215 blocks); its wall clock against Core v31.1's
+21.0 h from 2026-09-04 is the number every lever above is waiting on. Two
+harness defects had to be fixed first, both from the repo moving under it:
+it built `daemon/bitcoin_cli` (renamed `bmc_cli` on 2026-09-05) and wrote
+no `bmc.bootcatchup=0`, which would have measured the pre-interleave shape.
+
+**Not measured end to end (before that run).** No full sync had run on this code. The CC-8
 full-verification replay (`/storage/bmc-fullverify`, `assumevalid=0`) is
 being restarted on it from its 233k-block archive; its wall-clock is the
 first whole-run number. Two caveats bound what that run can show: the
