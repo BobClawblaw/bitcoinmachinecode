@@ -83,14 +83,14 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | **Block-relay-only outbound** | 2 extra legs that never relay tx/addr; eclipse resistance | **absent** (0 hits) | **GAP** |
 | **`anchors.dat`** | reconnect to last block-relay-only peers on restart | **absent** | **GAP** (pairs with the row above) |
 | Feeler connections | 1 short-lived every ~2 min, tests a book entry | same (`net_policy.c`) | **DONE** |
-| **Extra outbound when tip is stale** | +1 full-relay peer if no block in >30 min | **absent** | **GAP** |
+| Extra outbound when tip is stale | +1 full-relay peer if no block in >30 min | same (`stale_tip.c`, CC-6, `c6598b5`) | **DONE** |
 | Netgroup diversity in outbound selection | one per /16 (asmap) | same, asmap supported | **DONE** |
 | Tor / I2P / CJDNS outbound, `-onlynet`, stream isolation | | same; proven against Core over real tor, i2p, cjdroute | **DONE** |
 | Inbound onion service (`-listenonion`) | ADD_ONION at boot | same: `tor_onion_listener(port)` runs at boot (`main.c:8271`, `8296`); the 08-28 note in `FEATURE_GAPS.md` was stale | **DONE** |
 | Inbound I2P (`i2pacceptincoming`) | SAM `STREAM ACCEPT` | same: `i2p_inbound_start()` at boot, accept thread hands fds to the serve path | **DONE** |
 | Inbound slot limit, `-maxconnections`, per-connection permissions (`-whitelist`/`-whitebind`) | | same | **DONE** |
 | **Inbound eviction when full** (`AttemptToEvictConnection`) | protect by netgroup, ping, last block, last tx; evict the worst | **absent**: a 20-minute inactivity bound only (NET-3 residual). Under pressure, slots are held by whoever arrived first | **GAP** |
-| `-peertimeout` (connect timeout) | default 60 s | **not implemented** (DMN-14) — the timeout that exists is a different one | **GAP** (small) |
+| `-peertimeout` (handshake bound) | default 60 s | same (`peer_timeout.c`, CC-7, `c6598b5`; DMN-14 closed) | **DONE** |
 | Inactivity disconnect | 20 min | same (NET-3) | **DONE** |
 | `-maxuploadtarget`, `-blocksonly` | | same | **DONE** |
 | Address manager: source-netgroup cap, tried/new, eviction never touching tried | `CAddrMan` buckets | v3 book: per-source cap, tried flag, terrible-then-oldest eviction (NET-10, 2026-09-05, migrated live) | **DONE** (design differs; behavior matches on the properties that matter) |
@@ -112,7 +112,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | Minimum chain work at fork evaluation | never reorg to a chain below `nMinimumChainWork` | same (`minchainwork.c`, `reorg.c:708`, floor per chain) | **DONE** |
 | **Low-work headers sync / presync** | do not store a headers chain until it crosses the floor (24.0 presync) | **absent**: the boot fetch appends every PoW-valid header (`main.c:3315`) | **GAP** |
 | Checkpoints | still present for the early chain | present | **DONE** |
-| Stale-tip detection | warn + extra outbound | no extra outbound (row in §4) | **GAP** (same item) |
+| Stale-tip detection | warn + extra outbound | same (CC-6) | **DONE** |
 | Time offset | v28+ no longer adjusts; warns on large peer skew | no adjustment | **DONE** (parity by absence; warning: verify) |
 | Per-message size caps, framer limits, inv/getdata bounds | | same; 4 MB cap before drain | **DONE** |
 
@@ -186,8 +186,6 @@ by size. Each carries the test that would prove it.
 | 3 | **Inbound eviction** (`AttemptToEvictConnection`, §4) | Under slot pressure the node keeps whoever arrived first — and, found while scoping, *serves unrecorded* peers past the table's 64 slots | medium | CC-3 |
 | 4 | **Block-relay-only outbound + `anchors.dat`** (§4) | Eclipse resistance | medium | CC-4 |
 | 5 | **Low-work headers sync** (§5) | A peer can make the boot fetch store an arbitrarily long valid-PoW low-work chain; the floor is only checked at reorg | medium | CC-5 |
-| 6 | **Extra outbound on stale tip** (§4, §5) | Partition recovery | small | CC-6 |
-| 7 | **`-peertimeout`** (DMN-14) | Parsed, unread | small | CC-7 |
 | 8 | **Full-verification replay** (`assumevalid=0`, §1) | The proof; launch first, it runs unattended | wall-clock | CC-8 |
 | 9 | **BIP331 package relay wire** (§3) | Conditional on Core's default | medium | CC-9 |
 | 10 | `invalidateblock`/`reconsiderblock`, MuSig2 leaf signing, BIP389 derivation, knapsack/SRD | Completeness | small–medium each | CC-10 |
