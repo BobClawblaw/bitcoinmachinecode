@@ -8294,6 +8294,7 @@ int main(int argc, char** argv){
      * reads its tip from index.dat's length */
     { long tr = archive_trim_derived_tails();
       if(tr < 0) fprintf(stderr,"[boot] WARNING: could not trim the derived files past the tip: %s\n", strerror(errno)); }
+    { extern void par_set(int); par_set(g_cfg.par); }   /* -par: script-verification threads (Core semantics) */
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
     /* A fresh non-main datadir self-seeds its own genesis at index 0 (the
      * mainnet archive got genesis by a one-time injection, 5f36dee -- a
@@ -8515,19 +8516,16 @@ int main(int argc, char** argv){
          * clamps this down to however many confirmed-live peers it finds
          * (and up to 64 max), so an over-large request here just becomes a
          * ceiling, not a guarantee. */
-        /* Core -par semantics: 0 == auto (use the machine), negative == leave
-         * that many cores free. CLI arg still wins when given. `par` is the
-         * closest Core equivalent to this node's chunk-claiming worker count;
-         * dl_catchup already clamps the result down to however many
-         * confirmed-live peers it finds, so this is a ceiling, not a promise. */
+        /* The DOWNLOAD chunk-worker count is bmc.catchupworkers, NOT -par.
+         * Core's -par is the script-verification thread count and now means
+         * exactly that here too (tx_verify.c txv_script_threads); it used to
+         * be wired to this number instead, so par=8 halved the download and
+         * left verification using every core -- the opposite of the ask.
+         * dl_catchup clamps this down to however many confirmed-live peers it
+         * finds, so it is a ceiling, not a promise. */
         int catchup_workers;
         if(argc>=6) catchup_workers = atoi(argv[5]);
-        else {
-            long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<1) ncpu=4;
-            if(g_cfg.par > 0)      catchup_workers = g_cfg.par;
-            else if(g_cfg.par < 0) catchup_workers = (int)(ncpu + g_cfg.par);  /* leave |par| free */
-            else                   catchup_workers = 16;                       /* auto: prior default */
-        }
+        else        catchup_workers = g_cfg.catchup_workers;   /* bmc.catchupworkers, default 16 */
         if(catchup_workers<1) catchup_workers=1;
         if(catchup_workers>64) catchup_workers=64;
         fprintf(stderr,"[boot] config: datadir=%s port=%d (%s) listen=%d nwant=%d catchup_workers=%d (%s)\n",

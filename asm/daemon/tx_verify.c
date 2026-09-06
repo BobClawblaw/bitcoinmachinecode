@@ -649,6 +649,10 @@ static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long fla
  * profile could tune it, but correctness does not depend on the exact
  * value -- only throughput does. */
 #define TXV_PARALLEL_MIN 8
+
+/* -par (Core semantics) lives in daemon/par_threads.c so a test can link it alone. */
+#include "par_threads.h"
+
 #define TXV_MAX_WORKERS  16
 
 /* Was: set by utxo_live.c (via txv_set_bulk_mode) to skip parallel dispatch
@@ -734,8 +738,10 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
         return 1;
     }
 
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu < 1) ncpu = 1;
-    int nworkers = (int)(nverify < (u64)ncpu ? nverify : (u64)ncpu);
+    /* -par: the caller is one of the script-checking threads (Core counts it), so
+     * the pool is one smaller than the budget. */
+    long budget = par_script_threads();
+    int nworkers = (int)(nverify < (u64)budget ? nverify : (u64)budget);
     if (nworkers > TXV_MAX_WORKERS) nworkers = TXV_MAX_WORKERS;
     if (nworkers < 1) nworkers = 1;
 
@@ -1492,8 +1498,8 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
         return;
     }
 
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu < 1) ncpu = 1;
-    int nworkers = (int)(nverify < (u64)ncpu ? nverify : (u64)ncpu);
+    long budget = par_script_threads();          /* -par, caller included */
+    int nworkers = (int)(nverify < (u64)budget ? nverify : (u64)budget);
     if (nworkers > TXVB_MAX_WORKERS) nworkers = TXVB_MAX_WORKERS;
     if (nworkers < 1) nworkers = 1;
 
