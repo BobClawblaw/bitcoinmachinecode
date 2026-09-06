@@ -38,6 +38,7 @@ extern void chacha20_keystream_k0(void* out, unsigned long blocks, const unsigne
 extern void num3072_mul_force_path(int p);   /* 0 re-probe, 1 ADX, 2 generic */
 extern int  num3072_mul_current_path(void);
 extern int  num3072_cpu_has_adx(void);
+extern int  num3072_cpu_has_ifma(void);
 
 static int g_fail = 0;
 static const char* g_path = "";   /* which num3072_mul body a check ran on */
@@ -117,14 +118,15 @@ int main(void)
 
     /* ---- layers 3 and up run down EVERY num3072_mul body this CPU has ----
      * num3072_mul dispatches once from CPUID and caches the answer. Without
-     * forcing, the gate box (which has BMI2/ADX) would never execute the
-     * generic body -- the fallback a CPU without ADX depends on -- and a host
-     * without ADX would never execute the ADX body. So Core's multiply and
+     * forcing, the gate box (which has AVX-512 IFMA) would never execute the
+     * ADX or the generic body -- what every other CPU depends on -- and a
+     * host without IFMA would never execute that one. So Core's multiply and
      * set vectors, the order-independence property and the x*1 identity are
      * all run once per body, with the body's name prefixed to each line. */
     struct { int path; const char* name; int avail; } paths[] = {
         { 2, "generic/", 1 },
         { 1, "adx/",     num3072_cpu_has_adx() },
+        { 3, "ifma/",    num3072_cpu_has_ifma() },
     };
     for (size_t pi = 0; pi < sizeof paths / sizeof paths[0]; pi++) {
     if (!paths[pi].avail) {
