@@ -72,7 +72,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | BIP37 bloom (`filterload` etc.) | default off, `NODE_BLOOM` off | not implemented, bit never set | **DECIDED** (matches Core's default) |
 | BIP61 `reject` | removed in 0.20 | absent | **DONE** (parity by absence) |
 | BIP330 Erlay `sendtxrcncl` + reconciliation | negotiation + reconciliation (off by default) | negotiation only, wire-off | **DECIDED** (`FEATURE_GAPS.md` 2026-08-30 "deliberate stopping point") |
-| BIP331 package relay `sendpackages`/`pkgtxns`/`ancpkginfo` | wire negotiation + package fetch | acceptance is real; **wire protocol not built** | **PARTIAL** |
+| BIP331 package relay `sendpackages`/`pkgtxns`/`ancpkginfo` | **not shipped in Core** as of v30/v31: Core relays 1p1c packages *opportunistically* through orphan resolution, with no new messages | same: opportunistic 1p1c via `txr_orphan_resolve` sharing `submitpackage`'s validation; `sendpackages` recognised and ignored, as Core does | **DONE** (parity by absence; CC-9 decided 2026-09-06) |
 | Misbehavior scoring + ban list | `Misbehaving()`, discouragement, `banlist.json` persisted | scored for inv/getdata bounds, header rules, tx violations via `txr_report_violation`; shared in-memory ban list (`ctl_ban_add`), **not persisted across restart** (re-grep 2026-09-06: no banlist file) | **PARTIAL** |
 
 ## 4. P2P behavior — connections and relay
@@ -134,9 +134,9 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 |---|---|---|---|
 | Descriptor wallets, encryption (v3), PSBT create/sign/finalize/analyze/join, `bumpfee` | | same; `bumpfee` proven against real Core | **DONE** |
 | Miniscript, MuSig2 key-path, `musig()` descriptors | | same | **DONE** |
-| MuSig2 inside tapscript **leaf** scripts | signed | not signed | **PARTIAL** |
-| BIP389 multipath descriptors, PSBT Updater role, partial signatures | | absent | **GAP** |
-| Coin selection (BnB / knapsack / SRD, waste metric) | | BnB (`wallet_bnb.c`); knapsack and SRD absent | **PARTIAL** |
+| Taproot **script-path** PSBT signing and finalization (`PSBT_IN_TAP_SCRIPT_SIG`, leaf scripts, control blocks) — MuSig2 in leaves included | signed and finalized | key path only, for every key type; there is no 0x14/0x15 handling at all, so the MuSig2-in-leaf row was the visible edge of a wider gap | **GAP** (deferred: needs Core-generated PSBT fixtures to be built safely; see the scopes) |
+| BIP389 multipath descriptors | `<a;b>` expands to one descriptor per path | same (`descr_multipath_n`, `rpc_desc_multipath_expand`; `importdescriptors` imports one per expansion, `getdescriptorinfo` lists them). The register's first draft called this absent; a re-read of `descriptor.c` on 2026-09-06 found it | **DONE** |
+| Coin selection (BnB / knapsack / SRD, waste metric) | | same: BnB first, then knapsack and SRD over the same effective values, the lower waste taken; largest-first remains the last resort (`wallet_coinsel.c`, CC-10) | **DONE** |
 | Keypool | pre-generated | derives on demand | **DECIDED** |
 | Reorg awareness in the wallet | rescans/updates on disconnect | none (WAL-13) | **DECIDED** |
 | Secrets hygiene (mlock, DONTDUMP) | | same (WAL-3) | **DONE** |
@@ -183,8 +183,7 @@ by size. Each carries the test that would prove it.
 |---|---|---|---|---|
 | 2 | **BIP152 compact block receive** (§3) | Every block fetched in full; a Core peer's pushed `cmpctblock` is dropped then refetched | medium-large | CC-2 |
 | 8 | **Full-verification replay** (`assumevalid=0`, §1) | The proof; launch first, it runs unattended | wall-clock | CC-8 |
-| 9 | **BIP331 package relay wire** (§3) | Conditional on Core's default | medium | CC-9 |
-| 10 | `invalidateblock`/`reconsiderblock`, MuSig2 leaf signing, BIP389 derivation, knapsack/SRD | Completeness | small–medium each | CC-10 |
+| 10 | `invalidateblock`/`reconsiderblock`; taproot script-path PSBT signing | Completeness | medium; deferred | CC-10 |
 
 Every row is scoped in `docs/audits/CORE_COMPAT_SCOPES_2026-09-06.md`.
 

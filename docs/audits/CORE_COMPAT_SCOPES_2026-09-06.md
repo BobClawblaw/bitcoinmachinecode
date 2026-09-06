@@ -430,6 +430,8 @@ the point. **Size.** Wall-clock only; one config file and one launch.
 
 ## CC-9 — BIP331 package relay wire protocol
 
+**Status: DECIDED, 2026-09-06 — parity by absence.** Core v30/v31 do not ship the BIP331 messages; they relay 1p1c packages opportunistically through orphan resolution, which this node already does with the same validation as `submitpackage`. Nothing to build; the row is DONE in the register.
+
 **Core.** `sendpackages` negotiation, `ancpkginfo` to describe a package,
 `pkgtxns`/`getpkgtxns` to fetch it, used to relay 1p1c packages whose
 parent alone is below the peer's feefilter. (`net_processing.cpp`
@@ -450,6 +452,8 @@ serve `ancpkginfo`/`pkgtxns` for our own low-fee parents.
 ---
 
 ## CC-10 — Completeness items
+
+**Status (2026-09-06):** coin selection CLOSED (`wallet_coinsel.c`: SRD, knapsack, waste; `test_coinsel` gated, negative control = BnB alone finds nothing for a target with no changeless match); BIP389 was already implemented (register corrected); MuSig2-in-leaf turned out to be the edge of a wider gap — taproot script-path PSBT signing/finalization is absent for every key type — and is **deferred**: it needs Core-generated PSBT fixtures (a taptree with a leaf, a control block, `PSBT_IN_TAP_LEAF_SCRIPT`) to be built without guessing. `invalidateblock`/`reconsiderblock`: see the next commit in this batch.
 
 | item | here | design | size |
 |---|---|---|---|
