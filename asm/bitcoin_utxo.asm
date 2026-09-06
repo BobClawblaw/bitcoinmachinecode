@@ -112,26 +112,61 @@ utxo_hash:
     ret
 
 ; utxo_prefetch(u=rdi, txid=rsi, index=rdx) -> void
-; Warm the home slot's cache line(s) for a LATER utxo_get/utxo_del of the
-; same key. Added 2026-08-23: apply_block_inner's STAGE A walk sees every
-; prevout a full phase before STAGE B looks it up, so by issuing the home
-; slot's address here the dependent-miss latency of the real probe is paid
-; while the CPU is busy building the in-block index instead of stalling in
-; the probe loop. Purely a hint: no architectural effect, no result change.
-; Two lines: a 48-byte slot can straddle a 64-byte line, and the next line
-; also covers the first linear-probe step.
-; Clobbers only caller-saved regs (r10 kept across the utxo_hash call --
+; Warm the cache lines a LATER utxo_get/utxo_del of the same key will walk.
+; Added 2026-08-23: apply_block_inner's STAGE A walk sees every prevout a
+; full phase before STAGE B looks it up, so by issuing the addresses here
+; the dependent-miss latency of the real probe is paid while the CPU is
+; busy building the in-block index instead of stalling in the probe loop.
+; Purely a hint: no architectural effect, no result change.
+;
+; 2026-09-06: UTXO_PREFETCH_LINES lines from the home slot, not two.
+; tests/bench_utxo_probe at 2^26 slots: the two-line hint left a 75%-load
+; miss at ~105-120 ns (mean walk 8.5 slots = 6.8 lines, ~15 ns per line
+; beyond the two warmed) and a 50%-load miss at 40-60 ns; six lines take
+; them to ~75-95 and ~28-43 ns (prefetch distance 16 and 4096 keys), hits
+; unchanged. A prefetch INSIDE the probe loop was measured too and
+; rejected: it cannot get ahead of its own dependent chain and cost 2-7 ns
+; on the common one-probe case. Beyond six lines the gain is in the noise.
+; Cost: 384 bytes of L1/L2 fill per prevout; a 5,000-input block is 1.9 MB,
+; which is why the hint is only worth issuing a phase ahead, not per get.
+;
+; Clobbers only caller-saved regs (r10/r11 kept across the utxo_hash call --
 ; utxo_hash touches rax/rcx/r8/r9 only).
+UTXO_PREFETCH_LINES equ 6
 global utxo_prefetch
 utxo_prefetch:
+    mov  ecx, UTXO_PREFETCH_LINES
+    jmp  utxo_prefetch_n
+
+; utxo_prefetch_n(u=rdi, txid=rsi, index=rdx, lines=rcx) -> void
+; The same hint over `lines` consecutive 64-byte lines starting at the home
+; slot's first byte; 0 issues nothing, more than 64 is clamped (a prefetch
+; past the mapping's end cannot fault, but a runaway loop could). The seam:
+; utxo_prefetch_n(u, txid, index, 2) is exactly the 2026-08-23 behaviour,
+; which tests/test_utxo_probe_diff runs as its control arm and
+; tests/bench_utxo_probe sweeps with --pf-lines.
+global utxo_prefetch_n
+utxo_prefetch_n:
     sub  rsp, 8            ; entry rsp is 8 mod 16; realign so the call site is 0 mod 16
     mov  r10, rdi          ; u
+    mov  r11, rcx          ; lines (utxo_hash clobbers rcx)
     mov  rdi, rsi          ; txid
     mov  rsi, rdx          ; index
     mov  rdx, [r10+8]      ; mask
     call utxo_hash         ; rax = byte offset of home slot (from u)
-    prefetcht0 [r10+rax]
-    prefetcht0 [r10+rax+64]
+    lea  rax, [r10+rax]
+    cmp  r11, 64
+    jbe  .pn_go
+    mov  r11, 64
+.pn_go:
+    test r11, r11
+    jz   .pn_done
+.pn_loop:
+    prefetcht0 [rax]
+    add  rax, 64
+    dec  r11
+    jnz  .pn_loop
+.pn_done:
     add  rsp, 8
     ret
 

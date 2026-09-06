@@ -23,6 +23,11 @@
  *       indep      a plain loop over independent keys: whatever
  *                  memory-level parallelism the core finds on its own.
  *       indep+pf   the loop with the same DIST-ahead prefetch.
+ *       indep+pf+rec  the prefetch 2*DIST ahead, then DIST ahead a C walk
+ *                  of the (now cached) slot that prefetches the BLOB RECORD
+ *                  it points at: the two-phase shape a hit would need,
+ *                  since blob_off is only known once the slot has arrived.
+ *                  Modelled in C here to size the win; no assembly for it.
  *   - the probe-length histogram of the same query set, computed by a C
  *     mirror of the assembly's hash and walk (utxo_hash: FNV-1a over the
  *     first 8 txid bytes, XOR index, AND mask; linear probe, stride 48,
@@ -46,7 +51,9 @@
  *
  * Usage: bench_utxo_probe [--sizes 16,22,26] [--loads 50,75] [--queries LOG2]
  *                         [--cpu N] [--dist N] [--reps N] [--thp]
- *                         [--uniform-index] [--script-len N]
+ *                         [--uniform-index] [--script-len N] [--pf-lines N]
+ *   --pf-lines N uses utxo_prefetch_n(...,N) in place of utxo_prefetch
+ *   (2 = the 2026-08-23 two-line hint; utxo_prefetch itself is 6).
  * Not part of `make test`: it needs ~6 GB and a quiet core. */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -70,6 +77,7 @@ extern long utxo_get(void* u, const u8 txid[32], unsigned long index, u64* value
                      const u8** script, unsigned long* slen);
 extern long utxo_del(void* u, const u8 txid[32], unsigned long index);
 extern void utxo_prefetch(void* u, const u8 txid[32], unsigned long index);
+extern void utxo_prefetch_n(void* u, const u8 txid[32], unsigned long index, unsigned long lines);
 extern long utxo_count(void* u);
 
 /* ---- keys: deterministic from (set, i), no key array for the inserts ---- */
@@ -80,6 +88,7 @@ static u64 splitmix64(u64* s){
     return z ^ (z >> 31);
 }
 static int g_uniform_index = 0;
+static long g_pf_lines = -1;   /* -1: utxo_prefetch; else utxo_prefetch_n(.., N) */
 static void key_of(u64 set, u64 i, u8 txid[32], u32* index){
     u64 s = (set * 0xD1B54A32D192ED03ULL) ^ (i * 0x9E3779B97F4A7C15ULL);
     u64 w;
@@ -117,18 +126,34 @@ static long mirror_get(const u8* base, u64 mask, const u8* txid, u32 index, stru
     return 0;
 }
 
-static double now_ns(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e9 + ts.tv_nsec; }
-
 struct q { u8 txid[32]; u32 index; u32 pad; };
 
-/* mode: 0 dep, 1 dep+pf, 2 indep, 3 indep+pf */
+static inline void pf(void* u, const struct q* p){
+    if (g_pf_lines < 0) utxo_prefetch(u, p->txid, p->index); else utxo_prefetch_n(u, p->txid, p->index, (unsigned long)g_pf_lines);
+}
+/* phase two of the two-phase hint: the slot is cached now, so find it and
+ * touch the record it points at (C mirror of the probe; blob base at u+16) */
+static inline void pf_record(const u8* u, u64 mask, const struct q* p){
+    u64 end = 40 + (mask + 1) * 48, home = home_off(p->txid, p->index, mask), off = home;
+    const u8* blob; memcpy(&blob, u + 16, 8);
+    for (;;){
+        const u8* s = u + off; u32 idx; memcpy(&idx, s + 40, 4);
+        if (idx == 0xFFFFFFFFu) return;
+        if (idx == p->index && !memcmp(s + 8, p->txid, 32)){ u64 bo; memcpy(&bo, s, 8); __builtin_prefetch(blob + bo); return; }
+        off += 48; if (off >= end) off = 40;
+        if (off == home) return;
+    }
+}
+static double now_ns(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1e9 + ts.tv_nsec; }
+
+/* mode: 0 dep, 1 dep+pf, 2 indep, 3 indep+pf, 4 indep+pf+rec */
 static double time_gets(void* u, const struct q* qs, u64 Q, int mode, int dist, u64* found_out){
     u64 v = 0; unsigned long h, cb, sl; const u8* sp; u64 found = 0, qm = Q - 1;
     double t0 = now_ns();
     if (mode < 2){
         u64 j = 0;
         for (u64 i = 0; i < Q; i++){
-            if (mode == 1){ const struct q* p = &qs[(i + dist) & qm]; utxo_prefetch(u, p->txid, p->index); }
+            if (mode == 1) pf(u, &qs[(i + dist) & qm]);
             long r = utxo_get(u, qs[j].txid, qs[j].index, &v, &h, &cb, &sp, &sl);
             found += r;
             __asm__ volatile("" : "+r"(r));
@@ -136,7 +161,8 @@ static double time_gets(void* u, const struct q* qs, u64 Q, int mode, int dist, 
         }
     } else {
         for (u64 i = 0; i < Q; i++){
-            if (mode == 3){ const struct q* p = &qs[(i + dist) & qm]; utxo_prefetch(u, p->txid, p->index); }
+            if (mode >= 3) pf(u, &qs[(i + (mode == 4 ? 2 * dist : dist)) & qm]);
+            if (mode == 4) pf_record((const u8*)u, ((const u64*)u)[1], &qs[(i + dist) & qm]);
             found += utxo_get(u, qs[i].txid, qs[i].index, &v, &h, &cb, &sp, &sl);
         }
     }
@@ -214,15 +240,15 @@ static int run_one(int log2slots, int load_pct, int log2q, int dist, int reps, i
     if (mism){ printf("FAIL mirror walk disagrees with utxo_get on %lu queries\n", mism); (*fails)++; }
 
     printf("  put: %.1f ns/put (sequential inserts, includes first-touch page faults)\n", put_ns);
-    static const char* mname[4] = {"dep", "dep+pf", "indep", "indep+pf"};
-    printf("  %-8s %10s %10s\n", "ns/get", "hit", "miss");
-    for (int mode = 0; mode < 4; mode++){
+    static const char* mname[5] = {"dep", "dep+pf", "indep", "indep+pf", "indep+pf+rec"};
+    printf("  %-12s %10s %10s\n", "ns/get", "hit", "miss");
+    for (int mode = 0; mode < 5; mode++){
         double bh = 1e18, bm = 1e18; u64 f;
         for (int r = 0; r < reps; r++){
             double t = time_gets(u, hits, Q, mode, dist, &f); if (f != Q){ printf("FAIL hits found %lu/%lu\n", f, Q); (*fails)++; } if (t < bh) bh = t;
             t = time_gets(u, miss, Q, mode, dist, &f); if (f != 0){ printf("FAIL misses found %lu\n", f); (*fails)++; } if (t < bm) bm = t;
         }
-        printf("  %-8s %10.1f %10.1f\n", mname[mode], bh, bm);
+        printf("  %-12s %10.1f %10.1f\n", mname[mode], bh, bm);
     }
     hist_print("hit", &Hh); hist_print("miss", &Hm);
     free(hits); free(miss); munmap(u, tsz); munmap(blob, bsz);
@@ -244,6 +270,7 @@ int main(int argc, char** argv){
         else if (!strcmp(argv[i], "--dist") && i + 1 < argc) dist = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--script-len") && i + 1 < argc) slen = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--pf-lines") && i + 1 < argc) g_pf_lines = atol(argv[++i]);
         else if (!strcmp(argv[i], "--thp")) thp = 1;
         else if (!strcmp(argv[i], "--uniform-index")) g_uniform_index = 1;
         else { fprintf(stderr, "unknown arg %s\n", argv[i]); return 2; }
@@ -252,8 +279,8 @@ int main(int argc, char** argv){
     if (cpu < 0) cpu = (int)sysconf(_SC_NPROCESSORS_ONLN) - 2;
     { cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(cpu, &cs);
       if (sched_setaffinity(0, sizeof cs, &cs) != 0){ perror("sched_setaffinity"); return 2; } }
-    printf("bench_utxo_probe: cpu %d, 2^%d queries per set, prefetch distance %d, %d reps (min reported), index %s, script %d B\n",
-           cpu, log2q, dist, reps, g_uniform_index ? "uniform" : "geometric", slen);
+    printf("bench_utxo_probe: cpu %d, 2^%d queries per set, prefetch distance %d, %d reps (min reported), index %s, script %d B, prefetch %s\n",
+           cpu, log2q, dist, reps, g_uniform_index ? "uniform" : "geometric", slen, g_pf_lines < 0 ? "utxo_prefetch" : "utxo_prefetch_n");
     int fails = 0;
     for (int a = 0; a < nsizes; a++) for (int b = 0; b < nloads; b++) run_one(sizes[a], loads[b], log2q, dist, reps, thp, slen, &fails);
     printf(fails ? "FAIL (%d)\n" : "OK\n", fails);
