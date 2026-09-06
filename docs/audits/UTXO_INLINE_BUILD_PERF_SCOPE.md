@@ -5,6 +5,18 @@ the *semantics* of connecting as we go (the tip is the connected tip; a
 block that fails to connect is rejected, not fatal). This document is about
 the **time**: the fresh-install benchmark (`BobClawblaw/bmc-benchmark-2026-09`,
 2026-09-04→06, dedicated SSD, same `dbcache=8192` on both sides) measured
+**The 21.0 h Core figure is a FLOOR, not a fair result (corrected
+2026-09-06).** The harness wrote `par=8` and `maxconnections=64` into Core's
+config with no reason recorded anywhere, against Core's defaults of `par=0`
+(auto: cores, clamped to 15, plus the calling thread) and
+`maxconnections=125`. Core therefore ran with eight script-verification
+threads on a 32-core box and half its connection budget, and the handicap was
+applied to ONE side only. Both lines are removed from the harness. Pulling the
+other way, this node evaluates every script (a fresh archive has no
+assumevalid block) while Core's default skips signature checking below its
+built-in block. Neither bias is quantified. Any claim of parity with Core
+must state both.
+
 Core v31.1 at **21.0 h** end to end and this node at **24.1 h**, and the
 split says exactly where the 3.1 h is.
 
@@ -318,15 +330,41 @@ block had been applied once already, under an earlier height.
   AND absent — 600 blocks over 3 loopback peers is not enough concurrency to
   provoke it.
 
-**What is left.** The fault appears only at speed, with sixteen helpers
-writing while the connect walks heights upward, which is why the serial build
-ran 494,074 blocks without it. The next step is not another guess: it is to
-run the pipelined build with the archive guard (`utxo_live.c`, 2026-09-06 —
-the connect refuses a body that is not the block the index records) and see
-whether the guard fires where the BIP30 used to. If it does, the read is
-returning another block's bytes and the mechanism is a racing reader; if it
-does not, the double-apply is on the connect side and `g_applied_height` is
-moving backwards under some path.
+**ROOT CAUSE, found 2026-09-06 16:00Z: the reader is stale, not the archive.**
+The experiment above was run — the pipelined build plus the archive guard —
+and it answered cleanly: **the guard fired (14 times, at height 2,845) and the
+false `bad-txns-BIP30` never appeared.** So the connect had been reading bytes
+that are not the block the index records, and applying them under that height
+is what mis-filed the coins.
+
+The archive itself is correct. Parsing `index.dat` and `blk00000.dat` by hand
+at heights 2,843 to 2,847 (record = `[hash32][file_no u32][pos u64][size u32]`,
+body 8 bytes into the frame), every record's hash matches the body it points
+at and matches the Core oracle. Nothing on disk was wrong at any point.
+
+What is stale is the reader's own caches. `bitcoin_store_fast.asm` keeps, per
+blk file, a cached read fd and an mmap window (`store_rd_init`, `store_map_at`,
+four slots). `store_reload` — which `catchup_run` calls at the top of every
+pass — refreshes the index and the tip but drops NEITHER cache. So a pass that
+hits a stale window retries, reads the same stale bytes, and retries again: the
+connect sat at height 2,845 for 14 consecutive passes and never advanced. The
+serial downloader hit this rarely enough to run 494,074 blocks without tripping
+it; the pipelined one writes about 12x faster and trips it in minutes.
+
+**The fix has two halves.** The first is landed (PR #49): the connect refuses a
+body that is not the block the index records, so stale bytes can no longer be
+applied — the false rejection and the mis-filed coins are both impossible now.
+The second is not landed: on a mismatch the connect should DROP the stale
+caches (`store_rd_close`, `store_map_close`, both of which exist and are
+already called together by `store_prune_safe` for exactly this reason) and
+re-read the same height rather than stall. That is written and sitting on
+`batch/2026-09-06-ibd-pipeline-v2`; it survived a ten-minute pipelined sync
+with zero stalls and zero rejections, but that run reached only 2,843 blocks
+before it was stopped, so it is NOT proven and NOT merged.
+
+**The wider question this raises, which no test covers:** every other reader
+holding a store handle across writes by another process — the RPC block fetch,
+the filter builder, the tx index, the archive verifier — shares those caches.
 
 **Reproducer.** A real fresh mainnet sync, `bmc.bootcatchup=0`, pipelined
 build, on an otherwise idle box: five to six minutes to the failure. It does

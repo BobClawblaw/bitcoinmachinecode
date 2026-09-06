@@ -48,6 +48,7 @@
 #include "hdr_lowwork.h"
 #include "archive_seed.h"
 #include "ibd_pipeline.h"      /* the whole chunk in one getdata, not one block per round trip */       /* slot 0 is genesis on EVERY chain: a shifted archive reads every height one block high */       /* CC-5: hold low-work header pages until the chain proves its work */
+#include "banlist.h"          /* the ban list survives a restart, as Core's does */       /* slot 0 is genesis on EVERY chain: a shifted archive reads every height one block high */       /* CC-5: hold low-work header pages until the chain proves its work */
 #include "invalid_set.h"       /* CC-10: invalidateblock / reconsiderblock */
 #include "cmpct_recv.h"        /* CC-2: BIP152 compact block receive */
 /* VAL-5 / MEM-1: the generated per-height script-flag mask
@@ -79,7 +80,12 @@ static void mempool_refresh_seqlocks(void* store_buf, long now_tip);
  * chains: logs/bitcoind.log on mainnet, logs/bitcoind.<chain>.log otherwise
  * (all under the per-chain datadir's own logs/). Set at boot right after
  * chainparams_select; the static default covers every tool-mode caller. */
-static char g_logpath[256] = "logs/bitcoind.log";   /* debuglogfile= overrides (0 = /dev/null) */
+/* Core's -debuglogfile default, exactly: "debug.log" (logging.cpp:23,
+ * DEFAULT_DEBUGLOGFILE), relative to the NET-SPECIFIC datadir. Every chain
+ * here already has its own directory and the daemon chdir()s into it, so a
+ * bare "debug.log" lands at <chain-datadir>/debug.log -- the same file, in
+ * the same place, as Core. (This was logs/bitcoind.log until 2026-09-06.) */
+static char g_logpath[256] = "debug.log";   /* debuglogfile= overrides (0 = /dev/null) */
 #include "../rpc_server.h"   /* embedded JSON-RPC server (docs/RPC_LIVE_NODE.md) */
 #include "../rpc_chain.h"
 #include "../rpc_wallet_ops.h"
@@ -1493,6 +1499,43 @@ static long dl_reject_block(void* st, long h, const unsigned char hash[32], cons
     return 1;
 }
 
+/* ---- the ban list survives a restart (2026-09-06) -------------------------
+ * Core writes <datadir>/banlist.json whenever the list changes and at
+ * shutdown, and loads it at startup (banman.cpp). This node banned only in
+ * memory, so every restart forgave every ban -- a peer banned for a consensus
+ * violation returned the moment the node did. The register carried it as
+ * PARTIAL: "scored ... not persisted across restart".
+ *
+ * Called after every mutation of g_node_status->bans[]; cheap (64 entries)
+ * and rare (a ban, an unban, a clear). */
+static void banlist_persist(void)
+{
+    if (!g_node_status) return;
+    static ban_entry_t snap[RPC_MAX_BANS];
+    int n = 0;
+    for (int i = 0; i < RPC_MAX_BANS; i++){
+        if (!g_node_status->bans[i].until) continue;
+        snprintf(snap[n].subnet, sizeof snap[n].subnet, "%s", (const char*)g_node_status->bans[i].subnet);
+        snap[n].until   = g_node_status->bans[i].until;
+        snap[n].created = g_node_status->bans[i].created;
+        n++;
+    }
+    if (banlist_save(snap, n) != 0)
+        fprintf(stderr, "[ban] WARNING: could not write banlist.json -- bans will not survive a restart\n");
+}
+/* the loader's sink: same table, same rules, no RPC round trip */
+int ctl_ban_add(const char* subnet, long long until);   /* defined just below */
+static int banlist_restore_one(const char* subnet, long long until, long long created)
+{
+    if (!ctl_ban_add(subnet, until)) return 0;
+    for (int i = 0; i < RPC_MAX_BANS; i++)
+        if (g_node_status->bans[i].until == until &&
+            !strcmp((const char*)g_node_status->bans[i].subnet, subnet)){
+            if (created > 0) g_node_status->bans[i].created = created;   /* keep Core's ban_created */
+            break;
+        }
+    return 1;
+}
 /* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
 int ctl_ban_add(const char* subnet, long long until){
     if(!g_node_status || !subnet || !*subnet) return 0;
@@ -1526,7 +1569,7 @@ int ctl_ban_add(const char* subnet, long long until){
     g_node_status->bans[slot].created = (long long)time(NULL);
     __sync_synchronize();
     g_node_status->bans[slot].until = until;     /* published last */
-    return 1;
+    banlist_persist(); return 1;
 }
 
 /* Score a peer for a protocol violation. Returns 1 if this call banned it,
@@ -5944,6 +5987,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                             g_node_status->bans[i].until = 0;
                             result = 1; break;
                         }
+                    if(result == 1) banlist_persist();
                 } else {
                     /* ---- RPC-8 (audit 2026-09-03) ----
                      * This used to refuse any prefix that was not a multiple
@@ -6002,6 +6046,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             } else if(op == RPC_CTL_CLEARBANNED){
                 for(int i = 0; i < RPC_MAX_BANS; i++) g_node_status->bans[i].until = 0;
                 fprintf(stderr,"[ctl] ban list cleared\n");
+                banlist_persist();
                 result = 1;
             } else {
                 result = -1;
@@ -7181,6 +7226,10 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern void rpc_chain_set_maxtipage(long);
       rpc_chain_set_gbt_policy(g_cfg.blockmaxweight, g_cfg.blockreservedweight, g_cfg.blockmintxfee_satkvb,
                                g_cfg.blockversion, g_cfg.printpriority);
+      { extern void rpc_chain_set_mine_on_demand(int);
+        /* Core: MineBlocksOnDemand() == consensus.fPowNoRetargeting -- so
+         * -blockversion is honoured on regtest and nowhere else. */
+        rpc_chain_set_mine_on_demand(g_chainp->pow_no_retargeting); }
       rpc_chain_set_maxtipage(g_cfg.maxtipage); }
     { extern void (*txr_on_accept)(const unsigned char*, const unsigned char*, unsigned long);
       txr_on_accept = g_cfg.walletnotify[0] ? txr_walletnotify_hook : 0; }
@@ -8256,14 +8305,13 @@ int main(int argc, char** argv){
       fprintf(stderr, "[boot] tx-validation snapshot %s (%.2fs) -- inbound peers inherit it\n",
               ok ? "ready" : "UNAVAILABLE (inbound tx will be dropped, not accepted)",
               phase_elapsed(&txdv_pt)); }
-    /* Each chain keeps its own logs under <chain-datadir>/logs/ -- the asm
-     * logger (node_log_open) writes there via the cwd, so a regtest run can
-     * never interleave with the mainnet log. */
+    /* Each chain logs into its OWN directory -- the asm logger
+     * (node_log_open) writes via the cwd, which is the chain datadir, so a
+     * regtest run can never interleave with the mainnet log. The file is
+     * debug.log, as Core's is, and Core separates chains the same way: by
+     * directory, not by filename. logs/ is still created because the
+     * benchmark and soak harnesses put their own files there. */
     mkdir("logs", 0755);
-    if(g_chainp->id != CHAIN_MAIN)
-        ;   /* logs/bitcoind.log inside the CHAIN's directory -- per-chain by
-             * location now that every chain (main included) has its own
-             * subdirectory; the old bitcoind.<chain>.log suffix is redundant */
     /* `dir` is the EFFECTIVE (per-chain) datadir from here on: the forked
      * download worker re-chdir()s into it and utxo_live opens its files
      * there -- on the first regtest boot the worker's chdir(absp) put the
@@ -8310,6 +8358,7 @@ int main(int argc, char** argv){
      * reads its tip from index.dat's length */
     { long tr = archive_trim_derived_tails();
       if(tr < 0) fprintf(stderr,"[boot] WARNING: could not trim the derived files past the tip: %s\n", strerror(errno)); }
+    { extern void par_set(int); par_set(g_cfg.par); }   /* -par: script-verification threads (Core semantics) */
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
     /* A fresh non-main datadir self-seeds its own genesis at index 0 (the
      * mainnet archive got genesis by a one-time injection, 5f36dee -- a
@@ -8323,6 +8372,10 @@ int main(int argc, char** argv){
      * mainnet datadir then built an archive shifted by one -- the serial leg
      * appends the first block a peer sends, and no peer relays genesis. See
      * archive_seed.h. */
+    /* the ban list, before anything dials or accepts: a restart must not
+     * forgive a ban (Core loads banlist.json at startup and sweeps expiries). */
+    { int nb = banlist_load((long long)time(NULL), banlist_restore_one);
+      if (nb < 0) fprintf(stderr, "[ban] banlist.json could not be read -- starting with no bans\n"); }
     { int sd = archive_seed_genesis_if_empty(store_buf, g_chainp->genesis, (unsigned long)g_chainp->genesis_len);
       if(sd < 0){ fprintf(stderr,"[boot] failed to seed the %s genesis block\n", g_chainp->name); return 1; }
       if(sd == 1) fprintf(stderr,"[boot] %s genesis seeded at height 0 (empty archive)\n", g_chainp->name); }
@@ -8531,19 +8584,16 @@ int main(int argc, char** argv){
          * clamps this down to however many confirmed-live peers it finds
          * (and up to 64 max), so an over-large request here just becomes a
          * ceiling, not a guarantee. */
-        /* Core -par semantics: 0 == auto (use the machine), negative == leave
-         * that many cores free. CLI arg still wins when given. `par` is the
-         * closest Core equivalent to this node's chunk-claiming worker count;
-         * dl_catchup already clamps the result down to however many
-         * confirmed-live peers it finds, so this is a ceiling, not a promise. */
+        /* The DOWNLOAD chunk-worker count is bmc.catchupworkers, NOT -par.
+         * Core's -par is the script-verification thread count and now means
+         * exactly that here too (tx_verify.c txv_script_threads); it used to
+         * be wired to this number instead, so par=8 halved the download and
+         * left verification using every core -- the opposite of the ask.
+         * dl_catchup clamps this down to however many confirmed-live peers it
+         * finds, so it is a ceiling, not a promise. */
         int catchup_workers;
         if(argc>=6) catchup_workers = atoi(argv[5]);
-        else {
-            long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<1) ncpu=4;
-            if(g_cfg.par > 0)      catchup_workers = g_cfg.par;
-            else if(g_cfg.par < 0) catchup_workers = (int)(ncpu + g_cfg.par);  /* leave |par| free */
-            else                   catchup_workers = 16;                       /* auto: prior default */
-        }
+        else        catchup_workers = g_cfg.catchup_workers;   /* bmc.catchupworkers, default 16 */
         if(catchup_workers<1) catchup_workers=1;
         if(catchup_workers>64) catchup_workers=64;
         fprintf(stderr,"[boot] config: datadir=%s port=%d (%s) listen=%d nwant=%d catchup_workers=%d (%s)\n",

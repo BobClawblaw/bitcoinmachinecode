@@ -649,6 +649,43 @@ static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long fla
  * profile could tune it, but correctness does not depend on the exact
  * value -- only throughput does. */
 #define TXV_PARALLEL_MIN 8
+
+/* ---- Core's -par, exactly (2026-09-06) -------------------------------------
+ * Core (node/chainstatemanager_args.cpp):
+ *     script_threads = -par;                      // default 0
+ *     if (script_threads <= 0) script_threads += GetNumCores();
+ *     worker_threads_num = script_threads - 1;    // the main thread counts too
+ * So -par is the TOTAL number of threads doing script checks, the calling
+ * thread included: 0 = every core, -n = leave n cores free, 1 = the caller
+ * alone.
+ *
+ * This node parsed `par`, printed it at boot, and then used it for the
+ * DOWNLOAD chunk-worker count, while both pools below sized themselves from
+ * sysconf() and never read it: par=8 gave a node that still verified on every
+ * core AND halved its download parallelism. The download count is
+ * bmc.catchupworkers now.
+ *
+ * It lives HERE rather than in a module of its own because every link that
+ * needs it already carries this file; a separate file had to be added to
+ * seventeen source lists and arrived twice in several links. */
+#define MAX_SCRIPTCHECK_THREADS 15   /* Core validation.h */
+static int g_par = 0;
+void par_set(int par){ g_par = par; }
+int  par_get(void){ return g_par; }
+int  par_script_threads(void){
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu < 1) ncpu = 1;
+    long t = g_par;
+    if (t <= 0) t += ncpu;      /* 0 -> every core, -n -> leave n cores free */
+    if (t < 1) t = 1;           /* a node always has one script-checking thread */
+    /* Core clamps the pool to MAX_SCRIPTCHECK_THREADS (validation.cpp:
+     * std::clamp(worker_threads_num, 0, MAX_SCRIPTCHECK_THREADS)), i.e. 15
+     * workers plus the calling thread. Its -par help says "0 = auto, up to
+     * 15". Matching it costs parallelism on a box with more than 16 cores and
+     * is deliberate: the flag behaves exactly as Core's does. */
+    if (t > MAX_SCRIPTCHECK_THREADS + 1) t = MAX_SCRIPTCHECK_THREADS + 1;
+    return (int)t;
+}
+
 #define TXV_MAX_WORKERS  16
 
 /* Was: set by utxo_live.c (via txv_set_bulk_mode) to skip parallel dispatch
@@ -734,8 +771,10 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
         return 1;
     }
 
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu < 1) ncpu = 1;
-    int nworkers = (int)(nverify < (u64)ncpu ? nverify : (u64)ncpu);
+    /* -par: the caller is one of the script-checking threads (Core counts it), so
+     * the pool is one smaller than the budget. */
+    long budget = par_script_threads();
+    int nworkers = (int)(nverify < (u64)budget ? nverify : (u64)budget);
     if (nworkers > TXV_MAX_WORKERS) nworkers = TXV_MAX_WORKERS;
     if (nworkers < 1) nworkers = 1;
 
@@ -1492,8 +1531,8 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
         return;
     }
 
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu < 1) ncpu = 1;
-    int nworkers = (int)(nverify < (u64)ncpu ? nverify : (u64)ncpu);
+    long budget = par_script_threads();          /* -par, caller included */
+    int nworkers = (int)(nverify < (u64)budget ? nverify : (u64)budget);
     if (nworkers > TXVB_MAX_WORKERS) nworkers = TXVB_MAX_WORKERS;
     if (nworkers < 1) nworkers = 1;
 

@@ -255,7 +255,7 @@ included:
     bmcwallet.enc | bmcwallet.dat, *.txlog           wallet store and journal
     mempool.dat                mempool persistence
     .cookie                    RPC cookie (while running)
-    logs/bitcoind.log          the daemon's own leveled log
+    debug.log                 the daemon's own leveled log (Core's name and place)
 ```
 
 **Running under systemd.** A minimal unit:
@@ -327,7 +327,7 @@ log echoes the resolved values.
 | `walletpassfile` | — | absolute path, outside the datadir, to the wallet passphrase; refused if world-readable, group-writable or inside the datadir |
 | `disablewallet` | `0` | `1` loads no wallet; wallet RPCs report that none is loaded |
 | `walletdir` | chain directory | directory holding the wallet files and the `wallets/<name>/` subdirectories of named wallets; absolute, or relative to the chain directory; created if absent |
-| `debuglogfile` | `logs/bitcoind.log` | the daemon's own leveled log, relative to the chain directory or absolute; `0` disables it |
+| `debuglogfile` | `debug.log` | the daemon's own leveled log, relative to the chain directory or absolute; `0` disables it |
 | `signer` | — | external signer command |
 | `zmqpubhashblock` / `zmqpubhashtx` / `zmqpubrawblock` / `zmqpubrawtx` (+`hwm`) | — | ZMQ endpoints; `tcp://*` is refused, name an interface |
 | `blocknotify` / `alertnotify` / `startupnotify` / `shutdownnotify` | — | shell hooks; `%s` is sanitised before substitution |
