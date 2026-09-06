@@ -1114,3 +1114,30 @@ that would have hit any fresh sync of the live build.
   earlier that hour. The restart went straight to the worker.
 - **Restart on the fix** (`4c3e8fc`, hold bounded by memory): see the
   entry that follows.
+
+## 2026-09-06 (05:25–05:33Z): the replay on the CC-5 fix, then `bmc.bootcatchup=0` — the interleave is live
+
+- **05:25Z, restart on `ab7087e`** (PR #28, the hold bounded by memory).
+  SIGTERM to the parent; it exited in 2 s but its download worker finished
+  its bounded step first and the binary was still busy, so the copy failed
+  and the relaunch ran the OLD file — which refused the datadir lock and
+  exited ("FATAL: cannot obtain a lock"). Nothing ran twice. The worker
+  stopped cleanly at 05:26:38 ("stopping catch-up cleanly after height
+  361806, checkpoint persisted"); the copy and launch were redone at
+  05:26:53. **Lesson:** wait for the WORKER, not the parent, before
+  swapping the binary.
+- **The fix, verified live at 05:27:10:** "chain from 127.0.0.1 crossed
+  -minimumchainwork -- storing 284 held page(s)" — 568,000 headers held in
+  the mapping and released in order; span [369648, 965598]; download at
+  8.9 MB/s on the one loopback worker.
+- **But "connect deferred (no UTXO engine in this process)":** with the
+  gap now visible at boot, the download ran in the parent's boot catch-up
+  again, the path that cannot interleave. Exactly the case
+  `UTXO_INLINE_BUILD_PERF_SCOPE.md` step 1 documents.
+- **05:28Z, restart with `bmc.bootcatchup=0`** in `data/bitcoin.conf`
+  (clean stop in 3 s: "shutdown requested during the catch-up -- exiting
+  before the worker starts"). Boot: "skipping the boot catch-up; the
+  worker's far-behind trigger will run". At 05:32:26 the worker ran the
+  parallel downloader from 371,511; its first progress line at 05:32:51:
+  `applied=371745 lag=1`. **The UTXO set is connecting one block behind
+  the download** — the first time this node has done what step 1 was for.

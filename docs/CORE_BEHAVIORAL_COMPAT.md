@@ -181,7 +181,7 @@ by size. Each carries the test that would prove it.
 
 | # | Item | Why it is first | Size | Scope |
 |---|---|---|---|---|
-| 8 | **Full-verification replay** (`assumevalid=0`, §1) | **RUNNING** since 2026-09-06 01:12Z from the Core oracle; `stopatheight=965598`. Restarted 04:55Z on `305c1b4` (interleave) from its 250,913-block archive; that binary's header phase was abandoned by CC-5's four-page bound and the node fell back to its serial leg; restarted again on the bound fix (`4c3e8fc`) | wall-clock | CC-8 |
+| 8 | **Full-verification replay** (`assumevalid=0`, §1) | **RUNNING** since 2026-09-06 01:12Z from the Core oracle; `stopatheight=965598`. Restarted 04:55Z on `305c1b4` (interleave) from its 250,913-block archive; that binary's header phase was abandoned by CC-5's four-page bound and the node fell back to its serial leg; restarted 05:26Z on the bound fix (`ab7087e`; 284 held pages released) and 05:28Z with `bmc.bootcatchup=0` — from 05:32Z the worker downloads and connects together (`applied=371745 lag=1`) | wall-clock | CC-8 |
 | 10 | taproot script-path PSBT signing and finalization (all key types) | **deferred**: needs Core-generated fixtures | medium | CC-10 |
 
 Every row is scoped in `docs/audits/CORE_COMPAT_SCOPES_2026-09-06.md`.
