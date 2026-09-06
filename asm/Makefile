@@ -1783,6 +1783,14 @@ UTXOSTATSOBJS := bitcoin_utxo_stats.o bitcoin_muhash.o sha256.o
 tests/test_muhash: tests/test_muhash.c tests/muhash_vectors.h $(UTXOSTATSOBJS)
 	$(CC) $(CFLAGS) -Itests -o $@ tests/test_muhash.c $(UTXOSTATSOBJS)
 
+# bench_muhash -- ns per num3072_mul and per muhash_insert on ONE pinned core,
+# the ruler for the modmul work the perf scope calls the largest single lever
+# of a full sync (UTXO_INLINE_BUILD_PERF_SCOPE.md, "the MuHash fold is on the
+# bulk connect path"). Print-only, run by hand, not in `make test`:
+#     make tests/bench_muhash && tests/bench_muhash [N] [cpu]
+tests/bench_muhash: tests/bench_muhash.c $(UTXOSTATSOBJS)
+	$(CC) $(CFLAGS) -o $@ tests/bench_muhash.c $(UTXOSTATSOBJS)
+
 tests/test_utxo_setinfo: tests/test_utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Itests -o $@ tests/test_utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS)
 
