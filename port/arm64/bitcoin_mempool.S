@@ -2,18 +2,26 @@
  * txid -> serialized-tx in-memory mempool store (open addressing + backward-
  * shift deletion, no tombstones), same shape as the UTXO.
  * Exports: mpool_struct_size, mpool_init, mpool_put(1/0/2), mpool_get(ptr/0),
- *          mpool_del(1/0), mpool_count.
- * Layout: +0 n, +8 mask, +16 blob, +24 blob_cap, +32 fill, +40 slots 48B each
- *          [+0 len][+8 txid[32]][+40 blob_off]; empty marker len = -1.
- * mpool_hash is FNV-1 (mul then xor) folded to mask -> (idx*48+40).
+ *          mpool_del(1/0), mpool_count, mpool_wtxid_at_slot.
+ * Layout: +0 n, +8 mask, +16 blob, +24 blob_cap, +32 fill, +40 slots 80B each
+ *          [+0 len][+8 txid[32]][+40 blob_off][+48 wtxid[32]]
+ *          empty marker len = -1.
+ * The wtxid (sha256d over the stored tx bytes; == txid for a non-witness tx)
+ * is computed ONCE in mpool_put and cached in the slot -- cmpct_recv.c's
+ * ht_build reads it via mpool_wtxid_at_slot instead of re-hashing the pool
+ * per block. The C side reads the layout through mempool_slot.h; keep the
+ * two in step. mpool_hash is FNV-1 (mul then xor) folded to mask ->
+ * (idx*80+40).
  */
     .text
 
-/* ---------- mpool_struct_size(slots=x0) = 40 + slots*48 + 8 ---------- */
+    .extern sha256d
+
+/* ---------- mpool_struct_size(slots=x0) = 40 + slots*80 + 8 ---------- */
     .global mpool_struct_size
     .type mpool_struct_size,%function
 mpool_struct_size:
-    mov  x1,#48
+    mov  x1,#80
     mul  x0,x0,x1
     add  x0,x0,#48
     ret
@@ -35,7 +43,7 @@ mpool_init:
 .mi_e:
     cbz  x11,.mi_d
     str  x12,[x10]
-    add  x10,x10,#48
+    add  x10,x10,#80
     sub  x11,x11,#1
     b    .mi_e
 .mi_d:
@@ -59,7 +67,7 @@ mpool_hash:
     b    .mh_l
 .mh_d:
     and  w8,w8,w1                /* fold to mask (w write zero-extends x8) */
-    mov  x9,#48
+    mov  x9,#80
     mul  x8,x8,x9
     add  x0,x8,#40
     ret
@@ -130,10 +138,10 @@ mpool_put:
     mov  x2,#32
     bl   memcmp32
     cbz  x0,.mp_dup
-    add  x23,x23,#48
+    add  x23,x23,#80
     ldr  x9,[x19,#8]
     add  x9,x9,#1
-    mov  x10,#48
+    mov  x10,#80
     mul  x9,x9,x10
     add  x9,x9,#40
     cmp  x23,x9
@@ -157,10 +165,20 @@ mpool_put:
     add  x8,x19,x23
     str  x22,[x8]             /* slot.len = txlen */
     str  x9,[x8,#40]          /* slot.blob_off = fill */
+    /* slot.wtxid = sha256d(tx bytes as stored): computed once here, read by
+     * mpool_wtxid_at_slot. Written BEFORE the txid so that, as for len and
+     * blob_off (MEM-21), a txid match under ARM's observed ordering implies
+     * the cached wtxid is published too. sha256d clobbers scratch: re-derive
+     * the slot pointer. */
+    add  x0,x8,#48
+    mov  x1,x21
+    mov  x2,x22
+    bl   sha256d
+    add  x8,x19,x23
     add  x0,x8,#8
     mov  x1,x20
     mov  x2,#32
-    bl   mcopy                /* slot.txid */
+    bl   mcopy                /* slot.txid -- LAST, see MEM-21 */
     ldr  x9,[x19,#32]
     add  x9,x9,x22
     str  x9,[x19,#32]         /* fill += txlen */
@@ -216,10 +234,10 @@ mpool_get:
     mov  x2,#32
     bl   memcmp32
     cbz  x0,.mg_hit
-    add  x22,x22,#48
+    add  x22,x22,#80
     ldr  x9,[x19,#8]
     add  x9,x9,#1
-    mov  x10,#48
+    mov  x10,#80
     mul  x9,x9,x10
     add  x9,x9,#40
     cmp  x22,x9
@@ -313,10 +331,10 @@ mpool_del:
     mov  x2,#32
     bl   memcmp32
     cbz  x0,.md_hit
-    add  x21,x21,#48
+    add  x21,x21,#80
     ldr  x9,[x19,#8]
     add  x9,x9,#1
-    mov  x10,#48
+    mov  x10,#80
     mul  x9,x9,x10
     add  x9,x9,#40
     cmp  x21,x9
@@ -327,7 +345,7 @@ mpool_del:
     b    .md_probe
 .md_hit:
     sub  x9,x21,#40
-    mov  x10,#48
+    mov  x10,#80
     udiv x25,x9,x10           /* i = gap slot index */
     str  x23,[x11]            /* slot[i].len = EMPTY (open gap) */
     ldr  x9,[x19]
@@ -339,7 +357,7 @@ mpool_del:
     ldr  x9,[x19,#8]          /* mask */
     and  x26,x26,x9           /* j = (j+1) & mask */
     mov  x9,x26
-    mov  x10,#48
+    mov  x10,#80
     mul  x9,x9,x10
     add  x9,x9,#40
     add  x13,x19,x9           /* &slot[j] */
@@ -350,7 +368,7 @@ mpool_del:
     ldr  x1,[x19,#8]          /* mask */
     bl   mpool_hash           /* x0 = slot[j] home byte offset */
     sub  x9,x0,#40
-    mov  x10,#48
+    mov  x10,#80
     udiv x27,x9,x10           /* k = slot[j] home slot index */
     ldr  x10,[x19,#8]         /* mask */
     sub  x8,x25,x27
@@ -361,15 +379,15 @@ mpool_del:
     b.hs .md_bs               /* not safe to move */
     /* pull slot[j] back to gap i */
     mov  x9,x25
-    mov  x10,#48
+    mov  x10,#80
     mul  x9,x9,x10
     add  x9,x9,#40
     add  x0,x19,x9            /* &slot[i] */
     mov  x1,x13               /* &slot[j] */
-    mov  x2,#48
+    mov  x2,#80
     bl   mcopy
     mov  x9,x26
-    mov  x10,#48
+    mov  x10,#80
     mul  x9,x9,x10
     add  x9,x9,#40
     add  x13,x19,x9           /* recompute &slot[j] (x13 clobbered) */
@@ -398,5 +416,34 @@ mpool_count:
     ldr  x0,[x0]
     ret
     .size mpool_count,.-mpool_count
+
+/* ---------- mpool_wtxid_at_slot(mp=x0, i=x1) -> ptr to the cached
+ * wtxid[32] of slot i, or 0 when i > mask or the slot is empty. Leaf; no
+ * callee-saved use. A walker that already reads slot i's len and blob_off
+ * (cmpct_recv.c's ht_build) takes the wtxid from here instead of re-hashing
+ * the tx. The pointer aliases the MAP_SHARED slot, so it is only as stable
+ * as the entry: a concurrent del can move the record under a lockless
+ * reader, exactly as for the txid pointer the other walkers already hand
+ * out -- a torn wtxid yields a wrong short id, which reads as a miss. ---- */
+    .global mpool_wtxid_at_slot
+    .type mpool_wtxid_at_slot,%function
+mpool_wtxid_at_slot:
+    ldr  x9,[x0,#8]           /* mask */
+    cmp  x1, x9               /* i > mask -> 0 */
+    b.hi .mwa_none
+    mov  x9,#80
+    mul  x9,x1,x9
+    add  x9,x0,x9
+    add  x9,x9,#40            /* &slot[i] */
+    mov  x10,#-1
+    ldr  x11,[x9]
+    cmp  x11,x10
+    b.eq .mwa_none            /* empty -> 0 */
+    add  x0,x9,#48
+    ret
+.mwa_none:
+    mov  w0,#0
+    ret
+    .size mpool_wtxid_at_slot,.-mpool_wtxid_at_slot
 
     .section .note.GNU-stack,"",@progbits
