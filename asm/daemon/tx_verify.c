@@ -650,8 +650,34 @@ static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long fla
  * value -- only throughput does. */
 #define TXV_PARALLEL_MIN 8
 
-/* -par (Core semantics) lives in daemon/par_threads.c so a test can link it alone. */
-#include "par_threads.h"
+/* ---- Core's -par, exactly (2026-09-06) -------------------------------------
+ * Core (node/chainstatemanager_args.cpp):
+ *     script_threads = -par;                      // default 0
+ *     if (script_threads <= 0) script_threads += GetNumCores();
+ *     worker_threads_num = script_threads - 1;    // the main thread counts too
+ * So -par is the TOTAL number of threads doing script checks, the calling
+ * thread included: 0 = every core, -n = leave n cores free, 1 = the caller
+ * alone.
+ *
+ * This node parsed `par`, printed it at boot, and then used it for the
+ * DOWNLOAD chunk-worker count, while both pools below sized themselves from
+ * sysconf() and never read it: par=8 gave a node that still verified on every
+ * core AND halved its download parallelism. The download count is
+ * bmc.catchupworkers now.
+ *
+ * It lives HERE rather than in a module of its own because every link that
+ * needs it already carries this file; a separate file had to be added to
+ * seventeen source lists and arrived twice in several links. */
+static int g_par = 0;
+void par_set(int par){ g_par = par; }
+int  par_get(void){ return g_par; }
+int  par_script_threads(void){
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu < 1) ncpu = 1;
+    long t = g_par;
+    if (t <= 0) t += ncpu;      /* 0 -> every core, -n -> leave n cores free */
+    if (t < 1) t = 1;           /* a node always has one script-checking thread */
+    return (int)t;
+}
 
 #define TXV_MAX_WORKERS  16
 
