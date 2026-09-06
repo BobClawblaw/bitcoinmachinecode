@@ -3362,6 +3362,32 @@ long utxo_live_verify_after_recovery(long count_before){
 }
 
 long utxo_live_applied_height(void){ return g_applied_height; }
+
+/* ---- 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the node's PUBLIC tip is
+ * the CONNECTED tip, never the stored one.
+ *
+ * Core keeps AcceptBlock (to disk) and ConnectBlock (against the UTXO view)
+ * apart, and everything it says to the outside -- announces, getheaders
+ * answers, getblockcount, getbestblockhash, ZMQ hashblock -- is the connected
+ * tip. Here the two are decoupled by a backlog (the parallel downloader can
+ * put 100k blocks on disk before the first is connected), and until this
+ * function existed every outward-facing site read *(int*)(store+24): a
+ * height the node had never validated was announced, served and counted.
+ *
+ * One rule, read by every outward-facing site: with live tracking on, the
+ * tip is min(stored, applied); with it off (the "continuing WITHOUT live
+ * UTXO tracking" degraded mode) the stored tip, as before. The store's own
+ * tip stays the archive's high-water mark for the downloader. */
+long utxo_live_public_tip(void* store_buf, long live){
+    long stored = (long)*(int*)((char*)store_buf + 24);
+    if (!live) return stored;
+    long ah = g_applied_height;
+    return ah < stored ? ah : stored;
+}
+/* The persisted applied height (utxo_applied_height.dat in the cwd), -1 if
+ * absent. For the serve parent, which never loads the set: it seeds the
+ * shared connected-tip field before the worker starts publishing. */
+long utxo_live_persisted_height(void){ return read_applied_height(); }
 /* TEST-ONLY: the live LSM handles, so a test can read a specific outpoint back
  * out of the real store rather than infer it from counts. */
 void* utxo_live_test_lst(void){ return &g_utxo_lst; }

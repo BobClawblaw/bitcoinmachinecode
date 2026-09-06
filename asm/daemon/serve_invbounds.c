@@ -134,3 +134,30 @@ int serve_locator_from(const unsigned char* pl, unsigned long plen, void* htidx,
       if (!zero){ long sh = 0; if (idx_get(htidx, stop, &sh) == 1) *out_stop = sh; } }
     return 1;
 }
+
+/* ---- 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the tip bitcoin_serve.asm
+ * tells a peer about is the CONNECTED tip.
+ *
+ * Five places in the serve loop read `*(int*)(st+24)` -- the per-connection
+ * announce baseline, getheaders, getblocks, the tip-watch that announces a
+ * new block, and node_announce_tip itself. During a download backlog that is
+ * a height this node has stored but never validated, and a peer asking us
+ * for headers was told about it. They now all call this instead: the stored
+ * tip capped by the connected tip the worker publishes into the shared
+ * status block (node_status_t.connected_tip). No pointer registered, or the
+ * field at NODE_TIP_UNTRACKED (live tracking off), means the stored tip --
+ * the pre-3.1 behaviour, and what the test harnesses that never register
+ * anything still get.
+ *
+ * In C, like serve_locator_from, because it is one read of shared memory
+ * and a compare, and the asm caller keeps its state in statics across the
+ * call (rax..r11 are clobbered by any call). */
+static const volatile long long* g_connected_tip = 0;
+void serve_set_connected_tip_ptr(const volatile long long* p){ g_connected_tip = p; }
+long serve_public_tip(const void* st){
+    long stored = (long)*(const int*)((const char*)st + 24);
+    if (!g_connected_tip) return stored;
+    long long cap = *g_connected_tip;
+    if (cap == -2LL /* NODE_TIP_UNTRACKED */) return stored;
+    return cap < (long long)stored ? (long)cap : stored;
+}

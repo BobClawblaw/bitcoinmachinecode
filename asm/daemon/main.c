@@ -184,7 +184,32 @@ extern const char* utxo_live_last_reject(void);
  * accounting drift can never surface a nonsensical negative in the logs. */
 static long live_utxo_disp(void){ long c = utxo_live_count(); return c < 0 ? 0 : c; }
 extern long utxo_live_applied_height(void);              /* daemon/utxo_live.c */
+extern long utxo_live_public_tip(void* store_buf, long live);   /* daemon/utxo_live.c (3.1) */
+extern long utxo_live_persisted_height(void);            /* daemon/utxo_live.c (3.1) */
 extern long utxo_live_recover(void);                     /* daemon/utxo_live.c */
+/* ---- 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the node's tip is the
+ * CONNECTED tip. Until this, every outward-facing site read *(int*)(store+24)
+ * -- the ARCHIVE's high-water mark, which the parallel downloader runs
+ * hundreds of thousands of blocks past the last block this node has actually
+ * validated against its UTXO set. Core announces, serves and reports only
+ * what ActivateBestChain has connected; so does this node now, through this
+ * one function: min(stored, applied) while live UTXO tracking is on, the
+ * stored tip when it is off (the "continuing WITHOUT live UTXO tracking"
+ * degraded mode -- the pre-3.1 behaviour, kept as the negative control).
+ * g_utxo_live_on mirrors the worker's utxo_live_ok (set at init, cleared at
+ * the two HALT sites). The store's own tip remains what the downloader and
+ * the header mirror key on. */
+static int g_utxo_live_on = 0;
+static long node_public_tip(void* st){ return utxo_live_public_tip(st, g_utxo_live_on); }
+/* Publish the connected tip for the two other processes that speak for this
+ * node: the parent's chain RPCs (rpc_chain refresh) and the inbound serve
+ * children (serve_public_tip). Called at the rotation top and from the
+ * catch-up apply hook, so a long catch-up call keeps it fresh per block. */
+static void dl_publish_connected_tip(void){
+    if(!g_node_status) return;
+    g_node_status->connected_tip = g_utxo_live_on ? utxo_live_applied_height() : NODE_TIP_UNTRACKED;
+}
+static long rpc_public_tip(void){ return g_node_status ? (long)g_node_status->connected_tip : (long)NODE_TIP_UNTRACKED; }
 extern int  archive_verify_and_repair(void* store_buf, int repair); /* daemon/archive_verify.c */
 extern long archive_repair_bad_bodies(long nblocks, int level);  /* STO-11 */
 extern long archive_drop_utxo_state(void);                /* daemon/archive_verify.c */
@@ -1695,6 +1720,11 @@ static long txoq_mark_block(void* store_buf, const unsigned char hash[32], int o
     *out_h = h; return 1;
 }
 static void* g_txoq_store = NULL;                 /* CC-10: set by the worker before its rotation */
+static void txoq_service(void);
+/* The catch-up loop's between-block hook: publish the connected tip (3.1) so
+ * the parent's RPCs and the serve children follow a long catch-up call block
+ * by block, then answer pending gettxout queries (a no-op without the IPC). */
+static void dl_apply_hook(void){ dl_publish_connected_tip(); txoq_service(); }
 static void txoq_service(void){
     if(g_txoq_worker < 0) return;
     for(int guard = 0; guard < 64; guard++){
@@ -2401,10 +2431,11 @@ static long do_outbound_sync(int i){
     if(reorg_chainwork_sync(store_buf, 0) < 0)
         fprintf(stderr,"[chainwork] sync failed after storing heights %d..%d -- fork choice is DEGRADED until this recovers\n",
                 st_tip_before+1, st_tip);
-    /* announce the new tip to this peer (inv; BIP130 headers honored by the
-     * peer's sendheaders negotiation is handled downstream on its own leg) */
-    node_announce_tip(mux_out_fd[i], store_buf, ht_idx, 0);
-    fprintf(stderr,"[mux:%d] broadcast tip height=%d to %s\n", i, st_tip, mux_out_host[i]);
+    /* 3.1: NOT announced here. The block is stored, not connected; the
+     * announcement (inv to every outbound leg) fires from the worker's
+     * new-block choke point once utxo_live_catchup has connected it -- the
+     * same rotation in steady state, never ahead of validation. */
+    fprintf(stderr,"[mux:%d] stored tip height=%d from %s (announced on connect)\n", i, st_tip, mux_out_host[i]);
     /* advance this peer's persistent locator to our new stored tip */
     anchor_locator(mux_out_loc[i]);
     fprintf(stderr,"[mux:%d] %-22s sync ok=%ld new=%ld tip=%d (%.2fs)\n", i, mux_out_host[i], ok, cnt, st_tip, sync_s);
@@ -4978,6 +5009,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     g_in_utxo_reload = 1;                       /* see handle_shutdown_signal */
     int utxo_live_ok = archive_ok ? utxo_live_init(dir) : 0;
     g_in_utxo_reload = 0;
+    g_utxo_live_on = utxo_live_ok;             /* 3.1: node_public_tip() switches on this */
+    dl_publish_connected_tip();
     /* Incident #48: mempool prevout resolution in THIS process must query
      * the live writer state, never a boot-latched snapshot of files the
      * writer keeps mutating (misses + garbage script lengths within
@@ -5336,7 +5369,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     long long boot_ms = 0;
     { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); boot_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
     long long next_heartbeat_ms = boot_ms + DL_HEARTBEAT_MS;
-    int last_seen_tip = *(int*)(store_buf+24);   /* new-block announcement baseline (boot tip, so the catch-up burst is announced too) */
+    int last_seen_tip = (int)node_public_tip(store_buf);   /* new-block choke-point baseline: the CONNECTED tip at boot (3.1), so the catch-up burst is published too */
+    int last_seen_stored = *(int*)(store_buf+24);          /* archive high-water mark: keys the header mirror top-up only */
     /* STAGE B: next allowed fork probe (see the probe block in the rotation
      * below). Starts armed so a node booting onto a store that is already on
      * a losing branch notices on its first idle rotation rather than after a
@@ -5347,7 +5381,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     for(;;){
         /* publish outbound peer count + tip + peer table for the RPC thread */
         if(g_node_status){ int lp=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) lp++;
-            g_node_status->n_out = lp; g_node_status->tip_height = *(int*)(store_buf+24);
+            g_node_status->n_out = lp; g_node_status->tip_height = node_public_tip(store_buf);   /* 3.1: the CONNECTED tip */
+            dl_publish_connected_tip();
             long long nows = (long long)time(NULL);
             for(int i=0;i<RPC_MAX_PEERS;i++){
                 if(i >= MUX_MAX_OUT) continue;                      /* inbound children own 64..127 */
@@ -6210,7 +6245,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 if(utxo_live_halted()){
                     /* a spend found its coin absent right after verification resolved
                      * it: the store is lying and nothing downstream can be trusted */
-                    utxo_live_ok = 0;
+                    utxo_live_ok = 0; g_utxo_live_on = 0; dl_publish_connected_tip();
                     fprintf(stderr,"[dl] UTXO TRACKING HALTED at height %ld: store lookup inconsistency during apply (incident 2026-09-01 class). "
                                    "Blocks keep flowing without UTXO tracking; operator must drop and rebuild the UTXO state.\n",
                             utxo_live_applied_height());
@@ -6220,7 +6255,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                             utxo_live_applied_height(), count_before);
                     rounds = utxo_live_recover();
                     if(!utxo_live_verify_after_recovery(count_before)){
-                        utxo_live_ok = 0;
+                        utxo_live_ok = 0; g_utxo_live_on = 0; dl_publish_connected_tip();
                         fprintf(stderr,"[dl] UTXO TRACKING HALTED at height %ld: the set is inconsistent after recovery. "
                                        "Blocks keep flowing without UTXO tracking; operator must drop and rebuild the UTXO state.\n",
                                 utxo_live_applied_height());
@@ -6263,24 +6298,52 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * flight and a point query cannot race the writer. This is the only
          * place the worker answers gettxout. */
         txoq_service();
-        /* new-block announcement: one choke point watching the store's tip,
-         * so it fires no matter which path appended (mux keep-up leg,
-         * realtime getdata loop, catch-up). Hash read straight from the
-         * index record (store_get_tip_hash), printed big-endian like Core
-         * logs it, so a line here greps against a Core debug.log. */
+        /* The header mirror follows the ARCHIVE (it is derived from stored
+         * blocks and feeds the downloader's own header fetch), so it keeps
+         * its own watcher on the stored tip -- whichever path appended. */
         {
-            int now_tip = *(int*)(store_buf+24);
+            int now_stored = *(int*)(store_buf+24);
+            if(now_stored != last_seen_stored){
+                if(now_stored > last_seen_stored) dl_header_mirror_topup(store_buf);
+                last_seen_stored = now_stored;
+            }
+        }
+        /* new-block choke point (3.1: watching the CONNECTED tip, not the
+         * store's). Everything the node says or does about a "new block"
+         * -- the log line, the outbound-leg announce, ZMQ hashblock/rawblock,
+         * the index tails, -blocknotify, the mempool's removeForBlock and
+         * its tip anchor -- fires here, once per block that utxo_live has
+         * connected. Before 3.1 this watched *(int*)(store+24) and every one
+         * of those consumers saw blocks this node had stored but never
+         * validated. Hash printed big-endian like Core logs it, so a line
+         * here greps against a Core debug.log. The tip can also go DOWN here
+         * (a reorg, a rejected block truncating the archive): nothing is
+         * announced for that, the baseline just follows. */
+        {
+            int now_tip = (int)node_public_tip(store_buf);
             if(last_seen_tip >= 0 && now_tip > last_seen_tip){
-                unsigned char th[32]; char hex[65];
-                if(store_get_tip_hash(store_buf, th) == 1){
+                static unsigned char thb[8u<<20]; unsigned char th[32]; char hex[65];
+                if(store_read_at(store_buf, (unsigned long)now_tip, thb, (long)sizeof thb) >= 80){
+                    block_hash(th, thb);
                     for(int b=0;b<32;b++) sprintf(hex+b*2, "%02x", th[31-b]);
-                    fprintf(stderr,"[dl] new block: height=%d hash=%s (+%d)\n",
-                            now_tip, hex, now_tip-last_seen_tip);
+                    fprintf(stderr,"[dl] new block: height=%d hash=%s (+%d)%s\n",
+                            now_tip, hex, now_tip-last_seen_tip,
+                            now_tip < *(int*)(store_buf+24) ? " [connected; archive is ahead]" : "");
                 } else {
                     fprintf(stderr,"[dl] new block: height=%d (+%d)\n",
                             now_tip, now_tip-last_seen_tip);
                 }
-                dl_header_mirror_topup(store_buf);   /* keep the derived header mirror at the archive tip, whichever path appended */
+                /* announce the CONNECTED tip to every outbound leg (inv
+                 * MSG_BLOCK; node_announce_tip reads the public tip itself).
+                 * This replaces the per-leg announce that used to fire at
+                 * store time in the leg sync. */
+                { int announced = 0, legs = 0;
+                  for(int i2=0; i2<mux_n_out; i2++){
+                      if(mux_out_fd[i2] < 0) continue;
+                      legs++;
+                      if(node_announce_tip(mux_out_fd[i2], store_buf, ht_idx, 0) == 1) announced++;
+                  }
+                  if(legs) fprintf(stderr,"[dl] announced tip height=%d to %d/%d legs\n", now_tip, announced, legs); }
                 /* ZMQ hashblock/rawblock + the txid-index tail, from this
                  * same choke point for the same reason the log line is: it
                  * fires no matter which path appended the block.
@@ -6384,8 +6447,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             int failing=0; for(int k=0;k<mux_n_out;k++) if(g_sync_fail_streak[k]) failing++;
             char failbuf[32]; failbuf[0]=0;
             if(failing) snprintf(failbuf, sizeof failbuf, " sync_failing=%d", failing);
-            fprintf(stderr,"[dl] heartbeat: tip=%d peers=%d/%d txouts=%ld uptime=%s%s%s\n",
-                    *(int*)(store_buf+24), live_peers, mux_n_out,
+            char storedbuf[40]; storedbuf[0]=0;
+            { long pt = node_public_tip(store_buf), stt = *(int*)(store_buf+24);
+              if(stt != pt) snprintf(storedbuf, sizeof storedbuf, " stored=%ld", stt); }
+            fprintf(stderr,"[dl] heartbeat: tip=%ld%s peers=%d/%d txouts=%ld uptime=%s%s%s\n",
+                    node_public_tip(store_buf), storedbuf, live_peers, mux_n_out,
                     utxo_live_ok?live_utxo_disp():-1L,
                     fmt_uptime(upbuf, (now_ms-boot_ms)/1000), failbuf,
                     utxo_live_halted() ? "  [UTXO HALTED -- inconsistent after recovery; drop and rebuild]"
@@ -6665,6 +6731,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     { extern long rpc_node_submit_proposal(const char*, char*, unsigned long);
       rpc_chain_set_proposal(rpc_node_submit_proposal); }
     rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
+    rpc_chain_set_public_tip_fn(rpc_public_tip);   /* 3.1: every chain RPC's tip is the CONNECTED tip */
     /* getnetworkinfo tells the truth about the transports: reachability from
      * the dialer, our i2p destination, and (once the tor listener is up,
      * below in tor_onion_listener) the onion hostname. */
@@ -8468,7 +8535,18 @@ int main(int argc, char** argv){
                              MAP_SHARED|MAP_ANONYMOUS, -1, 0);
         if (g_node_status == MAP_FAILED){ g_node_status = NULL; }
         else { g_node_status->n_out = 0; g_node_status->n_inbound = 0;
-               g_node_status->tip_height = *(int*)(store_buf+24);
+               /* 3.1: seed the connected tip from the persisted applied height
+                * so the RPCs and the serve children cap by it from the first
+                * request, before the worker has loaded the set and started
+                * publishing (utxo_applied_height.dat absent -> -1: nothing
+                * connected yet, which is the truth on a fresh datadir). The
+                * worker overwrites it with NODE_TIP_UNTRACKED if live
+                * tracking fails to come up. */
+               { long ph = utxo_live_persisted_height(), stt = *(int*)(store_buf+24);
+                 g_node_status->connected_tip = ph;
+                 g_node_status->tip_height = ph < stt ? ph : stt; }
+               { extern void serve_set_connected_tip_ptr(const volatile long long*);
+                 serve_set_connected_tip_ptr(&g_node_status->connected_tip); }
                g_node_status->start_time = (long long)time(NULL);
                /* MUST be set explicitly: the status block is zeroed shared
                 * memory, and net_active == 0 means "networking disabled" --
@@ -8504,10 +8582,8 @@ int main(int argc, char** argv){
              * service hook before the worker's first utxo_live_catchup, so a
              * long catch-up pass answers gettxout queries at its block
              * boundaries instead of refusing them all until it returns. */
-            if(g_txoq_worker >= 0){
-                extern void utxo_live_set_apply_hook(void (*)(void));
-                utxo_live_set_apply_hook(txoq_service);
-            }
+            { extern void utxo_live_set_apply_hook(void (*)(void));
+              utxo_live_set_apply_hook(dl_apply_hook); }   /* 3.1: publishes the connected tip, then txoq_service */
             serve_download_worker(dir, (const char**)g_seed_hosts, g_n_seed_hosts, g_chainp->default_port);
             _exit(0);
         }
