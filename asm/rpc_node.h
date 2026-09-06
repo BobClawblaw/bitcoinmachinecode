@@ -113,7 +113,7 @@ typedef struct {
 typedef struct {
     volatile int       n_out;        /* live outbound peers  (download worker) */
     volatile int       n_inbound;    /* live inbound peers   (serve parent)    */
-    volatile long long tip_height;   /* current chain tip    (download worker) */
+    volatile long long tip_height;   /* current PUBLIC tip = the connected tip (download worker; 3.1) */
     volatile long long start_time;   /* node start, unix secs (parent, once)   */
     rpc_peer_t         peers[RPC_MAX_PEERS];  /* outbound peer table (worker)   */
     /* RPC-3: monotonic source for rpc_peer_t.nodeid. Bumped with an atomic
@@ -312,7 +312,19 @@ typedef struct {
         volatile unsigned long      vsize;     /* vbytes;   0 = unknown */
         volatile int                src_slot;  /* peer-table slot that delivered it; -1 = worker/RPC */
     } ann_ring[RPC_ANN_RING];
+    /* 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the CONNECTED tip, the
+     * cap every outward-facing site applies to the stored tip -- the parent's
+     * chain RPCs (rpc_chain refresh) and the inbound serve children's
+     * getheaders / getblocks / tip-watch announce (serve_public_tip). Seeded
+     * by the parent from utxo_applied_height.dat before the fork, then
+     * published by the worker on every rotation AND at every block boundary
+     * of a catch-up call (the apply hook), so it never lags the truth by more
+     * than the block being connected. NODE_TIP_UNTRACKED = live UTXO tracking
+     * is off (or the worker has not reported yet): readers use the stored
+     * tip, the pre-3.1 behaviour. -1 = tracking on, nothing connected yet. */
+    volatile long long connected_tip;
 } node_status_t;
+#define NODE_TIP_UNTRACKED (-2LL)
 
 /* Hand the RPC layer the shared status region (call before rpc_server_start).
  * NULL is valid -- methods that need it then report an empty/loading node.

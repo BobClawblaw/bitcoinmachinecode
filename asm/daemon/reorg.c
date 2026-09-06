@@ -83,6 +83,12 @@ extern long store_chainwork_reload(void* st);
 extern long store_chainwork_truncate(void* st, long target_height);
 
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
+extern long utxo_live_applied_height(void);   /* 3.3: the connected tip -- heights above it were never applied */
+extern long undo_discard(long height);        /* daemon/undo_log.c */
+extern int  hst_init(void* hst);              /* bitcoin_headers.asm (headers.dat mirror) */
+extern int  hst_reload(void* hst);
+extern long hst_count(void* hst);
+#include "invalid_set.h"                      /* CC-10: invalid.dat */
 
 /* ---- operator alerts (Core -alertnotify) ---------------------------------
  * reorg.c raises; it does not decide what an alert MEANS or how to deliver
@@ -743,10 +749,26 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         fprintf(stderr, "[reorg] refusing: fork height %ld is above our tip %ld\n", fork_height, tip);
         return 0;
     }
-    if (tip - fork_height > REORG_MAX_DEPTH){
-        fprintf(stderr, "[reorg] refusing: disconnect depth %ld exceeds max %d\n", tip - fork_height, REORG_MAX_DEPTH);
+    /* 3.3 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): heights above the
+     * CONNECTED tip were stored but never applied -- the parallel downloader
+     * runs the archive far ahead of utxo_live, and a block that failed to
+     * connect sits at applied+1. There is nothing to unapply for them: no
+     * undo file, no coins to restore. They are dropped from the archive by
+     * the truncate below, and only the connected part [fork+1 .. applied]
+     * goes through pre-flight and unapply. So the undo-window bound applies
+     * to the connected depth, not the archive's. Before this the pre-flight
+     * refused ("undo records=0 but block spends N inputs") and an
+     * invalidateblock -- or 3.3's own rejection of a bad block -- was
+     * impossible during any backlog. */
+    long applied = utxo_live_applied_height();
+    long conn_top = applied < tip ? applied : tip;      /* highest CONNECTED height in the archive */
+    if (conn_top - fork_height > REORG_MAX_DEPTH){
+        fprintf(stderr, "[reorg] refusing: disconnect depth %ld exceeds max %d\n", conn_top - fork_height, REORG_MAX_DEPTH);
         return 0;
     }
+    if (tip > conn_top)
+        fprintf(stderr, "[reorg] heights %ld..%ld are stored but were never connected (applied %ld): dropped without unapply\n",
+                conn_top + 1, tip, applied);
     if (nblocks <= 0 && !g_pure_disconnect){
         fprintf(stderr, "[reorg] refusing: no replacement blocks supplied\n");
         return 0;
@@ -784,7 +806,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
      * readable and (b) its undo data is present and record-for-record
      * complete. Failing here costs nothing; failing halfway through step 8
      * would leave a corrupted UTXO set. */
-    for (long h = tip; h > fork_height; h--){
+    for (long h = conn_top; h > fork_height; h--){
         long len = read_stored_block(st, h, blkbuf, sizeof blkbuf);
         if (len < 81){
             fprintf(stderr, "[reorg] refusing: cannot read block at height %ld (len=%ld)\n", h, len);
@@ -820,7 +842,11 @@ long reorg_execute(void* st, long fork_height, long nblocks,
     }
 
     /* ------------------------ point of no return ------------------------ */
-    for (long h = tip; h > fork_height; h--){
+    /* never-connected heights (3.3): no unapply, no applied-height step; a
+     * stale undo file from a failed apply attempt is discarded so a block
+     * later reconnected at that height starts clean */
+    for (long h = tip; h > conn_top && h > fork_height; h--) undo_discard(h);
+    for (long h = conn_top; h > fork_height; h--){
         long len = read_stored_block(st, h, blkbuf, sizeof blkbuf);
         if (len < 81){
             fprintf(stderr, "[reorg] FATAL: block at height %ld became unreadable mid-disconnect\n", h);
@@ -1421,4 +1447,57 @@ long reorg_disconnect_to(void* st, long fork_height){
     long r = reorg_execute(st, fork_height, 0, NULL, NULL);
     g_pure_disconnect = 0;
     return r;
+}
+
+/* ---- 3.3 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): mark a block invalid ----
+ * The one path behind BOTH the operator's invalidateblock (main.c's
+ * txoq_mark_block) and the node's own rejection of a block that fails to
+ * connect (utxo_live_catchup's reject hook) -- Core's InvalidateBlock and
+ * BLOCK_FAILED_VALID are the same mechanism too. Steps, in the order that
+ * keeps every crash point recoverable:
+ *   1. invset_add(hash) + invset_save: the CC-10 mark. From here the header
+ *      fetch (dlc_take_page) and the reorg analyzer refuse any chain
+ *      through this block, so nothing below can re-admit it.
+ *   2. if the block is in the archive (h <= stored tip): disconnect down to
+ *      its parent through reorg_disconnect_to -- unapply of whatever was
+ *      connected above the parent (usually nothing: a rejected block is at
+ *      applied+1), archive_truncate_safe to h-1, chainwork truncate, the
+ *      hash index rebuild.
+ *   3. headers.dat rolled back to h records (heights 0..h-1), so the next
+ *      header fetch asks peers from the parent and takes the heavier chain
+ *      that avoids the mark. The file is the mirror's backing store; every
+ *      user re-inits its handle from the file per call (main.c's
+ *      dlc_headers / dl_header_mirror_topup) or reloads after this returns.
+ * Returns 1 done, 0 refused (the reorg log says why), -1 failed part way
+ * (the reorg log says where). The caller logs the reason and the height;
+ * this function is deliberately silent about WHY the block is invalid. */
+long chain_invalidate_block(void* st, long h, const unsigned char hash[32]){
+    if (h < 0 || !hash) return 0;
+    int added = invset_add(hash);
+    if (added < 0){ fprintf(stderr, "[chain] invalidate: invalid.dat is full (%d marks) -- refusing\n", INVSET_MAX); return -1; }
+    invset_save("invalid.dat");
+    long tip = store_tip(st);
+    if (h <= tip){
+        long applied = utxo_live_applied_height();
+        fprintf(stderr, "[chain] invalidate: height %ld is in the archive (tip %ld, connected %ld) -- disconnecting to %ld\n",
+                h, tip, applied, h - 1);
+        long r = reorg_disconnect_to(st, h - 1);
+        if (r != 1){
+            fprintf(stderr, "[chain] invalidate: disconnect %s\n", r == 0 ? "refused (see the reorg log)" : "FAILED PART WAY -- see the reorg log");
+            return r == 0 ? 0 : -1;
+        }
+    }
+    { static unsigned char hb[4096];
+      if (hst_init(hb) == 1){
+          struct stat hs;
+          if (stat("headers.dat", &hs) == 0 && hs.st_size >= 112) hst_reload(hb);
+          long n = hst_count(hb);
+          if (n > h){
+              if (truncate("headers.dat", (off_t)h * 112) != 0)
+                  fprintf(stderr, "[chain] invalidate: could not roll headers.dat back to %ld record(s): %s\n", h, strerror(errno));
+          }
+      } }
+    fprintf(stderr, "[chain] invalidate: marked height %ld (%s); archive at %ld; headers rolled back to %ld; the chain stays below it until a heavier chain avoids the mark\n",
+            h, added ? "new mark" : "already marked", store_tip(st), h);
+    return 1;
 }
