@@ -207,5 +207,5 @@ subsystem entirely. A key is only really verified when a test asserts its READER
   `MineBlocksOnDemand()`** (regtest); `node/miner.cpp:148`. This node applies
   it wherever it is set (`rpc_chain.c`, `g_gbt_version`). A mainnet operator
   setting it would change the version this node puts in `getblocktemplate`
-  where Core would ignore it. **Open — behavioural, not a default**, and it
-  needs a decision before it is changed.
+  where Core would ignore it. **FIXED 2026-09-06** (PR #57): same predicate as Core,
+  read from `g_chainp->pow_no_retargeting`; `test_rpc_chain` pins it.
