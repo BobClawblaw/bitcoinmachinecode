@@ -16,7 +16,7 @@
 ;        [+0  qword blob_off]   (offset into blob of the record)
 ;        [+8  u8  txid[32]]
 ;        [+40 u32 index]
-;        [+44 qword _pad]
+;        [+44 u32 _pad]         (4 bytes; never read, never written by put)
 ;   empty slot marker: index == 0xFFFFFFFFFFFFFFFF-free: use index field 0xFFFFFFFF.
 ;
 ; Blob record at offset o (2026-08-19, Stage D: added height/is_coinbase so
