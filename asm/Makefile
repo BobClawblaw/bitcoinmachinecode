@@ -2943,8 +2943,8 @@ tests/test_rpc_control: tests/test_rpc_control.c rpc_commands.o rpc_json.o $(RPC
 tests/test_txospender_index: tests/test_txospender_index.c daemon/build_txospender_index daemon/txosp_tail.c daemon/txosp_format.h rpc_commands.o rpc_json.o $(RPCLIBS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_txospender_index.c daemon/txosp_tail.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
 
-tests/test_rpc_psbtfinal: tests/test_rpc_psbtfinal.c rpc_commands.o rpc_json.o $(RPCLIBS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_psbtfinal.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
+tests/test_rpc_psbtfinal: tests/test_rpc_psbtfinal.c tests/psbt_tapscript_vec.h rpc_commands.o rpc_json.o $(RPCLIBS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I tests -o $@ tests/test_rpc_psbtfinal.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
 
 # PSBT v2 (BIP370): normalization, Core-ordered emission, decode names, validation messages (2026-09-01)
 tests/test_psbt_v2: tests/test_psbt_v2.c rpc_commands.o rpc_json.o $(RPCLIBS)
