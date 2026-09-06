@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <errno.h>
 /* WAL-8: Core rpcwallet.cpp MAX_SLEEP_TIME */
 #define WOP_MAX_SLEEP_TIME 100000000LL
@@ -2982,6 +2983,37 @@ static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
             nin = (int)bn;
             fee = sum - target;               /* changeless: the excess is fee */
             change = 0;
+        }
+        /* CC-10 (2026-09-06): Core runs BnB, knapsack and SRD and keeps the
+         * selection with the least WASTE (wallet/coinselection.cpp
+         * GetSelectionWaste). BnB is only accepted when its excess is under
+         * the cost of change, so when it succeeds it wins; when it does not,
+         * this wallet fell straight to largest-first (wf_select). Now the two
+         * change-making selectors run over the same effective values and the
+         * lower-waste one is taken; largest-first remains the last resort. */
+        if (nin < 0 && ne > 0){
+            extern long wallet_knapsack_select(const unsigned long long*, int, unsigned long long, unsigned long long, int*, int, unsigned long long);
+            extern long wallet_srd_select(const unsigned long long*, int, unsigned long long, unsigned long long, int*, int, unsigned long long);
+            extern long long wallet_selection_waste(const unsigned long long*, const long long*, const int*, long, unsigned long long, unsigned long long);
+            int kp[WF_MAX_IN], sp[WF_MAX_IN];
+            unsigned long long chg_cost = change_out_cost + change_spend_cost;
+            unsigned long long min_change = 50000ULL + change_out_cost;          /* Core CHANGE_LOWER + the change output's fee */
+            unsigned long long seed = (unsigned long long)time(NULL) * 0x9e3779b97f4a7c15ULL ^ (unsigned long long)target;
+            long kn = wallet_knapsack_select(eff, ne, target + base_fee, min_change, kp, WF_MAX_IN, seed);
+            long sn = wallet_srd_select(eff, ne, target + base_fee, chg_cost, sp, WF_MAX_IN, seed ^ 0x5555555555555555ULL);
+            long long wk = kn > 0 ? wallet_selection_waste(eff, NULL, kp, kn, target + base_fee, chg_cost) : 0x7fffffffffffffffLL;
+            long long ws = sn > 0 ? wallet_selection_waste(eff, NULL, sp, sn, target + base_fee, chg_cost) : 0x7fffffffffffffffLL;
+            const int* best = NULL; long bestn = 0;
+            if (kn > 0 && wk <= ws){ best = kp; bestn = kn; } else if (sn > 0){ best = sp; bestn = sn; }
+            if (best && bestn <= WF_MAX_IN){
+                unsigned long long sum = 0, in_fees = 0;
+                for (long k = 0; k < bestn; k++){ int oi = order[best[k]]; pick[k] = oi; sum += coins[oi].value; in_fees += coins[oi].value - eff[best[k]]; }
+                unsigned long long total_fee = base_fee + in_fees + change_out_cost;
+                if (sum >= target + total_fee){
+                    nin = (int)bestn; fee = total_fee; change = sum - target - total_fee;
+                    if (change < 546ULL){ fee += change; change = 0; }         /* dust change folds into the fee, as Core does */
+                }
+            }
         }
     }
     if (nin < 0)
