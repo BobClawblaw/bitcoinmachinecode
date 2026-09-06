@@ -43,14 +43,35 @@ compact_to_target_le:
     .global chainwork_add
     .type chainwork_add,%function
 chainwork_add:
+    /* STO-13 (audit 2026-09-03): SATURATE instead of wrapping.
+     *
+     * Cumulative mainnet work is ~2^97 and per-block work ~2^80, so 128 bits
+     * is not close to exhausted and overflow needs a target below 2^128 --
+     * which pow_check cannot pass at real difficulty and `bad-diffbits`
+     * rejects before work is ever summed. The audit rates this "correct as
+     * used", and that is right.
+     *
+     * It saturates anyway because of WHAT this feeds: chainwork_cmp is the
+     * fork-choice predicate. A silent wrap would not corrupt a number in a
+     * log, it would make a lighter chain compare heavier -- the node
+     * reorganising ONTO the wrong chain, with no error anywhere. Clamping to
+     * all-ones keeps the comparison monotonic in the only direction that
+     * matters, and costs two instructions on a path that runs once per
+     * header. (AArch64 needs adcs, not adc, so the carry OUT is visible.) */
     ldr  x4,[x1,#0]
     ldr  x5,[x2,#0]
     adds x5,x4,x5
     str  x5,[x0,#0]
     ldr  x4,[x1,#8]
     ldr  x5,[x2,#8]
-    adc  x5,x4,x5
+    adcs x5,x4,x5           /* STO-13: adcs, not adc -- carry out must be visible */
     str  x5,[x0,#8]
+    b.cc .cwa_noovf
+    /* carry out of the high limb: pin to 2^128-1 */
+    movn x4,#0              /* x4 = 2^64-1 */
+    str  x4,[x0,#0]
+    str  x4,[x0,#8]
+.cwa_noovf:
     ret
     .size chainwork_add,.-chainwork_add
 
