@@ -1268,7 +1268,7 @@ that served BIP157 before this change must now set it explicitly.
 | `blockmaxweight` | Set maximum BIP141 block weight (default: 4000000) | implemented |
 | `blockmintxfee` | Set lowest fee rate (in BTC/kvB) for transactions to be included in block creation. (default: 0.00000001) | implemented |
 | `blocknotify` | Execute command when the best block changes (%s in cmd is replaced by block hash) | implemented |
-| `blockreconstructionextratxn` | Extra transactions to keep in memory for compact block reconstructions (default: 100) | accepted, no effect: compact-block reconstruction draws on the mempool only |
+| `blockreconstructionextratxn` | Extra transactions to keep in memory for compact block reconstructions (default: 100) | accepted, no effect: compact-block RECEIVE is not implemented (serve side only -- see the BIP152 row and `docs/CORE_BEHAVIORAL_COMPAT.md` §3), so there is no reconstruction for this to size |
 | `blockreservedweight` | Reserve space for the fixed-size block header plus the largest coinbase transaction the mining software may ad… | implemented |
 | `blocksdir` | Specify directory to hold blocks subdirectory for *.dat files (default: <datadir>) | accepted, no effect: the archive lives under <datadir>/<chain> and is not relocatable |
 | `blocksonly` | Whether to reject transactions from network peers. Disables automatic broadcast and rebroadcast of transaction… | implemented 2026-09-01: fRelay=0 in every version, tx/tx-inv from peers without `relay` is a violation (disconnect, no score), no feefilter, localrelay false, whitelistrelay->0 / maxmempool->5 interactions; RPC submissions still relay (Core). Wire-proven: validation/relay_policy_core_diff.sh |
