@@ -70,6 +70,25 @@ was found on the way, how, and what each cost, in the order found:
   far-behind run; its shutdown line says so. The restart went straight to
   the worker.
 
+- **A fresh mainnet archive was shifted by one block, for life.** Slot 0
+  must hold genesis; boot seeded it on every chain except mainnet, because
+  THIS box's archive already had it. On any other fresh mainnet datadir the
+  serial leg's first append — block 1, since no peer relays genesis — took
+  slot 0, and every read of height h returned block h+1. Surfaced as a false
+  `bad-txns-BIP30` on a valid block four minutes into the first fresh-sync
+  benchmark, and the same day's reject-not-halt change persisted the failure
+  mark and killed the download. Fixed by keying the seed on an empty
+  archive. Cost: one abandoned benchmark attempt, one hour.
+  **Why no test caught it:** every sync test uses a fake peer on a non-
+  mainnet chain, which took the branch that worked. A defect in the
+  "except mainnet" arm of a condition is invisible to a suite that never
+  runs mainnet.
+- **The benchmark harness had drifted from the repo.** It built
+  `daemon/bitcoin_cli`, renamed 2026-09-05, so the install failed outright;
+  and it wrote no `bmc.bootcatchup=0`, so it would have measured the
+  pre-interleave shape and reported no improvement. Both fixed on the bench
+  SSD before the run. A harness that lives outside the repo rots against it.
+
 Process note: the branches were built by parallel agents in worktrees, each
 gated alone; the coordinator cherry-picked them onto one landing branch and
 ran ONE gate per merge. One agent's scratch files were overwritten by

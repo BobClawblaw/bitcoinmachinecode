@@ -70,6 +70,7 @@ also annotated tags.
 | [`releases/2026-09-05-audits-closed.md`](releases/2026-09-05-audits-closed.md) | the state of every audit by ID; one standing property not closable by a change, and the systemd unit closed by operator decision |
 | [`releases/2026-09-06-core-compat.md`](releases/2026-09-06-core-compat.md) | the Core-compatibility work list resolved: CC-1..CC-7, CC-9, CC-10 closed or decided, CC-8 running, one item deferred with its reason |
 | [`releases/2026-09-06-utxo-modules.md`](releases/2026-09-06-utxo-modules.md) | seven UTXO / MuHash / compact-block module branches landed: the MuHash fold leaves the connect path, IFMA modmul 3.3×, radix flush 5.9×, short-id table 6.9× |
+| [`releases/2026-09-06-archive-genesis-seed.md`](releases/2026-09-06-archive-genesis-seed.md) | a fresh mainnet archive was shifted by one block for life; the false `bad-txns-BIP30` it caused, and why no test saw it |
 | [`releases/2026-09-06-lowwork-hold-bound.md`](releases/2026-09-06-lowwork-hold-bound.md) | CC-5's four-page hold abandoned every honest header sync below ~880k; found on the replay, bounded by memory instead |
 | [`releases/2026-09-06-utxo-interleave.md`](releases/2026-09-06-utxo-interleave.md) | the UTXO connect runs inside the parallel download instead of after it; the boot catch-up cannot interleave (`bmc.bootcatchup=0` for a fresh-clone benchmark) |
 
