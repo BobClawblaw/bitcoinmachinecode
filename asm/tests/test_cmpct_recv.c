@@ -8,6 +8,7 @@
 #include <sched.h>
 #include <time.h>
 #include "cmpct_recv.h"
+#include "mempool_slot.h"
 extern long cmpctblock_build(unsigned char* out, const unsigned char* blockbuf, unsigned long blen, unsigned long long nonce);
 extern long p2p_blocktxn_build(unsigned char* out, const unsigned char bh[32], const unsigned char* const* txs, const long* lens, long n);
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
@@ -26,6 +27,24 @@ static unsigned long mktx(unsigned char* t, unsigned tag){
     unsigned long o = 0; t[o++]=1; t[o++]=0; t[o++]=0; t[o++]=0; t[o++]=1;
     memset(t+o, 0, 32); t[o] = (unsigned char)tag; t[o+1] = (unsigned char)(tag>>8); o += 32; memset(t+o, 0, 4); o += 4; t[o++]=0; memset(t+o, 0xff, 4); o += 4;
     t[o++]=1; memset(t+o, 0, 8); t[o] = (unsigned char)tag; o += 8; t[o++]=1; t[o++]=0x51; memset(t+o, 0, 4); o += 4; return o;
+}
+/* a pool of `slots` slots holding the block's first nblk non-coinbase txs and nfill filler txs (tags 6000..) */
+static unsigned char* mkpool(unsigned long slots, unsigned char* blob, unsigned long bcap, int nblk, unsigned nfill, unsigned char (*tx)[256], const unsigned long* tl){
+    unsigned char* p = calloc(1, mpool_struct_size(slots)); mpool_init(p, slots, blob, bcap);
+    for (int i = 1; i <= nblk; i++){ unsigned char id[32]; sha256d(id, tx[i], tl[i]); mpool_put(p, id, tx[i], tl[i]); }
+    static unsigned char f[256]; for (unsigned k = 0; k < nfill; k++){ unsigned long fl = mktx(f, 6000 + k); unsigned char id[32]; sha256d(id, f, fl); if (mpool_put(p, id, f, fl) != 1){ printf("  put failed at %u\n", k); break; } }
+    return p;
+}
+/* one cmpctblock call, everything it produced captured: the return, the block bytes or the message it sent */
+typedef struct { long n; int writes; char cmd[16]; unsigned long msg_n; unsigned char msg[4096]; unsigned char out[8192]; } run_t;
+static void run1(run_t* r, void* p, const unsigned char* cb, long cl, const unsigned char bh[32]){
+    writes = 0; cap_n = 0; cap_cmd[0] = 0; r->n = cmpct_recv_cmpctblock(9, p, cb, (unsigned long)cl, r->out, sizeof r->out, bh);
+    r->writes = writes; strcpy(r->cmd, cap_cmd); r->msg_n = cap_n < sizeof r->msg ? cap_n : sizeof r->msg; memcpy(r->msg, cap, r->msg_n);
+}
+static int run_same(const run_t* a, const run_t* b){
+    if (a->n != b->n || a->writes != b->writes) return 0;
+    if (a->n > 0) return !memcmp(a->out, b->out, (size_t)a->n);
+    return !strcmp(a->cmd, b->cmd) && a->msg_n == b->msg_n && !memcmp(a->msg, b->msg, a->msg_n);
 }
 int main(void){
     static unsigned char blk[8192], tx[8][256]; unsigned long tl[8]; unsigned long bo = 80; memset(blk, 0x11, 80);
@@ -62,9 +81,7 @@ int main(void){
     printf("== 50,000-entry pool, one pinned core: cache off (pre-cache ht_build) vs on, same block ==\n");
     { cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(0, &cs); if (sched_setaffinity(0, sizeof cs, &cs) != 0) printf("  (note: could not pin to cpu 0)\n");
       enum { BIG_SLOTS = 131072, NBIG = 50000 };
-      unsigned char* big = calloc(1, mpool_struct_size(BIG_SLOTS)); static unsigned char bblob[8 << 20]; mpool_init(big, BIG_SLOTS, bblob, sizeof bblob);
-      for (int i = 1; i < 6; i++){ unsigned char id[32]; sha256d(id, tx[i], tl[i]); mpool_put(big, id, tx[i], tl[i]); }
-      { static unsigned char f[256]; for (unsigned k = 0; k < NBIG - 5; k++){ unsigned long fl = mktx(f, 6000 + k); unsigned char id[32]; sha256d(id, f, fl); if (mpool_put(big, id, f, fl) != 1){ printf("  put failed at %u\n", k); break; } } }
+      static unsigned char bblob[8 << 20]; unsigned char* big = mkpool(BIG_SLOTS, bblob, sizeof bblob, 5, NBIG - 5, tx, tl);
       ok(mpool_count(big) == NBIG, "50,000 entries in the pool (the block's five among them)");
       cmpct_recv_set_enabled(1); cmpct_recv_set_writer(capw);
       unsigned long h0 = cmpct_recv_hashed(); double t_off = 1e30, t_on = 1e30; long n_off = -1, n_on = -1; static unsigned char out2[8192]; int same_off = 1, same_on = 1;
@@ -79,8 +96,58 @@ int main(void){
       ok(same_off, "control: and still reconstructs the identical block");
       ok(h_on == 0, "cache on: zero tx_wtxid calls for pool entries");
       ok(same_on, "cache on: the identical block");
-      ok(t_on * 1.2 < t_off, "cache on is faster than the per-block rehash of 50,000 transactions by more than 20% (the rest of the per-block cost is the 64 MiB short-id table clear, common to both)");
+      ok(t_on * 1.2 < t_off, "cache on is faster than the per-block rehash of 50,000 transactions by more than 20%");
+      printf("== 50,000-entry pool, one pinned core: the memset build (control: whole-table clear, full width, per-entry key) vs the stamped, pool-sized build ==\n");
+      { double t_old = 1e30, t_new = 1e30; run_t a, b; int same_old = 1, same_new = 1;
+        cmpct_recv_set_ht_clear(1);                                        /* the control runs FIRST */
+        for (int r = 0; r < 9; r++){ double t0 = now_ms(); run1(&a, big, cb, cl, bh); double d = now_ms() - t0; if (d < t_old) t_old = d; if (a.n != (long)bo || memcmp(a.out, blk, bo)) same_old = 0; }
+        ok(cmpct_recv_ht_bits() == 21, "control: the memset build probes at the full 2^21 width");
+        cmpct_recv_set_ht_clear(0);
+        for (int r = 0; r < 9; r++){ double t0 = now_ms(); run1(&b, big, cb, cl, bh); double d = now_ms() - t0; if (d < t_new) t_new = d; if (b.n != (long)bo || memcmp(b.out, blk, bo)) same_new = 0; }
+        printf("  memset build : min %.2f ms/block\n  stamped build: min %.2f ms/block (%.1fx)\n", t_old, t_new, t_old / t_new);
+        ok(same_old && same_new, "both builds reconstruct the identical block");
+        ok(cmpct_recv_ht_bits() == 17, "50,000 entries: the stamped build probes 2^17 entries (next power of two >= 2 x count)");
+        ok(t_new * 3 < t_old, "the stamped, pool-sized build is at least 3x faster than the memset build"); }
       free(big); }
+    printf("== the short-id table: identical to the memset build for pools of 1, 100, 5,000 and 50,000 entries ==\n");
+    { static unsigned char pblob[8 << 20]; struct { unsigned n; unsigned long slots; unsigned bits; } P[4] = { {1, 64, 12}, {100, 256, 12}, {5000, 16384, 14}, {50000, 131072, 17} };
+      for (int q = 0; q < 4; q++){
+        unsigned n = P[q].n; int nblk = n < 5 ? (int)n : 5; unsigned char* p = mkpool(P[q].slots, pblob, sizeof pblob, nblk, n - nblk, tx, tl); run_t a, b; char m[200];
+        cmpct_recv_set_ht_clear(1); run1(&a, p, cb, cl, bh); unsigned ba = cmpct_recv_ht_bits();
+        cmpct_recv_set_ht_clear(0); run1(&b, p, cb, cl, bh); unsigned bb = cmpct_recv_ht_bits();
+        int full = nblk == 5 ? (b.n == (long)bo && !memcmp(b.out, blk, bo)) : (b.n == 0 && b.writes == 1 && !strcmp(b.cmd, "getblocktxn") && b.msg[32] == (unsigned char)(5 - nblk));
+        snprintf(m, sizeof m, "pool of %u (count %ld): memset build and stamped build agree byte for byte -- %s", n, mpool_count(p), nblk == 5 ? "the full block" : "getblocktxn for the four not in the pool");
+        ok(run_same(&a, &b) && full, m);
+        snprintf(m, sizeof m, "pool of %u: the memset build probed 2^%u, the stamped build 2^%u (expected 2^%u)", n, ba, bb, P[q].bits);
+        ok(ba == 21 && bb == P[q].bits, m);
+        free(p); } }
+    printf("== no stale entries: a rebuild after the pool changed misses what was removed ==\n");
+    { static unsigned char sblob[65536], pblob[8 << 20]; unsigned char* p = mkpool(64, sblob, sizeof sblob, 5, 0, tx, tl); run_t a; unsigned char id3[32]; sha256d(id3, tx[3], tl[3]);
+      cmpct_recv_set_ht_clear(0); run1(&a, p, cb, cl, bh); unsigned g1 = cmpct_recv_ht_gen();
+      ok(a.n == (long)bo && !memcmp(a.out, blk, bo), "A (tx 3) in the pool: the block reconstructs in full");
+      mpool_del(p, id3); run1(&a, p, cb, cl, bh);
+      ok(a.n == 0 && a.writes == 1 && !strcmp(a.cmd, "getblocktxn") && a.msg_n == 34 && a.msg[32] == 1 && a.msg[33] == 3, "A removed, same width, nothing cleared: the rebuild misses A -- getblocktxn for index 3 alone");
+      ok(cmpct_recv_ht_gen() == g1 + 1, "each build advances the generation by one");
+      unsigned char* big = mkpool(131072, pblob, sizeof pblob, 5, 49995, tx, tl); run1(&a, big, cb, cl, bh);
+      ok(a.n == (long)bo && cmpct_recv_ht_bits() == 17, "A in a 50,000-entry pool: full block at width 2^17");
+      run1(&a, p, cb, cl, bh);
+      ok(cmpct_recv_ht_bits() == 12 && a.n == 0 && a.writes == 1 && !strcmp(a.cmd, "getblocktxn") && a.msg_n == 34 && a.msg[33] == 3, "then the 4-entry pool at width 2^12, over the wide build's leftovers: A still missing, index 3 alone");
+      printf("== the generation's wrap: the one memset left ==\n");
+      cmpct_recv_ht_set_gen(0); mpool_put(p, id3, tx[3], tl[3]); run1(&a, p, cb, cl, bh);
+      ok(cmpct_recv_ht_gen() == 1 && a.n == (long)bo, "A back in the pool, built at generation 1 (the first-ever build's stamp)");
+      cmpct_recv_ht_set_gen(0xffffffffu); mpool_del(p, id3); run1(&a, p, cb, cl, bh);
+      ok(cmpct_recv_ht_gen() == 1, "the counter wrapped: the table was cleared and the generation restarted at 1");
+      ok(a.n == 0 && a.writes == 1 && !strcmp(a.cmd, "getblocktxn") && a.msg_n == 34 && a.msg[33] == 3, "A's generation-1 entry from before the wrap does not read live after it: index 3 missing");
+      free(p); free(big); }
+    printf("== the dup rule: a short id two pool entries share is missing ==\n");
+    { static unsigned char sblob[65536], f[256]; unsigned char* p = mkpool(64, sblob, sizeof sblob, 5, 1, tx, tl); run_t a, b;
+      unsigned long fl = mktx(f, 6000); unsigned char fid[32], w2[32]; sha256d(fid, f, fl); sha256d(w2, tx[2], tl[2]); int poked = 0;
+      for (unsigned long i = 0; i < 64; i++){ unsigned char* sl = MPOOL_SLOT_AT(p, i); if (*(unsigned long long*)sl != MPOOL_SLOT_EMPTY && !memcmp(sl + MPOOL_SLOT_TXID, fid, 32)){ memcpy(sl + MPOOL_SLOT_WTXID, w2, 32); poked = 1; } }
+      ok(poked, "the filler's cached wtxid overwritten with tx 2's: two pool entries now share tx 2's short id");
+      cmpct_recv_set_ht_clear(1); run1(&a, p, cb, cl, bh); cmpct_recv_set_ht_clear(0); run1(&b, p, cb, cl, bh);
+      ok(b.n == 0 && b.writes == 1 && !strcmp(b.cmd, "getblocktxn") && b.msg_n == 34 && b.msg[32] == 1 && b.msg[33] == 2, "tx 2 is treated as missing: getblocktxn for index 2 alone");
+      ok(run_same(&a, &b), "the memset build says the same");
+      free(p); }
     printf("== negative control: receive disabled (the pre-CC-2 node) ==\n");
     cmpct_recv_set_enabled(0); writes = 0;
     ok(cmpct_getdata_type(1) == 0x40000002u, "control: every block is requested in full");

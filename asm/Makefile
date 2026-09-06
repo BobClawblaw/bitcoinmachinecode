@@ -1375,6 +1375,14 @@ tests/test_invalid_set: tests/test_invalid_set.c daemon/invalid_set.c daemon/inv
 # 50,000-entry pool cache-off vs cache-on on one pinned core, and checks both
 # produce the identical block. Negative control = cmpct_recv_set_wtxid_cache(0),
 # the pre-cache ht_build that sha256d's every entry per block.
+# 2026-09-06 (short-id table): the table is generation-stamped and its probe
+# range sized to the pool, so a build clears nothing. Asserts the stamped build
+# equals the memset build byte for byte for pools of 1, 100, 5,000 and 50,000
+# (block or getblocktxn request), a rebuild after a removal misses the removed
+# entry (same width and across widths), the generation's wrap clears, the dup
+# rule holds (two entries sharing a short id -> missing), and the stamped build
+# is at least 3x faster on one pinned core at 50,000. Negative control =
+# cmpct_recv_set_ht_clear(1): the whole-table memset, full width, per-entry key.
 tests/test_cmpct_recv: tests/test_cmpct_recv.c daemon/cmpct_recv.c daemon/cmpct_recv.h mempool_slot.h bitcoin_cmpct.o bitcoin_hash.o bitcoin_tx.o bitcoin_mempool.o sha256.o wallet_coinsel.c
 	$(CC) $(WARNFLAGS) -O2 -I. -I daemon -o $@ tests/test_cmpct_recv.c daemon/cmpct_recv.c bitcoin_cmpct.o bitcoin_hash.o bitcoin_tx.o bitcoin_mempool.o sha256.o wallet_coinsel.c
 
