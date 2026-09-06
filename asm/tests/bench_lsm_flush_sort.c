@@ -29,6 +29,7 @@ extern void utxo_init(void* u, unsigned long slots, void* blob, unsigned long ca
 extern long utxo_put(void* u, const u8 txid[32], unsigned long index, unsigned long long value,
                      unsigned long height, unsigned long is_coinbase, const u8* script, unsigned long slen);
 extern void utxo_lsm_sort_desc(void* a, void* b, unsigned long n);
+extern void utxo_lsm_set_sort_mode(long mode);   /* 0 = merge sort, 1 = radix */
 
 static double now(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static u64 sm_state = 0x9E3779B97F4A7C15ULL;
@@ -82,16 +83,25 @@ int main(int argc, char** argv){
 
     printf("bench_lsm_flush_sort: N=%lu descriptors (%lu live + %lu tombstones), %lu slots, pinned cpu %d, fill %.2fs\n",
            N, live, T, slots, cpu, fill_s);
-    double best = 1e30;
-    for (int rep = 0; rep < 3; rep++){
-        memcpy(a, orig, N * 64); memset(b, 0, N * 64);
-        double t0 = now(); utxo_lsm_sort_desc(a, b, N); double dt = now() - t0;
-        unsigned long pushes = 0, bad = 0;
-        for (unsigned long i = 0; i < N; i++){ pushes += a[i * 64 + 36] == 1; if (i && cmp36(a + (i - 1) * 64, a + i * 64) > 0) bad++; }
-        if (bad || pushes != live){ printf("  rep %d: NOT SORTED (%lu inversions, %lu pushes)\n", rep, bad, pushes); return 1; }
-        printf("  rep %d: sort %.1f ms  (%.1f ns/key, %.0f MB/s of descriptors)\n", rep, dt * 1e3, dt * 1e9 / N, (double)N * 64 / dt / 1e6);
-        if (dt < best) best = dt;
+    static const char* const mode_name[2] = { "merge", "radix" };
+    double best[2] = { 1e30, 1e30 };
+    u8* ref = malloc(N * 64);
+    if (!ref){ fprintf(stderr, "malloc\n"); return 1; }
+    for (int mode = 0; mode < 2; mode++){
+        utxo_lsm_set_sort_mode(mode);
+        for (int rep = 0; rep < 3; rep++){
+            memcpy(a, orig, N * 64); memset(b, 0, N * 64);
+            double t0 = now(); utxo_lsm_sort_desc(a, b, N); double dt = now() - t0;
+            unsigned long pushes = 0, bad = 0;
+            for (unsigned long i = 0; i < N; i++){ pushes += a[i * 64 + 36] == 1; if (i && cmp36(a + (i - 1) * 64, a + i * 64) > 0) bad++; }
+            if (bad || pushes != live){ printf("  %s rep %d: NOT SORTED (%lu inversions, %lu pushes)\n", mode_name[mode], rep, bad, pushes); return 1; }
+            if (mode == 0 && rep == 0) memcpy(ref, a, N * 64);
+            else if (memcmp(ref, a, N * 64) != 0){ printf("  %s rep %d: output differs from the merge sort's\n", mode_name[mode], rep); return 1; }
+            printf("  %s rep %d: sort %.1f ms  (%.1f ns/key, %.0f MB/s of descriptors)\n", mode_name[mode], rep, dt * 1e3, dt * 1e9 / N, (double)N * 64 / dt / 1e6);
+            if (dt < best[mode]) best[mode] = dt;
+        }
     }
-    printf("best: %.1f ms for N=%lu (%.1f ns/key)\n", best * 1e3, N, best * 1e9 / N);
+    printf("best: merge %.1f ms, radix %.1f ms for N=%lu (%.1f vs %.1f ns/key, %.2fx)\n",
+           best[0] * 1e3, best[1] * 1e3, N, best[0] * 1e9 / N, best[1] * 1e9 / N, best[0] / best[1]);
     return 0;
 }
