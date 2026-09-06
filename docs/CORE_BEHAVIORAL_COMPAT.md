@@ -110,6 +110,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 |---|---|---|---|
 | Headers-first sync, PoW checked per header, contextual rules | | same; boot header fetch PoW-gates before append (VAL-5) | **DONE** |
 | Minimum chain work at fork evaluation | never reorg to a chain below `nMinimumChainWork` | same (`minchainwork.c`, `reorg.c:708`, floor per chain) | **DONE** |
+| `-par` script-verification threads | total threads doing script checks, caller included: 0 = cores, -n = leave n free, 1 = single-threaded (`chainstatemanager_args.cpp`) | same arithmetic, floor of one thread (`tx_verify.c`, `par_script_threads`), read by both verify pools; the download chunk-worker count is `bmc.catchupworkers`. **Was wired to the download count and ignored by the verifier until 2026-09-06** (`74dc317`) | **DONE** |
 | Low-work headers sync / presync | do not store a headers chain until it crosses the floor (24.0 presync) | bounded HOLD: full pages below the floor are held (linkage+PoW only), released when the chain crosses it, abandoned only at a memory bound of 1,000 pages / 162 MB mapped per fetch (`hdr_lowwork.c`, CC-5, `799fba3`, bound fixed `4c3e8fc`: the first cut abandoned after FOUR pages, which abandoned every honest sync below ~880k — seen on the CC-8 replay); Core's bit-commitment presync not replicated | **DONE** (stage 1) |
 | Checkpoints | still present for the early chain | present | **DONE** |
 | Stale-tip detection | warn + extra outbound | same (CC-6) | **DONE** |
