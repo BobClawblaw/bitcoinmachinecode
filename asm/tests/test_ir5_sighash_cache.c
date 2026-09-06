@@ -139,13 +139,26 @@ int main(void){
             alarm(300);
             { cpu_set_t one; CPU_ZERO(&one); CPU_SET(0, &one); sched_setaffinity(0, sizeof one, &one); }   /* one core */
             const char* r = "";
-            struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+            /* 2026-09-06: the bound is on CPU time, not wall clock. The point
+             * of this check is that the memo removes the per-signature
+             * aggregate recompute -- work done, not seconds elapsed. Pinning
+             * to one core does not stop OTHER processes sharing it: with a
+             * full-sync benchmark and a verification replay on the box (load
+             * 11-13) this same verification measured 4286 ms of wall clock
+             * and failed the gate, while on an idle core it takes ~625 ms.
+             * CPU time measures this process's own work either way. Wall
+             * clock is still printed, so a genuinely slow run is visible. */
+            struct timespec a, b, ca, cb;
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ca);
             int ok = tx_verify_at_height(full, fl, 900000, resolve_p2wpkh, NULL, &r);
+            clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cb);
             clock_gettime(CLOCK_MONOTONIC, &b);
-            double ms = (b.tv_sec-a.tv_sec)*1e3 + (b.tv_nsec-a.tv_nsec)/1e6;
+            double wall_ms = (b.tv_sec-a.tv_sec)*1e3 + (b.tv_nsec-a.tv_nsec)/1e6;
+            double ms = (cb.tv_sec-ca.tv_sec)*1e3 + (cb.tv_nsec-ca.tv_nsec)/1e6;
             if (ok != 1){ printf("FAIL: C. %d-input P2WPKH tx rejected: %s\n", N, r); fflush(stdout); _exit(2); }
             if (ms > 2500.0){ printf("FAIL: C. %d real P2WPKH signatures verified on one core in %.0f ms (aggregates recomputed per signature; want < 2500)\n", N, ms); fflush(stdout); _exit(3); }
-            printf("ok  : C. %d real P2WPKH signatures verified on one core in %.0f ms\n", N, ms); fflush(stdout); _exit(0);
+            printf("ok  : C. %d real P2WPKH signatures verified on one core in %.0f ms of CPU (%.0f ms wall)\n", N, ms, wall_ms); fflush(stdout); _exit(0);
         }
         int st = 0; waitpid(pid, &st, 0); checks++;
         if (!(WIFEXITED(st) && WEXITSTATUS(st) == 0)){ if (WIFSIGNALED(st)) printf("FAIL: C. child killed by signal %d\n", WTERMSIG(st)); fails++; }
