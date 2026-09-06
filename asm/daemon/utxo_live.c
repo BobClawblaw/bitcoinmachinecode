@@ -176,9 +176,13 @@ long utxo_live_compact_threshold(void);
  * utxo_lsm_reload() (a full current-generation WAL replay) stays cheap. That
  * is the right trade when we are a few blocks behind -- and badly wrong for a
  * from-scratch or long-gap replay, where it is quadratic: every flush is
- * ~49k entries, every 12th flush triggers utxo_lsm_compact, and compact
- * merges ALL runs into one, i.e. rewrites the ENTIRE UTXO set. Cost per
- * compaction grows with the set while the trigger cadence stays fixed.
+ * ~49k entries, every 12th flush triggers a compaction, and until 79d4c9c
+ * (2026-08-31) that merged ALL runs into one, i.e. rewrote the ENTIRE UTXO
+ * set: cost per compaction grew with the set while the cadence stayed
+ * fixed. The merge is leveled now (compact_pick_now below: the newest runs
+ * by size ratio, the base only once the young tier reaches a quarter of
+ * it), which bounds the rewrite to O(recent); the bulk sizing stays because
+ * the flush count, the WAL replay and the reload cost are what it fixes.
  *
  * Measured in production on 2026-08-18: with a fixed ~590k UTXO ops between
  * compactions, wall time per compaction interval grew from ~2-4s at height
@@ -297,9 +301,11 @@ static void tm_fmt(char* out, size_t cap, const u64* v, u64 wall, u64 blocks){
              blocks ? (double)wall / 1e6 / (double)blocks : 0.0, (unsigned long long)blocks);
 }
 /* ---- compaction in the background ------------------------------------------
- * Compaction rewrites the whole live set -- 13 GB on production -- and used to
- * run inline in the apply path: a 3-5 minute stall every ~90 blocks, measured
- * 2026-08-31, invisible only because tip-following resumed afterwards. It
+ * Compaction used to rewrite the whole live set -- 13 GB on production -- and
+ * ran inline in the apply path: a 3-5 minute stall every ~90 blocks, measured
+ * 2026-08-31, invisible only because tip-following resumed afterwards. (The
+ * merge is leveled since 79d4c9c and a tail merge is a few MB, but a base
+ * rewrite is still the whole set, so it still belongs in the background.) It
  * touches nothing the applier mutates (immutable runs in, one run out, then
  * the manifest), so it runs in a forked child now while apply continues.
  *
@@ -673,6 +679,16 @@ void utxo_live_set_coinstats(csi_coin_fn add, csi_coin_fn rm,
                              void (*inval)(const char*), void (*commit)(long)){
     g_csi_add = add; g_csi_rm = rm; g_csi_inval = inval; g_csi_commit = commit;
 }
+/* Bulk catch-up (2026-09-06, UTXO_INLINE_BUILD_PERF_SCOPE.md "the MuHash fold
+ * is on the bulk connect path"): while the memtable is bulk-sized the index
+ * does not fold per coin at all -- ~6.4 billion 1.66 us folds on a fresh
+ * sync, the same order as the whole bulk phase. It is seeded ONCE from a
+ * walk of the set at the moment the node becomes caught up (the downshift
+ * below), exactly as csi_seed_from_walk does at boot. This hook is that
+ * moment; the observers above stay registered and inert (the index is
+ * invalid) until it fires. NULL outside the worker. */
+static void (*g_csi_caught_up)(void* lst, void* table, long height) = 0;
+void utxo_live_set_coinstats_caught_up(void (*fn)(void*, void*, long)){ g_csi_caught_up = fn; }
 
 extern long utxo_store_wal_drain(void* st);
 static int persist_applied_height(long h){
@@ -2811,17 +2827,25 @@ static int g_bulk_mode = 0;
  * printed and inert is the exact failure this codebase has shipped repeatedly;
  * it is wired now.
  *
- * BULK MODE COMPACTS LESS OFTEN, by a factor of four. A compaction rewrites
- * the ENTIRE live set (one big run; the merge folds the new ones into it),
- * through three read syscalls and several write syscalls per record -- about
- * 50 MB/s whatever the disk. Measured on signet mid catch-up: 15 compactions
- * an hour, ~105 s each, 44% of wall-clock spent rewriting a 5 GB set instead
- * of applying blocks. Every run carries a Bloom filter, so a lookup that
- * misses costs one filter probe per extra run; while far behind that is far
- * cheaper than the rewrites. Steady state is unchanged. */
+ * BULK MODE COMPACTS LESS OFTEN, by a factor of four. When this was written
+ * a compaction rewrote the ENTIRE live set (one big run; the merge folded the
+ * new ones into it), through three read syscalls and several write syscalls
+ * per record -- about 50 MB/s whatever the disk. Measured on signet mid
+ * catch-up: 15 compactions an hour, ~105 s each, 44% of wall-clock spent
+ * rewriting a 5 GB set instead of applying blocks. Since 79d4c9c the merge is
+ * leveled (compact_pick_now: only the newest tier, the base once the young
+ * tier reaches a quarter of it -- tests/test_utxo_tiered_compact measures
+ * 6.5x the set written over a growing set against 27x for all-runs-to-one),
+ * so the x4 buys less than it did; it stays because every run carries a
+ * Bloom filter, so a lookup that misses costs one filter probe per extra
+ * run, and while far behind that is far cheaper than any rewrite. Steady
+ * state is unchanged. */
 /* Test hook: g_bulk_mode is decided from the store at init, which a unit test
  * of the threshold arithmetic has no business setting up. */
 void utxo_live_test_set_bulk_mode(int on){ g_bulk_mode = on; }
+/* Read side (daemon/main.c decides whether the coinstats index seeds at boot
+ * or defers to the caught-up hook above). */
+int utxo_live_bulk_mode(void){ return g_bulk_mode; }
 
 long utxo_live_compact_threshold(void){
     long t = g_cfg.utxo_compact_threshold > 0 ? g_cfg.utxo_compact_threshold
@@ -3359,6 +3383,13 @@ long utxo_live_catchup(void* store_buf){
                 fprintf(stderr, "[utxo_live] WARNING: catch-up WAL flush did not complete (r=%ld, log_len=%llu of %llu): a restart before the next block will replay that tail into a steady-state memtable and be very slow -- daemon/flush_wal_tail is the manual remedy\n",
                         fr, (unsigned long long)g_utxo_lst.log_len, before_len);
         }
+        /* The coinstats index seeds HERE, from a walk of the now-caught-up
+         * set (see utxo_live_set_coinstats_caught_up). The set is quiescent
+         * exactly as at boot: this is the same thread, between blocks, with
+         * the batch checkpoint just persisted above; a background compaction
+         * (a separate process) never touches this process's manifest until
+         * compact_poll adopts it. Minutes on mainnet, once per process. */
+        if (g_csi_caught_up) g_csi_caught_up(&g_utxo_lst, g_utxo_table, g_applied_height);
     }
     if (applied > 0) {
         /* STAGE B: steady-state undo-data retention. Bounded and resumable

@@ -62,6 +62,7 @@
                                    * Core's chainparams -- the SAME parse the
                                    * script-flag path assembles against */
 #include "mempool_entry.h"
+#include "mempool_slot.h"    /* the structural mempool's slot layout */
 #include "rpc_commands.h"
 #include "version_gen.h"
 
@@ -1019,11 +1020,11 @@ static long gbt_slot(void* mp, unsigned long i, gbt_ent* e){
     u8* m = (u8*)mp;
     unsigned long long mask; memcpy(&mask, m+8, 8);
     if (i > mask) return -1;
-    u8* sl = m + 40 + i*48;
+    u8* sl = MPOOL_SLOT_AT(m, i);
     unsigned long long len; memcpy(&len, sl, 8);
-    if (len == 0xFFFFFFFFFFFFFFFFULL) return 0;
+    if (len == MPOOL_SLOT_EMPTY) return 0;
     u8* blob; memcpy(&blob, m+16, 8);
-    unsigned long long off; memcpy(&off, sl+40, 8);
+    unsigned long long off; memcpy(&off, sl+MPOOL_SLOT_OFF, 8);
     e->txid = sl+8; e->tx = blob+off; e->len = (unsigned long)len;
     return 1;
 }
@@ -4337,6 +4338,14 @@ static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, con
     static char msg[256];
     long r = 0;
     if (g_csi_run) r = g_csi_run(want_muhash, &o, msg, sizeof msg);
+    /* -2 (2026-09-06, fold worker): the index EXISTS but cannot answer for
+     * the applied height yet -- the fold worker's watermark is behind the
+     * connect thread's last commit (waited, still behind), or the index is
+     * deferred for the whole bulk catch-up. Refuse, in Core's warm-up code;
+     * do NOT fall through to the walk reader, which would either refuse as
+     * busy or spend minutes walking a set the index is seconds from
+     * describing. */
+    if (r == -2){ *ec = -28; snprintf(embuf, sizeof embuf, "%s", msg[0] ? msg : "coinstats index not ready"); *em = embuf; return 0; }
     if (r != 1 && g_usi_run) r = g_usi_run(want_muhash, &o, msg, sizeof msg);
     if (r == 0){ *ec = -1; snprintf(embuf, sizeof embuf, "%s", msg[0] ? msg : "UTXO set busy"); *em = embuf; return 0; }
     if (r != 1){ *ec = -1; snprintf(embuf, sizeof embuf, "%s", msg[0] ? msg : "UTXO set read failed"); *em = embuf; return 0; }

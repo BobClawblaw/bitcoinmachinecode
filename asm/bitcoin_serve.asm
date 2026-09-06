@@ -167,9 +167,9 @@ s_txptr:   dq 0                    ; block_tx_at output pointer
 s_txlen:   dq 0                    ; block_tx_at output length
 s_j:       dq 0                    ; loop counter j (blocktxn assembly)
 ; ---- mempool for tx relay (static; initialized once in node_serve_loop) ----
-; struct+slots: 40 + slots*48 ; use 1024 slots
+; struct+slots: 40 + slots*80 + 8 (mpool_struct_size; 80-byte slots carry the cached wtxid) ; use 1024 slots
 MP_SLOTS equ 1024
-mp_area:   times (40 + 1024*48 + 8) db 0
+mp_area:   times (40 + 1024*80 + 8) db 0
 mp_blob:   times (2<<20) db 0           ; 2 MiB tx storage -- FALLBACK only
 mp_initdone: db 0
 ; ---- runtime-sized mempool (Core -maxmempool) ---------------------------

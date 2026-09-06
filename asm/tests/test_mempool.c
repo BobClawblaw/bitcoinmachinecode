@@ -84,7 +84,7 @@ int main(void){
      * neither. The pool is MAP_SHARED and daemon/tx_accept.c's verification
      * path reads it WITHOUT mp_lock, so a concurrent mpool_del in another
      * process can be mid-move when this reader matches: del copies a whole
-     * 48-byte record with one mcopy, and the txid sits at +8..39 while
+     * 80-byte record with one mcopy, and the txid sits at +8..39 while
      * blob_off sits at +40, so there is a window where the NEW occupant's
      * txid has landed but its blob_off has not. The reader then pairs the new
      * `len` with the STALE `blob_off` of the slot being emptied.
@@ -103,11 +103,11 @@ int main(void){
         unsigned long l = 0;
         /* tid1 is a live entry; corrupt its slot the way a torn del would.
          * Slot layout (bitcoin_mempool.asm header): +40 is the first slot,
-         * 48 bytes each, [+0 len][+8 txid[32]][+40 blob_off]. Find it by txid
-         * rather than assuming a probe position. */
+         * 80 bytes each, [+0 len][+8 txid[32]][+40 blob_off][+48 wtxid[32]].
+         * Find it by txid rather than assuming a probe position. */
         unsigned char* slot = NULL;
         for (unsigned long q = 0; q < slots; q++){
-            unsigned char* cand = mp + 40 + q * 48;
+            unsigned char* cand = mp + 40 + q * 80;
             if (memcmp(cand + 8, tid1, 32) == 0){ slot = cand; break; }
         }
         ck(slot != NULL, "MEM-21 located tid1's slot");

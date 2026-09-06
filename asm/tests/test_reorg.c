@@ -969,7 +969,7 @@ static void case_mempool(void){
     store_chain(nbase, nlose);
 
     /* mempool + policy */
-    static u8 mp[40 + 1024*48 + 8];
+    static u8 mp[40 + 1024*80 + 8];
     static u8 mpblob[1<<20];
     mpool_init(mp, 1024, mpblob, sizeof mpblob);
     static u8 pol[128];
@@ -1212,7 +1212,7 @@ static void case_mempool_ghosts(void){
      * every lookup here is expected to miss. */
     build_base(3, 0x207fffffu);
     harness_open();
-    static u8 mp[40 + 16384*48 + 8];
+    static u8 mp[40 + 16384*80 + 8];
     static u8* mpblob;
     if (!mpblob) mpblob = (u8*)malloc(32u<<20);
     ckm("ghost fixture blob allocated", mpblob != NULL);
@@ -1275,7 +1275,7 @@ static void case_mempool_wired(void){
     harness_open();
     store_chain(nbase, nlose);
 
-    static u8 mp[40 + 1024*48 + 8];
+    static u8 mp[40 + 1024*80 + 8];
     static u8 mpblob[1<<20];
     mpool_init(mp, 1024, mpblob, sizeof mpblob);
     static u8 pol[128];

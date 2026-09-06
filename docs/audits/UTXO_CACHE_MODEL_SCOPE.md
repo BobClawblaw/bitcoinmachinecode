@@ -34,7 +34,7 @@ block archive.
 | `CCoinsViewCache` | the memtable: 48-byte slots + a blob; 4M slots / 1 GB in bulk mode, 64k / 64 MB in steady state | `bitcoin_utxo.asm`, `utxo_live.c:166-197` |
 | — (none) | **`utxo.dat`, a WAL**: every PUSH and DEL appended; **checkpoint** (`utxo.idx`) fsyncs both files every 64 blocks or 2 s | `bitcoin_utxo_store.asm`, `utxo_live.c:2891` |
 | LevelDB | immutable sorted **runs** with Bloom filters and a crash-safe manifest; a *flush* writes the memtable's live entries plus tombstones as a new run | `bitcoin_utxo_lsm.asm` |
-| leveled compaction | **all runs → one**: every compaction rewrites the entire set (13.4 GB today, one run) | `utxo_lsm_compact` |
+| leveled compaction | **size-tiered merge** since 79d4c9c (2026-08-31): `lsm_compact_pick` walks the manifest newest-first over the run files' sizes, a run joins the batch while it is at most 4x (`LSM_COMPACT_RATIO`) everything newer than it, and `utxo_lsm_compact_range` merges just that batch, keeping its tombstones when runs remain below it. The base is rewritten only once everything above it has grown to a quarter of it. (This document's first draft said "all runs → one"; that was stale on the day it was written -- see §4.2.) | `utxo_lsm_compact_range`, `daemon/lsm_manifest.c`, `compact_pick_now` in `utxo_live.c` |
 | re-connect from block files | `utxo_applied_height.dat` + WAL replay from the last checkpoint + undo-based unapply of a half-applied block | `utxo_live_recover_at_boot` |
 | single process, one lock | **many processes**: every inbound serve child and the RPC path take a read snapshot by replaying the current WAL generation (`utxo_lsm_reload`, `reload_ro`) | `tx_accept.c:5-8`, `utxo_setinfo_rpc.c` |
 
@@ -49,10 +49,12 @@ LSM. Three things differ, and they are the whole of this scope:
    ~600 tip-era blocks; an 8 GB `dbcache` flushes every ~100M coins. A
    smaller cache means more flushes *and* a lower hit rate for spends of
    older outputs (each miss is a Bloom-gated run lookup).
-3. **Compaction.** All-runs-to-one rewrites 13 GB per compaction; the
-   trigger is a fixed run count, so during a full sync the set is
-   rewritten many times over (the 2026-08-18 measurement in `utxo_live.c`
-   is what led to bulk mode and background compaction).
+3. **Compaction.** Already tiered (79d4c9c): a compaction rewrites the
+   young tier, and the base only when the young tier has reached a quarter
+   of it. The all-runs-to-one merge that the 2026-08-18 measurement in
+   `utxo_live.c` describes (and that led to bulk mode and background
+   compaction) is the negative control now, not the shipped path -- see
+   §4.2 for the measured numbers.
 
 Fresh-coin elision, the property that sounds like the big one, we already
 have at flush time: a coin created and spent within one memtable
@@ -107,15 +109,52 @@ transition) and only its thresholds change.
   equivalent. The knob, not a constant; the RSS on the bench re-run decides
   the default.
 
-### 4.2 Compaction: stop rewriting the whole set
+### 4.2 Compaction: stop rewriting the whole set — already landed
 
-Replace all-runs-to-one with a **size-tiered merge**: merge the newest
-runs into one when their count exceeds the threshold, but leave the oldest
-large run alone until the merged younger runs approach its size. Lookups
-still walk newest-first through Bloom filters, so read cost grows only
-with the number of *tiers* (2–3), not the number of runs. This is the
-change that turns the per-compaction cost from O(set) into O(recent). It is
-independent of §4.1 and worth doing on its own numbers.
+**Correction (2026-09-06):** this section was written as if compaction were
+still all-runs-to-one. It was not: commit 79d4c9c (2026-08-31, "utxo:
+leveled compaction -- merge the newest runs by size ratio, keep their
+tombstones") landed six days before this document. What the code does:
+
+- `utxo_lsm_compact_range(lst, lo, k)` (`bitcoin_utxo_lsm.asm`) merges
+  manifest entries `[lo, lo+k)` into one run that takes index `lo`, through
+  the same streaming k-way merge and scratch layout as the full merge.
+  `lo == 0` is the classic base merge; `lo > 0` must end at the newest run
+  (a merge in the middle would put a fresh-generation run below older
+  survivors and break the gen-ascending order `utxo_lsm_get` scans). The
+  emit rule is "PUSH always; DEL only when runs exist below the batch": a
+  tail merge **keeps** its tombstones -- they still cancel puts in the runs
+  below, including the copy an in-batch PUT was shadowing (the BIP30 /
+  reorg shapes) -- and a batch anchored at the oldest run drops them, as
+  before, because nothing is below it.
+- `lsm_compact_pick` (`daemon/lsm_manifest.c`) chooses the batch from the
+  run files' sizes: walking from the newest run backwards, a run joins
+  while it is at most `LSM_COMPACT_RATIO` (4) times everything newer than
+  it combined; the first run that dwarfs the rest stops the walk. So
+  fresh runs fold into a medium one, the medium joins once the smalls reach
+  a quarter of it, and the base is rewritten only when everything above it
+  has grown to a quarter of the base. `lsm_compact_pick_budget` adds the
+  RAM-budget rule (above 35% of MemTotal in run files the count threshold
+  becomes 2). `compact_pick_now` in `utxo_live.c` applies it for the forked
+  background merge and for the boot-time pre-catch-up compaction.
+
+Lookups still walk newest-first through Bloom filters, so read cost grows
+with the number of *tiers*, not runs. **Measured** (`tests/test_utxo_tiered_compact`,
+deterministic: 160 flushes of ~350 KB into a set that grows to 51.8 MB,
+compact at 4 runs, spends aimed at every tier plus reorg- and BIP30-shaped
+keys): the tiered policy ran 87 compactions -- 74 tail merges, 13 base
+rewrites -- and wrote 335.6 MB, **6.5x** the final set; a tail merge's
+output never exceeded its own inputs (+ Bloom rounding) and was under a
+quarter of what was on disk (max 8.0 MB against 51.8 MB). The all-runs-to-one
+control on the same workload ran 53 compactions and wrote 1394.5 MB,
+**27.1x** the final set -- 4.15x the tiered total at this size, and the gap
+widens with the set because the control is quadratic. Both end with the
+identical live set. The earlier bench in 79d4c9c's message (500 MB set,
+compact at 12) measured 22.5x vs 5.3x.
+
+What remains open in this section is only the trigger: the count threshold
+(`bmc.utxocompactthreshold`, x4 in bulk mode) and the RAM budget decide
+*when*; the ratio decides *what*. Neither is gated on §4.1.
 
 ### 4.3 What does not change
 
@@ -151,11 +190,16 @@ and it should be decided by the instrumentation, not by the analogy.
   (muhash equality against an uninterrupted run). **Negative control**: the
   same kills against today's WAL mode recover through the WAL path, and the
   two modes reach the same muhash.
-- `test_utxo_tiered_compact` (gated): runs of known sizes; the merge policy
-  touches only the tiers it should; lookups through every tier resolve
-  tombstones correctly (the existing `test_utxo_lost_tombstones*` suites
-  extended, not replaced); **negative control**: all-runs-to-one on the same
-  input, same resulting set.
+- `test_utxo_tiered_compact` (gated, landed 2026-09-06): runs of known
+  sizes through the real flush path; the policy touches only the tier it
+  should (identity and bytes of the runs below every batch); lookups and
+  the full walk resolve every key and every tombstone through every tier
+  (the `test_lsm_lost_tombstones` / `test_utxo_lost_tombstones` cases
+  extended across tiers with reorg- and BIP30-shaped keys); bytes written
+  per compaction are bounded by the batch's inputs; **negative control**:
+  all-runs-to-one on the same input, same resulting set, 4x the bytes.
+  Watched to fail twice on scratch copies: ratio disabled (every pick the
+  whole manifest) and `keep_dels` forced off (14,480 resurrected spends).
 - The existing crash and checkpoint suites unchanged for steady state.
 - **Proof**: the benchmark re-run with the perf scope's interleave *and*
   cache mode, reporting the bulk phase's write volume (from `/proc/<pid>/io`,
@@ -184,7 +228,7 @@ and it should be decided by the instrumentation, not by the analogy.
 
 1. Perf scope step 0 (instrumentation) — it decides whether §4.1 is worth
    its risk. Nothing here starts before those numbers exist.
-2. §4.2 tiered compaction: independent, its own numbers, lower risk.
+2. §4.2 tiered compaction: landed (79d4c9c) and now measured; nothing left to build here.
 3. §4.1 cache mode, behind `bmc.utxocache` with WAL mode as the default
    until the re-run says otherwise.
 4. The benchmark re-run, both halves, and the `assumevalid=0` chart.
