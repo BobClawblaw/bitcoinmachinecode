@@ -31,7 +31,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | BIP30, BIP34, BIP65, BIP66, BIP68/112/113, nBits schedule | height/MTP activations | same; nBits replayed against every mainnet + testnet4 header | **DONE** |
 | `MAX_MONEY`, coinbase maturity, sigops per block (80,000) | | same (VAL-2, SCR-6) | **DONE** |
 | `assumevalid` | skip scripts at/below a pinned block; `=0` verifies all | both modes, per-chain defaults | **DONE** |
-| **Full-verification replay of mainnet** (`assumevalid=0`) | Core has been run this way by many parties | **never run here**. Two false-accepts found in 2026-09-05 sat *below* the assumevalid height — the region a default sync never executes | **PROOF** |
+| **Full-verification replay of mainnet** (`assumevalid=0`) | Core has been run this way by many parties | **never completed here**. Two false-accepts found on 2026-09-05 sat *below* the assumevalid height — the region a default sync never executes. Run reached **744,367 of 965,599 blocks (77%)** on 2026-09-06 and is PARKED at that archive to give the box to the fresh-sync benchmark; it resumes with the same command | **PROOF** |
 | `assumeutxo` snapshot load | `loadtxoutset` | absent | **DECIDED** (`FEATURE_GAPS.md` "genuinely still open": large lift, no need) |
 | UTXO set identity | | MuHash byte-identical to Core at two heights on two datadirs; re-runnable (`validation/muhash_vs_core.sh`) | **DONE** |
 | Reorg handling, undo, crash consistency | | same; tested | **DONE** |
@@ -73,6 +73,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | BIP61 `reject` | removed in 0.20 | absent | **DONE** (parity by absence) |
 | BIP330 Erlay `sendtxrcncl` + reconciliation | negotiation + reconciliation (off by default) | negotiation only, wire-off | **DECIDED** (`FEATURE_GAPS.md` 2026-08-30 "deliberate stopping point") |
 | BIP331 package relay `sendpackages`/`pkgtxns`/`ancpkginfo` | **not shipped in Core** as of v30/v31: Core relays 1p1c packages *opportunistically* through orphan resolution, with no new messages | same: opportunistic 1p1c via `txr_orphan_resolve` sharing `submitpackage`'s validation; `sendpackages` recognised and ignored, as Core does | **DONE** (parity by absence; CC-9 decided 2026-09-06) |
+| `-blockversion` scope | honoured **only on chains that mine on demand** (regtest): `node/miner.cpp:148` guards it with `chainparams.MineBlocksOnDemand()` | applied wherever it is set (`rpc_chain.c`, `g_gbt_version`), so a mainnet operator can change the version this node puts in `getblocktemplate` where Core would ignore them. Found by the 2026-09-06 config audit | **GAP** (behavioural; needs a decision, not a default change) |
 | Misbehavior scoring + ban list | `Misbehaving()`, discouragement, `banlist.json` persisted | scored for inv/getdata bounds, header rules, tx violations via `txr_report_violation`; shared in-memory ban list (`ctl_ban_add`), **not persisted across restart** (re-grep 2026-09-06: no banlist file) | **PARTIAL** |
 
 ## 4. P2P behavior — connections and relay
