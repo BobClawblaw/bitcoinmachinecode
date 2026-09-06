@@ -204,6 +204,98 @@ long utxo_live_compact_threshold(void);
 static void* g_utxo_table = 0;
 
 struct lsm_state g_utxo_lst;
+
+/* ---- per-block cost instrumentation (docs/audits/UTXO_INLINE_BUILD_PERF_SCOPE.md
+ * step 0, 2026-09-06) ---------------------------------------------------------
+ * Where a connect's wall time goes, per block, in nanoseconds, summed per
+ * progress tick and per process. Pure bookkeeping: nothing in this file
+ * branches on it, and utxo_live_set_timing(0) removes the clock reads too --
+ * every accumulator then stays exactly 0 (the negative control in
+ * tests/test_utxo_catchup_timing.c).
+ *   read    store_read_at of the block (utxo_live_catchup)
+ *   idx     Phase 0 parse + Phase 0.5 in-block outpoint index (apply_block_inner)
+ *   verify  tx_verify_block_connect_all minus its Phase 1 lookup pass
+ *   get     that lookup pass (bidx_get/utxo_lsm_get per input) + BIP30 gets
+ *   put     the Phase 5 walk (undo capture, utxo_lsm_put/del, buffered WAL)
+ *           minus any mac_flush inside it, plus the block-end WAL drain
+ *   ckpt    persist_applied_height (WAL fsync + tmp/fsync/rename/dirfsync)
+ *   flush   mac_flush stalls inside a put/del (timed from the flush hook to
+ *           the put's return -- the flush is the tail of the put) plus
+ *           compact_poll/compact_start_async per block (the inline-compaction
+ *           fallback lands here; a background compaction's own time does not,
+ *           apply never waits for it)
+ *   csi     the coinstats-index MuHash fold: csi_on_add per created output
+ *           (g_csi_add, live_on_output) and csi_on_remove per spent input
+ *           (undo_log.c's coin observer, inside undo_capture_and_del) --
+ *           ~1.7 us of 3072-bit modmul per coin whenever the index is valid,
+ *           which on a fresh sync is from height 0. Also subtracted from
+ *           `put`. Its per-block commit (g_csi_commit) runs inside
+ *           persist_applied_height and so lands under `ckpt`.
+ *   wall    the whole utxo_live_catchup call; "other" on the log line is
+ *           wall - sum (ledgers, BIP68, hooks, the progress line itself)
+ * Not split out: the second per-input utxo_lsm_get inside
+ * undo_capture_and_del is part of `put` -- separating it would cost two clock
+ * reads per input. Known slop: a flush that fires inside undo_capture_and_del
+ * is timed to the CALLER's return, so the one fold after that del (~2 us)
+ * lands in both `flush` and `csi` -- noise against a flush, and `put` absorbs
+ * it (saturating), so the phases never sum past the wall. About a dozen
+ * clock_gettime(CLOCK_MONOTONIC) per block, plus two per coin for `csi` (a
+ * 40 ns pair against a 1.7 us fold). */
+enum { TM_READ, TM_IDX, TM_VERIFY, TM_GET, TM_PUT, TM_CKPT, TM_FLUSH, TM_CSI, TM_WALL, TM_N };
+static int g_tm_on = 1;
+static u64 g_tm_tick[TM_N], g_tm_total[TM_N];
+static u64 g_tm_total_blocks = 0;
+static u64 g_tm_flush_t0 = 0;
+static int g_tm_flush_armed = 0;
+extern unsigned long long txvb_last_resolve_ns(void);   /* daemon/tx_verify.c */
+extern void txvb_set_timing(int on);
+extern unsigned long long undo_coin_observer_ns(void);  /* daemon/undo_log.c */
+extern void undo_set_coin_observer_timing(int on);
+static inline u64 tm_now(void){
+    if (!g_tm_on) return 0;
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (u64)t.tv_sec * 1000000000ULL + (u64)t.tv_nsec;
+}
+static inline void tm_add(int k, u64 ns){ g_tm_tick[k] += ns; g_tm_total[k] += ns; }
+/* book phase k from t0 to now; returns now, the next phase's t0 */
+static inline u64 tm_lap(int k, u64 t0){ u64 t1 = tm_now(); tm_add(k, t1 - t0); return t1; }
+/* after a put/del: if mac_flush ran inside it (the hook armed us), book the
+ * flush's span -- the walk's own lap subtracts it from `put` */
+static inline void tm_flush_check(void){
+    if (!g_tm_flush_armed) return;
+    g_tm_flush_armed = 0;
+    u64 t1 = tm_now();
+    if (t1 > g_tm_flush_t0) tm_add(TM_FLUSH, t1 - g_tm_flush_t0);
+}
+void utxo_live_set_timing(int on){
+    g_tm_on = on; txvb_set_timing(on); undo_set_coin_observer_timing(on); g_tm_flush_armed = 0;
+}
+void utxo_live_timing_reset(void){
+    memset(g_tm_tick, 0, sizeof g_tm_tick); memset(g_tm_total, 0, sizeof g_tm_total);
+    g_tm_total_blocks = 0;
+}
+/* phase 0..8 in the enum's order (8 = wall of the catch-up calls), in
+ * microseconds since the last reset; 9 = blocks applied by those calls.
+ * Anything else -> 0. apply paths outside utxo_live_catchup (reorg
+ * reconnect, the dry-run) add to the phases but not to wall or blocks. */
+unsigned long long utxo_live_timing_us(int phase){
+    if (phase == TM_N) return g_tm_total_blocks;
+    if (phase < 0 || phase >= TM_N) return 0;
+    return g_tm_total[phase] / 1000ULL;
+}
+static void tm_fmt(char* out, size_t cap, const u64* v, u64 wall, u64 blocks){
+    if (!g_tm_on){ snprintf(out, cap, "timing off"); return; }
+    u64 sum = 0;
+    for (int k = 0; k < TM_WALL; k++) sum += v[k];
+    u64 other = wall > sum ? wall - sum : 0;
+    double d = wall ? (double)wall : 1.0;
+    snprintf(out, cap,
+             "read %.0f%% idx %.0f%% verify %.0f%% get %.0f%% put %.0f%% ckpt %.0f%% flush %.0f%% csi %.0f%% other %.0f%% (%.2f ms/blk over %llu)",
+             100.0*(double)v[TM_READ]/d, 100.0*(double)v[TM_IDX]/d, 100.0*(double)v[TM_VERIFY]/d,
+             100.0*(double)v[TM_GET]/d, 100.0*(double)v[TM_PUT]/d, 100.0*(double)v[TM_CKPT]/d,
+             100.0*(double)v[TM_FLUSH]/d, 100.0*(double)v[TM_CSI]/d, 100.0*(double)other/d,
+             blocks ? (double)wall / 1e6 / (double)blocks : 0.0, (unsigned long long)blocks);
+}
 /* ---- compaction in the background ------------------------------------------
  * Compaction rewrites the whole live set -- 13 GB on production -- and used to
  * run inline in the apply path: a 3-5 minute stall every ~90 blocks, measured
@@ -299,7 +391,10 @@ static void compact_poll(void){
 /* mac_flush's gate: a flush is about to rewrite the manifest. It no longer
  * waits for anything -- run numbers are reserved, adoption reconciles -- it
  * just adopts a finished child first so the flush builds on the merged set. */
-static void compact_flush_hook(void){ compact_poll(); }
+static void compact_flush_hook(void){
+    if (g_tm_on){ g_tm_flush_t0 = tm_now(); g_tm_flush_armed = 1; }   /* step-0 timing: the flush starts here */
+    compact_poll();
+}
 /* Leveled: which runs to merge, by size ratio (lsm_compact_pick). Sizes come
  * from the run files themselves. Returns k, sets *lo. */
 /* Byte budget for the mapped run files: 45% of MemTotal by default (the
@@ -658,6 +753,7 @@ static void live_on_input(void* ctxv, const u8 txid[32], u32 index){
          * prevout is how a re-applied (crash-resumed) block legitimately
          * reads back. */
         long r = undo_capture_and_del(&g_utxo_lst, g_utxo_table, g_apply_height, txid, index);
+        tm_flush_check();
         if (r == -1) ctx->fatal = 1;
         /* Incident 2026-09-01 (the 2,596 resurrected coins): a 0 here used to be
          * silently accepted as "already absent, re-applied block". That rationale
@@ -685,6 +781,7 @@ static void live_on_input(void* ctxv, const u8 txid[32], u32 index){
     }
     if (g_csi_inval) g_csi_inval("spend outside undo capture (bulk mode)");
     long r = utxo_lsm_del(&g_utxo_lst, g_utxo_table, txid, index);
+    tm_flush_check();
     if (r == -1) ctx->fatal = 1;
 }
 
@@ -738,9 +835,12 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
      * the second put writes the new one, which is what the WAL replays in
      * order on reload. Live-count is unchanged (one del, one put) because the
      * outpoint exists both before and after. */
-    if (r == 1 && g_csi_add)
+    if (r == 1 && g_csi_add){
+        u64 tm_a0 = tm_now();
         g_csi_add(ctx->txid, out_index, value, (u64)g_apply_height,
                   (u64)ctx->is_coinbase, script, slen);
+        tm_lap(TM_CSI, tm_a0);
+    }
     if (r == 0 && ctx->is_coinbase) {
         /* the OLD coin's fields are not in scope here, so this overwrite's
          * remove-event cannot be described -- pre-BIP34 heights only, which
@@ -771,6 +871,7 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
      * block continue with the coin written nowhere. The asm now sign-extends;
      * testing the SIGN rather than one exact value means a future widening
      * cannot silently reopen it. */
+    tm_flush_check();
     if (r < 0 || r == 2) ctx->fatal = 1;   /* <0 I/O error, 2 table full (undersized memtable) */
 }
 
@@ -1511,6 +1612,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         if (pr != 1){ g_last_reject = "bad-diffbits"; return 0; }
     }
 
+    u64 tm_t = tm_now();   /* step-0 timing: phase laps from here (see the enum) */
     /* ---- Phase 0: parse every tx once (same tx_parse this loop always
      * used), building the tx array tx_verify.c also consumes. txs/pn_outs
      * are persistent, process-lifetime arenas (grown, never freed -- see
@@ -1744,6 +1846,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      *
      * On mainnet the gate is off from height 227,932 to 1,983,701, so for a
      * node replaying the current chain this loop does not run at all. ---- */
+    tm_t = tm_lap(TM_IDX, tm_t);     /* parse (+ the signet check) */
     if (bip30_enforced(g_apply_height, blk_hash)) {
         for (u64 t=0; t<ntx; t++){
             for (u32 o=0; o<pn_outs[t]; o++){
@@ -1761,6 +1864,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         }
     }
 
+    tm_t = tm_lap(TM_GET, tm_t);     /* BIP30 lookups (none on the modern chain) */
     /* ---- Phase 0 cont'd / Phase 0.5: in-block output index + whole-block
      * duplicate-outpoint check, in one pass over the already-parsed array.
      * See this file's own header comment above and tx_verify.c's for why.
@@ -1810,8 +1914,16 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * signatures, block-wide. Nothing applied yet -- a reject here needs no
      * rollback either. ---- */
     u64 fail_tx = 0; const char* reason = "?";
-    if (!tx_verify_block_connect_all(txs, ntx, g_apply_height, blk_hash,
-                                     &g_utxo_lst, g_utxo_table, &bx, &fail_tx, &reason)) {
+    tm_t = tm_lap(TM_IDX, tm_t);     /* the Phase 0.5 index build */
+    int vok = tx_verify_block_connect_all(txs, ntx, g_apply_height, blk_hash,
+                                          &g_utxo_lst, g_utxo_table, &bx, &fail_tx, &reason);
+    {   /* connect_all = its Phase 1 lookup pass (get) + everything else (verify) */
+        u64 t1 = tm_now(), span = t1 - tm_t;
+        u64 rs = g_tm_on ? (u64)txvb_last_resolve_ns() : 0;
+        if (rs > span) rs = span;
+        tm_add(TM_GET, rs); tm_add(TM_VERIFY, span - rs); tm_t = t1;
+    }
+    if (!vok) {
         fprintf(stderr, "[utxo_live] REJECT h=%ld tx=%lu: %s\n", g_apply_height, (unsigned long)fail_tx, reason);
         g_last_reject = reason;    /* tx_verify's own string, verbatim */
         return 0;
@@ -2002,6 +2114,9 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * only case that still needs rollback_partial_apply -- everything above
      * ran before any put/del happened. ---- */
     apply_ctx_t ctx = { 0, 0 };
+    /* put = the walk minus the flushes and the coinstats folds inside it */
+    u64 tm_p0 = tm_now(), tm_f0 = g_tm_total[TM_FLUSH], tm_c0 = g_tm_total[TM_CSI];
+    u64 tm_o0 = g_tm_on ? (u64)undo_coin_observer_ns() : 0;
     for (u64 t=0; t<ntx && !ctx.fatal; t++){
         ctx.txid = txs[t].txid;
         ctx.is_coinbase = (t == 0);
@@ -2010,6 +2125,10 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         if (!wok || ctx.fatal) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
         if (wnin != txs[t].pn_in || wnout != pn_outs[t]) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
     }
+    {   u64 span = tm_now() - tm_p0;
+        if (g_tm_on) tm_add(TM_CSI, (u64)undo_coin_observer_ns() - tm_o0);   /* the remove-side folds */
+        u64 inner = (g_tm_total[TM_FLUSH] - tm_f0) + (g_tm_total[TM_CSI] - tm_c0);
+        tm_add(TM_PUT, span > inner ? span - inner : 0); }
     if (!ctx.fatal && g_mined_cb)
         for (u64 t=0; t<ntx; t++) g_mined_cb(txs[t].txid);
     return ctx.fatal ? 0 : 1;
@@ -2055,8 +2174,11 @@ static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height);
  * rollback, the next block's undo file -- sees a complete on-disk record. */
 static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
     int r = apply_block_at_inner(blockbuf, blocklen, height);
+    u64 tm_d0 = tm_now();
     undo_close_current();
-    if (utxo_store_wal_drain(&g_utxo_lst) != 0) {
+    int drain_bad = (utxo_store_wal_drain(&g_utxo_lst) != 0);
+    tm_lap(TM_PUT, tm_d0);           /* the block-end WAL write is part of put */
+    if (drain_bad) {
         fprintf(stderr, "[utxo_live] FATAL: WAL drain failed after height %ld\n", height);
         g_last_fail_kind = UTXO_FAIL_STORE; g_last_fail_height = height;
         return 0;
@@ -2072,6 +2194,7 @@ static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
 }
 static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height){
     g_apply_height = height;
+    g_tm_flush_armed = 0;   /* a flush outside a block's walk (caught-up tail, a test's) is not this block's */
     { int on = (g_assumevalid_height < 0 || height > g_assumevalid_height);
       tx_verify_set_script_checks(on);
       if (on && g_assumevalid_height >= 0 && !g_av_announced_end){ g_av_announced_end = 1;
@@ -2906,7 +3029,10 @@ int utxo_live_ckpt_due(long h, long tip, long unpersisted, long long now_ms, lon
     return 0;
 }
 static int ckpt_now(void){
-    if (!persist_applied_height(g_applied_height)) return 0;
+    u64 tm_c0 = tm_now();
+    int ok = persist_applied_height(g_applied_height);
+    tm_lap(TM_CKPT, tm_c0);
+    if (!ok) return 0;
     g_ckpt_since = 0; g_ckpt_last_ms = mono_ms();
     return 1;
 }
@@ -2940,8 +3066,15 @@ long utxo_live_catchup(void* store_buf){
      * figure swing 0..80 blk/s), ETA as DD:HH:MM:SS of the remaining gap. */
     long long cu_t0 = mono_ms(), cu_last_ms = cu_t0;
     long cu_h0 = g_applied_height, cu_last_h = g_applied_height;
+    /* step-0 timing: this call's phase totals are (process total at exit) -
+     * (at entry); the tick totals restart at every progress line. */
+    u64 tm_call0[TM_N]; memcpy(tm_call0, g_tm_total, sizeof tm_call0);
+    u64 tm_call_t0 = tm_now(), tm_tick_t0 = tm_call_t0;
+    memset(g_tm_tick, 0, sizeof g_tm_tick);
     for (long h = g_applied_height + 1; h <= tip; h++){
+        u64 tm_r0 = tm_now();
         long len = store_read_at(store_buf, h, blockbuf, sizeof blockbuf);
+        tm_lap(TM_READ, tm_r0);
         if (len < 81) {
             fprintf(stderr, "[utxo_live] WARNING: hole/short block at height %ld (len=%ld) -- stopping catch-up short\n", h, len);
             g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = h;
@@ -2949,6 +3082,7 @@ long utxo_live_catchup(void* store_buf){
         }
         if (!apply_block_at(blockbuf, (u64)len, h)) {
             fprintf(stderr, "[utxo_live] FATAL: apply_block failed at height %ld -- stopping catch-up\n", h);
+            tm_lap(TM_WALL, tm_call_t0); if (g_tm_on) g_tm_total_blocks += (u64)applied;
             return -1;
         }
         /* Block h is now fully durable in the WAL but NOT yet checkpointed:
@@ -3055,8 +3189,13 @@ long utxo_live_catchup(void* store_buf){
                 char etabuf[32];
                 if (eta >= 0) snprintf(etabuf, sizeof etabuf, "%02ld:%02ld:%02ld:%02ld", eta / 86400, (eta / 3600) % 24, (eta / 60) % 60, eta % 60);
                 else          snprintf(etabuf, sizeof etabuf, "--:--:--:--");
-                fprintf(stderr, "[utxo_live] catchup progress: height=%ld/%ld (%.1f%%) %.1f blk/s (avg %.1f) eta %s\n",
-                        h, tip, tip > 0 ? 100.0 * (double)h / (double)tip : 0.0, inst, avg, etabuf);
+                /* step-0 timing: where this tick's wall went, per phase */
+                char tmbuf[256];
+                { u64 tnow = tm_now();
+                  tm_fmt(tmbuf, sizeof tmbuf, g_tm_tick, tnow - tm_tick_t0, (u64)(h - cu_last_h));
+                  memset(g_tm_tick, 0, sizeof g_tm_tick); tm_tick_t0 = tnow; }
+                fprintf(stderr, "[utxo_live] catchup progress: height=%ld/%ld (%.1f%%) %.1f blk/s (avg %.1f) eta %s | %s\n",
+                        h, tip, tip > 0 ? 100.0 * (double)h / (double)tip : 0.0, inst, avg, etabuf, tmbuf);
                 cu_last_ms = nowms; cu_last_h = h;
                 last_progress_log = now;
             }
@@ -3070,8 +3209,10 @@ long utxo_live_catchup(void* store_buf){
          * del starts returning -1 (fatal, per live_on_output/live_on_input)
          * partway through -- observed in production: a from-scratch replay
          * (applied_height reset to -1) hit this wall at height 202134. */
+        u64 tm_k0 = tm_now();
         compact_poll();                                   /* adopt a finished background merge */
         compact_start_async(h, "mid-catchup");
+        tm_lap(TM_FLUSH, tm_k0);                          /* inline-fallback compaction, if any, lands here */
     }
     /* Caught up while bulk-sized: drop the flush thresholds back to
      * steady-state so the current WAL generation stops growing to bulk size.
@@ -3083,6 +3224,17 @@ long utxo_live_catchup(void* store_buf){
      * would not be. */
     if (g_ckpt_since && !ckpt_now())          /* loop exit of any kind: land the pending batch */
         fprintf(stderr, "[utxo_live] WARNING: failed to persist the batched checkpoint at height %ld\n", g_applied_height);
+    /* step-0 timing: the call's own breakdown, once. Two or more blocks so a
+     * steady-state one-block call (every ~10 min at the tip) stays one line. */
+    { u64 tm_wall = tm_lap(TM_WALL, tm_call_t0) - tm_call_t0;
+      if (g_tm_on) g_tm_total_blocks += (u64)applied;
+      if (applied >= 2) {
+          u64 v[TM_N]; for (int k = 0; k < TM_N; k++) v[k] = g_tm_total[k] - tm_call0[k];
+          char tmbuf[256]; tm_fmt(tmbuf, sizeof tmbuf, v, tm_wall, (u64)applied);
+          fprintf(stderr, "[utxo_live] catchup timing: %ld block(s) %ld..%ld in %.1fs -- %s\n",
+                  applied, g_applied_height - applied + 1, g_applied_height,
+                  (double)(mono_ms() - cu_t0) / 1000.0, tmbuf);
+      } }
     if (g_bulk_mode && g_applied_height >= tip) {
         unsigned long ss = 1UL << UTXO_LIVE_SLOTS_LOG2;
         g_utxo_lst.fill_threshold = (u64)ss * 3 / 4;

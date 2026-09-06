@@ -87,6 +87,28 @@ stalls. Summed per progress tick and printed with the existing
 range into a number per regime. This is also what tells us whether the
 levers in §4.3 are needed at all.
 
+**Landed 2026-09-06** (`daemon/utxo_live.c`, `tx_verify.c`, `undo_log.c`;
+`tests/test_utxo_catchup_timing`). Every progress tick now ends with
+`| read 3% idx 2% verify 61% get 9% put 14% ckpt 8% flush 3% csi 0% other 0%
+(N ms/blk over M)`, percentages of the tick's wall, and a call that applied
+two or more blocks ends with one `[utxo_live] catchup timing: ...` line with
+the same breakdown over the whole call. Phase definitions (the enum's own
+comment in `utxo_live.c` is the authority): `read` = `store_read_at`;
+`idx` = parse + the in-block index; `verify` = `tx_verify_block_connect_all`
+minus its Phase 1 lookup pass; `get` = that lookup pass + BIP30 gets;
+`put` = the apply walk (undo capture, put/del, buffered WAL) + the block-end
+WAL drain, minus the flushes and folds inside it; `ckpt` =
+`persist_applied_height` (WAL fsync + height file + the coinstats commit);
+`flush` = `mac_flush` inside a put/del + the per-block compaction poll/start
+(the inline fallback lands here; a background compaction's own time does
+not); `csi` = phase (h), `csi_on_add` per created output and
+`csi_on_remove` per spent input. Two things the scope's list did not say:
+the undo capture does a **second** `utxo_lsm_get` per input on the apply
+path (inside `put`, not `get` -- splitting it costs two clock reads per
+input), and the checkpoint is per block within 64 of the tip, so a small
+synthetic chain reads ~98% `ckpt`. `utxo_live_set_timing(0)` removes the
+clock reads; the counters then stay at zero.
+
 ### Finding while scoping the cache model (2026-09-06, evening): the MuHash fold is on the bulk connect path
 
 `coinstats_index.c`'s `csi_on_add` / `csi_on_remove` run for every created
@@ -115,6 +137,13 @@ largest single lever in this document, ahead of the WAL:
    (52-bit limb) variant behind the same CPU-dispatch pattern the SHA-NI
    path uses is 3–5×. Assembly work, cleanly separable, verified against the
    existing Core vectors (`tests/muhash_vectors.h`).
+
+**Found by step 0 (2026-09-06, instrumentation agent):** the apply path does
+a *second* `utxo_lsm_get` per input inside `undo_capture_and_del` (get → undo
+append → del), after the verify-side resolve already looked the same input
+up. Every input is looked up twice; the second is charged to `put`. Carrying
+the resolved coin from verify into apply is a lever in its own right, gated
+on the `get` share the breakdown reports.
 
 ### Step 1 — connect inside the download loop (the structural fix)
 

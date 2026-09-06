@@ -86,6 +86,7 @@
 #include <pthread.h>
 #include "../bmc_thread.h"
 #include <semaphore.h>
+#include <time.h>
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -1110,6 +1111,23 @@ const u64* txvb_last_tx_in_sums(u64* n_out){
     return g_tx_in_sums;
 }
 
+/* ---- per-call cost instrumentation (UTXO_INLINE_BUILD_PERF_SCOPE step 0,
+ * 2026-09-06). Phase 1 of tx_verify_block_connect_all is the block's UTXO
+ * LOOKUP pass (bidx_get, then utxo_lsm_get, per input, sequential);
+ * everything else in that call is script verification. daemon/utxo_live.c
+ * times the whole call and reads this to split "get" from "verify". Two
+ * clock reads per call, nanoseconds, zeroed at entry so an early return
+ * (coinbase-only block) reads as 0. txvb_set_timing(0) skips the clock reads
+ * entirely (the value stays 0). Nothing behavioural reads it. */
+static int g_txvb_timing = 1;
+static u64 g_txvb_resolve_ns = 0;
+void txvb_set_timing(int on){ g_txvb_timing = on; }
+unsigned long long txvb_last_resolve_ns(void){ return g_txvb_resolve_ns; }
+static inline u64 txvb_clock_ns(void){
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (u64)t.tv_sec * 1000000000ULL + (u64)t.tv_nsec;
+}
+
 /* bidx_get: exported by daemon/utxo_live.c -- same argument/return shape as
  * utxo_lsm_get, plus the CALLING tx's own 0-based block position. Returns
  * 1 hit / 0 miss (not resolvable in-block; caller falls back to
@@ -1706,6 +1724,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
                                 u64* fail_tx_index, const char** reason){
     static char g_rbuf[64];
     unsigned long long flags = script_flags_for_block((unsigned long long)height, block_hash32);
+    g_txvb_resolve_ns = 0;
 
     /* VAL-1 fees ledger (audit 2026-09-03): per-tx input sums, exported to
      * the caller's ConnectBlock fee/subsidy check through
@@ -1806,6 +1825,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
      * lookup) stays here -- it is the caller's coupling to storage, not
      * classification. Behavior byte-identical to the inline version. ---- */
     int has_taproot = 0;
+    u64 tm_resolve_t0 = g_txvb_timing ? txvb_clock_ns() : 0;
     for (u64 gi=0; gi<total_nin; gi++){
         txvb_in_t* in = &flat[gi];
         u32 index; memcpy(&index, in->outpoint+32, 4);
@@ -1825,6 +1845,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
             *fail_tx_index = in->tx_index; goto fail;
         }
     }
+    if (g_txvb_timing) g_txvb_resolve_ns = txvb_clock_ns() - tm_resolve_t0;
 
     /* ---- SCR-6 (audit 2026-09-03): finish the per-tx sigop COST ledger
      * (sized at the top of this function; the coinbase's legacy cost is
