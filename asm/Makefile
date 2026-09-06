@@ -1142,8 +1142,7 @@ DIALSRCS := tests/test_dial_budget.c daemon/private_broadcast.c daemon/utxo_live
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c daemon/tx_submit.c daemon/tx_relay.c daemon/tx_index_tail.c daemon/txosp_tail.c daemon/utxo_setinfo_rpc.c daemon/coinstats_index.c daemon/addr_self.c daemon/bfilter_index.c daemon/addr_index_tail.c wallet_store.c wallet_msgsign.c \
     daemon/serve_invbounds.c daemon/serve_rejects.c daemon/relay_policy.c daemon/wallet_pass.c daemon/v2transport.c crypto_bip324_transport.c crypto_bip324.c crypto_bip324_fs.c \
     crypto_chacha20.c crypto_poly1305.c crypto_ellswift_ecdh.c \
-    crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c daemon/stale_tip.c daemon/peer_timeout.c daemon/txann.c daemon/inbound_evict.c daemon/anchors.c daemon/archive_seed.c daemon/ibd_pipeline.c daemon/hdr_lowwork.c daemon/invalid_set.c daemon/cmpct_recv.c
-    crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c daemon/stale_tip.c daemon/peer_timeout.c daemon/txann.c daemon/inbound_evict.c daemon/anchors.c daemon/archive_seed.c daemon/banlist.c daemon/hdr_lowwork.c daemon/invalid_set.c daemon/cmpct_recv.c
+    crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c daemon/stale_tip.c daemon/peer_timeout.c daemon/txann.c daemon/inbound_evict.c daemon/anchors.c daemon/archive_seed.c daemon/ibd_pipeline.c daemon/hdr_lowwork.c daemon/invalid_set.c daemon/cmpct_recv.c daemon/banlist.c
 tests/test_dial_budget: addrbook.a $(DIALSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(DIALSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
@@ -3130,8 +3129,7 @@ DAEMONSRCS := daemon/main.c daemon/private_broadcast.c daemon/fee_estimator.c da
     daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_witness_v0.c wallet_msgsign.c \
     daemon/serve_invbounds.c daemon/relay_policy.c daemon/wallet_pass.c daemon/v2transport.c crypto_bip324_transport.c crypto_bip324.c crypto_bip324_fs.c \
     crypto_chacha20.c crypto_poly1305.c crypto_ellswift_ecdh.c \
-    crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c daemon/stale_tip.c daemon/peer_timeout.c daemon/txann.c daemon/inbound_evict.c daemon/anchors.c daemon/archive_seed.c daemon/ibd_pipeline.c daemon/hdr_lowwork.c daemon/invalid_set.c daemon/cmpct_recv.c
-    crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c daemon/stale_tip.c daemon/peer_timeout.c daemon/txann.c daemon/inbound_evict.c daemon/anchors.c daemon/archive_seed.c daemon/banlist.c daemon/hdr_lowwork.c daemon/invalid_set.c daemon/cmpct_recv.c
+    crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c daemon/stale_tip.c daemon/peer_timeout.c daemon/txann.c daemon/inbound_evict.c daemon/anchors.c daemon/archive_seed.c daemon/ibd_pipeline.c daemon/hdr_lowwork.c daemon/invalid_set.c daemon/cmpct_recv.c daemon/banlist.c
 # Embedded RPC server (docs/RPC_LIVE_NODE.md): DAEMON_RPCOBJS is defined near
 # the top (with WALLETPRIMS) so its prereqs expand for every rule that uses it.
 # HARDENFLAGS (audit 2026-08-29 finding 9): full RELRO -- the GOT is made
