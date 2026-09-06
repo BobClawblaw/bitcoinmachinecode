@@ -244,6 +244,20 @@ node_handshake:
     xor  ecx, ecx
     xor  r8d, r8d
     call p2p_write
+    ; CC-2 (BIP152): tell the peer we accept compact blocks, low-bandwidth
+    ; mode, version 2 -- after verack, as Core requires. Only when the
+    ; receive side is installed (main.c sets the hooks): with them NULL the
+    ; wire stream is byte-identical to before, which the sync harnesses'
+    ; fake peers depend on.
+    cmp  qword [rel g_cmpct_hook_cmpct], 0
+    je   .no_sendcmpct
+    mov  rdi, r12
+    lea  rsi, [rel _sendcmpct]
+    mov  rdx, 9
+    lea  rcx, [rel _sendcmpct_pl]
+    mov  r8d, 9
+    call p2p_write
+.no_sendcmpct:
     mov  eax, 1
     jmp  .ret
 .fail:
@@ -672,6 +686,14 @@ node_sync_multi:
     je   .have_headers
     ; not headers: echo pong if ping, else just ignore & re-read
     lea  rdi, [rbp-0x160]
+    lea  rsi, [rel _sendcmpct]      ; CC-2: the peer accepts compact blocks
+    mov  ecx, 10
+    repe cmpsb
+    jne  .hdr_not_sendcmpct
+    mov  qword [rel g_peer_sendcmpct], 1
+    jmp  .hdr_drain
+.hdr_not_sendcmpct:
+    lea  rdi, [rbp-0x160]
     lea  rsi, [rel _ping]
     mov  ecx, 4
     repe cmpsb
@@ -760,6 +782,15 @@ node_sync_multi:
     lea  rsi, [rbp-0xa0]
     call p2p_getdata_block
     mov  [rbp-0x5c], eax
+    ; CC-2: MSG_CMPCT_BLOCK (4) when this leg's peer sent sendcmpct, else the
+    ; MSG_WITNESS_BLOCK p2p_getdata_block wrote. The type is the int32 at +1.
+    mov  rax, [rel g_cmpct_hook_type]
+    test rax, rax
+    jz   .gd_type_done
+    mov  rdi, [rel g_peer_sendcmpct]
+    call rax
+    mov  [rbp-0xcf], eax
+.gd_type_done:
     ; send getdata
     mov  rdi, rbx
     lea  rsi, [rel _getdata]
@@ -808,6 +839,62 @@ node_sync_multi:
     mov  ecx, 5
     repe cmpsb
     je   .have_block
+    ; ---- CC-2: a compact block for the block we asked for -------------------
+    ; cmpct_recv_cmpctblock(fd, mp, payload, plen, out, cap, want_hash)
+    ;   > 0: the full block is in the read buffer (in place) -> validate it
+    ;   0:   getblocktxn or a full getdata was sent -> keep draining
+    ;   -1:  not ours / disabled -> ignore
+    lea  rdi, [rbp-0x160]
+    lea  rsi, [rel _cmpctblock]
+    mov  ecx, 11
+    repe cmpsb
+    jne  .blk_not_cmpct
+    mov  r10, [rel g_cmpct_hook_cmpct]
+    test r10, r10
+    jz   .blk_drain                 ; receive not installed: ignore, as before
+    mov  rdi, rbx
+    mov  rsi, [rel g_sync_mp]
+    mov  rdx, r14
+    mov  ecx, [rbp-0x54]
+    mov  r8, r14
+    mov  r9d, [rbp-0x48]
+    lea  rax, [rbp-0xa0]
+    sub  rsp, 8
+    push rax                        ; 7th argument, stack stays 16-aligned
+    call r10
+    add  rsp, 16
+    cmp  rax, 0
+    jle  .blk_drain
+    mov  [rbp-0x54], eax
+    jmp  .have_block
+.blk_not_cmpct:
+    lea  rdi, [rbp-0x160]
+    lea  rsi, [rel _blocktxn]
+    mov  ecx, 9
+    repe cmpsb
+    jne  .blk_not_blocktxn
+    mov  r10, [rel g_cmpct_hook_blocktxn]
+    test r10, r10
+    jz   .blk_drain
+    mov  rdi, rbx
+    mov  rsi, r14
+    mov  edx, [rbp-0x54]
+    mov  rcx, r14
+    mov  r8d, [rbp-0x48]
+    call r10
+    cmp  rax, 0
+    jle  .blk_drain
+    mov  [rbp-0x54], eax
+    jmp  .have_block
+.blk_not_blocktxn:
+    lea  rdi, [rbp-0x160]
+    lea  rsi, [rel _sendcmpct]
+    mov  ecx, 10
+    repe cmpsb
+    jne  .blk_not_sendcmpct
+    mov  qword [rel g_peer_sendcmpct], 1
+    jmp  .blk_drain
+.blk_not_sendcmpct:
     ; not block: echo pong if ping, else ignore & re-read
     lea  rdi, [rbp-0x160]
     lea  rsi, [rel _ping]
@@ -2198,6 +2285,21 @@ g_peer_version_len:     dq 0
 ; as the version snapshot above.
 global g_peer_wants_addrv2
 g_peer_wants_addrv2:    dq 0
+global g_peer_sendcmpct
+g_peer_sendcmpct:       dq 0      ; CC-2: this leg's peer sent sendcmpct (main.c snapshots per leg)
+global g_sync_mp
+g_sync_mp:              dq 0      ; CC-2: the mempool the reconstruction draws on (set by main.c before node_sync_multi)
+; CC-2: the receive side lives in C (daemon/cmpct_recv.c) and is reached through
+; hook pointers main.c installs -- the same shape as bitcoin_serve.asm's
+; g_serve_* hooks -- so this object carries no undefined C symbol and no test
+; binary that links it has to know about compact blocks. NULL = not installed:
+; every block is requested and received in full, exactly as before.
+global g_cmpct_hook_type
+g_cmpct_hook_type:      dq 0      ; unsigned (*)(int leg_negotiated)
+global g_cmpct_hook_cmpct
+g_cmpct_hook_cmpct:     dq 0      ; long (*)(fd, mp, pl, plen, out, cap, want32)
+global g_cmpct_hook_blocktxn
+g_cmpct_hook_blocktxn:  dq 0      ; long (*)(fd, pl, plen, out, cap)
 
 section .rodata
 _version: db "version",0
@@ -2211,5 +2313,9 @@ _headers: db "headers",0
 _getdata: db "getdata",0
 _block:   db "block",0
 _inv:     db "inv",0
+_sendcmpct:  db "sendcmpct",0        ; CC-2
+_cmpctblock: db "cmpctblock",0
+_blocktxn:   db "blocktxn",0
+_sendcmpct_pl: db 0, 2,0,0,0,0,0,0,0   ; high_bandwidth=0, version=2 (u64 LE)
 
 section .note.GNU-stack noalloc noexec nowrite progbits

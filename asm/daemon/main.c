@@ -45,6 +45,8 @@
 #include "inbound_evict.h"     /* CC-3: Core AttemptToEvictConnection */
 #include "anchors.h"           /* CC-4: block-relay-only legs + anchors.dat */
 #include "hdr_lowwork.h"       /* CC-5: hold low-work header pages until the chain proves its work */
+#include "invalid_set.h"       /* CC-10: invalidateblock / reconsiderblock */
+#include "cmpct_recv.h"        /* CC-2: BIP152 compact block receive */
 /* VAL-5 / MEM-1: the generated per-height script-flag mask
  * (bitcoin_script_flags.asm, from validation/gen_script_flags.py). */
 extern unsigned long long script_flags_for_block(unsigned long long height,
@@ -1044,6 +1046,11 @@ static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
  * so it gets addrv2-encoded self-announcements (daemon/addr_self.c) */
 static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
 static unsigned char mux_out_kind[MUX_MAX_OUT];         /* CC-4: LEG_FULL / LEG_BLOCK_ONLY */
+static unsigned char mux_out_cmpct[MUX_MAX_OUT];        /* CC-2: the peer sent sendcmpct on this leg */
+extern long  g_peer_sendcmpct;                          /* bitcoind.asm: set by the sync drains when the peer sends sendcmpct */
+extern void* g_sync_mp;                                 /* bitcoind.asm: the mempool node_sync_multi reconstructs from */
+static void* txsub_pool(void);                           /* defined with the tx-submit worker below */
+static int   txsub_worker_ready(void);
 /* each leg's BMC_NET_*, derived from its host string. We announce ONE
  * address -- this node's clearnet IPv4 -- and telling an onion or i2p peer
  * that address links the two, which is exactly what running over those
@@ -1572,6 +1579,8 @@ static void upl_sample(void){
 #define TXOQ_SPK_CAP 16384u
 #define TXOQ_TIMEOUT_MS 2000              /* a tip-height block apply is ~0.1s */
 typedef struct { unsigned int magic, vout; unsigned char txid[32]; } txoq_req;
+#define TXOQ_MAGIC_MARK 0x4b52414du   /* CC-10: same framing, a different magic: vout = op, txid = block hash */
+static void dlc_headers_rollback(unsigned char* hst, long have);   /* defined with the boot header fetch below */
 /* The response ECHOES the outpoint it answers. Without that, a query that
  * timed out would leave its response sitting in the socket and the NEXT query
  * would read it -- a perfectly well-formed reply about the WRONG coin. Magic
@@ -1600,6 +1609,23 @@ static int txoq_read_all(int fd, void* buf, size_t n, int timeout_ms){
 
 /* The RPC-side query. Returns 1 found / 0 absent / -1 cannot answer.
  * Serialised: there is one channel and the RPC server is threaded. */
+/* CC-10: RPC side of invalidateblock (op 1) / reconsiderblock (op 2). */
+static long txoq_block_mark(const unsigned char hash_wire[32], int op, long* height, char* err, unsigned long errcap){
+    if(g_txoq_parent < 0){ snprintf(err, errcap, "no download worker channel"); return -1; }
+    pthread_mutex_lock(&g_txoq_lock);
+    txoq_req q; q.magic = TXOQ_MAGIC_MARK; q.vout = (unsigned int)op; memcpy(q.txid, hash_wire, 32);
+    long r = -1;
+    if(send(g_txoq_parent, &q, sizeof q, MSG_NOSIGNAL) == (ssize_t)sizeof q){
+        txoq_resp rp;
+        for(int guard = 0; guard < 8; guard++){
+            if(!txoq_read_all(g_txoq_parent, &rp, sizeof rp, 30000)){ snprintf(err, errcap, "worker did not answer in 30 s"); break; }
+            if(rp.magic == TXOQ_MAGIC_MARK && !memcmp(rp.txid, hash_wire, 32)){ r = rp.found; *height = (long)rp.height; if(r < 0) snprintf(err, errcap, "the worker could not disconnect the block; see its log"); break; }
+            if(rp.spklen){ unsigned char skip[4096]; unsigned long left = rp.spklen; while(left){ unsigned long n = left > sizeof skip ? sizeof skip : left; if(!txoq_read_all(g_txoq_parent, skip, n, 1000)) break; left -= n; } }   /* a stale gettxout reply: drain */
+        }
+    } else snprintf(err, errcap, "worker channel write failed");
+    pthread_mutex_unlock(&g_txoq_lock);
+    return r;
+}
 static long txoq_query(const unsigned char txid_wire[32], unsigned int vout,
                        unsigned long long* value, unsigned long* height,
                        unsigned long* is_coinbase,
@@ -1640,6 +1666,35 @@ extern long utxo_live_lsm_get(const unsigned char txid_wire[32], unsigned int vo
                               unsigned long long* value, unsigned long* height,
                               unsigned long* is_coinbase,
                               const unsigned char** script, unsigned long* slen);
+/* CC-10: the worker side of invalidateblock / reconsiderblock. The block is
+ * located by scanning headers.dat from the top (an operator command; a tenth
+ * of a second at 965k headers); if it is at or below the store's tip the
+ * chain is DISCONNECTED down to its parent through the reorg module's own
+ * unapply path, then headers.dat is rolled back so the header fetch does
+ * not re-offer the branch; the hash goes into invalid.dat, which the fetch
+ * and the reorg analyzer consult from then on. reconsiderblock removes the
+ * mark; the next header fetch takes the branch again. */
+static long txoq_mark_block(void* store_buf, const unsigned char hash[32], int op, long* out_h){
+    *out_h = -1;
+    if(op == 2){ int r = invset_remove(hash); invset_save("invalid.dat"); fprintf(stderr, "[chain] reconsiderblock: %s\n", r ? "mark removed" : "not marked"); return 1; }
+    static unsigned char hb[4096]; hst_init(hb);
+    long n = hst_count(hb), h = -1; unsigned char rec[112];
+    for(long k = n - 1; k >= 0; k--){ if(hst_get_at(hb, (unsigned long long)k, rec) != 1) break; if(!memcmp(rec + 80, hash, 32)){ h = k; break; } }
+    if(h < 0) return 0;
+    if(invset_add(hash) < 0) return -1;
+    invset_save("invalid.dat");
+    long tip = *(int*)((unsigned char*)store_buf + 24);
+    if(h <= tip){
+        fprintf(stderr, "[chain] invalidateblock: height %ld is in the active chain (tip %ld) -- disconnecting %ld block(s)\n", h, tip, tip - h + 1);
+        extern long reorg_disconnect_to(void* st, long fork_height);
+        long r = reorg_disconnect_to(store_buf, h - 1);
+        if(r != 1){ fprintf(stderr, "[chain] invalidateblock: disconnect %s\n", r == 0 ? "refused (see the reorg log)" : "FAILED PART WAY -- see the reorg log"); return -1; }
+    }
+    if(n > h) dlc_headers_rollback(hb, h);
+    fprintf(stderr, "[chain] invalidateblock: marked height %ld; headers rolled back to %ld; the chain stays below it until a heavier chain avoids it\n", h, h);
+    *out_h = h; return 1;
+}
+static void* g_txoq_store = NULL;                 /* CC-10: set by the worker before its rotation */
 static void txoq_service(void){
     if(g_txoq_worker < 0) return;
     for(int guard = 0; guard < 64; guard++){
@@ -1647,6 +1702,13 @@ static void txoq_service(void){
         if(poll(&pf, 1, 0) <= 0) return;               /* nothing pending */
         txoq_req q;
         if(!txoq_read_all(g_txoq_worker, &q, sizeof q, 50)) return;
+        if(q.magic == TXOQ_MAGIC_MARK){                /* CC-10: invalidateblock / reconsiderblock */
+            txoq_resp mr; memset(&mr, 0, sizeof mr); mr.magic = TXOQ_MAGIC_MARK; memcpy(mr.txid, q.txid, 32); mr.vout = q.vout;
+            long hh = -1; long r = txoq_mark_block(g_txoq_store, q.txid, (int)q.vout, &hh);
+            mr.found = (int)r; mr.height = hh < 0 ? 0 : (unsigned long)hh;
+            if(send(g_txoq_worker, &mr, sizeof mr, MSG_NOSIGNAL) != (ssize_t)sizeof mr) return;
+            continue;
+        }
         if(q.magic != TXOQ_MAGIC) return;              /* desynced: stop, do not guess */
         txoq_resp rp; memset(&rp, 0, sizeof rp);
         rp.magic = TXOQ_MAGIC; rp.found = 0;
@@ -2255,7 +2317,15 @@ static long do_outbound_sync(int i){
     static unsigned char cbuf[6<<20]; long cnt=0;
     int st_tip_before=*(int*)(store_buf+24);
     phase_timer_t sync_pt; phase_start(&sync_pt);
+    /* CC-2: this leg's compact-block state rides in two asm globals around the
+     * call -- whether the peer sent sendcmpct (the drains set it) and the pool
+     * the reconstruction draws on. Read back after: the peer may have sent
+     * sendcmpct during this very sync. */
+    g_peer_sendcmpct = mux_out_cmpct[i]; g_sync_mp = txsub_worker_ready() ? txsub_pool() : NULL;
     long ok=node_sync_multi(mux_out_fd[i], store_buf, loc, nloc, cbuf, (long)sizeof cbuf, &cnt);
+    if(g_peer_sendcmpct && !mux_out_cmpct[i]){ mux_out_cmpct[i] = 1; fprintf(stderr, "[cmpct] %s accepts compact blocks: requesting MSG_CMPCT_BLOCK on this leg from now on\n", mux_out_host[i]); }
+    { static unsigned long p_r, p_n, p_f; unsigned long r, n, f; cmpct_recv_stats(&r, &n, &f);
+      if(r != p_r || n != p_n || f != p_f){ fprintf(stderr, "[cmpct] reconstructed %lu block(s) from the mempool (%lu needed a getblocktxn round trip, %lu fell back to a full block)\n", r, n, f); p_r = r; p_n = n; p_f = f; } }
     double sync_s = phase_elapsed(&sync_pt);
     int st_tip=*(int*)(store_buf+24);
     if(ok!=1 || cnt<=0){
@@ -2610,7 +2680,7 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
     g_peer_wants_addrv2 = r->wants_addrv2;
     snprintf(mux_out_host[mux_n_out], sizeof mux_out_host[mux_n_out], "%s", host);
     mux_out_fd[mux_n_out] = fd;
-    mux_out_kind[mux_n_out] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */
+    mux_out_kind[mux_n_out] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
     mux_out_wants_v2[mux_n_out] = r->wants_addrv2;
     mux_out_peer[mux_n_out] = 0;
     anchor_locator(mux_out_loc[mux_n_out]);
@@ -3426,6 +3496,10 @@ for(; i < cnt; i++){
                           hh, cand, why);
                   dlc_headers_rollback(hst, have0); return -1;
               } }
+            if(invset_has(bh)){                       /* CC-10: the operator invalidated this block */
+                fprintf(stderr,"[dlc] headers from %s reach a block the operator invalidated at height %ld -- refusing this chain\n", cand, pos + (long)i);
+                dlc_headers_rollback(hst, have0); return -1;
+            }
             if(hst_append(hst, h, bh) < 0){ dlc_headers_rollback(hst, have0); return -1; }
             (*added)++;
         }
@@ -4773,6 +4847,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
       if (zmqpub_active()) zmqpub_start(); }
     fprintf(stderr,"[dl] worker: reloading chain archive...\n");
     phase_timer_t dl_load_pt; phase_start(&dl_load_pt);
+    { long ni = invset_load("invalid.dat"); if(ni) fprintf(stderr, "[chain] invalid.dat: %ld operator-invalidated block(s)\n", ni);   /* CC-10 */
+      reorg_set_invalid_fn(invset_has); g_txoq_store = store_buf; }
+    { extern void* g_cmpct_hook_type; extern void* g_cmpct_hook_cmpct; extern void* g_cmpct_hook_blocktxn;   /* CC-2: bitcoind.asm reaches the receive side through these */
+      g_cmpct_hook_type = (void*)cmpct_getdata_type; g_cmpct_hook_cmpct = (void*)cmpct_recv_cmpctblock; g_cmpct_hook_blocktxn = (void*)cmpct_recv_blocktxn; }
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
     fprintf(stderr,"[dl] worker: chain archive reloaded: tip=%d (%.2fs)\n",
             *(int*)(store_buf+24), phase_elapsed(&dl_load_pt));
@@ -5235,7 +5313,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
             struct timeval t2; t2.tv_sec=3; t2.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
             strncpy(mux_out_host[mux_n_out], srcpool[i], 127);
-            mux_out_fd[mux_n_out]=cfd[i]; mux_out_kind[mux_n_out] = host_is_block_only(srcpool[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */
+            mux_out_fd[mux_n_out]=cfd[i]; mux_out_kind[mux_n_out] = host_is_block_only(srcpool[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
             mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
             mux_out_peer[mux_n_out]=i;
             anchor_locator(mux_out_loc[mux_n_out]);
@@ -6403,7 +6481,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 int nfd=outbound_connect(srcpool[ci], 300, out_port);
                 if(nfd>=0){
                     strncpy(mux_out_host[mux_n_out], srcpool[ci], 127);
-                    mux_out_fd[mux_n_out]=nfd; txrelay_leg_reset(nfd); mux_out_kind[mux_n_out] = host_is_block_only(srcpool[ci]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */
+                    mux_out_fd[mux_n_out]=nfd; txrelay_leg_reset(nfd); mux_out_kind[mux_n_out] = host_is_block_only(srcpool[ci]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
                     mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
                     mux_out_peer[mux_n_out]=ci;
                     anchor_locator(mux_out_loc[mux_n_out]);
@@ -7061,7 +7139,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         int fd=outbound_connect(peers[i], 300, out_port);
         if(fd<0){ fprintf(stderr,"[mux] outbound %s failed: %s\n", peers[i], dial_fail_reason()); continue; }
         strncpy(mux_out_host[mux_n_out], peers[i], 127);
-        mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd); mux_out_kind[mux_n_out] = host_is_block_only(peers[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */
+        mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd); mux_out_kind[mux_n_out] = host_is_block_only(peers[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
         mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
         mux_out_peer[mux_n_out]=i;
         anchor_locator(mux_out_loc[mux_n_out]);
@@ -8444,6 +8522,7 @@ int main(int argc, char** argv){
                                                             unsigned long*, unsigned char*,
                                                             unsigned long, unsigned long*));
             rpc_commands_set_txo_query(txoq_query);
+            { extern void rpc_commands_set_block_mark(long (*)(const unsigned char[32], int, long*, char*, unsigned long)); rpc_commands_set_block_mark(txoq_block_mark); }   /* CC-10 */
             fprintf(stderr,"[rpc] gettxout answers via the download worker (IPC)\n");
         }
         { char rpccfg[512]; serve_start_rpc(dir, node_config_path(absp, rpccfg, sizeof rpccfg)); }

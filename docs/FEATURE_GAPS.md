@@ -1039,7 +1039,7 @@ Missing:
 
 Confirmed genuinely wired into the real serve loop (`bitcoin_serve.asm`),
 not just present as unused/tested-in-isolation code:
-- **BIP152 compact blocks — SERVE SIDE ONLY** (`cmpctblock_build`,
+- ~~**BIP152 compact blocks — SERVE SIDE ONLY**~~ **Receive side DONE 2026-09-06 (CC-2, `49c1c6f`): low-bandwidth mode — `sendcmpct` after verack on outbound legs, `MSG_CMPCT_BLOCK` requested, reconstruction from the mempool, `getblocktxn`/`blocktxn`, full-block fallback; high-bandwidth push is a follow-up.** Was: (`cmpctblock_build`,
   `p2p_blocktxn_build`). This node answers `MSG_CMPCT_BLOCK` getdata and
   `getblocktxn`, and negotiates `sendcmpct`. It does NOT receive compact
   blocks: `bitcoin_serve.asm` writes `cmpctblock` and `blocktxn` and has no
@@ -1267,7 +1267,7 @@ that served BIP157 before this change must now set it explicitly.
 | `blockmaxweight` | Set maximum BIP141 block weight (default: 4000000) | implemented |
 | `blockmintxfee` | Set lowest fee rate (in BTC/kvB) for transactions to be included in block creation. (default: 0.00000001) | implemented |
 | `blocknotify` | Execute command when the best block changes (%s in cmd is replaced by block hash) | implemented |
-| `blockreconstructionextratxn` | Extra transactions to keep in memory for compact block reconstructions (default: 100) | accepted, no effect: compact-block RECEIVE is not implemented (serve side only -- see the BIP152 row and `docs/CORE_BEHAVIORAL_COMPAT.md` §3), so there is no reconstruction for this to size |
+| `blockreconstructionextratxn` | Extra transactions to keep in memory for compact block reconstructions (default: 100) | accepted, no effect: compact-block RECEIVE exists since 2026-09-06 (CC-2, low-bandwidth, `daemon/cmpct_recv.c`) but the extra-transaction pool this option sizes is not implemented; reconstruction draws on the mempool only |
 | `blockreservedweight` | Reserve space for the fixed-size block header plus the largest coinbase transaction the mining software may ad… | implemented |
 | `blocksdir` | Specify directory to hold blocks subdirectory for *.dat files (default: <datadir>) | accepted, no effect: the archive lives under <datadir>/<chain> and is not relocatable |
 | `blocksonly` | Whether to reject transactions from network peers. Disables automatic broadcast and rebroadcast of transaction… | implemented 2026-09-01: fRelay=0 in every version, tx/tx-inv from peers without `relay` is a violation (disconnect, no score), no feefilter, localrelay false, whitelistrelay->0 / maxmempool->5 interactions; RPC submissions still relay (Core). Wire-proven: validation/relay_policy_core_diff.sh |

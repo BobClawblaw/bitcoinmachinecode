@@ -555,8 +555,17 @@ static unsigned long rg_mtp_at(void* vctx, long h){
     return (unsigned long)t[n/2];
 }
 
+static int g_pure_disconnect = 0;                 /* CC-10: reorg_disconnect_to() */
+static int (*g_invalid_fn)(const unsigned char[32]) = 0;
+void reorg_set_invalid_fn(int (*fn)(const unsigned char hash[32])){ g_invalid_fn = fn; }
 long reorg_analyze(void* st, reorg_cand_t* c){
     if (c->n <= 0) return 0;
+    if (g_invalid_fn)                                   /* CC-10: invalidateblock */
+        for (long k = 0; k < c->n; k++)
+            if (g_invalid_fn(c->hash[k])){
+                fprintf(stderr, "[reorg] candidate REFUSED: it contains a block the operator invalidated (index %ld of %ld)\n", k, c->n);
+                return 0;
+            }
     if (!g_cw_open){
         fprintf(stderr, "[reorg] refusing to evaluate a candidate chain: chainwork is not open in this process (our own tip would weigh zero, so EVERY chain would look heavier)\n");
         return -1;
@@ -738,7 +747,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         fprintf(stderr, "[reorg] refusing: disconnect depth %ld exceeds max %d\n", tip - fork_height, REORG_MAX_DEPTH);
         return 0;
     }
-    if (nblocks <= 0){
+    if (nblocks <= 0 && !g_pure_disconnect){
         fprintf(stderr, "[reorg] refusing: no replacement blocks supplied\n");
         return 0;
     }
@@ -1403,5 +1412,13 @@ long reorg_probe_peer(int fd, void* st, const char* peer){
 
     long r = reorg_execute(st, cand.fork_height, stg.n, stage_read, &stg);
     close(stg.fd); unlink(REORG_STAGE_PATH);
+    return r;
+}
+
+/* CC-10: the disconnect half of reorg_execute, for invalidateblock. */
+long reorg_disconnect_to(void* st, long fork_height){
+    g_pure_disconnect = 1;
+    long r = reorg_execute(st, fork_height, 0, NULL, NULL);
+    g_pure_disconnect = 0;
     return r;
 }
