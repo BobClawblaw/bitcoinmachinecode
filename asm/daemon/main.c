@@ -45,7 +45,8 @@
 #include "inbound_evict.h"     /* CC-3: Core AttemptToEvictConnection */
 #include "../mempool_slot.h"    /* the structural mempool's slot layout (80-byte slots) */
 #include "anchors.h"           /* CC-4: block-relay-only legs + anchors.dat */
-#include "hdr_lowwork.h"       /* CC-5: hold low-work header pages until the chain proves its work */
+#include "hdr_lowwork.h"
+#include "archive_seed.h"       /* slot 0 is genesis on EVERY chain: a shifted archive reads every height one block high */       /* CC-5: hold low-work header pages until the chain proves its work */
 #include "invalid_set.h"       /* CC-10: invalidateblock / reconsiderblock */
 #include "cmpct_recv.h"        /* CC-2: BIP152 compact block receive */
 /* VAL-5 / MEM-1: the generated per-height script-flag mask
@@ -8299,13 +8300,16 @@ int main(int argc, char** argv){
      * regtest dir is created empty every time, so the daemon must do it).
      * Everything downstream (locator build, catch-up, script-flag heights,
      * the UTXO walk's skip-genesis-coinbase rule) already assumes index ==
-     * height with genesis at 0. */
-    if(g_chainp->id != CHAIN_MAIN && *(int*)(store_buf+24) == -1){
-        unsigned char gh[32]; block_hash(gh, g_chainp->genesis);
-        if(store_append(store_buf, gh, g_chainp->genesis, (unsigned long)g_chainp->genesis_len) < 0){  /* returns new height (0) or -1 */
-            fprintf(stderr,"[boot] failed to seed the %s genesis block\n", g_chainp->name); return 1; }
-        fprintf(stderr,"[boot] %s genesis seeded at height 0\n", g_chainp->name);
-    }
+     * height with genesis at 0.
+     *
+     * 2026-09-06: this used to skip CHAIN_MAIN, because THIS box's mainnet
+     * archive had genesis from a one-time injection. Every OTHER fresh
+     * mainnet datadir then built an archive shifted by one -- the serial leg
+     * appends the first block a peer sends, and no peer relays genesis. See
+     * archive_seed.h. */
+    { int sd = archive_seed_genesis_if_empty(store_buf, g_chainp->genesis, (unsigned long)g_chainp->genesis_len);
+      if(sd < 0){ fprintf(stderr,"[boot] failed to seed the %s genesis block\n", g_chainp->name); return 1; }
+      if(sd == 1) fprintf(stderr,"[boot] %s genesis seeded at height 0 (empty archive)\n", g_chainp->name); }
 
     if(strcmp(mode,"sync")==0){
         /* Connect to a built-in loopback fake peer (forked in-process), exactly
