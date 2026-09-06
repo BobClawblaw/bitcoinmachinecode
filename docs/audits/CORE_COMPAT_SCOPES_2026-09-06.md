@@ -118,6 +118,8 @@ script. The design is the outbound one mirrored; nothing novel.
 
 ## CC-2 — BIP152 compact block receive
 
+**Status: CLOSED, low-bandwidth mode (`49c1c6f`).** Deviations from the design below: the receive lives in `bitcoind.asm`'s `node_sync_multi` (the real download loop; the C `serve_loop` the design named is a test harness), reconstruction is in place in the read buffer, and the mempool is walked through its documented slot layout rather than a new iterator. High-bandwidth mode and `blockreconstructionextratxn` are follow-ups. `test_cmpct_recv` gated (13 checks), negative control = receive disabled. **Follow-up:** a regtest run with Core serving compact blocks to this node.
+
 **Core.** After `sendcmpct`, a peer sends `cmpctblock` (header + nonce +
 short ids + prefilled txs). The receiver reconstructs from its mempool and
 `blockreconstructionextratxn`, requests the rest with `getblocktxn`, receives
@@ -386,6 +388,13 @@ held until the idle bound (20 min) instead. **Size.** Small. ~80 lines.
 
 ## CC-8 — Full-verification replay (`assumevalid=0`)
 
+**Status: RUNNING** since 2026-09-06 01:12Z at `/storage/bmc-fullverify` (binary snapshot `bitcoind.replay` = main `520c924`; log `replay.log`; `START` file). What the first hour taught, recorded so the next run does not repeat it:
+
+- **Early blocks are round-trip bound, not bandwidth bound.** At height ~6,500 the blocks are ~750 bytes; 12 blocks/s is 9 KB/s, and the downloader's byte-rate rule (`min_bps` 32,768 for 3 ticks) marked its only peer "dead weight", dropped it and redialled — churn, not progress. `bmc.peerminbps=1024` / `bmc.peerminticks=60` stop it; both keys exist and are now in the replay's config. Worth a saner default for loopback/early-chain conditions.
+- **A leg to the live node blocked in the boot header fetch for ten minutes** (40 silent reads × 15 s) while the live node answers a raw `getheaders` probe instantly. Not reproduced; the replay was moved to the Core oracle (`connect=127.0.0.1:8333`), which is the more independent source for a verification run anyway, and pulled 955k headers immediately. The ten-minute tolerance itself is a finding: a silent peer should not hold the boot fetch that long.
+- **The bench node shut down cleanly at 01:50Z** (cookie gone, `mempool.dat`/`fee_estimates.dat` written that minute). No console log survived to say who signalled it; every kill this session issued was by the replay's exact process name or pid. Its harness keeps no stderr log — that is a gap in the bench harness, not the node.
+- Progress: ~1,850 blocks/min through the early chain from the oracle; the run's wall-clock is itself the deliverable.
+
 **What it proves.** Today's "byte-identical UTXO set" was produced with
 Core's default assumevalid, so scripts below block 890,000-ish were never
 executed by this node. The 2026-09-05 interpreter review found two consensus
@@ -453,7 +462,7 @@ serve `ancpkginfo`/`pkgtxns` for our own low-fee parents.
 
 ## CC-10 — Completeness items
 
-**Status (2026-09-06):** coin selection CLOSED (`wallet_coinsel.c`: SRD, knapsack, waste; `test_coinsel` gated, negative control = BnB alone finds nothing for a target with no changeless match); BIP389 was already implemented (register corrected); MuSig2-in-leaf turned out to be the edge of a wider gap — taproot script-path PSBT signing/finalization is absent for every key type — and is **deferred**: it needs Core-generated PSBT fixtures (a taptree with a leaf, a control block, `PSBT_IN_TAP_LEAF_SCRIPT`) to be built without guessing. `invalidateblock`/`reconsiderblock`: see the next commit in this batch.
+**Status (2026-09-06):** coin selection CLOSED (`wallet_coinsel.c`: SRD, knapsack, waste; `test_coinsel` gated, negative control = BnB alone finds nothing for a target with no changeless match); BIP389 was already implemented (register corrected); MuSig2-in-leaf turned out to be the edge of a wider gap — taproot script-path PSBT signing/finalization is absent for every key type — and is **deferred**: it needs Core-generated PSBT fixtures (a taptree with a leaf, a control block, `PSBT_IN_TAP_LEAF_SCRIPT`) to be built without guessing. `invalidateblock`/`reconsiderblock`: **CLOSED (`32f3e5b`)** — persisted mark, disconnect through `reorg_disconnect_to()` (the reorg module's unapply half, newly admitted with no replacement blocks), header fetch and reorg analyzer refuse marked chains; `test_invalid_set` gated. **Follow-up:** a regtest invalidate-then-reorg-back script.
 
 | item | here | design | size |
 |---|---|---|---|

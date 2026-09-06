@@ -35,7 +35,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | `assumeutxo` snapshot load | `loadtxoutset` | absent | **DECIDED** (`FEATURE_GAPS.md` "genuinely still open": large lift, no need) |
 | UTXO set identity | | MuHash byte-identical to Core at two heights on two datadirs; re-runnable (`validation/muhash_vs_core.sh`) | **DONE** |
 | Reorg handling, undo, crash consistency | | same; tested | **DONE** |
-| `invalidateblock` / `reconsiderblock` | operator tooling to force a reorg | absent | **GAP** (small; RPC-only) |
+| `invalidateblock` / `reconsiderblock` | mark, disconnect, stay below the mark until a heavier chain avoids it | same: persisted mark (`invalid.dat`), disconnect through the reorg module's own unapply path, header fetch and reorg analyzer refuse marked chains (CC-10, `32f3e5b`) | **DONE** |
 | Chain selection | main / testnet4 / signet / regtest; testnet3 deprecated | same; testnet3 refused outright | **DONE** |
 
 ## 2. Mempool policy
@@ -67,7 +67,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | `getblocks` (legacy) | still answered | answered | **DONE** |
 | `mempool` (BIP35) gated by permission | | same (`NP_MEMPOOL`) | **DONE** |
 | **BIP152 compact blocks — serve side** | answers `MSG_CMPCT_BLOCK`, `getblocktxn`, negotiates `sendcmpct` | same | **DONE** |
-| **BIP152 compact blocks — receive side** | high- and low-bandwidth modes; reconstruct from mempool, `getblocktxn` for the rest, `blockreconstructionextratxn` | **absent**: `cmpctblock`/`blocktxn` are never handled inbound; the download path never sends `sendcmpct` and fetches every block as `MSG_BLOCK` (`main.c`, 4 sites). A peer's compact block is ignored. *`FEATURE_GAPS.md`'s config row for `blockreconstructionextratxn` said "reconstruction draws on the mempool only", implying it exists — corrected in this commit.* | **GAP** |
+| BIP152 compact blocks — receive side | high- and low-bandwidth modes; reconstruct from mempool, `getblocktxn` for the rest, `blockreconstructionextratxn` | **low-bandwidth mode**: `sendcmpct` sent after verack on outbound legs, `MSG_CMPCT_BLOCK` requested on a leg that negotiated, reconstruction from the shared mempool, `getblocktxn`/`blocktxn` for the rest, full-block fallback on any failure (`cmpct_recv.c`, CC-2, `49c1c6f`). High-bandwidth push and the extra-txn pool are follow-ups | **DONE** (low-bandwidth) |
 | BIP157/158 `getcfilters`/`getcfheaders`/`getcfcheckpt` | when `-peerblockfilters` | same (`serve_cfilters.c`), service bit gated the same way | **DONE** |
 | BIP37 bloom (`filterload` etc.) | default off, `NODE_BLOOM` off | not implemented, bit never set | **DECIDED** (matches Core's default) |
 | BIP61 `reject` | removed in 0.20 | absent | **DONE** (parity by absence) |
@@ -181,9 +181,8 @@ by size. Each carries the test that would prove it.
 
 | # | Item | Why it is first | Size | Scope |
 |---|---|---|---|---|
-| 2 | **BIP152 compact block receive** (§3) | Every block fetched in full; a Core peer's pushed `cmpctblock` is dropped then refetched | medium-large | CC-2 |
-| 8 | **Full-verification replay** (`assumevalid=0`, §1) | The proof; launch first, it runs unattended | wall-clock | CC-8 |
-| 10 | `invalidateblock`/`reconsiderblock`; taproot script-path PSBT signing | Completeness | medium; deferred | CC-10 |
+| 8 | **Full-verification replay** (`assumevalid=0`, §1) | **RUNNING** since 2026-09-06 01:12Z from the Core oracle; `stopatheight=965598` | wall-clock | CC-8 |
+| 10 | taproot script-path PSBT signing and finalization (all key types) | **deferred**: needs Core-generated fixtures | medium | CC-10 |
 
 Every row is scoped in `docs/audits/CORE_COMPAT_SCOPES_2026-09-06.md`.
 

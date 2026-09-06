@@ -65,6 +65,7 @@ also annotated tags.
 | [`releases/2026-09-05-interp-review.md`](releases/2026-09-05-interp-review.md) | interpreter review closed (14 of 17), MuHash re-verified and scripted, fresh clone builds, the mined-transaction corpus |
 | [`releases/2026-09-05-net10-addrbook.md`](releases/2026-09-05-net10-addrbook.md) | NET-10 closed: the address book stores who told us about an address and whether we connected to it; the last open MEDIUM |
 | [`releases/2026-09-05-audits-closed.md`](releases/2026-09-05-audits-closed.md) | the state of every audit by ID; one standing property not closable by a change, and the systemd unit closed by operator decision |
+| [`releases/2026-09-06-core-compat.md`](releases/2026-09-06-core-compat.md) | the Core-compatibility work list resolved: CC-1..CC-7, CC-9, CC-10 closed or decided, CC-8 running, one item deferred with its reason |
 
 ## Development history
 
