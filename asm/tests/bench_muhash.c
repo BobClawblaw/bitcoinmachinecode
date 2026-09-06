@@ -40,9 +40,10 @@
 extern void muhash_init(void* acc);
 extern void muhash_insert(void* acc, const void* data, unsigned long len);
 extern void num3072_mul(void* a, const void* b);
-extern void num3072_mul_force_path(int p);   /* 0 re-probe, 1 ADX, 2 generic */
+extern void num3072_mul_force_path(int p);   /* 0 re-probe, 1 ADX, 2 generic, 3 IFMA */
 extern int  num3072_mul_current_path(void);
 extern int  num3072_cpu_has_adx(void);
+extern int  num3072_cpu_has_ifma(void);
 
 static double now_ns(void)
 {
@@ -131,7 +132,8 @@ int main(int argc, char** argv)
      * daemon's path and is always present */
     struct { int path; const char* name; int avail; } paths[] = {
         { 2, "generic (mul/adc, pre-change)", 1 },
-        { 1, "bmi2/adx (mulx/adcx/adox)",     num3072_cpu_has_adx() },
+        { 1, "bmi2/adx (mulx/adcx/adox)",     num3072_cpu_has_adx()  },
+        { 3, "avx512-ifma (52-bit limbs)",    num3072_cpu_has_ifma() },
     };
     struct row rows[sizeof paths / sizeof paths[0]];
     int nrows = 0;
