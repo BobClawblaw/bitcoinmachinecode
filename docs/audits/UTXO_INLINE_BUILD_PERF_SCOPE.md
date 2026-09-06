@@ -5,6 +5,18 @@ the *semantics* of connecting as we go (the tip is the connected tip; a
 block that fails to connect is rejected, not fatal). This document is about
 the **time**: the fresh-install benchmark (`BobClawblaw/bmc-benchmark-2026-09`,
 2026-09-04→06, dedicated SSD, same `dbcache=8192` on both sides) measured
+**The 21.0 h Core figure is a FLOOR, not a fair result (corrected
+2026-09-06).** The harness wrote `par=8` and `maxconnections=64` into Core's
+config with no reason recorded anywhere, against Core's defaults of `par=0`
+(auto: cores, clamped to 15, plus the calling thread) and
+`maxconnections=125`. Core therefore ran with eight script-verification
+threads on a 32-core box and half its connection budget, and the handicap was
+applied to ONE side only. Both lines are removed from the harness. Pulling the
+other way, this node evaluates every script (a fresh archive has no
+assumevalid block) while Core's default skips signature checking below its
+built-in block. Neither bias is quantified. Any claim of parity with Core
+must state both.
+
 Core v31.1 at **21.0 h** end to end and this node at **24.1 h**, and the
 split says exactly where the 3.1 h is.
 
