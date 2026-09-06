@@ -138,6 +138,13 @@ largest single lever in this document, ahead of the WAL:
    path uses is 3–5×. Assembly work, cleanly separable, verified against the
    existing Core vectors (`tests/muhash_vectors.h`).
 
+**Found by step 0 (2026-09-06, instrumentation agent):** the apply path does
+a *second* `utxo_lsm_get` per input inside `undo_capture_and_del` (get → undo
+append → del), after the verify-side resolve already looked the same input
+up. Every input is looked up twice; the second is charged to `put`. Carrying
+the resolved coin from verify into apply is a lever in its own right, gated
+on the `get` share the breakdown reports.
+
 ### Step 1 — connect inside the download loop (the structural fix)
 
 Replace the monitor loop's `nanosleep(10 s)` with a **budgeted connect**:
