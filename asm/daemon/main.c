@@ -42,6 +42,7 @@
 #include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
 #include "peer_timeout.h"      /* CC-7: -peertimeout, the handshake deadline */
 #include "txann.h"             /* CC-1: tx announcement to and from inbound peers */
+#include "inbound_evict.h"     /* CC-3: Core AttemptToEvictConnection */
 /* VAL-5 / MEM-1: the generated per-height script-flag mask
  * (bitcoin_script_flags.asm, from validation/gen_script_flags.py). */
 extern unsigned long long script_flags_for_block(unsigned long long height,
@@ -1290,6 +1291,7 @@ void serve_policy_disconnect_log(const char* reason){
  * child's slot is reused) and publish what getpeerinfo shows */
 static void rpc_fill_peer_slot(int slot, const char* host);
 static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claimed);
+static unsigned netgroup_of_hostport(const char* hostport);   /* CC-3: defined with txr_source_group_fd below */
 static int inbound_slot_claim(const char* peerdesc){
     if(!g_node_status) return -1;
     for(int i = RPC_MAX_PEERS - 1; i >= MUX_MAX_OUT; i--){
@@ -1307,6 +1309,8 @@ static int inbound_slot_claim(const char* peerdesc){
         rpc_fill_peer_slot_ex(i, peerdesc, 1);
         q->inbound = 1; q->pid = (int)getpid(); q->perms = g_conn_perms_all;
         q->relaytxes = node_relay_flag && g_peer_relays_txs;
+        q->net_group = netgroup_of_hostport(peerdesc);          /* CC-3 */
+        q->last_tx_time = 0; q->last_block_time = 0; q->min_ping_us = 0; q->evict_requested = 0;
         return i;
     }
     return -1;
@@ -1332,6 +1336,22 @@ extern unsigned net_netgroup_v4(unsigned ip);                          /* daemon
  * we cannot parse -- gets a hash of the host string with the top bit set, so
  * it is stable per source and cannot collide with a /16 value. 0 means
  * "unknown", which ab2_add_from never caps. */
+/* CC-3: the Core /16 grouping of a "host:port" string (NET-10's rule for
+ * onion/i2p/cjdns: a stable hash with the top bit set, which cannot collide
+ * with a /16). 0 = unknown. Same logic as txr_source_group_fd below. */
+static unsigned netgroup_of_hostport(const char* hostport){
+    char ip[128]; ctl_ip_only(hostport, ip, sizeof ip);
+    if(!ip[0]) return 0;
+    unsigned o0, o1, o2, o3;
+    if(sscanf(ip, "%u.%u.%u.%u", &o0, &o1, &o2, &o3) == 4 && o0 < 256 && o1 < 256 && o2 < 256 && o3 < 256){
+        unsigned v4 = o0 | (o1 << 8) | (o2 << 16) | (o3 << 24);
+        unsigned g = net_netgroup_v4(v4);
+        return g ? g : 1u;
+    }
+    unsigned h = 2166136261u;
+    for(const char* p = ip; *p; p++){ h ^= (unsigned char)*p; h *= 16777619u; }
+    return h | 0x80000000u;
+}
 unsigned txr_source_group_fd(int fd){
     for(int k = 0; k < mux_n_out; k++){
         if(mux_out_fd[k] != fd) continue;
@@ -7218,6 +7238,24 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                     /* CC-1: this child's accepts are tagged with its slot (so it never
                      * announces a tx back to the peer that sent it) and it starts
                      * announcing to the peer if the peer negotiated relay. */
+                    /* CC-3 (Core AttemptToEvictConnection): every inbound slot is taken.
+                     * Before this, the child SERVED ANYWAY, unrecorded -- the node neither
+                     * evicted nor refused, and getpeerinfo under-reported. Now: pick a
+                     * victim by Core's protection rounds, ask it to leave (its txann_wait
+                     * sees the flag within a second and exits cleanly, freeing the slot),
+                     * claim the slot, and if every peer is protected, refuse as Core does. */
+                    if(hok==1 && g_inbound_slot < 0 && g_node_status){
+                        int v = inbound_select_victim(g_node_status, (long long)time(NULL), MUX_MAX_OUT, RPC_MAX_PEERS - 1);
+                        if(v >= 0){
+                            g_node_status->peers[v].evict_requested = 1;
+                            fprintf(stderr, "[serve] inbound slots full: evicting slot %d (%s) to admit %s\n", v, g_node_status->peers[v].addr, peerdesc);
+                            for(int w = 0; w < 25 && g_inbound_slot < 0; w++){ usleep(100000); g_inbound_slot = inbound_slot_claim(peerdesc); }
+                        }
+                        if(g_inbound_slot < 0){
+                            fprintf(stderr, "[serve] inbound slots full and every peer protected: refusing %s\n", peerdesc);
+                            close(c); _exit(0);
+                        }
+                    }
                     if(hok==1){ txann_set_my_slot(g_inbound_slot); txann_child_init(g_inbound_slot, node_relay_flag && g_peer_relays_txs); }
                     char pv[256]; pv[0]=0; if(hok==1) format_peer_version_info(pv, sizeof pv);
                     close(l6 >= 0 ? l6 : l);
