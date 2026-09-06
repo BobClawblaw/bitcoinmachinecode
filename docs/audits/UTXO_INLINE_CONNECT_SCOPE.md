@@ -3,6 +3,8 @@
 Scoping report, 2026-09-06. Not started. Companion to
 `docs/CORE_BEHAVIORAL_COMPAT.md` §1 ("Consensus and validation").
 
+> **Companion (2026-09-06):** `UTXO_INLINE_BUILD_PERF_SCOPE.md` quantifies the *time* cost of the decoupling this document describes — the 3.1 h gap to Core v31.1 in the fresh-install benchmark — and scopes the interleaving that removes it.
+
 ## 1. What Core does
 
 Core keeps two notions apart and never lets the second run ahead of the
