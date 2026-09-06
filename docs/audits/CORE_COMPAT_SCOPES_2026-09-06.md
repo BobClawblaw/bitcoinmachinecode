@@ -181,6 +181,8 @@ leg. High-bandwidth mode is deliberately excluded from this batch.
 
 ## CC-3 — Inbound eviction (`AttemptToEvictConnection`)
 
+**Status: CLOSED (`60486ce`).** As designed; the victim exits on its next txann_wait slice, the newcomer retries the claim for 2.5 s, refusal when everyone is protected. Test `test_inbound_evict` gated (15 checks) plus 3 in `test_txann`; negative control = the full table with no eviction.
+
 **Core.** When inbound slots are full, before refusing, pick a victim among
 inbound peers after *protecting*: the 4 with lowest min-ping, 8 that most
 recently sent us a tx, 4 that most recently sent a novel block, half of the

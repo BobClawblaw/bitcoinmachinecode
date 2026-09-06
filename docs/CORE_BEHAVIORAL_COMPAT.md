@@ -89,7 +89,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | Inbound onion service (`-listenonion`) | ADD_ONION at boot | same: `tor_onion_listener(port)` runs at boot (`main.c:8271`, `8296`); the 08-28 note in `FEATURE_GAPS.md` was stale | **DONE** |
 | Inbound I2P (`i2pacceptincoming`) | SAM `STREAM ACCEPT` | same: `i2p_inbound_start()` at boot, accept thread hands fds to the serve path | **DONE** |
 | Inbound slot limit, `-maxconnections`, per-connection permissions (`-whitelist`/`-whitebind`) | | same | **DONE** |
-| **Inbound eviction when full** (`AttemptToEvictConnection`) | protect by netgroup, ping, last block, last tx; evict the worst | **absent**: a 20-minute inactivity bound only (NET-3 residual). Under pressure, slots are held by whoever arrived first | **GAP** |
+| Inbound eviction when full (`AttemptToEvictConnection`) | protect by netgroup, ping, last block, last tx; evict the worst | same (`inbound_evict.c`, CC-3, `60486ce`); min-ping round inert until inbound peers are pinged. A full table no longer serves unrecorded peers | **DONE** |
 | `-peertimeout` (handshake bound) | default 60 s | same (`peer_timeout.c`, CC-7, `c6598b5`; DMN-14 closed) | **DONE** |
 | Inactivity disconnect | 20 min | same (NET-3) | **DONE** |
 | `-maxuploadtarget`, `-blocksonly` | | same | **DONE** |
@@ -182,7 +182,6 @@ by size. Each carries the test that would prove it.
 | # | Item | Why it is first | Size | Scope |
 |---|---|---|---|---|
 | 2 | **BIP152 compact block receive** (§3) | Every block fetched in full; a Core peer's pushed `cmpctblock` is dropped then refetched | medium-large | CC-2 |
-| 3 | **Inbound eviction** (`AttemptToEvictConnection`, §4) | Under slot pressure the node keeps whoever arrived first — and, found while scoping, *serves unrecorded* peers past the table's 64 slots | medium | CC-3 |
 | 4 | **Block-relay-only outbound + `anchors.dat`** (§4) | Eclipse resistance | medium | CC-4 |
 | 5 | **Low-work headers sync** (§5) | A peer can make the boot fetch store an arbitrarily long valid-PoW low-work chain; the floor is only checked at reorg | medium | CC-5 |
 | 8 | **Full-verification replay** (`assumevalid=0`, §1) | The proof; launch first, it runs unattended | wall-clock | CC-8 |
