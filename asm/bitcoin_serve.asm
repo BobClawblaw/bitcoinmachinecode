@@ -31,6 +31,7 @@ extern g_peer_wants_addrv2
     extern idx_get
     extern serve_inv_bounds
     extern serve_locator_from
+    extern serve_public_tip     ; 3.1: the CONNECTED tip (daemon/serve_invbounds.c)
 extern node_relay_flag
 extern serve_tx_gate
 extern serve_inv_gate
@@ -371,7 +372,11 @@ node_serve_loop:
     mov  qword [s_peerfee], 0
     mov  byte [s_feesent], 0
     mov  byte [s_addrsent], 0
-    mov  eax, [r14+24]           ; tip height (st[24])
+    ; 3.1: the PUBLIC tip = the connected tip (serve_public_tip caps
+    ; st[24] by the worker's published connected height; r14 = st is
+    ; callee-saved, nothing volatile is live here)
+    mov  rdi, r14
+    call serve_public_tip
     mov  [s_lasttip], rax
     ; feefilter_send(fd) -- 8-byte int64 LE min-relay-feerate (s_myfee)
     cmp  byte [g_serve_send_feefilter], 0
@@ -1340,8 +1345,10 @@ node_serve_loop:
     test eax, eax
     jz   .next               ; malformed: drop, as the inv path does
 .gh_build:
-    ; tip = st[24]
-    mov  eax, [r14+24]
+    ; tip = the CONNECTED tip (3.1), not st[24]: a peer is never told
+    ; about a block this node has stored but not validated
+    mov  rdi, r14
+    call serve_public_tip
     mov  [s_cnt], rax     ; tip
     ; NET-8: hashStop, when it names a height we hold, caps the range Core
     ; would send. Only ever LOWERS the bound -- a stop above our tip is not a
@@ -1506,8 +1513,9 @@ node_serve_loop:
     xor  eax, eax
 .gb_havefrom:
     mov  [s_fh], rax        ; from
-    ; tip = st[24]
-    mov  eax, [r14+24]
+    ; tip = the CONNECTED tip (3.1); s_fh is a static, survives the call
+    mov  rdi, r14
+    call serve_public_tip
     mov  [s_cnt], rax
     mov  rax, [s_fh]
     cmp  rax, [s_cnt]
@@ -1864,7 +1872,8 @@ node_serve_loop:
     ; `inv`(MSG_BLOCK) by default, or a `headers` message when the peer
     ; negotiated `sendheaders` (BIP130). Updates s_lasttip so each new tip is
     ; announced exactly once.
-    mov  eax, [r14+24]        ; tip height (st[24])
+    mov  rdi, r14             ; 3.1: watch the CONNECTED tip, not st[24]
+    call serve_public_tip
     mov  [s_cnt], rax
     mov  rax, [s_lasttip]
     cmp  rax, [s_cnt]
@@ -1980,9 +1989,12 @@ node_announce_tip:
     ; (node_serve_block / hashing) clobbers r15 and caller-saved regs, so keep
     ; the mode in a stack slot rather than a live register.
     mov  [rbp-0x30], rcx      ; use_headers
-    ; tip height = *(int*)(st+24)
-    mov  eax, [r13+24]
-    test eax, eax
+    ; tip height = the CONNECTED tip (3.1): serve_public_tip(st) caps
+    ; *(int*)(st+24) by the worker's published connected height. Stack is
+    ; 16-aligned here (entry 8 + push rbp + 5 pushes + sub 8).
+    mov  rdi, r13
+    call serve_public_tip
+    test rax, rax
     js   .at_fail             ; no tip
     mov  ebx, eax             ; height (ebx, callee-saved)
     ; node_serve_block(st, h, sb_buf, cap) -> rax = length
