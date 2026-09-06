@@ -64,7 +64,41 @@ sha512_block:
 	stp x23, x24, [sp, #-16]!
 	stp x25, x26, [sp, #-16]!
 	stp x27, x28, [sp, #-16]!
-	sub sp, sp, #640            /* W[0..79] u64 at sp */
+	sub sp, sp, #640            /* W[0..79] u64 at sp -- IN THIS FRAME.
+	                             *
+	                             * ---- CRY-4 (audit 2026-09-03) ----
+	                             * The x86 twin built this 80-word schedule in
+	                             * `Wbuf: resb 80*8` in .bss -- one buffer
+	                             * shared by every caller in the process -- and
+	                             * this commit moved it into sha512_block's own
+	                             * frame. Two threads hashing concurrently
+	                             * overwrote each other's schedule mid-round and
+	                             * both produced wrong digests, silently: the
+	                             * class of defect behind the schnorr
+	                             * false-reject incident, latent on x86 only
+	                             * because every SHA-512 user -- BIP32 and BIP39
+	                             * derivation, wallet_crypter, wallet_store,
+	                             * the RPC key paths -- happens to run under
+	                             * rpc_server.c's g_exec_lock. Nothing enforced
+	                             * that; a caller from a tx_verify worker or the
+	                             * ZMQ/i2p threads would have derived wrong
+	                             * CHILD KEYS -- getnewaddress handing out an
+	                             * address nobody can spend.
+	                             *
+	                             * THIS PORT NEVER HAD THE BUG: the schedule has
+	                             * lived in this frame (640 bytes, a multiple of
+	                             * 16, so SP's alignment at any call is
+	                             * unchanged -- and this function makes no calls
+	                             * in any case) since the original port, which
+	                             * is why the round-28 thread-stress sweep
+	                             * already showed 0 sha512 mismatches while the
+	                             * hmac half still failed. The comment exists so
+	                             * the property is not "refactored" back into a
+	                             * shared buffer later: the schedule MUST stay
+	                             * per-call. Pinned by tests/test_sha512_thread_stress
+	                             * (8 threads x 400 iters x 13 lengths straddling
+	                             * both block edges and the 16-byte length-field
+	                             * boundary, 0 mismatches required). */
 
 	/* W[0..15] from 128-byte big-endian block */
 	mov x2, #0
