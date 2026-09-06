@@ -997,6 +997,12 @@ tests/test_anchors: tests/test_anchors.c daemon/anchors.c daemon/anchors.h daemo
 # -minimumchainwork are held (linkage + PoW only), released in order when the
 # chain crosses the floor, abandoned after LOWWORK_HOLD_PAGES; a short page is
 # appended as Core does. Negative control = the gate disarmed.
+# test_par_threads -- 2026-09-06: -par is Core's script-verification thread
+# count (total, caller included), not the download worker count it used to be
+# wired to. Asserts the READER, which is what was missing.
+tests/test_par_threads: tests/test_par_threads.c wallet_core.c $(TXACCEPTOBJS) $(WALLETPRIMS) $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_par_threads.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
+
 # test_archive_seed -- 2026-09-06: slot 0 of the archive index is genesis on
 # EVERY chain. main() skipped the seeding on mainnet, so a fresh mainnet
 # datadir whose first block came from the serial leg was shifted by one for

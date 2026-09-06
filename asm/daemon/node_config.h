@@ -138,6 +138,7 @@ typedef struct {
                                       * below: hashblock, hashtx, rawblock, rawtx,
                                       * sequence. Core default 1000.                      */
     int  par;                    /* Core -par: worker threads, 0 = auto      */
+    int catchup_workers;   /* bmc.catchupworkers: parallel download chunk workers (NOT -par) */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
     long mempoolexpiry_h;        /* Core -mempoolexpiry (hours, 0 = never)   */
