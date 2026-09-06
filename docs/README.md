@@ -44,6 +44,7 @@ response to it.
 | [`audits/INTERP_REVIEW_2026-09-05.md`](audits/INTERP_REVIEW_2026-09-05.md) | in-session code review of the script interpreter slice: 17 findings (1 CRITICAL, 5 HIGH), two live consensus false-accepts and three valid-block DoS shapes; all OPEN and unreproduced, with the order and discipline for closing them |
 | [`audits/DOCS_REVIEW_2026-09-05.md`](audits/DOCS_REVIEW_2026-09-05.md) | documentation consistency review of PR #11: 7 confirmed, all closed the same day; the reference systemd unit was publishing `LimitCORE=infinity` |
 | [`audits/CORE_COMPAT_SCOPES_2026-09-06.md`](audits/CORE_COMPAT_SCOPES_2026-09-06.md) | scoping reports CC-1..CC-10 for every remaining Core-compatibility item: design against this architecture, files, tests with negative controls, risks, order |
+| [`audits/UTXO_INLINE_CONNECT_SCOPE.md`](audits/UTXO_INLINE_CONNECT_SCOPE.md) | scope: building the UTXO set inline as blocks connect, Core's ConnectBlock model -- the tip is the connected tip, connect after every store, a failed connect is a rejection not a halt |
 
 ## Reports
 
