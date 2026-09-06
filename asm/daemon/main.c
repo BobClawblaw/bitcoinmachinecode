@@ -46,7 +46,8 @@
 #include "../mempool_slot.h"    /* the structural mempool's slot layout (80-byte slots) */
 #include "anchors.h"           /* CC-4: block-relay-only legs + anchors.dat */
 #include "hdr_lowwork.h"
-#include "archive_seed.h"       /* slot 0 is genesis on EVERY chain: a shifted archive reads every height one block high */       /* CC-5: hold low-work header pages until the chain proves its work */
+#include "archive_seed.h"
+#include "banlist.h"          /* the ban list survives a restart, as Core's does */       /* slot 0 is genesis on EVERY chain: a shifted archive reads every height one block high */       /* CC-5: hold low-work header pages until the chain proves its work */
 #include "invalid_set.h"       /* CC-10: invalidateblock / reconsiderblock */
 #include "cmpct_recv.h"        /* CC-2: BIP152 compact block receive */
 /* VAL-5 / MEM-1: the generated per-height script-flag mask
@@ -1497,6 +1498,43 @@ static long dl_reject_block(void* st, long h, const unsigned char hash[32], cons
     return 1;
 }
 
+/* ---- the ban list survives a restart (2026-09-06) -------------------------
+ * Core writes <datadir>/banlist.json whenever the list changes and at
+ * shutdown, and loads it at startup (banman.cpp). This node banned only in
+ * memory, so every restart forgave every ban -- a peer banned for a consensus
+ * violation returned the moment the node did. The register carried it as
+ * PARTIAL: "scored ... not persisted across restart".
+ *
+ * Called after every mutation of g_node_status->bans[]; cheap (64 entries)
+ * and rare (a ban, an unban, a clear). */
+static void banlist_persist(void)
+{
+    if (!g_node_status) return;
+    static ban_entry_t snap[RPC_MAX_BANS];
+    int n = 0;
+    for (int i = 0; i < RPC_MAX_BANS; i++){
+        if (!g_node_status->bans[i].until) continue;
+        snprintf(snap[n].subnet, sizeof snap[n].subnet, "%s", (const char*)g_node_status->bans[i].subnet);
+        snap[n].until   = g_node_status->bans[i].until;
+        snap[n].created = g_node_status->bans[i].created;
+        n++;
+    }
+    if (banlist_save(snap, n) != 0)
+        fprintf(stderr, "[ban] WARNING: could not write banlist.json -- bans will not survive a restart\n");
+}
+/* the loader's sink: same table, same rules, no RPC round trip */
+int ctl_ban_add(const char* subnet, long long until);   /* defined just below */
+static int banlist_restore_one(const char* subnet, long long until, long long created)
+{
+    if (!ctl_ban_add(subnet, until)) return 0;
+    for (int i = 0; i < RPC_MAX_BANS; i++)
+        if (g_node_status->bans[i].until == until &&
+            !strcmp((const char*)g_node_status->bans[i].subnet, subnet)){
+            if (created > 0) g_node_status->bans[i].created = created;   /* keep Core's ban_created */
+            break;
+        }
+    return 1;
+}
 /* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
 int ctl_ban_add(const char* subnet, long long until){
     if(!g_node_status || !subnet || !*subnet) return 0;
@@ -1530,7 +1568,7 @@ int ctl_ban_add(const char* subnet, long long until){
     g_node_status->bans[slot].created = (long long)time(NULL);
     __sync_synchronize();
     g_node_status->bans[slot].until = until;     /* published last */
-    return 1;
+    banlist_persist(); return 1;
 }
 
 /* Score a peer for a protocol violation. Returns 1 if this call banned it,
@@ -5933,6 +5971,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                             g_node_status->bans[i].until = 0;
                             result = 1; break;
                         }
+                    if(result == 1) banlist_persist();
                 } else {
                     /* ---- RPC-8 (audit 2026-09-03) ----
                      * This used to refuse any prefix that was not a multiple
@@ -5991,6 +6030,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             } else if(op == RPC_CTL_CLEARBANNED){
                 for(int i = 0; i < RPC_MAX_BANS; i++) g_node_status->bans[i].until = 0;
                 fprintf(stderr,"[ctl] ban list cleared\n");
+                banlist_persist();
                 result = 1;
             } else {
                 result = -1;
@@ -8316,6 +8356,10 @@ int main(int argc, char** argv){
      * mainnet datadir then built an archive shifted by one -- the serial leg
      * appends the first block a peer sends, and no peer relays genesis. See
      * archive_seed.h. */
+    /* the ban list, before anything dials or accepts: a restart must not
+     * forgive a ban (Core loads banlist.json at startup and sweeps expiries). */
+    { int nb = banlist_load((long long)time(NULL), banlist_restore_one);
+      if (nb < 0) fprintf(stderr, "[ban] banlist.json could not be read -- starting with no bans\n"); }
     { int sd = archive_seed_genesis_if_empty(store_buf, g_chainp->genesis, (unsigned long)g_chainp->genesis_len);
       if(sd < 0){ fprintf(stderr,"[boot] failed to seed the %s genesis block\n", g_chainp->name); return 1; }
       if(sd == 1) fprintf(stderr,"[boot] %s genesis seeded at height 0 (empty archive)\n", g_chainp->name); }
