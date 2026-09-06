@@ -87,6 +87,35 @@ stalls. Summed per progress tick and printed with the existing
 range into a number per regime. This is also what tells us whether the
 levers in §4.3 are needed at all.
 
+### Finding while scoping the cache model (2026-09-06, evening): the MuHash fold is on the bulk connect path
+
+`coinstats_index.c`'s `csi_on_add` / `csi_on_remove` run for every created
+output and every spent input during connect whenever `g_csi.valid` is set —
+and on a fresh sync it is set from the start (`csi_seed_from_walk` at applied
+height 0, `main.c:5055`). Each call is one MuHash3072 element: ChaCha
+expansion, SHA, and a 3072-bit modular multiply in `bitcoin_muhash.asm`.
+Measured in isolation on this host: **1.66 µs per element**. A full sync
+creates ~3.3 billion outputs and spends ~3.1 billion of them, so the fold
+alone is on the order of **6.4 billion × 1.66 µs ≈ 3 hours of single-threaded
+CPU on the connect thread** — the same order as the entire 4.5 h bulk phase.
+Step 0 now instruments it as phase (h); if the number holds, it is the
+largest single lever in this document, ahead of the WAL:
+
+1. **Bulk mode: do not fold per coin at all.** Leave the index invalid
+   while catching up and seed it from a walk at "caught up" — 165M coins ×
+   1.66 µs ≈ **5 minutes** — which is what `csi_seed_from_walk` already does
+   at boot. The same bulk/steady split the cache scope uses.
+2. **Steady state: take the fold off the connect thread.** MuHash is
+   commutative, so a fold worker consuming a ring of coin records (the
+   announce-ring shape) folds while the next block connects; the tip-regime
+   cost today is ~10k elements × 1.66 µs ≈ 17 ms per heavy block on the
+   connect thread.
+3. **A faster modmul.** `num3072_mul` is a plain limb loop (`mul`/`adc`);
+   BMI2/ADX (`mulx`/`adcx`/`adox`) chains are ~2×, and an AVX-512 IFMA
+   (52-bit limb) variant behind the same CPU-dispatch pattern the SHA-NI
+   path uses is 3–5×. Assembly work, cleanly separable, verified against the
+   existing Core vectors (`tests/muhash_vectors.h`).
+
 ### Step 1 — connect inside the download loop (the structural fix)
 
 Replace the monitor loop's `nanosleep(10 s)` with a **budgeted connect**:
