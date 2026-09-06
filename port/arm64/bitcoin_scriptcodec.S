@@ -343,6 +343,40 @@ check_minimal_push:
 vfexec:		.space 1024	/* condition stack (bytes) */
 vfexec_sp:	.space 8
 
+/* ---- IR-6 (INTERP_REVIEW_2026-09-05, x86 4efb0c4a): position -> slot handle
+ * table. stack_erase_index shifted whole 528-byte records to close a hole, so
+ * a tapscript of `<998> OP_ROLL` repeated cost O(rolls x records) in bytes
+ * moved (~445 GB, ~10 s for a 3.4 MB leaf -- a denial of service by a
+ * consensus-VALID block; the ARM twin measured 27.9 s for the pinning test's
+ * 200,000-roll storm). Core moves a 24-byte vector header instead.
+ *
+ * Records now stay put and POSITIONS move: hnd_tab[p] is the SLOT holding the
+ * element at position p, so a roll rotates 4-byte handles. hnd_tab is always a
+ * permutation of [0, MAX_STACK_SIZE), which is what lets pop/push reuse slots
+ * without a free list: pop leaves its slot at hnd_tab[sp], push takes it back.
+ *
+ * The table belongs to ONE arena, hnd_base -- the MAIN stack, the only one
+ * that rolls. Any other arena (the alt stack, and every caller outside
+ * script_eval) matches nothing, falls through to identity, and behaves exactly
+ * as it did before this change.
+ *
+ * script_eval registers the table on entry (hnd_begin) and, ONLY IF hnd_dirty,
+ * applies the permutation to the records on exit (hnd_end), so every reader
+ * outside still finds element p at elems + p*ELEM_SIZE with its data inline --
+ * the ABI bitcoin_scriptverify.c's sv_rec/sv_len/sv_dat and the test harnesses
+ * use, unchanged. A script that never rolls leaves hnd_dirty clear and pays
+ * nothing, which is what keeps IR-7's removal of the per-input arena traffic
+ * intact.
+ *
+ * Order matters for x86 parity: hnd_base, hnd_dirty, then hnd_tab, adjacent, so
+ * a (caller-bug) read of hnd_tab[-1] lands on hnd_dirty's high half on both
+ * twins, exactly as in asm/bitcoin_scriptcodec.asm. */
+	.global hnd_base, hnd_dirty, hnd_tab	/* TLS_ADDR's gottprel needs them global */
+	.align 8
+hnd_base:	.space 8
+hnd_dirty:	.space 8
+hnd_tab:	.space 4*1000
+
 	.text
 	.global elem_tmp0_addr
 	.type elem_tmp0_addr,%function
@@ -392,13 +426,159 @@ stack_depth:
 	add  \outreg, \outreg, \elemsreg
 	.endm
 
+/* ---- IR-6 handle layer (x86 4efb0c4a) ------------------------------------
+ * HND_ADDR elems,pos,out -- out := the RECORD address of POSITION pos in the
+ * arena elems: elems + hnd_tab[pos]*528 when that arena registered a table,
+ * else elems + pos*528 -- exactly the pre-IR-6 identity, so the alt stack and
+ * every caller outside script_eval behave as before. Clobbers out, pos (the
+ * SLOT it resolved to lands there), x10 (the u32 table load has to land in a
+ * w register, so the macro owns one scratch) and x17 (TLS_ADDR's tpidr_el0).
+ * HND_OF elems,out       -- out := the handle table when elems registered one,
+ * else 0 (= identity). Clobbers out and x17.
+ *
+ * WHY MACROS WHERE x86 HAS LOCAL FUNCTIONS: on x86 these are `call`ed, the
+ * position rides in rdx and the stashed args in callee-saved r12-r15.
+ * AArch64 has no callee-saved scratch below x19, so a `bl hnd_addr` out of a
+ * frameless primitive writes x30 with no save area -- the abi-a64 auditor's
+ * UNSAVED-CLOBBER gate -- and would force a prologue onto every mutating
+ * primitive, the very frame traffic IR-6 exists to remove. Inlining keeps
+ * stack_push/dup/erase/insert/swap frameless and lets the position travel in
+ * whatever scratch each caller can spare instead of a fixed rdx. The 528
+ * multiply is (p<<9)+(p<<4), so no constant register is needed either. */
+	.macro HND_ADDR elems, pos, out
+	TLS_ADDR \out, hnd_base
+	ldr  \out, [\out]			/* *hnd_base: the registered arena, not its address */
+	cmp  \elems, \out
+	b.ne .Lhnd_a\@_id
+	TLS_ADDR x10, hnd_tab
+	ldr  w10, [x10, \pos, lsl #2]	/* w10: hnd_tab[pos] (a u32 slot; x10 scratch) */
+	mov  \pos, x10
+.Lhnd_a\@_id:
+	lsl  \out, \pos, #9
+	add  \out, \out, \pos, lsl #4	/* slot * 528 */
+	add  \out, \out, \elems
+	.endm
+
+	.macro HND_OF elems, out
+	TLS_ADDR \out, hnd_base
+	ldr  \out, [\out]
+	cmp  \elems, \out
+	b.eq .Lhnd_o\@
+	mov  \out, xzr
+	b    .Lhnd_oc\@
+.Lhnd_o\@:
+	TLS_ADDR \out, hnd_tab
+.Lhnd_oc\@:
+	.endm
+
+/* hnd_begin(x0=main_elems) -> x0 = 1 if THIS call registered the table (the
+ * caller must pair it with hnd_end), 0 if a table was already registered -- a
+ * nested script_eval, which then simply runs on identity like the old code.
+ * Clobbers x0-x4, x10, x17; touches no callee-saved register. */
+	.global hnd_begin
+	.type hnd_begin,%function
+hnd_begin:
+	TLS_ADDR x2, hnd_base
+	ldr  x3, [x2]
+	cbnz x3, .hb_busy
+	str  x0, [x2]			/* hnd_base = main_elems */
+	TLS_ADDR x2, hnd_dirty
+	str  xzr, [x2]
+	TLS_ADDR x2, hnd_tab
+	mov  x3, xzr
+.hb_init:
+	str  w3, [x2, x3, lsl #2]	/* hnd_tab[p] = p (identity) */
+	add  x3, x3, #1
+	cmp  x3, #1000			/* MAX_STACK_SIZE */
+	b.lt .hb_init
+	mov  w0, #1
+	ret
+.hb_busy:
+	mov  w0, #0
+	ret
+	.size hnd_begin,.-hnd_begin
+
+/* hnd_end(x0=&sp, x1=main_elems) -- put the records back in position order
+ * (only if something rolled) and unregister. Cycle-following: every record is
+ * moved at most once, at most sp moves, and only for a script that rolled.
+ * Saves/restores x19-x24 + x29/x30 (elem_move is a leaf on x0-x3, so nothing
+ * else moves). */
+	.global hnd_end
+	.type hnd_end,%function
+hnd_end:
+	stp  x19,x20,[sp,#-16]!
+	stp  x21,x22,[sp,#-16]!
+	stp  x23,x24,[sp,#-16]!
+	stp  x29,x30,[sp,#-16]!
+	mov  x29,sp
+	TLS_ADDR x10, hnd_dirty
+	ldr  x10, [x10]
+	cbz  x10, .he_clear
+	ldr  x21, [x0]			/* sp */
+	mov  x20, x1			/* elems */
+	TLS_ADDR x24, hnd_tab
+	mov  x19, xzr			/* i */
+	/* Apply the permutation in place: slot p must end up holding the record
+	 * for position p, and hnd_tab[p] says where that record is NOW. Walk
+	 * each cycle once, carrying one record in elem_tmp0, and mark a visited
+	 * entry by setting hnd_tab[j] = j -- so every record moves at most once.
+	 *
+	 * (The x86 first draft swapped hnd_tab[p] with hnd_tab[q] alongside the
+	 * record swap. That is wrong: exchanging the CONTENTS of slots p and q
+	 * has to update whichever entries HOLD the values p and q, not the
+	 * entries AT indices p and q. It produced the mirrored permutation --
+	 * the IR-6 vectors caught it, which is what they were written for. The
+	 * ARM twin inherits those vectors, so this loop is the corrected form.) */
+.he_outer:
+	cmp  x19, x21
+	b.hs .he_clear
+	ldr  w10, [x24, x19, lsl #2]
+	cmp  x10, x19
+	b.eq .he_nexti			/* already home */
+	TLS_ADDR x0, elem_tmp0
+	ELEM_PTR x19, x20, x1		/* x1 = &rec[i] */
+	bl   elem_move			/* carry = rec[i] */
+	mov  x22, x19			/* j = i */
+.he_cyc:
+	ldr  w10, [x24, x22, lsl #2]
+	mov  x23, x10			/* k = hnd_tab[j] */
+	str  w22, [x24, x22, lsl #2]	/* hnd_tab[j] = j (visited) */
+	cmp  x23, x19
+	b.eq .he_cycend
+	ELEM_PTR x23, x20, x1		/* x1 = &rec[k] */
+	ELEM_PTR x22, x20, x0		/* x0 = &rec[j] */
+	bl   elem_move			/* rec[j] = rec[k] */
+	mov  x22, x23			/* j = k */
+	b    .he_cyc
+.he_cycend:
+	ELEM_PTR x22, x20, x0		/* x0 = &rec[j] */
+	TLS_ADDR x1, elem_tmp0
+	bl   elem_move			/* rec[j] = carry */
+.he_nexti:
+	add  x19, x19, #1
+	b    .he_outer
+.he_clear:
+	TLS_ADDR x10, hnd_base
+	str  xzr, [x10]
+	TLS_ADDR x10, hnd_dirty
+	str  xzr, [x10]
+	ldp  x29,x30,[sp],#16
+	ldp  x23,x24,[sp],#16
+	ldp  x21,x22,[sp],#16
+	ldp  x19,x20,[sp],#16
+	ret
+	.size hnd_end,.-hnd_end
+
 	.global stack_top_ptr
 	.type stack_top_ptr,%function
 stack_top_ptr:				/* x0=&sp, x1=elems -> A record */
 	ldr x2,[x0]
 	sub x2,x2,#1
-	ELEM_PTR x2, x1, x0
-	ret
+	HND_ADDR x1, x2, x0			/* IR-6: position -> slot */
+	ret					/* HND_ADDR is not a tail: it ENDS in the add,
+						   so the ret the ELEM_PTR version had has to
+						   stay here or this falls through into
+						   stack_second_ptr and subtracts again. */
 	.size stack_top_ptr,.-stack_top_ptr
 
 	.global stack_second_ptr
@@ -406,7 +586,7 @@ stack_top_ptr:				/* x0=&sp, x1=elems -> A record */
 stack_second_ptr:
 	ldr x2,[x0]
 	sub x2,x2,#2
-	ELEM_PTR x2, x1, x0
+	HND_ADDR x1, x2, x0			/* IR-6 */
 	ret
 	.size stack_second_ptr,.-stack_second_ptr
 
@@ -415,14 +595,14 @@ stack_second_ptr:
 stack_third_ptr:
 	ldr x2,[x0]
 	sub x2,x2,#3
-	ELEM_PTR x2, x1, x0
+	HND_ADDR x1, x2, x0			/* IR-6 */
 	ret
 	.size stack_third_ptr,.-stack_third_ptr
 
 	.global stack_elem_ptr
 	.type stack_elem_ptr,%function
 stack_elem_ptr:				/* x1=elems, x2=idx -> ptr */
-	ELEM_PTR x2, x1, x0
+	HND_ADDR x1, x2, x0			/* IR-6 */
 	ret
 	.size stack_elem_ptr,.-stack_elem_ptr
 
@@ -461,9 +641,10 @@ stack_push:				/* x0=&sp,x1=elems,x2=data,x3=len */
 	ldr  x4,[x12]
 	cmp  x4,#1000
 	b.hs .sp_push_fail
-	ELEM_PTR x4, x13, x6
-	str  w14,[x6]			/* len */
-	add  x7,x6,#4
+	HND_ADDR x13, x4, x0		/* IR-6: the record for POSITION sp -- under a */
+					/* table a SLOT, not elems+sp*528 */
+	str  w14,[x0]			/* len */
+	add  x7,x0,#4
 	mov  x8,x14
 	cbz  x8, .sp_push_ok
 1:	ldrb w9,[x2],#1
@@ -484,23 +665,25 @@ stack_push:				/* x0=&sp,x1=elems,x2=data,x3=len */
 	.global stack_push_copy
 	.type stack_push_copy,%function
 stack_push_copy:			/* x0=&sp,x1=elems,x2=src_rec */
-	ldr  x4,[x0]
-	cmp  x4,#1000
+	mov  x12,x0
+	mov  x14,x2			/* IR-6: the SOURCE is already a record address; */
+	ldr  x4,[x12]			/* only the destination is a position, so it is */
+	cmp  x4,#1000			/* stashed out of HND_ADDR's way (x4/x0/x17). */
 	b.hs .spc_fail
-	ELEM_PTR x4, x1, x6
-	ldr  w7,[x2]			/* len */
-	str  w7,[x6]
-	add  x8,x6,#4
-	add  x9,x2,#4
+	HND_ADDR x1, x4, x0		/* IR-6: destination = slot of position sp */
+	ldr  w7,[x14]			/* len */
+	str  w7,[x0]
+	add  x8,x0,#4
+	add  x9,x14,#4
 	cbz  w7, .spc_ok
 1:	ldrb w10,[x9],#1
 	strb w10,[x8],#1
 	subs w7,w7,#1
 	b.ne 1b
 .spc_ok:
-	ldr  x4,[x0]
+	ldr  x4,[x12]
 	add  x4,x4,#1
-	str  x4,[x0]
+	str  x4,[x12]
 	mov  w0,#1
 	ret
 .spc_fail:
@@ -511,25 +694,28 @@ stack_push_copy:			/* x0=&sp,x1=elems,x2=src_rec */
 	.global stack_dup_index
 	.type stack_dup_index,%function
 stack_dup_index:			/* x0=&sp,x1=elems,x2=raw_index */
-	ldr  x4,[x0]
+	mov  x12,x0
+	mov  x13,x1
+	mov  x14,x2			/* raw_index */
+	ldr  x4,[x12]			/* sp */
 	cmp  x4,#1000
 	b.hs .sdi_fail
-	ELEM_PTR x2, x1, x6		/* src */
-	ELEM_PTR x4, x1, x7		/* dst */
+	HND_ADDR x13, x14, x6		/* IR-6: src = slot of position raw_index */
+	HND_ADDR x13, x4, x0		/* IR-6: dst = slot of position sp */
 	ldr  w8,[x6]
-	str  w8,[x7]
-	add  x9,x7,#4
+	str  w8,[x0]
+	add  x7,x0,#4
 	add  x10,x6,#4
 	mov  x11,x8
 	cbz  w8, .sdi_ok
-1:	ldrb w12,[x10],#1
-	strb w12,[x9],#1
+1:	ldrb w11,[x10],#1
+	strb w11,[x7],#1
 	subs w8,w8,#1
 	b.ne 1b
 .sdi_ok:
-	ldr  x4,[x0]
+	ldr  x4,[x12]
 	add  x4,x4,#1
-	str  x4,[x0]
+	str  x4,[x12]
 	mov  w0,#1
 	ret
 .sdi_fail:
@@ -542,8 +728,40 @@ stack_dup_index:			/* x0=&sp,x1=elems,x2=raw_index */
 stack_erase_index:			/* x0=&sp,x1=elems,x2=raw_index */
 	mov  x12,x0
 	mov  x13,x1
+	mov  x14,x2			/* raw_index */
+	HND_OF x13, x0
+	cbz  x0, .ser_records
+	/* IR-6: THE finding. Closing the hole used to shift every record above
+	 * the index -- 528 bytes each, and OP_ROLL is erase+append with no
+	 * tapscript opcode cap. With a table it shifts 4-byte handles, and the
+	 * erased slot lands at handles[sp-1] where the next push picks it up
+	 * (the table stays a permutation of [0, MAX_STACK_SIZE)). */
+	ldr  w9, [x0, x14, lsl #2]	/* h = handles[idx] */
+	ldr  x8, [x12]
+	sub  x8, x8, #1			/* last = sp-1 */
+	mov  x10, x14			/* j = idx */
+.ser_hshift:
+	cmp  x10, x8
+	b.hs .ser_hdone
+	add  x11, x10, #1
+	ldr  w11, [x0, x11, lsl #2]	/* handles[j] = handles[j+1] */
+	str  w11, [x0, x10, lsl #2]
+	add  x10, x10, #1
+	b    .ser_hshift
+.ser_hdone:
+	str  w9, [x0, x8, lsl #2]		/* handles[last] = the erased slot */
+	TLS_ADDR x10, hnd_dirty
+	mov  x11, #1
+	str  x11, [x10]
+	ldr  x4, [x12]
+	sub  x4, x4, #1
+	str  x4, [x12]
+	ret
+.ser_records:
+	/* no table for this arena (the alt stack, or a caller outside
+	 * script_eval): the pre-IR-6 record shift, unchanged. */
 	ldr  x4,[x12]			/* sp */
-	mov  x5,x2
+	mov  x5,x14
 	add  x6,x5,#1			/* j = raw+1 */
 1:	cmp  x6,x4
 	b.hs .ser_done
@@ -584,6 +802,46 @@ stack_insert_index:			/* x0=&sp,x1=elems,x2=raw,x3=data,x4=len */
 	ldr  x4,[x12]
 	cmp  x4,#1000
 	b.hs .sii_fail
+	HND_OF x13, x0
+	cbz  x0, .sii_records
+	/* IR-6: opening the hole shifts 4-byte handles, and the new element is
+	 * written into handles[sp] -- the slot the last pop/erase freed. (OP_TODEP
+	 * is insert+erase; without this it moved records like OP_ROLL did.) */
+	ldr  w9, [x0, x4, lsl #2]	/* h = handles[sp], the free slot */
+	mov  x10, x4			/* j = sp */
+.sii_ishift:
+	cmp  x10, x14
+	b.ls .sii_idone
+	sub  x11, x10, #1
+	ldr  w11, [x0, x11, lsl #2]	/* handles[j] = handles[j-1] */
+	str  w11, [x0, x10, lsl #2]
+	sub  x10, x10, #1
+	b    .sii_ishift
+.sii_idone:
+	str  w9, [x0, x14, lsl #2]	/* handles[raw] = h */
+	lsl  x0, x9, #9
+	add  x0, x0, x9, lsl #4
+	add  x0, x0, x13		/* dst = elems + h*528 (a slot, not a position) */
+	str  w16,[x0]			/* len */
+	add  x8,x0,#4
+	mov  x0,x15
+	mov  x11,x16
+	cbz  x11, .sii_dirty
+4:	ldrb w2,[x0],#1
+	strb w2,[x8],#1
+	subs x11,x11,#1
+	b.ne 4b
+.sii_dirty:
+	TLS_ADDR x10, hnd_dirty
+	mov  x11, #1
+	str  x11, [x10]
+	ldr  x4,[x12]
+	add  x4,x4,#1
+	str  x4,[x12]
+	mov  w0,#1
+	ret
+.sii_records:
+	/* no table for this arena: the pre-IR-6 record shift, unchanged. */
 	sub  x5,x4,#1			/* j = sp-1 */
 1:	cmp  x5,x14
 	b.lo .sii_sd
@@ -624,6 +882,29 @@ stack_insert_index:			/* x0=&sp,x1=elems,x2=raw,x3=data,x4=len */
 	.global stack_swap_two
 	.type stack_swap_two,%function
 stack_swap_two:				/* x0=&sp,x1=elems */
+	mov  x12,x0
+	mov  x13,x1
+	HND_OF x13, x0
+	cbz  x0, .ssw_records
+	/* IR-6: with a handle table, swapping two POSITIONS is swapping two
+	 * 4-byte handles; the records do not move. (OP_SWAP reaches here; on x86
+	 * this is the same fast path, so a swap-heavy script costs the ARM twin
+	 * the same 8 bytes of stores.) */
+	ldr  x9, [x12]			/* sp */
+	sub  x10, x9, #1
+	sub  x11, x9, #2
+	ldr  w4, [x0, x10, lsl #2]	/* h1 = handles[sp-1] */
+	ldr  w5, [x0, x11, lsl #2]	/* h2 = handles[sp-2] */
+	str  w5, [x0, x10, lsl #2]
+	str  w4, [x0, x11, lsl #2]
+	TLS_ADDR x9, hnd_dirty
+	mov  x10, #1
+	str  x10, [x9]
+	ret
+.ssw_records:
+	/* no table for this arena: the pre-IR-6 record swap, unchanged. */
+	mov  x0,x12
+	mov  x1,x13
 	stp  x29,x30,[sp,#-16]!		/* save our return addr; bl elem_move clobbers x30 */
 	mov  x29,sp
 	ldr  x2,[x0]

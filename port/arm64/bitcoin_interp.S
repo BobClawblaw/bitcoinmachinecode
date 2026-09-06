@@ -289,6 +289,11 @@ interp_memeq:
 	.equ SL_ET2,0x98
 	.equ SL_ET3,0xa0
 	.equ SL_SNUMOVF,0xa8
+	.equ SL_HND,0xb0		/* IR-6: hnd_begin() returned 1 (this call owns the */
+					/* handle table) and must pair it with hnd_end(). */
+					/* 0xb0/0xb8 were the two spare slots of the 0xC0 */
+					/* frame; x86 took [rbp-0x110] out of the same
+					/* reservation growth (0x108 -> 0x118). */
 
 	/* macros */
 	.macro CSTK		/* x0=&state.sp, x1=state.elems */
@@ -369,6 +374,22 @@ script_eval:
 	str  x2,[sp,#SL_ET3]
 	TLS_ADDR x2, snum_overflow
 	str  x2,[sp,#SL_SNUMOVF]
+
+	/* IR-6 (x86 4efb0c4a): register the position->slot handle table for the
+	 * MAIN stack, so a roll rotates 4-byte handles instead of shifting
+	 * 528-byte records. Returns 0 if a table is already registered (a nested
+	 * script_eval) -- then no table applies here, every primitive falls back
+	 * to identity, and this evaluation behaves exactly as it did pre-IR-6.
+	 * It must run BEFORE the first possible exit below (the script-size
+	 * check jumps straight to .err_ret0), exactly as on x86, so that the
+	 * .done epilogue always finds the flag initialised.
+	 * Register discipline: hnd_begin touches x0-x3 + x17 only -- the ARM
+	 * twin keeps its long-lived state in callee-saved x19/x20/x24, so the
+	 * call needs no extra save here (x86 had to keep r12 alive across the
+	 * same call by pushing rdi/rsi, which AAPCS64 gives us for free). */
+	ldr  x0,[x20]			/* main_elems */
+	bl   hnd_begin
+	str  x0,[sp,#SL_HND]
 
 	/* script size limit (BASE/WITNESS_V0) */
 	ldr  w2,[x20,#48]
@@ -2045,6 +2066,21 @@ script_eval:
 2:	mov  w0,#0
 .done:
 	/* epilogue */
+	/* IR-6 (x86 4efb0c4a): put the records back in position order (only if
+	 * something rolled) and unregister, so every reader OUTSIDE still finds
+	 * element p at elems + p*ELEM_SIZE with its data inline -- the ABI the
+	 * C harnesses and bitcoin_scriptverify.c use. Reached by EVERY exit
+	 * (both the verdict paths and .err_ret0), matching x86. x0 holds the
+	 * verdict; it rides through in callee-saved x19 (hnd_end preserves
+	 * x19-x24). sp is 16-aligned here: 4 paired pushes + a 0xC0 frame. */
+	ldr  x9,[sp,#SL_HND]
+	cbz  x9,.no_hnd_end
+	mov  x19,x0			/* verdict */
+	add  x0,x20,#8			/* &main_sp */
+	ldr  x1,[x20]			/* main_elems */
+	bl   hnd_end
+	mov  x0,x19
+.no_hnd_end:
 	add  sp,sp,#0xC0
 	ldp  x23,x24,[sp],#16
 	ldp  x21,x22,[sp],#16
