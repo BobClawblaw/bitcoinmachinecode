@@ -5141,9 +5141,16 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * fresh sync). Skip it: the index stays invalid and seeds from
              * ONE walk when utxo_live downshifts to steady state. */
             if (utxo_live_bulk_mode())
-                csi_defer_to_caught_up();
-            else if (!csi_boot(ah))
-                csi_seed_from_walk(utxo_live_lst(), utxo_live_table(), ah);
+                csi_defer_to_caught_up();       /* csi_on_caught_up seeds AND starts the fold worker */
+            else {
+                extern int csi_worker_start(void);
+                if (!csi_boot(ah))
+                    csi_seed_from_walk(utxo_live_lst(), utxo_live_table(), ah);
+                /* Steady state: fold OFF the connect thread (lever 2). The
+                 * worker inherits the adopted/seeded state; from here the
+                 * observers push records to the shared ring. */
+                csi_worker_start();
+            }
         }
     }
     if(!archive_ok) fprintf(stderr,"[dl] refusing to build UTXO state on an archive that failed verification\n");
@@ -5986,6 +5993,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * daemon/utxo_live.c. */
             { extern void utxo_live_close(void) __attribute__((weak));
               if (utxo_live_close) utxo_live_close(); }
+            /* utxo_live_close's checkpoint pushed the last commit marker;
+             * now a STOP marker behind it and wait for the fold worker to
+             * persist coinstats.dat (bounded; a kill only costs a re-seed). */
+            { extern void csi_worker_stop(void) __attribute__((weak));
+              if (csi_worker_stop) csi_worker_stop(); }
             _exit(0);
         }
         long long now_ms = 0;
@@ -8632,6 +8644,12 @@ int main(int argc, char** argv){
          * publish nothing and report no error. */
         zmqn_set_status(g_node_status);
         txann_set_status(g_node_status);          /* CC-1: the announce ring lives in the same block */
+        /* the coinstats fold ring + watermark (2026-09-06): the worker
+         * pushes, its forked fold worker drains, THIS parent's
+         * gettxoutsetinfo gates on the watermark. Weak: the dial/sync
+         * harnesses that link this file omit daemon/coinstats_index.c. */
+        { extern void csi_set_status(void*) __attribute__((weak));
+          if (csi_set_status) csi_set_status(g_node_status); }
 
         /* gettxout IPC channel, created BEFORE the fork so both sides inherit
          * it: the RPC in this parent asks the worker, which owns the live
