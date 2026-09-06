@@ -18,6 +18,16 @@ m39_prev: .space 64
 m39_cur:  .space 64
 m39_acc:  .space 64
 m39_nw:   .space 8
+/* WAL-11 canary. The overflow this module used to allow ran FORWARD from
+ * m39_idx through every buffer above, so the only way to observe it from C is
+ * to give it something to land in past the last of them: 400 words wrote
+ * 1,600 bytes where m39_idx..m39_nw is 1,328. Exported so tests/test_bip39.c
+ * can assert it stays zero -- remove the `cmp x20,#24` bound in bip39_parse
+ * and that assertion fails, which is what makes the test a real control
+ * rather than a restatement of the word-count check. */
+    .global m39_guard
+m39_guard:
+    .space 512
     .section .rodata
 m39_seed_salt:
     .ascii "mnemonic"
@@ -281,6 +291,16 @@ bip39_parse:
     ldp  x9,x10,[sp],#16
     cmp  x0,#-1
     b.eq .bp_invalid
+    /* ---- WAL-11 (audit 2026-09-03): BOUND THE INDEX ARRAY ----
+     * m39_idx holds 24 dwords (96 bytes) and the 12/15/18/21/24 word-count
+     * check is at .bp_tok_done, i.e. AFTER this loop -- so a 25th valid word
+     * wrote past the array, and `wallet_cli seed "<400 valid words>"` walked
+     * 1.6 KB through m39_salt, m39_msg and into the next object's .bss. The
+     * count check cannot move earlier (it needs the final total), so the
+     * bound belongs here. A mnemonic longer than 24 words can never be valid,
+     * so refusing it early loses nothing. */
+    cmp  x20,#24
+    b.hs .bp_invalid
     adrp x12,m39_idx
     add  x12,x12,:lo12:m39_idx
     str  w0,[x12,x20,lsl#2]
@@ -483,6 +503,27 @@ bip39_mnemonic_to_seed:
     mov  x20,x1                /* mn   */
     mov  x21,x2                /* pass */
     mov  x22,x3                /* passlen */
+    /* ---- CRY-4 (audit 2026-09-03): BOUND THE PASSPHRASE ----
+     *
+     * The salt is built as "mnemonic" || passphrase into m39_salt, which is
+     * 512 bytes -- so a passphrase over 504 bytes wrote past it into m39_msg,
+     * and the copy had no bound at all. Reachable without any RPC: the wallet
+     * store reads BMC_WALLET_PASS with strlen and daemon/wallet_cli.c takes
+     * the passphrase as a command-line argument, neither of which was capped.
+     * (hmac_sha512's own `tmp` scratch has 1032 bytes of room for the message,
+     * so THIS buffer is the one that goes first.)
+     *
+     * 504 is the real capacity, not a smaller round number: anything that
+     * derived a seed correctly before must still derive the SAME seed, or a
+     * wallet becomes unopenable. Everything past it produced corruption, and
+     * now produces a clean 0.
+     *
+     * A negative length is refused for the same reason -- the copy loop's
+     * bound is a signed compare. */
+    cmp  x22,#0
+    b.lt .bm_toolong
+    cmp  x22,#504
+    b.gt .bm_toolong
     mov  x0,x20
     bl   bip39_strlen
     mov  x23,x0                /* mnlen */
@@ -585,6 +626,75 @@ bip39_mnemonic_to_seed:
     b    .bm_se
 .bm_sed:
     mov  w0,#1
+    b    .bm_wipe
+    /* ---- WAL-3 (audit 2026-09-03): the derivation leaves the SEED behind ----
+     *
+     * m39_acc IS the 64-byte seed -- the copy above hands the caller a
+     * duplicate and the original stayed in .bss for the life of the process.
+     * m39_prev and m39_cur hold PBKDF2 intermediates derived from it,
+     * m39_salt holds "mnemonic" || the BIP39 passphrase, and m39_msg holds
+     * the same plus the block index. So `walletlock` could zero g_seed and
+     * still leave the seed and the passphrase readable through
+     * /proc/<pid>/mem, a swap partition or a hibernation image.
+     *
+     * Cleared unconditionally on the way out, including the refusal path.
+     * Each by name rather than one sweep over the three: they are declared
+     * consecutively today, but nothing enforces that, and a future `align`
+     * between them would silently turn one sweep into a partial wipe. */
+.bm_toolong:
+    mov  w0,#0                  /* CRY-4: passphrase over m39_salt capacity */
+.bm_wipe:
+    adrp x9,m39_salt
+    add  x9,x9,:lo12:m39_salt
+    mov  x10,#0
+.bm_zs1:
+    cmp  x10,#512
+    b.hs .bm_zs1d
+    strb wzr,[x9,x10]
+    add  x10,x10,#1
+    b    .bm_zs1
+.bm_zs1d:
+    adrp x9,m39_msg
+    add  x9,x9,:lo12:m39_msg
+    mov  x10,#0
+.bm_zs2:
+    cmp  x10,#520
+    b.hs .bm_zs2d
+    strb wzr,[x9,x10]
+    add  x10,x10,#1
+    b    .bm_zs2
+.bm_zs2d:
+    adrp x9,m39_prev
+    add  x9,x9,:lo12:m39_prev
+    mov  x10,#0
+.bm_zs3:
+    cmp  x10,#64
+    b.hs .bm_zs3d
+    strb wzr,[x9,x10]
+    add  x10,x10,#1
+    b    .bm_zs3
+.bm_zs3d:
+    adrp x9,m39_cur
+    add  x9,x9,:lo12:m39_cur
+    mov  x10,#0
+.bm_zs4:
+    cmp  x10,#64
+    b.hs .bm_zs4d
+    strb wzr,[x9,x10]
+    add  x10,x10,#1
+    b    .bm_zs4
+.bm_zs4d:
+    adrp x9,m39_acc
+    add  x9,x9,:lo12:m39_acc
+    mov  x10,#0
+.bm_zs5:
+    cmp  x10,#64
+    b.hs .bm_zs5d
+    strb wzr,[x9,x10]
+    add  x10,x10,#1
+    b    .bm_zs5
+.bm_zs5d:
+.bm_ret:
     ldp  x27,x28,[sp],#16
     ldp  x25,x26,[sp],#16
     ldp  x23,x24,[sp],#16
