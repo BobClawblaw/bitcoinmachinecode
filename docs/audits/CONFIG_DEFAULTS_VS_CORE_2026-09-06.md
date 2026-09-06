@@ -17,7 +17,7 @@ divergence is discussed before it ships.
 | `coinstatsindex` | 1 | 0 | same: disk and sync time a default Core node never pays |
 | `limitancestorcount` | 64 | 25 | **enforced at acceptance here** (`tx_accept.c`), so we accepted chains Core's default refuses |
 | `limitdescendantcount` | 64 | 25 | same |
-| ~~`debuglogfile`~~ | `logs/bitcoind.log` | `debug.log` | **NOT changed — agreed divergence.** Core's `DEFAULT_DEBUGLOGFILE` is `debug.log` in the net-specific datadir (`logging.cpp:23`); we keep a `logs/` subdir per chain because this node's operations are built around it |
+| `debuglogfile` | `logs/bitcoind.log` | `debug.log` | **FIXED.** Core's `DEFAULT_DEBUGLOGFILE` (`logging.cpp:23`) is `debug.log`, resolved against the net-specific datadir. Every chain here has its own directory and the daemon chdir()s into it, so a bare `debug.log` lands in exactly the same place Core's does |
 | `pid` | unset (no pid file) | `bitcoind.pid` | Core writes one by default |
 | `par` (clamp) | uncapped | 15 workers + caller | Core clamps to `MAX_SCRIPTCHECK_THREADS`; `par=0` gave us 32 threads and Core 16 |
 
@@ -72,7 +72,7 @@ download worker count and the verifier ignored it entirely.
 | `datacarrier` | 1 | 1 | match |
 | `datacarriersize` | 100000 | 100000 | match |
 | `dbcache` | 1024 | (none stated) | match (DEFAULT_DB_CACHE 1024; our devlog's "450" is stale) |
-| `debuglogfile` | logs/bitcoind.log | debug.log | **kept** — agreed divergence, see above |
+| `debuglogfile` | logs/bitcoind.log | debug.log | **FIXED** logs/bitcoind.log -> debug.log (chain dir, as Core) |
 | `disablewallet` | 0 | (none stated) | match (DEFAULT_DISABLE_WALLET false) |
 | `discardfee` | 0.0001 | 0.0001 | match |
 | `discover` | 1 | 1 | match |
@@ -196,3 +196,16 @@ matches Core's — `par` was the example that started this: the name, the 0/nega
 convention and the default all matched Core while the setting drove the wrong
 subsystem entirely. A key is only really verified when a test asserts its READER.
 
+## Two behavioural notes this audit turned up (NOT defaults)
+
+- **`rpcwhitelistdefault`** — the sample config listed a default of `1`; the
+  effective default is *unset*, and Core derives it: `GetBoolArg(
+  "-rpcwhitelistdefault", !GetArgs("-rpcwhitelist").empty())`. Our runtime
+  already does exactly that (`rpc_server.c`, `wl_default_effective`), so the
+  behaviour matched and only the documentation was wrong. Fixed.
+- **`blockversion`** — Core honours `-blockversion` **only on chains with
+  `MineBlocksOnDemand()`** (regtest); `node/miner.cpp:148`. This node applies
+  it wherever it is set (`rpc_chain.c`, `g_gbt_version`). A mainnet operator
+  setting it would change the version this node puts in `getblocktemplate`
+  where Core would ignore it. **Open — behavioural, not a default**, and it
+  needs a decision before it is changed.

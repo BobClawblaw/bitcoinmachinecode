@@ -78,13 +78,12 @@ static void mempool_refresh_seqlocks(void* store_buf, long now_tip);
  * chains: logs/bitcoind.log on mainnet, logs/bitcoind.<chain>.log otherwise
  * (all under the per-chain datadir's own logs/). Set at boot right after
  * chainparams_select; the static default covers every tool-mode caller. */
-/* DELIBERATE, DISCUSSED divergence from Core (2026-09-06, operator's call):
- * Core's -debuglogfile defaults to "debug.log" (logging.cpp:23,
- * DEFAULT_DEBUGLOGFILE), relative to the net-specific datadir. We keep
- * logs/bitcoind.log inside the CHAIN directory instead -- a logs/ subdir per
- * chain, which is what this node's operations and log rotation are built
- * around. Recorded in docs/audits/CONFIG_DEFAULTS_VS_CORE_2026-09-06.md. */
-static char g_logpath[256] = "logs/bitcoind.log";   /* debuglogfile= overrides (0 = /dev/null) */
+/* Core's -debuglogfile default, exactly: "debug.log" (logging.cpp:23,
+ * DEFAULT_DEBUGLOGFILE), relative to the NET-SPECIFIC datadir. Every chain
+ * here already has its own directory and the daemon chdir()s into it, so a
+ * bare "debug.log" lands at <chain-datadir>/debug.log -- the same file, in
+ * the same place, as Core. (This was logs/bitcoind.log until 2026-09-06.) */
+static char g_logpath[256] = "debug.log";   /* debuglogfile= overrides (0 = /dev/null) */
 #include "../rpc_server.h"   /* embedded JSON-RPC server (docs/RPC_LIVE_NODE.md) */
 #include "../rpc_chain.h"
 #include "../rpc_wallet_ops.h"
@@ -8246,14 +8245,13 @@ int main(int argc, char** argv){
       fprintf(stderr, "[boot] tx-validation snapshot %s (%.2fs) -- inbound peers inherit it\n",
               ok ? "ready" : "UNAVAILABLE (inbound tx will be dropped, not accepted)",
               phase_elapsed(&txdv_pt)); }
-    /* Each chain keeps its own logs under <chain-datadir>/logs/ -- the asm
-     * logger (node_log_open) writes there via the cwd, so a regtest run can
-     * never interleave with the mainnet log. */
+    /* Each chain logs into its OWN directory -- the asm logger
+     * (node_log_open) writes via the cwd, which is the chain datadir, so a
+     * regtest run can never interleave with the mainnet log. The file is
+     * debug.log, as Core's is, and Core separates chains the same way: by
+     * directory, not by filename. logs/ is still created because the
+     * benchmark and soak harnesses put their own files there. */
     mkdir("logs", 0755);
-    if(g_chainp->id != CHAIN_MAIN)
-        ;   /* logs/bitcoind.log inside the CHAIN's directory -- per-chain by
-             * location now that every chain (main included) has its own
-             * subdirectory; the old bitcoind.<chain>.log suffix is redundant */
     /* `dir` is the EFFECTIVE (per-chain) datadir from here on: the forked
      * download worker re-chdir()s into it and utxo_live opens its files
      * there -- on the first regtest boot the worker's chdir(absp) put the
