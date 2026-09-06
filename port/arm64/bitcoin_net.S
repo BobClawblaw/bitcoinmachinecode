@@ -455,6 +455,43 @@ p2p_read:
 	cmp x0, x1
 	b.ne .PREOF
 .PRNOCPY:
+	/* ---- NET-11 (audit 2026-09-03): VERIFY THE PAYLOAD CHECKSUM ----
+	 * The header's checksum[4] (hdr+20) was read into the frame and never
+	 * compared with sha256d(payload)[0:4], so a corrupted or deliberately
+	 * mis-checksummed message was processed as if it were sound. Core's
+	 * V1Transport::GetMessage rejects it ("Checksum mismatch") and
+	 * disconnects, so a mismatch here goes to .PREOF -- the same exit a bad
+	 * magic takes, which is exactly the audit's suggestion.
+	 *
+	 * ONLY when the whole payload was kept. If announced exceeded the
+	 * caller's cap the excess is drained below and never lands in the
+	 * buffer, and a digest over the prefix would be a guaranteed false
+	 * mismatch; the message is already reported as truncated in that case.
+	 *
+	 * An EMPTY payload is checked too, not skipped: Core verifies the
+	 * sha256d("") prefix on verack and friends, and a peer sending garbage
+	 * there is as wrong as one sending garbage anywhere else.
+	 *
+	 * cksum4 lives in this same file (it is what p2p_write uses to PRODUCE
+	 * the field), so this adds no link dependency to any of the sixty-odd
+	 * targets that carry bitcoin_net.o. x86 stows the 4-byte output in a
+	 * reserved frame gap; this frame has none, so the scratch is drain[0:4]
+	 * (sp+32) -- pure scratch until the drain loop below overwrites it, and
+	 * the compare happens before any drain write. cksum4 preserves x19-x21
+	 * itself and sha256d honours AAPCS64 callee-saved, so fd, cmd_out,
+	 * payload, cap and plen_out (x19-x23) all survive the call. */
+	ldr  w0, [sp, #24]              /* announced */
+	cmp  w0, w22                    /* cap */
+	b.hi .PRCKSUM                   /* truncated -- cannot verify what we did not keep */
+	add  x0, sp, #32                /* 4-byte scratch: sha256d(payload)[0:4] */
+	mov  x1, x21                    /* payload */
+	ldr  w2, [sp, #24]              /* len = announced (0 checked too) */
+	bl   cksum4
+	ldr  w1, [sp, #32]              /* computed checksum */
+	ldr  w2, [sp, #20]              /* header's checksum[4] (hdr+20) */
+	cmp  w1, w2
+	b.ne .PREOF                     /* Core: "Checksum mismatch" -> drop the peer */
+.PRCKSUM:
 	/* drain announced - tocopy */
 	ldr w0, [sp, #24]
 	ldr w1, [sp, #28]
