@@ -98,6 +98,7 @@ typedef struct {
  * (404KB payload each) and rides out the bursts; overrun past that is
  * counted and reported, which is all a lossy PUB feed owes anyone. */
 #define RPC_ZMQ_RING           64
+#define RPC_ANN_RING           1024   /* CC-1 announce ring (see ann_ring) */
 #define RPC_ZMQ_TXMAX          RPC_TXSUBMIT_MAX
 
 typedef struct {
@@ -286,6 +287,22 @@ typedef struct {
         volatile int          score;
         char                  ip[64];
     } misbehavior[RPC_MISBEHAVIOR_SLOTS];
+    /* CC-1 (2026-09-06): the transaction ANNOUNCE ring. Every accept path
+     * (tx_accept.c, in whichever process accepted -- the worker for
+     * outbound/RPC, a forked serve child for inbound) claims a slot with an
+     * atomic increment on ann_seq and fills it; every inbound serve child
+     * drains it on its own cursor and announces what it has not seen to its
+     * peer, and the worker drains it to feed inbound-origin transactions to
+     * the outbound legs. Same producer/consumer shape as zmq_ring above; the
+     * entries are 64 bytes, so a lapped consumer resyncs cheaply. */
+    volatile unsigned long long ann_seq;
+    struct {
+        volatile unsigned long long ready;     /* seq+1 once filled; 0 = empty */
+        unsigned char               txid[32];
+        volatile unsigned long long fee;       /* satoshis; 0 = unknown */
+        volatile unsigned long      vsize;     /* vbytes;   0 = unknown */
+        volatile int                src_slot;  /* peer-table slot that delivered it; -1 = worker/RPC */
+    } ann_ring[RPC_ANN_RING];
 } node_status_t;
 
 /* Hand the RPC layer the shared status region (call before rpc_server_start).

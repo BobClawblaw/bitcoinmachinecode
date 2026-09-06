@@ -26,6 +26,7 @@ default rel
     extern p2p_read
     extern p2p_write
     extern serve_getaddr
+    extern txann_wait               ; CC-1: announce accepted txs to this peer while waiting to read
 extern g_peer_wants_addrv2
     extern idx_get
     extern serve_inv_bounds
@@ -393,6 +394,19 @@ node_serve_loop:
     ; etc.); r15 is callee-saved so the external calls preserve it.
     mov  r15, 10000          ; (retained: reserved, unused bound)
 .outer:
+    ; ---- CC-1 (2026-09-06): before blocking in p2p_read, let the C side poll
+    ; the socket in sub-second slices and, between slices, announce whatever
+    ; the node has accepted since this peer last heard from us (the shared
+    ; announce ring, rpc_node.h). Returns 1 when the socket is readable (fall
+    ; through to the read exactly as before) or 0 when the NET-3 idle bound
+    ; expired with nothing to read -- the same outcome the SO_RCVTIMEO on the
+    ; socket used to produce from inside p2p_read, so .done is the right exit.
+    ; txann_wait(fd, peer_feefilter)
+    mov  rdi, r12
+    mov  rsi, [s_peerfee]
+    call txann_wait
+    test rax, rax
+    jz   .done
     ; ---- read a message ----
     mov  qword [s_plen], 0
     mov  rdi, r12
