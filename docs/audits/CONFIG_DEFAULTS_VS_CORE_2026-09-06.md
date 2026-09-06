@@ -17,7 +17,7 @@ divergence is discussed before it ships.
 | `coinstatsindex` | 1 | 0 | same: disk and sync time a default Core node never pays |
 | `limitancestorcount` | 64 | 25 | **enforced at acceptance here** (`tx_accept.c`), so we accepted chains Core's default refuses |
 | `limitdescendantcount` | 64 | 25 | same |
-| `debuglogfile` | `logs/bitcoind.log` | `debug.log` | log lands where Core's does |
+| ~~`debuglogfile`~~ | `logs/bitcoind.log` | `debug.log` | **NOT changed — agreed divergence.** Core's `DEFAULT_DEBUGLOGFILE` is `debug.log` in the net-specific datadir (`logging.cpp:23`); we keep a `logs/` subdir per chain because this node's operations are built around it |
 | `pid` | unset (no pid file) | `bitcoind.pid` | Core writes one by default |
 | `par` (clamp) | uncapped | 15 workers + caller | Core clamps to `MAX_SCRIPTCHECK_THREADS`; `par=0` gave us 32 threads and Core 16 |
 
@@ -72,7 +72,7 @@ download worker count and the verifier ignored it entirely.
 | `datacarrier` | 1 | 1 | match |
 | `datacarriersize` | 100000 | 100000 | match |
 | `dbcache` | 1024 | (none stated) | match (DEFAULT_DB_CACHE 1024; our devlog's "450" is stale) |
-| `debuglogfile` | logs/bitcoind.log | debug.log | **FIXED** logs/bitcoind.log -> debug.log |
+| `debuglogfile` | logs/bitcoind.log | debug.log | **kept** — agreed divergence, see above |
 | `disablewallet` | 0 | (none stated) | match (DEFAULT_DISABLE_WALLET false) |
 | `discardfee` | 0.0001 | 0.0001 | match |
 | `discover` | 1 | 1 | match |

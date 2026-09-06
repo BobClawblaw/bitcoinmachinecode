@@ -78,7 +78,13 @@ static void mempool_refresh_seqlocks(void* store_buf, long now_tip);
  * chains: logs/bitcoind.log on mainnet, logs/bitcoind.<chain>.log otherwise
  * (all under the per-chain datadir's own logs/). Set at boot right after
  * chainparams_select; the static default covers every tool-mode caller. */
-static char g_logpath[256] = "debug.log";   /* Core -debuglogfile default; debuglogfile= overrides (0 = /dev/null) */
+/* DELIBERATE, DISCUSSED divergence from Core (2026-09-06, operator's call):
+ * Core's -debuglogfile defaults to "debug.log" (logging.cpp:23,
+ * DEFAULT_DEBUGLOGFILE), relative to the net-specific datadir. We keep
+ * logs/bitcoind.log inside the CHAIN directory instead -- a logs/ subdir per
+ * chain, which is what this node's operations and log rotation are built
+ * around. Recorded in docs/audits/CONFIG_DEFAULTS_VS_CORE_2026-09-06.md. */
+static char g_logpath[256] = "logs/bitcoind.log";   /* debuglogfile= overrides (0 = /dev/null) */
 #include "../rpc_server.h"   /* embedded JSON-RPC server (docs/RPC_LIVE_NODE.md) */
 #include "../rpc_chain.h"
 #include "../rpc_wallet_ops.h"
