@@ -245,13 +245,19 @@ node_handshake:
     xor  r8d, r8d
     call p2p_write
     ; CC-2 (BIP152): tell the peer we accept compact blocks, low-bandwidth
-    ; mode, version 2 -- after verack, as Core requires.
+    ; mode, version 2 -- after verack, as Core requires. Only when the
+    ; receive side is installed (main.c sets the hooks): with them NULL the
+    ; wire stream is byte-identical to before, which the sync harnesses'
+    ; fake peers depend on.
+    cmp  qword [rel g_cmpct_hook_cmpct], 0
+    je   .no_sendcmpct
     mov  rdi, r12
     lea  rsi, [rel _sendcmpct]
     mov  rdx, 9
     lea  rcx, [rel _sendcmpct_pl]
     mov  r8d, 9
     call p2p_write
+.no_sendcmpct:
     mov  eax, 1
     jmp  .ret
 .fail:
