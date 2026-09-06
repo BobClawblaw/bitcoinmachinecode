@@ -385,6 +385,10 @@ static long scan_stub_run(const unsigned char* spks, const unsigned int* spklens
     return 1;
 }
 
+/* 3.1: fake connected-tip readers for the clamp test below */
+static long pub_tip_one(void){ return 1; }
+static long pub_tip_untracked(void){ return -2; }
+
 int main(void){
     /* deterministic sig/pubkey bytes satisfying strict DER + compressed-prefix checks */
     SIG[0]=0x30; SIG[1]=0x44; SIG[2]=0x02; SIG[3]=0x20; for (int i = 0; i < 32; i++) SIG[4+i] = (unsigned char)(0x11 + i);
@@ -427,6 +431,30 @@ int main(void){
     r = call("getblockhash", "[3]", &ec, &em); ck_str("getblockhash(getblockcount) == getbestblockhash", r ? r->str : NULL, g_hash[3]); rj_free(r);
     expect_err("getblockhash 4 out of range", "getblockhash", "[4]", -8, "Block height out of range");
     expect_err("getblockhash -1 out of range", "getblockhash", "[-1]", -8, "Block height out of range");
+
+    /* ---- 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the tip every chain
+     * RPC reports is the CONNECTED tip. The store holds 0..3; a registered
+     * reader says only 1 is connected: getblockcount / getbestblockhash /
+     * getblockchaininfo.blocks / getblockhash's range follow it, a stored
+     * block above it has confirmations -1 (Core: not in the active chain).
+     * Negative control: NODE_TIP_UNTRACKED (-2, live tracking off) -> the
+     * stored 3, as before. Watched to FAIL before the clamp: getblockcount
+     * stayed "3" with the reader saying 1. */
+    { extern void rpc_chain_set_public_tip_fn(long (*)(void));
+      rpc_chain_set_public_tip_fn(pub_tip_one);
+      r = call("getblockcount", "[]", &ec, &em); ck_str("connected 1 / stored 3: getblockcount == 1", r ? r->str : NULL, "1"); rj_free(r);
+      r = call("getbestblockhash", "[]", &ec, &em); ck_str("connected 1: getbestblockhash == hash[1]", r ? r->str : NULL, g_hash[1]); rj_free(r);
+      r = call("getblockchaininfo", "[]", &ec, &em); ck_str("connected 1: getblockchaininfo.blocks == 1", S(r,"blocks"), "1"); rj_free(r);
+      expect_err("connected 1: getblockhash 2 is out of range", "getblockhash", "[2]", -8, "Block height out of range");
+      { char p[128]; snprintf(p, sizeof p, "[\"%s\"]", g_hash[3]);
+        r = call("getblockheader", p, &ec, &em);
+        ck("connected 1: stored block 3 is still readable by hash", r && r->typ == RJ_OBJ);
+        ck_str("connected 1: block 3 has confirmations -1 (not in the active chain)", S(r,"confirmations"), "-1");
+        rj_free(r); }
+      rpc_chain_set_public_tip_fn(pub_tip_untracked);
+      r = call("getblockcount", "[]", &ec, &em); ck_str("NODE_TIP_UNTRACKED: getblockcount == stored 3 (negative control)", r ? r->str : NULL, "3"); rj_free(r);
+      rpc_chain_set_public_tip_fn(NULL);
+      r = call("getblockcount", "[]", &ec, &em); ck_str("no reader: getblockcount == stored 3", r ? r->str : NULL, "3"); rj_free(r); }
 
     /* ---- getblockheader ---- */
     { char p[128]; snprintf(p, sizeof p, "[\"%s\"]", GENESIS_HASH);
