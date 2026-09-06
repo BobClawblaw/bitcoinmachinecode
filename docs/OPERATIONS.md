@@ -261,15 +261,29 @@ Restart=on-failure
 RestartSec=10
 TimeoutStopSec=90
 KillSignal=SIGTERM
-LimitCORE=infinity
+# Hardening (audit 2026-09-02 N5). This process auto-unlocks the wallet at
+# boot and holds the decrypted seed for its lifetime: no core dumps (a dump is
+# the debugger-backtrace leak of 2026-08-30 in file form), no privilege gain,
+# no /home, a private /tmp. ProtectSystem=full leaves /etc read-only, which is
+# all the daemon needs from it.
+LimitCORE=0
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
 ```
 
 Drop-ins in `bmc-bitcoind.service.d/` in the reference deployment raise
-`TimeoutStopSec=900` (headroom for a compaction in progress at stop time)
-and add `SupplementaryGroups=debian-tor` (tor control cookie access).
+`TimeoutStopSec=900` (headroom for a compaction in progress at stop time),
+add `SupplementaryGroups=debian-tor` (tor control cookie access), and carry
+the hardening block above as `50-hardening.conf`. The block is reproduced
+inline here so that a unit built from this page is hardened without the
+drop-in; the reference deployment's unit itself is a local artifact and is
+deliberately not vendored into this repository (operator decision,
+2026-09-05 — see `releases/2026-09-05-audits-closed.md`).
 
 - `ExecStart` runs **`bitcoind.live`**, a symlink to a dated snapshot
   `bitcoind.deploy-<YYYYMMDD><letter>`, not the tree binary. A rebuild

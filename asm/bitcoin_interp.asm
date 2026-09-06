@@ -62,6 +62,8 @@
     ; BIP66 strict-DER signature encoding (bitcoin_scriptcodec.asm) -- Core's
     ; IsValidSignatureEncoding. See the CheckSignatureEncoding note below.
     extern der_sig_strict
+    extern hnd_begin                 ; IR-6
+    extern hnd_end                   ; IR-6
     ; cross-file TLS accessors (bitcoin_scriptcodec.asm) -- see that file's
     ; header note by their definitions for why these are function calls
     ; rather than direct wrt ..gottpoff references to an extern symbol.
@@ -352,7 +354,11 @@ script_eval:
     push  r15
     push  rbp
     mov   rbp, rsp
-    sub   rsp, 0x108          ; ODD multiple of 8, on purpose -- SysV alignment.
+    sub   rsp, 0x118          ; ODD multiple of 8, on purpose -- SysV alignment.
+                              ; (IR-6 took it from 0x108 to 0x118 for the
+                              ;  handle-registration flag at [rbp-0x110];
+                              ;  0x118 is 8 mod 16 too, so the property the
+                              ;  paragraph below describes still holds.)
                               ;   Entry RSP == 8 mod16; `push rbp` -> 0 mod16;
                               ;   the 5 callee-saved pushes -> 8 mod16 again.
                               ;   The reservation must therefore be 8 mod16 to
@@ -371,6 +377,15 @@ script_eval:
                               ; All locals here are rbp-relative, so growing the
                               ;   reservation by 8 moves no operand.
     mov   r12, rdi            ; state
+    ; IR-6: register the position->slot handle table for the MAIN stack, so
+    ; a roll rotates handles instead of shifting 524-byte records. Returns 0
+    ; if a table is already registered (a nested script_eval) -- then no
+    ; table applies here, every primitive falls back to identity, and this
+    ; evaluation behaves exactly as it did before IR-6.
+    mov   rdi, [r12+0]        ; main_elems
+    call  hnd_begin
+    mov   [rbp-0x110], rax
+    mov   rdi, r12
     ; SCR-3: interp_checksig/_add run in their own frames (their own r12); the
     ; tapscript empty-pubkey rule gates on sigversion, so stash the state
     ; pointer in a per-thread slot they can reach. Written straight through
@@ -581,6 +596,26 @@ script_eval:
     mov   rax, SCRIPT_ERR_STACK_SIZE
     jmp   .err_ret0
 .not_push:
+    ; IR-8 (INTERP_REVIEW_2026-09-05) -- Core, EvalScript, placed BEFORE the
+    ; fExec gate so it fires even in an unexecuted branch:
+    ;   if (opcode == OP_CODESEPARATOR && sigversion == SigVersion::BASE &&
+    ;       (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE))
+    ;       return set_error(serror, SCRIPT_ERR_OP_CODESEPARATOR);
+    ; Policy only (CONST_SCRIPTCODE is a STANDARD flag, not a block flag), but
+    ; without it a legacy tx carrying 0xab in an OP_IF branch entered the
+    ; mempool and was relayed where Core refuses it.
+    mov   rax, [rbp-0x38]
+    cmp   rax, OP_CODESEPARATOR
+    jne   .cs_const_ok
+    mov   eax, dword [r12+48]        ; sigversion: BASE == 0
+    test  eax, eax
+    jnz   .cs_const_ok
+    mov   rax, [r12+56]
+    test  rax, SCRIPT_VERIFY_CONST_SCRIPTCODE
+    jz    .cs_const_ok
+    mov   rax, SCRIPT_ERR_OP_CODESEPARATOR
+    jmp   .err_ret0
+.cs_const_ok:
     ; if not executing and not IF..ENDIF, skip
     mov   rax, [rbp-0x08]
     test  rax, rax
@@ -1014,6 +1049,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_depth
@@ -1023,6 +1061,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_3dup:
@@ -1039,6 +1080,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_depth
@@ -1048,6 +1092,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_depth
@@ -1057,6 +1104,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_2over:
@@ -1073,6 +1123,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_depth
@@ -1082,6 +1135,9 @@ script_eval:
     mov   rsi, [r12+0]
     mov   rdx, rbx
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_2rot:
@@ -1140,6 +1196,9 @@ script_eval:
     add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
                                 ; wrote, not at it -- see op_toalt's comment
     call  stack_push
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, [rbp-0x98]
@@ -1151,6 +1210,9 @@ script_eval:
     add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
                                 ; wrote, not at it -- see op_toalt's comment
     call  stack_push
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_2swap:
@@ -1225,6 +1287,9 @@ script_eval:
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_depth:
@@ -1263,6 +1328,9 @@ script_eval:
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_nip:
@@ -1293,6 +1361,9 @@ script_eval:
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_pick:
@@ -1366,12 +1437,18 @@ script_eval:
     add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
                                 ; wrote, not at it -- see op_toalt's comment
     call  stack_push
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 .pkdup:
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, r14
     call  stack_dup_index
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 .pk_fail:
     mov   rax, SCRIPT_ERR_INVALID_STACK_OPERATION
@@ -1471,6 +1548,9 @@ script_eval:
     add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
                                 ; wrote, not at it -- see op_toalt's comment
     call  stack_push
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, [rbp-0xA8]
@@ -1482,6 +1562,9 @@ script_eval:
     add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
                                 ; wrote, not at it -- see op_toalt's comment
     call  stack_push
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     lea   rdi, [r12+8]
     mov   rsi, [r12+0]
     mov   rdx, [rbp-0xA0]
@@ -1493,6 +1576,9 @@ script_eval:
     add   rdx, ELEM_DATA_OFF   ; must point PAST the length field elem_move
                                 ; wrote, not at it -- see op_toalt's comment
     call  stack_push
+    test  rax, rax
+    jz    .stack_size_err     ; IR-1: at MAX_STACK_SIZE the push is refused; Core
+                               ; pushes to 1001 and fails STACK_SIZE -- this must too
     jmp   .next_op
 
 .op_size:
@@ -2470,7 +2556,20 @@ script_eval:
 .ret0:
     xor   eax, eax
 .done:
-    add   rsp, 0x108          ; must match the prologue reservation above
+    ; IR-6: put the records back in position order (only if something
+    ; rolled) and unregister, so every reader outside still finds element p
+    ; at elems + p*ELEM_SIZE with its data inline. rax holds the verdict.
+    push  rax
+    push  rax                 ; keeps rsp 16-aligned for the call
+    cmp   qword [rbp-0x110], 0
+    je    .no_hnd_end
+    lea   rdi, [r12+8]        ; &main_sp
+    mov   rsi, [r12+0]        ; main_elems
+    call  hnd_end
+.no_hnd_end:
+    pop   rax
+    pop   rax
+    add   rsp, 0x118          ; must match the prologue reservation above
     pop   rbp                 ; save area is ABOVE rbp -- rbp pops first
     pop   r15
     pop   r14
@@ -2535,7 +2634,9 @@ is_opsuccess:
 ; tail-calls into the rax-based is_opsuccess logic above. Used by C harnesses.
 global is_opsuccess_c
 is_opsuccess_c:
-    mov   rax, rdi
+    mov   eax, edi            ; IR-12: the argument is a C `int`; SysV leaves the
+                              ; upper 32 bits of rdi undefined, and is_opsuccess
+                              ; compares all 64 bits of rax. Zero-extend.
     jmp   is_opsuccess
 
 ; ============================================================================
@@ -2749,10 +2850,31 @@ interp_sig_encoding_ok:
     movzx ecx, byte [rdi+3]
     movzx r8d, byte [rdi+5+rcx]      ; lenS
     cmp   r8d, 33
-    je    .sigenc_highs
+    je    .sigenc_s33
     cmp   r8d, 32
     jb    .sigenc_ht
     lea   r9, [rdi+6+rcx]            ; S, 32 bytes big-endian
+    jmp   .sigenc_s_n
+.sigenc_s33:
+    lea   r9, [rdi+7+rcx]            ; 33-byte S: skip the 0x00 pad (strict DER holds)
+.sigenc_s_n:
+    ; IR-13 (INTERP_REVIEW_2026-09-05): Core's CheckLowS lax-parses the
+    ; signature, and an S >= N overflows to a ZERO signature -- which is not
+    ; high -- so Core never reports SIG_HIGH_S for it; verification then
+    ; fails and NULLFAIL/false is what surfaces. Compare against N first and
+    ; fall through to the same path for S >= N.
+    lea   rcx, [rel order_n]
+    xor   r8d, r8d
+.sigenc_ncmp:
+    movzx eax, byte [r9+r8]
+    cmp   al, byte [rcx+r8]
+    jb    .sigenc_below_n
+    ja    .sigenc_ht                 ; S > N
+    inc   r8d
+    cmp   r8d, 32
+    jb    .sigenc_ncmp
+    jmp   .sigenc_ht                 ; S == N
+.sigenc_below_n:
     lea   rcx, [rel half_order_n]
     xor   r8d, r8d
 .sigenc_cmp:
@@ -2789,6 +2911,9 @@ interp_sig_encoding_ok:
 ; IsLowDERSignature). Read-only data kept next to its only reader.
 half_order_n: db 0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF
               db 0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0
+; secp256k1 group order N, big-endian (IR-13: the S >= N comparison)
+order_n: db 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE
+         db 0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41
 
 ; interp_pubkey_encoding_ok(rdi = publen, rsi = pubdata) -> rax = 1 ok / 0 = the
 ; script must fail with SCRIPT_ERR_PUBKEYTYPE. r12 = script_state.

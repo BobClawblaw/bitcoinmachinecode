@@ -102,7 +102,7 @@ int main(void){
      * evictor has to run with n > 65,536. */
     const unsigned long BLOB_CAP = 66000UL * 62UL;
     void* mblob = malloc(BLOB_CAP);
-    void* mp    = malloc(40 + (unsigned long)SLOTS*48 + 8);
+    void* mp    = malloc(40 + (unsigned long)SLOTS*80 + 8);   /* mpool_struct_size: 80-byte slots */
     void* ublob = malloc((unsigned long)NSEED * 64 + (1<<16));
     void* ux    = malloc(40 + (unsigned long)(NSEED+16)*48 + 8);
     if (!mblob || !mp || !ublob || !ux){ printf("FAIL: oom\n"); return 1; }

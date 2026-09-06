@@ -86,6 +86,7 @@
 #include <pthread.h>
 #include "../bmc_thread.h"
 #include <semaphore.h>
+#include <time.h>
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -151,6 +152,13 @@ extern int  taproot_verify_input(const u8* spk,
                                  const u8* prevouts, const u8* amounts,
                                  const u8* spks, int64_t num_inputs,
                                  const char** reason);
+/* IR-9: same, with the caller's script flags (policy bits reach the leaf) */
+extern int taproot_verify_input_flags(const u8* spk,
+                                 const u8* const* wit, const u32* witlen, u32 nwit,
+                                 const u8* tx, int64_t txlen, int64_t n_in,
+                                 const u8* prevouts, const u8* amounts,
+                                 const u8* spks, int64_t num_inputs,
+                                 const char** reason, unsigned long long flags);
 
 /* ---- confirmed UTXO set (bitcoin_utxo_lsm.asm) ---- */
 extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
@@ -478,13 +486,15 @@ static int tapagg_build(bytepool_t* pool, tapagg_t* d,
  * index WITHIN ITS OWN TRANSACTION, which is what BIP341 commits to. */
 static int tapagg_verify(const bytepool_t* pool, const tapagg_t* d, const u8* spk,
                          const u8* const* wit, const u32* witlen, u32 nwit,
-                         u64 local_idx, const char** reason){
+                         u64 local_idx, unsigned long long flags, const char** reason){
     const u8* A = pool->buf;
     const char* r = "p2tr verify failed";
-    if (!taproot_verify_input(spk, wit, witlen, nwit,
+    /* IR-9: the WV0 and LEGACY arms forwarded `flags`; this one did not, so
+     * TXV_MEMPOOL_POLICY_FLAGS never reached a tapscript leaf. */
+    if (!taproot_verify_input_flags(spk, wit, witlen, nwit,
                               A + d->ns_off, (int64_t)d->nslen, (int64_t)local_idx,
                               A + d->po_off, A + d->am_off, A + d->sp_off,
-                              (int64_t)d->nin, &r)) { *reason = r; return 0; }
+                              (int64_t)d->nin, &r, flags)) { *reason = r; return 0; }
     return 1;
 }
 
@@ -612,7 +622,7 @@ static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long fla
          * from here on -- so this case is safe to run concurrently. */
         if (!g_t1_tap_built) { *reason = "internal: taproot aggregate not built"; return 0; }
         return tapagg_verify(&g_t1_tap_pool, &g_t1_tap, in->spk,
-                             in->wit, in->witlen, in->nwit, i, reason);
+                             in->wit, in->witlen, in->nwit, i, flags, reason);
     }
     case TXV_SHAPE_WV0: {
         int err = sv_verify_witness_v0(in->wprog, in->wproglen, in->wit, in->witlen, in->nwit,
@@ -652,9 +662,27 @@ void txv_set_bulk_mode(int on){ (void)on; }
 typedef struct { u8 ok; char reason[64]; } txv_result_t;
 static txv_result_t g_txv_results[TXV_MAX_INPUTS];
 
+/* IR-5: per-transaction sighash session. Each transaction gets a fresh key
+ * when it is laid out; every per-input verify begins the session with it, so
+ * the BIP143 / BIP341 aggregate hashes and the parsed views are computed once
+ * per transaction per thread instead of once per signature. The key -- never
+ * the buffer address -- is the identity (bitcoin_segwit.c has the rationale). */
+extern void swsig_session_begin(u64 key);  extern void swsig_session_end(void);
+extern void tapsig_session_begin(u64 key); extern void tapsig_session_end(void);
+static u64  txv_fresh_tx_key(void){ static u64 ctr; return __atomic_add_fetch(&ctr, 1, __ATOMIC_RELAXED); }
+static void txv_session_begin(u64 k){ swsig_session_begin(k); tapsig_session_begin(k); }
+static void txv_session_end(void){ swsig_session_end(); tapsig_session_end(); }
+/* The block batch keys a transaction as (round << 32) | tx_index: the flat
+ * record already carries tx_index, so the record layout -- which the asm
+ * parse twin and its differential mirror byte for byte -- stays unchanged.
+ * The round id is drawn from the same counter, so it is >= 1 and the batch
+ * keys never collide with the plain per-tx keys txv_verify_all hands out. */
+static u64 g_txvb_round;
+
 typedef struct {
     const u8* tx; u64 txlen; unsigned long long flags;
     u64 lo, hi;
+    u64 key;                     /* IR-5: this transaction's session key */
 } txv_worker_arg_t;
 
 static void* txv_worker_thread(void* argp){
@@ -668,12 +696,14 @@ static void* txv_worker_thread(void* argp){
                                           * class of bug
                                           * test_scriptverify_thread_stress.c
                                           * was built to catch). */
+    txv_session_begin(a->key);                                   /* IR-5 */
     for (u64 i=a->lo;i<a->hi;i++){
         const char* r = 0;
         int ok = txv_verify_one(a->tx, a->txlen, i, a->flags, sv_work, 1<<20, &r);
         g_txv_results[i].ok = ok ? 1 : 0;
         if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(g_txv_results[i].reason, r, n); g_txv_results[i].reason[n]=0; }
     }
+    txv_session_end();
     return 0;
 }
 
@@ -689,15 +719,18 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
     if (nverify == 0) return 1;
 
     static char rbuf[64];
+    const u64 key = txv_fresh_tx_key();                            /* IR-5: one key per transaction */
 
     if (nverify < TXV_PARALLEL_MIN){
         static u8 sv_work[1<<20];
+        txv_session_begin(key);
         for (u64 i=0;i<nin;i++){
             const char* r = 0;
             if (!txv_verify_one(tx, txlen, i, flags, sv_work, 1<<20, &r)) {
-                *reason = r; return 0;
+                *reason = r; txv_session_end(); return 0;
             }
         }
+        txv_session_end();
         return 1;
     }
 
@@ -717,6 +750,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
         if (lo >= hi) break;
         args[spawned].tx = tx; args[spawned].txlen = txlen; args[spawned].flags = flags;
         args[spawned].lo = lo; args[spawned].hi = hi;
+        args[spawned].key = key;                                   /* IR-5 */
         if (bmc_pthread_create(&tids[spawned], txv_worker_thread, &args[spawned]) != 0){
             /* thread creation failed partway: whatever didn't get a thread
              * (including this one) stays at its zeroed g_txv_results slot
@@ -730,6 +764,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
 
     static u8 sv_work_main[1<<20];
     int all_ok = 1;
+    txv_session_begin(key);                                        /* IR-5: the inline sweep */
     for (u64 i=0;i<nin;i++){
         if (g_txv_results[i].ok) continue;
         if (g_txv_results[i].reason[0] != 0){
@@ -746,6 +781,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
             all_ok = 0; break;
         }
     }
+    txv_session_end();
     if (!all_ok) *reason = rbuf;
     return all_ok;
 }
@@ -919,7 +955,9 @@ int tx_verify_block_connect(const u8* tx, u64 txlen, long height, const u8 block
  *   MINIMALIF     (13)  bitcoin_interp.asm:809
  *   NULLFAIL      (14)  bitcoin_interp.asm:2089, 3414
  *   CONST_SCRIPTCODE (16) bitcoin_scriptverify.c:121, 186-193
- *   DISCOURAGE_OP_SUCCESS (19) bitcoin_interp.asm:457
+ *   DISCOURAGE_OP_SUCCESS (19) bitcoin_interp.asm:457, and the prescan in
+ *                              bitcoin_taproot_sighash.c that returns before
+ *                              it (IR-9: flags now reach the tapscript leaf)
  *
  * DELIBERATELY ABSENT:
  *
@@ -1071,6 +1109,23 @@ static u64 g_tx_in_sums_n = 0;
 const u64* txvb_last_tx_in_sums(u64* n_out){
     if (n_out) *n_out = g_tx_in_sums_n;
     return g_tx_in_sums;
+}
+
+/* ---- per-call cost instrumentation (UTXO_INLINE_BUILD_PERF_SCOPE step 0,
+ * 2026-09-06). Phase 1 of tx_verify_block_connect_all is the block's UTXO
+ * LOOKUP pass (bidx_get, then utxo_lsm_get, per input, sequential);
+ * everything else in that call is script verification. daemon/utxo_live.c
+ * times the whole call and reads this to split "get" from "verify". Two
+ * clock reads per call, nanoseconds, zeroed at entry so an early return
+ * (coinbase-only block) reads as 0. txvb_set_timing(0) skips the clock reads
+ * entirely (the value stays 0). Nothing behavioural reads it. */
+static int g_txvb_timing = 1;
+static u64 g_txvb_resolve_ns = 0;
+void txvb_set_timing(int on){ g_txvb_timing = on; }
+unsigned long long txvb_last_resolve_ns(void){ return g_txvb_resolve_ns; }
+static inline u64 txvb_clock_ns(void){
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (u64)t.tv_sec * 1000000000ULL + (u64)t.tv_nsec;
 }
 
 /* bidx_get: exported by daemon/utxo_live.c -- same argument/return shape as
@@ -1279,6 +1334,7 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
      * the spk pool for this block, so pool->buf is stable for the whole
      * verification pass. */
     const u8* spk = spk_pool->buf + in->spk_off;
+    txv_session_begin(((u64)g_txvb_round << 32) | in->tx_index);  /* IR-5 */
     if (!g_txv_script_checks) return 1;   /* assumevalid: the block-connect batch path skips evaluation too (missed on the first cut, 2026-09-01 13:10) */
     switch (in->shape){
     case TXV_SHAPE_P2TR: {
@@ -1289,7 +1345,7 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
          * (is_p2tr required spklen == 34). */
         if (in->tap_desc == ~0ull) { *reason = "internal: taproot aggregate not built"; return 0; }
         return tapagg_verify(tap_pool, &tapdesc[in->tap_desc], spk,
-                             in->wit, in->witlen, in->nwit, in->local_idx, reason);
+                             in->wit, in->witlen, in->nwit, in->local_idx, flags, reason);
     }
     case TXV_SHAPE_WV0: {
         const u8* wprog = in->wprog ? in->wprog : spk + in->wprog_off;
@@ -1384,6 +1440,7 @@ static void* txvb_worker_loop(void* argp){
             w->res[i].ok = ok ? 1 : 0;
             if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(w->res[i].reason, r, n); w->res[i].reason[n]=0; }
         }
+        txv_session_end();      /* IR-5: never leave a key set past the scope that owns it */
         sem_post(&g_txvb_done_sem);
     }
     return 0;   /* unreachable -- for(;;) above never exits, see this
@@ -1431,6 +1488,7 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
             res[i].ok = ok?1:0;
             if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(res[i].reason,r,n); res[i].reason[n]=0; }
         }
+        txv_session_end();      /* IR-5 */
         return;
     }
 
@@ -1466,6 +1524,7 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
         res[i].ok = ok ? 1 : 0;
         if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(res[i].reason, r, n); res[i].reason[n]=0; }
     }
+    txv_session_end();          /* IR-5 */
 }
 
 /* SCR-6 (audit 2026-09-03): per-tx sigop COST for the LAST
@@ -1599,7 +1658,7 @@ int txv_test_tapagg_build(bytepool_t* pool, tapagg_t* d, tapin_fn get, void* ctx
 int txv_test_tapagg_verify(const bytepool_t* pool, const tapagg_t* d, const u8* spk,
                            const u8* const* wit, const u32* witlen, u32 nwit,
                            u64 local_idx, const char** reason){
-    return tapagg_verify(pool, d, spk, wit, witlen, nwit, local_idx, reason);
+    return tapagg_verify(pool, d, spk, wit, witlen, nwit, local_idx, 0, reason);
 }
 /* slice 8 seam: the dispatch, explicit-state. */
 int txv_test_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long long flags,
@@ -1665,6 +1724,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
                                 u64* fail_tx_index, const char** reason){
     static char g_rbuf[64];
     unsigned long long flags = script_flags_for_block((unsigned long long)height, block_hash32);
+    g_txvb_resolve_ns = 0;
 
     /* VAL-1 fees ledger (audit 2026-09-03): per-tx input sums, exported to
      * the caller's ConnectBlock fee/subsidy check through
@@ -1727,6 +1787,8 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
                             * this call is freshly memcpy'd before any read */
     g_wit_pool.used = 0;   /* bump-reset the witness-item pool for this block */
 
+    g_txvb_round = txv_fresh_tx_key();   /* IR-5: this round's id, written before any worker is posted */
+
     /* ---- Phase 0/parse: expand every tx's inputs into the flat array. ---- */
     u64 base = 0;
     for (u64 t=1; t<ntx; t++){
@@ -1763,6 +1825,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
      * lookup) stays here -- it is the caller's coupling to storage, not
      * classification. Behavior byte-identical to the inline version. ---- */
     int has_taproot = 0;
+    u64 tm_resolve_t0 = g_txvb_timing ? txvb_clock_ns() : 0;
     for (u64 gi=0; gi<total_nin; gi++){
         txvb_in_t* in = &flat[gi];
         u32 index; memcpy(&index, in->outpoint+32, 4);
@@ -1782,6 +1845,7 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
             *fail_tx_index = in->tx_index; goto fail;
         }
     }
+    if (g_txvb_timing) g_txvb_resolve_ns = txvb_clock_ns() - tm_resolve_t0;
 
     /* ---- SCR-6 (audit 2026-09-03): finish the per-tx sigop COST ledger
      * (sized at the top of this function; the coinbase's legacy cost is

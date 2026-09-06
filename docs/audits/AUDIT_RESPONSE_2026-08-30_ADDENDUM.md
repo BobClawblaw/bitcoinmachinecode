@@ -229,11 +229,29 @@ accepted, and prefer a metric that counts the population actually acted upon.
 
 1. **Finding 3** — hand-written consensus assembly. Structural; needs
    continuous oracle differential and property-based fuzzing, not a patch.
-   **This is the only audit finding still open.**
-3. **Systemd hardening** — declined by the operator. `LimitCORE=0` remains
-   worth revisiting: Incident 1 was a debugger reading wallet secrets from
-   process memory, and a core dump is the same exposure.
-4. **`test_utxo_recover`** — does not link; fix or delete.
+   **Not closeable by a change**: it is a standing property of the codebase,
+   answered continuously by the differential harnesses and the gate rather
+   than by a fix. As of 2026-09-05 every *defect* finding from every audit is
+   closed, accepted or deferred with reasons; this row is what remains, and
+   it is not a defect (item 3 was applied and is closed by decision).
+3. ~~**Systemd hardening** — declined by the operator. `LimitCORE=0` remains
+   worth revisiting.~~ **Applied, verified, and closed by decision
+   (2026-09-05).** The concern was right — Incident 1 was a debugger reading
+   wallet secrets from process memory, and a core dump is the same exposure —
+   and it was acted on: the deployment's `50-hardening.conf` sets
+   `LimitCORE=0`, `NoNewPrivileges`, `ProtectSystem=full`,
+   `ProtectHome=read-only`, `PrivateTmp`, verified on the host
+   (`Max core file size 0` on the running process). The unit itself stays a
+   local artifact by operator decision; `docs/OPERATIONS.md`'s reference unit
+   carries the same block. See `releases/2026-09-05-audits-closed.md`.
+4. ~~**`test_utxo_recover`** — does not link; fix or delete.~~ **Closed: it
+   links.** Verified 2026-09-05 — `asm/Makefile:1016` builds it clean. It is
+   deliberately *not* gated: it is a manual integration tool that takes a
+   datadir (`./tests/test_utxo_recover <datadir>`, Makefile:1008) and exits 2
+   with a usage message when run bare, like `test_addr_ingest`. The gated
+   sibling is `test_utxo_recover_gate`, which `make test` does run
+   (Makefile:3470). The 2026-08-30 complaint was that it would not link;
+   that is fixed.
 
 ---
 

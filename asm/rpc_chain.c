@@ -62,6 +62,7 @@
                                    * Core's chainparams -- the SAME parse the
                                    * script-flag path assembles against */
 #include "mempool_entry.h"
+#include "mempool_slot.h"    /* the structural mempool's slot layout */
 #include "rpc_commands.h"
 #include "version_gen.h"
 
@@ -137,6 +138,22 @@ void rpc_chain_set_gbt_policy(long maxweight, long reserved, long minfee_satkvb,
     g_gbt_version = version; g_gbt_printpriority = printpriority;
 }
 void rpc_chain_set_maxtipage(long seconds){ g_maxtipage = seconds < 0 ? 0 : seconds; }
+/* 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the tip every chain RPC reports
+ * is the CONNECTED tip. refresh() below is the one place the stored tip is
+ * read for getblockcount, getbestblockhash, getblockchaininfo.blocks,
+ * getchaintips, getblockhash's range, confirmations -- so the cap is applied
+ * there, once. main.c registers a reader of the shared status block's
+ * connected_tip; a value of NODE_TIP_UNTRACKED (-2, live tracking off) or no
+ * reader at all means the stored tip, the pre-3.1 behaviour. "headers" in
+ * getblockchaininfo keeps reading headers.dat, as Core's does. */
+static long (*g_public_tip_fn)(void) = 0;
+void rpc_chain_set_public_tip_fn(long (*fn)(void)){ g_public_tip_fn = fn; }
+static long public_tip_cap(long stored){
+    if (!g_public_tip_fn) return stored;
+    long cap = g_public_tip_fn();
+    if (cap == -2L /* NODE_TIP_UNTRACKED */) return stored;
+    return cap < stored ? cap : stored;
+}
 
 #define ST_IDX_FD(st)     (*(long*)((u8*)(st)+8))
 #define ST_TIP(st)        (*(int*)((u8*)(st)+24))
@@ -240,8 +257,8 @@ static void idx_sync(long tip){
 static long refresh(void){
     store_reload(g_st);
     long tip = ST_TIP(g_st);
-    if (tip > g_idx_tip) idx_sync(tip);
-    return tip;
+    if (tip > g_idx_tip) idx_sync(tip);       /* the index follows the ARCHIVE: by-hash lookups see every stored block */
+    return public_tip_cap(tip);               /* the tip the RPCs report is the CONNECTED one (3.1) */
 }
 
 int rpc_chain_open(const char* dir){
@@ -836,7 +853,9 @@ static int header_json(long h, long tip, rj_val** out, long* ec, const char** em
     char hx[65];
     rj_val* o = rj_obj();
     hex_rev(hx, rec, 32); rj_obj_set(o, "hash", rj_str(hx));
-    rj_obj_set(o, "confirmations", rj_numf("%ld", tip - h + 1));
+    /* Core: a block that is stored but not in the active chain (here: above
+     * the connected tip) reports confirmations -1, never 0 or negative. */
+    rj_obj_set(o, "confirmations", rj_numf("%ld", h > tip ? -1L : tip - h + 1));
     rj_obj_set(o, "height", rj_numf("%ld", h));
     u32 ver = rd32(pre);
     rj_obj_set(o, "version", rj_numf("%d", (int)ver));
@@ -1001,11 +1020,11 @@ static long gbt_slot(void* mp, unsigned long i, gbt_ent* e){
     u8* m = (u8*)mp;
     unsigned long long mask; memcpy(&mask, m+8, 8);
     if (i > mask) return -1;
-    u8* sl = m + 40 + i*48;
+    u8* sl = MPOOL_SLOT_AT(m, i);
     unsigned long long len; memcpy(&len, sl, 8);
-    if (len == 0xFFFFFFFFFFFFFFFFULL) return 0;
+    if (len == MPOOL_SLOT_EMPTY) return 0;
     u8* blob; memcpy(&blob, m+16, 8);
-    unsigned long long off; memcpy(&off, sl+40, 8);
+    unsigned long long off; memcpy(&off, sl+MPOOL_SLOT_OFF, 8);
     e->txid = sl+8; e->tx = blob+off; e->len = (unsigned long)len;
     return 1;
 }
@@ -1962,7 +1981,7 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
             for (size_t k = 0; k < t->nmembers; k++) free(t->members[k].key);
             free(t->members); t->nmembers = 0; t->members = NULL; rj_free(t);
             rj_obj_set(o, "blockhash", rj_str(bs));
-            rj_obj_set(o, "confirmations", rj_numf("%ld", tip - h + 1));
+            rj_obj_set(o, "confirmations", rj_numf("%ld", h > tip ? -1L : tip - h + 1));   /* -1 above the connected tip (3.1) */
             u8 hdr[80]; read_block_prefix(h, hdr, 80);
             rj_obj_set(o, "time", rj_numf("%u", rd32(hdr + 68)));
             rj_obj_set(o, "blocktime", rj_numf("%u", rd32(hdr + 68)));
@@ -4319,6 +4338,14 @@ static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, con
     static char msg[256];
     long r = 0;
     if (g_csi_run) r = g_csi_run(want_muhash, &o, msg, sizeof msg);
+    /* -2 (2026-09-06, fold worker): the index EXISTS but cannot answer for
+     * the applied height yet -- the fold worker's watermark is behind the
+     * connect thread's last commit (waited, still behind), or the index is
+     * deferred for the whole bulk catch-up. Refuse, in Core's warm-up code;
+     * do NOT fall through to the walk reader, which would either refuse as
+     * busy or spend minutes walking a set the index is seconds from
+     * describing. */
+    if (r == -2){ *ec = -28; snprintf(embuf, sizeof embuf, "%s", msg[0] ? msg : "coinstats index not ready"); *em = embuf; return 0; }
     if (r != 1 && g_usi_run) r = g_usi_run(want_muhash, &o, msg, sizeof msg);
     if (r == 0){ *ec = -1; snprintf(embuf, sizeof embuf, "%s", msg[0] ? msg : "UTXO set busy"); *em = embuf; return 0; }
     if (r != 1){ *ec = -1; snprintf(embuf, sizeof embuf, "%s", msg[0] ? msg : "UTXO set read failed"); *em = embuf; return 0; }

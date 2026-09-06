@@ -225,7 +225,11 @@ static uint64_t sv_checksig(void* cptr, const uint8_t* sig, size_t siglen,
      * self-delimiting), so `ht` above -- not der_parse_sig's dht -- is the
      * real hashtype from here on. */
     uint64_t r[4], s[4]; uint32_t dht;
-    if (!der_parse_sig(sig, (unsigned long)siglen, r, s, &dht)) return 0;
+    /* IR-2: Core pops the hashtype byte BEFORE ecdsa_signature_parse_der_lax,
+       so the parser's bound is siglen-1. Passing the full length let S end ON
+       the hashtype byte -- one byte looser than Core (consensus false accept,
+       pre-BIP66 reach). The hashtype is read above, exactly as Core does. */
+    if (!der_parse_sig(sig, (unsigned long)siglen - 1, r, s, &dht)) return 0;
 
     /* FindAndDelete: remove this exact signature (as a script push) from
      * scriptCode before hashing. Core does this once per checksig call, on
@@ -345,7 +349,13 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
      * which is the safe direction to fail in. */
     sv_get_locktime_context(tx, txlen, nIn, &ctx.tx_version, &ctx.tx_locktime, &ctx.in_sequence);
 
-    memset(main_e, 0, MAX_STACK*ELEM_SIZE);
+    /* IR-7 (INTERP_REVIEW_2026-09-05): no per-call zeroing of the 528,000-byte
+     * arena. No reader touches a record beyond [rec+4, rec+4+len) -- the
+     * witness drivers run the same interpreter on never-zeroed arenas -- and
+     * st.sp = 0 makes every record dead. Proven by running the whole
+     * interpreter suite with the arena POISONED (0xAA) instead of zeroed. This
+     * memset plus the two whole-arena copies below cost ~1.06 MB of dead memory
+     * traffic per legacy input, ~1.6 MB per P2SH spend. */
 
     if ((flags & SV_SIGPUSHONLY) && !sv_push_only(scriptSig, ssl))
         return SCRIPT_ERR_SIG_PUSHONLY;
@@ -354,7 +364,7 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
         return err;
 
     if (flags & SV_P2SH){
-        memcpy(copy_e, main_e, MAX_STACK*ELEM_SIZE);
+        memcpy(copy_e, main_e, st.sp*ELEM_SIZE);   /* IR-7: live records only */
         cp.sp = st.sp;
     }
 
@@ -375,7 +385,7 @@ int sv_verify_script(const unsigned char* scriptSig, unsigned long ssl,
         memcpy(redeem, sv_dat(&cp, cp.sp-1), rl);
 
         cp.sp--;                          /* pop the serialised script */
-        memcpy(main_e, copy_e, MAX_STACK*ELEM_SIZE);
+        memcpy(main_e, copy_e, cp.sp*ELEM_SIZE);   /* IR-7: live records only */
         st.sp = cp.sp;
 
         if (!sv_run(redeem, rl, &st, flags, &ctx, &err))

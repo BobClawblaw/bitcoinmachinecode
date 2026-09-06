@@ -194,9 +194,13 @@ long utxo_live_compact_threshold(void);
  * utxo_lsm_reload() (a full current-generation WAL replay) stays cheap. That
  * is the right trade when we are a few blocks behind -- and badly wrong for a
  * from-scratch or long-gap replay, where it is quadratic: every flush is
- * ~49k entries, every 12th flush triggers utxo_lsm_compact, and compact
- * merges ALL runs into one, i.e. rewrites the ENTIRE UTXO set. Cost per
- * compaction grows with the set while the trigger cadence stays fixed.
+ * ~49k entries, every 12th flush triggers a compaction, and until 79d4c9c
+ * (2026-08-31) that merged ALL runs into one, i.e. rewrote the ENTIRE UTXO
+ * set: cost per compaction grew with the set while the cadence stayed
+ * fixed. The merge is leveled now (compact_pick_now below: the newest runs
+ * by size ratio, the base only once the young tier reaches a quarter of
+ * it), which bounds the rewrite to O(recent); the bulk sizing stays because
+ * the flush count, the WAL replay and the reload cost are what it fixes.
  *
  * Measured in production on 2026-08-18: with a fixed ~590k UTXO ops between
  * compactions, wall time per compaction interval grew from ~2-4s at height
@@ -226,10 +230,104 @@ long utxo_live_compact_threshold(void);
 static void* g_utxo_table = 0;
 
 struct lsm_state g_utxo_lst;
+
+/* ---- per-block cost instrumentation (docs/audits/UTXO_INLINE_BUILD_PERF_SCOPE.md
+ * step 0, 2026-09-06) ---------------------------------------------------------
+ * Where a connect's wall time goes, per block, in nanoseconds, summed per
+ * progress tick and per process. Pure bookkeeping: nothing in this file
+ * branches on it, and utxo_live_set_timing(0) removes the clock reads too --
+ * every accumulator then stays exactly 0 (the negative control in
+ * tests/test_utxo_catchup_timing.c).
+ *   read    store_read_at of the block (utxo_live_catchup)
+ *   idx     Phase 0 parse + Phase 0.5 in-block outpoint index (apply_block_inner)
+ *   verify  tx_verify_block_connect_all minus its Phase 1 lookup pass
+ *   get     that lookup pass (bidx_get/utxo_lsm_get per input) + BIP30 gets
+ *   put     the Phase 5 walk (undo capture, utxo_lsm_put/del, buffered WAL)
+ *           minus any mac_flush inside it, plus the block-end WAL drain
+ *   ckpt    persist_applied_height (WAL fsync + tmp/fsync/rename/dirfsync)
+ *   flush   mac_flush stalls inside a put/del (timed from the flush hook to
+ *           the put's return -- the flush is the tail of the put) plus
+ *           compact_poll/compact_start_async per block (the inline-compaction
+ *           fallback lands here; a background compaction's own time does not,
+ *           apply never waits for it)
+ *   csi     the coinstats-index MuHash fold: csi_on_add per created output
+ *           (g_csi_add, live_on_output) and csi_on_remove per spent input
+ *           (undo_log.c's coin observer, inside undo_capture_and_del) --
+ *           ~1.7 us of 3072-bit modmul per coin whenever the index is valid,
+ *           which on a fresh sync is from height 0. Also subtracted from
+ *           `put`. Its per-block commit (g_csi_commit) runs inside
+ *           persist_applied_height and so lands under `ckpt`.
+ *   wall    the whole utxo_live_catchup call; "other" on the log line is
+ *           wall - sum (ledgers, BIP68, hooks, the progress line itself)
+ * Not split out: the second per-input utxo_lsm_get inside
+ * undo_capture_and_del is part of `put` -- separating it would cost two clock
+ * reads per input. Known slop: a flush that fires inside undo_capture_and_del
+ * is timed to the CALLER's return, so the one fold after that del (~2 us)
+ * lands in both `flush` and `csi` -- noise against a flush, and `put` absorbs
+ * it (saturating), so the phases never sum past the wall. About a dozen
+ * clock_gettime(CLOCK_MONOTONIC) per block, plus two per coin for `csi` (a
+ * 40 ns pair against a 1.7 us fold). */
+enum { TM_READ, TM_IDX, TM_VERIFY, TM_GET, TM_PUT, TM_CKPT, TM_FLUSH, TM_CSI, TM_WALL, TM_N };
+static int g_tm_on = 1;
+static u64 g_tm_tick[TM_N], g_tm_total[TM_N];
+static u64 g_tm_total_blocks = 0;
+static u64 g_tm_flush_t0 = 0;
+static int g_tm_flush_armed = 0;
+extern unsigned long long txvb_last_resolve_ns(void);   /* daemon/tx_verify.c */
+extern void txvb_set_timing(int on);
+extern unsigned long long undo_coin_observer_ns(void);  /* daemon/undo_log.c */
+extern void undo_set_coin_observer_timing(int on);
+static inline u64 tm_now(void){
+    if (!g_tm_on) return 0;
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (u64)t.tv_sec * 1000000000ULL + (u64)t.tv_nsec;
+}
+static inline void tm_add(int k, u64 ns){ g_tm_tick[k] += ns; g_tm_total[k] += ns; }
+/* book phase k from t0 to now; returns now, the next phase's t0 */
+static inline u64 tm_lap(int k, u64 t0){ u64 t1 = tm_now(); tm_add(k, t1 - t0); return t1; }
+/* after a put/del: if mac_flush ran inside it (the hook armed us), book the
+ * flush's span -- the walk's own lap subtracts it from `put` */
+static inline void tm_flush_check(void){
+    if (!g_tm_flush_armed) return;
+    g_tm_flush_armed = 0;
+    u64 t1 = tm_now();
+    if (t1 > g_tm_flush_t0) tm_add(TM_FLUSH, t1 - g_tm_flush_t0);
+}
+void utxo_live_set_timing(int on){
+    g_tm_on = on; txvb_set_timing(on); undo_set_coin_observer_timing(on); g_tm_flush_armed = 0;
+}
+void utxo_live_timing_reset(void){
+    memset(g_tm_tick, 0, sizeof g_tm_tick); memset(g_tm_total, 0, sizeof g_tm_total);
+    g_tm_total_blocks = 0;
+}
+/* phase 0..8 in the enum's order (8 = wall of the catch-up calls), in
+ * microseconds since the last reset; 9 = blocks applied by those calls.
+ * Anything else -> 0. apply paths outside utxo_live_catchup (reorg
+ * reconnect, the dry-run) add to the phases but not to wall or blocks. */
+unsigned long long utxo_live_timing_us(int phase){
+    if (phase == TM_N) return g_tm_total_blocks;
+    if (phase < 0 || phase >= TM_N) return 0;
+    return g_tm_total[phase] / 1000ULL;
+}
+static void tm_fmt(char* out, size_t cap, const u64* v, u64 wall, u64 blocks){
+    if (!g_tm_on){ snprintf(out, cap, "timing off"); return; }
+    u64 sum = 0;
+    for (int k = 0; k < TM_WALL; k++) sum += v[k];
+    u64 other = wall > sum ? wall - sum : 0;
+    double d = wall ? (double)wall : 1.0;
+    snprintf(out, cap,
+             "read %.0f%% idx %.0f%% verify %.0f%% get %.0f%% put %.0f%% ckpt %.0f%% flush %.0f%% csi %.0f%% other %.0f%% (%.2f ms/blk over %llu)",
+             100.0*(double)v[TM_READ]/d, 100.0*(double)v[TM_IDX]/d, 100.0*(double)v[TM_VERIFY]/d,
+             100.0*(double)v[TM_GET]/d, 100.0*(double)v[TM_PUT]/d, 100.0*(double)v[TM_CKPT]/d,
+             100.0*(double)v[TM_FLUSH]/d, 100.0*(double)v[TM_CSI]/d, 100.0*(double)other/d,
+             blocks ? (double)wall / 1e6 / (double)blocks : 0.0, (unsigned long long)blocks);
+}
 /* ---- compaction in the background ------------------------------------------
- * Compaction rewrites the whole live set -- 13 GB on production -- and used to
- * run inline in the apply path: a 3-5 minute stall every ~90 blocks, measured
- * 2026-08-31, invisible only because tip-following resumed afterwards. It
+ * Compaction used to rewrite the whole live set -- 13 GB on production -- and
+ * ran inline in the apply path: a 3-5 minute stall every ~90 blocks, measured
+ * 2026-08-31, invisible only because tip-following resumed afterwards. (The
+ * merge is leveled since 79d4c9c and a tail merge is a few MB, but a base
+ * rewrite is still the whole set, so it still belongs in the background.) It
  * touches nothing the applier mutates (immutable runs in, one run out, then
  * the manifest), so it runs in a forked child now while apply continues.
  *
@@ -321,7 +419,10 @@ static void compact_poll(void){
 /* mac_flush's gate: a flush is about to rewrite the manifest. It no longer
  * waits for anything -- run numbers are reserved, adoption reconciles -- it
  * just adopts a finished child first so the flush builds on the merged set. */
-static void compact_flush_hook(void){ compact_poll(); }
+static void compact_flush_hook(void){
+    if (g_tm_on){ g_tm_flush_t0 = tm_now(); g_tm_flush_armed = 1; }   /* step-0 timing: the flush starts here */
+    compact_poll();
+}
 /* Leveled: which runs to merge, by size ratio (lsm_compact_pick). Sizes come
  * from the run files themselves. Returns k, sets *lo. */
 /* Byte budget for the mapped run files: 45% of MemTotal by default (the
@@ -602,6 +703,16 @@ void utxo_live_set_coinstats(csi_coin_fn add, csi_coin_fn rm,
                              void (*inval)(const char*), void (*commit)(long)){
     g_csi_add = add; g_csi_rm = rm; g_csi_inval = inval; g_csi_commit = commit;
 }
+/* Bulk catch-up (2026-09-06, UTXO_INLINE_BUILD_PERF_SCOPE.md "the MuHash fold
+ * is on the bulk connect path"): while the memtable is bulk-sized the index
+ * does not fold per coin at all -- ~6.4 billion 1.66 us folds on a fresh
+ * sync, the same order as the whole bulk phase. It is seeded ONCE from a
+ * walk of the set at the moment the node becomes caught up (the downshift
+ * below), exactly as csi_seed_from_walk does at boot. This hook is that
+ * moment; the observers above stay registered and inert (the index is
+ * invalid) until it fires. NULL outside the worker. */
+static void (*g_csi_caught_up)(void* lst, void* table, long height) = 0;
+void utxo_live_set_coinstats_caught_up(void (*fn)(void*, void*, long)){ g_csi_caught_up = fn; }
 
 extern long utxo_store_wal_drain(void* st);
 static int persist_applied_height(long h){
@@ -682,6 +793,7 @@ static void live_on_input(void* ctxv, const u8 txid[32], u32 index){
          * prevout is how a re-applied (crash-resumed) block legitimately
          * reads back. */
         long r = undo_capture_and_del(&g_utxo_lst, g_utxo_table, g_apply_height, txid, index);
+        tm_flush_check();
         if (r == -1) ctx->fatal = 1;
         /* Incident 2026-09-01 (the 2,596 resurrected coins): a 0 here used to be
          * silently accepted as "already absent, re-applied block". That rationale
@@ -709,6 +821,7 @@ static void live_on_input(void* ctxv, const u8 txid[32], u32 index){
     }
     if (g_csi_inval) g_csi_inval("spend outside undo capture (bulk mode)");
     long r = utxo_lsm_del(&g_utxo_lst, g_utxo_table, txid, index);
+    tm_flush_check();
     if (r == -1) ctx->fatal = 1;
 }
 
@@ -762,9 +875,12 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
      * the second put writes the new one, which is what the WAL replays in
      * order on reload. Live-count is unchanged (one del, one put) because the
      * outpoint exists both before and after. */
-    if (r == 1 && g_csi_add)
+    if (r == 1 && g_csi_add){
+        u64 tm_a0 = tm_now();
         g_csi_add(ctx->txid, out_index, value, (u64)g_apply_height,
                   (u64)ctx->is_coinbase, script, slen);
+        tm_lap(TM_CSI, tm_a0);
+    }
     if (r == 0 && ctx->is_coinbase) {
         /* the OLD coin's fields are not in scope here, so this overwrite's
          * remove-event cannot be described -- pre-BIP34 heights only, which
@@ -795,6 +911,7 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
      * block continue with the coin written nowhere. The asm now sign-extends;
      * testing the SIGN rather than one exact value means a future widening
      * cannot silently reopen it. */
+    tm_flush_check();
     if (r < 0 || r == 2) ctx->fatal = 1;   /* <0 I/O error, 2 table full (undersized memtable) */
 }
 
@@ -1156,6 +1273,55 @@ const char* utxo_live_fail_kind_name(long k){
     return k == UTXO_FAIL_REJECT ? "consensus-reject" : k == UTXO_FAIL_STORE ? "store-error"
          : k == UTXO_FAIL_OTHER ? "archive/recovery" : "none";
 }
+
+/* ---- 3.3 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): a block that fails to
+ * connect is REJECTED, not fatal.
+ *
+ * Core marks a block whose ConnectBlock fails BLOCK_FAILED_VALID, never puts
+ * it in the active chain, and moves to the next-best candidate without human
+ * help. Here, until this, apply_block_at returning 0 for ANY reason stopped
+ * the catch-up ("FATAL: apply_block failed"), and main.c's rotation retried
+ * the same block from the checkpoint with backoff, for ever: the node sat
+ * one block below an invalid block another miner produced, with that block
+ * in its archive and (before 3.1) announced as its tip.
+ *
+ * The classification that already exists is what makes rejection safe to
+ * automate: ONLY UTXO_FAIL_REJECT -- a verification phase refused the block
+ * and named why in g_last_reject (bad script, bad amount, missing/spent
+ * input, bad coinbase, BIP30/34/68, sigops, weight...) -- is a candidate.
+ * UTXO_FAIL_STORE (a put/del/flush/WAL step failed, or the incident
+ * 2026-09-01 lookup inconsistency that sets g_halted) and UTXO_FAIL_OTHER (a
+ * hole/short block, partial-block recovery) keep their halt semantics: the
+ * block may be perfectly valid and the STORE is what is broken, and
+ * "invalidating" it would truncate a good chain.
+ *
+ * The rejection itself is not done here. utxo_live.c has no business
+ * touching invalid.dat or headers.dat; it calls the hook the worker
+ * registers (main.c -> chain_invalidate_block in reorg.c: invset mark,
+ * archive truncate to h-1 through the reorg module's own disconnect path,
+ * headers.dat rollback to h -- exactly what the operator's invalidateblock
+ * does). No hook registered (tests, tools, the offline build_utxo) means
+ * the pre-3.3 behaviour: -1, kind REJECT, the caller retries.
+ *
+ * KNOWN LIMIT, stated rather than hidden: a lookup that lies (b3d47a9's bad
+ * sparse samples, 2026-09-01) surfaces as a verification reject
+ * ("missing/already-spent UTXO") and is indistinguishable from a genuinely
+ * invalid block at this layer -- Core has the same exposure with a corrupt
+ * chainstate. Two things bound the damage: a mark is reversible
+ * (reconsiderblock) and costs re-downloading the truncated tail, never UTXO
+ * state; and a second automatic rejection within UTXO_REJECT_MIN_GAP blocks
+ * of the previous one is REFUSED and falls back to the halt path, because a
+ * real invalid block is a one-off and a lying store rejects everything. */
+typedef long (*utxo_reject_fn)(void* store_buf, long height, const unsigned char hash[32], const char* reason);
+static utxo_reject_fn g_reject_fn = 0;
+void utxo_live_set_reject_fn(utxo_reject_fn fn){ g_reject_fn = fn; }
+#define UTXO_REJECT_MIN_GAP 100
+static long g_last_rejected_height = -1;   /* last height the hook invalidated (this process) */
+static long g_rejected_total = 0;
+static long g_call_rejected = -1;          /* height rejected by the CURRENT/last catch-up call, -1 none */
+long utxo_live_last_rejected_height(void){ return g_last_rejected_height; }
+long utxo_live_rejected_count(void){ return g_rejected_total; }
+long utxo_live_call_rejected_height(void){ return g_call_rejected; }
 
 /* Point query against the LIVE UTXO set, for the gettxout IPC (daemon/main.c).
  * The RPC server runs in the serve PARENT and has no handle on this state --
@@ -1615,6 +1781,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         if (pr != 1){ g_last_reject = "bad-diffbits"; return 0; }
     }
 
+    u64 tm_t = tm_now();   /* step-0 timing: phase laps from here (see the enum) */
     /* ---- Phase 0: parse every tx once (same tx_parse this loop always
      * used), building the tx array tx_verify.c also consumes. txs/pn_outs
      * are persistent, process-lifetime arenas (grown, never freed -- see
@@ -1848,7 +2015,8 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      *
      * On mainnet the gate is off from height 227,932 to 1,983,701, so for a
      * node replaying the current chain this loop does not run at all. ---- */
-    if (bip30_enforced(g_apply_height + 1, blk_hash)) {   /* consensus height: store is daemon-shifted -1 */
+    tm_t = tm_lap(TM_IDX, tm_t);     /* parse (+ the signet check) */
+    if (bip30_enforced(g_apply_height, blk_hash)) {
         for (u64 t=0; t<ntx; t++){
             for (u32 o=0; o<pn_outs[t]; o++){
                 u64 v; unsigned long hh, cb, sl; const u8* sp;
@@ -1865,6 +2033,7 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         }
     }
 
+    tm_t = tm_lap(TM_GET, tm_t);     /* BIP30 lookups (none on the modern chain) */
     /* ---- Phase 0 cont'd / Phase 0.5: in-block output index + whole-block
      * duplicate-outpoint check, in one pass over the already-parsed array.
      * See this file's own header comment above and tx_verify.c's for why.
@@ -1914,8 +2083,16 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * signatures, block-wide. Nothing applied yet -- a reject here needs no
      * rollback either. ---- */
     u64 fail_tx = 0; const char* reason = "?";
-    if (!tx_verify_block_connect_all(txs, ntx, g_apply_height, blk_hash,
-                                     &g_utxo_lst, g_utxo_table, &bx, &fail_tx, &reason)) {
+    tm_t = tm_lap(TM_IDX, tm_t);     /* the Phase 0.5 index build */
+    int vok = tx_verify_block_connect_all(txs, ntx, g_apply_height, blk_hash,
+                                          &g_utxo_lst, g_utxo_table, &bx, &fail_tx, &reason);
+    {   /* connect_all = its Phase 1 lookup pass (get) + everything else (verify) */
+        u64 t1 = tm_now(), span = t1 - tm_t;
+        u64 rs = g_tm_on ? (u64)txvb_last_resolve_ns() : 0;
+        if (rs > span) rs = span;
+        tm_add(TM_GET, rs); tm_add(TM_VERIFY, span - rs); tm_t = t1;
+    }
+    if (!vok) {
         fprintf(stderr, "[utxo_live] REJECT h=%ld tx=%lu: %s\n", g_apply_height, (unsigned long)fail_tx, reason);
         g_last_reject = reason;    /* tx_verify's own string, verbatim */
         return 0;
@@ -2125,6 +2302,9 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * only case that still needs rollback_partial_apply -- everything above
      * ran before any put/del happened. ---- */
     apply_ctx_t ctx = { 0, 0 };
+    /* put = the walk minus the flushes and the coinstats folds inside it */
+    u64 tm_p0 = tm_now(), tm_f0 = g_tm_total[TM_FLUSH], tm_c0 = g_tm_total[TM_CSI];
+    u64 tm_o0 = g_tm_on ? (u64)undo_coin_observer_ns() : 0;
     for (u64 t=0; t<ntx && !ctx.fatal; t++){
         ctx.txid = txs[t].txid;
         ctx.is_coinbase = (t == 0);
@@ -2133,6 +2313,10 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         if (!wok || ctx.fatal) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
         if (wnin != txs[t].pn_in || wnout != pn_outs[t]) { rollback_partial_apply(blockbuf, blocklen, t); return 0; }
     }
+    {   u64 span = tm_now() - tm_p0;
+        if (g_tm_on) tm_add(TM_CSI, (u64)undo_coin_observer_ns() - tm_o0);   /* the remove-side folds */
+        u64 inner = (g_tm_total[TM_FLUSH] - tm_f0) + (g_tm_total[TM_CSI] - tm_c0);
+        tm_add(TM_PUT, span > inner ? span - inner : 0); }
     if (!ctx.fatal && g_mined_cb)
         for (u64 t=0; t<ntx; t++) g_mined_cb(txs[t].txid);
     return ctx.fatal ? 0 : 1;
@@ -2178,8 +2362,11 @@ static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height);
  * rollback, the next block's undo file -- sees a complete on-disk record. */
 static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
     int r = apply_block_at_inner(blockbuf, blocklen, height);
+    u64 tm_d0 = tm_now();
     undo_close_current();
-    if (utxo_store_wal_drain(&g_utxo_lst) != 0) {
+    int drain_bad = (utxo_store_wal_drain(&g_utxo_lst) != 0);
+    tm_lap(TM_PUT, tm_d0);           /* the block-end WAL write is part of put */
+    if (drain_bad) {
         fprintf(stderr, "[utxo_live] FATAL: WAL drain failed after height %ld\n", height);
         g_last_fail_kind = UTXO_FAIL_STORE; g_last_fail_height = height;
         return 0;
@@ -2195,6 +2382,7 @@ static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
 }
 static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height){
     g_apply_height = height;
+    g_tm_flush_armed = 0;   /* a flush outside a block's walk (caught-up tail, a test's) is not this block's */
     { int on = (g_assumevalid_height < 0 || height > g_assumevalid_height);
       tx_verify_set_script_checks(on);
       if (on && g_assumevalid_height >= 0 && !g_av_announced_end){ g_av_announced_end = 1;
@@ -2762,17 +2950,25 @@ static int g_bulk_mode = 0;
  * printed and inert is the exact failure this codebase has shipped repeatedly;
  * it is wired now.
  *
- * BULK MODE COMPACTS LESS OFTEN, by a factor of four. A compaction rewrites
- * the ENTIRE live set (one big run; the merge folds the new ones into it),
- * through three read syscalls and several write syscalls per record -- about
- * 50 MB/s whatever the disk. Measured on signet mid catch-up: 15 compactions
- * an hour, ~105 s each, 44% of wall-clock spent rewriting a 5 GB set instead
- * of applying blocks. Every run carries a Bloom filter, so a lookup that
- * misses costs one filter probe per extra run; while far behind that is far
- * cheaper than the rewrites. Steady state is unchanged. */
+ * BULK MODE COMPACTS LESS OFTEN, by a factor of four. When this was written
+ * a compaction rewrote the ENTIRE live set (one big run; the merge folded the
+ * new ones into it), through three read syscalls and several write syscalls
+ * per record -- about 50 MB/s whatever the disk. Measured on signet mid
+ * catch-up: 15 compactions an hour, ~105 s each, 44% of wall-clock spent
+ * rewriting a 5 GB set instead of applying blocks. Since 79d4c9c the merge is
+ * leveled (compact_pick_now: only the newest tier, the base once the young
+ * tier reaches a quarter of it -- tests/test_utxo_tiered_compact measures
+ * 6.5x the set written over a growing set against 27x for all-runs-to-one),
+ * so the x4 buys less than it did; it stays because every run carries a
+ * Bloom filter, so a lookup that misses costs one filter probe per extra
+ * run, and while far behind that is far cheaper than any rewrite. Steady
+ * state is unchanged. */
 /* Test hook: g_bulk_mode is decided from the store at init, which a unit test
  * of the threshold arithmetic has no business setting up. */
 void utxo_live_test_set_bulk_mode(int on){ g_bulk_mode = on; }
+/* Read side (daemon/main.c decides whether the coinstats index seeds at boot
+ * or defers to the caught-up hook above). */
+int utxo_live_bulk_mode(void){ return g_bulk_mode; }
 
 long utxo_live_compact_threshold(void){
     long t = g_cfg.utxo_compact_threshold > 0 ? g_cfg.utxo_compact_threshold
@@ -3057,13 +3253,77 @@ int utxo_live_ckpt_due(long h, long tip, long unpersisted, long long now_ms, lon
     return 0;
 }
 static int ckpt_now(void){
-    if (!persist_applied_height(g_applied_height)) return 0;
+    u64 tm_c0 = tm_now();
+    int ok = persist_applied_height(g_applied_height);
+    tm_lap(TM_CKPT, tm_c0);
+    if (!ok) return 0;
     g_ckpt_since = 0; g_ckpt_last_ms = mono_ms();
     return 1;
 }
 
-long utxo_live_catchup(void* store_buf){
+/* ---- Step 1 of UTXO_INLINE_BUILD_PERF_SCOPE (2026-09-06): the bounded call.
+ * utxo_live_catchup_bounded(store_buf, max_ms, stop_at_hole) is the SAME
+ * per-block loop as utxo_live_catchup (one body, catchup_run, so the
+ * verify/apply/checkpoint/hook/shutdown sequence cannot drift between the
+ * two) with two differences the parallel downloader's monitor loop needs:
+ *   max_ms > 0     : return at the first block boundary at or past the
+ *                    budget (pending checkpoint landed, like any other exit);
+ *                    the caller runs it again on its next pass;
+ *   stop_at_hole   : a height store_read_at cannot serve (an all-zero index
+ *                    record -- the helpers fill heights out of order, so the
+ *                    contiguous prefix is what is connectable) is EXPECTED:
+ *                    stop quietly, no WARNING, no failure classification.
+ *                    The unbounded call keeps its behaviour: a hole is a
+ *                    short archive, logged and classed archive/recovery.
+ * The last call's exit is readable through utxo_live_last_stop_reason() so
+ * the monitor loop (and the tests) can tell "at the hole" from "out of
+ * budget" from "nothing to do". */
+#define UTXO_STOP_TIP       0   /* reached the stored tip (or nothing to do) */
+#define UTXO_STOP_HOLE      1   /* stop_at_hole: the next height is not on disk yet */
+#define UTXO_STOP_BUDGET    2   /* max_ms elapsed */
+#define UTXO_STOP_SHUTDOWN  3   /* the registered shutdown flag */
+#define UTXO_STOP_REJECT    4   /* 3.3: a block was rejected and invalidated */
+#define UTXO_STOP_FAIL      5   /* -1 return, a hole in the unbounded call, or a checkpoint persist failure */
+static int g_last_stop_reason = UTXO_STOP_TIP;
+long utxo_live_last_stop_reason(void){ return g_last_stop_reason; }
+static long catchup_run(void* store_buf, long max_ms, int stop_at_hole);
+long utxo_live_catchup(void* store_buf){ return catchup_run(store_buf, 0, 0); }
+long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole){
+    return catchup_run(store_buf, max_ms, stop_at_hole);
+}
+
+/* ---- the body at height h must BE the block recorded at height h ----------
+ * The archive's index record is [hash32][file_no u32][pos u64][size u32] at
+ * height*48. The connect loop now runs INSIDE the download (2026-09-06), so
+ * it reads heights while 16 helper processes are appending to the same
+ * archive. If a read ever returns bytes that are not the block the record
+ * names -- for any reason, a racing writer included -- applying them inserts
+ * another block's coins under this height, and the next height is then
+ * refused with a FALSE bad-txns-BIP30 against a coin the node mis-filed
+ * itself. That is what a real sync hit at heights 48,585 and 74,765 with the
+ * pipelined downloader.
+ *
+ * So: hash what we read and compare it with the record. A mismatch is NOT a
+ * consensus failure -- it is a not-ready archive -- so it stops the pass like
+ * a hole and the next pass retries. One pread of a cached page per block. */
+static unsigned long long g_arch_mismatch = 0;
+unsigned long long utxo_live_archive_mismatches(void){ return g_arch_mismatch; }
+/* Opened per call, NOT cached in a static: a cached descriptor outlives the
+ * store it belonged to. test_utxo_catchup_shutdown runs two stores in one
+ * process, and a cached fd from the first made every block of the second
+ * mismatch, stopping the pass at zero blocks. Two syscalls per block against
+ * a cached page, on a path that already verifies every script in the block. */
+static int archive_hash_at(long h, unsigned char out[32]){
+    int fd = open("index.dat", O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = pread(fd, out, 32, (off_t)h * 48);
+    close(fd);
+    return n == 32 ? 1 : 0;
+}
+static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
     g_bip30_store = store_buf;   /* for BIP30's BIP34-ancestor test; see bip30_enforced */
+    g_call_rejected = -1;        /* 3.3: per-call report, cleared before any early return */
+    g_last_stop_reason = UTXO_STOP_TIP;
     store_reload(store_buf);
     long tip = *(int*)((char*)store_buf + 24);
 
@@ -3077,29 +3337,97 @@ long utxo_live_catchup(void* store_buf){
         g_recovery_checked = 1;
         g_recovery_result = utxo_live_recover_partial_block(store_buf);
     }
-    if (g_recovery_result < 0) { g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = g_applied_height + 1; return -1; }
-    if (g_halted) return -1;          /* utxo_live_verify_after_recovery() found the set inconsistent */
+    if (g_recovery_result < 0) { g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = g_applied_height + 1; g_last_stop_reason = UTXO_STOP_FAIL; return -1; }
+    if (g_halted) { g_last_stop_reason = UTXO_STOP_FAIL; return -1; }   /* utxo_live_verify_after_recovery() found the set inconsistent */
     if (tip < 0 || tip <= g_applied_height) return 0;
     g_last_fail_kind = UTXO_FAIL_NONE;
 
     static u8 blockbuf[8<<20];
     long applied = 0;
-    time_t last_progress_log = 0;   /* 0 => the first block prints immediately (restart-visible) */
+    /* 0 => the first block prints immediately (restart-visible). A bounded
+     * call runs every few seconds for the whole download, so it carries the
+     * clock across calls: one progress line per ~30 s, not one per pass. */
+    static time_t s_bounded_last_log = 0;
+    time_t last_progress_log = max_ms > 0 ? s_bounded_last_log : 0;
     /* rate + ETA on the progress tick (2026-09-01): instantaneous rate over
      * the last tick interval, session-average rate since this call began
      * (the ETA uses the average -- flush pauses make the instantaneous
      * figure swing 0..80 blk/s), ETA as DD:HH:MM:SS of the remaining gap. */
     long long cu_t0 = mono_ms(), cu_last_ms = cu_t0;
     long cu_h0 = g_applied_height, cu_last_h = g_applied_height;
+    /* step-0 timing: this call's phase totals are (process total at exit) -
+     * (at entry); the tick totals restart at every progress line. */
+    u64 tm_call0[TM_N]; memcpy(tm_call0, g_tm_total, sizeof tm_call0);
+    u64 tm_call_t0 = tm_now(), tm_tick_t0 = tm_call_t0;
+    memset(g_tm_tick, 0, sizeof g_tm_tick);
     for (long h = g_applied_height + 1; h <= tip; h++){
+        u64 tm_r0 = tm_now();
         long len = store_read_at(store_buf, h, blockbuf, sizeof blockbuf);
+        tm_lap(TM_READ, tm_r0);
         if (len < 81) {
+            if (stop_at_hole) {
+                /* the contiguous prefix ends here: the helpers have not
+                 * delivered height h yet. Not a failure -- the next pass
+                 * resumes at h once it lands. */
+                g_last_stop_reason = UTXO_STOP_HOLE;
+                break;
+            }
             fprintf(stderr, "[utxo_live] WARNING: hole/short block at height %ld (len=%ld) -- stopping catch-up short\n", h, len);
             g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = h;
+            g_last_stop_reason = UTXO_STOP_FAIL;
             break;
         }
+        /* the body must be the block the index names at this height */
+        { unsigned char want32[32], got32[32];
+          if (archive_hash_at(h, want32)){
+              block_hash(got32, blockbuf);
+              if (memcmp(want32, got32, 32) != 0){
+                  g_arch_mismatch++;
+                  fprintf(stderr, "[utxo_live] archive not ready at height %ld: the body is not the block the index records "
+                                  "-- stopping this pass, it retries (mismatch #%llu)\n", h, (unsigned long long)g_arch_mismatch);
+                  g_last_stop_reason = UTXO_STOP_HOLE;
+                  break;
+              }
+          } }
         if (!apply_block_at(blockbuf, (u64)len, h)) {
-            fprintf(stderr, "[utxo_live] FATAL: apply_block failed at height %ld -- stopping catch-up (reason='%s')\n", h, g_last_reject);
+            /* 3.3: a VALIDATION failure rejects the block; see the reject
+             * hook's comment above for what qualifies and what does not. */
+            if (g_last_fail_kind == UTXO_FAIL_REJECT && !g_halted && g_reject_fn){
+                long gap = g_last_rejected_height < 0 ? -1 : labs(h - g_last_rejected_height);
+                unsigned char bh[32]; char hex[65];
+                block_hash(bh, blockbuf);
+                for (int b = 0; b < 32; b++) sprintf(hex + b*2, "%02x", bh[31-b]);
+                if (gap >= 0 && gap < UTXO_REJECT_MIN_GAP){
+                    fprintf(stderr, "[utxo_live] REJECT block at height %ld hash=%s: %s -- a second rejection within %ld blocks of the one at %ld: "
+                                    "NOT invalidating automatically (a lying store rejects everything; a real invalid block is a one-off). "
+                                    "Retrying from the checkpoint; operator: check the store, then invalidateblock/reconsiderblock by hand\n",
+                            h, hex, g_last_reject, gap, g_last_rejected_height);
+                    tm_lap(TM_WALL, tm_call_t0); if (g_tm_on) g_tm_total_blocks += (u64)applied;
+                    g_last_stop_reason = UTXO_STOP_FAIL;
+                    return -1;
+                }
+                fprintf(stderr, "[utxo_live] REJECT block at height %ld hash=%s: %s -- invalidating it (Core: BLOCK_FAILED_VALID); "
+                                "the chain stays at %ld until a heavier chain avoids it\n",
+                        h, hex, g_last_reject, h - 1);
+                long rr = g_reject_fn(store_buf, h, bh, g_last_reject);
+                if (rr == 1){
+                    g_last_rejected_height = h; g_rejected_total++; g_call_rejected = h;
+                    g_last_stop_reason = UTXO_STOP_REJECT;
+                    /* the archive was truncated to h-1 under us: `tip` is stale,
+                     * this call is done -- what was applied before h stands */
+                    store_reload(store_buf);
+                    break;
+                }
+                fprintf(stderr, "[utxo_live] REJECT at height %ld: invalidation %s -- falling back to the retry path\n",
+                        h, rr == 0 ? "refused (see the chain/reorg log)" : "FAILED PART WAY (see the reorg log)");
+                tm_lap(TM_WALL, tm_call_t0); if (g_tm_on) g_tm_total_blocks += (u64)applied;
+                g_last_stop_reason = UTXO_STOP_FAIL;
+                return -1;
+            }
+            fprintf(stderr, "[utxo_live] FATAL: apply_block failed at height %ld (%s) -- stopping catch-up\n",
+                    h, utxo_live_fail_kind_name(g_last_fail_kind));
+            tm_lap(TM_WALL, tm_call_t0); if (g_tm_on) g_tm_total_blocks += (u64)applied;
+            g_last_stop_reason = UTXO_STOP_FAIL;
             return -1;
         }
         /* Block h is now fully durable in the WAL but NOT yet checkpointed:
@@ -3163,6 +3491,7 @@ long utxo_live_catchup(void* store_buf){
              * a dead disk is a one-block ghost the guard rolls back. */
             fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld after block %ld -- stopping catch-up at this boundary (%ld block(s) applied this call)\n",
                     g_applied_height, h, applied);
+            g_last_stop_reason = UTXO_STOP_FAIL;
             break;
         }
         UTXO_LIVE_TEST_CRASH_HOOK(applied);
@@ -3190,6 +3519,17 @@ long utxo_live_catchup(void* store_buf){
         if (shutdown_requested()) {
             fprintf(stderr, "[utxo_live] shutdown requested -- stopping catch-up cleanly after height %ld (%ld block(s) applied this call, checkpoint persisted)\n",
                     h, applied);
+            g_last_stop_reason = UTXO_STOP_SHUTDOWN;
+            break;
+        }
+        /* The time budget, checked at the same boundary the shutdown flag
+         * is: block h applied, its checkpoint persisted or pending in the
+         * batch the loop exit lands. The check sits AFTER the block, never
+         * before it, so a bounded call always connects at least one block
+         * when one is connectable -- a budget below one block's cost still
+         * makes progress. */
+        if (max_ms > 0 && h < tip && mono_ms() - cu_t0 >= max_ms) {   /* h == tip: the loop ends as TIP */
+            g_last_stop_reason = UTXO_STOP_BUDGET;
             break;
         }
 
@@ -3214,8 +3554,13 @@ long utxo_live_catchup(void* store_buf){
                 char etabuf[32];
                 if (eta >= 0) snprintf(etabuf, sizeof etabuf, "%02ld:%02ld:%02ld:%02ld", eta / 86400, (eta / 3600) % 24, (eta / 60) % 60, eta % 60);
                 else          snprintf(etabuf, sizeof etabuf, "--:--:--:--");
-                fprintf(stderr, "[utxo_live] catchup progress: height=%ld/%ld (%.1f%%) %.1f blk/s (avg %.1f) eta %s\n",
-                        h, tip, tip > 0 ? 100.0 * (double)h / (double)tip : 0.0, inst, avg, etabuf);
+                /* step-0 timing: where this tick's wall went, per phase */
+                char tmbuf[256];
+                { u64 tnow = tm_now();
+                  tm_fmt(tmbuf, sizeof tmbuf, g_tm_tick, tnow - tm_tick_t0, (u64)(h - cu_last_h));
+                  memset(g_tm_tick, 0, sizeof g_tm_tick); tm_tick_t0 = tnow; }
+                fprintf(stderr, "[utxo_live] catchup progress: height=%ld/%ld (%.1f%%) %.1f blk/s (avg %.1f) eta %s | %s\n",
+                        h, tip, tip > 0 ? 100.0 * (double)h / (double)tip : 0.0, inst, avg, etabuf, tmbuf);
                 cu_last_ms = nowms; cu_last_h = h;
                 last_progress_log = now;
             }
@@ -3229,8 +3574,11 @@ long utxo_live_catchup(void* store_buf){
          * del starts returning -1 (fatal, per live_on_output/live_on_input)
          * partway through -- observed in production: a from-scratch replay
          * (applied_height reset to -1) hit this wall at height 202134. */
+        u64 tm_k0 = tm_now();
         compact_poll();                                   /* adopt a finished background merge */
         compact_start_async(h, "mid-catchup");            /* inline-fallback path carries its own ARM barrier */
+        compact_start_async(h, "mid-catchup");
+        tm_lap(TM_FLUSH, tm_k0);                          /* inline-fallback compaction, if any, lands here */
     }
     /* Caught up while bulk-sized: drop the flush thresholds back to
      * steady-state so the current WAL generation stops growing to bulk size.
@@ -3242,6 +3590,20 @@ long utxo_live_catchup(void* store_buf){
      * would not be. */
     if (g_ckpt_since && !ckpt_now())          /* loop exit of any kind: land the pending batch */
         fprintf(stderr, "[utxo_live] WARNING: failed to persist the batched checkpoint at height %ld\n", g_applied_height);
+    if (max_ms > 0) s_bounded_last_log = last_progress_log;
+    /* step-0 timing: the call's own breakdown, once. Two or more blocks so a
+     * steady-state one-block call (every ~10 min at the tip) stays one line.
+     * A bounded call prints none: it returns every few seconds for hours,
+     * and the 30 s progress heartbeat above already carries the breakdown. */
+    { u64 tm_wall = tm_lap(TM_WALL, tm_call_t0) - tm_call_t0;
+      if (g_tm_on) g_tm_total_blocks += (u64)applied;
+      if (applied >= 2 && max_ms == 0) {
+          u64 v[TM_N]; for (int k = 0; k < TM_N; k++) v[k] = g_tm_total[k] - tm_call0[k];
+          char tmbuf[256]; tm_fmt(tmbuf, sizeof tmbuf, v, tm_wall, (u64)applied);
+          fprintf(stderr, "[utxo_live] catchup timing: %ld block(s) %ld..%ld in %.1fs -- %s\n",
+                  applied, g_applied_height - applied + 1, g_applied_height,
+                  (double)(mono_ms() - cu_t0) / 1000.0, tmbuf);
+      } }
     if (g_bulk_mode && g_applied_height >= tip) {
         unsigned long ss = 1UL << UTXO_LIVE_SLOTS_LOG2;
         g_utxo_lst.fill_threshold = (u64)ss * 3 / 4;
@@ -3285,6 +3647,13 @@ long utxo_live_catchup(void* store_buf){
                 fprintf(stderr, "[utxo_live] WARNING: catch-up WAL flush did not complete (r=%ld, log_len=%llu of %llu): a restart before the next block will replay that tail into a steady-state memtable and be very slow -- daemon/flush_wal_tail is the manual remedy\n",
                         fr, (unsigned long long)g_utxo_lst.log_len, before_len);
         }
+        /* The coinstats index seeds HERE, from a walk of the now-caught-up
+         * set (see utxo_live_set_coinstats_caught_up). The set is quiescent
+         * exactly as at boot: this is the same thread, between blocks, with
+         * the batch checkpoint just persisted above; a background compaction
+         * (a separate process) never touches this process's manifest until
+         * compact_poll adopts it. Minutes on mainnet, once per process. */
+        if (g_csi_caught_up) g_csi_caught_up(&g_utxo_lst, g_utxo_table, g_applied_height);
     }
     if (applied > 0) {
         /* STAGE B: steady-state undo-data retention. Bounded and resumable
@@ -3371,6 +3740,32 @@ long utxo_live_verify_after_recovery(long count_before){
 }
 
 long utxo_live_applied_height(void){ return g_applied_height; }
+
+/* ---- 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the node's PUBLIC tip is
+ * the CONNECTED tip, never the stored one.
+ *
+ * Core keeps AcceptBlock (to disk) and ConnectBlock (against the UTXO view)
+ * apart, and everything it says to the outside -- announces, getheaders
+ * answers, getblockcount, getbestblockhash, ZMQ hashblock -- is the connected
+ * tip. Here the two are decoupled by a backlog (the parallel downloader can
+ * put 100k blocks on disk before the first is connected), and until this
+ * function existed every outward-facing site read *(int*)(store+24): a
+ * height the node had never validated was announced, served and counted.
+ *
+ * One rule, read by every outward-facing site: with live tracking on, the
+ * tip is min(stored, applied); with it off (the "continuing WITHOUT live
+ * UTXO tracking" degraded mode) the stored tip, as before. The store's own
+ * tip stays the archive's high-water mark for the downloader. */
+long utxo_live_public_tip(void* store_buf, long live){
+    long stored = (long)*(int*)((char*)store_buf + 24);
+    if (!live) return stored;
+    long ah = g_applied_height;
+    return ah < stored ? ah : stored;
+}
+/* The persisted applied height (utxo_applied_height.dat in the cwd), -1 if
+ * absent. For the serve parent, which never loads the set: it seeds the
+ * shared connected-tip field before the worker starts publishing. */
+long utxo_live_persisted_height(void){ return read_applied_height(); }
 /* TEST-ONLY: the live LSM handles, so a test can read a specific outpoint back
  * out of the real store rather than infer it from counts. */
 void* utxo_live_test_lst(void){ return &g_utxo_lst; }

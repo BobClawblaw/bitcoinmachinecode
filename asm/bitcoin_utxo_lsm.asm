@@ -105,8 +105,11 @@
 ;                                  manifest_cap*16 bytes)
 ;   +120 qword manifest_n      -- current run count
 ;   +128 qword scratch_buf     -- CALLER SETS: big scratch arena, layout:
-;                                  [0 .. desc_cap*64)         merge-sort ping
-;                                  [desc_cap*64 .. *128)      merge-sort pong
+;                                  [0 .. desc_cap*64)         sort ping (descriptors)
+;                                  [desc_cap*64 .. *128)      sort pong (merge sort's
+;                                                             scratch; the radix sort's
+;                                                             compact entries + gather
+;                                                             buffer -- see mac_rsort_desc)
 ;                                  [desc_cap*128 .. +BLOOM_MAX_BYTES) bloom
 ;                                  [+BLOOM_MAX_BYTES .. +SCRIPT_MAX_BYTES) script
 ;                                  where desc_cap = (scratch_cap -
@@ -114,7 +117,9 @@
 ;                                  Required: desc_cap >= fill_threshold +
 ;                                  tomb_cap (worst case every live memtable
 ;                                  entry AND every tombstone need a
-;                                  descriptor in the same flush). Used only
+;                                  descriptor in the same flush). Sorted by
+;                                  utxo_lsm_sort_desc (radix by default,
+;                                  merge via utxo_lsm_set_sort_mode(0)). Used only
 ;                                  by flush/get, NOT by compaction (which
 ;                                  mmaps its own small scratch -- see below).
 ;   +136 qword scratch_cap     -- CALLER SETS: byte size of scratch_buf
@@ -918,9 +923,22 @@ fmt_runname:
     pop  rbp
     ret
 
+; utxo_lsm_sort_desc(a=rdi, b=rsi, n=rdx) -- the flush's sort step, exported
+; so tests/bench_lsm_flush_sort.c can time it in isolation and a diff test can
+; compare implementations on the same descriptor array. Contract is
+; mac_sort_desc's: n 64-byte descriptors in a, b is scratch of >= n*64 bytes,
+; the sorted result is in a, and equal keys keep their input order (stable).
+global utxo_lsm_sort_desc
+utxo_lsm_sort_desc:
+    cmp  qword [rel mac_sort_mode], 0
+    je   mac_sort_desc
+    jmp  mac_rsort_desc
+
 ; mac_sort_desc(a=rdi, b=rsi, n=rdx) -- bottom-up iterative merge sort of n
 ; fixed-64-byte records in a, comparing the first 36 bytes (mac_cmp_key), b
-; is scratch of equal size. Final sorted result always ends up in a.
+; is scratch of equal size. Final sorted result always ends up in a. STABLE:
+; on a key tie the left run's record is taken first (.sd_take_q only when
+; p > q), so equal keys keep their descriptor-build order.
 mac_sort_desc:
     push rbp
     mov  rbp, rsp
@@ -1090,6 +1108,523 @@ mac_sort_desc:
     pop  r12
     pop  rbx
     pop  rbp
+    ret
+
+; ============================================================================
+; mac_rsort_desc(a=rdi, b=rsi, n=rdx) -- MSD radix sort of the flush's n
+; 64-byte descriptors (2026-09-06). Same contract as mac_sort_desc: sorted
+; result in a, b is scratch of >= n*64 bytes, STABLE. utxo_lsm_sort_desc
+; dispatches here unless utxo_lsm_set_sort_mode(0) selected the merge sort.
+;
+; The keys are 36-byte outpoints, txid (SHA256d, uniform) + index, compared
+; as unsigned big-endian bytes -- mac_cmp_key's order. The merge sort moved
+; the 64-byte descriptors ~log2(n) times through the ping/pong region and
+; called mac_cmp_key/mac_copy_rec per record: 538 ms for a bulk-mode flush
+; of 4M descriptors on one core (tests/bench_lsm_flush_sort). This sort:
+;
+;   1. builds a COMPACT 16-byte entry per descriptor in the pong region:
+;        +0  u64 hi   = key bytes 0..7 as a big-endian number
+;        +8  u32 idx  = the descriptor's position in a (0-based)
+;        +12 u32 lo   = key bytes 8..11 as a big-endian number
+;      so a level's digit is a shift-and-mask on 96 key bits held in the
+;      entry itself (the qword at +8 is lo:idx, and every digit shift keeps
+;      idx out of the digit: bit offset + width <= 96);
+;   2. MSD radix sorts the entries: 12-bit digits while a bucket has >=
+;      65536 entries, 8-bit below that, one counting pass + one stable
+;      scatter per level, ping/pong between the two halves of the compact
+;      region. A level whose count lands every entry in ONE bucket (a shared
+;      prefix) advances to the next digit without a scatter, so duplicate
+;      txids and long common prefixes cost a counting pass per level, not a
+;      scatter. Buckets of <= RS_INS_MAX entries finish with a stable
+;      insertion sort on (hi, lo), tie-broken on key bytes 12..35 read
+;      through the descriptor; past the 96 compact bits (bit offset 96..287,
+;      only reached by > RS_INS_MAX keys sharing 12 bytes -- a txid with
+;      many outputs) the digit is read from the descriptor's key byte.
+;      Software prefetch (prefetchw) on the scatter's destination line,
+;      RS_PF entries ahead;
+;   3. gathers the descriptors into b in sorted order (random 64-byte reads
+;      from a, prefetched RS_GATHER_PF entries ahead; sequential writes)
+;      and copies b back to a.
+;
+; Uniform keys: 4M entries -> 4096 buckets of ~1K -> 256 buckets of ~4 ->
+; insertion sort; two counting/scatter passes over 64 MB of entries instead
+; of 22 merge passes over 256 MB of descriptors.
+;
+; Region use inside b (64n bytes): the compact ping is b+32n, the compact
+; pong (where the sorted order must end: mac_rs_final) is b+48n, the top
+; 16n bytes. The gather writes b[64j..64j+64) at step j after reading entry
+; j at b+48n+16j; entry j+1 starts at b+48n+16j+16 >= 64j+64 for every
+; j <= n-1, so the gather never overruns the entries it has yet to read.
+;
+; Counts live in .bss per recursion depth (RS_MAX_DEPTH x 4096 qwords),
+; not on the stack; a level consumes >= 4 of the 288 key bits, so the depth
+; is bounded and the guard below is never reached. Single-writer, like
+; mac_fl_buf: mac_flush is the only caller in production and the sort is
+; not re-entrant.
+; ============================================================================
+RS_INS_MAX      equ 32                 ; insertion-sort a bucket at or below this
+RS_MAX_DEPTH    equ 72                 ; > 288 bits / 4 bits per level
+RS_CNT_BYTES    equ 4096*8             ; one level's count array (12-bit digit)
+RS_PF           equ 8                  ; scatter: prefetch the line this many entries ahead
+RS_GATHER_PF    equ 16                 ; gather: prefetch the descriptor this many entries ahead
+
+section .data
+mac_sort_mode:  dq 1                   ; 0 = merge sort (mac_sort_desc), 1 = radix (mac_rsort_desc)
+section .bss
+mac_rs_counts:  resb RS_MAX_DEPTH*RS_CNT_BYTES
+mac_rs_a:       resq 1                 ; the descriptor array: digit source past 96 bits, tie-break, gather
+mac_rs_final:   resq 1                 ; compact buffer the sorted order must end in (the upper one)
+section .text
+
+; utxo_lsm_set_sort_mode(mode=rdi): 0 = merge sort, nonzero = radix. For the
+; diff test and the bench; production never calls it (radix is the default).
+global utxo_lsm_set_sort_mode
+utxo_lsm_set_sort_mode:
+    mov  [rel mac_sort_mode], rdi
+    ret
+
+; ---- digit extraction: entry at [r8+%1]; cl = shift; r11 = mask; rsi = a + byte offset (C only)
+%macro RS_DIGIT_A 1                     ; bit offset + width <= 64: from hi alone
+    mov  rax, [r8+%1]
+    shr  rax, cl
+    and  rax, r11
+%endmacro
+%macro RS_DIGIT_B 1                     ; 64 < offset + width <= 96: straddles hi and lo
+    mov  rax, [r8+%1+8]                 ; lo:idx
+    mov  rdx, [r8+%1]                   ; hi
+    shrd rax, rdx, cl                   ; (hi:lo:idx) >> shift, shift >= 32 so idx never reaches the digit
+    and  rax, r11
+%endmacro
+%macro RS_DIGIT_C 1                     ; offset >= 96: key byte from the descriptor
+    mov  eax, [r8+%1+8]                 ; idx (zero-extended)
+    shl  rax, 6
+    movzx eax, byte [rsi+rax]
+%endmacro
+%macro RS_COUNT_LOOP 1                  ; r8 = entry cursor, r9 = remaining, r10 = counts
+%%loop:
+    %1 0
+    inc  qword [r10+rax*8]
+    add  r8, 16
+    dec  r9
+    jnz  %%loop
+    jmp  .rr_cnt_done
+%endmacro
+%macro RS_SCATTER_LOOP 2                ; %1 digit macro, %2 prefetch (0/1); r12 = dst base
+%%loop:
+%if %2
+    cmp  r9, RS_PF+1
+    jb   %%nopf
+    %1 RS_PF*16
+    mov  rdx, [r10+rax*8]
+    shl  rdx, 4
+    prefetchw [r12+rdx]
+%%nopf:
+%endif
+    %1 0
+    mov  rdx, [r10+rax*8]               ; this bucket's next slot
+    inc  qword [r10+rax*8]
+    shl  rdx, 4
+    movdqu xmm0, [r8]
+    movdqu [r12+rdx], xmm0
+    add  r8, 16
+    dec  r9
+    jnz  %%loop
+    jmp  .rr_sc_done
+%endmacro
+
+mac_rsort_desc:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x18
+    mov  rbx, rdi            ; a
+    mov  r12, rsi            ; b
+    mov  r13, rdx            ; n
+    cmp  r13, 1
+    jbe  .rd_done
+    mov  [rel mac_rs_a], rbx
+    mov  rax, r13
+    shl  rax, 5
+    lea  r14, [r12+rax]      ; compact ping  = b + 32n
+    mov  rax, r13
+    shl  rax, 4
+    lea  r15, [r14+rax]      ; compact pong  = b + 48n (final)
+    mov  [rel mac_rs_final], r15
+    ; ---- build the compact entries ----
+    xor  ecx, ecx            ; idx
+    mov  rsi, rbx
+    mov  rdi, r14
+.rd_build:
+    mov  rax, [rsi]
+    bswap rax
+    mov  [rdi], rax          ; hi
+    mov  edx, [rsi+8]
+    bswap edx
+    mov  [rdi+8], ecx        ; idx
+    mov  [rdi+12], edx       ; lo
+    add  rsi, 64
+    add  rdi, 16
+    inc  rcx
+    cmp  rcx, r13
+    jb   .rd_build
+    ; ---- sort the entries; the order ends in r15 ----
+    mov  rdi, r14
+    mov  rsi, r15
+    mov  rdx, r13
+    xor  ecx, ecx            ; bit offset 0
+    xor  r8d, r8d            ; depth 0
+    call mac_rsort_rec
+    ; ---- gather descriptors into b in that order ----
+    xor  ecx, ecx            ; j
+    mov  rdi, r12            ; b cursor
+    mov  rsi, r15            ; entry cursor
+.rd_gather:
+    lea  rax, [rcx+RS_GATHER_PF]
+    cmp  rax, r13
+    jae  .rd_g_nopf
+    mov  eax, [rsi+RS_GATHER_PF*16+8]
+    shl  rax, 6
+    prefetcht0 [rbx+rax]
+.rd_g_nopf:
+    mov  eax, [rsi+8]
+    shl  rax, 6
+    add  rax, rbx
+    movdqu xmm0, [rax]
+    movdqu xmm1, [rax+16]
+    movdqu xmm2, [rax+32]
+    movdqu xmm3, [rax+48]
+    movdqu [rdi], xmm0
+    movdqu [rdi+16], xmm1
+    movdqu [rdi+32], xmm2
+    movdqu [rdi+48], xmm3
+    add  rdi, 64
+    add  rsi, 16
+    inc  rcx
+    cmp  rcx, r13
+    jb   .rd_gather
+    ; ---- b -> a ----
+    mov  rdi, rbx
+    mov  rsi, r12
+    mov  rcx, r13
+    shl  rcx, 6
+    rep  movsb
+.rd_done:
+    add  rsp, 0x18
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; mac_rsort_rec(src=rdi, dst=rsi, n=rdx, bitoff=rcx, depth=r8)
+;   Sorts the n compact entries at src by key bits [bitoff, 288); src and
+;   dst are the same offset in the two compact buffers. On return the sorted
+;   entries are in whichever of the two lies in mac_rs_final's buffer.
+;   Frame (locals strictly below the five saves at rbp-0x08..rbp-0x28):
+;     -0x30 counts (this depth)  -0x38 width   -0x40 shift / byte offset
+;     -0x48 mask   -0x50 bucket cursor   -0x58 bucket count   -0x60 variant
+;     -0x68 previous bucket end
+mac_rsort_rec:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x48
+    mov  rbx, rdi            ; src
+    mov  r12, rsi            ; dst
+    mov  r13, rdx            ; n
+    mov  r14, rcx            ; bit offset
+    mov  r15, r8             ; depth
+.rr_level:
+    cmp  r14, 288
+    jae  .rr_leaf_copy       ; every key bit consumed: all equal, order is final
+    cmp  r13, RS_INS_MAX
+    jbe  .rr_leaf_isort
+    cmp  r15, RS_MAX_DEPTH
+    jae  .rr_leaf_isort      ; unreachable: each level consumes >= 4 of 288 bits
+    ; ---- digit width and extraction variant for this level ----
+    mov  eax, 8
+    cmp  r13, 65536
+    jb   .rr_w_have
+    mov  eax, 12
+.rr_w_have:
+    cmp  r14, 96
+    jae  .rr_var_c
+    mov  rdx, 96
+    sub  rdx, r14            ; compact bits left
+    cmp  rdx, rax
+    jae  .rr_w_ok
+    mov  rax, rdx            ; 8 or 4
+.rr_w_ok:
+    mov  [rbp-0x38], rax
+    mov  rdx, 1
+    mov  ecx, eax
+    shl  rdx, cl
+    dec  rdx
+    mov  [rbp-0x48], rdx     ; mask
+    lea  rdx, [r14+rax]      ; offset + width
+    cmp  rdx, 64
+    ja   .rr_var_b
+    mov  rcx, 64
+    sub  rcx, rdx
+    mov  [rbp-0x40], rcx     ; shift = 64 - (offset + width)
+    mov  qword [rbp-0x60], 0
+    jmp  .rr_count
+.rr_var_b:
+    mov  rcx, 128
+    sub  rcx, rdx
+    mov  [rbp-0x40], rcx     ; shift = 128 - (offset + width), in [32, 63]
+    mov  qword [rbp-0x60], 1
+    jmp  .rr_count
+.rr_var_c:
+    mov  qword [rbp-0x38], 8
+    mov  qword [rbp-0x48], 255
+    mov  rax, r14
+    shr  rax, 3
+    mov  [rbp-0x40], rax     ; key byte offset
+    mov  qword [rbp-0x60], 2
+.rr_count:
+    mov  rax, r15
+    shl  rax, 15             ; depth * RS_CNT_BYTES
+    lea  rdx, [rel mac_rs_counts]
+    add  rax, rdx
+    mov  [rbp-0x30], rax
+    mov  rdi, rax
+    mov  rcx, [rbp-0x48]
+    inc  rcx
+    mov  [rbp-0x58], rcx     ; bucket count = mask + 1
+    xor  eax, eax
+    rep  stosq
+    mov  r8, rbx
+    mov  r9, r13
+    mov  r10, [rbp-0x30]
+    mov  r11, [rbp-0x48]
+    mov  rcx, [rbp-0x40]
+    mov  rsi, [rel mac_rs_a]
+    add  rsi, rcx            ; variant C: a + byte offset
+    mov  rax, [rbp-0x60]
+    cmp  rax, 1
+    je   .rr_cnt_b
+    ja   .rr_cnt_c
+.rr_cnt_a:
+    RS_COUNT_LOOP RS_DIGIT_A
+.rr_cnt_b:
+    RS_COUNT_LOOP RS_DIGIT_B
+.rr_cnt_c:
+    RS_COUNT_LOOP RS_DIGIT_C
+.rr_cnt_done:
+    ; one bucket holding every entry = a shared digit: next level, no scatter
+    mov  rdi, [rbp-0x30]
+    mov  rcx, [rbp-0x58]
+.rr_skip_scan:
+    cmp  [rdi], r13
+    je   .rr_skip
+    add  rdi, 8
+    dec  rcx
+    jnz  .rr_skip_scan
+    ; ---- exclusive prefix sums: counts become write positions ----
+    mov  rdi, [rbp-0x30]
+    mov  rcx, [rbp-0x58]
+    xor  eax, eax
+.rr_prefix:
+    mov  rdx, [rdi]
+    mov  [rdi], rax
+    add  rax, rdx
+    add  rdi, 8
+    dec  rcx
+    jnz  .rr_prefix
+    ; ---- stable scatter src -> dst ----
+    mov  r8, rbx
+    mov  r9, r13
+    mov  r10, [rbp-0x30]
+    mov  r11, [rbp-0x48]
+    mov  rcx, [rbp-0x40]
+    mov  rsi, [rel mac_rs_a]
+    add  rsi, rcx
+    mov  rax, [rbp-0x60]
+    cmp  rax, 1
+    je   .rr_sc_b
+    ja   .rr_sc_c
+.rr_sc_a:
+    RS_SCATTER_LOOP RS_DIGIT_A, 1
+.rr_sc_b:
+    RS_SCATTER_LOOP RS_DIGIT_B, 1
+.rr_sc_c:
+    RS_SCATTER_LOOP RS_DIGIT_C, 0
+.rr_sc_done:
+    ; ---- recurse per bucket: after the scatter counts[d] is bucket d's end ----
+    mov  qword [rbp-0x50], 0
+    mov  qword [rbp-0x68], 0
+.rr_bkt:
+    mov  rax, [rbp-0x50]
+    cmp  rax, [rbp-0x58]
+    jae  .rr_done
+    mov  rdx, [rbp-0x30]
+    mov  rdx, [rdx+rax*8]    ; end
+    mov  rcx, [rbp-0x68]     ; start
+    mov  [rbp-0x68], rdx
+    inc  qword [rbp-0x50]
+    mov  rax, rdx
+    sub  rax, rcx            ; bucket size
+    jz   .rr_bkt
+    shl  rcx, 4
+    cmp  rax, 1
+    jne  .rr_bkt_rec
+    ; a singleton sits in dst; it must end in the final buffer
+    cmp  r12, [rel mac_rs_final]
+    jae  .rr_bkt
+    movdqu xmm0, [r12+rcx]
+    movdqu [rbx+rcx], xmm0
+    jmp  .rr_bkt
+.rr_bkt_rec:
+    lea  rdi, [r12+rcx]      ; the bucket, now in dst
+    lea  rsi, [rbx+rcx]
+    mov  rdx, rax
+    mov  rcx, r14
+    add  rcx, [rbp-0x38]     ; next digit
+    lea  r8, [r15+1]
+    call mac_rsort_rec
+    jmp  .rr_bkt
+.rr_skip:
+    add  r14, [rbp-0x38]
+    jmp  .rr_level
+.rr_leaf_isort:
+    mov  rdi, rbx
+    mov  rsi, r13
+    call mac_rs_isort
+.rr_leaf_copy:
+    cmp  rbx, [rel mac_rs_final]
+    jae  .rr_done            ; already in the final buffer
+    mov  rdi, r12
+    mov  rsi, rbx
+    mov  rcx, r13
+    shl  rcx, 4
+    rep  movsb
+.rr_done:
+    add  rsp, 0x48
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; mac_rs_isort(p=rdi, m=rsi) -- stable insertion sort of m compact entries
+; in place, full-key order (mac_rs_gt).
+mac_rs_isort:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 8
+    mov  rbx, rdi
+    mov  r12, rsi
+    cmp  r12, 1
+    jbe  .is_done
+    mov  r13, 1              ; i
+.is_outer:
+    mov  rax, r13
+    shl  rax, 4
+    mov  r14, [rbx+rax]      ; hold hi
+    mov  r15, [rbx+rax+8]    ; hold lo:idx
+    mov  rcx, r13            ; j
+.is_inner:
+    test rcx, rcx
+    jz   .is_place
+    lea  rax, [rcx-1]
+    shl  rax, 4
+    lea  rdi, [rbx+rax]      ; e[j-1]
+    mov  rsi, r14
+    mov  rdx, r15
+    call mac_rs_gt           ; preserves rcx
+    test eax, eax
+    jz   .is_place           ; e[j-1] <= hold: stable stop
+    mov  rax, rcx
+    shl  rax, 4
+    movdqu xmm0, [rbx+rax-16]
+    movdqu [rbx+rax], xmm0   ; e[j] = e[j-1]
+    dec  rcx
+    jmp  .is_inner
+.is_place:
+    mov  rax, rcx
+    shl  rax, 4
+    mov  [rbx+rax], r14
+    mov  [rbx+rax+8], r15
+    inc  r13
+    cmp  r13, r12
+    jb   .is_outer
+.is_done:
+    add  rsp, 8
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; mac_rs_gt(x=rdi -> entry, y_hi=rsi, y_lo_idx=rdx) -> eax 1 if key(x) > key(y)
+;   (hi, lo) first; a 96-bit tie compares key bytes 12..35 through the
+;   descriptors (mac_cmp_key's byte order). Leaf: clobbers rax, rdx, rsi,
+;   rdi, r8-r11 only; rcx untouched (mac_rs_isort keeps j there).
+mac_rs_gt:
+    mov  rax, [rdi]
+    cmp  rax, rsi
+    ja   .gt_yes
+    jb   .gt_no
+    mov  eax, [rdi+12]       ; x.lo
+    mov  r8, rdx
+    shr  r8, 32              ; y.lo
+    cmp  eax, r8d
+    ja   .gt_yes
+    jb   .gt_no
+    mov  r9, [rel mac_rs_a]
+    mov  eax, [rdi+8]        ; x.idx
+    shl  rax, 6
+    lea  r10, [r9+rax+12]
+    mov  eax, edx            ; y.idx
+    shl  rax, 6
+    lea  r11, [r9+rax+12]
+    mov  rax, [r10]
+    mov  rdx, [r11]
+    bswap rax
+    bswap rdx
+    cmp  rax, rdx
+    jne  .gt_diff
+    mov  rax, [r10+8]
+    mov  rdx, [r11+8]
+    bswap rax
+    bswap rdx
+    cmp  rax, rdx
+    jne  .gt_diff
+    mov  rax, [r10+16]
+    mov  rdx, [r11+16]
+    bswap rax
+    bswap rdx
+    cmp  rax, rdx
+    jne  .gt_diff
+.gt_no:
+    xor  eax, eax
+    ret
+.gt_diff:
+    ja   .gt_yes
+    xor  eax, eax
+    ret
+.gt_yes:
+    mov  eax, 1
     ret
 
 ; ============================================================================
@@ -2044,7 +2579,7 @@ mac_flush:
     mov  rsi, [r12+128]
     add  rsi, [rbp-0x40]
     mov  rdx, [rbp-0x38]
-    call mac_sort_desc
+    call utxo_lsm_sort_desc
 
     ; ---- compute bloom_bits/bits_mask ----
     mov  rax, [rbp-0x38]

@@ -283,7 +283,7 @@ int main(void){
       extern long mpool_put(void*, const unsigned char*, const unsigned char*, unsigned long);
       extern unsigned long mpool_struct_size(unsigned long);
       extern long mpool_count(void*);
-      static unsigned char pool[40 + 1024*48 + 8];
+      static unsigned char pool[40 + 1024*80 + 8];
       static unsigned char blob[1<<16];
       mpool_init(pool, 1024, blob, sizeof blob);
       /* legacy: the createrawtransaction P2PKH KAT tx (85 bytes, no witness) */

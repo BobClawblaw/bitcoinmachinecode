@@ -3042,3 +3042,53 @@ silent heap overrun:
   at least 41 wire bytes, so a 4,000,000-byte block carries at most ~97,600 of
   them, giving `(36+8+253) * 97,600 + 4 MB ≈ 33 MB` — bounded, bump-reset per
   block, and bounded by data the block-level checks already accepted.
+
+## 15. The UTXO / MuHash / compact-block modules — LANDED and measured, 2026-09-06
+
+The 3-hour gap to Core on the 2026-09-04 full-sync benchmark
+(`../audits/UTXO_INLINE_BUILD_PERF_SCOPE.md`) decomposed into independent
+levers. Eight branches landed today; the numbers below are each branch's own
+measurement on one pinned core of this host, from the benchmark named in the
+row (`asm/tests/`), min of three runs.
+
+| lever | before | after | benchmark |
+|---|---|---|---|
+| `num3072_mul`, generic → BMI2/ADX | 944 ns | 603 ns | `bench_muhash` |
+| `num3072_mul`, → AVX-512 IFMA (52-bit limbs) | 944 ns | 301 ns | `bench_muhash` |
+| `muhash_insert` per element (IFMA) | 1640 ns | 1005 ns | `bench_muhash` |
+| MuHash fold on the bulk connect path | ~1.66 µs × every coin event (~3 h/sync) | none (seed once at caught-up; worker in steady state) | instrumentation, PR #24 |
+| memtable flush descriptor sort, N=4M | 541 ms | 91 ms | `bench_lsm_flush_sort` |
+| memtable probe, 2^26 slots, 50% load, dependent hits | 1.50 ns amortised, 1–2 DRAM misses cold | prefetch widened to the six lines a probe walks; no other change paid for | `bench_utxo_probe` |
+| compact-block reconstruction, 50k-entry pool | 10.03 ms/block | 1.45 ms/block | agent measurement in `daemon/cmpct_recv.c` commit |
+| UTXO connect vs download | 4.5 h after a 19.5 h download | under it (8 s budget between reaps, stop at the first hole) | `test_dlc_interleave` |
+
+Where a row says "no other change paid for": the probe agent measured first
+and found a probe is one or two cache misses, not a sequence, so the
+cache-line-aware probe the scope imagined would have bought nothing.
+Tiered compaction, also in the scope, had already landed on 2026-08-31.
+
+**Measured end to end: in progress.** A fresh full sync on the dedicated
+bench SSD started 2026-09-06 05:50Z from main `0151051`
+(`/mnt/2tbssd/bmc-bench`, 16 workers, `dbcache=8192`,
+`bmc.bootcatchup=0`, 965,215 blocks); its wall clock against Core v31.1's
+21.0 h from 2026-09-04 is the number every lever above is waiting on. Two
+harness defects had to be fixed first, both from the repo moving under it:
+it built `daemon/bitcoin_cli` (renamed `bmc_cli` on 2026-09-05) and wrote
+no `bmc.bootcatchup=0`, which would have measured the pre-interleave shape.
+
+**Not measured end to end (before that run).** No full sync had run on this code. The CC-8
+full-verification replay (`/storage/bmc-fullverify`, `assumevalid=0`) is
+being restarted on it from its 233k-block archive; its wall-clock is the
+first whole-run number. Two caveats bound what that run can show: the
+boot-time catch-up cannot interleave (only the worker's far-behind run
+does; the replay's FIRST download, 02:05–04:55Z, was the boot catch-up —
+its shutdown line said so — and its restart on `305c1b4` went straight to
+the worker), and the replay syncs from one loopback peer, so the download
+is round-trip bound, not bandwidth bound. The restart also found CC-5's
+four-page hold abandoning the header phase (fixed, `4c3e8fc`); the
+interleaved download is first exercised on the restart after that fix.
+
+**Next levers, in order:** the ChaCha20 keystream inside a MuHash element
+(now the larger half); `TCP_NODELAY` on outbound sockets and a single write
+per message; the double input lookup; moving the boot catch-up into the
+worker.

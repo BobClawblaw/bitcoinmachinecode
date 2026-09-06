@@ -986,3 +986,11 @@ Changed by the 2026-08-23 work (`PERF_SCOPE.md` §13):
 | file | what changed |
 |---|---|
 | `asm/tests/bench_hash_core.c` | the `SHA256D64` row now drives `sha256d64`, which is Core's actual opposite number; the old one-at-a-time `sha256d` shape is kept as a second row so the change is visible in the same table |
+
+Added by the 2026-09-06 module work (`PERF_SCOPE.md` §15):
+
+| file | what it measures | Core opposite number |
+|---|---|---|
+| `asm/tests/bench_muhash.c` | ns per `num3072_mul` (chained, the shape every caller has) and per `muhash_insert` of a 100-byte coin, per dispatch body | `bench muhash` (`MuHash3072::Insert`) |
+| `asm/tests/bench_lsm_flush_sort.c` | the memtable flush's descriptor sort alone, 2^22 slots, three reps restoring the unsorted input | none — Core has no flush sort; its cache flushes into LevelDB |
+| `asm/tests/bench_utxo_probe.c` | one `utxo_get` at 2^16 / 2^22 / 2^26 slots, 50% and 75% load, dependent and independent, with and without prefetch; every answer checked against a mirror | `CCoinsViewCache::GetCoin` (unordered_map lookup) |

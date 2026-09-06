@@ -40,6 +40,15 @@
 #include <sys/file.h>          /* DMN-1: flock() for the datadir lock */
 #include "secure_zero.h"    /* WAL-3: a memset the optimiser may not delete */
 #include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
+#include "peer_timeout.h"      /* CC-7: -peertimeout, the handshake deadline */
+#include "txann.h"             /* CC-1: tx announcement to and from inbound peers */
+#include "inbound_evict.h"     /* CC-3: Core AttemptToEvictConnection */
+#include "../mempool_slot.h"    /* the structural mempool's slot layout (80-byte slots) */
+#include "anchors.h"           /* CC-4: block-relay-only legs + anchors.dat */
+#include "hdr_lowwork.h"
+#include "archive_seed.h"       /* slot 0 is genesis on EVERY chain: a shifted archive reads every height one block high */       /* CC-5: hold low-work header pages until the chain proves its work */
+#include "invalid_set.h"       /* CC-10: invalidateblock / reconsiderblock */
+#include "cmpct_recv.h"        /* CC-2: BIP152 compact block receive */
 /* VAL-5 / MEM-1: the generated per-height script-flag mask
  * (bitcoin_script_flags.asm, from validation/gen_script_flags.py). */
 extern unsigned long long script_flags_for_block(unsigned long long height,
@@ -104,7 +113,15 @@ static node_status_t* g_node_status;  /* MAP_SHARED live status, NULL if mmap fa
 #define DL_BUDGET_SECS 60.0
 /* Blocks the archive may run ahead of the applied UTXO height before the
  * download worker stops syncing legs and applies instead. At the tip the
- * backlog is 0-2; a from-scratch or long-gap restart is tens of thousands. */
+ * backlog is 0-2; a from-scratch or long-gap restart is tens of thousands.
+ *
+ * RECOVERY PATH since step 1 of UTXO_INLINE_BUILD_PERF_SCOPE (2026-09-06):
+ * the parallel downloader now connects the UTXO set INSIDE its monitor loop
+ * (dl_catchup), so on the worker's own runs the backlog only grows past this
+ * line if connect is SLOWER than the download, or after a boot-time catch-up
+ * (which runs in the parent, before the UTXO engine exists) hands the worker
+ * a full archive. Both are exactly the cases this rule was written for:
+ * stop syncing legs, apply. It stays in place, unchanged. */
 #define DL_APPLY_FIRST_BACKLOG 500L
 /* STAGE B: minimum gap between fork probes across all outbound legs. A probe
  * is one extra getheaders round trip on an already-idle leg, so this only has
@@ -169,6 +186,9 @@ extern long store_init(void* st);
 extern long store_reload(void* st);
 extern int  utxo_live_init(const char* dir);           /* daemon/utxo_live.c */
 extern long utxo_live_catchup(void* store_buf);        /* daemon/utxo_live.c */
+extern long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole);   /* step 1: the interleaved connect */
+extern long utxo_live_last_stop_reason(void);           /* why the last catch-up call returned (UTXO_STOP_*) */
+extern long utxo_live_call_rejected_height(void);       /* 3.3: the height the last call rejected, or -1 */
 extern void utxo_live_set_shutdown_flag(const volatile sig_atomic_t* flag); /* daemon/utxo_live.c */
 extern long utxo_live_count(void);                      /* daemon/utxo_live.c */
 extern long utxo_live_recovery_applicable(void);         /* daemon/utxo_live.c: incident 2026-09-01 */
@@ -184,7 +204,32 @@ extern const char* utxo_live_last_reject(void);
  * accounting drift can never surface a nonsensical negative in the logs. */
 static long live_utxo_disp(void){ long c = utxo_live_count(); return c < 0 ? 0 : c; }
 extern long utxo_live_applied_height(void);              /* daemon/utxo_live.c */
+extern long utxo_live_public_tip(void* store_buf, long live);   /* daemon/utxo_live.c (3.1) */
+extern long utxo_live_persisted_height(void);            /* daemon/utxo_live.c (3.1) */
 extern long utxo_live_recover(void);                     /* daemon/utxo_live.c */
+/* ---- 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the node's tip is the
+ * CONNECTED tip. Until this, every outward-facing site read *(int*)(store+24)
+ * -- the ARCHIVE's high-water mark, which the parallel downloader runs
+ * hundreds of thousands of blocks past the last block this node has actually
+ * validated against its UTXO set. Core announces, serves and reports only
+ * what ActivateBestChain has connected; so does this node now, through this
+ * one function: min(stored, applied) while live UTXO tracking is on, the
+ * stored tip when it is off (the "continuing WITHOUT live UTXO tracking"
+ * degraded mode -- the pre-3.1 behaviour, kept as the negative control).
+ * g_utxo_live_on mirrors the worker's utxo_live_ok (set at init, cleared at
+ * the two HALT sites). The store's own tip remains what the downloader and
+ * the header mirror key on. */
+static int g_utxo_live_on = 0;
+static long node_public_tip(void* st){ return utxo_live_public_tip(st, g_utxo_live_on); }
+/* Publish the connected tip for the two other processes that speak for this
+ * node: the parent's chain RPCs (rpc_chain refresh) and the inbound serve
+ * children (serve_public_tip). Called at the rotation top and from the
+ * catch-up apply hook, so a long catch-up call keeps it fresh per block. */
+static void dl_publish_connected_tip(void){
+    if(!g_node_status) return;
+    g_node_status->connected_tip = g_utxo_live_on ? utxo_live_applied_height() : NODE_TIP_UNTRACKED;
+}
+static long rpc_public_tip(void){ return g_node_status ? (long)g_node_status->connected_tip : (long)NODE_TIP_UNTRACKED; }
 extern int  archive_verify_and_repair(void* store_buf, int repair); /* daemon/archive_verify.c */
 extern long archive_repair_bad_bodies(long nblocks, int level);  /* STO-11 */
 extern long archive_drop_utxo_state(void);                /* daemon/archive_verify.c */
@@ -547,9 +592,10 @@ static void peer_sock_buffers(int fd){
  *
  * BMC_PEER_IDLE_SECS overrides it, following the BMC_LSM_MMAP /
  * BMC_ECDSA_GLV kill-switch idiom, so tests can drive the path in seconds.
- * Note this is NOT Core's -peertimeout, which is a CONNECT timeout;
- * g_cfg.peer_timeout_s is still unwired and is tracked separately rather than
- * silently repurposed here, which would be a fresh divergence from Core. */
+ * Note this is NOT Core's -peertimeout, which bounds the HANDSHAKE: that one
+ * is g_cfg.peer_timeout_s, applied by peer_handshake_deadline() from socket
+ * open until verack (CC-7, 2026-09-06; it was parsed and unread before --
+ * DMN-14). Once the handshake completes this idle bound takes over. */
 #define PEER_IDLE_SECS_DEFAULT 1200      /* Core TIMEOUT_INTERVAL, 20 minutes */
 static void peer_inbound_deadline(int fd){
     if (fd < 0) return;
@@ -1044,6 +1090,12 @@ static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
 /* per-leg BIP155 verdict from the handshake: 1 = the peer sent sendaddrv2,
  * so it gets addrv2-encoded self-announcements (daemon/addr_self.c) */
 static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
+static unsigned char mux_out_kind[MUX_MAX_OUT];         /* CC-4: LEG_FULL / LEG_BLOCK_ONLY */
+static unsigned char mux_out_cmpct[MUX_MAX_OUT];        /* CC-2: the peer sent sendcmpct on this leg */
+extern long  g_peer_sendcmpct;                          /* bitcoind.asm: set by the sync drains when the peer sends sendcmpct */
+extern void* g_sync_mp;                                 /* bitcoind.asm: the mempool node_sync_multi reconstructs from */
+static void* txsub_pool(void);                           /* defined with the tx-submit worker below */
+static int   txsub_worker_ready(void);
 /* each leg's BMC_NET_*, derived from its host string. We announce ONE
  * address -- this node's clearnet IPv4 -- and telling an onion or i2p peer
  * that address links the two, which is exactly what running over those
@@ -1279,10 +1331,10 @@ int serve_mempool_msg(int fd, void* mp){
     unsigned long long mask; memcpy(&mask, m+8, 8);
     static unsigned char inv[3 + 50000*36]; unsigned n = 0; long sent = 0;
     for(unsigned long long i = 0; i <= mask; i++){
-        unsigned char* sl = m + 40 + i*48;
+        unsigned char* sl = MPOOL_SLOT_AT(m, i);
         unsigned long long len; memcpy(&len, sl, 8);
-        if(len == 0xFFFFFFFFFFFFFFFFULL) continue;
-        unsigned char* e = inv + 3 + n*36; e[0]=1; e[1]=0; e[2]=0; e[3]=0; memcpy(e+4, sl+8, 32); n++;
+        if(len == MPOOL_SLOT_EMPTY) continue;
+        unsigned char* e = inv + 3 + n*36; e[0]=1; e[1]=0; e[2]=0; e[3]=0; memcpy(e+4, sl+MPOOL_SLOT_TXID, 32); n++;
         if(n == 50000){ inv[0]=0xfd; inv[1]=(unsigned char)n; inv[2]=(unsigned char)(n>>8); p2p_write(fd, "inv", 3, inv, 3 + n*36); sent += n; n = 0; }
     }
     if(n){ if(n < 0xfd){ inv[2]=(unsigned char)n; p2p_write(fd, "inv", 3, inv+2, 1 + n*36); }
@@ -1298,6 +1350,7 @@ void serve_policy_disconnect_log(const char* reason){
  * child's slot is reused) and publish what getpeerinfo shows */
 static void rpc_fill_peer_slot(int slot, const char* host);
 static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claimed);
+static unsigned netgroup_of_hostport(const char* hostport);   /* CC-3: defined with txr_source_group_fd below */
 static int inbound_slot_claim(const char* peerdesc){
     if(!g_node_status) return -1;
     for(int i = RPC_MAX_PEERS - 1; i >= MUX_MAX_OUT; i--){
@@ -1315,6 +1368,8 @@ static int inbound_slot_claim(const char* peerdesc){
         rpc_fill_peer_slot_ex(i, peerdesc, 1);
         q->inbound = 1; q->pid = (int)getpid(); q->perms = g_conn_perms_all;
         q->relaytxes = node_relay_flag && g_peer_relays_txs;
+        q->net_group = netgroup_of_hostport(peerdesc);          /* CC-3 */
+        q->last_tx_time = 0; q->last_block_time = 0; q->min_ping_us = 0; q->evict_requested = 0;
         return i;
     }
     return -1;
@@ -1331,16 +1386,121 @@ static void serve_violation_report(const char* reason){
 /* audit 2026-09-02 N3: the download worker's legs report by fd (tx_relay.c
  * declares this weak; the daemon supplies it). Map the fd to its leg's
  * "host:port", strip the port, and score it like a serve-side violation. */
+static void ctl_ip_only(const char* hostport, char* out, size_t cap);   /* defined below */
+extern unsigned net_netgroup_v4(unsigned ip);                          /* daemon/net_policy.c */
+
+/* NET-10: which source netgroup is the peer on this fd? Same fd -> leg
+ * "host:port" map the violation hook below uses. IPv4 gets Core's /16
+ * grouping (net_netgroup_v4); anything else -- onion, i2p, cjdns, or a host
+ * we cannot parse -- gets a hash of the host string with the top bit set, so
+ * it is stable per source and cannot collide with a /16 value. 0 means
+ * "unknown", which ab2_add_from never caps. */
+/* CC-3: the Core /16 grouping of a "host:port" string (NET-10's rule for
+ * onion/i2p/cjdns: a stable hash with the top bit set, which cannot collide
+ * with a /16). 0 = unknown. Same logic as txr_source_group_fd below. */
+static unsigned netgroup_of_hostport(const char* hostport){
+    char ip[128]; ctl_ip_only(hostport, ip, sizeof ip);
+    if(!ip[0]) return 0;
+    unsigned o0, o1, o2, o3;
+    if(sscanf(ip, "%u.%u.%u.%u", &o0, &o1, &o2, &o3) == 4 && o0 < 256 && o1 < 256 && o2 < 256 && o3 < 256){
+        unsigned v4 = o0 | (o1 << 8) | (o2 << 16) | (o3 << 24);
+        unsigned g = net_netgroup_v4(v4);
+        return g ? g : 1u;
+    }
+    unsigned h = 2166136261u;
+    for(const char* p = ip; *p; p++){ h ^= (unsigned char)*p; h *= 16777619u; }
+    return h | 0x80000000u;
+}
+unsigned txr_source_group_fd(int fd){
+    for(int k = 0; k < mux_n_out; k++){
+        if(mux_out_fd[k] != fd) continue;
+        char ip[128]; ctl_ip_only(mux_out_host[k], ip, sizeof ip);
+        if(!ip[0]) return 0;
+        unsigned o0, o1, o2, o3;
+        if(sscanf(ip, "%u.%u.%u.%u", &o0, &o1, &o2, &o3) == 4 && o0 < 256 && o1 < 256 && o2 < 256 && o3 < 256){
+            unsigned v4 = o0 | (o1 << 8) | (o2 << 16) | (o3 << 24);   /* byte 0 = first octet */
+            unsigned g = net_netgroup_v4(v4);
+            return g ? g : 1u;                 /* never hand back 0 = "unknown" */
+        }
+        unsigned h = 2166136261u;
+        for(const char* p = ip; *p; p++){ h ^= (unsigned char)*p; h *= 16777619u; }
+        return h | 0x80000000u;
+    }
+    return 0;
+}
+
+/* "host:port" / "[v6]:port" -> the bare address the misbehaviour table keys on */
+static void host_strip_port(char* host){
+    if(host[0] == '['){ char* e = strchr(host, ']'); if(e) *e = 0; memmove(host, host + 1, strlen(host)); }
+    else { char* c = strrchr(host, ':'); if(c && c == strchr(host, ':')) *c = 0; }   /* exactly one ':' = host:port; a bare IPv6 has several and no port */
+}
 void txr_report_violation_fd(int fd, const char* reason){
     for(int k = 0; k < mux_n_out; k++){
         if(mux_out_fd[k] != fd) continue;
         char host[128]; snprintf(host, sizeof host, "%s", mux_out_host[k]);
-        if(host[0] == '['){ char* e = strchr(host, ']'); if(e) *e = 0; memmove(host, host + 1, strlen(host)); }
-        else { char* c = strrchr(host, ':'); if(c && c == strchr(host, ':')) *c = 0; }   /* exactly one ':' = host:port; a bare IPv6 has several and no port */
+        host_strip_port(host);
         if(!host[0]) return;
         peer_misbehaving(host, 100, reason ? reason : "protocol violation");
         return;
     }
+}
+
+/* ---- 3.3 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): who delivered a block ----
+ * A block is connected long after it was stored, by a different code path;
+ * when it fails to connect the worker needs to know which peer handed it
+ * over to score the consensus violation (Core: Misbehaving(100) from
+ * MaybePunishNodeForBlock, then disconnect). The leg sync knows (it logs
+ * "[block] stored height=N ... (via host)"), so it notes the host here, in
+ * a ring keyed by height. Blocks from the parallel downloader's chunk
+ * workers (separate processes, many peers per pass) and from an inbound
+ * child's .do_block are NOT noted: their source is logged as unknown. */
+#define BLK_SRC_RING 4096
+static struct { long h; char host[64]; } g_blk_src[BLK_SRC_RING];
+static void blk_src_note(long h, const char* host){
+    if(h < 0 || !host) return;
+    g_blk_src[h % BLK_SRC_RING].h = h;
+    snprintf(g_blk_src[h % BLK_SRC_RING].host, sizeof g_blk_src[0].host, "%s", host);
+}
+static const char* blk_src_lookup(long h){
+    if(h < 0) return NULL;
+    return g_blk_src[h % BLK_SRC_RING].h == h && g_blk_src[h % BLK_SRC_RING].host[0] ? g_blk_src[h % BLK_SRC_RING].host : NULL;
+}
+/* The reject hook utxo_live_catchup calls for a block that FAILED VALIDATION
+ * (never for a store error -- see utxo_live.c's classification): the same
+ * invalidate path the operator's invalidateblock takes (chain_invalidate_block:
+ * invalid.dat mark, archive truncated to h-1 through the reorg module's
+ * disconnect, headers.dat rolled back to h), then the delivering peer, when
+ * known, is scored 100 for a consensus violation. The worker's next rotation
+ * fetches headers from its peers and takes the heavier chain that avoids the
+ * mark: the chain moves on, no restart, no operator. */
+static void dlc_stop_workers_for_reject(long h);   /* defined with dl_catchup below */
+static long dl_reject_block(void* st, long h, const unsigned char hash[32], const char* reason){
+    extern long chain_invalidate_block(void*, long, const unsigned char[32]);
+    /* Step 1 (the interleaved connect, UTXO_INLINE_BUILD_PERF_SCOPE): when
+     * the parallel downloader's helpers are running, they are stopped FIRST.
+     * chain_invalidate_block truncates the archive to h-1 and rolls
+     * headers.dat back to h; helpers still writing would re-create the
+     * rejected chain above h in the truncated archive (every remaining chunk
+     * of theirs comes from the header chain that includes h), and the next
+     * connect pass would reject h again -- which the burst guard then refuses
+     * to invalidate. Stopping them is also what lets the chain move on:
+     * dl_catchup returns, the rotation's legs fetch headers and take the
+     * heavier chain that avoids the mark, and the far-behind trigger runs the
+     * parallel download again on THAT chain. A no-op when no helper is
+     * running (the rotation's own drain, the boot-time parent). */
+    dlc_stop_workers_for_reject(h);
+    long r = chain_invalidate_block(st, h, hash);
+    if(r != 1) return r;
+    const char* src = blk_src_lookup(h);
+    char why[160]; snprintf(why, sizeof why, "block %ld failed to connect: %s", h, reason && reason[0] ? reason : "consensus reject");
+    if(src){
+        char host[128]; snprintf(host, sizeof host, "%s", src); host_strip_port(host);
+        fprintf(stderr,"[chain] rejected block %ld was delivered by %s -- scoring a consensus violation\n", h, src);
+        if(host[0]) peer_misbehaving(host, 100, why);
+    } else {
+        fprintf(stderr,"[chain] rejected block %ld: delivering peer unknown (parallel downloader or inbound push) -- no peer scored\n", h);
+    }
+    return 1;
 }
 
 /* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
@@ -1530,6 +1690,8 @@ static void upl_sample(void){
 #define TXOQ_SPK_CAP 16384u
 #define TXOQ_TIMEOUT_MS 2000              /* a tip-height block apply is ~0.1s */
 typedef struct { unsigned int magic, vout; unsigned char txid[32]; } txoq_req;
+#define TXOQ_MAGIC_MARK 0x4b52414du   /* CC-10: same framing, a different magic: vout = op, txid = block hash */
+static void dlc_headers_rollback(unsigned char* hst, long have);   /* defined with the boot header fetch below */
 /* The response ECHOES the outpoint it answers. Without that, a query that
  * timed out would leave its response sitting in the socket and the NEXT query
  * would read it -- a perfectly well-formed reply about the WRONG coin. Magic
@@ -1558,6 +1720,23 @@ static int txoq_read_all(int fd, void* buf, size_t n, int timeout_ms){
 
 /* The RPC-side query. Returns 1 found / 0 absent / -1 cannot answer.
  * Serialised: there is one channel and the RPC server is threaded. */
+/* CC-10: RPC side of invalidateblock (op 1) / reconsiderblock (op 2). */
+static long txoq_block_mark(const unsigned char hash_wire[32], int op, long* height, char* err, unsigned long errcap){
+    if(g_txoq_parent < 0){ snprintf(err, errcap, "no download worker channel"); return -1; }
+    pthread_mutex_lock(&g_txoq_lock);
+    txoq_req q; q.magic = TXOQ_MAGIC_MARK; q.vout = (unsigned int)op; memcpy(q.txid, hash_wire, 32);
+    long r = -1;
+    if(send(g_txoq_parent, &q, sizeof q, MSG_NOSIGNAL) == (ssize_t)sizeof q){
+        txoq_resp rp;
+        for(int guard = 0; guard < 8; guard++){
+            if(!txoq_read_all(g_txoq_parent, &rp, sizeof rp, 30000)){ snprintf(err, errcap, "worker did not answer in 30 s"); break; }
+            if(rp.magic == TXOQ_MAGIC_MARK && !memcmp(rp.txid, hash_wire, 32)){ r = rp.found; *height = (long)rp.height; if(r < 0) snprintf(err, errcap, "the worker could not disconnect the block; see its log"); break; }
+            if(rp.spklen){ unsigned char skip[4096]; unsigned long left = rp.spklen; while(left){ unsigned long n = left > sizeof skip ? sizeof skip : left; if(!txoq_read_all(g_txoq_parent, skip, n, 1000)) break; left -= n; } }   /* a stale gettxout reply: drain */
+        }
+    } else snprintf(err, errcap, "worker channel write failed");
+    pthread_mutex_unlock(&g_txoq_lock);
+    return r;
+}
 static long txoq_query(const unsigned char txid_wire[32], unsigned int vout,
                        unsigned long long* value, unsigned long* height,
                        unsigned long* is_coinbase,
@@ -1598,6 +1777,37 @@ extern long utxo_live_lsm_get(const unsigned char txid_wire[32], unsigned int vo
                               unsigned long long* value, unsigned long* height,
                               unsigned long* is_coinbase,
                               const unsigned char** script, unsigned long* slen);
+/* CC-10: the worker side of invalidateblock / reconsiderblock. The block is
+ * located by scanning headers.dat from the top (an operator command; a tenth
+ * of a second at 965k headers); if it is at or below the store's tip the
+ * chain is DISCONNECTED down to its parent through the reorg module's own
+ * unapply path, then headers.dat is rolled back so the header fetch does
+ * not re-offer the branch; the hash goes into invalid.dat, which the fetch
+ * and the reorg analyzer consult from then on. reconsiderblock removes the
+ * mark; the next header fetch takes the branch again. */
+static long txoq_mark_block(void* store_buf, const unsigned char hash[32], int op, long* out_h){
+    *out_h = -1;
+    if(op == 2){ int r = invset_remove(hash); invset_save("invalid.dat"); fprintf(stderr, "[chain] reconsiderblock: %s\n", r ? "mark removed" : "not marked"); return 1; }
+    static unsigned char hb[4096]; hst_init(hb);
+    long n = hst_count(hb), h = -1; unsigned char rec[112];
+    for(long k = n - 1; k >= 0; k--){ if(hst_get_at(hb, (unsigned long long)k, rec) != 1) break; if(!memcmp(rec + 80, hash, 32)){ h = k; break; } }
+    if(h < 0) return 0;
+    /* 3.3: the mark + disconnect + headers rollback is chain_invalidate_block
+     * (daemon/reorg.c) -- the same path the node takes on its own when a
+     * block fails to connect, so invalidateblock is that path invoked by the
+     * operator rather than a second implementation of it. */
+    extern long chain_invalidate_block(void*, long, const unsigned char[32]);
+    long r = chain_invalidate_block(store_buf, h, hash);
+    if(r != 1) return -1;
+    fprintf(stderr, "[chain] invalidateblock: marked height %ld; headers rolled back to %ld; the chain stays below it until a heavier chain avoids it\n", h, h);
+    *out_h = h; return 1;
+}
+static void* g_txoq_store = NULL;                 /* CC-10: set by the worker before its rotation */
+static void txoq_service(void);
+/* The catch-up loop's between-block hook: publish the connected tip (3.1) so
+ * the parent's RPCs and the serve children follow a long catch-up call block
+ * by block, then answer pending gettxout queries (a no-op without the IPC). */
+static void dl_apply_hook(void){ dl_publish_connected_tip(); txoq_service(); }
 static void txoq_service(void){
     if(g_txoq_worker < 0) return;
     for(int guard = 0; guard < 64; guard++){
@@ -1605,6 +1815,13 @@ static void txoq_service(void){
         if(poll(&pf, 1, 0) <= 0) return;               /* nothing pending */
         txoq_req q;
         if(!txoq_read_all(g_txoq_worker, &q, sizeof q, 50)) return;
+        if(q.magic == TXOQ_MAGIC_MARK){                /* CC-10: invalidateblock / reconsiderblock */
+            txoq_resp mr; memset(&mr, 0, sizeof mr); mr.magic = TXOQ_MAGIC_MARK; memcpy(mr.txid, q.txid, 32); mr.vout = q.vout;
+            long hh = -1; long r = txoq_mark_block(g_txoq_store, q.txid, (int)q.vout, &hh);
+            mr.found = (int)r; mr.height = hh < 0 ? 0 : (unsigned long)hh;
+            if(send(g_txoq_worker, &mr, sizeof mr, MSG_NOSIGNAL) != (ssize_t)sizeof mr) return;
+            continue;
+        }
         if(q.magic != TXOQ_MAGIC) return;              /* desynced: stop, do not guess */
         txoq_resp rp; memset(&rp, 0, sizeof rp);
         rp.magic = TXOQ_MAGIC; rp.found = 0;
@@ -1761,7 +1978,7 @@ static int peer_advertises_v2(const char* host, int out_port){
     return yes;
 }
 
-static int outbound_connect(const char* host, int rcv_ms, int out_port){
+static int outbound_connect_raw(const char* host, int rcv_ms, int out_port){
     g_dial_fail[0] = 0;
     /* ---- any BIP155 network (2026-08-28) ----------------------------------
      * A host that parses as a Tor/I2P/CJDNS/IPv6 address goes to its
@@ -1781,7 +1998,7 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
               }
               int dfd = dialer_connect(&da, g_cfg.connect_timeout_ms > 0 ? g_cfg.connect_timeout_ms : 15000, &why);
               if (dfd < 0){ snprintf(g_dial_fail, sizeof g_dial_fail, "%s dial: %.60s", bmc_net_name(da.net), why); return -1; }
-              struct timeval tv; tv.tv_sec = 30; tv.tv_usec = 0;   /* onion/i2p round trips are slow */
+              struct timeval tv; tv.tv_sec = (time_t)peer_handshake_secs(g_cfg.peer_timeout_s); tv.tv_usec = 0;   /* CC-7: -peertimeout bounds the handshake (60 s default; onion/i2p round trips are slow) */
               setsockopt(dfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
               if (node_handshake(dfd) != 1 || !peer_has_witness(host)){
                   snprintf(g_dial_fail, sizeof g_dial_fail, "%s handshake failed", bmc_net_name(da.net));
@@ -1974,6 +2191,29 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
  *
  * Refusing to start is the right failure. Continuing would interleave two
  * chains' blocks in one file, which no later check could untangle. */
+/* CC-4: the hosts we hold (or intend) as block-relay-only legs. Core keeps 2
+ * such connections: fRelay=0 in our version, no transaction announcements,
+ * addr gossip ignored -- an attacker who owns every full-relay peer still
+ * cannot hide a block from us. On shutdown they are written to anchors.dat
+ * (Core's format) and dialled first on the next start. */
+static char g_bo_hosts[MAX_BLOCK_RELAY_ONLY][128];
+static int  g_bo_n = 0;
+static int host_is_block_only(const char* host){
+    for(int i = 0; i < g_bo_n; i++) if(!strcmp(g_bo_hosts[i], host)) return 1;
+    return 0;
+}
+static int bo_want(void){ return g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY; }
+static void bo_add(const char* host){ if(g_bo_n < MAX_BLOCK_RELAY_ONLY && !host_is_block_only(host)) snprintf(g_bo_hosts[g_bo_n++], sizeof g_bo_hosts[0], "%s", host); }
+static int legs_block_only(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && mux_out_kind[k] == LEG_BLOCK_ONLY) n++; return n; }
+/* every outbound dial funnels through here: a block-only host gets fRelay=0
+ * in the version we send (the byte is per-connection already; see feelers) */
+static int outbound_connect(const char* host, int rcv_ms, int out_port){
+    unsigned char saved = node_relay_flag;
+    if(host_is_block_only(host)) node_relay_flag = 0;
+    int fd = outbound_connect_raw(host, rcv_ms, out_port);
+    node_relay_flag = saved;
+    return fd;
+}
 static int chain_archive_matches(void* store_buf){
     int  fd  = *(int*)((char*)store_buf + 8);    /* idx_fd  */
     long len = *(long*)((char*)store_buf + 16);  /* idx_len */
@@ -2117,6 +2357,23 @@ static void format_peer_version_info(char* out, size_t cap){
  *
  * Either way `pr->used = 1` at the end remains the publication point. */
 static void rpc_fill_peer_slot(int slot, const char* host){
+    /* NET-10: an OUTBOUND leg we established is a peer we have actually
+     * connected to -- Core's `tried`. Marking it here is what makes rule 2
+     * mean anything on a node with no legacy book to migrate: without it
+     * nothing would ever be tried, and eviction would have nothing to
+     * protect. Every caller of THIS wrapper is an outbound fill (the
+     * background dial, the initial pool fill, and the top-up).
+     *
+     * Deliberately NOT in rpc_fill_peer_slot_ex: the inbound path claims its
+     * slot through _ex directly, and marking an inbound peer tried would let
+     * anyone who dials US immunise their own address against eviction --
+     * exactly the capability NET-10 exists to remove. */
+    { ab2_t* b = addr_book();
+      if(b){
+          bmc_addr_t a;
+          if(bmc_addr_from_string_port(&a, host, 0) && bmc_addr_is_routable(&a))
+              ab2_mark_tried(b, &a);
+      } }
     rpc_fill_peer_slot_ex(slot, host, 0);
 }
 static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claimed){
@@ -2173,7 +2430,15 @@ static long do_outbound_sync(int i){
     static unsigned char cbuf[6<<20]; long cnt=0;
     int st_tip_before=*(int*)(store_buf+24);
     phase_timer_t sync_pt; phase_start(&sync_pt);
+    /* CC-2: this leg's compact-block state rides in two asm globals around the
+     * call -- whether the peer sent sendcmpct (the drains set it) and the pool
+     * the reconstruction draws on. Read back after: the peer may have sent
+     * sendcmpct during this very sync. */
+    g_peer_sendcmpct = mux_out_cmpct[i]; g_sync_mp = txsub_worker_ready() ? txsub_pool() : NULL;
     long ok=node_sync_multi(mux_out_fd[i], store_buf, loc, nloc, cbuf, (long)sizeof cbuf, &cnt);
+    if(g_peer_sendcmpct && !mux_out_cmpct[i]){ mux_out_cmpct[i] = 1; fprintf(stderr, "[cmpct] %s accepts compact blocks: requesting MSG_CMPCT_BLOCK on this leg from now on\n", mux_out_host[i]); }
+    { static unsigned long p_r, p_n, p_f; unsigned long r, n, f; cmpct_recv_stats(&r, &n, &f);
+      if(r != p_r || n != p_n || f != p_f){ fprintf(stderr, "[cmpct] reconstructed %lu block(s) from the mempool (%lu needed a getblocktxn round trip, %lu fell back to a full block)\n", r, n, f); p_r = r; p_n = n; p_f = f; } }
     double sync_s = phase_elapsed(&sync_pt);
     int st_tip=*(int*)(store_buf+24);
     if(ok!=1 || cnt<=0){
@@ -2238,6 +2503,7 @@ static long do_outbound_sync(int i){
         u64 consumed=0; u64 ntx = L>80 ? utxo_walk_read_varint(sb+80, sb+L, &consumed) : 0;
         if(!consumed) ntx = 0;
         fprintf(stderr,"[block] stored height=%d hash=%s.. bytes=%ld tx=%llu (via %s)\n", h, hs, L, (unsigned long long)ntx, mux_out_host[i]);
+        blk_src_note(h, mux_out_host[i]);   /* 3.3: remembered for the reject hook */
     }
     /* STAGE B: keep chainwork.dat in lockstep with index.dat for every block
      * that just landed. This is a CATCH-UP call, not a per-block hook: it
@@ -2249,10 +2515,11 @@ static long do_outbound_sync(int i){
     if(reorg_chainwork_sync(store_buf, 0) < 0)
         fprintf(stderr,"[chainwork] sync failed after storing heights %d..%d -- fork choice is DEGRADED until this recovers\n",
                 st_tip_before+1, st_tip);
-    /* announce the new tip to this peer (inv; BIP130 headers honored by the
-     * peer's sendheaders negotiation is handled downstream on its own leg) */
-    node_announce_tip(mux_out_fd[i], store_buf, ht_idx, 0);
-    fprintf(stderr,"[mux:%d] broadcast tip height=%d to %s\n", i, st_tip, mux_out_host[i]);
+    /* 3.1: NOT announced here. The block is stored, not connected; the
+     * announcement (inv to every outbound leg) fires from the worker's
+     * new-block choke point once utxo_live_catchup has connected it -- the
+     * same rotation in steady state, never ahead of validation. */
+    fprintf(stderr,"[mux:%d] stored tip height=%d from %s (announced on connect)\n", i, st_tip, mux_out_host[i]);
     /* advance this peer's persistent locator to our new stored tip */
     anchor_locator(mux_out_loc[i]);
     fprintf(stderr,"[mux:%d] %-22s sync ok=%ld new=%ld tip=%d (%.2fs)\n", i, mux_out_host[i], ok, cnt, st_tip, sync_s);
@@ -2528,6 +2795,7 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
     g_peer_wants_addrv2 = r->wants_addrv2;
     snprintf(mux_out_host[mux_n_out], sizeof mux_out_host[mux_n_out], "%s", host);
     mux_out_fd[mux_n_out] = fd;
+    mux_out_kind[mux_n_out] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
     mux_out_wants_v2[mux_n_out] = r->wants_addrv2;
     mux_out_peer[mux_n_out] = 0;
     anchor_locator(mux_out_loc[mux_n_out]);
@@ -3284,8 +3552,86 @@ static unsigned long dlc_varint(const unsigned char* p, unsigned long avail, uns
     if(p[0] == 0xfd){ if(avail < 3){ *used = 0; return 0; } *used = 3; return (unsigned long)p[1] | ((unsigned long)p[2] << 8); }
     *used = 0; return 0;                       /* a headers count never needs more */
 }
+/* CC-5: one page of headers, validated and appended exactly as before --
+ * linkage, overlap-must-match, PoW, the VAL-5 contextual rules -- factored
+ * out so a page HELD below -minimumchainwork can be taken later, in order.
+ * Returns the number of headers consumed (< cnt stops the peer's pages), or
+ * -1 after rolling the store back to have0. */
+static long dlc_take_page(void* hst, const unsigned char* first, unsigned long cnt, long pos,
+                          unsigned char prev[32], const char* cand, long have0, long* added){
+long have = hst_count(hst);
+unsigned long i = 0;
+for(; i < cnt; i++){
+        const unsigned char* h = first + i * 81;
+        if(h[80] != 0) break;                 /* txn_count must be 0 in a headers message */
+        if(memcmp(h + 4, prev, 32) != 0){
+            fprintf(stderr,"[dlc] headers from %s break their own chain at %lu -- discarding\n", cand, i);
+            dlc_headers_rollback(hst, have0); return -1;
+        }
+        unsigned char bh[32]; block_hash(bh, h);
+        if(pos + (long)i < have){
+            /* overlap with what we hold: must be the same block */
+            unsigned char rec[112];
+            if(hst_get_at(hst, (unsigned long long)(pos + (long)i), rec) != 1 || memcmp(rec + 80, bh, 32) != 0){
+                fprintf(stderr,"[dlc] headers from %s fork from our chain at height %ld -- discarding\n", cand, pos + (long)i);
+                dlc_headers_rollback(hst, have0); return -1;
+            }
+        } else {
+            /* VAL-5 (audit 2026-09-03): this used to append whatever a
+             * peer sent after only checking linkage -- no pow_check at
+             * all, so up to 2,000 x 1,000 headers of garbage from the
+             * first live peer landed in headers.dat by height, and the
+             * block downloader then requested blocks for hashes nothing
+             * ever revalidates. Core validates CheckProofOfWork on every
+             * header before storing. The nBits range/PoW check runs
+             * BEFORE hst_append (pow_check carries the VAL-11 nBits
+             * range gates + the armed chain powLimit), and VAL-5's
+             * remaining rules -- ContextualCheckBlockHeader's timestamp
+             * floor, its 2-hour ceiling and the legacy-version rules --
+             * run right after it, from daemon/hdrrules.h. */
+            if(!pow_check(h)){
+                fprintf(stderr,"[dlc] header at height %ld from %s fails its own PoW -- discarding the page\n",
+                        pos + (long)i, cand);
+                dlc_headers_rollback(hst, have0); return -1;
+            }
+            /* ---- VAL-5: the non-PoW header rules -------------------
+             * The timestamp FLOOR needs the parent's median-time-past.
+             * At the very start of a fetch the parent is whatever the
+             * store already holds; within a page it is the window this
+             * loop has just appended. hst_median_time_past reads the
+             * store, so it is only consulted for a height whose 11
+             * ancestors are already there -- otherwise the floor is
+             * skipped for that header rather than evaluated against a
+             * window that does not exist. The ceiling and the version
+             * rules need no ancestors and always run. */
+            { long hh = pos + (long)i;
+              const char* why = "?";
+              unsigned long pmtp = 0;
+              if (hh >= 11) (void)hst_median_time_past(hst, hh - 1, &pmtp);
+              unsigned long long hflags =
+                  script_flags_for_block((unsigned long long)hh, bh);
+              if(!hdr_contextual_ok(hh, h, pmtp, (long)time(NULL),
+                                    hflags, dlc_bip34_height(), &why)){
+                  fprintf(stderr,"[dlc] header at height %ld from %s rejected: %s -- discarding the page\n",
+                          hh, cand, why);
+                  dlc_headers_rollback(hst, have0); return -1;
+              } }
+            if(invset_has(bh)){                       /* CC-10: the operator invalidated this block */
+                fprintf(stderr,"[dlc] headers from %s reach a block the operator invalidated at height %ld -- refusing this chain\n", cand, pos + (long)i);
+                dlc_headers_rollback(hst, have0); return -1;
+            }
+            if(hst_append(hst, h, bh) < 0){ dlc_headers_rollback(hst, have0); return -1; }
+            (*added)++;
+        }
+        memcpy(prev, bh, 32);
+    }
+    return (long)i;
+}
+static lowwork_t g_lw;                                   /* CC-5 hold: 48 KB of bookkeeping; the page scratch is mmap'd per fetch */
+static int dlc_lw_get_at(void* hst, unsigned long long h, void* out){ return hst_get_at(hst, h, out); }
+extern int reorg_min_chain_work_set(void);
 static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
-    long have0 = hst_count(hst), added = 0;
+    long have0 = hst_count(hst), added = 0; int lw_started = 0; lowwork_clear(&g_lw);
     static unsigned char page[DLC_HDR_PAGE * 81 + 16];
     static unsigned char msg[2 << 20];
     unsigned char stop[32]; memset(stop, 0, 32);
@@ -3293,6 +3639,12 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
         unsigned char loc[DLC_HDR_LOCATOR_MAX * 32]; long lh[DLC_HDR_LOCATOR_MAX];
         int nl = dlc_locator_build(hst, loc, lh);
         if(nl <= 0) return -1;
+        { unsigned char th[32]; long tht;                        /* CC-5: ask onward from the held tail */
+          if(lowwork_tail(&g_lw, th, &tht)){
+              if(nl >= DLC_HDR_LOCATOR_MAX) nl = DLC_HDR_LOCATOR_MAX - 1;
+              memmove(loc + 32, loc, (size_t)nl * 32); memmove(lh + 1, lh, (size_t)nl * sizeof lh[0]);
+              memcpy(loc, th, 32); lh[0] = tht; nl++;
+          } }
         long plen = p2p_getheaders(page, loc, nl, stop);
         if(plen <= 0 || p2p_write(fd, "getheaders", 10, page, (unsigned)plen) < 0) return -1;
         /* the reply: skip anything else the peer says first (inv, ping, ...) */
@@ -3320,69 +3672,47 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
             fprintf(stderr,"[dlc] headers from %s attach at height %ld while we hold %ld -- a fork deeper than %ld is not a continuation; discarding\n", cand, pos, have0, DLC_HDR_SANE_MAX);
             dlc_headers_rollback(hst, have0); return -1;
         }
-        long have = hst_count(hst);
         unsigned char prev[32]; memcpy(prev, loc + at * 32, 32);
-        unsigned long i = 0;
-        for(; i < cnt; i++){
-            const unsigned char* h = first + i * 81;
-            if(h[80] != 0) break;                 /* txn_count must be 0 in a headers message */
-            if(memcmp(h + 4, prev, 32) != 0){
-                fprintf(stderr,"[dlc] headers from %s break their own chain at %lu -- discarding\n", cand, i);
-                dlc_headers_rollback(hst, have0); return -1;
-            }
-            unsigned char bh[32]; block_hash(bh, h);
-            if(pos + (long)i < have){
-                /* overlap with what we hold: must be the same block */
-                unsigned char rec[112];
-                if(hst_get_at(hst, (unsigned long long)(pos + (long)i), rec) != 1 || memcmp(rec + 80, bh, 32) != 0){
-                    fprintf(stderr,"[dlc] headers from %s fork from our chain at height %ld -- discarding\n", cand, pos + (long)i);
-                    dlc_headers_rollback(hst, have0); return -1;
-                }
-            } else {
-                /* VAL-5 (audit 2026-09-03): this used to append whatever a
-                 * peer sent after only checking linkage -- no pow_check at
-                 * all, so up to 2,000 x 1,000 headers of garbage from the
-                 * first live peer landed in headers.dat by height, and the
-                 * block downloader then requested blocks for hashes nothing
-                 * ever revalidates. Core validates CheckProofOfWork on every
-                 * header before storing. The nBits range/PoW check runs
-                 * BEFORE hst_append (pow_check carries the VAL-11 nBits
-                 * range gates + the armed chain powLimit), and VAL-5's
-                 * remaining rules -- ContextualCheckBlockHeader's timestamp
-                 * floor, its 2-hour ceiling and the legacy-version rules --
-                 * run right after it, from daemon/hdrrules.h. */
-                if(!pow_check(h)){
-                    fprintf(stderr,"[dlc] header at height %ld from %s fails its own PoW -- discarding the page\n",
-                            pos + (long)i, cand);
-                    dlc_headers_rollback(hst, have0); return -1;
-                }
-                /* ---- VAL-5: the non-PoW header rules -------------------
-                 * The timestamp FLOOR needs the parent's median-time-past.
-                 * At the very start of a fetch the parent is whatever the
-                 * store already holds; within a page it is the window this
-                 * loop has just appended. hst_median_time_past reads the
-                 * store, so it is only consulted for a height whose 11
-                 * ancestors are already there -- otherwise the floor is
-                 * skipped for that header rather than evaluated against a
-                 * window that does not exist. The ceiling and the version
-                 * rules need no ancestors and always run. */
-                { long hh = pos + (long)i;
-                  const char* why = "?";
-                  unsigned long pmtp = 0;
-                  if (hh >= 11) (void)hst_median_time_past(hst, hh - 1, &pmtp);
-                  unsigned long long hflags =
-                      script_flags_for_block((unsigned long long)hh, bh);
-                  if(!hdr_contextual_ok(hh, h, pmtp, (long)time(NULL),
-                                        hflags, dlc_bip34_height(), &why)){
-                      fprintf(stderr,"[dlc] header at height %ld from %s rejected: %s -- discarding the page\n",
-                              hh, cand, why);
-                      dlc_headers_rollback(hst, have0); return -1;
-                  } }
-                if(hst_append(hst, h, bh) < 0){ dlc_headers_rollback(hst, have0); return -1; }
-                added++;
-            }
-            memcpy(prev, bh, 32);
-        }
+        /* ---- CC-5: is this chain worth storing yet? ------------------------
+         * Core (24.0 presync) stores nothing from a peer until the chain's
+         * total work clears -minimumchainwork; this node appended every
+         * PoW-valid header regardless, so a peer could fill headers.dat with
+         * an arbitrarily long valid-PoW low-work chain. Full pages below the
+         * floor are HELD (linkage + PoW checked, nothing stored) and released
+         * in order once the chain crosses it; a chain that stays below for
+         * LOWWORK_HOLD_PAGES full pages is abandoned. */
+        if(!lw_started){ unsigned char cum[16]; lowwork_cum_from_store(cum, hst, pos - 1, dlc_lw_get_at); lowwork_begin(&g_lw, cum, reorg_min_chain_work_set()); lw_started = 1; }
+        { unsigned char lasth[32]; block_hash(lasth, first + (cnt - 1) * 81);
+          int lwv = lowwork_page(&g_lw, first, cnt, pos, prev, lasth);
+          if(lwv == LOWWORK_ABANDON){
+              fprintf(stderr,"[dlc] headers from %s: %d full pages (%lu headers, the hold's memory bound) and still below -minimumchainwork -- abandoning this chain (nothing was stored)\n", cand, LOWWORK_HOLD_PAGES, (unsigned long)LOWWORK_HOLD_PAGES * LOWWORK_PAGE_MAX);
+              lowwork_clear(&g_lw); dlc_headers_rollback(hst, have0); return -1;
+          }
+          if(lwv == LOWWORK_HOLD){
+              for(unsigned long j = 0; j < cnt; j++){
+                  const unsigned char* h = first + j * 81;
+                  if(h[80] != 0 || memcmp(h + 4, prev, 32) != 0 || !pow_check(h)){
+                      fprintf(stderr,"[dlc] held page from %s fails linkage or PoW at %lu -- discarding\n", cand, j);
+                      lowwork_clear(&g_lw); dlc_headers_rollback(hst, have0); return -1;
+                  }
+                  block_hash(prev, h);
+              }
+              if(g_lw.held == 1) fprintf(stderr,"[dlc] headers from %s are below -minimumchainwork so far -- holding %lu, storing none until the chain proves its work\n", cand, cnt);
+              continue;
+          }
+          if(lwv == LOWWORK_RELEASE){
+              fprintf(stderr,"[dlc] chain from %s crossed -minimumchainwork -- storing %d held page(s)\n", cand, g_lw.held);
+              for(int j = 0; j < g_lw.held; j++){
+                  const unsigned char* hp; unsigned long hc; long hpos; const unsigned char* hprev; unsigned char pv[32];
+                  lowwork_held(&g_lw, j, &hp, &hc, &hpos, &hprev); memcpy(pv, hprev, 32);
+                  if(dlc_take_page(hst, hp, hc, hpos, pv, cand, have0, &added) < 0){ lowwork_clear(&g_lw); return -1; }
+              }
+              lowwork_clear(&g_lw);
+          } }
+        unsigned long i;
+        { long took = dlc_take_page(hst, first, cnt, pos, prev, cand, have0, &added);
+          if(took < 0) return -1;
+          i = (unsigned long)took; }
         if(i < cnt) break;                        /* a non-empty txn_count: stop taking this peer's pages */
         if(cnt < DLC_HDR_PAGE) break;             /* a short page is the peer's tip */
     }
@@ -3922,6 +4252,42 @@ static void dlc_scan_progress(long* out_tip, long* out_present){
     idxscan_progress(out_tip, out_present);
 }
 
+/* ---- Step 1 of docs/audits/UTXO_INLINE_BUILD_PERF_SCOPE.md (2026-09-06):
+ * the knobs of the interleaved connect, and the helper-stop used by both the
+ * shutdown path and a mid-download rejection. Plain statics rather than
+ * config: the budget/idle pair is a scheduling detail of one loop, and the
+ * tests (tests/test_dlc_interleave, which includes this TU) set them. */
+#define DLC_CONNECT_BUDGET_MS 8000L   /* one connect pass: the scope's ~8 s */
+#define DLC_IDLE_MS           2000L   /* nothing connectable: the scope's ~2 s */
+#define DLC_STATUS_MS        10000L   /* the peer-status table's cadence (was the loop's nanosleep) */
+#define DLC_CONNECT_RETRY_MS 30000L   /* after a connect FAILURE (not a hole): keep downloading, retry later */
+static int  g_dlc_interleave        = 1;                     /* test seam: 0 = the pre-step-1 loop */
+static long g_dlc_connect_budget_ms = DLC_CONNECT_BUDGET_MS;
+static long g_dlc_idle_ms           = DLC_IDLE_MS;
+static pid_t* g_dlc_kids = NULL;   /* dl_catchup's helper pids while it runs; NULL otherwise */
+static int    g_dlc_nw   = 0;
+static void dl_new_block_choke(void);   /* the 3.1 choke point, defined with the worker below */
+static long long dlc_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000LL; }
+/* Tell every live helper to stop, give it a moment, then kill and reap it.
+ * Workers inherit the flag-only SIGTERM handler, so SIGTERM is advisory and
+ * the SIGKILL a second later is what actually ends a helper blocked in a
+ * socket read. kids[w] is zeroed for every stopped helper. */
+static void dlc_stop_workers(pid_t* kids, int nw, const char* why){
+    int n = 0; for(int w=0;w<nw;w++) if(kids[w]) n++;
+    if(!n) return;
+    fprintf(stderr,"[dlc] %s -- stopping %d worker(s)\n", why, n);
+    for(int w=0;w<nw;w++) if(kids[w]) kill(kids[w], SIGTERM);
+    { struct timespec g={1,0}; nanosleep(&g,NULL); }
+    for(int w=0;w<nw;w++) if(kids[w]){ int stt; if(waitpid(kids[w],&stt,WNOHANG)==0){ kill(kids[w], SIGKILL); waitpid(kids[w],&stt,0); } kids[w]=0; }
+}
+/* The reject hook's half (see dl_reject_block): a no-op unless dl_catchup is
+ * running in this process right now. */
+static void dlc_stop_workers_for_reject(long h){
+    if(!g_dlc_kids || g_dlc_nw <= 0) return;
+    char why[96]; snprintf(why, sizeof why, "block %ld rejected mid-download", h);
+    dlc_stop_workers(g_dlc_kids, g_dlc_nw, why);
+}
+
 static long dl_catchup(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
     ab2_t* ab = addr_book();
@@ -4116,17 +4482,75 @@ static long dl_catchup(const char* dir, int min_workers){
     long nbanned=0;
     double cumulative_bytes=0.0;       /* running total network-received, across the whole call */
     double cumulative_write_bytes=0.0; /* running total actually written to disk, across the whole call */
+    /* ---- Step 1 of docs/audits/UTXO_INLINE_BUILD_PERF_SCOPE.md (2026-09-06):
+     * connect INSIDE the download loop. This loop used to nanosleep(10 s) and
+     * print for the whole download (19.5 h on the 2026-09-04 bench) while the
+     * 4.5 h of UTXO connect waited for it to return. Now each pass, when this
+     * process owns the UTXO set, connects the contiguous prefix the helpers
+     * have delivered -- utxo_live_catchup_bounded with a DLC_CONNECT_BUDGET_MS
+     * budget, stopping at the first hole -- and idles DLC_IDLE_MS only when
+     * nothing was connectable. Every block goes through the same loop body
+     * as the unbounded call (verify workers, LSM, checkpoint cadence, the
+     * apply hook that publishes the connected tip, the shutdown flag), and
+     * the new-block choke point fires after each pass, so announcements,
+     * ZMQ, the index tails and the mempool follow the CONNECTED tip during
+     * the download. The peer-status table, the dead-weight kills and the EMA
+     * keep their 10 s cadence (DLC_STATUS_MS) whatever a connect pass took,
+     * with every per-tick rate divided by the tick's REAL length.
+     *
+     * SINGLE WRITER, unchanged. The helpers write blocks and index records
+     * (store_append_shared under append.lock) and never touch the UTXO set;
+     * this process -- the download worker, the one and only utxo_lsm_put/del
+     * caller -- is what connects. The read side is a pread by height of a
+     * record a helper has already published under the lock, and the
+     * contiguous-prefix rule means no height is read while a helper is still
+     * writing it. The boot-time PARENT has no UTXO engine (utxo_live_init
+     * runs in the worker; g_utxo_live_on is 0 here), so a boot catch-up
+     * (bmc.bootcatchup=1) still connects afterwards through the worker's
+     * drain; the far-behind trigger's run in the worker interleaves.
+     * g_dlc_interleave is the test seam (test_dlc_interleave's control).
+     *
+     * A block REJECTED mid-download (3.3): the reject hook stops the helpers
+     * BEFORE chain_invalidate_block truncates the archive under them (see
+     * dl_reject_block), this loop reaps them and returns, the rotation's legs
+     * take the heavier chain that avoids the mark, and the far-behind trigger
+     * re-runs the parallel download on it if the node is still DL_PARALLEL_GAP
+     * behind. A connect FAILURE that is not a rejection (a store error, the
+     * halt) does NOT stop the download: connect backs off DLC_CONNECT_RETRY_MS
+     * and the rotation's recovery path owns the failure once the download is
+     * done, exactly as it did when connect only ran afterwards. */
+    int interleave = g_dlc_interleave && g_utxo_live_on;
+    g_dlc_kids = kids; g_dlc_nw = nw;
+    long conn_total = 0;                       /* blocks connected by this call's passes */
+    long long last_status_ms = dlc_now_ms(), connect_retry_ms = 0;
     int alive=nw;
     while(alive>0){
-        struct timespec ts={10,0}; nanosleep(&ts,NULL);
+        long done = 0;
+        if(interleave && dlc_now_ms() >= connect_retry_ms){
+            /* (store_reload is the bounded call's first act, so it sees the
+             * helpers' appends; a second one here would be redundant.) */
+            done = utxo_live_catchup_bounded(store_buf, g_dlc_connect_budget_ms, 1);
+            if(done > 0){ conn_total += done; dl_new_block_choke(); }
+            if(utxo_live_call_rejected_height() >= 0){
+                fprintf(stderr,"[dlc] block at height %ld REJECTED (%s) and invalidated mid-download -- helpers stopped, connected %ld; "
+                               "the rotation fetches the chain that avoids it\n",
+                        utxo_live_call_rejected_height(), utxo_live_last_reject(), utxo_live_applied_height());
+            } else if(done < 0){
+                fprintf(stderr,"[dlc] connect FAILED at height %ld (%s) -- the download continues; connect retries in %lds, "
+                               "the rotation's recovery path owns it after the download\n",
+                        utxo_live_applied_height()+1, utxo_live_fail_kind_name(utxo_live_last_fail_kind()), DLC_CONNECT_RETRY_MS/1000);
+                connect_retry_ms = dlc_now_ms() + DLC_CONNECT_RETRY_MS;
+            }
+        }
+        if(done <= 0){
+            long ms = interleave ? g_dlc_idle_ms : 10000L;   /* the pre-step-1 loop: sleep 10 s, print */
+            struct timespec ts={ms/1000,(ms%1000)*1000000L}; nanosleep(&ts,NULL);
+        }
         if(g_shutdown_requested){
             /* incident 2026-09-01: this loop ignored SIGTERM and the stop hung
              * until a SIGKILL. Workers inherit the flag-only handler, so they
              * are told, given a moment, then killed. */
-            fprintf(stderr,"[dlc] shutdown requested -- stopping %d worker(s)\n", alive);
-            for(int w=0;w<nw;w++) if(kids[w]) kill(kids[w], SIGTERM);
-            { struct timespec g={1,0}; nanosleep(&g,NULL); }
-            for(int w=0;w<nw;w++) if(kids[w]){ int stt; if(waitpid(kids[w],&stt,WNOHANG)==0){ kill(kids[w], SIGKILL); waitpid(kids[w],&stt,0); } kids[w]=0; }
+            dlc_stop_workers(kids, nw, "shutdown requested");
             alive=0; break;
         }
         alive=0;
@@ -4135,6 +4559,12 @@ static long dl_catchup(const char* dir, int min_workers){
             int stt; pid_t r=waitpid(kids[w],&stt,WNOHANG);
             if(r==0) alive++; else kids[w]=0;
         }
+        /* everything below is the 10 s status tick; a connect pass that
+         * returned early (a hole, or the idle sleep) does not add a tick */
+        long long now_ms = dlc_now_ms();
+        if(alive > 0 && now_ms - last_status_ms < DLC_STATUS_MS) continue;
+        double tick_s = (double)(now_ms - last_status_ms) / 1000.0; if(tick_s < 1.0) tick_s = 1.0;
+        last_status_ms = now_ms;
         {
             long cur_tip, present;
             dlc_scan_progress(&cur_tip, &present);
@@ -4142,13 +4572,24 @@ static long dl_catchup(const char* dir, int min_workers){
             double overall_pct = 100.0*(double)present/(double)(end_h+1);
             double span_pct = cur_tip>=0 ? 100.0*(double)present/(double)(cur_tip+1) : 0.0;
             char elapsed[32]; dlc_fmt_elapsed(elapsed,sizeof elapsed,(long)(time(NULL)-catchup_start));
-            fprintf(stderr,"[dlc] == elapsed %s | overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free) ==\n",
-                    elapsed, present, end_h+1, overall_pct, holes, cur_tip, span_pct);
+            /* applied = the connected tip; lag = blocks on disk in the
+             * contiguous prefix that connect has not reached yet (the only
+             * lag connect could close -- a hole is the download's, not ours) */
+            char connbuf[128];
+            if(g_utxo_live_on){
+                long applied = utxo_live_applied_height();
+                long fh = cur_tip>=0 ? dlc_first_hole(cur_tip) : -1;
+                long prefix = fh>=0 ? fh-1 : cur_tip;
+                long lag = prefix - applied; if(lag < 0) lag = 0;
+                snprintf(connbuf,sizeof connbuf," | applied=%ld lag=%ld%s", applied, lag, interleave ? "" : " (interleave off)");
+            } else snprintf(connbuf,sizeof connbuf," | connect deferred (no UTXO engine in this process)");
+            fprintf(stderr,"[dlc] == elapsed %s | overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free)%s ==\n",
+                    elapsed, present, end_h+1, overall_pct, holes, cur_tip, span_pct, connbuf);
         }
         fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
         double tick_total_bytes=0.0, tick_total_write_bytes=0.0;
         for(int w=0;w<nw;w++){
-            long b=stats[w].blocks; long blkrate=(b-prev_blocks[w])/10;
+            long b=stats[w].blocks; long blkrate=(long)((double)(b-prev_blocks[w])/tick_s);
             long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
             long wc=kids[w]!=0 ? dlc_proc_wbytes(opid[w]) : -1;
             char bw[16]="--"; double byte_rate=-1.0;
@@ -4156,7 +4597,7 @@ static long dl_catchup(const char* dir, int min_workers){
                 if(prev_rchar[w]>0){
                     double delta=(double)(rc-prev_rchar[w]);
                     tick_total_bytes+=delta;
-                    byte_rate=delta/10.0;
+                    byte_rate=delta/tick_s;
                     dlc_fmt_rate(bw,sizeof bw,byte_rate);
                     stats[w].last_bw_bps=byte_rate; /* worker reads this to report why it got dropped */
                     /* EMA speed for the peer this worker HOLDS (alpha 0.5,
@@ -4232,10 +4673,10 @@ static long dl_catchup(const char* dir, int min_workers){
             cumulative_write_bytes+=tick_total_write_bytes;
             char totbuf[16], aggbuf[16], cumbuf[16], wtotbuf[16], waggbuf[16], wcumbuf[16];
             dlc_fmt_bytes(totbuf,sizeof totbuf,tick_total_bytes);
-            dlc_fmt_rate(aggbuf,sizeof aggbuf,tick_total_bytes/10.0);
+            dlc_fmt_rate(aggbuf,sizeof aggbuf,tick_total_bytes/tick_s);
             dlc_fmt_bytes(cumbuf,sizeof cumbuf,cumulative_bytes);
             dlc_fmt_bytes(wtotbuf,sizeof wtotbuf,tick_total_write_bytes);
-            dlc_fmt_rate(waggbuf,sizeof waggbuf,tick_total_write_bytes/10.0);
+            dlc_fmt_rate(waggbuf,sizeof waggbuf,tick_total_write_bytes/tick_s);
             dlc_fmt_bytes(wcumbuf,sizeof wcumbuf,cumulative_write_bytes);
             /* two genuinely different numbers, shown separately rather than
              * conflated into one "aggregate": network-received (rchar) is
@@ -4258,6 +4699,18 @@ static long dl_catchup(const char* dir, int min_workers){
     fprintf(stderr,"[dlc] -- average since start: %s recv, %s write --\n",avgrbuf,avgwbuf);
         }
     }
+    g_dlc_kids = NULL; g_dlc_nw = 0;            /* the reject hook's stop is a no-op again */
+    /* One more pass now that every helper has exited: the blocks that landed
+     * between the last connect pass and the last reap (up to a chunk per
+     * helper) are connected here, budget-bounded like any pass, so the lag
+     * at the download gate is what one pass leaves, not a tick's worth of
+     * download. The rotation's drain still owns whatever remains. */
+    if(interleave && !g_shutdown_requested){
+        long done = utxo_live_catchup_bounded(store_buf, g_dlc_connect_budget_ms, 1);
+        if(done > 0){ conn_total += done; dl_new_block_choke(); }
+    }
+    if(interleave) fprintf(stderr,"[dlc] connected %ld block(s) during the download; connected tip %ld (the rotation drains the rest)\n",
+                           conn_total, utxo_live_applied_height());
     long total=*done_count;
     /* Remember who actually produced blocks. A peer that delivered is worth
      * trying first next boot; the address book alone only records that an IP
@@ -4341,7 +4794,7 @@ extern int  txsub_accept_and_relay(void* mp_area, const unsigned char* tx, unsig
                                    const int* peer_fds, int n_fds,
                                    char* reason, unsigned long rcap, int* relayed_out);
 #define TXSUB_MP_SLOTS 1024
-static unsigned char txsub_mp_area[40 + TXSUB_MP_SLOTS*48 + 8];
+static unsigned char txsub_mp_area[MPOOL_AREA_BYTES(TXSUB_MP_SLOTS)];
 static unsigned char txsub_mp_blob[2u<<20];
 static int           txsub_ready = 0;   /* 0 uninit, 1 ready, -1 init failed */
 static unsigned long long txsub_last_seq = 0;
@@ -4630,6 +5083,141 @@ static int dl_should_parallel_fetch(long archive_tip, long best_peer_height,
     return 1;
 }
 
+/* ---- the new-block choke point (3.1), as ONE function ---------------------
+ * Fires from two places now: the worker's rotation, once per pass, and the
+ * parallel downloader's monitor loop after every bounded connect (step 1 of
+ * UTXO_INLINE_BUILD_PERF_SCOPE, 2026-09-06) -- so a block connected while the
+ * helpers are still downloading is announced, published to ZMQ, folded into
+ * the index tails and reconciled against the mempool the moment it connects,
+ * not hours later when dl_catchup returns. The baseline (g_dl_last_seen_tip)
+ * is the worker's: set to the connected tip at the rotation top, rewound to
+ * the fork height by a reorg (STO-7), -1 in the boot-time parent, where the
+ * downloader runs before any UTXO engine exists and this is never called. */
+static int g_dl_last_seen_tip = -1;
+/* new-block choke point (3.1: watching the CONNECTED tip, not the
+ * store's). Everything the node says or does about a "new block"
+ * -- the log line, the outbound-leg announce, ZMQ hashblock/rawblock,
+ * the index tails, -blocknotify, the mempool's removeForBlock and
+ * its tip anchor -- fires here, once per block that utxo_live has
+ * connected. Before 3.1 this watched *(int*)(store+24) and every one
+ * of those consumers saw blocks this node had stored but never
+ * validated. Hash printed big-endian like Core logs it, so a line
+ * here greps against a Core debug.log. The tip can also go DOWN here
+ * (a reorg, a rejected block truncating the archive): nothing is
+ * announced for that, the baseline just follows. */
+static void dl_new_block_choke(void){
+    int now_tip = (int)node_public_tip(store_buf);
+    if(g_dl_last_seen_tip >= 0 && now_tip > g_dl_last_seen_tip){
+        static unsigned char thb[8u<<20]; unsigned char th[32]; char hex[65];
+        if(store_read_at(store_buf, (unsigned long)now_tip, thb, (long)sizeof thb) >= 80){
+            block_hash(th, thb);
+            for(int b=0;b<32;b++) sprintf(hex+b*2, "%02x", th[31-b]);
+            fprintf(stderr,"[dl] new block: height=%d hash=%s (+%d)%s\n",
+                    now_tip, hex, now_tip-g_dl_last_seen_tip,
+                    now_tip < *(int*)(store_buf+24) ? " [connected; archive is ahead]" : "");
+        } else {
+            fprintf(stderr,"[dl] new block: height=%d (+%d)\n",
+                    now_tip, now_tip-g_dl_last_seen_tip);
+        }
+        /* announce the CONNECTED tip to every outbound leg (inv
+         * MSG_BLOCK; node_announce_tip reads the public tip itself).
+         * This replaces the per-leg announce that used to fire at
+         * store time in the leg sync. */
+        { int announced = 0, legs = 0;
+          for(int i2=0; i2<mux_n_out; i2++){
+              if(mux_out_fd[i2] < 0) continue;
+              legs++;
+              if(node_announce_tip(mux_out_fd[i2], store_buf, ht_idx, 0) == 1) announced++;
+          }
+          if(legs) fprintf(stderr,"[dl] announced tip height=%d to %d/%d legs\n", now_tip, announced, legs); }
+        /* ZMQ hashblock/rawblock + the txid-index tail, from this
+         * same choke point for the same reason the log line is: it
+         * fires no matter which path appended the block.
+         *
+         * EVERY new block is handled, not just the tip. A catch-up
+         * burst advances the tip by many blocks at once, and a
+         * subscriber that received only the last one would silently
+         * miss the rest -- Core notifies per connected block, so this
+         * must too. The loop is bounded by the burst size and reads
+         * each block ONCE from the archive it was just written to,
+         * feeding both consumers. */
+        if (zmqpub_active() || txit_active() || 1 /* bfi probes cheaply */){
+            static unsigned char zb[RPC_BLKSUBMIT_MAX];
+            for (int zh = g_dl_last_seen_tip + 1; zh <= now_tip; zh++){
+                long bl = store_read_at(store_buf, (unsigned long)zh, zb, (long)sizeof zb);
+                if (bl <= 0){
+                    fprintf(stderr,"[zmq] block %d unreadable; not published\n", zh);
+                    continue;
+                }
+                /* txindex tail: append this block's txid records so
+                 * getrawtransaction-by-txid keeps up with the tip
+                 * (idempotent by height -- a replayed height is a
+                 * no-op) */
+                txit_on_block(store_buf, zh, zb, bl);
+                tsp_on_block(store_buf, zh, zb, bl);
+                /* filter index tail: adopt/append (cheap probe when
+                 * the backfill has not closed in yet) */
+                if (g_cfg.blockfilterindex)
+                    bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
+                /* address index (extension): ADDs from the block,
+                 * DELs/TOUCHes from its undo records */
+                axt_on_block(store_buf, zh, zb, bl);
+                /* -blocknotify: after the indexes have taken the
+                 * block, so a hook that queries us sees it. */
+                if (g_cfg.blocknotify[0]){
+                    unsigned char bh[32]; char hx[65];
+                    block_hash(bh, zb);
+                    for (int _i = 0; _i < 32; _i++)
+                        snprintf(hx + _i*2, 3, "%02x", bh[31-_i]);  /* display order */
+                    notify_run(g_cfg.blocknotify, hx, "blocknotify");
+                }
+                /* -walletnotify: one run per transaction in this block
+                 * that spends or pays this wallet (Core fires it on
+                 * confirmation as well as on mempool arrival) */
+                if (g_cfg.walletnotify[0] && g_rpc_wallet.seed) walletnotify_block(zb, (long)bl);
+                /* mempool reconciliation (Core removeForBlock):
+                 * confirmed txs leave pool+policy graph, txs
+                 * CONFLICTING with this block's spends leave with
+                 * their descendants, and the rolling minfee floor
+                 * may decay again. Before this call nothing removed
+                 * mined txs at all -- they lingered until
+                 * -mempoolexpiry (LOG.md 2026-08-27 survey #1).
+                 * This SUBSUMES mining-polish's plain mined-tx
+                 * mpool_del callback (it also cleans the policy
+                 * graph and counts conflicts) -- that callback path
+                 * was removed at the 2026-08-27 policy-parity merge. */
+                { extern long tx_accept_block_connect_h(void*, const unsigned char*, unsigned long, long);
+                  extern void tx_accept_set_tip_time(long, long);
+                  extern void* mp_ext_area;
+                  /* fee estimation's "chainstate is current": this block's time */
+                  { unsigned int bt; memcpy(&bt, zb + 68, 4); tx_accept_set_tip_time((long)bt, -1); }
+                  if (txsub_worker_ready() && mp_ext_area){
+                      long mr = tx_accept_block_connect_h(mp_ext_area, zb, (unsigned long)bl, (long)zh);
+                      if (mr > 0)
+                          fprintf(stderr,"[mempool] block %d: removed %ld pool tx (confirmed/conflicted)\n", zh, mr);
+                  } }
+                if (!zmqpub_active()) continue;
+                /* The block HASH is sha256d over the 80-byte
+                 * header, REVERSED: Core's notifier flips the bytes
+                 * (data[31-i] = hash.begin()[i]) so the hashblock
+                 * topic carries the DISPLAY-order hash getblockhash
+                 * prints. Verified against real archived blocks by
+                 * tests/zmq_realblock_check. */
+                unsigned char bh[32], bhr[32];
+                sha256d(bh, zb, 80);
+                for (int zi = 0; zi < 32; zi++) bhr[zi] = bh[31 - zi];
+                zmqpub_notify("hashblock", bhr, 32);
+                zmqpub_notify("rawblock", zb, (unsigned long)bl);
+            }
+        }
+    }
+    /* keep mempool admission's maturity/flag anchor on the tip --
+     * unconditionally, not only when a publisher is active */
+    { extern void tx_accept_set_tip(long); tx_accept_set_tip(now_tip); }
+    mempool_refresh_seqlocks(store_buf, now_tip);   /* MEM-1 */
+    g_dl_last_seen_tip = now_tip;
+}
+
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
@@ -4667,6 +5255,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
       if (zmqpub_active()) zmqpub_start(); }
     fprintf(stderr,"[dl] worker: reloading chain archive...\n");
     phase_timer_t dl_load_pt; phase_start(&dl_load_pt);
+    { long ni = invset_load("invalid.dat"); if(ni) fprintf(stderr, "[chain] invalid.dat: %ld operator-invalidated block(s)\n", ni);   /* CC-10 */
+      reorg_set_invalid_fn(invset_has); g_txoq_store = store_buf; }
+    { extern void* g_cmpct_hook_type; extern void* g_cmpct_hook_cmpct; extern void* g_cmpct_hook_blocktxn;   /* CC-2: bitcoind.asm reaches the receive side through these */
+      g_cmpct_hook_type = (void*)cmpct_getdata_type; g_cmpct_hook_cmpct = (void*)cmpct_recv_cmpctblock; g_cmpct_hook_blocktxn = (void*)cmpct_recv_blocktxn; }
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
     fprintf(stderr,"[dl] worker: chain archive reloaded: tip=%d (%.2fs)\n",
             *(int*)(store_buf+24), phase_elapsed(&dl_load_pt));
@@ -4794,6 +5386,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     g_in_utxo_reload = 1;                       /* see handle_shutdown_signal */
     int utxo_live_ok = archive_ok ? utxo_live_init(dir) : 0;
     g_in_utxo_reload = 0;
+    g_utxo_live_on = utxo_live_ok;             /* 3.1: node_public_tip() switches on this */
+    dl_publish_connected_tip();
     /* Incident #48: mempool prevout resolution in THIS process must query
      * the live writer state, never a boot-latched snapshot of files the
      * writer keeps mutating (misses + garbage script lengths within
@@ -4864,20 +5458,28 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             extern void* utxo_live_lst(void);
             extern void* utxo_live_table(void);
             extern long utxo_live_applied_height(void);
+            extern int  utxo_live_bulk_mode(void);
+            extern void utxo_live_set_coinstats_caught_up(void (*)(void*, void*, long));
+            extern void csi_defer_to_caught_up(void);
+            extern void csi_on_caught_up(void*, void*, long);
             utxo_live_set_coinstats(csi_on_add, csi_on_remove, csi_invalidate, csi_commit);
             undo_set_coin_observer(csi_on_remove);
+            utxo_live_set_coinstats_caught_up(csi_on_caught_up);
             long ah = utxo_live_applied_height();
-            if (!csi_boot(ah)){
-                /* Defer the coinstats full-walk seed while in deferred-boot
-                 * mode: it re-walks the whole UTXO (a ~6h recount that also
-                 * defeats the recount-defer) and segfaults on this archive.
-                 * coinstatsindex only backs gettxoutsetinfo (display-only);
-                 * the catch-up's csi observers still build it incrementally
-                 * for newly-applied blocks, and nothing in download/serving
-                 * needs it. */
-                extern volatile unsigned char g_utxo_defer_recount;
-                if(!g_utxo_defer_recount)
+            /* Bulk catch-up (2026-09-06): far behind, the per-coin fold is
+             * the largest single cost on the connect thread (~3 h of a
+             * fresh sync). Skip it: the index stays invalid and seeds from
+             * ONE walk when utxo_live downshifts to steady state. */
+            if (utxo_live_bulk_mode())
+                csi_defer_to_caught_up();       /* csi_on_caught_up seeds AND starts the fold worker */
+            else {
+                extern int csi_worker_start(void);
+                if (!csi_boot(ah))
                     csi_seed_from_walk(utxo_live_lst(), utxo_live_table(), ah);
+                /* Steady state: fold OFF the connect thread (lever 2). The
+                 * worker inherits the adopted/seeded state; from here the
+                 * observers push records to the shared ring. */
+                csi_worker_start();
             }
         }
     }
@@ -4919,6 +5521,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         fprintf(stderr,"[dl] live UTXO tracking is off -- fork detection stays on but REORGS ARE DISABLED (no undo data)\n");
     }
     reorg_set_index_rebuild(rebuild_hash_index_after_reorg);
+    /* 3.3: a block that fails VALIDATION in catch-up is rejected through
+     * dl_reject_block, not left in the archive as a fatal retry loop */
+    { extern void utxo_live_set_reject_fn(long (*)(void*, long, const unsigned char[32], const char*));
+      utxo_live_set_reject_fn(dl_reject_block); }
     /* STO-7: hand reorg.c the SHARED mempool and the accept path's own policy
      * objects, so a completed reorg rebuilds the pool against the new branch
      * instead of leaving it holding transactions the new branch invalidated.
@@ -4990,6 +5596,17 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     } else {
         for(int i=0;i<npool && nsrc<64;i++) srcpool[nsrc++]=dle[i];
     }
+    /* CC-4: Core anchors.dat -- the block-relay-only peers of the last run are
+     * dialled first, as block-only again; the file is deleted on read. */
+    { char anc[MAX_BLOCK_RELAY_ONLY][128]; long na = anchors_read("anchors.dat", anc, MAX_BLOCK_RELAY_ONLY, g_chainp->magic);
+      if(na > 0){
+          for(long i = na - 1; i >= 0; i--){
+              if(nsrc >= 64) break;
+              for(int k = nsrc; k > 0; k--) srcpool[k] = srcpool[k-1];
+              bo_add(anc[i]); srcpool[0] = g_bo_hosts[g_bo_n - 1]; nsrc++;
+          }
+          fprintf(stderr, "[dial] anchors.dat: %ld block-relay-only peer(s) from the last run dialled first\n", na);
+      } else if(na < 0) fprintf(stderr, "[dial] anchors.dat: unreadable -- ignored and removed\n"); }
     if(nsrc==0){
         /* Discovery found nothing: DEGRADED fallback so the node still syncs.
          * Normally the seeds are bootstrap-only; this is only an emergency.
@@ -5128,7 +5745,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
             struct timeval t2; t2.tv_sec=3; t2.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
             strncpy(mux_out_host[mux_n_out], srcpool[i], 127);
-            mux_out_fd[mux_n_out]=cfd[i];
+            mux_out_fd[mux_n_out]=cfd[i]; mux_out_kind[mux_n_out] = host_is_block_only(srcpool[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
             mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
             mux_out_peer[mux_n_out]=i;
             anchor_locator(mux_out_loc[mux_n_out]);
@@ -5151,7 +5768,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     long long boot_ms = 0;
     { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); boot_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
     long long next_heartbeat_ms = boot_ms + DL_HEARTBEAT_MS;
-    int last_seen_tip = *(int*)(store_buf+24);   /* new-block announcement baseline (boot tip, so the catch-up burst is announced too) */
+    g_dl_last_seen_tip = (int)node_public_tip(store_buf);   /* new-block choke-point baseline: the CONNECTED tip at boot (3.1), so the catch-up burst is published too */
+    int last_seen_stored = *(int*)(store_buf+24);          /* archive high-water mark: keys the header mirror top-up only */
     /* STAGE B: next allowed fork probe (see the probe block in the rotation
      * below). Starts armed so a node booting onto a store that is already on
      * a losing branch notices on its first idle rotation rather than after a
@@ -5162,7 +5780,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     for(;;){
         /* publish outbound peer count + tip + peer table for the RPC thread */
         if(g_node_status){ int lp=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) lp++;
-            g_node_status->n_out = lp; g_node_status->tip_height = *(int*)(store_buf+24);
+            g_node_status->n_out = lp; g_node_status->tip_height = node_public_tip(store_buf);   /* 3.1: the CONNECTED tip */
+            dl_publish_connected_tip();
             long long nows = (long long)time(NULL);
             for(int i=0;i<RPC_MAX_PEERS;i++){
                 if(i >= MUX_MAX_OUT) continue;                      /* inbound children own 64..127 */
@@ -5719,6 +6338,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * daemon/utxo_live.c. */
             { extern void utxo_live_close(void) __attribute__((weak));
               if (utxo_live_close) utxo_live_close(); }
+            /* utxo_live_close's checkpoint pushed the last commit marker;
+             * now a STOP marker behind it and wait for the fold worker to
+             * persist coinstats.dat (bounded; a kill only costs a re-seed). */
+            { extern void csi_worker_stop(void) __attribute__((weak));
+              if (csi_worker_stop) csi_worker_stop(); }
             _exit(0);
         }
         long long now_ms = 0;
@@ -5771,7 +6395,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             apply_first_prev = apply_first;
         }
         for(int i=0;i<mux_n_out;i++){
-            if(g_shutdown_requested) break;   /* don't wait for a full rotation through every leg */
+            if(g_shutdown_requested){
+                /* CC-4: remember the live block-relay-only legs for the next start */
+                const char* bo[MAX_BLOCK_RELAY_ONLY]; int nb = 0;
+                for(int k = 0; k < mux_n_out && nb < MAX_BLOCK_RELAY_ONLY; k++) if(mux_out_fd[k] >= 0 && mux_out_kind[k] == LEG_BLOCK_ONLY) bo[nb++] = mux_out_host[k];
+                if(nb > 0){ long w = anchors_write("anchors.dat", bo, nb, g_chainp->magic, 0x409ULL, (unsigned)time(NULL)); fprintf(stderr, "[dial] anchors.dat: %ld block-relay-only peer(s) saved\n", w); }
+                break;   /* don't wait for a full rotation through every leg */
+            }
             if(mux_out_fd[i]<0){
                 /* dead slot: re-dial (rate-limited), same logic as serve_mux */
                 if(now_ms>=mux_out_nextretry[i]){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
@@ -5811,7 +6441,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * the inbound path uses, into the SHARED pool so the parent's
              * mempool RPCs see them. Cost when nothing is buffered: one
              * empty poll(2). */
-            if(mux_out_fd[i]>=0 && txsub_worker_ready()){
+            if(mux_out_fd[i]>=0 && mux_out_kind[i] != LEG_BLOCK_ONLY && txsub_worker_ready()){   /* CC-4: block-only legs neither relay nor take addr */
                 extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
                 long acc = txrelay_poll_leg(mux_out_fd[i], txsub_pool(), 250);
                 if(acc == -2){
@@ -5918,10 +6548,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                      * the pool never sees the connects that should evict the
                      * transactions the new branch just confirmed. */
                     { long fh = reorg_last_fork_height();
-                      if(fh >= 0 && fh < (long)last_seen_tip){
+                      if(fh >= 0 && fh < (long)g_dl_last_seen_tip){
                           fprintf(stderr,"[dl] reorg to fork height %ld: replaying the new-block choke point from %ld (was %d)\n",
-                                  fh, fh + 1, last_seen_tip);
-                          last_seen_tip = (int)fh;
+                                  fh, fh + 1, g_dl_last_seen_tip);
+                          g_dl_last_seen_tip = (int)fh;
                       } }
                 } else if(pr < 0){
                     fprintf(stderr,"[reorg] probe of %s rejected a candidate chain (no action taken)\n", mux_out_host[i]);
@@ -5936,7 +6566,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * from the pool */
         if(txsub_worker_ready()){
             extern long txrelay_announce(const int* fds, int nfds);
-            txrelay_announce(mux_out_fd, mux_n_out);
+            /* CC-1: transactions accepted by inbound serve children are on the
+             * shared ring; hand them to the outbound announcer so they reach
+             * the outbound legs too (the worker's own accepts are already
+             * queued by tx_relay.c and are skipped by the drain). */
+            { extern void txrelay_announce_own(const unsigned char txid[32]);
+              txann_worker_drain(txrelay_announce_own); }
+            { int rfds[MUX_MAX_OUT]; legs_relay_fds(mux_out_fd, mux_out_kind, mux_n_out, rfds);   /* CC-4 */
+              txrelay_announce(rfds, mux_n_out); }
         }
         { extern long addrself_maybe_announce_nets(const int*, const unsigned char*, const unsigned char*, int);
           for(int k=0;k<mux_n_out && k<MUX_MAX_OUT;k++){
@@ -6013,6 +6650,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(utxo_live_ok && now_ms >= utxo_retry_at_ms){
             phase_timer_t utxo_ct_pt; phase_start(&utxo_ct_pt);
             long ar = utxo_live_catchup(store_buf);
+            { extern long utxo_live_call_rejected_height(void);
+              long rj = utxo_live_call_rejected_height();
+              if(rj >= 0)
+                  fprintf(stderr,"[dl] block at height %ld REJECTED (%s) and invalidated -- archive at %d, connected %ld; the next rotation fetches the chain that avoids it\n",
+                          rj, utxo_live_last_reject(), *(int*)(store_buf+24), utxo_live_applied_height()); }
             if(ar < 0){
                 /* Incident 2026-09-01: recovery is no longer blind. Compaction
                  * runs ONLY when utxo_live says the failure is a store error
@@ -6027,7 +6669,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 if(utxo_live_halted()){
                     /* a spend found its coin absent right after verification resolved
                      * it: the store is lying and nothing downstream can be trusted */
-                    utxo_live_ok = 0;
+                    utxo_live_ok = 0; g_utxo_live_on = 0; dl_publish_connected_tip();
                     fprintf(stderr,"[dl] UTXO TRACKING HALTED at height %ld: store lookup inconsistency during apply (incident 2026-09-01 class). "
                                    "Blocks keep flowing without UTXO tracking; operator must drop and rebuild the UTXO state.\n",
                             utxo_live_applied_height());
@@ -6037,7 +6679,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                             utxo_live_applied_height(), count_before);
                     rounds = utxo_live_recover();
                     if(!utxo_live_verify_after_recovery(count_before)){
-                        utxo_live_ok = 0;
+                        utxo_live_ok = 0; g_utxo_live_on = 0; dl_publish_connected_tip();
                         fprintf(stderr,"[dl] UTXO TRACKING HALTED at height %ld: the set is inconsistent after recovery. "
                                        "Blocks keep flowing without UTXO tracking; operator must drop and rebuild the UTXO state.\n",
                                 utxo_live_applied_height());
@@ -6080,111 +6722,17 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * flight and a point query cannot race the writer. This is the only
          * place the worker answers gettxout. */
         txoq_service();
-        /* new-block announcement: one choke point watching the store's tip,
-         * so it fires no matter which path appended (mux keep-up leg,
-         * realtime getdata loop, catch-up). Hash read straight from the
-         * index record (store_get_tip_hash), printed big-endian like Core
-         * logs it, so a line here greps against a Core debug.log. */
+        /* The header mirror follows the ARCHIVE (it is derived from stored
+         * blocks and feeds the downloader's own header fetch), so it keeps
+         * its own watcher on the stored tip -- whichever path appended. */
         {
-            int now_tip = *(int*)(store_buf+24);
-            if(last_seen_tip >= 0 && now_tip > last_seen_tip){
-                unsigned char th[32]; char hex[65];
-                if(store_get_tip_hash(store_buf, th) == 1){
-                    for(int b=0;b<32;b++) sprintf(hex+b*2, "%02x", th[31-b]);
-                    fprintf(stderr,"[dl] new block: height=%d hash=%s (+%d)\n",
-                            now_tip, hex, now_tip-last_seen_tip);
-                } else {
-                    fprintf(stderr,"[dl] new block: height=%d (+%d)\n",
-                            now_tip, now_tip-last_seen_tip);
-                }
-                dl_header_mirror_topup(store_buf);   /* keep the derived header mirror at the archive tip, whichever path appended */
-                /* ZMQ hashblock/rawblock + the txid-index tail, from this
-                 * same choke point for the same reason the log line is: it
-                 * fires no matter which path appended the block.
-                 *
-                 * EVERY new block is handled, not just the tip. A catch-up
-                 * burst advances the tip by many blocks at once, and a
-                 * subscriber that received only the last one would silently
-                 * miss the rest -- Core notifies per connected block, so this
-                 * must too. The loop is bounded by the burst size and reads
-                 * each block ONCE from the archive it was just written to,
-                 * feeding both consumers. */
-                if (zmqpub_active() || txit_active() || 1 /* bfi probes cheaply */){
-                    static unsigned char zb[RPC_BLKSUBMIT_MAX];
-                    for (int zh = last_seen_tip + 1; zh <= now_tip; zh++){
-                        long bl = store_read_at(store_buf, (unsigned long)zh, zb, (long)sizeof zb);
-                        if (bl <= 0){
-                            fprintf(stderr,"[zmq] block %d unreadable; not published\n", zh);
-                            continue;
-                        }
-                        /* txindex tail: append this block's txid records so
-                         * getrawtransaction-by-txid keeps up with the tip
-                         * (idempotent by height -- a replayed height is a
-                         * no-op) */
-                        txit_on_block(store_buf, zh, zb, bl);
-                        tsp_on_block(store_buf, zh, zb, bl);
-                        /* filter index tail: adopt/append (cheap probe when
-                         * the backfill has not closed in yet) */
-                        if (g_cfg.blockfilterindex)
-                            bfi_on_block(store_buf, zh, zb, (unsigned long)bl);
-                        /* address index (extension): ADDs from the block,
-                         * DELs/TOUCHes from its undo records */
-                        axt_on_block(store_buf, zh, zb, bl);
-                        /* -blocknotify: after the indexes have taken the
-                         * block, so a hook that queries us sees it. */
-                        if (g_cfg.blocknotify[0]){
-                            unsigned char bh[32]; char hx[65];
-                            block_hash(bh, zb);
-                            for (int _i = 0; _i < 32; _i++)
-                                snprintf(hx + _i*2, 3, "%02x", bh[31-_i]);  /* display order */
-                            notify_run(g_cfg.blocknotify, hx, "blocknotify");
-                        }
-                        /* -walletnotify: one run per transaction in this block
-                         * that spends or pays this wallet (Core fires it on
-                         * confirmation as well as on mempool arrival) */
-                        if (g_cfg.walletnotify[0] && g_rpc_wallet.seed) walletnotify_block(zb, (long)bl);
-                        /* mempool reconciliation (Core removeForBlock):
-                         * confirmed txs leave pool+policy graph, txs
-                         * CONFLICTING with this block's spends leave with
-                         * their descendants, and the rolling minfee floor
-                         * may decay again. Before this call nothing removed
-                         * mined txs at all -- they lingered until
-                         * -mempoolexpiry (LOG.md 2026-08-27 survey #1).
-                         * This SUBSUMES mining-polish's plain mined-tx
-                         * mpool_del callback (it also cleans the policy
-                         * graph and counts conflicts) -- that callback path
-                         * was removed at the 2026-08-27 policy-parity merge. */
-                        { extern long tx_accept_block_connect_h(void*, const unsigned char*, unsigned long, long);
-                          extern void tx_accept_set_tip_time(long, long);
-                          extern void* mp_ext_area;
-                          /* fee estimation's "chainstate is current": this block's time */
-                          { unsigned int bt; memcpy(&bt, zb + 68, 4); tx_accept_set_tip_time((long)bt, -1); }
-                          if (txsub_worker_ready() && mp_ext_area){
-                              long mr = tx_accept_block_connect_h(mp_ext_area, zb, (unsigned long)bl, (long)zh);
-                              if (mr > 0)
-                                  fprintf(stderr,"[mempool] block %d: removed %ld pool tx (confirmed/conflicted)\n", zh, mr);
-                          } }
-                        if (!zmqpub_active()) continue;
-                        /* The block HASH is sha256d over the 80-byte
-                         * header, REVERSED: Core's notifier flips the bytes
-                         * (data[31-i] = hash.begin()[i]) so the hashblock
-                         * topic carries the DISPLAY-order hash getblockhash
-                         * prints. Verified against real archived blocks by
-                         * tests/zmq_realblock_check. */
-                        unsigned char bh[32], bhr[32];
-                        sha256d(bh, zb, 80);
-                        for (int zi = 0; zi < 32; zi++) bhr[zi] = bh[31 - zi];
-                        zmqpub_notify("hashblock", bhr, 32);
-                        zmqpub_notify("rawblock", zb, (unsigned long)bl);
-                    }
-                }
+            int now_stored = *(int*)(store_buf+24);
+            if(now_stored != last_seen_stored){
+                if(now_stored > last_seen_stored) dl_header_mirror_topup(store_buf);
+                last_seen_stored = now_stored;
             }
-            /* keep mempool admission's maturity/flag anchor on the tip --
-             * unconditionally, not only when a publisher is active */
-            { extern void tx_accept_set_tip(long); tx_accept_set_tip(now_tip); }
-            mempool_refresh_seqlocks(store_buf, now_tip);   /* MEM-1 */
-            last_seen_tip = now_tip;
         }
+        dl_new_block_choke();   /* the 3.1 choke point; shared with the parallel downloader (step 1) */
         /* Drain transactions staged by the serve children (and by this
          * worker's own sendrawtransaction path) and service subscriber
          * handshakes. Both are cheap no-ops when ZMQ is unconfigured. */
@@ -6201,8 +6749,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             int failing=0; for(int k=0;k<mux_n_out;k++) if(g_sync_fail_streak[k]) failing++;
             char failbuf[32]; failbuf[0]=0;
             if(failing) snprintf(failbuf, sizeof failbuf, " sync_failing=%d", failing);
-            fprintf(stderr,"[dl] heartbeat: tip=%d peers=%d/%d txouts=%ld uptime=%s%s%s\n",
-                    *(int*)(store_buf+24), live_peers, mux_n_out,
+            char storedbuf[40]; storedbuf[0]=0;
+            { long pt = node_public_tip(store_buf), stt = *(int*)(store_buf+24);
+              if(stt != pt) snprintf(storedbuf, sizeof storedbuf, " stored=%ld", stt); }
+            fprintf(stderr,"[dl] heartbeat: tip=%ld%s peers=%d/%d txouts=%ld uptime=%s%s%s\n",
+                    node_public_tip(store_buf), storedbuf, live_peers, mux_n_out,
                     utxo_live_ok?live_utxo_disp():-1L,
                     fmt_uptime(upbuf, (now_ms-boot_ms)/1000), failbuf,
                     utxo_live_halted() ? "  [UTXO HALTED -- inconsistent after recovery; drop and rebuild]"
@@ -6243,6 +6794,22 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         /* reserved slots: at least ONE leg per reachable anonymity network,
          * dialled in the background, on top of the clearnet legs (Core keeps
          * an extra network-specific outbound for the same reason) */
+        /* CC-4: keep bo_want() block-relay-only legs on clearnet, dialled in the
+         * background like the anonymity-network reserved legs below. The host is
+         * registered as block-only BEFORE the dial so the version carries fRelay=0. */
+        if((rot % 8)==0 && legs_block_only() < bo_want() && mux_n_out < MUX_MAX_OUT && dh_inflight_count() < DH_MAX){
+            for(int ci = 0; ci < nsrc; ci++){
+                int net = leg_net_of(srcpool[ci]);
+                if(net != BMC_NET_IPV4 && net != BMC_NET_IPV6) continue;
+                int already = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], srcpool[ci])){ already = 1; break; }
+                if(already || host_is_block_only(srcpool[ci])) continue;
+                { char ip[128]; ctl_ip_only(srcpool[ci], ip, sizeof ip); if(ctl_is_banned(ip)) continue; }
+                bo_add(srcpool[ci]);
+                fprintf(stderr, "[dial] %s: dialing as block-relay-only (%d of %d)\n", srcpool[ci], legs_block_only() + 1, bo_want());
+                dh_start(srcpool[ci], out_port);
+                break;
+            }
+        }
         if((rot % 8)==0 && g_node_status && g_node_status->net_active && mux_n_out < MUX_WANT_OUT() + 2 && mux_n_out < MUX_MAX_OUT){
             static const int anon_nets[2] = { BMC_NET_TORV3, BMC_NET_I2P };
             for(int an = 0; an < 2 && dh_inflight_count() < DH_MAX; an++){
@@ -6252,7 +6819,16 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 if(ci >= 0) dh_start(srcpool[ci], out_port);
             }
         }
-        if(mux_n_out - legs_anon() < MUX_WANT_OUT() && (rot % 8)==0){
+        /* CC-6: Core CheckForStaleTipAndEvictPeers -- when no block has arrived
+         * for 30 minutes and we are not catching up, want ONE extra full-relay
+         * leg so a partition is noticed (Core's m_try_another_outbound_peer).
+         * The extra leg is not torn down when the tip is fresh again: the
+         * want simply drops back and normal leg churn absorbs it. */
+        extern int tx_accept_stale_tip_extra(long now);
+        int stale_extra = tx_accept_stale_tip_extra((long)time(NULL));
+        { static int prev_stale = 0;
+          if(stale_extra != prev_stale){ fprintf(stderr, "[dial] tip %s: wanting %d outbound\n", stale_extra ? "stale for 30 min (no block seen)" : "fresh again", MUX_WANT_OUT() + stale_extra); prev_stale = stale_extra; } }
+        if(mux_n_out - legs_anon() - legs_block_only() < MUX_WANT_OUT() + stale_extra && (rot % 8)==0){
             /* ONE summary line per pass, not one per candidate: this loop walks
              * the whole live pool (up to nsrc) when nothing connects, so a
              * per-candidate log would flood exactly when the node is sickest. */
@@ -6264,7 +6840,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * (2026-09-01 01:34) and tripped the deploy guard; the next pass
              * (8 rotations later) fills the next slot. */
             int topup_filled = 0;
-            for(int ci=0; ci<nsrc && mux_n_out - legs_anon() < MUX_WANT_OUT() && mux_n_out<MUX_MAX_OUT; ci++){
+            for(int ci=0; ci<nsrc && mux_n_out - legs_anon() - legs_block_only() < MUX_WANT_OUT() + stale_extra && mux_n_out<MUX_MAX_OUT; ci++){
                 if(topup_filled >= 1 || topup_fail >= 4) break;
                 if(leg_is_anon_net(leg_net_of(srcpool[ci]))) continue;   /* the helper owns those */
                 int already=0;
@@ -6273,7 +6849,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 int nfd=outbound_connect(srcpool[ci], 300, out_port);
                 if(nfd>=0){
                     strncpy(mux_out_host[mux_n_out], srcpool[ci], 127);
-                    mux_out_fd[mux_n_out]=nfd; txrelay_leg_reset(nfd);
+                    mux_out_fd[mux_n_out]=nfd; txrelay_leg_reset(nfd); mux_out_kind[mux_n_out] = host_is_block_only(srcpool[ci]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
                     mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
                     mux_out_peer[mux_n_out]=ci;
                     anchor_locator(mux_out_loc[mux_n_out]);
@@ -6457,6 +7033,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     { extern long rpc_node_submit_proposal(const char*, char*, unsigned long);
       rpc_chain_set_proposal(rpc_node_submit_proposal); }
     rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
+    rpc_chain_set_public_tip_fn(rpc_public_tip);   /* 3.1: every chain RPC's tip is the CONNECTED tip */
     /* getnetworkinfo tells the truth about the transports: reachability from
      * the dialer, our i2p destination, and (once the tor listener is up,
      * below in tor_onion_listener) the onion hostname. */
@@ -6956,7 +7533,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         int fd=outbound_connect(peers[i], 300, out_port);
         if(fd<0){ fprintf(stderr,"[mux] outbound %s failed: %s\n", peers[i], dial_fail_reason()); continue; }
         strncpy(mux_out_host[mux_n_out], peers[i], 127);
-        mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd);
+        mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd); mux_out_kind[mux_n_out] = host_is_block_only(peers[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
         mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
         mux_out_peer[mux_n_out]=i;
         anchor_locator(mux_out_loc[mux_n_out]);
@@ -7128,7 +7705,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
              * no-op. Without this each child re-scans everything appended
              * since boot, and says so in the log once per connection. */
             if(c>=0) peer_sock_buffers(c);
-            if(c>=0) peer_inbound_deadline(c);        /* NET-3: idle peers cannot hold a slot forever */
+            if(c>=0) peer_handshake_deadline(c, g_cfg.peer_timeout_s);   /* CC-7: -peertimeout until verack; the NET-3 idle bound is armed after the handshake */
             if(c>=0 && g_shutdown_requested){
                 /* SC1 (2026-09-05, /mnt/2tbssd bmc-vs-Core benchmark): the
                  * stop sequence was observed forking a child into a parent
@@ -7247,7 +7824,30 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                       memcpy(g_cur_peer_ip, peerdesc, n); g_cur_peer_ip[n] = 0; }
                     g_serve_violation_hook = serve_violation_report;
                     int hok = node_accept_handshake(c);
+                    if(hok==1) peer_inbound_deadline(c);      /* NET-3: handshake done -> the 20-minute idle bound */
                     if(hok==1) g_inbound_slot = inbound_slot_claim(peerdesc);
+                    /* CC-1: this child's accepts are tagged with its slot (so it never
+                     * announces a tx back to the peer that sent it) and it starts
+                     * announcing to the peer if the peer negotiated relay. */
+                    /* CC-3 (Core AttemptToEvictConnection): every inbound slot is taken.
+                     * Before this, the child SERVED ANYWAY, unrecorded -- the node neither
+                     * evicted nor refused, and getpeerinfo under-reported. Now: pick a
+                     * victim by Core's protection rounds, ask it to leave (its txann_wait
+                     * sees the flag within a second and exits cleanly, freeing the slot),
+                     * claim the slot, and if every peer is protected, refuse as Core does. */
+                    if(hok==1 && g_inbound_slot < 0 && g_node_status){
+                        int v = inbound_select_victim(g_node_status, (long long)time(NULL), MUX_MAX_OUT, RPC_MAX_PEERS - 1);
+                        if(v >= 0){
+                            g_node_status->peers[v].evict_requested = 1;
+                            fprintf(stderr, "[serve] inbound slots full: evicting slot %d (%s) to admit %s\n", v, g_node_status->peers[v].addr, peerdesc);
+                            for(int w = 0; w < 25 && g_inbound_slot < 0; w++){ usleep(100000); g_inbound_slot = inbound_slot_claim(peerdesc); }
+                        }
+                        if(g_inbound_slot < 0){
+                            fprintf(stderr, "[serve] inbound slots full and every peer protected: refusing %s\n", peerdesc);
+                            close(c); _exit(0);
+                        }
+                    }
+                    if(hok==1){ txann_set_my_slot(g_inbound_slot); txann_child_init(g_inbound_slot, node_relay_flag && g_peer_relays_txs); }
                     char pv[256]; pv[0]=0; if(hok==1) format_peer_version_info(pv, sizeof pv);
                     close(l6 >= 0 ? l6 : l);
                     fprintf(stderr,"[serve] inbound %s %s [%s] (pid %d) %s\n", peerdesc,
@@ -7804,13 +8404,16 @@ int main(int argc, char** argv){
      * regtest dir is created empty every time, so the daemon must do it).
      * Everything downstream (locator build, catch-up, script-flag heights,
      * the UTXO walk's skip-genesis-coinbase rule) already assumes index ==
-     * height with genesis at 0. */
-    if(g_chainp->id != CHAIN_MAIN && *(int*)(store_buf+24) == -1){
-        unsigned char gh[32]; block_hash(gh, g_chainp->genesis);
-        if(store_append(store_buf, gh, g_chainp->genesis, (unsigned long)g_chainp->genesis_len) < 0){  /* returns new height (0) or -1 */
-            fprintf(stderr,"[boot] failed to seed the %s genesis block\n", g_chainp->name); return 1; }
-        fprintf(stderr,"[boot] %s genesis seeded at height 0\n", g_chainp->name);
-    }
+     * height with genesis at 0.
+     *
+     * 2026-09-06: this used to skip CHAIN_MAIN, because THIS box's mainnet
+     * archive had genesis from a one-time injection. Every OTHER fresh
+     * mainnet datadir then built an archive shifted by one -- the serial leg
+     * appends the first block a peer sends, and no peer relays genesis. See
+     * archive_seed.h. */
+    { int sd = archive_seed_genesis_if_empty(store_buf, g_chainp->genesis, (unsigned long)g_chainp->genesis_len);
+      if(sd < 0){ fprintf(stderr,"[boot] failed to seed the %s genesis block\n", g_chainp->name); return 1; }
+      if(sd == 1) fprintf(stderr,"[boot] %s genesis seeded at height 0 (empty archive)\n", g_chainp->name); }
 
     if(strcmp(mode,"sync")==0){
         /* Connect to a built-in loopback fake peer (forked in-process), exactly
@@ -8229,6 +8832,16 @@ int main(int argc, char** argv){
          * instantly (pure disk reads, no network) so it's safe to run on
          * every boot. */
         g_catchup_workers = catchup_workers;   /* the running worker re-uses it */
+        /* Step 1 of UTXO_INLINE_BUILD_PERF_SCOPE: dl_catchup connects the UTXO
+         * set while it downloads -- but only in the download WORKER, the one
+         * process that owns the set (utxo_live_init runs there, below). This
+         * boot-time call runs in the parent before that engine exists, so its
+         * blocks are connected afterwards, by the worker's drain. Say so: an
+         * operator who wants the interleaved path on a fresh node sets
+         * bmc.bootcatchup=0 and lets the worker's far-behind trigger run it. */
+        if(g_cfg.boot_catchup)
+            fprintf(stderr,"[boot] boot catch-up runs BEFORE the UTXO engine starts: its blocks are connected by the worker afterwards "
+                           "(bmc.bootcatchup=0 leaves the download to the worker, which connects while it downloads)\n");
         long caught = g_cfg.boot_catchup ? dl_catchup(dir, catchup_workers) : 0;
         if(!g_cfg.boot_catchup) fprintf(stderr,"[boot] bmc.bootcatchup=0 -- skipping the boot catch-up; the worker's far-behind trigger will run it if needed\n");
         fprintf(stderr,"[boot] catch-up check done: %ld block(s) written (%.2fs)\n",
@@ -8280,7 +8893,18 @@ int main(int argc, char** argv){
                              MAP_SHARED|MAP_ANONYMOUS, -1, 0);
         if (g_node_status == MAP_FAILED){ g_node_status = NULL; }
         else { g_node_status->n_out = 0; g_node_status->n_inbound = 0;
-               g_node_status->tip_height = *(int*)(store_buf+24);
+               /* 3.1: seed the connected tip from the persisted applied height
+                * so the RPCs and the serve children cap by it from the first
+                * request, before the worker has loaded the set and started
+                * publishing (utxo_applied_height.dat absent -> -1: nothing
+                * connected yet, which is the truth on a fresh datadir). The
+                * worker overwrites it with NODE_TIP_UNTRACKED if live
+                * tracking fails to come up. */
+               { long ph = utxo_live_persisted_height(), stt = *(int*)(store_buf+24);
+                 g_node_status->connected_tip = ph;
+                 g_node_status->tip_height = ph < stt ? ph : stt; }
+               { extern void serve_set_connected_tip_ptr(const volatile long long*);
+                 serve_set_connected_tip_ptr(&g_node_status->connected_tip); }
                g_node_status->start_time = (long long)time(NULL);
                /* MUST be set explicitly: the status block is zeroed shared
                 * memory, and net_active == 0 means "networking disabled" --
@@ -8298,6 +8922,13 @@ int main(int argc, char** argv){
          * pointer -- a child that staged into its own private copy would
          * publish nothing and report no error. */
         zmqn_set_status(g_node_status);
+        txann_set_status(g_node_status);          /* CC-1: the announce ring lives in the same block */
+        /* the coinstats fold ring + watermark (2026-09-06): the worker
+         * pushes, its forked fold worker drains, THIS parent's
+         * gettxoutsetinfo gates on the watermark. Weak: the dial/sync
+         * harnesses that link this file omit daemon/coinstats_index.c. */
+        { extern void csi_set_status(void*) __attribute__((weak));
+          if (csi_set_status) csi_set_status(g_node_status); }
 
         /* gettxout IPC channel, created BEFORE the fork so both sides inherit
          * it: the RPC in this parent asks the worker, which owns the live
@@ -8315,10 +8946,8 @@ int main(int argc, char** argv){
              * service hook before the worker's first utxo_live_catchup, so a
              * long catch-up pass answers gettxout queries at its block
              * boundaries instead of refusing them all until it returns. */
-            if(g_txoq_worker >= 0){
-                extern void utxo_live_set_apply_hook(void (*)(void));
-                utxo_live_set_apply_hook(txoq_service);
-            }
+            { extern void utxo_live_set_apply_hook(void (*)(void));
+              utxo_live_set_apply_hook(dl_apply_hook); }   /* 3.1: publishes the connected tip, then txoq_service */
             serve_download_worker(dir, (const char**)g_seed_hosts, g_n_seed_hosts, g_chainp->default_port);
             _exit(0);
         }
@@ -8333,6 +8962,7 @@ int main(int argc, char** argv){
                                                             unsigned long*, unsigned char*,
                                                             unsigned long, unsigned long*));
             rpc_commands_set_txo_query(txoq_query);
+            { extern void rpc_commands_set_block_mark(long (*)(const unsigned char[32], int, long*, char*, unsigned long)); rpc_commands_set_block_mark(txoq_block_mark); }   /* CC-10 */
             fprintf(stderr,"[rpc] gettxout answers via the download worker (IPC)\n");
         }
         { char rpccfg[512]; serve_start_rpc(dir, node_config_path(absp, rpccfg, sizeof rpccfg)); }

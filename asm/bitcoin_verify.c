@@ -242,18 +242,23 @@ static int der_valid(const unsigned char* sig, size_t n){
 }
 
 static int check_sig_encoding(const Ref* v, uint64_t flags, int* err){
-    if ((flags & (SCRIPT_VERIFY_DERSIG|SCRIPT_VERIFY_STRICTENC))==0) return 1;
+    /* IR-14 (INTERP_REVIEW_2026-09-05): Core's CheckSignatureEncoding.
+       IsValidSignatureEncoding is gated by DERSIG|LOW_S|STRICTENC and a
+       1-byte signature (hashtype only) fails it; IsDefinedHashtypeSignature is
+       gated by STRICTENC alone and requires (hashtype & ~ANYONECANPAY) in
+       ALL..SINGLE (1..3). The old rule tested the low five bits against
+       0x1c..0x1e, only when 0x80 was set, and under DERSIG too -- not Core's
+       rule in any reading. Never exercised, which is how it survived; an
+       oracle looser than the code it checks masks the code's own defects.
+       LOW_S itself is still not checked here (the oracle predates it). */
+    if ((flags & (SCRIPT_VERIFY_DERSIG|SCRIPT_VERIFY_LOW_S|SCRIPT_VERIFY_STRICTENC))==0) return 1;
     if (v->n==0) return 1;
     unsigned char hb = v->d[v->n-1];
     size_t siglen = v->n-1;
-    if ((flags & SCRIPT_VERIFY_DERSIG) && siglen>0)
-        if (!der_valid(v->d, siglen)){ *err=ERR_SIG_DER; return 0; }
-    if ((flags & SCRIPT_VERIFY_STRICTENC)){
-        if (siglen<8 || siglen>72){ *err=ERR_SIG_DER; return 0; }
-    }
-    if ((flags & (SCRIPT_VERIFY_DERSIG|SCRIPT_VERIFY_STRICTENC))){
-        if ((hb & 0x80) && (hb&0x1f)!=0x1c && (hb&0x1f)!=0x1d && (hb&0x1f)!=0x1e)
-            { *err=ERR_SIG_HASHTYPE; return 0; }
+    if (!der_valid(v->d, siglen)){ *err=ERR_SIG_DER; return 0; }
+    if (flags & SCRIPT_VERIFY_STRICTENC){
+        unsigned t = hb & 0x7f;
+        if (t < 1 || t > 3){ *err=ERR_SIG_HASHTYPE; return 0; }
     }
     return 1;
 }
@@ -277,10 +282,12 @@ static int check_sig(const Ref* sig, const Ref* pub,
     int ra = sighash_all(sighash, tx, txlen, nIn, sc, sc_len, work, workcap-64);
     if (!ra) return 0;
     uint64_t r[4], s[4]; uint32_t ht;
-    /* der_parse_sig expects the full DER+hashtype byte (sig->n), and returns the
-       trailing SIGHASH byte as ht. */
-    if (!der_parse_sig(sig->d, sig->n, r, s, &ht)) return 0;
-    if (ht!=1) return 0;
+    /* IR-2: the hashtype (hb, read above) is popped BEFORE the DER parse, as
+       Core does; the parser sees sig->n-1 bytes. Passing the full length let S
+       end on the hashtype byte, making this oracle one byte looser than the
+       code it exists to check. */
+    if (!der_parse_sig(sig->d, sig->n-1, r, s, &ht)) return 0;
+    (void)ht;
     uint64_t z[4];
     be_to_limbs(z, sighash, 32);
     uint64_t qx[4], qy[4];

@@ -1039,7 +1039,7 @@ Missing:
 
 Confirmed genuinely wired into the real serve loop (`bitcoin_serve.asm`),
 not just present as unused/tested-in-isolation code:
-- **BIP152 compact blocks — SERVE SIDE ONLY** (`cmpctblock_build`,
+- ~~**BIP152 compact blocks — SERVE SIDE ONLY**~~ **Receive side DONE 2026-09-06 (CC-2, `49c1c6f`): low-bandwidth mode — `sendcmpct` after verack on outbound legs, `MSG_CMPCT_BLOCK` requested, reconstruction from the mempool, `getblocktxn`/`blocktxn`, full-block fallback; high-bandwidth push is a follow-up.** Was: (`cmpctblock_build`,
   `p2p_blocktxn_build`). This node answers `MSG_CMPCT_BLOCK` getdata and
   `getblocktxn`, and negotiates `sendcmpct`. It does NOT receive compact
   blocks: `bitcoin_serve.asm` writes `cmpctblock` and `blocktxn` and has no
@@ -1118,11 +1118,10 @@ Confirmed absent:
   dials it, and Core reports the peer as `"network": "cjdns"` with a
   completed handshake; without `-cjdnsreachable` the peer is refused, as in
   Core. **All five BIP155 networks are now storable, relayable and
-  dialable.** Remaining, and stated: no inbound onion service of our own
-  (`-listenonion` parses but this node does not yet ADD_ONION for itself --
-  `daemon/torcontrol.c` exists and is tested, it is not yet called at boot),
-  and I2P inbound (`STREAM ACCEPT`) is implemented but not yet wired to the
-  serve loop.
+  dialable.** ~~Remaining, and stated: no inbound onion service of our own ... and I2P
+  inbound is implemented but not yet wired to the serve loop.~~ **Both wired
+  since: `tor_onion_listener(port)` and `i2p_inbound_start()` are passed to
+  `serve_mux` at boot (`main.c:8271`, `8296`). Verified 2026-09-06.**
 - ~~**ZMQ notification interface**~~ — **REAL since 2026-08-26**:
   `hashblock`/`hashtx`/`rawblock`/`rawtx` publish over a hand-written ZMTP
   3.1 PUB socket (`daemon/zmq_notify.c`, `daemon/zmq_pub.c`), with
@@ -1268,7 +1267,7 @@ that served BIP157 before this change must now set it explicitly.
 | `blockmaxweight` | Set maximum BIP141 block weight (default: 4000000) | implemented |
 | `blockmintxfee` | Set lowest fee rate (in BTC/kvB) for transactions to be included in block creation. (default: 0.00000001) | implemented |
 | `blocknotify` | Execute command when the best block changes (%s in cmd is replaced by block hash) | implemented |
-| `blockreconstructionextratxn` | Extra transactions to keep in memory for compact block reconstructions (default: 100) | accepted, no effect: compact-block reconstruction draws on the mempool only |
+| `blockreconstructionextratxn` | Extra transactions to keep in memory for compact block reconstructions (default: 100) | accepted, no effect: compact-block RECEIVE exists since 2026-09-06 (CC-2, low-bandwidth, `daemon/cmpct_recv.c`) but the extra-transaction pool this option sizes is not implemented; reconstruction draws on the mempool only |
 | `blockreservedweight` | Reserve space for the fixed-size block header plus the largest coinbase transaction the mining software may ad… | implemented |
 | `blocksdir` | Specify directory to hold blocks subdirectory for *.dat files (default: <datadir>) | accepted, no effect: the archive lives under <datadir>/<chain> and is not relocatable |
 | `blocksonly` | Whether to reject transactions from network peers. Disables automatic broadcast and rebroadcast of transaction… | implemented 2026-09-01: fRelay=0 in every version, tx/tx-inv from peers without `relay` is a violation (disconnect, no score), no feefilter, localrelay false, whitelistrelay->0 / maxmempool->5 interactions; RPC submissions still relay (Core). Wire-proven: validation/relay_policy_core_diff.sh |
@@ -1353,7 +1352,7 @@ that served BIP157 before this change must now set it explicitly.
 | `par` | Set the number of script verification threads (0 = auto, up to 15, <0 = leave that many cores free, default: 0… | implemented |
 | `peerblockfilters` | Serve compact block filters to peers per BIP 157 (default: 0) | implemented |
 | `peerbloomfilters` | Support filtering of blocks and transaction with bloom filters (default: 0) | accepted, no effect: BIP37 bloom filtering is not implemented; NODE_BLOOM is never advertised (Core's default is 0 too) |
-| `peertimeout` | Specify a p2p connection timeout delay in seconds. After connecting to a peer, wait this amount of time before… | **NOT implemented** (DMN-14, 2026-09-05: this said "implemented". `daemon/main.c:543` states plainly that the timeout it *does* have is NOT Core's `-peertimeout`, which is a CONNECT timeout; nothing reads the option. See DMN-3.) |
+| `peertimeout` | Specify a p2p connection timeout delay in seconds. After connecting to a peer, wait this amount of time before… | implemented 2026-09-06 (CC-7, `c6598b5`): bounds the version handshake from socket open to verack on both paths, clamped [1, 600]; the 20-minute idle bound (NET-3) takes over after. DMN-14 closed. |
 | `permitbaremultisig` | Relay transactions creating non-P2SH multisig outputs (default: 1) | implemented |
 | `persistmempool` | Whether to save the mempool on shutdown and load on restart (default: 1) | implemented |
 | `persistmempoolv1` | Whether a mempool.dat file created by -persistmempool or the savemempool RPC will be written in the legacy for… | accepted, no effect: mempool.dat is written in the current format only |
@@ -2250,6 +2249,15 @@ narrow the default from "loopback, both families" to "IPv4 loopback only" at
 exactly that moment. It is now annotated as inert at the line itself.
 
 ### Accepted risks, closed
+
+**08-29 #11 / 09-02 N5 — systemd unit not in version control.** The hardening
+itself is applied and verified on the host (`LimitCORE=0`, `NoNewPrivileges`,
+`ProtectSystem=full`, `ProtectHome=read-only`, `PrivateTmp`; `Max core file
+size 0` on the running process, 2026-09-05). The unit file stays a local
+deployment artifact by operator decision and is deliberately not vendored;
+`docs/OPERATIONS.md`'s reference unit carries the same block so a node built
+from the docs is hardened. Closed by decision, 2026-09-05 —
+`releases/2026-09-05-audits-closed.md`. Do not re-file.
 
 **CRY-8 — AES timing and the lazy S-box.** The inverse S-box is built lazily
 through an idempotent racy write (benign on x86: every writer stores the same

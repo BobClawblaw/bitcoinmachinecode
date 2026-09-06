@@ -925,3 +925,219 @@ Three rounds against console-log noise, each gated and deployed alone:
 Result: ~60 lines/min -> ~17 lines/min of real events (heartbeat, summaries,
 dial/leg churn, tor/i2p/cjdns state). The `size 2M` rotation now covers
 hours instead of minutes.
+
+## 2026-09-05 (evening): deploy a — the audit-closure build, and NET-10 migrating a live address book
+
+`bitcoind.deploy-20260905a`, main @ `9d9e93c`. The node had been running
+`deploy-20260904a` for 26 hours: a build that predated CSI-1 (it answered
+`gettxoutsetinfo muhash <height>` with the TIP set for a historical query) and
+every consensus fix of the 2026-09-05 interpreter review.
+
+What this build carries: IR-1 through IR-14 and IR-17 (two consensus
+false-accepts, three valid-block DoS shapes, two policy divergences, a latent
+memory-unsafety), IR-5's per-transaction sighash memo, IR-6's handle-based
+stack, CSI-1, SCR-9/SCR-10, and NET-10.
+
+**The rollout doubled as NET-10's first real migration.** `peers2.dat` was
+`BMCADBK2`, 46,079 records; the writer upgraded it in place on first open.
+Measured against a backup taken immediately before
+(`/storage/peers2.dat.pre-net10-20260905-2039`):
+
+| | |
+|---|---|
+| before | 2,211,808 bytes = 46,079 records at 48 B (v2) |
+| after | 2,582,064 bytes = 46,108 records at 56 B (v3) |
+| header count field | 46,108 — matches the file size exactly |
+| marked tried | **4,096** — exactly `AB2_V2_TRIED_HEAD`, the head the dialer already trusted |
+| carrying a source netgroup | 1 within the first minutes (gossip is rate-limited to 0.1 addr/s per leg) |
+
+The 29-record difference is gossip the old process accepted between the backup
+and the stop. Nothing was lost, and the head that `DL_POOL_V4_WINDOW` depends
+on is now protected by a flag rather than by insertion order.
+
+**Verified after restart:** clean stop ("Deactivated successfully", no
+timeout), height 965,665 — **the same block as the Core oracle** — with
+`headers == blocks` and `initialblockdownload false`; peers climbing from 0 to
+4 within a minute; zero FATAL/SEGV/HALTED lines; `NRestarts=0`.
+
+**~~Still true and not fixed here: the node has no inbound P2P listener.~~
+CORRECTED, same evening — the claim above was wrong.** The node *was*
+listening for inbound the whole time, on `0.0.0.0:8332`. There is no
+`data/bitcoin.conf`, but the repo-level fallback `config/bitcoin.conf` — which
+both the daemon and `bmc_cli` read — sets `port=8332` and `rpcport=8331`, and
+the daemon was using both. What I actually saw was `connections_in 0`, which
+means *nobody had dialled in*, not *nothing is listening*; and I read the
+`0.0.0.0:8332` line in `ss` as the RPC socket when it was the P2P one. Two
+different mistakes pointing the same wrong way. See the entry below.
+
+**Incidental audit resolution.** `docs/releases/2026-09-05-audits-closed.md`
+had, at that point, recorded `LimitCORE`/systemd hardening as an operator
+attestation not checkable from the tree, because no `.service` unit is in the
+repository.
+It can be checked from the *host*, and now has been: `systemctl show` reports
+`LimitCORE=0`, `NoNewPrivileges=yes`, `ProtectSystem=full`,
+`ProtectHome=read-only`, `PrivateTmp=yes` — the base unit's
+`LimitCORE=infinity` is overridden by the `50-hardening.conf` drop-in — and
+the running process shows `Max core file size 0` in `/proc/<pid>/limits`. The
+09-03 audit's closure was correct. The unit remaining outside version control
+was noted as the residual; later the same day the operator ruled it a local
+artifact, deliberately not vendored, and it is closed by that decision
+(`releases/2026-09-05-audits-closed.md`). `docs/OPERATIONS.md`'s reference
+unit now carries the hardening block so a node built from the docs gets it.
+
+
+## 2026-09-05 (later): P2P moved to 8433 — and a correction, plus a config-precedence defect
+
+**The correction first.** The deploy-a entry above said this node had no
+inbound P2P listener. That was wrong. `config/bitcoin.conf` (the repo-level
+fallback both the daemon and `bmc_cli` consult) sets `port=8332` and
+`rpcport=8331`; with no datadir config, the node used them. It had been
+listening on `0.0.0.0:8332` for its whole life. The evidence I misread was
+`connections_in 0` — which says nobody had dialled in, not that nothing was
+listening — and an `ss` line for `0.0.0.0:8332` that I took for the RPC socket
+when it was P2P. The same wrong claim went into
+`docs/reports/forum_reply_muhash_2026-09-05.bbcode` and is corrected there.
+
+**What was actually done.** `data/bitcoin.conf` now sets `port=8433`,
+`rpcport=8331`, `listen=1`. Moving P2P off 8332 is still worth doing — 8332 is
+Bitcoin Core's *RPC* port, and running our P2P listener there is confusing to
+anyone reading `ss` output, as this episode demonstrates.
+
+**A real defect this surfaced: the daemon and the CLI resolve config
+differently.** The first attempt set only `port=` and `listen=`. Then:
+
+* the **daemon**, having found a datadir config, took its own default for
+  `rpcport` (8332) rather than the fallback file's 8331;
+* the **CLI** (`cli_conf.c`'s `conf_lookup`) resolves *per key*: absent from
+  the datadir config, `rpcport` fell back to `config/bitcoin.conf` → 8331.
+
+So the daemon served RPC on 8332 while `bmc_cli` dialled 8331, and the CLI
+could not reach its own node without `-rpcport=`. Neither component is wrong
+on its own; they simply disagree about what a second config file means. The
+workaround is to state `rpcport` explicitly in the datadir config, which the
+committed file now does and says why. **The fix is a code change and is not
+made here:** the two must agree on precedence, and choosing which semantics
+wins (Core merges a single conf with defaults; this tree searches two files)
+needs its own change and its own test. Worth filing before someone else loses
+an hour to it.
+
+**Verified after the restart:** P2P listening on `0.0.0.0:8433` and
+`[::]:8433`; a raw stranger handshake on 8433 returns
+`version, wtxidrelay, sendaddrv2, verack`, so inbound genuinely works; RPC
+back on `127.0.0.1:8331` with `bmc_cli` needing no flags; height 965,669 —
+**the same block as the Core oracle** — `headers == blocks`, `ibd false`;
+`NRestarts=0`, no FAILURE/FATAL lines. The v3 address book carries 46,274
+records, 4,096 tried, and 154 with a source netgroup attributed since the
+upgrade — NET-10's attribution path working in production.
+
+
+## 2026-09-05 (night): rolled back to 8332, and the config-precedence defect fixed
+
+**Rolled back.** `data/bitcoin.conf` was deleted and the node restarted, so it
+is back on the repo-level `config/bitcoin.conf`: **P2P `0.0.0.0:8332` and
+`[::]:8332`, RPC `127.0.0.1:8331`** — the arrangement it had before this
+evening. Verified: a raw stranger handshake on 8332 returns
+`version, wtxidrelay, sendaddrv2, verack`; 8433 is closed; `bmc_cli` needs no
+flags; height 965,669 with `headers == blocks` and `ibd false`; `NRestarts=0`,
+no FAILURE lines. The 8433 config is kept at
+`/storage/bitcoin.conf.8433-rollback-20260905-2126` if it is ever wanted.
+
+**Why the rollback was right, and my 8433 change wrong-headed.** I moved the
+listener to avoid a clash with Core. There was no clash to avoid, and the
+existing arrangement was already designed around Core:
+
+| | Core (pid 106094) | BMC |
+|---|---|---|
+| P2P | 8333, bound to sixteen *specific* aliases `127.0.0.1`–`127.0.0.16` | 8332 on `0.0.0.0` + `[::]` |
+| RPC | 8335 (`rpcbind=127.0.0.1`) | 8331 |
+
+Core never binds `0.0.0.0`. That is precisely why BMC cannot take
+`0.0.0.0:8333` — a wildcard bind collides with any specific bind on the same
+port — and why the repo config puts BMC's P2P on 8332. The port sets are
+disjoint and always were.
+
+**The defect the episode surfaced is real and is now fixed** (`d0bc1c2`). The
+daemon reads exactly ONE config file — `$BITCOIN_CONF`, else
+`<datadir>/bitcoin.conf` when readable, else `<datadir>/../config/bitcoin.conf`
+— and never merges (`node_config.c`, `node_config_path`), which matches Core.
+`cli_conf.c`'s `conf_lookup` resolved *per key* across both, so a datadir
+config setting `port` but not `rpcport` left the daemon on its own default
+while the CLI still read the repo file's `rpcport`. The CLI now resolves the
+file once with the daemon's precedence, with a regression test watched to fail
+first.
+
+**What this cost, stated plainly:** three restarts of a production node and two
+published claims that were wrong (a listener that was never missing, and a
+clash that never existed). The node was never in danger — every restart was
+clean and it returned to the tip each time — but the diagnosis should have
+started with `ss -ltnp` read carefully and `config/bitcoin.conf` read at all,
+before anything was changed.
+
+## 2026-09-06: two things observed on the host while the replay ran
+
+Neither changed the live node. Both are recorded because the next person to
+see them should not have to rediscover them.
+
+- **The bench node (`/mnt/2tbssd/bmc-bench`) shut down cleanly at 01:50Z.**
+  Its cookie is gone and `mempool.dat` / `fee_estimates.dat` were written
+  that minute — the SIGTERM path, not a crash — and the kernel log has no
+  OOM or segfault. No console log survived (the harness redirects to a
+  `console.log` that is not there), so who sent the signal is unknown; every
+  kill this session issued was by the replay's exact process name or pid.
+- **The replay's leg to the live node blocked for ten minutes** in the boot
+  header fetch (40 silent reads at 15 s), while the live node answers a raw
+  `getheaders` probe with 253 headers instantly. Not reproduced. The replay
+  now syncs from the Core oracle. The ten-minute tolerance is filed against
+  the fetch, not the live node.
+
+## 2026-09-06 (early): the CC-8 replay restarted twice — the interleave, then a CC-5 regression
+
+Not the live node; `/storage/bmc-fullverify` (`assumevalid=0`, one loopback
+peer, the Core oracle). Recorded because the second restart found a defect
+that would have hit any fresh sync of the live build.
+
+- **04:55Z, restart on `305c1b4`** (the interleave, PR #27) from the
+  250,913-block archive, 2h50m into its first download. Clean stop: SIGTERM
+  to the parent, worker gone in 3 s, "catch-up done: 240320 new blocks
+  written (10172.69s)". Same command, same datadir, previous binary kept as
+  `bitcoind.replay.prev-77b6c1f`. The worker applied the 240k-block
+  backlog at ~20,000 blocks/s in the early chain, ~500 by height 200k.
+- **04:59:38Z, the parallel downloader gave up in 0.3 s.** CC-5's
+  four-page hold: "4 full pages and still below -minimumchainwork --
+  abandoning this chain", then "archive already complete through 250913",
+  "parallel downloader wrote 0 block(s)". The node fell back to its serial
+  leg (~110 blocks/s at height ~280k, 60 s re-dial cycles,
+  `sync_failing=1`). It kept running while the fix was built.
+- **Correction.** The first run's download was the parent's BOOT catch-up
+  (the shutdown line: "shutdown requested during the catch-up -- exiting
+  before the worker starts"), not the worker's far-behind run as stated
+  earlier that hour. The restart went straight to the worker.
+- **Restart on the fix** (`4c3e8fc`, hold bounded by memory): see the
+  entry that follows.
+
+## 2026-09-06 (05:25–05:33Z): the replay on the CC-5 fix, then `bmc.bootcatchup=0` — the interleave is live
+
+- **05:25Z, restart on `ab7087e`** (PR #28, the hold bounded by memory).
+  SIGTERM to the parent; it exited in 2 s but its download worker finished
+  its bounded step first and the binary was still busy, so the copy failed
+  and the relaunch ran the OLD file — which refused the datadir lock and
+  exited ("FATAL: cannot obtain a lock"). Nothing ran twice. The worker
+  stopped cleanly at 05:26:38 ("stopping catch-up cleanly after height
+  361806, checkpoint persisted"); the copy and launch were redone at
+  05:26:53. **Lesson:** wait for the WORKER, not the parent, before
+  swapping the binary.
+- **The fix, verified live at 05:27:10:** "chain from 127.0.0.1 crossed
+  -minimumchainwork -- storing 284 held page(s)" — 568,000 headers held in
+  the mapping and released in order; span [369648, 965598]; download at
+  8.9 MB/s on the one loopback worker.
+- **But "connect deferred (no UTXO engine in this process)":** with the
+  gap now visible at boot, the download ran in the parent's boot catch-up
+  again, the path that cannot interleave. Exactly the case
+  `UTXO_INLINE_BUILD_PERF_SCOPE.md` step 1 documents.
+- **05:28Z, restart with `bmc.bootcatchup=0`** in `data/bitcoin.conf`
+  (clean stop in 3 s: "shutdown requested during the catch-up -- exiting
+  before the worker starts"). Boot: "skipping the boot catch-up; the
+  worker's far-behind trigger will run". At 05:32:26 the worker ran the
+  parallel downloader from 371,511; its first progress line at 05:32:51:
+  `applied=371745 lag=1`. **The UTXO set is connecting one block behind
+  the download** — the first time this node has done what step 1 was for.

@@ -1,5 +1,26 @@
 # SECURITY AUDIT — /storage/bitcoinmachinecode
 
+
+> **Superseded, 2026-09-05.** Every finding in this document was re-verified by
+> `CODEBASE_AUDIT_2026-09-03.md` §3, which folded whatever was still open into
+> its own numbered findings — and all 182 of those are now closed, accepted or
+> deferred with reasons (`AUDIT_2026-09-03_REMEDIATION.md`, and
+> `NET-10_ADDRMAN_SCOPE.md` for the last MEDIUM). Where a line below still
+> reads "open" or "not started", check §3 of that audit before acting on it:
+> the item either has an ID there or was closed on the way. Two carry-overs
+> are worth naming explicitly:
+>
+> * the **test-wiring survey** (built-but-never-run targets, files with no
+>   Makefile rule, rules outside the gate) is now *enforced* rather than
+>   surveyed — `make runlist-check` requires every `test_*.c` to be in the gate
+>   or to carry a written reason for not being, and it is green;
+> * **`LimitCORE`/systemd hardening** is recorded closed by the 09-03 audit on
+>   the deployment host, and was **verified there on 2026-09-05**
+>   (`LimitCORE=0` effective, `Max core file size 0` on the running process).
+>   No `.service` unit is in this repository **by operator decision** — it is a
+>   local artifact — and `docs/OPERATIONS.md`'s reference unit carries the same
+>   hardening block. Closed; see `releases/2026-09-05-audits-closed.md`.
+
 **Audit date:** 2026-09-02 (UTC)
 **Auditor:** independent review (Hermes Agent)
 **Tree state:** `main` @ `d87adba` (clean working tree); live node = deploy `bitcoind.deploy-20260902ai` (from `ac64d46`), running as the unprivileged service account

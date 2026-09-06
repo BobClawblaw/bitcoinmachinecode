@@ -7,6 +7,94 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-09-06 -- the 3-hour gap to Core, decomposed and mostly removed
+
+Eight branches landed today against `audits/UTXO_INLINE_BUILD_PERF_SCOPE.md`
+(PRs #24-#26 and the interleave PR; tags `utxo-modules-2026-09-06`). What
+was found on the way, how, and what each cost, in the order found:
+
+- **The MuHash fold ran per coin on the bulk connect path.** Found by the
+  step-0 instrumentation (PR #24): ~1.66 us per element x ~6.4 billion coin
+  events over a sync is ~3 h, the single largest term in the gap and not
+  in the scope's first draft at all. Fix: bulk catch-up folds nothing, the
+  index seeds once from a walk at caught-up; steady state folds in a forked
+  worker fed by a shared ring, with `gettxoutsetinfo` gated on the worker's
+  watermark so a caller can never read a digest the fold has not reached.
+- **Every input was looked up twice** (verify, then apply). Same
+  instrumentation; recorded in the scope, not yet removed.
+- **`num3072_mul` was a plain mul/adc loop.** BMI2/ADX and AVX-512 IFMA
+  bodies now dispatch on CPUID leaf 7: multiply 944 -> 603 -> 301 ns, element
+  1640 -> 1005 ns. After that the SHA256 + six ChaCha20 blocks are the larger
+  half of an element, so the next lever there is the keystream, not the
+  multiply.
+- **The flush's descriptor sort was a merge sort at 135 ns/key**; a radix
+  sort does the same 4M keys in 91 ms instead of 541 ms, and a gated diff
+  proves the run it writes is byte-identical.
+- **`UTXO_CACHE_MODEL_SCOPE.md` section 4.2 was stale**: it asked for tiered
+  compaction that 79d4c9c had landed six days earlier. Caught by the agent
+  measuring before implementing; the doc now says so. Cost: one scoped item
+  that was never real.
+- **Compact-block reconstruction sha256d'd the whole mempool per block**,
+  then memset a 64 MiB short-id table per block (10 ms of a 9.9 ms
+  reconstruction once the hashing was gone). The slot carries the wtxid and
+  the table is generation-stamped: 10.03 -> 1.45 ms per block.
+- **The boot-time `dl_catchup` cannot interleave** with the UTXO connect: it
+  runs in the parent before the writer exists. Only the worker's far-behind
+  run does. A fresh-clone benchmark of the interleave needs
+  `bmc.bootcatchup=0`; the boot log says so. Moving boot catch-up into the
+  worker is the next change on that path.
+- **Outbound sockets lack `TCP_NODELAY` and `p2p_write` is two writes**: a
+  loopback getdata cost ~45 ms until the fixture set `TCP_QUICKACK`, then
+  ~5 ms. Found by the interleave fixture, not fixed.
+- **Landing hazard, caught by a word count**: keeping both sides of the
+  Makefile `test:` conflict across seven picks left eight copies of the rule.
+  make merges repeated rules' prerequisites, so it built and passed; only
+  the 8x token count showed it. Collapsed to one union line before the gate.
+- **A standing false positive in `gate-log-check`**: every gate log carries
+  one `Segmentation fault (core dumped)` from `test_rpc_signer`'s
+  deliberately wedged fake device, so the auditor reports 1 crash on every
+  green run. Not fixed today; a red check nobody reads is worse than none.
+
+- **CC-5's hold abandoned every honest header sync.** The four-page cap
+  from this morning abandons any chain still below `-minimumchainwork`
+  after 8,000 headers — a fresh mainnet node is below it for ~880,000. Not
+  visible to the gate (the test crossed the floor at header 5,000) nor to
+  the live node (at the tip). Found when the replay was restarted on the
+  first binary carrying the rule: header phase abandoned 0.3 s in, serial
+  leg fallback. Bounded by memory now (1,000 pages, 162 MB mapped per
+  fetch); the honest case is pinned by a test watched to fail first. Cost:
+  one replay restart; the scope's own Risks paragraph had described this
+  exact failure.
+- **Correction to a claim made earlier today:** the replay's first
+  download (02:05–04:55Z) was the parent's boot catch-up, not the worker's
+  far-behind run; its shutdown line says so. The restart went straight to
+  the worker.
+
+- **A fresh mainnet archive was shifted by one block, for life.** Slot 0
+  must hold genesis; boot seeded it on every chain except mainnet, because
+  THIS box's archive already had it. On any other fresh mainnet datadir the
+  serial leg's first append — block 1, since no peer relays genesis — took
+  slot 0, and every read of height h returned block h+1. Surfaced as a false
+  `bad-txns-BIP30` on a valid block four minutes into the first fresh-sync
+  benchmark, and the same day's reject-not-halt change persisted the failure
+  mark and killed the download. Fixed by keying the seed on an empty
+  archive. Cost: one abandoned benchmark attempt, one hour.
+  **Why no test caught it:** every sync test uses a fake peer on a non-
+  mainnet chain, which took the branch that worked. A defect in the
+  "except mainnet" arm of a condition is invisible to a suite that never
+  runs mainnet.
+- **The benchmark harness had drifted from the repo.** It built
+  `daemon/bitcoin_cli`, renamed 2026-09-05, so the install failed outright;
+  and it wrote no `bmc.bootcatchup=0`, so it would have measured the
+  pre-interleave shape and reported no improvement. Both fixed on the bench
+  SSD before the run. A harness that lives outside the repo rots against it.
+
+Process note: the branches were built by parallel agents in worktrees, each
+gated alone; the coordinator cherry-picked them onto one landing branch and
+ran ONE gate per merge. One agent's scratch files were overwritten by
+another's; nothing in the tree was touched, and scratch names are prefixed
+per agent since.
+
 ## 2026-08-29 -- a sample config, and what a proxy actually has to change
 
 config/bitcoin.sample.conf now lists EVERY key this node reads, commented

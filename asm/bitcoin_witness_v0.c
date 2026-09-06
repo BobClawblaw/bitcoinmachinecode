@@ -71,7 +71,11 @@ static uint64_t sv_checksig_witness_v0(void* cptr, const uint8_t* sig, size_t si
     if (!siglen) return 0;
     uint8_t ht = sig[siglen-1];
     uint64_t r[4], s[4]; uint32_t dht;
-    if (!der_parse_sig(sig, (unsigned long)siglen, r, s, &dht)) return 0;
+    /* IR-2: Core pops the hashtype byte BEFORE ecdsa_signature_parse_der_lax,
+       so the parser's bound is siglen-1. Passing the full length let S end ON
+       the hashtype byte -- one byte looser than Core (consensus false accept,
+       pre-BIP66 reach). The hashtype is read above, exactly as Core does. */
+    if (!der_parse_sig(sig, (unsigned long)siglen - 1, r, s, &dht)) return 0;
     static __thread uint8_t* pre; BMC_TLS_BUF(pre, 1<<16);
     uint8_t z[32];
     if (segwit_v0_sighash(z, c->tx, (int64_t)c->txlen, (int64_t)c->nIn, (uint32_t)ht,

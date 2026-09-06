@@ -93,7 +93,7 @@ struct lsm_state {
 #define BLOOM_MAX_BYTES  (4*1024*1024)
 #define SCRIPT_MAX_BYTES 65536
 
-static u8 mp_area[40 + 1024*48 + 8];
+static u8 mp_area[40 + 1024*80 + 8];
 static u8 mp_blob[2<<20];
 static int g_fails = 0, g_checks = 0;
 static void ck(const char* name, int cond){

@@ -78,6 +78,8 @@ extern tap_txctx_export               ; C seam: version/locktime/sequence
 %define C_ANNEX     72
 %define C_ANNEXLEN  80
 %define C_WEIGHT    88
+%define C_HARDFAIL  96                  ; int  (IR-3)
+%define C_HARDERR   100                 ; int  (IR-3)
 
 %define S_MAIN      0
 %define S_MAINSP    8
@@ -119,6 +121,7 @@ e_stackbig: db "p2tr tapscript initial stack too large",0
 e_elembig:  db "p2tr tapscript witness item exceeds 520 bytes",0
 e_overflow: db "p2tr tapscript initial stack overflow",0
 e_exec:     db "p2tr tapscript execution failed",0
+e_csfail:   db "p2tr tapscript checksig invalid",0
 
 section .text
 
@@ -183,10 +186,12 @@ section .text
 ;   merkle_root[32]  -0xf0  .. -0xd0
 ;   computed_q[32]   -0x110 .. -0xf0
 ;   err (8)          -0x118 .. -0x110
-;   ctx (96)         -0x178 .. -0x118
+;   ctx (104)        -0x180 .. -0x118   (IR-3: was 96 at -0x178, so hard_fail
+;                                       at +96 aliased the err slot and was
+;                                       never read -- sizeof is 104)
 ;   st  (120)        -0x1f8 .. -0x180
 ; ----------------------------------------------------------------------------
-%define L_CTX   0x178
+%define L_CTX   0x180
 %define L_ST    0x1f8
 
 global taproot_verify_input_asm
@@ -418,6 +423,10 @@ taproot_verify_input_asm:
     mov  [rbp-L_CTX+C_ANNEXLEN], rax
     mov  rax, [rbp-0x98]
     mov  [rbp-L_CTX+C_WEIGHT], rax
+    ; IR-3: the C twin zero-initialises the whole ctx; these two are filled by
+    ; the callback and READ after script_eval, so they must start at 0
+    mov  dword [rbp-L_CTX+C_HARDFAIL], 0
+    mov  dword [rbp-L_CTX+C_HARDERR], 0
 
     ; ---- per-thread arenas, then push the initial stack ----
     TLS_LAZY r13, tv_main_e, (TS_MAX_STACK*TS_ELEM_SIZE)
@@ -485,6 +494,11 @@ taproot_verify_input_asm:
     call script_eval
     test eax, eax
     jz   .r_exec
+    ; IR-3: a checksig that set hard_fail invalidates the script even if the
+    ; stack ends truthy (Core's EvalChecksigTapscript set_error cases: invalid
+    ; non-empty sig, empty pubkey, weight budget). Mirrors the C twin exactly.
+    cmp  dword [rbp-L_CTX+C_HARDFAIL], 0
+    jne  .r_csfail
 .accept:
     mov  eax, 1
     jmp  .out
@@ -514,6 +528,8 @@ taproot_verify_input_asm:
 .r_elembig:   lea rsi, [e_elembig]
               jmp .reject
 .r_overflow:  lea rsi, [e_overflow]
+              jmp .reject
+.r_csfail:    lea rsi, [e_csfail]
               jmp .reject
 .r_exec:      lea rsi, [e_exec]
 .reject:

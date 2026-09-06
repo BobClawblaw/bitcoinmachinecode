@@ -46,6 +46,15 @@ typedef struct {
      * next_nodeid at slot claim by both the worker (outbound) and each
      * inbound child. */
     volatile long long        nodeid;
+    /* CC-3 (2026-09-06): what Core's AttemptToEvictConnection protects by.
+     * Appended so every existing offset is unchanged; nothing in asm indexes
+     * this table. min_ping_us stays 0 (unmeasured: this node does not ping
+     * inbound peers), so the lowest-ping round protects nobody until it is. */
+    volatile unsigned         net_group;      /* Core /16 grouping, 0 = unknown */
+    volatile long long        last_tx_time;   /* unix secs: last tx WE ACCEPTED from this peer */
+    volatile long long        last_block_time;/* unix secs: last novel block from this peer */
+    volatile long long        min_ping_us;    /* 0 = unmeasured */
+    volatile int              evict_requested;/* set by the accept path; the child exits on its next tick */
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
@@ -98,12 +107,22 @@ typedef struct {
  * (404KB payload each) and rides out the bursts; overrun past that is
  * counted and reported, which is all a lossy PUB feed owes anyone. */
 #define RPC_ZMQ_RING           64
+#define RPC_ANN_RING           1024   /* CC-1 announce ring (see ann_ring) */
+/* Coinstats fold ring (see csi_ring): a few blocks' worth of coin records --
+ * a heavy block creates/spends ~10k coins, so 64k entries is 5-6 blocks of
+ * headroom before the connect thread has to wait for the worker. Entries
+ * are 192 bytes (12 MB shared); scripts longer than the inline part spill
+ * into continuation entries claimed with the same atomic increment. */
+#define RPC_CSI_RING           65536
+#define RPC_CSI_BODY           176
+#define RPC_CSI_HDR            52     /* key36 | value u64 | code u64 */
+#define RPC_CSI_INLINE         (RPC_CSI_BODY - RPC_CSI_HDR)   /* 124 script bytes inline */
 #define RPC_ZMQ_TXMAX          RPC_TXSUBMIT_MAX
 
 typedef struct {
     volatile int       n_out;        /* live outbound peers  (download worker) */
     volatile int       n_inbound;    /* live inbound peers   (serve parent)    */
-    volatile long long tip_height;   /* current chain tip    (download worker) */
+    volatile long long tip_height;   /* current PUBLIC tip = the connected tip (download worker; 3.1) */
     volatile long long start_time;   /* node start, unix secs (parent, once)   */
     rpc_peer_t         peers[RPC_MAX_PEERS];  /* outbound peer table (worker)   */
     /* RPC-3: monotonic source for rpc_peer_t.nodeid. Bumped with an atomic
@@ -286,7 +305,73 @@ typedef struct {
         volatile int          score;
         char                  ip[64];
     } misbehavior[RPC_MISBEHAVIOR_SLOTS];
+    /* CC-1 (2026-09-06): the transaction ANNOUNCE ring. Every accept path
+     * (tx_accept.c, in whichever process accepted -- the worker for
+     * outbound/RPC, a forked serve child for inbound) claims a slot with an
+     * atomic increment on ann_seq and fills it; every inbound serve child
+     * drains it on its own cursor and announces what it has not seen to its
+     * peer, and the worker drains it to feed inbound-origin transactions to
+     * the outbound legs. Same producer/consumer shape as zmq_ring above; the
+     * entries are 64 bytes, so a lapped consumer resyncs cheaply. */
+    volatile unsigned long long ann_seq;
+    struct {
+        volatile unsigned long long ready;     /* seq+1 once filled; 0 = empty */
+        unsigned char               txid[32];
+        volatile unsigned long long fee;       /* satoshis; 0 = unknown */
+        volatile unsigned long      vsize;     /* vbytes;   0 = unknown */
+        volatile int                src_slot;  /* peer-table slot that delivered it; -1 = worker/RPC */
+    } ann_ring[RPC_ANN_RING];
+    /* 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the CONNECTED tip, the
+     * cap every outward-facing site applies to the stored tip -- the parent's
+     * chain RPCs (rpc_chain refresh) and the inbound serve children's
+     * getheaders / getblocks / tip-watch announce (serve_public_tip). Seeded
+     * by the parent from utxo_applied_height.dat before the fork, then
+     * published by the worker on every rotation AND at every block boundary
+     * of a catch-up call (the apply hook), so it never lags the truth by more
+     * than the block being connected. NODE_TIP_UNTRACKED = live UTXO tracking
+     * is off (or the worker has not reported yet): readers use the stored
+     * tip, the pre-3.1 behaviour. -1 = tracking on, nothing connected yet. */
+    volatile long long connected_tip;
+    /* ---- coinstats FOLD ring (2026-09-06, UTXO_INLINE_BUILD_PERF_SCOPE.md:
+     * "the MuHash fold is on the bulk connect path", lever 2) -------------
+     * Steady state used to fold every created output and spent input into
+     * the MuHash accumulators ON the connect thread (~17 ms per heavy block).
+     * Now the connect thread pushes a compact coin record here and a forked
+     * fold worker (daemon/coinstats_index.c csi_worker_start) drains it into
+     * the accumulators, which it alone owns from then on. MuHash is
+     * commutative, so order within a block is irrelevant; reorg removals go
+     * through the same ring in the same sequence, so they cancel exactly.
+     *
+     * Same claim/fill/ready discipline as ann_ring above. What differs is
+     * that a lost record here is a WRONG DIGEST, not a missed announcement:
+     * the producer therefore waits for room (csi_folded_seq is the worker's
+     * consumption cursor) up to a bound, and a lap the worker detects on its
+     * side is counted AND invalidates the index (re-seeded at the next boot).
+     *
+     * csi_pushed_height / csi_folded_height: the connect thread's commit
+     * marker for the applied height goes through the ring too, and the
+     * worker publishes coinstats.dat and then csi_folded_height only after
+     * it has folded everything before that marker -- the WATERMARK the
+     * parent's gettxoutsetinfo gates on (folded < pushed: wait, then
+     * refuse). csi_deferred: bulk catch-up, no index to serve at all. */
+    volatile unsigned long long csi_seq;            /* slots claimed (connect thread) */
+    volatile unsigned long long csi_folded_seq;     /* slots consumed (fold worker)   */
+    volatile long long          csi_pushed_height;  /* last commit marker pushed      */
+    volatile long long          csi_folded_height;  /* watermark: file written through here */
+    volatile unsigned long long csi_lapped;         /* records lost to overrun (worker side)  */
+    volatile unsigned long long csi_overrun;        /* pushes that gave up waiting (producer) */
+    volatile unsigned long long csi_folds;          /* elements the worker has folded */
+    volatile int                csi_deferred;       /* bulk catch-up: index seeds at caught-up */
+    volatile int                csi_pause;          /* test seam: the worker holds its cursor */
+    volatile int                csi_worker_pid;     /* 0 = no worker (inline folding) */
+    struct {
+        volatile unsigned long long ready;          /* seq+1 once filled; 0 = empty */
+        volatile unsigned int       kind;           /* CSI_K_* (coinstats_index.c) */
+        volatile unsigned int       slen;           /* full script length (head) / chunk length (cont) */
+        unsigned char               body[RPC_CSI_BODY];
+    } csi_ring[RPC_CSI_RING];
 } node_status_t;
+#define NODE_TIP_UNTRACKED (-2LL)
 
 /* Hand the RPC layer the shared status region (call before rpc_server_start).
  * NULL is valid -- methods that need it then report an empty/loading node.

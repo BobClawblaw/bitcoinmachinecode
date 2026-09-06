@@ -23,6 +23,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/wait.h>
 #define ELEM_SIZE 528
 #define MAX_STACK 1000
 #define SCRIPT_ERR_STACK_SIZE 8
@@ -246,6 +249,225 @@ int main(void){
         if (g_probe.calls==0 && r==1)
             printf("ok: SCR-3 control: BASE sigversion keeps the empty-sig shortcut (no call)\n");
         else { printf("FAIL: SCR-3 BASE control: calls=%d r=%d (want 0/1)\n", g_probe.calls,r); fails++; }
+    }
+    /* --- IR-1 (INTERP_REVIEW_2026-09-05): every net-growing stack op
+     * discarded the 0 "stack full" return of stack_dup_index/stack_push.
+     * At exactly 1000 elements the op silently became a no-op, the post-op
+     * combined check saw 1000 (not > 1000) and PASSED, where Core pushes to
+     * 1001 and fails with SCRIPT_ERR_STACK_SIZE. A script Core rejects was
+     * ACCEPTED -- consensus false accept, any sigversion.
+     *
+     * Each vector fills the stack with OP_1s to (1000 - growth + 1) so the
+     * op is the one that would cross 1000, then runs the op. Both BASE (OP_1
+     * is not counted toward the 201-op limit; 1001 bytes < 10000) and
+     * TAPSCRIPT. Controls: the same op one element short MUST pass, and the
+     * net-zero ops at exactly 1000 MUST pass. */
+    for (int sigv = 0; sigv <= SIGV_TAPSCRIPT; sigv += SIGV_TAPSCRIPT) {
+        struct { const char* name; int fill; uint8_t op; int want_reject; } v[] = {
+            { "OP_DUP  @1000", 1000, 0x76, 1 },
+            { "OP_OVER @1000", 1000, 0x78, 1 },
+            { "OP_IFDUP@1000", 1000, 0x73, 1 },
+            { "OP_TUCK @1000", 1000, 0x7d, 1 },
+            { "OP_2DUP @999",   999, 0x6e, 1 },
+            { "OP_2OVER@999",   999, 0x70, 1 },
+            { "OP_3DUP @998",   998, 0x6f, 1 },
+            { "OP_SIZE @1000", 1000, 0x82, 1 },
+            { "OP_DEPTH@1000", 1000, 0x74, 1 },
+            /* controls: one short of the cap, must pass */
+            { "OP_DUP  @999",   999, 0x76, 0 },
+            { "OP_2DUP @998",   998, 0x6e, 0 },
+            { "OP_3DUP @997",   997, 0x6f, 0 },
+            /* controls: net-zero ops AT the cap, must pass */
+            { "OP_SWAP @1000", 1000, 0x7c, 0 },
+            { "OP_2ROT @1000", 1000, 0x71, 0 },
+            { "OP_ROT  @1000", 1000, 0x7b, 0 },
+        };
+        for (size_t i = 0; i < sizeof v / sizeof v[0]; i++) {
+            static uint8_t scr[4096]; size_t n = 0;
+            for (int k = 0; k < v[i].fill; k++) scr[n++] = 0x51;
+            scr[n++] = v[i].op;
+            /* tapscript requires exactly one element at the end (CLEANSTACK is
+             * consensus there): drain to one. If the op silently no-ops, the
+             * drain runs and the script PASSES -- the same false accept BASE
+             * shows without the drain. */
+            if (sigv == SIGV_TAPSCRIPT) for (int k = 0; k < 999; k++) scr[n++] = 0x75;
+            g_err = 999;
+            int r = run(scr, n, sigv, 0, 1, 0, 0);
+            if (v[i].want_reject) {
+                if (r == 0 && g_err == SCRIPT_ERR_STACK_SIZE)
+                    printf("ok: IR-1 sigv%d %s rejected with STACK_SIZE\n", sigv, v[i].name);
+                else { printf("FAIL: IR-1 sigv%d %s got r=%d err=%llu (want r=0 err=8: Core pushes to 1001 and rejects)\n",
+                              sigv, v[i].name, r, (unsigned long long)g_err); fails++; }
+            } else {
+                if (r == 1)
+                    printf("ok: IR-1 control sigv%d %s passes\n", sigv, v[i].name);
+                else { printf("FAIL: IR-1 control sigv%d %s got r=%d err=%llu (want r=1)\n",
+                              sigv, v[i].name, r, (unsigned long long)g_err); fails++; }
+            }
+        }
+        /* OP_PICK with n=0 at 999+index: pops the index, pushes a copy ->
+         * exactly 1000, must pass (net zero). */
+        {
+            static uint8_t scr[4096]; size_t n = 0;
+            for (int k = 0; k < 999; k++) scr[n++] = 0x51;
+            scr[n++] = 0x00; scr[n++] = 0x79;
+            if (sigv == SIGV_TAPSCRIPT) for (int k = 0; k < 999; k++) scr[n++] = 0x75;
+            g_err = 999;
+            int r = run(scr, n, sigv, 0, 1, 0, 0);
+            if (r == 1) printf("ok: IR-1 control sigv%d <0> OP_PICK at 999 -> 1000 passes\n", sigv);
+            else { printf("FAIL: IR-1 control sigv%d OP_PICK got r=%d err=%llu (want r=1)\n", sigv, r, (unsigned long long)g_err); fails++; }
+        }
+    }
+    /* --- IR-4 (INTERP_REVIEW_2026-09-05): fExec was recomputed before every
+     * opcode by a byte-at-a-time scan of the whole condition stack. Tapscript
+     * has no opcode or script-size cap, so `OP_1 OP_IF` x N, `OP_ENDIF` x N,
+     * OP_1 -- a consensus-VALID leaf -- cost O(N^2): ~N^2 byte loads. At
+     * N=120,000 that is ~1.4e10 loads (10-20 s here; a ~4 MB leaf is
+     * 15-40 minutes) while Core's ConditionStack is O(1) per opcode. The
+     * vector must PASS (it is valid) and must do so in well under 3 s; it is
+     * run in a child under alarm() so a quadratic regression is a FAIL, not
+     * a hang. Watched against the unfixed object: ~12 s. */
+    {
+        enum { N = 250000 };
+        static uint8_t big[3*N + 1]; size_t n = 0;
+        for (int i = 0; i < N; i++){ big[n++] = 0x51; big[n++] = 0x63; }
+        for (int i = 0; i < N; i++)  big[n++] = 0x68;
+        big[n++] = 0x51;
+        fflush(stdout);   /* stdout is a pipe under the gate: flush BEFORE forking or
+                           * the parent's buffered lines are inherited and printed twice */
+        pid_t pid = fork();
+        if (pid == 0){
+            alarm(30);
+            struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+            int r = run(big, n, SIGV_TAPSCRIPT, 0, 1, 0, 0);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            double ms = (t1.tv_sec - t0.tv_sec)*1e3 + (t1.tv_nsec - t0.tv_nsec)/1e6;
+            /* stdout is a pipe under the gate: flush before _exit or the line is lost */
+            if (r != 1) { printf("FAIL: IR-4 valid %d-deep nested IF leaf rejected (r=%d err=%llu)\n", N, r, (unsigned long long)g_err); fflush(stdout); _exit(2); }
+            if (ms > 3000.0) { printf("FAIL: IR-4 %d-deep nested IF took %.0f ms (O(N^2) fExec scan; want O(1) per opcode)\n", N, ms); fflush(stdout); _exit(3); }
+            printf("ok: IR-4 %d-deep nested IF leaf accepted in %.1f ms\n", N, ms); fflush(stdout); _exit(0);
+        }
+        int st_ = 0; waitpid(pid, &st_, 0);
+        if (!(WIFEXITED(st_) && WEXITSTATUS(st_) == 0)){
+            if (WIFSIGNALED(st_)) printf("FAIL: IR-4 child killed by signal %d (alarm: quadratic scan)\n", WTERMSIG(st_));
+            else printf("FAIL: IR-4 child exit %d\n", WEXITSTATUS(st_));
+            fails++;
+        }
+    }
+    /* --- IR-8 sigversion gate: CONST_SCRIPTCODE rejects OP_CODESEPARATOR only
+     * for SIGVERSION_BASE. The same script under WITNESS_V0 (sigv 1) must
+     * still pass -- Core's check names the sigversion explicitly. */
+    {
+        static uint8_t scr0[5] = { 0x00, 0x63, 0xab, 0x68, 0x51 };   /* OP_0 OP_IF OP_CODESEPARATOR OP_ENDIF OP_1 */
+        g_err = 999; int rb = run(scr0, 5, 0, (1ULL<<16), 1, 0, 0);
+        if (rb == 0 && g_err == 53) printf("ok: IR-8 BASE + CONST_SCRIPTCODE: unexecuted OP_CODESEPARATOR -> SCRIPT_ERR_OP_CODESEPARATOR\n");
+        else { printf("FAIL: IR-8 BASE got r=%d err=%llu (want r=0 err=53)\n", rb, (unsigned long long)g_err); fails++; }
+        g_err = 999; int rw = run(scr0, 5, 1, (1ULL<<16), 1, 0, 0);
+        if (rw == 1) printf("ok: IR-8 WITNESS_V0 + CONST_SCRIPTCODE: same script accepted (sigversion gate)\n");
+        else { printf("FAIL: IR-8 WITNESS_V0 got r=%d err=%llu (want r=1)\n", rw, (unsigned long long)g_err); fails++; }
+        g_err = 999; int rn = run(scr0, 5, 0, 0, 1, 0, 0);
+        if (rn == 1) printf("ok: IR-8 BASE without the flag: accepted (consensus)\n");
+        else { printf("FAIL: IR-8 BASE no-flag got r=%d err=%llu (want r=1)\n", rn, (unsigned long long)g_err); fails++; }
+    }
+    /* --- IR-13 (INTERP_REVIEW_2026-09-05): the LOW_S arm reported SIG_HIGH_S
+     * for S >= N. Core's CheckLowS lax-parses the signature; an S >= N
+     * overflows to a ZERO signature, which is not high, so the check passes
+     * and the failure surfaces from verification as NULLFAIL (or false) --
+     * never HIGH_S. The verdict is the same (reject); the error code that
+     * reaches RPC differs. Probe checksig returns 0 so verification fails. */
+    {
+        static const uint8_t N_BE[32]  = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
+                                          0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41};
+        static const uint8_t HALF[32]  = {0x7F,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+                                          0x5D,0x57,0x6E,0x73,0x57,0xA4,0x50,0x1D,0xDF,0xE9,0x2F,0x46,0x68,0x1B,0x20,0xA0};
+        uint8_t half1[32]; memcpy(half1, HALF, 32); half1[31] = 0xA1;          /* N/2 + 1: high, below N */
+        struct { const char* nm; const uint8_t* s; int want_err; } v[] = {
+            { "S == N     -> NULLFAIL (Core: lax parse overflows to a zero sig)", N_BE, 32 },
+            { "S == N/2+1 -> HIGH_S  (control)",                                 half1, 27 },
+            { "S == N/2   -> low, verification fails -> NULLFAIL (control)",     HALF,  32 },
+        };
+        for (unsigned i = 0; i < 3; i++){
+            uint8_t sig[80]; size_t n = 0; int pad = (v[i].s[0] & 0x80) ? 1 : 0;
+            sig[n++] = 0x30; sig[n++] = (uint8_t)(4 + 32 + 32 + pad);
+            sig[n++] = 0x02; sig[n++] = 32; sig[n++] = 0x7f; for (int k = 1; k < 32; k++) sig[n++] = 0x11;   /* R */
+            sig[n++] = 0x02; sig[n++] = (uint8_t)(32 + pad); if (pad) sig[n++] = 0x00; memcpy(sig + n, v[i].s, 32); n += 32;
+            sig[n++] = 0x01;                                                                                     /* SIGHASH_ALL */
+            static uint8_t scr[160]; size_t m = 0;
+            scr[m++] = (uint8_t)n; memcpy(scr + m, sig, n); m += n;
+            scr[m++] = 33; scr[m++] = 0x02; for (int k = 0; k < 32; k++) scr[m++] = 0x22; scr[m++] = 0xac;   /* <pub> OP_CHECKSIG */
+            memset(main_elems,0,sizeof main_elems); memset(alt_elems,0,sizeof alt_elems);
+            struct script_state st; memset(&st,0,sizeof st);
+            st.main_elems=main_elems; st.alt_elems=alt_elems; st.script=scr; st.script_len=m;
+            st.sigversion=0; st.flags=(1ULL<<2)|(1ULL<<3)|(1ULL<<14);   /* DERSIG | LOW_S | NULLFAIL */
+            st.work=work; st.work_cap=sizeof work; st.error_out=&g_err;
+            g_probe=(probe_t){0,0,0,0}; st.checksig_ctx=&g_probe; st.checksig_fn=probe_fn;
+            g_err=999; int r = script_eval(&st);
+            if (r == 0 && (int)g_err == v[i].want_err) printf("ok: IR-13 %s\n", v[i].nm);
+            else { printf("FAIL: IR-13 %s: got r=%d err=%llu (want r=0 err=%d)\n", v[i].nm, r, (unsigned long long)g_err, v[i].want_err); fails++; }
+        }
+    }
+    /* --- IR-6 (INTERP_REVIEW_2026-09-05): OP_ROLL shifts whole 524-byte
+     * records where Core moves a 24-byte header, so a valid tapscript of
+     * `<998> OP_ROLL` repeated costs O(rolls x records) in bytes moved. These
+     * vectors assert BOTH halves of the fix: the final order is exactly what
+     * a rotate produces (whatever the internal storage), and the storm runs in
+     * O(1) record moves per roll rather than O(records). The handle layer
+     * (bitcoin_scriptcodec.asm) rotates 4-byte handles and puts the records
+     * back in position order once, at script_eval's exit, only if anything
+     * rolled -- so the ABI every external reader uses, element p at
+     * elems + p*ELEM_SIZE with data inline, is unchanged.
+     *
+     * OP_ROLL(n) lifts the element n deep to the top, so <998> OP_ROLL over
+     * 999 items rotates the whole stack by one: model[i] = (i + R) mod 999. */
+    {   /* (a) BASE, small: the FULL final order is checkable (no CLEANSTACK) */
+        enum { N = 10, RR = 25 };
+        static uint8_t scr[2*RR]; size_t n = 0;
+        for (int i = 0; i < RR; i++){ scr[n++] = 0x59; scr[n++] = 0x7a; }      /* OP_9 OP_ROLL */
+        memset(main_elems, 0, sizeof main_elems);
+        for (int i = 0; i < N; i++){ uint8_t* rec = main_elems + (size_t)i*ELEM_SIZE; *(uint32_t*)rec = 4; *(uint32_t*)(rec+4) = (uint32_t)(i+1); }
+        struct script_state st; memset(&st,0,sizeof st);
+        st.main_elems=main_elems; st.main_sp=N; st.alt_elems=alt_elems; st.alt_sp=0;
+        st.script=scr; st.script_len=n; st.sigversion=0; st.flags=0;
+        st.work=work; st.work_cap=sizeof work; st.error_out=&g_err;
+        g_err=999; int r = script_eval(&st);
+        int ok = (r==1) && (st.main_sp==(size_t)N); int bad=-1;
+        for (int i=0;i<N && ok;i++){ uint8_t* rec=main_elems+(size_t)i*ELEM_SIZE; if (*(uint32_t*)(rec+4) != (uint32_t)(((i+RR)%N)+1)){ ok=0; bad=i; } }
+        if (ok) printf("ok: IR-6 %d rolls over %d items: full final order exact\n", RR, N);
+        else { printf("FAIL: IR-6 BASE roll order wrong at pos %d (r=%d sp=%zu err=%llu)\n", bad, r, st.main_sp, (unsigned long long)g_err); fails++; }
+    }
+    {   /* (b) tapscript, large: the storm the finding is about. Drained to one
+         * element -- CLEANSTACK is consensus there -- and the survivor is the
+         * old bottom, model[0] = R mod 999, a precise check on the rotation. */
+        enum { R = 200000, ITEMS = 999, ILEN = 520 };
+        static uint8_t scr[4*R + ITEMS + 8]; size_t n = 0;
+        for (int i = 0; i < R; i++){ scr[n++]=0x02; scr[n++]=0xE6; scr[n++]=0x03; scr[n++]=0x7a; }   /* <998> OP_ROLL */
+        for (int i = 0; i < ITEMS-1; i++) scr[n++] = 0x75;                                          /* OP_DROP x 998 */
+        fflush(stdout);   /* see the IR-4 note: flush before fork, not just before _exit */
+        pid_t pid = fork();
+        if (pid == 0){
+            alarm(120);
+            memset(main_elems, 0, sizeof main_elems);
+            for (int i = 0; i < ITEMS; i++){ uint8_t* rec = main_elems + (size_t)i*ELEM_SIZE; *(uint32_t*)rec = ILEN; memset(rec+4,0x5a,ILEN); *(uint32_t*)(rec+4) = (uint32_t)i; }
+            struct script_state st; memset(&st,0,sizeof st);
+            st.main_elems=main_elems; st.main_sp=ITEMS; st.alt_elems=alt_elems; st.alt_sp=0;
+            st.script=scr; st.script_len=n; st.sigversion=SIGV_TAPSCRIPT; st.flags=0;
+            st.work=work; st.work_cap=sizeof work; st.error_out=&g_err;
+            struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+            g_err=999; int r = script_eval(&st);
+            clock_gettime(CLOCK_MONOTONIC,&t1);
+            double ms=(t1.tv_sec-t0.tv_sec)*1e3+(t1.tv_nsec-t0.tv_nsec)/1e6;
+            if (r!=1){ printf("FAIL: IR-6 valid roll storm rejected (r=%d err=%llu)\n", r,(unsigned long long)g_err); fflush(stdout); _exit(2); }
+            uint32_t got = *(uint32_t*)(main_elems+4), want = (uint32_t)(R % ITEMS);
+            if (st.main_sp!=1 || got!=want){ printf("FAIL: IR-6 survivor is %u, want %u (sp=%zu)\n", got, want, st.main_sp); fflush(stdout); _exit(4); }
+            printf("ok: IR-6 %d rolls over %d x %d-byte items: survivor exact, %.0f ms\n", R, ITEMS, ILEN, ms);
+            fflush(stdout); _exit(ms > 400.0 ? 5 : 0);
+        }
+        int st_=0; waitpid(pid,&st_,0);
+        if (!(WIFEXITED(st_) && WEXITSTATUS(st_)==0)){
+            if (WIFSIGNALED(st_)) printf("FAIL: IR-6 child killed by signal %d\n", WTERMSIG(st_));
+            else if (WEXITSTATUS(st_)==5) printf("FAIL: IR-6 roll storm over 400 ms -- records are being shifted per roll again\n");
+            fails++;
+        }
     }
     printf(fails?"\nFAILURES %d\n":"\nALL TESTS PASSED (0 failures)\n",fails);
     return fails?1:0;

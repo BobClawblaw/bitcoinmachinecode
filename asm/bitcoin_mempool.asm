@@ -15,8 +15,19 @@
 ;   +16  qword blob   (base of tx-blob area)
 ;   +24  qword blob_cap
 ;   +32  qword fill   (high-water fill offset into blob)
-;   +40  ... slots, 48 bytes each: [+0 qword len][+8 txid[32]][+40 qword blob_off]
+;   +40  ... slots, 80 bytes each:
+;          [+0 qword len][+8 txid[32]][+40 qword blob_off][+48 wtxid[32]]
 ;   empty slot marker: len == 0xFFFFFFFFFFFFFFFF
+;
+; The wtxid (sha256d of the tx bytes exactly as stored -- the hash BIP152
+; short ids are computed over; equal to the txid for a non-witness tx) is
+; computed ONCE in mpool_put and cached in the slot. Before this the compact-
+; block reconstructor (daemon/cmpct_recv.c ht_build) recomputed sha256d over
+; EVERY pool entry for EVERY block it reconstructed. mpool_del's backward
+; shift moves the whole record, so the cache follows the entry. Nothing on
+; disk carries a slot: daemon/mempool_persist.c writes transactions (Core's
+; mempool.dat), and a reload re-enters them through mpool_put.
+; The C side reads the layout through mempool_slot.h; keep the two in step.
 ;
 ; Exports:
 ;   size_t mpool_struct_size(unsigned long slots)
@@ -30,14 +41,16 @@
 
 default rel
 
+extern sha256d               ; bitcoin_hash.asm -- fills the per-slot wtxid cache
+
 section .text
 
 ; ---------------------------------------------------------------- 
-; mpool_struct_size(slots) -> 40 + slots*48 + 8
+; mpool_struct_size(slots) -> 40 + slots*80 + 8
 global mpool_struct_size
 mpool_struct_size:
     mov  rax, rdi
-    imul rax, 48
+    imul rax, 80
     add  rax, 40 + 8
     ret
 
@@ -69,7 +82,7 @@ mpool_init:
     test rcx, rcx
     jz   .done
     mov  [rdi], rax
-    add  rdi, 48
+    add  rdi, 80
     dec  rcx
     jmp  .empty_loop
 .done:
@@ -100,7 +113,7 @@ mpool_hash:
     jmp  .hl
 .hd:
     and  eax, esi            ; slot index
-    imul rax, 48
+    imul rax, 80
     add  rax, 40             ; + slots region -> offset
     pop  rbp
     ret
@@ -197,11 +210,11 @@ mpool_put:
     test rax, rax
     jz   .dup
     ; advance probe with wrap-around (open addressing must wrap to slot 0)
-    add  r15, 48
+    add  r15, 80
     mov  rax, [r12+8]
     inc  rax                ; slot_count
-    imul rax, 48
-    add  rax, 40            ; end = 40 + slot_count*48
+    imul rax, 80
+    add  rax, 40            ; end = 40 + slot_count*80
     cmp  r15, rax
     jb   .nowrap1
     mov  r15, 40
@@ -229,7 +242,16 @@ mpool_put:
     ; slot.blob_off = fill
     mov  rax, [rbp-8]
     mov  [r8+40], rax
-    ; slot.txid = r13   (mcopy length arg is RDX)
+    ; slot.wtxid = sha256d(tx bytes as stored): computed once here, read by
+    ; mpool_wtxid_at_slot. Written BEFORE the txid so that, as for len and
+    ; blob_off (MEM-21 below), a txid match under x86 TSO implies the cached
+    ; wtxid is published too. sha256d clobbers r8: re-derive the slot pointer.
+    lea  rdi, [r8+48]
+    mov  rsi, r14
+    mov  rdx, rbx
+    call sha256d
+    lea  r8, [r12+r15]
+    ; slot.txid = r13   (mcopy length arg is RDX) -- LAST, see MEM-21
     lea  rdi, [r8+8]
     mov  rsi, r13
     mov  rdx, 32
@@ -297,10 +319,10 @@ mpool_get:
     test rax, rax
     jz   .hit
     ; advance probe with wrap-around
-    add  r15, 48
+    add  r15, 80
     mov  rax, [r12+8]
     inc  rax
-    imul rax, 48
+    imul rax, 80
     add  rax, 40
     cmp  r15, rax
     jb   .nowrap2
@@ -316,7 +338,7 @@ mpool_get:
     ; so a concurrent mpool_del or mpool_compact in another process can be
     ; mid-move when this reader matches.
     ;
-    ; mpool_del's backward shift copies a whole 48-byte record with one mcopy,
+    ; mpool_del's backward shift copies a whole 80-byte record with one mcopy,
     ; and the txid sits at +8..39 while blob_off sits at +40 -- so there is a
     ; window where the txid bytes of the NEW occupant have landed but its
     ; blob_off has not. The reader then pairs the new `len` with the STALE
@@ -398,10 +420,10 @@ mpool_del:
     test rax, rax
     jz   .dhit
     ; advance probe with wrap-around
-    add  r15, 48
+    add  r15, 80
     mov  rax, [r12+8]
     inc  rax
-    imul rax, 48
+    imul rax, 80
     add  rax, 40
     cmp  r15, rax
     jb   .dnowrap
@@ -425,12 +447,12 @@ mpool_del:
     ;
     ; r15 currently holds the found slot's BYTE offset; convert to a
     ; 0-based slot index (r13) for the modular distance comparison below
-    ; (slot count is a power of two; the 48-byte stride is not, so we
+    ; (slot count is a power of two; the 80-byte stride is not, so we
     ; convert once here rather than mask byte offsets directly).
     mov  rax, r15
     sub  rax, 40
     xor  edx, edx
-    mov  ecx, 48
+    mov  ecx, 80
     div  ecx
     mov  r13, rax              ; r13 = i (0-based gap index)
 
@@ -443,7 +465,7 @@ mpool_del:
     mov  r10, [r12+8]              ; mask
     and  r14, r10                   ; j = (j+1) & mask
     mov  rax, r14
-    imul rax, rax, 48
+    imul rax, rax, 80
     add  rax, 40
     add  rax, r12                    ; rax = &slot[j]
     mov  rcx, [rax]                   ; slot[j].len field
@@ -459,7 +481,7 @@ mpool_del:
     pop  r13
     sub  rax, 40
     xor  edx, edx
-    mov  ecx, 48
+    mov  ecx, 80
     div  ecx                                 ; rax = k (0-based home slot index)
     mov  r10, [r12+8]                         ; mask
     mov  r8, r13
@@ -472,12 +494,12 @@ mpool_del:
     jae  .mbs_loop                               ; not safe to move -- keep scanning
     ; safe: pull slot[j] back into the gap at i, then the gap moves to j.
     mov  rax, r13
-    imul rax, rax, 48
+    imul rax, rax, 80
     add  rax, 40
     add  rax, r12                                 ; rax = &slot[i]
     mov  rdi, rax
     mov  rsi, r15
-    mov  rdx, 48
+    mov  rdx, 80
     push r13
     push r14
     call mcopy                                      ; mcopy(dst=rdi,src=rsi,n=rdx)
@@ -504,6 +526,31 @@ mpool_del:
 global mpool_count
 mpool_count:
     mov  rax, [rdi]
+    ret
+
+; ----------------------------------------------------------------
+; mpool_wtxid_at_slot(mp, i) -> rax = pointer to slot i's cached wtxid[32],
+;                               or 0 when i > mask or the slot is empty.
+; Leaf; no callee-saved use. A walker that already reads slot i's len and
+; blob_off (cmpct_recv.c's ht_build) takes the wtxid from here instead of
+; re-hashing the tx. The pointer aliases the MAP_SHARED slot, so it is only
+; as stable as the entry: a concurrent del can move the record under a
+; lockless reader, exactly as for the txid pointer the other walkers already
+; hand out -- a torn wtxid yields a wrong short id, which reads as a miss.
+global mpool_wtxid_at_slot
+mpool_wtxid_at_slot:
+    cmp  rsi, [rdi+8]        ; i > mask -> 0
+    ja   .none
+    mov  rax, rsi
+    imul rax, 80
+    lea  rax, [rdi+rax+40]   ; &slot[i]
+    mov  rdx, 0xFFFFFFFFFFFFFFFF
+    cmp  [rax], rdx          ; empty -> 0
+    je   .none
+    add  rax, 48
+    ret
+.none:
+    xor  eax, eax
     ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits
