@@ -278,6 +278,61 @@ for a gain that step 1 mostly captures without it. If step 0 shows the LSM
 writes themselves dominate at the tip end — not the fsyncs, not the gets —
 that conclusion changes, and the number will say so.
 
+### The pipelined download: a 12x lever that trips a false consensus rejection — OPEN, 2026-09-06
+
+`daemon/ibd_pipeline.c` (branch `batch/2026-09-06-ibd-pipeline-v2`, first cut
+landed as PR #47 and reverted in PR #48) sends ONE getdata for a whole
+40-block chunk instead of one per block. The win on a real sync is large and
+was measured twice, against the same peer pool on the same afternoon:
+
+| build | blocks stored | elapsed |
+|---|---|---|
+| serial fetch (main) | 74,638 | 74 min |
+| pipelined fetch | 75,425 | 6 min |
+
+That is roughly **12x on the early chain**, where blocks are small and the
+cost is one round trip each — the phase that costs hours of a full sync. The
+microbenchmark agrees: `tests/bench_ibd_fetch` removes 39 of every 40 round
+trips (33.9x at 5 ms, 39.4x at 50 ms).
+
+**Why it is not landed.** Both pipelined runs died with a FALSE
+`bad-txns-BIP30`: at height 48,585 and, in the second run, 74,765. In each
+case the Core oracle confirms an ordinary block whose coinbase output is
+unique and unspent to this day; the archive was correct at those heights
+(slot N held block N against the oracle); and the rejected bytes really were
+that block. So the UTXO set already contained the block's own coinbase: the
+block had been applied once already, under an earlier height.
+
+**What has been ruled out.**
+
+* *The archive being shifted* — checked slot by slot against the oracle.
+* *Arrival-order storage.* The fetcher was changed to hold out-of-order
+  arrivals and store a chunk in ascending height order (bounded 24 MB hold,
+  peers answer in request order in practice so it is normally empty). The
+  fault reproduced anyway, at a different height.
+* *A reader/writer ordering hole in the store.* Both `store_append` and
+  `store_append_shared` honour STO-11: block bytes are durable before the
+  index record that points at them.
+* *The out-of-order fixture.* `test_dlc_interleave` gained a mode where the
+  fake peer answers every getdata backwards. It passes with the fault present
+  AND absent — 600 blocks over 3 loopback peers is not enough concurrency to
+  provoke it.
+
+**What is left.** The fault appears only at speed, with sixteen helpers
+writing while the connect walks heights upward, which is why the serial build
+ran 494,074 blocks without it. The next step is not another guess: it is to
+run the pipelined build with the archive guard (`utxo_live.c`, 2026-09-06 —
+the connect refuses a body that is not the block the index records) and see
+whether the guard fires where the BIP30 used to. If it does, the read is
+returning another block's bytes and the mechanism is a racing reader; if it
+does not, the double-apply is on the connect side and `g_applied_height` is
+moving backwards under some path.
+
+**Reproducer.** A real fresh mainnet sync, `bmc.bootcatchup=0`, pipelined
+build, on an otherwise idle box: five to six minutes to the failure. It does
+NOT reproduce when the box is busy — the second attempt, sharing bandwidth
+with another sync, passed 74,399 blocks cleanly.
+
 ## 5. Tests and the proof
 
 - `test_utxo_catchup_bounded` (gated): a synthetic archive with holes at
