@@ -48,7 +48,7 @@ typedef struct {
     int  utxo_compact_threshold;
 
     /* Bitcoin Core options honoured by name and unit */
-    int  dbcache_mb;             /* Core -dbcache: UTXO cache MB (def 450)   */
+    int  dbcache_mb;             /* Core -dbcache: UTXO cache MB (Core def 1024) */
     int  connect_timeout_ms;     /* Core -timeout    (def 5000ms)            */
     int  peer_timeout_s;         /* Core -peertimeout(def 60s)               */
     int  port;                   /* Core -port                               */

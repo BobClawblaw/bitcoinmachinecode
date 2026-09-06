@@ -62,9 +62,9 @@ node_config_t g_cfg = {
     .maxuploadtarget_mb    = 0,      /* Core -maxuploadtarget default: none  */
     .minrelaytxfee_satkvb  = 100,    /* Core -minrelaytxfee 0.000001 BTC/kvB (v30: 0.1 sat/vB) */
     .incrementalrelayfee_satkvb = 100, /* Core -incrementalrelayfee default (v30)             */
-    .limitancestorcount    = 64,     /* Core v31 accepts by CLUSTER (64 txs / 101 kvB); 25 is only the wallet default now */
+    .limitancestorcount    = 25,     /* Core -limitancestorcount default     */
     .limitancestorsize_kvb = 101,    /* Core -limitancestorsize default (kvB)*/
-    .limitdescendantcount  = 64,     /* same: a chain of up to 64 is one cluster of 64   */
+    .limitdescendantcount  = 25,     /* Core -limitdescendantcount default   */
     .limitdescendantsize_kvb = 101,  /* Core -limitdescendantsize default    */
     .mempoolfullrbf        = 1,      /* Core -mempoolfullrbf default (v28+)  */
     .dustrelayfee_satkvb   = 3000,   /* Core DUST_RELAY_TX_FEE               */
@@ -84,8 +84,8 @@ node_config_t g_cfg = {
     .i2pacceptincoming     = 1,      /* Core -i2pacceptincoming default: on  */
     .listenonion           = 1,      /* Core -listenonion default: on        */
     .bantime               = 86400,  /* Core -bantime default: 24h           */
-    .blockfilterindex      = 1,      /* both indexes already run; the knob    */
-    .coinstatsindex        = 1,      /* only lets an operator turn them OFF   */
+    .blockfilterindex      = 0,      /* Core default (2026-09-06): both indexes */
+    .coinstatsindex        = 0,      /* are OPT-IN, as they are in Core         */
     .rpccookie             = 1,      /* Core's default auth method            */
     .permitbaremultisig    = 1,      /* Core DEFAULT_PERMIT_BAREMULTISIG      */
     .v2transport           = 1,      /* Core DEFAULT_V2_TRANSPORT             */
@@ -293,8 +293,8 @@ static void set_defaults(void){
     g_cfg.checkblockindex = 0; g_cfg.checkmempool = 0; g_cfg.checkaddrman = 0; g_cfg.capturemessages = 0;
     g_cfg.stopafterblockimport = 0; g_cfg.mocktime = 0; g_cfg.n_includeconf = 0;
     g_cfg.bantime               = 86400;
-    g_cfg.blockfilterindex      = 1;
-    g_cfg.coinstatsindex        = 1;
+    g_cfg.blockfilterindex      = 0;
+    g_cfg.coinstatsindex        = 0;
     g_cfg.rpccookie             = 1;
     g_cfg.permitbaremultisig    = 1;
     g_cfg.v2transport           = 1;
@@ -312,7 +312,7 @@ static void set_defaults(void){
     g_cfg.n_rpcallowip          = 0;
     g_cfg.networkactive         = 1;
     g_cfg.forcednsseed          = 0;
-    g_cfg.pidfile[0]            = 0;
+    snprintf(g_cfg.pidfile, sizeof g_cfg.pidfile, "bitcoind.pid");   /* Core -pid default */
     g_cfg.blocknotify[0]        = 0;
     g_cfg.alertnotify[0]        = 0;
     g_cfg.startupnotify[0]      = 0;
@@ -349,9 +349,9 @@ static void set_defaults(void){
     g_cfg.maxuploadtarget_mb    = 0;
     g_cfg.minrelaytxfee_satkvb  = 100;
     g_cfg.incrementalrelayfee_satkvb = 100;
-    g_cfg.limitancestorcount    = 64;
+    g_cfg.limitancestorcount    = 25;
     g_cfg.limitancestorsize_kvb = 101;
-    g_cfg.limitdescendantcount  = 64;
+    g_cfg.limitdescendantcount  = 25;
     g_cfg.limitdescendantsize_kvb = 101;
     g_cfg.mempoolfullrbf        = 1;
     g_cfg.dustrelayfee_satkvb   = 3000;
