@@ -3,6 +3,8 @@
 #include "../mempool_slot.h"
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen) __attribute__((weak));
 extern void bip152_shortid(unsigned char out[6], const unsigned char hdr[80], unsigned long long nonce, const unsigned char wtxid[32]);
+extern unsigned long long siphash24_uint256(unsigned long long k0, unsigned long long k1, const unsigned char msg[32]);
+extern void sha256_full(unsigned char out[32], const void* msg, long len);
 extern void tx_wtxid(unsigned char out[32], const unsigned char* tx, unsigned long txlen);
 extern int  tx_parse(unsigned char info[64], const unsigned char* p, unsigned long cap);
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
@@ -56,35 +58,71 @@ static struct {
  * block. cmpct_recv_set_wtxid_cache(0) is the pre-cache behaviour, kept as
  * the test's negative control and as the fallback should a pool ever be
  * handed over without the cache (none is today: every writer is mpool_put). */
-#define HT_BITS 21
-static struct { unsigned long long sid; const unsigned char* tx; unsigned long len; unsigned char used, dup; } HT[1u << HT_BITS];
-static unsigned long ht_slot(unsigned long long sid){ return (unsigned long)((sid * 0x9e3779b97f4a7c15ULL) >> (64 - HT_BITS)); }
+#define HT_BITS 21                                   /* the table's full width: 2^21 entries, 48 MiB of BSS */
+#define HT_MIN_BITS 12                               /* the smallest probe range: 4096 entries, 96 KiB */
+static struct { unsigned long long sid; const unsigned char* tx; unsigned len, gen; } HT[1u << HT_BITS];   /* tx == 0 with a live gen: dup */
+static unsigned g_gen = 0;                           /* the build that stamped an entry; an entry with any other gen is empty */
+static unsigned g_bits = HT_BITS;                    /* this build's width: probes are masked to 2^g_bits entries */
+static unsigned long g_fill = 0;                     /* live entries this build; put stops one short of full so get always terminates */
+static int g_ht_clear = 0;                           /* 1 = the pre-stamp ht_build: memset the whole table at full width (the control) */
+void cmpct_recv_set_ht_clear(int on){ g_ht_clear = on; }
+unsigned cmpct_recv_ht_bits(void){ return g_bits; }
+unsigned cmpct_recv_ht_gen(void){ return g_gen; }
+void cmpct_recv_ht_set_gen(unsigned g){ g_gen = g; }
+static unsigned long ht_slot(unsigned long long sid){ return (unsigned long)((sid * 0x9e3779b97f4a7c15ULL) >> (64 - g_bits)); }
+static int ht_live(unsigned long i){ return HT[i].gen == g_gen; }
 static void ht_put(unsigned long long sid, const unsigned char* tx, unsigned long len){
-    unsigned long i = ht_slot(sid);
-    for (;;){ if (!HT[i].used){ HT[i].used = 1; HT[i].sid = sid; HT[i].tx = tx; HT[i].len = len; HT[i].dup = 0; return; }
-              if (HT[i].sid == sid){ HT[i].dup = 1; return; }
-              i = (i + 1) & ((1u << HT_BITS) - 1); }
+    unsigned long mask = (1ul << g_bits) - 1, i = ht_slot(sid);
+    if (g_fill >= mask) return;                      /* would fill the table: the rest of the pool is "missing" (getblocktxn fetches it) rather than an unterminated probe */
+    for (;;){ if (!ht_live(i)){ HT[i].gen = g_gen; HT[i].sid = sid; HT[i].tx = tx; HT[i].len = (unsigned)len; g_fill++; return; }
+              if (HT[i].sid == sid){ HT[i].tx = 0; return; }   /* two pool entries share this short id: missing (Core) */
+              i = (i + 1) & mask; }
 }
 static const unsigned char* ht_get(unsigned long long sid, unsigned long* len){
-    unsigned long i = ht_slot(sid);
-    for (;;){ if (!HT[i].used) return 0; if (HT[i].sid == sid){ if (HT[i].dup) return 0; *len = HT[i].len; return HT[i].tx; } i = (i + 1) & ((1u << HT_BITS) - 1); }
+    unsigned long mask = (1ul << g_bits) - 1, i = ht_slot(sid);
+    for (;;){ if (!ht_live(i)) return 0; if (HT[i].sid == sid){ if (!HT[i].tx) return 0; *len = HT[i].len; return HT[i].tx; } i = (i + 1) & mask; }
 }
+/* One build per compact block. Until 2026-09-06 this began with
+ * memset(HT, 0, sizeof HT): 64 MiB written per block, ~10 ms of a 9.9 ms
+ * reconstruction of a 50,000-entry pool once the wtxid cache had removed
+ * the hashing. Now nothing is cleared: each entry carries the generation
+ * that wrote it and a stale one reads as empty; and the probe range is
+ * sized to the pool -- the next power of two >= 2 x count, at least 2^12
+ * and at most 2^21 -- so a small pool touches a small, cache-resident
+ * prefix of the table. The one memset left is at the generation's wrap,
+ * once per 2^32 builds, when every stale stamp would otherwise read live
+ * again. And the SipHash key -- sha256(hdr || nonce), the same for every
+ * entry of a build -- is derived once here rather than once per entry
+ * inside bip152_shortid (50,000 SHA-256s per block on a full pool).
+ * cmpct_recv_set_ht_clear(1) is the old build in full -- the memset, the
+ * full width and the per-entry bip152_shortid -- the test's control. */
 static void ht_build(void* mp, const unsigned char hdr[80], unsigned long long nonce){
-    memset(HT, 0, sizeof HT);
-    if (!mp) return;
     const unsigned char* m = (const unsigned char*)mp;
+    unsigned long long count = mp ? *(const unsigned long long*)m : 0;
+    if (g_ht_clear){ memset(HT, 0, sizeof HT); g_gen = 1; g_bits = HT_BITS; }
+    else {
+        if (++g_gen == 0){ memset(HT, 0, sizeof HT); g_gen = 1; }
+        g_bits = HT_MIN_BITS; while (g_bits < HT_BITS && (1ull << g_bits) < 2 * count) g_bits++;
+    }
+    g_fill = 0;
+    if (!mp) return;
+    unsigned long long k0 = 0, k1 = 0;
+    if (!g_ht_clear){ unsigned char kb[88], H[32]; memcpy(kb, hdr, 80); for (int i = 0; i < 8; i++) kb[80 + i] = (unsigned char)(nonce >> (8 * i));
+                      sha256_full(H, kb, 88); for (int i = 0; i < 8; i++){ k0 |= (unsigned long long)H[i] << (8 * i); k1 |= (unsigned long long)H[8 + i] << (8 * i); } }
     unsigned long long mask = *(const unsigned long long*)(m + 8); const unsigned char* blob = *(const unsigned char* const*)(m + 16);
     unsigned long long blob_cap = *(const unsigned long long*)(m + 24);
     for (unsigned long long s = 0; s <= mask; s++){
         const unsigned char* slot = MPOOL_SLOT_AT(m, s); unsigned long long len = *(const unsigned long long*)slot;
-        if (len == MPOOL_SLOT_EMPTY || len == 0) continue;
+        if (len == MPOOL_SLOT_EMPTY || len == 0 || len > 0xffffffffULL) continue;
         unsigned long long off = *(const unsigned long long*)(slot + MPOOL_SLOT_OFF);
         if (off + len < off || off + len > blob_cap) continue;   /* torn slot (MEM-21): a miss, never a read past the blob */
         const unsigned char* tx = blob + off;
         unsigned char w[32], six[6]; const unsigned char* wp = g_wtxid_cache ? mpool_wtxid_at_slot(mp, (unsigned long)s) : 0;
         if (!wp){ tx_wtxid(w, tx, (unsigned long)len); g_st_hashed++; wp = w; }
-        bip152_shortid(six, hdr, nonce, wp);
-        ht_put(sid_of(six), tx, (unsigned long)len);
+        unsigned long long sid;
+        if (g_ht_clear){ bip152_shortid(six, hdr, nonce, wp); sid = sid_of(six); }
+        else sid = siphash24_uint256(k0, k1, wp) & 0xffffffffffffULL;
+        ht_put(sid, tx, (unsigned long)len);
     }
 }
 static long assemble(unsigned char* out, unsigned long cap){
