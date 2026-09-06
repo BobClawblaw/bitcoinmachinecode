@@ -312,7 +312,7 @@ static void set_defaults(void){
     g_cfg.n_rpcallowip          = 0;
     g_cfg.networkactive         = 1;
     g_cfg.forcednsseed          = 0;
-    g_cfg.pidfile[0]            = 0;
+    snprintf(g_cfg.pidfile, sizeof g_cfg.pidfile, "bitcoind.pid");   /* Core -pid default */
     g_cfg.blocknotify[0]        = 0;
     g_cfg.alertnotify[0]        = 0;
     g_cfg.startupnotify[0]      = 0;
