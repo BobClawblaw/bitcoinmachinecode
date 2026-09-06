@@ -175,8 +175,14 @@ node_handshake:
 	mov  x29, sp
 	stp  x19, x20, [sp, #-16]!
 	stp  x21, x22, [sp, #-16]!
-	sub  sp, sp, #432
-	/* locals: ver_payload@0 (128), plen@144(4), cmd@160(12), payload@192(256) */
+	sub  sp, sp, #704
+	/* locals: ver_payload@0 (128), plen@144(4), cmd@160(12), payload@192(512)
+	 * NET-13 (audit 2026-09-03): the payload cap was 256, so a version
+	 * message of 257..512 bytes failed the WHOLE handshake (p2p_read -2 ->
+	 * .NHfail) -- Core allows a 256-byte UA alone, i.e. ~350-byte versions,
+	 * so we silently refused those peers. 192+512=704, so this frame grew
+	 * 432 -> 704 to hold the wider buffer (the x86 fills the gap to cmd
+	 * instead: same cap, different frame shape). */
 	mov  x19, x0                     /* fd */
 	/* BIP155: per-handshake reset -- peer has not asked for addrv2 yet */
 	adrp x10, g_peer_wants_addrv2
@@ -207,7 +213,7 @@ node_handshake:
 	mov  x0, x19
 	add  x1, sp, #160                /* cmd */
 	add  x2, sp, #192                /* payload */
-	mov  x3, #256
+	mov  x3, #512                    /* NET-13: was 256 */
 	add  x4, sp, #144                /* plen */
 	bl   p2p_read
 	cmp  x0, #0
@@ -219,9 +225,11 @@ node_handshake:
 	mov  x2, #7
 	bl   .Lcmpeq
 	cbz  x0, .LNH_not_version
-	/* capture peer payload (side-effect only) */
+	/* capture peer payload (side-effect only). NET-13: the cap compare rose
+	 * to 512 with the read cap; the saturation stays 256 exactly as the x86
+	 * left it -- dead in practice (p2p_read never reports plen > cap=512). */
 	ldr  w0, [sp, #144]
-	cmp  x0, #256
+	cmp  x0, #512
 	b.ls 5f
 	mov  x0, #256
 5:	adrp x1, g_peer_version_len
@@ -333,7 +341,7 @@ node_handshake:
 .NHfail:
 	mov  w0, #0
 .NHret:
-	add  sp, sp, #432
+	add  sp, sp, #704
 	ldp  x21, x22, [sp], #16
 	ldp  x19, x20, [sp], #16
 	ldp  x29, x30, [sp], #16
@@ -351,7 +359,9 @@ node_accept_handshake:
 	stp  x19, x20, [sp, #-16]!
 	stp  x21, x22, [sp, #-16]!
 	sub  sp, sp, #1024
-	/* cmd@0 (12), plen@16(4), ourver@32(128), recv@192(256) */
+	/* cmd@0 (12), plen@16(4), ourver@32(128), recv@192(512)
+	 * NET-13: recv cap was 256 -- 192+512=704 still fits the 1024 frame
+	 * (x86 grew the same buffer at rbp-0x300 to 512). */
 	mov  x19, x0                     /* fd */
 	/* BIP155: per-handshake reset (see node_handshake) */
 	adrp x10, g_peer_wants_addrv2
@@ -361,7 +371,7 @@ node_accept_handshake:
 	mov  x0, x19
 	add  x1, sp, #0                  /* cmd */
 	add  x2, sp, #192                /* recv */
-	mov  x3, #256
+	mov  x3, #512                    /* NET-13: was 256 */
 	add  x4, sp, #16                 /* plen */
 	bl   p2p_read
 	cmp  x0, #0
@@ -388,9 +398,9 @@ node_accept_handshake:
 	b    .LAHloop
 .LAH_got_version:
 	ldr  w0, [sp, #16]
-	cmp  x0, #256
+	cmp  x0, #512                    /* NET-13: cap compare rose with the cap */
 	b.ls 6f
-	mov  x0, #256
+	mov  x0, #256                    /* saturation stays 256, x86 shape */
 6:	adrp x1, g_peer_version_len
 	add  x1, x1, :lo12:g_peer_version_len
 	str  x0, [x1]
@@ -455,7 +465,7 @@ node_accept_handshake:
 	mov  x0, x19
 	add  x1, sp, #0
 	add  x2, sp, #192
-	mov  x3, #256
+	mov  x3, #512                    /* NET-13: the post-verack drain, same cap */
 	add  x4, sp, #16
 	bl   p2p_read
 	cmp  x0, #0
@@ -1906,8 +1916,12 @@ sync_fail_code:
 /* ---- BSS: last-seen peer version payload capture ---- */
 	.global g_peer_version_payload
 	.type g_peer_version_payload, @object
+	/* NET-13 (audit 2026-09-03): 512, matching the read caps. Raising a cap
+	 * WITHOUT growing this would have turned a connectivity bug into a .bss
+	 * overrun on the inbound serve path -- the copy below moves
+	 * g_peer_version_len bytes in here. */
 g_peer_version_payload:
-	.zero 256
+	.zero 512
 	.global g_peer_version_len
 	.type g_peer_version_len, @object
 g_peer_version_len:
