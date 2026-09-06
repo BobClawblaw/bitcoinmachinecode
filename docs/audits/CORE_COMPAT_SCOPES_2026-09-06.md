@@ -282,7 +282,7 @@ anon nets and block-only legs must not double-count toward the want.
 
 ## CC-5 — Headers sync anti-DoS (presync / low-work headers)
 
-**Status: CLOSED, stage 1 (`799fba3`).** The bounded HOLD as designed; `test_hdr_lowwork` gated (12 checks), negative control = the gate disarmed. Stage 2 (Core's bit commitments) deliberately not done: stage 1 bounds the attack at 648 KB of scratch.
+**Status: CLOSED, stage 1 (`799fba3`; bound corrected `4c3e8fc`).** The bounded HOLD as designed; `test_hdr_lowwork` gated (15 checks), negative control = the gate disarmed. **The first cut's bound was wrong:** the "4 x 2000 headers" cap suggested below abandoned every honest chain, exactly as the Risks paragraph warned — a fresh node is below the floor for ~440 full pages. Found at 04:59Z on the CC-8 replay (header phase abandoned 0.3 s in; serial-leg fallback). The hold is now 1,000 pages (2M headers) in a lazily mapped 162 MB scratch, unmapped per fetch; a test now crosses the floor on the tenth page and was watched to fail on the four-page module. Stage 2 (Core's bit commitments) still not done: stage 1 bounds the attack at one fetch's mapping and nothing on disk.
 
 **Core.** Since 24.0, headers from a peer are not stored until the chain
 they form exceeds `nMinimumChainWork`; during that "presync" phase only a

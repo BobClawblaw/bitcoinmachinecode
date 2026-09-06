@@ -55,6 +55,21 @@ was found on the way, how, and what each cost, in the order found:
   deliberately wedged fake device, so the auditor reports 1 crash on every
   green run. Not fixed today; a red check nobody reads is worse than none.
 
+- **CC-5's hold abandoned every honest header sync.** The four-page cap
+  from this morning abandons any chain still below `-minimumchainwork`
+  after 8,000 headers — a fresh mainnet node is below it for ~880,000. Not
+  visible to the gate (the test crossed the floor at header 5,000) nor to
+  the live node (at the tip). Found when the replay was restarted on the
+  first binary carrying the rule: header phase abandoned 0.3 s in, serial
+  leg fallback. Bounded by memory now (1,000 pages, 162 MB mapped per
+  fetch); the honest case is pinned by a test watched to fail first. Cost:
+  one replay restart; the scope's own Risks paragraph had described this
+  exact failure.
+- **Correction to a claim made earlier today:** the replay's first
+  download (02:05–04:55Z) was the parent's boot catch-up, not the worker's
+  far-behind run; its shutdown line says so. The restart went straight to
+  the worker.
+
 Process note: the branches were built by parallel agents in worktrees, each
 gated alone; the coordinator cherry-picked them onto one landing branch and
 ran ONE gate per merge. One agent's scratch files were overwritten by

@@ -1089,3 +1089,28 @@ see them should not have to rediscover them.
   `getheaders` probe with 253 headers instantly. Not reproduced. The replay
   now syncs from the Core oracle. The ten-minute tolerance is filed against
   the fetch, not the live node.
+
+## 2026-09-06 (early): the CC-8 replay restarted twice — the interleave, then a CC-5 regression
+
+Not the live node; `/storage/bmc-fullverify` (`assumevalid=0`, one loopback
+peer, the Core oracle). Recorded because the second restart found a defect
+that would have hit any fresh sync of the live build.
+
+- **04:55Z, restart on `305c1b4`** (the interleave, PR #27) from the
+  250,913-block archive, 2h50m into its first download. Clean stop: SIGTERM
+  to the parent, worker gone in 3 s, "catch-up done: 240320 new blocks
+  written (10172.69s)". Same command, same datadir, previous binary kept as
+  `bitcoind.replay.prev-77b6c1f`. The worker applied the 240k-block
+  backlog at ~20,000 blocks/s in the early chain, ~500 by height 200k.
+- **04:59:38Z, the parallel downloader gave up in 0.3 s.** CC-5's
+  four-page hold: "4 full pages and still below -minimumchainwork --
+  abandoning this chain", then "archive already complete through 250913",
+  "parallel downloader wrote 0 block(s)". The node fell back to its serial
+  leg (~110 blocks/s at height ~280k, 60 s re-dial cycles,
+  `sync_failing=1`). It kept running while the fix was built.
+- **Correction.** The first run's download was the parent's BOOT catch-up
+  (the shutdown line: "shutdown requested during the catch-up -- exiting
+  before the worker starts"), not the worker's far-behind run as stated
+  earlier that hour. The restart went straight to the worker.
+- **Restart on the fix** (`4c3e8fc`, hold bounded by memory): see the
+  entry that follows.
