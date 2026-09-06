@@ -46,6 +46,7 @@
 #include "anchors.h"           /* CC-4: block-relay-only legs + anchors.dat */
 #include "hdr_lowwork.h"       /* CC-5: hold low-work header pages until the chain proves its work */
 #include "invalid_set.h"       /* CC-10: invalidateblock / reconsiderblock */
+#include "cmpct_recv.h"        /* CC-2: BIP152 compact block receive */
 /* VAL-5 / MEM-1: the generated per-height script-flag mask
  * (bitcoin_script_flags.asm, from validation/gen_script_flags.py). */
 extern unsigned long long script_flags_for_block(unsigned long long height,
@@ -1045,6 +1046,11 @@ static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
  * so it gets addrv2-encoded self-announcements (daemon/addr_self.c) */
 static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
 static unsigned char mux_out_kind[MUX_MAX_OUT];         /* CC-4: LEG_FULL / LEG_BLOCK_ONLY */
+static unsigned char mux_out_cmpct[MUX_MAX_OUT];        /* CC-2: the peer sent sendcmpct on this leg */
+extern long  g_peer_sendcmpct;                          /* bitcoind.asm: set by the sync drains when the peer sends sendcmpct */
+extern void* g_sync_mp;                                 /* bitcoind.asm: the mempool node_sync_multi reconstructs from */
+static void* txsub_pool(void);                           /* defined with the tx-submit worker below */
+static int   txsub_worker_ready(void);
 /* each leg's BMC_NET_*, derived from its host string. We announce ONE
  * address -- this node's clearnet IPv4 -- and telling an onion or i2p peer
  * that address links the two, which is exactly what running over those
@@ -2311,7 +2317,15 @@ static long do_outbound_sync(int i){
     static unsigned char cbuf[6<<20]; long cnt=0;
     int st_tip_before=*(int*)(store_buf+24);
     phase_timer_t sync_pt; phase_start(&sync_pt);
+    /* CC-2: this leg's compact-block state rides in two asm globals around the
+     * call -- whether the peer sent sendcmpct (the drains set it) and the pool
+     * the reconstruction draws on. Read back after: the peer may have sent
+     * sendcmpct during this very sync. */
+    g_peer_sendcmpct = mux_out_cmpct[i]; g_sync_mp = txsub_worker_ready() ? txsub_pool() : NULL;
     long ok=node_sync_multi(mux_out_fd[i], store_buf, loc, nloc, cbuf, (long)sizeof cbuf, &cnt);
+    if(g_peer_sendcmpct && !mux_out_cmpct[i]){ mux_out_cmpct[i] = 1; fprintf(stderr, "[cmpct] %s accepts compact blocks: requesting MSG_CMPCT_BLOCK on this leg from now on\n", mux_out_host[i]); }
+    { static unsigned long p_r, p_n, p_f; unsigned long r, n, f; cmpct_recv_stats(&r, &n, &f);
+      if(r != p_r || n != p_n || f != p_f){ fprintf(stderr, "[cmpct] reconstructed %lu block(s) from the mempool (%lu needed a getblocktxn round trip, %lu fell back to a full block)\n", r, n, f); p_r = r; p_n = n; p_f = f; } }
     double sync_s = phase_elapsed(&sync_pt);
     int st_tip=*(int*)(store_buf+24);
     if(ok!=1 || cnt<=0){
@@ -2666,7 +2680,7 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
     g_peer_wants_addrv2 = r->wants_addrv2;
     snprintf(mux_out_host[mux_n_out], sizeof mux_out_host[mux_n_out], "%s", host);
     mux_out_fd[mux_n_out] = fd;
-    mux_out_kind[mux_n_out] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */
+    mux_out_kind[mux_n_out] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
     mux_out_wants_v2[mux_n_out] = r->wants_addrv2;
     mux_out_peer[mux_n_out] = 0;
     anchor_locator(mux_out_loc[mux_n_out]);
@@ -5297,7 +5311,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
             struct timeval t2; t2.tv_sec=3; t2.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
             strncpy(mux_out_host[mux_n_out], srcpool[i], 127);
-            mux_out_fd[mux_n_out]=cfd[i]; mux_out_kind[mux_n_out] = host_is_block_only(srcpool[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */
+            mux_out_fd[mux_n_out]=cfd[i]; mux_out_kind[mux_n_out] = host_is_block_only(srcpool[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
             mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
             mux_out_peer[mux_n_out]=i;
             anchor_locator(mux_out_loc[mux_n_out]);
@@ -6465,7 +6479,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 int nfd=outbound_connect(srcpool[ci], 300, out_port);
                 if(nfd>=0){
                     strncpy(mux_out_host[mux_n_out], srcpool[ci], 127);
-                    mux_out_fd[mux_n_out]=nfd; txrelay_leg_reset(nfd); mux_out_kind[mux_n_out] = host_is_block_only(srcpool[ci]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */
+                    mux_out_fd[mux_n_out]=nfd; txrelay_leg_reset(nfd); mux_out_kind[mux_n_out] = host_is_block_only(srcpool[ci]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
                     mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
                     mux_out_peer[mux_n_out]=ci;
                     anchor_locator(mux_out_loc[mux_n_out]);
@@ -7123,7 +7137,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         int fd=outbound_connect(peers[i], 300, out_port);
         if(fd<0){ fprintf(stderr,"[mux] outbound %s failed: %s\n", peers[i], dial_fail_reason()); continue; }
         strncpy(mux_out_host[mux_n_out], peers[i], 127);
-        mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd); mux_out_kind[mux_n_out] = host_is_block_only(peers[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */
+        mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd); mux_out_kind[mux_n_out] = host_is_block_only(peers[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
         mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
         mux_out_peer[mux_n_out]=i;
         anchor_locator(mux_out_loc[mux_n_out]);
