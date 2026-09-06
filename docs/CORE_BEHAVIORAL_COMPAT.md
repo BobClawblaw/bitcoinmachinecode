@@ -110,7 +110,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 |---|---|---|---|
 | Headers-first sync, PoW checked per header, contextual rules | | same; boot header fetch PoW-gates before append (VAL-5) | **DONE** |
 | Minimum chain work at fork evaluation | never reorg to a chain below `nMinimumChainWork` | same (`minchainwork.c`, `reorg.c:708`, floor per chain) | **DONE** |
-| Low-work headers sync / presync | do not store a headers chain until it crosses the floor (24.0 presync) | bounded HOLD: full pages below the floor are held (linkage+PoW only), released when the chain crosses it, abandoned after 4 (`hdr_lowwork.c`, CC-5, `799fba3`); Core's bit-commitment presync not replicated | **DONE** (stage 1) |
+| Low-work headers sync / presync | do not store a headers chain until it crosses the floor (24.0 presync) | bounded HOLD: full pages below the floor are held (linkage+PoW only), released when the chain crosses it, abandoned only at a memory bound of 1,000 pages / 162 MB mapped per fetch (`hdr_lowwork.c`, CC-5, `799fba3`, bound fixed `4c3e8fc`: the first cut abandoned after FOUR pages, which abandoned every honest sync below ~880k — seen on the CC-8 replay); Core's bit-commitment presync not replicated | **DONE** (stage 1) |
 | Checkpoints | still present for the early chain | present | **DONE** |
 | Stale-tip detection | warn + extra outbound | same (CC-6) | **DONE** |
 | Time offset | v28+ no longer adjusts; warns on large peer skew | no adjustment | **DONE** (parity by absence; warning: verify) |
@@ -181,7 +181,7 @@ by size. Each carries the test that would prove it.
 
 | # | Item | Why it is first | Size | Scope |
 |---|---|---|---|---|
-| 8 | **Full-verification replay** (`assumevalid=0`, §1) | **RUNNING** since 2026-09-06 01:12Z from the Core oracle; `stopatheight=965598` | wall-clock | CC-8 |
+| 8 | **Full-verification replay** (`assumevalid=0`, §1) | **RUNNING** since 2026-09-06 01:12Z from the Core oracle; `stopatheight=965598`. Restarted 04:55Z on `305c1b4` (interleave) from its 250,913-block archive; that binary's header phase was abandoned by CC-5's four-page bound and the node fell back to its serial leg; restarted again on the bound fix (`4c3e8fc`) | wall-clock | CC-8 |
 | 10 | taproot script-path PSBT signing and finalization (all key types) | **deferred**: needs Core-generated fixtures | medium | CC-10 |
 
 Every row is scoped in `docs/audits/CORE_COMPAT_SCOPES_2026-09-06.md`.
