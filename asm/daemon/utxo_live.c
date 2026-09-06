@@ -679,6 +679,16 @@ void utxo_live_set_coinstats(csi_coin_fn add, csi_coin_fn rm,
                              void (*inval)(const char*), void (*commit)(long)){
     g_csi_add = add; g_csi_rm = rm; g_csi_inval = inval; g_csi_commit = commit;
 }
+/* Bulk catch-up (2026-09-06, UTXO_INLINE_BUILD_PERF_SCOPE.md "the MuHash fold
+ * is on the bulk connect path"): while the memtable is bulk-sized the index
+ * does not fold per coin at all -- ~6.4 billion 1.66 us folds on a fresh
+ * sync, the same order as the whole bulk phase. It is seeded ONCE from a
+ * walk of the set at the moment the node becomes caught up (the downshift
+ * below), exactly as csi_seed_from_walk does at boot. This hook is that
+ * moment; the observers above stay registered and inert (the index is
+ * invalid) until it fires. NULL outside the worker. */
+static void (*g_csi_caught_up)(void* lst, void* table, long height) = 0;
+void utxo_live_set_coinstats_caught_up(void (*fn)(void*, void*, long)){ g_csi_caught_up = fn; }
 
 extern long utxo_store_wal_drain(void* st);
 static int persist_applied_height(long h){
@@ -2833,6 +2843,9 @@ static int g_bulk_mode = 0;
 /* Test hook: g_bulk_mode is decided from the store at init, which a unit test
  * of the threshold arithmetic has no business setting up. */
 void utxo_live_test_set_bulk_mode(int on){ g_bulk_mode = on; }
+/* Read side (daemon/main.c decides whether the coinstats index seeds at boot
+ * or defers to the caught-up hook above). */
+int utxo_live_bulk_mode(void){ return g_bulk_mode; }
 
 long utxo_live_compact_threshold(void){
     long t = g_cfg.utxo_compact_threshold > 0 ? g_cfg.utxo_compact_threshold
@@ -3370,6 +3383,13 @@ long utxo_live_catchup(void* store_buf){
                 fprintf(stderr, "[utxo_live] WARNING: catch-up WAL flush did not complete (r=%ld, log_len=%llu of %llu): a restart before the next block will replay that tail into a steady-state memtable and be very slow -- daemon/flush_wal_tail is the manual remedy\n",
                         fr, (unsigned long long)g_utxo_lst.log_len, before_len);
         }
+        /* The coinstats index seeds HERE, from a walk of the now-caught-up
+         * set (see utxo_live_set_coinstats_caught_up). The set is quiescent
+         * exactly as at boot: this is the same thread, between blocks, with
+         * the batch checkpoint just persisted above; a background compaction
+         * (a separate process) never touches this process's manifest until
+         * compact_poll adopts it. Minutes on mainnet, once per process. */
+        if (g_csi_caught_up) g_csi_caught_up(&g_utxo_lst, g_utxo_table, g_applied_height);
     }
     if (applied > 0) {
         /* STAGE B: steady-state undo-data retention. Bounded and resumable

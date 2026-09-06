@@ -89,6 +89,18 @@ typedef struct {
 } csi_t;
 
 static csi_t g_csi;
+/* Bulk catch-up (2026-09-06): set by csi_defer_to_caught_up while the connect
+ * loop is bulk-sized. The observers are inert (g_csi.valid == 0, no file on
+ * disk, so the RPC cannot serve a stale record) until utxo_live's caught-up
+ * hook fires csi_on_caught_up, which seeds from a walk exactly as boot does.
+ * On a fresh sync this replaces ~6.4 billion per-coin folds with one walk. */
+static int g_csi_deferred;
+/* Every element folded into either accumulator, by this process, from any
+ * path (observer or seed walk). Test instrument: the bulk-mode property is
+ * that this stays 0 across the whole catch-up and equals the set size after
+ * the seed. */
+static u64 g_csi_folds;
+u64 csi_test_fold_count(void){ return g_csi_folds; }
 #define CSI_FILE "coinstats.dat"
 #define CSI_MAGIC "BMCCSI1"
 
@@ -117,6 +129,7 @@ void csi_invalidate(const char* why){
 
 int csi_valid(void){ return g_csi.valid; }
 long csi_height(void){ return g_csi.valid ? g_csi.height : -1; }
+int csi_deferred(void){ return g_csi_deferred; }
 
 /* one coin entered the live set */
 void csi_on_add(const u8 txid[32], u32 index, u64 value, u64 height, u64 coinbase,
@@ -125,6 +138,7 @@ void csi_on_add(const u8 txid[32], u32 index, u64 value, u64 height, u64 coinbas
     u8 key[36]; memcpy(key, txid, 32);
     for (int i = 0; i < 4; i++) key[32+i] = (u8)(index >> (8*i));
     utxo_stats_add(g_csi.num, key, value, (height << 1) | coinbase, script, slen);
+    g_csi_folds++;
 }
 
 /* one coin left the live set (spend, or a disconnected block's creation) */
@@ -134,6 +148,7 @@ void csi_on_remove(const u8 txid[32], u32 index, u64 value, u64 height, u64 coin
     u8 key[36]; memcpy(key, txid, 32);
     for (int i = 0; i < 4; i++) key[32+i] = (u8)(index >> (8*i));
     utxo_stats_add(g_csi.den, key, value, (height << 1) | coinbase, script, slen);
+    g_csi_folds++;
 }
 
 /* ---- persistence --------------------------------------------------------- */
@@ -220,6 +235,7 @@ static struct { void* st; long n, next, total; time_t t0; } g_csi_walkprog;
 static void csi_walk_add_prog(void* st, const u8 key36[36], unsigned long value,
                               unsigned long code, const u8* script, unsigned long slen){
     utxo_stats_add(st, key36, value, code, script, slen);
+    g_csi_folds++;
     if (++g_csi_walkprog.n >= g_csi_walkprog.next){
         long secs = (long)(time(NULL) - g_csi_walkprog.t0); if (secs < 1) secs = 1;
         if (g_csi_walkprog.total > 0)
@@ -248,6 +264,31 @@ int csi_seed_from_walk(void* lst, void* u, long height){
     fprintf(stderr, "[coinstats] seeded: %ld coins, txouts=%llu at height %ld\n",
             n, (unsigned long long)st_get(g_csi.num, ST_TXOUTS), height);
     return g_csi.valid;
+}
+
+/* ---- bulk catch-up: defer, then seed at caught-up ------------------------
+ * The worker calls csi_defer_to_caught_up at boot INSTEAD of csi_boot/seed
+ * when utxo_live_bulk_mode() says the connect loop is far behind. Any
+ * persisted state is dropped (it would only be maintained by the per-coin
+ * folds this exists to skip, and a coinstats.dat that stops at the boot
+ * height must not be served as if it were current). Reorgs during bulk mode
+ * are not a concern: the walk happens after. */
+void csi_defer_to_caught_up(void){
+    if (g_csi.valid) csi_invalidate("bulk catch-up: per-coin folding is off until caught up");
+    g_csi.valid = 0;
+    unlink(CSI_FILE);
+    g_csi_deferred = 1;
+    fprintf(stderr, "[coinstats] bulk catch-up: not folding per coin; the index seeds from a walk when the node is caught up\n");
+}
+
+/* utxo_live's caught-up hook (utxo_live_set_coinstats_caught_up): fires on
+ * the same thread, between blocks, after the batch checkpoint -- the
+ * quiescence csi_seed_from_walk needs, by the same construction as boot.
+ * A no-op unless the index was deferred. */
+void csi_on_caught_up(void* lst, void* u, long height){
+    if (!g_csi_deferred) return;
+    g_csi_deferred = 0;
+    csi_seed_from_walk(lst, u, height);
 }
 
 /* Boot: adopt the persisted state iff it matches the applied height exactly;

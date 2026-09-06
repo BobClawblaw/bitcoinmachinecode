@@ -5128,10 +5128,21 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             extern void* utxo_live_lst(void);
             extern void* utxo_live_table(void);
             extern long utxo_live_applied_height(void);
+            extern int  utxo_live_bulk_mode(void);
+            extern void utxo_live_set_coinstats_caught_up(void (*)(void*, void*, long));
+            extern void csi_defer_to_caught_up(void);
+            extern void csi_on_caught_up(void*, void*, long);
             utxo_live_set_coinstats(csi_on_add, csi_on_remove, csi_invalidate, csi_commit);
             undo_set_coin_observer(csi_on_remove);
+            utxo_live_set_coinstats_caught_up(csi_on_caught_up);
             long ah = utxo_live_applied_height();
-            if (!csi_boot(ah))
+            /* Bulk catch-up (2026-09-06): far behind, the per-coin fold is
+             * the largest single cost on the connect thread (~3 h of a
+             * fresh sync). Skip it: the index stays invalid and seeds from
+             * ONE walk when utxo_live downshifts to steady state. */
+            if (utxo_live_bulk_mode())
+                csi_defer_to_caught_up();
+            else if (!csi_boot(ah))
                 csi_seed_from_walk(utxo_live_lst(), utxo_live_table(), ah);
         }
     }
