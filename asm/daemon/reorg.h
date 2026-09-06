@@ -90,6 +90,12 @@ long reorg_analyze(void* st, reorg_cand_t* c);
  * Returns 1 on a completed reorg, 0 if it refused before touching anything,
  * -1 if it failed PART WAY THROUGH (the loud, must-not-happen case: the log
  * says exactly where). */
+/* CC-10 (2026-09-06): Core invalidateblock. Disconnect down to fork_height
+ * with NO replacement blocks -- the disconnect half of reorg_execute alone.
+ * 1 done, 0 refused before touching anything, -1 failed part way. */
+long reorg_disconnect_to(void* st, long fork_height);
+/* A candidate chain containing a hash the operator invalidated is refused. */
+void reorg_set_invalid_fn(int (*fn)(const unsigned char hash[32]));
 long reorg_execute(void* st, long fork_height, long nblocks,
                    reorg_block_src src, void* srcctx);
 

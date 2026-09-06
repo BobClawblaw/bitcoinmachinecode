@@ -35,7 +35,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | `assumeutxo` snapshot load | `loadtxoutset` | absent | **DECIDED** (`FEATURE_GAPS.md` "genuinely still open": large lift, no need) |
 | UTXO set identity | | MuHash byte-identical to Core at two heights on two datadirs; re-runnable (`validation/muhash_vs_core.sh`) | **DONE** |
 | Reorg handling, undo, crash consistency | | same; tested | **DONE** |
-| `invalidateblock` / `reconsiderblock` | operator tooling to force a reorg | absent | **GAP** (small; RPC-only) |
+| `invalidateblock` / `reconsiderblock` | mark, disconnect, stay below the mark until a heavier chain avoids it | same: persisted mark (`invalid.dat`), disconnect through the reorg module's own unapply path, header fetch and reorg analyzer refuse marked chains (CC-10, `32f3e5b`) | **DONE** |
 | Chain selection | main / testnet4 / signet / regtest; testnet3 deprecated | same; testnet3 refused outright | **DONE** |
 
 ## 2. Mempool policy
@@ -67,12 +67,12 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | `getblocks` (legacy) | still answered | answered | **DONE** |
 | `mempool` (BIP35) gated by permission | | same (`NP_MEMPOOL`) | **DONE** |
 | **BIP152 compact blocks — serve side** | answers `MSG_CMPCT_BLOCK`, `getblocktxn`, negotiates `sendcmpct` | same | **DONE** |
-| **BIP152 compact blocks — receive side** | high- and low-bandwidth modes; reconstruct from mempool, `getblocktxn` for the rest, `blockreconstructionextratxn` | **absent**: `cmpctblock`/`blocktxn` are never handled inbound; the download path never sends `sendcmpct` and fetches every block as `MSG_BLOCK` (`main.c`, 4 sites). A peer's compact block is ignored. *`FEATURE_GAPS.md`'s config row for `blockreconstructionextratxn` said "reconstruction draws on the mempool only", implying it exists — corrected in this commit.* | **GAP** |
+| BIP152 compact blocks — receive side | high- and low-bandwidth modes; reconstruct from mempool, `getblocktxn` for the rest, `blockreconstructionextratxn` | **low-bandwidth mode**: `sendcmpct` sent after verack on outbound legs, `MSG_CMPCT_BLOCK` requested on a leg that negotiated, reconstruction from the shared mempool, `getblocktxn`/`blocktxn` for the rest, full-block fallback on any failure (`cmpct_recv.c`, CC-2, `49c1c6f`). High-bandwidth push and the extra-txn pool are follow-ups | **DONE** (low-bandwidth) |
 | BIP157/158 `getcfilters`/`getcfheaders`/`getcfcheckpt` | when `-peerblockfilters` | same (`serve_cfilters.c`), service bit gated the same way | **DONE** |
 | BIP37 bloom (`filterload` etc.) | default off, `NODE_BLOOM` off | not implemented, bit never set | **DECIDED** (matches Core's default) |
 | BIP61 `reject` | removed in 0.20 | absent | **DONE** (parity by absence) |
 | BIP330 Erlay `sendtxrcncl` + reconciliation | negotiation + reconciliation (off by default) | negotiation only, wire-off | **DECIDED** (`FEATURE_GAPS.md` 2026-08-30 "deliberate stopping point") |
-| BIP331 package relay `sendpackages`/`pkgtxns`/`ancpkginfo` | wire negotiation + package fetch | acceptance is real; **wire protocol not built** | **PARTIAL** |
+| BIP331 package relay `sendpackages`/`pkgtxns`/`ancpkginfo` | **not shipped in Core** as of v30/v31: Core relays 1p1c packages *opportunistically* through orphan resolution, with no new messages | same: opportunistic 1p1c via `txr_orphan_resolve` sharing `submitpackage`'s validation; `sendpackages` recognised and ignored, as Core does | **DONE** (parity by absence; CC-9 decided 2026-09-06) |
 | Misbehavior scoring + ban list | `Misbehaving()`, discouragement, `banlist.json` persisted | scored for inv/getdata bounds, header rules, tx violations via `txr_report_violation`; shared in-memory ban list (`ctl_ban_add`), **not persisted across restart** (re-grep 2026-09-06: no banlist file) | **PARTIAL** |
 
 ## 4. P2P behavior — connections and relay
@@ -134,9 +134,9 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 |---|---|---|---|
 | Descriptor wallets, encryption (v3), PSBT create/sign/finalize/analyze/join, `bumpfee` | | same; `bumpfee` proven against real Core | **DONE** |
 | Miniscript, MuSig2 key-path, `musig()` descriptors | | same | **DONE** |
-| MuSig2 inside tapscript **leaf** scripts | signed | not signed | **PARTIAL** |
-| BIP389 multipath descriptors, PSBT Updater role, partial signatures | | absent | **GAP** |
-| Coin selection (BnB / knapsack / SRD, waste metric) | | BnB (`wallet_bnb.c`); knapsack and SRD absent | **PARTIAL** |
+| Taproot **script-path** PSBT signing and finalization (`PSBT_IN_TAP_SCRIPT_SIG`, leaf scripts, control blocks) — MuSig2 in leaves included | signed and finalized | key path only, for every key type; there is no 0x14/0x15 handling at all, so the MuSig2-in-leaf row was the visible edge of a wider gap | **GAP** (deferred: needs Core-generated PSBT fixtures to be built safely; see the scopes) |
+| BIP389 multipath descriptors | `<a;b>` expands to one descriptor per path | same (`descr_multipath_n`, `rpc_desc_multipath_expand`; `importdescriptors` imports one per expansion, `getdescriptorinfo` lists them). The register's first draft called this absent; a re-read of `descriptor.c` on 2026-09-06 found it | **DONE** |
+| Coin selection (BnB / knapsack / SRD, waste metric) | | same: BnB first, then knapsack and SRD over the same effective values, the lower waste taken; largest-first remains the last resort (`wallet_coinsel.c`, CC-10) | **DONE** |
 | Keypool | pre-generated | derives on demand | **DECIDED** |
 | Reorg awareness in the wallet | rescans/updates on disconnect | none (WAL-13) | **DECIDED** |
 | Secrets hygiene (mlock, DONTDUMP) | | same (WAL-3) | **DONE** |
@@ -181,10 +181,8 @@ by size. Each carries the test that would prove it.
 
 | # | Item | Why it is first | Size | Scope |
 |---|---|---|---|---|
-| 2 | **BIP152 compact block receive** (§3) | Every block fetched in full; a Core peer's pushed `cmpctblock` is dropped then refetched | medium-large | CC-2 |
-| 8 | **Full-verification replay** (`assumevalid=0`, §1) | The proof; launch first, it runs unattended | wall-clock | CC-8 |
-| 9 | **BIP331 package relay wire** (§3) | Conditional on Core's default | medium | CC-9 |
-| 10 | `invalidateblock`/`reconsiderblock`, MuSig2 leaf signing, BIP389 derivation, knapsack/SRD | Completeness | small–medium each | CC-10 |
+| 8 | **Full-verification replay** (`assumevalid=0`, §1) | **RUNNING** since 2026-09-06 01:12Z from the Core oracle; `stopatheight=965598` | wall-clock | CC-8 |
+| 10 | taproot script-path PSBT signing and finalization (all key types) | **deferred**: needs Core-generated fixtures | medium | CC-10 |
 
 Every row is scoped in `docs/audits/CORE_COMPAT_SCOPES_2026-09-06.md`.
 
