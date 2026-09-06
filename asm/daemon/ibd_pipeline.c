@@ -4,10 +4,17 @@
 
 #define IBD_PIPE_MAX 256          /* chunk sizes in use are 40; the cap bounds the stack arrays */
 
-extern long p2p_write(int fd, const char* cmd, unsigned long cmdlen, const unsigned char* payload, unsigned len);
-extern long p2p_read(int fd, char* cmd, unsigned char* buf, unsigned long cap, unsigned* outlen);
+/* These MUST match daemon/main.c's declarations exactly -- there is no shared
+ * header for them, so a mismatch links cleanly and misbehaves at run time.
+ * The first cut of this file declared cons_verify with two parameters (it
+ * takes four) and p2p_read as returning long (it returns int, so the high 32
+ * bits of the register are garbage): every chunk failed, the download wrote
+ * zero blocks, and only the real fixture caught it -- the unit test could
+ * not, because its stubs matched the wrong declarations. */
+extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen);
+extern int  p2p_read(int fd, char cmd[12], void* pl, unsigned cap, unsigned* len);
 extern int  hst_get_at(void* hst, unsigned long long idx, void* rec112);
-extern long cons_verify(const unsigned char* blk, unsigned long len);
+extern int  cons_verify(const void* block, long len, void* scratch, unsigned cap);
 extern void block_hash(unsigned char out[32], const unsigned char* hdr80);
 extern long store_append_shared(void* st, long height, const unsigned char hash[32],
                                 const unsigned char* raw, unsigned len);
@@ -30,7 +37,8 @@ static unsigned build_getdata(unsigned char* out, const unsigned char hashes[][3
 }
 
 long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long nloc,
-                               unsigned char* buf, unsigned long buflen)
+                               unsigned char* buf, unsigned buflen,
+                               void* scratch, unsigned scratch_cap)
 {
     if (nloc <= 0 || nloc > IBD_PIPE_MAX) return -1;
     static unsigned char want[IBD_PIPE_MAX][32];     /* the chunk's block hashes, by local index */
@@ -63,13 +71,13 @@ long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long n
             sent_to += take;
         }
         char cmd[12]; unsigned len = 0;
-        long r = p2p_read(fd, cmd, buf, buflen, &len);
+        int r = p2p_read(fd, cmd, buf, buflen, &len);
         if (r <= 0) return -1;
         if (!strncmp(cmd, "ping", 12) && len == 8){ p2p_write(fd, "pong", 4, buf, 8); continue; }
         if (strncmp(cmd, "block", 12) != 0) continue;         /* inv, addr, feefilter, ... */
         if (len < 81) continue;
 
-        if (cons_verify(buf, len) != 1) return -1;            /* same gate as the serial path */
+        if (cons_verify(buf, (long)len, scratch, scratch_cap) != 1) return -1;   /* same gate, same scratch, as the serial path */
         unsigned char bh[32];
         block_hash(bh, buf);
 

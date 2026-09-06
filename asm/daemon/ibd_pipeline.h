@@ -26,7 +26,8 @@
  * the peer broke the protocol, sent a block that fails validation, or the
  * socket died. buf/buflen is the caller's block scratch. */
 long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long nloc,
-                               unsigned char* buf, unsigned long buflen);
+                               unsigned char* buf, unsigned buflen,
+                               void* scratch, unsigned scratch_cap);
 /* test seam: how many hashes the last call put in ONE getdata (0 = never ran) */
 long ibd_pipeline_last_batch(void);
 /* test/bench seam: hashes per getdata. 0 (the default) means the whole chunk
