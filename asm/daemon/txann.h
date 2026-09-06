@@ -18,6 +18,7 @@ void txann_set_status(node_status_t* st);          /* once, before fork */
 void txann_set_my_slot(int slot);                  /* the serve child's peer-table slot; -1 = worker */
 int  txann_my_slot(void);
 void txann_push(const unsigned char txid[32], unsigned long long fee, unsigned long vsize);
+void txann_note_block(void);                       /* CC-3: a novel block arrived from this child's peer */
 
 void txann_child_init(int slot, int relay_ok);     /* after the handshake, before the serve loop */
 long txann_wait(int fd, unsigned long long peer_feefilter);   /* asm: 1 = readable, 0 = idle bound hit */
