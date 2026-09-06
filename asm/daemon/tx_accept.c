@@ -101,6 +101,7 @@ void tx_accept_set_tip(long tip){ g_next_height = tip + 1; }
 static long g_tip_time = 0, g_best_header = -1;
 void tx_accept_set_tip_time(long tip_time, long best_header){ g_tip_time = tip_time; g_best_header = best_header; }
 #include "stale_tip.h"
+#include "txann.h"
 /* CC-6: does the dialer want one extra outbound because the tip is stale? */
 int tx_accept_stale_tip_extra(long now){
     return stale_tip_extra_outbound(now, g_tip_time, g_next_height - 1, g_best_header, 1);
@@ -125,7 +126,12 @@ static void txacc_fee_note(const unsigned char* txid){
     extern long mpool_policy_n_parents(void*, const unsigned char*);
     extern int  mpol_in_package_context(void);
     unsigned long long fee = 0, vsize = 0;
-    if (!g_pol_state_for_fees || mpool_policy_entry(g_pol_state_for_fees, txid, &fee, &vsize) != 1) return;
+    /* CC-1: every accept, from whichever process, goes on the announce ring
+     * (fee/vsize let the readers honour a peer's feefilter; 0/0 = unknown,
+     * announced rather than dropped). This is the one place all three accept
+     * paths meet, under the pool lock, so it is the one feed point. */
+    if (!g_pol_state_for_fees || mpool_policy_entry(g_pol_state_for_fees, txid, &fee, &vsize) != 1){ txann_push(txid, 0, 0); return; }
+    txann_push(txid, fee, vsize);
     int valid = tx_accept_chainstate_current()
              && mpool_policy_n_parents(g_pol_state_for_fees, txid) == 0
              && !mpol_in_package_context();
