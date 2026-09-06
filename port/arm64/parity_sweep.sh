@@ -427,9 +427,11 @@ fi
 # daemon/bitcoin_rpcd: the RPC daemon binary (test_rpc_server execs it as
 # ./daemon/bitcoin_rpcd with TEST_RPC_PORT=0). Link = the daemon bundle with
 # bitcoin_rpcd.c swapped for main.c (build_daemon.sh's lists, minus main).
-# daemon/bitcoin_cli: daemon/bitcoin_cli.c + cli_conf.c + rpc_net/commands/json
-# + RPCLIBS (test_rpc_server shells out to it).
-# rebuilt EVERY sweep: a stale bitcoin_cli silently measures pre-merge code
+# daemon/bmc_cli: daemon/bmc_cli.c + cli_conf.c + rpc_net/commands/json
+# + RPCLIBS (test_rpc_server shells out to it). b89f468a renamed the tool
+# bitcoin_cli -> bmc_cli (asm/bitcoin_cli.o, the S6 store-inspection module,
+# deliberately KEPT its name); the tests exec daemon/bmc_cli.
+# rebuilt EVERY sweep: a stale bmc_cli silently measures pre-merge code
 # rebuilt EVERY sweep from build_daemon.sh's own lists -- a stale or
 # hand-maintained link line silently measures pre-merge code (the 2026-09-02
 # rpcd did: zero whitelist symbols). Swap the daemon main for the tool main.
@@ -440,9 +442,9 @@ if true; then
   SRCS="$SRCS ../../asm/wallet_book.c"
   OB=$(for m in $DAEMONOBJS; do echo "${m}.o"; done)
   gcc -no-pie -O2 -Wl,-z,relro,-z,now -lpthread -I../../asm -I../../asm/daemon -I../.. \
-    -o "$OUT/bitcoin_cli" ../../asm/daemon/bitcoin_cli.c $SRCS ../../asm/wallet_core.c $OB \
+    -o "$OUT/bmc_cli" ../../asm/daemon/bmc_cli.c $SRCS ../../asm/wallet_core.c $OB \
     2>> "$OUT/build.log" \
-  || echo -e "build-fail\tSPECIAL:bitcoin_cli\tsee build.log" >> "$OUT/results.tsv"
+  || echo -e "build-fail\tSPECIAL:bmc_cli\tsee build.log" >> "$OUT/results.tsv"
 fi
 # rebuilt EVERY sweep: a stale bitcoin_rpcd silently measures pre-merge code
 # rebuilt EVERY sweep from build_daemon.sh's own lists -- a stale or
@@ -482,7 +484,7 @@ ensure_asm_layout() {
     ln -sf "$AB/daemon_out/bitcoind" "$REPO/asm/daemon/bitcoind"
     [ -x "$AB/$OUT/wallet_cli" ] && ln -sf "$AB/$OUT/wallet_cli" "$REPO/asm/daemon/wallet_cli"
     [ -x "$AB/$OUT/bitcoin_rpcd" ] && ln -sf "$AB/$OUT/bitcoin_rpcd" "$REPO/asm/daemon/bitcoin_rpcd"
-    [ -x "$AB/$OUT/bitcoin_cli" ] && ln -sf "$AB/$OUT/bitcoin_cli" "$REPO/asm/daemon/bitcoin_cli"
+    [ -x "$AB/$OUT/bmc_cli" ] && ln -sf "$AB/$OUT/bmc_cli" "$REPO/asm/daemon/bmc_cli"
     # the txo-spender index base builder (x86: asm/Makefile daemon/build_txospender_index)
     if [ -x "$AB/$OUT/build_txospender_index" ]; then
         ln -sf "$AB/$OUT/build_txospender_index" "$REPO/asm/daemon/build_txospender_index"
