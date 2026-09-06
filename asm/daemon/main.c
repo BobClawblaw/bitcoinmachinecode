@@ -43,6 +43,8 @@
 #include "peer_timeout.h"      /* CC-7: -peertimeout, the handshake deadline */
 #include "txann.h"             /* CC-1: tx announcement to and from inbound peers */
 #include "inbound_evict.h"     /* CC-3: Core AttemptToEvictConnection */
+#include "anchors.h"           /* CC-4: block-relay-only legs + anchors.dat */
+#include "hdr_lowwork.h"       /* CC-5: hold low-work header pages until the chain proves its work */
 /* VAL-5 / MEM-1: the generated per-height script-flag mask
  * (bitcoin_script_flags.asm, from validation/gen_script_flags.py). */
 extern unsigned long long script_flags_for_block(unsigned long long height,
@@ -1041,6 +1043,7 @@ static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
 /* per-leg BIP155 verdict from the handshake: 1 = the peer sent sendaddrv2,
  * so it gets addrv2-encoded self-announcements (daemon/addr_self.c) */
 static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
+static unsigned char mux_out_kind[MUX_MAX_OUT];         /* CC-4: LEG_FULL / LEG_BLOCK_ONLY */
 /* each leg's BMC_NET_*, derived from its host string. We announce ONE
  * address -- this node's clearnet IPv4 -- and telling an onion or i2p peer
  * that address links the two, which is exactly what running over those
@@ -1800,7 +1803,7 @@ static int peer_advertises_v2(const char* host, int out_port){
     return yes;
 }
 
-static int outbound_connect(const char* host, int rcv_ms, int out_port){
+static int outbound_connect_raw(const char* host, int rcv_ms, int out_port){
     g_dial_fail[0] = 0;
     /* ---- any BIP155 network (2026-08-28) ----------------------------------
      * A host that parses as a Tor/I2P/CJDNS/IPv6 address goes to its
@@ -2013,6 +2016,29 @@ static int outbound_connect(const char* host, int rcv_ms, int out_port){
  *
  * Refusing to start is the right failure. Continuing would interleave two
  * chains' blocks in one file, which no later check could untangle. */
+/* CC-4: the hosts we hold (or intend) as block-relay-only legs. Core keeps 2
+ * such connections: fRelay=0 in our version, no transaction announcements,
+ * addr gossip ignored -- an attacker who owns every full-relay peer still
+ * cannot hide a block from us. On shutdown they are written to anchors.dat
+ * (Core's format) and dialled first on the next start. */
+static char g_bo_hosts[MAX_BLOCK_RELAY_ONLY][128];
+static int  g_bo_n = 0;
+static int host_is_block_only(const char* host){
+    for(int i = 0; i < g_bo_n; i++) if(!strcmp(g_bo_hosts[i], host)) return 1;
+    return 0;
+}
+static int bo_want(void){ return g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY; }
+static void bo_add(const char* host){ if(g_bo_n < MAX_BLOCK_RELAY_ONLY && !host_is_block_only(host)) snprintf(g_bo_hosts[g_bo_n++], sizeof g_bo_hosts[0], "%s", host); }
+static int legs_block_only(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && mux_out_kind[k] == LEG_BLOCK_ONLY) n++; return n; }
+/* every outbound dial funnels through here: a block-only host gets fRelay=0
+ * in the version we send (the byte is per-connection already; see feelers) */
+static int outbound_connect(const char* host, int rcv_ms, int out_port){
+    unsigned char saved = node_relay_flag;
+    if(host_is_block_only(host)) node_relay_flag = 0;
+    int fd = outbound_connect_raw(host, rcv_ms, out_port);
+    node_relay_flag = saved;
+    return fd;
+}
 static int chain_archive_matches(void* store_buf){
     int  fd  = *(int*)((char*)store_buf + 8);    /* idx_fd  */
     long len = *(long*)((char*)store_buf + 16);  /* idx_len */
@@ -2584,6 +2610,7 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
     g_peer_wants_addrv2 = r->wants_addrv2;
     snprintf(mux_out_host[mux_n_out], sizeof mux_out_host[mux_n_out], "%s", host);
     mux_out_fd[mux_n_out] = fd;
+    mux_out_kind[mux_n_out] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */
     mux_out_wants_v2[mux_n_out] = r->wants_addrv2;
     mux_out_peer[mux_n_out] = 0;
     anchor_locator(mux_out_loc[mux_n_out]);
@@ -3335,8 +3362,82 @@ static unsigned long dlc_varint(const unsigned char* p, unsigned long avail, uns
     if(p[0] == 0xfd){ if(avail < 3){ *used = 0; return 0; } *used = 3; return (unsigned long)p[1] | ((unsigned long)p[2] << 8); }
     *used = 0; return 0;                       /* a headers count never needs more */
 }
+/* CC-5: one page of headers, validated and appended exactly as before --
+ * linkage, overlap-must-match, PoW, the VAL-5 contextual rules -- factored
+ * out so a page HELD below -minimumchainwork can be taken later, in order.
+ * Returns the number of headers consumed (< cnt stops the peer's pages), or
+ * -1 after rolling the store back to have0. */
+static long dlc_take_page(void* hst, const unsigned char* first, unsigned long cnt, long pos,
+                          unsigned char prev[32], const char* cand, long have0, long* added){
+long have = hst_count(hst);
+unsigned long i = 0;
+for(; i < cnt; i++){
+        const unsigned char* h = first + i * 81;
+        if(h[80] != 0) break;                 /* txn_count must be 0 in a headers message */
+        if(memcmp(h + 4, prev, 32) != 0){
+            fprintf(stderr,"[dlc] headers from %s break their own chain at %lu -- discarding\n", cand, i);
+            dlc_headers_rollback(hst, have0); return -1;
+        }
+        unsigned char bh[32]; block_hash(bh, h);
+        if(pos + (long)i < have){
+            /* overlap with what we hold: must be the same block */
+            unsigned char rec[112];
+            if(hst_get_at(hst, (unsigned long long)(pos + (long)i), rec) != 1 || memcmp(rec + 80, bh, 32) != 0){
+                fprintf(stderr,"[dlc] headers from %s fork from our chain at height %ld -- discarding\n", cand, pos + (long)i);
+                dlc_headers_rollback(hst, have0); return -1;
+            }
+        } else {
+            /* VAL-5 (audit 2026-09-03): this used to append whatever a
+             * peer sent after only checking linkage -- no pow_check at
+             * all, so up to 2,000 x 1,000 headers of garbage from the
+             * first live peer landed in headers.dat by height, and the
+             * block downloader then requested blocks for hashes nothing
+             * ever revalidates. Core validates CheckProofOfWork on every
+             * header before storing. The nBits range/PoW check runs
+             * BEFORE hst_append (pow_check carries the VAL-11 nBits
+             * range gates + the armed chain powLimit), and VAL-5's
+             * remaining rules -- ContextualCheckBlockHeader's timestamp
+             * floor, its 2-hour ceiling and the legacy-version rules --
+             * run right after it, from daemon/hdrrules.h. */
+            if(!pow_check(h)){
+                fprintf(stderr,"[dlc] header at height %ld from %s fails its own PoW -- discarding the page\n",
+                        pos + (long)i, cand);
+                dlc_headers_rollback(hst, have0); return -1;
+            }
+            /* ---- VAL-5: the non-PoW header rules -------------------
+             * The timestamp FLOOR needs the parent's median-time-past.
+             * At the very start of a fetch the parent is whatever the
+             * store already holds; within a page it is the window this
+             * loop has just appended. hst_median_time_past reads the
+             * store, so it is only consulted for a height whose 11
+             * ancestors are already there -- otherwise the floor is
+             * skipped for that header rather than evaluated against a
+             * window that does not exist. The ceiling and the version
+             * rules need no ancestors and always run. */
+            { long hh = pos + (long)i;
+              const char* why = "?";
+              unsigned long pmtp = 0;
+              if (hh >= 11) (void)hst_median_time_past(hst, hh - 1, &pmtp);
+              unsigned long long hflags =
+                  script_flags_for_block((unsigned long long)hh, bh);
+              if(!hdr_contextual_ok(hh, h, pmtp, (long)time(NULL),
+                                    hflags, dlc_bip34_height(), &why)){
+                  fprintf(stderr,"[dlc] header at height %ld from %s rejected: %s -- discarding the page\n",
+                          hh, cand, why);
+                  dlc_headers_rollback(hst, have0); return -1;
+              } }
+            if(hst_append(hst, h, bh) < 0){ dlc_headers_rollback(hst, have0); return -1; }
+            (*added)++;
+        }
+        memcpy(prev, bh, 32);
+    }
+    return (long)i;
+}
+static lowwork_t g_lw;                                   /* CC-5 hold: 648 KB, one per process */
+static int dlc_lw_get_at(void* hst, unsigned long long h, void* out){ return hst_get_at(hst, h, out); }
+extern int reorg_min_chain_work_set(void);
 static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
-    long have0 = hst_count(hst), added = 0;
+    long have0 = hst_count(hst), added = 0; int lw_started = 0; lowwork_clear(&g_lw);
     static unsigned char page[DLC_HDR_PAGE * 81 + 16];
     static unsigned char msg[2 << 20];
     unsigned char stop[32]; memset(stop, 0, 32);
@@ -3344,6 +3445,12 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
         unsigned char loc[DLC_HDR_LOCATOR_MAX * 32]; long lh[DLC_HDR_LOCATOR_MAX];
         int nl = dlc_locator_build(hst, loc, lh);
         if(nl <= 0) return -1;
+        { unsigned char th[32]; long tht;                        /* CC-5: ask onward from the held tail */
+          if(lowwork_tail(&g_lw, th, &tht)){
+              if(nl >= DLC_HDR_LOCATOR_MAX) nl = DLC_HDR_LOCATOR_MAX - 1;
+              memmove(loc + 32, loc, (size_t)nl * 32); memmove(lh + 1, lh, (size_t)nl * sizeof lh[0]);
+              memcpy(loc, th, 32); lh[0] = tht; nl++;
+          } }
         long plen = p2p_getheaders(page, loc, nl, stop);
         if(plen <= 0 || p2p_write(fd, "getheaders", 10, page, (unsigned)plen) < 0) return -1;
         /* the reply: skip anything else the peer says first (inv, ping, ...) */
@@ -3371,69 +3478,47 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
             fprintf(stderr,"[dlc] headers from %s attach at height %ld while we hold %ld -- a fork deeper than %ld is not a continuation; discarding\n", cand, pos, have0, DLC_HDR_SANE_MAX);
             dlc_headers_rollback(hst, have0); return -1;
         }
-        long have = hst_count(hst);
         unsigned char prev[32]; memcpy(prev, loc + at * 32, 32);
-        unsigned long i = 0;
-        for(; i < cnt; i++){
-            const unsigned char* h = first + i * 81;
-            if(h[80] != 0) break;                 /* txn_count must be 0 in a headers message */
-            if(memcmp(h + 4, prev, 32) != 0){
-                fprintf(stderr,"[dlc] headers from %s break their own chain at %lu -- discarding\n", cand, i);
-                dlc_headers_rollback(hst, have0); return -1;
-            }
-            unsigned char bh[32]; block_hash(bh, h);
-            if(pos + (long)i < have){
-                /* overlap with what we hold: must be the same block */
-                unsigned char rec[112];
-                if(hst_get_at(hst, (unsigned long long)(pos + (long)i), rec) != 1 || memcmp(rec + 80, bh, 32) != 0){
-                    fprintf(stderr,"[dlc] headers from %s fork from our chain at height %ld -- discarding\n", cand, pos + (long)i);
-                    dlc_headers_rollback(hst, have0); return -1;
-                }
-            } else {
-                /* VAL-5 (audit 2026-09-03): this used to append whatever a
-                 * peer sent after only checking linkage -- no pow_check at
-                 * all, so up to 2,000 x 1,000 headers of garbage from the
-                 * first live peer landed in headers.dat by height, and the
-                 * block downloader then requested blocks for hashes nothing
-                 * ever revalidates. Core validates CheckProofOfWork on every
-                 * header before storing. The nBits range/PoW check runs
-                 * BEFORE hst_append (pow_check carries the VAL-11 nBits
-                 * range gates + the armed chain powLimit), and VAL-5's
-                 * remaining rules -- ContextualCheckBlockHeader's timestamp
-                 * floor, its 2-hour ceiling and the legacy-version rules --
-                 * run right after it, from daemon/hdrrules.h. */
-                if(!pow_check(h)){
-                    fprintf(stderr,"[dlc] header at height %ld from %s fails its own PoW -- discarding the page\n",
-                            pos + (long)i, cand);
-                    dlc_headers_rollback(hst, have0); return -1;
-                }
-                /* ---- VAL-5: the non-PoW header rules -------------------
-                 * The timestamp FLOOR needs the parent's median-time-past.
-                 * At the very start of a fetch the parent is whatever the
-                 * store already holds; within a page it is the window this
-                 * loop has just appended. hst_median_time_past reads the
-                 * store, so it is only consulted for a height whose 11
-                 * ancestors are already there -- otherwise the floor is
-                 * skipped for that header rather than evaluated against a
-                 * window that does not exist. The ceiling and the version
-                 * rules need no ancestors and always run. */
-                { long hh = pos + (long)i;
-                  const char* why = "?";
-                  unsigned long pmtp = 0;
-                  if (hh >= 11) (void)hst_median_time_past(hst, hh - 1, &pmtp);
-                  unsigned long long hflags =
-                      script_flags_for_block((unsigned long long)hh, bh);
-                  if(!hdr_contextual_ok(hh, h, pmtp, (long)time(NULL),
-                                        hflags, dlc_bip34_height(), &why)){
-                      fprintf(stderr,"[dlc] header at height %ld from %s rejected: %s -- discarding the page\n",
-                              hh, cand, why);
-                      dlc_headers_rollback(hst, have0); return -1;
-                  } }
-                if(hst_append(hst, h, bh) < 0){ dlc_headers_rollback(hst, have0); return -1; }
-                added++;
-            }
-            memcpy(prev, bh, 32);
-        }
+        /* ---- CC-5: is this chain worth storing yet? ------------------------
+         * Core (24.0 presync) stores nothing from a peer until the chain's
+         * total work clears -minimumchainwork; this node appended every
+         * PoW-valid header regardless, so a peer could fill headers.dat with
+         * an arbitrarily long valid-PoW low-work chain. Full pages below the
+         * floor are HELD (linkage + PoW checked, nothing stored) and released
+         * in order once the chain crosses it; a chain that stays below for
+         * LOWWORK_HOLD_PAGES full pages is abandoned. */
+        if(!lw_started){ unsigned char cum[16]; lowwork_cum_from_store(cum, hst, pos - 1, dlc_lw_get_at); lowwork_begin(&g_lw, cum, reorg_min_chain_work_set()); lw_started = 1; }
+        { unsigned char lasth[32]; block_hash(lasth, first + (cnt - 1) * 81);
+          int lwv = lowwork_page(&g_lw, first, cnt, pos, prev, lasth);
+          if(lwv == LOWWORK_ABANDON){
+              fprintf(stderr,"[dlc] headers from %s: %d full pages and still below -minimumchainwork -- abandoning this chain (nothing was stored)\n", cand, LOWWORK_HOLD_PAGES);
+              lowwork_clear(&g_lw); dlc_headers_rollback(hst, have0); return -1;
+          }
+          if(lwv == LOWWORK_HOLD){
+              for(unsigned long j = 0; j < cnt; j++){
+                  const unsigned char* h = first + j * 81;
+                  if(h[80] != 0 || memcmp(h + 4, prev, 32) != 0 || !pow_check(h)){
+                      fprintf(stderr,"[dlc] held page from %s fails linkage or PoW at %lu -- discarding\n", cand, j);
+                      lowwork_clear(&g_lw); dlc_headers_rollback(hst, have0); return -1;
+                  }
+                  block_hash(prev, h);
+              }
+              if(g_lw.held == 1) fprintf(stderr,"[dlc] headers from %s are below -minimumchainwork so far -- holding %lu, storing none until the chain proves its work\n", cand, cnt);
+              continue;
+          }
+          if(lwv == LOWWORK_RELEASE){
+              fprintf(stderr,"[dlc] chain from %s crossed -minimumchainwork -- storing %d held page(s)\n", cand, g_lw.held);
+              for(int j = 0; j < g_lw.held; j++){
+                  const unsigned char* hp; unsigned long hc; long hpos; const unsigned char* hprev; unsigned char pv[32];
+                  lowwork_held(&g_lw, j, &hp, &hc, &hpos, &hprev); memcpy(pv, hprev, 32);
+                  if(dlc_take_page(hst, hp, hc, hpos, pv, cand, have0, &added) < 0){ lowwork_clear(&g_lw); return -1; }
+              }
+              lowwork_clear(&g_lw);
+          } }
+        unsigned long i;
+        { long took = dlc_take_page(hst, first, cnt, pos, prev, cand, have0, &added);
+          if(took < 0) return -1;
+          i = (unsigned long)took; }
         if(i < cnt) break;                        /* a non-empty txn_count: stop taking this peer's pages */
         if(cnt < DLC_HDR_PAGE) break;             /* a short page is the peer's tip */
     }
@@ -5001,6 +5086,17 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     } else {
         for(int i=0;i<npool && nsrc<64;i++) srcpool[nsrc++]=dle[i];
     }
+    /* CC-4: Core anchors.dat -- the block-relay-only peers of the last run are
+     * dialled first, as block-only again; the file is deleted on read. */
+    { char anc[MAX_BLOCK_RELAY_ONLY][128]; long na = anchors_read("anchors.dat", anc, MAX_BLOCK_RELAY_ONLY, g_chainp->magic);
+      if(na > 0){
+          for(long i = na - 1; i >= 0; i--){
+              if(nsrc >= 64) break;
+              for(int k = nsrc; k > 0; k--) srcpool[k] = srcpool[k-1];
+              bo_add(anc[i]); srcpool[0] = g_bo_hosts[g_bo_n - 1]; nsrc++;
+          }
+          fprintf(stderr, "[dial] anchors.dat: %ld block-relay-only peer(s) from the last run dialled first\n", na);
+      } else if(na < 0) fprintf(stderr, "[dial] anchors.dat: unreadable -- ignored and removed\n"); }
     if(nsrc==0){
         /* Discovery found nothing: DEGRADED fallback so the node still syncs.
          * Normally the seeds are bootstrap-only; this is only an emergency.
@@ -5139,7 +5235,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
             struct timeval t2; t2.tv_sec=3; t2.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
             strncpy(mux_out_host[mux_n_out], srcpool[i], 127);
-            mux_out_fd[mux_n_out]=cfd[i];
+            mux_out_fd[mux_n_out]=cfd[i]; mux_out_kind[mux_n_out] = host_is_block_only(srcpool[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */
             mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
             mux_out_peer[mux_n_out]=i;
             anchor_locator(mux_out_loc[mux_n_out]);
@@ -5767,7 +5863,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             apply_first_prev = apply_first;
         }
         for(int i=0;i<mux_n_out;i++){
-            if(g_shutdown_requested) break;   /* don't wait for a full rotation through every leg */
+            if(g_shutdown_requested){
+                /* CC-4: remember the live block-relay-only legs for the next start */
+                const char* bo[MAX_BLOCK_RELAY_ONLY]; int nb = 0;
+                for(int k = 0; k < mux_n_out && nb < MAX_BLOCK_RELAY_ONLY; k++) if(mux_out_fd[k] >= 0 && mux_out_kind[k] == LEG_BLOCK_ONLY) bo[nb++] = mux_out_host[k];
+                if(nb > 0){ long w = anchors_write("anchors.dat", bo, nb, g_chainp->magic, 0x409ULL, (unsigned)time(NULL)); fprintf(stderr, "[dial] anchors.dat: %ld block-relay-only peer(s) saved\n", w); }
+                break;   /* don't wait for a full rotation through every leg */
+            }
             if(mux_out_fd[i]<0){
                 /* dead slot: re-dial (rate-limited), same logic as serve_mux */
                 if(now_ms>=mux_out_nextretry[i]){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS; }
@@ -5807,7 +5909,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * the inbound path uses, into the SHARED pool so the parent's
              * mempool RPCs see them. Cost when nothing is buffered: one
              * empty poll(2). */
-            if(mux_out_fd[i]>=0 && txsub_worker_ready()){
+            if(mux_out_fd[i]>=0 && mux_out_kind[i] != LEG_BLOCK_ONLY && txsub_worker_ready()){   /* CC-4: block-only legs neither relay nor take addr */
                 extern long txrelay_poll_leg(int fd, void* mp, int max_ms);
                 long acc = txrelay_poll_leg(mux_out_fd[i], txsub_pool(), 250);
                 if(acc == -2){
@@ -5938,7 +6040,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * queued by tx_relay.c and are skipped by the drain). */
             { extern void txrelay_announce_own(const unsigned char txid[32]);
               txann_worker_drain(txrelay_announce_own); }
-            txrelay_announce(mux_out_fd, mux_n_out);
+            { int rfds[MUX_MAX_OUT]; legs_relay_fds(mux_out_fd, mux_out_kind, mux_n_out, rfds);   /* CC-4 */
+              txrelay_announce(rfds, mux_n_out); }
         }
         { extern long addrself_maybe_announce_nets(const int*, const unsigned char*, const unsigned char*, int);
           for(int k=0;k<mux_n_out && k<MUX_MAX_OUT;k++){
@@ -6245,6 +6348,22 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         /* reserved slots: at least ONE leg per reachable anonymity network,
          * dialled in the background, on top of the clearnet legs (Core keeps
          * an extra network-specific outbound for the same reason) */
+        /* CC-4: keep bo_want() block-relay-only legs on clearnet, dialled in the
+         * background like the anonymity-network reserved legs below. The host is
+         * registered as block-only BEFORE the dial so the version carries fRelay=0. */
+        if((rot % 8)==0 && legs_block_only() < bo_want() && mux_n_out < MUX_MAX_OUT && dh_inflight_count() < DH_MAX){
+            for(int ci = 0; ci < nsrc; ci++){
+                int net = leg_net_of(srcpool[ci]);
+                if(net != BMC_NET_IPV4 && net != BMC_NET_IPV6) continue;
+                int already = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], srcpool[ci])){ already = 1; break; }
+                if(already || host_is_block_only(srcpool[ci])) continue;
+                { char ip[128]; ctl_ip_only(srcpool[ci], ip, sizeof ip); if(ctl_is_banned(ip)) continue; }
+                bo_add(srcpool[ci]);
+                fprintf(stderr, "[dial] %s: dialing as block-relay-only (%d of %d)\n", srcpool[ci], legs_block_only() + 1, bo_want());
+                dh_start(srcpool[ci], out_port);
+                break;
+            }
+        }
         if((rot % 8)==0 && g_node_status && g_node_status->net_active && mux_n_out < MUX_WANT_OUT() + 2 && mux_n_out < MUX_MAX_OUT){
             static const int anon_nets[2] = { BMC_NET_TORV3, BMC_NET_I2P };
             for(int an = 0; an < 2 && dh_inflight_count() < DH_MAX; an++){
@@ -6263,7 +6382,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         int stale_extra = tx_accept_stale_tip_extra((long)time(NULL));
         { static int prev_stale = 0;
           if(stale_extra != prev_stale){ fprintf(stderr, "[dial] tip %s: wanting %d outbound\n", stale_extra ? "stale for 30 min (no block seen)" : "fresh again", MUX_WANT_OUT() + stale_extra); prev_stale = stale_extra; } }
-        if(mux_n_out - legs_anon() < MUX_WANT_OUT() + stale_extra && (rot % 8)==0){
+        if(mux_n_out - legs_anon() - legs_block_only() < MUX_WANT_OUT() + stale_extra && (rot % 8)==0){
             /* ONE summary line per pass, not one per candidate: this loop walks
              * the whole live pool (up to nsrc) when nothing connects, so a
              * per-candidate log would flood exactly when the node is sickest. */
@@ -6275,7 +6394,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * (2026-09-01 01:34) and tripped the deploy guard; the next pass
              * (8 rotations later) fills the next slot. */
             int topup_filled = 0;
-            for(int ci=0; ci<nsrc && mux_n_out - legs_anon() < MUX_WANT_OUT() + stale_extra && mux_n_out<MUX_MAX_OUT; ci++){
+            for(int ci=0; ci<nsrc && mux_n_out - legs_anon() - legs_block_only() < MUX_WANT_OUT() + stale_extra && mux_n_out<MUX_MAX_OUT; ci++){
                 if(topup_filled >= 1 || topup_fail >= 4) break;
                 if(leg_is_anon_net(leg_net_of(srcpool[ci]))) continue;   /* the helper owns those */
                 int already=0;
@@ -6284,7 +6403,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 int nfd=outbound_connect(srcpool[ci], 300, out_port);
                 if(nfd>=0){
                     strncpy(mux_out_host[mux_n_out], srcpool[ci], 127);
-                    mux_out_fd[mux_n_out]=nfd; txrelay_leg_reset(nfd);
+                    mux_out_fd[mux_n_out]=nfd; txrelay_leg_reset(nfd); mux_out_kind[mux_n_out] = host_is_block_only(srcpool[ci]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */
                     mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
                     mux_out_peer[mux_n_out]=ci;
                     anchor_locator(mux_out_loc[mux_n_out]);
@@ -6942,7 +7061,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         int fd=outbound_connect(peers[i], 300, out_port);
         if(fd<0){ fprintf(stderr,"[mux] outbound %s failed: %s\n", peers[i], dial_fail_reason()); continue; }
         strncpy(mux_out_host[mux_n_out], peers[i], 127);
-        mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd);
+        mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd); mux_out_kind[mux_n_out] = host_is_block_only(peers[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */
         mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
         mux_out_peer[mux_n_out]=i;
         anchor_locator(mux_out_loc[mux_n_out]);

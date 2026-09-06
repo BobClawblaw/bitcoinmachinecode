@@ -80,8 +80,8 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | Behavior | Core | This node | Status |
 |---|---|---|---|
 | Outbound full-relay legs | 8 | configurable, default 8 (`MUX_WANT_OUT`) | **DONE** |
-| **Block-relay-only outbound** | 2 extra legs that never relay tx/addr; eclipse resistance | **absent** as legs; the count is plumbed (`bmc.blockrelayonly`, default 2, `MAX_BLOCK_RELAY_ONLY` ceiling) and only subtracted from the inbound budget | **GAP** |
-| **`anchors.dat`** | reconnect to last block-relay-only peers on restart | **absent** | **GAP** (pairs with the row above) |
+| Block-relay-only outbound | 2 extra legs that never relay tx/addr; eclipse resistance | same: `bmc.blockrelayonly` legs (default 2) dialled with fRelay=0, excluded from tx announce/poll and addr ingest (`anchors.c`, CC-4, `fc358ec`) | **DONE** |
+| `anchors.dat` | reconnect to last block-relay-only peers on restart | same, Core's file format byte for byte, deleted on read (CC-4) | **DONE** |
 | Feeler connections | 1 short-lived every ~2 min, tests a book entry | same (`net_policy.c`) | **DONE** |
 | Extra outbound when tip is stale | +1 full-relay peer if no block in >30 min | same (`stale_tip.c`, CC-6, `c6598b5`) | **DONE** |
 | Netgroup diversity in outbound selection | one per /16 (asmap) | same, asmap supported | **DONE** |
@@ -110,7 +110,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 |---|---|---|---|
 | Headers-first sync, PoW checked per header, contextual rules | | same; boot header fetch PoW-gates before append (VAL-5) | **DONE** |
 | Minimum chain work at fork evaluation | never reorg to a chain below `nMinimumChainWork` | same (`minchainwork.c`, `reorg.c:708`, floor per chain) | **DONE** |
-| **Low-work headers sync / presync** | do not store a headers chain until it crosses the floor (24.0 presync) | **absent**: the boot fetch appends every PoW-valid header (`main.c:3315`) | **GAP** |
+| Low-work headers sync / presync | do not store a headers chain until it crosses the floor (24.0 presync) | bounded HOLD: full pages below the floor are held (linkage+PoW only), released when the chain crosses it, abandoned after 4 (`hdr_lowwork.c`, CC-5, `799fba3`); Core's bit-commitment presync not replicated | **DONE** (stage 1) |
 | Checkpoints | still present for the early chain | present | **DONE** |
 | Stale-tip detection | warn + extra outbound | same (CC-6) | **DONE** |
 | Time offset | v28+ no longer adjusts; warns on large peer skew | no adjustment | **DONE** (parity by absence; warning: verify) |
@@ -182,8 +182,6 @@ by size. Each carries the test that would prove it.
 | # | Item | Why it is first | Size | Scope |
 |---|---|---|---|---|
 | 2 | **BIP152 compact block receive** (§3) | Every block fetched in full; a Core peer's pushed `cmpctblock` is dropped then refetched | medium-large | CC-2 |
-| 4 | **Block-relay-only outbound + `anchors.dat`** (§4) | Eclipse resistance | medium | CC-4 |
-| 5 | **Low-work headers sync** (§5) | A peer can make the boot fetch store an arbitrarily long valid-PoW low-work chain; the floor is only checked at reorg | medium | CC-5 |
 | 8 | **Full-verification replay** (`assumevalid=0`, §1) | The proof; launch first, it runs unattended | wall-clock | CC-8 |
 | 9 | **BIP331 package relay wire** (§3) | Conditional on Core's default | medium | CC-9 |
 | 10 | `invalidateblock`/`reconsiderblock`, MuSig2 leaf signing, BIP389 derivation, knapsack/SRD | Completeness | small–medium each | CC-10 |

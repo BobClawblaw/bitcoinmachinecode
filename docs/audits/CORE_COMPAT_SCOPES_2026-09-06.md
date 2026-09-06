@@ -232,6 +232,8 @@ Adding fields to the shared struct is safe for the reason given in CC-1.
 
 ## CC-4 — Block-relay-only outbound + `anchors.dat`
 
+**Status: CLOSED (`fc358ec`).** As designed; `test_anchors` gated (12 checks), negative control = every leg full-relay.
+
 **Core.** 8 full-relay outbound plus 2 block-relay-only connections that
 send `fRelay=0`, ignore `addr`, and never announce transactions — an
 attacker who controls all 8 full-relay peers still cannot eclipse the block
@@ -277,6 +279,8 @@ anon nets and block-only legs must not double-count toward the want.
 ---
 
 ## CC-5 — Headers sync anti-DoS (presync / low-work headers)
+
+**Status: CLOSED, stage 1 (`799fba3`).** The bounded HOLD as designed; `test_hdr_lowwork` gated (12 checks), negative control = the gate disarmed. Stage 2 (Core's bit commitments) deliberately not done: stage 1 bounds the attack at 648 KB of scratch.
 
 **Core.** Since 24.0, headers from a peer are not stored until the chain
 they form exceeds `nMinimumChainWork`; during that "presync" phase only a
