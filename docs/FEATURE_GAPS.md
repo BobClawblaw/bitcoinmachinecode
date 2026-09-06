@@ -1118,11 +1118,10 @@ Confirmed absent:
   dials it, and Core reports the peer as `"network": "cjdns"` with a
   completed handshake; without `-cjdnsreachable` the peer is refused, as in
   Core. **All five BIP155 networks are now storable, relayable and
-  dialable.** Remaining, and stated: no inbound onion service of our own
-  (`-listenonion` parses but this node does not yet ADD_ONION for itself --
-  `daemon/torcontrol.c` exists and is tested, it is not yet called at boot),
-  and I2P inbound (`STREAM ACCEPT`) is implemented but not yet wired to the
-  serve loop.
+  dialable.** ~~Remaining, and stated: no inbound onion service of our own ... and I2P
+  inbound is implemented but not yet wired to the serve loop.~~ **Both wired
+  since: `tor_onion_listener(port)` and `i2p_inbound_start()` are passed to
+  `serve_mux` at boot (`main.c:8271`, `8296`). Verified 2026-09-06.**
 - ~~**ZMQ notification interface**~~ — **REAL since 2026-08-26**:
   `hashblock`/`hashtx`/`rawblock`/`rawtx` publish over a hand-written ZMTP
   3.1 PUB socket (`daemon/zmq_notify.c`, `daemon/zmq_pub.c`), with

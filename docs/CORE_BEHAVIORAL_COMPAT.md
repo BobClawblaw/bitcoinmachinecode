@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06. **Reference:** Bitcoin Core v30/v31 default behavior.
 **Method:** every row below was checked against `asm/` source or the gate
-this morning, not copied from `FEATURE_GAPS.md` — where the two disagree,
+on 2026-09-06 (and re-checked while scoping the same day — five rows changed), not copied from `FEATURE_GAPS.md` — where the two disagree,
 this file says so and `FEATURE_GAPS.md` is corrected in the same commit.
 
 **Status vocabulary**
@@ -86,8 +86,8 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | **Extra outbound when tip is stale** | +1 full-relay peer if no block in >30 min | **absent** | **GAP** |
 | Netgroup diversity in outbound selection | one per /16 (asmap) | same, asmap supported | **DONE** |
 | Tor / I2P / CJDNS outbound, `-onlynet`, stream isolation | | same; proven against Core over real tor, i2p, cjdroute | **DONE** |
-| **Inbound onion service** (`-listenonion`) | ADD_ONION at boot | parses; `torcontrol.c` exists and is tested; **not called at boot** | **PARTIAL** |
-| **Inbound I2P** (`i2pacceptincoming`) | SAM `STREAM ACCEPT` | implemented; **not wired to the serve loop** | **PARTIAL** |
+| Inbound onion service (`-listenonion`) | ADD_ONION at boot | same: `tor_onion_listener(port)` runs at boot (`main.c:8271`, `8296`); the 08-28 note in `FEATURE_GAPS.md` was stale | **DONE** |
+| Inbound I2P (`i2pacceptincoming`) | SAM `STREAM ACCEPT` | same: `i2p_inbound_start()` at boot, accept thread hands fds to the serve path | **DONE** |
 | Inbound slot limit, `-maxconnections`, per-connection permissions (`-whitelist`/`-whitebind`) | | same | **DONE** |
 | **Inbound eviction when full** (`AttemptToEvictConnection`) | protect by netgroup, ping, last block, last tx; evict the worst | **absent**: a 20-minute inactivity bound only (NET-3 residual). Under pressure, slots are held by whoever arrived first | **GAP** |
 | `-peertimeout` (connect timeout) | default 60 s | **not implemented** (DMN-14) — the timeout that exists is a different one | **GAP** (small) |
@@ -109,7 +109,8 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | Behavior | Core | This node | Status |
 |---|---|---|---|
 | Headers-first sync, PoW checked per header, contextual rules | | same; boot header fetch PoW-gates before append (VAL-5) | **DONE** |
-| **Minimum chain work / headers presync** | refuse to commit memory to a low-work headers chain (`nMinimumChainWork`, 2022 presync with commitments) | **absent** (0 hits) | **GAP** |
+| Minimum chain work at fork evaluation | never reorg to a chain below `nMinimumChainWork` | same (`minchainwork.c`, `reorg.c:708`, floor per chain) | **DONE** |
+| **Low-work headers sync / presync** | do not store a headers chain until it crosses the floor (24.0 presync) | **absent**: the boot fetch appends every PoW-valid header (`main.c:3315`) | **GAP** |
 | Checkpoints | still present for the early chain | present | **DONE** |
 | Stale-tip detection | warn + extra outbound | no extra outbound (row in §4) | **GAP** (same item) |
 | Time offset | v28+ no longer adjusts; warns on large peer skew | no adjustment | **DONE** (parity by absence; warning: verify) |
@@ -122,7 +123,6 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | `txindex`, `blockfilterindex`, `txospenderindex`, address index | | same (address index is an extension) | **DONE** |
 | `coinstatsindex` at **any height** | one record per block | **tip only** (CSI-2); historical `gettxoutsetinfo muhash <h>` needs the oracle | **DECIDED** (`BENCH_DEFECT_LEDGER_2026-09-04.md`) |
 | RPC surface (~157 methods), cookie auth, `rpcauth`, `rpcwhitelist`, loopback default | | same, verified per method in `PARITY_PLAN.md` | **DONE** |
-| `getaddressinfo` wallet-context fields | | stubs for some | **PARTIAL** (`FEATURE_GAPS.md` bugs list) |
 | Long-running RPC concurrency | parallel workers | one execution lock (RPC-12) | **DECIDED** |
 | REST interface | `-rest` | absent | **DECIDED** |
 | ZMQ `hashblock`/`hashtx`/`rawblock`/`rawtx` | | same; `zmqpubsequence` refused (MEM-22) | **DONE** / sequence **DECIDED** |
@@ -136,7 +136,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | Miniscript, MuSig2 key-path, `musig()` descriptors | | same | **DONE** |
 | MuSig2 inside tapscript **leaf** scripts | signed | not signed | **PARTIAL** |
 | BIP389 multipath descriptors, PSBT Updater role, partial signatures | | absent | **GAP** |
-| Coin selection (BnB / knapsack / SRD, waste metric) | | basic | **PARTIAL** |
+| Coin selection (BnB / knapsack / SRD, waste metric) | | BnB (`wallet_bnb.c`); knapsack and SRD absent | **PARTIAL** |
 | Keypool | pre-generated | derives on demand | **DECIDED** |
 | Reorg awareness in the wallet | rescans/updates on disconnect | none (WAL-13) | **DECIDED** |
 | Secrets hygiene (mlock, DONTDUMP) | | same (WAL-3) | **DONE** |
@@ -146,7 +146,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | Behavior | Core | This node | Status |
 |---|---|---|---|
 | `getblocktemplate` (frame, retarget, longpoll), `submitblock` end to end | | same; frame diffed against Core at the same tip | **DONE** |
-| BIP23 proposal mode | | absent | **GAP** (small) |
+| BIP23 proposal mode | | same (`rpc_node_submit_proposal`, hooked `main.c:6431`) | **DONE** |
 | Stratum / pool interface | not in Core either | absent | **DONE** (parity by absence) |
 
 ## 9. Configuration surface
@@ -179,23 +179,25 @@ Config **file resolution** now matches Core: one file, `$BITCOIN_CONF`, else
 Ordering is by consequence to the network and to this node's safety, then
 by size. Each carries the test that would prove it.
 
-| # | Item | Why it is first | Size | Proof |
+| # | Item | Why it is first | Size | Scope |
 |---|---|---|---|---|
-| 1 | **Transaction relay to and from inbound peers** (§4, two rows) | Inbound peers currently receive no tx invs from us and what they send us stops at our outbound legs. A node that takes relay and gives none back is a partial leech; it is also the behavior a peer-quality heuristic (Core's own eviction) would score us down for. | medium: a per-inbound-peer inv queue in the serve loop fed from the shared pool, Poisson-timed, feefilter-honoring; and `txrelay_poll_leg`'s announce fan-out extended to inbound fds | regtest against real Core as an *inbound* peer of ours: it must receive our mempool; and as an inbound peer of Core, a tx we take from a third node must reach Core |
-| 2 | **BIP152 compact block receive** (§3) | Every block is fetched in full today. Core's default propagation is compact; this is bandwidth and latency at every block, and a Core peer in high-bandwidth mode pushes `cmpctblock` unsolicited — which we drop and then fetch in full | medium-large: `sendcmpct` on the download legs, `cmpctblock` handler with short-id reconstruction from the mempool, `getblocktxn`/`blocktxn` round trip, `blockreconstructionextratxn` | regtest: Core mines; we must reconstruct without a full `getdata` when the mempool holds the txs, and fall back correctly when it does not |
-| 3 | **Inbound eviction** (`AttemptToEvictConnection`, §4) | Under slot pressure the node keeps whoever arrived first; Core keeps whoever is useful and diverse. This is the residual of a HIGH (NET-3) | medium: the protection rounds (netgroup, ping, last block, last tx, longest-connected) over the shared peer table, then evict | unit: a synthetic full table; the eviction victim matches Core's rule set on 20 fixtures |
-| 4 | **Block-relay-only outbound + `anchors.dat`** (§4) | Eclipse resistance: two legs that never leak tx/addr timing and reconnect first on restart | medium | regtest: the two legs negotiate no tx relay (`fRelay=0`, no `sendaddrv2` acceptance) and are the first redialed |
-| 5 | **Minimum chain work / headers presync** (§5) | Anti-DoS for headers sync; today a low-work headers chain of any length is stored | medium | unit: a 100k-header regtest chain below the threshold is not committed |
-| 6 | **Extra outbound on stale tip** (§4, §5) | Recovery from a partition | small | regtest: partition; +1 leg within the window |
-| 7 | **`-peertimeout`** (DMN-14) | Correctness of an option Core has | small | unit |
-| 8 | **Full-verification replay** (`assumevalid=0`, §1) | The one run that turns "matches Core's trust boundary" into "every script, every block" | wall-clock only; second scratch datadir | MuHash identical to Core at the stop height, and the log has no rejected block |
-| 9 | **Inbound onion service + inbound I2P** (§4) | Two implemented pieces not called at boot / not wired | small each | Core over tor dials *us*; Core over i2p dials us |
-| 10 | **BIP331 package relay wire** (§3) | Completes a half-done feature the summary overstates | medium | regtest: a 1p1c package announced by Core is fetched as a package |
-| 11 | `invalidateblock`/`reconsiderblock`, BIP23 proposal mode, `getaddressinfo` stubs, MuSig2 leaf signing, BIP389, coin selection | Tooling and wallet completeness | small–medium each | per-method oracle diff, as `PARITY_PLAN.md` does |
+| 1 | **Transaction relay to and from inbound peers** (§4, two rows) | Inbound peers receive no tx invs from us and what they send us stops at our outbound legs — a partial leech, and what a peer-quality heuristic would score us down for | medium | CC-1 |
+| 2 | **BIP152 compact block receive** (§3) | Every block fetched in full; a Core peer's pushed `cmpctblock` is dropped then refetched | medium-large | CC-2 |
+| 3 | **Inbound eviction** (`AttemptToEvictConnection`, §4) | Under slot pressure the node keeps whoever arrived first — and, found while scoping, *serves unrecorded* peers past the table's 64 slots | medium | CC-3 |
+| 4 | **Block-relay-only outbound + `anchors.dat`** (§4) | Eclipse resistance | medium | CC-4 |
+| 5 | **Low-work headers sync** (§5) | A peer can make the boot fetch store an arbitrarily long valid-PoW low-work chain; the floor is only checked at reorg | medium | CC-5 |
+| 6 | **Extra outbound on stale tip** (§4, §5) | Partition recovery | small | CC-6 |
+| 7 | **`-peertimeout`** (DMN-14) | Parsed, unread | small | CC-7 |
+| 8 | **Full-verification replay** (`assumevalid=0`, §1) | The proof; launch first, it runs unattended | wall-clock | CC-8 |
+| 9 | **BIP331 package relay wire** (§3) | Conditional on Core's default | medium | CC-9 |
+| 10 | `invalidateblock`/`reconsiderblock`, MuSig2 leaf signing, BIP389 derivation, knapsack/SRD | Completeness | small–medium each | CC-10 |
+
+Every row is scoped in `docs/audits/CORE_COMPAT_SCOPES_2026-09-06.md`.
 
 Items 1–3 are the ones a Core node on the other end of a connection would
 notice. Items 4–6 are what protects *this* node. Item 8 is the proof. The
-rest is completeness.
+rest is completeness. Inbound onion/I2P and BIP23 were on the first draft of
+this list and are not gaps (see the scopes document's corrections).
 
 **Explicitly not on the list, by decision:** Erlay reconciliation, addrman
 test-before-evict, `assumeutxo`, REST, UPnP/NAT-PMP, BIP37 bloom, keypool,
