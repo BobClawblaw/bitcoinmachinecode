@@ -35,6 +35,7 @@
     .extern tapagg_verify_asm
     .extern sv_verify_witness_v0
     .extern sv_verify_script
+    .extern g_txv_script_checks
 
 .set LTV_CAP, (1 << 20)
 .set SHAPE_LEGACY, 0
@@ -178,6 +179,25 @@ txvb_verify_one_asm:
     ldr  x23, [x6, #BP_BUF]
     ldr  x9, [x19, #IN_SPKOFF]
     add  x23, x23, x9
+
+    /* ---- VAL-16 (audit 2026-09-03): the assumevalid short-circuit ----
+     * daemon/tx_verify.c:607 opens the equivalent C function with
+     *     if (!g_txv_script_checks) return 1;
+     * and this twin did not have it. Nothing in production drives this file
+     * today -- tests/test_txv_dispatch_diff is its only caller -- so there
+     * was no behavioural difference to observe. But the whole POINT of a
+     * differential twin is that it answers identically to the original, and
+     * the first differential run with assumevalid ON would have diverged on
+     * every input: the C side returning 1 without evaluating, this side
+     * evaluating. A twin that disagrees with its original under a documented
+     * configuration is worse than no twin, because the diff is trusted. */
+    adrp x9, g_txv_script_checks
+    add  x9, x9, :lo12:g_txv_script_checks
+    ldr  w10, [x9]
+    cbnz w10, .checks_on
+    mov  w0, #1                      /* assumevalid: accept without evaluating */
+    b    .out
+.checks_on:
 
     /* shape dispatch */
     ldrb w9, [x19, #IN_SHAPE]
