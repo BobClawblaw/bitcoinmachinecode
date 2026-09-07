@@ -22,9 +22,16 @@
  * have stored. */
 #ifndef IBD_PIPELINE_H
 #define IBD_PIPELINE_H
-/* Returns the number of blocks stored (== nloc on a clean chunk), or -1 if
- * the peer broke the protocol, sent a block that fails validation, or the
- * socket died. buf/buflen is the caller's block scratch. */
+/* Returns the number of blocks stored (== nloc on a clean chunk), or a
+ * NEGATIVE reason code (below) when the peer broke the protocol, sent a
+ * block that fails validation, the socket died, or the store refused. Every
+ * failure used to be a bare -1, and a worker that failed 400 chunks in 45 s
+ * on the 2026-09-07 run 10 left no line saying why. buf/buflen is the
+ * caller's block scratch. */
+enum { IBD_FAIL_ARGS = -1, IBD_FAIL_HEADERS = -2, IBD_FAIL_WRITE = -3, IBD_FAIL_READ = -4, IBD_FAIL_CONSENSUS = -5,
+       IBD_FAIL_LINK = -6, IBD_FAIL_STORE = -7, IBD_FAIL_HOLD = -8, IBD_FAIL_BUDGET = -9 };
+int ibd_pipeline_last_fail(void);                 /* the last call's reason code (0 = it succeeded) */
+const char* ibd_pipeline_fail_name(int code);     /* a short reason for the log line */
 long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long nloc,
                                unsigned char* buf, unsigned buflen,
                                void* scratch, unsigned scratch_cap);
