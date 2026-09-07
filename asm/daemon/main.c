@@ -3246,9 +3246,19 @@ static void dl_save_good_peers_ema(char (*peers)[DL_POOL_SLOT], const double* em
  * -- this falls back to EXACTLY the old (slot+a)%nlive rotation, so a run
  * with no speed knowledge behaves as today. The caller's loop runs this per
  * attempt and keeps doing CAS claims, so a lost race simply re-asks and the
- * now-claimed top peer drops out of the scan. */
+ * now-claimed top peer drops out of the scan.
+ *
+ * `bar` (2026-09-07): the boundary-rotation bar, half the pool median, or 0
+ * when unknown. Without it, a worker that had just dropped a slow peer at a
+ * chunk boundary got the SAME peer back: every never-tried peer has ema 0,
+ * so the highest-ema rule ranked the known-slow one above all of them, and
+ * a scratch node rotated 269 times among the same 16 addresses in five
+ * minutes with its mean slot rate never moving. With a bar, the order is:
+ * the fastest measured peer AT OR ABOVE the bar; else someone never tried;
+ * else the fastest measured peer even below the bar (never stall); else the
+ * plain rotation. bar 0 is exactly the old rule. */
 static int dlc_pick_peer(int nlive, int slot, const volatile double* ema,
-                         const volatile int* claimed, const volatile int* banned){
+                         const volatile int* claimed, const volatile int* banned, double bar){
     if(ema){
         int best=-1; double bv=0.0;
         for(int a=0;a<nlive;a++){
@@ -3257,7 +3267,15 @@ static int dlc_pick_peer(int nlive, int slot, const volatile double* ema,
             double v=ema[idx];
             if(v>bv){ bv=v; best=idx; }
         }
-        if(best>=0) return best;                    /* someone has speed history */
+        if(best>=0 && (bar<=0.0 || bv>=bar)) return best;   /* someone has speed history, and it clears the bar */
+        if(best>=0){                                          /* the best known is under the bar: prefer someone untried */
+            for(int a=0;a<nlive;a++){
+                int idx=(slot+a)%nlive;
+                if(banned[idx]||claimed[idx]) continue;
+                if(ema[idx]<=0.0) return idx;
+            }
+            return best;                                      /* nobody untried: the best there is, rather than no peer */
+        }
     }
     for(int a=0;a<nlive;a++){                       /* rotation, identical to the pre-EMA loop:
                                                      * banned and claimed both skip */
@@ -4151,7 +4169,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                  * rotation. Losing a CAS race simply re-asks -- the peer the
                  * other worker won is now claimed and drops out of the scan. */
                 for(int q=0;q<nlive && !ok;q++){
-                    int idx=dlc_pick_peer(nlive, slot, ema, claimed, banned);
+                    int idx=dlc_pick_peer(nlive, slot, ema, claimed, banned, mystat->pool_median_bps*DLC_ROTATE_FRACTION);
                     if(idx<0) break;
                     const char* cand=live[idx];
                     int cp2=0; unsigned ip=0; if(!dlc_parse_peer(cand, &ip, &cp2)) continue;
