@@ -418,6 +418,44 @@ serving on port <p> (N outbound peer(s))...
 RPC server is listening, so `getrawmempool` is briefly partial. The onion
 service line appears a few minutes after start.
 
+
+### Reading the parallel catch-up (`[dlc]`) since 2026-09-07
+
+One status line every 10 s:
+
+```
+[dlc] == elapsed 2:32:32 | eta 00:10:31:52 | overall: 442051/965954 stored (45.76% of real tip) | in flight 232 of window 4096 through 442282 (oldest gap 0s at 441270, 99.95% landed) | applied=440754 lag=515 ==
+[dlc] -- this tick: 0 rotation(s), 0 window wait(s), 0 help(s), 0 failed attempt(s), 0 abandon(s) | run: 780/545/64/68/0 --
+```
+
+- `eta` is `DD:HH:MM:SS` at the last ten minutes' block rate; blocks grow
+  toward the tip, so on the tail it reads optimistic. `--:--:--:--` until a
+  rate exists.
+- `in flight N of window W` is the claimed-not-yet-landed set: with 16
+  workers on 40-block chunks a few hundred is normal. It is bounded by the
+  window (4,096 above the first unfilled height); the archive consolidates
+  behind it.
+- `oldest gap Ns at h` is how long height `h` has been the lowest unfilled
+  height. A gap that stays oldest for 60 s prints as `STRANDED: height h
+  has been the oldest gap for Ns` — the one line on this subject that
+  deserves a look.
+- `applied` is the UTXO connect's height; `lag` is how far behind the
+  contiguous prefix it is.
+- The tick line counts the events since the last tick and for the run:
+  rotations (a worker left a peer under half the pool median at a chunk
+  boundary, nothing discarded), window waits (a worker paused rather than
+  claim past the window), helps (an idle worker fetched the blocking chunk),
+  failed attempts (a chunk fetch that failed on a peer; the worker backs
+  off and the peer's standing halves), abandons (a chunk that went to the
+  retry ring after 400 attempts).
+- The 16-line peer table prints once a minute.
+
+Lines that still print one per event, because each one is worth reading:
+`chunk [lo,hi] ABANDONED -> retry ring`, `dead weight (...)` (the parent's
+pool-relative verdict, with the measured rate and the bar), `stalled: no
+block for 120s`, `attempt N failed after M ms: <reason>` (only the third in
+a row on one chunk and every hundredth), and `REJECT h=`.
+
 ## Operating
 
 ### Logs
