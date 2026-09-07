@@ -61,7 +61,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUR_ARCHIVE="${OUR_ARCHIVE:-/storage/bitcoinmachinecode/data}"
 CORE_BLOCKS="${CORE_BLOCKS:-/storage/core-oracle/blocks}"
 CORE_BIN="${CORE_BIN:-/storage/bitcoin-core-source/build/bin/bitcoind}"
-OUR_BIN="${OUR_BIN:-$REPO_ROOT/asm/daemon/bitcoinmcd}"
+OUR_BIN="${OUR_BIN:-$REPO_ROOT/asm/daemon/bmcbitcoind}"
 WORK="${WORK:-/storage/bench-tier3}"
 
 HEIGHT=""
@@ -104,7 +104,7 @@ quiet_check(){
     if [ "$(printf '%.0f' "$load")" -gt 2 ]; then
         say ""
         say "The box is NOT quiet. A tier-3 run taken now measures contention, not code."
-        say "Specifically: the live replay (bmc-bitcoind.service) and any other agents"
+        say "Specifically: the live replay (bmcbitcoind.service) and any other agents"
         say "share this machine's memory bandwidth and page cache no matter which cores"
         say "each side is pinned to, so taskset does not rescue a multi-hour run the way"
         say "it rescues a 40 ms microbenchmark."
@@ -325,7 +325,7 @@ run_ours(){
     [ -n "$HEIGHT" ] || die "run-ours needs --height"
     local dest="$WORK/ours"
     [ -r "$dest/index.dat" ] || die "run prepare-ours first"
-    [ -x "$OUR_BIN" ] || die "no daemon at $OUR_BIN (build it: cd asm && make daemon/bitcoinmcd)"
+    [ -x "$OUR_BIN" ] || die "no daemon at $OUR_BIN (build it: cd asm && make daemon/bmcbitcoind)"
     need_quiet
 
     local log="$WORK/ours-run-$(date -u +%Y%m%dT%H%M%SZ).log"

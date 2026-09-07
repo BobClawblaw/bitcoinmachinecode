@@ -1,6 +1,6 @@
 /* tests/test_rpc_whitelist.c -- -rpcwhitelist / -rpcwhitelistdefault /
  * -rpcthreads / -rpcworkqueue / -rpcservertimeout on the REAL server
- * (daemon/bitcoin_rpcd, driven over raw HTTP), 2026-09-01.
+ * (daemon/bmc_rpcd, driven over raw HTTP), 2026-09-01.
  *   1. a whitelisted user may call only the listed methods: others get
  *      HTTP 403 with an empty body, exactly Core's answer;
  *   2. with a whitelist for SOME OTHER user, an unlisted user may call
@@ -61,7 +61,7 @@ static pid_t spawn(const char* whitelist, const char* wl_default, const char* th
         if (wl_default) setenv("TEST_RPC_WHITELIST_DEFAULT", wl_default, 1); else unsetenv("TEST_RPC_WHITELIST_DEFAULT");
         if (threads) setenv("TEST_RPC_THREADS", threads, 1);
         if (queue) setenv("TEST_RPC_WORKQUEUE", queue, 1);
-        char* argv[] = { (char*)"daemon/bitcoin_rpcd", NULL };
+        char* argv[] = { (char*)"daemon/bmc_rpcd", NULL };
         execv(argv[0], argv); _exit(127);
     }
     close(pout[1]);

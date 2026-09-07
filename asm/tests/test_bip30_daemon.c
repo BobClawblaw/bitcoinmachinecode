@@ -5,7 +5,7 @@
  *   BIP30 already had a differential against Core (validation/bip30_diff.py,
  *   replaying real mainnet blocks 0..91,900) and a smoke test
  *   (tests/test_bip30). Both passed. Both drove tests/bip30_shim.c -- which
- *   IMPLEMENTS the rule itself and is not linked into daemon/bitcoinmcd. The
+ *   IMPLEMENTS the rule itself and is not linked into daemon/bmcbitcoind. The
  *   daemon had no BIP30 check at all: daemon/tx_verify.c's utxo_lsm_get calls
  *   are all prevout lookups for inputs being SPENT, utxo_live.c's
  *   duplicate-outpoint pass is an IN-BLOCK double-spend guard (a different

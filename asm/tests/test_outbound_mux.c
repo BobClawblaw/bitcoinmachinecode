@@ -1,6 +1,6 @@
 /* test_outbound_mux.c -- loopback e2e for the OUTBOUND P2P MULTIPLEXER.
  *
- * Proves the RUNNING node (daemon/bitcoinmcd serve-test) continuously downloads
+ * Proves the RUNNING node (daemon/bmcbitcoind serve-test) continuously downloads
  * newly "mined" blocks WITHOUT restart while still serving stored blocks to a
  * concurrent inbound peer -- the keep-current half the old fork-per-inbound
  * serve lacked. A persistent outbound connection polls getheaders-from-tip
@@ -12,7 +12,7 @@
  *   1. MINING-PEER child listens on OUT_PORT, serves the asm node_sync
  *      protocol (headers pages + getdata blocks) from a chain of NB=6 blocks,
  *      initially exposing only blocks 0..4.
- *   2. NODE child = exec daemon/bitcoinmcd serve-test <dir> <SERVE> 127.0.0.1
+ *   2. NODE child = exec daemon/bmcbitcoind serve-test <dir> <SERVE> 127.0.0.1
  *      <OUT>: connects OUTBOUND to the peer, runs the poll() multiplexer
  *      (accept+inbound-fork + outbound node_sync). Pulls 0..4, then stays
  *      current polling for new ones while keeping its inbound listener open.
@@ -178,7 +178,7 @@ int main(int argc, char** argv){
     setbuf(stdout,NULL);
     signal(SIGPIPE,SIG_IGN);
     build_chain();
-    if(argc<2){ fprintf(stderr,"usage: %s <path-to-daemon/bitcoinmcd>\n",argv[0]); return 2; }
+    if(argc<2){ fprintf(stderr,"usage: %s <path-to-daemon/bmcbitcoind>\n",argv[0]); return 2; }
     tt_isolate();
     const char* daemon=tt_src(argv[1]);
 
@@ -186,7 +186,7 @@ int main(int argc, char** argv){
     /* The daemon takes its datadir as an argument, so hand it this test's
      * private directory rather than a pid-named /tmp path that nothing
      * ever removed. tt_isolate() also chdir()s, so the daemon path from
-     * argv (a repo-relative ./daemon/bitcoinmcd) is rebased with tt_src(). */
+     * argv (a repo-relative ./daemon/bmcbitcoind) is rebased with tt_src(). */
     const char* ndir = tt_workdir();
 
     /* ---- start MINING PEER, get its OUT_PORT via pipe ---- */

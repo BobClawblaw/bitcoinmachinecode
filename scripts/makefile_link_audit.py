@@ -144,7 +144,7 @@ def sym_of(asmdir, path, cache_dir):
         # Read what the archive ACTUALLY defines. The previous version granted
         # a rule containing any .a every symbol in the project ("a .a can
         # supply anything"), which exempted every rule that links RPCLIBS --
-        # and RPCLIBS ends in addrbook.a. daemon/bitcoin_rpcd broke exactly
+        # and RPCLIBS ends in addrbook.a. daemon/bmc_rpcd broke exactly
         # that way and this audit reported OK. Undefined symbols INSIDE the
         # archive are ignored: members satisfy each other, and the linker
         # reports what they cannot.

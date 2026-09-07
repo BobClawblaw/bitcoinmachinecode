@@ -239,7 +239,7 @@ path is ever allowed to serve consensus data.
 The node is pure assembly; CUDA is a C++/device-language runtime. You do not
 rewrite the assembly. You add a **small C host shim** (compiled with nvcc or as a
 `libcudart`-linked `.so`) that the asm binary can `dlsym`+call via the existing
-ABI, exactly the way `daemon/bitcoinmcd` already shells out to C for
+ABI, exactly the way `daemon/bmcbitcoind` already shells out to C for
 RPC/wallet/policy. Suggested shape:
 
 - Provide `cuda_sha256_batch_*` (already written) compiled behind a runtime probe:

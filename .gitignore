@@ -3,7 +3,7 @@
 *.so
 *.a
 
-# ---- Runtime logs / crash dumps (bmc-bitcoind.service) ----
+# ---- Runtime logs / crash dumps (bmcbitcoind.service) ----
 logs/
 
 # ---- Compiled binaries (tests + daemon) ----
@@ -51,7 +51,7 @@ asm/tests/test_store
 asm/tests/test_prune
 asm/tests/test_tx
 asm/tests/test_mempool_policy
-asm/daemon/bitcoinmcd
+asm/daemon/bmcbitcoind
 asm/daemon/bitcoind
 asm/daemon/cli
 asm/daemon/discover
@@ -180,7 +180,7 @@ asm/tests/test_mempool_accept_modern
 asm/tests/test_mempool_shared
 asm/daemon/wallet_cli
 asm/daemon/bmc_cli
-asm/daemon/bitcoin_rpcd
+asm/daemon/bmc_rpcd
 asm/tests/test_rpc_json
 asm/tests/test_rpc_transport
 asm/tests/test_rpc_server
@@ -403,8 +403,8 @@ regtest-e2e/
 
 # deploy snapshots: ~31MB binaries, one per deploy, kept on the host as the
 # rollback path. They are build products, not source.
-asm/daemon/bitcoinmcd.deploy-*
-asm/daemon/bitcoinmcd.live
+asm/daemon/bmcbitcoind.deploy-*
+asm/daemon/bmcbitcoind.live
 asm/daemon/bitcoind.live
 asm/daemon/bitcoind.deploy-*
 
@@ -426,3 +426,7 @@ asm/daemon/utxo_repair_del
 validation/core_script_oracle
 asm/tests/fuzz_script_diff
 asm/tests/fuzz_verify_diff
+asm/daemon/bitcoinmcd
+asm/daemon/bitcoinmcd.live
+asm/daemon/bitcoinmcd.deploy-*
+asm/daemon/bitcoin_rpcd
