@@ -7,7 +7,7 @@
  *   drove it to prove "the asm node implements BIP30 to zero divergence from
  *   Core". It did not prove that. bip30_shim.c IMPLEMENTS BIP30 itself --
  *   is_bip30_repeat(), the `enforce` flag and the utxo_get collision test all
- *   live in the shim -- and the shim is not linked into daemon/bitcoind. What
+ *   live in the shim -- and the shim is not linked into daemon/bitcoinmcd. What
  *   the differential validated was the shim.
  *
  *   The daemon, meanwhile, had no BIP30 check at all until 2026-08-23

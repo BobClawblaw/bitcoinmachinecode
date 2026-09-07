@@ -19,7 +19,7 @@
 # its getaddr handler had never answered anyone (bound register clobbered).
 set -u
 CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
-BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bitcoind}
+BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bitcoinmcd}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/wallet_cli}
 PROBE=${PROBE:-/storage/bitcoinmachinecode/validation/p2p_inbound_probe.py}
 WORK=${WORK:-/tmp/addrv2-e2e-$$}
