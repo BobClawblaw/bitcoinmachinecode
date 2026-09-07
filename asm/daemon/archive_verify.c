@@ -1031,29 +1031,57 @@ long archive_trim_derived_tails(void){
         long h = cw - 1;
         if (fseek(f, h * 48, SEEK_SET) != 0 || fread(r2, 1, 48, f) != 48){ fclose(f); return -1; }
         memcpy(prev_hash, r2, 32);
-        long good = h;                            /* highest height proven to continue the chain */
-        while (good + 1 < n){
-            if (fseek(f, (good + 1) * 48, SEEK_SET) != 0 || fread(r2, 1, 48, f) != 48) break;
+        /* A HOLE is in-flight work, not the end of the chain (2026-09-07):
+         * with sixteen workers a restart mid-sync always has chunks in
+         * flight, and this walk used to stop at the first hole and cut every
+         * stored record above it -- up to ~640 valid blocks re-downloaded
+         * (566 on the scratch node). A record above a hole cannot be linked
+         * to the record below it, so it is anchored to the HEADER chain
+         * instead: headers.dat must carry the same hash at that height, and
+         * that header must link to the one beneath it. Junk at a fake height
+         * (the 2026-09-01 incident) fails that anchor exactly as it failed
+         * the prev-hash link. The cut, when there is one, is at the first
+         * bad record; holes below it are kept as holes. */
+        FILE* fhd = fopen("headers.dat", "rb");
+        long cut = -1; int after_hole = 0;
+        for (long k = h + 1; k < n; k++){
+            if (fseek(f, k * 48, SEEK_SET) != 0 || fread(r2, 1, 48, f) != 48){ cut = k; break; }
             int zero = 1; for (int i = 0; i < 48; i++) if (r2[i]){ zero = 0; break; }
-            if (zero) break;
+            if (zero){ after_hole = 1; continue; }
             unsigned int fno; unsigned long long pos; unsigned int size;
             memcpy(&fno, r2 + 32, 4); memcpy(&pos, r2 + 36, 8); memcpy(&size, r2 + 44, 4);
-            if (size < 80) break;
+            if (size < 80){ cut = k; break; }
             char fn[64]; snprintf(fn, sizeof fn, "blk%05u.dat", fno);
-            FILE* bf = fopen(fn, "rb"); if (!bf) break;
+            FILE* bf = fopen(fn, "rb"); if (!bf){ cut = k; break; }
             unsigned char hdr[80]; int okr = (fseek(bf, (long)(pos + ARCHIVE_FRAME_LEN), SEEK_SET) == 0 && fread(hdr, 1, 80, bf) == 80);
             fclose(bf);
-            if (!okr) break;
+            if (!okr){ cut = k; break; }
             unsigned char bh[32]; block_hash(bh, hdr);
-            if (memcmp(bh, r2, 32) != 0 || memcmp(hdr + 4, prev_hash, 32) != 0) break;
-            memcpy(prev_hash, bh, 32); good++;
+            if (memcmp(bh, r2, 32) != 0){ cut = k; break; }                   /* does not hash to its own record */
+            if (!after_hole){
+                if (memcmp(hdr + 4, prev_hash, 32) != 0){ cut = k; break; }   /* does not continue the record below */
+            } else {
+                /* anchor to the header chain: headers.dat[k] == this hash and links to headers.dat[k-1] */
+                unsigned char hk[112], hk1[112], hkh[32], hk1h[32]; int ok_anchor = 0;
+                if (fhd && k >= 1 && fseek(fhd, (k - 1) * 112, SEEK_SET) == 0 && fread(hk1, 1, 112, fhd) == 112 && fread(hk, 1, 112, fhd) == 112){
+                    block_hash(hkh, hk); block_hash(hk1h, hk1);
+                    ok_anchor = memcmp(hkh, hk + 80, 32) == 0 && memcmp(hk1h, hk1 + 80, 32) == 0   /* both records hash to themselves */
+                             && memcmp(hkh, bh, 32) == 0                                          /* the header chain carries this block here */
+                             && memcmp(hk + 4, hk1 + 80, 32) == 0                                 /* and it links to the one beneath */
+                             && memcmp(hdr + 4, hk1 + 80, 32) == 0;                               /* as does the stored block itself */
+                }
+                if (!ok_anchor){ cut = k; break; }
+                after_hole = 0;
+            }
+            memcpy(prev_hash, bh, 32);
         }
+        if (fhd) fclose(fhd);
         fclose(f);
-        if (good + 1 < n){
-            if (truncate("index.dat", (off_t)(good + 1) * 48) != 0) return -1;
-            fprintf(stderr, "[boot] index.dat carried %ld record(s) beyond the linked chain (height %ld does not continue height %ld) -- trimmed\n",
-                    n - (good + 1), good + 1, good);
-            trimmed++; n = good + 1;
+        if (cut >= 0){
+            if (truncate("index.dat", (off_t)cut * 48) != 0) return -1;
+            fprintf(stderr, "[boot] index.dat carried %ld record(s) beyond the linked chain (height %ld continues neither the record below nor the header chain) -- trimmed\n",
+                    n - cut, cut);
+            trimmed++; n = cut;
         }
     }
     /* the header mirror must agree with the index height by height; cut it at

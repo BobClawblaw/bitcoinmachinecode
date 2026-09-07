@@ -102,6 +102,35 @@ int main(void){
       fclose(fh);
       ck("a record that does not hash to itself: cut (1 file trimmed)", archive_trim_derived_tails() == 1 && fsize("headers.dat") == 5*112);
       ck("chainwork.dat is still tied to the applied blocks (3 records)", fsize("chainwork.dat") == 3*16); }
+    printf("== a HOLE inside the index is in-flight work, not the end of the chain ==\n");
+    { /* 2026-09-07: the chain-continuation walk stopped at the first hole and
+       * cut every stored record above it -- with sixteen workers a restart
+       * mid-sync always has chunks in flight, so up to ~640 valid blocks were
+       * discarded and re-downloaded (566 on the scratch node). A record above
+       * a hole cannot be linked to the record below; it is kept when the
+       * header chain carries the same hash at that height and that header
+       * links to the one beneath it. */
+      extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
+      unsigned char hdr[8][80], hh[8][32]; unsigned char prev[32]; memset(prev, 0, 32);
+      for (int i = 0; i < 8; i++){ memset(hdr[i], 0, 80); hdr[i][0] = 1; memcpy(hdr[i] + 4, prev, 32); hdr[i][36] = (unsigned char)(0xc0 + i); block_hash(hh[i], hdr[i]); memcpy(prev, hh[i], 32); }
+      FILE* bf = fopen("blk00000.dat", "wb"); FILE* fi = fopen("index.dat", "wb"); FILE* fh = fopen("headers.dat", "wb"); FILE* fc = fopen("chainwork.dat", "wb");
+      unsigned long long pos = 0;
+      for (int i = 0; i < 8; i++){
+          unsigned char fr[8] = {80,0,0,0, 0xf9,0xbe,0xb4,0xd9}; fwrite(fr, 1, 8, bf); fwrite(hdr[i], 1, 80, bf);
+          unsigned char rec[48]; memset(rec, 0, 48);
+          if (i != 5){ memcpy(rec, hh[i], 32); unsigned int fno = 0, size = 80; memcpy(rec + 32, &fno, 4); memcpy(rec + 36, &pos, 8); memcpy(rec + 44, &size, 4); }
+          fwrite(rec, 1, 48, fi);                                   /* height 5 is a hole: its chunk was in flight */
+          unsigned char hr[112]; memcpy(hr, hdr[i], 80); memcpy(hr + 80, hh[i], 32); fwrite(hr, 1, 112, fh);
+          if (i < 5){ unsigned char cwr[16]; memset(cwr, 0, 16); cwr[0] = (unsigned char)i; fwrite(cwr, 1, 16, fc); }
+          pos += 88;
+      }
+      fclose(bf); fclose(fi); fclose(fh); fclose(fc);
+      ck("stored 0..4, hole at 5, stored 6..7 all on the header chain: nothing trimmed", archive_trim_derived_tails() == 0);
+      ck("index.dat keeps all 8 records (the blocks above the hole are real)", fsize("index.dat") == 8*48);
+      /* now a record above the hole that the header chain does NOT carry */
+      fh = fopen("headers.dat", "r+b"); fseek(fh, 6*112 + 80, SEEK_SET); unsigned char bad[32]; memset(bad, 0xab, 32); fwrite(bad, 1, 32, fh); fclose(fh);
+      long r = archive_trim_derived_tails();
+      ck("index record 6 is not on the header chain: the index is cut there (records 0..5 kept, the hole included)", r >= 1 && fsize("index.dat") == 6*48); }
     if (cwd0[0]) (void)!chdir(cwd0);
     printf("== the catch-up's worker-wait loop honours SIGTERM (structural) ==\n");
     { FILE* f = fopen("daemon/main.c", "r"); ck("daemon/main.c readable", f != NULL);
