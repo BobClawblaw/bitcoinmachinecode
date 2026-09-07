@@ -79,4 +79,4 @@ On boot the node trims `headers.dat` back to the archive tip ("ran N
 records past the archive tip -- trimmed"), so a restart in the middle of a
 sync refetches every header above the archive: 71 MB and the whole held
 region again. Headers ahead of blocks is the normal headers-first state.
-Not changed here; recorded for its own fix.
+Fixed the same afternoon: see `2026-09-07-keep-headers-ahead.md`.
