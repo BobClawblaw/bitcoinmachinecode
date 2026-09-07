@@ -5045,8 +5045,23 @@ static long dl_catchup(const char* dir, int min_workers){
             long cur_tip, present;
             dlc_scan_progress(&cur_tip, &present);
             long holes = cur_tip>=0 ? (cur_tip+1-present) : 0;
-            { long fh0 = cur_tip>=0 ? dlc_first_hole(cur_tip) : -1;          /* the window's anchor, for the workers */
-              next_claim[DLC_CTL_FIRST_HOLE] = fh0>=0 ? fh0 : (cur_tip>=0 ? cur_tip+1 : start_h); }
+            /* "holes" was the wrong word (2026-09-07): with 16 workers on
+             * 40-block chunks a few hundred heights are always claimed and
+             * not yet landed -- that is the download's work in progress,
+             * bounded by the window, not blocks nobody will fetch. The
+             * line now says "in flight", and separately how long the
+             * OLDEST gap has been the first hole: a gap that outlives the
+             * window's help timeout many times over is the one to read
+             * about, and it is printed as STRANDED. */
+            long fh0 = cur_tip>=0 ? dlc_first_hole(cur_tip) : -1;          /* the window's anchor, for the workers */
+            next_claim[DLC_CTL_FIRST_HOLE] = fh0>=0 ? fh0 : (cur_tip>=0 ? cur_tip+1 : start_h);
+            static long gap_h = -1; static long long gap_since_ms = 0; long gap_age_s = 0;
+            if(fh0 != gap_h){ gap_h = fh0; gap_since_ms = now_ms; }
+            if(fh0 >= 0) gap_age_s = (long)((now_ms - gap_since_ms)/1000);
+            char gapbuf[96];
+            if(fh0 < 0) snprintf(gapbuf, sizeof gapbuf, "no gap");
+            else if(gap_age_s >= 60) snprintf(gapbuf, sizeof gapbuf, "STRANDED: height %ld has been the oldest gap for %lds", fh0, gap_age_s);
+            else snprintf(gapbuf, sizeof gapbuf, "oldest gap %lds at %ld", gap_age_s, fh0);
             double overall_pct = 100.0*(double)present/(double)(end_h+1);
             double span_pct = cur_tip>=0 ? 100.0*(double)present/(double)(cur_tip+1) : 0.0;
             char elapsed[32]; dlc_fmt_elapsed(elapsed,sizeof elapsed,(long)(time(NULL)-catchup_start));
@@ -5070,8 +5085,8 @@ static long dl_catchup(const char* dir, int min_workers){
                 long lag = prefix - applied; if(lag < 0) lag = 0;
                 snprintf(connbuf,sizeof connbuf," | applied=%ld lag=%ld%s", applied, lag, interleave ? "" : " (interleave off)");
             } else snprintf(connbuf,sizeof connbuf," | connect deferred (no UTXO engine in this process)");
-            fprintf(stderr,"[dlc] == elapsed %s | eta %s | overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free)%s ==\n",
-                    elapsed, etabuf, present, end_h+1, overall_pct, holes, cur_tip, span_pct, connbuf);
+            fprintf(stderr,"[dlc] == elapsed %s | eta %s | overall: %ld/%ld stored (%.2f%% of real tip) | in flight %ld of window %ld through %ld (%s, %.2f%% landed)%s ==\n",
+                    elapsed, etabuf, present, end_h+1, overall_pct, holes, DLC_DOWNLOAD_WINDOW, cur_tip, gapbuf, span_pct, connbuf);
         }
         { static long tick_no = 0; tick_no++;
           long ro=next_claim[DLC_CTL_N_ROTATE], wa=next_claim[DLC_CTL_N_WAIT], he=next_claim[DLC_CTL_N_HELP], fa=next_claim[DLC_CTL_N_FAIL], ab=next_claim[DLC_CTL_N_ABANDON];
