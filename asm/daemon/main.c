@@ -3804,8 +3804,10 @@ for(; i < cnt; i++){
 static lowwork_t g_lw;                                   /* CC-5 hold: 48 KB of bookkeeping; the page scratch is mmap'd per fetch */
 static int dlc_lw_get_at(void* hst, unsigned long long h, void* out){ return hst_get_at(hst, h, out); }
 extern int reorg_min_chain_work_set(void);
+static long long dlc_now_ms(void); static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec);   /* defined below; the progress line needs them here */
 static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
     long have0 = hst_count(hst), added = 0; int lw_started = 0; lowwork_clear(&g_lw);
+    long long fetch_t0 = dlc_now_ms(); unsigned long held_bytes = 0;   /* for the held-region progress line */
     static unsigned char page[DLC_HDR_PAGE * 81 + 16];
     static unsigned char msg[2 << 20];
     unsigned char stop[32]; memset(stop, 0, 32);
@@ -3871,7 +3873,19 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
                   }
                   block_hash(prev, h);
               }
+              held_bytes += cnt * 81;
               if(g_lw.held == 1) fprintf(stderr,"[dlc] headers from %s are below -minimumchainwork so far -- holding %lu, storing none until the chain proves its work\n", cand, cnt);
+              /* 2026-09-07: an honest mainnet chain is below the floor for
+               * its first ~880,000 headers (~71 MB of pages), and this loop
+               * said nothing for all of it. A scratch node sharing its link
+               * with a benchmark held for 35 minutes at 133 KB/s and was
+               * mistaken for a hang. Say how far, how fast, every 50 pages. */
+              else if(g_lw.held % 50 == 0){
+                  double secs = (double)(dlc_now_ms() - fetch_t0) / 1000.0; if(secs < 1.0) secs = 1.0;
+                  char rate[16]; dlc_fmt_rate(rate, sizeof rate, (double)held_bytes / secs);
+                  fprintf(stderr,"[dlc] headers from %s: still below -minimumchainwork after %d held page(s) (%lu headers, %.1f MB) in %.0fs -- %s\n",
+                          cand, g_lw.held, (unsigned long)g_lw.held * cnt, (double)held_bytes / 1048576.0, secs, rate);
+              }
               continue;
           }
           if(lwv == LOWWORK_RELEASE){
