@@ -416,32 +416,79 @@ verify_p2pkh:
 .Lvp_walk:
 	cmp  x24, x22
 	b.hs .Lvp_found
-	add  x23, x23, #36                /* prevout+index */
+	/* IR-10 (x86 a7c16c7a): every cursor advance is bounded by the tx end (x21)
+	 * and, from .Lvp_found on, by the scriptSig end (x4). Before, an empty
+	 * scriptSig on the target input read sequence[0] = 0xff as the signature
+	 * length and walked ~250 bytes past the buffer -- the pinning test sees it
+	 * fault against the PROT_NONE page behind the tx. The ARM twin did NOT need
+	 * the other half of the x86 fix: this file's .Lparse_varint clobbers x2-x7
+	 * only, so the walk's counter (x24), its end (x21) and its cursor (x23)
+	 * already survived the call -- the x86 helper clobbered the caller's rcx. */
+	add  x2, x23, #36
+	cmp  x2, x21
+	b.hi .Lvp_fail			/* prevout+index must fit */
+	mov  x23, x2
 	mov  x0, x23
 	mov  x1, x21
-	bl   .Lparse_varint               /* scriptSig len */
-	add  x23, x1, x0                  /* skip scriptSig bytes */
-	add  x23, x23, #4                 /* sequence */
+	bl   .Lparse_varint			/* scriptSig len (x23 = cursor after the varint) */
+	mov  x23, x1
+	subs x2, x21, x23
+	cmp  x0, x2
+	b.hi .Lvp_fail			/* scriptSig must fit */
+	add  x23, x23, x0			/* skip scriptSig bytes */
+	add  x2, x23, #4
+	cmp  x2, x21
+	b.hi .Lvp_fail			/* sequence must fit */
+	mov  x23, x2
 	add  x24, x24, #1
 	b    .Lvp_walk
 .Lvp_found:
-	add  x23, x23, #36                /* -> target scriptSig varint */
+	add  x2, x23, #36
+	cmp  x2, x21
+	b.hi .Lvp_fail			/* IR-10: prevout+index must fit */
+	mov  x23, x2
 	mov  x0, x23
 	mov  x1, x21
-	bl   .Lparse_varint               /* scriptSig len; x1 = script bytes */
-	str  x1, [sp, #0x188]             /* script bytes start */
-	str  x0, [sp, #0x180]             /* scriptSig len */
-	/* push0 (sig): <len> sig */
-	ldrb w2, [x1]
+	bl   .Lparse_varint			/* scriptSig len; x1 = script bytes */
+	mov  x23, x1
+	subs x2, x21, x23
+	cmp  x0, x2
+	b.hi .Lvp_fail			/* IR-10: scriptSig must fit in the tx */
+	str  x23, [sp, #0x188]            /* script bytes start */
+	str  x0,  [sp, #0x180]            /* scriptSig len */
+	add  x4, x23, x0			/* IR-10: x4 = scriptSig END, the bound for both
+					   pushes. Free: .Lparse_varint owns x2-x7 and this
+					   is the last call before the pushes. */
+	/* push0 (sig): <len> sig -- IR-10: a DIRECT push (1..75) wholly inside the
+	 * scriptSig. Anything else is REFUSED, never misparsed: an OP_PUSHDATA1 sig
+	 * used to hand a fabricated length to der_parse_sig. */
+	cmp  x23, x4
+	b.hs .Lvp_fail
+	ldrb w2, [x23]
 	str  x2, [sp, #0x178]             /* sig len */
-	add  x3, x1, #1
+	cbz  x2, .Lvp_fail			/* IR-10: empty push -- no signature to parse */
+	cmp  x2, #75
+	b.hi .Lvp_fail				/* IR-10: not a direct push */
+	add  x2, x23, x2
+	add  x2, x2, #1
+	cmp  x2, x4
+	b.hi .Lvp_fail				/* IR-10: sig must end inside the scriptSig */
+	add  x3, x23, #1
 	str  x3, [sp, #0x170]             /* sig bytes */
-	add  x1, x1, x2
-	add  x1, x1, #1
-	/* push1 (pubkey): <len> pub */
-	ldrb w2, [x1]
+	mov  x23, x2				/* -> push1's length byte */
+	/* push1 (pubkey): <len> pub -- IR-10: direct push, bounded the same way */
+	cmp  x23, x4
+	b.hs .Lvp_fail
+	ldrb w2, [x23]
 	str  x2, [sp, #0x168]             /* pub len */
-	add  x3, x1, #1
+	cbz  x2, .Lvp_fail
+	cmp  x2, #75
+	b.hi .Lvp_fail
+	add  x2, x23, x2
+	add  x2, x2, #1
+	cmp  x2, x4
+	b.hi .Lvp_fail
+	add  x3, x23, #1
 	str  x3, [sp, #0x160]             /* pub bytes */
 
 	/* ---- step 3: der_parse_sig(sig, siglen-1, r@0x040, s@0x080, ht@0x198) ---- */
