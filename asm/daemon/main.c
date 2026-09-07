@@ -46,7 +46,9 @@
 #include "../mempool_slot.h"    /* the structural mempool's slot layout (80-byte slots) */
 #include "anchors.h"           /* CC-4: block-relay-only legs + anchors.dat */
 #include "hdr_lowwork.h"
-#include "archive_seed.h"       /* slot 0 is genesis on EVERY chain: a shifted archive reads every height one block high */       /* CC-5: hold low-work header pages until the chain proves its work */
+#include "archive_seed.h"
+#include "ibd_pipeline.h"      /* the whole chunk in one getdata, not one block per round trip */       /* slot 0 is genesis on EVERY chain: a shifted archive reads every height one block high */       /* CC-5: hold low-work header pages until the chain proves its work */
+#include "banlist.h"          /* the ban list survives a restart, as Core's does */       /* slot 0 is genesis on EVERY chain: a shifted archive reads every height one block high */       /* CC-5: hold low-work header pages until the chain proves its work */
 #include "invalid_set.h"       /* CC-10: invalidateblock / reconsiderblock */
 #include "cmpct_recv.h"        /* CC-2: BIP152 compact block receive */
 /* VAL-5 / MEM-1: the generated per-height script-flag mask
@@ -78,7 +80,12 @@ static void mempool_refresh_seqlocks(void* store_buf, long now_tip);
  * chains: logs/bitcoind.log on mainnet, logs/bitcoind.<chain>.log otherwise
  * (all under the per-chain datadir's own logs/). Set at boot right after
  * chainparams_select; the static default covers every tool-mode caller. */
-static char g_logpath[256] = "logs/bitcoind.log";   /* debuglogfile= overrides (0 = /dev/null) */
+/* Core's -debuglogfile default, exactly: "debug.log" (logging.cpp:23,
+ * DEFAULT_DEBUGLOGFILE), relative to the NET-SPECIFIC datadir. Every chain
+ * here already has its own directory and the daemon chdir()s into it, so a
+ * bare "debug.log" lands at <chain-datadir>/debug.log -- the same file, in
+ * the same place, as Core. (This was logs/bitcoind.log until 2026-09-06.) */
+static char g_logpath[256] = "debug.log";   /* debuglogfile= overrides (0 = /dev/null) */
 #include "../rpc_server.h"   /* embedded JSON-RPC server (docs/RPC_LIVE_NODE.md) */
 #include "../rpc_chain.h"
 #include "../rpc_wallet_ops.h"
@@ -153,21 +160,83 @@ extern long g_peer_wants_addrv2;   /* bitcoind.asm: peer sent sendaddrv2 before 
  * but it can still waste a leg failing every fetch, so refuse at dial time.
  * A version payload too short to carry services is refused the same way:
  * unknown is not "probably fine" on the path that feeds the archive. */
+/* ---- remember who lacks NODE_WITNESS (2026-09-06) --------------------------
+ * A peer without NODE_WITNESS is useless to us forever -- the bit does not
+ * come and go -- but nothing recorded that, so the dialler kept picking the
+ * same addresses out of the pool and re-handshaking them. Measured on a live
+ * benchmark: 7,891 of 8,630 log lines in nine minutes were this one message,
+ * 91% of the log, from 28 distinct addresses, one of them dialled 819 times.
+ * That is a wasted handshake each time, not just noise.
+ *
+ * So: a small per-run set of addresses already known to lack the bit. The
+ * message is printed ONCE per address; after that the peer is skipped before
+ * the socket is opened, and a periodic line reports the running count so the
+ * behaviour stays visible without drowning the log. Not persisted -- a node
+ * may be upgraded between runs, and Core re-learns services on every
+ * connection too. */
+#define NOWIT_MAX 512
+/* The download forks 16 helpers, so a per-process set is learned 16 times over
+ * and the message still repeats once per helper (measured: exactly 16). The
+ * set therefore lives in a MAP_SHARED page the parent creates before the fork,
+ * alongside claimed[] and banned[]; when it is absent (the parent's own dials
+ * before any download) the process-local arrays below are used instead. */
+typedef struct { volatile int n; char a[NOWIT_MAX][64]; volatile unsigned long long skips; } nowit_set_t;
+static nowit_set_t* g_nowit_sh = 0;
+void peer_nowit_attach(void* shared){ g_nowit_sh = (nowit_set_t*)shared; }
+unsigned long peer_nowit_bytes(void){ return (unsigned long)sizeof(nowit_set_t); }
+static char  g_nowit[NOWIT_MAX][64];
+static int   g_nowit_n = 0;
+static unsigned long long g_nowit_skips = 0;
+static void nowit_key(char* out, unsigned long n, const char* who){
+    snprintf(out, n, "%s", who ? who : "?");
+    char* c = strrchr(out, ':'); if (c && strchr(out, '.')) *c = 0;   /* strip :port, keep IPv6 */
+}
+/* 1 if this address already failed the witness check in this run */
+static int nowit_lookup(const char* k){
+    if (g_nowit_sh){
+        int n = g_nowit_sh->n; if (n > NOWIT_MAX) n = NOWIT_MAX;
+        for (int i = 0; i < n; i++) if (!strcmp(g_nowit_sh->a[i], k)) return 1;
+        return 0;
+    }
+    for (int i = 0; i < g_nowit_n; i++) if (!strcmp(g_nowit[i], k)) return 1;
+    return 0;
+}
+int peer_known_no_witness(const char* who){
+    char k[64]; nowit_key(k, sizeof k, who);
+    if (!nowit_lookup(k)) return 0;
+    if (g_nowit_sh) __sync_fetch_and_add(&g_nowit_sh->skips, 1ULL); else g_nowit_skips++;
+    return 1;
+}
+unsigned long long peer_no_witness_skips(void){ return g_nowit_sh ? g_nowit_sh->skips : g_nowit_skips; }
+int peer_no_witness_count(void){
+    if (!g_nowit_sh) return g_nowit_n;
+    int n = g_nowit_sh->n; return n > NOWIT_MAX ? NOWIT_MAX : n;
+}
+static void nowit_remember(const char* who){
+    char k[64]; nowit_key(k, sizeof k, who);
+    if (nowit_lookup(k)) return;
+    if (g_nowit_sh){
+        /* a duplicate here is harmless (the lookup is a scan), so a plain
+         * atomic claim of the next slot is enough -- no lock on a dial path. */
+        int slot = __sync_fetch_and_add(&g_nowit_sh->n, 1);
+        if (slot < NOWIT_MAX) snprintf(g_nowit_sh->a[slot], sizeof g_nowit_sh->a[0], "%s", k);
+        else __sync_fetch_and_sub(&g_nowit_sh->n, 1);
+        return;
+    }
+    if (g_nowit_n < NOWIT_MAX) snprintf(g_nowit[g_nowit_n++], sizeof g_nowit[0], "%s", k);
+}
 static int peer_has_witness(const char* who){
     unsigned long long services = 0;
     if (g_peer_version_len >= 12)
         memcpy(&services, g_peer_version_payload + 4, 8);
-    /* NODE_WITNESS is a tx-relay/address-serving hint, not a statement that the
-     * peer lacks full blocks. Every post-segwit node stores whole blocks (with
-     * witness data) and serves them on getdata regardless of its advertised
-     * services; this environment's peers advertise 0xc05 (= no witness bit),
-     * and refusing them strands the entire chain download at 0 outbound peers.
-     * Safety is preserved regardless: the BIP141 commitment check rejects any
-     * peer that actually delivers a non-witness block, and the per-leg
-     * replacement logic drops a peer that fails fetches -- so accepting a
-     * non-witness peer can waste a leg, never corrupt the archive. */
-    (void)services; (void)who;
-    return 1;
+    if (services & 0x8ULL) return 1;
+    char k[64]; nowit_key(k, sizeof k, who);
+    int known = nowit_lookup(k);
+    if (!known)
+        fprintf(stderr, "[dial] %s lacks NODE_WITNESS (services=0x%llx) -- dropping, and not dialling it again this run\n",
+                who ? who : "?", services);
+    nowit_remember(who);
+    return 0;
 }
 extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, long* out_count);
 /* STAGE B: the real multi-hash-locator entry point. node_sync is now a
@@ -1503,6 +1572,43 @@ static long dl_reject_block(void* st, long h, const unsigned char hash[32], cons
     return 1;
 }
 
+/* ---- the ban list survives a restart (2026-09-06) -------------------------
+ * Core writes <datadir>/banlist.json whenever the list changes and at
+ * shutdown, and loads it at startup (banman.cpp). This node banned only in
+ * memory, so every restart forgave every ban -- a peer banned for a consensus
+ * violation returned the moment the node did. The register carried it as
+ * PARTIAL: "scored ... not persisted across restart".
+ *
+ * Called after every mutation of g_node_status->bans[]; cheap (64 entries)
+ * and rare (a ban, an unban, a clear). */
+static void banlist_persist(void)
+{
+    if (!g_node_status) return;
+    static ban_entry_t snap[RPC_MAX_BANS];
+    int n = 0;
+    for (int i = 0; i < RPC_MAX_BANS; i++){
+        if (!g_node_status->bans[i].until) continue;
+        snprintf(snap[n].subnet, sizeof snap[n].subnet, "%s", (const char*)g_node_status->bans[i].subnet);
+        snap[n].until   = g_node_status->bans[i].until;
+        snap[n].created = g_node_status->bans[i].created;
+        n++;
+    }
+    if (banlist_save(snap, n) != 0)
+        fprintf(stderr, "[ban] WARNING: could not write banlist.json -- bans will not survive a restart\n");
+}
+/* the loader's sink: same table, same rules, no RPC round trip */
+int ctl_ban_add(const char* subnet, long long until);   /* defined just below */
+static int banlist_restore_one(const char* subnet, long long until, long long created)
+{
+    if (!ctl_ban_add(subnet, until)) return 0;
+    for (int i = 0; i < RPC_MAX_BANS; i++)
+        if (g_node_status->bans[i].until == until &&
+            !strcmp((const char*)g_node_status->bans[i].subnet, subnet)){
+            if (created > 0) g_node_status->bans[i].created = created;   /* keep Core's ban_created */
+            break;
+        }
+    return 1;
+}
 /* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
 int ctl_ban_add(const char* subnet, long long until){
     if(!g_node_status || !subnet || !*subnet) return 0;
@@ -1536,7 +1642,7 @@ int ctl_ban_add(const char* subnet, long long until){
     g_node_status->bans[slot].created = (long long)time(NULL);
     __sync_synchronize();
     g_node_status->bans[slot].until = until;     /* published last */
-    return 1;
+    banlist_persist(); return 1;
 }
 
 /* Score a peer for a protocol violation. Returns 1 if this call banned it,
@@ -3446,11 +3552,32 @@ static int dlc_headers_sane(long have0, long pos){ return have0 - pos <= DLC_HDR
  * still avoided (a healthy tiny-block peer passes the block check and
  * never trips the byte check -- the AND was never needed to protect it). */
 #define DLC_DEAD_WEIGHT_MIN_BLOCKS 10L
-static int dlc_dead_weight(double byte_rate, long blocks_this_tick){
+/* ---- the floor is RELATIVE to what the pool is achieving (2026-09-06) --------
+ * The absolute byte floor (32 KB/s) was calibrated for megabyte blocks. At
+ * height 50,000 a block is ~200 bytes and a serial fetch is bounded by the
+ * round trip, so a perfectly healthy worker moves ~9 KB/s -- and the floor
+ * declared every one of them dead. Measured on a fresh sync: 655 evictions
+ * in 30 minutes, 478 of them under 5 KB/s, 195 of them after ZERO chunks,
+ * with the whole 16-worker pool receiving 143 KB per tick. That is not
+ * finding bad peers, it is killing the pool for being early in the chain.
+ *
+ * So the floor is the smaller of the configured absolute floor and a quarter
+ * of the pool's median rate last tick. Early, when everyone is round-trip
+ * bound, only a worker far below its peers dies; later, when the median is
+ * hundreds of KB/s, the absolute floor takes over and the rule is what it
+ * was. A worker with no reading, or a pool with no median yet, is never
+ * killed on bytes -- the chunk budget still bounds a genuinely dead socket. */
+static double dlc_effective_floor(double median_bps){
+    double f = (double)g_cfg.dead_weight_bps;
+    if (median_bps > 0.0 && 0.25 * median_bps < f) f = 0.25 * median_bps;
+    if (f < 512.0) f = 512.0;                                        /* a truly dead socket still dies */
+    return f;
+}
+static int dlc_dead_weight(double byte_rate, long blocks_this_tick, double floor_bps){
     if (byte_rate < 0.0) return 0;                                   /* no reading yet */
-    if (byte_rate < g_cfg.dead_weight_bps) return 1;                 /* byte floor: binding at every depth */
+    if (byte_rate < floor_bps) return 1;                             /* under the pool-relative floor */
     if (blocks_this_tick < DLC_DEAD_WEIGHT_MIN_BLOCKS
-        && byte_rate < 2.0 * g_cfg.dead_weight_bps) return 1;        /* marginal bytes AND stalled blocks */
+        && byte_rate < 2.0 * floor_bps) return 1;                    /* marginal bytes AND stalled blocks */
     return 0;
 }
 /* ---------------------------------------------------------------- VAL-5
@@ -3755,6 +3882,9 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
     int pport = 0; unsigned ip = 0;
     if(!dlc_parse_peer(cand, &ip, &pport)){ *why = DLC_HT_PARSE; return -1; }
     int cport = pport ? pport : node_config_peer_port(cand);
+    /* already known to lack NODE_WITNESS this run: do not spend a socket and a
+     * handshake to be told again (2026-09-06). */
+    if(peer_known_no_witness(cand)){ *why = DLC_HT_WITNESS; return -1; }
     /* 2026-09-03, boot archive-gap: this was the PLAIN blocking tcp_connect_ip
      * -- no connect-phase timeout -- and the phase's own silence (31-66s of
      * nothing between "confirmed-live peer(s)" and "headers: already current",
@@ -3766,7 +3896,10 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
      * phase ALWAYS finishes -- the variance was how many dead dials stood in
      * line ahead of it. Bounded exactly the way dlc_probe_round already dials:
      * non-blocking connect + POLLOUT deadline, then back to blocking for the
-     * handshake/fetch below (they assume blocking reads under SO_RCVTIMEO). */
+     * handshake/fetch below (they assume blocking reads under SO_RCVTIMEO).
+     * (Merged with upstream's no-witness short-circuit above, which replaced
+     * tcp_connect_ip on its side of this hunk -- taking either side whole would
+     * have lost one of the two.) */
     int fd=socket(AF_INET,SOCK_STREAM,0);
     if(fd<0){ *why = DLC_HT_CONNECT; return -1; }
     int fl=fcntl(fd,F_GETFL,0); fcntl(fd,F_SETFL,fl|O_NONBLOCK);
@@ -4001,9 +4134,18 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                      * fallback for bare addresses (same rule as the header tries) */
                     { int cpc = cp2 ? cp2 : node_config_peer_port(cand); if(!cpc) cpc = g_chainp->default_port;   /* addnode=host:port keeps its port here too */
                       cp2 = cpc; }
+                    if(peer_known_no_witness(cand)){ claimed[idx]=0; slot=(idx+1)%nlive; continue; }   /* no witness bit: skip before the socket */
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)cp2));
                     if(fdc<0){ claimed[idx]=0; continue; }
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+                    /* 2026-09-06: a getdata is small and is the ONLY thing
+                     * standing between this worker and the peer's reply, so
+                     * Nagle can only delay it -- and p2p_write sends a message
+                     * as more than one segment, which is exactly the shape
+                     * that waits for the peer's delayed ACK. Measured on a
+                     * loopback fixture: ~45 ms per getdata without, ~5 ms
+                     * with the peer ACKing immediately. */
+                    { int one=1; setsockopt(fdc,IPPROTO_TCP,TCP_NODELAY,&one,sizeof one); }
                     if(node_handshake(fdc)==1 && peer_has_witness(cand)){
                         fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
                         mystat->held_idx=idx;   /* so the parent can ban THIS peer on early-kill */
@@ -4055,7 +4197,14 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             sigaction(SIGALRM,&sa,&old);   /* SIGUSR1 already registered for this worker's whole life, above */
             mux_sync_budget_fired=0;
             alarm(DLC_CHUNK_BUDGET_SECS);
-            long r=node_ibd_blocks_s(fd, st, hst, lo, n, buf, sizeof buf, scratch, cap);
+            /* 2026-09-06: the whole chunk in ONE getdata, blocks placed by
+             * hash as they arrive (daemon/ibd_pipeline.c). node_ibd_blocks_s
+             * asked for one block and waited for it before asking for the
+             * next, so every block cost a full round trip: 16 helpers against
+             * 16 real peers moved 0.23-1.2 MB/s each on the fresh-sync
+             * benchmark. Core keeps 16 blocks in flight per peer for the same
+             * reason. Same validation per block, block for block. */
+            long r=ibd_fetch_chunk_pipelined(fd, st, hst, lo, n, buf, (unsigned)sizeof buf, scratch, cap);
             alarm(0); sigaction(SIGALRM,&old,NULL);
             store_reload(st);
             guard++;
@@ -4288,6 +4437,90 @@ static void dlc_stop_workers_for_reject(long h){
     dlc_stop_workers(g_dlc_kids, g_dlc_nw, why);
 }
 
+/* ---- rank the live pool by a measured throughput sample (2026-09-06) --------
+ * dlc_probe_round measures ONE thing: whether a TCP connect succeeds. Every
+ * "confirmed-live" peer is then equal, and the 16 workers claim them in
+ * whatever order the DNS seeds happened to return. Measured on a fresh sync:
+ * 119 live peers, the first eviction at 249 s, hundreds of evictions after --
+ * four minutes of the phase that decides the wall clock, spent discovering
+ * by trial that most of the pool trickles at 2 KB/s. Being impatient about
+ * evicting was tried first and made it WORSE (4x fewer blocks in the same
+ * time): churn costs a handshake and abandons partial chunk work every time.
+ *
+ * So measure once, up front. Each live peer gets one getheaders for the
+ * 2,000 headers after genesis -- ~162 KB from any synced peer -- timed from
+ * request to reply; the pool is then sorted fastest-first, so the worker
+ * slots start on the best peers instead of finding them by elimination.
+ * Forked probes, 32 at a time, each under its own alarm(), writing into a
+ * shared page: the same shape dlc_worker uses, and nothing the parent does
+ * can hang on a silent peer. A peer that does not answer ranks last, which
+ * is where a peer that does not answer belongs. */
+#define RANK_BATCH 32
+#define RANK_TIMEOUT_S 10
+static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
+    if (nlive < 2) return;
+    double* rate = mmap(NULL, sizeof(double) * (size_t)nlive, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    if (rate == MAP_FAILED) return;
+    for (int i = 0; i < nlive; i++) rate[i] = -1.0;
+    unsigned char stop[32]; memset(stop, 0, 32);
+    struct timespec t_all0; clock_gettime(CLOCK_MONOTONIC, &t_all0);
+    for (int base = 0; base < nlive; base += RANK_BATCH){
+        int n = nlive - base; if (n > RANK_BATCH) n = RANK_BATCH;
+        pid_t kids[RANK_BATCH];
+        for (int k = 0; k < n; k++){
+            int i = base + k;
+            pid_t pid = fork();
+            if (pid < 0){ kids[k] = 0; continue; }
+            if (pid == 0){
+                alarm(RANK_TIMEOUT_S);                          /* nothing below may outlive this */
+                int pport = 0; unsigned ip = pool_ipv4(live[i], &pport);
+                if (!ip) _exit(0);
+                int cp = pport ? pport : node_config_peer_port(live[i]); if (!cp) cp = g_chainp->default_port;
+                int fd = tcp_connect_ip(ip, (unsigned short)htons((unsigned short)cp));
+                if (fd < 0) _exit(0);
+                struct timeval tv; tv.tv_sec = 5; tv.tv_usec = 0; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+                if (node_handshake(fd) != 1) _exit(0);
+                static unsigned char page[4096]; static unsigned char msg[2 << 20]; char cmd[12]; unsigned mlen = 0;
+                long plen = p2p_getheaders(page, g_chainp->genesis_hash, 1, stop);
+                struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+                if (plen <= 0 || p2p_write(fd, "getheaders", 10, page, (unsigned)plen) < 0) _exit(0);
+                long bytes = 0;
+                for (int q = 0; q < 40; q++){
+                    int r = p2p_read(fd, cmd, msg, sizeof msg, &mlen);
+                    if (r <= 0) break;
+                    if (!strncmp(cmd, "headers", 12)){ bytes = (long)mlen; break; }
+                    if (!strncmp(cmd, "ping", 12) && mlen == 8) p2p_write(fd, "pong", 4, msg, 8);
+                }
+                clock_gettime(CLOCK_MONOTONIC, &t1);
+                double secs = (double)(t1.tv_sec - t0.tv_sec) + (double)(t1.tv_nsec - t0.tv_nsec) / 1e9;
+                if (bytes > 0 && secs > 0.0) rate[i] = (double)bytes / secs;
+                close(fd); _exit(0);
+            }
+            kids[k] = pid;
+        }
+        for (int k = 0; k < n; k++) if (kids[k] > 0){ int st; waitpid(kids[k], &st, 0); }
+    }
+    /* sort fastest first; a peer with no sample ranks last, ties keep order */
+    static int idx[DLC_MAXPOOL]; for (int i = 0; i < nlive; i++) idx[i] = i;
+    for (int i = 1; i < nlive; i++){
+        int v = idx[i]; int j = i - 1;
+        while (j >= 0 && rate[idx[j]] < rate[v]){ idx[j + 1] = idx[j]; j--; }
+        idx[j + 1] = v;
+    }
+    static char sorted[DLC_MAXPOOL][DL_POOL_SLOT];
+    for (int i = 0; i < nlive; i++) memcpy(sorted[i], live[idx[i]], DL_POOL_SLOT);
+    for (int i = 0; i < nlive; i++) memcpy(live[i], sorted[i], DL_POOL_SLOT);
+    int answered = 0; double best = 0.0, worst_answered = 0.0;
+    for (int i = 0; i < nlive; i++) if (rate[idx[i]] >= 0.0){ answered++; if (best == 0.0) best = rate[idx[i]]; worst_answered = rate[idx[i]]; }
+    double median = answered ? rate[idx[answered / 2]] : 0.0;
+    struct timespec t_all1; clock_gettime(CLOCK_MONOTONIC, &t_all1);
+    fprintf(stderr, "[dlc] ranked %d live peer(s) by a 2000-header sample in %.1fs: %d answered, best %.0f KB/s, median %.0f KB/s, slowest answering %.0f KB/s; the %d silent rank last\n",
+            nlive, (double)(t_all1.tv_sec - t_all0.tv_sec) + (double)(t_all1.tv_nsec - t_all0.tv_nsec) / 1e9,
+            answered, best / 1024.0, median / 1024.0, worst_answered / 1024.0, nlive - answered);
+    for (int i = 0; i < nlive && i < 3; i++)
+        fprintf(stderr, "[dlc]   #%d %-22s %.0f KB/s\n", i + 1, live[i], rate[idx[i]] > 0 ? rate[idx[i]] / 1024.0 : 0.0);
+    munmap(rate, sizeof(double) * (size_t)nlive);
+}
 static long dl_catchup(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
     ab2_t* ab = addr_book();
@@ -4393,6 +4626,7 @@ static long dl_catchup(const char* dir, int min_workers){
         }
     }
     if(nlive<=0){ fprintf(stderr,"[dlc] no live peers; skipping catch-up\n"); return 0; }
+    dlc_rank_by_throughput(live, nlive);      /* fastest first: the workers claim from the top */
     int nw = min_workers; if(nlive<nw) nw=nlive; if(nw<1) nw=1; if(nw>64) nw=64;
 
     long hdr_len = dlc_headers(live, nlive);
@@ -4423,6 +4657,11 @@ static long dl_catchup(const char* dir, int min_workers){
      * "pick an unclaimed peer" atomic across all forked workers, so no two
      * workers ever share one peer's bandwidth while a distinct live peer
      * sits unused. */
+    /* the no-NODE_WITNESS set, shared with every forked helper so the bit is
+     * learned ONCE for the whole download rather than once per helper
+     * (2026-09-06: 16 helpers meant 16 identical log lines per address). */
+    { void* nw = mmap(NULL, peer_nowit_bytes(), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+      if (nw != MAP_FAILED){ memset(nw, 0, peer_nowit_bytes()); peer_nowit_attach(nw); } }
     volatile int* claimed=mmap(NULL,sizeof(int)*(size_t)nlive,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     /* Peers evicted for sustained uselessness are banned for the REST OF THE
      * RUN. Without this the replacement draw is memoryless: a worker killed
@@ -4588,6 +4827,14 @@ static long dl_catchup(const char* dir, int min_workers){
         }
         fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
         double tick_total_bytes=0.0, tick_total_write_bytes=0.0;
+        /* the pool's median rate from LAST tick, for the relative floor: one
+         * tick of lag is nothing against a 10 s tick and a 3-tick streak */
+        double median_bps = 0.0;
+        { double v[64]; int nv = 0;
+          for(int w=0;w<nw;w++) if(kids[w]!=0 && prev_rchar[w] > 0) v[nv++] = stats[w].last_bw_bps;   /* only workers with a real reading */
+          for(int i=1;i<nv;i++){ double x=v[i]; int j=i-1; while(j>=0 && v[j]>x){ v[j+1]=v[j]; j--; } v[j+1]=x; }
+          if(nv > 0) median_bps = v[nv/2]; }
+        double floor_bps = dlc_effective_floor(median_bps);
         for(int w=0;w<nw;w++){
             long b=stats[w].blocks; long blkrate=(long)((double)(b-prev_blocks[w])/tick_s);
             long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
@@ -4617,7 +4864,7 @@ static long dl_catchup(const char* dir, int min_workers){
             }
             char flag[48]="";
             if(kids[w]!=0 && byte_rate>=0.0){
-                if(dlc_dead_weight(byte_rate, b-prev_blocks[w])){
+                if(median_bps > 0.0 && dlc_dead_weight(byte_rate, b-prev_blocks[w], floor_bps)){
                     dead_ticks[w]++;
                     if(dead_ticks[w]>=g_cfg.dead_weight_ticks){
                         long bidx = stats[w].held_idx;
@@ -4695,7 +4942,23 @@ static long dl_catchup(const char* dir, int min_workers){
             char avgrbuf[16], avgwbuf[16];
             dlc_fmt_rate(avgrbuf,sizeof avgrbuf,cumulative_bytes/(double)elapsed_secs);
             dlc_fmt_rate(avgwbuf,sizeof avgwbuf,cumulative_write_bytes/(double)elapsed_secs);
-            fprintf(stderr,"[dlc] -- peers banned this run: %ld of %d --\n", nbanned, nlive);
+            fprintf(stderr,"[dlc] -- dead-weight floor this tick: %.1f KB/s (pool median %.1f KB/s, absolute %.1f KB/s) --\n",
+                    floor_bps/1024.0, median_bps/1024.0, (double)g_cfg.dead_weight_bps/1024.0);
+            /* nbanned counts ban EVENTS, and the workers' amnesty path clears
+             * banned[] without decrementing it -- so this used to print
+             * "715 of 119", more bans than peers. Report both truthfully:
+             * how many are banned RIGHT NOW (scan the shared array the workers
+             * actually read) and how many ban events there have been. */
+            { long cur = 0; for(int q = 0; q < nlive; q++) if(banned[q]) cur++;
+              if(nbanned == cur)
+                  fprintf(stderr,"[dlc] -- peers banned: %ld of %d --\n", cur, nlive);
+              else
+                  fprintf(stderr,"[dlc] -- peers banned: %ld of %d now (%ld ban event(s) so far; the rest were handed back by amnesty) --\n",
+                          cur, nlive, nbanned); }
+            { extern int peer_no_witness_count(void); extern unsigned long long peer_no_witness_skips(void);
+              if(peer_no_witness_count())
+                  fprintf(stderr,"[dlc] -- %d peer(s) dropped for lacking NODE_WITNESS; %llu redial(s) skipped since --\n",
+                          peer_no_witness_count(), peer_no_witness_skips()); }
     fprintf(stderr,"[dlc] -- average since start: %s recv, %s write --\n",avgrbuf,avgwbuf);
         }
     }
@@ -5974,6 +6237,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                             g_node_status->bans[i].until = 0;
                             result = 1; break;
                         }
+                    if(result == 1) banlist_persist();
                 } else {
                     /* ---- RPC-8 (audit 2026-09-03) ----
                      * This used to refuse any prefix that was not a multiple
@@ -6047,6 +6311,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             } else if(op == RPC_CTL_CLEARBANNED){
                 for(int i = 0; i < RPC_MAX_BANS; i++) g_node_status->bans[i].until = 0;
                 fprintf(stderr,"[ctl] ban list cleared\n");
+                banlist_persist();
                 result = 1;
             } else {
                 result = -1;
@@ -7226,6 +7491,10 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern void rpc_chain_set_maxtipage(long);
       rpc_chain_set_gbt_policy(g_cfg.blockmaxweight, g_cfg.blockreservedweight, g_cfg.blockmintxfee_satkvb,
                                g_cfg.blockversion, g_cfg.printpriority);
+      { extern void rpc_chain_set_mine_on_demand(int);
+        /* Core: MineBlocksOnDemand() == consensus.fPowNoRetargeting -- so
+         * -blockversion is honoured on regtest and nowhere else. */
+        rpc_chain_set_mine_on_demand(g_chainp->pow_no_retargeting); }
       rpc_chain_set_maxtipage(g_cfg.maxtipage); }
     { extern void (*txr_on_accept)(const unsigned char*, const unsigned char*, unsigned long);
       txr_on_accept = g_cfg.walletnotify[0] ? txr_walletnotify_hook : 0; }
@@ -8344,14 +8613,13 @@ int main(int argc, char** argv){
       fprintf(stderr, "[boot] tx-validation snapshot %s (%.2fs) -- inbound peers inherit it\n",
               ok ? "ready" : "UNAVAILABLE (inbound tx will be dropped, not accepted)",
               phase_elapsed(&txdv_pt)); }
-    /* Each chain keeps its own logs under <chain-datadir>/logs/ -- the asm
-     * logger (node_log_open) writes there via the cwd, so a regtest run can
-     * never interleave with the mainnet log. */
+    /* Each chain logs into its OWN directory -- the asm logger
+     * (node_log_open) writes via the cwd, which is the chain datadir, so a
+     * regtest run can never interleave with the mainnet log. The file is
+     * debug.log, as Core's is, and Core separates chains the same way: by
+     * directory, not by filename. logs/ is still created because the
+     * benchmark and soak harnesses put their own files there. */
     mkdir("logs", 0755);
-    if(g_chainp->id != CHAIN_MAIN)
-        ;   /* logs/bitcoind.log inside the CHAIN's directory -- per-chain by
-             * location now that every chain (main included) has its own
-             * subdirectory; the old bitcoind.<chain>.log suffix is redundant */
     /* `dir` is the EFFECTIVE (per-chain) datadir from here on: the forked
      * download worker re-chdir()s into it and utxo_live opens its files
      * there -- on the first regtest boot the worker's chdir(absp) put the
@@ -8398,6 +8666,7 @@ int main(int argc, char** argv){
      * reads its tip from index.dat's length */
     { long tr = archive_trim_derived_tails();
       if(tr < 0) fprintf(stderr,"[boot] WARNING: could not trim the derived files past the tip: %s\n", strerror(errno)); }
+    { extern void par_set(int); par_set(g_cfg.par); }   /* -par: script-verification threads (Core semantics) */
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
     /* A fresh non-main datadir self-seeds its own genesis at index 0 (the
      * mainnet archive got genesis by a one-time injection, 5f36dee -- a
@@ -8411,6 +8680,10 @@ int main(int argc, char** argv){
      * mainnet datadir then built an archive shifted by one -- the serial leg
      * appends the first block a peer sends, and no peer relays genesis. See
      * archive_seed.h. */
+    /* the ban list, before anything dials or accepts: a restart must not
+     * forgive a ban (Core loads banlist.json at startup and sweeps expiries). */
+    { int nb = banlist_load((long long)time(NULL), banlist_restore_one);
+      if (nb < 0) fprintf(stderr, "[ban] banlist.json could not be read -- starting with no bans\n"); }
     { int sd = archive_seed_genesis_if_empty(store_buf, g_chainp->genesis, (unsigned long)g_chainp->genesis_len);
       if(sd < 0){ fprintf(stderr,"[boot] failed to seed the %s genesis block\n", g_chainp->name); return 1; }
       if(sd == 1) fprintf(stderr,"[boot] %s genesis seeded at height 0 (empty archive)\n", g_chainp->name); }
@@ -8619,19 +8892,16 @@ int main(int argc, char** argv){
          * clamps this down to however many confirmed-live peers it finds
          * (and up to 64 max), so an over-large request here just becomes a
          * ceiling, not a guarantee. */
-        /* Core -par semantics: 0 == auto (use the machine), negative == leave
-         * that many cores free. CLI arg still wins when given. `par` is the
-         * closest Core equivalent to this node's chunk-claiming worker count;
-         * dl_catchup already clamps the result down to however many
-         * confirmed-live peers it finds, so this is a ceiling, not a promise. */
+        /* The DOWNLOAD chunk-worker count is bmc.catchupworkers, NOT -par.
+         * Core's -par is the script-verification thread count and now means
+         * exactly that here too (tx_verify.c txv_script_threads); it used to
+         * be wired to this number instead, so par=8 halved the download and
+         * left verification using every core -- the opposite of the ask.
+         * dl_catchup clamps this down to however many confirmed-live peers it
+         * finds, so it is a ceiling, not a promise. */
         int catchup_workers;
         if(argc>=6) catchup_workers = atoi(argv[5]);
-        else {
-            long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<1) ncpu=4;
-            if(g_cfg.par > 0)      catchup_workers = g_cfg.par;
-            else if(g_cfg.par < 0) catchup_workers = (int)(ncpu + g_cfg.par);  /* leave |par| free */
-            else                   catchup_workers = 16;                       /* auto: prior default */
-        }
+        else        catchup_workers = g_cfg.catchup_workers;   /* bmc.catchupworkers, default 16 */
         if(catchup_workers<1) catchup_workers=1;
         if(catchup_workers>64) catchup_workers=64;
         fprintf(stderr,"[boot] config: datadir=%s port=%d (%s) listen=%d nwant=%d catchup_workers=%d (%s)\n",

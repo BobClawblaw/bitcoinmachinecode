@@ -316,3 +316,55 @@ See the repo README for the full topology. The traps that recur:
 - macOS `sed -i` requires a backup-suffix argument. A failed `sed` in an
   `a && b && c` chain silently skips the rest while a later line still runs.
 - Git worktrees embed an absolute path tied to the host that created them.
+
+## 11. A threshold calibrated at one point of the chain is wrong at every other
+
+The fresh-sync benchmarks of 2026-09-06 (runs 4 through 7) spent hours
+running a node that was **killing its own healthy peers**. The operator's
+verdict on reading the log: *"a crime against good coding"* — and it is
+recorded here as what not to do, because every piece of it looked reasonable
+on the day it was written.
+
+**What the code did.** The download evicted any worker under an absolute
+32 KB/s "dead-weight" floor. That floor was calibrated near the tip, where a
+block is a megabyte and 32 KB/s is a stalled connection. At height 50,000 a
+block is ~200 bytes and a serial fetch is bounded by the round trip, so a
+*perfectly healthy* worker moves ~9 KB/s. The rule declared every one of them
+dead. Run 7: 655 evictions in the first 30 minutes, 478 of them under 5 KB/s,
+195 after zero chunks, 181 after two full chunks — peers that had served us
+blocks, banned for being early in the chain. 1,227 evictions by the hour.
+
+**Why nobody saw it for four runs.** Three reasons, each a rule of its own:
+
+1. *The metric was in the wrong units for the question.* The question was
+   "is this peer worse than the others?" and the answer was measured in
+   absolute bytes per second, which depends on block size far more than on
+   the peer. The fix that worked is a floor **relative to the pool's own
+   median** — it asks the actual question, and it is what a person would ask.
+2. *The probe measured something other than what the choice needed.* Peers
+   were "confirmed live" by a TCP connect succeeding, then handed to workers
+   in DNS-seed order. Liveness is not throughput. One timed 2,000-header fetch
+   per peer, done once up front, put the fast peers in the worker slots and
+   cost 40 seconds.
+3. *A test in a file named for parity pinned the defect.* `test_dialhelper`'s
+   "seven corners" asserted that 2 KB/s with 50 blocks per tick is dead
+   weight — the exact healthy early-chain peer — and passed on every gate.
+   A test that encodes a wrong belief is worse than no test: it makes the
+   wrong belief look verified.
+
+**The counter-example that made the lesson stick.** The first attempt at a
+fix went the *other* way — evict faster while untried peers remain. It cut
+time-to-first-eviction from 249 s to 112 s and produced **four times fewer
+blocks**, because every eviction costs a handshake and throws away partial
+chunk work. Speeding up a wrong decision does not make it right. That
+experiment is recorded in the commit that rejected it, so it is not retried.
+
+**Rule.** Before writing a threshold, write down what it is calibrated
+against and what happens at the other end of the range. If the answer is
+"it is wrong there", the threshold must be relative, adaptive, or gone. And
+when a peer, a worker, a process is being killed, the log line must say
+*what it was measured at and what the bar was*; "dead weight" with no
+numbers is how this ran for four benchmarks.
+
+Fixed in PR #61 (`peer-selection-2026-09-06`); measured at 5 min 19 s on the
+same peer pool: 41,974 blocks against ~16,000, zero evictions against 400+.

@@ -48,7 +48,7 @@ typedef struct {
     int  utxo_compact_threshold;
 
     /* Bitcoin Core options honoured by name and unit */
-    int  dbcache_mb;             /* Core -dbcache: UTXO cache MB (def 450)   */
+    int  dbcache_mb;             /* Core -dbcache: UTXO cache MB (Core def 1024) */
     int  connect_timeout_ms;     /* Core -timeout    (def 5000ms)            */
     int  peer_timeout_s;         /* Core -peertimeout(def 60s)               */
     int  port;                   /* Core -port                               */
@@ -138,6 +138,7 @@ typedef struct {
                                       * below: hashblock, hashtx, rawblock, rawtx,
                                       * sequence. Core default 1000.                      */
     int  par;                    /* Core -par: worker threads, 0 = auto      */
+    int catchup_workers;   /* bmc.catchupworkers: parallel download chunk workers (NOT -par) */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
     long mempoolexpiry_h;        /* Core -mempoolexpiry (hours, 0 = never)   */
