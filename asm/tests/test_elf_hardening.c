@@ -24,7 +24,7 @@ static int fails = 0;
 static void ck(const char* l, int c){ if (c) printf("  ok  %s\n", l); else { printf("  FAIL %s\n", l); fails++; } }
 
 int main(int argc, char** argv){
-    const char* path = argc > 1 ? argv[1] : "daemon/bitcoinmcd";
+    const char* path = argc > 1 ? argv[1] : "daemon/bmcbitcoind";
     FILE* f = fopen(path, "rb");
     if (!f){ printf("  FAIL cannot open %s\n", path); return 1; }
     if (fseek(f, 0, SEEK_END)) { fclose(f); return 1; }

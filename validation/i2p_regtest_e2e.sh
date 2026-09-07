@@ -13,7 +13,7 @@
 #   4. a real STREAM CONNECT to a remote destination through the router
 #      carries bytes (validation/i2p_remote_probe, run separately).
 set -u
-BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bitcoinmcd}
+BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/wallet_cli}
 SAM=${SAM:-127.0.0.1:7656}
 WORK=${WORK:-/tmp/i2p-e2e-$$}

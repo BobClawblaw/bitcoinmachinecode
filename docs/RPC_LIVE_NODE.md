@@ -12,7 +12,7 @@
 
 Goal: answer the RPCs that need **live** node state — `getconnectioncount`,
 `getpeerinfo`, `getnetworkinfo`, `getmempoolinfo`, `getrawmempool`,
-`sendrawtransaction`, `getchaintips` — which the standalone `bitcoin_rpcd`
+`sendrawtransaction`, `getchaintips` — which the standalone `bmc_rpcd`
 (a separate read-only process over the datadir) structurally cannot.
 
 ## The constraint that shapes everything: the fork model
@@ -44,7 +44,7 @@ easy part; the state bridge is the design.
 ## Sliced plan (lowest-risk first)
 
 Each slice is independently testable and shippable. The live daemon
-(`bmc-bitcoind`) is production, so every slice is built + tested on a scratch
+(`bmcbitcoind`) is production, so every slice is built + tested on a scratch
 serve instance and only deployed behind the normal gate.
 
 ### Slice 1 — foundation: shared status + connection counts  ← this change
@@ -65,7 +65,7 @@ serve instance and only deployed behind the normal gate.
 - Embed `rpc_server_start` on its background thread in the serve parent (before
   `serve_mux`, `main.c:3237`); `rpc_server_stop` in the shutdown path.
 - Build: link `rpc_server.o rpc_commands.o rpc_chain.o rpc_json.o rpc_net.o
-  rpc_node.o` + the missing wallet prims into `daemon/bitcoinmcd`; guard against
+  rpc_node.o` + the missing wallet prims into `daemon/bmcbitcoind`; guard against
   TUs already in `DAEMONOBJS`.
 
 ### Slice 2 — `getpeerinfo`

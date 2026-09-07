@@ -170,7 +170,7 @@ int main(void){
     /* the ONE discussed divergence in this list (2026-09-07): the pid file
      * default follows the daemon's name, so nothing we write carries Core's
      * daemon name. The `pid` key keeps Core's semantics. */
-    ck("pid file defaults to bitcoinmcd.pid (discussed divergence)", !strcmp(g_cfg.pidfile, "bitcoinmcd.pid"));
+    ck("pid file defaults to bmcbitcoind.pid (discussed divergence)", !strcmp(g_cfg.pidfile, "bmcbitcoind.pid"));
 
     { const char* tmp = "test_parity.conf";
       FILE* f = fopen(tmp, "w");

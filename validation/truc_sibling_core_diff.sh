@@ -29,7 +29,7 @@
 set -u
 CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build-zmq/bin}
 ROOT=${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
-BMC_BIN=${BMC_BIN:-$ROOT/asm/daemon/bitcoinmcd}
+BMC_BIN=${BMC_BIN:-$ROOT/asm/daemon/bmcbitcoind}
 WORK=${WORK:-/tmp/truc-diff-$$}
 CORE_DIR=$WORK/core; BMC_DIR=$WORK/bmc
 CORE_P2P=19644; CORE_RPC=19660; BMC_P2P=19655; BMC_RPC=19646
