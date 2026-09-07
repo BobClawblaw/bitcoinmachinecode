@@ -39,6 +39,26 @@ testnet4, signet (public or custom) and regtest.
 - Reorg handling with cumulative-work fork choice, an undo log, and crash
   recovery of a partially applied block.
 
+**Initial block download**
+
+- Headers-first, then 16 download workers each fetching a 40-block chunk
+  with one `getdata` per chunk (blocks placed by hash as they arrive), inside
+  a 4,096-block window above the first unfilled height — Core's
+  `BLOCK_DOWNLOAD_WINDOW` scaled to this node's in-flight count — so the
+  archive consolidates monotonically and a chunk a worker gives up on goes
+  to a retry ring, never a hole left behind. An idle worker fetches the
+  chunk blocking the window after 2 s (Core's stalling timeout).
+- Peers are ranked by a timed header sample before the download; a peer is
+  dropped only by a stall clock (nothing for 120 s) or, at a chunk boundary
+  with nothing discarded, for running under half the pool's median. Every
+  threshold is relative to the pool (`docs/ENGINEERING_RULES.md` rule 11).
+- The UTXO connect runs alongside the download in the same process; the
+  status line prints an ETA (`DD:HH:MM:SS` at the last ten minutes' rate),
+  what is in flight, and how old the oldest gap is.
+- A restart mid-sync keeps its headers (`headers.dat` ahead of the archive
+  is the normal state) and resumes; a fresh datadir has genesis seeded on
+  every chain.
+
 **Storage**
 
 - One append-only framed block archive (`blk*.dat` + positional `index.dat`
@@ -410,6 +430,14 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   the result).
 - **`addrindex`** and the `getaddressbalance`/`getaddresstxids` methods are
   an extension with no Core equivalent.
+- **Names.** The daemon is `bmcbitcoind`, the CLI `bmc_cli`, the standalone
+  RPC daemon `bmc_rpcd`, and the pid file defaults to `bmcbitcoind.pid`
+  (Core: `bitcoind.pid`) — nothing this node ships or writes carries a
+  Bitcoin Core file name, so both can live on one box. Every other config
+  default matches Core's (`docs/audits/CONFIG_DEFAULTS_VS_CORE_2026-09-06.md`).
+- **Download window.** 4,096 blocks above the first unfilled height against
+  Core's 1,024: Core keeps ~128–160 blocks in flight, this node 640, and the
+  window preserves Core's slack ratio rather than its constant.
 - **ZMQ `sequence` topic** is refused by configuration rather than
   published; the other four topics are supported.
 - **Wallet.** The seed wallet always carries bech32 (wpkh); `createwalletdescriptor`
@@ -498,3 +526,8 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
 Experimental software, AI-authored throughout, verified differentially
 against Bitcoin Core rather than independently audited by humans. It is not
 a replacement for Bitcoin Core and should not hold funds.
+
+Fresh-sync benchmarks against Bitcoin Core v31.1 on the same box are being
+run through September 2026; Core's measured time is 21 h 3 m. The landing
+notes in [`docs/releases/`](docs/releases/) record each change and the run
+that measured it; the daily record is in [`worklog/`](worklog/).
