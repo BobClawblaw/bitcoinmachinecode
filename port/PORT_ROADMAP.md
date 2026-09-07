@@ -658,21 +658,85 @@ DONE:
 - [x] the identity-heights retarget revert (3441651d) -- upstream's own
       genesis-at-index-0 fix confirms identity is the upstream truth too.
 
-QUEUE (the interpreter review series, IR-1..IR-17, x86 commits enumerated;
-each has a pinning test that currently fails on the ARM twin):
-- [ ] IR-1: every net-growing stack op fails STACK_SIZE at the cap
-      (406a1b6e) -- test_interp / test_scr_interp_bounds.
-- [ ] IR-2: pop the hashtype byte BEFORE the DER parse (406a1b6e pair;
-      test_checksig_diff "C=0 asm=1 -- S consumed the hashtype byte").
-- [ ] IR-6: OP_ROLL rotates 4-byte handles, not 524-byte records (4efb0c4a).
-- [ ] IR-8: OP_CODESEPARATOR under CONST_SCRIPTCODE refused before the
-      fExec gate (fe3fb996) -- test_scr9_policy_flags.
-- [ ] IR-10: verify_p2pkh bounds every cursor advance (a7c16c7a) --
-      test_ir10_p2pkh_bounds.
-- [ ] IR-12/13/14/17: four LOWs from the interpreter review (b7455a84).
-- [ ] test_taproot_verify_diff SEGFAULTS on the unported twin (rc=139) --
-      expected to clear with the IR series.
-All in asm/bitcoin_interp.asm (+bitcoin_script.asm for IR-2/SCR-8 followups);
-the pinning tests are in the tree and green on x86. After the IR series:
-one sweep (round 31), then deploy arm-12 (the node currently runs the
-pre-130-merge build, which is round-29-green and safe).
+QUEUE (the interpreter review series, IR-1..IR-17) -- **CLOSED 2026-09-06**,
+every pinning test green natively. Each item below names the ARM commit; the
+two items nobody had listed (SCR-2's vfexec bound, IR-3) were the real bugs.
+
+- [x] IR-2 (406a1b6e) -- hashtype popped BEFORE the DER parse, at all three ARM
+      sites: bitcoin_checksig.S (both sv_checksig arms), bitcoin_multisig.S
+      (step 3), bitcoin_script.S (verify_p2pkh). test_checksig_diff green. a15a8a4c
+- [x] IR-6 (4efb0c4a) -- OP_ROLL rotates 4-byte handles. bitcoin_scriptcodec.S
+      (hnd_base/hnd_dirty/hnd_tab, HND_ADDR/HND_OF, hnd_begin/hnd_end, all nine
+      primitives) + bitcoin_interp.S (script_eval registers/unregisters).
+      The pinning roll storm: 27.9 s -> 128 ms against a 400 ms bound. ARM takes
+      the helpers as MACROS, not x86's local `call`s -- there is no callee-saved
+      scratch below x19, so a frameless `bl` would write x30 with no save area
+      (5 UNSAVED-CLOBBER findings) and put a prologue back into the very
+      primitives IR-6 exists to keep frameless. Caught while verifying it: the
+      four position accessors lost their `ret` when ELEM_PTR became HND_ADDR and
+      FELL THROUGH into each other -- stack_top_ptr subtracted a second position
+      and at sp<2 indexed hnd_tab with a 32-bit -1 (0xffffffff << 2), SIGSEGV on
+      the first OP_TUCK. A fall-through is invisible to the ABI auditor.
+- [x] IR-8 (fe3fb996) -- OP_CODESEPARATOR under CONST_SCRIPTCODE at BASE refused
+      at .not_push, BEFORE the fExec gate; SE_OP_CODESEPARATOR (53) added.
+- [x] IR-1 (9952a1c4) -- 17 x86 sites land as 12 ARM ones (the twin loops
+      OP_3DUP and OP_2OVER into one body each); all route to .stack_size_err.
+- [x] IR-4 (71b6de1f) -- vfexec_all_true is one compare against the cached first
+      false, not a scan per opcode. ARM stores NO_FALSE as -1 but tests it as
+      `cmp xN,xzr; b.lt` -- `cmp` takes no negative 12-bit immediate.
+- [x] **SCR-2 (audit 2026-09-03) -- FOUND, NOT IN ANY QUEUE: the ARM twin never
+      got the vfexec bound.** x86 grew the condition stack 1 KiB -> 5 MiB and
+      made vfexec_push refuse at the cap; the twin had the 1024-byte buffer with
+      an UNBOUNDED push, so the 1025th nested OP_IF wrote over vfexec_sp and the
+      rest of the TLS block -- the attacker-controlled OOB write from P2P input
+      the audit named. It was hiding in the sweep as "test_scr_interp_bounds:
+      IR-4 child killed by signal 11 (alarm: quadratic scan)": signal 11 is
+      SIGSEGV, not the alarm, and the child died inside vfexec_push.
+- [x] **IR-3 (9df5e95a) -- FOUND while root-causing test_taproot_verify_diff's
+      rc=139 (the roadmap expected that to "clear with the IR series"; it did
+      not, because it was never an IR-6/1/8 symptom).** The shared C hook writes
+      ctx->hard_fail/hard_err at +96/+100 (sizeof taproot_checksig_ctx is 104);
+      bitcoin_taproot_verify.S reserved 96 with the script_state immediately
+      below, so every tapscript CHECKSIG wrote 8 bytes past the ctx onto the
+      state's main_elems -- and NOTHING READ hard_fail BACK, so a hard failure
+      (invalid non-empty sig, empty pubkey, weight budget) was a silent ACCEPT
+      where Core fails: `OP_CHECKSIG OP_DROP OP_1` with an empty pubkey.
+      L_CTX is now 104 B (L_ST/L_LEAFV move 8 down), both fields zeroed, and a
+      truthy stack is rejected with the byte-identical reason string.
+- [x] IR-10 (a7c16c7a) -- bounds only, deliberately: .Lparse_varint already
+      documents "clobbers x2-x7, preserves everything else", so the walk's
+      counter/end/cursor survive it and the twin passed the 253-byte-scriptSig
+      case x86 failed. prevout+index, scriptSig, sequence and both pushes are now
+      bounded, and only direct pushes of 1..75 are accepted.
+- [x] IR-12 (b7455a84) -- is_opsuccess_c zero-extends its C-int argument
+      (`mov w0,w0`, the ARM `mov eax, edi`).
+- [x] IR-13 (b7455a84) -- S compared against the group order N before N/2
+      (new order_n constant): S >= N lax-parses to a ZERO sig, which is not high,
+      so the answer is NULLFAIL, not SIG_HIGH_S. Verdict already agreed; the
+      error code reaching the RPC did not.
+- [x] IR-7 (1138aed2) -- the twin still zeroed the whole 528,000-byte arena per
+      call and memcpy'd the whole arena in both P2SH directions; narrowed to
+      `sp x ELEM_SIZE` live records, as x86 did. ~1.06 MB of dead traffic per
+      legacy input on the connect path.
+- [x] IR-14 -- the parity oracle (asm/bitcoin_verify.c) is arch-neutral C: merged
+      with the pull, nothing to port. IR-15/IR-16 (redundant FindAndDelete,
+      73-entry dispatch chain) and IR-11 (8-mod-16 frames) are x86-side/ABI
+      notes with no ARM obligation; IR-5 and IR-9 are pure C.
+- [x] IR-17 (b7455a84) -- verified already correct, no change: bitcoin_sigops.S
+      already labels script_sigops "(accurate=false) ... multisig = 20" and
+      script_sigops_accurate as the DecodeOP_N one, and script_sigops does
+      `mov x2,#0`. The inversion the x86 header had was never copied here.
+
+STILL OPEN after the series:
+- [ ] 7 sweep rows BUILD-FAIL, all one cause, all new with the 2026-09-06 x86
+      perf batch: test_muhash, test_muhash_mul_diff, test_lsm_flush_sort_diff,
+      test_utxo_probe_diff, bench_muhash, bench_lsm_flush_sort, bench_utxo_probe
+      link x86-only num3072_* (BMI2/ADX + AVX-512 IFMA) --
+      `undefined reference to num3072_cpu_has_adx / num3072_mul_force_path /
+      num3072_mul_current_path`. Needs an ARM num3072 twin (or plain-C path
+      selectors) before those four DIFFERENTIALS run here at all.
+- [ ] bitcoind.S: the CC-2 hook table exists as data symbols but the mux does not
+      CALL them -- no sendcmpct announcement after verack, no hook-selected
+      getdata type. The x86 daemon has both.
+- [ ] then deploy arm-12 (the node still runs the pre-130-merge, round-29-green
+      build; arm-12 would carry the mempool slot rework + everything above).

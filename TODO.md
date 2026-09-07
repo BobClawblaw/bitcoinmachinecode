@@ -1,4 +1,4 @@
-# TODO — arm-port state after 2026-09-06 (the 1019-commit main batch merged + the 2026-09-05 port batch done, round 29 green; arm-12 deploy next)
+# TODO — arm-port state after 2026-09-07 (the IR-1..IR-17 interpreter-review series is CLOSED, round 31 green: pass 367 / fail 4 env-only; arm-12 deploy is the next move)
 
 Everything below is landed on `arm-port` and pushed. History lives in
 `worklog/2026-09-0{1,2,3}.md`; the per-module port status is
@@ -43,6 +43,42 @@ Everything below is landed on `arm-port` and pushed. History lives in
       mutations / 7,805 interpreter probes, 0 divergences, 0 engine failures.
 
 ## Open (next sessions)
+- [ ] **Deploy arm-12 — everything it needs is ready; only the decision is missing.**
+      The port is round-31 green (pass 367 / fail 4, and those 4 are the standing
+      env-only bench rows), the IR series is closed, and `build_daemon.sh`'s link
+      re-runs rc=0 with no undefined symbols (checked against a temp output —
+      `daemon_out/bitcoind` was deliberately left untouched on the round-29-green
+      build, mtime 15:33, because two bitcoind processes are live off it). What arm-12
+      would carry: the 130-commit merge, the mempool 80-byte slot + cached-wtxid
+      rework, the CC-2 hook table, and the IR series — including two consensus false
+      accepts (IR-3's ignored `hard_fail`, IR-1's ignored STACK_SIZE) and two
+      memory-safety holes (IR-3's 8-byte ctx overrun, SCR-2's unbounded `vfexec_push`)
+      that the RUNNING binary still has.
+- [ ] **7 sweep rows BUILD-FAIL — new with the 2026-09-06 x86 perf batch, one cause:**
+      test_muhash, test_muhash_mul_diff, test_lsm_flush_sort_diff, test_utxo_probe_diff,
+      bench_muhash, bench_lsm_flush_sort, bench_utxo_probe fail to link on
+      `num3072_cpu_has_adx` / `num3072_mul_force_path` / `num3072_mul_current_path` —
+      x86-only BMI2/ADX + AVX-512 IFMA path selectors with no AArch64 twin. Until that
+      exists (an ARM num3072, or C path selectors that always report the generic path),
+      four DIFFERENTIALS — muhash, muhash_mul, lsm_flush_sort, utxo_probe — do not run
+      on this port at all. That is a coverage hole, not just a build nuisance.
+- [ ] **bitcoind.S CC-2 is half-wired:** the hook table exists as data symbols
+      (`g_peer_sendcmpct`, `g_cmpct_hook_type`, 130411fb) but the mux never CALLs them
+      — no sendcmpct announcement after verack, no hook-selected getdata type. The x86
+      daemon does both, so compact-block receive is inert here.
+- [x] **The IR-1..IR-17 interpreter-review series — CLOSED 2026-09-07, round 31 green.**
+      Ported: IR-1/2/3/4/6/7/8/10/12/13 (a15a8a4c 3711a746 f8c9474f 9cffb4c5 37310ae3
+      228e8c5e). Arch-neutral C, nothing to port: IR-5/9/14. x86-side notes with no ARM
+      obligation: IR-11/15/16. IR-17 verified already correct in the twin. Two findings
+      were on NO queue and are the ones that mattered: **SCR-2's `vfexec` bound had never
+      been ported** (1 KiB condition stack with an unbounded push — the 1025th nested
+      OP_IF wrote over `vfexec_sp` and the rest of the TLS block; the sweep had been
+      reporting it as `IR-4 child killed by signal 11`, and signal 11 is SIGSEGV, not
+      the alarm), and **IR-3's taproot ctx** (the twin reserved 96 bytes where
+      `taproot_checksig_ctx` is 104, so every tapscript CHECKSIG wrote 8 bytes past the
+      ctx onto the script_state's `main_elems` — and nothing read `hard_fail` back, so
+      an invalid-sig / empty-pubkey / over-budget tapscript was a silent ACCEPT). Per
+      item in `port/PORT_ROADMAP.md`; narrative in worklog/2026-09-06.md Session 5.
 - [x] `SIG_FINDANDDELETE` ordering — fixed 2026-09-03 on both architectures in
       one commit (f7d28ce): the CHECKSIG encoding-error arms run Core's
       CONST_SCRIPTCODE strip before reporting SIG_DER / SIG_HIGH_S /
