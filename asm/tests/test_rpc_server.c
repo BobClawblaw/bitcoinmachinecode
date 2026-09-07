@@ -1,7 +1,7 @@
 /* test_rpc_server.c -- end-to-end HTTP JSON-RPC SERVER endpoint test.
  *
  * Proves the PRODUCTION server path (not an in-process stub): it forks/execs
- * the ACTUAL daemon/bitcoin_rpcd binary on an ephemeral port, then drives it
+ * the ACTUAL daemon/bmc_rpcd binary on an ephemeral port, then drives it
  * two ways:
  *
  *   1. over a raw loopback socket, asserting Core-bit-exact HTTP behavior:
@@ -160,7 +160,7 @@ int main(void) {
     pid_t srv = fork();
     if (srv == 0) {
         dup2(pout[1], 2); close(pout[0]); close(pout[1]);
-        char* argv[] = { (char*)"daemon/bitcoin_rpcd", NULL };
+        char* argv[] = { (char*)"daemon/bmc_rpcd", NULL };
         /* TEST_RPC_PORT=0 -> HTTP server binds an ephemeral port (see daemon) */
         setenv("TEST_RPC_PORT", "0", 1);
         /* RPC-4: a short total-read budget so the slow-client case below
@@ -186,7 +186,7 @@ int main(void) {
         kill(srv, SIGKILL); waitpid(srv, NULL, 0);
         return 1;
     }
-    printf("ok  : bitcoin_rpcd up on 127.0.0.1:%d\n", port);
+    printf("ok  : bmc_rpcd up on 127.0.0.1:%d\n", port);
 
     char req[8192];
 

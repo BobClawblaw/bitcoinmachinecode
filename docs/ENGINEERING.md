@@ -82,7 +82,7 @@ audit. Treat it as untrusted until it has. See the warning banner in
 |   |-- validation/           #   Python big-int / Core oracles + differentials
 |   `-- wallet_*.c            #   wallet glue (core/store/txlog/msgsign/book)
 |-- config/
-|   `-- bitcoin.conf          #   RPC/network configuration (bitcoin_rpcd reads)
+|   `-- bitcoin.conf          #   RPC/network configuration (bmc_rpcd reads)
 |-- data/                     #   DURABLE CHAIN STORAGE (single unified archive)
 |   |-- blk00000.dat ...      #   append-only framed block files (rolling)
 |   |-- index.dat             #   positional height -> (offset/len/hash) index
@@ -209,7 +209,7 @@ Two knobs:
 | `BMC_TEST_KEEP` | if set and non-empty, keep the directory and print its path, for post-mortem inspection. |
 
 Paths that must still resolve against the source tree after the `chdir` —
-fixtures, `daemon/bitcoinmcd`, the shim executables — go through `tt_src("…")`.
+fixtures, `daemon/bmcbitcoind`, the shim executables — go through `tt_src("…")`.
 A harness that hands a datadir to a forked child or a spawned daemon passes
 `tt_workdir()`. When adding a harness that touches storage, add `tt_isolate()`
 and list `$(TEST_TMPDIR_H)` in its Makefile prerequisites.
@@ -221,7 +221,7 @@ targets — the daemon binary must be rebuilt by hand:
 
 ```bash
 cd /storage/bitcoinmachinecode/asm
-gcc -no-pie -O2 -o daemon/bitcoinmcd daemon/main.c sha256.o bitcoin_hash.o \
+gcc -no-pie -O2 -o daemon/bmcbitcoind daemon/main.c sha256.o bitcoin_hash.o \
     bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o \
     bitcoind.o node_log.o bitcoin_headers.o
 ```
@@ -310,25 +310,25 @@ python3 tests/stress_scalar.py     # scalar arith: 3k iters
 All binaries live under `asm/daemon/`. Paths below assume
 `cd /storage/bitcoinmachinecode/asm/daemon`.
 
-### 3.1 `bitcoinmcd` — the node daemon (primary deliverable)
+### 3.1 `bmcbitcoind` — the node daemon (primary deliverable)
 
 `main.c` is a thin CLI driver over the all-assembly node core. It resolves
 `<dir>` to an absolute path, `chdir`s into it, and operates on the store there.
 
 ```
-bitcoinmcd sync  <dir>                  # connect to a built-in loopback fake
+bmcbitcoind sync  <dir>                  # connect to a built-in loopback fake
                                       # peer, run node_sync (IBD), report height
-bitcoinmcd ibd   <dir>                  # FULL IBD as one asm pass (node_ibd =
+bmcbitcoind ibd   <dir>                  # FULL IBD as one asm pass (node_ibd =
                                       # headers-first persist + getdata block
                                       # bodies + cons_verify + store)
-bitcoinmcd follow <dir>                 # realtime keep-up on one connection
+bmcbitcoind follow <dir>                 # realtime keep-up on one connection
                                       # (re-runs node_sync, inv-announces tip)
-bitcoinmcd serve <dir> <port> [nwant] [catchup_workers]
+bmcbitcoind serve <dir> <port> [nwant] [catchup_workers]
                                       # PRODUCTION MODE: self-healing catch-up,
                                       # then continuous download + inbound serve
-bitcoinmcd serve-test <dir> <port> <peer_host> <out_port>
+bmcbitcoind serve-test <dir> <port> <peer_host> <out_port>
                                       # loopback outbound-mux test (no network)
-bitcoinmcd server-test <dir>            # end-to-end serve test (socketpair)
+bmcbitcoind server-test <dir>            # end-to-end serve test (socketpair)
 ```
 
 **`serve` mode (production)** — the mode you run to operate the node:
@@ -445,10 +445,10 @@ Commands available: `getnewaddress`, `getrawchangeaddress`, `getaddressinfo`,
 `decoderawtransaction` (+ more as the dispatch/render layer grows — see
 `asm/rpc_commands.c`).
 
-### 3.5 `bitcoin_rpcd` — the HTTP JSON-RPC *server*
+### 3.5 `bmc_rpcd` — the HTTP JSON-RPC *server*
 
 ```
-bitcoin_rpcd [-conf=<path>] [-rpcport=<n>] [-rpcuser=<u>] [-rpcpassword=<p>]
+bmc_rpcd [-conf=<path>] [-rpcport=<n>] [-rpcuser=<u>] [-rpcpassword=<p>]
 ```
 
 Production server side of the RPC transport. Loads `rpcport`/`rpcuser`/
@@ -495,9 +495,9 @@ names); if you run the project's own binaries, invoke them directly (see 3.1)
 instead of relying on these:
 
 ```
-scripts/start.sh        # systemctl start bmc-bitcoind, else `bitcoinmcd -datadir=<d> serve`
+scripts/start.sh        # systemctl start bmcbitcoind, else `bmcbitcoind -datadir=<d> serve`
 scripts/status.sh       # systemctl status + bmc_cli getblockchaininfo
-scripts/stop.sh         # systemctl stop bmc-bitcoind, else `bmc_cli stop`
+scripts/stop.sh         # systemctl stop bmcbitcoind, else `bmc_cli stop`
 scripts/worklog.sh [YYYY-MM-DD]   # open (create+seed) today's daily worklog
 ```
 
@@ -507,7 +507,7 @@ scripts/worklog.sh [YYYY-MM-DD]   # open (create+seed) today's daily worklog
 
 ### 4.1 `config/bitcoin.conf`
 
-Read by `bitcoin_rpcd` (and modeled after Bitcoin Core). Current contents:
+Read by `bmc_rpcd` (and modeled after Bitcoin Core). Current contents:
 
 > **Ports, corrected 2026-08-27.** RPC and P2P must not collide. Production
 > runs `port=8332` (P2P) and `rpcport=8331` (JSON-RPC). The embedded `serve`
@@ -580,7 +580,7 @@ config without a `chain` key is byte-identical to before this existed.
 
 ```
 +---------------------------------------------------------------+
-| CLI/RPC layer   wallet_cli · bmc_cli · bitcoin_rpcd · cli  |
+| CLI/RPC layer   wallet_cli · bmc_cli · bmc_rpcd · cli  |
 |                 (JSON-RPC transport: rpc_json/rpc_net/         |
 |                  rpc_commands/rpc_server)                      |
 +---------------------------------------------------------------+
@@ -755,7 +755,7 @@ inbound serve). Use 28333 if 8333 is taken by a co-located Core:
 
 ```bash
 cd /storage/bitcoinmachinecode/asm/daemon
-./bitcoinmcd serve /storage/bitcoinmachinecode/data 28333 &
+./bmcbitcoind serve /storage/bitcoinmachinecode/data 28333 &
 ```
 
 Query the stored chain:
@@ -769,7 +769,7 @@ Query the stored chain:
 Use the JSON-RPC layer (start server, then query with the client):
 
 ```bash
-./bitcoin_rpcd &                       # reads config/bitcoin.conf
+./bmc_rpcd &                       # reads config/bitcoin.conf
 ./bmc_cli getnewaddress  # ...  (against 127.0.0.1:8332)
 ```
 

@@ -24,11 +24,11 @@
 #   --keep   leave both nodes running afterwards (for poking at state)
 #
 # Needs: a Bitcoin Core build at $CORE_BIN (scratch build, never the
-# production install) and this repo's daemon/bitcoinmcd already built.
+# production install) and this repo's daemon/bmcbitcoind already built.
 set -u
 
 CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
-BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bitcoinmcd}
+BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/wallet_cli}
 WORK=${WORK:-/tmp/bumpfee-e2e-$$}
 CORE_DIR=$WORK/core
