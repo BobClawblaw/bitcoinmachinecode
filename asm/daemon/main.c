@@ -47,6 +47,7 @@
 #include "anchors.h"           /* CC-4: block-relay-only legs + anchors.dat */
 #include "hdr_lowwork.h"
 #include "archive_seed.h"
+#include "ibd_pipeline.h"      /* the whole chunk in one getdata, not one block per round trip */       /* slot 0 is genesis on EVERY chain: a shifted archive reads every height one block high */       /* CC-5: hold low-work header pages until the chain proves its work */
 #include "banlist.h"          /* the ban list survives a restart, as Core's does */       /* slot 0 is genesis on EVERY chain: a shifted archive reads every height one block high */       /* CC-5: hold low-work header pages until the chain proves its work */
 #include "invalid_set.h"       /* CC-10: invalidateblock / reconsiderblock */
 #include "cmpct_recv.h"        /* CC-2: BIP152 compact block receive */
@@ -4095,6 +4096,14 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)cp2));
                     if(fdc<0){ claimed[idx]=0; continue; }
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+                    /* 2026-09-06: a getdata is small and is the ONLY thing
+                     * standing between this worker and the peer's reply, so
+                     * Nagle can only delay it -- and p2p_write sends a message
+                     * as more than one segment, which is exactly the shape
+                     * that waits for the peer's delayed ACK. Measured on a
+                     * loopback fixture: ~45 ms per getdata without, ~5 ms
+                     * with the peer ACKing immediately. */
+                    { int one=1; setsockopt(fdc,IPPROTO_TCP,TCP_NODELAY,&one,sizeof one); }
                     if(node_handshake(fdc)==1 && peer_has_witness(cand)){
                         fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
                         mystat->held_idx=idx;   /* so the parent can ban THIS peer on early-kill */
@@ -4146,7 +4155,14 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             sigaction(SIGALRM,&sa,&old);   /* SIGUSR1 already registered for this worker's whole life, above */
             mux_sync_budget_fired=0;
             alarm(DLC_CHUNK_BUDGET_SECS);
-            long r=node_ibd_blocks_s(fd, st, hst, lo, n, buf, sizeof buf, scratch, cap);
+            /* 2026-09-06: the whole chunk in ONE getdata, blocks placed by
+             * hash as they arrive (daemon/ibd_pipeline.c). node_ibd_blocks_s
+             * asked for one block and waited for it before asking for the
+             * next, so every block cost a full round trip: 16 helpers against
+             * 16 real peers moved 0.23-1.2 MB/s each on the fresh-sync
+             * benchmark. Core keeps 16 blocks in flight per peer for the same
+             * reason. Same validation per block, block for block. */
+            long r=ibd_fetch_chunk_pipelined(fd, st, hst, lo, n, buf, (unsigned)sizeof buf, scratch, cap);
             alarm(0); sigaction(SIGALRM,&old,NULL);
             store_reload(st);
             guard++;

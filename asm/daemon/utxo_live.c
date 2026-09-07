@@ -3155,6 +3155,7 @@ long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole){
  * So: hash what we read and compare it with the record. A mismatch is NOT a
  * consensus failure -- it is a not-ready archive -- so it stops the pass like
  * a hole and the next pass retries. One pread of a cached page per block. */
+#define UTXO_ARCH_RETRY 4       /* fresh re-reads of one height before the pass gives up */
 static unsigned long long g_arch_mismatch = 0;
 unsigned long long utxo_live_archive_mismatches(void){ return g_arch_mismatch; }
 /* Opened per call, NOT cached in a static: a cached descriptor outlives the
@@ -3162,6 +3163,8 @@ unsigned long long utxo_live_archive_mismatches(void){ return g_arch_mismatch; }
  * process, and a cached fd from the first made every block of the second
  * mismatch, stopping the pass at zero blocks. Two syscalls per block against
  * a cached page, on a path that already verifies every script in the block. */
+extern void store_rd_close(void* st);
+extern void store_map_close(void* st);
 static int archive_hash_at(long h, unsigned char out[32]){
     int fd = open("index.dat", O_RDONLY);
     if (fd < 0) return 0;
@@ -3209,6 +3212,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
     u64 tm_call0[TM_N]; memcpy(tm_call0, g_tm_total, sizeof tm_call0);
     u64 tm_call_t0 = tm_now(), tm_tick_t0 = tm_call_t0;
     memset(g_tm_tick, 0, sizeof g_tm_tick);
+    int arch_retry = 0;
     for (long h = g_applied_height + 1; h <= tip; h++){
         u64 tm_r0 = tm_now();
         long len = store_read_at(store_buf, h, blockbuf, sizeof blockbuf);
@@ -3226,17 +3230,35 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
             g_last_stop_reason = UTXO_STOP_FAIL;
             break;
         }
-        /* the body must be the block the index names at this height */
+        /* The body must be the block the index names at this height. A
+         * mismatch means this process is looking at STALE bytes, not that the
+         * archive is wrong: measured 2026-09-06 with the pipelined
+         * downloader, the on-disk record and body agreed perfectly while the
+         * reader kept returning something else, at the same height, for
+         * minutes. The fast reader caches a read fd and an mmap window per
+         * blk file (bitcoin_store_fast.asm); store_reload does not drop
+         * either, so a pass that just retries reads the same stale bytes
+         * forever -- the connect stuck at height 2,845 across 14 passes.
+         * So: drop both caches and re-read the SAME height, a bounded number
+         * of times, before giving up on the pass. */
         { unsigned char want32[32], got32[32];
           if (archive_hash_at(h, want32)){
               block_hash(got32, blockbuf);
               if (memcmp(want32, got32, 32) != 0){
                   g_arch_mismatch++;
-                  fprintf(stderr, "[utxo_live] archive not ready at height %ld: the body is not the block the index records "
-                                  "-- stopping this pass, it retries (mismatch #%llu)\n", h, (unsigned long long)g_arch_mismatch);
+                  if (++arch_retry <= UTXO_ARCH_RETRY){
+                      store_rd_close(store_buf);      /* cached read fds */
+                      store_map_close(store_buf);     /* cached mmap windows */
+                      h--;                            /* re-read this height with fresh handles */
+                      continue;
+                  }
+                  fprintf(stderr, "[utxo_live] archive not ready at height %ld after %d fresh re-reads: the body is not the "
+                                  "block the index records -- stopping this pass, it retries (mismatch #%llu)\n",
+                          h, UTXO_ARCH_RETRY, (unsigned long long)g_arch_mismatch);
                   g_last_stop_reason = UTXO_STOP_HOLE;
                   break;
               }
+              arch_retry = 0;
           } }
         if (!apply_block_at(blockbuf, (u64)len, h)) {
             /* 3.3: a VALIDATION failure rejects the block; see the reject
