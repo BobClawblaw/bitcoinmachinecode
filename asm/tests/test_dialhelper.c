@@ -323,6 +323,16 @@ int main(void){
         int full_ok = 1; for (long i = 0; i < DLC_RETRY_MAX; i++) if (!dlc_retry_push(ctl, i * 40)) full_ok = 0;
         ok(full_ok && !dlc_retry_push(ctl, 1), "a full ring refuses the next push (the pass's own hole scan picks it up) rather than overwriting");
         ok(dlc_retry_pop(ctl) == 0, "and drains from the oldest"); }
+      /* run 14's two-minute stall: a failed fetch must cost the peer its
+       * standing, cost the worker a pause, and a help must land on the
+       * claim grid */
+      { ok(dlc_ema_after_failure(800.0*1024) == 400.0*1024, "a failed fetch halves the peer's rate (800 -> 400 KB/s)");
+        ok(dlc_ema_after_failure(0.0) == 1.0, "a never-measured peer that fails is marked tried (1.0), not left untried");
+        ok(dlc_fail_backoff_ms(1) == 200 && dlc_fail_backoff_ms(5) == 1000 && dlc_fail_backoff_ms(10) == 2000 && dlc_fail_backoff_ms(400) == 2000,
+           "backoff grows 200 ms per attempt and caps at 2 s (400 attempts take ~13 min, not 45 s)");
+        ok(dlc_help_chunk_lo(82565, 1) == 82561, "first hole 82,565 on a pass starting at 1: the help chunk is [82561,82600], the owner's, not [82560,82599]");
+        ok(dlc_help_chunk_lo(82565, 0) == 82560, "...and on a pass starting at 0 it is [82560,82599]");
+        ok(dlc_help_chunk_lo(5, 40) == 40, "a hole below the span start: the span's first chunk"); }
       /* slot rotation still breaks ties: 0 and 2 share the top ema, so from
        * slot 3 the walk reaches 0 by wrap in (slot+a) order */
       volatile double eq[4] = {9.0, 0.0, 9.0, 0.0};
