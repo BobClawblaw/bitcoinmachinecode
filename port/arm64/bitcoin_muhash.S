@@ -130,9 +130,45 @@ num3072_full_reduce:
     .size num3072_full_reduce,.-num3072_full_reduce
 
 /* ================= num3072_mul(a=x0, b=x1) : a = a*b mod p ================= */
+/* PATH DISPATCHER -- the twin of num3072_mul in asm/bitcoin_muhash.asm, kept with
+ * the SAME path numbering the shared harnesses use (0 unprobed, 1 ADX, 2 generic,
+ * 3 IFMA) so test_muhash, test_muhash_mul_diff and bench_muhash build and run
+ * here instead of failing to link.
+ *
+ * AArch64 has exactly ONE body. BMI2/ADX (mulx/adcx/adox) and AVX-512-IFMA are
+ * x86 instructions, not a slow-and-a-fast choice, so the probe caches 2 and every
+ * path value -- including a forced 1 or 3 -- runs the generic body (x86 branches
+ * to num3072_mul_adx / num3072_mul_ifma at this point). num3072_cpu_has_adx and
+ * num3072_cpu_has_ifma return 0 rather than pretending, and the shared tests are
+ * written for exactly that answer: they print "SKIP <body>: this CPU cannot run
+ * that num3072_mul body", test_muhash still runs Core's multiply and set vectors
+ * through "generic/" (which its table marks always-available), and
+ * test_muhash_mul_diff reports "SKIP, no accelerated body on this CPU (generic
+ * only)" -- honest coverage, not a vacuous pass. current_path() returns exactly
+ * what force_path() stored, which is what those tests assert.
+ *
+ * Scratch: x8 only. x0/x1 are the arguments and must reach the body untouched;
+ * the body initialises everything else itself. */
     .global num3072_mul
     .type num3072_mul,%function
 num3072_mul:
+    adrp x8, num3072_mul_path
+    ldrb w8, [x8, :lo12:num3072_mul_path]
+    cbnz w8, .Lmul_body
+    /* The probe site. x86 runs CPUID.(EAX=7,ECX=0) here -- and sha256's
+     * CRY-1 lesson is why the leaf number matters -- then caches the answer so
+     * the process pays it once. On AArch64 the answer is known at build time:
+     * generic. Writing it keeps current_path() truthful after a re-probe (0). */
+    mov  w8, #2
+    adrp x9, num3072_mul_path
+    strb w8, [x9, :lo12:num3072_mul_path]
+.Lmul_body:
+    b    num3072_mul_generic
+    .size num3072_mul,.-num3072_mul
+
+    .global num3072_mul_generic
+    .type num3072_mul_generic,%function
+num3072_mul_generic:
     stp  x29,x30,[sp,#-16]!
     stp  x19,x20,[sp,#-16]!
     stp  x21,x22,[sp,#-16]!
@@ -290,7 +326,53 @@ num3072_mul:
     ldp  x19,x20,[sp],#16
     ldp  x29,x30,[sp],#16
     ret
-    .size num3072_mul,.-num3072_mul
+    .size num3072_mul_generic,.-num3072_mul_generic
+
+/* ---- the test/bench seam (x86 num3072_mul_force_path family) --------------
+ * force_path(p): 0 = re-probe on the next call (what production always sees),
+ * 1 = adx, 2 = generic, 3 = ifma. current_path() reports the stored byte.
+ * Nothing in the daemon calls either; they exist so a host can be made to
+ * execute a body it would not auto-select. On AArch64 all of them land on the
+ * generic body -- see the dispatcher's note for why that is the honest answer
+ * rather than a stub. */
+    .global num3072_mul_force_path
+    .type num3072_mul_force_path,%function
+num3072_mul_force_path:
+    adrp x8, num3072_mul_path
+    strb w0, [x8, :lo12:num3072_mul_path]
+    ret
+    .size num3072_mul_force_path,.-num3072_mul_force_path
+
+    .global num3072_mul_current_path
+    .type num3072_mul_current_path,%function
+num3072_mul_current_path:
+    adrp x8, num3072_mul_path
+    ldrb w0, [x8, :lo12:num3072_mul_path]
+    ret
+    .size num3072_mul_current_path,.-num3072_mul_current_path
+
+/* BMI2 (mulx) + ADX (adcx/adox), and AVX-512F + AVX-512IFMA: x86 instruction
+ * sets. AArch64 reports them absent -- which is true, and is the answer the
+ * shared tests gate their body loops on. */
+    .global num3072_cpu_has_adx
+    .type num3072_cpu_has_adx,%function
+num3072_cpu_has_adx:
+    mov  w0,#0
+    ret
+    .size num3072_cpu_has_adx,.-num3072_cpu_has_adx
+
+    .global num3072_cpu_has_ifma
+    .type num3072_cpu_has_ifma,%function
+num3072_cpu_has_ifma:
+    mov  w0,#0
+    ret
+    .size num3072_cpu_has_ifma,.-num3072_cpu_has_ifma
+
+    .section .bss
+    .align 2
+num3072_mul_path:                   /* 0 unprobed, 1 adx, 2 generic, 3 ifma */
+    .zero 1
+    .text
 
 /* ================= chacha20_keystream_k0(out=x0, blocks=x1, key=x2) ================= */
     .global chacha20_keystream_k0

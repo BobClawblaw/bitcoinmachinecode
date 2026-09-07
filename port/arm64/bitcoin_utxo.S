@@ -12,7 +12,7 @@
  *   utxo_get(u,txid,index,&v,&h,&cb,&script,&slen)->1/0
  *   utxo_del(u,txid,index)->1/0 ; utxo_count(u)->n
  *   utxo_walk_live(u,cb,ctx)->emitted
- *   utxo_prefetch (hint, no-op)
+ *   utxo_prefetch / utxo_prefetch_n (PRFM hint over the home slot)
  */
 	.section .text
 	.balign 4
@@ -471,12 +471,64 @@ memcpy_asm:
 .ydone:
 	ret
 
-/* ---------- utxo_prefetch (hint only: no-op) ---------- */
+/* ---------- utxo_prefetch / utxo_prefetch_n: warm the home slot ---------- */
+/* The twin of asm/bitcoin_utxo.asm's pair. It used to be a plain no-op here,
+ * so the ARM probe never warmed the line its get was about to touch.
+ * AArch64's PRFM is the same KIND of instruction as x86's PREFETCHT0: a hint
+ * that is architecturally incapable of faulting, which is why the x86 note
+ * clamps the count for loop hygiene rather than for safety. */
+.equ UTXO_PREFETCH_LINES,6
 	.global utxo_prefetch
 	.type utxo_prefetch,%function
 utxo_prefetch:
-	ret
+	mov  x3,#UTXO_PREFETCH_LINES
+	b    utxo_prefetch_n
 	.size utxo_prefetch,.-utxo_prefetch
+
+/* utxo_prefetch_n(u=x0, txid=x1, index=x2, lines=x3) -> void
+ * `lines` consecutive 64-byte lines from the home slot's first byte; 0 issues
+ * nothing, more than 64 clamps to 64. This is the seam the shared tests need:
+ * utxo_prefetch_n(u, txid, index, 2) is exactly the 2026-08-23 behaviour, which
+ * tests/test_utxo_probe_diff runs as its control arm and tests/bench_utxo_probe
+ * sweeps with --pf-lines.
+ * Holding u and lines in x6/x7 across the utxo_hash call mirrors the x86 note
+ * that justifies r10/r11 there: utxo_hash touches x0 and x9-x14 only (and x30,
+ * which is ours to care for), so nothing on the stack is needed. */
+	.global utxo_prefetch_n
+	.type utxo_prefetch_n,%function
+utxo_prefetch_n:
+	/* x30 MUST be saved around the utxo_hash call. The x86 original just does
+	 * `call utxo_hash` and `ret`, and that is safe THERE because x86 call/ret are
+	 * stack-based. Here `ret` reads x30, which the `bl` overwrites with the
+	 * address just after itself -- so the tail ret jumped back into this
+	 * function's own body and looped forever. It cost test_utxo_probe_diff and
+	 * bench_utxo_probe a 900 s timeout each (they had never run here before, so
+	 * there was no baseline to compare against) and it is exactly what
+	 * `make abi-a64-check`'s UNSAVED-CLOBBER gate is for. */
+	stp  x29,x30,[sp,#-16]!
+	mov  x29,sp
+	mov  x6,x0			/* u */
+	mov  x7,x3			/* lines */
+	mov  x0,x1			/* txid */
+	mov  x1,x2			/* index */
+	ldr  x2,[x6,#8]			/* mask */
+	bl   utxo_hash			/* x0 = byte offset of the home slot from u */
+	add  x0,x6,x0
+	mov  x4,#64
+	cmp  x7,x4
+	csel x7,x4,x7,hi		/* clamp: a hint past the mapping is harmless, a
+					   runaway loop is not */
+	cmp  x7,#0
+	b.eq .pn_done
+.pn_loop:
+	prfm pldl1keep,[x0]
+	add  x0,x0,#64
+	subs x7,x7,#1
+	b.ne .pn_loop
+.pn_done:
+	ldp  x29,x30,[sp],#16
+	ret
+	.size utxo_prefetch_n,.-utxo_prefetch_n
 
 /* ---------- utxo_walk_live(u=x0,cb=x1,ctx=x2)->emitted ---------- */
 	.global utxo_walk_live

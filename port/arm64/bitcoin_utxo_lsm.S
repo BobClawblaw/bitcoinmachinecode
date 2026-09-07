@@ -734,6 +734,57 @@ mac_sort_desc:
 	ret
 	.size mac_sort_desc,.-mac_sort_desc
 
+/* ---------------------------------------------------------------------------
+ * utxo_lsm_sort_desc(a=x0, b=x1, n=x2) / utxo_lsm_set_sort_mode(mode=x0) --
+ * the flush sort's exported seam, from asm/bitcoin_utxo_lsm.asm. Contract is
+ * mac_sort_desc's: n 64-byte descriptors in a, b scratch of >= n*64 bytes, the
+ * sorted result ends in a, equal keys keep input order (stable).
+ *
+ * READ THIS BEFORE TRUSTING A "radix == merge" LINE OUT OF THIS PORT.
+ * x86 has TWO bodies: mac_sort_desc (merge) and mac_rsort_desc -- an MSD radix
+ * over compact 16-byte entries, the 541 ms -> 91 ms flush win at 4M
+ * descriptors, and the DEFAULT over there. The AArch64 twin has ONE body: the
+ * radix was not ported. So
+ *   - mac_sort_mode defaults to 0 (merge) here, where x86 defaults to radix;
+ *   - set_sort_mode(1) is recorded, and the dispatch below takes its radix
+ *     branch -- which lands on the merge body, because that is all there is;
+ *   - test_lsm_flush_sort_diff on ARM therefore compares the merge body with
+ *     ITSELF. What that proves is real but narrower than it sounds: a replayed
+ *     operation sequence yields a byte-identical run, i.e. the flush is
+ *     deterministic and its scratch is not leaking state. It does NOT show two
+ *     implementations agreeing, and bench_lsm_flush_sort's "radix" row here is
+ *     the merge body measured twice, not a radix measurement.
+ * Before the seam existed, neither file linked here at all -- no information,
+ * and no evidence about flush determinism either. Porting mac_rsort_desc is
+ * the open item in port/PORT_ROADMAP.md. It is bulk-build cost, not consensus,
+ * and it is exactly the sort of code that must not be rushed: a wrong order
+ * writes wrong runs, and a wrong run is a lost coin.
+ * ------------------------------------------------------------------------- */
+	.global utxo_lsm_sort_desc
+	.type utxo_lsm_sort_desc,%function
+utxo_lsm_sort_desc:
+	adrp x8, mac_sort_mode
+	ldr  x8, [x8, :lo12:mac_sort_mode]
+	cbnz x8, .Lsd_radix
+	b    mac_sort_desc
+.Lsd_radix:
+	b    mac_sort_desc		/* mac_rsort_desc: not ported */
+	.size utxo_lsm_sort_desc,.-utxo_lsm_sort_desc
+
+	.global utxo_lsm_set_sort_mode
+	.type utxo_lsm_set_sort_mode,%function
+utxo_lsm_set_sort_mode:
+	adrp x8, mac_sort_mode
+	str  x0, [x8, :lo12:mac_sort_mode]
+	ret
+	.size utxo_lsm_set_sort_mode,.-utxo_lsm_set_sort_mode
+
+	.section .bss
+	.align 3
+mac_sort_mode:				/* 0 = merge (the ARM default; x86 defaults to 1) */
+	.quad 0
+	.text
+
 /* ============================================================================
  * utxo_lsm_init(lst=x0) -> 1 ok / -1 err
  * ========================================================================== */

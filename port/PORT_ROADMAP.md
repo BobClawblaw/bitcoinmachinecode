@@ -749,38 +749,43 @@ STILL OPEN after the series:
       header-phase connect where the hunks overlapped. New upstream rows run natively:
       test_ibd_pipeline, test_banlist_persist, test_shared_stress pass; bench_ibd_fetch
       runs.
-- [ ] **8 sweep rows BUILD-FAIL, two distinct causes.**
-      (a) 7 of them -- test_muhash, test_muhash_mul_diff, test_lsm_flush_sort_diff,
-      test_utxo_probe_diff, bench_muhash, bench_lsm_flush_sort, bench_utxo_probe -- fail
-      to link x86-only `num3072_*` (BMI2/ADX + AVX-512 IFMA): `undefined reference to
-      num3072_cpu_has_adx / num3072_mul_force_path / num3072_mul_current_path`. Needs an
-      ARM num3072 twin (or plain-C path selectors); until then four DIFFERENTIALS do not
-      run here at all -- a coverage hole, not a build nuisance.
-      (b) 1 of them -- test_par_threads: upstream's `7781987c` added the Makefile RULE
-      without committing `asm/tests/test_par_threads.c` and left it out of the `test:`
-      run list, so x86's own gate never builds it either. Upstream's to fix.
-- [x] **origin/main merged through `c134d496`** (two pulls back to back: 10 commits to
-      `3b9e8005`, then 7 to `c134d496`). The product name moved TWICE in one morning:
-      `bitcoind` -> `bitcoinmcd` (x86 `8ff54a63`) -> **`bmcbitcoind`** (x86 `90e9aa3a`,
-      "everything we ship starts with bmc" so nothing of ours can be mistaken for a
-      Core file; pid `bmcbitcoind.pid`, RPC daemon `bmc_rpcd`, unit
-      `bmcbitcoind.service`, deploy name `bmcbitcoind.live`). Ported:
-      build_daemon.sh emits `daemon_out/bmcbitcoind`, and because the name moved twice
-      in 12 minutes parity_sweep.sh no longer hard-codes it -- it keeps name LISTS
-      (`bmcbitcoind bitcoinmcd bitcoind`, `bmc_rpcd bitcoin_rpcd`), resolves whichever
-      binary exists newest-first, links every name into the asm scratch layout and
-      remaps every arg form, so the next rename costs one list edit. SOURCE names do
-      not move and were not touched: `port/arm64/bitcoind.S` is the core-module twin
-      (x86 kept `bitcoind.asm/.o`) and `asm/daemon/bitcoin_rpcd.c` keeps its name.
-      Sweep round 34 on the merged tree: see the 2026-09-07 DEPLOYMENT_HISTORY entry.
-      NOT deployed: `bmc-arm.service` still names `daemon_out/bitcoind` (the arm-12
-      binary), so a restart comes back on the pre-merge build; the rename deploy needs
-      TWO steps -- move `ExecStart` to `daemon_out/bmcbitcoind` (+ `daemon-reload`) and
-      retire the old path into `rollback/` so nothing stale stays runnable behind the
-      unit. The ARM unit's own NAME (`bmc-arm.service`) is a per-box label, not the
-      product name; renaming it to `bmcbitcoind-arm.service` for convention is an
-      operator call. Also merged: the chunk budget is a stall clock, not a hidden
-      ~470 KB/s absolute bar (rule 11's second instance).
+- [x] **The 7 real BUILD-FAIL rows are closed** (round 35: pass 374 / fail 4 env-only
+      / bench-ok 18 / build-fail 1 / compared 396 of 432 -- up from pass 370 /
+      build-fail 8). They were THREE separate missing seams from the 2026-09-06 x86
+      perf batch, each one silencing a differential that had never run on ARM:
+      (a) `num3072_mul` is now a real dispatcher with the same path numbering the
+      shared harnesses use (0 unprobed / 1 adx / 2 generic / 3 ifma) plus
+      `force_path`/`current_path`/`cpu_has_adx`/`cpu_has_ifma`. BMI2/ADX and
+      AVX-512-IFMA are x86 instruction sets, not a slow-and-a-fast choice, so the
+      probes answer 0 and every path runs the one body that exists -- which is what
+      the shared tests are written to handle: they print their own SKIP lines and
+      `test_muhash` still drives Core's multiply and set vectors through
+      "generic/" (31 checks that had never executed on ARM). Baseline now on
+      record: num3072_mul 2856 ns, muhash_insert 4415 ns.
+      (b) `utxo_prefetch_n(u,txid,index,lines)` exists -- and it is a real PRFM
+      hint, where the twin used to be a no-op, so the ARM probe never warmed the
+      line its get was about to touch. `test_utxo_probe_diff` passes with the
+      prefetch arm matching the reference answer for answer, and
+      `bench_utxo_probe` sweeps --pf-lines here now.
+      (c) `utxo_lsm_sort_desc` / `utxo_lsm_set_sort_mode` are exported. **Read the
+      comment in port/arm64/bitcoin_utxo_lsm.S before believing a "radix == merge"
+      line from this port**: the AArch64 twin has ONE body -- `mac_rsort_desc` was
+      not ported -- so mode 1 dispatches to the merge sort, and the diff test here
+      proves flush determinism (a replayed sequence yields a byte-identical run),
+      NOT agreement between two implementations.
+- [ ] **Port `mac_rsort_desc` (the flush-descriptor MSD radix) -- now measured, not
+      guessed.** bench_lsm_flush_sort at N=4,000,000 descriptors: ARM merge
+      **2854 ms** (713 ns/key, 90 MB/s of descriptors) against x86's merge at 541 ms
+      and x86 radix at 91 ms. So the twin is 5.3x off x86's MERGE baseline before
+      anyone asks about the radix -- which says the byte-at-a-time
+      `mac_cmp_key`/`mac_copy_rec` primitives are the first target (a 64-byte
+      descriptor copy as ldp/stp pairs and an 8-byte-at-a-time key compare), and
+      the radix second. Bulk-build cost, not consensus -- and precisely the code
+      not to rush: a wrong order writes wrong runs, and a wrong run is a lost coin.
+- [ ] 1 build-fail row left, and it is upstream's: `test_par_threads` -- `7781987c`
+      added the Makefile rule without committing `asm/tests/test_par_threads.c`,
+      and left the target out of the `test:` run list, so x86's gate never builds
+      it either.
 - [ ] bitcoind.S: the CC-2 hook table exists as data symbols but the mux does not
       CALL them -- no sendcmpct announcement after verack, no hook-selected
       getdata type. The x86 daemon has both.
