@@ -4291,6 +4291,11 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                     char a[16], bmed[16]; dlc_fmt_rate(a,sizeof a,chunk_bps); dlc_fmt_rate(bmed,sizeof bmed,med);
                     fprintf(stderr,"[dlc w%d] %s rotated after a CLEAN chunk: %s over the chunk vs pool median %s (bar: half the median); nothing discarded\n",
                             w, mystat->peer, a, bmed);
+                    /* hand the verdict's number to the picker: the parent's
+                     * tick-EMA lags (alpha 0.5 over 10 s ticks), and a peer
+                     * whose EMA still read above the bar was re-picked 17
+                     * times in five minutes on the 2026-09-07 scratch node. */
+                    { long hi = mystat->held_idx; if(hi>=0 && hi<nlive) ema[hi] = chunk_bps; }
                     close(fd); fd=-1; DLC_RELEASE();
                     slot=(slot+1)%(nlive>0?nlive:1);
                 }
