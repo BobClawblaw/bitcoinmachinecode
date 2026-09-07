@@ -330,7 +330,37 @@ block had been applied once already, under an earlier height.
   AND absent — 600 blocks over 3 loopback peers is not enough concurrency to
   provoke it.
 
-**ROOT CAUSE, corrected 2026-09-06 22:30Z: the ARCHIVE is wrong, written
+**ROOT CAUSE, corrected again 2026-09-07 00:30Z: the fetcher's hold, not the
+store, and not the reader.** Two conclusions above were wrong in turn; both
+are kept because how they were wrong is the lesson.
+
+What settled it was proving the store correct without any network:
+`tests/test_shared_stress` drives `store_append_shared` the way sixteen
+helpers do -- interleaved 40-block chunks, bodies from 200 B to 3 MB, retried
+heights, a `store_reload` per chunk -- 48,000 appends across three rounds and
+16,000 more with multi-megabyte bodies, **zero inconsistencies**. The
+concurrent append is serialised. That left one file to blame.
+
+`daemon/ibd_pipeline.c` parks out-of-order arrivals in a bump-allocated hold.
+Its drain subtracted the drained block's length from the bump pointer, which
+is only right when the drained block was the *last* one parked. Park 1 and 3,
+deliver 0: 1 drains, 3 stays because 2 is missing, and the pointer lands
+exactly on 3's offset whenever len(1) == len(3) -- which, for early-chain
+blocks of identical size, is most of the time. The next arrival is written
+over the parked 3, and 3 is later drained with another block's bytes under
+its own hash: a record that names X and points at Y. `test_ibd_pipeline`
+now delivers 1,3,0,4,2 with equal-size blocks; the old fetcher writes one
+wrong body, the fixed one none. Fix and test are on `batch/2026-09-06-ibd-
+pipeline-v2`.
+
+**What is proven and what is not.** The mechanism is proven in a unit test and
+the store is proven clean under load. Not proven: that this accounts for the
+specific record at 44,863 in run 5 -- its chunk boundaries were 40-aligned
+from 0, which puts 44,888 in the *adjacent* chunk, and the hold is per chunk.
+The branch stays unmerged until a real pipelined sync runs clean past
+48,585, 74,765 and 44,863.
+
+**(superseded) ROOT CAUSE as stated 2026-09-06 22:30Z: the ARCHIVE is wrong, written
 wrong. It is a writer race, not a stale reader.**
 
 The 16:00Z conclusion below was mistaken and is kept here because the way it
