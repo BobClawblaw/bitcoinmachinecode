@@ -8210,7 +8210,7 @@ static int datadir_lock_acquire(const char* effdir){
     if(flock(datadir_lock_fd, LOCK_EX|LOCK_NB) != 0){
         if(errno == EWOULDBLOCK)
             fprintf(stderr,"[boot] FATAL: cannot obtain a lock on data directory %s. "
-                           "bmc-bitcoind is probably already running.\n", effdir);
+                           "bitcoinmcd is probably already running.\n", effdir);
         else
             fprintf(stderr,"[boot] FATAL: cannot lock %s/.lock: %s\n", effdir, strerror(errno));
         close(datadir_lock_fd); datadir_lock_fd = -1;
@@ -8240,7 +8240,7 @@ int main(int argc, char** argv){
         snprintf(_b, sizeof _b,
             "\n"
             "======================================================================\n"
-            "===== bmc-bitcoind  LOG START: %s\n"
+            "===== bitcoinmcd  LOG START: %s\n"
             "=====   pid %d  v%d.%d.%d  built %s %s  mode=%s\n"
             "======================================================================\n",
             _ts, (int)getpid(), NODE_VERSION_MAJOR, NODE_VERSION_MINOR, NODE_VERSION_PATCH,
@@ -8255,7 +8255,7 @@ int main(int argc, char** argv){
      * that already runs this binary changes.
      *
      * Flags are stripped out first; what remains keeps the old positional
-     * meaning, so `bitcoind -datadir=/x serve` and `bitcoind serve /x` are
+     * meaning, so `bitcoinmcd -datadir=/x serve` and `bitcoinmcd serve /x` are
      * the same invocation. */
     const char* flag_datadir = NULL; const char* flag_conf = NULL;
     { static char* pos[16]; int np = 0;
@@ -8277,7 +8277,7 @@ int main(int argc, char** argv){
         return 2; }
     const char* mode = argv[1];
     /* ---- DMN-10 (audit 2026-09-03): validate the MODE before doing work ----
-     * `bitcoind -datadir=/x serve` is documented as equivalent to the
+     * `bitcoinmcd -datadir=/x serve` is documented as equivalent to the
      * positional form, and it is not: stripping the flag leaves argc == 2, the
      * usage check below passes on flag_datadir, and the serve branch far below
      * is gated on argc >= 3 -- so the process resolved the datadir, chdir'd,

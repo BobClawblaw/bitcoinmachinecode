@@ -16,7 +16,7 @@
 # regtest, hermetic.
 set -u
 R=$(cd "$(dirname "$0")/.." && pwd)
-BIN="${BIN:-$R/asm/daemon/bitcoind}"
+BIN="${BIN:-$R/asm/daemon/bitcoinmcd}"
 [ -x "$BIN" ] || { echo "FAIL: no daemon at $BIN"; exit 1; }
 
 D=$(mktemp -d /tmp/dmn6XXXXXX) || exit 1

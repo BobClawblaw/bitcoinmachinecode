@@ -164,7 +164,7 @@ testnet4, signet (public or custom) and regtest.
 
 ```sh
 cd asm
-make daemon/bitcoind      # the node daemon (asm/daemon/bitcoind)
+make daemon/bitcoinmcd    # the node daemon (asm/daemon/bitcoinmcd; was bitcoind until 2026-09-07)
 make test                 # the full gate: audits + every test harness
 ```
 
@@ -212,7 +212,7 @@ and the archive tools (`check_chain`, `verify`, `dumpblock`, `unified_ibd`,
 2. **Run the daemon.**
 
    ```sh
-   asm/daemon/bitcoind serve /path/to/datadir [port] [nwant] [workers]
+   asm/daemon/bitcoinmcd serve /path/to/datadir [port] [nwant] [workers]
    ```
 
    `serve` is the production mode: it binds the P2P listener, discovers
@@ -268,7 +268,7 @@ After=network-online.target
 [Service]
 User=bitcoin
 WorkingDirectory=/path/to/repo/asm
-ExecStart=/path/to/repo/asm/daemon/bitcoind serve /path/to/datadir
+ExecStart=/path/to/repo/asm/daemon/bitcoinmcd serve /path/to/datadir
 StandardOutput=append:/path/to/repo/logs/main/bitcoin.main.log
 StandardError=append:/path/to/repo/logs/main/bitcoin.main.log
 Restart=on-failure

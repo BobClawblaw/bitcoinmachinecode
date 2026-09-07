@@ -124,7 +124,7 @@ global base58check_encode
 ;   harmless only because the checksum is consumed before work is filled.)
 ;
 ;   Nothing crashed in production, because gcc -O0 -- which is what
-;   daemon/bitcoind is pinned to -- reloads every value from memory around a
+;   daemon/bitcoinmcd is pinned to -- reloads every value from memory around a
 ;   call and so never trusts a callee-saved register. At -O2 it does trust
 ;   them, and tests/test_bip32_extkey segfaulted in strcmp on a `char*` gcc
 ;   had parked in r15 across the call. Caught by tests/test_abi_coverage,
