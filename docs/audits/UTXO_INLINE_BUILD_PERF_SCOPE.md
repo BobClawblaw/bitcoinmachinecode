@@ -330,37 +330,79 @@ block had been applied once already, under an earlier height.
   AND absent — 600 blocks over 3 loopback peers is not enough concurrency to
   provoke it.
 
-**ROOT CAUSE, found 2026-09-06 16:00Z: the reader is stale, not the archive.**
-The experiment above was run — the pipelined build plus the archive guard —
-and it answered cleanly: **the guard fired (14 times, at height 2,845) and the
-false `bad-txns-BIP30` never appeared.** So the connect had been reading bytes
-that are not the block the index records, and applying them under that height
-is what mis-filed the coins.
+**ROOT CAUSE, corrected again 2026-09-07 00:30Z: the fetcher's hold, not the
+store, and not the reader.** Two conclusions above were wrong in turn; both
+are kept because how they were wrong is the lesson.
 
-The archive itself is correct. Parsing `index.dat` and `blk00000.dat` by hand
-at heights 2,843 to 2,847 (record = `[hash32][file_no u32][pos u64][size u32]`,
-body 8 bytes into the frame), every record's hash matches the body it points
-at and matches the Core oracle. Nothing on disk was wrong at any point.
+What settled it was proving the store correct without any network:
+`tests/test_shared_stress` drives `store_append_shared` the way sixteen
+helpers do -- interleaved 40-block chunks, bodies from 200 B to 3 MB, retried
+heights, a `store_reload` per chunk -- 48,000 appends across three rounds and
+16,000 more with multi-megabyte bodies, **zero inconsistencies**. The
+concurrent append is serialised. That left one file to blame.
 
-What is stale is the reader's own caches. `bitcoin_store_fast.asm` keeps, per
-blk file, a cached read fd and an mmap window (`store_rd_init`, `store_map_at`,
-four slots). `store_reload` — which `catchup_run` calls at the top of every
-pass — refreshes the index and the tip but drops NEITHER cache. So a pass that
-hits a stale window retries, reads the same stale bytes, and retries again: the
-connect sat at height 2,845 for 14 consecutive passes and never advanced. The
-serial downloader hit this rarely enough to run 494,074 blocks without tripping
-it; the pipelined one writes about 12x faster and trips it in minutes.
+`daemon/ibd_pipeline.c` parks out-of-order arrivals in a bump-allocated hold.
+Its drain subtracted the drained block's length from the bump pointer, which
+is only right when the drained block was the *last* one parked. Park 1 and 3,
+deliver 0: 1 drains, 3 stays because 2 is missing, and the pointer lands
+exactly on 3's offset whenever len(1) == len(3) -- which, for early-chain
+blocks of identical size, is most of the time. The next arrival is written
+over the parked 3, and 3 is later drained with another block's bytes under
+its own hash: a record that names X and points at Y. `test_ibd_pipeline`
+now delivers 1,3,0,4,2 with equal-size blocks; the old fetcher writes one
+wrong body, the fixed one none. Fix and test are on `batch/2026-09-06-ibd-
+pipeline-v2`.
 
-**The fix has two halves.** The first is landed (PR #49): the connect refuses a
-body that is not the block the index records, so stale bytes can no longer be
-applied — the false rejection and the mis-filed coins are both impossible now.
-The second is not landed: on a mismatch the connect should DROP the stale
-caches (`store_rd_close`, `store_map_close`, both of which exist and are
-already called together by `store_prune_safe` for exactly this reason) and
-re-read the same height rather than stall. That is written and sitting on
-`batch/2026-09-06-ibd-pipeline-v2`; it survived a ten-minute pipelined sync
-with zero stalls and zero rejections, but that run reached only 2,843 blocks
-before it was stopped, so it is NOT proven and NOT merged.
+**What is proven and what is not.** The mechanism is proven in a unit test and
+the store is proven clean under load. Not proven: that this accounts for the
+specific record at 44,863 in run 5 -- its chunk boundaries were 40-aligned
+from 0, which puts 44,888 in the *adjacent* chunk, and the hold is per chunk.
+The branch stays unmerged until a real pipelined sync runs clean past
+48,585, 74,765 and 44,863.
+
+**(superseded) ROOT CAUSE as stated 2026-09-06 22:30Z: the ARCHIVE is wrong, written
+wrong. It is a writer race, not a stale reader.**
+
+The 16:00Z conclusion below was mistaken and is kept here because the way it
+was wrong matters. It rested on hand-parsing a datadir at heights 2,843-2,847
+and finding record and body in agreement, and concluded the reader must be
+returning stale bytes. The fix that followed -- drop the fast reader's cached
+fd and mmap window on a mismatch and re-read -- was then run against a real
+sync (run 5, 22:12Z, the pipelined build with the archive guard):
+
+* **Zero false `bad-txns-BIP30`**, past both heights where earlier pipelined
+  runs died. The guard works: nothing wrong is ever applied.
+* But the connect **wedged** at height 44,862 -- `applied` frozen while the
+  download ran on -- with 30 guard trips a minute at two heights, and
+  dropping the caches did not cure a single one.
+
+Hand-parsing THAT archive settles it. At height 44,863:
+
+| | |
+|---|---|
+| index record's hash | `0000000014121f6d...` |
+| Core oracle's hash for 44,863 | `0000000014121f6d...` — the record is RIGHT |
+| hash of the body at the recorded position | `0000000012ad2107...` |
+| that body's real height, per the oracle | **44,888** |
+
+So the record correctly names block 44,863 and points at bytes belonging to
+block 44,888 -- another block from the SAME 40-block chunk. The archive is
+internally inconsistent, on disk, at rest. No reader could have been right.
+
+`store_append_shared` takes the block-file `flock`, computes the append
+position with `lseek(SEEK_END)`, writes the body, then writes the 48-byte
+record at `height*48`. Two blocks of one chunk ending up at overlapping
+positions is what happens if that sequence is not serialised in practice --
+one writer's bytes land where another's record already points. The serial
+downloader wrote roughly one block per network round trip and never hit it;
+the pipelined one writes a whole chunk per round trip, about 12x the rate,
+and hits it within minutes.
+
+**Next step, and it is a measurement, not a guess:** verify the lock is
+actually held across the position computation and both writes -- print the
+`flock` fd and the computed position per append under a debug flag, run the
+pipelined fetch, and look for two appends that computed the same position.
+Until that is answered the pipelined download stays off main.
 
 **The wider question this raises, which no test covers:** every other reader
 holding a store handle across writes by another process — the RPC block fetch,
@@ -370,6 +412,37 @@ the filter builder, the tx index, the archive verifier — shares those caches.
 build, on an otherwise idle box: five to six minutes to the failure. It does
 NOT reproduce when the box is busy — the second attempt, sharing bandwidth
 with another sync, passed 74,399 blocks cleanly.
+
+### The peer pool, 2026-09-06 night — two defects the download's own log exposed
+
+The wall clock is download-bound and the download is peer-bound, so how the
+sixteen workers choose and keep peers is on the critical path. Run 7's log,
+read with the eviction rule in mind, showed two things:
+
+1. **We killed peers that had served us blocks.** The dead-weight floor was
+   an absolute 32 KB/s, calibrated for megabyte blocks. At height 50,000 a
+   block is ~200 bytes and a serial fetch is round-trip bound, so a healthy
+   worker moves ~9 KB/s -- the floor declared every one of them dead. 655
+   evictions in the first 30 minutes, 478 under 5 KB/s, 195 after zero
+   chunks, 181 after two full chunks. Fixed: the floor is the smaller of the
+   absolute floor and a quarter of the pool's median rate last tick.
+2. **We picked peers blind.** The probe measured only whether a TCP connect
+   succeeded; workers then took the pool in DNS-seed order. Fixed: one timed
+   2,000-header fetch per live peer, pool sorted fastest-first (119 ranked in
+   35 s; best 1,446 KB/s, median 219, 46 silent last).
+
+Tried first and rejected by measurement: evicting *faster* while untried
+peers remain. It shed peers in 112 s instead of 249 and produced four times
+fewer blocks -- churn costs a handshake and abandons partial chunks.
+
+| 5 min 19 s in | run 7 (before) | run 8 (after) |
+|---|---|---|
+| blocks stored | ~16,000 | 41,974 |
+| average receive | 32 KB/s | 100 KB/s |
+| evictions | 400+ | 0 |
+
+Early-chain only so far; whether the gain holds where blocks are large is
+what run 8's wall clock will say.
 
 ## 5. Tests and the proof
 

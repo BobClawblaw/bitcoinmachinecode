@@ -170,14 +170,30 @@ int main(void){
        * serving tiny early blocks. Retuned 2026-09-04 to an OR: the block
        * floor (<10 blocks/tick) binds at every chain depth, and the byte
        * floor decides once the block floor is satisfied. */
-      ok(dlc_dead_weight(2000.0, 0), "2 KB/s and no blocks this tick: dead weight");
-      ok(dlc_dead_weight(2000.0, 9), "2 KB/s and 9 blocks: still dead weight (byte floor binds at any depth)");
-      ok(dlc_dead_weight(2000.0, 50), "2 KB/s and 50 blocks: dead weight too (a block rate can launder bytes)");
-      ok(!dlc_dead_weight(50000.0, 50), "50 KB/s and 50 blocks: pulling its weight, not banned");
-      ok(!dlc_dead_weight(1500000.0, 1), "1.5 MB/s and one block: fine near the tip");
-      ok(dlc_dead_weight(40000.0, 1), "40 KB/s and one block: marginal bytes AND stalled blocks");
-      ok(!dlc_dead_weight(200000.0, 1), "200 KB/s and one block: big blocks, not stalled");
-      ok(!dlc_dead_weight(-1.0, 0), "no rate sample yet: not judged");
+      /* the seven corners, at the ABSOLUTE floor: unchanged in meaning */
+      { double F = (double)g_cfg.dead_weight_bps;
+      ok(dlc_dead_weight(2000.0, 0, F), "2 KB/s and no blocks this tick: dead weight");
+      ok(dlc_dead_weight(2000.0, 9, F), "2 KB/s and 9 blocks: still dead weight (byte floor binds at any depth)");
+      ok(dlc_dead_weight(2000.0, 50, F), "2 KB/s and 50 blocks: dead weight too (a block rate can launder bytes)");
+      ok(!dlc_dead_weight(50000.0, 50, F), "50 KB/s and 50 blocks: pulling its weight, not banned");
+      ok(!dlc_dead_weight(1500000.0, 1, F), "1.5 MB/s and one block: fine near the tip");
+      ok(dlc_dead_weight(40000.0, 1, F), "40 KB/s and one block: marginal bytes AND stalled blocks");
+      ok(!dlc_dead_weight(200000.0, 1, F), "200 KB/s and one block: big blocks, not stalled");
+      ok(!dlc_dead_weight(-1.0, 0, F), "no rate sample yet: not judged"); }
+      /* 2026-09-06: the floor is RELATIVE to the pool's median. The absolute
+       * 32 KB/s floor, calibrated for megabyte blocks, declared every healthy
+       * worker dead at height 50,000 where a block is 200 bytes and a serial
+       * fetch is round-trip bound (~9 KB/s): 655 evictions in 30 min, 181 of
+       * them peers that had served two full chunks. Watched to fail first
+       * with dlc_effective_floor returning the absolute floor always. */
+      { double F = (double)g_cfg.dead_weight_bps;
+      ok(dlc_effective_floor(0.0) == F, "no median yet: the absolute floor (callers skip the kill anyway)");
+      ok(dlc_effective_floor(5.6 * 1024.0) == 0.25 * 5.6 * 1024.0, "pool median 5.6 KB/s (early chain): floor is a quarter of it, 1.4 KB/s");
+      ok(dlc_effective_floor(1000000.0) == F, "pool median ~1 MB/s (later): the absolute floor takes over unchanged");
+      ok(dlc_effective_floor(100.0) == 512.0, "a pathological median cannot push the floor below 512 B/s");
+      double early = dlc_effective_floor(5.6 * 1024.0);
+      ok(!dlc_dead_weight(9.0 * 1024.0, 12, early), "the run-7 case: 9 KB/s and 12 blocks at height 50k is HEALTHY, not dead weight");
+      ok(dlc_dead_weight(300.0, 1, early), "0.3 KB/s and one block at the same floor: genuinely dead, still killed"); }
       if (cwd0[0]) (void)!chdir(cwd0); }
 
     printf("== 6. the boot header fetch: exponential locator, per-page checks ==\n");
