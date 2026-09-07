@@ -82,7 +82,7 @@ fi
 say "stopping bmc-bitcoind for the crossing"
 sudo systemctl stop bmc-bitcoind.service || { say "ABORT: stop failed"; exit 1; }
 sleep 5
-if pgrep -f "$ASM/daemon/bitcoind serve $DATA" >/dev/null; then
+if pgrep -f "$ASM/daemon/bitcoinmcd serve $DATA" >/dev/null; then
     say "ABORT: daemon still running after stop -- refusing to build"; exit 1
 fi
 if journalctl -u bmc-bitcoind.service --since "-3min" --no-pager 2>/dev/null | grep -qi "killing"; then

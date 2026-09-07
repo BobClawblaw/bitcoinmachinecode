@@ -51,6 +51,7 @@ asm/tests/test_store
 asm/tests/test_prune
 asm/tests/test_tx
 asm/tests/test_mempool_policy
+asm/daemon/bitcoinmcd
 asm/daemon/bitcoind
 asm/daemon/cli
 asm/daemon/discover
@@ -402,8 +403,10 @@ regtest-e2e/
 
 # deploy snapshots: ~31MB binaries, one per deploy, kept on the host as the
 # rollback path. They are build products, not source.
-asm/daemon/bitcoind.deploy-*
+asm/daemon/bitcoinmcd.deploy-*
+asm/daemon/bitcoinmcd.live
 asm/daemon/bitcoind.live
+asm/daemon/bitcoind.deploy-*
 
 # ARM port build artifacts (this branch)
 scratch_daemon/

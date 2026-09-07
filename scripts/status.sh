@@ -23,10 +23,10 @@ if [ -x "$CLI" ] && "$CLI" getblockchaininfo 2>/dev/null; then
 fi
 
 echo "RPC did not answer."
-if pgrep -f 'bitcoind(\.live)?( |$)' >/dev/null; then
-    echo "a bitcoind-like process IS running (pgrep -f 'bitcoind(.live)?'):"
-    pgrep -af 'bitcoind(\.live)?( |$)' | head -5
+if pgrep -f 'bitcoin(mc)?d(\.live)?( |$)' >/dev/null; then
+    echo "a bitcoinmcd-like process IS running (pgrep -f 'bitcoin(mc)?d(.live)?'):"
+    pgrep -af 'bitcoin(mc)?d(\.live)?( |$)' | head -5
 else
-    echo "no bitcoind process found"
+    echo "no bitcoinmcd process found"
 fi
 exit 1

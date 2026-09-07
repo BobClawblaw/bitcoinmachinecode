@@ -65,7 +65,7 @@ serve instance and only deployed behind the normal gate.
 - Embed `rpc_server_start` on its background thread in the serve parent (before
   `serve_mux`, `main.c:3237`); `rpc_server_stop` in the shutdown path.
 - Build: link `rpc_server.o rpc_commands.o rpc_chain.o rpc_json.o rpc_net.o
-  rpc_node.o` + the missing wallet prims into `daemon/bitcoind`; guard against
+  rpc_node.o` + the missing wallet prims into `daemon/bitcoinmcd`; guard against
   TUs already in `DAEMONOBJS`.
 
 ### Slice 2 — `getpeerinfo`

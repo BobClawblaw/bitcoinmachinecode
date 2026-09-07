@@ -368,3 +368,21 @@ numbers is how this ran for four benchmarks.
 
 Fixed in PR #61 (`peer-selection-2026-09-06`); measured at 5 min 19 s on the
 same peer pool: 41,974 blocks against ~16,000, zero evictions against 400+.
+
+**The same rule, a second time, one day later.** On 2026-09-07, seven hours
+into run 9 (the first run on the pipelined download, height 622,000), the
+log held 432 "dead weight" evictions. Three were the pool-relative verdict.
+The other 429 were `DLC_CHUNK_BUDGET_SECS`: a flat 120 s wall-clock budget
+for a *whole* 40-block chunk, whose own comment said "requires ~467 KB/s
+sustained to survive". That is the absolute bar again, wearing seconds
+instead of bytes per second, and it rises with block size: at height 600k a
+chunk is ~60 MB, and a 424 KB/s peer that had served 1,560 blocks was
+dropped for not finishing one in two minutes, while the pool median was
+764 KB/s. About 10.7 GB of half-received chunks were discarded. The budget
+is now a **stall** clock, re-armed by the fetcher on every block that
+arrives (`ibd_pipeline_set_progress`): it fires only when a peer delivers
+nothing for 120 s, which per 1.5 MB block is ~12 KB/s, below the floor, so
+the relative rule decides. And the log line now says *which* clock fired.
+Two lessons on top of the rule: a timeout is a rate threshold whenever the
+work it bounds has a size, and a log line that names one rule for two
+mechanisms hides the one that is actually firing.

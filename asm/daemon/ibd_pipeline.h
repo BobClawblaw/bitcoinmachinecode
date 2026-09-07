@@ -35,4 +35,12 @@ long ibd_pipeline_last_batch(void);
  * for one block, wait for it, ask for the next -- so the two can be timed
  * against the same peer, through the same code. */
 void ibd_pipeline_set_wave(long hashes_per_getdata);
+/* progress hook: called ONCE per wanted, validated block the peer delivers
+ * (stored or parked), never for pings, unasked blocks or duplicates. The
+ * download worker re-arms its chunk alarm from it, so the alarm measures
+ * "no block for N seconds" -- a stall -- rather than the whole chunk's
+ * wall-clock, which at 40 blocks x ~1.5 MB was a hidden ~470 KB/s absolute
+ * bar that dropped 429 peers (10.7 GB of half-received chunks) in seven
+ * hours of the 2026-09-07 benchmark while the pool median was 764 KB/s. */
+void ibd_pipeline_set_progress(void (*cb)(void*), void* arg);
 #endif

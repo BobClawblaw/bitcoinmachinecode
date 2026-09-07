@@ -312,7 +312,12 @@ static void set_defaults(void){
     g_cfg.n_rpcallowip          = 0;
     g_cfg.networkactive         = 1;
     g_cfg.forcednsseed          = 0;
-    snprintf(g_cfg.pidfile, sizeof g_cfg.pidfile, "bitcoind.pid");   /* Core -pid default */
+    /* Core's -pid default is bitcoind.pid. This is the ONE config default
+     * that deliberately diverges (decided 2026-09-07 with the daemon's
+     * rename): the file follows OUR daemon's name, so nothing this node
+     * writes on disk carries Core's daemon name. The key keeps Core's
+     * semantics: a relative path lands in the per-chain datadir. */
+    snprintf(g_cfg.pidfile, sizeof g_cfg.pidfile, "bitcoinmcd.pid");
     g_cfg.blocknotify[0]        = 0;
     g_cfg.alertnotify[0]        = 0;
     g_cfg.startupnotify[0]      = 0;
