@@ -166,7 +166,7 @@ void txit_boot(void* store_buf){
     long base_to = txit_base_to();
     if (base_to < 0){
         fprintf(stderr, "[txindex] no base txindex.dat -- tail maintenance disabled "
-                        "(build one with daemon/build_tx_index first)\n");
+                        "(build one with daemon/bmc_build_tx_index first)\n");
         return;
     }
     int fd = open(TXI_TAIL_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);

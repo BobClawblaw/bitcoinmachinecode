@@ -17,7 +17,7 @@ which is strictly more useful: a set difference is always caused by a block
 being applied differently, and the block is where the fix goes.
 
 Each probe rebuilds our set from genesis to the probe height with
-daemon/build_utxo into a scratch datadir, then measures it with
+daemon/bmc_build_utxo into a scratch datadir, then measures it with
 daemon/utxo_setinfo. That is O(height) per probe rather than incremental,
 which sounds wasteful and is not: build_utxo replays the first ~200k blocks in
 about a minute, and a bisection is ~log2(range) probes.

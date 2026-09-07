@@ -64,7 +64,7 @@ static int classify(const u8* s, u32 slen, u8* hash_out /*32 bytes*/) {
 static double now_s(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec+ts.tv_nsec*1e-9; }
 
 static FILE* bucket_f[NBUCKETS];
-static char bucket_path[NBUCKETS][64];
+static char bucket_path[NBUCKETS][320];   /* tmpdir (256) + "/bNNN.tmp"; 64 tripped -Werror=format-truncation once the tool was built again (2026-09-07) */
 
 static int cmp_rec(const void* a, const void* b) {
     const addr_rec* ra = a; const addr_rec* rb = b;

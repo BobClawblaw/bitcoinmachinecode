@@ -13,7 +13,7 @@
 set -u
 CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
 BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
-WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/wallet_cli}
+WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/bmc_wallet_cli}
 WORK=${WORK:-/tmp/cjdns-e2e-$$}
 CORE_DIR=$WORK/core; BMC_DIR=$WORK/bmc
 CORE_P2P=19974; CORE_RPC=19980; BMC_P2P=19975; BMC_RPC=19976

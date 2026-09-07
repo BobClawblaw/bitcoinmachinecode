@@ -286,7 +286,7 @@ void axt_boot(void* store_buf){
         fprintf(stderr, "[addrindex] index at %ld but tip is %ld -- the gap exceeds the "
                         "undo retention window, so historic spends cannot be recovered. "
                         "Disabled: set addrindex=1 BEFORE the node syncs (fresh datadir), "
-                        "or use daemon/build_addr_index for an offline snapshot.\n",
+                        "or use daemon/bmc_build_addr_index for an offline snapshot.\n",
                 covered, tip);
         close(fd);
         return;

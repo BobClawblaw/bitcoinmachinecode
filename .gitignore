@@ -117,7 +117,7 @@ asm/tests/test_hmac
 asm/bitcoin_hmac.o
 asm/tests/test_bip32_master
 asm/bitcoin_bip32.o
-asm/daemon/pverify
+asm/daemon/bmc_pverify
 
 # test-helper binaries (sources are tracked)
 asm/tests/gh_client
@@ -178,7 +178,7 @@ asm/tests/test_taproot_bounds_fuzz
 asm/tests/test_p2wpkh_real
 asm/tests/test_mempool_accept_modern
 asm/tests/test_mempool_shared
-asm/daemon/wallet_cli
+asm/daemon/bmc_wallet_cli
 asm/daemon/bmc_cli
 asm/daemon/bmc_rpcd
 asm/tests/test_rpc_json
@@ -251,10 +251,10 @@ asm/tests/run_batch
 asm/tests/test_interp_legacy_spend
 asm/tests/test_keepup
 asm/tests/test_outbound_mux
-asm/daemon/build_addr_index
+asm/daemon/bmc_build_addr_index
 asm/daemon/build_migrate_compact
-asm/daemon/build_utxo
-asm/daemon/chainwork_build
+asm/daemon/bmc_build_utxo
+asm/daemon/bmc_chainwork_build
 asm/daemon/flush_wal_tail
 asm/daemon/utxo_reload_check
 asm/tests/bench_ecdsa
@@ -371,7 +371,7 @@ bench-results/
 # UTXO set hash / gettxoutsetinfo (2026-08-23)
 asm/tests/test_muhash
 asm/tests/test_utxo_setinfo
-asm/daemon/utxo_setinfo
+asm/daemon/bmc_utxo_setinfo
 asm/tests/test_utxo_ghost_resume
 asm/tests/hs_cap_probe
 asm/tests/hs_seq_probe
@@ -418,9 +418,9 @@ asm/tests/tool_*
 # per-chain live confs carry rpc credentials, like config/bitcoin.conf
 config/bitcoin.testnet4.conf
 config/bitcoin.regtest.conf
-asm/daemon/build_txospender_index
-asm/daemon/utxo_dump_keys
-asm/daemon/utxo_repair_del
+asm/daemon/bmc_build_txospender_index
+asm/daemon/bmc_utxo_dump_keys
+asm/daemon/bmc_utxo_repair_del
 
 # built from the scratch Core tree by validation/build_core_oracle.sh; never committed
 validation/core_script_oracle
@@ -433,3 +433,17 @@ asm/daemon/bitcoin_rpcd
 
 # never again: a predeploy snapshot with private keys was committed on 2026-09-04
 backups/
+
+# pre-2026-09-07 tool names (renamed with the bmc_ prefix); keep stale builds ignored
+asm/daemon/wallet_cli
+asm/daemon/build_addr_index
+asm/daemon/build_block_filters
+asm/daemon/build_tx_index
+asm/daemon/build_txospender_index
+asm/daemon/build_utxo
+asm/daemon/chainwork_build
+asm/daemon/pverify
+asm/daemon/utxo_dump_keys
+asm/daemon/utxo_probe_one
+asm/daemon/utxo_repair_del
+asm/daemon/utxo_setinfo

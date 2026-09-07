@@ -181,7 +181,7 @@ static const struct { const char* key; const char* why; } k_noeffect[] = {
     {"deprecatedrpc",      "no deprecated-RPC toggles"},
     {"rpcdoccheck",        "debug-only"},
     {"test",               "debug-only"},
-    {"txospenderindex",    "the index is on whenever txospender.dat exists (build it with daemon/build_txospender_index); the key itself changes nothing"},
+    {"txospenderindex",    "the index is on whenever txospender.dat exists (build it with daemon/bmc_build_txospender_index); the key itself changes nothing"},
     {"fastprune",          "debug-only pruning knob; this node prunes by its own MiB budget"},
     {"testnet",            "testnet3 is refused by design; use testnet4=1"},
     {"version",            "command-line only"},
@@ -901,13 +901,13 @@ long node_config_load(const char* path){
          * alongside genuinely foreign keys like rpcuser. */
         else if(!strcmp(key,"txindex")){
             /* The index EXISTS as of 2026-08-26, but it is built OFFLINE by
-             * daemon/build_tx_index -- this daemon does not maintain it. So
+             * daemon/bmc_build_tx_index -- this daemon does not maintain it. So
              * the flag still changes nothing, and still says so: what it
              * would mean in Core (the node builds and keeps it current) is
              * not what happens here. getrawtransaction picks the file up on
              * its own when it is present, with or without this key. */
             if(iv) fprintf(stderr,"[config] txindex=1 has no effect -- the txid index is built "
-                                  "OFFLINE (daemon/build_tx_index <datadir>) and is used "
+                                  "OFFLINE (daemon/bmc_build_tx_index <datadir>) and is used "
                                   "automatically when txindex.dat is present; this daemon "
                                   "does not build or update it\n"); }
         else if(!strcmp(key,"assumevalid")){

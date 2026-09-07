@@ -212,8 +212,8 @@ I2P destination.
   (`127.0.0.1` for local subscribers). A publisher has no authentication.
   `zmqpubsequence` is not supported and is refused.
 - `txindex=1` has no effect on the daemon: the index is built offline
-  (`daemon/build_tx_index <datadir>`) and used when `txindex.dat` exists.
-- **txospenderindex** (2026-09-01): same pattern — `daemon/build_txospender_index
+  (`daemon/bmc_build_tx_index <datadir>`) and used when `txindex.dat` exists.
+- **txospenderindex** (2026-09-01): same pattern — `daemon/bmc_build_txospender_index
   <datadir> [from] [to]` writes `txospender.dat` (~35 GB for mainnet; run it
   while the node is idle, it reads the whole archive once), the daemon then
   keeps `txospender.tail` current and `gettxspendingprevout` answers
@@ -539,7 +539,7 @@ re-downloadable or rebuildable. Never keep the passphrase file with the
 wallet files: a backup carrying both is the failure the `walletpassfile`
 rules prevent, which is why the daemon refuses a passphrase file inside the
 datadir. Do not copy UTXO files or point tools at a datadir while the daemon
-writes it; stop it first. `daemon/utxo_setinfo <datadir> --muhash` on a
+writes it; stop it first. `daemon/bmc_utxo_setinfo <datadir> --muhash` on a
 stopped datadir is the instrument for comparing the set with a trusted
 node's `gettxoutsetinfo muhash`.
 

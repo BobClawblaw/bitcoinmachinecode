@@ -41,7 +41,7 @@ static long mk_tx(u8* p, int tag, const u8* prev_txid, unsigned prev_vout, int n
     *p++ = 0; *p++ = 0; *p++ = 0; *p++ = 0; return p - s;
 }
 int main(void){
-    char tool[4096]; if (!getcwd(tool, sizeof tool - 40)) return 1; strcat(tool, "/daemon/build_txospender_index");
+    char tool[4096]; if (!getcwd(tool, sizeof tool - 40)) return 1; strcat(tool, "/daemon/bmc_build_txospender_index");
     tt_isolate();
     memset(store_buf, 0, sizeof store_buf);
     ck("store_init", store_init(store_buf) == 1);

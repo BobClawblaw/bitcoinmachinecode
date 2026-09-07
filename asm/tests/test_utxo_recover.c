@@ -75,7 +75,7 @@ int main(int argc, char** argv){
      * dominates the runtime: every spend does a full utxo_lsm_get plus an
      * append to undo_<height>.dat before the delete. Leaving it on made the
      * 160k-180k stretch take 5.5 MINUTES here, against seconds for the same
-     * range in daemon/build_utxo (which has no undo capture) -- the clearest
+     * range in daemon/bmc_build_utxo (which has no undo capture) -- the clearest
      * measurement yet of what undo capture costs on a bulk replay. */
     utxo_live_set_undo_enabled(0);
 
