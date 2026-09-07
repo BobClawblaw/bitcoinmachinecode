@@ -4301,6 +4301,13 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                 }
                 break;
             }
+            /* the chunk failed on this peer. Say WHY -- the first three times
+             * and every hundredth after: run 10 (2026-09-07) had a worker
+             * fail 400 chunks in 45 s and abandon the chunk with no line
+             * between the rotation before it and "reconnect budget". */
+            if(guard<=3 || guard%100==0)
+                fprintf(stderr,"[dlc w%d] %s: chunk [%ld,%ld] attempt %d failed after %ld ms: %s (code %ld)\n",
+                        w, mystat->peer, lo, hi, guard, (long)(dlc_now_ms()-chunk_t0), ibd_pipeline_fail_name((int)r), r);
             close(fd); fd=-1; DLC_RELEASE();
             slot=(slot+1)%(nlive>0?nlive:1);
             if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }

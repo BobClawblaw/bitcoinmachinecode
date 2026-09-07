@@ -178,13 +178,13 @@ int main(void){
     ok(r == NB && g_nstored == NB, "a duplicate delivery is ignored, not stored twice");
     reset(); order_forward(); g_bad_prev = 6;      /* block 5's prevhash corrupted */
     r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
-    ok(r == -1, "a block whose prevhash breaks the header chain fails the chunk");
+    ok(r == IBD_FAIL_LINK, "a block whose prevhash breaks the header chain fails the chunk -- with the LINK reason code");
     reset(); order_forward(); g_bad_consensus = 4; /* block 3 fails cons_verify */
     r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
-    ok(r == -1, "a block that fails cons_verify fails the chunk (same gate as the serial path)");
+    ok(r == IBD_FAIL_CONSENSUS, "a block that fails cons_verify fails the chunk (same gate as the serial path) -- CONSENSUS reason code");
     reset(); g_norder = NB / 2; for (int i = 0; i < g_norder; i++) g_order[i] = i;
     r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
-    ok(r == -1, "a peer that goes quiet half way does NOT report a complete chunk");
+    ok(r == IBD_FAIL_READ, "a peer that goes quiet half way does NOT report a complete chunk -- READ reason code");
 
     printf("== the chunk budget is a STALL clock: the progress hook fires once per wanted block ==\n");
     /* 2026-09-07: the worker's 120 s alarm covered the WHOLE chunk, which at
@@ -203,7 +203,7 @@ int main(void){
     ok(r == NB && g_progress == NB, "a ping and an unasked block are NOT progress (still exactly 40)");
     reset(); order_forward(); g_norder = 7; g_progress = 0;
     r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
-    ok(r == -1 && g_progress == 7, "a peer that goes quiet after 7 blocks: 7 firings, then the chunk fails");
+    ok(r == IBD_FAIL_READ && g_progress == 7, "a peer that goes quiet after 7 blocks: 7 firings, then the chunk fails");
     ibd_pipeline_set_progress(NULL, NULL);
     reset(); order_forward(); g_progress = 0;
     r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
