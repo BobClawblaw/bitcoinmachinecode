@@ -3635,7 +3635,11 @@ static double dlc_effective_floor(double median_bps){
 #define DLC_RETRY_MAX 4096L
 enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CTL_FIRST_HOLE = 3, DLC_CTL_HELPING = 4,
        DLC_CTL_WANT_ANCHOR = 5,           /* a worker blocked at the window asks the PARENT for a fresh first hole */
-       DLC_CTL_RING = 6 };
+       /* per-event counters the workers bump and the parent prints ONCE per
+        * tick, in place of a line per event (2026-09-07: the rotation and
+        * window lines alone were 540 lines in six minutes of run 13) */
+       DLC_CTL_N_ROTATE = 6, DLC_CTL_N_WAIT = 7, DLC_CTL_N_HELP = 8, DLC_CTL_N_FAIL = 9, DLC_CTL_N_ABANDON = 10,
+       DLC_CTL_RING = 11 };
 /* The anchor is scanned by the parent only. The first cut had a blocked
  * worker rescan index.dat itself, and those reads landed in the worker's
  * /proc io rchar -- the counter the parent's per-worker rate, the pool
@@ -4238,12 +4242,11 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                     long cur=next_claim[DLC_CTL_HELPING];
                     if(cur!=blk && __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], cur, blk)){   /* one helper per blocking chunk */
                         lo=blk; helping=1;
-                        fprintf(stderr,"[dlc w%d] window blocked %.1fs at hole %ld (claims at %ld): fetching chunk [%ld,%ld] alongside its owner\n",
-                                w, waited_ticks/5.0, fh, peek, lo, lo+DLC_CHUNK_BLOCKS-1);
+                        __sync_fetch_and_add(&next_claim[DLC_CTL_N_HELP], 1L);
                         break;
                     }
                 }
-                if(waited_ticks==0) fprintf(stderr,"[dlc w%d] at the window: next claim %ld is %ld past the first hole %ld -- waiting, not running ahead\n", w, peek, peek-fh, fh);
+                if(waited_ticks==0) __sync_fetch_and_add(&next_claim[DLC_CTL_N_WAIT], 1L);
                 usleep(200000); waited_ticks++;
             }
             if(lo<0) lo=__sync_fetch_and_add(next_claim,(long)DLC_CHUNK_BLOCKS);
@@ -4394,9 +4397,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                 double chunk_bps = (secs >= 2.0 && chunk_r0 >= 0 && chunk_r1 >= chunk_r0) ? (double)(chunk_r1 - chunk_r0) / secs : -1.0;
                 double med = mystat->pool_median_bps;
                 if(dlc_rotate_after_chunk(chunk_bps, med)){
-                    char a[16], bmed[16]; dlc_fmt_rate(a,sizeof a,chunk_bps); dlc_fmt_rate(bmed,sizeof bmed,med);
-                    fprintf(stderr,"[dlc w%d] %s rotated after a CLEAN chunk: %s over the chunk vs pool median %s (bar: half the median); nothing discarded\n",
-                            w, mystat->peer, a, bmed);
+                    __sync_fetch_and_add(&next_claim[DLC_CTL_N_ROTATE], 1L);   /* counted on the tick line; nothing is discarded, so no line per event */
                     /* hand the verdict's number to the picker: the parent's
                      * tick-EMA lags (alpha 0.5 over 10 s ticks), and a peer
                      * whose EMA still read above the bar was re-picked 17
@@ -4411,7 +4412,8 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
              * and every hundredth after: run 10 (2026-09-07) had a worker
              * fail 400 chunks in 45 s and abandon the chunk with no line
              * between the rotation before it and "reconnect budget". */
-            if(guard<=3 || guard%100==0)
+            __sync_fetch_and_add(&next_claim[DLC_CTL_N_FAIL], 1L);
+            if(guard==3 || guard%100==0)      /* one peer failing once is normal; three in a row on one chunk is worth a line */
                 fprintf(stderr,"[dlc w%d] %s: chunk [%ld,%ld] attempt %d failed after %ld ms: %s (code %ld)\n",
                         w, mystat->peer, lo, hi, guard, (long)(dlc_now_ms()-chunk_t0), ibd_pipeline_fail_name((int)r), r);
             close(fd); fd=-1; DLC_RELEASE();
@@ -4425,6 +4427,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             mystat->chunks++; mystat->blocks+=n; mystat->guard+=guard;
         } else {
             int q=dlc_retry_push(next_claim, lo);
+            __sync_fetch_and_add(&next_claim[DLC_CTL_N_ABANDON], 1L);
             fprintf(stderr,"[dlc w%d] chunk [%ld,%ld] ABANDONED -> %s\n",w,lo,hi, q ? "retry ring (another worker will take it)" : "retry ring FULL; left for the next pass");
         }
     }
@@ -4900,6 +4903,7 @@ static long dl_catchup(const char* dir, int min_workers){
     *next_claim=start_h; *done_count=0;
     next_claim[DLC_CTL_RETRY_HEAD]=0; next_claim[DLC_CTL_RETRY_TAIL]=0; next_claim[DLC_CTL_FIRST_HOLE]=start_h; next_claim[DLC_CTL_HELPING]=-1; next_claim[DLC_CTL_WANT_ANCHOR]=0;   /* window starts at the span start; nobody helping */
     for(long i=0;i<DLC_RETRY_MAX;i++) next_claim[DLC_CTL_RING+i]=-1;   /* -1 = empty slot (0 is a real chunk) */
+    for(int i=DLC_CTL_N_ROTATE;i<=DLC_CTL_N_ABANDON;i++) next_claim[i]=0;
     /* MAP_ANONYMOUS pages come zeroed, so every stats[w].peer/chunks/blocks/
      * guard and every claimed[i] starts at "" / 0 / 0 / 0 / 0 -- no explicit
      * init needed. */
@@ -4966,6 +4970,7 @@ static long dl_catchup(const char* dir, int min_workers){
     long conn_total = 0;                       /* blocks connected by this call's passes */
     long long last_status_ms = dlc_now_ms(), connect_retry_ms = 0;
     int alive=nw;
+    int dlc_table_this_tick = 1;
     while(alive>0){
         long done = 0;
         if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);   /* before a connect call that may run for seconds */
@@ -5046,7 +5051,15 @@ static long dl_catchup(const char* dir, int min_workers){
             fprintf(stderr,"[dlc] == elapsed %s | eta %s | overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free)%s ==\n",
                     elapsed, etabuf, present, end_h+1, overall_pct, holes, cur_tip, span_pct, connbuf);
         }
-        fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
+        { static long tick_no = 0; tick_no++;
+          long ro=next_claim[DLC_CTL_N_ROTATE], wa=next_claim[DLC_CTL_N_WAIT], he=next_claim[DLC_CTL_N_HELP], fa=next_claim[DLC_CTL_N_FAIL], ab=next_claim[DLC_CTL_N_ABANDON];
+          static long p_ro=0, p_wa=0, p_he=0, p_fa=0, p_ab=0;
+          fprintf(stderr,"[dlc] -- this tick: %ld rotation(s), %ld window wait(s), %ld help(s), %ld failed attempt(s), %ld abandon(s) | run: %ld/%ld/%ld/%ld/%ld --\n",
+                  ro-p_ro, wa-p_wa, he-p_he, fa-p_fa, ab-p_ab, ro, wa, he, fa, ab);
+          p_ro=ro; p_wa=wa; p_he=he; p_fa=fa; p_ab=ab;
+          dlc_table_this_tick = (tick_no % 6 == 1);    /* the 16-line peer table once a minute; the rates still feed every tick */
+        }
+        if(dlc_table_this_tick) fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
         double tick_total_bytes=0.0, tick_total_write_bytes=0.0;
         /* the pool's median rate from LAST tick, for the relative floor: one
          * tick of lag is nothing against a 10 s tick and a 3-tick streak */
@@ -5132,7 +5145,7 @@ static long dl_catchup(const char* dir, int min_workers){
              * show up at all). Resets to nothing once healthy or just cut. */
             char dragbuf[48]="";
             if(dead_ticks[w]>0) snprintf(dragbuf,sizeof dragbuf," (Dragging: %d of %d)",dead_ticks[w],g_cfg.dead_weight_ticks);
-            fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s)%s%s%s\n",
+            if(dlc_table_this_tick) fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s)%s%s%s\n",
                     w, stats[w].peer[0]?(const char*)stats[w].peer:"(connecting)",
                     stats[w].chunks, b, blkrate, bw, kids[w]==0?" [done]":"", flag, dragbuf);
             prev_blocks[w]=b;
