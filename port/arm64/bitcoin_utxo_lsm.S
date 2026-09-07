@@ -226,20 +226,124 @@ mac_cmp_key:
 	ret
 
 /* mac_bloom_h(key=x0 (36B), seed=w1) -> w0 FNV-1a 32-bit hash. clobbers x9-x12. */
+/* Fully unrolled, exactly the x86 body: 36 fixed bytes. The loop this replaces
+ * re-loaded the prime 16777619 (movz+movk) on EVERY byte -- 72 wasted moves per
+ * hash -- and paid the cmp/b/add loop tax on top; x86 measured this loop at 12%
+ * of the flush's CPU before unrolling it (2026-09-06 batch), and ARM's loop was
+ * strictly worse. The 36 mul latencies are a serial chain either way -- that part
+ * is the hash, not the code -- but the per-byte overhead is now zero. */
 mac_bloom_h:
 	mov  w9, w1
-	mov  x10, #0
-.bh_l:
-	cmp  x10, #36
-	b.hs .bh_d
-	ldrb w11, [x0, x10]
-	eor  w9, w9, w11
 	mov  w12, #0x0193
 	movk w12, #0x0100, lsl #16       /* 16777619 */
+	ldrb w11, [x0, #0]
+	eor  w9, w9, w11
 	mul  w9, w9, w12
-	add  x10, x10, #1
-	b    .bh_l
-.bh_d:
+	ldrb w11, [x0, #1]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #2]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #3]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #4]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #5]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #6]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #7]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #8]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #9]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #10]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #11]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #12]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #13]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #14]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #15]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #16]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #17]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #18]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #19]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #20]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #21]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #22]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #23]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #24]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #25]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #26]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #27]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #28]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #29]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #30]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #31]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #32]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #33]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #34]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
+	ldrb w11, [x0, #35]
+	eor  w9, w9, w11
+	mul  w9, w9, w12
 	mov  w0, w9
 	ret
 
@@ -350,16 +454,32 @@ fmt_runname:
 	ret
 
 /* mac_copy_rec(dst=x0, src=x1) - copy fixed 64-byte descriptor. clobbers x7+ */
+/* mac_copy_rec(dst=x0, src=x1): move the 64-byte descriptor. Clobbers x8 only.
+ * Eight qword moves, exactly the x86 body. The byte loop this replaces was the
+ * innermost operation of every merge pass -- per record it cost ~320 instructions
+ * against 16 -- and it is most of why the ARM merge sort ran 2854 ms at N=4M
+ * descriptors where x86's identically-shaped sort (same call structure, cursors
+ * on the stack too) ran 541 ms (bench_lsm_flush_sort, 2026-09-07). AArch64
+ * ldr/str on normal memory accept unaligned addresses just like x86's mov, so
+ * the same shape ports one for one; descriptor arrays are 64-byte records, so
+ * every load after the first is aligned anyway. */
 mac_copy_rec:
-	mov  x7, #0
-.cp_l:
-	cmp  x7, #64
-	b.hs .cp_d
-	ldrb w8, [x1, x7]
-	strb w8, [x0, x7]
-	add  x7, x7, #1
-	b    .cp_l
-.cp_d:
+	ldr  x8, [x1]
+	str  x8, [x0]
+	ldr  x8, [x1, #8]
+	str  x8, [x0, #8]
+	ldr  x8, [x1, #16]
+	str  x8, [x0, #16]
+	ldr  x8, [x1, #24]
+	str  x8, [x0, #24]
+	ldr  x8, [x1, #32]
+	str  x8, [x0, #32]
+	ldr  x8, [x1, #40]
+	str  x8, [x0, #40]
+	ldr  x8, [x1, #48]
+	str  x8, [x0, #48]
+	ldr  x8, [x1, #56]
+	str  x8, [x0, #56]
 	ret
 
 /* mac_tomb_hash_reset(lst=x0) -> 1 ok / -1 err */
