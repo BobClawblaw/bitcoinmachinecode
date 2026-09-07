@@ -1141,3 +1141,67 @@ that would have hit any fresh sync of the live build.
   parallel downloader from 371,511; its first progress line at 05:32:51:
   `applied=371745 lag=1`. **The UTXO set is connecting one block behind
   the download** — the first time this node has done what step 1 was for.
+
+## 2026-09-07 (02:37Z): arm-12 — the IR series, the 45-commit merge, and the first deploy that changed consensus behaviour
+
+- **Deployed build:** `port/arm64/daemon_out/bitcoind`, md5 `cfe86ed4f811aa04529a3de3062f9fcb`,
+  built by `build_daemon.sh` (rc=0, no undefined symbols) on merge `d11ebf5b`.
+  Unit `bmc-arm.service`, conf `config/bitcoin-arm-stability.conf`, datadir `./data`.
+- **Rollback:** `port/arm64/daemon_out/rollback/bitcoind.pre-arm12-20260907`,
+  md5 `36250f970a3c519d8f6a34fa568d63c6` — the round-29-green build that had run
+  15h30m without a reject. One `cp` + `systemctl restart bmc-arm` to go back.
+- **Gate before deploying:** parity sweep round 32, the first on the merged tree —
+  pass 370 / fail 4 / bench-ok 15 / skip 10 / compared 389 of 432 plan rows, and all
+  four fails are the standing env-only bench rows (block413567.raw, ./index.dat).
+  Round 31 (pre-merge) was pass 367; the +3 are upstream's new rows, which run here
+  unchanged because nothing in the 45 commits touched an `.asm` file:
+  test_ibd_pipeline, test_banlist_persist, test_shared_stress all PASS natively and
+  bench_ibd_fetch builds and runs.
+- **What the node gained, in the order that matters.** Two consensus FALSE ACCEPTS
+  closed: the taproot `hard_fail` flag nobody read (IR-3 — an invalid non-empty
+  sig, an empty pubkey or an over-weight-budget leaf was ACCEPTED where Core fails
+  the script) and the ignored STACK_SIZE on every net-growing opcode (IR-1). Two
+  memory-safety holes closed: an 8-byte write past the taproot checksig ctx onto
+  the interpreter's own state, and the condition stack whose push was unbounded on
+  ARM while x86 had been bounded since the 2026-09-03 audit (SCR-2) — 1 KiB buffer,
+  so the 1025th nested `OP_IF` wrote over `vfexec_sp` and the rest of the TLS block.
+  Plus `OP_CODESEPARATOR` under `CONST_SCRIPTCODE` now refused where Core refuses
+  (IR-8, relay policy), the LOW_S error code matches Core for S >= N (IR-13),
+  `vfexec_all_true` is O(1) (IR-4 — a deeply nested tapscript leaf is no longer
+  quadratic), `OP_ROLL` rotates handles (IR-6 — 27.9 s -> 128 ms on the pinned storm),
+  the mempool's 80-byte slot layout with the cached wtxid, and the whole 45-commit
+  pull (the pipelined download, the hold bump-pointer fix, ban-list persistence,
+  peer ranking, the shared-append stress test).
+- **Procedure, and the two lessons re-applied.** Candidate built to a temp path
+  FIRST, so nothing ever wrote a file the running node had mapped (the 05:25Z entry's
+  `Text file busy` failure). `systemctl stop`, then wait for the WORKER, not the
+  parent. New trap of mine while waiting: `pgrep -cf "daemon_out/bitcoind"` counted
+  *my own shell*, whose command line contains that string — it reported "2 processes"
+  after a clean stop. Bracket one character (`bitcoi[n]d`) and it reads 0.
+- **Post-deploy state.** Boot: 136 confirmed-live peers in 2 probe rounds, UTXO
+  reload `applied_height=965871 manifest_n=3 live=165321036` (~4 s, unchanged from
+  the previous boot), "headers: already current", tip ADVANCED under the new binary
+  (965871 -> 965872) — the block-fetch path works. Steady at 15 min: connections 5,
+  verificationprogress 1, mempool admitting (+13..+24/30s), 0 invalid, 0 policy.
+  The boot archive check still reports its one standing problem — "block data is NOT
+  laid out monotonically (first break at height 328432), truncation and pruning will
+  refuse to run" — which the previous boot reported identically. Pre-existing, not
+  caused by this deploy, and still unfixed.
+- **WATCH THIS, and it is an upstream conversation, not an ARM one.** Upstream's
+  `1d543d08` ("learn once that a peer lacks NODE_WITNESS, and stop redialling it")
+  replaced a **local ARM workaround** (`e94c37b9`, 2026-08-29) that accepted any
+  peer regardless of the bit. The workaround's comment says the peers *here*
+  advertise 0xc05, and that turns out to be true of real mainnet peers, not only
+  the sim fixtures: the filter fired 3 times in the first 15 minutes
+  (`[dial] 139.177.194.63:8333 lacks NODE_WITNESS (services=0xc05) -- dropping`),
+  and the node sits at 4-5 legs of 8 where the old build held 5-6. The tip advances,
+  so the pool is sufficient and the deploy stands -- but this host's peer pool
+  measurably contains non-witness advertisers that DO serve witness blocks (which is
+  what the whole mainnet archive here is made of), so a hard drop costs legs for no
+  safety: the BIP141 commitment check is the thing that actually protects the
+  archive. Recommend upstream make it a soft preference or a config, not a ban.
+  If legs keep sliding toward 0, roll back with the file above.
+- **Also found, upstream's to fix:** `asm/Makefile` gained a `tests/test_par_threads`
+  rule in `7781987c` but `asm/tests/test_par_threads.c` was never committed, and the
+  target is not in the `test:` run list -- which is why x86's own gate never noticed.
+  On ARM it shows as an 8th build-fail row.

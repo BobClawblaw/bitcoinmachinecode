@@ -728,15 +728,37 @@ two items nobody had listed (SCR-2's vfexec bound, IR-3) were the real bugs.
       `mov x2,#0`. The inversion the x86 header had was never copied here.
 
 STILL OPEN after the series:
-- [ ] 7 sweep rows BUILD-FAIL, all one cause, all new with the 2026-09-06 x86
-      perf batch: test_muhash, test_muhash_mul_diff, test_lsm_flush_sort_diff,
-      test_utxo_probe_diff, bench_muhash, bench_lsm_flush_sort, bench_utxo_probe
-      link x86-only num3072_* (BMI2/ADX + AVX-512 IFMA) --
-      `undefined reference to num3072_cpu_has_adx / num3072_mul_force_path /
-      num3072_mul_current_path`. Needs an ARM num3072 twin (or plain-C path
-      selectors) before those four DIFFERENTIALS run here at all.
+- [x] **arm-12 DEPLOYED 2026-09-07 02:37Z** (candidate md5 cfe86ed4; rollback
+      `daemon_out/rollback/bitcoind.pre-arm12-20260907` = the round-29 build). It carries
+      this series, the mempool slot rework, the CC-2 hook table, and a 45-commit
+      origin/main merge. Gate was sweep round 32 green (pass 370 / fail 4 env-only /
+      bench-ok 15 / compared 389 of 432). Full record in `docs/devlog/DEPLOYMENT_HISTORY.md`.
+      **WATCH after any restart:** upstream's `1d543d08` NODE_WITNESS dial filter (it
+      replaced arm-port's local `e94c37b9` workaround during the merge) fires on REAL
+      peers on this host -- 3 drops in the first 15 minutes, legs 4-5/8 where the old
+      build held 5-6. The tip advanced under it, so the deploy stands, but this host's
+      pool contains 0xc05 advertisers that do serve witness blocks (the whole local
+      archive came from peers like that); upstream should make the drop a soft
+      preference or a config, since the BIP141 commitment check is what actually
+      protects the archive.
+- [x] **origin/main merged through `bf4ecd83`** (45 commits, PRs #61-#67, merge
+      `d11ebf5b`). No `.asm` file changed upstream, so nothing to hand-port: the work was
+      wiring `daemon/ibd_pipeline.c` + `daemon/banlist.c` into build_daemon.sh and
+      resolving two real decisions in main.c -- take upstream's witness policy over the
+      local workaround, and keep BOTH upstream's short-circuit and arm-port's bounded
+      header-phase connect where the hunks overlapped. New upstream rows run natively:
+      test_ibd_pipeline, test_banlist_persist, test_shared_stress pass; bench_ibd_fetch
+      runs.
+- [ ] **8 sweep rows BUILD-FAIL, two distinct causes.**
+      (a) 7 of them -- test_muhash, test_muhash_mul_diff, test_lsm_flush_sort_diff,
+      test_utxo_probe_diff, bench_muhash, bench_lsm_flush_sort, bench_utxo_probe -- fail
+      to link x86-only `num3072_*` (BMI2/ADX + AVX-512 IFMA): `undefined reference to
+      num3072_cpu_has_adx / num3072_mul_force_path / num3072_mul_current_path`. Needs an
+      ARM num3072 twin (or plain-C path selectors); until then four DIFFERENTIALS do not
+      run here at all -- a coverage hole, not a build nuisance.
+      (b) 1 of them -- test_par_threads: upstream's `7781987c` added the Makefile RULE
+      without committing `asm/tests/test_par_threads.c` and left it out of the `test:`
+      run list, so x86's own gate never builds it either. Upstream's to fix.
 - [ ] bitcoind.S: the CC-2 hook table exists as data symbols but the mux does not
       CALL them -- no sendcmpct announcement after verack, no hook-selected
       getdata type. The x86 daemon has both.
-- [ ] then deploy arm-12 (the node still runs the pre-130-merge, round-29-green
-      build; arm-12 would carry the mempool slot rework + everything above).
