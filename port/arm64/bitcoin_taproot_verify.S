@@ -76,6 +76,8 @@
 .set C_ANNEX, 72
 .set C_ANNEXLEN, 80
 .set C_WEIGHT, 88
+.set C_HARDFAIL, 96         /* int  (IR-3, x86 9df5e95a) -- written by the C hook */
+.set C_HARDERR, 100         /* int  (IR-3) -- Core's ScriptError for that failure */
 
 /* ts_script_state offsets*/
 .set S_MAIN, 0
@@ -123,10 +125,17 @@
 .set L_MERKLE, 208         /* 32 B -> 208..239*/
 .set L_Q, 240              /* 32 B -> 240..271*/
 .set L_ERR, 272            /* 8 B  -> 272..279*/
-.set L_CTX, 280            /* 96 B -> 280..375*/
-.set L_ST, 376             /* 120 B -> 376..495*/
-.set L_LEAFV, 496          /* 8 B  (leaf_version, persists across bl) -> 496..503*/
-.set FRAME, 0x200          /* 16-aligned, covers locals up to 503*/
+.set L_CTX, 280            /* 104 B -> 280..383 (IR-3: was 96 B at 280..375, so the
+                               C hook's write to ctx.hard_fail (+96) landed on
+                               L_ST+0 -- the script_state's main_elems pointer --
+                               and nothing ever read it back. sizeof
+                               taproot_checksig_ctx is 104: hard_fail/hard_err.
+                               That 8-byte overrun is the test_taproot_verify_diff
+                               SIGSEGV: elems became 0xffff00000001 and stack_push
+                               wrote to it.)*/
+.set L_ST, 384              /* 120 B -> 384..503 (was 376; IR-3 made room below)*/
+.set L_LEAFV, 504           /* 8 B  (leaf_version, persists across bl) -> 504..511*/
+.set FRAME, 0x200           /* 16-aligned, covers locals up to 511*/
 
 /* .tbss TLS arenas (Initial-Exec; PIE + non-PIE) -------------------------*/
     .section .tbss,"awT",@nobits
@@ -149,6 +158,7 @@ e_merkle:   .string "p2tr merkle root reconstruction failed"
 e_intpk:    .string "p2tr script-path internal pubkey invalid"
 e_commit:   .string "p2tr script-path commitment mismatch"
 e_parity:   .string "p2tr control block parity mismatch"
+e_csfail:   .string "p2tr tapscript checksig invalid"
 e_stackbig: .string "p2tr tapscript initial stack too large"
 e_elembig:  .string "p2tr tapscript witness item exceeds 520 bytes"
 e_overflow: .string "p2tr tapscript initial stack overflow"
@@ -415,6 +425,12 @@ taproot_verify_input_asm:
     str  x9, [x14, #C_ANNEXLEN]
     ldr  x9, [sp, #L_WEIGHT]
     str  x9, [x14, #C_WEIGHT]
+    /* IR-3 (x86 9df5e95a): the C twin zero-initialises the whole ctx. These two
+     * are FILLED BY THE CALLBACK and READ AFTER script_eval, so they must start
+     * at 0 -- and they must EXIST: before this the reservation stopped at 96 and
+     * the hook's ctx.hard_fail write fell into the script_state below. */
+    str  wzr, [x14, #C_HARDFAIL]
+    str  wzr, [x14, #C_HARDERR]
 
 /* ---- per-thread arenas (lazy), then push the initial stack ----*/
     TLS_ADDR x16, tv_main_e
@@ -522,6 +538,18 @@ taproot_verify_input_asm:
     add  x0, sp, #L_ST
     bl   script_eval
     cbz  w0, .r_exec
+    /* IR-3 (x86 9df5e95a): a checksig that set hard_fail invalidates the script
+     * EVEN IF the stack ends truthy -- Core's EvalChecksigTapscript set_error
+     * cases (invalid non-empty sig, empty pubkey, weight budget) are "the script
+     * is INVALID", not "this check produced FALSE". The callback can only return
+     * 0/1, which is why the flag exists; the C twin (bitcoin_taproot_sighash.c:
+     * `if (ctx.hard_fail) { *reason = "p2tr tapscript checksig invalid"; }`)
+     * reads it and so, from here on, does the asm twin. Before this the ARM twin
+     * accepted `OP_CHECKSIG OP_DROP OP_1` with an empty pubkey where Core fails.
+     * Mirrors the C twin exactly. */
+    add  x9, sp, #L_CTX
+    ldr  w9, [x9, #C_HARDFAIL]
+    cbnz w9, .r_csfail
     b    .accept
 
 .abort:
@@ -543,6 +571,8 @@ taproot_verify_input_asm:
 .r_merkle:    adr x2, e_merkle
               b   .reject
 .r_parity:    adr x2, e_parity
+              b   .reject
+.r_csfail:    adr x2, e_csfail
               b   .reject
 .r_intpk:     adr x2, e_intpk
               b   .reject
