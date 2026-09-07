@@ -242,12 +242,13 @@ sv_verify_script_asm:
 	add  x5, sp, #LOC_CTX+CTX_SEQUENCE
 	bl   sv_get_locktime_context
 
-	/* memset(main_e, 0, ARENA_BYTES) -- the C's per-call zeroing */
-	ldr  x0, [sp, #LOC_MAIN]
-	mov  x1, #0
-	movz x2, #ARENA_LO
-	movk x2, #ARENA_HI, lsl #16
-	bl   memset
+	/* IR-7 (x86 1138aed2, mirrored here): the per-call memset of the whole
+	 * 528,000-byte arena is DEAD TRAFFIC -- no reader touches a byte beyond a
+	 * record's [rec+4, rec+4+len), and the witness drivers run this same
+	 * interpreter on never-zeroed malloc'd arenas. Block connection was paying
+	 * ~1.06 MB per legacy input (~30-60 us, comparable to one ECDSA verify) to
+	 * clear records nothing reads. The C twin dropped it first; the ARM twin
+	 * follows, and the two P2SH copies below narrowed with it. */
 
 	/* SIGPUSHONLY gate */
 	tbz  x23, #5, .Lrun_sig            /* flag bit 5 = 1<<5 */
@@ -267,10 +268,12 @@ sv_verify_script_asm:
 	tbz  x23, #0, .Lrun_spk            /* flag bit 0 = SV_P2SH */
 	ldr  x0, [sp, #LOC_COPY]
 	ldr  x1, [sp, #LOC_MAIN]
-	movz x2, #ARENA_LO
-	movk x2, #ARENA_HI, lsl #16
-	bl   memcpy
 	ldr  x9, [sp, #LOC_ST_SP]
+	/* IR-7: st.sp LIVE RECORDS ONLY, not the whole arena. 528 = (s<<9)+(s<<4),
+	 * so no constant register and no third mul operand. */
+	lsl  x2, x9, #9
+	add  x2, x2, x9, lsl #4
+	bl   memcpy
 	str  x9, [sp, #LOC_CP_SP]
 
 .Lrun_spk:
@@ -336,8 +339,8 @@ sv_verify_script_asm:
 	str  x9, [sp, #LOC_CP_SP]
 	ldr  x0, [sp, #LOC_MAIN]
 	ldr  x1, [sp, #LOC_COPY]
-	movz x2, #ARENA_LO
-	movk x2, #ARENA_HI, lsl #16
+	lsl  x2, x9, #9			/* IR-7: cp.sp live records only (x86 imul ELEM_SIZE) */
+	add  x2, x2, x9, lsl #4
 	bl   memcpy
 	str  x9, [sp, #LOC_ST_SP]
 	/* run the redeem script */
