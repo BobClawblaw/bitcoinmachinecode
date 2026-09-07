@@ -121,7 +121,7 @@ download worker count and the verifier ignored it entirely.
 | `peertimeout` | 60 | (none stated) | match (DEFAULT_PEER_CONNECT_TIMEOUT 60) |
 | `permitbaremultisig` | 1 | 1 | match |
 | `persistmempool` | 1 | 1 | match |
-| `pid` | _unset_ | bitcoind.pid | **FIXED** unset -> bitcoind.pid |
+| `pid` | _unset_ | bitcoind.pid | **FIXED** unset -> bitcoind.pid; then 2026-09-07 **DISCUSSED DIVERGENCE**: `bitcoinmcd.pid`, following the daemon's rename, so nothing we write carries Core's daemon name. Semantics of the key unchanged. |
 | `port` | 8333 | 8333 | match |
 | `printpriority` | 0 | 0 | match |
 | `proxy` | _unset_ | disabled | match (unset = disabled) |

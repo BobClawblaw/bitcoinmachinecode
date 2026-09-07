@@ -29,3 +29,13 @@ What did not change, and why:
 `scripts/status.sh` matches either process name. The benchmark harness
 outside the repo was patched to build and run `bitcoinmcd`; run 9, already
 running on the previous build, is not affected.
+
+## Addendum, same day: the pid file follows the daemon
+
+The name was confirmed as `bitcoinmcd`, and the pid file default was
+decided as the one deliberate divergence from Core's config defaults: it
+is `bitcoinmcd.pid`, not `bitcoind.pid`, so nothing this node writes on
+disk carries Core's daemon name. The `pid` key keeps Core's semantics (a
+relative path lands in the per-chain datadir). `test_core_parity` pins
+the new default and was watched to fail against the old one. The
+2026-09-06 config-defaults audit records the divergence in its `pid` row.
