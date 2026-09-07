@@ -68,14 +68,33 @@ Everything below is landed on `arm-port` and pushed. History lives in
       and left the target out of the `test:` run list — so x86's own gate never builds
       it and nobody noticed. It is the 8th ARM build-fail row. Either the source wants
       committing upstream or the rule wants deleting.
-- [ ] **7 sweep rows BUILD-FAIL — new with the 2026-09-06 x86 perf batch, one cause:**
-      test_muhash, test_muhash_mul_diff, test_lsm_flush_sort_diff, test_utxo_probe_diff,
-      bench_muhash, bench_lsm_flush_sort, bench_utxo_probe fail to link on
-      `num3072_cpu_has_adx` / `num3072_mul_force_path` / `num3072_mul_current_path` —
-      x86-only BMI2/ADX + AVX-512 IFMA path selectors with no AArch64 twin. Until that
-      exists (an ARM num3072, or C path selectors that always report the generic path),
-      four DIFFERENTIALS — muhash, muhash_mul, lsm_flush_sort, utxo_probe — do not run
-      on this port at all. That is a coverage hole, not just a build nuisance.
+- [x] **The 7 sweep build-fails are CLOSED (2026-09-07, `0b991b77`).** Not one cause
+      but three missing seams from the 2026-09-06 x86 perf batch, each silencing a
+      differential that had never run here: (a) `num3072_mul` dispatcher with x86's
+      path numbering + the force_path/current_path/cpu_has_* seam (ADX/IFMA honestly
+      report 0; 31 Core-vector checks now run the generic body); (b) real
+      `utxo_prefetch_n` (PRFM over the home slot; the twin was a no-op) — cost one
+      x30 lesson on the way: AArch64 `ret` reads x30, which an inner `bl`
+      overwrites, unlike x86's stack-based call/ret; (c) `utxo_lsm_sort_desc` /
+      `utxo_lsm_set_sort_mode` exported with an in-code warning that the diff test
+      proves flush determinism, not radix==merge (radix body not ported).
+      Follow-up (`6d6d5f03`): the flush sort's helpers got the x86 bodies —
+      `mac_copy_rec` eight unrolled qword moves, `mac_bloom_h` fully unrolled with
+      the prime hoisted — taking bench_lsm_flush_sort at N=4M from 2854 ms to
+      **651 ms** (163 ns/key, 393 MB/s), within 20% of x86's merge. Sweep round 37:
+      pass 374 / fail 4 env-only / bench-ok 18 / build-fail 1 (upstream's own
+      `test_par_threads`) / compared 396 of 432.
+- [ ] **Port `mac_rsort_desc` (the flush-descriptor MSD radix).** Primitives done;
+      x86 radix: 541 -> 91 ms there, so if the ratio holds, ~110 ms here. The
+      dispatcher already branches on `mac_sort_mode` — it lands on merge today
+      (see the comment above `utxo_lsm_sort_desc`). A wrong order writes wrong
+      runs, and a wrong run is a lost coin: diff-test it exactly like x86 did.
+- [ ] **Deploy `bmcbitcoind` when told go.** Candidate rebuilt against the merged
+      tree (`2b98d3f1`, includes the 35 upstream commits + all ARM work; the old
+      `5bcfd57e` candidate was stale). Two-step rename deploy: point the unit at
+      `daemon_out/bmcbitcoind` + `daemon-reload`, AND retire `daemon_out/bitcoind`
+      into `rollback/`. Until then the node runs arm-12 (`cfe86ed4`) — safe/stale,
+      and `bmc-arm.service` crash-restart returns to arm-12, not to a broken path.
 - [ ] **bitcoind.S CC-2 is half-wired:** the hook table exists as data symbols
       (`g_peer_sendcmpct`, `g_cmpct_hook_type`, 130411fb) but the mux never CALLs them
       — no sendcmpct announcement after verack, no hook-selected getdata type. The x86

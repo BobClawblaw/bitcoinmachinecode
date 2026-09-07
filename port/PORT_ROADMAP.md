@@ -773,19 +773,27 @@ STILL OPEN after the series:
       not ported -- so mode 1 dispatches to the merge sort, and the diff test here
       proves flush determinism (a replayed sequence yields a byte-identical run),
       NOT agreement between two implementations.
-- [ ] **Port `mac_rsort_desc` (the flush-descriptor MSD radix) -- now measured, not
-      guessed.** bench_lsm_flush_sort at N=4,000,000 descriptors: ARM merge
-      **2854 ms** (713 ns/key, 90 MB/s of descriptors) against x86's merge at 541 ms
-      and x86 radix at 91 ms. So the twin is 5.3x off x86's MERGE baseline before
-      anyone asks about the radix -- which says the byte-at-a-time
-      `mac_cmp_key`/`mac_copy_rec` primitives are the first target (a 64-byte
-      descriptor copy as ldp/stp pairs and an 8-byte-at-a-time key compare), and
-      the radix second. Bulk-build cost, not consensus -- and precisely the code
-      not to rush: a wrong order writes wrong runs, and a wrong run is a lost coin.
-- [ ] 1 build-fail row left, and it is upstream's: `test_par_threads` -- `7781987c`
-      added the Makefile rule without committing `asm/tests/test_par_threads.c`,
-      and left the target out of the `test:` run list, so x86's gate never builds
-      it either.
+- [x] **Flush-sort primitives ported (2026-09-07, `6d6d5f03`).** The 5.3x gap was
+      the helper bodies: `mac_copy_rec` was a 64-iteration byte loop where x86 has
+      always been eight unrolled qword moves (now ported one for one -- AArch64
+      ldr/str take unaligned addresses like x86's mov), and `mac_bloom_h` re-loaded
+      the FNV prime every byte (now fully unrolled, prime hoisted, x86's shape).
+      bench_lsm_flush_sort at N=4,000,000: **2854 ms -> 651 ms** (163 ns/key,
+      393 MB/s) -- 4.4x, within 20% of x86's merge (541 ms). test_lsm_flush_sort_diff
+      still byte-identical; full sweep round 37 unchanged (pass 374 / fail 4
+      env-only / compared 396 of 432).
+- [ ] **Port `mac_rsort_desc` (the flush-descriptor MSD radix) -- measured, not
+      guessed.** x86 radix: 541 -> 91 ms there (5.9x). If the ratio holds on the
+      ARM twin's now-fast merge, 651 -> ~110 ms per 4M-descriptor flush. The ARM
+      `utxo_lsm_sort_desc` dispatcher already takes the radix branch on a nonzero
+      `mac_sort_mode` -- it just lands on merge today, and
+      `port/arm64/bitcoin_utxo_lsm.S`'s comment above it explains exactly what the
+      diff test does and does not prove until the radix exists. Bulk-build cost,
+      not consensus -- and precisely the code not to rush: a wrong order writes
+      wrong runs, and a wrong run is a lost coin.
+- [ ] **Rebuild `daemon_out/bmcbitcoind` against the merged tree** -- the 35
+      upstream commits touch `asm/daemon/*.c`, so the candidate on disk (md5
+      `5bcfd57e`) is stale relative to arm-port. Build only; deploy still held.
 - [ ] bitcoind.S: the CC-2 hook table exists as data symbols but the mux does not
       CALL them -- no sendcmpct announcement after verack, no hook-selected
       getdata type. The x86 daemon has both.
