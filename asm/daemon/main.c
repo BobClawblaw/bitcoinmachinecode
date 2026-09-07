@@ -3250,9 +3250,19 @@ static void dl_save_good_peers_ema(char (*peers)[DL_POOL_SLOT], const double* em
  * -- this falls back to EXACTLY the old (slot+a)%nlive rotation, so a run
  * with no speed knowledge behaves as today. The caller's loop runs this per
  * attempt and keeps doing CAS claims, so a lost race simply re-asks and the
- * now-claimed top peer drops out of the scan. */
+ * now-claimed top peer drops out of the scan.
+ *
+ * `bar` (2026-09-07): the boundary-rotation bar, half the pool median, or 0
+ * when unknown. Without it, a worker that had just dropped a slow peer at a
+ * chunk boundary got the SAME peer back: every never-tried peer has ema 0,
+ * so the highest-ema rule ranked the known-slow one above all of them, and
+ * a scratch node rotated 269 times among the same 16 addresses in five
+ * minutes with its mean slot rate never moving. With a bar, the order is:
+ * the fastest measured peer AT OR ABOVE the bar; else someone never tried;
+ * else the fastest measured peer even below the bar (never stall); else the
+ * plain rotation. bar 0 is exactly the old rule. */
 static int dlc_pick_peer(int nlive, int slot, const volatile double* ema,
-                         const volatile int* claimed, const volatile int* banned){
+                         const volatile int* claimed, const volatile int* banned, double bar){
     if(ema){
         int best=-1; double bv=0.0;
         for(int a=0;a<nlive;a++){
@@ -3261,7 +3271,15 @@ static int dlc_pick_peer(int nlive, int slot, const volatile double* ema,
             double v=ema[idx];
             if(v>bv){ bv=v; best=idx; }
         }
-        if(best>=0) return best;                    /* someone has speed history */
+        if(best>=0 && (bar<=0.0 || bv>=bar)) return best;   /* someone has speed history, and it clears the bar */
+        if(best>=0){                                          /* the best known is under the bar: prefer someone untried */
+            for(int a=0;a<nlive;a++){
+                int idx=(slot+a)%nlive;
+                if(banned[idx]||claimed[idx]) continue;
+                if(ema[idx]<=0.0) return idx;
+            }
+            return best;                                      /* nobody untried: the best there is, rather than no peer */
+        }
     }
     for(int a=0;a<nlive;a++){                       /* rotation, identical to the pre-EMA loop:
                                                      * banned and claimed both skip */
@@ -3589,6 +3607,137 @@ static double dlc_effective_floor(double median_bps){
     if (f < 512.0) f = 512.0;                                        /* a truly dead socket still dies */
     return f;
 }
+/* ---- monotonic download window + retry ring (2026-09-07) -----------------
+ * "Write out monotonically, like Core does." Core's downloader keeps a
+ * BLOCK_DOWNLOAD_WINDOW of 1024 blocks above the last connected block and
+ * never requests past it, so a missing block is always re-requested before
+ * the download runs ahead of it, and a peer that blocks the window is the
+ * one that gets kicked. Ours had 16 workers claiming 40-block chunks from
+ * a counter that only ever went up: a chunk a worker gave up on became a
+ * hole that nothing revisited until the next catch-up pass, and on run 10
+ * a per-worker "stalled" counter that was never reset per chunk made a
+ * worker abandon every chunk it claimed after 40 connect failures --
+ * 21,676 abandoned chunks in eleven minutes, the connect stuck at 45,160.
+ *
+ * The control block next_claim points at is now [claim counter, retry
+ * head, retry tail, first hole (published by the parent each tick), ring].
+ * A worker (1) pops the retry ring before claiming anything new; (2) does
+ * not claim a chunk more than DLC_DOWNLOAD_WINDOW blocks above the first
+ * hole -- it waits, re-checking the ring, and after DLC_WINDOW_HELP_SECS
+ * takes the first hole's own chunk itself (a duplicate fetch; the store's
+ * appends are idempotent, test_shared_stress) so a dead worker can never
+ * deadlock the window; (3) pushes any chunk it abandons onto the ring. */
+/* Core's BLOCK_DOWNLOAD_WINDOW is 1024 blocks against ~8 outbound peers x
+ * 16 blocks in flight (MAX_BLOCKS_IN_TRANSIT_PER_PEER): six to eight times
+ * its in-flight count. Ours is 16 workers x 40-block chunks = 640 in
+ * flight, so 1024 was only 1.6x -- run 11 and the scratch node after it
+ * spent most of their time at the window (523 waits in six minutes, 45k
+ * blocks against run 9's 86k). 4096 is the same slack Core gives itself;
+ * the archive is still consolidated behind it (holes bounded, the connect
+ * never more than the window behind the download). */
+#define DLC_DOWNLOAD_WINDOW 4096L
+/* Core's BLOCK_STALLING_TIMEOUT_DEFAULT: when the window is full and one
+ * peer blocks it, Core re-requests from another peer after 2 s. Same here:
+ * a worker idle at a full window for 2 s fetches the blocking chunk itself
+ * (one helper at a time, claimed through DLC_CTL_HELPING). */
+#define DLC_WINDOW_HELP_SECS 2
+#define DLC_RETRY_MAX 4096L
+enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CTL_FIRST_HOLE = 3, DLC_CTL_HELPING = 4,
+       DLC_CTL_WANT_ANCHOR = 5,           /* a worker blocked at the window asks the PARENT for a fresh first hole */
+       /* per-event counters the workers bump and the parent prints ONCE per
+        * tick, in place of a line per event (2026-09-07: the rotation and
+        * window lines alone were 540 lines in six minutes of run 13) */
+       DLC_CTL_N_ROTATE = 6, DLC_CTL_N_WAIT = 7, DLC_CTL_N_HELP = 8, DLC_CTL_N_FAIL = 9, DLC_CTL_N_ABANDON = 10,
+       DLC_CTL_SPAN_START = 11,           /* the pass's first height: the claim grid is start + k*DLC_CHUNK_BLOCKS */
+       DLC_CTL_RING = 12 };
+/* Run 14 (2026-09-07) stalled for two minutes at 82,565: every worker
+ * reconnected to the SAME peer -- one that accepted the handshake and
+ * dropped us ~100 ms later -- because a failed fetch never lowered the
+ * peer's standing and the picker handed it straight back; 12 reconnects a
+ * second across the pool, 4,274 failed attempts in nine minutes. Three
+ * rules, all pure so the test can pin them:
+ *  - a failed fetch HALVES the peer's shared rate (three failures put it
+ *    under any bar; the parent's next tick restores it if it delivers);
+ *  - a growing pause after each failure on one chunk: 200 ms x attempts,
+ *    capped at 2 s, so 400 attempts take 13 minutes, not 45 seconds;
+ *  - the help chunk lies on the CLAIM grid (start + k*40), not on
+ *    multiples of 40 from zero -- the pass starts at 1 when genesis is
+ *    seeded, and a misaligned help straddled two owners' chunks. */
+static double dlc_ema_after_failure(double ema){ return ema > 0.0 ? ema * 0.5 : 1.0; }
+static long dlc_fail_backoff_ms(int attempt){ long ms = 200L * (attempt < 1 ? 1 : attempt); return ms > 2000 ? 2000 : ms; }
+static long dlc_help_chunk_lo(long first_hole, long span_start){
+    if(first_hole < span_start) return span_start;
+    return span_start + ((first_hole - span_start) / DLC_CHUNK_BLOCKS) * DLC_CHUNK_BLOCKS;
+}
+/* The anchor is scanned by the parent only. The first cut had a blocked
+ * worker rescan index.dat itself, and those reads landed in the worker's
+ * /proc io rchar -- the counter the parent's per-worker rate, the pool
+ * median, the dead-weight floor and the rotation bar are all built from.
+ * Run 12 printed an "average since start" of 263 MB/s on an 11 MB/s link
+ * and rotated on nearly every chunk. Workers now only raise a flag. */
+static void dlc_publish_anchor(volatile long* ctl, long start_h){
+    long tip = dlc_index_tip(); long fh = tip>=0 ? dlc_first_hole(tip) : -1;
+    if(fh<0) fh = tip>=0 ? tip+1 : start_h;
+    if(fh > ctl[DLC_CTL_FIRST_HOLE]) ctl[DLC_CTL_FIRST_HOLE] = fh;      /* monotonic: a stale reader never moves it back */
+    ctl[DLC_CTL_WANT_ANCHOR] = 0;
+}
+#define DLC_CTL_BYTES ((size_t)(DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long))
+static int dlc_window_allows(long lo, long first_hole){ return lo - first_hole <= DLC_DOWNLOAD_WINDOW; }
+/* single-producer-per-push, multi-consumer ring: push reserves a slot with a
+ * CAS on head, pop reserves with a CAS on tail; entries are chunk `lo`s. */
+static int dlc_retry_push(volatile long* ctl, long lo){
+    for(;;){
+        long h = ctl[DLC_CTL_RETRY_HEAD], t = ctl[DLC_CTL_RETRY_TAIL];
+        if(h - t >= DLC_RETRY_MAX) return 0;                                   /* full: the next pass will find the hole */
+        if(__sync_bool_compare_and_swap(&ctl[DLC_CTL_RETRY_HEAD], h, h + 1)){ ctl[DLC_CTL_RING + (h % DLC_RETRY_MAX)] = lo; return 1; }
+    }
+}
+static long dlc_retry_pop(volatile long* ctl){
+    for(;;){
+        long t = ctl[DLC_CTL_RETRY_TAIL], h = ctl[DLC_CTL_RETRY_HEAD];
+        if(t >= h) return -1;
+        long lo = ctl[DLC_CTL_RING + (t % DLC_RETRY_MAX)];
+        if(lo < 0) continue;                                                    /* the push reserved the slot but has not written it yet */
+        if(__sync_bool_compare_and_swap(&ctl[DLC_CTL_RETRY_TAIL], t, t + 1)){ ctl[DLC_CTL_RING + (t % DLC_RETRY_MAX)] = -1; return lo; }
+    }
+}
+/* ---- boundary rotation (2026-09-07) --------------------------------------
+ * A worker KEEPS its peer after a clean chunk. Once the flat chunk budget
+ * became a stall clock (PR #68), nothing removed a delivering-but-slow peer:
+ * the dead-weight floor is min(32 KB/s, median/4) = 32 KB/s at the tail, so
+ * a 250 KB/s peer against an 800 KB/s median held its slot for the rest of
+ * the run, and slots drifted toward the slow end of the pool as fast peers
+ * disconnected and slow ones never left. Run 9's flat budget had purged
+ * those by accident -- at the cost of the partial chunk every time.
+ *
+ * So: judge at the CHUNK BOUNDARY, when nothing is in flight. A worker whose
+ * rate over the chunk it just completed was under half the pool median
+ * closes the socket and takes a fresh peer (dlc_pick_peer: the fastest
+ * unclaimed one). Nothing is discarded; the log prints the rate and the bar.
+ * The bar is relative at every depth (ENGINEERING_RULES rule 11). */
+#define DLC_ROTATE_FRACTION 0.5
+static int dlc_rotate_after_chunk(double chunk_bps, double median_bps){
+    if (chunk_bps < 0.0 || median_bps <= 0.0) return 0;      /* nothing measured, or no pool view yet */
+    return chunk_bps < DLC_ROTATE_FRACTION * median_bps;
+}
+/* ETA to the tip from the block rate over the status loop's recent window.
+ * Blocks grow toward the tip, so on the tail this is optimistic; it says
+ * "at the last ten minutes' rate", nothing more. -1 = no rate yet. */
+static long dlc_eta_secs(long remaining, long delta_blocks, double delta_secs){
+    if (remaining <= 0) return 0;
+    if (delta_blocks <= 0 || delta_secs <= 0.0) return -1;
+    double s = (double)remaining / ((double)delta_blocks / delta_secs);
+    if (s > 99.0 * 86400.0) s = 99.0 * 86400.0;
+    return (long)(s + 0.5);
+}
+static void dlc_fmt_eta(char* buf, size_t cap, long secs){               /* DD:HH:MM:SS */
+    if (secs < 0){ snprintf(buf, cap, "--:--:--:--"); return; }
+    int d = (int)(secs / 86400), h = (int)((secs % 86400) / 3600), m = (int)((secs % 3600) / 60), s = (int)(secs % 60);
+    char tmp[48];                                        /* four ints cannot exceed 47 chars: no truncation possible */
+    snprintf(tmp, sizeof tmp, "%02d:%02d:%02d:%02d", d, h, m, s);
+    size_t n = strlen(tmp); if (n >= cap) n = cap ? cap - 1 : 0;
+    memcpy(buf, tmp, n); if (cap) buf[n] = 0;
+}
 /* the pipeline's progress hook: every wanted block that arrives restarts the
  * stall clock, so a peer that keeps delivering is never dropped by it. */
 static void dlc_chunk_progress(void* arg){ (void)arg; alarm(DLC_CHUNK_BUDGET_SECS); }
@@ -3776,8 +3925,10 @@ for(; i < cnt; i++){
 static lowwork_t g_lw;                                   /* CC-5 hold: 48 KB of bookkeeping; the page scratch is mmap'd per fetch */
 static int dlc_lw_get_at(void* hst, unsigned long long h, void* out){ return hst_get_at(hst, h, out); }
 extern int reorg_min_chain_work_set(void);
+static long long dlc_now_ms(void); static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec);   /* defined below; the progress line needs them here */
 static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
     long have0 = hst_count(hst), added = 0; int lw_started = 0; lowwork_clear(&g_lw);
+    long long fetch_t0 = dlc_now_ms(); unsigned long held_bytes = 0;   /* for the held-region progress line */
     static unsigned char page[DLC_HDR_PAGE * 81 + 16];
     static unsigned char msg[2 << 20];
     unsigned char stop[32]; memset(stop, 0, 32);
@@ -3843,7 +3994,19 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
                   }
                   block_hash(prev, h);
               }
+              held_bytes += cnt * 81;
               if(g_lw.held == 1) fprintf(stderr,"[dlc] headers from %s are below -minimumchainwork so far -- holding %lu, storing none until the chain proves its work\n", cand, cnt);
+              /* 2026-09-07: an honest mainnet chain is below the floor for
+               * its first ~880,000 headers (~71 MB of pages), and this loop
+               * said nothing for all of it. A scratch node sharing its link
+               * with a benchmark held for 35 minutes at 133 KB/s and was
+               * mistaken for a hang. Say how far, how fast, every 50 pages. */
+              else if(g_lw.held % 50 == 0){
+                  double secs = (double)(dlc_now_ms() - fetch_t0) / 1000.0; if(secs < 1.0) secs = 1.0;
+                  char rate[16]; dlc_fmt_rate(rate, sizeof rate, (double)held_bytes / secs);
+                  fprintf(stderr,"[dlc] headers from %s: still below -minimumchainwork after %d held page(s) (%lu headers, %.1f MB) in %.0fs -- %s\n",
+                          cand, g_lw.held, (unsigned long)g_lw.held * cnt, (double)held_bytes / 1048576.0, secs, rate);
+              }
               continue;
           }
           if(lwv == LOWWORK_RELEASE){
@@ -4057,7 +4220,9 @@ static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
  * its own throughput while blocked inside node_ibd_blocks_s. MAP_ANONYMOUS
  * zero-inits it to 0.0, read as "no reading yet" if a drop somehow happens
  * before the parent's first 10s tick. */
-typedef struct { char peer[64]; long chunks; long blocks; long guard; double last_bw_bps; long timeouts; long held_idx; } dlc_stat_t;
+typedef struct { char peer[64]; long chunks; long blocks; long guard; double last_bw_bps; long timeouts; long held_idx;
+                 double pool_median_bps;   /* written by the parent each tick: the pool's median rate, read by the worker for boundary rotation */ } dlc_stat_t;
+static long long dlc_now_ms(void); static long dlc_proc_rchar(pid_t pid);   /* fwd decls: the worker judges its own chunk before these are defined */
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
 static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
 
@@ -4112,7 +4277,42 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
     int fd=-1; int held=-1;   /* index into live[]/claimed[] currently held, or -1 */
 #define DLC_RELEASE() do{ if(held>=0){ claimed[held]=0; held=-1; } }while(0)
     for(;;){
-        long lo=__sync_fetch_and_add(next_claim,(long)DLC_CHUNK_BLOCKS);
+        stalled=0;                          /* per CHUNK: run 10's cascade was this counter surviving into the next chunk */
+        /* the claim, in Core's order: a chunk that needs retrying first;
+         * else the next new chunk, but only inside the download window
+         * above the first hole; while the window is blocked, keep checking
+         * the ring, and after DLC_WINDOW_HELP_SECS fetch the blocking chunk
+         * ourselves rather than wait on a worker that may be gone. */
+        int helping=0;
+        long lo=dlc_retry_pop(next_claim);
+        if(lo<0){
+            int waited_ticks=0;                 /* 200 ms each */
+            for(;;){
+                long peek=next_claim[DLC_CTL_CLAIM], fh=next_claim[DLC_CTL_FIRST_HOLE];
+                if(peek>end_h || dlc_window_allows(peek, fh)) break;
+                /* The published anchor is up to one 10 s tick old. On the
+                 * early chain the window drains in a couple of seconds, so
+                 * run 11 (2026-09-07) sat idle between ticks: 32,241 blocks
+                 * at five minutes against run 9's 86,000, 512 waits. Blocked
+                 * on a stale anchor, refresh it ourselves (two asm scans of
+                 * index.dat) and share the fresher value; wait only when the
+                 * frontier really is where the anchor says. */
+                next_claim[DLC_CTL_WANT_ANCHOR]=1;   /* the parent rescans within 200 ms; our own reads must not touch our io counters */
+                lo=dlc_retry_pop(next_claim); if(lo>=0) break;
+                if(waited_ticks>=DLC_WINDOW_HELP_SECS*5){
+                    long blk=dlc_help_chunk_lo(fh, next_claim[DLC_CTL_SPAN_START]);   /* the chunk holding the first hole, on the claim grid */
+                    long cur=next_claim[DLC_CTL_HELPING];
+                    if(cur!=blk && __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], cur, blk)){   /* one helper per blocking chunk */
+                        lo=blk; helping=1;
+                        __sync_fetch_and_add(&next_claim[DLC_CTL_N_HELP], 1L);
+                        break;
+                    }
+                }
+                if(waited_ticks==0) __sync_fetch_and_add(&next_claim[DLC_CTL_N_WAIT], 1L);
+                usleep(200000); waited_ticks++;
+            }
+            if(lo<0) lo=__sync_fetch_and_add(next_claim,(long)DLC_CHUNK_BLOCKS);
+        }
         if(lo>end_h){ if(fd>=0) close(fd); DLC_RELEASE(); break; }
         long hi=lo+DLC_CHUNK_BLOCKS-1; if(hi>end_h) hi=end_h;
         if(dlc_chunk_all_present(lo,hi)) continue;
@@ -4140,7 +4340,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                  * rotation. Losing a CAS race simply re-asks -- the peer the
                  * other worker won is now claimed and drops out of the scan. */
                 for(int q=0;q<nlive && !ok;q++){
-                    int idx=dlc_pick_peer(nlive, slot, ema, claimed, banned);
+                    int idx=dlc_pick_peer(nlive, slot, ema, claimed, banned, mystat->pool_median_bps*DLC_ROTATE_FRACTION);
                     if(idx<0) break;
                     const char* cand=live[idx];
                     int cp2=0; unsigned ip=0; if(!dlc_parse_peer(cand, &ip, &cp2)) continue;
@@ -4153,9 +4353,9 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                      * fallback for bare addresses (same rule as the header tries) */
                     { int cpc = cp2 ? cp2 : node_config_peer_port(cand); if(!cpc) cpc = g_chainp->default_port;   /* addnode=host:port keeps its port here too */
                       cp2 = cpc; }
-                    if(peer_known_no_witness(cand)){ claimed[idx]=0; slot=(idx+1)%nlive; continue; }   /* no witness bit: skip before the socket */
+                    if(peer_known_no_witness(cand)){ if(ema[idx]<=0.0) ema[idx]=1.0; claimed[idx]=0; slot=(idx+1)%nlive; continue; }   /* no witness bit: skip before the socket; and no longer "untried" to the picker */
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)cp2));
-                    if(fdc<0){ claimed[idx]=0; continue; }
+                    if(fdc<0){ if(ema[idx]<=0.0) ema[idx]=1.0; claimed[idx]=0; continue; }   /* tried, unreachable: the picker must not offer it as untried again */
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
                     /* 2026-09-06: a getdata is small and is the ONLY thing
                      * standing between this worker and the peer's reply, so
@@ -4177,7 +4377,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                          * dropped peer did them). */
                         mystat->chunks=0; mystat->blocks=0; mystat->guard=0;
                     }
-                    else { claimed[idx]=0; close(fdc); }
+                    else { if(ema[idx]<=0.0) ema[idx]=1.0; claimed[idx]=0; close(fdc); }   /* handshake or witness failed: same */
                 }
                 if(!ok){
                     stalled++;
@@ -4224,6 +4424,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
              * 16 real peers moved 0.23-1.2 MB/s each on the fresh-sync
              * benchmark. Core keeps 16 blocks in flight per peer for the same
              * reason. Same validation per block, block for block. */
+            long long chunk_t0 = dlc_now_ms(); long chunk_r0 = dlc_proc_rchar(getpid());   /* for the boundary-rotation verdict */
             long r=ibd_fetch_chunk_pipelined(fd, st, hst, lo, n, buf, (unsigned)sizeof buf, scratch, cap);
             alarm(0); sigaction(SIGALRM,&old,NULL);
             store_reload(st);
@@ -4245,16 +4446,54 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                 if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
                 continue;   /* r is unreliable after an EINTR'd read; don't trust it */
             }
-            if(r>=0){ chunk_ok=1; break; }   /* clean completion; KEEP fd (and claim) for the next chunk */
+            if(r>=0){
+                chunk_ok=1;
+                /* clean completion. KEEP fd (and claim) for the next chunk --
+                 * unless this peer ran under half the pool median over the
+                 * chunk, in which case rotate NOW, with nothing in flight and
+                 * nothing to discard (see dlc_rotate_after_chunk). Chunks
+                 * under 2 s (the early chain) are not judged: round-trip
+                 * bound, and the rate would be noise. */
+                double secs = (double)(dlc_now_ms() - chunk_t0) / 1000.0;
+                long chunk_r1 = dlc_proc_rchar(getpid());
+                double chunk_bps = (secs >= 2.0 && chunk_r0 >= 0 && chunk_r1 >= chunk_r0) ? (double)(chunk_r1 - chunk_r0) / secs : -1.0;
+                double med = mystat->pool_median_bps;
+                if(dlc_rotate_after_chunk(chunk_bps, med)){
+                    __sync_fetch_and_add(&next_claim[DLC_CTL_N_ROTATE], 1L);   /* counted on the tick line; nothing is discarded, so no line per event */
+                    /* hand the verdict's number to the picker: the parent's
+                     * tick-EMA lags (alpha 0.5 over 10 s ticks), and a peer
+                     * whose EMA still read above the bar was re-picked 17
+                     * times in five minutes on the 2026-09-07 scratch node. */
+                    { long hi = mystat->held_idx; if(hi>=0 && hi<nlive) ema[hi] = chunk_bps; }
+                    close(fd); fd=-1; DLC_RELEASE();
+                    slot=(slot+1)%(nlive>0?nlive:1);
+                }
+                break;
+            }
+            /* the chunk failed on this peer. Say WHY -- the first three times
+             * and every hundredth after: run 10 (2026-09-07) had a worker
+             * fail 400 chunks in 45 s and abandon the chunk with no line
+             * between the rotation before it and "reconnect budget". */
+            __sync_fetch_and_add(&next_claim[DLC_CTL_N_FAIL], 1L);
+            { long hi_=mystat->held_idx; if(hi_>=0 && hi_<nlive) ema[hi_]=dlc_ema_after_failure(ema[hi_]); }   /* the picker must move on */
+            if(guard==3 || guard%100==0)      /* one peer failing once is normal; three in a row on one chunk is worth a line */
+                fprintf(stderr,"[dlc w%d] %s: chunk [%ld,%ld] attempt %d failed after %ld ms: %s (code %ld)\n",
+                        w, mystat->peer, lo, hi, guard, (long)(dlc_now_ms()-chunk_t0), ibd_pipeline_fail_name((int)r), r);
             close(fd); fd=-1; DLC_RELEASE();
             slot=(slot+1)%(nlive>0?nlive:1);
             if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
+            usleep((useconds_t)(dlc_fail_backoff_ms(guard)*1000));   /* do not hammer the pool: 12 reconnects/s was run 14's stall */
         }
         close(hfd);
+        if(helping) __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], lo, -1L);   /* the help is over, whichever way */
         if(chunk_ok){
             total+=n; __sync_fetch_and_add(done_count,n);
             mystat->chunks++; mystat->blocks+=n; mystat->guard+=guard;
-        } else fprintf(stderr,"[dlc w%d] chunk [%ld,%ld] ABANDONED\n",w,lo,hi);
+        } else {
+            int q=dlc_retry_push(next_claim, lo);
+            __sync_fetch_and_add(&next_claim[DLC_CTL_N_ABANDON], 1L);
+            fprintf(stderr,"[dlc w%d] chunk [%ld,%ld] ABANDONED -> %s\n",w,lo,hi, q ? "retry ring (another worker will take it)" : "retry ring FULL; left for the next pass");
+        }
     }
     fprintf(stderr,"[dlc w%d] done: blocks=%ld\n", w, total);
     close(lfd);
@@ -4677,7 +4916,7 @@ static long dl_catchup(const char* dir, int min_workers){
         int lf=open("append.lock", O_RDWR|O_CREAT, 0644); if(lf>=0) close(lf);
     }
 
-    volatile long* next_claim=mmap(NULL,sizeof(long),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
+    volatile long* next_claim=mmap(NULL,DLC_CTL_BYTES,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);   /* the control block: see DLC_CTL_* */
     volatile long* done_count=mmap(NULL,sizeof(long),PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     volatile dlc_stat_t* stats=mmap(NULL,sizeof(dlc_stat_t)*(size_t)nw,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     /* one claim flag per live[] peer -- __sync_bool_compare_and_swap makes
@@ -4726,6 +4965,9 @@ static long dl_catchup(const char* dir, int min_workers){
      * explicitly. */
     for(int i=0;i<nw;i++) stats[i].held_idx = -1;
     *next_claim=start_h; *done_count=0;
+    next_claim[DLC_CTL_RETRY_HEAD]=0; next_claim[DLC_CTL_RETRY_TAIL]=0; next_claim[DLC_CTL_FIRST_HOLE]=start_h; next_claim[DLC_CTL_HELPING]=-1; next_claim[DLC_CTL_WANT_ANCHOR]=0; next_claim[DLC_CTL_SPAN_START]=start_h;   /* window starts at the span start; nobody helping */
+    for(long i=0;i<DLC_RETRY_MAX;i++) next_claim[DLC_CTL_RING+i]=-1;   /* -1 = empty slot (0 is a real chunk) */
+    for(int i=DLC_CTL_N_ROTATE;i<=DLC_CTL_N_ABANDON;i++) next_claim[i]=0;
     /* MAP_ANONYMOUS pages come zeroed, so every stats[w].peer/chunks/blocks/
      * guard and every claimed[i] starts at "" / 0 / 0 / 0 / 0 -- no explicit
      * init needed. */
@@ -4745,6 +4987,8 @@ static long dl_catchup(const char* dir, int min_workers){
      * one large chunk shows 0 chunks for minutes even while actively
      * downloading at full speed, which the byte counter catches. */
     long prev_blocks[64]={0}; long prev_rchar[64]={0}; long prev_wbytes[64]={0}; int dead_ticks[64]={0};
+    enum { ETA_W = 61 };                     /* 61 ticks of 10 s: the ETA's ten-minute rate window */
+    long eta_present[ETA_W]; long long eta_ms[ETA_W]; int eta_n=0, eta_i=0;
     long nbanned=0;
     double cumulative_bytes=0.0;       /* running total network-received, across the whole call */
     double cumulative_write_bytes=0.0; /* running total actually written to disk, across the whole call */
@@ -4790,8 +5034,10 @@ static long dl_catchup(const char* dir, int min_workers){
     long conn_total = 0;                       /* blocks connected by this call's passes */
     long long last_status_ms = dlc_now_ms(), connect_retry_ms = 0;
     int alive=nw;
+    int dlc_table_this_tick = 1;
     while(alive>0){
         long done = 0;
+        if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);   /* before a connect call that may run for seconds */
         if(interleave && dlc_now_ms() >= connect_retry_ms){
             /* (store_reload is the bounded call's first act, so it sees the
              * helpers' appends; a second one here would be redundant.) */
@@ -4810,7 +5056,13 @@ static long dl_catchup(const char* dir, int min_workers){
         }
         if(done <= 0){
             long ms = interleave ? g_dlc_idle_ms : 10000L;   /* the pre-step-1 loop: sleep 10 s, print */
-            struct timespec ts={ms/1000,(ms%1000)*1000000L}; nanosleep(&ts,NULL);
+            /* sleep in 200 ms steps so a worker blocked at the window gets a
+             * fresh anchor without waiting for the 10 s tick */
+            for(long slept=0; slept<ms; slept+=200){
+                if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);
+                long step = ms-slept < 200 ? ms-slept : 200;
+                struct timespec ts={step/1000,(step%1000)*1000000L}; nanosleep(&ts,NULL);
+            }
         }
         if(g_shutdown_requested){
             /* incident 2026-09-01: this loop ignored SIGTERM and the stop hung
@@ -4835,9 +5087,20 @@ static long dl_catchup(const char* dir, int min_workers){
             long cur_tip, present;
             dlc_scan_progress(&cur_tip, &present);
             long holes = cur_tip>=0 ? (cur_tip+1-present) : 0;
+            { long fh0 = cur_tip>=0 ? dlc_first_hole(cur_tip) : -1;          /* the window's anchor, for the workers */
+              next_claim[DLC_CTL_FIRST_HOLE] = fh0>=0 ? fh0 : (cur_tip>=0 ? cur_tip+1 : start_h); }
             double overall_pct = 100.0*(double)present/(double)(end_h+1);
             double span_pct = cur_tip>=0 ? 100.0*(double)present/(double)(cur_tip+1) : 0.0;
             char elapsed[32]; dlc_fmt_elapsed(elapsed,sizeof elapsed,(long)(time(NULL)-catchup_start));
+            /* ETA (DD:HH:MM:SS) at the block rate of the last ten minutes:
+             * the oldest entry in the ring is the one about to be overwritten */
+            char etabuf[24];
+            { long eta = -1;
+              if(eta_n >= 2){ int oldest = eta_n < ETA_W ? 0 : eta_i;
+                              eta = dlc_eta_secs(end_h+1-present, present-eta_present[oldest], (double)(now_ms-eta_ms[oldest])/1000.0); }
+              eta_present[eta_i] = present; eta_ms[eta_i] = now_ms;
+              eta_i = (eta_i+1) % ETA_W; if(eta_n < ETA_W) eta_n++;
+              dlc_fmt_eta(etabuf,sizeof etabuf,eta); }
             /* applied = the connected tip; lag = blocks on disk in the
              * contiguous prefix that connect has not reached yet (the only
              * lag connect could close -- a hole is the download's, not ours) */
@@ -4849,10 +5112,18 @@ static long dl_catchup(const char* dir, int min_workers){
                 long lag = prefix - applied; if(lag < 0) lag = 0;
                 snprintf(connbuf,sizeof connbuf," | applied=%ld lag=%ld%s", applied, lag, interleave ? "" : " (interleave off)");
             } else snprintf(connbuf,sizeof connbuf," | connect deferred (no UTXO engine in this process)");
-            fprintf(stderr,"[dlc] == elapsed %s | overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free)%s ==\n",
-                    elapsed, present, end_h+1, overall_pct, holes, cur_tip, span_pct, connbuf);
+            fprintf(stderr,"[dlc] == elapsed %s | eta %s | overall: %ld/%ld stored (%.2f%% of real tip) | %ld holes in [0,%ld] reached so far (%.2f%% gap-free)%s ==\n",
+                    elapsed, etabuf, present, end_h+1, overall_pct, holes, cur_tip, span_pct, connbuf);
         }
-        fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
+        { static long tick_no = 0; tick_no++;
+          long ro=next_claim[DLC_CTL_N_ROTATE], wa=next_claim[DLC_CTL_N_WAIT], he=next_claim[DLC_CTL_N_HELP], fa=next_claim[DLC_CTL_N_FAIL], ab=next_claim[DLC_CTL_N_ABANDON];
+          static long p_ro=0, p_wa=0, p_he=0, p_fa=0, p_ab=0;
+          fprintf(stderr,"[dlc] -- this tick: %ld rotation(s), %ld window wait(s), %ld help(s), %ld failed attempt(s), %ld abandon(s) | run: %ld/%ld/%ld/%ld/%ld --\n",
+                  ro-p_ro, wa-p_wa, he-p_he, fa-p_fa, ab-p_ab, ro, wa, he, fa, ab);
+          p_ro=ro; p_wa=wa; p_he=he; p_fa=fa; p_ab=ab;
+          dlc_table_this_tick = (tick_no % 6 == 1);    /* the 16-line peer table once a minute; the rates still feed every tick */
+        }
+        if(dlc_table_this_tick) fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
         double tick_total_bytes=0.0, tick_total_write_bytes=0.0;
         /* the pool's median rate from LAST tick, for the relative floor: one
          * tick of lag is nothing against a 10 s tick and a 3-tick streak */
@@ -4862,6 +5133,7 @@ static long dl_catchup(const char* dir, int min_workers){
           for(int i=1;i<nv;i++){ double x=v[i]; int j=i-1; while(j>=0 && v[j]>x){ v[j+1]=v[j]; j--; } v[j+1]=x; }
           if(nv > 0) median_bps = v[nv/2]; }
         double floor_bps = dlc_effective_floor(median_bps);
+        for(int w=0;w<nw;w++) stats[w].pool_median_bps = median_bps;   /* published for the workers' boundary rotation */
         for(int w=0;w<nw;w++){
             long b=stats[w].blocks; long blkrate=(long)((double)(b-prev_blocks[w])/tick_s);
             long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
@@ -4937,7 +5209,7 @@ static long dl_catchup(const char* dir, int min_workers){
              * show up at all). Resets to nothing once healthy or just cut. */
             char dragbuf[48]="";
             if(dead_ticks[w]>0) snprintf(dragbuf,sizeof dragbuf," (Dragging: %d of %d)",dead_ticks[w],g_cfg.dead_weight_ticks);
-            fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s)%s%s%s\n",
+            if(dlc_table_this_tick) fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s)%s%s%s\n",
                     w, stats[w].peer[0]?(const char*)stats[w].peer:"(connecting)",
                     stats[w].chunks, b, blkrate, bw, kids[w]==0?" [done]":"", flag, dragbuf);
             prev_blocks[w]=b;
@@ -5057,7 +5329,7 @@ static long dl_catchup(const char* dir, int min_workers){
         }
         dl_save_good_peers_ema(good, good_e, ng);
     }
-    munmap((void*)next_claim,sizeof(long)); munmap((void*)done_count,sizeof(long));
+    munmap((void*)next_claim,DLC_CTL_BYTES); munmap((void*)done_count,sizeof(long));
     munmap((void*)stats,sizeof(dlc_stat_t)*(size_t)nw);
     munmap((void*)claimed,sizeof(int)*(size_t)nlive);
     munmap((void*)banned,sizeof(int)*(size_t)nlive);
