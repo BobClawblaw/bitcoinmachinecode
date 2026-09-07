@@ -9,7 +9,7 @@
 
 set -euo pipefail
 
-UNIT="${BMC_UNIT:-bmc-bitcoind}"
+UNIT="${BMC_UNIT:-$(systemctl cat bmcbitcoind >/dev/null 2>&1 && echo bmcbitcoind || echo bmc-bitcoind)}"   # the reference box's unit until the operator renames it
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="${BMC_BITCOIN_CLI:-$HERE/asm/daemon/bmc_cli}"
 
@@ -24,9 +24,9 @@ fi
 
 echo "RPC did not answer."
 if pgrep -f 'bitcoin(mc)?d(\.live)?( |$)' >/dev/null; then
-    echo "a bitcoinmcd-like process IS running (pgrep -f 'bitcoin(mc)?d(.live)?'):"
+    echo "a bmcbitcoind-like process IS running (pgrep -f 'bitcoin(mc)?d(.live)?'):"
     pgrep -af 'bitcoin(mc)?d(\.live)?( |$)' | head -5
 else
-    echo "no bitcoinmcd process found"
+    echo "no bmcbitcoind process found"
 fi
 exit 1

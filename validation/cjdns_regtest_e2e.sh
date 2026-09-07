@@ -12,7 +12,7 @@
 # Needs cjdroute running (its tun up) and IPv6 enabled on this host.
 set -u
 CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
-BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bitcoinmcd}
+BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/wallet_cli}
 WORK=${WORK:-/tmp/cjdns-e2e-$$}
 CORE_DIR=$WORK/core; BMC_DIR=$WORK/bmc

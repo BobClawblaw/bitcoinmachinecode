@@ -1,5 +1,5 @@
 #!/bin/bash
-# Live view of the UTXO rebuild running inside bmc-bitcoind.service.
+# Live view of the UTXO rebuild running inside bmcbitcoind.service.
 #
 # BLD-9 (audit 2026-09-03): `set -u` and a pipefail are on now -- this had
 # neither, so a typo'd variable read as empty and a failing stage in a
@@ -65,7 +65,7 @@ prev_live_h="" prev_live_t="" addr="" tip=""
 
 while true; do
   mapfile -t lines < <(grep '\[utxo_live\] catchup progress' "$LOG" | tail -2)
-  pids=$(pgrep -f 'daemon/bitcoinmcd serve')
+  pids=$(pgrep -f 'daemon/bmcbitcoind serve')
 
   if [ -z "$pids" ]; then
     printf "\n[daemon not running]\n"; exit 1

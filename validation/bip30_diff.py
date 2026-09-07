@@ -15,7 +15,7 @@ Until 2026-08-23 this file drove asm/tests/bip30_shim for both parts, and
 claimed to prove "the ASM node implements that exact rule to zero divergence".
 It did not. bip30_shim.c IMPLEMENTS BIP30 itself -- is_bip30_repeat(), the
 `enforce` flag and the utxo_get collision test are all inside the shim -- and
-the shim is not linked into daemon/bitcoinmcd. The daemon had no BIP30 check at
+the shim is not linked into daemon/bmcbitcoind. The daemon had no BIP30 check at
 all (LOG.md incident #30). A green differential sat beside a missing rule for
 as long as both existed, because the differential was validating the shim.
 

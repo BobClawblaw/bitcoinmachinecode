@@ -13,10 +13,10 @@
 
 set -euo pipefail
 
-UNIT="${BMC_UNIT:-bmc-bitcoind}"
+UNIT="${BMC_UNIT:-$(systemctl cat bmcbitcoind >/dev/null 2>&1 && echo bmcbitcoind || echo bmc-bitcoind)}"   # the reference box's unit until the operator renames it
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DATA="${BITCOIN_DATA_DIR:-$HERE/data}"
-BIN="${BMC_BITCOIND:-$HERE/asm/daemon/bitcoinmcd}"
+BIN="${BMC_BITCOIND:-$HERE/asm/daemon/bmcbitcoind}"
 
 if systemctl list-unit-files "$UNIT.service" >/dev/null 2>&1 &&
    systemctl cat "$UNIT" >/dev/null 2>&1; then
@@ -24,6 +24,6 @@ if systemctl list-unit-files "$UNIT.service" >/dev/null 2>&1 &&
     exec sudo systemctl start "$UNIT"
 fi
 
-[ -x "$BIN" ] || { echo "no daemon binary at $BIN (run: make -C asm daemon/bitcoinmcd)" >&2; exit 1; }
+[ -x "$BIN" ] || { echo "no daemon binary at $BIN (run: make -C asm daemon/bmcbitcoind)" >&2; exit 1; }
 echo "no $UNIT unit found; running in the foreground from $DATA"
 exec "$BIN" -datadir="$DATA" serve
