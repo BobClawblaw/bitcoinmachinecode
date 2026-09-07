@@ -273,25 +273,38 @@ int main(void){
        * banned skipped, and the fresh-sync fallback to plain rotation. */
       volatile int cl[4] = {0,0,0,0}, bn[4] = {0,0,0,0};
       volatile double em[4] = {10.0, 5.0, 9.0, 0.0};
-      ok(dlc_pick_peer(4, 0, em, cl, bn) == 0, "ema [10,5,9,0]: picks the fastest peer (0)");
+      ok(dlc_pick_peer(4, 0, em, cl, bn, 0.0) == 0, "ema [10,5,9,0]: picks the fastest peer (0)");
       cl[0] = 1;
-      ok(dlc_pick_peer(4, 0, em, cl, bn) == 2, "...then the second fastest once 0 is claimed (2)");
+      ok(dlc_pick_peer(4, 0, em, cl, bn, 0.0) == 2, "...then the second fastest once 0 is claimed (2)");
       bn[2] = 1; bn[3] = 1;
-      ok(dlc_pick_peer(4, 0, em, cl, bn) == 1, "claimed/banned slots are skipped even when the fallback runs: takes the only free one (1)");
+      ok(dlc_pick_peer(4, 0, em, cl, bn, 0.0) == 1, "claimed/banned slots are skipped even when the fallback runs: takes the only free one (1)");
       bn[1] = 1;
-      ok(dlc_pick_peer(4, 0, em, cl, bn) == -1, "claimed+banned leaves nothing: exhausted");
+      ok(dlc_pick_peer(4, 0, em, cl, bn, 0.0) == -1, "claimed+banned leaves nothing: exhausted");
       cl[0]=0; bn[1]=0; bn[2]=0; bn[3]=0;
-      ok(dlc_pick_peer(4, 0, em, cl, bn) == 0, "unclaiming makes 0 pickable again");
+      ok(dlc_pick_peer(4, 0, em, cl, bn, 0.0) == 0, "unclaiming makes 0 pickable again");
+      /* 2026-09-07: the boundary-rotation bar. A worker that just dropped a
+       * 300 KB/s peer against an 800 KB/s median must not get it straight
+       * back because every untried peer has ema 0. */
+      { volatile int c2[4] = {0,0,0,0}, b2[4] = {0,0,0,0};
+        volatile double e2[4] = {800.0, 300.0, 0.0, 0.0};
+        ok(dlc_pick_peer(4, 0, e2, c2, b2, 400.0) == 0, "bar 400, ema [800,300,untried,untried]: the fastest peer clears the bar (0)");
+        c2[0] = 1;
+        ok(dlc_pick_peer(4, 0, e2, c2, b2, 400.0) == 2, "...0 claimed: the 300 KB/s peer is under the bar, so someone UNTRIED is picked (2), not the known-slow one");
+        ok(dlc_pick_peer(4, 0, e2, c2, b2, 0.0) == 1, "...the same state with no bar (old rule): the known 300 KB/s peer (1)");
+        c2[2] = 1; c2[3] = 1;
+        ok(dlc_pick_peer(4, 0, e2, c2, b2, 400.0) == 1, "...nobody untried left: the best there is, even under the bar (1), never no peer");
+        b2[1] = 1;
+        ok(dlc_pick_peer(4, 0, e2, c2, b2, 400.0) == -1, "...and banned/claimed everywhere: exhausted"); }
       /* slot rotation still breaks ties: 0 and 2 share the top ema, so from
        * slot 3 the walk reaches 0 by wrap in (slot+a) order */
       volatile double eq[4] = {9.0, 0.0, 9.0, 0.0};
-      ok(dlc_pick_peer(4, 3, eq, cl, bn) == 0, "tied top ema takes (slot+a) order first (slot 3 wraps to 0)");
+      ok(dlc_pick_peer(4, 3, eq, cl, bn, 0.0) == 0, "tied top ema takes (slot+a) order first (slot 3 wraps to 0)");
       volatile double zero[4] = {0.0,0.0,0.0,0.0};
-      ok(dlc_pick_peer(4, 2, zero, cl, bn) == 2, "all-zero ema (fresh sync) falls back to rotation from the slot");
+      ok(dlc_pick_peer(4, 2, zero, cl, bn, 0.0) == 2, "all-zero ema (fresh sync) falls back to rotation from the slot");
       bn[2] = 1;
-      ok(dlc_pick_peer(4, 2, zero, cl, bn) == 3, "...and the fallback skips banned exactly as the old loop did");
+      ok(dlc_pick_peer(4, 2, zero, cl, bn, 0.0) == 3, "...and the fallback skips banned exactly as the old loop did");
       bn[2] = 0;
-      ok(dlc_pick_peer(4, 2, NULL, cl, bn) == 2, "no ema pointer at all behaves as today"); }
+      ok(dlc_pick_peer(4, 2, NULL, cl, bn, 0.0) == 2, "no ema pointer at all behaves as today"); }
     { char td3[] = "/tmp/bmc_goodpeers_XXXXXX"; if (!mkdtemp(td3)){ perror("mkdtemp"); return 1; }
       char cwd2[512]; if (!getcwd(cwd2, sizeof cwd2)) cwd2[0] = 0;
       if (chdir(td3) != 0){ perror("chdir"); return 1; }
