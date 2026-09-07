@@ -200,3 +200,21 @@ tip-only coinstats index (CSI-2), display-only `prioritisetransaction`
 (WAL-13), opcode dispatch table (IR-16), systemd unit in version control.
 Each has its reasoning where the row points; reopen one by arguing with the
 reasoning, not by re-filing it.
+
+---
+
+## Initial block download (added 2026-09-07)
+
+Checked against `asm/daemon/main.c` and `asm/daemon/ibd_pipeline.c` on 2026-09-07; the runs are in `worklog/2026-09-07.md`.
+
+| Behavior | Core | This node | Status |
+|---|---|---|---|
+| Headers-first, then blocks | yes | yes; a fresh datadir seeds genesis on every chain; `headers.dat` ahead of the archive is kept across a restart (PR #75) | **DONE** |
+| Blocks in flight per peer | 16 (`MAX_BLOCKS_IN_TRANSIT_PER_PEER`) | one 40-block chunk per worker in ONE `getdata`, placed by hash as they arrive (PR #66) | **DONE** (different shape, same effect) |
+| Download window | 1,024 blocks above the last connected block (`BLOCK_DOWNLOAD_WINDOW`) | 4,096 above the first unfilled height: Core's slack ratio at 640 in flight; abandoned chunks go to a retry ring (PRs #77, #78) | **DECIDED** (`docs/releases/2026-09-07-monotonic-download.md`) |
+| Stalling peer | re-request from another peer after 2 s (`BLOCK_STALLING_TIMEOUT_DEFAULT`), disconnect the staller | an idle worker fetches the blocking chunk after 2 s; the owner keeps going (its appends are idempotent) | **DONE** |
+| Per-block download timeout | 10 min base (`BLOCK_DOWNLOAD_TIMEOUT_BASE`) | a stall clock: nothing for 120 s drops the peer (PR #68) | **DECIDED** (stricter; relative rules decide who is slow) |
+| Peer selection for download | none beyond outbound selection | timed 2,000-header sample ranks the pool; boundary rotation under half the pool median; a failed fetch halves a peer's standing and backs off (PRs #61, #74, #81) | **DECIDED** |
+| Write order | blocks written on arrival, connected in order | same; the status line reports what is in flight and the age of the oldest gap (PR #82) | **DONE** |
+| Progress reporting | `debug.log` progress= and ETA in the GUI | `eta DD:HH:MM:SS` on the status line at the last ten minutes' block rate (PR #74) | **DONE** |
+
