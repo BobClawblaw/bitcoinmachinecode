@@ -115,7 +115,18 @@ long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long n
             while (next < nloc && held_len[next]){
                 if (store_append_shared(st, lo_real + next, held_hash[next],
                                         hold + held_off[next], held_len[next]) < 0) goto fail;
-                held_bytes -= held_len[next];
+                /* The hold is a BUMP allocator: freed space is never reused
+                 * within a chunk. The first cut subtracted the drained length
+                 * from the bump pointer here, which moved it BACK over blocks
+                 * still parked -- and when two parked blocks were the same
+                 * size (early-chain blocks very often are) the next arrival
+                 * landed exactly on a parked block's offset, so that block was
+                 * later drained with ANOTHER block's bytes under its own hash.
+                 * That is the "record names X, body is Y" archive the 2026-09-06
+                 * run 5 left behind. 24 MB per chunk is plenty; nothing needs
+                 * reclaiming. (Found by test_shared_stress proving the store
+                 * itself correct under 48,000 interleaved appends, which left
+                 * only this file to blame.) */
                 held_len[next] = 0; got[next] = 1; stored++; next++;
             }
         } else {

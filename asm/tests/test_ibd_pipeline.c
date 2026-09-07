@@ -87,11 +87,11 @@ int cons_verify(const void* blkv, long len, void* scratch, unsigned cap){
     const unsigned char* blk = blkv; (void)len; (void)scratch; (void)cap; if (g_bad_consensus && blk[76] == (unsigned char)g_bad_consensus - 1) return 0; return 1;
 }
 void block_hash(unsigned char out[32], const unsigned char* hdr80){ hash_of(out, hdr80[76]); }
-static long g_stored_h[NB]; static int g_nstored;
+static long g_stored_h[NB]; static int g_nstored; static int g_wrong_body;
 long store_append_shared(void* st, long height, const unsigned char hash[32], const unsigned char* raw, unsigned len){
     (void)st; (void)raw; (void)len;
     unsigned char want[32]; hash_of(want, raw[76]);
-    if (memcmp(hash, want, 32) != 0) { printf("      stored the wrong hash\n"); exit(2); }
+    if (memcmp(hash, want, 32) != 0) g_wrong_body++;   /* record names one block, bytes are another */
     if (g_nstored < NB) g_stored_h[g_nstored++] = height;
     return height;
 }
@@ -106,7 +106,7 @@ static void build_chain(void){
     }
 }
 static void reset(void){
-    g_getdata_msgs = g_getdata_entries = g_pongs = g_pos = g_nstored = 0;
+    g_getdata_msgs = g_getdata_entries = g_pongs = g_pos = g_nstored = g_wrong_body = 0;
     g_inject_unasked = g_inject_ping = g_bad_prev = g_bad_consensus = 0;
     memset(g_stored_h, 0, sizeof g_stored_h);
 }
@@ -140,6 +140,29 @@ int main(void){
     { int ascending = 1; for (int i = 1; i < NB; i++) if (g_stored_h[i] <= g_stored_h[i-1]) ascending = 0;
       ok(ascending && g_stored_h[0] == LO,
          "stores are in ASCENDING height order even though delivery was reversed"); }
+
+    printf("== the hold is a bump allocator: a drain must NOT move the pointer back ==\n");
+    /* Every block in this fixture is the same length, as early-chain blocks
+     * very often are. Deliver 1 and 3 (both parked), then 0: 0 is stored, 1
+     * drains, 3 stays parked because 2 is still missing. The first cut then
+     * subtracted 1's length from the bump pointer, which put it exactly at 3's
+     * offset -- so 4, arriving next, was written OVER the parked 3, and 3 was
+     * later drained with 4's bytes under 3's hash.
+     * That is the "record names X, body is Y" archive run 5 left behind. */
+    reset();
+    /* park 1 and 3; deliver 0 -> 0 stored, 1 drained, 3 STAYS parked (2 is
+     * missing). Old code: pointer -= len(1) == len(3) -> exactly 3's offset.
+     * Deliver 4 -> parked ON TOP of 3. Deliver 2 -> 2 stored, 3 drained with
+     * 4's bytes under 3's hash. */
+    { int ord[NB]; int k = 0; ord[k++] = 1; ord[k++] = 3; ord[k++] = 0; ord[k++] = 4; ord[k++] = 2;
+      for (int i = 5; i < NB; i++) ord[k++] = i;
+      g_norder = NB; for (int i = 0; i < NB; i++) g_order[i] = ord[i]; }
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
+    ok(r == NB, "the chunk still completes");
+    ok(g_wrong_body == 0, "NO record was written with another block's bytes (the run-5 corruption)");
+    if (g_wrong_body) printf("      %d record(s) carried the wrong body\n", g_wrong_body);
+    { int ascending = 1; for (int i = 1; i < NB; i++) if (g_stored_h[i] <= g_stored_h[i-1]) ascending = 0;
+      ok(ascending, "and the archive still grew in ascending height order"); }
 
     printf("== noise and abuse ==\n");
     reset(); order_forward(); g_inject_ping = 1;
