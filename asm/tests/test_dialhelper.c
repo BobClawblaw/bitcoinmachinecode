@@ -194,6 +194,26 @@ int main(void){
       double early = dlc_effective_floor(5.6 * 1024.0);
       ok(!dlc_dead_weight(9.0 * 1024.0, 12, early), "the run-7 case: 9 KB/s and 12 blocks at height 50k is HEALTHY, not dead weight");
       ok(dlc_dead_weight(300.0, 1, early), "0.3 KB/s and one block at the same floor: genuinely dead, still killed"); }
+      /* 2026-09-07: boundary rotation. With the flat chunk budget gone (PR
+       * #68) nothing removed a delivering-but-slow peer: the floor is 32 KB/s
+       * at the tail, so a 250 KB/s peer against an 800 KB/s median held its
+       * slot for the run. The verdict is taken at the chunk boundary, with
+       * nothing in flight: under half the pool median -> a fresh peer. */
+      { ok(dlc_rotate_after_chunk(300.0*1024, 800.0*1024), "300 KB/s over a clean chunk vs an 800 KB/s median: rotate (under half)");
+        ok(!dlc_rotate_after_chunk(450.0*1024, 800.0*1024), "450 KB/s vs 800: keep (over half)");
+        ok(!dlc_rotate_after_chunk(300.0*1024, 0.0), "no median published yet: keep");
+        ok(!dlc_rotate_after_chunk(-1.0, 800.0*1024), "no chunk rate (chunk too short to judge): keep");
+        ok(dlc_rotate_after_chunk(5.0*1024, 12.0*1024), "early chain, 5 KB/s vs a 12 KB/s median: rotate -- the bar is relative at every depth");
+        /* ETA in DD:HH:MM:SS at the recent block rate */
+        char e[24];
+        dlc_fmt_eta(e,sizeof e,0);      ok(!strcmp(e,"00:00:00:00"), "eta 0 s -> 00:00:00:00");
+        dlc_fmt_eta(e,sizeof e,86399);  ok(!strcmp(e,"00:23:59:59"), "eta 86,399 s -> 00:23:59:59");
+        dlc_fmt_eta(e,sizeof e,90061);  ok(!strcmp(e,"01:01:01:01"), "eta 90,061 s -> 01:01:01:01 (DD:HH:MM:SS)");
+        dlc_fmt_eta(e,sizeof e,-1);     ok(!strcmp(e,"--:--:--:--"), "no rate yet -> --:--:--:--");
+        long t = dlc_eta_secs(213000, 41833, 3600.0);
+        ok(t >= 18329 && t <= 18331, "213,000 blocks left at run 9's 41,833/h: 5:05:30 (18,330 s)");
+        ok(dlc_eta_secs(0, 41833, 3600.0) == 0, "nothing left: 0");
+        ok(dlc_eta_secs(1000, 0, 600.0) == -1, "no blocks in the window: no estimate"); }
       if (cwd0[0]) (void)!chdir(cwd0); }
 
     printf("== 6. the boot header fetch: exponential locator, per-page checks ==\n");
