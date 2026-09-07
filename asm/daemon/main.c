@@ -4193,19 +4193,28 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
          * ourselves rather than wait on a worker that may be gone. */
         long lo=dlc_retry_pop(next_claim);
         if(lo<0){
-            int waited=0;
+            int waited_ticks=0;                 /* 200 ms each */
             for(;;){
                 long peek=next_claim[DLC_CTL_CLAIM], fh=next_claim[DLC_CTL_FIRST_HOLE];
                 if(peek>end_h || dlc_window_allows(peek, fh)) break;
+                /* The published anchor is up to one 10 s tick old. On the
+                 * early chain the window drains in a couple of seconds, so
+                 * run 11 (2026-09-07) sat idle between ticks: 32,241 blocks
+                 * at five minutes against run 9's 86,000, 512 waits. Blocked
+                 * on a stale anchor, refresh it ourselves (two asm scans of
+                 * index.dat) and share the fresher value; wait only when the
+                 * frontier really is where the anchor says. */
+                { long tip=dlc_index_tip(); long fresh = tip>=0 ? dlc_first_hole(tip) : -1; if(fresh<0 && tip>=0) fresh=tip+1;
+                  if(fresh>fh){ next_claim[DLC_CTL_FIRST_HOLE]=fresh; fh=fresh; if(dlc_window_allows(peek, fh)) break; } }
                 lo=dlc_retry_pop(next_claim); if(lo>=0) break;
-                if(waited>=DLC_WINDOW_HELP_SECS){
+                if(waited_ticks>=DLC_WINDOW_HELP_SECS*5){
                     lo=fh-((fh-0)%DLC_CHUNK_BLOCKS); if(lo<0) lo=0;   /* the chunk holding the first hole */
                     fprintf(stderr,"[dlc w%d] window blocked %ds at hole %ld (claims at %ld): fetching chunk [%ld,%ld] alongside its owner\n",
-                            w, waited, fh, peek, lo, lo+DLC_CHUNK_BLOCKS-1);
+                            w, waited_ticks/5, fh, peek, lo, lo+DLC_CHUNK_BLOCKS-1);
                     break;
                 }
-                if(waited==0) fprintf(stderr,"[dlc w%d] at the window: next claim %ld is %ld past the first hole %ld -- waiting, not running ahead\n", w, peek, peek-fh, fh);
-                sleep(1); waited++;
+                if(waited_ticks==0) fprintf(stderr,"[dlc w%d] at the window: next claim %ld is %ld past the first hole %ld -- waiting, not running ahead\n", w, peek, peek-fh, fh);
+                usleep(200000); waited_ticks++;
             }
             if(lo<0) lo=__sync_fetch_and_add(next_claim,(long)DLC_CHUNK_BLOCKS);
         }
