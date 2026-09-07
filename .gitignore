@@ -430,3 +430,6 @@ asm/daemon/bitcoinmcd
 asm/daemon/bitcoinmcd.live
 asm/daemon/bitcoinmcd.deploy-*
 asm/daemon/bitcoin_rpcd
+
+# never again: a predeploy snapshot with private keys was committed on 2026-09-04
+backups/
