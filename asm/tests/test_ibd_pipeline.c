@@ -88,6 +88,7 @@ int cons_verify(const void* blkv, long len, void* scratch, unsigned cap){
 }
 void block_hash(unsigned char out[32], const unsigned char* hdr80){ hash_of(out, hdr80[76]); }
 static long g_stored_h[NB]; static int g_nstored; static int g_wrong_body;
+static int g_progress; static void count_progress(void* a){ (void)a; g_progress++; }
 long store_append_shared(void* st, long height, const unsigned char hash[32], const unsigned char* raw, unsigned len){
     (void)st; (void)raw; (void)len;
     unsigned char want[32]; hash_of(want, raw[76]);
@@ -184,6 +185,29 @@ int main(void){
     reset(); g_norder = NB / 2; for (int i = 0; i < g_norder; i++) g_order[i] = i;
     r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
     ok(r == -1, "a peer that goes quiet half way does NOT report a complete chunk");
+
+    printf("== the chunk budget is a STALL clock: the progress hook fires once per wanted block ==\n");
+    /* 2026-09-07: the worker's 120 s alarm covered the WHOLE chunk, which at
+     * 40 x 1.5 MB blocks is a ~470 KB/s absolute bar; it dropped 429 peers
+     * above the pool-relative floor in seven hours. The alarm is now re-armed
+     * from this hook, so only a peer that delivers NOTHING for 120 s trips it. */
+    ibd_pipeline_set_progress(count_progress, NULL);
+    reset(); order_forward(); g_progress = 0;
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
+    ok(r == NB && g_progress == NB, "forward delivery: the hook fired exactly once per block (40)");
+    reset(); order_reverse(); g_progress = 0;
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
+    ok(r == NB && g_progress == NB, "reverse delivery: 40 firings -- progress is counted on ARRIVAL, so a peer whose blocks are parked is not a stalled peer");
+    reset(); order_forward(); g_inject_unasked = 1; g_inject_ping = 1; g_progress = 0;
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
+    ok(r == NB && g_progress == NB, "a ping and an unasked block are NOT progress (still exactly 40)");
+    reset(); order_forward(); g_norder = 7; g_progress = 0;
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
+    ok(r == -1 && g_progress == 7, "a peer that goes quiet after 7 blocks: 7 firings, then the chunk fails");
+    ibd_pipeline_set_progress(NULL, NULL);
+    reset(); order_forward(); g_progress = 0;
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
+    ok(r == NB && g_progress == 0, "with no hook registered the fetch still completes (the hook is optional)");
 
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);
     return fails?1:0;

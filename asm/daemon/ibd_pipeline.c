@@ -33,6 +33,8 @@ static long g_last_batch = 0;
 long ibd_pipeline_last_batch(void){ return g_last_batch; }
 static long g_wave = 0;                  /* 0 = the whole chunk in one getdata */
 void ibd_pipeline_set_wave(long n){ g_wave = (n > 0 && n < IBD_PIPE_MAX) ? n : 0; }
+static void (*g_progress)(void*) = 0; static void* g_progress_arg = 0;
+void ibd_pipeline_set_progress(void (*cb)(void*), void* arg){ g_progress = cb; g_progress_arg = arg; }
 
 /* CompactSize for a count < 253 (the only sizes this builds: <= IBD_PIPE_MAX). */
 static unsigned build_getdata(unsigned char* out, const unsigned char hashes[][32], long n)
@@ -110,6 +112,7 @@ long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long n
          * If this is the next height, write it and then drain whatever the
          * hold has for the heights that follow. Otherwise park it. */
         if (idx == next){
+            if (g_progress) g_progress(g_progress_arg);       /* a wanted block arrived: progress */
             if (store_append_shared(st, lo_real + idx, bh, buf, len) < 0) goto fail;
             got[idx] = 1; stored++; next++;
             while (next < nloc && held_len[next]){
@@ -131,6 +134,7 @@ long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long n
             }
         } else {
             if (held_len[idx]) continue;                       /* already held */
+            if (g_progress) g_progress(g_progress_arg);       /* parked out of order, but it DID arrive */
             if (!hold){
                 hold = mmap(0, IBD_HOLD_BYTES, PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);

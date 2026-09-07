@@ -2003,8 +2003,9 @@ static volatile sig_atomic_t mux_sync_budget_fired = 0;
  * already did on budget expiry; the peer loses nothing but a half-read frame
  * we were going to discard anyway. */
 static volatile int mux_budget_fd = -1;
+static volatile sig_atomic_t mux_sync_budget_sig = 0;   /* WHICH signal: SIGALRM (stall) or SIGUSR1 (parent early-kill) */
 static void mux_budget_alarm(int sig){
-    (void)sig;
+    mux_sync_budget_sig = sig;
     mux_sync_budget_fired = 1;
     int fd = mux_budget_fd;
     if (fd >= 0) shutdown(fd, SHUT_RDWR);
@@ -3402,12 +3403,27 @@ static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
  * so all 512 were covered in 0.49s -- so there is no reason to sample. */
 #define DLC_MAXPOOL 2048
 #define DLC_HDR_TRY_PEERS 8
-/* wall-clock budget for ONE chunk transfer. At DLC_CHUNK_BLOCKS=40
- * (~50-60MB near the real tip), 120s requires ~467KB/s sustained to
- * survive -- similar bar to the old 480s/200-block combo, but the
- * detect-and-replace cycle for a dead peer is ~4x faster and a miss costs
- * ~4x less redone work. */
+/* STALL budget: the longest a worker waits for the NEXT block of a chunk
+ * before dropping the peer. Re-armed from the pipeline's progress hook on
+ * every wanted block that arrives.
+ *
+ * Until 2026-09-07 this was the wall-clock budget for the WHOLE chunk, and
+ * the comment here said so plainly: "at 40 blocks (~50-60MB near the tip),
+ * 120s requires ~467KB/s sustained to survive". That is an absolute rate
+ * bar in disguise (docs/ENGINEERING_RULES.md rule 11), and it does not even
+ * hold still -- it rises with block size. Seven hours into the 2026-09-07
+ * fresh-sync benchmark it had dropped 429 peers whose measured rate was
+ * ABOVE the pool-relative floor (one had served 1,560 blocks; a 424 KB/s
+ * peer at height 600k simply cannot finish 60 MB in 120 s), discarding
+ * ~10.7 GB of half-received chunks, while the real dead-weight rule found
+ * 3. Per-block, 120 s is ~12 KB/s for a 1.5 MB block: a stall detector,
+ * below the 32 KB/s absolute floor, so the pool-relative rule -- not this
+ * constant -- is what decides who is slow. Core's own per-block download
+ * timeout is 10 minutes (BLOCK_DOWNLOAD_TIMEOUT_BASE); this is stricter,
+ * as before. */
 #define DLC_CHUNK_BUDGET_SECS 120
+#define DLC_STR_(x) #x
+#define DLC_STR(x) DLC_STR_(x)     /* the stall line prints the constant, not a copy of it */
 /* early-kill thresholds: the parent's status loop already samples each
  * worker's real /proc/<pid>/io bandwidth every 10s for the live display --
  * a connection sustaining under DLC_DEAD_WEIGHT_BPS for
@@ -3564,6 +3580,9 @@ static double dlc_effective_floor(double median_bps){
     if (f < 512.0) f = 512.0;                                        /* a truly dead socket still dies */
     return f;
 }
+/* the pipeline's progress hook: every wanted block that arrives restarts the
+ * stall clock, so a peer that keeps delivering is never dropped by it. */
+static void dlc_chunk_progress(void* arg){ (void)arg; alarm(DLC_CHUNK_BUDGET_SECS); }
 static int dlc_dead_weight(double byte_rate, long blocks_this_tick, double floor_bps){
     if (byte_rate < 0.0) return 0;                                   /* no reading yet */
     if (byte_rate < floor_bps) return 1;                             /* under the pool-relative floor */
@@ -4153,7 +4172,8 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             struct sigaction sa, old; memset(&sa,0,sizeof sa);
             sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
             sigaction(SIGALRM,&sa,&old);   /* SIGUSR1 already registered for this worker's whole life, above */
-            mux_sync_budget_fired=0;
+            mux_sync_budget_fired=0; mux_sync_budget_sig=0;
+            ibd_pipeline_set_progress(dlc_chunk_progress, 0);   /* each arriving block re-arms this */
             alarm(DLC_CHUNK_BUDGET_SECS);
             /* 2026-09-06: the whole chunk in ONE getdata, blocks placed by
              * hash as they arrive (daemon/ibd_pipeline.c). node_ibd_blocks_s
@@ -4169,8 +4189,15 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             if(mux_sync_budget_fired){
                 mystat->timeouts++;   /* covers both the flat budget AND an early-kill signal -- same code path */
                 char lastbw[16]; dlc_fmt_rate(lastbw,sizeof lastbw,mystat->last_bw_bps);
-                fprintf(stderr,"[dlc w%d] %s dead weight (last measured %s, completed %ld chunk(s)/%ld block(s) on this peer); dropping for a fresh peer\n",
-                        w, mystat->peer, lastbw, mystat->chunks, mystat->blocks);
+                /* the line says WHICH rule fired: the parent's pool-relative
+                 * dead-weight verdict (SIGUSR1), or this worker's own stall
+                 * clock (SIGALRM: no block for DLC_CHUNK_BUDGET_SECS). Before
+                 * 2026-09-07 both printed "dead weight", and 429 of 432 such
+                 * lines in one run were the alarm, not the verdict. */
+                fprintf(stderr,"[dlc w%d] %s %s (last measured %s, completed %ld chunk(s)/%ld block(s) on this peer); dropping for a fresh peer\n",
+                        w, mystat->peer,
+                        mux_sync_budget_sig==SIGUSR1 ? "dead weight" : "stalled: no block for " DLC_STR(DLC_CHUNK_BUDGET_SECS) "s",
+                        lastbw, mystat->chunks, mystat->blocks);
                 close(fd); fd=-1; DLC_RELEASE();
                 slot=(slot+1)%(nlive>0?nlive:1);
                 if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
