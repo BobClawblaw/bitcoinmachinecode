@@ -43,3 +43,16 @@ sudo mv /etc/systemd/system/bmc-bitcoind.service.d /etc/systemd/system/bmcbitcoi
 sudo systemctl daemon-reload
 sudo systemctl disable bmc-bitcoind; sudo systemctl enable --now bmcbitcoind
 ```
+
+## Addendum: the reference box's unit was renamed at 09:57Z
+
+Done with the operator's sudo. The same binary the node had been running
+(the 2026-09-05a snapshot) was copied to `bmcbitcoind.deploy-20260905a`,
+byte-identical, and `bmcbitcoind.live` points at it, so the rename
+changed names only, not code. The unit file became
+`/etc/systemd/system/bmcbitcoind.service` with its four drop-ins; the
+logrotate service and timer descriptions follow. Old unit stopped and
+removed, new one enabled and active; the node was back on the network
+inside a minute and closed the 40 blocks it had missed with no error in
+its log. The log banner still reads `bmc-bitcoind` until the next deploy
+puts a build from today's main behind `bmcbitcoind.live`.
