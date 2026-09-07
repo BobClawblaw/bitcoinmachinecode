@@ -1238,3 +1238,45 @@ new one and falling back to the old so no test silently skips a missing daemon.
 - The pid-file change is inert on this deployment: no pid file exists (repo root or
   datadir), no boot line claims one, and systemd is what tracks the PID here.
 
+
+## 2026-09-07 (later still): the name moved again, 12 minutes on — `bmcbitcoind`. Supersedes the entry above.
+
+The entry before this one ported `bitcoinmcd`. Upstream then decided the rule
+(`90e9aa3a`, "everything we ship starts with `bmc`"): nothing of ours may be
+mistaken for, or collide with, a Bitcoin Core file on the same box. So:
+
+| artifact | now |
+|---|---|
+| daemon | **`bmcbitcoind`** (was `bitcoinmcd` for ~12 minutes, `bitcoind` before that) |
+| pid file | `bmcbitcoind.pid` |
+| RPC daemon | `bmc_rpcd` (source `asm/daemon/bitcoin_rpcd.c` keeps its name) |
+| unit / deploy convention | `bmcbitcoind.service` / `bmcbitcoind.live` — the reference box renamed its unit at 09:57Z (`d272f442`) and deployed today's main as `bmcbitcoind.deploy-20260907a` (`9ea07ab2`) |
+
+- **ARM port:** `build_daemon.sh` emits `daemon_out/bmcbitcoind`. Because the name had
+  already moved twice, `parity_sweep.sh` stopped hard-coding it: it keeps name lists
+  (`bmcbitcoind bitcoinmcd bitcoind`, `bmc_rpcd bitcoin_rpcd`), resolves whichever
+  binary exists newest-first, links **every** name into the asm scratch layout and
+  remaps every arg form. A future rename costs one list edit, and a test that needs a
+  daemon either gets one or fails visibly — never silently skips.
+  `port/arm64/bitcoind.S` and `asm/daemon/bitcoin_rpcd.c` were left alone on purpose:
+  those are source names for the core module and the RPC tool's main, and x86 kept both.
+- **Housekeeping:** the transient `daemon_out/bitcoinmcd` was deleted (a name upstream
+  abandoned before anything could run it). `daemon_out/bitcoind` stays — it is the
+  **live arm-12 binary**, which the unit still points at.
+- **Sweep round 34** on the merged tree (`merge c134d496`): pass 370 / fail 4 /
+  bench-ok 15 / skip 10 / build-fail 8 / compared 389 of 432 — the same verdict as
+  rounds 32 and 33. The rows that touch the renamed products are the check and all
+  pass natively: `test_elf_hardening` (defaults to `daemon/bmcbitcoind`),
+  `test_core_parity` (pins the `bmcbitcoind.pid` default — the one discussed
+  divergence from Core's config defaults), `test_rpc_server` / `test_rpc_transport` /
+  `test_rpc_start_policy` (they exec `./daemon/bmc_rpcd`), `test_bitcoind`,
+  `test_bitcoind_sync`, `test_bip30_daemon`.
+- **Deploy state, unchanged and still the thing to do:** `bmc-arm.service` runs
+  `daemon_out/bitcoind` = arm-12 (`cfe86ed4`). The merged build is
+  `daemon_out/bmcbitcoind` md5 `5bcfd57e`. A crash-restart right now therefore comes
+  back on the pre-merge build. The deploy is TWO steps, and now against the final
+  name: point `ExecStart` at `daemon_out/bmcbitcoind` + `systemctl daemon-reload`, and
+  retire `daemon_out/bitcoind` into `rollback/` so no stale binary stays runnable
+  behind the unit. The ARM unit's own name (`bmc-arm.service`) is a per-box label
+  rather than a product name; renaming it toward the `bmcbitcoind.service` convention
+  is an operator call, not a port requirement.

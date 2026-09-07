@@ -48,11 +48,11 @@
 #       $(wildcard ...) of exactly that path), test_txv_parse_diff,
 #       test_txvb_parse_diff, test_strip_witness_diff, test_bip143_diff
 #       (env-only: those tests are arch-neutral C).
-#   ./daemon/bitcoinmcd runner arg (test_outbound_mux, test_redial)
-#       remapped to the ARM daemon_out/bitcoinmcd (the product was renamed from
-#       bitcoind by x86 8ff54a63; the old ./daemon/bitcoind form still resolves,
-#       see ensure_asm_layout); needs loopback ports, may be env-sensitive --
-#       triaged from the TSV, not pre-skipped.
+#   ./daemon/bmcbitcoind runner arg (test_outbound_mux, test_redial)
+#       remapped to the ARM daemon (the product's name moved twice on 2026-09-07:
+#       bitcoind -> bitcoinmcd 8ff54a63 -> bmcbitcoind 90e9aa3a; every form still
+#       resolves, see ensure_asm_layout); needs loopback ports, may be
+#       env-sensitive -- triaged from the TSV, not pre-skipped.
 #   tests/ecdsa_verify_ref.o
 #       NOT a skip: ported 1:1 in port/arm64/ecdsa_verify_ref.S (frozen
 #       pre-4.2 verifier). tests/undo_log_ref.o is arch-neutral C + objcopy
@@ -426,9 +426,10 @@ if true; then
     2>> "$OUT/build.log" \
   || echo -e "build-fail\tSPECIAL:wallet_cli\tsee build.log" >> "$OUT/results.tsv"
 fi
-# daemon/bitcoin_rpcd: the RPC daemon binary (test_rpc_server execs it as
-# ./daemon/bitcoin_rpcd with TEST_RPC_PORT=0). Link = the daemon bundle with
-# bitcoin_rpcd.c swapped for main.c (build_daemon.sh's lists, minus main).
+# daemon/bmc_rpcd: the RPC daemon binary (test_rpc_server execs it as
+# ./daemon/bmc_rpcd with TEST_RPC_PORT=0; renamed by x86 90e9aa3a, the SOURCE file
+# keeps its name). Link = the daemon bundle with bitcoin_rpcd.c swapped for
+# main.c (build_daemon.sh's lists, minus main).
 # daemon/bmc_cli: daemon/bmc_cli.c + cli_conf.c + rpc_net/commands/json
 # + RPCLIBS (test_rpc_server shells out to it). b89f468a renamed the tool
 # bitcoin_cli -> bmc_cli (asm/bitcoin_cli.o, the S6 store-inspection module,
@@ -448,10 +449,10 @@ if true; then
     2>> "$OUT/build.log" \
   || echo -e "build-fail\tSPECIAL:bmc_cli\tsee build.log" >> "$OUT/results.tsv"
 fi
-# rebuilt EVERY sweep: a stale bitcoin_rpcd silently measures pre-merge code
 # rebuilt EVERY sweep from build_daemon.sh's own lists -- a stale or
 # hand-maintained link line silently measures pre-merge code (the 2026-09-02
 # rpcd did: zero whitelist symbols). Swap the daemon main for the tool main.
+# Output is bmc_rpcd (x86 90e9aa3a); the SOURCE stays asm/daemon/bitcoin_rpcd.c.
 if true; then
   eval $(grep -E "^DAEMONSRCS=|^RPCSRCS=|^NEWSRCS=|^DAEMONOBJS=" build_daemon.sh)
   SRCS=$(echo "$DAEMONSRCS $RPCSRCS $NEWSRCS" | tr ' ' '\n' | grep -v "daemon/main.c" | tr '\n' ' ')
@@ -459,9 +460,9 @@ if true; then
   SRCS="$SRCS ../../asm/wallet_book.c"
   OB=$(for m in $DAEMONOBJS; do echo "${m}.o"; done)
   gcc -no-pie -O2 -Wl,-z,relro,-z,now -lpthread -I../../asm -I../../asm/daemon -I../.. \
-    -o "$OUT/bitcoin_rpcd" ../../asm/daemon/bitcoin_rpcd.c $SRCS ../../asm/wallet_core.c $OB \
+    -o "$OUT/bmc_rpcd" ../../asm/daemon/bitcoin_rpcd.c $SRCS ../../asm/wallet_core.c $OB \
     2>> "$OUT/build.log" \
-  || echo -e "build-fail\tSPECIAL:bitcoin_rpcd\tsee build.log" >> "$OUT/results.tsv"
+  || echo -e "build-fail\tSPECIAL:bmc_rpcd\tsee build.log" >> "$OUT/results.tsv"
 fi
 [ -f ecdsa_verify_ref.o ] || gcc -march=armv8.2-a+sha2 -c -o ecdsa_verify_ref.o ecdsa_verify_ref.S 2>> "$OUT/build.log"
 [ -f parity_support/bench_abi_guard.o ] || gcc -c -o parity_support/bench_abi_guard.o parity_support/bench_abi_guard.S 2>> "$OUT/build.log"
@@ -482,16 +483,29 @@ is_elf() { [ "$(head -c4 "$1" 2>/dev/null | tail -c1)" = "$(printf '\177')" ]; }
 # launch from $REPO/asm with the ARM-built binaries symlinked into place.
 ensure_asm_layout() {
     local AB="$REPO/port/arm64"
-    # daemon build products the tests exec via tt_src("daemon/<name>")
-    # RENAMED 2026-09-07 (x86 8ff54a63): the product is bitcoinmcd now. Link the
-    # new name, and keep the old symlink resolving to the same binary so any
-    # straggler arg form still finds a daemon instead of silently skipping.
-    local ARMDAEMON="$AB/daemon_out/bitcoinmcd"
-    [ -x "$ARMDAEMON" ] || ARMDAEMON="$AB/daemon_out/bitcoind"
-    ln -sf "$ARMDAEMON" "$REPO/asm/daemon/bitcoinmcd"
-    ln -sf "$ARMDAEMON" "$REPO/asm/daemon/bitcoind"
+    # daemon build products the tests exec via tt_src("daemon/<name>").
+    # The daemon's name has moved TWICE in a day (bitcoind -> bitcoinmcd 8ff54a63
+    # -> bmcbitcoind 90e9aa3a, "everything we ship starts with bmc"), so resolve
+    # whichever binary actually exists (newest first) and link EVERY name any test
+    # might still exec to it. A missing product must fail loudly, never silently
+    # skip the tests that need a daemon.
+    DAEMON_NAMES="bmcbitcoind bitcoinmcd bitcoind"
+    RPCD_NAMES="bmc_rpcd bitcoin_rpcd"
+    local ARMDAEMON=""
+    for n in $DAEMON_NAMES; do
+        [ -x "$AB/daemon_out/$n" ] && { ARMDAEMON="$AB/daemon_out/$n"; break; }
+    done
+    if [ -n "$ARMDAEMON" ]; then
+        for n in $DAEMON_NAMES; do ln -sf "$ARMDAEMON" "$REPO/asm/daemon/$n"; done
+    fi
+    local ARMRPCD=""
+    for n in $RPCD_NAMES; do
+        [ -x "$AB/$OUT/$n" ] && { ARMRPCD="$AB/$OUT/$n"; break; }
+    done
+    if [ -n "$ARMRPCD" ]; then
+        for n in $RPCD_NAMES; do ln -sf "$ARMRPCD" "$REPO/asm/daemon/$n"; done
+    fi
     [ -x "$AB/$OUT/wallet_cli" ] && ln -sf "$AB/$OUT/wallet_cli" "$REPO/asm/daemon/wallet_cli"
-    [ -x "$AB/$OUT/bitcoin_rpcd" ] && ln -sf "$AB/$OUT/bitcoin_rpcd" "$REPO/asm/daemon/bitcoin_rpcd"
     [ -x "$AB/$OUT/bmc_cli" ] && ln -sf "$AB/$OUT/bmc_cli" "$REPO/asm/daemon/bmc_cli"
     # the txo-spender index base builder (x86: asm/Makefile daemon/build_txospender_index)
     if [ -x "$AB/$OUT/build_txospender_index" ]; then
@@ -518,13 +532,20 @@ run_inv() {  # name kind args index
     for f in "$AB/$OUT"/test_* "$AB/$OUT"/bench_* "$AB/$OUT"/*_shim "$AB/$OUT"/smoke_* "$AB/$OUT"/run_batch "$AB/$OUT"/fakepeer_*; do
         link_helper "$f"
     done
-    # ./daemon/<daemon> arg remap -> the ARM daemon (cwd is asm/ now, where
-    # ./daemon/bitcoinmcd already resolves via the symlink above; keep the
-    # remap for older arg forms, and both names since the rename)
-    local ARMDAEMON="$REPO/port/arm64/daemon_out/bitcoinmcd"
-    [ -x "$ARMDAEMON" ] || ARMDAEMON="$REPO/port/arm64/daemon_out/bitcoind"
-    local args2="${args//.\/daemon\/bitcoinmcd/$ARMDAEMON}"
-    args2="${args2//.\/daemon\/bitcoind/$ARMDAEMON}"
+    # ./daemon/<daemon> arg remap -> the ARM daemon. cwd is asm/ now, where the
+    # symlink already resolves; the remap covers absolute/older arg forms, and
+    # loops every name the product has had today so a rename costs the list in
+    # ensure_asm_layout, not this line.
+    local DAEMON_PATH=""
+    for n in bmcbitcoind bitcoinmcd bitcoind; do
+        [ -x "$REPO/port/arm64/daemon_out/$n" ] && { DAEMON_PATH="$REPO/port/arm64/daemon_out/$n"; break; }
+    done
+    local args2="$args"
+    if [ -n "$DAEMON_PATH" ]; then
+        for n in bmcbitcoind bitcoinmcd bitcoind; do
+            args2="${args2//.\/daemon\/$n/$DAEMON_PATH}"
+        done
+    fi
     ( cd "$REPO/asm" && timeout "$TMO" "$bin" $args2 > "$REPO/port/arm64/$OUT/$label.out.txt" 2>&1 )
     local rc=$?
     local outf="$REPO/port/arm64/$OUT/$label.out.txt"
