@@ -304,6 +304,19 @@ specific window is wrong by construction (detect the window, or pay for the
 recount); and when a cheap number and an expensive measurement disagree,
 the measurement is the number.
 
+## 10. Working on this machine
+
+See the repo README for the full topology. The traps that recur:
+
+- `pkill -f <pattern>` matches the ssh command line itself and kills the
+  session. Use explicit PIDs.
+- `/tmp` on the host is not writable by the service account.
+- Heredocs inside single-quoted ssh commands break on quoting. Write the
+  script locally, `scp` it, run it, delete it.
+- macOS `sed -i` requires a backup-suffix argument. A failed `sed` in an
+  `a && b && c` chain silently skips the rest while a later line still runs.
+- Git worktrees embed an absolute path tied to the host that created them.
+
 ## 11. A threshold calibrated at one point of the chain is wrong at every other
 
 The fresh-sync benchmarks of 2026-09-06 (runs 4 through 7) spent hours
@@ -355,16 +368,3 @@ numbers is how this ran for four benchmarks.
 
 Fixed in PR #61 (`peer-selection-2026-09-06`); measured at 5 min 19 s on the
 same peer pool: 41,974 blocks against ~16,000, zero evictions against 400+.
-
-## 10. Working on this machine
-
-See the repo README for the full topology. The traps that recur:
-
-- `pkill -f <pattern>` matches the ssh command line itself and kills the
-  session. Use explicit PIDs.
-- `/tmp` on the host is not writable by the service account.
-- Heredocs inside single-quoted ssh commands break on quoting. Write the
-  script locally, `scp` it, run it, delete it.
-- macOS `sed -i` requires a backup-suffix argument. A failed `sed` in an
-  `a && b && c` chain silently skips the rest while a later line still runs.
-- Git worktrees embed an absolute path tied to the host that created them.
