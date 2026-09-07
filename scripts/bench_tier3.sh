@@ -61,7 +61,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUR_ARCHIVE="${OUR_ARCHIVE:-/storage/bitcoinmachinecode/data}"
 CORE_BLOCKS="${CORE_BLOCKS:-/storage/core-oracle/blocks}"
 CORE_BIN="${CORE_BIN:-/storage/bitcoin-core-source/build/bin/bitcoind}"
-OUR_BIN="${OUR_BIN:-$REPO_ROOT/asm/daemon/bitcoind}"
+OUR_BIN="${OUR_BIN:-$REPO_ROOT/asm/daemon/bitcoinmcd}"
 WORK="${WORK:-/storage/bench-tier3}"
 
 HEIGHT=""
@@ -325,7 +325,7 @@ run_ours(){
     [ -n "$HEIGHT" ] || die "run-ours needs --height"
     local dest="$WORK/ours"
     [ -r "$dest/index.dat" ] || die "run prepare-ours first"
-    [ -x "$OUR_BIN" ] || die "no daemon at $OUR_BIN (build it: cd asm && make daemon/bitcoind)"
+    [ -x "$OUR_BIN" ] || die "no daemon at $OUR_BIN (build it: cd asm && make daemon/bitcoinmcd)"
     need_quiet
 
     local log="$WORK/ours-run-$(date -u +%Y%m%dT%H%M%SZ).log"

@@ -65,7 +65,7 @@ prev_live_h="" prev_live_t="" addr="" tip=""
 
 while true; do
   mapfile -t lines < <(grep '\[utxo_live\] catchup progress' "$LOG" | tail -2)
-  pids=$(pgrep -f 'daemon/bitcoind serve')
+  pids=$(pgrep -f 'daemon/bitcoinmcd serve')
 
   if [ -z "$pids" ]; then
     printf "\n[daemon not running]\n"; exit 1
