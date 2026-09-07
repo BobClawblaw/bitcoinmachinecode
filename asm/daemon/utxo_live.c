@@ -496,7 +496,9 @@ static long  g_applied_height = -1;
  * filed under. Set by apply_block_at before any walk begins. */
 static long  g_apply_height = -1;
 /* -assumevalid (2026-09-01): the height of the operator's assumed-valid block,
- * resolved from the archive index at init (-1 = none). While applying a block
+ * resolved from the HEADER chain (2026-09-07; the archive index before that,
+ * see utxo_live_resolve_assumevalid) at init and, while unresolved, every
+ * 1,000 blocks (-1 = none). While applying a block
  * at or below it, tx_verify's script EVALUATION is switched off -- everything
  * else (PoW, merkle, structure, every UTXO check) runs unchanged, exactly
  * Core's semantics. A submitblock dry run always evaluates scripts. */
@@ -519,15 +521,35 @@ static void utxo_live_resolve_assumevalid(void){
             want[31-q] = (unsigned char)((hi<<4)|lo);
         }
     }
-    FILE* f = fopen("index.dat", "rb"); if (!f) return;
-    unsigned char rec[48]; long h = 0;
-    while (fread(rec, 1, 48, f) == 48){ if (!memcmp(rec, want, 32)){ g_assumevalid_height = h; break; } h++; }
-    fclose(f);
+    /* Core's rule: a block is assumed valid when the assumed-valid block is
+     * its DESCENDANT on the header chain (and that chain's work clears
+     * -minimumchainwork -- which the header phase's low-work hold already
+     * guarantees for anything in headers.dat). Until 2026-09-07 this looked
+     * the block up in index.dat, i.e. among STORED blocks, and in a
+     * headers-first sync the assumed-valid block is one of the last stored:
+     * run 16 verified every signature at height 565,000, ~70% of the
+     * connect's CPU in ECDSA, for nothing. headers.dat carries the hash at
+     * +80 of each 112-byte record; index.dat stays as the fallback for a
+     * datadir that has blocks but no header mirror. */
+    const char* src = "the header chain";
+    FILE* f = fopen("headers.dat", "rb");
+    if (f){
+        unsigned char rec[112]; long h = 0;
+        while (fread(rec, 1, 112, f) == 112){ if (!memcmp(rec + 80, want, 32)){ g_assumevalid_height = h; break; } h++; }
+        fclose(f);
+    }
+    if (g_assumevalid_height < 0 && (f = fopen("index.dat", "rb"))){
+        src = "the archive index";
+        unsigned char rec[48]; long h = 0;
+        while (fread(rec, 1, 48, f) == 48){ if (!memcmp(rec, want, 32)){ g_assumevalid_height = h; break; } h++; }
+        fclose(f);
+    }
     if (g_assumevalid_height >= 0)
-        fprintf(stderr, "[utxo_live] assumevalid: block found at height %ld -- script evaluation skipped through it, resumed above\n", g_assumevalid_height);
+        fprintf(stderr, "[utxo_live] assumevalid: block found at height %ld on %s -- script evaluation skipped through it, resumed above\n", g_assumevalid_height, src);
     else
-        fprintf(stderr, "[utxo_live] assumevalid: block not in the archive -- every script is evaluated\n");
+        fprintf(stderr, "[utxo_live] assumevalid: block not on the header chain yet -- every script is evaluated; re-checked every 1,000 blocks\n");
 }
+long utxo_live_assumevalid_resolve_now(void){ utxo_live_resolve_assumevalid(); return g_assumevalid_height; }
 
 
 
@@ -2260,6 +2282,9 @@ static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
 static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height){
     g_apply_height = height;
     g_tm_flush_armed = 0;   /* a flush outside a block's walk (caught-up tail, a test's) is not this block's */
+    /* headers arrive after init on a fresh sync: while unresolved, look again
+     * every 1,000 blocks (one scan of headers.dat, ~100 MB at the tip) */
+    if (g_assumevalid_height < 0 && g_cfg.assumevalid_mode != 2 && height > 0 && height % 1000 == 0) utxo_live_resolve_assumevalid();
     { int on = (g_assumevalid_height < 0 || height > g_assumevalid_height);
       tx_verify_set_script_checks(on);
       if (on && g_assumevalid_height >= 0 && !g_av_announced_end){ g_av_announced_end = 1;

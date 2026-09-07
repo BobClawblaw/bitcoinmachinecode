@@ -55,6 +55,8 @@ extern int  pow_check(const u8 hdr[80]);
 extern int  tx_txid(u8 out[32], const u8* tx, unsigned long txlen, u8* buf, unsigned long buflen);
 
 extern int  utxo_live_init(const char* dir);
+extern long utxo_live_assumevalid_resolve_now(void);   /* 2026-09-07: re-runs the resolver, returns the height (-1 = none) */
+#include "../daemon/node_config.h"
 extern long utxo_live_catchup(void* store_buf);
 extern long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole);
 extern long utxo_live_last_stop_reason(void);
@@ -170,6 +172,31 @@ static volatile sig_atomic_t g_flag = 0;
 
 int main(void){
     tt_isolate();
+
+    /* ---------------- 0: assumevalid resolves against the HEADER chain ------
+     * Run 16 (2026-09-07) verified every signature at height 565,000, below
+     * mainnet's assumed-valid block at 938,343: the resolver looked for the
+     * block in index.dat, and in a headers-first sync that block is not
+     * STORED until the end. Core resolves it on the header chain. A profile
+     * of the connect process put ~70% of its CPU in ECDSA. */
+    {
+        tt_subdir("assumevalid");
+        u8 want[32]; for (int i = 0; i < 32; i++) want[i] = (u8)(0x40 + i);
+        FILE* fh = fopen("headers.dat", "wb");
+        for (int h = 0; h < 12; h++){ u8 rec[112]; memset(rec, (u8)h, 112); if (h == 7) memcpy(rec + 80, want, 32); fwrite(rec, 1, 112, fh); }
+        fclose(fh);                                                    /* headers through 11; NO index.dat at all */
+        int saved_mode = g_cfg.assumevalid_mode; u8 saved_hash[32]; memcpy(saved_hash, g_cfg.assumevalid, 32);
+        g_cfg.assumevalid_mode = 1; memcpy(g_cfg.assumevalid, want, 32);
+        ck("0 the assumed-valid block is found on the HEADER chain at 7, with no block stored", utxo_live_assumevalid_resolve_now(), 7);
+        FILE* fi = fopen("index.dat", "wb"); for (int h = 0; h < 3; h++){ u8 rec[48]; memset(rec, (u8)(0xa0 + h), 48); fwrite(rec, 1, 48, fi); } fclose(fi);
+        ck("0 ...and still at 7 when the archive holds only 3 blocks (headers-first)", utxo_live_assumevalid_resolve_now(), 7);
+        g_cfg.assumevalid_mode = 2;
+        ck("0 assumevalid=0: nothing is assumed (-1)", utxo_live_assumevalid_resolve_now(), -1);
+        g_cfg.assumevalid_mode = 1; want[0] ^= 1; memcpy(g_cfg.assumevalid, want, 32);
+        ck("0 a hash the header chain does not carry: -1, every script evaluated", utxo_live_assumevalid_resolve_now(), -1);
+        g_cfg.assumevalid_mode = saved_mode; memcpy(g_cfg.assumevalid, saved_hash, 32);
+        unlink("headers.dat"); unlink("index.dat");
+    }
 
     /* ---------------- A: holes at known heights ---------------- */
     {
