@@ -186,13 +186,13 @@ int main(int argc, char** argv){
     setbuf(stdout,NULL);
     signal(SIGPIPE,SIG_IGN);
     build_chain();
-    if(argc<2){ fprintf(stderr,"usage: %s <path-to-daemon/bitcoinmcd>\n",argv[0]); return 2; }
+    if(argc<2){ fprintf(stderr,"usage: %s <path-to-daemon/bmcbitcoind>\n",argv[0]); return 2; }
     tt_isolate();
     const char* daemon=tt_src(argv[1]);
     /* The daemon takes its datadir as an argument, so hand it this test's
      * private directory rather than a pid-named /tmp path that nothing
      * ever removed. tt_isolate() also chdir()s, so the daemon path from
-     * argv (a repo-relative ./daemon/bitcoinmcd) is rebased with tt_src(). */
+     * argv (a repo-relative ./daemon/bmcbitcoind) is rebased with tt_src(). */
     const char* ndir = tt_workdir();
 
     int portpipe[2], growpipe[2];

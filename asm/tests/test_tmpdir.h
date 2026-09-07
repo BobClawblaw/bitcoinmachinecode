@@ -25,7 +25,7 @@
  *       tt_isolate();                       // FIRST statement in main()
  *       ...
  *       FILE* f = fopen(tt_src("tests/fixtures/blk_600000.bin"), "rb");
- *       execv(tt_src("daemon/bitcoinmcd"), av);
+ *       execv(tt_src("daemon/bmcbitcoind"), av);
  *       spawn_child_with_datadir(tt_workdir());
  *   }
  *

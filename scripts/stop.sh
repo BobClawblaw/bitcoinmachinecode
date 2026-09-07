@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-UNIT="${BMC_UNIT:-bmc-bitcoind}"
+UNIT="${BMC_UNIT:-$(systemctl cat bmcbitcoind >/dev/null 2>&1 && echo bmcbitcoind || echo bmc-bitcoind)}"   # the reference box's unit until the operator renames it
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CLI="${BMC_BITCOIN_CLI:-$HERE/asm/daemon/bmc_cli}"
 

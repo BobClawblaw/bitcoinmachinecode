@@ -317,7 +317,7 @@ static void set_defaults(void){
      * rename): the file follows OUR daemon's name, so nothing this node
      * writes on disk carries Core's daemon name. The key keeps Core's
      * semantics: a relative path lands in the per-chain datadir. */
-    snprintf(g_cfg.pidfile, sizeof g_cfg.pidfile, "bitcoinmcd.pid");
+    snprintf(g_cfg.pidfile, sizeof g_cfg.pidfile, "bmcbitcoind.pid");
     g_cfg.blocknotify[0]        = 0;
     g_cfg.alertnotify[0]        = 0;
     g_cfg.startupnotify[0]      = 0;

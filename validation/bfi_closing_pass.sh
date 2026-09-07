@@ -79,13 +79,14 @@ fi
 
 # 4. stop the daemon (only safe when it is AT TIP, not mid-catch-up: a stop
 #    during bulk catch-up is the SIGKILL/checkpoint hazard)
-say "stopping bmc-bitcoind for the crossing"
-sudo systemctl stop bmc-bitcoind.service || { say "ABORT: stop failed"; exit 1; }
+UNIT="${BMC_UNIT:-$(systemctl cat bmcbitcoind >/dev/null 2>&1 && echo bmcbitcoind || echo bmc-bitcoind)}"   # the reference box's unit until the operator renames it
+say "stopping ${UNIT} for the crossing"
+sudo systemctl stop ${UNIT}.service || { say "ABORT: stop failed"; exit 1; }
 sleep 5
-if pgrep -f "$ASM/daemon/bitcoinmcd serve $DATA" >/dev/null; then
+if pgrep -f "$ASM/daemon/bmcbitcoind serve $DATA" >/dev/null; then
     say "ABORT: daemon still running after stop -- refusing to build"; exit 1
 fi
-if journalctl -u bmc-bitcoind.service --since "-3min" --no-pager 2>/dev/null | grep -qi "killing"; then
+if journalctl -u ${UNIT}.service --since "-3min" --no-pager 2>/dev/null | grep -qi "killing"; then
     say "WARNING: systemd had to SIGKILL the daemon; checkpoint may lag (ghost"
     say "         guard handles it on boot, but note it)"
 fi
@@ -97,8 +98,8 @@ say "closing pass done; index at $(idxn) records (height $(( $(idxn) - 1 )))"
 
 # 6. bring the daemon back; it adopts on the next connected block and closes
 #    any residual gap from undo data
-say "starting bmc-bitcoind"
-sudo systemctl start bmc-bitcoind.service || { say "ABORT: start failed -- NODE IS DOWN"; exit 1; }
+say "starting ${UNIT}"
+sudo systemctl start ${UNIT}.service || { say "ABORT: start failed -- NODE IS DOWN"; exit 1; }
 
 # 7. confirm adoption (a block may take ~10min to arrive; wait up to 45)
 for i in $(seq 90); do

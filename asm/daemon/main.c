@@ -7580,7 +7580,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
      * The daemon has already chdir'd into the (per-chain) datadir, so the
      * bare relative name lands in the right place on every chain. */
     /* -pid: Core writes bitcoind.pid so an init script can find the process;
-     * ours defaults to bitcoinmcd.pid (the discussed divergence, node_config.c).
+     * ours defaults to bmcbitcoind.pid (the discussed divergence, node_config.c).
      * Written after the RPC port is bound, i.e. once the node is actually
      * up, so the file's existence means something. */
     if (g_cfg.pidfile[0]){
@@ -8211,7 +8211,7 @@ static int datadir_lock_acquire(const char* effdir){
     if(flock(datadir_lock_fd, LOCK_EX|LOCK_NB) != 0){
         if(errno == EWOULDBLOCK)
             fprintf(stderr,"[boot] FATAL: cannot obtain a lock on data directory %s. "
-                           "bitcoinmcd is probably already running.\n", effdir);
+                           "bmcbitcoind is probably already running.\n", effdir);
         else
             fprintf(stderr,"[boot] FATAL: cannot lock %s/.lock: %s\n", effdir, strerror(errno));
         close(datadir_lock_fd); datadir_lock_fd = -1;
@@ -8241,7 +8241,7 @@ int main(int argc, char** argv){
         snprintf(_b, sizeof _b,
             "\n"
             "======================================================================\n"
-            "===== bitcoinmcd  LOG START: %s\n"
+            "===== bmcbitcoind  LOG START: %s\n"
             "=====   pid %d  v%d.%d.%d  built %s %s  mode=%s\n"
             "======================================================================\n",
             _ts, (int)getpid(), NODE_VERSION_MAJOR, NODE_VERSION_MINOR, NODE_VERSION_PATCH,
@@ -8256,7 +8256,7 @@ int main(int argc, char** argv){
      * that already runs this binary changes.
      *
      * Flags are stripped out first; what remains keeps the old positional
-     * meaning, so `bitcoinmcd -datadir=/x serve` and `bitcoinmcd serve /x` are
+     * meaning, so `bmcbitcoind -datadir=/x serve` and `bmcbitcoind serve /x` are
      * the same invocation. */
     const char* flag_datadir = NULL; const char* flag_conf = NULL;
     { static char* pos[16]; int np = 0;
@@ -8278,7 +8278,7 @@ int main(int argc, char** argv){
         return 2; }
     const char* mode = argv[1];
     /* ---- DMN-10 (audit 2026-09-03): validate the MODE before doing work ----
-     * `bitcoinmcd -datadir=/x serve` is documented as equivalent to the
+     * `bmcbitcoind -datadir=/x serve` is documented as equivalent to the
      * positional form, and it is not: stripping the flag leaves argc == 2, the
      * usage check below passes on flag_datadir, and the serve branch far below
      * is gated on argc >= 3 -- so the process resolved the datadir, chdir'd,

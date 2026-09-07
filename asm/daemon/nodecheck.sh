@@ -25,7 +25,7 @@ echo "=== 3) serve round-trip on up to 3 stored blocks (bytes must be identical)
 if [ ! -x "$ASM/tests/serve_test" ]; then
   (cd "$ASM" && gcc -no-pie -O0 -o tests/serve_test tests/serve_test.c sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o bitcoind.o bitcoin_headers.o node_log.o) 2>/dev/null
 fi
-"$ASM/daemon/bitcoinmcd" serve "$D" "$PORT" > /tmp/nodecheck_serve.log 2>&1 &
+"$ASM/daemon/bmcbitcoind" serve "$D" "$PORT" > /tmp/nodecheck_serve.log 2>&1 &
 SPID=$!
 sleep 3
 # pick up to 3 well-separated stored heights

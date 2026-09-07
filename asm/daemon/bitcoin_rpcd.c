@@ -56,11 +56,11 @@ static struct lsm_state g_utxo_lst;
 
 static void* mmap_file(const char* path, u64 size){
     int fd = open(path, O_RDWR | O_CREAT, 0644);
-    if (fd < 0) { fprintf(stderr, "bitcoin_rpcd: open(%s): %s\n", path, strerror(errno)); return 0; }
-    if (ftruncate(fd, (off_t)size) != 0) { fprintf(stderr, "bitcoin_rpcd: ftruncate(%s): %s\n", path, strerror(errno)); close(fd); return 0; }
+    if (fd < 0) { fprintf(stderr, "bmc_rpcd: open(%s): %s\n", path, strerror(errno)); return 0; }
+    if (ftruncate(fd, (off_t)size) != 0) { fprintf(stderr, "bmc_rpcd: ftruncate(%s): %s\n", path, strerror(errno)); close(fd); return 0; }
     void* p = mmap(0, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
-    if (p == MAP_FAILED) { fprintf(stderr, "bitcoin_rpcd: mmap(%s): %s\n", path, strerror(errno)); return 0; }
+    if (p == MAP_FAILED) { fprintf(stderr, "bmc_rpcd: mmap(%s): %s\n", path, strerror(errno)); return 0; }
     return p;
 }
 
@@ -73,7 +73,7 @@ static void* mmap_file(const char* path, u64 size){
  * slots. Matching the production sizing costs more memory/startup time but
  * is correct regardless of how large the tail turns out to be. */
 static int init_utxo_store(const char* datadir) {
-    if (chdir(datadir)) { fprintf(stderr, "bitcoin_rpcd: chdir(%s): %s\n", datadir, strerror(errno)); return 0; }
+    if (chdir(datadir)) { fprintf(stderr, "bmc_rpcd: chdir(%s): %s\n", datadir, strerror(errno)); return 0; }
     int slots_log2 = 22;
     unsigned long slots = 1UL << slots_log2;
     u64 blob_cap = 2UL*1024*1024*1024;
@@ -93,7 +93,7 @@ static int init_utxo_store(const char* datadir) {
     void* tomb_buf = malloc(tomb_cap*36);
     void* manifest_buf = malloc(manifest_cap*16);
     void* scratch_buf = malloc(scratch_cap);
-    if (!tomb_buf || !manifest_buf || !scratch_buf) { fprintf(stderr, "bitcoin_rpcd: malloc failed\n"); return 0; }
+    if (!tomb_buf || !manifest_buf || !scratch_buf) { fprintf(stderr, "bmc_rpcd: malloc failed\n"); return 0; }
 
     memset(&g_utxo_lst, 0, sizeof g_utxo_lst);
     g_utxo_lst.op_threshold = op_threshold;
@@ -103,8 +103,8 @@ static int init_utxo_store(const char* datadir) {
     g_utxo_lst.scratch_buf = scratch_buf; g_utxo_lst.scratch_cap = scratch_cap;
 
     long replayed = utxo_lsm_reload(&g_utxo_lst, u);
-    if (replayed < 0) { fprintf(stderr, "bitcoin_rpcd: utxo_lsm_reload failed\n"); return 0; }
-    fprintf(stderr, "bitcoin_rpcd: UTXO store loaded (manifest_n=%llu, %ld WAL-tail ops replayed)\n",
+    if (replayed < 0) { fprintf(stderr, "bmc_rpcd: utxo_lsm_reload failed\n"); return 0; }
+    fprintf(stderr, "bmc_rpcd: UTXO store loaded (manifest_n=%llu, %ld WAL-tail ops replayed)\n",
             g_utxo_lst.manifest_n, replayed);
     rpc_commands_set_utxo_store(&g_utxo_lst, u);
     return 1;
@@ -120,17 +120,17 @@ static int init_utxo_store(const char* datadir) {
 static int init_addr_index(void) {
     int fd = open("addr_index.dat", O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "bitcoin_rpcd: no addr_index.dat (listunspent/getbalance will report empty) -- %s\n", strerror(errno));
+        fprintf(stderr, "bmc_rpcd: no addr_index.dat (listunspent/getbalance will report empty) -- %s\n", strerror(errno));
         return 1;
     }
     struct stat st;
-    if (fstat(fd, &st) != 0) { fprintf(stderr, "bitcoin_rpcd: fstat(addr_index.dat): %s\n", strerror(errno)); close(fd); return 0; }
+    if (fstat(fd, &st) != 0) { fprintf(stderr, "bmc_rpcd: fstat(addr_index.dat): %s\n", strerror(errno)); close(fd); return 0; }
     u64 size = (u64)st.st_size;
     void* base = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
-    if (base == MAP_FAILED) { fprintf(stderr, "bitcoin_rpcd: mmap(addr_index.dat): %s\n", strerror(errno)); return 0; }
+    if (base == MAP_FAILED) { fprintf(stderr, "bmc_rpcd: mmap(addr_index.dat): %s\n", strerror(errno)); return 0; }
     rpc_commands_set_addr_index(base, size);
-    fprintf(stderr, "bitcoin_rpcd: address index loaded (%llu bytes)\n", size);
+    fprintf(stderr, "bmc_rpcd: address index loaded (%llu bytes)\n", size);
     return 1;
 }
 
@@ -229,11 +229,11 @@ int main(int argc, char** argv) {
 
     if (datadir) {
         if (!init_utxo_store(datadir)) {
-            fprintf(stderr, "bitcoin_rpcd: UTXO store init failed for -datadir=%s\n", datadir);
+            fprintf(stderr, "bmc_rpcd: UTXO store init failed for -datadir=%s\n", datadir);
             return 1;
         }
         if (!init_addr_index()) {
-            fprintf(stderr, "bitcoin_rpcd: address index init failed\n");
+            fprintf(stderr, "bmc_rpcd: address index init failed\n");
             return 1;
         }
         /* Blockchain-query RPCs (getblock*, getblockchaininfo, getrawtransaction
@@ -241,9 +241,9 @@ int main(int argc, char** argv) {
          * without index.dat those methods answer -28 "Loading block index...". */
         rpc_chain_set_prune_mib(g_prune_mib);
         if (rpc_chain_open(NULL))
-            fprintf(stderr, "bitcoin_rpcd: block archive opened (blockchain-query RPCs live)\n");
+            fprintf(stderr, "bmc_rpcd: block archive opened (blockchain-query RPCs live)\n");
         else
-            fprintf(stderr, "bitcoin_rpcd: no block archive in datadir (blockchain-query RPCs will report -28)\n");
+            fprintf(stderr, "bmc_rpcd: no block archive in datadir (blockchain-query RPCs will report -28)\n");
     }
 
     /* ZERO-INITIALISED. The struct grows fields (bind_addr, allows), and a
@@ -265,17 +265,17 @@ int main(int argc, char** argv) {
           char buf[1024]; snprintf(buf, sizeof buf, "%s", e);
           char* save = NULL;
           for (char* t = strtok_r(buf, ";", &save); t; t = strtok_r(NULL, ";", &save))
-              if (!rpc_whitelist_add(t)) fprintf(stderr, "bitcoin_rpcd: bad TEST_RPC_WHITELIST entry %s\n", t);
+              if (!rpc_whitelist_add(t)) fprintf(stderr, "bmc_rpcd: bad TEST_RPC_WHITELIST entry %s\n", t);
       }
       if ((e = getenv("TEST_RPC_WHITELIST_DEFAULT")) && *e) rpc_whitelist_set_default(atoi(e)); }
 
     int actual = 0;
     char errmsg[256];
     if (rpc_server_start(&cfg, &actual, errmsg, sizeof errmsg) != 0) {
-        fprintf(stderr, "bitcoin_rpcd: %s\n", errmsg);
+        fprintf(stderr, "bmc_rpcd: %s\n", errmsg);
         return 1;
     }
-    fprintf(stderr, "bitcoin_rpcd: JSON-RPC server listening on 127.0.0.1:%d (user=%s)\n", actual, user);
+    fprintf(stderr, "bmc_rpcd: JSON-RPC server listening on 127.0.0.1:%d (user=%s)\n", actual, user);
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);

@@ -17,8 +17,8 @@
 #
 # Exit 0 = the guard holds. Any other exit is a failure with a reason.
 set -u
-BIN="${BIN:-$(cd "$(dirname "$0")/.." && pwd)/asm/daemon/bitcoinmcd}"
-[ -x "$BIN" ] || { echo "FAIL: no daemon at $BIN (make daemon/bitcoinmcd)"; exit 1; }
+BIN="${BIN:-$(cd "$(dirname "$0")/.." && pwd)/asm/daemon/bmcbitcoind}"
+[ -x "$BIN" ] || { echo "FAIL: no daemon at $BIN (make daemon/bmcbitcoind)"; exit 1; }
 
 D=$(mktemp -d /tmp/dmn1lockXXXXXX) || exit 1
 cleanup(){ [ -n "${A_PID:-}" ] && kill "$A_PID" 2>/dev/null; sleep 1;

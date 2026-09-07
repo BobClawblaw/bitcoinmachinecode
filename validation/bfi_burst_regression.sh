@@ -18,7 +18,7 @@
 set -u
 CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
 WT=${WT:-${TMPDIR:-/tmp}/bmc-wt-adoptgate}
-BMC_BIN=${BMC_BIN:-$WT/asm/daemon/bitcoinmcd}
+BMC_BIN=${BMC_BIN:-$WT/asm/daemon/bmcbitcoind}
 BUILDER=${BUILDER:-$WT/asm/daemon/build_block_filters}
 TXIBUILD=${TXIBUILD:-$WT/asm/daemon/build_tx_index}
 WALLET_CLI=${WALLET_CLI:-$WT/asm/daemon/wallet_cli}

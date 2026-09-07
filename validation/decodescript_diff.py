@@ -3,7 +3,7 @@
 
 decodescript is a PURE function of its input hex -- no chain, UTXO or mempool
 state -- so this harness is a direct output comparison, not a sabotage probe:
-it feeds the same script hex to our `bitcoin_rpcd` and to a scratch Bitcoin
+it feeds the same script hex to our `bmc_rpcd` and to a scratch Bitcoin
 Core, and compares the parsed JSON.
 
 WHAT IT DRIVES
