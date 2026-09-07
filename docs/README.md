@@ -73,6 +73,12 @@ also annotated tags.
 | [`releases/2026-09-06-archive-genesis-seed.md`](releases/2026-09-06-archive-genesis-seed.md) | a fresh mainnet archive was shifted by one block for life; the false `bad-txns-BIP30` it caused, and why no test saw it |
 | [`releases/2026-09-06-lowwork-hold-bound.md`](releases/2026-09-06-lowwork-hold-bound.md) | CC-5's four-page hold abandoned every honest header sync below ~880k; found on the replay, bounded by memory instead |
 | [`releases/2026-09-06-utxo-interleave.md`](releases/2026-09-06-utxo-interleave.md) | the UTXO connect runs inside the parallel download instead of after it; the boot catch-up cannot interleave (`bmc.bootcatchup=0` for a fresh-clone benchmark) |
+| [`releases/2026-09-07-chunk-stall-budget.md`](releases/2026-09-07-chunk-stall-budget.md) | the chunk budget is a stall clock, not a hidden ~470 KB/s bar |
+| [`releases/2026-09-07-rename-bitcoinmcd.md`](releases/2026-09-07-rename-bitcoinmcd.md) | the daemon renamed (first pass) and the pid file follows it |
+| [`releases/2026-09-07-bmc-prefix.md`](releases/2026-09-07-bmc-prefix.md) | everything we ship starts with `bmc`: `bmcbitcoind`, `bmc_rpcd`, the unit, the pid file |
+| [`releases/2026-09-07-boundary-rotation-eta.md`](releases/2026-09-07-boundary-rotation-eta.md) | a slow peer rotated at the chunk boundary; the picker bar; ETA in DD:HH:MM:SS |
+| [`releases/2026-09-07-keep-headers-ahead.md`](releases/2026-09-07-keep-headers-ahead.md) | headers ahead of the archive are kept across a restart |
+| [`releases/2026-09-07-monotonic-download.md`](releases/2026-09-07-monotonic-download.md) | the download is monotonic like Core's: window, retry ring, the run-10 cascade; the 4096 window and 2 s help |
 
 ## Development history
 
