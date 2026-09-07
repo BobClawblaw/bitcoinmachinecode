@@ -759,6 +759,18 @@ STILL OPEN after the series:
       (b) 1 of them -- test_par_threads: upstream's `7781987c` added the Makefile RULE
       without committing `asm/tests/test_par_threads.c` and left it out of the `test:`
       run list, so x86's own gate never builds it either. Upstream's to fix.
+- [x] **origin/main merged through `3b9e8005`** (10 commits, merge `d73278be`) and the
+      rename ported: the product is `bitcoinmcd` now (x86 `8ff54a63`), so
+      build_daemon.sh emits `daemon_out/bitcoinmcd` and parity_sweep.sh symlinks and
+      remaps BOTH names (new preferred, old as fallback so nothing silently skips).
+      `bitcoind.S` STAYS -- it is the core-module twin, exactly as x86 kept
+      `bitcoind.asm/.o`. Sweep round 33: pass 370 / fail 4 env-only, identical to
+      round 32, with the name-sensitive rows green (test_elf_hardening now defaults to
+      `daemon/bitcoinmcd`). NOT deployed yet: `bmc-arm.service` still names
+      `daemon_out/bitcoind` (the arm-12 binary), so a restart right now comes back on
+      the pre-merge build -- see the 2026-09-07 DEPLOYMENT_HISTORY entry for the two
+      steps a rename deploy needs. Also merged: the chunk budget is a stall clock, not
+      a hidden ~470 KB/s absolute bar (rule 11's second instance).
 - [ ] bitcoind.S: the CC-2 hook table exists as data symbols but the mux does not
       CALL them -- no sendcmpct announcement after verack, no hook-selected
       getdata type. The x86 daemon has both.

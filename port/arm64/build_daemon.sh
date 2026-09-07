@@ -1,7 +1,12 @@
 #!/bin/bash
-# Native AArch64 build of the x86 serve daemon (daemon/bitcoind).
-# Mirrors asm/Makefile's daemon/bitcoind rule exactly, but compiles the
+# Native AArch64 build of the x86 serve daemon (daemon/bitcoinmcd).
+# Mirrors asm/Makefile's daemon/bitcoinmcd rule exactly, but compiles the
 # ported .S objects natively and the arch-neutral daemon C with gcc.
+# RENAMED 2026-09-07 (x86 8ff54a63 "the daemon is bitcoinmcd, not bitcoind"):
+# the output moved daemon_out/bitcoind -> daemon_out/bitcoinmcd. What did NOT
+# move is port/arm64/bitcoind.S -- that is the CORE MODULE twin (x86 kept
+# bitcoind.asm/.o for the same reason), not the product. The live systemd unit
+# bmc-arm.service names the deployed path, so a deploy has to move it too.
 set -u
 cd "$(dirname "$0")"            # port/arm64
 mkdir -p daemon_out
@@ -36,7 +41,7 @@ NEWSRCS="../../asm/daemon/addrbook.c ../../asm/daemon/asmap.c ../../asm/daemon/d
 # is made read-only and bound at load; the port's link must carry it too or
 # tests/test_elf_hardening rightly fails the binary.
 gcc -no-pie -O2 -Wl,-z,relro,-z,now -lpthread -I../../asm -I../../asm/daemon -I../.. \
-    -o daemon_out/bitcoind $DAEMONSRCS $RPCSRCS $NEWSRCS ../../asm/wallet_core.c \
+    -o daemon_out/bitcoinmcd $DAEMONSRCS $RPCSRCS $NEWSRCS ../../asm/wallet_core.c \
     $(for m in $OBJBUNDLE; do echo "${m}.o"; done) 2>> "$LOG"
 RC=$?
 echo "=== LINK RC=$RC ===" >> "$LOG"

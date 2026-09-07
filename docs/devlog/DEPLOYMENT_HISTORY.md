@@ -1205,3 +1205,36 @@ that would have hit any fresh sync of the live build.
   rule in `7781987c` but `asm/tests/test_par_threads.c` was never committed, and the
   target is not in the `test:` run list -- which is why x86's own gate never noticed.
   On ARM it shows as an 8th build-fail row.
+
+## 2026-09-07 (later): the product is `bitcoinmcd` now — merged, ported, **not yet deployed**
+
+Upstream renamed the node binary (`8ff54a63`): `asm/daemon/bitcoind` is
+`asm/daemon/bitcoinmcd`, and the pid-file default followed it (`2983444f`,
+`bitcoinmcd.pid`). What was deliberately NOT renamed: `bitcoind.asm/.o` — that is
+the core module, not the product — so the ARM twin keeps `port/arm64/bitcoind.S`
+too. Only `port/arm64/build_daemon.sh` moved (output
+`daemon_out/bitcoind` -> `daemon_out/bitcoinmcd`) and `parity_sweep.sh`, which now
+symlinks BOTH names into `asm/daemon/` and remaps both arg forms, preferring the
+new one and falling back to the old so no test silently skips a missing daemon.
+
+- `daemon_out/bitcoinmcd` md5 `a31703ad` — built from merge `d73278be` (10 commits:
+  the rename, the pid default, and the chunk budget becoming a **stall clock**: the
+  old 120 s wall-clock-per-chunk was an absolute ~467 KB/s bar in disguise that had
+  dropped 429 peers who were faster than the pool-relative floor and discarded
+  ~10.7 GB of half-received chunks in 7 hours).
+- Sweep round 33 on the merged tree: pass 370 / fail 4 (env-only) / bench-ok 15 /
+  compared 389 of 432 — identical to round 32, so the rename cost nothing. The rows
+  that touch the binary by name are the check: `test_elf_hardening` (which now
+  defaults to `daemon/bitcoinmcd`), `test_bitcoind`, `test_bitcoind_sync`,
+  `test_bip30_daemon`, `test_cli_prompt` all pass natively.
+- **THE LIVE UNIT STILL NAMES THE OLD PATH.** `bmc-arm.service` runs
+  `daemon_out/bitcoind`, which is still present and is the arm-12 binary
+  (`cfe86ed4`). So the node is unaffected — but a crash-restart right now silently
+  comes back on the PRE-merge build. That is the state to resolve on the next
+  deploy, which is two steps rather than one: point `ExecStart` at
+  `daemon_out/bitcoinmcd` (+ `systemctl daemon-reload`), and move the old
+  `daemon_out/bitcoind` into `rollback/` afterwards so no stale path is left
+  runnable behind the unit.
+- The pid-file change is inert on this deployment: no pid file exists (repo root or
+  datadir), no boot line claims one, and systemd is what tracks the PID here.
+

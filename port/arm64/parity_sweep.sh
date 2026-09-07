@@ -48,9 +48,11 @@
 #       $(wildcard ...) of exactly that path), test_txv_parse_diff,
 #       test_txvb_parse_diff, test_strip_witness_diff, test_bip143_diff
 #       (env-only: those tests are arch-neutral C).
-#   ./daemon/bitcoind runner arg (test_outbound_mux, test_redial)
-#       remapped to the ARM daemon_out/bitcoind; needs loopback ports, may
-#       be env-sensitive -- triaged from the TSV, not pre-skipped.
+#   ./daemon/bitcoinmcd runner arg (test_outbound_mux, test_redial)
+#       remapped to the ARM daemon_out/bitcoinmcd (the product was renamed from
+#       bitcoind by x86 8ff54a63; the old ./daemon/bitcoind form still resolves,
+#       see ensure_asm_layout); needs loopback ports, may be env-sensitive --
+#       triaged from the TSV, not pre-skipped.
 #   tests/ecdsa_verify_ref.o
 #       NOT a skip: ported 1:1 in port/arm64/ecdsa_verify_ref.S (frozen
 #       pre-4.2 verifier). tests/undo_log_ref.o is arch-neutral C + objcopy
@@ -481,7 +483,13 @@ is_elf() { [ "$(head -c4 "$1" 2>/dev/null | tail -c1)" = "$(printf '\177')" ]; }
 ensure_asm_layout() {
     local AB="$REPO/port/arm64"
     # daemon build products the tests exec via tt_src("daemon/<name>")
-    ln -sf "$AB/daemon_out/bitcoind" "$REPO/asm/daemon/bitcoind"
+    # RENAMED 2026-09-07 (x86 8ff54a63): the product is bitcoinmcd now. Link the
+    # new name, and keep the old symlink resolving to the same binary so any
+    # straggler arg form still finds a daemon instead of silently skipping.
+    local ARMDAEMON="$AB/daemon_out/bitcoinmcd"
+    [ -x "$ARMDAEMON" ] || ARMDAEMON="$AB/daemon_out/bitcoind"
+    ln -sf "$ARMDAEMON" "$REPO/asm/daemon/bitcoinmcd"
+    ln -sf "$ARMDAEMON" "$REPO/asm/daemon/bitcoind"
     [ -x "$AB/$OUT/wallet_cli" ] && ln -sf "$AB/$OUT/wallet_cli" "$REPO/asm/daemon/wallet_cli"
     [ -x "$AB/$OUT/bitcoin_rpcd" ] && ln -sf "$AB/$OUT/bitcoin_rpcd" "$REPO/asm/daemon/bitcoin_rpcd"
     [ -x "$AB/$OUT/bmc_cli" ] && ln -sf "$AB/$OUT/bmc_cli" "$REPO/asm/daemon/bmc_cli"
@@ -510,10 +518,13 @@ run_inv() {  # name kind args index
     for f in "$AB/$OUT"/test_* "$AB/$OUT"/bench_* "$AB/$OUT"/*_shim "$AB/$OUT"/smoke_* "$AB/$OUT"/run_batch "$AB/$OUT"/fakepeer_*; do
         link_helper "$f"
     done
-    # ./daemon/bitcoind arg remap -> the ARM daemon (cwd is asm/ now, where
-    # ./daemon/bitcoind already resolves via the symlink above; keep the
-    # remap for older arg forms)
-    local args2="${args//.\/daemon\/bitcoind/$REPO/port/arm64/daemon_out/bitcoind}"
+    # ./daemon/<daemon> arg remap -> the ARM daemon (cwd is asm/ now, where
+    # ./daemon/bitcoinmcd already resolves via the symlink above; keep the
+    # remap for older arg forms, and both names since the rename)
+    local ARMDAEMON="$REPO/port/arm64/daemon_out/bitcoinmcd"
+    [ -x "$ARMDAEMON" ] || ARMDAEMON="$REPO/port/arm64/daemon_out/bitcoind"
+    local args2="${args//.\/daemon\/bitcoinmcd/$ARMDAEMON}"
+    args2="${args2//.\/daemon\/bitcoind/$ARMDAEMON}"
     ( cd "$REPO/asm" && timeout "$TMO" "$bin" $args2 > "$REPO/port/arm64/$OUT/$label.out.txt" 2>&1 )
     local rc=$?
     local outf="$REPO/port/arm64/$OUT/$label.out.txt"
