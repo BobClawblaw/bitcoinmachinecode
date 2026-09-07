@@ -7579,7 +7579,8 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     /* -rpccookiefile, else <datadir>/.cookie -- Core's default auth method.
      * The daemon has already chdir'd into the (per-chain) datadir, so the
      * bare relative name lands in the right place on every chain. */
-    /* -pid: Core writes bitcoind.pid so an init script can find the process.
+    /* -pid: Core writes bitcoind.pid so an init script can find the process;
+     * ours defaults to bitcoinmcd.pid (the discussed divergence, node_config.c).
      * Written after the RPC port is bound, i.e. once the node is actually
      * up, so the file's existence means something. */
     if (g_cfg.pidfile[0]){
