@@ -3633,7 +3633,21 @@ static double dlc_effective_floor(double median_bps){
  * (one helper at a time, claimed through DLC_CTL_HELPING). */
 #define DLC_WINDOW_HELP_SECS 2
 #define DLC_RETRY_MAX 4096L
-enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CTL_FIRST_HOLE = 3, DLC_CTL_HELPING = 4, DLC_CTL_RING = 5 };
+enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CTL_FIRST_HOLE = 3, DLC_CTL_HELPING = 4,
+       DLC_CTL_WANT_ANCHOR = 5,           /* a worker blocked at the window asks the PARENT for a fresh first hole */
+       DLC_CTL_RING = 6 };
+/* The anchor is scanned by the parent only. The first cut had a blocked
+ * worker rescan index.dat itself, and those reads landed in the worker's
+ * /proc io rchar -- the counter the parent's per-worker rate, the pool
+ * median, the dead-weight floor and the rotation bar are all built from.
+ * Run 12 printed an "average since start" of 263 MB/s on an 11 MB/s link
+ * and rotated on nearly every chunk. Workers now only raise a flag. */
+static void dlc_publish_anchor(volatile long* ctl, long start_h){
+    long tip = dlc_index_tip(); long fh = tip>=0 ? dlc_first_hole(tip) : -1;
+    if(fh<0) fh = tip>=0 ? tip+1 : start_h;
+    if(fh > ctl[DLC_CTL_FIRST_HOLE]) ctl[DLC_CTL_FIRST_HOLE] = fh;      /* monotonic: a stale reader never moves it back */
+    ctl[DLC_CTL_WANT_ANCHOR] = 0;
+}
 #define DLC_CTL_BYTES ((size_t)(DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long))
 static int dlc_window_allows(long lo, long first_hole){ return lo - first_hole <= DLC_DOWNLOAD_WINDOW; }
 /* single-producer-per-push, multi-consumer ring: push reserves a slot with a
@@ -4217,8 +4231,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                  * on a stale anchor, refresh it ourselves (two asm scans of
                  * index.dat) and share the fresher value; wait only when the
                  * frontier really is where the anchor says. */
-                { long tip=dlc_index_tip(); long fresh = tip>=0 ? dlc_first_hole(tip) : -1; if(fresh<0 && tip>=0) fresh=tip+1;
-                  if(fresh>fh){ next_claim[DLC_CTL_FIRST_HOLE]=fresh; fh=fresh; if(dlc_window_allows(peek, fh)) break; } }
+                next_claim[DLC_CTL_WANT_ANCHOR]=1;   /* the parent rescans within 200 ms; our own reads must not touch our io counters */
                 lo=dlc_retry_pop(next_claim); if(lo>=0) break;
                 if(waited_ticks>=DLC_WINDOW_HELP_SECS*5){
                     long blk=fh-((fh-0)%DLC_CHUNK_BLOCKS); if(blk<0) blk=0;   /* the chunk holding the first hole */
@@ -4885,7 +4898,7 @@ static long dl_catchup(const char* dir, int min_workers){
      * explicitly. */
     for(int i=0;i<nw;i++) stats[i].held_idx = -1;
     *next_claim=start_h; *done_count=0;
-    next_claim[DLC_CTL_RETRY_HEAD]=0; next_claim[DLC_CTL_RETRY_TAIL]=0; next_claim[DLC_CTL_FIRST_HOLE]=start_h; next_claim[DLC_CTL_HELPING]=-1;   /* window starts at the span start; nobody helping */
+    next_claim[DLC_CTL_RETRY_HEAD]=0; next_claim[DLC_CTL_RETRY_TAIL]=0; next_claim[DLC_CTL_FIRST_HOLE]=start_h; next_claim[DLC_CTL_HELPING]=-1; next_claim[DLC_CTL_WANT_ANCHOR]=0;   /* window starts at the span start; nobody helping */
     for(long i=0;i<DLC_RETRY_MAX;i++) next_claim[DLC_CTL_RING+i]=-1;   /* -1 = empty slot (0 is a real chunk) */
     /* MAP_ANONYMOUS pages come zeroed, so every stats[w].peer/chunks/blocks/
      * guard and every claimed[i] starts at "" / 0 / 0 / 0 / 0 -- no explicit
@@ -4955,6 +4968,7 @@ static long dl_catchup(const char* dir, int min_workers){
     int alive=nw;
     while(alive>0){
         long done = 0;
+        if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);   /* before a connect call that may run for seconds */
         if(interleave && dlc_now_ms() >= connect_retry_ms){
             /* (store_reload is the bounded call's first act, so it sees the
              * helpers' appends; a second one here would be redundant.) */
@@ -4973,7 +4987,13 @@ static long dl_catchup(const char* dir, int min_workers){
         }
         if(done <= 0){
             long ms = interleave ? g_dlc_idle_ms : 10000L;   /* the pre-step-1 loop: sleep 10 s, print */
-            struct timespec ts={ms/1000,(ms%1000)*1000000L}; nanosleep(&ts,NULL);
+            /* sleep in 200 ms steps so a worker blocked at the window gets a
+             * fresh anchor without waiting for the 10 s tick */
+            for(long slept=0; slept<ms; slept+=200){
+                if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);
+                long step = ms-slept < 200 ? ms-slept : 200;
+                struct timespec ts={step/1000,(step%1000)*1000000L}; nanosleep(&ts,NULL);
+            }
         }
         if(g_shutdown_requested){
             /* incident 2026-09-01: this loop ignored SIGTERM and the stop hung
