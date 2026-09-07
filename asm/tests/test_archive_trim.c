@@ -69,6 +69,39 @@ int main(void){
         memcpy(rec, x5, 32); unsigned int fno = 0, size = 80; memcpy(rec + 32, &fno, 4); memcpy(rec + 36, &p5, 8); memcpy(rec + 44, &size, 4); fwrite(rec, 1, 48, fi); }
       fclose(fi);
       ck("a linked block above chainwork (crash before apply) is kept", archive_trim_derived_tails() == 0 && fsize("index.dat") == 6*48); }
+    printf("== headers-first: headers.dat AHEAD of the archive is the normal sync state, and is kept while it links ==\n");
+    { /* 2026-09-07: a restart in the middle of a sync used to cut headers.dat
+       * back to the archive tip and refetch every header (71 MB of them on
+       * mainnet, the whole held region below -minimumchainwork again). The
+       * "must not outrun the archive" rule was written for index.dat's empty
+       * tail (2026-09-01); headers ahead of blocks is what headers-first
+       * means. Records past the tip are kept as long as each one hashes to
+       * its own record and links to the one below; the tail is cut at the
+       * first break, so a torn write still cannot leave junk in the mirror. */
+      extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
+      unsigned char hdr[7][80], hh[7][32]; unsigned char prev[32]; memset(prev, 0, 32);
+      for (int i = 0; i < 7; i++){ memset(hdr[i], 0, 80); hdr[i][0] = 1; memcpy(hdr[i] + 4, prev, 32); hdr[i][36] = (unsigned char)(0xa0 + i); block_hash(hh[i], hdr[i]); memcpy(prev, hh[i], 32); }
+      FILE* fi = fopen("index.dat", "wb"); FILE* fh = fopen("headers.dat", "wb"); FILE* fc = fopen("chainwork.dat", "wb");
+      for (int i = 0; i < 3; i++){ unsigned char rec[48]; memset(rec, 0, 48); memcpy(rec, hh[i], 32); unsigned int fno = 0, size = 80; unsigned long long pos = (unsigned long long)i * 88; memcpy(rec + 32, &fno, 4); memcpy(rec + 36, &pos, 8); memcpy(rec + 44, &size, 4); fwrite(rec, 1, 48, fi);
+                                   unsigned char cwr[16]; memset(cwr, 0, 16); cwr[0] = (unsigned char)i; fwrite(cwr, 1, 16, fc); }
+      for (int i = 0; i < 5; i++){ unsigned char hr[112]; memcpy(hr, hdr[i], 80); memcpy(hr + 80, hh[i], 32); fwrite(hr, 1, 112, fh); }
+      fclose(fi); fclose(fh); fclose(fc);
+      ck("3 blocks stored, 5 linked headers: nothing trimmed", archive_trim_derived_tails() == 0);
+      ck("headers.dat keeps its 5 records (2 ahead of the archive)", fsize("headers.dat") == 5*112);
+      /* now a torn tail: records 5 and 6 where 5 does not link to 4 */
+      fh = fopen("headers.dat", "ab");
+      { unsigned char bad[80]; memcpy(bad, hdr[5], 80); memset(bad + 4, 0xee, 32); unsigned char bh[32]; block_hash(bh, bad);
+        unsigned char hr[112]; memcpy(hr, bad, 80); memcpy(hr + 80, bh, 32); fwrite(hr, 1, 112, fh);
+        memcpy(hr, hdr[6], 80); memcpy(hr + 80, hh[6], 32); fwrite(hr, 1, 112, fh); }
+      fclose(fh);
+      ck("a header past the tip that does not link to the one below: cut there (1 file trimmed)", archive_trim_derived_tails() == 1);
+      ck("headers.dat back to the 5 linked records, not to the archive tip", fsize("headers.dat") == 5*112);
+      /* a record whose stored hash is not its header's hash is junk too */
+      fh = fopen("headers.dat", "ab");
+      { unsigned char hr[112]; memcpy(hr, hdr[5], 80); memcpy(hr + 80, hh[5], 32); hr[80] ^= 1; fwrite(hr, 1, 112, fh); }
+      fclose(fh);
+      ck("a record that does not hash to itself: cut (1 file trimmed)", archive_trim_derived_tails() == 1 && fsize("headers.dat") == 5*112);
+      ck("chainwork.dat is still tied to the applied blocks (3 records)", fsize("chainwork.dat") == 3*16); }
     if (cwd0[0]) (void)!chdir(cwd0);
     printf("== the catch-up's worker-wait loop honours SIGTERM (structural) ==\n");
     { FILE* f = fopen("daemon/main.c", "r"); ck("daemon/main.c readable", f != NULL);

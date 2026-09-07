@@ -1077,10 +1077,40 @@ long archive_trim_derived_tails(void){
             }
         } else { if (fi) fclose(fi); if (fh) fclose(fh); }
     }
+    /* headers.dat AHEAD of the archive is the normal headers-first state, not
+     * an overrun (2026-09-07). Until today this cut it back to the archive
+     * tip, so a restart in the middle of a sync refetched every header --
+     * 71 MB on mainnet, the whole held region below -minimumchainwork again.
+     * The 2026-09-01 rule was written for index.dat's empty tail. A record
+     * past the tip is kept while it hashes to its own record and links to
+     * the one below; the mirror is cut at the first break, so a torn write
+     * still cannot leave junk in it. (Every record was PoW-gated by the
+     * fetch that wrote it -- VAL-5; this guards against corruption.) */
     if (stat("headers.dat", &st) == 0 && st.st_size > (off_t)n * 112){
-        if (truncate("headers.dat", (off_t)n * 112) != 0) return -1;
-        fprintf(stderr, "[boot] headers.dat ran %ld record(s) past the archive tip -- trimmed to %ld\n", (long)(st.st_size / 112) - n, n);
-        trimmed++;
+        long hn = (long)(st.st_size / 112), keep = n;
+        FILE* fh = fopen("headers.dat", "rb");
+        if (fh){
+            unsigned char hr[112], prev_hash[32]; int have_prev = 0;
+            if (n > 0 && fseek(fh, (n - 1) * 112, SEEK_SET) == 0 && fread(hr, 1, 112, fh) == 112){ memcpy(prev_hash, hr + 80, 32); have_prev = 1; }
+            if (n == 0 || have_prev){
+                if (fseek(fh, n * 112, SEEK_SET) == 0){
+                    for (long h = n; h < hn; h++){
+                        if (fread(hr, 1, 112, fh) != 112) break;
+                        unsigned char bh[32]; block_hash(bh, hr);
+                        if (memcmp(bh, hr + 80, 32) != 0) break;                        /* does not hash to its own record */
+                        if (have_prev && memcmp(hr + 4, prev_hash, 32) != 0) break;      /* does not link to the one below */
+                        memcpy(prev_hash, bh, 32); have_prev = 1; keep = h + 1;
+                    }
+                }
+            }
+            fclose(fh);
+        }
+        if (keep < hn){
+            if (truncate("headers.dat", (off_t)keep * 112) != 0) return -1;
+            fprintf(stderr, "[boot] headers.dat: %ld linked record(s) ahead of the archive tip kept; %ld unlinked record(s) beyond them trimmed\n", keep - n, hn - keep);
+            trimmed++;
+        } else if (hn > n)
+            fprintf(stderr, "[boot] headers.dat runs %ld linked record(s) ahead of the archive tip (headers-first): kept\n", hn - n);
     }
     if (stat("chainwork.dat", &st) == 0 && st.st_size > (off_t)n * 16){
         if (truncate("chainwork.dat", (off_t)n * 16) != 0) return -1;
