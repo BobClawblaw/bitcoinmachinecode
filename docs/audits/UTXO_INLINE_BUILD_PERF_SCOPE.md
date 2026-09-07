@@ -383,6 +383,37 @@ build, on an otherwise idle box: five to six minutes to the failure. It does
 NOT reproduce when the box is busy — the second attempt, sharing bandwidth
 with another sync, passed 74,399 blocks cleanly.
 
+### The peer pool, 2026-09-06 night — two defects the download's own log exposed
+
+The wall clock is download-bound and the download is peer-bound, so how the
+sixteen workers choose and keep peers is on the critical path. Run 7's log,
+read with the eviction rule in mind, showed two things:
+
+1. **We killed peers that had served us blocks.** The dead-weight floor was
+   an absolute 32 KB/s, calibrated for megabyte blocks. At height 50,000 a
+   block is ~200 bytes and a serial fetch is round-trip bound, so a healthy
+   worker moves ~9 KB/s -- the floor declared every one of them dead. 655
+   evictions in the first 30 minutes, 478 under 5 KB/s, 195 after zero
+   chunks, 181 after two full chunks. Fixed: the floor is the smaller of the
+   absolute floor and a quarter of the pool's median rate last tick.
+2. **We picked peers blind.** The probe measured only whether a TCP connect
+   succeeded; workers then took the pool in DNS-seed order. Fixed: one timed
+   2,000-header fetch per live peer, pool sorted fastest-first (119 ranked in
+   35 s; best 1,446 KB/s, median 219, 46 silent last).
+
+Tried first and rejected by measurement: evicting *faster* while untried
+peers remain. It shed peers in 112 s instead of 249 and produced four times
+fewer blocks -- churn costs a handshake and abandons partial chunks.
+
+| 5 min 19 s in | run 7 (before) | run 8 (after) |
+|---|---|---|
+| blocks stored | ~16,000 | 41,974 |
+| average receive | 32 KB/s | 100 KB/s |
+| evictions | 400+ | 0 |
+
+Early-chain only so far; whether the gain holds where blocks are large is
+what run 8's wall clock will say.
+
 ## 5. Tests and the proof
 
 - `test_utxo_catchup_bounded` (gated): a synthetic archive with holes at
