@@ -3618,10 +3618,22 @@ static double dlc_effective_floor(double median_bps){
  * takes the first hole's own chunk itself (a duplicate fetch; the store's
  * appends are idempotent, test_shared_stress) so a dead worker can never
  * deadlock the window; (3) pushes any chunk it abandons onto the ring. */
-#define DLC_DOWNLOAD_WINDOW 1024L        /* Core's BLOCK_DOWNLOAD_WINDOW */
-#define DLC_WINDOW_HELP_SECS 120         /* waited this long at the window: fetch the blocking chunk too */
+/* Core's BLOCK_DOWNLOAD_WINDOW is 1024 blocks against ~8 outbound peers x
+ * 16 blocks in flight (MAX_BLOCKS_IN_TRANSIT_PER_PEER): six to eight times
+ * its in-flight count. Ours is 16 workers x 40-block chunks = 640 in
+ * flight, so 1024 was only 1.6x -- run 11 and the scratch node after it
+ * spent most of their time at the window (523 waits in six minutes, 45k
+ * blocks against run 9's 86k). 4096 is the same slack Core gives itself;
+ * the archive is still consolidated behind it (holes bounded, the connect
+ * never more than the window behind the download). */
+#define DLC_DOWNLOAD_WINDOW 4096L
+/* Core's BLOCK_STALLING_TIMEOUT_DEFAULT: when the window is full and one
+ * peer blocks it, Core re-requests from another peer after 2 s. Same here:
+ * a worker idle at a full window for 2 s fetches the blocking chunk itself
+ * (one helper at a time, claimed through DLC_CTL_HELPING). */
+#define DLC_WINDOW_HELP_SECS 2
 #define DLC_RETRY_MAX 4096L
-enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CTL_FIRST_HOLE = 3, DLC_CTL_RING = 4 };
+enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CTL_FIRST_HOLE = 3, DLC_CTL_HELPING = 4, DLC_CTL_RING = 5 };
 #define DLC_CTL_BYTES ((size_t)(DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long))
 static int dlc_window_allows(long lo, long first_hole){ return lo - first_hole <= DLC_DOWNLOAD_WINDOW; }
 /* single-producer-per-push, multi-consumer ring: push reserves a slot with a
@@ -4191,6 +4203,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
          * above the first hole; while the window is blocked, keep checking
          * the ring, and after DLC_WINDOW_HELP_SECS fetch the blocking chunk
          * ourselves rather than wait on a worker that may be gone. */
+        int helping=0;
         long lo=dlc_retry_pop(next_claim);
         if(lo<0){
             int waited_ticks=0;                 /* 200 ms each */
@@ -4208,10 +4221,14 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                   if(fresh>fh){ next_claim[DLC_CTL_FIRST_HOLE]=fresh; fh=fresh; if(dlc_window_allows(peek, fh)) break; } }
                 lo=dlc_retry_pop(next_claim); if(lo>=0) break;
                 if(waited_ticks>=DLC_WINDOW_HELP_SECS*5){
-                    lo=fh-((fh-0)%DLC_CHUNK_BLOCKS); if(lo<0) lo=0;   /* the chunk holding the first hole */
-                    fprintf(stderr,"[dlc w%d] window blocked %ds at hole %ld (claims at %ld): fetching chunk [%ld,%ld] alongside its owner\n",
-                            w, waited_ticks/5, fh, peek, lo, lo+DLC_CHUNK_BLOCKS-1);
-                    break;
+                    long blk=fh-((fh-0)%DLC_CHUNK_BLOCKS); if(blk<0) blk=0;   /* the chunk holding the first hole */
+                    long cur=next_claim[DLC_CTL_HELPING];
+                    if(cur!=blk && __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], cur, blk)){   /* one helper per blocking chunk */
+                        lo=blk; helping=1;
+                        fprintf(stderr,"[dlc w%d] window blocked %.1fs at hole %ld (claims at %ld): fetching chunk [%ld,%ld] alongside its owner\n",
+                                w, waited_ticks/5.0, fh, peek, lo, lo+DLC_CHUNK_BLOCKS-1);
+                        break;
+                    }
                 }
                 if(waited_ticks==0) fprintf(stderr,"[dlc w%d] at the window: next claim %ld is %ld past the first hole %ld -- waiting, not running ahead\n", w, peek, peek-fh, fh);
                 usleep(200000); waited_ticks++;
@@ -4389,6 +4406,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
         }
         close(hfd);
+        if(helping) __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], lo, -1L);   /* the help is over, whichever way */
         if(chunk_ok){
             total+=n; __sync_fetch_and_add(done_count,n);
             mystat->chunks++; mystat->blocks+=n; mystat->guard+=guard;
@@ -4867,7 +4885,7 @@ static long dl_catchup(const char* dir, int min_workers){
      * explicitly. */
     for(int i=0;i<nw;i++) stats[i].held_idx = -1;
     *next_claim=start_h; *done_count=0;
-    next_claim[DLC_CTL_RETRY_HEAD]=0; next_claim[DLC_CTL_RETRY_TAIL]=0; next_claim[DLC_CTL_FIRST_HOLE]=start_h;   /* window starts at the span start */
+    next_claim[DLC_CTL_RETRY_HEAD]=0; next_claim[DLC_CTL_RETRY_TAIL]=0; next_claim[DLC_CTL_FIRST_HOLE]=start_h; next_claim[DLC_CTL_HELPING]=-1;   /* window starts at the span start; nobody helping */
     for(long i=0;i<DLC_RETRY_MAX;i++) next_claim[DLC_CTL_RING+i]=-1;   /* -1 = empty slot (0 is a real chunk) */
     /* MAP_ANONYMOUS pages come zeroed, so every stats[w].peer/chunks/blocks/
      * guard and every claimed[i] starts at "" / 0 / 0 / 0 / 0 -- no explicit

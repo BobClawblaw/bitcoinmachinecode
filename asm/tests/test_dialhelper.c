@@ -311,8 +311,8 @@ int main(void){
       /* the download window and the retry ring ("write out monotonically,
        * like Core does"): a chunk is never claimed more than 1024 blocks
        * above the first hole, and an abandoned chunk is retried, never left. */
-      { ok(dlc_window_allows(45160 + 1024, 45160), "a claim exactly 1024 above the first hole is inside Core's window");
-        ok(!dlc_window_allows(45160 + 1025, 45160), "1025 above: outside -- the worker waits instead of running ahead");
+      { ok(dlc_window_allows(45160 + 4096, 45160), "a claim exactly 4096 above the first hole is inside the window (Core's 1024 scaled to our 640 in flight)");
+        ok(!dlc_window_allows(45160 + 4097, 45160), "4097 above: outside -- the worker waits instead of running ahead");
         ok(dlc_window_allows(100, 45160), "a claim below the first hole (a retry) is always allowed");
         static volatile long ctl[DLC_CTL_RING + DLC_RETRY_MAX];
         for (long i = 0; i < DLC_CTL_RING + DLC_RETRY_MAX; i++) ctl[i] = i < DLC_CTL_RING ? 0 : -1;
