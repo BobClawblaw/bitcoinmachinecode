@@ -1,20 +1,20 @@
 # Bitcoin Machine Code — Operations Guide
 
 This guide covers installing, configuring, running, upgrading and
-troubleshooting the `bitcoind` daemon of Bitcoin Machine Code on a Linux
+troubleshooting the `bitcoinmcd` daemon of Bitcoin Machine Code on a Linux
 x86-64 host under systemd. It describes the system as it is; what the node
 does and does not implement is in `README.md` and `docs/FEATURE_GAPS.md`.
 
 ## Overview
 
-One binary, `asm/daemon/bitcoind`, runs the node as a fork-model daemon:
+One binary, `asm/daemon/bitcoinmcd` (named `bitcoind` until 2026-09-07; the sources are still `bitcoind.asm`), runs the node as a fork-model daemon:
 
 - a **parent** accepts inbound peers (one forked serve child per connection)
   and runs the embedded JSON-RPC server on its own thread;
 - a forked **download worker** owns the outbound peer legs, block download
   and keep-up, UTXO application and reorg handling;
 - a background **UTXO compaction** forks a short-lived child per merge; it
-  appears as a second `bitcoind` process with the same command line.
+  appears as a second `bitcoinmcd` process with the same command line.
 
 Everything the node persists lives in one datadir, and every chain gets its
 own subdirectory of it: `<datadir>/main`, `<datadir>/signet`,
@@ -46,7 +46,7 @@ and cookie, so no other flags are usually needed.
 
 ```sh
 cd /path/to/repo/asm
-make daemon/bitcoind              # the daemon (about 31 MB)
+make daemon/bitcoinmcd              # the daemon (about 31 MB)
 make daemon/bmc_cli           # the RPC client
 make tests/tool_archive_relayout  # archive maintenance tool (optional)
 ```
@@ -80,7 +80,7 @@ txouts=<utxo count> uptime=<d:hh:mm:ss>`.
 
 ### Location
 
-`bitcoind serve <datadir>` resolves its configuration in this order:
+`bitcoinmcd serve <datadir>` resolves its configuration in this order:
 a `-conf=<path>` argument (an unreadable file is fatal, never a fallback);
 `$BITCOIN_CONF`; `<datadir>/bitcoin.conf` if readable;
 `<datadir>/../config/bitcoin.conf`. The path used is echoed at boot as
@@ -254,7 +254,7 @@ Type=simple
 User=<service-user>
 Group=<service-group>
 WorkingDirectory=/path/to/repo/asm
-ExecStart=/path/to/repo/asm/daemon/bitcoind.live serve /path/to/repo/data
+ExecStart=/path/to/repo/asm/daemon/bitcoinmcd.live serve /path/to/repo/data
 StandardOutput=append:/path/to/repo/logs/main/bitcoin.main.log
 StandardError=append:/path/to/repo/logs/main/bitcoin.main.log
 Restart=on-failure
@@ -285,8 +285,8 @@ drop-in; the reference deployment's unit itself is a local artifact and is
 deliberately not vendored into this repository (operator decision,
 2026-09-05 — see `releases/2026-09-05-audits-closed.md`).
 
-- `ExecStart` runs **`bitcoind.live`**, a symlink to a dated snapshot
-  `bitcoind.deploy-<YYYYMMDD><letter>`, not the tree binary. A rebuild
+- `ExecStart` runs **`bitcoinmcd.live`**, a symlink to a dated snapshot
+  `bitcoinmcd.deploy-<YYYYMMDD><letter>`, not the tree binary. A rebuild
   changes nothing until the symlink moves; `systemctl restart` boots whatever
   it points at.
 - The datadir argument is the root; `chain=` selects `<datadir>/<chain>`.
@@ -337,7 +337,7 @@ host-local build products, not in git; keep the last few.
 ```sh
 cd /path/to/repo/asm
 git pull
-make daemon/bitcoind          # safe while the old binary runs: ld unlinks first
+make daemon/bitcoinmcd          # safe while the old binary runs: ld unlinks first
 
 # the three build audits (each is also a prerequisite of `make test`)
 make prereq-check             # every file a recipe uses is a declared prerequisite
@@ -362,8 +362,8 @@ a prerequisite failed to link contains no `FAIL` lines.
 Deploy:
 
 ```sh
-cp -a daemon/bitcoind daemon/bitcoind.deploy-$(date +%Y%m%d)a   # next free letter
-ln -sfn bitcoind.deploy-$(date +%Y%m%d)a daemon/bitcoind.live
+cp -a daemon/bitcoinmcd daemon/bitcoinmcd.deploy-$(date +%Y%m%d)a   # next free letter
+ln -sfn bitcoinmcd.deploy-$(date +%Y%m%d)a daemon/bitcoinmcd.live
 sudo systemctl restart bmc-bitcoind
 ```
 
@@ -375,7 +375,7 @@ wallet or index formats.
 Rollback:
 
 ```sh
-ln -sfn bitcoind.deploy-<previous> daemon/bitcoind.live
+ln -sfn bitcoinmcd.deploy-<previous> daemon/bitcoinmcd.live
 sudo systemctl restart bmc-bitcoind
 ```
 
@@ -386,14 +386,14 @@ about a minute. Check, in order:
 
 ```sh
 systemctl is-active bmc-bitcoind
-ss -ltnp | grep bitcoind             # P2P, RPC, onion target, ZMQ endpoints
+ss -ltnp | grep bitcoinmcd            # P2P, RPC, onion target, ZMQ endpoints
 daemon/bmc_cli -datadir=/path/to/repo/data getblockcount
 ```
 
 Expected lines in `logs/<chain>/bitcoin.<chain>.log`, in order:
 
 ```
-===== bmc-bitcoind  LOG START: ...   pid N  vX.Y.Z  built ...  mode=serve
+===== bitcoinmcd  LOG START: ...   pid N  vX.Y.Z  built ...  mode=serve
 [config] loaded <path>: N setting(s) applied
 [net] BIP324 v2 transport enabled (services=0x...); N of M known peers advertise v2
 [boot] chain=<chain> datadir=<datadir>/<chain> port=<p> dnsseed=<0|1>
@@ -570,7 +570,7 @@ rollback. The scratch copy needs as much space as the archive.
 | `[dial] no IPv6 on this host: ipv6 and cjdns peers are unreachable` | Enable host IPv6 (and run `cjdroute`) for `cjdnsreachable=1`. |
 | `[wallet] walletpassfile "..." not usable: <why>` / `is inside the datadir -- refusing` | Fix path and mode (absolute, outside the datadir, 0640 or stricter, not group-writable). The wallet stays locked until then. |
 | `[boot] archive check found N problem(s)` | Read the `[check]` lines above it. The non-monotonic layout notice is expected on a parallel-downloaded archive (see *Maintenance*); other findings name the height. |
-| a second `bitcoind` with the same command line | A compaction child. Check `/proc/<pid>/exe` and the parent PID before assuming a duplicate daemon; never run two daemons on one chain directory. |
+| a second `bitcoinmcd` with the same command line | A compaction child. Check `/proc/<pid>/exe` and the parent PID before assuming a duplicate daemon; never run two daemons on one chain directory. |
 
 ## Running more than one chain
 
@@ -626,7 +626,7 @@ Extra listeners: onion service target at chain default P2P port + 1
 
 Outside the chain directory: `<datadir>/bitcoin.conf` or
 `<repo>/config/bitcoin.conf`; `<repo>/logs/<chain>/bitcoin.<chain>.log`;
-`<repo>/asm/daemon/bitcoind.live` and `bitcoind.deploy-*`;
+`<repo>/asm/daemon/bitcoinmcd.live` and `bitcoinmcd.deploy-*`;
 `<repo>/config/logrotate-bmc.conf`.
 
 ## Config options added 2026-09-01 (Core names, Core defaults)

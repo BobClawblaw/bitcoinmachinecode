@@ -23,7 +23,7 @@
 set -u
 CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build-zmq/bin}
 ROOT=${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
-BMC_BIN=${BMC_BIN:-$ROOT/asm/daemon/bitcoind}
+BMC_BIN=${BMC_BIN:-$ROOT/asm/daemon/bitcoinmcd}
 WORK=${WORK:-${CLAUDE_JOB_DIR:-/tmp}/tmp/privbcast/e2e-$$}
 CORE_DIR=$WORK/core; BMC_DIR=$WORK/bmc
 PB=${PORT_BASE:-21840}; CORE_P2P=$((PB+4)); CORE_RPC=$((PB+20)); BMC_P2P=$((PB+15)); BMC_RPC=$((PB+6)); SOCKS=$((PB+30))

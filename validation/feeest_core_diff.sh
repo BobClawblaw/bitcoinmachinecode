@@ -15,7 +15,7 @@ set -u
 ROUNDS=${1:-60}
 CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build-zmq/bin}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-BMC_BIN=${BMC_BIN:-$ROOT/asm/daemon/bitcoind}
+BMC_BIN=${BMC_BIN:-$ROOT/asm/daemon/bitcoinmcd}
 WALLET_CLI=${WALLET_CLI:-$ROOT/asm/daemon/wallet_cli}
 WORK=${WORK:-${CLAUDE_JOB_DIR:-/tmp}/tmp/fee/diff-$$}
 CORE_DIR=$WORK/core; BMC_DIR=$WORK/bmc

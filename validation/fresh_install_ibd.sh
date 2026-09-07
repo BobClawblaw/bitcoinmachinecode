@@ -23,7 +23,7 @@ mkdir -p "$DEST"; cd "$DEST" || exit 2
 PH="$DEST/phase.log"; ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }; ph(){ echo "$(ts) $*" | tee -a "$PH"; }
 ph "START dest=$DEST host=$(hostname) kernel=$(uname -r) nasm=$(nasm -v | head -1) gcc=$(gcc --version | head -1)"
 if [ "$RESUME" = 1 ]; then
-    [ -x src/asm/daemon/bitcoind ] || { ph "FAIL resume: no build at src/asm/daemon/bitcoind"; echo FAIL > RESULT; exit 2; }
+    [ -x src/asm/daemon/bitcoinmcd ] || { ph "FAIL resume: no build at src/asm/daemon/bitcoinmcd"; echo FAIL > RESULT; exit 2; }
     [ -f data/bitcoin.conf ] || { ph "FAIL resume: no data/bitcoin.conf"; echo FAIL > RESULT; exit 2; }
     if [ -f daemon.pid ] && kill -0 "$(cat daemon.pid)" 2>/dev/null; then ph "FAIL resume: daemon $(cat daemon.pid) is still running"; exit 2; fi
     ph "RESUME commit=$(git -C src rev-parse --short HEAD) datadir=$(du -sh data | cut -f1) -- clone/build/conf untouched"
@@ -32,7 +32,7 @@ else
 t0=$(date +%s); git clone -q "$REPO" src || { ph "FAIL clone"; echo FAIL > RESULT; exit 1; }
 ph "CLONE done $(( $(date +%s)-t0 ))s commit=$(git -C src rev-parse --short HEAD)"
 # 2. build -- exactly the README's target
-t0=$(date +%s); ( cd src/asm && make -s daemon/bitcoind daemon/bmc_cli ) > build.log 2>&1 || { ph "FAIL build (see build.log)"; echo FAIL > RESULT; exit 1; }
+t0=$(date +%s); ( cd src/asm && make -s daemon/bitcoinmcd daemon/bmc_cli ) > build.log 2>&1 || { ph "FAIL build (see build.log)"; echo FAIL > RESULT; exit 1; }
 ph "BUILD done $(( $(date +%s)-t0 ))s warnings=$(grep -c warning build.log)"
 # 3. configuration -- the sample, plus the three things a second node on one box must set
 mkdir -p data
@@ -53,8 +53,8 @@ ph "CONF port=$P2P rpcport=$RPC dbcache=8192 (everything else = sample defaults)
 fi
 # 4. start, unattended, low priority, its own console log; never as a unit
 ph "START daemon"
-if [ "$RESUME" = 1 ]; then setsid nohup nice -n 10 ionice -c3 src/asm/daemon/bitcoind serve "$DEST/data" >> console.log 2>&1 < /dev/null &
-else setsid nohup nice -n 10 ionice -c3 src/asm/daemon/bitcoind serve "$DEST/data" > console.log 2>&1 < /dev/null & fi
+if [ "$RESUME" = 1 ]; then setsid nohup nice -n 10 ionice -c3 src/asm/daemon/bitcoinmcd serve "$DEST/data" >> console.log 2>&1 < /dev/null &
+else setsid nohup nice -n 10 ionice -c3 src/asm/daemon/bitcoinmcd serve "$DEST/data" > console.log 2>&1 < /dev/null & fi
 echo $! > daemon.pid; sleep 5
 kill -0 "$(cat daemon.pid)" 2>/dev/null || { ph "FAIL daemon exited at once (console.log)"; echo FAIL > RESULT; exit 1; }
 grep -q "no config file" console.log && { ph "FAIL the daemon did not find the configuration (see console.log)"; kill "$(cat daemon.pid)"; echo FAIL > RESULT; exit 1; }

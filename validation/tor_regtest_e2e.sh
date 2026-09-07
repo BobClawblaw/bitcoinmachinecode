@@ -11,7 +11,7 @@
 # Nothing here is mocked: real tor, real circuits, real Core.
 set -u
 CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
-BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bitcoind}
+BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bitcoinmcd}
 WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/wallet_cli}
 WORK=${WORK:-/tmp/tor-e2e-$$}
 CORE_DIR=$WORK/core; BMC_DIR=$WORK/bmc

@@ -209,7 +209,7 @@ Two knobs:
 | `BMC_TEST_KEEP` | if set and non-empty, keep the directory and print its path, for post-mortem inspection. |
 
 Paths that must still resolve against the source tree after the `chdir` —
-fixtures, `daemon/bitcoind`, the shim executables — go through `tt_src("…")`.
+fixtures, `daemon/bitcoinmcd`, the shim executables — go through `tt_src("…")`.
 A harness that hands a datadir to a forked child or a spawned daemon passes
 `tt_workdir()`. When adding a harness that touches storage, add `tt_isolate()`
 and list `$(TEST_TMPDIR_H)` in its Makefile prerequisites.
@@ -221,7 +221,7 @@ targets — the daemon binary must be rebuilt by hand:
 
 ```bash
 cd /storage/bitcoinmachinecode/asm
-gcc -no-pie -O2 -o daemon/bitcoind daemon/main.c sha256.o bitcoin_hash.o \
+gcc -no-pie -O2 -o daemon/bitcoinmcd daemon/main.c sha256.o bitcoin_hash.o \
     bitcoin_net.o bitcoin_p2p.o bitcoin_tx.o bitcoin_cons.o bitcoin_store.o \
     bitcoind.o node_log.o bitcoin_headers.o
 ```
@@ -310,25 +310,25 @@ python3 tests/stress_scalar.py     # scalar arith: 3k iters
 All binaries live under `asm/daemon/`. Paths below assume
 `cd /storage/bitcoinmachinecode/asm/daemon`.
 
-### 3.1 `bitcoind` — the node daemon (primary deliverable)
+### 3.1 `bitcoinmcd` — the node daemon (primary deliverable)
 
 `main.c` is a thin CLI driver over the all-assembly node core. It resolves
 `<dir>` to an absolute path, `chdir`s into it, and operates on the store there.
 
 ```
-bitcoind sync  <dir>                  # connect to a built-in loopback fake
+bitcoinmcd sync  <dir>                  # connect to a built-in loopback fake
                                       # peer, run node_sync (IBD), report height
-bitcoind ibd   <dir>                  # FULL IBD as one asm pass (node_ibd =
+bitcoinmcd ibd   <dir>                  # FULL IBD as one asm pass (node_ibd =
                                       # headers-first persist + getdata block
                                       # bodies + cons_verify + store)
-bitcoind follow <dir>                 # realtime keep-up on one connection
+bitcoinmcd follow <dir>                 # realtime keep-up on one connection
                                       # (re-runs node_sync, inv-announces tip)
-bitcoind serve <dir> <port> [nwant] [catchup_workers]
+bitcoinmcd serve <dir> <port> [nwant] [catchup_workers]
                                       # PRODUCTION MODE: self-healing catch-up,
                                       # then continuous download + inbound serve
-bitcoind serve-test <dir> <port> <peer_host> <out_port>
+bitcoinmcd serve-test <dir> <port> <peer_host> <out_port>
                                       # loopback outbound-mux test (no network)
-bitcoind server-test <dir>            # end-to-end serve test (socketpair)
+bitcoinmcd server-test <dir>            # end-to-end serve test (socketpair)
 ```
 
 **`serve` mode (production)** — the mode you run to operate the node:
@@ -495,7 +495,7 @@ names); if you run the project's own binaries, invoke them directly (see 3.1)
 instead of relying on these:
 
 ```
-scripts/start.sh        # systemctl start bmc-bitcoind, else `bitcoind -datadir=<d> serve`
+scripts/start.sh        # systemctl start bmc-bitcoind, else `bitcoinmcd -datadir=<d> serve`
 scripts/status.sh       # systemctl status + bmc_cli getblockchaininfo
 scripts/stop.sh         # systemctl stop bmc-bitcoind, else `bmc_cli stop`
 scripts/worklog.sh [YYYY-MM-DD]   # open (create+seed) today's daily worklog
@@ -755,7 +755,7 @@ inbound serve). Use 28333 if 8333 is taken by a co-located Core:
 
 ```bash
 cd /storage/bitcoinmachinecode/asm/daemon
-./bitcoind serve /storage/bitcoinmachinecode/data 28333 &
+./bitcoinmcd serve /storage/bitcoinmachinecode/data 28333 &
 ```
 
 Query the stored chain:

@@ -88,7 +88,7 @@ WHY THE VERDICT USES THE CLOSURE, NOT THE DIRECT LIST
 Make's guarantee is transitive: every prerequisite, and every prerequisite of
 those, is brought up to date before a recipe runs -- serially and under -j
 alike.  Gating on the direct list alone would flag `test:` for running
-./daemon/bitcoind, which its own prerequisites tests/test_outbound_mux and
+./daemon/bitcoinmcd, which its own prerequisites tests/test_outbound_mux and
 tests/test_redial already depend on; that recipe cannot race, so failing the
 build over it would be a false alarm.  Closure keeps the gate at zero false
 positives while still catching both real defects, neither of which was
