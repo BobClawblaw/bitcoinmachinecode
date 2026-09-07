@@ -3639,7 +3639,27 @@ enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CT
         * tick, in place of a line per event (2026-09-07: the rotation and
         * window lines alone were 540 lines in six minutes of run 13) */
        DLC_CTL_N_ROTATE = 6, DLC_CTL_N_WAIT = 7, DLC_CTL_N_HELP = 8, DLC_CTL_N_FAIL = 9, DLC_CTL_N_ABANDON = 10,
-       DLC_CTL_RING = 11 };
+       DLC_CTL_SPAN_START = 11,           /* the pass's first height: the claim grid is start + k*DLC_CHUNK_BLOCKS */
+       DLC_CTL_RING = 12 };
+/* Run 14 (2026-09-07) stalled for two minutes at 82,565: every worker
+ * reconnected to the SAME peer -- one that accepted the handshake and
+ * dropped us ~100 ms later -- because a failed fetch never lowered the
+ * peer's standing and the picker handed it straight back; 12 reconnects a
+ * second across the pool, 4,274 failed attempts in nine minutes. Three
+ * rules, all pure so the test can pin them:
+ *  - a failed fetch HALVES the peer's shared rate (three failures put it
+ *    under any bar; the parent's next tick restores it if it delivers);
+ *  - a growing pause after each failure on one chunk: 200 ms x attempts,
+ *    capped at 2 s, so 400 attempts take 13 minutes, not 45 seconds;
+ *  - the help chunk lies on the CLAIM grid (start + k*40), not on
+ *    multiples of 40 from zero -- the pass starts at 1 when genesis is
+ *    seeded, and a misaligned help straddled two owners' chunks. */
+static double dlc_ema_after_failure(double ema){ return ema > 0.0 ? ema * 0.5 : 1.0; }
+static long dlc_fail_backoff_ms(int attempt){ long ms = 200L * (attempt < 1 ? 1 : attempt); return ms > 2000 ? 2000 : ms; }
+static long dlc_help_chunk_lo(long first_hole, long span_start){
+    if(first_hole < span_start) return span_start;
+    return span_start + ((first_hole - span_start) / DLC_CHUNK_BLOCKS) * DLC_CHUNK_BLOCKS;
+}
 /* The anchor is scanned by the parent only. The first cut had a blocked
  * worker rescan index.dat itself, and those reads landed in the worker's
  * /proc io rchar -- the counter the parent's per-worker rate, the pool
@@ -4238,7 +4258,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                 next_claim[DLC_CTL_WANT_ANCHOR]=1;   /* the parent rescans within 200 ms; our own reads must not touch our io counters */
                 lo=dlc_retry_pop(next_claim); if(lo>=0) break;
                 if(waited_ticks>=DLC_WINDOW_HELP_SECS*5){
-                    long blk=fh-((fh-0)%DLC_CHUNK_BLOCKS); if(blk<0) blk=0;   /* the chunk holding the first hole */
+                    long blk=dlc_help_chunk_lo(fh, next_claim[DLC_CTL_SPAN_START]);   /* the chunk holding the first hole, on the claim grid */
                     long cur=next_claim[DLC_CTL_HELPING];
                     if(cur!=blk && __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], cur, blk)){   /* one helper per blocking chunk */
                         lo=blk; helping=1;
@@ -4413,12 +4433,14 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
              * fail 400 chunks in 45 s and abandon the chunk with no line
              * between the rotation before it and "reconnect budget". */
             __sync_fetch_and_add(&next_claim[DLC_CTL_N_FAIL], 1L);
+            { long hi_=mystat->held_idx; if(hi_>=0 && hi_<nlive) ema[hi_]=dlc_ema_after_failure(ema[hi_]); }   /* the picker must move on */
             if(guard==3 || guard%100==0)      /* one peer failing once is normal; three in a row on one chunk is worth a line */
                 fprintf(stderr,"[dlc w%d] %s: chunk [%ld,%ld] attempt %d failed after %ld ms: %s (code %ld)\n",
                         w, mystat->peer, lo, hi, guard, (long)(dlc_now_ms()-chunk_t0), ibd_pipeline_fail_name((int)r), r);
             close(fd); fd=-1; DLC_RELEASE();
             slot=(slot+1)%(nlive>0?nlive:1);
             if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
+            usleep((useconds_t)(dlc_fail_backoff_ms(guard)*1000));   /* do not hammer the pool: 12 reconnects/s was run 14's stall */
         }
         close(hfd);
         if(helping) __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], lo, -1L);   /* the help is over, whichever way */
@@ -4901,7 +4923,7 @@ static long dl_catchup(const char* dir, int min_workers){
      * explicitly. */
     for(int i=0;i<nw;i++) stats[i].held_idx = -1;
     *next_claim=start_h; *done_count=0;
-    next_claim[DLC_CTL_RETRY_HEAD]=0; next_claim[DLC_CTL_RETRY_TAIL]=0; next_claim[DLC_CTL_FIRST_HOLE]=start_h; next_claim[DLC_CTL_HELPING]=-1; next_claim[DLC_CTL_WANT_ANCHOR]=0;   /* window starts at the span start; nobody helping */
+    next_claim[DLC_CTL_RETRY_HEAD]=0; next_claim[DLC_CTL_RETRY_TAIL]=0; next_claim[DLC_CTL_FIRST_HOLE]=start_h; next_claim[DLC_CTL_HELPING]=-1; next_claim[DLC_CTL_WANT_ANCHOR]=0; next_claim[DLC_CTL_SPAN_START]=start_h;   /* window starts at the span start; nobody helping */
     for(long i=0;i<DLC_RETRY_MAX;i++) next_claim[DLC_CTL_RING+i]=-1;   /* -1 = empty slot (0 is a real chunk) */
     for(int i=DLC_CTL_N_ROTATE;i<=DLC_CTL_N_ABANDON;i++) next_claim[i]=0;
     /* MAP_ANONYMOUS pages come zeroed, so every stats[w].peer/chunks/blocks/
