@@ -76,7 +76,7 @@ static long tspt_backfill(void* store_buf, long tip){
 }
 void tsp_boot(void* store_buf){
     long base_to = tspt_base_to();
-    if (base_to < 0){ fprintf(stderr, "[txospender] no base %s -- index disabled (build one with daemon/build_txospender_index)\n", TSP_BASE_FILE); return; }
+    if (base_to < 0){ fprintf(stderr, "[txospender] no base %s -- index disabled (build one with daemon/bmc_build_txospender_index)\n", TSP_BASE_FILE); return; }
     int fd = open(TSP_TAIL_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
     if (fd < 0){ fprintf(stderr, "[txospender] cannot open %s -- tail disabled\n", TSP_TAIL_FILE); return; }
     long tail_max = tspt_scan_max(fd);

@@ -22,7 +22,7 @@
 set -u
 DATA=/storage/bitcoinmachinecode/data
 ASM=/storage/bitcoinmachinecode/asm
-BUILDER=$ASM/daemon/build_block_filters
+BUILDER=$ASM/daemon/bmc_build_block_filters
 PLOG=${PLOG:-/storage/bitcoinmachinecode/logs/bitcoind.production.log}
 LOG=/storage/bitcoinmachinecode/logs/bfi_closing_pass.log
 # If the first builder leaves MORE than this to do, closing it with the daemon

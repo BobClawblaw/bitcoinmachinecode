@@ -6,7 +6,7 @@
  * Flow exercised here is exactly what the wallet/validation bridge promises
  * as a unit:
  *   1. BUILD   : a real, fundable P2PKH tx (1 input, 2 outputs, change).
- *   2. SIGN    : hand the unsigned tx to the actual daemon/wallet_cli "sign"
+ *   2. SIGN    : hand the unsigned tx to the actual daemon/bmc_wallet_cli "sign"
  *                subcommand (legacy SIGHASH_ALL, low-S, deterministic nonce).
  *                We capture its "signed-tx:" hex over stdout -- the same
  *                output a human reading the CLI would get.
@@ -161,7 +161,7 @@ static long cli_sign(unsigned char* out_signed, long cap,
                      const char* txhex, const char* keyhex, const char* idxhex,
                      char* cli_log, long logcap) {
     char cmd[16400];
-    snprintf(cmd, sizeof cmd, "./daemon/wallet_cli sign %s %s %s", txhex, keyhex, idxhex);
+    snprintf(cmd, sizeof cmd, "./daemon/bmc_wallet_cli sign %s %s %s", txhex, keyhex, idxhex);
     FILE* fp = popen(cmd, "r");
     if (!fp) { fprintf(stderr, "  !! popen(wallet_cli sign) failed\n"); return -1; }
 

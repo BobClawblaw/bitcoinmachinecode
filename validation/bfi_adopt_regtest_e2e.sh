@@ -17,8 +17,8 @@
 set -u
 CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
 BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
-BUILDER=${BUILDER:-/storage/bitcoinmachinecode/asm/daemon/build_block_filters}
-WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/wallet_cli}
+BUILDER=${BUILDER:-/storage/bitcoinmachinecode/asm/daemon/bmc_build_block_filters}
+WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/bmc_wallet_cli}
 WORK=${TMPDIR:-/tmp}/bmc-bfi-proof-$$
 CORE_DIR=$WORK/core; BMC_DIR=$WORK/bmc
 CORE_P2P=19644; CORE_RPC=19660; BMC_P2P=19655; BMC_RPC=19646
@@ -103,7 +103,7 @@ echo "  utxo catch-up drained to $TIP (burst over -- the adopt gate now sees the
 # the filter builder resolves prevouts THROUGH the txid index, so that index
 # has to exist first -- exactly the ordering the mainnet backfill depends on.
 echo "== txid index (the filter builder resolves prevouts through it) =="
-/storage/bitcoinmachinecode/asm/daemon/build_tx_index "$BMC_DIR/regtest" >"$WORK/txi.log" 2>&1 \
+/storage/bitcoinmachinecode/asm/daemon/bmc_build_tx_index "$BMC_DIR/regtest" >"$WORK/txi.log" 2>&1 \
   || { echo "build_tx_index failed"; tail -5 "$WORK/txi.log"; exit 2; }
 echo "  txindex.dat $(stat -c%s "$BMC_DIR/regtest/txindex.dat" 2>/dev/null || echo 0) bytes"
 

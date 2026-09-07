@@ -193,7 +193,7 @@ static void trc_hex_rev(char* out, const unsigned char* b, size_t n){
 }
 
 /* ---- build a txid index over the fixture archive ------------------------
- * Written here rather than by invoking daemon/build_tx_index so the test
+ * Written here rather than by invoking daemon/bmc_build_tx_index so the test
  * stays hermetic, but in the SAME format the builder emits -- if the two
  * ever disagree the reader will reject this file and the assertions below
  * fail, which is the point.

@@ -20,7 +20,7 @@
 set -u
 CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build/bin}
 BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
-WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/wallet_cli}
+WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/bmc_wallet_cli}
 PROBE=${PROBE:-/storage/bitcoinmachinecode/validation/p2p_inbound_probe.py}
 WORK=${WORK:-/tmp/addrv2-e2e-$$}
 CORE_DIR=$WORK/core; BMC_DIR=$WORK/bmc

@@ -154,7 +154,7 @@ def main():
 
     cli = args.cli.split() if args.cli else DEFAULT_CLI
     if not os.path.exists(args.tool):
-        sys.exit("diff_utxo_setinfo: %s not built (make daemon/utxo_setinfo)" % args.tool)
+        sys.exit("diff_utxo_setinfo: %s not built (make daemon/bmc_utxo_setinfo)" % args.tool)
 
     overrides = BIP30_COINS if args.explain_bip30 else ()
     mine = ours(args.tool, args.dir, not args.no_muhash, args.settle_ms, args.force,

@@ -14,7 +14,7 @@
  * The wire-format parsing here is lifted verbatim from daemon/addrgather.c,
  * which already did exactly this correctly but was never called from the
  * daemon and was not even in the Makefile -- an orphaned tool, the same shape
- * daemon/build_utxo was in. Rather than write a second addr parser, this
+ * daemon/bmc_build_utxo was in. Rather than write a second addr parser, this
  * makes that logic reusable and wires it into the node.
  */
 #include <stdio.h>

@@ -98,7 +98,7 @@ The last four landed 2026-08-27 and are listed first:
   the (default-OFF) address index, so a funded wallet no longer reports
   `0.00000000`.
 - **txospenderindex** (Core v30+ `-txospenderindex`) — **DONE 2026-09-01**: the
-  same shape as txindex — an offline sorted base (`daemon/build_txospender_index`,
+  same shape as txindex — an offline sorted base (`daemon/bmc_build_txospender_index`,
   28-byte records keyed by spent outpoint, ~35 GB for mainnet) plus a
   daemon-maintained tail (`daemon/txosp_tail.c`, contiguous by boot
   backfill, watermark follows reorg truncation); every candidate is verified
@@ -259,7 +259,7 @@ tables and the writers themselves.
   lookups. Verified against Core on the same chain and not merely by message
   name: the `cfilter`, `cfheaders` and `cfcheckpt` payloads are
   **byte-identical** to Core's for the same request. Requires the filter
-  index to have been built (`daemon/build_block_filters`), exactly as Core
+  index to have been built (`daemon/bmc_build_block_filters`), exactly as Core
   requires `-blockfilterindex`.
 
   *One stated caveat on "byte-identical" (STO-14, audit 2026-09-03):
@@ -409,7 +409,7 @@ tables and the writers themselves.
   both the live writer and the offline builder, because a second copy of
   three chain hashes is how two writers come to disagree about what the UTXO
   set is. Proven on real regtest blocks in the e2e.
-  Found while fixing it: **`daemon/build_utxo` had not LINKED** since
+  Found while fixing it: **`daemon/bmc_build_utxo` had not LINKED** since
   `utxo_script_unspendable` was added to it — missing from its object list,
   and the tool is not part of `make test`, so nothing caught it. It is in the
   gate now, which is the actual fix.
@@ -846,7 +846,7 @@ plus straightforward methods on top of it.
 
 - ~~**`txindex`** — explicitly ignored; `getrawtransaction` by bare txid
   won't work.~~ — **DONE 2026-08-26**: offline base build
-  (`daemon/build_tx_index`, ~29 GB, 8-byte prefix keys exact-by-
+  (`daemon/bmc_build_tx_index`, ~29 GB, 8-byte prefix keys exact-by-
   verification) + daemon-maintained incremental tail
   (`daemon/tx_index_tail.c`) that backfills at boot and follows the tip, so
   `getrawtransaction <txid>` works with no block hash and `getindexinfo`
@@ -865,7 +865,7 @@ plus straightforward methods on top of it.
   `daemon/build_block_filters.c`): whole-chain BIP158 basic filters AND the
   filter-header chain, tip-following; `getblockfilter` serves them.
 - **`coinstatsindex` / `gettxoutsetinfo`** — **the read side now exists**
-  (2026-08-23, branch `utxo-set-hash`). `daemon/utxo_setinfo` computes
+  (2026-08-23, branch `utxo-set-hash`). `daemon/bmc_utxo_setinfo` computes
   `txouts`, `total_amount`, `bogosize` and a **MuHash3072** set hash over a
   filtered view of the LSM set, and `validation/diff_utxo_setinfo.py` diffs
   those against a live Core node's `gettxoutsetinfo` at the same height.
