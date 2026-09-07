@@ -295,6 +295,34 @@ int main(void){
         ok(dlc_pick_peer(4, 0, e2, c2, b2, 400.0) == 1, "...nobody untried left: the best there is, even under the bar (1), never no peer");
         b2[1] = 1;
         ok(dlc_pick_peer(4, 0, e2, c2, b2, 400.0) == -1, "...and banned/claimed everywhere: exhausted"); }
+      /* 2026-09-07, run 10: a peer that could not be connected, handshaken
+       * or lacked NODE_WITNESS kept ema 0 and so was offered as "untried"
+       * again and again; a worker spent all 112 picks on such peers, 40
+       * times over, and then abandoned every chunk it claimed. The worker
+       * now marks such a peer 1.0 (tried, worthless), which the picker ranks
+       * below any measured peer and never as untried. */
+      { volatile int c3[4] = {1,0,0,0}, b3[4] = {0,0,0,0};
+        volatile double e3[4] = {800.0, 300.0, 1.0, 0.0};
+        ok(dlc_pick_peer(4, 0, e3, c3, b3, 400.0) == 3, "ema [800(claimed),300,1.0(dead mark),untried], bar 400: the untried one (3)");
+        c3[3] = 1;
+        ok(dlc_pick_peer(4, 0, e3, c3, b3, 400.0) == 1, "...untried gone: the 300 KB/s peer (1), NOT the dead-marked one -- it is measured, not untried");
+        c3[1] = 1;
+        ok(dlc_pick_peer(4, 0, e3, c3, b3, 400.0) == 2, "...and only the dead-marked one left: still returned rather than no peer (2)"); }
+      /* the download window and the retry ring ("write out monotonically,
+       * like Core does"): a chunk is never claimed more than 1024 blocks
+       * above the first hole, and an abandoned chunk is retried, never left. */
+      { ok(dlc_window_allows(45160 + 1024, 45160), "a claim exactly 1024 above the first hole is inside Core's window");
+        ok(!dlc_window_allows(45160 + 1025, 45160), "1025 above: outside -- the worker waits instead of running ahead");
+        ok(dlc_window_allows(100, 45160), "a claim below the first hole (a retry) is always allowed");
+        static volatile long ctl[DLC_CTL_RING + DLC_RETRY_MAX];
+        for (long i = 0; i < DLC_CTL_RING + DLC_RETRY_MAX; i++) ctl[i] = i < DLC_CTL_RING ? 0 : -1;
+        ok(dlc_retry_pop(ctl) == -1, "empty ring: nothing to retry");
+        ok(dlc_retry_push(ctl, 45161) && dlc_retry_push(ctl, 0) && dlc_retry_push(ctl, 72001), "three abandoned chunks pushed (one of them chunk 0)");
+        ok(dlc_retry_pop(ctl) == 45161 && dlc_retry_pop(ctl) == 0 && dlc_retry_pop(ctl) == 72001, "popped in order, chunk 0 included");
+        ok(dlc_retry_pop(ctl) == -1, "and empty again");
+        int full_ok = 1; for (long i = 0; i < DLC_RETRY_MAX; i++) if (!dlc_retry_push(ctl, i * 40)) full_ok = 0;
+        ok(full_ok && !dlc_retry_push(ctl, 1), "a full ring refuses the next push (the pass's own hole scan picks it up) rather than overwriting");
+        ok(dlc_retry_pop(ctl) == 0, "and drains from the oldest"); }
       /* slot rotation still breaks ties: 0 and 2 share the top ema, so from
        * slot 3 the walk reaches 0 by wrap in (slot+a) order */
       volatile double eq[4] = {9.0, 0.0, 9.0, 0.0};
