@@ -211,11 +211,19 @@ I2P destination.
   `tcp://<interface>:<port>`; `tcp://*:PORT` is refused, name an interface
   (`127.0.0.1` for local subscribers). A publisher has no authentication.
   `zmqpubsequence` is not supported and is refused.
+- **Address history** (2026-09-08): `daemon/bmc_build_addr_hist <chaindir>`
+  writes `addr_hist.dat` (about 200 GB on mainnet, ~700 GB of temp files
+  beside it while it runs, hours; the archive is all it reads). With the
+  file present the Esplora facade serves the `/address` routes; set
+  `addrindex=1` afterwards so the tail journal keeps the history current
+  (a fresh journal adopts the base's coverage and backfills over the undo
+  data). `/address/:addr/utxo` needs the txospender index too. See
+  `releases/2026-09-08-address-history.md`.
 - `bmc.esploraport=<port>` (2026-09-08) opens the Esplora facade for
   mempool.space's `BACKEND: "esplora"`: a second, unauthenticated listener
   (`bmc.esplorabind`, default 127.0.0.1) answering Esplora's REST routes from
   the node's own RPC handlers in process. Keep it on loopback or behind a
-  proxy. Address routes answer 501 until the history index lands. See
+  proxy. Address routes need the address history index (above). See
   `releases/2026-09-08-esplora-facade.md`.
 - `txindex=1` has no effect on the daemon: the index is built offline
   (`daemon/bmc_build_tx_index <datadir>`) and used when `txindex.dat` exists.
