@@ -5237,7 +5237,7 @@ static long dl_catchup(const char* dir, int min_workers){
               static int last_nowit = 0; int nw_now = peer_no_witness_count();
               if(nw_now != last_nowit){ last_nowit = nw_now;              /* only when the count changes */
                   fprintf(stderr,"[dlc] -- %d peer(s) dropped for lacking NODE_WITNESS; %llu redial(s) skipped since --\n", nw_now, peer_no_witness_skips()); } }
-            fprintf(stderr,"[dlc] -- recv %s/s (avg %s) | write %s/s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
+            fprintf(stderr,"[dlc] -- recv %s (avg %s) | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
                     aggbuf, avgrbuf, waggbuf, avgwbuf, floor_bps/1024.0, median_bps/1024.0, cur, nlive,
                     nbanned == cur ? "" : " (amnesty active)", d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
         }
@@ -5617,6 +5617,19 @@ static long long txsub_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MON
 #define DL_PARALLEL_GAP      2000L
 #define DL_PARALLEL_REARM_S  600L
 static int g_catchup_workers = 16;
+/* The backlog the apply-first rule looks at is what the connect can ACTUALLY
+ * apply: the contiguous prefix above the applied height, i.e. up to the
+ * first hole. Until 2026-09-08 it was archive tip minus applied height, and
+ * on a restart mid-sync that counted the in-flight chunks the stopped run
+ * left as holes: 523 on the first continuity test, over the 500 line, so
+ * the trigger said "apply first" while the connect sat on the hole at
+ * 135,639 that only the downloader could fill. A deadlock, once a second,
+ * forever. first_hole < 0 means no hole. */
+static long dl_apply_backlog(long archive_tip, long first_hole, long applied){
+    if(applied < 0) return 0;
+    long top = (first_hole >= 0 && first_hole - 1 < archive_tip) ? first_hole - 1 : archive_tip;
+    return top > applied ? top - applied : 0;
+}
 static int dl_should_parallel_fetch(long archive_tip, long best_peer_height,
                                     long apply_backlog, long long now_s, long long last_run_s){
     if(best_peer_height <= 0 || archive_tip < 0) return 0;
@@ -6925,7 +6938,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         long apply_backlog = 0;
         if(utxo_live_ok){
             long ah = utxo_live_applied_height();
-            if(ah >= 0) apply_backlog = (long)(*(int*)(store_buf+24)) - ah;
+            long atip0 = (long)(*(int*)(store_buf+24));
+            if(ah >= 0) apply_backlog = dl_apply_backlog(atip0, atip0 >= 0 ? dlc_first_hole(atip0) : -1, ah);
         }
         int apply_first = apply_backlog > DL_APPLY_FIRST_BACKLOG;
         {
