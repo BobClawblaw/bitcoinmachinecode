@@ -101,6 +101,19 @@ int main(void){
     snprintf(cmd, sizeof cmd, "BMC_CLI_DRYRUN=1 %s -rpcport=1 -rpcuser=u -rpcpassword=p getblockcount 2>&1", BCLI);
     rc = run_sh(cmd, out, sizeof out);
     ck("without the flags nothing is read from stdin", rc == 0 && strstr(out, "\"params\":[]") != NULL);
+    printf("== bmc_cli: parameter conversion (bitcoin-cli's RPCConvertValues, by shape) ==\n");
+    snprintf(cmd, sizeof cmd, "BMC_CLI_DRYRUN=1 %s -rpcport=1 -rpcuser=u -rpcpassword=p getrawmempool true 2>&1", BCLI);
+    rc = run_sh(cmd, out, sizeof out);
+    ck("getrawmempool true sends a JSON boolean, not the string \"true\"", rc == 0 && strstr(out, "\"params\":[true]") != NULL);
+    snprintf(cmd, sizeof cmd, "BMC_CLI_DRYRUN=1 %s -rpcport=1 -rpcuser=u -rpcpassword=p createrawtransaction '[{\"txid\":\"ab\",\"vout\":0}]' '{\"bc1qx\":0.1}' 2>&1", BCLI);
+    rc = run_sh(cmd, out, sizeof out);
+    ck("an argument that parses as a JSON array or object is sent as one", rc == 0 && strstr(out, "\"params\":[[{\"txid\":\"ab\",\"vout\":0}],{\"bc1qx\":0.1}]") != NULL);
+    snprintf(cmd, sizeof cmd, "BMC_CLI_DRYRUN=1 %s -rpcport=1 -rpcuser=u -rpcpassword=p getblock 00aa 2 2>&1", BCLI);
+    rc = run_sh(cmd, out, sizeof out);
+    ck("a hash stays a string and a verbosity stays a number", rc == 0 && strstr(out, "\"params\":[\"00aa\",2]") != NULL);
+    snprintf(cmd, sizeof cmd, "BMC_CLI_DRYRUN=1 %s -rpcport=1 -rpcuser=u -rpcpassword=p setlabel bc1qx '[not json' false null 2>&1", BCLI);
+    rc = run_sh(cmd, out, sizeof out);
+    ck("false and null convert; a bracket that is not JSON stays a string", rc == 0 && strstr(out, "\"params\":[\"bc1qx\",\"[not json\",false,null]") != NULL);
     printf("%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL PASS", fails);
     return fails ? 1 : 0;
 }

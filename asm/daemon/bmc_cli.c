@@ -119,9 +119,25 @@ int main(int argc, char** argv) {
         read_stdin_line(secret, sizeof secret, 1);
         rj_arr_push(params, (rj_val*)rj_str(secret));
     }
+    /* 2026-09-08: bitcoin-cli's per-parameter conversion table turns the
+     * literal words true/false/null and JSON arrays/objects into JSON values
+     * for the parameters that take them (RPCConvertValues). Without it
+     * `getrawmempool true` reached the server as the STRING "true" and
+     * answered as the non-verbose form, and `createrawtransaction '[...]'`
+     * sent its inputs as a string. This node's CLI converts by shape rather
+     * than by table: true/false/null, and any argument that starts with [
+     * or { and parses as JSON. A label that happens to be the word "true"
+     * needs the -stdin route, as with bitcoin-cli's named-argument path. */
 #define CLI_PUSH_ARG(s) do { const char* s_ = (s); int numeric = (*s_ == '-' || (*s_ >= '0' && *s_ <= '9')); \
         if (numeric) { for (const char* p = s_ + (s_[0] == '-'); *p; p++) if (*p < '0' || *p > '9') { numeric = 0; break; } } \
-        rj_arr_push(params, numeric ? (rj_val*)rj_numf("%s", s_) : (rj_val*)rj_str(s_)); } while (0)
+        rj_val* jv_ = NULL; \
+        if (!numeric && (*s_ == '[' || *s_ == '{')) jv_ = rj_parse(s_, strlen(s_)); \
+        if (numeric) rj_arr_push(params, (rj_val*)rj_numf("%s", s_)); \
+        else if (jv_) rj_arr_push(params, jv_); \
+        else if (!strcmp(s_, "true")) rj_arr_push(params, (rj_val*)rj_bool(1)); \
+        else if (!strcmp(s_, "false")) rj_arr_push(params, (rj_val*)rj_bool(0)); \
+        else if (!strcmp(s_, "null")) rj_arr_push(params, (rj_val*)rj_null()); \
+        else rj_arr_push(params, (rj_val*)rj_str(s_)); } while (0)
     for (int i = argi + 1; i < argc; i++) CLI_PUSH_ARG(argv[i]);
     if (g_stdin) {                           /* Core: extra params, one per line, until EOF */
         char line[4096];
@@ -137,10 +153,16 @@ int main(int argc, char** argv) {
         fwrite(body, 1, (size_t)bodylen, stdout); putchar('\n'); return 0;
     }
 
-    char resp[65536];
+    /* 2026-09-08: a fixed 64 KB reply buffer made every reply past it
+     * "malformed" -- a 930 KB `getblock <hash> 2` among them, while the server
+     * had answered correctly. bitcoin-cli has no such cap; 64 MB covers a
+     * verbosity-3 block with every prevout. */
+    static const long RESP_CAP = 64L << 20;
+    char* resp = malloc((size_t)RESP_CAP + 1);
+    if (!resp) { fprintf(stderr, "error: out of memory for the reply buffer\n"); return 1; }
     char errmsg[256];
     long blen = rpc_http_post(g_rpcport, g_rpcuser, g_rpcpass, body, bodylen,
-                              resp, sizeof resp, errmsg, sizeof errmsg);
+                              resp, RESP_CAP, errmsg, sizeof errmsg);
     if (blen < 0) {
         fprintf(stderr, "error: %s\n", errmsg);
         return 1;
@@ -165,9 +187,14 @@ int main(int argc, char** argv) {
     } else if (r.result && r.result->typ == RJ_NULL) {
         /* null result -> bitcoin-cli prints nothing */
     } else if (r.result) {
-        char out[65536];
-        long n = rj_write(out, sizeof out, r.result, 2); /* Core write(2) */
+        /* the rendered result gets the same 64 MB as the reply: a 64 KB
+         * stack buffer printed NOTHING for a large block (rj_write returned
+         * -1 and the CLI exited 0 with empty output) */
+        char* out = malloc((size_t)RESP_CAP + 1);
+        long n = out ? rj_write(out, (size_t)RESP_CAP, r.result, 2) : -1; /* Core write(2) */
         if (n >= 0) printf("%s\n", out);
+        else fprintf(stderr, "error: result too large to render\n");
+        free(out);
     }
     rpc_reply_free(&r);
     return 0;
