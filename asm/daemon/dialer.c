@@ -131,6 +131,7 @@ int dialer_connect_name(const char* host, int port, int timeout_ms, const char**
     if (!g_ready) dialer_init();
     if (!g_proxy_ip[0]){ *why = "no proxy configured for name resolution"; return -1; }
     int rep = 0;
+    dial_gate_wait();
     int fd = socks5_connect(g_proxy_ip, g_proxy_port, host, port, NULL, NULL, timeout_ms, &rep);
     if (fd < 0){ snprintf(err, sizeof err, "socks5(name) rc=%d rep=%d", fd, rep); *why = err; }
     return fd;
@@ -185,6 +186,7 @@ int dialer_connect(const bmc_addr_t* a, int timeout_ms, const char** why){
              * cannot isolate, so fail the dial rather than share a circuit */
             *why = "cannot read /dev/urandom for stream isolation"; return -1; }
         int rep = 0;
+        dial_gate_wait();
         int fd = socks5_connect(g_onion_ip, g_onion_port, host, a->port ? a->port : 8333,
                                 g_cfg.proxyrandomize ? u : NULL, g_cfg.proxyrandomize ? p : NULL,
                                 timeout_ms, &rep);
@@ -192,6 +194,7 @@ int dialer_connect(const bmc_addr_t* a, int timeout_ms, const char** why){
         return fd; }
     case BMC_NET_I2P: {
         if (!g_i2p_ok){ *why = "no i2p session (-i2psam)"; return -1; }
+        dial_gate_wait();
         int fd = i2psam_connect(&g_i2p, g_sam_ip, g_sam_port, host, timeout_ms, err, sizeof err);
         if (fd < 0) *why = err;
         return fd; }
@@ -202,12 +205,14 @@ int dialer_connect(const bmc_addr_t* a, int timeout_ms, const char** why){
             char u[40], p[40]; int have = dialer_isolation_creds(u, sizeof u, p, sizeof p);
             if (!have){ *why = "cannot read /dev/urandom for stream isolation"; return -1; }
             int rep = 0;
+            dial_gate_wait();
             int fd = socks5_connect(g_proxy_ip, g_proxy_port, host, a->port,
                                     g_cfg.proxyrandomize ? u : NULL, g_cfg.proxyrandomize ? p : NULL, timeout_ms, &rep);
             if (fd < 0){ snprintf(err, sizeof err, "socks5 rc=%d rep=%d", fd, rep); *why = err; }
             return fd;
         }
         unsigned ip; memcpy(&ip, a->addr, 4);
+        dial_gate_wait();
         int fd = tcp_connect_ip(ip, htons(a->port));
         if (fd < 0) *why = "connect failed";
         return fd; }
@@ -218,6 +223,7 @@ int dialer_connect(const bmc_addr_t* a, int timeout_ms, const char** why){
          * have IPv6/CJDNS quietly go direct. */
         if (g_proxy_ip[0]){
             int rep2 = 0;
+            dial_gate_wait();
             int pfd = socks5_connect(g_proxy_ip, g_proxy_port, host, a->port, NULL, NULL, timeout_ms, &rep2);
             if (pfd < 0){ snprintf(err, sizeof err, "socks5 rc=%d rep=%d", pfd, rep2); *why = err; }
             return pfd;
@@ -268,6 +274,7 @@ int dialer_connect_private(const bmc_addr_t* a, int timeout_ms, const char** why
         char u[40], p[40];
         if (!dialer_isolation_creds(u, sizeof u, p, sizeof p)){ *why = "cannot read /dev/urandom for stream isolation"; return -1; }
         int rep = 0;
+        dial_gate_wait();
         int fd = socks5_connect(g_proxy_ip, g_proxy_port, host, a->port ? a->port : 8333, u, p, timeout_ms, &rep);
         if (fd < 0){ snprintf(err, sizeof err, "socks5 rc=%d rep=%d", fd, rep); *why = err; }
         return fd; }
@@ -278,6 +285,7 @@ int dialer_connect_private(const bmc_addr_t* a, int timeout_ms, const char** why
         static i2psam_t tmp;
         if (!i2psam_session(&tmp, g_sam_ip, g_sam_port, "/nonexistent/private-broadcast-transient", timeout_ms)){
             snprintf(err, sizeof err, "transient i2p session: %.120s", tmp.err); *why = err; return -1; }
+        dial_gate_wait();
         int fd = i2psam_connect(&tmp, g_sam_ip, g_sam_port, host, timeout_ms, err, sizeof err);
         if (fd < 0) *why = err;
         return fd; }

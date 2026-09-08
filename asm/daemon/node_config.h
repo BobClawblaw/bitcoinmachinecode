@@ -138,6 +138,8 @@ typedef struct {
                                       * below: hashblock, hashtx, rawblock, rawtx,
                                       * sequence. Core default 1000.                      */
     int  par;                    /* Core -par: worker threads, 0 = auto      */
+    int dial_rate_limit;   /* bmc.dialratelimit: max outbound connection ATTEMPTS per second, node-wide (0 = off) */
+    int download_rate_limit_kbps; /* bmc.downloadratelimit: max block+header download, KB/s, node-wide (0 = off) */
     int catchup_workers;   /* bmc.catchupworkers: parallel download chunk workers (NOT -par) */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
@@ -341,3 +343,27 @@ void node_config_get_proxy_info(const char** proxy, const char** onion_proxy,
                                 const char** i2psam, int* proxyrandomize);
 
 #endif
+
+/* ---- outbound dial pacer (bmc.dialratelimit, 2026-09-07) ---------------
+ * One clock shared by every process of the node (parent, serve worker,
+ * download workers, probes, crawlers) through an 8-byte file in the datadir:
+ * each remote outbound connection attempt reserves the next slot on it and
+ * sleeps until that slot. N per second means one attempt every 1000/N ms,
+ * node-wide, no bursts. 0 = off. Core has no such key: it opens outbound
+ * connections one at a time from one thread; this node has sixteen download
+ * workers and forked probes that can each dial at once. */
+void dial_gate_configure(int per_second);                       /* after node_config_load; 0 = off */
+void dial_gate_wait(void);                                      /* call before every REMOTE connect() */
+long dial_gate_reserve(volatile long long* next_ms, long long now_ms, long interval_ms);   /* pure: the wait for one reservation */
+/* ---- download pacer (bmc.downloadratelimit, KB/s) ----------------------
+ * Same shared clock file, second cell. Every block the parallel download
+ * receives and every header page the boot fetch receives is charged to it:
+ * the bytes were already on the wire, so the charge is a debt the NEXT read
+ * waits out. Core has no download cap (only -maxuploadtarget); this is the
+ * operator's ceiling on what a sync may pull. The ranking probes are exempt
+ * (pacing them would corrupt the ranking) and so are the keep-up legs at the
+ * tip, which move a block every ten minutes. */
+void dl_gate_configure(int kbytes_per_second);                  /* after node_config_load; 0 = off */
+void dl_gate_account(long bytes);                               /* charge bytes just received; sleeps out the debt */
+long dl_gate_reserve(volatile long long* next_ms, long long now_ms, long bytes, long bytes_per_sec);   /* pure: the wait */
+

@@ -2200,7 +2200,7 @@ static int outbound_connect_raw(const char* host, int rcv_ms, int out_port){
             pa.net = BMC_NET_IPV4; pa.len = 4; memcpy(pa.addr, &ip, 4);
             pa.port = (unsigned short)out_port;
             fd = dialer_connect(&pa, g_cfg.connect_timeout_ms > 0 ? g_cfg.connect_timeout_ms : 15000, &pwhy);
-        } else fd = tcp_connect_ip(ip,(unsigned short)htons((unsigned short)out_port));
+        } else { dial_gate_wait(); fd = tcp_connect_ip(ip,(unsigned short)htons((unsigned short)out_port)); }
         if(fd < 0) break;
         { struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv); }
         if(attempt == 0 && want_v2){
@@ -3732,6 +3732,7 @@ static void dlc_fmt_eta(char* buf, size_t cap, long secs){               /* DD:H
 /* the pipeline's progress hook: every wanted block that arrives restarts the
  * stall clock, so a peer that keeps delivering is never dropped by it. */
 static void dlc_chunk_progress(void* arg){ (void)arg; alarm(DLC_CHUNK_BUDGET_SECS); }
+static void dlc_chunk_bytes(long n){ dl_gate_account(n); }   /* bmc.downloadratelimit */
 static int dlc_dead_weight(double byte_rate, long blocks_this_tick, double floor_bps){
     if (byte_rate < 0.0) return 0;                                   /* no reading yet */
     if (byte_rate < floor_bps) return 1;                             /* under the pool-relative floor */
@@ -3944,6 +3945,7 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
             else if(!strncmp(cmd, "ping", 12) && mlen == 8) p2p_write(fd, "pong", 4, msg, 8);
         }
         if(!got){ if(added) break; return -1; }
+        dl_gate_account((long)mlen);                                  /* bmc.downloadratelimit: a header page is bytes too */
         unsigned long used; unsigned long cnt = dlc_varint(msg, mlen, &used);
         if(!used || cnt > DLC_HDR_PAGE || used + cnt * 81 > mlen) break;   /* malformed: stop here */
         if(cnt == 0) break;
@@ -4058,6 +4060,7 @@ static long dlc_headers_try(const char* cand, void* hst, unsigned char loc[32],
     /* already known to lack NODE_WITNESS this run: do not spend a socket and a
      * handshake to be told again (2026-09-06). */
     if(peer_known_no_witness(cand)){ *why = DLC_HT_WITNESS; return -1; }
+    dial_gate_wait();
     int fd=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)(cport ? cport : g_chainp->default_port)));
     if(fd<0){ *why = DLC_HT_CONNECT; return -1; }
     struct timeval tv; tv.tv_sec=15; tv.tv_usec=0; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
@@ -4312,6 +4315,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                     { int cpc = cp2 ? cp2 : node_config_peer_port(cand); if(!cpc) cpc = g_chainp->default_port;   /* addnode=host:port keeps its port here too */
                       cp2 = cpc; }
                     if(peer_known_no_witness(cand)){ if(ema[idx]<=0.0) ema[idx]=1.0; claimed[idx]=0; slot=(idx+1)%nlive; continue; }   /* no witness bit: skip before the socket; and no longer "untried" to the picker */
+                    dial_gate_wait();
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)cp2));
                     if(fdc<0){ if(ema[idx]<=0.0) ema[idx]=1.0; claimed[idx]=0; continue; }   /* tried, unreachable: the picker must not offer it as untried again */
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
@@ -4374,6 +4378,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             sigaction(SIGALRM,&sa,&old);   /* SIGUSR1 already registered for this worker's whole life, above */
             mux_sync_budget_fired=0; mux_sync_budget_sig=0;
             ibd_pipeline_set_progress(dlc_chunk_progress, 0);   /* each arriving block re-arms this */
+            ibd_pipeline_set_bytes(dlc_chunk_bytes);
             alarm(DLC_CHUNK_BUDGET_SECS);
             /* 2026-09-06: the whole chunk in ONE getdata, blocks placed by
              * hash as they arrive (daemon/ibd_pipeline.c). node_ibd_blocks_s
@@ -4492,6 +4497,7 @@ static int dlc_probe_round(char pool[][DL_POOL_SLOT], int from, int ntry,
         struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET;
         { int cp = pport ? pport : node_config_peer_port(pool[i]);   /* addnode=host:port / connect=host:port keep their port */
           sa.sin_addr.s_addr=ip; sa.sin_port=(unsigned short)htons((unsigned short)(cp ? cp : g_chainp->default_port)); }
+        dial_gate_wait();
         int rc=connect(fd,(struct sockaddr*)&sa,sizeof sa);
         if(rc!=0 && errno!=EINPROGRESS){ close(fd); cfd[nc++]=-1; continue; }
         cfd[nc++]=fd;
@@ -4700,6 +4706,7 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
                 int pport = 0; unsigned ip = pool_ipv4(live[i], &pport);
                 if (!ip) _exit(0);
                 int cp = pport ? pport : node_config_peer_port(live[i]); if (!cp) cp = g_chainp->default_port;
+                dial_gate_wait();
                 int fd = tcp_connect_ip(ip, (unsigned short)htons((unsigned short)cp));
                 if (fd < 0) _exit(0);
                 struct timeval tv; tv.tv_sec = 5; tv.tv_usec = 0; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -6215,6 +6222,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             struct sockaddr_in sa; memset(&sa,0,sizeof sa); sa.sin_family=AF_INET;
             sa.sin_addr.s_addr=ip;
             sa.sin_port=(unsigned short)htons((unsigned short)(spport ? spport : out_port));
+            dial_gate_wait();
             int rc=connect(fd,(struct sockaddr*)&sa,sizeof sa);
             if(rc!=0 && errno!=EINPROGRESS){ close(fd); cfd[nc++]=-1; continue; }
             /* stash the original flags so we can clear O_NONBLOCK after promote */
@@ -9119,9 +9127,11 @@ int main(int argc, char** argv){
         else        catchup_workers = g_cfg.catchup_workers;   /* bmc.catchupworkers, default 16 */
         if(catchup_workers<1) catchup_workers=1;
         if(catchup_workers>64) catchup_workers=64;
-        fprintf(stderr,"[boot] config: datadir=%s port=%d (%s) listen=%d nwant=%d catchup_workers=%d (%s)\n",
+        dial_gate_configure(g_cfg.dial_rate_limit); dl_gate_configure(g_cfg.download_rate_limit_kbps);
+        fprintf(stderr,"[boot] config: datadir=%s port=%d (%s) listen=%d nwant=%d catchup_workers=%d (%s) dialratelimit=%d/s%s downloadratelimit=%dKB/s%s\n",
                 dir, port, (argc>=4)?"cli":"bitcoin.conf", g_cfg.listen, nwant,
-                catchup_workers, (argc>=6)?"cli":"par");
+                catchup_workers, (argc>=6)?"cli":"bmc.catchupworkers", g_cfg.dial_rate_limit, g_cfg.dial_rate_limit ? "" : " (off)",
+                g_cfg.download_rate_limit_kbps, g_cfg.download_rate_limit_kbps ? "" : " (off)");
         phase_timer_t boot_pt; phase_start(&boot_pt);
         fprintf(stderr,"[boot] loading chain archive from disk...\n");
         phase_timer_t load_pt; phase_start(&load_pt);

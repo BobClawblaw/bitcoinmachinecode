@@ -15,6 +15,7 @@
 #include "log_ts.h"
 #include <stdlib.h>
 #include <string.h>
+#include "node_config.h"
 #include <stdint.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -114,6 +115,7 @@ static int handshake_getaddr(const char* host){
         if(getaddrinfo(buf,NULL,&h,&res)!=0) return -1;
         ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr; freeaddrinfo(res);
     }
+    dial_gate_wait();
     int fd=tcp_connect_ip(ip,PB); if(fd<0) return -1;
     setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
     unsigned char v[102]; int o=0;

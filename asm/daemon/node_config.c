@@ -17,6 +17,9 @@
 #include <unistd.h>
 #include "node_config.h"
 #include "netperm.h"
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <time.h>
 
 /* STATICALLY initialised to the compiled defaults.
  *
@@ -55,6 +58,8 @@ node_config_t g_cfg = {
     .blocksonly            = 0,
     .bind_addr             = "",     /* empty == INADDR_ANY */
     .par                   = 0,      /* Core -par default: auto              */
+    .dial_rate_limit       = 0,      /* bmc.dialratelimit: off unless set */
+    .download_rate_limit_kbps = 0,   /* bmc.downloadratelimit: off unless set */
     .catchup_workers       = 16,     /* bmc.catchupworkers: parallel download chunk workers */
     .maxrecvbuffer_kb      = 5000,   /* Core -maxreceivebuffer default       */
     .maxmempool_mb         = 300,    /* Core -maxmempool default (MB)        */
@@ -348,6 +353,8 @@ static void set_defaults(void){
     g_cfg.bind_addr[0]          = 0;
     g_cfg.par                   = 0;
     g_cfg.catchup_workers       = 16;
+    g_cfg.dial_rate_limit       = 0;
+    g_cfg.download_rate_limit_kbps = 0;
     g_cfg.maxrecvbuffer_kb      = 5000;
     g_cfg.maxmempool_mb         = 300;
     g_cfg.mempoolexpiry_h       = 336;
@@ -701,6 +708,17 @@ long node_config_load(const char* path){
                        if(bp>0 && bp<65536){ g_cfg.port = bp; } }
             snprintf(g_cfg.bind_addr,sizeof g_cfg.bind_addr,"%s",tmp);
             applied++; }
+        else if(!strcmp(key,"bmc.dialratelimit")){
+            /* outbound connection attempts per second, node-wide (2026-09-07).
+             * 0 = off. Run 14 hammered one peer at 12 reconnects a second; the
+             * fail-backoff ended that, and this is the operator's ceiling on
+             * the node as a whole, probes and crawlers included. */
+            t=clamp_int(iv,0,10000,key,&bad); if(t!=-1){ g_cfg.dial_rate_limit=t; applied++; } }
+        else if(!strcmp(key,"bmc.downloadratelimit")){
+            /* KB/s the sync may pull, node-wide (2026-09-07). 0 = off. Charged
+             * per block in the parallel download and per page in the header
+             * fetch; probes and the keep-up legs are exempt. */
+            t=clamp_int(iv,0,10000000,key,&bad); if(t!=-1){ g_cfg.download_rate_limit_kbps=t; applied++; } }
         else if(!strcmp(key,"bmc.catchupworkers")){
             /* the PARALLEL DOWNLOAD chunk-worker ceiling. Not -par: that is
              * Core's script-verification thread count and means exactly that
@@ -1291,3 +1309,48 @@ void node_config_get_proxy_info(const char** proxy, const char** onion_proxy,
     *proxy = g_cfg.proxy; *onion_proxy = g_cfg.onion_proxy;
     *i2psam = g_cfg.i2psam; *proxyrandomize = g_cfg.proxyrandomize;
 }
+
+/* ---- outbound dial pacer (bmc.dialratelimit) -------------------------- */
+static long g_dial_interval_ms = 0;                 /* 0 = off */
+static long g_dl_bytes_per_sec = 0;                 /* 0 = off */
+static volatile long long* g_dial_next = 0;         /* the shared clock file: [0] dial, [1] download; 0 until mapped */
+static long long dial_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000; }
+void dial_gate_configure(int per_second){ g_dial_interval_ms = per_second > 0 ? (1000L + per_second - 1) / per_second : 0; }
+long dial_gate_reserve(volatile long long* next_ms, long long now_ms, long interval_ms){
+    for(;;){
+        long long cur = *next_ms;
+        long long base = cur > now_ms ? cur : now_ms;          /* an idle clock never owes the past */
+        if(__sync_bool_compare_and_swap(next_ms, cur, base + interval_ms)) return (long)(base - now_ms);
+    }
+}
+static int dial_gate_map(void){
+    if(g_dial_next) return 1;
+    int fd = open("dial_gate.dat", O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
+    if(fd < 0) return 0;                                        /* no datadir here (a tool, a test): no pacing */
+    if(ftruncate(fd, 16) != 0){ close(fd); return 0; }
+    void* p = mmap(0, 16, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if(p == MAP_FAILED) return 0;
+    g_dial_next = (volatile long long*)p;
+    return 1;
+}
+static void gate_sleep(long wait){ if(wait > 0){ struct timespec ts = { wait/1000, (wait%1000)*1000000L }; nanosleep(&ts, 0); } }
+void dial_gate_wait(void){
+    if(g_dial_interval_ms <= 0 || !dial_gate_map()) return;
+    gate_sleep(dial_gate_reserve(g_dial_next, dial_now_ms(), g_dial_interval_ms));
+}
+void dl_gate_configure(int kbytes_per_second){ g_dl_bytes_per_sec = kbytes_per_second > 0 ? (long)kbytes_per_second * 1024L : 0; }
+long dl_gate_reserve(volatile long long* next_ms, long long now_ms, long bytes, long bytes_per_sec){
+    if(bytes_per_sec <= 0 || bytes <= 0) return 0;
+    long long cost = ((long long)bytes * 1000LL + bytes_per_sec - 1) / bytes_per_sec;   /* ms these bytes are worth, rounded up */
+    for(;;){
+        long long cur = *next_ms;
+        long long base = cur > now_ms ? cur : now_ms;          /* an idle clock never owes the past */
+        if(__sync_bool_compare_and_swap(next_ms, cur, base + cost)) return (long)(base - now_ms);
+    }
+}
+void dl_gate_account(long bytes){
+    if(g_dl_bytes_per_sec <= 0 || !dial_gate_map()) return;
+    gate_sleep(dl_gate_reserve(g_dial_next + 1, dial_now_ms(), bytes, g_dl_bytes_per_sec));
+}
+

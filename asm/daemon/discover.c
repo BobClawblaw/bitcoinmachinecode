@@ -12,6 +12,7 @@
 #include "log_ts.h"
 #include <stdlib.h>
 #include <string.h>
+#include "node_config.h"
 #include <stdint.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -44,6 +45,7 @@ static int connect_handshake(const char* host, int verbose){
     ip=((struct sockaddr_in*)res->ai_addr)->sin_addr.s_addr;
     freeaddrinfo(res);
 gotip:
+    dial_gate_wait();
     int fd=tcp_connect_ip(ip,PB); if(fd<0) return -1;
     struct timeval tv; tv.tv_sec=4; tv.tv_usec=0;
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
