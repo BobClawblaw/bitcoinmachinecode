@@ -55,6 +55,8 @@ typedef struct {
     volatile long long        last_block_time;/* unix secs: last novel block from this peer */
     volatile long long        min_ping_us;    /* 0 = unmeasured */
     volatile int              evict_requested;/* set by the accept path; the child exits on its next tick */
+    volatile long             inflight_lo, inflight_hi;   /* download worker: the chunk in flight (hi < lo = none) */
+    volatile int              dl_worker;      /* download worker index, -1 for a leg or inbound peer */
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
@@ -370,6 +372,15 @@ typedef struct {
         volatile unsigned int       slen;           /* full script length (head) / chunk length (cont) */
         unsigned char               body[RPC_CSI_BODY];
     } csi_ring[RPC_CSI_RING];
+    /* 2026-09-08: the parallel download's peers. Core's getpeerinfo during
+     * IBD is where an operator watches the sync -- which peers serve blocks,
+     * what is in flight, bytes per peer -- and this node's sixteen download
+     * workers are forked processes whose sockets the RPC server never saw.
+     * The catch-up parent publishes them here every tick; getpeerinfo
+     * appends them, getnettotals counts their bytes. */
+    volatile int              n_dlpeers;
+    volatile long long        dl_bytes_total;       /* every byte the download has received this run */
+    rpc_peer_t                dlpeers[64];
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 

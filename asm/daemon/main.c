@@ -2479,6 +2479,25 @@ static void rpc_fill_peer_slot(int slot, const char* host){
       } }
     rpc_fill_peer_slot_ex(slot, host, 0);
 }
+/* parse the captured `version` message into a peer record's proto, services,
+ * subver and start_height -- shared by the legs and, since 2026-09-08, the
+ * download workers (getpeerinfo) */
+static void rpc_peer_from_version(rpc_peer_t* pr, const unsigned char* p, long len){
+    if (len < 80) return;
+    pr->proto = (unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24);
+    unsigned long long services; memcpy(&services, p+4, 8); pr->services = services;
+    long off = 80; unsigned long long ualen = 0; int ok = 1;
+    if (p[off] < 0xfd) { ualen = p[off]; off += 1; }
+    else if (p[off]==0xfd){ if(off+3<=len){ ualen=(unsigned)p[off+1]|((unsigned)p[off+2]<<8); off+=3; } else ok=0; }
+    else if (p[off]==0xfe){ if(off+5<=len){ memcpy(&ualen,p+off+1,4); off+=5; } else ok=0; }
+    else { if(off+9<=len){ memcpy(&ualen,p+off+1,8); off+=9; } else ok=0; }
+    if (ok && ualen <= 90 && off+(long)ualen+4 <= len){
+        memcpy(pr->subver, p+off, (size_t)ualen); pr->subver[ualen] = 0;
+        for (unsigned long long k=0;k<ualen;k++) if(pr->subver[k]<0x20||pr->subver[k]>0x7e) pr->subver[k]='.';
+        off += (long)ualen;
+        unsigned height; memcpy(&height, p+off, 4); pr->start_height = (int)height;
+    }
+}
 static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claimed){
     if (!g_node_status || slot < 0 || slot >= RPC_MAX_PEERS) return;
     rpc_peer_t* pr = &g_node_status->peers[slot];
@@ -2490,21 +2509,8 @@ static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claime
     pr->conn_time = (long long)time(NULL);
     long len = g_peer_version_len;
     const unsigned char* p = g_peer_version_payload;
-    if (len >= 80){
-        pr->proto = (unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24);
-        unsigned long long services; memcpy(&services, p+4, 8); pr->services = services;
-        long off = 80; unsigned long long ualen = 0; int ok = 1;
-        if (p[off] < 0xfd) { ualen = p[off]; off += 1; }
-        else if (p[off]==0xfd){ if(off+3<=len){ ualen=(unsigned)p[off+1]|((unsigned)p[off+2]<<8); off+=3; } else ok=0; }
-        else if (p[off]==0xfe){ if(off+5<=len){ memcpy(&ualen,p+off+1,4); off+=5; } else ok=0; }
-        else { if(off+9<=len){ memcpy(&ualen,p+off+1,8); off+=9; } else ok=0; }
-        if (ok && ualen <= 90 && off+(long)ualen+4 <= len){
-            memcpy(pr->subver, p+off, (size_t)ualen); pr->subver[ualen] = 0;
-            for (unsigned long long k=0;k<ualen;k++) if(pr->subver[k]<0x20||pr->subver[k]>0x7e) pr->subver[k]='.';
-            off += (long)ualen;
-            unsigned height; memcpy(&height, p+off, 4); pr->start_height = (int)height;
-        }
-    }
+    pr->dl_worker = -1; pr->inflight_lo = 1; pr->inflight_hi = 0;
+    rpc_peer_from_version(pr, p, len);
     { extern int rp_version_frelay(const unsigned char*, long);
       pr->relaytxes = rp_version_frelay(p, len) != 0; }   /* Core relaytxes: the peer's fRelay */
     /* RPC-3: a fresh, never-reused id for this connection. Assigned before
@@ -4184,7 +4190,10 @@ static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
  * zero-inits it to 0.0, read as "no reading yet" if a drop somehow happens
  * before the parent's first 10s tick. */
 typedef struct { char peer[64]; long chunks; long blocks; long guard; double last_bw_bps; long timeouts; long held_idx;
-                 double pool_median_bps;   /* written by the parent each tick: the pool's median rate, read by the worker for boundary rotation */ } dlc_stat_t;
+                 double pool_median_bps;   /* written by the parent each tick: the pool's median rate, read by the worker for boundary rotation */
+                 /* 2026-09-08, for getpeerinfo: the handshake's facts (worker), the chunk in flight (worker), bytes on this peer (parent) */
+                 unsigned proto; unsigned long long services; char subver[96]; int start_height; long long conn_time;
+                 long cur_lo, cur_hi; long long bytes_peer; } dlc_stat_t;
 static long long dlc_now_ms(void); static long dlc_proc_rchar(pid_t pid);   /* fwd decls: the worker judges its own chunk before these are defined */
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
 static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
@@ -4279,6 +4288,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
         if(lo>end_h){ if(fd>=0) close(fd); DLC_RELEASE(); break; }
         long hi=lo+DLC_CHUNK_BLOCKS-1; if(hi>end_h) hi=end_h;
         if(dlc_chunk_all_present(lo,hi)) continue;
+        mystat->cur_lo=lo; mystat->cur_hi=hi;                          /* getpeerinfo's inflight */
 
         unlink(hp_);                       /* DMN-8: stale file from a crashed run */
         int hfd=open(hp_,O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
@@ -4333,6 +4343,9 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                         fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
                         mystat->held_idx=idx;   /* so the parent can ban THIS peer on early-kill */
                         strncpy((char*)mystat->peer,cand,63);
+                        { rpc_peer_t v; memset(&v,0,sizeof v); rpc_peer_from_version(&v, g_peer_version_payload, g_peer_version_len);   /* for getpeerinfo */
+                          mystat->proto=v.proto; mystat->services=v.services; mystat->start_height=v.start_height;
+                          memcpy((char*)mystat->subver, v.subver, sizeof mystat->subver); mystat->conn_time=(long long)time(NULL); mystat->bytes_peer=0; }
                         /* fresh peer -- the displayed chunks/blocks/guard
                          * must reflect THIS connection, not accumulate
                          * across every peer this worker slot has ever
@@ -5120,6 +5133,23 @@ static long dl_catchup(const char* dir, int min_workers){
           if(nv > 0) median_bps = v[nv/2]; }
         double floor_bps = dlc_effective_floor(median_bps);
         for(int w=0;w<nw;w++) stats[w].pool_median_bps = median_bps;   /* published for the workers' boundary rotation */
+        /* publish the workers' peers for getpeerinfo / getnettotals (2026-09-08) */
+        if(g_node_status){
+            int nd = nw > 64 ? 64 : nw;
+            for(int w=0; w<nd; w++){
+                rpc_peer_t* d = &g_node_status->dlpeers[w];
+                if(kids[w]==0 || !stats[w].peer[0]){ d->used = 0; continue; }
+                strncpy(d->addr, (const char*)stats[w].peer, sizeof d->addr - 1); d->addr[sizeof d->addr - 1] = 0;
+                d->proto = stats[w].proto; d->services = stats[w].services; d->start_height = stats[w].start_height;
+                memcpy(d->subver, (const char*)stats[w].subver, sizeof d->subver); d->subver[sizeof d->subver - 1] = 0;
+                d->conn_time = stats[w].conn_time; d->bytes_recv = stats[w].bytes_peer; d->bytes_sent = 0;
+                d->last_recv = d->last_send = (long long)time(NULL);
+                d->inflight_lo = stats[w].cur_lo; d->inflight_hi = stats[w].cur_hi; d->dl_worker = w; d->inbound = 0;
+                d->used = 1;
+            }
+            g_node_status->n_dlpeers = nd;
+            g_node_status->dl_bytes_total = (long long)cumulative_bytes;
+        }
         for(int w=0;w<nw;w++){
             long b=stats[w].blocks; long blkrate=(long)((double)(b-prev_blocks[w])/tick_s);
             long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
@@ -5132,6 +5162,7 @@ static long dl_catchup(const char* dir, int min_workers){
                     byte_rate=delta/tick_s;
                     dlc_fmt_rate(bw,sizeof bw,byte_rate);
                     stats[w].last_bw_bps=byte_rate; /* worker reads this to report why it got dropped */
+                    stats[w].bytes_peer += (long long)delta;   /* the worker zeroes it when it changes peer */
                     /* EMA speed for the peer this worker HOLDS (alpha 0.5,
                      * half-life ~20s). held_idx is the same index the ban
                      * path uses; -1 means the worker never connected, and a
@@ -5243,6 +5274,7 @@ static long dl_catchup(const char* dir, int min_workers){
         }
     }
     g_dlc_kids = NULL; g_dlc_nw = 0;            /* the reject hook's stop is a no-op again */
+    if(g_node_status){ g_node_status->n_dlpeers = 0; }   /* the download is over: its peers leave getpeerinfo (the byte total stays) */
     /* One more pass now that every helper has exited: the blocks that landed
      * between the last connect pass and the last reap (up to a chunk per
      * helper) are connected here, budget-bounded like any pass, so the lag
