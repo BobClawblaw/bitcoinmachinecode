@@ -87,6 +87,7 @@ also annotated tags.
 | [`releases/2026-09-08-in-order-committer.md`](releases/2026-09-08-in-order-committer.md) | workers stage verified chunks; one committer appends the archive in height order, so the block files are laid out monotonically and the archive never has a hole |
 | [`releases/2026-09-08-committer-sync-per-chunk.md`](releases/2026-09-08-committer-sync-per-chunk.md) | the committer fdatasyncs once per chunk: the early chain went from the SSD's commit rate to the link's 11 MB/s |
 | [`releases/2026-09-08-undo-keep-all.md`](releases/2026-09-08-undo-keep-all.md) | undo data for every block in packed rev files, like Core; the 200-block window is gone |
+| [`releases/2026-09-08-esplora-facade.md`](releases/2026-09-08-esplora-facade.md) | an Esplora-compatible listener for mempool.space, answered in process by the node's own RPC handlers (stage 1: blocks, transactions, mempool, outspends) |
 
 ## Development history
 

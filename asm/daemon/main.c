@@ -8182,6 +8182,14 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
         fprintf(stderr, "[rpc] server start failed: %s\n", err);
         return;
     }
+    /* 2026-09-08: the Esplora facade (mempool.space's BACKEND esplora) */
+    if (g_cfg.esplora_port > 0){
+        extern int rpc_esplora_start(const char*, int, char*, size_t);
+        char eerr[256] = "";
+        if (rpc_esplora_start(g_cfg.esplora_bind, g_cfg.esplora_port, eerr, sizeof eerr) == 0)
+            fprintf(stderr, "[rpc] Esplora facade on %s:%d (bmc.esploraport; no auth: keep it on loopback or behind a proxy)\n", g_cfg.esplora_bind, g_cfg.esplora_port);
+        else fprintf(stderr, "[rpc] Esplora facade NOT started: %s\n", eerr);
+    }
     fprintf(stderr, "[rpc] JSON-RPC server on %s:%d (live-node + chain, user=%s)\n",
             bindaddr[0] ? bindaddr : "127.0.0.1", actual, user);
     /* -rpccookiefile, else <datadir>/.cookie -- Core's default auth method.

@@ -140,6 +140,8 @@ typedef struct {
     int  par;                    /* Core -par: worker threads, 0 = auto      */
     int dial_rate_limit;   /* bmc.dialratelimit: max outbound connection ATTEMPTS per second, node-wide (0 = off) */
     int download_rate_limit_kbps; /* bmc.downloadratelimit: max block+header download, KB/s, node-wide (0 = off) */
+    int  esplora_port;            /* bmc.esploraport: the Esplora facade listener (0 = off) */
+    char esplora_bind[64];        /* bmc.esplorabind: its address (default 127.0.0.1) */
     int upload_rate_limit_kbps;   /* bmc.uploadratelimit: max bytes SENT to peers, KB/s, node-wide (0 = off) */
     int catchup_workers;   /* bmc.catchupworkers: parallel download chunk workers (NOT -par) */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
