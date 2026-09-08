@@ -5097,13 +5097,17 @@ static long dl_catchup(const char* dir, int min_workers){
             fprintf(stderr,"[dlc] == elapsed %s | eta %s | overall: %ld/%ld stored (%.2f%% of real tip) | in flight %ld of window %ld through %ld (%s, %.2f%% landed)%s ==\n",
                     elapsed, etabuf, present, end_h+1, overall_pct, holes, DLC_DOWNLOAD_WINDOW, cur_tip, gapbuf, span_pct, connbuf);
         }
+        /* 2026-09-08: the tick's seven dashed lines became ONE, printed at the
+         * end of the tick when every number exists (recv, write, floor,
+         * median, bans, events); run 16 wrote 17,000 of those lines in
+         * eight hours. The peer table prints every 30th tick (5 min). */
+        long d_ro=0, d_wa=0, d_he=0, d_fa=0, d_ab=0, t_ro=0, t_wa=0, t_he=0, t_fa=0, t_ab=0;
         { static long tick_no = 0; tick_no++;
-          long ro=next_claim[DLC_CTL_N_ROTATE], wa=next_claim[DLC_CTL_N_WAIT], he=next_claim[DLC_CTL_N_HELP], fa=next_claim[DLC_CTL_N_FAIL], ab=next_claim[DLC_CTL_N_ABANDON];
+          t_ro=next_claim[DLC_CTL_N_ROTATE]; t_wa=next_claim[DLC_CTL_N_WAIT]; t_he=next_claim[DLC_CTL_N_HELP]; t_fa=next_claim[DLC_CTL_N_FAIL]; t_ab=next_claim[DLC_CTL_N_ABANDON];
           static long p_ro=0, p_wa=0, p_he=0, p_fa=0, p_ab=0;
-          fprintf(stderr,"[dlc] -- this tick: %ld rotation(s), %ld window wait(s), %ld help(s), %ld failed attempt(s), %ld abandon(s) | run: %ld/%ld/%ld/%ld/%ld --\n",
-                  ro-p_ro, wa-p_wa, he-p_he, fa-p_fa, ab-p_ab, ro, wa, he, fa, ab);
-          p_ro=ro; p_wa=wa; p_he=he; p_fa=fa; p_ab=ab;
-          dlc_table_this_tick = (tick_no % 6 == 1);    /* the 16-line peer table once a minute; the rates still feed every tick */
+          d_ro=t_ro-p_ro; d_wa=t_wa-p_wa; d_he=t_he-p_he; d_fa=t_fa-p_fa; d_ab=t_ab-p_ab;
+          p_ro=t_ro; p_wa=t_wa; p_he=t_he; p_fa=t_fa; p_ab=t_ab;
+          dlc_table_this_tick = (tick_no % 30 == 1);
         }
         if(dlc_table_this_tick) fprintf(stderr,"[dlc] -- peer status (%d/%d worker(s) active) --\n", alive, nw);
         double tick_total_bytes=0.0, tick_total_write_bytes=0.0;
@@ -5212,8 +5216,7 @@ static long dl_catchup(const char* dir, int min_workers){
              * sparse-block allocation, filesystem journaling, and local
              * header/index re-reads all add disk I/O the network figure
              * never sees, so disk growth normally runs ahead of it. */
-            fprintf(stderr,"[dlc] -- network recv this tick: %s (%s) | total recv: %s || disk write this tick: %s (%s) | total written: %s --\n",
-                    totbuf,aggbuf,cumbuf,wtotbuf,waggbuf,wcumbuf);
+            (void)totbuf; (void)cumbuf; (void)wtotbuf; (void)wcumbuf;   /* folded into the one dashed line below */
             /* the per-tick numbers above are a noisy 10s snapshot -- this is
              * the stable figure: total bytes / total elapsed time since
              * dl_catchup started, so it settles down over the run instead
@@ -5223,24 +5226,20 @@ static long dl_catchup(const char* dir, int min_workers){
             char avgrbuf[16], avgwbuf[16];
             dlc_fmt_rate(avgrbuf,sizeof avgrbuf,cumulative_bytes/(double)elapsed_secs);
             dlc_fmt_rate(avgwbuf,sizeof avgwbuf,cumulative_write_bytes/(double)elapsed_secs);
-            fprintf(stderr,"[dlc] -- dead-weight floor this tick: %.1f KB/s (pool median %.1f KB/s, absolute %.1f KB/s) --\n",
-                    floor_bps/1024.0, median_bps/1024.0, (double)g_cfg.dead_weight_bps/1024.0);
+            /* floor and median: on the one dashed line below */
             /* nbanned counts ban EVENTS, and the workers' amnesty path clears
              * banned[] without decrementing it -- so this used to print
              * "715 of 119", more bans than peers. Report both truthfully:
              * how many are banned RIGHT NOW (scan the shared array the workers
              * actually read) and how many ban events there have been. */
-            { long cur = 0; for(int q = 0; q < nlive; q++) if(banned[q]) cur++;
-              if(nbanned == cur)
-                  fprintf(stderr,"[dlc] -- peers banned: %ld of %d --\n", cur, nlive);
-              else
-                  fprintf(stderr,"[dlc] -- peers banned: %ld of %d now (%ld ban event(s) so far; the rest were handed back by amnesty) --\n",
-                          cur, nlive, nbanned); }
+            long cur = 0; for(int q = 0; q < nlive; q++) if(banned[q]) cur++;
             { extern int peer_no_witness_count(void); extern unsigned long long peer_no_witness_skips(void);
-              if(peer_no_witness_count())
-                  fprintf(stderr,"[dlc] -- %d peer(s) dropped for lacking NODE_WITNESS; %llu redial(s) skipped since --\n",
-                          peer_no_witness_count(), peer_no_witness_skips()); }
-    fprintf(stderr,"[dlc] -- average since start: %s recv, %s write --\n",avgrbuf,avgwbuf);
+              static int last_nowit = 0; int nw_now = peer_no_witness_count();
+              if(nw_now != last_nowit){ last_nowit = nw_now;              /* only when the count changes */
+                  fprintf(stderr,"[dlc] -- %d peer(s) dropped for lacking NODE_WITNESS; %llu redial(s) skipped since --\n", nw_now, peer_no_witness_skips()); } }
+            fprintf(stderr,"[dlc] -- recv %s/s (avg %s) | write %s/s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
+                    aggbuf, avgrbuf, waggbuf, avgwbuf, floor_bps/1024.0, median_bps/1024.0, cur, nlive,
+                    nbanned == cur ? "" : " (amnesty active)", d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
         }
     }
     g_dlc_kids = NULL; g_dlc_nw = 0;            /* the reject hook's stop is a no-op again */
@@ -5666,12 +5665,24 @@ static void dl_new_block_choke(void){
     int now_tip = (int)node_public_tip(store_buf);
     if(g_dl_last_seen_tip >= 0 && now_tip > g_dl_last_seen_tip){
         static unsigned char thb[8u<<20]; unsigned char th[32]; char hex[65];
+        /* 2026-09-08: during initial block download (Core's rule: the tip is
+         * older than maxtipage) neither this line nor the announcement below
+         * is printed -- the catch-up's status line already carries the
+         * applied height every ten seconds, and run 16 wrote 5,161 of these.
+         * At the tip, one line per block, as before. */
+        int in_ibd = 0; static int ibd_said = 0;
         if(store_read_at(store_buf, (unsigned long)now_tip, thb, (long)sizeof thb) >= 80){
-            block_hash(th, thb);
-            for(int b=0;b<32;b++) sprintf(hex+b*2, "%02x", th[31-b]);
-            fprintf(stderr,"[dl] new block: height=%d hash=%s (+%d)%s\n",
-                    now_tip, hex, now_tip-g_dl_last_seen_tip,
-                    now_tip < *(int*)(store_buf+24) ? " [connected; archive is ahead]" : "");
+            unsigned long tip_time = (unsigned long)thb[68] | ((unsigned long)thb[69]<<8) | ((unsigned long)thb[70]<<16) | ((unsigned long)thb[71]<<24);
+            in_ibd = !dl_announce_allowed(tip_time, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
+            if(in_ibd){ if(!ibd_said){ ibd_said = 1; fprintf(stderr,"[dl] per-block lines and tip announcements are off while the tip is older than maxtipage (initial block download; Core relays no blocks in IBD) -- they resume at the tip\n"); } }
+            else {
+                ibd_said = 0;
+                block_hash(th, thb);
+                for(int b=0;b<32;b++) sprintf(hex+b*2, "%02x", th[31-b]);
+                fprintf(stderr,"[dl] new block: height=%d hash=%s (+%d)%s\n",
+                        now_tip, hex, now_tip-g_dl_last_seen_tip,
+                        now_tip < *(int*)(store_buf+24) ? " [connected; archive is ahead]" : "");
+            }
         } else {
             fprintf(stderr,"[dl] new block: height=%d (+%d)\n",
                     now_tip, now_tip-g_dl_last_seen_tip);
@@ -5680,21 +5691,15 @@ static void dl_new_block_choke(void){
          * MSG_BLOCK; node_announce_tip reads the public tip itself).
          * This replaces the per-leg announce that used to fire at
          * store time in the leg sync. */
-        { unsigned long tip_time = 0; static int suppressed_said = 0;
-          if(store_read_at(store_buf, (unsigned long)now_tip, thb, 80) >= 80) tip_time = (unsigned long)thb[68] | ((unsigned long)thb[69]<<8) | ((unsigned long)thb[70]<<16) | ((unsigned long)thb[71]<<24);
-          if(tip_time && !dl_announce_allowed(tip_time, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400)){
-              if(!suppressed_said){ suppressed_said = 1;
-                  fprintf(stderr,"[dl] tip announcements to the legs are suppressed while the tip is older than maxtipage (initial block download; Core relays no blocks in IBD) -- they resume at the tip\n"); }
-          } else {
-              int announced = 0, legs = 0;
-              for(int i2=0; i2<mux_n_out; i2++){
-                  if(mux_out_fd[i2] < 0) continue;
-                  legs++;
-                  if(node_announce_tip(mux_out_fd[i2], store_buf, ht_idx, 0) == 1) announced++;
-              }
-              if(legs) fprintf(stderr,"[dl] announced tip height=%d to %d/%d legs\n", now_tip, announced, legs);
-              suppressed_said = 0;
-          } }
+        if(!in_ibd){
+            int announced = 0, legs = 0;
+            for(int i2=0; i2<mux_n_out; i2++){
+                if(mux_out_fd[i2] < 0) continue;
+                legs++;
+                if(node_announce_tip(mux_out_fd[i2], store_buf, ht_idx, 0) == 1) announced++;
+            }
+            if(legs) fprintf(stderr,"[dl] announced tip height=%d to %d/%d legs\n", now_tip, announced, legs);
+        }
         /* ZMQ hashblock/rawblock + the txid-index tail, from this
          * same choke point for the same reason the log line is: it
          * fires no matter which path appended the block.
