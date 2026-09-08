@@ -75,11 +75,32 @@ int main(void){
       fwrite(sp, AH_SPARSE_BYTES, (size_t)nsp, f); fseek(f, 0, SEEK_SET); fwrite(&hd, 1, sizeof hd, f); fclose(f);
       int all = 1; for (int k = 0; k < 700; k++){ u8 h[32]; memset(h, 0, 32); h[0] = (u8)(k / 256); h[1] = (u8)(k % 256); h[2] = 1; long c = ah_lookup(3, h, &ev); if (c != 1 || ((const ah_event*)ev)->value != (u64)k * 1000) all = 0; }
       ck("synthetic 700-key file (3 sparse entries): every key found with its own event", all);
+
       { u8 h[32]; memset(h, 0, 32); h[2] = 2; ck("a key between two present keys: 0", ah_lookup(3, h, &ev) == 0); }
       { u8 h[32]; memset(h, 0xff, 32); ck("a key above the last: 0", ah_lookup(3, h, &ev) == 0); }
       { u8 h[32]; memset(h, 0, 32); ck("a key below the first: 0", ah_lookup(3, h, &ev) == 0); }
       ck("a rebuilt file is picked up (to_height changed 2 -> 7)", ah_to_height() == 7);
       unlink(AH_FILE); }
+    /* the builder's bucket order (2026-09-08) -- last, its fixture replaces the file */
+    { FILE* f; ah_header hd; u8 zero[AH_HDR_BYTES] = {0}; u64 body; ah_sparse sp[8]; int nsp;
+      /* 2026-09-08: the file as the builder writes it -- buckets by hash[0]
+       * in order, each sorted (type, hash) inside. Mixed types: bucket 0x00
+       * holds (1, 00aa..) then (2, 00bb..); bucket 0x62 holds (1, 62..) then
+       * (2, 62..). Under a type-major comparator that sequence is unsorted
+       * and the lookup of (1, 62..) stopped at (2, 00bb..) with "not found":
+       * production's base answered nothing for any key. */
+      f = fopen(AH_FILE, "wb"); memset(&hd, 0, sizeof hd); hd.magic = AH_MAGIC; hd.version = AH_VERSION; hd.to_height = 900000; hd.body_off = AH_HDR_BYTES;
+      fwrite(zero, 1, AH_HDR_BYTES, f); body = 0; nsp = 0;
+      { u8 keys[4][33] = {{1},{2},{1},{2}}; keys[0][1] = 0x00; keys[0][2] = 0xaa; keys[1][1] = 0x00; keys[1][2] = 0xbb; keys[2][1] = 0x62; keys[2][2] = 0x01; keys[3][1] = 0x62; keys[3][2] = 0x02;
+        for (int k = 0; k < 4; k++){ ah_group_hdr g; g.type = keys[k][0]; memcpy(g.hash, keys[k] + 1, 32); g.n = 1;
+          if (k % AH_SPARSE_STRIDE == 0){ sp[nsp].type = g.type; memcpy(sp[nsp].hash, g.hash, 32); sp[nsp].off = body; nsp++; }
+          fwrite(&g, 1, AH_GROUP_HDR, f); ah_event e = { AH_FUND, 1000u + (u32)k, 1, 0, 100 }; fwrite(&e, 1, AH_EVENT_BYTES, f); body += AH_GROUP_HDR + AH_EVENT_BYTES; }
+        hd.n_keys = 4; hd.n_events = 4; hd.body_len = body; hd.sparse_off = AH_HDR_BYTES + body; hd.sparse_n = (u64)nsp;
+        fwrite(sp, AH_SPARSE_BYTES, (size_t)nsp, f); fseek(f, 0, SEEK_SET); fwrite(&hd, 1, sizeof hd, f); fclose(f);
+        int found = 0; for (int k = 0; k < 4; k++){ const ah_event* ev = 0; long n = ah_lookup(keys[k][0], keys[k] + 1, &ev); ah_event e; if (n == 1){ memcpy(&e, ev, sizeof e); if (e.height == 1000u + (u32)k) found++; } }
+        ck("the builder's bucket order with mixed types: all four keys found (type-major search found only bucket 0x00's)", found == 4); }
+    }
+
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
 }

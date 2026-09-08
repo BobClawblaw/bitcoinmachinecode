@@ -397,6 +397,17 @@ static long qparam(const char* path, size_t plen, const char* key){
 #include <unistd.h>
 static pthread_mutex_t g_mp_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_mp_refresher = 0;
+/* A refresh holds the cache lock only while it touches the cache: every RPC
+ * call inside it releases the lock first (mp_call). Production's first
+ * request after a boot waited 58 s behind one 400-transaction slice that
+ * held the lock through 1,200 dispatches. */
+static __thread int g_mp_in_refresh = 0;
+static rj_val* mp_call(const rpc_wallet* w, const char* method, rj_val* params){
+    if (g_mp_in_refresh) pthread_mutex_unlock(&g_mp_lock);
+    rj_val* r = call(w, method, params, 0, 0);
+    if (g_mp_in_refresh) pthread_mutex_lock(&g_mp_lock);
+    return r;
+}
 #define MP_REFRESH_SLICE 400
 typedef struct { unsigned char key[33]; unsigned char txid[32]; unsigned vout; unsigned long long value; int is_spend; unsigned char spent_txid[32]; unsigned spent_vout; } mp_ev;   /* one output funded, or one input spent */
 typedef struct { unsigned char txid[32]; unsigned char vout_keys_done; } mp_tx;
@@ -414,7 +425,7 @@ static int mp_prevout(const rpc_wallet* w, const unsigned char ptxid[32], unsign
     for (long i = 0; i < g_mp_nev; i++) if (!g_mp_ev[i].is_spend && g_mp_ev[i].vout == vout && !memcmp(g_mp_ev[i].txid, ptxid, 32)){ memcpy(key, g_mp_ev[i].key, 33); *value = g_mp_ev[i].value; return 1; }
     if (mp_has(ptxid)) return 0;                                  /* a mempool parent's non-standard output */
     char hx[65]; hexrev(hx, ptxid);
-    rj_val* t = call(w, "getrawtransaction", P1s1n(hx, 1), 0, 0); if (!t) return 0;
+    rj_val* t = mp_call(w, "getrawtransaction", P1s1n(hx, 1)); if (!t) return 0;
     rj_val* vo = G(t, "vout"); int ok = 0;
     if (vo && vo->typ == RJ_ARR && vout < vo->nitems){
         rj_val* spk = G(vo->items[vout], "scriptPubKey"); const char* hex = S(spk, "hex");
@@ -425,8 +436,9 @@ static int mp_prevout(const rpc_wallet* w, const unsigned char ptxid[32], unsign
     rj_free(t); return ok;
 }
 static void mp_refresh_locked(const rpc_wallet* w, long budget){
-    rj_val* m = call(w, "getrawmempool", (rj_val*)({ rj_val* a = rj_arr(); rj_arr_push(a, rj_bool(0)); a; }), 0, 0);
-    if (!m || m->typ != RJ_ARR){ if (m) rj_free(m); return; }
+    g_mp_in_refresh = 1;
+    rj_val* m = mp_call(w, "getrawmempool", (rj_val*)({ rj_val* a = rj_arr(); rj_arr_push(a, rj_bool(0)); a; }));
+    if (!m || m->typ != RJ_ARR){ if (m) rj_free(m); g_mp_in_refresh = 0; return; }
     long n = (long)m->nitems; unsigned char (*now)[32] = malloc((size_t)(n + 1) * 32); long nn = 0;
     for (long i = 0; i < n; i++) if (m->items[i]->str && unhex(m->items[i]->str, now[nn], 32) == 32){ for (int k = 0; k < 16; k++){ unsigned char x = now[nn][k]; now[nn][k] = now[nn][31-k]; now[nn][31-k] = x; } nn++; }
     rj_free(m);
@@ -441,7 +453,7 @@ static void mp_refresh_locked(const rpc_wallet* w, long budget){
         for (long i = 0; i < nn && fetched < budget; i++){
             if (mp_has(now[i])) continue;
             char hx[65]; hexrev(hx, now[i]);
-            rj_val* t = call(w, "getrawtransaction", P1s1n(hx, 1), 0, 0); if (!t) continue;
+            rj_val* t = mp_call(w, "getrawtransaction", P1s1n(hx, 1)); if (!t) continue;
             rj_val* vo = G(t, "vout"); rj_val* vi = G(t, "vin");
             for (size_t o = 0; vo && vo->typ == RJ_ARR && o < vo->nitems; o++){
                 rj_val* spk = G(vo->items[o], "scriptPubKey"); const char* hex = S(spk, "hex");
@@ -465,7 +477,7 @@ static void mp_refresh_locked(const rpc_wallet* w, long budget){
     /* the known set = what is in the mempool now (minus the ones deferred to the next refresh) */
     long kn = 0; for (long i = 0; i < g_mp_ntx; i++) if (bsearch(g_mp_txids[i], now, (size_t)nn, 32, cmp32)) memcpy(g_mp_txids[kn++], g_mp_txids[i], 32);
     g_mp_ntx = kn;
-    free(now);
+    free(now); g_mp_in_refresh = 0;
 }
 /* the address's mempool view: stats, its unconfirmed txids (newest last, as seen), its unconfirmed outputs, and the outpoints it had that the mempool spends */
 typedef struct { long funded_n, spent_n; long long funded_sum, spent_sum; unsigned char (*txids)[32]; long ntx; mp_ev* funds; long nfunds; mp_ev* spends; long nspends; } mp_view;
