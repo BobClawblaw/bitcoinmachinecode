@@ -1040,7 +1040,7 @@ Missing:
 
 Confirmed genuinely wired into the real serve loop (`bitcoin_serve.asm`),
 not just present as unused/tested-in-isolation code:
-- ~~**BIP152 compact blocks — SERVE SIDE ONLY**~~ **Receive side DONE 2026-09-06 (CC-2, `49c1c6f`): low-bandwidth mode — `sendcmpct` after verack on outbound legs, `MSG_CMPCT_BLOCK` requested, reconstruction from the mempool, `getblocktxn`/`blocktxn`, full-block fallback; high-bandwidth push is a follow-up.** Was: (`cmpctblock_build`,
+- **BIP152 compact blocks — receive side OPEN** (2026-09-08): the receive path landed 2026-09-06 (CC-2, `49c1c6f`) but has not completed a reconstruction that needed a `getblocktxn` round trip -- production counted 14 such blocks, 0 reconstructed, 0 fallen back, the tip advancing only through other legs' full blocks; on a single-leg regtest the tip stalls. `bmc.cmpctrecv=0` makes outbound legs request full blocks. Found by the coinstats differential.
   `p2p_blocktxn_build`). This node answers `MSG_CMPCT_BLOCK` getdata and
   `getblocktxn`, and negotiates `sendcmpct`. Until 2026-09-06 it did NOT
   receive compact blocks: `bitcoin_serve.asm` wrote `cmpctblock` and

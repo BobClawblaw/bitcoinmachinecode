@@ -6195,6 +6195,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     { long ni = invset_load("invalid.dat"); if(ni) fprintf(stderr, "[chain] invalid.dat: %ld operator-invalidated block(s)\n", ni);   /* CC-10 */
       reorg_set_invalid_fn(invset_has); g_txoq_store = store_buf; }
     { extern void* g_cmpct_hook_type; extern void* g_cmpct_hook_cmpct; extern void* g_cmpct_hook_blocktxn;   /* CC-2: bitcoind.asm reaches the receive side through these */
+      { extern void cmpct_recv_set_enabled(int); cmpct_recv_set_enabled(g_cfg.cmpctrecv); if (!g_cfg.cmpctrecv) fprintf(stderr, "[cmpct] bmc.cmpctrecv=0 -- outbound legs request full blocks, not compact ones\n"); }
       g_cmpct_hook_type = (void*)cmpct_getdata_type; g_cmpct_hook_cmpct = (void*)cmpct_recv_cmpctblock; g_cmpct_hook_blocktxn = (void*)cmpct_recv_blocktxn; }
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
     fprintf(stderr,"[dl] worker: chain archive reloaded: tip=%d (%.2fs)\n",
@@ -6399,7 +6400,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             extern void utxo_live_set_coinstats_caught_up(void (*)(void*, void*, long));
             extern void csi_defer_to_caught_up(void);
             extern void csi_on_caught_up(void*, void*, long);
+            { extern void csi_set_chain(long, int); csi_set_chain(g_chainp->halving_interval, !strcmp(g_chainp->name, "main")); }
             utxo_live_set_coinstats(csi_on_add, csi_on_remove, csi_invalidate, csi_commit);
+            { extern void csi_on_block(long); extern void utxo_live_set_coinstats_block(void (*)(long)); utxo_live_set_coinstats_block(csi_on_block); }
             undo_set_coin_observer(csi_on_remove);
             utxo_live_set_coinstats_caught_up(csi_on_caught_up);
             long ah = utxo_live_applied_height();
@@ -8136,6 +8139,9 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
         extern void rpc_chain_set_coinstats(long (*)(int, void*, char*, unsigned long));
         extern void rpc_chain_set_coinstats_height(long (*)(void));
         rpc_chain_set_coinstats(csi_rpc_run);
+        { extern int csi_hist_query(long, int, void*); extern long csi_hist_first(void), csi_hist_last(void);
+          extern void rpc_chain_set_coinstats_hist(int (*)(long, int, void*), long (*)(void), long (*)(void));
+          rpc_chain_set_coinstats_hist(csi_hist_query, csi_hist_first, csi_hist_last); }
         rpc_chain_set_coinstats_height(csi_file_height); } }
     { extern long utxo_dump_rpc_run(const char*, int (*)(long, unsigned char*),
                                     long*, unsigned long long*, char*, unsigned long);

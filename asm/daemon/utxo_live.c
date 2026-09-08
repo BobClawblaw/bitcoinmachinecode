@@ -703,6 +703,8 @@ typedef void (*csi_coin_fn)(const u8 txid[32], u32 index, u64 value, u64 height,
 static csi_coin_fn g_csi_add = 0, g_csi_rm = 0;
 static void (*g_csi_inval)(const char*) = 0;
 static void (*g_csi_commit)(long) = 0;   /* per-block durability point */
+static void (*g_csi_block)(long) = 0;    /* after every applied block: the index closes the block's row (2026-09-08) */
+void utxo_live_set_coinstats_block(void (*fn)(long)){ g_csi_block = fn; }
 void utxo_live_set_coinstats(csi_coin_fn add, csi_coin_fn rm,
                              void (*inval)(const char*), void (*commit)(long)){
     g_csi_add = add; g_csi_rm = rm; g_csi_inval = inval; g_csi_commit = commit;
@@ -2267,6 +2269,7 @@ static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height);
  * rollback, the next block's undo file -- sees a complete on-disk record. */
 static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
     int r = apply_block_at_inner(blockbuf, blocklen, height);
+    if (r && g_csi_block) g_csi_block(height);
     u64 tm_d0 = tm_now();
     /* 2026-09-08: a successful apply closes the block's undo run with the END
      * marker (a block that spent nothing gets an empty run, so every applied

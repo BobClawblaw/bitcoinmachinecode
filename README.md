@@ -111,13 +111,13 @@ testnet4, signet (public or custom) and regtest.
 - BIP339 `wtxidrelay`, BIP144 witness transport with witness-only peer
   preference, stripped-block serving to legacy peers, `sendheaders`,
   `feefilter`.
-- BIP152 compact blocks in both directions: this node answers
-  `MSG_CMPCT_BLOCK` getdata and `getblocktxn`, negotiates `sendcmpct`, and
-  since 2026-09-06 receives `cmpctblock`, reconstructs the block from its
-  mempool by short id, asks `getblocktxn` for what it lacks, and falls back
-  to a full `getdata` (`daemon/cmpct_recv.c`). (The receive side was absent
-  at the 2026-09-03 audit, NET-9; this line said "SERVE side only" until
-  2026-09-08.)
+- BIP152 compact blocks: this node answers `MSG_CMPCT_BLOCK` getdata and
+  `getblocktxn` and negotiates `sendcmpct`. A receive path exists since
+  2026-09-06 (`daemon/cmpct_recv.c`) but has not yet completed a
+  reconstruction that needed a `getblocktxn` round trip (2026-09-08:
+  production counted 14 such blocks, 0 reconstructed, 0 fallen back;
+  blocks arrive in full from other legs). `bmc.cmpctrecv=0` makes every
+  outbound leg request full blocks; the defect is open.
 - BIP157/158 compact block filter serving (`getcfilters`, `getcfheaders`,
   `getcfcheckpt`) backed by the whole-chain filter index.
 - BIP324 v2 encrypted transport, inbound and outbound, with in-band v1
@@ -357,7 +357,7 @@ log echoes the resolved values.
 | `dbcache` | `1024` MiB | UTXO memtable sizing |
 | `par` | `0` (auto) | script-verification threads |
 | `prune` | `0` | `0` off, `1` manual-only, `>=550` target size in MiB |
-| `txindex` / `addrindex` / `blockfilterindex` / `coinstatsindex` | `0` / `0` / `1` / `1` | optional indexes; `txindex` is adopted automatically when `txindex.dat` exists |
+| `txindex` / `addrindex` / `blockfilterindex` / `coinstatsindex` | `0` / `0` / `0` / `0` | optional indexes; `txindex` is adopted automatically when `txindex.dat` exists |
 | `checkblocks` / `checklevel` / `stopatheight` / `minimumchainwork` | `6` / `3` / `0` / chain default | startup verification and sync bounds |
 | `persistmempool` | `1` | reload `mempool.dat` at boot, write it at shutdown |
 | `walletpassfile` | — | absolute path, outside the datadir, to the wallet passphrase; refused if world-readable, group-writable or inside the datadir |
