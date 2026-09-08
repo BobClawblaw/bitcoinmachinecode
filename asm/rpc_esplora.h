@@ -10,6 +10,8 @@
 int esplora_handle(const char* method, size_t mlen, const char* path, size_t plen,
                    const char* body, size_t blen, const rpc_wallet* w,
                    char** out, size_t* outlen, int* status, const char** ctype);
+/* the execution lock, taken around each dispatch (rpc_server.c installs it) */
+void esplora_set_exec_lock(void (*lock)(void), void (*unlock)(void));
 /* the second listener (rpc_server.c): 0 ok, -1 with errmsg */
 int rpc_esplora_start(const char* bind_addr, int port, char* errmsg, size_t errcap);
 /* pure helpers, exported for tests */
