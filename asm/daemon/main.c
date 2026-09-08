@@ -5649,6 +5649,19 @@ static int g_dl_last_seen_tip = -1;
  * here greps against a Core debug.log. The tip can also go DOWN here
  * (a reorg, a rejected block truncating the archive): nothing is
  * announced for that, the baseline just follows. */
+/* Core relays no blocks while it is in initial block download
+ * (PeerManagerImpl gates block announcement on !IsInitialBlockDownload(),
+ * whose main clause is "the tip is older than -maxtipage"). This node
+ * announced every connected tip to its outbound legs regardless, and on
+ * the 2026-09-07 benchmark those legs were dead twenty minutes in -- the
+ * peers' inactivity timeout, because the serve worker is inside the
+ * parallel catch-up and never services them -- so the log carried one
+ * "announced tip ... to 0/4 legs" per block for the rest of the run.
+ * Same rule as Core now, and the same rule the RPC's
+ * "initialblockdownload" field already uses. */
+static int dl_announce_allowed(unsigned long tip_time, long long now, long maxtipage){
+    return now - (long long)tip_time <= maxtipage;      /* a tip in the future is fine: not IBD */
+}
 static void dl_new_block_choke(void){
     int now_tip = (int)node_public_tip(store_buf);
     if(g_dl_last_seen_tip >= 0 && now_tip > g_dl_last_seen_tip){
@@ -5667,13 +5680,21 @@ static void dl_new_block_choke(void){
          * MSG_BLOCK; node_announce_tip reads the public tip itself).
          * This replaces the per-leg announce that used to fire at
          * store time in the leg sync. */
-        { int announced = 0, legs = 0;
-          for(int i2=0; i2<mux_n_out; i2++){
-              if(mux_out_fd[i2] < 0) continue;
-              legs++;
-              if(node_announce_tip(mux_out_fd[i2], store_buf, ht_idx, 0) == 1) announced++;
-          }
-          if(legs) fprintf(stderr,"[dl] announced tip height=%d to %d/%d legs\n", now_tip, announced, legs); }
+        { unsigned long tip_time = 0; static int suppressed_said = 0;
+          if(store_read_at(store_buf, (unsigned long)now_tip, thb, 80) >= 80) tip_time = (unsigned long)thb[68] | ((unsigned long)thb[69]<<8) | ((unsigned long)thb[70]<<16) | ((unsigned long)thb[71]<<24);
+          if(tip_time && !dl_announce_allowed(tip_time, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400)){
+              if(!suppressed_said){ suppressed_said = 1;
+                  fprintf(stderr,"[dl] tip announcements to the legs are suppressed while the tip is older than maxtipage (initial block download; Core relays no blocks in IBD) -- they resume at the tip\n"); }
+          } else {
+              int announced = 0, legs = 0;
+              for(int i2=0; i2<mux_n_out; i2++){
+                  if(mux_out_fd[i2] < 0) continue;
+                  legs++;
+                  if(node_announce_tip(mux_out_fd[i2], store_buf, ht_idx, 0) == 1) announced++;
+              }
+              if(legs) fprintf(stderr,"[dl] announced tip height=%d to %d/%d legs\n", now_tip, announced, legs);
+              suppressed_said = 0;
+          } }
         /* ZMQ hashblock/rawblock + the txid-index tail, from this
          * same choke point for the same reason the log line is: it
          * fires no matter which path appended the block.
