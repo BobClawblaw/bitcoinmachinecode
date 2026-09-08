@@ -226,16 +226,33 @@ I2P destination.
   amounts), so `gettxoutsetinfo <hash_type> <hash_or_height>` answers at
   any height the rows cover, in Core's shape, `block_info` included. A
   boot with no valid persisted state seeds the index from a walk of the
-  set (minutes); rows exist from that height on, and a query below it is
-  refused by name -- until the history is built:
-  `daemon/bmc_build_coinstats_hist <chaindir> [to_height] [workers]` fills
-  the rows from genesis from the archive alone (about two hours and
-  ~500 GB of temporary files on mainnet with eight workers; the daemon may
-  keep running, the tool writes only rows below the live coverage). Its
-  numbers are Core's coinstatsindex's: verified byte for byte at height
-  963,967 and at the tip. mempool.space reads `txouts` and `block_info.prevout_spent`
-  per indexed block once `getindexinfo` reports the index synced at that
+  set (minutes); rows exist from that height on in the TAIL
+  (`coinstats_hist.dat`), and a query below it is refused by name until
+  the BASE exists: `coinstats_hist_base.dat`, rows 0..to_height, written
+  by `daemon/bmc_build_coinstats_hist <chaindir> [to_height] [workers]`
+  from the archive alone (about two hours and ~500 GB of scratch under
+  `csh_tmp/` on mainnet with eight workers; the daemon may keep running).
+  The reader prefers the base for every height it covers. Its numbers are
+  Core's coinstatsindex's: verified byte for byte at height 963,967 and at
+  the tip. mempool.space reads `txouts` and `block_info.prevout_spent` per
+  indexed block once `getindexinfo` reports the index synced at that
   height. Off (`0`) the index is not maintained and the RPC refuses.
+  **The base repairs itself** (2026-09-08, after a build died in an OOM
+  and its half-written rows and 209 GB of leftovers went unnoticed): once
+  a heartbeat the fold worker checks the base (header every time; every
+  row, the header's hash and the seam with the tail the first time) and,
+  when it is absent, spawns the builder beside its own executable, niced,
+  never during initial block download, at most three attempts per boot
+  with six hours between them; `bmc.coinstatshistrepair=0` turns that
+  off. A base that fails the check is renamed `*.broken-<epoch>` (delete
+  those when you have looked) and rebuilt. The builder resumes at the
+  pass after its last `csh_tmp/passN.done` marker, discards scratch
+  without a marker (and the old layout's `csh_*.tmp`), sizes pass 3 from
+  free RAM, holds `csh_tmp/lock` so two builders never share a scratch,
+  and writes the base to a temp name that is renamed into place with the
+  complete flag set last. `gettxoutsetinfo` below the base names the
+  state ("being rebuilt", "waits for initial block download", ...);
+  `coinstats_hist.status` in the chain directory carries the same line.
 - `bmc.esploraport=<port>` (2026-09-08) opens the Esplora facade for
   mempool.space's `BACKEND: "esplora"`: a second, unauthenticated listener
   (`bmc.esplorabind`, default 127.0.0.1) answering Esplora's REST routes from

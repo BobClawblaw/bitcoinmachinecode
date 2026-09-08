@@ -45,9 +45,30 @@
  *   pass 4  one process: the prefix products and the rows.
  *
  * Usage: bmc_build_coinstats_hist <chaindir> [to_height] [workers]
- * Disk: ~500 GB of temporary files beside the archive at the mainnet tip,
- * deleted as they are consumed. Time on the reference box: ~2 h. Launch it
- * with best-effort I/O, not the idle class: the join is write-bound. */
+ * Disk: ~500 GB of temporary files under <chaindir>/csh_tmp at the mainnet
+ * tip, removed when the base is in place. Time on the reference box: ~2 h.
+ * Launch it with best-effort I/O, not the idle class: the join is
+ * write-bound.
+ *
+ * 2026-09-08, after the build that died in pass 3 (an OOM took the box):
+ *   - every pass ends by writing csh_tmp/passN.done (the worker count and
+ *     the target height it ran with, fsynced); a rerun skips the passes
+ *     whose markers match and resumes at the first that has none. A crash
+ *     costs the pass it was in, not the run.
+ *   - scratch without a pass1 marker is dead and is removed first, and so
+ *     is the old layout's csh_*.tmp beside the archive: the range files of
+ *     pass 2 are opened in APPEND mode, so a leftover from a dead run would
+ *     have doubled every spend it held.
+ *   - pass 3 loads a whole spend-height range per worker (4-9 GB each late
+ *     in the chain); its concurrency is sized from MemAvailable and the
+ *     largest range on disk, whatever worker count the caller asked for.
+ *   - the rows go to coinstats_hist_base.dat.tmp and are renamed into
+ *     place with the header's complete flag set last, so the daemon never
+ *     sees a half-written base (the old build wrote straight into the
+ *     file the daemon appends to).
+ *   - csh_tmp/lock is held (flock) for the whole run: a second builder on
+ *     the same archive exits 4 instead of sharing the scratch.
+ *   - BMC_CSH_STOP_AFTER=<pass> exits 0 after that pass's marker (tests). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +78,9 @@
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <sys/file.h>
+#include <dirent.h>
+#include <errno.h>
 #include "coinstats_hist_fmt.h"
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 extern long store_init(void* st);
@@ -95,8 +119,61 @@ static u64 rdvi(const u8* p, const u8* end, u64* used){
     if (p[0] == 0xfe){ if (p + 5 > end){ *used = 0; return 0; } *used = 5; u32 v; memcpy(&v, p + 1, 4); return v; }
     if (p + 9 > end){ *used = 0; return 0; } *used = 9; u64 v; memcpy(&v, p + 1, 8); return v;
 }
-static char* nm(char* b, const char* pfx, int w, int i){ sprintf(b, "csh_%s_w%02d_%03d.tmp", pfx, w, i); return b; }
+static char* nm(char* b, const char* pfx, int w, int i){ sprintf(b, CSH_TMPDIR "/csh_%s_w%02d_%03d.tmp", pfx, w, i); return b; }
 static void die(const char* m){ fprintf(stderr, "[coinstats-hist] FATAL: %s\n", m); exit(1); }
+static int g_Wfiles = 8;                 /* the worker count baked into the temp-file names (pass 1's), recorded in the markers */
+
+/* ---- scratch: markers, cleanup, the lock --------------------------------------- */
+static int marker_read(int pass, int* W, long* to){
+    char b[64]; sprintf(b, CSH_TMPDIR "/pass%d.done", pass);
+    FILE* f = fopen(b, "r"); if (!f) return 0;
+    int ok = fscanf(f, "W=%d to=%ld", W, to) == 2; fclose(f); return ok;
+}
+static void marker_write(int pass, int W, long to){
+    char b[64]; sprintf(b, CSH_TMPDIR "/pass%d.done", pass);
+    FILE* f = fopen(b, "w"); if (!f) die("marker write");
+    fprintf(f, "W=%d to=%ld\n", W, to); fflush(f); fsync(fileno(f)); fclose(f);
+}
+/* remove every entry of a directory whose name starts with pfx (not the directory itself) */
+static long unlink_prefix(const char* dir, const char* pfx, const char* keep){
+    DIR* d = opendir(dir); if (!d) return 0; struct dirent* e; long n = 0; char b[512];
+    while ((e = readdir(d))){
+        if (!strncmp(e->d_name, ".", 1)) continue;
+        if (strncmp(e->d_name, pfx, strlen(pfx))) continue;
+        if (keep && !strcmp(e->d_name, keep)) continue;
+        snprintf(b, sizeof b, "%s/%s", dir, e->d_name); if (unlink(b) == 0) n++;
+    }
+    closedir(d); return n;
+}
+/* dead scratch: everything under csh_tmp except the lock, and the old layout's csh_*.tmp beside the archive */
+static void scratch_reset(void){
+    long a = unlink_prefix(CSH_TMPDIR, "", "lock");
+    long b = unlink_prefix(".", "csh_", 0);
+    if (a || b) fprintf(stderr, "[coinstats-hist] discarded %ld stale scratch file(s) and %ld old-layout csh_*.tmp (no pass1 marker: a dead run's leftovers)\n", a, b);
+}
+static int g_lock_fd = -1;
+static void take_lock(void){
+    if (mkdir(CSH_TMPDIR, 0755) != 0 && errno != EEXIST) die("mkdir " CSH_TMPDIR);
+    g_lock_fd = open(CSH_TMPDIR "/lock", O_RDWR | O_CREAT, 0644); if (g_lock_fd < 0) die("open lock");
+    if (flock(g_lock_fd, LOCK_EX | LOCK_NB) != 0){ fprintf(stderr, "[coinstats-hist] another builder holds " CSH_TMPDIR "/lock -- exiting\n"); exit(4); }
+}
+static long long mem_available(void){
+    FILE* f = fopen("/proc/meminfo", "r"); if (!f) return -1; char line[256]; long long kb = -1;
+    while (fgets(line, sizeof line, f)) if (sscanf(line, "MemAvailable: %lld kB", &kb) == 1) break;
+    fclose(f); return kb < 0 ? -1 : kb * 1024;
+}
+/* pass 3 concurrency: each worker holds one whole range (its files across every
+ * pass-2 writer) plus a 16-byte index per event; size it from the largest range
+ * and 3/4 of MemAvailable, never above the caller's count, never below 1 */
+static int pass3_workers(int W, long* need_out){
+    char b[64]; long long biggest = 0;
+    for (int r = 0; r < NR; r++){ long long sz = 0; for (int w = 0; w < g_Wfiles; w++){ struct stat st; if (stat(nm(b, "r", w, r), &st) == 0) sz += st.st_size; } if (sz > biggest) biggest = sz; }
+    long long need = biggest + biggest / 4 + (64 << 20);            /* the buffer, the index, headroom */
+    long long avail = mem_available(); if (need_out) *need_out = (long)(need >> 20);
+    if (avail < 0) return W;
+    long long fit = (avail * 3 / 4) / need; if (fit < 1) fit = 1; if (fit > W) fit = W;
+    return (int)fit;
+}
 
 /* ---- pass 1: one worker over [lo, hi] ------------------------------------------ */
 static int pass1_worker(int w, long lo, long hi, u8* store_buf, int addprod_fd){
@@ -168,7 +245,8 @@ typedef struct { const u8* p; } oidx;   /* pointer to an outref_hdr in the loade
 static int cmp_oidx(const void* a, const void* b){ const outref_hdr* x = (const outref_hdr*)((const oidx*)a)->p; const outref_hdr* y = (const outref_hdr*)((const oidx*)b)->p; int c = memcmp(x->txid, y->txid, 32); if (c) return c; return x->vout < y->vout ? -1 : x->vout > y->vout; }
 static int cmp_spend(const void* a, const void* b){ const spendref* x = a; const spendref* y = b; int c = memcmp(x->txid, y->txid, 32); if (c) return c; return x->vout < y->vout ? -1 : x->vout > y->vout; }
 static int pass2_bucket(int w, int i, int W, long to_h, u64* n_matched, u64* n_unmatched){
-    size_t olen, slen; u8* o = load_all("o", W, i, &olen); u8* s = load_all("s", W, i, &slen);
+    (void)W;   /* the bucket files were written by g_Wfiles workers, whatever runs now */
+    size_t olen, slen; u8* o = load_all("o", g_Wfiles, i, &olen); u8* s = load_all("s", g_Wfiles, i, &slen);
     size_t no = 0; for (size_t p = 0; p + sizeof(outref_hdr) <= olen; ){ const outref_hdr* r = (const outref_hdr*)(o + p); p += sizeof *r + r->slen; no++; }
     oidx* ix = malloc((no + 1) * sizeof *ix); if (!ix) die("oom idx"); size_t k = 0;
     for (size_t p = 0; p + sizeof(outref_hdr) <= olen; ){ const outref_hdr* r = (const outref_hdr*)(o + p); ix[k++].p = o + p; p += sizeof *r + r->slen; }
@@ -191,7 +269,8 @@ static int pass2_bucket(int w, int i, int W, long to_h, u64* n_matched, u64* n_u
 typedef struct { const u8* p; } eidx;
 static int cmp_eidx(const void* a, const void* b){ u32 x = ((const remev_hdr*)((const eidx*)a)->p)->spend_h, y = ((const remev_hdr*)((const eidx*)b)->p)->spend_h; return x < y ? -1 : x > y; }
 static int pass3_range(int r, int W, int remprod_fd){
-    size_t elen; u8* e = load_all("r", W, r, &elen);
+    (void)W;
+    size_t elen; u8* e = load_all("r", g_Wfiles, r, &elen);
     size_t ne = 0; for (size_t p = 0; p + sizeof(remev_hdr) <= elen; ){ const remev_hdr* h = (const remev_hdr*)(e + p); p += sizeof *h + h->slen; ne++; }
     eidx* ix = malloc((ne + 1) * sizeof *ix); if (!ix) die("oom eidx"); size_t k = 0;
     for (size_t p = 0; p + sizeof(remev_hdr) <= elen; ){ const remev_hdr* h = (const remev_hdr*)(e + p); ix[k++].p = e + p; p += sizeof *h + h->slen; }
@@ -211,9 +290,10 @@ static int pass3_range(int r, int W, int remprod_fd){
 }
 /* ---- pass 4: the prefix and the rows ------------------------------------------- */
 static int pass4(long to_h, int addprod_fd, int remprod_fd){
-    int fd = open(CSH_FILE, O_RDWR | O_CREAT, 0644); if (fd < 0) die("open " CSH_FILE);
-    csh_header_t hd; memset(&hd, 0, sizeof hd);
-    if (pread(fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd || hd.magic != CSH_MAGIC || hd.rec != CSH_REC){ memset(&hd, 0, sizeof hd); hd.magic = CSH_MAGIC; hd.version = 1; hd.rec = CSH_REC; hd.gen = 0; hd.first_height = -1; hd.last_height = -1; }
+    int fd = open(CSH_BASE_TMP, O_RDWR | O_CREAT | O_TRUNC, 0644); if (fd < 0) die("open " CSH_BASE_TMP);
+    csh_base_header_t bh; memset(&bh, 0, sizeof bh); bh.magic = CSH_BASE_MAGIC; bh.version = 1; bh.rec = CSH_REC; bh.complete = 0; bh.to_height = to_h; bh.n_rows = to_h + 1;
+    if (pwrite(fd, &bh, sizeof bh, 0) != (ssize_t)sizeof bh) die("base header write");
+    u8* sums = malloc((size_t)(to_h + 1) * 32); if (!sums) die("oom sums");
     static u8 num[ST_SIZE] __attribute__((aligned(16))), den[ST_SIZE] __attribute__((aligned(16)));
     utxo_stats_init(num, 1, 0); utxo_stats_init(den, 1, 0);
     u64 txouts = 0, amount = 0, bogo = 0, prevout = 0, coinbase = 0, newcb = 0, scripts = 0, genesis = 0, bip30 = 0, subsidy = 0;
@@ -232,12 +312,17 @@ static int pass4(long to_h, int addprod_fd, int remprod_fd){
         memcpy(row.num_acc, num + ST_ACC, 384); memcpy(row.den_acc, den + ST_ACC, 384);
         sha256_full(row.sum, &row, sizeof row - 32);
         if (pwrite(fd, &row, sizeof row, CSH_HDR + (off_t)h * CSH_REC) != (ssize_t)sizeof row) die("row write");
+        memcpy(sums + (size_t)h * 32, row.sum, 32);
         if (h % 50000 == 0) fprintf(stderr, "[coinstats-hist] pass4 %ld/%ld txouts=%llu (%llds)\n", h, to_h, (unsigned long long)txouts, (long long)(time(NULL) - t0));
     }
-    if (pread(fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd || hd.magic != CSH_MAGIC){ memset(&hd, 0, sizeof hd); hd.magic = CSH_MAGIC; hd.version = 1; hd.rec = CSH_REC; hd.last_height = -1; }   /* re-read: a live daemon may have advanced it */
-    hd.first_height = 0; if (hd.last_height < to_h) hd.last_height = to_h;
-    if (pwrite(fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd) die("header write");
-    fsync(fd); close(fd);
+    /* every row is on disk before the header says so; the rename makes the base appear whole */
+    if (fsync(fd) != 0) die("fsync rows");
+    sha256_full(bh.sum, sums, (long)(to_h + 1) * 32); free(sums);
+    bh.complete = 1;
+    if (pwrite(fd, &bh, sizeof bh, 0) != (ssize_t)sizeof bh) die("base header write");
+    if (fsync(fd) != 0) die("fsync header");
+    close(fd);
+    if (rename(CSH_BASE_TMP, CSH_BASE_FILE) != 0) die("rename base into place");
     fprintf(stderr, "[coinstats-hist] DONE: rows 0..%ld, txouts=%llu amount=%llu.%08llu prevout_spent=%llu coinbase=%llu scripts=%llu subsidy=%llu (%llds)\n", to_h,
             (unsigned long long)txouts, (unsigned long long)(amount / 100000000ULL), (unsigned long long)(amount % 100000000ULL), (unsigned long long)prevout, (unsigned long long)coinbase, (unsigned long long)scripts, (unsigned long long)subsidy, (long long)(time(NULL) - t0));
     return 0;
@@ -261,14 +346,32 @@ int main(int argc, char** argv){
     { const char* c = getenv("BMC_CHAIN"); if (c && strcmp(c, "main")){ g_mainnet = 0; if (!strcmp(c, "regtest")) g_halving = 150; } }
     if (tip < 0) die("empty store");
     fprintf(stderr, "[coinstats-hist] dir=%s tip=%ld to=%ld workers=%d chain=%s\n", argv[1], tip, to_h, W, g_mainnet ? "main" : "other");
-    int addprod_fd = open("csh_addprod.tmp", O_RDWR | O_CREAT | O_TRUNC, 0644), remprod_fd = open("csh_remprod.tmp", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    take_lock();
+    /* resume: the highest pass whose marker matches this target; a pass 1 marker
+     * fixes the worker count every later pass must read the files with */
+    int start = 1; { int mW = 0; long mto = -1;
+        if (marker_read(1, &mW, &mto) && mto == to_h && mW >= 1 && mW <= 64){ g_Wfiles = mW; start = 2;
+            if (marker_read(2, &mW, &mto) && mto == to_h && mW == g_Wfiles){ start = 3;
+                if (marker_read(3, &mW, &mto) && mto == to_h && mW == g_Wfiles) start = 4; } } }
+    if (start == 1){ scratch_reset(); g_Wfiles = W; }
+    else fprintf(stderr, "[coinstats-hist] resuming at pass %d (passes below it are marked done for to=%ld with %d workers)\n", start, to_h, g_Wfiles);
+    int stop_after = getenv("BMC_CSH_STOP_AFTER") ? atoi(getenv("BMC_CSH_STOP_AFTER")) : 0;
+    int addprod_fd = open(CSH_TMPDIR "/csh_addprod.tmp", O_RDWR | O_CREAT | (start == 1 ? O_TRUNC : 0), 0644);
+    int remprod_fd = open(CSH_TMPDIR "/csh_remprod.tmp", O_RDWR | O_CREAT | (start <= 3 ? O_TRUNC : 0), 0644);
     if (addprod_fd < 0 || remprod_fd < 0) die("open products");
-    ctx_t x = { to_h, W, store_buf, addprod_fd, remprod_fd };
+    ctx_t x = { to_h, g_Wfiles, store_buf, addprod_fd, remprod_fd };
     time_t t0 = time(NULL);
-    run_workers(W, p1, &x); fprintf(stderr, "[coinstats-hist] pass1 done (%llds)\n", (long long)(time(NULL) - t0));
-    run_workers(W, p2, &x); fprintf(stderr, "[coinstats-hist] pass2 done (%llds)\n", (long long)(time(NULL) - t0));
-    run_workers(W, p3, &x); fprintf(stderr, "[coinstats-hist] pass3 done (%llds)\n", (long long)(time(NULL) - t0));
+    if (start <= 1){ run_workers(g_Wfiles, p1, &x); marker_write(1, g_Wfiles, to_h); fprintf(stderr, "[coinstats-hist] pass1 done (%llds)\n", (long long)(time(NULL) - t0));
+        if (stop_after == 1){ fprintf(stderr, "[coinstats-hist] stopping after pass 1 (BMC_CSH_STOP_AFTER)\n"); return 0; } }
+    if (start <= 2){ unlink_prefix(CSH_TMPDIR, "csh_r_", 0);   /* the range files are appended to: a retried pass 2 starts them empty */
+        run_workers(g_Wfiles, p2, &x); marker_write(2, g_Wfiles, to_h); fprintf(stderr, "[coinstats-hist] pass2 done (%llds)\n", (long long)(time(NULL) - t0));
+        if (stop_after == 2){ fprintf(stderr, "[coinstats-hist] stopping after pass 2 (BMC_CSH_STOP_AFTER)\n"); return 0; } }
+    if (start <= 3){ long need_mb = 0; int W3 = pass3_workers(W, &need_mb);
+        fprintf(stderr, "[coinstats-hist] pass3: %d worker(s) (largest range needs ~%ld MB each; MemAvailable %lld MB)\n", W3, need_mb, mem_available() >> 20);
+        ctx_t x3 = x; x3.W = W3; run_workers(W3, p3, &x3); marker_write(3, g_Wfiles, to_h); fprintf(stderr, "[coinstats-hist] pass3 done (%llds)\n", (long long)(time(NULL) - t0));
+        if (stop_after == 3){ fprintf(stderr, "[coinstats-hist] stopping after pass 3 (BMC_CSH_STOP_AFTER)\n"); return 0; } }
     if (pass4(to_h, addprod_fd, remprod_fd) != 0) return 1;
-    close(addprod_fd); close(remprod_fd); unlink("csh_addprod.tmp"); unlink("csh_remprod.tmp");
+    close(addprod_fd); close(remprod_fd);
+    unlink_prefix(CSH_TMPDIR, "", 0); rmdir(CSH_TMPDIR);   /* the lock goes with the scratch; the fd stays held until exit */
     return 0;
 }

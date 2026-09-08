@@ -6028,6 +6028,13 @@ static int g_dl_last_seen_tip = -1;
 static int dl_announce_allowed(unsigned long tip_time, long long now, long maxtipage){
     return now - (long long)tip_time <= maxtipage;      /* a tip in the future is fine: not IBD */
 }
+/* the Core rule again, for the history repair: the tip is older than maxtipage */
+static int dl_tip_is_ibd(void){
+    static unsigned char hb[8u<<20]; long tip = *(int*)(store_buf+24); if (tip < 0) return 1;
+    if (store_read_at(store_buf, (unsigned long)tip, hb, (long)sizeof hb) < 80) return 1;
+    unsigned long tip_time = (unsigned long)hb[68] | ((unsigned long)hb[69]<<8) | ((unsigned long)hb[70]<<16) | ((unsigned long)hb[71]<<24);
+    return !dl_announce_allowed(tip_time, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
+}
 static void dl_new_block_choke(void){
     int now_tip = (int)node_public_tip(store_buf);
     if(g_dl_last_seen_tip >= 0 && now_tip > g_dl_last_seen_tip){
@@ -6411,6 +6418,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             extern void csi_defer_to_caught_up(void);
             extern void csi_on_caught_up(void*, void*, long);
             { extern void csi_set_chain(long, int); csi_set_chain(g_chainp->halving_interval, !strcmp(g_chainp->name, "main")); }
+            /* 2026-09-08: the history base repairs itself. The builder lives
+             * beside this executable; the supervisor ticks at the heartbeat. */
+            { extern void csi_hist_repair_configure(const char*, const char*, const char*, int, int);
+              char exe[512], builder[600]; ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+              if (n > 0){ exe[n] = 0; char* sl = strrchr(exe, '/'); if (sl) *sl = 0; snprintf(builder, sizeof builder, "%s/bmc_build_coinstats_hist", exe); }
+              else snprintf(builder, sizeof builder, "bmc_build_coinstats_hist");
+              csi_hist_repair_configure(builder, dir, g_chainp->name, g_cfg.coinstatshist_workers, g_cfg.coinstatshist_repair); }
             utxo_live_set_coinstats(csi_on_add, csi_on_remove, csi_invalidate, csi_commit);
             { extern void csi_on_block(long); extern void utxo_live_set_coinstats_block(void (*)(long)); utxo_live_set_coinstats_block(csi_on_block); }
             undo_set_coin_observer(csi_on_remove);
@@ -7711,6 +7725,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(g_cfg.maxuploadtarget_mb > 0)
                 fprintf(stderr,"[dl] upload: %lldMB of %ldMB this 24h window\n",
                         upload_bytes_this_window()>>20, g_cfg.maxuploadtarget_mb);
+            /* the coinstats history's health and repair, once a heartbeat (2026-09-08) */
+            if(g_cfg.coinstatsindex){
+                extern int csi_hist_repair_tick(long, int, long long);
+                long target = utxo_live_ok ? utxo_live_applied_height() : (long)*(int*)(store_buf+24);
+                csi_hist_repair_tick(target, dl_tip_is_ibd(), (long long)time(NULL));
+            }
             /* Relay-pool health. Silent when nothing has been parked, so a
              * node with no orphan traffic prints nothing extra. */
             { extern long txrelay_stats(long*,long*,long*,long*,long*,long*);
@@ -8151,7 +8171,10 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
         rpc_chain_set_coinstats(csi_rpc_run);
         { extern int csi_hist_query(long, int, void*); extern long csi_hist_first(void), csi_hist_last(void);
           extern void rpc_chain_set_coinstats_hist(int (*)(long, int, void*), long (*)(void), long (*)(void)) __attribute__((weak));   /* the test rules that compile this file without rpc_chain.o (link-check) */
-          if (rpc_chain_set_coinstats_hist) rpc_chain_set_coinstats_hist(csi_hist_query, csi_hist_first, csi_hist_last); }
+          if (rpc_chain_set_coinstats_hist) rpc_chain_set_coinstats_hist(csi_hist_query, csi_hist_first, csi_hist_last);
+          { extern const char* csi_hist_status(void);
+            extern void rpc_chain_set_coinstats_hist_status(const char* (*)(void)) __attribute__((weak));
+            if (rpc_chain_set_coinstats_hist_status) rpc_chain_set_coinstats_hist_status(csi_hist_status); } }
         rpc_chain_set_coinstats_height(csi_file_height); } }
     { extern long utxo_dump_rpc_run(const char*, int (*)(long, unsigned char*),
                                     long*, unsigned long long*, char*, unsigned long);

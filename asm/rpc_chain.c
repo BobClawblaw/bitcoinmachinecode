@@ -4187,6 +4187,8 @@ static long (*g_csi_run)(int, void*, char*, unsigned long);
 static int  (*g_csi_hist)(long, int, csi_hist_out_t*) = 0;   /* the per-height rows (2026-09-08) */
 static long (*g_csi_hist_first)(void) = 0, (*g_csi_hist_last)(void) = 0;
 void rpc_chain_set_coinstats_hist(int (*q)(long, int, csi_hist_out_t*), long (*first)(void), long (*last)(void)){ g_csi_hist = q; g_csi_hist_first = first; g_csi_hist_last = last; }
+static const char* (*g_csi_hist_status)(void) = 0;   /* one line on the history base's health / repair (2026-09-08) */
+void rpc_chain_set_coinstats_hist_status(const char* (*fn)(void)){ g_csi_hist_status = fn; }
 void rpc_chain_set_coinstats(long (*run)(int, void*, char*, unsigned long)){
     g_csi_run = run;
 }
@@ -4457,7 +4459,8 @@ static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, con
         csi_hist_out_t ho; int r = g_csi_hist(h, want_muhash, &ho);
         if (r == 0){
             long f = g_csi_hist_first ? g_csi_hist_first() : -1, l = g_csi_hist_last ? g_csi_hist_last() : -1;
-            snprintf(embuf, sizeof embuf, "coinstatsindex has no record for height %ld (its rows cover heights %ld to %ld; earlier heights need the history build)", h, f, l);
+            snprintf(embuf, sizeof embuf, "coinstatsindex has no record for height %ld (its rows cover heights %ld to %ld; %s)", h, f, l,
+                     g_csi_hist_status ? g_csi_hist_status() : "earlier heights need the history build");
             *ec = -8; *em = embuf; return 0; }
         if (r < 0){ snprintf(embuf, sizeof embuf, "coinstatsindex row %ld is the baseline of its generation: block_info needs the previous row", h); *ec = -8; *em = embuf; return 0; }
         rj_val* out = rj_obj();
