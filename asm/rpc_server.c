@@ -1104,6 +1104,8 @@ int rpc_esplora_start(const char* bind_addr, int port, char* errmsg, size_t errc
     g_esp_fd = fd;
     pthread_t th; if (bmc_pthread_create(&th, esp_server_thread, 0) != 0){ snprintf(errmsg, errcap, "thread: %s", strerror(errno)); close(fd); g_esp_fd = -1; return -1; }
     pthread_detach(th);
+    /* the mempool cache refresher: a request never refreshes inline (2026-09-08) */
+    if (esplora_start_refresher(g_wallet) != 0) fprintf(stderr, "[rpc] esplora: the mempool refresher thread did not start; views refresh inline\n");
     return 0;
 }
 static void* server_thread(void* arg) {

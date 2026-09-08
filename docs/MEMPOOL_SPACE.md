@@ -79,6 +79,17 @@ In `backend/mempool-config.json`:
 - The frontend's dev server proxies `/api/*` to the backend, which
   forwards Esplora routes to the facade.
 
+## Limits on the address routes
+
+- `/address/:a/utxo` refuses an address with more than 500 unspent outputs
+  (HTTP 400 `too many unspent transaction outputs`), Esplora's own
+  `utxos_limit` rule: every funding event would need its transaction id,
+  one block read each.
+- The stats route resolves no transaction ids; a page of `/txs` resolves
+  its own 25. The mempool view is a cache refreshed by a background thread
+  in bounded slices, so a request only reads it; a fresh node's view is
+  complete a minute or two after boot.
+
 ## What to expect
 
 Blocks, block summaries, miner identification, transactions with fees and

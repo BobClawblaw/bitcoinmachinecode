@@ -12,6 +12,8 @@ int esplora_handle(const char* method, size_t mlen, const char* path, size_t ple
                    char** out, size_t* outlen, int* status, const char** ctype);
 /* the execution lock, taken around each dispatch (rpc_server.c installs it) */
 void esplora_set_exec_lock(void (*lock)(void), void (*unlock)(void));
+void esplora_mp_refresh(const rpc_wallet* w, long budget);   /* one bounded refresh of the mempool cache (the tests; the refresher thread) */
+int  esplora_start_refresher(const rpc_wallet* w);           /* the background refresher: after it, requests only read the cache */
 /* the second listener (rpc_server.c): 0 ok, -1 with errmsg */
 int rpc_esplora_start(const char* bind_addr, int port, char* errmsg, size_t errcap);
 /* pure helpers, exported for tests */
