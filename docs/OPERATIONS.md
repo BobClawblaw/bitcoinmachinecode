@@ -285,6 +285,12 @@ drop-in; the reference deployment's unit itself is a local artifact and is
 deliberately not vendored into this repository (operator decision,
 2026-09-05 — see `releases/2026-09-05-audits-closed.md`).
 
+- The reference deployment's `data/bitcoin.conf` (2026-09-08) has three keys:
+  `bind=<host address>` because a Core oracle on the same host listens on
+  `127.0.0.1-16:8333` for the benchmark's loopback replay and Linux refuses
+  a wildcard bind against a listening specific address on the same port;
+  `debuglogfile=0` and `printtoconsole=1` so the log keeps flowing through
+  the unit's capture below rather than `<chaindir>/debug.log`.
 - `ExecStart` runs **`bmcbitcoind.live`**, a symlink to a dated snapshot
   `bmcbitcoind.deploy-<YYYYMMDD><letter>`, not the tree binary. A rebuild
   changes nothing until the symlink moves; `systemctl restart` boots whatever
