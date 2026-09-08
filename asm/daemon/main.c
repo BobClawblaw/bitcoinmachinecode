@@ -8140,8 +8140,8 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
         extern void rpc_chain_set_coinstats_height(long (*)(void));
         rpc_chain_set_coinstats(csi_rpc_run);
         { extern int csi_hist_query(long, int, void*); extern long csi_hist_first(void), csi_hist_last(void);
-          extern void rpc_chain_set_coinstats_hist(int (*)(long, int, void*), long (*)(void), long (*)(void));
-          rpc_chain_set_coinstats_hist(csi_hist_query, csi_hist_first, csi_hist_last); }
+          extern void rpc_chain_set_coinstats_hist(int (*)(long, int, void*), long (*)(void), long (*)(void)) __attribute__((weak));   /* the test rules that compile this file without rpc_chain.o (link-check) */
+          if (rpc_chain_set_coinstats_hist) rpc_chain_set_coinstats_hist(csi_hist_query, csi_hist_first, csi_hist_last); }
         rpc_chain_set_coinstats_height(csi_file_height); } }
     { extern long utxo_dump_rpc_run(const char*, int (*)(long, unsigned char*),
                                     long*, unsigned long long*, char*, unsigned long);
