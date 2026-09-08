@@ -220,7 +220,7 @@ I2P destination.
 - `txindex=1` has no effect on the daemon: the index is built offline
   (`daemon/bmc_build_tx_index <datadir>`) and used when `txindex.dat` exists.
 - **txospenderindex** (2026-09-01): same pattern — `daemon/bmc_build_txospender_index
-  <datadir> [from] [to]` writes `txospender.dat` (~35 GB for mainnet; run it
+  <datadir> [from] [to]` writes `txospender.dat` (98 GB for mainnet at height 966,038, measured 2026-09-08; 46 minutes on the reference box; run it
   while the node is idle, it reads the whole archive once), the daemon then
   keeps `txospender.tail` current and `gettxspendingprevout` answers
   confirmed spends. Absent file = index off, exactly as Core without the
