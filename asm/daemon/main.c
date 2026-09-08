@@ -4227,6 +4227,24 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
             dlc_headers_rollback(hst, have0); return -1;
         }
         unsigned char prev[32]; memcpy(prev, loc + at * 32, 32);
+        /* ---- a peer BEHIND us (2026-09-08) ------------------------------------
+         * A peer answers from the deepest locator hash it knows. One that is
+         * behind our tip knows only a deep entry and sends the 2,000 headers
+         * after it -- every one a header we hold. dlc_take_page verified the
+         * overlap and appended nothing, the full page counted as progress,
+         * the locator (rebuilt from our unchanged tip) asked the same question
+         * and the peer gave the same page: production walked 415 identical
+         * pages (67 MB, 25 minutes) from a node ~100k blocks behind, the tip
+         * loop waiting the whole time. A page that ends below what we hold
+         * offers nothing; the peer is behind us, and the next candidate is
+         * tried. */
+        { long have_now = hst_count(hst);
+          if(pos + (long)cnt <= have_now){
+              fprintf(stderr,"[dlc] headers from %s attach at height %ld and end at %ld, below the %ld we hold -- the peer is behind us; trying another\n",
+                      cand, pos, pos + (long)cnt - 1, have_now);
+              lowwork_clear(&g_lw);
+              return added > 0 ? added : -1;
+          } }
         /* ---- CC-5: is this chain worth storing yet? ------------------------
          * Core (24.0 presync) stores nothing from a peer until the chain's
          * total work clears -minimumchainwork; this node appended every
@@ -5956,6 +5974,16 @@ static long dl_apply_backlog(long archive_tip, long first_hole, long applied){
     long top = (first_hole >= 0 && first_hole - 1 < archive_tip) ? first_hole - 1 : archive_tip;
     return top > applied ? top - applied : 0;
 }
+/* The height the far-behind trigger believes: the second-highest of the
+ * connected peers' announced start heights (the highest with one peer). A
+ * single peer's claim, honest or not, never starts the parallel downloader
+ * on its own; two agreeing peers do. */
+static long dl_trigger_height(const long* hs, int n){
+    if(n <= 0) return 0;
+    long top = 0, second = 0;
+    for(int i=0;i<n;i++){ if(hs[i] > top){ second = top; top = hs[i]; } else if(hs[i] > second) second = hs[i]; }
+    return n >= 2 ? second : top;
+}
 static int dl_should_parallel_fetch(long archive_tip, long best_peer_height,
                                     long apply_backlog, long long now_s, long long last_run_s){
     if(best_peer_height <= 0 || archive_tip < 0) return 0;
@@ -7269,19 +7297,30 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         }
         int apply_first = apply_backlog > DL_APPLY_FIRST_BACKLOG;
         {
-            long best = 0;
+            /* 2026-09-08: the trigger height is the SECOND-highest announce
+             * (dl_trigger_height), so one peer claiming 969,817 on a 966,063
+             * chain cannot start the parallel downloader -- production ran
+             * its two-minute header phase every ten minutes on exactly that
+             * peer, wrote nothing, and paused this loop each time. An
+             * announce that produced no blocks is not retried while the
+             * archive stands still. */
+            long hs[RPC_MAX_PEERS]; int nh = 0;
             if(g_node_status)
                 for(int i=0;i<mux_n_out && i<RPC_MAX_PEERS;i++)
-                    if(mux_out_fd[i]>=0 && g_node_status->peers[i].start_height > best)
-                        best = g_node_status->peers[i].start_height;
+                    if(mux_out_fd[i]>=0 && g_node_status->peers[i].start_height > 0)
+                        hs[nh++] = g_node_status->peers[i].start_height;
+            long best = dl_trigger_height(hs, nh);
             long atip = (long)(*(int*)(store_buf+24));
             long long nows = (long long)time(NULL);
+            static long noop_best = -1, noop_tip = -1;
+            if(best == noop_best && atip == noop_tip) best = atip;        /* the same claim already came to nothing at this tip */
             if(dl_should_parallel_fetch(atip, best, apply_backlog, nows, dl_parallel_last_s)){
                 fprintf(stderr,"[dl] archive at %ld, peers announce %ld: %ld blocks behind -- running the parallel downloader (%d workers)\n",
                         atip, best, best-atip, g_catchup_workers);
                 dl_parallel_last_s = nows;
                 long got = dl_catchup(dir, g_catchup_workers);
                 store_reload(store_buf);
+                if(got <= 0){ noop_best = best; noop_tip = atip; }
                 fprintf(stderr,"[dl] parallel downloader wrote %ld block(s); archive now %d\n", got, *(int*)(store_buf+24));
                 continue;                  /* re-evaluate: apply-first will take over */
             }

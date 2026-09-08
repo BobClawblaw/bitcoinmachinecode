@@ -267,6 +267,15 @@ int main(void){
       { /* a fork: overlaps our height 2 with a DIFFERENT block */
         unsigned char f2[80]; mk_hdr(f2, hh1, 0x99); unsigned char fp_[1][80]; memcpy(fp_[0], f2, 80);
         HFETCH(0, 1, fp_, "a page that forks from our chain at a held height: refused, store unchanged (count 4)", res == -1 && hst_count(hst) == 4); }
+      { /* a peer BEHIND us (2026-09-08): answers from an earlier locator point
+         * with a page that ends below our tip -- every header one we hold.
+         * Before the fix the overlap verified, nothing was appended, and the
+         * fetch returned 0 ("already current"); on a full page the loop asked
+         * the same locator again and production walked 415 identical pages
+         * from a node ~100k blocks behind. Now: -1, the next peer is tried. */
+        unsigned char h3b[80]; mk_hdr(h3b, hh2, 0x13);          /* == our height 3 (mk_hdr is deterministic) */
+        unsigned char bp2[2][80]; memcpy(bp2[0], h2, 80); memcpy(bp2[1], h3b, 80);
+        HFETCH(0, 2, bp2, "a page from an earlier locator point that ends BELOW our tip (a peer behind us): refused (-1), store unchanged (count 4)", res == -1 && hst_count(hst) == 4); }
       { /* VAL-5 (audit 2026-09-03): a header that CHAINS to our tip but fails
          * its own PoW must never be appended. Deterministic construction:
          * nBits exponent 4 / mantissa 1 -> target = 256, i.e. ~2^-248 of all
@@ -327,6 +336,13 @@ int main(void){
         ok(dlc_pick_peer(4, 0, e3, c3, b3, 400.0) == 1, "...untried gone: the 300 KB/s peer (1), NOT the dead-marked one -- it is measured, not untried");
         c3[1] = 1;
         ok(dlc_pick_peer(4, 0, e3, c3, b3, 400.0) == 2, "...and only the dead-marked one left: still returned rather than no peer (2)"); }
+      /* the far-behind trigger's height (2026-09-08): one liar cannot start
+       * the parallel downloader; two agreeing peers can */
+      { long one[1] = { 969817 }; long two[2] = { 969817, 966063 }; long many[5] = { 966063, 966063, 969817, 966062, 966063 };
+        ok(dl_trigger_height(one, 1) == 969817, "a single peer: its own claim (a fresh node with one peer must still sync)");
+        ok(dl_trigger_height(two, 2) == 966063, "two peers, one claiming 969,817: the second-highest, 966,063");
+        ok(dl_trigger_height(many, 5) == 966063, "five peers with one liar: 966,063");
+        ok(dl_trigger_height(many, 0) == 0, "no peers: 0"); }
       /* the download window and the retry ring ("write out monotonically,
        * like Core does"): a chunk is never claimed more than 1024 blocks
        * above the first hole, and an abandoned chunk is retried, never left. */
