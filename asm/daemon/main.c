@@ -3657,13 +3657,16 @@ enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CT
         * behind one trickling peer while 85 chunks above it were staged. */
        DLC_CTL_CURSOR_WANT = 16, DLC_CTL_N_CURSOR_HELP = 17,
        DLC_CTL_RING = 18 };
-#define DLC_CURSOR_HELP_SECS 10
+#define DLC_CURSOR_HELP_SECS 30
 /* ...and only when the pool has moved on without it: at least this many
  * chunks staged above the cursor. A 40-block chunk is 40 MB at height
- * 490,000 and takes a worker a minute; a bare 10 s clock fired five helps
- * in four minutes of run 18, each a duplicate download of a chunk whose
- * owner was still delivering it. */
-#define DLC_CURSOR_HELP_MIN_STAGED 8
+ * 490,000 and takes a worker a minute; a bare clock fires duplicate
+ * downloads of chunks whose owner is still delivering them. */
+#define DLC_CURSOR_HELP_MIN_STAGED 32
+/* (2026-09-08, later the same day: 10 s and 8 chunks fired 39 helps in 21
+ * minutes of run 18 at height 500,000 -- most of them on chunks whose owner
+ * was still delivering. A third of the window staged above the cursor and
+ * half a minute is a stall; anything less is a slow chunk.) */
 static long g_dlc_cursor_help_ms = DLC_CURSOR_HELP_SECS * 1000L;   /* test seam */
 /* Run 14 (2026-09-07) stalled for two minutes at 82,565: every worker
  * reconnected to the SAME peer -- one that accepted the handshake and
