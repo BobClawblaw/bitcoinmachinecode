@@ -11,6 +11,7 @@ Bitcoin Core. Everything else lives here.
 | [`OPERATIONS.md`](OPERATIONS.md) | installing, configuring, running as a service, upgrading, verifying, backing up, troubleshooting |
 | [`../config/bitcoin.sample.conf`](../config/bitcoin.sample.conf) | the complete configuration reference: every key at its default, and every Bitcoin Core option the node accepts without effect, does not apply, or does not support |
 | [`RPC_LIVE_NODE.md`](RPC_LIVE_NODE.md) | the embedded JSON-RPC server and its methods |
+| [`MEMPOOL_SPACE.md`](MEMPOOL_SPACE.md) | running mempool.space against the node: the Esplora facade, the address history index, the backend configuration (2026-09-08) |
 | [`FEATURE_GAPS.md`](FEATURE_GAPS.md) | what this node does and does not implement, against Bitcoin Core |
 | [`CORE_BEHAVIORAL_COMPAT.md`](CORE_BEHAVIORAL_COMPAT.md) | every Core behavior in one table with DONE / PARTIAL / GAP / DECIDED / PROOF against the source, and the ordered work list |
 | [`../validation/muhash_vs_core.sh`](../validation/muhash_vs_core.sh) | is this node's UTXO set byte-identical to Core's? Asks both nodes for `gettxoutsetinfo muhash` at the same height and compares muhash, txouts and total amount; an empty side is a failure. Re-runnable by anyone with an oracle |
@@ -89,6 +90,25 @@ also annotated tags.
 | [`releases/2026-09-08-undo-keep-all.md`](releases/2026-09-08-undo-keep-all.md) | undo data for every block in packed rev files, like Core; the 200-block window is gone |
 | [`releases/2026-09-08-esplora-facade.md`](releases/2026-09-08-esplora-facade.md) | an Esplora-compatible listener for mempool.space, answered in process by the node's own RPC handlers (stage 1: blocks, transactions, mempool, outspends) |
 | [`releases/2026-09-08-address-history.md`](releases/2026-09-08-address-history.md) | the address history index: every funding and spending event, native, ~200 GB; the facade's address routes on it |
+| [`releases/2026-09-07-download-window.md`](releases/2026-09-07-download-window.md) | The download window is 4096 blocks with a fresh anchor and a 2 s help -- monotonic AND faster than run 9 |
+| [`releases/2026-09-07-anchor-in-parent.md`](releases/2026-09-07-anchor-in-parent.md) | The window anchor is rescanned by the parent on demand -- a worker's own index reads were counted as network bytes |
+| [`releases/2026-09-07-quiet-log.md`](releases/2026-09-07-quiet-log.md) | Per-event download lines become per-tick counts; the peer table prints once a minute |
+| [`releases/2026-09-07-fail-backoff.md`](releases/2026-09-07-fail-backoff.md) | A failed fetch halves the peer's standing and backs off; the help chunk sits on the claim grid -- run 14's two-minute stall |
+| [`releases/2026-09-07-inflight-label.md`](releases/2026-09-07-inflight-label.md) | The status line says 'in flight N of window W' and how old the oldest gap is, not 'holes' |
+| [`releases/2026-09-07-index-holes-bmc-tools.md`](releases/2026-09-07-index-holes-bmc-tools.md) | Records above an index hole are kept when the header chain anchors them; every executable carries the bmc_ prefix |
+| [`releases/2026-09-08-rpcthreads-default.md`](releases/2026-09-08-rpcthreads-default.md) | Rpcthreads defaults to Core's 4, not 16 |
+| [`releases/2026-09-08-no-announce-in-ibd.md`](releases/2026-09-08-no-announce-in-ibd.md) | No tip announcements to the legs during initial block download, as Core |
+| [`releases/2026-09-08-quieter-log.md`](releases/2026-09-08-quieter-log.md) | The catch-up tick is two lines, per-block lines silent in IBD, one line per compaction, peer table every five minutes |
+| [`releases/2026-09-08-getpeerinfo-workers.md`](releases/2026-09-08-getpeerinfo-workers.md) | Getpeerinfo lists the parallel download's peers with their chunk in flight; getnettotals counts the download's bytes |
+| [`releases/2026-09-08-cursor-help.md`](releases/2026-09-08-cursor-help.md) | The committer asks for its stalled cursor chunk once the pool has moved on |
+| [`releases/2026-09-08-rawtx-v2-cap.md`](releases/2026-09-08-rawtx-v2-cap.md) | Getrawtransaction verbosity 2 keeps fee and prevouts past 1,024 inputs; the cursor help waits for a real stall |
+| [`releases/2026-09-08-facade-locking.md`](releases/2026-09-08-facade-locking.md) | The Esplora facade locks per dispatch and never asks gettxout for a mempool prevout |
+| [`releases/2026-09-08-stage-sweep.md`](releases/2026-09-08-stage-sweep.md) | Stale staged chunks are swept and the staged gauge is the directory's count |
+| [`releases/2026-09-08-rawtx-prevouts.md`](releases/2026-09-08-rawtx-prevouts.md) | Getrawtransaction verbosity 2 attaches the RIGHT prevouts, by txid and by block hash |
+| [`releases/2026-09-08-address-history-utxo-tail.md`](releases/2026-09-08-address-history-utxo-tail.md) | /address/:addr/utxo from funding events and the spender index; the tail journal adopts the history base |
+| [`releases/2026-09-08-announce-cap.md`](releases/2026-09-08-announce-cap.md) | The far-behind trigger believes the second-highest announce, not one peer's claim |
+| [`releases/2026-09-08-behind-peer.md`](releases/2026-09-08-behind-peer.md) | A header page that ends below our tip means the peer is behind us -- try another |
+| [`releases/2026-09-08-address-mempool.md`](releases/2026-09-08-address-mempool.md) | The address routes include the mempool |
 
 ## Development history
 
