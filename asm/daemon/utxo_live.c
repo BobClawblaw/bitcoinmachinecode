@@ -3253,7 +3253,8 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
                 g_last_stop_reason = UTXO_STOP_HOLE;
                 break;
             }
-            fprintf(stderr, "[utxo_live] WARNING: hole/short block at height %ld (len=%ld) -- stopping catch-up short\n", h, len);
+            { static long warned_h = -1;                       /* once per height: the worker retries every second */
+              if(h != warned_h){ warned_h = h; fprintf(stderr, "[utxo_live] WARNING: hole/short block at height %ld (len=%ld) -- stopping catch-up short (said once per height)\n", h, len); } }
             g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = h;
             g_last_stop_reason = UTXO_STOP_FAIL;
             break;
