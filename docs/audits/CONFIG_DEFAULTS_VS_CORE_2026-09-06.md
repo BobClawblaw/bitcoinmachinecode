@@ -137,7 +137,7 @@ download worker count and the verifier ignored it entirely.
 | `rpcpassword` | _unset_ | (none stated) | no stated Core default; unset here |
 | `rpcport` | 8332 | 8332 | match |
 | `rpcservertimeout` | 30 | 30 | match |
-| `rpcthreads` | 16 | 16 | match |
+| `rpcthreads` | 4 | 16 -> **4** | **FIXED 2026-09-08**: this audit had Core's default wrong (`DEFAULT_HTTP_THREADS` is 4); found when the operator asked why the RPC server was not multithreaded -- it is, with four workers now, as Core |
 | `rpcuser` | _unset_ | (none stated) | no stated Core default; unset here |
 | `rpcwhitelist` | _unset_ | (none stated) | no stated Core default; unset here |
 | `rpcwhitelistdefault` | 1 | (none stated) | no stated Core default; unset here |

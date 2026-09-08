@@ -74,6 +74,12 @@ V2_FD_MAX equ 4096
 global g_v2_hook_write
 global g_v2_hook_read
 global g_v2_active
+global g_p2p_write_hook
+; bmc.uploadratelimit (2026-09-08): a C pacer called BEFORE every p2p_write,
+; v1 and v2 alike, with (fd, payload length). 0 = no hook. It sleeps out the
+; byte debt of what this process has already sent, so the node's upload
+; stays under the operator's KB/s ceiling.
+g_p2p_write_hook: dq 0         ; void (*)(int fd, u32 plen)
 g_v2_hook_write: dq 0          ; long (*)(int fd, const char* cmd, u32 cmdlen,
                                ;         const void* payload, u32 plen)
 g_v2_hook_read:  dq 0          ; int  (*)(int fd, char cmd_out[12], void* payload,
@@ -380,6 +386,33 @@ p2p_frame:
 ; ============================================================================
 global p2p_write
 p2p_write:
+    ; upload pacer hook first, for BOTH transports. A C call at either stack
+    ; parity: save the argument registers, align, call, restore, then carry on
+    ; exactly as before. rax/r10/r11 are clobbered, which every caller already
+    ; tolerates on the v2 path below.
+    mov  rax, [rel g_p2p_write_hook]
+    test rax, rax
+    je   .nohook
+    push rbp
+    mov  rbp, rsp
+    push rdi
+    push rsi
+    push rdx
+    push rcx
+    push r8
+    push r9
+    mov  esi, r8d           ; arg2 = plen (arg1 fd already in edi)
+    and  rsp, -16
+    call rax
+    lea  rsp, [rbp-48]
+    pop  r9
+    pop  r8
+    pop  rcx
+    pop  rdx
+    pop  rsi
+    pop  rdi
+    pop  rbp
+.nohook:
     ; v2 dispatch (see g_v2_active above); falls through to v1 untouched
     cmp  edi, V2_FD_MAX
     jae  .v1

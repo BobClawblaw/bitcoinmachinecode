@@ -352,6 +352,7 @@ log echoes the resolved values.
 | `zmqpubhashblock` / `zmqpubhashtx` / `zmqpubrawblock` / `zmqpubrawtx` (+`hwm`) | — | ZMQ endpoints; `tcp://*` is refused, name an interface |
 | `blocknotify` / `alertnotify` / `startupnotify` / `shutdownnotify` | — | shell hooks; `%s` is sanitised before substitution |
 | `whitelist` / `whitebind` / `asmap` / `bantime` / `maxuploadtarget` / `blocksonly` | — / — / — / `86400` / `0` / `0` | peer permissions, AS bucketing, bans, upload budget, no tx relay |
+| `bmc.dialratelimit` / `bmc.downloadratelimit` / `bmc.uploadratelimit` | `0` / `0` / `0` | node-wide ceilings, off by default: outbound connection attempts per second; KB/s the sync may pull; KB/s the node may send (Core has only `maxuploadtarget`, a MiB-per-day budget, which is implemented too) |
 | `bmc.utxocompactthreshold` / `bmc.bootcatchup` | `12` / `1` | project-specific: UTXO runs that trigger compaction; run the parallel downloader at boot |
 
 ## Networks: Tor, I2P, CJDNS, IPv6
@@ -496,7 +497,7 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   (`peerbloomfilters`), `whitelistrelay`/`whitelistforcerelay`, GUI,
   `loadtxoutset` (assumeutxo import; export via `dumptxoutset` works),
   `walletnotify`, `maxtxfee` enforcement, `uacomment`,
-  `rpcthreads`/`rpcworkqueue`, `includeconf`/`settings`. Each unimplemented
+  `includeconf`/`settings`. Each unimplemented
   Core option is named in the startup log when set.
 - **Chains.** Legacy testnet3 (`testnet=1`, `chain=test`) is refused.
 - **One relay edge.** A transaction announced exactly once during a leg's

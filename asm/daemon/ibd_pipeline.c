@@ -34,6 +34,8 @@ long ibd_pipeline_last_batch(void){ return g_last_batch; }
 static long g_wave = 0;                  /* 0 = the whole chunk in one getdata */
 void ibd_pipeline_set_wave(long n){ g_wave = (n > 0 && n < IBD_PIPE_MAX) ? n : 0; }
 static void (*g_progress)(void*) = 0; static void* g_progress_arg = 0;
+static void (*g_bytes)(long) = 0;
+void ibd_pipeline_set_bytes(void (*cb)(long)){ g_bytes = cb; }
 void ibd_pipeline_set_progress(void (*cb)(void*), void* arg){ g_progress = cb; g_progress_arg = arg; }
 
 /* CompactSize for a count < 253 (the only sizes this builds: <= IBD_PIPE_MAX). */
@@ -92,6 +94,7 @@ long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long n
         if (r <= 0){ why = IBD_FAIL_READ; goto fail; }
         if (!strncmp(cmd, "ping", 12) && len == 8){ p2p_write(fd, "pong", 4, buf, 8); continue; }
         if (strncmp(cmd, "block", 12) != 0) continue;         /* inv, addr, feefilter, ... */
+        if (g_bytes) g_bytes((long)len);                       /* charged whether or not we wanted it */
         if (len < 81) continue;
 
         if (cons_verify(buf, (long)len, scratch, scratch_cap) != 1){ why = IBD_FAIL_CONSENSUS; goto fail; }   /* same gate, same scratch, as the serial path */

@@ -167,6 +167,9 @@ int main(void){
     ck("dbcache defaults to Core's 1024 MiB",        g_cfg.dbcache_mb == 1024);
     ck("maxconnections defaults to Core's 200",      g_cfg.max_connections == 200);
     ck("par defaults to Core's 0 (auto)",            g_cfg.par == 0);
+    ck("rpcthreads defaults to Core's 4 (DEFAULT_HTTP_THREADS)", g_cfg.rpcthreads == 4);
+    ck("rpcworkqueue defaults to Core's 64",           g_cfg.rpcworkqueue == 64);
+    ck("rpcservertimeout defaults to Core's 30 s",     g_cfg.rpcservertimeout == 30);
     /* the ONE discussed divergence in this list (2026-09-07): the pid file
      * default follows the daemon's name, so nothing we write carries Core's
      * daemon name. The `pid` key keeps Core's semantics. */

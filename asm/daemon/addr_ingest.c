@@ -177,6 +177,7 @@ long addr_ingest_msg(void* ab, const char* cmd, const unsigned char* pl, long pl
 long addr_gather_from(void* ab, const char* ip_str, int wait_s){
     unsigned ip;
     if(inet_pton(AF_INET, ip_str, &ip)!=1) return 0;
+    dial_gate_wait();
     int fd = tcp_connect_ip(ip, (unsigned short)htons(8333));
     if(fd<0) return 0;
     struct timeval tv; tv.tv_sec=6; tv.tv_usec=0;
