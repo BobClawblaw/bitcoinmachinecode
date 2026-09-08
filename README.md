@@ -111,11 +111,13 @@ testnet4, signet (public or custom) and regtest.
 - BIP339 `wtxidrelay`, BIP144 witness transport with witness-only peer
   preference, stripped-block serving to legacy peers, `sendheaders`,
   `feefilter`.
-- BIP152 compact blocks, SERVE side only: this node answers
-  `MSG_CMPCT_BLOCK` getdata and `getblocktxn`, and negotiates `sendcmpct`.
-  It does not RECEIVE compact blocks -- there is no inbound `cmpctblock` or
-  `blocktxn` handler -- so blocks always arrive in full. (NET-9, audit
-  2026-09-03: this line used to read "in both directions".)
+- BIP152 compact blocks in both directions: this node answers
+  `MSG_CMPCT_BLOCK` getdata and `getblocktxn`, negotiates `sendcmpct`, and
+  since 2026-09-06 receives `cmpctblock`, reconstructs the block from its
+  mempool by short id, asks `getblocktxn` for what it lacks, and falls back
+  to a full `getdata` (`daemon/cmpct_recv.c`). (The receive side was absent
+  at the 2026-09-03 audit, NET-9; this line said "SERVE side only" until
+  2026-09-08.)
 - BIP157/158 compact block filter serving (`getcfilters`, `getcfheaders`,
   `getcfcheckpt`) backed by the whole-chain filter index.
 - BIP324 v2 encrypted transport, inbound and outbound, with in-band v1

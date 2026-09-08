@@ -67,6 +67,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | `getblocks` (legacy) | still answered | answered | **DONE** |
 | `mempool` (BIP35) gated by permission | | same (`NP_MEMPOOL`) | **DONE** |
 | **BIP152 compact blocks — serve side** | answers `MSG_CMPCT_BLOCK`, `getblocktxn`, negotiates `sendcmpct` | same | **DONE** |
+| **BIP152 compact blocks — receive side** | `cmpctblock` reconstructed from the mempool by short id, `getblocktxn` for the rest, full `getdata` fallback | the same since 2026-09-06 (`daemon/cmpct_recv.c`, CC-2) | **DONE** |
 | BIP152 compact blocks — receive side | high- and low-bandwidth modes; reconstruct from mempool, `getblocktxn` for the rest, `blockreconstructionextratxn` | **low-bandwidth mode**: `sendcmpct` sent after verack on outbound legs, `MSG_CMPCT_BLOCK` requested on a leg that negotiated, reconstruction from the shared mempool, `getblocktxn`/`blocktxn` for the rest, full-block fallback on any failure (`cmpct_recv.c`, CC-2, `49c1c6f`). High-bandwidth push and the extra-txn pool are follow-ups | **DONE** (low-bandwidth) |
 | BIP157/158 `getcfilters`/`getcfheaders`/`getcfcheckpt` | when `-peerblockfilters` | same (`serve_cfilters.c`), service bit gated the same way | **DONE** |
 | BIP37 bloom (`filterload` etc.) | default off, `NODE_BLOOM` off | not implemented, bit never set | **DECIDED** (matches Core's default) |

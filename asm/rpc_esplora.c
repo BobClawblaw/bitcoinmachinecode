@@ -395,6 +395,8 @@ static long qparam(const char* path, size_t plen, const char* key){
  * refreshes inline with the same bound. */
 #include <pthread.h>
 #include <unistd.h>
+#include <sched.h>
+#include <time.h>
 static pthread_mutex_t g_mp_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_mp_refresher = 0;
 /* A refresh holds the cache lock only while it touches the cache: every RPC
@@ -402,19 +404,32 @@ static volatile int g_mp_refresher = 0;
  * request after a boot waited 58 s behind one 400-transaction slice that
  * held the lock through 1,200 dispatches. */
 static __thread int g_mp_in_refresh = 0;
+/* 15:30Z 2026-09-08: the refresher released and re-took the RPC lock in a
+ * tight loop for every transaction of a 9,000-transaction fill and no
+ * waiting request thread ever won the (unfair) mutex until the pass ended:
+ * the facade answered nothing for minutes while JSON-RPC limped. After
+ * every dispatch the refresher yields and sleeps a millisecond, so a
+ * waiter gets the lock; a pass is bounded by time as well as by count. */
 static rj_val* mp_call(const rpc_wallet* w, const char* method, rj_val* params){
     if (g_mp_in_refresh) pthread_mutex_unlock(&g_mp_lock);
     rj_val* r = call(w, method, params, 0, 0);
-    if (g_mp_in_refresh) pthread_mutex_lock(&g_mp_lock);
+    if (g_mp_in_refresh){ struct timespec ts = { 0, 1000 * 1000 }; sched_yield(); nanosleep(&ts, 0); pthread_mutex_lock(&g_mp_lock); }
     return r;
 }
+static long long mp_now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec * 1000 + t.tv_nsec / 1000000; }
+#define MP_REFRESH_MS 400
 #define MP_REFRESH_SLICE 400
 typedef struct { unsigned char key[33]; unsigned char txid[32]; unsigned vout; unsigned long long value; int is_spend; unsigned char spent_txid[32]; unsigned spent_vout; } mp_ev;   /* one output funded, or one input spent */
 typedef struct { unsigned char txid[32]; unsigned char vout_keys_done; } mp_tx;
 static mp_ev* g_mp_ev = 0; static long g_mp_nev = 0, g_mp_cap = 0;
 static unsigned char (*g_mp_txids)[32] = 0; static long g_mp_ntx = 0;        /* the txids the cache knows, sorted */
 static int cmp32(const void* a, const void* b){ return memcmp(a, b, 32); }
-static int mp_has(const unsigned char txid[32]){ return g_mp_ntx && bsearch(txid, g_mp_txids, (size_t)g_mp_ntx, 32, cmp32) != 0; }
+static long g_mp_sorted = 0;                                                   /* the sorted prefix of g_mp_txids; the tail is this pass's appends */
+static int mp_has(const unsigned char txid[32]){
+    if (g_mp_sorted && bsearch(txid, g_mp_txids, (size_t)g_mp_sorted, 32, cmp32)) return 1;
+    for (long i = g_mp_sorted; i < g_mp_ntx; i++) if (!memcmp(g_mp_txids[i], txid, 32)) return 1;
+    return 0;
+}
 static void mp_push(const unsigned char key[33], const unsigned char txid[32], unsigned vout, unsigned long long value, int is_spend, const unsigned char* stx, unsigned svout){
     if (g_mp_nev == g_mp_cap){ g_mp_cap = g_mp_cap ? g_mp_cap * 2 : 4096; g_mp_ev = realloc(g_mp_ev, (size_t)g_mp_cap * sizeof *g_mp_ev); }
     mp_ev* e = &g_mp_ev[g_mp_nev++]; memcpy(e->key, key, 33); memcpy(e->txid, txid, 32); e->vout = vout; e->value = value; e->is_spend = is_spend;
@@ -448,9 +463,9 @@ static void mp_refresh_locked(const rpc_wallet* w, long budget){
     for (long i = 0; i < g_mp_nev; i++) if (bsearch(g_mp_ev[i].txid, now, (size_t)nn, 32, cmp32)) g_mp_ev[keep++] = g_mp_ev[i];
     g_mp_nev = keep;
     /* fetch the new ones (parents before children when both are new: two rounds) */
-    long fetched = 0;
+    long fetched = 0; long long t0 = mp_now_ms(); int resort = 0;
     for (int round = 0; round < 2 && fetched < budget; round++){
-        for (long i = 0; i < nn && fetched < budget; i++){
+        for (long i = 0; i < nn && fetched < budget && mp_now_ms() - t0 < MP_REFRESH_MS; i++){
             if (mp_has(now[i])) continue;
             char hx[65]; hexrev(hx, now[i]);
             rj_val* t = mp_call(w, "getrawtransaction", P1s1n(hx, 1)); if (!t) continue;
@@ -464,7 +479,7 @@ static void mp_refresh_locked(const rpc_wallet* w, long budget){
                 mp_push(key, now[i], (unsigned)o, (unsigned long long)esplora_sats_of_amount(S(vo->items[o], "value")), 0, 0, 0);
             }
             /* the txid joins the known set now, so a child in this round finds its parent's outputs */
-            { unsigned char (*nk)[32] = realloc(g_mp_txids, (size_t)(g_mp_ntx + 1) * 32); g_mp_txids = nk; memcpy(g_mp_txids[g_mp_ntx++], now[i], 32); qsort(g_mp_txids, (size_t)g_mp_ntx, 32, cmp32); }
+            { unsigned char (*nk)[32] = realloc(g_mp_txids, (size_t)(g_mp_ntx + 1) * 32); g_mp_txids = nk; memcpy(g_mp_txids[g_mp_ntx++], now[i], 32); resort = 1; }
             for (size_t k = 0; vi && vi->typ == RJ_ARR && k < vi->nitems; k++){
                 const char* ptx = S(vi->items[k], "txid"); if (!ptx || S(vi->items[k], "coinbase")) continue;
                 unsigned char pt[32]; if (unhex(ptx, pt, 32) != 32) continue; for (int q = 0; q < 16; q++){ unsigned char x = pt[q]; pt[q] = pt[31-q]; pt[31-q] = x; }
@@ -477,6 +492,8 @@ static void mp_refresh_locked(const rpc_wallet* w, long budget){
     /* the known set = what is in the mempool now (minus the ones deferred to the next refresh) */
     long kn = 0; for (long i = 0; i < g_mp_ntx; i++) if (bsearch(g_mp_txids[i], now, (size_t)nn, 32, cmp32)) memcpy(g_mp_txids[kn++], g_mp_txids[i], 32);
     g_mp_ntx = kn;
+    if (resort || kn) qsort(g_mp_txids, (size_t)g_mp_ntx, 32, cmp32);
+    g_mp_sorted = g_mp_ntx;
     free(now); g_mp_in_refresh = 0;
 }
 /* the address's mempool view: stats, its unconfirmed txids (newest last, as seen), its unconfirmed outputs, and the outpoints it had that the mempool spends */
