@@ -367,6 +367,7 @@ log echoes the resolved values.
 | `blocknotify` / `alertnotify` / `startupnotify` / `shutdownnotify` | — | shell hooks; `%s` is sanitised before substitution |
 | `whitelist` / `whitebind` / `asmap` / `bantime` / `maxuploadtarget` / `blocksonly` | — / — / — / `86400` / `0` / `0` | peer permissions, AS bucketing, bans, upload budget, no tx relay |
 | `bmc.dialratelimit` / `bmc.downloadratelimit` / `bmc.uploadratelimit` | `0` / `0` / `0` | node-wide ceilings, off by default: outbound connection attempts per second; KB/s the sync may pull; KB/s the node may send (Core has only `maxuploadtarget`, a MiB-per-day budget, which is implemented too) |
+| `rest` | `0` | `1` serves Core's REST interface (`/rest/...`) on the RPC listener, unauthenticated; keep the listener on loopback |
 | `bmc.esploraport` / `bmc.esplorabind` | `0` / `127.0.0.1` | the Esplora facade for mempool.space: a second, unauthenticated listener; keep it on loopback or behind a proxy |
 | `bmc.utxocompactthreshold` / `bmc.bootcatchup` | `12` / `1` | project-specific: UTXO runs that trigger compaction; run the parallel downloader at boot |
 
@@ -419,6 +420,10 @@ log echoes the resolved values.
   verification record is in [`docs/PARITY_PLAN.md`](docs/PARITY_PLAN.md).
 - A method the node cannot honour returns an explicit refusal naming the
   gap rather than an approximate answer.
+- Core's REST interface (`rest=1`, 2026-09-08): the fourteen `/rest/`
+  routes on the RPC listener, unauthenticated as in Core, in `.json`,
+  `.hex` and `.bin`, with Core's status codes and error texts; every
+  route is answered from the node's own RPC handlers.
 - The Esplora facade (`bmc.esploraport`) serves Esplora's REST contract
   in-process for mempool.space; it takes the RPC lock per dispatch, so a
   batch route cannot starve JSON-RPC callers. Address routes need the
@@ -512,8 +517,7 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   tested but not emitted on the wire. Reconciliation rounds are not built;
   Bitcoin Core itself ships only the negotiation (its `-txreconciliation` is
   off by default and its message processing has no `reqrecon`/`sketch`).
-- **Not implemented:** REST interface, UPnP/NAT-PMP, BIP37 bloom filters
-  (Core's REST is absent; an Esplora-contract listener exists instead, `bmc.esploraport`)
+- **Not implemented:** UPnP/NAT-PMP, BIP37 bloom filters
   (`peerbloomfilters`), `whitelistrelay`/`whitelistforcerelay`, GUI,
   `loadtxoutset` (assumeutxo import; export via `dumptxoutset` works),
   `walletnotify`, `maxtxfee` enforcement, `uacomment`,

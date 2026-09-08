@@ -149,7 +149,6 @@ static const struct { const char* key; const char* why; } k_noeffect[] = {
     {"txreconciliation",   "Erlay: BIP330 negotiation is built but reconciliation is a deliberate stop"},
     {"natpmp",             "no NAT-PMP/UPnP port mapping by design"},
     {"upnp",               "no NAT-PMP/UPnP port mapping by design"},
-    {"rest",               "no REST interface by design"},
     {"server",             "the JSON-RPC server is always on"},
     {"daemon",             "a systemd unit (or the shell) backgrounds the process"},
     {"daemonwait",         "a systemd unit (or the shell) backgrounds the process"},
@@ -252,7 +251,7 @@ int nodecfg_known_key(const char* key){
         "upnp","natpmp","peerbloomfilters","peerblockfilters","blockfilterindex",
         "txindex","coinstatsindex","addressindex","spentindex","timestampindex",
         "prune","par","checkblockindex","checkmempool","checkaddrman",
-        "capturemessages","stopafterblockimport","persistmempool","rest",
+        "capturemessages","stopafterblockimport","persistmempool",
         "server","daemon","logips","logtimestamps","debuglogfile","printtoconsole",
         "reindex","reindex-chainstate","fixedseeds","forcednsseed","i2pacceptincoming",
         "v2transport","networkactive","rpccookieperms","deprecatedrpc",
@@ -294,7 +293,7 @@ static void set_defaults(void){
     g_cfg.txreconciliation = 0;
     g_cfg.logips = 0; g_cfg.logtimestamps = 1; g_cfg.logtimemicros = 0; g_cfg.logthreadnames = 0;
     g_cfg.logsourcelocations = 0; g_cfg.shrinkdebugfile = 1; g_cfg.printtoconsole = 0; g_cfg.loglevel[0] = 0;
-    g_cfg.rpcthreads = 4; g_cfg.rpcworkqueue = 64; g_cfg.rpcservertimeout = 30; g_cfg.n_rpcwhitelist = 0;   /* Core: DEFAULT_HTTP_THREADS 4, DEFAULT_HTTP_WORKQUEUE 64, DEFAULT_HTTP_SERVER_TIMEOUT 30 (was 16 threads until 2026-09-08) */
+    g_cfg.rest = 0; g_cfg.rpcthreads = 4; g_cfg.rpcworkqueue = 64; g_cfg.rpcservertimeout = 30; g_cfg.n_rpcwhitelist = 0;   /* Core: DEFAULT_HTTP_THREADS 4, DEFAULT_HTTP_WORKQUEUE 64, DEFAULT_HTTP_SERVER_TIMEOUT 30 (was 16 threads until 2026-09-08) */
     g_cfg.rpcwhitelistdefault = -1; g_cfg.rpccookieperms = 0;
     g_cfg.limitclustercount = 64; g_cfg.limitclustersize_kvb = 101;
     g_cfg.checkblockindex = 0; g_cfg.checkmempool = 0; g_cfg.checkaddrman = 0; g_cfg.capturemessages = 0;
@@ -918,6 +917,8 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"bmc.bootcatchup")){ g_cfg.boot_catchup = iv ? 1 : 0; applied++; }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
             g_cfg.listen = iv?1:0; saw_listen = 1; applied++; }
+        else if(!strcmp(key,"rest")){         /* Core: the REST interface on the RPC listener, unauthenticated (rest.c, 2026-09-08) */
+            g_cfg.rest = iv?1:0; applied++; }
         else if(!strcmp(key,"prune")){
             /* Core -prune: 0 disabled, 1 manual-only (no automatic deletion),
              * >=550 a target size in MiB for the block data. Values in 2..549

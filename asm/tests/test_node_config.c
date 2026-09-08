@@ -409,9 +409,14 @@ int main(void){
     if (sig_ok && g_cfg.n_seednode==0) printf("PASS: signetseednode becomes a seednode on signet only\n");
     else { printf("FAIL: signetseednode (signet ok=%d main n=%d)\n", sig_ok, g_cfg.n_seednode); failures++; }
     /* no-effect Core options are recognised with a reason */
-    if (nodecfg_noeffect_reason("mocktime") && nodecfg_noeffect_reason("rest") && !nodecfg_noeffect_reason("uacomment") && !nodecfg_noeffect_reason("dbcache"))
-        printf("PASS: no-effect table names mocktime/rest, not implemented keys\n");
+    /* rest left the no-effect table on 2026-09-08: rest=1 serves Core's REST interface (rest.c) */
+    if (nodecfg_noeffect_reason("mocktime") && !nodecfg_noeffect_reason("rest") && !nodecfg_noeffect_reason("uacomment") && !nodecfg_noeffect_reason("dbcache"))
+        printf("PASS: no-effect table names mocktime, not implemented keys (rest is implemented)\n");
     else { printf("FAIL: no-effect table\n"); failures++; }
+    wr("rest.conf", "rest=1\n"); node_config_load("rest.conf");
+    if (g_cfg.rest == 1) printf("PASS: rest=1 enables Core's REST interface\n"); else { printf("FAIL: rest=1 not applied\n"); failures++; }
+    node_config_load("/nonexistent/reset.conf");
+    if (g_cfg.rest == 0) printf("PASS: rest defaults to 0 (Core's default)\n"); else { printf("FAIL: rest default\n"); failures++; }
     node_config_load("/nonexistent/reset.conf");
     /* rpcthreads: 4 is Core's DEFAULT_HTTP_THREADS; this line pinned 16 until 2026-09-08 (a test that encoded the defect) */
     if (g_cfg.blockmaxweight==4000000 && g_cfg.txconfirmtarget==6 && g_cfg.walletrbf==1 && g_cfg.rpcthreads==4 && g_cfg.maxtipage==86400 && !strcmp(g_cfg.addresstype,"bech32") && g_cfg.n_uacomment==0)

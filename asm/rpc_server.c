@@ -5,6 +5,8 @@
  * rpc_dispatch() so the server can never diverge from the client.
  */
 #include "rpc_server.h"
+#include "rest.h"                 /* Core's REST interface on this listener (rest=1) */
+static volatile int g_rest_on = 0;
 #include "crypto_hkdf.h"   /* hmac_sha256, shared with BIP324 */
 #include "rpc_net.h"
 #include "rpc_json.h"
@@ -952,8 +954,16 @@ static void service_conn(int cfd) {
         const char* e = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
         (void)write_all(cfd, e, strlen(e)); free(buf); close(cfd); return;
     }
-    (void)path; (void)plen;
-
+    /* Core's REST interface (rest=1): the /rest/ routes on this listener,
+     * any method, no authentication -- exactly as Core serves them. The
+     * rpcallowip check already happened at accept. */
+    if (g_rest_on && rest_is_path(path, plen)){
+        char* rout = 0; size_t routlen = 0; int rstatus = 500; const char* rctype = "text/plain";
+        rest_handle(m, mlen, path, plen, body, blen, g_wallet, &rout, &routlen, &rstatus, &rctype);
+        char rh[256]; int rl = snprintf(rh, sizeof rh, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", rstatus, status_text(rstatus), rctype, routlen);
+        (void)write_all(cfd, rh, (size_t)rl); if (rout && routlen) (void)write_all(cfd, rout, routlen);
+        free(rout); free(buf); close(cfd); return;
+    }
     /* only POST (Core exact text + 405) */
     if (mlen != 4 || memcmp(m, "POST", 4) != 0) {
         const char* txt = "JSONRPC server handles only POST requests";
@@ -1079,6 +1089,8 @@ static void* esp_server_thread(void* arg){
 }
 static void esp_lock(void){ pthread_mutex_lock(&g_exec_lock); }
 static void esp_unlock(void){ pthread_mutex_unlock(&g_exec_lock); }
+/* Core's REST interface (rest=1, 2026-09-08): served by the JSON-RPC listener, dispatch-locked like the facade */
+void rpc_rest_enable(int on){ g_rest_on = on; rest_set_exec_lock(esp_lock, esp_unlock); }
 int rpc_esplora_start(const char* bind_addr, int port, char* errmsg, size_t errcap){
     if (port <= 0) return 0;
     esplora_set_exec_lock(esp_lock, esp_unlock);

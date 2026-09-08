@@ -29,6 +29,7 @@ extern void* mp_ext_area;
 extern unsigned long mp_ext_slots;
 extern unsigned long mp_ext_inited;
 extern void* mp_ext_polstate;
+extern unsigned long mp_ext_blob_cap;
 extern long mpool_put(void* mp, const unsigned char txid[32],
                       const unsigned char* tx, unsigned long txlen);
 extern long mpool_count(void* mp);
@@ -54,6 +55,7 @@ int main(void){
     g_cfg.maxmempool_mb = 8;
     ck("mempool_configure(8MB)", mempool_configure() == 1);
     ck("region published", mp_ext_area != NULL && mp_ext_slots >= 1024);
+    ck("the budget is Core's MB: 8 -> 8,000,000 bytes (was MiB: 8,388,608; getmempoolinfo reported 314572800 for the default)", mp_ext_blob_cap == 8000000UL);
     ck("pool init'd ONCE at configure (mp_ext_inited)", mp_ext_inited == 1);
     ck("policy state shared region published", mp_ext_polstate != NULL);
     ck("pool starts empty", mpool_count(mp_ext_area) == 0);
