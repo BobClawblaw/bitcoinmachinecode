@@ -116,10 +116,8 @@ static long mk_block(u8* raw, u8 hash[32], const u8 prev[32], unsigned tag, unsi
     return o - raw;
 }
 
-static int undo_exists(long h){
-    char p[64]; snprintf(p,sizeof p,"undo_%ld.dat",h);
-    struct stat sb; return stat(p,&sb)==0;
-}
+#include "../daemon/undo_store.h"
+static int undo_exists(long h){ return us_exists(h); }   /* 2026-09-08: presence is an index entry in the packed store */
 
 /* Coinbase maturity is 100, so a block can only spend a coinbase at least
  * 100 deep. 140 blocks with spends from height 101 onward gives a tip whose

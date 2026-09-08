@@ -22,11 +22,11 @@
  * ~1 getheaders page plus margin, and far beyond any reorg depth this node
  * will ever act on (see REORG_MAX_DEPTH). */
 #define REORG_MAX_HEADERS   2048
-/* Hard cap on how many blocks we will ever disconnect automatically. MUST
- * stay <= daemon/utxo_live.c's UTXO_UNDO_WINDOW (200), because a disconnect
- * deeper than the retained undo data physically cannot reconstruct the UTXO
- * set. A candidate that forks deeper than this is refused outright and
- * logged -- that situation is a human's decision, not a daemon's. */
+/* Hard cap on how many blocks we will ever disconnect automatically. Undo
+ * data is kept for every block since 2026-09-08 (daemon/undo_store.h), so
+ * this is policy, not a physical limit: a candidate that forks deeper than
+ * this is refused outright and logged -- that situation is a human's
+ * decision, not a daemon's. */
 #define REORG_MAX_DEPTH     100
 /* Matches daemon/locator_build.c's own LOCATOR_MAX. */
 #define REORG_LOCATOR_MAX   32

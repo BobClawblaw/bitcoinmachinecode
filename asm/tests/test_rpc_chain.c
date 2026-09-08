@@ -18,6 +18,7 @@
  *
  * Every expected string below is Core's own rendering for that field.
  */
+#include "../daemon/undo_store.h"
 #include "../rpc_json.h"
 #include "../rpc_commands.h"
 #include "../rpc_chain.h"
@@ -614,9 +615,8 @@ int main(void){
         r1[48] = 0;                                    /* not generated */
         r1[49] = 25; r1[50] = 0;
         memcpy(r1+51, SPK_PKH, 25);
-        FILE* uf = fopen("undo_3.dat", "wb");
-        ck("undo_3.dat opened", uf != NULL);
-        if (uf){ fwrite(rec, 1, sizeof rec, uf); fclose(uf); }
+        /* 2026-09-08: the packed undo store -- height 3's run, closed with END */
+        ck("undo run for height 3 written to the rev store", us_append_run(3, rec, sizeof rec, 1) == 0);
       }
       snprintf(p, sizeof p, "[\"%s\", 2]", g_hash[3]);
       r = call("getblock", p, &ec, &em);

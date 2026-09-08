@@ -500,8 +500,10 @@ tests/test_undo_log: tests/test_undo_log.c daemon/undo_log.o $(UTXOLSMOBJS) $(TE
 # compiled with objcopy-prefixed symbols (ref_*) so both link into one
 # binary; the prefixed object has its own rule so prereq-check sees it as a
 # declared prerequisite rather than a file the recipe conjures.
-tests/undo_log_ref.o: daemon/undo_log.c
-	$(CC) $(CFLAGS) -c daemon/undo_log.c -o $@
+# 2026-09-08: the reference is the FROZEN pre-packed-store module (tests/undo_log_ref.c):
+# bitcoin_undo.asm ports that file format; the daemon links daemon/undo_log.c on the rev store.
+tests/undo_log_ref.o: tests/undo_log_ref.c
+	$(CC) $(CFLAGS) -c tests/undo_log_ref.c -o $@
 	objcopy --redefine-sym undo_append_record=ref_undo_append_record \
 	        --redefine-sym undo_capture_and_del=ref_undo_capture_and_del \
 	        --redefine-sym undo_load=ref_undo_load \
@@ -2682,7 +2684,7 @@ rpc_net.o: rpc_net.c rpc_net.h rpc_json.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_net.c
 rpc_commands.o: rpc_commands.c rpc_commands.h rpc_json.h rpc_node.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_commands.c
-rpc_chain.o: rpc_chain.c rpc_chain.h bitcoin_pow_rules.h rpc_json.h rpc_commands.h version_gen.h descriptor.h miniscript.h musig2.h \
+rpc_chain.o: rpc_chain.c rpc_chain.h bitcoin_pow_rules.h rpc_json.h rpc_commands.h version_gen.h descriptor.h miniscript.h musig2.h daemon/undo_store.h \
     rpc_node.h script_flags_consts.h block_filter.h mempool_slot.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_chain.c
 rpc_node.o: rpc_node.c rpc_node.h rpc_json.h version_gen.h mempool_slot.h

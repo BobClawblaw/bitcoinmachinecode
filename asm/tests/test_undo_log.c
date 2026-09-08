@@ -13,6 +13,18 @@
  *
  * LSM setup mirrors tests/test_utxo_lsm.c's own init pattern.
  */
+#include "../daemon/undo_store.h"
+/* 2026-09-08: the store's API used by the new checks (undo_log.c has no header) */
+typedef int (*undo_replay_cb)(void* ctx, const unsigned char txid[32], unsigned index, unsigned long long value, unsigned height, unsigned char is_coinbase, const unsigned char* script, unsigned short slen);
+extern long undo_replay_tolerant(long height, undo_replay_cb cb, void* ctx, int* torn);
+extern long undo_discard(long height);
+extern long undo_commit(long height);
+extern int  undo_exists(long height);
+extern long undo_prune_below(long keep_from);
+extern long undo_prune_from(long from_height, long tip_height, long window, long max_scan);
+extern long undo_migrate_legacy(void);
+extern long undo_wipe(void);
+extern void undo_close_current(void);
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -89,10 +101,6 @@ static void setup_lst(struct LST* lst, void* tomb, void* manifest, void* scratch
     lst->scratch_buf = scratch; lst->scratch_cap = SCRATCH_CAP;
 }
 
-static int file_exists(const char* path){
-    struct stat sb;
-    return stat(path, &sb) == 0;
-}
 
 int main(void){
     tt_isolate();
@@ -194,33 +202,75 @@ int main(void){
             if (h == REAL_HEIGHT) continue; /* already has real records from Part 1 */
             cki("seed dummy undo record", undo_append_record(h, dummy_txid, 0, 1, 0, 0, dummy_script, 3), 1);
         }
-        char path_real[64]; snprintf(path_real, sizeof path_real, "undo_%ld.dat", REAL_HEIGHT);
-        ckm("real-height undo file exists before prune", file_exists(path_real));
+        undo_close_current();
+        ckm("real-height undo run exists before any prune", undo_exists(REAL_HEIGHT));
 
+        /* 2026-09-08: undo is kept for EVERY block, like Core's rev files. The
+         * old 200-block window (undo_prune / undo_prune_from) is a no-op. */
         long removed = undo_prune(250, 200);
-        cki("undo_prune removed count", removed, 51);
+        cki("undo_prune is a no-op now (retention follows the block store)", removed, 0);
+        cki("undo_prune_from is a no-op too (cursor unchanged)", undo_prune_from(7, 250, 200, 20000), 7);
+        int all_kept = 1; for (long h = 0; h <= 250; h++) if (!undo_exists(h)) all_kept = 0;
+        ckm("every height 0..250 still has its undo run after the old window's prune", all_kept);
+        { static undo_rec_t r10[2]; cki("undo_load(10) after undo_prune(250,200) still returns its record (retention, not a window)", undo_load(10, r10, 2), 1); }
 
-        for (long h = 0; h <= 50; h++){
-            char p[64]; snprintf(p, sizeof p, "undo_%ld.dat", h);
-            char lbl[80]; snprintf(lbl, sizeof lbl, "undo_%ld.dat removed (h<=50)", h);
-            ckm(lbl, !file_exists(p));
-        }
-        for (long h = 51; h <= 250; h += 37){ /* spot-check the retained range */
-            char p[64]; snprintf(p, sizeof p, "undo_%ld.dat", h);
-            char lbl[80]; snprintf(lbl, sizeof lbl, "undo_%ld.dat retained (h>=51)", h);
-            ckm(lbl, file_exists(p));
-        }
-        ckm("real-height undo file survived pruning (h=200 is inside the window)", file_exists(path_real));
+        /* the block store pruned below 51: entries below go, the rev file
+         * stays while it still holds a kept height (whole files, like Core) */
+        long files = undo_prune_below(51);
+        cki("undo_prune_below(51) removed no rev file (the one file also holds kept heights)", files, 0);
+        int low_gone = 1; for (long h = 0; h <= 50; h++) if (undo_exists(h)) low_gone = 0;
+        ckm("heights 0..50 have no undo entry after the store prune", low_gone);
+        int high_kept = 1; for (long h = 51; h <= 250; h += 37) if (!undo_exists(h)) high_kept = 0;
+        ckm("heights 51..250 keep their entries", high_kept);
+        ckm("real-height undo run survived (h=200 is kept)", undo_exists(REAL_HEIGHT));
         {
             static undo_rec_t recs[8];
             long n = undo_load(REAL_HEIGHT, recs, 8);
-            cki("real-height undo file still has both real records after prune", n, 2);
+            cki("real-height run still has both real records after the prune", n, 2);
         }
+        cki("pruning below the same height again removes nothing more", undo_prune_below(51), 0);
+    }
 
-        /* second prune call with the same window is a clean no-op (nothing
-         * left below the boundary to remove) */
-        long removed2 = undo_prune(250, 200);
-        cki("re-pruning the same window removes nothing more", removed2, 0);
+    /* 2026-09-08: the packed store's run semantics -- open, closed, torn */
+    {
+        u8 tx[32]; memset(tx, 0xB1, 32); u8 sc[3] = {1,2,3};
+        cki("append h=880 (run open, no END yet)", undo_append_record(880, tx, 1, 10, 0, 0, sc, 3), 1);
+        cki("append h=880 again", undo_append_record(880, tx, 2, 20, 0, 0, sc, 3), 1);
+        undo_close_current();
+        { undo_rec_t recs[4]; cki("an OPEN run loads its whole records (as the old file read to its end)", undo_load(880, recs, 4), 2); }
+        cki("commit h=880 (END written)", undo_commit(880), 1);
+        { undo_rec_t recs[4]; cki("a closed run loads the same two records", undo_load(880, recs, 4), 2); }
+        cki("commit of a height that spent nothing creates an empty run", undo_commit(881), 1);
+        ckm("...so undo_exists(881) is true: 881 was applied", undo_exists(881));
+        { undo_rec_t recs[4]; cki("...and it loads zero records", undo_load(881, recs, 4), 0); }
+        /* a torn tail: a partial record appended raw to the current rev file after a new open run */
+        cki("append h=882 (open)", undo_append_record(882, tx, 3, 30, 0, 0, sc, 3), 1);
+        undo_close_current();
+        { undo_slot_t sl = {0, 0}; ckm("882 has an index entry", us_slot_get(882, &sl) == 1);
+          char name[32]; us_rev_name(name, sl.file); int fd = open(name, O_WRONLY | O_APPEND);
+          u8 partial[20]; memset(partial, 0x77, 20); ckm("write a partial record at the tail", fd >= 0 && write(fd, partial, 20) == 20); if (fd >= 0) close(fd); }
+        { undo_rec_t recs[4]; cki("strict load of a torn run is -1", undo_load(882, recs, 4), -1); }
+        { int torn = -1; long n = undo_replay_tolerant(882, 0, 0, &torn); cki("tolerant replay returns the whole record before the tear", n, 1); cki("...and reports torn", torn, 1); }
+        cki("discard 882 clears the entry", undo_discard(882), 1);
+        ckm("...undo_exists(882) is false", !undo_exists(882));
+        cki("re-append h=882 starts a fresh run after the orphan bytes", undo_append_record(882, tx, 9, 90, 0, 0, sc, 3), 1);
+        undo_close_current();
+        { undo_rec_t recs[4]; long n = undo_load(882, recs, 4); cki("the fresh run holds only the new record", n, 1); cki("...index 9", n == 1 ? (long)recs[0].index : -1, 9); }
+        undo_discard(880); undo_discard(881); undo_discard(882);
+    }
+
+    /* 2026-09-08: legacy per-height files fold into the store once */
+    {
+        u8 tx[32]; memset(tx, 0xC1, 32); u8 rec[2][54];
+        for (int i = 0; i < 2; i++){ memset(rec[i], 0, 54); memcpy(rec[i], tx, 32); unsigned idx = (unsigned)i; memcpy(rec[i] + 32, &idx, 4);
+            unsigned long long v = 1000 + (unsigned long long)i; memcpy(rec[i] + 36, &v, 8); rec[i][49] = 3; memcpy(rec[i] + 51, "\x01\x02\x03", 3); }
+        FILE* lf = fopen("undo_900.dat", "wb"); ckm("legacy undo_900.dat written", lf != 0); if (lf){ fwrite(rec, 1, sizeof rec, lf); fclose(lf); }
+        cki("migration folded one legacy file", undo_migrate_legacy(), 1);
+        ckm("the legacy file is gone", access("undo_900.dat", F_OK) != 0);
+        ckm("height 900 exists in the store", undo_exists(900));
+        { undo_rec_t recs[4]; long n = undo_load(900, recs, 4); cki("its two records load", n, 2); cki("...second value 1001", n == 2 ? (long)recs[1].value : -1, 1001); }
+        cki("a second migration finds nothing", undo_migrate_legacy(), 0);
+        undo_discard(900);
     }
 
     /* 2026-09-01: the undo file of a height stays open across its appends;
@@ -242,11 +292,8 @@ int main(void){
         undo_discard(777);
     }
 
-    /* cleanup */
-    for (long h = 0; h <= 250; h++){
-        char p[64]; snprintf(p, sizeof p, "undo_%ld.dat", h);
-        unlink(p);
-    }
+    /* cleanup: the packed store */
+    undo_wipe();
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }
