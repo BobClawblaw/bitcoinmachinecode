@@ -860,25 +860,20 @@ mac_sort_desc:
  * mac_sort_desc's: n 64-byte descriptors in a, b scratch of >= n*64 bytes, the
  * sorted result ends in a, equal keys keep input order (stable).
  *
- * READ THIS BEFORE TRUSTING A "radix == merge" LINE OUT OF THIS PORT.
- * x86 has TWO bodies: mac_sort_desc (merge) and mac_rsort_desc -- an MSD radix
- * over compact 16-byte entries, the 541 ms -> 91 ms flush win at 4M
- * descriptors, and the DEFAULT over there. The AArch64 twin has ONE body: the
- * radix was not ported. So
- *   - mac_sort_mode defaults to 0 (merge) here, where x86 defaults to radix;
- *   - set_sort_mode(1) is recorded, and the dispatch below takes its radix
- *     branch -- which lands on the merge body, because that is all there is;
- *   - test_lsm_flush_sort_diff on ARM therefore compares the merge body with
- *     ITSELF. What that proves is real but narrower than it sounds: a replayed
- *     operation sequence yields a byte-identical run, i.e. the flush is
- *     deterministic and its scratch is not leaking state. It does NOT show two
- *     implementations agreeing, and bench_lsm_flush_sort's "radix" row here is
- *     the merge body measured twice, not a radix measurement.
- * Before the seam existed, neither file linked here at all -- no information,
- * and no evidence about flush determinism either. Porting mac_rsort_desc is
- * the open item in port/PORT_ROADMAP.md. It is bulk-build cost, not consensus,
- * and it is exactly the sort of code that must not be rushed: a wrong order
- * writes wrong runs, and a wrong run is a lost coin.
+ * TWO bodies now, exactly like x86: mac_sort_desc (merge) and mac_rsort_desc
+ * -- an MSD radix over compact 16-byte entries, ported 2026-09-08 with the
+ * same shape (three digit variants: hi-only, hi/lo straddle, descriptor byte
+ * past the 96 compact bits; per-depth counts in .bss; single-bucket levels
+ * skip the scatter; buckets <= 32 finish in a stable insertion sort; the
+ * gather prefetches the descriptor it will read next). Consequences:
+ *   - mac_sort_mode defaults to 1 (radix) here, as on x86;
+ *   - set_sort_mode(0) selects the merge; the flush itself never calls it;
+ *   - test_lsm_flush_sort_diff on ARM is now the REAL test: radix vs merge on
+ *     the same replayed descriptor arrays, byte for byte. Until this port it
+ *     could only compare the merge with itself (flush determinism), which the
+ *     comment below used to say in so many words.
+ * This is bulk-build cost, not consensus -- and it is exactly the code not to
+ * rush: a wrong order writes wrong runs, and a wrong run is a lost coin.
  * ------------------------------------------------------------------------- */
 	.global utxo_lsm_sort_desc
 	.type utxo_lsm_sort_desc,%function
@@ -888,7 +883,7 @@ utxo_lsm_sort_desc:
 	cbnz x8, .Lsd_radix
 	b    mac_sort_desc
 .Lsd_radix:
-	b    mac_sort_desc		/* mac_rsort_desc: not ported */
+	b    mac_rsort_desc		/* the radix twin: see below */
 	.size utxo_lsm_sort_desc,.-utxo_lsm_sort_desc
 
 	.global utxo_lsm_set_sort_mode
@@ -899,11 +894,574 @@ utxo_lsm_set_sort_mode:
 	ret
 	.size utxo_lsm_set_sort_mode,.-utxo_lsm_set_sort_mode
 
-	.section .bss
+	.section .data
 	.align 3
-mac_sort_mode:				/* 0 = merge (the ARM default; x86 defaults to 1) */
+	.global mac_sort_mode
+mac_sort_mode:
+	.quad 1				/* 0 = merge (mac_sort_desc), 1 = radix (mac_rsort_desc).
+					   Matches x86: radix is the DEFAULT now that the twin
+					   exists. The diff test flips this per run. */
+	.text
+
+	.section .bss
+	.align 6
+/* per-recursion-depth count arrays: RS_MAX_DEPTH levels x 4096 qwords. Counts
+ * live here rather than on the stack (x86 does the same): a level consumes
+ * >= 4 of the 288 key bits, so depth is bounded and the depth guard is
+ * unreachable. Single-writer, like mac_fl_buf: mac_flush is the only
+ * production caller and the sort is not re-entrant. */
+	.equ RS_MAX_DEPTH, 72
+	.equ RS_CNT_BYTES, (4096*8)
+mac_rs_counts:
+	.zero RS_MAX_DEPTH * RS_CNT_BYTES
+mac_rs_a:				/* the descriptor array: digit source past 96 bits,
+	.quad 0				   tie-break source in mac_rs_gt */
+mac_rs_final:				/* compact buffer the sorted order must end in */
 	.quad 0
 	.text
+
+/* ===========================================================================
+ * mac_rsort_desc(a=x0, b=x1, n=x2) -- MSD radix sort of the flush's n
+ * 64-byte descriptors. Port of asm/bitcoin_utxo_lsm.asm (2026-09-08), same
+ * contract as mac_sort_desc: sorted result in a, b scratch of >= n*64 bytes,
+ * STABLE. The keys are the 36-byte outpoints in mac_cmp_key's order
+ * (unsigned big-endian bytes of txid||index).
+ *
+ * Shape, matching x86 line for line:
+ *   1. build a COMPACT 16-byte entry per descriptor in b+32n (the ping):
+ *        +0  u64 hi  = key bytes 0..7 big-endian (rev)
+ *        +8  u32 idx = descriptor position in a
+ *        +12 u32 lo  = key bytes 8..11 big-endian
+ *      so every digit is a shift-and-mask on the 96 compact bits (bit offset
+ *      + width <= 96 keeps idx out of the digit);
+ *   2. MSD radix via mac_rsort_rec: 12-bit digits while a bucket has >= 65536
+ *      entries, 8-bit below; one counting pass + one stable scatter per
+ *      level, ping/pong between the two compact halves; a level whose count
+ *      lands every entry in ONE bucket advances a digit with no scatter;
+ *      buckets <= RS_INS_MAX finish in a stable insertion sort on
+ *      (hi, lo) with key bytes 12..35 tie-broken through the descriptor;
+ *      past the 96 compact bits the digit is a key byte read from the
+ *      descriptor. The scatter prefetches (PRFM PSTL1KEEP) the destination
+ *      line RS_PF entries ahead;
+ *   3. gather descriptors into b in sorted order (random 64-byte reads from
+ *      a, prefetched RS_GATHER_PF entries ahead; sequential writes), then
+ *      copy b back to a.
+ *
+ * Region use inside b (64n bytes): ping = b+32n, pong = b+48n (mac_rs_final:
+ * the sorted order MUST end there), top 16n free. The gather writes b[64j..]
+ * after reading entry j at b+48n+16j; entry j+1 starts at 48n+16j+16 >=
+ * 64j+64 for every j <= n-1, so it never overruns unread entries.
+ *
+ * AArch64 translation notes: x86 shrd rax,rdx,cl (the hi/lo straddle) is a
+ * 128-bit shift done as (lo >> s) | (hi << (64-s)) -- s is always in
+ * [32,63] there, so both pieces are well-defined; movdqu pairs are ldp/stp;
+ * prefetchw is PRFM PSTL1KEEP; the gather's prefetcht0 is PLDL1KEEP.
+ * mac_rs_final's pointer compare keeps the x86 semantics exactly: dst >=
+ * final means dst IS the final buffer.
+ * =========================================================================== */
+	.equ RS_INS_MAX, 32
+	.equ RS_PF, 8
+	.equ RS_GATHER_PF, 16
+
+	.global mac_rsort_desc
+	.type mac_rsort_desc,%function
+mac_rsort_desc:
+	stp  x29, x30, [sp, #-16]!
+	stp  x19, x20, [sp, #-16]!
+	stp  x21, x22, [sp, #-16]!
+	stp  x23, x24, [sp, #-16]!
+	mov  x19, x0			/* a */
+	mov  x20, x1			/* b */
+	mov  x21, x2			/* n */
+	cmp  x21, #1
+	b.ls .Lrd_done
+	adrp x8, mac_rs_a
+	add  x8, x8, :lo12:mac_rs_a
+	str  x19, [x8]
+	lsl  x9, x21, #5		/* 32n */
+	add  x22, x20, x9		/* compact ping = b + 32n */
+	lsl  x9, x21, #4		/* 16n */
+	add  x23, x22, x9		/* compact pong = b + 48n (final) */
+	adrp x8, mac_rs_final
+	add  x8, x8, :lo12:mac_rs_final
+	str  x23, [x8]
+	/* ---- build the compact entries ---- */
+	mov  x8, x19			/* descriptor cursor */
+	mov  x9, x22			/* entry cursor */
+	mov  x10, #0			/* idx */
+.Lrd_build:
+	ldr  x11, [x8]
+	rev  x11, x11
+	str  x11, [x9]			/* hi */
+	ldr  w11, [x8, #8]
+	rev  w11, w11
+	str  w10, [x9, #8]		/* idx */
+	str  w11, [x9, #12]		/* lo */
+	add  x8, x8, #64
+	add  x9, x9, #16
+	add  x10, x10, #1
+	cmp  x10, x21
+	b.lo .Lrd_build
+	/* ---- sort the entries; the order ends in pong (mac_rs_final) ---- */
+	mov  x0, x22
+	mov  x1, x23
+	mov  x2, x21
+	mov  x3, #0			/* bit offset 0 */
+	mov  x4, #0			/* depth 0 */
+	bl   mac_rsort_rec
+	/* ---- gather descriptors into b in that order ---- */
+	mov  x8, x23			/* entry cursor (pong) */
+	mov  x9, x20			/* b cursor */
+	mov  x10, #0			/* j */
+.Lrd_gather:
+	add  x11, x10, #RS_GATHER_PF
+	cmp  x11, x21
+	b.hs .Lrd_g_nopf
+	ldr  w11, [x8, #RS_GATHER_PF*16 + 8]	/* entry[j+PF].idx */
+	lsl  x11, x11, #6
+	add  x11, x11, x19
+	prfm pldl1keep, [x11]
+.Lrd_g_nopf:
+	ldr  w11, [x8, #8]		/* entry[j].idx */
+	lsl  x11, x11, #6
+	add  x11, x11, x19
+	ldp  x12, x13, [x11]
+	stp  x12, x13, [x9]
+	ldp  x12, x13, [x11, #16]
+	stp  x12, x13, [x9, #16]
+	ldp  x12, x13, [x11, #32]
+	stp  x12, x13, [x9, #32]
+	ldp  x12, x13, [x11, #48]
+	stp  x12, x13, [x9, #48]
+	add  x9, x9, #64
+	add  x8, x8, #16
+	add  x10, x10, #1
+	cmp  x10, x21
+	b.lo .Lrd_gather
+	/* ---- b -> a ---- */
+	lsl  x10, x21, #6
+	mov  x8, x20
+	mov  x9, x19
+.Lrd_b2a:
+	ldp  x11, x12, [x8], #16
+	stp  x11, x12, [x9], #16
+	subs x10, x10, #16
+	b.hi .Lrd_b2a
+.Lrd_done:
+	ldp  x23, x24, [sp], #16
+	ldp  x21, x22, [sp], #16
+	ldp  x19, x20, [sp], #16
+	ldp  x29, x30, [sp], #16
+	ret
+	.size mac_rsort_desc,.-mac_rsort_desc
+
+/* mac_rsort_rec(src=x0, dst=x1, n=x2, bitoff=x3, depth=x4)
+ * Sorts the n compact entries at src by key bits [bitoff, 288); src and dst
+ * are the same offset in the two compact buffers. On return the sorted
+ * entries are in whichever of the two IS mac_rs_final's buffer.
+ * Registers: x19 src, x20 dst, x21 n, x22 bitoff, x23 depth, x24 counts base
+ * (this depth), x25 width, x26 shift (A/B) or key byte offset (C), x27 mask,
+ * x28 variant (0=A hi-only, 1=B hi/lo straddle, 2=C descriptor byte).
+ * Stack locals: [sp] bucket idx, [sp,#8] bucket start, [sp,#16] nbuckets. */
+	.type mac_rsort_rec,%function
+mac_rsort_rec:
+	stp  x29, x30, [sp, #-16]!
+	stp  x19, x20, [sp, #-16]!
+	stp  x21, x22, [sp, #-16]!
+	stp  x23, x24, [sp, #-16]!
+	stp  x25, x26, [sp, #-16]!
+	stp  x27, x28, [sp, #-16]!
+	sub  sp, sp, #32
+	mov  x19, x0			/* src */
+	mov  x20, x1			/* dst */
+	mov  x21, x2			/* n */
+	mov  x22, x3			/* bit offset */
+	mov  x23, x4			/* depth */
+.Lrr_level:
+	cmp  x22, #288
+	b.hs .Lrr_leaf_copy		/* every key bit consumed: all equal, final */
+	cmp  x21, #RS_INS_MAX
+	b.ls .Lrr_leaf_isort
+	cmp  x23, #RS_MAX_DEPTH
+	b.hs .Lrr_leaf_isort		/* unreachable: a level consumes >= 4 of 288 bits */
+	/* ---- digit width: 12 while a bucket has >= 65536 entries, else 8 ---- */
+	mov  x25, #8
+	mov  x9, #65536
+	cmp  x21, x9
+	b.lo .Lrr_w_have
+	mov  x25, #12
+.Lrr_w_have:
+	cmp  x22, #96
+	b.hs .Lrr_var_c
+	mov  x9, #96
+	sub  x9, x9, x22		/* compact bits left */
+	cmp  x9, x25
+	b.hs .Lrr_w_ok
+	mov  x25, x9			/* 4 or 8 */
+.Lrr_w_ok:
+	add  x9, x22, x25		/* offset + width */
+	cmp  x9, #64
+	b.hi .Lrr_chk_b
+	mov  x26, #64
+	sub  x26, x26, x9		/* shift = 64 - (offset+width), in [0,63] */
+	mov  x28, #0			/* variant A: from hi alone */
+	b    .Lrr_mask
+.Lrr_chk_b:
+	cmp  x9, #96
+	b.hi .Lrr_var_c
+	mov  x26, #128
+	sub  x26, x26, x9		/* shift = 128 - (offset+width), in [32,63] */
+	mov  x28, #1			/* variant B: straddles hi and lo:idx */
+	b    .Lrr_mask
+.Lrr_var_c:
+	mov  x25, #8			/* one key byte */
+	mov  x26, x22, lsr #3		/* key byte offset in the descriptor */
+	mov  x28, #2
+.Lrr_mask:
+	mov  x27, #1
+	lsl  x27, x27, x25
+	sub  x27, x27, #1		/* mask = 2^width - 1 (variant C overwritten below) */
+	cmp  x28, #2
+	b.ne .Lrr_cnt_base
+	mov  x27, #255
+.Lrr_cnt_base:
+	/* counts = mac_rs_counts + depth * RS_CNT_BYTES; zero nbuckets slots */
+	mov  x9, #RS_CNT_BYTES
+	adrp x10, mac_rs_counts
+	add  x10, x10, :lo12:mac_rs_counts
+	madd x24, x23, x9, x10
+	add  x9, x27, #1		/* nbuckets = mask + 1 (2^width; 256 for C) */
+	str  x9, [sp, #16]
+	mov  x8, x24
+	mov  x11, x9
+.Lrr_zero:
+	stp  xzr, xzr, [x8], #16
+	subs x11, x11, #2
+	b.hi .Lrr_zero			/* nbuckets is 2^width, always even */
+	/* ---- counting pass ---- */
+	mov  x8, x19			/* entry cursor */
+	mov  x9, x21			/* remaining */
+	mov  x10, x24			/* counts */
+	mov  x11, x27			/* mask */
+	cmp  x28, #1
+	b.eq .Lrr_cntB
+	b.hi .Lrr_cntC
+.Lrr_cntA:
+	ldr  x14, [x8]
+	lsr  x14, x14, x26
+	and  x14, x14, x11
+	b    .Lrr_cnt_inc
+.Lrr_cntB:
+	ldr  x14, [x8, #8]		/* lo:idx */
+	ldr  x15, [x8]			/* hi */
+	lsr  x14, x14, x26		/* (hi:lo:idx) >> shift, low 64 -- see the header:
+					   shift is in [32,63] so idx never reaches the digit */
+	mov  x16, #64
+	sub  x16, x16, x26
+	lsl  x15, x15, x16
+	orr  x14, x14, x15
+	and  x14, x14, x11
+	b    .Lrr_cnt_inc
+.Lrr_cntC:
+	ldr  w14, [x8, #8]		/* idx */
+	lsl  x14, x14, #6
+	ldrb w14, [x13, x14]		/* a + byteoff + idx*64: the key byte */
+.Lrr_cnt_inc:
+	ldr  x15, [x10, x14, lsl #3]
+	add  x15, x15, #1
+	str  x15, [x10, x14, lsl #3]
+	add  x8, x8, #16
+	subs x9, x9, #1
+	b.ne .Lrr_cnt_back
+	b    .Lrr_cnt_done
+.Lrr_cnt_back:
+	cmp  x28, #1
+	b.eq .Lrr_cntB
+	b.hi .Lrr_cntC
+	b    .Lrr_cntA
+.Lrr_cnt_done:
+	/* one bucket holding every entry = a shared digit: next level, no scatter */
+	mov  x8, x24
+	ldr  x9, [sp, #16]		/* nbuckets */
+.Lrr_skip_scan:
+	ldr  x10, [x8]
+	cmp  x10, x21
+	b.eq .Lrr_skip
+	add  x8, x8, #8
+	subs x9, x9, #1
+	b.ne .Lrr_skip_scan
+	/* ---- exclusive prefix sums: counts become write positions ---- */
+	mov  x8, x24
+	ldr  x9, [sp, #16]
+	mov  x10, #0
+.Lrr_prefix:
+	ldr  x11, [x8]
+	str  x10, [x8]
+	add  x10, x10, x11
+	add  x8, x8, #8
+	subs x9, x9, #1
+	b.ne .Lrr_prefix
+	/* ---- stable scatter src -> dst ---- */
+	mov  x8, x19			/* entry cursor */
+	mov  x9, x21			/* remaining */
+	mov  x10, x24			/* counts */
+	mov  x11, x27			/* mask */
+	cmp  x28, #1
+	b.eq .Lrr_scB
+	b.hi .Lrr_scC
+.Lrr_scA:
+	cmp  x9, #RS_PF+1
+	b.lo .Lrr_scA_nopf
+	ldr  x14, [x8, #RS_PF*16]
+	lsr  x14, x14, x26
+	and  x14, x14, x11
+	ldr  x15, [x10, x14, lsl #3]
+	lsl  x15, x15, #4
+	add  x15, x15, x20
+	prfm pstl1keep, [x15]		/* the destination line RS_PF entries ahead */
+.Lrr_scA_nopf:
+	ldr  x14, [x8]
+	lsr  x14, x14, x26
+	and  x14, x14, x11
+	ldr  x15, [x10, x14, lsl #3]	/* this bucket's next slot */
+	add  x16, x10, x14, lsl #3
+	ldr  x17, [x16]
+	add  x17, x17, #1
+	str  x17, [x16]			/* counts[d]++ */
+	lsl  x15, x15, #4
+	add  x15, x15, x20
+	ldp  x16, x17, [x8]
+	stp  x16, x17, [x15]
+	add  x8, x8, #16
+	subs x9, x9, #1
+	b.ne .Lrr_scA
+	b    .Lrr_sc_done
+.Lrr_scB:
+	cmp  x9, #RS_PF+1
+	b.lo .Lrr_scB_nopf
+	ldr  x14, [x8, #RS_PF*16 + 8]
+	ldr  x16, [x8, #RS_PF*16]
+	lsr  x14, x14, x26
+	mov  x17, #64
+	sub  x17, x17, x26
+	lsl  x16, x16, x17
+	orr  x14, x14, x16
+	and  x14, x14, x11
+	ldr  x15, [x10, x14, lsl #3]
+	lsl  x15, x15, #4
+	add  x15, x15, x20
+	prfm pstl1keep, [x15]
+.Lrr_scB_nopf:
+	ldr  x14, [x8, #8]
+	ldr  x16, [x8]
+	lsr  x14, x14, x26
+	mov  x17, #64
+	sub  x17, x17, x26
+	lsl  x16, x16, x17
+	orr  x14, x14, x16
+	and  x14, x14, x11
+	ldr  x15, [x10, x14, lsl #3]
+	add  x16, x10, x14, lsl #3
+	ldr  x17, [x16]
+	add  x17, x17, #1
+	str  x17, [x16]
+	lsl  x15, x15, #4
+	add  x15, x15, x20
+	ldp  x16, x17, [x8]
+	stp  x16, x17, [x15]
+	add  x8, x8, #16
+	subs x9, x9, #1
+	b.ne .Lrr_scB
+	b    .Lrr_sc_done
+.Lrr_scC:
+	ldr  w14, [x8, #8]
+	lsl  x14, x14, #6
+	ldrb w14, [x13, x14]
+	ldr  x15, [x10, x14, lsl #3]
+	add  x16, x10, x14, lsl #3
+	ldr  x17, [x16]
+	add  x17, x17, #1
+	str  x17, [x16]
+	lsl  x15, x15, #4
+	add  x15, x15, x20
+	ldp  x16, x17, [x8]
+	stp  x16, x17, [x15]
+	add  x8, x8, #16
+	subs x9, x9, #1
+	b.ne .Lrr_scC
+.Lrr_sc_done:
+	/* ---- recurse per bucket: after the scatter counts[d] is bucket d's end ---- */
+	str  xzr, [sp]			/* bucket idx */
+	str  xzr, [sp, #8]		/* bucket start */
+.Lrr_bkt:
+	ldr  x9, [sp]
+	ldr  x10, [sp, #16]		/* nbuckets */
+	cmp  x9, x10
+	b.hs .Lrr_done
+	ldr  x11, [x24, x9, lsl #3]	/* end */
+	ldr  x12, [sp, #8]		/* start */
+	str  x11, [sp, #8]
+	add  x9, x9, #1
+	str  x9, [sp]
+	sub  x13, x11, x12		/* bucket size */
+	cbz  x13, .Lrr_bkt
+	lsl  x14, x12, #4		/* entry offset */
+	cmp  x13, #1
+	b.ne .Lrr_bkt_rec
+	/* a singleton sits in dst; it must end in the final buffer */
+	adrp x8, mac_rs_final
+	ldr  x8, [x8, :lo12:mac_rs_final]
+	cmp  x20, x8
+	b.hs .Lrr_bkt			/* dst IS final: already home */
+	add  x15, x20, x14
+	ldp  x16, x17, [x15]
+	add  x15, x19, x14
+	stp  x16, x17, [x15]
+	b    .Lrr_bkt
+.Lrr_bkt_rec:
+	add  x0, x20, x14		/* src = the bucket, now in dst */
+	add  x1, x19, x14		/* dst = src's slot (ping-pong swap) */
+	mov  x2, x13
+	add  x3, x22, x25		/* next digit */
+	add  x4, x23, #1
+	bl   mac_rsort_rec
+	b    .Lrr_bkt
+.Lrr_skip:
+	add  x22, x22, x25		/* shared digit: advance, no scatter */
+	b    .Lrr_level
+.Lrr_leaf_isort:
+	mov  x0, x19
+	mov  x1, x21
+	bl   mac_rs_isort
+	/* fall through: the sorted run must end in the final buffer */
+.Lrr_leaf_copy:
+	adrp x8, mac_rs_final
+	ldr  x8, [x8, :lo12:mac_rs_final]
+	cmp  x19, x8
+	b.hs .Lrr_done			/* src IS final: already home */
+	lsl  x9, x21, #4		/* n*16 bytes */
+.Lrr_lcopy:
+	ldp  x14, x15, [x19], #16
+	stp  x14, x15, [x20], #16
+	subs x9, x9, #16
+	b.hi .Lrr_lcopy
+.Lrr_done:
+	add  sp, sp, #32
+	ldp  x27, x28, [sp], #16
+	ldp  x25, x26, [sp], #16
+	ldp  x23, x24, [sp], #16
+	ldp  x21, x22, [sp], #16
+	ldp  x19, x20, [sp], #16
+	ldp  x29, x30, [sp], #16
+	ret
+	.size mac_rsort_rec,.-mac_rsort_rec
+
+/* mac_rs_isort(p=x0, m=x1) -- stable insertion sort of m compact entries in
+ * place, full-key order (mac_rs_gt). j lives in x24 (callee-saved) where the
+ * x86 keeps it in rcx across the mac_rs_gt call. */
+	.type mac_rs_isort,%function
+mac_rs_isort:
+	stp  x29, x30, [sp, #-16]!
+	stp  x19, x20, [sp, #-16]!
+	stp  x21, x22, [sp, #-16]!
+	stp  x23, x24, [sp, #-16]!
+	mov  x19, x0			/* p */
+	mov  x20, x1			/* m */
+	cmp  x20, #1
+	b.ls .Lis_done
+	mov  x21, #1			/* i */
+.Lis_outer:
+	lsl  x9, x21, #4
+	ldr  x22, [x19, x9]		/* hold hi */
+	add  x10, x9, #8
+	ldr  x23, [x19, x10]		/* hold lo:idx */
+	mov  x24, x21			/* j */
+.Lis_inner:
+	cbz  x24, .Lis_place
+	sub  x9, x24, #1
+	lsl  x9, x9, #4
+	add  x0, x19, x9		/* &e[j-1] */
+	mov  x1, x22
+	mov  x2, x23
+	bl   mac_rs_gt
+	cbz  x0, .Lis_place		/* e[j-1] <= hold: stable stop */
+	lsl  x9, x24, #4
+	sub  x10, x9, #16
+	add  x13, x19, x10
+	ldp  x11, x12, [x13]
+	add  x13, x19, x9
+	stp  x11, x12, [x13]		/* e[j] = e[j-1] */
+	sub  x24, x24, #1
+	b    .Lis_inner
+.Lis_place:
+	lsl  x9, x24, #4
+	add  x10, x19, x9
+	stp  x22, x23, [x10]
+	add  x21, x21, #1
+	cmp  x21, x20
+	b.lo .Lis_outer
+.Lis_done:
+	ldp  x23, x24, [sp], #16
+	ldp  x21, x22, [sp], #16
+	ldp  x19, x20, [sp], #16
+	ldp  x29, x30, [sp], #16
+	ret
+	.size mac_rs_isort,.-mac_rs_isort
+
+/* mac_rs_gt(x=x0 -> entry, y_hi=x1, y_lo_idx=x2) -> w0 1 if key(x) > key(y)
+ * (hi, lo) first; a 96-bit tie compares key bytes 12..35 through the
+ * descriptors (mac_cmp_key's byte order). Leaf: clobbers x0, x2, x9-x12
+ * only; x19-x28 untouched (mac_rs_isort keeps j in x24). */
+	.type mac_rs_gt,%function
+mac_rs_gt:
+	ldr  x9, [x0]
+	cmp  x9, x1
+	b.hi .Lgt_yes
+	b.lo .Lgt_no
+	ldr  w9, [x0, #12]		/* x.lo */
+	lsr  x10, x2, #32		/* y.lo */
+	cmp  w9, w10
+	b.hi .Lgt_yes
+	b.lo .Lgt_no
+	adrp x11, mac_rs_a
+	add  x11, x11, :lo12:mac_rs_a
+	ldr  w9, [x0, #8]		/* x.idx */
+	lsl  x9, x9, #6
+	add  x9, x9, #12
+	add  x10, x11, x9		/* &xdesc[12] */
+	uxtw x9, w2			/* y.idx */
+	lsl  x9, x9, #6
+	add  x9, x9, #12
+	add  x12, x11, x9		/* &ydesc[12] */
+	ldr  x9, [x10]
+	ldr  x0, [x12]
+	rev  x9, x9
+	rev  x0, x0
+	cmp  x9, x0
+	b.ne .Lgt_diff
+	ldr  x9, [x10, #8]
+	ldr  x0, [x12, #8]
+	rev  x9, x9
+	rev  x0, x0
+	cmp  x9, x0
+	b.ne .Lgt_diff
+	ldr  x9, [x10, #16]
+	ldr  x0, [x12, #16]
+	rev  x9, x9
+	rev  x0, x0
+	cmp  x9, x0
+	b.ne .Lgt_diff
+	/* all three equal: key(x) == key(y) */
+.Lgt_no:
+	mov  w0, #0
+	ret
+.Lgt_diff:
+	b.hi .Lgt_yes			/* flags still hold the last qword compare */
+	b    .Lgt_no
+.Lgt_yes:
+	mov  w0, #1
+	ret
+	.size mac_rs_gt,.-mac_rs_gt
 
 /* ============================================================================
  * utxo_lsm_init(lst=x0) -> 1 ok / -1 err
