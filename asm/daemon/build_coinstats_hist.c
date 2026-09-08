@@ -46,7 +46,8 @@
  *
  * Usage: bmc_build_coinstats_hist <chaindir> [to_height] [workers]
  * Disk: ~500 GB of temporary files beside the archive at the mainnet tip,
- * deleted as they are consumed. Time on the reference box: ~2 h. */
+ * deleted as they are consumed. Time on the reference box: ~2 h. Launch it
+ * with best-effort I/O, not the idle class: the join is write-bound. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -100,7 +101,12 @@ static void die(const char* m){ fprintf(stderr, "[coinstats-hist] FATAL: %s\n", 
 /* ---- pass 1: one worker over [lo, hi] ------------------------------------------ */
 static int pass1_worker(int w, long lo, long hi, u8* store_buf, int addprod_fd){
     char b[64]; FILE* ob[NB]; FILE* sb[NB];
-    for (int i = 0; i < NB; i++){ ob[i] = fopen(nm(b, "o", w, i), "wb"); sb[i] = fopen(nm(b, "s", w, i), "wb"); if (!ob[i] || !sb[i]) die("open bucket"); }
+    for (int i = 0; i < NB; i++){ ob[i] = fopen(nm(b, "o", w, i), "wb"); sb[i] = fopen(nm(b, "s", w, i), "wb"); if (!ob[i] || !sb[i]) die("open bucket");
+        /* 2026-09-08: with stdio's 4 KB buffers the fan-out into 512 files was a
+         * storm of small writes that the kernel's dirty-page balancing
+         * throttled to under a bucket a minute in the join; 1 MB per stream
+         * (512 MB a worker) makes every write a large sequential chunk */
+        setvbuf(ob[i], NULL, _IOFBF, 1 << 20); setvbuf(sb[i], NULL, _IOFBF, 1 << 20); }
     u8* blockbuf = malloc(BLOCKBUF); u8* scratch = malloc(BLOCKBUF); static u8 add_st[ST_SIZE] __attribute__((aligned(16)));
     if (!blockbuf || !scratch) die("oom");
     time_t t0 = time(NULL);
@@ -168,7 +174,7 @@ static int pass2_bucket(int w, int i, int W, long to_h, u64* n_matched, u64* n_u
     for (size_t p = 0; p + sizeof(outref_hdr) <= olen; ){ const outref_hdr* r = (const outref_hdr*)(o + p); ix[k++].p = o + p; p += sizeof *r + r->slen; }
     qsort(ix, no, sizeof *ix, cmp_oidx);
     size_t ns = slen / sizeof(spendref); spendref* sp = (spendref*)s; qsort(sp, ns, sizeof *sp, cmp_spend);
-    char b[64]; FILE* rf[NR]; for (int r = 0; r < NR; r++){ rf[r] = fopen(nm(b, "r", w, r), "ab"); if (!rf[r]) die("open range"); }
+    char b[64]; FILE* rf[NR]; for (int r = 0; r < NR; r++){ rf[r] = fopen(nm(b, "r", w, r), "ab"); if (!rf[r]) die("open range"); setvbuf(rf[r], NULL, _IOFBF, 4 << 20); }
     size_t a = 0;
     for (size_t j = 0; j < ns; j++){
         while (a < no){ const outref_hdr* r = (const outref_hdr*)ix[a].p; int c = memcmp(r->txid, sp[j].txid, 32); if (c < 0 || (c == 0 && r->vout < sp[j].vout)) a++; else break; }
