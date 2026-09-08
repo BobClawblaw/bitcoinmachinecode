@@ -27,12 +27,11 @@ getblocktemplate, uptime, validateaddress.
 ## What the backend hit on this box
 
 1. **"Parse Error: Expected HTTP/, RTSP/ or ICE/" on every call to
-   production (port 8332).** The identical request shape (Node `http`,
-   `agent: false`, `auth` from the cookie file, no Content-Type) succeeds
-   against the bench node on the current build. Production runs the
-   2026-09-07 deploy, so its RPC server is the older code. Redeploy
-   production and re-run the backend; if it persists, capture the raw
-   response with `nc` from the backend host.
+   production (port 8332).** Resolved 06:37Z: the 09-07 build had its P2P
+   listener on 8332 and its RPC on 8331 (one below the defaults), so the
+   backend was speaking JSON-RPC to the P2P port. Today's build listens
+   on the correct 8333/8332; production was redeployed on it (worklog
+   session 28) and the backend runs without RPC errors.
 2. **MySQL 8 rejects the schema migration** ("error in your SQL syntax");
    mempool.space targets MariaDB 10.5+. A MariaDB 10.11 container now
    runs on 127.0.0.1:3307 (`mempool-mariadb`, data in
