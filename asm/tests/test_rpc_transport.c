@@ -376,6 +376,25 @@ int main(int argc, char** argv) {
     }
 
     stop_server();
+
+    /* 2026-09-08: rpc_reply_parse deep-copied the result through a 64 KB
+     * stack buffer and silently returned result=NULL past it, so the CLI
+     * printed nothing (exit 0) for getblock verbosity 1 (112 KB) and 2
+     * (6.6 MB). A 20,000-string array (~700 KB) must come back whole. */
+    {
+        const size_t n = 20000;
+        char* body = malloc(64 + n * 40);
+        size_t L = (size_t)sprintf(body, "{\"result\":[");
+        for (size_t i = 0; i < n; i++) L += (size_t)sprintf(body + L, "%s\"0123456789abcdef0123456789abcdef\"", i ? "," : "");
+        L += (size_t)sprintf(body + L, "],\"error\":null,\"id\":1}");
+        rpc_reply r;
+        int okp = rpc_reply_parse(body, L, &r);
+        ck("reply parse: a 700 KB result parses", okp == 1);
+        ck("reply parse: a 700 KB result is kept, not dropped as NULL", okp && r.result != NULL);
+        ck("reply parse: all 20000 elements survive", okp && r.result && r.result->typ == RJ_ARR && r.result->nitems == n);
+        if (okp) rpc_reply_free(&r);
+        free(body);
+    }
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }
