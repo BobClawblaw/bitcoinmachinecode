@@ -327,6 +327,13 @@ int main(void){
         ok(dlc_pick_peer(4, 0, e3, c3, b3, 400.0) == 1, "...untried gone: the 300 KB/s peer (1), NOT the dead-marked one -- it is measured, not untried");
         c3[1] = 1;
         ok(dlc_pick_peer(4, 0, e3, c3, b3, 400.0) == 2, "...and only the dead-marked one left: still returned rather than no peer (2)"); }
+      /* the far-behind trigger's height (2026-09-08): one liar cannot start
+       * the parallel downloader; two agreeing peers can */
+      { long one[1] = { 969817 }; long two[2] = { 969817, 966063 }; long many[5] = { 966063, 966063, 969817, 966062, 966063 };
+        ok(dl_trigger_height(one, 1) == 969817, "a single peer: its own claim (a fresh node with one peer must still sync)");
+        ok(dl_trigger_height(two, 2) == 966063, "two peers, one claiming 969,817: the second-highest, 966,063");
+        ok(dl_trigger_height(many, 5) == 966063, "five peers with one liar: 966,063");
+        ok(dl_trigger_height(many, 0) == 0, "no peers: 0"); }
       /* the download window and the retry ring ("write out monotonically,
        * like Core does"): a chunk is never claimed more than 1024 blocks
        * above the first hole, and an abandoned chunk is retried, never left. */
