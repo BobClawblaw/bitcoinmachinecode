@@ -267,6 +267,40 @@ static int cmd_getpeerinfo(rj_val** res){
               rj_obj_set(o, "network", rj_str(nn)); }
             rj_arr_push(arr, o);
         }
+        /* the parallel download's peers (2026-09-08), one per worker holding a
+         * connection; ids from 100000 so they never collide with the legs */
+        int nd = g_status->n_dlpeers; if (nd > 64) nd = 64;
+        for (int i = 0; i < nd; i++){
+            const rpc_peer_t* p = &g_status->dlpeers[i];
+            if (!p->used || !p->addr[0]) continue;
+            rj_val* o = rj_obj();
+            rj_obj_set(o, "id", rj_numf("%lld", 100000LL + i));
+            rj_obj_set(o, "addr", rj_str(p->addr));
+            { char h[17]; snprintf(h, sizeof h, "%016llx", (unsigned long long)p->services); rj_obj_set(o, "services", rj_str(h)); }
+            { rj_val* sn = rj_arr(); services_names(p->services, sn); rj_obj_set(o, "servicesnames", sn); }
+            rj_obj_set(o, "relaytxes", rj_bool(0));
+            rj_obj_set(o, "lastsend", rj_numf("%lld", (long long)p->last_send));
+            rj_obj_set(o, "lastrecv", rj_numf("%lld", (long long)p->last_recv));
+            rj_obj_set(o, "bytessent", rj_numf("%lld", (long long)p->bytes_sent));
+            rj_obj_set(o, "bytesrecv", rj_numf("%lld", (long long)p->bytes_recv));
+            rj_obj_set(o, "conntime", rj_numf("%lld", (long long)p->conn_time));
+            rj_obj_set(o, "timeoffset", rj_numf("%d", 0));
+            rj_obj_set(o, "version", rj_numf("%u", p->proto));
+            rj_obj_set(o, "subver", rj_str(p->subver));
+            rj_obj_set(o, "inbound", rj_bool(0));
+            rj_obj_set(o, "permissions", rj_arr());
+            rj_obj_set(o, "startingheight", rj_numf("%d", p->start_height));
+            rj_obj_set(o, "synced_headers", rj_numf("%d", p->start_height));
+            rj_obj_set(o, "synced_blocks", rj_numf("%ld", p->inflight_hi >= p->inflight_lo ? p->inflight_lo - 1 : -1L));
+            { rj_val* fl = rj_arr(); if (p->inflight_hi >= p->inflight_lo) for (long h = p->inflight_lo; h <= p->inflight_hi && h < p->inflight_lo + 256; h++) rj_arr_push(fl, rj_numf("%ld", h));
+              rj_obj_set(o, "inflight", fl); }
+            rj_obj_set(o, "connection_type", rj_str("outbound-full-relay"));
+            rj_obj_set(o, "bmc_download_worker", rj_numf("%d", p->dl_worker));   /* this node's extension: which worker holds it */
+            { bmc_addr_t pa; const char* nn = "ipv4";
+              if (bmc_addr_from_string_port(&pa, p->addr, 0)) nn = bmc_net_name(pa.net);
+              rj_obj_set(o, "network", rj_str(nn)); }
+            rj_arr_push(arr, o);
+        }
     }
     *res = arr;
     return 1;
@@ -329,10 +363,12 @@ static int cmd_getnettotals(rj_val** res){
             if (!p->used) continue;
             sent += p->bytes_sent; recv += p->bytes_recv;
         }
+    if (g_status) recv += g_status->dl_bytes_total;   /* the parallel download's bytes (2026-09-08): this read 3 KB against a 50 GB archive */
     rj_val* o = rj_obj();
     /* Core counts bytes for the process lifetime including closed peers; we
-     * sum the LIVE peer table, which is what this node tracks. Documented
-     * divergence, not an approximation dressed as a total. */
+     * sum the LIVE peer table plus everything the download received this
+     * run. Documented divergence for the legs, not an approximation dressed
+     * as a total. */
     rj_obj_set(o, "totalbytesrecv", rj_numf("%lld", recv));
     rj_obj_set(o, "totalbytessent", rj_numf("%lld", sent));
     { struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);

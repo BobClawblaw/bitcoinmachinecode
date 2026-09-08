@@ -224,6 +224,24 @@ int main(void){
     r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
     ck("getpeerinfo dispatched to array", rc == 1 && r && r->typ == RJ_ARR);
     ck("getpeerinfo has 2 peers", r && r->nitems == 2);
+    /* 2026-09-08: the parallel download's peers are listed too, with the chunk in flight */
+    rj_free(r);
+    st.n_dlpeers = 1; memset(&st.dlpeers[0], 0, sizeof st.dlpeers[0]); st.dlpeers[0].used = 1;
+    strcpy(st.dlpeers[0].addr, "203.0.113.9:8333"); strcpy(st.dlpeers[0].subver, "/Satoshi:31.1.0/"); st.dlpeers[0].proto = 70016;
+    st.dlpeers[0].services = 0x409; st.dlpeers[0].start_height = 966000; st.dlpeers[0].bytes_recv = 123456789LL; st.dlpeers[0].conn_time = 1800000000LL;
+    st.dlpeers[0].inflight_lo = 500001; st.dlpeers[0].inflight_hi = 500040; st.dlpeers[0].dl_worker = 7; st.dl_bytes_total = 50000000000LL;
+    r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
+    ck("getpeerinfo lists the download worker's peer as a third entry", rc == 1 && r && r->nitems == 3);
+    { rj_val* d = (r && r->nitems == 3) ? r->items[2] : NULL; rj_val* fl = d ? rj_obj_get(d, "inflight") : NULL; rj_val* bw = d ? rj_obj_get(d, "bmc_download_worker") : NULL; rj_val* br = d ? rj_obj_get(d, "bytesrecv") : NULL; rj_val* ct = d ? rj_obj_get(d, "connection_type") : NULL;
+      ck("...with 40 heights in flight, 500001..500040", fl && fl->nitems == 40 && !strcmp(fl->items[0]->str, "500001") && !strcmp(fl->items[39]->str, "500040"));
+      ck("...naming worker 7, its bytes, and connection_type outbound-full-relay", bw && !strcmp(bw->str, "7") && br && !strcmp(br->str, "123456789") && ct && !strcmp(ct->str, "outbound-full-relay")); }
+    rj_free(r);
+    r = NULL; rc = rpc_node_dispatch("getnettotals", NULL, &r, &ec, &em);
+    { rj_val* tr = r ? rj_obj_get(r, "totalbytesrecv") : NULL;
+      ck("getnettotals counts the download's bytes (50 GB + the legs)", rc == 1 && tr && strtoll(tr->str, NULL, 10) >= 50000000000LL); }
+    st.n_dlpeers = 0; st.dl_bytes_total = 0;
+    r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
+    ck("with the download over, getpeerinfo is back to the 2 legs", rc == 1 && r && r->nitems == 2);
     { rj_val* p0 = (r && r->nitems) ? r->items[0] : 0;
       ck("peer0 addr", p0 && S(p0,"addr") && !strcmp(S(p0,"addr"), "1.2.3.4:8333"));
       ck("peer0 version", p0 && S(p0,"version") && !strcmp(S(p0,"version"), "70016"));
