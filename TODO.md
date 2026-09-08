@@ -95,12 +95,16 @@ Everything below is landed on `arm-port` and pushed. History lives in
       test_lsm_flush_sort_diff is a REAL equivalence test here now: byte-identical
       runs, radix vs merge, same arrays. Round 43: pass 374 / fail 4 env-only /
       compared 396 of 432 -- ninth consecutive identical sweep.
-- [ ] **Deploy `bmcbitcoind` when told go.** Candidate rebuilt against the merged
-      tree (`7542fc1d`, upstream through PR #98 + the
-      g_p2p_write_hook port; predecessors `84a2bccb`/`2b98d3f1` stale). Two-step rename deploy: point the unit at
-      `daemon_out/bmcbitcoind` + `daemon-reload`, AND retire `daemon_out/bitcoind`
-      into `rollback/`. Until then the node runs arm-12 (`cfe86ed4`) — safe/stale,
-      and `bmc-arm.service` crash-restart returns to arm-12, not to a broken path.
+- [x] **DEPLOYED arm-13 (2026-09-08 05:16 CDT, `8a20f7c8`).** Candidate md5
+      `a80f869b` -> live via the two-step rename deploy; rollback
+      `rollback/bitcoind.pre-arm13-20260908` (`cfe86ed4` = arm-12). Verified:
+      reload 0.18 s, 0 invalid, 146 confirmed-live peers, tip advanced
+      966054 -> 966055 under the new binary, mempool admitting. NOTE: logs
+      moved to `data/main/debug.log` (#94); journald is lifecycle-only now.
+- [ ] **Standing policy (operator, 2026-09-08): deploy new builds as they gate
+      green** -- rebuild `bmcbitcoind` after every merged+gated upstream sync,
+      two-step deploy, verify boot (reload time, 0 invalid, tip advance,
+      mempool, peers), rollback artifact per build. No more holding.
 - [ ] **bitcoind.S CC-2 is half-wired:** the hook table exists as data symbols
       (`g_peer_sendcmpct`, `g_cmpct_hook_type`, 130411fb) but the mux never CALLs them
       — no sendcmpct announcement after verack, no hook-selected getdata type. The x86

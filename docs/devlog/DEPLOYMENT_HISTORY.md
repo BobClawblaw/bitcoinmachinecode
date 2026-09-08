@@ -1280,3 +1280,28 @@ mistaken for, or collide with, a Bitcoin Core file on the same box. So:
   behind the unit. The ARM unit's own name (`bmc-arm.service`) is a per-box label
   rather than a product name; renaming it toward the `bmcbitcoind.service` convention
   is an operator call, not a port requirement.
+
+## arm-13 -- 2026-09-08 05:16 CDT -- the rename deploy lands; upstream through #98 + the radix
+
+- **Deployed:** `bmcbitcoind` md5 `a80f869b` (built after the mac_rsort_desc
+  port; carries upstream through PR #98 plus every ARM port item of the day:
+  the three seams `0b991b77`, the flush-sort unrolls `6d6d5f03`, the
+  `g_p2p_write_hook` port, and the radix `8a20f7c8`). Main PID 11769,
+  NRestarts 0.
+- **Rollback:** `daemon_out/rollback/bitcoind.pre-arm13-20260908` (md5
+  `cfe86ed4` = arm-12, moved out of the runnable path per the two-step rule;
+  unit backup at `/etc/systemd/system/bmc-arm.service.pre-arm13-20260908`).
+  One `cp` back + `daemon-reload` + restart to undo.
+- **Verified:** UTXO reload **0.18 s** at `applied_height=966054` (arm-12 took
+  ~4 s -- the LSM rework and the per-chunk committer show), mempool admitting
+  (+64 to +256 tx/min), **0 invalid** blocks, 146 confirmed-live peers (dlc
+  probe), `sync_failing=1` transient on the first two heartbeats and gone by
+  the third, and the tip advanced under the new binary: 966054 -> 966055 at
+  10:29:39 with txouts +1476. Fully synced (blocks == headers) throughout.
+- **Operational change from upstream #94 (debuglog):** the daemon no longer
+  streams logs to the console -- `journalctl -u bmc-arm` now shows only
+  systemd lifecycle lines. The log is `<chaindir>/debug.log` =
+  `data/main/debug.log`, and the pid file is `data/main/bmcbitcoind.pid`
+  (the rename convention held end to end). Monitor the file, not the journal.
+- **Policy change (operator):** deploy new builds AS THEY GATE GREEN -- no more
+  holding candidates -- so testing keeps pace with the sync treadmill.
