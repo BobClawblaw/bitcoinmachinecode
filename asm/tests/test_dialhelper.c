@@ -418,8 +418,11 @@ int main(void){
             g_dlc_cursor_help_ms = 300;                   /* the seam: 300 ms instead of 10 s */
             pid_t cp = fork();
             if (cp == 0){ int rc = dlc_committer_run(ctl3, 300, 379, 0, rec_append, 0, 20, 0, 0); _exit(rc); }
+            usleep(700000);
+            ok(ctl3[DLC_CTL_CURSOR_WANT] == -1, "with nothing staged above it, a missing cursor chunk is NOT published (the pool has not moved on)");
+            ctl3[DLC_CTL_STAGED] = DLC_CURSOR_HELP_MIN_STAGED + 1;   /* eight chunks above it are done (+1: the commit of 300 takes one back) */
             long waited = 0; while (ctl3[DLC_CTL_CURSOR_WANT] != 300 && waited < 5000){ usleep(20000); waited += 20; }
-            ok(ctl3[DLC_CTL_CURSOR_WANT] == 300 && waited >= 200, "after the help delay the committer publishes the missing cursor chunk (300)");
+            ok(ctl3[DLC_CTL_CURSOR_WANT] == 300, "with 8 chunks staged above it, the missing cursor chunk (300) is published after the delay");
             stage_chunk(300, 40);                          /* the helper delivered it */
             waited = 0; while (ctl3[DLC_CTL_CURSOR_WANT] != -1 && waited < 5000){ usleep(20000); waited += 20; }
             ok(ctl3[DLC_CTL_CURSOR_WANT] == -1 && ctl3[DLC_CTL_COMMIT_TIP] == 339, "...the chunk commits and the want is cleared; committed tip 339");

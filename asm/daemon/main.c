@@ -3658,6 +3658,12 @@ enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CT
        DLC_CTL_CURSOR_WANT = 16, DLC_CTL_N_CURSOR_HELP = 17,
        DLC_CTL_RING = 18 };
 #define DLC_CURSOR_HELP_SECS 10
+/* ...and only when the pool has moved on without it: at least this many
+ * chunks staged above the cursor. A 40-block chunk is 40 MB at height
+ * 490,000 and takes a worker a minute; a bare 10 s clock fired five helps
+ * in four minutes of run 18, each a duplicate download of a chunk whose
+ * owner was still delivering it. */
+#define DLC_CURSOR_HELP_MIN_STAGED 8
 static long g_dlc_cursor_help_ms = DLC_CURSOR_HELP_SECS * 1000L;   /* test seam */
 /* Run 14 (2026-09-07) stalled for two minutes at 82,565: every worker
  * reconnected to the SAME peer -- one that accepted the handshake and
@@ -3860,7 +3866,7 @@ static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void*
         /* not staged yet: after DLC_CURSOR_HELP_SECS on the same chunk, ask
          * for a helper; a fresh chunk resets the clock */
         if(lo != wait_lo){ wait_lo = lo; wait_ms = 0; ctl[DLC_CTL_CURSOR_WANT] = -1; }
-        else if(wait_ms >= g_dlc_cursor_help_ms && ctl[DLC_CTL_CURSOR_WANT] != lo) ctl[DLC_CTL_CURSOR_WANT] = lo;
+        else if(wait_ms >= g_dlc_cursor_help_ms && ctl[DLC_CTL_STAGED] >= DLC_CURSOR_HELP_MIN_STAGED && ctl[DLC_CTL_CURSOR_WANT] != lo) ctl[DLC_CTL_CURSOR_WANT] = lo;
         wait_ms += poll_ms;
         { struct timespec ts = { poll_ms / 1000, (poll_ms % 1000) * 1000000L }; nanosleep(&ts, NULL); }
     }
