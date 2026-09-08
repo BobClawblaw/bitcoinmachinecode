@@ -41,7 +41,7 @@ HARDEN_CC  := -fstack-protector-strong -D_FORTIFY_SOURCE=2
 # 2026-09-02, when NASMFLAGS gained -Werror. See the note above it.)
 WARNFLAGS  := -Wall -Werror
 # HARDENFLAGS: full RELRO + BIND_NOW on every SHIPPED binary (not just the
-# daemon). Audit 2026-09-02 found daemon/wallet_cli -- the binary that decrypts
+# daemon). Audit 2026-09-02 found daemon/bmc_wallet_cli -- the binary that decrypts
 # and holds the wallet seed -- linked with NO relro at all, and the other tools
 # with partial RELRO (no BIND_NOW), i.e. a writable GOT for the life of the
 # process. Defined here so both hardening knobs sit together; the original
@@ -838,7 +838,7 @@ BYTEPOOLSRCS := tests/test_tx_verify_bytepool_realloc.c daemon/utxo_live.c daemo
 tests/test_tx_verify_bytepool_realloc: $(BYTEPOOLSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ $(BYTEPOOLSRCS) $(REORGOBJS) -lpthread
 
-# daemon/build_utxo -- batch UTXO-set construction from the archive. This is
+# daemon/bmc_build_utxo -- batch UTXO-set construction from the archive. This is
 # the RIGHT tool for a from-scratch (or long-gap) UTXO rebuild: its memtable is
 # CLI-sized (slots_log2/blob_gb) for batch work, so it flushes -- and therefore
 # full-compacts -- orders of magnitude less often than the live daemon's
@@ -862,34 +862,34 @@ tests/zmq_realblock_check: tests/zmq_realblock_check.c bitcoin_store.o bitcoin_s
 # utxo_probe_one -- diagnostic: resolve outpoints against a fresh read-only
 # LSM reload through BOTH read paths (point lookup + full walk). The tool
 # that made incident #49's nondeterministic slen corruption deterministic.
-daemon/utxo_probe_one: daemon/utxo_probe_one.c bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o
+daemon/bmc_utxo_probe_one: daemon/utxo_probe_one.c bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/utxo_probe_one.c bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o -lpthread
 
 # build_addr_index -- offline address->UTXO snapshot from a compacted LSM
 # run (two-pass external sort). The classifier is shared with the live tail
 # (daemon/addr_index_fmt.h) so the two can never disagree.
-daemon/build_addr_index: daemon/build_addr_index.c daemon/addr_index_fmt.h
+daemon/bmc_build_addr_index: daemon/build_addr_index.c daemon/addr_index_fmt.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_addr_index.c
 
 # build_block_filters -- whole-chain BIP158 filter backfill, prevouts
 # resolved through the txid index. Resumable; never run after the daemon
 # has adopted the files (bfilter_index.c's writer-sequence contract).
-daemon/build_block_filters: daemon/build_block_filters.c daemon/bfilter_index.c daemon/txi_format.h block_filter.c block_filter.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
+daemon/bmc_build_block_filters: daemon/build_block_filters.c daemon/bfilter_index.c daemon/txi_format.h block_filter.c block_filter.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_block_filters.c daemon/bfilter_index.c block_filter.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o -lpthread
 
-daemon/build_tx_index: daemon/build_tx_index.c daemon/txi_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
+daemon/bmc_build_tx_index: daemon/build_tx_index.c daemon/txi_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/build_tx_index.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 
 # txo-spender index base build (Core -txospenderindex), 2026-09-01
-daemon/build_txospender_index: daemon/build_txospender_index.c daemon/txosp_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
+daemon/bmc_build_txospender_index: daemon/build_txospender_index.c daemon/txosp_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_txospender_index.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 
-daemon/build_utxo: daemon/build_utxo.c $(BUILDUTXOOBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_utxo.c $(BUILDUTXOOBJS) -lpthread
+daemon/bmc_build_utxo: daemon/build_utxo.c $(BUILDUTXOOBJS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_utxo.c $(BUILDUTXOOBJS)
 
 # chainwork_build -- regenerate chainwork.dat from headers.dat (block_work sum).
 # Fixes the post-segwit chainwork.dat corruption; block_work itself is correct.
-daemon/chainwork_build: daemon/chainwork_build.c bitcoin_chainwork.o
+daemon/bmc_chainwork_build: daemon/chainwork_build.c bitcoin_chainwork.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/chainwork_build.c bitcoin_chainwork.o
 
 # test_truncate_guard_prim -- store_truncate_to must REFUSE an out-of-order
@@ -1120,7 +1120,7 @@ tests/test_private_broadcast: tests/test_private_broadcast.c daemon/private_broa
 # does not have. Run it by hand against a real store:
 #   make tests/test_utxo_recover && ./tests/test_utxo_recover <datadir>
 # It still gets a rule so it is built/compiled-checked on demand rather than
-# rotting the way daemon/build_utxo did with no target at all.
+# rotting the way daemon/bmc_build_utxo did with no target at all.
 RECOVERSRCS := tests/test_utxo_recover.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/tx_accept.c daemon/zmq_notify.c daemon/zmq_pub.c \
     daemon/mempool_cfg.c daemon/reorg.c daemon/invalid_set.c daemon/minchainwork.c daemon/notify.c daemon/locator_build.c daemon/archive_verify.c \
     daemon/node_config.c daemon/netperm.c daemon/subnet.c bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_txval_modern.c bitcoin_segwit.c \
@@ -1399,7 +1399,7 @@ tests/test_wallet_store: tests/test_wallet_store.c wallet_store.c daemon/wallet_
 # disk: wallet_cli prompts (echo off on a pty) or reads one line from a pipe;
 # bmc_cli -stdinwalletpassphrase / -stdin (Core semantics). Drives the
 # real binaries, so they are prerequisites.
-tests/test_cli_prompt: tests/test_cli_prompt.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c bitcoin_bip39.o sha512.o sha256.o bitcoin_hmac.o daemon/wallet_cli daemon/bmc_cli
+tests/test_cli_prompt: tests/test_cli_prompt.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c bitcoin_bip39.o sha512.o sha256.o bitcoin_hmac.o daemon/bmc_wallet_cli daemon/bmc_cli
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ tests/test_cli_prompt.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c bitcoin_bip39.o sha512.o sha256.o bitcoin_hmac.o -lutil
 
 # Branch-and-Bound coin selection (Core SelectCoinsBnB semantics), pure.
@@ -1889,7 +1889,7 @@ tests/test_muhash_mul_diff: tests/test_muhash_mul_diff.c $(UTXOSTATSOBJS)
 tests/test_utxo_setinfo: tests/test_utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS) $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Itests -o $@ tests/test_utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS)
 
-daemon/utxo_setinfo: daemon/utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS)
+daemon/bmc_utxo_setinfo: daemon/utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS)
 	$(CC) $(CFLAGS) $(HARDENFLAGS) -o $@ daemon/utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS)
 
 # utxo_dump_keys / utxo_repair_del -- incident 2026-09-01 tools. The dumper is a
@@ -1897,9 +1897,9 @@ daemon/utxo_setinfo: daemon/utxo_setinfo.c $(UTXOLSMOBJS) $(UTXOSTATSOBJS)
 # line, usable against a running node between writes); the repair tool deletes a
 # listed set of outpoints offline (daemon stopped) after verifying every one is
 # present. Not gated: both act on a real datadir.
-daemon/utxo_dump_keys: daemon/utxo_dump_keys.c $(UTXOLSMOBJS)
+daemon/bmc_utxo_dump_keys: daemon/utxo_dump_keys.c $(UTXOLSMOBJS)
 	$(CC) $(CFLAGS) $(HARDENFLAGS) -o $@ daemon/utxo_dump_keys.c $(UTXOLSMOBJS) -lpthread
-daemon/utxo_repair_del: daemon/utxo_repair_del.c $(UTXOLSMOBJS)
+daemon/bmc_utxo_repair_del: daemon/utxo_repair_del.c $(UTXOLSMOBJS)
 	$(CC) $(CFLAGS) $(HARDENFLAGS) -o $@ daemon/utxo_repair_del.c $(UTXOLSMOBJS) -lpthread
 
 # Regression test for the 2026-08-20 compaction manifest-ordering bug (see
@@ -1926,14 +1926,14 @@ tests/test_txval: tests/test_txval.c tests/txval_vec.h $(TXVALOBJS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_txval.c $(TXVALOBJS)
 
 # LIVE-WIRE end-to-end sighash test: builds a real P2PKH tx, signs it by
-# invoking the ACTUAL daemon/wallet_cli binary (legacy SIGHASH_ALL), then
+# invoking the ACTUAL daemon/bmc_wallet_cli binary (legacy SIGHASH_ALL), then
 # validates the CLI-signed tx with the whole-transaction validator
 # (tx_parse + UTXO + verify_p2pkh + fee). Ties the wallet signer and the
 # validator together across a real process boundary instead of isolated
 # pre-generated vectors. Requires bitcoin_keys/bitcoin_addr (for the prevout
 # P2PKH script) on top of the validator set.
 E2EOBJS := $(TXVALOBJS) bitcoin_keys.o bitcoin_addr.o ripemd160.o
-tests/test_e2e_sighash: tests/test_e2e_sighash.c daemon/wallet_cli $(E2EOBJS)
+tests/test_e2e_sighash: tests/test_e2e_sighash.c daemon/bmc_wallet_cli $(E2EOBJS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_e2e_sighash.c $(E2EOBJS)
 
 # "send" (createrawtx + sign-all-inputs) end-to-end: wallet_core.c builds the
@@ -2601,7 +2601,7 @@ tests/test_tx_submit: tests/test_tx_submit.c tests/modern_spend.h daemon/tx_subm
 # BIP32 master/path/extkey) plus the verified scalar/point/field ops (sc_*,
 # point_scalar_mul, fe_*) used to construct ECDSA signatures.
 # WALLETPRIMS is defined at the top of this file -- see the "expanded when read" note there.
-daemon/wallet_cli: daemon/wallet_cli.c wallet_core.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c wallet_book.c wallet_txlog.c wallet_msgsign.c $(WALLETPRIMS) bitcoin_script.o
+daemon/bmc_wallet_cli: daemon/wallet_cli.c wallet_core.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c wallet_book.c wallet_txlog.c wallet_msgsign.c $(WALLETPRIMS) bitcoin_script.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/wallet_cli.c wallet_core.c wallet_store.c daemon/wallet_crypter.c bitcoin_aes.c wallet_book.c wallet_txlog.c wallet_msgsign.c $(WALLETPRIMS) bitcoin_script.o
 
 tests/test_wallet_txlog: tests/test_wallet_txlog.c wallet_txlog.c
@@ -2964,7 +2964,7 @@ tests/test_rpc_control: tests/test_rpc_control.c rpc_commands.o rpc_json.o $(RPC
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_control.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
 
 # txo-spender index end to end: builder base + tail + reader + gettxspendingprevout (2026-09-01)
-tests/test_txospender_index: tests/test_txospender_index.c daemon/build_txospender_index daemon/txosp_tail.c daemon/txosp_format.h rpc_commands.o rpc_json.o $(RPCLIBS)
+tests/test_txospender_index: tests/test_txospender_index.c daemon/bmc_build_txospender_index daemon/txosp_tail.c daemon/txosp_format.h rpc_commands.o rpc_json.o $(RPCLIBS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_txospender_index.c daemon/txosp_tail.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
 
 tests/test_rpc_psbtfinal: tests/test_rpc_psbtfinal.c tests/psbt_tapscript_vec.h rpc_commands.o rpc_json.o $(RPCLIBS)
@@ -3171,7 +3171,7 @@ daemon/bmcbitcoind: addrbook.a $(DAEMONSRCS) daemon/archive_reindex.h daemon/utx
 tests/test_elf_hardening: tests/test_elf_hardening.c daemon/bmcbitcoind
 	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_elf_hardening.c
 
-daemon/pverify: daemon/pverify.c $(CONSOBJS)
+daemon/bmc_pverify: daemon/pverify.c $(CONSOBJS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/pverify.c $(CONSOBJS) -lpthread
 
 # bitcoin_store.asm shared-append: concurrent-safe single-store write (standalone).
@@ -3365,7 +3365,7 @@ script-flags-check:
 
 
 
-test: abi-check callee-saved-check prereq-check runlist-check clean-check san-check script-flags-check link-audit-selftest gate-log-selftest daemon/build_utxo daemon/bmcbitcoind link-check tests/test_abi_coverage tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_cry6_sha_paths tests/test_sha512 tests/test_aes tests/test_wallet_crypter tests/test_wallet_store tests/test_cli_prompt tests/test_chainparams tests/test_pow_rules tests/test_coinselect_bnb tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip32_ckdpub tests/test_bip39 tests/test_bip39_passbound tests/test_sha512_thread_stress tests/test_secret_wipe tests/test_ripemd160 tests/test_ripemd160_thread_stress tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_msg_sign tests/test_net_policy tests/test_private_broadcast tests/test_wallet_txlog tests/test_lsm_bloomsat tests/test_lsm_pick_budget tests/test_lsm_flush_sparse tests/test_lsm_lost_tombstones tests/test_lsm_lost_tombstones_bad tests/test_utxo_lost_tombstones tests/test_utxo_put_wal_fail tests/test_utxo_wal_reset_fail tests/test_utxo_reload_truncated tests/test_utxo_manifest_bad tests/test_reorg_crash_ordering tests/test_utxo_lost_tombstones_bad tests/test_interp_legacy_spend tests/test_ir10_p2pkh_bounds tests/test_package_policy tests/test_truc_policy \
+test: abi-check callee-saved-check prereq-check runlist-check clean-check san-check script-flags-check link-audit-selftest gate-log-selftest daemon/bmc_build_utxo daemon/bmcbitcoind link-check tests/test_abi_coverage tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_cry6_sha_paths tests/test_sha512 tests/test_aes tests/test_wallet_crypter tests/test_wallet_store tests/test_cli_prompt tests/test_chainparams tests/test_pow_rules tests/test_coinselect_bnb tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip32_ckdpub tests/test_bip39 tests/test_bip39_passbound tests/test_sha512_thread_stress tests/test_secret_wipe tests/test_ripemd160 tests/test_ripemd160_thread_stress tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_msg_sign tests/test_net_policy tests/test_private_broadcast tests/test_wallet_txlog tests/test_lsm_bloomsat tests/test_lsm_pick_budget tests/test_lsm_flush_sparse tests/test_lsm_lost_tombstones tests/test_lsm_lost_tombstones_bad tests/test_utxo_lost_tombstones tests/test_utxo_put_wal_fail tests/test_utxo_wal_reset_fail tests/test_utxo_reload_truncated tests/test_utxo_manifest_bad tests/test_reorg_crash_ordering tests/test_utxo_lost_tombstones_bad tests/test_interp_legacy_spend tests/test_ir10_p2pkh_bounds tests/test_package_policy tests/test_truc_policy \
 tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tests/test_mempool_evict_64k tests/test_mempool_finality tests/test_mempool_core_parity tests/test_txtxid tests/test_mempool_persist tests/test_block tests/test_tx tests/test_net tests/test_net_timeouts tests/test_inbound_idle_timeout tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_sto11_append_durability tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_serve_violation tests/test_serve_block_ctx tests/test_p2p_msgsize tests/test_wallet_pass tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_addrv2_serve tests/test_addr_ingest_parse tests/test_addr_ingest_violation tests/test_sha3 tests/test_base32 tests/test_netaddr tests/test_addrbook tests/test_addrbook_net10 tests/test_stale_tip tests/test_peer_timeout tests/test_txann tests/test_inbound_evict tests/test_anchors tests/test_ibd_pipeline tests/test_archive_seed tests/test_hdr_lowwork tests/test_coinsel tests/test_invalid_set tests/test_cmpct_recv tests/test_socks5 tests/test_torcontrol tests/test_i2psam tests/test_net6 tests/test_privacy_dns tests/test_chacha20 tests/test_poly1305 tests/test_hkdf tests/test_bip324_fs tests/test_bip324 tests/test_bip324_transport tests/test_v2transport tests/test_fe_sqrt tests/test_ellswift tests/test_ellswift_ecdh tests/test_asmap tests/test_core_parity tests/test_outbound_mux tests/test_redial tests/test_elf_hardening tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_wal_buffer tests/test_utxo_torn_tail tests/test_utxo_lsm tests/test_utxo_probe_bound tests/test_utxo_prefetch_race tests/test_utxo_live_count tests/test_sparse_offsets tests/test_compact_async tests/test_compact_leveled tests/test_policy_v31 tests/test_utxo_ckpt_batch tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/test_scr_interp_bounds tests/smoke_interp tests/test_interp tests/test_csv_disable_flag tests/test_interp_core_vectors tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_scr10_sigops_bounds tests/test_schnorr tests/test_taproot tests/test_taproot_thread_stress tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_tx_submit tests/test_tx_relay tests/test_txrelay_invscale tests/test_mempool_consensus_verify tests/test_txacc_snapshot_size tests/test_rpc_json tests/test_rpc_amount tests/test_rpc_transport tests/test_rpc_server tests/test_rpc18_ipv6 tests/test_mempool_shared tests/test_append_linkage tests/test_txindex_tail tests/test_coinstats_index tests/test_addr_self tests/test_bfilter_index tests/test_cfheaders_bounds tests/test_serve_rejects tests/test_secure_lock tests/test_block_strip tests/test_addr_index_tail tests/test_blk_submit tests/test_blk_dryrun tests/test_val_connect tests/test_val_read_tx tests/test_bip68_locks tests/test_hdr_contextual tests/test_tx_bounds_fuzz tests/test_pow_check tests/test_scr5_spkrun tests/test_scr7_cms_bounds tests/test_scr9_policy_flags tests/test_txaccept_corpus tests/test_ir9_tapscript_policy tests/test_ir5_sighash_cache tests/test_rpc_chain tests/test_zmq_ring tests/test_zmq_bind tests/test_zmq_thread tests/test_rpc_start_policy tests/test_rpc_json_depth tests/test_txrecon tests/test_mempool_persist_wiring tests/test_reindex_chainstate tests/test_archive_trim tests/test_reindex tests/test_descriptor_vectors tests/test_miniscript tests/test_bip340_sign tests/test_signet_solution tests/test_signet_txs tests/test_signet_verify tests/test_signet_block tests/test_netperm tests/test_subnet tests/test_rpc_acl tests/test_cli_conf tests/test_misbehavior_shared tests/test_txoutproof tests/test_rpc_msg tests/test_rpc_rawtx tests/test_rpc_psbtfinal tests/test_psbt_v2 tests/test_txospender_index tests/test_rpc_psbt_taproot tests/test_rpc_control tests/test_wallet_scan tests/test_block_filter tests/test_utxo_snapshot tests/test_rpc_signer tests/test_taproot_parity tests/test_multisig_opcount tests/test_rpc_signraw tests/test_rpc_miniscript_sign tests/test_rpc_node tests/test_rpc_wallet_ops tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_bip30_daemon tests/test_bip30_overwrite tests/test_utxo_unspendable tests/test_txv_parse_diff tests/test_txv_classify_diff tests/test_segwit_classify_diff tests/test_txvb_parse_diff tests/test_txv_pools_diff tests/test_strip_witness_diff tests/test_tapagg_diff tests/test_txv_dispatch_diff tests/test_wv0_drv_diff tests/test_svs_drv_diff tests/test_checksig_diff tests/test_bip143_diff tests/test_taproot_verify_diff tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul tests/test_muhash tests/test_utxo_setinfo tests/test_schnorr_diff tests/test_schnorr_thread_stress tests/test_merkle_batch tests/test_mv_parse_bounds tests/test_money_range tests/test_txv_cs_maxsize tests/test_compact_threshold tests/test_bip341_diff tests/test_musig2 tests/test_musig2_psbt tests/test_rpc_whitelist tests/test_fee_estimator tests/test_psbt_update tests/test_psbt_bounds tests/test_relay_policy tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_undo_asm_diff tests/test_reorg tests/test_dial_budget tests/test_sync_budget tests/test_dlc_peer_parse tests/test_dialhelper tests/test_i2p_inbound tests/test_pool_diversity tests/test_parallel_trigger tests/test_txoq_ipc tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_compact_manifest_order tests/test_utxo_compact_gen_tiebreak tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_utxo_ghost_resume tests/test_lsm_count_drift tests/test_utxo_recover_gate tests/test_taproot_scriptpath tests/test_mul_carry_regression tests/test_fe_repr tests/test_fe_inline tests/test_point_repr tests/test_ecdsa_inverse tests/test_lsm_mmap_diff tests/test_utxo_catchup_shutdown tests/test_utxo_catchup_timing tests/test_utxo_crash_recovery tests/test_lsm_sparse_diff tests/soak_lsm_mm tests/test_ecdsa_glv_switch tests/test_witness_commitment tests/test_compactsize_canonical tests/test_txvb_wprog_stable tests/test_taproot_exception_block tests/test_dersig_encoding tests/test_scr8_der_lax tests/test_verify_core_vectors tests/test_scriptnum_bool tests/test_segwit_real tests/test_segwit_coverage tests/test_tapscript_scale tests/test_block_481827_pool_stack tests/test_segwit_txout_bound tests/test_segwit_bounds_fuzz tests/test_taproot_bounds_fuzz tests/test_taproot_parallel_arena tests/test_taproot_block_diff tests/test_public_tip tests/test_connect_reject tests/test_utxo_tiered_compact tests/test_lsm_flush_sort_diff tests/test_muhash_mul_diff tests/test_mempool_wtxid tests/test_coinstats_bulk_seed tests/test_coinstats_fold_ring tests/test_utxo_probe_diff tests/test_utxo_catchup_bounded tests/test_dlc_interleave tests/test_banlist_persist tests/test_shared_stress
 	./tests/test_abi_stack_align
 	./tests/bench_abi_audit $(ABI_AUDIT_BLOCK)
@@ -3785,4 +3785,4 @@ clean-check:
 
 clean:
 	rm -f $(SAN_BINS) $(addsuffix .sanlog,$(SAN_BINS))   # BLD-7
-	rm -f $(OBJS) serve_hdrctx.o secp256k1_taproot.o secp256k1_schnorr.o bitcoind.o sha512.o bitcoin_hmac.o bitcoin_keys.o bitcoin_bip39.o ripemd160.o bitcoin_addr.o tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip32_ckdpub tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_wal_buffer tests/test_utxo_lsm tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_tx_submit tests/test_tx_relay tests/test_mempool_consensus_verify tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_whitelist tests/test_rpc_msg tests/test_rpc_rawtx tests/test_rpc_signraw tests/test_rpc_miniscript_sign rpc_json.o rpc_net.o rpc_commands.o rpc_server.o daemon/bmc_cli daemon/bmc_rpcd daemon/wallet_cli tests/bip30_shim tests/test_bip30 bitcoin_chainwork.o daemon/locator_build.o daemon/undo_log.o tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg
+	rm -f $(OBJS) serve_hdrctx.o secp256k1_taproot.o secp256k1_schnorr.o bitcoind.o sha512.o bitcoin_hmac.o bitcoin_keys.o bitcoin_bip39.o ripemd160.o bitcoin_addr.o tests/test_pubkey tests/test_sighash tests/test_script tests/test_p2pkh tests/test_utxo tests/test_sha256 tests/test_sha512 tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip32_ckdpub tests/test_bip39 tests/test_ripemd160 tests/test_addr tests/test_bech32 tests/test_mempool tests/test_txtxid tests/test_block tests/test_tx tests/test_net tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_wal_buffer tests/test_utxo_lsm tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/test_schnorr tests/test_taproot tests/test_taproot_sighash tests/test_segwit_sighash tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_tx_submit tests/test_tx_relay tests/test_mempool_consensus_verify tests/test_rpc_json tests/test_rpc_transport tests/test_rpc_server tests/test_rpc_whitelist tests/test_rpc_msg tests/test_rpc_rawtx tests/test_rpc_signraw tests/test_rpc_miniscript_sign rpc_json.o rpc_net.o rpc_commands.o rpc_server.o daemon/bmc_cli daemon/bmc_rpcd daemon/bmc_wallet_cli tests/bip30_shim tests/test_bip30 bitcoin_chainwork.o daemon/locator_build.o daemon/undo_log.o tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_reorg

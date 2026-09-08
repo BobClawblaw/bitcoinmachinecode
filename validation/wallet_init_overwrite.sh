@@ -17,8 +17,8 @@
 # a "returns non-zero" test), and --force must still work so scripted
 # re-initialisation remains possible.
 set -u
-BIN="${BIN:-$(cd "$(dirname "$0")/.." && pwd)/asm/daemon/wallet_cli}"
-[ -x "$BIN" ] || { echo "FAIL: no wallet_cli at $BIN (make daemon/wallet_cli)"; exit 1; }
+BIN="${BIN:-$(cd "$(dirname "$0")/.." && pwd)/asm/daemon/bmc_wallet_cli}"
+[ -x "$BIN" ] || { echo "FAIL: no wallet_cli at $BIN (make daemon/bmc_wallet_cli)"; exit 1; }
 
 D=$(mktemp -d /tmp/wal5XXXXXX) || exit 1
 trap 'rm -rf "$D"' EXIT

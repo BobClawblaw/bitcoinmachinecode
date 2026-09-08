@@ -939,7 +939,7 @@ respectively. The channel they would ride now exists.
 most likely thing to break an application swapping this node in for Core.
 
 ### The index
-`daemon/build_tx_index <datadir> [from] [to]` walks the archive and emits
+`daemon/bmc_build_tx_index <datadir> [from] [to]` walks the archive and emits
 `txindex.dat`: 20-byte records sorted by an **8-byte txid prefix**, with a
 sparse sample every 256th record.
 

@@ -15,7 +15,7 @@ set -u
 set -o pipefail
 #
 # NOTE: this used to watch build_utxo_seed.log, the log of a separate,
-# one-off standalone seeding tool (daemon/build_utxo) -- not what actually
+# one-off standalone seeding tool (daemon/bmc_build_utxo) -- not what actually
 # runs day to day. The live daemon logs its own catchup progress to
 # bitcoind.production.log instead, at a WIDE interval (every 20000 heights),
 # so during a slow bulk-mode stretch that's tens of minutes of nothing new

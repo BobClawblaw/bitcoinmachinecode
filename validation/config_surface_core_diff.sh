@@ -11,7 +11,7 @@ set -u
 CORE_BIN=${CORE_BIN:-/storage/bitcoin-core-source/build-zmq/bin}
 ROOT=${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 BMC_BIN=${BMC_BIN:-$ROOT/asm/daemon/bmcbitcoind}
-WALLET_CLI=${WALLET_CLI:-$ROOT/asm/daemon/wallet_cli}
+WALLET_CLI=${WALLET_CLI:-$ROOT/asm/daemon/bmc_wallet_cli}
 WORK=${WORK:-${CLAUDE_JOB_DIR:-/tmp}/tmp/cfg/diff-$$}
 CORE_DIR=$WORK/core; BMC_DIR=$WORK/bmc
 PB=${PORT_BASE:-20740}; CORE_P2P=$((PB+4)); CORE_RPC=$((PB+20)); BMC_P2P=$((PB+15)); BMC_RPC=$((PB+6))

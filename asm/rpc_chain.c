@@ -2330,7 +2330,7 @@ static int cmd_gettxoutproof(const rj_val* params, rj_val** res, long* ec, const
         if (!lookup_block_param(params, 1, 1, &h, ec, em)) return 0;
     } else {
         /* No blockhash given. Core's own order: try the txid index (built
-         * offline, daemon/build_tx_index, or maintained live by
+         * offline, daemon/bmc_build_tx_index, or maintained live by
          * daemon/tx_index_tail.c) on the FIRST requested txid -- exactly
          * one lookup, since a proof only makes sense when every txid in the
          * request lives in the SAME block, and the loop below already
@@ -2363,7 +2363,7 @@ static int cmd_gettxoutproof(const rj_val* params, rj_val** res, long* ec, const
                          "or pass the block hash.", g_txi_from, cov_to);
                 *ec = -5; *em = nomsg; return 0;
             }
-            *ec = -5; *em = "No txid index built (daemon/build_tx_index) and no block hash given -- "
+            *ec = -5; *em = "No txid index built (daemon/bmc_build_tx_index) and no block hash given -- "
                             "pass the block hash, or build the index to locate a confirmed "
                             "transaction by txid alone."; return 0;
         }

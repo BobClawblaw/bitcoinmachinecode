@@ -39,7 +39,7 @@ static int run_pty(const char* answer, char* out, int cap, int* saw_prompt){
 int main(void){
     const char* MN = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     char cwd[512]; if (!getcwd(cwd, sizeof cwd)) return 1;
-    snprintf(WCLI, sizeof WCLI, "%s/daemon/wallet_cli", cwd); snprintf(BCLI, sizeof BCLI, "%s/daemon/bmc_cli", cwd);
+    snprintf(WCLI, sizeof WCLI, "%s/daemon/bmc_wallet_cli", cwd); snprintf(BCLI, sizeof BCLI, "%s/daemon/bmc_cli", cwd);
     char tmpl[] = "/tmp/cliprompt.XXXXXX"; char* d = mkdtemp(tmpl); if (!d) return 1; snprintf(DIR, sizeof DIR, "%s", d);
     char path[1400]; snprintf(path, sizeof path, "%s/data", DIR); mkdir(path, 0700);
     snprintf(path, sizeof path, "%s/data/bmcwallet.dat", DIR);

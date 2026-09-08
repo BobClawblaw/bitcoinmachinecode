@@ -19,8 +19,8 @@ lo=$(echo $rng|cut -d' ' -f1); hi=$(echo $rng|cut -d' ' -f2)
 echo "Verifying longest contiguous stored run: [$lo, $hi] ($((hi-lo+1)) blocks)"
 # Prefer the parallel verifier (machine-adaptive worker pool, ~7x on multi-core);
 # fall back to the serial verifier if pverify isn't built.
-if [ -x ./daemon/pverify ]; then
-  ./daemon/pverify "$DIR" "$lo" "$hi" 2>&1 | tail -8
+if [ -x ./daemon/bmc_pverify ]; then
+  ./daemon/bmc_pverify "$DIR" "$lo" "$hi" 2>&1 | tail -8
 else
   ./daemon/verify  "$DIR" "$lo" "$hi" 2>&1 | tail -8
 fi

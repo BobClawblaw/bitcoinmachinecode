@@ -14,7 +14,7 @@
 #      carries bytes (validation/i2p_remote_probe, run separately).
 set -u
 BMC_BIN=${BMC_BIN:-/storage/bitcoinmachinecode/asm/daemon/bmcbitcoind}
-WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/wallet_cli}
+WALLET_CLI=${WALLET_CLI:-/storage/bitcoinmachinecode/asm/daemon/bmc_wallet_cli}
 SAM=${SAM:-127.0.0.1:7656}
 WORK=${WORK:-/tmp/i2p-e2e-$$}
 BMC_DIR=$WORK/bmc; BMC_P2P=19965; BMC_RPC=19966
