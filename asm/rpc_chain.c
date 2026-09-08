@@ -1930,14 +1930,24 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
     u8 want[32]; for (int i = 0; i < 32; i++) want[i] = want_disp[31-i];
     u64 c; u64 ntx = read_varint(blk + 80, end, &c);
     const u8* p = blk + 80 + c;
+    u64 pre = 0;                      /* transactions before p in the block */
     if (known_off > 0 && known_off < len){
         /* the index already knows where it is: start there and stop after
          * one transaction. The txid is still recomputed and compared below,
-         * so a stale or wrong index entry cannot return the wrong tx. */
+         * so a stale or wrong index entry cannot return the wrong tx.
+         * 2026-09-08: the transaction's INDEX in the block still has to be
+         * real -- the undo slice below is located by it, and with i == 0 for
+         * every indexed lookup the prevouts were skipped as if the tx were
+         * the coinbase (production's Esplora facade showed fee 0 on every
+         * /tx). One pass over the block up to the offset, as the block-hash
+         * path does over the whole block. */
+        const u8* q = blk + 80 + c;
+        while (q < blk + known_off){ txw_t kw; if (!tx_walk(q, end, &kw)) break; pre++; q += kw.len; }
         p = blk + known_off;
         ntx = 1;
     }
-    for (u64 i = 0; i < ntx; i++){
+    for (u64 i0 = 0; i0 < ntx; i0++){
+        const u64 i = i0 + pre;       /* the transaction's index in the block */
         txw_t w;
         if (!tx_walk(p, end, &w)) break;
         u8 txid[32]; u8* scratch = malloc(w.len);
@@ -1980,7 +1990,12 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
                      * non-coinbase input. Walk the block again to find it --
                      * the same walk that located the transaction, so the cost
                      * is one extra pass over a block already in memory. */
-                    long skip = 0; const u8* q = blk;
+                    /* 2026-09-08: the walk started at the block HEADER, so
+                     * tx_walk failed on the first step and `skip` stayed 0:
+                     * every transaction past the first got the first
+                     * transaction's prevouts (and fee) on both paths. Start
+                     * at the first transaction. */
+                    long skip = 0; const u8* q = blk + 80 + c;
                     for (u64 k = 0; k < i; k++){
                         txw_t kw;
                         if (!tx_walk(q, end, &kw)) break;
