@@ -109,6 +109,7 @@ also annotated tags.
 | [`releases/2026-09-08-announce-cap.md`](releases/2026-09-08-announce-cap.md) | The far-behind trigger believes the second-highest announce, not one peer's claim |
 | [`releases/2026-09-08-behind-peer.md`](releases/2026-09-08-behind-peer.md) | A header page that ends below our tip means the peer is behind us -- try another |
 | [`releases/2026-09-08-address-mempool.md`](releases/2026-09-08-address-mempool.md) | The address routes include the mempool |
+| [`releases/2026-09-08-core-rest.md`](releases/2026-09-08-core-rest.md) | Core's REST interface (`rest=1`), 82 route checks against Core's regtest REST; four RPC parity gaps it exposed |
 
 ## Development history
 
