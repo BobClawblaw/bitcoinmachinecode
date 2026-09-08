@@ -358,6 +358,7 @@ extern void utxo_lsm_set_flush_hook(void (*fn)(void));
 extern void lsm_mm_invalidate_all(void);
 static pid_t   g_cmp_pid = 0;
 static struct timespec g_cmp_t0;
+static char g_cmp_desc[160];   /* what the running compaction is, for its completion line (2026-09-08) */
 static u64     g_cmp_inputs[64]; static int g_cmp_nin = 0;
 static u64     g_cmp_n_before = 0;
 static long    g_cmp_height = 0;
@@ -400,8 +401,8 @@ static void compact_adopt(int st){
             int gone = 0;
             for (int i = 0; i < g_cmp_nin; i++) if (!manifest_names(g_cmp_inputs[i])){ unlink_run(g_cmp_inputs[i]); gone++; }
             long interim = (long)g_utxo_lst.manifest_n - ((long)g_cmp_n_before - g_cmp_nin + 1);   /* runs flushed since fork */
-            fprintf(stderr, "[utxo_live] background compaction done in %.1fs: manifest_n %lu -> %lu (%d merged into run %lu, %ld flushed meanwhile), %d input run(s) unlinked (started at height %ld; apply never waited)\n",
-                    secs, (unsigned long)g_cmp_n_before, (unsigned long)g_utxo_lst.manifest_n, g_cmp_nin, (unsigned long)g_cmp_child_run, interim, gone, g_cmp_height);
+            fprintf(stderr, "[utxo_live] compaction done in %.1fs (%s; started at height %ld): manifest_n %lu -> %lu, merged into run %lu, %ld flushed meanwhile, %d input run(s) unlinked; apply never waited\n",
+                    secs, g_cmp_desc, g_cmp_height, (unsigned long)g_cmp_n_before, (unsigned long)g_utxo_lst.manifest_n, (unsigned long)g_cmp_child_run, interim, gone);
         }
     } else {
         unlink_run(g_cmp_child_run); unlink(LSM_MANIFEST_CHILD);
@@ -499,9 +500,11 @@ static int compact_start_async(long height, const char* why){
     g_cmp_child_run = g_utxo_lst.next_run_no; g_utxo_lst.next_run_no++; g_utxo_lst.next_gen++;
     g_cmp_is_full = (lo == 0 && (u64)g_cmp_nin == g_utxo_lst.manifest_n);
     g_cmp_pid = p; clock_gettime(CLOCK_MONOTONIC, &g_cmp_t0);
-    fprintf(stderr, "[utxo_live] compaction of %d run(s) [%ld..%ld) of %lu started in background pid %d (%s at height %ld; %s) -- apply continues\n",
-            g_cmp_nin, lo, lo + k, (unsigned long)g_utxo_lst.manifest_n, (int)p, why, height,
-            g_cmp_is_full ? "full merge" : lo == 0 ? "oldest runs" : "newest runs, tombstones kept");
+    /* 2026-09-08: the start is described on the completion line instead of
+     * its own line (run 16: 2,720 compactions, two lines each) */
+    snprintf(g_cmp_desc, sizeof g_cmp_desc, "%d run(s) [%ld..%ld) of %lu, %s, %s",
+             g_cmp_nin, lo, lo + k, (unsigned long)g_utxo_lst.manifest_n, why,
+             g_cmp_is_full ? "full merge" : lo == 0 ? "oldest runs" : "newest runs, tombstones kept");
     return 1;
 }
 /* For the daemon's shutdown path: a child mid-merge is killed, not awaited --
@@ -3401,7 +3404,8 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
                 g_last_stop_reason = UTXO_STOP_HOLE;
                 break;
             }
-            fprintf(stderr, "[utxo_live] WARNING: hole/short block at height %ld (len=%ld) -- stopping catch-up short\n", h, len);
+            { static long warned_h = -1;                       /* once per height: the worker retries every second */
+              if(h != warned_h){ warned_h = h; fprintf(stderr, "[utxo_live] WARNING: hole/short block at height %ld (len=%ld) -- stopping catch-up short (said once per height)\n", h, len); } }
             g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = h;
             g_last_stop_reason = UTXO_STOP_FAIL;
             break;

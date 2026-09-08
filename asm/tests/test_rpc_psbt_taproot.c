@@ -19,12 +19,57 @@
 #include <string.h>
 #include "../rpc_commands.h"
 #include "../rpc_json.h"
+#include "psbt_tapscript_vec.h"   /* Core's signed+finalized script-path spend: calibrates the verifier harness */
 typedef unsigned char u8;
 extern void scalar_to_pubkey(u8 pub[33], const u8 priv_be[32]);
 extern void sha256_full(u8 out[32], const void* msg, unsigned long len);
 extern void base58check_encode(char* out, const u8* payload, int len);
 extern int  bip32_xonly_tweak_add_par(const u8* x, const u8* t, u8* out_x, int* odd);
 static int fails = 0, checks = 0;
+/* ---- 2026-09-08: every finalized spend below is run through the CONSENSUS
+ * taproot verifier (taproot_verify_input, the code that validates blocks),
+ * against the funding output the PSBT declared. Until now the tests checked
+ * the witness's shape; a signature that verifies is the actual claim. */
+#include <stdint.h>
+extern int taproot_verify_input(const uint8_t* spk, const uint8_t* const* wit, const uint32_t* witlen, uint32_t nwit,
+                                const uint8_t* tx, int64_t txlen, int64_t n_in, const uint8_t* prevouts, const uint8_t* amounts,
+                                const uint8_t* spks, int64_t num_inputs, const char** reason);
+static unsigned long rd_varint(const u8* p, unsigned long* used){
+    if (p[0] < 0xfd){ *used = 1; return p[0]; }
+    if (p[0] == 0xfd){ *used = 3; return p[1] | ((unsigned long)p[2] << 8); }
+    if (p[0] == 0xfe){ *used = 5; return p[1] | ((unsigned long)p[2] << 8) | ((unsigned long)p[3] << 16) | ((unsigned long)p[4] << 24); }
+    *used = 9; unsigned long v = 0; for (int i = 0; i < 8; i++) v |= (unsigned long)p[1+i] << (8*i); return v;
+}
+static int unhex(u8* out, const char* h, unsigned long cap){ unsigned long n = strlen(h) / 2; if (n > cap) return -1;
+    for (unsigned long i = 0; i < n; i++){ unsigned v; if (sscanf(h + 2*i, "%2x", &v) != 1) return -1; out[i] = (u8)v; } return (int)n; }
+/* verify input 0 of a finalized segwit tx (hex) against a P2TR funding output of 1 BTC */
+static int consensus_verifies(const char* hex, const u8 xonly_q[32], const char** reason){
+    static u8 tx[8192]; int txl = unhex(tx, hex, sizeof tx); if (txl < 0) { *reason = "bad hex"; return 0; }
+    const u8* p = tx + 4; if (p[0] != 0 || p[1] != 1){ *reason = "not a segwit tx"; return 0; } p += 2;
+    unsigned long used, nin = rd_varint(p, &used); p += used;
+    u8 prevouts[36]; memcpy(prevouts, p, 36);
+    for (unsigned long i = 0; i < nin; i++){ p += 36; unsigned long sl = rd_varint(p, &used); p += used + sl + 4; }
+    unsigned long nout = rd_varint(p, &used); p += used;
+    for (unsigned long i = 0; i < nout; i++){ p += 8; unsigned long sl = rd_varint(p, &used); p += used + sl; }
+    unsigned long nwit = rd_varint(p, &used); p += used;
+    static const u8* wit[16]; static uint32_t witlen[16]; if (nwit > 16){ *reason = "too many witness items"; return 0; }
+    for (unsigned long i = 0; i < nwit; i++){ witlen[i] = (uint32_t)rd_varint(p, &used); p += used; wit[i] = p; p += witlen[i]; }
+    /* the verifier (like tx_verify.c) takes the witness-STRIPPED serialization:
+     * version, vin, vout, locktime -- no marker/flag, no witness */
+    static u8 stx[8192]; unsigned long sl = 0;
+    memcpy(stx, tx, 4); sl = 4;
+    { const u8* q = tx + 6; unsigned long u2, ni = rd_varint(q, &u2); unsigned long body_start = 6;
+      const u8* e = q + u2; for (unsigned long i = 0; i < ni; i++){ e += 36; unsigned long l2 = rd_varint(e, &u2); e += u2 + l2 + 4; }
+      unsigned long no = rd_varint(e, &u2); e += u2; for (unsigned long i = 0; i < no; i++){ e += 8; unsigned long l2 = rd_varint(e, &u2); e += u2 + l2; }
+      unsigned long body_len = (unsigned long)(e - tx) - body_start;
+      memcpy(stx + sl, tx + body_start, body_len); sl += body_len; }
+    memcpy(stx + sl, tx + txl - 4, 4); sl += 4;                     /* locktime */
+    u8 spk[34] = {0x51, 0x20}; memcpy(spk + 2, xonly_q, 32);
+    u8 amounts[8]; unsigned long long val = 100000000ULL; for (int i = 0; i < 8; i++) amounts[i] = (u8)(val >> (8*i));
+    u8 spks[35]; spks[0] = 34; memcpy(spks + 1, spk, 34);
+    return taproot_verify_input(spk, wit, witlen, (uint32_t)nwit, stx, (int64_t)sl, 0, prevouts, amounts, spks, 1, reason) == 1;
+}
+
 static void ck(const char* w, int c){ checks++; if (c) printf("ok  : %s\n", w); else { printf("FAIL: %s\n", w); fails++; } }
 static void hexs(char* o, const u8* b, int n){ for (int i = 0; i < n; i++) sprintf(o + 2*i, "%02x", b[i]); o[2*n] = 0; }
 static const char* S(rj_val* o, const char* k){ rj_val* v = o ? rj_obj_get(o, k) : NULL; return v ? v->str : NULL; }
@@ -61,6 +106,15 @@ int main(void){
     static char ps64[6000], pj[7000]; long ec; const char* em; rj_val* r;
     char hah[65], hbh[65], rooth[65]; hexs(hah, ha, 32); hexs(hbh, hb, 32); hexs(rooth, root, 32);
 
+    printf("== 0. the verifier harness itself: Core's own finalized script-path spend must pass it ==\n");
+    { static const u8 core_q[32] = { 0x86, 0x26, 0x6e, 0xdd, 0x5f, 0x97, 0x1d, 0x1a, 0xac, 0x29, 0xfa, 0x99, 0xc1, 0x60, 0xec, 0x21, 0xc5, 0x07, 0x4c, 0x3b, 0x8d, 0x5e, 0xef, 0x16, 0x2c, 0xbf, 0x17, 0x36, 0x6f, 0x4b, 0x70, 0xfc };
+      const char* why = "?"; int okv = consensus_verifies(FINAL_TX_HEX, core_q, &why);
+      ck("Core's finalized tx (tests/psbt_tapscript_vec.h) is accepted by our consensus verifier through this harness", okv); if (!okv) printf("    (reason: %s)\n", why);
+      /* and the harness bites: one flipped byte in the signature (the first witness item) must be refused */
+      { char* mut = strdup(FINAL_TX_HEX); size_t L = strlen(mut); size_t p = L - 8 - 2*(33 + 2) - 2*(35 + 2) - 2*64 + 20;   /* inside the 64-byte sig, before the leaf script and control block */
+        mut[p] = (mut[p] == 'a') ? 'b' : 'a';
+        int okm = consensus_verifies(mut, core_q, &why); ck("...and refuses the same tx with one byte of the signature flipped", !okm); free(mut); } }
+
     printf("== 1. decodepsbt ==\n");
     mk_psbt(ps64, Q, leaves, llen, ctrls, 2, pub[2]+1, root);
     snprintf(pj, sizeof pj, "[\"%s\"]", ps64); r = call("decodepsbt", pj, &ec, &em);
@@ -77,7 +131,8 @@ int main(void){
     snprintf(pj, sizeof pj, "[\"%s\", [\"tr(%s,{pk(%s),multi_a(2,%s,%s)})\"]]", ps64, wif[2], xh[0], xh[0], xh[1]);
     r = call("descriptorprocesspsbt", pj, &ec, &em);
     ck("descriptorprocesspsbt with the internal key completes", r && S(r, "complete") && S(r, "complete")[0] == '1'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
-    { const char* h = r ? S(r, "hex") : NULL; ck("...one witness item (key-path signature)", h && strlen(h) > 100 && strstr(h, "0140") ); }
+    { const char* h = r ? S(r, "hex") : NULL; ck("...one witness item (key-path signature)", h && strlen(h) > 100 && strstr(h, "0140") );
+      const char* why = "?"; ck("...and the CONSENSUS verifier accepts the key-path spend", h && consensus_verifies(h, Q, &why)); if (h && !consensus_verifies(h, Q, &why)) printf("    (reason: %s)\n", why); }
     rj_free(r);
 
     printf("== 3. script path, leaf A (only x0 held) ==\n");
@@ -85,6 +140,7 @@ int main(void){
     r = call("descriptorprocesspsbt", pj, &ec, &em);
     ck("x0 alone completes via leaf A", r && S(r, "complete") && S(r, "complete")[0] == '1'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
     { const char* h = r ? S(r, "hex") : NULL; char lah[80]; hexs(lah, la, 34); ck("...witness carries the leaf script and control block", h && strstr(h, lah) && strstr(h, xh[2])); }
+    { const char* h = r ? S(r, "hex") : NULL; const char* why = "?"; int okv = h && consensus_verifies(h, Q, &why); ck("...and the CONSENSUS verifier accepts the pk() leaf spend (our own 0x14 signature)", okv); if (h && !okv) printf("    (reason: %s)\n", why); }
     rj_free(r);
     /* the same, sign-only: partials are TAP_SCRIPT_SIG entries naming x0 + leaf A */
     snprintf(pj, sizeof pj, "[\"%s\", [\"tr(%s,{pk(%s),multi_a(2,%s,%s)})\"], \"DEFAULT\", true, false]", ps64, xh[2], wif[0], xh[0], xh[1]);
@@ -119,6 +175,8 @@ int main(void){
       if (half){ snprintf(pj, sizeof pj, "[\"%s\", [\"tr(%s,multi_a(2,%s,%s))\"]]", half, xh[2], xh[0], wif[1]);
           r = call("descriptorprocesspsbt", pj, &ec, &em);
           ck("x1 then completes (2 of 2) and finalizes", r && S(r, "complete") && S(r, "complete")[0] == '1'); if (!r) printf("    (%ld: %s)\n", ec, em ? em : "");
+          { const char* h = r ? S(r, "hex") : NULL; const char* why = "?"; int okv = h && consensus_verifies(h, Q2, &why);
+            ck("...and the CONSENSUS verifier accepts the multi_a(2,x0,x1) leaf spend built from two partial 0x14 signatures", okv); if (h && !okv) printf("    (reason: %s)\n", why); }
           rj_free(r); free(half); } }
 
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);

@@ -2988,8 +2988,12 @@ tests/test_psbt_update: tests/test_psbt_update.c rpc_commands.o psbt_update.o rp
 tests/test_psbt_bounds: tests/test_psbt_bounds.c rpc_commands.o psbt_update.o rpc_json.o $(RPCLIBS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_psbt_bounds.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
 
-tests/test_rpc_psbt_taproot: tests/test_rpc_psbt_taproot.c rpc_commands.o rpc_json.o $(RPCLIBS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_psbt_taproot.c rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
+# 2026-09-08: links the consensus taproot verifier too, so every spend the
+# signer produces (key path, pk() leaf, multi_a 2-of-2) is checked by the same
+# interpreter that validates blocks -- not just for shape.
+TAPPSBT_VERIFY := bitcoin_taproot_sighash.c secp256k1_schnorr.o secp256k1_taproot.o bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
+tests/test_rpc_psbt_taproot: tests/test_rpc_psbt_taproot.c rpc_commands.o rpc_json.o $(RPCLIBS) $(TAPPSBT_VERIFY)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_psbt_taproot.c rpc_commands.o rpc_json.o $(RPCLIBS) $(TAPPSBT_VERIFY) -lpthread
 
 # a full 2-of-2 MuSig2 key-path session over the RPC surface, signature
 # checked by the consensus verifier over an independently computed BIP341

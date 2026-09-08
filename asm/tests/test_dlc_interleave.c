@@ -343,7 +343,11 @@ int main(void){
         { const char* sl = last_line_with(log, "block(s) during the download"); print_line(sl);
           long ct = -9; if(sl){ const char* c = strstr(sl, "connected tip "); if(c) sscanf(c, "connected tip %ld", &ct); }
           ckm("the download-end summary reports the connected tip at the gate", sl && ct == gate_applied); }
-        ckm("the choke point fired during the download (new block lines before the gate)", strstr(log, "[dl] new block: height=") != NULL);
+        /* 2026-09-08: in IBD (this fixture's timestamps are old) the choke
+         * point prints one line saying the per-block lines are off, not a
+         * line per batch -- either is proof it fired before the gate */
+        ckm("the choke point fired during the download (a new-block line, or the once-only IBD line, before the gate)",
+            strstr(log, "[dl] new block: height=") != NULL || strstr(log, "[dl] per-block lines and tip announcements are off") != NULL);
         ck("the drain afterwards connects exactly the gate lag", utxo_live_catchup(store_buf), (NB-1) - gate_applied);
         ck("connected tip == NB-1 after the drain", utxo_live_applied_height(), NB-1);
         ck("live count == NB-1 (the genesis coinbase is not in the set, as in Core)", utxo_live_count(), NB-1);

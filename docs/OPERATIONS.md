@@ -421,11 +421,11 @@ service line appears a few minutes after start.
 
 ### Reading the parallel catch-up (`[dlc]`) since 2026-09-07
 
-One status line every 10 s:
+Two lines every 10 s (since 2026-09-08; before that the tick was eight lines):
 
 ```
 [dlc] == elapsed 2:32:32 | eta 00:10:31:52 | overall: 442051/965954 stored (45.76% of real tip) | in flight 232 of window 4096 through 442282 (oldest gap 0s at 441270, 99.95% landed) | applied=440754 lag=515 ==
-[dlc] -- this tick: 0 rotation(s), 0 window wait(s), 0 help(s), 0 failed attempt(s), 0 abandon(s) | run: 780/545/64/68/0 --
+[dlc] -- recv 11.0MB/s (avg 9.8MB/s) | write 10.9MB/s (avg 10.1MB/s) | floor 32.0 KB/s (median 812.3) | banned 1/126 | events 0 rot 0 wait 0 help 0 fail 0 abandon (run 780/545/64/68/0) --
 ```
 
 - `eta` is `DD:HH:MM:SS` at the last ten minutes' block rate; blocks grow
@@ -441,14 +441,22 @@ One status line every 10 s:
   deserves a look.
 - `applied` is the UTXO connect's height; `lag` is how far behind the
   contiguous prefix it is.
-- The tick line counts the events since the last tick and for the run:
+- The dashed line carries this tick's network receive and disk write rates
+  with their averages since the start, the dead-weight floor with the pool
+  median it derives from, how many peers are banned right now, and the
+  event counts since the last tick with the run totals in brackets:
   rotations (a worker left a peer under half the pool median at a chunk
   boundary, nothing discarded), window waits (a worker paused rather than
   claim past the window), helps (an idle worker fetched the blocking chunk),
   failed attempts (a chunk fetch that failed on a peer; the worker backs
   off and the peer's standing halves), abandons (a chunk that went to the
   retry ring after 400 attempts).
-- The 16-line peer table prints once a minute.
+- The NODE_WITNESS drop count prints only when it changes.
+- The 16-line peer table prints every five minutes.
+- `[dl] new block` and `[dl] announced tip` are silent while the tip is
+  older than `maxtipage` (Core's definition of initial block download,
+  during which Core relays no blocks); one line says so, and at the tip
+  both return, one per block. A compaction is one line, at completion.
 
 Lines that still print one per event, because each one is worth reading:
 `chunk [lo,hi] ABANDONED -> retry ring`, `dead weight (...)` (the parent's
@@ -460,9 +468,24 @@ a row on one chunk and every hundredth), and `REJECT h=`.
 
 ### Logs
 
-- **Console log**: `logs/<chain>/bitcoin.<chain>.log` (systemd stdout/stderr):
-  `[boot]`, `[config]`, `[rpc]`, `[dl]`, `[tx_accept]`, `[tor]`, `[zmq]`.
-- **Daemon's own leveled log**: `<datadir>/<chain>/debug.log` — Core's filename, in the per-chain directory, exactly where Core puts its own (2026-09-06; it was `logs/bitcoind.log` before).
+- **The log**: `<datadir>/<chain>/debug.log`, Core's file in Core's place.
+  Since 2026-09-08 everything the daemon prints goes there by default,
+  every `[boot]`, `[config]`, `[rpc]`, `[dl]`, `[dlc]`, `[utxo_live]`,
+  `[tx_accept]`, `[tor]`, `[zmq]` line, from every forked child. Before that
+  stderr was the log and only the assembly logger's few lines reached
+  `debug.log`. `printtoconsole=1` sends the same lines to the console as
+  well (Core's semantics); `debuglogfile=0` turns the file off.
+  `shrinkdebugfile=1` (default) keeps the last 200 KB of a file over 10 MB
+  at start-up; between restarts the file grows, as Core's does, so rotate
+  it (`config/logrotate-bmc.conf` covers `data/*/debug.log` with
+  `copytruncate`).
+- **What still reaches the launcher's stderr**: the lines printed before
+  the chain directory is entered, i.e. the config echo, chain selection
+  and a datadir-lock failure, and a `[boot] logging to ...` line naming
+  the file. Under systemd those land in `logs/<chain>/bitcoin.<chain>.log`.
+  A deployment that wants the old arrangement, everything on stderr and
+  nothing in the chain directory, sets `printtoconsole=1` and
+  `debuglogfile=0`.
 - `journalctl -u bmcbitcoind` holds only systemd's lines (start, stop,
   `Killing` on a stop timeout).
 
@@ -660,7 +683,7 @@ Extra listeners: onion service target at chain default P2P port + 1
 | `bmcwallet.enc` / `bmcwallet.dat` (+ `.txlog`), `walletkeys.dat`, `walletscan.dat` | wallet container / plaintext store and journal, HD keys, rescan records |
 | `onion_v3_private_key`, `i2p_private_key` | persisted onion service key and I2P destination |
 | `txindex.dat` + `txindex.tail`, `addr_index.dat`, `bfilters.dat` + `bfilters.idx`, `coinstats.dat` | optional indexes |
-| `debug.log` | the daemon's own leveled log (was `logs/bitcoind.log` before 2026-09-06) |
+| `debug.log` | the daemon's log, everything, as Core (since 2026-09-08; before that only the leveled logger's lines; `logs/bitcoind.log` before 2026-09-06) |
 
 Outside the chain directory: `<datadir>/bitcoin.conf` or
 `<repo>/config/bitcoin.conf`; `<repo>/logs/<chain>/bitcoin.<chain>.log`;

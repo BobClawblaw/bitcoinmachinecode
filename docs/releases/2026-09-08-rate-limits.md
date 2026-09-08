@@ -24,3 +24,27 @@ socketpair (called once, before the write, with the right fd and length;
 every byte still arrives; a cleared hook is not called). The abi and
 callee-saved audits pass on the new assembly. The boot config line prints
 all three.
+
+## Live proof, 01:00Z
+
+A scratch node on mainnet, sharing the box with benchmark run 16:
+
+- **Download cap at 30 KB/s.** The header phase, whose pages are charged
+  too, reported 30.1 KB/s over 525 seconds. An earlier attempt at a
+  500 KB/s cap never touched the cap, because the one header peer it drew
+  only gave 118 KB/s: the cap is a ceiling, not a target.
+- **Dial cap at 2 per second.** The liveness probe round, 8 seconds
+  uncapped, took two minutes, and only 8 of 117 peers answered the
+  40-second ranking sample where an uncapped node gets 60 to 70. A dial
+  cap that low degrades peer ranking, because ranking spends dials; set
+  it with that in mind.
+- **Upload cap.** Proven at the socketpair level by `test_p2p`; a live run
+  needs a second node pulling from the first and has not been done.
+- The boot line printed `dialratelimit=2/s downloadratelimit=30KB/s
+  uploadratelimit=0KB/s (off)`, and `dial_gate.dat` appeared in the
+  chain directory at 24 bytes.
+
+Also confirmed on the same evening, against run 16 at height 656,003:
+the RPC server answers during initial block download (`getblockcount`,
+`getblockchaininfo`, `getnetworkinfo`), reporting the connected height,
+as Core does.

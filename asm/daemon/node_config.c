@@ -1367,3 +1367,33 @@ void ul_gate_account(long bytes){
     gate_sleep(dl_gate_reserve(g_dial_next + 2, dial_now_ms(), bytes, g_ul_bytes_per_sec));
 }
 
+/* ---- the log sink (bmc: Core's debuglogfile/printtoconsole semantics) ---- */
+int log_sink_open(const char* path, int printtoconsole){
+    if(!path || !*path) return 0;
+    int quiet = !strcmp(path, "/dev/null");
+    if(quiet && printtoconsole) return 1;                       /* debuglogfile=0 + printtoconsole: the console only, as now */
+    int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0600);
+    if(fd < 0) return 0;
+    if(!printtoconsole){                                        /* the file IS fd 2, inherited by every child */
+        if(dup2(fd, 2) < 0){ close(fd); return 0; }
+        close(fd); return 1;
+    }
+    int pfd[2]; if(pipe(pfd) != 0){ close(fd); return 0; }
+    int console = dup(2);                                       /* the pump's copy of the original console */
+    pid_t p = fork();
+    if(p < 0){ close(pfd[0]); close(pfd[1]); close(console); close(fd); return 0; }
+    if(p == 0){                                                 /* the pump: copies every byte to file and console, exits on EOF */
+        close(pfd[1]); close(2);
+        char buf[8192]; ssize_t n;
+        while((n = read(pfd[0], buf, sizeof buf)) > 0){
+            ssize_t o = 0; while(o < n){ ssize_t w = write(fd, buf + o, (size_t)(n - o)); if(w <= 0) break; o += w; }
+            o = 0;         while(o < n){ ssize_t w = write(console, buf + o, (size_t)(n - o)); if(w <= 0) break; o += w; }
+        }
+        _exit(0);
+    }
+    close(pfd[0]); close(console); close(fd);
+    if(dup2(pfd[1], 2) < 0){ close(pfd[1]); return 0; }
+    close(pfd[1]);
+    return 1;
+}
+

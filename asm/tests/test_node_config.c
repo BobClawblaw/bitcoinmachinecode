@@ -5,6 +5,8 @@
  * stalled a live sync on 2026-08-18. A typo must not be able to reproduce
  * that. */
 #include <stdio.h>
+#include <unistd.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <string.h>
 #include <stdlib.h>
@@ -110,6 +112,25 @@ int main(void){
     wr("bmc_ul.conf", "bmc.uploadratelimit=250\n");
     node_config_load("bmc_ul.conf");
     if (g_cfg.upload_rate_limit_kbps == 250) printf("PASS: bmc.uploadratelimit=250 (KB/s) applied\n"); else { printf("FAIL: bmc.uploadratelimit -> %d\n", g_cfg.upload_rate_limit_kbps); failures++; }
+    /* 2026-09-08: the log sink -- debuglogfile/printtoconsole with Core's semantics */
+    { unlink("sink.log"); pid_t c = fork();
+      if (c == 0){
+          if (!log_sink_open("sink.log", 0)) _exit(9);
+          fprintf(stderr, "to-the-file\n"); fflush(stderr); _exit(0);
+      }
+      int st = 0; waitpid(c, &st, 0); FILE* f = fopen("sink.log", "r"); char line[64] = ""; if (f){ if (!fgets(line, sizeof line, f)) line[0] = 0; fclose(f); }
+      if (WEXITSTATUS(st) == 0 && !strncmp(line, "to-the-file", 11)) printf("PASS: log sink: printtoconsole=0 sends stderr to the file\n");
+      else { printf("FAIL: log sink file: exit %d line '%s'\n", WEXITSTATUS(st), line); failures++; } }
+    { unlink("sink2.log"); int pp[2]; if (pipe(pp) == 0){ pid_t c = fork();
+      if (c == 0){
+          close(pp[0]); dup2(pp[1], 2); close(pp[1]);          /* the "console" is this pipe */
+          if (!log_sink_open("sink2.log", 1)) _exit(9);
+          fprintf(stderr, "to-both\n"); fflush(stderr); _exit(0);
+      }
+      close(pp[1]); char cons[64] = ""; ssize_t n = 0, t = 0; while (t < 63 && (n = read(pp[0], cons + t, (size_t)(63 - t))) > 0) t += n; close(pp[0]);
+      int st = 0; waitpid(c, &st, 0); FILE* f = fopen("sink2.log", "r"); char line[64] = ""; if (f){ if (!fgets(line, sizeof line, f)) line[0] = 0; fclose(f); }
+      if (WEXITSTATUS(st) == 0 && !strncmp(line, "to-both", 7) && !strncmp(cons, "to-both", 7)) printf("PASS: log sink: printtoconsole=1 sends stderr to the file AND the console (the pump outlived the writer)\n");
+      else { printf("FAIL: log sink both: exit %d file '%s' console '%s'\n", WEXITSTATUS(st), line, cons); failures++; } } }
     wr("bmc_t2.conf", "maxconnections=16\nbmc.maxoutbound=32\n");
     node_config_load("bmc_t2.conf");
     { int outb=g_cfg.max_outbound+g_cfg.max_block_relay_only+g_cfg.max_feeler;
