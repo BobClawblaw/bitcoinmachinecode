@@ -602,6 +602,13 @@ long node_config_load(const char* path){
         char* p = line;
         while(*p==' '||*p=='\t') p++;
         if(*p=='#'||*p=='\n'||*p==0) continue;
+        /* 2026-09-08: Core strips everything from the first '#' on a line
+         * (util/settings.cpp GetConfigOptions), so `printtoconsole=1  # why`
+         * is printtoconsole=1 there. Here the value "1  # why" was "not a
+         * usable number" and silently became 0: the 09-08 bench resume lost
+         * its console tee to exactly that line. Same rule now, same limit:
+         * a '#' inside a value (an rpcpassword) truncates it in Core too. */
+        { char* h = strchr(p, '#'); if(h) *h = 0; }
         /* DMN-4: a section header changes which chain the following keys
          * belong to. Previously it fell through the `no =` test and was
          * simply ignored, taking its scoping with it. */

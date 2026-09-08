@@ -80,6 +80,18 @@ int main(void){
     unlink("dbcache.conf");
     node_config_load("/nonexistent/reset.conf");
 
+    /* 2026-09-08: Core strips a trailing "# comment" from a config line
+     * (util/settings.cpp GetConfigOptions). `printtoconsole=1   # why` read
+     * as "1   # why" here, was rejected as a number, and silently became 0:
+     * the bench resume of 09-08 lost its console tee to that. */
+    wr("comment.conf", "dbcache=2048   # sized for the bench box\nprinttoconsole=1 # keep the tee\n");
+    node_config_load("comment.conf");
+    if (g_cfg.dbcache_mb == 2048 && g_cfg.printtoconsole == 1)
+        printf("PASS: a trailing '# comment' is stripped from a config line (Core's rule): dbcache=2048, printtoconsole=1\n");
+    else { printf("FAIL: inline comment not stripped (dbcache=%d printtoconsole=%d)\n", g_cfg.dbcache_mb, g_cfg.printtoconsole); failures++; }
+    unlink("comment.conf");
+    node_config_load("/nonexistent/reset.conf");
+
     /* 3. out-of-range values are rejected, not applied */
     wr("bmc_t1.conf", "maxconnections=2\nbmc.peerminusable=0\nbmc.peerpool=-5\n");
     node_config_load("bmc_t1.conf");
