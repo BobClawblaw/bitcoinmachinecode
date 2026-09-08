@@ -761,6 +761,14 @@ static void handle_request(int cfd, const char* body, size_t blen) {
  * SERIAL execution path by taking the same mutex the accept loop holds
  * around every handler. Handlers therefore never run concurrently. */
 static pthread_mutex_t g_exec_lock = PTHREAD_MUTEX_INITIALIZER;
+/* 2026-09-08: callers waiting for the exec lock. The Esplora facade's mempool
+ * refresher takes the lock once per transaction of a pass and, on an
+ * unfair mutex, kept winning it back: JSON-RPC and the facade's own routes
+ * stalled for tens of seconds under an 11,900-transaction mempool. The
+ * refresher now defers while this is non-zero (rpc_exec_waiters). */
+static volatile int g_exec_waiters = 0;
+static void exec_lock(void){ __sync_fetch_and_add(&g_exec_waiters, 1); pthread_mutex_lock(&g_exec_lock); __sync_fetch_and_sub(&g_exec_waiters, 1); }
+int rpc_exec_waiters(void){ return g_exec_waiters; }
 #define LP_MAX_WAIT_S  60
 #define LP_POLL_MS     250
 
@@ -854,7 +862,7 @@ static void* lp_waiter(void* arg){
             nanosleep(&ts, NULL);
         }
     }
-    pthread_mutex_lock(&g_exec_lock);
+    exec_lock();
     handle_request(r->cfd, r->buf + r->body_off, r->blen);
     pthread_mutex_unlock(&g_exec_lock);
     free(r->buf); free(r);
@@ -1023,7 +1031,7 @@ static void service_conn(int cfd) {
               lp_waiters_release();                  /* RPC-5: spawn failed */
           }
       } }
-    pthread_mutex_lock(&g_exec_lock);
+    exec_lock();
     handle_request(cfd, body, blen);
     pthread_mutex_unlock(&g_exec_lock);
     free(buf);
@@ -1087,7 +1095,7 @@ static void* esp_server_thread(void* arg){
     }
     return 0;
 }
-static void esp_lock(void){ pthread_mutex_lock(&g_exec_lock); }
+static void esp_lock(void){ exec_lock(); }
 static void esp_unlock(void){ pthread_mutex_unlock(&g_exec_lock); }
 /* Core's REST interface (rest=1, 2026-09-08): served by the JSON-RPC listener, dispatch-locked like the facade */
 void rpc_rest_enable(int on){ g_rest_on = on; rest_set_exec_lock(esp_lock, esp_unlock); }
