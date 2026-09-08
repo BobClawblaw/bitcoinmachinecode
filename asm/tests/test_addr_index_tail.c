@@ -47,6 +47,8 @@ typedef int (*undo_cb)(void*, const u8*, u32, u64, u32, u8, const u8*, unsigned 
 extern void axt_set_undo_replay(long (*)(long, undo_cb, void*));
 
 static int fails = 0;
+static long g_applied_stub = -1;                 /* section 6: the UTXO engine's applied height */
+static long applied_stub(void){ return g_applied_stub; }
 static void ck(const char* l, int c){ if (c) printf("  ok  %s\n", l); else { printf("  FAIL %s\n", l); fails++; } }
 
 /* ---- stub undo store: per-height spent-prevout lists -------------------- */
@@ -199,6 +201,36 @@ int main(void){
       axt_boot(store);
       ck("a fresh journal with a history base to height 1 adopts it and backfills to the tip", axt_active() && axt_covered() == (long)(*(int*)((u8*)store + 24)));
       unlink(AH_FILE); ah_reset_for_test(); }
+    printf("\n== 6: boot while the archive is ahead of the UTXO engine (2026-09-08) ==\n");
+    { /* Production, every boot from 17:16Z: the archive held blocks the
+       * engine had not applied yet (a stop lands blocks it does not connect).
+       * Their undo does not exist until they are applied, so a boot backfill
+       * aimed at the ARCHIVE tip hit "undo has 0 records" and disabled the
+       * index for the whole session; thirty seconds later the engine wrote
+       * exactly that undo. The backfill must stop at the APPLIED height and
+       * stay live, the choke point must defer a height above it, and the gap
+       * must close once the engine has applied the block. */
+      extern void axt_set_applied_height(long (*)(void));
+      unlink(AXF_TAIL_FILE);
+      *(int*)(store + 24) = 2;            /* archive tip 2 */
+      g_nspent[2] = 0;                    /* block 2 stored, NOT applied: no undo yet */
+      g_applied_stub = 1;
+      axt_set_applied_height(applied_stub);
+      axt_boot(store);
+      ck("boot stops at the applied height and stays live (covered=1)", axt_active() && axt_covered() == 1);
+      axt_on_block(store, 2, blk, bl);   /* the choke point sees a stored-but-unapplied block */
+      ck("a block above the applied height is deferred, not a failure", axt_active() && axt_covered() == 1);
+      g_nspent[2] = 1; g_applied_stub = 2; /* the engine applied it and wrote its undo */
+      axt_on_block(store, 2, blk, bl);
+      ck("the gap closes once the block is applied (covered=2)", axt_active() && axt_covered() == 2);
+      nt = axt_read_address(AXF_P2WPKH, keyB, &bal, &rcv, &nu, txids, 64);
+      ck("B's h2 records are back: balance=140 utxos=2", bal == 140 && nu == 2 && nt == 2);
+      /* no engine (applied unknown, -1): the archive tip stays the target, as before */
+      unlink(AXF_TAIL_FILE); g_applied_stub = -1;
+      axt_boot(store);
+      ck("without an applied height the boot backfills to the archive tip", axt_active() && axt_covered() == 2);
+      axt_set_applied_height(0); }
+
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

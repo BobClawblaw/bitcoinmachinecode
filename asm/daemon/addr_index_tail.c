@@ -79,6 +79,19 @@ typedef int (*axt_undo_cb)(void*, const u8*, u32, u64, u32, u8, const u8*, unsig
 static long (*g_undo_replay_fn)(long, axt_undo_cb, void*);
 void axt_set_undo_replay(long (*fn)(long, axt_undo_cb, void*)){ g_undo_replay_fn = fn; }
 
+/* the UTXO engine's applied height, REGISTERED like the undo replay: undo
+ * records exist only for applied blocks, so no backfill may aim above it.
+ * Unset, or -1 from it (no engine), means the archive tip is the target. */
+static long (*g_applied_fn)(void);
+void axt_set_applied_height(long (*fn)(void)){ g_applied_fn = fn; }
+/* the highest height this tail may index right now: the archive tip, capped
+ * at the applied height when an engine reports one. */
+static long axt_limit(long tip){
+    if (!g_applied_fn) return tip;
+    long a = g_applied_fn();
+    return (a >= 0 && a < tip) ? a : tip;
+}
+
 int axt_active(void){ return g_fd >= 0; }
 long axt_covered(void){ return g_covered; }
 
@@ -285,7 +298,17 @@ void axt_boot(void* store_buf){
         fprintf(stderr, "[addrindex] cannot reconcile %s -- disabled\n", AXF_TAIL_FILE);
         close(fd); return;
     }
-    long tip = *(int*)((u8*)store_buf + 24);
+    /* 2026-09-08: the target is the APPLIED height, not the archive tip. A
+     * stop lands blocks it does not connect, so every boot found the archive
+     * a few blocks ahead of the engine; the backfill reached the first
+     * unapplied block, read the undo the engine had not written yet ("undo
+     * has 0 records but the block spends 6870"), and disabled the index for
+     * the whole session -- at four boots in a row on production, at four
+     * different heights, each one indexed fine on the next boot. Coverage
+     * now stops at the applied height and the choke point closes the gap as
+     * the engine applies each block. */
+    long archive_tip = *(int*)((u8*)store_buf + 24);
+    long tip = axt_limit(archive_tip);
     long covered = max_h;                        /* -1 for a fresh file */
     /* 2026-09-08: a fresh journal on a node that has the address HISTORY base
      * (addr_hist.dat, built to its to_height) starts right after that base:
@@ -314,13 +337,17 @@ void axt_boot(void* store_buf){
         close(g_fd); g_fd = -1;
         return;
     }
-    fprintf(stderr, "[addrindex] LIVE: covered=%ld (backfilled %ld) -- extension index, "
-                    "not a Core feature\n", g_covered, n < 0 ? 0 : n);
+    fprintf(stderr, "[addrindex] LIVE: covered=%ld (backfilled %ld%s) -- extension index, "
+                    "not a Core feature\n", g_covered, n < 0 ? 0 : n,
+            tip < archive_tip ? "; the archive is ahead, the rest lands as the engine applies it" : "");
 }
 
 /* New-block choke point (same site as txit_on_block / bfi_on_block). */
 void axt_on_block(void* store_buf, long h, const u8* blk, long blen){
     if (g_fd < 0 || h <= g_covered) return;
+    /* not applied yet: its undo does not exist. Leave it; the next call with
+     * an applied height above it backfills the gap (2026-09-08). */
+    if (h > axt_limit(h)) return;
     if (h > g_covered + 1 && axt_backfill(store_buf, h - 1) < 0){
         fprintf(stderr, "[addrindex] gap close failed below %ld -- disabled\n", h);
         close(g_fd); g_fd = -1;
