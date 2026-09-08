@@ -3651,7 +3651,14 @@ enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CT
         * publishes, the staged-not-yet-committed chunk gauge, the chunks it
         * has appended, and the parent's "workers are gone: drain and exit" */
        DLC_CTL_COMMIT_TIP = 12, DLC_CTL_STAGED = 13, DLC_CTL_N_COMMIT = 14, DLC_CTL_STOP_COMMIT = 15,
-       DLC_CTL_RING = 16 };
+       /* the chunk the committer has been waiting on for DLC_CURSOR_HELP_SECS
+        * (or -1): a worker picks it up at its next claim without waiting for
+        * the window to fill. Run 18 (2026-09-08) sat six minutes at 484,201
+        * behind one trickling peer while 85 chunks above it were staged. */
+       DLC_CTL_CURSOR_WANT = 16, DLC_CTL_N_CURSOR_HELP = 17,
+       DLC_CTL_RING = 18 };
+#define DLC_CURSOR_HELP_SECS 10
+static long g_dlc_cursor_help_ms = DLC_CURSOR_HELP_SECS * 1000L;   /* test seam */
 /* Run 14 (2026-09-07) stalled for two minutes at 82,565: every worker
  * reconnected to the SAME peer -- one that accepted the handshake and
  * dropped us ~100 ms later -- because a failed fetch never lowered the
@@ -3822,7 +3829,7 @@ static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void*
     while(fh <= end_h && present && present(fh)) fh++;
     if(fh > ctl[DLC_CTL_FIRST_HOLE]) ctl[DLC_CTL_FIRST_HOLE] = fh;
     ctl[DLC_CTL_COMMIT_TIP] = fh - 1;
-    int rc = 0;
+    int rc = 0; long wait_lo = -1, wait_ms = 0;
     for(;;){
         if(g_shutdown_requested) break;
         if(parent > 0 && getppid() != parent) break;          /* orphaned: the download is over */
@@ -3831,6 +3838,7 @@ static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void*
         char path[64]; dlc_stage_path(path, sizeof path, lo);
         long r = dlc_commit_chunk(st, path, &fh, append, present, buf, DLC_STAGE_MAX_BYTES);
         if(r >= 0){
+            if(ctl[DLC_CTL_CURSOR_WANT] == lo) ctl[DLC_CTL_CURSOR_WANT] = -1;
             if(synced && r > 0) synced(st);                       /* one journal commit per chunk, not per block */
             while(fh <= end_h && present && present(fh)) fh++;
             if(fh > ctl[DLC_CTL_FIRST_HOLE]) ctl[DLC_CTL_FIRST_HOLE] = fh;
@@ -3849,8 +3857,14 @@ static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void*
             rc = 2; sleep(1); continue;
         }
         if(ctl[DLC_CTL_STOP_COMMIT]) break;                    /* -3 and the workers are gone */
+        /* not staged yet: after DLC_CURSOR_HELP_SECS on the same chunk, ask
+         * for a helper; a fresh chunk resets the clock */
+        if(lo != wait_lo){ wait_lo = lo; wait_ms = 0; ctl[DLC_CTL_CURSOR_WANT] = -1; }
+        else if(wait_ms >= g_dlc_cursor_help_ms && ctl[DLC_CTL_CURSOR_WANT] != lo) ctl[DLC_CTL_CURSOR_WANT] = lo;
+        wait_ms += poll_ms;
         { struct timespec ts = { poll_ms / 1000, (poll_ms % 1000) * 1000000L }; nanosleep(&ts, NULL); }
     }
+    ctl[DLC_CTL_CURSOR_WANT] = -1;
     munmap(buf, DLC_STAGE_MAX_BYTES);
     return rc;
 }
@@ -4473,6 +4487,19 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
          * ourselves rather than wait on a worker that may be gone. */
         int helping=0;
         long lo=dlc_retry_pop(next_claim);
+        if(lo<0){
+            /* the committer's stalled cursor chunk, before anything new: one
+             * helper (the CAS on HELPING), and not a chunk that is already
+             * staged (the owner finished in the meantime) */
+            long want=next_claim[DLC_CTL_CURSOR_WANT];
+            if(want>=0 && !dlc_stage_exists(want)){
+                long cur=next_claim[DLC_CTL_HELPING];
+                if(cur!=want && __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], cur, want)){
+                    lo=want; helping=1;
+                    __sync_fetch_and_add(&next_claim[DLC_CTL_N_CURSOR_HELP], 1L);
+                }
+            }
+        }
         if(lo<0){
             int waited_ticks=0;                 /* 200 ms each */
             for(;;){
@@ -5177,6 +5204,7 @@ static long dl_catchup(const char* dir, int min_workers){
     for(long i=0;i<DLC_RETRY_MAX;i++) next_claim[DLC_CTL_RING+i]=-1;   /* -1 = empty slot (0 is a real chunk) */
     for(int i=DLC_CTL_N_ROTATE;i<=DLC_CTL_N_ABANDON;i++) next_claim[i]=0;
     next_claim[DLC_CTL_COMMIT_TIP]=start_h-1; next_claim[DLC_CTL_STAGED]=0; next_claim[DLC_CTL_N_COMMIT]=0; next_claim[DLC_CTL_STOP_COMMIT]=0;
+    next_claim[DLC_CTL_CURSOR_WANT]=-1; next_claim[DLC_CTL_N_CURSOR_HELP]=0;
     { long stale=dlc_stage_wipe(); if(stale) fprintf(stderr,"[dlc] stage: discarded %ld file(s) an earlier run left; their chunks are fetched again\n", stale); }
     { pid_t cp=fork(); if(cp==0){ _exit(dlc_committer_main(next_claim, start_h, end_h, getppid())); } g_dlc_committer=cp; }
     /* MAP_ANONYMOUS pages come zeroed, so every stats[w].peer/chunks/blocks/
@@ -5506,9 +5534,9 @@ static long dl_catchup(const char* dir, int min_workers){
               static int last_nowit = 0; int nw_now = peer_no_witness_count();
               if(nw_now != last_nowit){ last_nowit = nw_now;              /* only when the count changes */
                   fprintf(stderr,"[dlc] -- %d peer(s) dropped for lacking NODE_WITNESS; %llu redial(s) skipped since --\n", nw_now, peer_no_witness_skips()); } }
-            fprintf(stderr,"[dlc] -- recv %s (avg %s) | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | staged %ld commit %ld | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
+            fprintf(stderr,"[dlc] -- recv %s (avg %s) | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | staged %ld commit %ld cursorhelp %ld | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
                     aggbuf, avgrbuf, waggbuf, avgwbuf, floor_bps/1024.0, median_bps/1024.0, cur, nlive,
-                    nbanned == cur ? "" : " (amnesty active)", next_claim[DLC_CTL_STAGED], next_claim[DLC_CTL_N_COMMIT], d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
+                    nbanned == cur ? "" : " (amnesty active)", next_claim[DLC_CTL_STAGED], next_claim[DLC_CTL_N_COMMIT], next_claim[DLC_CTL_N_CURSOR_HELP], d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
         }
     }
     dlc_drain_committer(next_claim);            /* a no-op when the loop's last reap already drained it */
