@@ -53,6 +53,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include "addr_index_fmt.h"
+#include "addr_hist_fmt.h"
 #include "txi_format.h"
 
 typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
@@ -282,7 +283,17 @@ void axt_boot(void* store_buf){
     }
     long tip = *(int*)((u8*)store_buf + 24);
     long covered = max_h;                        /* -1 for a fresh file */
-    if (tip - covered > AXT_ADOPT_GAP && !(covered == -1 && tip <= AXT_ADOPT_GAP)){
+    /* 2026-09-08: a fresh journal on a node that has the address HISTORY base
+     * (addr_hist.dat, built to its to_height) starts right after that base:
+     * undo data is kept for every block now, so the backfill below can replay
+     * the spends from to_height+1 to the tip however far that is. The old
+     * rule -- a gap wider than the undo window is unrecoverable -- still
+     * holds for a journal that fell behind on its own. */
+    if (covered == -1 && ah_available()){
+        long base_to = ah_to_height();
+        if (base_to >= 0 && base_to <= tip){ covered = base_to; fprintf(stderr, "[addrindex] fresh journal adopts the history base's coverage (%ld); backfilling to %ld\n", covered, tip); }
+    }
+    if (tip - covered > AXT_ADOPT_GAP && !(covered == -1 && tip <= AXT_ADOPT_GAP) && !(max_h == -1 && covered == ah_to_height())){
         fprintf(stderr, "[addrindex] index at %ld but tip is %ld -- the gap exceeds the "
                         "undo retention window, so historic spends cannot be recovered. "
                         "Disabled: set addrindex=1 BEFORE the node syncs (fresh datadir), "

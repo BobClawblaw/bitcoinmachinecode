@@ -33,10 +33,6 @@
 extern int  wallet_validate_address(const char* addr, int* type, unsigned char* ver, unsigned char h160[20], unsigned char prog[32]);
 extern long axt_read_events(int type, const unsigned char hash[32], long min_height,
                             int (*cb)(void*, int, const unsigned char*, unsigned, unsigned long long, unsigned), void* ctx);
-extern int  rpc_addr_idx_utxos(unsigned char type_tag, const unsigned char hash[32], void* out_recs, int cap);
-#pragma pack(push,1)
-typedef struct { unsigned char type_tag; unsigned char hash[32]; unsigned char txid[32]; unsigned int vout; unsigned long long value; } esp_utxo_rec;
-#pragma pack(pop)
 
 typedef unsigned char u8;
 extern void sha256d(u8 out[32], const void* data, unsigned long len);
@@ -490,28 +486,53 @@ static void esplora_address(resp_t* r, const rpc_wallet* w, char seg[][80], int 
     }
     if (IS(2, "txs") && ns == 4 && IS(3, "mempool")){ free(h.refs); reply_json(r, rj_arr()); return; }
     if (IS(2, "utxo")){
-        /* the reverse index's snapshot, adjusted by the tail: ADD appends, DEL removes */
-        static esp_utxo_rec recs[100000]; int n = rpc_addr_idx_utxos((unsigned char)type, key, recs, 100000);
-        esp_utxos ux; ux.cap = n > 0 ? n + 4096 : 4096; ux.n = 0; ux.u = malloc(sizeof(esp_utxo) * (size_t)ux.cap);
-        for (int i = 0; i < n; i++){ memcpy(ux.u[ux.n].txid, recs[i].txid, 32); ux.u[ux.n].vout = recs[i].vout; ux.u[ux.n].value = recs[i].value; ux.u[ux.n].height = 0; ux.n++; }
-        axt_read_events(type, key, -1, utxo_tail_cb, &ux);
-        esp_utxo* u = ux.u; long nu = ux.n;
-        rj_val* arr = rj_arr();
-        for (long i = 0; i < nu; i++){
-            char hx[65]; hexrev(hx, u[i].txid);
-            rj_val* o = rj_obj(); rj_obj_set(o, "txid", rj_str(hx)); rj_obj_set(o, "vout", rj_numf("%u", u[i].vout));
-            rj_val* st = rj_obj();
-            long height = u[i].height;
-            if (height <= 0 && i < 500){
-                rj_val* t = call(w, "getrawtransaction", P1s1n(hx, 1), 0, 0);
-                if (t){ const char* bh = S(t, "blockhash"); if (bh){ rj_val* hd = call(w, "getblockheader", P1s(bh), 0, 0); if (hd){ height = N(hd, "height"); rj_free(hd); } } rj_free(t); }
+        /* every funding event of the address (base, then the tail's ADDs),
+         * minus the ones the txospender index knows a spender for -- one
+         * gettxspendingprevout per 500 outpoints. The tail's DELs cover
+         * spends above the spender index's own coverage. No reverse index,
+         * no gettxout (that call crosses to the download worker). */
+        typedef struct { unsigned char txid[32]; unsigned vout; unsigned long long value; long height; int spent; } fund_t;
+        fund_t* f = malloc(sizeof(fund_t) * (size_t)(h.funded_n + 16)); long nf = 0;
+        const ah_event* ev = 0; long n = ah_lookup((uint8_t)type, key, &ev); long last_h = -1; rj_val* last_txs = 0;
+        for (long i = 0; i < n && nf < h.funded_n + 16; i++){
+            ah_event e; memcpy(&e, (const unsigned char*)ev + i * AH_EVENT_BYTES, sizeof e);
+            if (e.kind != AH_FUND) continue;
+            if ((long)e.height != last_h){
+                if (last_txs) rj_free(last_txs);
+                last_txs = 0; last_h = e.height;
+                rj_val* hh = call(w, "getblockhash", (rj_val*)({ rj_val* a = rj_arr(); rj_arr_push(a, rj_numf("%u", e.height)); a; }), 0, 0);
+                if (hh && hh->str){ rj_val* b = call(w, "getblock", P1s1n(hh->str, 1), 0, 0); if (b){ last_txs = rj_clone(G(b, "tx")); rj_free(b); } }
+                if (hh) rj_free(hh);
             }
-            rj_obj_set(st, "confirmed", rj_bool(1));
-            if (height > 0) rj_obj_set(st, "block_height", rj_numf("%ld", height));
-            rj_obj_set(o, "status", st); rj_obj_set(o, "value", rj_numf("%llu", u[i].value));
+            if (!last_txs || last_txs->typ != RJ_ARR || e.txpos >= last_txs->nitems || !last_txs->items[e.txpos]->str) continue;
+            unhex(last_txs->items[e.txpos]->str, f[nf].txid, 32);
+            for (int k = 0; k < 16; k++){ unsigned char x = f[nf].txid[k]; f[nf].txid[k] = f[nf].txid[31-k]; f[nf].txid[31-k] = x; }
+            f[nf].vout = e.idx; f[nf].value = e.value; f[nf].height = e.height; f[nf].spent = 0; nf++;
+        }
+        if (last_txs) rj_free(last_txs);
+        esp_utxos ux; ux.cap = 4096; ux.n = 0; ux.u = malloc(sizeof(esp_utxo) * (size_t)ux.cap);
+        axt_read_events(type, key, ah_to_height(), utxo_tail_cb, &ux);   /* ADDs above the base; DELs cancel (tail or base funds) */
+        for (long i = 0; i < ux.n && nf < h.funded_n + 16; i++){ memcpy(f[nf].txid, ux.u[i].txid, 32); f[nf].vout = ux.u[i].vout; f[nf].value = ux.u[i].value; f[nf].height = ux.u[i].height; f[nf].spent = 0; nf++; }
+        free(ux.u);
+        /* the tail's DELs against base funds: replay once more, marking */
+        for (long start = 0; start < nf; start += 500){
+            rj_val* outs = rj_arr(); long end = start + 500 < nf ? start + 500 : nf;
+            for (long i = start; i < end; i++){ char hx[65]; hexrev(hx, f[i].txid); rj_val* o = rj_obj(); rj_obj_set(o, "txid", rj_str(hx)); rj_obj_set(o, "vout", rj_numf("%u", f[i].vout)); rj_arr_push(outs, o); }
+            rj_val* p = rj_arr(); rj_arr_push(p, outs); rj_val* opt = rj_obj(); rj_obj_set(opt, "mempool_only", rj_bool(0)); rj_arr_push(p, opt);
+            rj_val* sp = call(w, "gettxspendingprevout", p, 0, 0);
+            for (long i = start; i < end; i++){ const rj_val* e = sp && sp->typ == RJ_ARR && (size_t)(i - start) < sp->nitems ? sp->items[i - start] : 0; if (e && S(e, "spendingtxid")) f[i].spent = 1; }
+            if (sp) rj_free(sp);
+        }
+        rj_val* arr = rj_arr();
+        for (long i = 0; i < nf; i++){
+            if (f[i].spent) continue;
+            char hx[65]; hexrev(hx, f[i].txid);
+            rj_val* o = rj_obj(); rj_obj_set(o, "txid", rj_str(hx)); rj_obj_set(o, "vout", rj_numf("%u", f[i].vout));
+            rj_val* st = rj_obj(); rj_obj_set(st, "confirmed", rj_bool(1)); rj_obj_set(st, "block_height", rj_numf("%ld", f[i].height));
+            rj_obj_set(o, "status", st); rj_obj_set(o, "value", rj_numf("%llu", f[i].value));
             rj_arr_push(arr, o);
         }
-        free(u); free(h.refs); reply_json(r, arr); return;
+        free(f); free(h.refs); reply_json(r, arr); return;
     }
     free(h.refs); reply_text(r, 404, "unknown address route");
 }

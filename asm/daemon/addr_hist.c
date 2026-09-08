@@ -49,3 +49,5 @@ long ah_lookup(uint8_t type, const uint8_t hash[32], const ah_event** events){
     }
     return 0;
 }
+/* test seam: forget the mapping */
+void ah_reset_for_test(void){ if (g_map){ munmap((void*)g_map, g_len); g_map = 0; } g_len = 0; g_ino = 0; }

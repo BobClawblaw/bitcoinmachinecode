@@ -3053,8 +3053,8 @@ tests/test_block_strip: tests/test_block_strip.c daemon/block_strip.c bitcoin_st
 # close (stubbed undo_replay), reorg truncate + re-append.
 # test_addr_index_tail -- the live address index: journal semantics through
 # the real writer (stubbed undo), torn-tail truncation, reorg rollback.
-tests/test_addr_index_tail: tests/test_addr_index_tail.c daemon/addr_index_tail.c daemon/addr_index_fmt.h daemon/txi_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_idxscan.o bitcoin_idx.o bitcoin_tx.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_addr_index_tail.c daemon/addr_index_tail.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idxscan.o bitcoin_idx.o bitcoin_tx.o bitcoin_hash.o sha256.o -lpthread
+tests/test_addr_index_tail: tests/test_addr_index_tail.c daemon/addr_index_tail.c daemon/addr_hist.o daemon/addr_index_fmt.h daemon/txi_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_idxscan.o bitcoin_idx.o bitcoin_tx.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_addr_index_tail.c daemon/addr_index_tail.c daemon/addr_hist.o bitcoin_store.o bitcoin_store_fast.o bitcoin_idxscan.o bitcoin_idx.o bitcoin_tx.o bitcoin_hash.o sha256.o -lpthread
 
 tests/test_serve_rejects: tests/test_serve_rejects.c daemon/serve_rejects.c
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_serve_rejects.c daemon/serve_rejects.c

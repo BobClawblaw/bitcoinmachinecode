@@ -17,6 +17,7 @@ extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
 #define TX1 "1111111111111111111111111111111111111111111111111111111111111111"
 #define TX2 "2222222222222222222222222222222222222222222222222222222222222222"
 #define TX3 "3333333333333333333333333333333333333333333333333333333333333333"
+static const char* S(const rj_val* o, const char* k);
 static int g_spender_index = 1; static int g_calls_gettxout = 0; static int g_big = 0;
 /* ---- the address routes' sources, canned ---------------------------------- */
 #include "../daemon/addr_hist_fmt.h"
@@ -25,22 +26,16 @@ static const unsigned char KEY_A[20] = {0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,
 int wallet_validate_address(const char* addr, int* type, unsigned char* ver, unsigned char h160[20], unsigned char prog[32]){
     (void)ver; (void)prog; if (!strcmp(addr, "bc1qaddrA")){ *type = 2; memcpy(h160, KEY_A, 20); return 1; } return 0;
 }
-static int g_tail_on = 0;
+static int g_tail_on = 0, g_tail_add_only = 0;
 long axt_read_events(int type, const unsigned char hash[32], long min_height,
                      int (*cb)(void*, int, const unsigned char*, unsigned, unsigned long long, unsigned), void* ctx){
-    if (!g_tail_on || type != 2 || memcmp(hash, KEY_A, 20)) return 0;
+    if (!(g_tail_on || g_tail_add_only) || type != 2 || memcmp(hash, KEY_A, 20)) return 0;
     unsigned char t3[32]; memset(t3, 0x55, 32); unsigned char t4[32]; memset(t4, 0x44, 32);
     long n = 0;
     /* height 700001: tx 0x55.. funds A with 700 sats (ADD); height 700002: tx 0x44.. spends it (DEL of 0x55:0, TOUCH 0x44) */
     if (700001 > min_height){ if (cb && !cb(ctx, AXF_OP_ADD, t3, 0, 700, 700001)) return n; n++; }
-    if (700002 > min_height){ if (cb && !cb(ctx, AXF_OP_DEL, t3, 0, 700, 700002)) return n; n++; if (cb && !cb(ctx, AXF_OP_TOUCH, t4, 0, 0, 700002)) return n; n++; }
+    if (700002 > min_height && !g_tail_add_only){ if (cb && !cb(ctx, AXF_OP_DEL, t3, 0, 700, 700002)) return n; n++; if (cb && !cb(ctx, AXF_OP_TOUCH, t4, 0, 0, 700002)) return n; n++; }
     return n;
-}
-int rpc_addr_idx_utxos(unsigned char type_tag, const unsigned char hash[32], void* out_recs, int cap){
-    if (type_tag != 2 || memcmp(hash, KEY_A, 20) || cap < 1) return 0;
-    unsigned char* r = out_recs; r[0] = 2; memcpy(r + 1, hash, 32);
-    unsigned char t2[32]; memset(t2, 0x22, 32); memcpy(r + 33, t2, 32); unsigned vout = 1; memcpy(r + 65, &vout, 4); unsigned long long v = 3611917; memcpy(r + 69, &v, 8);
-    return 1;
 }
 /* a base with one key (A): FUND at 700000/txpos 1 (TX2, 3611917), SPEND at 700000/txpos 2 (TX3 spends it, value 3611917) */
 static void write_base(void){
@@ -93,8 +88,15 @@ int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, 
         if (p0 && !strcmp(p0, TX2) && p1 == 0){ *result = J("{\"value\":0.03611917,\"scriptPubKey\":{\"hex\":\"76a914aa88ac\",\"type\":\"pubkeyhash\",\"address\":\"1test\"}}"); return 1; }
         *result = rj_null(); return 1; }
     if (!strcmp(method, "gettxspendingprevout")){ if (!g_spender_index){ *ec = -1; *em = "txospenderindex is unavailable"; return 0; }
-        const char* s = "[{\"txid\":\"" TX2 "\",\"vout\":0,\"spendingtxid\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"spendingvin\":0},{\"txid\":\"" TX2 "\",\"vout\":1}]";
-        *result = rj_parse(s, strlen(s)); return 1; }
+        /* echo every outpoint asked; TX2:0 is spent by 0x44.., the rest unspent */
+        const rj_val* list = params->items[0]; rj_val* arr = rj_arr();
+        for (size_t i = 0; list && list->typ == RJ_ARR && i < list->nitems; i++){
+            rj_val* o = rj_obj(); const char* tx = S(list->items[i], "txid"); const char* vo = S(list->items[i], "vout");
+            rj_obj_set(o, "txid", rj_str(tx ? tx : "")); rj_obj_set(o, "vout", rj_num(vo ? vo : "0"));
+            if (tx && !strcmp(tx, TX2) && vo && !strcmp(vo, "0")){ rj_obj_set(o, "spendingtxid", rj_str("4444444444444444444444444444444444444444444444444444444444444444")); rj_obj_set(o, "spendingvin", rj_num("0")); }
+            rj_arr_push(arr, o);
+        }
+        *result = arr; return 1; }
     if (!strcmp(method, "getrawmempool")){ if (params->items[0]->str[0] == '1'){ *result = J("{\"4444444444444444444444444444444444444444444444444444444444444444\":{\"vsize\":110,\"fees\":{\"base\":0.000005}}}"); return 1; }
         *result = J("[\"4444444444444444444444444444444444444444444444444444444444444444\"]"); return 1; }
     if (!strcmp(method, "getmempoolinfo")){ *result = J("{\"size\":1,\"bytes\":110,\"total_fee\":0.000005}"); return 1; }
@@ -205,12 +207,14 @@ int main(void){
       rj_free(t); }
     { rj_val* t = GET("/address/bc1qaddrA/txs/chain/" TX3); ok(t && t->nitems == 1 && streq(S(t->items[0], "txid"), TX2), "GET /address/txs/chain/:lastSeen pages after it"); rj_free(t); }
     { rj_val* t = GET("/address/bc1qaddrA/txs/mempool"); ok(t && t->typ == RJ_ARR && t->nitems == 0, "GET /address/txs/mempool: empty in this cut"); rj_free(t); }
-    { rj_val* u = GET("/address/bc1qaddrA/utxo"); ok(u && u->nitems == 1 && streq(S(u->items[0], "txid"), TX2) && streq(S(u->items[0], "vout"), "1") && streq(S(u->items[0], "value"), "3611917") && streq(S(G(u->items[0], "status"), "block_height"), "700000"), "GET /address/utxo: the reverse index's record with its block height"); rj_free(u); }
+    { rj_val* u = GET("/address/bc1qaddrA/utxo"); ok(u && u->typ == RJ_ARR && u->nitems == 0, "GET /address/utxo: the base's one funding (TX2:0) is spent per the spender index -> empty"); rj_free(u); }
     g_tail_on = 1;
     { rj_val* a = GET("/address/bc1qaddrA"); rj_val* cs = G(a, "chain_stats");
       ok(a && streq(S(cs, "funded_txo_count"), "2") && streq(S(cs, "funded_txo_sum"), "3612617") && streq(S(cs, "spent_txo_count"), "2") && streq(S(cs, "tx_count"), "4"), "with the tail journal: the ADD, DEL and TOUCH above the base count in (2 funded, 2 spent, 4 txs)"); rj_free(a); }
     { rj_val* t = GET("/address/bc1qaddrA/txs"); ok(t && t->nitems >= 3 && streq(S(t->items[0], "txid"), "4444444444444444444444444444444444444444444444444444444444444444"), "...the newest transaction is the tail's spender (0x44.., height 700002)"); rj_free(t); }
-    { rj_val* u = GET("/address/bc1qaddrA/utxo"); ok(u && u->nitems == 1, "...utxo: the tail's ADD then DEL cancel; the base's record remains"); rj_free(u); }
+    { rj_val* u = GET("/address/bc1qaddrA/utxo"); ok(u && u->typ == RJ_ARR && u->nitems == 0, "...utxo with the tail: its ADD (0x55:0) is cancelled by its DEL; still empty"); rj_free(u); }
+    { g_tail_add_only = 1; rj_val* u = GET("/address/bc1qaddrA/utxo"); g_tail_add_only = 0;
+      ok(u && u->nitems == 1 && streq(S(u->items[0], "txid"), "5555555555555555555555555555555555555555555555555555555555555555") && streq(S(u->items[0], "value"), "700") && streq(S(G(u->items[0], "status"), "block_height"), "700001"), "...a tail ADD with no DEL: one utxo, 700 sats at 700001"); rj_free(u); }
     g_tail_on = 0; unlink(AH_FILE);
     GET("/scripthash/aa"); ok(g_status == 501, "scripthash routes: 501 (the index is keyed by address)");
     GET("/nothing/here"); ok(g_status == 404, "an unknown route -> 404");

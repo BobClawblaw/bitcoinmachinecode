@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include "test_tmpdir.h"
 #include "../daemon/addr_index_fmt.h"
+#include "../daemon/addr_hist_fmt.h"
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -187,6 +188,17 @@ int main(void){
       nt = axt_read_address(AXF_P2PKH, keyA, &bal, &rcv, &nu, txids, 64);
       ck("A's h1 coinbase is unspent again", bal == 100 && nu == 1); }
 
+    /* 2026-09-08: a FRESH journal on a node with the address history base
+     * adopts the base's coverage (undo is kept for every block, so the
+     * backfill replays from there); without the base the old gap rule holds. */
+    { extern void ah_reset_for_test(void); extern int ah_available(void);
+      unlink(AXF_TAIL_FILE); ah_reset_for_test();
+      FILE* f = fopen(AH_FILE, "wb"); ah_header hd; memset(&hd, 0, sizeof hd); hd.magic = AH_MAGIC; hd.version = AH_VERSION; hd.to_height = 1; hd.body_off = AH_HDR_BYTES;
+      unsigned char zero[AH_HDR_BYTES] = {0}; fwrite(zero, 1, AH_HDR_BYTES, f); hd.sparse_off = AH_HDR_BYTES; fseek(f, 0, SEEK_SET); fwrite(&hd, 1, sizeof hd, f); fclose(f);
+      ck("the history base is visible", ah_available());
+      axt_boot(store);
+      ck("a fresh journal with a history base to height 1 adopts it and backfills to the tip", axt_active() && axt_covered() == (long)(*(int*)((u8*)store + 24)));
+      unlink(AH_FILE); ah_reset_for_test(); }
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }
