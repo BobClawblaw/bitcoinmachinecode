@@ -5237,7 +5237,7 @@ static long dl_catchup(const char* dir, int min_workers){
               static int last_nowit = 0; int nw_now = peer_no_witness_count();
               if(nw_now != last_nowit){ last_nowit = nw_now;              /* only when the count changes */
                   fprintf(stderr,"[dlc] -- %d peer(s) dropped for lacking NODE_WITNESS; %llu redial(s) skipped since --\n", nw_now, peer_no_witness_skips()); } }
-            fprintf(stderr,"[dlc] -- recv %s/s (avg %s) | write %s/s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
+            fprintf(stderr,"[dlc] -- recv %s (avg %s) | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
                     aggbuf, avgrbuf, waggbuf, avgwbuf, floor_bps/1024.0, median_bps/1024.0, cur, nlive,
                     nbanned == cur ? "" : " (amnesty active)", d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
         }
