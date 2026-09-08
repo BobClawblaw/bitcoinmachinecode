@@ -816,9 +816,10 @@ static rj_val* tx_to_json_pv(const u8* tx, const txw_t* w, long long in_total,
                 rj_obj_set(in, "txinwitness", arr);
             }
         }
-        rj_obj_set(in, "sequence", rj_numf("%u", seq));
         /* RPX-2: Core's TxToUniv with TxVerbosity::SHOW_DETAILS. Coinbase
-         * inputs have no prevout to show -- they spend nothing. */
+         * inputs have no prevout to show -- they spend nothing. The prevout
+         * comes BEFORE sequence (2026-09-08: the REST differential against
+         * Core caught the two the other way round). */
         if (!coinbase && prevouts && (long)i < nprevouts){
             const undo_prevout_t* pv = &prevouts[i];
             rj_val* po = rj_obj();
@@ -828,6 +829,7 @@ static rj_val* tx_to_json_pv(const u8* tx, const txw_t* w, long long in_total,
             rj_obj_set(po, "scriptPubKey", script_pubkey_json_x(pv->spk, pv->spklen, 1));
             rj_obj_set(in, "prevout", po);
         }
+        rj_obj_set(in, "sequence", rj_numf("%u", seq));
         rj_arr_push(vin, in);
     }
     rj_obj_set(o, "vin", vin);
@@ -3193,6 +3195,59 @@ static void gdi_dep(rj_val* o, const char* name, long h, long tip){
     rj_obj_set(d, "height", rj_numf("%ld", h));
     rj_obj_set(o, name, d);
 }
+/* ---- regtest's testdummy: a live BIP9 deployment (Core's versionbits.cpp) --
+ * bit 28, start_time 0, no timeout, min_activation_height 0, threshold 108
+ * of a 144-block period. The only chain where it is enabled; the others set
+ * NEVER_ACTIVE and Core lists nothing. The state for the block after `prev`
+ * is decided at period boundaries from the previous period's blocks, exactly
+ * as GetStateFor walks them. */
+enum { TS_DEFINED, TS_STARTED, TS_LOCKED_IN, TS_ACTIVE, TS_FAILED };
+static const char* ts_name(int s){ return s == TS_DEFINED ? "defined" : s == TS_STARTED ? "started" : s == TS_LOCKED_IN ? "locked_in" : s == TS_ACTIVE ? "active" : "failed"; }
+static int bip9_signals(long h){ u8 pre[89 + 9]; if (read_block_prefix(h, pre, sizeof pre) != 1) return 0; u32 v = rd32(pre); return (v & 0xE0000000u) == 0x20000000u && (v & (1u << 28)) != 0; }
+#define TD_PERIOD 144L
+#define TD_THRESHOLD 108L
+static int bip9_state_for(long prev, long* since){
+    int state = TS_DEFINED; long s = 0;
+    for (long b = TD_PERIOD; prev >= 0 && b - 1 <= prev; b += TD_PERIOD){
+        long p = b - 1; int next = state;
+        switch (state){
+        case TS_DEFINED: if (median_time_past(p) >= 0) next = TS_STARTED; break;                       /* start_time 0 */
+        case TS_STARTED: { long count = 0; for (long k = b - TD_PERIOD; k <= p; k++) count += bip9_signals(k);
+                           if (count >= TD_THRESHOLD) next = TS_LOCKED_IN; /* no timeout: NO_TIMEOUT */ } break;
+        case TS_LOCKED_IN: next = TS_ACTIVE; break;                                                     /* min_activation_height 0 */
+        default: break;
+        }
+        if (next != state){ state = next; s = b; }
+    }
+    *since = s; return state;
+}
+static void gdi_testdummy(rj_val* o, long tip){
+    long since = 0, since_next = 0;
+    int cur = bip9_state_for(tip - 1, &since), next = bip9_state_for(tip, &since_next);
+    int has_signal = (cur == TS_STARTED || cur == TS_LOCKED_IN);
+    rj_val* b9 = rj_obj();
+    if (has_signal) rj_obj_set(b9, "bit", rj_num("28"));
+    rj_obj_set(b9, "start_time", rj_num("0"));
+    rj_obj_set(b9, "timeout", rj_num("9223372036854775807"));
+    rj_obj_set(b9, "min_activation_height", rj_num("0"));
+    rj_obj_set(b9, "status", rj_str(ts_name(cur)));
+    rj_obj_set(b9, "since", rj_numf("%ld", since));
+    rj_obj_set(b9, "status_next", rj_str(ts_name(next)));
+    if (has_signal){
+        long in_period = 1 + (tip % TD_PERIOD), elapsed = 0, count = 0; char sig[TD_PERIOD + 1]; memset(sig, '-', sizeof sig); sig[in_period] = 0;
+        for (long k = tip; in_period > 0; k--){ elapsed++; in_period--; if (bip9_signals(k)){ count++; sig[in_period] = '#'; } }
+        rj_val* st = rj_obj(); rj_obj_set(st, "period", rj_numf("%ld", TD_PERIOD)); rj_obj_set(st, "elapsed", rj_numf("%ld", elapsed)); rj_obj_set(st, "count", rj_numf("%ld", count));
+        if (cur == TS_STARTED){ int possible = (TD_PERIOD - elapsed) >= (TD_THRESHOLD - count); rj_obj_set(st, "threshold", rj_numf("%ld", TD_THRESHOLD)); rj_obj_set(st, "possible", rj_bool(possible)); }
+        rj_obj_set(b9, "statistics", st); rj_obj_set(b9, "signalling", rj_str(sig));
+    }
+    rj_val* rv = rj_obj(); rj_obj_set(rv, "type", rj_str("bip9"));
+    int active = 0;
+    if (cur == TS_ACTIVE){ rj_obj_set(rv, "height", rj_numf("%ld", since)); active = since <= tip + 1; }
+    else if (next == TS_ACTIVE){ rj_obj_set(rv, "height", rj_numf("%ld", tip + 1)); active = 1; }
+    rj_obj_set(rv, "active", rj_bool(active));
+    rj_obj_set(rv, "bip9", b9);
+    rj_obj_set(o, "testdummy", rv);
+}
 
 static int cmd_getdeploymentinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
     long tip = refresh();
@@ -3209,24 +3264,32 @@ static int cmd_getdeploymentinfo(const rj_val* params, rj_val** res, long* ec, c
     rj_val* o = rj_obj();
     rj_obj_set(o, "hash", rj_str(hx));
     rj_obj_set(o, "height", rj_numf("%ld", tip));
+    /* the chain's heights (script_flags_consts.h carries every chain's;
+     * 2026-09-08: this reported mainnet's on regtest -- bip34 at 227,931) */
+    long h_bip34 = SFC_HEIGHT_BIP34, h_dersig = SFC_HEIGHT_DERSIG, h_cltv = SFC_HEIGHT_CLTV, h_csv = SFC_HEIGHT_CSV, h_segwit = SFC_HEIGHT_SEGWIT;
+    int regtest = !strcmp(g_chain_name, "regtest");
+    if (regtest){ h_bip34 = SFC_R_HEIGHT_BIP34; h_dersig = SFC_R_HEIGHT_DERSIG; h_cltv = SFC_R_HEIGHT_CLTV; h_csv = SFC_R_HEIGHT_CSV; h_segwit = SFC_R_HEIGHT_SEGWIT; }
+    else if (!strcmp(g_chain_name, "testnet4")){ h_bip34 = SFC_T_HEIGHT_BIP34; h_dersig = SFC_T_HEIGHT_DERSIG; h_cltv = SFC_T_HEIGHT_CLTV; h_csv = SFC_T_HEIGHT_CSV; h_segwit = SFC_T_HEIGHT_SEGWIT; }
+    else if (!strcmp(g_chain_name, "signet")){ h_bip34 = SFC_S_HEIGHT_BIP34; h_dersig = SFC_S_HEIGHT_DERSIG; h_cltv = SFC_S_HEIGHT_CLTV; h_csv = SFC_S_HEIGHT_CSV; h_segwit = SFC_S_HEIGHT_SEGWIT; }
     /* script_flags: the flags this node applies to the NEXT block, in Core's
      * sorted order. P2SH/WITNESS/TAPROOT are unconditional here. */
     rj_val* sf = rj_arr();
     long next = tip + 1;
-    if (next >= SFC_HEIGHT_CLTV)   rj_arr_push(sf, rj_str("CHECKLOCKTIMEVERIFY"));
-    if (next >= SFC_HEIGHT_CSV)    rj_arr_push(sf, rj_str("CHECKSEQUENCEVERIFY"));
-    if (next >= SFC_HEIGHT_DERSIG) rj_arr_push(sf, rj_str("DERSIG"));
-    if (next >= SFC_HEIGHT_SEGWIT) rj_arr_push(sf, rj_str("NULLDUMMY"));
+    if (next >= h_cltv)   rj_arr_push(sf, rj_str("CHECKLOCKTIMEVERIFY"));
+    if (next >= h_csv)    rj_arr_push(sf, rj_str("CHECKSEQUENCEVERIFY"));
+    if (next >= h_dersig) rj_arr_push(sf, rj_str("DERSIG"));
+    if (next >= h_segwit) rj_arr_push(sf, rj_str("NULLDUMMY"));
     rj_arr_push(sf, rj_str("P2SH"));
     rj_arr_push(sf, rj_str("TAPROOT"));
-    if (next >= SFC_HEIGHT_SEGWIT) rj_arr_push(sf, rj_str("WITNESS"));
+    if (next >= h_segwit) rj_arr_push(sf, rj_str("WITNESS"));
     rj_obj_set(o, "script_flags", sf);
     rj_val* dep = rj_obj();
-    gdi_dep(dep, "bip34",  SFC_HEIGHT_BIP34,  tip);
-    gdi_dep(dep, "bip66",  SFC_HEIGHT_DERSIG, tip);
-    gdi_dep(dep, "bip65",  SFC_HEIGHT_CLTV,   tip);
-    gdi_dep(dep, "csv",    SFC_HEIGHT_CSV,    tip);
-    gdi_dep(dep, "segwit", SFC_HEIGHT_SEGWIT, tip);
+    gdi_dep(dep, "bip34",  h_bip34,  tip);
+    gdi_dep(dep, "bip66",  h_dersig, tip);
+    gdi_dep(dep, "bip65",  h_cltv,   tip);
+    gdi_dep(dep, "csv",    h_csv,    tip);
+    gdi_dep(dep, "segwit", h_segwit, tip);
+    if (regtest) gdi_testdummy(dep, tip);
     rj_obj_set(o, "deployments", dep);
     *res = o;
     return 1;

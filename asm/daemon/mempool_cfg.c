@@ -146,11 +146,17 @@ static void mempool_forget(const unsigned char txid[32]);
 /* Size the region from Core's -maxmempool (MB). Slots are derived from the
  * byte budget at a conservative ~512B per tx and rounded to a power of two,
  * because mpool indexes with a mask. Returns 1 if a region was published. */
+unsigned long mp_ext_blob_cap = 0;   /* the published byte budget (tests; getmempoolinfo reads the pool's own) */
 int mempool_configure(void){
     long mb = g_cfg.maxmempool_mb;
     if(mb <= 0) return 0;                       /* 0 == keep the asm statics */
 
-    unsigned long long blob_cap = (unsigned long long)mb << 20;
+    /* Core's -maxmempool is in MB of 1,000,000 bytes (DEFAULT_MAX_MEMPOOL_SIZE_MB
+     * * 1'000'000; getmempoolinfo reports 300000000 for the default). This
+     * used MiB and reported 314572800 -- the REST differential against Core
+     * caught it (2026-09-08). */
+    unsigned long long blob_cap = (unsigned long long)mb * 1000000ULL;
+    mp_ext_blob_cap = (unsigned long)blob_cap;
     unsigned long slots = 1024;
     while(slots < (blob_cap / 512UL) && slots < (1UL<<22)) slots <<= 1;
 

@@ -678,6 +678,22 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
     unsigned char txid_display[32];
     if (!hex_to_bytes(txid_display, txid, 64)) { *ec = -8; *em = "Invalid parameter: txid must be hexadecimal"; return 0; }
     if (vout < 0) { *result = rj_null(); return 1; }
+    /* include_mempool (Core's third parameter, default true; 2026-09-08 --
+     * the REST differential's getutxos/checkmempool found it ignored): an
+     * output spent in the mempool is null, and an output CREATED in the
+     * mempool is answered with 0 confirmations, both as Core's
+     * CCoinsViewMemPool does. */
+    int include_mempool = 1;
+    if (params && params->typ == RJ_ARR && params->nitems > 2 && params->items[2] && params->items[2]->typ == RJ_BOOL) include_mempool = params->items[2]->str[0] == '1';
+    if (include_mempool){
+        rj_val* op = rj_obj(); rj_obj_set(op, "txid", rj_str(txid)); rj_obj_set(op, "vout", rj_numf("%lld", vout));
+        rj_val* list = rj_arr(); rj_arr_push(list, op); rj_val* opt = rj_obj(); rj_obj_set(opt, "mempool_only", rj_bool(1));
+        rj_val* p = rj_arr(); rj_arr_push(p, list); rj_arr_push(p, opt);
+        rj_val* sp = 0; long e2 = 0; const char* m2 = 0;
+        if (rpc_dispatch("gettxspendingprevout", p, w, &sp, &e2, &m2) && sp && sp->typ == RJ_ARR && sp->nitems && rj_obj_get(sp->items[0], "spendingtxid")){ rj_free(sp); rj_free(p); *result = rj_null(); return 1; }
+        if (sp) rj_free(sp);
+        rj_free(p);
+    }
     /* RPC txid strings are byte-reversed relative to the internal/wire order
      * the LSM store's key uses (matches tx_txid's own output -- see build_
      * utxo.c's doc comment) -- reverse before the lookup. */
@@ -718,6 +734,26 @@ static int cmd_gettxout_w(const rj_val* params, const rpc_wallet* w,
               "not answer. Returning null would claim the output is spent, "
               "which this node has not established";
         return 0;
+    }
+    if (r != 1 && include_mempool){
+        /* not in the confirmed set: an output the mempool created? */
+        rj_val* p = rj_arr(); rj_arr_push(p, rj_str(txid)); rj_arr_push(p, rj_numf("%d", 1));
+        rj_val* t = 0; long e2 = 0; const char* m2 = 0;
+        if (rpc_dispatch("getrawtransaction", p, w, &t, &e2, &m2) && t && t->typ == RJ_OBJ && !rj_obj_get(t, "blockhash")){
+            rj_val* vo = rj_obj_get(t, "vout");
+            if (vo && vo->typ == RJ_ARR && (size_t)vout < vo->nitems){
+                rj_val* o = rj_obj();
+                long tip = rpc_chain_tip_height(); unsigned char th[32];
+                if (tip >= 0 && rpc_chain_hash_at(tip, th)){ char hx[65]; for (int i = 0; i < 32; i++) sprintf(hx + i*2, "%02x", th[31 - i]); hx[64] = 0; rj_obj_set(o, "bestblock", rj_str(hx)); }
+                rj_obj_set(o, "confirmations", rj_num("0"));
+                rj_val* v = rj_obj_get(vo->items[vout], "value"); rj_obj_set(o, "value", v ? rj_clone(v) : rj_num("0"));
+                rj_val* spk = rj_obj_get(vo->items[vout], "scriptPubKey"); rj_obj_set(o, "scriptPubKey", spk ? rj_clone(spk) : rj_obj());
+                rj_obj_set(o, "coinbase", rj_bool(0));
+                rj_free(t); rj_free(p); *result = o; return 1;
+            }
+        }
+        if (t) rj_free(t);
+        rj_free(p);
     }
     if (r != 1) { *result = rj_null(); return 1; }
 
