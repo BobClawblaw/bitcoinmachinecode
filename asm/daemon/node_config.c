@@ -60,6 +60,7 @@ node_config_t g_cfg = {
     .par                   = 0,      /* Core -par default: auto              */
     .dial_rate_limit       = 0,      /* bmc.dialratelimit: off unless set */
     .download_rate_limit_kbps = 0,   /* bmc.downloadratelimit: off unless set */
+    .upload_rate_limit_kbps = 0,     /* bmc.uploadratelimit: off unless set */
     .catchup_workers       = 16,     /* bmc.catchupworkers: parallel download chunk workers */
     .maxrecvbuffer_kb      = 5000,   /* Core -maxreceivebuffer default       */
     .maxmempool_mb         = 300,    /* Core -maxmempool default (MB)        */
@@ -355,6 +356,7 @@ static void set_defaults(void){
     g_cfg.catchup_workers       = 16;
     g_cfg.dial_rate_limit       = 0;
     g_cfg.download_rate_limit_kbps = 0;
+    g_cfg.upload_rate_limit_kbps = 0;
     g_cfg.maxrecvbuffer_kb      = 5000;
     g_cfg.maxmempool_mb         = 300;
     g_cfg.mempoolexpiry_h       = 336;
@@ -719,6 +721,11 @@ long node_config_load(const char* path){
              * per block in the parallel download and per page in the header
              * fetch; probes and the keep-up legs are exempt. */
             t=clamp_int(iv,0,10000000,key,&bad); if(t!=-1){ g_cfg.download_rate_limit_kbps=t; applied++; } }
+        else if(!strcmp(key,"bmc.uploadratelimit")){
+            /* KB/s the node may SEND, node-wide (2026-09-08). 0 = off. A
+             * rate, unlike Core's -maxuploadtarget (a MiB/day budget, kept
+             * separately with Core's semantics). */
+            t=clamp_int(iv,0,10000000,key,&bad); if(t!=-1){ g_cfg.upload_rate_limit_kbps=t; applied++; } }
         else if(!strcmp(key,"bmc.catchupworkers")){
             /* the PARALLEL DOWNLOAD chunk-worker ceiling. Not -par: that is
              * Core's script-verification thread count and means exactly that
@@ -1313,6 +1320,7 @@ void node_config_get_proxy_info(const char** proxy, const char** onion_proxy,
 /* ---- outbound dial pacer (bmc.dialratelimit) -------------------------- */
 static long g_dial_interval_ms = 0;                 /* 0 = off */
 static long g_dl_bytes_per_sec = 0;                 /* 0 = off */
+static long g_ul_bytes_per_sec = 0;                 /* 0 = off */
 static volatile long long* g_dial_next = 0;         /* the shared clock file: [0] dial, [1] download; 0 until mapped */
 static long long dial_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); return (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000; }
 void dial_gate_configure(int per_second){ g_dial_interval_ms = per_second > 0 ? (1000L + per_second - 1) / per_second : 0; }
@@ -1327,8 +1335,8 @@ static int dial_gate_map(void){
     if(g_dial_next) return 1;
     int fd = open("dial_gate.dat", O_RDWR | O_CREAT | O_NOFOLLOW, 0600);
     if(fd < 0) return 0;                                        /* no datadir here (a tool, a test): no pacing */
-    if(ftruncate(fd, 16) != 0){ close(fd); return 0; }
-    void* p = mmap(0, 16, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if(ftruncate(fd, 24) != 0){ close(fd); return 0; }
+    void* p = mmap(0, 24, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if(p == MAP_FAILED) return 0;
     g_dial_next = (volatile long long*)p;
@@ -1352,5 +1360,10 @@ long dl_gate_reserve(volatile long long* next_ms, long long now_ms, long bytes, 
 void dl_gate_account(long bytes){
     if(g_dl_bytes_per_sec <= 0 || !dial_gate_map()) return;
     gate_sleep(dl_gate_reserve(g_dial_next + 1, dial_now_ms(), bytes, g_dl_bytes_per_sec));
+}
+void ul_gate_configure(int kbytes_per_second){ g_ul_bytes_per_sec = kbytes_per_second > 0 ? (long)kbytes_per_second * 1024L : 0; }
+void ul_gate_account(long bytes){
+    if(g_ul_bytes_per_sec <= 0 || !dial_gate_map()) return;
+    gate_sleep(dl_gate_reserve(g_dial_next + 2, dial_now_ms(), bytes, g_ul_bytes_per_sec));
 }
 

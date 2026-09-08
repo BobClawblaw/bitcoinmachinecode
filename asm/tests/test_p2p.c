@@ -3,6 +3,8 @@
  * validation/p2p_oracle.py (the authoritative reference).
  */
 #include <stdio.h>
+#include <sys/socket.h>
+#include <unistd.h>
 #include <string.h>
 
 extern long p2p_getheaders(void* out, const void* locator, long count, const void* stop);
@@ -21,6 +23,13 @@ static void cbyte(const char* lbl, const unsigned char* got, const unsigned char
            printf("\n  exp "); for(int i=0;i<n;i++)printf("%02x",exp[i]); printf("\n"); failures++; }
 }
 
+
+/* bmc.uploadratelimit (2026-09-08): bitcoin_net.asm calls g_p2p_write_hook
+ * BEFORE every write with (fd, payload length), on the v1 and v2 paths. */
+extern void (*g_p2p_write_hook)(int fd, unsigned plen);
+extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen);
+static int g_hook_calls, g_hook_fd; static unsigned g_hook_plen;
+static void rec_hook(int fd, unsigned plen){ g_hook_calls++; g_hook_fd = fd; g_hook_plen = plen; }
 int main(void){
     const unsigned char hash[32] = {0x3b,0xa3,0xed,0xfd,0x7a,0x7b,0x12,0xb2,0x7a,0xc7,0x2c,0x3e,0x67,0x76,0x8f,0x61,0x7f,0xc8,0x1b,0xc3,0x88,0x8a,0x51,0x32,0x3a,0x9f,0xb8,0xaa,0x4b,0x1e,0x5e,0x4a};
     const unsigned char zero[32] = {0};
@@ -77,6 +86,22 @@ int main(void){
     memset(hdr3,0,sizeof(hdr3)); hdr3[0]=0xfd; hdr3[1]=3; hdr3[2]=0;
     cki("headers_count fd-varint 3", p2p_headers_count(hdr3, 246), 3);
 
+    /* ---- the p2p_write hook: called once, before the bytes go out, with the fd and the payload length ---- */
+    { int sv[2]; if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0){
+        unsigned char nonce[8] = {1,2,3,4,5,6,7,8};
+        g_hook_calls = 0; g_p2p_write_hook = rec_hook;
+        long w = p2p_write(sv[0], "ping", 4, nonce, 8);
+        g_p2p_write_hook = 0;
+        unsigned char got[64]; long n = read(sv[1], got, sizeof got);
+        cki("hook: p2p_write still writes the 24-byte header + 8-byte payload", w, 32);
+        cki("hook: the peer receives all 32 bytes", n, 32);
+        cki("hook: called exactly once", g_hook_calls, 1);
+        cki("hook: with the socket fd", g_hook_fd, sv[0]);
+        cki("hook: with the payload length (8)", (long)g_hook_plen, 8);
+        g_hook_calls = 0; w = p2p_write(sv[0], "ping", 4, nonce, 8);
+        cki("hook cleared: p2p_write unchanged", w, 32);
+        cki("hook cleared: not called", g_hook_calls, 0);
+        close(sv[0]); close(sv[1]); } }
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }

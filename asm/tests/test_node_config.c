@@ -107,6 +107,9 @@ int main(void){
       long w1 = dl_gate_reserve(&next, 1000, 512000, r), w2 = dl_gate_reserve(&next, 1000, 512000, r), w3 = dl_gate_reserve(&next, 5000, 100, r), w0 = dl_gate_reserve(&next, 5000, 100, 0);
       if (w1 == 0 && w2 == 500 && w3 == 0 && w0 == 0) printf("PASS: download pacer: 512 KB twice at 1000 KB/s waits 0 then 500 ms; idle owes 0; off owes 0\n");
       else { printf("FAIL: download pacer waits %ld/%ld/%ld/%ld\n", w1, w2, w3, w0); failures++; } }
+    wr("bmc_ul.conf", "bmc.uploadratelimit=250\n");
+    node_config_load("bmc_ul.conf");
+    if (g_cfg.upload_rate_limit_kbps == 250) printf("PASS: bmc.uploadratelimit=250 (KB/s) applied\n"); else { printf("FAIL: bmc.uploadratelimit -> %d\n", g_cfg.upload_rate_limit_kbps); failures++; }
     wr("bmc_t2.conf", "maxconnections=16\nbmc.maxoutbound=32\n");
     node_config_load("bmc_t2.conf");
     { int outb=g_cfg.max_outbound+g_cfg.max_block_relay_only+g_cfg.max_feeler;

@@ -140,6 +140,7 @@ typedef struct {
     int  par;                    /* Core -par: worker threads, 0 = auto      */
     int dial_rate_limit;   /* bmc.dialratelimit: max outbound connection ATTEMPTS per second, node-wide (0 = off) */
     int download_rate_limit_kbps; /* bmc.downloadratelimit: max block+header download, KB/s, node-wide (0 = off) */
+    int upload_rate_limit_kbps;   /* bmc.uploadratelimit: max bytes SENT to peers, KB/s, node-wide (0 = off) */
     int catchup_workers;   /* bmc.catchupworkers: parallel download chunk workers (NOT -par) */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
@@ -366,4 +367,12 @@ long dial_gate_reserve(volatile long long* next_ms, long long now_ms, long inter
 void dl_gate_configure(int kbytes_per_second);                  /* after node_config_load; 0 = off */
 void dl_gate_account(long bytes);                               /* charge bytes just received; sleeps out the debt */
 long dl_gate_reserve(volatile long long* next_ms, long long now_ms, long bytes, long bytes_per_sec);   /* pure: the wait */
+/* ---- upload pacer (bmc.uploadratelimit, KB/s) --------------------------
+ * Third cell of the clock file. Installed as the p2p_write hook (asm
+ * g_p2p_write_hook) in every process of the node, so every message that
+ * leaves -- served blocks, headers, transactions, our own requests -- is
+ * charged before it is written. Core's -maxuploadtarget is a MiB-per-day
+ * budget and is implemented separately (upload_cap.c); this is a rate. */
+void ul_gate_configure(int kbytes_per_second);                  /* after node_config_load; 0 = off */
+void ul_gate_account(long bytes);                               /* charge bytes about to be sent; sleeps out the debt first */
 

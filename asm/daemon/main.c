@@ -3733,6 +3733,8 @@ static void dlc_fmt_eta(char* buf, size_t cap, long secs){               /* DD:H
  * stall clock, so a peer that keeps delivering is never dropped by it. */
 static void dlc_chunk_progress(void* arg){ (void)arg; alarm(DLC_CHUNK_BUDGET_SECS); }
 static void dlc_chunk_bytes(long n){ dl_gate_account(n); }   /* bmc.downloadratelimit */
+extern void (*g_p2p_write_hook)(int fd, unsigned plen);      /* bitcoin_net.asm: called before every p2p_write */
+static void p2p_upload_pace(int fd, unsigned plen){ (void)fd; ul_gate_account((long)plen); }   /* bmc.uploadratelimit */
 static int dlc_dead_weight(double byte_rate, long blocks_this_tick, double floor_bps){
     if (byte_rate < 0.0) return 0;                                   /* no reading yet */
     if (byte_rate < floor_bps) return 1;                             /* under the pool-relative floor */
@@ -9128,10 +9130,12 @@ int main(int argc, char** argv){
         if(catchup_workers<1) catchup_workers=1;
         if(catchup_workers>64) catchup_workers=64;
         dial_gate_configure(g_cfg.dial_rate_limit); dl_gate_configure(g_cfg.download_rate_limit_kbps);
-        fprintf(stderr,"[boot] config: datadir=%s port=%d (%s) listen=%d nwant=%d catchup_workers=%d (%s) dialratelimit=%d/s%s downloadratelimit=%dKB/s%s\n",
+        ul_gate_configure(g_cfg.upload_rate_limit_kbps); if(g_cfg.upload_rate_limit_kbps > 0) g_p2p_write_hook = p2p_upload_pace;   /* inherited by every forked serve child and worker */
+        fprintf(stderr,"[boot] config: datadir=%s port=%d (%s) listen=%d nwant=%d catchup_workers=%d (%s) dialratelimit=%d/s%s downloadratelimit=%dKB/s%s uploadratelimit=%dKB/s%s\n",
                 dir, port, (argc>=4)?"cli":"bitcoin.conf", g_cfg.listen, nwant,
                 catchup_workers, (argc>=6)?"cli":"bmc.catchupworkers", g_cfg.dial_rate_limit, g_cfg.dial_rate_limit ? "" : " (off)",
-                g_cfg.download_rate_limit_kbps, g_cfg.download_rate_limit_kbps ? "" : " (off)");
+                g_cfg.download_rate_limit_kbps, g_cfg.download_rate_limit_kbps ? "" : " (off)",
+                g_cfg.upload_rate_limit_kbps, g_cfg.upload_rate_limit_kbps ? "" : " (off)");
         phase_timer_t boot_pt; phase_start(&boot_pt);
         fprintf(stderr,"[boot] loading chain archive from disk...\n");
         phase_timer_t load_pt; phase_start(&load_pt);
