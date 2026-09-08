@@ -384,6 +384,20 @@ static long qparam(const char* path, size_t plen, const char* key){
  * pays for a whole burst. */
 #include "daemon/addr_index_fmt.h"
 #define MP_REFRESH_MAX 2000
+/* ---- the mempool cache is shared by every facade connection (2026-09-08) --
+ * Production's first address request crashed the daemon: two connections
+ * were in mp_refresh at once (the first client had timed out and its
+ * thread was still refreshing when the next request came), and the two
+ * realloc'd the same arrays -- a double free 71 s in. One lock guards the
+ * cache. A refresher thread (esplora_start_refresher) keeps it current in
+ * the background, a bounded slice of new transactions per pass, so a
+ * request only ever READS the cache; without the thread (the tests) a view
+ * refreshes inline with the same bound. */
+#include <pthread.h>
+#include <unistd.h>
+static pthread_mutex_t g_mp_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_mp_refresher = 0;
+#define MP_REFRESH_SLICE 400
 typedef struct { unsigned char key[33]; unsigned char txid[32]; unsigned vout; unsigned long long value; int is_spend; unsigned char spent_txid[32]; unsigned spent_vout; } mp_ev;   /* one output funded, or one input spent */
 typedef struct { unsigned char txid[32]; unsigned char vout_keys_done; } mp_tx;
 static mp_ev* g_mp_ev = 0; static long g_mp_nev = 0, g_mp_cap = 0;
@@ -410,7 +424,7 @@ static int mp_prevout(const rpc_wallet* w, const unsigned char ptxid[32], unsign
     }
     rj_free(t); return ok;
 }
-static void mp_refresh(const rpc_wallet* w){
+static void mp_refresh_locked(const rpc_wallet* w, long budget){
     rj_val* m = call(w, "getrawmempool", (rj_val*)({ rj_val* a = rj_arr(); rj_arr_push(a, rj_bool(0)); a; }), 0, 0);
     if (!m || m->typ != RJ_ARR){ if (m) rj_free(m); return; }
     long n = (long)m->nitems; unsigned char (*now)[32] = malloc((size_t)(n + 1) * 32); long nn = 0;
@@ -423,8 +437,8 @@ static void mp_refresh(const rpc_wallet* w){
     g_mp_nev = keep;
     /* fetch the new ones (parents before children when both are new: two rounds) */
     long fetched = 0;
-    for (int round = 0; round < 2 && fetched < MP_REFRESH_MAX; round++){
-        for (long i = 0; i < nn && fetched < MP_REFRESH_MAX; i++){
+    for (int round = 0; round < 2 && fetched < budget; round++){
+        for (long i = 0; i < nn && fetched < budget; i++){
             if (mp_has(now[i])) continue;
             char hx[65]; hexrev(hx, now[i]);
             rj_val* t = call(w, "getrawtransaction", P1s1n(hx, 1), 0, 0); if (!t) continue;
@@ -455,8 +469,24 @@ static void mp_refresh(const rpc_wallet* w){
 }
 /* the address's mempool view: stats, its unconfirmed txids (newest last, as seen), its unconfirmed outputs, and the outpoints it had that the mempool spends */
 typedef struct { long funded_n, spent_n; long long funded_sum, spent_sum; unsigned char (*txids)[32]; long ntx; mp_ev* funds; long nfunds; mp_ev* spends; long nspends; } mp_view;
+void esplora_mp_refresh(const rpc_wallet* w, long budget){
+    pthread_mutex_lock(&g_mp_lock); mp_refresh_locked(w, budget > 0 ? budget : MP_REFRESH_SLICE); pthread_mutex_unlock(&g_mp_lock);
+}
+static void* mp_refresher_thread(void* arg){
+    const rpc_wallet* w = arg;
+    for (;;){ esplora_mp_refresh(w, MP_REFRESH_SLICE); sleep(3); }
+    return 0;
+}
+int esplora_start_refresher(const rpc_wallet* w){
+    pthread_t th; pthread_attr_t at; pthread_attr_init(&at); pthread_attr_setstacksize(&at, (size_t)16 << 20);
+    int r = pthread_create(&th, &at, mp_refresher_thread, (void*)w); pthread_attr_destroy(&at);
+    if (r == 0){ pthread_detach(th); g_mp_refresher = 1; }
+    return r == 0 ? 0 : -1;
+}
 static void mp_view_of(const rpc_wallet* w, int type, const unsigned char hash[32], mp_view* v){
-    memset(v, 0, sizeof *v); mp_refresh(w);
+    memset(v, 0, sizeof *v);
+    pthread_mutex_lock(&g_mp_lock);
+    if (!g_mp_refresher) mp_refresh_locked(w, MP_REFRESH_SLICE);
     unsigned char key[33]; key[0] = (unsigned char)type; memcpy(key + 1, hash, 32);
     for (long i = 0; i < g_mp_nev; i++){
         mp_ev* e = &g_mp_ev[i]; if (memcmp(e->key, key, 33)) continue;
@@ -465,6 +495,7 @@ static void mp_view_of(const rpc_wallet* w, int type, const unsigned char hash[3
         int dup = 0; for (long j = 0; j < v->ntx; j++) if (!memcmp(v->txids[j], e->txid, 32)){ dup = 1; break; }
         if (!dup){ v->txids = realloc(v->txids, (size_t)(v->ntx + 1) * 32); memcpy(v->txids[v->ntx++], e->txid, 32); }
     }
+    pthread_mutex_unlock(&g_mp_lock);
 }
 static void mp_view_free(mp_view* v){ free(v->txids); free(v->funds); free(v->spends); }
 
@@ -515,35 +546,58 @@ static int esp_hist_load(const rpc_wallet* w, int type, const unsigned char key[
         if (h->nrefs == 0 || h->refs[h->nrefs-1].height != (long)e.height || h->refs[h->nrefs-1].txpos != (long)e.txpos) hist_push(h, e.height, e.txpos, 0);
     }
     axt_read_events(type, key, base_to, hist_tail_cb, h);
-    /* txids for the base refs, one getblock per distinct block */
+    /* newest first, into a fresh array. Base refs carry (height, txpos) and
+     * are distinct by construction (the events are sorted and a
+     * transaction's events are adjacent); tail refs carry txids and a
+     * transaction that funds and spends the address is pushed twice, so
+     * those dedupe by txid. No txid is resolved here: the stats need none,
+     * and a page resolves its own 25 (esp_hist_resolve). The genesis
+     * address holds tens of thousands of events; resolving every one cost
+     * 44,000 RPC calls per request. */
+    esp_txref* out = malloc((size_t)(h->nrefs ? h->nrefs : 1) * sizeof *out); long m = 0;
+    for (long i = h->nrefs - 1; i >= 0; i--){
+        int dup = 0;
+        if (h->refs[i].has_txid) for (long j = 0; j < m && j < 4096; j++) if (out[j].has_txid && !memcmp(h->refs[i].txid, out[j].txid, 32)){ dup = 1; break; }
+        if (!dup) out[m++] = h->refs[i];
+    }
+    free(h->refs); h->refs = out; h->nrefs = m;
+    return 1;
+}
+/* txids for refs[from, from+count): one getblock per distinct height, the
+ * slice's refs of one height are adjacent (the list is ordered by height) */
+static void esp_hist_resolve(const rpc_wallet* w, esp_hist* h, long from, long count){
     long last_h = -1; rj_val* last_txs = 0;
-    for (long i = 0; i < h->nrefs; i++){
+    for (long i = from; i < h->nrefs && i < from + count; i++){
         esp_txref* t = &h->refs[i]; if (t->has_txid) continue;
         if (t->height != last_h){
             if (last_txs) rj_free(last_txs);
             last_txs = 0; last_h = t->height;
             rj_val* hh = call(w, "getblockhash", (rj_val*)({ rj_val* a = rj_arr(); rj_arr_push(a, rj_numf("%ld", t->height)); a; }), 0, 0);
-            if (hh && hh->str){ rj_val* b = call(w, "getblock", P1s1n(hh->str, 1), 0, 0); if (b){ last_txs = rj_clone(G(b, "tx")); rj_free(b); } }
+            if (hh && hh->str){ rj_val* b = call(w, "getblock", P1s1n(hh->str, 1), 0, 0); if (b){ rj_val* tx = G(b, "tx"); last_txs = tx ? rj_clone(tx) : 0; rj_free(b); } }
             if (hh) rj_free(hh);
         }
         if (last_txs && last_txs->typ == RJ_ARR && t->txpos >= 0 && (size_t)t->txpos < last_txs->nitems && last_txs->items[t->txpos]->str){
             unhex(last_txs->items[t->txpos]->str, t->txid, 32);
-            /* stored wire-order: the displayed hex is byte-reversed */
             for (int k = 0; k < 16; k++){ unsigned char x = t->txid[k]; t->txid[k] = t->txid[31-k]; t->txid[31-k] = x; }
             t->has_txid = 1;
         }
     }
     if (last_txs) rj_free(last_txs);
-    /* dedupe by txid (a tx can fund and spend the same address), newest first --
-     * into a fresh array: compacting in place from the back overwrote entries
-     * before they were read */
-    esp_txref* out = malloc((size_t)(h->nrefs ? h->nrefs : 1) * sizeof *out); long m = 0;
-    for (long i = h->nrefs - 1; i >= 0; i--){
-        int dup = 0; for (long j = 0; j < m; j++) if (h->refs[i].has_txid && out[j].has_txid && !memcmp(h->refs[i].txid, out[j].txid, 32)){ dup = 1; break; }
-        if (!dup) out[m++] = h->refs[i];
-    }
-    free(h->refs); h->refs = out; h->nrefs = m;
-    return 1;
+}
+/* the position of a transaction in the ref list (the after_txid paging):
+ * a tail ref by txid, a base ref by the (height, txpos) its block gives */
+static long esp_hist_find(const rpc_wallet* w, esp_hist* h, const unsigned char want[32], const char* want_hex){
+    for (long i = 0; i < h->nrefs; i++) if (h->refs[i].has_txid && !memcmp(h->refs[i].txid, want, 32)) return i;
+    rj_val* t = call(w, "getrawtransaction", P1s1n(want_hex, 1), 0, 0); if (!t) return -1;
+    const char* bh = S(t, "blockhash"); long height = -1, txpos = -1;
+    if (bh){ rj_val* b = call(w, "getblock", P1s1n(bh, 1), 0, 0);
+        if (b){ height = N(b, "height"); rj_val* tx = G(b, "tx");
+            for (size_t k = 0; tx && tx->typ == RJ_ARR && k < tx->nitems; k++) if (tx->items[k]->str && !strcmp(tx->items[k]->str, want_hex)){ txpos = (long)k; break; }
+            rj_free(b); } }
+    rj_free(t);
+    if (height < 0 || txpos < 0) return -1;
+    for (long i = 0; i < h->nrefs; i++) if (!h->refs[i].has_txid && h->refs[i].height == height && h->refs[i].txpos == txpos) return i;
+    return -1;
 }
 #define IS(k, s) (!strcmp(seg[k], s))
 static void esplora_address(resp_t* r, const rpc_wallet* w, char seg[][80], int ns, int get){
@@ -570,9 +624,10 @@ static void esplora_address(resp_t* r, const rpc_wallet* w, char seg[][80], int 
             unsigned char want[32];
             if (unhex(seg[4], want, 32) == 32){
                 for (int k = 0; k < 16; k++){ unsigned char x = want[k]; want[k] = want[31-k]; want[31-k] = x; }
-                for (long i = 0; i < h.nrefs; i++) if (h.refs[i].has_txid && !memcmp(h.refs[i].txid, want, 32)){ start = i + 1; break; }
+                long at = esp_hist_find(w, &h, want, seg[4]); if (at >= 0) start = at + 1;
             }
         }
+        esp_hist_resolve(w, &h, start, 25);
         rj_val* arr = rj_arr(); long taken = 0;
         if (ns == 3){                                            /* the unconfirmed ones first, as Esplora lists them */
             mp_view v; mp_view_of(w, type, key, &v);
@@ -593,6 +648,10 @@ static void esplora_address(resp_t* r, const rpc_wallet* w, char seg[][80], int 
         mp_view_free(&v); free(h.refs); reply_json(r, arr); return;
     }
     if (IS(2, "utxo")){
+        /* Esplora refuses an address with more unspent outputs than its
+         * utxos_limit (500): every funding event would need its txid, one
+         * getblock per block. Same rule here. */
+        if (h.funded_n - h.spent_n > 500){ free(h.refs); reply_text(r, 400, "too many unspent transaction outputs"); return; }
         /* every funding event of the address (base, then the tail's ADDs),
          * minus the ones the txospender index knows a spender for -- one
          * gettxspendingprevout per 500 outpoints. The tail's DELs cover
