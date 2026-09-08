@@ -110,6 +110,7 @@ also annotated tags.
 | [`releases/2026-09-08-behind-peer.md`](releases/2026-09-08-behind-peer.md) | A header page that ends below our tip means the peer is behind us -- try another |
 | [`releases/2026-09-08-address-mempool.md`](releases/2026-09-08-address-mempool.md) | The address routes include the mempool |
 | [`releases/2026-09-08-core-rest.md`](releases/2026-09-08-core-rest.md) | Core's REST interface (`rest=1`), 82 route checks against Core's regtest REST; four RPC parity gaps it exposed |
+| [`releases/2026-09-08-coinstats-hist.md`](releases/2026-09-08-coinstats-hist.md) | `gettxoutsetinfo` at any height the coinstats index covers: a row per applied block, Core's shape, 235 differential checks; the compact-block receive path found never to have completed |
 
 ## Development history
 

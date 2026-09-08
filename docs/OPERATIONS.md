@@ -219,6 +219,17 @@ I2P destination.
   (a fresh journal adopts the base's coverage and backfills over the undo
   data). `/address/:addr/utxo` needs the txospender index too. See
   `releases/2026-09-08-address-history.md`.
+- **`coinstatsindex=1`** keeps the coin statistics index live (`coinstats.dat`,
+  the running MuHash and totals at the applied tip) and, since 2026-09-08,
+  one row per committed height in `coinstats_hist.dat` (1 KB each: the
+  set's counters, both MuHash accumulators, the cumulative per-block
+  amounts), so `gettxoutsetinfo <hash_type> <hash_or_height>` answers at
+  any height the rows cover, in Core's shape, `block_info` included. A
+  boot with no valid persisted state seeds the index from a walk of the
+  set (minutes); rows exist from that height on, and a query below it is
+  refused by name. mempool.space reads `txouts` and `block_info.prevout_spent`
+  per indexed block once `getindexinfo` reports the index synced at that
+  height. Off (`0`) the index is not maintained and the RPC refuses.
 - `bmc.esploraport=<port>` (2026-09-08) opens the Esplora facade for
   mempool.space's `BACKEND: "esplora"`: a second, unauthenticated listener
   (`bmc.esplorabind`, default 127.0.0.1) answering Esplora's REST routes from
@@ -233,7 +244,8 @@ I2P destination.
   keeps `txospender.tail` current and `gettxspendingprevout` answers
   confirmed spends. Absent file = index off, exactly as Core without the
   option.
-  `blockfilterindex` and `coinstatsindex` are on; the keys only turn them off.
+  `blockfilterindex` and `coinstatsindex` are opt-in, as in Core (default 0
+  since 2026-09-06); set them to 1 to maintain them.
 - `assumevalid=<hash>` skips script evaluation for blocks at and below that
   block (PoW, merkle, structure and every UTXO check still run); the height is
   resolved from the archive at boot (`[utxo_live] assumevalid: block found at

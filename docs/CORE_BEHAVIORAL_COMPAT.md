@@ -67,8 +67,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | `getblocks` (legacy) | still answered | answered | **DONE** |
 | `mempool` (BIP35) gated by permission | | same (`NP_MEMPOOL`) | **DONE** |
 | **BIP152 compact blocks — serve side** | answers `MSG_CMPCT_BLOCK`, `getblocktxn`, negotiates `sendcmpct` | same | **DONE** |
-| **BIP152 compact blocks — receive side** | `cmpctblock` reconstructed from the mempool by short id, `getblocktxn` for the rest, full `getdata` fallback | the same since 2026-09-06 (`daemon/cmpct_recv.c`, CC-2) | **DONE** |
-| BIP152 compact blocks — receive side | high- and low-bandwidth modes; reconstruct from mempool, `getblocktxn` for the rest, `blockreconstructionextratxn` | **low-bandwidth mode**: `sendcmpct` sent after verack on outbound legs, `MSG_CMPCT_BLOCK` requested on a leg that negotiated, reconstruction from the shared mempool, `getblocktxn`/`blocktxn` for the rest, full-block fallback on any failure (`cmpct_recv.c`, CC-2, `49c1c6f`). High-bandwidth push and the extra-txn pool are follow-ups | **DONE** (low-bandwidth) |
+| **BIP152 compact blocks — receive side** | `cmpctblock` reconstructed from the mempool by short id, `getblocktxn` for the rest, full `getdata` fallback | a receive path since 2026-09-06 (`daemon/cmpct_recv.c`), but no reconstruction that needed a `getblocktxn` round trip has completed (2026-09-08: production 14 needed, 0 reconstructed, 0 fell back; blocks arrive in full from other legs). `bmc.cmpctrecv=0` requests full blocks | **OPEN** |
 | BIP157/158 `getcfilters`/`getcfheaders`/`getcfcheckpt` | when `-peerblockfilters` | same (`serve_cfilters.c`), service bit gated the same way | **DONE** |
 | BIP37 bloom (`filterload` etc.) | default off, `NODE_BLOOM` off | not implemented, bit never set | **DECIDED** (matches Core's default) |
 | BIP61 `reject` | removed in 0.20 | absent | **DONE** (parity by absence) |
@@ -124,7 +123,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | Behavior | Core | This node | Status |
 |---|---|---|---|
 | `txindex`, `blockfilterindex`, `txospenderindex`, address index | | same (address index is an extension) | **DONE** |
-| `coinstatsindex` at **any height** | one record per block | **tip only** (CSI-2); historical `gettxoutsetinfo muhash <h>` needs the oracle | **DECIDED** (`BENCH_DEFECT_LEDGER_2026-09-04.md`) |
+| `coinstatsindex` at **any height** | one record per block; `gettxoutsetinfo <hash_type> <hash_or_height>` answers from it, with `block_info` as the difference from the previous block | the same since 2026-09-08 (`coinstats_hist.dat`, one 1 KB row per committed height: the counters, both MuHash accumulators, the cumulative per-block amounts); Core's output shape and error texts; `total_unspendable_amount` is sum(subsidy) - total_amount, an identity of Core's accounting verified at 800,000 and 966,000. Rows exist from the height the index was seeded at; earlier heights are refused by name until the history build exists | **DONE** (from the seed height) |
 | RPC surface (~157 methods), cookie auth, `rpcauth`, `rpcwhitelist`, loopback default | | same, verified per method in `PARITY_PLAN.md` | **DONE** |
 | Long-running RPC concurrency | parallel workers | one execution lock (RPC-12) | **DECIDED** |
 | REST interface | `-rest`: fourteen `/rest/` routes on the RPC port, unauthenticated, `.json`/`.hex`/`.bin` | the same (`rest=1`, 2026-09-08): every route from the node's RPC handlers, Core's status codes and error texts; `mempool_sequence=true` is refused (no sequence counter) | **DONE** |

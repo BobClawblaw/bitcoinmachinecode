@@ -4183,6 +4183,10 @@ int rpc_chain_decode_rawtx(const u8* tx, long txlen, rj_val** result, long* ec, 
  * running state (instant), or 0 meaning "no valid index -- walk instead".
  * Coverage semantics are identical: both describe the UTXO APPLIED height. */
 static long (*g_csi_run)(int, void*, char*, unsigned long);
+#include "daemon/coinstats_hist_fmt.h"
+static int  (*g_csi_hist)(long, int, csi_hist_out_t*) = 0;   /* the per-height rows (2026-09-08) */
+static long (*g_csi_hist_first)(void) = 0, (*g_csi_hist_last)(void) = 0;
+void rpc_chain_set_coinstats_hist(int (*q)(long, int, csi_hist_out_t*), long (*first)(void), long (*last)(void)){ g_csi_hist = q; g_csi_hist_first = first; g_csi_hist_last = last; }
 void rpc_chain_set_coinstats(long (*run)(int, void*, char*, unsigned long)){
     g_csi_run = run;
 }
@@ -4414,12 +4418,13 @@ static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, con
      * -- a silently wrong answer: the caller asked for 963,967 and received
      * 965,626 with the right "height" field but the wrong data for what
      * they actually queried. Core's own error text, same meaning. */
-    if (params && params->typ == RJ_ARR && params->nitems >= 2){
-        *ec = -8;
-        *em = "coinstatsindex does not support querying at historical heights";
-        return 0;
-    }
     int want_muhash = 1;   /* OUR default (documented divergence, see above) */
+    if (params && params->typ == RJ_ARR && params->nitems >= 2 && params->items[1]->typ != RJ_NULL){   /* Core's order: the block-specific refusals first */
+        if (params->items[0]->typ == RJ_STR && !strncmp(params->items[0]->str, "hash_serialized", 15)){
+            *ec = -8; *em = "hash_serialized_3 hash type cannot be queried for a specific block"; return 0; }
+        if (params->nitems >= 3 && params->items[2]->typ == RJ_BOOL && params->items[2]->str[0] == '0'){
+            *ec = -8; *em = "Cannot set use_index to false when querying for a specific block"; return 0; }
+    }
     if (params && params->typ == RJ_ARR && params->nitems >= 1){
         if (params->items[0]->typ != RJ_STR){
             *ec = -3; *em = "JSON value of type number is not of expected type string"; return 0; }
@@ -4432,6 +4437,53 @@ static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, con
         else {
             snprintf(embuf, sizeof embuf, "'%s' is not a valid hash_type", ht);
             *ec = -8; *em = embuf; return 0; }
+    }
+    /* ---- a specific block (Core's hash_or_height, 2026-09-08) --------------
+     * Answered from the index's per-height rows (coinstats_hist.dat; the
+     * design note above described the seam). Core's checks and texts first;
+     * then Core's output shape: the set at that height, and block_info as
+     * the difference from the previous row. total_unspendable_amount is
+     * sum(subsidy 0..h) - total_amount, an identity of Core's accounting
+     * (verified against the oracle at 800,000 and 966,000). */
+    if (params && params->typ == RJ_ARR && params->nitems >= 2 && params->items[1]->typ != RJ_NULL){
+        if (!g_csi_hist){ *ec = -8; *em = "Querying specific block heights requires coinstatsindex"; return 0; }
+        long h; long tip = refresh();
+        if (params->items[1]->typ == RJ_NUM){                       /* a height (Core: ParseHashOrHeight) */
+            long long v; if (!rpc_param_i64(params, 1, &v, ec, em)) return 0;
+            if (v < 0){ *ec = -8; snprintf(embuf, sizeof embuf, "Target block height %lld is negative", v); *em = embuf; return 0; }
+            if (v > tip){ *ec = -8; snprintf(embuf, sizeof embuf, "Target block height %lld after current tip %ld", v, tip); *em = embuf; return 0; }
+            h = (long)v;
+        } else if (!lookup_block_param(params, 1, 1, &h, ec, em)) return 0;   /* a block hash */
+        csi_hist_out_t ho; int r = g_csi_hist(h, want_muhash, &ho);
+        if (r == 0){
+            long f = g_csi_hist_first ? g_csi_hist_first() : -1, l = g_csi_hist_last ? g_csi_hist_last() : -1;
+            snprintf(embuf, sizeof embuf, "coinstatsindex has no record for height %ld (its rows cover heights %ld to %ld; earlier heights need the history build)", h, f, l);
+            *ec = -8; *em = embuf; return 0; }
+        if (r < 0){ snprintf(embuf, sizeof embuf, "coinstatsindex row %ld is the baseline of its generation: block_info needs the previous row", h); *ec = -8; *em = embuf; return 0; }
+        rj_val* out = rj_obj();
+        rj_obj_set(out, "height", rj_numf("%ld", h));
+        { u8 hdr[80]; char hx[65];
+          if (read_block_prefix(h, hdr, 80) == 1){ u8 hh[32]; sha256d(hh, hdr, 80); hex_rev(hx, hh, 32); rj_obj_set(out, "bestblock", rj_str(hx)); } }
+        rj_obj_set(out, "txouts", rj_numf("%llu", (unsigned long long)ho.txouts));
+        rj_obj_set(out, "bogosize", rj_numf("%llu", (unsigned long long)ho.bogo));
+        if (want_muhash && ho.digest_valid){ char mh[65]; hex_rev(mh, ho.digest, 32); rj_obj_set(out, "muhash", rj_str(mh)); }
+        rj_obj_set(out, "total_amount", amount_json(ho.amount));
+        { unsigned long long sum = 0; long hh = 0; unsigned long long sub = 5000000000ULL;
+          while (hh <= h){ long n = g_halving_interval - (hh % g_halving_interval); if (hh + n > h + 1) n = h + 1 - hh; sum += sub * (unsigned long long)n; hh += n; sub >>= 1; }
+          rj_obj_set(out, "total_unspendable_amount", amount_json(sum - ho.amount)); }
+        rj_val* bi = rj_obj();
+        rj_obj_set(bi, "prevout_spent", amount_json(ho.d_prevout));
+        rj_obj_set(bi, "coinbase", amount_json(ho.d_coinbase));
+        rj_obj_set(bi, "new_outputs_ex_coinbase", amount_json(ho.d_new_ex_cb));
+        rj_obj_set(bi, "unspendable", amount_json(ho.d_genesis + ho.d_bip30 + ho.d_scripts + ho.d_unclaimed));
+        rj_val* un = rj_obj();
+        rj_obj_set(un, "genesis_block", amount_json(ho.d_genesis));
+        rj_obj_set(un, "bip30", amount_json(ho.d_bip30));
+        rj_obj_set(un, "scripts", amount_json(ho.d_scripts));
+        rj_obj_set(un, "unclaimed_rewards", amount_json(ho.d_unclaimed));
+        rj_obj_set(bi, "unspendables", un);
+        rj_obj_set(out, "block_info", bi);
+        *res = out; return 1;
     }
     if (!g_usi_run && !g_csi_run){ *ec = -1; *em = "UTXO set info unavailable in this process"; return 0; }
     rpc_usi_out_t o; memset(&o, 0, sizeof o);

@@ -110,6 +110,7 @@ extern void sha256_full(unsigned char out[32], const void* data, unsigned long l
 #define CSI_K_COMMIT  4u   /* body: i64 height */
 #define CSI_K_INVAL   5u   /* body: reason (NUL-terminated) */
 #define CSI_K_STOP    6u
+#define CSI_K_ROW     7u   /* body: i64 height -- close the block's accounting and write its row (2026-09-08) */
 #define CSI_SCRIPT_MAX 10000   /* MAX_SCRIPT_SIZE: anything longer never enters the set */
 
 static node_status_t* g_st;              /* the pre-fork MAP_SHARED status block; NULL = inline */
@@ -162,6 +163,101 @@ typedef struct {
 } csi_t;
 
 static csi_t g_csi;
+
+/* ---- per-height rows (coinstats_hist.dat; daemon/coinstats_hist_fmt.h) ----- */
+#include "coinstats_hist_fmt.h"
+static u64 st_get(const u8* st, int off);
+static void num3072_inv(u8 out[384], const u8 in[384]);
+static struct { u64 prevout_spent, coinbase, new_ex_cb, unsp_scripts, unsp_genesis, unsp_bip30, subsidy_sum; u32 gen; } g_acct;
+static int  g_hist_baseline = 0;        /* the next persist writes a baseline row (a seed, or the first run) */
+static long g_halving = 210000; static int g_mainnet = 1;
+void csi_set_chain(long halving_interval, int mainnet){ if (halving_interval > 0) g_halving = halving_interval; g_mainnet = mainnet; }
+static u64 subsidy_at(long h){ long k = h / g_halving; return k >= 64 ? 0 : (5000000000ULL >> k); }
+u64 csi_subsidy_at(long h){ return subsidy_at(h); }
+static int script_unspendable(const u8* s, unsigned long n){ return (n > 0 && s[0] == 0x6a) || n > 10000; }
+static int bip30_height(long h){ return g_mainnet && (h == 91842 || h == 91880); }
+/* one coin event, on whichever side folds it (inline or the worker) */
+static void acct_event(int add, u64 value, u64 code, const u8* script, unsigned long slen){
+    long h = (long)(code >> 1); int coinbase = (int)(code & 1);
+    if (!add){ g_acct.prevout_spent += value; return; }
+    if (script_unspendable(script, slen)){ g_acct.unsp_scripts += value; return; }
+    if (coinbase){ if (!bip30_height(h)) g_acct.coinbase += value; }   /* a BIP30 duplicate's outputs are the subsidy, counted as bip30 at commit */
+    else g_acct.new_ex_cb += value;
+}
+static int g_hist_fd = -1;
+static int hist_open(void){
+    if (g_hist_fd >= 0) return 1;
+    g_hist_fd = open(CSH_FILE, O_RDWR | O_CREAT, 0644); if (g_hist_fd < 0) return 0;
+    csh_header_t hd; memset(&hd, 0, sizeof hd);
+    if (pread(g_hist_fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd || hd.magic != CSH_MAGIC || hd.rec != CSH_REC){
+        memset(&hd, 0, sizeof hd); hd.magic = CSH_MAGIC; hd.version = 1; hd.rec = CSH_REC; hd.gen = 0; hd.first_height = -1; hd.last_height = -1;
+        if (pwrite(g_hist_fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd) return 0;
+    }
+    return 1;
+}
+static int hist_read_row(long h, csh_row_t* row){
+    if (h < 0 || !hist_open()) return 0;
+    if (pread(g_hist_fd, row, sizeof *row, CSH_HDR + (off_t)h * CSH_REC) != (ssize_t)sizeof *row) return 0;
+    if (row->tag != CSH_ROW_TAG || row->height != h) return 0;
+    u8 want[32]; sha256_full(want, row, sizeof *row - 32);
+    return memcmp(want, row->sum, 32) == 0;
+}
+static void hist_write_row(long h){
+    if (!hist_open()) return;
+    csh_row_t row; memset(&row, 0, sizeof row);
+    row.tag = CSH_ROW_TAG; row.gen = g_acct.gen; row.height = h;
+    row.txouts = st_get(g_csi.num, ST_TXOUTS) - st_get(g_csi.den, ST_TXOUTS);
+    row.amount = st_get(g_csi.num, ST_AMOUNT) - st_get(g_csi.den, ST_AMOUNT);
+    row.bogo   = st_get(g_csi.num, ST_BOGO)   - st_get(g_csi.den, ST_BOGO);
+    row.prevout_spent = g_acct.prevout_spent; row.coinbase = g_acct.coinbase; row.new_ex_cb = g_acct.new_ex_cb;
+    row.unsp_scripts = g_acct.unsp_scripts; row.unsp_genesis = g_acct.unsp_genesis; row.unsp_bip30 = g_acct.unsp_bip30; row.subsidy_sum = g_acct.subsidy_sum;
+    memcpy(row.num_acc, g_csi.num + ST_ACC, CSH_ACC); memcpy(row.den_acc, g_csi.den + ST_ACC, CSH_ACC);
+    sha256_full(row.sum, &row, sizeof row - 32);
+    if (pwrite(g_hist_fd, &row, sizeof row, CSH_HDR + (off_t)h * CSH_REC) != (ssize_t)sizeof row) return;
+    csh_header_t hd; if (pread(g_hist_fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd) return;
+    if (hd.first_height < 0 || g_hist_baseline) hd.first_height = h;
+    hd.last_height = h; hd.gen = g_acct.gen;
+    if (pwrite(g_hist_fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd) return;
+}
+/* the per-block close: the subsidy, genesis/BIP30, then the row. Called once
+ * per committed height by csi_persist, in the process that folds. */
+static void csi_hist_commit(long h){
+    if (g_hist_baseline){ memset(&g_acct, 0, sizeof g_acct); csh_header_t hd; if (hist_open() && pread(g_hist_fd, &hd, sizeof hd, 0) == (ssize_t)sizeof hd) g_acct.gen = hd.gen + 1; else g_acct.gen = 1;
+        hist_write_row(h); g_hist_baseline = 0; return; }
+    u64 sub = subsidy_at(h); g_acct.subsidy_sum += sub;
+    if (h == 0) g_acct.unsp_genesis += sub;
+    if (bip30_height(h)) g_acct.unsp_bip30 += sub;
+    hist_write_row(h);
+}
+/* adopt: the persisted state at h continues its generation when row h exists */
+static void csi_hist_adopt(long h){
+    csh_row_t row;
+    if (hist_read_row(h, &row)){
+        g_acct.prevout_spent = row.prevout_spent; g_acct.coinbase = row.coinbase; g_acct.new_ex_cb = row.new_ex_cb;
+        g_acct.unsp_scripts = row.unsp_scripts; g_acct.unsp_genesis = row.unsp_genesis; g_acct.unsp_bip30 = row.unsp_bip30; g_acct.subsidy_sum = row.subsidy_sum; g_acct.gen = row.gen;
+        return;
+    }
+    g_hist_baseline = 1;   /* no row for the adopted height (first run with rows): the next commit is a baseline */
+}
+void csi_hist_mark_baseline(void){ g_hist_baseline = 1; }
+long csi_hist_first(void){ csh_header_t hd; if (!hist_open() || pread(g_hist_fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd) return -1; return (long)hd.first_height; }
+long csi_hist_last(void){ csh_header_t hd; if (!hist_open() || pread(g_hist_fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd) return -1; return (long)hd.last_height; }
+/* the RPC's read: 1 = ok; 0 = no row at h; -1 = a baseline row (no predecessor in its generation) */
+int csi_hist_query(long h, int want_digest, csi_hist_out_t* o){
+    csh_row_t cur, prev; memset(o, 0, sizeof *o);
+    if (!hist_read_row(h, &cur)) return 0;
+    o->height = h; o->gen = cur.gen; o->txouts = cur.txouts; o->amount = cur.amount; o->bogo = cur.bogo; o->subsidy = subsidy_at(h);
+    if (want_digest){
+        static u8 inv[384] __attribute__((aligned(16))); static u8 tmp[384] __attribute__((aligned(16)));
+        num3072_inv(inv, cur.den_acc); memcpy(tmp, cur.num_acc, 384); num3072_mul(tmp, inv); muhash_finalize(o->digest, tmp); o->digest_valid = 1;
+    }
+    if (h == 0){ o->d_genesis = o->subsidy; o->d_unclaimed = 0; return 1; }
+    if (!hist_read_row(h - 1, &prev) || prev.gen != cur.gen) return -1;
+    o->d_prevout = cur.prevout_spent - prev.prevout_spent; o->d_coinbase = cur.coinbase - prev.coinbase; o->d_new_ex_cb = cur.new_ex_cb - prev.new_ex_cb;
+    o->d_scripts = cur.unsp_scripts - prev.unsp_scripts; o->d_genesis = cur.unsp_genesis - prev.unsp_genesis; o->d_bip30 = cur.unsp_bip30 - prev.unsp_bip30;
+    o->d_unclaimed = o->subsidy + o->d_prevout - o->d_new_ex_cb - o->d_coinbase - o->d_genesis - o->d_bip30 - o->d_scripts;
+    return 1;
+}
 /* Bulk catch-up (2026-09-06): set by csi_defer_to_caught_up while the connect
  * loop is bulk-sized. The observers are inert (g_csi.valid == 0, no file on
  * disk, so the RPC cannot serve a stale record) until utxo_live's caught-up
@@ -238,6 +334,7 @@ void csi_on_add(const u8 txid[32], u32 index, u64 value, u64 height, u64 coinbas
         return;
     }
     utxo_stats_add(g_csi.num, key, value, (height << 1) | coinbase, script, slen);
+    acct_event(1, value, (height << 1) | coinbase, script, slen);
     g_csi_folds++;
 }
 
@@ -253,6 +350,7 @@ void csi_on_remove(const u8 txid[32], u32 index, u64 value, u64 height, u64 coin
         return;
     }
     utxo_stats_add(g_csi.den, key, value, (height << 1) | coinbase, script, slen);
+    acct_event(0, value, (height << 1) | coinbase, script, slen);
     g_csi_folds++;
 }
 
@@ -293,6 +391,19 @@ static void csi_persist(long height){
     }
     close(fd);
     if (rename(CSI_FILE ".tmp", CSI_FILE) != 0) csi_invalidate_local("persist rename failed");
+}
+/* every applied block, after its coin events (utxo_live's apply_block_at):
+ * close the block's accounting and write its row. Through the ring when the
+ * worker folds (it holds the accumulators), inline otherwise. A durability
+ * commit (csi_commit) may come once per batch; rows come once per block. */
+void csi_on_block(long height){
+    if (!g_csi.valid) return;
+    if (g_ring_on){
+        long long h = height;
+        if (ring_push(CSI_K_ROW, 0, 0, 0, 0, 0, &h, 8) < 0) csi_invalidate("fold worker gone");
+        return;
+    }
+    csi_hist_commit(height);
 }
 void csi_commit(long height){
     if (!g_csi.valid) return;
@@ -380,6 +491,8 @@ int csi_seed_from_walk(void* lst, void* u, long height){
     long n = utxo_lsm_walk(lst, u, (void*)csi_walk_add_prog, g_csi.num);
     if (n < 0){ fprintf(stderr, "[coinstats] seed walk failed\n"); g_csi.valid = 0; return 0; }
     g_csi.valid = 1;
+    g_hist_baseline = 1;               /* a new generation of cumulatives: the baseline row, written here (no worker runs during a seed) */
+    csi_hist_commit(height);
     csi_commit(height);
     fprintf(stderr, "[coinstats] seeded: %ld coins, txouts=%llu at height %ld\n",
             n, (unsigned long long)st_get(g_csi.num, ST_TXOUTS), height);
@@ -422,6 +535,7 @@ int csi_boot(long applied_height){
     long h = csi_load();
     if (h >= 0 && h == applied_height){
         g_csi.valid = 1;
+        csi_hist_adopt(h);
         fprintf(stderr, "[coinstats] adopted persisted state at height %ld\n", h);
         return 1;
     }
@@ -665,7 +779,11 @@ static void worker_run(u64 cursor, pid_t parent){
             if (coin && g_csi.valid){
                 u64 value, code; memcpy(&value, body + 36, 8); memcpy(&code, body + 44, 8);
                 utxo_stats_add(kind == CSI_K_ADD ? g_csi.num : g_csi.den, body, value, code, script, slen);
+                acct_event(kind == CSI_K_ADD, value, code, script, slen);
                 g_csi_folds++; st->csi_folds = g_csi_folds;
+            } else if (kind == CSI_K_ROW){
+                long long h; memcpy(&h, body, 8);
+                if (g_csi.valid) csi_hist_commit((long)h);
             } else if (kind == CSI_K_COMMIT){
                 long long h; memcpy(&h, body, 8);
                 if (g_csi.valid) csi_persist((long)h);
