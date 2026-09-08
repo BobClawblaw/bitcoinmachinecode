@@ -1696,6 +1696,18 @@ int main(void){
      * up on the next lookup -- which is also what an operator building the
      * index against a running node needs. */
 
+    { /* 2026-09-08: verbosity 2 BY TXID ALONE (the index path) must carry the
+       * fee and prevouts: the handler jumped to the indexed offset and walked
+       * one transaction, so its index in the block read as 0 and the undo
+       * slice was skipped as the coinbase's. Production's facade showed fee 0
+       * on every /tx while the block-hash path (and getblock 3) had them. */
+      char pj[96]; snprintf(pj, sizeof pj, "[\"%s\", 2]", g_tx2_txid);
+      rj_val* r = call("getrawtransaction", pj, &ec, &em);
+      ck_str("getrawtransaction v2 by txid alone: tx2's fee from undo (index path)", S(r, "fee"), "49.98999000");
+      { rj_val* vin = G(r, "vin"); rj_val* pv = vin && vin->nitems ? G(vin->items[0], "prevout") : NULL;
+        ck("...and its input's prevout", pv != NULL);
+        ck_str("...the RIGHT prevout: tx1's output (49.99), not the coinbase's (the walk used to start at the header and skip nothing)", S(pv, "value"), "49.99000000"); }
+      if (r) rj_free(r); }
     { /* every fixture transaction must now resolve by txid alone, and the
        * bytes must be IDENTICAL to what the blockhash path returns */
       const char* ids[] = { g_cb_txid[1], g_cb_txid[2], g_tx1_txid, g_tx2_txid };
