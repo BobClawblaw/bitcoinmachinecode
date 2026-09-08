@@ -217,4 +217,5 @@ Checked against `asm/daemon/main.c` and `asm/daemon/ibd_pipeline.c` on 2026-09-0
 | Peer selection for download | none beyond outbound selection | timed 2,000-header sample ranks the pool; boundary rotation under half the pool median; a failed fetch halves a peer's standing and backs off (PRs #61, #74, #81) | **DECIDED** |
 | Write order | blocks written on arrival, connected in order | same; the status line reports what is in flight and the age of the oldest gap (PR #82) | **DONE** |
 | Progress reporting | `debug.log` progress= and ETA in the GUI | `eta DD:HH:MM:SS` on the status line at the last ten minutes' block rate (PR #74) | **DONE** |
+| Rate limits | `-maxuploadtarget` (MiB per day; historical blocks refused once spent) only | the same key with the same semantics, plus three node-wide rates of this node's own: `bmc.dialratelimit` (connection attempts/s), `bmc.downloadratelimit` (KB/s pulled), `bmc.uploadratelimit` (KB/s sent, paced at `p2p_write` for both transports); all default off (PRs of 2026-09-08) | **DECIDED** |
 

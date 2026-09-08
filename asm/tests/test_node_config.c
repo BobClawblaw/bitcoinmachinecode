@@ -87,6 +87,29 @@ int main(void){
                   g_cfg.max_connections,g_cfg.min_usable_peers,g_cfg.maxpool); failures++; }
 
     /* 4. a config that would leave zero inbound slots must be refused wholesale */
+    /* bmc.dialratelimit (2026-09-07): attempts per second, node-wide; 0 = off */
+    wr("bmc_dial.conf", "bmc.dialratelimit=5\n");
+    node_config_load("bmc_dial.conf");
+    if (g_cfg.dial_rate_limit == 5) printf("PASS: bmc.dialratelimit=5 applied\n"); else { printf("FAIL: bmc.dialratelimit=5 -> %d\n", g_cfg.dial_rate_limit); failures++; }
+    wr("bmc_dial2.conf", "bmc.dialratelimit=-1\n");
+    node_config_load("bmc_dial2.conf");
+    if (g_cfg.dial_rate_limit == 0) printf("PASS: bmc.dialratelimit=-1 rejected, default 0 (off)\n"); else { printf("FAIL: bmc.dialratelimit=-1 -> %d\n", g_cfg.dial_rate_limit); failures++; }
+    { /* the pacer arithmetic: N reservations on one clock are spaced exactly one interval apart, and an idle clock never owes the past */
+      volatile long long next = 0; long w1 = dial_gate_reserve(&next, 1000, 200), w2 = dial_gate_reserve(&next, 1000, 200), w3 = dial_gate_reserve(&next, 1000, 200);
+      long w4 = dial_gate_reserve(&next, 5000, 200);
+      if (w1 == 0 && w2 == 200 && w3 == 400 && w4 == 0) printf("PASS: dial pacer: 3 attempts at once wait 0/200/400 ms at 5 per second; after an idle stretch the next waits 0\n");
+      else { printf("FAIL: dial pacer waits %ld/%ld/%ld then %ld\n", w1, w2, w3, w4); failures++; } }
+    wr("bmc_dl.conf", "bmc.downloadratelimit=1000\n");
+    node_config_load("bmc_dl.conf");
+    if (g_cfg.download_rate_limit_kbps == 1000) printf("PASS: bmc.downloadratelimit=1000 (KB/s) applied\n"); else { printf("FAIL: bmc.downloadratelimit -> %d\n", g_cfg.download_rate_limit_kbps); failures++; }
+    { /* the byte pacer: at 1000 KB/s two 512,000-byte blocks at once cost 0 then 500 ms; an idle stretch owes nothing */
+      volatile long long next = 0; long r = 1024000;
+      long w1 = dl_gate_reserve(&next, 1000, 512000, r), w2 = dl_gate_reserve(&next, 1000, 512000, r), w3 = dl_gate_reserve(&next, 5000, 100, r), w0 = dl_gate_reserve(&next, 5000, 100, 0);
+      if (w1 == 0 && w2 == 500 && w3 == 0 && w0 == 0) printf("PASS: download pacer: 512 KB twice at 1000 KB/s waits 0 then 500 ms; idle owes 0; off owes 0\n");
+      else { printf("FAIL: download pacer waits %ld/%ld/%ld/%ld\n", w1, w2, w3, w0); failures++; } }
+    wr("bmc_ul.conf", "bmc.uploadratelimit=250\n");
+    node_config_load("bmc_ul.conf");
+    if (g_cfg.upload_rate_limit_kbps == 250) printf("PASS: bmc.uploadratelimit=250 (KB/s) applied\n"); else { printf("FAIL: bmc.uploadratelimit -> %d\n", g_cfg.upload_rate_limit_kbps); failures++; }
     wr("bmc_t2.conf", "maxconnections=16\nbmc.maxoutbound=32\n");
     node_config_load("bmc_t2.conf");
     { int outb=g_cfg.max_outbound+g_cfg.max_block_relay_only+g_cfg.max_feeler;

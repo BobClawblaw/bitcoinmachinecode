@@ -352,6 +352,7 @@ log echoes the resolved values.
 | `zmqpubhashblock` / `zmqpubhashtx` / `zmqpubrawblock` / `zmqpubrawtx` (+`hwm`) | — | ZMQ endpoints; `tcp://*` is refused, name an interface |
 | `blocknotify` / `alertnotify` / `startupnotify` / `shutdownnotify` | — | shell hooks; `%s` is sanitised before substitution |
 | `whitelist` / `whitebind` / `asmap` / `bantime` / `maxuploadtarget` / `blocksonly` | — / — / — / `86400` / `0` / `0` | peer permissions, AS bucketing, bans, upload budget, no tx relay |
+| `bmc.dialratelimit` / `bmc.downloadratelimit` / `bmc.uploadratelimit` | `0` / `0` / `0` | node-wide ceilings, off by default: outbound connection attempts per second; KB/s the sync may pull; KB/s the node may send (Core has only `maxuploadtarget`, a MiB-per-day budget, which is implemented too) |
 | `bmc.utxocompactthreshold` / `bmc.bootcatchup` | `12` / `1` | project-specific: UTXO runs that trigger compaction; run the parallel downloader at boot |
 
 ## Networks: Tor, I2P, CJDNS, IPv6

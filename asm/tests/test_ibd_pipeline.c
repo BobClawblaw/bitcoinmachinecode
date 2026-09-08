@@ -89,6 +89,7 @@ int cons_verify(const void* blkv, long len, void* scratch, unsigned cap){
 void block_hash(unsigned char out[32], const unsigned char* hdr80){ hash_of(out, hdr80[76]); }
 static long g_stored_h[NB]; static int g_nstored; static int g_wrong_body;
 static int g_progress; static void count_progress(void* a){ (void)a; g_progress++; }
+static long g_bytes_seen; static void count_bytes(long n){ g_bytes_seen += n; }
 long store_append_shared(void* st, long height, const unsigned char hash[32], const unsigned char* raw, unsigned len){
     (void)st; (void)raw; (void)len;
     unsigned char want[32]; hash_of(want, raw[76]);
@@ -204,6 +205,13 @@ int main(void){
     reset(); order_forward(); g_norder = 7; g_progress = 0;
     r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
     ok(r == IBD_FAIL_READ && g_progress == 7, "a peer that goes quiet after 7 blocks: 7 firings, then the chunk fails");
+    /* 2026-09-07: the bytes hook charges bmc.downloadratelimit with every
+     * block message's length, wanted or not */
+    ibd_pipeline_set_bytes(count_bytes);
+    reset(); order_forward(); g_inject_unasked = 1; g_bytes_seen = 0;
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
+    ok(r == NB && g_bytes_seen == (long)NB * 120 + 100, "bytes hook: 40 blocks of 120 bytes plus the 100-byte unasked one = 4,900 bytes charged");
+    ibd_pipeline_set_bytes(NULL);
     ibd_pipeline_set_progress(NULL, NULL);
     reset(); order_forward(); g_progress = 0;
     r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);

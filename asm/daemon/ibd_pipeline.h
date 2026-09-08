@@ -50,4 +50,8 @@ void ibd_pipeline_set_wave(long hashes_per_getdata);
  * bar that dropped 429 peers (10.7 GB of half-received chunks) in seven
  * hours of the 2026-09-07 benchmark while the pool median was 764 KB/s. */
 void ibd_pipeline_set_progress(void (*cb)(void*), void* arg);
+/* bytes hook (2026-09-07): called with the length of EVERY block message
+ * received, wanted or not -- the bytes were on the wire either way. The
+ * download worker charges them to bmc.downloadratelimit. */
+void ibd_pipeline_set_bytes(void (*cb)(long));
 #endif
