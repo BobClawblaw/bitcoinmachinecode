@@ -16,7 +16,7 @@ extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
 #define TX1 "1111111111111111111111111111111111111111111111111111111111111111"
 #define TX2 "2222222222222222222222222222222222222222222222222222222222222222"
 #define TX3 "3333333333333333333333333333333333333333333333333333333333333333"
-static int g_spender_index = 1; static int g_calls_gettxout = 0;
+static int g_spender_index = 1; static int g_calls_gettxout = 0; static int g_big = 0;
 static rj_val* J(const char* lit){ return rj_parse(lit, strlen(lit)); }
 int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, rj_val** result, long* ec, const char** em){
     (void)w; const char* p0 = params && params->typ == RJ_ARR && params->nitems ? params->items[0]->str : 0;
@@ -39,7 +39,9 @@ int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, 
         *result = rj_parse(buf, strlen(buf)); free(buf); return 1; }
     if (!strcmp(method, "getrawtransaction")){
         if (p0 && !strcmp(p0, TX2)){
-            if (p1 == 0){ *result = rj_str("0200aa"); return 1; }
+            if (p1 == 0){ *result = rj_str("0200aa"); return 1; }            if (g_big){ char* big = malloc(1300000); memset(big, 'a', 1200000); big[1200000] = 0;
+                char* t = malloc(1400000); snprintf(t, 1400000, "{\"txid\":\"" TX2 "\",\"version\":2,\"locktime\":0,\"size\":1,\"weight\":4,\"fee\":0.00000001,\"blockhash\":\"" BH "\",\"vin\":[{\"txid\":\"" TX3 "\",\"vout\":0,\"scriptSig\":{\"hex\":\"\"},\"txinwitness\":[\"%s\"],\"sequence\":0}],\"vout\":[]}", big);
+                *result = J(t); free(t); free(big); return 1; }
             const char* t = "{\"txid\":\"" TX2 "\",\"version\":2,\"locktime\":699999,\"size\":222,\"weight\":561,\"fee\":0.00000377,\"blockhash\":\"" BH "\",\"confirmations\":3,\"blocktime\":1631000000,\"vin\":[{\"txid\":\"" TX3 "\",\"vout\":1,\"scriptSig\":{\"hex\":\"\"},\"txinwitness\":[\"3044aa\"],\"sequence\":4294967293,\"prevout\":{\"generated\":false,\"height\":699990,\"value\":0.03612294,\"scriptPubKey\":{\"hex\":\"00146ffe291a\",\"type\":\"witness_v0_keyhash\",\"address\":\"bc1qprev\"}}}],\"vout\":[{\"value\":0.03611917,\"n\":0,\"scriptPubKey\":{\"hex\":\"76a914aa88ac\",\"type\":\"pubkeyhash\",\"address\":\"1test\"}},{\"value\":0,\"n\":1,\"scriptPubKey\":{\"hex\":\"6a04deadbeef\",\"type\":\"nulldata\"}}]}";
             *result = rj_parse(t, strlen(t)); return 1; }
         if (p0 && !strcmp(p0, "4444444444444444444444444444444444444444444444444444444444444444")){   /* an unconfirmed tx: no prevout, no fee, no blockhash */
@@ -148,6 +150,9 @@ int main(void){
     POST("/tx", "bad"); ok(g_status == 400, "POST /tx with a rejected tx -> 400 with the node's reason");
     GET("/address/bc1qtest"); ok(g_status == 501, "GET /address/... -> 501 until the history index (stage 2)");
     GET("/nothing/here"); ok(g_status == 404, "an unknown route -> 404");
+    /* a response over 1 MiB: the writer reports the needed length, the reply must grow (found live: garbage after the first MiB) */
+    { g_big = 1; rj_val* m = POST("/internal/txs", "[\"" TX2 "\"]"); g_big = 0;
+      ok(m && m->nitems == 1 && g_outlen > (1u << 20) && g_out[g_outlen - 1] == ']', "a >1 MiB response is complete and well-formed"); rj_free(m); }
     free(g_out);
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;

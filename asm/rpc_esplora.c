@@ -247,8 +247,16 @@ static rj_val* block_to_esplora(const rj_val* b){
 typedef struct { char** out; size_t* outlen; int* status; const char** ctype; } resp_t;
 static void reply_text(resp_t* r, int status, const char* txt){ *r->out = strdup(txt); *r->outlen = strlen(txt); *r->status = status; *r->ctype = "text/plain"; }
 static void reply_json(resp_t* r, rj_val* v){
+    /* rj_write reports the length it NEEDS when the buffer is too small (a
+     * snprintf-like contract, not -1); grow until the whole document fits.
+     * A block's transactions with prevouts run to tens of MB. */
     long cap = 1 << 20; char* buf = 0; long n = -1;
-    for (int tries = 0; tries < 9 && n < 0; tries++){ free(buf); buf = malloc((size_t)cap); if (!buf) break; n = rj_write(buf, cap, v, 0); if (n < 0) cap *= 2; }
+    for (int tries = 0; tries < 10; tries++){
+        free(buf); buf = malloc((size_t)cap + 1); if (!buf){ n = -1; break; }
+        n = rj_write(buf, cap, v, 0);
+        if (n >= 0 && n < cap) break;
+        cap *= 2; n = -1;
+    }
     rj_free(v);
     if (n < 0){ free(buf); reply_text(r, 500, "response too large"); return; }
     *r->out = buf; *r->outlen = (size_t)n; *r->status = 200; *r->ctype = "application/json";
