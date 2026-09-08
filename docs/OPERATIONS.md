@@ -227,7 +227,13 @@ I2P destination.
   any height the rows cover, in Core's shape, `block_info` included. A
   boot with no valid persisted state seeds the index from a walk of the
   set (minutes); rows exist from that height on, and a query below it is
-  refused by name. mempool.space reads `txouts` and `block_info.prevout_spent`
+  refused by name -- until the history is built:
+  `daemon/bmc_build_coinstats_hist <chaindir> [to_height] [workers]` fills
+  the rows from genesis from the archive alone (about two hours and
+  ~500 GB of temporary files on mainnet with eight workers; the daemon may
+  keep running, the tool writes only rows below the live coverage). Its
+  numbers are Core's coinstatsindex's: verified byte for byte at height
+  963,967 and at the tip. mempool.space reads `txouts` and `block_info.prevout_spent`
   per indexed block once `getindexinfo` reports the index synced at that
   height. Off (`0`) the index is not maintained and the RPC refuses.
 - `bmc.esploraport=<port>` (2026-09-08) opens the Esplora facade for

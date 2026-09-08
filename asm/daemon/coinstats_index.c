@@ -215,7 +215,7 @@ static void hist_write_row(long h){
     sha256_full(row.sum, &row, sizeof row - 32);
     if (pwrite(g_hist_fd, &row, sizeof row, CSH_HDR + (off_t)h * CSH_REC) != (ssize_t)sizeof row) return;
     csh_header_t hd; if (pread(g_hist_fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd) return;
-    if (hd.first_height < 0 || g_hist_baseline) hd.first_height = h;
+    if (hd.first_height < 0 || (g_hist_baseline && h < hd.first_height)) hd.first_height = h;   /* the history build may already cover lower heights */
     hd.last_height = h; hd.gen = g_acct.gen;
     if (pwrite(g_hist_fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd) return;
 }
