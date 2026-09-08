@@ -285,10 +285,45 @@ p2p_frame:
 
 /* ============================================================================
  * long p2p_write(fd=x0, cmd=x1, cmdlen=x2, payload=x3, plen=x4) -> sent/-1
- * ========================================================================== */
+ * =========================================================================== */
+
+	.section .data
+	.align 3
+	.global g_p2p_write_hook
+	.type g_p2p_write_hook,%object
+/* bmc.uploadratelimit (upstream 2026-09-08, PR #88 batch): a C pacer called
+ * BEFORE every p2p_write, v1 and v2 alike, with (fd, payload length). 0 = no
+ * hook. It sleeps out the byte debt of what this process has already sent, so
+ * the node's upload stays under the operator's KB/s ceiling. The daemon's
+ * arch-neutral C installs the pacer here from node config; nothing in this
+ * file calls it except p2p_write below. */
+g_p2p_write_hook:
+	.quad 0
+	.text
+
 	.global p2p_write
 	.type p2p_write, %function
 p2p_write:
+	/* upload pacer hook (x86 bitcoin_net.asm g_p2p_write_hook): fires BEFORE the
+	 * v2 dispatch so BOTH transports pace, with (fd, plen). 0 = no hook. The
+	 * write's five args are all live and all restored after the call, exactly
+	 * like x86 saves rdi/rsi/rdx/rcx/r8/r9 -- the C pacer may clobber x0-x18
+	 * freely. The three stp/str pushes keep sp 16-aligned throughout, and the
+	 * caller's FP/link ride in the first pair like the v2 call below does. */
+	adrp x9, g_p2p_write_hook
+	ldr  x9, [x9, :lo12:g_p2p_write_hook]
+	cbz  x9, .PW_nohook
+	stp  x29, x30, [sp, #-16]!
+	stp  x0, x1, [sp, #-16]!		/* fd, cmd */
+	stp  x2, x3, [sp, #-16]!		/* cmdlen, payload */
+	str  x4, [sp, #-16]!			/* plen */
+	mov  x1, x4				/* hook args: x0=fd (already), x1=plen */
+	blr  x9
+	ldr  x4, [sp], #16
+	ldp  x2, x3, [sp], #16
+	ldp  x0, x1, [sp], #16
+	ldp  x29, x30, [sp], #16
+.PW_nohook:
 	/* BIP324 v2 dispatch; falls through to v1 untouched when no v2 module
 	 * (see x86: one cmp + one branch on the hot v1 path). Args x0..x4 are
 	 * already the hook's (fd, cmd, cmdlen, payload, plen). */
