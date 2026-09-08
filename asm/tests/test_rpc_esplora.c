@@ -18,6 +18,7 @@ extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
 #define TX3 "3333333333333333333333333333333333333333333333333333333333333333"
 static int g_spender_index = 1; static int g_calls_gettxout = 0; static int g_big = 0;
 static rj_val* J(const char* lit){ return rj_parse(lit, strlen(lit)); }
+static int g_locks = 0, g_unlocks = 0; static void tlock(void){ g_locks++; } static void tunlock(void){ g_unlocks++; }
 int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, rj_val** result, long* ec, const char** em){
     (void)w; const char* p0 = params && params->typ == RJ_ARR && params->nitems ? params->items[0]->str : 0;
     long p1 = params && params->nitems > 1 && params->items[1]->str ? strtol(params->items[1]->str, 0, 10) : -1;
@@ -92,6 +93,7 @@ int main(void){
       memcpy(pair, acc, 32); memcpy(pair + 32, br[1], 32); sha256d(acc, pair, 64);
       ok(nb == 2 && !memcmp(acc, root, 32), "merkle branch of leaf 1 in a 3-leaf tree rebuilds the root (odd level paired with itself)"); }
 
+    esplora_set_exec_lock(tlock, tunlock);
     /* routes */
     GET("/blocks/tip/height"); ok(g_status == 200 && streq(g_out, "700000"), "GET /blocks/tip/height -> 700000 as text");
     GET("/blocks/tip/hash"); ok(streq(g_out, BH), "GET /blocks/tip/hash");
@@ -136,9 +138,11 @@ int main(void){
       ok(o && o->nitems == 2 && G(o->items[0], "spent")->str[0] == '0' && G(o->items[1], "spent")->str[0] == '1' && g_calls_gettxout == 2, "without the index: gettxout per output decides spent (unspent output 0, spent output 1)");
       rj_free(o); g_spender_index = 1; }
     { rj_val* o = GET("/tx/" TX2 "/outspend/1"); ok(o && G(o, "spent")->str[0] == '0', "GET /tx/:txid/outspend/1"); rj_free(o); }
+    g_calls_gettxout = 0;
     { rj_val* t = GET("/tx/4444444444444444444444444444444444444444444444444444444444444444");
       ok(t && G(G(t, "status"), "confirmed")->str[0] == '0' && streq(S(t, "fee"), "500"), "an unconfirmed tx: status unconfirmed, fee from getmempoolentry");
-      rj_val* pv = G(G(t, "vin")->items[0], "prevout"); ok(pv && streq(S(pv, "value"), "3611917") && streq(S(pv, "scriptpubkey_address"), "1test"), "...its prevout filled from gettxout(include_mempool)");
+      rj_val* pv = G(G(t, "vin")->items[0], "prevout"); ok(pv && streq(S(pv, "value"), "3611917") && streq(S(pv, "scriptpubkey_address"), "1test"), "...its prevout filled from the previous transaction's vout");
+      ok(g_calls_gettxout == 0, "...without a single gettxout (that call crosses to the download worker and starved production's RPC)");
       rj_free(t); }
     { rj_val* m = GET("/mempool/txids"); ok(m && m->nitems == 1, "GET /mempool/txids"); rj_free(m); }
     { rj_val* m = GET("/mempool"); ok(m && streq(S(m, "count"), "1") && streq(S(m, "vsize"), "110") && streq(S(m, "total_fee"), "500"), "GET /mempool -> count, vsize, total_fee in sats"); rj_free(m); }
@@ -150,6 +154,7 @@ int main(void){
     POST("/tx", "bad"); ok(g_status == 400, "POST /tx with a rejected tx -> 400 with the node's reason");
     GET("/address/bc1qtest"); ok(g_status == 501, "GET /address/... -> 501 until the history index (stage 2)");
     GET("/nothing/here"); ok(g_status == 404, "an unknown route -> 404");
+    ok(g_locks > 20 && g_locks == g_unlocks, "the execution lock was taken and released around every dispatch, not once per request");
     /* a response over 1 MiB: the writer reports the needed length, the reply must grow (found live: garbage after the first MiB) */
     { g_big = 1; rj_val* m = POST("/internal/txs", "[\"" TX2 "\"]"); g_big = 0;
       ok(m && m->nitems == 1 && g_outlen > (1u << 20) && g_out[g_outlen - 1] == ']', "a >1 MiB response is complete and well-formed"); rj_free(m); }

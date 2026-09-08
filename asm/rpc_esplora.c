@@ -137,9 +137,16 @@ int esplora_merkle_branch(const u8 (*txids)[32], long n, long pos, u8 (*branch)[
 }
 
 /* ---- RPC in process --------------------------------------------------------- */
+/* The server's execution lock is taken around EACH dispatch, not around the
+ * request: a route that makes thousands of calls (a batch load) must let
+ * JSON-RPC callers interleave. rpc_server.c installs the hooks. */
+static void (*g_lock)(void) = 0; static void (*g_unlock)(void) = 0;
+void esplora_set_exec_lock(void (*lock)(void), void (*unlock)(void)){ g_lock = lock; g_unlock = unlock; }
 static rj_val* call(const rpc_wallet* w, const char* method, rj_val* params, long* ec, const char** em){
     rj_val* r = 0; long e = 0; const char* m = 0;
+    if (g_lock) g_lock();
     int ok = rpc_dispatch(method, params, w, &r, &e, &m);
+    if (g_unlock) g_unlock();
     if (params) rj_free(params);
     if (ec) *ec = ok ? 0 : e;
     if (em) *em = ok ? 0 : m;
@@ -283,14 +290,20 @@ static rj_val* tx_by_id(const rpc_wallet* w, const char* txid, long* ec, const c
          * reshape once -- rj_obj_set appends, it does not replace. */
         rj_val* me = call(w, "getmempoolentry", P1s(txid), 0, 0);
         if (me){ rj_val* fees = G(me, "fees"); if (fees && S(fees, "base") && !S(t, "fee")) rj_obj_set(t, "fee", rj_num(S(fees, "base"))); rj_free(me); }
+        /* Each prevout from the PREVIOUS transaction (txindex, or the mempool
+         * for an unconfirmed parent), never from gettxout: on this node
+         * gettxout is a request to the download worker over a socketpair,
+         * answered only at that worker's service points, and a batch of
+         * thousands held the RPC execution lock for an hour on production
+         * (2026-09-08 09:41Z) while every other call waited behind it. */
         rj_val* cvin = G(t, "vin");
         for (size_t i = 0; cvin && cvin->typ == RJ_ARR && i < cvin->nitems; i++){
             rj_val* ci = cvin->items[i];
             if (S(ci, "coinbase") || G(ci, "prevout") || !S(ci, "txid")) continue;
-            rj_val* a = rj_arr(); rj_arr_push(a, rj_str(S(ci, "txid"))); rj_arr_push(a, rj_numf("%lld", N(ci, "vout"))); rj_arr_push(a, rj_bool(1));
-            rj_val* to = call(w, "gettxout", a, 0, 0);
-            if (to && to->typ == RJ_OBJ) rj_obj_set(ci, "prevout", to);   /* value + scriptPubKey: the prevout's shape */
-            else if (to) rj_free(to);
+            rj_val* prev = call(w, "getrawtransaction", P1s1n(S(ci, "txid"), 1), 0, 0);
+            rj_val* pvout = prev ? G(prev, "vout") : 0; long n = N(ci, "vout");
+            if (pvout && pvout->typ == RJ_ARR && n >= 0 && (size_t)n < pvout->nitems) rj_obj_set(ci, "prevout", rj_clone(pvout->items[n]));   /* value + scriptPubKey: the prevout's shape */
+            if (prev) rj_free(prev);
         }
     }
     rj_val* e = tx_to_esplora(t, height, bh ? bhash : 0, btime, w);

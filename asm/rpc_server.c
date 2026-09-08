@@ -1051,9 +1051,9 @@ static void* esp_conn_thread(void* arg){
         free(buf); close(cfd); __sync_fetch_and_sub(&g_esp_live, 1); return 0;
     }
     char* out = 0; size_t outlen = 0; int status = 500; const char* ctype = "text/plain";
-    pthread_mutex_lock(&g_exec_lock);
+    /* the lock is taken per dispatch inside the facade (esplora_set_exec_lock),
+     * so a batch route cannot starve the JSON-RPC callers */
     esplora_handle(m, mlen, path, plen, body, blen, g_wallet, &out, &outlen, &status, &ctype);
-    pthread_mutex_unlock(&g_exec_lock);
     char hdr[256];
     int hl = snprintf(hdr, sizeof hdr, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
                       status, status_text(status), ctype, outlen);
@@ -1077,8 +1077,11 @@ static void* esp_server_thread(void* arg){
     }
     return 0;
 }
+static void esp_lock(void){ pthread_mutex_lock(&g_exec_lock); }
+static void esp_unlock(void){ pthread_mutex_unlock(&g_exec_lock); }
 int rpc_esplora_start(const char* bind_addr, int port, char* errmsg, size_t errcap){
     if (port <= 0) return 0;
+    esplora_set_exec_lock(esp_lock, esp_unlock);
     struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)port);
     if (!bind_addr || !*bind_addr) bind_addr = "127.0.0.1";
     if (inet_pton(AF_INET, bind_addr, &a.sin_addr) != 1){ snprintf(errmsg, errcap, "bmc.esplorabind=%s is not an IPv4 address", bind_addr); return -1; }
