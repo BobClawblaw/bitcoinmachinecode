@@ -285,8 +285,10 @@ drop-in; the reference deployment's unit itself is a local artifact and is
 deliberately not vendored into this repository (operator decision,
 2026-09-05 — see `releases/2026-09-05-audits-closed.md`).
 
-- The reference deployment's `data/bitcoin.conf` (2026-09-08) has three keys:
-  `bind=<host address>` because a Core oracle on the same host listens on
+- The reference deployment's `data/bitcoin.conf` (2026-09-08) has five keys:
+  `port=8332` and `rpcport=8331` (the operator's choice: the router forwards
+  8332 to this node's P2P side, and the ports the 09-07 build happened to
+  use are the ones peers and tooling know); `bind=<host address>` because a Core oracle on the same host listens on
   `127.0.0.1-16:8333` for the benchmark's loopback replay and Linux refuses
   a wildcard bind against a listening specific address on the same port;
   `debuglogfile=0` and `printtoconsole=1` so the log keeps flowing through
