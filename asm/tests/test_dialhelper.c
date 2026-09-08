@@ -420,7 +420,10 @@ int main(void){
             if (cp == 0){ int rc = dlc_committer_run(ctl3, 300, 379, 0, rec_append, 0, 20, 0, 0); _exit(rc); }
             usleep(700000);
             ok(ctl3[DLC_CTL_CURSOR_WANT] == -1, "with nothing staged above it, a missing cursor chunk is NOT published (the pool has not moved on)");
-            ctl3[DLC_CTL_STAGED] = DLC_CURSOR_HELP_MIN_STAGED + 1;   /* the pool has moved on (+1: the commit of 300 takes one back) */
+            /* the pool has moved on: a third of the window staged ABOVE the cursor, as
+             * real files -- the committer recounts the gauge from the directory */
+            for (int k = 0; k <= DLC_CURSOR_HELP_MIN_STAGED; k++) stage_chunk(380 + 40L * k, 40);
+            ctl3[DLC_CTL_STAGED] = DLC_CURSOR_HELP_MIN_STAGED + 1;
             long waited = 0; while (ctl3[DLC_CTL_CURSOR_WANT] != 300 && waited < 5000){ usleep(20000); waited += 20; }
             ok(ctl3[DLC_CTL_CURSOR_WANT] == 300, "with a third of the window staged above it, the missing cursor chunk (300) is published after the delay");
             stage_chunk(300, 40);                          /* the helper delivered it */
@@ -431,8 +434,18 @@ int main(void){
             ctl3[DLC_CTL_STOP_COMMIT] = 1; int st = 0; waitpid(cp, &st, 0);
             ok(WIFEXITED(st) && WEXITSTATUS(st) == 0 && ctl3[DLC_CTL_CURSOR_WANT] == -1, "STOP ends the run and clears the want");
             g_dlc_cursor_help_ms = DLC_CURSOR_HELP_SECS * 1000L;
+            dlc_stage_wipe();
             munmap((void*)ctl3, (DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long)); }
           ok(g_synced_n == 2, "...and the store was synced once per committed chunk (2), not once per block (80)");
+          /* stale staged files wholly below the cursor are swept and the gauge
+           * becomes the directory's count (run 18 held six stale files that
+           * inflated the gauge gating the cursor help) */
+          { stage_chunk(20, 40); stage_chunk(60, 40); stage_chunk(180, 40); stage_chunk(220, 40);
+            static volatile long ctl5[DLC_CTL_RING + DLC_RETRY_MAX]; ctl5[DLC_CTL_STAGED] = 99;
+            long swept = dlc_stage_sweep(180, ctl5);
+            ok(swept == 2 && !dlc_stage_exists(20) && !dlc_stage_exists(60), "chunks 20 and 60 (wholly below cursor 180) are swept");
+            ok(dlc_stage_exists(180) && dlc_stage_exists(220) && ctl5[DLC_CTL_STAGED] == 2, "chunks 180 and 220 stay; the gauge is recounted from the directory (2, not 99)");
+            ok(dlc_stage_wipe() == 2, "(cleanup)"); }
           /* the window's help guard, and the next run's wipe */
           stage_chunk(180, 40);
           ok(dlc_stage_exists(180), "a staged chunk is visible to the help guard: the worker must not refetch it");

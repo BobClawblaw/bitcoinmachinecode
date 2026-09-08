@@ -3777,6 +3777,23 @@ static long dlc_stage_wipe(void){
     closedir(d);
     return n;
 }
+/* Staged files wholly below the cursor are stale: a chunk's owner finished
+ * after a helper had already delivered it (run 18 held six of them, and they
+ * inflated the staged gauge that gates the cursor help). Sweep them, then
+ * make the gauge the directory's truth: the count of published chunks. */
+static long dlc_stage_sweep(long cursor, volatile long* ctl){
+    DIR* d = opendir(DLC_STAGE_DIR); if (!d) return 0;
+    struct dirent* e; long removed = 0, kept = 0;
+    while ((e = readdir(d))){
+        long lo; if (sscanf(e->d_name, "c%ld.chunk", &lo) != 1 || strstr(e->d_name, ".tmp")) continue;
+        char p[320]; snprintf(p, sizeof p, DLC_STAGE_DIR "/%s", e->d_name);
+        if (lo + DLC_CHUNK_BLOCKS - 1 < cursor){ if (unlink(p) == 0) removed++; }
+        else kept++;
+    }
+    closedir(d);
+    if (ctl) ctl[DLC_CTL_STAGED] = kept;
+    return removed;
+}
 typedef long (*dlc_append_fn)(void* st, long height, const unsigned char hash[32], const unsigned char* raw, unsigned len);
 typedef int  (*dlc_present_fn)(long height);
 static int dlc_index_present(long h){ return idxscan_all_present(h, h) != 0; }
@@ -3853,12 +3870,12 @@ static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void*
             if(fh > ctl[DLC_CTL_FIRST_HOLE]) ctl[DLC_CTL_FIRST_HOLE] = fh;
             ctl[DLC_CTL_COMMIT_TIP] = fh - 1;
             __sync_fetch_and_add(&ctl[DLC_CTL_N_COMMIT], 1L);
-            if(ctl[DLC_CTL_STAGED] > 0) __sync_fetch_and_sub(&ctl[DLC_CTL_STAGED], 1L);
+            dlc_stage_sweep(fh, ctl);                              /* stale files below the cursor go; the gauge is the directory */
             continue;
         }
         if(r == -2){
             fprintf(stderr, "[dlc committer] staged chunk %s is malformed -- discarded; the window's help fetches it again\n", path);
-            if(ctl[DLC_CTL_STAGED] > 0) __sync_fetch_and_sub(&ctl[DLC_CTL_STAGED], 1L);
+            dlc_stage_sweep(fh, ctl);
             continue;
         }
         if(r == -1){
@@ -4665,7 +4682,8 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             close(sfd); g_stage_fd=-1;
             if(r>=0 && !mux_sync_budget_fired){
                 char sfin[64]; dlc_stage_path(sfin,sizeof sfin,lo);
-                if(rename(stmp,sfin)!=0){ fprintf(stderr,"[dlc w%d] stage: cannot publish %s (%s)\n", w, sfin, strerror(errno)); unlink(stmp); r=IBD_FAIL_STORE; }
+                if(hi <= next_claim[DLC_CTL_COMMIT_TIP]) unlink(stmp);          /* a helper delivered it first: already committed, nothing to publish */
+                else if(rename(stmp,sfin)!=0){ fprintf(stderr,"[dlc w%d] stage: cannot publish %s (%s)\n", w, sfin, strerror(errno)); unlink(stmp); r=IBD_FAIL_STORE; }
                 else __sync_fetch_and_add(&next_claim[DLC_CTL_STAGED],1L);
             } else unlink(stmp);
             store_reload(st);
