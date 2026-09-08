@@ -371,6 +371,103 @@ static long qparam(const char* path, size_t plen, const char* key){
     }
     return -1;
 }
+/* ---- the mempool, by address (2026-09-08) --------------------------------------
+ * Esplora's address answers include the mempool: mempool_stats, the
+ * unconfirmed transactions first in the list, unconfirmed outputs in /utxo
+ * and outputs spent in the mempool dropped from it. An in-process cache,
+ * refreshed lazily on an address request: the mempool's txid list is read
+ * (getrawmempool), transactions not seen before are fetched once and their
+ * outputs classified into address keys; each input's prevout comes from
+ * the parent transaction (the cache when the parent is in the mempool, the
+ * txindex otherwise). Transactions that left the mempool are dropped. At
+ * most MP_REFRESH_MAX new transactions per refresh, so one request never
+ * pays for a whole burst. */
+#include "daemon/addr_index_fmt.h"
+#define MP_REFRESH_MAX 2000
+typedef struct { unsigned char key[33]; unsigned char txid[32]; unsigned vout; unsigned long long value; int is_spend; unsigned char spent_txid[32]; unsigned spent_vout; } mp_ev;   /* one output funded, or one input spent */
+typedef struct { unsigned char txid[32]; unsigned char vout_keys_done; } mp_tx;
+static mp_ev* g_mp_ev = 0; static long g_mp_nev = 0, g_mp_cap = 0;
+static unsigned char (*g_mp_txids)[32] = 0; static long g_mp_ntx = 0;        /* the txids the cache knows, sorted */
+static int cmp32(const void* a, const void* b){ return memcmp(a, b, 32); }
+static int mp_has(const unsigned char txid[32]){ return g_mp_ntx && bsearch(txid, g_mp_txids, (size_t)g_mp_ntx, 32, cmp32) != 0; }
+static void mp_push(const unsigned char key[33], const unsigned char txid[32], unsigned vout, unsigned long long value, int is_spend, const unsigned char* stx, unsigned svout){
+    if (g_mp_nev == g_mp_cap){ g_mp_cap = g_mp_cap ? g_mp_cap * 2 : 4096; g_mp_ev = realloc(g_mp_ev, (size_t)g_mp_cap * sizeof *g_mp_ev); }
+    mp_ev* e = &g_mp_ev[g_mp_nev++]; memcpy(e->key, key, 33); memcpy(e->txid, txid, 32); e->vout = vout; e->value = value; e->is_spend = is_spend;
+    if (stx) memcpy(e->spent_txid, stx, 32); else memset(e->spent_txid, 0, 32); e->spent_vout = svout;
+}
+/* an output's (value, script) -> key; from the cache for a mempool parent, else the txindex */
+static int mp_prevout(const rpc_wallet* w, const unsigned char ptxid[32], unsigned vout, unsigned char key[33], unsigned long long* value){
+    for (long i = 0; i < g_mp_nev; i++) if (!g_mp_ev[i].is_spend && g_mp_ev[i].vout == vout && !memcmp(g_mp_ev[i].txid, ptxid, 32)){ memcpy(key, g_mp_ev[i].key, 33); *value = g_mp_ev[i].value; return 1; }
+    if (mp_has(ptxid)) return 0;                                  /* a mempool parent's non-standard output */
+    char hx[65]; hexrev(hx, ptxid);
+    rj_val* t = call(w, "getrawtransaction", P1s1n(hx, 1), 0, 0); if (!t) return 0;
+    rj_val* vo = G(t, "vout"); int ok = 0;
+    if (vo && vo->typ == RJ_ARR && vout < vo->nitems){
+        rj_val* spk = G(vo->items[vout], "scriptPubKey"); const char* hex = S(spk, "hex");
+        unsigned char scr[10000]; long sl = hex ? unhex(hex, scr, sizeof scr) : -1; unsigned char hash[32];
+        int type = sl > 0 ? axf_classify(scr, (unsigned)sl, hash) : AXF_INVALID;
+        if (type != AXF_INVALID){ key[0] = (unsigned char)type; memcpy(key + 1, hash, 32); *value = (unsigned long long)esplora_sats_of_amount(S(vo->items[vout], "value")); ok = 1; }
+    }
+    rj_free(t); return ok;
+}
+static void mp_refresh(const rpc_wallet* w){
+    rj_val* m = call(w, "getrawmempool", (rj_val*)({ rj_val* a = rj_arr(); rj_arr_push(a, rj_bool(0)); a; }), 0, 0);
+    if (!m || m->typ != RJ_ARR){ if (m) rj_free(m); return; }
+    long n = (long)m->nitems; unsigned char (*now)[32] = malloc((size_t)(n + 1) * 32); long nn = 0;
+    for (long i = 0; i < n; i++) if (m->items[i]->str && unhex(m->items[i]->str, now[nn], 32) == 32){ for (int k = 0; k < 16; k++){ unsigned char x = now[nn][k]; now[nn][k] = now[nn][31-k]; now[nn][31-k] = x; } nn++; }
+    rj_free(m);
+    qsort(now, (size_t)nn, 32, cmp32);
+    /* drop events of transactions that left */
+    long keep = 0;
+    for (long i = 0; i < g_mp_nev; i++) if (bsearch(g_mp_ev[i].txid, now, (size_t)nn, 32, cmp32)) g_mp_ev[keep++] = g_mp_ev[i];
+    g_mp_nev = keep;
+    /* fetch the new ones (parents before children when both are new: two rounds) */
+    long fetched = 0;
+    for (int round = 0; round < 2 && fetched < MP_REFRESH_MAX; round++){
+        for (long i = 0; i < nn && fetched < MP_REFRESH_MAX; i++){
+            if (mp_has(now[i])) continue;
+            char hx[65]; hexrev(hx, now[i]);
+            rj_val* t = call(w, "getrawtransaction", P1s1n(hx, 1), 0, 0); if (!t) continue;
+            rj_val* vo = G(t, "vout"); rj_val* vi = G(t, "vin");
+            for (size_t o = 0; vo && vo->typ == RJ_ARR && o < vo->nitems; o++){
+                rj_val* spk = G(vo->items[o], "scriptPubKey"); const char* hex = S(spk, "hex");
+                unsigned char scr[10000]; long sl = hex ? unhex(hex, scr, sizeof scr) : -1; unsigned char hash[32];
+                int type = sl > 0 ? axf_classify(scr, (unsigned)sl, hash) : AXF_INVALID;
+                if (type == AXF_INVALID) continue;
+                unsigned char key[33]; key[0] = (unsigned char)type; memcpy(key + 1, hash, 32);
+                mp_push(key, now[i], (unsigned)o, (unsigned long long)esplora_sats_of_amount(S(vo->items[o], "value")), 0, 0, 0);
+            }
+            /* the txid joins the known set now, so a child in this round finds its parent's outputs */
+            { unsigned char (*nk)[32] = realloc(g_mp_txids, (size_t)(g_mp_ntx + 1) * 32); g_mp_txids = nk; memcpy(g_mp_txids[g_mp_ntx++], now[i], 32); qsort(g_mp_txids, (size_t)g_mp_ntx, 32, cmp32); }
+            for (size_t k = 0; vi && vi->typ == RJ_ARR && k < vi->nitems; k++){
+                const char* ptx = S(vi->items[k], "txid"); if (!ptx || S(vi->items[k], "coinbase")) continue;
+                unsigned char pt[32]; if (unhex(ptx, pt, 32) != 32) continue; for (int q = 0; q < 16; q++){ unsigned char x = pt[q]; pt[q] = pt[31-q]; pt[31-q] = x; }
+                unsigned char key[33]; unsigned long long value = 0;
+                if (mp_prevout(w, pt, (unsigned)N(vi->items[k], "vout"), key, &value)) mp_push(key, now[i], (unsigned)k, value, 1, pt, (unsigned)N(vi->items[k], "vout"));
+            }
+            rj_free(t); fetched++;
+        }
+    }
+    /* the known set = what is in the mempool now (minus the ones deferred to the next refresh) */
+    long kn = 0; for (long i = 0; i < g_mp_ntx; i++) if (bsearch(g_mp_txids[i], now, (size_t)nn, 32, cmp32)) memcpy(g_mp_txids[kn++], g_mp_txids[i], 32);
+    g_mp_ntx = kn;
+    free(now);
+}
+/* the address's mempool view: stats, its unconfirmed txids (newest last, as seen), its unconfirmed outputs, and the outpoints it had that the mempool spends */
+typedef struct { long funded_n, spent_n; long long funded_sum, spent_sum; unsigned char (*txids)[32]; long ntx; mp_ev* funds; long nfunds; mp_ev* spends; long nspends; } mp_view;
+static void mp_view_of(const rpc_wallet* w, int type, const unsigned char hash[32], mp_view* v){
+    memset(v, 0, sizeof *v); mp_refresh(w);
+    unsigned char key[33]; key[0] = (unsigned char)type; memcpy(key + 1, hash, 32);
+    for (long i = 0; i < g_mp_nev; i++){
+        mp_ev* e = &g_mp_ev[i]; if (memcmp(e->key, key, 33)) continue;
+        if (e->is_spend){ v->spent_n++; v->spent_sum += (long long)e->value; v->spends = realloc(v->spends, (size_t)(v->nspends + 1) * sizeof *e); v->spends[v->nspends++] = *e; }
+        else { v->funded_n++; v->funded_sum += (long long)e->value; v->funds = realloc(v->funds, (size_t)(v->nfunds + 1) * sizeof *e); v->funds[v->nfunds++] = *e; }
+        int dup = 0; for (long j = 0; j < v->ntx; j++) if (!memcmp(v->txids[j], e->txid, 32)){ dup = 1; break; }
+        if (!dup){ v->txids = realloc(v->txids, (size_t)(v->ntx + 1) * 32); memcpy(v->txids[v->ntx++], e->txid, 32); }
+    }
+}
+static void mp_view_free(mp_view* v){ free(v->txids); free(v->funds); free(v->spends); }
+
 /* ---- /address routes (stage 2) ------------------------------------------------
  * History = the base index (addr_hist.dat, to its to_height) + the live tail
  * journal above it (addrindex.tail: ADD funding, DEL spend, TOUCH the
@@ -461,8 +558,9 @@ static void esplora_address(resp_t* r, const rpc_wallet* w, char seg[][80], int 
         rj_val* cs = rj_obj(); rj_obj_set(cs, "funded_txo_count", rj_numf("%ld", h.funded_n)); rj_obj_set(cs, "funded_txo_sum", rj_numf("%lld", h.funded_sum));
         rj_obj_set(cs, "spent_txo_count", rj_numf("%ld", h.spent_n)); rj_obj_set(cs, "spent_txo_sum", rj_numf("%lld", h.spent_sum)); rj_obj_set(cs, "tx_count", rj_numf("%ld", h.nrefs));
         rj_obj_set(o, "chain_stats", cs);
-        rj_val* ms = rj_obj(); rj_obj_set(ms, "funded_txo_count", rj_num("0")); rj_obj_set(ms, "funded_txo_sum", rj_num("0")); rj_obj_set(ms, "spent_txo_count", rj_num("0")); rj_obj_set(ms, "spent_txo_sum", rj_num("0")); rj_obj_set(ms, "tx_count", rj_num("0"));
-        rj_obj_set(o, "mempool_stats", ms);
+        mp_view v; mp_view_of(w, type, key, &v);
+        rj_val* ms = rj_obj(); rj_obj_set(ms, "funded_txo_count", rj_numf("%ld", v.funded_n)); rj_obj_set(ms, "funded_txo_sum", rj_numf("%lld", v.funded_sum)); rj_obj_set(ms, "spent_txo_count", rj_numf("%ld", v.spent_n)); rj_obj_set(ms, "spent_txo_sum", rj_numf("%lld", v.spent_sum)); rj_obj_set(ms, "tx_count", rj_numf("%ld", v.ntx));
+        rj_obj_set(o, "mempool_stats", ms); mp_view_free(&v);
         free(h.refs); reply_json(r, o); return;
     }
     if (IS(2, "txs") && (ns == 3 || (ns >= 4 && IS(3, "chain")))){
@@ -476,6 +574,11 @@ static void esplora_address(resp_t* r, const rpc_wallet* w, char seg[][80], int 
             }
         }
         rj_val* arr = rj_arr(); long taken = 0;
+        if (ns == 3){                                            /* the unconfirmed ones first, as Esplora lists them */
+            mp_view v; mp_view_of(w, type, key, &v);
+            for (long i = v.ntx - 1; i >= 0 && taken < 25; i--){ char hx[65]; hexrev(hx, v.txids[i]); rj_val* t = tx_by_id(w, hx, 0, 0); if (t){ rj_arr_push(arr, t); taken++; } }
+            mp_view_free(&v); taken = 0;
+        }
         for (long i = start; i < h.nrefs && taken < 25; i++){
             if (!h.refs[i].has_txid) continue;
             char hx[65]; hexrev(hx, h.refs[i].txid);
@@ -484,7 +587,11 @@ static void esplora_address(resp_t* r, const rpc_wallet* w, char seg[][80], int 
         }
         free(h.refs); reply_json(r, arr); return;
     }
-    if (IS(2, "txs") && ns == 4 && IS(3, "mempool")){ free(h.refs); reply_json(r, rj_arr()); return; }
+    if (IS(2, "txs") && ns == 4 && IS(3, "mempool")){
+        mp_view v; mp_view_of(w, type, key, &v); rj_val* arr = rj_arr();
+        for (long i = v.ntx - 1; i >= 0; i--){ char hx[65]; hexrev(hx, v.txids[i]); rj_val* t = tx_by_id(w, hx, 0, 0); if (t) rj_arr_push(arr, t); }
+        mp_view_free(&v); free(h.refs); reply_json(r, arr); return;
+    }
     if (IS(2, "utxo")){
         /* every funding event of the address (base, then the tail's ADDs),
          * minus the ones the txospender index knows a spender for -- one
@@ -523,6 +630,9 @@ static void esplora_address(resp_t* r, const rpc_wallet* w, char seg[][80], int 
             for (long i = start; i < end; i++){ const rj_val* e = sp && sp->typ == RJ_ARR && (size_t)(i - start) < sp->nitems ? sp->items[i - start] : 0; if (e && S(e, "spendingtxid")) f[i].spent = 1; }
             if (sp) rj_free(sp);
         }
+        /* the mempool: outputs it spends leave, outputs it creates join (unconfirmed) */
+        mp_view v; mp_view_of(w, type, key, &v);
+        for (long i = 0; i < nf; i++) for (long k = 0; k < v.nspends; k++) if (v.spends[k].spent_vout == f[i].vout && !memcmp(v.spends[k].spent_txid, f[i].txid, 32)) f[i].spent = 1;
         rj_val* arr = rj_arr();
         for (long i = 0; i < nf; i++){
             if (f[i].spent) continue;
@@ -532,6 +642,15 @@ static void esplora_address(resp_t* r, const rpc_wallet* w, char seg[][80], int 
             rj_obj_set(o, "status", st); rj_obj_set(o, "value", rj_numf("%llu", f[i].value));
             rj_arr_push(arr, o);
         }
+        for (long i = 0; i < v.nfunds; i++){
+            int spent = 0; for (long k = 0; k < v.nspends; k++) if (v.spends[k].spent_vout == v.funds[i].vout && !memcmp(v.spends[k].spent_txid, v.funds[i].txid, 32)) spent = 1;
+            if (spent) continue;
+            char hx[65]; hexrev(hx, v.funds[i].txid);
+            rj_val* o = rj_obj(); rj_obj_set(o, "txid", rj_str(hx)); rj_obj_set(o, "vout", rj_numf("%u", v.funds[i].vout));
+            rj_val* st = rj_obj(); rj_obj_set(st, "confirmed", rj_bool(0)); rj_obj_set(o, "status", st); rj_obj_set(o, "value", rj_numf("%llu", v.funds[i].value));
+            rj_arr_push(arr, o);
+        }
+        mp_view_free(&v);
         free(f); free(h.refs); reply_json(r, arr); return;
     }
     free(h.refs); reply_text(r, 404, "unknown address route");

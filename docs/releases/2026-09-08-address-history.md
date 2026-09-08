@@ -37,12 +37,24 @@ the replay reaches any distance.
 
 ## The routes
 
-`/address/:addr` (chain_stats from base and tail; mempool_stats zero in
-this cut), `/address/:addr/txs` and `/txs/chain/:lastSeen` (newest first,
-25 a page, deduplicated by transaction), `/address/:addr/txs/mempool`
-(empty in this cut), `/address/:addr/utxo` (the funding events with no
-spender per the txospender index, each with its block height). Scripthash
-routes answer 501: the index is keyed by address.
+`/address/:addr` (chain_stats from base and tail, mempool_stats from the
+mempool view below), `/address/:addr/txs` and `/txs/chain/:lastSeen`
+(unconfirmed first, then newest first, 25 a page, deduplicated by
+transaction), `/address/:addr/txs/mempool`, `/address/:addr/utxo` (the
+funding events with no spender per the txospender index, each with its
+block height; outputs spent in the mempool dropped, outputs created in the
+mempool added as unconfirmed). Scripthash routes answer 501: the index is
+keyed by address.
+
+## The mempool view
+
+An in-process cache keyed by address, refreshed lazily on an address
+request: the mempool's txid list is read, transactions not seen before are
+fetched once and their outputs classified into address keys, and each
+input's prevout comes from the parent transaction (the cache when the
+parent is in the mempool, the txindex otherwise). Transactions that left
+the mempool are dropped; at most 2,000 new transactions are taken per
+refresh, so one request never pays for a whole burst.
 
 ## Tests
 
