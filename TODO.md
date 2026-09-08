@@ -84,11 +84,17 @@ Everything below is landed on `arm-port` and pushed. History lives in
       **651 ms** (163 ns/key, 393 MB/s), within 20% of x86's merge. Sweep round 37:
       pass 374 / fail 4 env-only / bench-ok 18 / build-fail 1 (upstream's own
       `test_par_threads`) / compared 396 of 432.
-- [ ] **Port `mac_rsort_desc` (the flush-descriptor MSD radix).** Primitives done;
-      x86 radix: 541 -> 91 ms there, so if the ratio holds, ~110 ms here. The
-      dispatcher already branches on `mac_sort_mode` — it lands on merge today
-      (see the comment above `utxo_lsm_sort_desc`). A wrong order writes wrong
-      runs, and a wrong run is a lost coin: diff-test it exactly like x86 did.
+- [x] **Port `mac_rsort_desc` -- DONE (2026-09-08, `8a20f7c8`).** MSD radix over
+      compact 16-byte entries, x86's shape line for line (three digit variants,
+      per-depth counts in .bss, single-bucket skip, <= 32-bucket insertion sort
+      with descriptor tie-break, prefetched gather; the order must end in
+      mac_rs_final). At N=4M: **152.9 ms** vs merge 654.6 ms -- 4.29x, 1675 MB/s
+      (x86: 5.9x; the twin's radix is 1.7x off x86's, plausibly dynamic-shift
+      digit extraction + scalar copies). `mac_sort_mode` now defaults to 1
+      (radix), matching x86, and `utxo_lsm_sort_desc` really dispatches.
+      test_lsm_flush_sort_diff is a REAL equivalence test here now: byte-identical
+      runs, radix vs merge, same arrays. Round 43: pass 374 / fail 4 env-only /
+      compared 396 of 432 -- ninth consecutive identical sweep.
 - [ ] **Deploy `bmcbitcoind` when told go.** Candidate rebuilt against the merged
       tree (`7542fc1d`, upstream through PR #98 + the
       g_p2p_write_hook port; predecessors `84a2bccb`/`2b98d3f1` stale). Two-step rename deploy: point the unit at

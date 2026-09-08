@@ -782,15 +782,12 @@ STILL OPEN after the series:
       393 MB/s) -- 4.4x, within 20% of x86's merge (541 ms). test_lsm_flush_sort_diff
       still byte-identical; full sweep round 37 unchanged (pass 374 / fail 4
       env-only / compared 396 of 432).
-- [ ] **Port `mac_rsort_desc` (the flush-descriptor MSD radix) -- measured, not
-      guessed.** x86 radix: 541 -> 91 ms there (5.9x). If the ratio holds on the
-      ARM twin's now-fast merge, 651 -> ~110 ms per 4M-descriptor flush. The ARM
-      `utxo_lsm_sort_desc` dispatcher already takes the radix branch on a nonzero
-      `mac_sort_mode` -- it just lands on merge today, and
-      `port/arm64/bitcoin_utxo_lsm.S`'s comment above it explains exactly what the
-      diff test does and does not prove until the radix exists. Bulk-build cost,
-      not consensus -- and precisely the code not to rush: a wrong order writes
-      wrong runs, and a wrong run is a lost coin.
+- [x] **Port `mac_rsort_desc` -- DONE (2026-09-08, `8a20f7c8`).** The in-code
+      disclaimer above `utxo_lsm_sort_desc` is rewritten: two bodies now, like
+      x86, default radix. 152.9 ms vs 654.6 ms merge at N=4M (4.29x); the diff
+      test compares radix and merge byte-for-byte on this port now. Remaining
+      radix headroom vs x86 (153 vs 91 ms) is noted in the commit, not chased:
+      the flush sort is bulk-build cost and the win is already banked.
 - [ ] **Rebuild `daemon_out/bmcbitcoind` against the merged tree** -- the 35
       upstream commits touch `asm/daemon/*.c`, so the candidate on disk (md5
       `5bcfd57e`) is stale relative to arm-port. Build only; deploy still held.
