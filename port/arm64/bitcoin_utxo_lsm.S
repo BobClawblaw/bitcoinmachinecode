@@ -898,9 +898,22 @@ utxo_lsm_set_sort_mode:
 	.align 3
 	.global mac_sort_mode
 mac_sort_mode:
-	.quad 1				/* 0 = merge (mac_sort_desc), 1 = radix (mac_rsort_desc).
-					   Matches x86: radix is the DEFAULT now that the twin
-					   exists. The diff test flips this per run. */
+	.quad 0				/* 0 = merge (mac_sort_desc), 1 = radix (mac_rsort_desc).
+					   DEFAULT IS MERGE ON ARM for now, DIVERGING from x86
+					   (radix there): the fresh-sync boot loop of 2026-09-08 --
+					   five SEGV crashes ~35-90 s into boots with radix as the
+					   default (si_addr=0x0, victim thread boot_utxo_progress
+					   inside nanosleep, x86-identical C) -- stopped recurring
+					   with the merge default, and the one radix-default boot
+					   that ran 25 min shows the bug is intermittent and
+					   data-dependent. My radix port passes
+					   test_lsm_flush_sort_diff (byte-identical vs merge on
+					   synthetic arrays) but something in it corrupts memory
+					   under production flush shapes. It gets an offline stress
+					   harness (radix vs merge, randomized production-shaped
+					   arrays) before the default flips back. The flush sort is
+					   651 ms/4M here with merge -- correctness first. */
+
 	.text
 
 	.section .bss
