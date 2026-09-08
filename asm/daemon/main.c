@@ -6315,9 +6315,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     if(archive_ok) txit_boot(store_buf);
     /* txo-spender index tail (Core -txospenderindex): same shape, same rules */
     if(archive_ok) tsp_boot(store_buf);
-    /* live address index (EXTENSION -- Core has no such index): only when
-     * the operator asked with addrindex=1 */
-    if(archive_ok && g_cfg.addrindex) axt_boot(store_buf);
+    /* the live address index (EXTENSION) boots AFTER the UTXO engine below:
+     * its backfill replays undo, which exists only for applied blocks */
 
     fprintf(stderr,"[dl] worker: loading live UTXO state...\n");
     phase_timer_t utxo_init_pt; phase_start(&utxo_init_pt);
@@ -6326,6 +6325,17 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     g_in_utxo_reload = 0;
     g_utxo_live_on = utxo_live_ok;             /* 3.1: node_public_tip() switches on this */
     dl_publish_connected_tip();
+    /* live address index (EXTENSION -- Core has no such index): only when
+     * the operator asked with addrindex=1. 2026-09-08: after the engine, and
+     * capped at its applied height -- the archive is ahead of it at every
+     * boot (a stop lands blocks it does not connect), and a backfill aimed at
+     * the archive tip read undo the engine had not written yet and disabled
+     * the index for the session, four boots in a row on production. */
+    if(archive_ok && g_cfg.addrindex){
+        extern void axt_set_applied_height(long (*)(void));
+        if(utxo_live_ok) axt_set_applied_height(utxo_live_applied_height);
+        axt_boot(store_buf);
+    }
     /* Incident #48: mempool prevout resolution in THIS process must query
      * the live writer state, never a boot-latched snapshot of files the
      * writer keeps mutating (misses + garbage script lengths within
