@@ -410,8 +410,13 @@ static __thread int g_mp_in_refresh = 0;
  * the facade answered nothing for minutes while JSON-RPC limped. After
  * every dispatch the refresher yields and sleeps a millisecond, so a
  * waiter gets the lock; a pass is bounded by time as well as by count. */
+extern int rpc_exec_waiters(void) __attribute__((weak));   /* rpc_server.c; absent in the unit tests */
 static rj_val* mp_call(const rpc_wallet* w, const char* method, rj_val* params){
     if (g_mp_in_refresh) pthread_mutex_unlock(&g_mp_lock);
+    /* defer to anyone waiting for the exec lock: a request thread's dispatch
+     * is milliseconds, a pass can wait; bounded so a steady stream of
+     * callers cannot starve the refresh either (200 x 2 ms) */
+    if (g_mp_in_refresh && rpc_exec_waiters) for (int i = 0; i < 200 && rpc_exec_waiters() > 0; i++){ struct timespec ts = { 0, 2000 * 1000 }; nanosleep(&ts, 0); }
     rj_val* r = call(w, method, params, 0, 0);
     if (g_mp_in_refresh){ struct timespec ts = { 0, 1000 * 1000 }; sched_yield(); nanosleep(&ts, 0); pthread_mutex_lock(&g_mp_lock); }
     return r;
