@@ -280,7 +280,7 @@ int main(void){
       /* uacomment WAS flagged until 2026-09-01 (config-surface); it is
        * implemented now. A still-inert Core option carries the flag instead. */
       ck("uacomment is NOT flagged -- implemented 2026-09-01", nodecfg_unimplemented("uacomment") == 0);
-      ck("a still-inert Core option (rest) is flagged", nodecfg_unimplemented("rest") == 1);
+      ck("a still-inert Core option (natpmp) is flagged (rest is implemented since 2026-09-08)", nodecfg_unimplemented("natpmp") == 1);
       ck("an IMPLEMENTED option is not flagged", nodecfg_unimplemented("bantime") == 0);
       ck("  nor is minimumchainwork", nodecfg_unimplemented("minimumchainwork") == 0);
       ck("  nor blocknotify",         nodecfg_unimplemented("blocknotify") == 0);

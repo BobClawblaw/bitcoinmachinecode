@@ -436,7 +436,7 @@ tables and the writers themselves.
   `chain=testnet4`). Supported: **main, signet, testnet4 and regtest** —
   testnet4's whole chain synced with a byte-identical muhash vs Core, and
   signet closed 2026-08-30 (below).
-- **Tor/I2P/onion, REST interface, UPnP/NAT-PMP, Bitcoin-Qt GUI** — absent by
+- **Tor/I2P/onion, UPnP/NAT-PMP, Bitcoin-Qt GUI** (REST since 2026-09-08) — absent by
   design (not gaps for an asm/daemon consensus project).
 
 CLOSED since the previous revision of this list, each with its evidence in
@@ -457,7 +457,7 @@ than trusted:
 | surface | state |
 | --- | --- |
 | **Public RPC methods** | **155 / 155.** The 16 Core methods absent here are *all* in Core's own `hidden` category — mining, test scaffolding, chain manipulation, debug introspection. Two of those were added anyway because the data already existed: `getrawaddrman` and `getorphantxs`. |
-| **Config options** | **133 / 181 implemented, 48 accepted without effect (each named with its reason at start-up), 0 not recognised** — see the 2026-09-01 config-surface update below for the full table. |
+| **Config options** | **134 / 181 implemented, 47 accepted without effect (each named with its reason at start-up), 0 not recognised** — see the 2026-09-01 config-surface update below for the full table. |
 | **Chains** | main, testnet4, regtest. **signet and testnet3 absent** — and refused explicitly at startup rather than started with the wrong rules. |
 | **Indexes** | txindex, coinstatsindex, blockfilterindex, addrindex, **txospenderindex (2026-09-01)**, **the address history index (`bmc_build_addr_hist`, 2026-09-08; backs the Esplora facade's address routes)**. |
 | **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport COMPLETE, live on mainnet in both directions, proven against Bitcoin Core v31.99. Erlay: BIP330 negotiation implemented and tested, not wired to the wire; reconciliation deliberately not built (see below).** |
@@ -1129,7 +1129,7 @@ Confirmed absent:
   `getzmqnotifications` dispatched. Core only exposes that method when built
   WITH zmq, which the census Core was not — so this is one method BEYOND the
   surface the census measured.
-- **REST interface** (separate from JSON-RPC) — zero hits.
+- ~~**REST interface** (separate from JSON-RPC)~~ — **implemented 2026-09-08** (`rest=1`, `asm/rest.c`).
 - **UPnP / NAT-PMP** automatic port forwarding — zero hits.
 - ~~Addr self-advertisement~~ — **DONE 2026-08-26** (`daemon/addr_self.c`):
   external IPv4 from two agreeing peers' addr_recv views, announced with
@@ -1218,7 +1218,7 @@ states, and nothing else: **implemented** (parsed, with Core's semantics
 behind it), **accepted, no effect** (parsed, named at every start-up with the
 reason it is inert here — the table `k_noeffect` in node_config.c is the
 same list), or **not recognised** (ignored silently, as Core ignores unknown
-keys). Counts: 133 implemented, 48 accepted without effect, 0 not recognised.
+keys). Counts: 134 implemented, 47 accepted without effect, 0 not recognised (rest implemented 2026-09-08).
 
 Landed today (branch `feat/config-surface`): `uacomment` (runtime user agent,
 on the wire and in `getnetworkinfo`), `blockmaxweight` / `blockreservedweight`
@@ -1368,7 +1368,7 @@ that served BIP157 before this change must now set it explicitly.
 | `prune` | Reduce storage requirements by enabling pruning (deleting) of old blocks. This allows the pruneblockchain RPC … | implemented |
 | `regtest` | Enter regression test mode, which uses a special chain in which blocks can be solved instantly. This is intend… | implemented |
 | `reindex` | If enabled, wipe chain state and block index, and rebuild them from blk*.dat files on disk. Also wipe and rebu… | implemented |
-| `rest` | Accept public REST requests (default: 0) | accepted, no effect: no REST interface by design |
+| `rest` | Accept public REST requests (default: 0) | **implemented 2026-09-08** (`rest.c`: the fourteen `/rest/` routes, `.json`/`.hex`/`.bin`, Core's error texts) |
 | `rpcallowip` | Allow JSON-RPC connections from specified source. Valid values for <ip> are a single IP (e.g. 1.2.3.4), a netw… | implemented |
 | `rpcauth` | Username and HMAC-SHA-256 hashed password for JSON-RPC connections. The field <userpw> comes in the format: <U… | implemented |
 | `rpcbind` |  | implemented |
@@ -2080,7 +2080,7 @@ needs to prove.
   overstates this as done; it is half-done.
 - Erlay/BIP330 reconciliation — negotiation only, wire-off, a deliberately
   declared stopping point, unchanged since 2026-08-30.
-- REST interface, UPnP/NAT-PMP, `blockreconstructionextratxn`, `rpc.discover`
+- UPnP/NAT-PMP, `blockreconstructionextratxn`, `rpc.discover` (REST: implemented 2026-09-08)
   — all absent by explicit design, consistently described as such.
 - **Inbound-accepted transactions are not re-announced to this node's other
   peer connections** (`asm/daemon/tx_relay.c`'s `txrelay_poll_leg` is only

@@ -8276,6 +8276,11 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
         fprintf(stderr, "[rpc] server start failed: %s\n", err);
         return;
     }
+    if (g_cfg.rest){
+        /* weak: the test rules that compile this file without rpc_server.o (link-check) */
+        extern void rpc_rest_enable(int) __attribute__((weak));
+        if (rpc_rest_enable){ rpc_rest_enable(1); fprintf(stderr, "[rpc] REST interface on the RPC listener (rest=1; unauthenticated, like Core's)\n"); }
+    }
     /* 2026-09-08: the Esplora facade (mempool.space's BACKEND esplora) */
     if (g_cfg.esplora_port > 0){
         extern int rpc_esplora_start(const char*, int, char*, size_t);

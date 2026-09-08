@@ -126,7 +126,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | `coinstatsindex` at **any height** | one record per block | **tip only** (CSI-2); historical `gettxoutsetinfo muhash <h>` needs the oracle | **DECIDED** (`BENCH_DEFECT_LEDGER_2026-09-04.md`) |
 | RPC surface (~157 methods), cookie auth, `rpcauth`, `rpcwhitelist`, loopback default | | same, verified per method in `PARITY_PLAN.md` | **DONE** |
 | Long-running RPC concurrency | parallel workers | one execution lock (RPC-12) | **DECIDED** |
-| REST interface | `-rest` | absent | **DECIDED** |
+| REST interface | `-rest`: fourteen `/rest/` routes on the RPC port, unauthenticated, `.json`/`.hex`/`.bin` | the same (`rest=1`, 2026-09-08): every route from the node's RPC handlers, Core's status codes and error texts; `mempool_sequence=true` is refused (no sequence counter) | **DONE** |
 | ZMQ `hashblock`/`hashtx`/`rawblock`/`rawtx` | | same; `zmqpubsequence` refused (MEM-22) | **DONE** / sequence **DECIDED** |
 | `settings.json` persistence of RPC-set values | | absent | **DECIDED** (config table) |
 
@@ -194,7 +194,7 @@ rest is completeness. Inbound onion/I2P and BIP23 were on the first draft of
 this list and are not gaps (see the scopes document's corrections).
 
 **Explicitly not on the list, by decision:** Erlay reconciliation, addrman
-test-before-evict, `assumeutxo`, REST, UPnP/NAT-PMP, BIP37 bloom, keypool,
+test-before-evict, `assumeutxo`, UPnP/NAT-PMP, BIP37 bloom, keypool,
 tip-only coinstats index (CSI-2), display-only `prioritisetransaction`
 (MEM-18), single RPC execution lock (RPC-12), wallet reorg awareness
 (WAL-13), opcode dispatch table (IR-16), systemd unit in version control.

@@ -277,6 +277,7 @@ typedef struct {
     int  shrinkdebugfile;           /* default 1: truncate a >10 MB log to its last 200 KB at start-up */
     int  printtoconsole;
     char loglevel[24];
+    int  rest;                      /* rest=1: Core's REST interface on the RPC listener (default 0) */
     int  rpcthreads;                /* default 16 (>= 1)  */
     int  rpcworkqueue;              /* default 64 (>= 1)  */
     int  rpcservertimeout;          /* default 30 s (>= 1) */
