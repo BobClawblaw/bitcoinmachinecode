@@ -10,4 +10,4 @@ Every production boot from 17:16Z disabled the live address index: "[axt] h=9660
 
 ---
 
-PR_LINE
+PR #123 (`batch/2026-09-08-addrindex-boot-race`), merged 22:35Z as `617f1154`; tag `addrindex-boot-race-2026-09-08`. Deployed as snapshot `deploy-20260908m`.
