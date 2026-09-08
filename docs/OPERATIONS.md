@@ -699,6 +699,7 @@ Extra listeners: onion service target at chain default P2P port + 1
 | `.cookie` | RPC cookie, mode 0600, removed at shutdown |
 | `bmcwallet.enc` / `bmcwallet.dat` (+ `.txlog`), `walletkeys.dat`, `walletscan.dat` | wallet container / plaintext store and journal, HD keys, rescan records |
 | `onion_v3_private_key`, `i2p_private_key` | persisted onion service key and I2P destination |
+| `rev%05u.dat` + `undo.idx` | undo data for every block (2026-09-08; Core's rev files). Pruned only with the block store. A node upgraded from the per-height `undo_<h>.dat` files folds them in at start; older history needs `-reindex-chainstate` |
 | `txindex.dat` + `txindex.tail`, `addr_index.dat`, `bfilters.dat` + `bfilters.idx`, `coinstats.dat` | optional indexes |
 | `debug.log` | the daemon's log, everything, as Core (since 2026-09-08; before that only the leveled logger's lines; `logs/bitcoind.log` before 2026-09-06) |
 

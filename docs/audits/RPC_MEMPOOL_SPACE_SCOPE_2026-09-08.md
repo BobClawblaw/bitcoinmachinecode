@@ -59,7 +59,14 @@ getblocktemplate, uptime, validateaddress.
 | block-level keys of `getblock` | 20 keys | all 20 present | none |
 | tx-level keys of `getblock` 2 | txid hash version size vsize weight locktime vin vout hex fee | all but `fee` outside the window | see above |
 
-## The one design decision
+## Decided 2026-09-08: keep all undo, like Core
+
+Landed as `docs/releases/2026-09-08-undo-keep-all.md`: every "outside the
+window" row above becomes "for every block the node has applied on this
+build"; production's history before the deploy needs `-reindex-chainstate`
+once. The section below is kept as the record of the choice.
+
+## The one design decision (as it stood before the decision)
 
 Core keeps undo data for every block (the `rev*.dat` files) unless the
 node is pruned; this node keeps a 200-block ring of per-block undo files.

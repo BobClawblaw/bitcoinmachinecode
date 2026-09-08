@@ -944,8 +944,8 @@ static void case_undo_preflight_gate(void){
 
     /* Delete one height's undo data, simulating it having been pruned away or
      * lost. The reorg MUST refuse rather than produce a wrong UTXO set. */
-    char p[64]; snprintf(p,sizeof p,"undo_%ld.dat", tip_before-1);
-    ck("undo file existed before we removed it", unlink(p), 0);
+    { extern long undo_discard(long height);   /* 2026-09-08: the packed store; discard clears the entry */
+      ck("undo data existed before we removed it", undo_discard(tip_before-1), 1); }
 
     ck("reorg_execute REFUSES when undo data is missing",
        reorg_execute(store_buf, nbase-1, nlose+1, memsrc, &(memsrc_t){win,nlose+1}), 0);

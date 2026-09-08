@@ -9594,8 +9594,12 @@ int main(int argc, char** argv){
             case ARCHIVE_PRUNE_OK:
                 fprintf(stderr,"[prune] budget %ld MiB -> retaining from height %ld; deleting below it\n",
                         g_cfg.prune_mib, ph);
-                if(store_prune(store_buf, (int)ph) == 1)
+                if(store_prune(store_buf, (int)ph) == 1){
                     fprintf(stderr,"[prune] done: block data below height %ld removed\n", ph);
+                    /* 2026-09-08: undo follows the block store (Core deletes the rev file with its blk file) */
+                    { extern long undo_prune_below(long keep_from); long uf = undo_prune_below(ph);
+                      if(uf) fprintf(stderr,"[prune] undo: %ld rev file(s) wholly below height %ld removed\n", uf, ph); }
+                }
                 else
                     fprintf(stderr,"[prune] store_prune FAILED -- archive left as it was\n");
                 break;

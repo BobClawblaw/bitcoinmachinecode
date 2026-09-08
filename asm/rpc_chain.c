@@ -51,6 +51,7 @@
  *   - uptime/stop apply to THIS RPC process (bitcoin_rpcd), which is not the
  *     block-relaying node; stop's reply names this project, not Core.
  */
+#include "daemon/undo_store.h"
 #include "rpc_chain.h"
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -694,14 +695,13 @@ typedef struct {
  * entry count, or -1 (absent/pruned/garbage) with *raw NULL. */
 static long undo_block_load(long h, undo_prevout_t* out, long cap, u8** raw){
     *raw = NULL;
-    char path[64]; snprintf(path, sizeof path, "undo_%ld.dat", h);
-    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
-    struct stat sb; if (fstat(fd, &sb) != 0 || sb.st_size <= 0){ close(fd); return -1; }
-    u8* buf = malloc((size_t)sb.st_size); if (!buf){ close(fd); return -1; }
-    long got = 0; ssize_t rd;
-    while (got < sb.st_size && (rd = pread(fd, buf+got, (size_t)(sb.st_size-got), got)) > 0) got += rd;
-    close(fd);
-    if (got != sb.st_size){ free(buf); return -1; }
+    /* 2026-09-08: the block's run from the packed store (undo_store.h); a
+     * torn run (no END marker) is unusable, as trailing garbage was. */
+    u8* buf = 0; int torn = 0;
+    long run_len = us_read_run(h, &buf, &torn);
+    if (run_len < 0) return -1;
+    if (torn){ free(buf); return -1; }
+    struct { long st_size; } sb = { run_len };
     long n = 0, off = 0;
     while (off + 51 <= sb.st_size && n < cap){
         u32 slen = (u32)buf[off+49] | ((u32)buf[off+50] << 8);
@@ -720,14 +720,14 @@ static long undo_block_load(long h, undo_prevout_t* out, long cap, u8** raw){
 }
 
 static long undo_block_values(long h, u64* out, long cap){
-    char path[64]; snprintf(path, sizeof path, "undo_%ld.dat", h);
-    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
-    struct stat sb; if (fstat(fd, &sb) != 0 || sb.st_size <= 0){ close(fd); return -1; }
-    u8* buf = malloc((size_t)sb.st_size); if (!buf){ close(fd); return -1; }
-    long got = 0, off = 0; ssize_t rd;
-    while (got < sb.st_size && (rd = pread(fd, buf+got, (size_t)(sb.st_size-got), got)) > 0) got += rd;
-    close(fd);
-    if (got != sb.st_size){ free(buf); return -1; }
+    /* 2026-09-08: the block's run from the packed store (undo_store.h); a
+     * torn run (no END marker) is unusable, as trailing garbage was. */
+    u8* buf = 0; int torn = 0;
+    long run_len = us_read_run(h, &buf, &torn);
+    if (run_len < 0) return -1;
+    if (torn){ free(buf); return -1; }
+    struct { long st_size; } sb = { run_len };
+    long off = 0;
     long n = 0;
     while (off + 51 <= sb.st_size && n < cap){
         out[n++] = rd64(buf + off + 36);            /* value at offset 36 */
@@ -742,14 +742,14 @@ static long undo_block_values(long h, u64* out, long cap){
  * (for getblockstats' utxo_size_inc). Fills vals[] and slens[] in block order;
  * returns count or -1 (absent/pruned/garbage). */
 static long undo_block_prevouts(long h, u64* vals, u32* slens, long cap){
-    char path[64]; snprintf(path, sizeof path, "undo_%ld.dat", h);
-    int fd = open(path, O_RDONLY); if (fd < 0) return -1;
-    struct stat sb; if (fstat(fd, &sb) != 0 || sb.st_size <= 0){ close(fd); return -1; }
-    u8* buf = malloc((size_t)sb.st_size); if (!buf){ close(fd); return -1; }
-    long got = 0, off = 0; ssize_t rd;
-    while (got < sb.st_size && (rd = pread(fd, buf+got, (size_t)(sb.st_size-got), got)) > 0) got += rd;
-    close(fd);
-    if (got != sb.st_size){ free(buf); return -1; }
+    /* 2026-09-08: the block's run from the packed store (undo_store.h); a
+     * torn run (no END marker) is unusable, as trailing garbage was. */
+    u8* buf = 0; int torn = 0;
+    long run_len = us_read_run(h, &buf, &torn);
+    if (run_len < 0) return -1;
+    if (torn){ free(buf); return -1; }
+    struct { long st_size; } sb = { run_len };
+    long off = 0;
     long n = 0;
     while (off + 51 <= sb.st_size && n < cap){
         u32 slen = (u32)buf[off+49] | ((u32)buf[off+50] << 8);
@@ -3400,9 +3400,9 @@ static int cmd_verifychain(const rj_val* params, rj_val** res, long* ec, const c
             if (!vc_merkle_ok(g_blockbuf, blen, g_blockbuf + 36)){ ok = 0; break; }
         }
         if (level >= 2){
-            char up[64]; struct stat ub;
-            snprintf(up, sizeof up, "undo_%ld.dat", h);
-            if (stat(up, &ub) != 0 || ub.st_size <= 0){ ok = 0; break; }
+            /* 2026-09-08: the block's undo run must exist and be closed (END) */
+            { u8* ub = 0; int torn = 0; long ul = us_read_run(h, &ub, &torn); free(ub);
+              if (ul < 0 || torn){ ok = 0; break; } }
         }
     }
     *res = rj_bool(ok);
