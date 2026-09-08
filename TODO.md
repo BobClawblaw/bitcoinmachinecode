@@ -90,7 +90,7 @@ Everything below is landed on `arm-port` and pushed. History lives in
       (see the comment above `utxo_lsm_sort_desc`). A wrong order writes wrong
       runs, and a wrong run is a lost coin: diff-test it exactly like x86 did.
 - [ ] **Deploy `bmcbitcoind` when told go.** Candidate rebuilt against the merged
-      tree (`86d8ff75`, upstream through PR #94 + the
+      tree (`7542fc1d`, upstream through PR #98 + the
       g_p2p_write_hook port; predecessors `84a2bccb`/`2b98d3f1` stale). Two-step rename deploy: point the unit at
       `daemon_out/bmcbitcoind` + `daemon-reload`, AND retire `daemon_out/bitcoind`
       into `rollback/`. Until then the node runs arm-12 (`cfe86ed4`) — safe/stale,
