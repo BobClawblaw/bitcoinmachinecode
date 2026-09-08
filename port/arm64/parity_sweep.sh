@@ -506,12 +506,35 @@ ensure_asm_layout() {
         for n in $RPCD_NAMES; do ln -sf "$ARMRPCD" "$REPO/asm/daemon/$n"; done
     fi
     [ -x "$AB/$OUT/wallet_cli" ] && ln -sf "$AB/$OUT/wallet_cli" "$REPO/asm/daemon/wallet_cli"
+    # the wallet_cli TOOL was renamed to bmc_wallet_cli by upstream PR #85; the
+    # SOURCE file keeps its name and so does the ARM build output. The shared
+    # tests exec ./daemon/bmc_wallet_cli (test_e2e_sighash.c:164,
+    # test_cli_prompt.c:42), so the symlink must carry the new name too.
+    [ -x "$AB/$OUT/wallet_cli" ] && ln -sf "$AB/$OUT/wallet_cli" "$REPO/asm/daemon/bmc_wallet_cli"
     [ -x "$AB/$OUT/bmc_cli" ] && ln -sf "$AB/$OUT/bmc_cli" "$REPO/asm/daemon/bmc_cli"
-    # the txo-spender index base builder (x86: asm/Makefile daemon/build_txospender_index)
-    if [ -x "$AB/$OUT/build_txospender_index" ]; then
-        ln -sf "$AB/$OUT/build_txospender_index" "$REPO/asm/daemon/build_txospender_index"
-    elif [ -x "$AB/build_txospender_index" ]; then
-        ln -sf "$AB/build_txospender_index" "$REPO/asm/daemon/build_txospender_index"
+    # daemon/bmc_build_txospender_index: the txo-spender index base builder.
+    # Renamed from build_txospender_index by upstream PR #85 (85 merge, 2026-09-07);
+    # the SOURCE file keeps its name, per the naming convention. The shared test
+    # (test_txospender_index.c:44) execs ./daemon/bmc_build_txospender_index, so
+    # build it here if absent and symlink under the bmc_ name. Link list mirrors
+    # asm/Makefile's rule (daemon/build_txospender_index.c + the store/tx/hash
+    # objects as sources); the first run of this after the rename found only a
+    # stale parity_out/build_txospender_index and 12 checks cascaded from
+    # "FAIL: builder ran".
+    if [ ! -x "$AB/$OUT/bmc_build_txospender_index" ]; then
+        # link list mirrors asm/Makefile's daemon/bmc_build_txospender_index rule,
+        # against THIS port's objects (the same ones the daemon and the sweep's
+        # rpcd link): the tool's C is arch-neutral, the modules are ARM twins.
+        (cd "$AB" && gcc -no-pie -O2 -Wl,-z,relro,-z,now -lpthread \
+          -I../../asm -I../../asm/daemon \
+          -o "$OUT/bmc_build_txospender_index" \
+          ../../asm/daemon/build_txospender_index.c \
+          sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_store.o bitcoin_store_fast.o) \
+        2>> "$AB/$OUT/build.log" \
+        || echo -e "build-fail\tSPECIAL:bmc_build_txospender_index\tsee build.log" >> "$AB/$OUT/results.tsv"
+    fi
+    if [ -x "$AB/$OUT/bmc_build_txospender_index" ]; then
+        ln -sf "$AB/$OUT/bmc_build_txospender_index" "$REPO/asm/daemon/bmc_build_txospender_index"
     fi
     return 0
 }
