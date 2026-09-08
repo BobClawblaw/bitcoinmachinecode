@@ -85,6 +85,7 @@ also annotated tags.
 | [`releases/2026-09-08-debuglog.md`](releases/2026-09-08-debuglog.md) | the daemon logs to `<chaindir>/debug.log` like Core; `printtoconsole=1` tees; `debuglogfile=0` turns the file off |
 | [`releases/2026-09-08-cli-params.md`](releases/2026-09-08-cli-params.md) | `bmc_cli` converts arguments like bitcoin-cli and prints replies of any size; the config parser strips a trailing `#` comment |
 | [`releases/2026-09-08-in-order-committer.md`](releases/2026-09-08-in-order-committer.md) | workers stage verified chunks; one committer appends the archive in height order, so the block files are laid out monotonically and the archive never has a hole |
+| [`releases/2026-09-08-committer-sync-per-chunk.md`](releases/2026-09-08-committer-sync-per-chunk.md) | the committer fdatasyncs once per chunk: the early chain went from the SSD's commit rate to the link's 11 MB/s |
 
 ## Development history
 
