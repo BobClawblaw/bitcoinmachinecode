@@ -59,7 +59,14 @@ getblocktemplate, uptime, validateaddress.
 | block-level keys of `getblock` | 20 keys | all 20 present | none |
 | tx-level keys of `getblock` 2 | txid hash version size vsize weight locktime vin vout hex fee | all but `fee` outside the window | see above |
 
-## The one design decision
+## Decided 2026-09-08: keep all undo, like Core
+
+Landed as `docs/releases/2026-09-08-undo-keep-all.md`: every "outside the
+window" row above becomes "for every block the node has applied on this
+build"; production's history before the deploy needs `-reindex-chainstate`
+once. The section below is kept as the record of the choice.
+
+## The one design decision (as it stood before the decision)
 
 Core keeps undo data for every block (the `rev*.dat` files) unless the
 node is pruned; this node keeps a 200-block ring of per-block undo files.
@@ -90,3 +97,35 @@ Config: `CORE_RPC` 127.0.0.1:8332 with the production cookie
 `/mnt/2tbssd/mempool-cache`. Logs to wherever stdout goes
 (`/mnt/2tbssd/mempool-backend.log` in this session's runs). The frontend
 is not built yet.
+
+## Afternoon: the Esplora facade, and what it found
+
+`bmc.esploraport` (PR #100, #103) gives mempool.space its `BACKEND: "esplora"`,
+served in process from the node's own RPC handlers; the frontend's
+Esplora-style paths (`/api/tx`, `/api/block/.../txs`, `/api/address`) go
+straight to it (the dev proxy's `local-esplora` entry, port 3005 here). The
+facade exercised the RPC surface harder than anything before it and found:
+
+| found | fix |
+|---|---|
+| `getrawtransaction` verbosity 2 lost fee and prevouts for any block with more than 1,024 inputs (a fixed array) | #102 |
+| through the txindex it never located a transaction's undo slice (index read as 0, the coinbase's) | rawtx-txindex-prevout |
+| the walk summing earlier inputs started at the block header, so every transaction after the first got the first one's prevouts and fee, on both paths | rawtx-txindex-prevout |
+| `gettxout` is a socketpair request to the download worker; a batch of thousands under the RPC execution lock starved production's RPC for eleven minutes | #103 (lock per dispatch; prevouts from the previous transaction) |
+| the txospender index is 98 GB on mainnet, not the documented 35 | docs |
+
+Address and scripthash routes answer 501: the address index on disk is a
+reverse UTXO index plus a tail journal, not the history Esplora's
+`chain_stats`, `txs` and `utxo` want. Stage 2 is that history index
+(keyed like the existing one, per address: every funding and spending
+event with height, position, value), its builder over the undo data now
+kept for every block, the daemon's tail for new blocks, and the routes.
+
+## Stage 2, built the same day
+
+`docs/releases/2026-09-08-address-history.md`. The estimate given earlier
+in the day (30 to 40 GB) was wrong by a factor of five: a history that
+keeps a value per event and a 33-byte key per address is about 200 GB
+uncompressed on mainnet. Still a quarter of a true Esplora, with no
+second process. A varint-packed layout could roughly halve it later.
+

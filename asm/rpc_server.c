@@ -1019,6 +1019,81 @@ static void service_conn(int cfd) {
     free(buf);
 }
 
+/* ---- the Esplora facade listener (2026-09-08) ------------------------------
+ * A second port, no authentication (Esplora has none; mempool.space's client
+ * sends none), every request routed to rpc_esplora.c under the same
+ * g_exec_lock the JSON-RPC path holds, so the handlers never run twice at
+ * once. One thread per connection, capped. */
+#include "rpc_esplora.h"
+static int g_esp_fd = -1;
+static volatile int g_esp_live = 0;
+#define ESP_MAX_CONN 16
+static void* esp_conn_thread(void* arg){
+    int cfd = (int)(long)arg;
+    struct timeval tv = { 60, 0 }; setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    size_t cap = 65536, got = 0; char* buf = malloc(cap); const char* hdrend = 0;
+    if (!buf){ close(cfd); __sync_fetch_and_sub(&g_esp_live, 1); return 0; }
+    for (;;){
+        if (got + 1 >= cap){ if (cap >= (8u << 20)) break; size_t hoff = hdrend ? (size_t)(hdrend - buf) : 0; char* nb = realloc(buf, cap * 2); if (!nb) break; buf = nb; cap *= 2; if (hdrend) hdrend = buf + hoff; }
+        ssize_t n = read(cfd, buf + got, cap - 1 - got);
+        if (n <= 0) break;
+        got += (size_t)n; buf[got] = 0;
+        if (!hdrend){ char* e = strstr(buf, "\r\n\r\n"); if (e) hdrend = e; }
+        if (hdrend){
+            const char* cl = find_header(buf, (size_t)(hdrend - buf), "Content-Length", 14);
+            long nv = cl ? strtol(cl, NULL, 10) : 0;
+            if ((long)(got - ((size_t)(hdrend - buf) + 4)) >= nv) break;
+        }
+    }
+    const char *m, *path, *body; size_t mlen, plen, blen;
+    if (got == 0 || !http_request_parse(buf, got, &m, &mlen, &path, &plen, &body, &blen)){
+        const char* e = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"; (void)write_all(cfd, e, strlen(e));
+        free(buf); close(cfd); __sync_fetch_and_sub(&g_esp_live, 1); return 0;
+    }
+    char* out = 0; size_t outlen = 0; int status = 500; const char* ctype = "text/plain";
+    /* the lock is taken per dispatch inside the facade (esplora_set_exec_lock),
+     * so a batch route cannot starve the JSON-RPC callers */
+    esplora_handle(m, mlen, path, plen, body, blen, g_wallet, &out, &outlen, &status, &ctype);
+    char hdr[256];
+    int hl = snprintf(hdr, sizeof hdr, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %zu\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+                      status, status_text(status), ctype, outlen);
+    (void)write_all(cfd, hdr, (size_t)hl);
+    if (out && outlen) (void)write_all(cfd, out, outlen);
+    free(out); free(buf); close(cfd);
+    __sync_fetch_and_sub(&g_esp_live, 1);
+    return 0;
+}
+static void* esp_server_thread(void* arg){
+    (void)arg;
+    for (;;){
+        struct sockaddr_storage cli; socklen_t cl = sizeof cli;
+        int c = accept(g_esp_fd, (struct sockaddr*)&cli, &cl);
+        if (c < 0){ if (errno == EMFILE || errno == ENFILE){ struct timespec ts = { 0, 50 * 1000 * 1000 }; nanosleep(&ts, NULL); } continue; }
+        if (g_esp_live >= ESP_MAX_CONN){ const char* e = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n"; (void)write_all(c, e, strlen(e)); close(c); continue; }
+        __sync_fetch_and_add(&g_esp_live, 1);
+        pthread_t th;
+        if (bmc_pthread_create(&th, esp_conn_thread, (void*)(long)c) != 0){ close(c); __sync_fetch_and_sub(&g_esp_live, 1); continue; }
+        pthread_detach(th);
+    }
+    return 0;
+}
+static void esp_lock(void){ pthread_mutex_lock(&g_exec_lock); }
+static void esp_unlock(void){ pthread_mutex_unlock(&g_exec_lock); }
+int rpc_esplora_start(const char* bind_addr, int port, char* errmsg, size_t errcap){
+    if (port <= 0) return 0;
+    esplora_set_exec_lock(esp_lock, esp_unlock);
+    struct sockaddr_in a; memset(&a, 0, sizeof a); a.sin_family = AF_INET; a.sin_port = htons((unsigned short)port);
+    if (!bind_addr || !*bind_addr) bind_addr = "127.0.0.1";
+    if (inet_pton(AF_INET, bind_addr, &a.sin_addr) != 1){ snprintf(errmsg, errcap, "bmc.esplorabind=%s is not an IPv4 address", bind_addr); return -1; }
+    int fd = socket(AF_INET, SOCK_STREAM, 0); if (fd < 0){ snprintf(errmsg, errcap, "socket: %s", strerror(errno)); return -1; }
+    int one = 1; setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    if (bind(fd, (struct sockaddr*)&a, sizeof a) < 0){ snprintf(errmsg, errcap, "bind %s:%d: %s", bind_addr, port, strerror(errno)); close(fd); return -1; }
+    if (listen(fd, 64) < 0){ snprintf(errmsg, errcap, "listen: %s", strerror(errno)); close(fd); return -1; }
+    g_esp_fd = fd;
+    pthread_t th; if (bmc_pthread_create(&th, esp_server_thread, 0) != 0){ snprintf(errmsg, errcap, "thread: %s", strerror(errno)); close(fd); g_esp_fd = -1; return -1; }
+    pthread_detach(th);
+    return 0;
+}
 static void* server_thread(void* arg) {
     (void)arg;
     while (g_run) {

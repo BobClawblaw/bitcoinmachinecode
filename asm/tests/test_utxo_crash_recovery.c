@@ -277,7 +277,7 @@ static void run_scenario(const scen_t* s){
             ckm("a flush landed INSIDE the crashed block (run files grew while the child ran)", runs_after > runs_before);
 
         ck("on-disk checkpoint still 149 (block 150 never checkpointed)", read_checkpoint_file(), NCB-1);
-        ckm("undo_150.dat exists (block 150 began applying)", access("undo_150.dat", F_OK) == 0);
+        { extern int undo_exists(long height); ckm("undo data for 150 exists (block 150 began applying)", undo_exists(150)); }
 
         /* Real restart. */
         ck("utxo_live_init (post-crash reload)", utxo_live_init("."), 1);

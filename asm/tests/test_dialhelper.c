@@ -267,6 +267,15 @@ int main(void){
       { /* a fork: overlaps our height 2 with a DIFFERENT block */
         unsigned char f2[80]; mk_hdr(f2, hh1, 0x99); unsigned char fp_[1][80]; memcpy(fp_[0], f2, 80);
         HFETCH(0, 1, fp_, "a page that forks from our chain at a held height: refused, store unchanged (count 4)", res == -1 && hst_count(hst) == 4); }
+      { /* a peer BEHIND us (2026-09-08): answers from an earlier locator point
+         * with a page that ends below our tip -- every header one we hold.
+         * Before the fix the overlap verified, nothing was appended, and the
+         * fetch returned 0 ("already current"); on a full page the loop asked
+         * the same locator again and production walked 415 identical pages
+         * from a node ~100k blocks behind. Now: -1, the next peer is tried. */
+        unsigned char h3b[80]; mk_hdr(h3b, hh2, 0x13);          /* == our height 3 (mk_hdr is deterministic) */
+        unsigned char bp2[2][80]; memcpy(bp2[0], h2, 80); memcpy(bp2[1], h3b, 80);
+        HFETCH(0, 2, bp2, "a page from an earlier locator point that ends BELOW our tip (a peer behind us): refused (-1), store unchanged (count 4)", res == -1 && hst_count(hst) == 4); }
       { /* VAL-5 (audit 2026-09-03): a header that CHAINS to our tip but fails
          * its own PoW must never be appended. Deterministic construction:
          * nBits exponent 4 / mantissa 1 -> target = 256, i.e. ~2^-248 of all
@@ -327,6 +336,13 @@ int main(void){
         ok(dlc_pick_peer(4, 0, e3, c3, b3, 400.0) == 1, "...untried gone: the 300 KB/s peer (1), NOT the dead-marked one -- it is measured, not untried");
         c3[1] = 1;
         ok(dlc_pick_peer(4, 0, e3, c3, b3, 400.0) == 2, "...and only the dead-marked one left: still returned rather than no peer (2)"); }
+      /* the far-behind trigger's height (2026-09-08): one liar cannot start
+       * the parallel downloader; two agreeing peers can */
+      { long one[1] = { 969817 }; long two[2] = { 969817, 966063 }; long many[5] = { 966063, 966063, 969817, 966062, 966063 };
+        ok(dl_trigger_height(one, 1) == 969817, "a single peer: its own claim (a fresh node with one peer must still sync)");
+        ok(dl_trigger_height(two, 2) == 966063, "two peers, one claiming 969,817: the second-highest, 966,063");
+        ok(dl_trigger_height(many, 5) == 966063, "five peers with one liar: 966,063");
+        ok(dl_trigger_height(many, 0) == 0, "no peers: 0"); }
       /* the download window and the retry ring ("write out monotonically,
        * like Core does"): a chunk is never claimed more than 1024 blocks
        * above the first hole, and an abandoned chunk is retried, never left. */
@@ -408,7 +424,44 @@ int main(void){
           ok(ctl2[DLC_CTL_FIRST_HOLE] == 180 && ctl2[DLC_CTL_COMMIT_TIP] == 179 && ctl2[DLC_CTL_N_COMMIT] == 2 && ctl2[DLC_CTL_STAGED] == 0,
              "...first hole 180 and committed tip 179 published, 2 commits counted, the gauge back to 0");
           ok(!dlc_stage_exists(100) && !dlc_stage_exists(140), "...and both files are gone; it exited at the missing chunk because STOP was set");
+          /* the cursor-stall help (run 18 sat six minutes behind one trickling
+           * peer while 85 chunks above were staged): a missing cursor chunk is
+           * published after the help delay, a worker takes it, and the want
+           * is cleared the moment the chunk commits */
+          { volatile long* ctl3 = mmap(0, (DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+            for (long i = 0; i < DLC_CTL_RING + DLC_RETRY_MAX; i++) ctl3[i] = i < DLC_CTL_RING ? 0 : -1;
+            ctl3[DLC_CTL_FIRST_HOLE] = 300; ctl3[DLC_CTL_CURSOR_WANT] = -1;
+            g_dlc_cursor_help_ms = 300;                   /* the seam: 300 ms instead of 10 s */
+            pid_t cp = fork();
+            if (cp == 0){ int rc = dlc_committer_run(ctl3, 300, 379, 0, rec_append, 0, 20, 0, 0); _exit(rc); }
+            usleep(700000);
+            ok(ctl3[DLC_CTL_CURSOR_WANT] == -1, "with nothing staged above it, a missing cursor chunk is NOT published (the pool has not moved on)");
+            /* the pool has moved on: a third of the window staged ABOVE the cursor, as
+             * real files -- the committer recounts the gauge from the directory */
+            for (int k = 0; k <= DLC_CURSOR_HELP_MIN_STAGED; k++) stage_chunk(380 + 40L * k, 40);
+            ctl3[DLC_CTL_STAGED] = DLC_CURSOR_HELP_MIN_STAGED + 1;
+            long waited = 0; while (ctl3[DLC_CTL_CURSOR_WANT] != 300 && waited < 5000){ usleep(20000); waited += 20; }
+            ok(ctl3[DLC_CTL_CURSOR_WANT] == 300, "with a third of the window staged above it, the missing cursor chunk (300) is published after the delay");
+            stage_chunk(300, 40);                          /* the helper delivered it */
+            waited = 0; while (ctl3[DLC_CTL_CURSOR_WANT] != -1 && waited < 5000){ usleep(20000); waited += 20; }
+            ok(ctl3[DLC_CTL_CURSOR_WANT] == -1 && ctl3[DLC_CTL_COMMIT_TIP] == 339, "...the chunk commits and the want is cleared; committed tip 339");
+            waited = 0; while (ctl3[DLC_CTL_CURSOR_WANT] != 340 && waited < 5000){ usleep(20000); waited += 20; }
+            ok(ctl3[DLC_CTL_CURSOR_WANT] == 340, "...the next missing chunk (340) is published in its turn");
+            ctl3[DLC_CTL_STOP_COMMIT] = 1; int st = 0; waitpid(cp, &st, 0);
+            ok(WIFEXITED(st) && WEXITSTATUS(st) == 0 && ctl3[DLC_CTL_CURSOR_WANT] == -1, "STOP ends the run and clears the want");
+            g_dlc_cursor_help_ms = DLC_CURSOR_HELP_SECS * 1000L;
+            dlc_stage_wipe();
+            munmap((void*)ctl3, (DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long)); }
           ok(g_synced_n == 2, "...and the store was synced once per committed chunk (2), not once per block (80)");
+          /* stale staged files wholly below the cursor are swept and the gauge
+           * becomes the directory's count (run 18 held six stale files that
+           * inflated the gauge gating the cursor help) */
+          { stage_chunk(20, 40); stage_chunk(60, 40); stage_chunk(180, 40); stage_chunk(220, 40);
+            static volatile long ctl5[DLC_CTL_RING + DLC_RETRY_MAX]; ctl5[DLC_CTL_STAGED] = 99;
+            long swept = dlc_stage_sweep(180, ctl5);
+            ok(swept == 2 && !dlc_stage_exists(20) && !dlc_stage_exists(60), "chunks 20 and 60 (wholly below cursor 180) are swept");
+            ok(dlc_stage_exists(180) && dlc_stage_exists(220) && ctl5[DLC_CTL_STAGED] == 2, "chunks 180 and 220 stay; the gauge is recounted from the directory (2, not 99)");
+            ok(dlc_stage_wipe() == 2, "(cleanup)"); }
           /* the window's help guard, and the next run's wipe */
           stage_chunk(180, 40);
           ok(dlc_stage_exists(180), "a staged chunk is visible to the help guard: the worker must not refetch it");

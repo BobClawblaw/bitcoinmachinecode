@@ -1,27 +1,53 @@
-/* daemon/undo_log.c -- per-block undo data: what a block's inputs spent,
- * captured as the block is applied so it can be disconnected again, and read
- * back for fees and prevouts.
+/* daemon/undo_log.c -- Stage A reorg/fork-choice primitive #5 (per-block
+ * undo-data structure). 100% AI-generated, plain C.
  *
- * 2026-09-08: kept for EVERY block, like Core's rev*.dat, on the packed store
- * of daemon/undo_store.h (rev%05u.dat runs + undo.idx). Before that each
- * height had its own undo_<h>.dat and a 200-block window deleted them, which
- * capped reorg depth, fee/prevout answers and the address-index backfill at
- * 200 blocks. The API below is unchanged for its callers; only where the
- * bytes live changed. Two additions: undo_commit(height) closes a block's run
- * with the END marker (apply_block_at calls it; a block that spent nothing
- * still gets an entry so "undo exists for h" means "h was applied"), and
- * undo_exists(height) replaces the callers' stat() of the old file name.
- * Legacy undo_<h>.dat files are folded into the store once at start
- * (undo_migrate_legacy) so an upgraded node keeps its recent history.
+ * STAGE B UPDATE -- THIS IS NOW LIVE. Stage A deliberately left this module
+ * unwired (its original note explained that adding the capture step to
+ * daemon/utxo_live.c's live_on_input meant editing a real-time call site the
+ * production daemon executes, which that stage's brief forbade). Stage B is
+ * the stage that does it: undo_capture_and_del is now called from
+ * live_on_input for every non-coinbase input of every block the live daemon
+ * applies, which is what makes a later DISCONNECT of those blocks possible
+ * at all. Stage B also adds undo_replay (streaming reader -- the disconnect
+ * path cannot afford undo_load's 10KB-per-record array), undo_discard, and
+ * undo_prune_from (bounded/resumable retention sweep). undo_append_record,
+ * undo_load, undo_prune and undo_capture_and_del are unchanged.
  *
- * Record (unchanged): txid[32] | index u32 | value u64 | height u32 |
- * is_coinbase u8 | slen u16 | script[slen]. `height` is the spent UTXO's
- * own creation height (needed to restore a coinbase output's maturity), NOT
- * the spending block's height, which names the run.
+ * PERFORMANCE NOTE for the now-live capture path: every spent input costs one
+ * extra utxo_lsm_get (to read the value+script before deleting) plus one
+ * open/write/close on undo_<height>.dat. The LSM's own header comment notes
+ * that utxo_lsm_get does a linear scan per candidate disk run and was written
+ * on the assumption of never being on a hot path -- it now is. See this
+ * stage's report; this is called out as something to measure under real
+ * mainnet block sizes before it is trusted at scale.
  *
- * Retention: undo_prune_below(keep_from) follows the block store's prune
- * gate (whole rev files, like Core); undo_prune/undo_prune_from are kept as
- * no-ops for their remaining callers and tests -- the window is gone. */
+ * Record format (one per spent input), written in order to a per-height
+ * file `undo_<height>.dat` (append-only; simplest possible layout given a
+ * bounded ~100-200 block retention window -- no separate index file is
+ * needed since consumers just read a whole small file sequentially):
+ *   txid[32] | index(u32 LE) | value(u64 LE) | height(u32 LE) |
+ *   is_coinbase(u8) | script_len(u16 LE) | script[script_len]
+ * (51-byte fixed header + variable-length script, back to back, no framing
+ * beyond that -- a reader just consumes records until EOF, mirroring how
+ * bitcoin_store.asm's blk%05u.dat framing is "read until you know you're
+ * done" rather than length-prefixed as a whole file).
+ *
+ * height/is_coinbase added 2026-08-19 (Stage D of PLAN_SCRIPT_VERIFY.md).
+ * CAREFUL: this record's `height` field is the spent UTXO's OWN original
+ * creation height (captured from utxo_lsm_get right before the spend) --
+ * NOT the height of the block doing the spending, which is a completely
+ * different value already used elsewhere (the undo FILE's own name,
+ * `undo_<consuming_block_height>.dat`). Losing this distinction would mean
+ * a reorg-restored coinbase output silently gets the WRONG creation height
+ * (or none at all), defeating the 100-block maturity check for exactly the
+ * blocks that most need reorg correctness.
+ *
+ * Retention: undo_prune(tip_height, window) removes undo_<h>.dat files for
+ * every h below (tip_height-window+1), mirroring bitcoin_store.asm's own
+ * store_prune in spirit (a cheap forward-only deletion sweep) though far
+ * simpler here since there's no byte-range compaction to do -- undo data is
+ * already one whole file per height, so "prune" is just unlink().
+ */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -30,7 +56,6 @@
 #include <sys/uio.h>
 #include <stdint.h>
 #include <time.h>
-#include "undo_store.h"
 
 typedef unsigned char u8;
 typedef unsigned int u32;
@@ -40,55 +65,41 @@ typedef unsigned long long u64;
 #define UNDO_MAX_SCRIPT 10000   /* generous vs. any real scriptPubKey */
 #define UNDO_HEADER_BYTES 51    /* 32 + 4 + 8 + 4 + 1 + 2 (was 46 before Stage D) */
 
-/* ---- writer state: one open rev file, one run at a time ------------------ */
-static int  g_undo_fd = -1;          /* the current rev file, O_APPEND */
-static long g_undo_fd_height = -1;   /* the height whose run is being written */
-static unsigned g_undo_file = 0;     /* its file number */
+static void undo_path(char out[64], long height){
+    snprintf(out, 64, "undo_%ld.dat", height);
+}
+
+/* undo_append_record(height, txid, index, value, utxo_height, is_coinbase,
+ *                    script, slen) -> 1 ok / -1 err
+ * `height` here is the CONSUMING block's height (the undo file this record
+ * is appended to); `utxo_height` is the spent UTXO's OWN original creation
+ * height, captured separately -- see this file's header comment. */
+/* The undo file of the block being applied stays open across the block
+ * (2026-09-01): open/write/write/close per spent input was four syscalls
+ * per input on the live replay. The writes are still immediate (O_APPEND,
+ * one writev per record), so what is on disk at any instant is exactly
+ * what it was before -- only the open/close pair moved to the block
+ * boundary. undo_close_current() is called by the apply loop after every
+ * block and by undo_discard/prune before unlinking the same height. */
+static int  g_undo_fd = -1;
+static long g_undo_fd_height = -1;
 void undo_close_current(void){
     if (g_undo_fd >= 0) close(g_undo_fd);
     g_undo_fd = -1; g_undo_fd_height = -1;
 }
-/* open the current rev file (rotating at UNDO_REV_MAX) and, for a height with
- * no entry yet, register the run's start = the file's end */
 static int undo_fd_for(long height){
     if (g_undo_fd >= 0 && g_undo_fd_height == height) return g_undo_fd;
-    /* moving on from a run that was never committed (a failed apply that
-     * nobody rolled back yet): close it with END so the next run in the file
-     * can never be read as its continuation. Its records stay as they are. */
-    if (g_undo_fd >= 0 && g_undo_fd_height >= 0 && g_undo_fd_height != height){
-        u8 end[UNDO_REC_HDR]; us_make_end(end, g_undo_fd_height);
-        if (write(g_undo_fd, end, UNDO_REC_HDR) != UNDO_REC_HDR){ undo_close_current(); return -1; }
-    }
     undo_close_current();
-    int ifd = us_idx_open_rw(); if (ifd < 0) return -1;
-    undo_slot_t s; int have = us_slot_get(height, &s);
-    unsigned file; unsigned long long off;
-    if (have == 1){ file = s.file; off = s.off; }
-    else {
-        file = us_cur_file(ifd);
-        char name[32]; us_rev_name(name, file);
-        struct stat sb; unsigned long long sz = (stat(name, &sb) == 0) ? (unsigned long long)sb.st_size : 0;
-        if (sz >= UNDO_REV_MAX){ file++; if (us_set_cur_file(ifd, file) != 0){ close(ifd); return -1; } sz = 0; }
-        off = sz;
-        if (us_slot_put(ifd, height, file, off) != 0){ close(ifd); return -1; }
-    }
-    close(ifd);
-    char name[32]; us_rev_name(name, file);
-    int fd = open(name, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    char path[64]; undo_path(path, height);
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (fd < 0) return -1;
-    g_undo_fd = fd; g_undo_fd_height = height; g_undo_file = file;
+    g_undo_fd = fd; g_undo_fd_height = height;
     return fd;
 }
-int undo_exists(long height){ return us_exists(height); }
-/* close block `height`'s run with the END marker (creating the run if the
- * block spent nothing). 1 ok, -1 write failure. */
-long undo_commit(long height){
-    int fd = undo_fd_for(height);
-    if (fd < 0) return -1;
-    u8 end[UNDO_REC_HDR]; us_make_end(end, height);
-    long w = write(fd, end, UNDO_REC_HDR);
-    undo_close_current();
-    return w == UNDO_REC_HDR ? 1 : -1;
+static int undo_unlink(long height){
+    if (g_undo_fd_height == height) undo_close_current();
+    char path[64]; undo_path(path, height);
+    return unlink(path);
 }
 
 long undo_append_record(long height, const u8 txid[32], u32 index, u64 value,
@@ -127,25 +138,31 @@ typedef struct {
  * a height with no spends, or one that's already been pruned/never
  * existed, both legitimately read back as "nothing here"). */
 long undo_load(long height, undo_rec_t* out, long max_recs){
-    u8* buf = 0; int torn = 0;
-    long len = us_read_run(height, &buf, &torn);
-    if (len < 0) return 0;                       /* absent == empty, as before */
-    if (torn){ free(buf); return -1; }           /* a torn run is malformed to the strict loader */
-    long n = 0, off = 0;
-    while (n < max_recs && off + UNDO_HEADER_BYTES <= len){
-        const u8* hdr = buf + off;
+    char path[64]; undo_path(path, height);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+
+    long n = 0;
+    while (n < max_recs) {
+        u8 hdr[UNDO_HEADER_BYTES];
+        long r = read(fd, hdr, UNDO_HEADER_BYTES);
+        if (r == 0) break;                 /* clean EOF between records */
+        if (r != UNDO_HEADER_BYTES) { close(fd); return -1; }
+
         memcpy(out[n].txid, hdr, 32);
         memcpy(&out[n].index, hdr+32, 4);
         memcpy(&out[n].value, hdr+36, 8);
         memcpy(&out[n].height, hdr+44, 4);
         out[n].is_coinbase = hdr[48];
         memcpy(&out[n].slen, hdr+49, 2);
-        if (out[n].slen > UNDO_MAX_SCRIPT || off + UNDO_HEADER_BYTES + out[n].slen > len){ free(buf); return -1; }
-        memcpy(out[n].script, hdr + UNDO_HEADER_BYTES, out[n].slen);
-        off += UNDO_HEADER_BYTES + out[n].slen;
+        if (out[n].slen > UNDO_MAX_SCRIPT) { close(fd); return -1; }
+        if (out[n].slen > 0) {
+            long sr = read(fd, out[n].script, out[n].slen);
+            if (sr != (long)out[n].slen) { close(fd); return -1; }
+        }
         n++;
     }
-    free(buf);
+    close(fd);
     return n;
 }
 
@@ -170,26 +187,45 @@ typedef int (*undo_replay_cb)(void* ctx, const u8 txid[32], u32 index,
                                const u8* script, u16 slen);
 
 static long undo_replay_impl(long height, undo_replay_cb cb, void* ctx, int tolerant, int* torn){
-    u8* buf = 0; int t = 0;
-    long len = us_read_run(height, &buf, &t);
-    if (len < 0) return 0;            /* same contract as undo_load: absent == empty */
-    if (t && !tolerant){ free(buf); return -1; }
-    if (t && torn) *torn = 1;
-    long n = 0, off = 0;
-    while (off + UNDO_HEADER_BYTES <= len){
-        const u8* hdr = buf + off;
+    char path[64]; undo_path(path, height);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;            /* same contract as undo_load: absent == empty */
+
+    static u8 script[UNDO_MAX_SCRIPT];
+    long n = 0;
+    for (;;) {
+        u8 hdr[UNDO_HEADER_BYTES];
+        long r = read(fd, hdr, UNDO_HEADER_BYTES);
+        if (r == 0) break;
+        if (r != UNDO_HEADER_BYTES) {
+            /* Short header at the tail: undo_append_record died between
+             * open and its first write completing (or a power loss tore
+             * it). The matching delete never ran, so in tolerant mode this
+             * is end-of-file, not corruption. */
+            if (tolerant && r > 0) { if (torn) *torn = 1; break; }
+            close(fd); return -1;
+        }
         u32 index; u64 value; u32 utxo_height; u8 is_coinbase; u16 slen;
         memcpy(&index, hdr+32, 4);
         memcpy(&value, hdr+36, 8);
         memcpy(&utxo_height, hdr+44, 4);
         is_coinbase = hdr[48];
         memcpy(&slen,  hdr+49, 2);
-        if (slen > UNDO_MAX_SCRIPT || off + UNDO_HEADER_BYTES + slen > len){ free(buf); return -1; }
-        if (cb && !cb(ctx, hdr, index, value, utxo_height, is_coinbase, hdr + UNDO_HEADER_BYTES, slen)){ free(buf); return -1; }
-        off += UNDO_HEADER_BYTES + slen;
+        if (slen > UNDO_MAX_SCRIPT) { close(fd); return -1; }
+        if (slen > 0) {
+            long sr = read(fd, script, slen);
+            if (sr != (long)slen) {
+                /* Header landed, script didn't: the kill hit between
+                 * undo_append_record's two write()s. Same reasoning --
+                 * the delete that follows the append never happened. */
+                if (tolerant && sr >= 0) { if (torn) *torn = 1; break; }
+                close(fd); return -1;
+            }
+        }
+        if (cb && !cb(ctx, hdr, index, value, utxo_height, is_coinbase, script, slen)) { close(fd); return -1; }
         n++;
     }
-    free(buf);
+    close(fd);
     return n;
 }
 
@@ -217,62 +253,52 @@ long undo_replay_tolerant(long height, undo_replay_cb cb, void* ctx, int* torn){
  * undo_append_record opens with O_APPEND, so a stale file left in place
  * would be silently PREPENDED to the new block's records). */
 long undo_discard(long height){
-    if (g_undo_fd_height == height) undo_close_current();
-    return us_slot_clear(height) == 1 ? 1 : 0;
+    return undo_unlink(height) == 0 ? 1 : 0;
 }
 
-/* Retention follows the block store now (2026-09-08). undo_prune_from and
- * undo_prune were the 200-block window; they keep their signatures for the
- * callers and tests that still name them and do nothing: undo data is kept
- * for every block the node keeps. */
+/* undo_prune_from(from_height, tip_height, window, max_scan)
+ *   -> the height the sweep reached (a resumable cursor), or -1 on bad args.
+ *
+ * Bounded, resumable variant of undo_prune below. undo_prune restarts its
+ * unlink sweep at h=0 on EVERY call: wired into a per-block flow on a store
+ * whose tip is ~974k, that is ~974,000 failing unlink() syscalls per block
+ * applied, forever. This variant starts at a caller-held cursor and examines
+ * at most `max_scan` heights per call, returning the new cursor -- so the
+ * steady-state per-block cost is O(1) and a cold start (cursor 0 on a deep
+ * store) is amortised over several calls instead of stalling one.
+ * undo_prune is left byte-for-byte unchanged (tests/test_undo_log.c covers
+ * its exact existing semantics).
+ */
 long undo_prune_from(long from_height, long tip_height, long window, long max_scan){
-    (void)tip_height; (void)window; (void)max_scan;
-    return from_height < 0 ? 0 : from_height;
-}
-long undo_prune(long tip_height, long window){ (void)tip_height; (void)window; return 0; }
-/* the block store pruned below keep_from: drop the rev files that hold only
- * lower heights (whole files, like Core). Returns files removed. */
-long undo_prune_below(long keep_from){
-    undo_close_current();
-    return keep_from > 0 ? us_prune_below(keep_from) : 0;
-}
-/* the UTXO state is being rebuilt from scratch: drop every undo file */
-long undo_wipe(void){ undo_close_current(); return us_wipe(); }
-
-/* One-time migration of the pre-2026-09-08 per-height files: each
- * undo_<h>.dat becomes h's run in the store (records copied, END added), then
- * the file is deleted. A torn legacy file (no END could be proven) is copied
- * as it is and left WITHOUT an END marker, so recovery still sees it as torn.
- * Returns the number of files migrated. */
-long undo_migrate_legacy(void){
-    DIR* d = opendir("."); if (!d) return 0;
-    struct dirent* e; long n = 0;
-    while ((e = readdir(d))){
-        long h; char tail[8];
-        if (sscanf(e->d_name, "undo_%ld.da%7s", &h, tail) != 2 || strcmp(tail, "t") != 0 || h < 0) continue;
-        if (us_exists(h)){ unlink(e->d_name); continue; }      /* the store already has it */
-        int fd = open(e->d_name, O_RDONLY); if (fd < 0) continue;
-        struct stat sb; if (fstat(fd, &sb) != 0){ close(fd); continue; }
-        u8* buf = malloc((size_t)sb.st_size + 1); if (!buf){ close(fd); continue; }
-        long got = 0; ssize_t r;
-        while (got < sb.st_size && (r = pread(fd, buf + got, (size_t)(sb.st_size - got), got)) > 0) got += r;
-        close(fd);
-        /* validate: whole records only; a short tail = torn */
-        long off = 0; int torn = 0;
-        while (off + UNDO_HEADER_BYTES <= got){
-            u16 slen; memcpy(&slen, buf + off + 49, 2);
-            if (slen > UNDO_MAX_SCRIPT || off + UNDO_HEADER_BYTES + slen > got){ torn = 1; break; }
-            off += UNDO_HEADER_BYTES + slen;
-        }
-        if (off != got) torn = 1;
-        /* copied as a closed run: the partial record (if any) is dropped, which
-         * is what the tolerant replay dropped anyway */
-        (void)torn;
-        if (us_append_run(h, buf, (size_t)off, 1) == 0){ unlink(e->d_name); n++; }
-        free(buf);
+    if (tip_height < 0 || window <= 0 || max_scan <= 0) return from_height;
+    if (from_height < 0) from_height = 0;
+    long keep_from = tip_height - window + 1;
+    if (keep_from < 0) keep_from = 0;
+    long end = from_height + max_scan;
+    if (end > keep_from) end = keep_from;
+    for (long h = from_height; h < end; h++){
+        undo_unlink(h);
     }
-    closedir(d);
-    return n;
+    return end > from_height ? end : from_height;
+}
+
+/* undo_prune(tip_height, window) -> number of undo_<h>.dat files removed.
+ * Retains heights [max(0,tip_height-window+1) .. tip_height]; everything
+ * older is deleted. A no-op (0 removed) for an invalid tip/window. Meant to
+ * be called once per (future, wired-in) block application -- see this
+ * file's header for why that wiring isn't done in this stage; a caller
+ * that jumps `tip_height` forward by a lot in one call will still correctly
+ * remove everything now outside the window (just at O(jump) cost, fine for
+ * an occasional catch-up but not a hot per-block path if jumps are large). */
+long undo_prune(long tip_height, long window){
+    if (tip_height < 0 || window <= 0) return 0;
+    long keep_from = tip_height - window + 1;
+    if (keep_from < 0) keep_from = 0;
+    long removed = 0;
+    for (long h = 0; h < keep_from; h++){
+        if (undo_unlink(h) == 0) removed++;
+    }
+    return removed;
 }
 
 /* ---- the intended future live_on_input hookup shape (see file header for

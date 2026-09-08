@@ -459,7 +459,7 @@ than trusted:
 | **Public RPC methods** | **155 / 155.** The 16 Core methods absent here are *all* in Core's own `hidden` category — mining, test scaffolding, chain manipulation, debug introspection. Two of those were added anyway because the data already existed: `getrawaddrman` and `getorphantxs`. |
 | **Config options** | **133 / 181 implemented, 48 accepted without effect (each named with its reason at start-up), 0 not recognised** — see the 2026-09-01 config-surface update below for the full table. |
 | **Chains** | main, testnet4, regtest. **signet and testnet3 absent** — and refused explicitly at startup rather than started with the wrong rules. |
-| **Indexes** | txindex, coinstatsindex, blockfilterindex, addrindex, **txospenderindex (2026-09-01)**. |
+| **Indexes** | txindex, coinstatsindex, blockfilterindex, addrindex, **txospenderindex (2026-09-01)**, **the address history index (`bmc_build_addr_hist`, 2026-09-08; backs the Esplora facade's address routes)**. |
 | **P2P protocol** | addrv2, compact blocks, BIP157/158, package relay, all five BIP155 networks, **inbound Tor**. **BIP324 v2 transport COMPLETE, live on mainnet in both directions, proven against Bitcoin Core v31.99. Erlay: BIP330 negotiation implemented and tested, not wired to the wire; reconciliation deliberately not built (see below).** |
 
 *Closed since 08-28:* `minimumchainwork` (was absent entirely); RPC **cookie
@@ -633,8 +633,9 @@ propagated into this file (see `assumevalid`). Two tools do it:
 harness can compare JSON directly):
 
 - Blockchain query: `getblockcount`, `getbestblockhash`, `getblockhash`,
-  `getblockheader` (verbose + raw hex), `getblock` (verbosity 0/1/2; 3 acts
-  like 2 — no undo data, same as Core without it), `getblockchaininfo`,
+  `getblockheader` (verbose + raw hex), `getblock` (verbosity 0/1/2/3;
+  since 2026-09-08 undo data exists for every block, so verbosity 3 carries
+  `prevout` and every verbosity 2+ block carries `fee`), `getblockchaininfo`,
   `getdifficulty`.
 - Raw tx: `getrawtransaction <txid> [verbosity] <blockhash>` — the exact
   behaviour Core has with **no txindex and an empty mempool**: succeeds only

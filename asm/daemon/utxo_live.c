@@ -98,6 +98,9 @@ extern void utxo_prefetch(void* u, const u8 txid[32], unsigned long index); /* b
 extern long undo_capture_and_del(void* lst, void* u, long height,
                                  const u8 txid[32], u32 index);
 extern long undo_discard(long height);
+extern int  undo_exists(long height);         /* 2026-09-08: an index entry in the packed store */
+extern long undo_commit(long height);         /* closes the block's run with the END marker */
+extern long undo_migrate_legacy(void);        /* folds pre-09-08 undo_<h>.dat files into the store */
 extern long undo_prune_from(long from_height, long tip_height, long window, long max_scan);
 /* utxo_walk.h supplies u8/u32/u64 but not u16 (undo records carry a u16
  * script length -- see daemon/undo_log.c's record format). */
@@ -166,7 +169,7 @@ extern void block_hash(u8 out[32], const u8 hdr[80]);
  * comfortably deeper than any reorg this node would apply automatically
  * (see REORG_MAX_DEPTH in daemon/reorg.c, which refuses to go deeper than
  * the undo data can actually support). */
-#define UTXO_UNDO_WINDOW    200
+#define UTXO_UNDO_WINDOW    200   /* 2026-09-08: no longer a retention window (undo is kept for every block); kept as the reorg-depth reference REORG_MAX_DEPTH compares against */
 /* Heights examined per prune sweep. Bounds the cold-start cost on a deep
  * store (a fresh boot starts the cursor at 0) without ever stalling the
  * download worker's loop; the cursor resumes on the next block. */
@@ -599,7 +602,7 @@ void utxo_live_set_mined_cb(void (*cb)(const unsigned char[32])){ g_mined_cb = c
 static int   g_undo_enabled = 1;
 /* Resumable prune cursor -- see undo_prune_from's own header comment for why
  * a plain undo_prune(tip,window) per block is not viable at mainnet depth. */
-static long  g_undo_prune_cursor = 0;
+/* (the 2026-09-08 change removed the undo prune cursor: retention follows the block store) */
 
 /* TXOQ-1 (2026-09-05 benchmark): between-block quiescent hook -- set once by
  * the download worker in main.c (txoq_service). Fires in utxo_live_catchup's
@@ -2388,6 +2391,14 @@ static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height);
 static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
     int r = apply_block_at_inner(blockbuf, blocklen, height);
     u64 tm_d0 = tm_now();
+    /* 2026-09-08: a successful apply closes the block's undo run with the END
+     * marker (a block that spent nothing gets an empty run, so every applied
+     * height has undo); a failed one leaves it open = torn, which is what
+     * boot recovery and the strict replay expect of a half-applied block. */
+    if (r && g_undo_enabled && height >= 0 && undo_commit(height) != 1){
+        fprintf(stderr, "[utxo_live] FATAL: could not close the undo run for height %ld\n", height);
+        r = 0;
+    }
     undo_close_current();
     int drain_bad = (utxo_store_wal_drain(&g_utxo_lst) != 0);
     tm_lap(TM_PUT, tm_d0);           /* the block-end WAL write is part of put */
@@ -2431,9 +2442,7 @@ static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height){
      * instead, then apply fresh; refuse to apply on rollback failure rather
      * than proceed on inconsistent state. */
     if (g_undo_enabled && height >= 0) {
-        char upath[64]; struct stat usb;
-        snprintf(upath, sizeof upath, "undo_%ld.dat", height);
-        if (stat(upath, &usb) == 0 && !rollback_unapplied_block(blockbuf, blocklen, height))
+        if (undo_exists(height) && !rollback_unapplied_block(blockbuf, blocklen, height))
             return 0;
     }
     return apply_block_inner(blockbuf, blocklen);
@@ -2777,9 +2786,7 @@ long utxo_live_recover_partial_block(void* store_buf){
     long lo = g_applied_height + 1;
     long hi = lo - 1;
     for (long h = lo; ; h++){
-        char upath[64]; snprintf(upath, sizeof upath, "undo_%ld.dat", h);
-        struct stat sb;
-        if (stat(upath, &sb) != 0) break;
+        if (!undo_exists(h)) break;          /* 2026-09-08: an index entry, not a file (undo_store.h) */
         hi = h;
     }
     if (hi < lo) return 0;
@@ -2789,7 +2796,7 @@ long utxo_live_recover_partial_block(void* store_buf){
     for (long h = hi; h >= lo; h--){
         long len = store_read_at(store_buf, (u64)h, blockbuf, sizeof blockbuf);
         if (len < 81) {
-            fprintf(stderr, "[utxo_live] RECOVERY: undo_%ld.dat exists (block %ld began applying before the last checkpoint) but block %ld is unreadable (len=%ld) -- cannot roll back, leaving it for retry\n",
+            fprintf(stderr, "[utxo_live] RECOVERY: undo data for %ld exists (block %ld began applying before the last checkpoint) but block %ld is unreadable (len=%ld) -- cannot roll back, leaving it for retry\n",
                     h, h, h, len);
             return -1;
         }
@@ -3015,6 +3022,9 @@ long utxo_live_compact_threshold(void){
 extern void txv_set_bulk_mode(int on);
 
 int utxo_live_init(const char* dir){
+    /* 2026-09-08: an upgraded node folds its per-height undo files into the
+     * packed store once, so its recent history (and reorg depth) survives */
+    if (g_undo_enabled){ long mig = undo_migrate_legacy(); if (mig > 0) fprintf(stderr, "[utxo_live] undo: migrated %ld legacy undo_<h>.dat file(s) into the rev store\n", mig); }
     utxo_live_resolve_assumevalid();
     g_recovery_checked = 0;
     g_test_input_count = 0;
@@ -3259,11 +3269,11 @@ int utxo_live_init(const char* dir){
  * the live tip, it stays per block. The crash window this opens is exactly
  * the multi-block ghost run utxo_live_recover_partial_block already heals
  * (descending rollback from the undo files), so the batch must stay well
- * inside UTXO_UNDO_WINDOW: every ghost needs its undo file. Loop exits and
+ * bounded: every ghost needs its undo run (kept for every block since 2026-09-08). Loop exits and
  * utxo_live_close flush a pending checkpoint. Core's shape, for reference:
  * the UTXO batch and the best-block pointer are one atomic write, issued at
  * dbcache pressure, not per block. */
-#define UTXO_CKPT_BATCH_BLOCKS 64      /* < UTXO_UNDO_WINDOW (200) */
+#define UTXO_CKPT_BATCH_BLOCKS 64      /* undo is kept for every block since 2026-09-08; the batch bound is a recovery-time choice now */
 #define UTXO_CKPT_BATCH_MS     2000
 #define UTXO_CKPT_NEAR_TIP     64
 static long      g_ckpt_since = 0;      /* applied blocks not yet covered by a checkpoint */
@@ -3710,9 +3720,9 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
         /* STAGE B: steady-state undo-data retention. Bounded and resumable
          * (see undo_prune_from) so this stays O(1) per catch-up call at
          * mainnet depth instead of re-sweeping from height 0 every time. */
-        if (g_undo_enabled)
-            g_undo_prune_cursor = undo_prune_from(g_undo_prune_cursor, g_applied_height,
-                                                  UTXO_UNDO_WINDOW, UTXO_UNDO_PRUNE_SCAN);
+        /* 2026-09-08: no steady-state undo pruning. Undo is kept for every
+         * block, like Core's rev files; the block store's prune gate is the
+         * only thing that removes it (undo_prune_below, from the prune path). */
         if (!persist_applied_height(g_applied_height)) {
             fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld (will re-apply from the prior persisted height on next boot -- safe, puts/dels are idempotent)\n", g_applied_height);
         }

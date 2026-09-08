@@ -225,6 +225,8 @@ long archive_drop_utxo_state(void){
         struct dirent* e;
         while ((e = readdir(d))){
             if (strncmp(e->d_name, "undo_", 5) == 0 && unlink(e->d_name) == 0) removed++;
+            /* 2026-09-08: the packed undo store (rev%05u.dat + undo.idx) goes with the UTXO state it describes */
+            if (((strncmp(e->d_name, "rev", 3) == 0 && strstr(e->d_name, ".dat")) || strcmp(e->d_name, "undo.idx") == 0) && unlink(e->d_name) == 0) removed++;
         }
         closedir(d);
     }
@@ -591,8 +593,9 @@ static long archive_index_tip(void){
  *
  * out_height receives the first height to RETAIN; out_detail receives the
  * offending height for the refusal verdicts (-1 otherwise). */
-/* STO-12: Core's MIN_BLOCKS_TO_KEEP. 288 > UTXO_UNDO_WINDOW (200) >
- * REORG_MAX_DEPTH (100), so this one number subsumes both windows.
+/* STO-12: Core's MIN_BLOCKS_TO_KEEP. 288 > REORG_MAX_DEPTH (100); undo data
+ * is kept for every block since 2026-09-08, so the reorg depth is the one
+ * window this floor has to cover.
  *
  * INJECTABLE, and that is not test-only convenience. The prune verdicts are
  * exercised on a two- or three-block fixture precisely so all five outcomes

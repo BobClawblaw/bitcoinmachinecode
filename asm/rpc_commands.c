@@ -4896,3 +4896,11 @@ int rpc_dispatch(const char* method, const rj_val* params,
     *err_code = -32601; *err_msg = "Method not found";
     return 0;
 }
+
+/* 2026-09-08: the Esplora facade's /address/:addr/utxo reads the reverse
+ * index through this; the lookup itself stays static. Records are
+ * (txid, vout, value) of the base snapshot; the tail journal adjusts them. */
+int rpc_addr_idx_utxos(unsigned char type_tag, const unsigned char hash[32], void* out_recs, int cap){
+    return addr_idx_lookup(type_tag, hash, (addr_idx_rec*)out_recs, cap);
+}
+

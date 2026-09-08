@@ -3660,7 +3660,23 @@ enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CT
         * publishes, the staged-not-yet-committed chunk gauge, the chunks it
         * has appended, and the parent's "workers are gone: drain and exit" */
        DLC_CTL_COMMIT_TIP = 12, DLC_CTL_STAGED = 13, DLC_CTL_N_COMMIT = 14, DLC_CTL_STOP_COMMIT = 15,
-       DLC_CTL_RING = 16 };
+       /* the chunk the committer has been waiting on for DLC_CURSOR_HELP_SECS
+        * (or -1): a worker picks it up at its next claim without waiting for
+        * the window to fill. Run 18 (2026-09-08) sat six minutes at 484,201
+        * behind one trickling peer while 85 chunks above it were staged. */
+       DLC_CTL_CURSOR_WANT = 16, DLC_CTL_N_CURSOR_HELP = 17,
+       DLC_CTL_RING = 18 };
+#define DLC_CURSOR_HELP_SECS 30
+/* ...and only when the pool has moved on without it: at least this many
+ * chunks staged above the cursor. A 40-block chunk is 40 MB at height
+ * 490,000 and takes a worker a minute; a bare clock fires duplicate
+ * downloads of chunks whose owner is still delivering them. */
+#define DLC_CURSOR_HELP_MIN_STAGED 32
+/* (2026-09-08, later the same day: 10 s and 8 chunks fired 39 helps in 21
+ * minutes of run 18 at height 500,000 -- most of them on chunks whose owner
+ * was still delivering. A third of the window staged above the cursor and
+ * half a minute is a stall; anything less is a slow chunk.) */
+static long g_dlc_cursor_help_ms = DLC_CURSOR_HELP_SECS * 1000L;   /* test seam */
 /* Run 14 (2026-09-07) stalled for two minutes at 82,565: every worker
  * reconnected to the SAME peer -- one that accepted the handshake and
  * dropped us ~100 ms later -- because a failed fetch never lowered the
@@ -3770,6 +3786,23 @@ static long dlc_stage_wipe(void){
     closedir(d);
     return n;
 }
+/* Staged files wholly below the cursor are stale: a chunk's owner finished
+ * after a helper had already delivered it (run 18 held six of them, and they
+ * inflated the staged gauge that gates the cursor help). Sweep them, then
+ * make the gauge the directory's truth: the count of published chunks. */
+static long dlc_stage_sweep(long cursor, volatile long* ctl){
+    DIR* d = opendir(DLC_STAGE_DIR); if (!d) return 0;
+    struct dirent* e; long removed = 0, kept = 0;
+    while ((e = readdir(d))){
+        long lo; if (sscanf(e->d_name, "c%ld.chunk", &lo) != 1 || strstr(e->d_name, ".tmp")) continue;
+        char p[320]; snprintf(p, sizeof p, DLC_STAGE_DIR "/%s", e->d_name);
+        if (lo + DLC_CHUNK_BLOCKS - 1 < cursor){ if (unlink(p) == 0) removed++; }
+        else kept++;
+    }
+    closedir(d);
+    if (ctl) ctl[DLC_CTL_STAGED] = kept;
+    return removed;
+}
 typedef long (*dlc_append_fn)(void* st, long height, const unsigned char hash[32], const unsigned char* raw, unsigned len);
 typedef int  (*dlc_present_fn)(long height);
 static int dlc_index_present(long h){ return idxscan_all_present(h, h) != 0; }
@@ -3831,7 +3864,7 @@ static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void*
     while(fh <= end_h && present && present(fh)) fh++;
     if(fh > ctl[DLC_CTL_FIRST_HOLE]) ctl[DLC_CTL_FIRST_HOLE] = fh;
     ctl[DLC_CTL_COMMIT_TIP] = fh - 1;
-    int rc = 0;
+    int rc = 0; long wait_lo = -1, wait_ms = 0;
     for(;;){
         if(g_shutdown_requested) break;
         if(parent > 0 && getppid() != parent) break;          /* orphaned: the download is over */
@@ -3840,17 +3873,18 @@ static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void*
         char path[64]; dlc_stage_path(path, sizeof path, lo);
         long r = dlc_commit_chunk(st, path, &fh, append, present, buf, DLC_STAGE_MAX_BYTES);
         if(r >= 0){
+            if(ctl[DLC_CTL_CURSOR_WANT] == lo) ctl[DLC_CTL_CURSOR_WANT] = -1;
             if(synced && r > 0) synced(st);                       /* one journal commit per chunk, not per block */
             while(fh <= end_h && present && present(fh)) fh++;
             if(fh > ctl[DLC_CTL_FIRST_HOLE]) ctl[DLC_CTL_FIRST_HOLE] = fh;
             ctl[DLC_CTL_COMMIT_TIP] = fh - 1;
             __sync_fetch_and_add(&ctl[DLC_CTL_N_COMMIT], 1L);
-            if(ctl[DLC_CTL_STAGED] > 0) __sync_fetch_and_sub(&ctl[DLC_CTL_STAGED], 1L);
+            dlc_stage_sweep(fh, ctl);                              /* stale files below the cursor go; the gauge is the directory */
             continue;
         }
         if(r == -2){
             fprintf(stderr, "[dlc committer] staged chunk %s is malformed -- discarded; the window's help fetches it again\n", path);
-            if(ctl[DLC_CTL_STAGED] > 0) __sync_fetch_and_sub(&ctl[DLC_CTL_STAGED], 1L);
+            dlc_stage_sweep(fh, ctl);
             continue;
         }
         if(r == -1){
@@ -3858,8 +3892,14 @@ static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void*
             rc = 2; sleep(1); continue;
         }
         if(ctl[DLC_CTL_STOP_COMMIT]) break;                    /* -3 and the workers are gone */
+        /* not staged yet: after DLC_CURSOR_HELP_SECS on the same chunk, ask
+         * for a helper; a fresh chunk resets the clock */
+        if(lo != wait_lo){ wait_lo = lo; wait_ms = 0; ctl[DLC_CTL_CURSOR_WANT] = -1; }
+        else if(wait_ms >= g_dlc_cursor_help_ms && ctl[DLC_CTL_STAGED] >= DLC_CURSOR_HELP_MIN_STAGED && ctl[DLC_CTL_CURSOR_WANT] != lo) ctl[DLC_CTL_CURSOR_WANT] = lo;
+        wait_ms += poll_ms;
         { struct timespec ts = { poll_ms / 1000, (poll_ms % 1000) * 1000000L }; nanosleep(&ts, NULL); }
     }
+    ctl[DLC_CTL_CURSOR_WANT] = -1;
     munmap(buf, DLC_STAGE_MAX_BYTES);
     return rc;
 }
@@ -4196,6 +4236,24 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
             dlc_headers_rollback(hst, have0); return -1;
         }
         unsigned char prev[32]; memcpy(prev, loc + at * 32, 32);
+        /* ---- a peer BEHIND us (2026-09-08) ------------------------------------
+         * A peer answers from the deepest locator hash it knows. One that is
+         * behind our tip knows only a deep entry and sends the 2,000 headers
+         * after it -- every one a header we hold. dlc_take_page verified the
+         * overlap and appended nothing, the full page counted as progress,
+         * the locator (rebuilt from our unchanged tip) asked the same question
+         * and the peer gave the same page: production walked 415 identical
+         * pages (67 MB, 25 minutes) from a node ~100k blocks behind, the tip
+         * loop waiting the whole time. A page that ends below what we hold
+         * offers nothing; the peer is behind us, and the next candidate is
+         * tried. */
+        { long have_now = hst_count(hst);
+          if(pos + (long)cnt <= have_now){
+              fprintf(stderr,"[dlc] headers from %s attach at height %ld and end at %ld, below the %ld we hold -- the peer is behind us; trying another\n",
+                      cand, pos, pos + (long)cnt - 1, have_now);
+              lowwork_clear(&g_lw);
+              return added > 0 ? added : -1;
+          } }
         /* ---- CC-5: is this chain worth storing yet? ------------------------
          * Core (24.0 presync) stores nothing from a peer until the chain's
          * total work clears -minimumchainwork; this node appended every
@@ -4516,6 +4574,19 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
         int helping=0;
         long lo=dlc_retry_pop(next_claim);
         if(lo<0){
+            /* the committer's stalled cursor chunk, before anything new: one
+             * helper (the CAS on HELPING), and not a chunk that is already
+             * staged (the owner finished in the meantime) */
+            long want=next_claim[DLC_CTL_CURSOR_WANT];
+            if(want>=0 && !dlc_stage_exists(want)){
+                long cur=next_claim[DLC_CTL_HELPING];
+                if(cur!=want && __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], cur, want)){
+                    lo=want; helping=1;
+                    __sync_fetch_and_add(&next_claim[DLC_CTL_N_CURSOR_HELP], 1L);
+                }
+            }
+        }
+        if(lo<0){
             int waited_ticks=0;                 /* 200 ms each */
             for(;;){
                 long peek=next_claim[DLC_CTL_CLAIM], fh=next_claim[DLC_CTL_FIRST_HOLE];
@@ -4671,7 +4742,8 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             close(sfd); g_stage_fd=-1;
             if(r>=0 && !mux_sync_budget_fired){
                 char sfin[64]; dlc_stage_path(sfin,sizeof sfin,lo);
-                if(rename(stmp,sfin)!=0){ fprintf(stderr,"[dlc w%d] stage: cannot publish %s (%s)\n", w, sfin, strerror(errno)); unlink(stmp); r=IBD_FAIL_STORE; }
+                if(hi <= next_claim[DLC_CTL_COMMIT_TIP]) unlink(stmp);          /* a helper delivered it first: already committed, nothing to publish */
+                else if(rename(stmp,sfin)!=0){ fprintf(stderr,"[dlc w%d] stage: cannot publish %s (%s)\n", w, sfin, strerror(errno)); unlink(stmp); r=IBD_FAIL_STORE; }
                 else __sync_fetch_and_add(&next_claim[DLC_CTL_STAGED],1L);
             } else unlink(stmp);
             store_reload(st);
@@ -5219,6 +5291,7 @@ static long dl_catchup(const char* dir, int min_workers){
     for(long i=0;i<DLC_RETRY_MAX;i++) next_claim[DLC_CTL_RING+i]=-1;   /* -1 = empty slot (0 is a real chunk) */
     for(int i=DLC_CTL_N_ROTATE;i<=DLC_CTL_N_ABANDON;i++) next_claim[i]=0;
     next_claim[DLC_CTL_COMMIT_TIP]=start_h-1; next_claim[DLC_CTL_STAGED]=0; next_claim[DLC_CTL_N_COMMIT]=0; next_claim[DLC_CTL_STOP_COMMIT]=0;
+    next_claim[DLC_CTL_CURSOR_WANT]=-1; next_claim[DLC_CTL_N_CURSOR_HELP]=0;
     { long stale=dlc_stage_wipe(); if(stale) fprintf(stderr,"[dlc] stage: discarded %ld file(s) an earlier run left; their chunks are fetched again\n", stale); }
     { pid_t cp=fork(); if(cp==0){ _exit(dlc_committer_main(next_claim, start_h, end_h, getppid())); } g_dlc_committer=cp; }
     /* MAP_ANONYMOUS pages come zeroed, so every stats[w].peer/chunks/blocks/
@@ -5548,9 +5621,9 @@ static long dl_catchup(const char* dir, int min_workers){
               static int last_nowit = 0; int nw_now = peer_no_witness_count();
               if(nw_now != last_nowit){ last_nowit = nw_now;              /* only when the count changes */
                   fprintf(stderr,"[dlc] -- %d peer(s) dropped for lacking NODE_WITNESS; %llu redial(s) skipped since --\n", nw_now, peer_no_witness_skips()); } }
-            fprintf(stderr,"[dlc] -- recv %s (avg %s) | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | staged %ld commit %ld | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
+            fprintf(stderr,"[dlc] -- recv %s (avg %s) | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | staged %ld commit %ld cursorhelp %ld | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
                     aggbuf, avgrbuf, waggbuf, avgwbuf, floor_bps/1024.0, median_bps/1024.0, cur, nlive,
-                    nbanned == cur ? "" : " (amnesty active)", next_claim[DLC_CTL_STAGED], next_claim[DLC_CTL_N_COMMIT], d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
+                    nbanned == cur ? "" : " (amnesty active)", next_claim[DLC_CTL_STAGED], next_claim[DLC_CTL_N_COMMIT], next_claim[DLC_CTL_N_CURSOR_HELP], d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
         }
     }
     dlc_drain_committer(next_claim);            /* a no-op when the loop's last reap already drained it */
@@ -5942,6 +6015,16 @@ static long dl_apply_backlog(long archive_tip, long first_hole, long applied){
     if(applied < 0) return 0;
     long top = (first_hole >= 0 && first_hole - 1 < archive_tip) ? first_hole - 1 : archive_tip;
     return top > applied ? top - applied : 0;
+}
+/* The height the far-behind trigger believes: the second-highest of the
+ * connected peers' announced start heights (the highest with one peer). A
+ * single peer's claim, honest or not, never starts the parallel downloader
+ * on its own; two agreeing peers do. */
+static long dl_trigger_height(const long* hs, int n){
+    if(n <= 0) return 0;
+    long top = 0, second = 0;
+    for(int i=0;i<n;i++){ if(hs[i] > top){ second = top; top = hs[i]; } else if(hs[i] > second) second = hs[i]; }
+    return n >= 2 ? second : top;
 }
 static int dl_should_parallel_fetch(long archive_tip, long best_peer_height,
                                     long apply_backlog, long long now_s, long long last_run_s){
@@ -7271,19 +7354,30 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         }
         int apply_first = apply_backlog > DL_APPLY_FIRST_BACKLOG;
         {
-            long best = 0;
+            /* 2026-09-08: the trigger height is the SECOND-highest announce
+             * (dl_trigger_height), so one peer claiming 969,817 on a 966,063
+             * chain cannot start the parallel downloader -- production ran
+             * its two-minute header phase every ten minutes on exactly that
+             * peer, wrote nothing, and paused this loop each time. An
+             * announce that produced no blocks is not retried while the
+             * archive stands still. */
+            long hs[RPC_MAX_PEERS]; int nh = 0;
             if(g_node_status)
                 for(int i=0;i<mux_n_out && i<RPC_MAX_PEERS;i++)
-                    if(mux_out_fd[i]>=0 && g_node_status->peers[i].start_height > best)
-                        best = g_node_status->peers[i].start_height;
+                    if(mux_out_fd[i]>=0 && g_node_status->peers[i].start_height > 0)
+                        hs[nh++] = g_node_status->peers[i].start_height;
+            long best = dl_trigger_height(hs, nh);
             long atip = (long)(*(int*)(store_buf+24));
             long long nows = (long long)time(NULL);
+            static long noop_best = -1, noop_tip = -1;
+            if(best == noop_best && atip == noop_tip) best = atip;        /* the same claim already came to nothing at this tip */
             if(dl_should_parallel_fetch(atip, best, apply_backlog, nows, dl_parallel_last_s)){
                 fprintf(stderr,"[dl] archive at %ld, peers announce %ld: %ld blocks behind -- running the parallel downloader (%d workers)\n",
                         atip, best, best-atip, g_catchup_workers);
                 dl_parallel_last_s = nows;
                 long got = dl_catchup(dir, g_catchup_workers);
                 store_reload(store_buf);
+                if(got <= 0){ noop_best = best; noop_tip = atip; }
                 fprintf(stderr,"[dl] parallel downloader wrote %ld block(s); archive now %d\n", got, *(int*)(store_buf+24));
                 continue;                  /* re-evaluate: apply-first will take over */
             }
@@ -8238,6 +8332,14 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
     if (rpc_server_start(&cfg, &actual, err, sizeof err) != 0){
         fprintf(stderr, "[rpc] server start failed: %s\n", err);
         return;
+    }
+    /* 2026-09-08: the Esplora facade (mempool.space's BACKEND esplora) */
+    if (g_cfg.esplora_port > 0){
+        extern int rpc_esplora_start(const char*, int, char*, size_t);
+        char eerr[256] = "";
+        if (rpc_esplora_start(g_cfg.esplora_bind, g_cfg.esplora_port, eerr, sizeof eerr) == 0)
+            fprintf(stderr, "[rpc] Esplora facade on %s:%d (bmc.esploraport; no auth: keep it on loopback or behind a proxy)\n", g_cfg.esplora_bind, g_cfg.esplora_port);
+        else fprintf(stderr, "[rpc] Esplora facade NOT started: %s\n", eerr);
     }
     fprintf(stderr, "[rpc] JSON-RPC server on %s:%d (live-node + chain, user=%s)\n",
             bindaddr[0] ? bindaddr : "127.0.0.1", actual, user);
@@ -9694,8 +9796,12 @@ int main(int argc, char** argv){
             case ARCHIVE_PRUNE_OK:
                 fprintf(stderr,"[prune] budget %ld MiB -> retaining from height %ld; deleting below it\n",
                         g_cfg.prune_mib, ph);
-                if(store_prune(store_buf, (int)ph) == 1)
+                if(store_prune(store_buf, (int)ph) == 1){
                     fprintf(stderr,"[prune] done: block data below height %ld removed\n", ph);
+                    /* 2026-09-08: undo follows the block store (Core deletes the rev file with its blk file) */
+                    { extern long undo_prune_below(long keep_from); long uf = undo_prune_below(ph);
+                      if(uf) fprintf(stderr,"[prune] undo: %ld rev file(s) wholly below height %ld removed\n", uf, ph); }
+                }
                 else
                     fprintf(stderr,"[prune] store_prune FAILED -- archive left as it was\n");
                 break;

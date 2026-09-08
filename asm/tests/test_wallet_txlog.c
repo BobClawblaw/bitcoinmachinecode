@@ -93,7 +93,11 @@ int main(void){
         char o[4096]; o[0]=0;
         txlog_list(jp2, o, sizeof o);
         ck("torn-write: good record still listed", strstr(o, "000102030405060708090a0b0c0d0e0f") != NULL, 1);
-        ck_contains("torn-write: corrupt record rejected", o, "900", 0);
+        /* 2026-09-08: the needle was "900", the corrupt record's value -- but the
+         * GOOD record is listed with the current epoch time, which contained
+         * "900" at 1788849001 and failed a gate. The corrupt record's own
+         * timestamp cannot appear in any genuine record. */
+        ck_contains("torn-write: corrupt record rejected", o, "1786923023", 0);
     }
 
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);

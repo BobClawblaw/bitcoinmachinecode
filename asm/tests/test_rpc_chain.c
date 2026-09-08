@@ -18,6 +18,7 @@
  *
  * Every expected string below is Core's own rendering for that field.
  */
+#include "../daemon/undo_store.h"
 #include "../rpc_json.h"
 #include "../rpc_commands.h"
 #include "../rpc_chain.h"
@@ -614,9 +615,8 @@ int main(void){
         r1[48] = 0;                                    /* not generated */
         r1[49] = 25; r1[50] = 0;
         memcpy(r1+51, SPK_PKH, 25);
-        FILE* uf = fopen("undo_3.dat", "wb");
-        ck("undo_3.dat opened", uf != NULL);
-        if (uf){ fwrite(rec, 1, sizeof rec, uf); fclose(uf); }
+        /* 2026-09-08: the packed undo store -- height 3's run, closed with END */
+        ck("undo run for height 3 written to the rev store", us_append_run(3, rec, sizeof rec, 1) == 0);
       }
       snprintf(p, sizeof p, "[\"%s\", 2]", g_hash[3]);
       r = call("getblock", p, &ec, &em);
@@ -636,6 +636,25 @@ int main(void){
                cbw && cbw->nitems ? cbw->items[0]->str : NULL,
                "0000000000000000000000000000000000000000000000000000000000000000"); }
       ck_str("v2 tx[1].fee (0.01 from undo)", S(t1,"fee"), "0.01000000");
+      /* 2026-09-08: getrawtransaction verbosity 2 loaded the block's undo run
+       * into a 1,024-entry array and the loader refused anything larger, so
+       * every real block lost fee and prevouts on that route. Re-stage the
+       * run with 1,500 records (the two real ones first) and ask again. */
+      { static const unsigned char W22[22] = { 0x00,0x14, 0x75,0x1e,0x76,0xe8,0x19,0x91,0x96,0xd4,0x54,0x94, 0x1c,0x45,0xd1,0xb3,0xa3,0x23,0xf1,0x43,0x3b,0xd6 };
+        static const unsigned char P25[25] = { 0x76,0xa9,0x14, 0x75,0x1e,0x76,0xe8,0x19,0x91,0x96,0xd4,0x54,0x94, 0x1c,0x45,0xd1,0xb3,0xa3,0x23,0xf1,0x43,0x3b,0xd6, 0x88,0xac };
+        unsigned char* big = malloc(1500 * 76 + 1); size_t bl = 0;
+        memset(big, 0, 51); put_u64(big + 36, 5000000000ULL); big[44] = 1; big[48] = 1; big[49] = 22; memcpy(big + 51, W22, 22); bl = 73;
+        memset(big + bl, 0, 51); put_u64(big + bl + 36, 4999000000ULL); big[bl + 44] = 2; big[bl + 49] = 25; memcpy(big + bl + 51, P25, 25); bl += 76;
+        for (int k = 0; k < 1498; k++){ memset(big + bl, 0, 51); big[bl + 49] = 22; memcpy(big + bl + 51, W22, 22); bl += 73; }
+        us_slot_clear(3);
+        ck("re-staged height 3's undo run with 1,500 records", us_append_run(3, big, bl, 1) == 0);
+        free(big);
+        char q[240]; snprintf(q, sizeof q, "[\"%s\", 2, \"%s\"]", g_tx1_txid, g_hash[3]);   /* by block hash: this fixture has no txindex here */
+        long ec2 = 0; const char* em2 = NULL; rj_val* r2 = call("getrawtransaction", q, &ec2, &em2);
+        ck_str("getrawtransaction v2 keeps the fee when the block has more than 1,024 inputs' worth of undo", S(r2, "fee"), "0.01000000");
+        { rj_val* vin = G(r2, "vin"); rj_val* pv = vin && vin->nitems ? G(vin->items[0], "prevout") : NULL;
+          ck("...and the input's prevout", pv != NULL); }
+        if (r2) rj_free(r2); }
       ck_str("v2 tx[2].fee (49.98999 from undo)", S(t2,"fee"), "49.98999000");
       ck_str("v2 tx[1].txid == v1 txid", S(t1,"txid"), g_tx1_txid);
       ck_str("v2 tx[2].txid == v1 txid", S(t2,"txid"), g_tx2_txid);
@@ -1677,6 +1696,18 @@ int main(void){
      * up on the next lookup -- which is also what an operator building the
      * index against a running node needs. */
 
+    { /* 2026-09-08: verbosity 2 BY TXID ALONE (the index path) must carry the
+       * fee and prevouts: the handler jumped to the indexed offset and walked
+       * one transaction, so its index in the block read as 0 and the undo
+       * slice was skipped as the coinbase's. Production's facade showed fee 0
+       * on every /tx while the block-hash path (and getblock 3) had them. */
+      char pj[96]; snprintf(pj, sizeof pj, "[\"%s\", 2]", g_tx2_txid);
+      rj_val* r = call("getrawtransaction", pj, &ec, &em);
+      ck_str("getrawtransaction v2 by txid alone: tx2's fee from undo (index path)", S(r, "fee"), "49.98999000");
+      { rj_val* vin = G(r, "vin"); rj_val* pv = vin && vin->nitems ? G(vin->items[0], "prevout") : NULL;
+        ck("...and its input's prevout", pv != NULL);
+        ck_str("...the RIGHT prevout: tx1's output (49.99), not the coinbase's (the walk used to start at the header and skip nothing)", S(pv, "value"), "49.99000000"); }
+      if (r) rj_free(r); }
     { /* every fixture transaction must now resolve by txid alone, and the
        * bytes must be IDENTICAL to what the blockhash path returns */
       const char* ids[] = { g_cb_txid[1], g_cb_txid[2], g_tx1_txid, g_tx2_txid };

@@ -130,6 +130,19 @@ there are no per-worker shards. The directory contains only these files:
   PUSH/DEL write-ahead log (`utxo.dat`, the durable source of truth) plus a
   checkpoint index (`utxo.idx`: a snapshot of the live set + the log offset it
   covers). Restart resume = restore checkpoint, then replay the WAL tail.
+- `rev00000.dat` .. + `undo.idx` (2026-09-08) — undo data for every block,
+  Core's rev-file model: one append-only run per block, 128 MiB files,
+  16 bytes per height in the index (file, offset, tag). Pruned only with
+  the block store.
+- `stage/c<lo>.chunk` (2026-09-08) — a download worker's verified 40-block
+  chunk, waiting for the committer, which appends chunks to the archive in
+  height order so `blk*.dat` are laid out monotonically. Stale files are
+  swept at boot and on every commit pass.
+- `addr_hist.dat` (2026-09-08, optional; `bmc_build_addr_hist`) — the
+  address history index: every funding and spend event per script key,
+  grouped and sparse-indexed, about 200 GB on mainnet; `addr_index.dat` +
+  `addrindex.tail` (the live address index) carry it forward from the
+  build height.
 
 The same lock/append discipline protects concurrent writers (the built-in
 `dl_catchup` workers, the standalone `unified_ibd` tool, and the continuous
@@ -474,6 +487,9 @@ check_chain <dir> [deep]                    # integrity audit: dups/holes/corrup
 verify <dir> [start] [end]                  # hash/chain/PoW/consensus validation
 pverify <dir> [start] [end]                 # parallel variant of verify
 dumpblock <dir> <height> [raw]              # inspect a stored block
+bmc_build_addr_hist <chaindir> [to_height]  # the address history index (three
+                                            # bucketed passes over the archive;
+                                            # hours, ~200 GB + ~700 GB of temp)
 nodecheck.sh <dir>                          # one-shot health: audit+progress+serve
 chainprogress.sh <dir>                      # coverage toward a complete 0..tip
 peerstats.sh                                # tail -f live dl_catchup status

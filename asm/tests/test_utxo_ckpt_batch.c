@@ -223,8 +223,9 @@ int main(void){
     if (waitpid(pid, &status, 0) != pid) { perror("waitpid"); return 1; }
     ckm("child died via the crash hook after 5 blocks", WIFEXITED(status) && WEXITSTATUS(status)==1);
     utxo_live_test_set_crash_after(-1);
-    int undo_present = 0; for (long h = 150; h < 155; h++){ char p[64]; snprintf(p,sizeof p,"undo_%ld.dat",h); if (access(p,F_OK)==0) undo_present++; }
-    ck("all 5 ghosts left their undo files (recovery's evidence)", undo_present, 5);
+    extern int undo_exists(long height);
+    int undo_present = 0; for (long h = 150; h < 155; h++){ if (undo_exists(h)) undo_present++; }
+    ck("all 5 ghosts left their undo runs (recovery's evidence)", undo_present, 5);
     ck("reopen", utxo_live_init("."), 1);
     ck("checkpoint still 149: none of the 5 was persisted", utxo_live_applied_height(), n1-1);
     long re = utxo_live_catchup(store_buf);        /* rolls back 154..150, re-applies 150..154 */
@@ -235,8 +236,8 @@ int main(void){
       ckm("coinbase 0 is SPENT after re-apply (no double-apply, no lost rollback)", utxo_live_resolve(cb_txid[0], 0, &v, &hh, &cb, &sc, &sl) != 1);
       ckm("coinbase 4 is SPENT (the last ghost's spend survived rollback + re-apply)", utxo_live_resolve(cb_txid[4], 0, &v, &hh, &cb, &sc, &sl) != 1);
       ckm("coinbase 7 (never spent) still resolves", utxo_live_resolve(cb_txid[7], 0, &v, &hh, &cb, &sc, &sl) == 1); }
-    undo_present = 0; for (long h = 150; h < 155; h++){ char p[64]; snprintf(p,sizeof p,"undo_%ld.dat",h); if (access(p,F_OK)==0) undo_present++; }
-    ck("re-applied blocks have fresh undo files", undo_present, 5);
+    undo_present = 0; for (long h = 150; h < 155; h++){ if (undo_exists(h)) undo_present++; }
+    ck("re-applied blocks have fresh undo runs", undo_present, 5);
     ck("nothing left to apply", utxo_live_catchup(store_buf), 0);
 
     printf("== 3. clean close mid-batch persists ==\n");
