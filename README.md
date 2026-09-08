@@ -37,7 +37,10 @@ testnet4, signet (public or custom) and regtest.
 - Signet (BIP325) block-signature enforcement through the same script
   interpreter used for transactions.
 - Reorg handling with cumulative-work fork choice, an undo log, and crash
-  recovery of a partially applied block.
+  recovery of a partially applied block. Undo data is kept for every block
+  in packed `rev*.dat` files like Core's (2026-09-08), so fees and prevouts
+  are available for the whole chain and a reorg is bounded only by the
+  chain, not by a window.
 
 **Initial block download**
 
@@ -157,6 +160,13 @@ testnet4, signet (public or custom) and regtest.
   plus the filter-header chain), all tip-following; `getindexinfo`.
 - `addrindex` (an extension with no Core equivalent): `getaddressbalance`
   and `getaddresstxids`.
+- An Esplora-contract listener (`bmc.esploraport`, 2026-09-08) answers
+  mempool.space's `BACKEND: "esplora"` in-process from the same RPC
+  dispatch: blocks, transactions with fees and prevouts, outspends, merkle
+  proofs, the mempool, fee estimates, and address pages from a native
+  address history index (`bmc_build_addr_hist`, about 200 GB on mainnet).
+  mempool.space runs against the node unpatched; see
+  [`docs/MEMPOOL_SPACE.md`](docs/MEMPOOL_SPACE.md).
 - `getblocktemplate`/`submitblock`/`submitheader`,
   `prioritisetransaction`, `dumptxoutset` (assumeutxo snapshot export).
 - ZMQ publishers for `hashblock`, `hashtx`, `rawblock`, `rawtx` with per-topic
@@ -357,6 +367,7 @@ log echoes the resolved values.
 | `blocknotify` / `alertnotify` / `startupnotify` / `shutdownnotify` | — | shell hooks; `%s` is sanitised before substitution |
 | `whitelist` / `whitebind` / `asmap` / `bantime` / `maxuploadtarget` / `blocksonly` | — / — / — / `86400` / `0` / `0` | peer permissions, AS bucketing, bans, upload budget, no tx relay |
 | `bmc.dialratelimit` / `bmc.downloadratelimit` / `bmc.uploadratelimit` | `0` / `0` / `0` | node-wide ceilings, off by default: outbound connection attempts per second; KB/s the sync may pull; KB/s the node may send (Core has only `maxuploadtarget`, a MiB-per-day budget, which is implemented too) |
+| `bmc.esploraport` / `bmc.esplorabind` | `0` / `127.0.0.1` | the Esplora facade for mempool.space: a second, unauthenticated listener; keep it on loopback or behind a proxy |
 | `bmc.utxocompactthreshold` / `bmc.bootcatchup` | `12` / `1` | project-specific: UTXO runs that trigger compaction; run the parallel downloader at boot |
 
 ## Networks: Tor, I2P, CJDNS, IPv6
@@ -408,6 +419,10 @@ log echoes the resolved values.
   verification record is in [`docs/PARITY_PLAN.md`](docs/PARITY_PLAN.md).
 - A method the node cannot honour returns an explicit refusal naming the
   gap rather than an approximate answer.
+- The Esplora facade (`bmc.esploraport`) serves Esplora's REST contract
+  in-process for mempool.space; it takes the RPC lock per dispatch, so a
+  batch route cannot starve JSON-RPC callers. Address routes need the
+  history index; `/scripthash` is refused (501) until it exists.
 - ZMQ: a native ZMTP 3.1 PUB implementation (no libzmq dependency) publishes
   `hashblock`, `hashtx`, `rawblock` and `rawtx`; `getzmqnotifications` lists
   the endpoints. Subscribers that observe a sequence gap resynchronise via
@@ -498,6 +513,7 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   Bitcoin Core itself ships only the negotiation (its `-txreconciliation` is
   off by default and its message processing has no `reqrecon`/`sketch`).
 - **Not implemented:** REST interface, UPnP/NAT-PMP, BIP37 bloom filters
+  (Core's REST is absent; an Esplora-contract listener exists instead, `bmc.esploraport`)
   (`peerbloomfilters`), `whitelistrelay`/`whitelistforcerelay`, GUI,
   `loadtxoutset` (assumeutxo import; export via `dumptxoutset` works),
   `walletnotify`, `maxtxfee` enforcement, `uacomment`,
@@ -515,6 +531,7 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
 | [`docs/README.md`](docs/README.md) | index of everything under `docs/` |
 | [`docs/OPERATIONS.md`](docs/OPERATIONS.md) | operations guide: running, configuring, monitoring, upgrading and recovering the node |
 | [`docs/RPC_LIVE_NODE.md`](docs/RPC_LIVE_NODE.md) | the embedded JSON-RPC server and its methods |
+| [`docs/MEMPOOL_SPACE.md`](docs/MEMPOOL_SPACE.md) | running mempool.space against the node: the Esplora facade, the address history index, the backend configuration |
 | [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md) | what the node does and does not implement, against Bitcoin Core |
 | [`docs/PARITY_PLAN.md`](docs/PARITY_PLAN.md) | how parity with Core is established and checked, method by method |
 | [`docs/ENGINEERING.md`](docs/ENGINEERING.md) | architecture, binaries and command lines, on-disk formats, validation gates |
@@ -533,6 +550,10 @@ against Bitcoin Core rather than independently audited by humans. It is not
 a replacement for Bitcoin Core and should not hold funds.
 
 Fresh-sync benchmarks against Bitcoin Core v31.1 on the same box are being
-run through September 2026; Core's measured time is 21 h 3 m. The landing
-notes in [`docs/releases/`](docs/releases/) record each change and the run
-that measured it; the daily record is in [`worklog/`](worklog/).
+run through September 2026; Core's measured time is 21 h 3 m. Run 18
+(2026-09-08) was level with Core through 400,000 blocks and half an hour
+behind at 634,000, the half hour being the day's eight relaunches. The
+landing notes in [`docs/releases/`](docs/releases/) record each change and
+the run that measured it; the daily record is in [`worklog/`](worklog/).
+mempool.space runs against the production node through the Esplora facade
+([`docs/MEMPOOL_SPACE.md`](docs/MEMPOOL_SPACE.md)).
