@@ -1963,7 +1963,13 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
              * window) the fields are simply omitted, which is also what Core
              * does when it cannot reach the undo data. */
             long long rt_in_total = -1;
-            undo_prevout_t rt_pv[1024];
+            /* 2026-09-08: this was a 1,024-entry stack array, and undo_block_load
+             * refuses a run it cannot hold whole ("trailing garbage"), so every
+             * mainnet block with more than 1,024 inputs -- all of them -- lost
+             * its fee and prevouts on this route while getblock verbosity 3,
+             * with the 600,000-entry table below, kept them. Same table size;
+             * the handlers run under the server's execution lock. */
+            static undo_prevout_t rt_pv[600000];
             long rt_npv = 0;
             u8* rt_raw = NULL;
             if (verbosity >= 2){   /* the mempool path returned far above */
