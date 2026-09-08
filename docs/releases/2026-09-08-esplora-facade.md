@@ -32,6 +32,17 @@ integer satoshis computed from Core's decimal strings without a double.
 | `POST /tx` | sendrawtransaction |
 | `/address/...`, `/scripthash/...` | 501 until stage 2 |
 
+## The lock, after the first day
+
+The first deploy held the RPC server's execution lock for a whole request.
+mempool's 1,000-transaction batch load, with a `gettxout` per input, held
+it for minutes: on this node `gettxout` is a request to the download worker
+over a socketpair, answered at that worker's service points. Production's
+RPC stopped answering for eleven minutes. The lock is now taken around
+each dispatch, so JSON-RPC callers interleave with a batch, and a mempool
+transaction's prevouts come from its previous transactions through the
+txindex, never from `gettxout`.
+
 ## Stage 2
 
 Address and scripthash routes need a history index: the address index on
