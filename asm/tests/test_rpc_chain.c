@@ -1352,16 +1352,24 @@ int main(void){
                  "hash_serialized_3 hash type not implemented (this node computes muhash)");
       expect_err("usi bad hash_type -> Core message shape", "gettxoutsetinfo",
                  "[\"bogus\"]", -8, "'bogus' is not a valid hash_type");
-      /* CSI-1 (2026-09-05 benchmark): height/blockhash as param 2 is NOT
-       * honored (no per-height history) and must be REFUSED, Core's own
-       * message -- previously the arg was ignored and the tip set returned,
-       * silently answering a different question than was asked. */
-      expect_err("usi height arg -> refused (no historical queries)", "gettxoutsetinfo",
+      /* CSI-1 (2026-09-05): a height/blockhash as param 2 must never be
+       * answered with the TIP set. Since 2026-09-08 the per-height rows
+       * answer it when the index is wired (validation/coinstats_regtest_diff.sh
+       * proves the values against Core); this harness has no index, so the
+       * refusal is Core's own text for a node without coinstatsindex, and
+       * Core's block-specific refusals come before the hash-type parse. */
+      expect_err("usi height arg without the index -> Core's refusal", "gettxoutsetinfo",
                  "[\"muhash\", 3]", -8,
-                 "coinstatsindex does not support querying at historical heights");
-      expect_err("usi blockhash arg -> refused (no historical queries)", "gettxoutsetinfo",
+                 "Querying specific block heights requires coinstatsindex");
+      expect_err("usi blockhash arg without the index -> Core's refusal", "gettxoutsetinfo",
                  "[\"muhash\", \"0f9188f13cb7b2c71f2a335e3a4fc325bf174ffcf8ff03b2a4c6f0e2e2f3f4f5\"]", -8,
-                 "coinstatsindex does not support querying at historical heights");
+                 "Querying specific block heights requires coinstatsindex");
+      expect_err("usi hash_serialized_3 with a block -> Core's text, before the hash-type check", "gettxoutsetinfo",
+                 "[\"hash_serialized_3\", 3]", -8,
+                 "hash_serialized_3 hash type cannot be queried for a specific block");
+      expect_err("usi use_index=false with a block -> Core's text", "gettxoutsetinfo",
+                 "[\"none\", 3, false]", -8,
+                 "Cannot set use_index to false when querying for a specific block");
       g_usi_stub_busy = 1;
       { long e1; const char* m1; rj_val* r1 = NULL;
         rj_val* p1 = rj_parse("[]", 2);
