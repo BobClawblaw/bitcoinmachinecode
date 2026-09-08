@@ -60,6 +60,7 @@ node_config_t g_cfg = {
     .par                   = 0,      /* Core -par default: auto              */
     .dial_rate_limit       = 0,      /* bmc.dialratelimit: off unless set */
     .download_rate_limit_kbps = 0,   /* bmc.downloadratelimit: off unless set */
+    .esplora_port = 0, .esplora_bind = "127.0.0.1",
     .upload_rate_limit_kbps = 0,     /* bmc.uploadratelimit: off unless set */
     .catchup_workers       = 16,     /* bmc.catchupworkers: parallel download chunk workers */
     .maxrecvbuffer_kb      = 5000,   /* Core -maxreceivebuffer default       */
@@ -346,6 +347,7 @@ static void set_defaults(void){
     g_cfg.connect_timeout_ms    = 5000;     /* Core's -timeout default */
     g_cfg.peer_timeout_s        = 60;       /* Core's -peertimeout default */
     g_cfg.port                  = 8333;
+    g_cfg.esplora_port = 0; snprintf(g_cfg.esplora_bind, sizeof g_cfg.esplora_bind, "127.0.0.1");
     g_cfg.port_explicit         = 0;
     snprintf(g_cfg.chain, sizeof g_cfg.chain, "main");
     g_cfg.listen                = 1;
@@ -728,6 +730,10 @@ long node_config_load(const char* path){
              * per block in the parallel download and per page in the header
              * fetch; probes and the keep-up legs are exempt. */
             t=clamp_int(iv,0,10000000,key,&bad); if(t!=-1){ g_cfg.download_rate_limit_kbps=t; applied++; } }
+        else if(!strcmp(key,"bmc.esploraport")){   /* EXTENSION: the Esplora facade (rpc_esplora.c), 0 = off */
+            t=clamp_int(iv,0,65535,key,&bad); if(t>=0){g_cfg.esplora_port=t;applied++;} }
+        else if(!strcmp(key,"bmc.esplorabind")){
+            snprintf(g_cfg.esplora_bind,sizeof g_cfg.esplora_bind,"%s",val); applied++; }
         else if(!strcmp(key,"bmc.uploadratelimit")){
             /* KB/s the node may SEND, node-wide (2026-09-08). 0 = off. A
              * rate, unlike Core's -maxuploadtarget (a MiB/day budget, kept

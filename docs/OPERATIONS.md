@@ -211,6 +211,12 @@ I2P destination.
   `tcp://<interface>:<port>`; `tcp://*:PORT` is refused, name an interface
   (`127.0.0.1` for local subscribers). A publisher has no authentication.
   `zmqpubsequence` is not supported and is refused.
+- `bmc.esploraport=<port>` (2026-09-08) opens the Esplora facade for
+  mempool.space's `BACKEND: "esplora"`: a second, unauthenticated listener
+  (`bmc.esplorabind`, default 127.0.0.1) answering Esplora's REST routes from
+  the node's own RPC handlers in process. Keep it on loopback or behind a
+  proxy. Address routes answer 501 until the history index lands. See
+  `releases/2026-09-08-esplora-facade.md`.
 - `txindex=1` has no effect on the daemon: the index is built offline
   (`daemon/bmc_build_tx_index <datadir>`) and used when `txindex.dat` exists.
 - **txospenderindex** (2026-09-01): same pattern — `daemon/bmc_build_txospender_index
