@@ -267,6 +267,15 @@ int main(void){
       { /* a fork: overlaps our height 2 with a DIFFERENT block */
         unsigned char f2[80]; mk_hdr(f2, hh1, 0x99); unsigned char fp_[1][80]; memcpy(fp_[0], f2, 80);
         HFETCH(0, 1, fp_, "a page that forks from our chain at a held height: refused, store unchanged (count 4)", res == -1 && hst_count(hst) == 4); }
+      { /* a peer BEHIND us (2026-09-08): answers from an earlier locator point
+         * with a page that ends below our tip -- every header one we hold.
+         * Before the fix the overlap verified, nothing was appended, and the
+         * fetch returned 0 ("already current"); on a full page the loop asked
+         * the same locator again and production walked 415 identical pages
+         * from a node ~100k blocks behind. Now: -1, the next peer is tried. */
+        unsigned char h3b[80]; mk_hdr(h3b, hh2, 0x13);          /* == our height 3 (mk_hdr is deterministic) */
+        unsigned char bp2[2][80]; memcpy(bp2[0], h2, 80); memcpy(bp2[1], h3b, 80);
+        HFETCH(0, 2, bp2, "a page from an earlier locator point that ends BELOW our tip (a peer behind us): refused (-1), store unchanged (count 4)", res == -1 && hst_count(hst) == 4); }
       { /* VAL-5 (audit 2026-09-03): a header that CHAINS to our tip but fails
          * its own PoW must never be appended. Deterministic construction:
          * nBits exponent 4 / mantissa 1 -> target = 256, i.e. ~2^-248 of all

@@ -4227,6 +4227,24 @@ static long dlc_fetch_headers(int fd, unsigned char* hst, const char* cand){
             dlc_headers_rollback(hst, have0); return -1;
         }
         unsigned char prev[32]; memcpy(prev, loc + at * 32, 32);
+        /* ---- a peer BEHIND us (2026-09-08) ------------------------------------
+         * A peer answers from the deepest locator hash it knows. One that is
+         * behind our tip knows only a deep entry and sends the 2,000 headers
+         * after it -- every one a header we hold. dlc_take_page verified the
+         * overlap and appended nothing, the full page counted as progress,
+         * the locator (rebuilt from our unchanged tip) asked the same question
+         * and the peer gave the same page: production walked 415 identical
+         * pages (67 MB, 25 minutes) from a node ~100k blocks behind, the tip
+         * loop waiting the whole time. A page that ends below what we hold
+         * offers nothing; the peer is behind us, and the next candidate is
+         * tried. */
+        { long have_now = hst_count(hst);
+          if(pos + (long)cnt <= have_now){
+              fprintf(stderr,"[dlc] headers from %s attach at height %ld and end at %ld, below the %ld we hold -- the peer is behind us; trying another\n",
+                      cand, pos, pos + (long)cnt - 1, have_now);
+              lowwork_clear(&g_lw);
+              return added > 0 ? added : -1;
+          } }
         /* ---- CC-5: is this chain worth storing yet? ------------------------
          * Core (24.0 presync) stores nothing from a peer until the chain's
          * total work clears -minimumchainwork; this node appended every
