@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include "../rpc_esplora.h"
 #include "../rpc_json.h"
 static int fails = 0, checks = 0;
@@ -17,6 +18,40 @@ extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
 #define TX2 "2222222222222222222222222222222222222222222222222222222222222222"
 #define TX3 "3333333333333333333333333333333333333333333333333333333333333333"
 static int g_spender_index = 1; static int g_calls_gettxout = 0; static int g_big = 0;
+/* ---- the address routes' sources, canned ---------------------------------- */
+#include "../daemon/addr_hist_fmt.h"
+#include "../daemon/addr_index_fmt.h"
+static const unsigned char KEY_A[20] = {0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11,0x11};
+int wallet_validate_address(const char* addr, int* type, unsigned char* ver, unsigned char h160[20], unsigned char prog[32]){
+    (void)ver; (void)prog; if (!strcmp(addr, "bc1qaddrA")){ *type = 2; memcpy(h160, KEY_A, 20); return 1; } return 0;
+}
+static int g_tail_on = 0;
+long axt_read_events(int type, const unsigned char hash[32], long min_height,
+                     int (*cb)(void*, int, const unsigned char*, unsigned, unsigned long long, unsigned), void* ctx){
+    if (!g_tail_on || type != 2 || memcmp(hash, KEY_A, 20)) return 0;
+    unsigned char t3[32]; memset(t3, 0x55, 32); unsigned char t4[32]; memset(t4, 0x44, 32);
+    long n = 0;
+    /* height 700001: tx 0x55.. funds A with 700 sats (ADD); height 700002: tx 0x44.. spends it (DEL of 0x55:0, TOUCH 0x44) */
+    if (700001 > min_height){ if (cb && !cb(ctx, AXF_OP_ADD, t3, 0, 700, 700001)) return n; n++; }
+    if (700002 > min_height){ if (cb && !cb(ctx, AXF_OP_DEL, t3, 0, 700, 700002)) return n; n++; if (cb && !cb(ctx, AXF_OP_TOUCH, t4, 0, 0, 700002)) return n; n++; }
+    return n;
+}
+int rpc_addr_idx_utxos(unsigned char type_tag, const unsigned char hash[32], void* out_recs, int cap){
+    if (type_tag != 2 || memcmp(hash, KEY_A, 20) || cap < 1) return 0;
+    unsigned char* r = out_recs; r[0] = 2; memcpy(r + 1, hash, 32);
+    unsigned char t2[32]; memset(t2, 0x22, 32); memcpy(r + 33, t2, 32); unsigned vout = 1; memcpy(r + 65, &vout, 4); unsigned long long v = 3611917; memcpy(r + 69, &v, 8);
+    return 1;
+}
+/* a base with one key (A): FUND at 700000/txpos 1 (TX2, 3611917), SPEND at 700000/txpos 2 (TX3 spends it, value 3611917) */
+static void write_base(void){
+    FILE* f = fopen(AH_FILE, "wb"); ah_header hd; memset(&hd, 0, sizeof hd); hd.magic = AH_MAGIC; hd.version = AH_VERSION; hd.to_height = 700000; hd.body_off = AH_HDR_BYTES;
+    unsigned char zero[AH_HDR_BYTES] = {0}; fwrite(zero, 1, AH_HDR_BYTES, f);
+    ah_group_hdr g; g.type = 2; memset(g.hash, 0, 32); memcpy(g.hash, KEY_A, 20); g.n = 2; fwrite(&g, 1, AH_GROUP_HDR, f);
+    ah_event e1 = { AH_FUND, 700000, 1, 0, 3611917 }; ah_event e2 = { AH_SPEND, 700000, 2, 0, 3611917 }; fwrite(&e1, 1, AH_EVENT_BYTES, f); fwrite(&e2, 1, AH_EVENT_BYTES, f);
+    hd.n_keys = 1; hd.n_events = 2; hd.body_len = AH_GROUP_HDR + 2 * AH_EVENT_BYTES; hd.sparse_off = AH_HDR_BYTES + hd.body_len; hd.sparse_n = 1;
+    ah_sparse sp; sp.type = 2; memcpy(sp.hash, g.hash, 32); sp.off = 0; fwrite(&sp, AH_SPARSE_BYTES, 1, f);
+    fseek(f, 0, SEEK_SET); fwrite(&hd, 1, sizeof hd, f); fclose(f);
+}
 static rj_val* J(const char* lit){ return rj_parse(lit, strlen(lit)); }
 static int g_locks = 0, g_unlocks = 0; static void tlock(void){ g_locks++; } static void tunlock(void){ g_unlocks++; }
 int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, rj_val** result, long* ec, const char** em){
@@ -45,6 +80,10 @@ int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, 
                 *result = J(t); free(t); free(big); return 1; }
             const char* t = "{\"txid\":\"" TX2 "\",\"version\":2,\"locktime\":699999,\"size\":222,\"weight\":561,\"fee\":0.00000377,\"blockhash\":\"" BH "\",\"confirmations\":3,\"blocktime\":1631000000,\"vin\":[{\"txid\":\"" TX3 "\",\"vout\":1,\"scriptSig\":{\"hex\":\"\"},\"txinwitness\":[\"3044aa\"],\"sequence\":4294967293,\"prevout\":{\"generated\":false,\"height\":699990,\"value\":0.03612294,\"scriptPubKey\":{\"hex\":\"00146ffe291a\",\"type\":\"witness_v0_keyhash\",\"address\":\"bc1qprev\"}}}],\"vout\":[{\"value\":0.03611917,\"n\":0,\"scriptPubKey\":{\"hex\":\"76a914aa88ac\",\"type\":\"pubkeyhash\",\"address\":\"1test\"}},{\"value\":0,\"n\":1,\"scriptPubKey\":{\"hex\":\"6a04deadbeef\",\"type\":\"nulldata\"}}]}";
             *result = rj_parse(t, strlen(t)); return 1; }
+        if (p0 && (!strcmp(p0, TX3) || !strcmp(p0, "5555555555555555555555555555555555555555555555555555555555555555"))){
+            /* a confirmed tx used by the address routes (TX3 at 700000, 0x55.. at 700001) */
+            static char t[1200]; snprintf(t, sizeof t, "{\"txid\":\"%s\",\"version\":2,\"locktime\":0,\"size\":100,\"weight\":400,\"fee\":0.00000100,\"blockhash\":\"" BH "\",\"confirmations\":1,\"vin\":[{\"txid\":\"" TX2 "\",\"vout\":0,\"scriptSig\":{\"hex\":\"\"},\"sequence\":0,\"prevout\":{\"generated\":false,\"height\":700000,\"value\":0.03611917,\"scriptPubKey\":{\"hex\":\"0014aa\",\"type\":\"witness_v0_keyhash\",\"address\":\"bc1qaddrA\"}}}],\"vout\":[{\"value\":0.036,\"n\":0,\"scriptPubKey\":{\"hex\":\"0014bb\",\"type\":\"witness_v0_keyhash\",\"address\":\"bc1qother\"}}]}", p0);
+            *result = J(t); return 1; }
         if (p0 && !strcmp(p0, "4444444444444444444444444444444444444444444444444444444444444444")){   /* an unconfirmed tx: no prevout, no fee, no blockhash */
             const char* t = "{\"txid\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"version\":2,\"locktime\":0,\"size\":110,\"weight\":440,\"vin\":[{\"txid\":\"" TX2 "\",\"vout\":0,\"scriptSig\":{\"hex\":\"\"},\"sequence\":0}],\"vout\":[{\"value\":0.03,\"n\":0,\"scriptPubKey\":{\"hex\":\"0014cc\",\"type\":\"witness_v0_keyhash\",\"address\":\"bc1qout\"}}]}";
             *result = rj_parse(t, strlen(t)); return 1; }
@@ -152,7 +191,28 @@ int main(void){
     { rj_val* m = POST("/internal/txs/outspends/by-txid", "[\"" TX2 "\"]"); ok(m && m->nitems == 1 && m->items[0]->nitems == 2, "POST /internal/txs/outspends/by-txid"); rj_free(m); }
     POST("/tx", "0200aa\n"); ok(g_status == 200 && streq(g_out, "4444444444444444444444444444444444444444444444444444444444444444"), "POST /tx broadcasts and returns the txid");
     POST("/tx", "bad"); ok(g_status == 400, "POST /tx with a rejected tx -> 400 with the node's reason");
-    GET("/address/bc1qtest"); ok(g_status == 501, "GET /address/... -> 501 until the history index (stage 2)");
+    GET("/address/bc1qtest"); ok(g_status == 400, "GET /address/<unknown to the decoder> -> 400");
+    /* ---- the address routes (stage 2) ---- */
+    GET("/address/bc1qaddrA"); ok(g_status == 501, "without the history index: 501 naming the builder");
+    GET("/address/notanaddress"); ok(g_status == 400, "an invalid address: 400");
+    write_base();
+    { rj_val* a = GET("/address/bc1qaddrA"); rj_val* cs = G(a, "chain_stats");
+      ok(a && streq(S(a, "address"), "bc1qaddrA") && streq(S(cs, "funded_txo_count"), "1") && streq(S(cs, "funded_txo_sum"), "3611917") && streq(S(cs, "spent_txo_count"), "1") && streq(S(cs, "spent_txo_sum"), "3611917") && streq(S(cs, "tx_count"), "2"),
+         "GET /address: chain_stats from the base (1 funded, 1 spent, 2 transactions)");
+      ok(a && G(a, "mempool_stats") && streq(S(G(a, "mempool_stats"), "tx_count"), "0"), "...mempool_stats present, zero (this cut)"); rj_free(a); }
+    { rj_val* t = GET("/address/bc1qaddrA/txs");
+      ok(t && t->typ == RJ_ARR && t->nitems == 2 && streq(S(t->items[0], "txid"), TX3) && streq(S(t->items[1], "txid"), TX2), "GET /address/txs: newest first (TX3 the spend, then TX2 the fund), txids resolved through getblock");
+      rj_free(t); }
+    { rj_val* t = GET("/address/bc1qaddrA/txs/chain/" TX3); ok(t && t->nitems == 1 && streq(S(t->items[0], "txid"), TX2), "GET /address/txs/chain/:lastSeen pages after it"); rj_free(t); }
+    { rj_val* t = GET("/address/bc1qaddrA/txs/mempool"); ok(t && t->typ == RJ_ARR && t->nitems == 0, "GET /address/txs/mempool: empty in this cut"); rj_free(t); }
+    { rj_val* u = GET("/address/bc1qaddrA/utxo"); ok(u && u->nitems == 1 && streq(S(u->items[0], "txid"), TX2) && streq(S(u->items[0], "vout"), "1") && streq(S(u->items[0], "value"), "3611917") && streq(S(G(u->items[0], "status"), "block_height"), "700000"), "GET /address/utxo: the reverse index's record with its block height"); rj_free(u); }
+    g_tail_on = 1;
+    { rj_val* a = GET("/address/bc1qaddrA"); rj_val* cs = G(a, "chain_stats");
+      ok(a && streq(S(cs, "funded_txo_count"), "2") && streq(S(cs, "funded_txo_sum"), "3612617") && streq(S(cs, "spent_txo_count"), "2") && streq(S(cs, "tx_count"), "4"), "with the tail journal: the ADD, DEL and TOUCH above the base count in (2 funded, 2 spent, 4 txs)"); rj_free(a); }
+    { rj_val* t = GET("/address/bc1qaddrA/txs"); ok(t && t->nitems >= 3 && streq(S(t->items[0], "txid"), "4444444444444444444444444444444444444444444444444444444444444444"), "...the newest transaction is the tail's spender (0x44.., height 700002)"); rj_free(t); }
+    { rj_val* u = GET("/address/bc1qaddrA/utxo"); ok(u && u->nitems == 1, "...utxo: the tail's ADD then DEL cancel; the base's record remains"); rj_free(u); }
+    g_tail_on = 0; unlink(AH_FILE);
+    GET("/scripthash/aa"); ok(g_status == 501, "scripthash routes: 501 (the index is keyed by address)");
     GET("/nothing/here"); ok(g_status == 404, "an unknown route -> 404");
     ok(g_locks > 20 && g_locks == g_unlocks, "the execution lock was taken and released around every dispatch, not once per request");
     /* a response over 1 MiB: the writer reports the needed length, the reply must grow (found live: garbage after the first MiB) */

@@ -428,3 +428,30 @@ long axt_read_address(int type, const u8 hash[32],
     *nutxo = nu;
     return ntxid;
 }
+
+/* ---- the history reader's tail (2026-09-08) ---------------------------------
+ * The address history index (addr_hist_fmt.h) covers heights up to its
+ * to_height; the journal above it is this. cb receives each record of the
+ * key above `min_height` in journal order: op (ADD/DEL/TOUCH), txid, vout,
+ * value, height. Returns the number delivered, -1 without a journal. */
+long axt_read_events(int type, const u8 hash[32], long min_height,
+                     int (*cb)(void* ctx, int op, const u8 txid[32], u32 vout, u64 value, u32 height), void* ctx){
+    int fd = open(AXF_TAIL_FILE, O_RDONLY); if (fd < 0) return -1;
+    struct stat sb; if (fstat(fd, &sb) != 0){ close(fd); return -1; }
+    size_t sz = (size_t)(sb.st_size / AXF_TAIL_REC) * AXF_TAIL_REC;
+    u8* buf = sz ? malloc(sz) : 0;
+    if (sz && (!buf || pread(fd, buf, sz, 0) != (ssize_t)sz)){ free(buf); close(fd); return -1; }
+    close(fd);
+    long n = 0;
+    for (size_t off = 0; off + AXF_TAIL_REC <= sz; off += AXF_TAIL_REC){
+        const u8* r = buf + off;
+        if (r[1] != (u8)type || memcmp(r + 2, hash, 32) != 0) continue;
+        u32 vout, height; u64 value; memcpy(&vout, r + 66, 4); memcpy(&value, r + 70, 8); memcpy(&height, r + 78, 4);
+        if ((long)height <= min_height) continue;
+        if (cb && !cb(ctx, r[0], r + 34, vout, value, height)) break;
+        n++;
+    }
+    free(buf);
+    return n;
+}
+
