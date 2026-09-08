@@ -47,9 +47,21 @@ typedef struct { uint8_t type; uint8_t hash[32]; uint32_t n; } ah_group_hdr;
 typedef struct { uint8_t type; uint8_t hash[32]; uint64_t off; } ah_sparse;
 typedef struct { uint32_t magic, version, to_height, pad; uint64_t n_keys, n_events, body_off, body_len, sparse_off, sparse_n; } ah_header;
 #pragma pack(pop)
+/* The key order of the file: hash[0] first, then type, then the rest of
+ * the hash. The builder buckets keys by hash[0] and writes the buckets in
+ * order, sorting each one with this comparator; hash[0] is constant inside
+ * a bucket, so the global sequence is sorted by exactly this order and the
+ * reader's binary search over the sparse index is valid.
+ *
+ * 2026-09-08: the comparator was type-major (type, then the 32 bytes) while
+ * the file was bucket-major -- the sparse search landed anywhere and every
+ * base lookup on production returned nothing: the genesis address showed
+ * its seven tail events, not its 78,688 fundings. The order below is the
+ * order the buckets were written in, so the 207 GB base is valid as it is. */
 static inline int ah_key_cmp(uint8_t ta, const uint8_t* ha, uint8_t tb, const uint8_t* hb){
+    if (ha[0] != hb[0]) return ha[0] < hb[0] ? -1 : 1;
     if (ta != tb) return ta < tb ? -1 : 1;
-    return memcmp(ha, hb, 32);
+    return memcmp(ha + 1, hb + 1, 31);
 }
 static inline int ah_event_cmp(const ah_event* a, const ah_event* b){
     if (a->height != b->height) return a->height < b->height ? -1 : 1;
