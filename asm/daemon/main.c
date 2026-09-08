@@ -3814,7 +3814,8 @@ static long dlc_commit_chunk(void* st, const char* path, long* cursor,
  * are gone: what is not here is not coming), on shutdown, or when orphaned.
  * poll_ms is the wait between looks when nothing is staged. */
 static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void* st,
-                             dlc_append_fn append, dlc_present_fn present, long poll_ms, pid_t parent){
+                             dlc_append_fn append, dlc_present_fn present, long poll_ms, pid_t parent,
+                             void (*synced)(void* st)){
     unsigned char* buf = mmap(0, DLC_STAGE_MAX_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if(buf == MAP_FAILED){ fprintf(stderr, "[dlc committer] cannot map the chunk buffer\n"); return 1; }
     long fh = ctl[DLC_CTL_FIRST_HOLE]; if(fh < start_h) fh = start_h;
@@ -3830,6 +3831,7 @@ static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void*
         char path[64]; dlc_stage_path(path, sizeof path, lo);
         long r = dlc_commit_chunk(st, path, &fh, append, present, buf, DLC_STAGE_MAX_BYTES);
         if(r >= 0){
+            if(synced && r > 0) synced(st);                       /* one journal commit per chunk, not per block */
             while(fh <= end_h && present && present(fh)) fh++;
             if(fh > ctl[DLC_CTL_FIRST_HOLE]) ctl[DLC_CTL_FIRST_HOLE] = fh;
             ctl[DLC_CTL_COMMIT_TIP] = fh - 1;
@@ -3856,6 +3858,24 @@ static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void*
  * append goes to the NEWEST blk file (store_init says file 0, and an append
  * there would fill the end of blk00000.dat -- one more way to a
  * non-monotonic layout) */
+/* Run 18 (2026-09-08), first minutes: 103 chunks staged, the committer at
+ * 96 blocks/s in jbd2_log_wait_commit -- store_append_shared does an
+ * fdatasync per block (STO-11: bytes durable before the record), and with
+ * one sequential writer that is one journal commit per block. The workers
+ * had the same limit under the lock; the committer is the one place that
+ * can batch it: the per-block sync is off in THIS process only (a fork:
+ * the switch is a per-process global) and the chunk's blk and index fds
+ * are fdatasync'd once after its appends. ext4 data=ordered keeps the
+ * STO-11 order at the commit boundary (extending writes are flushed before
+ * the commit that names them), a crash loses at most the last chunk's
+ * appends, and the boot check cuts the index at the first record whose
+ * body is missing. */
+extern void store_set_sync(int on);
+static void dlc_store_sync_chunk(void* st){
+    int bfd = *(int*)((char*)st + 0), ifd = *(int*)((char*)st + 8);
+    if(bfd >= 0) fdatasync(bfd);
+    if(ifd >= 0) fdatasync(ifd);
+}
 static int dlc_committer_main(volatile long* ctl, long start_h, long end_h, pid_t parent){
     int lfd = open("append.lock", O_RDWR | O_CREAT, 0644);
     if(lfd < 0){ fprintf(stderr, "[dlc committer] no lock\n"); return 1; }
@@ -3864,7 +3884,8 @@ static int dlc_committer_main(volatile long* ctl, long start_h, long end_h, pid_
     { extern unsigned int net_magic; *(int*)((char*)st + 36) = (int)net_magic; }
     *(int*)((char*)st + 28) = 0; *(int*)((char*)st + 0) = -1;
     store_reload(st);
-    int r = dlc_committer_run(ctl, start_h, end_h, st, store_append_shared, dlc_index_present, 20, parent);
+    store_set_sync(0);                                       /* this process only; synced per chunk below */
+    int r = dlc_committer_run(ctl, start_h, end_h, st, store_append_shared, dlc_index_present, 20, parent, dlc_store_sync_chunk);
     close(lfd);
     return r;
 }

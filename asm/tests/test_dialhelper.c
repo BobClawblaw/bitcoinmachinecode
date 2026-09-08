@@ -27,6 +27,7 @@ static long rec_append(void* st, long h, const unsigned char hash[32], const uns
     return h;
 }
 static int present_below(long h){ return h < g_present_below; }
+static int g_synced_n = 0; static void rec_synced(void* st){ (void)st; g_synced_n++; }
 /* write stage/c<lo>.chunk directly in the committer's record format: n blocks of 100 bytes, byte pattern = height */
 static long stage_chunk(long lo, int n){
     char path[64]; snprintf(path, sizeof path, "stage/c%ld.chunk", lo);
@@ -400,12 +401,14 @@ int main(void){
           for (long i = 0; i < DLC_CTL_RING + DLC_RETRY_MAX; i++) ctl2[i] = i < DLC_CTL_RING ? 0 : -1;
           ctl2[DLC_CTL_FIRST_HOLE] = 100; ctl2[DLC_CTL_STOP_COMMIT] = 1; ctl2[DLC_CTL_STAGED] = 2;
           stage_chunk(100, 40); stage_chunk(140, 40); g_rec_n = 0; g_rec_ok = 1; g_present_below = -1;
-          int rc = dlc_committer_run(ctl2, 100, 999, 0, rec_append, 0, 5, 0);
+          g_synced_n = 0;
+          int rc = dlc_committer_run(ctl2, 100, 999, 0, rec_append, 0, 5, 0, rec_synced);
           ok(rc == 0 && g_rec_n == 80 && g_rec_h[0] == 100 && g_rec_h[79] == 179 && g_rec_ok,
              "committer_run: two staged chunks appended in order (80 blocks)");
           ok(ctl2[DLC_CTL_FIRST_HOLE] == 180 && ctl2[DLC_CTL_COMMIT_TIP] == 179 && ctl2[DLC_CTL_N_COMMIT] == 2 && ctl2[DLC_CTL_STAGED] == 0,
              "...first hole 180 and committed tip 179 published, 2 commits counted, the gauge back to 0");
           ok(!dlc_stage_exists(100) && !dlc_stage_exists(140), "...and both files are gone; it exited at the missing chunk because STOP was set");
+          ok(g_synced_n == 2, "...and the store was synced once per committed chunk (2), not once per block (80)");
           /* the window's help guard, and the next run's wipe */
           stage_chunk(180, 40);
           ok(dlc_stage_exists(180), "a staged chunk is visible to the help guard: the worker must not refetch it");
