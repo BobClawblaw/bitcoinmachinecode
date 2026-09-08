@@ -497,7 +497,7 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
   (`peerbloomfilters`), `whitelistrelay`/`whitelistforcerelay`, GUI,
   `loadtxoutset` (assumeutxo import; export via `dumptxoutset` works),
   `walletnotify`, `maxtxfee` enforcement, `uacomment`,
-  `rpcthreads`/`rpcworkqueue`, `includeconf`/`settings`. Each unimplemented
+  `includeconf`/`settings`. Each unimplemented
   Core option is named in the startup log when set.
 - **Chains.** Legacy testnet3 (`testnet=1`, `chain=test`) is refused.
 - **One relay edge.** A transaction announced exactly once during a leg's

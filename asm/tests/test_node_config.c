@@ -380,7 +380,8 @@ int main(void){
         printf("PASS: no-effect table names mocktime/rest, not implemented keys\n");
     else { printf("FAIL: no-effect table\n"); failures++; }
     node_config_load("/nonexistent/reset.conf");
-    if (g_cfg.blockmaxweight==4000000 && g_cfg.txconfirmtarget==6 && g_cfg.walletrbf==1 && g_cfg.rpcthreads==16 && g_cfg.maxtipage==86400 && !strcmp(g_cfg.addresstype,"bech32") && g_cfg.n_uacomment==0)
+    /* rpcthreads: 4 is Core's DEFAULT_HTTP_THREADS; this line pinned 16 until 2026-09-08 (a test that encoded the defect) */
+    if (g_cfg.blockmaxweight==4000000 && g_cfg.txconfirmtarget==6 && g_cfg.walletrbf==1 && g_cfg.rpcthreads==4 && g_cfg.maxtipage==86400 && !strcmp(g_cfg.addresstype,"bech32") && g_cfg.n_uacomment==0)
         printf("PASS: Core defaults restored on reload\n");
     else { printf("FAIL: defaults after reload\n"); failures++; }
 

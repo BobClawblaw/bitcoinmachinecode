@@ -293,7 +293,7 @@ static void set_defaults(void){
     g_cfg.txreconciliation = 0;
     g_cfg.logips = 0; g_cfg.logtimestamps = 1; g_cfg.logtimemicros = 0; g_cfg.logthreadnames = 0;
     g_cfg.logsourcelocations = 0; g_cfg.shrinkdebugfile = 1; g_cfg.printtoconsole = 0; g_cfg.loglevel[0] = 0;
-    g_cfg.rpcthreads = 16; g_cfg.rpcworkqueue = 64; g_cfg.rpcservertimeout = 30; g_cfg.n_rpcwhitelist = 0;
+    g_cfg.rpcthreads = 4; g_cfg.rpcworkqueue = 64; g_cfg.rpcservertimeout = 30; g_cfg.n_rpcwhitelist = 0;   /* Core: DEFAULT_HTTP_THREADS 4, DEFAULT_HTTP_WORKQUEUE 64, DEFAULT_HTTP_SERVER_TIMEOUT 30 (was 16 threads until 2026-09-08) */
     g_cfg.rpcwhitelistdefault = -1; g_cfg.rpccookieperms = 0;
     g_cfg.limitclustercount = 64; g_cfg.limitclustersize_kvb = 101;
     g_cfg.checkblockindex = 0; g_cfg.checkmempool = 0; g_cfg.checkaddrman = 0; g_cfg.capturemessages = 0;

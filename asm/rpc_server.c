@@ -64,7 +64,7 @@ static const char* g_user;
 static const char* g_pass;
 
 /* ---- -rpcthreads / -rpcworkqueue / -rpcservertimeout (2026-09-01) ---- */
-static int g_threads = 16, g_workqueue = 64, g_timeout_s = 30;
+static int g_threads = 4, g_workqueue = 64, g_timeout_s = 30;   /* Core's DEFAULT_HTTP_THREADS/WORKQUEUE/SERVER_TIMEOUT; 16 threads was a divergence until 2026-09-08 */
 
 /* ---- RPC-4 (audit 2026-09-03): a TOTAL deadline for reading one request ----
  *
@@ -1181,7 +1181,7 @@ int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
                                ? ((struct sockaddr_in6*)&ss)->sin6_port
                                : ((struct sockaddr_in*)&ss)->sin_port); }
 
-    g_threads   = cfg->threads   > 0 ? (cfg->threads > 256 ? 256 : cfg->threads) : 16;
+    g_threads   = cfg->threads   > 0 ? (cfg->threads > 256 ? 256 : cfg->threads) : 4;
     g_workqueue = cfg->workqueue > 0 ? (cfg->workqueue > RPC_QUEUE_CAP ? RPC_QUEUE_CAP : cfg->workqueue) : 64;
     g_timeout_s = cfg->timeout_s > 0 ? cfg->timeout_s : 30;
     /* RPC-4: the total-read budget. Env-overridable so an operator on a
