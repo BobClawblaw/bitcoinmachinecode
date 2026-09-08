@@ -121,3 +121,11 @@ reverse UTXO index plus a tail journal, not the history Esplora's
 event with height, position, value), its builder over the undo data now
 kept for every block, the daemon's tail for new blocks, and the routes.
 
+## Stage 2, built the same day
+
+`docs/releases/2026-09-08-address-history.md`. The estimate given earlier
+in the day (30 to 40 GB) was wrong by a factor of five: a history that
+keeps a value per event and a 33-byte key per address is about 200 GB
+uncompressed on mainnet. Still a quarter of a true Esplora, with no
+second process. A varint-packed layout could roughly halve it later.
+
