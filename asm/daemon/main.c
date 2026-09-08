@@ -8675,7 +8675,8 @@ int main(int argc, char** argv){
       wallet_pass_set_file(g_cfg.walletpassfile); }
     /* ---- 2026-09-01 option-surface completion: push the config into the
      * subsystems that own each behaviour (none of them include node_config.h) */
-    if(g_cfg.shrinkdebugfile) log_shrink(g_logpath);
+    /* shrinkdebugfile moved after the chdir into the chain directory (2026-09-08): with the default relative
+     * "debug.log" it used to shrink whatever debug.log sat in the directory the daemon was started from */
     { /* -uacomment: Core renders "/Name:ver(c1; c2)/" */
       extern unsigned char node_ua_buf[256]; extern unsigned long long node_ua_len;
       char ua[256]; int n = snprintf(ua, sizeof ua, "%s", NODE_UA_STRING);
@@ -8834,6 +8835,14 @@ int main(int argc, char** argv){
     /* DMN-1: before ANYTHING touches the datadir -- archive_trim_derived_tails
      * truncates, genesis seeding writes, the worker fork owns the LSM. */
     if(!datadir_lock_acquire(effdir)) return 1;
+    /* 2026-09-08: from here on the log goes where Core's goes. The lines
+     * above this point (config echo, chain selection, lock failures) reach
+     * whatever launched us, as Core's early lines do. */
+    if(g_cfg.shrinkdebugfile) log_shrink(g_logpath);
+    if(log_sink_open(g_logpath, g_cfg.printtoconsole))
+        fprintf(stderr,"[boot] logging to %s/%s (debuglogfile)%s\n", effdir, g_logpath, g_cfg.printtoconsole ? " and to the console (printtoconsole=1)" : "");
+    else
+        fprintf(stderr,"[boot] WARNING: could not open %s/%s for logging (%s) -- logging to stderr as launched\n", effdir, g_logpath, strerror(errno));
     /* DMN-1: before ANYTHING touches the datadir -- archive_trim_derived_tails
      * truncates, genesis seeding writes, the worker fork owns the LSM. */
     if(g_chainp->id != CHAIN_MAIN){

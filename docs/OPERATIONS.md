@@ -468,9 +468,24 @@ a row on one chunk and every hundredth), and `REJECT h=`.
 
 ### Logs
 
-- **Console log**: `logs/<chain>/bitcoin.<chain>.log` (systemd stdout/stderr):
-  `[boot]`, `[config]`, `[rpc]`, `[dl]`, `[tx_accept]`, `[tor]`, `[zmq]`.
-- **Daemon's own leveled log**: `<datadir>/<chain>/debug.log` — Core's filename, in the per-chain directory, exactly where Core puts its own (2026-09-06; it was `logs/bitcoind.log` before).
+- **The log**: `<datadir>/<chain>/debug.log`, Core's file in Core's place.
+  Since 2026-09-08 everything the daemon prints goes there by default,
+  every `[boot]`, `[config]`, `[rpc]`, `[dl]`, `[dlc]`, `[utxo_live]`,
+  `[tx_accept]`, `[tor]`, `[zmq]` line, from every forked child. Before that
+  stderr was the log and only the assembly logger's few lines reached
+  `debug.log`. `printtoconsole=1` sends the same lines to the console as
+  well (Core's semantics); `debuglogfile=0` turns the file off.
+  `shrinkdebugfile=1` (default) keeps the last 200 KB of a file over 10 MB
+  at start-up; between restarts the file grows, as Core's does, so rotate
+  it (`config/logrotate-bmc.conf` covers `data/*/debug.log` with
+  `copytruncate`).
+- **What still reaches the launcher's stderr**: the lines printed before
+  the chain directory is entered, i.e. the config echo, chain selection
+  and a datadir-lock failure, and a `[boot] logging to ...` line naming
+  the file. Under systemd those land in `logs/<chain>/bitcoin.<chain>.log`.
+  A deployment that wants the old arrangement, everything on stderr and
+  nothing in the chain directory, sets `printtoconsole=1` and
+  `debuglogfile=0`.
 - `journalctl -u bmcbitcoind` holds only systemd's lines (start, stop,
   `Killing` on a stop timeout).
 
@@ -668,7 +683,7 @@ Extra listeners: onion service target at chain default P2P port + 1
 | `bmcwallet.enc` / `bmcwallet.dat` (+ `.txlog`), `walletkeys.dat`, `walletscan.dat` | wallet container / plaintext store and journal, HD keys, rescan records |
 | `onion_v3_private_key`, `i2p_private_key` | persisted onion service key and I2P destination |
 | `txindex.dat` + `txindex.tail`, `addr_index.dat`, `bfilters.dat` + `bfilters.idx`, `coinstats.dat` | optional indexes |
-| `debug.log` | the daemon's own leveled log (was `logs/bitcoind.log` before 2026-09-06) |
+| `debug.log` | the daemon's log, everything, as Core (since 2026-09-08; before that only the leveled logger's lines; `logs/bitcoind.log` before 2026-09-06) |
 
 Outside the chain directory: `<datadir>/bitcoin.conf` or
 `<repo>/config/bitcoin.conf`; `<repo>/logs/<chain>/bitcoin.<chain>.log`;

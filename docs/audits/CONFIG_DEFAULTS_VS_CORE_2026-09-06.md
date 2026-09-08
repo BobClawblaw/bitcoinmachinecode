@@ -72,7 +72,7 @@ download worker count and the verifier ignored it entirely.
 | `datacarrier` | 1 | 1 | match |
 | `datacarriersize` | 100000 | 100000 | match |
 | `dbcache` | 1024 | (none stated) | match (DEFAULT_DB_CACHE 1024; our devlog's "450" is stale) |
-| `debuglogfile` | logs/bitcoind.log | debug.log | **FIXED** logs/bitcoind.log -> debug.log (chain dir, as Core) |
+| `debuglogfile` | logs/bitcoind.log | debug.log | **FIXED** logs/bitcoind.log -> debug.log (chain dir, as Core); and on 2026-09-08 the WHOLE log goes there (until then only the leveled logger did, stderr was the log): `printtoconsole` and `shrinkdebugfile` now carry Core's semantics too |
 | `disablewallet` | 0 | (none stated) | match (DEFAULT_DISABLE_WALLET false) |
 | `discardfee` | 0.0001 | 0.0001 | match |
 | `discover` | 1 | 1 | match |

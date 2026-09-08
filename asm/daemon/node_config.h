@@ -376,3 +376,16 @@ long dl_gate_reserve(volatile long long* next_ms, long long now_ms, long bytes, 
 void ul_gate_configure(int kbytes_per_second);                  /* after node_config_load; 0 = off */
 void ul_gate_account(long bytes);                               /* charge bytes about to be sent; sleeps out the debt first */
 
+/* ---- the log sink (2026-09-08): Core's -debuglogfile / -printtoconsole ----
+ * Until today stderr WAS the log and whoever launched the daemon captured
+ * it; <chaindir>/debug.log held only the assembly logger's few lines. Core
+ * writes everything to debug.log and reaches the console only with
+ * -printtoconsole=1 (then both). log_sink_open() makes fd 2 that: with
+ * printtoconsole=0 it is the file (every forked child inherits it and
+ * appends atomically); with printtoconsole=1 a small forked pump copies fd
+ * 2 to both the file and the original console, and outlives the parent
+ * until every writer has closed. path "/dev/null" is -debuglogfile=0.
+ * Returns 1 on success, 0 if the file could not be opened (stderr is then
+ * left as it was, and the caller says so). */
+int log_sink_open(const char* path, int printtoconsole);
+
