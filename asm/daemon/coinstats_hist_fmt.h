@@ -26,6 +26,17 @@
 #define BMC_COINSTATS_HIST_FMT_H
 #include <stdint.h>
 #define CSH_FILE    "coinstats_hist.dat"
+/* 2026-09-08: the history is TWO files. The live index appends its rows to
+ * coinstats_hist.dat (the tail, from the height it was seeded at); the
+ * builder (daemon/build_coinstats_hist.c) writes coinstats_hist_base.dat
+ * (the base, rows 0..to_height) to a temp name and renames it into place,
+ * so the base is either whole or absent -- never half-written into the file
+ * the daemon is appending to, which is what a build that died in pass 4
+ * used to leave behind. The reader prefers the base for h <= to_height. */
+#define CSH_BASE_FILE   "coinstats_hist_base.dat"
+#define CSH_BASE_TMP    "coinstats_hist_base.dat.tmp"
+#define CSH_BASE_MAGIC  0x42485343u   /* "CSHB" */
+#define CSH_TMPDIR      "csh_tmp"     /* the builder's scratch, beside the archive; pass markers + a lock live here */
 #define CSH_MAGIC   0x31485343u   /* "CSH1" */
 #define CSH_ROW_TAG 0x52485343u   /* "CSHR" */
 #define CSH_HDR     64
@@ -36,6 +47,15 @@ typedef struct __attribute__((packed)) {
     int64_t  first_height, last_height;
     uint8_t  pad[CSH_HDR - 32];
 } csh_header_t;
+/* the base's header (64 bytes, so row h sits at the same offset as in the
+ * tail): complete is written LAST, after every row and an fsync; sum is the
+ * sha256 over the concatenated row sums, so a boot check can verify the whole
+ * file against one hash. */
+typedef struct __attribute__((packed)) {
+    uint32_t magic, version, rec, complete;
+    int64_t  to_height, n_rows;
+    uint8_t  sum[32];
+} csh_base_header_t;
 typedef struct __attribute__((packed)) {
     uint32_t tag, gen;
     int64_t  height;

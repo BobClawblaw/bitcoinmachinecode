@@ -13,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <fcntl.h>
 #include "../daemon/coinstats_hist_fmt.h"
 #include "test_tmpdir.h"
 typedef unsigned char u8; typedef uint32_t u32; typedef uint64_t u64;
@@ -83,6 +84,30 @@ int main(void){
     csi_hist_out_t a2; csi_hist_query(101, 1, &a2);
     ck("a row read twice gives the same digest and counters", !memcmp(a.digest, a2.digest, 32) && a.txouts == a2.txouts && a.d_prevout == a2.d_prevout);
     ck("no row: height 104 (not committed) and height 50 (before the baseline) answer 0", csi_hist_query(104, 0, &o) == 0 && csi_hist_query(50, 0, &o) == 0);
+    /* ---- 2026-09-08: the base beneath the tail, and the seam between them ---- */
+    printf("---- the base beneath the tail ----\n");
+    { extern int csi_hist_check(int, char*, unsigned long); extern long csi_hist_base_to(void); extern void sha256_full(u8*, const void*, long);
+      /* a base to 101 built from the tail's own rows 100 and 101 (generation 0),
+       * with rows 0..99 below them (copies of row 100 at their own heights) */
+      csh_row_t r100, r101; int tf = open(CSH_FILE, O_RDONLY);
+      ck("read the tail's rows 100 and 101", tf >= 0 && pread(tf, &r100, sizeof r100, CSH_HDR + 100 * CSH_REC) == (ssize_t)sizeof r100 && pread(tf, &r101, sizeof r101, CSH_HDR + 101 * CSH_REC) == (ssize_t)sizeof r101); close(tf);
+      int bf = open(CSH_BASE_FILE, O_RDWR | O_CREAT | O_TRUNC, 0644); u8* sums = malloc(102 * 32);
+      for (long h = 0; h <= 101; h++){ csh_row_t r = h == 101 ? r101 : r100; r.height = h; r.gen = 0; sha256_full(r.sum, &r, sizeof r - 32); (void)!pwrite(bf, &r, sizeof r, CSH_HDR + h * CSH_REC); memcpy(sums + h * 32, r.sum, 32); }
+      csh_base_header_t bh; memset(&bh, 0, sizeof bh); bh.magic = CSH_BASE_MAGIC; bh.version = 1; bh.rec = CSH_REC; bh.complete = 1; bh.to_height = 101; bh.n_rows = 102; sha256_full(bh.sum, sums, 102 * 32);
+      (void)!pwrite(bf, &bh, sizeof bh, 0); close(bf); free(sums);
+      ck("the base is complete to 101 and coverage now starts at 0 (last still 103)", csi_hist_base_to() == 101 && csi_hist_first() == 0 && csi_hist_last() == 103);
+      ck("a height below the tail answers from the base", csi_hist_query(50, 1, &o) == 1 && o.txouts == 2 && o.digest_valid);
+      ck("height 101 answers from the base with the same block_info the tail gave", csi_hist_query(101, 0, &o) == 1 && o.d_prevout == 250000000ULL && o.d_coinbase == 5000100000ULL);
+      ck("height 102, the first above the base, keeps its block_info (its predecessor comes from the tail, not the base's generation-0 copy)", csi_hist_query(102, 0, &o) == 1 && o.d_coinbase == 4900000000ULL && o.d_scripts == 50000000ULL);
+      char why[200];
+      ck("the seam check passes: base and tail agree at height 100", csi_hist_check(1, why, sizeof why) == 1);
+      /* a base whose rows are intact but disagree with the live index at the seam */
+      bf = open(CSH_BASE_FILE, O_RDWR); csh_row_t bad = r100; bad.gen = 0; bad.txouts += 1; sha256_full(bad.sum, &bad, sizeof bad - 32); (void)!pwrite(bf, &bad, sizeof bad, CSH_HDR + 100 * CSH_REC);
+      sums = malloc(102 * 32); for (long h = 0; h <= 101; h++){ csh_row_t r; (void)!pread(bf, &r, sizeof r, CSH_HDR + h * CSH_REC); memcpy(sums + h * 32, r.sum, 32); }
+      sha256_full(bh.sum, sums, 102 * 32); (void)!pwrite(bf, &bh, sizeof bh, 0); close(bf); free(sums);
+      ck("a base that disagrees with the live index at the seam is quarantined, naming the height", csi_hist_check(1, why, sizeof why) == -1 && strstr(why, "disagrees") && strstr(why, "height 100") && access(CSH_BASE_FILE, F_OK) != 0);
+      ck("coverage is the tail's again: 100..103", csi_hist_first() == 100 && csi_hist_last() == 103); }
+
     /* a re-seed starts a new generation: its baseline has no block_info, and a delta across generations is refused */
     ck("re-seeded at 103 (a new generation)", csi_seed_from_walk(&lst, table, 103) == 1);
     ck("the re-seed's row 103 is a baseline: -1 (no block_info across generations)", csi_hist_query(103, 0, &o) == -1);

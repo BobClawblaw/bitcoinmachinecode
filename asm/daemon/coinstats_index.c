@@ -59,6 +59,8 @@
 #include <errno.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
+#include <sys/file.h>
+#include <sys/resource.h>
 #include "../rpc_node.h"   /* node_status_t: the shared fold ring (csi_ring) */
 
 typedef unsigned char u8;
@@ -195,12 +197,50 @@ static int hist_open(void){
     }
     return 1;
 }
-static int hist_read_row(long h, csh_row_t* row){
-    if (h < 0 || !hist_open()) return 0;
-    if (pread(g_hist_fd, row, sizeof *row, CSH_HDR + (off_t)h * CSH_REC) != (ssize_t)sizeof *row) return 0;
+static int row_ok(long h, const csh_row_t* row){
     if (row->tag != CSH_ROW_TAG || row->height != h) return 0;
     u8 want[32]; sha256_full(want, row, sizeof *row - 32);
     return memcmp(want, row->sum, 32) == 0;
+}
+static int tail_read_row(long h, csh_row_t* row){
+    if (h < 0 || !hist_open()) return 0;
+    if (pread(g_hist_fd, row, sizeof *row, CSH_HDR + (off_t)h * CSH_REC) != (ssize_t)sizeof *row) return 0;
+    return row_ok(h, row);
+}
+/* ---- the base (coinstats_hist_base.dat, the builder's rows 0..to_height) ----
+ * Opened lazily in whichever process reads (the RPC parent, the fold worker);
+ * usable only when its header says complete. Every row is checked as it is
+ * read, so a torn row is "no record", never a wrong answer. The full check
+ * (every row, the header's hash, the seam with the tail) is csi_hist_check
+ * below; a base that fails it is QUARANTINED by rename, so every process sees
+ * it gone and the repair rebuilds it. */
+static int g_base_fd = -1; static csh_base_header_t g_base_hd;
+static void base_close(void);
+static int base_open(void){
+    if (g_base_fd >= 0){
+        /* the builder and the quarantine replace the file by rename: a cached
+         * descriptor would keep answering from the old inode */
+        struct stat a, b;
+        if (fstat(g_base_fd, &a) == 0 && stat(CSH_BASE_FILE, &b) == 0 && a.st_ino == b.st_ino && a.st_dev == b.st_dev) return 1;
+        base_close();
+    }
+    int fd = open(CSH_BASE_FILE, O_RDONLY); if (fd < 0) return 0;
+    csh_base_header_t hd;
+    if (pread(fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd || hd.magic != CSH_BASE_MAGIC || hd.rec != CSH_REC || !hd.complete || hd.to_height < 0 || hd.n_rows != hd.to_height + 1){ close(fd); return 0; }
+    g_base_fd = fd; g_base_hd = hd; return 1;
+}
+static void base_close(void){ if (g_base_fd >= 0) close(g_base_fd); g_base_fd = -1; }
+static int base_read_row(long h, csh_row_t* row){
+    if (h < 0 || !base_open() || h > g_base_hd.to_height) return 0;
+    if (pread(g_base_fd, row, sizeof *row, CSH_HDR + (off_t)h * CSH_REC) != (ssize_t)sizeof *row) return 0;
+    return row_ok(h, row);
+}
+long csi_hist_base_to(void){ return base_open() ? (long)g_base_hd.to_height : -1; }
+/* the row for h: the base for every height it covers (an independent, whole
+ * computation from the archive), the tail above it */
+static int hist_read_row(long h, csh_row_t* row){
+    if (base_open() && h <= g_base_hd.to_height) return base_read_row(h, row);
+    return tail_read_row(h, row);
 }
 static void hist_write_row(long h){
     if (!hist_open()) return;
@@ -240,8 +280,10 @@ static void csi_hist_adopt(long h){
     g_hist_baseline = 1;   /* no row for the adopted height (first run with rows): the next commit is a baseline */
 }
 void csi_hist_mark_baseline(void){ g_hist_baseline = 1; }
-long csi_hist_first(void){ csh_header_t hd; if (!hist_open() || pread(g_hist_fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd) return -1; return (long)hd.first_height; }
-long csi_hist_last(void){ csh_header_t hd; if (!hist_open() || pread(g_hist_fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd) return -1; return (long)hd.last_height; }
+static long tail_first(void){ csh_header_t hd; if (!hist_open() || pread(g_hist_fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd) return -1; return (long)hd.first_height; }
+static long tail_last(void){ csh_header_t hd; if (!hist_open() || pread(g_hist_fd, &hd, sizeof hd, 0) != (ssize_t)sizeof hd) return -1; return (long)hd.last_height; }
+long csi_hist_first(void){ if (base_open()) return 0; return tail_first(); }
+long csi_hist_last(void){ long l = tail_last(), b = csi_hist_base_to(); return l > b ? l : b; }
 /* the RPC's read: 1 = ok; 0 = no row at h; -1 = a baseline row (no predecessor in its generation) */
 int csi_hist_query(long h, int want_digest, csi_hist_out_t* o){
     csh_row_t cur, prev; memset(o, 0, sizeof *o);
@@ -252,12 +294,212 @@ int csi_hist_query(long h, int want_digest, csi_hist_out_t* o){
         num3072_inv(inv, cur.den_acc); memcpy(tmp, cur.num_acc, 384); num3072_mul(tmp, inv); muhash_finalize(o->digest, tmp); o->digest_valid = 1;
     }
     if (h == 0){ o->d_genesis = o->subsidy; o->d_unclaimed = 0; return 1; }
-    if (!hist_read_row(h - 1, &prev) || prev.gen != cur.gen) return -1;
+    /* the predecessor from the same file as cur: a tail row above the base
+     * pairs with the tail's own previous row (same generation), never with the
+     * base's copy of that height (generation 0), so the one height right above
+     * the base keeps its block_info (2026-09-08) */
+    int from_base = base_open() && h <= g_base_hd.to_height;
+    int have_prev = from_base ? base_read_row(h - 1, &prev) : (tail_read_row(h - 1, &prev) || base_read_row(h - 1, &prev));
+    if (!have_prev || prev.gen != cur.gen) return -1;
     o->d_prevout = cur.prevout_spent - prev.prevout_spent; o->d_coinbase = cur.coinbase - prev.coinbase; o->d_new_ex_cb = cur.new_ex_cb - prev.new_ex_cb;
     o->d_scripts = cur.unsp_scripts - prev.unsp_scripts; o->d_genesis = cur.unsp_genesis - prev.unsp_genesis; o->d_bip30 = cur.unsp_bip30 - prev.unsp_bip30;
     o->d_unclaimed = o->subsidy + o->d_prevout - o->d_new_ex_cb - o->d_coinbase - o->d_genesis - o->d_bip30 - o->d_scripts;
     return 1;
 }
+/* ---- the history's health (2026-09-08) ---------------------------------------
+ * "Broken" is one of: no base; a base whose header is not complete or whose
+ * rows do not hash to the header's sum; a base that disagrees with the live
+ * tail where both have a row (the seam: the set's counters and the MuHash
+ * digest at the tail's first height, two independent computations). A base
+ * that fails is renamed to <name>.broken-<epoch> so every process sees it
+ * absent, and the repair below rebuilds it from the archive. */
+static char g_hist_why[200];
+static int  g_hist_state;        /* 0 unchecked, 1 ok, -1 absent, -2 broken (last check in THIS process) */
+const char* csi_hist_why(void){ return g_hist_why; }
+int csi_hist_state(void){ return g_hist_state; }
+static void row_digest(const csh_row_t* r, u8 out[32]){
+    static u8 inv[384] __attribute__((aligned(16))); static u8 tmp[384] __attribute__((aligned(16)));
+    num3072_inv(inv, r->den_acc); memcpy(tmp, r->num_acc, 384); num3072_mul(tmp, inv); muhash_finalize(out, tmp);
+}
+int csi_hist_check(int full, char* why, unsigned long why_cap){
+    char buf[200]; buf[0] = 0;
+    base_close();
+    int r = 1;
+    if (!base_open()){
+        struct stat st;
+        if (stat(CSH_BASE_FILE, &st) != 0){ snprintf(buf, sizeof buf, "no history base (%s absent)", CSH_BASE_FILE); r = -1; }
+        else { snprintf(buf, sizeof buf, "history base header rejected (magic/complete/rows)"); r = 0; }
+    }
+    if (r == 1 && full){
+        long n = (long)g_base_hd.n_rows; u8* sums = malloc((size_t)n * 32); csh_row_t row;
+        if (!sums){ snprintf(buf, sizeof buf, "check: out of memory"); r = 0; }
+        else {
+            for (long h = 0; h < n; h++){
+                if (pread(g_base_fd, &row, sizeof row, CSH_HDR + (off_t)h * CSH_REC) != (ssize_t)sizeof row || !row_ok(h, &row)){
+                    snprintf(buf, sizeof buf, "history base row %ld is torn or missing (of %ld)", h, n); r = 0; break; }
+                memcpy(sums + (size_t)h * 32, row.sum, 32);
+            }
+            if (r == 1){ u8 want[32]; sha256_full(want, sums, n * 32);
+                if (memcmp(want, g_base_hd.sum, 32)){ snprintf(buf, sizeof buf, "history base rows do not hash to the header's sum"); r = 0; } }
+            free(sums);
+        }
+    }
+    if (r == 1){
+        /* the seam: the tail's first row, when the base covers it */
+        long tf = tail_first();
+        if (tf >= 0 && tf <= g_base_hd.to_height){
+            csh_row_t a, b;
+            if (base_read_row(tf, &a) && tail_read_row(tf, &b)){
+                u8 da[32], db[32]; row_digest(&a, da); row_digest(&b, db);
+                if (a.txouts != b.txouts || a.amount != b.amount || a.bogo != b.bogo || memcmp(da, db, 32)){
+                    snprintf(buf, sizeof buf, "history base disagrees with the live index at height %ld (txouts %llu vs %llu, amount %llu vs %llu%s)",
+                             tf, (unsigned long long)a.txouts, (unsigned long long)b.txouts, (unsigned long long)a.amount, (unsigned long long)b.amount,
+                             memcmp(da, db, 32) ? ", digests differ" : ""); r = 0; }
+            }
+        }
+    }
+    if (r == 0){
+        char q[128]; snprintf(q, sizeof q, "%s.broken-%lld", CSH_BASE_FILE, (long long)time(NULL));
+        base_close();
+        if (rename(CSH_BASE_FILE, q) == 0) fprintf(stderr, "[coinstats] %s -- quarantined as %s; the repair rebuilds it\n", buf, q);
+        else fprintf(stderr, "[coinstats] %s -- could not quarantine it (%s)\n", buf, strerror(errno));
+        r = -1;   /* absent now */
+    }
+    if (r == 1 && !buf[0]) snprintf(buf, sizeof buf, "history base complete to %ld", (long)g_base_hd.to_height);
+    g_hist_state = r == 1 ? 1 : r == -1 ? -1 : -2;
+    snprintf(g_hist_why, sizeof g_hist_why, "%s", buf);
+    if (why && why_cap) snprintf(why, why_cap, "%s", buf);
+    return r;
+}
+
+/* ---- the repair: the builder as a supervised child ----------------------------
+ * Runs in the process that folds (the download worker): once a heartbeat it
+ * checks the base (the header every time, every row the first time) and, when
+ * the base is absent, spawns daemon/bmc_build_coinstats_hist beside the
+ * daemon's own executable, niced, with the archive's chain name in the
+ * environment. Never during initial block download (the archive is still
+ * moving), never while another builder holds csh_tmp/lock (one that outlived
+ * a restart finishes on its own and is adopted here), at most
+ * CSI_REPAIR_MAX_ATTEMPTS per boot with CSI_REPAIR_BACKOFF_S between them.
+ * Completion is the file, not the exit status: SIGCHLD is ignored in the
+ * worker (children auto-reap), so a vanished pid means "look at the base". */
+#define CSI_REPAIR_MAX_ATTEMPTS 3
+#define CSI_REPAIR_BACKOFF_S    (6 * 3600)
+static struct {
+    int enabled, workers, configured, checked_full;
+    char builder[512], chaindir[512], chain[16];
+    pid_t pid; long long started, next_allowed; int attempts; long to;
+    int state;   /* CSI_REPAIR_* */
+} g_rep;
+enum { CSI_REPAIR_IDLE = 0, CSI_REPAIR_OK = 1, CSI_REPAIR_RUNNING = 2, CSI_REPAIR_WAIT_LOCK = 3, CSI_REPAIR_BACKOFF = 4, CSI_REPAIR_DISABLED = 5, CSI_REPAIR_IBD = 6, CSI_REPAIR_GAVE_UP = 7, CSI_REPAIR_NO_BUILDER = 8 };
+void csi_hist_repair_configure(const char* builder, const char* chaindir, const char* chain, int workers, int enabled){
+    memset(&g_rep, 0, sizeof g_rep);
+    snprintf(g_rep.builder, sizeof g_rep.builder, "%s", builder ? builder : "");
+    snprintf(g_rep.chaindir, sizeof g_rep.chaindir, "%s", chaindir ? chaindir : ".");
+    snprintf(g_rep.chain, sizeof g_rep.chain, "%s", chain ? chain : "main");
+    g_rep.workers = workers; g_rep.enabled = enabled; g_rep.configured = 1; g_rep.pid = -1;
+}
+int csi_hist_repair_state(void){ return g_rep.state; }
+pid_t csi_hist_repair_pid(void){ return g_rep.pid; }
+static int auto_workers(void){
+    long n = sysconf(_SC_NPROCESSORS_ONLN); if (n < 1) n = 1;
+    long w = n / 4; if (w < 2) w = 2; if (w > 8) w = 8; return (int)w;
+}
+static int lock_is_held(void){
+    char b[600]; snprintf(b, sizeof b, "%s/" CSH_TMPDIR "/lock", g_rep.chaindir);
+    int fd = open(b, O_RDONLY); if (fd < 0) return 0;
+    int held = flock(fd, LOCK_EX | LOCK_NB) != 0; if (!held) flock(fd, LOCK_UN);
+    close(fd); return held;
+}
+static int child_gone(pid_t pid){
+    int st = 0; pid_t w = waitpid(pid, &st, WNOHANG);
+    if (w == pid) return 1;                              /* reaped here (SIGCHLD not ignored: tests) */
+    if (w < 0 && errno == ECHILD) return kill(pid, 0) != 0 && errno == ESRCH;   /* auto-reaped: the pid is simply gone */
+    return 0;
+}
+static void repair_spawn(long to, long long now){
+    int W = g_rep.workers > 0 ? g_rep.workers : auto_workers();
+    char to_s[32], w_s[16]; snprintf(to_s, sizeof to_s, "%ld", to); snprintf(w_s, sizeof w_s, "%d", W);
+    pid_t pid = fork();
+    if (pid < 0){ fprintf(stderr, "[coinstats] repair: fork failed (%s)\n", strerror(errno)); return; }
+    if (pid == 0){
+        setpriority(PRIO_PROCESS, 0, 10);                 /* best-effort I/O follows the nice value */
+        setenv("BMC_CHAIN", g_rep.chain, 1);
+        execl(g_rep.builder, "bmc_build_coinstats_hist", g_rep.chaindir, to_s, w_s, (char*)0);
+        fprintf(stderr, "[coinstats] repair: exec %s failed (%s)\n", g_rep.builder, strerror(errno));
+        _exit(127);
+    }
+    g_rep.pid = pid; g_rep.started = now; g_rep.to = to; g_rep.attempts++; g_rep.state = CSI_REPAIR_RUNNING;
+    fprintf(stderr, "[coinstats] repair: history base %s -- building rows 0..%ld with %d worker(s) (pid %d, attempt %d of %d; %s)\n",
+            g_hist_state == -1 ? "absent" : "broken", to, W, (int)pid, g_rep.attempts, CSI_REPAIR_MAX_ATTEMPTS, g_rep.builder);
+}
+/* one tick; returns the state. applied = the height the base should reach (the
+ * engine's applied height, or the archive tip without an engine). */
+static int repair_tick_inner(long applied, int in_ibd, long long now);
+static void status_publish(void);
+int csi_hist_repair_tick(long applied, int in_ibd, long long now){
+    int r = repair_tick_inner(applied, in_ibd, now);
+    if (g_rep.configured) status_publish();
+    return r;
+}
+static int repair_tick_inner(long applied, int in_ibd, long long now){
+    if (!g_rep.configured) return CSI_REPAIR_IDLE;
+    if (g_rep.state == CSI_REPAIR_RUNNING){
+        if (!child_gone(g_rep.pid)) return CSI_REPAIR_RUNNING;
+        long long secs = now - g_rep.started; pid_t was = g_rep.pid; g_rep.pid = -1;
+        int r = csi_hist_check(1, 0, 0);
+        if (r == 1){ g_rep.state = CSI_REPAIR_OK; fprintf(stderr, "[coinstats] repair: history base rebuilt, rows 0..%ld verified (pid %d, %llds)\n", csi_hist_base_to(), (int)was, secs); return g_rep.state; }
+        g_rep.next_allowed = now + CSI_REPAIR_BACKOFF_S;
+        g_rep.state = g_rep.attempts >= CSI_REPAIR_MAX_ATTEMPTS ? CSI_REPAIR_GAVE_UP : CSI_REPAIR_BACKOFF;
+        fprintf(stderr, "[coinstats] repair: builder pid %d ended after %llds without a usable base (%s); %s\n", (int)was, secs, g_hist_why,
+                g_rep.state == CSI_REPAIR_GAVE_UP ? "no more attempts this boot" : "next attempt in 6 h");
+        return g_rep.state;
+    }
+    int r = csi_hist_check(!g_rep.checked_full, 0, 0); g_rep.checked_full = 1;
+    if (r == 1){ if (g_rep.state != CSI_REPAIR_OK) fprintf(stderr, "[coinstats] %s\n", g_hist_why); g_rep.state = CSI_REPAIR_OK; return g_rep.state; }
+    if (!g_rep.enabled){ g_rep.state = CSI_REPAIR_DISABLED; return g_rep.state; }
+    if (g_rep.attempts >= CSI_REPAIR_MAX_ATTEMPTS){ g_rep.state = CSI_REPAIR_GAVE_UP; return g_rep.state; }
+    if (now < g_rep.next_allowed){ g_rep.state = CSI_REPAIR_BACKOFF; return g_rep.state; }
+    if (in_ibd){ g_rep.state = CSI_REPAIR_IBD; return g_rep.state; }
+    if (lock_is_held()){ if (g_rep.state != CSI_REPAIR_WAIT_LOCK) fprintf(stderr, "[coinstats] repair: another builder holds " CSH_TMPDIR "/lock -- waiting for it\n"); g_rep.state = CSI_REPAIR_WAIT_LOCK; return g_rep.state; }
+    if (!g_rep.builder[0] || access(g_rep.builder, X_OK) != 0){ if (g_rep.state != CSI_REPAIR_NO_BUILDER) fprintf(stderr, "[coinstats] repair: builder %s not executable -- cannot rebuild the history base\n", g_rep.builder); g_rep.state = CSI_REPAIR_NO_BUILDER; return g_rep.state; }
+    if (applied < 0){ g_rep.state = CSI_REPAIR_IDLE; return g_rep.state; }
+    repair_spawn(applied, now);
+    return g_rep.state;
+}
+/* one line for the RPC's refusal and the log. The supervisor runs in the fold
+ * worker; the RPC answers from the parent, so the worker writes the line to
+ * coinstats_hist.status on every tick and an unconfigured process reads it. */
+#define CSH_STATUS_FILE "coinstats_hist.status"
+static const char* status_line(void);
+const char* csi_hist_status(void){
+    static char s[320];
+    if (g_rep.configured) return status_line();
+    FILE* f = fopen(CSH_STATUS_FILE, "r");
+    if (f){ if (fgets(s, sizeof s, f)){ size_t n = strlen(s); while (n && (s[n-1] == '\n' || s[n-1] == '\r')) s[--n] = 0; fclose(f); if (s[0]) return s; } fclose(f); }
+    return status_line();
+}
+static void status_publish(void){
+    char tmp[64]; snprintf(tmp, sizeof tmp, CSH_STATUS_FILE ".tmp");
+    FILE* f = fopen(tmp, "w"); if (!f) return;
+    fprintf(f, "%s\n", status_line()); fclose(f); rename(tmp, CSH_STATUS_FILE);
+}
+static const char* status_line(void){
+    static char s[320];
+    switch (g_rep.state){
+    case CSI_REPAIR_RUNNING:   snprintf(s, sizeof s, "the history base is being rebuilt (builder pid %d, rows 0..%ld, attempt %d)", (int)g_rep.pid, g_rep.to, g_rep.attempts); break;
+    case CSI_REPAIR_WAIT_LOCK: snprintf(s, sizeof s, "a history builder is running outside this process; its base is adopted when it finishes"); break;
+    case CSI_REPAIR_BACKOFF:   snprintf(s, sizeof s, "%s; the rebuild failed %d time(s), next attempt in %llds", g_hist_why, g_rep.attempts, (long long)(g_rep.next_allowed - time(NULL))); break;
+    case CSI_REPAIR_GAVE_UP:   snprintf(s, sizeof s, "%s; %d rebuilds failed this boot, restart to retry", g_hist_why, g_rep.attempts); break;
+    case CSI_REPAIR_DISABLED:  snprintf(s, sizeof s, "%s; bmc.coinstatshistrepair=0, run daemon/bmc_build_coinstats_hist by hand", g_hist_why); break;
+    case CSI_REPAIR_IBD:       snprintf(s, sizeof s, "%s; the rebuild waits for initial block download to finish", g_hist_why); break;
+    case CSI_REPAIR_NO_BUILDER: snprintf(s, sizeof s, "%s; the builder binary is missing beside the daemon", g_hist_why); break;
+    case CSI_REPAIR_OK:        snprintf(s, sizeof s, "%s", g_hist_why); break;
+    default:                   snprintf(s, sizeof s, "%s", g_hist_why[0] ? g_hist_why : "the history base has not been checked yet"); break;
+    }
+    return s;
+}
+
 /* Bulk catch-up (2026-09-06): set by csi_defer_to_caught_up while the connect
  * loop is bulk-sized. The observers are inert (g_csi.valid == 0, no file on
  * disk, so the RPC cannot serve a stale record) until utxo_live's caught-up

@@ -141,6 +141,8 @@ typedef struct {
     int dial_rate_limit;   /* bmc.dialratelimit: max outbound connection ATTEMPTS per second, node-wide (0 = off) */
     int download_rate_limit_kbps; /* bmc.downloadratelimit: max block+header download, KB/s, node-wide (0 = off) */
     int  cmpctrecv;               /* bmc.cmpctrecv: request MSG_CMPCT_BLOCK on outbound legs (default 1; 0 = full blocks) */
+    int  coinstatshist_repair;    /* bmc.coinstatshistrepair: rebuild a missing/broken coinstats history base in a supervised child (default 1) */
+    int  coinstatshist_workers;   /* bmc.coinstatshistworkers: the builder's worker count (0 = auto: cores/4, 2..8; pass 3 sizes itself by RAM) */
     int  esplora_port;            /* bmc.esploraport: the Esplora facade listener (0 = off) */
     char esplora_bind[64];        /* bmc.esplorabind: its address (default 127.0.0.1) */
     int upload_rate_limit_kbps;   /* bmc.uploadratelimit: max bytes SENT to peers, KB/s, node-wide (0 = off) */

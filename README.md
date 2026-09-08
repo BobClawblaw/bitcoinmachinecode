@@ -371,6 +371,7 @@ log echoes the resolved values.
 | `bmc.dialratelimit` / `bmc.downloadratelimit` / `bmc.uploadratelimit` | `0` / `0` / `0` | node-wide ceilings, off by default: outbound connection attempts per second; KB/s the sync may pull; KB/s the node may send (Core has only `maxuploadtarget`, a MiB-per-day budget, which is implemented too) |
 | `rest` | `0` | `1` serves Core's REST interface (`/rest/...`) on the RPC listener, unauthenticated; keep the listener on loopback |
 | `bmc.esploraport` / `bmc.esplorabind` | `0` / `127.0.0.1` | the Esplora facade for mempool.space: a second, unauthenticated listener; keep it on loopback or behind a proxy |
+| `bmc.coinstatshistrepair` / `bmc.coinstatshistworkers` | `1` / `0` | the coinstats history base (`gettxoutsetinfo` at any height) is checked once a heartbeat and rebuilt by a supervised, niced child when missing or broken: never during initial block download, three attempts per boot; workers `0` = cores/4 (2..8), pass 3 sizes itself by free RAM |
 | `bmc.utxocompactthreshold` / `bmc.bootcatchup` | `12` / `1` | project-specific: UTXO runs that trigger compaction; run the parallel downloader at boot |
 
 ## Networks: Tor, I2P, CJDNS, IPv6
