@@ -28,6 +28,15 @@
 #include <ctype.h>
 #include "rpc_esplora.h"
 #include "rpc_json.h"
+#include "daemon/addr_hist_fmt.h"
+/* the address routes' sources (stage 2, 2026-09-08) */
+extern int  wallet_validate_address(const char* addr, int* type, unsigned char* ver, unsigned char h160[20], unsigned char prog[32]);
+extern long axt_read_events(int type, const unsigned char hash[32], long min_height,
+                            int (*cb)(void*, int, const unsigned char*, unsigned, unsigned long long, unsigned), void* ctx);
+extern int  rpc_addr_idx_utxos(unsigned char type_tag, const unsigned char hash[32], void* out_recs, int cap);
+#pragma pack(push,1)
+typedef struct { unsigned char type_tag; unsigned char hash[32]; unsigned char txid[32]; unsigned int vout; unsigned long long value; } esp_utxo_rec;
+#pragma pack(pop)
 
 typedef unsigned char u8;
 extern void sha256d(u8 out[32], const void* data, unsigned long len);
@@ -366,6 +375,147 @@ static long qparam(const char* path, size_t plen, const char* key){
     }
     return -1;
 }
+/* ---- /address routes (stage 2) ------------------------------------------------
+ * History = the base index (addr_hist.dat, to its to_height) + the live tail
+ * journal above it (addrindex.tail: ADD funding, DEL spend, TOUCH the
+ * spender). A base event names its transaction by (height, txpos); the txid
+ * is one getblock away, cached per block within a request. mempool_stats and
+ * the mempool transaction list are empty in this cut. */
+typedef struct { long height; long txpos; unsigned char txid[32]; int has_txid; } esp_txref;
+typedef struct { long funded_n, spent_n; long long funded_sum, spent_sum; esp_txref* refs; long nrefs, cap; } esp_hist;
+static void hist_push(esp_hist* h, long height, long txpos, const unsigned char* txid){
+    if (h->nrefs == h->cap){ h->cap = h->cap ? h->cap * 2 : 256; h->refs = realloc(h->refs, (size_t)h->cap * sizeof *h->refs); }
+    esp_txref* t = &h->refs[h->nrefs++]; t->height = height; t->txpos = txpos; t->has_txid = txid != 0; if (txid) memcpy(t->txid, txid, 32); else memset(t->txid, 0, 32);
+}
+static int hist_tail_cb(void* ctx, int op, const unsigned char* txid, unsigned vout, unsigned long long value, unsigned height){
+    esp_hist* h = ctx; (void)vout;
+    if (op == 1){ h->funded_n++; h->funded_sum += (long long)value; hist_push(h, (long)height, -1, txid); }
+    else if (op == 2){ h->spent_n++; h->spent_sum += (long long)value; }
+    else if (op == 3){ hist_push(h, (long)height, -1, txid); }
+    return 1;
+}
+typedef struct { unsigned char txid[32]; unsigned vout; unsigned long long value; unsigned height; } esp_utxo;
+typedef struct { esp_utxo* u; long n, cap; } esp_utxos;
+static int utxo_tail_cb(void* c, int op, const unsigned char* txid, unsigned vout, unsigned long long value, unsigned height){
+    esp_utxos* x = c;
+    if (op == 1){ if (x->n == x->cap){ x->cap *= 2; x->u = realloc(x->u, sizeof(esp_utxo) * (size_t)x->cap); } memcpy(x->u[x->n].txid, txid, 32); x->u[x->n].vout = vout; x->u[x->n].value = value; x->u[x->n].height = height; x->n++; }
+    else if (op == 2){ for (long i = 0; i < x->n; i++) if (x->u[i].vout == vout && !memcmp(x->u[i].txid, txid, 32)){ x->u[i] = x->u[x->n-1]; x->n--; break; } }
+    return 1;
+}
+static int esp_addr_key(const char* addr, int* type, unsigned char key[32]){
+    int t = 0; unsigned char ver, h160[20], prog[32];
+    if (!wallet_validate_address(addr, &t, &ver, h160, prog)) return 0;
+    if (t < 1 || t > 5) return 0;
+    memset(key, 0, 32);
+    if (t == 4 || t == 5) memcpy(key, prog, 32); else memcpy(key, h160, 20);
+    *type = t; return 1;
+}
+/* every event of the address: base then tail; refs deduplicated per transaction, newest first */
+static int esp_hist_load(const rpc_wallet* w, int type, const unsigned char key[32], esp_hist* h){
+    memset(h, 0, sizeof *h);
+    const ah_event* ev = 0; long n = ah_lookup((uint8_t)type, key, &ev);
+    if (n < 0) return 0;                                     /* no base index at all */
+    long base_to = ah_to_height();
+    for (long i = 0; i < n; i++){
+        ah_event e; memcpy(&e, (const unsigned char*)ev + i * AH_EVENT_BYTES, sizeof e);
+        if (e.kind == AH_FUND){ h->funded_n++; h->funded_sum += (long long)e.value; } else { h->spent_n++; h->spent_sum += (long long)e.value; }
+        if (h->nrefs == 0 || h->refs[h->nrefs-1].height != (long)e.height || h->refs[h->nrefs-1].txpos != (long)e.txpos) hist_push(h, e.height, e.txpos, 0);
+    }
+    axt_read_events(type, key, base_to, hist_tail_cb, h);
+    /* txids for the base refs, one getblock per distinct block */
+    long last_h = -1; rj_val* last_txs = 0;
+    for (long i = 0; i < h->nrefs; i++){
+        esp_txref* t = &h->refs[i]; if (t->has_txid) continue;
+        if (t->height != last_h){
+            if (last_txs) rj_free(last_txs);
+            last_txs = 0; last_h = t->height;
+            rj_val* hh = call(w, "getblockhash", (rj_val*)({ rj_val* a = rj_arr(); rj_arr_push(a, rj_numf("%ld", t->height)); a; }), 0, 0);
+            if (hh && hh->str){ rj_val* b = call(w, "getblock", P1s1n(hh->str, 1), 0, 0); if (b){ last_txs = rj_clone(G(b, "tx")); rj_free(b); } }
+            if (hh) rj_free(hh);
+        }
+        if (last_txs && last_txs->typ == RJ_ARR && t->txpos >= 0 && (size_t)t->txpos < last_txs->nitems && last_txs->items[t->txpos]->str){
+            unhex(last_txs->items[t->txpos]->str, t->txid, 32);
+            /* stored wire-order: the displayed hex is byte-reversed */
+            for (int k = 0; k < 16; k++){ unsigned char x = t->txid[k]; t->txid[k] = t->txid[31-k]; t->txid[31-k] = x; }
+            t->has_txid = 1;
+        }
+    }
+    if (last_txs) rj_free(last_txs);
+    /* dedupe by txid (a tx can fund and spend the same address), newest first --
+     * into a fresh array: compacting in place from the back overwrote entries
+     * before they were read */
+    esp_txref* out = malloc((size_t)(h->nrefs ? h->nrefs : 1) * sizeof *out); long m = 0;
+    for (long i = h->nrefs - 1; i >= 0; i--){
+        int dup = 0; for (long j = 0; j < m; j++) if (h->refs[i].has_txid && out[j].has_txid && !memcmp(h->refs[i].txid, out[j].txid, 32)){ dup = 1; break; }
+        if (!dup) out[m++] = h->refs[i];
+    }
+    free(h->refs); h->refs = out; h->nrefs = m;
+    return 1;
+}
+#define IS(k, s) (!strcmp(seg[k], s))
+static void esplora_address(resp_t* r, const rpc_wallet* w, char seg[][80], int ns, int get){
+    int type; unsigned char key[32];
+    if (!get){ reply_text(r, 405, "method not allowed"); return; }
+    if (!esp_addr_key(seg[1], &type, key)){ reply_text(r, 400, "Invalid Bitcoin address"); return; }
+    if (!ah_available()){ reply_text(r, 501, "address history index not built on this node (daemon/bmc_build_addr_hist)"); return; }
+    esp_hist h;
+    if (!esp_hist_load(w, type, key, &h)){ reply_text(r, 500, "address history index unreadable"); return; }
+    if (ns == 2){
+        rj_val* o = rj_obj(); rj_obj_set(o, "address", rj_str(seg[1]));
+        rj_val* cs = rj_obj(); rj_obj_set(cs, "funded_txo_count", rj_numf("%ld", h.funded_n)); rj_obj_set(cs, "funded_txo_sum", rj_numf("%lld", h.funded_sum));
+        rj_obj_set(cs, "spent_txo_count", rj_numf("%ld", h.spent_n)); rj_obj_set(cs, "spent_txo_sum", rj_numf("%lld", h.spent_sum)); rj_obj_set(cs, "tx_count", rj_numf("%ld", h.nrefs));
+        rj_obj_set(o, "chain_stats", cs);
+        rj_val* ms = rj_obj(); rj_obj_set(ms, "funded_txo_count", rj_num("0")); rj_obj_set(ms, "funded_txo_sum", rj_num("0")); rj_obj_set(ms, "spent_txo_count", rj_num("0")); rj_obj_set(ms, "spent_txo_sum", rj_num("0")); rj_obj_set(ms, "tx_count", rj_num("0"));
+        rj_obj_set(o, "mempool_stats", ms);
+        free(h.refs); reply_json(r, o); return;
+    }
+    if (IS(2, "txs") && (ns == 3 || (ns >= 4 && IS(3, "chain")))){
+        /* newest first, 25 per page, after `lastSeen` when given */
+        long start = 0;
+        if (ns >= 5){
+            unsigned char want[32];
+            if (unhex(seg[4], want, 32) == 32){
+                for (int k = 0; k < 16; k++){ unsigned char x = want[k]; want[k] = want[31-k]; want[31-k] = x; }
+                for (long i = 0; i < h.nrefs; i++) if (h.refs[i].has_txid && !memcmp(h.refs[i].txid, want, 32)){ start = i + 1; break; }
+            }
+        }
+        rj_val* arr = rj_arr(); long taken = 0;
+        for (long i = start; i < h.nrefs && taken < 25; i++){
+            if (!h.refs[i].has_txid) continue;
+            char hx[65]; hexrev(hx, h.refs[i].txid);
+            rj_val* t = tx_by_id(w, hx, 0, 0);
+            if (t){ rj_arr_push(arr, t); taken++; }
+        }
+        free(h.refs); reply_json(r, arr); return;
+    }
+    if (IS(2, "txs") && ns == 4 && IS(3, "mempool")){ free(h.refs); reply_json(r, rj_arr()); return; }
+    if (IS(2, "utxo")){
+        /* the reverse index's snapshot, adjusted by the tail: ADD appends, DEL removes */
+        static esp_utxo_rec recs[100000]; int n = rpc_addr_idx_utxos((unsigned char)type, key, recs, 100000);
+        esp_utxos ux; ux.cap = n > 0 ? n + 4096 : 4096; ux.n = 0; ux.u = malloc(sizeof(esp_utxo) * (size_t)ux.cap);
+        for (int i = 0; i < n; i++){ memcpy(ux.u[ux.n].txid, recs[i].txid, 32); ux.u[ux.n].vout = recs[i].vout; ux.u[ux.n].value = recs[i].value; ux.u[ux.n].height = 0; ux.n++; }
+        axt_read_events(type, key, -1, utxo_tail_cb, &ux);
+        esp_utxo* u = ux.u; long nu = ux.n;
+        rj_val* arr = rj_arr();
+        for (long i = 0; i < nu; i++){
+            char hx[65]; hexrev(hx, u[i].txid);
+            rj_val* o = rj_obj(); rj_obj_set(o, "txid", rj_str(hx)); rj_obj_set(o, "vout", rj_numf("%u", u[i].vout));
+            rj_val* st = rj_obj();
+            long height = u[i].height;
+            if (height <= 0 && i < 500){
+                rj_val* t = call(w, "getrawtransaction", P1s1n(hx, 1), 0, 0);
+                if (t){ const char* bh = S(t, "blockhash"); if (bh){ rj_val* hd = call(w, "getblockheader", P1s(bh), 0, 0); if (hd){ height = N(hd, "height"); rj_free(hd); } } rj_free(t); }
+            }
+            rj_obj_set(st, "confirmed", rj_bool(1));
+            if (height > 0) rj_obj_set(st, "block_height", rj_numf("%ld", height));
+            rj_obj_set(o, "status", st); rj_obj_set(o, "value", rj_numf("%llu", u[i].value));
+            rj_arr_push(arr, o);
+        }
+        free(u); free(h.refs); reply_json(r, arr); return;
+    }
+    free(h.refs); reply_text(r, 404, "unknown address route");
+}
+#undef IS
 int esplora_handle(const char* method, size_t mlen, const char* path, size_t plen,
                    const char* body, size_t blen, const rpc_wallet* w,
                    char** out, size_t* outlen, int* status, const char** ctype){
@@ -482,9 +632,8 @@ int esplora_handle(const char* method, size_t mlen, const char* path, size_t ple
         }
         reply_text(&r, 404, "unknown internal route"); return 1;
     }
-    if (ns >= 2 && (IS(0, "address") || IS(0, "scripthash"))){
-        reply_text(&r, 501, "address history index: not built yet on this node (stage 2 of the Esplora facade)"); return 1;
-    }
+    if (ns >= 2 && IS(0, "address")){ esplora_address(&r, w, seg, ns, get); return 1; }
+    if (ns >= 2 && IS(0, "scripthash")){ reply_text(&r, 501, "scripthash lookups are not served: the address index is keyed by address, not script hash"); return 1; }
     reply_text(&r, 404, "unknown route"); return 1;
     #undef IS
 }
