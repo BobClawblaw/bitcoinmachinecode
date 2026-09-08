@@ -408,6 +408,30 @@ int main(void){
           ok(ctl2[DLC_CTL_FIRST_HOLE] == 180 && ctl2[DLC_CTL_COMMIT_TIP] == 179 && ctl2[DLC_CTL_N_COMMIT] == 2 && ctl2[DLC_CTL_STAGED] == 0,
              "...first hole 180 and committed tip 179 published, 2 commits counted, the gauge back to 0");
           ok(!dlc_stage_exists(100) && !dlc_stage_exists(140), "...and both files are gone; it exited at the missing chunk because STOP was set");
+          /* the cursor-stall help (run 18 sat six minutes behind one trickling
+           * peer while 85 chunks above were staged): a missing cursor chunk is
+           * published after the help delay, a worker takes it, and the want
+           * is cleared the moment the chunk commits */
+          { volatile long* ctl3 = mmap(0, (DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+            for (long i = 0; i < DLC_CTL_RING + DLC_RETRY_MAX; i++) ctl3[i] = i < DLC_CTL_RING ? 0 : -1;
+            ctl3[DLC_CTL_FIRST_HOLE] = 300; ctl3[DLC_CTL_CURSOR_WANT] = -1;
+            g_dlc_cursor_help_ms = 300;                   /* the seam: 300 ms instead of 10 s */
+            pid_t cp = fork();
+            if (cp == 0){ int rc = dlc_committer_run(ctl3, 300, 379, 0, rec_append, 0, 20, 0, 0); _exit(rc); }
+            usleep(700000);
+            ok(ctl3[DLC_CTL_CURSOR_WANT] == -1, "with nothing staged above it, a missing cursor chunk is NOT published (the pool has not moved on)");
+            ctl3[DLC_CTL_STAGED] = DLC_CURSOR_HELP_MIN_STAGED + 1;   /* eight chunks above it are done (+1: the commit of 300 takes one back) */
+            long waited = 0; while (ctl3[DLC_CTL_CURSOR_WANT] != 300 && waited < 5000){ usleep(20000); waited += 20; }
+            ok(ctl3[DLC_CTL_CURSOR_WANT] == 300, "with 8 chunks staged above it, the missing cursor chunk (300) is published after the delay");
+            stage_chunk(300, 40);                          /* the helper delivered it */
+            waited = 0; while (ctl3[DLC_CTL_CURSOR_WANT] != -1 && waited < 5000){ usleep(20000); waited += 20; }
+            ok(ctl3[DLC_CTL_CURSOR_WANT] == -1 && ctl3[DLC_CTL_COMMIT_TIP] == 339, "...the chunk commits and the want is cleared; committed tip 339");
+            waited = 0; while (ctl3[DLC_CTL_CURSOR_WANT] != 340 && waited < 5000){ usleep(20000); waited += 20; }
+            ok(ctl3[DLC_CTL_CURSOR_WANT] == 340, "...the next missing chunk (340) is published in its turn");
+            ctl3[DLC_CTL_STOP_COMMIT] = 1; int st = 0; waitpid(cp, &st, 0);
+            ok(WIFEXITED(st) && WEXITSTATUS(st) == 0 && ctl3[DLC_CTL_CURSOR_WANT] == -1, "STOP ends the run and clears the want");
+            g_dlc_cursor_help_ms = DLC_CURSOR_HELP_SECS * 1000L;
+            munmap((void*)ctl3, (DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long)); }
           ok(g_synced_n == 2, "...and the store was synced once per committed chunk (2), not once per block (80)");
           /* the window's help guard, and the next run's wipe */
           stage_chunk(180, 40);
