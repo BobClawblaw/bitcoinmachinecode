@@ -333,6 +333,11 @@ int main(void){
         ok(dlc_help_chunk_lo(82565, 1) == 82561, "first hole 82,565 on a pass starting at 1: the help chunk is [82561,82600], the owner's, not [82560,82599]");
         ok(dlc_help_chunk_lo(82565, 0) == 82560, "...and on a pass starting at 0 it is [82560,82599]");
         ok(dlc_help_chunk_lo(5, 40) == 40, "a hole below the span start: the span's first chunk"); }
+      /* 2026-09-08: no tip announcements in IBD, Core's rule (tip older than maxtipage) */
+      { long long now = 1800000000LL;
+        ok(dl_announce_allowed((unsigned long)(now - 3600), now, 86400), "a tip an hour old: announce (not IBD)");
+        ok(!dl_announce_allowed((unsigned long)(now - 90000), now, 86400), "a tip 25 hours old with maxtipage 24h: suppressed (IBD, as Core)");
+        ok(dl_announce_allowed((unsigned long)(now + 100), now, 86400), "a tip slightly in the future: announce"); }
       /* slot rotation still breaks ties: 0 and 2 share the top ema, so from
        * slot 3 the walk reaches 0 by wrap in (slot+a) order */
       volatile double eq[4] = {9.0, 0.0, 9.0, 0.0};
