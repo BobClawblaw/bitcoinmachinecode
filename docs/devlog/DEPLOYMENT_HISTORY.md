@@ -1141,3 +1141,17 @@ that would have hit any fresh sync of the live build.
   parallel downloader from 371,511; its first progress line at 05:32:51:
   `applied=371745 lag=1`. **The UTXO set is connecting one block behind
   the download** — the first time this node has done what step 1 was for.
+
+## 2026-09-08 22:36Z — `deploy-20260908m`: the addrindex boot race (PR #123)
+
+- **Why:** every boot since 17:16Z disabled the live address index
+  ("undo has 0 records but the block spends N" at 966097, 966106,
+  966110, 966111). `axt_boot` ran before the UTXO engine with the
+  archive tip as its target and read undo for blocks the engine had not
+  applied yet. Address pages on the facade were off all evening.
+- **What:** `cp -a daemon/bmcbitcoind daemon/bmcbitcoind.deploy-20260908m`,
+  relink `bmcbitcoind.live`; binary from `617f1154` (main), gate green.
+- **Restart:** the operator's (`sudo systemctl restart bmcbitcoind`).
+  Expected on the next boot: "[addrindex] LIVE: covered=<applied>
+  (backfilled N; the archive is ahead, the rest lands as the engine
+  applies it)" and no "boot backfill failed" line.
