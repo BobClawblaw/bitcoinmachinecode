@@ -54,14 +54,16 @@ int rpc_reply_parse(const char* body, size_t len, rpc_reply* r) {
         rj_val* msg = rj_obj_get(err, "message");
         if (msg && msg->typ == RJ_STR) r->error_message = strdup(msg->str);
     }
-    rj_val* res = rj_obj_get(doc, "result");
     /* result field is present when error is null (Core omits result on error). */
     r->result = NULL;
-    if (!r->is_error && res) {
-        /* deep-copy the result subtree so the caller owns it independently */
-        char tmp[65536];
-        long w = rj_write(tmp, sizeof tmp, res, 0);
-        if (w > 0 && w < (long)sizeof tmp) r->result = rj_parse(tmp, (size_t)w);
+    if (!r->is_error) {
+        /* 2026-09-08: the result used to be deep-copied through a 64 KB stack
+         * buffer, and a bigger one (getblock verbosity 1 is 112 KB, 2 is
+         * 6.6 MB) was silently dropped: the CLI printed nothing and exited 0.
+         * Detach the subtree from the document instead: the caller owns it,
+         * rj_free(doc) skips the NULL slot, and there is no size at all. */
+        for (size_t i = 0; i < doc->nmembers; i++)
+            if (!strcmp(doc->members[i].key, "result")) { r->result = doc->members[i].val; doc->members[i].val = NULL; break; }
     }
     rj_free(doc);
     return 1;

@@ -18,6 +18,25 @@
 #undef main
 static int fails = 0;
 static void ok(int c, const char* w){ printf("  %s %s\n", c?"ok ":"FAIL", w); if(!c) fails++; }
+
+/* ---- the in-order committer's recording append and a direct chunk writer ---- */
+static long g_rec_h[512]; static int g_rec_n = 0; static int g_rec_ok = 1; static long g_present_below = -1;
+static long rec_append(void* st, long h, const unsigned char hash[32], const unsigned char* raw, unsigned len){
+    (void)st; if (g_rec_n < 512) g_rec_h[g_rec_n] = h; g_rec_n++;
+    if (len != 100 || raw[0] != (unsigned char)(h & 0xff) || raw[99] != (unsigned char)(h & 0xff) || hash[0] != (unsigned char)(h & 0xff) || hash[31] != (unsigned char)(h & 0xff)) g_rec_ok = 0;
+    return h;
+}
+static int present_below(long h){ return h < g_present_below; }
+static int g_synced_n = 0; static void rec_synced(void* st){ (void)st; g_synced_n++; }
+/* write stage/c<lo>.chunk directly in the committer's record format: n blocks of 100 bytes, byte pattern = height */
+static long stage_chunk(long lo, int n){
+    char path[64]; snprintf(path, sizeof path, "stage/c%ld.chunk", lo);
+    FILE* f = fopen(path, "wb"); if (!f) return -1; long total = 0;
+    for (int i = 0; i < n; i++){ long h = lo + i; unsigned len = 100; unsigned char hash[32], raw[100];
+        memset(hash, (int)(h & 0xff), 32); memset(raw, (int)(h & 0xff), 100);
+        fwrite(&h, 8, 1, f); fwrite(&len, 4, 1, f); fwrite(hash, 32, 1, f); fwrite(raw, 100, 1, f); total += 44 + 100; }
+    fclose(f); return total;
+}
 static void put_u16be(unsigned char*p,unsigned v){p[0]=v>>8;p[1]=v&0xff;}
 static void put_u32le(unsigned char*p,unsigned v){p[0]=v;p[1]=v>>8;p[2]=v>>16;p[3]=v>>24;}
 static void put_u64le(unsigned char*p,unsigned long long v){for(int i=0;i<8;i++){p[i]=v&0xff;v>>=8;}}
@@ -333,6 +352,70 @@ int main(void){
         ok(dlc_help_chunk_lo(82565, 1) == 82561, "first hole 82,565 on a pass starting at 1: the help chunk is [82561,82600], the owner's, not [82560,82599]");
         ok(dlc_help_chunk_lo(82565, 0) == 82560, "...and on a pass starting at 0 it is [82560,82599]");
         ok(dlc_help_chunk_lo(5, 40) == 40, "a hole below the span start: the span's first chunk"); }
+      /* the in-order committer (2026-09-08): a worker STAGES a chunk, one
+       * committer appends it from the first hole upward. The archive is
+       * then written by a single process in height order -- the layout the
+       * boot check, in-place pruning and physical truncation all want -- and
+       * never has a hole. */
+      { char cwd3[512] = ""; if (!getcwd(cwd3, sizeof cwd3)) cwd3[0] = 0;
+        char td3[] = "/tmp/dlc_commit_XXXXXX";
+        if (!mkdtemp(td3) || chdir(td3) != 0) ok(0, "scratch dir for the committer");
+        else {
+          ok(dlc_stage_wipe() == 0, "a fresh stage dir has nothing to discard");
+          /* a chunk through the worker's sink: 40 records, then the rename that publishes it */
+          char tmp[96]; int sfd = dlc_stage_open_tmp(tmp, sizeof tmp, 100);
+          ok(sfd >= 0, "a staging tmp file opens exclusively");
+          g_stage_fd = sfd; int sunk = 1;
+          for (int i = 0; i < 40; i++){ long h = 100 + i; unsigned char hash[32], raw[100]; memset(hash, (int)(h & 0xff), 32); memset(raw, (int)(h & 0xff), 100);
+              if (dlc_stage_sink(0, h, hash, raw, 100) != h) sunk = 0; }
+          close(sfd); g_stage_fd = -1;
+          ok(sunk, "the sink returns the height for each of 40 records");
+          ok(!dlc_stage_exists(100), "...and the chunk is not visible until renamed");
+          char fin[64]; dlc_stage_path(fin, sizeof fin, 100);
+          ok(rename(tmp, fin) == 0 && dlc_stage_exists(100), "renamed: the chunk is staged");
+          unsigned char* cb = mmap(0, DLC_STAGE_MAX_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+          g_rec_n = 0; g_rec_ok = 1; long cursor = 100;
+          long n = dlc_commit_chunk(0, fin, &cursor, rec_append, 0, cb, DLC_STAGE_MAX_BYTES);
+          ok(n == 40 && cursor == 140, "committed 40 blocks; the cursor is 140");
+          ok(g_rec_n == 40 && g_rec_h[0] == 100 && g_rec_h[39] == 139 && g_rec_ok, "appended in height order, with the staged bytes and hashes");
+          ok(!dlc_stage_exists(100), "the staged file is gone after the commit");
+          /* a resumed datadir: the cursor sits mid-chunk, the heights below it are present */
+          stage_chunk(140, 40); g_rec_n = 0; g_rec_ok = 1; cursor = 150; g_present_below = 150;
+          char p140[64]; dlc_stage_path(p140, sizeof p140, 140);
+          n = dlc_commit_chunk(0, p140, &cursor, rec_append, present_below, cb, DLC_STAGE_MAX_BYTES);
+          ok(n == 30 && cursor == 180 && g_rec_h[0] == 150 && g_rec_ok, "heights already present are skipped: 30 appended from 150, cursor 180");
+          /* a torn file (a worker killed mid-write can only leave a .tmp, but the committer checks anyway) */
+          long sz = stage_chunk(180, 40); char p180[64]; dlc_stage_path(p180, sizeof p180, 180);
+          ok(truncate(p180, sz - 10) == 0, "truncate the staged file by 10 bytes");
+          g_rec_n = 0; cursor = 180;
+          n = dlc_commit_chunk(0, p180, &cursor, rec_append, 0, cb, DLC_STAGE_MAX_BYTES);
+          ok(n == -2 && g_rec_n == 0 && cursor == 180 && !dlc_stage_exists(180), "a torn staging file commits NOTHING and is discarded");
+          /* a gap: the file's first height is above the cursor */
+          stage_chunk(220, 40); char p220[64]; dlc_stage_path(p220, sizeof p220, 220);
+          g_rec_n = 0; cursor = 180;
+          n = dlc_commit_chunk(0, p220, &cursor, rec_append, 0, cb, DLC_STAGE_MAX_BYTES);
+          ok(n == -2 && g_rec_n == 0 && cursor == 180 && !dlc_stage_exists(220), "a file starting above the cursor is discarded: a gap is never committed over");
+          ok(dlc_commit_chunk(0, "stage/c9999.chunk", &cursor, rec_append, 0, cb, DLC_STAGE_MAX_BYTES) == -3, "a chunk not yet staged is -3 (wait)");
+          /* the loop: chunks 100 and 140 staged, 180 missing, STOP set -> commits 80 in order, publishes 180, exits */
+          static volatile long ctl2[DLC_CTL_RING + DLC_RETRY_MAX];
+          for (long i = 0; i < DLC_CTL_RING + DLC_RETRY_MAX; i++) ctl2[i] = i < DLC_CTL_RING ? 0 : -1;
+          ctl2[DLC_CTL_FIRST_HOLE] = 100; ctl2[DLC_CTL_STOP_COMMIT] = 1; ctl2[DLC_CTL_STAGED] = 2;
+          stage_chunk(100, 40); stage_chunk(140, 40); g_rec_n = 0; g_rec_ok = 1; g_present_below = -1;
+          g_synced_n = 0;
+          int rc = dlc_committer_run(ctl2, 100, 999, 0, rec_append, 0, 5, 0, rec_synced);
+          ok(rc == 0 && g_rec_n == 80 && g_rec_h[0] == 100 && g_rec_h[79] == 179 && g_rec_ok,
+             "committer_run: two staged chunks appended in order (80 blocks)");
+          ok(ctl2[DLC_CTL_FIRST_HOLE] == 180 && ctl2[DLC_CTL_COMMIT_TIP] == 179 && ctl2[DLC_CTL_N_COMMIT] == 2 && ctl2[DLC_CTL_STAGED] == 0,
+             "...first hole 180 and committed tip 179 published, 2 commits counted, the gauge back to 0");
+          ok(!dlc_stage_exists(100) && !dlc_stage_exists(140), "...and both files are gone; it exited at the missing chunk because STOP was set");
+          ok(g_synced_n == 2, "...and the store was synced once per committed chunk (2), not once per block (80)");
+          /* the window's help guard, and the next run's wipe */
+          stage_chunk(180, 40);
+          ok(dlc_stage_exists(180), "a staged chunk is visible to the help guard: the worker must not refetch it");
+          ok(dlc_stage_wipe() == 1 && !dlc_stage_exists(180), "a new run discards what an earlier run left (its chunks are fetched again)");
+          munmap(cb, DLC_STAGE_MAX_BYTES);
+        }
+        if (cwd3[0]) (void)!chdir(cwd3); }
       /* 2026-09-08: no tip announcements in IBD, Core's rule (tip older than maxtipage) */
       { long long now = 1800000000LL;
         ok(dl_announce_allowed((unsigned long)(now - 3600), now, 86400), "a tip an hour old: announce (not IBD)");

@@ -29,6 +29,13 @@ extern void block_hash(unsigned char out[32], const unsigned char* hdr80);
 extern long store_append_shared(void* st, long height, const unsigned char hash[32],
                                 const unsigned char* raw, unsigned len);
 
+/* 2026-09-08: the sink (see ibd_pipeline.h). NULL = store_append_shared. */
+static ibd_sink_fn g_sink = 0;
+void ibd_pipeline_set_sink(ibd_sink_fn sink){ g_sink = sink; }
+static long ibd_sink(void* st, long height, const unsigned char hash[32], const unsigned char* raw, unsigned len){
+    return g_sink ? g_sink(st, height, hash, raw, len) : store_append_shared(st, height, hash, raw, len);
+}
+
 static long g_last_batch = 0; static int g_last_fail = 0;
 long ibd_pipeline_last_batch(void){ return g_last_batch; }
 static long g_wave = 0;                  /* 0 = the whole chunk in one getdata */
@@ -116,11 +123,11 @@ long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long n
          * hold has for the heights that follow. Otherwise park it. */
         if (idx == next){
             if (g_progress) g_progress(g_progress_arg);       /* a wanted block arrived: progress */
-            if (store_append_shared(st, lo_real + idx, bh, buf, len) < 0){ why = IBD_FAIL_STORE; goto fail; }
+            if (ibd_sink(st, lo_real + idx, bh, buf, len) < 0){ why = IBD_FAIL_STORE; goto fail; }
             got[idx] = 1; stored++; next++;
             while (next < nloc && held_len[next]){
-                if (store_append_shared(st, lo_real + next, held_hash[next],
-                                        hold + held_off[next], held_len[next]) < 0){ why = IBD_FAIL_STORE; goto fail; }
+                if (ibd_sink(st, lo_real + next, held_hash[next],
+                             hold + held_off[next], held_len[next]) < 0){ why = IBD_FAIL_STORE; goto fail; }
                 /* The hold is a BUMP allocator: freed space is never reused
                  * within a chunk. The first cut subtracted the drained length
                  * from the bump pointer here, which moved it BACK over blocks

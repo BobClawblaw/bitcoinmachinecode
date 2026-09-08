@@ -37,6 +37,7 @@
 #include <pthread.h>
 #include <stdbool.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <sys/file.h>          /* DMN-1: flock() for the datadir lock */
 #include "secure_zero.h"    /* WAL-3: a memset the optimiser may not delete */
 #include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
@@ -2483,6 +2484,25 @@ static void rpc_fill_peer_slot(int slot, const char* host){
       } }
     rpc_fill_peer_slot_ex(slot, host, 0);
 }
+/* parse the captured `version` message into a peer record's proto, services,
+ * subver and start_height -- shared by the legs and, since 2026-09-08, the
+ * download workers (getpeerinfo) */
+static void rpc_peer_from_version(rpc_peer_t* pr, const unsigned char* p, long len){
+    if (len < 80) return;
+    pr->proto = (unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24);
+    unsigned long long services; memcpy(&services, p+4, 8); pr->services = services;
+    long off = 80; unsigned long long ualen = 0; int ok = 1;
+    if (p[off] < 0xfd) { ualen = p[off]; off += 1; }
+    else if (p[off]==0xfd){ if(off+3<=len){ ualen=(unsigned)p[off+1]|((unsigned)p[off+2]<<8); off+=3; } else ok=0; }
+    else if (p[off]==0xfe){ if(off+5<=len){ memcpy(&ualen,p+off+1,4); off+=5; } else ok=0; }
+    else { if(off+9<=len){ memcpy(&ualen,p+off+1,8); off+=9; } else ok=0; }
+    if (ok && ualen <= 90 && off+(long)ualen+4 <= len){
+        memcpy(pr->subver, p+off, (size_t)ualen); pr->subver[ualen] = 0;
+        for (unsigned long long k=0;k<ualen;k++) if(pr->subver[k]<0x20||pr->subver[k]>0x7e) pr->subver[k]='.';
+        off += (long)ualen;
+        unsigned height; memcpy(&height, p+off, 4); pr->start_height = (int)height;
+    }
+}
 static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claimed){
     if (!g_node_status || slot < 0 || slot >= RPC_MAX_PEERS) return;
     rpc_peer_t* pr = &g_node_status->peers[slot];
@@ -2494,21 +2514,8 @@ static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claime
     pr->conn_time = (long long)time(NULL);
     long len = g_peer_version_len;
     const unsigned char* p = g_peer_version_payload;
-    if (len >= 80){
-        pr->proto = (unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24);
-        unsigned long long services; memcpy(&services, p+4, 8); pr->services = services;
-        long off = 80; unsigned long long ualen = 0; int ok = 1;
-        if (p[off] < 0xfd) { ualen = p[off]; off += 1; }
-        else if (p[off]==0xfd){ if(off+3<=len){ ualen=(unsigned)p[off+1]|((unsigned)p[off+2]<<8); off+=3; } else ok=0; }
-        else if (p[off]==0xfe){ if(off+5<=len){ memcpy(&ualen,p+off+1,4); off+=5; } else ok=0; }
-        else { if(off+9<=len){ memcpy(&ualen,p+off+1,8); off+=9; } else ok=0; }
-        if (ok && ualen <= 90 && off+(long)ualen+4 <= len){
-            memcpy(pr->subver, p+off, (size_t)ualen); pr->subver[ualen] = 0;
-            for (unsigned long long k=0;k<ualen;k++) if(pr->subver[k]<0x20||pr->subver[k]>0x7e) pr->subver[k]='.';
-            off += (long)ualen;
-            unsigned height; memcpy(&height, p+off, 4); pr->start_height = (int)height;
-        }
-    }
+    pr->dl_worker = -1; pr->inflight_lo = 1; pr->inflight_hi = 0;
+    rpc_peer_from_version(pr, p, len);
     { extern int rp_version_frelay(const unsigned char*, long);
       pr->relaytxes = rp_version_frelay(p, len) != 0; }   /* Core relaytxes: the peer's fRelay */
     /* RPC-3: a fresh, never-reused id for this connection. Assigned before
@@ -3649,7 +3656,11 @@ enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CT
         * window lines alone were 540 lines in six minutes of run 13) */
        DLC_CTL_N_ROTATE = 6, DLC_CTL_N_WAIT = 7, DLC_CTL_N_HELP = 8, DLC_CTL_N_FAIL = 9, DLC_CTL_N_ABANDON = 10,
        DLC_CTL_SPAN_START = 11,           /* the pass's first height: the claim grid is start + k*DLC_CHUNK_BLOCKS */
-       DLC_CTL_RING = 12 };
+       /* the in-order committer (2026-09-08): the committed contiguous tip it
+        * publishes, the staged-not-yet-committed chunk gauge, the chunks it
+        * has appended, and the parent's "workers are gone: drain and exit" */
+       DLC_CTL_COMMIT_TIP = 12, DLC_CTL_STAGED = 13, DLC_CTL_N_COMMIT = 14, DLC_CTL_STOP_COMMIT = 15,
+       DLC_CTL_RING = 16 };
 /* Run 14 (2026-09-07) stalled for two minutes at 82,565: every worker
  * reconnected to the SAME peer -- one that accepted the handshake and
  * dropped us ~100 ms later -- because a failed fetch never lowered the
@@ -3700,6 +3711,217 @@ static long dlc_retry_pop(volatile long* ctl){
         if(lo < 0) continue;                                                    /* the push reserved the slot but has not written it yet */
         if(__sync_bool_compare_and_swap(&ctl[DLC_CTL_RETRY_TAIL], t, t + 1)){ ctl[DLC_CTL_RING + (t % DLC_RETRY_MAX)] = -1; return lo; }
     }
+}
+
+/* ---- the in-order committer (2026-09-08) ----------------------------------
+ * "WHY IS THE BLOCK DATA STILL NOT MONOTONIC FOR US?!" Sixteen workers
+ * appended chunks to the archive in ARRIVAL order, so the index's
+ * (file, offset) did not increase with height -- the boot check said so at
+ * height 41 of every node this download built, and in-place pruning and the
+ * physical truncation refused to run on it. The monotonic-download work
+ * (#77) made the WINDOW monotonic, not the layout.
+ *
+ * Now a worker never touches the archive. It writes the chunk it has
+ * fetched and verified (cons_verify, header hash, prev link -- unchanged)
+ * to a staging file, records in ascending height order, and renames it
+ * complete. ONE committer process appends staged chunks to the archive
+ * strictly from the first hole upward, deletes each as it goes, and
+ * publishes the first hole itself. The archive therefore never has a hole
+ * and grows in height order from a single writer; a staging file that
+ * lives a few seconds never reaches the disk. A chunk missing at the
+ * cursor is what the workers' help path (2 s at the window) already
+ * fetches; the committer just waits for it. Stale staging files from an
+ * earlier run are discarded at start (they are re-fetched; the archive is
+ * the durable state). Everything below is pure enough for
+ * tests/test_dialhelper to run it on a scratch directory. */
+#define DLC_STAGE_DIR "stage"
+#define DLC_STAGE_REC_HDR 44u                 /* [u64 height][u32 len][hash 32] then the raw block */
+#define DLC_STAGE_MAX_BYTES ((size_t)DLC_CHUNK_BLOCKS * ((4u << 20) + DLC_STAGE_REC_HDR) + 4096)
+extern long store_append_shared(void* st, long height, const unsigned char hash[32], const unsigned char* raw, unsigned len);   /* bitcoin_store.asm */
+static int g_stage_fd = -1;                   /* the worker's open staging file, per process */
+static pid_t g_dlc_committer = 0;             /* the committer's pid while dl_catchup runs */
+static int dlc_write_all(int fd, const void* p, size_t n){
+    const unsigned char* q = (const unsigned char*)p;
+    while(n){ ssize_t w = write(fd, q, n); if(w < 0){ if(errno == EINTR) continue; return -1; } q += w; n -= (size_t)w; }
+    return 0;
+}
+static long dlc_stage_sink(void* st, long height, const unsigned char hash[32], const unsigned char* raw, unsigned len){
+    (void)st; unsigned char h[DLC_STAGE_REC_HDR];
+    memcpy(h, &height, 8); memcpy(h + 8, &len, 4); memcpy(h + 12, hash, 32);
+    if(g_stage_fd < 0 || dlc_write_all(g_stage_fd, h, sizeof h) < 0 || dlc_write_all(g_stage_fd, raw, len) < 0) return -1;
+    return height;
+}
+static void dlc_stage_path(char* buf, size_t cap, long lo){ snprintf(buf, cap, DLC_STAGE_DIR "/c%ld.chunk", lo); }
+static int  dlc_stage_exists(long lo){ char p[64]; dlc_stage_path(p, sizeof p, lo); return access(p, F_OK) == 0; }
+static int  dlc_stage_open_tmp(char* tmp, size_t cap, long lo){
+    snprintf(tmp, cap, DLC_STAGE_DIR "/c%ld.w%d.tmp", lo, (int)getpid()); unlink(tmp);
+    return open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+}
+/* mkdir + discard whatever an earlier run left; returns how many were discarded */
+static long dlc_stage_wipe(void){
+    mkdir(DLC_STAGE_DIR, 0700);
+    DIR* d = opendir(DLC_STAGE_DIR); if(!d) return 0;
+    struct dirent* e; long n = 0;
+    while((e = readdir(d))){
+        if(e->d_name[0] != 'c') continue;
+        char p[320]; snprintf(p, sizeof p, DLC_STAGE_DIR "/%s", e->d_name);
+        if(unlink(p) == 0) n++;
+    }
+    closedir(d);
+    return n;
+}
+typedef long (*dlc_append_fn)(void* st, long height, const unsigned char hash[32], const unsigned char* raw, unsigned len);
+typedef int  (*dlc_present_fn)(long height);
+static int dlc_index_present(long h){ return idxscan_all_present(h, h) != 0; }
+/* Commit ONE staged chunk file. Its records must start at or below *cursor
+ * and run contiguously upward from there; heights already present are
+ * skipped. Two passes -- validate the whole file, then append -- so a torn
+ * or misordered file commits nothing and is discarded (-2). -3: no such
+ * file yet. -1: the archive append failed (the file is kept for a retry).
+ * >= 0: blocks appended; *cursor is past the file's last height and the
+ * file is gone. */
+static long dlc_commit_chunk(void* st, const char* path, long* cursor,
+                             dlc_append_fn append, dlc_present_fn present,
+                             unsigned char* buf, size_t cap){
+    int fd = open(path, O_RDONLY | O_NOFOLLOW); if(fd < 0) return -3;
+    struct stat sb; if(fstat(fd, &sb) < 0){ close(fd); return -3; }
+    size_t sz = (size_t)sb.st_size;
+    if(sz == 0 || sz > cap){ close(fd); unlink(path); return -2; }
+    size_t got = 0;
+    while(got < sz){ ssize_t r = pread(fd, buf + got, sz - got, (off_t)got); if(r < 0 && errno == EINTR) continue; if(r <= 0) break; got += (size_t)r; }
+    close(fd);
+    if(got != sz){ unlink(path); return -2; }
+    /* pass 1: every record whole, heights contiguous from the first, the first at or below the cursor */
+    size_t off = 0; long nrec = 0, expect = 0;
+    while(off < sz){
+        if(sz - off < DLC_STAGE_REC_HDR){ unlink(path); return -2; }
+        long h; unsigned len; memcpy(&h, buf + off, 8); memcpy(&len, buf + off + 8, 4);
+        if(len < 81 || sz - off - DLC_STAGE_REC_HDR < len){ unlink(path); return -2; }
+        if(nrec == 0){ if(h > *cursor || h < 0){ unlink(path); return -2; } }
+        else if(h != expect){ unlink(path); return -2; }
+        expect = h + 1; off += DLC_STAGE_REC_HDR + len; nrec++;
+    }
+    if(nrec == 0){ unlink(path); return -2; }
+    /* pass 2: append in order */
+    off = 0; long n = 0;
+    while(off < sz){
+        long h; unsigned len; memcpy(&h, buf + off, 8); memcpy(&len, buf + off + 8, 4);
+        const unsigned char* hash = buf + off + 12; const unsigned char* raw = buf + off + DLC_STAGE_REC_HDR;
+        if(h >= *cursor){
+            if(!(present && present(h))){ if(append(st, h, hash, raw, len) < 0) return -1; n++; }
+            *cursor = h + 1;
+        }
+        off += DLC_STAGE_REC_HDR + len;
+    }
+    unlink(path);
+    return n;
+}
+/* The committer's loop: from the first hole, commit the staged chunk at the
+ * cursor whenever it exists, skip heights that are already present, publish
+ * the first hole after each. Exits when the cursor passes end_h, when the
+ * parent has set STOP and the chunk at the cursor is not staged (the workers
+ * are gone: what is not here is not coming), on shutdown, or when orphaned.
+ * poll_ms is the wait between looks when nothing is staged. */
+static int dlc_committer_run(volatile long* ctl, long start_h, long end_h, void* st,
+                             dlc_append_fn append, dlc_present_fn present, long poll_ms, pid_t parent,
+                             void (*synced)(void* st)){
+    unsigned char* buf = mmap(0, DLC_STAGE_MAX_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if(buf == MAP_FAILED){ fprintf(stderr, "[dlc committer] cannot map the chunk buffer\n"); return 1; }
+    long fh = ctl[DLC_CTL_FIRST_HOLE]; if(fh < start_h) fh = start_h;
+    while(fh <= end_h && present && present(fh)) fh++;
+    if(fh > ctl[DLC_CTL_FIRST_HOLE]) ctl[DLC_CTL_FIRST_HOLE] = fh;
+    ctl[DLC_CTL_COMMIT_TIP] = fh - 1;
+    int rc = 0;
+    for(;;){
+        if(g_shutdown_requested) break;
+        if(parent > 0 && getppid() != parent) break;          /* orphaned: the download is over */
+        if(fh > end_h) break;
+        long lo = dlc_help_chunk_lo(fh, start_h);
+        char path[64]; dlc_stage_path(path, sizeof path, lo);
+        long r = dlc_commit_chunk(st, path, &fh, append, present, buf, DLC_STAGE_MAX_BYTES);
+        if(r >= 0){
+            if(synced && r > 0) synced(st);                       /* one journal commit per chunk, not per block */
+            while(fh <= end_h && present && present(fh)) fh++;
+            if(fh > ctl[DLC_CTL_FIRST_HOLE]) ctl[DLC_CTL_FIRST_HOLE] = fh;
+            ctl[DLC_CTL_COMMIT_TIP] = fh - 1;
+            __sync_fetch_and_add(&ctl[DLC_CTL_N_COMMIT], 1L);
+            if(ctl[DLC_CTL_STAGED] > 0) __sync_fetch_and_sub(&ctl[DLC_CTL_STAGED], 1L);
+            continue;
+        }
+        if(r == -2){
+            fprintf(stderr, "[dlc committer] staged chunk %s is malformed -- discarded; the window's help fetches it again\n", path);
+            if(ctl[DLC_CTL_STAGED] > 0) __sync_fetch_and_sub(&ctl[DLC_CTL_STAGED], 1L);
+            continue;
+        }
+        if(r == -1){
+            fprintf(stderr, "[dlc committer] archive append FAILED at height %ld -- retrying in 1 s\n", fh);
+            rc = 2; sleep(1); continue;
+        }
+        if(ctl[DLC_CTL_STOP_COMMIT]) break;                    /* -3 and the workers are gone */
+        { struct timespec ts = { poll_ms / 1000, (poll_ms % 1000) * 1000000L }; nanosleep(&ts, NULL); }
+    }
+    munmap(buf, DLC_STAGE_MAX_BYTES);
+    return rc;
+}
+/* the process: the worker's store setup, then store_reload so the first
+ * append goes to the NEWEST blk file (store_init says file 0, and an append
+ * there would fill the end of blk00000.dat -- one more way to a
+ * non-monotonic layout) */
+/* Run 18 (2026-09-08), first minutes: 103 chunks staged, the committer at
+ * 96 blocks/s in jbd2_log_wait_commit -- store_append_shared does an
+ * fdatasync per block (STO-11: bytes durable before the record), and with
+ * one sequential writer that is one journal commit per block. The workers
+ * had the same limit under the lock; the committer is the one place that
+ * can batch it: the per-block sync is off in THIS process only (a fork:
+ * the switch is a per-process global) and the chunk's blk and index fds
+ * are fdatasync'd once after its appends. ext4 data=ordered keeps the
+ * STO-11 order at the commit boundary (extending writes are flushed before
+ * the commit that names them), a crash loses at most the last chunk's
+ * appends, and the boot check cuts the index at the first record whose
+ * body is missing. */
+extern void store_set_sync(int on);
+static void dlc_store_sync_chunk(void* st){
+    int bfd = *(int*)((char*)st + 0), ifd = *(int*)((char*)st + 8);
+    if(bfd >= 0) fdatasync(bfd);
+    if(ifd >= 0) fdatasync(ifd);
+}
+static int dlc_committer_main(volatile long* ctl, long start_h, long end_h, pid_t parent){
+    int lfd = open("append.lock", O_RDWR | O_CREAT, 0644);
+    if(lfd < 0){ fprintf(stderr, "[dlc committer] no lock\n"); return 1; }
+    static unsigned char st[4096]; store_init(st);
+    *(int*)((char*)st + 40) = lfd;
+    { extern unsigned int net_magic; *(int*)((char*)st + 36) = (int)net_magic; }
+    *(int*)((char*)st + 28) = 0; *(int*)((char*)st + 0) = -1;
+    store_reload(st);
+    store_set_sync(0);                                       /* this process only; synced per chunk below */
+    int r = dlc_committer_run(ctl, start_h, end_h, st, store_append_shared, dlc_index_present, 20, parent, dlc_store_sync_chunk);
+    close(lfd);
+    return r;
+}
+/* every worker has exited, so every chunk that will ever be staged is
+ * staged: tell the committer to drain and stop at the first chunk it does
+ * not find (the next pass's hole scan owns that one). Called at the loop's
+ * last reap, BEFORE the final status tick, so that tick shows the archive
+ * the committer finished, not the one it was still writing. */
+static void dlc_drain_committer(volatile long* ctl){
+    if(g_dlc_committer<=0) return;
+    ctl[DLC_CTL_STOP_COMMIT]=1;
+    int cst; long waited_ms=0;
+    while(waitpid(g_dlc_committer,&cst,WNOHANG)==0){
+        if(g_shutdown_requested){ kill(g_dlc_committer,SIGTERM); waitpid(g_dlc_committer,&cst,0); break; }
+        struct timespec ts={0,50000000L}; nanosleep(&ts,NULL); waited_ms+=50;
+        if(waited_ms%10000==0) fprintf(stderr,"[dlc] waiting for the committer: %ld staged chunk(s) left\n", ctl[DLC_CTL_STAGED]);
+    }
+    g_dlc_committer=0;
+    fprintf(stderr,"[dlc] committer: %ld chunk(s) appended in height order; committed tip %ld\n",
+            ctl[DLC_CTL_N_COMMIT], ctl[DLC_CTL_COMMIT_TIP]);
+}
+static void dlc_stop_committer(void){
+    if(g_dlc_committer <= 0) return;
+    int stt; kill(g_dlc_committer, SIGTERM);
+    { struct timespec g = {1, 0}; nanosleep(&g, NULL); }
+    if(waitpid(g_dlc_committer, &stt, WNOHANG) == 0){ kill(g_dlc_committer, SIGKILL); waitpid(g_dlc_committer, &stt, 0); }
+    g_dlc_committer = 0;
 }
 /* ---- boundary rotation (2026-09-07) --------------------------------------
  * A worker KEEPS its peer after a clean chunk. Once the flat chunk budget
@@ -4226,7 +4448,10 @@ static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
  * zero-inits it to 0.0, read as "no reading yet" if a drop somehow happens
  * before the parent's first 10s tick. */
 typedef struct { char peer[64]; long chunks; long blocks; long guard; double last_bw_bps; long timeouts; long held_idx;
-                 double pool_median_bps;   /* written by the parent each tick: the pool's median rate, read by the worker for boundary rotation */ } dlc_stat_t;
+                 double pool_median_bps;   /* written by the parent each tick: the pool's median rate, read by the worker for boundary rotation */
+                 /* 2026-09-08, for getpeerinfo: the handshake's facts (worker), the chunk in flight (worker), bytes on this peer (parent) */
+                 unsigned proto; unsigned long long services; char subver[96]; int start_height; long long conn_time;
+                 long cur_lo, cur_hi; long long bytes_peer; } dlc_stat_t;
 static long long dlc_now_ms(void); static long dlc_proc_rchar(pid_t pid);   /* fwd decls: the worker judges its own chunk before these are defined */
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
 static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
@@ -4307,7 +4532,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                 if(waited_ticks>=DLC_WINDOW_HELP_SECS*5){
                     long blk=dlc_help_chunk_lo(fh, next_claim[DLC_CTL_SPAN_START]);   /* the chunk holding the first hole, on the claim grid */
                     long cur=next_claim[DLC_CTL_HELPING];
-                    if(cur!=blk && __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], cur, blk)){   /* one helper per blocking chunk */
+                    if(cur!=blk && !dlc_stage_exists(blk) && __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], cur, blk)){   /* staged = the committer has it; not ours to refetch */   /* one helper per blocking chunk */
                         lo=blk; helping=1;
                         __sync_fetch_and_add(&next_claim[DLC_CTL_N_HELP], 1L);
                         break;
@@ -4321,6 +4546,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
         if(lo>end_h){ if(fd>=0) close(fd); DLC_RELEASE(); break; }
         long hi=lo+DLC_CHUNK_BLOCKS-1; if(hi>end_h) hi=end_h;
         if(dlc_chunk_all_present(lo,hi)) continue;
+        mystat->cur_lo=lo; mystat->cur_hi=hi;                          /* getpeerinfo's inflight */
 
         unlink(hp_);                       /* DMN-8: stale file from a crashed run */
         int hfd=open(hp_,O_RDWR|O_CREAT|O_EXCL|O_NOFOLLOW,0600);
@@ -4375,6 +4601,9 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                         fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
                         mystat->held_idx=idx;   /* so the parent can ban THIS peer on early-kill */
                         strncpy((char*)mystat->peer,cand,63);
+                        { rpc_peer_t v; memset(&v,0,sizeof v); rpc_peer_from_version(&v, g_peer_version_payload, g_peer_version_len);   /* for getpeerinfo */
+                          mystat->proto=v.proto; mystat->services=v.services; mystat->start_height=v.start_height;
+                          memcpy((char*)mystat->subver, v.subver, sizeof mystat->subver); mystat->conn_time=(long long)time(NULL); mystat->bytes_peer=0; }
                         /* fresh peer -- the displayed chunks/blocks/guard
                          * must reflect THIS connection, not accumulate
                          * across every peer this worker slot has ever
@@ -4432,8 +4661,19 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
              * benchmark. Core keeps 16 blocks in flight per peer for the same
              * reason. Same validation per block, block for block. */
             long long chunk_t0 = dlc_now_ms(); long chunk_r0 = dlc_proc_rchar(getpid());   /* for the boundary-rotation verdict */
+            /* 2026-09-08: the chunk goes to a staging file, not the archive;
+             * the committer appends it in height order (see dlc_commit_chunk) */
+            char stmp[96]; int sfd=dlc_stage_open_tmp(stmp,sizeof stmp,lo);
+            if(sfd<0){ fprintf(stderr,"[dlc w%d] stage: cannot create %s (%s)\n", w, stmp, strerror(errno)); close(fd); fd=-1; DLC_RELEASE(); break; }
+            g_stage_fd=sfd; ibd_pipeline_set_sink(dlc_stage_sink);
             long r=ibd_fetch_chunk_pipelined(fd, st, hst, lo, n, buf, (unsigned)sizeof buf, scratch, cap);
             alarm(0); sigaction(SIGALRM,&old,NULL);
+            close(sfd); g_stage_fd=-1;
+            if(r>=0 && !mux_sync_budget_fired){
+                char sfin[64]; dlc_stage_path(sfin,sizeof sfin,lo);
+                if(rename(stmp,sfin)!=0){ fprintf(stderr,"[dlc w%d] stage: cannot publish %s (%s)\n", w, sfin, strerror(errno)); unlink(stmp); r=IBD_FAIL_STORE; }
+                else __sync_fetch_and_add(&next_claim[DLC_CTL_STAGED],1L);
+            } else unlink(stmp);
             store_reload(st);
             guard++;
             if(mux_sync_budget_fired){
@@ -4702,6 +4942,7 @@ static void dlc_stop_workers(pid_t* kids, int nw, const char* why){
     for(int w=0;w<nw;w++) if(kids[w]) kill(kids[w], SIGTERM);
     { struct timespec g={1,0}; nanosleep(&g,NULL); }
     for(int w=0;w<nw;w++) if(kids[w]){ int stt; if(waitpid(kids[w],&stt,WNOHANG)==0){ kill(kids[w], SIGKILL); waitpid(kids[w],&stt,0); } kids[w]=0; }
+    dlc_stop_committer();                       /* before anything truncates the archive under it */
 }
 /* The reject hook's half (see dl_reject_block): a no-op unless dl_catchup is
  * running in this process right now. */
@@ -4977,6 +5218,9 @@ static long dl_catchup(const char* dir, int min_workers){
     next_claim[DLC_CTL_RETRY_HEAD]=0; next_claim[DLC_CTL_RETRY_TAIL]=0; next_claim[DLC_CTL_FIRST_HOLE]=start_h; next_claim[DLC_CTL_HELPING]=-1; next_claim[DLC_CTL_WANT_ANCHOR]=0; next_claim[DLC_CTL_SPAN_START]=start_h;   /* window starts at the span start; nobody helping */
     for(long i=0;i<DLC_RETRY_MAX;i++) next_claim[DLC_CTL_RING+i]=-1;   /* -1 = empty slot (0 is a real chunk) */
     for(int i=DLC_CTL_N_ROTATE;i<=DLC_CTL_N_ABANDON;i++) next_claim[i]=0;
+    next_claim[DLC_CTL_COMMIT_TIP]=start_h-1; next_claim[DLC_CTL_STAGED]=0; next_claim[DLC_CTL_N_COMMIT]=0; next_claim[DLC_CTL_STOP_COMMIT]=0;
+    { long stale=dlc_stage_wipe(); if(stale) fprintf(stderr,"[dlc] stage: discarded %ld file(s) an earlier run left; their chunks are fetched again\n", stale); }
+    { pid_t cp=fork(); if(cp==0){ _exit(dlc_committer_main(next_claim, start_h, end_h, getppid())); } g_dlc_committer=cp; }
     /* MAP_ANONYMOUS pages come zeroed, so every stats[w].peer/chunks/blocks/
      * guard and every claimed[i] starts at "" / 0 / 0 / 0 / 0 -- no explicit
      * init needed. */
@@ -5080,12 +5324,19 @@ static long dl_catchup(const char* dir, int min_workers){
             dlc_stop_workers(kids, nw, "shutdown requested");
             alive=0; break;
         }
+        if(g_dlc_committer>0){                 /* the committer died under us: restart it (its state is the archive itself) */
+            int cst; if(waitpid(g_dlc_committer,&cst,WNOHANG)>0){
+                fprintf(stderr,"[dlc] committer exited unexpectedly (status %d) -- restarting it\n", cst);
+                pid_t cp=fork(); if(cp==0){ _exit(dlc_committer_main(next_claim, start_h, end_h, getppid())); } g_dlc_committer=cp;
+            }
+        }
         alive=0;
         for(int w=0;w<nw;w++){
             if(kids[w]==0) continue;
             int stt; pid_t r=waitpid(kids[w],&stt,WNOHANG);
             if(r==0) alive++; else kids[w]=0;
         }
+        if(alive==0) dlc_drain_committer(next_claim);   /* the final tick below shows the finished archive */
         /* everything below is the 10 s status tick; a connect pass that
          * returned early (a hole, or the idle sleep) does not add a tick */
         long long now_ms = dlc_now_ms();
@@ -5162,6 +5413,23 @@ static long dl_catchup(const char* dir, int min_workers){
           if(nv > 0) median_bps = v[nv/2]; }
         double floor_bps = dlc_effective_floor(median_bps);
         for(int w=0;w<nw;w++) stats[w].pool_median_bps = median_bps;   /* published for the workers' boundary rotation */
+        /* publish the workers' peers for getpeerinfo / getnettotals (2026-09-08) */
+        if(g_node_status){
+            int nd = nw > 64 ? 64 : nw;
+            for(int w=0; w<nd; w++){
+                rpc_peer_t* d = &g_node_status->dlpeers[w];
+                if(kids[w]==0 || !stats[w].peer[0]){ d->used = 0; continue; }
+                strncpy(d->addr, (const char*)stats[w].peer, sizeof d->addr - 1); d->addr[sizeof d->addr - 1] = 0;
+                d->proto = stats[w].proto; d->services = stats[w].services; d->start_height = stats[w].start_height;
+                memcpy(d->subver, (const char*)stats[w].subver, sizeof d->subver); d->subver[sizeof d->subver - 1] = 0;
+                d->conn_time = stats[w].conn_time; d->bytes_recv = stats[w].bytes_peer; d->bytes_sent = 0;
+                d->last_recv = d->last_send = (long long)time(NULL);
+                d->inflight_lo = stats[w].cur_lo; d->inflight_hi = stats[w].cur_hi; d->dl_worker = w; d->inbound = 0;
+                d->used = 1;
+            }
+            g_node_status->n_dlpeers = nd;
+            g_node_status->dl_bytes_total = (long long)cumulative_bytes;
+        }
         for(int w=0;w<nw;w++){
             long b=stats[w].blocks; long blkrate=(long)((double)(b-prev_blocks[w])/tick_s);
             long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
@@ -5174,6 +5442,7 @@ static long dl_catchup(const char* dir, int min_workers){
                     byte_rate=delta/tick_s;
                     dlc_fmt_rate(bw,sizeof bw,byte_rate);
                     stats[w].last_bw_bps=byte_rate; /* worker reads this to report why it got dropped */
+                    stats[w].bytes_peer += (long long)delta;   /* the worker zeroes it when it changes peer */
                     /* EMA speed for the peer this worker HOLDS (alpha 0.5,
                      * half-life ~20s). held_idx is the same index the ban
                      * path uses; -1 means the worker never connected, and a
@@ -5279,12 +5548,14 @@ static long dl_catchup(const char* dir, int min_workers){
               static int last_nowit = 0; int nw_now = peer_no_witness_count();
               if(nw_now != last_nowit){ last_nowit = nw_now;              /* only when the count changes */
                   fprintf(stderr,"[dlc] -- %d peer(s) dropped for lacking NODE_WITNESS; %llu redial(s) skipped since --\n", nw_now, peer_no_witness_skips()); } }
-            fprintf(stderr,"[dlc] -- recv %s (avg %s) | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
+            fprintf(stderr,"[dlc] -- recv %s (avg %s) | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | staged %ld commit %ld | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
                     aggbuf, avgrbuf, waggbuf, avgwbuf, floor_bps/1024.0, median_bps/1024.0, cur, nlive,
-                    nbanned == cur ? "" : " (amnesty active)", d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
+                    nbanned == cur ? "" : " (amnesty active)", next_claim[DLC_CTL_STAGED], next_claim[DLC_CTL_N_COMMIT], d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
         }
     }
+    dlc_drain_committer(next_claim);            /* a no-op when the loop's last reap already drained it */
     g_dlc_kids = NULL; g_dlc_nw = 0;            /* the reject hook's stop is a no-op again */
+    if(g_node_status){ g_node_status->n_dlpeers = 0; }   /* the download is over: its peers leave getpeerinfo (the byte total stays) */
     /* One more pass now that every helper has exited: the blocks that landed
      * between the last connect pass and the last reap (up to a chunk per
      * helper) are connected here, budget-bounded like any pass, so the lag
