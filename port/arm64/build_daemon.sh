@@ -34,7 +34,7 @@ done
 
 # ---- 2. DAEMONSRCS + DAEMON_RPCOBJS + main + wallet_core: single native link ----
 DAEMONSRCS="../../asm/daemon/main.c ../../asm/daemon/utxo_live.c ../../asm/daemon/block_witness.c ../../asm/daemon/tx_accept.c ../../asm/daemon/zmq_notify.c ../../asm/daemon/zmq_pub.c ../../asm/daemon/reorg.c ../../asm/daemon/undo_log.c ../../asm/daemon/locator_build.c ../../asm/daemon/archive_verify.c ../../asm/daemon/addr_ingest.c ../../asm/daemon/net_policy.c ../../asm/daemon/node_config.c ../../asm/daemon/chainparams.c ../../asm/daemon/mempool_cfg.c ../../asm/daemon/upload_cap.c ../../asm/daemon/tx_submit.c ../../asm/daemon/tx_relay.c ../../asm/daemon/tx_index_tail.c ../../asm/daemon/blk_submit.c ../../asm/daemon/utxo_setinfo_rpc.c ../../asm/daemon/coinstats_index.c ../../asm/daemon/addr_self.c ../../asm/daemon/bfilter_index.c ../../asm/daemon/addr_index_tail.c ../../asm/daemon/block_strip.c ../../asm/wallet_store.c ../../asm/bitcoin_mempool_policy.c ../../asm/daemon/mempool_compact.c ../../asm/bitcoin_txval_modern.c ../../asm/bitcoin_segwit.c ../../asm/bitcoin_taproot_sighash.c ../../asm/daemon/tx_verify.c ../../asm/bitcoin_scriptverify.c ../../asm/bitcoin_witness_v0.c ../../asm/daemon/serve_cfilters.c ../../asm/wallet_msgsign.c"
-RPCSRCS="../../asm/rpc_server.c ../../asm/rpc_commands.c ../../asm/rpc_chain.c ../../asm/bitcoin_pow_rules.c ../../asm/block_filter.c ../../asm/utxo_snapshot.c ../../asm/rpc_signer.c ../../asm/bip32_ckdpub.c ../../asm/rpc_json.c ../../asm/rpc_net.c ../../asm/rpc_node.c ../../asm/daemon/mempool_persist.c ../../asm/rpc_wallet_ops.c ../../asm/wallet_labels.c ../../asm/wallet_scan.c ../../asm/wallet_scan_hash.c ../../asm/daemon/wallet_enc_state.c ../../asm/daemon/wallet_crypter.c ../../asm/bitcoin_aes.c ../../asm/wallet_txlog.c ../../asm/wallet_bnb.c"
+RPCSRCS="../../asm/rpc_server.c ../../asm/rpc_esplora.c ../../asm/daemon/addr_hist.c ../../asm/rpc_commands.c ../../asm/rpc_chain.c ../../asm/bitcoin_pow_rules.c ../../asm/block_filter.c ../../asm/utxo_snapshot.c ../../asm/rpc_signer.c ../../asm/bip32_ckdpub.c ../../asm/rpc_json.c ../../asm/rpc_net.c ../../asm/rpc_node.c ../../asm/daemon/mempool_persist.c ../../asm/rpc_wallet_ops.c ../../asm/wallet_labels.c ../../asm/wallet_scan.c ../../asm/wallet_scan_hash.c ../../asm/daemon/wallet_enc_state.c ../../asm/daemon/wallet_crypter.c ../../asm/bitcoin_aes.c ../../asm/wallet_txlog.c ../../asm/wallet_bnb.c"
 
 OBJBUNDLE="$DAEMONOBJS"
 # ---- 3. NEWSRCS: C files added by main since the ARM build was written ----
@@ -46,10 +46,19 @@ NEWSRCS="../../asm/daemon/addrbook.c ../../asm/daemon/asmap.c ../../asm/daemon/d
 # is made read-only and bound at load; the port's link must carry it too or
 # tests/test_elf_hardening rightly fails the binary.
 gcc -no-pie -O2 -Wl,-z,relro,-z,now -lpthread -I../../asm -I../../asm/daemon -I../.. \
-    -o daemon_out/bmcbitcoind $DAEMONSRCS $RPCSRCS $NEWSRCS ../../asm/wallet_core.c \
+    -o daemon_out/.bmcbitcoind.new $DAEMONSRCS $RPCSRCS $NEWSRCS ../../asm/wallet_core.c \
     $(for m in $OBJBUNDLE; do echo "${m}.o"; done) 2>> "$LOG"
 RC=$?
 echo "=== LINK RC=$RC ===" >> "$LOG"
+# Swap onto the live path with a RENAME, not an in-place write: gcc opening the
+# running daemon's own binary would fail with ETXTBSY, but rename(2) over a path
+# an executing process holds is fine -- the running inode stays alive for it and
+# the next start picks up the new file. A failed link leaves the old binary in
+# place (the .new file is only adopted on rc=0).
+if [ "$RC" = "0" ]; then
+    mv -f daemon_out/.bmcbitcoind.new daemon_out/bmcbitcoind
+    RC=$?
+fi
 echo "=== undefined symbols (first 60) ===" >> "$LOG"
 grep -aoE 'undefined reference to `[^'"'"']+'"'"'' "$LOG" | sort -u | head -60 >> "$LOG"
 echo "BUILD DONE rc=$RC (see $LOG)"

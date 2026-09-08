@@ -365,9 +365,15 @@ PYEOF
 [ -s "$OUT/sweep_plan.tsv" ] || { echo "plan generation FAILED"; exit 1; }
 
 # ---- pre-build the special objects ----------------------------------------
-# tests/undo_log_ref.o: x86 recipe is gcc -c + objcopy --redefine-sym (the C
-# is arch-neutral, so this is faithful on aarch64).
-gcc -no-pie -O2 -c ../../asm/daemon/undo_log.c -o /tmp/undo_ref_raw.o 2>> "$OUT/build.log" \
+# tests/undo_log_ref.o: x86 recipe is gcc -c tests/undo_log_ref.c + objcopy
+# --redefine-sym. The source MUST be the FROZEN copy under tests/, not the live
+# daemon/undo_log.c: the undo-keep-all batch (ec2979c2) rewrote undo_log.c to
+# the packed rev*.dat store, and the frozen copy is kept pre-store ON PURPOSE
+# so the asm-vs-C module compare keeps its oracle. Compiling the live module
+# made the "ref" side write rev*.dat + undo.idx, b/undo_<h>.dat went missing,
+# and the append byte-identity check failed 0-vs-1 -- the sweep ran this for a
+# week on the assumption the two files were the same bytes; ec2979c2 broke that.
+gcc -no-pie -O2 -c ../../asm/tests/undo_log_ref.c -o /tmp/undo_ref_raw.o 2>> "$OUT/build.log" \
 && objcopy --redefine-sym undo_append_record=ref_undo_append_record \
            --redefine-sym undo_capture_and_del=ref_undo_capture_and_del \
            --redefine-sym undo_load=ref_undo_load \
@@ -535,6 +541,22 @@ ensure_asm_layout() {
     fi
     if [ -x "$AB/$OUT/bmc_build_txospender_index" ]; then
         ln -sf "$AB/$OUT/bmc_build_txospender_index" "$REPO/asm/daemon/bmc_build_txospender_index"
+    fi
+    # daemon/bmc_build_addr_hist: the address-history index base builder
+    # (asm/Makefile rule of the same name, from the addr-hist batch #107/#108).
+    # tests/test_addr_hist execs it; link list mirrors the x86 rule, against
+    # this port's objects.
+    if [ ! -x "$AB/$OUT/bmc_build_addr_hist" ]; then
+        (cd "$AB" && gcc -no-pie -O2 -Wl,-z,relro,-z,now -lpthread \
+          -I../../asm -I../../asm/daemon \
+          -o "$OUT/bmc_build_addr_hist" \
+          ../../asm/daemon/build_addr_hist.c \
+          bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o) \
+        2>> "$AB/$OUT/build.log" \
+        || echo -e "build-fail\tSPECIAL:bmc_build_addr_hist\tsee build.log" >> "$AB/$OUT/results.tsv"
+    fi
+    if [ -x "$AB/$OUT/bmc_build_addr_hist" ]; then
+        ln -sf "$AB/$OUT/bmc_build_addr_hist" "$REPO/asm/daemon/bmc_build_addr_hist"
     fi
     return 0
 }
