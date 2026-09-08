@@ -47,7 +47,11 @@ testnet4, signet (public or custom) and regtest.
   `BLOCK_DOWNLOAD_WINDOW` scaled to this node's in-flight count — so the
   archive consolidates monotonically and a chunk a worker gives up on goes
   to a retry ring, never a hole left behind. An idle worker fetches the
-  chunk blocking the window after 2 s (Core's stalling timeout).
+  chunk blocking the window after 2 s (Core's stalling timeout). Workers
+  stage each verified chunk to a file and one committer process appends
+  the archive in height order, so the block files are laid out
+  monotonically and the archive never holds a hole (unlike Core's
+  arrival-order `blk*.dat`).
 - Peers are ranked by a timed header sample before the download; a peer is
   dropped only by a stall clock (nothing for 120 s) or, at a chunk boundary
   with nothing discarded, for running under half the pool's median. Every

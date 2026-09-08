@@ -311,6 +311,15 @@ int main(void){
         ck("dl_catchup wrote every block", got, NB);
         long present_gate = 0; { int fd = open("index.dat", O_RDONLY); present_gate = count_present(fd); close(fd); }
         ck("archive complete at the gate", present_gate, NB);
+        /* 2026-09-08: three workers, one committer -- the archive's (file, offset)
+         * must increase with height. Before the committer the workers appended
+         * in arrival order and this was the boot check's "NOT laid out
+         * monotonically (first break at height 41)". */
+        { extern long archive_layout_monotonic(long upto);
+          long first_break = archive_layout_monotonic(idxscan_tip());
+          ck("archive laid out monotonically after a 3-worker download (first break -1)", first_break, -1);
+          const char* cl = last_line_with(log, "committer:"); print_line(cl);
+          ck("the committer reported its chunks", cl != 0, 1); }
         /* the gate: everything stored, and the lag is what ONE budget-bounded
          * pass leaves behind -- bounded by a chunk here, never a download's
          * worth (the pre-step-1 loop left all NB) */

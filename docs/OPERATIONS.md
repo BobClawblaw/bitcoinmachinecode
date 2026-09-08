@@ -450,7 +450,11 @@ Two lines every 10 s (since 2026-09-08; before that the tick was eight lines):
   claim past the window), helps (an idle worker fetched the blocking chunk),
   failed attempts (a chunk fetch that failed on a peer; the worker backs
   off and the peer's standing halves), abandons (a chunk that went to the
-  retry ring after 400 attempts).
+  retry ring after 400 attempts). Before the event counts, `staged N
+  commit M` (2026-09-08): chunks waiting for the in-order committer right
+  now, and chunks it has appended. `staged` above a handful for more than
+  a tick means the chunk at the first hole has not arrived; the help path
+  fetches it after 2 s.
 - The NODE_WITNESS drop count prints only when it changes.
 - The 16-line peer table prints every five minutes.
 - `[dl] new block` and `[dl] announced tip` are silent while the tip is
@@ -594,10 +598,15 @@ Recovery:
 
 ### Archive re-layout
 
-Archives filled by the parallel downloader are not in height order, and every
-boot reports `[check] block data is NOT laid out monotonically (first break
-at height H) -- truncation and pruning will refuse to run`. This is
-informational; only truncation and pruning refuse.
+Archives filled by the parallel downloader BEFORE 2026-09-08 are not in
+height order, and every boot reports `[check] block data is NOT laid out
+monotonically (first break at height H) -- truncation and pruning will
+refuse to run`. This is informational; only in-place pruning and physical
+truncation refuse (the whole-file pruner and the index-only truncation run
+instead). Since 2026-09-08 the download's in-order committer appends the
+archive in height order from a single process
+(`docs/releases/2026-09-08-in-order-committer.md`), so a fresh sync passes
+the check; the tool below is for archives built earlier.
 
 `tests/tool_archive_relayout <archive-dir> <out-dir>` reads `index.dat`,
 copies every block frame into new `blk*.dat` files in height order (128 MiB

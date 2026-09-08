@@ -79,6 +79,12 @@ also annotated tags.
 | [`releases/2026-09-07-boundary-rotation-eta.md`](releases/2026-09-07-boundary-rotation-eta.md) | a slow peer rotated at the chunk boundary; the picker bar; ETA in DD:HH:MM:SS |
 | [`releases/2026-09-07-keep-headers-ahead.md`](releases/2026-09-07-keep-headers-ahead.md) | headers ahead of the archive are kept across a restart |
 | [`releases/2026-09-07-monotonic-download.md`](releases/2026-09-07-monotonic-download.md) | the download is monotonic like Core's: window, retry ring, the run-10 cascade; the 4096 window and 2 s help |
+| [`releases/2026-09-08-rate-limits.md`](releases/2026-09-08-rate-limits.md) | `bmc.dialratelimit`, `bmc.downloadratelimit`, `bmc.uploadratelimit`: pacers shared across processes through one clock file; all default off |
+| [`releases/2026-09-08-taproot-scriptpath-signing.md`](releases/2026-09-08-taproot-scriptpath-signing.md) | script-path signing verified by the consensus verifier on Core's own fixture |
+| [`releases/2026-09-08-resume-deadlock.md`](releases/2026-09-08-resume-deadlock.md) | the apply-first backlog stops at the first hole: a resume no longer waits on a block that is not there |
+| [`releases/2026-09-08-debuglog.md`](releases/2026-09-08-debuglog.md) | the daemon logs to `<chaindir>/debug.log` like Core; `printtoconsole=1` tees; `debuglogfile=0` turns the file off |
+| [`releases/2026-09-08-cli-params.md`](releases/2026-09-08-cli-params.md) | `bmc_cli` converts arguments like bitcoin-cli and prints replies of any size; the config parser strips a trailing `#` comment |
+| [`releases/2026-09-08-in-order-committer.md`](releases/2026-09-08-in-order-committer.md) | workers stage verified chunks; one committer appends the archive in height order, so the block files are laid out monotonically and the archive never has a hole |
 
 ## Development history
 

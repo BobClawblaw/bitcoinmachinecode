@@ -54,4 +54,12 @@ void ibd_pipeline_set_progress(void (*cb)(void*), void* arg);
  * received, wanted or not -- the bytes were on the wire either way. The
  * download worker charges them to bmc.downloadratelimit. */
 void ibd_pipeline_set_bytes(void (*cb)(long));
+/* sink hook (2026-09-08): where each validated block goes. NULL (the
+ * default) is store_append_shared, the archive in arrival order. The
+ * download's in-order committer sets a sink that writes the chunk to a
+ * staging file, so the archive is appended by ONE process in height order.
+ * The sink sees (height, hash, raw, len) in ascending height order within the
+ * chunk, exactly as the store did. Returns <0 to fail the chunk. */
+typedef long (*ibd_sink_fn)(void* st, long height, const unsigned char hash[32], const unsigned char* raw, unsigned len);
+void ibd_pipeline_set_sink(ibd_sink_fn sink);
 #endif
