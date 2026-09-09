@@ -143,12 +143,23 @@ int main(void){
     { unlink(CSH_BASE_FILE);
       snprintf(cmd, sizeof cmd, "BMC_CHAIN=regtest BMC_CSH_STOP_AFTER=1 %s . 3 2 2>resume1.log", tool);
       ck("stopped after pass 1: marker written, no base yet", system(cmd) == 0 && access(CSH_TMPDIR "/pass1.done", F_OK) == 0 && access(CSH_BASE_FILE, F_OK) != 0);
+      ck("pass 1's outputs are all there for pass 2 (2 workers x 256 buckets, both sides)", access(CSH_TMPDIR "/csh_o_w00_000.tmp", F_OK) == 0 && access(CSH_TMPDIR "/csh_s_w01_255.tmp", F_OK) == 0);
       snprintf(cmd, sizeof cmd, "BMC_CHAIN=regtest BMC_CSH_STOP_AFTER=2 %s . 3 2 2>resume2.log", tool);
       ck("the second run resumed at pass 2 and stopped after it", system(cmd) == 0 && log_has("resume2.log", "resuming at pass 2") && access(CSH_TMPDIR "/pass2.done", F_OK) == 0);
+      ck("pass 2 kept its inputs until it completed, then removed them; pass 3's inputs are there", access(CSH_TMPDIR "/csh_o_w00_000.tmp", F_OK) != 0 && access(CSH_TMPDIR "/csh_r_w00_000.tmp", F_OK) == 0);
       snprintf(cmd, sizeof cmd, "BMC_CHAIN=regtest %s . 3 2 2>resume3.log", tool);
       ck("the third run resumed at pass 3 and completed", system(cmd) == 0 && log_has("resume3.log", "resuming at pass 3") && csi_hist_base_to() == 3);
       csi_hist_out_t o4; int q = csi_hist_query(3, 1, &o4);
       ck("the resumed build's digest equals the first build's, the scratch is gone, the check passes", q == 1 && !memcmp(golden, o4.digest, 32) && access(CSH_TMPDIR, F_OK) != 0 && csi_hist_check(1, why, sizeof why) == 1);
+      /* a marker without its inputs (a pass 2 killed midway used to eat pass 1's
+       * buckets as it read them; 2026-09-09) starts over instead of joining
+       * half-empty buckets */
+      unlink(CSH_BASE_FILE);
+      snprintf(cmd, sizeof cmd, "BMC_CHAIN=regtest BMC_CSH_STOP_AFTER=1 %s . 3 2 2>/dev/null", tool); (void)!system(cmd);
+      unlink(CSH_TMPDIR "/csh_o_w00_007.tmp"); unlink(CSH_TMPDIR "/csh_s_w00_007.tmp");
+      snprintf(cmd, sizeof cmd, "BMC_CHAIN=regtest %s . 3 2 2>missing.log", tool);
+      ck("pass 1's marker with a bucket missing: the run starts over, and the base is right", system(cmd) == 0 && log_has("missing.log", "starting over") && !log_has("missing.log", "resuming at pass 2") && csi_hist_base_to() == 3);
+      { csi_hist_out_t o6; ck("... same digest as the clean build", csi_hist_query(3, 1, &o6) == 1 && !memcmp(golden, o6.digest, 32)); }
       /* markers for another target height are not resumed */
       unlink(CSH_BASE_FILE);
       snprintf(cmd, sizeof cmd, "BMC_CHAIN=regtest BMC_CSH_STOP_AFTER=1 %s . 3 2 2>/dev/null", tool); (void)!system(cmd);
