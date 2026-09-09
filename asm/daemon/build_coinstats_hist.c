@@ -56,7 +56,15 @@
  *   - every pass ends by writing csh_tmp/passN.done (the worker count and
  *     the target height it ran with, fsynced); a rerun skips the passes
  *     whose markers match and resumes at the first that has none. A crash
- *     costs the pass it was in, not the run.
+ *     costs the pass it was in, not the run. A pass keeps its inputs until
+ *     it completes -- the loader used to delete each bucket as it read it,
+ *     so a pass 2 killed midway (2026-09-09 03:05Z, the harness's memory
+ *     heuristic) had eaten part of pass 1's output and the resumed pass 2
+ *     joined half-empty buckets: 22 million "unmatched" spends. The bucket
+ *     files go after pass 2's marker, the range files after pass 3's, and a
+ *     resume that finds its inputs missing starts over instead. Peak disk is
+ *     the outrefs + spendrefs + range files together (~2x the consumed
+ *     estimate) at the mainnet tip; ~830 GB was free on the reference box.
  *   - scratch without a pass1 marker is dead and is removed first, and so
  *     is the old layout's csh_*.tmp beside the archive: the range files of
  *     pass 2 are opened in APPEND mode, so a leftover from a dead run would
@@ -240,7 +248,7 @@ static int pass1_worker(int w, long lo, long hi, u8* store_buf, int addprod_fd){
 static u8* load_all(const char* pfx, int W, int i, size_t* len){
     char b[64]; size_t total = 0; for (int w = 0; w < W; w++){ struct stat st; if (stat(nm(b, pfx, w, i), &st) == 0) total += (size_t)st.st_size; }
     u8* a = malloc(total + 1); if (!a) die("oom join"); size_t off = 0;
-    for (int w = 0; w < W; w++){ FILE* f = fopen(nm(b, pfx, w, i), "rb"); if (!f) continue; struct stat st; fstat(fileno(f), &st); if (fread(a + off, 1, (size_t)st.st_size, f) != (size_t)st.st_size) die("short read"); off += (size_t)st.st_size; fclose(f); unlink(nm(b, pfx, w, i)); }
+    for (int w = 0; w < W; w++){ FILE* f = fopen(nm(b, pfx, w, i), "rb"); if (!f) continue; struct stat st; fstat(fileno(f), &st); if (fread(a + off, 1, (size_t)st.st_size, f) != (size_t)st.st_size) die("short read"); off += (size_t)st.st_size; fclose(f); }   /* not consumed here: a pass keeps its inputs until it completes (2026-09-09) */
     *len = off; return a;
 }
 typedef struct { const u8* p; } oidx;   /* pointer to an outref_hdr in the loaded buffer */
@@ -355,6 +363,14 @@ int main(int argc, char** argv){
         if (marker_read(1, &mW, &mto) && mto == to_h && mW >= 1 && mW <= 64){ g_Wfiles = mW; start = 2;
             if (marker_read(2, &mW, &mto) && mto == to_h && mW == g_Wfiles){ start = 3;
                 if (marker_read(3, &mW, &mto) && mto == to_h && mW == g_Wfiles) start = 4; } } }
+    /* a marker promises the next pass's inputs; verify them, since a kill
+     * between a pass's end and its successor's cleanup, or an operator's
+     * tidy-up, can leave the marker without the files */
+    if (start == 2 || start == 3){
+        char b[64]; long have = 0, want = (long)g_Wfiles * (start == 2 ? NB : NR); struct stat st;
+        for (int w = 0; w < g_Wfiles; w++) for (int i = 0; i < (start == 2 ? NB : NR); i++) if (stat(nm(b, start == 2 ? "o" : "r", w, i), &st) == 0) have++;
+        if (have < want){ fprintf(stderr, "[coinstats-hist] pass %d's inputs are missing (%ld of %ld files) -- starting over\n", start, have, want); start = 1; }
+    }
     if (start == 1){ scratch_reset(); g_Wfiles = W; }
     else fprintf(stderr, "[coinstats-hist] resuming at pass %d (passes below it are marked done for to=%ld with %d workers)\n", start, to_h, g_Wfiles);
     int stop_after = getenv("BMC_CSH_STOP_AFTER") ? atoi(getenv("BMC_CSH_STOP_AFTER")) : 0;
@@ -367,10 +383,12 @@ int main(int argc, char** argv){
         if (stop_after == 1){ fprintf(stderr, "[coinstats-hist] stopping after pass 1 (BMC_CSH_STOP_AFTER)\n"); return 0; } }
     if (start <= 2){ unlink_prefix(CSH_TMPDIR, "csh_r_", 0);   /* the range files are appended to: a retried pass 2 starts them empty */
         run_workers(g_Wfiles, p2, &x); marker_write(2, g_Wfiles, to_h); fprintf(stderr, "[coinstats-hist] pass2 done (%llds)\n", (long long)(time(NULL) - t0));
+        unlink_prefix(CSH_TMPDIR, "csh_o_", 0); unlink_prefix(CSH_TMPDIR, "csh_s_", 0);   /* pass 2's inputs, after its marker */
         if (stop_after == 2){ fprintf(stderr, "[coinstats-hist] stopping after pass 2 (BMC_CSH_STOP_AFTER)\n"); return 0; } }
     if (start <= 3){ long need_mb = 0; int W3 = pass3_workers(W, &need_mb);
         fprintf(stderr, "[coinstats-hist] pass3: %d worker(s) (largest range needs ~%ld MB each; MemAvailable %lld MB)\n", W3, need_mb, mem_available() >> 20);
         ctx_t x3 = x; x3.W = W3; run_workers(W3, p3, &x3); marker_write(3, g_Wfiles, to_h); fprintf(stderr, "[coinstats-hist] pass3 done (%llds)\n", (long long)(time(NULL) - t0));
+        unlink_prefix(CSH_TMPDIR, "csh_r_", 0);   /* pass 3's inputs, after its marker */
         if (stop_after == 3){ fprintf(stderr, "[coinstats-hist] stopping after pass 3 (BMC_CSH_STOP_AFTER)\n"); return 0; } }
     if (pass4(to_h, addprod_fd, remprod_fd) != 0) return 1;
     close(addprod_fd); close(remprod_fd);
