@@ -7,7 +7,7 @@ The rest of the audit, for the record:
 - Core's own rules, present and matching: stack 1000, element 520, ops 201, multisig keys 20, script 10,000, sigops cost 80,000, money range.
 - Still open: the UTXO store's record keeps an output script's length in two bytes, so a consensus-valid output script longer than 65,535 bytes cannot be represented -- a record format change (version 3), scheduled. `submitblock` refuses a block above 16,384 transactions where a pathological valid block could hold 16,666 (mining path); compact-block receive falls back to a full block above 20,000 (harmless).
 
-`test_txv_many_inputs` (new): 150 coinbases, a 24,000-output fan-out at 150, the 24,000-input spend at 151 through the live engine, and the same transaction through the single-transaction parser. **Watched to fail** on the fixed table (the parser assertion). GATE_LINE
+`test_txv_many_inputs` (new): 150 coinbases, a 24,000-output fan-out at 150, the 24,000-input spend at 151 through the live engine, and the same transaction through the single-transaction parser. **Watched to fail** on the fixed table (the parser assertion). A first gate caught a differential-parser mismatch from a pre-check on the claimed input count (the tables grow inside the loop instead; a bogus count fails on truncation as before). Gate `make -j8 test`: MAKE_EXIT 0, 0 failures (the expected test_rpc_signer segfault); audits exit 0.
 
 ---
 
