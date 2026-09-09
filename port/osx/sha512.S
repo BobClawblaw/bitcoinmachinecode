@@ -332,11 +332,11 @@ _sha512_full:
 	 * (any realistic len < 2^61 keeps the upper 8 bytes zero) */
 	add  x13, sp, x12			/* carrier base */
 	add  x13, x13, #120			/* -> carrier[120] (length low end) */
-	mov  x9, #112
+	mov  x9, #-8				/* zero carrier[112..127] = [x13-8..x13+7] */
 81:
-	strb wzr, [x13, x9]			/* zero carrier[112..127] */
+	strb wzr, [x13, x9]
 	add  x9, x9, #1
-	cmp  x9, #128
+	cmp  x9, #8
 	b.lt 81b
 	lsl  x10, x21, #3			/* bits = len*8 */
 	mov  x9, #8				/* 8 bytes BE at [x13..x13+7] */
