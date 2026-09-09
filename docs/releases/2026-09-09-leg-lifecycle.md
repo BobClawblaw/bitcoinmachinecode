@@ -27,3 +27,7 @@ Answers to the brief's questions. The budget measures wall-clock from the start 
 `test_dial_memory` (new): the schedule, the host key, the permanent case, the clearing, a full table. `test_dialhelper`: EINPROGRESS reads as a timeout (**watched to fail**). Gate `make -j8 -k test`: see the trailer.
 
 **Acceptance is measured after the restart, not asserted here**: the median leg lifetime, the number of `theirs` closes and their unread text, connections at the configured budget for an hour, `sync_failing=0`, the tip against mempool.space. The node was not restarted for this note; snapshot `deploy-20260909h` is staged.
+
+---
+
+PR #143 (`batch/2026-09-09-leg-lifecycle`), merged 17:4xZ as `00301543`; tag `leg-lifecycle-2026-09-09`. Staged as `deploy-20260909h`. Gate: the first run failed `test_sync_budget` on the sole-leg rule (fixed to a 4x budget), the second MAKE_EXIT 0, 344 passes. **Live from 18:38:24Z** (snapshot i): the first hour ran at the full outbound budget, 25/25 legs, at the public tip -- and 93 closes at a median 47 s, 63 of them the three-strike streak retiring non-serving cloud listeners, the finding behind the second pass.

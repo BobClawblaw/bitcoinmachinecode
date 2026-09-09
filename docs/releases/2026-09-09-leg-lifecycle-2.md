@@ -17,3 +17,7 @@ The first hour of close labels on production (snapshot i, boot 18:38:24Z) showed
 `test_dialhelper`: a quiet socketpair is not a hang-up, the peer's `shutdown(SHUT_WR)` is (POLLRDHUP), its close still is, a settled socket reads in 3 s ticks (was 300 ms). `test_dial_memory`: the permanent case (**watched to fail**). Gate: see the trailer.
 
 The capture also closes the last open question from the first batch: the peers that FIN us at 2 to 15 minutes had sent nothing after their verack and answered no `getheaders`; they are the same non-serving listeners, and the memory now holds them off.
+
+---
+
+PR #146 (`batch/2026-09-09-leg-lifecycle-2`), merged 19:3xZ as `a7fd883b`; tag `leg-lifecycle-2-2026-09-09`. Gate MAKE_EXIT 0, 344 passes. Staged as `deploy-20260909k`, the live link; not yet running on production.
