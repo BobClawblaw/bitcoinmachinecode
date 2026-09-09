@@ -124,6 +124,12 @@ also annotated tags.
 | [`releases/2026-09-09-no-seq-cap.md`](releases/2026-09-09-no-seq-cap.md) | No sequence cap: the BIP68 ledger is sized to the transaction, like Core's |
 | [`releases/2026-09-09-one-record-per-key.md`](releases/2026-09-09-one-record-per-key.md) | One record per key per run: the UTXO defect behind bench run 18's rejected block |
 | [`releases/2026-09-09-picker-dead-mark.md`](releases/2026-09-09-picker-dead-mark.md) | The download worker's picker: a dead-marked peer never clears the bar, not even a fresh sync's unknown bar |
+| [`releases/2026-09-09-blocktxn-is-not-a-block.md`](releases/2026-09-09-blocktxn-is-not-a-block.md) | Compact blocks received at last: `blocktxn` is not `block` |
+| [`releases/2026-09-09-cmpct-fallback.md`](releases/2026-09-09-cmpct-fallback.md) | A bad compact-block reconstruction falls back to the full block; `bmc.cmpctrecv` is gone |
+| [`releases/2026-09-09-leg-lifecycle-2.md`](releases/2026-09-09-leg-lifecycle-2.md) | Legs, second pass: the peer's half-close is seen at once, and the drains get the patience they were designed with |
+| [`releases/2026-09-09-leg-lifecycle.md`](releases/2026-09-09-leg-lifecycle.md) | Outbound legs: every close says whose it is, a failed dial is remembered, the streak is per peer, pongs within one pass |
+| [`releases/2026-09-09-pings-and-one-request-per-block.md`](releases/2026-09-09-pings-and-one-request-per-block.md) | Pings on every leg, and one request per block across the legs |
+| [`releases/2026-09-09-version-truth.md`](releases/2026-09-09-version-truth.md) | The version message tells the truth |
 
 ## Development history
 

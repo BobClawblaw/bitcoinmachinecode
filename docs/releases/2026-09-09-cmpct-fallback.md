@@ -8,3 +8,7 @@ Core has no switch for compact-block receive because it never needs one: a `Part
 `test_cmpct_fallback` (new, **watched to fail**: where=8, nothing stored): a fake peer answers the compact request for block 0 with a prefilled coinbase whose value byte is flipped, so the assembled block's merkle root no longer matches; the node must fetch block 0 in full, store both blocks, and count one fallback and one clean reconstruction. It did, once the drain had the fallback. The frame grew by 16 bytes for the two flags; assembled first on a scratch copy.
 
 Production's conf line comes out at its next restart; until then it is inert.
+
+---
+
+PR #148 (`batch/2026-09-09-cmpct-fallback`), merged 20:0xZ as `ef705eea`; tag `cmpct-fallback-2026-09-09`. Staged as `deploy-20260909l`; live on production from 20:11:40Z with the conf line removed. First hour: 6 new blocks, 4 reconstructed, 12 round trips, 0 fallbacks, tip = public.

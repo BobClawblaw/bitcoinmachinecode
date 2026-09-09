@@ -9,3 +9,7 @@ The first two rows of `docs/CORE_DIVERGENCES.md`, closed together.
 `test_inflight` (new): claim, refuse, own claim, release by leg and by hash, a stale claim taken over, a full table recycling its oldest. `test_sync_gate` (new, **watched to fail**: the pass fetched anyway): a refusing gate ends the pass with no `getdata` and nothing stored, an accepting one fetches both blocks, the gate is asked once per block. `test_dialhelper`: the ping schedule, the 20-minute timeout, a pong after the ping clearing it, the nonce match. The gate call is one hook in `bitcoind.asm`'s header loop, assembled first on a scratch copy.
 
 **Production on snapshot l, 20:11-21:09Z, compact blocks on for the first time:** 6 new blocks, 4 reconstructed, 12 round trips, 0 fallbacks; tip equal to the public tip throughout. The counter that read 0 of 1,262 all day moved.
+
+---
+
+PR #150 (`batch/2026-09-09-pings-inflight`), merged 21:3xZ as `313cf7dd`; tag `pings-inflight-2026-09-09`. Gate MAKE_EXIT 0, 347 passes. Staged as `deploy-20260909n`, the live link; production runs l.
