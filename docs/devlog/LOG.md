@@ -7,6 +7,30 @@ success is reached. Update it after every meaningful event.
 ================================================================================
 LOG
 ----------------------------------------------------------------------------
+## 2026-09-09 -- bmc_osx: a native macOS/Apple Silicon port is opened
+
+`main` stays the x86-64 development tree. New long-lived branch `bmc_osx`
+(forked from main @1dac38ae, upstream through #127) ports the assembly to
+Apple silicon natively — AArch64 again, but Darwin this time, which is why
+the arm-port work does not carry over mechanically:
+
+- **Hypothesis:** the arm-port branch (all 63 modules differential-verified
+  on Linux AArch64) could be retargeted cheaply. **Disproved by inspection:**
+  its syscall layer is Linux-only — `svc #0` with nr in x8, ELF sections,
+  x28 used as a callee-saved frame register, error convention via flags.
+  Darwin wants `svc #0x80` with nr in x16, errno in x0 with carry set,
+  Mach-O sections with `_`-prefixed symbols, x28 reserved (platform), PIC
+  via adrp/add. Every syscall-touching line is rework. Heaviest modules by
+  svc count (measured from the arm-port .S): utxo_lsm 66, store 42,
+  utxo_store 30, idxscan 19, undo 18, store_fast 17.
+- **Decision:** fresh port in `port/osx/` on the arm-port layout model
+  (same public symbols, C harnesses unchanged), with the arm-port kept on
+  origin as the algorithm/semantics reference. Pure-compute module first to
+  prove the Mach-O build+differential loop before touching syscall code.
+- Durable docs created on the branch: `port/OSX_PORT.md` (branch/sync
+  model), `port/OSX_ROADMAP.md` (method + Darwin deltas),
+  `port/OSX_STATE.md` (state snapshot), `worklog/2026-09-09.md` (round 0).
+
 ## 2026-09-06 -- the 3-hour gap to Core, decomposed and mostly removed
 
 Eight branches landed today against `audits/UTXO_INLINE_BUILD_PERF_SCOPE.md`
