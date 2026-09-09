@@ -21,10 +21,12 @@
  *
  * Core's rules that shape the set, applied where the live path applies
  * them: the genesis coinbase never enters the set (its subsidy is
- * unspendables.genesis_block); the two BIP30 duplicate coinbases (91,842 and
- * 91,880, mainnet) are skipped (their subsidy is unspendables.bip30) and a
- * spend of one of those txids removes the ORIGINAL coin with its original
- * height, which is what the join produces; a provably unspendable output
+ * unspendables.genesis_block); the two BIP30 ORIGINAL coinbases (91,722 and
+ * 91,812, mainnet -- Core's IsBIP30Unspendable) are skipped (their subsidy
+ * is unspendables.bip30) and the duplicates at 91,842 and 91,880 enter the
+ * set with THEIR heights, as in Core's database, which overwrote the
+ * originals; a spend of one of those txids removes the duplicate's coin,
+ * which is what the join produces; a provably unspendable output
  * (OP_RETURN, or over MAX_SCRIPT_SIZE) never enters the set and counts as
  * unspendables.scripts. utxo_stats_add applies that filter itself.
  *
@@ -110,7 +112,7 @@ typedef struct __attribute__((packed)) { u8 txid[32]; u32 vout; u32 spend_h; } s
 typedef struct __attribute__((packed)) { u32 spend_h; u8 txid[32]; u32 vout; u64 value; u32 height; u8 cb; u16 slen; } remev_hdr;  /* followed by the script */
 static long g_halving = 210000; static int g_mainnet = 1;
 static u64 subsidy_at(long h){ long k = h / g_halving; return k >= 64 ? 0 : (5000000000ULL >> k); }
-static int bip30_height(long h){ return g_mainnet && (h == 91842 || h == 91880); }
+static int bip30_height(long h){ return csh_bip30_unspendable(h, g_mainnet); }   /* 91,722 and 91,812: the originals (Core's rule; see the header) */
 static int script_unspendable(const u8* s, unsigned long n){ return (n > 0 && s[0] == 0x6a) || n > 10000; }
 static u64 rdvi(const u8* p, const u8* end, u64* used){
     if (p >= end){ *used = 0; return 0; }
