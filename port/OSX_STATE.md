@@ -1,7 +1,18 @@
 # OSX PORT STATE — durable snapshot
 
 Updated whenever status materially changes. Newest section top.
-(Companion to `OSX_PORT.md` (branch model) and `OSX_ROADMAP.md` (per-module status).)
+(Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
+status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
+
+## 2026-09-09 — strategy locked: native port, phased, PR-per-layer
+
+- `port/OSX_STRATEGY.md` merged via PR #130: port-don't-emulate decision,
+  measured surface (238 raw syscalls; C layer POSIX-clean except 2 prctl
+  uses; no futex/epoll/eventfd), 5 phases (p0 build bridge → p1 pure-compute
+  → p2 syscall I/O → p3 daemon → p4 parity), PR branches `osx/pN-*` merged
+  --no-ff into bmc_osx with green gates.
+- First working PR target: p0 sha256 proof module (Mach-O build + native
+  harness + differential fuzz vs hashlib/Python).
 
 ## 2026-09-09 — round 0: fresh start on `bmc_osx`
 
