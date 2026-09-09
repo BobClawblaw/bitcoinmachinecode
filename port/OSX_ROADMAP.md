@@ -58,7 +58,16 @@ Python oracle), with both code paths exercised where a dispatcher exists.
 - [ ] secp256k1_point / _point_ct / _scalar / _scalar_c / _glv_c / _ecdsa
       (+ _taproot/_schnorr when upstream main carries them)
 - [ ] bitcoin_hmac, aes (wallet_crypter deps), bip39
-- [ ] bitcoin_tx (parser), bitcoin_p2p (codec), bitcoin_pubkey, bitcoin_keys
+- [x] bitcoin_tx -> port/osx/bitcoin_tx.S  DONE 2026-09-09. Evidence:
+      upstream test_tx 20/20 + test_txtxid + test_tx_bounds_fuzz
+      55,232,133 guarded calls 0 faults (all native) + 501-tx differential
+      (tx_parse+tx_txid, valid/truncated/poisoned) byte-identical vs the x86
+      objects on the 9950X3D (drivers: port/osx/tests/dtx.c + gen_tx_vecs.py).
+      Port bugs the gates caught: (1) stp/ldp x27,x27 -- ldp with Rt==Rt2 is
+      CONSTRAINED UNPREDICTABLE and SIGILLs on Apple Silicon (pop odd slot
+      with ldr + add sp,#8); (2) locktime path stored the ADDRESS register as
+      the new cursor (tx_len corruption); (3) witness walk must reload n_in
+      from info after x23 is reused for n_out.
 - [ ] bitcoin_sighash, bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
 - [ ] bitcoin_interp, bitcoin_scriptcodec, bitcoin_script_flags,
       bitcoin_script, bitcoin_multisig, bitcoin_cons

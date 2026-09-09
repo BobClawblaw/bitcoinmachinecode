@@ -73,3 +73,14 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 - Docs created: `port/OSX_PORT.md`, `port/OSX_ROADMAP.md`, this file.
 - Next: pick the first module (pure-compute, no syscalls — e.g. sha256 or
   bitcoin_hash) to prove the Mach-O build+verify loop end to end.
+
+## 2026-09-09 — bitcoin_tx native: bounds fuzz 55M calls + x86-diff byte-identical
+
+- port/osx/bitcoin_tx.S (tx_parse + tx_txid): test_tx 20/20, test_txtxid,
+  test_tx_bounds_fuzz 55,232,133 guarded calls 0 faults, 501-vector
+  differential byte-identical vs x86 objects on .242 (dtx.c/gen_tx_vecs.py).
+- NEW DARWIN PITFALL: `ldp x27,x27,[sp],#16` (Rt==Rt2) is CONSTRAINED
+  UNPREDICTABLE — SIGILL on Apple Silicon. Never pair-restore the same
+  register twice; pop odd slots with ldr + explicit sp adjust.
+- Delegation note: parallel subagent waves time out on this provider (5-12
+  API calls in 600s). Porting proceeds serially, coordinator-owned.
