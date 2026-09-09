@@ -377,7 +377,8 @@ _sc_inv_var:
 	stp	x19, x20, [sp, #-16]!
 	stp	x21, x22, [sp, #-16]!
 	stp	x23, x24, [sp, #-16]!
-	stp	x25, x25, [sp, #-16]!
+	str	x25, [sp, #-16]!
+	nop
 	mov	x29, sp
 	sub	sp, sp, #160			/* u@-64 v@-96 x1@-128 x2@-160 */
 
@@ -556,7 +557,8 @@ _sc_inv_var:
 	mov	w0, #0
 .Lsciv_out:
 	add	sp, sp, #160
-	ldp	x25, x25, [sp], #16
+	ldr	x25, [sp], #16
+	nop
 	ldp	x23, x24, [sp], #16
 	ldp	x21, x22, [sp], #16
 	ldp	x19, x20, [sp], #16

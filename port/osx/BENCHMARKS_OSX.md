@@ -90,3 +90,20 @@ peers, dbcache=8192, bulk_slots=2^25.
 - osx equivalent: pending the p3 daemon link (this is the reason p1/p2 are
   being ported); the Darwin daemon will run this same IBD natively on the
   M1 Max for the real cross-arch IBD comparison.
+
+## 2026-09-09 — ECDSA/Schnorr (first cross-arch crypto-verify numbers)
+First native ECDSA + BIP340 Schnorr verification benchmarks on the M1 Max
+(port/osx/ecdsa_twin.c + pubkey_schnorr_twin.c, quiet machine, min-of-5
+thread-CPU rounds — same discipline as the x86 side):
+
+| benchmark | x86 9950X3D (taskset -c 16-19) | M1 Max (this port) | ratio |
+|---|---|---|---|
+| ecdsa_verify  | 21.46 us/verify (46,606/s per core) | 140.14 us/verify (7,136/s per core) | 6.5x |
+| schnorr_verify| 26.07 us/verify (38,353/s per core) | 273.11 us/verify (3,661/s per core) | 10.5x |
+
+Context: 1e9 sigs at these rates = 6.0 core-hours (x86) vs 38.9 core-hours
+(M1 Max) for ECDSA.  The gap is dominated by the C twins running the same
+algorithms the x86 has as hand-scheduled asm (fe_mul chains, comb/GLV
+multiplies); AArch64 native asm for fe_mul/scalar_mul is future work and
+should close much of it.  Both implementations produce byte-identical
+results (1740-vector point/CT differential + BIP340 csv row 0 fixture).
