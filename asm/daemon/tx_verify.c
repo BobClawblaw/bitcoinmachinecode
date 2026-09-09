@@ -518,16 +518,17 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
     if (segwit) p += 2;
     u64 nin = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad n_in varint"; return 0; }
     if (nin == 0) { *reason = "input count out of bounds"; return 0; }
-    if (nin > (u64)(end - p) / 41 + 1) { *reason = "input count exceeds the bytes"; return 0; }   /* an input is at least 41 bytes */
-    if (nin > g_txv_in_cap || nin > g_txv_results_cap){
-        u64 c = 4096; while (c < nin) c *= 2;
-        txv_rawin_t* a = realloc(g_txv_in, c * sizeof *a); if (!a){ *reason = "out of memory"; return 0; }
-        g_txv_in = a; g_txv_in_cap = c;
-        txv_result_t* r = realloc(g_txv_results, c * sizeof *r); if (!r){ *reason = "out of memory"; return 0; }
-        g_txv_results = r; g_txv_results_cap = c;
-    }
     for (u64 i=0;i<nin;i++){
         if (p+36 > end) { *reason = "truncated outpoint"; return 0; }
+        /* grow the tables as inputs are actually parsed, so a claimed count
+         * the bytes cannot back fails on truncation (as it always did) and
+         * never sizes anything; every input that reaches here is real */
+        if (i >= g_txv_in_cap){
+            u64 c = g_txv_in_cap ? g_txv_in_cap * 2 : 4096;
+            txv_rawin_t* a = realloc(g_txv_in, c * sizeof *a); if (!a){ *reason = "out of memory"; return 0; }
+            txv_result_t* r = realloc(g_txv_results, c * sizeof *r); if (!r){ *reason = "out of memory"; return 0; }
+            g_txv_in = a; g_txv_in_cap = c; g_txv_results = r; g_txv_results_cap = c;
+        }
         g_txv_in[i].outpoint = p; p += 36;
         u64 sl = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad scriptSig varint"; return 0; }
         /* split bound: `(end-p) < sl+4` WRAPS for sl within 4 of 2^64 (an 0xff
