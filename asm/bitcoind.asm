@@ -540,7 +540,7 @@ node_accept_handshake:
 ;   Moved txid_scratch to fresh space at the (enlarged) frame's own edge,
 ;   fully clear of both rbp and the block-hash-precompute array, without
 ;   touching any other local's offset.
-;   sub rsp, 0x1b08 (8 mod16; 6 pushes -> RSP 0 mod16 at every nested call)
+;   sub rsp, 0x1b18 (8 mod16; 6 pushes -> RSP 0 mod16 at every nested call)
 ;
 ;   STAGE B FRAME ADDITIONS. The getheaders payload used to be built at
 ;   rbp-0x140, where it had only 0x45 (69) bytes of clearance before the
@@ -589,7 +589,7 @@ node_sync_multi:
     push r13
     push r14
     push r15
-    sub  rsp, 0x1b08       ; frame: scratch@-0x1308 (cons_verify), block hashes
+    sub  rsp, 0x1b18       ; frame: scratch@-0x1308 (cons_verify), block hashes; -0x1b08/-0x1b0c: compact-block fallback flags (2026-09-09)
                            ; array@-0xae8 (64 x 32B) so headers stay usable even
                            ; after the block receive overwrites buf. 0x1b08==8
                            ; mod16, after 6 pushes -> RSP 0 mod16 at all calls.
@@ -834,6 +834,8 @@ node_sync_multi:
     ; Same fix as .hdr_drain: a single read timeout (-1) retries (bounded)
     ; rather than immediately abandoning the block fetch -- see the .hdr_drain
     ; comment above for why (busy real peers pause between chatter bursts).
+    mov  dword [rbp-0x1b08], 0    ; this block did not come through the compact path (yet)
+    mov  dword [rbp-0x1b0c], 0    ; no full-block fallback sent for it (yet)
     mov  dword [rbp-0x1b00], 0    ; blk-drain retry counter (separate 4 bytes
                                     ; from the hdr-drain one at -0x1b04)
 .blk_drain:
@@ -890,6 +892,7 @@ node_sync_multi:
     cmp  rax, 0
     jle  .blk_drain
     mov  [rbp-0x54], eax
+    mov  dword [rbp-0x1b08], 1    ; assembled from a compact block: a verification failure falls back
     jmp  .have_block
 .blk_not_cmpct:
     lea  rdi, [rbp-0x160]
@@ -909,6 +912,7 @@ node_sync_multi:
     cmp  rax, 0
     jle  .blk_drain
     mov  [rbp-0x54], eax
+    mov  dword [rbp-0x1b08], 1    ; assembled from a compact block: a verification failure falls back
     jmp  .have_block
 .blk_not_blocktxn:
     lea  rdi, [rbp-0x160]
@@ -957,6 +961,36 @@ node_sync_multi:
     call cons_verify
     test eax, eax
     jnz .fchk8
+    ; 2026-09-09: a block ASSEMBLED FROM A COMPACT BLOCK that fails verification
+    ; is re-requested in full, once, and the drain continues -- Core's
+    ; PartiallyDownloadedBlock fallback. Until today this failed the pass
+    ; (where=8) and cost the block, which is why bmc.cmpctrecv existed.
+    cmp  dword [rbp-0x1b08], 1
+    jne  .verify_failed
+    cmp  dword [rbp-0x1b0c], 0
+    jne  .verify_failed             ; the full block failed too: genuinely bad
+    mov  dword [rbp-0x1b0c], 1
+    mov  dword [rbp-0x1b08], 0
+    lea  rdi, [rbp-0xd0]
+    lea  rsi, [rbp-0xa0]
+    call p2p_getdata_block          ; MSG_WITNESS_BLOCK: the full block
+    mov  [rbp-0x5c], eax
+    mov  rdi, rbx
+    lea  rsi, [rel _getdata]
+    mov  rdx, 7
+    lea  rcx, [rbp-0xd0]
+    mov  r8d, [rbp-0x5c]
+    call p2p_write
+    cmp  rax, 24
+    jl   .verify_failed
+    mov  rax, [rel g_cmpct_hook_fallback]
+    test rax, rax
+    jz   .fb_counted
+    call rax                        ; cmpct_recv_note_fallback: the stats line
+.fb_counted:
+    mov  dword [rbp-0x1b00], 0      ; a fresh block-drain patience for the full block
+    jmp  .blk_drain
+.verify_failed:
     mov  dword [rel sync_fail_code], 8
     jmp  .fail
     .fchk8:
@@ -1005,7 +1039,7 @@ node_sync_multi:
     jmp  .sync_loop
 .done:
     mov  eax, 1
-    add  rsp, 0x1b08
+    add  rsp, 0x1b18
     pop  r15
     pop  r14
     pop  r13
@@ -1015,7 +1049,7 @@ node_sync_multi:
     ret
 .fail:
     mov  eax, 0
-    add  rsp, 0x1b08
+    add  rsp, 0x1b18
     pop  r15
     pop  r14
     pop  r13
@@ -2328,6 +2362,8 @@ global g_cmpct_hook_cmpct
 g_cmpct_hook_cmpct:     dq 0      ; long (*)(fd, mp, pl, plen, out, cap, want32)
 global g_cmpct_hook_blocktxn
 g_cmpct_hook_blocktxn:  dq 0      ; long (*)(fd, pl, plen, out, cap)
+global g_cmpct_hook_fallback
+g_cmpct_hook_fallback:  dq 0      ; void (*)(void): count a full-block fallback (2026-09-09)
 
 section .rodata
 _version: db "version",0

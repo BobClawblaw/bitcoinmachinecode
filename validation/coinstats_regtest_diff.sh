@@ -55,7 +55,6 @@ cat > "$BMC_DIR/bitcoin.conf" <<CONF
 chain=regtest
 coinstatsindex=1
 printtoconsole=1
-bmc.cmpctrecv=0
 [regtest]
 port=$BMC_P2P
 rpcport=$BMC_RPC

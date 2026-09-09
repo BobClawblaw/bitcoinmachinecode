@@ -413,10 +413,7 @@ int main(void){
     if (nodecfg_noeffect_reason("mocktime") && !nodecfg_noeffect_reason("rest") && !nodecfg_noeffect_reason("uacomment") && !nodecfg_noeffect_reason("dbcache"))
         printf("PASS: no-effect table names mocktime, not implemented keys (rest is implemented)\n");
     else { printf("FAIL: no-effect table\n"); failures++; }
-    wr("cr.conf", "bmc.cmpctrecv=0\n"); node_config_load("cr.conf");
-    if (g_cfg.cmpctrecv == 0) printf("PASS: bmc.cmpctrecv=0 applied\n"); else { printf("FAIL: bmc.cmpctrecv\n"); failures++; }
-    node_config_load("/nonexistent/reset.conf");
-    if (g_cfg.cmpctrecv == 1) printf("PASS: bmc.cmpctrecv defaults to 1\n"); else { printf("FAIL: bmc.cmpctrecv default\n"); failures++; }
+    /* 2026-09-09: bmc.cmpctrecv is gone (Core has no such switch: a bad reconstruction falls back to a full block) */
     wr("rest.conf", "rest=1\n"); node_config_load("rest.conf");
     if (g_cfg.rest == 1) printf("PASS: rest=1 enables Core's REST interface\n"); else { printf("FAIL: rest=1 not applied\n"); failures++; }
     node_config_load("/nonexistent/reset.conf");
