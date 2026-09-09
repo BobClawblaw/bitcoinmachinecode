@@ -68,7 +68,16 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       gen_dsl_vecs*.py).  Commit 131e5171 (branch osx/p1-scalar).
       Pitfalls recorded: AArch64 `add`/`adc` set no flags (use
       adds/adcs); ldp Rt==Rt2 SIGILL; frame aliases need real `sub sp`.
-- [ ] bitcoin_hmac, aes (wallet_crypter deps), bip39
+- [x] bitcoin_hmac -> port/osx/bitcoin_hmac.S  DONE 2026-09-09. Evidence:
+      test_hmac RFC 4231 3/3 native + 400-vector cross-arch differential
+      (RFC shapes, BIP32/BIP39 inputs, 127/128/129 key boundaries,
+      two-block pads) byte-identical vs .242 (drivers port/osx/tests/dsv.c
+      + gen_dsv_vecs.py).  C twin bitcoin_hmac_c.c kept as reference.
+      Commit da3f4b6d.  FIXED A REAL sha512.S BUG found by the differential:
+      the carrier[112..127] zero loop was aimed at carrier+232..247 (base
+      x13 already +120) -- for the two-block pad path (rem>=112) it wrote
+      16 zero bytes INTO THE CALLER'S FRAME (hmac kpad[8..23]).  Gate
+      caught it: any keylen>=16 + msglen 112..127/255 failed vs x86.
 - [x] bitcoin_tx -> port/osx/bitcoin_tx.S  DONE 2026-09-09. Evidence:
       upstream test_tx 20/20 + test_txtxid + test_tx_bounds_fuzz
       55,232,133 guarded calls 0 faults (all native) + 501-tx differential
