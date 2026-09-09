@@ -813,7 +813,8 @@ static int cmd_getmempoolinfo(rj_val** res){
  * Stage one command, bump the seq, wait for the worker's ack. Same shape as
  * cmd_sendrawtransaction's staging, and the same reason: the worker owns the
  * peer legs and is the only thing that may touch them. */
-#define CTL_WAIT_MS 3000
+#define CTL_WAIT_MS 10000   /* 2026-09-09: was 3000, shorter than one worker rotation (a 2.5 s poll plus the
+                             * per-leg TCP_INFO pass), so a healthy worker "did not answer" addnode twice in a row */
 #define CTL_POLL_US 500
 
 static int ctl_send(int op, const char* arg, long long num,
