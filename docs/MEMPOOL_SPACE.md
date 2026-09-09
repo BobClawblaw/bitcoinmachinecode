@@ -69,6 +69,14 @@ In `backend/mempool-config.json`:
 "DATABASE": { "ENABLED": true, "POOL_SIZE": 1, ... }
 ```
 
+- `INDEXING_BLOCKS_AMOUNT` is how far back the backend indexes blocks
+  (fees, pools, the hashrate/difficulty graph). Every indexed block needs
+  `getblockstats` with fees, which needs undo data: on a node whose undo
+  starts above genesis the indexer dies on the oldest block it reaches
+  (2026-09-08, undo from 965,826: the depth was capped at 20). After
+  `reindex-chainstate=1` (2026-09-09) undo covers the whole chain and
+  the depth is a year, 52,560. The backend reads it at start; restart it
+  after a change.
 - `CORE_RPC` is the node's JSON-RPC server (`rpcport`, the credentials
   from `rpcauth` or `rpcuser`/`rpcpassword`).
 - `POOL_SIZE: 1` matters: mempool's pools importer commits its mining-pool

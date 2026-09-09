@@ -111,6 +111,19 @@ also annotated tags.
 | [`releases/2026-09-08-address-mempool.md`](releases/2026-09-08-address-mempool.md) | The address routes include the mempool |
 | [`releases/2026-09-08-core-rest.md`](releases/2026-09-08-core-rest.md) | Core's REST interface (`rest=1`), 82 route checks against Core's regtest REST; four RPC parity gaps it exposed |
 | [`releases/2026-09-08-coinstats-hist.md`](releases/2026-09-08-coinstats-hist.md) | `gettxoutsetinfo` at any height the coinstats index covers: a row per applied block, Core's shape, 235 differential checks; the compact-block receive path found never to have completed |
+| [`releases/2026-09-08-addrindex-boot-race.md`](releases/2026-09-08-addrindex-boot-race.md) | The address index boots after the UTXO engine and stops at its applied height |
+| [`releases/2026-09-08-coinstats-self-heal.md`](releases/2026-09-08-coinstats-self-heal.md) | The coinstats history checks itself and rebuilds itself |
+| [`releases/2026-09-08-undo-parity.md`](releases/2026-09-08-undo-parity.md) | getblockstats without undo errors like Core; the facade omits an unknown fee |
+| [`releases/2026-09-09-addnode-dials.md`](releases/2026-09-09-addnode-dials.md) | `addnode` dials; the control channel waits for a whole worker rotation |
+| [`releases/2026-09-09-announced-height.md`](releases/2026-09-09-announced-height.md) | The header phase refuses a chain far below what the pool announces |
+| [`releases/2026-09-09-bip30-originals.md`](releases/2026-09-09-bip30-originals.md) | BIP30: the unspendable coinbases are the originals, as in Core |
+| [`releases/2026-09-09-bip68-seq-cap.md`](releases/2026-09-09-bip68-seq-cap.md) | The BIP68 sequence cap is sized from the block weight limit |
+| [`releases/2026-09-09-builder-keeps-inputs.md`](releases/2026-09-09-builder-keeps-inputs.md) | The coinstats builder keeps a pass's inputs until it completes |
+| [`releases/2026-09-09-chain-selection.md`](releases/2026-09-09-chain-selection.md) | Chain selection like Core's: a handoff for long replacements, the header mirror as the best chain, a fork tree for every other branch |
+| [`releases/2026-09-09-no-input-cap.md`](releases/2026-09-09-no-input-cap.md) | No per-transaction input cap in the single-transaction verifier; the connect path proven capless |
+| [`releases/2026-09-09-no-seq-cap.md`](releases/2026-09-09-no-seq-cap.md) | No sequence cap: the BIP68 ledger is sized to the transaction, like Core's |
+| [`releases/2026-09-09-one-record-per-key.md`](releases/2026-09-09-one-record-per-key.md) | One record per key per run: the UTXO defect behind bench run 18's rejected block |
+| [`releases/2026-09-09-picker-dead-mark.md`](releases/2026-09-09-picker-dead-mark.md) | The download worker's picker: a dead-marked peer never clears the bar, not even a fresh sync's unknown bar |
 
 ## Development history
 
