@@ -1000,8 +1000,9 @@ int main(void){
         expect_err("cms invalid key", "createmultisig", "[1, [\"deadbeef\"]]", -5, "Invalid public key: deadbeef");
     }
 
-    /* ---- getblockstats (block-only fields; the synthetic archive has no undo,
-     * so fee/feerate/utxo_size_inc keys are omitted -- as against a pruned node).
+    /* ---- getblockstats (the synthetic archive has undo only for block 3, written
+     * by the fee test above; a height without undo errors like Core's
+     * GetUndoChecked, and the genesis block answers, as on Core).
      * The full field set is oracle-verified live; here we regression the
      * block-only computation on synthetic block 3 (segwit cb + legacy spend +
      * segwit spend). ins=2, outs=3, total_out=4999000000+1000, subsidy=50 BTC. */
@@ -1033,6 +1034,11 @@ int main(void){
       ck_str("gbs by-hash total_out matches", S(r2,"total_out"), "4999001000");
       rj_free(r2);
       expect_err("gbs height out of range", "getblockstats", "[999]", -8, "Target block height out of range");
+      /* 2026-09-08: no undo => Core's error, not a silent omission of the fee fields */
+      expect_err("gbs without undo errors like Core", "getblockstats", "[2]", -1, "Can't read undo data from disk");
+      rj_val* r0 = call("getblockstats", "[0]", &ec, &em);
+      ck("gbs genesis answers without undo (Core: the genesis block has no undo data)", r0 != NULL && S(r0,"height") && !strcmp(S(r0,"height"), "0"));
+      if (r0) rj_free(r0);
     }
 
     /* ---- getnetworkhashps / getmininginfo (chainwork from the header fallback,

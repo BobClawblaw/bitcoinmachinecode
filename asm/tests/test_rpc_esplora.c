@@ -167,7 +167,7 @@ int main(void){
       rj_val* o1 = G(t2, "vout") ? G(t2, "vout")->items[1] : 0;
       ok(o1 && streq(S(o1, "scriptpubkey_type"), "op_return") && !G(o1, "scriptpubkey_address") && streq(S(o1, "value"), "0"), "an OP_RETURN output: type op_return, no address, value 0");
       rj_val* t3 = txs ? txs->items[2] : 0;
-      ok(t3 && streq(S(t3, "fee"), "0"), "a tx without prevouts in Core's JSON gets fee 0 rather than a lie");
+      ok(t3 && !G(t3, "fee") && G(t3, "vin"), "a tx whose prevouts Core's JSON lacks has NO fee key: 0 would claim it paid nothing (2026-09-08)");
       rj_free(txs); }
     { rj_val* txs = GET("/block/" BH "/txs/1"); ok(txs && txs->nitems == 2 && streq(S(txs->items[0], "txid"), TX2), "GET /block/:hash/txs/1 -> from index 1"); rj_free(txs); }
     { rj_val* t = GET("/tx/" TX2);
