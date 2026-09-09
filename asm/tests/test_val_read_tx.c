@@ -69,6 +69,7 @@ typedef struct {
     int coinbase_shape;
     int null_prevout;
     int bad_shape;
+    int any_nonfinal_seq;        /* VAL-4 (was missing from this mirror; padding kept the offsets equal) */
     u64 in_count;
     u64 out_count;
     u64 stripped_len;
@@ -215,6 +216,46 @@ int main(void){
     ck("the vectors carried both segwit and legacy shapes", n_segwit > 0 && n_legacy > 0);
     ck("the vector table was not empty", n_seen >= 4);
     printf("      %d transactions (%d segwit, %d legacy)\n", n_seen, n_segwit, n_legacy);
+
+    /* 2026-09-09: mainnet block 880,338 carries a transaction with 7,244
+     * inputs. val_read_tx recorded at most 2,048 sequences and flagged the
+     * rest as truncated, and the BIP68 pass refused the whole block rather
+     * than treat the surplus as final -- a valid block rejected, the bench
+     * node forked off mainnet at 91% of a fresh sync. The cap is sized from
+     * the block weight limit now (no valid transaction can have more inputs
+     * than fit in 4,000,000 weight units at 41 bytes each), so every
+     * sequence of every possible transaction is read. */
+    { unsigned N = 7244; size_t cap = 16 + (size_t)N * 41 + 16; u8* big = malloc(cap); size_t o = 0;
+      big[o++] = 2; big[o++] = 0; big[o++] = 0; big[o++] = 0;                  /* version 2 (BIP68 applies) */
+      big[o++] = 0xfd; big[o++] = (u8)(N & 0xff); big[o++] = (u8)(N >> 8);     /* input count */
+      for (unsigned i = 0; i < N; i++){
+          memset(big + o, 0x11, 32); o += 32; big[o++] = (u8)i; big[o++] = (u8)(i >> 8); big[o++] = 0; big[o++] = 0;   /* prevout */
+          big[o++] = 0;                                                        /* empty scriptSig */
+          u32 seq = (i == N - 1) ? 0x00000010u : 0xffffffffu; memcpy(big + o, &seq, 4); o += 4;
+      }
+      big[o++] = 1; memset(big + o, 0, 8); o += 8; big[o++] = 0;                /* one output, empty script */
+      memset(big + o, 0, 4); o += 4;                                           /* locktime */
+      val_txinfo_t vi; int r = val_read_tx_probe(big, (u64)o, &vi);
+      ck("a 7,244-input transaction (mainnet 880,338's shape) parses", r == 1 && !vi.bad_shape && vi.in_count == N);
+      ck("every one of its sequences is recorded: nseqs == 7244, no truncation", vi.nseqs == N);
+      ck("the last input's sequence (a height lock of 16) is read, not lost past a cap", vi.nseqs == N && vi.seqs[N - 1] == 0x10u);
+      ck("the non-final flag is set by that last input", vi.any_nonfinal_seq == 1);
+      free(big); }
+    /* Core has no cap at all: CalculateSequenceLocks walks tx.vin, a vector.
+     * The ledger here is sized to the transaction, so a 30,000-input one --
+     * past what a 4,000,000-weight block can even hold -- reads every
+     * sequence too. Consensus follows Core wherever Core has a rule; where
+     * Core has none, neither do we (2026-09-09). */
+    { unsigned N = 30000; size_t cap = 16 + (size_t)N * 41 + 16; u8* big = malloc(cap); size_t o = 0;
+      big[o++] = 2; big[o++] = 0; big[o++] = 0; big[o++] = 0;
+      big[o++] = 0xfd; big[o++] = (u8)(N & 0xff); big[o++] = (u8)(N >> 8);
+      for (unsigned i = 0; i < N; i++){ memset(big + o, 0x22, 32); o += 32; memcpy(big + o, &i, 4); o += 4; big[o++] = 0;
+          u32 seq = (i == N - 1) ? 0x00400007u : 0xffffffffu; memcpy(big + o, &seq, 4); o += 4; }
+      big[o++] = 1; memset(big + o, 0, 8); o += 8; big[o++] = 0; memset(big + o, 0, 4); o += 4;
+      val_txinfo_t vi; int r = val_read_tx_probe(big, (u64)o, &vi);
+      ck("a 30,000-input transaction: every sequence recorded, no cap of any size", r == 1 && vi.in_count == N && vi.nseqs == N);
+      ck("its last sequence (a time lock) is read", vi.nseqs == N && vi.seqs[N - 1] == 0x00400007u);
+      free(big); }
 
     printf("\n%s (%d checks, %d failures)\n",
            fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
