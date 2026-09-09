@@ -1,0 +1,11 @@
+# 2026-09-09 — Pings on every leg, and one request per block across the legs
+
+The first two rows of `docs/CORE_DIVERGENCES.md`, closed together.
+
+**Pings.** Core pings every peer every two minutes and disconnects one that has not answered in twenty; the measured round trip is what its inbound eviction protects. This node answered pings and never sent one: a dead peer was found only when a sync pass failed, and we had no ping time to offer. Now each leg is pinged every 120 s from the between-pass sweep (`leg_ping_tick`), the leg drain hands the `pong` to the daemon (`txrelay_on_pong` → `leg_on_pong`, matched by nonce), the round trip is recorded per leg, and a leg with no pong for 20 minutes is closed `ours/ping-timeout` and remembered as an early drop.
+
+**One request per block.** Core requests a block from one peer and tracks it in flight by hash; every one of this node's legs requested the block the node lacked on its own pass, so a new block at the tip cost eight requests from eight legs and, with compact blocks on, eight reconstructions (production, the hour before this: 12 round trips for 6 blocks). `daemon/inflight.c` is the shared table: the sync loop asks `g_block_fetch_hook` before every `getdata`; a hash another leg claimed within the last 10 minutes ends the pass with what it has (ok=1), and a leg's claims are released when its pass returns. The heartbeat's dial line reports claims and duplicate fetches avoided.
+
+`test_inflight` (new): claim, refuse, own claim, release by leg and by hash, a stale claim taken over, a full table recycling its oldest. `test_sync_gate` (new, **watched to fail**: the pass fetched anyway): a refusing gate ends the pass with no `getdata` and nothing stored, an accepting one fetches both blocks, the gate is asked once per block. `test_dialhelper`: the ping schedule, the 20-minute timeout, a pong after the ping clearing it, the nonce match. The gate call is one hook in `bitcoind.asm`'s header loop, assembled first on a scratch copy.
+
+**Production on snapshot l, 20:11-21:09Z, compact blocks on for the first time:** 6 new blocks, 4 reconstructed, 12 round trips, 0 fallbacks; tip equal to the public tip throughout. The counter that read 0 of 1,262 all day moved.

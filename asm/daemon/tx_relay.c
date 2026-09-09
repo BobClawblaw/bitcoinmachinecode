@@ -1173,6 +1173,7 @@ void txrelay_stats3(long* retried_other, long* gaveup, long* active){
     if (active) *active = n;
 }
 
+void (*txrelay_on_pong)(int fd, const unsigned char nonce[8]) = 0;   /* set by the daemon (2026-09-09) */
 long txrelay_poll_leg(int fd, void* mp, int max_ms){
     static u8 pl[TXR_PAYLOAD_CAP];
     static u8 scratch[2000*81 + 8];      /* worker is single-threaded */
@@ -1204,6 +1205,12 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
             /* consumed a keepalive meant for the sync loop -- answer it,
              * or the peer times this connection out */
             if (plen == 8) p2p_write(fd, "pong", 4, pl, 8);
+            continue;
+        }
+        if (!memcmp(cmd, "pong", 5)){
+            /* 2026-09-09: the reply to OUR ping (the daemon tracks liveness and
+             * the round trip per leg, as Core does) */
+            if (plen == 8 && txrelay_on_pong) txrelay_on_pong(fd, pl);
             continue;
         }
         if (!memcmp(cmd, "inv", 4)){

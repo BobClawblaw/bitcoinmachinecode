@@ -377,6 +377,22 @@ int main(void){
       /* 2026-09-09: tcp_connect_ip's connect() is blocking under a 10 s
        * SO_SNDTIMEO; its expiry surfaces as EINPROGRESS, which was rendered
        * "Operation now in progress" and read as an attempt still in flight */
+      /* 2026-09-09: we ping every leg every 2 min and close one silent for 20 min (Core's numbers) */
+      { ok(leg_ping_due(1000, 0), "a fresh leg is pinged at once");
+        ok(!leg_ping_due(1000 + 119, 1000), "... not again for 2 min");
+        ok(leg_ping_due(1000 + 120, 1000), "... then again");
+        ok(!leg_ping_timed_out(1000 + 1199, 1000, 0), "no pong for 19:59 is not a timeout");
+        ok(leg_ping_timed_out(1000 + 1200, 1000, 0), "no pong for 20 min is");
+        ok(!leg_ping_timed_out(1000 + 1200, 1000, 1001), "a pong after the ping clears it");
+        ok(!leg_ping_timed_out(1000 + 9999, 0, 0), "a leg never pinged cannot time out");
+        /* the pong callback matches the nonce to the slot */
+        int sp[2]; socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
+        mux_n_out = 1; mux_out_fd[0] = sp[0]; mux_out_ping_nonce[0] = 0x1122334455667788ULL; mux_out_pong_at[0] = 0; mux_out_ping_sent_ms[0] = dh_now_ms();
+        unsigned char wrong[8] = {1,2,3,4,5,6,7,8}; leg_on_pong(sp[0], wrong);
+        ok(mux_out_pong_at[0] == 0, "a pong with another nonce is ignored");
+        unsigned char right[8]; unsigned long long nn = 0x1122334455667788ULL; memcpy(right, &nn, 8); leg_on_pong(sp[0], right);
+        ok(mux_out_pong_at[0] != 0 && mux_out_ping_ms[0] >= 0, "the matching pong records the time and the round trip");
+        mux_out_fd[0] = -1; mux_n_out = 0; close(sp[0]); close(sp[1]); }
       /* 2026-09-09, second leg batch: the peer's half-close is seen at once, and
        * a leg's socket ticks at 3 s after the handshake so the drains get their
        * designed patience (they counted 300 ms ticks: 2.4 s for headers) */
