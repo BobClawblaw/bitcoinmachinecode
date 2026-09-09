@@ -36,8 +36,18 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       Gate 10/10 (FIPS KATs, padding edges vs hashlib, 1500-case fuzz).
       The C twin's own first cut had the length field memcpy'd LE -- the
       gate caught it; fixed to BE. (asm translations deferred.)
-- [ ] secp256k1_fe / _point / _glv_c / _point_ct / _scalar / _scalar_c /
-      _ecdsa (+ taproot _taproot/_schnorr when upstream main carries them)
+- [x] secp256k1_fe -> port/osx/fe_twin.c  DONE 2026-09-09 as C twin
+      (constant-time; the x86 ADcx/ADox/MULX carry schedule has no AArch64
+      equivalent, so the algorithm was reimplemented and differential-
+      verified). Gates: upstream test_fe 40/40 (incl. algebraic identities
+      a*inv(a)==1 over all vectors), test_fe_sqrt via crypto_fe_sqrt.c:
+      ALL PASS. Two real bugs the gate caught in my first reduce: a
+      2^32-vs-2^64 weight typo on acc[5] and a mis-weighted oh*C fold.
+      NOTE: test_fe_repr/test_fe_inline need the x86-only fe_ref/fe_inline
+      differential objects -- not portable; superseded by the vectors in
+      test_fe plus the python big-int differential used during bring-up.
+- [ ] secp256k1_point / _point_ct / _scalar / _scalar_c / _glv_c / _ecdsa
+      (+ _taproot/_schnorr when upstream main carries them)
 - [ ] bitcoin_hmac, aes (wallet_crypter deps), bip39
 - [ ] bitcoin_tx (parser), bitcoin_p2p (codec), bitcoin_pubkey, bitcoin_keys
 - [ ] bitcoin_sighash, bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
