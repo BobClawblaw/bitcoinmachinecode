@@ -1506,7 +1506,16 @@ typedef struct {
                                     the BIP68 pass treats the surplus as
                                     FINAL -- see the note in the pass) */
 } val_txinfo_t;
-#define VAL_SEQ_CAP 2048
+/* 2026-09-09: 24,576, from the block weight limit. A non-witness input is at
+ * least 41 bytes (outpoint 36, script length 1, sequence 4) and counts four
+ * times in weight, so a transaction can carry at most 4,000,000 / 164 =
+ * 24,390 inputs; the cap covers every transaction a valid block can hold. It
+ * was 2,048, and mainnet block 880,338 carries a transaction with 7,244
+ * inputs: the BIP68 pass refused the block rather than treat the surplus as
+ * final ("past the sequence window"), invalidated it, and the bench node
+ * forked off mainnet at 91% of a fresh sync. The truncation flag stays as a
+ * guard for a transaction no valid block can contain. */
+#define VAL_SEQ_CAP 24576
 static u32 g_val_seqs[VAL_SEQ_CAP];    /* single-buffer scratch: val_read_tx
                                         * has exactly one live consumer at a
                                         * time (all check loops finish one tx
@@ -2098,9 +2107,12 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * at most VAL_SEQ_CAP sequences and its truncation rule treats the
      * surplus as FINAL. For BIP68 "final" means nSequence 0xffffffff, which
      * has the DISABLE flag set, so a surplus input is treated as exempt --
-     * it can only make us MORE permissive on a transaction with more than
-     * 2,048 inputs, never less. That direction is wrong in principle, so the
-     * truncation is refused outright below rather than relied upon. ---- */
+     * it can only make us MORE permissive, never less. That direction is
+     * wrong in principle, so the truncation is refused outright below rather
+     * than relied upon. Since 2026-09-09 the cap (24,576) exceeds the input
+     * count of any transaction a valid block can hold, so the refusal is a
+     * guard, not a rule a real block can trip: at 2,048 it rejected mainnet
+     * block 880,338 (a 7,244-input transaction). ---- */
     {
         unsigned long long bflags68 = script_flags_for_block((unsigned long long)g_apply_height, blk_hash);
         int csv_active68 = (int)((bflags68 >> VAL_SFC_BIT_CSV) & 1ULL);
