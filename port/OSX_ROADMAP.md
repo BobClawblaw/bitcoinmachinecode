@@ -32,7 +32,10 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       why: two asm translations diverged unlocatably). Gates: upstream
       test_ripemd160 23/23 + thread-stress 2.08M digests/8 threads, 0
       mismatches.
-- [ ] sha1, bech32, base32
+- [x] sha1    -> port/osx/sha1_twin.c   DONE 2026-09-09 as C twin.
+      Gate 10/10 (FIPS KATs, padding edges vs hashlib, 1500-case fuzz).
+      The C twin's own first cut had the length field memcpy'd LE -- the
+      gate caught it; fixed to BE. (asm translations deferred.)
 - [ ] secp256k1_fe / _point / _glv_c / _point_ct / _scalar / _scalar_c /
       _ecdsa (+ taproot _taproot/_schnorr when upstream main carries them)
 - [ ] bitcoin_hmac, aes (wallet_crypter deps), bip39
