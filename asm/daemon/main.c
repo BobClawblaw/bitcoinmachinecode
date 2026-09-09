@@ -1192,8 +1192,8 @@ static int g_sync_fail_streak[MUX_MAX_OUT]; /* monotonic ms deadline before the 
  * addition without editing the config, and getaddednodeinfo reports the
  * config list, so conflating them would make `remove` appear to fail. */
 #define CTL_MAX_ADDNODE 32
-static char g_ctl_addnode[CTL_MAX_ADDNODE][64];
-static int  g_ctl_n_addnode = 0;
+#include "ctl_dial.h"   /* 2026-09-09: the runtime list is a DIAL QUEUE now -- it had been stored and never dialed */
+static int ctl_dial_is_leg(const char* host){ for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], host)) return 1; return 0; }
 
 /* Is `ip` covered by a ban entry? Entries are either a bare address or
  * a.b.c.d/LEN; matching is on the textual prefix for a bare address and on
@@ -6880,27 +6880,15 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     result = 1; break;
                 }
             } else if(op == RPC_CTL_ADDNODE){
+                /* 2026-09-09: `add` and `onetry` used to answer "done" and dial
+                 * nothing (the list had no reader). They queue a manual dial
+                 * now; the pass below the top-up makes it, every rotation. */
                 if(num == 1){                                  /* remove */
-                    for(int i = 0; i < g_ctl_n_addnode; i++)
-                        if(!strcmp(g_ctl_addnode[i], arg)){
-                            memmove(g_ctl_addnode[i], g_ctl_addnode[g_ctl_n_addnode - 1], 64);
-                            g_ctl_n_addnode--;
-                            result = 1; break;
-                        }
-                } else if(g_ctl_n_addnode < CTL_MAX_ADDNODE){
-                    int dup = 0;
-                    for(int i = 0; i < g_ctl_n_addnode; i++)
-                        if(!strcmp(g_ctl_addnode[i], arg)) dup = 1;
-                    if(!dup && num == 0){
-                        snprintf(g_ctl_addnode[g_ctl_n_addnode++], 64, "%s", arg);
-                        fprintf(stderr,"[ctl] addnode: %s (runtime list now %d)\n",
-                                arg, g_ctl_n_addnode);
-                    }
-                    result = 1;      /* onetry and duplicate-add are both "done" */
+                    result = ctl_dial_remove(arg);
                 } else {
-                    result = -1;
-                    snprintf(reason, sizeof reason,
-                             "the runtime addnode list is full (%d)", CTL_MAX_ADDNODE);
+                    int q = ctl_dial_add(arg, num == 0, (long long)time(NULL));
+                    if(q < 0){ result = -1; snprintf(reason, sizeof reason, "the runtime addnode list is full (%d)", CTL_DIAL_MAX); }
+                    else { result = 1; fprintf(stderr,"[ctl] addnode %s: %s (queue %d)\n", num == 0 ? "add" : "onetry", arg, ctl_dial_count()); }
                 }
             } else if(op == RPC_CTL_ADDPEERADDRESS){
                 /* one address into the version-2 book (any BIP155 network);
@@ -7384,6 +7372,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(poll(&pf, 1, 0) > 0 && (pf.revents & (POLLHUP|POLLERR|POLLNVAL))){
                 fprintf(stderr,"[dl:%d] %s connection dropped (revents 0x%x); re-dialing\n",
                         i, mux_out_host[i], pf.revents);
+                if(ctl_dial_listed(mux_out_host[i])) ctl_dial_report(mux_out_host[i], 0, (long long)time(NULL));   /* addnode add: back in the queue */
                 mux_next_peer(i, srcpool, nsrc, out_port);
                 mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
                 continue;
@@ -7836,6 +7825,36 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(topup_fail)
                 fprintf(stderr,"[dl] outbound top-up: %d dial(s) failed, first %s\n",
                         topup_fail, topup_why);
+        }
+
+        /* manual connections (addnode add / onetry): one dial per rotation,
+         * inline like the top-up (an IP dial is milliseconds), whether or not
+         * the node "wants" more outbound -- Core's manual peers are extra to
+         * the target. A persistent entry that drops is re-queued at the drop
+         * site with backoff; a onetry entry is consumed here. */
+        if(mux_n_out < MUX_MAX_OUT){
+            long long nowsec = (long long)time(NULL);
+            const char* mh = ctl_dial_next(nowsec, ctl_dial_is_leg);
+            if(mh && !leg_is_anon_net(leg_net_of(mh))){
+                char host[64]; snprintf(host, sizeof host, "%s", mh);
+                int nfd = outbound_connect(host, 300, out_port);
+                if(nfd >= 0){
+                    strncpy(mux_out_host[mux_n_out], host, 127);
+                    mux_out_fd[mux_n_out] = nfd; txrelay_leg_reset(nfd); mux_out_kind[mux_n_out] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL;
+                    mux_out_wants_v2[mux_n_out] = (unsigned char)g_peer_wants_addrv2;
+                    mux_out_peer[mux_n_out] = 0;
+                    anchor_locator(mux_out_loc[mux_n_out]);
+                    mux_out_nextretry[mux_n_out] = 0;
+                    { char pv[256]; format_peer_version_info(pv, sizeof pv);
+                      fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s addrv2=%d [manual: addnode]\n", mux_n_out, host, nfd, pv, (int)mux_out_wants_v2[mux_n_out]); }
+                    rpc_fill_peer_slot(mux_n_out, host);
+                    mux_n_out++;
+                    ctl_dial_report(host, 1, nowsec);
+                } else {
+                    fprintf(stderr,"[dl] addnode %s: dial failed (%s)%s\n", host, dial_fail_reason(), ctl_dial_listed(host) ? "; retrying with backoff" : "");
+                    ctl_dial_report(host, 0, nowsec);
+                }
+            }
         }
     }
 }

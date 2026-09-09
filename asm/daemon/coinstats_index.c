@@ -482,7 +482,8 @@ const char* csi_hist_status(void){
 static void status_publish(void){
     char tmp[64]; snprintf(tmp, sizeof tmp, CSH_STATUS_FILE ".tmp");
     FILE* f = fopen(tmp, "w"); if (!f) return;
-    fprintf(f, "%s\n", status_line()); fclose(f); rename(tmp, CSH_STATUS_FILE);
+    fputs(status_line(), f); fputc('\n', f);   /* fputs, not fprintf: log_ts.h stamps every fprintf with the log time */
+    fclose(f); rename(tmp, CSH_STATUS_FILE);
 }
 static const char* status_line(void){
     static char s[320];
