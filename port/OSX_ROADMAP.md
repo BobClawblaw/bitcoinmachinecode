@@ -7,7 +7,9 @@ test vectors / differential fuzz. The daemon C is portable and links these
 modules, so once the symbols the daemon uses exist as Mach-O AArch64
 objects, the daemon links and runs natively on macOS.
 
-Read `port/OSX_PORT.md` first for the branch/sync model. Worklog:
+Read `port/OSX_PORT.md` first for the branch/sync model. The plan-of-record
+for the whole port — phases, PR naming, risks — is
+[`port/OSX_STRATEGY.md`](OSX_STRATEGY.md). Worklog:
 `worklog/YYYY-MM-DD.md`; long-form engineering record: `docs/devlog/LOG.md`.
 
 ## Toolchain (verified 2026-09-09)
