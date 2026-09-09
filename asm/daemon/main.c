@@ -1178,6 +1178,8 @@ static int   g_in_dial_helper = 0;          /* set in a dial-helper child: no bo
 static int   mux_n_out = 0;
 extern void txrelay_leg_reset(int fd);   /* a (re)dialled leg starts its own announce timer */
 static int   mux_out_peer[MUX_MAX_OUT];     /* index into the peer pool (for re-dial rotation) */
+static int   g_reorg_ok = 0;                /* the worker opened chainwork: the reorg module is usable (2026-09-09) */
+static void  dl_after_gate_rewind(long back);   /* defined with the choke-point state below */
 static long long mux_out_nextretry[MUX_MAX_OUT];
 /* consecutive failed sync passes per leg; surfaced in the heartbeat as
  * sync_failing=N and used to drop a leg that will not answer (see
@@ -2551,6 +2553,19 @@ static long do_outbound_sync(int i){
       if(r != p_r || n != p_n || f != p_f){ fprintf(stderr, "[cmpct] reconstructed %lu block(s) from the mempool (%lu needed a getblocktxn round trip, %lu fell back to a full block)\n", r, n, f); p_r = r; p_n = n; p_f = f; } }
     double sync_s = phase_elapsed(&sync_pt);
     int st_tip=*(int*)(store_buf+24);
+    /* 2026-09-09: blocks this leg stored off the best header chain came from a
+     * peer on a lighter branch; retain them, rewind, and let the reorg probe
+     * and the parallel downloader follow the best chain instead */
+    if(ok == 1 && cnt > 0 && st_tip > st_tip_before && g_reorg_ok && g_utxo_live_on){
+        extern long reorg_gate_best_header(void*, long);
+        long back = reorg_gate_best_header(store_buf, st_tip_before);
+        if(back >= 0){
+            fprintf(stderr,"[dl] leg %s extended onto a branch lighter than the best header chain -- rewound to %ld; not taking its blocks\n", mux_out_host[i], back);
+            store_reload(store_buf); st_tip = *(int*)(store_buf+24); anchor_locator(mux_out_loc[i]);
+            dl_after_gate_rewind(back);
+            return 0;
+        }
+    }
     if(ok!=1 || cnt<=0){
         /* keep the locator fresh even on a no-op so we don't re-request from
          * genesis forever (node_sync advanced it internally only on success) */
@@ -4052,6 +4067,56 @@ static int __attribute__((unused)) dlc_headers_connect_ok(unsigned char* hst, lo
 }
 /* drop everything appended past `have`: headers.dat is the store's backing
  * file (112-byte records), so truncate it and reload */
+/* the reorg handoff (daemon/reorg.c): the archive was rewound to the fork
+ * point; headers.dat must follow, or the next header sync reads the stale
+ * mirror as "already current" and the downloader never asks for the
+ * replacement (2026-09-09). The next dlc run re-reads the file. */
+static int g_dl_parallel_now = 0;
+/* the mirror as the best header chain, for the reorg module: one loaded copy,
+ * refreshed when the file's size changes (an append here, a fetch elsewhere) */
+static unsigned char g_mirror_hst[4096]; static off_t g_mirror_size = -1;
+static int dl_mirror_load(void){
+    struct stat s; if(stat("headers.dat", &s) != 0) return 0;
+    if(s.st_size != g_mirror_size){ hst_init(g_mirror_hst); hst_reload(g_mirror_hst); g_mirror_size = s.st_size; }
+    return 1;
+}
+static int dl_mirror_hash_at(long height, unsigned char out[32]){
+    if(height < 0 || !dl_mirror_load() || height >= hst_count(g_mirror_hst)) return 0;
+    unsigned char rec[112]; if(hst_get_at(g_mirror_hst, (unsigned long long)height, rec) != 1) return 0;
+    memcpy(out, rec + 80, 32); return 1;
+}
+static int dl_mirror_append(const unsigned char hdr80[80], long height){
+    if(!dl_mirror_load() || hst_count(g_mirror_hst) != height) return 0;   /* only a continuation of the mirror's tip */
+    unsigned char bh[32]; block_hash(bh, hdr80);
+    if(hst_append(g_mirror_hst, hdr80, bh) < 0) return 0;
+    struct stat s; if(stat("headers.dat", &s) == 0) g_mirror_size = s.st_size;
+    return 1;
+}
+/* a header page the fetch refused because it forks below our tip: retained
+ * in the fork tree with its work from the fork base (Core keeps every valid
+ * header; a probe decides whether it is heavier) */
+static long dl_retain_page(const unsigned char* first, unsigned long cnt, long pos){
+    extern int hdrtree_add(const unsigned char*, long, const unsigned char*);
+    extern int store_chainwork_get_at(void*, long, unsigned char*);
+    extern void block_work(unsigned char*, unsigned); extern void chainwork_add(unsigned char*, const unsigned char*, const unsigned char*);
+    unsigned char cum[16]; memset(cum, 0, 16);
+    if(pos > 0 && store_chainwork_get_at(store_buf, pos - 1, cum) != 1) return 0;
+    long n = 0;
+    for(unsigned long j = 0; j < cnt; j++){
+        const unsigned char* h = first + j * 81; unsigned bits; memcpy(&bits, h + 72, 4);
+        unsigned char w[16]; block_work(w, bits); chainwork_add(cum, cum, w);
+        if(hdrtree_add(h, pos + (long)j, cum) == 1) n++;
+    }
+    return n;
+}
+static void dl_headers_truncate_to(long keep){
+    struct stat s;
+    if(stat("headers.dat", &s) != 0 || s.st_size <= (off_t)keep * 112) return;
+    if(truncate("headers.dat", (off_t)keep * 112) == 0)
+        fprintf(stderr,"[dl] header mirror rolled back to %ld record(s) for the reorg handoff\n", keep);
+    else fprintf(stderr,"[dl] could not roll headers.dat back to %ld record(s): %s\n", keep, strerror(errno));
+    g_dl_parallel_now = 1;
+}
 static void dlc_headers_rollback(unsigned char* hst, long have){
     if(truncate("headers.dat", (off_t)have * 112) != 0)
         fprintf(stderr,"[dlc] could not roll headers.dat back to %ld record(s): %s\n", have, strerror(errno));
@@ -4124,7 +4189,8 @@ for(; i < cnt; i++){
             /* overlap with what we hold: must be the same block */
             unsigned char rec[112];
             if(hst_get_at(hst, (unsigned long long)(pos + (long)i), rec) != 1 || memcmp(rec + 80, bh, 32) != 0){
-                fprintf(stderr,"[dlc] headers from %s fork from our chain at height %ld -- discarding\n", cand, pos + (long)i);
+                long kept = dl_retain_page(first + i * 81, cnt - i, pos + (long)i);   /* 2026-09-09: Core keeps every header; a probe weighs it */
+                fprintf(stderr,"[dlc] headers from %s fork from our chain at height %ld -- not taken (%ld retained in the fork tree)\n", cand, pos + (long)i, kept);
                 dlc_headers_rollback(hst, have0); return -1;
             }
         } else {
@@ -6004,6 +6070,10 @@ static int dl_should_parallel_fetch(long archive_tip, long best_peer_height,
  * the fork height by a reorg (STO-7), -1 in the boot-time parent, where the
  * downloader runs before any UTXO engine exists and this is never called. */
 static int g_dl_last_seen_tip = -1;
+static void dl_after_gate_rewind(long back){
+    g_dl_parallel_now = 1;
+    if(back < (long)g_dl_last_seen_tip) g_dl_last_seen_tip = (int)back;
+}
 /* new-block choke point (3.1: watching the CONNECTED tip, not the
  * store's). Everything the node says or does about a "new block"
  * -- the log line, the outbound-leg announce, ZMQ hashblock/rawblock,
@@ -6473,7 +6543,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         if(added < 0){
             fprintf(stderr,"[dl] chainwork backfill failed -- fork detection DISABLED for this process\n");
         } else {
-            reorg_ok = 1;
+            reorg_ok = 1; g_reorg_ok = 1;
             fprintf(stderr,"[dl] worker: chainwork in step with the archive (%ld record(s) backfilled, %.2fs)\n",
                     added, phase_elapsed(&cw_pt));
         }
@@ -6484,6 +6554,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     if(reorg_ok && !utxo_live_ok){
         fprintf(stderr,"[dl] live UTXO tracking is off -- fork detection stays on but REORGS ARE DISABLED (no undo data)\n");
     }
+    { extern void reorg_set_headers_truncate(void (*)(long)); reorg_set_headers_truncate(dl_headers_truncate_to);   /* 2026-09-09: the handoff rewinds the mirror too */
+      extern void reorg_set_mirror_append(int (*)(const unsigned char*, long)); reorg_set_mirror_append(dl_mirror_append);
+      extern void reorg_set_mirror_hash_at(int (*)(long, unsigned char*)); reorg_set_mirror_hash_at(dl_mirror_hash_at);
+      extern int hdrtree_open(void); hdrtree_open(); }   /* the fork tree, from headers_forks.dat in the chain dir */
     reorg_set_index_rebuild(rebuild_hash_index_after_reorg);
     /* 3.3: a block that fails VALIDATION in catch-up is rejected through
      * dl_reject_block, not left in the archive as a fatal retry loop */
@@ -7328,6 +7402,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             long atip = (long)(*(int*)(store_buf+24));
             long long nows = (long long)time(NULL);
             static long noop_best = -1, noop_tip = -1;
+            if(g_dl_parallel_now){ g_dl_parallel_now = 0; noop_best = -1; noop_tip = -1; dl_parallel_last_s = 0; }   /* a reorg handoff: fetch now */
             if(best == noop_best && atip == noop_tip) best = atip;        /* the same claim already came to nothing at this tip */
             if(dl_should_parallel_fetch(atip, best, apply_backlog, nows, dl_parallel_last_s)){
                 fprintf(stderr,"[dl] archive at %ld, peers announce %ld: %ld blocks behind -- running the parallel downloader (%d workers)\n",
@@ -7506,6 +7581,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                   fh, fh + 1, g_dl_last_seen_tip);
                           g_dl_last_seen_tip = (int)fh;
                       } }
+                } else if(pr == 3){
+                    /* handed off: the archive is at the fork point; the far-behind
+                     * check runs the parallel downloader on the next rotation */
+                    for(int k=0;k<mux_n_out;k++) if(mux_out_fd[k]>=0) anchor_locator(mux_out_loc[k]);
+                    did = 1; dl_parallel_last_s = 0;
+                    { extern long reorg_last_handoff_fork(void); long fh = reorg_last_handoff_fork();
+                      if(fh >= 0 && fh < (long)g_dl_last_seen_tip) g_dl_last_seen_tip = (int)fh; }
                 } else if(pr < 0){
                     fprintf(stderr,"[reorg] probe of %s rejected a candidate chain (no action taken)\n", mux_out_host[i]);
                 }
@@ -7714,6 +7796,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(g_cfg.maxuploadtarget_mb > 0)
                 fprintf(stderr,"[dl] upload: %lldMB of %ldMB this 24h window\n",
                         upload_bytes_this_window()>>20, g_cfg.maxuploadtarget_mb);
+            { extern long hdrtree_prune_below(long); long ptip = (long)*(int*)(store_buf+24); if(ptip > 20000) hdrtree_prune_below(ptip - 20000); }   /* the fork tree keeps the recent past */
             /* the coinstats history's health and repair, once a heartbeat (2026-09-08) */
             if(g_cfg.coinstatsindex){
                 extern int csi_hist_repair_tick(long, int, long long);
