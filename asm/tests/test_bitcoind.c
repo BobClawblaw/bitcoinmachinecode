@@ -18,6 +18,8 @@
 #include "../version_gen.h"
 
 extern long node_make_version(unsigned char* out);
+extern unsigned node_start_height; extern unsigned short node_listen_port_be;   /* bitcoind.asm, set by the daemon */
+#include <time.h>
 extern int  node_handshake(int fd);
 extern unsigned char g_peer_version_payload[512];
 extern long g_peer_version_len;
@@ -87,13 +89,24 @@ int main(void){
     cki("version len", n, 81 + NODE_UA_STRING_LEN + 5);
     cki("version field", vb[0]==0x80&&vb[1]==0x11&&vb[2]==0x01&&vb[3]==0x00, 1);
     cki("services=9 (NETWORK|WITNESS)", vb[4]==9, 1);
-    unsigned long long ts; memcpy(&ts,vb+12,8); cki("timestamp", (long)ts, 1700000000);
-    unsigned short pr; memcpy(&pr,vb+44,2); cki("addr_recv port 0x8d20", pr, 0x8d20);
-    memcpy(&pr,vb+70,2); cki("addr_from port 0x8d20", pr, 0x8d20);
-    unsigned long long nn; memcpy(&nn,vb+72,8); cki("nonce", nn, 0x1122334455667788ULL);
+    /* 2026-09-09: the version message tells the truth. It carried a fixed
+     * timestamp (1700000000, a November-2023 clock), a fixed nonce
+     * (0x1122334455667788 -- Core detects a connection to itself by the
+     * nonce), port 8333 in both address fields on a node listening on 8332,
+     * and start_height 0 at 966k. These assertions pinned every one of them. */
+    unsigned long long ts; memcpy(&ts,vb+12,8); cki("timestamp is the wall clock (within 5 s)", (long)ts >= (long)time(NULL) - 5 && (long)ts <= (long)time(NULL) + 5, 1);
+    unsigned short pr; memcpy(&pr,vb+44,2); cki("addr_recv port = the listening port (default 8333 = 0x8d20 big-endian)", pr, 0x8d20);
+    memcpy(&pr,vb+70,2); cki("addr_from port = the listening port", pr, 0x8d20);
+    unsigned long long nn; memcpy(&nn,vb+72,8); cki("nonce is not the old constant", nn != 0x1122334455667788ULL && nn != 0, 1);
+    { unsigned char vb2[160]; node_make_version(vb2); unsigned long long n2; memcpy(&n2,vb2+72,8); cki("a second version has a different nonce (random per connection)", n2 != nn, 1); }
     cki("UA len", vb[80], NODE_UA_STRING_LEN);
     cki("UA bytes", memcmp(vb+81, NODE_UA_STRING, NODE_UA_STRING_LEN)==0, 1);
-    unsigned sh; memcpy(&sh, vb+81+NODE_UA_STRING_LEN, 4); cki("start_height=0", sh, 0);
+    unsigned sh; memcpy(&sh, vb+81+NODE_UA_STRING_LEN, 4); cki("start_height = node_start_height (0 until the daemon sets it)", sh, 0);
+    node_start_height = 966238; node_listen_port_be = 0x8c20;   /* 8332 big-endian: bytes 20 8c */
+    { unsigned char vb3[160]; node_make_version(vb3); unsigned sh3; memcpy(&sh3, vb3+81+NODE_UA_STRING_LEN, 4); cki("start_height follows the daemon's tip", sh3, 966238);
+      unsigned short p3; memcpy(&p3, vb3+70, 2); cki("addr_from port follows -port (8332)", p3, 0x8c20);
+      unsigned char z[26]; memset(z, 0, 26); cki("addr_from's address bytes stay zero after the port store", memcmp(vb3+46, z, 24)==0, 1); }
+    node_start_height = 0; node_listen_port_be = 0x8d20;
     cki("relay=1", vb[81+NODE_UA_STRING_LEN+4], 1);
     g_saw_wtxidrelay = 0;   /* reset before the live handshake below */
     g_saw_sendaddrv2 = 0;
