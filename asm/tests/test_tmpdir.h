@@ -110,9 +110,48 @@ static char  tt_workdir_buf[TT_DIRMAX];
 static pid_t tt_owner_pid;
 static int   tt_active;
 
+
+#ifdef __APPLE__
+/* Darwin: no SYS_getdents64.  Use readdir_r over a DIR* derived from dirfd;
+ * same contract as the Linux path below (rm -rf under dirfd, bounded). */
+#include <dirent.h>
+__attribute__((unused)) static void tt_rmrf_at(int dirfd, int depth)
+{
+    char buf[8192];
+    (void)buf;
+    if (depth > 8) return;
+    int pass;
+    for (pass = 0; pass < 64; pass++) {
+        long removed = 0;
+        if (lseek(dirfd, 0, SEEK_SET) < 0) return;
+        int dupfd = dup(dirfd);
+        if (dupfd < 0) return;
+        DIR* d = fdopendir(dupfd);
+        if (!d) { close(dupfd); return; }
+        struct dirent* de;
+        while ((de = readdir(d)) != NULL) {
+            const char* nm = de->d_name;
+            if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0)))
+                continue;
+            if (de->d_type == DT_DIR) {
+                int sub = openat(dirfd, nm, O_RDONLY | O_DIRECTORY);
+                if (sub >= 0) { tt_rmrf_at(sub, depth + 1); close(sub); }
+                if (unlinkat(dirfd, nm, AT_REMOVEDIR) == 0) removed++;
+            } else {
+                if (unlinkat(dirfd, nm, 0) == 0) removed++;
+            }
+        }
+        closedir(d);
+        if (removed == 0) return;
+    }
+}
+#define TT_RMRF_AT_DEFINED 1
+#endif
+
 /* Depth-first removal of everything under `dirfd` (the directory itself is left
  * for the caller to rmdir). Async-signal-safe: no malloc, no stdio, no fork.
  * Bounded recursion; these trees are one or two levels deep. */
+#ifndef TT_RMRF_AT_DEFINED
 __attribute__((unused)) static void tt_rmrf_at(int dirfd, int depth)
 {
     char buf[8192];
@@ -153,6 +192,7 @@ __attribute__((unused)) static void tt_rmrf_at(int dirfd, int depth)
         if (removed == 0) return;
     }
 }
+#endif /* TT_RMRF_AT_DEFINED */
 
 __attribute__((unused)) static void tt_cleanup(void)
 {
@@ -323,8 +363,12 @@ __attribute__((unused)) static const char* tt_progname(void)
 #ifdef TT_NAME
     return TT_NAME;
 #else
+#ifdef __APPLE__
+    return getprogname();
+#else
     extern char* program_invocation_short_name;
     return program_invocation_short_name;
+#endif
 #endif
 }
 
