@@ -75,4 +75,15 @@ typedef struct {
     uint8_t  digest[32];                                 /* finalize order (the RPC reverses for display) */
     int      digest_valid;
 } csi_hist_out_t;
+/* BIP30's two unspendable coinbases, Core's rule (validation.cpp
+ * IsBIP30Unspendable): heights 91,722 and 91,812 -- the ORIGINALS, whose
+ * txids the coinbases of 91,842 and 91,880 repeated. Core's database
+ * overwrote the originals with the duplicates (same txid, later height), so
+ * the coins that exist carry the later heights and the originals' subsidy is
+ * "unspendables.bip30". This node named the DUPLICATES here until
+ * 2026-09-09: the coin count converged at the tip either way, but every
+ * such coin hashed with the wrong height and the whole history base
+ * disagreed with Core's MuHash from 91,722 on. One definition, used by the
+ * builder and the live index's accounting. */
+static inline int csh_bip30_unspendable(long h, int mainnet){ return mainnet && (h == 91722 || h == 91812); }
 #endif
