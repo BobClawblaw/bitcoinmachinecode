@@ -188,7 +188,11 @@ extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index,
  * anything to do with taproot. First hit live in production at height
  * 243015 during a full archive replay -- 243014 blocks of real chain data
  * had simply never carried a legacy script that large before. */
-#define TXV_MAX_INPUTS    20000
+/* No per-transaction input cap (2026-09-09): the tables below grow to the
+ * transaction. Core's tx.vin is a vector; it was a fixed 20,000 here and
+ * txv_parse answered "input count out of bounds" above it -- unreachable
+ * from the block-connect path (tx_verify_block_connect_all sizes its own
+ * ledger) but a cap all the same on the single-transaction verifiers. */
 #define TXV_SPK_CAP       10000
 /* Per-input witness stack item count. The history here is two incidents, and
  * the second one invalidated the first one's reasoning:
@@ -242,7 +246,9 @@ typedef struct {
     u8  spk[TXV_SPK_CAP]; u32 spklen;
     u8  shape;
 } txv_rawin_t;
-static txv_rawin_t g_txv_in[TXV_MAX_INPUTS];
+static txv_rawin_t* g_txv_in; static u64 g_txv_in_cap;   /* grown per transaction in txv_parse */
+typedef struct { u8 ok; char reason[64]; } txv_result_t;
+static txv_result_t* g_txv_results; static u64 g_txv_results_cap;   /* grown with g_txv_in */
 
 /* ---- VAL-10 / SER-3 (audit 2026-09-03): CANONICAL CompactSize ----
  *
@@ -277,8 +283,8 @@ static u64 txv_rd_cs(const u8** p, const u8* end, int* ok){
 }
 
 /* Witness-item pool: (ptr-into-tx, len) pairs for every input's stack, so an
- * input's witness is not a fixed inline array (which at TXV_MAX_INPUTS x the
- * item cap would be hundreds of MB of mostly-empty storage per block). Two
+ * input's witness is not a fixed inline array (which at tens of thousands of
+ * inputs x the item cap would be hundreds of MB of mostly-empty storage). Two
  * parallel growable arrays; inputs reference a start OFFSET and resolve to
  * ptr/len addresses only AFTER parse stops growing the pool, exactly like
  * g_spk_pool/spk_off above (a realloc during parse would otherwise dangle a
@@ -511,9 +517,18 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
     int segwit = (p+2<=end && p[0]==0x00 && p[1]==0x01);
     if (segwit) p += 2;
     u64 nin = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad n_in varint"; return 0; }
-    if (nin == 0 || nin > TXV_MAX_INPUTS) { *reason = "input count out of bounds"; return 0; }
+    if (nin == 0) { *reason = "input count out of bounds"; return 0; }
     for (u64 i=0;i<nin;i++){
         if (p+36 > end) { *reason = "truncated outpoint"; return 0; }
+        /* grow the tables as inputs are actually parsed, so a claimed count
+         * the bytes cannot back fails on truncation (as it always did) and
+         * never sizes anything; every input that reaches here is real */
+        if (i >= g_txv_in_cap){
+            u64 c = g_txv_in_cap ? g_txv_in_cap * 2 : 4096;
+            txv_rawin_t* a = realloc(g_txv_in, c * sizeof *a); if (!a){ *reason = "out of memory"; return 0; }
+            txv_result_t* r = realloc(g_txv_results, c * sizeof *r); if (!r){ *reason = "out of memory"; return 0; }
+            g_txv_in = a; g_txv_in_cap = c; g_txv_results = r; g_txv_results_cap = c;
+        }
         g_txv_in[i].outpoint = p; p += 36;
         u64 sl = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad scriptSig varint"; return 0; }
         /* split bound: `(end-p) < sl+4` WRAPS for sl within 4 of 2^64 (an 0xff
@@ -696,8 +711,6 @@ int  par_script_threads(void){
  * scale with bulk-mode state has an obvious place to hook back in. */
 void txv_set_bulk_mode(int on){ (void)on; }
 
-typedef struct { u8 ok; char reason[64]; } txv_result_t;
-static txv_result_t g_txv_results[TXV_MAX_INPUTS];
 
 /* IR-5: per-transaction sighash session. Each transaction gets a fresh key
  * when it is laid out; every per-input verify begins the session with it, so

@@ -115,6 +115,14 @@ int main(void){
     /* mainnet: the BIP30 duplicate coinbases' subsidy is counted as bip30, and genesis at 0 */
     csi_set_chain(210000, 1);
     ck("mainnet subsidy: 6.25 BTC at 700,000, 3.125 at 840,000", csi_subsidy_at(700000) == 625000000ULL && csi_subsidy_at(840000) == 312500000ULL);
+    { extern int csi_bip30_unspendable(long);
+      /* Core's IsBIP30Unspendable: the ORIGINALS 91,722 and 91,812, not the duplicates 91,842 and 91,880
+       * (2026-09-09: the history base named the duplicates and disagreed with Core's MuHash from 91,722 on) */
+      ck("BIP30 unspendable coinbases are the originals, 91,722 and 91,812", csi_bip30_unspendable(91722) && csi_bip30_unspendable(91812));
+      ck("... and not the duplicates at 91,842 and 91,880", !csi_bip30_unspendable(91842) && !csi_bip30_unspendable(91880));
+      csi_set_chain(150, 0);
+      ck("no BIP30 heights off mainnet", !csi_bip30_unspendable(91722) && !csi_bip30_unspendable(91812));
+      csi_set_chain(210000, 1); }
     printf("%s (%d failure(s))\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }

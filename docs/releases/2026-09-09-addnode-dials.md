@@ -10,4 +10,4 @@ Found while trying to make production dial the Core oracle to read why remote pe
 
 ---
 
-PR_LINE
+PR #127 (`batch/2026-09-09-addnode-dials`), merged 00:14Z as `1dac38ae`; tag `addnode-dials-2026-09-09`. Staged as `deploy-20260909a` and carried forward in snapshots b..e; the production restart is pending.

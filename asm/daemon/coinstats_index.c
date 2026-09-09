@@ -177,7 +177,8 @@ void csi_set_chain(long halving_interval, int mainnet){ if (halving_interval > 0
 static u64 subsidy_at(long h){ long k = h / g_halving; return k >= 64 ? 0 : (5000000000ULL >> k); }
 u64 csi_subsidy_at(long h){ return subsidy_at(h); }
 static int script_unspendable(const u8* s, unsigned long n){ return (n > 0 && s[0] == 0x6a) || n > 10000; }
-static int bip30_height(long h){ return g_mainnet && (h == 91842 || h == 91880); }
+static int bip30_height(long h){ return csh_bip30_unspendable(h, g_mainnet); }   /* the originals, 91,722 and 91,812 (Core's rule; coinstats_hist_fmt.h) */
+int csi_bip30_unspendable(long h){ return bip30_height(h); }
 /* one coin event, on whichever side folds it (inline or the worker) */
 static void acct_event(int add, u64 value, u64 code, const u8* script, unsigned long slen){
     long h = (long)(code >> 1); int coinbase = (int)(code & 1);
