@@ -241,6 +241,21 @@ int main(void){
       ck("the last input's sequence (a height lock of 16) is read, not lost past a cap", vi.nseqs == N && vi.seqs[N - 1] == 0x10u);
       ck("the non-final flag is set by that last input", vi.any_nonfinal_seq == 1);
       free(big); }
+    /* Core has no cap at all: CalculateSequenceLocks walks tx.vin, a vector.
+     * The ledger here is sized to the transaction, so a 30,000-input one --
+     * past what a 4,000,000-weight block can even hold -- reads every
+     * sequence too. Consensus follows Core wherever Core has a rule; where
+     * Core has none, neither do we (2026-09-09). */
+    { unsigned N = 30000; size_t cap = 16 + (size_t)N * 41 + 16; u8* big = malloc(cap); size_t o = 0;
+      big[o++] = 2; big[o++] = 0; big[o++] = 0; big[o++] = 0;
+      big[o++] = 0xfd; big[o++] = (u8)(N & 0xff); big[o++] = (u8)(N >> 8);
+      for (unsigned i = 0; i < N; i++){ memset(big + o, 0x22, 32); o += 32; memcpy(big + o, &i, 4); o += 4; big[o++] = 0;
+          u32 seq = (i == N - 1) ? 0x00400007u : 0xffffffffu; memcpy(big + o, &seq, 4); o += 4; }
+      big[o++] = 1; memset(big + o, 0, 8); o += 8; big[o++] = 0; memset(big + o, 0, 4); o += 4;
+      val_txinfo_t vi; int r = val_read_tx_probe(big, (u64)o, &vi);
+      ck("a 30,000-input transaction: every sequence recorded, no cap of any size", r == 1 && vi.in_count == N && vi.nseqs == N);
+      ck("its last sequence (a time lock) is read", vi.nseqs == N && vi.seqs[N - 1] == 0x00400007u);
+      free(big); }
 
     printf("\n%s (%d checks, %d failures)\n",
            fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
