@@ -860,7 +860,7 @@ node_sync_multi:
     .fchk7:
     lea  rdi, [rbp-0x160]
     lea  rsi, [rel _block]
-    mov  ecx, 5
+    mov  ecx, 6                     ; "block" AND its NUL: a 5-byte prefix matched "blocktxn" (2026-09-09)
     repe cmpsb
     je   .have_block
     ; ---- CC-2: a compact block for the block we asked for -------------------
@@ -1310,7 +1310,7 @@ node_drain:
     jle  .inv_next
     lea  rdi, [rbp-0x40]
     lea  rsi, [rel _block]
-    mov  ecx, 5
+    mov  ecx, 6                     ; "block" AND its NUL: a 5-byte prefix matched "blocktxn" (2026-09-09)
     repe cmpsb
     jne  .inv_next
     ; validate: cons_verify(buf @r13, plen, scratch, cap)
@@ -1769,7 +1769,7 @@ node_ibd_blocks:
 .not_ping:
     lea  rdi, [rbp-0xe0]
     lea  rsi, [rel _block]
-    mov  ecx, 5
+    mov  ecx, 6                     ; "block" AND its NUL: a 5-byte prefix matched "blocktxn" (2026-09-09)
     repe cmpsb
     jne  .receive           ; not the block we want -> drain and keep reading
     ; got `block`: validate with cons_verify(buf, plen, scratch@rbp-0x540, cap)
@@ -1937,7 +1937,7 @@ node_ibd_blocks_x:
     ; block? else drain (ignore chatter) and keep reading
     lea  rdi, [rbp-0x70]
     lea  rsi, [rel _block]
-    mov  ecx, 5
+    mov  ecx, 6                     ; "block" AND its NUL: a 5-byte prefix matched "blocktxn" (2026-09-09)
     repe cmpsb
     jne  .receive_x
     ; ---- got `block`: validate with the CALLER scratch ----
@@ -2100,7 +2100,7 @@ node_ibd_blocks_s:
 .not_ping_s:
     lea  rdi, [rbp-0x70]
     lea  rsi, [rel _block]
-    mov  ecx, 5
+    mov  ecx, 6                     ; "block" AND its NUL: a 5-byte prefix matched "blocktxn" (2026-09-09)
     repe cmpsb
     jne  .receive_s
     mov  rdi, r14
