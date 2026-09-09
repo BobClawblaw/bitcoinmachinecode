@@ -55,8 +55,19 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       NOTE: test_fe_repr/test_fe_inline need the x86-only fe_ref/fe_inline
       differential objects -- not portable; superseded by the vectors in
       test_fe plus the python big-int differential used during bring-up.
-- [ ] secp256k1_point / _point_ct / _scalar / _scalar_c / _glv_c / _ecdsa
+- [ ] secp256k1_point / _point_ct / _glv_c / _ecdsa
       (+ _taproot/_schnorr when upstream main carries them)
+- [x] secp256k1_scalar -> port/osx/secp256k1_scalar.S  DONE 2026-09-09.
+      Native: sc_add/sc_sub/sc_sqr/sc_inv/sc_inv_var/sc_mul_512/
+      sc_split_lambda; sc_mul -> sc_mul_c (C twin) + sc_mul_512 wrapped
+      over sc_mul_512_c until the AArch64 asm fold bug is root-caused.
+      Evidence: test_scalar 12/12, test_glv_split 3 campaigns (1,001,018
+      + 1,000,000 cases) 0 failures; cross-arch differential vs x86
+      objects on the 9950X3D: 2,306 vectors byte-identical (mul_512 800,
+      split 6, sc_mul/sc_add/sc_sub 1500; drivers port/osx/tests/dsl.c +
+      gen_dsl_vecs*.py).  Commit 131e5171 (branch osx/p1-scalar).
+      Pitfalls recorded: AArch64 `add`/`adc` set no flags (use
+      adds/adcs); ldp Rt==Rt2 SIGILL; frame aliases need real `sub sp`.
 - [ ] bitcoin_hmac, aes (wallet_crypter deps), bip39
 - [x] bitcoin_tx -> port/osx/bitcoin_tx.S  DONE 2026-09-09. Evidence:
       upstream test_tx 20/20 + test_txtxid + test_tx_bounds_fuzz
