@@ -377,6 +377,23 @@ int main(void){
       /* 2026-09-09: tcp_connect_ip's connect() is blocking under a 10 s
        * SO_SNDTIMEO; its expiry surfaces as EINPROGRESS, which was rendered
        * "Operation now in progress" and read as an attempt still in flight */
+      /* 2026-09-09, second leg batch: the peer's half-close is seen at once, and
+       * a leg's socket ticks at 3 s after the handshake so the drains get their
+       * designed patience (they counted 300 ms ticks: 2.4 s for headers) */
+      { int sp[2]; ok(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0, "socketpair for the hang-up checks");
+        short rv = 0;
+        ok(leg_peer_hung_up(sp[0], &rv) == 0, "an open, quiet peer has not hung up");
+        shutdown(sp[1], SHUT_WR);
+        ok(leg_peer_hung_up(sp[0], &rv) == 1 && (rv & POLLRDHUP), "the peer's half-close (FIN) is a hang-up: POLLRDHUP");
+        close(sp[1]);
+        ok(leg_peer_hung_up(sp[0], &rv) == 1, "... and its full close still is");
+        close(sp[0]);
+        int sq[2]; socketpair(AF_UNIX, SOCK_STREAM, 0, sq);
+        struct timeval before = {0, 300000}; setsockopt(sq[0], SOL_SOCKET, SO_RCVTIMEO, &before, sizeof before);
+        leg_settle_socket(sq[0]);
+        struct timeval after; socklen_t sl = sizeof after; getsockopt(sq[0], SOL_SOCKET, SO_RCVTIMEO, &after, &sl);
+        ok(after.tv_sec == LEG_READ_TICK_S && after.tv_usec == 0, "a settled leg socket reads in 3 s ticks (was the dial's 300 ms)");
+        close(sq[0]); close(sq[1]); }
       { dial_fail_errno("connect", -EINPROGRESS);
         ok(!strcmp(dial_fail_reason(), "connect timed out (10s)"), "EINPROGRESS from the bounded blocking connect reads as a timeout");
         dial_fail_errno("connect", -ECONNREFUSED);

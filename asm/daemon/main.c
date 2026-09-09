@@ -1224,10 +1224,38 @@ static int legs_live(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux
 /* every deliberate close of a leg says so: "closed ours/<reason>", never a
  * later "connection dropped" that reads as the peer's doing (a socket we
  * shutdown() ourselves presents POLLIN|POLLERR|POLLHUP to our own poll) */
+/* 2026-09-09 (second leg batch, from the first hour of labels on production):
+ * a leg's socket keeps the 300 ms read timeout of its dial, so the sync
+ * drains' tick counts -- 8 for headers, 20 for a block, designed as 3 s
+ * ticks (24 s / 60 s) -- gave a peer 2.4 s to answer getheaders; seven
+ * legs in twenty minutes were closed as "no headers" (where=3 in 2.4s).
+ * After the handshake the socket ticks at 3 s. */
+#define LEG_READ_TICK_S 3
+static void leg_settle_socket(int fd){ struct timeval tv = { LEG_READ_TICK_S, 0 }; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv); }
+#ifndef POLLRDHUP
+#define POLLRDHUP 0x2000
+#endif
+/* Has the peer hung up? A half-close (FIN, the common Core disconnect)
+ * raises POLLRDHUP, not POLLHUP: eight legs in twenty minutes sat dead for
+ * three rotations after the peer's FIN, each pass failing at once with
+ * where=4 (EOF), until the streak retired them as "ours". */
+static int leg_peer_hung_up(int fd, short* revents_out){
+    struct pollfd pf = { fd, POLLIN | POLLRDHUP, 0 };
+    int r = poll(&pf, 1, 0);
+    if(revents_out) *revents_out = pf.revents;
+    return r > 0 && (pf.revents & (POLLHUP | POLLERR | POLLNVAL | POLLRDHUP)) ? 1 : 0;
+}
 static void leg_close_ours(int i, const char* reason, const char* detail){
     fprintf(stderr,"[dl:%d] %s connection closed ours/%s after %llds%s%s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", reason, leg_age_s(i),
             detail && detail[0] ? " -- " : "", detail ? detail : "");
     if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
+}
+static void leg_close_theirs(int i, const char* how, const char* unread){
+    long long age = leg_age_s(i);
+    fprintf(stderr,"[dl:%d] %s connection closed theirs (%s) after %llds; unread: %s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", how, age, unread ? unread : "(nothing)");
+    if(g_dialmem && age >= 0 && age <= DM_EARLY_S) dialmem_note_failure(g_dialmem, mux_out_host[i], age <= DM_REFUSED_S ? DM_REFUSED : DM_EARLY_DROP, dialmem_now());
+    if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
+    mux_out_nextretry[i] = 0;   /* re-dial on the next rotation */
 }
 #define REDIAL_BACKOFF_MS 30000L             /* min gap between re-dial tries on a dead slot */
 
@@ -2303,6 +2331,7 @@ static int outbound_connect_raw(const char* host, int rcv_ms, int out_port){
         bmc_v2_close(fd); close(fd);
         return -1;
     }
+    leg_settle_socket(fd);
     fprintf(stderr,"[dial] %s connected over %s\n", host, v2res);
     /* Record what this peer ACTUALLY offers.
      *
@@ -2663,10 +2692,22 @@ static long do_outbound_sync(int i){
          * rotation stops burning ~60 s on a peer that will not answer (that
          * is where=3, the headers-drain timeout); the caller's existing
          * dead-slot path re-dials it, rate-limited. */
+        if(sync_fail_code == 4 && sync_s < 0.5){   /* EOF before the peer said anything: it hung up */
+            leg_close_theirs(i, "EOF on the first read", "(nothing)");
+            g_sync_fail_streak[i] = 0;
+            return 0;
+        }
         g_sync_fail_streak[i]++;
         if(g_sync_fail_streak[i] >= 3){
             char d[96]; snprintf(d, sizeof d, "3 failing sync passes, last where=%d in %.1fs", sync_fail_code, sync_s);
             leg_close_ours(i, "sync-failed-3x", d);
+            /* 2026-09-09 (LAN capture, 19:00-19:14Z): the legs we retire this
+             * way are a handful of cloud-hosted listeners that complete the
+             * handshake and never answer a getheaders -- one was dialled seven
+             * times in fifteen minutes because this close alone was not fed to
+             * the dial memory. A peer that served nothing three times is
+             * remembered like an early drop: 10 min, doubling to 6 h. */
+            if(g_dialmem) dialmem_note_failure(g_dialmem, mux_out_host[i], DM_EARLY_DROP, dialmem_now());
             g_sync_fail_streak[i] = 0;
             mux_out_nextretry[i] = 0;   /* re-dial on the next rotation, not after the dead-slot backoff */
         }
@@ -3031,7 +3072,8 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
       } }
     int fd = outbound_connect(peers[p], 300, out_port);
     if(fd<0){ long bo = g_dialmem ? dialmem_note_failure(g_dialmem, peers[p], strstr(dial_fail_reason(), "handshake") ? DM_REFUSED : DM_CONNECT_FAIL, dialmem_now()) : 0;
-              fprintf(stderr,"[mux:%d] next peer %s unreachable: %s (leg stays down; not dialled again for %ld min)\n",
+              if(bo < 0) fprintf(stderr,"[mux:%d] next peer %s unreachable: %s (leg stays down; not dialled again this run)\n", i, peers[p], dial_fail_reason());
+              else fprintf(stderr,"[mux:%d] next peer %s unreachable: %s (leg stays down; not dialled again for %ld min)\n",
                      i, peers[p], dial_fail_reason(), bo / 60); return; }
     mux_out_fd[i]=fd; txrelay_leg_reset(fd); leg_note_installed(i);
     mux_out_wants_v2[i]=(unsigned char)g_peer_wants_addrv2;
@@ -7543,7 +7585,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * POLLNVAL pattern (see the accept loop above), mirrored here so
              * the download worker's peer drops are equally visible/handled. */
             struct pollfd pf = { mux_out_fd[i], POLLIN, 0 };
-            if(poll(&pf, 1, 0) > 0 && (pf.revents & (POLLHUP|POLLERR|POLLNVAL))){
+            if(leg_peer_hung_up(mux_out_fd[i], &pf.revents)){
                 /* 2026-09-09: the peer's doing (every close of ours is labelled
                  * before it reaches here). Read what it left in the socket --
                  * its last words, if any -- and remember the address: an

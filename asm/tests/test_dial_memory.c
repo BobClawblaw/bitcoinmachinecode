@@ -29,6 +29,7 @@ int main(void){
     ck("... never offered", dialmem_allowed(t, "5.6.7.8:8333", now + 10 * 86400), 0);
     dialmem_note_success(t, "5.6.7.8:8333");
     ck("... not even after a 'success'", dialmem_allowed(t, "5.6.7.8:8333", now + 10 * 86400), 0);
+    ck("a later connect failure on a permanent entry answers -1, not minutes", dialmem_note_failure(t, "5.6.7.8:8333", DM_CONNECT_FAIL, now), -1);
     ck("an IPv6 literal keeps its colons", (dialmem_note_failure(t, "[2001:db8::1]:8333", DM_REFUSED, now), dialmem_allowed(t, "[2001:db8::1]:8333", now)), 0);
     ck("skips are counted for the heartbeat", (long)t->skips, 5);
     /* the table is full (4): a new failure evicts the entry whose backoff ended longest ago, never the permanent one */
