@@ -1,21 +1,28 @@
 # Where this node still differs from Core — issues to resolve (2026-09-09)
 
-An inventory taken after the 09-09 leg and compact-block work, ordered by measured payoff. Each row names what Core does, what this node does, the measured cost, and the fix. Rows move to "closed" with the PR that closes them. Consensus is not on this list: every consensus rule is proven against Core's vectors and the regtest differentials, and the two decided refusals (`assumeutxo`, testnet3) are documented in `FEATURE_GAPS.md`.
+An inventory taken after the 09-09 leg and compact-block work, extended the same night with the initial-sync rows from the run 19 measurements, ordered by measured payoff. Each row names what Core does, what this node does, the measured cost, and the fix. Rows move to "closed" with the PR that closes them. Consensus is not on this list: every consensus rule is proven against Core's vectors and the regtest differentials, and the two decided refusals (`assumeutxo`, testnet3) are documented in `FEATURE_GAPS.md`.
 
 ## Open
 
 | # | area | Core | this node | cost measured | fix |
 |---|---|---|---|---|---|
-| 1 | header sync | `sendheaders`: peers push new headers; `getheaders` only with cause | `getheaders` on every leg, every rotation | one request per peer per rotation, ~30 s of latency to a new block, silence detectable only by timeout | act on pushed `headers`/`inv` from the sweep; request only when behind |
-| 2 | compact blocks | up to 3 high-bandwidth peers push a compact block with no round trip | low-bandwidth only | one round trip per block before reconstruction starts | `sendcmpct` hb=1 to the 3 best legs; accept unsolicited `cmpctblock` from them |
-| 3 | leg service | one event loop over all peers | legs served one at a time, 60 s budget each | a slow pass delays every other leg; pongs answered within a pass, not at once | an event-driven leg loop (largest change, smallest measured gain now) |
-| 4 | history indexes | txindex, coinstatsindex, blockfilterindex built and repaired in the daemon; `-reindex` rebuilds all | offline `bmc_build_*` tools; the daemon adopts within a gap; only the coinstats history self-heals | the filter index sat at 964,359 for a day; the address history needs an operator | the coinstats self-heal shape for the filter index and the address history |
-| 5 | long reorgs | staged and connected as one unit | above 32 blocks: rewind and hand off to the downloader | a rotation without legs after a handoff | keep the legs through the handoff |
+| 1 | compaction during initial sync | one cache, one write | merges run in a background child sharing the disk with the apply; steady-state mode merged ~1,000 times in a run | run 18: 993 compactions; bulk mode: one 48-run merge every ~45k blocks | bulk sizing cuts the count; then merge cadence and I/O priority under the apply |
+| 2 | checkpoint cadence during initial sync | none until the cache is flushed | the WAL checkpoints on a cadence sized for the live tip | 13-24% of block time at 700,000 | bulk thresholds first; then "once at the end" for a fresh sync |
+| 3 | download parallelism | 16 blocks in flight per outbound peer, all peers | a fixed 16 chunk workers against a pool whose peers deliver 250-600 KB/s each; the 2.5 Gbit interface carries 11 MB/s | run 19: 11 MB/s flat from the first minute | raise the worker ceiling toward 32 once the apply has headroom; measure at the 634k/800k marks |
+| 4 | header sync | `sendheaders`: peers push new headers; `getheaders` only with cause | `getheaders` on every leg, every rotation | one request per peer per rotation, ~30 s of latency to a new block, silence detectable only by timeout | act on pushed `headers`/`inv` from the sweep; request only when behind |
+| 5 | compact blocks | up to 3 high-bandwidth peers push a compact block with no round trip | low-bandwidth only | one round trip per block before reconstruction starts | `sendcmpct` hb=1 to the 3 best legs; accept unsolicited `cmpctblock` from them |
+| 6 | leg service | one event loop over all peers | legs served one at a time, 60 s budget each | a slow pass delays every other leg; pongs answered within a pass, not at once | an event-driven leg loop (largest change, smallest measured gain now) |
+| 7 | history indexes | txindex, coinstatsindex, blockfilterindex built and repaired in the daemon; `-reindex` rebuilds all | offline `bmc_build_*` tools; the daemon adopts within a gap; only the coinstats history self-heals | the filter index sat at 964,359 for a day; the address history needs an operator | the coinstats self-heal shape for the filter index and the address history |
+| 8 | long reorgs | staged and connected as one unit | above 32 blocks: rewind and hand off to the downloader | a rotation without legs after a handoff | keep the legs through the handoff |
+
+| 9 | live coin counter after a crash | the count is the cache's, exact after replay | under the bulk memtable, a kill mid-block recovers with the counter 2 high (`test_utxo_crash_recovery`'s steady-state scenario forced to bulk: 153 vs 151, every key identical); the set is right, the counter is not | cosmetic until `gettxoutsetinfo` is asked after a crash mid-sync; the coinstats seed walk corrects it | find the double count in bulk-mode recovery (the interleaved verifier's spend accounting is the suspect); pin with the scenario at 2^22 slots |
 
 ## Closed today
 
 | # | what | PR |
 |---|---|---|
+| j | a fresh sync uses the dbcache: an empty set takes the bulk memtable | #153 |
+| i | a block another leg just stored ends the pass well; the fetch gate skips hashes the store holds | #152 |
 | g | one request per block across the legs (`daemon/inflight.c`, the sync loop's fetch gate) | #150 |
 | h | pings every 2 min per leg, 20-minute timeout, the round trip recorded | #150 |
 | a | compact-block receive completed nothing: `blocktxn` matched as `block` | #145 |

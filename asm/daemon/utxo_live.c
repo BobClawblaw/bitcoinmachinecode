@@ -23,6 +23,7 @@
  * (manifest_n directly bounds .do_tx's per-lookup disk-run scan cost for
  * every inbound child once that's wired up).
  */
+#include "utxo_live_sizing.h"
 #include "genesis_skip.h"
 #include "chainparams.h"
 #include "../script_flags_consts.h"   /* per-chain BIP34 activation heights
@@ -2874,7 +2875,10 @@ static int g_bulk_mode = 0;
  * state is unchanged. */
 /* Test hook: g_bulk_mode is decided from the store at init, which a unit test
  * of the threshold arithmetic has no business setting up. */
+static int g_test_force_sizing = -1;   /* tests: -1 decide as production does, 0 steady-state, 1 bulk (2026-09-09: a fresh datadir is bulk now, and a test that needs the small memtable says so) */
+void utxo_live_test_force_sizing(int mode){ g_test_force_sizing = mode; }
 void utxo_live_test_set_bulk_mode(int on){ g_bulk_mode = on; }
+int  utxo_live_is_bulk(void){ return g_bulk_mode; }   /* 2026-09-09: for tests and the boot line */
 /* Read side (daemon/main.c decides whether the coinstats index seeds at boot
  * or defers to the caught-up hook above). */
 int utxo_live_bulk_mode(void){ return g_bulk_mode; }
@@ -2906,7 +2910,11 @@ int utxo_live_init(const char* dir){
     long boot_applied = read_applied_height();
     long boot_tip     = utxo_live_index_tip();
     long boot_gap     = (boot_tip >= 0) ? (boot_tip - boot_applied) : 0;
-    g_bulk_mode = (boot_gap >= g_cfg.utxo_bulk_gap_blocks);
+    /* 2026-09-09: an empty set is initial block download -- a fresh datadir
+     * boots with gap 1 and used to take the 64 MB steady-state memtable for
+     * the whole chain while the dbcache-sized bulk memtable sat unused
+     * (utxo_live_sizing.h; run 19: 300 ms a block at 700,000) */
+    g_bulk_mode = g_test_force_sizing >= 0 ? g_test_force_sizing : utxo_live_pick_bulk(boot_applied, boot_tip, g_cfg.utxo_bulk_gap_blocks);
 
     /* ...and ALSO go bulk when the WAL tail we are about to replay is large,
      * regardless of how few blocks remain.

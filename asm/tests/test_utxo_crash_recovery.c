@@ -207,8 +207,16 @@ static void apply_sizing(int tiny){
         g_cfg.utxo_bulk_gap_blocks = 0;
         g_cfg.utxo_bulk_slots_log2 = 2;
         g_cfg.utxo_bulk_blob_mb    = 1;
+        { extern void utxo_live_test_force_sizing(int); utxo_live_test_force_sizing(1); }
     } else {
-        g_cfg.utxo_bulk_gap_blocks = 1000000L;   /* steady-state 2^16 slots */
+        /* steady-state 2^16 slots. 2026-09-09: a fresh datadir takes the bulk
+         * sizing by itself now (utxo_live_sizing.h), so this variant asks for
+         * the small memtable explicitly. Under the bulk memtable this same
+         * scenario recovers with a live count of 153 against the reference's
+         * 151 -- a counter drift in bulk-mode crash recovery, recorded in
+         * docs/CORE_DIVERGENCES.md as its own item. */
+        extern void utxo_live_test_force_sizing(int);
+        utxo_live_test_force_sizing(0);
     }
 }
 
