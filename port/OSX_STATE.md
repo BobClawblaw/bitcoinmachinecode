@@ -4,6 +4,14 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-09 — p1 progressing: sha512 (asm) + ripemd160 (C twin) landed
+
+- sha512.S native, upstream test 4/4. ripemd160 shipped as C twin after
+  two failed asm translations (see OSX_ROADMAP pitfalls); 23/23 + 2.08M
+  digest thread-stress green. bitcoin_hash done earlier (PR #134).
+- Committed straight to bmc_osx (docs+module batch); next modules:
+  sha1, bech32, base32, then the secp256k1 family.
+
 ## 2026-09-09 — p0 landed: sha256 is the first native module
 
 - `port/osx/sha256.S` (Mach-O AArch64, 7 public symbols) + native gate
