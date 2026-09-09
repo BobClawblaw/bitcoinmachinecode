@@ -374,6 +374,13 @@ int main(void){
       /* run 14's two-minute stall: a failed fetch must cost the peer its
        * standing, cost the worker a pause, and a help must land on the
        * claim grid */
+      /* 2026-09-09: tcp_connect_ip's connect() is blocking under a 10 s
+       * SO_SNDTIMEO; its expiry surfaces as EINPROGRESS, which was rendered
+       * "Operation now in progress" and read as an attempt still in flight */
+      { dial_fail_errno("connect", -EINPROGRESS);
+        ok(!strcmp(dial_fail_reason(), "connect timed out (10s)"), "EINPROGRESS from the bounded blocking connect reads as a timeout");
+        dial_fail_errno("connect", -ECONNREFUSED);
+        ok(!strcmp(dial_fail_reason(), "connect: Connection refused"), "a refused connect keeps strerror's text"); }
       { ok(dlc_ema_after_failure(800.0*1024) == 400.0*1024, "a failed fetch halves the peer's rate (800 -> 400 KB/s)");
         ok(dlc_ema_after_failure(0.0) == 1.0, "a never-measured peer that fails is marked tried (1.0), not left untried");
         ok(dlc_fail_backoff_ms(1) == 200 && dlc_fail_backoff_ms(5) == 1000 && dlc_fail_backoff_ms(10) == 2000 && dlc_fail_backoff_ms(400) == 2000,

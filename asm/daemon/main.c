@@ -184,6 +184,12 @@ extern long g_peer_wants_addrv2;   /* bitcoind.asm: peer sent sendaddrv2 before 
 typedef struct { volatile int n; char a[NOWIT_MAX][64]; volatile unsigned long long skips; } nowit_set_t;
 static nowit_set_t* g_nowit_sh = 0;
 void peer_nowit_attach(void* shared){ g_nowit_sh = (nowit_set_t*)shared; }
+/* 2026-09-09: what every dial attempt taught us (daemon/dial_memory.h) --
+ * MAP_SHARED so the dial helpers and the worker consult one table */
+#include "dial_memory.h"
+#define DIALMEM_CAP 4096
+static dm_table_t* g_dialmem = 0;
+static long long dialmem_now(void){ return (long long)time(NULL); }
 unsigned long peer_nowit_bytes(void){ return (unsigned long)sizeof(nowit_set_t); }
 static char  g_nowit[NOWIT_MAX][64];
 static int   g_nowit_n = 0;
@@ -237,6 +243,7 @@ static int peer_has_witness(const char* who){
         fprintf(stderr, "[dial] %s lacks NODE_WITNESS (services=0x%llx) -- dropping, and not dialling it again this run\n",
                 who ? who : "?", services);
     nowit_remember(who);
+    if (g_dialmem) dialmem_note_failure(g_dialmem, who, DM_NO_WITNESS, dialmem_now());
     return 0;
 }
 extern long node_sync(int fd, void* st, void* locator, void* buf, long buflen, long* out_count);
@@ -308,6 +315,24 @@ extern int  store_set_prune(void* st, int h);             /* bitcoin_store.asm  
 extern int  store_prune(void* st, int h);                 /* bitcoin_store.asm       */
 extern long p2p_write(int fd,const char*cmd,unsigned cmdlen,const void*pl,unsigned plen);
 extern int  p2p_read(int fd,char cmd[12],void*pl,unsigned cap,unsigned*len);
+/* 2026-09-09: what a peer that hung up left unread in the socket -- the
+ * message types, in order, and a reject's text. Bounded: at most 12
+ * messages, and a hung-up socket answers every read at once. */
+static void leg_drain_unread(int fd, char* out, unsigned long cap){
+    static unsigned char buf[1 << 20]; char cmd[12]; unsigned len = 0; unsigned long o = 0; int n = 0;
+    out[0] = 0;
+    for(; n < 12; n++){
+        struct pollfd pf = { fd, POLLIN, 0 };
+        if(poll(&pf, 1, 0) <= 0 || !(pf.revents & POLLIN)) break;
+        int r = p2p_read(fd, cmd, buf, sizeof buf, &len);
+        if(r != 1) break;
+        char c[13]; memcpy(c, cmd, 12); c[12] = 0;
+        for(int k = 0; k < 12; k++) if(c[k] && (c[k] < 0x20 || c[k] > 0x7e)) c[k] = '.';
+        int w = snprintf(out + o, cap - o, "%s%s", o ? " " : "", c); if(w < 0 || (unsigned long)w >= cap - o) break; o += (unsigned long)w;
+        if(!strncmp(cmd, "reject", 12) && len > 1){ unsigned ml = buf[0]; unsigned p = 1 + ml; if(p < len){ unsigned rl = buf[p]; p += 2; if(p + rl <= len){ w = snprintf(out + o, cap - o, "(%.*s)", rl > 60 ? 60 : rl, (const char*)buf + p); if(w > 0 && (unsigned long)w < cap - o) o += (unsigned long)w; } } }
+    }
+    if(!o) snprintf(out, cap, "%s", n == 0 ? "(nothing)" : "(nothing readable)");
+}
 extern long p2p_getheaders(void* out, const void* locator, int count, const void* stop);
 extern int  node_log_open(const char* path);
 extern void node_log_event(int fd, int kind, unsigned a, unsigned b, unsigned c);
@@ -1184,7 +1209,26 @@ static long long mux_out_nextretry[MUX_MAX_OUT];
 /* consecutive failed sync passes per leg; surfaced in the heartbeat as
  * sync_failing=N and used to drop a leg that will not answer (see
  * do_outbound_sync). */
-static int g_sync_fail_streak[MUX_MAX_OUT]; /* monotonic ms deadline before the next re-dial attempt */
+static int g_sync_fail_streak[MUX_MAX_OUT]; /* consecutive failing sync passes of the leg in the slot (reset per peer) */
+static long long mux_out_since[MUX_MAX_OUT];      /* 2026-09-09: when the leg in the slot connected (epoch s) */
+static unsigned char mux_out_good[MUX_MAX_OUT];   /* it lived DM_GOOD_S: its address's failure streak was cleared */
+extern int sync_fail_code;                        /* bitcoind.asm: where the last node_sync_multi pass failed */
+/* a new peer in the slot: its own clock, its own streak. Before 2026-09-09 the
+ * streak was never reset when the slot changed hands, so a fresh leg whose
+ * first pass failed was closed on the spot -- silently -- as the third
+ * strike of two predecessors (production, 16:30-16:42Z: eight legs closed by
+ * us within 50-160 s, none logged). */
+static void leg_note_installed(int i){ mux_out_since[i] = (long long)time(NULL); mux_out_good[i] = 0; g_sync_fail_streak[i] = 0; }
+static long long leg_age_s(int i){ return mux_out_since[i] ? (long long)time(NULL) - mux_out_since[i] : -1; }
+static int legs_live(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0) n++; return n; }
+/* every deliberate close of a leg says so: "closed ours/<reason>", never a
+ * later "connection dropped" that reads as the peer's doing (a socket we
+ * shutdown() ourselves presents POLLIN|POLLERR|POLLHUP to our own poll) */
+static void leg_close_ours(int i, const char* reason, const char* detail){
+    fprintf(stderr,"[dl:%d] %s connection closed ours/%s after %llds%s%s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", reason, leg_age_s(i),
+            detail && detail[0] ? " -- " : "", detail ? detail : "");
+    if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
+}
 #define REDIAL_BACKOFF_MS 30000L             /* min gap between re-dial tries on a dead slot */
 
 /* ---- runtime peer control (RPC ctl_* channel) ---------------------------
@@ -2013,6 +2057,13 @@ static void mux_budget_alarm(int sig){
     int fd = mux_budget_fd;
     if (fd >= 0) shutdown(fd, SHUT_RDWR);
 }
+/* 2026-09-09: the pass budget for a leg. Recycling the ONLY path to the
+ * network every 60 s was a starvation loop (bmcmonitor: connections median
+ * 1, sub-minute flicker); a sole leg gets four times the budget before it is
+ * replaced. The alarm still ends the pass either way (a trickling peer resets
+ * SO_RCVTIMEO on every partial read and the pass would never return). */
+#define DL_BUDGET_ONLY_LEG_MULT 4
+static unsigned leg_budget_secs(int live_legs){ return (unsigned)(live_legs <= 1 ? DL_BUDGET_SECS * DL_BUDGET_ONLY_LEG_MULT : DL_BUDGET_SECS); }
 
 /* Wall-clock budget for ONE dial (blocking connect + handshake). SO_RCVTIMEO
  * alone is NOT sufficient here and this is a real production hang, not a
@@ -2050,6 +2101,11 @@ static const char* dial_fail_reason(void){
  * number when it is not a value strerror knows. */
 static void dial_fail_errno(const char* what, int rc){
     int e = -rc;
+    /* 2026-09-09: tcp_connect_ip's connect() is BLOCKING under a 10 s
+     * SO_SNDTIMEO; when that expires the kernel reports EINPROGRESS, and
+     * "Operation now in progress" was read as an attempt abandoned in flight
+     * (1,575 lines in a day). It is a connect that timed out: say so. */
+    if(e == EINPROGRESS || e == ETIMEDOUT){ snprintf(g_dial_fail, sizeof g_dial_fail, "%s timed out (10s)", what); return; }
     const char* m = (e > 0 && e < 200) ? strerror(e) : NULL;
     if(m) snprintf(g_dial_fail, sizeof g_dial_fail, "%s: %s", what, m);
     else  snprintf(g_dial_fail, sizeof g_dial_fail, "%s: rc=%d", what, rc);
@@ -2606,9 +2662,10 @@ static long do_outbound_sync(int i){
          * dead-slot path re-dials it, rate-limited. */
         g_sync_fail_streak[i]++;
         if(g_sync_fail_streak[i] >= 3){
-            bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]);
-            mux_out_fd[i] = -1;
+            char d[96]; snprintf(d, sizeof d, "3 failing sync passes, last where=%d in %.1fs", sync_fail_code, sync_s);
+            leg_close_ours(i, "sync-failed-3x", d);
             g_sync_fail_streak[i] = 0;
+            mux_out_nextretry[i] = 0;   /* re-dial on the next rotation, not after the dead-slot backoff */
         }
         return 0;
     }
@@ -2702,6 +2759,7 @@ static int dh_reserved_pick(int an, int net, const char* srcpool[], int nsrc){
         int already = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], srcpool[ci])){ already = 1; break; }
         if(already) continue;
         { char ip[128]; ctl_ip_only(srcpool[ci], ip, sizeof ip); if(ctl_is_banned(ip)) continue; }
+        if(g_dialmem && !dialmem_allowed(g_dialmem, srcpool[ci], dialmem_now())) continue;   /* 2026-09-09: under backoff */
         g_dh_cursor[an] = (ci + 1) % nsrc;
         return ci;
     }
@@ -2919,7 +2977,7 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
     g_peer_version_len = r->vlen; if(r->vlen) memcpy(g_peer_version_payload, r->vpayload, (size_t)r->vlen);
     g_peer_wants_addrv2 = r->wants_addrv2;
     snprintf(mux_out_host[mux_n_out], sizeof mux_out_host[mux_n_out], "%s", host);
-    mux_out_fd[mux_n_out] = fd;
+    mux_out_fd[mux_n_out] = fd; leg_note_installed(mux_n_out);
     mux_out_kind[mux_n_out] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
     mux_out_wants_v2[mux_n_out] = r->wants_addrv2;
     mux_out_peer[mux_n_out] = 0;
@@ -2951,6 +3009,7 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
       for(int tries = 0; tries < pool_len; tries++){
           ctl_ip_only(peers[p], me, sizeof me);
           int held = leg_is_anon_net(leg_net_of(peers[p]));   /* anonymity dials belong to the helper, never inline */
+          if(!held && g_dialmem && !dialmem_allowed(g_dialmem, peers[p], dialmem_now())) held = 1;   /* 2026-09-09: under backoff */
           for(int k = 0; k < mux_n_out && !held; k++){
               if(k == i || mux_out_fd[k] < 0) continue;
               char other[128]; ctl_ip_only(mux_out_host[k], other, sizeof other);
@@ -2968,9 +3027,10 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
           return;
       } }
     int fd = outbound_connect(peers[p], 300, out_port);
-    if(fd<0){ fprintf(stderr,"[mux:%d] next peer %s unreachable: %s (leg stays down)\n",
-                     i, peers[p], dial_fail_reason()); return; }
-    mux_out_fd[i]=fd; txrelay_leg_reset(fd);
+    if(fd<0){ long bo = g_dialmem ? dialmem_note_failure(g_dialmem, peers[p], strstr(dial_fail_reason(), "handshake") ? DM_REFUSED : DM_CONNECT_FAIL, dialmem_now()) : 0;
+              fprintf(stderr,"[mux:%d] next peer %s unreachable: %s (leg stays down; not dialled again for %ld min)\n",
+                     i, peers[p], dial_fail_reason(), bo / 60); return; }
+    mux_out_fd[i]=fd; txrelay_leg_reset(fd); leg_note_installed(i);
     mux_out_wants_v2[i]=(unsigned char)g_peer_wants_addrv2;
     strncpy(mux_out_host[i], peers[p], 127);
     anchor_locator(mux_out_loc[i]);
@@ -5307,7 +5367,9 @@ static long dl_catchup(const char* dir, int min_workers){
      * learned ONCE for the whole download rather than once per helper
      * (2026-09-06: 16 helpers meant 16 identical log lines per address). */
     { void* nw = mmap(NULL, peer_nowit_bytes(), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
-      if (nw != MAP_FAILED){ memset(nw, 0, peer_nowit_bytes()); peer_nowit_attach(nw); } }
+      if (nw != MAP_FAILED){ memset(nw, 0, peer_nowit_bytes()); peer_nowit_attach(nw); }
+      void* dm = mmap(NULL, dialmem_bytes(DIALMEM_CAP), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+      if (dm != MAP_FAILED){ dialmem_init(dm, DIALMEM_CAP); g_dialmem = (dm_table_t*)dm; } }
     volatile int* claimed=mmap(NULL,sizeof(int)*(size_t)nlive,PROT_READ|PROT_WRITE,MAP_SHARED|MAP_ANONYMOUS,-1,0);
     /* Peers evicted for sustained uselessness are banned for the REST OF THE
      * RUN. Without this the replacement draw is memoryless: a worker killed
@@ -6818,7 +6880,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
             struct timeval t2; t2.tv_sec=3; t2.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
             strncpy(mux_out_host[mux_n_out], srcpool[i], 127);
-            mux_out_fd[mux_n_out]=cfd[i]; mux_out_kind[mux_n_out] = host_is_block_only(srcpool[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
+            mux_out_fd[mux_n_out]=cfd[i]; leg_note_installed(mux_n_out); mux_out_kind[mux_n_out] = host_is_block_only(srcpool[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
             mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
             mux_out_peer[mux_n_out]=i;
             anchor_locator(mux_out_loc[mux_n_out]);
@@ -7479,8 +7541,17 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * the download worker's peer drops are equally visible/handled. */
             struct pollfd pf = { mux_out_fd[i], POLLIN, 0 };
             if(poll(&pf, 1, 0) > 0 && (pf.revents & (POLLHUP|POLLERR|POLLNVAL))){
-                fprintf(stderr,"[dl:%d] %s connection dropped (revents 0x%x); re-dialing\n",
-                        i, mux_out_host[i], pf.revents);
+                /* 2026-09-09: the peer's doing (every close of ours is labelled
+                 * before it reaches here). Read what it left in the socket --
+                 * its last words, if any -- and remember the address: an
+                 * inbound-full node evicting its newest peer, or a listener
+                 * that hangs up after a minute, is not worth the next dial. */
+                char unread[200]; leg_drain_unread(mux_out_fd[i], unread, sizeof unread);
+                long long age = leg_age_s(i);
+                fprintf(stderr,"[dl:%d] %s connection closed theirs (revents 0x%x) after %llds; unread: %s\n",
+                        i, mux_out_host[i], pf.revents, age, unread);
+                if(g_dialmem && age >= 0 && age <= DM_EARLY_S)
+                    dialmem_note_failure(g_dialmem, mux_out_host[i], age <= DM_REFUSED_S ? DM_REFUSED : DM_EARLY_DROP, dialmem_now());
                 if(ctl_dial_listed(mux_out_host[i])) ctl_dial_report(mux_out_host[i], 0, (long long)time(NULL));   /* addnode add: back in the queue */
                 mux_next_peer(i, srcpool, nsrc, out_port);
                 mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
@@ -7509,7 +7580,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 if(acc == -2){
                     /* Core: "transaction sent in violation of protocol" -- we told
                      * this peer fRelay=0 (-blocksonly) and it relayed anyway */
-                    fprintf(stderr,"[mux:%d] %s sent transactions in -blocksonly: violation, disconnecting\n", i, mux_out_host[i]);
+                    leg_close_ours(i, "blocksonly-violation", "the peer relayed transactions after we sent fRelay=0");
                     mux_next_peer(i, peers, pool_len, out_port);
                     /* DMN-7 (audit 2026-09-03): clock() is process CPU time,
                      * not wall time. Compared against now_ms (CLOCK_MONOTONIC,
@@ -7560,10 +7631,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             sigaction(SIGALRM,&sa,&old);
             mux_sync_budget_fired=0;
             mux_budget_fd = mux_out_fd[i];
-            alarm((unsigned)DL_BUDGET_SECS);
+            unsigned budget_s = leg_budget_secs(legs_live());
+            alarm(budget_s);
             long n = do_outbound_sync(i);
             alarm(0); mux_budget_fd = -1; sigaction(SIGALRM,&old,NULL);
             if(mux_sync_budget_fired){
+                char d[80]; snprintf(d, sizeof d, "the pass exceeded %us%s (where=%d)", budget_s, budget_s > (unsigned)DL_BUDGET_SECS ? ", the only-leg budget" : "", sync_fail_code);
+                leg_close_ours(i, "sync-budget", d);
                 fprintf(stderr,"[dl:%d] %s exceeded %gs budget; re-dialing\n",
                         i, mux_out_fd[i]>=0?mux_out_host[i]:"?", DL_BUDGET_SECS);
                 mux_next_peer(i, srcpool, nsrc, out_port);
@@ -7596,6 +7670,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 long pr = reorg_probe_peer(mux_out_fd[i], store_buf, mux_out_host[i]);
                 alarm(0); mux_budget_fd = -1; sigaction(SIGALRM,&pold,NULL);
                 if(mux_sync_budget_fired){
+                    leg_close_ours(i, "probe-budget", "the reorg probe exceeded its budget");
                     fprintf(stderr,"[reorg] probe of %s exceeded %gs budget; re-dialing\n", mux_out_host[i], DL_BUDGET_SECS);
                     mux_next_peer(i, srcpool, nsrc, out_port);
                 } else if(pr == 1){
@@ -7626,6 +7701,17 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     fprintf(stderr,"[reorg] probe of %s rejected a candidate chain (no action taken)\n", mux_out_host[i]);
                 }
             }
+            /* 2026-09-09: service every OTHER leg's buffered messages now --
+             * a ping used to wait for its leg's turn in the rotation (75 s
+             * measured; Core's eviction protects its lowest-ping peers, and a
+             * peer that never got a pong ranks last at an inbound-full node).
+             * Nothing outstanding means only what is already buffered is read. */
+            { long long nowsec = (long long)time(NULL);
+              for(int k = 0; k < mux_n_out; k++){
+                  if(k == i || mux_out_fd[k] < 0) continue;
+                  if(mux_out_kind[k] != LEG_BLOCK_ONLY && txsub_worker_ready()){ extern long txrelay_poll_leg(int, void*, int); (void)txrelay_poll_leg(mux_out_fd[k], txsub_pool(), 0); }
+                  if(!mux_out_good[k] && mux_out_since[k] && nowsec - mux_out_since[k] >= DM_GOOD_S){ mux_out_good[k] = 1; if(g_dialmem) dialmem_note_success(g_dialmem, mux_out_host[k]); }
+              } }
             /* brief yield so we don't spin a CPU core when all legs are idle */
             if((i&1)==1){ usleep(20000); }
         }
@@ -7821,6 +7907,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             char storedbuf[40]; storedbuf[0]=0;
             { long pt = node_public_tip(store_buf), stt = *(int*)(store_buf+24);
               if(stt != pt) snprintf(storedbuf, sizeof storedbuf, " stored=%ld", stt); }
+            if(g_dialmem) fprintf(stderr,"[dial] memory: %d address(es) remembered, %llu candidate(s) skipped under backoff\n", dialmem_count(g_dialmem), (unsigned long long)g_dialmem->skips);
             fprintf(stderr,"[dl] heartbeat: tip=%ld%s peers=%d/%d txouts=%ld uptime=%s%s%s\n",
                     node_public_tip(store_buf), storedbuf, live_peers, mux_n_out,
                     utxo_live_ok?live_utxo_disp():-1L,
@@ -7865,7 +7952,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         { dh_result_t dr; int dfd; char dhost[128];
           while(dh_poll(&dr, &dfd, dhost, sizeof dhost)){
               if(dr.ok && dfd >= 0){ if(!dh_install_leg(dhost, dfd, &dr)) fprintf(stderr, "[dial] %s: background dial landed but the leg was not installed\n", dhost); }
-              else fprintf(stderr, "[dial] %s: background dial failed: %s\n", dhost, dr.why[0] ? dr.why : "?");
+              else { long bo = g_dialmem ? dialmem_note_failure(g_dialmem, dhost, strstr(dr.why, "handshake") ? DM_REFUSED : DM_CONNECT_FAIL, dialmem_now()) : 0;
+                     fprintf(stderr, "[dial] %s: background dial failed: %s (not dialled again for %ld min)\n", dhost, dr.why[0] ? dr.why : "?", bo / 60); }
           } }
         /* reserved slots: at least ONE leg per reachable anonymity network,
          * dialled in the background, on top of the clearnet legs (Core keeps
@@ -7922,10 +8010,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 int already=0;
                 for(int k=0;k<mux_n_out;k++) if(!strcmp(mux_out_host[k],srcpool[ci])){ already=1; break; }
                 if(already) continue;
+                if(g_dialmem && !dialmem_allowed(g_dialmem, srcpool[ci], dialmem_now())) continue;   /* 2026-09-09: under backoff */
                 int nfd=outbound_connect(srcpool[ci], 300, out_port);
+                if(nfd<0 && g_dialmem) dialmem_note_failure(g_dialmem, srcpool[ci], strstr(dial_fail_reason(), "handshake") ? DM_REFUSED : DM_CONNECT_FAIL, dialmem_now());
                 if(nfd>=0){
                     strncpy(mux_out_host[mux_n_out], srcpool[ci], 127);
-                    mux_out_fd[mux_n_out]=nfd; txrelay_leg_reset(nfd); mux_out_kind[mux_n_out] = host_is_block_only(srcpool[ci]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
+                    mux_out_fd[mux_n_out]=nfd; txrelay_leg_reset(nfd); leg_note_installed(mux_n_out); mux_out_kind[mux_n_out] = host_is_block_only(srcpool[ci]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
                     mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
                     mux_out_peer[mux_n_out]=ci;
                     anchor_locator(mux_out_loc[mux_n_out]);
@@ -7957,7 +8047,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 int nfd = outbound_connect(host, 300, out_port);
                 if(nfd >= 0){
                     strncpy(mux_out_host[mux_n_out], host, 127);
-                    mux_out_fd[mux_n_out] = nfd; txrelay_leg_reset(nfd); mux_out_kind[mux_n_out] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL;
+                    mux_out_fd[mux_n_out] = nfd; txrelay_leg_reset(nfd); leg_note_installed(mux_n_out); mux_out_kind[mux_n_out] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL;
                     mux_out_wants_v2[mux_n_out] = (unsigned char)g_peer_wants_addrv2;
                     mux_out_peer[mux_n_out] = 0;
                     anchor_locator(mux_out_loc[mux_n_out]);
