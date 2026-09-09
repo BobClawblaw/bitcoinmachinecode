@@ -1,64 +1,74 @@
-# macOS / Apple Silicon Port Roadmap — bitcoinmachinecode
+# OSX Port Roadmap — per-module status
 
-Goal: run this project NATIVELY on Apple silicon (AArch64 + macOS/Darwin) by
-rewriting the 62 x86-64 assembly modules (~50k LOC) in Apple-clang AArch64
-assembly, one at a time, each validated against the repo's own C oracles /
-test vectors / differential fuzz. The daemon C is portable and links these
-modules, so once the symbols the daemon uses exist as Mach-O AArch64
-objects, the daemon links and runs natively on macOS.
+Companion to `OSX_STRATEGY.md` (phases) and `OSX_PORT.md` (branch model).
+A module is DONE only when its gate runs natively on this Mac: build +
+repo-harness-equivalent run + differential verification (fuzz vs C twin /
+Python oracle), with both code paths exercised where a dispatcher exists.
 
-Read `port/OSX_PORT.md` first for the branch/sync model. The plan-of-record
-for the whole port — phases, PR naming, risks — is
-[`port/OSX_STRATEGY.md`](OSX_STRATEGY.md). Worklog:
-`worklog/YYYY-MM-DD.md`; long-form engineering record: `docs/devlog/LOG.md`.
+## Phase 0 — build bridge
+- [x] Toolchain proof: Mach-O AArch64 object assembles under Apple clang
+      21 (`cc -arch arm64`), links with repo C, runs natively. (2026-09-09)
+- [x] Darwin-ism inventory for the .S layer: `_`-prefixed globals,
+      `adrp+@PAGEOFF` (no GOT for same-file data), no `.type/.size/
+      .note.GNU-stack`, x18/x28 forbidden (platform regs), sp 16-aligned
+      at every `bl`, sysctl instead of EL0-trapping MRS probes. (2026-09-09)
 
-## Toolchain (verified 2026-09-09)
-- Apple clang 21.0.0 (`cc`) — assembles .S with Mach-O AArch64.
-- Build target: `port/osx/` objects + repo C, linked against the repo
-  harnesses. Keep names/symbols identical to upstream so nothing else
-  changes.
+## Phase 1 — pure-compute modules
+- [x] sha256   -> port/osx/sha256.S   DONE 2026-09-09. Evidence:
+      16-check osx gate 0 failures (KATs; boundary lens 55/56/57/63/64/119/120
+      vs hashlib; 2x2000 random-length fuzz vs hashlib through BOTH bodies;
+      5000 random state/block pairs scalar-vs-accelerator bit-identical;
+      dispatcher/probe contract) + upstream CRY-6 harness 7/7 ok. Two Darwin
+      bugs caught and fixed by the gate: (1) 8-byte x30 push in the probe
+      left sp misaligned at a call site -> stp x29,x30; (2) test's own
+      oracle first deadlocked on popen stdin (pipe never hit EOF) ->
+      file-based batched oracle, and second: python -c cannot run a
+      compound `while` statement on one line -> newline-separated helper.
+- [ ] bitcoin_hash (sha256d/block_hash/diff_target/pow_check) — needs sha256
+- [ ] sha1, sha512, ripemd160, bech32, base32
+- [ ] secp256k1_fe / _point / _glv_c / _point_ct / _scalar / _scalar_c /
+      _ecdsa (+ taproot _taproot/_schnorr when upstream main carries them)
+- [ ] bitcoin_hmac, aes (wallet_crypter deps), bip39
+- [ ] bitcoin_tx (parser), bitcoin_p2p (codec), bitcoin_pubkey, bitcoin_keys
+- [ ] bitcoin_sighash, bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
+- [ ] bitcoin_interp, bitcoin_scriptcodec, bitcoin_script_flags,
+      bitcoin_script, bitcoin_multisig, bitcoin_cons
+- [ ] bitcoin_chainwork, bitcoin_muhash (compute parts), bip32 family
 
-## Method (inherited, proven on arm-port)
-1. Read the upstream `asm/<name>.asm` to capture the EXACT public ABI +
-   semantics (SysV amd64 rdi/rsi/rdx -> AAPCS64 x0/x1/x2; bswap -> rev).
-2. Write `port/osx/<name>.S` exposing identical symbols so existing C
-   harnesses / daemon link UNCHANGED.
-3. Build native: `cc -c <name>.S` (Mach-O), link the repo C harness, run it.
-4. Differential-verify against the C twin / Python oracle over thousands of
-   random vectors.
-5. Mark DONE only when the repo's suite + differential checks pass natively.
+## Phase 2 — syscall-carrying modules (Darwin syscall rework)
+Heavy svc counts from the x86 .asm (measured 2026-09-09):
+- [ ] bitcoin_utxo_lsm (65), bitcoin_store (51), bitcoin_utxo_store (31)
+- [ ] bitcoin_idxscan (19), bitcoin_undo (17), bitcoin_store_fast (15)
+- [ ] bitcoin_net (9: raw-socket syscalls, x86 arg4-in-R10 -> Darwin x3),
+      bitcoin_headers (6), bitcoin_addrmgr (6), bitcoin_idx (5)
+- [ ] bitcoin_cli (2), bitcoind (2), node_log (1), bitcoin_serve (1)
+Darwin syscall deltas to apply per site: `svc #0x80`, nr in x16, args x0-x7,
+error = negative errno in x0 with carry set (b.cs); fdatasync sites that
+mean durability -> F_FULLFSYNC via fcntl; C shims (_bmcshim_*) only where no
+Darwin twin exists, each shim noted here with its justification.
 
-## Darwin vs Linux-AArch64 deltas (the reason this is a fresh port, not arm-port)
-- Mach-O, not ELF: no `.note.GNU-stack`, different section directives
-  (`.section __TEXT,__text`), symbol scaffolding (`_` prefix on symbols,
-  `.globl _name`).
-- Syscalls: Linux `svc #0` (nr in x8, args x0-x5, carry-flag error
-  convention) -> Darwin `svc #0x80` (nr in x16, args x0-x7, returns
-  +errno in x0 with carry bit set on error via `b.cs`). Library calls via
-  `bl _symbol` preferred where possible.
-- x28 is the platform register (APFS/TSD) — never use it as a callee-saved
-  work register (arm-port used x28-based frames).
-- x18 reserved (platform); red zone differs; stack 16-byte aligned and LR
-  must be saved at callsites (Mach-O contract).
-- PIC required: page-relative adrp/add + GOT loads for extern symbols.
+## Phase 3 — daemon
+- [ ] link all port/osx objects + daemon C into bmcbitcoind (macOS)
+- [ ] darwin_compat.h: prctl(PR_SET_PDEATHSIG)->fork-getppid poll,
+      prctl(PR_GET_NAME)->pthread_getname_np (coinstats_index.c, log_ts.h)
+- [ ] regtest IBD green, then signet/testnet4
 
-## Status
-(No modules ported yet. Copy the arm-port module list as the checklist and
-mark each with: -> IN PROGRESS -> DONE (date, verification evidence).)
+## Phase 4 — parity
+- [ ] differential run vs x86 reference (Linux container on this Mac)
+- [ ] parity sweep summary "pass N" rows verified actually-run
+      (ENGINEERING_RULES: link-check once ran 0 tests silently)
 
-## Git identity hard rule (private companion file)
-
-**Never commit as any real-world name — all commits are
-`BobClawblaw <BobClawblaw@users.noreply.github.com>`** (author AND
-committer). Git silently falls back to the OS account when
-`user.name`/`user.email` are unset; that bit us once in bmc_osx round 0
-(2026-09-09) and was caught before push. Config is set globally and
-repo-local. Details live in the gitignored `docs/PROJECT_LOCAL_RULES.md`
-(kept out of the repo because it names the identity), plus a pre-push
-`git log --format='%an <%ae> | %cn <%ce>'` check on every new commit.
-
-## Verification gates before any merge/deploy
-- Native build of touched module + repo harness run.
-- Differential fuzz vs C twin / Python oracle (thousands of vectors).
-- Relevant arm-port parity notes used as the expected-behavior reference.
-- Worklog + OSX_ROADMAP updated in the same commit as status changes.
+## Recurring Darwin .S pitfalls (found during p0, in this tree)
+- sp must be 16-byte aligned AT EVERY bl SITE: an 8-byte lone x30 push
+  misaligns it (the arm-port did this; guardmalloc kills it on macOS).
+  Use `stp x29, x30, [sp,#-16]!` / `ldp x29, x30, [sp], #16`.
+- x18 and x28 are platform-reserved on macOS — never temps (arm-port used
+  w27/w28 freely; all temps moved to x9-x15/w4-w8 here).
+- adrp+@PAGEOFF for same-file data; `:got:` relocs are ELF-only.
+- MRS of ID_AA64ISAR0_EL1 traps at EL0 on macOS; feature probes go through
+  sysctlbyname ("hw.optional.arm.FEAT_SHA256" etc.).
+- Mach-O: every exported symbol is `_name`; no .type/.size/.note.GNU-stack;
+  sections __TEXT,__text / __DATA,__data / __TEXT,__cstring.
+- python -c one-liners can't carry a compound while-statement on a single
+  line (syntax error at the second simple statement) — newline-join or
+  ship a helper .py file next to the harness.
