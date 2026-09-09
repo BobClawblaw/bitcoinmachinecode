@@ -453,3 +453,6 @@ asm/daemon/bmc_utxo_probe_one
 
 # ---- Private project rules (local-only; contains identity info, never push) ----
 docs/PROJECT_LOCAL_RULES.md
+
+# ---- osx port build scratch (binaries + run logs) ----
+port/osx/daemon_out/
