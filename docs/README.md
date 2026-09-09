@@ -49,6 +49,19 @@ response to it.
 | [`audits/UTXO_INLINE_BUILD_PERF_SCOPE.md`](audits/UTXO_INLINE_BUILD_PERF_SCOPE.md) | the 3-hour gap to Core measured by the 2026-09-04 benchmark: connect runs after the download instead of inside it; the worker idles 19.5 h while its helpers download; interleaving connect into that loop is the fix, with the rate analysis, levers and the re-run as proof |
 | [`audits/UTXO_CACHE_MODEL_SCOPE.md`](audits/UTXO_CACHE_MODEL_SCOPE.md) | scope: Core's in-RAM cache-and-flush model mapped onto our memtable/runs -- no WAL and size-triggered flushes in bulk mode only (readers need the WAL at the tip), tiered compaction, archive redo as recovery; additive to the interleave, decided by its instrumentation |
 
+## Porting (AArch64)
+
+The ARM port lives under [`../port/`](../port/), not here, because it is a
+branch with its own tree of native sources and harnesses rather than a
+document set. Indexing it here so it is findable:
+
+| | | |
+|---|---|---|
+| [`../port/ARM_PORT.md`](../port/ARM_PORT.md) | branch and sync model, layout, how to bring the port up on a new ARM host | 2026-09-08 |
+| [`../port/ARM_STATE_2026-09-08.md`](../port/ARM_STATE_2026-09-08.md) | **current status**: the port is paused with the ARM host reassigned; exact state at the halt, ranked open defects with repros, what a Raspberry Pi can carry | 2026-09-08 |
+| [`../port/PORT_ROADMAP.md`](../port/PORT_ROADMAP.md) | per-module port status and the verification method behind each `[x]` | 2026-09-08 |
+| [`../TODO.md`](../TODO.md) | the open board, halt banner first | 2026-09-08 |
+
 ## Reports
 
 [`reports/`](reports/) holds findings written to be read outside the

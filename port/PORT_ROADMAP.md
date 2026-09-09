@@ -794,3 +794,73 @@ STILL OPEN after the series:
 - [ ] bitcoind.S: the CC-2 hook table exists as data symbols but the mux does not
       CALL them -- no sendcmpct announcement after verack, no hook-selected
       getdata type. The x86 daemon has both.
+
+## 2026-09-08 (end of day) — ARM work PAUSED on xspark04; host reassigned to an LLM
+
+The operator took this host back for LLM serving (vLLM, ~114 of 121 GiB
+committed) and paused the port. `bmc-arm.service` and `bmc-logrotate.timer` are
+`disabled` + `inactive`, so nothing ARM runs here across a reboot. The next
+round is planned on a Raspberry Pi. Full handoff:
+`port/ARM_STATE_2026-09-08.md`; the day's narrative: `worklog/2026-09-08.md`
+sessions 2-5.
+
+What the port can now do, proven live on AArch64 rather than inferred:
+
+- [x] **A complete fresh mainnet download, from genesis, on the ARM binary.**
+      612,660 blocks in 6,434.59 s (~95 blk/s) to `966118/966123 stored
+      (100.00% of real tip)`, 0 invalid, no holes — the per-chunk committer,
+      the packed undo store and the fresh-datadir seeding path all exercised on
+      a 746 GB store built from nothing. (arm-14 + the radix suspension.)
+- [x] **The UTXO build survives being stopped mid-flight, twice.** Both the
+      22:06 UTC restart and the 23:27:34 UTC halt logged `stopping catch-up
+      cleanly after height N ... checkpoint persisted`, and the next boot
+      reloaded at exactly that height (`reload applied_height=354881 ...
+      live=18591768`, manifest_n 21 -> 1 by a pre-catchup compact). Halt state:
+      `applied_height=408166`, `live=36,008,347`.
+- [x] `bmc.utxocompactthreshold=3` committed (2026-09-08, with this file's
+      rationale in the conf). Bulk catch-up had 21 runs so every UTXO get
+      scanned all of them, and the x4 threshold (12 -> 48) meant the background
+      compactor never fired; at 3 the log shows `compaction done in 29.0s
+      (12 run(s) ... full merge; started at height 386192): manifest_n 12 -> 1`.
+      Honest apply rates to plan a host around: 43 blk/s over the light early
+      blocks, 12.3 blk/s over the fat middle WITH compaction firing -- so the
+      remaining ~558k blocks are ~13 h on this box, not the 21-55 min the early
+      light-block ETA suggested (session 3 called that ETA out as naive).
+- [x] Two stale ARM harnesses that had been burning a core each for days
+      (`test_interp_core_vectors` 6 d 4 h, `t_stack` 14 d 6 h with a `(deleted)`
+      executable) are re-verified GREEN against the current tree, so neither is
+      an open defect. Standing hygiene: a rebuild does not stop the copy already
+      running — hunt stale PIDs and read `/proc/<pid>/exe`.
+
+Still open, in the order the next session should take them (detail and repro
+commands in `port/ARM_STATE_2026-09-08.md`):
+
+- [ ] **Stress `mac_rsort_desc` and clear the radix suspension.** It is the
+      prime suspect for the fresh-sync boot-loop SEGV (5 of 6 radix boots
+      crashed 35-90 s in; the single merge boot ran clean; gdb showed a
+      corrupted frame on an unrelated thread). `mac_sort_mode` defaults to
+      merge on ARM ONLY until this is settled — a deliberate divergence from
+      x86, documented in the comment above the symbol in
+      `port/arm64/bitcoin_utxo_lsm.S`. Synthetic `test_lsm_flush_sort_diff`
+      passing byte-identical is NOT the evidence needed: build the
+      production-shaped randomized array harness (odd n, heavy tombstones,
+      repeated calls reusing the .bss counts) and run radix vs merge.
+- [ ] Root-cause `[check] block data is NOT laid out monotonically (first break
+      at height 353881) -- truncation and pruning will refuse to run`, printed
+      on every boot of the fresh store, 0 holes / 1 problem. Either the
+      committer laid a chunk out of order or the monotonic check is wrong about
+      a legal interleaving. Until then prune and truncate are dead on ARM.
+- [ ] Finish the UTXO build to the tip (~558k blocks, ~13 h at the measured
+      rate) **on a host that has the archive** — i.e. `xspark04` in a scheduled
+      window, not a Pi — then run `validation/muhash_vs_core.sh` at a matched
+      height, which is the last unclaimed proof in "Remainder for stable
+      IBD+tip".
+- [ ] bitcoind.S CC-2: the hook table exists as data symbols; the mux still
+      never calls it (no sendcmpct after verack, no hook-selected getdata type).
+- [ ] Re-establish the rollback-per-build rule: `daemon_out/rollback/` stops at
+      `bitcoind.pre-arm13-20260908` (arm-12), so the running candidate has no
+      one-`cp` rollback.
+- [ ] First job on the Pi: `bash port/arm64/parity_sweep.sh` and reproduce the
+      round-44b baseline (pass 376 / fail 4 env-only / 398 of 434). Host
+      portability is the test; anything that differs is the finding. Timing
+      numbers from a Pi are their own row — never compare them to xspark04/x86.

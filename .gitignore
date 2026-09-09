@@ -457,3 +457,11 @@ asm/daemon/utxo_setinfo
 asm/daemon/bmc_build_block_filters
 asm/daemon/bmc_build_tx_index
 asm/daemon/bmc_utxo_probe_one
+
+# 2026-09-08: parity_sweep.sh symlinks the ARM-built tools back into asm/daemon so the
+# shared harnesses find them. Build outputs, not sources.
+/asm/daemon/bitcoin_cli
+/asm/daemon/bmc_build_addr_hist
+
+# agent scratch: pi-goal-task / pi-long-task run dirs (regenerated, never source)
+/tmp/

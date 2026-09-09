@@ -540,6 +540,9 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
 | [`docs/audits/`](docs/audits/) | external security audits and the project's responses |
 | [`docs/devlog/`](docs/devlog/) | development log: incident log, plans, benchmarks, assessments |
 | `worklog/` | dated development action logs |
+| [`port/ARM_PORT.md`](port/ARM_PORT.md) | the AArch64 (ARM64) port: branch and sync model, current status, how to resume it on a new machine |
+| [`port/ARM_STATE_2026-09-08.md`](port/ARM_STATE_2026-09-08.md) | the ARM port's state at its 2026-09-08 pause: what has been proven live on ARM, the ranked open defects, and what a small ARM host can carry |
+| [`port/PORT_ROADMAP.md`](port/PORT_ROADMAP.md) | per-module AArch64 port status and how each module was verified |
 | [`config/bitcoin.sample.conf`](config/bitcoin.sample.conf) | every configuration key at its default |
 | [`validation/`](validation/) | differential test corpus and oracle scripts against Bitcoin Core |
 
@@ -557,3 +560,12 @@ landing notes in [`docs/releases/`](docs/releases/) record each change and
 the run that measured it; the daily record is in [`worklog/`](worklog/).
 mempool.space runs against the production node through the Esplora facade
 ([`docs/MEMPOOL_SPACE.md`](docs/MEMPOOL_SPACE.md)).
+
+The AArch64 port (branch `arm-port`) is at the same stage one step behind:
+every module is ported and differential-verified natively, the full parity
+sweep runs, and on 2026-09-08 a fresh mainnet node built from genesis on ARM
+stored 100% of the chain with zero invalid blocks. It is **paused** as of
+2026-09-08 because the ARM host was reassigned to an LLM workload; its state,
+open defects and resume instructions are in
+[`port/ARM_STATE_2026-09-08.md`](port/ARM_STATE_2026-09-08.md) and
+[`port/ARM_PORT.md`](port/ARM_PORT.md).

@@ -1305,3 +1305,85 @@ mistaken for, or collide with, a Bitcoin Core file on the same box. So:
   (the rename convention held end to end). Monitor the file, not the journal.
 - **Policy change (operator):** deploy new builds AS THEY GATE GREEN -- no more
   holding candidates -- so testing keeps pace with the sync treadmill.
+
+## arm-14 -- 2026-09-08 11:26 CDT -- upstream through #112, and the "old logging" report closed
+
+- **Deployed:** `port/arm64/daemon_out/bmcbitcoind` md5 `49fea96b` — the
+  41-commit `origin/main` merge (PRs #99-#112: behind-peer header handling,
+  announce-cap, the mempool-by-address index, the Esplora facade, 257 lines of
+  `main.c`) on top of arm-13. Main PID 1452612.
+- **Gate:** sweep round 44b on the merged tree — pass 376 / fail 4 (env-only) /
+  398 of 434 plan rows compared.
+- **Verified:** boot clean, UTXO reload 1.01 s, 145 confirmed-live peers,
+  0 invalid, `blocks == headers == 966095`, and the boot-window dial-failure
+  profile matches arm-13's (27 vs 35 EINPROGRESS, 4 v2 connects each) — the low
+  leg count minutes after boot is the same ramp arm-13 showed, not a regression.
+- **The report that drove it was true but not for the reason given.** "debug.log
+  is not using the new log format / production runs different logging" resolved
+  as: the shared C is fine and emits `[boot] logging to <path>` (upstream
+  #94 changed the DESTINATION to `<chaindir>/debug.log`, not the line format),
+  and production really was older code — because arm-13 predated a 41-commit
+  merge that changes `main.c`'s log output. A stale binary, not a fork.
+  Three sweep gaps surfaced by that merge were fixed first (round 44b):
+  `rpc_esplora.c` + `daemon/addr_hist.c` added to the link lists — their absence
+  made the sweep's `rpcd` build fail SILENTLY and four rows test a STALE `rpcd`;
+  `undo_log_ref.o` now compiles the FROZEN `tests/undo_log_ref.c` instead of the
+  live `daemon/undo_log.c`; `bmc_build_addr_hist` built + symlinked for the new
+  row. `build_daemon.sh` also learned to link to `.bmcbitcoind.new` and adopt it
+  with `mv(2)` — renaming over a running daemon's path is legal, in-place gcc
+  is ETXTBSY.
+- **Rollback:** `daemon_out/rollback/bitcoind.pre-arm13-20260908` (md5
+  `cfe86ed4` = arm-12), unit backup `/etc/systemd/system/bmc-arm.service.pre-arm13-20260908`.
+
+## the same binary, superseded -- 2026-09-08 12:58 CDT -- the radix default suspended
+
+- `mac_sort_mode` now defaults to **0 (merge) on ARM**, diverging from x86
+  (radix), because the fresh-sync boot loop crashed 5 of 6 boots with radix on
+  and the one merge boot ran clean. `bitcoin_utxo_lsm.S`, the `.o` and
+  `bmcbitcoind` all carry a 12:58 timestamp, so the running binary
+  (`ecd78965a2a862a06041d36a4093d954`) is arm-14 + the suspension. This is a
+  SUSPENSION, not a fix — `mac_rsort_desc` is still the prime suspect for an
+  intermittent, production-shaped corruption; see the incident note above the
+  symbol and `port/ARM_STATE_2026-09-08.md` item 1.
+- **Rollback discipline lapsed here, and it should not have.** The candidate was
+  rebuilt in place, so arm-13's image (`a80f869b`) was overwritten rather than
+  retired: `rollback/` still stops at `bitcoind.pre-arm13-20260908` (= arm-12)
+  and there is no one-`cp` rollback from what was actually running. First deploy
+  on the new host must restore the rule.
+- **Privilege change (session 3, still in force):** the unit's `User=root` —
+  deliberate at the time, line 9 — became `User=xian`/`Group=xian` with `data/`
+  chowned to match, because a parser SEGV during boot as root is a compromise
+  rather than a crash. Keep it on any replacement host.
+- **Unit bug left open on purpose:** `/etc/systemd/system/bmc-arm.service:15`
+  warns `Unknown key name 'StartLimitIntervalSec' in section 'Service'` on every
+  reload. The key belongs in `[Unit]`, so the intended
+  `StartLimitIntervalSec=0` has never actually applied. Fix when the unit is next
+  edited.
+
+## HALT -- 2026-09-08 18:30 CDT -- the ARM node is off this box, and the box is not ARM's any more
+
+- **Operator decision:** this host exists to serve an LLM; `bmcbitcoind` was
+  competing with it (6.8 GB RSS and 44% of a core while 114 of 121 GiB sat
+  committed to the LLM with swap in use). Port work moves to a Raspberry Pi.
+- **Stopped and DISABLED:** `bmc-arm.service` (`stop` + `disable`) and
+  `bmc-logrotate.timer` (`disable --now`). Both verified `disabled`/`inactive`,
+  gone from `multi-user.target.wants/` / `timers.target.wants/`, no bmc timer
+  scheduled, and `list-dependencies --reverse bmc-arm.service` shows nothing
+  else pulls it in. Unit files and the `LimitCORE=infinity` drop-in are untouched
+  on disk, so the state is one `systemctl enable --now bmc-arm.service` from
+  being what it was.
+- **Why `pkill` is not a stop here:** `Restart=always` / `RestartSec=15` brought
+  the node back 14 s after the first kill. Any operator hunting this node must
+  use `systemctl stop` (or the unit is what gets found again).
+- **What the node was doing when it stopped** (read from `data/main/debug.log`,
+  UTC; CDT = UTC-5): the block archive was **finished** — `catch-up done: 612660
+  new blocks written (6434.59s)`, `966118/966123 stored (100.00% of real tip)`,
+  0 holes — and the **UTXO build** was in flight: `stopping catch-up cleanly
+  after height 408166 ... checkpoint persisted`, `live=36,008,347`. The store is
+  consistent and resumes at that height. `data/main` = 746 GB; the pre-wipe
+  rollback `data/main.pre-fresh-20260908` = 731 GB.
+- **No data, binary, unit or commit was destroyed.** Off the box: four
+  runaway ARM-build processes (two of them harnesses that had been spinning a
+  core each for 6 and 14 days — both re-verified green against the current tree,
+  so neither is an open bug) and an orphaned journal-watch loop. Everything the
+  next session needs is in `port/ARM_STATE_2026-09-08.md`.

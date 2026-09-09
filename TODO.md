@@ -1,8 +1,27 @@
-# TODO — arm-port state after 2026-09-07 (IR series CLOSED, origin/main merged through bf4ecd83, round 32 green: pass 370 / fail 4 env-only, and **arm-12 is DEPLOYED**)
+# TODO — arm-port state at the 2026-09-08 HALT (**PAUSED: the ARM host was reassigned to an LLM; next round moves to a Raspberry Pi**)
 
-Everything below is landed on `arm-port` and pushed. History lives in
-`worklog/2026-09-0{1,2,3}.md`; the per-module port status is
-`port/PORT_ROADMAP.md`.
+Everything below is landed on `arm-port` and pushed. Per-module port status is
+`port/PORT_ROADMAP.md`; the day-by-day record is `worklog/YYYY-MM-DD.md`.
+
+> ## STOP AND READ THIS FIRST
+>
+> As of 2026-09-08 18:30 CDT **no ARM work runs on `xspark04`.** The operator
+> took the box back for LLM serving; `bmc-arm.service` and
+> `bmc-logrotate.timer` are `disabled` + `inactive` (unit files untouched, so
+> `systemctl enable --now bmc-arm.service` restores it exactly). Nothing was
+> deleted: `arm-port` @ `9e2a7d60`, `port/arm64/daemon_out/bmcbitcoind` md5
+> `ecd78965…`, and 1.5 TB of chain data are all in place.
+>
+> **[`port/ARM_STATE_2026-09-08.md`](port/ARM_STATE_2026-09-08.md)** is the
+> handoff: exact state at the halt, ranked open defects with repro commands,
+> and what a Raspberry Pi can and cannot carry. Its headline corrects the last
+> entry in `worklog/2026-09-08.md` (“39.11% and climbing”): the mainnet
+> **download finished** — `966118/966123 stored (100.00% of real tip)`, 0
+> holes, 746 GB — and what was still running is the **UTXO build**, halted
+> cleanly with a persisted checkpoint at `applied_height=408166`,
+> `live=36,008,347` (~42% of the chain, ~13 h of apply left at the measured
+> 12.3 blk/s). That remainder is compute, not bandwidth, and it does not fit a
+> Pi: it needs the 746 GB archive, i.e. a scheduled window on this box.
 
 ## Done since the last TODO (details in the worklogs)
 - [x] **The 2026-09-05 upstream batch port — CLOSED 2026-09-06, round 29
@@ -43,6 +62,56 @@ Everything below is landed on `arm-port` and pushed. History lives in
       mutations / 7,805 interpreter probes, 0 divergences, 0 engine failures.
 
 ## Open (next sessions)
+
+### Fresh from the 2026-09-08 halt — take these before the older items below
+
+- [ ] **Stress `mac_rsort_desc` and settle the radix suspension (item 1).** The
+      radix flush sort is the prime suspect for the fresh-sync boot-loop SEGV
+      (5 of 6 radix boots died 35-90 s in; the one merge boot ran clean; gdb
+      found a corrupted frame on an unrelated thread, `si_addr = 0x0`).
+      `mac_sort_mode` defaults to merge **on ARM only** until this is settled
+      — a deliberate divergence from x86, documented above the symbol in
+      `port/arm64/bitcoin_utxo_lsm.S`. `test_lsm_flush_sort_diff` passing
+      byte-identical on synthetic arrays is NOT the needed evidence; build the
+      production-shaped randomized harness (odd n, heavy tombstones, repeated
+      calls reusing the `.bss` per-depth counts). Silent-corruption-shaped, and
+      the reason radix is off is that we could not prove it innocent.
+- [ ] **Root-cause the monotonic-layout `[check]`** printed on every boot of
+      the fresh store: `block data is NOT laid out monotonically (first break
+      at height 353881) -- truncation and pruning will refuse to run`, with
+      `0 hole(s), 1 problem(s)`. The archive is complete and hash-checked, so
+      either the per-chunk committer landed a chunk out of order or the check
+      is wrong about a legal interleaving. Today it disables prune/truncate on
+      ARM, which also blocks any pruned-mode test on the Pi.
+- [ ] **First job on the Pi: reproduce sweep round 44b** (`bash
+      port/arm64/parity_sweep.sh`; baseline pass 376 / fail 4 env-only / 398 of
+      434). A new host earns trust by reproducing the sweep, not by booting the
+      daemon. Do not compare its timings against xspark04 or x86 rows — give
+      it its own baseline column.
+- [ ] **Restore rollback-per-build discipline on the first deploy there.**
+      `daemon_out/rollback/` stops at `bitcoind.pre-arm13-20260908` (= arm-12);
+      arm-13 and the running `ecd78965` candidate were written over in place,
+      so the live build has no one-`cp` rollback.
+- [ ] **Finish the UTXO build to the tip, then MuHash parity vs Core** —
+      ~558k blocks, ~13 h at 12.3 blk/s, only on a host holding the archive
+      (a window here), then `validation/muhash_vs_core.sh` at a matched height.
+      This is the last unclaimed proof under “Remainder for stable IBD+tip”.
+- [ ] Fix `/etc/systemd/system/bmc-arm.service:15`: `StartLimitIntervalSec=0`
+      sits in `[Service]`, so systemd warns and IGNORES it — the intended key
+      belongs in `[Unit]`. Cosmetic today, wrong if a crash-loop ever matters.
+- [ ] Decide the future of the two dead stores before the Pi work needs disk:
+      `data/main` (746 GB, complete archive + UTXO at 408166) and
+      `data/main.pre-fresh-20260908` (731 GB, the pre-wipe tip-synced store,
+      `live=165,321,036`). 1.8 TB free today; nothing was deleted at the halt.
+- [x] **CLOSED at the halt, do not re-open:** the two 100%-CPU ARM harnesses
+      found running for days (`test_interp_core_vectors` 6 d 4 h,
+      `t_stack` 14 d 6 h with a `(deleted)` executable) are NOT defects. Both
+      re-verified against the current tree on 09-08: `test_interp_core_vectors`
+      -> `ALL PASS (0 failures)`; `t_stack` on the exact 7-op script that had
+      spun -> `d=2 / t:11 / s2:22`, exit 0. The real finding is hygiene: a
+      rebuild does not stop the running copy — hunt stale PIDs and read
+      `/proc/<pid>/exe` for `(deleted)`.
+
 - [x] **DEPLOYED arm-12 (2026-09-07 02:37Z).** Candidate md5 `cfe86ed4`, rollback
       `port/arm64/daemon_out/rollback/bitcoind.pre-arm12-20260907` (md5 `36250f97`, the
       round-29 build) — one `cp` + `systemctl restart bmc-arm` to undo it. Gate: sweep
