@@ -4,6 +4,19 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-09 — p0 landed: sha256 is the first native module
+
+- `port/osx/sha256.S` (Mach-O AArch64, 7 public symbols) + native gate
+  `port/osx/tests/test_sha256_osx.c` (16 checks, 0 failures) + upstream
+  `test_cry6_sha_paths.c` linked unchanged against the Mach-O object (7/7).
+  Upstream C compiled untouched; only the x86-only CPUID section of
+  test_sha256.c needed replacing (Darwin has no CPUID) — the osx gate
+  replaces it with a sysctl cross-check. Full evidence in OSX_ROADMAP.md.
+- Recurring-pitfall list started in OSX_ROADMAP.md (sp alignment at bl
+  sites, x18/x28 reserved, @PAGEOFF, sysctl probes, python -c limits).
+- Next: bitcoin_hash (sha256d/block_hash/diff_target/pow_check) on top of
+  the proven sha256, then sha1/sha512/ripemd160.
+
 ## 2026-09-09 — strategy locked: native port, phased, PR-per-layer
 
 - `port/OSX_STRATEGY.md` merged via PR #130: port-don't-emulate decision,
