@@ -2358,10 +2358,15 @@ static int outbound_connect_raw(const char* host, int rcv_ms, int out_port){
      * tally (daemon/addr_self.c) */
     { extern void addrself_note_peer_view(const unsigned char*, long);
       addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
-    /* handshake done: tighten the recv bound so each node_sync pass returns
-     * promptly when the peer is already at the chain tip */
-    struct timeval t2; t2.tv_sec=rcv_ms/1000; t2.tv_usec=(rcv_ms%1000)*1000;
-    setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
+    /* 2026-09-09: this used to re-apply the dial's 300 ms read bound AFTER the
+     * handshake ("so each node_sync pass returns promptly at the tip"), which
+     * undid leg_settle_socket above and gave the drains 2.4 s where their tick
+     * counts were written for 24 s / 60 s -- production on snapshot k still
+     * showed "where=3 in 2.4s". A peer at the tip answers getheaders at once,
+     * so the tick only matters for a silent peer, and a silent peer now costs
+     * 24 s a pass and three passes, then the dial memory holds it off. Core
+     * waits minutes for headers. The socket stays at LEG_READ_TICK_S. */
+    (void)rcv_ms;
     return fd;
 }
 
