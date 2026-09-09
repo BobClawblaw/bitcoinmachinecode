@@ -11,4 +11,4 @@ The rest of the audit, for the record:
 
 ---
 
-PR_LINE
+PR #131 (`batch/2026-09-09-no-input-cap`), merged 01:58Z as `6a3064c0`; tag `no-input-cap-2026-09-09`.

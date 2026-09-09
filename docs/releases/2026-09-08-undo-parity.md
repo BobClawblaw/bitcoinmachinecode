@@ -9,4 +9,4 @@ Two lies below production's undo boundary (965,826, where its rev files begin), 
 
 ---
 
-PR_LINE
+PR #126 (`batch/2026-09-08-undo-parity`), merged 2026-09-09 00:03Z as `212d3d84`; tag `undo-parity-2026-09-08`.
