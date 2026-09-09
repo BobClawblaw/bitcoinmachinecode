@@ -100,3 +100,15 @@ tx epilogue leak); (3) my MULACC expansion dropped the hi term into the
 carry chain (cur[k+1] += hi + c, then propagate) — the x86 macro did the
 same math but the ARM rewrite skipped it. Commit 131e5171 on osx/p1-scalar,
 merged to bmc_osx (2e7b1f07).
+
+## 2026-09-09 — bitcoin_hmac native + sha512.S caller-frame corruption fix
+port/osx/bitcoin_hmac.S: hmac_sha512 native (CRY-4 frame-local buffers,
+WAL-3 zeroise).  The 400-vector differential vs .242 exposed a REAL bug in
+port/osx/sha512.S: the 128-bit BE length field zero loop ran with x13 =
+carrier+120 and offsets 112..127, writing carrier[232..247] — outside the
+sha512_full frame.  When rem>=112 (two-block pad path) the carrier is pad1
+at its_sp+0xc0, so the stray writes hit the CALLER's frame at caller_sp+8..
++23, zeroing hmac's kpad[8..23] and corrupting any HMAC with keylen>=16 and
+msglen in 112..127/255 (symptom: only some vectors fail, key-length
+dependent).  Fix: offsets -8..7 from x13.  sha512_NIST 4/4 re-verified;
+400/400 byte-identical after the fix.  Commit da3f4b6d.
