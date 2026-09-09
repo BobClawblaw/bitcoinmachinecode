@@ -112,3 +112,15 @@ at its_sp+0xc0, so the stray writes hit the CALLER's frame at caller_sp+8..
 msglen in 112..127/255 (symptom: only some vectors fail, key-length
 dependent).  Fix: offsets -8..7 from x13.  sha512_NIST 4/4 re-verified;
 400/400 byte-identical after the fix.  Commit da3f4b6d.
+
+## 2026-09-09 — bitcoin_bip39 native; bitcoin_aes already pure C
+port/osx/bitcoin_bip39.S: all four ABI functions native + wordlist_gnu.inc
+(the 2048x9 table in __TEXT,__const — __cstring gets tail-merged by the
+Darwin linker and silently shifts fixed-width records).  Two port bugs the
+gate caught: (1) find_word_index clobbered x22/x23 (unsaved callee-saved in
+that helper) destroying the caller's token pointer after the first word —
+every mnemonic invalid; (2) the parse tail (entropy extract + checksum
+compare) initially fell through to the epilogue returning garbage.  Gate:
+test_bip39 24-vector oracle round + WAL-11 canary + negatives, ALL PASS,
+same harness green on x86.  bitcoin_aes: pure C upstream, test_aes passes
+natively unchanged.  Commits 0c259e99.
