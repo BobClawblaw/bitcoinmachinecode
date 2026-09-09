@@ -21,6 +21,9 @@ extern void point_add_mixed_zr(u64 r[12], const u64 p[12], const u64 xy[8], u64 
 extern void point_scalar_mul(u64 r[12], const u64 xy[8], const u64 k[4]);
 extern void point_scalar_mul_fixed(u64 r[12], const u64 k[4]);
 extern void point_scalar_mul_glv(u64 r[12], const u64 xy[8], const u64 k[4]);
+extern void pointh_add(u64 r[12], const u64 p[12], const u64 q[12]);
+extern void pointh_double(u64 r[12], const u64 p[12]);
+extern void point_scalar_mul_ct(u64 r[12], const u64 xy[8], const u64 k[4]);
 static u64 p[12], q[12], xy[8], k[4], r[12], zr[4];
 static int rd(void* v, size_t n){ return fread(v,1,n,stdin)==n; }
 int main(void){
@@ -34,6 +37,9 @@ int main(void){
         else if (op==4){ if(!rd(xy,64)||!rd(k,32))break; point_scalar_mul(r,xy,k); fwrite(r,8,12,stdout); }
         else if (op==5){ if(!rd(k,32))break; point_scalar_mul_fixed(r,k); fwrite(r,8,12,stdout); }
         else if (op==6){ if(!rd(xy,64)||!rd(k,32))break; point_scalar_mul_glv(r,xy,k); fwrite(r,8,12,stdout); }
+        else if (op==7){ if(!rd(p,96)||!rd(q,96))break; pointh_add(r,p,q); fwrite(r,8,12,stdout); }
+        else if (op==8){ if(!rd(p,96))break; pointh_double(r,p); fwrite(r,8,12,stdout); }
+        else if (op==9){ if(!rd(xy,64)||!rd(k,32))break; point_scalar_mul_ct(r,xy,k); fwrite(r,8,12,stdout); }
     }
     return 0;
 }

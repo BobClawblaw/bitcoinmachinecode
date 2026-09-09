@@ -61,5 +61,8 @@ for i in range(NREC):
         out.append(4); out += axy + pack_fe(k)
         out.append(5); out += pack_fe(k)
         out.append(6); out += axy + pack_fe(k)
+        out.append(9); out += axy + pack_fe(k)
+    out.append(7); out += pj + qj
+    out.append(8); out += pj
 sys.stdout.buffer.write(bytes(out))
 print(f"wrote {NREC} shapes", file=sys.stderr)
