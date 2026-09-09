@@ -84,3 +84,19 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
   register twice; pop odd slots with ldr + explicit sp adjust.
 - Delegation note: parallel subagent waves time out on this provider (5-12
   API calls in 600s). Porting proceeds serially, coordinator-owned.
+
+## 2026-09-09 — secp256k1_scalar native: 2,306-vector x86-diff byte-identical
+port/osx/secp256k1_scalar.S: sc_add/sc_sub/sc_sqr/sc_inv/sc_inv_var/
+sc_mul_512/sc_split_lambda native AArch64. sc_mul + sc_mul_512 currently
+route to proven C twins (port/osx/sc_mul_c.c, sc_mul_512_c.c) — the AArch64
+asm fold drops a DELTA on dense products; root-cause later, C twins are the
+correctness baseline. Gates: test_scalar 12/12, test_glv_split 3 campaigns
+(1,001,018 + 1,000,000) 0 failures, cross-arch dsl diff vs .242 byte-identical
+(800 mul_512/split + 1500 mul/add/sub vectors). Three port bugs the gates
+caught: (1) add/adc vs adds/adcs — AArch64 add/adc do NOT write NZCV, every
+carry chain needs adds/adcs; (2) sc_mul_512/split frames were aliased over
+active locals until a real `sub sp, sp, #N` was added (same class as the
+tx epilogue leak); (3) my MULACC expansion dropped the hi term into the
+carry chain (cur[k+1] += hi + c, then propagate) — the x86 macro did the
+same math but the ARM rewrite skipped it. Commit 131e5171 on osx/p1-scalar,
+merged to bmc_osx (2e7b1f07).
