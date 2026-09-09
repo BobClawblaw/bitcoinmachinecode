@@ -3279,6 +3279,7 @@ static void dl_save_good_peers_ema(char (*peers)[DL_POOL_SLOT], const double* em
  * the fastest measured peer AT OR ABOVE the bar; else someone never tried;
  * else the fastest measured peer even below the bar (never stall); else the
  * plain rotation. bar 0 is exactly the old rule. */
+#define DLC_EMA_DEAD_MARK 1.0   /* dlc_ema_after_failure's mark for "tried, delivered nothing" (bytes/s) */
 static int dlc_pick_peer(int nlive, int slot, const volatile double* ema,
                          const volatile int* claimed, const volatile int* banned, double bar){
     if(ema){
@@ -3289,7 +3290,12 @@ static int dlc_pick_peer(int nlive, int slot, const volatile double* ema,
             double v=ema[idx];
             if(v>bv){ bv=v; best=idx; }
         }
-        if(best>=0 && (bar<=0.0 || bv>=bar)) return best;   /* someone has speed history, and it clears the bar */
+        /* 2026-09-09 (run 19, stalled at block 560): a peer whose only
+         * history is failure carries the dead mark (1.0, or less after more
+         * failures) and must never clear a bar -- not even the unknown bar
+         * (0) of a fresh sync, where it outranked every untried peer and two
+         * workers went back 200 times to the two peers that closed on them. */
+        if(best>=0 && bv > DLC_EMA_DEAD_MARK && (bar<=0.0 || bv>=bar)) return best;   /* someone has MEASURED speed, and it clears the bar */
         if(best>=0){                                          /* the best known is under the bar: prefer someone untried */
             for(int a=0;a<nlive;a++){
                 int idx=(slot+a)%nlive;
@@ -3698,7 +3704,7 @@ static long g_dlc_cursor_help_ms = DLC_CURSOR_HELP_SECS * 1000L;   /* test seam 
  *  - the help chunk lies on the CLAIM grid (start + k*40), not on
  *    multiples of 40 from zero -- the pass starts at 1 when genesis is
  *    seeded, and a misaligned help straddled two owners' chunks. */
-static double dlc_ema_after_failure(double ema){ return ema > 0.0 ? ema * 0.5 : 1.0; }
+static double dlc_ema_after_failure(double ema){ return ema > 0.0 ? ema * 0.5 : DLC_EMA_DEAD_MARK; }
 static long dlc_fail_backoff_ms(int attempt){ long ms = 200L * (attempt < 1 ? 1 : attempt); return ms > 2000 ? 2000 : ms; }
 static long dlc_help_chunk_lo(long first_hole, long span_start){
     if(first_hole < span_start) return span_start;
