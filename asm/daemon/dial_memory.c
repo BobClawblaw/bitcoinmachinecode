@@ -44,6 +44,7 @@ long dialmem_note_failure(dm_table_t* t, const char* host_port, int kind, long l
     __sync_fetch_and_add(&t->notes, 1ULL);
     e->last = now;
     if (kind == DM_NO_WITNESS){ e->permanent = 1; e->next_ok = now + DM_MAX_S; return -1; }
+    if (e->permanent) return -1;   /* a later failure on a permanent entry does not shorten it (or mislabel it as minutes) */
     if (e->streak < 30) e->streak++;
     long s = dialmem_backoff_s(e->streak);
     e->next_ok = now + s;
