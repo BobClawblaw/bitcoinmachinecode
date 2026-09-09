@@ -10,3 +10,7 @@ Core fills `-dbcache` during initial block download and writes it out when full 
 **Found on the way, left open** (`docs/CORE_DIVERGENCES.md`): under the bulk memtable, `test_utxo_crash_recovery`'s steady-state scenario recovers from a kill mid-block with a live count of 153 against the never-crashed reference's 151, every key identical. The count is the engine's counter, not the set; the set is right. The steady-state variant keeps its small memtable, and the drift is its own item.
 
 The next benchmark run is the measurement: the 634,561 and 800,000 marks against run 19's 6h52m and its 800,000 time, and the apply lag.
+
+---
+
+PR #153 (`batch/2026-09-09-fresh-sync-dbcache`), merged 23:0xZ as `47d97491`; tag `fresh-sync-dbcache-2026-09-09`. Gate MAKE_EXIT 0, 349 passes (the first run failed test_dlc_interleave's lag assertion under load; it keeps the small memtable). Staged as `deploy-20260909p`; live on production from 23:16:38Z (inert there: production is at the tip).

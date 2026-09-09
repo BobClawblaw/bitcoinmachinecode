@@ -24,6 +24,9 @@
  * every inbound child once that's wired up).
  */
 #include "utxo_live_sizing.h"
+#include "utxo_live_compact_policy.h"
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include "genesis_skip.h"
 #include "chainparams.h"
 #include "../script_flags_consts.h"   /* per-chain BIP34 activation heights
@@ -358,6 +361,7 @@ static int manifest_names(u64 run_no){
     for (u64 i = 0; i < g_utxo_lst.manifest_n; i++){ u64 r; memcpy(&r, e + i*16 + 8, 8); if (r == run_no) return 1; }
     return 0;
 }
+static unsigned long g_cmp_deferred = 0;   /* merges deferred because the apply was behind (2026-09-09) */
 static void compact_adopt(int st){
     struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
     double secs = (t1.tv_sec - g_cmp_t0.tv_sec) + (t1.tv_nsec - g_cmp_t0.tv_nsec) / 1e9;
@@ -383,8 +387,8 @@ static void compact_adopt(int st){
             int gone = 0;
             for (int i = 0; i < g_cmp_nin; i++) if (!manifest_names(g_cmp_inputs[i])){ unlink_run(g_cmp_inputs[i]); gone++; }
             long interim = (long)g_utxo_lst.manifest_n - ((long)g_cmp_n_before - g_cmp_nin + 1);   /* runs flushed since fork */
-            fprintf(stderr, "[utxo_live] compaction done in %.1fs (%s; started at height %ld): manifest_n %lu -> %lu, merged into run %lu, %ld flushed meanwhile, %d input run(s) unlinked; apply never waited\n",
-                    secs, g_cmp_desc, g_cmp_height, (unsigned long)g_cmp_n_before, (unsigned long)g_utxo_lst.manifest_n, (unsigned long)g_cmp_child_run, interim, gone);
+            fprintf(stderr, "[utxo_live] compaction done in %.1fs (%s; started at height %ld): manifest_n %lu -> %lu, merged into run %lu, %ld flushed meanwhile, %d input run(s) unlinked; apply never waited; %lu merge(s) deferred so far\n",
+                    secs, g_cmp_desc, g_cmp_height, (unsigned long)g_cmp_n_before, (unsigned long)g_utxo_lst.manifest_n, (unsigned long)g_cmp_child_run, interim, gone, g_cmp_deferred);
         }
     } else {
         unlink_run(g_cmp_child_run); unlink(LSM_MANIFEST_CHILD);
@@ -445,10 +449,26 @@ static long compact_pick_now(long* lo){
     return k;
 }
 static long g_cmp_lo = 0;
+static long g_apply_lag = 0;            /* archive tip minus the applied height, set by the catch-up loop (2026-09-09) */
+static int g_cmp_defer_logged = 0;
+unsigned long utxo_live_compactions_deferred(void){ return g_cmp_deferred; }
 static int compact_start_async(long height, const char* why){
     if (g_cmp_pid) return 0;
     long lo = 0, k = compact_pick_now(&lo);
     if (k == 0) return 0;
+    /* 2026-09-09: while the apply is behind the download the disk is the
+     * apply's; a merge waits, up to a ceiling on the run count and never
+     * when the run files are over the memory budget (compact_pick_now picks
+     * below the count threshold only for that reason) */
+    { long n = (long)g_utxo_lst.manifest_n, thr = utxo_live_compact_threshold();
+      int over_budget = (n < thr);
+      if (compact_should_defer(g_apply_lag, n, thr, over_budget)){
+          g_cmp_deferred++;
+          if (!g_cmp_defer_logged){ g_cmp_defer_logged = 1;
+              fprintf(stderr, "[utxo_live] merge of %ld run(s) deferred: the apply is %ld blocks behind the archive (waits under %ld runs)\n", k, g_apply_lag, thr * COMPACT_DEFER_CEILING_MULT); }
+          return 0;
+      }
+      g_cmp_defer_logged = 0; }
     g_cmp_nin = (int)k; g_cmp_lo = lo;
     const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
     for (int i = 0; i < g_cmp_nin; i++) memcpy(&g_cmp_inputs[i], e + (lo + i)*16 + 8, 8);
@@ -468,7 +488,12 @@ static int compact_start_async(long height, const char* why){
     }
     if (p == 0){
         /* child: no stdio (a parent thread may hold its lock at fork), no
-         * atexit, nothing but the merge. */
+         * atexit, nothing but the merge. 2026-09-09: and it yields to the
+         * apply -- nice 10 and best-effort I/O at the lowest priority (not
+         * the idle class: an idle-class writer starves outright under a
+         * busy apply and the merge never lands, see the 09-08 note). */
+        setpriority(PRIO_PROCESS, 0, 10);
+        syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, (2 << 13) | 7 /* best-effort, prio 7 */);
         utxo_lsm_set_flush_hook(0);
         utxo_lsm_set_defer_unlink(1);
         utxo_lsm_set_defer_publish(1);
@@ -3483,6 +3508,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
          * (applied_height reset to -1) hit this wall at height 202134. */
         u64 tm_k0 = tm_now();
         compact_poll();                                   /* adopt a finished background merge */
+        g_apply_lag = tip > h ? tip - h : 0;
         compact_start_async(h, "mid-catchup");
         tm_lap(TM_FLUSH, tm_k0);                          /* inline-fallback compaction, if any, lands here */
     }
