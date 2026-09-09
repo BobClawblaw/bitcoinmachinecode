@@ -10,3 +10,7 @@ Every `version` this node ever sent carried a fixed timestamp (1700000000, a Nov
 The self-address gossip (`addr`/`addrv2`) already stamped `time(NULL)` and announced the real port, so the 70-minute skew rule was not discarding our announcements; the version message was the only liar.
 
 `test_bitcoind`: the timestamp within 5 s of now, two versions with different non-constant nonces, start_height and the port following the daemon's globals, the address bytes still zero after the port store (**watched to fail**: 5 assertions against the old builder). Assembled first on a scratch copy; the port stores had to re-zero AL before the next `rep stosb`, caught in review.
+
+---
+
+PR #144 (`batch/2026-09-09-version-truth`), merged 17:5xZ as `744bd3fd`; tag `version-truth-2026-09-09`. Staged as `deploy-20260909i`; live on production from 18:38:24Z.

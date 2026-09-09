@@ -9,3 +9,7 @@ The compact-block receive path landed on 09-06 and never completed a reconstruct
 **Production** runs `bmc.cmpctrecv=0` since the 18:38Z restart, set the moment the 1,262-to-0 count was read; it stays there until this build is deployed and the counter on production reads reconstructed blocks. The default stays 1.
 
 **Still divergent from Core, for their own batch:** a reconstructed block that fails verification should fall back to a full `getdata` instead of failing the pass (Core's `PartiallyDownloadedBlock` fallback); a block should be requested once and tracked in flight by hash across legs rather than by every leg's pass.
+
+---
+
+PR #145 (`batch/2026-09-09-cmpct-recv`), merged 19:0xZ as `a36f616f`; tag `blocktxn-is-not-a-block-2026-09-09`. Staged as `deploy-20260909j`; production stays on `bmc.cmpctrecv=0` until deployed and its counter moves.
