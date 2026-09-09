@@ -3442,6 +3442,8 @@ static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
  * exhaust the pool. Probing is nearly free -- dead peers refuse instantly,
  * so all 512 were covered in 0.49s -- so there is no reason to sample. */
 #define DLC_MAXPOOL 2048
+#include "dlc_rules.h"
+static long g_live_announced[DLC_MAXPOOL];   /* each ranked live peer's start_height (aligned with live[] after the sort; 0 = unknown) */
 #define DLC_HDR_TRY_PEERS 8
 /* STALL budget: the longest a worker waits for the NEXT block of a chunk
  * before dropping the peer. Re-armed from the pipeline's progress hook on
@@ -4474,11 +4476,22 @@ static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
     }
     static unsigned char hdrbuf[2<<20];
     int tried=0, failed=0, whys[8]={0};
+    long announced = dlc_announced_height(g_live_announced, nlive);   /* 2026-09-09: the pool's claim, from the ranking handshakes */
+    int short_i = -1; long short_tip = -1;                             /* the longest chain that still fell short, in case every candidate does */
     for(int i=0;i<nlive && tried<DLC_HDR_TRY_PEERS; i++){
         int why=0;
         long added=dlc_headers_try(live[i], hst, loc, hdrbuf, sizeof hdrbuf, &why);
         if(added<0){ failed++; if(why>=0 && why<8) whys[why]++; continue; }
         tried++;
+        { long tip_now = hst_count(hst) - 1;
+          if((added>0 || have>0) && dlc_chain_falls_short(tip_now, announced)){
+            /* the bench took a stuck peer's stale branch, 4,500 blocks short of
+             * what every other peer announced, and synced to its end (2026-09-09) */
+            fprintf(stderr,"[dlc] headers from %s end at %ld while the pool announces %ld -- the peer is behind or on a stale branch; trying another\n", live[i], tip_now, announced);
+            if(tip_now > short_tip){ short_tip = tip_now; short_i = i; }
+            if(added>0) dlc_headers_rollback(hst, have);
+            continue;
+          } }
         /* a genuine peer failure/hiccup can return exactly 0 added headers
          * with nothing wrong at the protocol level (unified_ibd.c's own
          * fork-based header phase treats this the same way: h>0 is the only
@@ -4488,6 +4501,14 @@ static long dlc_headers(char live[][DL_POOL_SLOT], int nlive){
          * already at its tip, which is legitimate success. */
         if(added>0){ fprintf(stderr,"[dlc] headers +%ld from %s (total %ld)\n", added, live[i], hst_count(hst)); return hst_count(hst); }
         if(added==0 && have>0){ fprintf(stderr,"[dlc] headers: already current per %s (total %ld)\n", live[i], hst_count(hst)); return hst_count(hst); }
+    }
+    if(short_i >= 0){
+        /* every candidate fell short of the announcement: take the longest of
+         * them rather than nothing (the announcement may be the liar, or every
+         * reachable peer may be behind) -- and say so */
+        int why=0; long added=dlc_headers_try(live[short_i], hst, loc, hdrbuf, sizeof hdrbuf, &why);
+        fprintf(stderr,"[dlc] no candidate reached the announced %ld; taking the longest, %s at %ld (total %ld)\n", announced, live[short_i], short_tip, hst_count(hst));
+        if(added>=0 && hst_count(hst)>0) return hst_count(hst);
     }
     /* Nothing added and nothing confirmed current: the boot downloader is
      * about to be told the archive is "complete" through whatever headers.dat
@@ -5072,7 +5093,9 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
     if (nlive < 2) return;
     double* rate = mmap(NULL, sizeof(double) * (size_t)nlive, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
     if (rate == MAP_FAILED) return;
-    for (int i = 0; i < nlive; i++) rate[i] = -1.0;
+    long* ann = mmap(NULL, sizeof(long) * (size_t)nlive, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);   /* announced heights, from the same handshakes (2026-09-09) */
+    if (ann == MAP_FAILED){ munmap(rate, sizeof(double) * (size_t)nlive); return; }
+    for (int i = 0; i < nlive; i++){ rate[i] = -1.0; ann[i] = 0; }
     unsigned char stop[32]; memset(stop, 0, 32);
     struct timespec t_all0; clock_gettime(CLOCK_MONOTONIC, &t_all0);
     for (int base = 0; base < nlive; base += RANK_BATCH){
@@ -5092,6 +5115,7 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
                 if (fd < 0) _exit(0);
                 struct timeval tv; tv.tv_sec = 5; tv.tv_usec = 0; setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
                 if (node_handshake(fd) != 1) _exit(0);
+                { rpc_peer_t v; memset(&v, 0, sizeof v); rpc_peer_from_version(&v, g_peer_version_payload, g_peer_version_len); if (v.start_height > 0) ann[i] = v.start_height; }   /* the announced height, parsed as getpeerinfo does (the relay byte follows it) */
                 static unsigned char page[4096]; static unsigned char msg[2 << 20]; char cmd[12]; unsigned mlen = 0;
                 long plen = p2p_getheaders(page, g_chainp->genesis_hash, 1, stop);
                 struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -5122,6 +5146,10 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
     static char sorted[DLC_MAXPOOL][DL_POOL_SLOT];
     for (int i = 0; i < nlive; i++) memcpy(sorted[i], live[idx[i]], DL_POOL_SLOT);
     for (int i = 0; i < nlive; i++) memcpy(live[i], sorted[i], DL_POOL_SLOT);
+    { static long sorted_ann[DLC_MAXPOOL]; for (int i = 0; i < nlive; i++) sorted_ann[i] = ann[idx[i]]; for (int i = 0; i < nlive; i++) g_live_announced[i] = sorted_ann[i]; for (int i = nlive; i < DLC_MAXPOOL; i++) g_live_announced[i] = 0;
+      long announced = dlc_announced_height(g_live_announced, nlive); int claimed = 0; for (int i = 0; i < nlive; i++) if (g_live_announced[i] > 0) claimed++;
+      fprintf(stderr, "[dlc] the pool announces height %ld (%d of %d peers claimed one; the second-highest claim counts)\n", announced, claimed, nlive);
+      munmap(ann, sizeof(long) * (size_t)nlive); }
     int answered = 0; double best = 0.0, worst_answered = 0.0;
     for (int i = 0; i < nlive; i++) if (rate[idx[i]] >= 0.0){ answered++; if (best == 0.0) best = rate[idx[i]]; worst_answered = rate[idx[i]]; }
     double median = answered ? rate[idx[answered / 2]] : 0.0;
