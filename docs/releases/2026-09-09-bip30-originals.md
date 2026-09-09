@@ -9,4 +9,4 @@ Core's `IsBIP30Unspendable` names 91,722 and 91,812, the ORIGINALS whose txids t
 
 ---
 
-PR_LINE
+PR #133 (`batch/2026-09-09-bip30-originals`), merged 02:14Z as `0011b2a8`; tag `bip30-originals-2026-09-09`. **Proven at scale at 06:10Z:** the base rebuilt with the fixed tool passed the seam check and was adopted ("history base complete to 966142"); at 963,967 our row's raw MuHash3072 hashes to Core's `1e3c77ad25f40961f1f757a77960b7c49a5c7bd091597bd925d561a5c202c118`, and `gettxoutsetinfo muhash 963967` on production matches Core in every field.
