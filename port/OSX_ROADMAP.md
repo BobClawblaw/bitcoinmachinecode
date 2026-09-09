@@ -44,6 +44,17 @@ Read `port/OSX_PORT.md` first for the branch/sync model. Worklog:
 (No modules ported yet. Copy the arm-port module list as the checklist and
 mark each with: -> IN PROGRESS -> DONE (date, verification evidence).)
 
+## Git identity hard rule (private companion file)
+
+**Never commit as any real-world name — all commits are
+`BobClawblaw <BobClawblaw@users.noreply.github.com>`** (author AND
+committer). Git silently falls back to the OS account when
+`user.name`/`user.email` are unset; that bit us once in bmc_osx round 0
+(2026-09-09) and was caught before push. Config is set globally and
+repo-local. Details live in the gitignored `docs/PROJECT_LOCAL_RULES.md`
+(kept out of the repo because it names the identity), plus a pre-push
+`git log --format='%an <%ae> | %cn <%ce>'` check on every new commit.
+
 ## Verification gates before any merge/deploy
 - Native build of touched module + repo harness run.
 - Differential fuzz vs C twin / Python oracle (thousands of vectors).
