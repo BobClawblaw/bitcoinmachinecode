@@ -4,6 +4,25 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-09 — bitcoin_hash native: first full 6-op module, x86-diff byte-identical
+
+- `port/osx/bitcoin_hash.S` (7 public symbols) gated three ways: upstream
+  test_pow_check 13/13 native, 6,485-vector Python-oracle differential 0
+  failures, and byte-identical results vs the x86 bitcoin_hash.o/sha256.o run
+  on the 9950X3D (192.168.5.242). Driver pair committed (dvh.c /
+  gen_bhash_vecs.py) — batched file-based oracles, no popen.
+- Driver bug caught by cross-arch diff: sha256d64 out stride is 32B per 64B
+  input (Core SHA256D64 shape); assuming 64B out stride silently compared
+  stale memory on BOTH arches and "agreed". Cross-arch diffing only proves
+  what the driver actually measures.
+- x86-vs-osx benchmarking now possible on shared shapes: bench_hash_core +
+  bench_fe build on both. x86 reference numbers captured (9950X3D, cores
+  16-19): sha256_1MB 2.40 GB/s, fe_mul THRU 5.54ns, ECDSA verify 47.1k/s/core,
+  Schnorr 38.4k/s/core.
+- IBD status: x86 full mainnet IBD COMPLETE on .242 (tip 961639, progress 1.0,
+  760G, /mnt/2tbssd/bmc-bench deployment). OSX native daemon (p3) still
+  blocked on p1/p2 module waves.
+
 ## 2026-09-09 — p1 progressing: sha512 + ripemd160 + sha1 landed
 
 - sha1 joined ripemd160 as a C twin (gate 10/10 after fixing a LE length

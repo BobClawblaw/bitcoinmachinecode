@@ -24,7 +24,16 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       oracle first deadlocked on popen stdin (pipe never hit EOF) ->
       file-based batched oracle, and second: python -c cannot run a
       compound `while` statement on one line -> newline-separated helper.
-- [ ] bitcoin_hash (sha256d/block_hash/diff_target/pow_check) — needs sha256
+- [x] bitcoin_hash -> port/osx/bitcoin_hash.S  DONE 2026-09-09. Evidence:
+      upstream test_pow_check 13/13 native (guard-page clamp, VAL-11 range
+      checks, powLimit arming) + 6,485-vector differential: Python oracle
+      0 failures AND byte-identical output stream vs the x86 objects run on
+      the 9950X3D reference (drivers: port/osx/tests/dvh.c +
+      gen_bhash_vecs.py; ops sha256d/block_hash/diff_target/pow_check/
+      sha256d64/merkle_root incl. odd counts + CVE-2012-2459 mutation flag).
+      Contract notes: sha256d64 writes 32B per 64B input (in stride 64,
+      out stride 32); diff_target stores BE with e3<0 or e3>31 -> all-zero
+      target; merkle_root returns mutation flag 0/1 in w0.
 - [x] sha512   -> port/osx/sha512.S      DONE 2026-09-09. Upstream
       test_sha512 unchanged: 4/4 FIPS vectors (incl. 1M-'a').
 - [x] ripemd160 -> port/osx/ripemd160_twin.c  DONE 2026-09-09 as a C TWIN
