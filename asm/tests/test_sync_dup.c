@@ -1,4 +1,5 @@
-/* tests/test_sync_gate.c -- the sync pass asks the daemon before fetching a
+/* tests/test_sync_dup.c -- a duplicate of a block another leg just stored ends the sync pass well (split from test_sync_gate: the hash index is process-global). Was:
+ * tests/test_sync_gate.c -- the sync pass asks the daemon before fetching a
  * block (g_block_fetch_hook, 2026-09-09): another leg already fetching that
  * hash ends this pass with what it has; a free hash is fetched as before.
  * Until today every leg's pass fetched the block the node lacked -- eight
@@ -62,37 +63,41 @@ static void fake_peer(int cfd, int* ngetdata){
 }
 static int g_gate_calls = 0; static int g_gate_answer = 1;
 static long gate(const unsigned char* hash){ (void)hash; g_gate_calls++; return g_gate_answer; }
-static int run(int answer, long* sr, long* cnt, int* ngetdata){
-    static unsigned char stbuf[4096]; if(store_init(stbuf)!=1){ printf("FAIL store_init\n"); return 1; }
-    g_gate_answer = answer; g_gate_calls = 0;
-    int ls=socket(AF_INET,SOCK_STREAM,0); struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
-    bind(ls,(struct sockaddr*)&a,sizeof a); socklen_t al=sizeof a; getsockname(ls,(struct sockaddr*)&a,&al); listen(ls,2);
-    int pfd[2]; if(pipe(pfd)!=0) return 1;
-    pid_t pid=fork();
-    if(pid==0){ close(pfd[0]); int c=accept(ls,0,0); int n=0; fake_peer(c, &n); close(c); (void)!write(pfd[1], &n, sizeof n); _exit(0); }
-    close(pfd[1]);
-    int fd=tcp_connect_ip(htonl(INADDR_LOOPBACK), a.sin_port); if(fd<0){ printf("FAIL connect\n"); return 1; }
-    if(node_handshake(fd)!=1){ printf("FAIL handshake\n"); return 1; }
-    unsigned char gen_loc[32]; memset(gen_loc,0,32); static unsigned char buf[65536]; *cnt=0;
-    *sr=node_sync(fd, stbuf, gen_loc, buf, sizeof buf, cnt);
-    close(fd); waitpid(pid,0,0); close(ls); *ngetdata=0; (void)!read(pfd[0], ngetdata, sizeof *ngetdata);
-    return 0;
-}
 int main(void){
     unsigned char prev[32]; memset(prev,0,32);
     for(int i=0;i<2;i++){ blen[i]=build_cb_block(blocks[i], prev, i); unsigned nz=0; while(!pow_check(blocks[i])){ nz++; put_u32(blocks[i]+76,nz); } block_hash(bh[i], blocks[i]); memcpy(prev, bh[i], 32); NB++; }
     tt_isolate(); g_block_fetch_hook = (void*)gate;
-    long sr=0, cnt=0; int ng=0;
-    if(run(1, &sr, &cnt, &ng)) return 1;
-    cki("gate says fetch: the pass stores both blocks", cnt, 2);
-    cki("... two getdata reached the peer", ng, 2);
-    cki("... the gate was asked once per block", g_gate_calls, 2);
-    (void)!chdir("/"); tt_isolate();
-    if(run(0, &sr, &cnt, &ng)) return 1;
-    cki("gate says another leg has it: the pass ends cleanly (ok=1)", sr, 1);
-    cki("... storing nothing", cnt, 0);
-    cki("... and NO getdata reached the peer", ng, 0);
-    cki("... after one question", g_gate_calls, 1);
+    /* 2026-09-09 (production on snapshot n, where=10 six times an hour): a block
+     * another leg stored moments ago is not the peer's fault. The append
+     * refuses the duplicate (-2, not tip-linked) and the pass must END WELL
+     * (ok=1) so the next rotation rebuilds the locator from the true tip --
+     * not fail with where=10 and count a strike against the peer. */
+    { static unsigned char st2[4096]; if(store_init(st2)!=1){ printf("FAIL store_init\n"); return 1; }
+      g_gate_answer = 1;
+      /* "another leg": a peer serving block 0 only, synced first */
+      g_serve_upto = 1;
+      { int ls=socket(AF_INET,SOCK_STREAM,0); struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+        bind(ls,(struct sockaddr*)&a,sizeof a); socklen_t al=sizeof a; getsockname(ls,(struct sockaddr*)&a,&al); listen(ls,2);
+        pid_t pid=fork(); if(pid==0){ int c=accept(ls,0,0); int n=0; fake_peer(c, &n); close(c); _exit(0); }
+        int fd=tcp_connect_ip(htonl(INADDR_LOOPBACK), a.sin_port); node_handshake(fd);
+        unsigned char loc[32]; memset(loc,0,32); static unsigned char b0[65536]; long c0=0;
+        node_sync(fd, st2, loc, b0, sizeof b0, &c0); cki("block 0 stored by 'another leg'", c0, 1);
+        close(fd); waitpid(pid,0,0); close(ls); }
+      /* this leg: its locator predates block 0, the peer serves both */
+      g_serve_upto = 2; g_gate_calls = 0;
+      int ls=socket(AF_INET,SOCK_STREAM,0); struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+      bind(ls,(struct sockaddr*)&a,sizeof a); socklen_t al=sizeof a; getsockname(ls,(struct sockaddr*)&a,&al); listen(ls,2);
+      pid_t pid=fork(); if(pid==0){ int c=accept(ls,0,0); int n=0; fake_peer(c, &n); close(c); _exit(0); }
+      int fd=tcp_connect_ip(htonl(INADDR_LOOPBACK), a.sin_port); node_handshake(fd);
+      unsigned char loc[32]; memset(loc,0,32); static unsigned char buf2[65536]; long c2=0;
+      long s2=node_sync(fd, st2, loc, buf2, sizeof buf2, &c2);
+      cki("a duplicate of a block already stored ends the pass WELL (ok=1), not with where=10", s2, 1);
+      cki("... nothing counted", c2, 0);
+      memcpy(loc, bh[0], 32); c2=0; s2=node_sync(fd, st2, loc, buf2, sizeof buf2, &c2);
+      { extern int sync_fail_code; if(c2 != 1) printf("     second pass: sr=%ld cnt=%ld where=%d\n", s2, c2, sync_fail_code); }
+      cki("the next pass, from the true tip, fetches block 1", c2, 1);
+      cki("store tip is block 1", *(int*)(st2+24), 1);
+      close(fd); waitpid(pid,0,0); close(ls); }
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }

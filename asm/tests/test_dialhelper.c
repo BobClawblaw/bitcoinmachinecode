@@ -377,6 +377,19 @@ int main(void){
       /* 2026-09-09: tcp_connect_ip's connect() is blocking under a 10 s
        * SO_SNDTIMEO; its expiry surfaces as EINPROGRESS, which was rendered
        * "Operation now in progress" and read as an attempt still in flight */
+      /* 2026-09-09: the fetch gate refuses a hash the store already holds (a sibling leg
+       * landed it: production on snapshot n fetched and then refused six duplicates an
+       * hour, each a strike) and claims a fresh one for this leg */
+      { static unsigned char idxbuf[24 + HT_SLOTS*48]; idx_init(idxbuf, HT_SLOTS); unsigned char* saved = ht_idx; ht_idx = idxbuf;
+        unsigned char known[32], fresh[32]; memset(known, 0x11, 32); memset(fresh, 0x22, 32); idx_put(ht_idx, known, 5);
+        inflight_init(&g_inflight); g_sync_leg = 3;
+        ok(block_fetch_gate(known) == 0, "a hash already in the store's index is not fetched");
+        ok(block_fetch_gate(fresh) == 1, "a fresh hash is claimed for this leg");
+        g_sync_leg = 4;
+        ok(block_fetch_gate(fresh) == 0, "... and refused to another leg while the claim lives");
+        inflight_release_leg(&g_inflight, 3);
+        ok(block_fetch_gate(fresh) == 1, "... until the first leg's pass ends");
+        ht_idx = saved; g_sync_leg = -1; inflight_init(&g_inflight); }
       /* 2026-09-09: we ping every leg every 2 min and close one silent for 20 min (Core's numbers) */
       { ok(leg_ping_due(1000, 0), "a fresh leg is pinged at once");
         ok(!leg_ping_due(1000 + 119, 1000), "... not again for 2 min");
