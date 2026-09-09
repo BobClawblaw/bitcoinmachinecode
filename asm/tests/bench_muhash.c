@@ -117,9 +117,14 @@ static double time_insert(long n, int reps, double* spread)
 int main(int argc, char** argv)
 {
     long n   = argc > 1 ? atol(argv[1]) : 200000;
+#ifdef __APPLE__
+    int  cpu = argc > 2 ? atoi(argv[2]) : 0;   /* no sched_getcpu on Darwin */
+#else
     int  cpu = argc > 2 ? atoi(argv[2]) : sched_getcpu();
+#endif
     const int reps = 3;
 
+#ifndef __APPLE__
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
@@ -127,6 +132,7 @@ int main(int argc, char** argv)
         perror("sched_setaffinity");
         return 1;
     }
+#endif
 
     /* every body this CPU can run, generic first: it is the pre-change
      * daemon's path and is always present */
