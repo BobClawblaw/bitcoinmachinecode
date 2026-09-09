@@ -627,6 +627,18 @@ writes it; stop it first. `daemon/bmc_utxo_setinfo <datadir> --muhash` on a
 stopped datadir is the instrument for comparing the set with a trusted
 node's `gettxoutsetinfo muhash`.
 
+**A coin the node calls spent that a trusted node calls unspent** (a block
+rejected for "input references a missing/already-spent UTXO" that Core
+accepted): `daemon/bmc_utxo_probe_one <datadir> <txid> <vout>` resolves the
+outpoint through both read paths, the point lookup and the full walk. Both
+missing: the set lacks the coin. Walk found, lookup missed: a run file is at
+fault -- symlink the run files into a scratch directory with a hand-written
+one-entry manifest (`UMN2`, n, total_live, then (gen, run_no) pairs) and
+probe each run alone. Bench run 18 (2026-09-09) found a run holding a key
+twice, a PUSH then a DEL, from two defects fixed that day
+(`docs/releases/2026-09-09-one-record-per-key.md`); a run written before
+the fix is repaired by its next compaction.
+
 Recovery:
 
 - **Unclean stop or crash.** Start the service. Boot rolls back any ghost
