@@ -20,4 +20,6 @@ The capture also closes the last open question from the first batch: the peers t
 
 ---
 
+**Amended 20:2xZ, PR #149:** the 3 s tick did not hold on snapshot k -- five legs still failed "no headers" at 2.4 s -- because the dial path re-applied its 300 ms bound after the handshake, at the very end of `outbound_connect_raw`, past the point where `leg_settle_socket` had set 3 s. That re-application is gone; the socket stays at 3 s.
+
 PR #146 (`batch/2026-09-09-leg-lifecycle-2`), merged 19:3xZ as `a7fd883b`; tag `leg-lifecycle-2-2026-09-09`. Gate MAKE_EXIT 0, 344 passes. Staged as `deploy-20260909k`, the live link; not yet running on production.
