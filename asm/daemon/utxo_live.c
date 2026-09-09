@@ -1485,11 +1485,10 @@ typedef struct {
                                     walked by the merkle pass either) */
     int any_nonfinal_seq;        /* VAL-4: ANY input with nSequence !=
                                     0xffffffff. Tracked as a flag during the
-                                    walk rather than read back out of seqs[],
-                                    because seqs[] is capped at VAL_SEQ_CAP
-                                    and its truncation rule treats the surplus
-                                    as FINAL -- safe for BIP68, but the WRONG
-                                    direction for IsFinalTx, where missing a
+                                    walk (it dates from when seqs[] was capped
+                                    and the surplus defaulted FINAL -- safe for
+                                    BIP68, but the WRONG direction for
+                                    IsFinalTx, where missing a
                                     non-final input means accepting a block
                                     Core rejects. */
     u64 in_count;
@@ -1501,25 +1500,26 @@ typedef struct {
                                     Equals txlen for a non-segwit tx. */
     u32 locktime;                /* trailing 4 bytes (IsFinalTx, BIP68) */
     u32 version;                 /* BIP68's version>=2 gate */
-    const u32* seqs; u32 nseqs;  /* per-input sequences (up to SEQ_CAP; a tx
-                                    with more inputs reports nseqs=SEQ_CAP and
-                                    the BIP68 pass treats the surplus as
-                                    FINAL -- see the note in the pass) */
+    const u32* seqs; u32 nseqs;  /* per-input sequences, every one of them:
+                                    nseqs == in_count on success */
 } val_txinfo_t;
-/* 2026-09-09: 24,576, from the block weight limit. A non-witness input is at
- * least 41 bytes (outpoint 36, script length 1, sequence 4) and counts four
- * times in weight, so a transaction can carry at most 4,000,000 / 164 =
- * 24,390 inputs; the cap covers every transaction a valid block can hold. It
- * was 2,048, and mainnet block 880,338 carries a transaction with 7,244
- * inputs: the BIP68 pass refused the block rather than treat the surplus as
- * final ("past the sequence window"), invalidated it, and the bench node
- * forked off mainnet at 91% of a fresh sync. The truncation flag stays as a
- * guard for a transaction no valid block can contain. */
-#define VAL_SEQ_CAP 24576
-static u32 g_val_seqs[VAL_SEQ_CAP];    /* single-buffer scratch: val_read_tx
-                                        * has exactly one live consumer at a
-                                        * time (all check loops finish one tx
-                                        * before starting the next) */
+/* The sequence ledger is sized to the transaction, as Core's tx.vin is a
+ * vector CalculateSequenceLocks walks in full. It was a fixed 2,048-entry
+ * buffer with a truncation flag, and the BIP68 pass refused any block whose
+ * transaction had more inputs: mainnet block 880,338 carries one with 7,244,
+ * so the bench node rejected a valid block and forked off mainnet at 91% of a
+ * fresh sync (2026-09-09). Core has no cap of any size, so neither does this;
+ * the input count is already bounded by the transaction's own length (41
+ * bytes per input at least), so the reservation cannot outrun the buffer the
+ * block was read into. One live consumer at a time (every check loop
+ * finishes one transaction before starting the next). */
+static u32* g_val_seqs; static u64 g_val_seqs_cap;
+static int val_seqs_reserve(u64 n){
+    if (n <= g_val_seqs_cap) return 1;
+    u64 c = g_val_seqs_cap ? g_val_seqs_cap : 4096; while (c < n) c *= 2;
+    u32* q = realloc(g_val_seqs, c * sizeof *q); if (!q) return 0;
+    g_val_seqs = q; g_val_seqs_cap = c; return 1;
+}
 static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
     memset(vi, 0, sizeof *vi);
     const u8* p = tx; const u8* end = tx + txlen;
@@ -1532,6 +1532,7 @@ static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
     u64 nin = utxo_walk_read_varint(p, end, &used); if (!used){ vi->bad_shape=1; return 0; }
     p += used; vi->in_count = nin;
     if (nin == 0) { vi->bad_shape = 1; return 0; }
+    if (nin > (u64)(end - p) / 41 + 1 || !val_seqs_reserve(nin)){ vi->bad_shape = 1; return 0; }   /* more inputs than the bytes can hold */
     vi->seqs = g_val_seqs;
     for (u64 i = 0; i < nin; i++){
         if (p + 36 > end) { vi->bad_shape = 1; return 0; }
@@ -1551,11 +1552,7 @@ static int val_read_tx(const u8* tx, u64 txlen, val_txinfo_t* vi){
         if ((u64)(end - p) < 4){ vi->bad_shape=1; return 0; }
         if (i == 0){ vi->in0_script = sp; vi->in0_slen = sl; }
         { u32 sq; memcpy(&sq, p, 4); if (sq != 0xFFFFFFFFu) vi->any_nonfinal_seq = 1; }
-        if (vi->nseqs < VAL_SEQ_CAP){ memcpy(&g_val_seqs[vi->nseqs], p, 4); vi->nseqs++; }
-        else vi->nseqs = VAL_SEQ_CAP;              /* truncation flag (see the
-                                                    * BIP68 pass: surplus
-                                                    * inputs default FINAL,
-                                                    * never FALSE) */
+        memcpy(&g_val_seqs[vi->nseqs], p, 4); vi->nseqs++;
         p += 4;                                    /* sequence */
     }
     /* ---- the OUTPUT section.
@@ -2103,16 +2100,9 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
      * and carries this height. Re-resolving them here would duplicate that
      * precedence rule. The per-input sequences come from val_read_tx.
      *
-     * THE seqs[] CAP IS SAFE HERE, unlike for IsFinalTx. val_read_tx records
-     * at most VAL_SEQ_CAP sequences and its truncation rule treats the
-     * surplus as FINAL. For BIP68 "final" means nSequence 0xffffffff, which
-     * has the DISABLE flag set, so a surplus input is treated as exempt --
-     * it can only make us MORE permissive, never less. That direction is
-     * wrong in principle, so the truncation is refused outright below rather
-     * than relied upon. Since 2026-09-09 the cap (24,576) exceeds the input
-     * count of any transaction a valid block can hold, so the refusal is a
-     * guard, not a rule a real block can trip: at 2,048 it rejected mainnet
-     * block 880,338 (a 7,244-input transaction). ---- */
+     * Every input's sequence is in seqs[] (the ledger is sized to the
+     * transaction, like Core's vector); there is no cap and no surplus to
+     * default. ---- */
     {
         unsigned long long bflags68 = script_flags_for_block((unsigned long long)g_apply_height, blk_hash);
         int csv_active68 = (int)((bflags68 >> VAL_SFC_BIT_CSV) & 1ULL);
@@ -2136,14 +2126,6 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
                 }
                 if (t == 0) continue;         /* the coinbase has no prevouts */
 
-                if (vib.nseqs >= VAL_SEQ_CAP && vib.in_count > VAL_SEQ_CAP){
-                    /* see the note above: proceeding would be permissive */
-                    fprintf(stderr, "[utxo_live] REJECT h=%ld: bad-txns-nonBIP68-final "
-                                    "(tx %llu has %llu inputs, past the sequence window)\n",
-                            g_apply_height, (unsigned long long)t,
-                            (unsigned long long)vib.in_count);
-                    g_last_reject = "bad-txns-nonBIP68-final"; return 0;
-                }
 
                 long long min_height = -1, min_time = -1;
                 int enforce = (vib.version >= 2);
