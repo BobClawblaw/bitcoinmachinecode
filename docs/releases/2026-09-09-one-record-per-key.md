@@ -12,3 +12,7 @@ The point lookup takes whichever record the sparse index lands on; the walk take
 `test_utxo_lsm_dups` (new, **watched to fail**, 8 assertions): del/put/del in one generation flushes one DEL; a merge over a hand-written run holding [DEL K, DEL K] and a newer run holding 63 fillers and PUSH K writes 64 records with one PUSH K, and get() finds it (the stale DEL used to be the 64th record, exactly the sparse sample); the bench's own shape, [PUSH K, DEL K] with the sparse index on the DEL, prints "get says spent, the walk says live" before the merge and one PUSH after it. `test_lsm_flush_sort_diff` expected the duplicate tombstones (a test that encoded the defect); it now counts distinct tombstoned keys.
 
 **Diagnosis recipe** (OPERATIONS.md): `daemon/bmc_utxo_probe_one <datadir> <txid> <vout>` compares get() with the walk; symlink the run files into a scratch directory with a hand-written one-entry manifest to test a run alone.
+
+---
+
+PR #139 (`batch/2026-09-09-lsm-dups-header-select`, two commits), merged 09:33Z as `fcfe834d`; tag `one-record-per-key-2026-09-09`. Staged as `deploy-20260909g`.
