@@ -1386,6 +1386,9 @@ extern unsigned g_conn_perms;                     /* whitebind permissions of th
  * version and building ours), and the serve loop's C gates read them. */
 extern void (*g_accept_version_hook)(void);      /* bitcoind.asm node_accept_handshake */
 extern unsigned char node_relay_flag;            /* bitcoind.asm: fRelay byte of OUR version */
+extern unsigned node_start_height;               /* bitcoind.asm: start_height of OUR version (2026-09-09: was 0) */
+extern unsigned short node_listen_port_be;       /* bitcoind.asm: the port in OUR version's address fields, big-endian (was 8333) */
+static void version_tell_the_truth(void){ node_start_height = (unsigned)(*(int*)(store_buf+24) > 0 ? *(int*)(store_buf+24) : 0); node_listen_port_be = htons((unsigned short)g_cfg.port); }
 extern unsigned char g_serve_send_feefilter;     /* bitcoin_serve.asm: send `feefilter` at connect */
 static unsigned g_conn_perms_all;                /* whitelist | whitebind, this connection */
 static int      g_peer_relays_txs = 1;           /* the peer's version fRelay */
@@ -2273,7 +2276,7 @@ static int outbound_connect_raw(const char* host, int rcv_ms, int out_port){
         }
         break;
     }
-    if(fd>=0) hk = node_handshake(fd);
+    if(fd>=0){ version_tell_the_truth(); hk = node_handshake(fd); }
 
     alarm(0);
     int fired = mux_sync_budget_fired;
@@ -9018,6 +9021,7 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                       if(n >= sizeof g_cur_peer_ip) n = sizeof g_cur_peer_ip - 1;
                       memcpy(g_cur_peer_ip, peerdesc, n); g_cur_peer_ip[n] = 0; }
                     g_serve_violation_hook = serve_violation_report;
+                    version_tell_the_truth();
                     int hok = node_accept_handshake(c);
                     if(hok==1) peer_inbound_deadline(c);      /* NET-3: handshake done -> the 20-minute idle bound */
                     if(hok==1) g_inbound_slot = inbound_slot_claim(peerdesc);

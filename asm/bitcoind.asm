@@ -49,21 +49,44 @@ node_make_version:
     ; when -v2transport is enabled); we serve witness blocks (fe3addb)
     mov  rax, [node_services]
     mov  [r12+4], rax
-    mov  qword [r12+12], 1700000000
+    ; timestamp: the wall clock (2026-09-09: it was a fixed 1700000000, a
+    ; November-2023 clock, on every version we ever sent)
+    push rdi
+    xor  edi, edi
+    mov  eax, 201            ; time(NULL)
+    syscall
+    pop  rdi
+    mov  [r12+12], rax
     ; addr_recv[26] at +20: zero, then port at +44
     lea  rdi, [r12+20]
     xor  eax, eax
     mov  rcx, 26
     rep  stosb
-    mov  word [r12+44], 0x8d20     ; port 8333 big-endian bytes 20 8d
+    mov  ax, [rel node_listen_port_be]   ; the port we listen on, big-endian (2026-09-09: was a constant 8333)
+    mov  [r12+44], ax
+    xor  eax, eax                        ; the rep stosb below zeroes with AL
     ; addr_from[26] at +46: zero, then port at +70
     lea  rdi, [r12+46]
     mov  rcx, 26
     rep  stosb
-    mov  word [r12+70], 0x8d20
-    ; nonce at +72  (build in rax: an imm64 mem-store truncates to 32 bits!)
-    mov  rax, 0x1122334455667788
+    mov  ax, [rel node_listen_port_be]
+    mov  [r12+70], ax
+    xor  eax, eax
+    ; nonce at +72: random per connection, as Core's (2026-09-09: it was the
+    ; constant 0x1122334455667788; Core uses the nonce to detect a connection
+    ; to itself, and a constant one is the classic self-disconnect trap)
+    push rdi
+    lea  rdi, [r12+72]
+    mov  esi, 8
+    xor  edx, edx
+    mov  eax, 318            ; getrandom(buf, 8, 0)
+    syscall
+    pop  rdi
+    cmp  rax, 8
+    je   .nonce_ok
+    mov  rax, 0x1122334455667788   ; getrandom unavailable: the old constant, better than garbage
     mov  [r12+72], rax
+.nonce_ok:
     ; user_agent varstr at +80: len byte + UA bytes. Length is DERIVED at
     ; assembly time from version.inc (%strlen), so it can never drift from the
     ; string itself.
@@ -77,7 +100,8 @@ node_make_version:
     lea  rdi, [r12+81]
     rep  movsb
     ; start_height u32 then relay byte (cursor-relative: rdi is past the UA)
-    mov  dword [rdi], 0
+    mov  eax, [rel node_start_height]    ; our tip, set by the daemon (2026-09-09: was 0 at 966k)
+    mov  [rdi], eax
     mov  al, [rel node_relay_flag]
     mov  byte [rdi+4], al
     ; total length = 81 + UA_LEN + 4 + 1 -- derived, no hardcoded total
@@ -2259,6 +2283,10 @@ node_relay_flag: db 1
 ; must keep working with the plain default.
 global node_services
 node_services: dq 9
+global node_start_height
+node_start_height: dd 0          ; the daemon sets it to the archive tip before dialling
+global node_listen_port_be
+node_listen_port_be: dw 0x8d20   ; big-endian; the daemon sets it from -port
 
 ; ---- last-seen peer `version` payload, captured (not parsed) by both
 ; node_handshake and node_accept_handshake the moment they see a "version"
