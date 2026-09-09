@@ -336,6 +336,19 @@ int main(void){
         ok(dlc_pick_peer(4, 0, e3, c3, b3, 400.0) == 1, "...untried gone: the 300 KB/s peer (1), NOT the dead-marked one -- it is measured, not untried");
         c3[1] = 1;
         ok(dlc_pick_peer(4, 0, e3, c3, b3, 400.0) == 2, "...and only the dead-marked one left: still returned rather than no peer (2)"); }
+      /* 2026-09-09, run 19: a FRESH sync has no pool median yet (bar 0), and
+       * with bar 0 the dead mark (1.0) outranked every untried peer, so two
+       * workers went back to the same two peers that closed the socket on
+       * every request -- 200 attempts each, the committer waiting on their
+       * chunk, the whole run stalled at block 560. A peer whose only history
+       * is failure never clears a bar, not even an unknown one. */
+      { volatile int c4[4] = {0,0,0,0}, b4[4] = {0,0,0,0};
+        volatile double e4[4] = {1.0, 0.5, 0.0, 0.0};
+        ok(dlc_pick_peer(4, 0, e4, c4, b4, 0.0) == 2, "ema [1.0(dead mark),0.5(failed twice),untried,untried], bar 0 (fresh sync): the untried one (2)");
+        c4[2] = 1; c4[3] = 1;
+        ok(dlc_pick_peer(4, 0, e4, c4, b4, 0.0) == 0, "...nobody untried: the least-failed mark rather than no peer (0)");
+        volatile double e5[4] = {1.0, 300.0, 0.0, 0.0}; volatile int c5[4] = {0,0,0,0};
+        ok(dlc_pick_peer(4, 0, e5, c5, b4, 0.0) == 1, "ema [1.0(dead mark),300 measured,untried,untried], bar 0: the measured peer (1), as before"); }
       /* the far-behind trigger's height (2026-09-08): one liar cannot start
        * the parallel downloader; two agreeing peers can */
       { long one[1] = { 969817 }; long two[2] = { 969817, 966063 }; long many[5] = { 966063, 966063, 969817, 966062, 966063 };
