@@ -1482,6 +1482,60 @@ static void case_fakepeer_locator_and_reorg(void){
 }
 
 /* ======================================================================== */
+/* CASE: a replacement longer than the staging limit is HANDED OFF.          */
+/*                                                                           */
+/* 2026-09-09: the bench sat on an 8-block stale branch for four hours. The  */
+/* probe detected the heavier chain every 30 s and staged its replacement    */
+/* from the one peer under a 60 s budget -- 4,500 blocks, so "did not        */
+/* deliver replacement block 19 -- aborting BEFORE any change" every time.   */
+/* Above the staging limit the probe now rewinds to the fork point on the    */
+/* strength of the candidate's headers (the module's own "shorter but       */
+/* consistent" state), truncates the header mirror through the registered    */
+/* callback, and returns 3; the caller runs the parallel downloader.         */
+/* ======================================================================== */
+static long g_trunc_keep = -1;
+static void test_headers_truncate(long keep){ g_trunc_keep = keep; }
+static void case_fakepeer_handoff(void){
+    const long nbase = 12, nlose = 3, nwin = 10;
+    build_base(nbase, 0x207fffffu);
+    build_branch(lose, nlose, nbase, 0x20000000u, 0x207fffffu);
+    build_branch(win,  nwin,  nbase, 0x30000000u, 0x207fffffu);
+    g_peer_nbase = nbase; g_peer_nwin = nwin;
+    harness_open();
+    store_chain(nbase, nlose);
+    extern void reorg_set_stage_max(long); extern void reorg_set_headers_truncate(void (*)(long)); extern long reorg_last_handoff_fork(void);
+    reorg_set_stage_max(8); reorg_set_headers_truncate(test_headers_truncate); g_trunc_keep = -1;
+
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a; memset(&a,0,sizeof a);
+    a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(ls,(struct sockaddr*)&a,sizeof a)!=0){ printf("FAIL bind\n"); failures++; return; }
+    socklen_t al = sizeof a; getsockname(ls,(struct sockaddr*)&a,&al);
+    listen(ls, 4);
+    pid_t pid = fork();
+    if (pid == 0){ int c = accept(ls,0,0); if (c>=0){ fake_peer(c); close(c);} _exit(0); }
+
+    int fd = socket(AF_INET,SOCK_STREAM,0);
+    struct timeval tv = {5,0}; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+    ckm("connect to fake peer (handoff probe)", connect(fd,(struct sockaddr*)&a,sizeof a)==0);
+    ck("before: our tip is the losing branch's top", (long)*(int*)(store_buf+24), nbase + nlose - 1);
+    long r = reorg_probe_peer(fd, store_buf, "fakepeer");
+    close(fd);
+    ck("a 10-block replacement above a staging limit of 8: the probe HANDS OFF (3), it does not stage", r, 3);
+    ck("the archive is rewound to the fork point (the base's top)", (long)*(int*)(store_buf+24), nbase - 1);
+    ck("the header mirror was told to keep fork+1 records", g_trunc_keep, nbase);
+    ck("the handoff fork height is published for the caller", reorg_last_handoff_fork(), nbase - 1);
+    /* the UTXO set is the base's alone: the losing branch's coins are gone, the winner's not yet in */
+    model_reset();
+    for (long h=0;h<nbase;h++) model_apply(&base[h]);
+    verify_ondisk_chain("handoff", base, nbase);
+    verify_utxo_against_model("handoff", lose, nlose);
+    reorg_set_stage_max(0); reorg_set_headers_truncate(0);
+    kill(pid, SIGKILL); waitpid(pid,0,0); close(ls);
+    utxo_live_close();
+}
+
+/* ======================================================================== */
 /* CASE: append-lock scope, and the inbound prevhash gate's predicate.       */
 /*                                                                           */
 /* A reorg has to exclude the OTHER writer into this archive (an inbound      */
@@ -1723,6 +1777,7 @@ int main(void){
     total += run_case("reconcile leaves no ghosts (MEM-8)", case_mempool_ghosts);
     total += run_case("reorg header rules (VAL-5 rest)", case_reorg_header_rules);
     total += run_case("fake peer locator + reorg",      case_fakepeer_locator_and_reorg);
+    total += run_case("fake peer handoff (long replacement)", case_fakepeer_handoff);
     total += run_case("node_sync_multi (asm frame)",    case_node_sync_multi);
     total += run_case("append-lock scope + prevhash gate", case_append_lock_scope);
 

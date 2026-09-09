@@ -94,6 +94,13 @@ long reorg_analyze(void* st, reorg_cand_t* c);
  * with NO replacement blocks -- the disconnect half of reorg_execute alone.
  * 1 done, 0 refused before touching anything, -1 failed part way. */
 long reorg_disconnect_to(void* st, long fork_height);
+/* 2026-09-09: a replacement longer than the staging limit is handed off --
+ * reorg_probe_peer returns 3 after rewinding to the fork point; the caller
+ * runs the parallel downloader. The header mirror is truncated through the
+ * registered callback (records to keep = fork height + 1). */
+void reorg_set_stage_max(long n);
+void reorg_set_headers_truncate(void (*cb)(long keep_records));
+long reorg_last_handoff_fork(void);
 /* A candidate chain containing a hash the operator invalidated is refused. */
 void reorg_set_invalid_fn(int (*fn)(const unsigned char hash[32]));
 long reorg_execute(void* st, long fork_height, long nblocks,

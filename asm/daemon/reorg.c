@@ -148,6 +148,24 @@ extern void mpool_policy_state_init(void* st, unsigned n);
 #define REORG_NET_BUF          (6<<20)
 #define REORG_BLOCK_BUF        (8<<20)
 #define REORG_STAGE_PATH       "reorg_stage.dat"
+/* 2026-09-09: how long a replacement branch this will STAGE from the one
+ * peer that announced it (sequential getdata, under the leg's 60 s budget --
+ * about the mainnet blocks a leg delivers in that time). A longer replacement
+ * is handed off: the node rewinds to the fork point on the strength of the
+ * candidate's headers (PoW-checked, heavier than ours, above
+ * -minimumchainwork -- the same evidence Core switches its header chain on)
+ * and the parallel downloader fetches the replacement from the whole pool.
+ * The bench sat on an 8-block stale branch for four hours because the
+ * replacement was 4,500 blocks and "peer did not deliver replacement block
+ * 19 -- aborting BEFORE any change" fired every probe. A rewound chain is
+ * the shorter-but-consistent state this module's own design names as safe. */
+#define REORG_STAGE_MAX        32
+static long g_stage_max = REORG_STAGE_MAX;
+void reorg_set_stage_max(long n){ g_stage_max = n > 0 ? n : REORG_STAGE_MAX; }
+static void (*g_headers_truncate)(long keep_records);            /* the header mirror follows the archive */
+void reorg_set_headers_truncate(void (*cb)(long)){ g_headers_truncate = cb; }
+static long g_last_handoff_fork = -1;
+long reorg_last_handoff_fork(void){ return g_last_handoff_fork; }
 
 static void (*g_index_rebuild)(void) = 0;
 void reorg_set_index_rebuild(void (*cb)(void)){ g_index_rebuild = cb; }
@@ -1363,6 +1381,7 @@ static long stage_read(void* ctx, long i, unsigned char* out, uint64_t cap){
     return (long)s->len[i];
 }
 
+long reorg_disconnect_to(void* st, long fork_height);
 long reorg_probe_peer(int fd, void* st, const char* peer){
     if (!g_cw_open) return 0;
     static reorg_cand_t cand;
@@ -1400,6 +1419,16 @@ long reorg_probe_peer(int fd, void* st, const char* peer){
     /* ---- download + verify every replacement block into the staging file
      * BEFORE touching anything. ---- */
     long nnew = cand.n - cand.first_new;
+    if (nnew > g_stage_max){
+        fprintf(stderr, "[reorg] the competing chain from %s adds %ld blocks, more than the %ld this stages from one peer: "
+                        "rewinding to fork height %ld on the strength of its headers; the parallel downloader fetches the replacement\n",
+                peer, nnew, g_stage_max, cand.fork_height);
+        long r = reorg_disconnect_to(st, cand.fork_height);
+        if (r < 0){ fprintf(stderr, "[reorg] rewind to %ld refused (%ld) -- no change\n", cand.fork_height, r); return r; }
+        if (g_headers_truncate) g_headers_truncate(cand.fork_height + 1);
+        g_last_handoff_fork = cand.fork_height;
+        return 3;
+    }
     stage_t stg; memset(&stg, 0, sizeof stg);
     stg.fd = open(REORG_STAGE_PATH, O_RDWR|O_CREAT|O_TRUNC, 0644);
     if (stg.fd < 0){

@@ -4052,6 +4052,19 @@ static int __attribute__((unused)) dlc_headers_connect_ok(unsigned char* hst, lo
 }
 /* drop everything appended past `have`: headers.dat is the store's backing
  * file (112-byte records), so truncate it and reload */
+/* the reorg handoff (daemon/reorg.c): the archive was rewound to the fork
+ * point; headers.dat must follow, or the next header sync reads the stale
+ * mirror as "already current" and the downloader never asks for the
+ * replacement (2026-09-09). The next dlc run re-reads the file. */
+static int g_dl_parallel_now = 0;
+static void dl_headers_truncate_to(long keep){
+    struct stat s;
+    if(stat("headers.dat", &s) != 0 || s.st_size <= (off_t)keep * 112) return;
+    if(truncate("headers.dat", (off_t)keep * 112) == 0)
+        fprintf(stderr,"[dl] header mirror rolled back to %ld record(s) for the reorg handoff\n", keep);
+    else fprintf(stderr,"[dl] could not roll headers.dat back to %ld record(s): %s\n", keep, strerror(errno));
+    g_dl_parallel_now = 1;
+}
 static void dlc_headers_rollback(unsigned char* hst, long have){
     if(truncate("headers.dat", (off_t)have * 112) != 0)
         fprintf(stderr,"[dlc] could not roll headers.dat back to %ld record(s): %s\n", have, strerror(errno));
@@ -6484,6 +6497,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     if(reorg_ok && !utxo_live_ok){
         fprintf(stderr,"[dl] live UTXO tracking is off -- fork detection stays on but REORGS ARE DISABLED (no undo data)\n");
     }
+    { extern void reorg_set_headers_truncate(void (*)(long)); reorg_set_headers_truncate(dl_headers_truncate_to); }   /* 2026-09-09: the handoff rewinds the mirror too */
     reorg_set_index_rebuild(rebuild_hash_index_after_reorg);
     /* 3.3: a block that fails VALIDATION in catch-up is rejected through
      * dl_reject_block, not left in the archive as a fatal retry loop */
@@ -7328,6 +7342,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             long atip = (long)(*(int*)(store_buf+24));
             long long nows = (long long)time(NULL);
             static long noop_best = -1, noop_tip = -1;
+            if(g_dl_parallel_now){ g_dl_parallel_now = 0; noop_best = -1; noop_tip = -1; dl_parallel_last_s = 0; }   /* a reorg handoff: fetch now */
             if(best == noop_best && atip == noop_tip) best = atip;        /* the same claim already came to nothing at this tip */
             if(dl_should_parallel_fetch(atip, best, apply_backlog, nows, dl_parallel_last_s)){
                 fprintf(stderr,"[dl] archive at %ld, peers announce %ld: %ld blocks behind -- running the parallel downloader (%d workers)\n",
@@ -7506,6 +7521,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                   fh, fh + 1, g_dl_last_seen_tip);
                           g_dl_last_seen_tip = (int)fh;
                       } }
+                } else if(pr == 3){
+                    /* handed off: the archive is at the fork point; the far-behind
+                     * check runs the parallel downloader on the next rotation */
+                    for(int k=0;k<mux_n_out;k++) if(mux_out_fd[k]>=0) anchor_locator(mux_out_loc[k]);
+                    did = 1; dl_parallel_last_s = 0;
+                    { extern long reorg_last_handoff_fork(void); long fh = reorg_last_handoff_fork();
+                      if(fh >= 0 && fh < (long)g_dl_last_seen_tip) g_dl_last_seen_tip = (int)fh; }
                 } else if(pr < 0){
                     fprintf(stderr,"[reorg] probe of %s rejected a candidate chain (no action taken)\n", mux_out_host[i]);
                 }
