@@ -450,3 +450,6 @@ asm/daemon/utxo_setinfo
 asm/daemon/bmc_build_block_filters
 asm/daemon/bmc_build_tx_index
 asm/daemon/bmc_utxo_probe_one
+
+# ---- Private project rules (local-only; contains identity info, never push) ----
+docs/PROJECT_LOCAL_RULES.md
