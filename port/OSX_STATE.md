@@ -4,7 +4,10 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
-## 2026-09-09 — p1 progressing: sha512 (asm) + ripemd160 (C twin) landed
+## 2026-09-09 — p1 progressing: sha512 + ripemd160 + sha1 landed
+
+- sha1 joined ripemd160 as a C twin (gate 10/10 after fixing a LE length
+  field the gate caught). Committed straight to bmc_osx (3ee6c5a5).
 
 - sha512.S native, upstream test 4/4. ripemd160 shipped as C twin after
   two failed asm translations (see OSX_ROADMAP pitfalls); 23/23 + 2.08M
