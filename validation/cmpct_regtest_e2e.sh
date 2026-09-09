@@ -1,7 +1,7 @@
 #!/bin/bash
 # validation/cmpct_regtest_e2e.sh -- compact blocks received end to end, on regtest.
 #
-# One bmc leg to a Core regtest node with bmc.cmpctrecv left at its default (1):
+# One bmc leg to a Core regtest node, compact blocks on (there is no switch, as in Core):
 # Core mines blocks carrying transactions this node has never seen, so every
 # block needs a getblocktxn round trip. PASS = bmc follows Core to the same
 # height; FAIL = it stalls. 2026-09-09: it stalled at the first such block on

@@ -15,6 +15,8 @@ static int g_enabled = 1; static cmpct_writer_t g_write = 0;
 static unsigned long g_st_recon = 0, g_st_need = 0, g_st_fb = 0;
 static int g_wtxid_cache = 1; static unsigned long g_st_hashed = 0;
 void cmpct_recv_set_enabled(int on){ g_enabled = on; }
+/* 2026-09-09: the sync drain re-requested a block in full after a compact one reconstructed badly (bitcoind.asm .have_block) */
+void cmpct_recv_note_fallback(void){ g_st_fb++; }
 void cmpct_recv_set_wtxid_cache(int on){ g_wtxid_cache = on; }
 unsigned long cmpct_recv_hashed(void){ return g_st_hashed; }
 int  cmpct_recv_enabled(void){ return g_enabled; }
