@@ -204,6 +204,7 @@ int main(void){
         memset(store_buf,0,sizeof store_buf);
         ck("A store_init", store_init(store_buf), 1);
         ck("A utxo_live_init", utxo_live_init("."), 1);
+        { extern int utxo_live_is_bulk(void); ck("a fresh datadir takes the dbcache-sized BULK memtable (2026-09-09)", utxo_live_is_bulk(), 1); }
         long n = 300;
         if (build_chain(n, 0x70000000u) < 0) return 1;
         u8 rec100[48], rec200[48];

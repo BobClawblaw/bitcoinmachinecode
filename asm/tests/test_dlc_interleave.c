@@ -285,6 +285,11 @@ static long run_download(const char* tag, int interleave, long* out_gate_applied
 }
 
 int main(void){
+    /* 2026-09-09: a fresh datadir takes the dbcache-sized bulk memtable by
+     * itself now; this test is about the interleave and its lag assertions
+     * are timing-sensitive under the gate's load, so it keeps the small
+     * memtable its expectations were written against. */
+    { extern void utxo_live_test_force_sizing(int); utxo_live_test_force_sizing(0); }
     signal(SIGPIPE, SIG_IGN);
     setvbuf(stdout, NULL, _IONBF, 0);
     build_chain();

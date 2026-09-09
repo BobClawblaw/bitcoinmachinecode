@@ -6,3 +6,7 @@ Production's first hour on snapshot n closed six legs an hour as `ours/sync-fail
 - **The fetch gate refuses a hash the store already holds** (`idx_get` on the worker's hash index) before claiming it in the in-flight table, so the duplicate is not fetched at all. The in-flight counter's "duplicate fetches avoided" now counts both.
 
 `test_sync_dup` (new, **watched to fail**: where=10, the pass failed): a first peer stores block 0; a second peer, asked from a stale locator, serves it again; the pass ends well with nothing counted and the next pass, from the true tip, fetches block 1. Its own binary because the archive's hash index is process-global. `test_dialhelper`: the gate refuses a known hash, claims a fresh one for this leg, refuses it to another leg while the claim lives, and frees it when the pass ends.
+
+---
+
+PR #152 (`batch/2026-09-09-duplicate-block`), merged 22:5xZ as `1081365e`; tag `duplicate-block-2026-09-09`. Gate MAKE_EXIT 0, 348 passes. Staged as `deploy-20260909o`; production runs n.
