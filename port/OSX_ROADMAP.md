@@ -25,7 +25,14 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       file-based batched oracle, and second: python -c cannot run a
       compound `while` statement on one line -> newline-separated helper.
 - [ ] bitcoin_hash (sha256d/block_hash/diff_target/pow_check) — needs sha256
-- [ ] sha1, sha512, ripemd160, bech32, base32
+- [x] sha512   -> port/osx/sha512.S      DONE 2026-09-09. Upstream
+      test_sha512 unchanged: 4/4 FIPS vectors (incl. 1M-'a').
+- [x] ripemd160 -> port/osx/ripemd160_twin.c  DONE 2026-09-09 as a C TWIN
+      (clang -O2 AArch64, identical symbol/semantics; in-file doc records
+      why: two asm translations diverged unlocatably). Gates: upstream
+      test_ripemd160 23/23 + thread-stress 2.08M digests/8 threads, 0
+      mismatches.
+- [ ] sha1, bech32, base32
 - [ ] secp256k1_fe / _point / _glv_c / _point_ct / _scalar / _scalar_c /
       _ecdsa (+ taproot _taproot/_schnorr when upstream main carries them)
 - [ ] bitcoin_hmac, aes (wallet_crypter deps), bip39
@@ -72,3 +79,21 @@ Darwin twin exists, each shim noted here with its justification.
 - python -c one-liners can't carry a compound while-statement on a single
   line (syntax error at the second simple statement) — newline-join or
   ship a helper .py file next to the harness.
+- FRAME-BASE ORDER: `sub sp, #locals` MUST come BEFORE `mov x20, sp`.
+  The wrong order points the frame base at the save area and every
+  +offset store lands in saved regs / the caller's frame -- the bug
+  class behind the ripemd160 crash saga (silent main-frame corruption,
+  process died at exit, pc=0 reports).
+- CALLEE-SAVED REGS ARE OFF-LIMITS inside .L helpers called from a
+  wrapper that parked pointers there (x25/x26/x27 as table bases
+  clobbered the wrapper's out/in/len). Use dead arg regs (x3-x7).
+- W-REGISTER TEMPS ZERO THE PARKED X-REG: writing w19 destroys x19's
+  upper half. Never park a live pointer in a register whose w-half is a
+  body temp (w19 was the X-load temp; out pointer moved to x6).
+- C-symbol naming: C `___dumphere` becomes `____dumphere` at link time
+  (extra `_`); asm `___dumphere` stays 3. When a debug symbol mismatches,
+  count the underscores first.
+- ESCAPE HATCH (used for ripemd160): a module may ship as a clang -O2 C
+  twin with the identical symbol when asm translation resists localization
+  -- rule #2 (prove the outcome) outranks assembly purity. Document
+  in-file and revisit after the daemon runs.
