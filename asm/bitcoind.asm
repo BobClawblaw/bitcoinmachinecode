@@ -1029,8 +1029,12 @@ node_sync_multi:
     ; correct either way: the locator is stale, and the next rotation
     ; rebuilds it from the true tip. Distinct fail code so the log
     ; distinguishes "append error" from "stale duplicate refused".
+    ; 2026-09-09: and it ends the pass WELL. A sibling leg storing the block
+    ; first is not this peer's failure; production on snapshot n closed six
+    ; legs an hour as "sync-failed-3x ... where=10". The code stays set for
+    ; the log; the next rotation rebuilds the locator from the true tip.
     mov  dword [rel sync_fail_code], 10
-    jmp  .fail
+    jmp  .done
     .app_err:
     mov  dword [rel sync_fail_code], 9
     jmp  .fail

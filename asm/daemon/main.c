@@ -1216,7 +1216,11 @@ static long long mux_out_since[MUX_MAX_OUT];      /* 2026-09-09: when the leg in
 #include "inflight.h"
 static inflight_t g_inflight; static int g_sync_leg = -1;
 extern void* g_block_fetch_hook;
-static long block_fetch_gate(const unsigned char* hash){ return inflight_claim(&g_inflight, hash, g_sync_leg, (long long)time(NULL)); }
+static long block_fetch_gate(const unsigned char* hash){
+    long h;
+    if(ht_idx && idx_get(ht_idx, hash, &h)) { g_inflight.refused++; return 0; }   /* already stored (a sibling leg landed it): nothing to fetch */
+    return inflight_claim(&g_inflight, hash, g_sync_leg, (long long)time(NULL));
+}
 /* 2026-09-09: we ping every leg, as Core does (2 min), and a leg that has not
  * answered in 20 min is closed. Until now a dead peer was found only when a
  * pass failed, and we had no ping time to offer an inbound-full node's
