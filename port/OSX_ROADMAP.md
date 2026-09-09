@@ -68,7 +68,18 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       gen_dsl_vecs*.py).  Commit 131e5171 (branch osx/p1-scalar).
       Pitfalls recorded: AArch64 `add`/`adc` set no flags (use
       adds/adcs); ldp Rt==Rt2 SIGILL; frame aliases need real `sub sp`.
-- [x] bitcoin_hmac -> port/osx/bitcoin_hmac.S  DONE 2026-09-09. Evidence:
+- [x] bitcoin_aes -> NO PORT NEEDED: asm/bitcoin_aes.c is pure C; test_aes
+      passes natively on AArch64 unchanged.  Verified 2026-09-09.
+- [x] bitcoin_bip39 -> port/osx/bitcoin_bip39.S  DONE 2026-09-09. Evidence:
+      tests/test_bip39 native: 24-vector oracle round (generate+validate+
+      entropy+seed; empty and TREZOR passphrases) + WAL-11 400-word
+      rejection + m39_guard canary + negative cases ALL PASS; the same
+      harness is green on x86 .242.  Commit 0c259e99.
+      MACH-O PITFALL: fixed-width data tables must go in __TEXT,__const —
+      __cstring entries get tail-merged by the Darwin linker, silently
+      shifting 9-byte wordlist records.  Helper-scratch pitfall:
+      find_word_index must use x8-x17 only (first draft trashed the
+      caller's x22/x23 after word one).
       test_hmac RFC 4231 3/3 native + 400-vector cross-arch differential
       (RFC shapes, BIP32/BIP39 inputs, 127/128/129 key boundaries,
       two-block pads) byte-identical vs .242 (drivers port/osx/tests/dsv.c
@@ -78,6 +89,8 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       x13 already +120) -- for the two-block pad path (rem>=112) it wrote
       16 zero bytes INTO THE CALLER'S FRAME (hmac kpad[8..23]).  Gate
       caught it: any keylen>=16 + msglen 112..127/255 failed vs x86.
+- [x] bitcoin_hmac -> port/osx/bitcoin_hmac.S  DONE 2026-09-09.  (Evidence
+      block follows the bip39/aes entries above.)
 - [x] bitcoin_tx -> port/osx/bitcoin_tx.S  DONE 2026-09-09. Evidence:
       upstream test_tx 20/20 + test_txtxid + test_tx_bounds_fuzz
       55,232,133 guarded calls 0 faults (all native) + 501-tx differential
