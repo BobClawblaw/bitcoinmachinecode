@@ -801,6 +801,17 @@ node_sync_multi:
     mov  rcx, 32
     rep  movsb
     pop  rsi
+    ; 2026-09-09: one request per block across the legs -- ask the daemon
+    ; whether another leg is already fetching this hash; if so this pass
+    ; ends with what it has (ok=1) and the next rotation re-checks.
+    mov  rax, [rel g_block_fetch_hook]
+    test rax, rax
+    jz   .fetch_ok
+    lea  rdi, [rbp-0xa0]
+    call rax
+    test rax, rax
+    jz   .done
+.fetch_ok:
     ; build getdata (buffer at -0xd0)
     lea  rdi, [rbp-0xd0]
     lea  rsi, [rbp-0xa0]
@@ -2364,6 +2375,8 @@ global g_cmpct_hook_blocktxn
 g_cmpct_hook_blocktxn:  dq 0      ; long (*)(fd, pl, plen, out, cap)
 global g_cmpct_hook_fallback
 g_cmpct_hook_fallback:  dq 0      ; void (*)(void): count a full-block fallback (2026-09-09)
+global g_block_fetch_hook
+g_block_fetch_hook:     dq 0      ; long (*)(const u8 hash[32]): 0 = another leg is fetching it, end the pass (2026-09-09)
 
 section .rodata
 _version: db "version",0
