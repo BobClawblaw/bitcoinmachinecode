@@ -225,7 +225,11 @@ static rj_val* tx_to_esplora(const rj_val* t, long height, const char* bhash, lo
     rj_obj_set(o, "vout", vout);
     if (fee < 0 && all_prev && cvin && cvin->nitems && !S(cvin->items[0], "coinbase")) fee = in_sum - out_sum;
     if (fee < 0 && cvin && cvin->nitems && S(cvin->items[0], "coinbase")) fee = 0;
-    rj_obj_set(o, "fee", rj_numf("%ld", fee < 0 ? 0 : fee));
+    /* an unknown fee (a prevout the node cannot resolve: no undo for the
+     * block, before the history was replayed) is OMITTED, not reported as 0 --
+     * "this transaction paid nothing" is a claim, and a false one (2026-09-08;
+     * mempool.space summed it into its block fee stats) */
+    if (fee >= 0) rj_obj_set(o, "fee", rj_numf("%ld", fee));
     rj_val* st = rj_obj();
     if (height >= 0){
         rj_obj_set(st, "confirmed", rj_bool(1));

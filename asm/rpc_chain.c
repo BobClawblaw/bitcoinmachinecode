@@ -3003,10 +3003,14 @@ static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, cons
  * Per-block statistics. Block-only fields (sizes/weights/counts/subsidy/times/
  * total_out/utxo_increase) are computed from block data and match Core exactly.
  * The fee/feerate fields and utxo_size_inc{,_actual} need the block's spent
- * prevout values+sizes (undo data); where undo is unavailable (our recent
- * window only) those keys are OMITTED -- an honest divergence from a full node
- * (which would error on a pruned block), consistent with getblock's fee
- * omission. Constants match Core: PER_UTXO_OVERHEAD = sizeof(COutPoint)+4 = 40. */
+ * prevout values+sizes (undo data). Without undo Core's GetUndoChecked throws
+ * RPC_MISC_ERROR "Can't read undo data from disk" (the genesis block excepted:
+ * it has no undo and answers), and so does this, since 2026-09-08: the eleven
+ * keys used to be OMITTED, which mempool.space's block indexer read as
+ * `stats.feerate_percentiles[2]` of undefined and died on the first block
+ * below production's undo history. A caller that must have the block-only
+ * fields for such a height has getblock (whose fee omission matches Core).
+ * Constants match Core: PER_UTXO_OVERHEAD = sizeof(COutPoint)+4 = 40. */
 static u64 gbs_subsidy(long h){ long era=h/g_halving_interval; if (era>=64) return 0; return 5000000000ULL >> era; }
 static long gbs_cs(u64 n){ if (n<253) return 1; if (n<=0xffff) return 3; if (n<=0xffffffffULL) return 5; return 9; }
 static int gbs_unspendable(const u8* s, u64 len){ return (len>0 && s[0]==0x6a) || len>10000; }
@@ -3033,6 +3037,7 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
     static u64 uvals[600000]; static u32 uslens[600000];
     long undo_n = undo_block_prevouts(h, uvals, uslens, 600000);
     int have_undo = (undo_n >= 0); long undo_cur = 0;
+    if (!have_undo && h > 0){ *ec=-1; *em="Can't read undo data from disk"; return 0; }   /* Core: GetUndoChecked */
 
     long long inputs=0, outputs=0, total_out=0, total_size=0, total_weight=0;
     long long swtotal_size=0, swtotal_weight=0, swtxs=0;

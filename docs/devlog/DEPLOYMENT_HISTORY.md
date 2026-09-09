@@ -1155,3 +1155,18 @@ that would have hit any fresh sync of the live build.
   Expected on the next boot: "[addrindex] LIVE: covered=<applied>
   (backfilled N; the archive is ahead, the rest lands as the engine
   applies it)" and no "boot backfill failed" line.
+
+## 2026-09-08 23:49Z — `deploy-20260908n`: the coinstats history heals itself (PR #125)
+
+- **Why:** the history build died in the 19:05Z OOM and nothing noticed;
+  the base is now a separate file the fold worker checks once a heartbeat
+  and rebuilds through a supervised child.
+- **What:** snapshot from `86d48a66`, relink, `systemctl restart` (the
+  operator's sentence, 23:49Z). Boot 2 m 20 s to the fold worker.
+- **Verified live at 23:53:51Z:** "[coinstats] repair: history base
+  absent -- building rows 0..966124 with 8 worker(s) (pid 1884083,
+  attempt 1 of 3)"; the builder discarded the 252 old-layout `csh_*.tmp`
+  (209 GB) first; `gettxoutsetinfo muhash 500000` refuses with "the
+  history base is being rebuilt (builder pid 1884083, rows 0..966124,
+  attempt 1)". Pass 1 at ~1.7k blocks/s per worker.
+

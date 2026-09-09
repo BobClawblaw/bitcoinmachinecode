@@ -12,4 +12,4 @@ The history build died in pass 3 when the box went over its memory at 19:05Z. No
 
 ---
 
-PR_LINE
+PR #125 (`batch/2026-09-08-coinstats-self-heal`), merged 23:33Z as `86d48a66`; tag `coinstats-self-heal-2026-09-08`. Deployed as snapshot `deploy-20260908n`; the first repair started on production at 23:53Z on its own.
