@@ -55,6 +55,7 @@
 #include "../bitcoin_pow_rules.h"
 #include "../mempool_slot.h"   /* the structural mempool's slot layout */
 #include "utxo_walk.h"
+#include "hdr_tree.h"      /* 2026-09-09: the fork tree -- branches off the best chain, retained like Core's block index */
 
 /* ---------------- externs: assembly + sibling C modules ------------------ */
 extern long store_reload(void* st);
@@ -164,8 +165,37 @@ static long g_stage_max = REORG_STAGE_MAX;
 void reorg_set_stage_max(long n){ g_stage_max = n > 0 ? n : REORG_STAGE_MAX; }
 static void (*g_headers_truncate)(long keep_records);            /* the header mirror follows the archive */
 void reorg_set_headers_truncate(void (*cb)(long)){ g_headers_truncate = cb; }
+/* the header mirror (headers.dat) is the BEST header chain: a handoff appends
+ * the winner's headers to it, and a keep-up leg that stores blocks off it is
+ * rewound. Both reach the file through these; tests register arrays. */
+static int (*g_mirror_append)(const unsigned char hdr80[80], long height);
+static int (*g_mirror_hash_at)(long height, unsigned char out[32]);
+void reorg_set_mirror_append(int (*cb)(const unsigned char*, long)){ g_mirror_append = cb; }
+void reorg_set_mirror_hash_at(int (*cb)(long, unsigned char*)){ g_mirror_hash_at = cb; }
 static long g_last_handoff_fork = -1;
 long reorg_last_handoff_fork(void){ return g_last_handoff_fork; }
+static int read_stored_header(void* st, long h, unsigned char out[80]);
+static unsigned hdr_bits(const unsigned char hdr[80]);
+/* retain OUR blocks [from..to] in the fork tree with their recorded work */
+static long retain_branch(void* st, long from, long to){
+    long n = 0; unsigned char hdr[80], w[16];
+    for (long h = from; h <= to; h++){
+        if (!read_stored_header(st, h, hdr) || store_chainwork_get_at(st, h, w) != 1) break;
+        if (hdrtree_add(hdr, h, w) == 1) n++;
+    }
+    return n;
+}
+/* retain a candidate's headers above the fork with cumulative work from the fork base */
+static long retain_candidate(void* st, const reorg_cand_t* c){
+    unsigned char cum[16]; memset(cum, 0, 16);
+    if (c->fork_height >= 0 && store_chainwork_get_at(st, c->fork_height, cum) != 1) return 0;
+    long n = 0;
+    for (long k = c->first_new; k < c->n; k++){
+        unsigned char w[16]; block_work(w, hdr_bits(c->hdr[k])); chainwork_add(cum, cum, w);
+        if (hdrtree_add(c->hdr[k], c->fork_height + 1 + (k - c->first_new), cum) == 1) n++;
+    }
+    return n;
+}
 
 static void (*g_index_rebuild)(void) = 0;
 void reorg_set_index_rebuild(void (*cb)(void)){ g_index_rebuild = cb; }
@@ -1411,8 +1441,9 @@ long reorg_probe_peer(int fd, void* st, const char* peer){
         if (cand.n == before) break;
     }
     if (verdict != 2){
-        fprintf(stderr, "[reorg] competing chain at height %ld from %s is NOT heavier -- ignoring (no action taken)\n",
-                cand.fork_height, peer);
+        long kept = retain_candidate(st, &cand);
+        fprintf(stderr, "[reorg] competing chain at height %ld from %s is NOT heavier -- no action; %ld header(s) retained in the fork tree\n",
+                cand.fork_height, peer, kept);
         return 0;
     }
 
@@ -1423,9 +1454,15 @@ long reorg_probe_peer(int fd, void* st, const char* peer){
         fprintf(stderr, "[reorg] the competing chain from %s adds %ld blocks, more than the %ld this stages from one peer: "
                         "rewinding to fork height %ld on the strength of its headers; the parallel downloader fetches the replacement\n",
                 peer, nnew, g_stage_max, cand.fork_height);
+        long old_tip = store_tip(st);
+        long kept = retain_branch(st, cand.fork_height + 1, old_tip);             /* the branch we leave stays known (Core keeps every header) */
         long r = reorg_disconnect_to(st, cand.fork_height);
         if (r < 0){ fprintf(stderr, "[reorg] rewind to %ld refused (%ld) -- no change\n", cand.fork_height, r); return r; }
         if (g_headers_truncate) g_headers_truncate(cand.fork_height + 1);
+        long appended = 0;
+        if (g_mirror_append) for (long k = cand.first_new; k < cand.n; k++){ if (g_mirror_append(cand.hdr[k], cand.fork_height + 1 + (k - cand.first_new)) != 1) break; appended++; }
+        fprintf(stderr, "[reorg] handoff: %ld header(s) of the branch we left retained in the fork tree; %ld of the winner's appended to the best header chain (now to %ld)\n",
+                kept, appended, cand.fork_height + appended);
         g_last_handoff_fork = cand.fork_height;
         return 3;
     }
@@ -1473,6 +1510,27 @@ long reorg_probe_peer(int fd, void* st, const char* peer){
 }
 
 /* CC-10: the disconnect half of reorg_execute, for invalidateblock. */
+/* A keep-up leg stored blocks (tip_before, tip]. Any of them off the best
+ * header chain -- the mirror names a different block at that height -- came
+ * from a peer on a lighter branch (the stuck peer that re-offered the eight
+ * stale blocks thirty seconds after the handoff, 2026-09-09). Retain them
+ * in the fork tree and rewind to the last height on the best chain. Returns
+ * the height rewound to, or -1 when every new block is on the best chain or
+ * beyond the mirror's knowledge. */
+long reorg_gate_best_header(void* st, long tip_before){
+    if (!g_mirror_hash_at) return -1;
+    long tip = store_tip(st); unsigned char want[32], have[32];
+    for (long h = tip_before + 1; h <= tip; h++){
+        if (!g_mirror_hash_at(h, want)) return -1;                    /* the mirror ends: an extension it does not know is fine */
+        if (!our_hash_at(st, h, have)) return -1;
+        if (memcmp(want, have, 32) == 0) continue;
+        long kept = retain_branch(st, h, tip);
+        fprintf(stderr, "[reorg] block(s) %ld..%ld are off the best header chain (a lighter branch; %ld header(s) retained in the fork tree) -- rewinding to %ld\n", h, tip, kept, h - 1);
+        long r = reorg_disconnect_to(st, h - 1);
+        return r < 0 ? -1 : h - 1;
+    }
+    return -1;
+}
 long reorg_disconnect_to(void* st, long fork_height){
     g_pure_disconnect = 1;
     long r = reorg_execute(st, fork_height, 0, NULL, NULL);

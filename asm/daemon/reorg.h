@@ -100,7 +100,10 @@ long reorg_disconnect_to(void* st, long fork_height);
  * registered callback (records to keep = fork height + 1). */
 void reorg_set_stage_max(long n);
 void reorg_set_headers_truncate(void (*cb)(long keep_records));
+void reorg_set_mirror_append(int (*cb)(const unsigned char hdr80[80], long height));
+void reorg_set_mirror_hash_at(int (*cb)(long height, unsigned char out[32]));
 long reorg_last_handoff_fork(void);
+long reorg_gate_best_header(void* st, long tip_before);
 /* A candidate chain containing a hash the operator invalidated is refused. */
 void reorg_set_invalid_fn(int (*fn)(const unsigned char hash[32]));
 long reorg_execute(void* st, long fork_height, long nblocks,

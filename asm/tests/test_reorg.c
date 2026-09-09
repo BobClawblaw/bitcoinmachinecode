@@ -1493,8 +1493,26 @@ static void case_fakepeer_locator_and_reorg(void){
 /* consistent" state), truncates the header mirror through the registered    */
 /* callback, and returns 3; the caller runs the parallel downloader.         */
 /* ======================================================================== */
+/* an in-memory header mirror standing in for headers.dat: the best header chain */
 static long g_trunc_keep = -1;
-static void test_headers_truncate(long keep){ g_trunc_keep = keep; }
+static unsigned char g_mirror_hash[MAXBLK * 2][32]; static long g_mirror_n = 0, g_mirror_first_appended = -1, g_mirror_appended = 0;
+static void test_headers_truncate(long keep){ g_trunc_keep = keep; if (g_mirror_n > keep) g_mirror_n = keep; }
+static int  test_mirror_append(const unsigned char* hdr, long height){
+    if (height != g_mirror_n || g_mirror_n >= MAXBLK * 2) return 0;
+    block_hash(g_mirror_hash[g_mirror_n], hdr); g_mirror_n++;
+    if (g_mirror_first_appended < 0) g_mirror_first_appended = height;
+    g_mirror_appended++; return 1;
+}
+static int  test_mirror_hash_at(long h, unsigned char out[32]){ if (h < 0 || h >= g_mirror_n) return 0; memcpy(out, g_mirror_hash[h], 32); return 1; }
+static void test_mirror_reset(long nb, long nl){
+    g_mirror_n = 0; g_mirror_first_appended = -1; g_mirror_appended = 0; g_trunc_keep = -1;
+    for (long h = 0; h < nb; h++) memcpy(g_mirror_hash[g_mirror_n++], base[h].hash, 32);
+    for (long i = 0; i < nl; i++) memcpy(g_mirror_hash[g_mirror_n++], lose[i].hash, 32);
+}
+extern int  hdrtree_has(const unsigned char hash[32]); extern void hdrtree_reset(void); extern long hdrtree_count(void);
+extern void reorg_set_stage_max(long); extern void reorg_set_headers_truncate(void (*)(long)); extern long reorg_last_handoff_fork(void);
+extern void reorg_set_mirror_append(int (*)(const unsigned char*, long)); extern void reorg_set_mirror_hash_at(int (*)(long, unsigned char*));
+extern long reorg_gate_best_header(void* st, long tip_before);
 static void case_fakepeer_handoff(void){
     const long nbase = 12, nlose = 3, nwin = 10;
     build_base(nbase, 0x207fffffu);
@@ -1503,8 +1521,9 @@ static void case_fakepeer_handoff(void){
     g_peer_nbase = nbase; g_peer_nwin = nwin;
     harness_open();
     store_chain(nbase, nlose);
-    extern void reorg_set_stage_max(long); extern void reorg_set_headers_truncate(void (*)(long)); extern long reorg_last_handoff_fork(void);
-    reorg_set_stage_max(8); reorg_set_headers_truncate(test_headers_truncate); g_trunc_keep = -1;
+    hdrtree_reset(); test_mirror_reset(nbase, nlose);
+    reorg_set_stage_max(8); reorg_set_headers_truncate(test_headers_truncate);
+    reorg_set_mirror_append(test_mirror_append); reorg_set_mirror_hash_at(test_mirror_hash_at);
 
     int ls = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in a; memset(&a,0,sizeof a);
@@ -1525,14 +1544,54 @@ static void case_fakepeer_handoff(void){
     ck("the archive is rewound to the fork point (the base's top)", (long)*(int*)(store_buf+24), nbase - 1);
     ck("the header mirror was told to keep fork+1 records", g_trunc_keep, nbase);
     ck("the handoff fork height is published for the caller", reorg_last_handoff_fork(), nbase - 1);
+    /* Core keeps every header: the branch we left is in the fork tree, the winner's headers are the mirror's continuation */
+    { int all = 1; for (long i = 0; i < nlose; i++) if (!hdrtree_has(lose[i].hash)) all = 0;
+      ck("the branch we left is retained in the fork tree (every header)", all, 1);
+      ck("the winner's headers are NOT in the tree (they are the best chain)", hdrtree_has(win[0].hash), 0); }
+    ck("the mirror was truncated to the fork and the winner's headers appended from height nbase", g_mirror_first_appended, nbase);
+    ck("all ten of the winner's headers went to the mirror", g_mirror_appended, nwin);
+    { unsigned char m[32]; ck("the mirror at the fork+1 is the winner's first block", test_mirror_hash_at(nbase, m) && !memcmp(m, win[0].hash, 32), 1); }
     /* the UTXO set is the base's alone: the losing branch's coins are gone, the winner's not yet in */
     model_reset();
     for (long h=0;h<nbase;h++) model_apply(&base[h]);
     verify_ondisk_chain("handoff", base, nbase);
     verify_utxo_against_model("handoff", lose, nlose);
-    reorg_set_stage_max(0); reorg_set_headers_truncate(0);
+    /* a keep-up leg re-offers the stale branch (the stuck peer, thirty seconds later): stored, then gated off the best header chain */
+    ckm("a leg stores the stale branch's first block again", harness_store(&lose[0]) == nbase);
+    ck("the store is on the stale branch again for a moment", (long)*(int*)(store_buf+24), nbase);
+    ck("the gate rewinds to the last height on the best header chain", reorg_gate_best_header(store_buf, nbase - 1), nbase - 1);
+    ck("the archive is back at the fork point", (long)*(int*)(store_buf+24), nbase - 1);
+    ck("the stale block stays known in the fork tree", hdrtree_has(lose[0].hash), 1);
+    /* a leg that extends BEYOND the mirror's knowledge is not gated: the mirror learns it */
+    { long before = (long)*(int*)(store_buf+24); ck("the gate is silent when nothing was stored", reorg_gate_best_header(store_buf, before), -1); }
+    reorg_set_stage_max(0); reorg_set_headers_truncate(0); reorg_set_mirror_append(0); reorg_set_mirror_hash_at(0);
     kill(pid, SIGKILL); waitpid(pid,0,0); close(ls);
     utxo_live_close();
+}
+
+/* ======================================================================== */
+/* CASE: a competing chain that is NOT heavier is retained, not forgotten.   */
+/* ======================================================================== */
+static void case_fakepeer_lighter_retained(void){
+    const long nbase = 12, nlose = 3, nwin = 2;                /* two winner blocks vs three of ours: lighter */
+    build_base(nbase, 0x207fffffu);
+    build_branch(lose, nlose, nbase, 0x20000000u, 0x207fffffu);
+    build_branch(win,  nwin,  nbase, 0x30000000u, 0x207fffffu);
+    g_peer_nbase = nbase; g_peer_nwin = nwin;
+    harness_open(); store_chain(nbase, nlose); hdrtree_reset();
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(ls,(struct sockaddr*)&a,sizeof a)!=0){ printf("FAIL bind\n"); failures++; return; }
+    socklen_t al = sizeof a; getsockname(ls,(struct sockaddr*)&a,&al); listen(ls, 4);
+    pid_t pid = fork(); if (pid == 0){ int c = accept(ls,0,0); if (c>=0){ fake_peer(c); close(c);} _exit(0); }
+    int fd = socket(AF_INET,SOCK_STREAM,0); struct timeval tv = {5,0}; setsockopt(fd,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
+    ckm("connect to fake peer (lighter chain)", connect(fd,(struct sockaddr*)&a,sizeof a)==0);
+    long r = reorg_probe_peer(fd, store_buf, "fakepeer"); close(fd);
+    ck("a lighter competing chain: no action", r, 0);
+    ck("our tip is unchanged", (long)*(int*)(store_buf+24), nbase + nlose - 1);
+    ck("... but its headers are retained in the fork tree (Core keeps every header)", hdrtree_has(win[0].hash) && hdrtree_has(win[1].hash), 1);
+    ck("our own blocks are not in the tree", hdrtree_has(lose[0].hash), 0);
+    kill(pid, SIGKILL); waitpid(pid,0,0); close(ls); utxo_live_close();
 }
 
 /* ======================================================================== */
@@ -1778,6 +1837,7 @@ int main(void){
     total += run_case("reorg header rules (VAL-5 rest)", case_reorg_header_rules);
     total += run_case("fake peer locator + reorg",      case_fakepeer_locator_and_reorg);
     total += run_case("fake peer handoff (long replacement)", case_fakepeer_handoff);
+    total += run_case("fake peer lighter chain retained", case_fakepeer_lighter_retained);
     total += run_case("node_sync_multi (asm frame)",    case_node_sync_multi);
     total += run_case("append-lock scope + prevhash gate", case_append_lock_scope);
 
