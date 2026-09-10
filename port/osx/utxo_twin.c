@@ -82,6 +82,10 @@ long utxo_put(void *u, const u8 txid[32], unsigned long index,
     memcpy(slot + 8, txid, 32);                     /* slot txid */
     *(u32 *)(slot + 40) = (u32)index;               /* slot index */
     memcpy(rec, &value, 8);
+    /* x86 packs height into low 32 bits and is_coinbase into BYTE 4 of the
+     * qword (shl r9,32 where r9 = the zero-extended is_coinbase byte value;
+     * bytes 5..7 stay zero). utxo_get unpacks height with a 32-bit mov and
+     * is_coinbase with shr 32/and 0xFF -- so cb must sit at bit 32, exactly. */
     u64 hc = (u64)height | ((u64)(is_coinbase & 0xFF) << 32);
     memcpy(rec + 8, &hc, 8);
     memcpy(rec + 16, &slen, 8);
@@ -194,6 +198,13 @@ long utxo_walk_live(void *u,
             return emitted;
     }
     return emitted;
+}
+
+
+/* utxo_struct_size(slots) -> 40 + slots*48 + 8 (byte-identical to the x86) */
+unsigned long utxo_struct_size(unsigned long slots)
+{
+    return 40 + slots * 48 + 8;
 }
 
 void utxo_prefetch(void *u, const u8 txid[32], unsigned long index);
