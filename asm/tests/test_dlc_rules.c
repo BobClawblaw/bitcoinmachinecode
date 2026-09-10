@@ -28,6 +28,25 @@ int main(void){
     ck("a chain 145 short is refused", dlc_chain_falls_short(966132 - 145, 966132));
     ck("a chain at or above the announced height is accepted", !dlc_chain_falls_short(966140, 966132));
     ck("with no announced height nothing falls short", !dlc_chain_falls_short(5, 0));
+    /* ---- Core's download shape (2026-09-10) ---- */
+    ck("124 live peers, cap 64: 64 download (run 19 ran 16)", dlc_workers_for(124, 64) == 64);
+    ck("12 live peers, cap 64: all 12", dlc_workers_for(12, 64) == 12);
+    ck("no live peer: still one worker slot", dlc_workers_for(0, 64) == 1);
+    ck("a cap above the arrays' 64 is 64", dlc_workers_for(500, 200) == 64);
+    ck("the window is six times what is in flight: 64 x 40 x 6 = 15,360", dlc_window_blocks(64, 40) == 15360);
+    ck("...never under 4,096 (16 workers: 3,840 in flight would be 1.6x, run 11's stall)", dlc_window_blocks(16, 40) == 4096);
+    ck("anchor: the connected tip + 1 when the engine is here", dlc_window_anchor(700001, 700970) == 700001);
+    ck("anchor: the first hole when there is no engine (-1)", dlc_window_anchor(-1, 700970) == 700970);
+    ck("anchor: never above the first hole", dlc_window_anchor(700980, 700970) == 700970);
+    ck("a claim 15,360 above the anchor is allowed", dlc_window_allows(700001 + 15360, 700001, 15360));
+    ck("15,361 above: the worker waits", !dlc_window_allows(700001 + 15361, 700001, 15360));
+    ck("stall timeout: 2 s doubles to 4 on an eviction", dlc_stall_timeout_after(2, 1) == 4);
+    ck("...and caps at 64", dlc_stall_timeout_after(64, 1) == 64 && dlc_stall_timeout_after(40, 1) == 64);
+    ck("...eases 15% when the tail moves (64 -> 54)", dlc_stall_timeout_after(64, 0) == 54);
+    ck("...never under 2 s", dlc_stall_timeout_after(2, 0) == 2);
+    ck("the tail's holder is a staller only while the window is full", !dlc_tail_stalled(0, 10000, 2) && dlc_tail_stalled(1, 2000, 2));
+    ck("1,999 ms at a 2 s timeout: not yet", !dlc_tail_stalled(1, 1999, 2));
+    ck("a peer is replaced only when a free peer exists", dlc_replace_allowed(1) && !dlc_replace_allowed(0));
     printf("%s (%d failure(s))\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }
