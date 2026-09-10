@@ -55,6 +55,19 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
   1M-slot table so it was latent. Vectors regenerated to keep <100% load;
   x86 asm fix goes on main (TODO.md).
 
+## 2026-09-09 — bitcoin_store twin landed (C twin); p2 store layer open
+
+- `port/osx/store_twin.c`: the full block store (init/reload/append/get_at/
+  get_tip/get_file_fd/prune family/append_shared family/reorg primitives/
+  truncate family), 19 public symbols. Gates: upstream test_store 42/42,
+  test_truncate 54/54, 69-record differential byte-identical (retval stream
+  AND the full cwd file set via tarball compare). Commit a253ef93.
+- Note: prune/truncate run against files by bare relative name -- differential
+  harness must start in a scratch cwd (stale prune.dat from a previous run
+  poisons store_init's gate restore).
+- GitHub push still blocked from this Mac (no gh auth, SSH key unregistered);
+  9 commits pending on bmc_osx.
+
 ## 2026-09-09 — bitcoin_hash native: first full 6-op module, x86-diff byte-identical
 
 - `port/osx/bitcoin_hash.S` (7 public symbols) gated three ways: upstream

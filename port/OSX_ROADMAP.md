@@ -162,6 +162,21 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       exercises defined behavior. x86 fix belongs on main (move the budget
       to a stack local or a non-clobbered reg) -- TODO.md item added.
       Commit 6fed3a71.
+- [x] bitcoin_store -> port/osx/store_twin.c  DONE 2026-09-09 as a C TWIN
+      (rolling 128MB blk%05u.dat files + positional index.dat, state struct
+      offsets identical; fmt_blkname, init/reload w/ prune.dat restore,
+      append w/ STO-11 fdatasync ordering + rollover, get_at with prune
+      gate + 0xFFFFFFFF sparse-prune marker, get_tip, get_file_fd, set/get
+      sync, append_shared(+nolock) w/ flock self-healing position, tip_hash,
+      validates_prevhash, layout_monotonic, truncate_to w/ the
+      monotonic-safety gate, truncate_index_only, set_prune/prune with
+      boundary-file compaction). Gates: upstream test_store 42/42 +
+      test_truncate 54/54 native + 69-record differential byte-identical vs
+      x86 bitcoin_store.o on .242 -- retval stream AND the full resulting
+      file set (index.dat, blk*.dat, prune.dat) compared via tarball
+      (dstore.c + gen_dstore_vecs.py: append/get/tip/tip_hash/
+      prevhash/monotonic/reload/re-append/prune persist+physical/
+      truncate_to mid + wipe/idx-only/sync toggles). Commit a253ef93.
 - [ ] bitcoin_sighash, bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
 - [ ] bitcoin_interp, bitcoin_scriptcodec, bitcoin_script_flags,
       bitcoin_script, bitcoin_multisig, bitcoin_cons
