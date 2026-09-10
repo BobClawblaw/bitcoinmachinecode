@@ -32,6 +32,9 @@ _hmac_sha512:
 	stp	x19, x20, [sp, #-16]!
 	stp	x21, x22, [sp, #-16]!
 	stp	x23, x24, [sp, #-16]!
+	stp	x25, x26, [sp, #-16]!	/* x25 = tmp base below -- callee-saved;
+	                                   main's GOT anchor died on it in the
+	                                   dbip32 differential driver 2026-09-10 */
 	sub	sp, sp, #1296			/* kpad(128) @sp+0 .. @sp+127,
 						   tmp(1160) @sp+128 .. @sp+1287 */
 
@@ -151,6 +154,7 @@ _hmac_sha512:
 	b.lo	.Lhmac_zt
 
 	add	sp, sp, #1296
+	ldp	x25, x26, [sp], #16
 	ldp	x23, x24, [sp], #16
 	ldp	x21, x22, [sp], #16
 	ldp	x19, x20, [sp], #16
