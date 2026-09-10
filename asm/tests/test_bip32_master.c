@@ -10,8 +10,13 @@ static void ck(const char* name,const unsigned char* seed,long sl,const char* ek
     unsigned char k[32],c[32];
     int r=bip32_master(k,c,seed,sl);
     unsigned char kg[32],cg[32];
-    for(int i=0;i<32;i++)sscanf(ek+i*2,"%2x",(unsigned*)&kg[i]);
-    for(int i=0;i<32;i++)sscanf(ec+i*2,"%2x",(unsigned*)&cg[i]);
+    /* %2x must go through an unsigned temp: sscanf writes 4 bytes, so
+     * (unsigned*)&kg[i] spills 3 bytes past each target -- under clang's
+     * arm64 frame order those bytes landed on kg[0..2]/c[0..2] and zeroed
+     * them AFTER the fill (found by the osx port gate 2026-09-09; the x86
+     * gcc layout hid it). Same pattern test_bip32_chain.c already uses. */
+    for(int i=0;i<32;i++){unsigned v;sscanf(ek+i*2,"%2x",&v);kg[i]=(unsigned char)v;}
+    for(int i=0;i<32;i++){unsigned v;sscanf(ec+i*2,"%2x",&v);cg[i]=(unsigned char)v;}
     int ok = r==1 && memcmp(k,kg,32)==0 && memcmp(c,cg,32)==0;
     printf("%s %s\n", ok?"PASS":"FAIL", name);
     if(!ok){ printf("  k got "); hx(k,32); printf("\n  k exp "); hx(kg,32); printf("\n  c got "); hx(c,32); printf("\n  c exp "); hx(cg,32); printf("\n"); failures++; }
