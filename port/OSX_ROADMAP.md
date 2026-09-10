@@ -177,6 +177,28 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       (dstore.c + gen_dstore_vecs.py: append/get/tip/tip_hash/
       prevhash/monotonic/reload/re-append/prune persist+physical/
       truncate_to mid + wipe/idx-only/sync toggles). Commit a253ef93.
+- [x] bitcoin_utxo_store -> port/osx/utxo_store_twin.c  DONE 2026-09-09 as
+      a C TWIN (WAL utxo.dat w/ 1MB process-wide shared buffer keyed by fd +
+      atomic utxo.idx checkpoint publish via .tmp+rename; put/del write the
+      record then apply via the memtable twin; reload = clear + snapshot +
+      WAL-tail replay with UTX-4 torn-tail truncate; init_ro for read-only
+      datadirs; log_len is the LOGICAL length). Also added
+      utxo_struct_size to utxo_twin.c (was missing). Gates: upstream
+      test_utxo_store + test_utxo_wal_buffer (42503-record self-drain) +
+      test_utxo_torn_tail ALL GREEN native; 124-record differential
+      byte-identical vs x86 on .242 -- retval stream AND utxo.dat/utxo.idx
+      files (duxst.c + gen_duxst_vecs.py: 40 puts w/ script lens
+      0/1/24/255/320/1690, dels, gets, count, full-WAL reload,
+      checkpoint+tail reload, second sync+tail, closes).
+      TWIN BUGS THE GATE CAUGHT: (1) torn-tail gate must fire on the
+      FAILING-RECORD START (a `torn` flag + rec_start vs log_end), else an
+      unknown-op record is skipped (consumed already advanced) and a clean
+      WAL's last record gets truncated -- both caught by test_utxo_torn_tail;
+      (2) utxo_get's out pointers are 8-byte unsigned long (asm ABI) -- a
+      4-byte out got its neighbor smashed (test_utxo_store's height checks).
+      DRIVER NOTE: x86-side duxst needs static get-outs (gcc -O2 stack-local
+      outs corrupted the value slot with the upstream asm; osx twin + statics
+      agree byte-for-byte). Commits 55c76deb (+ utxo_struct_size in utxo_twin).
 - [ ] bitcoin_sighash, bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
 - [ ] bitcoin_interp, bitcoin_scriptcodec, bitcoin_script_flags,
       bitcoin_script, bitcoin_multisig, bitcoin_cons

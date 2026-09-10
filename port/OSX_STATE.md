@@ -68,6 +68,14 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 - GitHub push still blocked from this Mac (no gh auth, SSH key unregistered);
   9 commits pending on bmc_osx.
 
+## 2026-09-09 — bitcoin_utxo_store twin landed (C twin)
+
+- `port/osx/utxo_store_twin.c`: WAL + checkpoint UTXO persistence (buffered
+  WAL, atomic checkpoint publish, torn-tail truncate, init_ro). Gates:
+  test_utxo_store + test_utxo_wal_buffer + test_utxo_torn_tail green,
+  124-record differential byte-identical (retvals + utxo.dat/utxo.idx).
+  Commit 55c76deb. utxo_struct_size added to utxo_twin.c.
+
 ## 2026-09-09 — bitcoin_hash native: first full 6-op module, x86-diff byte-identical
 
 - `port/osx/bitcoin_hash.S` (7 public symbols) gated three ways: upstream
