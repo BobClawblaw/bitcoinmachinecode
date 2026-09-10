@@ -2458,9 +2458,24 @@ int utxo_live_can_unapply(const void* blockbuf, u64 blocklen, long height){
  * captured by undo_capture_and_del at spend time (see daemon/undo_log.c's
  * header comment). Getting this wrong would mean a reorg-restored coinbase
  * output silently loses correct maturity data. */
+static long g_restore_present = 0;   /* restores skipped because the coin was still there (the spend never became durable) */
 static int undo_restore_cb(void* ctx, const u8 txid[32], u32 index, u64 value,
                            u32 height, u8 is_coinbase, const u8* script, u16 slen){
     int* fatal = (int*)ctx;
+    /* 2026-09-10 (CORE_DIVERGENCES row 4): restore only what is actually
+     * gone. The undo record proves the spend was CAPTURED, not that its
+     * delete reached the disk: a process that dies with the WAL buffer
+     * unwritten leaves the coin in place, and utxo_lsm_put of a key that
+     * lives in an older run counts it as new (the memtable cannot see the
+     * run without a lookup; the set stays right, the tally goes one high per
+     * such coin -- +2 in test_utxo_crash_recovery's mid-block scenario under
+     * the bulk memtable, where the base sits in a run rather than the
+     * memtable). The mirror of del_created_on_output's gate: one get per
+     * restored prevout, on rollback paths only. */
+    if (!g_store_inconsistent){
+        u64 v=0; unsigned long hh=0, cb=0, sl=0; const u8* sc=0;
+        if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, txid, index, &v, &hh, &cb, &sc, &sl) == 1){ g_restore_present++; return 1; }
+    }
     long r = utxo_lsm_put(&g_utxo_lst, g_utxo_table, txid, index, value,
                           (u64)height, (u64)is_coinbase, script, (u32)slen);
     if (r < 0 || r == 2) { *fatal = 1; return 0; }   /* UTX-3: sign, not one value */
