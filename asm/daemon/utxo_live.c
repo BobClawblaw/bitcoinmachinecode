@@ -743,8 +743,6 @@ void utxo_live_set_coinstats(csi_coin_fn add, csi_coin_fn rm,
  * below), exactly as csi_seed_from_walk does at boot. This hook is that
  * moment; the observers above stay registered and inert (the index is
  * invalid) until it fires. NULL outside the worker. */
-static void (*g_csi_caught_up)(void* lst, void* table, long height) = 0;
-void utxo_live_set_coinstats_caught_up(void (*fn)(void*, void*, long)){ g_csi_caught_up = fn; }
 
 extern long utxo_store_wal_drain(void* st);
 static int persist_applied_height(long h){
@@ -3617,13 +3615,9 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
                 fprintf(stderr, "[utxo_live] WARNING: catch-up WAL flush did not complete (r=%ld, log_len=%llu of %llu): a restart before the next block will replay that tail into a steady-state memtable and be very slow -- daemon/flush_wal_tail is the manual remedy\n",
                         fr, (unsigned long long)g_utxo_lst.log_len, before_len);
         }
-        /* The coinstats index seeds HERE, from a walk of the now-caught-up
-         * set (see utxo_live_set_coinstats_caught_up). The set is quiescent
-         * exactly as at boot: this is the same thread, between blocks, with
-         * the batch checkpoint just persisted above; a background compaction
-         * (a separate process) never touches this process's manifest until
-         * compact_poll adopts it. Minutes on mainnet, once per process. */
-        if (g_csi_caught_up) g_csi_caught_up(&g_utxo_lst, g_utxo_table, g_applied_height);
+        /* (The coinstats index used to seed HERE from a walk; since
+         * 2026-09-10 it folds per block from block 0 through the fold
+         * worker, in every mode, like Core's coinstatsindex.) */
     }
     if (applied > 0) {
         /* STAGE B: steady-state undo-data retention. Bounded and resumable

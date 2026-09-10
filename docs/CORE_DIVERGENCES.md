@@ -18,6 +18,7 @@ An inventory taken after the 09-09 leg and compact-block work, extended the same
 
 | # | what | PR |
 |---|---|---|
+| m | the coinstats index folds per block during a bulk sync through the fold worker (the walk-at-caught-up deferral is gone; history rows from block 0) | #156 |
 | l | bulk mode checkpoints every 1,024 blocks or 60 s, a bounded pass carries its batch and never downshifts the memtable | #155 |
 | k | a background merge waits while the apply is behind and yields when it runs | #154 |
 | j | a fresh sync uses the dbcache: an empty set takes the bulk memtable | #153 |

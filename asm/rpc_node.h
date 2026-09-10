@@ -363,7 +363,7 @@ typedef struct {
     volatile unsigned long long csi_lapped;         /* records lost to overrun (worker side)  */
     volatile unsigned long long csi_overrun;        /* pushes that gave up waiting (producer) */
     volatile unsigned long long csi_folds;          /* elements the worker has folded */
-    volatile int                csi_deferred;       /* bulk catch-up: index seeds at caught-up */
+    volatile int                csi_deferred;       /* retired 2026-09-10 (bulk catch-up deferred the index); stays 0, kept for the layout */
     volatile int                csi_pause;          /* test seam: the worker holds its cursor */
     volatile int                csi_worker_pid;     /* 0 = no worker (inline folding) */
     struct {
