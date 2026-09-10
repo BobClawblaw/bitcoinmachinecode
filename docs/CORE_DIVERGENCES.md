@@ -8,11 +8,13 @@ An inventory taken after the 09-09 leg and compact-block work, extended the same
 |---|---|---|---|---|---|
 | 1 | leg service | one event loop over all peers, never blocked by a connect | legs served one at a time, 60 s budget each; since #161 no dial blocks the loop and passes run only on announcements | a slow pass still delays the other legs; the 27 s block on snapshot t (an inline top-up) is fixed | an event-driven leg loop for what remains |
 | 2 | mempool overlap with the network | a peer's mempool holds nearly every transaction a new block carries (blocktxn a few KB) | production held 4,472 entries; one blocktxn on 2026-09-10 was 800 KB of a 1.6 MB block (half the transactions missing), seven round trips under TCP slow start on a 0.8 s peer | relay coverage: what the legs announce vs what we request, orphan and policy rejects, the pool's size; measure the miss rate per block first |
+| 3 | BIP324 v2 on helper-dialed legs | dials v2 wherever the peer advertises it | a leg dialled by the background helper is v1 (the cipher state cannot cross the fork; snapshot u lost every such leg within a second) | privacy on the outbound legs the helper installs (re-dials and top-ups); the boot's own dials are still v2 | hand the transport state over with the fd (buffers and a cipher: a serialiser), or move the v2 handshake to the parent under a bound |
 
 ## Closed today
 
 | # | what | PR |
 |---|---|---|
+| u | helper-dialed legs speak v1 (the v2 state stays in the child); the worker creates the dial memory (it was null on production since 09-09: "0 min" backoffs) | #163 |
 | t | the block filter index and the address history repair themselves in the daemon (the coinstats supervisor as a module, one instance per index) | #162 |
 | s | the live coin counter after a crash under the bulk memtable: the ghost rollback restores only what is gone (a lookup before the put) | #162 |
 | r | the legs stay served through a reorg handoff (the sweep runs inside the parallel download); helpers bounded by the span | #162 |
