@@ -181,17 +181,18 @@ static long long txr_now_ms(void);
  * instead of reporting a mismatch. A bound turns the worst case of a future
  * mistake back into the linear scan this index replaced -- slow, which is
  * survivable, rather than wedged, which is not. */
-static int txr_ring_has(const u8* txid){
+static int txr_ring_lookup(const u8* txid, int count_refetch){
     txr_hash_init();
     unsigned guard = 0;
     for (int i = txr_ring_head[txr_h8(txid)]; i >= 0 && guard < TXR_RING; i = txr_ring_next[i], guard++)
         if (!memcmp(txr_ring[i], txid, 8)){
             if (txr_now_ms() - txr_ring_t[i] < txr_req_ttl_ms) return 1;
-            txr_req_refetch++;
+            if (count_refetch) txr_req_refetch++;
             return 0;                                   /* timed out: ask again */
         }
     return 0;
 }
+static int txr_ring_has(const u8* txid){ return txr_ring_lookup(txid, 1); }
 static void txr_ring_add(const u8* txid){
     txr_hash_init();
     unsigned slot = txr_ring_w % TXR_RING;
@@ -1174,6 +1175,38 @@ void txrelay_stats3(long* retried_other, long* gaveup, long* active){
 }
 
 void (*txrelay_on_pong)(int fd, const unsigned char nonce[8]) = 0;   /* set by the daemon (2026-09-09) */
+/* ---- 2026-09-10, CORE_DIVERGENCES row 2: the request queue drains --------
+ * Core's TxRequestTracker keeps every announcement and requests as the
+ * in-flight budget frees up. Ours requested at most TXR_MAX_REQ per pass and
+ * left the rest noted as announced but never requested: 106 of a block's
+ * missing transactions on production (2026-09-10 05:12Z). Each poll of a leg
+ * now requests, from what that leg announced and nothing has fetched, up to
+ * TXR_MAX_REQ more while the per-peer in-flight budget (100) has room. */
+static long txr_drained = 0;
+long txrelay_drained_count(void){ return txr_drained; }
+static int txr_drain_pending(int fd, void* mp, int outstanding){
+    static u8 gd[1 + TXR_MAX_REQ*36];
+    unsigned want = 0;
+    for (int i = 0; i < TXR_WANT_MAX && want < TXR_MAX_REQ && outstanding + (int)want < 100; i++){
+        txr_want_t* w = &txr_want_tab[i];
+        if (!w->used || w->inflight) continue;
+        int mine = 0; for (int k = 0; k < w->nfd; k++) if (w->fds[k] == fd) mine = 1;
+        if (!mine || txr_want_tried(w, fd) || txr_nf_has(fd, w->hash) || txr_ring_lookup(w->hash, 0)) continue;   /* the drain is not a re-request after a timeout */
+        unsigned long got_len;
+        if (w->rtype == TXR_MSG_WITNESS_TX && mpool_get(mp, w->hash, &got_len)){ txr_want_forget(w); continue; }
+        u8* o = gd + 1 + want*36;
+        o[0] = (u8)w->rtype; o[1] = (u8)(w->rtype >> 8); o[2] = (u8)(w->rtype >> 16); o[3] = (u8)(w->rtype >> 24);
+        memcpy(o + 4, w->hash, 32);
+        txr_ring_add(w->hash);
+        txr_want_note(w->hash, w->rtype, fd, 1);
+        want++;
+    }
+    if (!want) return 0;
+    gd[0] = (u8)want;
+    if (p2p_write(fd, "getdata", 7, gd, 1 + want*36) <= 0) return 0;
+    txr_drained += want;
+    return (int)want;
+}
 /* ---- 2026-09-10: Core's shape at the tip ---------------------------------
  * Block announcements and pushed blocks reach the daemon from the SWEEP
  * instead of waiting for the leg's rotation turn (5-20 s behind Core on
@@ -1262,6 +1295,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
     int outstanding = txr_pend_get(fd);  /* getdata entries awaiting replies, carried from the last poll */
     txr_orphan_expire();
     txr_recon_expire();
+    outstanding += txr_drain_pending(fd, mp, outstanding);   /* row 2: what this leg announced and nothing fetched */
     long long deadline = txr_now_ms() + max_ms;
 
     for (int msgs = 0; msgs < TXR_MAX_MSGS; msgs++){
@@ -1327,8 +1361,10 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 continue;
             }
             unsigned long scanned_cap = n < 5000UL ? n : 5000UL;
-            for (unsigned long i = 0; i < scanned_cap && want < TXR_MAX_REQ; i++){
-                if (outstanding + (int)want >= 100) break;     /* Core's per-peer in-flight cap */
+            /* 2026-09-10: every entry is NOTED (Core keeps every announcement);
+             * only the request stops at the per-pass and per-peer caps, and
+             * txr_drain_pending requests the rest on later polls */
+            for (unsigned long i = 0; i < scanned_cap; i++){
                 const u8* e = pl + cc + i*36;
                 if (e + 36 > pl + plen) break;
                 unsigned type = (unsigned)e[0] | (unsigned)e[1]<<8 |
@@ -1341,6 +1377,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 else continue;
                 unsigned long got_len;
                 txr_want_note(e + 4, req_type, fd, 0);           /* remember the announcer either way */
+                if (want >= TXR_MAX_REQ || outstanding + (int)want >= 100) continue;   /* the caps: noted, requested by the drain later */
                 if (txr_ring_has(e + 4)) continue;     /* recently requested */
                 /* pool-dedup only makes sense for a txid announcement; a
                  * wtxid keys differently, so a wtxid we already hold may be
