@@ -42,6 +42,19 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
   byte-identical vs x86 -- result stream AND the resulting peers.dat file.
   Commit 2725d14b.
 
+## 2026-09-09 — bitcoin_idx twin landed (C twin) + REAL x86 BUG found
+
+- `port/osx/idx_twin.c`: hash->height open-addressing index (init/put/get/
+  count/build_from_file), layout-compatible 48B slots. Gates: upstream
+  test_idx 12/12, 868-record cross-arch differential byte-identical.
+  Commit 6fed3a71.
+- THE DIFFERENTIAL FOUND A REAL X86 BUG: 100%-full table -> x86 idx_put
+  spins forever. memcmp_exact clobbers r8b; idx_put keeps the probe budget
+  in r8 across the call, so after one non-matching memcmp the budget is
+  garbage and `dec r8; jz .full` never fires. Production never fills its
+  1M-slot table so it was latent. Vectors regenerated to keep <100% load;
+  x86 asm fix goes on main (TODO.md).
+
 ## 2026-09-09 — bitcoin_hash native: first full 6-op module, x86-diff byte-identical
 
 - `port/osx/bitcoin_hash.S` (7 public symbols) gated three ways: upstream
