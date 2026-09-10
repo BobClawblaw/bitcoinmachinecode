@@ -28,6 +28,8 @@ void bmc_v2_close(int fd);
  * state does not fit; import: 1 / 0, and the fd is a v2 session from then. */
 long bmc_v2_export(int fd, unsigned char* out, unsigned long cap);
 int  bmc_v2_import(int fd, const unsigned char* in, unsigned long len);
+long bmc_v2_export_need(int fd);       /* bytes an export needs now (0: not a v2 session) */
+int  bmc_v2_pump_once(int fd);         /* one socket read into the session, nothing delivered: bytes, 0 EOF, -1 error */
 
 /* 1 if this fd is carrying a v2 session. */
 int bmc_v2_is_active(int fd);

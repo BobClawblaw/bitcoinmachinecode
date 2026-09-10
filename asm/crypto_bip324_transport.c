@@ -352,6 +352,7 @@ typedef struct {
     unsigned long  recv_len, msg_len;
     char           msg_type[13];
 } bip324_xport_hdr;
+unsigned long bip324_t_export_need(const bip324_transport_t* t){ return sizeof(bip324_xport_hdr) + sizeof t->cipher + t->recv.len + t->msg.len; }
 long bip324_t_export(const bip324_transport_t* t, unsigned char* out, unsigned long cap){
     if (t->recv_state != BIP324_RECV_APP || !t->keys_ready) return 0;
     unsigned long need = sizeof(bip324_xport_hdr) + sizeof t->cipher + t->recv.len + t->msg.len;

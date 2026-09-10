@@ -68,6 +68,7 @@ void bip324_t_free(bip324_transport_t* t);
  * the session reaches BIP324_RECV_APP, which is the only state exported.
  * Returns the bytes written (0: not exportable / cap too small); import
  * returns 1 / 0. */
+unsigned long bip324_t_export_need(const bip324_transport_t* t);   /* bytes an export would need (a message in flight rides in it) */
 long bip324_t_export(const bip324_transport_t* t, unsigned char* out, unsigned long cap);
 int  bip324_t_import(bip324_transport_t* t, const unsigned char* in, unsigned long len);
 
