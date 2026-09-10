@@ -2706,17 +2706,30 @@ static void log_hash_short(char out[17], const unsigned char hash32[32]){
  * our tip, through the same evaluator submitblock uses; and a store breaks
  * the rotation so the apply runs at once. */
 static int g_stored_now = 0;                            /* a pushed block was stored during this rotation's sweeps */
+/* row 5's measurement, one line per block that went through the compact
+ * receiver: what the mempool supplied and where the rest had gone */
+extern void cmpct_recv_last_block(unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long cls[5]);
+static void cmpct_overlap_line(long height, const char* host){
+    unsigned long ntx, pool, pre, miss, mb, cls[5]; cmpct_recv_last_block(&ntx, &pool, &pre, &miss, &mb, cls);
+    if(!ntx) return;
+    fprintf(stderr,"[cmpct] block %ld (%s): %lu tx: %lu from the mempool (%.1f%%), %lu prefilled, %lu fetched by getblocktxn (%lu KB): %lu never announced, %lu announced not requested, %lu requested no reply, %lu orphans, %lu rejected by policy\n",
+            height, host, ntx, pool, ntx ? 100.0 * (double)pool / (double)ntx : 0.0, pre, miss, mb / 1024,
+            cls[0], cls[1], cls[2], cls[3], cls[4]);
+}
 static long g_announce_inv_n, g_announce_hdr_n, g_push_n, g_push_stored_n, g_push_skipped_n;
 static int leg_of_fd(int fd){ for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && mux_out_fd[k] == fd) return k; return -1; }
-static void leg_on_block_announce(int fd, const unsigned char hash[32]){
+static unsigned char mux_out_announced_hash[MUX_MAX_OUT][32];
+static void leg_on_block_announce(int fd, const unsigned char hash[32], const char* how){
     int k = leg_of_fd(fd); if(k < 0) return;
     long h; if(ht_idx && idx_get(ht_idx, hash, &h)) return;         /* already stored */
-    mux_out_announced[k] = 1;
+    if(mux_out_announced[k] && !memcmp(mux_out_announced_hash[k], hash, 32)) return;   /* the same block, again */
+    mux_out_announced[k] = 1; memcpy(mux_out_announced_hash[k], hash, 32);
+    fprintf(stderr,"[tip] %s announced block %02x%02x%02x%02x.. by %s: its pass runs next\n", mux_out_host[k], hash[31], hash[30], hash[29], hash[28], how);
 }
-static void leg_on_block_inv(int fd, const unsigned char hash[32]){ g_announce_inv_n++; leg_on_block_announce(fd, hash); }
+static void leg_on_block_inv(int fd, const unsigned char hash[32]){ g_announce_inv_n++; leg_on_block_announce(fd, hash, "inv"); }
 static void leg_on_headers(int fd, const unsigned char* hdrs, unsigned long n){
     unsigned char bh[32]; sha256d(bh, hdrs + (n - 1) * 81, 80); g_announce_hdr_n++;
-    leg_on_block_announce(fd, bh);
+    leg_on_block_announce(fd, bh, "headers");
 }
 /* the rotation asks: is a leg other than `except` announced? (clears the mark) */
 static int leg_announced_pick(int except){
@@ -2753,11 +2766,11 @@ static unsigned char g_push_hash[32]; static int g_push_pending = 0, g_push_leg 
  * then the locked append; the apply follows at once (the rotation breaks) */
 static long dl_store_pushed_block(int k, const unsigned char* blk, unsigned long len, const unsigned char bh[32], const char* how){
     unsigned char tiph[32]; long tip = *(int*)(store_buf + 24);
-    if(store_get_tip_hash(store_buf, tiph) != 1 || memcmp(blk + 4, tiph, 32) != 0){ g_push_skipped_n++; leg_on_block_announce(mux_out_fd[k], bh); return 0; }   /* not on our tip: the pass sorts it out */
+    if(store_get_tip_hash(store_buf, tiph) != 1 || memcmp(blk + 4, tiph, 32) != 0){ g_push_skipped_n++; leg_on_block_announce(mux_out_fd[k], bh, "a push off our tip"); return 0; }   /* not on our tip: the pass sorts it out */
     char reason[64]; reason[0] = 0;
     if(blk_submit_evaluate_ex(blk, len, tiph, tip, 1, reason, sizeof reason) != 1){
         fprintf(stderr,"[cmpct] %s from %s refused: %s -- the leg's pass fetches it in full\n", how, mux_out_host[k], reason);
-        leg_on_block_announce(mux_out_fd[k], bh); return -1;
+        leg_on_block_announce(mux_out_fd[k], bh, "a refused push"); return -1;
     }
     long r = idxscan_append_locked(store_buf, bh, blk, (long)len);
     if(r == -2){ g_push_skipped_n++; return 0; }                        /* the tip moved under us: a sibling stored it first */
@@ -2765,6 +2778,7 @@ static long dl_store_pushed_block(int k, const unsigned char* blk, unsigned long
     g_push_stored_n++; g_stored_now = 1;
     { char hs[17]; for(int j = 0; j < 8; j++) sprintf(hs + 2*j, "%02x", bh[31 - j]);
       fprintf(stderr,"[block] stored height=%ld hash=%s.. bytes=%lu (%s from %s)\n", tip + 1, hs, len, how, mux_out_host[k]); }
+    if(how[0] == 'p' && how[7] == 'c') cmpct_overlap_line(tip + 1, mux_out_host[k]);   /* "pushed compact block..." */
     leg_hb_note_block(k);
     return 1;
 }
@@ -2773,7 +2787,7 @@ static long leg_on_cmpctblock(int fd, const unsigned char* pl, unsigned long ple
     unsigned char bh[32]; sha256d(bh, pl, 80); g_push_n++;
     long h; if(ht_idx && idx_get(ht_idx, bh, &h)){ g_push_skipped_n++; return 0; }
     unsigned char tiph[32];
-    if(store_get_tip_hash(store_buf, tiph) != 1 || memcmp(pl + 4, tiph, 32) != 0){ leg_on_block_announce(fd, bh); return 0; }   /* behind, or a fork: the pass sorts it out */
+    if(store_get_tip_hash(store_buf, tiph) != 1 || memcmp(pl + 4, tiph, 32) != 0){ leg_on_block_announce(fd, bh, "a compact block off our tip"); return 0; }   /* behind, or a fork: the pass sorts it out */
     if(!inflight_claim(&g_inflight, bh, k, (long long)time(NULL))) return 0;   /* another leg is fetching it */
     if(g_push_pending){ inflight_release_leg(&g_inflight, g_push_leg); g_push_pending = 0; }   /* an older push never completed */
     long n = cmpct_recv_cmpctblock(fd, txsub_worker_ready() ? txsub_pool() : NULL, pl, plen, g_push_blk, sizeof g_push_blk, bh);
@@ -2818,7 +2832,8 @@ static long do_outbound_sync(int i){
     inflight_release_leg(&g_inflight, i); g_sync_leg = -1;   /* the claims live with the pass */
     if(g_peer_sendcmpct && !mux_out_cmpct[i]){ mux_out_cmpct[i] = 1; fprintf(stderr, "[cmpct] %s accepts compact blocks: requesting MSG_CMPCT_BLOCK on this leg from now on\n", mux_out_host[i]); }
     { static unsigned long p_r, p_n, p_f; unsigned long r, n, f; cmpct_recv_stats(&r, &n, &f);
-      if(r != p_r || n != p_n || f != p_f){ fprintf(stderr, "[cmpct] reconstructed %lu block(s) from the mempool (%lu needed a getblocktxn round trip, %lu fell back to a full block)\n", r, n, f); p_r = r; p_n = n; p_f = f; } }
+      if(r != p_r || n != p_n || f != p_f){ fprintf(stderr, "[cmpct] reconstructed %lu block(s) from the mempool (%lu needed a getblocktxn round trip, %lu fell back to a full block)\n", r, n, f); p_r = r; p_n = n; p_f = f;
+                                              cmpct_overlap_line((long)*(int*)(store_buf+24), mux_out_host[i]); } }
     double sync_s = phase_elapsed(&sync_pt);
     int st_tip=*(int*)(store_buf+24);
     /* 2026-09-09: blocks this leg stored off the best header chain came from a
@@ -2953,8 +2968,15 @@ static long do_outbound_sync(int i){
  * worker polls the channel without blocking every rotation and installs the
  * leg exactly as the inline fill would have. Core does the same job with a
  * thread; a child keeps this worker's single-threaded invariants. */
-#define DH_MAX 2
-typedef struct { int sp; pid_t pid; char host[128]; int net; long long t0; } dh_slot_t;
+/* 2026-09-10: every outbound dial runs in a helper now -- the clearnet
+ * re-dial and the top-up used outbound_connect inline, and a candidate that
+ * black-holes costs the 10 s connect timeout, four of them 40 s, during
+ * which the worker reads no leg: the first block on snapshot t was stored
+ * 27 s after the oracle because the loop sat in a top-up. Core's message
+ * loop never blocks on a connect. want_slot: the leg slot a re-dial fills
+ * when it lands (-1: append, the top-up's case). */
+#define DH_MAX 4
+typedef struct { int sp; pid_t pid; char host[128]; int net; long long t0; int want_slot; } dh_slot_t;
 static dh_slot_t g_dh[DH_MAX];
 static long long g_dh_timeout_ms = 120000;
 /* g_in_dial_helper is declared with the leg tables above */
@@ -2989,7 +3011,11 @@ static int dh_reserved_pick(int an, int net, const char* srcpool[], int nsrc){
     }
     return -1;
 }
-static int dh_start(const char* host, int out_port){
+static int dh_inflight_for(int want_slot){ for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0 && g_dh[i].want_slot == want_slot) return 1; return 0; }
+static int g_dh_last_slot = -1;   /* the want_slot of the result dh_poll just returned */
+static int dh_start_slot(const char* host, int out_port, int want_slot);
+static int dh_start(const char* host, int out_port){ return dh_start_slot(host, out_port, -1); }
+static int dh_start_slot(const char* host, int out_port, int want_slot){
     int slot = -1; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid <= 0){ slot = i; break; }
     if(slot < 0) return 0;
     int sp[2]; if(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return 0;
@@ -3016,9 +3042,10 @@ static int dh_start(const char* host, int out_port){
         _exit(0);
     }
     close(sp[1]);
-    g_dh[slot].sp = sp[0]; g_dh[slot].pid = pid; g_dh[slot].net = leg_net_of(host); g_dh[slot].t0 = dh_now_ms();
+    g_dh[slot].sp = sp[0]; g_dh[slot].pid = pid; g_dh[slot].net = leg_net_of(host); g_dh[slot].t0 = dh_now_ms(); g_dh[slot].want_slot = want_slot;
     snprintf(g_dh[slot].host, sizeof g_dh[slot].host, "%s", host);
-    fprintf(stderr, "[dial] %s: dialing in the background (%s)\n", host, bmc_net_name(g_dh[slot].net));
+    if(want_slot >= 0) fprintf(stderr, "[dial] %s: dialing in the background for leg %d (%s)\n", host, want_slot, bmc_net_name(g_dh[slot].net));
+    else fprintf(stderr, "[dial] %s: dialing in the background (%s)\n", host, bmc_net_name(g_dh[slot].net));
     return 1;
 }
 /* ---- -privatebroadcast (Core v30): the worker's side -----------------------
@@ -3174,7 +3201,7 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
             if(dh_now_ms() - g_dh[i].t0 > g_dh_timeout_ms){
                 fprintf(stderr, "[dial] %s: background dial gave up after %llds\n", g_dh[i].host, g_dh_timeout_ms / 1000);
                 kill(g_dh[i].pid, SIGKILL); waitpid(g_dh[i].pid, NULL, 0);
-                close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1;
+                close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1; g_dh_last_slot = g_dh[i].want_slot;
                 out->ok = 0; snprintf(out->why, sizeof out->why, "timeout"); *fd_out = -1;
                 snprintf(host_out, hcap, "%s", g_dh[i].host);
                 return 1;
@@ -3188,7 +3215,7 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
             if(*fd_out < 0) out->ok = 0;
         } else if(n != (ssize_t)sizeof *out){ out->ok = 0; snprintf(out->why, sizeof out->why, "helper exited without a result"); }
         waitpid(g_dh[i].pid, NULL, 0);
-        close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1;
+        close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1; g_dh_last_slot = g_dh[i].want_slot;
         snprintf(host_out, hcap, "%s", g_dh[i].host);
         return 1;
     }
@@ -3196,10 +3223,21 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
 }
 /* install a helper-dialled leg exactly as the inline fill does */
 static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
-    if(mux_n_out >= MUX_MAX_OUT){ close(fd); return 0; }
     for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], host)){ close(fd); return 0; }   /* already a leg */
     g_peer_version_len = r->vlen; if(r->vlen) memcpy(g_peer_version_payload, r->vpayload, (size_t)r->vlen);
     g_peer_wants_addrv2 = r->wants_addrv2;
+    int s = g_dh_last_slot; g_dh_last_slot = -1;
+    if(s >= 0 && s < mux_n_out && mux_out_fd[s] < 0){                       /* a re-dial: the leg it was for is still down */
+        snprintf(mux_out_host[s], sizeof mux_out_host[s], "%s", host);
+        mux_out_fd[s] = fd; txrelay_leg_reset(fd); leg_note_installed(s);
+        mux_out_kind[s] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL; mux_out_cmpct[s] = 0;
+        mux_out_wants_v2[s] = r->wants_addrv2;
+        anchor_locator(mux_out_loc[s]); mux_out_nextretry[s] = 0;
+        fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d) addrv2=%d [background dial]\n", s, host, fd, (int)r->wants_addrv2);
+        rpc_fill_peer_slot(s, host);
+        return 1;
+    }
+    if(mux_n_out >= MUX_MAX_OUT){ close(fd); return 0; }
     snprintf(mux_out_host[mux_n_out], sizeof mux_out_host[mux_n_out], "%s", host);
     mux_out_fd[mux_n_out] = fd; leg_note_installed(mux_n_out);
     mux_out_kind[mux_n_out] = host_is_block_only(host) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
@@ -3250,16 +3288,12 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
           fprintf(stderr,"[mux:%d] %s is banned -- not dialing\n", i, peers[p]);
           return;
       } }
-    int fd = outbound_connect(peers[p], 300, out_port);
-    if(fd<0){ long bo = g_dialmem ? dialmem_note_failure(g_dialmem, peers[p], strstr(dial_fail_reason(), "handshake") ? DM_REFUSED : DM_CONNECT_FAIL, dialmem_now()) : 0;
-              if(bo < 0) fprintf(stderr,"[mux:%d] next peer %s unreachable: %s (leg stays down; not dialled again this run)\n", i, peers[p], dial_fail_reason());
-              else fprintf(stderr,"[mux:%d] next peer %s unreachable: %s (leg stays down; not dialled again for %ld min)\n",
-                     i, peers[p], dial_fail_reason(), bo / 60); return; }
-    mux_out_fd[i]=fd; txrelay_leg_reset(fd); leg_note_installed(i);
-    mux_out_wants_v2[i]=(unsigned char)g_peer_wants_addrv2;
-    strncpy(mux_out_host[i], peers[p], 127);
-    anchor_locator(mux_out_loc[i]);
-    fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d) addrv2=%d\n", i, peers[p], fd, (int)mux_out_wants_v2[i]);
+    /* 2026-09-10: in a helper, never inline (Core's loop never blocks on a
+     * connect). The leg stays down until the helper lands; dh_install_leg
+     * fills THIS slot. One helper per slot; the caller's backoff stamp keeps
+     * the slot from asking again before the helper has answered. */
+    if(dh_inflight_for(i)) return;
+    if(!dh_start_slot(peers[p], out_port, i)) fprintf(stderr,"[mux:%d] no dial helper free for %s -- the leg stays down until the next retry\n", i, peers[p]);
 }
 
 /* ---- per-leg sync wall-clock budget (accept-starve fix, t_7ea57703) ----
@@ -6670,7 +6704,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
       { extern void (*txrelay_on_pong)(int, const unsigned char*); txrelay_on_pong = leg_on_pong; inflight_init(&g_inflight); g_block_fetch_hook = (void*)block_fetch_gate; }
       { extern void (*txrelay_on_block_inv)(int, const unsigned char*); extern void (*txrelay_on_headers)(int, const unsigned char*, unsigned long);
         extern long (*txrelay_on_cmpctblock)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_blocktxn)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_block)(int, const unsigned char*, unsigned long);
-        txrelay_on_block_inv = leg_on_block_inv; txrelay_on_headers = leg_on_headers; txrelay_on_cmpctblock = leg_on_cmpctblock; txrelay_on_blocktxn = leg_on_blocktxn; txrelay_on_block = leg_on_block; }   /* 2026-09-10: Core's shape at the tip */   /* 2026-09-09: pings and one request per block */   /* 2026-09-09: the full-block fallback is counted on the [cmpct] line */
+        txrelay_on_block_inv = leg_on_block_inv; txrelay_on_headers = leg_on_headers; txrelay_on_cmpctblock = leg_on_cmpctblock; txrelay_on_blocktxn = leg_on_blocktxn; txrelay_on_block = leg_on_block; }   /* 2026-09-10: Core's shape at the tip */
+      { extern int txrelay_classify_missing(const unsigned char*, unsigned long); extern void cmpct_recv_set_classifier(int (*)(const unsigned char*, unsigned long));
+        cmpct_recv_set_classifier(txrelay_classify_missing); }   /* row 5: where the block's missing transactions went */   /* 2026-09-09: pings and one request per block */   /* 2026-09-09: the full-block fallback is counted on the [cmpct] line */
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
     fprintf(stderr,"[dl] worker: chain archive reloaded: tip=%d (%.2fs)\n",
             *(int*)(store_buf+24), phase_elapsed(&dl_load_pt));
@@ -8324,26 +8360,15 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 for(int k=0;k<mux_n_out;k++) if(!strcmp(mux_out_host[k],srcpool[ci])){ already=1; break; }
                 if(already) continue;
                 if(g_dialmem && !dialmem_allowed(g_dialmem, srcpool[ci], dialmem_now())) continue;   /* 2026-09-09: under backoff */
-                int nfd=outbound_connect(srcpool[ci], 300, out_port);
-                if(nfd<0 && g_dialmem) dialmem_note_failure(g_dialmem, srcpool[ci], strstr(dial_fail_reason(), "handshake") ? DM_REFUSED : DM_CONNECT_FAIL, dialmem_now());
-                if(nfd>=0){
-                    strncpy(mux_out_host[mux_n_out], srcpool[ci], 127);
-                    mux_out_fd[mux_n_out]=nfd; txrelay_leg_reset(nfd); leg_note_installed(mux_n_out); mux_out_kind[mux_n_out] = host_is_block_only(srcpool[ci]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
-                    mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
-                    mux_out_peer[mux_n_out]=ci;
-                    anchor_locator(mux_out_loc[mux_n_out]);
-                    mux_out_nextretry[mux_n_out]=0;
-                    { char pv[256]; format_peer_version_info(pv, sizeof pv);
-                      fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s addrv2=%d\n", mux_n_out, srcpool[ci], nfd, pv, (int)mux_out_wants_v2[mux_n_out]); }
-                    rpc_fill_peer_slot(mux_n_out, srcpool[ci]);   /* publish peer to getpeerinfo */
-                    mux_n_out++; topup_filled++;
-                }
-                else { if(!topup_fail++) snprintf(topup_why,sizeof topup_why,"%s: %s",
-                                                  srcpool[ci], dial_fail_reason()); }
-                /* if outbound_connect to this one hung/refused, move on to next */
+                /* 2026-09-10: one background dial per top-up tick; the result
+                 * appends a leg through dh_install_leg when it lands. Never an
+                 * inline connect in the loop that reads the legs. */
+                if(dh_inflight_for(-1)) break;                       /* a top-up dial is already out */
+                if(dh_start_slot(srcpool[ci], out_port, -1)) topup_filled++;
+                else { if(!topup_fail++) snprintf(topup_why,sizeof topup_why,"%s: no dial helper free", srcpool[ci]); }
             }
             if(topup_fail)
-                fprintf(stderr,"[dl] outbound top-up: %d dial(s) failed, first %s\n",
+                fprintf(stderr,"[dl] outbound top-up: %d dial(s) not started, first %s\n",
                         topup_fail, topup_why);
         }
 

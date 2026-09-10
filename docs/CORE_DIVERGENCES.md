@@ -6,7 +6,7 @@ An inventory taken after the 09-09 leg and compact-block work, extended the same
 
 | # | area | Core | this node | cost measured | fix |
 |---|---|---|---|---|---|
-| 1 | leg service | one event loop over all peers | legs served one at a time, 60 s budget each | a slow pass delays every other leg; pongs answered within a pass, not at once | an event-driven leg loop (largest change, smallest measured gain now) |
+| 1 | leg service | one event loop over all peers, never blocked by a connect | legs served one at a time, 60 s budget each; since #161 no dial blocks the loop and passes run only on announcements | a slow pass still delays the other legs; the 27 s block on snapshot t (an inline top-up) is fixed | an event-driven leg loop for what remains |
 | 2 | history indexes | txindex, coinstatsindex, blockfilterindex built and repaired in the daemon; `-reindex` rebuilds all | offline `bmc_build_*` tools; the daemon adopts within a gap; only the coinstats history self-heals | the filter index sat at 964,359 for a day; the address history needs an operator | the coinstats self-heal shape for the filter index and the address history |
 | 3 | long reorgs | staged and connected as one unit | above 32 blocks: rewind and hand off to the downloader | a rotation without legs after a handoff | keep the legs through the handoff |
 | 4 | live coin counter after a crash | the count is the cache's, exact after replay | under the bulk memtable, a kill mid-block recovers with the counter 2 high (`test_utxo_crash_recovery`'s steady-state scenario forced to bulk: 153 vs 151, every key identical); the set is right, the counter is not | cosmetic until `gettxoutsetinfo` is asked after a crash mid-sync; the coinstats seed walk corrects it | find the double count in bulk-mode recovery (the interleaved verifier's spend accounting is the suspect); pin with the scenario at 2^22 slots |
@@ -16,6 +16,7 @@ An inventory taken after the 09-09 leg and compact-block work, extended the same
 
 | # | what | PR |
 |---|---|---|
+| q | every outbound dial runs in a helper (re-dials fill their slot when they land, the top-up dials one at a time); the per-block mempool-overlap line and the missing-transaction classifier (row 5's measurement) | #161 |
 | p | high-bandwidth compact blocks from the three most recent block sources, pushed blocks stored from the sweep, the apply right after a store | #159 |
 | o | sendheaders after the handshake; announcements (inv, pushed headers) drive a leg's pass; no polling for headers between announcements (30 s safety net) | #159 |
 | n | the parallel download takes Core's shape: every live peer downloads (cap 64), the window scales and anchors to the connected tip, the window's tail evicts stallers, replacement only when a free peer exists | #157 |

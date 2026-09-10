@@ -136,7 +136,8 @@ int main(void){
     printf("== 3. capacity ==\n");
     dial_helper_test_set_timeout_ms(1500);
     ok(dh_start("198.51.100.2:8333", 8333) == 1 && dh_start("198.51.100.3:8333", 8333) == 1, "two helpers may run at once");
-    ok(dh_start("198.51.100.4:8333", 8333) == 0, "a third is refused (DH_MAX)");
+    ok(dh_start("198.51.100.4:8333", 8333) == 1 && dh_start("198.51.100.5:8333", 8333) == 1, "...and four (2026-09-10: every dial is a helper now, DH_MAX 4)");
+    ok(dh_start("198.51.100.6:8333", 8333) == 0, "a fifth is refused (DH_MAX)");
     ok(dh_inflight_net(BMC_NET_IPV4) == 1, "in-flight lookup by network");
     for (int i = 0; i < 200; i++){ if (dh_poll(&r, &fd, h, sizeof h) && dh_inflight_count() == 0) break; usleep(50000); }
     for (int i = 0; i < 100 && dh_inflight_count(); i++){ dh_poll(&r, &fd, h, sizeof h); usleep(50000); }

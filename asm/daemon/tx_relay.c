@@ -1210,6 +1210,24 @@ static int txr_block_msg(int fd, const char* cmd, const u8* pl, unsigned plen){
     return 0;
 }
 static u8 txr_pl[TXR_PAYLOAD_CAP];      /* the sweep's payload buffer (the worker is single-threaded) */
+/* 2026-09-10, CORE_DIVERGENCES row 5: where did a transaction a block
+ * carried, and the mempool did not hold, go? 4 refused by policy (the shared
+ * recent-rejects filter), 3 parked as an orphan, 2 requested and never
+ * answered (in flight, or in the request ring), 1 announced by a leg but
+ * never requested, 0 never announced to us at all. */
+extern int serve_reject_has(const unsigned char txid[32]) __attribute__((weak));
+int txrelay_classify_missing(const unsigned char* tx, unsigned long len){
+    static u8 scratch[2000*81 + 8];
+    u8 txid[32], wtxid[32];
+    if (len < 60 || tx_txid(txid, tx, len, scratch, sizeof scratch) != 1) return 0;
+    { extern void sha256d(u8 out[32], const void* p, unsigned long n); sha256d(wtxid, tx, len); }
+    if (serve_reject_has && serve_reject_has(txid)) return 4;
+    for (int i = 0; i < TXR_ORPHAN_MAX; i++) if (txr_orph[i].buf && !memcmp(txr_orph[i].txid, txid, 32)) return 3;
+    txr_want_t* w = txr_want_find(txid); if (!w) w = txr_want_find(wtxid);
+    if (txr_ring_has(txid) || txr_ring_has(wtxid) || (w && w->inflight)) return 2;
+    if (w) return 1;
+    return 0;
+}
 /* a block-relay-only leg's sweep: what is already buffered, blocks only --
  * ping/pong, block invs, pushed headers, compact blocks and their follow-ups;
  * a tx inv is ignored (we told the peer fRelay=0) */
