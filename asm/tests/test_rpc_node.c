@@ -245,13 +245,13 @@ int main(void){
     r = NULL; rc = rpc_node_dispatch("getnettotals", NULL, &r, &ec, &em);
     { rj_val* tr = r ? rj_obj_get(r, "totalbytesrecv") : NULL;
       ck("getnettotals counts the download's bytes (50 GB + the legs)", rc == 1 && tr && strtoll(tr->str, NULL, 10) >= 50000000000LL); }
-    /* 2026-09-10: getbmcdownloadinfo -- the window state getpeerinfo cannot
+    /* 2026-09-10: bmcgetdownloadinfo -- the window state getpeerinfo cannot
      * carry. Core has no counterpart, so nothing here mirrors a Core shape. */
     st.dl_active = 1; st.dl_workers = 8; st.dl_pool = 120; st.dl_banned = 10; st.dl_free_peers = 37;
     st.dl_window = 4096; st.dl_first_hole = 500001; st.dl_claim = 504097; st.dl_applied = 499000;
     st.dl_end_h = 966368; st.dl_staged = 12; st.dl_stall_timeout_s = 4; st.dl_stall_evictions = 3;
     st.dl_median_bps = 1361510; st.dlpeers[0].bps_recv = 1400000LL;
-    r = NULL; rc = rpc_node_dispatch("getbmcdownloadinfo", NULL, &r, &ec, &em);
+    r = NULL; rc = rpc_node_dispatch("bmcgetdownloadinfo", NULL, &r, &ec, &em);
     { rj_val* a = r ? rj_obj_get(r, "active") : NULL;
       rj_val* wk = r ? rj_obj_get(r, "workers") : NULL;
       rj_val* wn = r ? rj_obj_get(r, "window") : NULL;
@@ -259,7 +259,7 @@ int main(void){
       rj_val* so = r ? rj_obj_get(r, "stall_timeout_s") : NULL;
       rj_val* bn = r ? rj_obj_get(r, "banned") : NULL;
       rj_val* pa = r ? rj_obj_get(r, "peers") : NULL;
-      ck("getbmcdownloadinfo reports the window state while a download runs",
+      ck("bmcgetdownloadinfo reports the window state while a download runs",
          rc == 1 && a && a->typ == RJ_BOOL && a->str && a->str[0] == '1' && wk && !strcmp(wk->str, "8") && wn && !strcmp(wn->str, "4096")
          && fh && !strcmp(fh->str, "500001") && so && !strcmp(so->str, "4") && bn && !strcmp(bn->str, "10"));
       { rj_val* w0 = (pa && pa->nitems == 1) ? pa->items[0] : NULL;
@@ -270,7 +270,7 @@ int main(void){
            ad && !strcmp(ad->str, "203.0.113.9:8333") && bp && !strcmp(bp->str, "1400000") && iw && !strcmp(iw->str, "7")); } }
     rj_free(r);
     st.dl_active = 0;
-    r = NULL; rc = rpc_node_dispatch("getbmcdownloadinfo", NULL, &r, &ec, &em);
+    r = NULL; rc = rpc_node_dispatch("bmcgetdownloadinfo", NULL, &r, &ec, &em);
     { rj_val* a = r ? rj_obj_get(r, "active") : NULL; rj_val* bt = r ? rj_obj_get(r, "bytes_total") : NULL;
       ck("with no download running it answers active=false rather than failing (a poller calls it unconditionally)",
          rc == 1 && a && a->typ == RJ_BOOL && a->str && a->str[0] == '0' && bt); }

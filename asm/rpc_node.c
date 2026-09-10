@@ -2451,7 +2451,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
     return 1;
 }
 
-/* ---- getbmcdownloadinfo (2026-09-10) ---------------------------------------
+/* ---- bmcgetdownloadinfo (2026-09-10) ---------------------------------------
  * The parallel download's live state: which worker holds which peer, what
  * each is pulling and at what rate, and the window state that explains why
  * the tail is or is not moving.
@@ -2465,19 +2465,21 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
  * the adaptive stall timeout or the ban list, which is what an operator (and
  * bmcmonitor) needs when a sync slows down.
  *
- * The name carries the bmc marker for the same reason the bmc.* config keys
- * do: a Core name must carry Core's exact semantics, so a call Core does not
- * have must not take a name Core might later use. It leads with "get" rather
- * than "bmc" because bmcmonitor's RPC allowlist is default-deny over
- * READ-SHAPED PREFIXES (server/rpc/allowlist.js), and its own comment warns
- * that widening those prefixes is "a hole, not a guard" -- a bmc* prefix rule
- * would pre-authorise a future bmcset*. Named this way it needs no change
- * there. Fields are plain snake_case and stable; a monitor differences the
+ * NAMING (operator's rule, 2026-09-10): every command of ours is prefaced
+ * bmc*. That also satisfies the reason the bmc.* config keys carry the
+ * prefix -- a Core name must carry Core's exact semantics, so a call Core
+ * does not have must not take a name Core might later use.
+ *
+ * A consumer whose RPC allowlist is default-deny over read-shaped prefixes
+ * (bmcmonitor's server/rpc/allowlist.js) admits this by allowing "bmcget"
+ * and "bmclist", NOT a bare "bmc": the marker plus a read verb keeps the
+ * guard its own comment asks for, since a future bmcset* still fails to
+ * match. Fields are plain snake_case and stable; a monitor differences the
  * counters itself.
  *
  * Answers {"active": false} outside a parallel download rather than failing,
  * so a poller can call it unconditionally. */
-static int cmd_getbmcdownloadinfo(rj_val** res){
+static int cmd_bmcgetdownloadinfo(rj_val** res){
     rj_val* o = rj_obj();
     const node_status_t* s = g_status;
     long long total = s ? (long long)s->dl_bytes_total : 0;
@@ -2529,7 +2531,7 @@ static const char* const NODE_METHODS[] = {
     "gettxspendingprevout", "getmempoolcluster", "getblockfrompeer",
     "testmempoolaccept", "submitpackage", "savemempool", "importmempool",
     "getprivatebroadcastinfo", "abortprivatebroadcast",
-    "getbmcdownloadinfo",   /* 2026-09-10: this node's own, no Core counterpart */
+    "bmcgetdownloadinfo",   /* 2026-09-10: this node's own, no Core counterpart */
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "getrawaddrman", "getorphantxs", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "addpeeraddress", "disconnectnode",
     "setban", "setnetworkactive", "ping", "getzmqnotifications",
@@ -2622,7 +2624,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "savemempool"))   return cmd_savemempool(res, ec, em);
     if (!strcmp(m, "importmempool")) return cmd_importmempool(params, res, ec, em);
     if (!strcmp(m, "getprivatebroadcastinfo")) return cmd_getprivatebroadcastinfo(res, ec, em);
-    if (!strcmp(m, "getbmcdownloadinfo"))  return cmd_getbmcdownloadinfo(res);
+    if (!strcmp(m, "bmcgetdownloadinfo"))  return cmd_bmcgetdownloadinfo(res);
     if (!strcmp(m, "abortprivatebroadcast"))   return cmd_abortprivatebroadcast(params, res, ec, em);
     if (!strcmp(m, "getmempoolcluster"))
         return cmd_net_unsupported(

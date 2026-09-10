@@ -16,10 +16,8 @@ The commit comes from a generated `build_gen.h`, rewritten only when the value a
 
 The 0/0 symptom itself is **not** present on the current build: measured on snapshot ae, `getconnectioncount` 9, `getpeerinfo` 9 peers, `getnettotals` with real byte counts. It was build-dependent, which is exactly why the attestation is the durable fix.
 
-## `bmcgetdownloadinfo` → `getbmcdownloadinfo`
+## The download RPC keeps its `bmc` prefix; the monitor admits it by read verb
 
-The name shipped in #179 was unreachable from the consumer it was written for. bmcmonitor's `server/rpc/allowlist.js` is default-deny over read-shaped prefixes (`get`, `list`, `estimate`, …), so `bmc…` classified as "not recognised as a read-only method".
+Every command of ours is prefaced `bmc*` (the operator's rule). #180 briefly renamed `bmcgetdownloadinfo` to `getbmcdownloadinfo` to satisfy bmcmonitor's allowlist, which is default-deny over read-shaped prefixes (`get`, `list`, `estimate`, …) and classified `bmc…` as "not recognised as a read-only method". That put the accommodation in the wrong repo, and the name is back.
 
-Widening that allowlist with a `bmc` prefix would be wrong, and the file says why: "a prefix rule like *starts with get* would be a hole, not a guard". A `bmc*` prefix would pre-authorise a future `bmcset*`. Leading with `get` passes the existing rule unchanged, keeps the `bmc` marker so no Core name can ever collide, and needs no change on the monitor side.
-
-Verified: `test_rpc_node` covers both, each watched to FAIL first (`bmc_build_commit` forced to `"unknown"`). Gate `make -j8 -k test` MAKE_EXIT=0, 372 suites.
+The monitor now admits the marker **plus a read verb** — `bmcget`, `bmclist`, `bmcestimate`, `bmcverify` — rather than a bare `bmc`, which would have been the hole its own header warns about, pre-authorising a future `bmcsetban` or `bmcimportmempool`. The mutating `bmc` shapes are named explicitly in its deny list, and an unrecognised `bmc*` shape stays denied by default. Landed in bmcmonitor as fdec42f with a test covering all three cases, watched to fail.
