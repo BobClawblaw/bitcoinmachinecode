@@ -136,7 +136,8 @@ int main(void){
     printf("== 3. capacity ==\n");
     dial_helper_test_set_timeout_ms(1500);
     ok(dh_start("198.51.100.2:8333", 8333) == 1 && dh_start("198.51.100.3:8333", 8333) == 1, "two helpers may run at once");
-    ok(dh_start("198.51.100.4:8333", 8333) == 0, "a third is refused (DH_MAX)");
+    ok(dh_start("198.51.100.4:8333", 8333) == 1 && dh_start("198.51.100.5:8333", 8333) == 1, "...and four (2026-09-10: every dial is a helper now, DH_MAX 4)");
+    ok(dh_start("198.51.100.6:8333", 8333) == 0, "a fifth is refused (DH_MAX)");
     ok(dh_inflight_net(BMC_NET_IPV4) == 1, "in-flight lookup by network");
     for (int i = 0; i < 200; i++){ if (dh_poll(&r, &fd, h, sizeof h) && dh_inflight_count() == 0) break; usleep(50000); }
     for (int i = 0; i < 100 && dh_inflight_count(); i++){ dh_poll(&r, &fd, h, sizeof h); usleep(50000); }
@@ -538,8 +539,14 @@ int main(void){
             static volatile dlc_stat_t sst[2]; memset((void*)sst, 0, sizeof sst);
             pid_t kids[2], opid[2];
             /* the tail's holder: a child that exits 7 on SIGUSR1 (the worker's abandon signal) */
+            /* SIGUSR1 is blocked BEFORE the fork so the child inherits the mask
+             * and sigwait can never miss it (the gate's load once delivered the
+             * signal before the child had blocked it: terminated by signal, not
+             * exit 7). The parent unblocks after the fork. */
+            sigset_t um; sigemptyset(&um); sigaddset(&um, SIGUSR1); sigprocmask(SIG_BLOCK, &um, 0);
             pid_t hp = fork();
-            if (hp == 0){ for (;;){ sigset_t m; sigemptyset(&m); int s = 0; sigaddset(&m, SIGUSR1); sigprocmask(SIG_BLOCK, &m, 0); sigwait(&m, &s); if (s == SIGUSR1) _exit(7); } }
+            if (hp == 0){ for (;;){ sigset_t m; sigemptyset(&m); int s = 0; sigaddset(&m, SIGUSR1); sigwait(&m, &s); if (s == SIGUSR1) _exit(7); } }
+            sigprocmask(SIG_UNBLOCK, &um, 0);
             kids[0] = opid[0] = hp; kids[1] = opid[1] = 0;
             sst[0].cur_lo = 100; sst[0].cur_hi = 139; strcpy((char*)sst[0].peer, "10.0.0.1:8333");
             c[DLC_CTL_FIRST_HOLE] = 100; c[DLC_CTL_SPAN_START] = 100; c[DLC_CTL_APPLIED] = -1;

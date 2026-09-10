@@ -70,6 +70,27 @@ static unsigned g_bits = HT_BITS;                    /* this build's width: prob
 static unsigned long g_fill = 0;                     /* live entries this build; put stops one short of full so get always terminates */
 static int g_ht_clear = 0;                           /* 1 = the pre-stamp ht_build: memset the whole table at full width (the control) */
 void cmpct_recv_set_ht_clear(int on){ g_ht_clear = on; }
+/* ---- 2026-09-10, CORE_DIVERGENCES row 5 (mempool overlap): what the last
+ * block needed. Core's peers hold nearly every transaction a block carries;
+ * one production blocktxn was 800 KB of a 1.6 MB block. Per block: how many
+ * transactions the block has, how many the mempool supplied, how many were
+ * prefilled by the peer, how many getblocktxn fetched and their bytes -- and,
+ * through the daemon's classifier, WHERE each fetched one went: never
+ * announced to us, announced but never requested, requested with no reply,
+ * parked as an orphan, or refused by policy. The measurement row 5 asks for
+ * before its fix. */
+enum { CR_CLS_UNSEEN = 0, CR_CLS_ANNOUNCED, CR_CLS_REQUESTED, CR_CLS_ORPHAN, CR_CLS_REJECTED, CR_CLS_N };
+static int (*g_classify)(const unsigned char* tx, unsigned long len) = 0;
+void cmpct_recv_set_classifier(int (*fn)(const unsigned char*, unsigned long)){ g_classify = fn; }
+static struct { unsigned long ntx, pool, pre, miss, miss_bytes, cls[CR_CLS_N]; } g_last;
+void cmpct_recv_last_block(unsigned long* ntx, unsigned long* pool, unsigned long* pre, unsigned long* miss, unsigned long* miss_bytes, unsigned long cls[5]){
+    if (ntx) *ntx = g_last.ntx;
+    if (pool) *pool = g_last.pool;
+    if (pre) *pre = g_last.pre;
+    if (miss) *miss = g_last.miss;
+    if (miss_bytes) *miss_bytes = g_last.miss_bytes;
+    if (cls) for (int i = 0; i < CR_CLS_N; i++) cls[i] = g_last.cls[i];
+}
 unsigned cmpct_recv_ht_bits(void){ return g_bits; }
 unsigned cmpct_recv_ht_gen(void){ return g_gen; }
 void cmpct_recv_ht_set_gen(unsigned g){ g_gen = g; }
@@ -162,6 +183,7 @@ long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned l
     if (!(c = get_cs(pl + o, plen - o, &npre))) return fallback_full(fd);
     o += (unsigned long)c;
     S.ntx = (unsigned long)(nshort + npre); if (S.ntx == 0 || S.ntx > CR_MAX_TX) return fallback_full(fd);
+    memset(&g_last, 0, sizeof g_last); g_last.ntx = S.ntx; g_last.pre = (unsigned long)npre;
     for (unsigned long i = 0; i < S.ntx; i++) S.ptr[i] = 0;
     /* prefilled: (differential index, tx) -- copy the tx bytes, the payload buffer is reused by the next read */
     unsigned long idx = 0;
@@ -181,6 +203,7 @@ long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned l
         unsigned long l; const unsigned char* tx = ht_get(sid_of(sids + k * 6), &l); k++;
         if (tx){ S.ptr[i] = tx; S.len[i] = l; } else S.nmiss++;
     }
+    g_last.miss = S.nmiss; g_last.pool = S.ntx - (unsigned long)npre - S.nmiss;
     if (S.nmiss == 0){ long n = assemble(out, cap); if (dbg()) fprintf(stderr, "[cmpct-dbg] assembled from the mempool and the prefilled: %ld bytes, ntx=%lu\n", n, S.ntx); return n > 0 ? n : fallback_full(fd); }
     /* getblocktxn: blockhash || count || differential indexes of the missing */
     unsigned char req[32 + 9 + CR_MAX_TX * 5]; unsigned long ro = 32; memcpy(req, S.hash, 32);
@@ -202,6 +225,8 @@ long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, un
         unsigned char info[64]; if (!tx_parse(info, pl + o, plen - o)) return fallback_full(fd);
         unsigned long tl = (unsigned long)*(unsigned long long*)info; if (S.pre_used + tl > sizeof S.pre) return fallback_full(fd);
         memcpy(S.pre + S.pre_used, pl + o, tl); S.ptr[i] = S.pre + S.pre_used; S.len[i] = tl; S.pre_used += tl; o += tl;
+        g_last.miss_bytes += tl;
+        { int c = g_classify ? g_classify(S.ptr[i], tl) : 0; if (c < 0 || c >= CR_CLS_N) c = 0; g_last.cls[c]++; }   /* no classifier: never announced */
     }
     long r = assemble(out, cap);
     if (dbg()) fprintf(stderr, "[cmpct-dbg] assembled after blocktxn: %ld bytes\n", r);
