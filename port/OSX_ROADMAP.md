@@ -55,8 +55,42 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       NOTE: test_fe_repr/test_fe_inline need the x86-only fe_ref/fe_inline
       differential objects -- not portable; superseded by the vectors in
       test_fe plus the python big-int differential used during bring-up.
-- [ ] secp256k1_point / _point_ct / _glv_c / _ecdsa
-      (+ _taproot/_schnorr when upstream main carries them)
+- [x] secp256k1_point -> port/osx/point_twin.c  DONE 2026-09-09 as a C TWIN
+      (point_double/add/add_mixed/add_mixed_zr/scalar_mul w=4 windowed/
+      scalar_mul_fixed over the 64x15 comb table (g_comb_table_data.c,
+      converted from the NASM .inc)/scalar_mul_glv GLV+wNAF with fallback;
+      same formulas, same 4x64-limb convention, same 12-limb Jacobian and
+      Z=0-with-X=Y=1 infinity repr as the x86 asm; fe ops from fe_twin,
+      scalar split from secp256k1_scalar.S, wNAF from upstream-pure-C
+      secp256k1_glv_c.c). Gates: tests/test_point 2/2 + test_point_inf ALL
+      PASS native; 1200-record cross-arch differential byte-identical vs
+      x86 on .242 (random + Z=0 canonical/non-canonical + q==p +
+      mixed-equal-x + Y1=0 + affine(0,0) shapes; drivers port/osx/tests/
+      dpt.c + gen_dpt_vecs.py). C twin because the x86 inline-macro
+      structure (r8-r11 accumulator, cmov/sbb tails) has no faithful
+      AArch64 mapping at this scope; revisit asm for perf after p3.
+      Commit 8b341e41.
+- [x] secp256k1_point_ct -> port/osx/point_ct_twin.c  DONE 2026-09-09 as a
+      C TWIN (pointh_add RCB Algorithm 7 complete branch-free, pointh_double
+      complete a=0 doubling, point_scalar_mul_ct fixed 256-round cmov ladder
+      with the x86's exact emit mapping out.x=X*Z/out.y=Y*Z^2/out.z=Z
+      non-affine -- the contract callers bip32_ckdpub/bip340_sign consume).
+      Gate: 1740-record cross-arch differential byte-identical vs x86 (dpt.c
+      ops 7-9 added). Commit 93a4d015.
+- [x] secp256k1_ecdsa -> port/osx/ecdsa_twin.c  DONE 2026-09-09 as a C TWIN
+      (ecdsa_verify + ecdsa_x_eq_mod_n transcribed instruction-for-
+      instruction from the x86 listing so the slot flow matches).
+- [x] bitcoin_pubkey + secp256k1_schnorr -> port/osx/pubkey_schnorr_twin.c
+      DONE 2026-09-09 as a C TWIN (pubkey_parse compressed/hybrid, BIP340
+      schnorr_verify with the repo's message-length cap, fe_pow
+      square-and-multiply). Both gated by the first cross-arch crypto-verify
+      benchmarks (bench_ecdsa/bench_schnorr, quiet machine, min-of-5
+      thread-CPU rounds; BIP340 csv row 0 fixture on both sides; numbers in
+      BENCHMARKS_OSX.md: ecdsa 140.14 us/verify M1 Max vs 21.46 us x86,
+      schnorr 273.11 vs 26.07 -- the gap is C twins vs hand-scheduled asm,
+      both byte-identical on the shared fixtures). The wave also fixed a
+      real port bug: sc_inv_var's `ldp x25,x25` (Rt==Rt2 SIGILL class).
+      Commit b25968b9. secp256k1_taproot stays open.
 - [x] secp256k1_scalar -> port/osx/secp256k1_scalar.S  DONE 2026-09-09.
       Native: sc_add/sc_sub/sc_sqr/sc_inv/sc_inv_var/sc_mul_512/
       sc_split_lambda; sc_mul -> sc_mul_c (C twin) + sc_mul_512 wrapped
@@ -222,12 +256,51 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       p3 (needs the full REORGOBJS module set). Commit b65c12e1.
 - [ ] bitcoin_sighash, bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
 - [ ] bitcoin_interp, bitcoin_scriptcodec, bitcoin_script_flags,
-      bitcoin_script, bitcoin_multisig, bitcoin_cons
-- [ ] bitcoin_chainwork, bitcoin_muhash (compute parts), bip32 family
+      bitcoin_script, bitcoin_multisig
+- [ ] bip32 family (bitcoin_bip32, bitcoin_keys, bitcoin_addr)
+- [x] bitcoin_chainwork -> port/osx/chainwork_twin.c  DONE 2026-09-09 as a
+      C TWIN (compact_to_target_le, u256_div, block_work, chainwork_add/cmp,
+      store_chainwork_init/append/get_at -- the chainwork.dat layer).
+- [x] bitcoin_muhash -> port/osx/muhash_twin.c  DONE 2026-09-09 as a C TWIN
+      (num3072 p=2^3072-1103717 48xu64 LE limbs, muhash_to_num3072 via
+      SHA256+ChaCha20 keystream, insert/combine/finalize, the generic and
+      stat layers on top).
+- [x] bitcoin_utxo_stats -> port/osx/utxo_stats_twin.c  DONE 2026-09-09 as
+      a C TWIN (struct layout offsets identical to x86 -- tests poke them
+      directly: TXOUTS/AMOUNT/BOGOSIZE/UNSP_*/RAW_N/ZEROH/WANT_MUHASH/
+      EXCL_GENESIS/GENESIS_N/ACC/MUHASH). Gates for the three: upstream
+      test_chainwork 0 failures + test_muhash ALL GREEN native (Core-oracle
+      vectors); asm/tests/test_tmpdir.h added as the Darwin test-harness
+      shim (mkdtemp vs the x86 fixed tmp paths) + bench_muhash guards.
+      Commit 50526b34.
+- [x] bitcoin_utxo -> port/osx/utxo_twin.c  DONE 2026-09-09 as a C TWIN
+      (in-memory UTXO set, 48B slots, FNV-1a over the first 8 txid bytes
+      xor index, blob arena; struct offsets from the x86 listing).
+- [x] bitcoin_store_fast -> port/osx/store_fast_twin.c  DONE 2026-09-09 as
+      a C TWIN (read-cache layer on the store struct: FDC magic +8-slot
+      fd cache LRU-by-slot + mmap layer). bitcoin_store's own twin was born
+      in this commit and completed in a253ef93. Gates: test_utxo 0 failures
+      + test_store 0 failures native, bench_store_read byte-exact through
+      the fd-cache and mmap layers. Commit b611922b.
+- [x] bitcoin_cons -> port/osx/cons_twin.c  DONE 2026-09-09 as a C TWIN
+      (cons_verify: pow_check + compact-size tx count + every tx parses and
+      txids (cap 1 MiB) + tx[0] coinbase n_in==1 + exact txid-list fill +
+      merkle root match + no duplicate-txid mutation flag). Gate: upstream
+      test_cons ALL GREEN native (re-verified 2026-09-09 in this session).
+      Commit 5b7f679f.
+- [x] bitcoin_headers -> port/osx/headers_twin.c  DONE 2026-09-09 as a C
+      TWIN (hst_init/reload/append/get_at/count over the 112-byte-record
+      headers.dat; hst_append returns the new count). Gate: upstream
+      test_headers ALL GREEN native -- each stored entry's block_hash links
+      to the next entry's prevhash (re-verified 2026-09-09 in this
+      session). Commit 9f112d91. Full IBD-path pairing with net_twin
+      completed 2026-09-09 (see OSX_STATE).
 
 ## Phase 2 — syscall-carrying modules (Darwin syscall rework)
 Heavy svc counts from the x86 .asm (measured 2026-09-09):
-- [ ] bitcoin_utxo_lsm (65), bitcoin_store (51), bitcoin_utxo_store (31)
+- [x] bitcoin_store (51), bitcoin_utxo_store (31), bitcoin_utxo_lsm (65)
+      (store/utxo_store/utxo_lsm landed as C twins through Darwin libc;
+      the raw-svc tiers are subsumed -- the twins own these modules now)
 - [ ] bitcoin_idxscan (19), bitcoin_undo (17), bitcoin_store_fast (15)
 - [x] bitcoin_net (9: raw-socket syscalls, x86 arg4-in-R10 -> Darwin x3),
       bitcoin_headers (6), bitcoin_addrmgr (6), bitcoin_idx (5)

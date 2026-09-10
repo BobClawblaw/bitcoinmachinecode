@@ -4,6 +4,30 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-09 — docs backfill: the point→cons wave (8b341e41..5b7f679f)
+
+- Ten modules landed in a fast wave without per-module state/roadmap
+  entries (the worklog jumped from fe_twin to net_twin). Durable record
+  now in OSX_ROADMAP.md, evidence from the commits + in-file headers:
+  - **secp256k1_point/point_ct** (point_twin.c, point_ct_twin.c,
+    g_comb_table_data.c): test_point + test_point_inf native, 1200 +
+    1740-record cross-arch diffs byte-identical (8b341e41, 93a4d015).
+  - **secp256k1_ecdsa + bitcoin_pubkey/secp256k1_schnorr**
+    (ecdsa_twin.c, pubkey_schnorr_twin.c): BIP340 verify native + first
+    cross-arch verify benches (BENCHMARKS_OSX.md); fixed sc_inv_var
+    `ldp x25,x25` SIGILL (b25968b9).
+  - **bitcoin_chainwork/muhash/utxo_stats** (chainwork_twin.c,
+    muhash_twin.c, utxo_stats_twin.c): test_chainwork 0F + test_muhash
+    green on Core-oracle vectors; test_tmpdir.h Darwin shim (50526b34).
+  - **bitcoin_utxo + bitcoin_store_fast** (utxo_twin.c,
+    store_fast_twin.c): test_utxo 0F, test_store 0F, bench_store_read
+    byte-exact (b611922b; store_twin born here, completed a253ef93).
+  - **bitcoin_cons** (cons_twin.c) and **bitcoin_headers**
+    (headers_twin.c): test_cons / test_headers green (5b7f679f,
+    9f112d91); cons + headers gates re-run green in this session.
+- Session housekeeping: removed a stale utxo_lsm_twin-*.o.tmp; push still
+  blocked from this Mac (origin publickey), 15 commits pending on bmc_osx.
+
 ## 2026-09-09 — bitcoin_net twin: first p2 syscall module landed (C twin)
 
 - `port/osx/net_twin.c`: BIP314 v1 framing + fd plumbing + v2 dispatch +
