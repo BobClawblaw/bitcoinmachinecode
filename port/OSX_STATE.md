@@ -4,6 +4,30 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-09 — bip143 (no port needed) + bitcoin_script twin; schnorr bench was 3.4x inflated
+
+- **bitcoin_bip143: NO PORT NEEDED.** Production calls bitcoin_segwit.c
+  (arch-neutral) directly; the asm module is only the differential harness's
+  perf twin.  Gate: native test (BIP143 published example + real block-481824
+  tx 562 with the actual witness signature verified through ecdsa_twin under
+  the C's sighash + swtx_parse contract) and a 1,635-vector corpus dump
+  byte-identical three ways: osx-C == x86-C == x86-ASM.
+- **bitcoin_script -> script_twin.c** (C twin): test_script + test_p2pkh
+  green native; 18.7 KB cross-arch diff byte-identical; the differential
+  caught der_long_len re-masking the first length byte as the count (the
+  upstream short-form-only harnesses could not see long-form INTEGERs).
+- **pubkey_schnorr_twin.c carried committed bring-up debug inside
+  schnorr_verify** (two fe_inv + fprintf per call).  Removed; BIP340
+  19/19 re-verified; bench CORRECTED 273.11 -> 79.92 us/verify (3.4x;
+  BENCHMARKS_OSX.md updated).  Two process lessons recorded: (1) the first
+  removal pass dropped the real point_scalar_mul_fixed(SG,sL) call with the
+  debug block -- caught only because bench_schnorr refuses to time a
+  fixture that does not verify; (2) hand-transcribed fixture hex carried
+  two silent copy errors -- regenerate fixtures programmatically.
+- segwit-v0 sighash is now fully Darwin-covered.  Next: secp256k1_taproot
+  (tagged_hash256/tweaked_pubkey) to unlock the bip341 gate, then the
+  script VM wave.
+
 ## 2026-09-09 — keys/addr/bip32 native + sighash twin: wallet derivation covered
 
 - Four modules landed, three as native AArch64 asm (details in

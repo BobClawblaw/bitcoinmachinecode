@@ -254,7 +254,35 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       0/12/33/255/20, dels w/ older-run shadowing, reload, explicit flush,
       compact, post-compact reload+gets). test_lsm_count_drift deferred to
       p3 (needs the full REORGOBJS module set). Commit b65c12e1.
-- [ ] bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
+- [x] bitcoin_bip143 -> NO PORT NEEDED  DONE 2026-09-09.  The x86 asm module
+      is only the differential harness's perf twin; production
+      (bitcoin_witness_v0.c, bitcoin_scriptverify.c) calls bitcoin_segwit.c
+      directly -- arch-neutral C, compiles unchanged on Darwin.  Gate (all
+      native): port/osx/tests/test_bip143_osx.c (BIP143 published example
+      digest c37af311..; real block-481824 tx 562 fixture sighash 32f2913c..
+      with the actual witness signature verified through ecdsa_twin under
+      that sighash; swtx_parse contract) + 1,635-vector corpus
+      (gen_b143_corpus.py) dumped via validation/bip143_corpus_dump.c:
+      osx-C == x86-C == x86-ASM byte-for-byte on .242.  ABI note: the C
+      takes the BARE scriptCode and writes the compactsize itself; the
+      prefixed 1976a914.. form is the Python oracle's convention.  Hand-
+      transcribed fixture hex had TWO silent copy errors -- fixtures must
+      be generated programmatically.  Commit 93b6cfca.
+- [x] bitcoin_script -> port/osx/script_twin.c  DONE 2026-09-09 as a C TWIN
+      (der_parse_sig with Core's ecdsa_signature_parse_der_lax shape --
+      long-form SEQUENCE length skipped unchecked, long-form INTEGER length
+      bytes leading-zero-skipped + >=4 rejected + BE accumulated, any number
+      of redundant 0x00s stripped to <=32; be_to_limbs; verify_p2pkh with
+      the IR-10 bounded walk, IR-2 hashtype-pop, direct pushes only).
+      Gates: test_script + test_p2pkh green native (test_ir10 deferred to
+      the interp wave: needs bitcoin_interp/scriptcodec); 18.7 KB cross-arch
+      differential byte-identical vs .242 (dscript.c + gen_dscript_vecs.py).
+      The differential caught a REAL twin bug the short-form-only upstream
+      harnesses missed: der_long_len re-masked the first length BYTE as the
+      count instead of the header's low 7 bits.  Commit 93b6cfca.
+- [ ] bitcoin_bip341, bitcoin_bip342 (bip341 looks like bip143: asm is the
+      perf twin, bitcoin_taproot_sighash.c is production arch-neutral C --
+      gate needs secp256k1_taproot first)
 - [x] bitcoin_sighash -> port/osx/sighash_twin.c  DONE 2026-09-09 as a C
       TWIN (sighash_all, legacy_sighash with every legacy hashtype x
       ANYONECANPAY incl. the SIGHASH_SINGLE out-of-range uint256(1) quirk
