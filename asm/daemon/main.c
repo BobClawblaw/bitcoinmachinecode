@@ -2706,6 +2706,8 @@ static void log_hash_short(char out[17], const unsigned char hash32[32]){
  * our tip, through the same evaluator submitblock uses; and a store breaks
  * the rotation so the apply runs at once. */
 static int g_stored_now = 0;                            /* a pushed block was stored during this rotation's sweeps */
+#include "index_repair.h"                                /* 2026-09-10, row 2: the filter index and the address history repair themselves */
+static ir_t g_ir_bfi, g_ir_addrhist;
 /* row 5's measurement, one line per block that went through the compact
  * receiver: what the mempool supplied and where the rest had gone */
 extern void cmpct_recv_last_block(unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long cls[5]);
@@ -6945,7 +6947,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               char exe[512], builder[600]; ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
               if (n > 0){ exe[n] = 0; char* sl = strrchr(exe, '/'); if (sl) *sl = 0; snprintf(builder, sizeof builder, "%s/bmc_build_coinstats_hist", exe); }
               else snprintf(builder, sizeof builder, "bmc_build_coinstats_hist");
-              csi_hist_repair_configure(builder, dir, g_chainp->name, g_cfg.coinstatshist_workers, g_cfg.coinstatshist_repair); }
+              csi_hist_repair_configure(builder, dir, g_chainp->name, g_cfg.coinstatshist_workers, g_cfg.coinstatshist_repair);
+              /* 2026-09-10 (CORE_DIVERGENCES row 2): the block filter index and
+               * the address history repair themselves the same way -- the
+               * builders beside this executable, ticked at the heartbeat */
+              { char b2[600]; snprintf(b2, sizeof b2, "%s/bmc_build_block_filters", n > 0 ? exe : ".");
+                ir_configure(&g_ir_bfi, "bfilter", b2, dir, g_chainp->name, "", g_cfg.blockfilterindex);
+                snprintf(b2, sizeof b2, "%s/bmc_build_addr_hist", n > 0 ? exe : ".");
+                ir_configure(&g_ir_addrhist, "addrhist", b2, dir, g_chainp->name, "", g_cfg.addrindex); } }
             utxo_live_set_coinstats(csi_on_add, csi_on_remove, csi_invalidate, csi_commit);
             { extern void csi_on_block(long); extern void utxo_live_set_coinstats_block(void (*)(long)); utxo_live_set_coinstats_block(csi_on_block); }
             undo_set_coin_observer(csi_on_remove);
@@ -8287,6 +8296,23 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 long target = utxo_live_ok ? utxo_live_applied_height() : (long)*(int*)(store_buf+24);
                 csi_hist_repair_tick(target, dl_tip_is_ibd(), (long long)time(NULL));
             }
+            /* 2026-09-10 (row 2): the block filter index and the address history
+             * repair themselves. The filter index needs a build when it is
+             * absent or more than the adopt gap behind the tip (the live tail
+             * adopts and closes the rest from undo once it is within 144); the
+             * address history when its base is absent. */
+            { long atip = (long)*(int*)(store_buf+24); long long nows = (long long)time(NULL); int ibd = dl_tip_is_ibd();
+              if(g_cfg.blockfilterindex){
+                  extern long bfi_count(void); extern long bfi_probe_count(void);
+                  long have = bfi_probe_count(); int needed = bfi_count() < 0 && (have < 0 || atip - have > 144);
+                  ir_tick(&g_ir_bfi, needed, atip, ibd, nows);
+              }
+              if(g_cfg.addrindex){
+                  extern int ah_available(void) __attribute__((weak));
+                  int needed = ah_available ? !ah_available() : 0;
+                  long target = utxo_live_ok ? utxo_live_applied_height() : atip;
+                  ir_tick(&g_ir_addrhist, needed, target, ibd, nows);
+              } }
             /* Relay-pool health. Silent when nothing has been parked, so a
              * node with no orphan traffic prints nothing extra. */
             { extern long txrelay_stats(long*,long*,long*,long*,long*,long*);
