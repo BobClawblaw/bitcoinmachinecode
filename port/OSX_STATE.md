@@ -4,6 +4,24 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-09 — secp256k1_taproot twin landed; bip341 gate scoped
+
+- **secp256k1_taproot -> taproot_twin.c** (C twin): tagged_hash256,
+  tap_branch_hash, tap_leaf_hash, taproot_tweak_pubkey (1 even / 2 odd,
+  parity captured before even-normalising), tap_merkle_root.  Gates:
+  upstream test_taproot ALL PASS native + 227-record cross-arch
+  differential byte-identical vs .242 (tags/msgs to 200 KB, leaf
+  compactsize boundaries, tweak rejections x>=p/t>=n, merkle depth 0..8).
+- bitcoin_taproot_sighash.c (the bip341/bip342 production C) is
+  arch-neutral and needs this twin at link time; its harness
+  test_taproot_sighash pulls bitcoin_interp/scriptcodec/sha1, so the
+  bip341/342 gate lands with the script VM wave -- the same deferral
+  pattern as test_ir10 (script) and test_segwit_sighash (witness_v0).
+- Session total so far: bitcoin_keys.S, bitcoin_addr.S, bitcoin_bip32.S
+  native; sighash/script/taproot twins; bip143 no-port gate; hmac x25 ABI
+  fix; harness UB fix; schnorr bench corrected 273 -> 80 us.  24 commits
+  pending push (origin publickey still blocked from this Mac).
+
 ## 2026-09-09 — bip143 (no port needed) + bitcoin_script twin; schnorr bench was 3.4x inflated
 
 - **bitcoin_bip143: NO PORT NEEDED.** Production calls bitcoin_segwit.c
