@@ -2440,11 +2440,80 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
     return 1;
 }
 
+/* ---- bmcgetdownloadinfo (2026-09-10) ---------------------------------------
+ * The parallel download's live state: which worker holds which peer, what
+ * each is pulling and at what rate, and the window state that explains why
+ * the tail is or is not moving.
+ *
+ * Core has NO counterpart, by construction. Its block download is 8 outbound
+ * peers driven from one ThreadMessageHandler thread, so there is no worker to
+ * report; here node_ibd_blocks_s blocks for the length of a chunk and cannot
+ * multiplex, so each downloading peer is a forked process and the mapping
+ * worker -> peer -> chunk -> rate is the only way to see what the sync is
+ * doing. getpeerinfo shows the peers; it cannot show the window, the tail,
+ * the adaptive stall timeout or the ban list, which is what an operator (and
+ * bmcmonitor) needs when a sync slows down.
+ *
+ * The name carries the bmc prefix for the same reason the bmc.* config keys
+ * do: a Core name must carry Core's exact semantics, so a call Core does not
+ * have must not take a name Core might later use. Fields are plain snake_case
+ * and stable; a monitor differences the counters itself.
+ *
+ * Answers {"active": false} outside a parallel download rather than failing,
+ * so a poller can call it unconditionally. */
+static int cmd_bmcgetdownloadinfo(rj_val** res){
+    rj_val* o = rj_obj();
+    const node_status_t* s = g_status;
+    long long total = s ? (long long)s->dl_bytes_total : 0;
+    if (!s || !s->dl_active){
+        rj_obj_set(o, "active", rj_bool(0));
+        rj_obj_set(o, "bytes_total", rj_numf("%lld", total));
+        *res = o; return 1;
+    }
+    rj_obj_set(o, "active", rj_bool(1));
+    rj_obj_set(o, "workers",          rj_numf("%d",   s->dl_workers));
+    rj_obj_set(o, "pool",             rj_numf("%d",   s->dl_pool));
+    rj_obj_set(o, "banned",           rj_numf("%d",   s->dl_banned));
+    rj_obj_set(o, "free_peers",       rj_numf("%d",   s->dl_free_peers));
+    rj_obj_set(o, "window",           rj_numf("%lld", (long long)s->dl_window));
+    rj_obj_set(o, "first_hole",       rj_numf("%lld", (long long)s->dl_first_hole));
+    rj_obj_set(o, "claim",            rj_numf("%lld", (long long)s->dl_claim));
+    rj_obj_set(o, "applied",          rj_numf("%lld", (long long)s->dl_applied));
+    rj_obj_set(o, "end_height",       rj_numf("%lld", (long long)s->dl_end_h));
+    rj_obj_set(o, "staged",           rj_numf("%lld", (long long)s->dl_staged));
+    rj_obj_set(o, "stall_timeout_s",  rj_numf("%lld", (long long)s->dl_stall_timeout_s));
+    rj_obj_set(o, "stall_evictions",  rj_numf("%lld", (long long)s->dl_stall_evictions));
+    rj_obj_set(o, "median_bps",       rj_numf("%lld", (long long)s->dl_median_bps));
+    rj_obj_set(o, "bytes_total",      rj_numf("%lld", total));
+    { rj_val* pa = rj_arr();
+      int nd = s->n_dlpeers; if (nd > 64) nd = 64; if (nd < 0) nd = 0;
+      for (int i = 0; i < nd; i++){
+          const rpc_peer_t* p = &s->dlpeers[i];
+          if (!p->used) continue;
+          rj_val* w = rj_obj();
+          rj_obj_set(w, "worker",     rj_numf("%d", p->dl_worker));
+          rj_obj_set(w, "addr",       rj_str((const char*)p->addr));
+          rj_obj_set(w, "subver",     rj_str((const char*)p->subver));
+          rj_obj_set(w, "services",   rj_numf("%llu", (unsigned long long)p->services));
+          rj_obj_set(w, "startingheight", rj_numf("%d", p->start_height));
+          rj_obj_set(w, "conntime",   rj_numf("%lld", (long long)p->conn_time));
+          rj_obj_set(w, "bytes_recv", rj_numf("%lld", (long long)p->bytes_recv));
+          rj_obj_set(w, "bps_recv",   rj_numf("%lld", (long long)p->bps_recv));
+          /* the chunk in flight; hi < lo means the worker holds nothing */
+          rj_obj_set(w, "inflight_lo", rj_numf("%lld", (long long)p->inflight_lo));
+          rj_obj_set(w, "inflight_hi", rj_numf("%lld", (long long)p->inflight_hi));
+          rj_arr_push(pa, w);
+      }
+      rj_obj_set(o, "peers", pa); }
+    *res = o; return 1;
+}
+
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
     "gettxspendingprevout", "getmempoolcluster", "getblockfrompeer",
     "testmempoolaccept", "submitpackage", "savemempool", "importmempool",
     "getprivatebroadcastinfo", "abortprivatebroadcast",
+    "bmcgetdownloadinfo",   /* 2026-09-10: this node's own, no Core counterpart */
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "getrawaddrman", "getorphantxs", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "addpeeraddress", "disconnectnode",
     "setban", "setnetworkactive", "ping", "getzmqnotifications",
@@ -2537,6 +2606,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "savemempool"))   return cmd_savemempool(res, ec, em);
     if (!strcmp(m, "importmempool")) return cmd_importmempool(params, res, ec, em);
     if (!strcmp(m, "getprivatebroadcastinfo")) return cmd_getprivatebroadcastinfo(res, ec, em);
+    if (!strcmp(m, "bmcgetdownloadinfo"))  return cmd_bmcgetdownloadinfo(res);
     if (!strcmp(m, "abortprivatebroadcast"))   return cmd_abortprivatebroadcast(params, res, ec, em);
     if (!strcmp(m, "getmempoolcluster"))
         return cmd_net_unsupported(
