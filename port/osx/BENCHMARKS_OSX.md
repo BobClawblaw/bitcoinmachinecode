@@ -100,9 +100,16 @@ thread-CPU rounds — same discipline as the x86 side):
 |---|---|---|---|
 | ecdsa_verify  | 21.46 us/verify (46,606/s per core) | 140.14 us/verify (7,136/s per core) | 6.5x |
 | schnorr_verify| 26.07 us/verify (38,353/s per core) | 273.11 us/verify (3,661/s per core) | 10.5x |
+| schnorr_verify (2026-09-10 CORRECTED) | 26.07 us/verify | 79.92 us/verify (12,513/s per core) | 3.1x |
 
 Context: 1e9 sigs at these rates = 6.0 core-hours (x86) vs 38.9 core-hours
-(M1 Max) for ECDSA.  The gap is dominated by the C twins running the same
+(M1 Max) for ECDSA.
+
+2026-09-10 CORRECTION: the 273.11 us schnorr number was measured with
+leftover bring-up debug inside schnorr_verify (two fe_inv + several
+fprintf per call) -- removed in the bip143 session; re-measured 79.92 us
+(3.4x faster, and the ratio to x86 drops from 10.5x to 3.1x).  The
+ecdsa_verify number was never affected (ecdsa_twin.c carried no debug).  The gap is dominated by the C twins running the same
 algorithms the x86 has as hand-scheduled asm (fe_mul chains, comb/GLV
 multiplies); AArch64 native asm for fe_mul/scalar_mul is future work and
 should close much of it.  Both implementations produce byte-identical
