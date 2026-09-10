@@ -4,6 +4,35 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-09 — keys/addr/bip32 native + sighash twin: wallet derivation covered
+
+- Four modules landed, three as native AArch64 asm (details in
+  OSX_ROADMAP.md; commits 3db7bd97, 1092ebee, 5cfccf4d, 404f968b):
+  **bitcoin_keys.S** (test_keys 6/6 + 647-record diff), **bitcoin_addr.S**
+  (test_addr 5/5 + 56-record diff; the x11-cursor pitfall again),
+  **bitcoin_bip32.S** (all four upstream bip32 harnesses + 990-record diff;
+  frame-overrun, byte-0-skipping carry loops, and the AAPCS64
+  eight-register-arg extkey contract all caught by the gates), and
+  **sighash_twin.c** (test_legacy_sighash 500/500 Core vectors +
+  test_find_and_delete 23/23 + test_sighash_oob + 143 KB diff).
+- REAL PRE-EXISTING PORT BUG fixed: bitcoin_hmac.S used x25 without saving
+  it (callee-saved; main's GOT anchor) -- latent until the dbip32 driver,
+  which parks x25 across bip32_master -> hmac_sha512. Prologue/epilogue
+  now save/restore x25,x26; test_hmac re-verified green. First port bug
+  found by a caller's register pressure rather than a gate's value check
+  -- the differential drivers earn their keep as ABI stress.
+- UPSTREAM HARNESS UB fixed: test_bip32_master.c's sscanf %2x into
+  (unsigned*)&kg[i] spills 3 bytes into adjacent frame vars (zeroed
+  kg[0..2] and the caller's c[0..2] under clang's layout; the k/c outputs
+  were correct all along). Fixed to the unsigned-temp pattern; verified
+  green on BOTH arches (.242 re-run).
+- With this wave the wallet key-derivation path (seed -> master -> path ->
+  xprv/xpub/address) and the legacy sighash preimage builders are fully
+  Darwin-covered. Remaining p1: bip143/bip341/bip342, taproot, and the
+  script VM (interp/scriptcodec/script/multisig/script_flags).
+- Session housekeeping: removed a stale utxo_lsm_twin-*.o.tmp; push still
+  blocked from this Mac (origin publickey), 20 commits pending on bmc_osx.
+
 ## 2026-09-09 — docs backfill: the point→cons wave (8b341e41..5b7f679f)
 
 - Ten modules landed in a fast wave without per-module state/roadmap
