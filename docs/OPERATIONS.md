@@ -76,6 +76,25 @@ with full script verification. Expect days, CPU-bound on signature
 verification. The pulse is `[dl] heartbeat: tip=<h> peers=<live>/<wanted>
 txouts=<utxo count> uptime=<d:hh:mm:ss>`.
 
+### Host tuning
+
+One kernel setting, applied on the reference host 2026-09-10 and kept in
+`/etc/sysctl.d/90-bmc-tcp.conf`:
+
+```
+net.ipv4.tcp_slow_start_after_idle = 0
+```
+
+By default Linux resets a TCP connection's send window to its initial 10
+segments after one round trip of quiet. A block connection is quiet for ten
+minutes between blocks, so every block this node serves to an inbound peer
+(and every blocktxn reply) started from the smallest window: a 40 KB
+compact block took three round trips and an 800 KB blocktxn seven on a
+0.8 s peer, measured on a passive capture. With the setting off, a
+connection keeps the window it earned. It governs what THIS host sends; a
+remote peer's kernel decides how fast it sends to us. It applies to every
+socket on the box, the Core oracle and a benchmark run included.
+
 ## Configuration
 
 ### Location
