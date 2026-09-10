@@ -24,10 +24,11 @@ int main(void){
 
     /* 1. absent file -> compiled defaults, no crash */
     node_config_load("/nonexistent/bitcoin.conf");
-    if (g_cfg.max_connections==200 && g_cfg.max_outbound==8 && g_cfg.dbcache_mb==1024)
-        printf("PASS: missing file falls back to compiled defaults (Core v31 dbcache default 1024)\n");
-    else { printf("FAIL: defaults wrong (conns=%d out=%d dbcache=%d)\n",
-                  g_cfg.max_connections,g_cfg.max_outbound,g_cfg.dbcache_mb); failures++; }
+    if (g_cfg.max_connections==200 && g_cfg.max_outbound==8 && g_cfg.dbcache_mb==1024
+        && g_cfg.catchup_workers==8)   /* 2026-09-10: Core's MAX_OUTBOUND_FULL_RELAY_CONNECTIONS; 64 was the array size adopted as a default, never measured */
+        printf("PASS: missing file falls back to compiled defaults (Core v31 dbcache default 1024, 8 download peers)\n");
+    else { printf("FAIL: defaults wrong (conns=%d out=%d dbcache=%d catchupworkers=%d)\n",
+                  g_cfg.max_connections,g_cfg.max_outbound,g_cfg.dbcache_mb,g_cfg.catchup_workers); failures++; }
 
     /* 2. the repo's SAMPLE config -- the tracked one. config/bitcoin.conf is
      * an operator file (rpcpassword) and is gitignored since 2026-08-29, so a

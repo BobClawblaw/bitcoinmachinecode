@@ -12,7 +12,7 @@
  *                                       (bitcoind.asm); this is only the main
  *                                       loop over sockets. nwant (default 3)
  *                                       is the steady-state outbound leg
- *                                       count; catchup_workers (default 16)
+ *                                       count; catchup_workers (default 8)
  *                                       is the dl_catchup chunk-claiming
  *                                       worker count for the self-healing
  *                                       boot-time catch-up pass.
@@ -10418,7 +10418,7 @@ int main(int argc, char** argv){
          * finds, so it is a ceiling, not a promise. */
         int catchup_workers;
         if(argc>=6) catchup_workers = atoi(argv[5]);
-        else        catchup_workers = g_cfg.catchup_workers;   /* bmc.catchupworkers, default 64 since 2026-09-10 (every live peer downloads, up to it) */
+        else        catchup_workers = g_cfg.catchup_workers;   /* bmc.catchupworkers, default 8 since 2026-09-10: Core's outbound full-relay count */
         if(catchup_workers<1) catchup_workers=1;
         if(catchup_workers>64) catchup_workers=64;
         dial_gate_configure(g_cfg.dial_rate_limit); dl_gate_configure(g_cfg.download_rate_limit_kbps);

@@ -12,6 +12,7 @@ An inventory taken after the 09-09 leg and compact-block work, extended the same
 
 | # | what | PR |
 |---|---|---|
+| ab | download concurrency costs a PROCESS per peer here (node_ibd_blocks_s blocks for a chunk and cannot multiplex); Core multiplexes 8 peers in one ThreadMessageHandler thread. Same peer count now, different mechanism | open (architectural) |
 | aa | a peer evicted for stalling the download window is remembered for the run, so the picker cannot hand it the same chunk again (run 20: fourteen times on one chunk) | #177 |
 | z | a v2 session exports with the message in flight (the 64 KB blob refused a headers reply and closed healthy legs on snapshot ab); the refusal names its size | #174 |
 | y | the reorg probe runs before the pass on an idle leg (it had probed the socket a pass child was reading: every leg reset within seconds on snapshot aa); no pass runs inline; eight dial helpers | #172 |
@@ -25,7 +26,7 @@ An inventory taken after the 09-09 leg and compact-block work, extended the same
 | q | every outbound dial runs in a helper (re-dials fill their slot when they land, the top-up dials one at a time); the per-block mempool-overlap line and the missing-transaction classifier (row 5's measurement) | #161 |
 | p | high-bandwidth compact blocks from the three most recent block sources, pushed blocks stored from the sweep, the apply right after a store | #159 |
 | o | sendheaders after the handshake; announcements (inv, pushed headers) drive a leg's pass; no polling for headers between announcements (30 s safety net) | #159 |
-| n | the parallel download takes Core's shape: every live peer downloads (cap 64), the window scales and anchors to the connected tip, the window's tail evicts stallers, replacement only when a free peer exists | #157 |
+| n | the parallel download takes Core's shape: the window scales and anchors to the connected tip, the window's tail evicts stallers, replacement only when a free peer exists. Peers downloading at once defaults to 8, Core's MAX_OUTBOUND_FULL_RELAY_CONNECTIONS (was 64, never measured); the ceiling stays 64 for a fatter link | #157, #178 |
 | m | the coinstats index folds per block during a bulk sync through the fold worker (the walk-at-caught-up deferral is gone; history rows from block 0) | #156 |
 | l | bulk mode checkpoints every 1,024 blocks or 60 s, a bounded pass carries its batch and never downshifts the memtable | #155 |
 | k | a background merge waits while the apply is behind and yields when it runs | #154 |
