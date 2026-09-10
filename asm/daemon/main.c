@@ -2735,6 +2735,16 @@ static void leg_on_block_announce(int fd, const unsigned char hash[32], const ch
     fprintf(stderr,"[tip] %s announced block %02x%02x%02x%02x.. by %s: its pass runs next\n", mux_out_host[k], hash[31], hash[30], hash[29], hash[28], how);
 }
 static void leg_on_block_inv(int fd, const unsigned char hash[32]){ g_announce_inv_n++; leg_on_block_announce(fd, hash, "inv"); }
+/* the peer's sendcmpct (BIP152: high_bandwidth u8, version u64): version 2 is
+ * what we request with; recorded here because the sweep reads it before any
+ * pass could (2026-09-10) */
+static void leg_on_sendcmpct(int fd, const unsigned char* pl, unsigned long plen){
+    int k = leg_of_fd(fd); if(k < 0 || plen < 9) return;
+    unsigned long long ver = 0; for(int i = 0; i < 8; i++) ver |= (unsigned long long)pl[1 + i] << (8 * i);
+    if(ver != 2 || mux_out_cmpct[k]) return;
+    mux_out_cmpct[k] = 1;
+    fprintf(stderr, "[cmpct] %s accepts compact blocks: requesting MSG_CMPCT_BLOCK on this leg from now on\n", mux_out_host[k]);
+}
 static void leg_on_headers(int fd, const unsigned char* hdrs, unsigned long n){
     unsigned char bh[32]; sha256d(bh, hdrs + (n - 1) * 81, 80); g_announce_hdr_n++;
     leg_on_block_announce(fd, bh, "headers");
@@ -6751,7 +6761,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
       { extern void (*txrelay_on_pong)(int, const unsigned char*); txrelay_on_pong = leg_on_pong; inflight_init(&g_inflight); g_block_fetch_hook = (void*)block_fetch_gate; }
       { extern void (*txrelay_on_block_inv)(int, const unsigned char*); extern void (*txrelay_on_headers)(int, const unsigned char*, unsigned long);
         extern long (*txrelay_on_cmpctblock)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_blocktxn)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_block)(int, const unsigned char*, unsigned long);
-        txrelay_on_block_inv = leg_on_block_inv; txrelay_on_headers = leg_on_headers; txrelay_on_cmpctblock = leg_on_cmpctblock; txrelay_on_blocktxn = leg_on_blocktxn; txrelay_on_block = leg_on_block; }   /* 2026-09-10: Core's shape at the tip */
+        txrelay_on_block_inv = leg_on_block_inv; txrelay_on_headers = leg_on_headers; txrelay_on_cmpctblock = leg_on_cmpctblock; txrelay_on_blocktxn = leg_on_blocktxn; txrelay_on_block = leg_on_block;
+        extern void (*txrelay_on_sendcmpct)(int, const unsigned char*, unsigned long); txrelay_on_sendcmpct = leg_on_sendcmpct; }   /* 2026-09-10: Core's shape at the tip */
       { extern int txrelay_classify_missing(const unsigned char*, unsigned long); extern void cmpct_recv_set_classifier(int (*)(const unsigned char*, unsigned long));
         cmpct_recv_set_classifier(txrelay_classify_missing); }   /* row 5: where the block's missing transactions went */   /* 2026-09-09: pings and one request per block */   /* 2026-09-09: the full-block fallback is counted on the [cmpct] line */
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }

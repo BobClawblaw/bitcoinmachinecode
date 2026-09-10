@@ -137,6 +137,8 @@ static int rec_n_inv, rec_n_hdr, rec_n_cmpct, rec_n_bt, rec_n_blk; static u8 rec
 static unsigned long rec_hdr_n, rec_cmpct_len, rec_bt_len, rec_blk_len; static int rec_hdr_first, rec_hdr_79;
 static char cmd9[13]; static u8 pl9[4096];
 static void rec_block_inv(int fd, const u8* h){ (void)fd; rec_n_inv++; memcpy(rec_inv_hash, h, 32); }
+static int rec_n_sc; static unsigned long rec_sc_ver;
+static void rec_sendcmpct(int fd, const u8* p, unsigned long n){ (void)fd; rec_n_sc++; rec_sc_ver = n >= 9 ? p[1] : 0; }
 static void rec_headers(int fd, const u8* hd, unsigned long n){ (void)fd; rec_n_hdr++; rec_hdr_n = n; rec_hdr_first = hd[0]; rec_hdr_79 = hd[79]; }
 static long rec_cmpct(int fd, const u8* p, unsigned long n){ (void)fd; (void)p; rec_n_cmpct++; rec_cmpct_len = n; return 0; }
 static long rec_blocktxn(int fd, const u8* p, unsigned long n){ (void)fd; (void)p; rec_n_bt++; rec_bt_len = n; return 0; }
@@ -920,6 +922,7 @@ int main(void){
         extern long (*txrelay_on_cmpctblock)(int, const u8*, unsigned long); extern long (*txrelay_on_blocktxn)(int, const u8*, unsigned long); extern long (*txrelay_on_block)(int, const u8*, unsigned long);
         extern long txrelay_poll_block_only_leg(int fd);
         txrelay_on_block_inv = rec_block_inv; txrelay_on_headers = rec_headers; txrelay_on_cmpctblock = rec_cmpct; txrelay_on_blocktxn = rec_blocktxn; txrelay_on_block = rec_block;
+        { extern void (*txrelay_on_sendcmpct)(int, const u8*, unsigned long); txrelay_on_sendcmpct = rec_sendcmpct; }
         int sp[2]; ck("leg pair for the announcements", socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);   /* the early pair is closed by now */
         u8 bh[32]; for (int i = 0; i < 32; i++) bh[i] = (u8)(0xA0 + i);
         /* inv: one tx entry (ignored by the block scan) and one MSG_BLOCK entry */
@@ -933,6 +936,7 @@ int main(void){
         u8 cb[100]; memset(cb, 0x11, sizeof cb); p2p_write(sp[1], "cmpctblock", 10, cb, sizeof cb);
         u8 bt[40];  memset(bt, 0x22, sizeof bt); p2p_write(sp[1], "blocktxn", 8, bt, sizeof bt);
         u8 bk[90];  memset(bk, 0x33, sizeof bk); p2p_write(sp[1], "block", 5, bk, sizeof bk);
+        u8 sc[9] = {0, 2,0,0,0,0,0,0,0}; p2p_write(sp[1], "sendcmpct", 9, sc, 9);
         rec_n_inv = rec_n_hdr = rec_n_cmpct = rec_n_bt = rec_n_blk = 0;
         txrelay_poll_leg(sp[0], mp_area, 50);
         ck("the block inv reached the hook once, with the announced hash (the tx entry did not)", rec_n_inv == 1 && memcmp(rec_inv_hash, bh, 32) == 0);
@@ -940,6 +944,7 @@ int main(void){
         ck("cmpctblock reached its hook with its length", rec_n_cmpct == 1 && rec_cmpct_len == 100);
         ck("blocktxn reached its hook (not swallowed as a block: the terminator compare)", rec_n_bt == 1 && rec_bt_len == 40);
         ck("a pushed block reached its hook", rec_n_blk == 1 && rec_blk_len == 90);
+        ck("the peer's sendcmpct reached its hook (the sweep used to swallow it: full blocks since #159)", rec_n_sc == 1 && rec_sc_ver == 2);
         /* the block-relay-only sweep: ping answered, a block inv acted on, a tx inv ignored */
         u8 nonce[8] = {9,8,7,6,5,4,3,2}; p2p_write(sp[1], "ping", 4, nonce, 8);
         p2p_write(sp[1], "inv", 3, inv, sizeof inv);
