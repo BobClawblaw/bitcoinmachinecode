@@ -541,6 +541,12 @@ int main(void){
             for (long i = 0; i < DLC_CTL_RING + DLC_RETRY_MAX; i++) c[i] = i < DLC_CTL_RING ? 0 : -1;
             static volatile dlc_stat_t sst[2]; memset((void*)sst, 0, sizeof sst);
             pid_t kids[2], opid[2];
+            /* the live pool the eviction bans into (2026-09-10, run 20) */
+            #define TNLIVE 16
+            static char tlive[TNLIVE][DL_POOL_SLOT]; static volatile int tbanned[TNLIVE];
+            memset(tlive, 0, sizeof tlive); memset((void*)tbanned, 0, sizeof tbanned);
+            for (int q = 0; q < TNLIVE; q++) snprintf(tlive[q], DL_POOL_SLOT, "10.0.0.%d:8333", q + 1);
+            g_cfg.min_usable_peers = 8;
             /* the tail's holder: a child that exits 7 on SIGUSR1 (the worker's abandon signal) */
             /* SIGUSR1 is blocked BEFORE the fork so the child inherits the mask
              * and sigwait can never miss it (the gate's load once delivered the
@@ -551,31 +557,51 @@ int main(void){
             if (hp == 0){ for (;;){ sigset_t m; sigemptyset(&m); int s = 0; sigaddset(&m, SIGUSR1); sigwait(&m, &s); if (s == SIGUSR1) _exit(7); } }
             sigprocmask(SIG_UNBLOCK, &um, 0);
             kids[0] = opid[0] = hp; kids[1] = opid[1] = 0;
-            sst[0].cur_lo = 100; sst[0].cur_hi = 139; strcpy((char*)sst[0].peer, "10.0.0.1:8333");
+            sst[0].cur_lo = 100; sst[0].cur_hi = 139; strcpy((char*)sst[0].peer, "10.0.0.1:8333"); sst[0].held_idx = 0;
             c[DLC_CTL_FIRST_HOLE] = 100; c[DLC_CTL_SPAN_START] = 100; c[DLC_CTL_APPLIED] = -1;
             g_dlc_window = 4096; g_dlc_stall_timeout_s = 2;
             c[DLC_CTL_CLAIM] = 100 + 4000;                                   /* room left: not full */
-            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 1000); dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 60000);
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 1000, tlive, TNLIVE, tbanned); dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 60000, tlive, TNLIVE, tbanned);
             ok(c[DLC_CTL_N_STALL] == 0 && waitpid(hp, 0, WNOHANG) == 0, "window not full: the tail's holder is not a staller however long it holds");
             c[DLC_CTL_CLAIM] = 100 + 4097;                                   /* full */
             stage_chunk(100, 40);
-            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 61000); dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 120000);
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 61000, tlive, TNLIVE, tbanned); dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 120000, tlive, TNLIVE, tbanned);
             ok(c[DLC_CTL_N_STALL] == 0 && waitpid(hp, 0, WNOHANG) == 0, "window full but the tail chunk is STAGED: the committer has it, nobody is stalling");
             dlc_stage_wipe();
-            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 121000);      /* the holder's clock starts */
-            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 122900);      /* 1.9 s: not yet */
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 121000, tlive, TNLIVE, tbanned);      /* the holder's clock starts */
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 122900, tlive, TNLIVE, tbanned);      /* 1.9 s: not yet */
             ok(c[DLC_CTL_N_STALL] == 0 && waitpid(hp, 0, WNOHANG) == 0, "full, unstaged, held for 1.9 s of a 2 s timeout: not yet");
-            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 123000);      /* 2.0 s: evicted */
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 123000, tlive, TNLIVE, tbanned);      /* 2.0 s: evicted */
             int st7 = 0; waitpid(hp, &st7, 0);
             ok(c[DLC_CTL_N_STALL] == 1 && WIFEXITED(st7) && WEXITSTATUS(st7) == 7 && sst[0].kill_reason == 1,
                "2 s at a full window: the holder is dropped (SIGUSR1, reason 'stalling the window'), the eviction counted");
             ok(g_dlc_stall_timeout_s == 4, "...and the timeout doubled to 4 s");
+            ok(tbanned[0] == 1,
+               "...and the staller is BANNED for the run (run 20, 2026-09-10: the eviction was memoryless and one address was handed the same chunk 14 times)");
             kids[0] = 0;                                                    /* the worker is gone */
             c[DLC_CTL_FIRST_HOLE] = 140;                                     /* the tail moved on */
-            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 124000);
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 124000, tlive, TNLIVE, tbanned);
             ok(g_dlc_stall_timeout_s == 3, "the tail moved: the timeout eases 15% (4 s -> 3 s)");
-            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 200000);
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 200000, tlive, TNLIVE, tbanned);
             ok(c[DLC_CTL_N_STALL] == 1, "nobody holds the new tail (it is the retry ring's): no eviction");
+            /* the floor guard: the same rule that stops the dead-weight
+             * eviction emptying the pool applies here -- a slow peer beats no
+             * peer, so at the floor the staller is dropped but stays selectable */
+            { sigset_t um2; sigemptyset(&um2); sigaddset(&um2, SIGUSR1); sigprocmask(SIG_BLOCK, &um2, 0);
+              pid_t hp2 = fork();
+              if (hp2 == 0){ for (;;){ sigset_t m; sigemptyset(&m); int s = 0; sigaddset(&m, SIGUSR1); sigwait(&m, &s); if (s == SIGUSR1) _exit(7); } }
+              sigprocmask(SIG_UNBLOCK, &um2, 0);
+              kids[0] = opid[0] = hp2;
+              sst[0].cur_lo = 140; sst[0].cur_hi = 179; sst[0].held_idx = 1; sst[0].kill_reason = 0;
+              c[DLC_CTL_FIRST_HOLE] = 140; c[DLC_CTL_CLAIM] = 140 + 4097;
+              g_dlc_stall_timeout_s = 2;
+              int save_floor = g_cfg.min_usable_peers; g_cfg.min_usable_peers = TNLIVE;   /* every peer is needed */
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 300000, tlive, TNLIVE, tbanned);
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 303000, tlive, TNLIVE, tbanned);
+              int st8 = 0; waitpid(hp2, &st8, 0);
+              ok(WIFEXITED(st8) && WEXITSTATUS(st8) == 7 && tbanned[1] == 0,
+                 "at the usable floor the staller is still dropped but NOT banned (a slow peer beats no peer)");
+              g_cfg.min_usable_peers = save_floor; kids[0] = 0; }
             g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
             munmap((void*)c, (DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long)); }
           /* a staged chunk is visible to the stall rule's guard, and the next run's wipe */

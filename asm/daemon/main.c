@@ -5714,7 +5714,8 @@ static void legs_sweep_except(int except){
  * Every 200 ms from the parent's idle steps and once per connect pass. */
 static long g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
 static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t* kids, pid_t* opid, int nw,
-                           long start_h, long end_h, long long now_ms){
+                           long start_h, long end_h, long long now_ms,
+                           char live[][DL_POOL_SLOT], int nlive, volatile int* banned){
     static long tail = -1; static long long since = 0; static int holder = -1;
     long fh = ctl[DLC_CTL_FIRST_HOLE];
     if(fh > end_h){ tail = -1; holder = -1; return; }
@@ -5734,9 +5735,29 @@ static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t
     stats[w].kill_reason = 1;
     kill(opid[w], SIGUSR1);
     __sync_fetch_and_add(&ctl[DLC_CTL_N_STALL], 1L);
-    fprintf(stderr,"[dlc] w%d %s is stalling the window: chunk [%ld,%ld] is the oldest missing and the window (%ld above %ld) is full -- dropped after %ld s (next timeout %ld s)\n",
+    /* 2026-09-10 (run 20): this eviction was MEMORYLESS. dlc_pick_peer could
+     * hand the evicted address the very chunk it had just been dropped for,
+     * and did: one AWS listener took chunk [18561,18600] fourteen times in
+     * twelve minutes while the timeout backed off to its 64 s ceiling, so the
+     * run stored 18,561 blocks and stopped. The dead-weight eviction has
+     * banned its peer for the rest of the run since 2026-09-06 ("without this
+     * the replacement draw is memoryless"); the stall rule now does the same,
+     * under the SAME two guards -- a manual peer (addnode/connect) is never
+     * banned, and the pool is never drawn below the usable floor. */
+    const char* verdict = "kept (no pool)";
+    long bidx = stats[w].held_idx;
+    if(banned && live && bidx >= 0 && bidx < nlive){
+        if(node_config_is_manual(live[bidx]))      verdict = "manual, kept selectable";
+        else if(banned[bidx])                      verdict = "already banned";
+        else {
+            int usable = 0; for(int q = 0; q < nlive; q++) if(!banned[q]) usable++;
+            if(usable > g_cfg.min_usable_peers){ banned[bidx] = 1; verdict = "BANNED for the run"; }
+            else                                   verdict = "at the usable floor, kept selectable";
+        }
+    }
+    fprintf(stderr,"[dlc] w%d %s is stalling the window: chunk [%ld,%ld] is the oldest missing and the window (%ld above %ld) is full -- dropped after %ld s (next timeout %ld s; peer %s)\n",
             w, stats[w].peer[0] ? (const char*)stats[w].peer : "(connecting)", lo, lo + DLC_CHUNK_BLOCKS - 1, g_dlc_window, anchor,
-            (long)((now_ms - since) / 1000), dlc_stall_timeout_after(g_dlc_stall_timeout_s, 1));
+            (long)((now_ms - since) / 1000), dlc_stall_timeout_after(g_dlc_stall_timeout_s, 1), verdict);
     g_dlc_stall_timeout_s = dlc_stall_timeout_after(g_dlc_stall_timeout_s, 1);
     holder = -1; since = now_ms;
 }
@@ -6011,7 +6032,7 @@ static long dl_catchup(const char* dir, int min_workers){
     while(alive>0){
         long done = 0;
         if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);   /* before a connect call that may run for seconds */
-        dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms());   /* Core's rule, every pass (2026-09-10) */
+        dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms(), live, nlive, banned);   /* Core's rule, every pass (2026-09-10) */
         legs_sweep_except(-1);                                                            /* row 3: the legs stay served through a handoff */
         if(interleave && dlc_now_ms() >= connect_retry_ms){
             /* (store_reload is the bounded call's first act, so it sees the
@@ -6036,7 +6057,7 @@ static long dl_catchup(const char* dir, int min_workers){
              * fresh anchor without waiting for the 10 s tick */
             for(long slept=0; slept<ms; slept+=200){
                 if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);
-                dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms());
+                dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms(), live, nlive, banned);
                 long step = ms-slept < 200 ? ms-slept : 200;
                 struct timespec ts={step/1000,(step%1000)*1000000L}; nanosleep(&ts,NULL);
             }
