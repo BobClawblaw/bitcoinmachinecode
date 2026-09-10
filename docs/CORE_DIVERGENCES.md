@@ -12,6 +12,7 @@ An inventory taken after the 09-09 leg and compact-block work, extended the same
 
 | # | what | PR |
 |---|---|---|
+| y | the reorg probe runs before the pass on an idle leg (it had probed the socket a pass child was reading: every leg reset within seconds on snapshot aa); no pass runs inline; eight dial helpers | #172 |
 | x | a leg's pass runs in a helper; the sweep, pongs, relay and pushes continue while a block is fetched | #169 |
 | w | the transaction request queue drains as Core's does (announced-not-requested closed) | #168 |
 | v | a BIP324 session travels with its socket across the dial helper's fork (export/import); helper-dialed legs are v2 again where advertised | #167 |
