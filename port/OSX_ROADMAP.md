@@ -141,6 +141,27 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       add new/dup, get_i in+out of range, lookup hit/miss, v1/v2 codecs
       1..300 records, addr_count fd/fe/ff/truncated shapes).
       Commit 2725d14b.
+- [x] bitcoin_idx -> port/osx/idx_twin.c  DONE 2026-09-09 as a C TWIN
+      (FNV-1a full-32-byte hash + XOR-fold, linear probing, 48B stride slot
+      layout identical to x86; buffered-pread build_from_file, wire-order
+      hashes, holes skipped). Gates: upstream test_idx 12/12 native (incl.
+      the 500k pow-prefix clustering regression guard, 0.84s total) +
+      868-record differential byte-identical vs x86 bitcoin_idx.o on .242
+      (didx.c + gen_didx_vecs.py: put/get/dup/negative/heavy-collision,
+      build_from_file over hole-rich files with dups, raw table dumps at
+      64/1024/4096 slots).
+      CROSS-ARCH FIND (real x86 bug, masked in production): a 100%-full table
+      makes x86 idx_put SPIN FOREVER. memcmp_exact clobbers r8b (its own
+      header says it may), but idx_put/idx_get keep the probe budget in r8
+      across the call -- after one memcmp the budget becomes garbage
+      (0x400 | last hash byte) and `dec r8; jz .full` never fires. The
+      differential vectors hit this by accident (800 puts + 224 build
+      inserts == 1024 slots exactly); production masks it (1M slots, 962k
+      records, never full). Twin implements the DOCUMENTED contract (ret 2
+      full); vectors keep <100% load (700-put phase B) so the differential
+      exercises defined behavior. x86 fix belongs on main (move the budget
+      to a stack local or a non-clobbered reg) -- TODO.md item added.
+      Commit 6fed3a71.
 - [ ] bitcoin_sighash, bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
 - [ ] bitcoin_interp, bitcoin_scriptcodec, bitcoin_script_flags,
       bitcoin_script, bitcoin_multisig, bitcoin_cons
