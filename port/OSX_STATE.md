@@ -4,6 +4,25 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-09 — bitcoin_net twin: first p2 syscall module landed (C twin)
+
+- `port/osx/net_twin.c`: BIP314 v1 framing + fd plumbing + v2 dispatch +
+  upload-pacer hook, all 12 public symbols of asm/bitcoin_net.asm. Gates:
+  upstream test_net 19/19, test_p2p_msgsize 14/14 (oversize -3 + no-drain +
+  NET-11 checksum), hook-arg smoke, live tcp_connect_ip vs .242:8332, and
+  a 240-frame p2p_frame cross-arch differential byte-identical vs the x86
+  objects (dnet.c + gen_dnet_vecs.py; includes two 4MB P2P_MAX_MSG frames).
+  Commit 45fe22bb.
+- Twin bug the upstream-equivalent gates caught: a half-finished edit left a
+  DUPLICATED drain loop and checksum-before-drain ordering; x86 order is
+  checksum (only when announced<=cap) THEN drain, and *plen_out is written
+  AFTER the drain (test_net's post-drain-alignment check pins this).
+- headers_twin landed just before this (9f112d91, test_headers all green,
+  hst_append returns new count). IBD-path assembly pair bitcoin_net +
+  bitcoin_headers is now Darwin-covered. Next: bitcoin_p2p message builders
+  (p2p_getheaders etc. -- pure compute) then addrmgr/idx, keeping the
+  one-module-one-gate rhythm.
+
 ## 2026-09-09 — bitcoin_hash native: first full 6-op module, x86-diff byte-identical
 
 - `port/osx/bitcoin_hash.S` (7 public symbols) gated three ways: upstream

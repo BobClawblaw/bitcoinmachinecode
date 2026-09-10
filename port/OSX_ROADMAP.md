@@ -101,6 +101,22 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       with ldr + add sp,#8); (2) locktime path stored the ADDRESS register as
       the new cursor (tx_len corruption); (3) witness walk must reload n_in
       from info after x23 is reused for n_out.
+- [x] bitcoin_net -> port/osx/net_twin.c  DONE 2026-09-09 as a C TWIN
+      (the 9 socket syscalls go through Darwin libc; x86 arg4-in-R10 is moot).
+      Surface: net_magic, g_v2_active[4096], g_p2p_write_hook, g_v2_hook_write,
+      g_v2_hook_read, fd_write_all, fd_read_full, fd_close, tcp_connect_ip,
+      p2p_frame, p2p_write, p2p_read. Gates: upstream test_net 19/19 +
+      test_p2p_msgsize 14/14 native (oversize -3 refusal, no drain, checksum
+      incl. empty-payload NET-11) + v2/pacer hook smoke (hook arg order:
+      read hook gets plen_out POINTER as 5th arg) + live tcp_connect_ip to
+      .242:8332 and refused-port -errno passthrough + 240-frame p2p_frame
+      cross-arch differential byte-identical vs x86 (drivers:
+      port/osx/tests/dnet.c + gen_dnet_vecs.py; cmd lens 0..16 straddling
+      the 12-byte field, payload lens 0/55/56/63/64/65/127/128/129/... and
+      two P2P_MAX_MSG 4,000,000 frames).  Commit 45fe22bb.  TWIN BUGS THE
+      GATES CAUGHT: first cut duplicated the drain loop after a botched edit
+      and had checksum-before-drain ordering wrong (checksum runs FIRST,
+      only when announced<=cap; plen_out is written AFTER the drain).
 - [ ] bitcoin_sighash, bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
 - [ ] bitcoin_interp, bitcoin_scriptcodec, bitcoin_script_flags,
       bitcoin_script, bitcoin_multisig, bitcoin_cons
@@ -110,7 +126,7 @@ Python oracle), with both code paths exercised where a dispatcher exists.
 Heavy svc counts from the x86 .asm (measured 2026-09-09):
 - [ ] bitcoin_utxo_lsm (65), bitcoin_store (51), bitcoin_utxo_store (31)
 - [ ] bitcoin_idxscan (19), bitcoin_undo (17), bitcoin_store_fast (15)
-- [ ] bitcoin_net (9: raw-socket syscalls, x86 arg4-in-R10 -> Darwin x3),
+- [x] bitcoin_net (9: raw-socket syscalls, x86 arg4-in-R10 -> Darwin x3),
       bitcoin_headers (6), bitcoin_addrmgr (6), bitcoin_idx (5)
 - [ ] bitcoin_cli (2), bitcoind (2), node_log (1), bitcoin_serve (1)
 Darwin syscall deltas to apply per site: `svc #0x80`, nr in x16, args x0-x7,
