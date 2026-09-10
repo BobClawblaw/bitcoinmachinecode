@@ -359,9 +359,9 @@ int main(void){
       /* the download window and the retry ring ("write out monotonically,
        * like Core does"): a chunk is never claimed more than 1024 blocks
        * above the first hole, and an abandoned chunk is retried, never left. */
-      { ok(dlc_window_allows(45160 + 4096, 45160), "a claim exactly 4096 above the first hole is inside the window (Core's 1024 scaled to our 640 in flight)");
-        ok(!dlc_window_allows(45160 + 4097, 45160), "4097 above: outside -- the worker waits instead of running ahead");
-        ok(dlc_window_allows(100, 45160), "a claim below the first hole (a retry) is always allowed");
+      { ok(dlc_window_allows(45160 + 4096, 45160, 4096), "a claim exactly 4096 above the first hole is inside the window (Core's 1024 scaled to our 640 in flight)");
+        ok(!dlc_window_allows(45160 + 4097, 45160, 4096), "4097 above: outside -- the worker waits instead of running ahead");
+        ok(dlc_window_allows(100, 45160, 4096), "a claim below the first hole (a retry) is always allowed");
         static volatile long ctl[DLC_CTL_RING + DLC_RETRY_MAX];
         for (long i = 0; i < DLC_CTL_RING + DLC_RETRY_MAX; i++) ctl[i] = i < DLC_CTL_RING ? 0 : -1;
         ok(dlc_retry_pop(ctl) == -1, "empty ring: nothing to retry");
@@ -528,9 +528,49 @@ int main(void){
             ok(swept == 2 && !dlc_stage_exists(20) && !dlc_stage_exists(60), "chunks 20 and 60 (wholly below cursor 180) are swept");
             ok(dlc_stage_exists(180) && dlc_stage_exists(220) && ctl5[DLC_CTL_STAGED] == 2, "chunks 180 and 220 stay; the gauge is recounted from the directory (2, not 99)");
             ok(dlc_stage_wipe() == 2, "(cleanup)"); }
-          /* the window's help guard, and the next run's wipe */
+          /* Core's stall rule (2026-09-10): the parent evicts the worker holding
+           * the window's tail -- the oldest missing chunk -- only while the
+           * window is full, only if the chunk is not staged, only after the
+           * adaptive timeout; the timeout doubles on an eviction and eases
+           * when the tail moves. Time is the tick's parameter, so no waiting. */
+          { volatile long* c = mmap(0, (DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+            for (long i = 0; i < DLC_CTL_RING + DLC_RETRY_MAX; i++) c[i] = i < DLC_CTL_RING ? 0 : -1;
+            static volatile dlc_stat_t sst[2]; memset((void*)sst, 0, sizeof sst);
+            pid_t kids[2], opid[2];
+            /* the tail's holder: a child that exits 7 on SIGUSR1 (the worker's abandon signal) */
+            pid_t hp = fork();
+            if (hp == 0){ for (;;){ sigset_t m; sigemptyset(&m); int s = 0; sigaddset(&m, SIGUSR1); sigprocmask(SIG_BLOCK, &m, 0); sigwait(&m, &s); if (s == SIGUSR1) _exit(7); } }
+            kids[0] = opid[0] = hp; kids[1] = opid[1] = 0;
+            sst[0].cur_lo = 100; sst[0].cur_hi = 139; strcpy((char*)sst[0].peer, "10.0.0.1:8333");
+            c[DLC_CTL_FIRST_HOLE] = 100; c[DLC_CTL_SPAN_START] = 100; c[DLC_CTL_APPLIED] = -1;
+            g_dlc_window = 4096; g_dlc_stall_timeout_s = 2;
+            c[DLC_CTL_CLAIM] = 100 + 4000;                                   /* room left: not full */
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 1000); dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 60000);
+            ok(c[DLC_CTL_N_STALL] == 0 && waitpid(hp, 0, WNOHANG) == 0, "window not full: the tail's holder is not a staller however long it holds");
+            c[DLC_CTL_CLAIM] = 100 + 4097;                                   /* full */
+            stage_chunk(100, 40);
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 61000); dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 120000);
+            ok(c[DLC_CTL_N_STALL] == 0 && waitpid(hp, 0, WNOHANG) == 0, "window full but the tail chunk is STAGED: the committer has it, nobody is stalling");
+            dlc_stage_wipe();
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 121000);      /* the holder's clock starts */
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 122900);      /* 1.9 s: not yet */
+            ok(c[DLC_CTL_N_STALL] == 0 && waitpid(hp, 0, WNOHANG) == 0, "full, unstaged, held for 1.9 s of a 2 s timeout: not yet");
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 123000);      /* 2.0 s: evicted */
+            int st7 = 0; waitpid(hp, &st7, 0);
+            ok(c[DLC_CTL_N_STALL] == 1 && WIFEXITED(st7) && WEXITSTATUS(st7) == 7 && sst[0].kill_reason == 1,
+               "2 s at a full window: the holder is dropped (SIGUSR1, reason 'stalling the window'), the eviction counted");
+            ok(g_dlc_stall_timeout_s == 4, "...and the timeout doubled to 4 s");
+            kids[0] = 0;                                                    /* the worker is gone */
+            c[DLC_CTL_FIRST_HOLE] = 140;                                     /* the tail moved on */
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 124000);
+            ok(g_dlc_stall_timeout_s == 3, "the tail moved: the timeout eases 15% (4 s -> 3 s)");
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 200000);
+            ok(c[DLC_CTL_N_STALL] == 1, "nobody holds the new tail (it is the retry ring's): no eviction");
+            g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
+            munmap((void*)c, (DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long)); }
+          /* a staged chunk is visible to the stall rule's guard, and the next run's wipe */
           stage_chunk(180, 40);
-          ok(dlc_stage_exists(180), "a staged chunk is visible to the help guard: the worker must not refetch it");
+          ok(dlc_stage_exists(180), "a staged chunk is visible to the stall rule: its holder is not judged");
           ok(dlc_stage_wipe() == 1 && !dlc_stage_exists(180), "a new run discards what an earlier run left (its chunks are fetched again)");
           munmap(cb, DLC_STAGE_MAX_BYTES);
         }

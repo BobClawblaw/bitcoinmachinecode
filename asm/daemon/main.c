@@ -3814,12 +3814,19 @@ static double dlc_effective_floor(double median_bps){
  * blocks against run 9's 86k). 4096 is the same slack Core gives itself;
  * the archive is still consolidated behind it (holes bounded, the connect
  * never more than the window behind the download). */
-#define DLC_DOWNLOAD_WINDOW 4096L
+/* 2026-09-10: the window is now dlc_window_blocks(nw, DLC_CHUNK_BLOCKS) --
+ * six times what is in flight, never under 4,096 -- and anchored to the
+ * CONNECTED tip (dlc_window_anchor), Core's shape. */
+static long g_dlc_window = DLC_WINDOW_MIN;
 /* Core's BLOCK_STALLING_TIMEOUT_DEFAULT: when the window is full and one
  * peer blocks it, Core re-requests from another peer after 2 s. Same here:
  * a worker idle at a full window for 2 s fetches the blocking chunk itself
  * (one helper at a time, claimed through DLC_CTL_HELPING). */
-#define DLC_WINDOW_HELP_SECS 2
+/* (2026-09-10: the worker-side help -- an idle worker fetching the
+ * blocking chunk itself, a duplicate -- is gone. The parent now evicts the
+ * peer holding the window's tail, Core's rule, and the chunk goes to the
+ * retry ring for the next claim; the committer's cursor help remains the
+ * safety net for a chunk nobody holds.) */
 #define DLC_RETRY_MAX 4096L
 enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CTL_FIRST_HOLE = 3, DLC_CTL_HELPING = 4,
        DLC_CTL_WANT_ANCHOR = 5,           /* a worker blocked at the window asks the PARENT for a fresh first hole */
@@ -3837,7 +3844,11 @@ enum { DLC_CTL_CLAIM = 0, DLC_CTL_RETRY_HEAD = 1, DLC_CTL_RETRY_TAIL = 2, DLC_CT
         * the window to fill. Run 18 (2026-09-08) sat six minutes at 484,201
         * behind one trickling peer while 85 chunks above it were staged. */
        DLC_CTL_CURSOR_WANT = 16, DLC_CTL_N_CURSOR_HELP = 17,
-       DLC_CTL_RING = 18 };
+       /* Core's shape (2026-09-10): the connected tip + 1 (-1: no engine in
+        * this process), the count of unclaimed usable peers (a replacement
+        * exists), the stall evictions */
+       DLC_CTL_APPLIED = 18, DLC_CTL_FREE_PEERS = 19, DLC_CTL_N_STALL = 20,
+       DLC_CTL_RING = 21 };
 #define DLC_CURSOR_HELP_SECS 30
 /* ...and only when the pool has moved on without it: at least this many
  * chunks staged above the cursor. A 40-block chunk is 40 MB at height
@@ -3881,7 +3892,6 @@ static void dlc_publish_anchor(volatile long* ctl, long start_h){
     ctl[DLC_CTL_WANT_ANCHOR] = 0;
 }
 #define DLC_CTL_BYTES ((size_t)(DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long))
-static int dlc_window_allows(long lo, long first_hole){ return lo - first_hole <= DLC_DOWNLOAD_WINDOW; }
 /* single-producer-per-push, multi-consumer ring: push reserves a slot with a
  * CAS on head, pop reserves with a CAS on tail; entries are chunk `lo`s. */
 static int dlc_retry_push(volatile long* ctl, long lo){
@@ -4718,7 +4728,9 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
                  double pool_median_bps;   /* written by the parent each tick: the pool's median rate, read by the worker for boundary rotation */
                  /* 2026-09-08, for getpeerinfo: the handshake's facts (worker), the chunk in flight (worker), bytes on this peer (parent) */
                  unsigned proto; unsigned long long services; char subver[96]; int start_height; long long conn_time;
-                 long cur_lo, cur_hi; long long bytes_peer; } dlc_stat_t;
+                 long cur_lo, cur_hi; long long bytes_peer;
+                 int kill_reason;          /* set by the parent before SIGUSR1: 0 dead weight, 1 stalling the window (2026-09-10) */
+               } dlc_stat_t;
 static long long dlc_now_ms(void); static long dlc_proc_rchar(pid_t pid);   /* fwd decls: the worker judges its own chunk before these are defined */
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
 static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
@@ -4799,25 +4811,20 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             int waited_ticks=0;                 /* 200 ms each */
             for(;;){
                 long peek=next_claim[DLC_CTL_CLAIM], fh=next_claim[DLC_CTL_FIRST_HOLE];
-                if(peek>end_h || dlc_window_allows(peek, fh)) break;
+                long anchor=dlc_window_anchor(next_claim[DLC_CTL_APPLIED], fh);   /* the CONNECTED tip when the engine is here (2026-09-10) */
+                if(peek>end_h || dlc_window_allows(peek, anchor, g_dlc_window)) break;
                 /* The published anchor is up to one 10 s tick old. On the
                  * early chain the window drains in a couple of seconds, so
                  * run 11 (2026-09-07) sat idle between ticks: 32,241 blocks
                  * at five minutes against run 9's 86,000, 512 waits. Blocked
-                 * on a stale anchor, refresh it ourselves (two asm scans of
-                 * index.dat) and share the fresher value; wait only when the
-                 * frontier really is where the anchor says. */
+                 * on a stale anchor, ask the parent for a fresh one; wait
+                 * only when the frontier really is where the anchor says.
+                 * A worker waiting here never fetches the blocking chunk
+                 * itself any more: the parent evicts its holder when it
+                 * stalls the window (dlc_stall_tick) and the chunk comes
+                 * through the retry ring, which this loop keeps checking. */
                 next_claim[DLC_CTL_WANT_ANCHOR]=1;   /* the parent rescans within 200 ms; our own reads must not touch our io counters */
                 lo=dlc_retry_pop(next_claim); if(lo>=0) break;
-                if(waited_ticks>=DLC_WINDOW_HELP_SECS*5){
-                    long blk=dlc_help_chunk_lo(fh, next_claim[DLC_CTL_SPAN_START]);   /* the chunk holding the first hole, on the claim grid */
-                    long cur=next_claim[DLC_CTL_HELPING];
-                    if(cur!=blk && !dlc_stage_exists(blk) && __sync_bool_compare_and_swap(&next_claim[DLC_CTL_HELPING], cur, blk)){   /* staged = the committer has it; not ours to refetch */   /* one helper per blocking chunk */
-                        lo=blk; helping=1;
-                        __sync_fetch_and_add(&next_claim[DLC_CTL_N_HELP], 1L);
-                        break;
-                    }
-                }
                 if(waited_ticks==0) __sync_fetch_and_add(&next_claim[DLC_CTL_N_WAIT], 1L);
                 usleep(200000); waited_ticks++;
             }
@@ -4967,8 +4974,10 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                  * lines in one run were the alarm, not the verdict. */
                 fprintf(stderr,"[dlc w%d] %s %s (last measured %s, completed %ld chunk(s)/%ld block(s) on this peer); dropping for a fresh peer\n",
                         w, mystat->peer,
-                        mux_sync_budget_sig==SIGUSR1 ? "dead weight" : "stalled: no block for " DLC_STR(DLC_CHUNK_BUDGET_SECS) "s",
+                        mux_sync_budget_sig==SIGUSR1 ? (mystat->kill_reason==1 ? "stalling the window (held its oldest missing chunk while it was full)" : "dead weight")
+                                                     : "stalled: no block for " DLC_STR(DLC_CHUNK_BUDGET_SECS) "s",
                         lastbw, mystat->chunks, mystat->blocks);
+                mystat->kill_reason=0;
                 close(fd); fd=-1; DLC_RELEASE();
                 slot=(slot+1)%(nlive>0?nlive:1);
                 if(guard>400){ fprintf(stderr,"[dlc w%d] reconnect budget [%ld,%ld]\n",w,lo,hi); break; }
@@ -4986,7 +4995,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                 long chunk_r1 = dlc_proc_rchar(getpid());
                 double chunk_bps = (secs >= 2.0 && chunk_r0 >= 0 && chunk_r1 >= chunk_r0) ? (double)(chunk_r1 - chunk_r0) / secs : -1.0;
                 double med = mystat->pool_median_bps;
-                if(dlc_rotate_after_chunk(chunk_bps, med)){
+                if(dlc_rotate_after_chunk(chunk_bps, med) && dlc_replace_allowed((int)next_claim[DLC_CTL_FREE_PEERS])){   /* 2026-09-10: no free peer, no rotation -- the window's tail judges */
                     __sync_fetch_and_add(&next_claim[DLC_CTL_N_ROTATE], 1L);   /* counted on the tick line; nothing is discarded, so no line per event */
                     /* hand the verdict's number to the picker: the parent's
                      * tick-EMA lags (alpha 0.5 over 10 s ticks), and a peer
@@ -5325,6 +5334,50 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
         fprintf(stderr, "[dlc]   #%d %-22s %.0f KB/s\n", i + 1, live[i], rate[idx[i]] > 0 ? rate[idx[i]] / 1024.0 : 0.0);
     munmap(rate, sizeof(double) * (size_t)nlive);
 }
+/* ---- Core's stall rule (2026-09-10) ----------------------------------------
+ * The one judge of slowness in Core's downloader: when the window is full
+ * (nothing more can be requested above the connected tip) and one peer
+ * holds the OLDEST missing block, that peer has the stall timeout -- 2 s,
+ * doubling to 64 s when evictions come fast, easing back as the tail moves
+ * -- before it is disconnected and its block re-requested elsewhere. Here
+ * the tail is the committer's cursor chunk (the archive's first hole, on
+ * the claim grid); it is stalled only while the window is full, the chunk
+ * is not staged, and a live worker holds it. The eviction is the same
+ * SIGUSR1 the rate floor used, labelled; the abandoned chunk goes to the
+ * retry ring, which the workers idle at the window are already polling.
+ * Every 200 ms from the parent's idle steps and once per connect pass. */
+static long g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
+static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t* kids, pid_t* opid, int nw,
+                           long start_h, long end_h, long long now_ms){
+    static long tail = -1; static long long since = 0; static int holder = -1;
+    long fh = ctl[DLC_CTL_FIRST_HOLE];
+    if(fh > end_h){ tail = -1; holder = -1; return; }
+    long lo = dlc_help_chunk_lo(fh, start_h);
+    long anchor = dlc_window_anchor(ctl[DLC_CTL_APPLIED], fh);
+    long claim = ctl[DLC_CTL_CLAIM];
+    int full = claim <= end_h && !dlc_window_allows(claim, anchor, g_dlc_window);
+    if(lo != tail){                                            /* the tail moved: the timeout eases (Core: on a block received) */
+        if(tail >= 0) g_dlc_stall_timeout_s = dlc_stall_timeout_after(g_dlc_stall_timeout_s, 0);
+        tail = lo; holder = -1; since = now_ms;
+    }
+    if(!full || dlc_stage_exists(lo)){ holder = -1; since = now_ms; return; }   /* not a stall: room to request, or the chunk is already here */
+    int w = -1; for(int i = 0; i < nw; i++) if(kids[i] && stats[i].cur_lo == lo){ w = i; break; }
+    if(w < 0){ holder = -1; since = now_ms; return; }        /* nobody holds it: it is in the retry ring or the cursor help's */
+    if(w != holder){ holder = w; since = now_ms; return; }   /* a new holder gets a fresh clock */
+    if(!dlc_tail_stalled(full, (long)(now_ms - since), g_dlc_stall_timeout_s)) return;
+    stats[w].kill_reason = 1;
+    kill(opid[w], SIGUSR1);
+    __sync_fetch_and_add(&ctl[DLC_CTL_N_STALL], 1L);
+    fprintf(stderr,"[dlc] w%d %s is stalling the window: chunk [%ld,%ld] is the oldest missing and the window (%ld above %ld) is full -- dropped after %ld s (next timeout %ld s)\n",
+            w, stats[w].peer[0] ? (const char*)stats[w].peer : "(connecting)", lo, lo + DLC_CHUNK_BLOCKS - 1, g_dlc_window, anchor,
+            (long)((now_ms - since) / 1000), dlc_stall_timeout_after(g_dlc_stall_timeout_s, 1));
+    g_dlc_stall_timeout_s = dlc_stall_timeout_after(g_dlc_stall_timeout_s, 1);
+    holder = -1; since = now_ms;
+}
+/* the window's anchor: the connected tip + 1 when the engine is in this process */
+static void dlc_publish_applied(volatile long* ctl){
+    ctl[DLC_CTL_APPLIED] = g_utxo_live_on ? utxo_live_applied_height() + 1 : -1;
+}
 static long dl_catchup(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
     ab2_t* ab = addr_book();
@@ -5389,7 +5442,7 @@ static long dl_catchup(const char* dir, int min_workers){
         /* Target a deep live pool: workers*3 was sized before peers could be
          * banned, and left no headroom -- evicting duds then starved the
          * downloader outright. Aim for 6x so eviction has room to work. */
-        int want = min_workers*6; if(want>npool) want=npool;
+        int want = min_workers*2; if(want>npool) want=npool;   /* 2026-09-10: every live peer downloads, so the pool need not be six deep per worker */
         int from=0, rounds=0;
         /* no arbitrary round cap: keep probing until either `want` is hit or
          * the WHOLE discovered pool has been tried (from<npool already
@@ -5431,7 +5484,17 @@ static long dl_catchup(const char* dir, int min_workers){
     }
     if(nlive<=0){ fprintf(stderr,"[dlc] no live peers; skipping catch-up\n"); return 0; }
     dlc_rank_by_throughput(live, nlive);      /* fastest first: the workers claim from the top */
-    int nw = min_workers; if(nlive<nw) nw=nlive; if(nw<1) nw=1; if(nw>64) nw=64;
+    /* Core's shape (2026-09-10): every live peer downloads, up to the cap
+     * (bmc.catchupworkers, default 64) -- a fixed 16 against 124 live peers
+     * carried 11 MB/s on a 2.5 Gbit link, the sum of 16 peers at 250-600
+     * KB/s. The window scales with what is in flight and is anchored to the
+     * connected tip; the parent evicts a peer that stalls the window's
+     * tail; rotation and the rate floor act only while a free peer exists. */
+    int nw = dlc_workers_for(nlive, min_workers);
+    g_dlc_window = dlc_window_blocks(nw, DLC_CHUNK_BLOCKS);
+    g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
+    fprintf(stderr,"[dlc] Core's shape: %d of %d live peer(s) download at once (cap %d), window %ld blocks above the connected tip, stall timeout %ld s\n",
+            nw, nlive, min_workers, g_dlc_window, g_dlc_stall_timeout_s);
 
     long hdr_len = dlc_headers(live, nlive);
     if(hdr_len<=0){ fprintf(stderr,"[dlc] header phase failed; skipping catch-up\n"); return 0; }
@@ -5510,6 +5573,7 @@ static long dl_catchup(const char* dir, int min_workers){
     for(int i=DLC_CTL_N_ROTATE;i<=DLC_CTL_N_ABANDON;i++) next_claim[i]=0;
     next_claim[DLC_CTL_COMMIT_TIP]=start_h-1; next_claim[DLC_CTL_STAGED]=0; next_claim[DLC_CTL_N_COMMIT]=0; next_claim[DLC_CTL_STOP_COMMIT]=0;
     next_claim[DLC_CTL_CURSOR_WANT]=-1; next_claim[DLC_CTL_N_CURSOR_HELP]=0;
+    next_claim[DLC_CTL_APPLIED]=-1; next_claim[DLC_CTL_FREE_PEERS]=0; next_claim[DLC_CTL_N_STALL]=0;
     { long stale=dlc_stage_wipe(); if(stale) fprintf(stderr,"[dlc] stage: discarded %ld file(s) an earlier run left; their chunks are fetched again\n", stale); }
     { pid_t cp=fork(); if(cp==0){ _exit(dlc_committer_main(next_claim, start_h, end_h, getppid())); } g_dlc_committer=cp; }
     /* MAP_ANONYMOUS pages come zeroed, so every stats[w].peer/chunks/blocks/
@@ -5582,10 +5646,12 @@ static long dl_catchup(const char* dir, int min_workers){
     while(alive>0){
         long done = 0;
         if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);   /* before a connect call that may run for seconds */
+        dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms());   /* Core's rule, every pass (2026-09-10) */
         if(interleave && dlc_now_ms() >= connect_retry_ms){
             /* (store_reload is the bounded call's first act, so it sees the
              * helpers' appends; a second one here would be redundant.) */
             done = utxo_live_catchup_bounded(store_buf, g_dlc_connect_budget_ms, 1);
+            dlc_publish_applied(next_claim);                          /* the window's anchor moves with the connected tip */
             if(done > 0){ conn_total += done; dl_new_block_choke(); }
             if(utxo_live_call_rejected_height() >= 0){
                 fprintf(stderr,"[dlc] block at height %ld REJECTED (%s) and invalidated mid-download -- helpers stopped, connected %ld; "
@@ -5604,6 +5670,7 @@ static long dl_catchup(const char* dir, int min_workers){
              * fresh anchor without waiting for the 10 s tick */
             for(long slept=0; slept<ms; slept+=200){
                 if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);
+                dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms());
                 long step = ms-slept < 200 ? ms-slept : 200;
                 struct timespec ts={step/1000,(step%1000)*1000000L}; nanosleep(&ts,NULL);
             }
@@ -5679,7 +5746,7 @@ static long dl_catchup(const char* dir, int min_workers){
                 snprintf(connbuf,sizeof connbuf," | applied=%ld lag=%ld%s", applied, lag, interleave ? "" : " (interleave off)");
             } else snprintf(connbuf,sizeof connbuf," | connect deferred (no UTXO engine in this process)");
             fprintf(stderr,"[dlc] == elapsed %s | eta %s | overall: %ld/%ld stored (%.2f%% of real tip) | in flight %ld of window %ld through %ld (%s, %.2f%% landed)%s ==\n",
-                    elapsed, etabuf, present, end_h+1, overall_pct, holes, DLC_DOWNLOAD_WINDOW, cur_tip, gapbuf, span_pct, connbuf);
+                    elapsed, etabuf, present, end_h+1, overall_pct, holes, g_dlc_window, cur_tip, gapbuf, span_pct, connbuf);
         }
         /* 2026-09-08: the tick's seven dashed lines became ONE, printed at the
          * end of the tick when every number exists (recv, write, floor,
@@ -5704,6 +5771,9 @@ static long dl_catchup(const char* dir, int min_workers){
           if(nv > 0) median_bps = v[nv/2]; }
         double floor_bps = dlc_effective_floor(median_bps);
         for(int w=0;w<nw;w++) stats[w].pool_median_bps = median_bps;   /* published for the workers' boundary rotation */
+        /* a replacement exists? (2026-09-10: rotation and the rate floor act only then) */
+        int free_peers = 0; for(int q=0;q<nlive;q++) if(!claimed[q] && !banned[q]) free_peers++;
+        next_claim[DLC_CTL_FREE_PEERS] = free_peers;
         /* publish the workers' peers for getpeerinfo / getnettotals (2026-09-08) */
         if(g_node_status){
             int nd = nw > 64 ? 64 : nw;
@@ -5751,7 +5821,7 @@ static long dl_catchup(const char* dir, int min_workers){
             }
             char flag[48]="";
             if(kids[w]!=0 && byte_rate>=0.0){
-                if(median_bps > 0.0 && dlc_dead_weight(byte_rate, b-prev_blocks[w], floor_bps)){
+                if(median_bps > 0.0 && dlc_replace_allowed(free_peers) && dlc_dead_weight(byte_rate, b-prev_blocks[w], floor_bps)){
                     dead_ticks[w]++;
                     if(dead_ticks[w]>=g_cfg.dead_weight_ticks){
                         long bidx = stats[w].held_idx;
@@ -5839,9 +5909,10 @@ static long dl_catchup(const char* dir, int min_workers){
               static int last_nowit = 0; int nw_now = peer_no_witness_count();
               if(nw_now != last_nowit){ last_nowit = nw_now;              /* only when the count changes */
                   fprintf(stderr,"[dlc] -- %d peer(s) dropped for lacking NODE_WITNESS; %llu redial(s) skipped since --\n", nw_now, peer_no_witness_skips()); } }
-            fprintf(stderr,"[dlc] -- recv %s (avg %s) | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | staged %ld commit %ld cursorhelp %ld | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
+            fprintf(stderr,"[dlc] -- recv %s (avg %s) | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | free peers %d | staged %ld commit %ld cursorhelp %ld | stall evictions %ld (timeout %ld s) | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
                     aggbuf, avgrbuf, waggbuf, avgwbuf, floor_bps/1024.0, median_bps/1024.0, cur, nlive,
-                    nbanned == cur ? "" : " (amnesty active)", next_claim[DLC_CTL_STAGED], next_claim[DLC_CTL_N_COMMIT], next_claim[DLC_CTL_N_CURSOR_HELP], d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
+                    nbanned == cur ? "" : " (amnesty active)", free_peers, next_claim[DLC_CTL_STAGED], next_claim[DLC_CTL_N_COMMIT], next_claim[DLC_CTL_N_CURSOR_HELP],
+                    next_claim[DLC_CTL_N_STALL], g_dlc_stall_timeout_s, d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
         }
     }
     dlc_drain_committer(next_claim);            /* a no-op when the loop's last reap already drained it */
@@ -9915,7 +9986,7 @@ int main(int argc, char** argv){
          * finds, so it is a ceiling, not a promise. */
         int catchup_workers;
         if(argc>=6) catchup_workers = atoi(argv[5]);
-        else        catchup_workers = g_cfg.catchup_workers;   /* bmc.catchupworkers, default 16 */
+        else        catchup_workers = g_cfg.catchup_workers;   /* bmc.catchupworkers, default 64 since 2026-09-10 (every live peer downloads, up to it) */
         if(catchup_workers<1) catchup_workers=1;
         if(catchup_workers>64) catchup_workers=64;
         dial_gate_configure(g_cfg.dial_rate_limit); dl_gate_configure(g_cfg.download_rate_limit_kbps);
