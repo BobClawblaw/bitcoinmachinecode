@@ -116,6 +116,23 @@ VERSION_GEN_PY   := gen_version_header.py
 $(VERSION_GEN_H): $(VERSION_INC) $(VERSION_GEN_PY)
 	python3 $(VERSION_GEN_PY) --out $@ --version-inc $(VERSION_INC)
 
+# 2026-09-10: WHICH BUILD is answering. bmcmonitor measured two builds on this
+# box giving different answers to getnettotals/getpeerinfo while both reported
+# the same subversion, and concluded the log banner was the only attestation
+# available. getnetworkinfo now carries the commit. Rewritten only when the
+# value CHANGES (cmp before mv), so a rebuild at the same commit does not
+# relink the world; .PHONY so it is re-checked every make.
+BUILD_GEN_H := build_gen.h
+.PHONY: build-stamp
+build-stamp:
+	@c=$$(git -C .. rev-parse --short HEAD 2>/dev/null || echo unknown); \
+	 d=$$(git -C .. diff --quiet HEAD 2>/dev/null && echo 0 || echo 1); \
+	 printf '/* build_gen.h -- GENERATED. Do not edit. */\n#ifndef BMC_BUILD_GEN_H\n#define BMC_BUILD_GEN_H\n#define BMC_BUILD_COMMIT "%s"\n#define BMC_BUILD_DIRTY %s\n#endif\n' "$$c" "$$d" > $(BUILD_GEN_H).tmp; \
+	 cmp -s $(BUILD_GEN_H).tmp $(BUILD_GEN_H) 2>/dev/null || mv $(BUILD_GEN_H).tmp $(BUILD_GEN_H); \
+	 rm -f $(BUILD_GEN_H).tmp
+$(BUILD_GEN_H): build-stamp
+	@:
+
 utxo_lsm_mm.o: utxo_lsm_mm.c
 	$(CC) $(CFLAGS) -c -o $@ utxo_lsm_mm.c
 
@@ -2738,7 +2755,7 @@ rpc_esplora.o: rpc_esplora.c rpc_esplora.h rpc_json.h rpc_commands.h daemon/addr
 rpc_chain.o: rpc_chain.c rpc_chain.h bitcoin_pow_rules.h rpc_json.h rpc_commands.h version_gen.h descriptor.h miniscript.h musig2.h daemon/undo_store.h \
     rpc_node.h script_flags_consts.h block_filter.h mempool_slot.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_chain.c
-rpc_node.o: rpc_node.c rpc_node.h rpc_json.h version_gen.h mempool_slot.h
+rpc_node.o: rpc_node.c rpc_node.h rpc_json.h version_gen.h build_gen.h mempool_slot.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_node.c
 
 daemon/bmc_cli: daemon/bmc_cli.c daemon/cli_conf.c daemon/cli_conf.h rpc_net.o rpc_commands.o rpc_json.o $(RPCLIBS)

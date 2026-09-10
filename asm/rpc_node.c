@@ -15,6 +15,7 @@
 #include "mempool_entry.h"
 #include "mempool_slot.h"    /* the structural mempool's slot layout */
 #include "version_gen.h"
+#include "build_gen.h"
 #include <signal.h>
 #include <errno.h>
 #include <string.h>
@@ -155,6 +156,16 @@ static int cmd_getnetworkinfo(rj_val** res){
     { rj_val* names = rj_arr(); rj_arr_push(names, rj_str("NETWORK"));
       rj_arr_push(names, rj_str("WITNESS"));
       rj_obj_set(o, "localservicesnames", names); }
+    /* 2026-09-10: WHICH BUILD is answering. bmcmonitor measured two builds on
+     * this box giving different answers to getnettotals and getpeerinfo while
+     * both reported subversion "/BitcoinMachineCode:0.0.1/", and concluded
+     * that the log banner was the only build attestation available -- so a
+     * monitor could not tell a fixed node from a broken one over RPC.
+     * subversion cannot carry this: it goes out on the wire in the version
+     * message, and Core's semantics for it are the user agent. Extension
+     * fields, bmc_ prefixed like getpeerinfo's bmc_download_worker. */
+    rj_obj_set(o, "bmc_build_commit", rj_str(BMC_BUILD_COMMIT));
+    rj_obj_set(o, "bmc_build_dirty",  rj_bool(BMC_BUILD_DIRTY));
     rj_obj_set(o, "localrelay", rj_bool(g_localrelay));
     rj_obj_set(o, "timeoffset", rj_numf("%d", 0));
     /* the REAL toggle state, not a constant: setnetworkactive changes it and
@@ -2440,7 +2451,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
     return 1;
 }
 
-/* ---- bmcgetdownloadinfo (2026-09-10) ---------------------------------------
+/* ---- getbmcdownloadinfo (2026-09-10) ---------------------------------------
  * The parallel download's live state: which worker holds which peer, what
  * each is pulling and at what rate, and the window state that explains why
  * the tail is or is not moving.
@@ -2454,14 +2465,19 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
  * the adaptive stall timeout or the ban list, which is what an operator (and
  * bmcmonitor) needs when a sync slows down.
  *
- * The name carries the bmc prefix for the same reason the bmc.* config keys
+ * The name carries the bmc marker for the same reason the bmc.* config keys
  * do: a Core name must carry Core's exact semantics, so a call Core does not
- * have must not take a name Core might later use. Fields are plain snake_case
- * and stable; a monitor differences the counters itself.
+ * have must not take a name Core might later use. It leads with "get" rather
+ * than "bmc" because bmcmonitor's RPC allowlist is default-deny over
+ * READ-SHAPED PREFIXES (server/rpc/allowlist.js), and its own comment warns
+ * that widening those prefixes is "a hole, not a guard" -- a bmc* prefix rule
+ * would pre-authorise a future bmcset*. Named this way it needs no change
+ * there. Fields are plain snake_case and stable; a monitor differences the
+ * counters itself.
  *
  * Answers {"active": false} outside a parallel download rather than failing,
  * so a poller can call it unconditionally. */
-static int cmd_bmcgetdownloadinfo(rj_val** res){
+static int cmd_getbmcdownloadinfo(rj_val** res){
     rj_val* o = rj_obj();
     const node_status_t* s = g_status;
     long long total = s ? (long long)s->dl_bytes_total : 0;
@@ -2513,7 +2529,7 @@ static const char* const NODE_METHODS[] = {
     "gettxspendingprevout", "getmempoolcluster", "getblockfrompeer",
     "testmempoolaccept", "submitpackage", "savemempool", "importmempool",
     "getprivatebroadcastinfo", "abortprivatebroadcast",
-    "bmcgetdownloadinfo",   /* 2026-09-10: this node's own, no Core counterpart */
+    "getbmcdownloadinfo",   /* 2026-09-10: this node's own, no Core counterpart */
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "getrawaddrman", "getorphantxs", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "addpeeraddress", "disconnectnode",
     "setban", "setnetworkactive", "ping", "getzmqnotifications",
@@ -2606,7 +2622,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "savemempool"))   return cmd_savemempool(res, ec, em);
     if (!strcmp(m, "importmempool")) return cmd_importmempool(params, res, ec, em);
     if (!strcmp(m, "getprivatebroadcastinfo")) return cmd_getprivatebroadcastinfo(res, ec, em);
-    if (!strcmp(m, "bmcgetdownloadinfo"))  return cmd_bmcgetdownloadinfo(res);
+    if (!strcmp(m, "getbmcdownloadinfo"))  return cmd_getbmcdownloadinfo(res);
     if (!strcmp(m, "abortprivatebroadcast"))   return cmd_abortprivatebroadcast(params, res, ec, em);
     if (!strcmp(m, "getmempoolcluster"))
         return cmd_net_unsupported(
