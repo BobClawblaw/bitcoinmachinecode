@@ -6173,10 +6173,26 @@ static long dl_catchup(const char* dir, int min_workers){
                 d->conn_time = stats[w].conn_time; d->bytes_recv = stats[w].bytes_peer; d->bytes_sent = 0;
                 d->last_recv = d->last_send = (long long)time(NULL);
                 d->inflight_lo = stats[w].cur_lo; d->inflight_hi = stats[w].cur_hi; d->dl_worker = w; d->inbound = 0;
+                d->bps_recv = (long long)stats[w].last_bw_bps;   /* 2026-09-10: for bmcgetdownloadinfo */
                 d->used = 1;
             }
             g_node_status->n_dlpeers = nd;
             g_node_status->dl_bytes_total = (long long)cumulative_bytes;
+            /* the aggregate state bmcgetdownloadinfo serves (2026-09-10) */
+            g_node_status->dl_active          = 1;
+            g_node_status->dl_workers         = nw;
+            g_node_status->dl_pool            = nlive;
+            { int nb = 0; for(int q = 0; q < nlive; q++) if(banned[q]) nb++; g_node_status->dl_banned = nb; }
+            g_node_status->dl_free_peers      = free_peers;
+            g_node_status->dl_window          = g_dlc_window;
+            g_node_status->dl_first_hole      = next_claim[DLC_CTL_FIRST_HOLE];
+            g_node_status->dl_claim           = next_claim[DLC_CTL_CLAIM];
+            g_node_status->dl_applied         = next_claim[DLC_CTL_APPLIED];
+            g_node_status->dl_end_h           = end_h;
+            g_node_status->dl_staged          = next_claim[DLC_CTL_STAGED];
+            g_node_status->dl_stall_timeout_s = g_dlc_stall_timeout_s;
+            g_node_status->dl_stall_evictions = next_claim[DLC_CTL_N_STALL];
+            g_node_status->dl_median_bps      = (long long)median_bps;
         }
         for(int w=0;w<nw;w++){
             long b=stats[w].blocks; long blkrate=(long)((double)(b-prev_blocks[w])/tick_s);
@@ -6304,7 +6320,7 @@ static long dl_catchup(const char* dir, int min_workers){
     }
     dlc_drain_committer(next_claim);            /* a no-op when the loop's last reap already drained it */
     g_dlc_kids = NULL; g_dlc_nw = 0;            /* the reject hook's stop is a no-op again */
-    if(g_node_status){ g_node_status->n_dlpeers = 0; }   /* the download is over: its peers leave getpeerinfo (the byte total stays) */
+    if(g_node_status){ g_node_status->n_dlpeers = 0; g_node_status->dl_active = 0; }   /* the download is over: its peers leave getpeerinfo (the byte total stays) */
     /* One more pass now that every helper has exited: the blocks that landed
      * between the last connect pass and the last reap (up to a chunk per
      * helper) are connected here, budget-bounded like any pass, so the lag

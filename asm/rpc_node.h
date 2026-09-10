@@ -57,6 +57,7 @@ typedef struct {
     volatile int              evict_requested;/* set by the accept path; the child exits on its next tick */
     volatile long             inflight_lo, inflight_hi;   /* download worker: the chunk in flight (hi < lo = none) */
     volatile int              dl_worker;      /* download worker index, -1 for a leg or inbound peer */
+    volatile long long        bps_recv;       /* download worker: parent-sampled receive rate, bytes/s (0 = unmeasured). 2026-09-10 */
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
@@ -381,6 +382,28 @@ typedef struct {
     volatile int              n_dlpeers;
     volatile long long        dl_bytes_total;       /* every byte the download has received this run */
     rpc_peer_t                dlpeers[64];
+    /* 2026-09-10: the parallel download's AGGREGATE state, for
+     * bmcgetdownloadinfo. Core has no counterpart -- its block download is 8
+     * outbound peers driven from one message-handler thread, so there is no
+     * worker to report and no window state an operator can act on. Here each
+     * downloading peer is a forked process, so the mapping worker -> peer ->
+     * chunk -> rate is the only way to see what the sync is doing. Published
+     * by the catch-up parent on the same tick as dlpeers, cleared when the
+     * download ends. Appended: every offset above is unchanged. */
+    volatile int              dl_active;          /* 1 while the parallel downloader runs */
+    volatile int              dl_workers;         /* workers this run */
+    volatile int              dl_pool;            /* live candidate pool */
+    volatile int              dl_banned;          /* peers banned for the run */
+    volatile int              dl_free_peers;      /* unclaimed and unbanned */
+    volatile long long        dl_window;          /* blocks the window allows above the anchor */
+    volatile long long        dl_first_hole;      /* the archive's first missing height */
+    volatile long long        dl_claim;           /* the claim cursor */
+    volatile long long        dl_applied;         /* the connected tip the window anchors to */
+    volatile long long        dl_end_h;           /* the span's last height */
+    volatile long long        dl_staged;          /* chunks staged, not yet committed */
+    volatile long long        dl_stall_timeout_s; /* the adaptive stall timeout right now */
+    volatile long long        dl_stall_evictions; /* window-tail evictions this run */
+    volatile long long        dl_median_bps;      /* the pool's median receive rate */
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 
