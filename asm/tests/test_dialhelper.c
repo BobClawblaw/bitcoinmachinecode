@@ -539,8 +539,14 @@ int main(void){
             static volatile dlc_stat_t sst[2]; memset((void*)sst, 0, sizeof sst);
             pid_t kids[2], opid[2];
             /* the tail's holder: a child that exits 7 on SIGUSR1 (the worker's abandon signal) */
+            /* SIGUSR1 is blocked BEFORE the fork so the child inherits the mask
+             * and sigwait can never miss it (the gate's load once delivered the
+             * signal before the child had blocked it: terminated by signal, not
+             * exit 7). The parent unblocks after the fork. */
+            sigset_t um; sigemptyset(&um); sigaddset(&um, SIGUSR1); sigprocmask(SIG_BLOCK, &um, 0);
             pid_t hp = fork();
-            if (hp == 0){ for (;;){ sigset_t m; sigemptyset(&m); int s = 0; sigaddset(&m, SIGUSR1); sigprocmask(SIG_BLOCK, &m, 0); sigwait(&m, &s); if (s == SIGUSR1) _exit(7); } }
+            if (hp == 0){ for (;;){ sigset_t m; sigemptyset(&m); int s = 0; sigaddset(&m, SIGUSR1); sigwait(&m, &s); if (s == SIGUSR1) _exit(7); } }
+            sigprocmask(SIG_UNBLOCK, &um, 0);
             kids[0] = opid[0] = hp; kids[1] = opid[1] = 0;
             sst[0].cur_lo = 100; sst[0].cur_hi = 139; strcpy((char*)sst[0].peer, "10.0.0.1:8333");
             c[DLC_CTL_FIRST_HOLE] = 100; c[DLC_CTL_SPAN_START] = 100; c[DLC_CTL_APPLIED] = -1;
