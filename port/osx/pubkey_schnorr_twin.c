@@ -93,20 +93,8 @@ int pubkey_parse(const u8 *pub, unsigned long publen, u64 qx[4], u64 qy[4])
         fe_sqr(t, x);
         fe_mul(rhs, t, x);
         fe_add(rhs, rhs, CURVE7);
-        {
-            extern int printf(const char*, ...);
-            printf("rhs=");
-            for (int q = 3; q >= 0; q--) printf("%016llx", rhs[q]);
-            printf("\n");
-        }
         /* y = rhs^((p+1)/4) */
         fe_pow(y, rhs, EXP_QR);
-        {
-            extern int printf(const char*, ...);
-            printf("yraw=");
-            for (int q = 3; q >= 0; q--) printf("%016llx", y[q]);
-            printf("\n");
-        }
         /* verify y^2 == rhs */
         fe_sqr(t, y);
         if (t[0] != rhs[0] || t[1] != rhs[1] ||
@@ -120,12 +108,6 @@ int pubkey_parse(const u8 *pub, unsigned long publen, u64 qx[4], u64 qy[4])
                 borrow = (u64)((s >> 64) & 1);
             }
             memcpy(y, v, 32);
-        }
-        {
-            extern int printf(const char*, ...);
-            printf("precopy_y=");
-            for (int q = 3; q >= 0; q--) printf("%016llx", y[q]);
-            printf("\n");
         }
         memcpy(qx, x, 32);
         memcpy(qy, y, 32);
@@ -218,15 +200,9 @@ int schnorr_verify(const unsigned char sig[64], const unsigned char pub_xonly[32
         }
     }
 
-    /* SG = s*G ; EP = e*P (GLV or plain) */
-    {
-        fprintf(stderr, "eL="); for (int i=3;i>=0;i--) fprintf(stderr, "%016llx", eL[i]); fprintf(stderr, "\n");
-        fprintf(stderr, "sL@call=%016llx %016llx %016llx %016llx\n", sL[0], sL[1], sL[2], sL[3]);
-    }
-    point_scalar_mul_fixed(SG, sL);
-    fprintf(stderr, "SGraw: ");
-    for (int i = 0; i < 12; i++) fprintf(stderr, "[%d]=%016llx ", i, SG[i]);
-    fprintf(stderr, "\n");
+    point_scalar_mul_fixed(SG, sL);          /* SG = s*G (restored: the debug
+                                                block removal had swallowed
+                                                the real call) */
     if (bmc_ecdsa_glv_enabled())
         point_scalar_mul_glv(EP, P_aff, eL);
     else
@@ -242,28 +218,7 @@ int schnorr_verify(const unsigned char sig[64], const unsigned char pub_xonly[32
         }
         memcpy(EP + 4, v, 32);
     }
-    {
-        fprintf(stderr, "SGX=%016llx%016llx%016llx%016llx\n", SG[3],SG[2],SG[1],SG[0]);
-        fprintf(stderr, "SGY=%016llx%016llx%016llx%016llx\n", SG[7],SG[6],SG[5],SG[4]);
-        fprintf(stderr, "SGZ=%016llx%016llx%016llx%016llx\n", SG[11],SG[10],SG[9],SG[8]);
-        fprintf(stderr, "sL =%016llx%016llx%016llx%016llx\n", sL[3],sL[2],sL[1],sL[0]);
-    }
-    {
-        u64 zi2[4], z22[4], z32[4], ax2[4], ay2[4];
-        fe_inv(zi2, EP+8); fe_sqr(z22, zi2); fe_mul(z32, z22, zi2);
-        fe_mul(ax2, EP+0, z22); fe_mul(ay2, EP+4, z32);
-        fprintf(stderr, "EPaff=%016llx%016llx%016llx%016llx %016llx%016llx%016llx%016llx\n",
-                ax2[3],ax2[2],ax2[1],ax2[0], ay2[3],ay2[2],ay2[1],ay2[0]);
-    }
     point_add(RPT, SG, EP);
-    fprintf(stderr, "RPTaff-dump\n");
-    {
-        u64 zi2[4], z22[4], z32[4], ax2[4], ay2[4];
-        fe_inv(zi2, RPT+8); fe_sqr(z22, zi2); fe_mul(z32, z22, zi2);
-        fe_mul(ax2, RPT+0, z22); fe_mul(ay2, RPT+4, z32);
-        fprintf(stderr, "RPTaff=%016llx%016llx%016llx%016llx %016llx%016llx%016llx%016llx\n",
-                ax2[3],ax2[2],ax2[1],ax2[0], ay2[3],ay2[2],ay2[1],ay2[0]);
-    }
     if ((RPT[8] | RPT[9] | RPT[10] | RPT[11]) == 0) return 0;
 
     if (!schnorr_x_eq_r_pub(rL, RPT, RPT + 8)) return 0;
