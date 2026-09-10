@@ -254,10 +254,78 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       0/12/33/255/20, dels w/ older-run shadowing, reload, explicit flush,
       compact, post-compact reload+gets). test_lsm_count_drift deferred to
       p3 (needs the full REORGOBJS module set). Commit b65c12e1.
-- [ ] bitcoin_sighash, bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
+- [ ] bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
+- [x] bitcoin_sighash -> port/osx/sighash_twin.c  DONE 2026-09-09 as a C
+      TWIN (sighash_all, legacy_sighash with every legacy hashtype x
+      ANYONECANPAY incl. the SIGHASH_SINGLE out-of-range uint256(1) quirk
+      and OP_CODESEPARATOR stripping via script_find_and_delete(0xab),
+      script_op_len/script_push_encode/script_find_and_delete,
+      legacy_sighash_scfbuf as __thread[20000] replacing the x86 .tbss TLS;
+      every bound check / unchecked raw copy of the x86 transcribed as-is).
+      Gates: test_sighash green, test_legacy_sighash 500/500 Core
+      sighash.json vectors, test_find_and_delete 23/23, test_sighash_oob
+      rejection -- all native; 143 KB cross-arch differential byte-identical
+      vs x86 (120 random txs x both builders x 11 hashtype classes,
+      per-stage truncations, SINGLE quirk, ACP shapes, zero-output tx,
+      PUSHDATA1/2/4 forms incl. truncated headers, all push length classes,
+      needle present/absent/repeated/malformed; drivers port/osx/tests/
+      dsighash.c + gen_dsighash_vecs.py). Commit 404f968b.
 - [ ] bitcoin_interp, bitcoin_scriptcodec, bitcoin_script_flags,
       bitcoin_script, bitcoin_multisig
-- [ ] bip32 family (bitcoin_bip32, bitcoin_keys, bitcoin_addr)
+- [x] bip32 family -> port/osx/bitcoin_keys.S + bitcoin_addr.S +
+      bitcoin_bip32.S  DONE 2026-09-09 as native AArch64 asm (all three).
+      - bitcoin_keys.S: scalar_small_nonzero (byte-wise n compare; the x86's
+        k==n falls-through-to-1 quirk transcribed verbatim and noted in-file)
+        + scalar_to_pubkey (BE->4 LE limbs, CT ladder via point_scalar_mul_ct,
+        affinize z2/z3/inv2/inv3, compressed serialize). Gates: test_keys
+        6/6 native + 647-record cross-arch differential byte-identical
+        (compare-lattice edges: first-differing-byte walks, n-1/n/n+1,
+        600 random + curve-edge to_pubkey scalars incl. 0/n/n+1; dkeys.c +
+        gen_dkeys_vecs.py). Commit 3db7bd97.
+      - bitcoin_addr.S: hash160 (sha256_full + ripemd160) + base58check_encode
+        (zcount '1's, div-58 digit loop with udiv/msub, paylen 0..78 with the
+        >78 and unsigned-negative refusal writing out[0]=0 only). First cut
+        parked the out cursor in x11 and the digit-emit temps zeroed it
+        (w-write destroys the parked x -- the recurring pitfall); cursor
+        moved to callee-saved x22. Gates: test_addr 5/5 native + 56-record
+        cross-arch differential byte-identical (hash160 lengths 0..1000,
+        base58check paylen edges 0/1/4/5/20/21/25/64/78 x zero/random/
+        end-nonzero payloads, 78-byte extended-key shape, refusal shapes;
+        daddr.c + gen_daddr_vecs.py; driver's 64-byte out window raised to
+        the callers' real 128). Commit 1092ebee.
+      - bitcoin_bip32.S: bip32_master (HMAC-SHA512 "Bitcoin seed"),
+        bip32_ckd_priv (hardened 0x00||k vs ser256(K_par) data, IL range
+        gate, (IL+kpar) mod n byte-wise carry/borrow chains),
+        bip32_derive_path (in-place walk of native-endian u32 indexes),
+        bip32_fingerprint (HASH160[0..3]), bip32_extkey_serialize (xprv/xpub
+        payload; key/keylen arrive in x6/x7 -- AAPCS64 passes eight args in
+        registers where x86 SysV spills 7/8 to the stack). Port bugs the
+        gates caught: the 33-byte pub temp overran ckd_priv's local
+        reservation into the save area (the x86 module's own documented
+        FINDING class); the add/sub loops skipped byte 0 (post-decrement
+        cbnz bound), leaving the carry INTO byte 0 in w9 -- a phantom 257th
+        bit -- plus a stale sum[0]; both rewritten countdown-from-32.
+        Gates: test_bip32_master, test_bip32_chain (full vector-1 chain m
+        .. m/0'/1/2'/2/1e9), test_bip32_extkey (BIP44/BIP84 receive paths,
+        xprv/xpub/address), test_bip32_ckdpub (12 checks through the
+        wallet_core link) ALL GREEN native; 990-record cross-arch
+        differential byte-identical (masters over seed-length classes,
+        ckd_priv over edge scalars x index classes incl. zero/all-ff kpar,
+        60 random paths, fingerprints, extkey serializations; dbip32.c +
+        gen_dbip32_vecs.py). Commit 5cfccf4d.
+      - FOUND BY THE BIP32 DIFFERENTIAL DRIVER, FIXED IN PLACE:
+        bitcoin_hmac.S used x25 as its concat-buffer base WITHOUT saving it
+        (x24 was saved; x25 is callee-saved) -- main's GOT anchor died at
+        the next ldr [x25] after any hmac_sha512 call. Latent until dbip32
+        (no earlier caller parked x25 across the call). Prologue/epilogue
+        now save/restore x25,x26; test_hmac re-verified green. Same commit.
+      - test_bip32_master.c itself had UB: sscanf %2x into
+        (unsigned*)&kg[i] writes 4 bytes into a 1-byte slot, spilling 3
+        bytes into adjacent frame vars -- under clang's arm64 layout those
+        zeroed kg[0..2] and the caller's c[0..2] AFTER the fill (the k/c
+        outputs were correct all along; x86 gcc layout hid it). Fixed to
+        the unsigned-temp pattern test_bip32_chain.c already uses;
+        verified green natively AND on .242.
 - [x] bitcoin_chainwork -> port/osx/chainwork_twin.c  DONE 2026-09-09 as a
       C TWIN (compact_to_target_le, u256_div, block_work, chainwork_add/cmp,
       store_chainwork_init/append/get_at -- the chainwork.dat layer).
