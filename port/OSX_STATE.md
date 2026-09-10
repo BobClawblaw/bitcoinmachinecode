@@ -34,6 +34,14 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
   builders, header store) is Darwin-covered. Next: addrmgr/idx, then the
   big store modules, keeping one-module-one-gate.
 
+## 2026-09-09 — bitcoin_addrmgr twin landed (C twin)
+
+- `port/osx/addrmgr_twin.c`: peers.dat book (init/count/add/get_i/lookup)
+  + addr v1/v2 codecs + addr_count. Gates: upstream test_addrmgr 28/28
+  (Core-reference codec bytes), 73-record cross-arch differential
+  byte-identical vs x86 -- result stream AND the resulting peers.dat file.
+  Commit 2725d14b.
+
 ## 2026-09-09 — bitcoin_hash native: first full 6-op module, x86-diff byte-identical
 
 - `port/osx/bitcoin_hash.S` (7 public symbols) gated three ways: upstream
