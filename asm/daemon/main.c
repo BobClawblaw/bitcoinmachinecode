@@ -3020,9 +3020,17 @@ static int dh_reserved_pick(int an, int net, const char* srcpool[], int nsrc){
     return -1;
 }
 static int dh_inflight_for(int want_slot){ for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0 && g_dh[i].want_slot == want_slot) return 1; return 0; }
+/* 2026-09-10 (snapshot v, 03:54Z): the block-relay-only picker dialled the
+ * same refused host every rotation, three helpers deep, and the legs' own
+ * re-dials found "no dial helper free" for ten minutes. Extra legs (block-
+ * relay-only, the anonymity networks) may use helpers only while two stay
+ * free for the legs; want_slot DH_SLOT_EXTRA marks their dials. */
+#define DH_SLOT_EXTRA (-2)
+#define DH_RESERVE_FOR_LEGS 2
+static int dh_extra_allowed(void){ return dh_inflight_count() < DH_MAX - DH_RESERVE_FOR_LEGS && !dh_inflight_for(DH_SLOT_EXTRA); }
 static int g_dh_last_slot = -1;   /* the want_slot of the result dh_poll just returned */
 static int dh_start_slot(const char* host, int out_port, int want_slot);
-static int dh_start(const char* host, int out_port){ return dh_start_slot(host, out_port, -1); }
+static int __attribute__((unused)) dh_start(const char* host, int out_port){ return dh_start_slot(host, out_port, -1); }   /* the tests' entry; the daemon names a slot */
 static int dh_start_slot(const char* host, int out_port, int want_slot){
     int slot = -1; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid <= 0){ slot = i; break; }
     if(slot < 0) return 0;
@@ -3032,6 +3040,7 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
     if(pid == 0){
         close(sp[0]); g_in_dial_helper = 1;
         dh_result_t r; memset(&r, 0, sizeof r);
+        snprintf(g_dial_fail, sizeof g_dial_fail, "refused before dialing");   /* not the parent's last reason (2026-09-10: "timed out (10s)" after 1.4 s) */
         int fd = outbound_connect(host, 300, out_port);
         if(fd >= 0){
             r.ok = 1; r.wants_addrv2 = (unsigned char)g_peer_wants_addrv2;
@@ -8364,16 +8373,21 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         /* CC-4: keep bo_want() block-relay-only legs on clearnet, dialled in the
          * background like the anonymity-network reserved legs below. The host is
          * registered as block-only BEFORE the dial so the version carries fRelay=0. */
-        if((rot % 8)==0 && legs_block_only() < bo_want() && mux_n_out < MUX_MAX_OUT && dh_inflight_count() < DH_MAX){
-            for(int ci = 0; ci < nsrc; ci++){
+        if((rot % 8)==0 && legs_block_only() < bo_want() && mux_n_out < MUX_MAX_OUT && dh_extra_allowed()){
+            static int bo_cursor = 0;                       /* 2026-09-10: rotate through the pool; a refused host is not first again */
+            for(int step = 0; step < nsrc; step++){
+                int ci = (bo_cursor + step) % (nsrc > 0 ? nsrc : 1);
                 int net = leg_net_of(srcpool[ci]);
                 if(net != BMC_NET_IPV4 && net != BMC_NET_IPV6) continue;
                 int already = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], srcpool[ci])){ already = 1; break; }
                 if(already || host_is_block_only(srcpool[ci])) continue;
                 { char ip[128]; ctl_ip_only(srcpool[ci], ip, sizeof ip); if(ctl_is_banned(ip)) continue; }
+                if(g_dialmem && !dialmem_allowed(g_dialmem, srcpool[ci], dialmem_now())) continue;   /* under backoff */
                 bo_add(srcpool[ci]);
+                if(!host_is_block_only(srcpool[ci])) continue;   /* the registry is full: an unregistered dial would come up fRelay=1 */
+                bo_cursor = (ci + 1) % (nsrc > 0 ? nsrc : 1);
                 fprintf(stderr, "[dial] %s: dialing as block-relay-only (%d of %d)\n", srcpool[ci], legs_block_only() + 1, bo_want());
-                dh_start(srcpool[ci], out_port);
+                dh_start_slot(srcpool[ci], out_port, DH_SLOT_EXTRA);
                 break;
             }
         }
@@ -8383,7 +8397,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 int net = anon_nets[an];
                 if(!dialer_net_reachable(net) || legs_on_net(net) > 0 || dh_inflight_net(net)) continue;
                 int ci = dh_reserved_pick(an, net, srcpool, nsrc);
-                if(ci >= 0) dh_start(srcpool[ci], out_port);
+                if(ci >= 0 && dh_extra_allowed()) dh_start_slot(srcpool[ci], out_port, DH_SLOT_EXTRA);
             }
         }
         /* CC-6: Core CheckForStaleTipAndEvictPeers -- when no block has arrived
