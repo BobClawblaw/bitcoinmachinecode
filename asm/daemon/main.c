@@ -2706,6 +2706,8 @@ static void log_hash_short(char out[17], const unsigned char hash32[32]){
  * our tip, through the same evaluator submitblock uses; and a store breaks
  * the rotation so the apply runs at once. */
 static int g_stored_now = 0;                            /* a pushed block was stored during this rotation's sweeps */
+#include "index_repair.h"                                /* 2026-09-10, row 2: the filter index and the address history repair themselves */
+static ir_t g_ir_bfi, g_ir_addrhist;
 /* row 5's measurement, one line per block that went through the compact
  * receiver: what the mempool supplied and where the rest had gone */
 extern void cmpct_recv_last_block(unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long cls[5]);
@@ -5495,6 +5497,28 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
         fprintf(stderr, "[dlc]   #%d %-22s %.0f KB/s\n", i + 1, live[i], rate[idx[i]] > 0 ? rate[idx[i]] / 1024.0 : 0.0);
     munmap(rate, sizeof(double) * (size_t)nlive);
 }
+/* ---- the legs' sweep (2026-09-09; factored 2026-09-10) ---------------------
+ * Every OTHER leg's buffered messages now -- a ping used to wait for its
+ * leg's turn in the rotation (75 s measured; Core's eviction protects its
+ * lowest-ping peers, and a peer that never got a pong ranks last at an
+ * inbound-full node). Nothing outstanding means only what is already
+ * buffered is read; pongs, the good mark and the ping schedule ride along.
+ * Since 2026-09-10 this also runs inside the PARALLEL DOWNLOAD's loop
+ * (CORE_DIVERGENCES row 3): a reorg handoff used to leave every leg
+ * unserved for the whole download -- no pongs, no relay, no announcements
+ * -- and the rotation came back to legs that had given up on us. Core keeps
+ * serving its peers while it fetches a branch. except = -1 sweeps all. */
+static void legs_sweep_except(int except){
+    long long nowsec = (long long)time(NULL);
+    for(int k = 0; k < mux_n_out; k++){
+        if(k == except || mux_out_fd[k] < 0) continue;
+        if(mux_out_kind[k] != LEG_BLOCK_ONLY && txsub_worker_ready()){ extern long txrelay_poll_leg(int, void*, int); (void)txrelay_poll_leg(mux_out_fd[k], txsub_pool(), 0); }
+        else if(mux_out_kind[k] == LEG_BLOCK_ONLY){ extern long txrelay_poll_block_only_leg(int); (void)txrelay_poll_block_only_leg(mux_out_fd[k]); }
+        if(!mux_out_good[k] && mux_out_since[k] && nowsec - mux_out_since[k] >= DM_GOOD_S){ mux_out_good[k] = 1; if(g_dialmem) dialmem_note_success(g_dialmem, mux_out_host[k]); }
+        leg_ping_tick(k, nowsec);
+    }
+    if(except >= 0 && except < mux_n_out && mux_out_fd[except] >= 0) leg_ping_tick(except, nowsec);
+}
 /* ---- Core's stall rule (2026-09-10) ----------------------------------------
  * The one judge of slowness in Core's downloader: when the window is full
  * (nothing more can be requested above the connected tip) and one peer
@@ -5651,12 +5675,6 @@ static long dl_catchup(const char* dir, int min_workers){
      * KB/s. The window scales with what is in flight and is anchored to the
      * connected tip; the parent evicts a peer that stalls the window's
      * tail; rotation and the rate floor act only while a free peer exists. */
-    int nw = dlc_workers_for(nlive, min_workers);
-    g_dlc_window = dlc_window_blocks(nw, DLC_CHUNK_BLOCKS);
-    g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
-    fprintf(stderr,"[dlc] Core's shape: %d of %d live peer(s) download at once (cap %d), window %ld blocks above the connected tip, stall timeout %ld s\n",
-            nw, nlive, min_workers, g_dlc_window, g_dlc_stall_timeout_s);
-
     long hdr_len = dlc_headers(live, nlive);
     if(hdr_len<=0){ fprintf(stderr,"[dlc] header phase failed; skipping catch-up\n"); return 0; }
 
@@ -5666,6 +5684,11 @@ static long dl_catchup(const char* dir, int min_workers){
         return 0;
     }
     fprintf(stderr,"[dlc] span [%ld,%ld] (%ld heights)\n", start_h, end_h, end_h-start_h+1);
+    int nw = dlc_workers_for(nlive, min_workers, end_h - start_h + 1);   /* a handoff's few dozen blocks do not need 64 helpers (row 3) */
+    g_dlc_window = dlc_window_blocks(nw, DLC_CHUNK_BLOCKS);
+    g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
+    fprintf(stderr,"[dlc] Core's shape: %d of %d live peer(s) download at once (cap %d, span %ld), window %ld blocks above the connected tip, stall timeout %ld s\n",
+            nw, nlive, min_workers, end_h - start_h + 1, g_dlc_window, g_dlc_stall_timeout_s);
 
     /* pre-size index.dat GROW-ONLY, create append.lock */
     {
@@ -5808,6 +5831,7 @@ static long dl_catchup(const char* dir, int min_workers){
         long done = 0;
         if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);   /* before a connect call that may run for seconds */
         dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms());   /* Core's rule, every pass (2026-09-10) */
+        legs_sweep_except(-1);                                                            /* row 3: the legs stay served through a handoff */
         if(interleave && dlc_now_ms() >= connect_retry_ms){
             /* (store_reload is the bounded call's first act, so it sees the
              * helpers' appends; a second one here would be redundant.) */
@@ -6923,7 +6947,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               char exe[512], builder[600]; ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
               if (n > 0){ exe[n] = 0; char* sl = strrchr(exe, '/'); if (sl) *sl = 0; snprintf(builder, sizeof builder, "%s/bmc_build_coinstats_hist", exe); }
               else snprintf(builder, sizeof builder, "bmc_build_coinstats_hist");
-              csi_hist_repair_configure(builder, dir, g_chainp->name, g_cfg.coinstatshist_workers, g_cfg.coinstatshist_repair); }
+              csi_hist_repair_configure(builder, dir, g_chainp->name, g_cfg.coinstatshist_workers, g_cfg.coinstatshist_repair);
+              /* 2026-09-10 (CORE_DIVERGENCES row 2): the block filter index and
+               * the address history repair themselves the same way -- the
+               * builders beside this executable, ticked at the heartbeat */
+              { char b2[600]; snprintf(b2, sizeof b2, "%s/bmc_build_block_filters", n > 0 ? exe : ".");
+                ir_configure(&g_ir_bfi, "bfilter", b2, dir, g_chainp->name, "", g_cfg.blockfilterindex);
+                snprintf(b2, sizeof b2, "%s/bmc_build_addr_hist", n > 0 ? exe : ".");
+                ir_configure(&g_ir_addrhist, "addrhist", b2, dir, g_chainp->name, "", g_cfg.addrindex); } }
             utxo_live_set_coinstats(csi_on_add, csi_on_remove, csi_invalidate, csi_commit);
             { extern void csi_on_block(long); extern void utxo_live_set_coinstats_block(void (*)(long)); utxo_live_set_coinstats_block(csi_on_block); }
             undo_set_coin_observer(csi_on_remove);
@@ -8050,15 +8081,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * measured; Core's eviction protects its lowest-ping peers, and a
              * peer that never got a pong ranks last at an inbound-full node).
              * Nothing outstanding means only what is already buffered is read. */
-            { long long nowsec = (long long)time(NULL);
-              for(int k = 0; k < mux_n_out; k++){
-                  if(k == i || mux_out_fd[k] < 0) continue;
-                  if(mux_out_kind[k] != LEG_BLOCK_ONLY && txsub_worker_ready()){ extern long txrelay_poll_leg(int, void*, int); (void)txrelay_poll_leg(mux_out_fd[k], txsub_pool(), 0); }
-                  else if(mux_out_kind[k] == LEG_BLOCK_ONLY){ extern long txrelay_poll_block_only_leg(int); (void)txrelay_poll_block_only_leg(mux_out_fd[k]); }
-                  if(!mux_out_good[k] && mux_out_since[k] && nowsec - mux_out_since[k] >= DM_GOOD_S){ mux_out_good[k] = 1; if(g_dialmem) dialmem_note_success(g_dialmem, mux_out_host[k]); }
-                  leg_ping_tick(k, nowsec);
-              }
-              leg_ping_tick(i, nowsec); }
+            legs_sweep_except(i);
             /* brief yield so we don't spin a CPU core when all legs are idle */
             if(g_stored_now) stored_break = 1;
             if(stored_break){ leg_start = (i + 1) % mux_n_out; break; }   /* 2026-09-10: to the apply; the rotation resumes after this leg */
@@ -8273,6 +8296,23 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 long target = utxo_live_ok ? utxo_live_applied_height() : (long)*(int*)(store_buf+24);
                 csi_hist_repair_tick(target, dl_tip_is_ibd(), (long long)time(NULL));
             }
+            /* 2026-09-10 (row 2): the block filter index and the address history
+             * repair themselves. The filter index needs a build when it is
+             * absent or more than the adopt gap behind the tip (the live tail
+             * adopts and closes the rest from undo once it is within 144); the
+             * address history when its base is absent. */
+            { long atip = (long)*(int*)(store_buf+24); long long nows = (long long)time(NULL); int ibd = dl_tip_is_ibd();
+              if(g_cfg.blockfilterindex){
+                  extern long bfi_count(void); extern long bfi_probe_count(void);
+                  long have = bfi_probe_count(); int needed = bfi_count() < 0 && (have < 0 || atip - have > 144);
+                  ir_tick(&g_ir_bfi, needed, atip, ibd, nows);
+              }
+              if(g_cfg.addrindex){
+                  extern int ah_available(void) __attribute__((weak));
+                  int needed = ah_available ? !ah_available() : 0;
+                  long target = utxo_live_ok ? utxo_live_applied_height() : atip;
+                  ir_tick(&g_ir_addrhist, needed, target, ibd, nows);
+              } }
             /* Relay-pool health. Silent when nothing has been parked, so a
              * node with no orphan traffic prints nothing extra. */
             { extern long txrelay_stats(long*,long*,long*,long*,long*,long*);
