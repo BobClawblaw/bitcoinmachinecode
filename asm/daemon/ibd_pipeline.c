@@ -1,6 +1,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <sys/mman.h>
+#include <unistd.h>
+#include <time.h>
 #include "ibd_pipeline.h"
 
 #define IBD_PIPE_MAX 256          /* chunk sizes in use are 40; the cap bounds the arrays */
@@ -104,7 +106,20 @@ long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long n
         if (g_bytes) g_bytes((long)len);                       /* charged whether or not we wanted it */
         if (len < 81) continue;
 
-        if (cons_verify(buf, (long)len, scratch, scratch_cap) != 1){ why = IBD_FAIL_CONSENSUS; goto fail; }   /* same gate, same scratch, as the serial path */
+        if (cons_verify(buf, (long)len, scratch, scratch_cap) != 1){
+            why = IBD_FAIL_CONSENSUS;
+            /* bmc_osx: standalone cons_verify passes every block of the
+             * failing chunk, so the bytes ARRIVING here are wrong. Dump the
+             * offender for offline analysis before the retry overwrites it. */
+            unsigned char bh_dbg[32]; block_hash(bh_dbg, buf);
+            char dp[96]; snprintf(dp, sizeof dp, "/tmp/ibd_bad_%d_%lld.bin",
+                                  (int)getpid(), (long long)time(NULL));
+            FILE* df = fopen(dp, "wb");
+            if (df){ fwrite(buf, 1, len, df); fclose(df); }
+            fprintf(stderr, "[ibd] cons_verify FAILED len=%u blockhash=", len);
+            for (int di = 31; di >= 0; di--) fprintf(stderr, "%02x", bh_dbg[di]);
+            fprintf(stderr, " dumped %s\n", dp);
+            goto fail; }   /* same gate, same scratch, as the serial path */
         unsigned char bh[32];
         block_hash(bh, buf);
 
