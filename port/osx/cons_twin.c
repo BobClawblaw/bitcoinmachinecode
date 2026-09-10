@@ -21,7 +21,93 @@ typedef unsigned char u8;
 extern long tx_parse(u64 info[8], const void *tx, u64 txlen);
 extern long tx_txid(u8 out[32], const void *tx, u64 txlen, void *buf, u64 buflen);
 extern long merkle_root(u8 root[32], const u8 *txids, unsigned long n);
+extern void sha256d(u8 out[32], const void *msg, unsigned long long len);
 extern long pow_check(const u8 header[80]);
+
+/* ----------------------------------------------------------------------------
+ * UPSTREAM-BUG NOTE (2026-09-10, found mining the first osx regtest block):
+ * asm/tx_txid (x86 bitcoin_tx.asm) rebuilds the unwitnessed serialization
+ * CORRECTLY (byte-identical to Core's stripped form for a real segwit tx) but
+ * then hashes the WRONG LENGTH -- its txid differs from Core's for every
+ * segwit tx.  Latent on x86: the IBD path verifies through daemon/tx_verify.c's
+ * C walker, not asm cons_verify; only submitblock reaches it.  This twin
+ * computes the txid itself (strip marker/flag + witness in C, then sha256d) so
+ * the osx node ACCEPTS segwit blocks exactly as Core does.  The x86 fix
+ * belongs on main (bitcoin_tx.asm tx_txid's length computation).
+ * -------------------------------------------------------------------------- */
+static int txid_of_span(const u8* tx, u64 txlen, u8 out[32], u8* scratch, u64 cap){
+    if (txlen < 10) return 0;               /* version + n_in + locktime minimum */
+    const u8* end = tx + txlen;
+    const u8* p = tx + 4;
+    u64 hdr = 4;                            /* stripped body start (no marker/flag) */
+    if (p + 2 <= end && p[0] == 0x00 && p[1] != 0x00){ p += 2; hdr = 6; }  /* BIP144 */
+    u64 body;
+    u64 nin = 0, nout = 0;
+    { const u8* q = p;
+      u64 csval[2]; int which = 0;
+      while (q < end && which < 2){
+          u64 v = *q++;
+          if (v == 0xfd){ if (end - q < 2) return 0; v = (u64)q[0] | ((u64)q[1]<<8); q += 2; }
+          else if (v == 0xfe){ if (end - q < 4) return 0; v = (u64)q[0] | ((u64)q[1]<<8) | ((u64)q[2]<<16) | ((u64)q[3]<<24); q += 4; }
+          else if (v == 0xff){ if (end - q < 8) return 0; v = 0; for (int i = 0; i < 8; i++) v |= (u64)q[i] << (8*i); q += 8; }
+          csval[which++] = v;
+          if (which == 1){
+              nin = v;
+              for (u64 i = 0; i < nin; i++){
+                  if (end - q < 36) return 0; q += 36;
+                  u64 sl = *q++;
+                  if (sl == 0xfd){ if (end - q < 2) return 0; sl = (u64)q[0] | ((u64)q[1]<<8); q += 2; }
+                  else if (sl == 0xfe){ if (end - q < 4) return 0; sl = (u64)q[0] | ((u64)q[1]<<8) | ((u64)q[2]<<16) | ((u64)q[3]<<24); q += 4; }
+                  else if (sl == 0xff){ if (end - q < 8) return 0; sl = 0; for (int k = 0; k < 8; k++) sl |= (u64)q[k] << (8*k); q += 8; }
+                  if ((u64)(end - q) < sl) return 0; q += sl;
+                  if (end - q < 4) return 0; q += 4;
+              }
+          } else {
+              nout = v;
+              for (u64 i = 0; i < nout; i++){
+                  if (end - q < 8) return 0; q += 8;
+                  u64 sl = *q++;
+                  if (sl == 0xfd){ if (end - q < 2) return 0; sl = (u64)q[0] | ((u64)q[1]<<8); q += 2; }
+                  else if (sl == 0xfe){ if (end - q < 4) return 0; sl = (u64)q[0] | ((u64)q[1]<<8) | ((u64)q[2]<<16) | ((u64)q[3]<<24); q += 4; }
+                  else if (sl == 0xff){ if (end - q < 8) return 0; sl = 0; for (int k = 0; k < 8; k++) sl |= (u64)q[k] << (8*k); q += 8; }
+                  if ((u64)(end - q) < sl) return 0; q += sl;
+              }
+          }
+      }
+      if (hdr == 6){                       /* segwit: skip the witness stacks */
+          for (u64 i = 0; i < nin; i++){
+              if (q >= end) return 0;
+              u64 ni = *q++;
+              if (ni == 0xfd){ if (end - q < 2) return 0; ni = (u64)q[0] | ((u64)q[1]<<8); q += 2; }
+              else if (ni == 0xfe){ if (end - q < 4) return 0; ni = (u64)q[0] | ((u64)q[1]<<8) | ((u64)q[2]<<16) | ((u64)q[3]<<24); q += 4; }
+              for (u64 j = 0; j < ni; j++){
+                  if (q >= end) return 0;
+                  u64 il = *q++;
+                  if (il == 0xfd){ if (end - q < 2) return 0; il = (u64)q[0] | ((u64)q[1]<<8); q += 2; }
+                  else if (il == 0xfe){ if (end - q < 4) return 0; il = (u64)q[0] | ((u64)q[1]<<8) | ((u64)q[2]<<16) | ((u64)q[3]<<24); q += 4; }
+                  else if (il == 0xff){ if (end - q < 8) return 0; il = 0; for (int k = 0; k < 8; k++) il |= (u64)q[k] << (8*k); q += 8; }
+                  if ((u64)(end - q) < il) return 0; q += il;
+              }
+          }
+          if (q + 4 != end) return 0;      /* locktime must follow exactly */
+      } else {
+          if (end - q != 4) return 0;      /* legacy: only the locktime remains */
+      }
+      body = (u64)(q - tx);
+    }
+    /* stripped = version(4) || [n_in varint .. outs_end) || locktime(4)
+     * body = offset of the witness section (= end of outputs; == txlen-4 for
+     * legacy).  hdr is where the body starts: 6 with marker+flag, 4 without
+     * (the first cut hardcoded 6 and ate two bytes of every legacy txid --
+     * test_cons's valid-block fixtures caught it). */
+    u64 blen = 4 + (body - hdr) + 4;
+    if (blen > cap) return 0;
+    memcpy(scratch, tx, 4);
+    memcpy(scratch + 4, tx + hdr, body - hdr);
+    memcpy(scratch + 4 + (body - hdr), end - 4, 4);
+    sha256d(out, scratch, blen);
+    return 1;
+}
 
 int cons_verify(const u8 *block, u64 len, u8 *txids_out, u64 cap)
 {
@@ -72,7 +158,7 @@ int cons_verify(const u8 *block, u64 len, u8 *txids_out, u64 cap)
 
         if ((u64)count >= cap) return 0;
         u8 txid[32];
-        if (tx_txid(txid, block + off, txlen, scratch, sizeof scratch) == 0)
+        if (txid_of_span(block + off, txlen, txid, scratch, sizeof scratch) == 0)
             return 0;
         memcpy(txids_out + (u64)count * 32, txid, 32);
         count++;
