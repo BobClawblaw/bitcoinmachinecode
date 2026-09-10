@@ -23,6 +23,17 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
   (p2p_getheaders etc. -- pure compute) then addrmgr/idx, keeping the
   one-module-one-gate rhythm.
 
+## 2026-09-09 — bitcoin_p2p twin: IBD message layer complete (C twin)
+
+- `port/osx/p2p_twin.c`: p2p_getheaders (Stage A multi-hash locator,
+  count 1..252), p2p_getdata_block (MSG_WITNESS_BLOCK 0x40000002), p2p_ping,
+  p2p_headers_count, p2p_inv_count, p2p_inv_get. Gates: upstream test_p2p
+  18/18 + test_p2p_inv 12/12 native, 130-record cross-arch differential
+  byte-identical vs x86 (dp2p.c + gen_dp2p_vecs.py). Commit 57588bdb.
+- With net_twin + headers_twin the whole IBD wire path (framing, message
+  builders, header store) is Darwin-covered. Next: addrmgr/idx, then the
+  big store modules, keeping one-module-one-gate.
+
 ## 2026-09-09 — bitcoin_hash native: first full 6-op module, x86-diff byte-identical
 
 - `port/osx/bitcoin_hash.S` (7 public symbols) gated three ways: upstream
