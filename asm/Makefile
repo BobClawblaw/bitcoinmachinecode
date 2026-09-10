@@ -3143,12 +3143,13 @@ tests/test_coinstats_index: tests/test_coinstats_index.c daemon/coinstats_index.
 tests/test_coinstats_fold_ring: tests/test_coinstats_fold_ring.c daemon/coinstats_index.c daemon/muhash_p2.inc.h rpc_node.h bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_coinstats_fold_ring.c daemon/coinstats_index.c bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o -lpthread
 
-# test_coinstats_bulk_seed -- (2026-09-06, UTXO_INLINE_BUILD_PERF_SCOPE.md):
-# during bulk catch-up the coinstats index folds NOTHING per coin and seeds
-# once from a walk at caught-up; the seed equals inline folding's digest.
-# Negative control = today's path (seeded at boot, every coin folded inline).
-# Driven through the real utxo_live_catchup; the CKPTSRCS link set plus the
-# index itself.
+# test_coinstats_bulk_seed -- (2026-09-06; rewritten 2026-09-10): the
+# coinstats index folds per block during BULK catch-up too, through the fold
+# worker (Core's coinstatsindex shape): the connect thread folds nothing, the
+# worker's digest equals an independent walk, the history rows exist for
+# every height, no seed walk at the downshift. Negative control = inline
+# folding in steady state, same digest. Driven through the real
+# utxo_live_catchup; the CKPTSRCS link set plus the index itself.
 BULKSEEDSRCS := tests/test_coinstats_bulk_seed.c daemon/coinstats_index.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
     daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
