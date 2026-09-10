@@ -2350,7 +2350,13 @@ static int outbound_connect_raw(const char* host, int rcv_ms, int out_port){
     const char* v2res = "v1";
     /* Only peers that advertise NODE_P2P_V2 get a v2 dial; everyone else is
      * one plain v1 connection, as before. See peer_advertises_v2 above. */
-    const int want_v2 = peer_advertises_v2(host, out_port);
+    /* 2026-09-10: a dial helper's socket crosses a fork, and the BIP324 v2
+     * cipher state lives in the process that ran the handshake -- the
+     * parent's first bytes on a helper-dialed v2 leg were garbage to the
+     * peer and every such leg died within a second on snapshot u. Helpers
+     * dial v1 until the transport state can be handed over with the fd
+     * (CORE_DIVERGENCES: v2 on helper-dialed legs). */
+    const int want_v2 = g_in_dial_helper ? 0 : peer_advertises_v2(host, out_port);
     for(int attempt = 0; attempt < 2; attempt++){
         if(proxied){
             bmc_addr_t pa; memset(&pa,0,sizeof pa);
@@ -6695,6 +6701,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     utxo_live_set_shutdown_flag(&g_shutdown_requested);
     { extern void rpc_node_set_shutdown_flag(const volatile sig_atomic_t*);
       rpc_node_set_shutdown_flag(&g_shutdown_requested); }   /* the mempool reload must yield to SIGTERM */
+    /* 2026-09-10: the dial memory was created by the parallel downloader only,
+     * so this worker's legs dialled without one: every failure line read "not
+     * dialled again for 0 min" and the same dead host was tried every 30 s.
+     * The memory is MAP_SHARED so the helpers' notes land in it too. */
+    if(!g_dialmem){
+        void* dm = mmap(NULL, dialmem_bytes(DIALMEM_CAP), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+        if(dm != MAP_FAILED){ dialmem_init(dm, DIALMEM_CAP); g_dialmem = (dm_table_t*)dm; }
+    }
     /* Reload a fresh store state rather than inherit the parent's possibly-
      * stale in-memory idx_len/pos (fork COW is not safe for a growable
      * store -- see the unified_ibd comments on re-initialising per
