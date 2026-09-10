@@ -280,9 +280,20 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       The differential caught a REAL twin bug the short-form-only upstream
       harnesses missed: der_long_len re-masked the first length BYTE as the
       count instead of the header's low 7 bits.  Commit 93b6cfca.
-- [ ] bitcoin_bip341, bitcoin_bip342 (bip341 looks like bip143: asm is the
-      perf twin, bitcoin_taproot_sighash.c is production arch-neutral C --
-      gate needs secp256k1_taproot first)
+- [x] secp256k1_taproot -> port/osx/taproot_twin.c  DONE 2026-09-09 as a C
+      TWIN (tagged_hash256, tap_branch_hash with cmpsb ordering, tap_leaf_hash
+      with the TAP_PREIMG_CAP-70 bound, taproot_tweak_pubkey returning 1 even
+      / 2 odd with the parity captured before even-normalising, tap_merkle_root
+      over control siblings innermost-first, count ignored as on x86; lazy
+      __thread 4 MiB tap_preimg replaces the .tbss).  Gates: upstream
+      test_taproot ALL PASS native; 227-record cross-arch differential
+      byte-identical vs x86 on .242 (dtap.c + gen_dtap_vecs.py: tags/msgs to
+      200 KB, leaf compactsize boundaries 0xfd/0x10000, tweak rejections
+      x>=p/t>=n, merkle paths depth 0..8 mixed orderings).  Commit 871200f3.
+- [ ] bitcoin_bip341, bitcoin_bip342 (bitcoin_taproot_sighash.c is
+      production arch-neutral C like bitcoin_segwit.c and needs this twin
+      at link time; its harness test_taproot_sighash pulls
+      bitcoin_interp/scriptcodec/sha1 -- gate lands with the script VM wave)
 - [x] bitcoin_sighash -> port/osx/sighash_twin.c  DONE 2026-09-09 as a C
       TWIN (sighash_all, legacy_sighash with every legacy hashtype x
       ANYONECANPAY incl. the SIGHASH_SINGLE out-of-range uint256(1) quirk
