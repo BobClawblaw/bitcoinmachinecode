@@ -117,6 +117,18 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       GATES CAUGHT: first cut duplicated the drain loop after a botched edit
       and had checksum-before-drain ordering wrong (checksum runs FIRST,
       only when announced<=cap; plen_out is written AFTER the drain).
+- [x] bitcoin_p2p -> port/osx/p2p_twin.c  DONE 2026-09-09 as a C TWIN
+      (6 pure-compute payload builders/parsers; NODE_PROTOCOL_VER pinned to
+      asm/version.inc's 70016 with a pointer comment -- a bump shows as a
+      cross-arch diff failure, not silent drift). Gates: upstream test_p2p
+      18/18 (incl. the p2p_write pacer-hook block via net_twin) +
+      test_p2p_inv 12/12 (1-byte/0xfd varints, 0xfe reject, round-trip) +
+      130-record differential byte-identical vs x86 bitcoin_p2p.o
+      (drivers port/osx/tests/dp2p.c + gen_dp2p_vecs.py: getheaders counts
+      1..252 + negatives 0/253/300/0xFFFFFFFF, getdata MSG_WITNESS_BLOCK,
+      ping nonces, headers_count/inv_count incl. 0xfc/0xfd/0xfe/0xff and
+      count*81/count*36 plen boundaries, inv_get round-trips).
+      Commit 57588bdb.
 - [ ] bitcoin_sighash, bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
 - [ ] bitcoin_interp, bitcoin_scriptcodec, bitcoin_script_flags,
       bitcoin_script, bitcoin_multisig, bitcoin_cons
