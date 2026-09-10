@@ -1187,6 +1187,11 @@ void (*txrelay_on_headers)(int fd, const unsigned char* hdrs81, unsigned long n)
 long (*txrelay_on_cmpctblock)(int fd, const unsigned char* pl, unsigned long plen) = 0;
 long (*txrelay_on_blocktxn)(int fd, const unsigned char* pl, unsigned long plen) = 0;
 long (*txrelay_on_block)(int fd, const unsigned char* pl, unsigned long plen) = 0;
+/* 2026-09-10: the peer's sendcmpct arrives right after verack, and since the
+ * sweep reads a leg before its first pass, the sync drains that used to
+ * record it never saw it -- every leg installed since #159 fetched FULL
+ * blocks (11.5 s for 1.6 MB from one peer on block 966,302). */
+void (*txrelay_on_sendcmpct)(int fd, const unsigned char* pl, unsigned long plen) = 0;
 static void txr_block_inv_scan(int fd, const u8* pl, unsigned plen){
     if (!txrelay_on_block_inv) return;
     unsigned cc; unsigned long n = txr_varint(pl, pl + plen, &cc);
@@ -1207,6 +1212,7 @@ static int txr_block_msg(int fd, const char* cmd, const u8* pl, unsigned plen){
     if (!memcmp(cmd, "cmpctblock", 11)){ if (txrelay_on_cmpctblock) txrelay_on_cmpctblock(fd, pl, plen); return 1; }
     if (!memcmp(cmd, "blocktxn", 9)){ if (txrelay_on_blocktxn) txrelay_on_blocktxn(fd, pl, plen); return 1; }
     if (!memcmp(cmd, "block", 6)){ if (txrelay_on_block) txrelay_on_block(fd, pl, plen); return 1; }
+    if (!memcmp(cmd, "sendcmpct", 10)){ if (txrelay_on_sendcmpct) txrelay_on_sendcmpct(fd, pl, plen); return 1; }
     return 0;
 }
 static u8 txr_pl[TXR_PAYLOAD_CAP];      /* the sweep's payload buffer (the worker is single-threaded) */
