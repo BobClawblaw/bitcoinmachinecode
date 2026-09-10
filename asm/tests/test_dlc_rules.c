@@ -29,10 +29,13 @@ int main(void){
     ck("a chain at or above the announced height is accepted", !dlc_chain_falls_short(966140, 966132));
     ck("with no announced height nothing falls short", !dlc_chain_falls_short(5, 0));
     /* ---- Core's download shape (2026-09-10) ---- */
-    ck("124 live peers, cap 64: 64 download (run 19 ran 16)", dlc_workers_for(124, 64) == 64);
-    ck("12 live peers, cap 64: all 12", dlc_workers_for(12, 64) == 12);
-    ck("no live peer: still one worker slot", dlc_workers_for(0, 64) == 1);
-    ck("a cap above the arrays' 64 is 64", dlc_workers_for(500, 200) == 64);
+    ck("124 live peers, cap 64: 64 download (run 19 ran 16)", dlc_workers_for(124, 64, 966211) == 64);
+    ck("12 live peers, cap 64: all 12", dlc_workers_for(12, 64, 966211) == 12);
+    ck("no live peer: still one worker slot", dlc_workers_for(0, 64, 966211) == 1);
+    ck("a cap above the arrays' 64 is 64", dlc_workers_for(500, 200, 966211) == 64);
+    ck("a 40-block handoff: one helper, not 64 (row 3)", dlc_workers_for(124, 64, 40) == 1);
+    ck("a 41-block span: two helpers", dlc_workers_for(124, 64, 41) == 2);
+    ck("a 1,000-block span: 25 helpers", dlc_workers_for(124, 64, 1000) == 25);
     ck("the window is six times what is in flight: 64 x 40 x 6 = 15,360", dlc_window_blocks(64, 40) == 15360);
     ck("...never under 4,096 (16 workers: 3,840 in flight would be 1.6x, run 11's stall)", dlc_window_blocks(16, 40) == 4096);
     ck("anchor: the connected tip + 1 when the engine is here", dlc_window_anchor(700001, 700970) == 700001);

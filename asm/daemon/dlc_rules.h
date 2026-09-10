@@ -52,9 +52,13 @@ static inline int dlc_chain_falls_short(long chain_tip, long announced){
 #define DLC_WINDOW_INFLIGHT_MULT 6L        /* Core: 1,024 over ~160 in flight */
 #define DLC_STALL_TIMEOUT_MIN_S 2L         /* BLOCK_STALLING_TIMEOUT_DEFAULT */
 #define DLC_STALL_TIMEOUT_MAX_S 64L        /* BLOCK_STALLING_TIMEOUT_MAX */
-/* every live peer downloads, up to the operator's cap and the arrays' 64 */
-static inline int dlc_workers_for(int nlive, int cap){
+/* every live peer downloads, up to the operator's cap and the arrays' 64 --
+ * and no more than the span has chunks (2026-09-10, row 3: a reorg handoff
+ * of forty blocks forked 64 helpers for one chunk) */
+static inline int dlc_workers_for(int nlive, int cap, long span_blocks){
     int n = nlive < cap ? nlive : cap;
+    long chunks = (span_blocks + 39) / 40;
+    if (chunks >= 1 && n > chunks) n = (int)chunks;
     if (n < 1) n = 1;
     if (n > DLC_WORKERS_HARD_MAX) n = DLC_WORKERS_HARD_MAX;
     return n;
