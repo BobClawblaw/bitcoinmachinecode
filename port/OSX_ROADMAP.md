@@ -199,6 +199,27 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       DRIVER NOTE: x86-side duxst needs static get-outs (gcc -O2 stack-local
       outs corrupted the value slot with the upstream asm; osx twin + statics
       agree byte-for-byte). Commits 55c76deb (+ utxo_struct_size in utxo_twin).
+- [x] bitcoin_utxo_lsm -> port/osx/utxo_lsm_twin.c  DONE 2026-09-09 as a
+      C TWIN (memtable flush -> sorted MAGIC_RUN3 runs w/ 3-seed bloom +
+      64-record sparse index; UMAN/UMN2 manifest w/ tmp+fsync+rename+dirsync;
+      multi-run get newest-index-first bloom-gated sparse-accelerated;
+      k-way merge recount/compact/compact_range/walk; tombstone O(1) hash;
+      radix or merge sort via set_sort_mode; WAL tier delegated to
+      utxo_store_twin -- lst layout is utxo_store's exactly). The upstream
+      asm/utxo_lsm_mm.c mmap fast path is vendored byte-identical, DEFAULTED
+      OFF on macOS: byte-identical file, but 8-thread concurrent gets fail
+      under clang-21/arm64 while single-threaded mm lookups are byte-correct
+      and the twin fallback passes everything including concurrently
+      (documented in the file; root cause unpinned, correctness anchor is
+      the twin path). Gates: upstream test_utxo_lsm + test_lsm_flush_sparse
+      + test_lsm_mmap_diff + test_lsm_sparse_diff + test_lsm_bloomsat +
+      test_lsm_lost_tombstones ALL GREEN native; 229-record differential
+      byte-identical vs x86 bitcoin_utxo_lsm.o -- retval stream AND the
+      full file set (utxo.dat, utxo.idx, utxo_manifest.dat, every
+      utxo_run_*.dat) (dlsm.c + gen_dlsm_vecs.py: 120 puts w/ script lens
+      0/12/33/255/20, dels w/ older-run shadowing, reload, explicit flush,
+      compact, post-compact reload+gets). test_lsm_count_drift deferred to
+      p3 (needs the full REORGOBJS module set). Commit b65c12e1.
 - [ ] bitcoin_sighash, bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
 - [ ] bitcoin_interp, bitcoin_scriptcodec, bitcoin_script_flags,
       bitcoin_script, bitcoin_multisig, bitcoin_cons

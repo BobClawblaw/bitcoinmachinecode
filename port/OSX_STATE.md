@@ -76,6 +76,17 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
   124-record differential byte-identical (retvals + utxo.dat/utxo.idx).
   Commit 55c76deb. utxo_struct_size added to utxo_twin.c.
 
+## 2026-09-09 — bitcoin_utxo_lsm twin landed (C twin) -- the whale is done
+
+- `port/osx/utxo_lsm_twin.c` (+ vendored utxo_lsm_mm.c): the LSM UTXO store
+  -- flush/sorted-runs/bloom/sparse-index/manifest, multi-run get,
+  recount/compact/walk k-way merge, tombstone hash. Gates: 6 upstream LSM
+  harnesses green native; 229-record differential byte-identical (retvals +
+  WAL/runs/manifest file set). Commit b65c12e1. macOS note: the upstream
+  mmap fast path is byte-identical but fails CONCURRENT gets under
+  clang-21/arm64 -- defaulted off on __APPLE__, twin path is the anchor
+  (documented in utxo_lsm_mm.c).
+
 ## 2026-09-09 — bitcoin_hash native: first full 6-op module, x86-diff byte-identical
 
 - `port/osx/bitcoin_hash.S` (7 public symbols) gated three ways: upstream
