@@ -1287,12 +1287,27 @@ static int leg_peer_hung_up(int fd, short* revents_out){
     if(revents_out) *revents_out = pf.revents;
     return r > 0 && (pf.revents & (POLLHUP | POLLERR | POLLNVAL | POLLRDHUP)) ? 1 : 0;
 }
+/* ---- a leg's pass runs in a helper (2026-09-10, CORE_DIVERGENCES row 1) ----
+ * Core serves every peer from one loop; a slow fetch never stalls the rest.
+ * Here a pass (getheaders, the block, verify, store) blocked the worker for
+ * its whole length -- 4-12 s per block on production -- and every other
+ * leg's sweep, pongs, relay and pushes waited. The pass now runs in a
+ * forked child that owns the leg's socket until it reports: the archive
+ * appends are file-level and locked, the mempool is shared, and what the
+ * parent needs back is small (the verdict, the tip it stored to, whether
+ * the peer took sendcmpct, the reorg gate's rewind, and the BIP324 session
+ * with its advanced cipher). In the child a close is RECORDED, not done:
+ * the parent replays the same bookkeeping from the report, once. */
+static int g_pass_in_child = 0;
+static long g_pass_child_rewound = -1;
 static void leg_close_ours(int i, const char* reason, const char* detail){
+    if(g_pass_in_child) return;                        /* the parent decides from the report */
     fprintf(stderr,"[dl:%d] %s connection closed ours/%s after %llds%s%s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", reason, leg_age_s(i),
             detail && detail[0] ? " -- " : "", detail ? detail : "");
     if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
 }
 static void leg_close_theirs(int i, const char* how, const char* unread){
+    if(g_pass_in_child) return;                        /* the parent decides from the report */
     long long age = leg_age_s(i);
     fprintf(stderr,"[dl:%d] %s connection closed theirs (%s) after %llds; unread: %s\n", i, mux_out_host[i][0] ? mux_out_host[i] : "?", how, age, unread ? unread : "(nothing)");
     if(g_dialmem && age >= 0 && age <= DM_EARLY_S) dialmem_note_failure(g_dialmem, mux_out_host[i], age <= DM_REFUSED_S ? DM_REFUSED : DM_EARLY_DROP, dialmem_now());
@@ -2749,9 +2764,10 @@ static void leg_on_headers(int fd, const unsigned char* hdrs, unsigned long n){
     unsigned char bh[32]; sha256d(bh, hdrs + (n - 1) * 81, 80); g_announce_hdr_n++;
     leg_on_block_announce(fd, bh, "headers");
 }
+static int leg_pass_busy(int i);   /* defined with the pass helper below */
 /* the rotation asks: is a leg other than `except` announced? (clears the mark) */
 static int leg_announced_pick(int except){
-    for(int a = 0; a < mux_n_out; a++) if(a != except && mux_out_announced[a]){ mux_out_announced[a] = 0; if(mux_out_fd[a] >= 0) return a; }
+    for(int a = 0; a < mux_n_out; a++) if(a != except && mux_out_announced[a] && !leg_pass_busy(a)){ mux_out_announced[a] = 0; if(mux_out_fd[a] >= 0) return a; }
     return -1;
 }
 #define LEG_HB_MAX 3
@@ -2829,6 +2845,28 @@ static long leg_on_block(int fd, const unsigned char* pl, unsigned long plen){
     inflight_release_leg(&g_inflight, k);
     return r;
 }
+static long g_last_sync_ok = 0;   /* node_sync_multi's verdict of the last pass, for the helper's report */
+/* the fail bookkeeping of a pass, as one function: the synchronous pass runs
+ * it in place, the helper's parent runs it from the report (the comments
+ * that used to sit here -- incident #33, the health-signal rule, the
+ * three-strike replacement -- are in the git history of 2026-08/09) */
+static void pass_fail_bookkeeping(int i, long ok, int fail_code, double sync_s){
+    anchor_locator(mux_out_loc[i]);
+    if(ok == 1){ g_sync_fail_streak[i] = 0; return; }   /* peer had nothing: normal at tip */
+    if(fail_code == 4 && sync_s < 0.5){   /* EOF before the peer said anything: it hung up */
+        leg_close_theirs(i, "EOF on the first read", "(nothing)");
+        g_sync_fail_streak[i] = 0;
+        return;
+    }
+    g_sync_fail_streak[i]++;
+    if(g_sync_fail_streak[i] >= 3){
+        char d[96]; snprintf(d, sizeof d, "3 failing sync passes, last where=%d in %.1fs", fail_code, sync_s);
+        leg_close_ours(i, "sync-failed-3x", d);
+        if(g_dialmem) dialmem_note_failure(g_dialmem, mux_out_host[i], DM_EARLY_DROP, dialmem_now());
+        g_sync_fail_streak[i] = 0;
+        mux_out_nextretry[i] = 0;   /* re-dial on the next rotation, not after the dead-slot backoff */
+    }
+}
 static long do_outbound_sync(int i){
     /* STAGE B: a REAL multi-hash locator built fresh from our stored chain on
      * every pass, replacing the single-hash anchor. mux_out_loc[i] is still
@@ -2848,6 +2886,7 @@ static long do_outbound_sync(int i){
     g_sync_leg = i;
     long ok=node_sync_multi(mux_out_fd[i], store_buf, loc, nloc, cbuf, (long)sizeof cbuf, &cnt);
     inflight_release_leg(&g_inflight, i); g_sync_leg = -1;   /* the claims live with the pass */
+    g_last_sync_ok = ok;
     if(g_peer_sendcmpct && !mux_out_cmpct[i]){ mux_out_cmpct[i] = 1; fprintf(stderr, "[cmpct] %s accepts compact blocks: requesting MSG_CMPCT_BLOCK on this leg from now on\n", mux_out_host[i]); }
     { static unsigned long p_r, p_n, p_f; unsigned long r, n, f; cmpct_recv_stats(&r, &n, &f);
       if(r != p_r || n != p_n || f != p_f){ fprintf(stderr, "[cmpct] reconstructed %lu block(s) from the mempool (%lu needed a getblocktxn round trip, %lu fell back to a full block)\n", r, n, f); p_r = r; p_n = n; p_f = f;
@@ -2863,67 +2902,12 @@ static long do_outbound_sync(int i){
         if(back >= 0){
             fprintf(stderr,"[dl] leg %s extended onto a branch lighter than the best header chain -- rewound to %ld; not taking its blocks\n", mux_out_host[i], back);
             store_reload(store_buf); st_tip = *(int*)(store_buf+24); anchor_locator(mux_out_loc[i]);
-            dl_after_gate_rewind(back);
+            if(g_pass_in_child) g_pass_child_rewound = back; else dl_after_gate_rewind(back);
             return 0;
         }
     }
     if(ok!=1 || cnt<=0){
-        /* keep the locator fresh even on a no-op so we don't re-request from
-         * genesis forever (node_sync advanced it internally only on success) */
-        anchor_locator(mux_out_loc[i]);
-        if(ok == 1){ g_sync_fail_streak[i] = 0; return 0; }   /* peer had nothing: normal at tip */
-        /* Incident #33 made this path log, because its silence hid a total
-         * keep-up failure for 14.5 hours. #33 is fixed; what is left here is
-         * an OPERATIONAL log, and the first version of it was far too loud --
-         * a line per leg per rotation, including the perfectly normal "peer
-         * had nothing for us at the tip". Rules now:
-         *
-         *   ok == 1, cnt == 0   the peer had nothing. This is the NORMAL
-         *                       state between blocks. Never logged.
-         *   ok != 1             the exchange failed. Logged once when a leg
-         *                       STARTS failing and once when it recovers --
-         *                       not once per rotation.
-         *
-         * And a failing leg is now REPLACED rather than retried forever. The
-         * common failure here is where=3, the headers-drain timeout, which
-         * costs a full ~60 s of the rotation before it gives up; two of those
-         * back to back on the same peer means the peer is not going to answer,
-         * and every further rotation spends a minute proving it again. */
-        /* Incident #33 made this path log, because its silence hid a total
-         * keep-up failure for 14.5 hours. #33 is fixed, so what belongs here
-         * now is a HEALTH SIGNAL, not a running commentary. Two earlier
-         * versions were too loud: one printed a line per leg per rotation
-         * (including the entirely normal "peer had nothing at the tip"), and
-         * the next printed every leg replacement, which on a pool where many
-         * peers do not answer getheaders is its own flood.
-         *
-         * So: nothing is logged from here at all. The per-leg failure count
-         * is exported to the heartbeat, which prints one compact number for
-         * the whole node -- an operator sees "sync_failing=2" and can turn on
-         * detail if they care, instead of reading the same four lines every
-         * rotation. A leg that fails repeatedly is still dropped so the
-         * rotation stops burning ~60 s on a peer that will not answer (that
-         * is where=3, the headers-drain timeout); the caller's existing
-         * dead-slot path re-dials it, rate-limited. */
-        if(sync_fail_code == 4 && sync_s < 0.5){   /* EOF before the peer said anything: it hung up */
-            leg_close_theirs(i, "EOF on the first read", "(nothing)");
-            g_sync_fail_streak[i] = 0;
-            return 0;
-        }
-        g_sync_fail_streak[i]++;
-        if(g_sync_fail_streak[i] >= 3){
-            char d[96]; snprintf(d, sizeof d, "3 failing sync passes, last where=%d in %.1fs", sync_fail_code, sync_s);
-            leg_close_ours(i, "sync-failed-3x", d);
-            /* 2026-09-09 (LAN capture, 19:00-19:14Z): the legs we retire this
-             * way are a handful of cloud-hosted listeners that complete the
-             * handshake and never answer a getheaders -- one was dialled seven
-             * times in fifteen minutes because this close alone was not fed to
-             * the dial memory. A peer that served nothing three times is
-             * remembered like an early drop: 10 min, doubling to 6 h. */
-            if(g_dialmem) dialmem_note_failure(g_dialmem, mux_out_host[i], DM_EARLY_DROP, dialmem_now());
-            g_sync_fail_streak[i] = 0;
-            mux_out_nextretry[i] = 0;   /* re-dial on the next rotation, not after the dead-slot backoff */
-        }
+        pass_fail_bookkeeping(i, ok, sync_fail_code, sync_s);   /* 2026-09-10: one function, shared with the helper's parent */
         return 0;
     }
     /* index every newly stored height (st_tip_before+1 .. st_tip) into ht_idx,
@@ -5550,6 +5534,120 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
         fprintf(stderr, "[dlc]   #%d %-22s %.0f KB/s\n", i + 1, live[i], rate[idx[i]] > 0 ? rate[idx[i]] / 1024.0 : 0.0);
     munmap(rate, sizeof(double) * (size_t)nlive);
 }
+/* ---- the pass helper: start, poll, finish (2026-09-10, row 1) ------------ */
+typedef struct {
+    long ok, cnt; int fail_code; double sync_s; int tip_before, tip_after;
+    int cmpct, budget_fired; long rewound_to; unsigned long v2_len;   /* the session bytes follow the struct */
+} pass_result_t;
+static struct { pid_t pid; int fd; long long t0; unsigned budget_s; } g_pass[MUX_MAX_OUT];
+#define PASS_MAX_CONCURRENT 4
+static int leg_pass_busy(int i){ return i >= 0 && i < MUX_MAX_OUT && g_pass[i].pid > 0; }
+static int pass_running(void){ int n = 0; for(int k = 0; k < MUX_MAX_OUT; k++) if(g_pass[k].pid > 0) n++; return n; }
+static long g_pass_started, g_pass_fallback, g_pass_crashed;
+/* the child: the synchronous pass under its own budget alarm, then the report */
+static int leg_pass_start(int i, unsigned budget_s){
+    if(leg_pass_busy(i) || pass_running() >= PASS_MAX_CONCURRENT) return 0;
+    int pp[2]; if(pipe(pp) != 0) return 0;
+    pid_t pid = fork();
+    if(pid < 0){ close(pp[0]); close(pp[1]); return 0; }
+    if(pid == 0){
+        close(pp[0]); g_pass_in_child = 1; g_pass_child_rewound = -1;
+        signal(SIGCHLD, SIG_DFL); signal(SIGPIPE, SIG_IGN);   /* a peer that hung up must not kill the report */
+        struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = mux_budget_alarm; sigemptyset(&sa.sa_mask); sigaction(SIGALRM, &sa, NULL);
+        mux_sync_budget_fired = 0; mux_budget_fd = mux_out_fd[i];
+        pass_result_t r; memset(&r, 0, sizeof r);
+        r.tip_before = *(int*)(store_buf + 24);
+        phase_timer_t pt; phase_start(&pt);
+        alarm(budget_s);
+        long n = do_outbound_sync(i);
+        alarm(0);
+        r.ok = g_last_sync_ok; r.cnt = n; r.fail_code = sync_fail_code; r.sync_s = phase_elapsed(&pt);
+        r.tip_after = *(int*)(store_buf + 24); r.cmpct = mux_out_cmpct[i]; r.budget_fired = mux_sync_budget_fired;
+        r.rewound_to = g_pass_child_rewound;
+        static unsigned char blob[DH_V2_BLOB_CAP];
+        if(mux_out_fd[i] >= 0 && bmc_v2_is_active(mux_out_fd[i])){ long b = bmc_v2_export(mux_out_fd[i], blob, sizeof blob); r.v2_len = b > 0 ? (unsigned long)b : 0; if(b <= 0) r.fail_code = 99; }
+        unsigned long off = 0; const unsigned char* q = (const unsigned char*)&r;
+        while(off < sizeof r){ ssize_t w = write(pp[1], q + off, sizeof r - off); if(w <= 0) _exit(1); off += (unsigned long)w; }
+        off = 0; while(off < r.v2_len){ ssize_t w = write(pp[1], blob + off, r.v2_len - off); if(w <= 0) _exit(1); off += (unsigned long)w; }
+        _exit(0);
+    }
+    close(pp[1]);
+    g_pass[i].pid = pid; g_pass[i].fd = pp[0]; g_pass[i].t0 = dh_now_ms(); g_pass[i].budget_s = budget_s;
+    g_pass_started++;
+    return 1;
+}
+/* the parent, on a report: what the synchronous path did in memory */
+static long leg_pass_finish(int i, const pass_result_t* r, const unsigned char* v2, unsigned long v2_len){
+    store_reload(store_buf);
+    if(mux_out_fd[i] >= 0){
+        if(r->v2_len){
+            if(v2_len != r->v2_len || !bmc_v2_import(mux_out_fd[i], v2, v2_len)){ leg_close_ours(i, "pass-session", "the helper's v2 session could not be imported"); return 0; }
+        } else if(bmc_v2_is_active(mux_out_fd[i])) bmc_v2_close(mux_out_fd[i]);   /* the child spoke v1 on it */
+    }
+    if(r->fail_code == 99){ leg_close_ours(i, "pass-session", "the pass could not export its v2 session"); return 0; }
+    if(r->cmpct && !mux_out_cmpct[i]){ mux_out_cmpct[i] = 1; }
+    if(r->rewound_to >= 0){ anchor_locator(mux_out_loc[i]); dl_after_gate_rewind(r->rewound_to); return 0; }
+    if(r->ok != 1 || r->cnt <= 0){ pass_fail_bookkeeping(i, r->ok, r->fail_code, r->sync_s); return 0; }
+    static unsigned char sb[8<<20];
+    for(int h = r->tip_before + 1; h <= r->tip_after; h++){
+        long L = node_serve_block(store_buf, h, sb, sizeof sb);
+        if(L < 80) continue;
+        unsigned char bhash[32]; block_hash(bhash, sb);
+        idx_put(ht_idx, bhash, h);
+        blk_src_note(h, mux_out_host[i]);
+    }
+    if(reorg_chainwork_sync(store_buf, 0) < 0)
+        fprintf(stderr,"[chainwork] sync failed after the helper stored heights %d..%d -- fork choice is DEGRADED until this recovers\n", r->tip_before + 1, r->tip_after);
+    anchor_locator(mux_out_loc[i]);
+    g_sync_fail_streak[i] = 0;
+    return r->cnt;
+}
+/* the parent, each rotation: reports that arrived, children that overran */
+static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int out_port){
+    long stored = 0; if(stored_leg) *stored_leg = -1;
+    for(int i = 0; i < MUX_MAX_OUT; i++){
+        if(g_pass[i].pid <= 0) continue;
+        struct pollfd pf = { g_pass[i].fd, POLLIN, 0 };
+        int pr = poll(&pf, 1, 0);
+        long long age = dh_now_ms() - g_pass[i].t0;
+        if(pr <= 0){
+            if(age > (long long)g_pass[i].budget_s * 1000 + 15000){          /* the alarm did not end it: kill, treat as budget */
+                kill(g_pass[i].pid, SIGKILL); waitpid(g_pass[i].pid, NULL, 0); close(g_pass[i].fd); g_pass[i].pid = 0;
+                g_pass_crashed++;
+                leg_close_ours(i, "sync-budget", "the pass helper overran its budget and was killed");
+                mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+            }
+            continue;
+        }
+        pass_result_t r; memset(&r, 0, sizeof r); unsigned long off = 0; unsigned char* q = (unsigned char*)&r; int good = 1;
+        while(off < sizeof r){ ssize_t n = read(g_pass[i].fd, q + off, sizeof r - off); if(n <= 0){ good = 0; break; } off += (unsigned long)n; }
+        static unsigned char blob[DH_V2_BLOB_CAP]; unsigned long got = 0;
+        if(good && r.v2_len){ if(r.v2_len > DH_V2_BLOB_CAP) good = 0; else while(got < r.v2_len){ ssize_t n = read(g_pass[i].fd, blob + got, r.v2_len - got); if(n <= 0) break; got += (unsigned long)n; } }
+        int st = 0; waitpid(g_pass[i].pid, &st, 0); close(g_pass[i].fd); g_pass[i].pid = 0;
+        if(!good || (r.v2_len && got != r.v2_len)){
+            g_pass_crashed++;
+            char d[96];
+            if(WIFSIGNALED(st)) snprintf(d, sizeof d, "the pass helper died on signal %d without a report", WTERMSIG(st));
+            else snprintf(d, sizeof d, "the pass helper ended (exit %d) without a report", WIFEXITED(st) ? WEXITSTATUS(st) : -1);
+            leg_close_ours(i, "pass-crashed", d);
+            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+            continue;
+        }
+        if(r.budget_fired){
+            char d[80]; snprintf(d, sizeof d, "the pass exceeded %us%s (where=%d)", g_pass[i].budget_s, g_pass[i].budget_s > (unsigned)DL_BUDGET_SECS ? ", the only-leg budget" : "", r.fail_code);
+            leg_close_ours(i, "sync-budget", d);
+            mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
+            continue;
+        }
+        long n = leg_pass_finish(i, &r, blob, got);
+        if(n > 0){ stored += n; if(stored_leg) *stored_leg = i; }
+        else if(mux_out_fd[i] < 0){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS; }   /* the bookkeeping closed it */
+    }
+    return stored;
+}
+static void leg_pass_stop_all(void){
+    for(int i = 0; i < MUX_MAX_OUT; i++) if(g_pass[i].pid > 0){ kill(g_pass[i].pid, SIGTERM); waitpid(g_pass[i].pid, NULL, 0); close(g_pass[i].fd); g_pass[i].pid = 0; }
+}
 /* ---- the legs' sweep (2026-09-09; factored 2026-09-10) ---------------------
  * Every OTHER leg's buffered messages now -- a ping used to wait for its
  * leg's turn in the rotation (75 s measured; Core's eviction protects its
@@ -5564,7 +5662,7 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
 static void legs_sweep_except(int except){
     long long nowsec = (long long)time(NULL);
     for(int k = 0; k < mux_n_out; k++){
-        if(k == except || mux_out_fd[k] < 0) continue;
+        if(k == except || mux_out_fd[k] < 0 || leg_pass_busy(k)) continue;   /* a pass helper owns that socket */
         if(mux_out_kind[k] != LEG_BLOCK_ONLY && txsub_worker_ready()){ extern long txrelay_poll_leg(int, void*, int); (void)txrelay_poll_leg(mux_out_fd[k], txsub_pool(), 0); }
         else if(mux_out_kind[k] == LEG_BLOCK_ONLY){ extern long txrelay_poll_block_only_leg(int); (void)txrelay_poll_block_only_leg(mux_out_fd[k]); }
         if(!mux_out_good[k] && mux_out_since[k] && nowsec - mux_out_since[k] >= DM_GOOD_S){ mux_out_good[k] = 1; if(g_dialmem) dialmem_note_success(g_dialmem, mux_out_host[k]); }
@@ -7851,6 +7949,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     fmt_uptime(upbuf, (stop_ms-boot_ms)/1000));
             /* fee_estimates.dat (Core Flush()) -- weak: the dial/sync test
              * harnesses that link this file do not carry daemon/fee_hooks.c */
+            leg_pass_stop_all();                               /* row 1: the pass helpers */
             { extern void fest_shutdown_flush(void); fest_shutdown_flush(); }
             /* ---- DMN-5 (audit 2026-09-03): close the UTXO layer -----------
              * utxo_live_close() checkpoints a pending batch, shuts the
@@ -7883,6 +7982,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); now_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
         int did=0;
         int stored_break = 0; g_stored_now = 0;       /* 2026-09-10: a store ends the rotation early so the apply runs at once */
+        { int sl = -1; long ps = leg_pass_poll(&sl, srcpool, nsrc, out_port);   /* row 1: the pass helpers' reports */
+          if(ps > 0){ stored_break = 1; did = 1; if(sl >= 0) leg_hb_note_block(sl); } }
         static int leg_start = 0;
         /* APPLY FIRST WHEN FAR BEHIND. The rotation below syncs every leg for
          * up to DL_BUDGET_SECS each before the UTXO catch-up step gets a turn
@@ -7970,6 +8071,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * below) -- this is the serve_mux parent's own POLLHUP/POLLERR/
              * POLLNVAL pattern (see the accept loop above), mirrored here so
              * the download worker's peer drops are equally visible/handled. */
+            if(leg_pass_busy(i)) continue;                     /* row 1: the helper owns the socket until it reports */
             struct pollfd pf = { mux_out_fd[i], POLLIN, 0 };
             if(leg_peer_hung_up(mux_out_fd[i], &pf.revents)){
                 /* 2026-09-09: the peer's doing (every close of ours is labelled
@@ -8060,26 +8162,34 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * pending (bounded: the relay layer forgets after 1.5 s). */
             { extern int txrelay_replies_pending(int); extern void txrelay_note_sync_deferred(void);
               if(mux_out_fd[i]>=0 && txrelay_replies_pending(mux_out_fd[i])){ txrelay_note_sync_deferred(); continue; } }
-            /* bounded sync pass on this leg (DL_BUDGET_SECS wall-clock) */
-            struct sigaction sa, old; memset(&sa,0,sizeof sa);
-            sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
-            sigaction(SIGALRM,&sa,&old);
-            mux_sync_budget_fired=0;
-            mux_budget_fd = mux_out_fd[i];
+            /* 2026-09-10 (row 1): the pass runs in a helper under its budget;
+             * the report comes back through leg_pass_poll on a later rotation.
+             * A leg whose pass is running is skipped by the sweep and the
+             * announced pick. If no helper can start (fork failed, four already
+             * out), the pass runs here as before. */
+            if(leg_pass_busy(i)) continue;
             unsigned budget_s = leg_budget_secs(legs_live());
-            alarm(budget_s);
-            long n = do_outbound_sync(i);
-            alarm(0); mux_budget_fd = -1; sigaction(SIGALRM,&old,NULL);
-            if(mux_sync_budget_fired){
-                char d[80]; snprintf(d, sizeof d, "the pass exceeded %us%s (where=%d)", budget_s, budget_s > (unsigned)DL_BUDGET_SECS ? ", the only-leg budget" : "", sync_fail_code);
-                leg_close_ours(i, "sync-budget", d);
-                fprintf(stderr,"[dl:%d] %s exceeded %gs budget; re-dialing\n",
-                        i, mux_out_fd[i]>=0?mux_out_host[i]:"?", DL_BUDGET_SECS);
-                mux_next_peer(i, srcpool, nsrc, out_port);
+            long n = 0;
+            if(leg_pass_start(i, budget_s)){ did = 1; }
+            else {
+                g_pass_fallback++;
+                struct sigaction sa, old; memset(&sa,0,sizeof sa);
+                sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
+                sigaction(SIGALRM,&sa,&old);
+                mux_sync_budget_fired=0;
+                mux_budget_fd = mux_out_fd[i];
+                alarm(budget_s);
+                n = do_outbound_sync(i);
+                alarm(0); mux_budget_fd = -1; sigaction(SIGALRM,&old,NULL);
+                if(mux_sync_budget_fired){
+                    char d[80]; snprintf(d, sizeof d, "the pass exceeded %us%s (where=%d)", budget_s, budget_s > (unsigned)DL_BUDGET_SECS ? ", the only-leg budget" : "", sync_fail_code);
+                    leg_close_ours(i, "sync-budget", d);
+                    mux_next_peer(i, srcpool, nsrc, out_port);
+                }
+                did |= (n>0)?1:0;
             }
-            did |= (n>0)?1:0;
             mux_out_announced[i] = 0;                          /* the pass consumed whatever was announced on this leg */
-            if(n>0){ leg_hb_note_block(i); stored_break = 1; }   /* 2026-09-10: a block landed -- apply now, the rest of the rotation waits */
+            if(n>0){ leg_hb_note_block(i); stored_break = 1; }   /* the synchronous fallback stored: apply now */
             /* ---- STAGE B: periodic fork probe -----------------------------
              * Runs only on a leg that just returned NOTHING, which is exactly
              * the situation a fork hides in: if the peer is on a competing
