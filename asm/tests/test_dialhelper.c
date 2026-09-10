@@ -582,6 +582,32 @@ int main(void){
           munmap(cb, DLC_STAGE_MAX_BYTES);
         }
         if (cwd3[0]) (void)!chdir(cwd3); }
+      /* 2026-09-10 (row 1): a leg's pass in a helper -- the report path, the
+       * peer-hung-up close replayed by the parent, and the budget close */
+      { char pd[] = "/tmp/bmc-pass-XXXXXX"; char cwdp[512]; cwdp[0] = 0; (void)!getcwd(cwdp, sizeof cwdp);
+        if (mkdtemp(pd) && chdir(pd) == 0){
+          static unsigned char sb[4096]; memset(sb, 0, sizeof sb); store_init(sb); memcpy(store_buf, sb, sizeof sb);
+          const char* pool1[1] = { "198.51.100.9:8333" };
+          int sp[2]; ok(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0, "leg pair for the pass helper");
+          mux_n_out = 1; mux_out_fd[0] = sp[0]; snprintf(mux_out_host[0], sizeof mux_out_host[0], "10.9.9.9:8333"); mux_out_since[0] = (long long)time(NULL) - 100; mux_out_kind[0] = LEG_FULL;
+          close(sp[1]);                                          /* the peer hung up before saying anything */
+          ok(leg_pass_start(0, 5) == 1 && leg_pass_busy(0), "a pass starts in a helper and the leg is busy");
+          int sl = -1; long got = 0; int waited = 0;
+          while (g_pass[0].pid > 0 && waited < 8000){ got += leg_pass_poll(&sl, pool1, 1, 8333); usleep(20000); waited += 20; }
+          ok(g_pass[0].pid == 0 && got == 0, "the helper reported: nothing stored");
+          ok(mux_out_fd[0] < 0 || g_sync_fail_streak[0] == 1, "...and the parent replayed the fail bookkeeping: the leg is down (EOF on the first read) or carries one strike (the getheaders write failed)");
+          /* the budget: a peer that never answers, a 1 s budget */
+          int sq[2]; ok(socketpair(AF_UNIX, SOCK_STREAM, 0, sq) == 0, "leg pair for the budget");
+          for (int k = 0; k < DH_MAX; k++) if (g_dh[k].pid > 0){ kill(g_dh[k].pid, SIGKILL); waitpid(g_dh[k].pid, NULL, 0); close(g_dh[k].sp); g_dh[k].pid = 0; }   /* the re-dial the close started */
+          mux_out_fd[0] = sq[0]; mux_out_since[0] = (long long)time(NULL) - 100;
+          ok(leg_pass_start(0, 1) == 1, "a pass starts under a 1 s budget");
+          waited = 0; while (g_pass[0].pid > 0 && waited < 30000){ leg_pass_poll(&sl, pool1, 1, 8333); usleep(50000); waited += 50; }
+          ok(g_pass[0].pid == 0 && waited < 30000, "the helper's alarm ended the pass within the budget window");
+          ok(mux_out_fd[0] < 0, "...and the parent closed the leg ours/sync-budget");
+          for (int k = 0; k < DH_MAX; k++) if (g_dh[k].pid > 0){ kill(g_dh[k].pid, SIGKILL); waitpid(g_dh[k].pid, NULL, 0); close(g_dh[k].sp); g_dh[k].pid = 0; }
+          close(sq[1]); mux_n_out = 0;
+        }
+        if (cwdp[0]) (void)!chdir(cwdp); }
       /* 2026-09-08: no tip announcements in IBD, Core's rule (tip older than maxtipage) */
       { long long now = 1800000000LL;
         ok(dl_announce_allowed((unsigned long)(now - 3600), now, 86400), "a tip an hour old: announce (not IBD)");
