@@ -140,6 +140,7 @@ int main(void){
     ok(dh_start("198.51.100.6:8333", 8333) == 1 && dh_start("198.51.100.7:8333", 8333) == 1
        && dh_start("198.51.100.8:8333", 8333) == 1 && dh_start("198.51.100.9:8333", 8333) == 1, "...and eight (DH_MAX 8: nine churning legs saturated four)");
     ok(dh_start("198.51.100.10:8333", 8333) == 0, "a ninth is refused (DH_MAX)");
+    ok(DH_V2_BLOB_CAP >= (4u << 20), "the session blob holds a message in flight (snapshot ab: a headers reply outgrew 64 KB and healthy legs were closed)");
     ok(dh_inflight_net(BMC_NET_IPV4) == 1, "in-flight lookup by network");
     for (int i = 0; i < 200; i++){ if (dh_poll(&r, &fd, h, sizeof h) && dh_inflight_count() == 0) break; usleep(50000); }
     for (int i = 0; i < 100 && dh_inflight_count(); i++){ dh_poll(&r, &fd, h, sizeof h); usleep(50000); }

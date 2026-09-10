@@ -2999,7 +2999,7 @@ static long long g_dh_timeout_ms = 120000;
 typedef struct { int ok; unsigned char wants_addrv2; long vlen; unsigned char vpayload[512]; char why[128];
                  unsigned long v2_len;      /* 2026-09-10: bytes of exported v2 session that follow the struct on the socketpair (0: v1) */
                } dh_result_t;
-#define DH_V2_BLOB_CAP (64u << 10)
+#define DH_V2_BLOB_CAP (8u << 20)    /* 2026-09-10 (ab): 64 KB refused a headers reply in flight and closed the leg; a block in flight fits now */
 static unsigned char g_dh_v2_blob[DH_V2_BLOB_CAP]; static unsigned long g_dh_v2_len = 0;   /* the parent's copy of the last result's session */
 void dial_helper_test_set_timeout_ms(long long ms){ g_dh_timeout_ms = ms; }
 static int leg_net_of(const char* hostport){
@@ -5556,6 +5556,7 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
 typedef struct {
     long ok, cnt; int fail_code; double sync_s; int tip_before, tip_after;
     int cmpct, budget_fired; long rewound_to; unsigned long v2_len;   /* the session bytes follow the struct */
+    unsigned long v2_need;                                             /* when the export was refused: the bytes it needed */
 } pass_result_t;
 static struct { pid_t pid; int fd; long long t0; unsigned budget_s; } g_pass[MUX_MAX_OUT];
 /* 2026-09-10 (snapshot aa): four was too few -- with nine legs the fifth
@@ -5588,7 +5589,7 @@ static int leg_pass_start(int i, unsigned budget_s){
         r.tip_after = *(int*)(store_buf + 24); r.cmpct = mux_out_cmpct[i]; r.budget_fired = mux_sync_budget_fired;
         r.rewound_to = g_pass_child_rewound;
         static unsigned char blob[DH_V2_BLOB_CAP];
-        if(mux_out_fd[i] >= 0 && bmc_v2_is_active(mux_out_fd[i])){ long b = bmc_v2_export(mux_out_fd[i], blob, sizeof blob); r.v2_len = b > 0 ? (unsigned long)b : 0; if(b <= 0) r.fail_code = 99; }
+        if(mux_out_fd[i] >= 0 && bmc_v2_is_active(mux_out_fd[i])){ long b = bmc_v2_export(mux_out_fd[i], blob, sizeof blob); r.v2_len = b > 0 ? (unsigned long)b : 0; if(b <= 0){ r.fail_code = 99; long nd = bmc_v2_export_need(mux_out_fd[i]); r.v2_need = nd > 0 ? (unsigned long)nd : 0; } }
         unsigned long off = 0; const unsigned char* q = (const unsigned char*)&r;
         while(off < sizeof r){ ssize_t w = write(pp[1], q + off, sizeof r - off); if(w <= 0) _exit(1); off += (unsigned long)w; }
         off = 0; while(off < r.v2_len){ ssize_t w = write(pp[1], blob + off, r.v2_len - off); if(w <= 0) _exit(1); off += (unsigned long)w; }
@@ -5607,7 +5608,7 @@ static long leg_pass_finish(int i, const pass_result_t* r, const unsigned char* 
             if(v2_len != r->v2_len || !bmc_v2_import(mux_out_fd[i], v2, v2_len)){ leg_close_ours(i, "pass-session", "the helper's v2 session could not be imported"); return 0; }
         } else if(bmc_v2_is_active(mux_out_fd[i])) bmc_v2_close(mux_out_fd[i]);   /* the child spoke v1 on it */
     }
-    if(r->fail_code == 99){ leg_close_ours(i, "pass-session", "the pass could not export its v2 session"); return 0; }
+    if(r->fail_code == 99){ char d[120]; snprintf(d, sizeof d, "the pass could not export its v2 session (%lu bytes needed, cap %u%s)", r->v2_need, DH_V2_BLOB_CAP, r->v2_need <= DH_V2_BLOB_CAP ? "; the send flush failed: the peer is gone" : ""); leg_close_ours(i, "pass-session", d); return 0; }
     if(r->cmpct && !mux_out_cmpct[i]){ mux_out_cmpct[i] = 1; }
     if(r->rewound_to >= 0){ anchor_locator(mux_out_loc[i]); dl_after_gate_rewind(r->rewound_to); return 0; }
     g_pass_last_empty[i] = (r->ok == 1 && r->cnt <= 0);
