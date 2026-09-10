@@ -326,6 +326,23 @@ int bmc_v2_handshake(int fd, int initiator, int timeout_ms){
 
 /* v1 p2p_write returns 24 + plen; callers depend on that shape. See the file
  * header -- this is a success indicator in v1's units, not a wire count. */
+long bmc_v2_export(int fd, unsigned char* out, unsigned long cap){
+    if (!bmc_v2_is_active(fd)) return 0;
+    v2_conn* c = g_conn[fd];
+    if (c->has_held) return 0;                 /* a decoded message waiting for the caller: not a handover point */
+    return bip324_t_export(&c->t, out, cap);
+}
+int bmc_v2_import(int fd, const unsigned char* in, unsigned long len){
+    if (fd < 0 || fd >= V2_FD_MAX) return 0;
+    bmc_v2_close(fd);
+    v2_conn* c = (v2_conn*)calloc(1, sizeof *c);
+    if (!c) return 0;
+    if (!bip324_t_import(&c->t, in, len)){ free(c); return 0; }
+    g_conn[fd] = c;
+    install_hooks();
+    g_v2_active[fd] = 1;
+    return 1;
+}
 static long v2_write_hook(int fd, const char* cmd, unsigned cmdlen,
                           const void* payload, unsigned plen){
     v2_conn* c = (fd >= 0 && fd < V2_FD_MAX) ? g_conn[fd] : 0;

@@ -23,6 +23,11 @@ int bmc_v2_handshake(int fd, int initiator, int timeout_ms);
  * called before the fd number can be reused, or the next connection to land
  * on that number inherits a dead session. */
 void bmc_v2_close(int fd);
+/* 2026-09-10: hand a live session across a fork with its socket (the dial
+ * helper). export: bytes written, 0 when the fd is not a v2 session or the
+ * state does not fit; import: 1 / 0, and the fd is a v2 session from then. */
+long bmc_v2_export(int fd, unsigned char* out, unsigned long cap);
+int  bmc_v2_import(int fd, const unsigned char* in, unsigned long len);
 
 /* 1 if this fd is carrying a v2 session. */
 int bmc_v2_is_active(int fd);

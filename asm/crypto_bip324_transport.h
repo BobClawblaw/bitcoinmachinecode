@@ -60,6 +60,16 @@ int  bip324_t_init(bip324_transport_t* t, const unsigned char seckey32[32],
                    const unsigned char our_ellswift64[64], const unsigned char net_magic[4],
                    int initiator, const unsigned char* garbage, unsigned long garbage_len);
 void bip324_t_free(bip324_transport_t* t);
+/* 2026-09-10: a completed session moves between processes with its socket (the
+ * dial helper runs the handshake in a child; the parent talks). Export packs
+ * the cipher, the receive state, the undigested receive bytes and a decoded
+ * message not yet delivered; import rebuilds a transport from it. The
+ * garbage buffers and the ephemeral key are not carried: they are spent once
+ * the session reaches BIP324_RECV_APP, which is the only state exported.
+ * Returns the bytes written (0: not exportable / cap too small); import
+ * returns 1 / 0. */
+long bip324_t_export(const bip324_transport_t* t, unsigned char* out, unsigned long cap);
+int  bip324_t_import(bip324_transport_t* t, const unsigned char* in, unsigned long len);
 
 /* Feed received bytes. 0 means a protocol violation and the caller must drop
  * the connection. */
