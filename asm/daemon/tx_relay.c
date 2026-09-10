@@ -98,7 +98,7 @@ extern long strip_witness(const unsigned char* tx, long long txlen,
 #define TXR_MSG_WTX         5u          /* BIP339: wtxid-based tx inv/getdata */
 #define TXR_MAX_REQ         32          /* getdata entries per pass */
 #define TXR_MAX_MSGS        64          /* messages per pass -- a leg cannot monopolise the rotation */
-#define TXR_PAYLOAD_CAP     (2u << 20)  /* > max consensus tx size */
+#define TXR_PAYLOAD_CAP     ((4u << 20) + (64u << 10))  /* > max consensus tx size; and since 2026-09-10 a pushed blocktxn or block (up to 4 MB) */
 
 /* Recently-requested ring: 8-byte txid prefixes, FIFO. A false positive
  * (prefix collision) skips one fetch of one tx on one pass -- it will be
@@ -1174,8 +1174,61 @@ void txrelay_stats3(long* retried_other, long* gaveup, long* active){
 }
 
 void (*txrelay_on_pong)(int fd, const unsigned char nonce[8]) = 0;   /* set by the daemon (2026-09-09) */
+/* ---- 2026-09-10: Core's shape at the tip ---------------------------------
+ * Block announcements and pushed blocks reach the daemon from the SWEEP
+ * instead of waiting for the leg's rotation turn (5-20 s behind Core on
+ * production, measured against the oracle on the same box). An inv naming
+ * a block and a pushed `headers` (the daemon sends sendheaders after the
+ * handshake) name a block the daemon may not have; cmpctblock / blocktxn /
+ * block are a high-bandwidth peer's push and its follow-ups. NULL = the
+ * old discard. The hooks own the response; this file only recognises. */
+void (*txrelay_on_block_inv)(int fd, const unsigned char hash[32]) = 0;
+void (*txrelay_on_headers)(int fd, const unsigned char* hdrs81, unsigned long n) = 0;
+long (*txrelay_on_cmpctblock)(int fd, const unsigned char* pl, unsigned long plen) = 0;
+long (*txrelay_on_blocktxn)(int fd, const unsigned char* pl, unsigned long plen) = 0;
+long (*txrelay_on_block)(int fd, const unsigned char* pl, unsigned long plen) = 0;
+static void txr_block_inv_scan(int fd, const u8* pl, unsigned plen){
+    if (!txrelay_on_block_inv) return;
+    unsigned cc; unsigned long n = txr_varint(pl, pl + plen, &cc);
+    if (!cc || n > 50000UL) return;
+    for (unsigned long i = 0; i < n; i++){
+        const u8* e = pl + cc + i*36; if (cc + (i+1)*36 > plen) break;
+        unsigned t = (unsigned)e[0] | ((unsigned)e[1]<<8) | ((unsigned)e[2]<<16) | ((unsigned)e[3]<<24);
+        if (t == 2u || t == 0x40000002u) txrelay_on_block_inv(fd, e + 4);   /* MSG_BLOCK / MSG_WITNESS_BLOCK */
+    }
+}
+/* the command names compare WITH their terminator (2026-09-09: "block" vs "blocktxn") */
+static int txr_block_msg(int fd, const char* cmd, const u8* pl, unsigned plen){
+    if (!memcmp(cmd, "headers", 8)){
+        unsigned cc; unsigned long n = txr_varint(pl, pl + plen, &cc);
+        if (cc && n && n <= 2000UL && cc + n * 81 <= plen && txrelay_on_headers) txrelay_on_headers(fd, pl + cc, n);
+        return 1;
+    }
+    if (!memcmp(cmd, "cmpctblock", 11)){ if (txrelay_on_cmpctblock) txrelay_on_cmpctblock(fd, pl, plen); return 1; }
+    if (!memcmp(cmd, "blocktxn", 9)){ if (txrelay_on_blocktxn) txrelay_on_blocktxn(fd, pl, plen); return 1; }
+    if (!memcmp(cmd, "block", 6)){ if (txrelay_on_block) txrelay_on_block(fd, pl, plen); return 1; }
+    return 0;
+}
+static u8 txr_pl[TXR_PAYLOAD_CAP];      /* the sweep's payload buffer (the worker is single-threaded) */
+/* a block-relay-only leg's sweep: what is already buffered, blocks only --
+ * ping/pong, block invs, pushed headers, compact blocks and their follow-ups;
+ * a tx inv is ignored (we told the peer fRelay=0) */
+long txrelay_poll_block_only_leg(int fd){
+    char cmd[12]; unsigned plen; long seen = 0;
+    for (int msgs = 0; msgs < TXR_MAX_MSGS; msgs++){
+        struct pollfd pf = { fd, POLLIN, 0 };
+        if (poll(&pf, 1, 0) <= 0 || !(pf.revents & POLLIN)) break;
+        if (p2p_read(fd, cmd, txr_pl, sizeof txr_pl, &plen) != 1) break;
+        seen++;
+        if (!memcmp(cmd, "ping", 5)){ if (plen == 8) p2p_write(fd, "pong", 4, txr_pl, 8); continue; }
+        if (!memcmp(cmd, "pong", 5)){ if (plen == 8 && txrelay_on_pong) txrelay_on_pong(fd, txr_pl); continue; }
+        if (!memcmp(cmd, "inv", 4)){ txr_block_inv_scan(fd, txr_pl, plen); continue; }
+        txr_block_msg(fd, cmd, txr_pl, plen);
+    }
+    return seen;
+}
 long txrelay_poll_leg(int fd, void* mp, int max_ms){
-    static u8 pl[TXR_PAYLOAD_CAP];
+    u8* pl = txr_pl;
     static u8 scratch[2000*81 + 8];      /* worker is single-threaded */
     char cmd[12];
     unsigned plen;
@@ -1199,7 +1252,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
         struct pollfd pf = { fd, POLLIN, 0 };
         int pr = poll(&pf, 1, wait);
         if (pr <= 0 || !(pf.revents & POLLIN)) break;
-        if (p2p_read(fd, cmd, pl, sizeof pl, &plen) != 1) break;
+        if (p2p_read(fd, cmd, pl, TXR_PAYLOAD_CAP, &plen) != 1) break;
 
         if (!memcmp(cmd, "ping", 5)){
             /* consumed a keepalive meant for the sync loop -- answer it,
@@ -1216,6 +1269,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
         if (!memcmp(cmd, "inv", 4)){
             unsigned cc;
             unsigned long n = txr_varint(pl, pl + plen, &cc);
+            txr_block_inv_scan(fd, pl, plen);            /* 2026-09-10: a block inv is an announcement, blocksonly or not */
             if (txr_blocksonly()){                       /* -blocksonly: a tx inv from a leg we told fRelay=0 is a violation */
                 for (unsigned long i = 0; i < n; i++){
                     const u8* e = pl + cc + i*36; if (cc + (i+1)*36 > plen) break;
@@ -1428,9 +1482,9 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 fprintf(stderr, "[txrelay] %s gossip: +%ld address(es) to the book\n", cmd, added);
             continue;
         }
-        /* headers/cmpctblock/...: not ours -- same discard the sync drains
-         * apply. A `block` push lost here is re-fetched by the next
-         * headers-driven pass. */
+        /* headers / cmpctblock / blocktxn / block: the daemon's hooks
+         * (2026-09-10); anything else is the discard the sync drains apply */
+        txr_block_msg(fd, cmd, pl, plen);
     }
     txr_pend_set(fd, outstanding);
     return accepted;
