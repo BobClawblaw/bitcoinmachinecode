@@ -187,6 +187,12 @@ int main(void){
     ck("getnetworkinfo dispatched", rc == 1 && r != NULL);
     ck("protocolversion 70016",  r && S(r,"protocolversion") && !strcmp(S(r,"protocolversion"), "70016"));
     ck("subversion is ours",     r && S(r,"subversion") && !strcmp(S(r,"subversion"), "/BitcoinMachineCode:0.0.1/"));
+    /* 2026-09-10: which BUILD is answering. bmcmonitor could not tell a fixed
+     * node from a broken one over RPC -- both reported this same subversion. */
+    { rj_val* bc = rj_obj_get(r, "bmc_build_commit"); rj_val* bd = rj_obj_get(r, "bmc_build_dirty");
+      ck("getnetworkinfo names the build's commit, so a monitor can tell which binary answered",
+         bc && bc->typ == RJ_STR && bc->str && bc->str[0] && strcmp(bc->str, "unknown") != 0);
+      ck("...and whether that build had uncommitted changes", bd && bd->typ == RJ_BOOL); }
     ck("localservices NETWORK",  r && S(r,"localservices") && !strcmp(S(r,"localservices"), "0000000000000009"));
     ck("connections 11",         r && S(r,"connections") && !strcmp(S(r,"connections"), "11"));
     ck("connections_out 8",      r && S(r,"connections_out") && !strcmp(S(r,"connections_out"), "8"));
@@ -239,13 +245,13 @@ int main(void){
     r = NULL; rc = rpc_node_dispatch("getnettotals", NULL, &r, &ec, &em);
     { rj_val* tr = r ? rj_obj_get(r, "totalbytesrecv") : NULL;
       ck("getnettotals counts the download's bytes (50 GB + the legs)", rc == 1 && tr && strtoll(tr->str, NULL, 10) >= 50000000000LL); }
-    /* 2026-09-10: bmcgetdownloadinfo -- the window state getpeerinfo cannot
+    /* 2026-09-10: getbmcdownloadinfo -- the window state getpeerinfo cannot
      * carry. Core has no counterpart, so nothing here mirrors a Core shape. */
     st.dl_active = 1; st.dl_workers = 8; st.dl_pool = 120; st.dl_banned = 10; st.dl_free_peers = 37;
     st.dl_window = 4096; st.dl_first_hole = 500001; st.dl_claim = 504097; st.dl_applied = 499000;
     st.dl_end_h = 966368; st.dl_staged = 12; st.dl_stall_timeout_s = 4; st.dl_stall_evictions = 3;
     st.dl_median_bps = 1361510; st.dlpeers[0].bps_recv = 1400000LL;
-    r = NULL; rc = rpc_node_dispatch("bmcgetdownloadinfo", NULL, &r, &ec, &em);
+    r = NULL; rc = rpc_node_dispatch("getbmcdownloadinfo", NULL, &r, &ec, &em);
     { rj_val* a = r ? rj_obj_get(r, "active") : NULL;
       rj_val* wk = r ? rj_obj_get(r, "workers") : NULL;
       rj_val* wn = r ? rj_obj_get(r, "window") : NULL;
@@ -253,7 +259,7 @@ int main(void){
       rj_val* so = r ? rj_obj_get(r, "stall_timeout_s") : NULL;
       rj_val* bn = r ? rj_obj_get(r, "banned") : NULL;
       rj_val* pa = r ? rj_obj_get(r, "peers") : NULL;
-      ck("bmcgetdownloadinfo reports the window state while a download runs",
+      ck("getbmcdownloadinfo reports the window state while a download runs",
          rc == 1 && a && a->typ == RJ_BOOL && a->str && a->str[0] == '1' && wk && !strcmp(wk->str, "8") && wn && !strcmp(wn->str, "4096")
          && fh && !strcmp(fh->str, "500001") && so && !strcmp(so->str, "4") && bn && !strcmp(bn->str, "10"));
       { rj_val* w0 = (pa && pa->nitems == 1) ? pa->items[0] : NULL;
@@ -264,7 +270,7 @@ int main(void){
            ad && !strcmp(ad->str, "203.0.113.9:8333") && bp && !strcmp(bp->str, "1400000") && iw && !strcmp(iw->str, "7")); } }
     rj_free(r);
     st.dl_active = 0;
-    r = NULL; rc = rpc_node_dispatch("bmcgetdownloadinfo", NULL, &r, &ec, &em);
+    r = NULL; rc = rpc_node_dispatch("getbmcdownloadinfo", NULL, &r, &ec, &em);
     { rj_val* a = r ? rj_obj_get(r, "active") : NULL; rj_val* bt = r ? rj_obj_get(r, "bytes_total") : NULL;
       ck("with no download running it answers active=false rather than failing (a poller calls it unconditionally)",
          rc == 1 && a && a->typ == RJ_BOOL && a->str && a->str[0] == '0' && bt); }
