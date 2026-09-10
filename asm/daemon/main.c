@@ -2782,6 +2782,7 @@ static int leg_announced_pick(int except){
 #define LEG_HB_MAX 3
 static void leg_send_sendcmpct(int k, int hb){
     unsigned char pl[9] = {0}; pl[0] = (unsigned char)hb; pl[1] = 2;    /* high_bandwidth, version 2 (u64 LE) */
+    if(leg_pass_busy(k)) return;                                          /* a pass helper owns the socket: the set is re-evaluated on the next block */
     if(mux_out_fd[k] >= 0) p2p_write(mux_out_fd[k], "sendcmpct", 9, pl, 9);
     mux_out_hb[k] = (unsigned char)hb; mux_out_hb_since[k] = hb ? dh_now_ms() : 0;
 }
@@ -3027,6 +3028,11 @@ static int dh_reserved_pick(int an, int net, const char* srcpool[], int nsrc){
     return -1;
 }
 static int dh_inflight_for(int want_slot){ for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0 && g_dh[i].want_slot == want_slot) return 1; return 0; }
+/* 2026-09-10 (snapshot x, 06:35Z): the block-relay-only picker and the top-up
+ * ran in one rotation and each dialled the same first candidate -- two
+ * helpers, two connections, one closed as a duplicate on arrival. A host
+ * with a dial in flight is not a candidate for another. */
+static int dh_inflight_host(const char* host){ for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0 && !strcmp(g_dh[i].host, host)) return 1; return 0; }
 /* 2026-09-10 (snapshot v, 03:54Z): the block-relay-only picker dialled the
  * same refused host every rotation, three helpers deep, and the legs' own
  * re-dials found "no dial helper free" for ten minutes. Extra legs (block-
@@ -3039,6 +3045,7 @@ static int g_dh_last_slot = -1;   /* the want_slot of the result dh_poll just re
 static int dh_start_slot(const char* host, int out_port, int want_slot);
 static int __attribute__((unused)) dh_start(const char* host, int out_port){ return dh_start_slot(host, out_port, -1); }   /* the tests' entry; the daemon names a slot */
 static int dh_start_slot(const char* host, int out_port, int want_slot){
+    if(dh_inflight_host(host)) return 0;                  /* one dial per host at a time */
     int slot = -1; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid <= 0){ slot = i; break; }
     if(slot < 0) return 0;
     int sp[2]; if(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) return 0;
@@ -6753,7 +6760,7 @@ static void dl_new_block_choke(void){
         if(!in_ibd){
             int announced = 0, legs = 0;
             for(int i2=0; i2<mux_n_out; i2++){
-                if(mux_out_fd[i2] < 0) continue;
+                if(mux_out_fd[i2] < 0 || leg_pass_busy(i2)) continue;   /* 2026-09-10: a pass helper owns that socket (its cipher, on v2) */
                 legs++;
                 if(node_announce_tip(mux_out_fd[i2], store_buf, ht_idx, 0) == 1) announced++;
             }
@@ -7532,7 +7539,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             } else if(op == RPC_CTL_PING){
                 int sent = 0;
                 for(int i = 0; i < mux_n_out; i++)
-                    if(mux_out_fd[i] >= 0 &&
+                    if(mux_out_fd[i] >= 0 && !leg_pass_busy(i) &&
                        p2p_write(mux_out_fd[i], "ping", 4, "\x11\x22\x33\x44\x55\x66\x77\x88", 8) > 0)
                         sent++;
                 fprintf(stderr,"[ctl] ping queued to %d leg(s)\n", sent);
@@ -7935,7 +7942,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                   memcpy(inv+5, bh, 32);
                                   int announced = 0;
                                   for (int i2=0; i2<mux_n_out; i2++)
-                                      if (mux_out_fd[i2] >= 0 &&
+                                      if (mux_out_fd[i2] >= 0 && !leg_pass_busy(i2) &&
                                           p2p_write(mux_out_fd[i2], "inv", 3, inv, 37) > 0) announced++;
                                   fprintf(stderr,"[dl] submitblock: CONNECTED h=%ld, announced to %d/%d legs\n",
                                           tip + 1, announced, mux_n_out); }
@@ -8285,7 +8292,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * queued by tx_relay.c and are skipped by the drain). */
             { extern void txrelay_announce_own(const unsigned char txid[32]);
               txann_worker_drain(txrelay_announce_own); }
-            { int rfds[MUX_MAX_OUT]; legs_relay_fds(mux_out_fd, mux_out_kind, mux_n_out, rfds);   /* CC-4 */
+            { int rfds[MUX_MAX_OUT]; int free_fds[MUX_MAX_OUT];                                 /* 2026-09-10: never a busy leg */
+              for(int k = 0; k < mux_n_out; k++) free_fds[k] = leg_pass_busy(k) ? -1 : mux_out_fd[k];
+              legs_relay_fds(free_fds, mux_out_kind, mux_n_out, rfds);   /* CC-4 */
               txrelay_announce(rfds, mux_n_out); }
         }
         { extern long addrself_maybe_announce_nets(const int*, const unsigned char*, const unsigned char*, int);
@@ -8293,7 +8302,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               bmc_addr_t la;
               mux_out_net[k] = bmc_addr_from_string(&la, mux_out_host[k]) ? la.net : BMC_NET_IPV4;
           }
-          addrself_maybe_announce_nets(mux_out_fd, mux_out_wants_v2, mux_out_net, mux_n_out); }
+          { int free_fds[MUX_MAX_OUT]; for(int k = 0; k < mux_n_out; k++) free_fds[k] = leg_pass_busy(k) ? -1 : mux_out_fd[k];
+            addrself_maybe_announce_nets(free_fds, mux_out_wants_v2, mux_out_net, mux_n_out); } }
         rot++;
         /* Real-time UTXO catch-up: its OWN step, decoupled from any single
          * leg's do_outbound_sync return value. A per-leg local diff would
