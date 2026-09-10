@@ -2767,7 +2767,16 @@ static void leg_on_headers(int fd, const unsigned char* hdrs, unsigned long n){
 static int leg_pass_busy(int i);   /* defined with the pass helper below */
 /* the rotation asks: is a leg other than `except` announced? (clears the mark) */
 static int leg_announced_pick(int except){
-    for(int a = 0; a < mux_n_out; a++) if(a != except && mux_out_announced[a] && !leg_pass_busy(a)){ mux_out_announced[a] = 0; if(mux_out_fd[a] >= 0) return a; }
+    for(int a = 0; a < mux_n_out; a++){
+        if(a == except || !mux_out_announced[a] || leg_pass_busy(a)) continue;
+        mux_out_announced[a] = 0;
+        if(mux_out_fd[a] < 0) continue;
+        /* 2026-09-10 (snapshot y): with passes in helpers, every leg that announced
+         * the same block fetched it -- six reconstructions of block 966,312. One
+         * pass per announced block: the claim is released when its pass reports. */
+        if(!inflight_claim(&g_inflight, mux_out_announced_hash[a], a, (long long)time(NULL))) continue;
+        return a;
+    }
     return -1;
 }
 #define LEG_HB_MAX 3
@@ -5639,6 +5648,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
             mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
             continue;
         }
+        inflight_release_leg(&g_inflight, i);            /* the announced block's claim, if this pass carried one */
         long n = leg_pass_finish(i, &r, blob, got);
         if(n > 0){ stored += n; if(stored_leg) *stored_leg = i; }
         else if(mux_out_fd[i] < 0){ mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS; }   /* the bookkeeping closed it */
@@ -5668,7 +5678,11 @@ static void legs_sweep_except(int except){
         if(!mux_out_good[k] && mux_out_since[k] && nowsec - mux_out_since[k] >= DM_GOOD_S){ mux_out_good[k] = 1; if(g_dialmem) dialmem_note_success(g_dialmem, mux_out_host[k]); }
         leg_ping_tick(k, nowsec);
     }
-    if(except >= 0 && except < mux_n_out && mux_out_fd[except] >= 0) leg_ping_tick(except, nowsec);
+    /* 2026-09-10 (snapshot y): the current leg's ping tick ran AFTER its pass
+     * helper had taken the socket; with a v2 session the parent's stale cipher
+     * made that ping garbage and the peer hung up ("EOF on the first read" on
+     * four legs in a minute). Nothing touches a busy leg. */
+    if(except >= 0 && except < mux_n_out && mux_out_fd[except] >= 0 && !leg_pass_busy(except)) leg_ping_tick(except, nowsec);
 }
 /* ---- Core's stall rule (2026-09-10) ----------------------------------------
  * The one judge of slowness in Core's downloader: when the window is full

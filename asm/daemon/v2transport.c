@@ -330,6 +330,7 @@ long bmc_v2_export(int fd, unsigned char* out, unsigned long cap){
     if (!bmc_v2_is_active(fd)) return 0;
     v2_conn* c = g_conn[fd];
     if (c->has_held) return 0;                 /* a decoded message waiting for the caller: not a handover point */
+    if (!flush_send(fd, &c->t)) return 0;      /* 2026-09-10: bytes the cipher already counted must reach the wire before the state moves */
     return bip324_t_export(&c->t, out, cap);
 }
 int bmc_v2_import(int fd, const unsigned char* in, unsigned long len){
