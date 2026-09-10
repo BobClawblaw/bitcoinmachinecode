@@ -6162,9 +6162,39 @@ static void dl_new_block_choke(void){
     g_dl_last_seen_tip = now_tip;
 }
 
+#ifdef __APPLE__
+/* bmc_osx: the download worker was dying on SIGSYS/SIGSEGV during regtest
+ * submitblock with no way to see where -- lldb attach AND batch launch are
+ * permission-gated on this macOS (26.6).  Dump a native backtrace + siginfo
+ * to stderr from the handler; the parent's "died on signal" line then has a
+ * stack behind it.  Not async-signal-safe by the book (snprintf/backtrace),
+ * but on a fatal path beyond saving that is the right trade. */
+#include <execinfo.h>
+static void dlc_crash_handler(int sig, siginfo_t* si, void* uctx){
+    (void)uctx;
+    char msg[160];
+    int n = snprintf(msg, sizeof msg,
+        "\n[dlc] FATAL-CRASH: signal %d si_code=%d si_addr=%p errno=%d\n",
+        sig, si ? si->si_code : 0, si ? si->si_addr : NULL,
+        si ? si->si_errno : 0);
+    write(2, msg, (size_t)n);
+    void* bt[64];
+    int nbt = backtrace(bt, 64);
+    backtrace_symbols_fd(bt, nbt, 2);
+    _exit(128 + sig);
+}
+#endif
+
 static void serve_download_worker(const char* dir, const char* peers[], int pool_len, int out_port){
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_IGN);
+#ifdef __APPLE__
+    { struct sigaction sa; memset(&sa, 0, sizeof sa);
+      sa.sa_sigaction = dlc_crash_handler; sa.sa_flags = SA_SIGINFO;
+      sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
+      sigaction(SIGILL,  &sa, NULL); sigaction(SIGSYS, &sa, NULL);
+      sigaction(SIGFPE,  &sa, NULL); sigaction(SIGABRT, &sa, NULL); }
+#endif
     signal(SIGTERM, handle_shutdown_signal);
     signal(SIGINT, handle_shutdown_signal);
     /* Let the (multi-hour, during bulk replay) utxo_live_catchup loop see the
