@@ -956,6 +956,29 @@ int main(void){
         txrelay_on_block_inv = 0; txrelay_on_headers = 0; txrelay_on_cmpctblock = 0; txrelay_on_blocktxn = 0; txrelay_on_block = 0;
         close(sp[0]); close(sp[1]);
     }
+    printf("== 10: announced but not requested -- the queue drains on the next poll (2026-09-10, CORE_DIVERGENCES row 2) ==\n");
+    /* Core's TxRequestTracker keeps every announcement and requests as the
+     * in-flight budget frees up. Ours requested at most TXR_MAX_REQ per pass
+     * and left the rest announced-but-never-requested (106 of a block's
+     * missing transactions on production, 2026-09-10 05:12Z). */
+    {
+        int sp[2]; ck("leg pair for the drain", socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+        enum { NINV = 40 };
+        static u8 inv[1 + NINV*36]; inv[0] = NINV;
+        for (int i = 0; i < NINV; i++){ u8* e = inv + 1 + i*36; e[0] = 1; e[1] = e[2] = e[3] = 0; for (int j = 0; j < 32; j++) e[4 + j] = (u8)(0xC0 + i + j * 3); }
+        p2p_write(sp[1], "inv", 3, inv, sizeof inv);
+        txrelay_poll_leg(sp[0], mp_area, 50);
+        char cmd[13]; static u8 pl[8192];
+        int plen = read_msg(sp[1], cmd, pl, sizeof pl);
+        ck("the first pass requests TXR_MAX_REQ (32) of the 40", plen == 1 + 32*36 && !strcmp(cmd, "getdata") && pl[0] == 32);
+        ck("...and nothing else yet", no_bytes_pending(sp[1]));
+        txrelay_poll_leg(sp[0], mp_area, 50);            /* nothing buffered: the drain alone */
+        plen = read_msg_nb(sp[1], cmd, pl, sizeof pl);
+        ck("the next poll requests the 8 announced-but-not-requested (the drain)", plen == 1 + 8*36 && !strcmp(cmd, "getdata") && pl[0] == 8);
+        txrelay_poll_leg(sp[0], mp_area, 50);
+        ck("...and a third poll requests nothing more", read_msg_nb(sp[1], cmd, pl, sizeof pl) < 0);
+        close(sp[0]); close(sp[1]);
+    }
     printf("\n%s (%d checks, %d failures)\n", g_fails==0 ? "ALL PASS" : "SOME FAILED", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }
