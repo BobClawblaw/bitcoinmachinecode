@@ -1252,9 +1252,10 @@ extern int sync_fail_code;                        /* bitcoind.asm: where the las
  * first pass failed was closed on the spot -- silently -- as the third
  * strike of two predecessors (production, 16:30-16:42Z: eight legs closed by
  * us within 50-160 s, none logged). */
+static unsigned char g_pass_last_empty[MUX_MAX_OUT];   /* the leg's last pass report stored nothing (the reorg probe's trigger, 2026-09-10) */
 static void leg_note_installed(int i){
     mux_out_since[i] = (long long)time(NULL); mux_out_good[i] = 0; g_sync_fail_streak[i] = 0; mux_out_ping_sent[i] = 0; mux_out_pong_at[i] = 0; mux_out_ping_ms[i] = -1;
-    mux_out_announced[i] = 0; mux_out_hb[i] = 0; mux_out_hb_since[i] = 0; mux_out_lastpass_ms[i] = 0;
+    mux_out_announced[i] = 0; mux_out_hb[i] = 0; mux_out_hb_since[i] = 0; mux_out_lastpass_ms[i] = 0; g_pass_last_empty[i] = 0;
     /* 2026-09-10: Core sends sendheaders after verack so peers PUSH new
      * headers instead of announcing by inv; the sweep acts on either. Only
      * with the receive side installed, like sendcmpct: the sync harnesses'
@@ -2894,12 +2895,13 @@ static long do_outbound_sync(int i){
      * sendcmpct during this very sync. */
     g_peer_sendcmpct = mux_out_cmpct[i]; g_sync_mp = txsub_worker_ready() ? txsub_pool() : NULL;
     g_sync_leg = i;
+    unsigned long p_r, p_n, p_f; cmpct_recv_stats(&p_r, &p_n, &p_f);   /* at entry, not a static: a pass child's static was the parent's snapshot at fork, so every child reprinted the previous block's overlap line (2026-09-10) */
     long ok=node_sync_multi(mux_out_fd[i], store_buf, loc, nloc, cbuf, (long)sizeof cbuf, &cnt);
     inflight_release_leg(&g_inflight, i); g_sync_leg = -1;   /* the claims live with the pass */
     g_last_sync_ok = ok;
     if(g_peer_sendcmpct && !mux_out_cmpct[i]){ mux_out_cmpct[i] = 1; fprintf(stderr, "[cmpct] %s accepts compact blocks: requesting MSG_CMPCT_BLOCK on this leg from now on\n", mux_out_host[i]); }
-    { static unsigned long p_r, p_n, p_f; unsigned long r, n, f; cmpct_recv_stats(&r, &n, &f);
-      if(r != p_r || n != p_n || f != p_f){ fprintf(stderr, "[cmpct] reconstructed %lu block(s) from the mempool (%lu needed a getblocktxn round trip, %lu fell back to a full block)\n", r, n, f); p_r = r; p_n = n; p_f = f;
+    { unsigned long r, n, f; cmpct_recv_stats(&r, &n, &f);
+      if(r != p_r || n != p_n || f != p_f){ fprintf(stderr, "[cmpct] reconstructed %lu block(s) from the mempool (%lu needed a getblocktxn round trip, %lu fell back to a full block)\n", r, n, f);
                                               cmpct_overlap_line((long)*(int*)(store_buf+24), mux_out_host[i]); } }
     double sync_s = phase_elapsed(&sync_pt);
     int st_tip=*(int*)(store_buf+24);
@@ -2987,7 +2989,7 @@ static long do_outbound_sync(int i){
  * 27 s after the oracle because the loop sat in a top-up. Core's message
  * loop never blocks on a connect. want_slot: the leg slot a re-dial fills
  * when it lands (-1: append, the top-up's case). */
-#define DH_MAX 4
+#define DH_MAX 8                 /* 2026-09-10 (aa): nine churning legs saturated four dial helpers ("no dial helper free" every rotation) */
 typedef struct { int sp; pid_t pid; char host[128]; int net; long long t0; int want_slot; } dh_slot_t;
 static dh_slot_t g_dh[DH_MAX];
 static long long g_dh_timeout_ms = 120000;
@@ -5556,7 +5558,12 @@ typedef struct {
     int cmpct, budget_fired; long rewound_to; unsigned long v2_len;   /* the session bytes follow the struct */
 } pass_result_t;
 static struct { pid_t pid; int fd; long long t0; unsigned budget_s; } g_pass[MUX_MAX_OUT];
-#define PASS_MAX_CONCURRENT 4
+/* 2026-09-10 (snapshot aa): four was too few -- with nine legs the fifth
+ * pass fell back to running INLINE and blocked the loop for its length; a
+ * helper-dialed socket waited 21 s to be installed and its peer had given
+ * up. One helper per leg, and no inline pass: a pass that cannot start
+ * waits for the next rotation. */
+#define PASS_MAX_CONCURRENT MUX_MAX_OUT
 static int leg_pass_busy(int i){ return i >= 0 && i < MUX_MAX_OUT && g_pass[i].pid > 0; }
 static int pass_running(void){ int n = 0; for(int k = 0; k < MUX_MAX_OUT; k++) if(g_pass[k].pid > 0) n++; return n; }
 static long g_pass_started, g_pass_fallback, g_pass_crashed;
@@ -5603,6 +5610,7 @@ static long leg_pass_finish(int i, const pass_result_t* r, const unsigned char* 
     if(r->fail_code == 99){ leg_close_ours(i, "pass-session", "the pass could not export its v2 session"); return 0; }
     if(r->cmpct && !mux_out_cmpct[i]){ mux_out_cmpct[i] = 1; }
     if(r->rewound_to >= 0){ anchor_locator(mux_out_loc[i]); dl_after_gate_rewind(r->rewound_to); return 0; }
+    g_pass_last_empty[i] = (r->ok == 1 && r->cnt <= 0);
     if(r->ok != 1 || r->cnt <= 0){ pass_fail_bookkeeping(i, r->ok, r->fail_code, r->sync_s); return 0; }
     static unsigned char sb[8<<20];
     for(int h = r->tip_before + 1; h <= r->tip_after; h++){
@@ -8189,28 +8197,6 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * announced pick. If no helper can start (fork failed, four already
              * out), the pass runs here as before. */
             if(leg_pass_busy(i)) continue;
-            unsigned budget_s = leg_budget_secs(legs_live());
-            long n = 0;
-            if(leg_pass_start(i, budget_s)){ did = 1; }
-            else {
-                g_pass_fallback++;
-                struct sigaction sa, old; memset(&sa,0,sizeof sa);
-                sa.sa_handler=mux_budget_alarm; sigemptyset(&sa.sa_mask);
-                sigaction(SIGALRM,&sa,&old);
-                mux_sync_budget_fired=0;
-                mux_budget_fd = mux_out_fd[i];
-                alarm(budget_s);
-                n = do_outbound_sync(i);
-                alarm(0); mux_budget_fd = -1; sigaction(SIGALRM,&old,NULL);
-                if(mux_sync_budget_fired){
-                    char d[80]; snprintf(d, sizeof d, "the pass exceeded %us%s (where=%d)", budget_s, budget_s > (unsigned)DL_BUDGET_SECS ? ", the only-leg budget" : "", sync_fail_code);
-                    leg_close_ours(i, "sync-budget", d);
-                    mux_next_peer(i, srcpool, nsrc, out_port);
-                }
-                did |= (n>0)?1:0;
-            }
-            mux_out_announced[i] = 0;                          /* the pass consumed whatever was announced on this leg */
-            if(n>0){ leg_hb_note_block(i); stored_break = 1; }   /* the synchronous fallback stored: apply now */
             /* ---- STAGE B: periodic fork probe -----------------------------
              * Runs only on a leg that just returned NOTHING, which is exactly
              * the situation a fork hides in: if the peer is on a competing
@@ -8227,7 +8213,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * pass uses so a stalled peer cannot hold the rotation.
              * Gated on BOTH chainwork (needed to compare) and live UTXO
              * tracking (needed for undo data). */
-            if(reorg_ok && utxo_live_ok && n<=0 && mux_out_fd[i]>=0 && now_ms>=next_reorg_probe_ms){
+            /* 2026-09-10 (snapshot aa): this ran AFTER the pass had been handed to a
+             * helper -- n was 0 every time, so the parent probed the very socket
+             * a child was reading (strace: the probe's 60 s alarm armed within a
+             * millisecond of the fork), two readers interleaved the frames, the
+             * probe tore the leg down and Core saw a reset ("EOF on the first
+             * read", every leg, every 30-70 s). Now it runs BEFORE the pass, on an
+             * idle leg whose last REPORT was empty. */
+            if(reorg_ok && utxo_live_ok && g_pass_last_empty[i] && mux_out_fd[i]>=0 && now_ms>=next_reorg_probe_ms){
                 next_reorg_probe_ms = now_ms + REORG_PROBE_INTERVAL_MS;
                 struct sigaction psa, pold; memset(&psa,0,sizeof psa);
                 psa.sa_handler=mux_budget_alarm; sigemptyset(&psa.sa_mask);
@@ -8269,6 +8262,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     fprintf(stderr,"[reorg] probe of %s rejected a candidate chain (no action taken)\n", mux_out_host[i]);
                 }
             }
+            if(mux_out_fd[i] < 0) continue;                    /* the probe closed it */
+            unsigned budget_s = leg_budget_secs(legs_live());
+            if(leg_pass_start(i, budget_s)){ did = 1; }
+            else { g_pass_fallback++; mux_out_lastpass_ms[i] = 0; continue; }   /* no helper (fork failed): never inline -- the next rotation tries again */
+            mux_out_announced[i] = 0;                          /* the pass consumed whatever was announced on this leg */
             /* 2026-09-09: service every OTHER leg's buffered messages now --
              * a ping used to wait for its leg's turn in the rotation (75 s
              * measured; Core's eviction protects its lowest-ping peers, and a
