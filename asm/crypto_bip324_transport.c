@@ -340,3 +340,50 @@ int bip324_t_send_message(bip324_transport_t* t, const char* type,
     free(contents); free(pkt);
     return ok;
 }
+
+/* ---- session handover (2026-09-10) ---------------------------------------- */
+#define BIP324_XPORT_MAGIC 0x32345458u   /* "XT42" */
+typedef struct {
+    unsigned int   magic;
+    unsigned int   cipher_len;
+    int            initiator, recv_state, keys_ready, sent_version, msg_ready, have_len;
+    unsigned char  net_magic[4];
+    unsigned long  pending_len;
+    unsigned long  recv_len, msg_len;
+    char           msg_type[13];
+} bip324_xport_hdr;
+long bip324_t_export(const bip324_transport_t* t, unsigned char* out, unsigned long cap){
+    if (t->recv_state != BIP324_RECV_APP || !t->keys_ready) return 0;
+    unsigned long need = sizeof(bip324_xport_hdr) + sizeof t->cipher + t->recv.len + t->msg.len;
+    if (need > cap) return 0;
+    bip324_xport_hdr h; memset(&h, 0, sizeof h);
+    h.magic = BIP324_XPORT_MAGIC; h.cipher_len = (unsigned int)sizeof t->cipher;
+    h.initiator = t->initiator; h.recv_state = t->recv_state; h.keys_ready = t->keys_ready;
+    h.sent_version = t->sent_version; h.msg_ready = t->msg_ready; h.have_len = t->have_len;
+    memcpy(h.net_magic, t->net_magic, 4); h.pending_len = t->pending_len;
+    h.recv_len = t->recv.len; h.msg_len = t->msg.len; memcpy(h.msg_type, t->msg_type, 13);
+    unsigned long o = 0;
+    memcpy(out + o, &h, sizeof h); o += sizeof h;
+    memcpy(out + o, &t->cipher, sizeof t->cipher); o += sizeof t->cipher;
+    if (t->recv.len){ memcpy(out + o, t->recv.p, t->recv.len); o += t->recv.len; }
+    if (t->msg.len){ memcpy(out + o, t->msg.p, t->msg.len); o += t->msg.len; }
+    return (long)o;
+}
+int bip324_t_import(bip324_transport_t* t, const unsigned char* in, unsigned long len){
+    bip324_xport_hdr h;
+    if (len < sizeof h) return 0;
+    memcpy(&h, in, sizeof h);
+    if (h.magic != BIP324_XPORT_MAGIC || h.cipher_len != sizeof t->cipher) return 0;
+    if (len != sizeof h + sizeof t->cipher + h.recv_len + h.msg_len) return 0;
+    if (h.recv_state != BIP324_RECV_APP || !h.keys_ready) return 0;
+    memset(t, 0, sizeof *t);
+    unsigned long o = sizeof h;
+    memcpy(&t->cipher, in + o, sizeof t->cipher); o += sizeof t->cipher;
+    t->initiator = h.initiator; t->recv_state = h.recv_state; t->keys_ready = h.keys_ready;
+    t->sent_version = h.sent_version; t->msg_ready = h.msg_ready; t->have_len = h.have_len;
+    memcpy(t->net_magic, h.net_magic, 4); t->pending_len = h.pending_len; memcpy(t->msg_type, h.msg_type, 13);
+    if (h.recv_len && !buf_append(&t->recv, in + o, h.recv_len)) return 0;
+    o += h.recv_len;
+    if (h.msg_len && !buf_append(&t->msg, in + o, h.msg_len)){ buf_free(&t->recv); return 0; }
+    return 1;
+}

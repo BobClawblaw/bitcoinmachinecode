@@ -2356,7 +2356,7 @@ static int outbound_connect_raw(const char* host, int rcv_ms, int out_port){
      * peer and every such leg died within a second on snapshot u. Helpers
      * dial v1 until the transport state can be handed over with the fd
      * (CORE_DIVERGENCES: v2 on helper-dialed legs). */
-    const int want_v2 = g_in_dial_helper ? 0 : peer_advertises_v2(host, out_port);
+    const int want_v2 = peer_advertises_v2(host, out_port);   /* 2026-09-10: a helper's session travels with its socket (bmc_v2_export) */
     for(int attempt = 0; attempt < 2; attempt++){
         if(proxied){
             bmc_addr_t pa; memset(&pa,0,sizeof pa);
@@ -3000,7 +3000,11 @@ static long long g_dh_timeout_ms = 120000;
 /* g_in_dial_helper is declared with the leg tables above */
 /* NET-13: vpayload MUST match g_peer_version_payload -- a smaller field here
  * silently truncates the capture across the dial-helper socketpair. */
-typedef struct { int ok; unsigned char wants_addrv2; long vlen; unsigned char vpayload[512]; char why[128]; } dh_result_t;
+typedef struct { int ok; unsigned char wants_addrv2; long vlen; unsigned char vpayload[512]; char why[128];
+                 unsigned long v2_len;      /* 2026-09-10: bytes of exported v2 session that follow the struct on the socketpair (0: v1) */
+               } dh_result_t;
+#define DH_V2_BLOB_CAP (64u << 10)
+static unsigned char g_dh_v2_blob[DH_V2_BLOB_CAP]; static unsigned long g_dh_v2_len = 0;   /* the parent's copy of the last result's session */
 void dial_helper_test_set_timeout_ms(long long ms){ g_dh_timeout_ms = ms; }
 static int leg_net_of(const char* hostport){
     bmc_addr_t a; return bmc_addr_from_string_port(&a, hostport, 0) ? (int)a.net : BMC_NET_IPV4;
@@ -3052,10 +3056,18 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
         dh_result_t r; memset(&r, 0, sizeof r);
         snprintf(g_dial_fail, sizeof g_dial_fail, "refused before dialing");   /* not the parent's last reason (2026-09-10: "timed out (10s)" after 1.4 s) */
         int fd = outbound_connect(host, 300, out_port);
+        static unsigned char blob[DH_V2_BLOB_CAP];
         if(fd >= 0){
             r.ok = 1; r.wants_addrv2 = (unsigned char)g_peer_wants_addrv2;
             r.vlen = g_peer_version_len > 0 && g_peer_version_len <= 256 ? g_peer_version_len : 0;
             if(r.vlen) memcpy(r.vpayload, g_peer_version_payload, (size_t)r.vlen);
+            /* the v2 session, if any, follows the struct: the parent imports it
+             * against the same fd (2026-09-10; snapshot u lost every v2 helper leg) */
+            if(bmc_v2_is_active(fd)){
+                long n = bmc_v2_export(fd, blob, sizeof blob);
+                if(n <= 0){ r.ok = 0; snprintf(r.why, sizeof r.why, "v2 session not exportable"); bmc_v2_close(fd); close(fd); fd = -1; }
+                else r.v2_len = (unsigned long)n;
+            }
         } else snprintf(r.why, sizeof r.why, "%s", dial_fail_reason());
         struct iovec iov = { &r, sizeof r };
         char cbuf[CMSG_SPACE(sizeof(int))]; memset(cbuf, 0, sizeof cbuf);
@@ -3066,6 +3078,7 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
             memcpy(CMSG_DATA(cm), &fd, sizeof fd);
         }
         (void)!sendmsg(sp[1], &mh, 0);
+        if(r.v2_len){ unsigned long off = 0; while(off < r.v2_len){ ssize_t w = write(sp[1], blob + off, r.v2_len - off); if(w <= 0) break; off += (unsigned long)w; } }
         _exit(0);
     }
     close(sp[1]);
@@ -3236,10 +3249,18 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
             continue;
         }
         *fd_out = -1;
+        g_dh_v2_len = 0;
         if(n == (ssize_t)sizeof *out && out->ok){
             for(struct cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm))
                 if(cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS){ memcpy(fd_out, CMSG_DATA(cm), sizeof(int)); break; }
             if(*fd_out < 0) out->ok = 0;
+            if(out->ok && out->v2_len){                     /* the session bytes follow; the child wrote them right after the struct */
+                if(out->v2_len > DH_V2_BLOB_CAP){ out->ok = 0; snprintf(out->why, sizeof out->why, "v2 session too large"); }
+                else { unsigned long off = 0; struct pollfd pf = { g_dh[i].sp, POLLIN, 0 };
+                       while(off < out->v2_len){ if(poll(&pf, 1, 2000) <= 0) break; ssize_t r = read(g_dh[i].sp, g_dh_v2_blob + off, out->v2_len - off); if(r <= 0) break; off += (unsigned long)r; }
+                       if(off == out->v2_len) g_dh_v2_len = off; else { out->ok = 0; snprintf(out->why, sizeof out->why, "v2 session truncated on the socketpair"); } }
+                if(!out->ok && *fd_out >= 0){ close(*fd_out); *fd_out = -1; }
+            }
         } else if(n != (ssize_t)sizeof *out){ out->ok = 0; snprintf(out->why, sizeof out->why, "helper exited without a result"); }
         waitpid(g_dh[i].pid, NULL, 0);
         close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1; g_dh_last_slot = g_dh[i].want_slot;
@@ -3251,6 +3272,13 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
 /* install a helper-dialled leg exactly as the inline fill does */
 static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
     for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && !strcmp(mux_out_host[k], host)){ close(fd); return 0; }   /* already a leg */
+    if(r->v2_len){                                     /* the helper's v2 session: ours now, before the first write (2026-09-10) */
+        if(g_dh_v2_len != r->v2_len || !bmc_v2_import(fd, g_dh_v2_blob, g_dh_v2_len)){
+            fprintf(stderr, "[dial] %s: the helper's v2 session could not be imported -- leg not installed\n", host);
+            g_dh_v2_len = 0; close(fd); return 0;
+        }
+        g_dh_v2_len = 0;
+    }
     g_peer_version_len = r->vlen; if(r->vlen) memcpy(g_peer_version_payload, r->vpayload, (size_t)r->vlen);
     g_peer_wants_addrv2 = r->wants_addrv2;
     int s = g_dh_last_slot; g_dh_last_slot = -1;

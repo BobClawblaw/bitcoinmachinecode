@@ -149,6 +149,53 @@ int main(void){
       ck("  the wire carried no v1 magic and no cleartext payload",
          code != 71 && code != 72); }
 
+    printf("== a session survives a fork: handshake in a child, export, import in the parent (2026-09-10) ==\n");
+    /* the dial helper's shape: the child runs the handshake and hands the
+     * socket back; snapshot u lost every such leg because the cipher state
+     * stayed in the child. The parent imports the exported session and
+     * carries five encrypted round trips, a 200 KB message and the raw-wire
+     * check with the SAME responder as the scenario above. */
+    { int sv[2], pp[2];
+      if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0 || pipe(pp) != 0){ printf("  FAIL socketpair/pipe\n"); return 1; }
+      pid_t rp = fork();
+      if (rp == 0){ close(sv[0]); close(pp[0]); close(pp[1]); _exit(responder(sv[1], 1)); }
+      close(sv[1]);
+      pid_t hp = fork();
+      if (hp == 0){                                        /* the helper: handshake, export, exit */
+          close(pp[0]);
+          if (bmc_v2_handshake(sv[0], 1, 5000) != 1) _exit(80);
+          static unsigned char blob[65536]; long n = bmc_v2_export(sv[0], blob, sizeof blob);
+          if (n <= 0) _exit(81);
+          unsigned long off = 0; while (off < (unsigned long)n){ ssize_t w = write(pp[1], blob + off, (unsigned long)n - off); if (w <= 0) _exit(82); off += (unsigned long)w; }
+          _exit(0);
+      }
+      close(pp[1]);
+      static unsigned char blob[65536]; unsigned long got = 0;
+      for (;;){ ssize_t r = read(pp[0], blob + got, sizeof blob - got); if (r <= 0) break; got += (unsigned long)r; }
+      close(pp[0]);
+      int hst = 0; waitpid(hp, &hst, 0);
+      ck("the helper child completed the handshake and exported the session", WIFEXITED(hst) && WEXITSTATUS(hst) == 0 && got > 0);
+      ck("the parent has no session on the fd before the import", !bmc_v2_is_active(sv[0]));
+      ck("import succeeds and the fd is a v2 session in the parent", bmc_v2_import(sv[0], blob, got) == 1 && bmc_v2_is_active(sv[0]));
+      int fd = sv[0], ok = 1;
+      unsigned char pl[8] = {1,2,3,4,5,6,7,8}; char cmd[12]; unsigned char buf[4096]; unsigned plen;
+      for (int i = 0; i < 5; i++){
+          if (p2p_write(fd, "ping", 4, pl, 8) != 32){ ok = 0; break; }
+          if (p2p_read(fd, cmd, buf, sizeof buf, &plen) != 1){ ok = 0; break; }
+          if (strncmp(cmd, "pong", 4) || plen != 8 || memcmp(buf, pl, 8)){ ok = 0; break; }
+      }
+      ck("five ping/pong round trips over the IMPORTED session", ok);
+      unsigned char* big = malloc(300000);
+      int r = p2p_read(fd, cmd, big, 300000, &plen);
+      ck("a 200 KB message arrives whole on the imported session", r == 1 && !strncmp(cmd, "block", 5) && plen == 200000);
+      free(big);
+      ck("a distinctive payload for the wire check", p2p_write(fd, "ping", 4, MARKER, 8) == 32);
+      bmc_v2_close(fd); close(fd);
+      int st = 0; waitpid(rp, &st, 0);
+      int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+      char l[160]; snprintf(l, sizeof l, "the responder agreed throughout with the imported session (exit %d)", code);
+      ck(l, code == 0);
+      ck("  and the wire stayed encrypted after the handover", code != 71 && code != 72); }
     printf("== an inbound v1 peer is detected and left on the v1 path ==\n");
     /* The responder must not eat the bytes a v1 peer already sent. */
     { int sv[2];
