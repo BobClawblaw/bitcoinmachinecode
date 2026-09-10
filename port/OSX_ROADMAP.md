@@ -129,6 +129,18 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       ping nonces, headers_count/inv_count incl. 0xfc/0xfd/0xfe/0xff and
       count*81/count*36 plen boundaries, inv_get round-trips).
       Commit 57588bdb.
+- [x] bitcoin_addrmgr -> port/osx/addrmgr_twin.c  DONE 2026-09-09 as a C
+      TWIN (peers.dat book ops via Darwin libc; the x86 raw open/lseek/read/
+      write collapse to open/lseek/read/write -- semantics kept exactly:
+      count=filesize/18 no partial-tail error, add=seek-end+write(18),
+      get_i short read -> -1). Gates: upstream test_addrmgr 28/28 native
+      (Core msg_addr/msg_addrv2 reference bytes incl. services CompactSize
+      edges fd/fe and 300-record fd 2c 01 count) + 73-record differential
+      byte-identical vs x86 bitcoin_addrmgr.o on .242 -- BOTH the result
+      stream AND the resulting peers.dat file (damr.c + gen_damr_vecs.py:
+      add new/dup, get_i in+out of range, lookup hit/miss, v1/v2 codecs
+      1..300 records, addr_count fd/fe/ff/truncated shapes).
+      Commit 2725d14b.
 - [ ] bitcoin_sighash, bitcoin_bip143, bitcoin_bip341, bitcoin_bip342
 - [ ] bitcoin_interp, bitcoin_scriptcodec, bitcoin_script_flags,
       bitcoin_script, bitcoin_multisig, bitcoin_cons
