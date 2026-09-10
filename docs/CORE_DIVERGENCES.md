@@ -6,17 +6,18 @@ An inventory taken after the 09-09 leg and compact-block work, extended the same
 
 | # | area | Core | this node | cost measured | fix |
 |---|---|---|---|---|---|
-| 1 | header sync | `sendheaders`: peers push new headers; `getheaders` only with cause | `getheaders` on every leg, every rotation | one request per peer per rotation, ~30 s of latency to a new block, silence detectable only by timeout | act on pushed `headers`/`inv` from the sweep; request only when behind |
-| 2 | compact blocks | up to 3 high-bandwidth peers push a compact block with no round trip | low-bandwidth only | one round trip per block before reconstruction starts | `sendcmpct` hb=1 to the 3 best legs; accept unsolicited `cmpctblock` from them |
-| 3 | leg service | one event loop over all peers | legs served one at a time, 60 s budget each | a slow pass delays every other leg; pongs answered within a pass, not at once | an event-driven leg loop (largest change, smallest measured gain now) |
-| 4 | history indexes | txindex, coinstatsindex, blockfilterindex built and repaired in the daemon; `-reindex` rebuilds all | offline `bmc_build_*` tools; the daemon adopts within a gap; only the coinstats history self-heals | the filter index sat at 964,359 for a day; the address history needs an operator | the coinstats self-heal shape for the filter index and the address history |
-| 5 | long reorgs | staged and connected as one unit | above 32 blocks: rewind and hand off to the downloader | a rotation without legs after a handoff | keep the legs through the handoff |
-| 6 | live coin counter after a crash | the count is the cache's, exact after replay | under the bulk memtable, a kill mid-block recovers with the counter 2 high (`test_utxo_crash_recovery`'s steady-state scenario forced to bulk: 153 vs 151, every key identical); the set is right, the counter is not | cosmetic until `gettxoutsetinfo` is asked after a crash mid-sync; the coinstats seed walk corrects it | find the double count in bulk-mode recovery (the interleaved verifier's spend accounting is the suspect); pin with the scenario at 2^22 slots |
+| 1 | leg service | one event loop over all peers | legs served one at a time, 60 s budget each | a slow pass delays every other leg; pongs answered within a pass, not at once | an event-driven leg loop (largest change, smallest measured gain now) |
+| 2 | history indexes | txindex, coinstatsindex, blockfilterindex built and repaired in the daemon; `-reindex` rebuilds all | offline `bmc_build_*` tools; the daemon adopts within a gap; only the coinstats history self-heals | the filter index sat at 964,359 for a day; the address history needs an operator | the coinstats self-heal shape for the filter index and the address history |
+| 3 | long reorgs | staged and connected as one unit | above 32 blocks: rewind and hand off to the downloader | a rotation without legs after a handoff | keep the legs through the handoff |
+| 4 | live coin counter after a crash | the count is the cache's, exact after replay | under the bulk memtable, a kill mid-block recovers with the counter 2 high (`test_utxo_crash_recovery`'s steady-state scenario forced to bulk: 153 vs 151, every key identical); the set is right, the counter is not | cosmetic until `gettxoutsetinfo` is asked after a crash mid-sync; the coinstats seed walk corrects it | find the double count in bulk-mode recovery (the interleaved verifier's spend accounting is the suspect); pin with the scenario at 2^22 slots |
+| 5 | mempool overlap with the network | a peer's mempool holds nearly every transaction a new block carries (blocktxn a few KB) | production held 4,472 entries; one blocktxn on 2026-09-10 was 800 KB of a 1.6 MB block (half the transactions missing), seven round trips under TCP slow start on a 0.8 s peer | relay coverage: what the legs announce vs what we request, orphan and policy rejects, the pool's size; measure the miss rate per block first |
 
 ## Closed today
 
 | # | what | PR |
 |---|---|---|
+| p | high-bandwidth compact blocks from the three most recent block sources, pushed blocks stored from the sweep, the apply right after a store | #159 |
+| o | sendheaders after the handshake; announcements (inv, pushed headers) drive a leg's pass; no polling for headers between announcements (30 s safety net) | #159 |
 | n | the parallel download takes Core's shape: every live peer downloads (cap 64), the window scales and anchors to the connected tip, the window's tail evicts stallers, replacement only when a free peer exists | #157 |
 | m | the coinstats index folds per block during a bulk sync through the fold worker (the walk-at-caught-up deferral is gone; history rows from block 0) | #156 |
 | l | bulk mode checkpoints every 1,024 blocks or 60 s, a bounded pass carries its batch and never downshifts the memtable | #155 |

@@ -1187,6 +1187,19 @@ static int   mux_out_fd[MUX_MAX_OUT];       /* persistent outbound seed fds  */
 static unsigned char mux_out_wants_v2[MUX_MAX_OUT];
 static unsigned char mux_out_kind[MUX_MAX_OUT];         /* CC-4: LEG_FULL / LEG_BLOCK_ONLY */
 static unsigned char mux_out_cmpct[MUX_MAX_OUT];        /* CC-2: the peer sent sendcmpct on this leg */
+/* 2026-09-10, Core's shape at the tip: a block announced on the leg since its
+ * last pass (inv, or a pushed `headers`: we send sendheaders), and whether the
+ * leg is one of the three high-bandwidth compact-block sources */
+static unsigned char mux_out_announced[MUX_MAX_OUT];
+static unsigned char mux_out_hb[MUX_MAX_OUT];
+static long long     mux_out_hb_since[MUX_MAX_OUT];
+/* Core sends getheaders only with cause (a new peer, a header that does not
+ * connect); a synced node is told of blocks. Ours sent one per leg per
+ * rotation. A leg now gets a pass when a block was announced on it, else at
+ * most every LEG_PASS_EVERY_MS as the safety net (inventory row 1). */
+static long long     mux_out_lastpass_ms[MUX_MAX_OUT];
+#define LEG_PASS_EVERY_MS 30000LL
+extern void* g_cmpct_hook_cmpct;                        /* bitcoind.asm: non-NULL once the receive side is installed */
 extern long  g_peer_sendcmpct;                          /* bitcoind.asm: set by the sync drains when the peer sends sendcmpct */
 extern void* g_sync_mp;                                 /* bitcoind.asm: the mempool node_sync_multi reconstructs from */
 static void* txsub_pool(void);                           /* defined with the tx-submit worker below */
@@ -1239,7 +1252,15 @@ extern int sync_fail_code;                        /* bitcoind.asm: where the las
  * first pass failed was closed on the spot -- silently -- as the third
  * strike of two predecessors (production, 16:30-16:42Z: eight legs closed by
  * us within 50-160 s, none logged). */
-static void leg_note_installed(int i){ mux_out_since[i] = (long long)time(NULL); mux_out_good[i] = 0; g_sync_fail_streak[i] = 0; mux_out_ping_sent[i] = 0; mux_out_pong_at[i] = 0; mux_out_ping_ms[i] = -1; }
+static void leg_note_installed(int i){
+    mux_out_since[i] = (long long)time(NULL); mux_out_good[i] = 0; g_sync_fail_streak[i] = 0; mux_out_ping_sent[i] = 0; mux_out_pong_at[i] = 0; mux_out_ping_ms[i] = -1;
+    mux_out_announced[i] = 0; mux_out_hb[i] = 0; mux_out_hb_since[i] = 0; mux_out_lastpass_ms[i] = 0;
+    /* 2026-09-10: Core sends sendheaders after verack so peers PUSH new
+     * headers instead of announcing by inv; the sweep acts on either. Only
+     * with the receive side installed, like sendcmpct: the sync harnesses'
+     * fake peers depend on the bare stream. */
+    if(mux_out_fd[i] >= 0 && g_cmpct_hook_cmpct) p2p_write(mux_out_fd[i], "sendheaders", 11, 0, 0);
+}
 static long long leg_age_s(int i){ return mux_out_since[i] ? (long long)time(NULL) - mux_out_since[i] : -1; }
 static int legs_live(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0) n++; return n; }
 /* every deliberate close of a leg says so: "closed ours/<reason>", never a
@@ -2670,6 +2691,112 @@ static void log_hash_short(char out[17], const unsigned char hash32[32]){
     out[16]=0;
 }
 
+/* ---- Core's shape at the tip (2026-09-10) ----------------------------------
+ * Measured on production against the Core oracle on the same box: our tip
+ * moved 5-20 s after Core's. Three costs, each a divergence: a block was
+ * learned of only when its leg's rotation turn sent getheaders (the sweep
+ * discarded the peer's inv); every block cost a round trip before the
+ * reconstruction could start (low-bandwidth compact blocks only); and a
+ * stored block waited for the rest of the rotation before the apply ran.
+ * Now: the sweep's hooks (tx_relay.c) mark a leg ANNOUNCED on a block inv or
+ * a pushed header for a block we do not have, and the rotation runs that
+ * leg's pass next; the three legs that most recently delivered a block get
+ * sendcmpct high-bandwidth (Core's MaybeSetPeerAsAnnouncingHeaderAndIDs) and
+ * their pushed cmpctblock is reconstructed and stored from the sweep, on
+ * our tip, through the same evaluator submitblock uses; and a store breaks
+ * the rotation so the apply runs at once. */
+static int g_stored_now = 0;                            /* a pushed block was stored during this rotation's sweeps */
+static long g_announce_inv_n, g_announce_hdr_n, g_push_n, g_push_stored_n, g_push_skipped_n;
+static int leg_of_fd(int fd){ for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && mux_out_fd[k] == fd) return k; return -1; }
+static void leg_on_block_announce(int fd, const unsigned char hash[32]){
+    int k = leg_of_fd(fd); if(k < 0) return;
+    long h; if(ht_idx && idx_get(ht_idx, hash, &h)) return;         /* already stored */
+    mux_out_announced[k] = 1;
+}
+static void leg_on_block_inv(int fd, const unsigned char hash[32]){ g_announce_inv_n++; leg_on_block_announce(fd, hash); }
+static void leg_on_headers(int fd, const unsigned char* hdrs, unsigned long n){
+    unsigned char bh[32]; sha256d(bh, hdrs + (n - 1) * 81, 80); g_announce_hdr_n++;
+    leg_on_block_announce(fd, bh);
+}
+/* the rotation asks: is a leg other than `except` announced? (clears the mark) */
+static int leg_announced_pick(int except){
+    for(int a = 0; a < mux_n_out; a++) if(a != except && mux_out_announced[a]){ mux_out_announced[a] = 0; if(mux_out_fd[a] >= 0) return a; }
+    return -1;
+}
+#define LEG_HB_MAX 3
+static void leg_send_sendcmpct(int k, int hb){
+    unsigned char pl[9] = {0}; pl[0] = (unsigned char)hb; pl[1] = 2;    /* high_bandwidth, version 2 (u64 LE) */
+    if(mux_out_fd[k] >= 0) p2p_write(mux_out_fd[k], "sendcmpct", 9, pl, 9);
+    mux_out_hb[k] = (unsigned char)hb; mux_out_hb_since[k] = hb ? dh_now_ms() : 0;
+}
+/* Core: the peer that just gave us a block joins the high-bandwidth set; the
+ * set holds three, and the one that delivered longest ago goes back to low */
+static void leg_hb_note_block(int k){
+    if(!g_cmpct_hook_cmpct || k < 0 || mux_out_fd[k] < 0) return;
+    if(mux_out_hb[k]){ mux_out_hb_since[k] = dh_now_ms(); return; }
+    int n = 0, oldest = -1;
+    for(int j = 0; j < mux_n_out; j++) if(mux_out_fd[j] >= 0 && mux_out_hb[j]){ n++; if(oldest < 0 || mux_out_hb_since[j] < mux_out_hb_since[oldest]) oldest = j; }
+    if(n >= LEG_HB_MAX && oldest >= 0){
+        leg_send_sendcmpct(oldest, 0);
+        fprintf(stderr,"[cmpct] %s back to low-bandwidth compact blocks (the high-bandwidth set holds %d)\n", mux_out_host[oldest], LEG_HB_MAX);
+    }
+    leg_send_sendcmpct(k, 1);
+    fprintf(stderr,"[cmpct] %s delivered a block: high-bandwidth compact blocks from this leg from now on (Core: the last %d block sources)\n", mux_out_host[k], LEG_HB_MAX);
+}
+extern long blk_submit_evaluate_ex(const unsigned char*, unsigned long, const unsigned char*, long, int, char*, unsigned long);
+extern long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap, const unsigned char want[32]);
+extern long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap);
+static unsigned char g_push_blk[4u << 20];
+static unsigned char g_push_hash[32]; static int g_push_pending = 0, g_push_leg = -1;
+/* a block that arrived through the sweep: on our tip, PoW and consensus
+ * through the evaluator submitblock uses (the same cons_verify the pass runs),
+ * then the locked append; the apply follows at once (the rotation breaks) */
+static long dl_store_pushed_block(int k, const unsigned char* blk, unsigned long len, const unsigned char bh[32], const char* how){
+    unsigned char tiph[32]; long tip = *(int*)(store_buf + 24);
+    if(store_get_tip_hash(store_buf, tiph) != 1 || memcmp(blk + 4, tiph, 32) != 0){ g_push_skipped_n++; leg_on_block_announce(mux_out_fd[k], bh); return 0; }   /* not on our tip: the pass sorts it out */
+    char reason[64]; reason[0] = 0;
+    if(blk_submit_evaluate_ex(blk, len, tiph, tip, 1, reason, sizeof reason) != 1){
+        fprintf(stderr,"[cmpct] %s from %s refused: %s -- the leg's pass fetches it in full\n", how, mux_out_host[k], reason);
+        leg_on_block_announce(mux_out_fd[k], bh); return -1;
+    }
+    long r = idxscan_append_locked(store_buf, bh, blk, (long)len);
+    if(r == -2){ g_push_skipped_n++; return 0; }                        /* the tip moved under us: a sibling stored it first */
+    if(r < 0){ fprintf(stderr,"[cmpct] %s from %s: locked append FAILED\n", how, mux_out_host[k]); return -1; }
+    g_push_stored_n++; g_stored_now = 1;
+    { char hs[17]; for(int j = 0; j < 8; j++) sprintf(hs + 2*j, "%02x", bh[31 - j]);
+      fprintf(stderr,"[block] stored height=%ld hash=%s.. bytes=%lu (%s from %s)\n", tip + 1, hs, len, how, mux_out_host[k]); }
+    leg_hb_note_block(k);
+    return 1;
+}
+static long leg_on_cmpctblock(int fd, const unsigned char* pl, unsigned long plen){
+    int k = leg_of_fd(fd); if(k < 0 || plen < 88) return -1;
+    unsigned char bh[32]; sha256d(bh, pl, 80); g_push_n++;
+    long h; if(ht_idx && idx_get(ht_idx, bh, &h)){ g_push_skipped_n++; return 0; }
+    unsigned char tiph[32];
+    if(store_get_tip_hash(store_buf, tiph) != 1 || memcmp(pl + 4, tiph, 32) != 0){ leg_on_block_announce(fd, bh); return 0; }   /* behind, or a fork: the pass sorts it out */
+    if(!inflight_claim(&g_inflight, bh, k, (long long)time(NULL))) return 0;   /* another leg is fetching it */
+    if(g_push_pending){ inflight_release_leg(&g_inflight, g_push_leg); g_push_pending = 0; }   /* an older push never completed */
+    long n = cmpct_recv_cmpctblock(fd, txsub_worker_ready() ? txsub_pool() : NULL, pl, plen, g_push_blk, sizeof g_push_blk, bh);
+    if(n > 0){ long r = dl_store_pushed_block(k, g_push_blk, (unsigned long)n, bh, "pushed compact block"); inflight_release_leg(&g_inflight, k); return r; }
+    if(n == 0){ g_push_pending = 1; g_push_leg = k; memcpy(g_push_hash, bh, 32); return 0; }   /* getblocktxn (or a full-block getdata) is out; the reply comes through the sweep */
+    inflight_release_leg(&g_inflight, k); return -1;
+}
+static long leg_on_blocktxn(int fd, const unsigned char* pl, unsigned long plen){
+    int k = leg_of_fd(fd); if(k < 0 || !g_push_pending || k != g_push_leg) return -1;
+    long n = cmpct_recv_blocktxn(fd, pl, plen, g_push_blk, sizeof g_push_blk);
+    if(n > 0){ g_push_pending = 0; long r = dl_store_pushed_block(k, g_push_blk, (unsigned long)n, g_push_hash, "pushed compact block + blocktxn"); inflight_release_leg(&g_inflight, k); return r; }
+    if(n == 0) return 0;                                                /* the receiver fell back to a full-block getdata: the `block` comes through the sweep */
+    g_push_pending = 0; inflight_release_leg(&g_inflight, k); return -1;
+}
+static long leg_on_block(int fd, const unsigned char* pl, unsigned long plen){
+    int k = leg_of_fd(fd); if(k < 0 || plen < 81) return -1;
+    unsigned char bh[32]; sha256d(bh, pl, 80);
+    if(g_push_pending && !memcmp(bh, g_push_hash, 32)){ g_push_pending = 0; }
+    long h; if(ht_idx && idx_get(ht_idx, bh, &h)){ inflight_release_leg(&g_inflight, k); g_push_skipped_n++; return 0; }
+    long r = dl_store_pushed_block(k, pl, plen, bh, "pushed full block");
+    inflight_release_leg(&g_inflight, k);
+    return r;
+}
 static long do_outbound_sync(int i){
     /* STAGE B: a REAL multi-hash locator built fresh from our stored chain on
      * every pass, replacing the single-hash anchor. mux_out_loc[i] is still
@@ -6540,7 +6667,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
       /* 2026-09-09: bmc.cmpctrecv is gone -- a compact block that reconstructs badly falls back to a full one, as Core, so no valve is needed */
       g_cmpct_hook_type = (void*)cmpct_getdata_type; g_cmpct_hook_cmpct = (void*)cmpct_recv_cmpctblock; g_cmpct_hook_blocktxn = (void*)cmpct_recv_blocktxn; }
       { extern void* g_cmpct_hook_fallback; extern void cmpct_recv_note_fallback(void); g_cmpct_hook_fallback = (void*)cmpct_recv_note_fallback; }
-      { extern void (*txrelay_on_pong)(int, const unsigned char*); txrelay_on_pong = leg_on_pong; inflight_init(&g_inflight); g_block_fetch_hook = (void*)block_fetch_gate; }   /* 2026-09-09: pings and one request per block */   /* 2026-09-09: the full-block fallback is counted on the [cmpct] line */
+      { extern void (*txrelay_on_pong)(int, const unsigned char*); txrelay_on_pong = leg_on_pong; inflight_init(&g_inflight); g_block_fetch_hook = (void*)block_fetch_gate; }
+      { extern void (*txrelay_on_block_inv)(int, const unsigned char*); extern void (*txrelay_on_headers)(int, const unsigned char*, unsigned long);
+        extern long (*txrelay_on_cmpctblock)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_blocktxn)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_block)(int, const unsigned char*, unsigned long);
+        txrelay_on_block_inv = leg_on_block_inv; txrelay_on_headers = leg_on_headers; txrelay_on_cmpctblock = leg_on_cmpctblock; txrelay_on_blocktxn = leg_on_blocktxn; txrelay_on_block = leg_on_block; }   /* 2026-09-10: Core's shape at the tip */   /* 2026-09-09: pings and one request per block */   /* 2026-09-09: the full-block fallback is counted on the [cmpct] line */
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
     fprintf(stderr,"[dl] worker: chain archive reloaded: tip=%d (%.2fs)\n",
             *(int*)(store_buf+24), phase_elapsed(&dl_load_pt));
@@ -7623,6 +7753,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         long long now_ms = 0;
         { struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); now_ms = ts.tv_sec*1000L + ts.tv_nsec/1000000L; }
         int did=0;
+        int stored_break = 0; g_stored_now = 0;       /* 2026-09-10: a store ends the rotation early so the apply runs at once */
+        static int leg_start = 0;
         /* APPLY FIRST WHEN FAR BEHIND. The rotation below syncs every leg for
          * up to DL_BUDGET_SECS each before the UTXO catch-up step gets a turn
          * -- ~10 minutes with 7 legs and re-dials. That is the right order at
@@ -7682,7 +7814,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 : "[dl] UTXO backlog %ld -- resuming normal leg rotation\n", apply_backlog);
             apply_first_prev = apply_first;
         }
-        for(int i=0;i<mux_n_out;i++){
+        for(int n_=0;n_<mux_n_out;n_++){
+            int i = (leg_start + n_) % mux_n_out;
+            /* 2026-09-10: a leg whose peer announced a block we do not have
+             * goes first (its pass fetches it); this slot is revisited */
+            int announced_now = 0;
+            { int a = leg_announced_pick(-1); if(a >= 0){ announced_now = 1; if(a != i){ i = a; n_--; } } }
             if(g_shutdown_requested){
                 /* CC-4: remember the live block-relay-only legs for the next start */
                 const char* bo[MAX_BLOCK_RELAY_ONLY]; int nb = 0;
@@ -7784,7 +7921,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     }
                 }
             }
+            if(mux_out_fd[i]>=0 && mux_out_kind[i] == LEG_BLOCK_ONLY){ extern long txrelay_poll_block_only_leg(int); (void)txrelay_poll_block_only_leg(mux_out_fd[i]); }   /* 2026-09-10: block announcements from block-relay-only legs too */
+            if(g_stored_now) stored_break = 1;
             if(apply_first) continue;        /* see APPLY FIRST above */
+            if(!announced_now && mux_out_lastpass_ms[i] && now_ms - mux_out_lastpass_ms[i] < LEG_PASS_EVERY_MS) continue;   /* 2026-09-10: no polling for headers between announcements */
+            mux_out_lastpass_ms[i] = now_ms;
             /* A sync pass on this leg would feed any reply still owed to the
              * relay layer into .drain's discard. Skip it while replies are
              * pending (bounded: the relay layer forgets after 1.5 s). */
@@ -7808,6 +7949,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 mux_next_peer(i, srcpool, nsrc, out_port);
             }
             did |= (n>0)?1:0;
+            mux_out_announced[i] = 0;                          /* the pass consumed whatever was announced on this leg */
+            if(n>0){ leg_hb_note_block(i); stored_break = 1; }   /* 2026-09-10: a block landed -- apply now, the rest of the rotation waits */
             /* ---- STAGE B: periodic fork probe -----------------------------
              * Runs only on a leg that just returned NOTHING, which is exactly
              * the situation a fork hides in: if the peer is on a competing
@@ -7875,11 +8018,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               for(int k = 0; k < mux_n_out; k++){
                   if(k == i || mux_out_fd[k] < 0) continue;
                   if(mux_out_kind[k] != LEG_BLOCK_ONLY && txsub_worker_ready()){ extern long txrelay_poll_leg(int, void*, int); (void)txrelay_poll_leg(mux_out_fd[k], txsub_pool(), 0); }
+                  else if(mux_out_kind[k] == LEG_BLOCK_ONLY){ extern long txrelay_poll_block_only_leg(int); (void)txrelay_poll_block_only_leg(mux_out_fd[k]); }
                   if(!mux_out_good[k] && mux_out_since[k] && nowsec - mux_out_since[k] >= DM_GOOD_S){ mux_out_good[k] = 1; if(g_dialmem) dialmem_note_success(g_dialmem, mux_out_host[k]); }
                   leg_ping_tick(k, nowsec);
               }
               leg_ping_tick(i, nowsec); }
             /* brief yield so we don't spin a CPU core when all legs are idle */
+            if(g_stored_now) stored_break = 1;
+            if(stored_break){ leg_start = (i + 1) % mux_n_out; break; }   /* 2026-09-10: to the apply; the rotation resumes after this leg */
             if((i&1)==1){ usleep(20000); }
         }
         /* propagate this rotation's relay accepts: one inv per leg covering
