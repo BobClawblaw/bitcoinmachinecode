@@ -4,6 +4,28 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-10 — MAINNET IBD RUNNING on Apple Silicon
+
+- The native bmcbitcoind (M1 Max, macOS 26.6) is doing a real mainnet IBD
+  right now: 966,400 headers stored (headers.dat 108,236,800 B, ~29 min),
+  then blocks from genesis via the boot catch-up against the x86 reference
+  node (`connect=192.168.5.242:8332`, which is itself mid-IBD -- the osx
+  node follows its tail live). 115,401/966,400 stored (11.9%) at elapsed
+  5:01, ~460 blk/s, zero consensus failures. No debugger was usable on
+  this machine (lldb attach/launch permission-gated); the crash backtraces
+  came from macOS DiagnosticReports .ips files plus an in-worker
+  siginfo+backtrace handler.
+- Enabling commits: bc38f9e8 (the p2/p3 wave: syscall .S ports + C shims +
+  native build + the fixes below) and the diagnostics commit. Regtest IBD
+  end-to-end green first: fresh node B pulled 113 blocks from node A over
+  the wire (3 chunks, ~10s), UTXO applied 113/113, tip hashes identical.
+- Four port bugs the IBD path caught (details in worklog/2026-09-10.md):
+  three raw-svc sites still using the Linux nr-in-x8 convention
+  (idxscan flock x2, node_log openat -- SIGSYS/SIGSEGV roulette in the
+  worker), node_make_version's double-deref of _node_services (SIGSEGV at
+  0x809 in the probe handshake), and cons_twin txid_of_span's legacy-tx
+  strip offset + cap-semantics confusion (caught by test_cons).
+
 ## 2026-09-09 — secp256k1_taproot twin landed; bip341 gate scoped
 
 - **secp256k1_taproot -> taproot_twin.c** (C twin): tagged_hash256,

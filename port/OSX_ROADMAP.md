@@ -408,20 +408,76 @@ Heavy svc counts from the x86 .asm (measured 2026-09-09):
 - [x] bitcoin_store (51), bitcoin_utxo_store (31), bitcoin_utxo_lsm (65)
       (store/utxo_store/utxo_lsm landed as C twins through Darwin libc;
       the raw-svc tiers are subsumed -- the twins own these modules now)
-- [ ] bitcoin_idxscan (19), bitcoin_undo (17), bitcoin_store_fast (15)
+- [x] bitcoin_idxscan (19) -> port/osx/bitcoin_idxscan.S  DONE 2026-09-10.
+      Native AArch64 from origin/arm-port via adapt_armport.py +
+      fix_syscalls.py (openat 463, pread 153, lseek 199, close 6, flock 131;
+      nr in x16, svc #0x80). Gates: upstream bench_idxscan green native
+      against the live regtest archive (1.18-2.09x over the C baseline) +
+      the daemon path itself (116 mined+submitted blocks and the whole
+      regtest/mainnet IBD append through idxscan_append_locked). Two of
+      its flock sites initially kept the Linux nr-in-x8 convention -- the
+      SIGSYS/SIGSEGV roulette documented in OSX_STATE -- fixed to x16.
+- [x] bitcoin_undo (17) -> NO PORT NEEDED for the daemon: main.c links
+      daemon/undo_log.c (C, the rev*.dat/undo.idx store); bitcoin_undo.asm
+      is the optional perf module behind test_undo_asm_diff. Same
+      subsumption pattern as store. Revisit after p4 if the undo perf
+      path matters on macOS.
+- [x] bitcoin_store_fast (15) -> store_fast_twin.c (landed 2026-09-09).
 - [x] bitcoin_net (9: raw-socket syscalls, x86 arg4-in-R10 -> Darwin x3),
       bitcoin_headers (6), bitcoin_addrmgr (6), bitcoin_idx (5)
-- [ ] bitcoin_cli (2), bitcoind (2), node_log (1), bitcoin_serve (1)
+- [x] bitcoind (2), node_log (1), bitcoin_serve (1), bitcoin_mempool,
+      bitcoin_interp + bitcoin_scriptcodec + bitcoin_script_flags,
+      bitcoin_sigops, bitcoin_cmpct, bitcoin_strip_witness
+      -> port/osx/*.S  DONE 2026-09-10 (commit bc38f9e8), the wave that
+      links bmcbitcoind natively; gates = the daemon itself (regtest IBD
+      end-to-end + mainnet IBD in progress) with the upstream harnesses
+      still to be re-run per module where they link without x86-only
+      objects. node_log's openat and node_make_version's _node_services
+      are the two wave bugs the IBD path caught (see OSX_STATE).
+- [ ] bitcoin_cli (2) -- the wallet CLI (bmc_wallet_cli) builds and links
+      natively via build_wallet_cli.sh; its two raw syscalls route through
+      the same libc surface. Gate = a wallet round-trip against a running
+      osx node, still open.
 Darwin syscall deltas to apply per site: `svc #0x80`, nr in x16, args x0-x7,
 error = negative errno in x0 with carry set (b.cs); fdatasync sites that
 mean durability -> F_FULLFSYNC via fcntl; C shims (_bmcshim_*) only where no
 Darwin twin exists, each shim noted here with its justification.
+MECHANICAL-REWRITE RESIDUE: fix_syscalls.py missed sites where the nr load
+was not immediately adjacent to the svc (idxscan's two flock sites via x8,
+node_log's openat via w8). Audit rule for any future .S port: dump every
+svc site with its nr load and check the REGISTER, not just the number
+(port/osx/tests has no checker yet -- a 20-line awk over `svc` sites would
+have caught all three).
 
 ## Phase 3 — daemon
-- [ ] link all port/osx objects + daemon C into bmcbitcoind (macOS)
-- [ ] darwin_compat.h: prctl(PR_SET_PDEATHSIG)->fork-getppid poll,
+- [x] link all port/osx objects + daemon C into bmcbitcoind (macOS)
+      DONE 2026-09-10: build_daemon.sh compiles every daemon-referenced C
+      source and every port/osx object natively and links bmcbitcoind
+      (1.78 MB) + bmc_wallet_cli. bmcshim.c (getrandom ->
+      arc4random_buf) and darwin_stubs.c (malloc_info -> -1, robust
+      mutexes -> ENOTSUP) close the libc gap.
+- [x] darwin_compat.h: prctl(PR_SET_PDEATHSIG)->fork-getppid poll,
       prctl(PR_GET_NAME)->pthread_getname_np (coinstats_index.c, log_ts.h)
-- [ ] regtest IBD green, then signet/testnet4
+      DONE as port/osx/compat/sys/prctl.h (+ compat/malloc.h): PR_GET_NAME
+      -> pthread_getname_np, PDEATHSIG -> no-op with the daemon's existing
+      getppid re-check preserving the orphan-supervision property.
+- [x] regtest IBD green  DONE 2026-09-10: fresh node B (addnode under the
+      [regtest] section, listen=0) probed node A (listen=1), pulled 113
+      blocks over the wire in 3 chunks (~10s), archive committed in height
+      order, UTXO applied 113/113, tip hash identical to A's via
+      getblockchaininfo. Mining side: 116 blocks mined+submitted via
+      bmc_regtest_mine.py (getblocktemplate/submitblock) through the same
+      append path.
+- [x] mainnet IBD running  STARTED 2026-09-10: 966,400 headers stored
+      (~29 min), blocks from genesis against .242 (itself mid-IBD -- the
+      osx node follows its tail live), ~460 blk/s in the empty-block era,
+      zero consensus failures. WATCH: UTXO connect engages when the boot
+      catch-up hands off to the worker; completion bound by .242's own
+      progress, then wire speed.
+- [ ] signet/testnet4 IBD green
+- [ ] worker stability soak: the SIGSYS/SIGSEGV class is fixed, but the
+      download worker needs a multi-hour unattended run (the .242 IBD gives
+      one for free) with the DiagnosticReports directory monitored
 
 ## Phase 4 — parity
 - [ ] differential run vs x86 reference (Linux container on this Mac)
