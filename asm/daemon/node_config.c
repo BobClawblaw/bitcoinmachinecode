@@ -62,7 +62,7 @@ node_config_t g_cfg = {
     .download_rate_limit_kbps = 0,   /* bmc.downloadratelimit: off unless set */
     .coinstatshist_repair = 1, .coinstatshist_workers = 0, .esplora_port = 0, .esplora_bind = "127.0.0.1",
     .upload_rate_limit_kbps = 0,     /* bmc.uploadratelimit: off unless set */
-    .catchup_workers       = 64,     /* bmc.catchupworkers: at most this many peers download at once (2026-09-10: every live peer does, up to this) */
+    .catchup_workers       = 8,      /* bmc.catchupworkers: peers downloading at once. Core's MAX_OUTBOUND_FULL_RELAY_CONNECTIONS (2026-09-10) */
     .maxrecvbuffer_kb      = 5000,   /* Core -maxreceivebuffer default       */
     .maxmempool_mb         = 300,    /* Core -maxmempool default (MB)        */
     .mempoolexpiry_h       = 336,    /* Core -mempoolexpiry default (2 weeks)*/
@@ -354,7 +354,7 @@ static void set_defaults(void){
     g_cfg.blocksonly            = 0;
     g_cfg.bind_addr[0]          = 0;
     g_cfg.par                   = 0;
-    g_cfg.catchup_workers       = 64;
+    g_cfg.catchup_workers       = 8;
     g_cfg.dial_rate_limit       = 0;
     g_cfg.download_rate_limit_kbps = 0;
     g_cfg.upload_rate_limit_kbps = 0;
