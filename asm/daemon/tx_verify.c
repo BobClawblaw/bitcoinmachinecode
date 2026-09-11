@@ -246,9 +246,28 @@ typedef struct {
     u8  spk[TXV_SPK_CAP]; u32 spklen;
     u8  shape;
 } txv_rawin_t;
-static txv_rawin_t* g_txv_in; static u64 g_txv_in_cap;   /* grown per transaction in txv_parse */
+/* bmc_osx (testnet4 h=124,864, 2026-09-11): every arena below that a
+ * tx_verify entry path mutates is now __thread. The file-scope originals
+ * were shared across threads with NO lock: the connect thread runs
+ * tx_verify_block_connect_all (Phase 0 witness parse -> Phase 1 spk copies
+ * -> Phase 2 verify) while the SAME process's net thread runs
+ * tx_accept_validate -> tx_verify_mempool -> txv_parse on RELAYED
+ * transactions (orphan/1p1c resolution -- the worker does its own tx
+ * relay). txv_parse bump-resets g_wit_pool and bytepool_alloc grows
+ * g_spk_pool, so a mempool admission mid-connect reallocated/rewrote the
+ * pools the connect's Phase 1 had just filled: inputs classified against a
+ * real p2wpkh program verified against another transaction's spk bytes and
+ * witness lengths -> "p2wpkh signature invalid" / EQUALVERIFY rejects of
+ * consensus-valid blocks (testnet4 h=124,864; glibc's realloc rarely moves
+ * on Linux, macOS's moves near-always -- which is why the x86 deployment
+ * never saw it). glibc does NOT make this correct on Linux either; the
+ * race window is merely narrower. Thread-local arenas give every entry
+ * path private state; Phase 2 workers are already confined to READ-ONLY
+ * access of the dispatching thread's arenas (passed by parameter), and
+ * the sighash sessions were already __thread. */
+static __thread txv_rawin_t* g_txv_in; __thread u64 g_txv_in_cap;   /* grown per transaction in txv_parse */
 typedef struct { u8 ok; char reason[64]; } txv_result_t;
-static txv_result_t* g_txv_results; static u64 g_txv_results_cap;   /* grown with g_txv_in */
+static __thread txv_result_t* g_txv_results; __thread u64 g_txv_results_cap;   /* grown with g_txv_in */
 
 /* ---- VAL-10 / SER-3 (audit 2026-09-03): CANONICAL CompactSize ----
  *
@@ -291,7 +310,7 @@ static u64 txv_rd_cs(const u8** p, const u8* end, int* ok){
  * pointer handed to an earlier input). The item pointers themselves aim into
  * the tx bytes, which are stable for the block. Bump-reset per block/tx. */
 typedef struct { const u8** ptr; u32* len; u64 cap, used; } witpool_t;
-static witpool_t g_wit_pool = {0};
+static __thread witpool_t g_wit_pool = {0};
 /* Phase 2 slice 1 seam (2026-08-24): bitcoin_txv_parse.asm's twin of
  * txv_parse keeps pool GROWTH in C -- allocation is phase 3's boundary --
  * so the reserve gets a non-static name it can call. Same function. */
@@ -332,7 +351,7 @@ u64 txv_witpool_reserve(witpool_t* wp, u64 n){
  * (pool->buf + offset) only AFTER the pool is done growing, i.e. after the
  * resolve/build phase returns -- exactly when every current reader runs. */
 typedef struct { u8* buf; u64 cap; u64 used; } bytepool_t;
-static bytepool_t g_spk_pool = {0};
+static __thread bytepool_t g_spk_pool = {0};
 
 /* Reserve n uninitialised bytes; the caller writes them itself. Returns the
  * offset, or ~0ull on OOM. Callers must finish writing the region BEFORE the
@@ -663,9 +682,9 @@ static const u8* legacy_tx_view(const u8* tx, u64 txlen, u64* out_len){
  * one pool, since exactly one transaction is ever in flight here (that is the
  * whole premise of g_txv_in being a file-scope static). Separate from the
  * block path's pool so the two can never alias. */
-static bytepool_t g_t1_tap_pool = {0};
-static tapagg_t   g_t1_tap = {0};
-static int        g_t1_tap_built = 0;
+static __thread bytepool_t g_t1_tap_pool = {0};
+static __thread tapagg_t   g_t1_tap = {0};
+static __thread int        g_t1_tap_built = 0;
 
 /* Adapter: input k of the single-transaction path, resolved by pass 1. */
 static void t1_tapin(void* ctx, u64 k, const u8** outpoint, u64* value,
@@ -1222,8 +1241,9 @@ int tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
  * tx_verify_block_connect_all call. File-scope like every other arena here
  * (same single-threaded Phase-1 discipline); the caller reads it through
  * txvb_last_tx_in_sums immediately after a successful call. */
-static u64* g_tx_in_sums = 0;    static u64 g_tx_in_sums_cap = 0;
-static u64 g_tx_in_sums_n = 0;
+__thread u64 g_flat_cap = 0; __thread u64 g_res_cap = 0; __thread u64 g_ranges_cap = 0;
+static __thread u64* g_tx_in_sums = 0;    __thread u64 g_tx_in_sums_cap = 0;
+__thread u64 g_tx_in_sums_n = 0;
 const u64* txvb_last_tx_in_sums(u64* n_out){
     if (n_out) *n_out = g_tx_in_sums_n;
     return g_tx_in_sums;
@@ -1349,9 +1369,9 @@ typedef struct { u64 lo, hi; } txvb_txrange_t;
  * (indexed by block position, so ntx entries; only taproot-bearing
  * transactions are ever filled in or read). Written by Phase 1.5 only;
  * strictly read-only from the moment Phase 2 dispatches. */
-static bytepool_t       g_tap_pool = {0};
-static tapagg_t*        g_tapdesc = 0;
-static u64              g_tapdesc_cap = 0;
+static __thread bytepool_t       g_tap_pool = {0};
+static __thread tapagg_t*        g_tapdesc = 0;
+static __thread u64              g_tapdesc_cap = 0;
 
 /* Parses ONE tx's inputs (+ witnesses) into flat[base..base+nin), mirroring
  * txv_parse's own CompactSize decode exactly (reuses txv_rd_cs directly --
@@ -1553,8 +1573,8 @@ typedef struct {
 
 static txvb_worker_slot_t g_txvb_pool[TXVB_MAX_WORKERS];
 static int g_txvb_pool_size = 0;
-static sem_t g_txvb_done_sem;
-static int g_txvb_done_sem_ready = 0;
+static __thread sem_t g_txvb_done_sem;
+static __thread int g_txvb_done_sem_ready = 0;
 
 /* Loops forever -- these workers live for the process's whole lifetime,
  * same as this codebase's convention elsewhere of never gracefully
@@ -1673,7 +1693,7 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
  * accumulates (nSigOpsCost += GetTransactionSigOpCost(tx, view, flags);
  * reject bad-blk-sigops above MAX_BLOCK_SIGOPS_COST=80,000). Same file-scope
  * single-threaded export discipline as the VAL-1 fees ledger. */
-static u64* g_tx_sigops = 0;  static u64 g_tx_sigops_cap = 0;  static u64 g_tx_sigops_n = 0;
+static __thread u64* g_tx_sigops = 0;  __thread u64 g_tx_sigops_cap = 0;  __thread u64 g_tx_sigops_n = 0;
 unsigned long long* txvb_last_tx_sigops(unsigned long long* n){ if(n) *n = g_tx_sigops_n; return (unsigned long long*)g_tx_sigops; }
 
 /* VAL-4 / BIP68 (audit 2026-09-03): the per-input prevout CREATION HEIGHTS,
@@ -1687,8 +1707,8 @@ unsigned long long* txvb_last_tx_sigops(unsigned long long* n){ if(n) *n = g_tx_
  * re-resolving them in the caller would mean duplicating the bidx/LSM
  * precedence rule, which is exactly the kind of second implementation that
  * drifts. Same seam as txvb_last_tx_sigops. */
-static u64* g_in_height = 0;  static u64 g_in_height_cap = 0;  static u64 g_in_height_n = 0;
-static u32* g_in_txidx  = 0;  static u64 g_in_txidx_cap  = 0;
+static __thread u64* g_in_height = 0;  __thread u64 g_in_height_cap = 0;  __thread u64 g_in_height_n = 0;
+static __thread u32* g_in_txidx  = 0;  __thread u64 g_in_txidx_cap  = 0;
 unsigned long long* txvb_last_in_heights(unsigned long long* n, unsigned int** txidx){
     if (n) *n = g_in_height_n;
     if (txidx) *txidx = g_in_txidx;
@@ -1911,9 +1931,9 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         }
     }
 
-    static txvb_in_t* g_flat = 0;        static u64 g_flat_cap = 0;
-    static txvb_result_t* g_res = 0;     static u64 g_res_cap = 0;
-    static txvb_txrange_t* g_ranges = 0; static u64 g_ranges_cap = 0;
+    static __thread txvb_in_t* g_flat = 0;        /* caps are file-scope __thread (TLV storage rule) */
+    static __thread txvb_result_t* g_res = 0;
+    static __thread txvb_txrange_t* g_ranges = 0;
     /* g_spk_pool is file-scope (see its own comment, near bytepool_alloc) --
      * txvb_verify_one and the taproot pass below both need to resolve
      * spk_off against it too, not just this function. */
