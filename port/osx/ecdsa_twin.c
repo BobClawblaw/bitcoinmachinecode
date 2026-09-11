@@ -10,6 +10,8 @@
  * flow (which decides WHERE each intermediate lives) matches exactly.
  * -------------------------------------------------------------------------- */
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef uint64_t u64;
@@ -32,9 +34,15 @@ static const u64 N_LIMBS[4] = {
     0xBFD25E8CD0364141ULL, 0xBAAEDCE6AF48A03BULL,
     0xFFFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL
 };
-/* p - n, little-endian limbs */
+/* p - n, little-endian limbs.
+ * BUG FIX (bmc_osx, 2026-09-11, same session as the dead-second-branch fix
+ * below): this table read 0x402DA1732FC9BEBF -- two digit transcriptions
+ * off from the x86 asm's 0x402DA1722FC9BAEE (secp256k1_ecdsa.asm PMN_LIMBS,
+ * verified against python p-n). The wrong bound made the second-branch gate
+ * admit r in [p-n_true, p-n_twin), whose r+n overflows p -- and combined
+ * with the dead branch it never mattered before; pin both here. */
 static const u64 PMN_LIMBS[4] = {
-    0x402DA1732FC9BEBFULL, 0x4551231950B75FC4ULL,
+    0x402DA1722FC9BAEEULL, 0x4551231950B75FC4ULL,
     0x0000000000000001ULL, 0x0000000000000000ULL
 };
 
@@ -59,16 +67,37 @@ int ecdsa_x_eq_mod_n(const u64 r[4], const u64 X[4], const u64 Z[4])
     if (lhs[0] == X[0] && lhs[1] == X[1] &&
         lhs[2] == X[2] && lhs[3] == X[3])
         return 1;
-
-    /* second candidate only if r < p - n (then r + n < p) */
-    if (!(r[3] < PMN_LIMBS[3])) return 0;   /* x86: jb .lt / ja .no */
-    if (r[3] == PMN_LIMBS[3]) {
-        if (r[2] < PMN_LIMBS[2]) goto lt;
-        if (r[2] > PMN_LIMBS[2]) return 0;
-        if (r[1] < PMN_LIMBS[1]) goto lt;
-        if (r[1] > PMN_LIMBS[1]) return 0;
-        if (r[0] >= PMN_LIMBS[0]) return 0;
+    if (getenv("BMC_ECDSADBG")) {
+        fprintf(stderr, "[xmod] primary: lhs1=%016llx%016llx%016llx%016llx r=%016llx%016llx%016llx%016llx\n",
+            (unsigned long long)lhs[3],(unsigned long long)lhs[2],(unsigned long long)lhs[1],(unsigned long long)lhs[0],
+            (unsigned long long)r[3],(unsigned long long)r[2],(unsigned long long)r[1],(unsigned long long)r[0]);
     }
+
+    /* second candidate only if r < p - n (then r + n < p).
+     *
+     * BUG FIX (bmc_osx, testnet4 h=126,683 tx=93, 2026-09-11): the first
+     * cut translated the x86 chain as `if (!(r[3] < PMN[3])) return 0;` --
+     * which RETURNS on r[3] == PMN[3], where the x86 falls through to the
+     * next limb (jb .lt / ja .no / fall). PMN[3] is 0, so every r with
+     * r[3] == 0 -- i.e. EVERY r small enough for the second branch to be
+     * reachable at all -- took the early return: the r+n branch was DEAD
+     * CODE and ecdsa_x_eq_mod_n rejected every valid signature whose
+     * R.x (affine) landed in [n, p) instead of [0, n). A uniformly random
+     * differential vector hits that band with probability (p-n)/p ~ 2^-127,
+     * which is why 1200+ random records plus every harness vector agreed
+     * with the x86 while real blocks did not. h=126,683 tx=93 carries a
+     * CONSTRUCTED signature (sha256 of a brute-forced 16-byte preimage is a
+     * valid DER signature -- r is 10 bytes, s is 15 bytes) whose R.x sits in
+     * the [n, p) band; the x86 verifies it, the twin returned
+     * SCRIPT_ERR_EVAL_FALSE and the block was invalidated. False-negative
+     * only (the bug rejects, never accepts). */
+    if (r[3] < PMN_LIMBS[3]) goto lt;
+    if (r[3] > PMN_LIMBS[3]) return 0;
+    if (r[2] < PMN_LIMBS[2]) goto lt;
+    if (r[2] > PMN_LIMBS[2]) return 0;
+    if (r[1] < PMN_LIMBS[1]) goto lt;
+    if (r[1] > PMN_LIMBS[1]) return 0;
+    if (r[0] >= PMN_LIMBS[0]) return 0;
 lt:
     /* cand = r + n (mod 2^256), plain adc chain */
     unsigned carry = 0;
@@ -81,6 +110,13 @@ lt:
     if (lhs[0] == X[0] && lhs[1] == X[1] &&
         lhs[2] == X[2] && lhs[3] == X[3])
         return 1;
+    if (getenv("BMC_ECDSADBG")) {
+        fprintf(stderr, "[xmod] X   =%016llx%016llx%016llx%016llx\n",
+            (unsigned long long)X[3],(unsigned long long)X[2],(unsigned long long)X[1],(unsigned long long)X[0]);
+        fprintf(stderr, "[xmod] lhs2=%016llx%016llx%016llx%016llx cand=%016llx%016llx%016llx%016llx\n",
+            (unsigned long long)lhs[3],(unsigned long long)lhs[2],(unsigned long long)lhs[1],(unsigned long long)lhs[0],
+            (unsigned long long)cand[3],(unsigned long long)cand[2],(unsigned long long)cand[1],(unsigned long long)cand[0]);
+    }
     return 0;
 }
 
