@@ -36,6 +36,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -413,8 +416,21 @@ static void compact_flush_hook(void){
 static u64 g_run_budget = ~0ULL;
 u64 utxo_live_run_budget(void){
     if (g_run_budget != ~0ULL) return g_run_budget;
-    u64 kb = 0; FILE* f = fopen("/proc/meminfo", "r");
+    u64 kb = 0;
+#ifdef __APPLE__
+    /* bmc_osx: /proc/meminfo is Linux-only. With kb=0 the budget came out 0
+     * and lsm_compact_pick_budget treated EVERY run as over budget -- a
+     * near-full background compaction forked on practically every flush,
+     * which is how the first testnet4 IBD walked into the 2026-09-01
+     * incident class (store answered two different things right after a
+     * flush). hw.memsize is the same number in bytes. */
+    size_t sz = sizeof kb;
+    if (sysctlbyname("hw.memsize", &kb, &sz, NULL, 0) != 0) kb = 0;
+    kb /= 1024;
+#else
+    FILE* f = fopen("/proc/meminfo", "r");
     if (f){ char line[128]; while (fgets(line, sizeof line, f)) if (!strncmp(line, "MemTotal:", 9)){ kb = strtoull(line + 9, NULL, 10); break; } fclose(f); }
+#endif
     /* 35%, not 45%: on the 63 GB box the worker itself holds ~16 GB of anonymous
      * flush scratch plus the file-backed memtable, and at 25.7 GB of runs (4 runs)
      * lookups were already faulting from disk (2026-09-01 18:09, 3-12 blk/s). */
@@ -815,8 +831,8 @@ static void live_on_input(void* ctxv, const u8 txid[32], u32 index){
          * block's undo records), the failure is classified as a store error, and
          * the node retries from the checkpoint -- loudly, never silently. */
         if (r == 0) {
-            fprintf(stderr, "[utxo_live] FATAL h=%ld: prevout resolved by verification is ABSENT at apply (store lookup inconsistency) -- failing the block\n",
-                    g_apply_height);
+            fprintf(stderr, "[utxo_live] FATAL h=%ld: prevout resolved by verification is ABSENT at apply (store lookup inconsistency) outpoint=%02x%02x%02x%02x%02x%02x%02x%02x:%u -- failing the block\n",
+                    g_apply_height, txid[0],txid[1],txid[2],txid[3],txid[4],txid[5],txid[6],txid[7], index);
             g_store_inconsistent = 1;
             g_halted = 1;          /* nothing below (rollback, retry, recovery) can trust a lookup now */
             ctx->fatal = 1;
