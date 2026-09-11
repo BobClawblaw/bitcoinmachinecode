@@ -3,13 +3,27 @@
  * ELF TLS.  Mach-O TLV is accessed from the asm through the
  * C getters below (cross-object @TLVPPAGE from hand-written
  * asm does not get the TLV fixup kind -- see OSX_ROADMAP). */
+#include <stdint.h>
+#include <stdlib.h>
 __thread unsigned char scriptnum_buf[16];
 __thread unsigned char snum_overflow[8];
 __thread unsigned char elem_tmp0[528];
 __thread unsigned char elem_tmp1[528];
 __thread unsigned char elem_tmp2[528];
 __thread unsigned char elem_tmp3[528];
-__thread unsigned char vfexec[0];
+/* vfexec was generated as a ZERO-SIZE array: the x86 module reserves
+ * VFEXEC_MAX (5 MiB) for it in .tbss, but the adapt script could not carry
+ * the size through, and for a zero-length __thread object &vfexec aliases
+ * the NEXT TLS variable -- vfexec_sp. Every condition byte the interpreter
+ * wrote (IF/ELSE toggles) therefore landed on vfexec_sp\'s low byte:
+ * a TRUE condition at depth 1 survived by luck (writing 0x01 over 0x01),
+ * an ELSE toggle wrote 0x00 over depth 1 -> depth 0 -> "UNBALANCED
+ * CONDITIONAL" at the ENDIF (testnet4 h=123,615, tx#57/62 -- real blocks,
+ * found by the UTXO connect after the radix/tie-break fixes unblocked it).
+ * The buffer is now a lazily-allocated per-thread heap block behind the
+ * existing getter, zero-filled to match the x86 .tbss semantics. */
+static __thread uint8_t* vfexec_ptr;
+#define VFEXEC_MAX_BYTES (5*1024*1024)
 __thread unsigned char vfexec_sp[8];
 __thread unsigned char vfexec_ff[8];
 __thread unsigned char hnd_base[8];
@@ -22,7 +36,10 @@ void *tls_get__elem_tmp0(void) { return elem_tmp0; }
 void *tls_get__elem_tmp1(void) { return elem_tmp1; }
 void *tls_get__elem_tmp2(void) { return elem_tmp2; }
 void *tls_get__elem_tmp3(void) { return elem_tmp3; }
-void *tls_get__vfexec(void) { return vfexec; }
+void *tls_get__vfexec(void) {
+    if (!vfexec_ptr) vfexec_ptr = calloc(1, VFEXEC_MAX_BYTES);
+    return vfexec_ptr;
+}
 void *tls_get__vfexec_sp(void) { return vfexec_sp; }
 void *tls_get__vfexec_ff(void) { return vfexec_ff; }
 void *tls_get__hnd_base(void) { return hnd_base; }

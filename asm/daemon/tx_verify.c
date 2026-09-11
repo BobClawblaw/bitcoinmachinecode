@@ -515,6 +515,8 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
     g_wit_pool.used = 0;   /* bump-reset for this tx's witness items */
     p += 4; /* version */
     int segwit = (p+2<=end && p[0]==0x00 && p[1]==0x01);
+    if (getenv("BMC_TXVDBG")) fprintf(stderr, "[txvdbg] txlen=%llu segwit=%d b4=%02x%02x%02x%02x%02x%02x\n",
+        (unsigned long long)txlen, segwit, tx[0],tx[1],tx[2],tx[3],tx[4],tx[5]);
     if (segwit) p += 2;
     u64 nin = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad n_in varint"; return 0; }
     if (nin == 0) { *reason = "input count out of bounds"; return 0; }
@@ -1365,6 +1367,8 @@ static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
     if (txlen < 10) { *reason = "tx too short"; return 0; }
     p += 4;
     int segwit = (p+2<=end && p[0]==0x00 && p[1]==0x01);
+    if (getenv("BMC_TXVDBG")) fprintf(stderr, "[txvdbg] txlen=%llu segwit=%d b4=%02x%02x%02x%02x%02x%02x\n",
+        (unsigned long long)txlen, segwit, tx[0],tx[1],tx[2],tx[3],tx[4],tx[5]);
     if (segwit) p += 2;
     u64 nin = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad n_in varint"; return 0; }
     if (nin == 0) { *reason = "input count out of bounds"; return 0; }
@@ -1385,6 +1389,15 @@ static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
         e->scriptSig = p; e->scriptSiglen = (u32)sl;
         p += sl + 4;
         e->nwit = 0;
+        e->wprog = 0; e->wprog_off = 0; e->wproglen = 0; e->wrapped = 0;
+        /* bmc_osx (testnet4 h=124,845): wprog MUST be reset with tap_desc --
+         * the flat arena is reused across blocks, and a stale non-NULL wprog
+         * from the PREVIOUS block's occupant of this slot made the WV0 case
+         * prefer the stale pointer over the offset-based re-derivation
+         * (spk_pool.buf + spk_off + wprog_off), hashing a garbage scriptCode
+         * -> "p2wpkh signature invalid" / "p2wsh script verification failed"
+         * on valid blocks. tap_desc got exactly this reset for exactly this
+         * reason; wprog was missed. */
         e->tap_desc = ~0ull;   /* filled by Phase 1.5 iff this turns out to
                                 * be a taproot input; a stale value from the
                                 * PREVIOUS block's flat array would otherwise
@@ -1471,9 +1484,13 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
         int err = sv_verify_witness_v0(wprog, in->wproglen, in->wit, in->witlen, in->nwit,
                                        in->value, flags, (unsigned long)in->local_idx, tx, txlen, sv_work, sv_workcap);
         if (err != 0) {
-            fprintf(stderr, "[dbg-wv0] FAIL local_idx=%lu err=%d wproglen=%u value=%llu nwit=%u wit0len=%u\n",
+            fprintf(stderr, "[dbg-wv0] FAIL local_idx=%lu err=%d wproglen=%u value=%llu nwit=%u spk_off=%u SPKFULL=",
                     (unsigned long)in->local_idx, err, (unsigned)in->wproglen, (unsigned long long)in->value,
-                    in->nwit > 0 ? in->witlen[0] : 0, in->nwit > 1 ? in->witlen[1] : 0);
+                    (unsigned)in->nwit, (unsigned)in->spk_off);
+            for (int dz=0; dz<34; dz++) fprintf(stderr, "%02x", spk[dz]);
+            fprintf(stderr, " witlens=");
+            for (u32 dz=0; dz<in->nwit && dz<8; dz++) fprintf(stderr, "%u,", in->witlen[dz]);
+            fprintf(stderr, "\n");
             *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0;
         }
         return 1;
