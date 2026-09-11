@@ -16,6 +16,7 @@
 typedef uint64_t u64;
 typedef uint32_t u32;
 typedef uint16_t u16_t;
+#include <stdio.h>
 typedef unsigned char u8;
 
 extern long tx_parse(u64 info[8], const void *tx, u64 txlen);
@@ -74,6 +75,16 @@ static int txid_of_span(const u8* tx, u64 txlen, u8 out[32], u8* scratch, u64 ca
               }
           }
       }
+      body = (u64)(q - tx);                /* END OF OUTPUTS = the witness start
+                                            * for segwit, txlen-4 for legacy.
+                                            * MUST be taken BEFORE the witness
+                                            * skip: after it q points past the
+                                            * witness and the "stripped" form
+                                            * would include the witness stacks
+                                            * (found by the testnet4 IBD: every
+                                            * segwit block failed cons_verify;
+                                            * the /tmp/ibd_bad_*.bin dumps +
+                                            * a python hand-hash pinned it). */
       if (hdr == 6){                       /* segwit: skip the witness stacks */
           for (u64 i = 0; i < nin; i++){
               if (q >= end) return 0;
@@ -93,7 +104,6 @@ static int txid_of_span(const u8* tx, u64 txlen, u8 out[32], u8* scratch, u64 ca
       } else {
           if (end - q != 4) return 0;      /* legacy: only the locktime remains */
       }
-      body = (u64)(q - tx);
     }
     /* stripped = version(4) || [n_in varint .. outs_end) || locktime(4)
      * body = offset of the witness section (= end of outputs; == txlen-4 for
