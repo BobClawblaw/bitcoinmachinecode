@@ -18,6 +18,8 @@
  * returned early in between.
  */
 #include <string.h>
+#include <stdlib.h>
+#include "bmc_thread.h"
 #include "signet.h"
 #include "signet_block.h"
 
@@ -200,16 +202,17 @@ long signet_check_block(const void* txs, unsigned long ntx, unsigned long stride
         *reason = "bad-signet-no-commitment"; return 0;
     }
 
-    static __thread u8 sol[4096], stripped[4096];
+    static __thread u8* sol;   BMC_TLS_BUF(sol, 4096);
+    static __thread u8* stripped; BMC_TLS_BUF(stripped, 4096);
     u64 sol_len = 0, stripped_len = 0;
     int found = signet_extract_solution(spk, spk_len, sol, &sol_len,
-                                        stripped, &stripped_len, sizeof sol);
+                                        stripped, &stripped_len, 4096);
     if (found < 0){ *reason = "bad-signet-commitment-malformed"; return 0; }
     if (!found){
         /* No solution section: the commitment stands unmodified, and the
          * challenge had better be one that needs no signature. */
         stripped_len = spk_len;
-        if (spk_len > sizeof stripped){ *reason = "bad-signet-commitment-size"; return 0; }
+        if (spk_len > 4096){ *reason = "bad-signet-commitment-size"; return 0; }
         memcpy(stripped, spk, spk_len);
     }
 
