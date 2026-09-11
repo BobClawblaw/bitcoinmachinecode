@@ -4,6 +4,30 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-11 (late II) — vfexec zero-size TLS: the real tapscript root cause; one WV0 divergence left
+
+- The h=123,615 tapscript failure was NOT the script_eval semantics: the
+  generated TLS header had `__thread unsigned char vfexec[0]` — a
+  zero-length condition stack whose writes ALIASED vfexec_sp (the next
+  TLS variable). Every OP_IF/ELSE toggle wrote the condition byte over
+  the depth: TRUE at depth 1 survived by luck; the OP_ELSE toggle wrote
+  0x00 over depth 1 → UNBALANCED_CONDITIONAL at ENDIF. Fixed (ddb687d3):
+  vfexec is a lazily-allocated per-thread heap block behind the getter.
+  h=123,615 now PASSES; the p2wsh/p2tr driver passes 88/88 (x86 parity);
+  the whole script-VM gate set is green.
+- NEW divergence found by the continuing connect: h=124,032 and h=124,845
+  fail with "p2wpkh signature invalid"/"p2wsh script verification failed"
+  (err=2 EVAL_FALSE) — witness-v0 scripts with ZERO-LENGTH initial-stack
+  elements (witness {empty,empty,empty,71B-DER-sig,121B-script};
+  x86 verifies the same block). The checksig stub differential shows the
+  twin's CHECKSIG receiving sig DATA=zeros with the RIGHT length — the
+  stack element handling around zero-length elements diverges from the
+  x86 inside script_eval (the harness also crashes in hnd_end's cycle
+  walk — a second symptom of the same element-move class). This is the
+  one remaining consensus-path blocker; the reproducer is
+  /tmp/wv0_dbg.c (script+stack from block 124,845 tx#167, stub checksig,
+  SIGV_WITNESS_V0) against the ported interp objects.
+
 ## 2026-09-11 (late) — the last known consensus blocker: one tapscript divergence
 
 - testnet4 chain IBD complete (151,869 headers+blocks stored, verified);
