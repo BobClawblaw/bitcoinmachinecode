@@ -1,5 +1,6 @@
 #include <string.h>
 #include <time.h>
+#include <poll.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include "ibd_pipeline.h"
@@ -47,6 +48,31 @@ static long g_last_batch = 0; static int g_last_fail = 0;
 static long long g_wait_ms = 0, g_wall_ms = 0;
 long ibd_pipeline_last_wait_ms(void){ return g_wait_ms; }
 long ibd_pipeline_last_wall_ms(void){ return g_wall_ms; }
+/* How long this socket had NOTHING to give us, in milliseconds.
+ *
+ * IDLE IS THE TIME BEFORE THE FIRST BYTE, NOT THE TIME INSIDE THE READ. The
+ * first cut of this timed the whole p2p_read call, which also RECEIVES the
+ * message -- a 1.4 MB block at a peer's 1.2 MB/s is most of a second of
+ * productive transfer -- so it reported 99% and said nothing. Run 23 printed
+ * "pool idle 99%" within ten minutes of starting, which is how it was caught.
+ *
+ * The question the number answers is "is this peer keeping the pipe full?", so
+ * only the stretch with nothing on the socket counts. A zero-timeout poll
+ * separates the two for free: bytes already waiting means there was no idle.
+ * The blocking poll is bounded so a dead peer still reaches the caller's alarm
+ * rather than sitting here. */
+static long long ibd_now_ms(void);
+long ibd_idle_before_read(int fd)
+{
+    struct pollfd pfd;
+    long long t0;
+    pfd.fd = fd; pfd.events = POLLIN; pfd.revents = 0;
+    if (poll(&pfd, 1, 0) != 0) return 0;        /* data already there: not idle */
+    t0 = ibd_now_ms();
+    (void)poll(&pfd, 1, 1000);
+    return (long)(ibd_now_ms() - t0);
+}
+
 static long long ibd_now_ms(void){
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000;
@@ -114,9 +140,19 @@ long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long n
             sent_to += take;
         }
         char cmd[12]; unsigned len = 0;
-        long long rd_t0 = ibd_now_ms();
+        /* IDLE IS THE TIME BEFORE THE FIRST BYTE, NOT THE TIME INSIDE THE READ.
+         *
+         * The first cut of this timed the whole p2p_read call. That call also
+         * RECEIVES the message -- a 1.4 MB block at a peer's 1.2 MB/s is most
+         * of a second of productive transfer -- so the figure came out at 99%
+         * and said nothing. (Seen immediately on run 23: "pool idle 99%".)
+         *
+         * What the number is supposed to answer is "is this peer keeping the
+         * pipe full?", so it must count only the stretch where the socket has
+         * NOTHING to give us. poll() with a zero timeout distinguishes the two
+         * for free: if bytes are already waiting, there was no idle at all. */
+        g_wait_ms += ibd_idle_before_read(fd);
         int r = p2p_read(fd, cmd, buf, buflen, &len);
-        g_wait_ms += ibd_now_ms() - rd_t0;
         if (r <= 0){ why = IBD_FAIL_READ; goto fail; }
         if (!strncmp(cmd, "ping", 12) && len == 8){ p2p_write(fd, "pong", 4, buf, 8); continue; }
         if (strncmp(cmd, "block", 12) != 0) continue;         /* inv, addr, feefilter, ... */

@@ -42,6 +42,9 @@ long ibd_pipeline_last_batch(void);
  * whose peer cannot fill the pipe, and that is the difference between "add
  * peers" and "make the code faster" -- see docs/CORE_DIVERGENCES.md row 2. */
 long ibd_pipeline_last_wait_ms(void);
+/* milliseconds this socket had nothing to give -- measured BEFORE the read, so
+ * it counts waiting and not the transfer itself. Exposed for its own test. */
+long ibd_idle_before_read(int fd);
 long ibd_pipeline_last_wall_ms(void);
 /* test/bench seam: hashes per getdata. 0 (the default) means the whole chunk
  * in one message. 1 reproduces the serial shape node_ibd_blocks_s had -- ask

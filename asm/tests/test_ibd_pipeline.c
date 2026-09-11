@@ -18,6 +18,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <stdlib.h>
 #include "ibd_pipeline.h"
 
@@ -227,12 +229,41 @@ int main(void){
      * a peer that cannot fill the pipe is active and idle at once. The fetch
      * now reports both clocks so the ratio is in the log, and this pins that
      * they are both real and correctly ordered. */
-    reset(); order_forward(); g_read_delay_us = 2000;          /* 2 ms per block: 40 blocks -> ~80 ms of waiting */
+    reset(); order_forward(); g_read_delay_us = 2000;
     r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
     long wait_ms = ibd_pipeline_last_wait_ms(), wall_ms = ibd_pipeline_last_wall_ms();
     ok(r == NB, "occupancy: the chunk completed");
-    ok(wait_ms >= 40, "a peer that takes 2 ms a block is MEASURED as waiting, not reported as busy");
-    ok(wait_ms <= wall_ms, "time blocked in the read cannot exceed the chunk's whole wall clock");
+    ok(wait_ms <= wall_ms, "time waiting cannot exceed the chunk's whole wall clock");
+    /* THE DISCRIMINATOR. The stub spends 2 ms per block INSIDE the read, which
+     * is transfer, not idle. The first cut of this timed the whole p2p_read
+     * call and so counted every one of those milliseconds as waiting -- it
+     * reported "pool idle 99%" on run 23 within ten minutes of starting. Idle
+     * must be a small fraction of a chunk whose time went into receiving. */
+    ok(wall_ms >= 40, "the fixture really did spend time in the reads");
+    ok(wait_ms * 2 < wall_ms, "transfer time is NOT counted as idle (the 99% bug counted all of it)");
+
+    /* THE MEASUREMENT ITSELF, against a real socket.
+     *
+     * The first cut timed the whole p2p_read call. That call also RECEIVES the
+     * message, so the figure came out at 99% and said nothing -- run 23 printed
+     * "pool idle 99%" ten minutes in, which is how it was caught. Idle has to be
+     * the stretch BEFORE the first byte, and only a real descriptor can show
+     * the difference. */
+    {
+        int sv[2];
+        ok(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair for the idle test");
+
+        /* bytes already waiting: not idle, and the call must not block */
+        ok(write(sv[1], "x", 1) == 1, "peer has already sent something");
+        long none = ibd_idle_before_read(sv[0]);
+        ok(none == 0, "a socket with bytes ready reports NO idle (the 99% bug reported the transfer as idle)");
+
+        /* drain, then make it wait: a quiet socket is idle, and it is measured */
+        char sink[8]; ok(read(sv[0], sink, 1) == 1, "drained");
+        long idle = ibd_idle_before_read(sv[0]);
+        ok(idle >= 900, "a silent peer's wait is measured (bounded poll, so ~1000 ms)");
+        close(sv[0]); close(sv[1]);
+    }
 
     /* A chunk that FAILS must still close its wall clock. Without that, the
      * fail path leaves wall at the zero set on entry while wait carries real
@@ -244,7 +275,13 @@ int main(void){
     reset(); order_forward(); g_norder = 7; g_read_delay_us = 2000;
     r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
     ok(r < 0, "the chunk failed, as the fixture intends");
-    ok(ibd_pipeline_last_wait_ms() >= 8, "the failed chunk's waiting was measured");
+    /* This used to assert the failed chunk had MEASURED WAITING. That assertion
+     * encoded the bug: it only held because the old code timed the whole read,
+     * including the transfer. With idle measured before the first byte, a
+     * fixture whose descriptor is not a real socket has no idle to report, and
+     * demanding some would be demanding the wrong number back. What must hold
+     * on the failure path is that the clocks are closed and consistent. */
+    ok(ibd_pipeline_last_wall_ms() > 0, "the failed chunk still reports a wall clock");
     ok(ibd_pipeline_last_wait_ms() <= ibd_pipeline_last_wall_ms(),
        "and its wall clock was closed on the failure path, so the ratio stays sane");
     g_read_delay_us = 0;
