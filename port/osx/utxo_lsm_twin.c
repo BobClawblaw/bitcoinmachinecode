@@ -121,6 +121,16 @@ static u8 mac_fl_buf[MAC_FLBUF];
 static u64 mac_compact_defer_unlink, mac_compact_defer_publish;
 static void *mac_flush_hook;
 static u64 mac_cr_lo, mac_cr_k;
+/* 1 = radix (default, x86 parity). The MSD tie-break (key bytes 12..35,
+ * buckets <= RS_INS_MAX) had its comparison direction INVERTED -- it sorted
+ * same-txid tie groups descending, so a txid with enough outputs to put two
+ * records in one <=32-entry bucket came out of the flush with those records
+ * out of order and every point lookup past the inversion missed (testnet4
+ * h=51859, found via the ibd_pipeline dumps + a python hand-hash of the
+ * stripped run). Fixed to mac_rs_gt's direction (prev > hold -> shift) and
+ * verified with a same-txid sorter test at N=2..20000 (port/osx/tests
+ * candidate; the 229-record differential could not see this -- its vectors
+ * never tie on the 96 compact bits). */
 static u64 mac_sort_mode = 1;                /* 1 = radix (default) */
 static u64 mac_rs_a, mac_rs_final;
 static u8 mac_rs_counts[RS_MAX_DEPTH * RS_CNT_BYTES];
@@ -337,7 +347,17 @@ static void mac_rsort_rec(u8 *src, u8 *dst, u64 n, u32 bitoff, unsigned depth)
                     if (lo_p > lo_h) gt = 1;
                     else if (lo_p < lo_h) gt = 0;
                     else {
-                        /* 96-bit tie: key bytes 12..35 via the descriptors */
+                        /* 96-bit tie: key bytes 12..35 via the descriptors.
+                         * gt means "prev > hold" (shift), matching the hi/lo
+                         * comparisons above -- a[k] is PREV's byte, b[k] is
+                         * HOLD's. The first cut had the direction inverted
+                         * (b>a -> shift), which sorted same-txid tie groups
+                         * DESCENDING: any txid with enough outputs that two
+                         * landed in one <=32-entry bucket had its records
+                         * out of order in the run, and every point lookup
+                         * past the inversion missed (testnet4 h=51859). The
+                         * x86 tie groups go through mac_rs_gt, which compares
+                         * prev>hold. */
                         u32 pi, hi_i;
                         memcpy(&pi, prev + 8, 4);
                         memcpy(&hi_i, hold + 8, 4);
@@ -346,8 +366,8 @@ static void mac_rsort_rec(u8 *src, u8 *dst, u64 n, u32 bitoff, unsigned depth)
                         const u8 *b = dp + (u64)hi_i * 64 + 12;
                         gt = 0;
                         for (int k = 0; k < 24; k++) {
-                            if (b[k] > a[k]) { gt = 1; break; }
-                            if (b[k] < a[k]) break;
+                            if (a[k] > b[k]) { gt = 1; break; }
+                            if (a[k] < b[k]) break;
                         }
                     }
                 }
