@@ -4,6 +4,70 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-11 (night) — FOUR more root causes; testnet4 UTXO connect GREEN end-to-end; node synced + following tip
+
+The session took the port from "one known WV0 divergence" to a fully
+synced, live-following testnet4 node. Four distinct bugs, each found by a
+faithful differential driver, each with a committed gate:
+
+1. **TLS_ADDR dropped the getter result for CALLEE-SAVED destinations**
+   (253bb349). The macro delivered to x0-x17 via save slots only; for
+   x19-x28 destinations (three sites: TLS_ADDR x24,_hnd_tab in _hnd_end,
+   TLS_ADDR x27,_cms_scstrip0/1 in the CHECKMULTISIG strip) the getter's
+   return was silently discarded and the register kept stale garbage ->
+   hnd_end's cycle walk elem_move'd to wild addresses (the harness SIGBUS)
+   and records resolved through junk (the twin's final EQUAL pushed empty
+   -> EVAL_FALSE). The "WV0 zero-length-element divergence" entry below is
+   OBSOLETE: script_eval's zero-length handling was correct all along.
+   Evidence: wv0_zero_drv.c (real h=124,845 script+stack; was SIGBUS, now
+   byte-identical to x86), wv0_full_drv.c (the EXACT daemon entry
+   sv_verify_witness_v0 on all four p2wsh inputs: was 4x err=2, now 4x
+   err=0), wv0_rep.c (121-prefix-cut sweep, byte-identical).
+
+2. **tx_verify's arenas were shared across threads with no lock**
+   (c64ae055). The connect thread ran tx_verify_block_connect_all while
+   the same worker process's net thread accepted relayed txs (orphan/1p1c)
+   through txv_parse, which bump-resets g_wit_pool and grows g_spk_pool ->
+   a mid-connect admission rewrote the pools Phase 1 had just filled:
+   inputs classified against a real p2wpkh program verified against ANOTHER
+   transaction's spk bytes and witness lengths (witlens=64,64 -- no such
+   items exist in the real block) -> bogus rejects + invalidations
+   (h=124,864/125,673/126,361). glibc's realloc rarely moves; macOS's
+   moves near-always. All entry-path arenas are now __thread.
+
+3. **ecdsa_x_eq_mod_n: dead r+n branch + wrong p-n constant** (4f109a20).
+   The twin's compare chain returned on r[3]==PMN[3]==0 where the x86
+   falls through per limb -- the second candidate (affine R.x in [n,p))
+   was dead code -- AND its PMN_LIMBS transcription was two digits off
+   (0x402DA1732FC9BEBF vs asm 0x402DA1722FC9BAEE). Random differentials
+   hit the [n,p) band with probability ~2^-127; h=126,683 tx=93 carries a
+   CONSTRUCTED signature (sha256 of a brute-forced 16-byte preimage is a
+   valid DER signature; r=10B, s=15B) whose R.x sits there. Gate:
+   test_ecdsa_xmod.c -- contract pinned across both branches + p-n
+   boundary + three Z values; the SAME gate passes against the x86 asm.
+
+4. **txvb worker-pool semaphores are no-ops on macOS** (02b0d077). sem_init
+   fails on Darwin (no unnamed semaphores) so BOTH barriers silently
+   vanished: workers read uninitialized slots (SIGSEGV at
+   txvb_verify_one+100 through a wild spk_pool, killed the connect worker
+   four restarts in a row) and txvb_verify_all drained res[] before the
+   workers finished. Mutex+condvar with an explicit round generation;
+   identical semantics on Linux.
+
+   Also: the remaining static-TLS arrays converted to heap scratch
+   (63284ff2) -- p2wpkh_script's TLV getter faulted in the forked connect
+   worker (SIGSEGV ACCERR at the TLV write) in shapes no standalone driver
+   reproduces; bmc_thread.h's heap-TLS convention is now universal on the
+   verify path.
+
+**STATE: testnet4 FULLY SYNCED on the native daemon** -- getblockchaininfo
+verificationprogress=1, initialblockdownload=false, blocks=headers=151,987
+(151,988+ live), 14.2M txouts, heartbeats clean, DNS-seeded peers, zero
+consensus failures since the fixes. Mainnet catch-up continues on the same
+binary (79.8% stored at session end, connect engages at the .242 handoff).
+Remaining p3/p4: signet IBD, mainnet connect green, parity sweep, push (39+
+commits pending on this Mac -- origin publickey still blocked).
+
 ## 2026-09-11 (late II) — vfexec zero-size TLS: the real tapscript root cause; one WV0 divergence left
 
 - The h=123,615 tapscript failure was NOT the script_eval semantics: the

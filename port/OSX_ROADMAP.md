@@ -487,6 +487,12 @@ have caught all three).
       KNOWN PERF GAP (not correctness): the twin's lookup fallback re-reads
       the full bloom per lookup (the x86 mm path caches it); LSM-heavy
       blocks run ~30-60ms/blk vs x86's ~13ms -- revisit after p4.
+      2026-09-11 (night): testnet4 UTXO connect FULLY GREEN -- four more
+      root causes fixed on the way (TLS_ADDR callee-saved delivery,
+      tx_verify thread-shared arenas, ecdsa_x_eq_mod_n dead r+n branch +
+      p-n constant, txvb worker semaphores no-op on macOS); the node is
+      synced (verificationprogress=1) and following the live tip. See
+      OSX_STATE.md 2026-09-11 (night) for the full record.
 - [x] worker stability soak  the mainnet node has run unattended for
       hours (3.5h+ catch-up, restarts included) with zero worker crashes
       since the syscall/ services fixes; DiagnosticReports monitored.
