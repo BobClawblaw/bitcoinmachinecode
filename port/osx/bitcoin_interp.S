@@ -535,6 +535,12 @@ _script_eval:
 	sub  x0,x0,#1
 	str  x0,[sp,#SL_OP]	/* opcode */
 	str  x1,[sp,#SL_PUSHLEN]
+#ifdef BMC_OPTRACE
+	stp  x29,x30,[sp,#-16]!
+	mov  w0,w0
+	bl   __dbg_op
+	ldp  x29,x30,[sp],#16
+#endif
 
 	cmp  x1,#MAX_SCRIPT_ELEMENT_SIZE
 	b.ls .ps_ok

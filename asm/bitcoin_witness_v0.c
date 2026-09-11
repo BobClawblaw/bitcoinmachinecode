@@ -15,6 +15,7 @@
  * VerifyWitnessProgram + ExecuteWitnessScript and VerifyScript's P2SH branch.
  */
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include "script_error_codes.h"
 
@@ -78,12 +79,17 @@ static uint64_t sv_checksig_witness_v0(void* cptr, const uint8_t* sig, size_t si
     if (!der_parse_sig(sig, (unsigned long)siglen - 1, r, s, &dht)) return 0;
     static __thread uint8_t* pre; BMC_TLS_BUF(pre, 1<<16);
     uint8_t z[32];
+    if (getenv("BMC_WV0DBG")) fprintf(stderr, "[wv0-cs] nIn=%lld ht=%02x amount=%llu siglen=%zu publen=%zu pub0=%02x%02x%02x\n",
+        (long long)c->nIn, ht, (unsigned long long)c->amount, siglen, publen, pub[0],pub[1],pub[2]);
     if (segwit_v0_sighash(z, c->tx, (int64_t)c->txlen, (int64_t)c->nIn, (uint32_t)ht,
                           c->amount, sc->p, (uint64_t)sc->n, pre, (long)(1<<16)) <= 0) return 0;
     uint64_t zl[4]; be_to_limbs(zl, z, 32);
     uint64_t qx[4], qy[4];
     if (!pubkey_parse(pub, (unsigned long)publen, qx, qy)) return 0;
-    return (uint64_t)ecdsa_verify(zl, r, s, qx, qy);
+    { int vr = ecdsa_verify(zl, r, s, qx, qy);
+      if (getenv("BMC_WV0DBG")) fprintf(stderr, "[wv0-cs] z=%016llx%016llx%016llx%016llx ecdsa=%d\n",
+          (unsigned long long)zl[3],(unsigned long long)zl[2],(unsigned long long)zl[1],(unsigned long long)zl[0], vr);
+      return (uint64_t)vr; }
 }
 
 /* ======================================================================
