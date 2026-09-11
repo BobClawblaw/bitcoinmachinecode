@@ -42,7 +42,11 @@ mkdir -p "$DEST" && cd "$DEST" || exit 2
 
 ph "START host=$(hostname) kernel=$(uname -r) workers=$WORKERS"
 [ -d src ] || git clone -q /storage/bitcoinmachinecode src
-git -C src fetch -q origin 2>/dev/null; git -C src checkout -q "$SRCREF" 2>/dev/null
+# Hard-reset to the REMOTE ref. `checkout <branch>` on an existing clone keeps
+# whatever that branch pointed at when it was cloned, which silently built the
+# previous commit on 2026-09-11 and put the wrong binary into a 20-hour run.
+git -C src fetch -q origin "+refs/heads/*:refs/remotes/origin/*" 2>/dev/null
+git -C src checkout -q --detach "origin/$SRCREF" 2>/dev/null || git -C src checkout -q --detach "$SRCREF" 2>/dev/null
 COMMIT=$(git -C src rev-parse --short HEAD)
 ph "SRC commit=$COMMIT ref=$SRCREF"
 ( cd src/asm && make -j8 daemon/bmcbitcoind ) > build.log 2>&1 || { ph "FAIL build"; echo FAIL > RESULT; exit 1; }
