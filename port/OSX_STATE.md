@@ -48,11 +48,20 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
   in (num_inputs as byte length, 32-byte prevouts instead of 36-byte
   outpoints, unprefixed spks) -- the x86 fails identically on a wrong
   context, which is how the driver was trusted.
-- Status: everything else on the IBD path is green and gated; this one
-  script_eval/CHECKSIG-context divergence is the sole remaining
-  consensus blocker for the testnet4 UTXO connect (and eventually
-  mainnet's). Reproducer: /tmp/p2tr_lines.txt (committed) against
-  p2tr_block_drv on both arches.
+- Status: the tapscript block at h=123,615 now PASSES (vfexec fix); the
+  connect advanced to h=124,032/124,845 where p2wsh inputs with
+  zero-length initial-stack elements fail with EVAL_FALSE (err=2).
+  The x86 verifies the same blocks (r=1). Isolated: the twin's
+  script_eval handles the CHECKSIG/SWAP/SHA256 sequence correctly
+  through the per-opcode trace (29 opcodes, one checksig callback,
+  matching x86), but the final NUMEQUAL evaluates false — the stack
+  element handling for ZERO-LENGTH initial-stack elements diverges
+  inside script_eval (the harness also faults in hnd_end's cycle walk
+  with the same elements). Reproducer: /tmp/wv0_dbg.c-style runs
+  against the ported interp objects with the block-124,845 tx#167
+  script+stack. THE ONE REMAINING consensus-path blocker.
+- Mainnet: 650k+/966k stored (67%) on the fully fixed binary, zero
+  consensus failures; the connect engages at the .242 tail handoff.
 
 ## 2026-09-11 — testnet4 IBD green; two more real bugs (segwit txid, radix tie-break)
 
