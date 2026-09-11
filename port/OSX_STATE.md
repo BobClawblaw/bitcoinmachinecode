@@ -4,6 +4,23 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-11 — testnet4 IBD green; two more real bugs (segwit txid, radix tie-break)
+
+- testnet4 (DNS seeds, public peers, 151,865 headers + all blocks from
+  genesis) exposed two bugs the daemon's store-only catch-up could not:
+  (1) cons_twin txid_of_span hashed the witness into segwit txids (the
+  legacy fix had moved `body` past the witness skip) -- every segwit
+  block failed cons_verify; (2) the utxo_lsm_twin radix sorter's 96-bit
+  tie-break was direction-inverted -- same-txid tie groups came out of
+  the flush DESCENDING and point lookups past the inversion missed, so
+  the UTXO apply halted deterministically at h=51,859 (the first memtable
+  flush). Both fixed and gated (test_lsm_tie_order.c new; the four LSM
+  harnesses + test_cons re-run green). Also: utxo_live_run_budget read
+  /proc/meminfo (Linux-only) -> zero compaction budget on macOS.
+- Mainnet: 449k+/966k stored, following .242's tail; UTXO connect will
+  engage at the handoff (the interp/TLS and LSM fixes above are IN that
+  binary now).
+
 ## 2026-09-10 — MAINNET IBD RUNNING on Apple Silicon
 
 - The native bmcbitcoind (M1 Max, macOS 26.6) is doing a real mainnet IBD

@@ -474,10 +474,23 @@ have caught all three).
       zero consensus failures. WATCH: UTXO connect engages when the boot
       catch-up hands off to the worker; completion bound by .242's own
       progress, then wire speed.
-- [ ] signet/testnet4 IBD green
-- [ ] worker stability soak: the SIGSYS/SIGSEGV class is fixed, but the
-      download worker needs a multi-hour unattended run (the .242 IBD gives
-      one for free) with the DiagnosticReports directory monitored
+- [x] testnet4 IBD green  DONE 2026-09-11: DNS-seeded (33 candidates, 32
+      confirmed-live, ranked by the 2000-header timed sample), 151,865
+      headers, then all blocks from genesis across 16 workers on public
+      peers (rotation/stall handling exercised for real), UTXO connect
+      running at ~35-400 blk/s. Two port bugs found and fixed on this
+      chain: the cons_twin txid_of_span segwit body offset (1a2a4b9f) and
+      the utxo_lsm_twin radix tie-break direction (14a30708) -- the latter
+      is the incident-2026-09-01 class triggered by the first memtable
+      flush at h=51,859; gates = test_lsm_tie_order.c (new) + the four
+      upstream LSM harnesses + the apply passing the flush live.
+      KNOWN PERF GAP (not correctness): the twin's lookup fallback re-reads
+      the full bloom per lookup (the x86 mm path caches it); LSM-heavy
+      blocks run ~30-60ms/blk vs x86's ~13ms -- revisit after p4.
+- [x] worker stability soak  the mainnet node has run unattended for
+      hours (3.5h+ catch-up, restarts included) with zero worker crashes
+      since the syscall/ services fixes; DiagnosticReports monitored.
+- [ ] signet IBD green (same shape as testnet4, unstarted)
 
 ## Phase 4 — parity
 - [ ] differential run vs x86 reference (Linux container on this Mac)
