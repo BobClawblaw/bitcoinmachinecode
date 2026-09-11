@@ -51,3 +51,24 @@ against the unmeasured code. The first version of the failure-path check passed
 either way, because the fixture's reads were instantaneous and both clocks read
 zero; the stub now takes measurable time, which is what makes the check mean
 anything.
+
+## Deployment
+
+The binary is built and staged as `asm/daemon/bmcbitcoind.deploy-20260911ah`, byte
+identical to the gated build (`sha256 1657171c640e0863…`). The `bmcbitcoind.live`
+symlink is **deliberately left pointing at the previous build**: this change is not
+merged yet, and an unplanned restart must not silently adopt unmerged code.
+
+To activate, once the PR has landed:
+
+```
+cd /storage/bitcoinmachinecode/asm/daemon
+ln -sfn bmcbitcoind.deploy-20260911ah bmcbitcoind.live.new && mv -T bmcbitcoind.live.new bmcbitcoind.live
+sudo systemctl restart bmcbitcoind
+```
+
+To roll back, repoint the symlink at `bmcbitcoind.deploy-20260910ag` and restart.
+
+Production is synced at the tip, so a restart costs its mempool and its peer set,
+and the new figures only appear while the node is catching up. There is no reason
+to force a restart for this; the next one will pick it up.
