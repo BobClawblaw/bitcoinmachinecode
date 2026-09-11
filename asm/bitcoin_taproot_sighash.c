@@ -1233,7 +1233,33 @@ int taproot_verify_input_flags(const uint8_t* spk,
     st.checksig_ctx = &ctx;
     st.checksig_fn  = taproot_checksig_fn;
 
-    if (!script_eval(&st)) { *reason = "p2tr tapscript execution failed"; return 0; }
+    if (!script_eval(&st)) {
+        { fprintf(stderr, "[dbg-ctx] n_in=%lld num_inputs=%lld scriptlen=%zu\n", (long long)n_in, (long long)num_inputs, (size_t)slen);
+          fprintf(stderr, "[dbg-ctx] script="); for (size_t di=0; di<slen && di<400; di++) fprintf(stderr, "%02x", script[di]); fprintf(stderr, "\n");
+          for (int64_t di=0; di<num_inputs; di++) {
+              const uint8_t* q = spks; const uint8_t* qe = spks + (4u<<20); (void)qe;
+              /* walk spks to input di */
+              const uint8_t* myspk = NULL; uint64_t mylen = 0;
+              for (int64_t dj=0; dj<=di; dj++) {
+                  uint64_t sl = 0; int k=0;
+                  while (q+k < qe && q[k] >= 0xfd && k < 4) k++;
+                  if (k==0) sl = q[0];
+                  else if (k==1) sl = q[1];
+                  else if (k==2) sl = q[2];
+                  else sl = q[3];
+                  q += k; if (dj==di){ myspk=q; mylen=sl; }
+                  q += sl; if (q > qe) break;
+              }
+              if (myspk) { fprintf(stderr, "[dbg-ctx] in%lld spk=", (long long)di);
+                  for (uint64_t dz=0; dz<mylen && dz<64; dz++) fprintf(stderr, "%02x", myspk[dz]);
+                  fprintf(stderr, "\n"); }
+          }
+          for (uint32_t di=0; di<nwit; di++) { fprintf(stderr, "[dbg-ctx] wit[%u] len=%u: ", di, witlen[di]);
+              for (uint32_t dz=0; dz<witlen[di] && dz<80; dz++) fprintf(stderr, "%02x", wit[di][dz]);
+              fprintf(stderr, "\n"); }
+        }
+        *reason = "p2tr tapscript execution failed"; return 0;
+    }
     /* A checksig that set hard_fail invalidates the script even if the stack
      * happens to end truthy -- see taproot_checksig_ctx.hard_fail. */
     if (ctx.hard_fail) { *reason = "p2tr tapscript checksig invalid"; return 0; }

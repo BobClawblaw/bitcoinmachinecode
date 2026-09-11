@@ -526,6 +526,22 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
         if (i >= g_txv_in_cap){
             u64 c = g_txv_in_cap ? g_txv_in_cap * 2 : 4096;
             txv_rawin_t* a = realloc(g_txv_in, c * sizeof *a); if (!a){ *reason = "out of memory"; return 0; }
+            /* bmc_osx (testnet4 h=124,845): Phase-B verifies earlier
+             * transactions while THIS parse grows g_txv_in. The wit/witlen
+             * pointers of already-parsed inputs point INTO g_wit_pool, but
+             * the rawin records THEMSELVES move with the realloc -- on macOS
+             * realloc moves far more often than glibc, and a moved record
+             * made later verify passes read nwit=0/NULL witnesses for
+             * perfectly good p2wsh/p2tr inputs ("p2wpkh signature invalid").
+             * The wit fields are offset-based by design (wit_off survives
+             * the pool's realloc) -- re-resolve them for every entry parsed
+             * so far whenever the array moves. */
+            if (a != g_txv_in){
+                for (u64 k=0;k<i;k++){
+                    if (a[k].nwit){ a[k].wit = g_wit_pool.ptr + a[k].wit_off;
+                                    a[k].witlen = g_wit_pool.len + a[k].wit_off; }
+                }
+            }
             txv_result_t* r = realloc(g_txv_results, c * sizeof *r); if (!r){ *reason = "out of memory"; return 0; }
             g_txv_in = a; g_txv_in_cap = c; g_txv_results = r; g_txv_results_cap = c;
         }
@@ -572,6 +588,49 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
     }
     *out_nin = nin;
     return 1;
+}
+
+/* bmc_osx debug export: drive txv_parse on arbitrary bytes (testnet4 h=124845
+ * p2wsh witness-collection loss). Not used by the daemon. */
+long dbg_txv_parse(const u8* tx, u64 len, u64* nin_out, u64* nwit_out, u32* wit_off_out, u32* witlen_out)
+{
+    const char* reason = 0; u64 nin = 0;
+    extern void* txv_bytepool_ptr(void);
+    (void)nin_out; (void)nwit_out; (void)wit_off_out; (void)witlen_out;
+    (void)reason;
+    /* txv_parse is static with pool-side state; expose the observable:
+     * re-implement the exact walk here and report per-input nwit. */
+    {
+        const u8* p = tx; const u8* end = tx + len;
+        if (len < 10) return -1;
+        p += 4;
+        int segwit = (len > 6 && p[0] == 0x00 && p[1] == 0x01);
+        if (segwit) p += 2;
+        u64 n = 0; { int sh = 0; while (p < end && sh < 8){ u64 v=0; int k=0; u8 b0=p[0];
+            if (b0<0xfd){ v=b0; k=1; } else if (b0==0xfd){ v=p[1]|(p[2]<<8); k=3; } else if (b0==0xfe){ v=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); k=5; } else { v=p[6]; k=9; }
+            if (k==0){ v=b0; k=1; } n=v; p+=k; break; } (void)sh; }
+        u64 nin2 = n;
+        for (u64 i=0;i<nin2;i++){ p+=36; u64 sl=0; { u8 b0=p[0]; int k; if (b0<0xfd){ sl=b0; p+=1; } else if (b0==0xfd){ sl=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ sl=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { sl=p[6]; p+=9; } } p+=sl+4; }
+        u64 nout2 = 0; { u8 b0=p[0]; if (b0<0xfd){ nout2=b0; p+=1; } else if (b0==0xfd){ nout2=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ nout2=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { nout2=p[6]; p+=9; } }
+        for (u64 i=0;i<nout2;i++){ p+=8; u64 sl=0; { u8 b0=p[0]; if (b0<0xfd){ sl=b0; p+=1; } else if (b0==0xfd){ sl=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ sl=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { sl=p[6]; p+=9; } } p+=sl; }
+        u64* counts = (u64*)malloc((nin2?nin2:1)*sizeof(u64));
+        if (segwit){
+            for (u64 i=0;i<nin2;i++){
+                u64 ni=0; { u8 b0=p[0]; if (b0<0xfd){ ni=b0; p+=1; } else if (b0==0xfd){ ni=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ ni=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { ni=p[6]; p+=9; } }
+                counts[i]=ni;
+                for (u64 j=0;j<ni;j++){ u64 il=0; { u8 b0=p[0]; if (b0<0xfd){ il=b0; p+=1; } else if (b0==0xfd){ il=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ il=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { il=p[6]; p+=9; } } p+=il; }
+            }
+        } else { for (u64 i=0;i<nin2;i++) counts[i]=0; }
+        *nin_out = nin2;
+        if (nin_out) { }
+        if (nwit_out){ for (u64 i=0;i<nin2 && i<64;i++){ } }
+        { char buf[512]; int off=0;
+          off += snprintf(buf+off, sizeof buf-off, "[dbg-txvparse] nin=%llu segwit=%d counts=", (unsigned long long)nin2, segwit);
+          for (u64 i=0;i<nin2 && i<12;i++) off += snprintf(buf+off, sizeof buf-off, "%llu,", (unsigned long long)counts[i]);
+          fprintf(stderr, "%s\n", buf); }
+        free(counts);
+        return (long)(p - tx);
+    }
 }
 
 static int is_p2tr  (const u8* spk, u32 sl){ return sl==34 && spk[0]==0x51 && spk[1]==0x20; }
@@ -642,7 +701,12 @@ static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long fla
     case TXV_SHAPE_WV0: {
         int err = sv_verify_witness_v0(in->wprog, in->wproglen, in->wit, in->witlen, in->nwit,
                                        in->value, flags, (unsigned long)i, tx, txlen, sv_work, sv_workcap);
-        if (err != 0) { *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0; }
+        if (err != 0) {
+            fprintf(stderr, "[dbg-wv0] FAIL in_idx=%lu err=%d wproglen=%u value=%llu nwit=%u wit_off=%u wit0len=%u\n",
+                    (unsigned long)i, err, (unsigned)in->wproglen, (unsigned long long)in->value, (unsigned)in->nwit, (unsigned)in->wit_off,
+                    in->nwit > 0 ? in->witlen[0] : 0);
+            *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0;
+        }
         return 1;
     }
     case TXV_SHAPE_LEGACY: {
@@ -1356,6 +1420,9 @@ static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
     return 1;
 }
 
+/* bmc_osx debug export: drive txv_parse on arbitrary bytes (testnet4 h=124845
+ * p2wsh witness-collection loss). Not used by the daemon. */
+
 /* Adapter: input k of ONE transaction on the block path. ctx is &flat[lo],
  * i.e. that transaction's first entry in the block-wide flat array. Reads
  * only Phase 1's already-resolved fields; the scriptPubKey comes out of
@@ -1403,7 +1470,12 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
         const u8* wprog = in->wprog ? in->wprog : spk + in->wprog_off;
         int err = sv_verify_witness_v0(wprog, in->wproglen, in->wit, in->witlen, in->nwit,
                                        in->value, flags, (unsigned long)in->local_idx, tx, txlen, sv_work, sv_workcap);
-        if (err != 0) { *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0; }
+        if (err != 0) {
+            fprintf(stderr, "[dbg-wv0] FAIL local_idx=%lu err=%d wproglen=%u value=%llu nwit=%u wit0len=%u\n",
+                    (unsigned long)in->local_idx, err, (unsigned)in->wproglen, (unsigned long long)in->value,
+                    in->nwit > 0 ? in->witlen[0] : 0, in->nwit > 1 ? in->witlen[1] : 0);
+            *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0;
+        }
         return 1;
     }
     case TXV_SHAPE_LEGACY: {
