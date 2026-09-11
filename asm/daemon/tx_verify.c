@@ -706,25 +706,33 @@ int g_txv_script_checks = 1;
 void tx_verify_set_script_checks(int on){ g_txv_script_checks = on ? 1 : 0; }
 int  tx_verify_script_checks(void){ return g_txv_script_checks; }
 
-static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long flags,
+/* bmc_osx: the arenas arrive as parameters. They are __thread now, and the
+ * worker threads used to read them through the file-scope names -- which on
+ * a worker resolves to that WORKER's own empty TLS instance (NULL
+ * g_txv_in / unbuilt t1 state) instead of the dispatching thread's filled
+ * arenas. Same discipline as the block path's txvb_verify_one (explicit
+ * state so the asm twin can be driven side by side). */
+static int txv_verify_one(const u8* tx, u64 txlen, txv_rawin_t* in, u64 idx, unsigned long long flags,
+                          const tapagg_t* t1_tap, const bytepool_t* t1_tap_pool, int t1_tap_built,
                           u8* sv_work, unsigned long sv_workcap, const char** reason){
-    txv_rawin_t* in = &g_txv_in[i];
+    /* txv_rawin_t* in = &g_txv_in[i]; -- replaced by the parameters (idx is
+     * the input's position WITHIN ITS OWN transaction -- the sighash nIn) */
     if (!g_txv_script_checks) return 1;   /* assumevalid: below the assumed-valid block, no script evaluation */
     switch (in->shape){
     case TXV_SHAPE_P2TR: {
         /* Phase B. g_t1_tap/g_t1_tap_pool were filled by pass 1c below,
          * strictly before any worker thread was created, and are read-only
          * from here on -- so this case is safe to run concurrently. */
-        if (!g_t1_tap_built) { *reason = "internal: taproot aggregate not built"; return 0; }
-        return tapagg_verify(&g_t1_tap_pool, &g_t1_tap, in->spk,
-                             in->wit, in->witlen, in->nwit, i, flags, reason);
+        if (!t1_tap_built) { *reason = "internal: taproot aggregate not built"; return 0; }
+        return tapagg_verify(t1_tap_pool, t1_tap, in->spk,
+                             in->wit, in->witlen, in->nwit, idx, flags, reason);
     }
     case TXV_SHAPE_WV0: {
         int err = sv_verify_witness_v0(in->wprog, in->wproglen, in->wit, in->witlen, in->nwit,
-                                       in->value, flags, (unsigned long)i, tx, txlen, sv_work, sv_workcap);
+                                       in->value, flags, (unsigned long)idx, tx, txlen, sv_work, sv_workcap);
         if (err != 0) {
             fprintf(stderr, "[dbg-wv0] FAIL in_idx=%lu err=%d wproglen=%u value=%llu nwit=%u wit_off=%u wit0len=%u\n",
-                    (unsigned long)i, err, (unsigned)in->wproglen, (unsigned long long)in->value, (unsigned)in->nwit, (unsigned)in->wit_off,
+                    (unsigned long)idx, err, (unsigned)in->wproglen, (unsigned long long)in->value, (unsigned)in->nwit, (unsigned)in->wit_off,
                     in->nwit > 0 ? in->witlen[0] : 0);
             *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0;
         }
@@ -733,7 +741,7 @@ static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long fla
     case TXV_SHAPE_LEGACY: {
         u64 ltxlen; const u8* ltx = legacy_tx_view(tx, txlen, &ltxlen);
         int err = sv_verify_script(in->scriptSig, in->scriptSiglen, in->spk, in->spklen,
-                                   flags, (unsigned long)i, ltx, ltxlen, sv_work, sv_workcap);
+                                   flags, (unsigned long)idx, ltx, ltxlen, sv_work, sv_workcap);
         if (err != 0) { *reason = "legacy script verification failed"; return 0; }
         return 1;
     }
@@ -818,6 +826,11 @@ typedef struct {
     const u8* tx; u64 txlen; unsigned long long flags;
     u64 lo, hi;
     u64 key;                     /* IR-5: this transaction's session key */
+    txv_rawin_t* in_base;        /* the DISPATCHING thread's arenas (TLS:
+                                    workers must not read the file-scope
+                                    names -- they would get their own
+                                    empty instances) */
+    const tapagg_t* t1_tap; const bytepool_t* t1_tap_pool; int t1_tap_built;
 } txv_worker_arg_t;
 
 static void* txv_worker_thread(void* argp){
@@ -833,8 +846,10 @@ static void* txv_worker_thread(void* argp){
                                           * was built to catch). */
     txv_session_begin(a->key);                                   /* IR-5 */
     for (u64 i=a->lo;i<a->hi;i++){
+        /* the dispatcher's arenas, carried in the args */
         const char* r = 0;
-        int ok = txv_verify_one(a->tx, a->txlen, i, a->flags, sv_work, 1<<20, &r);
+        int ok = txv_verify_one(a->tx, a->txlen, &a->in_base[i], i, a->flags,
+                                a->t1_tap, &a->t1_tap_pool[0] == a->t1_tap ? a->t1_tap : a->t1_tap, a->t1_tap_built, sv_work, 1<<20, &r);
         g_txv_results[i].ok = ok ? 1 : 0;
         if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(g_txv_results[i].reason, r, n); g_txv_results[i].reason[n]=0; }
     }
@@ -861,7 +876,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
         txv_session_begin(key);
         for (u64 i=0;i<nin;i++){
             const char* r = 0;
-            if (!txv_verify_one(tx, txlen, i, flags, sv_work, 1<<20, &r)) {
+            if (!txv_verify_one(tx, txlen, &g_txv_in[i], i, flags, &g_t1_tap, &g_t1_tap_pool, g_t1_tap_built, sv_work, 1<<20, &r)) {
                 *reason = r; txv_session_end(); return 0;
             }
         }
@@ -888,6 +903,9 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
         args[spawned].tx = tx; args[spawned].txlen = txlen; args[spawned].flags = flags;
         args[spawned].lo = lo; args[spawned].hi = hi;
         args[spawned].key = key;                                   /* IR-5 */
+        args[spawned].in_base = g_txv_in;
+        args[spawned].t1_tap = &g_t1_tap; args[spawned].t1_tap_pool = &g_t1_tap_pool;
+        args[spawned].t1_tap_built = g_t1_tap_built;
         if (bmc_pthread_create(&tids[spawned], txv_worker_thread, &args[spawned]) != 0){
             /* thread creation failed partway: whatever didn't get a thread
              * (including this one) stays at its zeroed g_txv_results slot
@@ -913,7 +931,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
          * verify it inline now, in this thread, so a transient resource
          * failure never silently skips a check. */
         const char* r = 0;
-        if (!txv_verify_one(tx, txlen, i, flags, sv_work_main, sizeof sv_work_main, &r)) {
+        if (!txv_verify_one(tx, txlen, &g_txv_in[i], i, flags, &g_t1_tap, &g_t1_tap_pool, g_t1_tap_built, sv_work_main, sizeof sv_work_main, &r)) {
             memcpy(rbuf, r, strlen(r)+1 > sizeof rbuf ? sizeof rbuf : strlen(r)+1);
             all_ok = 0; break;
         }
@@ -1565,16 +1583,32 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
  * this section's header is unchanged. */
 typedef struct {
     pthread_t tid;
-    sem_t work_sem;
+    /* bmc_osx (2026-09-11): sem_t is NOT usable here -- macOS has no
+     * working unnamed semaphores (sem_init fails; sem_wait/sem_post then
+     * no-op), so the dispatch and join barriers below were silent no-ops:
+     * workers read uninitialized slots (wild spk_pool -> SIGSEGV in
+     * txvb_verify_one) and txvb_verify_all drained res[] before the
+     * workers finished. Mutex+condvar with an explicit round generation
+     * replaces them; identical barrier semantics on Linux. */
+    pthread_mutex_t lock;
+    pthread_cond_t  cv;
+    u64 round;                 /* incremented per dispatch; workers wait
+                                * for round > their own seen value */
+    u64 seen;                  /* worker-private: last round it processed */
     txvb_in_t* flat; txvb_result_t* res; unsigned long long flags;
     u64* next;                 /* shared claim counter for this round */
     u64  total;                /* one past the last claimable index */
+    /* bmc_osx: the DISPATCHING thread's pools, carried because the pool
+     * globals are __thread now -- a worker evaluating &g_spk_pool directly
+     * would see its own empty instance (NULL buf) and fault at
+     * NULL+spk_off inside txvb_verify_one. */
+    const bytepool_t* spk_pool; const bytepool_t* tap_pool; const tapagg_t* tapdesc;
 } txvb_worker_slot_t;
 
 static txvb_worker_slot_t g_txvb_pool[TXVB_MAX_WORKERS];
 static int g_txvb_pool_size = 0;
-static __thread sem_t g_txvb_done_sem;
-static __thread int g_txvb_done_sem_ready = 0;
+static struct { pthread_mutex_t lock; pthread_cond_t cv; u64 count; }
+    g_txvb_done = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0 };
 
 /* Loops forever -- these workers live for the process's whole lifetime,
  * same as this codebase's convention elsewhere of never gracefully
@@ -1588,21 +1622,29 @@ static void* txvb_worker_loop(void* argp){
                                          * whole process-lifetime, not once per
                                          * dispatch round either. */
     for (;;){
-        /* sem_wait/sem_post are the round's memory barriers: everything the
-         * main thread wrote into flat[]/g_spk_pool/g_tap_pool before posting
-         * work_sem is visible here, and everything written into res[] here
-         * is visible to the main thread after it drains g_txvb_done_sem. */
-        sem_wait(&w->work_sem);
+        /* lock/cv/wait + unlock and the done-counter below are the round's
+         * memory barriers: everything the main thread wrote into flat[]/
+         * g_spk_pool/g_tap_pool before the post is visible here, and
+         * everything written into res[] here is visible to the main thread
+         * after it drains the done counter. */
+        pthread_mutex_lock(&w->lock);
+        while (w->seen == w->round)
+            pthread_cond_wait(&w->cv, &w->lock);
+        w->seen = w->round;
+        pthread_mutex_unlock(&w->lock);
         for (;;){
             u64 i = __atomic_fetch_add(w->next, 1, __ATOMIC_RELAXED);
             if (i >= w->total) break;
             const char* r = 0;
-            int ok = txvb_verify_one(w->flat[i].tx_ptr, w->flat[i].tx_len, &w->flat[i], w->flags, sv_work, 1<<20, &g_spk_pool, &g_tap_pool, g_tapdesc, &r);
+            int ok = txvb_verify_one(w->flat[i].tx_ptr, w->flat[i].tx_len, &w->flat[i], w->flags, sv_work, 1<<20, w->spk_pool, w->tap_pool, w->tapdesc, &r);
             w->res[i].ok = ok ? 1 : 0;
             if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(w->res[i].reason, r, n); w->res[i].reason[n]=0; }
         }
         txv_session_end();      /* IR-5: never leave a key set past the scope that owns it */
-        sem_post(&g_txvb_done_sem);
+        pthread_mutex_lock(&g_txvb_done.lock);
+        g_txvb_done.count++;
+        pthread_cond_signal(&g_txvb_done.cv);
+        pthread_mutex_unlock(&g_txvb_done.lock);
     }
     return 0;   /* unreachable -- for(;;) above never exits, see this
                  * function's own header comment */
@@ -1614,10 +1656,11 @@ static void* txvb_worker_loop(void* argp){
  * fails, matching txvb_verify_all's existing "finish inline" fallback
  * story for whatever didn't get a thread). */
 static int txvb_pool_ensure(int need){
-    if (!g_txvb_done_sem_ready) { sem_init(&g_txvb_done_sem, 0, 0); g_txvb_done_sem_ready = 1; }
     while (g_txvb_pool_size < need){
         txvb_worker_slot_t* w = &g_txvb_pool[g_txvb_pool_size];
-        sem_init(&w->work_sem, 0, 0);
+        pthread_mutex_init(&w->lock, 0);
+        pthread_cond_init(&w->cv, 0);
+        w->round = 0; w->seen = 0;
         if (bmc_pthread_create(&w->tid, txvb_worker_loop, w) != 0) break;
         g_txvb_pool_size++;
     }
@@ -1663,15 +1706,26 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
     static u64 claim;            /* one round at a time; the pool is not
                                   * re-entrant and never has been */
     claim = 0;
+    pthread_mutex_lock(&g_txvb_done.lock);
+    g_txvb_done.count = 0;               /* this round's baseline */
+    pthread_mutex_unlock(&g_txvb_done.lock);
     int spawned = 0;
     for (int w=0; w<nspawn; w++){
         txvb_worker_slot_t* slot = &g_txvb_pool[w];
+        pthread_mutex_lock(&slot->lock);
         slot->flat=flat; slot->res=res; slot->flags=flags;
         slot->next=&claim; slot->total=total;
-        sem_post(&slot->work_sem);
+        slot->spk_pool=&g_spk_pool; slot->tap_pool=&g_tap_pool; slot->tapdesc=g_tapdesc;
+        slot->round++;                   /* release this worker */
+        pthread_cond_signal(&slot->cv);
+        pthread_mutex_unlock(&slot->lock);
         spawned++;
     }
-    for (int w=0; w<spawned; w++) sem_wait(&g_txvb_done_sem);
+    /* join: wait until every spawned worker posted for THIS round */
+    pthread_mutex_lock(&g_txvb_done.lock);
+    while (g_txvb_done.count < (u64)spawned)
+        pthread_cond_wait(&g_txvb_done.cv, &g_txvb_done.lock);
+    pthread_mutex_unlock(&g_txvb_done.lock);
 
     /* plain static, not __thread -- runs only after every worker has
      * already joined above (sequential), same as txv_verify_all's own
