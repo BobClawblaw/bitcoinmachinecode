@@ -1,3 +1,4 @@
+#include <stdio.h>
 #include "bmc_thread.h"
 /* bitcoin_scriptverify.c -- VerifyScript driven by the ASM interpreter.
  *
@@ -236,10 +237,11 @@ static uint64_t sv_checksig(void* cptr, const uint8_t* sig, size_t siglen,
      * the interpreter-supplied slice, BEFORE legacy_sighash's own internal
      * OP_CODESEPARATOR strip (interp.asm:CODESEPARATOR handling already
      * bounds `sc` to [pbegincodehash, pend), matching Core's scriptCode). */
-    static __thread uint8_t needle[600], scF[20000];
-    long long nlen = script_push_encode(needle, sizeof needle, sig, siglen);
+    static __thread uint8_t* needle;  BMC_TLS_BUF(needle, 600);
+    static __thread uint8_t* scF;     BMC_TLS_BUF(scF, 20000);
+    long long nlen = script_push_encode(needle, 600, sig, siglen);
     if (nlen < 0) return 0;
-    long long scflen = script_find_and_delete(scF, sizeof scF, sc->p, sc->n,
+    long long scflen = script_find_and_delete(scF, 20000, sc->p, sc->n,
                                               needle, (unsigned long)nlen);
     if (scflen < 0) return 0;
 
@@ -248,8 +250,26 @@ static uint64_t sv_checksig(void* cptr, const uint8_t* sig, size_t siglen,
                         (int32_t)ht, c->work, c->workcap)) return 0;
     uint64_t zl[4]; be_to_limbs(zl, z, 32);
     uint64_t qx[4], qy[4];
-    if (!pubkey_parse(pub, (unsigned long)publen, qx, qy)) return 0;
-    return (uint64_t)ecdsa_verify(zl, r, s, qx, qy);
+    if (!pubkey_parse(pub, (unsigned long)publen, qx, qy)) {
+        if (getenv("BMC_LSDBG")) fprintf(stderr, "[ls-cs] pubkey_parse FAIL publen=%zu\n", publen);
+        return 0;
+    }
+    {
+        uint64_t v = ecdsa_verify(zl, r, s, qx, qy);
+        if (getenv("BMC_LSDBG")) {
+            fprintf(stderr, "[ls-cs] ht=%02x siglen=%zu sig=", ht, siglen);
+            for (size_t q = 0; q < siglen && q < 40; q++) fprintf(stderr, "%02x", sig[q]);
+            fprintf(stderr, " r=%016llx%016llx%016llx%016llx s=%016llx%016llx%016llx%016llx",
+                (unsigned long long)r[3],(unsigned long long)r[2],(unsigned long long)r[1],(unsigned long long)r[0],
+                (unsigned long long)s[3],(unsigned long long)s[2],(unsigned long long)s[1],(unsigned long long)s[0]);
+            fprintf(stderr, " z=%016llx%016llx%016llx%016llx qx=%016llx%016llx%016llx%016llx qy=%016llx%016llx%016llx%016llx v=%llu\n",
+                (unsigned long long)zl[3],(unsigned long long)zl[2],(unsigned long long)zl[1],(unsigned long long)zl[0],
+                (unsigned long long)qx[3],(unsigned long long)qx[2],(unsigned long long)qx[1],(unsigned long long)qx[0],
+                (unsigned long long)qy[3],(unsigned long long)qy[2],(unsigned long long)qy[1],(unsigned long long)qy[0],
+                (unsigned long long)v);
+        }
+        return v;
+    }
 }
 
 /* ------------------------------------------------------------ script shape */
