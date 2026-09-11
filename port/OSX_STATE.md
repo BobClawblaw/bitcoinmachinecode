@@ -4,6 +4,32 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-11 (late) — the last known consensus blocker: one tapscript divergence
+
+- testnet4 chain IBD complete (151,869 headers+blocks stored, verified);
+  the UTXO connect verified 0..123,614 (13.9M txouts live, 6.06 ms/blk
+  with the mm path) and halts at h=123,615 on "p2tr tapscript execution
+  failed". Isolated with the new differential driver
+  (port/osx/tests/p2tr_block_drv.c + p2tr_block_123615.txt: all 88
+  taproot inputs of that block): **x86 88/88 pass, osx twin 86/88** --
+  tx#57 vin#0 and tx#62 vin#0 fail. Both are 6-item script-path spends
+  (witness {sig,sig,preimage,01,script,control}; script =
+  IF HASH256 <h> EQUALVERIFY CHECKSIG <32> CHECKSIGADD 2 LESSTHANOREQUAL
+  ELSE ... ENDIF). The interpreter mechanics are individually correct
+  (fragment bisect: IF/HASH256/EQUALVERIFY/args all fine; the only
+  in-fragment failures are the expected CLEANSTACK/EVAL_FALSE) and the
+  BIP342 sighash gate is 51/51 -- the divergence needs the REAL
+  checksig_fn context (taproot_sighash + schnorr under the 4-deep
+  initial stack). The driver itself had three context bugs on the way
+  in (num_inputs as byte length, 32-byte prevouts instead of 36-byte
+  outpoints, unprefixed spks) -- the x86 fails identically on a wrong
+  context, which is how the driver was trusted.
+- Status: everything else on the IBD path is green and gated; this one
+  script_eval/CHECKSIG-context divergence is the sole remaining
+  consensus blocker for the testnet4 UTXO connect (and eventually
+  mainnet's). Reproducer: /tmp/p2tr_lines.txt (committed) against
+  p2tr_block_drv on both arches.
+
 ## 2026-09-11 — testnet4 IBD green; two more real bugs (segwit txid, radix tie-break)
 
 - testnet4 (DNS seeds, public peers, 151,865 headers + all blocks from
