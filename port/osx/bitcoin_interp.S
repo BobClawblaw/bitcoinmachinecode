@@ -324,7 +324,89 @@ _interp_memeq:
  * threaded daemon verifies many inputs across worker threads; the scratch
  * buffers below are PER-THREAD (x86 parity). */
 .macro TLS_ADDR d, sym
-	bl  _tls_get_\sym
+	/* x86 contract: TLS_ADDR clobbers ONLY its destination register (gottpoff
+	 * + fs:0 arithmetic). The Darwin form makes a CALL (C getter), so it must
+	 * additionally preserve LR: a leaf .S function that ends in `ret` relies
+	 * on x30 holding ITS return address, and the macro's bl overwrites x30
+	 * -- without the save, the closing ret jumps to the last getter's return
+	 * site (the nop1/cm script-VM gates caught the resulting chaos). Save
+	 * x30 first (deepest slot), deliver \d by writing the result into \d's
+	 * own save slot, then pop everything. */
+	str  x30, [sp, #-16]!
+	stp  x16, x17, [sp, #-16]!
+	stp  x14, x15, [sp, #-16]!
+	stp  x12, x13, [sp, #-16]!
+	stp  x10, x11, [sp, #-16]!
+	stp  x8,  x9,  [sp, #-16]!
+	stp  x6,  x7,  [sp, #-16]!
+	stp  x4,  x5,  [sp, #-16]!
+	stp  x2,  x3,  [sp, #-16]!
+	stp  x0,  x1,  [sp, #-16]!
+	bl   _tls_get_\sym
+	.ifc "\d", "x0"
+	 str  x0, [sp, #0]
+	.endif
+	.ifc "\d", "x1"
+	 str  x0, [sp, #8]
+	.endif
+	.ifc "\d", "x2"
+	 str  x0, [sp, #16]
+	.endif
+	.ifc "\d", "x3"
+	 str  x0, [sp, #24]
+	.endif
+	.ifc "\d", "x4"
+	 str  x0, [sp, #32]
+	.endif
+	.ifc "\d", "x5"
+	 str  x0, [sp, #40]
+	.endif
+	.ifc "\d", "x6"
+	 str  x0, [sp, #48]
+	.endif
+	.ifc "\d", "x7"
+	 str  x0, [sp, #56]
+	.endif
+	.ifc "\d", "x8"
+	 str  x0, [sp, #64]
+	.endif
+	.ifc "\d", "x9"
+	 str  x0, [sp, #72]
+	.endif
+	.ifc "\d", "x10"
+	 str  x0, [sp, #80]
+	.endif
+	.ifc "\d", "x11"
+	 str  x0, [sp, #88]
+	.endif
+	.ifc "\d", "x12"
+	 str  x0, [sp, #96]
+	.endif
+	.ifc "\d", "x13"
+	 str  x0, [sp, #104]
+	.endif
+	.ifc "\d", "x14"
+	 str  x0, [sp, #112]
+	.endif
+	.ifc "\d", "x15"
+	 str  x0, [sp, #120]
+	.endif
+	.ifc "\d", "x16"
+	 str  x0, [sp, #128]
+	.endif
+	.ifc "\d", "x17"
+	 str  x0, [sp, #136]
+	.endif
+	ldp  x0,  x1,  [sp], #16
+	ldp  x2,  x3,  [sp], #16
+	ldp  x4,  x5,  [sp], #16
+	ldp  x6,  x7,  [sp], #16
+	ldp  x8,  x9,  [sp], #16
+	ldp  x10, x11, [sp], #16
+	ldp  x12, x13, [sp], #16
+	ldp  x14, x15, [sp], #16
+	ldp  x16, x17, [sp], #16
+	ldr  x30, [sp], #16
 .endm
 
 	.globl _script_eval

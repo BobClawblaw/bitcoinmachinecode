@@ -79,7 +79,13 @@ int main(void){
     printf("== the wtxid cache: reconstruction hashes no pool entry ==\n");
     ok(cmpct_recv_hashed() == 0, "every reconstruction above took its wtxids from the slot cache: 0 tx_wtxid calls for pool entries");
     printf("== 50,000-entry pool, one pinned core: cache off (pre-cache ht_build) vs on, same block ==\n");
-    { cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(0, &cs); if (sched_setaffinity(0, sizeof cs, &cs) != 0) printf("  (note: could not pin to cpu 0)\n");
+    { /* cpu_set_t/sched_setaffinity are Linux-only; on macOS the bench just
+         runs unpinned (the pin is a noise-reduction nicety, not the gate). */
+#ifdef __APPLE__
+      if (0) printf("  (note: core pinning is Linux-only; running unpinned)\n");
+#else
+      cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(0, &cs); if (sched_setaffinity(0, sizeof cs, &cs) != 0) printf("  (note: could not pin to cpu 0)\n");
+#endif
       enum { BIG_SLOTS = 131072, NBIG = 50000 };
       static unsigned char bblob[8 << 20]; unsigned char* big = mkpool(BIG_SLOTS, bblob, sizeof bblob, 5, NBIG - 5, tx, tl);
       ok(mpool_count(big) == NBIG, "50,000 entries in the pool (the block's five among them)");
