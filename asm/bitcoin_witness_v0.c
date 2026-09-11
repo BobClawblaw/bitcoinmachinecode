@@ -188,7 +188,19 @@ int sv_verify_witness_v0(const uint8_t* prog, uint32_t proglen,
                          const uint8_t* tx, unsigned long txlen,
                          uint8_t* work, unsigned long workcap){
     static __thread uint8_t* main_e; BMC_TLS_BUF(main_e, MAX_STACK*ELEM_SIZE);
-    static __thread uint8_t p2wpkh_script[25];
+    /* bmc_osx (testnet4 connect crash, 2026-09-11): this was a TRUE-TLS
+     * array (Mach-O TLV). Inside the daemon's forked connect worker, the
+     * TLV getter for it faulted (SIGSEGV si_addr 0x18..0x1e0, si_code
+     * ACCERR, PC at the strh into the TLV slot) on Phase-2 worker threads
+     * mid-catch-up -- reproducible across worker restarts, NOT reachable
+     * from any standalone driver (plain threads, forked child with fresh
+     * threads, forked child of a multi-threaded parent all pass). The repo
+     * already standardised on lazily heap-allocated per-thread scratch
+     * (bmc_thread.h BMC_TLS_BUF) after the same class bit on Linux; this
+     * array (and the other static-TLS arrays converted alongside) are the
+     * leftovers. Heap per-thread removes the dyld TLV dependency from the
+     * verify path entirely. */
+    static __thread uint8_t* p2wpkh_script; BMC_TLS_BUF(p2wpkh_script, 25);
     const uint8_t* script; uint32_t slen; uint32_t nstack;
     if (proglen == 32){
         if (nwit == 0) return SCRIPT_ERR_WITNESS_PROGRAM_WITNESS_EMPTY;
