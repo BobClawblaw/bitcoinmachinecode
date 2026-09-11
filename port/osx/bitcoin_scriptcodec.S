@@ -106,6 +106,46 @@
 	.ifc "\d", "x17"
 	 str  x0, [sp, #136]
 	.endif
+	/* Callee-saved destinations (x19-x28): the macro's pops never restore
+	 * them, so the getter's result can be moved directly -- but the mov must
+	 * happen BEFORE the first pop clobbers x0. Without these branches the
+	 * getter result was SILENTLY DISCARDED for a callee-saved \d: the macro
+	 * assembled cleanly and \d kept whatever stale value it held. That ate
+	 * three sites: TLS_ADDR x24,_hnd_tab in _hnd_end (the table pointer was
+	 * garbage -> the permutation cycle-walk elem_move'd to a wild address --
+	 * the testnet4 h=124,032/124,845 p2wsh EVAL_FALSE + harness SIGBUS), and
+	 * TLS_ADDR x27,_cms_scstrip0/1 in the CHECKMULTISIG strip (wild strip
+	 * buffer). All x0-x17 destinations were always fine (slot delivery). */
+	.ifc "\d", "x19"
+	 mov  \d, x0
+	.endif
+	.ifc "\d", "x20"
+	 mov  \d, x0
+	.endif
+	.ifc "\d", "x21"
+	 mov  \d, x0
+	.endif
+	.ifc "\d", "x22"
+	 mov  \d, x0
+	.endif
+	.ifc "\d", "x23"
+	 mov  \d, x0
+	.endif
+	.ifc "\d", "x24"
+	 mov  \d, x0
+	.endif
+	.ifc "\d", "x25"
+	 mov  \d, x0
+	.endif
+	.ifc "\d", "x26"
+	 mov  \d, x0
+	.endif
+	.ifc "\d", "x27"
+	 mov  \d, x0
+	.endif
+	.ifc "\d", "x28"
+	 mov  \d, x0
+	.endif
 	ldp  x0,  x1,  [sp], #16
 	ldp  x2,  x3,  [sp], #16
 	ldp  x4,  x5,  [sp], #16
