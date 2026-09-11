@@ -58,6 +58,7 @@ typedef struct {
     volatile long             inflight_lo, inflight_hi;   /* download worker: the chunk in flight (hi < lo = none) */
     volatile int              dl_worker;      /* download worker index, -1 for a leg or inbound peer */
     volatile long long        bps_recv;       /* download worker: parent-sampled receive rate, bytes/s (0 = unmeasured). 2026-09-10 */
+    volatile int              idle_pct;       /* download worker: share of its chunk wall-clock spent blocked in the socket read, 0..100, -1 unmeasured. 2026-09-11 */
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
@@ -404,6 +405,13 @@ typedef struct {
     volatile long long        dl_stall_timeout_s; /* the adaptive stall timeout right now */
     volatile long long        dl_stall_evictions; /* window-tail evictions this run */
     volatile long long        dl_median_bps;      /* the pool's median receive rate */
+    /* Pool OCCUPANCY: the share of all worker wall-clock spent blocked in the
+     * socket read (0..100, -1 unmeasured). This is the number that answers
+     * "would more peers help?". Low means the peers are filling the pipe and
+     * only more of them can help; high means the slots are held by peers that
+     * cannot fill it. Measured on run 22 from OUTSIDE the process because the
+     * node did not report it: 11-20% per worker while the log said 8/8 active. */
+    volatile int              dl_pool_idle_pct;
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 

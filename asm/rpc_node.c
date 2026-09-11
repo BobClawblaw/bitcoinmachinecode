@@ -2490,6 +2490,8 @@ static int cmd_bmcgetdownloadinfo(rj_val** res){
     }
     rj_obj_set(o, "active", rj_bool(1));
     rj_obj_set(o, "workers",          rj_numf("%d",   s->dl_workers));
+    /* the one figure that says whether adding peers would help: see rpc_node.h */
+    rj_obj_set(o, "pool_idle_pct",    rj_numf("%d",   s->dl_pool_idle_pct));
     rj_obj_set(o, "pool",             rj_numf("%d",   s->dl_pool));
     rj_obj_set(o, "banned",           rj_numf("%d",   s->dl_banned));
     rj_obj_set(o, "free_peers",       rj_numf("%d",   s->dl_free_peers));
@@ -2517,6 +2519,7 @@ static int cmd_bmcgetdownloadinfo(rj_val** res){
           rj_obj_set(w, "conntime",   rj_numf("%lld", (long long)p->conn_time));
           rj_obj_set(w, "bytes_recv", rj_numf("%lld", (long long)p->bytes_recv));
           rj_obj_set(w, "bps_recv",   rj_numf("%lld", (long long)p->bps_recv));
+          rj_obj_set(w, "idle_pct",   rj_numf("%d", p->idle_pct));
           /* the chunk in flight; hi < lo means the worker holds nothing */
           rj_obj_set(w, "inflight_lo", rj_numf("%lld", (long long)p->inflight_lo));
           rj_obj_set(w, "inflight_hi", rj_numf("%lld", (long long)p->inflight_hi));

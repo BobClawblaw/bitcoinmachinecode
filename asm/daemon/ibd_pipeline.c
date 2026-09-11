@@ -1,4 +1,5 @@
 #include <string.h>
+#include <time.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include "ibd_pipeline.h"
@@ -37,6 +38,19 @@ static long ibd_sink(void* st, long height, const unsigned char hash[32], const 
 }
 
 static long g_last_batch = 0; static int g_last_fail = 0;
+/* How long the last chunk spent BLOCKED IN THE SOCKET READ, against its total
+ * wall clock. Measured 2026-09-11 on run 22 from outside the process: the
+ * eight workers were idle 11-20% of wall time, waiting on peer bytes, while
+ * the daemon's own line said "8/8 worker(s) active". Occupancy is the number
+ * that decides whether more peers would help, and it was the one number the
+ * download did not report. */
+static long long g_wait_ms = 0, g_wall_ms = 0;
+long ibd_pipeline_last_wait_ms(void){ return g_wait_ms; }
+long ibd_pipeline_last_wall_ms(void){ return g_wall_ms; }
+static long long ibd_now_ms(void){
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec*1000 + ts.tv_nsec/1000000;
+}
 long ibd_pipeline_last_batch(void){ return g_last_batch; }
 static long g_wave = 0;                  /* 0 = the whole chunk in one getdata */
 void ibd_pipeline_set_wave(long n){ g_wave = (n > 0 && n < IBD_PIPE_MAX) ? n : 0; }
@@ -61,6 +75,9 @@ long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long n
                                unsigned char* buf, unsigned buflen,
                                void* scratch, unsigned scratch_cap)
 {
+    /* declared before the first `goto fail`, or the jump skips the
+     * initialiser and the compiler is right to refuse it. */
+    const long long chunk_t0 = ibd_now_ms(); g_wait_ms = 0; g_wall_ms = 0;
     if (nloc <= 0 || nloc > IBD_PIPE_MAX) return IBD_FAIL_ARGS;
     static unsigned held_off[IBD_PIPE_MAX], held_len[IBD_PIPE_MAX];
     static unsigned char held_hash[IBD_PIPE_MAX][32];
@@ -97,7 +114,9 @@ long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long n
             sent_to += take;
         }
         char cmd[12]; unsigned len = 0;
+        long long rd_t0 = ibd_now_ms();
         int r = p2p_read(fd, cmd, buf, buflen, &len);
+        g_wait_ms += ibd_now_ms() - rd_t0;
         if (r <= 0){ why = IBD_FAIL_READ; goto fail; }
         if (!strncmp(cmd, "ping", 12) && len == 8){ p2p_write(fd, "pong", 4, buf, 8); continue; }
         if (strncmp(cmd, "block", 12) != 0) continue;         /* inv, addr, feefilter, ... */
@@ -159,11 +178,13 @@ long ibd_fetch_chunk_pipelined(int fd, void* st, void* hst, long lo_real, long n
     }
     if (stored != nloc){ why = IBD_FAIL_BUDGET; goto fail; }
     if (hold) munmap(hold, IBD_HOLD_BYTES);
+    g_wall_ms = ibd_now_ms() - chunk_t0;
     return stored;
 fail:
     /* every failure path releases the hold: dlc_worker retries a failed chunk
      * against another peer, so a leak here would be per retry, not per run. */
     if (hold) munmap(hold, IBD_HOLD_BYTES);
+    g_wall_ms = ibd_now_ms() - chunk_t0;
     g_last_fail = why;
     return why;
 }

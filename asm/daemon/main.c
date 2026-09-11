@@ -3816,6 +3816,7 @@ static int dl_pool_from_book(void* ab, char out[][DL_POOL_SLOT], int nitems){
  * with a proportionally shorter budget gives a ~4x faster detect-and-replace
  * cycle at ~4x lower cost per miss. */
 #define DLC_CHUNK_BLOCKS 40
+static long g_dlc_pool_idle_pct = -1;   /* pool-wide share of worker wall-clock blocked in the socket read (2026-09-11); -1 until a chunk completes */
 /* Draw from the WHOLE address book, not a 512 slice of it. Measured
  * 2026-08-18: the book held 1,974 peers, the pool was capped at 512, the
  * probe tried all 512 and only 22 were reachable (~4% -- normal for an aged
@@ -4948,6 +4949,13 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
                  unsigned proto; unsigned long long services; char subver[96]; int start_height; long long conn_time;
                  long cur_lo, cur_hi; long long bytes_peer;
                  int kill_reason;          /* set by the parent before SIGUSR1: 0 dead weight, 1 stalling the window (2026-09-10) */
+                 /* 2026-09-11: OCCUPANCY. The worker adds each chunk's blocked-in-read
+                  * time and wall clock here; the parent prints the ratio. Measured from
+                  * outside on run 22, the eight workers were idle 11-20% of wall time
+                  * waiting on peer bytes while the status line said "8/8 active" --
+                  * true, and useless, because a worker holding a peer that cannot fill
+                  * the pipe is active and idle at the same time. */
+                 long long wait_ms, wall_ms;
                } dlc_stat_t;
 static long long dlc_now_ms(void); static long dlc_proc_rchar(pid_t pid);   /* fwd decls: the worker judges its own chunk before these are defined */
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
@@ -5172,6 +5180,8 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
             if(sfd<0){ fprintf(stderr,"[dlc w%d] stage: cannot create %s (%s)\n", w, stmp, strerror(errno)); close(fd); fd=-1; DLC_RELEASE(); break; }
             g_stage_fd=sfd; ibd_pipeline_set_sink(dlc_stage_sink);
             long r=ibd_fetch_chunk_pipelined(fd, st, hst, lo, n, buf, (unsigned)sizeof buf, scratch, cap);
+            mystat->wait_ms += ibd_pipeline_last_wait_ms();
+            mystat->wall_ms += ibd_pipeline_last_wall_ms();
             alarm(0); sigaction(SIGALRM,&old,NULL);
             close(sfd); g_stage_fd=-1;
             if(r>=0 && !mux_sync_budget_fired){
@@ -6154,6 +6164,14 @@ static long dl_catchup(const char* dir, int min_workers){
         double median_bps = 0.0;
         { double v[64]; int nv = 0;
           for(int w=0;w<nw;w++) if(kids[w]!=0 && prev_rchar[w] > 0) v[nv++] = stats[w].last_bw_bps;   /* only workers with a real reading */
+          /* the pool's occupancy, for the tick line: the share of all worker
+           * wall-clock spent blocked in the socket read. This is the number
+           * that answers "would more peers help?" -- if the pool is 5% idle
+           * the peers are filling the pipe and only more of them can help; if
+           * it is 30% idle the slots are held by peers that cannot. */
+          { long long sw=0, sl=0;
+            for(int w2=0;w2<nw;w2++){ sw += stats[w2].wait_ms; sl += stats[w2].wall_ms; }
+            g_dlc_pool_idle_pct = sl > 0 ? (long)((sw*100)/sl) : -1; }
           for(int i=1;i<nv;i++){ double x=v[i]; int j=i-1; while(j>=0 && v[j]>x){ v[j+1]=v[j]; j--; } v[j+1]=x; }
           if(nv > 0) median_bps = v[nv/2]; }
         double floor_bps = dlc_effective_floor(median_bps);
@@ -6173,6 +6191,8 @@ static long dl_catchup(const char* dir, int min_workers){
                 d->conn_time = stats[w].conn_time; d->bytes_recv = stats[w].bytes_peer; d->bytes_sent = 0;
                 d->last_recv = d->last_send = (long long)time(NULL);
                 d->inflight_lo = stats[w].cur_lo; d->inflight_hi = stats[w].cur_hi; d->dl_worker = w; d->inbound = 0;
+                d->idle_pct = stats[w].wall_ms > 0
+                    ? (int)((stats[w].wait_ms * 100) / stats[w].wall_ms) : -1;
                 d->bps_recv = (long long)stats[w].last_bw_bps;   /* 2026-09-10: for bmcgetdownloadinfo */
                 d->used = 1;
             }
@@ -6180,6 +6200,10 @@ static long dl_catchup(const char* dir, int min_workers){
             g_node_status->dl_bytes_total = (long long)cumulative_bytes;
             /* the aggregate state bmcgetdownloadinfo serves (2026-09-10) */
             g_node_status->dl_active          = 1;
+            /* -1, not 0, before the first chunk completes: the shared table is
+             * zeroed at creation, and a zero here reads as "0% idle", which is
+             * the most confident possible claim from a node that has measured
+             * nothing. */
             g_node_status->dl_workers         = nw;
             g_node_status->dl_pool            = nlive;
             { int nb = 0; for(int q = 0; q < nlive; q++) if(banned[q]) nb++; g_node_status->dl_banned = nb; }
@@ -6193,6 +6217,7 @@ static long dl_catchup(const char* dir, int min_workers){
             g_node_status->dl_stall_timeout_s = g_dlc_stall_timeout_s;
             g_node_status->dl_stall_evictions = next_claim[DLC_CTL_N_STALL];
             g_node_status->dl_median_bps      = (long long)median_bps;
+            g_node_status->dl_pool_idle_pct   = (int)g_dlc_pool_idle_pct;
         }
         for(int w=0;w<nw;w++){
             long b=stats[w].blocks; long blkrate=(long)((double)(b-prev_blocks[w])/tick_s);
@@ -6270,14 +6295,27 @@ static long dl_catchup(const char* dir, int min_workers){
              * show up at all). Resets to nothing once healthy or just cut. */
             char dragbuf[48]="";
             if(dead_ticks[w]>0) snprintf(dragbuf,sizeof dragbuf," (Dragging: %d of %d)",dead_ticks[w],g_cfg.dead_weight_ticks);
-            if(dlc_table_this_tick) fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s)%s%s%s\n",
+            /* idle% = of this worker's chunk wall-clock, the share spent blocked
+             * in the socket read. Low means the peer is filling the pipe and
+             * more peers is the only lever; high means the peer cannot, and the
+             * worker is holding a slot it is not using. */
+            char idlebuf[32]="";
+            if(stats[w].wall_ms > 0){
+                long pc=(long)((stats[w].wait_ms*100)/stats[w].wall_ms);
+                if(pc<0) pc=0;
+                if(pc>100) pc=100;
+                snprintf(idlebuf,sizeof idlebuf," idle=%d%%", (int)pc);   /* 0..100, so int: %ld made the compiler reserve 19 digits */
+            }
+            if(dlc_table_this_tick) fprintf(stderr,"[dlc]   w%d %-21s chunks=%-4ld blocks=%-6ld (+%ld blk/s, %s%s)%s%s%s\n",
                     w, stats[w].peer[0]?(const char*)stats[w].peer:"(connecting)",
-                    stats[w].chunks, b, blkrate, bw, kids[w]==0?" [done]":"", flag, dragbuf);
+                    stats[w].chunks, b, blkrate, bw, idlebuf, kids[w]==0?" [done]":"", flag, dragbuf);
             prev_blocks[w]=b;
         }
         {
             cumulative_bytes+=tick_total_bytes;
             cumulative_write_bytes+=tick_total_write_bytes;
+            char idlepool[32]="";
+            if(g_dlc_pool_idle_pct >= 0) snprintf(idlepool,sizeof idlepool," | pool idle %d%%", (int)(g_dlc_pool_idle_pct > 100 ? 100 : g_dlc_pool_idle_pct));
             char totbuf[16], aggbuf[16], cumbuf[16], wtotbuf[16], waggbuf[16], wcumbuf[16];
             dlc_fmt_bytes(totbuf,sizeof totbuf,tick_total_bytes);
             dlc_fmt_rate(aggbuf,sizeof aggbuf,tick_total_bytes/tick_s);
@@ -6312,8 +6350,8 @@ static long dl_catchup(const char* dir, int min_workers){
               static int last_nowit = 0; int nw_now = peer_no_witness_count();
               if(nw_now != last_nowit){ last_nowit = nw_now;              /* only when the count changes */
                   fprintf(stderr,"[dlc] -- %d peer(s) dropped for lacking NODE_WITNESS; %llu redial(s) skipped since --\n", nw_now, peer_no_witness_skips()); } }
-            fprintf(stderr,"[dlc] -- recv %s (avg %s) | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | free peers %d | staged %ld commit %ld cursorhelp %ld | stall evictions %ld (timeout %ld s) | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
-                    aggbuf, avgrbuf, waggbuf, avgwbuf, floor_bps/1024.0, median_bps/1024.0, cur, nlive,
+            fprintf(stderr,"[dlc] -- recv %s (avg %s)%s | write %s (avg %s) | floor %.1f KB/s (median %.1f) | banned %ld/%d%s | free peers %d | staged %ld commit %ld cursorhelp %ld | stall evictions %ld (timeout %ld s) | events %ld rot %ld wait %ld help %ld fail %ld abandon (run %ld/%ld/%ld/%ld/%ld) --\n",
+                    aggbuf, avgrbuf, idlepool, waggbuf, avgwbuf, floor_bps/1024.0, median_bps/1024.0, cur, nlive,
                     nbanned == cur ? "" : " (amnesty active)", free_peers, next_claim[DLC_CTL_STAGED], next_claim[DLC_CTL_N_COMMIT], next_claim[DLC_CTL_N_CURSOR_HELP],
                     next_claim[DLC_CTL_N_STALL], g_dlc_stall_timeout_s, d_ro, d_wa, d_he, d_fa, d_ab, t_ro, t_wa, t_he, t_fa, t_ab);
         }
