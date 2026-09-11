@@ -1,0 +1,203 @@
+[size=16pt][b]An assembly Bitcoin node vs Bitcoin Core v31.1: a full mainnet IBD, measured[/b][/size]
+
+2026-09-11. Benchmark tag [tt]bench-2026-09-10[/tt], node commit [tt]4a4872cf[/tt].
+
+This is a report on one fresh mainnet initial block download by an independent
+Bitcoin full node written in x86-64 assembly, measured against Bitcoin Core
+v31.1 on the same machine, and on the defect that measurement found.
+
+[b]The short version: it finished an hour ahead of Core, and it was still wrong.[/b]
+The chain it built is identical to Core's, block for block. The UTXO set it
+derived from that chain is not.
+
+[hr]
+[size=12pt][b]The machine, and both configurations[/b][/size]
+
+[table]
+[tr][td][b][/b][/td][td][b][/b][/td][/tr]
+[tr][td]CPU[/td][td]AMD Ryzen 9 9950X3D, 16 cores / 32 threads[/td][/tr]
+[tr][td]RAM[/td][td]123 GB[/td][/tr]
+[tr][td]disk[/td][td]Samsung Portable SSD T5, 1.8 TB, ext4, sequential write 0.40 GiB/s[/td][/tr]
+[tr][td]kernel[/td][td]Linux 7.0.0-31-generic[/td][/tr]
+[tr][td]link[/td][td]2500 Mb/s, no traffic shaping ([tt]fq_codel[/tt] default)[/td][/tr]
+[/table]
+
+Both nodes: [tt]dbcache=8192[/tt], fresh datadir, no [tt]assumeutxo[/tt], no pruning, mainnet,
+peers from the public network by DNS seed.
+
+[b]On peer counts, which is where IBD comparisons usually go wrong.[/b] Core's
+block-download concurrency is not configurable. [tt]MAX_OUTBOUND_FULL_RELAY_CONNECTIONS[/tt]
+pins it at 8 outbound full-relay peers regardless of what [tt]maxconnections[/tt] says,
+and it keeps up to 16 blocks in flight per peer inside a 1,024-block window.
+Earlier comparisons here ran the assembly node at 16 to 64 downloading peers
+against Core's 8, which is not a comparison of anything. This run is the first
+at [b]8 on both sides[/b].
+
+[hr]
+[size=12pt][b]Result[/b][/size]
+
+[table]
+[tr][td][b][/b][/td][td][b]assembly node[/b][/td][td][b]Core v31.1[/b][/td][/tr]
+[tr][td]blocks[/td][td]966,369[/td][td]965,703[/td][/tr]
+[tr][td]wall clock[/td][td][b]20h 08m[/b][/td][td][b]21h 11m[/b][/td][/tr]
+[tr][td]UTXO engine caught up[/td][td]20h 15m[/td][td]n/a[/td][/tr]
+[tr][td]bad blocks / gaps[/td][td]zero / none[/td][td]zero[/td][/tr]
+[tr][td]tip vs oracle[/td][td]identical by hash[/td][td]identical by hash[/td][/tr]
+[/table]
+
+The chain was verified by block hash against a third node at heights 966,000,
+966,494 and 966,495. All three agree.
+
+[hr]
+[size=12pt][b]The hour is not a win[/b][/size]
+
+Segment by segment tells a different story from the total.
+
+[table]
+[tr][td][b]heights[/b][/td][td][b]Core[/b][/td][td][b]assembly node[/b][/td][td][b]ratio[/b][/td][/tr]
+[tr][td]400k-500k[/td][td]2h 07m[/td][td]2h 05m[/td][td]0.98x[/td][/tr]
+[tr][td]500k-650k[/td][td]3h 44m[/td][td]4h 05m[/td][td]1.09x slower[/td][/tr]
+[tr][td]650k-800k[/td][td]4h 45m[/td][td]5h 20m[/td][td]1.12x slower[/td][/tr]
+[tr][td]800k-850k[/td][td]4h 21m[/td][td]2h 15m[/td][td]0.52x[/td][/tr]
+[tr][td]850k-932k[/td][td]3h 13m[/td][td]3h 25m[/td][td]1.06x slower[/td][/tr]
+[/table]
+
+The two are level to height 500,000 and the assembly node is then a steady
+[b]8 to 12 percent slower[/b] in every segment but one. That one segment is where
+the hour came from, and it is not a property of either node's download code:
+
+[code]
+2026-09-05T18:27:22Z UpdateTip: height=835000
+2026-09-05T20:45:25Z Peer is stalling block download, disconnecting peer=213
+2026-09-05T20:45:30Z UpdateTip: height=840000
+[/code]
+
+Core spent 138 minutes on 5,000 blocks where the neighbouring 5,000-block
+stretches took 10 to 15, then recovered the instant its stalling-peer timeout
+fired. Take that segment out and Core finishes ahead. The honest summary is that
+**Core moves blocks about ten percent faster per segment at equal peer count,
+and the assembly node finished first because it did not lose two hours to one
+bad peer.**
+
+The assembly node evicted 11 stalling peers over the run with no comparable
+freeze. That is a real difference in stall handling, and it is the only reason
+the totals came out the way they did.
+
+[hr]
+[size=12pt][b]Where the ten percent goes[/b][/size]
+
+The node did not report the figure that answers this, so it was measured from
+outside the process at 96% of the chain, sampling [tt]/proc/<pid>/io[/tt] at 50 ms.
+
+[table]
+[tr][td][b][/b][/td][td][b][/b][/td][/tr]
+[tr][td]aggregate receive[/td][td]10.1 MB/s, flat, 99% of 6,157 samples inside 9-11 MB/s[/td][/tr]
+[tr][td]per-worker receive[/td][td]0.94 to 1.74 MB/s[/td][/tr]
+[tr][td]worker blocked with nothing arriving[/td][td]11-20% of wall time[/td][/tr]
+[tr][td]idle gaps, 30 s across 8 workers[/td][td]332; median 50 ms, p90 350 ms, none over 0.7 s[/td][/tr]
+[tr][td]worker CPU[/td][td]0.2-0.6% each[/td][/tr]
+[tr][td]block-apply CPU[/td][td]20% of one core[/td][/tr]
+[tr][td]iowait[/td][td]0[/td][/tr]
+[/table]
+
+Separately measured: 0% of samples showed a read gap while the worker was
+writing, so the staging path is not the cause either. The workers are asleep
+waiting for peer bytes, on a machine that is otherwise idle.
+
+The status line said [tt]8/8 worker(s) active[/tt]. That is true and useless, because a
+worker holding a peer that cannot fill the pipe is active and idle at the same
+time. Occupancy is now reported by the node.
+
+[b]Whether more peers would fix it is not yet known and is not being guessed at.[/b]
+This project has twice set that number without measuring it. A short
+randomised-order sweep at 8/16/24/32 peers, reading throughput together with
+occupancy, is what will settle it, because those three cases are indistinguishable
+in a single run:
+
+[list][li]idle low, throughput flat as peers rise -- a shared wide-area ceiling[/li][li]idle low, throughput rising -- per-peer limited, add peers[/li][li]idle high -- the slots are held by peers that cannot fill the pipe[/li][/list]
+
+[hr]
+[size=12pt][b]The part that matters: the UTXO set is wrong[/b][/size]
+
+The run's final check compares the whole UTXO set against Core using MuHash, the
+same rolling set hash Core's [tt]gettxoutsetinfo muhash[/tt] produces. It failed.
+
+[code]
+MUHASH h=966494 ours=34eddd67... 165206507  oracle=f235648f... 165206507
+FAIL muhash differs at 966494
+[/code]
+
+[b]This is the first time that comparison has ever completed on this project.[/b]
+Every previous run timed out inside the walk, and an empty result compared equal
+to an empty oracle value, so the harness printed nothing and the run passed. The
+capstone had been verifying nothing, for months.
+
+[b]What was ruled out, by test[/b]
+
+[table]
+[tr][td][b]hypothesis[/b][/td][td][b]test[/b][/td][td][b]result[/b][/td][/tr]
+[tr][td]a fork[/td][td]block hash at 966,494 on all three nodes[/td][td]identical[/td][/tr]
+[tr][td]the set moving under a live walk[/td][td]froze the node ([tt]setnetworkactive false[/tt]), re-hashed[/td][td]still differs, stable across repeats[/td][/tr]
+[tr][td]the MuHash implementation[/td][td]a second, independently-synced node of the same software vs Core[/td][td][b]identical[/b][/td][/tr]
+[tr][td]the set-walk code path[/td][td]that node's walk vs its own index vs Core[/td][td][b]all three identical[/b][/td][/tr]
+[/table]
+
+The second node had been built by [tt]reindex-chainstate[/tt] rather than by a fresh
+network sync, and it is byte-correct against Core on both of its code paths. So
+the code is sound and the fresh-sync [b]data[/b] is not.
+
+[b]What actually differs[/b]
+
+At height 966,495, both nodes on the same block, the benchmark node frozen:
+
+[table]
+[tr][td][b]field[/b][/td][td][b]benchmark node[/b][/td][td][b]Core[/b][/td][td][b]same[/b][/td][/tr]
+[tr][td]txouts[/td][td]165,203,925[/td][td]165,203,925[/td][td]yes[/td][/tr]
+[tr][td]bogosize[/td][td]12,942,059,030[/td][td]12,942,059,030[/td][td]yes[/td][/tr]
+[tr][td]total_amount[/td][td]20,082,569.88121624[/td][td]20,082,569.88121624[/td][td]yes[/td][/tr]
+[tr][td]muhash[/td][td][tt]2f8a7959...[/tt][/td][td][tt]dcfaa870...[/tt][/td][td][b]no[/b][/td][/tr]
+[/table]
+
+Every aggregate matches exactly. Only the set hash differs.
+
+That combination is the whole finding. The outpoints, the values and the scripts
+must be right, or [tt]txouts[/tt], [tt]total_amount[/tt] and [tt]bogosize[/tt] would move. What feeds
+MuHash and feeds none of those three is the coin's [b]height and coinbase flag[/b],
+which Core serialises into the hashed record and this node packs as
+[tt]code = (height << 1) | coinbase[/tt]. Both of this node's code paths hand that same
+word to the same hashing routine, so the hashing is shared and the inputs differ.
+
+**The fresh parallel-download sync writes correct coins with wrong height
+metadata for at least one of them.** That is not a consensus break for spending
+-- the chain is identical and every value is right -- but it is wrong data, and
+coinbase maturity and BIP68 relative timelocks are computed from exactly that
+field.
+
+[hr]
+[size=12pt][b]Why it cost twenty hours to learn that[/b][/size]
+
+The answer was one bit at the tip: the set differs. It named no block.
+
+The next run carries [tt]coinstatsindex=1[/tt], so the node records a set hash for every
+height as it syncs and the first divergent height can be bisected against Core's
+own index in seconds. From one block it is one coin. The harness also refuses to
+render a verdict on anything that is not 64 hex characters from both sides, so
+the empty-equals-empty pass that hid this is no longer possible, and it compares
+at a settled height rather than at a tip the network is still moving.
+
+The index costs sync time, so the next run's wall clock will not be comparable
+with this one's. That is deliberate. Timing is answered; correctness is not.
+
+[hr]
+[size=12pt][b]What to take from this[/b][/size]
+
+A node can download the entire chain, agree with Core on every block hash, report
+zero errors, and still derive the wrong UTXO set. Tip-hash agreement proves you
+downloaded the same chain. It says nothing about what you computed from it. If
+you are writing a node, the set hash is the check that matters, and a check that
+has never failed is worth looking at twice -- this one could not fail, and nobody
+noticed until it finally ran.
+
+The benchmark node's UTXO and header stores, 17 GB, are retained as the only
+reproduction. The 962 GB of blocks were not: they are re-downloadable and carry
+nothing the chain does not already have.
