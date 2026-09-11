@@ -3002,6 +3002,20 @@ int utxo_live_init(const char* dir){
     struct stat sb;
     int has_wal = (stat("utxo.dat", &sb) == 0 && sb.st_size > 0);
     int has_manifest = (stat("utxo_manifest.dat", &sb) == 0);
+#ifdef __APPLE__
+    /* bmc_osx: the twin's lookup fallback re-reads the FULL bloom of every
+     * candidate run per point lookup (4MB on a 4.5M-record run) -- the
+     * catch-up apply crawled at 1-30 blk/s once runs existed. The mm fast
+     * path (utxo_lsm_mm.c) caches mapped runs and is documented
+     * "single-threaded byte-correct" on macOS; its unpinned failure mode is
+     * CONCURRENT gets (8 threads), and this worker's LSM access is
+     * single-threaded (apply loop, txoq hook at block boundaries, recount
+     * -- one thread; serve children only read via their own reload).
+     * Enable it here; BMC_LSM_MMAP=0 still forces the fallback off for
+     * diffing (mm_enabled honours the env on first use). */
+    { const char *mmenv = getenv("BMC_LSM_MMAP");
+      if (!mmenv || mmenv[0] != '0') { extern void lsm_mm_set_enabled(int); lsm_mm_set_enabled(1); } }
+#endif
     int have_prior_state = has_wal || has_manifest;
     /* utxo_lsm_init(lst) -> 1 ok / -1 err, but utxo_lsm_reload(lst,u) ->
      * REPLAYED RECORD COUNT / -1 err (not literally 1) -- different
