@@ -46,3 +46,25 @@ An inventory taken after the 09-09 leg and compact-block work, extended the same
 | d | the version message: wall-clock timestamp, random nonce, our port, our tip | #144 |
 | e | chain selection like Core's: handoff, header mirror, fork tree, leg gate; the announced-height rule (median) | #137, #139, #140 |
 | f | no consensus caps where Core has none; BIP30 originals | #129, #131, #133 |
+
+---
+
+## `getchainstates`: `coins_db_cache_bytes` and `coins_tip_cache_bytes` are omitted
+
+Found 2026-09-12 by `validation/rpc_field_parity.py` once its case table was
+extended past the original 39 calls.
+
+Core reports two cache sizes per chainstate: `coins_db_cache_bytes`, the
+LevelDB block cache, and `coins_tip_cache_bytes`, the in-memory `CCoinsViewCache`
+budget. **This node has neither.** Its UTXO set is an LSM with its own sizing —
+a memtable, run files and a blob map — and no structure in it is the opposite
+number of either field.
+
+The fields are omitted rather than filled. A number here would describe a cache
+that does not exist, and a caller reading `coins_tip_cache_bytes` to reason
+about memory would be reasoning about the wrong engine entirely. This follows
+the rule that a Core-named key must carry Core's exact semantics: where the
+semantics cannot be honoured, the key is absent, not approximated.
+
+A caller wanting this node's cache sizing should read `bmcgetdownloadinfo` and
+the `dbcache` setting, which describe what is actually allocated.

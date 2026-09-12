@@ -114,3 +114,43 @@ Thirty-two of the 42 diffed calls match field for field, including
 `getblockchaininfo`, `getblockstats`, `getblockheader`, `getblocktemplate`,
 `getrawtransaction`, `getdeploymentinfo`, `getchaintxstats`, `gettxout` and
 `decoderawtransaction`.
+
+## 2026-09-12 — coverage past the original 39 calls
+
+The case table was extended from 39 calls to 58, covering the node-level and
+pure-function methods that can be diffed without a wallet and without mutating
+either side: `getblockhash`, `getchainstates`, `getaddrmaninfo`,
+`getprioritisedtransactions`, `getblockfilter`, `getmempoolcluster`,
+`gettxspendingprevout`, `testmempoolaccept`, `verifychain`, `createmultisig`,
+`createrawtransaction`, `scantxoutset status`, `scanblocks status`, the PSBT
+family (`converttopsbt`, `decodepsbt`, `analyzepsbt`, `finalizepsbt`,
+`utxoupdatepsbt`, `combinepsbt`, `joinpsbts`), `combinerawtransaction`, the
+message-signing pair, and the wallet-directory listings.
+
+**First fact established: no RPC method is missing.** All 156 of Core v31.1's
+method names are present on this node, and none is a stub — the gap was never
+the method list, it is the response shapes, which is what this document exists
+for.
+
+What the new coverage found:
+
+| call | finding | disposition |
+|---|---|---|
+| `testmempoolaccept` | `reject-details` missing | **implemented** — matches Core's `TxValidationState::ToString()`, and is omitted for `missing-inputs` exactly as Core omits it |
+| `getchainstates` | `coins_db_cache_bytes`, `coins_tip_cache_bytes` missing | **divergence, recorded** — this node has no LevelDB block cache and no `CCoinsViewCache`; see `CORE_DIVERGENCES.md` |
+| `getmempoolcluster` | errors; Core returns a cluster | **feature gap** — Core's cluster mempool is a subsystem this node does not implement. Same root as the four missing `getmempoolentry`/`getrawmempool` fields below |
+| `getmempoolentry`, `getrawmempool true` | `chunkweight`, `fees.chunk`, `vsize_adjusted`, `vsize_bip141` | **feature gap** — all four are cluster-mempool fields, not independent omissions |
+| `listwalletdir`, `getprioritisedtransactions`, `getzmqnotifications` | fields "missing" | **not defects** — our collection is empty, so there is nothing to sample. See the false-positive note in the tool |
+
+The four mempool-entry fields and `getmempoolcluster` are one item, not five:
+implementing Core's cluster linearization. That is a subsystem decision, not a
+field to add, and it is the largest remaining shape gap on the RPC surface.
+
+### The survey that must not be repeated
+
+The "is any method a stub?" question was first answered by looping over every
+Core method name and invoking it against the **live production node**. Invoking
+an API is not a read-only act: the loop called `clearbanned`, `ping` and then
+`stop`, and took production down for ninety seconds. `rpc_field_parity.py` now
+carries a `NEVER_CALL` deny list and refuses to run if any case names a method
+that changes state, spends, signs from a wallet, or controls the process.

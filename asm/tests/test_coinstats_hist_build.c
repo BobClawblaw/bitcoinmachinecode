@@ -5,6 +5,7 @@
  * unclaimed rewards per block), and the MuHash at the tip against a direct
  * fold of the surviving coins -- which exercises the builder's removal
  * algebra (the denominator) and its bookkeeping end to end. */
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -77,6 +78,20 @@ static int tick_until_settled(long long* now){
 int main(void){
     char tool[4096]; if (!getcwd(tool, sizeof tool - 48)) return 1;
     if (getenv("BMC_CSH_BUILDER")) snprintf(tool, sizeof tool, "%s", getenv("BMC_CSH_BUILDER")); else strcat(tool, "/daemon/bmc_build_coinstats_hist");
+    /* 2026-09-12: say WHY, once, instead of failing 34 assertions. Every test
+     * here that needs a rebuilt base spawns this binary; if it is missing or
+     * not executable, all of them fail with messages about adoption and status
+     * files and none of them mentions the builder. A stale artifact left at
+     * mode 644 cost a gate run exactly that way -- `make` produces 755, but it
+     * considered the existing file up to date and never rebuilt it. */
+    if (access(tool, X_OK) != 0){
+        fprintf(stderr,
+            "FAIL builder not executable: %s (%s)\n"
+            "     Every base-rebuild case below spawns it. Fix with:\n"
+            "       chmod +x %s     # or: touch daemon/build_coinstats_hist.c && make %s\n",
+            tool, strerror(errno), tool, tool);
+        return 1;
+    }
     tt_isolate();
     memset(store_buf, 0, sizeof store_buf); ck("store_init", store_init(store_buf) == 1);
     static u8 blk[4][8192]; long blen[4]; u8 hash[4][32]; static u8 scratch[16384]; u8 txid[6][32];

@@ -28,6 +28,9 @@ static const unsigned char SPK[22] = {0x00,0x14, 0x99,0x99,0x99,0x99,0x99,0x99,0
 static volatile int g_tw_run = 1;
 static int g_tw_saw_test[8];      /* per handled submission, in order */
 static int g_tw_n;
+/* 2026-09-12: settable so the missing-inputs branch of reject-details can be
+ * driven; Core omits reject-details for that reason alone. */
+static const char* g_tw_reason = "min relay fee not met";
 static int g_tw_verdict = 1;      /* what to report back */
 static int g_tw_saw_pkg[8];       /* tx_submit_pkg_n per submission, in order */
 static const char* g_tw_pkg_msg = "success";   /* package-level verdict */
@@ -55,7 +58,7 @@ static void* fake_txworker(void* arg){
                     ns->pkg_fee[i]    = 12345;
                     ns->pkg_vsize[i]  = 200;
                     snprintf((char*)ns->pkg_reason[i], sizeof ns->pkg_reason[i], "%s",
-                             pkg_ok ? (g_tw_verdict == 1 ? "" : "min relay fee not met")
+                             pkg_ok ? (g_tw_verdict == 1 ? "" : g_tw_reason)
                                     : "package-not-validated");
                 }
                 ns->pkg_eff_fee   = 12345ull * (unsigned)pn;
@@ -64,7 +67,7 @@ static void* fake_txworker(void* arg){
                          "%s", g_tw_pkg_msg);
             } else {
                 snprintf((char*)ns->tx_submit_reason, sizeof ns->tx_submit_reason,
-                         g_tw_verdict == 1 ? "" : "min relay fee not met");
+                         "%s", g_tw_verdict == 1 ? "" : g_tw_reason);
             }
             __sync_synchronize();
             ns->tx_submit_ack = last;
@@ -1172,8 +1175,27 @@ int main(void){
         ck("reject-reason is the worker's text",
            e0 && S(e0,"reject-reason") && !strcmp(S(e0,"reject-reason"), "min relay fee not met"));
         ck("no fees on a rejected tx", e0 && rj_obj_get(e0,"fees") == NULL);
-        ck("no vsize on a rejected tx", e0 && rj_obj_get(e0,"vsize") == NULL); }
+        ck("no vsize on a rejected tx", e0 && rj_obj_get(e0,"vsize") == NULL);
+        /* Core pushes reject-details = TxValidationState::ToString() next to
+         * every reject-reason (rpc/mempool.cpp), which with no debug message is
+         * the reason itself. Found missing by validation/rpc_field_parity.py
+         * once its case table was extended past the original 39 calls. */
+        ck("reject-details accompanies reject-reason",
+           e0 && S(e0,"reject-details") && !strcmp(S(e0,"reject-details"), "min relay fee not met")); }
       rj_free(r); rj_free(p);
+
+      /* ...except for missing-inputs, where Core takes the other branch and
+       * pushes the reason ALONE. */
+      g_tw_reason = "missing-inputs";
+      p = rj_parse(j, strlen(j));
+      r = NULL; rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
+      { rj_val* e0 = (r && r->nitems) ? r->items[0] : 0;
+        ck("missing-inputs still carries reject-reason",
+           e0 && S(e0,"reject-reason") && !strcmp(S(e0,"reject-reason"), "missing-inputs"));
+        ck("missing-inputs carries NO reject-details",
+           e0 && rj_obj_get(e0,"reject-details") == NULL); }
+      rj_free(r); rj_free(p);
+      g_tw_reason = "min relay fee not met";
       g_tw_verdict = 1;
 
       /* more than one tx: PACKAGE mode. The array must go to the worker as
