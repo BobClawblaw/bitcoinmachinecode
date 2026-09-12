@@ -29,52 +29,30 @@ the release this node tracks. Two connected regtest nodes give a real
 
 ## The work
 
-### 1. `getpeerinfo` — 20 fields, v31.1 has 38  *(partly done)*
+### 1. `getpeerinfo` — **38 of 38, DONE 2026-09-12**
 
-**Done 2026-09-12.** `connection_type` and `inflight` now appear on **every**
-peer, verified live on all nine. Both previously existed on download workers
-only, so the same RPC returned two different field sets depending on the kind
-of peer — a divergence inside our own call. One shared helper now owns every
-common field so the two builders cannot drift again.
+Verified live against a production node: 38 fields, nothing missing, nothing
+additive. Every field is emitted only where a real source exists.
 
-Also removed for exactness: `startingheight` (v31.1 dropped it) and
-`bmc_download_worker` (additive key in a Core call; the worker index is on
-`bmcgetdownloadinfo`, which is ours to define). `getpeerinfo` now carries **no**
-additive keys.
+| what had to be plumbed | fields |
+|---|---|
+| the socket's own facts, recorded by the process that holds it | `transport_protocol_type`, `session_id`, `addrbind` |
+| BIP152 state | `bip152_hb_from` (the peer's own flag), `bip152_hb_to` (false as a fact: `_sendcmpct_pl` is a compile-time `high_bandwidth=0`) |
+| BIP133 | `minfeefilter` — we sent a feefilter and never read the peer's |
+| address relay | `addr_relay_enabled`, `addr_processed`, `addr_rate_limited` — the counts existed but were GLOBAL, so one peer flooding looked like a busy pool |
+| ping timing | `pingtime`, `minping` — the round trip was already measured on every pong and never published, which also left the eviction logic's lowest-ping protection with nothing to protect by |
+| announcement queue | `inv_to_send`, `last_inv_sequence` |
+| activity timestamps | `last_block`, `last_transaction` — previously written only by `txann`, whose slot is set for INBOUND children alone, so on a nearly all-outbound node they never appeared at all |
+| per-message byte maps | `bytessent_per_msg` via the asm write hook, extended to carry the command name; `bytesrecv_per_msg` in the drain loops, where the command is already in hand |
+| removed for exactness | `startingheight` (v31.1 dropped it), `bmc_download_worker` (additive key in a Core call) |
 
-`last_block`, `last_transaction` and `minping` are emitted **when the data
-exists**, which matches Core's own behaviour of omitting them when unknown —
-but on this node the data mostly does not exist yet, so they do not appear in
-practice. That is honest rather than useful, and the underlying gap is real:
-
-- `last_tx_time` / `last_block_time` are written only by `txann`, which sets
-  its slot for **inbound children only** (`txann_set_my_slot` is called once,
-  from the inbound path). Production is almost entirely outbound, so the
-  fields stay empty. Core populates both for every peer.
-- `min_ping_us` has **no writer at all** — the struct comment says so
-  outright. There is no ping round-trip measurement in this node.
-
-### 1b. `getpeerinfo` — the 18 still missing
-
-The largest gap, and the one bmcmonitor's Peers page is blocked on. Twenty
-fields, grouped by where the data has to come from:
-
-- [ ] **Per-message byte counters**: `bytessent_per_msg`, `bytesrecv_per_msg`.
-      Needs a per-command counter pair on the connection, incremented in the
-      send and receive paths. Largest single item; everything else is smaller.
-- [ ] **Latency**: `pingtime`, `minping`. Needs ping round-trip tracking.
-- [ ] **Transport and identity**: `addrbind`, `connection_type`,
-      `transport_protocol_type`, `session_id`. Mostly already known at the
-      socket; `session_id` is the BIP324 session id, which the v2 code has.
-- [ ] **Relay state**: `minfeefilter`, `inflight`, `inv_to_send`,
-      `last_block`, `last_transaction`, `last_inv_sequence`,
-      `presynced_headers`.
-- [ ] **Compact blocks**: `bip152_hb_to`, `bip152_hb_from`.
-- [ ] **Address relay**: `addr_processed`, `addr_rate_limited`,
-      `addr_relay_enabled`.
-
-Note we emit `startingheight`, which **v31.1 no longer has**. Decide: keep as a
-documented extension, or drop for exactness.
+Two things the work itself turned up. The asm write hook was `(fd, plen)` and now
+carries `(fd, plen, cmd, cmdlen)`; the upload pacer ignores the extra arguments,
+as SysV allows, and the hook is installed unconditionally now because it carries
+accounting as well as pacing. And `presynced_headers` is emitted as Core's `-1`
+unless a *positive* height was recorded: the unknown default is applied where a
+leg slot is filled, but a slot published by any path that memsets the record
+arrives as 0, and 0 read as a height would claim a presync at genesis.
 
 ### 2. `getmininginfo` — 7 fields, v31.1 has 12
 

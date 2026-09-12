@@ -237,7 +237,24 @@ int main(void){
       ck("a relay leg carries inflight (empty, honestly)", p0 && rj_obj_get(p0, "inflight")
          && rj_obj_get(p0, "inflight")->typ == RJ_ARR);
       ck("no peer carries startingheight, which Core v31.1 dropped",
-         p0 && rj_obj_get(p0, "startingheight") == NULL); }
+         p0 && rj_obj_get(p0, "startingheight") == NULL);
+      /* 2026-09-12: getpeerinfo reached 38/38 against Core v31.1. These are
+       * the fields that were missing, grouped by what had to be plumbed for
+       * each -- transport facts from the socket's owner, counters from the
+       * relay paths, and the per-message byte maps from the write hook and
+       * the drain loops. Emitted unconditionally, so a stub peer shows them. */
+      static const char* ALWAYS[] = {"transport_protocol_type","session_id",
+          "connection_type","inflight","inv_to_send","last_inv_sequence",
+          "presynced_headers", NULL};
+      int miss = 0;
+      for (int q = 0; ALWAYS[q]; q++)
+          if (!p0 || !rj_obj_get(p0, ALWAYS[q])){ miss++; printf("  (missing %s)\n", ALWAYS[q]); }
+      ck("every peer carries the unconditional Core v31.1 fields", p0 && miss == 0);
+      /* presynced_headers is -1 off the presync path, which is Core's own
+       * value for it -- verified against a live node, where all three peers
+       * read -1. A 0 here would claim a presync that never happened. */
+      ck("presynced_headers defaults to Core's -1, not 0",
+         p0 && S(p0,"presynced_headers") && !strcmp(S(p0,"presynced_headers"), "-1")); }
     /* 2026-09-08: the parallel download's peers are listed too, with the chunk in flight */
     rj_free(r);
     st.n_dlpeers = 1; memset(&st.dlpeers[0], 0, sizeof st.dlpeers[0]); st.dlpeers[0].used = 1;

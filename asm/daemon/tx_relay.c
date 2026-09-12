@@ -495,6 +495,15 @@ static long long txr_exp_ms(long mean_ms){
  * the behaviour that rides on it. */
 long long txrelay_test_exp_draw(long mean_ms){ return txr_exp_ms(mean_ms); }
 
+/* Set by the daemon: per-connection counters for getpeerinfo. Declared here,
+   above every use, because these are C function POINTERS -- an implicit
+   declaration makes the compiler treat them as functions and the later
+   definition then conflicts. */
+extern void (*txrelay_on_addr_stats)(int fd, long processed, long rate_limited);
+extern void (*txrelay_on_tx_accepted)(int fd);
+extern void (*txrelay_on_inv_sent)(int fd, unsigned sent, int still_queued);
+extern void rpc_note_msg_recv(int fd, const char* cmd, unsigned plen) __attribute__((weak));
+
 static void txr_ann_add(const u8 txid[32], int src_fd){
     if (txr_ann_n >= TXR_ANN_MAX) return;
     memcpy(txr_ann[txr_ann_n], txid, 32);
@@ -603,6 +612,10 @@ long txrelay_announce(const int* fds, int nfds){
             n++;
         }
         if (n){ inv[0] = (u8)n; p2p_write(fds[f], "inv", 3, inv, 1 + n*36); }
+        /* getpeerinfo's inv_to_send (what is still queued for this peer) and
+         * last_inv_sequence (how many we have announced to it). The queue
+         * depth was per-leg all along; nothing published it. */
+        if (txrelay_on_inv_sent) txrelay_on_inv_sent(fds[f], n, txr_leg_pend_n[sl] - (int)n);
         txr_leg_pend_n[sl] = 0;
         txr_leg_next[sl] = now + txr_exp_ms(txr_ann_mean_ms);
     }
@@ -896,6 +909,7 @@ static long txr_addr_declared(const char* cmd, const u8* pl, unsigned plen){
     }
     return p2p_addr_count(pl, plen);
 }
+
 static long txr_addr_ingest(int fd, const char* cmd, const u8* pl, unsigned plen){
     long n = txr_addr_declared(cmd, pl, plen);
     if (n < 0 || n > 1000){                          /* malformed, or Core: > MAX_ADDR_TO_SEND misbehaves */
@@ -921,7 +935,9 @@ static long txr_addr_ingest(int fd, const char* cmd, const u8* pl, unsigned plen
     if (*tk > TXR_ADDR_BUCKET_MAX) *tk = TXR_ADDR_BUCKET_MAX;
     txr_addr_bucket[slot].t_ms = now;
     long budget = (long)*tk;                          /* whole tokens available */
-    if (budget <= 0){ txr_addr_gossip_limited += n; return 0; }
+    if (budget <= 0){ txr_addr_gossip_limited += n;
+        if (txrelay_on_addr_stats) txrelay_on_addr_stats(fd, 0, n);   /* wholly rate-limited is not 'quiet' */
+        return 0; }
     if (budget > n) budget = n;
     else txr_addr_gossip_limited += n - budget;         /* the tail Core would drop too */
     *tk -= (double)budget;
@@ -932,6 +948,12 @@ static long txr_addr_ingest(int fd, const char* cmd, const u8* pl, unsigned plen
     if (viol && txr_report_violation_fd) txr_report_violation_fd(fd, TXR_ADDR_VIOL_REASON);
     txr_addr_gossip_msgs++;
     if (added > 0) txr_addr_gossip_added += added;
+    /* Per-PEER counts for getpeerinfo. The three totals above are global and
+     * always were, so a peer flooding addresses looked exactly like the whole
+     * pool being busy. Core reports addr_processed and addr_rate_limited per
+     * connection; `limited` here is the same tail this function already drops. */
+    if (txrelay_on_addr_stats)
+        txrelay_on_addr_stats(fd, added > 0 ? added : 0, n - budget > 0 ? n - budget : 0);
     return added;
 }
 
@@ -1225,6 +1247,10 @@ long (*txrelay_on_block)(int fd, const unsigned char* pl, unsigned long plen) = 
  * record it never saw it -- every leg installed since #159 fetched FULL
  * blocks (11.5 s for 1.6 MB from one peer on block 966,302). */
 void (*txrelay_on_sendcmpct)(int fd, const unsigned char* pl, unsigned long plen) = 0;
+void (*txrelay_on_feefilter)(int fd, const unsigned char* pl, unsigned long plen) = 0;
+void (*txrelay_on_addr_stats)(int fd, long processed, long rate_limited) = 0;
+void (*txrelay_on_tx_accepted)(int fd) = 0;
+void (*txrelay_on_inv_sent)(int fd, unsigned sent, int still_queued) = 0;
 static void txr_block_inv_scan(int fd, const u8* pl, unsigned plen){
     if (!txrelay_on_block_inv) return;
     unsigned cc; unsigned long n = txr_varint(pl, pl + plen, &cc);
@@ -1246,6 +1272,9 @@ static int txr_block_msg(int fd, const char* cmd, const u8* pl, unsigned plen){
     if (!memcmp(cmd, "blocktxn", 9)){ if (txrelay_on_blocktxn) txrelay_on_blocktxn(fd, pl, plen); return 1; }
     if (!memcmp(cmd, "block", 6)){ if (txrelay_on_block) txrelay_on_block(fd, pl, plen); return 1; }
     if (!memcmp(cmd, "sendcmpct", 10)){ if (txrelay_on_sendcmpct) txrelay_on_sendcmpct(fd, pl, plen); return 1; }
+    /* feefilter (BIP133): the peer's minimum relay rate, for getpeerinfo's
+     * minfeefilter. We already SEND one; nothing read the peer's. */
+    if (!memcmp(cmd, "feefilter", 10)){ if (txrelay_on_feefilter) txrelay_on_feefilter(fd, pl, plen); return 1; }
     return 0;
 }
 static u8 txr_pl[TXR_PAYLOAD_CAP];      /* the sweep's payload buffer (the worker is single-threaded) */
@@ -1277,6 +1306,9 @@ long txrelay_poll_block_only_leg(int fd){
         if (poll(&pf, 1, 0) <= 0 || !(pf.revents & POLLIN)) break;
         if (p2p_read(fd, cmd, txr_pl, sizeof txr_pl, &plen) != 1) break;
         seen++;
+        /* getpeerinfo bytesrecv_per_msg: the command is in hand here, and the
+         * asm read path has two exits whose frames are not worth disturbing. */
+        if (rpc_note_msg_recv) rpc_note_msg_recv(fd, cmd, plen);
         if (!memcmp(cmd, "ping", 5)){ if (plen == 8) p2p_write(fd, "pong", 4, txr_pl, 8); continue; }
         if (!memcmp(cmd, "pong", 5)){ if (plen == 8 && txrelay_on_pong) txrelay_on_pong(fd, txr_pl); continue; }
         if (!memcmp(cmd, "inv", 4)){ txr_block_inv_scan(fd, txr_pl, plen); continue; }
@@ -1311,6 +1343,9 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
         int pr = poll(&pf, 1, wait);
         if (pr <= 0 || !(pf.revents & POLLIN)) break;
         if (p2p_read(fd, cmd, pl, TXR_PAYLOAD_CAP, &plen) != 1) break;
+        /* getpeerinfo bytesrecv_per_msg: the command is in hand here, and the
+         * asm read path has two exits whose frames are not worth disturbing. */
+        if (rpc_note_msg_recv) rpc_note_msg_recv(fd, cmd, plen);
 
         if (!memcmp(cmd, "ping", 5)){
             /* consumed a keepalive meant for the sync loop -- answer it,
@@ -1409,6 +1444,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 long r = tx_accept_validate_p2p(mp, txid, pl, plen);
                 if (r == 1){
                     accepted++;
+                    if (txrelay_on_tx_accepted) txrelay_on_tx_accepted(fd);   /* getpeerinfo last_transaction */
                     if (txr_on_accept) txr_on_accept(txid, pl, plen);   /* -walletnotify */
                     txr_ann_add(txid, fd);
                     accepted += txr_orphan_resolve_ann(mp, txid, fd);   /* cascade waiting children */

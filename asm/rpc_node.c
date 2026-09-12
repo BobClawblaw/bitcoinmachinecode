@@ -10,7 +10,25 @@
  * /BitcoinMachineCode:0.0.1/) -- so we match the documented v31 field set with
  * values true for THIS node, not the oracle's numbers.
  */
+#include <string.h>
 #include "rpc_node.h"
+
+/* Core's per-message byte breakdown for getpeerinfo. Defined here so exactly
+ * one object carries it; the header declares it extern. */
+const char* const RPC_MSG_NAMES[RPC_MSG_N] = {
+    "addr","addrv2","block","blocktxn","cmpctblock","feefilter","filteradd",
+    "filterclear","filterload","getaddr","getblocks","getblocktxn","getdata",
+    "getheaders","headers","inv","mempool","notfound","ping","pong",
+    "sendaddrv2","sendcmpct","sendheaders","tx","verack","version","other"
+};
+int rpc_msg_index(const char* cmd, unsigned cmdlen){
+    if (!cmd) return RPC_MSG_N - 1;
+    char n[13]; unsigned i = 0;
+    for (; i < 12 && i < cmdlen && cmd[i]; i++) n[i] = cmd[i];
+    n[i] = 0;
+    for (int j = 0; j < RPC_MSG_N - 1; j++) if (!strcmp(n, RPC_MSG_NAMES[j])) return j;
+    return RPC_MSG_N - 1;
+}
 #include "daemon/asmap.h"   /* mapped_as, when -asmap is loaded */
 #include "mempool_entry.h"
 #include "mempool_slot.h"    /* the structural mempool's slot layout */
@@ -258,6 +276,60 @@ static void peer_common_fields(rj_val* o, const rpc_peer_t* p)
      * block-relay-only, manual, feeler and addr-fetch; none of those exist
      * here, so none are claimed. */
     rj_obj_set(o, "connection_type", rj_str(p->inbound ? "inbound" : "outbound-full-relay"));
+    /* Core's per-message byte breakdown. Emitted whole: a peer that has
+     * exchanged nothing of a kind gets no entry for it, which is what Core
+     * does, and an all-zero map would be indistinguishable from an
+     * unmeasured one. */
+    { rj_val* s = rj_obj(); rj_val* r = rj_obj(); int ns = 0, nr = 0;
+      for (int i = 0; i < RPC_MSG_N; i++){
+          if (p->sent_per_msg[i] > 0){ rj_obj_set(s, RPC_MSG_NAMES[i], rj_numf("%lld", (long long)p->sent_per_msg[i])); ns++; }
+          if (p->recv_per_msg[i] > 0){ rj_obj_set(r, RPC_MSG_NAMES[i], rj_numf("%lld", (long long)p->recv_per_msg[i])); nr++; }
+      }
+      if (ns) rj_obj_set(o, "bytessent_per_msg", s); else rj_free(s);
+      if (nr) rj_obj_set(o, "bytesrecv_per_msg", r); else rj_free(r); }
+    /* the transport that carried this connection, and the session both sides
+     * derived. Core names them exactly this. */
+    rj_obj_set(o, "transport_protocol_type", rj_str(p->v2transport ? "v2" : "v1"));
+    { int any = 0; for (int i = 0; i < 32; i++) if (p->session_id[i]) any = 1;
+      static const char* HEXD = "0123456789abcdef";
+      char sid[65];
+      for (int i = 0; i < 32; i++){ unsigned char b = p->session_id[i]; sid[i*2]=HEXD[b>>4]; sid[i*2+1]=HEXD[b&15]; }
+      sid[64] = 0;
+      /* Core emits an EMPTY session_id on a v1 connection, not no field. */
+      rj_obj_set(o, "session_id", rj_str(any ? sid : "")); }
+    if (p->addrbind[0]) rj_obj_set(o, "addrbind", rj_str((const char*)p->addrbind));
+    /* minfeefilter is a BTC/kvB amount in Core; we hold it in sat/kvB. -1 is
+     * "the peer never sent one", which is different from a filter of zero. */
+    if (p->minfeefilter >= 0)
+        rj_obj_set(o, "minfeefilter", rj_numf("%lld.%08lld",
+            (long long)p->minfeefilter / 100000000LL, (long long)p->minfeefilter % 100000000LL));
+    if (p->hb_to   >= 0) rj_obj_set(o, "bip152_hb_to",   rj_bool(p->hb_to));
+    if (p->hb_from >= 0) rj_obj_set(o, "bip152_hb_from", rj_bool(p->hb_from));
+    if (p->addr_relay_enabled >= 0){
+        rj_obj_set(o, "addr_relay_enabled", rj_bool(p->addr_relay_enabled));
+        rj_obj_set(o, "addr_processed",     rj_numf("%lld", (long long)p->addr_processed));
+        rj_obj_set(o, "addr_rate_limited",  rj_numf("%lld", (long long)p->addr_rate_limited));
+    }
+    if (p->ping_usec > 0) rj_obj_set(o, "pingtime", rj_numf("%.6f", (double)p->ping_usec / 1e6));
+    /* Core emits all three unconditionally -- verified against a live node:
+     * inv_to_send 0, last_inv_sequence 0, presynced_headers -1 are the values
+     * a quiet peer gets, not omissions. Zero really is "nothing queued" here,
+     * so publishing it asserts nothing we have not measured. */
+    rj_obj_set(o, "inv_to_send",       rj_numf("%lld", (long long)(p->inv_to_send > 0 ? p->inv_to_send : 0)));
+    rj_obj_set(o, "last_inv_sequence", rj_numf("%lld", (long long)(p->last_inv_sequence > 0 ? p->last_inv_sequence : 0)));
+    /* presynced_headers is -1 in Core whenever the peer is not in the headers
+     * PRESYNC phase, which is every peer on a synced node -- the three on the
+     * oracle all read -1. This node's header phase holds low-work pages
+     * instead of running Core's presync state machine, so it is -1 here for a
+     * structural reason as well as the usual one. Emitted, not omitted,
+     * because Core emits it. */
+    /* > 0, not >= 0. The "unknown" default of -1 is applied where a leg slot
+     * is filled, but a slot published by another path -- the download-worker
+     * table, or any caller that memsets the record -- arrives as 0, and 0
+     * read as a height would claim a presync at genesis that never happened.
+     * A presync height of 0 is not a real state, so anything that is not
+     * positive is reported as Core's -1. */
+    rj_obj_set(o, "presynced_headers", rj_numf("%ld", (long)(p->presynced_headers > 0 ? p->presynced_headers : -1)));
     /* inflight: the block heights requested from this peer and not yet in.
      * A leg requests none, and an empty array is the honest answer there --
      * it is what Core returns for a peer with nothing outstanding. */

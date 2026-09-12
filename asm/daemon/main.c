@@ -1323,6 +1323,18 @@ static void leg_on_pong(int fd, const unsigned char nonce[8]){
         if(n != mux_out_ping_nonce[k]) return;
         mux_out_pong_at[k] = (long long)time(NULL);
         mux_out_ping_ms[k] = (long)(dh_now_ms() - mux_out_ping_sent_ms[k]);
+        /* The round trip was measured here all along and never published, so
+         * getpeerinfo had no pingtime and min_ping_us stayed 0 -- which also
+         * left inbound_evict.c's lowest-ping protection with nothing to
+         * protect by. Both now come from this one measurement. */
+        if(g_node_status && k < RPC_MAX_PEERS){
+            rpc_peer_t* pr = &g_node_status->peers[k];
+            long long us = (long long)mux_out_ping_ms[k] * 1000;
+            if(us >= 0){
+                pr->ping_usec = us;
+                if(pr->min_ping_us <= 0 || us < pr->min_ping_us) pr->min_ping_us = us;
+            }
+        }
         return;
     }
 }
@@ -2683,6 +2695,45 @@ static void rpc_peer_from_version(rpc_peer_t* pr, const unsigned char* p, long l
         unsigned height; memcpy(&height, p+off, 4); pr->start_height = (int)height;
     }
 }
+/* What only the socket's owner knows: which transport carried it, the BIP324
+ * session id both sides derived, and our own bound address. Called once, by
+ * the child that holds the fd, after the handshake settles. */
+void rpc_note_peer_socket(int slot, int fd){
+    if (!g_node_status || slot < 0 || slot >= RPC_MAX_PEERS || fd < 0) return;
+    rpc_peer_t* pr = &g_node_status->peers[slot];
+    pr->v2transport = bmc_v2_is_active(fd) ? 1 : 0;
+    /* bip152_hb_to is "we selected this peer as a high-bandwidth compact-block
+     * peer", i.e. we sent it sendcmpct with the HB flag set. We never do:
+     * bitcoind.asm's _sendcmpct_pl is `db 0, 2,0,0,0,0,0,0,0` -- high_bandwidth
+     * 0, version 2, a compile-time constant. So this is false for every peer,
+     * and it is false as a FACT about our own behaviour rather than as an
+     * unmeasured default. bip152_hb_from is the peer's own flag and is
+     * recorded when its sendcmpct arrives. */
+    pr->hb_to = 0;
+    /* addr_relay_enabled: we DO relay addresses -- serve_addr.c answers
+     * getaddr and addr_self.c gossips our own address on these legs. Core
+     * reports false for block-relay-only connections, which this node does
+     * not make. True as a fact about our behaviour, not a default. */
+    pr->addr_relay_enabled = 1;
+    if (pr->v2transport){
+        unsigned char sid[32];
+        if (bmc_v2_session_id(fd, sid)) memcpy((void*)pr->session_id, sid, 32);
+    }
+    { struct sockaddr_storage ss; socklen_t sl = sizeof ss;
+      if (getsockname(fd, (struct sockaddr*)&ss, &sl) == 0){
+          char h[64] = "";
+          if (ss.ss_family == AF_INET){
+              const struct sockaddr_in* a = (const struct sockaddr_in*)&ss;
+              if (inet_ntop(AF_INET, &a->sin_addr, h, sizeof h))
+                  snprintf((char*)pr->addrbind, sizeof pr->addrbind, "%s:%u", h, (unsigned)ntohs(a->sin_port));
+          } else if (ss.ss_family == AF_INET6){
+              const struct sockaddr_in6* a = (const struct sockaddr_in6*)&ss;
+              if (inet_ntop(AF_INET6, &a->sin6_addr, h, sizeof h))
+                  snprintf((char*)pr->addrbind, sizeof pr->addrbind, "[%s]:%u", h, (unsigned)ntohs(a->sin6_port));
+          }
+      } }
+}
+
 static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claimed){
     if (!g_node_status || slot < 0 || slot >= RPC_MAX_PEERS) return;
     rpc_peer_t* pr = &g_node_status->peers[slot];
@@ -2695,6 +2746,10 @@ static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claime
     long len = g_peer_version_len;
     const unsigned char* p = g_peer_version_payload;
     pr->dl_worker = -1; pr->inflight_lo = 1; pr->inflight_hi = 0;
+    /* UNKNOWN, not zero. The memset above made every one of these 0, and 0 is
+     * a legitimate measured value for several of them. */
+    pr->minfeefilter = -1; pr->hb_to = -1; pr->hb_from = -1;
+    pr->addr_relay_enabled = -1; pr->presynced_headers = -1;
     rpc_peer_from_version(pr, p, len);
     { extern int rp_version_frelay(const unsigned char*, long);
       pr->relaytxes = rp_version_frelay(p, len) != 0; }   /* Core relaytxes: the peer's fRelay */
@@ -2748,6 +2803,11 @@ static void leg_on_block_announce(int fd, const unsigned char hash[32], const ch
     long h; if(ht_idx && idx_get(ht_idx, hash, &h)) return;         /* already stored */
     if(mux_out_announced[k] && !memcmp(mux_out_announced_hash[k], hash, 32)) return;   /* the same block, again */
     mux_out_announced[k] = 1; memcpy(mux_out_announced_hash[k], hash, 32);
+    /* getpeerinfo's last_block. It was written only by txann, whose slot is
+     * set for INBOUND children alone, so on a node that is nearly all
+     * outbound the field never appeared at all. A novel block announced on a
+     * leg is exactly what Core records here. */
+    if(g_node_status && k < RPC_MAX_PEERS) g_node_status->peers[k].last_block_time = (long long)time(NULL);
     fprintf(stderr,"[tip] %s announced block %02x%02x%02x%02x.. by %s: its pass runs next\n", mux_out_host[k], hash[31], hash[30], hash[29], hash[28], how);
 }
 static void leg_on_block_inv(int fd, const unsigned char hash[32]){ g_announce_inv_n++; leg_on_block_announce(fd, hash, "inv"); }
@@ -2757,9 +2817,47 @@ static void leg_on_block_inv(int fd, const unsigned char hash[32]){ g_announce_i
 static void leg_on_sendcmpct(int fd, const unsigned char* pl, unsigned long plen){
     int k = leg_of_fd(fd); if(k < 0 || plen < 9) return;
     unsigned long long ver = 0; for(int i = 0; i < 8; i++) ver |= (unsigned long long)pl[1 + i] << (8 * i);
+    /* BIP152 high bandwidth: pl[0] is the peer's HB flag on the sendcmpct it
+     * sent US, which is Core's bip152_hb_from -- "this peer wants to push
+     * compact blocks to us". bip152_hb_to is the mirror, set where we send
+     * our own sendcmpct below. Recorded before the version gate, because a
+     * peer asking for HB at version 1 has still asked. */
+    if(g_node_status && k < RPC_MAX_PEERS) g_node_status->peers[k].hb_from = pl[0] ? 1 : 0;
     if(ver != 2 || mux_out_cmpct[k]) return;
     mux_out_cmpct[k] = 1;
     fprintf(stderr, "[cmpct] %s accepts compact blocks: requesting MSG_CMPCT_BLOCK on this leg from now on\n", mux_out_host[k]);
+}
+/* BIP133 feefilter: the peer's minimum relay feerate, in sat/kvB, little
+ * endian int64. Core reports it as getpeerinfo's minfeefilter. A peer that
+ * never sends one leaves the slot at -1 and the field is omitted -- which is
+ * not the same as a peer advertising a floor of zero. */
+static void leg_on_feefilter(int fd, const unsigned char* pl, unsigned long plen){
+    int k = leg_of_fd(fd); if(k < 0 || k >= RPC_MAX_PEERS || plen < 8 || !g_node_status) return;
+    long long v = 0; for(int i = 7; i >= 0; i--) v = (v << 8) | pl[i];
+    if(v < 0) return;                      /* a negative floor is not a floor */
+    g_node_status->peers[k].minfeefilter = v;
+}
+/* Core's addr_processed / addr_rate_limited, per connection. */
+/* getpeerinfo's last_transaction, for an OUTBOUND leg. Same gap as
+ * last_block: txann only ever set it for inbound children. */
+static void leg_on_tx_accepted(int fd){
+    int k = leg_of_fd(fd); if(k < 0 || k >= RPC_MAX_PEERS || !g_node_status) return;
+    g_node_status->peers[k].last_tx_time = (long long)time(NULL);
+}
+/* getpeerinfo's inv_to_send and last_inv_sequence. Core's last_inv_sequence
+ * is a monotonically rising count of announcements made to this peer; ours
+ * accumulates the invs actually written to it. */
+static void leg_on_inv_sent(int fd, unsigned sent, int still_queued){
+    int k = leg_of_fd(fd); if(k < 0 || k >= RPC_MAX_PEERS || !g_node_status) return;
+    rpc_peer_t* pr = &g_node_status->peers[k];
+    if (sent) pr->last_inv_sequence += sent;
+    pr->inv_to_send = still_queued > 0 ? still_queued : 0;
+}
+static void leg_on_addr_stats(int fd, long processed, long rate_limited){
+    int k = leg_of_fd(fd); if(k < 0 || k >= RPC_MAX_PEERS || !g_node_status) return;
+    rpc_peer_t* pr = &g_node_status->peers[k];
+    if (processed > 0)    pr->addr_processed    += processed;
+    if (rate_limited > 0) pr->addr_rate_limited += rate_limited;
 }
 static void leg_on_headers(int fd, const unsigned char* hdrs, unsigned long n){
     unsigned char bh[32]; sha256d(bh, hdrs + (n - 1) * 81, 80); g_announce_hdr_n++;
@@ -3292,6 +3390,7 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
         anchor_locator(mux_out_loc[s]); mux_out_nextretry[s] = 0;
         fprintf(stderr,"[mux:%d] leg replaced: connected next pool peer %s (fd %d) addrv2=%d [background dial]\n", s, host, fd, (int)r->wants_addrv2);
         rpc_fill_peer_slot(s, host);
+        rpc_note_peer_socket(s, fd);
         return 1;
     }
     if(mux_n_out >= MUX_MAX_OUT){ close(fd); return 0; }
@@ -3305,6 +3404,7 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
     { char pv[256]; format_peer_version_info(pv, sizeof pv);
       fprintf(stderr, "[dl] filled outbound %d = %s (fd %d) %s addrv2=%d [background dial]\n", mux_n_out, host, fd, pv, (int)r->wants_addrv2); }
     rpc_fill_peer_slot(mux_n_out, host);
+    rpc_note_peer_socket(mux_n_out, fd);
     mux_n_out++;
     return 1;
 }
@@ -4405,8 +4505,37 @@ static void dlc_fmt_eta(char* buf, size_t cap, long secs){               /* DD:H
  * stall clock, so a peer that keeps delivering is never dropped by it. */
 static void dlc_chunk_progress(void* arg){ (void)arg; alarm(DLC_CHUNK_BUDGET_SECS); }
 static void dlc_chunk_bytes(long n){ dl_gate_account(n); }   /* bmc.downloadratelimit */
-extern void (*g_p2p_write_hook)(int fd, unsigned plen);      /* bitcoin_net.asm: called before every p2p_write */
-static void p2p_upload_pace(int fd, unsigned plen){ (void)fd; ul_gate_account((long)plen); }   /* bmc.uploadratelimit */
+/* bitcoin_net.asm calls this before every p2p_write. It gained the command
+ * and its length on 2026-09-12, for getpeerinfo's bytessent_per_msg; the
+ * upload pacer ignores the extra arguments, which SysV allows. */
+extern void (*g_p2p_write_hook)(int fd, unsigned plen, const char* cmd, unsigned cmdlen);
+/* Which peer slot owns this fd in THIS process: a leg in the worker, or the
+ * one connection a serve child holds. -1 when neither, which is every helper
+ * process that writes to a socket getpeerinfo does not report. */
+static int peer_slot_of_fd(int fd){
+    int k = leg_of_fd(fd);
+    if (k >= 0 && k < RPC_MAX_PEERS) return k;
+    if (g_inbound_slot >= 0 && g_inbound_slot < RPC_MAX_PEERS) return g_inbound_slot;
+    return -1;
+}
+/* Installed as g_p2p_write_hook for EVERY process, not only when the upload
+ * pacer is on: it now carries getpeerinfo's bytessent_per_msg as well, and a
+ * node without a rate limit still has to answer that. The pacing half stays
+ * conditional on ul_gate_configure having been given a rate. Counted WITH
+ * the 24-byte header, as Core counts them. */
+static void p2p_upload_pace(int fd, unsigned plen, const char* cmd, unsigned cmdlen){
+    ul_gate_account((long)plen);
+    if (g_node_status){
+        int s = peer_slot_of_fd(fd);
+        if (s >= 0) g_node_status->peers[s].sent_per_msg[rpc_msg_index(cmd, cmdlen)] += (long long)plen + 24;
+    }
+}
+/* the receive side, called from the drain loops where the command is in hand */
+void rpc_note_msg_recv(int fd, const char* cmd, unsigned plen){
+    if (!g_node_status) return;
+    int s = peer_slot_of_fd(fd);
+    if (s >= 0) g_node_status->peers[s].recv_per_msg[rpc_msg_index(cmd, 12)] += (long long)plen + 24;
+}
 static int dlc_dead_weight(double byte_rate, long blocks_this_tick, double floor_bps){
     if (byte_rate < 0.0) return 0;                                   /* no reading yet */
     if (byte_rate < floor_bps) return 1;                             /* under the pool-relative floor */
@@ -6993,7 +7122,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
       { extern void (*txrelay_on_block_inv)(int, const unsigned char*); extern void (*txrelay_on_headers)(int, const unsigned char*, unsigned long);
         extern long (*txrelay_on_cmpctblock)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_blocktxn)(int, const unsigned char*, unsigned long); extern long (*txrelay_on_block)(int, const unsigned char*, unsigned long);
         txrelay_on_block_inv = leg_on_block_inv; txrelay_on_headers = leg_on_headers; txrelay_on_cmpctblock = leg_on_cmpctblock; txrelay_on_blocktxn = leg_on_blocktxn; txrelay_on_block = leg_on_block;
-        extern void (*txrelay_on_sendcmpct)(int, const unsigned char*, unsigned long); txrelay_on_sendcmpct = leg_on_sendcmpct; }   /* 2026-09-10: Core's shape at the tip */
+        extern void (*txrelay_on_sendcmpct)(int, const unsigned char*, unsigned long); txrelay_on_sendcmpct = leg_on_sendcmpct;
+        extern void (*txrelay_on_feefilter)(int, const unsigned char*, unsigned long); txrelay_on_feefilter = leg_on_feefilter;
+        extern void (*txrelay_on_addr_stats)(int, long, long); txrelay_on_addr_stats = leg_on_addr_stats;
+        extern void (*txrelay_on_tx_accepted)(int); txrelay_on_tx_accepted = leg_on_tx_accepted;
+        extern void (*txrelay_on_inv_sent)(int, unsigned, int); txrelay_on_inv_sent = leg_on_inv_sent; }   /* 2026-09-10: Core's shape at the tip */
       { extern int txrelay_classify_missing(const unsigned char*, unsigned long); extern void cmpct_recv_set_classifier(int (*)(const unsigned char*, unsigned long));
         cmpct_recv_set_classifier(txrelay_classify_missing); }   /* row 5: where the block's missing transactions went */   /* 2026-09-09: pings and one request per block */   /* 2026-09-09: the full-block fallback is counted on the [cmpct] line */
     if(store_reload(store_buf)!=1){ fprintf(stderr,"[dl] store_reload failed\n"); _exit(1); }
@@ -7515,6 +7648,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             { char pv[256]; format_peer_version_info(pv, sizeof pv);
               fprintf(stderr,"[dl] outbound %d = %s (fd %d) %s addrv2=%d\n", mux_n_out, srcpool[i], cfd[i], pv, (int)mux_out_wants_v2[mux_n_out]); }
             rpc_fill_peer_slot(mux_n_out, srcpool[i]);   /* publish peer to getpeerinfo */
+            rpc_note_peer_socket(mux_n_out, cfd[i]);
             mux_n_out++;
         }
         /* close every candidate fd that was NOT promoted into a live leg */
@@ -8708,6 +8842,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     { char pv[256]; format_peer_version_info(pv, sizeof pv);
                       fprintf(stderr,"[dl] filled outbound %d = %s (fd %d) %s addrv2=%d [manual: addnode]\n", mux_n_out, host, nfd, pv, (int)mux_out_wants_v2[mux_n_out]); }
                     rpc_fill_peer_slot(mux_n_out, host);
+                    rpc_note_peer_socket(mux_n_out, nfd);
                     mux_n_out++;
                     ctl_dial_report(host, 1, nowsec);
                 } else {
@@ -9700,6 +9835,8 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                         }
                     }
                     if(hok==1){ txann_set_my_slot(g_inbound_slot); txann_child_init(g_inbound_slot, node_relay_flag && g_peer_relays_txs); }
+                    /* the connection's own facts, from the process holding the socket */
+                    if(hok==1 && g_inbound_slot >= 0) rpc_note_peer_socket(g_inbound_slot, c);
                     char pv[256]; pv[0]=0; if(hok==1) format_peer_version_info(pv, sizeof pv);
                     close(l6 >= 0 ? l6 : l);
                     fprintf(stderr,"[serve] inbound %s %s [%s] (pid %d) %s\n", peerdesc,
@@ -10479,7 +10616,11 @@ int main(int argc, char** argv){
         if(catchup_workers<1) catchup_workers=1;
         if(catchup_workers>64) catchup_workers=64;
         dial_gate_configure(g_cfg.dial_rate_limit); dl_gate_configure(g_cfg.download_rate_limit_kbps);
-        ul_gate_configure(g_cfg.upload_rate_limit_kbps); if(g_cfg.upload_rate_limit_kbps > 0) g_p2p_write_hook = p2p_upload_pace;   /* inherited by every forked serve child and worker */
+        ul_gate_configure(g_cfg.upload_rate_limit_kbps);
+        /* always installed now: the hook carries per-message byte accounting as
+         * well as the pacer, and a node with no rate limit still owes
+         * getpeerinfo its bytessent_per_msg. */
+        g_p2p_write_hook = p2p_upload_pace;   /* inherited by every forked serve child and worker */
         fprintf(stderr,"[boot] config: datadir=%s port=%d (%s) listen=%d nwant=%d catchup_workers=%d (%s) dialratelimit=%d/s%s downloadratelimit=%dKB/s%s uploadratelimit=%dKB/s%s\n",
                 dir, port, (argc>=4)?"cli":"bitcoin.conf", g_cfg.listen, nwant,
                 catchup_workers, (argc>=6)?"cli":"bmc.catchupworkers", g_cfg.dial_rate_limit, g_cfg.dial_rate_limit ? "" : " (off)",
