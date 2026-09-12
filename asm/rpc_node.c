@@ -10,11 +10,30 @@
  * /BitcoinMachineCode:0.0.1/) -- so we match the documented v31 field set with
  * values true for THIS node, not the oracle's numbers.
  */
+#include <string.h>
 #include "rpc_node.h"
+
+/* Core's per-message byte breakdown for getpeerinfo. Defined here so exactly
+ * one object carries it; the header declares it extern. */
+const char* const RPC_MSG_NAMES[RPC_MSG_N] = {
+    "addr","addrv2","block","blocktxn","cmpctblock","feefilter","filteradd",
+    "filterclear","filterload","getaddr","getblocks","getblocktxn","getdata",
+    "getheaders","headers","inv","mempool","notfound","ping","pong",
+    "sendaddrv2","sendcmpct","sendheaders","tx","verack","version","other"
+};
+int rpc_msg_index(const char* cmd, unsigned cmdlen){
+    if (!cmd) return RPC_MSG_N - 1;
+    char n[13]; unsigned i = 0;
+    for (; i < 12 && i < cmdlen && cmd[i]; i++) n[i] = cmd[i];
+    n[i] = 0;
+    for (int j = 0; j < RPC_MSG_N - 1; j++) if (!strcmp(n, RPC_MSG_NAMES[j])) return j;
+    return RPC_MSG_N - 1;
+}
 #include "daemon/asmap.h"   /* mapped_as, when -asmap is loaded */
 #include "mempool_entry.h"
 #include "mempool_slot.h"    /* the structural mempool's slot layout */
 #include "version_gen.h"
+#include "build_gen.h"
 #include <signal.h>
 #include <errno.h>
 #include <string.h>
@@ -155,6 +174,16 @@ static int cmd_getnetworkinfo(rj_val** res){
     { rj_val* names = rj_arr(); rj_arr_push(names, rj_str("NETWORK"));
       rj_arr_push(names, rj_str("WITNESS"));
       rj_obj_set(o, "localservicesnames", names); }
+    /* 2026-09-10: WHICH BUILD is answering. bmcmonitor measured two builds on
+     * this box giving different answers to getnettotals and getpeerinfo while
+     * both reported subversion "/BitcoinMachineCode:0.0.1/", and concluded
+     * that the log banner was the only build attestation available -- so a
+     * monitor could not tell a fixed node from a broken one over RPC.
+     * subversion cannot carry this: it goes out on the wire in the version
+     * message, and Core's semantics for it are the user agent. Extension
+     * fields, bmc_ prefixed like getpeerinfo's bmc_download_worker. */
+    rj_obj_set(o, "bmc_build_commit", rj_str(BMC_BUILD_COMMIT));
+    rj_obj_set(o, "bmc_build_dirty",  rj_bool(BMC_BUILD_DIRTY));
     rj_obj_set(o, "localrelay", rj_bool(g_localrelay));
     rj_obj_set(o, "timeoffset", rj_numf("%d", 0));
     /* the REAL toggle state, not a constant: setnetworkactive changes it and
@@ -219,6 +248,98 @@ static void services_names(unsigned long long s, rj_val* arr){
  * synced_headers/blocks) are reported as 0/-1 -- a documented gap, not a
  * fabricated value. Inbound peers are counted (getconnectioncount) but not
  * itemized here yet (they are separate forked children). */
+/* The getpeerinfo fields common to a relay leg and a download worker.
+ *
+ * There are two builders below -- one per kind of peer -- and every field
+ * added to one and not the other is a silent divergence in the same call.
+ * Anything either of them can answer honestly goes here, once.
+ *
+ * Only fields with a REAL source are emitted. Core's getpeerinfo has 38
+ * fields in v31.1 and this node does not yet track the rest: per-message byte
+ * counters, ping round-trip times, the peer's feefilter, its compact-block
+ * high-bandwidth state, the BIP324 session id, the bound local address, and
+ * the address-relay counters. Emitting any of those as a zero or a guess
+ * would be worse than omitting them -- a caller cannot tell an invented zero
+ * from a measured one. They are tracked in docs/PARITY_RPC_FIELDS.md. */
+static void peer_common_fields(rj_val* o, const rpc_peer_t* p)
+{
+    /* Core reports these as seconds since epoch, and omits them at 0 rather
+     * than claiming "at the epoch". */
+    if (p->last_block_time > 0) rj_obj_set(o, "last_block", rj_numf("%lld", (long long)p->last_block_time));
+    if (p->last_tx_time   > 0) rj_obj_set(o, "last_transaction", rj_numf("%lld", (long long)p->last_tx_time));
+    /* minping in SECONDS, as Core prints it. min_ping_us is 0 when unmeasured
+     * -- this node does not ping inbound peers -- and an unmeasured minimum
+     * printed as 0.0 would read as a perfect link. Omitted, like Core. */
+    if (p->min_ping_us > 0)
+        rj_obj_set(o, "minping", rj_numf("%.6f", (double)p->min_ping_us / 1e6));
+    /* connection_type: what this node actually runs. Core also has
+     * block-relay-only, manual, feeler and addr-fetch; none of those exist
+     * here, so none are claimed. */
+    rj_obj_set(o, "connection_type", rj_str(p->inbound ? "inbound" : "outbound-full-relay"));
+    /* Core's per-message byte breakdown. Emitted whole: a peer that has
+     * exchanged nothing of a kind gets no entry for it, which is what Core
+     * does, and an all-zero map would be indistinguishable from an
+     * unmeasured one. */
+    { rj_val* s = rj_obj(); rj_val* r = rj_obj(); int ns = 0, nr = 0;
+      for (int i = 0; i < RPC_MSG_N; i++){
+          if (p->sent_per_msg[i] > 0){ rj_obj_set(s, RPC_MSG_NAMES[i], rj_numf("%lld", (long long)p->sent_per_msg[i])); ns++; }
+          if (p->recv_per_msg[i] > 0){ rj_obj_set(r, RPC_MSG_NAMES[i], rj_numf("%lld", (long long)p->recv_per_msg[i])); nr++; }
+      }
+      if (ns) rj_obj_set(o, "bytessent_per_msg", s); else rj_free(s);
+      if (nr) rj_obj_set(o, "bytesrecv_per_msg", r); else rj_free(r); }
+    /* the transport that carried this connection, and the session both sides
+     * derived. Core names them exactly this. */
+    rj_obj_set(o, "transport_protocol_type", rj_str(p->v2transport ? "v2" : "v1"));
+    { int any = 0; for (int i = 0; i < 32; i++) if (p->session_id[i]) any = 1;
+      static const char* HEXD = "0123456789abcdef";
+      char sid[65];
+      for (int i = 0; i < 32; i++){ unsigned char b = p->session_id[i]; sid[i*2]=HEXD[b>>4]; sid[i*2+1]=HEXD[b&15]; }
+      sid[64] = 0;
+      /* Core emits an EMPTY session_id on a v1 connection, not no field. */
+      rj_obj_set(o, "session_id", rj_str(any ? sid : "")); }
+    if (p->addrbind[0]) rj_obj_set(o, "addrbind", rj_str((const char*)p->addrbind));
+    /* minfeefilter is a BTC/kvB amount in Core; we hold it in sat/kvB. -1 is
+     * "the peer never sent one", which is different from a filter of zero. */
+    if (p->minfeefilter >= 0)
+        rj_obj_set(o, "minfeefilter", rj_numf("%lld.%08lld",
+            (long long)p->minfeefilter / 100000000LL, (long long)p->minfeefilter % 100000000LL));
+    if (p->hb_to   >= 0) rj_obj_set(o, "bip152_hb_to",   rj_bool(p->hb_to));
+    if (p->hb_from >= 0) rj_obj_set(o, "bip152_hb_from", rj_bool(p->hb_from));
+    if (p->addr_relay_enabled >= 0){
+        rj_obj_set(o, "addr_relay_enabled", rj_bool(p->addr_relay_enabled));
+        rj_obj_set(o, "addr_processed",     rj_numf("%lld", (long long)p->addr_processed));
+        rj_obj_set(o, "addr_rate_limited",  rj_numf("%lld", (long long)p->addr_rate_limited));
+    }
+    if (p->ping_usec > 0) rj_obj_set(o, "pingtime", rj_numf("%.6f", (double)p->ping_usec / 1e6));
+    /* Core emits all three unconditionally -- verified against a live node:
+     * inv_to_send 0, last_inv_sequence 0, presynced_headers -1 are the values
+     * a quiet peer gets, not omissions. Zero really is "nothing queued" here,
+     * so publishing it asserts nothing we have not measured. */
+    rj_obj_set(o, "inv_to_send",       rj_numf("%lld", (long long)(p->inv_to_send > 0 ? p->inv_to_send : 0)));
+    rj_obj_set(o, "last_inv_sequence", rj_numf("%lld", (long long)(p->last_inv_sequence > 0 ? p->last_inv_sequence : 0)));
+    /* presynced_headers is -1 in Core whenever the peer is not in the headers
+     * PRESYNC phase, which is every peer on a synced node -- the three on the
+     * oracle all read -1. This node's header phase holds low-work pages
+     * instead of running Core's presync state machine, so it is -1 here for a
+     * structural reason as well as the usual one. Emitted, not omitted,
+     * because Core emits it. */
+    /* > 0, not >= 0. The "unknown" default of -1 is applied where a leg slot
+     * is filled, but a slot published by another path -- the download-worker
+     * table, or any caller that memsets the record -- arrives as 0, and 0
+     * read as a height would claim a presync at genesis that never happened.
+     * A presync height of 0 is not a real state, so anything that is not
+     * positive is reported as Core's -1. */
+    rj_obj_set(o, "presynced_headers", rj_numf("%ld", (long)(p->presynced_headers > 0 ? p->presynced_headers : -1)));
+    /* inflight: the block heights requested from this peer and not yet in.
+     * A leg requests none, and an empty array is the honest answer there --
+     * it is what Core returns for a peer with nothing outstanding. */
+    { rj_val* fl = rj_arr();
+      if (p->inflight_hi >= p->inflight_lo)
+          for (long h = p->inflight_lo; h <= p->inflight_hi && h < p->inflight_lo + 256; h++)
+              rj_arr_push(fl, rj_numf("%ld", h));
+      rj_obj_set(o, "inflight", fl); }
+}
+
 static int cmd_getpeerinfo(rj_val** res){
     rj_val* arr = rj_arr();
     if (g_status){
@@ -259,12 +380,17 @@ static int cmd_getpeerinfo(rj_val** res){
               if (f & (1u<<4)) rj_arr_push(pa, rj_str("download"));
               if (f & (1u<<5)) rj_arr_push(pa, rj_str("addr"));
               rj_obj_set(o, "permissions", pa); }
-            rj_obj_set(o, "startingheight", rj_numf("%d", p->start_height));
+            /* startingheight was REMOVED from Core's getpeerinfo; v31.1 run on
+             * regtest does not emit it. Dropped 2026-09-12 for exactness at the
+             * operator's call -- it was the only field we returned that Core
+             * does not. The handshake height is still kept internally and is on
+             * bmcgetdownloadinfo, which is ours to define. */
             rj_obj_set(o, "synced_headers", rj_numf("%d", -1));
             rj_obj_set(o, "synced_blocks", rj_numf("%d", -1));
             { bmc_addr_t pa; const char* nn = "ipv4";
               if (bmc_addr_from_string_port(&pa, p->addr, 0)) nn = bmc_net_name(pa.net);
               rj_obj_set(o, "network", rj_str(nn)); }
+            peer_common_fields(o, p);
             rj_arr_push(arr, o);
         }
         /* the parallel download's peers (2026-09-08), one per worker holding a
@@ -289,16 +415,27 @@ static int cmd_getpeerinfo(rj_val** res){
             rj_obj_set(o, "subver", rj_str(p->subver));
             rj_obj_set(o, "inbound", rj_bool(0));
             rj_obj_set(o, "permissions", rj_arr());
-            rj_obj_set(o, "startingheight", rj_numf("%d", p->start_height));
+            /* startingheight was REMOVED from Core's getpeerinfo; v31.1 run on
+             * regtest does not emit it. Dropped 2026-09-12 for exactness at the
+             * operator's call -- it was the only field we returned that Core
+             * does not. The handshake height is still kept internally and is on
+             * bmcgetdownloadinfo, which is ours to define. */
             rj_obj_set(o, "synced_headers", rj_numf("%d", p->start_height));
             rj_obj_set(o, "synced_blocks", rj_numf("%ld", p->inflight_hi >= p->inflight_lo ? p->inflight_lo - 1 : -1L));
-            { rj_val* fl = rj_arr(); if (p->inflight_hi >= p->inflight_lo) for (long h = p->inflight_lo; h <= p->inflight_hi && h < p->inflight_lo + 256; h++) rj_arr_push(fl, rj_numf("%ld", h));
-              rj_obj_set(o, "inflight", fl); }
-            rj_obj_set(o, "connection_type", rj_str("outbound-full-relay"));
-            rj_obj_set(o, "bmc_download_worker", rj_numf("%d", p->dl_worker));   /* this node's extension: which worker holds it */
+            /* inflight and connection_type now come from peer_common_fields
+             * below. They used to be emitted HERE and nowhere else, so the
+             * same RPC returned two different field sets depending on whether
+             * a peer was a relay leg or a download worker -- the exact
+             * divergence the shared helper exists to prevent.
+             *
+             * bmc_download_worker is gone too. It was an additive key in a
+             * Core call, which is the same category as the startingheight we
+             * just dropped for exactness; the worker index is on
+             * bmcgetdownloadinfo, which is ours to define. */
             { bmc_addr_t pa; const char* nn = "ipv4";
               if (bmc_addr_from_string_port(&pa, p->addr, 0)) nn = bmc_net_name(pa.net);
               rj_obj_set(o, "network", rj_str(nn)); }
+            peer_common_fields(o, p);
             rj_arr_push(arr, o);
         }
     }
@@ -764,6 +901,13 @@ static unsigned long mp_tx_vsize(const unsigned char* tx, unsigned long len){
     return (mp_tx_weight(tx,len) + 3) / 4;
 }
 
+/* -limitancestorcount / -limitancestorsize, injected by main.c from the
+   config; defaults are Core's pre-cluster values. See getmempoolinfo. */
+static long g_limit_anc_count = 25, g_limit_anc_size_kvb = 101;
+void rpc_node_set_ancestor_limits(long count, long size_kvb){
+    if (count > 0) g_limit_anc_count = count;
+    if (size_kvb > 0) g_limit_anc_size_kvb = size_kvb;
+}
 static int cmd_getmempoolinfo(rj_val** res){
     long count = 0; unsigned long long bytes = 0, total_fee = 0, blob_used = 0;
     if (g_mph.mp){
@@ -798,6 +942,28 @@ static int cmd_getmempoolinfo(rj_val** res){
       double eff = dyn_btc > MEMPOOL_MINFEE_BTC ? dyn_btc : MEMPOOL_MINFEE_BTC;
       rj_obj_set(o, "mempoolminfee", rj_numf("%.8f", eff)); }
     rj_obj_set(o, "minrelaytxfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));  /* Core's field name */
+    /* fullrbf: v31.1 has it, master has dropped it. Core's -mempoolfullrbf
+     * became unconditional in v28, so the field is true there and here. */
+    rj_obj_set(o, "fullrbf", rj_bool(1));
+    /* THE CLUSTER FIELDS ARE A DOCUMENTED SEMANTIC DIVERGENCE, not a copy.
+     *
+     * Core v31.1 replaced the ancestor/descendant limits with CLUSTER limits:
+     * a cluster is a whole connected component of the mempool graph, and
+     * limitclustercount/limitclustersize bound it. This node still enforces
+     * Core's older -limitancestorcount / -limitancestorsize, which bound a
+     * transaction's ANCESTOR SET, not its component.
+     *
+     * The numbers below are therefore the limits this node actually enforces,
+     * reported under Core's field names because they are the binding
+     * constraint on how large a package here can get. They are NOT cluster
+     * limits, and a caller reasoning about connected components from them
+     * would be wrong. `optimal` is false for the same reason: it means "the
+     * mempool is fully linearised" under cluster mempool, and nothing here
+     * linearises anything, so claiming true would be a lie. Recorded in
+     * docs/CORE_DIVERGENCES.md. */
+    rj_obj_set(o, "limitclustercount", rj_numf("%ld", g_limit_anc_count));
+    rj_obj_set(o, "limitclustersize", rj_numf("%ld", g_limit_anc_size_kvb * 1000));
+    rj_obj_set(o, "optimal", rj_bool(0));
     rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", (double)g_incremental_satkvb / 1e8));
     rj_obj_set(o, "unbroadcastcount", rj_numf("%d", 0));
     /* the real policy value, not a literal: reporting a setting the
@@ -1153,11 +1319,80 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
     return 1;
 }
 
+/* ---- vsize cache for the BULK path ---------------------------------------
+ * mpe_entry_obj sums ancestor and descendant vsizes by looking up each set
+ * member in the pool and PARSING IT. For one transaction that is nothing. For
+ * the whole pool it is quadratic in the cluster size: measured 2026-09-11 on
+ * 15,302 live entries, the widened getrawmempool took 8.38 s, against Core's
+ * 0.38 s for 22,992 -- about 33x per entry. On a node whose RPC server handles
+ * one request at a time, an 8 s call is an outage for every other consumer.
+ *
+ * The fix is to parse each transaction ONCE per call. The bulk path walks the
+ * pool anyway, so it records (txid, vsize) as it goes, sorts by txid, and the
+ * set sums become binary searches. Single-entry getmempoolentry passes no
+ * cache and keeps the old direct path, which is cheaper for one lookup. */
+typedef struct { unsigned char id[32]; unsigned long vs; long inf; } mpe_vs_t;
+static mpe_vs_t* g_mpe_vs; static unsigned long g_mpe_vs_n;
+/* the whole graph for this call, filled once by pol_entry_info_all; indexed
+   by the same sorted txid order as the vsize cache above */
+static mp_entry_info* g_mpe_inf; static unsigned char (*g_mpe_inf_id)[32]; static long g_mpe_inf_n;
+static int mpe_vs_cmp(const void* a, const void* b){
+    return memcmp(((const mpe_vs_t*)a)->id, ((const mpe_vs_t*)b)->id, 32);
+}
+/* the member's vsize, or 0 when it is no longer in the pool -- the same
+ * "filtered to txs still in the pool" rule the direct path applies */
+static long mpe_vs_find(const unsigned char id[32]){
+    unsigned long lo = 0, hi = g_mpe_vs_n;
+    while (lo < hi){
+        unsigned long mid = lo + (hi - lo) / 2;
+        int c = memcmp(g_mpe_vs[mid].id, id, 32);
+        if (c == 0) return (long)mid;
+        if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    return -1;
+}
+static long mpe_inf_lookup(const unsigned char id[32]){
+    long k = mpe_vs_find(id);
+    return (k >= 0 && g_mpe_inf) ? g_mpe_vs[k].inf : -1;
+}
+static unsigned long mpe_vs_lookup(const unsigned char id[32]){
+    long k = mpe_vs_find(id);
+    return k >= 0 ? g_mpe_vs[k].vs : 0;
+}
+
+/* the per-entry object, shared by getmempoolentry and verbose getrawmempool */
+static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len);
 static int cmd_getrawmempool(const rj_val* params, rj_val** res){
     /* verbose (params[0]==true) -> object keyed by txid; else -> array of
-     * txids (display byte order). Verbose entries carry the fields this node
-     * genuinely tracks: vsize, weight, time (0 if unknown), and fees.base;
-     * ancestor/descendant aggregates come with getmempoolentry (next slice). */
+     * txids (display byte order).
+     *
+     * 2026-09-11: verbose entries are now the SAME object getmempoolentry
+     * returns, which is what Core does. They used to carry four fields --
+     * vsize, weight, time, fees.base -- because this was landed as a first
+     * slice whose comment said the aggregates would come with
+     * getmempoolentry. They did: the accept-path policy registry has held the
+     * real ancestor/descendant graph ever since, and getmempoolentry has been
+     * serving `depends`, `spentby`, ancestorcount/size and descendantcount/size
+     * from it. Nobody came back to widen the bulk call.
+     *
+     * That gap was load-bearing for a consumer. Building CPFP clusters over
+     * the whole pool needs the graph for every entry, and the only way to get
+     * it was one getmempoolentry per transaction -- 19,475 calls against an
+     * RPC server that handles one request at a time. So bmcmonitor could only
+     * show ancestor packages for the block template, via getblocktemplate's
+     * own `depends`, and said so rather than pretending otherwise.
+     *
+     * 2026-09-12: that list is now shorter, and the reason it was long is
+     * gone. `vsize_adjusted` and `vsize_bip141` are emitted unconditionally --
+     * the registry stores each entry's BIP141 sigop cost and the policy layer
+     * knows -bytespersigop, so Core's adjusted weight,
+     * max(weight, sigop_cost * bytes_per_sigop) (policy.cpp
+     * GetSigOpsAdjustedWeight), is exactly computable here. `chunkweight` and
+     * `fees.chunk` are emitted for a SINGLETON cluster only, where they are
+     * determined without any linearization: a lone transaction is its own
+     * chunk. For a multi-transaction cluster both depend on Core's cluster
+     * linearization, which this node does not implement, and they are omitted
+     * rather than guessed. */
     int verbose = 0;
     if (params && params->typ == RJ_ARR && params->nitems >= 1){
         const rj_val* v = params->items[0];
@@ -1168,24 +1403,49 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
         static const char* HEXD = "0123456789abcdef";
         mpl();
         unsigned long n = mp_slot_count(g_mph.mp);
+        /* ONE parse per transaction for the whole call: fill the vsize cache
+         * on a first pass, so the ancestor/descendant sums below are binary
+         * searches instead of a pool lookup plus a full parse per set member.
+         * If the allocation fails the cache stays null and every entry takes
+         * the slower direct path -- correct either way, just slower. */
+        if (verbose && n){
+            g_mpe_vs = (mpe_vs_t*)malloc((size_t)n * sizeof *g_mpe_vs);
+            g_mpe_vs_n = 0;
+            if (g_mpe_vs){
+                for (unsigned long i=0;i<n;i++){ mp_ent e2;
+                    if (mp_slot(g_mph.mp,i,&e2) != 1) continue;
+                    memcpy(g_mpe_vs[g_mpe_vs_n].id, e2.txid, 32);
+                    g_mpe_vs[g_mpe_vs_n].vs = (mp_tx_weight(e2.tx, e2.len)+3)/4;
+                    g_mpe_vs[g_mpe_vs_n].inf = -1;
+                    g_mpe_vs_n++;
+                }
+                /* the whole graph in one pass; -1 means fall back per entry */
+                g_mpe_inf_n = -1;
+                if (g_mph.polstate && g_mph.pol_entry_info_all){
+                    g_mpe_inf = (mp_entry_info*)malloc((size_t)n * sizeof *g_mpe_inf);
+                    g_mpe_inf_id = (unsigned char (*)[32])malloc((size_t)n * 32);
+                    if (g_mpe_inf && g_mpe_inf_id)
+                        g_mpe_inf_n = g_mph.pol_entry_info_all(g_mph.polstate, g_mpe_inf, g_mpe_inf_id, (unsigned)n);
+                    if (g_mpe_inf_n < 0){ free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf=0; g_mpe_inf_id=0; }
+                }
+                qsort(g_mpe_vs, g_mpe_vs_n, sizeof *g_mpe_vs, mpe_vs_cmp);
+                for (long q=0;q<g_mpe_inf_n;q++){
+                    long k = mpe_vs_find(g_mpe_inf_id[q]);
+                    if (k >= 0) g_mpe_vs[k].inf = q;
+                }
+            }
+        }
         for (unsigned long i=0;i<n;i++){ mp_ent e;
             if (mp_slot(g_mph.mp,i,&e) != 1) continue;
             char hx[65];
             for (int k=0;k<32;k++){ unsigned char b=e.txid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
             hx[64]=0;
             if (!verbose){ rj_arr_push(out, rj_str(hx)); continue; }
-            rj_val* ent = rj_obj();
-            unsigned long w = mp_tx_weight(e.tx, e.len);
-            rj_obj_set(ent, "vsize", rj_numf("%lu", (w+3)/4));
-            rj_obj_set(ent, "weight", rj_numf("%lu", w));
-            rj_obj_set(ent, "time", rj_numf("%ld", g_mph.time_of ? g_mph.time_of(e.txid) : 0));
-            unsigned long long f=0,s=0;
-            rj_val* fees = rj_obj();
-            if (g_mph.polstate && g_mph.pol_entry && g_mph.pol_entry(g_mph.polstate,e.txid,&f,&s))
-                rj_obj_set(fees, "base", rj_numf("%llu.%08llu", f/100000000ULL, f%100000000ULL));
-            rj_obj_set(ent, "fees", fees);
-            rj_obj_set(out, hx, ent);
+            /* the same builder getmempoolentry uses, under the same pool lock */
+            rj_obj_set(out, hx, mpe_entry_obj(e.txid, e.tx, e.len));
         }
+        free(g_mpe_vs); g_mpe_vs = 0; g_mpe_vs_n = 0;
+        free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf = 0; g_mpe_inf_id = 0; g_mpe_inf_n = 0;
         mpu();
     }
     *res = out;
@@ -1211,7 +1471,6 @@ static void mpe_hex(char* dst, const unsigned char* internal){
     for (int k=0;k<32;k++){ unsigned char b=internal[31-k]; dst[k*2]=HEXD[b>>4]; dst[k*2+1]=HEXD[b&15]; }
     dst[64]=0;
 }
-static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len);
 static long long pri_delta_of(const unsigned char txid[32]);
 static rj_val* mpe_amount(unsigned long long sat){
     return rj_numf("%llu.%08llu", sat/100000000ULL, sat%100000000ULL);
@@ -1251,20 +1510,32 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
     unsigned long w = mp_tx_weight(tx, len);
     rj_obj_set(o, "vsize", rj_numf("%lu", (w+3)/4));
     rj_obj_set(o, "weight", rj_numf("%lu", w));
+    rj_obj_set(o, "vsize_bip141", rj_numf("%lu", (w+3)/4));
     rj_obj_set(o, "time", rj_numf("%ld", g_mph.time_of ? g_mph.time_of(txid) : 0));
     rj_obj_set(o, "height", rj_numf("%d", 0));   /* documented gap: entry height untracked */
 
     mp_entry_info inf; int have_inf = 0;
-    if (g_mph.polstate && g_mph.pol_entry_info)
+    /* Prefer the one-pass graph when this call built one; otherwise ask per
+     * txid. The FALLBACK MATTERS: the bulk build is skipped when the node
+     * exposes no pol_entry_info_all and refused when its allocation fails, and
+     * the first cut of this returned no graph at all in those cases -- it made
+     * the per-txid branch conditional on there being no bulk cache, so a
+     * verbose call with a cache but no graph silently dropped depends,
+     * spentby and both counts. The suite caught it immediately. */
+    long myinf = (g_mpe_vs && g_mpe_inf) ? mpe_inf_lookup(txid) : -1;
+    if (myinf >= 0){ inf = g_mpe_inf[myinf]; have_inf = 1; }
+    else if (g_mph.polstate && g_mph.pol_entry_info)
         have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
     /* ancestor/descendant vsize sums over set members STILL IN THE POOL */
     unsigned long long anc_vs=0, desc_vs=0; int anc_n=0, desc_n=0;
     if (have_inf){
-        for (int i=0;i<inf.n_anc;i++){ unsigned long l2=0;
-            const unsigned char* t2 = g_mph.get(g_mph.mp, inf.anc[i], &l2);
+        for (int i=0;i<inf.n_anc;i++){
+            if (g_mpe_vs){ unsigned long v = mpe_vs_lookup(inf.anc[i]); if (v){ anc_vs += v; anc_n++; } continue; }
+            unsigned long l2=0; const unsigned char* t2 = g_mph.get(g_mph.mp, inf.anc[i], &l2);
             if (t2){ anc_vs += (mp_tx_weight(t2,l2)+3)/4; anc_n++; } }
-        for (int i=0;i<inf.n_desc;i++){ unsigned long l2=0;
-            const unsigned char* t2 = g_mph.get(g_mph.mp, inf.desc[i], &l2);
+        for (int i=0;i<inf.n_desc;i++){
+            if (g_mpe_vs){ unsigned long v = mpe_vs_lookup(inf.desc[i]); if (v){ desc_vs += v; desc_n++; } continue; }
+            unsigned long l2=0; const unsigned char* t2 = g_mph.get(g_mph.mp, inf.desc[i], &l2);
             if (t2){ desc_vs += (mp_tx_weight(t2,l2)+3)/4; desc_n++; } }
     } else { anc_n=1; desc_n=1; anc_vs=desc_vs=(w+3)/4; }
     rj_obj_set(o, "descendantcount", rj_numf("%d", desc_n));
@@ -1285,15 +1556,36 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
       rj_obj_set(fees, "modified", rj_numf("%s%lld.%08lld", modified<0?"-":"", am/100000000LL, am%100000000LL));
       rj_obj_set(fees, "ancestor", mpe_amount(have_inf ? inf.anc_fee : base));
       rj_obj_set(fees, "descendant", mpe_amount(have_inf ? inf.desc_fee : base));
+      /* Core's adjusted weight: max(weight, sigop_cost * bytes_per_sigop)
+       * (policy.cpp GetSigOpsAdjustedWeight). vsize_adjusted is that over 4,
+       * rounded up, exactly as GetVirtualTransactionSize does it. */
+      { unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
+        unsigned long long adjw = w;
+        if (have_inf){ unsigned long long sw = (unsigned long long)inf.sigop_cost * bps;
+                       if (sw > adjw) adjw = sw; }
+        rj_obj_set(o, "vsize_adjusted", rj_numf("%llu", (adjw+3)/4));
+        /* A SINGLETON cluster -- no unconfirmed parents, no unconfirmed
+         * children -- is its own chunk, so chunkweight and fees.chunk are
+         * determined with no linearization at all. Both counts include the tx
+         * itself, so 1 and 1 is the lone-transaction case. Anything larger
+         * needs Core's cluster linearization, which this node does not
+         * implement: the two keys are then OMITTED rather than approximated. */
+        if (have_inf && inf.n_anc == 1 && inf.n_desc == 1){
+            rj_obj_set(o, "chunkweight", rj_numf("%llu", adjw));
+            rj_obj_set(fees, "chunk", rj_numf("%s%lld.%08lld",
+                       modified<0?"-":"", am/100000000LL, am%100000000LL));
+        } }
       rj_obj_set(o, "fees", fees); }
 
     { rj_val* dep = rj_arr();
       if (have_inf) for (int i=0;i<inf.n_depends;i++){ unsigned long l2=0;
-          if (g_mph.get(g_mph.mp, inf.depends[i], &l2)){ char h2[65]; mpe_hex(h2, inf.depends[i]); rj_arr_push(dep, rj_str(h2)); } }
+          int here = g_mpe_vs ? (mpe_vs_lookup(inf.depends[i]) != 0) : (g_mph.get(g_mph.mp, inf.depends[i], &l2) != 0);
+          if (here){ char h2[65]; mpe_hex(h2, inf.depends[i]); rj_arr_push(dep, rj_str(h2)); } }
       rj_obj_set(o, "depends", dep); }
     { rj_val* sb = rj_arr();
       if (have_inf) for (int i=0;i<inf.n_spentby;i++){ unsigned long l2=0;
-          if (g_mph.get(g_mph.mp, inf.spentby[i], &l2)){ char h2[65]; mpe_hex(h2, inf.spentby[i]); rj_arr_push(sb, rj_str(h2)); } }
+          int here = g_mpe_vs ? (mpe_vs_lookup(inf.spentby[i]) != 0) : (g_mph.get(g_mph.mp, inf.spentby[i], &l2) != 0);
+          if (here){ char h2[65]; mpe_hex(h2, inf.spentby[i]); rj_arr_push(sb, rj_str(h2)); } }
       rj_obj_set(o, "spentby", sb); }
     rj_obj_set(o, "unbroadcast", rj_bool(0));
     return o;
@@ -2248,6 +2540,19 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
     return 1;
 }
 
+/* Core emits reject-details alongside reject-reason for a refused tx
+ * (rpc/mempool.cpp): the value is TxValidationState::ToString(), which is the
+ * reject reason on its own when there is no debug message, and "reason, debug"
+ * when there is. It is OMITTED for missing-inputs, where Core takes the other
+ * branch and pushes only the reason. This node carries no separate debug
+ * message, so details equals the reason -- which is precisely Core's output in
+ * the no-debug-message case, not an approximation of it. */
+static void tma_set_reject(rj_val* e, const char* rsn){
+    rj_obj_set(e, "reject-reason", rj_str(rsn));
+    if (strcmp(rsn, "missing-inputs") != 0)
+        rj_obj_set(e, "reject-details", rj_str(rsn));
+}
+
 static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_ARR || params->items[0]->nitems < 1){
@@ -2382,8 +2687,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
                 rj_obj_set(e, "fees", f);
             } else {
                 rj_obj_set(e, "allowed", rj_bool(0));
-                rj_obj_set(e, "reject-reason",
-                           rj_str(r_reason[i][0] ? r_reason[i] : "transaction rejected"));
+                tma_set_reject(e, r_reason[i][0] ? r_reason[i] : "transaction rejected");
             }
             rj_arr_push(arr, e);
         }
@@ -2430,7 +2734,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
             rj_obj_set(e, "fees", fees);
         } else {
             rj_obj_set(e, "allowed", rj_bool(0));
-            rj_obj_set(e, "reject-reason", rj_str(reason[0] ? reason : "transaction rejected"));
+            tma_set_reject(e, reason[0] ? reason : "transaction rejected");
         }
         rj_arr_push(arr, e);
     }
@@ -2440,11 +2744,90 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
     return 1;
 }
 
+/* ---- bmcgetdownloadinfo (2026-09-10) ---------------------------------------
+ * The parallel download's live state: which worker holds which peer, what
+ * each is pulling and at what rate, and the window state that explains why
+ * the tail is or is not moving.
+ *
+ * Core has NO counterpart, by construction. Its block download is 8 outbound
+ * peers driven from one ThreadMessageHandler thread, so there is no worker to
+ * report; here node_ibd_blocks_s blocks for the length of a chunk and cannot
+ * multiplex, so each downloading peer is a forked process and the mapping
+ * worker -> peer -> chunk -> rate is the only way to see what the sync is
+ * doing. getpeerinfo shows the peers; it cannot show the window, the tail,
+ * the adaptive stall timeout or the ban list, which is what an operator (and
+ * bmcmonitor) needs when a sync slows down.
+ *
+ * NAMING (operator's rule, 2026-09-10): every command of ours is prefaced
+ * bmc*. That also satisfies the reason the bmc.* config keys carry the
+ * prefix -- a Core name must carry Core's exact semantics, so a call Core
+ * does not have must not take a name Core might later use.
+ *
+ * A consumer whose RPC allowlist is default-deny over read-shaped prefixes
+ * (bmcmonitor's server/rpc/allowlist.js) admits this by allowing "bmcget"
+ * and "bmclist", NOT a bare "bmc": the marker plus a read verb keeps the
+ * guard its own comment asks for, since a future bmcset* still fails to
+ * match. Fields are plain snake_case and stable; a monitor differences the
+ * counters itself.
+ *
+ * Answers {"active": false} outside a parallel download rather than failing,
+ * so a poller can call it unconditionally. */
+static int cmd_bmcgetdownloadinfo(rj_val** res){
+    rj_val* o = rj_obj();
+    const node_status_t* s = g_status;
+    long long total = s ? (long long)s->dl_bytes_total : 0;
+    if (!s || !s->dl_active){
+        rj_obj_set(o, "active", rj_bool(0));
+        rj_obj_set(o, "bytes_total", rj_numf("%lld", total));
+        *res = o; return 1;
+    }
+    rj_obj_set(o, "active", rj_bool(1));
+    rj_obj_set(o, "workers",          rj_numf("%d",   s->dl_workers));
+    /* the one figure that says whether adding peers would help: see rpc_node.h */
+    rj_obj_set(o, "pool_idle_pct",    rj_numf("%d",   s->dl_pool_idle_pct));
+    rj_obj_set(o, "pool",             rj_numf("%d",   s->dl_pool));
+    rj_obj_set(o, "banned",           rj_numf("%d",   s->dl_banned));
+    rj_obj_set(o, "free_peers",       rj_numf("%d",   s->dl_free_peers));
+    rj_obj_set(o, "window",           rj_numf("%lld", (long long)s->dl_window));
+    rj_obj_set(o, "first_hole",       rj_numf("%lld", (long long)s->dl_first_hole));
+    rj_obj_set(o, "claim",            rj_numf("%lld", (long long)s->dl_claim));
+    rj_obj_set(o, "applied",          rj_numf("%lld", (long long)s->dl_applied));
+    rj_obj_set(o, "end_height",       rj_numf("%lld", (long long)s->dl_end_h));
+    rj_obj_set(o, "staged",           rj_numf("%lld", (long long)s->dl_staged));
+    rj_obj_set(o, "stall_timeout_s",  rj_numf("%lld", (long long)s->dl_stall_timeout_s));
+    rj_obj_set(o, "stall_evictions",  rj_numf("%lld", (long long)s->dl_stall_evictions));
+    rj_obj_set(o, "median_bps",       rj_numf("%lld", (long long)s->dl_median_bps));
+    rj_obj_set(o, "bytes_total",      rj_numf("%lld", total));
+    { rj_val* pa = rj_arr();
+      int nd = s->n_dlpeers; if (nd > 64) nd = 64; if (nd < 0) nd = 0;
+      for (int i = 0; i < nd; i++){
+          const rpc_peer_t* p = &s->dlpeers[i];
+          if (!p->used) continue;
+          rj_val* w = rj_obj();
+          rj_obj_set(w, "worker",     rj_numf("%d", p->dl_worker));
+          rj_obj_set(w, "addr",       rj_str((const char*)p->addr));
+          rj_obj_set(w, "subver",     rj_str((const char*)p->subver));
+          rj_obj_set(w, "services",   rj_numf("%llu", (unsigned long long)p->services));
+          rj_obj_set(w, "startingheight", rj_numf("%d", p->start_height));
+          rj_obj_set(w, "conntime",   rj_numf("%lld", (long long)p->conn_time));
+          rj_obj_set(w, "bytes_recv", rj_numf("%lld", (long long)p->bytes_recv));
+          rj_obj_set(w, "bps_recv",   rj_numf("%lld", (long long)p->bps_recv));
+          rj_obj_set(w, "idle_pct",   rj_numf("%d", p->idle_pct));
+          /* the chunk in flight; hi < lo means the worker holds nothing */
+          rj_obj_set(w, "inflight_lo", rj_numf("%lld", (long long)p->inflight_lo));
+          rj_obj_set(w, "inflight_hi", rj_numf("%lld", (long long)p->inflight_hi));
+          rj_arr_push(pa, w);
+      }
+      rj_obj_set(o, "peers", pa); }
+    *res = o; return 1;
+}
+
 static const char* const NODE_METHODS[] = {
     "getconnectioncount", "getnetworkinfo", "getpeerinfo",
     "gettxspendingprevout", "getmempoolcluster", "getblockfrompeer",
     "testmempoolaccept", "submitpackage", "savemempool", "importmempool",
     "getprivatebroadcastinfo", "abortprivatebroadcast",
+    "bmcgetdownloadinfo",   /* 2026-09-10: this node's own, no Core counterpart */
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "getrawaddrman", "getorphantxs", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "addpeeraddress", "disconnectnode",
     "setban", "setnetworkactive", "ping", "getzmqnotifications",
@@ -2526,6 +2909,84 @@ int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
     return 0;
 }
+/* getmempoolcluster, for the case that needs no linearization.
+ *
+ * Core returns the transaction's whole cluster in LINEARIZATION order, split
+ * into chunks by the cluster's chunk feerates (rpc/mempool.cpp clusterToJSON).
+ * This node has no cluster mempool and so no linearization -- but a SINGLETON
+ * cluster has only one possible answer. A transaction with no unconfirmed
+ * parents and no unconfirmed children is alone in its cluster and is its own
+ * single chunk, so clusterweight, txcount and the one chunk are all exactly
+ * determined. Verified field for field against Core v31.1 on a live mempool.
+ *
+ * For a cluster of two or more the chunk boundaries ARE the linearization, and
+ * nothing here can recover them: that case still refuses, and says why, rather
+ * than inventing an ordering that would differ from Core's silently. */
+static int cmd_getmempoolcluster(const rj_val* params, rj_val** res, long* ec, const char** em){
+    static char embuf[512];
+    /* Core answers a null/absent txid with -3 (RPC_TYPE_ERROR), not -8; see
+     * getmempoolcluster against v31.1. Three older sites in this file
+     * (getmempoolentry and friends) return -8 for the identical condition and
+     * are wrong about it -- recorded in PARITY_RPC_FIELDS.md rather than
+     * changed here, since altering a returned error code is a caller-visible
+     * break that belongs in its own change. */
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_STR){
+        *ec = -3; *em = "JSON value of type null is not of expected type string"; return 0; }
+    const char* hx = params->items[0]->str;
+    if (strlen(hx) != 64){
+        snprintf(embuf, sizeof embuf, "txid must be of length 64 (not %zu, for '%s')", strlen(hx), hx);
+        *ec = -8; *em = embuf; return 0; }
+    unsigned char txid[32];
+    for (int i=0;i<32;i++){
+        int a=srt_hex1(hx[i*2]), b=srt_hex1(hx[i*2+1]);
+        if (a<0||b<0){ snprintf(embuf,sizeof embuf,"txid must be hexadecimal string (not '%s')",hx);
+                       *ec=-8; *em=embuf; return 0; }
+        txid[31-i]=(unsigned char)((a<<4)|b);
+    }
+    if (!g_mph.mp || !g_mph.get){ *ec=-5; *em="Transaction not in mempool"; return 0; }
+    mpl();
+    unsigned long len=0;
+    const unsigned char* tx = g_mph.get(g_mph.mp, txid, &len);
+    if (!tx){ mpu(); *ec=-5; *em="Transaction not in mempool"; return 0; }
+    unsigned long w = mp_tx_weight(tx, len);
+    mp_entry_info inf; int have_inf = 0;
+    if (g_mph.pol_entry_info && g_mph.polstate)
+        have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
+    mpu();
+    if (!have_inf){ *ec = -5; *em = "Transaction not in mempool"; return 0; }
+    if (inf.n_anc != 1 || inf.n_desc != 1){
+        snprintf(embuf, sizeof embuf,
+                 "this transaction's cluster holds %d transaction(s) (ancestors %d, "
+                 "descendants %d, both counting itself). Splitting a cluster into chunks "
+                 "IS Core's cluster linearization, which this node does not implement, so "
+                 "the chunks cannot be reported. A singleton cluster is answered in full; "
+                 "see getmempoolancestors/getmempooldescendants for the graph.",
+                 inf.n_anc > inf.n_desc ? inf.n_anc : inf.n_desc, inf.n_anc, inf.n_desc);
+        *ec = -1; *em = embuf; return 0;
+    }
+    unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
+    unsigned long long adjw = w;
+    { unsigned long long sw = (unsigned long long)inf.sigop_cost * bps;
+      if (sw > adjw) adjw = sw; }
+    long long modified = (long long)inf.fee + pri_delta_of(txid);
+    long long am = modified < 0 ? -modified : modified;
+
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "clusterweight", rj_numf("%llu", adjw));
+    rj_obj_set(o, "txcount", rj_numf("%d", 1));
+    rj_val* chunks = rj_arr();
+    rj_val* c = rj_obj();
+    rj_obj_set(c, "chunkfee", rj_numf("%s%lld.%08lld", modified<0?"-":"",
+                                      am/100000000LL, am%100000000LL));
+    rj_obj_set(c, "chunkweight", rj_numf("%llu", adjw));
+    rj_val* txs = rj_arr(); rj_arr_push(txs, rj_str(hx));
+    rj_obj_set(c, "txs", txs);
+    rj_arr_push(chunks, c);
+    rj_obj_set(o, "chunks", chunks);
+    *res = o;
+    return 1;
+}
+
 int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em){
     (void)ec; (void)em;
     if (!strcmp(m, "getconnectioncount")) return cmd_getconnectioncount(res);
@@ -2537,13 +2998,9 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "savemempool"))   return cmd_savemempool(res, ec, em);
     if (!strcmp(m, "importmempool")) return cmd_importmempool(params, res, ec, em);
     if (!strcmp(m, "getprivatebroadcastinfo")) return cmd_getprivatebroadcastinfo(res, ec, em);
+    if (!strcmp(m, "bmcgetdownloadinfo"))  return cmd_bmcgetdownloadinfo(res);
     if (!strcmp(m, "abortprivatebroadcast"))   return cmd_abortprivatebroadcast(params, res, ec, em);
-    if (!strcmp(m, "getmempoolcluster"))
-        return cmd_net_unsupported(
-            "this node's mempool has no cluster linearization: it tracks the "
-            "ancestor/descendant graph (see getmempoolancestors) but not "
-            "Core's cluster mempool structure, so there are no clusters to "
-            "report", ec, em);
+    if (!strcmp(m, "getmempoolcluster")) return cmd_getmempoolcluster(params, res, ec, em);
     if (!strcmp(m, "getblockfrompeer"))
         return cmd_net_unsupported(
             "peer connections belong to the forked download worker, which "

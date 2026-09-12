@@ -37,7 +37,13 @@ static void emit(void* ctx, const u8 key36[36], unsigned long value, unsigned lo
      * for a divergence to live: it would have reported a real mismatch as
      * agreement, or invented one. */
     int spendable = !((slen > 0 && script[0] == 0x6a) || slen > 10000);
-    o += snprintf(line + o, sizeof line - o, " %u %lu %lu %d\n", vout, value, code >> 1, spendable);
+    /* 2026-09-12: the coinbase bit is now emitted too. The coin record's code
+     * is (height << 1) | coinbase, and run 22's muhash differed from Core while
+     * every aggregate (txouts, bogosize, total_amount) matched -- which leaves
+     * the code as the only field that can differ, since it is the one input to
+     * the hash that no aggregate reflects. Dumping height without the coinbase
+     * bit could only ever see half of the suspect field. */
+    o += snprintf(line + o, sizeof line - o, " %u %lu %lu %d %d\n", vout, value, code >> 1, (int)(code & 1), spendable);
     fwrite(line, 1, (size_t)o, stdout);
     if (++g_n % 20000000 == 0) fprintf(stderr, "[dump_keys] %ldM coins\n", g_n / 1000000);
 }

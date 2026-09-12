@@ -49,21 +49,44 @@ node_make_version:
     ; when -v2transport is enabled); we serve witness blocks (fe3addb)
     mov  rax, [node_services]
     mov  [r12+4], rax
-    mov  qword [r12+12], 1700000000
+    ; timestamp: the wall clock (2026-09-09: it was a fixed 1700000000, a
+    ; November-2023 clock, on every version we ever sent)
+    push rdi
+    xor  edi, edi
+    mov  eax, 201            ; time(NULL)
+    syscall
+    pop  rdi
+    mov  [r12+12], rax
     ; addr_recv[26] at +20: zero, then port at +44
     lea  rdi, [r12+20]
     xor  eax, eax
     mov  rcx, 26
     rep  stosb
-    mov  word [r12+44], 0x8d20     ; port 8333 big-endian bytes 20 8d
+    mov  ax, [rel node_listen_port_be]   ; the port we listen on, big-endian (2026-09-09: was a constant 8333)
+    mov  [r12+44], ax
+    xor  eax, eax                        ; the rep stosb below zeroes with AL
     ; addr_from[26] at +46: zero, then port at +70
     lea  rdi, [r12+46]
     mov  rcx, 26
     rep  stosb
-    mov  word [r12+70], 0x8d20
-    ; nonce at +72  (build in rax: an imm64 mem-store truncates to 32 bits!)
-    mov  rax, 0x1122334455667788
+    mov  ax, [rel node_listen_port_be]
+    mov  [r12+70], ax
+    xor  eax, eax
+    ; nonce at +72: random per connection, as Core's (2026-09-09: it was the
+    ; constant 0x1122334455667788; Core uses the nonce to detect a connection
+    ; to itself, and a constant one is the classic self-disconnect trap)
+    push rdi
+    lea  rdi, [r12+72]
+    mov  esi, 8
+    xor  edx, edx
+    mov  eax, 318            ; getrandom(buf, 8, 0)
+    syscall
+    pop  rdi
+    cmp  rax, 8
+    je   .nonce_ok
+    mov  rax, 0x1122334455667788   ; getrandom unavailable: the old constant, better than garbage
     mov  [r12+72], rax
+.nonce_ok:
     ; user_agent varstr at +80: len byte + UA bytes. Length is DERIVED at
     ; assembly time from version.inc (%strlen), so it can never drift from the
     ; string itself.
@@ -77,7 +100,8 @@ node_make_version:
     lea  rdi, [r12+81]
     rep  movsb
     ; start_height u32 then relay byte (cursor-relative: rdi is past the UA)
-    mov  dword [rdi], 0
+    mov  eax, [rel node_start_height]    ; our tip, set by the daemon (2026-09-09: was 0 at 966k)
+    mov  [rdi], eax
     mov  al, [rel node_relay_flag]
     mov  byte [rdi+4], al
     ; total length = 81 + UA_LEN + 4 + 1 -- derived, no hardcoded total
@@ -516,7 +540,7 @@ node_accept_handshake:
 ;   Moved txid_scratch to fresh space at the (enlarged) frame's own edge,
 ;   fully clear of both rbp and the block-hash-precompute array, without
 ;   touching any other local's offset.
-;   sub rsp, 0x1b08 (8 mod16; 6 pushes -> RSP 0 mod16 at every nested call)
+;   sub rsp, 0x1b18 (8 mod16; 6 pushes -> RSP 0 mod16 at every nested call)
 ;
 ;   STAGE B FRAME ADDITIONS. The getheaders payload used to be built at
 ;   rbp-0x140, where it had only 0x45 (69) bytes of clearance before the
@@ -565,7 +589,7 @@ node_sync_multi:
     push r13
     push r14
     push r15
-    sub  rsp, 0x1b08       ; frame: scratch@-0x1308 (cons_verify), block hashes
+    sub  rsp, 0x1b18       ; frame: scratch@-0x1308 (cons_verify), block hashes; -0x1b08/-0x1b0c: compact-block fallback flags (2026-09-09)
                            ; array@-0xae8 (64 x 32B) so headers stay usable even
                            ; after the block receive overwrites buf. 0x1b08==8
                            ; mod16, after 6 pushes -> RSP 0 mod16 at all calls.
@@ -777,6 +801,17 @@ node_sync_multi:
     mov  rcx, 32
     rep  movsb
     pop  rsi
+    ; 2026-09-09: one request per block across the legs -- ask the daemon
+    ; whether another leg is already fetching this hash; if so this pass
+    ; ends with what it has (ok=1) and the next rotation re-checks.
+    mov  rax, [rel g_block_fetch_hook]
+    test rax, rax
+    jz   .fetch_ok
+    lea  rdi, [rbp-0xa0]
+    call rax
+    test rax, rax
+    jz   .done
+.fetch_ok:
     ; build getdata (buffer at -0xd0)
     lea  rdi, [rbp-0xd0]
     lea  rsi, [rbp-0xa0]
@@ -810,6 +845,8 @@ node_sync_multi:
     ; Same fix as .hdr_drain: a single read timeout (-1) retries (bounded)
     ; rather than immediately abandoning the block fetch -- see the .hdr_drain
     ; comment above for why (busy real peers pause between chatter bursts).
+    mov  dword [rbp-0x1b08], 0    ; this block did not come through the compact path (yet)
+    mov  dword [rbp-0x1b0c], 0    ; no full-block fallback sent for it (yet)
     mov  dword [rbp-0x1b00], 0    ; blk-drain retry counter (separate 4 bytes
                                     ; from the hdr-drain one at -0x1b04)
 .blk_drain:
@@ -836,7 +873,7 @@ node_sync_multi:
     .fchk7:
     lea  rdi, [rbp-0x160]
     lea  rsi, [rel _block]
-    mov  ecx, 5
+    mov  ecx, 6                     ; "block" AND its NUL: a 5-byte prefix matched "blocktxn" (2026-09-09)
     repe cmpsb
     je   .have_block
     ; ---- CC-2: a compact block for the block we asked for -------------------
@@ -866,6 +903,7 @@ node_sync_multi:
     cmp  rax, 0
     jle  .blk_drain
     mov  [rbp-0x54], eax
+    mov  dword [rbp-0x1b08], 1    ; assembled from a compact block: a verification failure falls back
     jmp  .have_block
 .blk_not_cmpct:
     lea  rdi, [rbp-0x160]
@@ -885,6 +923,7 @@ node_sync_multi:
     cmp  rax, 0
     jle  .blk_drain
     mov  [rbp-0x54], eax
+    mov  dword [rbp-0x1b08], 1    ; assembled from a compact block: a verification failure falls back
     jmp  .have_block
 .blk_not_blocktxn:
     lea  rdi, [rbp-0x160]
@@ -933,6 +972,36 @@ node_sync_multi:
     call cons_verify
     test eax, eax
     jnz .fchk8
+    ; 2026-09-09: a block ASSEMBLED FROM A COMPACT BLOCK that fails verification
+    ; is re-requested in full, once, and the drain continues -- Core's
+    ; PartiallyDownloadedBlock fallback. Until today this failed the pass
+    ; (where=8) and cost the block, which is why bmc.cmpctrecv existed.
+    cmp  dword [rbp-0x1b08], 1
+    jne  .verify_failed
+    cmp  dword [rbp-0x1b0c], 0
+    jne  .verify_failed             ; the full block failed too: genuinely bad
+    mov  dword [rbp-0x1b0c], 1
+    mov  dword [rbp-0x1b08], 0
+    lea  rdi, [rbp-0xd0]
+    lea  rsi, [rbp-0xa0]
+    call p2p_getdata_block          ; MSG_WITNESS_BLOCK: the full block
+    mov  [rbp-0x5c], eax
+    mov  rdi, rbx
+    lea  rsi, [rel _getdata]
+    mov  rdx, 7
+    lea  rcx, [rbp-0xd0]
+    mov  r8d, [rbp-0x5c]
+    call p2p_write
+    cmp  rax, 24
+    jl   .verify_failed
+    mov  rax, [rel g_cmpct_hook_fallback]
+    test rax, rax
+    jz   .fb_counted
+    call rax                        ; cmpct_recv_note_fallback: the stats line
+.fb_counted:
+    mov  dword [rbp-0x1b00], 0      ; a fresh block-drain patience for the full block
+    jmp  .blk_drain
+.verify_failed:
     mov  dword [rel sync_fail_code], 8
     jmp  .fail
     .fchk8:
@@ -960,8 +1029,12 @@ node_sync_multi:
     ; correct either way: the locator is stale, and the next rotation
     ; rebuilds it from the true tip. Distinct fail code so the log
     ; distinguishes "append error" from "stale duplicate refused".
+    ; 2026-09-09: and it ends the pass WELL. A sibling leg storing the block
+    ; first is not this peer's failure; production on snapshot n closed six
+    ; legs an hour as "sync-failed-3x ... where=10". The code stays set for
+    ; the log; the next rotation rebuilds the locator from the true tip.
     mov  dword [rel sync_fail_code], 10
-    jmp  .fail
+    jmp  .done
     .app_err:
     mov  dword [rel sync_fail_code], 9
     jmp  .fail
@@ -981,7 +1054,7 @@ node_sync_multi:
     jmp  .sync_loop
 .done:
     mov  eax, 1
-    add  rsp, 0x1b08
+    add  rsp, 0x1b18
     pop  r15
     pop  r14
     pop  r13
@@ -991,7 +1064,7 @@ node_sync_multi:
     ret
 .fail:
     mov  eax, 0
-    add  rsp, 0x1b08
+    add  rsp, 0x1b18
     pop  r15
     pop  r14
     pop  r13
@@ -1286,7 +1359,7 @@ node_drain:
     jle  .inv_next
     lea  rdi, [rbp-0x40]
     lea  rsi, [rel _block]
-    mov  ecx, 5
+    mov  ecx, 6                     ; "block" AND its NUL: a 5-byte prefix matched "blocktxn" (2026-09-09)
     repe cmpsb
     jne  .inv_next
     ; validate: cons_verify(buf @r13, plen, scratch, cap)
@@ -1745,7 +1818,7 @@ node_ibd_blocks:
 .not_ping:
     lea  rdi, [rbp-0xe0]
     lea  rsi, [rel _block]
-    mov  ecx, 5
+    mov  ecx, 6                     ; "block" AND its NUL: a 5-byte prefix matched "blocktxn" (2026-09-09)
     repe cmpsb
     jne  .receive           ; not the block we want -> drain and keep reading
     ; got `block`: validate with cons_verify(buf, plen, scratch@rbp-0x540, cap)
@@ -1913,7 +1986,7 @@ node_ibd_blocks_x:
     ; block? else drain (ignore chatter) and keep reading
     lea  rdi, [rbp-0x70]
     lea  rsi, [rel _block]
-    mov  ecx, 5
+    mov  ecx, 6                     ; "block" AND its NUL: a 5-byte prefix matched "blocktxn" (2026-09-09)
     repe cmpsb
     jne  .receive_x
     ; ---- got `block`: validate with the CALLER scratch ----
@@ -2076,7 +2149,7 @@ node_ibd_blocks_s:
 .not_ping_s:
     lea  rdi, [rbp-0x70]
     lea  rsi, [rel _block]
-    mov  ecx, 5
+    mov  ecx, 6                     ; "block" AND its NUL: a 5-byte prefix matched "blocktxn" (2026-09-09)
     repe cmpsb
     jne  .receive_s
     mov  rdi, r14
@@ -2259,6 +2332,10 @@ node_relay_flag: db 1
 ; must keep working with the plain default.
 global node_services
 node_services: dq 9
+global node_start_height
+node_start_height: dd 0          ; the daemon sets it to the archive tip before dialling
+global node_listen_port_be
+node_listen_port_be: dw 0x8d20   ; big-endian; the daemon sets it from -port
 
 ; ---- last-seen peer `version` payload, captured (not parsed) by both
 ; node_handshake and node_accept_handshake the moment they see a "version"
@@ -2300,6 +2377,10 @@ global g_cmpct_hook_cmpct
 g_cmpct_hook_cmpct:     dq 0      ; long (*)(fd, mp, pl, plen, out, cap, want32)
 global g_cmpct_hook_blocktxn
 g_cmpct_hook_blocktxn:  dq 0      ; long (*)(fd, pl, plen, out, cap)
+global g_cmpct_hook_fallback
+g_cmpct_hook_fallback:  dq 0      ; void (*)(void): count a full-block fallback (2026-09-09)
+global g_block_fetch_hook
+g_block_fetch_hook:     dq 0      ; long (*)(const u8 hash[32]): 0 = another leg is fetching it, end the pass (2026-09-09)
 
 section .rodata
 _version: db "version",0

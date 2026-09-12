@@ -60,9 +60,9 @@ node_config_t g_cfg = {
     .par                   = 0,      /* Core -par default: auto              */
     .dial_rate_limit       = 0,      /* bmc.dialratelimit: off unless set */
     .download_rate_limit_kbps = 0,   /* bmc.downloadratelimit: off unless set */
-    .cmpctrecv = 1, .coinstatshist_repair = 1, .coinstatshist_workers = 0, .esplora_port = 0, .esplora_bind = "127.0.0.1",
+    .coinstatshist_repair = 1, .coinstatshist_workers = 0, .esplora_port = 0, .esplora_bind = "127.0.0.1",
     .upload_rate_limit_kbps = 0,     /* bmc.uploadratelimit: off unless set */
-    .catchup_workers       = 16,     /* bmc.catchupworkers: parallel download chunk workers */
+    .catchup_workers       = 8,      /* bmc.catchupworkers: peers downloading at once. Core's MAX_OUTBOUND_FULL_RELAY_CONNECTIONS (2026-09-10) */
     .maxrecvbuffer_kb      = 5000,   /* Core -maxreceivebuffer default       */
     .maxmempool_mb         = 300,    /* Core -maxmempool default (MB)        */
     .mempoolexpiry_h       = 336,    /* Core -mempoolexpiry default (2 weeks)*/
@@ -346,7 +346,7 @@ static void set_defaults(void){
     g_cfg.connect_timeout_ms    = 5000;     /* Core's -timeout default */
     g_cfg.peer_timeout_s        = 60;       /* Core's -peertimeout default */
     g_cfg.port                  = 8333;
-    g_cfg.cmpctrecv = 1; g_cfg.coinstatshist_repair = 1; g_cfg.coinstatshist_workers = 0; g_cfg.esplora_port = 0; snprintf(g_cfg.esplora_bind, sizeof g_cfg.esplora_bind, "127.0.0.1");
+    g_cfg.coinstatshist_repair = 1; g_cfg.coinstatshist_workers = 0; g_cfg.esplora_port = 0; snprintf(g_cfg.esplora_bind, sizeof g_cfg.esplora_bind, "127.0.0.1");
     g_cfg.port_explicit         = 0;
     snprintf(g_cfg.chain, sizeof g_cfg.chain, "main");
     g_cfg.listen                = 1;
@@ -354,7 +354,7 @@ static void set_defaults(void){
     g_cfg.blocksonly            = 0;
     g_cfg.bind_addr[0]          = 0;
     g_cfg.par                   = 0;
-    g_cfg.catchup_workers       = 16;
+    g_cfg.catchup_workers       = 8;
     g_cfg.dial_rate_limit       = 0;
     g_cfg.download_rate_limit_kbps = 0;
     g_cfg.upload_rate_limit_kbps = 0;
@@ -729,8 +729,6 @@ long node_config_load(const char* path){
              * per block in the parallel download and per page in the header
              * fetch; probes and the keep-up legs are exempt. */
             t=clamp_int(iv,0,10000000,key,&bad); if(t!=-1){ g_cfg.download_rate_limit_kbps=t; applied++; } }
-        else if(!strcmp(key,"bmc.cmpctrecv")){      /* EXTENSION (2026-09-08): 0 asks for full blocks instead of compact ones */
-            g_cfg.cmpctrecv = iv?1:0; applied++; }
         else if(!strcmp(key,"bmc.coinstatshistrepair")){   /* EXTENSION (2026-09-08): the coinstats history base repairs itself */
             g_cfg.coinstatshist_repair = iv?1:0; applied++; }
         else if(!strcmp(key,"bmc.coinstatshistworkers")){
@@ -745,9 +743,10 @@ long node_config_load(const char* path){
              * separately with Core's semantics). */
             t=clamp_int(iv,0,10000000,key,&bad); if(t!=-1){ g_cfg.upload_rate_limit_kbps=t; applied++; } }
         else if(!strcmp(key,"bmc.catchupworkers")){
-            /* the PARALLEL DOWNLOAD chunk-worker ceiling. Not -par: that is
-             * Core's script-verification thread count and means exactly that
-             * here (2026-09-06). dl_catchup clamps this to the live peers. */
+            /* the PARALLEL DOWNLOAD ceiling: at most this many peers download
+             * at once; every live peer does, up to it (2026-09-10, Core's
+             * shape). Not -par: that is Core's script-verification thread
+             * count and means exactly that here (2026-09-06). */
             t=clamp_int(iv,1,64,key,&bad); if(t!=-1){ g_cfg.catchup_workers=t; applied++; } }
         else if(!strcmp(key,"par")){
             /* Core -par: worker threads. 0 = auto, and NEGATIVE means "leave

@@ -1,0 +1,15 @@
+# 2026-09-09 — Compact blocks received at last: `blocktxn` is not `block`
+
+The compact-block receive path landed on 09-06 and never completed a reconstruction that needed a `getblocktxn` round trip: production counted 1,262 such round trips today and 0 blocks, and every leg that tried failed its sync pass, fed the strike counter, and was closed. The tip advanced only through legs whose peer never negotiated compact blocks.
+
+**The cause, one byte.** The sync drain in `bitcoind.asm` matched the command name `block` with a 5-byte prefix compare. `blocktxn` begins with those five bytes, so the peer's reply to our `getblocktxn` was taken for a full block, handed to the consensus verifier, failed (failure code 8), and the pass was thrown away -- the assembled block never existed. Found on regtest with the receiver traced: `getblocktxn sent: 3 missing of 4`, then never a `blocktxn` line; the drain's other names (`headers`, `cmpctblock`, `blocktxn` itself) were compared with their terminator and could not collide. Five sites compare six bytes now. Three diagnostic tools (`bmc_peertest`, `bmc_paribd`, `bmc_inbound_client`) made the same 5-byte compare in C and compare the full 12 now.
+
+**Proof.** `validation/cmpct_regtest_e2e.sh` (new): one bmc leg to a Core regtest, `bmc.cmpctrecv` at its default, Core mines blocks carrying transactions this node has never seen. Against the 09-09 snapshot i build it stalls at the first such block (**watched to fail**); against this build bmc follows Core to 116 through six blocks that each needed the round trip (12 reconstructed in all), and each assembled block is byte-identical to Core's own serialization (`BMC_CMPCT_DUMP=<dir>` writes them; `BMC_CMPCT_DEBUG=1` traces the receiver's paths, both left in as diagnostics).
+
+**Production** runs `bmc.cmpctrecv=0` since the 18:38Z restart, set the moment the 1,262-to-0 count was read; it stays there until this build is deployed and the counter on production reads reconstructed blocks. The default stays 1.
+
+**Still divergent from Core, for their own batch:** a reconstructed block that fails verification should fall back to a full `getdata` instead of failing the pass (Core's `PartiallyDownloadedBlock` fallback); a block should be requested once and tracked in flight by hash across legs rather than by every leg's pass.
+
+---
+
+PR #145 (`batch/2026-09-09-cmpct-recv`), merged 19:0xZ as `a36f616f`; tag `blocktxn-is-not-a-block-2026-09-09`. Staged as `deploy-20260909j`; production stays on `bmc.cmpctrecv=0` until deployed and its counter moves.

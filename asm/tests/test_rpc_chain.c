@@ -531,15 +531,21 @@ int main(void){
       ck_str("getblock v1 strippedsize", S(r,"strippedsize"), "285");
       ck_str("getblock v1 size", S(r,"size"), "285");
       ck_str("getblock v1 weight", S(r,"weight"), "1140");
-      /* RPX-7: these five assertions used to check a `coinbase_tx` OBJECT on
-       * the getblock result. Core's blockToJSON has no such field -- it was
-       * an additive divergence, undocumented, and pinned HERE as if it were
-       * canonical, which is why it survived. The field is gone; what is
-       * asserted now is its ABSENCE, which is the actual parity claim. The
-       * coinbase's contents are still checked, from inside the `tx` array
-       * where Core puts them (verbosity 2, below). */
-      ck("RPX-7: getblock does NOT emit a non-Core coinbase_tx field",
-         G(r,"coinbase_tx") == NULL);
+      /* 2026-09-12: this asserted the ABSENCE of coinbase_tx, on the premise
+       * that "Core's blockToJSON has no such field". The premise was never
+       * checked and is wrong -- Bitcoin Core v31.1 run on regtest returns
+       * coinbase_tx at verbosity 1, 2 and 3:
+       *
+       *   {"version":2,"locktime":100,"sequence":4294967294,
+       *    "coinbase":"016500","witness":"0000...0000"}
+       *
+       * So the assertion encoded the defect rather than the contract, and the
+       * field was built and discarded for a year. It is back, and what is
+       * pinned now is the SHAPE Core returns. */
+      { rj_val* cb = G(r,"coinbase_tx");
+        ck("getblock emits coinbase_tx, as Core v31.1 does", cb && cb->typ == RJ_OBJ);
+        ck("coinbase_tx carries Core's members", cb && S(cb,"version") && S(cb,"locktime")
+           && S(cb,"sequence") && S(cb,"coinbase")); }
       rj_val* tx = G(r,"tx");
       ck("getblock v1 tx is array of 1", tx && tx->typ == RJ_ARR && tx->nitems == 1);
       ck_str("getblock v1 tx[0] == genesis coinbase txid", tx && tx->nitems ? tx->items[0]->str : NULL, GENESIS_MERKLE);
@@ -574,10 +580,10 @@ int main(void){
       snprintf(want, sizeof want, "%zu", g_blk3_stripped*3 + g_blk3_len); ck_str("blk3 weight", S(r,"weight"), want);
       /* RPX-7: was `blk3 coinbase_tx.witness`. The witness reserved value is
        * still asserted -- from `tx[0].vin[0].txinwitness` at verbosity 2,
-       * which is where CORE exposes it, instead of from the non-Core
-       * coinbase_tx object that used to carry it here. */
-      ck("RPX-7: blk3 getblock has no coinbase_tx field either",
-         G(r,"coinbase_tx") == NULL);
+       * which is where Core also exposes it. coinbase_tx is a real Core
+       * v31.1 field and is checked for presence alongside it. */
+      ck("blk3 getblock emits coinbase_tx too (Core v31.1 does at every verbosity)",
+         G(r,"coinbase_tx") != NULL);
       rj_val* tx = G(r,"tx");
       ck("blk3 v1 has 3 txids", tx && tx->nitems == 3);
       ck_str("blk3 v1 tx[0] == segwit coinbase txid (independent sha256d of stripped)", tx && tx->nitems ? tx->items[0]->str : NULL, g_cb_txid[3]);

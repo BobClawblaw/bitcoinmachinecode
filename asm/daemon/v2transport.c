@@ -326,6 +326,42 @@ int bmc_v2_handshake(int fd, int initiator, int timeout_ms){
 
 /* v1 p2p_write returns 24 + plen; callers depend on that shape. See the file
  * header -- this is a success indicator in v1's units, not a wire count. */
+long bmc_v2_export(int fd, unsigned char* out, unsigned long cap){
+    if (!bmc_v2_is_active(fd)) return 0;
+    v2_conn* c = g_conn[fd];
+    if (c->has_held) return 0;                 /* a decoded message waiting for the caller: not a handover point */
+    if (!flush_send(fd, &c->t)) return 0;      /* 2026-09-10: bytes the cipher already counted must reach the wire before the state moves */
+    return bip324_t_export(&c->t, out, cap);
+}
+/* 2026-09-10 (snapshot ab): the bytes an export needs, so a refusal can say
+ * why -- three healthy legs were closed "could not export its v2 session"
+ * when a headers reply in flight outgrew the 64 KB blob. */
+long bmc_v2_export_need(int fd){
+    if (!bmc_v2_is_active(fd)) return 0;
+    return (long)bip324_t_export_need(&g_conn[fd]->t);
+}
+/* One socket read into the session without delivering a message (a poll-driven
+ * caller, and the tests' way to leave a message half received). Bytes fed,
+ * 0 on EOF, -1 on error. */
+int bmc_v2_pump_once(int fd){
+    v2_conn* c = (fd >= 0 && fd < V2_FD_MAX) ? g_conn[fd] : 0;
+    if (!c) return -1;
+    unsigned char buf[65536];
+    ssize_t r = recv(fd, buf, sizeof buf, 0);
+    if (r <= 0) return r == 0 ? 0 : -1;
+    return bip324_t_feed(&c->t, buf, (unsigned long)r) ? (int)r : -1;
+}
+int bmc_v2_import(int fd, const unsigned char* in, unsigned long len){
+    if (fd < 0 || fd >= V2_FD_MAX) return 0;
+    bmc_v2_close(fd);
+    v2_conn* c = (v2_conn*)calloc(1, sizeof *c);
+    if (!c) return 0;
+    if (!bip324_t_import(&c->t, in, len)){ free(c); return 0; }
+    g_conn[fd] = c;
+    install_hooks();
+    g_v2_active[fd] = 1;
+    return 1;
+}
 static long v2_write_hook(int fd, const char* cmd, unsigned cmdlen,
                           const void* payload, unsigned plen){
     v2_conn* c = (fd >= 0 && fd < V2_FD_MAX) ? g_conn[fd] : 0;

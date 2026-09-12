@@ -13,7 +13,10 @@
  *      the hole (stop reason HOLE, no failure classification, no WARNING),
  *      returns 0 while the hole stays, resumes past it once the record is
  *      filled, and reaches the tip (stop reason TIP) once every hole is;
- *      utxo_applied_height.dat equals the applied height after every call;
+ *      utxo_applied_height.dat TRAILS the applied height (2026-09-10: a
+ *      fresh datadir is bulk, and a bulk bounded pass carries its batch to
+ *      the next pass -- the per-pass checkpoint was five fsyncs a pass and
+ *      the per-block one 13-24% of run 19's block time; the close lands it);
  *   B. the time budget: a 4,000-block chain with a 1 ms budget connects a
  *      prefix -- at least one block, far from all of them -- with stop
  *      reason BUDGET and a consistent checkpoint; repeated bounded calls
@@ -204,6 +207,7 @@ int main(void){
         memset(store_buf,0,sizeof store_buf);
         ck("A store_init", store_init(store_buf), 1);
         ck("A utxo_live_init", utxo_live_init("."), 1);
+        { extern int utxo_live_is_bulk(void); ck("a fresh datadir takes the dbcache-sized BULK memtable (2026-09-09)", utxo_live_is_bulk(), 1); }
         long n = 300;
         if (build_chain(n, 0x70000000u) < 0) return 1;
         u8 rec100[48], rec200[48];
@@ -217,7 +221,7 @@ int main(void){
         ck("A1 stop reason == HOLE", utxo_live_last_stop_reason(), STOP_HOLE);
         ck("A1 no failure classification (a hole is expected, not archive/recovery)", utxo_live_last_fail_kind(), FAIL_NONE);
         ckm("A1 no 'hole/short block' WARNING logged", log && !strstr(log, "hole/short block"));
-        ck("A1 utxo_applied_height.dat == applied height", read_checkpoint_file(), 99);
+        ckm("A1 utxo_applied_height.dat NOT written per pass: the bulk batch carries (2026-09-10)", read_checkpoint_file() < 99);
         ck("A1 live count == 100", utxo_live_count(), 100);
         free(log);
 
@@ -231,17 +235,19 @@ int main(void){
         ck("A3 resumes past it: connects [100,199] and stops at the next hole", ar, 100);
         ck("A3 applied_height == 199", utxo_live_applied_height(), 199);
         ck("A3 stop reason == HOLE", utxo_live_last_stop_reason(), STOP_HOLE);
-        ck("A3 checkpoint == 199", read_checkpoint_file(), 199);
+        ckm("A3 checkpoint still carried", read_checkpoint_file() < 199);
 
         ckm("A4 height 200 delivered", fill_hole(200, rec200));
         ar = utxo_live_catchup_bounded(store_buf, 60000, 1);
         ck("A4 connects the rest [200,299]", ar, 100);
         ck("A4 applied_height == 299 (the tip)", utxo_live_applied_height(), 299);
         ck("A4 stop reason == TIP", utxo_live_last_stop_reason(), STOP_TIP);
-        ck("A4 checkpoint == 299", read_checkpoint_file(), 299);
+        ckm("A4 checkpoint still carried at the frontier (a bounded pass is not the chain's tip)", read_checkpoint_file() < 299);
         ck("A4 live count == 300", utxo_live_count(), 300);
         ck("A5 caught up: another bounded call is a no-op", utxo_live_catchup_bounded(store_buf, 60000, 1), 0);
+        { extern int utxo_live_is_bulk(void); ck("A5 still bulk: no bounded pass downshifts (2026-09-10)", utxo_live_is_bulk(), 1); }
         utxo_live_close();
+        ck("A6 the clean close landed the carried batch: checkpoint == 299", read_checkpoint_file(), 299);
     }
 
     /* ---------------- B: the time budget ---------------- */
@@ -259,7 +265,7 @@ int main(void){
         ckm("B1 ...and only a prefix, not the whole chain", ar < n);
         ck("B1 stop reason == BUDGET", utxo_live_last_stop_reason(), STOP_BUDGET);
         ck("B1 applied_height == blocks connected - 1", utxo_live_applied_height(), ar - 1);
-        ck("B1 checkpoint == applied_height (the pending batch landed on exit)", read_checkpoint_file(), utxo_live_applied_height());
+        ckm("B1 checkpoint <= applied_height (carried or landed, never ahead)", read_checkpoint_file() <= utxo_live_applied_height());
         ck("B1 no failure classification", utxo_live_last_fail_kind(), FAIL_NONE);
 
         /* repeated bounded calls: every one makes progress, none overshoots */
@@ -274,10 +280,12 @@ int main(void){
         ck("B2 the calls sum to the chain exactly", total, n);
         ck("B2 applied_height at the tip", utxo_live_applied_height(), n - 1);
         ck("B2 last stop reason == TIP", utxo_live_last_stop_reason(), STOP_TIP);
-        ck("B2 checkpoint == tip", read_checkpoint_file(), n - 1);
+        { long c = read_checkpoint_file(); printf("     B: checkpoint at %ld, tip %ld\n", c, n - 1);
+          ckm("B2 checkpoint trails the tip by at most the bulk batch (1,024)", c <= n - 1 && c >= n - 1 - 1024); }
         ck("B2 live count == n", utxo_live_count(), n);
         ck("B3 max_ms == 0 with stop_at_hole: unbounded in time, a no-op when caught up", utxo_live_catchup_bounded(store_buf, 0, 1), 0);
         utxo_live_close();
+        ck("B4 the clean close landed it: checkpoint == tip", read_checkpoint_file(), n - 1);
     }
 
     /* ---------------- C: the shutdown flag ---------------- */

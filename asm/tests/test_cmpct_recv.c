@@ -46,6 +46,7 @@ static int run_same(const run_t* a, const run_t* b){
     if (a->n > 0) return !memcmp(a->out, b->out, (size_t)a->n);
     return !strcmp(a->cmd, b->cmd) && a->msg_n == b->msg_n && !memcmp(a->msg, b->msg, a->msg_n);
 }
+static int cls_stub_calls; static int cls_stub(const unsigned char* tx, unsigned long len){ (void)tx; (void)len; cls_stub_calls++; return 1; }
 int main(void){
     static unsigned char blk[8192], tx[8][256]; unsigned long tl[8]; unsigned long bo = 80; memset(blk, 0x11, 80);
     blk[bo++] = 6; for (int i = 0; i < 6; i++){ tl[i] = mktx(tx[i], 1000 + i); memcpy(blk + bo, tx[i], tl[i]); bo += tl[i]; }
@@ -66,6 +67,19 @@ int main(void){
     { const unsigned char* txs[2] = { tx[2], tx[4] }; long lens[2] = { (long)tl[2], (long)tl[4] }; static unsigned char bt[8192]; long btl = p2p_blocktxn_build(bt, bh, txs, lens, 2);
       writes = 0; n = cmpct_recv_blocktxn(9, bt, (unsigned long)btl, out, sizeof out);
       ok(n == (long)bo && !memcmp(out, blk, bo) && writes == 0, "blocktxn fills the two gaps: block byte-identical, nothing more sent"); }
+    printf("== row 5 (2026-09-10): the block's accounting and the classifier ==\n");
+    { extern void cmpct_recv_last_block(unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long cls[5]);
+      extern void cmpct_recv_set_classifier(int (*)(const unsigned char*, unsigned long));
+      unsigned long ntx_, pool_, pre_, miss_, mb_, cls_[5]; cmpct_recv_last_block(&ntx_, &pool_, &pre_, &miss_, &mb_, cls_);
+      ok(miss_ == 2 && pool_ + pre_ + miss_ == ntx_ && mb_ > 0, "after the blocktxn: 2 fetched, pool + prefilled + fetched = the block's tx count, bytes counted");
+      ok(cls_[0] == 2 && cls_[1] + cls_[2] + cls_[3] + cls_[4] == 0, "no classifier: the fetched ones count as never announced");
+      cmpct_recv_set_classifier(cls_stub);
+      writes = 0; cmpct_recv_cmpctblock(9, mp, cb, (unsigned long)cl, out, sizeof out, bh);
+      { const unsigned char* txs2[2] = { tx[2], tx[4] }; long lens2[2] = { (long)tl[2], (long)tl[4] }; static unsigned char bt2[8192]; long btl2 = p2p_blocktxn_build(bt2, bh, txs2, lens2, 2);
+        n = cmpct_recv_blocktxn(9, bt2, (unsigned long)btl2, out, sizeof out); }
+      cmpct_recv_last_block(&ntx_, &pool_, &pre_, &miss_, &mb_, cls_);
+      ok(n > 0 && cls_stub_calls == 2 && cls_[1] == 2 && cls_[0] == 0, "with a classifier: called once per fetched tx, and their class is counted (2 announced)");
+      cmpct_recv_set_classifier(0); }
     printf("== wrong block, junk, and the fallback ==\n");
     unsigned char other[32]; memset(other, 7, 32); ok(cmpct_recv_cmpctblock(9, mp, cb, (unsigned long)cl, out, sizeof out, other) == -1, "a compact block for another hash is ignored");
     writes = 0; n = cmpct_recv_cmpctblock(9, mp, cb, 90, out, sizeof out, bh); ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getdata") && cap[1] == 2 && cap[4] == 0x40, "a truncated payload falls back to a full MSG_WITNESS_BLOCK getdata");
@@ -73,7 +87,7 @@ int main(void){
       writes = 0; cmpct_recv_cmpctblock(9, mp, cb, (unsigned long)cl, out, sizeof out, bh);   /* re-arm state (2 missing) */
       unsigned char bt[64]; memcpy(bt, bh, 32); bt[32] = 1;   /* wrong count */
       writes = 0; n = cmpct_recv_blocktxn(9, bt, 33, out, sizeof out); ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getdata"), "a blocktxn with the wrong count falls back to a full getdata"); }
-    unsigned long r, need, fb; cmpct_recv_stats(&r, &need, &fb); ok(r == 2 && need >= 2 && fb == 2, "stats: 2 reconstructed, getblocktxn needed, 2 fallbacks");
+    unsigned long r, need, fb; cmpct_recv_stats(&r, &need, &fb); ok(r == 3 && need >= 3 && fb == 2, "stats: 3 reconstructed (the row 5 scenario reconstructed once more), getblocktxn needed, 2 fallbacks");
     printf("== the inventory type we request with ==\n");
     ok(cmpct_getdata_type(1) == 4 && cmpct_getdata_type(0) == 0x40000002u, "a leg that negotiated sendcmpct is asked for MSG_CMPCT_BLOCK; one that did not, MSG_WITNESS_BLOCK");
     printf("== the wtxid cache: reconstruction hashes no pool entry ==\n");

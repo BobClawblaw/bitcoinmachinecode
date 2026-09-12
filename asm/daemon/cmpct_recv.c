@@ -1,4 +1,6 @@
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "cmpct_recv.h"
 #include "../mempool_slot.h"
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen) __attribute__((weak));
@@ -13,6 +15,8 @@ static int g_enabled = 1; static cmpct_writer_t g_write = 0;
 static unsigned long g_st_recon = 0, g_st_need = 0, g_st_fb = 0;
 static int g_wtxid_cache = 1; static unsigned long g_st_hashed = 0;
 void cmpct_recv_set_enabled(int on){ g_enabled = on; }
+/* 2026-09-09: the sync drain re-requested a block in full after a compact one reconstructed badly (bitcoind.asm .have_block) */
+void cmpct_recv_note_fallback(void){ g_st_fb++; }
 void cmpct_recv_set_wtxid_cache(int on){ g_wtxid_cache = on; }
 unsigned long cmpct_recv_hashed(void){ return g_st_hashed; }
 int  cmpct_recv_enabled(void){ return g_enabled; }
@@ -66,6 +70,27 @@ static unsigned g_bits = HT_BITS;                    /* this build's width: prob
 static unsigned long g_fill = 0;                     /* live entries this build; put stops one short of full so get always terminates */
 static int g_ht_clear = 0;                           /* 1 = the pre-stamp ht_build: memset the whole table at full width (the control) */
 void cmpct_recv_set_ht_clear(int on){ g_ht_clear = on; }
+/* ---- 2026-09-10, CORE_DIVERGENCES row 5 (mempool overlap): what the last
+ * block needed. Core's peers hold nearly every transaction a block carries;
+ * one production blocktxn was 800 KB of a 1.6 MB block. Per block: how many
+ * transactions the block has, how many the mempool supplied, how many were
+ * prefilled by the peer, how many getblocktxn fetched and their bytes -- and,
+ * through the daemon's classifier, WHERE each fetched one went: never
+ * announced to us, announced but never requested, requested with no reply,
+ * parked as an orphan, or refused by policy. The measurement row 5 asks for
+ * before its fix. */
+enum { CR_CLS_UNSEEN = 0, CR_CLS_ANNOUNCED, CR_CLS_REQUESTED, CR_CLS_ORPHAN, CR_CLS_REJECTED, CR_CLS_N };
+static int (*g_classify)(const unsigned char* tx, unsigned long len) = 0;
+void cmpct_recv_set_classifier(int (*fn)(const unsigned char*, unsigned long)){ g_classify = fn; }
+static struct { unsigned long ntx, pool, pre, miss, miss_bytes, cls[CR_CLS_N]; } g_last;
+void cmpct_recv_last_block(unsigned long* ntx, unsigned long* pool, unsigned long* pre, unsigned long* miss, unsigned long* miss_bytes, unsigned long cls[5]){
+    if (ntx) *ntx = g_last.ntx;
+    if (pool) *pool = g_last.pool;
+    if (pre) *pre = g_last.pre;
+    if (miss) *miss = g_last.miss;
+    if (miss_bytes) *miss_bytes = g_last.miss_bytes;
+    if (cls) for (int i = 0; i < CR_CLS_N; i++) cls[i] = g_last.cls[i];
+}
 unsigned cmpct_recv_ht_bits(void){ return g_bits; }
 unsigned cmpct_recv_ht_gen(void){ return g_gen; }
 void cmpct_recv_ht_set_gen(unsigned g){ g_gen = g; }
@@ -129,15 +154,26 @@ static long assemble(unsigned char* out, unsigned long cap){
     unsigned long o = 0; if (cap < 80 + 9) return -1;
     memcpy(out, S.hdr, 80); o = 80; o += (unsigned long)put_cs(out + o, S.ntx);
     for (unsigned long i = 0; i < S.ntx; i++){ if (!S.ptr[i] || o + S.len[i] > cap) return -1; memcpy(out + o, S.ptr[i], S.len[i]); o += S.len[i]; }
-    S.active = 0; g_st_recon++; return (long)o;
+    S.active = 0; g_st_recon++;
+    /* 2026-09-09 diagnostic: BMC_CMPCT_DUMP=<dir> writes every assembled block
+     * as <dir>/<height-agnostic hash>.blk for a byte diff against the peer's */
+    { const char* d = getenv("BMC_CMPCT_DUMP");
+      if (d){ char path[512]; unsigned char h[32]; block_hash(h, out); char hx[65]; for (int i = 0; i < 32; i++) sprintf(hx + 2*i, "%02x", h[31 - i]);
+              snprintf(path, sizeof path, "%s/%s.blk", d, hx); FILE* f = fopen(path, "wb"); if (f){ fwrite(out, 1, o, f); fclose(f); } } }
+    return (long)o;
 }
 static long fallback_full(int fd){
     unsigned char gd[37]; gd[0] = 1; unsigned t = MSG_WITNESS_BLOCK_T; memcpy(gd + 1, &t, 4); memcpy(gd + 5, S.hash, 32);
     S.active = 0; g_st_fb++; wr(fd, "getdata", 7, gd, 37); return 0;
 }
+/* BMC_CMPCT_DEBUG=1 traces every path through the receiver (2026-09-09: the
+ * trace showed getblocktxn sent and no blocktxn ever reaching this file --
+ * the sync drain's 5-byte "block" compare had swallowed it) */
+static int dbg(void){ static int d = -1; if (d < 0) d = getenv("BMC_CMPCT_DEBUG") ? 1 : 0; return d; }
 long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap, const unsigned char want[32]){
+    if (dbg()) fprintf(stderr, "[cmpct-dbg] cmpctblock fd=%d plen=%lu out%spl cap=%lu enabled=%d\n", fd, plen, out == pl ? "==" : "!=", cap, g_enabled);
     if (!g_enabled || plen < 80 + 8 + 1 + 1) return -1;
-    unsigned char bh[32]; block_hash(bh, pl); if (memcmp(bh, want, 32) != 0) return -1;
+    unsigned char bh[32]; block_hash(bh, pl); if (memcmp(bh, want, 32) != 0){ if (dbg()) fprintf(stderr, "[cmpct-dbg] not the wanted block (%02x%02x.. vs want %02x%02x..)\n", bh[31], bh[30], want[31], want[30]); return -1; }
     S.active = 1; memcpy(S.hash, bh, 32); memcpy(S.hdr, pl, 80); memcpy(&S.nonce, pl + 80, 8); S.pre_used = 0; S.nmiss = 0;
     unsigned long o = 88; unsigned long long nshort = 0, npre = 0; long c;
     if (!(c = get_cs(pl + o, plen - o, &nshort))) return fallback_full(fd);
@@ -147,6 +183,7 @@ long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned l
     if (!(c = get_cs(pl + o, plen - o, &npre))) return fallback_full(fd);
     o += (unsigned long)c;
     S.ntx = (unsigned long)(nshort + npre); if (S.ntx == 0 || S.ntx > CR_MAX_TX) return fallback_full(fd);
+    memset(&g_last, 0, sizeof g_last); g_last.ntx = S.ntx; g_last.pre = (unsigned long)npre;
     for (unsigned long i = 0; i < S.ntx; i++) S.ptr[i] = 0;
     /* prefilled: (differential index, tx) -- copy the tx bytes, the payload buffer is reused by the next read */
     unsigned long idx = 0;
@@ -166,17 +203,20 @@ long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned l
         unsigned long l; const unsigned char* tx = ht_get(sid_of(sids + k * 6), &l); k++;
         if (tx){ S.ptr[i] = tx; S.len[i] = l; } else S.nmiss++;
     }
-    if (S.nmiss == 0){ long n = assemble(out, cap); return n > 0 ? n : fallback_full(fd); }
+    g_last.miss = S.nmiss; g_last.pool = S.ntx - (unsigned long)npre - S.nmiss;
+    if (S.nmiss == 0){ long n = assemble(out, cap); if (dbg()) fprintf(stderr, "[cmpct-dbg] assembled from the mempool and the prefilled: %ld bytes, ntx=%lu\n", n, S.ntx); return n > 0 ? n : fallback_full(fd); }
     /* getblocktxn: blockhash || count || differential indexes of the missing */
     unsigned char req[32 + 9 + CR_MAX_TX * 5]; unsigned long ro = 32; memcpy(req, S.hash, 32);
     ro += (unsigned long)put_cs(req + ro, S.nmiss); unsigned long last = 0; int first = 1;
     for (unsigned long i = 0; i < S.ntx; i++) if (!S.ptr[i]){ ro += (unsigned long)put_cs(req + ro, first ? i : i - last - 1); last = i; first = 0; }
     g_st_need++; wr(fd, "getblocktxn", 11, req, (unsigned)ro);
+    if (dbg()) fprintf(stderr, "[cmpct-dbg] getblocktxn sent: %lu missing of %lu\n", S.nmiss, S.ntx);
     return 0;
 }
 long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, unsigned char* out, unsigned long cap){
+    if (dbg()) fprintf(stderr, "[cmpct-dbg] blocktxn fd=%d plen=%lu active=%d\n", fd, plen, S.active);
     if (!g_enabled || !S.active || plen < 33) return -1;
-    if (memcmp(pl, S.hash, 32) != 0) return -1;
+    if (memcmp(pl, S.hash, 32) != 0){ if (dbg()) fprintf(stderr, "[cmpct-dbg] blocktxn for another block\n"); return -1; }
     unsigned long o = 32; unsigned long long n; long c;
     if (!(c = get_cs(pl + o, plen - o, &n)) || n != S.nmiss) return fallback_full(fd);
     o += (unsigned long)c;
@@ -185,6 +225,10 @@ long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, un
         unsigned char info[64]; if (!tx_parse(info, pl + o, plen - o)) return fallback_full(fd);
         unsigned long tl = (unsigned long)*(unsigned long long*)info; if (S.pre_used + tl > sizeof S.pre) return fallback_full(fd);
         memcpy(S.pre + S.pre_used, pl + o, tl); S.ptr[i] = S.pre + S.pre_used; S.len[i] = tl; S.pre_used += tl; o += tl;
+        g_last.miss_bytes += tl;
+        { int c = g_classify ? g_classify(S.ptr[i], tl) : 0; if (c < 0 || c >= CR_CLS_N) c = 0; g_last.cls[c]++; }   /* no classifier: never announced */
     }
-    long r = assemble(out, cap); return r > 0 ? r : fallback_full(fd);
+    long r = assemble(out, cap);
+    if (dbg()) fprintf(stderr, "[cmpct-dbg] assembled after blocktxn: %ld bytes\n", r);
+    return r > 0 ? r : fallback_full(fd);
 }
