@@ -1,4 +1,44 @@
-# Run 22: a clean sync that produced the wrong UTXO set
+# Run 22: a clean sync, and a capstone that could not read its own result
+
+> **CORRECTION, 2026-09-12.** The conclusion below is WRONG and is kept because
+> the reasoning that produced it is worth reading. There is no coin-metadata
+> defect. Run 22's UTXO set is correct.
+>
+> The archived store was walked **offline and quiesced** and compared to the
+> oracle at the same height:
+>
+> | | ours | Core v31.1 |
+> |---|---|---|
+> | height | 966,496 | 966,496 |
+> | txouts | 165,200,444 | 165,200,444 |
+> | bogosize | 12,941,799,750 | 12,941,799,750 |
+> | total_amount | 2,008,257,300,621,623 sat | 2,008,257,300,621,623 sat |
+> | muhash | `df1b0340…073d0165` | `df1b0340…073d0165` |
+>
+> Identical on every field. The original FAIL came from asking the LIVE node for
+> `gettxoutsetinfo` six minutes after the tip line, while the UTXO engine was
+> still applying and flushing. A walk over a moving LSM is not a set.
+>
+> **Why the wrong conclusion was so persuasive.** The argument below runs: every
+> aggregate matches, so outpoints, values and scripts are right; the only muhash
+> input left is the coin's `(height << 1) | coinbase`. That is sound *if* the
+> aggregates and the hash came from the same read. They did not. On the live
+> path `txouts` is a maintained counter, not the walk's own count, so it kept
+> reporting the correct figure while the hash was computed over a set being
+> rewritten underneath it. **Aggregates agreeing with a hash that disagrees is
+> the signature of a torn read.** Treat it as one next time.
+>
+> The freezing test below (`setnetworkactive false`, re-hash, "still differs and
+> is stable across repeats") did not rule this out: stopping the network stops
+> new blocks arriving, but the UTXO engine goes on applying blocks already
+> stored, so the set kept moving. Quiescence had to be asserted, not assumed —
+> `bmc_utxo_setinfo` reports `quiesced` and `consistent` for exactly this
+> reason, and the capstone bypassed it.
+>
+> Fixed in `validation/fresh_ibd_run.sh`: the capstone now quiesces, asks OUR
+> side for its current set with no height argument, and pins the oracle to the
+> height our own answer reports.
+
 
 2026-09-11. Fresh mainnet IBD, commit `4a4872cf`, `dbcache=8192`,
 `bmc.catchupworkers=8`, `bmc.bootcatchup=0`.

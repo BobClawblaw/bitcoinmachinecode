@@ -2,13 +2,33 @@
 
 2026-09-11. Benchmark tag [tt]bench-2026-09-10[/tt], node commit [tt]4a4872cf[/tt].
 
+[quote][b]CORRECTIONS, 2026-09-12.[/b] Two claims in the original version of this
+report were wrong, both in ways that need saying plainly.
+
+[b]1. The UTXO set was correct.[/b] This report said the node built a wrong UTXO
+set. It did not. The store was later walked offline and quiesced and matched
+Core exactly at height 966,496 -- muhash [tt]df1b0340...073d0165[/tt], txouts
+165,200,444, bogosize 12,941,799,750, total_amount 2,008,257,300,621,623 sat,
+every field identical. The original failure came from hashing the set through
+the live node while its UTXO engine was still applying and flushing, which is a
+torn read, not a defect.
+
+[b]2. The "hour ahead of Core" is not safe to quote.[/b] Core's 21h 11m was
+measured with its daemon under [tt]ionice -c3[/tt], the idle I/O class, while
+our node ran with no ionice at all. On a disk-bound sync that is a handicap, not
+a control. An unhandicapped Core baseline is running as of 2026-09-12 and will
+replace the figure. The segment-by-segment table below is the honest part of the
+comparison and it already says we are 8-12% slower than Core from height 500,000
+onward.[/quote]
+
 This is a report on one fresh mainnet initial block download by an independent
 Bitcoin full node written in x86-64 assembly, measured against Bitcoin Core
-v31.1 on the same machine, and on the defect that measurement found.
+v31.1 on the same machine -- and, as it turned out, on three defects in the
+measurement rather than in the node.
 
-[b]The short version: it finished an hour ahead of Core, and it was still wrong.[/b]
-The chain it built is identical to Core's, block for block. The UTXO set it
-derived from that chain is not.
+[b]The short version: it built a chain identical to Core's block for block, and a
+UTXO set identical to Core's coin for coin.[/b] The capstone that said otherwise
+was reading a set that was still moving.
 
 [hr]
 [size=12pt][b]The machine, and both configurations[/b][/size]

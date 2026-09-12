@@ -74,17 +74,30 @@ echo $! > daemon.pid; sleep 8
 kill -0 "$(cat daemon.pid)" 2>/dev/null || { ph "FAIL daemon exited at once"; echo FAIL > RESULT; exit 1; }
 ph "DAEMON pid=$(cat daemon.pid) epoch=$T0"
 
-CLI="src/asm/daemon/bmc_cli -rpcport=$RPC -datadir=$DEST/data"
+# -rpcclienttimeout=0 (wait forever): gettxoutsetinfo walks the whole UTXO set
+# and blows past the 900s default on a mainnet-sized node.
+CLI="src/asm/daemon/bmc_cli -rpcport=$RPC -datadir=$DEST/data -rpcclienttimeout=0"
 while :; do
     sleep 300
-    hb=$(grep '\[dl\] .*elapsed' console.log | tail -1 | sed 's/.*== //;s/ ==.*//')
-    [ -z "$hb" ] && hb=$(grep '\[dl\] heartbeat' console.log | tail -1 | sed 's/.*heartbeat: //')
-    bad=$(grep -E 'FATAL|REJECT|HALTED|SEGV' console.log | grep -vE '\[reorg\] (candidate REJECTED|probe of )' | grep -c .)
+    # 2026-09-12: this read console.log, which holds ONLY the startup banner --
+    # the daemon redirects its running log to data/main/debug.log (its [boot]
+    # line says so). Every tick therefore recorded hb='' and bad=0 for three
+    # runs: no heartbeat, and, worse, a bad-marker check that could never fire.
+    # Three separate mistakes, all of which had to be fixed to get one number:
+    #   - the file: data/main/debug.log, not console.log
+    #   - the pattern: the heartbeat is "[dlc] == elapsed ...", and "\[dl\] "
+    #     cannot match "[dlc]" because it demands "] " straight after "dl"
+    #   - grep -a: debug.log carries NUL bytes, so grep calls it binary and
+    #     prints nothing at all, counts included
+    LOG=data/main/debug.log
+    hb=$(grep -a '\[dlc\] == elapsed' "$LOG" 2>/dev/null | tail -1 | sed 's/.*== //;s/ ==.*//')
+    [ -z "$hb" ] && hb=$(grep -a '\[dl\] heartbeat' "$LOG" 2>/dev/null | tail -1 | sed 's/.*heartbeat: //')
+    bad=$(grep -aE 'FATAL|REJECT|HALTED|SEGV' "$LOG" 2>/dev/null | grep -vE '\[reorg\] (candidate REJECTED|probe of )' | grep -c .)
     du=$(du -sh data 2>/dev/null | cut -f1)
     # the 2026-09-11 occupancy figure: the share of worker wall-clock spent
     # blocked in the socket read. Recorded every tick so the sync's throughput
     # can be read against whether the peers were ever able to fill the pipe.
-    idle=$(grep -oE 'pool idle [0-9]+%' console.log | tail -1)
+    idle=$(grep -aoE 'pool idle [0-9]+%' "$LOG" 2>/dev/null | tail -1)
     echo "$(ts) hb='$hb' disk=$du ${idle:+$idle} bad=$bad" >> "$PROG"
     [ "${bad:-0}" != "0" ] && { ph "FAIL bad markers"; echo FAIL > RESULT; exit 1; }
     ours=$($CLI getblockcount 2>/dev/null); theirs=$($ORACLE getblockcount 2>/dev/null)
@@ -92,11 +105,51 @@ while :; do
     [ "$ours" -ge $((theirs-1)) ] || continue
 
     ph "TIP reached: ours=$ours oracle=$theirs elapsed=$(( $(date +%s)-T0 ))s"
-    sleep 180                      # let the engine settle and the index commit
-    # Compare at a SETTLED height, well below the tip, so neither side is
-    # hashing a set the network is still moving under it.
-    H=$(( ours - 20 ))
-    OM=$($CLI gettxoutsetinfo muhash "$H" 2>/dev/null | sed -n 's/.*"muhash": *"\([0-9a-f]*\)".*/\1/p' | head -1)
+
+    # ------------------------------------------------------------------
+    # THE CAPSTONE. Three ways this has lied, all fixed here:
+    #
+    # 1. Run 22 (2026-09-11) hashed a LIVE set. The comparison ran six minutes
+    #    after the tip line while the engine was still applying and flushing,
+    #    so the walk saw a moving LSM. It reported FAIL and a coin-metadata bug
+    #    was written up. On 2026-09-12 the archived store was walked offline,
+    #    quiesced, and matched Core on muhash AND every aggregate exactly. The
+    #    set was always right; the read was torn. Note what made the torn read
+    #    convincing: `txouts` AGREED, because on the live path that figure is a
+    #    maintained counter rather than the walk's own count -- so "aggregates
+    #    match but the hash differs" is the signature of an inconsistent read,
+    #    not of good data with bad metadata.
+    #
+    # 2. Run 23 asked OUR node for a HISTORICAL height (ours-20). That answer
+    #    comes from the coinstatsindex, which on a fresh sync has not caught up
+    #    to the tip yet, so the call errored and returned ''. Asking our own
+    #    node for a height it cannot yet answer is a harness bug, not a defect.
+    #
+    # 3. Before both, an empty hash compared equal to an empty oracle value and
+    #    every run "passed" a check that never executed.
+    #
+    # The fix: quiesce, then ask OUR side for its CURRENT set with no height
+    # argument -- always answerable, no index dependency -- and let it tell us
+    # which height that was. Then ask the oracle for THAT height, where the
+    # index makes it O(1). The height is pinned by the answer, not assumed.
+    # ------------------------------------------------------------------
+    $CLI setnetworkactive false >/dev/null 2>&1 && ph "CAPSTONE network disabled for a still set"
+    prev=-1; stable=0
+    for i in $(seq 1 60); do
+        cur=$($CLI getblockcount 2>/dev/null)
+        if [ -n "$cur" ] && [ "$cur" = "$prev" ]; then
+            stable=$(( stable + 1 ))
+            [ $stable -ge 3 ] && { ph "CAPSTONE quiesced at height $cur"; break; }
+        else stable=0; fi
+        prev=$cur; sleep 20
+    done
+    [ $stable -ge 3 ] || ph "WARN capstone proceeding without a stable height (last=$prev)"
+
+    OURJSON=$($CLI gettxoutsetinfo muhash 2>/dev/null)
+    OM=$(echo "$OURJSON" | sed -n 's/.*"muhash": *"\([0-9a-f]*\)".*/\1/p' | head -1)
+    H=$(echo  "$OURJSON" | sed -n 's/.*"height": *\([0-9]*\).*/\1/p' | head -1)
+    case "$H" in ''|*[!0-9]*) ph "FAIL capstone: our side reported no height"; echo FAIL > RESULT; exit 1;; esac
+    ph "CAPSTONE ours is at height $H; asking the oracle for the same height"
     CM=$($ORACLE gettxoutsetinfo muhash "$H" 2>/dev/null | sed -n 's/.*"muhash": *"\([0-9a-f]*\)".*/\1/p' | head -1)
     # THE GUARD THAT WAS MISSING: an empty answer is not a passing answer.
     case "$OM" in *[!0-9a-f]*|"") ph "FAIL muhash: our side returned no usable hash ('$OM')"; echo FAIL > RESULT; exit 1;; esac
@@ -107,7 +160,21 @@ while :; do
         ph "PASS muhash identical at $H ($OM)"; echo "PASS $H" > RESULT; exit 0
     fi
     ph "FAIL muhash differs at $H: ours=$OM oracle=$CM"
-    ph "BISECT: finding the first height whose set diverges"
+    # The bisect reads OUR per-height digests, which come from the
+    # coinstatsindex. On a fresh sync that index trails the chain, and asking it
+    # for a height it has not reached returns nothing -- which is how run 23
+    # produced an empty hash and no verdict. Check it is actually caught up
+    # before trusting a single answer from it.
+    CSI=$($CLI getindexinfo 2>/dev/null | sed -n '/coinstatsindex/,/}/p' | sed -n 's/.*"best_block_height": *\([0-9]*\).*/\1/p' | head -1)
+    case "$CSI" in ''|*[!0-9]*) CSI=0;; esac
+    if [ "$CSI" -lt "$H" ]; then
+        ph "BISECT unavailable: our coinstatsindex is at $CSI, below $H -- per-height"
+        ph "      digests do not exist yet, so a bisect would read empty answers as"
+        ph "      divergence. Re-run the bisect once the index catches up."
+        echo "FAIL muhash-differs-at=$H (bisect deferred: coinstatsindex at $CSI)" > RESULT
+        exit 1
+    fi
+    ph "BISECT: finding the first height whose set diverges (coinstatsindex at $CSI)"
     LO=1; HI=$H
     while [ $LO -lt $HI ]; do
         MID=$(( (LO+HI)/2 ))
