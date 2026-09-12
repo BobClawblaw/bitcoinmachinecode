@@ -9158,6 +9158,7 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
       extern unsigned long long mpool_policy_min_fee(void*);
       extern long mpool_count(void*);
       extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32], unsigned long* out_len);
+    extern unsigned long long mpool_policy_bytespersigop(void);
       rpc_mempool_hooks h = {
           .mp = mp_ext_area, .polstate = mp_ext_polstate,
           .maxbytes = (long long)mp_ext_blobcap,
@@ -9172,6 +9173,7 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
            * member says unsigned long -- ABI-identical on x86-64 SysV. */
           .sha256d = (void(*)(unsigned char*, const void*, unsigned long))sha256d,
           .min_fee = mpool_policy_min_fee,
+          .bytespersigop = mpool_policy_bytespersigop,
           .feeest = mp_ext_feeest,
           .min_relay_satkvb = g_cfg.minrelaytxfee_satkvb > 0 ? (unsigned long long)g_cfg.minrelaytxfee_satkvb : 100ULL };
       rpc_node_set_mempool(&h);
