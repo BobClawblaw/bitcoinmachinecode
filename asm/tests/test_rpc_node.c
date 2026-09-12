@@ -230,6 +230,14 @@ int main(void){
     r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
     ck("getpeerinfo dispatched to array", rc == 1 && r && r->typ == RJ_ARR);
     ck("getpeerinfo has 2 peers", r && r->nitems == 2);
+    /* every peer gets the shared fields, not just download workers: the two
+     * builders used to emit different field sets from the same RPC. */
+    { rj_val* p0 = (r && r->nitems) ? r->items[0] : NULL;
+      ck("a relay leg carries connection_type", p0 && rj_obj_get(p0, "connection_type"));
+      ck("a relay leg carries inflight (empty, honestly)", p0 && rj_obj_get(p0, "inflight")
+         && rj_obj_get(p0, "inflight")->typ == RJ_ARR);
+      ck("no peer carries startingheight, which Core v31.1 dropped",
+         p0 && rj_obj_get(p0, "startingheight") == NULL); }
     /* 2026-09-08: the parallel download's peers are listed too, with the chunk in flight */
     rj_free(r);
     st.n_dlpeers = 1; memset(&st.dlpeers[0], 0, sizeof st.dlpeers[0]); st.dlpeers[0].used = 1;
@@ -238,9 +246,15 @@ int main(void){
     st.dlpeers[0].inflight_lo = 500001; st.dlpeers[0].inflight_hi = 500040; st.dlpeers[0].dl_worker = 7; st.dl_bytes_total = 50000000000LL;
     r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
     ck("getpeerinfo lists the download worker's peer as a third entry", rc == 1 && r && r->nitems == 3);
-    { rj_val* d = (r && r->nitems == 3) ? r->items[2] : NULL; rj_val* fl = d ? rj_obj_get(d, "inflight") : NULL; rj_val* bw = d ? rj_obj_get(d, "bmc_download_worker") : NULL; rj_val* br = d ? rj_obj_get(d, "bytesrecv") : NULL; rj_val* ct = d ? rj_obj_get(d, "connection_type") : NULL;
+    { rj_val* d = (r && r->nitems == 3) ? r->items[2] : NULL; rj_val* fl = d ? rj_obj_get(d, "inflight") : NULL; rj_val* br = d ? rj_obj_get(d, "bytesrecv") : NULL; rj_val* ct = d ? rj_obj_get(d, "connection_type") : NULL;
       ck("...with 40 heights in flight, 500001..500040", fl && fl->nitems == 40 && !strcmp(fl->items[0]->str, "500001") && !strcmp(fl->items[39]->str, "500040"));
-      ck("...naming worker 7, its bytes, and connection_type outbound-full-relay", bw && !strcmp(bw->str, "7") && br && !strcmp(br->str, "123456789") && ct && !strcmp(ct->str, "outbound-full-relay")); }
+      ck("...its bytes, and connection_type outbound-full-relay", br && !strcmp(br->str, "123456789") && ct && !strcmp(ct->str, "outbound-full-relay"));
+      /* bmc_download_worker was an ADDITIVE key in a Core call. It is gone
+       * (2026-09-12), the same category as the startingheight dropped for
+       * exactness; the worker index lives on bmcgetdownloadinfo, which is
+       * ours to define. This assertion used to require the extra key, so it
+       * pinned the divergence -- it now pins its absence. */
+      ck("getpeerinfo carries no additive bmc_ key", d && rj_obj_get(d, "bmc_download_worker") == NULL); }
     rj_free(r);
     r = NULL; rc = rpc_node_dispatch("getnettotals", NULL, &r, &ec, &em);
     { rj_val* tr = r ? rj_obj_get(r, "totalbytesrecv") : NULL;

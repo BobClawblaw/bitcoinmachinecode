@@ -29,7 +29,32 @@ the release this node tracks. Two connected regtest nodes give a real
 
 ## The work
 
-### 1. `getpeerinfo` — 19 fields, v31.1 has 38
+### 1. `getpeerinfo` — 20 fields, v31.1 has 38  *(partly done)*
+
+**Done 2026-09-12.** `connection_type` and `inflight` now appear on **every**
+peer, verified live on all nine. Both previously existed on download workers
+only, so the same RPC returned two different field sets depending on the kind
+of peer — a divergence inside our own call. One shared helper now owns every
+common field so the two builders cannot drift again.
+
+Also removed for exactness: `startingheight` (v31.1 dropped it) and
+`bmc_download_worker` (additive key in a Core call; the worker index is on
+`bmcgetdownloadinfo`, which is ours to define). `getpeerinfo` now carries **no**
+additive keys.
+
+`last_block`, `last_transaction` and `minping` are emitted **when the data
+exists**, which matches Core's own behaviour of omitting them when unknown —
+but on this node the data mostly does not exist yet, so they do not appear in
+practice. That is honest rather than useful, and the underlying gap is real:
+
+- `last_tx_time` / `last_block_time` are written only by `txann`, which sets
+  its slot for **inbound children only** (`txann_set_my_slot` is called once,
+  from the inbound path). Production is almost entirely outbound, so the
+  fields stay empty. Core populates both for every peer.
+- `min_ping_us` has **no writer at all** — the struct comment says so
+  outright. There is no ping round-trip measurement in this node.
+
+### 1b. `getpeerinfo` — the 18 still missing
 
 The largest gap, and the one bmcmonitor's Peers page is blocked on. Twenty
 fields, grouped by where the data has to come from:

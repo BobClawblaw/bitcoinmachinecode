@@ -111,7 +111,11 @@ for m, a in CASES:
                                                                     "ok" if c is not None else "ERR")))
         continue
     ko, kc = keypaths(o), keypaths(c)
-    miss, ext = sorted(kc - ko), sorted(ko - kc)
+    # Two DELIBERATE additive keys: the operator asked for build attestation
+    # over RPC, and Core has no equivalent. Everything else additive has been
+    # removed for exactness. Named here so they read as a decision, not drift.
+    ext_ok = {"bmc_build_commit", "bmc_build_dirty"}
+    miss, ext = sorted(kc - ko), sorted((ko - kc) - ext_ok)
     if miss: gaps += 1
     if ext: extras += 1
     rows.append((label, len(ko), len(kc), miss, ext, ""))

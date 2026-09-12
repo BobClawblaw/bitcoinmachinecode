@@ -230,6 +230,44 @@ static void services_names(unsigned long long s, rj_val* arr){
  * synced_headers/blocks) are reported as 0/-1 -- a documented gap, not a
  * fabricated value. Inbound peers are counted (getconnectioncount) but not
  * itemized here yet (they are separate forked children). */
+/* The getpeerinfo fields common to a relay leg and a download worker.
+ *
+ * There are two builders below -- one per kind of peer -- and every field
+ * added to one and not the other is a silent divergence in the same call.
+ * Anything either of them can answer honestly goes here, once.
+ *
+ * Only fields with a REAL source are emitted. Core's getpeerinfo has 38
+ * fields in v31.1 and this node does not yet track the rest: per-message byte
+ * counters, ping round-trip times, the peer's feefilter, its compact-block
+ * high-bandwidth state, the BIP324 session id, the bound local address, and
+ * the address-relay counters. Emitting any of those as a zero or a guess
+ * would be worse than omitting them -- a caller cannot tell an invented zero
+ * from a measured one. They are tracked in docs/PARITY_RPC_FIELDS.md. */
+static void peer_common_fields(rj_val* o, const rpc_peer_t* p)
+{
+    /* Core reports these as seconds since epoch, and omits them at 0 rather
+     * than claiming "at the epoch". */
+    if (p->last_block_time > 0) rj_obj_set(o, "last_block", rj_numf("%lld", (long long)p->last_block_time));
+    if (p->last_tx_time   > 0) rj_obj_set(o, "last_transaction", rj_numf("%lld", (long long)p->last_tx_time));
+    /* minping in SECONDS, as Core prints it. min_ping_us is 0 when unmeasured
+     * -- this node does not ping inbound peers -- and an unmeasured minimum
+     * printed as 0.0 would read as a perfect link. Omitted, like Core. */
+    if (p->min_ping_us > 0)
+        rj_obj_set(o, "minping", rj_numf("%.6f", (double)p->min_ping_us / 1e6));
+    /* connection_type: what this node actually runs. Core also has
+     * block-relay-only, manual, feeler and addr-fetch; none of those exist
+     * here, so none are claimed. */
+    rj_obj_set(o, "connection_type", rj_str(p->inbound ? "inbound" : "outbound-full-relay"));
+    /* inflight: the block heights requested from this peer and not yet in.
+     * A leg requests none, and an empty array is the honest answer there --
+     * it is what Core returns for a peer with nothing outstanding. */
+    { rj_val* fl = rj_arr();
+      if (p->inflight_hi >= p->inflight_lo)
+          for (long h = p->inflight_lo; h <= p->inflight_hi && h < p->inflight_lo + 256; h++)
+              rj_arr_push(fl, rj_numf("%ld", h));
+      rj_obj_set(o, "inflight", fl); }
+}
+
 static int cmd_getpeerinfo(rj_val** res){
     rj_val* arr = rj_arr();
     if (g_status){
@@ -280,6 +318,7 @@ static int cmd_getpeerinfo(rj_val** res){
             { bmc_addr_t pa; const char* nn = "ipv4";
               if (bmc_addr_from_string_port(&pa, p->addr, 0)) nn = bmc_net_name(pa.net);
               rj_obj_set(o, "network", rj_str(nn)); }
+            peer_common_fields(o, p);
             rj_arr_push(arr, o);
         }
         /* the parallel download's peers (2026-09-08), one per worker holding a
@@ -311,13 +350,20 @@ static int cmd_getpeerinfo(rj_val** res){
              * bmcgetdownloadinfo, which is ours to define. */
             rj_obj_set(o, "synced_headers", rj_numf("%d", p->start_height));
             rj_obj_set(o, "synced_blocks", rj_numf("%ld", p->inflight_hi >= p->inflight_lo ? p->inflight_lo - 1 : -1L));
-            { rj_val* fl = rj_arr(); if (p->inflight_hi >= p->inflight_lo) for (long h = p->inflight_lo; h <= p->inflight_hi && h < p->inflight_lo + 256; h++) rj_arr_push(fl, rj_numf("%ld", h));
-              rj_obj_set(o, "inflight", fl); }
-            rj_obj_set(o, "connection_type", rj_str("outbound-full-relay"));
-            rj_obj_set(o, "bmc_download_worker", rj_numf("%d", p->dl_worker));   /* this node's extension: which worker holds it */
+            /* inflight and connection_type now come from peer_common_fields
+             * below. They used to be emitted HERE and nowhere else, so the
+             * same RPC returned two different field sets depending on whether
+             * a peer was a relay leg or a download worker -- the exact
+             * divergence the shared helper exists to prevent.
+             *
+             * bmc_download_worker is gone too. It was an additive key in a
+             * Core call, which is the same category as the startingheight we
+             * just dropped for exactness; the worker index is on
+             * bmcgetdownloadinfo, which is ours to define. */
             { bmc_addr_t pa; const char* nn = "ipv4";
               if (bmc_addr_from_string_port(&pa, p->addr, 0)) nn = bmc_net_name(pa.net);
               rj_obj_set(o, "network", rj_str(nn)); }
+            peer_common_fields(o, p);
             rj_arr_push(arr, o);
         }
     }
