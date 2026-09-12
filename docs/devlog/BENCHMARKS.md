@@ -651,8 +651,8 @@ carry the segment tables, the configuration and the defect analysis.
 
 | run | date | node commit | blocks | wall clock | capstone | report |
 |---|---|---|---|---|---|---|
-| 22 | 2026-09-11 | `4a4872cf` | 966,369 | 20h 08m | **FAIL** — muhash differs from oracle at 966,494 | [public report](../reports/2026-09-11-ibd-vs-core.md) · [bbcode](../reports/2026-09-11-ibd-vs-core.bbcode) · [defect writeup](../reports/2026-09-11-run22-muhash-divergence.md) |
-| 23 | 2026-09-12 | `8bc638f9` | 966,674 | 19h 05m | **FAIL** — our side returned no usable hash | not yet written |
+| 22 | 2026-09-11 | `4a4872cf` | 966,369 | 20h 08m | **PASS** (2026-09-12, offline) — the live capstone's FAIL was a torn read | [public report](../reports/2026-09-11-ibd-vs-core.md) · [bbcode](../reports/2026-09-11-ibd-vs-core.bbcode) · [defect writeup](../reports/2026-09-11-run22-muhash-divergence.md) |
+| 23 | 2026-09-12 | `8bc638f9` | 966,674 | 19h 05m | **no verdict** — harness asked our node for a height its index had not reached | not yet written |
 
 **Run 22** is the first comparison run at 8 download peers on both sides. Core's
 block-download concurrency is not configurable — `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`
@@ -663,10 +663,36 @@ node is then 8 to 12 percent *slower* in every segment but one. The hour it
 finished ahead is a 138-minute stall on Core's side, not our throughput.
 
 **Run 23** carried `coinstatsindex=1` and reached the oracle's tip exactly. Its
-capstone did not fail the way run 22's did — it never produced a hash to compare,
-so the run proves the chain and says nothing about the UTXO set. The empty-hash
-case is now reported as FAIL rather than silently passing, which is itself new;
-see the note on the capstone below.
+capstone never produced a hash: it asked OUR node for the set at `tip-20`, an
+answer that comes from the coinstatsindex, which on a fresh sync trails the
+chain and had not reached that height. The call errored, returned an empty
+string, and the run ended with no verdict on its UTXO set. That is a harness
+bug, not a node defect.
+
+### Run 22's capstone was wrong, and the set was right
+
+On 2026-09-12 run 22's archived store was walked **offline and quiesced** with
+`bmc_utxo_setinfo --muhash` and compared to the oracle at the same height:
+
+| | ours | Core v31.1 |
+|---|---|---|
+| height | 966,496 | 966,496 |
+| txouts | 165,200,444 | 165,200,444 |
+| bogosize | 12,941,799,750 | 12,941,799,750 |
+| total_amount | 2,008,257,300,621,623 sat | 2,008,257,300,621,623 sat |
+| muhash | `df1b0340…073d0165` | `df1b0340…073d0165` |
+
+Identical on every field. **The fresh parallel-download sync builds a correct
+UTXO set.** The original FAIL came from calling the LIVE node's
+`gettxoutsetinfo` six minutes after the tip line, while the engine was still
+applying and flushing — a walk over a moving LSM is not a set.
+
+Note what made that torn read convincing enough to write up as a coin-metadata
+defect: `txouts` AGREED with Core. On the live path that figure is a maintained
+counter rather than the walk's own count, so it stayed right while the hash went
+wrong. **"Every aggregate matches but the hash differs" is the signature of an
+inconsistent read, not of good data with bad metadata.** The tool that reports
+`quiesced` and `consistent` existed the whole time; the capstone bypassed it.
 
 ### The capstone had never run before 2026-09-11
 

@@ -2,13 +2,36 @@
 
 2026-09-11. Benchmark tag `bench-2026-09-10`, node commit `4a4872cf`.
 
+> **CORRECTIONS, 2026-09-12.** Two claims in the original version of this report
+> were wrong, both in ways that need saying plainly.
+>
+> **1. The UTXO set was correct.** This report said the node built a wrong UTXO
+> set. It did not. The store was later walked offline and quiesced and matched
+> Core exactly at height 966,496 — muhash `df1b0340…073d0165`, txouts
+> 165,200,444, bogosize 12,941,799,750, total_amount 2,008,257,300,621,623 sat,
+> every field identical. The original failure came from hashing the set through
+> the live node while its UTXO engine was still applying and flushing, which is
+> a torn read, not a defect.
+>
+> **2. The "hour ahead of Core" is not safe to quote.** Core's 21h 11m was
+> measured with its daemon under `ionice -c3`, the idle I/O class, while our
+> node ran with no ionice at all. On a disk-bound sync that is a handicap, not a
+> control. An unhandicapped Core baseline is running as of 2026-09-12 and will
+> replace the figure. The segment-by-segment table below is the honest part of
+> the comparison and it already says we are 8-12% slower than Core from height
+> 500,000 onward.
+>
+> The measurement bugs are covered in
+> [the run 22 writeup](2026-09-11-run22-muhash-divergence.md).
+
 This is a report on one fresh mainnet initial block download by an independent
 Bitcoin full node written in x86-64 assembly, measured against Bitcoin Core
-v31.1 on the same machine, and on the defect that measurement found.
+v31.1 on the same machine — and, as it turned out, on three defects in the
+measurement rather than in the node.
 
-**The short version: it finished an hour ahead of Core, and it was still wrong.**
-The chain it built is identical to Core's, block for block. The UTXO set it
-derived from that chain is not.
+**The short version: it built a chain identical to Core's block for block, and a
+UTXO set identical to Core's coin for coin.** The capstone that said otherwise
+was reading a set that was still moving.
 
 ## The machine, and both configurations
 
