@@ -4,6 +4,27 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-12 — main merged (131 commits); daemon relinked green; deploy home is ~/bmc_osx_deploy; mainnet IBD resumed after a 21.5h stall
+
+- Merge cce2f5d7 (#175–#189). Two add/add worklog conflicts resolved by
+  keeping both streams (x86 section annotated). Build fixes 045c8c07
+  (SYS_ioprio_set guard, build_gen.h generation in build_daemon.sh) and
+  061bfeca (four new C twins + four bitcoind.S data symbols). LINK OK,
+  zero undefined symbols.
+- The deploy runtime (binary, conf, 431 GB mainnet datadir, logs,
+  start.sh/stop.sh) moved from /tmp to /Users/xian/bmc_osx_deploy/ —
+  macOS clears /tmp at boot and daily-cleans 3-day-old files; a reboot
+  would have cost the whole IBD. /tmp paths remain as symlinks. The dev
+  repo is unchanged at ~/bmc_osx/bitcoinmachinecode.
+- Mainnet IBD had been frozen at 777,321 (80.43%) since 09-11 23:13 —
+  silent peer death, no redial ("peers exhausted", retry ring every
+  2 min). Relaunched on the merged binary (which carries main's newer
+  stall/redial work): resumed immediately, 777,681 -> 780,601 in the
+  first 90 s, zero consensus failures.
+- Push backlog cleared: origin is HTTPS via the gh credential helper,
+  pushed through 061bfeca. Remaining p3/p4: signet IBD, mainnet connect
+  green, parity sweep.
+
 ## 2026-09-11 (night) — FOUR more root causes; testnet4 UTXO connect GREEN end-to-end; node synced + following tip
 
 The session took the port from "one known WV0 divergence" to a fully
