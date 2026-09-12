@@ -54,6 +54,9 @@ int main(void){
         int sp[2]; socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
         pid_t peer = start_trickler(sp[1]); close(sp[1]);
         sigaction(SIGALRM,&sa,&old);
+        /* 2026-09-09: a sole leg gets four times the pass budget; two or more get the budget */
+        ok(leg_budget_secs(1) == 4 * (unsigned)DL_BUDGET_SECS && leg_budget_secs(0) == 4 * (unsigned)DL_BUDGET_SECS, "the only live leg's pass budget is four times DL_BUDGET_SECS");
+        ok(leg_budget_secs(2) == (unsigned)DL_BUDGET_SECS && leg_budget_secs(31) == (unsigned)DL_BUDGET_SECS, "with company, the plain budget");
         mux_sync_budget_fired = 0; mux_budget_fd = -1;
         double t0 = now(); alarm(1);
         long r = fd_read_full(sp[0], big, sizeof big);

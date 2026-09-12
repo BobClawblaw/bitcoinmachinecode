@@ -98,7 +98,7 @@ extern long strip_witness(const unsigned char* tx, long long txlen,
 #define TXR_MSG_WTX         5u          /* BIP339: wtxid-based tx inv/getdata */
 #define TXR_MAX_REQ         32          /* getdata entries per pass */
 #define TXR_MAX_MSGS        64          /* messages per pass -- a leg cannot monopolise the rotation */
-#define TXR_PAYLOAD_CAP     (2u << 20)  /* > max consensus tx size */
+#define TXR_PAYLOAD_CAP     ((4u << 20) + (64u << 10))  /* > max consensus tx size; and since 2026-09-10 a pushed blocktxn or block (up to 4 MB) */
 
 /* Recently-requested ring: 8-byte txid prefixes, FIFO. A false positive
  * (prefix collision) skips one fetch of one tx on one pass -- it will be
@@ -181,17 +181,18 @@ static long long txr_now_ms(void);
  * instead of reporting a mismatch. A bound turns the worst case of a future
  * mistake back into the linear scan this index replaced -- slow, which is
  * survivable, rather than wedged, which is not. */
-static int txr_ring_has(const u8* txid){
+static int txr_ring_lookup(const u8* txid, int count_refetch){
     txr_hash_init();
     unsigned guard = 0;
     for (int i = txr_ring_head[txr_h8(txid)]; i >= 0 && guard < TXR_RING; i = txr_ring_next[i], guard++)
         if (!memcmp(txr_ring[i], txid, 8)){
             if (txr_now_ms() - txr_ring_t[i] < txr_req_ttl_ms) return 1;
-            txr_req_refetch++;
+            if (count_refetch) txr_req_refetch++;
             return 0;                                   /* timed out: ask again */
         }
     return 0;
 }
+static int txr_ring_has(const u8* txid){ return txr_ring_lookup(txid, 1); }
 static void txr_ring_add(const u8* txid){
     txr_hash_init();
     unsigned slot = txr_ring_w % TXR_RING;
@@ -494,6 +495,15 @@ static long long txr_exp_ms(long mean_ms){
  * the behaviour that rides on it. */
 long long txrelay_test_exp_draw(long mean_ms){ return txr_exp_ms(mean_ms); }
 
+/* Set by the daemon: per-connection counters for getpeerinfo. Declared here,
+   above every use, because these are C function POINTERS -- an implicit
+   declaration makes the compiler treat them as functions and the later
+   definition then conflicts. */
+extern void (*txrelay_on_addr_stats)(int fd, long processed, long rate_limited);
+extern void (*txrelay_on_tx_accepted)(int fd);
+extern void (*txrelay_on_inv_sent)(int fd, unsigned sent, int still_queued);
+extern void rpc_note_msg_recv(int fd, const char* cmd, unsigned plen) __attribute__((weak));
+
 static void txr_ann_add(const u8 txid[32], int src_fd){
     if (txr_ann_n >= TXR_ANN_MAX) return;
     memcpy(txr_ann[txr_ann_n], txid, 32);
@@ -602,6 +612,10 @@ long txrelay_announce(const int* fds, int nfds){
             n++;
         }
         if (n){ inv[0] = (u8)n; p2p_write(fds[f], "inv", 3, inv, 1 + n*36); }
+        /* getpeerinfo's inv_to_send (what is still queued for this peer) and
+         * last_inv_sequence (how many we have announced to it). The queue
+         * depth was per-leg all along; nothing published it. */
+        if (txrelay_on_inv_sent) txrelay_on_inv_sent(fds[f], n, txr_leg_pend_n[sl] - (int)n);
         txr_leg_pend_n[sl] = 0;
         txr_leg_next[sl] = now + txr_exp_ms(txr_ann_mean_ms);
     }
@@ -895,6 +909,7 @@ static long txr_addr_declared(const char* cmd, const u8* pl, unsigned plen){
     }
     return p2p_addr_count(pl, plen);
 }
+
 static long txr_addr_ingest(int fd, const char* cmd, const u8* pl, unsigned plen){
     long n = txr_addr_declared(cmd, pl, plen);
     if (n < 0 || n > 1000){                          /* malformed, or Core: > MAX_ADDR_TO_SEND misbehaves */
@@ -920,7 +935,9 @@ static long txr_addr_ingest(int fd, const char* cmd, const u8* pl, unsigned plen
     if (*tk > TXR_ADDR_BUCKET_MAX) *tk = TXR_ADDR_BUCKET_MAX;
     txr_addr_bucket[slot].t_ms = now;
     long budget = (long)*tk;                          /* whole tokens available */
-    if (budget <= 0){ txr_addr_gossip_limited += n; return 0; }
+    if (budget <= 0){ txr_addr_gossip_limited += n;
+        if (txrelay_on_addr_stats) txrelay_on_addr_stats(fd, 0, n);   /* wholly rate-limited is not 'quiet' */
+        return 0; }
     if (budget > n) budget = n;
     else txr_addr_gossip_limited += n - budget;         /* the tail Core would drop too */
     *tk -= (double)budget;
@@ -931,6 +948,12 @@ static long txr_addr_ingest(int fd, const char* cmd, const u8* pl, unsigned plen
     if (viol && txr_report_violation_fd) txr_report_violation_fd(fd, TXR_ADDR_VIOL_REASON);
     txr_addr_gossip_msgs++;
     if (added > 0) txr_addr_gossip_added += added;
+    /* Per-PEER counts for getpeerinfo. The three totals above are global and
+     * always were, so a peer flooding addresses looked exactly like the whole
+     * pool being busy. Core reports addr_processed and addr_rate_limited per
+     * connection; `limited` here is the same tail this function already drops. */
+    if (txrelay_on_addr_stats)
+        txrelay_on_addr_stats(fd, added > 0 ? added : 0, n - budget > 0 ? n - budget : 0);
     return added;
 }
 
@@ -1173,8 +1196,128 @@ void txrelay_stats3(long* retried_other, long* gaveup, long* active){
     if (active) *active = n;
 }
 
+void (*txrelay_on_pong)(int fd, const unsigned char nonce[8]) = 0;   /* set by the daemon (2026-09-09) */
+/* ---- 2026-09-10, CORE_DIVERGENCES row 2: the request queue drains --------
+ * Core's TxRequestTracker keeps every announcement and requests as the
+ * in-flight budget frees up. Ours requested at most TXR_MAX_REQ per pass and
+ * left the rest noted as announced but never requested: 106 of a block's
+ * missing transactions on production (2026-09-10 05:12Z). Each poll of a leg
+ * now requests, from what that leg announced and nothing has fetched, up to
+ * TXR_MAX_REQ more while the per-peer in-flight budget (100) has room. */
+static long txr_drained = 0;
+long txrelay_drained_count(void){ return txr_drained; }
+static int txr_drain_pending(int fd, void* mp, int outstanding){
+    static u8 gd[1 + TXR_MAX_REQ*36];
+    unsigned want = 0;
+    for (int i = 0; i < TXR_WANT_MAX && want < TXR_MAX_REQ && outstanding + (int)want < 100; i++){
+        txr_want_t* w = &txr_want_tab[i];
+        if (!w->used || w->inflight) continue;
+        int mine = 0; for (int k = 0; k < w->nfd; k++) if (w->fds[k] == fd) mine = 1;
+        if (!mine || txr_want_tried(w, fd) || txr_nf_has(fd, w->hash) || txr_ring_lookup(w->hash, 0)) continue;   /* the drain is not a re-request after a timeout */
+        unsigned long got_len;
+        if (w->rtype == TXR_MSG_WITNESS_TX && mpool_get(mp, w->hash, &got_len)){ txr_want_forget(w); continue; }
+        u8* o = gd + 1 + want*36;
+        o[0] = (u8)w->rtype; o[1] = (u8)(w->rtype >> 8); o[2] = (u8)(w->rtype >> 16); o[3] = (u8)(w->rtype >> 24);
+        memcpy(o + 4, w->hash, 32);
+        txr_ring_add(w->hash);
+        txr_want_note(w->hash, w->rtype, fd, 1);
+        want++;
+    }
+    if (!want) return 0;
+    gd[0] = (u8)want;
+    if (p2p_write(fd, "getdata", 7, gd, 1 + want*36) <= 0) return 0;
+    txr_drained += want;
+    return (int)want;
+}
+/* ---- 2026-09-10: Core's shape at the tip ---------------------------------
+ * Block announcements and pushed blocks reach the daemon from the SWEEP
+ * instead of waiting for the leg's rotation turn (5-20 s behind Core on
+ * production, measured against the oracle on the same box). An inv naming
+ * a block and a pushed `headers` (the daemon sends sendheaders after the
+ * handshake) name a block the daemon may not have; cmpctblock / blocktxn /
+ * block are a high-bandwidth peer's push and its follow-ups. NULL = the
+ * old discard. The hooks own the response; this file only recognises. */
+void (*txrelay_on_block_inv)(int fd, const unsigned char hash[32]) = 0;
+void (*txrelay_on_headers)(int fd, const unsigned char* hdrs81, unsigned long n) = 0;
+long (*txrelay_on_cmpctblock)(int fd, const unsigned char* pl, unsigned long plen) = 0;
+long (*txrelay_on_blocktxn)(int fd, const unsigned char* pl, unsigned long plen) = 0;
+long (*txrelay_on_block)(int fd, const unsigned char* pl, unsigned long plen) = 0;
+/* 2026-09-10: the peer's sendcmpct arrives right after verack, and since the
+ * sweep reads a leg before its first pass, the sync drains that used to
+ * record it never saw it -- every leg installed since #159 fetched FULL
+ * blocks (11.5 s for 1.6 MB from one peer on block 966,302). */
+void (*txrelay_on_sendcmpct)(int fd, const unsigned char* pl, unsigned long plen) = 0;
+void (*txrelay_on_feefilter)(int fd, const unsigned char* pl, unsigned long plen) = 0;
+void (*txrelay_on_addr_stats)(int fd, long processed, long rate_limited) = 0;
+void (*txrelay_on_tx_accepted)(int fd) = 0;
+void (*txrelay_on_inv_sent)(int fd, unsigned sent, int still_queued) = 0;
+static void txr_block_inv_scan(int fd, const u8* pl, unsigned plen){
+    if (!txrelay_on_block_inv) return;
+    unsigned cc; unsigned long n = txr_varint(pl, pl + plen, &cc);
+    if (!cc || n > 50000UL) return;
+    for (unsigned long i = 0; i < n; i++){
+        const u8* e = pl + cc + i*36; if (cc + (i+1)*36 > plen) break;
+        unsigned t = (unsigned)e[0] | ((unsigned)e[1]<<8) | ((unsigned)e[2]<<16) | ((unsigned)e[3]<<24);
+        if (t == 2u || t == 0x40000002u) txrelay_on_block_inv(fd, e + 4);   /* MSG_BLOCK / MSG_WITNESS_BLOCK */
+    }
+}
+/* the command names compare WITH their terminator (2026-09-09: "block" vs "blocktxn") */
+static int txr_block_msg(int fd, const char* cmd, const u8* pl, unsigned plen){
+    if (!memcmp(cmd, "headers", 8)){
+        unsigned cc; unsigned long n = txr_varint(pl, pl + plen, &cc);
+        if (cc && n && n <= 2000UL && cc + n * 81 <= plen && txrelay_on_headers) txrelay_on_headers(fd, pl + cc, n);
+        return 1;
+    }
+    if (!memcmp(cmd, "cmpctblock", 11)){ if (txrelay_on_cmpctblock) txrelay_on_cmpctblock(fd, pl, plen); return 1; }
+    if (!memcmp(cmd, "blocktxn", 9)){ if (txrelay_on_blocktxn) txrelay_on_blocktxn(fd, pl, plen); return 1; }
+    if (!memcmp(cmd, "block", 6)){ if (txrelay_on_block) txrelay_on_block(fd, pl, plen); return 1; }
+    if (!memcmp(cmd, "sendcmpct", 10)){ if (txrelay_on_sendcmpct) txrelay_on_sendcmpct(fd, pl, plen); return 1; }
+    /* feefilter (BIP133): the peer's minimum relay rate, for getpeerinfo's
+     * minfeefilter. We already SEND one; nothing read the peer's. */
+    if (!memcmp(cmd, "feefilter", 10)){ if (txrelay_on_feefilter) txrelay_on_feefilter(fd, pl, plen); return 1; }
+    return 0;
+}
+static u8 txr_pl[TXR_PAYLOAD_CAP];      /* the sweep's payload buffer (the worker is single-threaded) */
+/* 2026-09-10, CORE_DIVERGENCES row 5: where did a transaction a block
+ * carried, and the mempool did not hold, go? 4 refused by policy (the shared
+ * recent-rejects filter), 3 parked as an orphan, 2 requested and never
+ * answered (in flight, or in the request ring), 1 announced by a leg but
+ * never requested, 0 never announced to us at all. */
+extern int serve_reject_has(const unsigned char txid[32]) __attribute__((weak));
+int txrelay_classify_missing(const unsigned char* tx, unsigned long len){
+    static u8 scratch[2000*81 + 8];
+    u8 txid[32], wtxid[32];
+    if (len < 60 || tx_txid(txid, tx, len, scratch, sizeof scratch) != 1) return 0;
+    { extern void sha256d(u8 out[32], const void* p, unsigned long n); sha256d(wtxid, tx, len); }
+    if (serve_reject_has && serve_reject_has(txid)) return 4;
+    for (int i = 0; i < TXR_ORPHAN_MAX; i++) if (txr_orph[i].buf && !memcmp(txr_orph[i].txid, txid, 32)) return 3;
+    txr_want_t* w = txr_want_find(txid); if (!w) w = txr_want_find(wtxid);
+    if (txr_ring_has(txid) || txr_ring_has(wtxid) || (w && w->inflight)) return 2;
+    if (w) return 1;
+    return 0;
+}
+/* a block-relay-only leg's sweep: what is already buffered, blocks only --
+ * ping/pong, block invs, pushed headers, compact blocks and their follow-ups;
+ * a tx inv is ignored (we told the peer fRelay=0) */
+long txrelay_poll_block_only_leg(int fd){
+    char cmd[12]; unsigned plen; long seen = 0;
+    for (int msgs = 0; msgs < TXR_MAX_MSGS; msgs++){
+        struct pollfd pf = { fd, POLLIN, 0 };
+        if (poll(&pf, 1, 0) <= 0 || !(pf.revents & POLLIN)) break;
+        if (p2p_read(fd, cmd, txr_pl, sizeof txr_pl, &plen) != 1) break;
+        seen++;
+        /* getpeerinfo bytesrecv_per_msg: the command is in hand here, and the
+         * asm read path has two exits whose frames are not worth disturbing. */
+        if (rpc_note_msg_recv) rpc_note_msg_recv(fd, cmd, plen);
+        if (!memcmp(cmd, "ping", 5)){ if (plen == 8) p2p_write(fd, "pong", 4, txr_pl, 8); continue; }
+        if (!memcmp(cmd, "pong", 5)){ if (plen == 8 && txrelay_on_pong) txrelay_on_pong(fd, txr_pl); continue; }
+        if (!memcmp(cmd, "inv", 4)){ txr_block_inv_scan(fd, txr_pl, plen); continue; }
+        txr_block_msg(fd, cmd, txr_pl, plen);
+    }
+    return seen;
+}
 long txrelay_poll_leg(int fd, void* mp, int max_ms){
-    static u8 pl[TXR_PAYLOAD_CAP];
+    u8* pl = txr_pl;
     static u8 scratch[2000*81 + 8];      /* worker is single-threaded */
     char cmd[12];
     unsigned plen;
@@ -1184,6 +1327,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
     int outstanding = txr_pend_get(fd);  /* getdata entries awaiting replies, carried from the last poll */
     txr_orphan_expire();
     txr_recon_expire();
+    outstanding += txr_drain_pending(fd, mp, outstanding);   /* row 2: what this leg announced and nothing fetched */
     long long deadline = txr_now_ms() + max_ms;
 
     for (int msgs = 0; msgs < TXR_MAX_MSGS; msgs++){
@@ -1198,7 +1342,10 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
         struct pollfd pf = { fd, POLLIN, 0 };
         int pr = poll(&pf, 1, wait);
         if (pr <= 0 || !(pf.revents & POLLIN)) break;
-        if (p2p_read(fd, cmd, pl, sizeof pl, &plen) != 1) break;
+        if (p2p_read(fd, cmd, pl, TXR_PAYLOAD_CAP, &plen) != 1) break;
+        /* getpeerinfo bytesrecv_per_msg: the command is in hand here, and the
+         * asm read path has two exits whose frames are not worth disturbing. */
+        if (rpc_note_msg_recv) rpc_note_msg_recv(fd, cmd, plen);
 
         if (!memcmp(cmd, "ping", 5)){
             /* consumed a keepalive meant for the sync loop -- answer it,
@@ -1206,9 +1353,16 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
             if (plen == 8) p2p_write(fd, "pong", 4, pl, 8);
             continue;
         }
+        if (!memcmp(cmd, "pong", 5)){
+            /* 2026-09-09: the reply to OUR ping (the daemon tracks liveness and
+             * the round trip per leg, as Core does) */
+            if (plen == 8 && txrelay_on_pong) txrelay_on_pong(fd, pl);
+            continue;
+        }
         if (!memcmp(cmd, "inv", 4)){
             unsigned cc;
             unsigned long n = txr_varint(pl, pl + plen, &cc);
+            txr_block_inv_scan(fd, pl, plen);            /* 2026-09-10: a block inv is an announcement, blocksonly or not */
             if (txr_blocksonly()){                       /* -blocksonly: a tx inv from a leg we told fRelay=0 is a violation */
                 for (unsigned long i = 0; i < n; i++){
                     const u8* e = pl + cc + i*36; if (cc + (i+1)*36 > plen) break;
@@ -1242,8 +1396,10 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 continue;
             }
             unsigned long scanned_cap = n < 5000UL ? n : 5000UL;
-            for (unsigned long i = 0; i < scanned_cap && want < TXR_MAX_REQ; i++){
-                if (outstanding + (int)want >= 100) break;     /* Core's per-peer in-flight cap */
+            /* 2026-09-10: every entry is NOTED (Core keeps every announcement);
+             * only the request stops at the per-pass and per-peer caps, and
+             * txr_drain_pending requests the rest on later polls */
+            for (unsigned long i = 0; i < scanned_cap; i++){
                 const u8* e = pl + cc + i*36;
                 if (e + 36 > pl + plen) break;
                 unsigned type = (unsigned)e[0] | (unsigned)e[1]<<8 |
@@ -1256,6 +1412,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 else continue;
                 unsigned long got_len;
                 txr_want_note(e + 4, req_type, fd, 0);           /* remember the announcer either way */
+                if (want >= TXR_MAX_REQ || outstanding + (int)want >= 100) continue;   /* the caps: noted, requested by the drain later */
                 if (txr_ring_has(e + 4)) continue;     /* recently requested */
                 /* pool-dedup only makes sense for a txid announcement; a
                  * wtxid keys differently, so a wtxid we already hold may be
@@ -1287,6 +1444,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 long r = tx_accept_validate_p2p(mp, txid, pl, plen);
                 if (r == 1){
                     accepted++;
+                    if (txrelay_on_tx_accepted) txrelay_on_tx_accepted(fd);   /* getpeerinfo last_transaction */
                     if (txr_on_accept) txr_on_accept(txid, pl, plen);   /* -walletnotify */
                     txr_ann_add(txid, fd);
                     accepted += txr_orphan_resolve_ann(mp, txid, fd);   /* cascade waiting children */
@@ -1421,9 +1579,9 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
                 fprintf(stderr, "[txrelay] %s gossip: +%ld address(es) to the book\n", cmd, added);
             continue;
         }
-        /* headers/cmpctblock/...: not ours -- same discard the sync drains
-         * apply. A `block` push lost here is re-fetched by the next
-         * headers-driven pass. */
+        /* headers / cmpctblock / blocktxn / block: the daemon's hooks
+         * (2026-09-10); anything else is the discard the sync drains apply */
+        txr_block_msg(fd, cmd, pl, plen);
     }
     txr_pend_set(fd, outstanding);
     return accepted;

@@ -108,7 +108,7 @@ int main(int argc, char** argv){
         int r=p2p_read(fd,cmd,rb,sizeof rb,&plen);
         if(r<=0){ printf("  server closed waiting block\n"); break; }
         cmd[11]=0;
-        if(strncmp(cmd,"block",5)==0 && plen>80){ got_block=1; printf("block served, %u bytes\n", plen); break; }
+        if(strncmp(cmd,"block",12)==0 && plen>80){ got_block=1; printf("block served, %u bytes\n", plen); break; }
     }
     fd_close(fd);
     if(got_block){ printf("RESULT: server serves blocks to a real inbound peer -- ALL GOOD\n"); return 0; }

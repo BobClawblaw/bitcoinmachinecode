@@ -52,6 +52,7 @@ static void rnd_bytes(u8* p, int n){ for (int i = 0; i < n; i++) p[i] = (u8)rnd(
 
 /* one operation sequence, replayed identically per mode */
 struct key { u8 txid[32]; u32 index; u64 value; int live; };
+static int key36_cmp(const void* a, const void* b){ return memcmp(a, b, 36); }
 struct ops { struct key* live; unsigned long nlive; struct key* tomb; unsigned long ntomb; unsigned long expect_live, expect_desc; };
 
 static struct ops gen(unsigned long N){
@@ -83,7 +84,7 @@ static struct ops gen(unsigned long N){
         struct key* k = &o.tomb[t]; k->live = 0;   /* .live here = "was a live key" */
         switch (t % 5){
         case 0: rnd_bytes(k->txid, 32); k->index = (u32)(rnd() & 3); break;                       /* absent key */
-        case 1: if (t > 0 && (t % 10) == 1){ *k = o.tomb[t - 1]; k->live = 0; break; }              /* the SAME absent key again: duplicate tombstone */
+        case 1: if (t > 0 && (t % 10) == 1){ *k = o.tomb[t - 1]; k->live = 0; break; }              /* the SAME absent key again: duplicate tombstone (written ONCE since 2026-09-09) */
                 rnd_bytes(k->txid, 32); k->index = (u32)(rnd() & 3); break;
         case 2: memcpy(k->txid, o.live[L > 40 ? L - 1 - (t % 8) : 0].txid, 32); k->txid[31] ^= 0x5A; k->index = 9; break; /* absent, shares a prefix with a live key */
         case 3: if (t < L){ *k = o.live[t]; k->live = 1; o.live[t].live = 0; break; }             /* delete a live key */
@@ -93,7 +94,16 @@ static struct ops gen(unsigned long N){
         }
     }
     for (i = 0; i < L; i++) o.expect_live += o.live[i].live;
-    o.expect_desc = o.expect_live; for (unsigned long t = 0; t < T; t++) o.expect_desc += o.tomb[t].live != 2;
+    /* 2026-09-09: utxo_lsm_del keeps a key ONCE per generation (bench run 18: a
+     * run holding a key twice had a live coin called spent), so the run holds
+     * one DEL per DISTINCT tombstoned key -- case 1 repeats its predecessor and
+     * case 2 cycles through eight keys. Count the distinct ones. */
+    o.expect_desc = o.expect_live;
+    { unsigned long nk = 0; u8* keys = malloc((T ? T : 1) * 36);
+      for (unsigned long t = 0; t < T; t++){ if (o.tomb[t].live == 2) continue; memcpy(keys + nk*36, o.tomb[t].txid, 32); memcpy(keys + nk*36 + 32, &o.tomb[t].index, 4); nk++; }
+      qsort(keys, nk, 36, key36_cmp);
+      for (unsigned long q = 0; q < nk; q++) if (q == 0 || memcmp(keys + q*36, keys + (q-1)*36, 36)) o.expect_desc++;
+      free(keys); }
     return o;
 }
 

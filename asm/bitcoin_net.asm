@@ -401,6 +401,14 @@ p2p_write:
     push rcx
     push r8
     push r9
+    ; arg3 = the COMMAND, arg4 = its length. Read before either source
+    ; register is overwritten: rsi holds cmd and rdx holds cmdlen on entry,
+    ; and both are restored from the stack below, so clobbering them here
+    ; disturbs nothing. Added 2026-09-12 for getpeerinfo's bytessent_per_msg,
+    ; which needs to know WHICH message left, not just how big it was. The
+    ; existing upload pacer ignores the extra arguments, as SysV allows.
+    mov  rcx, rdx           ; arg4 = cmdlen
+    mov  rdx, rsi           ; arg3 = cmd
     mov  esi, r8d           ; arg2 = plen (arg1 fd already in edi)
     and  rsp, -16
     call rax

@@ -1040,17 +1040,7 @@ Missing:
 
 Confirmed genuinely wired into the real serve loop (`bitcoin_serve.asm`),
 not just present as unused/tested-in-isolation code:
-- **BIP152 compact blocks — receive side OPEN** (2026-09-08): the receive path landed 2026-09-06 (CC-2, `49c1c6f`) but has not completed a reconstruction that needed a `getblocktxn` round trip -- production counted 14 such blocks, 0 reconstructed, 0 fallen back, the tip advancing only through other legs' full blocks; on a single-leg regtest the tip stalls. `bmc.cmpctrecv=0` makes outbound legs request full blocks. Found by the coinstats differential.
-  `p2p_blocktxn_build`). This node answers `MSG_CMPCT_BLOCK` getdata and
-  `getblocktxn`, and negotiates `sendcmpct`. Until 2026-09-06 it did NOT
-  receive compact blocks: `bitcoin_serve.asm` wrote `cmpctblock` and
-  `blocktxn` and had no inbound handler for either, so a peer's compact
-  block was ignored and the block fetched in full (the receive side is in
-  `daemon/cmpct_recv.c` now). NET-9 (audit 2026-09-03) found this entry
-  claiming "both directions … full message handling"; the send side is real
-  and now handles any transaction count (SER-4 fixed the one-byte count that
-  had capped it at 252, i.e. at almost every mainnet block), but the receive
-  side has never existed. Corrected rather than left overstating the surface.
+- ~~**BIP152 compact blocks — receive side OPEN** (2026-09-08)~~ — **CLOSED 2026-09-09** (`2026-09-09-blocktxn-is-not-a-block.md`): the sync drain matched `block` by a 5-byte prefix, so every `blocktxn` reply was verified as a block and thrown away; `validation/cmpct_regtest_e2e.sh` follows Core through blocks needing a `getblocktxn` round trip, assembled bytes identical to Core's. Left open from the same finding: fallback to a full `getdata` when a reconstructed block fails verification, and one in-flight request per block hash across legs (Core does both).
 - **wtxid relay, feefilter, sendheaders** — all genuinely
   implemented and exchanged during real handshakes.
 - **Witness transport (BIP144) — FIXED 2026-08-22** (`31eac9a`, `fe3addb`):

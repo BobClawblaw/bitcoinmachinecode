@@ -23,6 +23,10 @@
  * (manifest_n directly bounds .do_tx's per-lookup disk-run scan cost for
  * every inbound child once that's wired up).
  */
+#include "utxo_live_sizing.h"
+#include "utxo_live_compact_policy.h"
+#include <sys/resource.h>
+#include <sys/syscall.h>
 #include "genesis_skip.h"
 #include "chainparams.h"
 #include "../script_flags_consts.h"   /* per-chain BIP34 activation heights
@@ -360,6 +364,7 @@ static int manifest_names(u64 run_no){
     for (u64 i = 0; i < g_utxo_lst.manifest_n; i++){ u64 r; memcpy(&r, e + i*16 + 8, 8); if (r == run_no) return 1; }
     return 0;
 }
+static unsigned long g_cmp_deferred = 0;   /* merges deferred because the apply was behind (2026-09-09) */
 static void compact_adopt(int st){
     struct timespec t1; clock_gettime(CLOCK_MONOTONIC, &t1);
     double secs = (t1.tv_sec - g_cmp_t0.tv_sec) + (t1.tv_nsec - g_cmp_t0.tv_nsec) / 1e9;
@@ -385,8 +390,8 @@ static void compact_adopt(int st){
             int gone = 0;
             for (int i = 0; i < g_cmp_nin; i++) if (!manifest_names(g_cmp_inputs[i])){ unlink_run(g_cmp_inputs[i]); gone++; }
             long interim = (long)g_utxo_lst.manifest_n - ((long)g_cmp_n_before - g_cmp_nin + 1);   /* runs flushed since fork */
-            fprintf(stderr, "[utxo_live] compaction done in %.1fs (%s; started at height %ld): manifest_n %lu -> %lu, merged into run %lu, %ld flushed meanwhile, %d input run(s) unlinked; apply never waited\n",
-                    secs, g_cmp_desc, g_cmp_height, (unsigned long)g_cmp_n_before, (unsigned long)g_utxo_lst.manifest_n, (unsigned long)g_cmp_child_run, interim, gone);
+            fprintf(stderr, "[utxo_live] compaction done in %.1fs (%s; started at height %ld): manifest_n %lu -> %lu, merged into run %lu, %ld flushed meanwhile, %d input run(s) unlinked; apply never waited; %lu merge(s) deferred so far\n",
+                    secs, g_cmp_desc, g_cmp_height, (unsigned long)g_cmp_n_before, (unsigned long)g_utxo_lst.manifest_n, (unsigned long)g_cmp_child_run, interim, gone, g_cmp_deferred);
         }
     } else {
         unlink_run(g_cmp_child_run); unlink(LSM_MANIFEST_CHILD);
@@ -460,10 +465,26 @@ static long compact_pick_now(long* lo){
     return k;
 }
 static long g_cmp_lo = 0;
+static long g_apply_lag = 0;            /* archive tip minus the applied height, set by the catch-up loop (2026-09-09) */
+static int g_cmp_defer_logged = 0;
+unsigned long utxo_live_compactions_deferred(void){ return g_cmp_deferred; }
 static int compact_start_async(long height, const char* why){
     if (g_cmp_pid) return 0;
     long lo = 0, k = compact_pick_now(&lo);
     if (k == 0) return 0;
+    /* 2026-09-09: while the apply is behind the download the disk is the
+     * apply's; a merge waits, up to a ceiling on the run count and never
+     * when the run files are over the memory budget (compact_pick_now picks
+     * below the count threshold only for that reason) */
+    { long n = (long)g_utxo_lst.manifest_n, thr = utxo_live_compact_threshold();
+      int over_budget = (n < thr);
+      if (compact_should_defer(g_apply_lag, n, thr, over_budget)){
+          g_cmp_deferred++;
+          if (!g_cmp_defer_logged){ g_cmp_defer_logged = 1;
+              fprintf(stderr, "[utxo_live] merge of %ld run(s) deferred: the apply is %ld blocks behind the archive (waits under %ld runs)\n", k, g_apply_lag, thr * COMPACT_DEFER_CEILING_MULT); }
+          return 0;
+      }
+      g_cmp_defer_logged = 0; }
     g_cmp_nin = (int)k; g_cmp_lo = lo;
     const unsigned char* e = (const unsigned char*)g_utxo_lst.manifest_buf;
     for (int i = 0; i < g_cmp_nin; i++) memcpy(&g_cmp_inputs[i], e + (lo + i)*16 + 8, 8);
@@ -483,7 +504,12 @@ static int compact_start_async(long height, const char* why){
     }
     if (p == 0){
         /* child: no stdio (a parent thread may hold its lock at fork), no
-         * atexit, nothing but the merge. */
+         * atexit, nothing but the merge. 2026-09-09: and it yields to the
+         * apply -- nice 10 and best-effort I/O at the lowest priority (not
+         * the idle class: an idle-class writer starves outright under a
+         * busy apply and the merge never lands, see the 09-08 note). */
+        setpriority(PRIO_PROCESS, 0, 10);
+        syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, (2 << 13) | 7 /* best-effort, prio 7 */);
         utxo_lsm_set_flush_hook(0);
         utxo_lsm_set_defer_unlink(1);
         utxo_lsm_set_defer_publish(1);
@@ -733,8 +759,6 @@ void utxo_live_set_coinstats(csi_coin_fn add, csi_coin_fn rm,
  * below), exactly as csi_seed_from_walk does at boot. This hook is that
  * moment; the observers above stay registered and inert (the index is
  * invalid) until it fires. NULL outside the worker. */
-static void (*g_csi_caught_up)(void* lst, void* table, long height) = 0;
-void utxo_live_set_coinstats_caught_up(void (*fn)(void*, void*, long)){ g_csi_caught_up = fn; }
 
 extern long utxo_store_wal_drain(void* st);
 static int persist_applied_height(long h){
@@ -2450,9 +2474,24 @@ int utxo_live_can_unapply(const void* blockbuf, u64 blocklen, long height){
  * captured by undo_capture_and_del at spend time (see daemon/undo_log.c's
  * header comment). Getting this wrong would mean a reorg-restored coinbase
  * output silently loses correct maturity data. */
+static long g_restore_present = 0;   /* restores skipped because the coin was still there (the spend never became durable) */
 static int undo_restore_cb(void* ctx, const u8 txid[32], u32 index, u64 value,
                            u32 height, u8 is_coinbase, const u8* script, u16 slen){
     int* fatal = (int*)ctx;
+    /* 2026-09-10 (CORE_DIVERGENCES row 4): restore only what is actually
+     * gone. The undo record proves the spend was CAPTURED, not that its
+     * delete reached the disk: a process that dies with the WAL buffer
+     * unwritten leaves the coin in place, and utxo_lsm_put of a key that
+     * lives in an older run counts it as new (the memtable cannot see the
+     * run without a lookup; the set stays right, the tally goes one high per
+     * such coin -- +2 in test_utxo_crash_recovery's mid-block scenario under
+     * the bulk memtable, where the base sits in a run rather than the
+     * memtable). The mirror of del_created_on_output's gate: one get per
+     * restored prevout, on rollback paths only. */
+    if (!g_store_inconsistent){
+        u64 v=0; unsigned long hh=0, cb=0, sl=0; const u8* sc=0;
+        if (utxo_lsm_get(&g_utxo_lst, g_utxo_table, txid, index, &v, &hh, &cb, &sc, &sl) == 1){ g_restore_present++; return 1; }
+    }
     long r = utxo_lsm_put(&g_utxo_lst, g_utxo_table, txid, index, value,
                           (u64)height, (u64)is_coinbase, script, (u32)slen);
     if (r < 0 || r == 2) { *fatal = 1; return 0; }   /* UTX-3: sign, not one value */
@@ -2890,7 +2929,10 @@ static int g_bulk_mode = 0;
  * state is unchanged. */
 /* Test hook: g_bulk_mode is decided from the store at init, which a unit test
  * of the threshold arithmetic has no business setting up. */
+static int g_test_force_sizing = -1;   /* tests: -1 decide as production does, 0 steady-state, 1 bulk (2026-09-09: a fresh datadir is bulk now, and a test that needs the small memtable says so) */
+void utxo_live_test_force_sizing(int mode){ g_test_force_sizing = mode; }
 void utxo_live_test_set_bulk_mode(int on){ g_bulk_mode = on; }
+int  utxo_live_is_bulk(void){ return g_bulk_mode; }   /* 2026-09-09: for tests and the boot line */
 /* Read side (daemon/main.c decides whether the coinstats index seeds at boot
  * or defers to the caught-up hook above). */
 int utxo_live_bulk_mode(void){ return g_bulk_mode; }
@@ -2922,7 +2964,11 @@ int utxo_live_init(const char* dir){
     long boot_applied = read_applied_height();
     long boot_tip     = utxo_live_index_tip();
     long boot_gap     = (boot_tip >= 0) ? (boot_tip - boot_applied) : 0;
-    g_bulk_mode = (boot_gap >= g_cfg.utxo_bulk_gap_blocks);
+    /* 2026-09-09: an empty set is initial block download -- a fresh datadir
+     * boots with gap 1 and used to take the 64 MB steady-state memtable for
+     * the whole chain while the dbcache-sized bulk memtable sat unused
+     * (utxo_live_sizing.h; run 19: 300 ms a block at 700,000) */
+    g_bulk_mode = g_test_force_sizing >= 0 ? g_test_force_sizing : utxo_live_pick_bulk(boot_applied, boot_tip, g_cfg.utxo_bulk_gap_blocks);
 
     /* ...and ALSO go bulk when the WAL tail we are about to replay is large,
      * regardless of how few blocks remain.
@@ -3152,18 +3198,30 @@ int utxo_live_init(const char* dir){
 #define UTXO_CKPT_BATCH_BLOCKS 64      /* undo is kept for every block since 2026-09-08; the batch bound is a recovery-time choice now */
 #define UTXO_CKPT_BATCH_MS     2000
 #define UTXO_CKPT_NEAR_TIP     64
+/* 2026-09-10: BULK mode (a fresh sync, a reindex) checkpoints on its own
+ * cadence. During the parallel download the archive tip is the download's
+ * frontier, not the chain's, and the apply reaches it every few passes -- so
+ * "within 64 of the tip" made the checkpoint per block for most of run 19
+ * (ckpt 13-24% of block time, 72% on some ticks; 5 fsyncs a block on the
+ * bench SSD). Core writes nothing durable during initial block download and
+ * a crash costs it the whole cache; ours costs a rollback of at most this
+ * batch from the per-block undo files, which boot recovery already does.
+ * The steady-state rule (per block at the tip) returns with the downshift. */
+#define UTXO_CKPT_BULK_BLOCKS  1024
+#define UTXO_CKPT_BULK_MS      60000
 static long      g_ckpt_since = 0;      /* applied blocks not yet covered by a checkpoint */
 static long long g_ckpt_last_ms = 0;
 static long      g_test_ckpt_batch = -1;   /* test knob: -1 default, 0 per-block, n = batch n even at the tip */
 void utxo_live_test_set_ckpt_batch(long n){ g_test_ckpt_batch = n; }
 static long long mono_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000LL + t.tv_nsec/1000000; }
 /* Pure so tests/test_utxo_ckpt_batch pins it without a chain. */
-int utxo_live_ckpt_due(long h, long tip, long unpersisted, long long now_ms, long long last_ms, long forced){
-    long batch = forced >= 0 ? forced : UTXO_CKPT_BATCH_BLOCKS;
+int utxo_live_ckpt_due(long h, long tip, long unpersisted, long long now_ms, long long last_ms, long forced, int bulk){
+    long batch = forced >= 0 ? forced : bulk ? UTXO_CKPT_BULK_BLOCKS : UTXO_CKPT_BATCH_BLOCKS;
+    long bound = bulk && forced < 0 ? UTXO_CKPT_BULK_MS : UTXO_CKPT_BATCH_MS;
     if (batch <= 0) return 1;
-    if (forced < 0 && tip - h < UTXO_CKPT_NEAR_TIP) return 1;
+    if (forced < 0 && !bulk && tip - h < UTXO_CKPT_NEAR_TIP) return 1;
     if (unpersisted >= batch) return 1;
-    if (now_ms - last_ms >= UTXO_CKPT_BATCH_MS) return 1;
+    if (now_ms - last_ms >= bound) return 1;
     return 0;
 }
 static int ckpt_now(void){
@@ -3200,6 +3258,20 @@ static int ckpt_now(void){
 #define UTXO_STOP_FAIL      5   /* -1 return, a hole in the unbounded call, or a checkpoint persist failure */
 static int g_last_stop_reason = UTXO_STOP_TIP;
 long utxo_live_last_stop_reason(void){ return g_last_stop_reason; }
+/* The loop's exit. Steady state lands whatever is pending (an exit of any
+ * kind used to). In bulk mode a BOUNDED pass that stopped at the download's
+ * frontier -- a hole, its budget, or the frontier itself -- carries its
+ * batch to the next pass (the download loop runs one every DLC_CONNECT_
+ * BUDGET_MS, and the per-block test above lands it on the time bound); the
+ * unbounded drain, a failure, a rejection and shutdown land it now. A clean
+ * close lands it too (utxo_live_close); a crash rolls it back at boot. */
+static int ckpt_land_on_exit(long max_ms){
+    if (!g_ckpt_since) return 0;
+    if (!g_bulk_mode || max_ms == 0) return 1;
+    if (shutdown_requested() || g_last_stop_reason == UTXO_STOP_SHUTDOWN) return 1;
+    if (g_last_stop_reason == UTXO_STOP_FAIL || g_last_stop_reason == UTXO_STOP_REJECT) return 1;
+    return mono_ms() - g_ckpt_last_ms >= UTXO_CKPT_BULK_MS;
+}
 static long catchup_run(void* store_buf, long max_ms, int stop_at_hole);
 long utxo_live_catchup(void* store_buf){ return catchup_run(store_buf, 0, 0); }
 long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole){
@@ -3241,6 +3313,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
     g_bip30_store = store_buf;   /* for BIP30's BIP34-ancestor test; see bip30_enforced */
     g_call_rejected = -1;        /* 3.3: per-call report, cleared before any early return */
     g_last_stop_reason = UTXO_STOP_TIP;
+    if (g_ckpt_last_ms == 0) g_ckpt_last_ms = mono_ms();   /* the first batch is a batch, not a checkpoint on block one */
     store_reload(store_buf);
     long tip = *(int*)((char*)store_buf + 24);
 
@@ -3256,7 +3329,13 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
     }
     if (g_recovery_result < 0) { g_last_fail_kind = UTXO_FAIL_OTHER; g_last_fail_height = g_applied_height + 1; g_last_stop_reason = UTXO_STOP_FAIL; return -1; }
     if (g_halted) { g_last_stop_reason = UTXO_STOP_FAIL; return -1; }   /* utxo_live_verify_after_recovery() found the set inconsistent */
-    if (tip < 0 || tip <= g_applied_height) return 0;
+    if (tip < 0 || tip <= g_applied_height) {
+        /* nothing to apply -- but a carried bulk batch still has its time
+         * bound: a download that stalls must not hold the checkpoint open */
+        if (g_ckpt_since && g_bulk_mode && mono_ms() - g_ckpt_last_ms >= UTXO_CKPT_BULK_MS && !ckpt_now())
+            fprintf(stderr, "[utxo_live] WARNING: failed to persist the carried checkpoint at height %ld\n", g_applied_height);
+        return 0;
+    }
     g_last_fail_kind = UTXO_FAIL_NONE;
 
     static u8 blockbuf[8<<20];
@@ -3407,7 +3486,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
          * bounded fraction of total replay time in exchange for closing an
          * unbounded-drift crash window. */
         g_ckpt_since++;
-        if (utxo_live_ckpt_due(h, tip, g_ckpt_since, mono_ms(), g_ckpt_last_ms, g_test_ckpt_batch) && !ckpt_now()) {
+        if (utxo_live_ckpt_due(h, tip, g_ckpt_since, mono_ms(), g_ckpt_last_ms, g_test_ckpt_batch, g_bulk_mode) && !ckpt_now()) {
             /* STOP, don't continue (2026-08-25). The old comment claimed
              * continuing was "safe, puts/dels are idempotent" -- false since
              * Stage D verifies before applying: every un-checkpointed block
@@ -3505,6 +3584,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
          * (applied_height reset to -1) hit this wall at height 202134. */
         u64 tm_k0 = tm_now();
         compact_poll();                                   /* adopt a finished background merge */
+        g_apply_lag = tip > h ? tip - h : 0;
         compact_start_async(h, "mid-catchup");
         tm_lap(TM_FLUSH, tm_k0);                          /* inline-fallback compaction, if any, lands here */
     }
@@ -3516,7 +3596,7 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
      * threshold and flushes naturally, which also resets the WAL. Lowering a
      * threshold under buffers sized for a bigger one is safe; the reverse
      * would not be. */
-    if (g_ckpt_since && !ckpt_now())          /* loop exit of any kind: land the pending batch */
+    if (ckpt_land_on_exit(max_ms) && !ckpt_now())   /* land the pending batch (bulk bounded passes carry it: see ckpt_land_on_exit) */
         fprintf(stderr, "[utxo_live] WARNING: failed to persist the batched checkpoint at height %ld\n", g_applied_height);
     if (max_ms > 0) s_bounded_last_log = last_progress_log;
     /* step-0 timing: the call's own breakdown, once. Two or more blocks so a
@@ -3532,7 +3612,13 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
                   applied, g_applied_height - applied + 1, g_applied_height,
                   (double)(mono_ms() - cu_t0) / 1000.0, tmbuf);
       } }
-    if (g_bulk_mode && g_applied_height >= tip) {
+    /* 2026-09-10: ...and only from the UNBOUNDED drain. A bounded pass is the
+     * download loop's, and its tip is the download's frontier: on a fresh
+     * sync the apply reaches it within minutes, and this downshift threw the
+     * dbcache-sized memtable away right there (bulk sizing had never run on
+     * a fresh sync before PR #153, so nothing showed it). The rotation's
+     * drain after the download is the call that is at the chain's tip. */
+    if (g_bulk_mode && g_applied_height >= tip && max_ms == 0) {
         unsigned long ss = 1UL << UTXO_LIVE_SLOTS_LOG2;
         g_utxo_lst.fill_threshold = (u64)ss * 3 / 4;
         g_utxo_lst.op_threshold   = (u64)ss * 2;
@@ -3574,13 +3660,9 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
                 fprintf(stderr, "[utxo_live] WARNING: catch-up WAL flush did not complete (r=%ld, log_len=%llu of %llu): a restart before the next block will replay that tail into a steady-state memtable and be very slow -- daemon/flush_wal_tail is the manual remedy\n",
                         fr, (unsigned long long)g_utxo_lst.log_len, before_len);
         }
-        /* The coinstats index seeds HERE, from a walk of the now-caught-up
-         * set (see utxo_live_set_coinstats_caught_up). The set is quiescent
-         * exactly as at boot: this is the same thread, between blocks, with
-         * the batch checkpoint just persisted above; a background compaction
-         * (a separate process) never touches this process's manifest until
-         * compact_poll adopts it. Minutes on mainnet, once per process. */
-        if (g_csi_caught_up) g_csi_caught_up(&g_utxo_lst, g_utxo_table, g_applied_height);
+        /* (The coinstats index used to seed HERE from a walk; since
+         * 2026-09-10 it folds per block from block 0 through the fold
+         * worker, in every mode, like Core's coinstatsindex.) */
     }
     if (applied > 0) {
         /* STAGE B: steady-state undo-data retention. Bounded and resumable
@@ -3589,7 +3671,9 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
         /* 2026-09-08: no steady-state undo pruning. Undo is kept for every
          * block, like Core's rev files; the block store's prune gate is the
          * only thing that removes it (undo_prune_below, from the prune path). */
-        if (!persist_applied_height(g_applied_height)) {
+        /* 2026-09-10: the loop exit above IS the checkpoint; this was a second
+         * one on every call (five more fsyncs a pass). Retry only if it failed. */
+        if (g_ckpt_since && ckpt_land_on_exit(max_ms) && !ckpt_now()) {
             fprintf(stderr, "[utxo_live] WARNING: failed to persist applied height %ld (will re-apply from the prior persisted height on next boot -- safe, puts/dels are idempotent)\n", g_applied_height);
         }
         compact_poll();

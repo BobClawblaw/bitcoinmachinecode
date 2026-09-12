@@ -1,5 +1,12 @@
 # Bitcoin Core feature-parity plan
 
+> **2026-09-12: this file tracks METHOD NAMES, and that is not parity.**
+> Every Core method exists here, and the surface still had 30+ missing response
+> fields -- `getrawmempool true` returned 4 where Core returns 16, `getpeerinfo`
+> returns 19 where v31.1 returns 38. A name is not a contract. The field-level
+> work and the differential that finds it are in `docs/PARITY_RPC_FIELDS.md`.
+
+
 > **Reconciled 2026-09-01:** every checkbox below is now closed or annotated;
 > the living inventory is `docs/FEATURE_GAPS.md` — this file is kept as the
 > historical plan and its gating analysis.

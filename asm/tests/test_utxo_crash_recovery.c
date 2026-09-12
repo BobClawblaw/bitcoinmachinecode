@@ -207,8 +207,24 @@ static void apply_sizing(int tiny){
         g_cfg.utxo_bulk_gap_blocks = 0;
         g_cfg.utxo_bulk_slots_log2 = 2;
         g_cfg.utxo_bulk_blob_mb    = 1;
+        { extern void utxo_live_test_force_sizing(int); utxo_live_test_force_sizing(1); }
     } else {
-        g_cfg.utxo_bulk_gap_blocks = 1000000L;   /* steady-state 2^16 slots */
+        /* steady-state 2^16 slots. 2026-09-09: a fresh datadir takes the bulk
+         * sizing by itself now (utxo_live_sizing.h), so this variant asks for
+         * the small memtable explicitly. Under the bulk memtable the mid-block
+         * scenario recovered with a live count of 153 against the reference's
+         * 151 (CORE_DIVERGENCES row 4, fixed 2026-09-10: the ghost rollback
+         * restored coins the crashed child had never durably deleted, and a
+         * put of a key that lives in a run counts it as new). The same source
+         * built with -DCRASH_RECOVERY_BULK (test_utxo_crash_recovery_bulk)
+         * runs (a) and (b) under the bulk memtable, as production does; (c)'s
+         * 4-slot memtable is its own sizing and stays in this binary only. */
+        extern void utxo_live_test_force_sizing(int);
+#ifdef CRASH_RECOVERY_BULK
+        utxo_live_test_force_sizing(1);
+#else
+        utxo_live_test_force_sizing(0);
+#endif
     }
 }
 
@@ -349,7 +365,12 @@ int main(void){
         { "(c) killed mid-block with a forced mac_flush INSIDE the block (4-slot memtable, 5 spends, die after input 4)",
           CRASH_AFTER_INPUTS, 4, 5, 1 },
     };
-    for (unsigned i=0;i<sizeof scens/sizeof scens[0];i++) run_scenario(&scens[i]);
+    for (unsigned i=0;i<sizeof scens/sizeof scens[0];i++){
+#ifdef CRASH_RECOVERY_BULK
+        if (scens[i].tiny) continue;      /* (c) sizes its own 4-slot memtable; the bulk build covers (a) and (b) */
+#endif
+        run_scenario(&scens[i]);
+    }
     printf("\n%s (%d failures)\n", failures==0 ? "ALL TESTS PASSED" : "TESTS FAILED", failures);
     return failures ? 1 : 0;
 }

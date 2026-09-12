@@ -85,7 +85,7 @@ static int test_one(const char* host, unsigned short port){
     for(int i=0;i<200;i++){
         int r=p2p_read(fd,cmd,rb,sizeof rb,&plen); if(r<=0) break; cmd[11]=0;
         if(!strncmp(cmd,"ping",4)&&plen==8){ p2p_write(fd,"pong",4,rb,8); continue; }
-        if(!strncmp(cmd,"block",5)&&plen>80){ got=1; break; }
+        if(!strncmp(cmd,"block",12)&&plen>80){ got=1; break; }
         if(!strncmp(cmd,"notfound",8)) break;
     }
     fd_close(fd);

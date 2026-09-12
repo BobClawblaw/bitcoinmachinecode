@@ -122,7 +122,7 @@ static int drain_until(int fd, char* cmd, unsigned char* rb, unsigned long rbsiz
         if(!strncmp(cmd,"ping",4)&&*plen==8){ p2p_write(fd,"pong",4,rb,8); continue; }
         if(!strncmp(cmd,"sendheaders",11)||!strncmp(cmd,"sendaddrv2",10)||!strncmp(cmd,"sendcmpct",9)||!strncmp(cmd,"wtxidrelay",10)||!strncmp(cmd,"feefilter",9)){ p2p_write(fd,cmd,strlen(cmd),"",0); continue; }
         if(want_block){
-            if(!strncmp(cmd,"block",5)&&*plen>80) return 1;
+            if(!strncmp(cmd,"block",12)&&*plen>80) return 1;
             if(!strncmp(cmd,"notfound",8)) return -2;
         } else {
             if(!strncmp(cmd,"headers",7)) return 1;

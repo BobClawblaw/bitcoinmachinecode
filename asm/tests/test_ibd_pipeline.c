@@ -17,6 +17,9 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <stdlib.h>
 #include "ibd_pipeline.h"
 
@@ -60,9 +63,11 @@ long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigne
     } else if (!strncmp(cmd, "pong", 4)) g_pongs++;
     return (long)len;
 }
+static int g_read_delay_us = 0;   /* a peer that makes us wait, so occupancy is measurable */
 int p2p_read(int fd, char cmd[12], void* pl, unsigned cap, unsigned* outlen){
     unsigned char* buf = pl;
     (void)fd;
+    if (g_read_delay_us) usleep((unsigned)g_read_delay_us);
     if (g_inject_ping){ g_inject_ping = 0; memcpy(cmd, "ping\0\0\0\0\0\0\0", 12); memset(buf, 7, 8); *outlen = 8; return 8; }
     if (g_inject_unasked){ g_inject_unasked = 0;
         memcpy(cmd, "block\0\0\0\0\0\0", 12);
@@ -216,6 +221,81 @@ int main(void){
     reset(); order_forward(); g_progress = 0;
     r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
     ok(r == NB && g_progress == 0, "with no hook registered the fetch still completes (the hook is optional)");
+
+    /* 2026-09-11: OCCUPANCY. Run 22 was measured from OUTSIDE the process --
+     * sampling /proc/<pid>/io at 50 ms showed the eight workers idle 11-20% of
+     * wall time, waiting on peer bytes, while the daemon's own line said
+     * "8/8 worker(s) active". That line was true and useless: a worker holding
+     * a peer that cannot fill the pipe is active and idle at once. The fetch
+     * now reports both clocks so the ratio is in the log, and this pins that
+     * they are both real and correctly ordered. */
+    reset(); order_forward(); g_read_delay_us = 2000;
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
+    long wait_ms = ibd_pipeline_last_wait_ms(), wall_ms = ibd_pipeline_last_wall_ms();
+    ok(r == NB, "occupancy: the chunk completed");
+    ok(wait_ms <= wall_ms, "time waiting cannot exceed the chunk's whole wall clock");
+    /* THE DISCRIMINATOR. The stub spends 2 ms per block INSIDE the read, which
+     * is transfer, not idle. The first cut of this timed the whole p2p_read
+     * call and so counted every one of those milliseconds as waiting -- it
+     * reported "pool idle 99%" on run 23 within ten minutes of starting. Idle
+     * must be a small fraction of a chunk whose time went into receiving. */
+    ok(wall_ms >= 40, "the fixture really did spend time in the reads");
+    ok(wait_ms * 2 < wall_ms, "transfer time is NOT counted as idle (the 99% bug counted all of it)");
+
+    /* THE MEASUREMENT ITSELF, against a real socket.
+     *
+     * The first cut timed the whole p2p_read call. That call also RECEIVES the
+     * message, so the figure came out at 99% and said nothing -- run 23 printed
+     * "pool idle 99%" ten minutes in, which is how it was caught. Idle has to be
+     * the stretch BEFORE the first byte, and only a real descriptor can show
+     * the difference. */
+    {
+        int sv[2];
+        ok(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair for the idle test");
+
+        /* bytes already waiting: not idle, and the call must not block */
+        ok(write(sv[1], "x", 1) == 1, "peer has already sent something");
+        long none = ibd_idle_before_read(sv[0]);
+        ok(none == 0, "a socket with bytes ready reports NO idle (the 99% bug reported the transfer as idle)");
+
+        /* drain, then make it wait: a quiet socket is idle, and it is measured */
+        char sink[8]; ok(read(sv[0], sink, 1) == 1, "drained");
+        long idle = ibd_idle_before_read(sv[0]);
+        ok(idle >= 900, "a silent peer's wait is measured (bounded poll, so ~1000 ms)");
+        close(sv[0]); close(sv[1]);
+    }
+
+    /* A chunk that FAILS must still close its wall clock. Without that, the
+     * fail path leaves wall at the zero set on entry while wait carries real
+     * milliseconds, and the parent divides by it: a worker whose chunks fail
+     * would read as 100% idle, or worse, as a division by zero. This only
+     * catches it because the stub above actually takes time -- the first
+     * version of this check used the instant fixture, where both clocks were
+     * zero and the assertion held either way. */
+    reset(); order_forward(); g_norder = 7; g_read_delay_us = 2000;
+    r = ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
+    ok(r < 0, "the chunk failed, as the fixture intends");
+    /* This used to assert the failed chunk had MEASURED WAITING. That assertion
+     * encoded the bug: it only held because the old code timed the whole read,
+     * including the transfer. With idle measured before the first byte, a
+     * fixture whose descriptor is not a real socket has no idle to report, and
+     * demanding some would be demanding the wrong number back. What must hold
+     * on the failure path is that the clocks are closed and consistent. */
+    ok(ibd_pipeline_last_wall_ms() > 0, "the failed chunk still reports a wall clock");
+    ok(ibd_pipeline_last_wait_ms() <= ibd_pipeline_last_wall_ms(),
+       "and its wall clock was closed on the failure path, so the ratio stays sane");
+    g_read_delay_us = 0;
+
+    /* the counters are PER CALL, not cumulative: the parent adds them up
+     * itself, and a counter that kept growing would make every worker look
+     * 100% busy after the first slow chunk */
+    reset(); order_forward();
+    ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
+    long w1 = ibd_pipeline_last_wall_ms();
+    reset(); order_forward();
+    ibd_fetch_chunk_pipelined(3, NULL, NULL, LO, NB, buf, (unsigned)sizeof buf, NULL, 0);
+    long w2 = ibd_pipeline_last_wall_ms();
+    ok(w2 < w1 + 1000, "each call reports ITS OWN wall clock, not the sum of every call so far");
 
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);
     return fails?1:0;

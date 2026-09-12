@@ -41,7 +41,10 @@ extern long utxo_live_applied_height(void);
 extern void utxo_live_close(void);
 extern void utxo_live_test_set_crash_after(long n);
 extern void utxo_live_test_set_ckpt_batch(long n);
-extern int  utxo_live_ckpt_due(long h, long tip, long unpersisted, long long now_ms, long long last_ms, long forced);
+extern int  utxo_live_ckpt_due(long h, long tip, long unpersisted, long long now_ms, long long last_ms, long forced, int bulk);
+extern long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole);
+extern void utxo_live_test_force_sizing(int mode);
+extern int  utxo_live_is_bulk(void);
 extern long utxo_live_resolve(const u8 txid[32], unsigned long index, unsigned long long* value, unsigned long* height,
                               unsigned long* is_coinbase, const u8** script, unsigned long* slen);
 
@@ -172,15 +175,26 @@ static u8 store_buf[4096];
 int main(void){
     tt_isolate();
     printf("== 1. the decision ==\n");
-    /* (h, tip, unpersisted, now, last, forced) */
-    ckm("far behind, batch not full, fresh: not due",        !utxo_live_ckpt_due(1000, 100000, 10, 5000, 4000, -1));
-    ckm("far behind, batch full: due",                        utxo_live_ckpt_due(1000, 100000, 64, 5000, 4000, -1));
-    ckm("far behind, 2 s since last: due",                    utxo_live_ckpt_due(1000, 100000, 1, 6000, 4000, -1));
-    ckm("within 64 of the tip: due every block",              utxo_live_ckpt_due(99950, 100000, 1, 5000, 4999, -1));
-    ckm("at the tip: due",                                    utxo_live_ckpt_due(100000, 100000, 1, 5000, 4999, -1));
-    ckm("forced 0 (per-block): due",                          utxo_live_ckpt_due(1000, 100000, 1, 5000, 4999, 0));
-    ckm("forced 64 near the tip: still batching (test knob)", !utxo_live_ckpt_due(99999, 100000, 5, 5000, 4999, 64));
-    ckm("forced 64, 64 unpersisted: due",                     utxo_live_ckpt_due(99999, 100000, 64, 5000, 4999, 64));
+    /* (h, tip, unpersisted, now, last, forced, bulk) */
+    ckm("far behind, batch not full, fresh: not due",        !utxo_live_ckpt_due(1000, 100000, 10, 5000, 4000, -1, 0));
+    ckm("far behind, batch full: due",                        utxo_live_ckpt_due(1000, 100000, 64, 5000, 4000, -1, 0));
+    ckm("far behind, 2 s since last: due",                    utxo_live_ckpt_due(1000, 100000, 1, 6000, 4000, -1, 0));
+    ckm("within 64 of the tip: due every block",              utxo_live_ckpt_due(99950, 100000, 1, 5000, 4999, -1, 0));
+    ckm("at the tip: due",                                    utxo_live_ckpt_due(100000, 100000, 1, 5000, 4999, -1, 0));
+    ckm("forced 0 (per-block): due",                          utxo_live_ckpt_due(1000, 100000, 1, 5000, 4999, 0, 0));
+    ckm("forced 64 near the tip: still batching (test knob)", !utxo_live_ckpt_due(99999, 100000, 5, 5000, 4999, 64, 0));
+    ckm("forced 64, 64 unpersisted: due",                     utxo_live_ckpt_due(99999, 100000, 64, 5000, 4999, 64, 0));
+    /* 2026-09-10: BULK mode (a fresh sync or a reindex). The archive tip is
+     * the download's frontier, not the chain's, so "near the tip" means
+     * nothing; the batch is 1,024 blocks or 60 s. Run 19 spent 13-24% of
+     * every block (72% of some) on per-block checkpoints at lag 0. */
+    ckm("bulk, far behind, 64 unpersisted: NOT due (the steady-state batch)", !utxo_live_ckpt_due(1000, 100000, 64, 5000, 4000, -1, 1));
+    ckm("bulk, far behind, 2 s since last: NOT due",                       !utxo_live_ckpt_due(1000, 100000, 1, 7000, 4000, -1, 1));
+    ckm("bulk, 1,024 unpersisted: due",                                      utxo_live_ckpt_due(1000, 100000, 1024, 5000, 4000, -1, 1));
+    ckm("bulk, 60 s since last: due",                                        utxo_live_ckpt_due(1000, 100000, 1, 64000, 4000, -1, 1));
+    ckm("bulk, one below the archive tip: NOT due (the frontier is not the tip)", !utxo_live_ckpt_due(99999, 100000, 1, 5000, 4999, -1, 1));
+    ckm("bulk, AT the archive tip: NOT due (the loop exit decides)",        !utxo_live_ckpt_due(100000, 100000, 1, 5000, 4999, -1, 1));
+    ckm("bulk, forced 0 (per-block test knob): due",                         utxo_live_ckpt_due(1000, 100000, 1, 5000, 4999, 0, 1));
 
     printf("== 2. crash mid-batch: 5 ghost blocks ==\n");
     memset(store_buf,0,sizeof store_buf);
@@ -254,6 +268,45 @@ int main(void){
     ck("reopen", utxo_live_init("."), 1);
     ck("clean close persisted the batched checkpoint: 159", utxo_live_applied_height(), n1+9);
     ck("nothing to recover or apply", utxo_live_catchup(store_buf), 0);
+    utxo_live_close();
+    printf("== 4. bulk mode: a bounded pass at the download's frontier carries its batch and stays bulk ==\n");
+    /* The download loop connects the contiguous prefix in bounded passes
+     * (utxo_live_catchup_bounded, stop_at_hole). On a fresh sync the apply
+     * reaches the frontier every few passes; that is not "caught up", so
+     * neither the per-block checkpoint nor the steady-state downshift (which
+     * threw away the dbcache-sized memtable minutes into every fresh sync)
+     * may fire there. Only the unbounded drain, which the rotation runs
+     * once the download is over, is at the chain's tip. */
+    tt_subdir("bulk");
+    memset(store_buf,0,sizeof store_buf);
+    ck("4 store_init", store_init(store_buf), 1);
+    utxo_live_test_force_sizing(1);
+    ck("4 utxo_live_init", utxo_live_init("."), 1);
+    ckm("4 bulk memtable", utxo_live_is_bulk() == 1);
+    memset(prev,0,32);
+    for (long h=0; h<5; h++){
+        u8 raw[256], hash[32];
+        long len = mk_and_mine(raw, hash, prev, 0x72000000u+(u32)h, 1900300000u+(u32)h);
+        long r = store_append(store_buf, hash, raw, len);
+        if (r != h) { printf("FAIL 4 store_append h=%ld got=%ld\n", h, r); failures++; }
+        memcpy(prev, hash, 32);
+    }
+    ck("4 a bounded pass applied the 5 blocks to the frontier", utxo_live_catchup_bounded(store_buf, 60000, 1), 5);
+    ck("4 applied height 4 in memory", utxo_live_applied_height(), 4);
+    ckm("4 still BULK after the pass (the frontier is not the tip: no downshift)", utxo_live_is_bulk() == 1);
+    ckm("4 no checkpoint landed for those 5 blocks (the batch carries to the next pass)", access("utxo_applied_height.dat", F_OK) != 0);
+    utxo_live_close();                          /* a clean close lands the carried batch */
+    ckm("4 the clean close landed the batch", access("utxo_applied_height.dat", F_OK) == 0);
+    ck("4 reopen", utxo_live_init("."), 1);
+    ck("4 the checkpoint is 4", utxo_live_applied_height(), 4);
+    ckm("4 bulk again", utxo_live_is_bulk() == 1);
+    { u8 raw[256], hash[32];
+      long len = mk_and_mine(raw, hash, prev, 0x72000005u, 1900300005u);
+      ck("4 store_append 5", store_append(store_buf, hash, raw, len), 5);
+      memcpy(prev, hash, 32); }
+    ck("4 the UNBOUNDED drain applied the block", utxo_live_catchup(store_buf), 1);
+    ckm("4 ...and downshifted to steady state: the drain's tip is the chain's", utxo_live_is_bulk() == 0);
+    utxo_live_test_force_sizing(-1);
     utxo_live_close();
     printf("\n%s (%d failure%s)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures, failures==1?"":"s");
     return failures ? 1 : 0;

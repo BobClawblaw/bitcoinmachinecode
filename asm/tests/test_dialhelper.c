@@ -136,7 +136,11 @@ int main(void){
     printf("== 3. capacity ==\n");
     dial_helper_test_set_timeout_ms(1500);
     ok(dh_start("198.51.100.2:8333", 8333) == 1 && dh_start("198.51.100.3:8333", 8333) == 1, "two helpers may run at once");
-    ok(dh_start("198.51.100.4:8333", 8333) == 0, "a third is refused (DH_MAX)");
+    ok(dh_start("198.51.100.4:8333", 8333) == 1 && dh_start("198.51.100.5:8333", 8333) == 1, "...and four (2026-09-10: every dial is a helper now)");
+    ok(dh_start("198.51.100.6:8333", 8333) == 1 && dh_start("198.51.100.7:8333", 8333) == 1
+       && dh_start("198.51.100.8:8333", 8333) == 1 && dh_start("198.51.100.9:8333", 8333) == 1, "...and eight (DH_MAX 8: nine churning legs saturated four)");
+    ok(dh_start("198.51.100.10:8333", 8333) == 0, "a ninth is refused (DH_MAX)");
+    ok(DH_V2_BLOB_CAP >= (4u << 20), "the session blob holds a message in flight (snapshot ab: a headers reply outgrew 64 KB and healthy legs were closed)");
     ok(dh_inflight_net(BMC_NET_IPV4) == 1, "in-flight lookup by network");
     for (int i = 0; i < 200; i++){ if (dh_poll(&r, &fd, h, sizeof h) && dh_inflight_count() == 0) break; usleep(50000); }
     for (int i = 0; i < 100 && dh_inflight_count(); i++){ dh_poll(&r, &fd, h, sizeof h); usleep(50000); }
@@ -336,6 +340,19 @@ int main(void){
         ok(dlc_pick_peer(4, 0, e3, c3, b3, 400.0) == 1, "...untried gone: the 300 KB/s peer (1), NOT the dead-marked one -- it is measured, not untried");
         c3[1] = 1;
         ok(dlc_pick_peer(4, 0, e3, c3, b3, 400.0) == 2, "...and only the dead-marked one left: still returned rather than no peer (2)"); }
+      /* 2026-09-09, run 19: a FRESH sync has no pool median yet (bar 0), and
+       * with bar 0 the dead mark (1.0) outranked every untried peer, so two
+       * workers went back to the same two peers that closed the socket on
+       * every request -- 200 attempts each, the committer waiting on their
+       * chunk, the whole run stalled at block 560. A peer whose only history
+       * is failure never clears a bar, not even an unknown one. */
+      { volatile int c4[4] = {0,0,0,0}, b4[4] = {0,0,0,0};
+        volatile double e4[4] = {1.0, 0.5, 0.0, 0.0};
+        ok(dlc_pick_peer(4, 0, e4, c4, b4, 0.0) == 2, "ema [1.0(dead mark),0.5(failed twice),untried,untried], bar 0 (fresh sync): the untried one (2)");
+        c4[2] = 1; c4[3] = 1;
+        ok(dlc_pick_peer(4, 0, e4, c4, b4, 0.0) == 0, "...nobody untried: the least-failed mark rather than no peer (0)");
+        volatile double e5[4] = {1.0, 300.0, 0.0, 0.0}; volatile int c5[4] = {0,0,0,0};
+        ok(dlc_pick_peer(4, 0, e5, c5, b4, 0.0) == 1, "ema [1.0(dead mark),300 measured,untried,untried], bar 0: the measured peer (1), as before"); }
       /* the far-behind trigger's height (2026-09-08): one liar cannot start
        * the parallel downloader; two agreeing peers can */
       { long one[1] = { 969817 }; long two[2] = { 969817, 966063 }; long many[5] = { 966063, 966063, 969817, 966062, 966063 };
@@ -346,9 +363,9 @@ int main(void){
       /* the download window and the retry ring ("write out monotonically,
        * like Core does"): a chunk is never claimed more than 1024 blocks
        * above the first hole, and an abandoned chunk is retried, never left. */
-      { ok(dlc_window_allows(45160 + 4096, 45160), "a claim exactly 4096 above the first hole is inside the window (Core's 1024 scaled to our 640 in flight)");
-        ok(!dlc_window_allows(45160 + 4097, 45160), "4097 above: outside -- the worker waits instead of running ahead");
-        ok(dlc_window_allows(100, 45160), "a claim below the first hole (a retry) is always allowed");
+      { ok(dlc_window_allows(45160 + 4096, 45160, 4096), "a claim exactly 4096 above the first hole is inside the window (Core's 1024 scaled to our 640 in flight)");
+        ok(!dlc_window_allows(45160 + 4097, 45160, 4096), "4097 above: outside -- the worker waits instead of running ahead");
+        ok(dlc_window_allows(100, 45160, 4096), "a claim below the first hole (a retry) is always allowed");
         static volatile long ctl[DLC_CTL_RING + DLC_RETRY_MAX];
         for (long i = 0; i < DLC_CTL_RING + DLC_RETRY_MAX; i++) ctl[i] = i < DLC_CTL_RING ? 0 : -1;
         ok(dlc_retry_pop(ctl) == -1, "empty ring: nothing to retry");
@@ -361,6 +378,59 @@ int main(void){
       /* run 14's two-minute stall: a failed fetch must cost the peer its
        * standing, cost the worker a pause, and a help must land on the
        * claim grid */
+      /* 2026-09-09: tcp_connect_ip's connect() is blocking under a 10 s
+       * SO_SNDTIMEO; its expiry surfaces as EINPROGRESS, which was rendered
+       * "Operation now in progress" and read as an attempt still in flight */
+      /* 2026-09-09: the fetch gate refuses a hash the store already holds (a sibling leg
+       * landed it: production on snapshot n fetched and then refused six duplicates an
+       * hour, each a strike) and claims a fresh one for this leg */
+      { static unsigned char idxbuf[24 + HT_SLOTS*48]; idx_init(idxbuf, HT_SLOTS); unsigned char* saved = ht_idx; ht_idx = idxbuf;
+        unsigned char known[32], fresh[32]; memset(known, 0x11, 32); memset(fresh, 0x22, 32); idx_put(ht_idx, known, 5);
+        inflight_init(&g_inflight); g_sync_leg = 3;
+        ok(block_fetch_gate(known) == 0, "a hash already in the store's index is not fetched");
+        ok(block_fetch_gate(fresh) == 1, "a fresh hash is claimed for this leg");
+        g_sync_leg = 4;
+        ok(block_fetch_gate(fresh) == 0, "... and refused to another leg while the claim lives");
+        inflight_release_leg(&g_inflight, 3);
+        ok(block_fetch_gate(fresh) == 1, "... until the first leg's pass ends");
+        ht_idx = saved; g_sync_leg = -1; inflight_init(&g_inflight); }
+      /* 2026-09-09: we ping every leg every 2 min and close one silent for 20 min (Core's numbers) */
+      { ok(leg_ping_due(1000, 0), "a fresh leg is pinged at once");
+        ok(!leg_ping_due(1000 + 119, 1000), "... not again for 2 min");
+        ok(leg_ping_due(1000 + 120, 1000), "... then again");
+        ok(!leg_ping_timed_out(1000 + 1199, 1000, 0), "no pong for 19:59 is not a timeout");
+        ok(leg_ping_timed_out(1000 + 1200, 1000, 0), "no pong for 20 min is");
+        ok(!leg_ping_timed_out(1000 + 1200, 1000, 1001), "a pong after the ping clears it");
+        ok(!leg_ping_timed_out(1000 + 9999, 0, 0), "a leg never pinged cannot time out");
+        /* the pong callback matches the nonce to the slot */
+        int sp[2]; socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
+        mux_n_out = 1; mux_out_fd[0] = sp[0]; mux_out_ping_nonce[0] = 0x1122334455667788ULL; mux_out_pong_at[0] = 0; mux_out_ping_sent_ms[0] = dh_now_ms();
+        unsigned char wrong[8] = {1,2,3,4,5,6,7,8}; leg_on_pong(sp[0], wrong);
+        ok(mux_out_pong_at[0] == 0, "a pong with another nonce is ignored");
+        unsigned char right[8]; unsigned long long nn = 0x1122334455667788ULL; memcpy(right, &nn, 8); leg_on_pong(sp[0], right);
+        ok(mux_out_pong_at[0] != 0 && mux_out_ping_ms[0] >= 0, "the matching pong records the time and the round trip");
+        mux_out_fd[0] = -1; mux_n_out = 0; close(sp[0]); close(sp[1]); }
+      /* 2026-09-09, second leg batch: the peer's half-close is seen at once, and
+       * a leg's socket ticks at 3 s after the handshake so the drains get their
+       * designed patience (they counted 300 ms ticks: 2.4 s for headers) */
+      { int sp[2]; ok(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0, "socketpair for the hang-up checks");
+        short rv = 0;
+        ok(leg_peer_hung_up(sp[0], &rv) == 0, "an open, quiet peer has not hung up");
+        shutdown(sp[1], SHUT_WR);
+        ok(leg_peer_hung_up(sp[0], &rv) == 1 && (rv & POLLRDHUP), "the peer's half-close (FIN) is a hang-up: POLLRDHUP");
+        close(sp[1]);
+        ok(leg_peer_hung_up(sp[0], &rv) == 1, "... and its full close still is");
+        close(sp[0]);
+        int sq[2]; socketpair(AF_UNIX, SOCK_STREAM, 0, sq);
+        struct timeval before = {0, 300000}; setsockopt(sq[0], SOL_SOCKET, SO_RCVTIMEO, &before, sizeof before);
+        leg_settle_socket(sq[0]);
+        struct timeval after; socklen_t sl = sizeof after; getsockopt(sq[0], SOL_SOCKET, SO_RCVTIMEO, &after, &sl);
+        ok(after.tv_sec == LEG_READ_TICK_S && after.tv_usec == 0, "a settled leg socket reads in 3 s ticks (was the dial's 300 ms)");
+        close(sq[0]); close(sq[1]); }
+      { dial_fail_errno("connect", -EINPROGRESS);
+        ok(!strcmp(dial_fail_reason(), "connect timed out (10s)"), "EINPROGRESS from the bounded blocking connect reads as a timeout");
+        dial_fail_errno("connect", -ECONNREFUSED);
+        ok(!strcmp(dial_fail_reason(), "connect: Connection refused"), "a refused connect keeps strerror's text"); }
       { ok(dlc_ema_after_failure(800.0*1024) == 400.0*1024, "a failed fetch halves the peer's rate (800 -> 400 KB/s)");
         ok(dlc_ema_after_failure(0.0) == 1.0, "a never-measured peer that fails is marked tried (1.0), not left untried");
         ok(dlc_fail_backoff_ms(1) == 200 && dlc_fail_backoff_ms(5) == 1000 && dlc_fail_backoff_ms(10) == 2000 && dlc_fail_backoff_ms(400) == 2000,
@@ -462,13 +532,111 @@ int main(void){
             ok(swept == 2 && !dlc_stage_exists(20) && !dlc_stage_exists(60), "chunks 20 and 60 (wholly below cursor 180) are swept");
             ok(dlc_stage_exists(180) && dlc_stage_exists(220) && ctl5[DLC_CTL_STAGED] == 2, "chunks 180 and 220 stay; the gauge is recounted from the directory (2, not 99)");
             ok(dlc_stage_wipe() == 2, "(cleanup)"); }
-          /* the window's help guard, and the next run's wipe */
+          /* Core's stall rule (2026-09-10): the parent evicts the worker holding
+           * the window's tail -- the oldest missing chunk -- only while the
+           * window is full, only if the chunk is not staged, only after the
+           * adaptive timeout; the timeout doubles on an eviction and eases
+           * when the tail moves. Time is the tick's parameter, so no waiting. */
+          { volatile long* c = mmap(0, (DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+            for (long i = 0; i < DLC_CTL_RING + DLC_RETRY_MAX; i++) c[i] = i < DLC_CTL_RING ? 0 : -1;
+            static volatile dlc_stat_t sst[2]; memset((void*)sst, 0, sizeof sst);
+            pid_t kids[2], opid[2];
+            /* the live pool the eviction bans into (2026-09-10, run 20) */
+            #define TNLIVE 16
+            static char tlive[TNLIVE][DL_POOL_SLOT]; static volatile int tbanned[TNLIVE];
+            memset(tlive, 0, sizeof tlive); memset((void*)tbanned, 0, sizeof tbanned);
+            for (int q = 0; q < TNLIVE; q++) snprintf(tlive[q], DL_POOL_SLOT, "10.0.0.%d:8333", q + 1);
+            g_cfg.min_usable_peers = 8;
+            /* the tail's holder: a child that exits 7 on SIGUSR1 (the worker's abandon signal) */
+            /* SIGUSR1 is blocked BEFORE the fork so the child inherits the mask
+             * and sigwait can never miss it (the gate's load once delivered the
+             * signal before the child had blocked it: terminated by signal, not
+             * exit 7). The parent unblocks after the fork. */
+            sigset_t um; sigemptyset(&um); sigaddset(&um, SIGUSR1); sigprocmask(SIG_BLOCK, &um, 0);
+            pid_t hp = fork();
+            if (hp == 0){ for (;;){ sigset_t m; sigemptyset(&m); int s = 0; sigaddset(&m, SIGUSR1); sigwait(&m, &s); if (s == SIGUSR1) _exit(7); } }
+            sigprocmask(SIG_UNBLOCK, &um, 0);
+            kids[0] = opid[0] = hp; kids[1] = opid[1] = 0;
+            sst[0].cur_lo = 100; sst[0].cur_hi = 139; strcpy((char*)sst[0].peer, "10.0.0.1:8333"); sst[0].held_idx = 0;
+            c[DLC_CTL_FIRST_HOLE] = 100; c[DLC_CTL_SPAN_START] = 100; c[DLC_CTL_APPLIED] = -1;
+            g_dlc_window = 4096; g_dlc_stall_timeout_s = 2;
+            c[DLC_CTL_CLAIM] = 100 + 4000;                                   /* room left: not full */
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 1000, tlive, TNLIVE, tbanned); dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 60000, tlive, TNLIVE, tbanned);
+            ok(c[DLC_CTL_N_STALL] == 0 && waitpid(hp, 0, WNOHANG) == 0, "window not full: the tail's holder is not a staller however long it holds");
+            c[DLC_CTL_CLAIM] = 100 + 4097;                                   /* full */
+            stage_chunk(100, 40);
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 61000, tlive, TNLIVE, tbanned); dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 120000, tlive, TNLIVE, tbanned);
+            ok(c[DLC_CTL_N_STALL] == 0 && waitpid(hp, 0, WNOHANG) == 0, "window full but the tail chunk is STAGED: the committer has it, nobody is stalling");
+            dlc_stage_wipe();
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 121000, tlive, TNLIVE, tbanned);      /* the holder's clock starts */
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 122900, tlive, TNLIVE, tbanned);      /* 1.9 s: not yet */
+            ok(c[DLC_CTL_N_STALL] == 0 && waitpid(hp, 0, WNOHANG) == 0, "full, unstaged, held for 1.9 s of a 2 s timeout: not yet");
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 123000, tlive, TNLIVE, tbanned);      /* 2.0 s: evicted */
+            int st7 = 0; waitpid(hp, &st7, 0);
+            ok(c[DLC_CTL_N_STALL] == 1 && WIFEXITED(st7) && WEXITSTATUS(st7) == 7 && sst[0].kill_reason == 1,
+               "2 s at a full window: the holder is dropped (SIGUSR1, reason 'stalling the window'), the eviction counted");
+            ok(g_dlc_stall_timeout_s == 4, "...and the timeout doubled to 4 s");
+            ok(tbanned[0] == 1,
+               "...and the staller is BANNED for the run (run 20, 2026-09-10: the eviction was memoryless and one address was handed the same chunk 14 times)");
+            kids[0] = 0;                                                    /* the worker is gone */
+            c[DLC_CTL_FIRST_HOLE] = 140;                                     /* the tail moved on */
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 124000, tlive, TNLIVE, tbanned);
+            ok(g_dlc_stall_timeout_s == 3, "the tail moved: the timeout eases 15% (4 s -> 3 s)");
+            dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 200000, tlive, TNLIVE, tbanned);
+            ok(c[DLC_CTL_N_STALL] == 1, "nobody holds the new tail (it is the retry ring's): no eviction");
+            /* the floor guard: the same rule that stops the dead-weight
+             * eviction emptying the pool applies here -- a slow peer beats no
+             * peer, so at the floor the staller is dropped but stays selectable */
+            { sigset_t um2; sigemptyset(&um2); sigaddset(&um2, SIGUSR1); sigprocmask(SIG_BLOCK, &um2, 0);
+              pid_t hp2 = fork();
+              if (hp2 == 0){ for (;;){ sigset_t m; sigemptyset(&m); int s = 0; sigaddset(&m, SIGUSR1); sigwait(&m, &s); if (s == SIGUSR1) _exit(7); } }
+              sigprocmask(SIG_UNBLOCK, &um2, 0);
+              kids[0] = opid[0] = hp2;
+              sst[0].cur_lo = 140; sst[0].cur_hi = 179; sst[0].held_idx = 1; sst[0].kill_reason = 0;
+              c[DLC_CTL_FIRST_HOLE] = 140; c[DLC_CTL_CLAIM] = 140 + 4097;
+              g_dlc_stall_timeout_s = 2;
+              int save_floor = g_cfg.min_usable_peers; g_cfg.min_usable_peers = TNLIVE;   /* every peer is needed */
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 300000, tlive, TNLIVE, tbanned);
+              dlc_stall_tick(c, sst, kids, opid, 2, 100, 999999, 303000, tlive, TNLIVE, tbanned);
+              int st8 = 0; waitpid(hp2, &st8, 0);
+              ok(WIFEXITED(st8) && WEXITSTATUS(st8) == 7 && tbanned[1] == 0,
+                 "at the usable floor the staller is still dropped but NOT banned (a slow peer beats no peer)");
+              g_cfg.min_usable_peers = save_floor; kids[0] = 0; }
+            g_dlc_stall_timeout_s = DLC_STALL_TIMEOUT_MIN_S;
+            munmap((void*)c, (DLC_CTL_RING + DLC_RETRY_MAX) * sizeof(long)); }
+          /* a staged chunk is visible to the stall rule's guard, and the next run's wipe */
           stage_chunk(180, 40);
-          ok(dlc_stage_exists(180), "a staged chunk is visible to the help guard: the worker must not refetch it");
+          ok(dlc_stage_exists(180), "a staged chunk is visible to the stall rule: its holder is not judged");
           ok(dlc_stage_wipe() == 1 && !dlc_stage_exists(180), "a new run discards what an earlier run left (its chunks are fetched again)");
           munmap(cb, DLC_STAGE_MAX_BYTES);
         }
         if (cwd3[0]) (void)!chdir(cwd3); }
+      /* 2026-09-10 (row 1): a leg's pass in a helper -- the report path, the
+       * peer-hung-up close replayed by the parent, and the budget close */
+      { char pd[] = "/tmp/bmc-pass-XXXXXX"; char cwdp[512]; cwdp[0] = 0; (void)!getcwd(cwdp, sizeof cwdp);
+        if (mkdtemp(pd) && chdir(pd) == 0){
+          static unsigned char sb[4096]; memset(sb, 0, sizeof sb); store_init(sb); memcpy(store_buf, sb, sizeof sb);
+          const char* pool1[1] = { "198.51.100.9:8333" };
+          int sp[2]; ok(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0, "leg pair for the pass helper");
+          mux_n_out = 1; mux_out_fd[0] = sp[0]; snprintf(mux_out_host[0], sizeof mux_out_host[0], "10.9.9.9:8333"); mux_out_since[0] = (long long)time(NULL) - 100; mux_out_kind[0] = LEG_FULL;
+          close(sp[1]);                                          /* the peer hung up before saying anything */
+          ok(leg_pass_start(0, 5) == 1 && leg_pass_busy(0), "a pass starts in a helper and the leg is busy");
+          int sl = -1; long got = 0; int waited = 0;
+          while (g_pass[0].pid > 0 && waited < 8000){ got += leg_pass_poll(&sl, pool1, 1, 8333); usleep(20000); waited += 20; }
+          ok(g_pass[0].pid == 0 && got == 0, "the helper reported: nothing stored");
+          ok(mux_out_fd[0] < 0 || g_sync_fail_streak[0] == 1, "...and the parent replayed the fail bookkeeping: the leg is down (EOF on the first read) or carries one strike (the getheaders write failed)");
+          /* the budget: a peer that never answers, a 1 s budget */
+          int sq[2]; ok(socketpair(AF_UNIX, SOCK_STREAM, 0, sq) == 0, "leg pair for the budget");
+          for (int k = 0; k < DH_MAX; k++) if (g_dh[k].pid > 0){ kill(g_dh[k].pid, SIGKILL); waitpid(g_dh[k].pid, NULL, 0); close(g_dh[k].sp); g_dh[k].pid = 0; }   /* the re-dial the close started */
+          mux_out_fd[0] = sq[0]; mux_out_since[0] = (long long)time(NULL) - 100;
+          ok(leg_pass_start(0, 1) == 1, "a pass starts under a 1 s budget");
+          waited = 0; while (g_pass[0].pid > 0 && waited < 30000){ leg_pass_poll(&sl, pool1, 1, 8333); usleep(50000); waited += 50; }
+          ok(g_pass[0].pid == 0 && waited < 30000, "the helper's alarm ended the pass within the budget window");
+          ok(mux_out_fd[0] < 0, "...and the parent closed the leg ours/sync-budget");
+          for (int k = 0; k < DH_MAX; k++) if (g_dh[k].pid > 0){ kill(g_dh[k].pid, SIGKILL); waitpid(g_dh[k].pid, NULL, 0); close(g_dh[k].sp); g_dh[k].pid = 0; }
+          close(sq[1]); mux_n_out = 0;
+        }
+        if (cwdp[0]) (void)!chdir(cwdp); }
       /* 2026-09-08: no tip announcements in IBD, Core's rule (tip older than maxtipage) */
       { long long now = 1800000000LL;
         ok(dl_announce_allowed((unsigned long)(now - 3600), now, 86400), "a tip an hour old: announce (not IBD)");

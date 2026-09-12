@@ -28,6 +28,9 @@ static const unsigned char SPK[22] = {0x00,0x14, 0x99,0x99,0x99,0x99,0x99,0x99,0
 static volatile int g_tw_run = 1;
 static int g_tw_saw_test[8];      /* per handled submission, in order */
 static int g_tw_n;
+/* 2026-09-12: settable so the missing-inputs branch of reject-details can be
+ * driven; Core omits reject-details for that reason alone. */
+static const char* g_tw_reason = "min relay fee not met";
 static int g_tw_verdict = 1;      /* what to report back */
 static int g_tw_saw_pkg[8];       /* tx_submit_pkg_n per submission, in order */
 static const char* g_tw_pkg_msg = "success";   /* package-level verdict */
@@ -55,7 +58,7 @@ static void* fake_txworker(void* arg){
                     ns->pkg_fee[i]    = 12345;
                     ns->pkg_vsize[i]  = 200;
                     snprintf((char*)ns->pkg_reason[i], sizeof ns->pkg_reason[i], "%s",
-                             pkg_ok ? (g_tw_verdict == 1 ? "" : "min relay fee not met")
+                             pkg_ok ? (g_tw_verdict == 1 ? "" : g_tw_reason)
                                     : "package-not-validated");
                 }
                 ns->pkg_eff_fee   = 12345ull * (unsigned)pn;
@@ -64,7 +67,7 @@ static void* fake_txworker(void* arg){
                          "%s", g_tw_pkg_msg);
             } else {
                 snprintf((char*)ns->tx_submit_reason, sizeof ns->tx_submit_reason,
-                         g_tw_verdict == 1 ? "" : "min relay fee not met");
+                         "%s", g_tw_verdict == 1 ? "" : g_tw_reason);
             }
             __sync_synchronize();
             ns->tx_submit_ack = last;
@@ -187,6 +190,12 @@ int main(void){
     ck("getnetworkinfo dispatched", rc == 1 && r != NULL);
     ck("protocolversion 70016",  r && S(r,"protocolversion") && !strcmp(S(r,"protocolversion"), "70016"));
     ck("subversion is ours",     r && S(r,"subversion") && !strcmp(S(r,"subversion"), "/BitcoinMachineCode:0.0.1/"));
+    /* 2026-09-10: which BUILD is answering. bmcmonitor could not tell a fixed
+     * node from a broken one over RPC -- both reported this same subversion. */
+    { rj_val* bc = rj_obj_get(r, "bmc_build_commit"); rj_val* bd = rj_obj_get(r, "bmc_build_dirty");
+      ck("getnetworkinfo names the build's commit, so a monitor can tell which binary answered",
+         bc && bc->typ == RJ_STR && bc->str && bc->str[0] && strcmp(bc->str, "unknown") != 0);
+      ck("...and whether that build had uncommitted changes", bd && bd->typ == RJ_BOOL); }
     ck("localservices NETWORK",  r && S(r,"localservices") && !strcmp(S(r,"localservices"), "0000000000000009"));
     ck("connections 11",         r && S(r,"connections") && !strcmp(S(r,"connections"), "11"));
     ck("connections_out 8",      r && S(r,"connections_out") && !strcmp(S(r,"connections_out"), "8"));
@@ -224,6 +233,31 @@ int main(void){
     r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
     ck("getpeerinfo dispatched to array", rc == 1 && r && r->typ == RJ_ARR);
     ck("getpeerinfo has 2 peers", r && r->nitems == 2);
+    /* every peer gets the shared fields, not just download workers: the two
+     * builders used to emit different field sets from the same RPC. */
+    { rj_val* p0 = (r && r->nitems) ? r->items[0] : NULL;
+      ck("a relay leg carries connection_type", p0 && rj_obj_get(p0, "connection_type"));
+      ck("a relay leg carries inflight (empty, honestly)", p0 && rj_obj_get(p0, "inflight")
+         && rj_obj_get(p0, "inflight")->typ == RJ_ARR);
+      ck("no peer carries startingheight, which Core v31.1 dropped",
+         p0 && rj_obj_get(p0, "startingheight") == NULL);
+      /* 2026-09-12: getpeerinfo reached 38/38 against Core v31.1. These are
+       * the fields that were missing, grouped by what had to be plumbed for
+       * each -- transport facts from the socket's owner, counters from the
+       * relay paths, and the per-message byte maps from the write hook and
+       * the drain loops. Emitted unconditionally, so a stub peer shows them. */
+      static const char* ALWAYS[] = {"transport_protocol_type","session_id",
+          "connection_type","inflight","inv_to_send","last_inv_sequence",
+          "presynced_headers", NULL};
+      int miss = 0;
+      for (int q = 0; ALWAYS[q]; q++)
+          if (!p0 || !rj_obj_get(p0, ALWAYS[q])){ miss++; printf("  (missing %s)\n", ALWAYS[q]); }
+      ck("every peer carries the unconditional Core v31.1 fields", p0 && miss == 0);
+      /* presynced_headers is -1 off the presync path, which is Core's own
+       * value for it -- verified against a live node, where all three peers
+       * read -1. A 0 here would claim a presync that never happened. */
+      ck("presynced_headers defaults to Core's -1, not 0",
+         p0 && S(p0,"presynced_headers") && !strcmp(S(p0,"presynced_headers"), "-1")); }
     /* 2026-09-08: the parallel download's peers are listed too, with the chunk in flight */
     rj_free(r);
     st.n_dlpeers = 1; memset(&st.dlpeers[0], 0, sizeof st.dlpeers[0]); st.dlpeers[0].used = 1;
@@ -232,13 +266,50 @@ int main(void){
     st.dlpeers[0].inflight_lo = 500001; st.dlpeers[0].inflight_hi = 500040; st.dlpeers[0].dl_worker = 7; st.dl_bytes_total = 50000000000LL;
     r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
     ck("getpeerinfo lists the download worker's peer as a third entry", rc == 1 && r && r->nitems == 3);
-    { rj_val* d = (r && r->nitems == 3) ? r->items[2] : NULL; rj_val* fl = d ? rj_obj_get(d, "inflight") : NULL; rj_val* bw = d ? rj_obj_get(d, "bmc_download_worker") : NULL; rj_val* br = d ? rj_obj_get(d, "bytesrecv") : NULL; rj_val* ct = d ? rj_obj_get(d, "connection_type") : NULL;
+    { rj_val* d = (r && r->nitems == 3) ? r->items[2] : NULL; rj_val* fl = d ? rj_obj_get(d, "inflight") : NULL; rj_val* br = d ? rj_obj_get(d, "bytesrecv") : NULL; rj_val* ct = d ? rj_obj_get(d, "connection_type") : NULL;
       ck("...with 40 heights in flight, 500001..500040", fl && fl->nitems == 40 && !strcmp(fl->items[0]->str, "500001") && !strcmp(fl->items[39]->str, "500040"));
-      ck("...naming worker 7, its bytes, and connection_type outbound-full-relay", bw && !strcmp(bw->str, "7") && br && !strcmp(br->str, "123456789") && ct && !strcmp(ct->str, "outbound-full-relay")); }
+      ck("...its bytes, and connection_type outbound-full-relay", br && !strcmp(br->str, "123456789") && ct && !strcmp(ct->str, "outbound-full-relay"));
+      /* bmc_download_worker was an ADDITIVE key in a Core call. It is gone
+       * (2026-09-12), the same category as the startingheight dropped for
+       * exactness; the worker index lives on bmcgetdownloadinfo, which is
+       * ours to define. This assertion used to require the extra key, so it
+       * pinned the divergence -- it now pins its absence. */
+      ck("getpeerinfo carries no additive bmc_ key", d && rj_obj_get(d, "bmc_download_worker") == NULL); }
     rj_free(r);
     r = NULL; rc = rpc_node_dispatch("getnettotals", NULL, &r, &ec, &em);
     { rj_val* tr = r ? rj_obj_get(r, "totalbytesrecv") : NULL;
       ck("getnettotals counts the download's bytes (50 GB + the legs)", rc == 1 && tr && strtoll(tr->str, NULL, 10) >= 50000000000LL); }
+    /* 2026-09-10: bmcgetdownloadinfo -- the window state getpeerinfo cannot
+     * carry. Core has no counterpart, so nothing here mirrors a Core shape. */
+    st.dl_active = 1; st.dl_workers = 8; st.dl_pool = 120; st.dl_banned = 10; st.dl_free_peers = 37;
+    st.dl_window = 4096; st.dl_first_hole = 500001; st.dl_claim = 504097; st.dl_applied = 499000;
+    st.dl_end_h = 966368; st.dl_staged = 12; st.dl_stall_timeout_s = 4; st.dl_stall_evictions = 3;
+    st.dl_median_bps = 1361510; st.dlpeers[0].bps_recv = 1400000LL;
+    r = NULL; rc = rpc_node_dispatch("bmcgetdownloadinfo", NULL, &r, &ec, &em);
+    { rj_val* a = r ? rj_obj_get(r, "active") : NULL;
+      rj_val* wk = r ? rj_obj_get(r, "workers") : NULL;
+      rj_val* wn = r ? rj_obj_get(r, "window") : NULL;
+      rj_val* fh = r ? rj_obj_get(r, "first_hole") : NULL;
+      rj_val* so = r ? rj_obj_get(r, "stall_timeout_s") : NULL;
+      rj_val* bn = r ? rj_obj_get(r, "banned") : NULL;
+      rj_val* pa = r ? rj_obj_get(r, "peers") : NULL;
+      ck("bmcgetdownloadinfo reports the window state while a download runs",
+         rc == 1 && a && a->typ == RJ_BOOL && a->str && a->str[0] == '1' && wk && !strcmp(wk->str, "8") && wn && !strcmp(wn->str, "4096")
+         && fh && !strcmp(fh->str, "500001") && so && !strcmp(so->str, "4") && bn && !strcmp(bn->str, "10"));
+      { rj_val* w0 = (pa && pa->nitems == 1) ? pa->items[0] : NULL;
+        rj_val* ad = w0 ? rj_obj_get(w0, "addr") : NULL;
+        rj_val* bp = w0 ? rj_obj_get(w0, "bps_recv") : NULL;
+        rj_val* iw = w0 ? rj_obj_get(w0, "worker") : NULL;
+        ck("...and one worker entry mapping worker 7 to its peer, chunk and rate",
+           ad && !strcmp(ad->str, "203.0.113.9:8333") && bp && !strcmp(bp->str, "1400000") && iw && !strcmp(iw->str, "7")); } }
+    rj_free(r);
+    st.dl_active = 0;
+    r = NULL; rc = rpc_node_dispatch("bmcgetdownloadinfo", NULL, &r, &ec, &em);
+    { rj_val* a = r ? rj_obj_get(r, "active") : NULL; rj_val* bt = r ? rj_obj_get(r, "bytes_total") : NULL;
+      ck("with no download running it answers active=false rather than failing (a poller calls it unconditionally)",
+         rc == 1 && a && a->typ == RJ_BOOL && a->str && a->str[0] == '0' && bt); }
+    rj_free(r);
+
     st.n_dlpeers = 0; st.dl_bytes_total = 0;
     r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
     ck("with the download over, getpeerinfo is back to the 2 legs", rc == 1 && r && r->nitems == 2);
@@ -376,11 +447,16 @@ int main(void){
         ck("an empty outputs array -> -8 (Core rejects it too)", rcb == 0 && ec == -8);
         rj_free(r); rj_free(p); }
 
-      /* the two node-side Blockchain refusals name what is missing */
+      /* getmempoolcluster used to refuse everything with -1 and this asserted
+       * that refusal. 2026-09-12 it answers a SINGLETON cluster exactly (a lone
+       * transaction is its own chunk, no linearization needed), so a missing
+       * txid now takes the parameter path -- and Core answers that with -3
+       * (RPC_TYPE_ERROR), verified against v31.1. The old assertion pinned the
+       * unimplemented state, so it is replaced, not restored. */
       { r = NULL; ec = 0; em = NULL;
         int rcb = rpc_node_dispatch("getmempoolcluster", NULL, &r, &ec, &em);
-        ck("getmempoolcluster -> -1 naming the missing cluster structure",
-           rcb == 0 && ec == -1 && em && strstr(em, "cluster"));
+        ck("getmempoolcluster with no txid -> -3, as Core answers it",
+           rcb == 0 && ec == -3 && em && strstr(em, "not of expected type string"));
         rj_free(r);
         r = NULL; ec = 0; em = NULL;
         rcb = rpc_node_dispatch("getblockfrompeer", NULL, &r, &ec, &em);
@@ -685,6 +761,82 @@ int main(void){
             h.pol_entry = mpool_policy_entry;
             h.pol_entry_info = mpool_policy_entry_info;
             rpc_node_set_mempool(&h); } }
+
+        /* ---- verbose getrawmempool carries the SAME per-entry object as
+         * getmempoolentry (2026-09-11).
+         *
+         * It used to carry four fields -- vsize, weight, time, fees.base --
+         * because it was landed as a first slice whose comment said the
+         * aggregates would come with getmempoolentry. They did, and nobody
+         * widened the bulk call, so a consumer wanting CPFP clusters over the
+         * whole pool had to issue one getmempoolentry per transaction against
+         * an RPC server that handles one request at a time.
+         *
+         * Two properties are pinned here. The graph must be PRESENT, and the
+         * bulk answer must AGREE with the per-txid answer -- they are now
+         * computed by different code (a one-pass graph build vs. the original
+         * per-entry scans), and a fast path that disagrees with the slow one
+         * is worse than no fast path. ---- */
+        for (int bulk_on = 0; bulk_on < 2; bulk_on++){
+          /* run every assertion below through BOTH paths: the one-pass graph
+           * build (bulk_on) and the original per-txid scans. They are separate
+           * code, and the fast one exists only if it agrees with the slow one.
+           * The first cut of the fast path made the per-txid branch
+           * conditional on there being no cache, so a node without
+           * pol_entry_info_all got an entry with NO graph at all. */
+          { extern long mpool_policy_entry(void*, const unsigned char*,
+                                           unsigned long long*, unsigned long long*);
+            extern long mpool_policy_entry_info_all(void*, struct mp_entry_info*,
+                                                    unsigned char (*)[32], unsigned);
+            rpc_mempool_hooks h; memset(&h,0,sizeof h);
+            h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
+            h.get = mpool_get; h.polstate = polstate;
+            h.pol_entry = mpool_policy_entry;
+            h.pol_entry_info = mpool_policy_entry_info;
+            if (bulk_on) h.pol_entry_info_all = mpool_policy_entry_info_all;
+            rpc_node_set_mempool(&h); }
+          printf("  (graph path: %s)\n", bulk_on ? "one-pass bulk" : "per-txid fallback");
+          rj_val* pv2 = rj_parse("[true]", 6); r = NULL;
+          rc = rpc_node_dispatch("getrawmempool", pv2, &r, &ec, &em);
+          ck("getrawmempool true -> an object with the pool in it", rc==1 && r && r->typ==RJ_OBJ && r->nmembers >= 2);
+          rj_val* pe = r ? rj_obj_get(r, pidhex) : NULL;
+          rj_val* ce = r ? rj_obj_get(r, cidhex) : NULL;
+          ck("the parent entry is present", pe != NULL);
+          ck("the child entry is present", ce != NULL);
+          ck("child carries depends -> its parent (CPFP clusters buildable from ONE call)",
+             ce && rj_obj_get(ce,"depends") && rj_obj_get(ce,"depends")->typ==RJ_ARR
+             && rj_obj_get(ce,"depends")->nitems==1
+             && rj_obj_get(ce,"depends")->items[0]->str
+             && !strcmp(rj_obj_get(ce,"depends")->items[0]->str, pidhex));
+          ck("parent carries spentby -> its child",
+             pe && rj_obj_get(pe,"spentby") && rj_obj_get(pe,"spentby")->typ==RJ_ARR
+             && rj_obj_get(pe,"spentby")->nitems==1
+             && rj_obj_get(pe,"spentby")->items[0]->str
+             && !strcmp(rj_obj_get(pe,"spentby")->items[0]->str, cidhex));
+          ck("child ancestorcount counts itself and the parent (2)",
+             ce && S(ce,"ancestorcount") && !strcmp(S(ce,"ancestorcount"),"2"));
+          ck("parent descendantcount counts itself and the child (2)",
+             pe && S(pe,"descendantcount") && !strcmp(S(pe,"descendantcount"),"2"));
+          { const char* FIELDS[] = {"vsize","weight","height","ancestorcount","ancestorsize",
+                                    "descendantcount","descendantsize","wtxid"};
+            int agree = 1;
+            const char* who[2] = { pidhex, cidhex };
+            for (int q=0;q<2;q++){
+                char one[128]; snprintf(one,sizeof one,"[\"%s\"]",who[q]);
+                rj_val* op = rj_parse(one, strlen(one)); rj_val* o1 = NULL;
+                if (rpc_node_dispatch("getmempoolentry", op, &o1, &ec, &em) == 1 && o1){
+                    rj_val* bulk = rj_obj_get(r, who[q]);
+                    for (unsigned f=0; f<sizeof FIELDS/sizeof *FIELDS; f++){
+                        const char* a = bulk ? S(bulk, FIELDS[f]) : NULL;
+                        const char* b = S(o1, FIELDS[f]);
+                        if (!a || !b || strcmp(a,b)){ agree = 0;
+                            printf("  (disagree on %s: bulk=%s single=%s)\n", FIELDS[f], a?a:"(none)", b?b:"(none)"); }
+                    }
+                }
+                rj_free(o1); rj_free(op);
+            }
+            ck("bulk getrawmempool agrees with getmempoolentry field for field", agree); }
+          rj_free(r); rj_free(pv2); }
 
         /* ---- prioritisetransaction / getprioritisedtransactions: deltas
          * accumulate, zero-sum entries erased, fees.modified = base + delta,
@@ -1028,8 +1180,27 @@ int main(void){
         ck("reject-reason is the worker's text",
            e0 && S(e0,"reject-reason") && !strcmp(S(e0,"reject-reason"), "min relay fee not met"));
         ck("no fees on a rejected tx", e0 && rj_obj_get(e0,"fees") == NULL);
-        ck("no vsize on a rejected tx", e0 && rj_obj_get(e0,"vsize") == NULL); }
+        ck("no vsize on a rejected tx", e0 && rj_obj_get(e0,"vsize") == NULL);
+        /* Core pushes reject-details = TxValidationState::ToString() next to
+         * every reject-reason (rpc/mempool.cpp), which with no debug message is
+         * the reason itself. Found missing by validation/rpc_field_parity.py
+         * once its case table was extended past the original 39 calls. */
+        ck("reject-details accompanies reject-reason",
+           e0 && S(e0,"reject-details") && !strcmp(S(e0,"reject-details"), "min relay fee not met")); }
       rj_free(r); rj_free(p);
+
+      /* ...except for missing-inputs, where Core takes the other branch and
+       * pushes the reason ALONE. */
+      g_tw_reason = "missing-inputs";
+      p = rj_parse(j, strlen(j));
+      r = NULL; rpc_node_dispatch("testmempoolaccept", p, &r, &ec, &em);
+      { rj_val* e0 = (r && r->nitems) ? r->items[0] : 0;
+        ck("missing-inputs still carries reject-reason",
+           e0 && S(e0,"reject-reason") && !strcmp(S(e0,"reject-reason"), "missing-inputs"));
+        ck("missing-inputs carries NO reject-details",
+           e0 && rj_obj_get(e0,"reject-details") == NULL); }
+      rj_free(r); rj_free(p);
+      g_tw_reason = "min relay fee not met";
       g_tw_verdict = 1;
 
       /* more than one tx: PACKAGE mode. The array must go to the worker as

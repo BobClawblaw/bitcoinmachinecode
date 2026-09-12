@@ -1,0 +1,70 @@
+# Where this node still differs from Core — issues to resolve (2026-09-09)
+
+An inventory taken after the 09-09 leg and compact-block work, extended the same night with the initial-sync rows from the run 19 measurements, ordered by measured payoff. Each row names what Core does, what this node does, the measured cost, and the fix. Rows move to "closed" with the PR that closes them. Consensus is not on this list: every consensus rule is proven against Core's vectors and the regtest differentials, and the two decided refusals (`assumeutxo`, testnet3) are documented in `FEATURE_GAPS.md`.
+
+## Open
+
+| # | area | Core | this node | cost measured | fix |
+|---|---|---|---|---|---|
+| 1 | mempool overlap with the network | a peer's mempool holds nearly every transaction a new block carries (blocktxn a few KB); every peer relays transactions to it, inbound included | production holds 4,000-9,000 entries; the first measured blocks on snapshot x (2026-09-10 04:53Z): 966,304 had 40% of its 2,093 transactions in the mempool and fetched 690 KB, 966,305 had 65% of 1,398 and fetched 460 KB; of the fetched, 98% and 87% were NEVER ANNOUNCED to us, the rest orphans (28, 16), announced-not-requested (0, 43), policy rejects (0, 3), unanswered requests (2, 0) | the miss is coverage, not policy: three to eight full-relay legs and inbound relay at 50% see a fraction of the network's transactions; a 460 KB blocktxn is still seven round trips under slow start | the announced-not-requested class is closed (#168: the request queue drains like Core's tracker); what remains is coverage -- inbound peers (the router forward on 8333, inboundrelaypercent=100 already set), then remeasure the never-announced share |
+
+| 2 | download occupancy | Core keeps up to 16 blocks in flight per peer and reassigns on completion, across 8 outbound full-relay peers it cannot exceed | one getdata carries a whole 40-block chunk, so the peer is never short of work inside a chunk; but a worker holds one peer and 8 workers is a configured cap, not an architectural one, with 112 peers sitting free | run 22, 2026-09-11, measured at 96% of the chain: aggregate pinned at 10.1 MB/s for 19 hours (99% of 6,157 samples in 9-11 MB/s) with per-worker rates 0.94-1.74 MB/s; sampling /proc/<pid>/io at 50 ms showed each worker BLOCKED IN THE SOCKET READ 11-20% of wall time, 332 gaps in 30 s, median 50 ms, none over 0.7 s. Workers burn 0.2-0.6% CPU, the applier averages 20% of one core, iowait is 0, the link is 2500 Mb/s with no shaping. The wait is the peer's, not ours | the node now REPORTS it (`pool_idle_pct` on `bmcgetdownloadinfo`, `idle=N%` per worker and `pool idle N%` on the [dlc] tick line) -- it previously printed "8/8 worker(s) active", which is true and useless for a worker holding a peer that cannot fill the pipe. `validation/download_worker_sweep.sh` then answers the question the register cannot: whether throughput rises with peer count (per-peer limited, add peers), stays flat at low idle (a shared WAN ceiling), or stays flat at high idle (peer selection, not peer count). The default stays 8 until that runs: 64 was adopted unmeasured once already |
+
+| 3 | UTXO set metadata after a fresh sync | Core's UTXO record carries the coin's height and coinbase flag, and muhash commits to both | the fresh parallel-download sync produces correct outpoints, values and scripts but at least one coin's height/coinbase metadata is wrong; the chain, txouts, bogosize and total_amount are all exactly right | run 22, 2026-09-11 at height 966,495 on the same block with the node FROZEN: txouts 165,203,925 = Core's, bogosize 12,942,059,030 = Core's, total_amount 20,082,569.88121624 = Core's, muhash `2f8a7959…` vs Core's `dcfaa870…`. Production, built by reindex, matches Core on BOTH its walk and its index, so the code is sound and the data is not. First time this comparison has ever completed: earlier runs timed out and an empty result compared equal to an empty oracle value | the next run carries `coinstatsindex=1` so the node records a muhash per height and the harness bisects the first divergent height against the oracle (`validation/fresh_ibd_run.sh`); from one block it is one coin, and `utxo_setinfo --override <txid>:<n>=<height>` confirms it offline against the archived store without a 20-hour sync. Full account: `docs/reports/2026-09-11-run22-muhash-divergence.md` |
+
+## Closed today
+
+| # | what | PR |
+|---|---|---|
+| ad | `getnetworkinfo` carries `bmc_build_commit`/`bmc_build_dirty`: Core has no build attestation over RPC and a monitor could not tell a fixed node from a broken one | #180 |
+| ac | `bmcgetdownloadinfo`: an RPC Core has no counterpart for, exposing the forked downloader's worker->peer->chunk->rate map and window state. Deliberate addition, not a gap | #179 |
+| ab | download concurrency costs a PROCESS per peer here (node_ibd_blocks_s blocks for a chunk and cannot multiplex); Core multiplexes 8 peers in one ThreadMessageHandler thread. Same peer count now, different mechanism | open (architectural) |
+| aa | a peer evicted for stalling the download window is remembered for the run, so the picker cannot hand it the same chunk again (run 20: fourteen times on one chunk) | #177 |
+| z | a v2 session exports with the message in flight (the 64 KB blob refused a headers reply and closed healthy legs on snapshot ab); the refusal names its size | #174 |
+| y | the reorg probe runs before the pass on an idle leg (it had probed the socket a pass child was reading: every leg reset within seconds on snapshot aa); no pass runs inline; eight dial helpers | #172 |
+| x | a leg's pass runs in a helper; the sweep, pongs, relay and pushes continue while a block is fetched | #169 |
+| w | the transaction request queue drains as Core's does (announced-not-requested closed) | #168 |
+| v | a BIP324 session travels with its socket across the dial helper's fork (export/import); helper-dialed legs are v2 again where advertised | #167 |
+| u | helper-dialed legs speak v1 (the v2 state stays in the child); the worker creates the dial memory (it was null on production since 09-09: "0 min" backoffs) | #163 |
+| t | the block filter index and the address history repair themselves in the daemon (the coinstats supervisor as a module, one instance per index) | #162 |
+| s | the live coin counter after a crash under the bulk memtable: the ghost rollback restores only what is gone (a lookup before the put) | #162 |
+| r | the legs stay served through a reorg handoff (the sweep runs inside the parallel download); helpers bounded by the span | #162 |
+| q | every outbound dial runs in a helper (re-dials fill their slot when they land, the top-up dials one at a time); the per-block mempool-overlap line and the missing-transaction classifier (row 5's measurement) | #161 |
+| p | high-bandwidth compact blocks from the three most recent block sources, pushed blocks stored from the sweep, the apply right after a store | #159 |
+| o | sendheaders after the handshake; announcements (inv, pushed headers) drive a leg's pass; no polling for headers between announcements (30 s safety net) | #159 |
+| n | the parallel download takes Core's shape: the window scales and anchors to the connected tip, the window's tail evicts stallers, replacement only when a free peer exists. Peers downloading at once defaults to 8, Core's MAX_OUTBOUND_FULL_RELAY_CONNECTIONS (was 64, never measured); the ceiling stays 64 for a fatter link | #157, #178 |
+| m | the coinstats index folds per block during a bulk sync through the fold worker (the walk-at-caught-up deferral is gone; history rows from block 0) | #156 |
+| l | bulk mode checkpoints every 1,024 blocks or 60 s, a bounded pass carries its batch and never downshifts the memtable | #155 |
+| k | a background merge waits while the apply is behind and yields when it runs | #154 |
+| j | a fresh sync uses the dbcache: an empty set takes the bulk memtable | #153 |
+| i | a block another leg just stored ends the pass well; the fetch gate skips hashes the store holds | #152 |
+| g | one request per block across the legs (`daemon/inflight.c`, the sync loop's fetch gate) | #150 |
+| h | pings every 2 min per leg, 20-minute timeout, the round trip recorded | #150 |
+| a | compact-block receive completed nothing: `blocktxn` matched as `block` | #145 |
+| b | a bad reconstruction cost the block: Core's full-block fallback, `bmc.cmpctrecv` removed | #148 |
+| c | every close named (`ours/<reason>` / `theirs`), failed dials remembered with backoff, the streak per peer, pongs within a pass | #143, #146, #149 |
+| d | the version message: wall-clock timestamp, random nonce, our port, our tip | #144 |
+| e | chain selection like Core's: handoff, header mirror, fork tree, leg gate; the announced-height rule (median) | #137, #139, #140 |
+| f | no consensus caps where Core has none; BIP30 originals | #129, #131, #133 |
+
+---
+
+## `getchainstates`: `coins_db_cache_bytes` and `coins_tip_cache_bytes` are omitted
+
+Found 2026-09-12 by `validation/rpc_field_parity.py` once its case table was
+extended past the original 39 calls.
+
+Core reports two cache sizes per chainstate: `coins_db_cache_bytes`, the
+LevelDB block cache, and `coins_tip_cache_bytes`, the in-memory `CCoinsViewCache`
+budget. **This node has neither.** Its UTXO set is an LSM with its own sizing —
+a memtable, run files and a blob map — and no structure in it is the opposite
+number of either field.
+
+The fields are omitted rather than filled. A number here would describe a cache
+that does not exist, and a caller reading `coins_tip_cache_bytes` to reason
+about memory would be reasoning about the wrong engine entirely. This follows
+the rule that a Core-named key must carry Core's exact semantics: where the
+semantics cannot be honoured, the key is absent, not approximated.
+
+A caller wanting this node's cache sizing should read `bmcgetdownloadinfo` and
+the `dbcache` setting, which describe what is actually allocated.

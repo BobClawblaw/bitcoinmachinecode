@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include "../daemon/node_config.h"
 #include <unistd.h>
 #include <sys/socket.h>
@@ -131,6 +132,21 @@ static int read_n(int fd, u8* buf, int n){
 }
 
 /* read one framed message from the peer end; returns payload length or -1 */
+/* 2026-09-10: recorders for the block-announcement hooks (scenario 9) */
+static int rec_n_inv, rec_n_hdr, rec_n_cmpct, rec_n_bt, rec_n_blk; static u8 rec_inv_hash[32];
+static unsigned long rec_hdr_n, rec_cmpct_len, rec_bt_len, rec_blk_len; static int rec_hdr_first, rec_hdr_79;
+static char cmd9[13]; static u8 pl9[4096];
+static void rec_block_inv(int fd, const u8* h){ (void)fd; rec_n_inv++; memcpy(rec_inv_hash, h, 32); }
+static int rec_n_sc; static unsigned long rec_sc_ver;
+static void rec_sendcmpct(int fd, const u8* p, unsigned long n){ (void)fd; rec_n_sc++; rec_sc_ver = n >= 9 ? p[1] : 0; }
+static void rec_headers(int fd, const u8* hd, unsigned long n){ (void)fd; rec_n_hdr++; rec_hdr_n = n; rec_hdr_first = hd[0]; rec_hdr_79 = hd[79]; }
+static long rec_cmpct(int fd, const u8* p, unsigned long n){ (void)fd; (void)p; rec_n_cmpct++; rec_cmpct_len = n; return 0; }
+static long rec_blocktxn(int fd, const u8* p, unsigned long n){ (void)fd; (void)p; rec_n_bt++; rec_bt_len = n; return 0; }
+static long rec_block(int fd, const u8* p, unsigned long n){ (void)fd; (void)p; rec_n_blk++; rec_blk_len = n; return 0; }
+static int read_msg(int fd, char cmd_out[13], u8* pl, int cap);
+static int read_msg_nb(int fd, char cmd_out[13], u8* pl, int cap){   /* -1 when nothing is buffered */
+    struct pollfd pf = { fd, POLLIN, 0 }; if (poll(&pf, 1, 20) <= 0) return -1; return read_msg(fd, cmd_out, pl, cap);
+}
 static int read_msg(int fd, char cmd_out[13], u8* pl, int cap){
     u8 hdr[24];
     if (read_n(fd, hdr, 24) != 24) return -1;
@@ -900,6 +916,69 @@ int main(void){
     }
     close(spX[0]); close(spX[1]);
 
+    printf("== 9: block announcements and pushed blocks reach the daemon's hooks (2026-09-10, Core's shape at the tip) ==\n");
+    {
+        extern void (*txrelay_on_block_inv)(int, const u8*); extern void (*txrelay_on_headers)(int, const u8*, unsigned long);
+        extern long (*txrelay_on_cmpctblock)(int, const u8*, unsigned long); extern long (*txrelay_on_blocktxn)(int, const u8*, unsigned long); extern long (*txrelay_on_block)(int, const u8*, unsigned long);
+        extern long txrelay_poll_block_only_leg(int fd);
+        txrelay_on_block_inv = rec_block_inv; txrelay_on_headers = rec_headers; txrelay_on_cmpctblock = rec_cmpct; txrelay_on_blocktxn = rec_blocktxn; txrelay_on_block = rec_block;
+        { extern void (*txrelay_on_sendcmpct)(int, const u8*, unsigned long); txrelay_on_sendcmpct = rec_sendcmpct; }
+        int sp[2]; ck("leg pair for the announcements", socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);   /* the early pair is closed by now */
+        u8 bh[32]; for (int i = 0; i < 32; i++) bh[i] = (u8)(0xA0 + i);
+        /* inv: one tx entry (ignored by the block scan) and one MSG_BLOCK entry */
+        u8 inv[1 + 2*36]; inv[0] = 2; memset(inv + 1, 0, 72);
+        inv[1] = 1; memcpy(inv + 5, txid, 32);                  /* MSG_TX (already in the pool: not fetched) */
+        inv[37] = 2; memcpy(inv + 41, bh, 32);                  /* MSG_BLOCK */
+        p2p_write(sp[1], "inv", 3, inv, sizeof inv);
+        /* headers: count 1, an 80-byte header, the 0 tx count */
+        u8 hdrs[1 + 81]; hdrs[0] = 1; for (int i = 0; i < 80; i++) hdrs[1 + i] = (u8)i; hdrs[81] = 0;
+        p2p_write(sp[1], "headers", 7, hdrs, sizeof hdrs);
+        u8 cb[100]; memset(cb, 0x11, sizeof cb); p2p_write(sp[1], "cmpctblock", 10, cb, sizeof cb);
+        u8 bt[40];  memset(bt, 0x22, sizeof bt); p2p_write(sp[1], "blocktxn", 8, bt, sizeof bt);
+        u8 bk[90];  memset(bk, 0x33, sizeof bk); p2p_write(sp[1], "block", 5, bk, sizeof bk);
+        u8 sc[9] = {0, 2,0,0,0,0,0,0,0}; p2p_write(sp[1], "sendcmpct", 9, sc, 9);
+        rec_n_inv = rec_n_hdr = rec_n_cmpct = rec_n_bt = rec_n_blk = 0;
+        txrelay_poll_leg(sp[0], mp_area, 50);
+        ck("the block inv reached the hook once, with the announced hash (the tx entry did not)", rec_n_inv == 1 && memcmp(rec_inv_hash, bh, 32) == 0);
+        ck("the pushed headers reached the hook: one 81-byte entry, header bytes intact", rec_n_hdr == 1 && rec_hdr_n == 1 && rec_hdr_first == 0 && rec_hdr_79 == 79);
+        ck("cmpctblock reached its hook with its length", rec_n_cmpct == 1 && rec_cmpct_len == 100);
+        ck("blocktxn reached its hook (not swallowed as a block: the terminator compare)", rec_n_bt == 1 && rec_bt_len == 40);
+        ck("a pushed block reached its hook", rec_n_blk == 1 && rec_blk_len == 90);
+        ck("the peer's sendcmpct reached its hook (the sweep used to swallow it: full blocks since #159)", rec_n_sc == 1 && rec_sc_ver == 2);
+        /* the block-relay-only sweep: ping answered, a block inv acted on, a tx inv ignored */
+        u8 nonce[8] = {9,8,7,6,5,4,3,2}; p2p_write(sp[1], "ping", 4, nonce, 8);
+        p2p_write(sp[1], "inv", 3, inv, sizeof inv);
+        rec_n_inv = 0;
+        long seen = txrelay_poll_block_only_leg(sp[0]);
+        ck("block-only sweep read both buffered messages", seen == 2);
+        ck("...answered the ping", read_msg(sp[1], cmd9, pl9, sizeof pl9) == 8 && strcmp(cmd9, "pong") == 0 && memcmp(pl9, nonce, 8) == 0);
+        ck("...and acted on the block inv only (no getdata for the tx entry)", rec_n_inv == 1 && read_msg_nb(sp[1], cmd9, pl9, sizeof pl9) < 0);
+        txrelay_on_block_inv = 0; txrelay_on_headers = 0; txrelay_on_cmpctblock = 0; txrelay_on_blocktxn = 0; txrelay_on_block = 0;
+        close(sp[0]); close(sp[1]);
+    }
+    printf("== 10: announced but not requested -- the queue drains on the next poll (2026-09-10, CORE_DIVERGENCES row 2) ==\n");
+    /* Core's TxRequestTracker keeps every announcement and requests as the
+     * in-flight budget frees up. Ours requested at most TXR_MAX_REQ per pass
+     * and left the rest announced-but-never-requested (106 of a block's
+     * missing transactions on production, 2026-09-10 05:12Z). */
+    {
+        int sp[2]; ck("leg pair for the drain", socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+        enum { NINV = 40 };
+        static u8 inv[1 + NINV*36]; inv[0] = NINV;
+        for (int i = 0; i < NINV; i++){ u8* e = inv + 1 + i*36; e[0] = 1; e[1] = e[2] = e[3] = 0; for (int j = 0; j < 32; j++) e[4 + j] = (u8)(0xC0 + i + j * 3); }
+        p2p_write(sp[1], "inv", 3, inv, sizeof inv);
+        txrelay_poll_leg(sp[0], mp_area, 50);
+        char cmd[13]; static u8 pl[8192];
+        int plen = read_msg(sp[1], cmd, pl, sizeof pl);
+        ck("the first pass requests TXR_MAX_REQ (32) of the 40", plen == 1 + 32*36 && !strcmp(cmd, "getdata") && pl[0] == 32);
+        ck("...and nothing else yet", no_bytes_pending(sp[1]));
+        txrelay_poll_leg(sp[0], mp_area, 50);            /* nothing buffered: the drain alone */
+        plen = read_msg_nb(sp[1], cmd, pl, sizeof pl);
+        ck("the next poll requests the 8 announced-but-not-requested (the drain)", plen == 1 + 8*36 && !strcmp(cmd, "getdata") && pl[0] == 8);
+        txrelay_poll_leg(sp[0], mp_area, 50);
+        ck("...and a third poll requests nothing more", read_msg_nb(sp[1], cmd, pl, sizeof pl) < 0);
+        close(sp[0]); close(sp[1]);
+    }
     printf("\n%s (%d checks, %d failures)\n", g_fails==0 ? "ALL PASS" : "SOME FAILED", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

@@ -1,0 +1,9 @@
+# 2026-09-10 — Helper-dialed legs speak v1, and the worker finally has a dial memory
+
+What the first ten minutes of snapshot u showed. Production was rolled back to t within twelve minutes; nothing was lost but time.
+
+**Legs installed by a background dial died within a second.** Every "leg replaced ... [background dial]" was followed by "connection closed theirs after 0s". The dial helper runs the whole handshake in a forked child and hands the socket back over a socketpair; a peer that advertises BIP324 gets a v2 handshake, and the v2 cipher state lives in the process that ran it. The parent then wrote its first message, sendheaders, through the v1 path: garbage to the peer, which hung up. The anonymity-network legs took this path before and got away with it because their peers were v1. Helpers now dial v1 only (`g_in_dial_helper` turns the v2 gate off). This is a divergence from Core, which dials v2 wherever it is advertised, and it is on the inventory: the fix is to serialise the transport state with the fd, and the state holds buffers and a cipher, so it is its own batch.
+
+**The worker had no dial memory.** Every failure line since the leg-lifecycle batch read "not dialled again for 0 min", and the same dead host (103.124.165.160, then 92.105.49.68) was dialled every thirty seconds. The memory was created inside the parallel downloader only; the worker's legs, the re-dials and the top-up ran with a null table, and the backoff that was measured and designed on 2026-09-09 never applied on production. The worker creates the table at start now (MAP_SHARED, so the helpers' notes land in it).
+
+**Verified:** `test_dialhelper` (the helper path unchanged for v1). On production after the restart: helper-dialed legs surviving past a minute, failure lines with a backoff in minutes, and the same host not re-dialled inside it.

@@ -1803,9 +1803,20 @@ utxo_lsm_del:
     mov  rsi, rdi                 ; key = &tomb_buf[old_index] (just-written)
     mov  rdi, r12                  ; lst
     call mac_tomb_hash_probe
+    ; 2026-09-09 (bench run 18): a key already in this generation's list --
+    ; del K, put K, del K, the shape of a stale block's spend, its unapply and
+    ; the replacement block's spend -- was appended AGAIN, and mac_flush wrote
+    ; both: two DEL records for one key in one run. The merge then handed the
+    ; key to two iterations and a PUSH from a newer run was followed into the
+    ; output by the stale DEL; the sparse index pointed at the DEL and the
+    ; point lookup called a live coin spent, invalidating a valid block. One
+    ; tombstone per key per generation: the probe found its slot, keep it.
+    cmp  qword [rax], -1
+    jne  .ld_tomb_known             ; already listed this generation
     mov  rdx, [r12+80]              ; old_index (tomb_n, still pre-increment)
     mov  [rax], rdx
     inc  qword [r12+80]
+.ld_tomb_known:
     inc  qword [r12+40]
     dec  qword [r12+88]
     xor  r15d, r15d
@@ -3931,6 +3942,7 @@ mac_lsm_recount:
     call mac_compact_read_rec
     cmp  eax, -1
     je   .rc_err_cleanup
+    jmp  .rc_adv_loop               ; 2026-09-09: past every copy of the key in this slot (see .cc_adv_reread)
 .rc_adv_next:
     inc  qword [rbp-0x40]
     jmp  .rc_adv_loop
@@ -4607,6 +4619,12 @@ utxo_lsm_compact:
     call mac_compact_read_rec
     cmp  eax, -1
     je   .cc_err_close
+    ; 2026-09-09: re-examine the SAME slot -- an input that holds the key
+    ; twice (a run written before utxo_lsm_del deduplicated its tombstones)
+    ; must be walked past every copy now, or the next iteration emits the key
+    ; again and the output inherits the duplicate (bench run 18: 11,362 of
+    ; them in one run, one of which spent a live coin).
+    jmp  .cc_adv_loop
 .cc_adv_next:
     inc  qword [rbp-0x78]
     jmp  .cc_adv_loop
