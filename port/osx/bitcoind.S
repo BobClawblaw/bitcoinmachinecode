@@ -1970,3 +1970,22 @@ _g_cmpct_hook_cmpct:
 _g_cmpct_hook_blocktxn:
 	.quad 0
 
+/* 2026-09-12 merge from main: two more hook slots and the version-truth
+ * data (bitcoind.asm ~line 2335). main.c sets the hooks at boot and
+ * version_tell_the_truth() writes start_height + the big-endian port;
+ * with no asm caller the defaults below are the x86 defaults. */
+	.align 3
+	.globl _g_cmpct_hook_fallback
+_g_cmpct_hook_fallback:
+	.quad 0
+	.globl _g_block_fetch_hook
+_g_block_fetch_hook:
+	.quad 0
+	.align 2
+	.globl _node_start_height
+_node_start_height:
+	.long 0
+	.globl _node_listen_port_be
+_node_listen_port_be:
+	.short 0x8d20
+

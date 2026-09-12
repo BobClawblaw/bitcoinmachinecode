@@ -44,7 +44,8 @@ CSRC=(
   daemon/txann.c daemon/inbound_evict.c daemon/anchors.c daemon/archive_seed.c daemon/ibd_pipeline.c
   daemon/hdr_lowwork.c daemon/invalid_set.c daemon/cmpct_recv.c daemon/banlist.c
   daemon/addrbook.c daemon/addr_hist.c daemon/netaddr.c
-  daemon/asmap.c daemon/dialer.c
+  daemon/asmap.c daemon/dialer.c daemon/dial_memory.c daemon/inflight.c
+  daemon/index_repair.c daemon/hdr_tree.c
   daemon/socks5.c daemon/torcontrol.c daemon/serve_hdrctx.c bitcoin_sha3.c daemon/i2psam.c daemon/net6.c
 
   daemon/ctl_dial.c
