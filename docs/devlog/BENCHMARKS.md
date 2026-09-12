@@ -38,6 +38,7 @@ are not doing the same work it says that instead of printing a ratio.
 - [Tier 1 — primitives, directly comparable](#tier-1--primitives-directly-comparable)
 - [Tier 2 — components, comparable with stated caveats](#tier-2--components-comparable-with-stated-caveats)
 - [Tier 3 — end-to-end full-verification replay](#tier-3--end-to-end-full-verification-replay)
+- [Tier 4 — network IBD against a Core oracle](#tier-4--network-ibd-against-a-core-oracle)
 - [Where we are slower](#where-we-are-slower)
 - [What could not be measured, and why](#what-could-not-be-measured-and-why)
 - [Bugs found while building this suite](#bugs-found-while-building-this-suite)
@@ -632,6 +633,69 @@ proportion is exactly why H must be large.
 5. Record everything `check` printed, both `Command-line arg:` blocks, and the
    asserted post-conditions. Publish the differences list above alongside the
    ratio, or the ratio means nothing.
+
+---
+
+## Tier 4 — network IBD against a Core oracle
+
+Tier 3 above replays a bounded height range off local disk with no network on
+either side. That is the clean comparison, and it is still the one that has not
+been run. **Tier 4 is different work**: a fresh full mainnet initial block
+download over the public network, start to tip, measured against Bitcoin Core
+v31.1 doing the same thing on the same box. It answers the question people
+actually ask — *how long does it take to sync* — at the cost of a variable no
+harness controls, which is the peer set.
+
+Each run below has a standalone report. This table is the index; the reports
+carry the segment tables, the configuration and the defect analysis.
+
+| run | date | node commit | blocks | wall clock | capstone | report |
+|---|---|---|---|---|---|---|
+| 22 | 2026-09-11 | `4a4872cf` | 966,369 | 20h 08m | **FAIL** — muhash differs from oracle at 966,494 | [public report](../reports/2026-09-11-ibd-vs-core.md) · [bbcode](../reports/2026-09-11-ibd-vs-core.bbcode) · [defect writeup](../reports/2026-09-11-run22-muhash-divergence.md) |
+| 23 | 2026-09-12 | `8bc638f9` | 966,674 | 19h 05m | **FAIL** — our side returned no usable hash | not yet written |
+
+**Run 22** is the first comparison run at 8 download peers on both sides. Core's
+block-download concurrency is not configurable — `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`
+pins it at 8 — and every earlier run here put the assembly node at 16 to 64
+against that 8, which compares nothing. Read the segment table in the report
+before quoting the total: the two are level to height 500,000 and the assembly
+node is then 8 to 12 percent *slower* in every segment but one. The hour it
+finished ahead is a 138-minute stall on Core's side, not our throughput.
+
+**Run 23** carried `coinstatsindex=1` and reached the oracle's tip exactly. Its
+capstone did not fail the way run 22's did — it never produced a hash to compare,
+so the run proves the chain and says nothing about the UTXO set. The empty-hash
+case is now reported as FAIL rather than silently passing, which is itself new;
+see the note on the capstone below.
+
+### The capstone had never run before 2026-09-11
+
+The muhash comparison is the post-condition that makes an IBD run mean anything:
+the chain being identical block-for-block does not establish that the UTXO set
+derived from it is. Before run 22 the harness timed out on its own walk, compared
+an empty string against an empty string, found them equal, and printed nothing.
+**Every "passing" IBD run before 2026-09-11 passed a capstone that never
+executed.** Do not cite one as evidence of UTXO correctness.
+
+### Fairness controls, and one that was broken
+
+| control | how it is enforced |
+|---|---|
+| same box, same disk, same cache | both `dbcache=8192` on the same SSD, runs never concurrent |
+| same download concurrency | 8 peers a side; ours via `bmc.catchupworkers`, Core's is fixed at 8 |
+| fresh datadir | no `assumeutxo`, no pruning, no reused chainstate |
+| same scheduling priority | `nice -n 10` on both, **default I/O class on both** |
+| SSD or NVMe only | the platter is archival; never a bench or production datadir |
+| tip agreement | every run's tip is checked by hash against the oracle, not by height |
+
+The scheduling row was wrong until 2026-09-12. The Core runner launched its
+daemon under `ionice -c3` — the idle I/O class, meaning Core got the disk only
+when nothing else wanted it — while the bmc harness used `nice -n 10` and no
+ionice at all. On a disk-bound sync, sharing a box with a live production node,
+that is a handicap rather than a control. **The 21h 11m Core figure quoted in the
+run 22 report was measured under it**, so the margin in that report is not safe
+to quote until a Core baseline run without the handicap replaces it. One is in
+flight as of 2026-09-12.
 
 ---
 
