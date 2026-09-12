@@ -2911,6 +2911,102 @@ long mpool_policy_set_sigops(void* st, const unsigned char txid[32], unsigned in
     return 0;
 }
 
+/* ---- the WHOLE graph in one pass -----------------------------------------
+ * mpool_policy_entry_info answers for ONE transaction, and every question it
+ * asks costs a full scan of the node array: the self lookup, the spentby
+ * sweep, and a fresh sweep per node popped during the descendant walk. That
+ * is the right shape for getmempoolentry, which is called for one txid.
+ *
+ * Calling it once per entry, as a verbose getrawmempool must, makes the whole
+ * call O(n^2). Measured 2026-09-11 on a live pool: 13,343 entries took 7.6 s,
+ * against Bitcoin Core's 0.38 s for 22,992 -- roughly 33x per entry. On a node
+ * whose RPC server handles one request at a time, that is an outage for every
+ * other consumer, which is how a previous gettxout change starved this same
+ * server.
+ *
+ * This fills every entry in one pass instead. The children of each node are
+ * indexed once (counting sort over the parent edges), so both sweeps become
+ * walks of an adjacency list and the closures are bounded by MPE_MAX_SET.
+ * Returns the number of entries written, or -1 on a bad state / allocation
+ * failure, in which case the caller falls back to the per-entry path.
+ *
+ * out[i] corresponds to ids[i]; the caller matches by txid. Caller holds
+ * mp_lock, exactly as for the single-entry call. */
+long mpool_policy_entry_info_all(void* st, mp_entry_info* out, unsigned char (*ids)[32], uint32_t max)
+{
+    if (!st || *(uint32_t*)st != MPOL_MAGIC || !out || !ids) return -1;
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    if (n > max) return -1;
+    if (n == 0) return 0;
+
+    /* children index: head[i] is the first child slot, nxt[] chains the rest */
+    uint32_t* head = (uint32_t*)malloc((size_t)n * sizeof *head);
+    uint32_t  edges = 0;
+    for (uint32_t i=0;i<n;i++) edges += t[i].n_parents;
+    uint32_t* nxt  = (uint32_t*)malloc((size_t)(edges?edges:1) * sizeof *nxt);
+    uint32_t* chld = (uint32_t*)malloc((size_t)(edges?edges:1) * sizeof *chld);
+    if (!head || !nxt || !chld){ free(head); free(nxt); free(chld); return -1; }
+    for (uint32_t i=0;i<n;i++) head[i] = 0xFFFFFFFFu;
+    uint32_t e = 0;
+    for (uint32_t i=0;i<n;i++)
+        for (uint32_t k=0;k<t[i].n_parents;k++){
+            uint32_t p = mpol_par_at(st, &t[i], k);
+            if (p >= n) continue;
+            chld[e] = i; nxt[e] = head[p]; head[p] = e; e++;
+        }
+
+    for (uint32_t s=0;s<n;s++){
+        mp_entry_info* o = &out[s];
+        memcpy(ids[s], t[s].txid, 32);
+        memset(o, 0, sizeof *o);
+        o->fee = t[s].fee; o->size = t[s].size; o->sigop_cost = t[s].sigop_cost;
+
+        for (uint32_t k=0; k<t[s].n_parents && o->n_depends<MPE_MAX_SET; k++){
+            uint32_t p = mpol_par_at(st, &t[s], k);
+            if (p >= n) continue;
+            if (!mpe_seen(o->depends, o->n_depends, t[p].txid))
+                memcpy(o->depends[o->n_depends++], t[p].txid, 32);
+        }
+        for (uint32_t c = head[s]; c != 0xFFFFFFFFu && o->n_spentby<MPE_MAX_SET; c = nxt[c]){
+            uint32_t i = chld[c];
+            if (!mpe_seen(o->spentby, o->n_spentby, t[i].txid))
+                memcpy(o->spentby[o->n_spentby++], t[i].txid, 32);
+        }
+        { uint32_t stack[MPE_MAX_SET]; int sp=0;
+          memcpy(o->anc[o->n_anc++], t[s].txid, 32);
+          o->anc_fee = t[s].fee; o->anc_size = t[s].size;
+          stack[sp++] = s;
+          while (sp > 0){
+              uint32_t cur = stack[--sp];
+              for (uint32_t k=0; k<t[cur].n_parents; k++){
+                  uint32_t p = mpol_par_at(st, &t[cur], k);
+                  if (p >= n || mpe_seen(o->anc, o->n_anc, t[p].txid)) continue;
+                  if (o->n_anc >= MPE_MAX_SET) break;
+                  memcpy(o->anc[o->n_anc++], t[p].txid, 32);
+                  o->anc_fee += t[p].fee; o->anc_size += t[p].size;
+                  if (sp < MPE_MAX_SET) stack[sp++] = p;
+              }
+          } }
+        { uint32_t stack[MPE_MAX_SET]; int sp=0;
+          memcpy(o->desc[o->n_desc++], t[s].txid, 32); o->desc_fee = t[s].fee;
+          stack[sp++] = s;
+          while (sp > 0){
+              uint32_t cur = stack[--sp];
+              for (uint32_t c = head[cur]; c != 0xFFFFFFFFu; c = nxt[c]){
+                  uint32_t i = chld[c];
+                  if (mpe_seen(o->desc, o->n_desc, t[i].txid)) continue;
+                  if (o->n_desc >= MPE_MAX_SET) break;
+                  memcpy(o->desc[o->n_desc++], t[i].txid, 32);
+                  o->desc_fee += t[i].fee;
+                  if (sp < MPE_MAX_SET) stack[sp++] = i;
+              }
+          } }
+    }
+    free(head); free(nxt); free(chld);
+    return (long)n;
+}
+
 long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_info* out){
     if (!st || *(uint32_t*)st != MPOL_MAGIC || !out) return 0;
     mpol_node* t = mpol_nodes_base(st);

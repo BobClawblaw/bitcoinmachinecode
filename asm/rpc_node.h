@@ -446,6 +446,10 @@ typedef struct {
                       unsigned long long*, unsigned long long*);/* fee/size */
     long (*pol_entry_info)(void*, const unsigned char*,
                            struct mp_entry_info*);              /* full graph */
+    /* every entry's graph in ONE pass: the per-txid call above costs a full
+       scan of the node array, so asking it n times is O(n^2). Returns the
+       count written, or -1 to say "fall back to the per-txid call". */
+    long (*pol_entry_info_all)(void*, struct mp_entry_info*, unsigned char (*)[32], unsigned);
     long (*estimate)(void*, unsigned long long*,
                      unsigned long long*);                      /* fee EMA+samples */
     void (*sha256d)(unsigned char*, const void*, unsigned long);/* for wtxid */

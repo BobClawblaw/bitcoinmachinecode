@@ -1164,11 +1164,73 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
     return 1;
 }
 
+/* ---- vsize cache for the BULK path ---------------------------------------
+ * mpe_entry_obj sums ancestor and descendant vsizes by looking up each set
+ * member in the pool and PARSING IT. For one transaction that is nothing. For
+ * the whole pool it is quadratic in the cluster size: measured 2026-09-11 on
+ * 15,302 live entries, the widened getrawmempool took 8.38 s, against Core's
+ * 0.38 s for 22,992 -- about 33x per entry. On a node whose RPC server handles
+ * one request at a time, an 8 s call is an outage for every other consumer.
+ *
+ * The fix is to parse each transaction ONCE per call. The bulk path walks the
+ * pool anyway, so it records (txid, vsize) as it goes, sorts by txid, and the
+ * set sums become binary searches. Single-entry getmempoolentry passes no
+ * cache and keeps the old direct path, which is cheaper for one lookup. */
+typedef struct { unsigned char id[32]; unsigned long vs; long inf; } mpe_vs_t;
+static mpe_vs_t* g_mpe_vs; static unsigned long g_mpe_vs_n;
+/* the whole graph for this call, filled once by pol_entry_info_all; indexed
+   by the same sorted txid order as the vsize cache above */
+static mp_entry_info* g_mpe_inf; static unsigned char (*g_mpe_inf_id)[32]; static long g_mpe_inf_n;
+static int mpe_vs_cmp(const void* a, const void* b){
+    return memcmp(((const mpe_vs_t*)a)->id, ((const mpe_vs_t*)b)->id, 32);
+}
+/* the member's vsize, or 0 when it is no longer in the pool -- the same
+ * "filtered to txs still in the pool" rule the direct path applies */
+static long mpe_vs_find(const unsigned char id[32]){
+    unsigned long lo = 0, hi = g_mpe_vs_n;
+    while (lo < hi){
+        unsigned long mid = lo + (hi - lo) / 2;
+        int c = memcmp(g_mpe_vs[mid].id, id, 32);
+        if (c == 0) return (long)mid;
+        if (c < 0) lo = mid + 1; else hi = mid;
+    }
+    return -1;
+}
+static long mpe_inf_lookup(const unsigned char id[32]){
+    long k = mpe_vs_find(id);
+    return (k >= 0 && g_mpe_inf) ? g_mpe_vs[k].inf : -1;
+}
+static unsigned long mpe_vs_lookup(const unsigned char id[32]){
+    long k = mpe_vs_find(id);
+    return k >= 0 ? g_mpe_vs[k].vs : 0;
+}
+
+/* the per-entry object, shared by getmempoolentry and verbose getrawmempool */
+static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len);
 static int cmd_getrawmempool(const rj_val* params, rj_val** res){
     /* verbose (params[0]==true) -> object keyed by txid; else -> array of
-     * txids (display byte order). Verbose entries carry the fields this node
-     * genuinely tracks: vsize, weight, time (0 if unknown), and fees.base;
-     * ancestor/descendant aggregates come with getmempoolentry (next slice). */
+     * txids (display byte order).
+     *
+     * 2026-09-11: verbose entries are now the SAME object getmempoolentry
+     * returns, which is what Core does. They used to carry four fields --
+     * vsize, weight, time, fees.base -- because this was landed as a first
+     * slice whose comment said the aggregates would come with
+     * getmempoolentry. They did: the accept-path policy registry has held the
+     * real ancestor/descendant graph ever since, and getmempoolentry has been
+     * serving `depends`, `spentby`, ancestorcount/size and descendantcount/size
+     * from it. Nobody came back to widen the bulk call.
+     *
+     * That gap was load-bearing for a consumer. Building CPFP clusters over
+     * the whole pool needs the graph for every entry, and the only way to get
+     * it was one getmempoolentry per transaction -- 19,475 calls against an
+     * RPC server that handles one request at a time. So bmcmonitor could only
+     * show ancestor packages for the block template, via getblocktemplate's
+     * own `depends`, and said so rather than pretending otherwise.
+     *
+     * Still absent, and deliberately: `vsize_adjusted` (no -bytespersigop
+     * concept anywhere in this RPC surface -- see the getrawtransaction note),
+     * and `chunkweight`/`vsize_bip141`, which are cluster-mempool fields from
+     * Core master rather than the v31.1 release this node tracks. */
     int verbose = 0;
     if (params && params->typ == RJ_ARR && params->nitems >= 1){
         const rj_val* v = params->items[0];
@@ -1179,24 +1241,49 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
         static const char* HEXD = "0123456789abcdef";
         mpl();
         unsigned long n = mp_slot_count(g_mph.mp);
+        /* ONE parse per transaction for the whole call: fill the vsize cache
+         * on a first pass, so the ancestor/descendant sums below are binary
+         * searches instead of a pool lookup plus a full parse per set member.
+         * If the allocation fails the cache stays null and every entry takes
+         * the slower direct path -- correct either way, just slower. */
+        if (verbose && n){
+            g_mpe_vs = (mpe_vs_t*)malloc((size_t)n * sizeof *g_mpe_vs);
+            g_mpe_vs_n = 0;
+            if (g_mpe_vs){
+                for (unsigned long i=0;i<n;i++){ mp_ent e2;
+                    if (mp_slot(g_mph.mp,i,&e2) != 1) continue;
+                    memcpy(g_mpe_vs[g_mpe_vs_n].id, e2.txid, 32);
+                    g_mpe_vs[g_mpe_vs_n].vs = (mp_tx_weight(e2.tx, e2.len)+3)/4;
+                    g_mpe_vs[g_mpe_vs_n].inf = -1;
+                    g_mpe_vs_n++;
+                }
+                /* the whole graph in one pass; -1 means fall back per entry */
+                g_mpe_inf_n = -1;
+                if (g_mph.polstate && g_mph.pol_entry_info_all){
+                    g_mpe_inf = (mp_entry_info*)malloc((size_t)n * sizeof *g_mpe_inf);
+                    g_mpe_inf_id = (unsigned char (*)[32])malloc((size_t)n * 32);
+                    if (g_mpe_inf && g_mpe_inf_id)
+                        g_mpe_inf_n = g_mph.pol_entry_info_all(g_mph.polstate, g_mpe_inf, g_mpe_inf_id, (unsigned)n);
+                    if (g_mpe_inf_n < 0){ free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf=0; g_mpe_inf_id=0; }
+                }
+                qsort(g_mpe_vs, g_mpe_vs_n, sizeof *g_mpe_vs, mpe_vs_cmp);
+                for (long q=0;q<g_mpe_inf_n;q++){
+                    long k = mpe_vs_find(g_mpe_inf_id[q]);
+                    if (k >= 0) g_mpe_vs[k].inf = q;
+                }
+            }
+        }
         for (unsigned long i=0;i<n;i++){ mp_ent e;
             if (mp_slot(g_mph.mp,i,&e) != 1) continue;
             char hx[65];
             for (int k=0;k<32;k++){ unsigned char b=e.txid[31-k]; hx[k*2]=HEXD[b>>4]; hx[k*2+1]=HEXD[b&15]; }
             hx[64]=0;
             if (!verbose){ rj_arr_push(out, rj_str(hx)); continue; }
-            rj_val* ent = rj_obj();
-            unsigned long w = mp_tx_weight(e.tx, e.len);
-            rj_obj_set(ent, "vsize", rj_numf("%lu", (w+3)/4));
-            rj_obj_set(ent, "weight", rj_numf("%lu", w));
-            rj_obj_set(ent, "time", rj_numf("%ld", g_mph.time_of ? g_mph.time_of(e.txid) : 0));
-            unsigned long long f=0,s=0;
-            rj_val* fees = rj_obj();
-            if (g_mph.polstate && g_mph.pol_entry && g_mph.pol_entry(g_mph.polstate,e.txid,&f,&s))
-                rj_obj_set(fees, "base", rj_numf("%llu.%08llu", f/100000000ULL, f%100000000ULL));
-            rj_obj_set(ent, "fees", fees);
-            rj_obj_set(out, hx, ent);
+            /* the same builder getmempoolentry uses, under the same pool lock */
+            rj_obj_set(out, hx, mpe_entry_obj(e.txid, e.tx, e.len));
         }
+        free(g_mpe_vs); g_mpe_vs = 0; g_mpe_vs_n = 0;
+        free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf = 0; g_mpe_inf_id = 0; g_mpe_inf_n = 0;
         mpu();
     }
     *res = out;
@@ -1222,7 +1309,6 @@ static void mpe_hex(char* dst, const unsigned char* internal){
     for (int k=0;k<32;k++){ unsigned char b=internal[31-k]; dst[k*2]=HEXD[b>>4]; dst[k*2+1]=HEXD[b&15]; }
     dst[64]=0;
 }
-static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len);
 static long long pri_delta_of(const unsigned char txid[32]);
 static rj_val* mpe_amount(unsigned long long sat){
     return rj_numf("%llu.%08llu", sat/100000000ULL, sat%100000000ULL);
@@ -1266,16 +1352,27 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
     rj_obj_set(o, "height", rj_numf("%d", 0));   /* documented gap: entry height untracked */
 
     mp_entry_info inf; int have_inf = 0;
-    if (g_mph.polstate && g_mph.pol_entry_info)
+    /* Prefer the one-pass graph when this call built one; otherwise ask per
+     * txid. The FALLBACK MATTERS: the bulk build is skipped when the node
+     * exposes no pol_entry_info_all and refused when its allocation fails, and
+     * the first cut of this returned no graph at all in those cases -- it made
+     * the per-txid branch conditional on there being no bulk cache, so a
+     * verbose call with a cache but no graph silently dropped depends,
+     * spentby and both counts. The suite caught it immediately. */
+    long myinf = (g_mpe_vs && g_mpe_inf) ? mpe_inf_lookup(txid) : -1;
+    if (myinf >= 0){ inf = g_mpe_inf[myinf]; have_inf = 1; }
+    else if (g_mph.polstate && g_mph.pol_entry_info)
         have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
     /* ancestor/descendant vsize sums over set members STILL IN THE POOL */
     unsigned long long anc_vs=0, desc_vs=0; int anc_n=0, desc_n=0;
     if (have_inf){
-        for (int i=0;i<inf.n_anc;i++){ unsigned long l2=0;
-            const unsigned char* t2 = g_mph.get(g_mph.mp, inf.anc[i], &l2);
+        for (int i=0;i<inf.n_anc;i++){
+            if (g_mpe_vs){ unsigned long v = mpe_vs_lookup(inf.anc[i]); if (v){ anc_vs += v; anc_n++; } continue; }
+            unsigned long l2=0; const unsigned char* t2 = g_mph.get(g_mph.mp, inf.anc[i], &l2);
             if (t2){ anc_vs += (mp_tx_weight(t2,l2)+3)/4; anc_n++; } }
-        for (int i=0;i<inf.n_desc;i++){ unsigned long l2=0;
-            const unsigned char* t2 = g_mph.get(g_mph.mp, inf.desc[i], &l2);
+        for (int i=0;i<inf.n_desc;i++){
+            if (g_mpe_vs){ unsigned long v = mpe_vs_lookup(inf.desc[i]); if (v){ desc_vs += v; desc_n++; } continue; }
+            unsigned long l2=0; const unsigned char* t2 = g_mph.get(g_mph.mp, inf.desc[i], &l2);
             if (t2){ desc_vs += (mp_tx_weight(t2,l2)+3)/4; desc_n++; } }
     } else { anc_n=1; desc_n=1; anc_vs=desc_vs=(w+3)/4; }
     rj_obj_set(o, "descendantcount", rj_numf("%d", desc_n));
@@ -1300,11 +1397,13 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
 
     { rj_val* dep = rj_arr();
       if (have_inf) for (int i=0;i<inf.n_depends;i++){ unsigned long l2=0;
-          if (g_mph.get(g_mph.mp, inf.depends[i], &l2)){ char h2[65]; mpe_hex(h2, inf.depends[i]); rj_arr_push(dep, rj_str(h2)); } }
+          int here = g_mpe_vs ? (mpe_vs_lookup(inf.depends[i]) != 0) : (g_mph.get(g_mph.mp, inf.depends[i], &l2) != 0);
+          if (here){ char h2[65]; mpe_hex(h2, inf.depends[i]); rj_arr_push(dep, rj_str(h2)); } }
       rj_obj_set(o, "depends", dep); }
     { rj_val* sb = rj_arr();
       if (have_inf) for (int i=0;i<inf.n_spentby;i++){ unsigned long l2=0;
-          if (g_mph.get(g_mph.mp, inf.spentby[i], &l2)){ char h2[65]; mpe_hex(h2, inf.spentby[i]); rj_arr_push(sb, rj_str(h2)); } }
+          int here = g_mpe_vs ? (mpe_vs_lookup(inf.spentby[i]) != 0) : (g_mph.get(g_mph.mp, inf.spentby[i], &l2) != 0);
+          if (here){ char h2[65]; mpe_hex(h2, inf.spentby[i]); rj_arr_push(sb, rj_str(h2)); } }
       rj_obj_set(o, "spentby", sb); }
     rj_obj_set(o, "unbroadcast", rj_bool(0));
     return o;
