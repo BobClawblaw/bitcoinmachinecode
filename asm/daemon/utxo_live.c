@@ -509,7 +509,11 @@ static int compact_start_async(long height, const char* why){
          * the idle class: an idle-class writer starves outright under a
          * busy apply and the merge never lands, see the 09-08 note). */
         setpriority(PRIO_PROCESS, 0, 10);
+#ifndef __APPLE__
+        /* macOS has no ioprio(2) and deprecated syscall(); the nice above
+         * is the whole concession there (osx port, merge 2026-09-12). */
         syscall(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, (2 << 13) | 7 /* best-effort, prio 7 */);
+#endif
         utxo_lsm_set_flush_hook(0);
         utxo_lsm_set_defer_unlink(1);
         utxo_lsm_set_defer_publish(1);

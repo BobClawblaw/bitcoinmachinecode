@@ -15,6 +15,14 @@ ERRLOG="$OUT/compile_errors.log"
 # ---- version header ----
 [ -f version_gen.h ] || python3 gen_version_header.py --out version_gen.h --version-inc version.inc
 
+# ---- build stamp (rpc_node.c includes build_gen.h since the 09-10 RPC
+# parity wave; mirror the x86 Makefile's build-stamp rule) ----
+c=$(git -C .. rev-parse --short HEAD 2>/dev/null || echo unknown)
+d=$(git -C .. diff --quiet HEAD 2>/dev/null && echo 0 || echo 1)
+printf '/* build_gen.h -- GENERATED. Do not edit. */\n#ifndef BMC_BUILD_GEN_H\n#define BMC_BUILD_GEN_H\n#define BMC_BUILD_COMMIT "%s"\n#define BMC_BUILD_DIRTY %s\n#endif\n' "$c" "$d" > build_gen.h.tmp
+cmp -s build_gen.h.tmp build_gen.h 2>/dev/null || mv build_gen.h.tmp build_gen.h
+rm -f build_gen.h.tmp
+
 # ---- the arch-neutral C the daemon links (from DAEMONSRCS + DAEMON_RPCOBJS) ----
 CSRC=(
   daemon/main.c daemon/private_broadcast.c daemon/fee_estimator.c daemon/fee_hooks.c
