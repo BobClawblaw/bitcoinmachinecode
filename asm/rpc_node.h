@@ -14,6 +14,23 @@
 /* One outbound peer, published by the download worker at connect/handshake.
  * Byte/last-send counters Core tracks per-socket are not tracked here (the
  * worker has no per-fd meters); getpeerinfo reports them as 0/-1. */
+/* The P2P message names getpeerinfo breaks bytes down by. Core enumerates
+ * every command it knows and buckets the rest under "other"; this is the same
+ * list for the messages this node actually exchanges, and "other" catches
+ * anything else so a total is never silently lost. Keep RPC_MSG_NAMES in step
+ * with the enum -- the test asserts they are the same length. */
+#define RPC_MSG_N 27
+/* Defined once, in rpc_node.c. It was a guarded `static` in this header
+   first, which silently produced nothing: another include pulled rpc_node.h
+   before the guard macro was set, the include guard then made the second
+   include a no-op, and the table never existed. */
+extern const char* const RPC_MSG_NAMES[RPC_MSG_N];
+/* the bucket for a command name, or RPC_MSG_N-1 ("other") */
+int rpc_msg_index(const char* cmd, unsigned cmdlen);
+/* the receive side of the per-message counters; the send side is the
+   g_p2p_write_hook installed in main.c */
+void rpc_note_msg_recv(int fd, const char* cmd, unsigned plen);
+
 #define RPC_MAX_PEERS 128   /* 0..63 outbound legs (the worker), 64..127 inbound children (2026-09-01) */
 /* Shared misbehaviour table size; mirrored by MISBEHAVIOR_SLOTS in
  * daemon/main.c, which asserts the two agree at compile time. */
@@ -58,6 +75,31 @@ typedef struct {
     volatile long             inflight_lo, inflight_hi;   /* download worker: the chunk in flight (hi < lo = none) */
     volatile int              dl_worker;      /* download worker index, -1 for a leg or inbound peer */
     volatile long long        bps_recv;       /* download worker: parent-sampled receive rate, bytes/s (0 = unmeasured). 2026-09-10 */
+    volatile int              idle_pct;       /* download worker: share of its chunk wall-clock spent blocked in the socket read, 0..100, -1 unmeasured. 2026-09-11 */
+    /* ---- getpeerinfo parity, 2026-09-12 -------------------------------
+     * Core v31.1 returns 38 fields here and this node returned 19. These
+     * carry the facts a peer's own process knows and the RPC cannot reach:
+     * getpeerinfo runs in another process, so everything it reports has to
+     * come through this shared table. Each is written by the child that owns
+     * the connection. An "unknown" value means the RPC OMITS the field rather
+     * than publishing a zero a caller cannot tell from a measurement -- the
+     * rule min_ping_us already follows. */
+    volatile int              v2transport;    /* 1 = BIP324 v2, 0 = v1 */
+    volatile unsigned char    session_id[32]; /* BIP324 session id; all-zero = none */
+    volatile char             addrbind[72];   /* our own side of the socket, "ip:port" */
+    volatile long long        minfeefilter;   /* the peer's feefilter, sat/kvB; -1 unknown */
+    volatile int              hb_to, hb_from; /* BIP152 high-bandwidth, -1 unknown */
+    volatile long long        addr_processed, addr_rate_limited;  /* addr relay counters */
+    volatile int              addr_relay_enabled;                 /* -1 unknown */
+    volatile long long        ping_usec;      /* last measured round trip, 0 = unmeasured */
+    volatile long long        inv_to_send, last_inv_sequence;     /* announcement queue */
+    volatile long             presynced_headers;                  /* -1 unknown */
+    /* Per-message byte counters, Core's bytessent_per_msg / bytesrecv_per_msg.
+     * Indexed by RPC_MSG_* below; anything not in the table lands in "other",
+     * which is what Core does too. Counted WITH the 24-byte header, as Core
+     * counts them. */
+    volatile long long        sent_per_msg[RPC_MSG_N];
+    volatile long long        recv_per_msg[RPC_MSG_N];
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
@@ -404,6 +446,13 @@ typedef struct {
     volatile long long        dl_stall_timeout_s; /* the adaptive stall timeout right now */
     volatile long long        dl_stall_evictions; /* window-tail evictions this run */
     volatile long long        dl_median_bps;      /* the pool's median receive rate */
+    /* Pool OCCUPANCY: the share of all worker wall-clock spent blocked in the
+     * socket read (0..100, -1 unmeasured). This is the number that answers
+     * "would more peers help?". Low means the peers are filling the pipe and
+     * only more of them can help; high means the slots are held by peers that
+     * cannot fill it. Measured on run 22 from OUTSIDE the process because the
+     * node did not report it: 11-20% per worker while the log said 8/8 active. */
+    volatile int              dl_pool_idle_pct;
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 
@@ -438,6 +487,10 @@ typedef struct {
                       unsigned long long*, unsigned long long*);/* fee/size */
     long (*pol_entry_info)(void*, const unsigned char*,
                            struct mp_entry_info*);              /* full graph */
+    /* every entry's graph in ONE pass: the per-txid call above costs a full
+       scan of the node array, so asking it n times is O(n^2). Returns the
+       count written, or -1 to say "fall back to the per-txid call". */
+    long (*pol_entry_info_all)(void*, struct mp_entry_info*, unsigned char (*)[32], unsigned);
     long (*estimate)(void*, unsigned long long*,
                      unsigned long long*);                      /* fee EMA+samples */
     void (*sha256d)(unsigned char*, const void*, unsigned long);/* for wtxid */
@@ -495,4 +548,10 @@ long rpc_node_mempool_rawtx(const unsigned char txid_wire[32], unsigned char* ou
 long rpc_node_mempool_save(const char* path);   /* txs written, or -1 */
 long rpc_node_mempool_load(const char* path);   /* txs accepted, or -1 */
 
+/* -limitancestorcount / -limitancestorsize, for getmempoolinfo's cluster fields */
+void rpc_node_set_ancestor_limits(long count, long size_kvb);
+/* Record a connection's own facts -- transport, BIP324 session id, our bound
+   address -- from the process that holds the socket. getpeerinfo runs
+   elsewhere and can only report what reaches the shared table. */
+void rpc_note_peer_socket(int slot, int fd);
 #endif
