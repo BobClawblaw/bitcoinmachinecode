@@ -17,6 +17,16 @@ per-entry field.
 Fields Core has and we do not are the work. Fields we have and Core does not are
 this node's own extensions and are listed separately, not as errors.
 
+ONE FALSE-POSITIVE CLASS, named so it is not chased again. A response whose
+collection is EMPTY on our side yields no key paths to compare, so every field
+Core samples from ITS populated collection reads as missing. Three rows do this
+today and none is a defect: listwalletdir (the oracle's wallet dir holds
+wallets, this node's holds none), getprioritisedtransactions (the oracle has
+prioritised transactions, this node has none) and getzmqnotifications (the
+oracle runs ZMQ, production does not). Rows where our side is an empty
+collection are marked "no local sample" rather than counted as gaps -- the same
+mistake in a different costume as the 194,561 phantom mempool gaps above.
+
   python3 validation/rpc_field_parity.py [--json out.json]
 """
 import json, subprocess, sys
@@ -71,6 +81,16 @@ MPTX = mp[0] if mp else ""
 ADDR = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"
 DESC = "pkh(02e8b0c2d0a2c1b4a8f0e7d6c5b4a3928170695847362514038271605948372615)"
 RAWTX = raw(CORE, ["getrawtransaction", TXID, "0", BH]) if TXID else None
+# Built on the ORACLE so both nodes are handed byte-identical input: these are
+# pure functions of their argument, so any key difference is ours.
+PSBT = (raw(CORE, ["converttopsbt", RAWTX]) or "").strip('"') if RAWTX else None
+# A throwaway key/address/signature triple for the message-signing pair. The key
+# is a published test vector, holds nothing, and never touches a wallet.
+WIFKEY = "L4rK1yDtCWekvXuE6oXD9jCYfFNV2cWRpVuPLBcCU2z8TrisoyY1"
+MSG    = "rpc parity"
+SIG    = raw(CORE, ["signmessagewithprivkey", WIFKEY, MSG])
+SIG    = SIG.strip('"') if SIG else None
+WIFADDR = "1F3sAm6ZtwLAUnj7d38pGFxtP3RVEvtsbV"
 
 # Read-only calls only. Nothing here changes node state on either side.
 CASES = [
@@ -99,7 +119,69 @@ if RAWTX:
     CASES += [("decoderawtransaction", [RAWTX])]
 if MPTX:
     CASES += [("getmempoolentry", [MPTX]), ("getmempoolancestors", [MPTX, "true"]),
-              ("getmempooldescendants", [MPTX, "true"])]
+              ("getmempooldescendants", [MPTX, "true"]),
+              ("getmempoolcluster", [MPTX])]
+
+# --- 2026-09-12: coverage beyond the original 39 ------------------------------
+# The register said "every Core method name exists", and it does -- all 156.
+# What was never checked is the SHAPE of 100+ of those responses. These are the
+# node-level and pure-function calls that can be compared without a wallet and
+# without mutating either side.
+CASES += [
+    ("getblockhash", [H]), ("getchainstates", []), ("getaddrmaninfo", []),
+    ("getprioritisedtransactions", []), ("getblockfilter", [BH]),
+    ("listwallets", []), ("listwalletdir", []),
+    # status subcommands: read-only progress reports, they start nothing
+    ("scantxoutset", ["status"]), ("scanblocks", ["status"]),
+    # level 0, one block: the cheapest form that still returns Core's shape
+    ("verifychain", ["0", "1"]),
+    ("createmultisig", ["1", '["03a34b99f22c790c4e36b2b3c2c35a36db06226e41c692fc82b8b56ac1c540c5bd"]']),
+    ("createrawtransaction", ["[]", "{}"]),
+]
+if TXID:
+    CASES += [("gettxspendingprevout", ['[{"txid":"%s","vout":0}]' % TXID])]
+if RAWTX:
+    # testmempoolaccept does NOT submit; it is Core's dry-run acceptance check.
+    CASES += [("testmempoolaccept", ['["%s"]' % RAWTX]),
+              ("converttopsbt", [RAWTX]),
+              ("combinerawtransaction", ['["%s"]' % RAWTX])]
+if PSBT:
+    CASES += [("decodepsbt", [PSBT]), ("analyzepsbt", [PSBT]),
+              ("finalizepsbt", [PSBT]), ("utxoupdatepsbt", [PSBT]),
+              ("combinepsbt", ['["%s"]' % PSBT]), ("joinpsbts", ['["%s"]' % PSBT])]
+if SIG:
+    CASES += [("verifymessage", [WIFADDR, SIG, MSG]),
+              ("signmessagewithprivkey", [WIFKEY, MSG])]
+
+# --- the guard this tool did not have, and should have ------------------------
+# 2026-09-12: a survey loop elsewhere invoked every Core method name against the
+# LIVE production node to see which were stubs. Invoking an API is not a
+# read-only act: it called clearbanned, ping and then stop, and took production
+# down mid-afternoon. Nothing in this file may ever call a method that changes
+# state, spends, signs from a wallet, or controls the process.
+NEVER_CALL = {
+    "stop", "ping", "clearbanned", "setban", "setnetworkactive", "addnode",
+    "disconnectnode", "addpeeraddress", "invalidateblock", "reconsiderblock",
+    "preciousblock", "pruneblockchain", "submitblock", "submitheader",
+    "submitpackage", "sendrawtransaction", "sendmsgtopeer", "generateblock",
+    "generatetoaddress", "generatetodescriptor", "generate", "importmempool",
+    "savemempool", "setmocktime", "mockscheduler", "syncwithvalidationinterfacequeue",
+    "loadtxoutset", "dumptxoutset", "exportasmap", "prioritisetransaction",
+    "logging", "encryptwallet", "walletlock", "walletpassphrase",
+    "walletpassphrasechange", "keypoolrefill", "getnewaddress",
+    "getrawchangeaddress", "sendtoaddress", "sendmany", "send", "sendall",
+    "settxfee", "setwalletflag", "abandontransaction", "abortrescan",
+    "backupwallet", "bumpfee", "psbtbumpfee", "createwallet", "loadwallet",
+    "unloadwallet", "restorewallet", "migratewallet", "upgradewallet",
+    "rescanblockchain", "importprivkey", "importwallet", "importdescriptors",
+    "importmulti", "importaddress", "importpubkey", "importprunedfunds",
+    "removeprunedfunds", "dumpprivkey", "dumpwallet", "sethdseed", "newkeypool",
+    "addmultisigaddress", "lockunspent", "setlabel", "walletdisplayaddress",
+    "abortprivatebroadcast", "addhdkey", "createwalletdescriptor",
+}
+_bad = sorted({m for m, _ in CASES} & NEVER_CALL)
+if _bad:
+    sys.exit("REFUSING TO RUN: these cases call state-changing methods: %s" % ", ".join(_bad))
 
 rows, gaps, extras, skipped = [], 0, 0, 0
 for m, a in CASES:

@@ -2513,6 +2513,19 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
     return 1;
 }
 
+/* Core emits reject-details alongside reject-reason for a refused tx
+ * (rpc/mempool.cpp): the value is TxValidationState::ToString(), which is the
+ * reject reason on its own when there is no debug message, and "reason, debug"
+ * when there is. It is OMITTED for missing-inputs, where Core takes the other
+ * branch and pushes only the reason. This node carries no separate debug
+ * message, so details equals the reason -- which is precisely Core's output in
+ * the no-debug-message case, not an approximation of it. */
+static void tma_set_reject(rj_val* e, const char* rsn){
+    rj_obj_set(e, "reject-reason", rj_str(rsn));
+    if (strcmp(rsn, "missing-inputs") != 0)
+        rj_obj_set(e, "reject-details", rj_str(rsn));
+}
+
 static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_ARR || params->items[0]->nitems < 1){
@@ -2647,8 +2660,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
                 rj_obj_set(e, "fees", f);
             } else {
                 rj_obj_set(e, "allowed", rj_bool(0));
-                rj_obj_set(e, "reject-reason",
-                           rj_str(r_reason[i][0] ? r_reason[i] : "transaction rejected"));
+                tma_set_reject(e, r_reason[i][0] ? r_reason[i] : "transaction rejected");
             }
             rj_arr_push(arr, e);
         }
@@ -2695,7 +2707,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
             rj_obj_set(e, "fees", fees);
         } else {
             rj_obj_set(e, "allowed", rj_bool(0));
-            rj_obj_set(e, "reject-reason", rj_str(reason[0] ? reason : "transaction rejected"));
+            tma_set_reject(e, reason[0] ? reason : "transaction rejected");
         }
         rj_arr_push(arr, e);
     }
