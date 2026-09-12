@@ -730,6 +730,93 @@ rollback. The scratch copy needs as much space as the archive.
 | `[boot] archive check found N problem(s)` | Read the `[check]` lines above it. The non-monotonic layout notice is expected on a parallel-downloaded archive (see *Maintenance*); other findings name the height. |
 | a second `bmcbitcoind` with the same command line | A compaction child. Check `/proc/<pid>/exe` and the parent PID before assuming a duplicate daemon; never run two daemons on one chain directory. |
 
+## The Core oracle (authoritative local node)
+
+`/storage/core-oracle` is the authoritative local Bitcoin Core node on this box.
+It is **not** a benchmark node and **not** a development node: every IBD
+capstone, the muhash parity check and the bench monitors compare against it, so
+it has to be up and at the tip whenever a run finishes.
+
+| | |
+|---|---|
+| datadir | `/storage/core-oracle` (918 GB, mainnet, `prune=0`) |
+| binary | `/storage/bitcoin-core-source/build-zmq/bin/bitcoind` (v31.1) |
+| P2P | **8333**, on sixteen loopback binds `127.0.0.1`–`127.0.0.16` |
+| RPC | 8335, `rpcbind=127.0.0.1` |
+| indexes | `txindex`, `coinstatsindex`, `blockfilterindex`, all synced |
+| ZMQ | `tcp://127.0.0.1:28432` (hashblock, hashtx, rawblock, rawtx) |
+| unit | `bitcoin-oracle.service`, enabled at boot |
+
+The sixteen loopback binds are deliberate: they let a benchmark node dial
+sixteen distinct "peers" that are all this node, which is what the replay
+peer-rate setup needs. It listens on loopback **only** and is not reachable from
+the LAN. Production bmc owns 8332/8331 and does not collide with it; see
+`bind=<host address>` under **Configuration**.
+
+### It runs as a unit — do not launch it by hand
+
+Until 2026-09-12 this node had no unit at all. It survived only because nobody
+killed it: any reboot, OOM event or box-wide session teardown took out the one
+reference every benchmark depends on, and it came back only when someone noticed
+and relaunched it from a shell. It died exactly that way in the 2026-09-08 OOM,
+together with the bench daemon and every monitor loop.
+
+```
+sudo systemctl status  bitcoin-oracle
+sudo systemctl restart bitcoin-oracle
+sudo systemctl stop    bitcoin-oracle
+```
+
+A hand-launched second copy will fight the unit for the datadir lock and the
+ports, so the old `setsid nohup bitcoind ...` line is retired. Query it with:
+
+```
+/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli \
+  -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle getblockcount
+```
+
+Reference unit, `/etc/systemd/system/bitcoin-oracle.service`:
+
+```ini
+[Unit]
+Description=Bitcoin Core oracle (authoritative local node, P2P 8333)
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/storage/core-oracle
+
+[Service]
+Type=simple
+User=<service-user>
+Group=<service-group>
+ExecStart=/storage/bitcoin-core-source/build-zmq/bin/bitcoind \
+  -conf=/storage/core-oracle/bitcoin.conf \
+  -datadir=/storage/core-oracle
+TimeoutStopSec=900
+KillSignal=SIGTERM
+SendSIGKILL=no
+Restart=always
+RestartSec=15
+OOMScoreAdjust=-500
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Why the unit is shaped the way it is.** `Restart=always` with `RestartSec=15`
+is the whole point. `OOMScoreAdjust=-500` biases the OOM killer away from the
+one node that cannot be cheaply rebuilt — this box has OOM-killed `systemd
+--user` before the process that actually grew. `TimeoutStopSec=900` and
+`SendSIGKILL=no` matter most: Core flushes a 918 GB chainstate on shutdown, and
+a SIGKILL partway through corrupts the database and costs a multi-day resync, so
+a normal stop waits rather than escalating.
+
+Verified on creation by sending SIGTERM to the main pid: systemd brought it back
+in about 20 seconds, at the tip, with all sixteen binds restored and all three
+indexes synced.
+
+Tor control 9051 warnings in its log are normal — there is no tor on this box.
+
 ## Running more than one chain
 
 One `bitcoin.conf` selects one chain, so a second chain needs its own
