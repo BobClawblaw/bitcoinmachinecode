@@ -270,7 +270,11 @@ static int cmd_getpeerinfo(rj_val** res){
               if (f & (1u<<4)) rj_arr_push(pa, rj_str("download"));
               if (f & (1u<<5)) rj_arr_push(pa, rj_str("addr"));
               rj_obj_set(o, "permissions", pa); }
-            rj_obj_set(o, "startingheight", rj_numf("%d", p->start_height));
+            /* startingheight was REMOVED from Core's getpeerinfo; v31.1 run on
+             * regtest does not emit it. Dropped 2026-09-12 for exactness at the
+             * operator's call -- it was the only field we returned that Core
+             * does not. The handshake height is still kept internally and is on
+             * bmcgetdownloadinfo, which is ours to define. */
             rj_obj_set(o, "synced_headers", rj_numf("%d", -1));
             rj_obj_set(o, "synced_blocks", rj_numf("%d", -1));
             { bmc_addr_t pa; const char* nn = "ipv4";
@@ -300,7 +304,11 @@ static int cmd_getpeerinfo(rj_val** res){
             rj_obj_set(o, "subver", rj_str(p->subver));
             rj_obj_set(o, "inbound", rj_bool(0));
             rj_obj_set(o, "permissions", rj_arr());
-            rj_obj_set(o, "startingheight", rj_numf("%d", p->start_height));
+            /* startingheight was REMOVED from Core's getpeerinfo; v31.1 run on
+             * regtest does not emit it. Dropped 2026-09-12 for exactness at the
+             * operator's call -- it was the only field we returned that Core
+             * does not. The handshake height is still kept internally and is on
+             * bmcgetdownloadinfo, which is ours to define. */
             rj_obj_set(o, "synced_headers", rj_numf("%d", p->start_height));
             rj_obj_set(o, "synced_blocks", rj_numf("%ld", p->inflight_hi >= p->inflight_lo ? p->inflight_lo - 1 : -1L));
             { rj_val* fl = rj_arr(); if (p->inflight_hi >= p->inflight_lo) for (long h = p->inflight_lo; h <= p->inflight_hi && h < p->inflight_lo + 256; h++) rj_arr_push(fl, rj_numf("%ld", h));
@@ -775,6 +783,13 @@ static unsigned long mp_tx_vsize(const unsigned char* tx, unsigned long len){
     return (mp_tx_weight(tx,len) + 3) / 4;
 }
 
+/* -limitancestorcount / -limitancestorsize, injected by main.c from the
+   config; defaults are Core's pre-cluster values. See getmempoolinfo. */
+static long g_limit_anc_count = 25, g_limit_anc_size_kvb = 101;
+void rpc_node_set_ancestor_limits(long count, long size_kvb){
+    if (count > 0) g_limit_anc_count = count;
+    if (size_kvb > 0) g_limit_anc_size_kvb = size_kvb;
+}
 static int cmd_getmempoolinfo(rj_val** res){
     long count = 0; unsigned long long bytes = 0, total_fee = 0, blob_used = 0;
     if (g_mph.mp){
@@ -809,6 +824,28 @@ static int cmd_getmempoolinfo(rj_val** res){
       double eff = dyn_btc > MEMPOOL_MINFEE_BTC ? dyn_btc : MEMPOOL_MINFEE_BTC;
       rj_obj_set(o, "mempoolminfee", rj_numf("%.8f", eff)); }
     rj_obj_set(o, "minrelaytxfee", rj_numf("%.8f", MEMPOOL_MINFEE_BTC));  /* Core's field name */
+    /* fullrbf: v31.1 has it, master has dropped it. Core's -mempoolfullrbf
+     * became unconditional in v28, so the field is true there and here. */
+    rj_obj_set(o, "fullrbf", rj_bool(1));
+    /* THE CLUSTER FIELDS ARE A DOCUMENTED SEMANTIC DIVERGENCE, not a copy.
+     *
+     * Core v31.1 replaced the ancestor/descendant limits with CLUSTER limits:
+     * a cluster is a whole connected component of the mempool graph, and
+     * limitclustercount/limitclustersize bound it. This node still enforces
+     * Core's older -limitancestorcount / -limitancestorsize, which bound a
+     * transaction's ANCESTOR SET, not its component.
+     *
+     * The numbers below are therefore the limits this node actually enforces,
+     * reported under Core's field names because they are the binding
+     * constraint on how large a package here can get. They are NOT cluster
+     * limits, and a caller reasoning about connected components from them
+     * would be wrong. `optimal` is false for the same reason: it means "the
+     * mempool is fully linearised" under cluster mempool, and nothing here
+     * linearises anything, so claiming true would be a lie. Recorded in
+     * docs/CORE_DIVERGENCES.md. */
+    rj_obj_set(o, "limitclustercount", rj_numf("%ld", g_limit_anc_count));
+    rj_obj_set(o, "limitclustersize", rj_numf("%ld", g_limit_anc_size_kvb * 1000));
+    rj_obj_set(o, "optimal", rj_bool(0));
     rj_obj_set(o, "incrementalrelayfee", rj_numf("%.8f", (double)g_incremental_satkvb / 1e8));
     rj_obj_set(o, "unbroadcastcount", rj_numf("%d", 0));
     /* the real policy value, not a literal: reporting a setting the

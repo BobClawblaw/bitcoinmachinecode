@@ -507,4 +507,6 @@ long rpc_node_mempool_rawtx(const unsigned char txid_wire[32], unsigned char* ou
 long rpc_node_mempool_save(const char* path);   /* txs written, or -1 */
 long rpc_node_mempool_load(const char* path);   /* txs accepted, or -1 */
 
+/* -limitancestorcount / -limitancestorsize, for getmempoolinfo's cluster fields */
+void rpc_node_set_ancestor_limits(long count, long size_kvb);
 #endif

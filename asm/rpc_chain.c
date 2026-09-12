@@ -129,6 +129,15 @@ void rpc_chain_set_prune_mib(long mib){ g_prune_mib = mib; }
  * and -maxtipage: injected by main.c from the config (this file never includes
  * node_config.h). Defaults are Core's. */
 static long g_gbt_maxweight = 4000000, g_gbt_reserved = 8000, g_gbt_minfee_satkvb = 1;
+/* the last template's totals, for getmininginfo. Core omits both fields until
+ * a template has been built, and so do we -- reporting 0 would assert an empty
+ * block rather than "not asked yet". */
+static long g_last_tmpl_tx = 0, g_last_tmpl_weight = 0; static int g_last_tmpl_seen = 0;
+static long long g_tmpl_used_w = 0;   /* the selection loop's running weight, read back above */
+/* getmininginfo is defined before the template builder; these are its two
+   dependencies from further down the file. */
+static u32 gbt_next_bits(long tip, long curtime);
+static rpc_mempool_hooks g_gbt_mph;
 static int  g_gbt_version = 0, g_gbt_printpriority = 0;
 /* Core honours -blockversion ONLY where blocks are mined on demand:
  *   node/miner.cpp:148  if (chainparams.MineBlocksOnDemand()) {
@@ -960,12 +969,20 @@ static int cmd_getnetworkhashps(const rj_val* params, rj_val** res, long* ec, co
     return 1;
 }
 
-/* getmininginfo (Core rpc/mining.cpp): the documented v31 field set -- blocks,
- * bits, difficulty, networkhashps, pooledtx, chain, warnings. The master oracle
- * adds bleeding-edge fields (target, next, blockmintxfee) the project policy
- * does not chase; the shared fields are oracle-verifiable. pooledtx reflects
- * THIS process's mempool (0 for the read-only rpcd / listen=0 node, as
- * getmempoolinfo). */
+/* getmininginfo (Core rpc/mining.cpp).
+ *
+ * 2026-09-12: this used to stop at blocks/bits/difficulty/networkhashps/
+ * pooledtx/chain/warnings, and the comment here called target, next and
+ * blockmintxfee "bleeding-edge fields the project policy does not chase". That
+ * was an ASSUMPTION, and it was wrong: Bitcoin Core v31.1 run on regtest
+ * returns all three, plus currentblocktx and currentblockweight once a
+ * template exists. The assumption survived because the parity register
+ * compared method NAMES and nothing compared response shape -- the same gap
+ * that left getrawmempool at four fields. See docs/PARITY_RPC_FIELDS.md.
+ *
+ * currentblocktx/currentblockweight are omitted until a template has actually
+ * been built, exactly as Core omits them: reporting 0 would assert an empty
+ * block rather than "nobody has asked for a template yet". */
 static int cmd_getmininginfo(rj_val** res, long* ec, const char** em){
     long tip = refresh();
     if (tip < 0){ *ec=-28; *em="Loading block index..."; return 0; }
@@ -978,7 +995,28 @@ static int cmd_getmininginfo(rj_val** res, long* ec, const char** em){
     { rj_val* nh=NULL; long e2; const char* m2;
       if (cmd_getnetworkhashps(NULL,&nh,&e2,&m2)) rj_obj_set(o,"networkhashps", nh);
       else rj_obj_set(o,"networkhashps", rj_numf("%d",0)); }
-    rj_obj_set(o,"pooledtx", rj_numf("%d", 0));
+    { char hx[65]; target_hex(bits, hx); rj_obj_set(o,"target", rj_str(hx)); }
+    /* -blockmintxfee is carried in sat/kvB; Core prints it as a BTC amount */
+    { long long s = g_gbt_minfee_satkvb;
+      rj_obj_set(o,"blockmintxfee", rj_numf("%lld.%08lld", s/100000000LL, s%100000000LL)); }
+    /* the block that would be mined NEXT: its retargeted bits, and what they mean */
+    { u32 nb = gbt_next_bits(tip, (long)time(NULL));
+      rj_val* nx = rj_obj();
+      rj_obj_set(nx,"height", rj_numf("%ld", tip+1));
+      { char b[9]; snprintf(b,sizeof b,"%08x",(unsigned)nb); rj_obj_set(nx,"bits", rj_str(b)); }
+      rj_obj_set(nx,"difficulty", rj_double(difficulty_of(nb)));
+      { char hx[65]; target_hex(nb, hx); rj_obj_set(nx,"target", rj_str(hx)); }
+      rj_obj_set(o,"next", nx); }
+    if (g_last_tmpl_seen){
+        rj_obj_set(o,"currentblocktx", rj_numf("%ld", g_last_tmpl_tx));
+        rj_obj_set(o,"currentblockweight", rj_numf("%ld", g_last_tmpl_weight));
+    }
+    /* pooledtx is the mempool's transaction count, not a constant. It was
+     * hard-coded to 0, which the key-level differential could never catch --
+     * a field present and always wrong is invisible to a shape diff. */
+    { long pooled = 0;
+      if (g_gbt_mph.mp && g_gbt_mph.count) pooled = (long)g_gbt_mph.count(g_gbt_mph.mp);
+      rj_obj_set(o,"pooledtx", rj_numf("%ld", pooled)); }
     rj_obj_set(o,"chain", rj_str(g_chain_name));
     rj_obj_set(o,"warnings", rj_arr());     /* v31: empty array */
     *res = o;
@@ -1267,7 +1305,7 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
                         (unsigned long long)c->fee, (unsigned long long)c->size,
                         c->size ? (double)c->fee / (double)c->size * 1000.0 / 1e8 : 0.0);
             for (int k = 0; k < c->cnt; k++){ order[emitted_n++] = cmem[c->start + k]; }
-            used_w += c->w; used_s += c->s;
+            used_w += c->w; used_s += c->s; g_tmpl_used_w = used_w;
         }
         #undef UF_FIND
         /* render in order; depends[] are 1-based indices into this array */
@@ -1315,6 +1353,12 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
         if (g_gbt_mph.unlock) g_gbt_mph.unlock();
     }
     rj_obj_set(o, "transactions", txs);
+    /* Core's getmininginfo reports currentblocktx/currentblockweight from the
+     * LAST BLOCK TEMPLATE assembled, and omits both until one exists. Record
+     * them here, which is the only place a template is built. */
+    g_last_tmpl_tx = (long)txs->nitems;
+    g_last_tmpl_weight = (long)g_tmpl_used_w;
+    g_last_tmpl_seen = 1;
 
     rj_obj_set(o, "coinbaseaux", rj_obj());
     rj_obj_set(o, "coinbasevalue", rj_numf("%llu", (unsigned long long)gbs_subsidy(height) + fees_total));
@@ -1503,18 +1547,22 @@ static int cmd_getblock(const rj_val* params, rj_val** res, long* ec, const char
     rj_obj_set(o, "strippedsize", rj_numf("%zu", stripped));
     rj_obj_set(o, "size", rj_numf("%ld", len));
     rj_obj_set(o, "weight", rj_numf("%zu", stripped * 3 + (size_t)len));
-    /* RPX-7 (audit 2026-09-03): `coinbase_tx` is NOT a Core field.
-     * Core's blockToJSON has no such member -- the coinbase appears only
-     * inside the `tx` array, like every other transaction. An additive field
-     * is exactly what a strict field-set diff against Core flags, and this
-     * one was undocumented AND pinned by tests/test_rpc_chain.c as if it were
-     * canonical. Nothing outside that test ever read it. Dropped rather than
-     * documented as an extension: this node's whole claim is Core's result
-     * shapes, and an extra key is a divergence however convenient it is.
-     * The object is still BUILT above and freed here, because building it is
-     * what proves the coinbase parses; see the assertions in
-     * tests/test_rpc_chain.c that replaced the field checks. */
-    if (cb) rj_free(cb);
+    /* coinbase_tx: Core v31.1 DOES emit this, and we used to build it and
+     * throw it away.
+     *
+     * The 2026-09-03 audit removed it on the reasoning that "Core's
+     * blockToJSON has no such member" and that an additive field is what a
+     * strict field-set diff would flag. The reasoning was sound; the premise
+     * was not checked. Bitcoin Core v31.1 run on regtest returns coinbase_tx
+     * at verbosity 1, 2 and 3, with exactly these five members -- version,
+     * locktime, sequence, coinbase, witness -- which is the object built
+     * above, unchanged.
+     *
+     * It survived a year as a wrong assumption because the parity register
+     * compared method NAMES and nothing compared response shape. The
+     * differential that would have caught it in either direction is
+     * validation/rpc_field_parity.py; see docs/PARITY_RPC_FIELDS.md. */
+    if (cb) rj_obj_set(o, "coinbase_tx", cb);
     rj_obj_set(o, "tx", txs);
     *res = o;
     return 1;

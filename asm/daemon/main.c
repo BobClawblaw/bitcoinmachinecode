@@ -9041,6 +9041,7 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
           .min_relay_satkvb = g_cfg.minrelaytxfee_satkvb > 0 ? (unsigned long long)g_cfg.minrelaytxfee_satkvb : 100ULL };
       rpc_node_set_mempool(&h);
       /* getblocktemplate reads the same pool through rpc_chain */
+      rpc_node_set_ancestor_limits(g_cfg.limitancestorcount, g_cfg.limitancestorsize_kvb);
       rpc_chain_set_mempool(&h, gbt_sigops_legacy4); }
     /* gettxoutsetinfo: the tool-derived reader (daemon/utxo_setinfo_rpc.c) */
     { extern long utxo_setinfo_rpc_run(int, void*, char*, unsigned long);
