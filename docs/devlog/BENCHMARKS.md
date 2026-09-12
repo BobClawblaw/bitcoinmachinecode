@@ -652,7 +652,7 @@ carry the segment tables, the configuration and the defect analysis.
 | run | date | node commit | blocks | wall clock | capstone | report |
 |---|---|---|---|---|---|---|
 | 22 | 2026-09-11 | `4a4872cf` | 966,369 | 20h 08m | **PASS** (2026-09-12, offline) — the live capstone's FAIL was a torn read | [public report](../reports/2026-09-11-ibd-vs-core.md) · [bbcode](../reports/2026-09-11-ibd-vs-core.bbcode) · [defect writeup](../reports/2026-09-11-run22-muhash-divergence.md) |
-| 23 | 2026-09-12 | `8bc638f9` | 966,674 | 19h 05m | **no verdict** — harness asked our node for a height its index had not reached | not yet written |
+| 23 | 2026-09-12 | `8bc638f9` | 966,674 | 19h 05m | **PASS** (2026-09-12, offline) — identical to Core on every field | see the verdict below |
 
 **Run 22** is the first comparison run at 8 download peers on both sides. Core's
 block-download concurrency is not configurable — `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`
@@ -702,6 +702,29 @@ derived from it is. Before run 22 the harness timed out on its own walk, compare
 an empty string against an empty string, found them equal, and printed nothing.
 **Every "passing" IBD run before 2026-09-11 passed a capstone that never
 executed.** Do not cite one as evidence of UTXO correctness.
+
+### Both runs' UTXO sets are correct
+
+Neither run got a valid verdict from its own harness. Both were settled offline,
+quiesced, against the oracle at the run's own applied height:
+
+| run | commit | height | muhash | verdict |
+|---|---|---|---|---|
+| 22 | `4a4872cf` | 966,496 | `df1b0340…073d0165` | **PASS** |
+| 23 | `8bc638f9` | 966,674 | `b75303cd…71290099` | **PASS** |
+
+Identical to Core on height, txouts, bogosize, total_amount and muhash in both
+cases. Production, built by `reindex-chainstate`, independently matches the
+oracle at 966,679 through its coinstatsindex — three confirmations across three
+different build and sync paths.
+
+Run 23 is the more informative of the two: its store had 17 manifest runs to run
+22's 2, and replayed 58,768 WAL records, so the same answer came out of a
+materially different LSM layout rather than a repeat of one configuration.
+
+**The fresh parallel-download sync builds a correct UTXO set.** Every claim to
+the contrary in this repository came from a capstone reading a set that was
+still moving.
 
 ### Fairness controls, and one that was broken
 
