@@ -154,3 +154,47 @@ an API is not a read-only act: the loop called `clearbanned`, `ping` and then
 `stop`, and took production down for ninety seconds. `rpc_field_parity.py` now
 carries a `NEVER_CALL` deny list and refuses to run if any case names a method
 that changes state, spends, signs from a wallet, or controls the process.
+
+### `getmempoolcluster` implemented for the case that has one answer (2026-09-12)
+
+Core returns a transaction's whole cluster in **linearization order**, split
+into chunks by chunk feerate (`rpc/mempool.cpp` `clusterToJSON`). This node has
+no cluster mempool and so no linearization — but a **singleton cluster has only
+one possible answer**: a transaction with no unconfirmed parents and no
+unconfirmed children is alone in its cluster and is its own single chunk, so
+`clusterweight`, `txcount` and the one chunk are exactly determined. That case
+is now answered, verified field for field against v31.1 on a live mempool
+(`clusterweight 832`, `txcount 1`, `chunkfee 0.00062700`).
+
+A cluster of two or more still refuses, because the chunk boundaries *are* the
+linearization and nothing here can recover them — but the error now names the
+cluster size and the reason, instead of claiming this node has no clusters.
+
+The same arithmetic closed three of the four missing mempool-entry fields. Core's
+adjusted weight is `max(weight, sigop_cost * bytes_per_sigop)` (`policy.cpp`
+`GetSigOpsAdjustedWeight`); the registry stores each entry's BIP141 sigop cost
+and the policy layer knows `-bytespersigop`, so:
+
+| field | status |
+|---|---|
+| `vsize_bip141` | emitted always — `(weight + 3) / 4` |
+| `vsize_adjusted` | emitted always — adjusted weight over 4, rounded up |
+| `chunkweight` | emitted for a singleton cluster; omitted otherwise |
+| `fees.chunk` | emitted for a singleton cluster; omitted otherwise |
+
+The comment in `rpc_node.c` calling these "absent, and deliberately" was stale:
+it was written before the registry carried `sigop_cost`, and the data had been
+available for some time.
+
+**Formulas were read from Core's source, not inferred from samples.**
+`GetSigOpsAdjustedWeight` only differs from plain weight on sigop-heavy
+transactions, so a sample of ordinary transactions shows the two as identical
+and would have hidden the rule entirely.
+
+### Open: an error-code divergence, found in passing
+
+Core answers a null or absent txid with **-3** (`RPC_TYPE_ERROR`).
+`getmempoolcluster` now does. Three older sites in `rpc_node.c` return **-8**
+for the identical condition (`getmempoolentry` among them) and are wrong about
+it. Not changed here: a returned error code is caller-visible, so it belongs in
+its own change rather than riding along with a feature.

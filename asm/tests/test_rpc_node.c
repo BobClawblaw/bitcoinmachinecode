@@ -447,11 +447,16 @@ int main(void){
         ck("an empty outputs array -> -8 (Core rejects it too)", rcb == 0 && ec == -8);
         rj_free(r); rj_free(p); }
 
-      /* the two node-side Blockchain refusals name what is missing */
+      /* getmempoolcluster used to refuse everything with -1 and this asserted
+       * that refusal. 2026-09-12 it answers a SINGLETON cluster exactly (a lone
+       * transaction is its own chunk, no linearization needed), so a missing
+       * txid now takes the parameter path -- and Core answers that with -3
+       * (RPC_TYPE_ERROR), verified against v31.1. The old assertion pinned the
+       * unimplemented state, so it is replaced, not restored. */
       { r = NULL; ec = 0; em = NULL;
         int rcb = rpc_node_dispatch("getmempoolcluster", NULL, &r, &ec, &em);
-        ck("getmempoolcluster -> -1 naming the missing cluster structure",
-           rcb == 0 && ec == -1 && em && strstr(em, "cluster"));
+        ck("getmempoolcluster with no txid -> -3, as Core answers it",
+           rcb == 0 && ec == -3 && em && strstr(em, "not of expected type string"));
         rj_free(r);
         r = NULL; ec = 0; em = NULL;
         rcb = rpc_node_dispatch("getblockfrompeer", NULL, &r, &ec, &em);

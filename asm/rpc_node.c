@@ -1382,10 +1382,17 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
      * show ancestor packages for the block template, via getblocktemplate's
      * own `depends`, and said so rather than pretending otherwise.
      *
-     * Still absent, and deliberately: `vsize_adjusted` (no -bytespersigop
-     * concept anywhere in this RPC surface -- see the getrawtransaction note),
-     * and `chunkweight`/`vsize_bip141`, which are cluster-mempool fields from
-     * Core master rather than the v31.1 release this node tracks. */
+     * 2026-09-12: that list is now shorter, and the reason it was long is
+     * gone. `vsize_adjusted` and `vsize_bip141` are emitted unconditionally --
+     * the registry stores each entry's BIP141 sigop cost and the policy layer
+     * knows -bytespersigop, so Core's adjusted weight,
+     * max(weight, sigop_cost * bytes_per_sigop) (policy.cpp
+     * GetSigOpsAdjustedWeight), is exactly computable here. `chunkweight` and
+     * `fees.chunk` are emitted for a SINGLETON cluster only, where they are
+     * determined without any linearization: a lone transaction is its own
+     * chunk. For a multi-transaction cluster both depend on Core's cluster
+     * linearization, which this node does not implement, and they are omitted
+     * rather than guessed. */
     int verbose = 0;
     if (params && params->typ == RJ_ARR && params->nitems >= 1){
         const rj_val* v = params->items[0];
@@ -1503,6 +1510,7 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
     unsigned long w = mp_tx_weight(tx, len);
     rj_obj_set(o, "vsize", rj_numf("%lu", (w+3)/4));
     rj_obj_set(o, "weight", rj_numf("%lu", w));
+    rj_obj_set(o, "vsize_bip141", rj_numf("%lu", (w+3)/4));
     rj_obj_set(o, "time", rj_numf("%ld", g_mph.time_of ? g_mph.time_of(txid) : 0));
     rj_obj_set(o, "height", rj_numf("%d", 0));   /* documented gap: entry height untracked */
 
@@ -1548,6 +1556,25 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
       rj_obj_set(fees, "modified", rj_numf("%s%lld.%08lld", modified<0?"-":"", am/100000000LL, am%100000000LL));
       rj_obj_set(fees, "ancestor", mpe_amount(have_inf ? inf.anc_fee : base));
       rj_obj_set(fees, "descendant", mpe_amount(have_inf ? inf.desc_fee : base));
+      /* Core's adjusted weight: max(weight, sigop_cost * bytes_per_sigop)
+       * (policy.cpp GetSigOpsAdjustedWeight). vsize_adjusted is that over 4,
+       * rounded up, exactly as GetVirtualTransactionSize does it. */
+      { unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
+        unsigned long long adjw = w;
+        if (have_inf){ unsigned long long sw = (unsigned long long)inf.sigop_cost * bps;
+                       if (sw > adjw) adjw = sw; }
+        rj_obj_set(o, "vsize_adjusted", rj_numf("%llu", (adjw+3)/4));
+        /* A SINGLETON cluster -- no unconfirmed parents, no unconfirmed
+         * children -- is its own chunk, so chunkweight and fees.chunk are
+         * determined with no linearization at all. Both counts include the tx
+         * itself, so 1 and 1 is the lone-transaction case. Anything larger
+         * needs Core's cluster linearization, which this node does not
+         * implement: the two keys are then OMITTED rather than approximated. */
+        if (have_inf && inf.n_anc == 1 && inf.n_desc == 1){
+            rj_obj_set(o, "chunkweight", rj_numf("%llu", adjw));
+            rj_obj_set(fees, "chunk", rj_numf("%s%lld.%08lld",
+                       modified<0?"-":"", am/100000000LL, am%100000000LL));
+        } }
       rj_obj_set(o, "fees", fees); }
 
     { rj_val* dep = rj_arr();
@@ -2882,6 +2909,84 @@ int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
     return 0;
 }
+/* getmempoolcluster, for the case that needs no linearization.
+ *
+ * Core returns the transaction's whole cluster in LINEARIZATION order, split
+ * into chunks by the cluster's chunk feerates (rpc/mempool.cpp clusterToJSON).
+ * This node has no cluster mempool and so no linearization -- but a SINGLETON
+ * cluster has only one possible answer. A transaction with no unconfirmed
+ * parents and no unconfirmed children is alone in its cluster and is its own
+ * single chunk, so clusterweight, txcount and the one chunk are all exactly
+ * determined. Verified field for field against Core v31.1 on a live mempool.
+ *
+ * For a cluster of two or more the chunk boundaries ARE the linearization, and
+ * nothing here can recover them: that case still refuses, and says why, rather
+ * than inventing an ordering that would differ from Core's silently. */
+static int cmd_getmempoolcluster(const rj_val* params, rj_val** res, long* ec, const char** em){
+    static char embuf[512];
+    /* Core answers a null/absent txid with -3 (RPC_TYPE_ERROR), not -8; see
+     * getmempoolcluster against v31.1. Three older sites in this file
+     * (getmempoolentry and friends) return -8 for the identical condition and
+     * are wrong about it -- recorded in PARITY_RPC_FIELDS.md rather than
+     * changed here, since altering a returned error code is a caller-visible
+     * break that belongs in its own change. */
+    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_STR){
+        *ec = -3; *em = "JSON value of type null is not of expected type string"; return 0; }
+    const char* hx = params->items[0]->str;
+    if (strlen(hx) != 64){
+        snprintf(embuf, sizeof embuf, "txid must be of length 64 (not %zu, for '%s')", strlen(hx), hx);
+        *ec = -8; *em = embuf; return 0; }
+    unsigned char txid[32];
+    for (int i=0;i<32;i++){
+        int a=srt_hex1(hx[i*2]), b=srt_hex1(hx[i*2+1]);
+        if (a<0||b<0){ snprintf(embuf,sizeof embuf,"txid must be hexadecimal string (not '%s')",hx);
+                       *ec=-8; *em=embuf; return 0; }
+        txid[31-i]=(unsigned char)((a<<4)|b);
+    }
+    if (!g_mph.mp || !g_mph.get){ *ec=-5; *em="Transaction not in mempool"; return 0; }
+    mpl();
+    unsigned long len=0;
+    const unsigned char* tx = g_mph.get(g_mph.mp, txid, &len);
+    if (!tx){ mpu(); *ec=-5; *em="Transaction not in mempool"; return 0; }
+    unsigned long w = mp_tx_weight(tx, len);
+    mp_entry_info inf; int have_inf = 0;
+    if (g_mph.pol_entry_info && g_mph.polstate)
+        have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
+    mpu();
+    if (!have_inf){ *ec = -5; *em = "Transaction not in mempool"; return 0; }
+    if (inf.n_anc != 1 || inf.n_desc != 1){
+        snprintf(embuf, sizeof embuf,
+                 "this transaction's cluster holds %d transaction(s) (ancestors %d, "
+                 "descendants %d, both counting itself). Splitting a cluster into chunks "
+                 "IS Core's cluster linearization, which this node does not implement, so "
+                 "the chunks cannot be reported. A singleton cluster is answered in full; "
+                 "see getmempoolancestors/getmempooldescendants for the graph.",
+                 inf.n_anc > inf.n_desc ? inf.n_anc : inf.n_desc, inf.n_anc, inf.n_desc);
+        *ec = -1; *em = embuf; return 0;
+    }
+    unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
+    unsigned long long adjw = w;
+    { unsigned long long sw = (unsigned long long)inf.sigop_cost * bps;
+      if (sw > adjw) adjw = sw; }
+    long long modified = (long long)inf.fee + pri_delta_of(txid);
+    long long am = modified < 0 ? -modified : modified;
+
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "clusterweight", rj_numf("%llu", adjw));
+    rj_obj_set(o, "txcount", rj_numf("%d", 1));
+    rj_val* chunks = rj_arr();
+    rj_val* c = rj_obj();
+    rj_obj_set(c, "chunkfee", rj_numf("%s%lld.%08lld", modified<0?"-":"",
+                                      am/100000000LL, am%100000000LL));
+    rj_obj_set(c, "chunkweight", rj_numf("%llu", adjw));
+    rj_val* txs = rj_arr(); rj_arr_push(txs, rj_str(hx));
+    rj_obj_set(c, "txs", txs);
+    rj_arr_push(chunks, c);
+    rj_obj_set(o, "chunks", chunks);
+    *res = o;
+    return 1;
+}
+
 int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em){
     (void)ec; (void)em;
     if (!strcmp(m, "getconnectioncount")) return cmd_getconnectioncount(res);
@@ -2895,12 +3000,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getprivatebroadcastinfo")) return cmd_getprivatebroadcastinfo(res, ec, em);
     if (!strcmp(m, "bmcgetdownloadinfo"))  return cmd_bmcgetdownloadinfo(res);
     if (!strcmp(m, "abortprivatebroadcast"))   return cmd_abortprivatebroadcast(params, res, ec, em);
-    if (!strcmp(m, "getmempoolcluster"))
-        return cmd_net_unsupported(
-            "this node's mempool has no cluster linearization: it tracks the "
-            "ancestor/descendant graph (see getmempoolancestors) but not "
-            "Core's cluster mempool structure, so there are no clusters to "
-            "report", ec, em);
+    if (!strcmp(m, "getmempoolcluster")) return cmd_getmempoolcluster(params, res, ec, em);
     if (!strcmp(m, "getblockfrompeer"))
         return cmd_net_unsupported(
             "peer connections belong to the forked download worker, which "
