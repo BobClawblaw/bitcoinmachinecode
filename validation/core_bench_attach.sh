@@ -53,7 +53,11 @@ sleep 60
 H=$($CLI getblockcount)
 ph "CAPSTONE starting gettxoutsetinfo at h=$H (no client timeout; this walks the set)"
 OM=""; for try in 1 2 3; do
-  OM=$($CLI gettxoutsetinfo 2>>"$PH" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['muhash'], r['txouts'])" 2>/dev/null)
+  # 2026-09-13: this called gettxoutsetinfo with NO hash type. Core's default is
+  # hash_serialized_3, whose response has no "muhash" key at all, so the lookup
+  # raised, python printed nothing, and the capstone reported an empty hash three
+  # times running. The argument is not optional.
+  OM=$($CLI gettxoutsetinfo muhash 2>>"$PH" | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['muhash'], r['txouts'])" 2>/dev/null)
   [ -n "$OM" ] && break
   ph "CAPSTONE our side returned nothing (attempt $try/3); retrying in 120s"
   sleep 120
