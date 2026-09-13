@@ -32,6 +32,7 @@ DEST=${DEST:-/mnt/2tbssd/bmc-bench}
 SRCREF=${SRCREF:-HEAD}
 P2P=${P2P:-8462}; RPC=${RPC:-8461}
 WORKERS=${WORKERS:-8}
+. "$(dirname "$0")/lib/ibd_harness_lib.sh"
 ORACLE=${ORACLE:-"/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"}
 PH="$DEST/phase.log"; PROG="$DEST/progress.log"
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -79,25 +80,16 @@ ph "DAEMON pid=$(cat daemon.pid) epoch=$T0"
 CLI="src/asm/daemon/bmc_cli -rpcport=$RPC -datadir=$DEST/data -rpcclienttimeout=0"
 while :; do
     sleep 300
-    # 2026-09-12: this read console.log, which holds ONLY the startup banner --
-    # the daemon redirects its running log to data/main/debug.log (its [boot]
-    # line says so). Every tick therefore recorded hb='' and bad=0 for three
-    # runs: no heartbeat, and, worse, a bad-marker check that could never fire.
-    # Three separate mistakes, all of which had to be fixed to get one number:
-    #   - the file: data/main/debug.log, not console.log
-    #   - the pattern: the heartbeat is "[dlc] == elapsed ...", and "\[dl\] "
-    #     cannot match "[dlc]" because it demands "] " straight after "dl"
-    #   - grep -a: debug.log carries NUL bytes, so grep calls it binary and
-    #     prints nothing at all, counts included
+    # The readers live in lib/ibd_harness_lib.sh and are tested by
+    # test_ibd_harness.sh. They were inline here until 2026-09-12, which is how
+    # three of them stayed broken for three runs: nothing could call a piece of
+    # this script, so nothing ever checked that the heartbeat it recorded was a
+    # heartbeat. Two of those defects reported success rather than failing.
     LOG=data/main/debug.log
-    hb=$(grep -a '\[dlc\] == elapsed' "$LOG" 2>/dev/null | tail -1 | sed 's/.*== //;s/ ==.*//')
-    [ -z "$hb" ] && hb=$(grep -a '\[dl\] heartbeat' "$LOG" 2>/dev/null | tail -1 | sed 's/.*heartbeat: //')
-    bad=$(grep -aE 'FATAL|REJECT|HALTED|SEGV' "$LOG" 2>/dev/null | grep -vE '\[reorg\] (candidate REJECTED|probe of )' | grep -c .)
+    hb=$(ibd_heartbeat "$LOG")
+    bad=$(ibd_bad_markers "$LOG")
     du=$(du -sh data 2>/dev/null | cut -f1)
-    # the 2026-09-11 occupancy figure: the share of worker wall-clock spent
-    # blocked in the socket read. Recorded every tick so the sync's throughput
-    # can be read against whether the peers were ever able to fill the pipe.
-    idle=$(grep -aoE 'pool idle [0-9]+%' "$LOG" 2>/dev/null | tail -1)
+    idle=$(ibd_occupancy "$LOG")
     echo "$(ts) hb='$hb' disk=$du ${idle:+$idle} bad=$bad" >> "$PROG"
     [ "${bad:-0}" != "0" ] && { ph "FAIL bad markers"; echo FAIL > RESULT; exit 1; }
     ours=$($CLI getblockcount 2>/dev/null); theirs=$($ORACLE getblockcount 2>/dev/null)
