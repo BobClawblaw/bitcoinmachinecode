@@ -101,7 +101,10 @@ while :; do
   fi
 done
 sleep 60
-OM=$($CLI gettxoutsetinfo 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['muhash'], r['txouts'])" 2>/dev/null)
+# 2026-09-13: needs the hash type. Core's default is hash_serialized_3, whose
+# response has no "muhash" key, so r['muhash'] raised and the capstone read an
+# empty value -- failing a run whose UTXO set matched the oracle exactly.
+OM=$($CLI gettxoutsetinfo muhash 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['muhash'], r['txouts'])" 2>/dev/null)
 H=$($CLI getblockcount)
 CM=$($ORACLE gettxoutsetinfo muhash "$H" 2>/dev/null | python3 -c "import sys,json; r=json.load(sys.stdin); print(r['muhash'], r['txouts'])" 2>/dev/null)
 ph "MUHASH h=$H ours=$OM oracle=$CM"

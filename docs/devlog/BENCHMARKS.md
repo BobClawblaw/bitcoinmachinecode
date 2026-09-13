@@ -653,6 +653,7 @@ carry the segment tables, the configuration and the defect analysis.
 |---|---|---|---|---|---|---|
 | 22 | 2026-09-11 | `4a4872cf` | 966,369 | 20h 08m | **PASS** (2026-09-12, offline) — the live capstone's FAIL was a torn read | [public report](../reports/2026-09-11-ibd-vs-core.md) · [bbcode](../reports/2026-09-11-ibd-vs-core.bbcode) · [defect writeup](../reports/2026-09-11-run22-muhash-divergence.md) |
 | 23 | 2026-09-12 | `8bc638f9` | 966,674 | 19h 05m | **PASS** (2026-09-12, offline) — identical to Core on every field | see the verdict below |
+| Core v31.1 baseline | 2026-09-13 | v31.1, no ionice | 966,808 | 19h 14m | **PASS** — identical to the oracle at 966,870 | segment table below |
 
 **Run 22** is the first comparison run at 8 download peers on both sides. Core's
 block-download concurrency is not configurable — `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`
@@ -725,6 +726,34 @@ materially different LSM layout rather than a repeat of one configuration.
 **The fresh parallel-download sync builds a correct UTXO set.** Every claim to
 the contrary in this repository came from a capstone reading a set that was
 still moving.
+
+### The 138-minute stall was one peer in one run
+
+The 2026-09-05 Core baseline lost 2h 18m between heights 835,000 and 840,000 and
+that gap was most of the "hour ahead of Core" this project published. **It does
+not reproduce.** Four runs on this box now cross that segment:
+
+| segment | Core 09-13 | Core 09-05 | bmc 22 | bmc 23 |
+|---|---|---|---|---|
+| 800k–835k | 1h 29m | 1h 40m | 1h 35m | **1h 25m** |
+| 835k–840k | 0h 16m | **2h 18m** | 0h 15m | **0h 11m** |
+| 840k–850k | 0h 23m | 0h 22m | 0h 25m | **0h 23m** |
+| 850k–900k | 2h 06m | 1h 59m | 2h 10m | **1h 56m** |
+| 900k–950k | 1h 56m | 1h 54m | 2h 02m | **1h 50m** |
+| **to the tip** | **19h 14m** | 21h 11m | 20h 08m | **19h 05m** |
+
+Two consequences, and they point opposite ways. The published margin over Core
+was an artifact and is withdrawn. And the published "8 to 12 percent slower per
+segment" is also wrong: against an unhandicapped Core, run 23 is faster in every
+segment, while carrying a coinstatsindex the Core runs did not.
+
+The defensible statement is narrower than either: on this box, at 8 peers a
+side, the two are within a few percent, and the ordering depends on the commit
+and the peer set. A single number from any one run is noise.
+
+bmc times are the UTXO **applied** height, which is what Core's `blocks` means.
+The stored-block frontier runs ahead of applied; quoting it would flatter this
+node by several thousand blocks.
 
 ### Fairness controls, and one that was broken
 

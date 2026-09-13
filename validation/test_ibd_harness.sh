@@ -146,6 +146,19 @@ for f in ./*.sh; do
 done
 ck "no #!-carrying harness is left non-executable" "$missing" ""
 
+echo "== gettxoutsetinfo always names its hash type =="
+# 2026-09-13: core_bench_attach.sh called `gettxoutsetinfo` with no hash type.
+# Core's default is hash_serialized_3, whose response has NO "muhash" key, so
+# the capstone read an empty value three times and failed a run whose UTXO set
+# was in fact identical to the oracle's. Any caller that goes on to read
+# r['muhash'] must ask for muhash.
+# Only INVOCATIONS count: a ph/echo line that merely mentions the call by name
+# is not a call. Match lines where it follows a CLI variable.
+badhash=$(grep -nE '\$(CLI|ORACLE|C)[^|]*gettxoutsetinfo' \
+          $(ls ./*.sh | grep -v test_ibd_harness) 2>/dev/null \
+          | grep -v 'gettxoutsetinfo muhash' | grep -vc ':[[:space:]]*#' || true)
+ck "every gettxoutsetinfo call names muhash" "$badhash" "0"
+
 echo "== every harness parses, and reads the right log =="
 # A harness with a syntax error is found when someone launches a 20-hour run,
 # not before. bash -n costs milliseconds.
