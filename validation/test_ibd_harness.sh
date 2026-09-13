@@ -91,6 +91,51 @@ chmod 755 "$T/runner.sh"
 out=$(ibd_require_exec "$T/runner.sh"); ckc "mode 755 passes" "$?" "0"
 out=$(ibd_require_exec "$T/nope.sh");   ckc "a missing program is refused" "$?" "1"
 
+echo "== core-bench readers =="
+J='{"blocks":740351,"headers":966753,"verificationprogress":0.5257,"chain":"main"}'
+ck "a present field is read"            "$(bench_json_field "$J" blocks)" "740351"
+ck "a float field is read verbatim"     "$(bench_json_field "$J" verificationprogress)" "0.5257"
+# The defect this replaces: `|| echo 0` reported 0 for an absent field and for a
+# dead RPC alike, so a stopped daemon looked like a node at height zero.
+bench_json_field "$J" nosuchfield >/dev/null 2>&1; ckc "an ABSENT field is rc 1, not 0" "$?" "1"
+ck  "...and prints nothing"             "$(bench_json_field "$J" nosuchfield 2>/dev/null)" ""
+bench_json_field "" blocks >/dev/null 2>&1;         ckc "empty input (dead RPC) is rc 1" "$?" "1"
+bench_json_field "not json" blocks >/dev/null 2>&1; ckc "unparseable input is rc 1" "$?" "1"
+bench_json_field "[1,2]" blocks >/dev/null 2>&1;    ckc "a JSON array is rc 1, not a field read" "$?" "1"
+
+echo "== core-bench tip test =="
+bench_tip_reached 966752 966753 1.0;   ckc "at the tip with vbf 1.0 -> rc 0" "$?" "0"
+bench_tip_reached 740351 966753 0.52;  ckc "mid-sync -> rc 1" "$?" "1"
+bench_tip_reached 966752 966753 0.98;  ckc "height reached but vbf low -> rc 1" "$?" "1"
+# The trap: ${theirs:-99999999} made a dead oracle mean "never at the tip", so a
+# finished run waited forever and said nothing. Unreadable must be its own answer.
+bench_tip_reached 966752 "" 1.0;       ckc "an unreadable ORACLE height is rc 2 (cannot tell)" "$?" "2"
+bench_tip_reached "" 966753 1.0;       ckc "an unreadable OUR height is rc 2" "$?" "2"
+bench_tip_reached 966752 966753 "";    ckc "an unreadable vbf is rc 2" "$?" "2"
+bench_tip_reached 966752 966753 "abc"; ckc "a non-numeric vbf is rc 2" "$?" "2"
+
+echo "== every runnable harness carries its exec bit =="
+# The fourth recurrence in one day: a bench runner rewritten to mode 644 so a
+# queue announced a launch that never happened; a build artifact at 644 that
+# read as 34 unrelated gate failures; and this very file, stripped by the script
+# that wrote it.
+#
+# THE ROOT CAUSE, found 2026-09-13: this repo sets core.fileMode=false, so git
+# IGNORES exec bits. `chmod +x` is invisible to git and never reaches a commit,
+# and every fresh clone gets 644 again. This check found 15 harnesses in that
+# state, fresh_ibd_run.sh and download_worker_sweep.sh among them. The fix is
+# `git update-index --chmod=+x <file>`, which writes 100755 into the index
+# whatever core.fileMode says -- chmod alone will not do it here.
+missing=""
+# lib/ is SOURCED, never run, so its exec bit is irrelevant -- only files a
+# caller invokes directly are checked.
+for f in ./*.sh; do
+    [ -f "$f" ] || continue
+    head -1 "$f" | grep -q '^#!' || continue      # only files meant to be run
+    [ -x "$f" ] || missing="$missing $f"
+done
+ck "no #!-carrying harness is left non-executable" "$missing" ""
+
 echo
 echo "passed $pass, failed $fail"
 [ "$fail" -eq 0 ] || exit 1
