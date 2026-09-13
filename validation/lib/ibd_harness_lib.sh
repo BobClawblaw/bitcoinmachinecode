@@ -129,3 +129,27 @@ bench_tip_reached() {
     python3 -c "import sys; sys.exit(0 if float('$vbf') > 0.9999 else 1)" 2>/dev/null || return 1
     return 0
 }
+
+# Where this daemon actually writes its running log, given a DATADIR.
+#
+# Harnesses kept reading <datadir>/console.log, which holds ONLY the startup
+# banner -- the daemon says so itself in its first [boot] line and then logs to
+# <datadir>/<chain>/debug.log. The split matters and both halves are legitimate:
+#   console.log : the banner, the "no config file" refusal, the [config] lines
+#                 printed before logging is redirected. Startup checks read it.
+#   debug.log   : everything the running node emits. Every heartbeat, every
+#                 throughput line, every FATAL. Progress checks read this.
+# Three harnesses read the wrong half and measured nothing at all.
+ibd_daemon_log() {
+    local datadir="$1" chain="${2:-main}"
+    printf '%s/%s/debug.log' "$datadir" "$chain"
+}
+
+# The download pool's most recent average receive rate, e.g. "avg 10.8MB/s".
+# download_worker_sweep.sh read this from console.log, where the string appears
+# ZERO times -- it appears 5,916 times in one archived debug.log. The sweep's
+# cross-check on bytes_total would have been empty for every arm.
+ibd_throughput() {
+    local log="$1"
+    grep -aoE 'avg [0-9.]+MB/s' "$log" 2>/dev/null | tail -1
+}

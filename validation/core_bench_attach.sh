@@ -21,7 +21,13 @@ T0=$(cat epoch.start); PID=$(cat daemon.pid)
 kill -0 "$PID" 2>/dev/null || { ph "ATTACH FAIL: daemon pid $PID is not running"; exit 1; }
 ph "ATTACH monitoring pid=$PID from epoch=$T0 (elapsed already $(( $(date +%s)-T0 ))s)"
 
-jget(){ python3 -c "import sys,json; print(json.load(sys.stdin).get('$1',0))" 2>/dev/null || echo 0; }
+# 2026-09-13: this was `...get('$1',0) || echo 0`, which cannot tell "the node
+# says 0" from "the RPC is dead" -- the same silent-success shape that made the
+# IBD heartbeat log '' for three runs. bench_json_field returns rc 1 and prints
+# nothing when the field is absent or the input unreadable, and the tip test
+# below answers "cannot tell" separately from "not yet".
+. "$(dirname "$0")/lib/ibd_harness_lib.sh"
+jget(){ bench_json_field "$(cat)" "$1"; }
 
 while :; do
   info=$($CLI getblockchaininfo 2>/dev/null)
@@ -32,8 +38,11 @@ while :; do
   theirs=$($ORACLE getblockcount 2>/dev/null)
   echo "$(ts) blocks=$h headers=$headers vbf=$vbf disk=$du rss=$rss oracle=$theirs elapsed=$(( $(date +%s)-T0 ))s" >> "$PROG"
   kill -0 "$PID" 2>/dev/null || { ph "FAIL daemon died at blocks=$h"; echo FAIL > RESULT; exit 1; }
-  if [ -n "${theirs:-}" ] && [ "${h:-0}" -ge $(( theirs - 1 )) ] \
-     && python3 -c "import sys; sys.exit(0 if float('$vbf')>0.9999 else 1)"; then
+  bench_tip_reached "$h" "$theirs" "$vbf"; tipres=$?
+  if [ $tipres -eq 2 ]; then
+      ph "WARN cannot tell whether the tip is reached (ours='$h' oracle='$theirs' vbf='$vbf') -- an unreadable side is not 'not yet'"
+  fi
+  if [ $tipres -eq 0 ]; then
     ph "TIP reached: ours=$h oracle=$theirs vbf=$vbf elapsed=$(( $(date +%s)-T0 ))s"
     break
   fi
