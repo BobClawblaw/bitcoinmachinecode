@@ -191,7 +191,7 @@ if ! bmc getrawmempool | grep -q "$TXID"; then
   CTRL=$(core -rpcwallet=e2ecore sendtoaddress "$(core -rpcwallet=e2ecore getnewaddress)" 0.7); BUMPED=1
   for i in $(seq 60); do bmc getrawmempool | grep -q "$TXID" && break; sleep 1; done
 fi
-[ $BUMPED = 1 ] && echo "  (note: Core announced the private tx to our leg only after another tx bumped its inbound announcement bucket; inv batches to our leg: $(grep -c 'sending inv' "$CORE_DIR/regtest/debug.log"))"
+[ $BUMPED = 1 ] && echo "  (note: Core announced the private tx to our leg only after another tx bumped its inbound announcement bucket; inv batches to our leg: $(grep -ac 'sending inv' "$CORE_DIR/regtest/debug.log"))"
 bmc getrawmempool | grep -q "$TXID" && ok "the tx came BACK to us over the normal leg and entered our mempool" || fail "our mempool never got it back: $(bmc getrawmempool)"
 sleep 2
 INFO=$(bmc getprivatebroadcastinfo); [ "$(echo "$INFO" | jget "len(d['result']['transactions'])")" = 0 ] && ok "the queue is empty after the receipt (Core: 'stopping private broadcast attempts')" || fail "queue not empty: $INFO"

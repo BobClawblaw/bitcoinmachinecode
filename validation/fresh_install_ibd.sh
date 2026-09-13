@@ -10,6 +10,7 @@
 # Writes <dest>/phase.log (timestamps of every phase), <dest>/progress.log
 # (a line every 10 min while syncing), <dest>/RESULT at the end.
 set -u
+. "$(dirname "$0")/lib/ibd_harness_lib.sh"
 DEST=${1:?dest dir}; ORACLE=${2:-"/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"}
 # RESUME=1 restarts an interrupted run on the datadir it already built: the
 # clone, the build and the configuration are left exactly as they were, the
@@ -64,14 +65,21 @@ CLI="src/asm/daemon/bmc_cli -datadir=$DEST/data"
 last_phase=""
 while :; do
     sleep 600
-    hb=$(grep '\[dl\] heartbeat' console.log | tail -1 | sed 's/.*heartbeat: //')
+    # 2026-09-13: console.log holds only the startup banner; the daemon logs to
+    # <datadir>/main/debug.log. Same triple defect as fresh_ibd_run.sh carried
+    # for three runs -- wrong file, and a bad-marker check that could never
+    # fire. The STARTUP checks above still read console.log, correctly: the
+    # "no config file" refusal and the [config] lines are printed there before
+    # logging is redirected.
+    LOG=$(ibd_daemon_log "$DEST/data")
+    hb=$(ibd_heartbeat "$LOG")
     # A lagging peer offering its own shorter chain makes the node log
     # "[reorg] candidate REJECTED ... (no action taken)". That is the node
     # being right, and it is routine on mainnet -- it must not fail the run.
-    bad=$(grep -E 'FATAL|REJECT|HALTED|SEGV' console.log | grep -vE '\[reorg\] (candidate REJECTED|probe of )' | grep -c .)
+    bad=$(ibd_bad_markers "$LOG")
     du=$(du -sh data 2>/dev/null | cut -f1); rss=$(ps -o rss= -p "$(cat daemon.pid)" 2>/dev/null | awk '{printf "%.1fG", $1/1048576}')
     for m in 'header' 'catch-up' 'bulk' '\[utxo_live\] init' 'coinstats\] adopted' 'keep-up'; do
-        l=$(grep -m1 -E "$m" console.log | cut -c1-140); [ -n "$l" ] && ! grep -qF "$m" "$PH" && ph "PHASE first '$m': $l"
+        l=$(grep -am1 -E "$m" "$LOG" | cut -c1-140); [ -n "$l" ] && ! grep -qF "$m" "$PH" && ph "PHASE first '$m': $l"
     done
     echo "$(ts) $hb disk=$du rss=$rss bad=$bad" >> progress.log
     if ! kill -0 "$(cat daemon.pid)" 2>/dev/null; then ph "FAIL daemon died (bad=$bad)"; echo FAIL > RESULT; exit 1; fi

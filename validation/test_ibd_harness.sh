@@ -114,6 +114,16 @@ bench_tip_reached "" 966753 1.0;       ckc "an unreadable OUR height is rc 2" "$
 bench_tip_reached 966752 966753 "";    ckc "an unreadable vbf is rc 2" "$?" "2"
 bench_tip_reached 966752 966753 "abc"; ckc "a non-numeric vbf is rc 2" "$?" "2"
 
+echo "== daemon log location and throughput =="
+ck "the running log is <datadir>/<chain>/debug.log, not console.log" \
+   "$(ibd_daemon_log /x/data)" "/x/data/main/debug.log"
+ck "a non-default chain is honoured" "$(ibd_daemon_log /x/data signet)" "/x/data/signet/debug.log"
+printf '2026-09-12 11:50:00.000 [dl] recv avg 10.8MB/s over 8 legs\n' >> "$T/debug.log"
+ck "throughput reads the last avg line"        "$(ibd_throughput "$T/debug.log")" "avg 10.8MB/s"
+# The sweep's defect: this string never appears in console.log at all.
+ck "throughput from console.log is empty -- the sweep measured nothing" \
+   "$(ibd_throughput "$T/console.log")" ""
+
 echo "== every runnable harness carries its exec bit =="
 # The fourth recurrence in one day: a bench runner rewritten to mode 644 so a
 # queue announced a launch that never happened; a build artifact at 644 that
@@ -135,6 +145,23 @@ for f in ./*.sh; do
     [ -x "$f" ] || missing="$missing $f"
 done
 ck "no #!-carrying harness is left non-executable" "$missing" ""
+
+echo "== every harness parses, and reads the right log =="
+# A harness with a syntax error is found when someone launches a 20-hour run,
+# not before. bash -n costs milliseconds.
+broken=""
+for f in ./*.sh; do bash -n "$f" 2>/dev/null || broken="$broken $f"; done
+ck "no harness has a syntax error" "$broken" ""
+
+# The NUL trap, enforced across the tree: any grep of a debug.log must pass -a,
+# or a single NUL byte makes the file read as empty and the check silently
+# passes. Three harnesses were in that state.
+# This file is excluded: it DESCRIBES the pattern in prose, and a grep over the
+# tree matches its own comment (the file:line prefix defeats a ^# filter).
+nula=$(grep -nE "grep (-[a-zA-Z]*)?[a-zA-Z-]* *['\"]?[^|]*debug\.log" \
+        $(ls ./*.sh | grep -v test_ibd_harness) 2>/dev/null \
+        | grep -v 'grep -[a-zA-Z]*a' | grep -vc ':[[:space:]]*#' || true)
+ck "every debug.log grep passes -a" "$nula" "0"
 
 echo
 echo "passed $pass, failed $fail"

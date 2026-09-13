@@ -23,6 +23,7 @@
 # the bytes per block, are identical across arms. Arms are short and the
 # order is randomised, so a slow minute on the link does not land on one arm.
 set -u
+. "$(dirname "$0")/lib/ibd_harness_lib.sh"
 BASE=${BASE:-/mnt/2tbssd/sweep}
 SRC=${SRC:-/storage/bitcoinmachinecode}
 ARMS=${ARMS:-"8 16 24 32"}
@@ -62,7 +63,11 @@ CONF
     BYTES=$(echo "$INFO" | sed -n 's/.*"bytes_total": *\([0-9]*\).*/\1/p' | head -1)
     HEIGHT=$("$CLI" -rpcport=$RPCPORT -datadir="$D" getblockcount 2>/dev/null)
     # the console's own recv average is the cross-check on bytes_total
-    RECV=$(grep -oE 'avg [0-9.]+MB/s' "$D/console.log" | tail -1)
+    # 2026-09-13: this read $D/console.log, where "avg N MB/s" appears ZERO
+    # times -- it is written to the daemon's running log. One archived debug.log
+    # carries 5,916 of them. Every arm of this sweep would have recorded an
+    # empty cross-check, and the sweep has never been run, so nobody saw it.
+    RECV=$(ibd_throughput "$(ibd_daemon_log "$D")")
     say "arm w=$W : height=$HEIGHT bytes=$BYTES window=$((T1-T0))s console_avg=$RECV pool_idle=${IDLE}%"
     PID=$(cat "$D/pid" 2>/dev/null)
     [ -n "${PID:-}" ] && kill -TERM "$PID" 2>/dev/null
