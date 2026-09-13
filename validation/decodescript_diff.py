@@ -34,6 +34,10 @@ WHAT THE MATRIX COVERS
 """
 import os, sys, json, subprocess, urllib.request
 
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
+
 RPC_URL = os.environ.get("RPC_URL", "http://127.0.0.1:18545")
 RPC_USER = os.environ.get("RPC_USER", "x")
 RPC_PASS = os.environ.get("RPC_PASS", "y")
@@ -119,9 +123,17 @@ def real_cases(n_blocks=3):
 
 
 def main():
+    syn = synthetic_cases()
+    real = real_cases()
+    # 2026-09-13: without this, an empty `cases` prints "ALL 0 MATCH" and exits
+    # 0 -- a differential that compared nothing reporting success. real_cases()
+    # pulls from the chain, so a missing datadir or an unreachable oracle used
+    # to degrade this silently to synthetic-only while still claiming a pass.
+    require_sources({"synthetic": len(syn), "real": len(real)})
     cases = {}
-    cases.update(synthetic_cases())
-    cases.update(real_cases())
+    cases.update(syn)
+    cases.update(real)
+    require_cases(len(cases), "decodescript cases")
     fails = 0
     for name, scr in cases.items():
         o = strip_desc(ours(scr))
