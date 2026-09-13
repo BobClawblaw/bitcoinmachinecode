@@ -85,3 +85,47 @@ ibd_require_exec() {
     [ -x "$p" ] || { printf 'FAIL not executable: %s' "$p"; return 1; }
     printf 'OK %s' "$p"; return 0
 }
+
+# --------------------------------------------------------------------------
+# Readers for the Core-side bench runner (run_core_bench.sh).
+#
+# Its originals were written as
+#     h=$(echo "$info" | python3 -c "...get('blocks',0)" || echo 0)
+# which cannot tell "the node says height 0" from "the RPC is dead". A run whose
+# daemon stopped answering reports blocks=0 forever and the loop waits forever:
+# the same silent-success shape as the heartbeat that logged '' for three runs.
+# Worse, the tip test read
+#     [ "$h" -ge $(( ${theirs:-99999999} - 1 )) ]
+# so an oracle that stopped answering made the tip UNREACHABLE rather than
+# raising anything -- a 20-hour run that could never finish and never say why.
+# --------------------------------------------------------------------------
+
+# Print one top-level field of a JSON object. Returns 1 (printing nothing) when
+# the input is not an object or the field is absent -- ABSENT IS NOT ZERO.
+bench_json_field() {
+    local json="$1" field="$2"
+    printf '%s' "$json" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+if not isinstance(d, dict) or sys.argv[1] not in d:
+    sys.exit(1)
+v = d[sys.argv[1]]
+sys.stdout.write("" if v is None else str(v))
+' "$field" 2>/dev/null
+}
+
+# Has the run reached the oracle's tip? Returns 0 only when every input is a
+# real number AND the condition holds. An unreadable side is rc 2 ("cannot
+# tell"), which a caller must treat as a problem, never as "not yet".
+bench_tip_reached() {
+    local ours="$1" theirs="$2" vbf="$3"
+    case "$ours"   in ''|*[!0-9]*)      return 2;; esac
+    case "$theirs" in ''|*[!0-9]*)      return 2;; esac
+    case "$vbf"    in ''|*[!0-9.eE+-]*) return 2;; esac
+    [ "$ours" -ge $(( theirs - 1 )) ] || return 1
+    python3 -c "import sys; sys.exit(0 if float('$vbf') > 0.9999 else 1)" 2>/dev/null || return 1
+    return 0
+}
