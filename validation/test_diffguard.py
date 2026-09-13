@@ -47,13 +47,10 @@ ck("the OLD shape really does report success on zero cases", summary == "ALL 0 M
 ck("...and the guard refuses that exact input", exits_with('require_cases(0, "cases")', 2))
 
 print("== the ratchet: unguarded differentials may shrink, never grow ==")
-# 16 of the 17 *_diff.py tools still end with the shape above: an empty case set
-# prints ALL 0 MATCH and exits 0. Fixing all of them at once is a bigger change
-# than this one, and a gate that fails on known, recorded debt is noise nobody
-# reads. So this is a RATCHET: it pins the number today and fails the moment a
-# NEW unguarded differential appears, or when someone guards one and forgets to
-# lower the bound. Lower UNGUARDED_MAX as they are converted.
-UNGUARDED_MAX = 16
+# All 17 *_diff.py tools are now guarded (2026-09-13). The ratchet stays at 0 so
+# a NEW differential that forgets the guard fails here rather than shipping able
+# to report "ALL 0 MATCH" over an empty case set. Raise this only with a reason.
+UNGUARDED_MAX = 0
 here = os.path.dirname(os.path.abspath(__file__))
 unguarded = []
 for fn in sorted(os.listdir(here)):

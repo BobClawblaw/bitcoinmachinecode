@@ -19,6 +19,10 @@ Exit 0 if zero divergences.
 """
 import os, sys, subprocess, json, time, hashlib, struct
 
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, '..'))
 SHIM = os.path.join(ROOT, 'asm', 'tests', 'consensus_shim')
@@ -165,7 +169,9 @@ def main():
 
     shim = Shim()
     divs = []
+    ran = []                 # one entry per case actually compared
     def check(label, block):
+        ran.append(label)
         # ASM structural sigop count + verdict
         s = shim.sigops(block)
         asm_ok = s['ok'] == 1
@@ -211,6 +217,10 @@ def main():
     shim.close()
 
     print('\n==== sigops differential ====')
+    # This tool has no case list: check() is called by hand. With no counter,
+    # a build failure before the first check() printed 'divergences: 0' and
+    # exited clean, having compared nothing. Both arms are required.
+    require_cases(len(ran), 'sigops cases', minimum=2)
     print('MAX_BLOCK_SIGOPS=%d  divergences=%d' % (MAX_SIGOPS, len(divs)))
     for d in divs:
         print('  DIVERGENCE', d)

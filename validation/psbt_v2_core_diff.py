@@ -14,6 +14,10 @@ P2SH-P2WPKH and P2WSH(pk):
     errors carry Core's text.
 Needs the scratch Core build (never the production install)."""
 import base64, json, os, re, subprocess, sys, tempfile, time, hashlib
+
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
 CORE = os.environ.get("CORE_BIN", "/storage/bitcoin-core-source/build-zmq/bin")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PORT, RPCPORT = int(os.environ.get("PORT_BASE", "18590")), int(os.environ.get("PORT_BASE", "18590")) + 1
@@ -226,6 +230,9 @@ def main():
     finally:
         ours.close(); core.stop()
     for f in findings: print("FINDING", f)
+    # OK counts passing comparisons; with none made this prints
+    # 'RESULT: 0 ok, 0 fail' and returns 0.
+    require_cases(OK + len(FAILS), 'psbt v2 checks')
     print(f"RESULT: {OK} ok, {len(FAILS)} fail" + (f"; {len(findings)} finding(s) on full-JSON decode parity" if findings else ""))
     return 1 if FAILS else 0
 if __name__ == "__main__": sys.exit(main())

@@ -5,12 +5,19 @@ witness), CPFP present with parent-before-child on both, identical tx sets,
 BIP23 proposal verdicts verbatim, and longpoll blocking until the tip moves."""
 import json, subprocess, urllib.request, base64, time, threading, struct, hashlib, sys
 
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
+
 CLI = ["/storage/bitcoin-core-source/build/bin/bitcoin-cli",
        "-datadir=/storage/core-regtest", "-rpcport=18460", "-rpcwallet=reg"]
 BMC = "http://127.0.0.1:19446/"
 AUTH = base64.b64encode(b"mbmc:mbmcpw").decode()
 fails = 0
+_dg_ck = 0          # comparisons actually made (see require_cases at the end)
 def ck(l, c):
+    global _dg_ck
+    _dg_ck += 1
     global fails
     print(("  ok  " if c else "  FAIL ") + l)
     if not c: fails += 1
@@ -219,5 +226,8 @@ ck("longpoll returned after the new block", not th.is_alive() and res.get("dt",0
 ck("longpoll template is for the NEW tip (height %s)" % res.get("height"),
    res.get("height") == tip_before + 2)
 
+# This module has no case counter -- ck() only tracks failures, so a setup
+# failure before the first check prints ALL DIFFS PASS. _dg_ck counts calls.
+require_cases(_dg_ck, 'mining polish checks')
 print("\n%s (%d failures)" % ("ALL DIFFS PASS" if fails == 0 else "DIFFS FAILED", fails))
 sys.exit(1 if fails else 0)
