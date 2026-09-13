@@ -16,6 +16,10 @@ Core v31.99 on regtest (2026-09-01).
           testmempoolaccept + a mined block judge.
 Reuses validation/miniscript_core_diff.py's Core/Ours/shell helpers."""
 import os, sys, json, re, shutil, tempfile, subprocess, hashlib, time
+
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import miniscript_core_diff as m
 m.PORT, m.RPCPORT = 18590, 18591
@@ -174,6 +178,9 @@ def main():
         try: ours.close()
         except Exception: pass
         core.stop(); shutil.rmtree(tmp, ignore_errors=True)
+    # checks counts the comparisons made; zero of them prints "RESULT: 0 ok,
+    # 0 fail" and exits 0.
+    require_cases(checks, "updater checks")
     print(f"RESULT: {checks - fails} ok, {fails} fail")
     sys.exit(1 if fails else 0)
 if __name__ == "__main__": main()

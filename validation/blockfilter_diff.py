@@ -20,6 +20,10 @@ asm/tests/test_block_filter.c and the element-set semantics tests beside them.
 """
 import json, os, subprocess, sys
 
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
+
 CONF    = "/storage/core-oracle/bitcoin.conf"
 DATADIR = "/storage/core-oracle"
 CLI     = "/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli"
@@ -77,6 +81,9 @@ def main():
         if not ok: bad += 1
         print(f"  {h:>8}  {'OK  ' if ok else 'DIFF'}  {len(prevs):>6} prevouts   "
               f"ours={len(got)//2}B core={len(want)//2}B{'' if ok else '   <-- MISMATCH'}")
+    # Every height can be skipped (a missing block, an unreachable node) and
+    # this would still print "0 height(s) compared, 0 mismatch(es)" and return 0.
+    require_cases(len(heights) - skipped, "heights actually compared")
     print(f"\n{len(heights) - skipped} height(s) compared, {bad} mismatch(es)")
     return 1 if bad else 0
 

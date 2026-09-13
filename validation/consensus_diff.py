@@ -40,6 +40,10 @@ validation/consensus_diff_report.json (cwd-independent).
 """
 import sys, os, json, time, subprocess, random, hashlib, collections
 
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, '..'))
 SHIM = os.path.join(ROOT, 'asm', 'tests', 'consensus_shim')
@@ -329,6 +333,10 @@ def main():
     print('  ACCEPT: run=%d ok=%d' % (stats['accept_run'], stats['accept_ok']))
     print('  REJECT (ASM⊃Core paired): run=%d agree=%d both-accepted=%d' %
           (stats['reject_run'], stats['reject_agree'], stats['reject_both_accepted']))
+    # Both arms must actually have run. Without this, a shim that failed to
+    # start reports 'ACCEPT: run=0' and 'divergences: 0' and exits clean.
+    require_sources({'accept cases': stats['accept_run'],
+                     'reject cases': stats['reject_run']})
     print('  divergences: %d' % len(divs))
     report.update({'tip': blocks, 'accept': accepts, 'reject': rejects,
                    'divergences': divs, 'stats': dict(stats)})

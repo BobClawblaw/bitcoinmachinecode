@@ -84,6 +84,10 @@ Usage:
 Exit 0 if zero divergences. Writes validation/bip30_diff_report.json.
 """
 import os, sys, subprocess, hashlib, struct, time, json, shutil, argparse, tempfile
+
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
 from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -423,6 +427,13 @@ def main():
         d, r2 = part2(args, SHIM_LEGACY)
         divs += d; part2_res = r2
 
+    # Each SELECTED part must have produced a result. part1_res/part2_res stay
+    # None when a part returned nothing, and the report then prints
+    # 'divergences: 0' over a run that compared nothing at all.
+    _sel = {}
+    if args.part in ('1', 'all'): _sel['part1'] = 0 if part1_res is None else 1
+    if args.part in ('2', 'all'): _sel['part2'] = 0 if part2_res is None else 1
+    require_sources(_sel)
     report['part1'] = part1_res
     report['part2'] = part2_res
     report['divergences'] = divs

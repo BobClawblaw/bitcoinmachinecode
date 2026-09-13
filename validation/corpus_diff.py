@@ -42,6 +42,10 @@ Exit 0 if zero divergences, 1 otherwise. Writes validation/corpus_diff_report.js
 and validation/corpus_diff_report.txt (cwd-independent).
 """
 import sys, os, json, time, subprocess, random, hashlib, base64
+
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
 import http.client
 from concurrent.futures import ThreadPoolExecutor
 
@@ -538,6 +542,10 @@ def main():
     print('  TXID ok=%d/%d' % (stats['txid_ok'], stats['txid_run']), flush=True)
     print('  MUT run=%d agree=%d both-accepted=%d' %
           (stats['mut_run'], stats['mut_agree'], stats['mut_both_accepted']), flush=True)
+    # txid_run is how many transactions were actually compared. A corpus that
+    # failed to load reports ok=0/0 and divergences: 0 -- a clean pass over
+    # nothing.
+    require_cases(stats['txid_run'], 'corpus transactions')
     print('  divergences: %d' % len(divs), flush=True)
 
     report = {

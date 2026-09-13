@@ -26,6 +26,10 @@ FULL COMPARE (no divergence)
 """
 import os, sys, json, subprocess, urllib.request, urllib.error, base64
 
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
+
 RPC_URL = os.environ.get("RPC_URL", "http://127.0.0.1:18545")
 RPC_USER = os.environ.get("RPC_USER", "x")
 RPC_PASS = os.environ.get("RPC_PASS", "y")
@@ -118,6 +122,8 @@ CASES = [
 
 
 def main():
+    # A differential over an empty case list prints ALL 0 MATCH and exits 0.
+    require_cases(len(CASES), "createmultisig cases")
     fails = 0
     for name, args in CASES:
         o, c = ours(*args), core(*args)
