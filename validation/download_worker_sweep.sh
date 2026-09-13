@@ -38,6 +38,7 @@ say "=== download worker sweep: arms=[$ARMS] ${MINUTES}min each, commit=$(git -C
 say "link: $(ip -br link show enp14s0 2>/dev/null | awk '{print $1,$2}') $(sudo ethtool enp14s0 2>/dev/null | awk -F': ' '/Speed/{print $2}')"
 
 # a randomised order, so a slow stretch of the link is not always the same arm
+FAILED_ARMS=""; RESULTS=""
 ORDER=$(for a in $ARMS; do echo "$RANDOM $a"; done | sort -n | awk '{print $2}')
 say "randomised arm order: $(echo $ORDER | tr '\n' ' ')"
 
@@ -52,7 +53,23 @@ bmc.bootcatchup=0
 bmc.catchupworkers=$W
 CONF
     say "--- arm w=$W : starting"
-    ( cd "$D" && "$SRC/asm/daemon/bmcbitcoind" serve "$D" >"$D/console.log" 2>&1 & echo $! > "$D/pid" )
+    # 2026-09-13: this was
+    #   ( cd "$D" && "$BIN" serve "$D" >console.log 2>&1 & echo $! > pid )
+    # where `&` backgrounds the whole `cd && cmd` LIST, so $! is the SUBSHELL's
+    # pid, not the daemon's. The subshell exits at once, `kill -0` on it fails
+    # immediately, and the arm logs "stopped" while the daemon and its forked
+    # download workers keep running and holding the port. Arms 2, 3 and 4 then
+    # died with "bind failed: Address already in use" and recorded nothing,
+    # while the sweep still printed "sweep done". One usable arm out of four.
+    #
+    # setsid puts the daemon in its own process GROUP so the whole tree can be
+    # signalled -- this node forks a worker per download slot, and killing only
+    # the parent leaves them holding the listening socket.
+    ( cd "$D" && setsid "$SRC/asm/daemon/bmcbitcoind" serve "$D" >"$D/console.log" 2>&1 & echo $! > "$D/pid" )
+    sleep 2
+    # the recorded pid is the daemon itself; record its group for the kill below
+    DPID=$(cat "$D/pid" 2>/dev/null)
+    ps -o pgid= -p "$DPID" 2>/dev/null | tr -d ' ' > "$D/pgid" || true
     sleep 90                                    # headers + the first chunks, before measuring
     T0=$(date +%s)
     sleep $((MINUTES*60))
@@ -69,11 +86,46 @@ CONF
     # empty cross-check, and the sweep has never been run, so nobody saw it.
     RECV=$(ibd_throughput "$(ibd_daemon_log "$D")")
     say "arm w=$W : height=$HEIGHT bytes=$BYTES window=$((T1-T0))s console_avg=$RECV pool_idle=${IDLE}%"
-    PID=$(cat "$D/pid" 2>/dev/null)
-    [ -n "${PID:-}" ] && kill -TERM "$PID" 2>/dev/null
+    # An arm that produced nothing must SAY SO. The first run of this sweep
+    # logged three arms as "height= bytes= console_avg= pool_idle=%" and still
+    # finished with "sweep done" -- the daemon had failed to bind and the script
+    # had no opinion about it. Empty fields are a failed arm, not a datapoint.
+    if [ -z "${BYTES:-}" ] || [ -z "${HEIGHT:-}" ] || [ -z "${IDLE:-}" ]; then
+        say "arm w=$W : FAILED -- no measurement (daemon up? port free? see $D/main/debug.log)"
+        grep -aE 'bind failed|lsock failed|FATAL' "$(ibd_daemon_log "$D")" 2>/dev/null | tail -2 | while read -r l; do say "    $l"; done
+        FAILED_ARMS="$FAILED_ARMS $W"
+    else
+        MBPS=$(python3 -c "print(f'{$BYTES/1048576/$((T1-T0)):.1f}')" 2>/dev/null)
+        say "arm w=$W : ${MBPS} MB/s over the window, idle ${IDLE}%"
+        RESULTS="$RESULTS $W:$MBPS:$IDLE"
+    fi
+    PID=$(cat "$D/pid" 2>/dev/null); PGID=$(cat "$D/pgid" 2>/dev/null)
+    [ -n "${PGID:-}" ] && kill -TERM -"$PGID" 2>/dev/null    # the whole tree
+    [ -n "${PID:-}"  ] && kill -TERM "$PID"   2>/dev/null
     # wait for it to close its files rather than racing the next arm's disk
     for i in $(seq 1 60); do kill -0 "$PID" 2>/dev/null || break; sleep 2; done
+    # AND wait for the port to actually be free. Waiting on the pid alone is what
+    # let the next arm start into a held socket: the forked workers outlive the
+    # parent by a moment, and a listening socket they still hold is a bind
+    # failure for the arm that follows.
+    for i in $(seq 1 60); do
+        ss -lnt 2>/dev/null | grep -qE ":$PORT\b" || break
+        [ "$i" = 60 ] && say "WARN port $PORT still held after 120s; the next arm will fail to bind"
+        sleep 2
+    done
     say "arm w=$W : stopped"
 done
+say ""
+say "=== sweep summary ==="
+for r in $RESULTS; do
+    w=${r%%:*}; rest=${r#*:}; mb=${rest%%:*}; id=${rest#*:}
+    say "  w=$w  ${mb} MB/s  idle ${id}%"
+done
+if [ -n "$FAILED_ARMS" ]; then
+    say "  FAILED ARMS:$FAILED_ARMS -- these produced NO measurement."
+    say "  A sweep missing arms cannot answer the question it exists to answer."
+    say "=== sweep INCOMPLETE ==="
+    exit 1
+fi
 say "=== sweep done. Read the arms together: throughput AND pool_idle decide"
 say "    which of the three readings above applies. One arm on its own says nothing."
