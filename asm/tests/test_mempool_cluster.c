@@ -510,6 +510,16 @@ int main(void){
         ck("every resulting chunk is connected", bad_conn==0);
     }
 
+    printf("== one cluster bound across the tree ==\n");
+    {   /* Until 2026-09-14 this tree carried THREE cluster bounds: 64 at accept
+         * (Core's DEFAULT_CLUSTER_LIMIT), 128 in eviction, 512 in the mining
+         * template. The two larger ones were unreachable -- accept refuses
+         * anything above 64 -- but a bound that disagrees with the rule that
+         * enforces it is a trap for the next reader, who has no way to know
+         * which one is load-bearing. This pins them together. */
+        ck("the cluster module uses Core's limit", MPC_MAX_CLUSTER == 64);
+    }
+
     printf("\npassed %d, failed %d\n", pass, fail);
     if (fail) { printf("TESTS FAILED (%d failure(s))\n", fail); return 1; }
     printf("ALL TESTS PASSED (0 failures)\n");
