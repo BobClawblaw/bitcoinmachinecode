@@ -59,6 +59,32 @@ int mpc_chunk_linearization(const mpc_cluster* cl, const int* lin, mpc_chunking*
  * unusable: it would have a block template spend an output before creating it. */
 int mpc_is_topological(const mpc_cluster* cl, const int* lin);
 
+/* Build a linearization: an ordering in which every parent precedes every child.
+ *
+ * STAGE 3 (see the plan): ancestor-score greedy. Repeatedly take the remaining
+ * ancestor-closed set with the best feerate and emit it, topologically, then
+ * remove it and repeat. This is the classic mining ordering and is what this
+ * node already selects by; it is deterministic, always topologically valid, and
+ * never worse than emitting in arrival order.
+ *
+ * It is NOT Core's optimum. Core v31 searches with a spanning-forest algorithm
+ * under a cost budget and a seeded RNG, and reports whether it reached the
+ * optimum; two correct implementations agree only where both do. Improving on
+ * this is stage 5 and is deliberately separate: a valid-but-suboptimal
+ * linearization is a working mempool, a subtly wrong one is a broken one.
+ *
+ * Ties are broken as Core breaks them when emitting ready chunks
+ * (SpanningForestState::GetLinearization): better feerate first, then SMALLER
+ * weight, then lowest member index. Deterministic ordering matters beyond
+ * tidiness -- an unstable order makes two runs over the same mempool disagree
+ * and turns a differential into noise.
+ *
+ * Writes cl->n indices into lin[]. Returns 0, or -1 on a malformed cluster.  */
+int mpc_linearize_ancestor_score(const mpc_cluster* cl, int* lin);
+
+/* Sum fee and weight over a member bitset. */
+void mpc_set_totals(const mpc_cluster* cl, uint64_t set, uint64_t* fee, uint64_t* weight);
+
 /* Compare two feerates as Core's FeeFrac does: a.fee/a.weight vs b.fee/b.weight
  * by cross-multiplication, so no division and no floating point. Returns
  * -1/0/1. 64x64 products can overflow 64 bits, so this uses __int128. */
