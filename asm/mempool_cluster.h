@@ -8,6 +8,18 @@
  * ancestor/descendant sets are one uint64_t each, so set algebra is a single
  * instruction and a cluster costs 24 bytes per member.
  *
+ * THE WEIGHT FIELD IS WHATEVER THE CALLER MEASURES IN. This module compares
+ * fee/weight by cross-multiplication and never divides, so it is
+ * denominator-agnostic. Both callers currently hand it the sigops-ADJUSTED
+ * VSIZE, which is what this node's mempool stores and what Core's own
+ * CTxMemPoolEntry::GetTxSize() returns. Core's linearization divides by adjusted
+ * WEIGHT instead (txmempool.cpp: FeePerWeight(fee, GetSigOpsAdjustedWeight(...))),
+ * which differs only by the division by four -- the orderings disagree in about
+ * 3 pairs per million, at rounding boundaries. Measured and recorded in
+ * docs/CORE_DIVERGENCES.md. If it is ever closed, close it in BOTH callers at
+ * once: one of them using weight while the other uses vsize would re-split the
+ * implementation this module exists to unify.
+ *
  * A LINEARIZATION is an ordering of the cluster in which every parent precedes
  * every child. CHUNKS are that ordering split into runs of non-increasing
  * feerate, by the rule in Core's ChunkLinearizationInfo.
