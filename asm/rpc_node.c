@@ -1592,6 +1592,7 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
                 !cl.truncated && cl.n > 1){
                 int lin[MPC_MAX_CLUSTER]; mpc_chunking ch;
                 if (mpc_linearize_ancestor_score(&cl, lin) == 0 &&
+                    (mpc_post_linearize(&cl, lin), 1) &&
                     mpc_chunk_linearization(&cl, lin, &ch) == 0){
                     int me = -1;
                     for (int k = 0; k < cl.n; k++)
@@ -3046,6 +3047,10 @@ static int cmd_getmempoolcluster(const rj_val* params, rj_val** res, long* ec, c
     int lin[MPC_MAX_CLUSTER];
     if (mpc_linearize_ancestor_score(&cl, lin) != 0){
         *ec = -1; *em = "the cluster could not be linearized (not a DAG?)"; return 0; }
+    /* Post-linearization is equal-or-better by construction and makes the chunks
+     * CONNECTED, which the greedy alone does not guarantee. A disconnected chunk
+     * is not wrong arithmetic, but it is not a chunk Core would report. */
+    mpc_post_linearize(&cl, lin);
     mpc_chunking ch;
     if (mpc_chunk_linearization(&cl, lin, &ch) != 0){
         *ec = -1; *em = "the cluster's linearization could not be chunked"; return 0; }

@@ -226,3 +226,117 @@ closed:
                 out->m[i].descendants |= (uint64_t)1 << j;
     return 0;
 }
+
+/* ---- PostLinearize --------------------------------------------------------
+ * One pass, as Core states it (cluster_linearize.h):
+ *
+ *   Start with an empty list of groups L=[]. For every transaction i in the old
+ *   linearization, front to back: append a new group C=[i]. While L has a group
+ *   P immediately before C whose feerate is LOWER than C's: if C depends on P,
+ *   merge P into C (P+C); otherwise swap P and C. Output is the concatenation.
+ *
+ * The backward pass is the same with the input reversed, ancestors and
+ * descendants exchanged, the feerate sense flipped, and the output reversed --
+ * which is Core's "the meanings of parent/child, and of high/low feerate are
+ * reversed".
+ *
+ * n <= 64, so groups are plain arrays and the O(n^2) shape costs nothing worth
+ * the linked lists Core needs at its scale. */
+typedef struct { int idx[MPC_MAX_CLUSTER]; int n; uint64_t members, fee, weight; } mpc_group;
+
+static void mpc_one_pass(const mpc_cluster* cl, int* lin, int backward)
+{
+    mpc_group g[MPC_MAX_CLUSTER];
+    int ng = 0;
+
+    for (int step = 0; step < cl->n; step++) {
+        int i = backward ? lin[cl->n - 1 - step] : lin[step];
+        mpc_group* c = &g[ng++];
+        c->n = 1; c->idx[0] = i;
+        c->members = (uint64_t)1 << i;
+        c->fee = cl->m[i].fee; c->weight = cl->m[i].weight;
+
+        int pos = ng - 1;
+        while (pos > 0) {
+            mpc_group* P = &g[pos - 1];
+            mpc_group* C = &g[pos];
+            /* forward: absorb/overtake a PRECEDING group of LOWER feerate.
+             * backward: the sense is flipped, so it is a HIGHER one. */
+            int cmp = mpc_feerate_cmp(P->fee, P->weight, C->fee, C->weight);
+            if (!(backward ? (cmp > 0) : (cmp < 0))) break;
+
+            /* Does C depend on P? Forward: any member of C has an ancestor in
+             * P. Backward: the relation is transposed, so it is descendants. */
+            uint64_t link = 0;
+            for (int k = 0; k < C->n; k++)
+                link |= backward ? cl->m[C->idx[k]].descendants
+                                 : cl->m[C->idx[k]].ancestors;
+            int depends = (link & P->members) != 0;
+
+            if (depends) {
+                /* merge P into C, keeping P's members in front of C's */
+                mpc_group merged;
+                merged.n = 0;
+                for (int k = 0; k < P->n; k++) merged.idx[merged.n++] = P->idx[k];
+                for (int k = 0; k < C->n; k++) merged.idx[merged.n++] = C->idx[k];
+                merged.members = P->members | C->members;
+                merged.fee = P->fee + C->fee;
+                merged.weight = P->weight + C->weight;
+                g[pos - 1] = merged;
+                for (int k = pos; k < ng - 1; k++) g[k] = g[k + 1];
+                ng--; pos--;
+            } else {
+                mpc_group t = *P; *P = *C; *C = t;   /* swap: C moves earlier */
+                pos--;
+            }
+        }
+    }
+
+    int out = 0;
+    for (int k = 0; k < ng; k++)
+        for (int j = 0; j < g[k].n; j++) lin[out++] = g[k].idx[j];
+    if (backward) {                                  /* the pass built it reversed */
+        for (int k = 0; k < cl->n / 2; k++) {
+            int t = lin[k]; lin[k] = lin[cl->n - 1 - k]; lin[cl->n - 1 - k] = t;
+        }
+    }
+}
+
+int mpc_post_linearize(const mpc_cluster* cl, int* lin)
+{
+    if (!cl || !lin || !mpc_is_topological(cl, lin)) return -1;
+    /* backward first: that is what gives the moved-tree property */
+    mpc_one_pass(cl, lin, 1);
+    mpc_one_pass(cl, lin, 0);
+    /* A pass that produced a non-topological order would be a defect, not a
+     * worse linearization -- refuse rather than hand back something a block
+     * template would spend out of order. */
+    return mpc_is_topological(cl, lin) ? 0 : -1;
+}
+
+int mpc_diagram_at_least_as_good(const mpc_cluster* cl, const int* a, const int* b)
+{
+    mpc_chunking ca, cb;
+    if (mpc_chunk_linearization(cl, a, &ca) != 0) return 0;
+    if (mpc_chunk_linearization(cl, b, &cb) != 0) return 0;
+    /* Walk B's cumulative curve. At each of B's breakpoints, A must have got at
+     * least as much fee into the same weight budget. Both hold the same
+     * transactions, so the curves meet at the end; only the path matters. */
+    uint64_t bw = 0, bf = 0;
+    for (int i = 0; i < cb.n; i++) {
+        bw += cb.c[i].weight; bf += cb.c[i].fee;
+        /* fee A achieves within weight budget bw, taking whole chunks and then
+         * a proportional slice of the chunk it lands inside (the diagram is
+         * piecewise linear, which is what makes chunks the right unit) */
+        uint64_t aw = 0; __int128 af = 0;
+        for (int k = 0; k < ca.n; k++) {
+            if (aw + ca.c[k].weight <= bw) { aw += ca.c[k].weight; af += ca.c[k].fee; continue; }
+            uint64_t room = bw - aw;
+            if (room && ca.c[k].weight)
+                af += ((__int128)ca.c[k].fee * (__int128)room) / (__int128)ca.c[k].weight;
+            aw = bw; break;
+        }
+        if (af < (__int128)bf) return 0;
+    }
+    return 1;
+}
