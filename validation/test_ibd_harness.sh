@@ -159,6 +159,23 @@ badhash=$(grep -nE '\$(CLI|ORACLE|C)[^|]*gettxoutsetinfo' \
           | grep -v 'gettxoutsetinfo muhash' | grep -vc ':[[:space:]]*#' || true)
 ck "every gettxoutsetinfo call names muhash" "$badhash" "0"
 
+echo "== the retired sweep stays retired =="
+# download_worker_sweep.sh answers a question this project should not act on
+# (Core's download concurrency is fixed at 8) and cost an outage proving it.
+# If someone revives it, this fails and they get the header instead of a LAN
+# incident.
+# CHECKED STATICALLY, NOT BY RUNNING IT. Verifying "it refuses to run" by
+# running it means that the instant the guard is missing, the test STARTS THE
+# SWEEP -- which is precisely what happened on 2026-09-14 while testing this
+# very check, spawning daemons that had to be killed by hand. A test for a
+# dangerous script must never invoke it.
+ck "download_worker_sweep.sh still carries its refusal guard" \
+   "$(grep -c 'SWEEP_I_HAVE_READ_THE_HEADER' ./download_worker_sweep.sh)" "2"
+ck "...and the RETIRED banner is still in its header" \
+   "$(grep -c 'RETIRED 2026-09-14. DO NOT RUN' ./download_worker_sweep.sh)" "1"
+ck "...and its config still writes a maxconnections cap" \
+   "$(grep -c 'maxconnections=\$MAXCONN' ./download_worker_sweep.sh)" "1"
+
 echo "== every harness parses, and reads the right log =="
 # A harness with a syntax error is found when someone launches a 20-hour run,
 # not before. bash -n costs milliseconds.

@@ -1,4 +1,51 @@
 #!/bin/bash
+# ============================================================================
+# RETIRED 2026-09-14. DO NOT RUN.
+#
+# This script is kept for its reasoning, not its use. It answers a question this
+# project should not act on, and answering it cost a day and an outage.
+#
+# WHY IT IS RETIRED
+#
+# 1. The number is not ours to tune. Core's block-download concurrency is FIXED
+#    at 8 (MAX_OUTBOUND_FULL_RELAY_CONNECTIONS, not configurable).
+#    bmc.catchupworkers=8 exists to MATCH that. It is a parity decision, not a
+#    performance one, and a Core-named behaviour carries Core's semantics.
+#
+# 2. Acting on the answer would break every benchmark. The IBD report says it
+#    outright: earlier runs at 16 to 64 workers against Core's 8 "is not a
+#    comparison of anything". Raising the count would make future Core
+#    comparisons measure peer count rather than implementation.
+#
+# 3. The performance question is already answered in the only configuration we
+#    can honestly benchmark. Run 23, at 8 workers, is the fastest of four runs
+#    and beats an unhandicapped Core v31.1.
+#
+# 4. More download slots means more connections to strangers' nodes, for our
+#    benefit. Core chose 8 deliberately.
+#
+# WHAT IT COST
+#
+# Four distinct failures, never once a complete result: it read its throughput
+# from a file where the string never appears; $! captured a subshell so three of
+# four arms died on a held port; empty arms were reported as "sweep done"; and
+# the w=32 arm, with no maxconnections in its generated config, opened thousands
+# of outbound connections across 35 processes and saturated the operator's LAN.
+#
+# WHAT IS WORTH KEEPING
+#
+# The pool_idle figure, 17-31% of worker wall-clock spent blocked before the
+# first byte. That is a real observation about PEER SELECTION -- slots held by
+# peers that cannot fill the pipe -- and it does not need a worker sweep. Measure
+# it against the local oracle's sixteen loopback listeners, where no stranger's
+# node is involved and nothing touches the LAN.
+#
+# If you are about to run this anyway, you need a reason better than curiosity,
+# MAXCONN set, and the operator's agreement.
+# ============================================================================
+echo "download_worker_sweep.sh is RETIRED -- see the header. Refusing to run." >&2
+echo "Set SWEEP_I_HAVE_READ_THE_HEADER=1 to override." >&2
+[ "${SWEEP_I_HAVE_READ_THE_HEADER:-0}" = "1" ] || exit 2
 # validation/download_worker_sweep.sh -- does adding download peers add throughput?
 #
 # WHY THIS EXISTS. bmc.catchupworkers has twice been set from an unmeasured
@@ -26,13 +73,29 @@ set -u
 . "$(dirname "$0")/lib/ibd_harness_lib.sh"
 BASE=${BASE:-/mnt/2tbssd/sweep}
 SRC=${SRC:-/storage/bitcoinmachinecode}
-ARMS=${ARMS:-"8 16 24 32"}
+# Arms are capped and the ceiling is deliberate: 8 is Core's own outbound
+# full-relay count, and anything above MAXARM has to be asked for explicitly by
+# someone who has decided the network load is acceptable.
+ARMS=${ARMS:-"4 8 12 16"}
+MAXARM=${MAXARM:-16}
+MAXCONN=${MAXCONN:-24}
 MINUTES=${MINUTES:-6}
 PORT=${PORT:-8472}; RPCPORT=${RPCPORT:-8471}
 CLI="$SRC/asm/daemon/bmc_cli"
 ts(){ date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 say(){ echo "$(ts) $*" | tee -a "$BASE/sweep.log"; }
 
+# Refuse before a single socket is opened, not after.
+for a in $ARMS; do
+    case "$a" in ''|*[!0-9]*) echo "arm '$a' is not a number" >&2; exit 2;; esac
+    if [ "$a" -gt "$MAXARM" ]; then
+        echo "REFUSING: arm w=$a exceeds MAXARM=$MAXARM." >&2
+        echo "  On 2026-09-14 a w=32 arm with no maxconnections opened thousands of" >&2
+        echo "  outbound connections across 35 processes and saturated the LAN." >&2
+        echo "  Raise MAXARM deliberately, with MAXCONN set, if you mean it." >&2
+        exit 2
+    fi
+done
 mkdir -p "$BASE"
 say "=== download worker sweep: arms=[$ARMS] ${MINUTES}min each, commit=$(git -C "$SRC" rev-parse --short HEAD)"
 say "link: $(ip -br link show enp14s0 2>/dev/null | awk '{print $1,$2}') $(sudo ethtool enp14s0 2>/dev/null | awk -F': ' '/Speed/{print $2}')"
@@ -51,6 +114,13 @@ rpcport=$RPCPORT
 dbcache=8192
 bmc.bootcatchup=0
 bmc.catchupworkers=$W
+# 2026-09-14: THIS CAP IS NOT OPTIONAL. Without it, this config placed no bound
+# on connections at all, and the w=32 arm opened thousands of outbound
+# connections across 35 processes and saturated the operator's LAN. The arm's
+# teardown never ran, so nothing bounded it until it was killed by hand.
+# catchupworkers raises download concurrency; maxconnections is what keeps that
+# from becoming a connection storm against the public network.
+maxconnections=$MAXCONN
 CONF
     say "--- arm w=$W : starting"
     # 2026-09-13: this was

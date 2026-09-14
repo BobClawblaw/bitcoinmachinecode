@@ -68,3 +68,40 @@ semantics cannot be honoured, the key is absent, not approximated.
 
 A caller wanting this node's cache sizing should read `bmcgetdownloadinfo` and
 the `dbcache` setting, which describe what is actually allocated.
+
+---
+
+## `bmc.catchupworkers` is pinned at 8 because Core's is, and is not a tuning knob
+
+Recorded 2026-09-14, after retiring `validation/download_worker_sweep.sh`.
+
+Core's block-download concurrency is **fixed**: `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`
+is 8 and is not configurable. This node exposes `bmc.catchupworkers`, which
+looks like a tuning knob and is not one — it exists so this node can be set to
+**match** Core, and 8 is the value that does.
+
+**Why this is written down rather than left to judgement.** The count has twice
+been set from an unmeasured number: 64 arrived as the size of the worker arrays,
+and 8 replaced it on a comparison the release note itself called "not a
+controlled A/B". A sweep was then built to measure it properly, and the
+measurement was the wrong thing to want:
+
+1. Raising the count above 8 makes Core comparisons meaningless. The IBD report
+   states it directly — earlier runs at 16 to 64 against Core's 8 "is not a
+   comparison of anything". A benchmark at a different peer count measures peer
+   count, not implementation.
+2. The performance question is already answered where it can be asked honestly:
+   run 23, at 8 workers, is the fastest of four measured runs and beats an
+   unhandicapped Core v31.1.
+3. Each additional download slot is another connection to a stranger's node, for
+   our benefit. Core chose 8 deliberately.
+
+**What remains genuinely open** is peer *selection*, not peer count. Download
+workers spend 17 to 31% of their wall-clock blocked before the first byte —
+slots held by peers that cannot fill the pipe. Adding slots does not fix that;
+choosing better peers might. Measure it against the local oracle's sixteen
+loopback listeners, where no stranger's node is involved.
+
+Raising `bmc.catchupworkers` above 8 for a benchmark invalidates that benchmark.
+Raising it in production is a deliberate divergence from Core and belongs in this
+file with its own entry.
