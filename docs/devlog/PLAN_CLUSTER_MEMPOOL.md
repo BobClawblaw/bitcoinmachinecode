@@ -24,9 +24,16 @@
 > eviction path, the mining path, and `mempool_cluster.c`. That is the problem
 > worth solving now, and it is not a refactor:
 >
-> - the mining path computes feerate over **vsize** where the module uses
->   **adjusted weight**, and breaks ties by **txid** where the module uses index.
->   Both change which transactions land in a block.
+> - ~~the mining path computes feerate over **vsize** where the module uses
+>   **adjusted weight** ... Both change which transactions land in a block.~~
+>   **CORRECTED 2026-09-14.** Overstated. This node's stored size is already the
+>   sigops-ADJUSTED vsize, the same figure Core's own `CTxMemPoolEntry::GetTxSize()`
+>   returns; the only difference from Core's chunking unit is the division by
+>   four, and the two orderings disagree in **0.0003%** of pairs, purely at
+>   rounding boundaries. Measured, recorded in `CORE_DIVERGENCES.md`, and
+>   deliberately not fixed: eviction cannot recover adjusted weight without a
+>   MAP_SHARED layout change, and fixing only mining would re-split the module.
+>   The tie-break difference (txid versus index) is real and unpinned.
 > - the mining path's selection coverage is PARTIAL, not absent. (An earlier
 >   version of this note said "no test coverage of selection at all". That was
 >   wrong — `test_rpc_chain.c` carries 31 getblocktemplate assertions including

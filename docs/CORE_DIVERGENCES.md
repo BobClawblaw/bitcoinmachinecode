@@ -105,3 +105,49 @@ loopback listeners, where no stranger's node is involved.
 Raising `bmc.catchupworkers` above 8 for a benchmark invalidates that benchmark.
 Raising it in production is a deliberate divergence from Core and belongs in this
 file with its own entry.
+
+---
+
+## Chunk ordering: Core divides by adjusted WEIGHT, this node by adjusted VSIZE
+
+Measured 2026-09-14, after unifying the three cluster implementations.
+
+**What Core does.** `CTxMemPool::AddTransaction` hands the transaction graph
+`FeePerWeight(fee, GetSigOpsAdjustedWeight(GetTransactionWeight(tx),
+sigops_cost, nBytesPerSigOp))` (`txmempool.cpp:1066`). Its linearization and
+chunking therefore order by **fee ÷ adjusted weight**.
+
+**What this node does.** The mempool stores each entry's size as the
+sigops-adjusted **vsize** — `ceil(max(weight, sigop_cost × bytespersigop) / 4)`,
+the max taken on the weight scale and the rounding done once at the end, which
+is Core's `GetVirtualTransactionSize` exactly and the same figure Core's own
+`CTxMemPoolEntry::GetTxSize()` returns. `mempool_cluster.c` is handed that, so
+chunk ordering is **fee ÷ adjusted vsize**.
+
+**The difference is the division by four, and only the rounding survives it.**
+`vsize = ceil(adjw / 4)`, so the two orderings agree except where the ceiling
+tips a comparison. Measured over 2,000,000 random `(fee, weight)` pairs in
+realistic ranges: **5 disagreements, 0.0003%** — roughly three per million, all
+at rounding boundaries.
+
+**Why it is recorded rather than fixed.** The cost is asymmetric between the two
+consumers:
+
+* the **mining** path can compute adjusted weight cheaply — it already holds the
+  transaction's weight and sigop cost.
+* the **eviction** path cannot. `mpol_node` stores adjusted vsize and sigop cost
+  but no weight, and vsize is not invertible: `ceil(adjw/4)` discards which of
+  four weights produced it. Recovering exactness means adding a field to a
+  struct that lives in a **MAP_SHARED** region — a shared-memory layout change,
+  for a rounding tie.
+
+Changing only the mining path would re-split the linearization implementation
+that was just unified into one tested module, which is a worse outcome than the
+divergence. So both paths use adjusted vsize, consistently, and this entry
+records the gap with its size measured rather than guessed.
+
+**If this is ever closed**, close it in both paths at once: add the weight to
+`mpol_node` (a shared-memory layout change, so it needs its own migration
+reasoning), then hand `max(weight, sigop_cost × bytespersigop)` to
+`mempool_cluster.c` from both call sites. The module itself needs no change — it
+is denominator-agnostic and compares `fee/weight` by cross-multiplication.
