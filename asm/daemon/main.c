@@ -1353,6 +1353,10 @@ static void leg_ping_tick(int k, long long now){
     if(p2p_write(mux_out_fd[k], "ping", 4, pl, 8) > 0){ mux_out_ping_nonce[k] = nonce; mux_out_ping_sent[k] = now; mux_out_ping_sent_ms[k] = dh_now_ms(); }
 }
 #define REDIAL_BACKOFF_MS 30000L             /* min gap between re-dial tries on a dead slot */
+/* Core's CONNECT_INTERVAL: how often it re-dials a peer the OPERATOR named
+ * (`-connect`/`-addnode`), which addrman's triedtime does not gate. Used as
+ * the floor on a manual peer's re-dials -- see mux_next_peer. */
+#define MANUAL_RETRY_FLOOR_MS 60000L
 
 /* ---- runtime peer control (RPC ctl_* channel) ---------------------------
  * The worker owns the legs, so it owns these. The parent asks; this decides.
@@ -3411,6 +3415,48 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
 static int legs_on_net(int net){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && leg_net_of(mux_out_host[k]) == net) n++; return n; }
 static int legs_anon(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && leg_is_anon_net(leg_net_of(mux_out_host[k]))) n++; return n; }
 
+/* ------------------------------------------------------------------------
+ * The dial gate (2026-09-14).
+ *
+ * mux_next_peer is the one place an outbound leg is established, so it is
+ * also the one place a re-dial can be refused. Until today it could not
+ * refuse. The candidate loop below marks a host `held` when it is under
+ * dial-memory backoff or already carried by another live leg -- and then,
+ * having walked the whole pool without finding a free candidate, dialled
+ * `peers[p]` ANYWAY, because nothing sat between the loop and the dial.
+ * The verdict was consulted, logged-adjacent, and then ignored.
+ *
+ * The osx mainnet deploy is the shape that makes that fatal: a conf with ONE
+ * `connect=` host, whose port named the reference node's RPC port (8332)
+ * rather than its P2P port (8333). TCP connects -- an HTTP listener accepts
+ * -- the P2P version never happens, the peer hangs up immediately:
+ *     [dl:0] 192.168.5.242 connection closed theirs (revents 0x11) after 0s
+ * and ~200 ms later the next dial. The address WAS remembered (DM_REFUSED,
+ * 10 min, doubling) and the memory WAS consulted and answered NO, every
+ * single time. Measured on the deploy that triggered this: 8,986 dial/close
+ * cycles against that one host in the 33 minutes from 13:31Z to 14:04Z on
+ * 2026-09-14 -- 4.5 a second, 260-284 a minute -- and it only starts once the
+ * download worker owns the legs, which is why the two days before it logged
+ * not one dial. In the log it reads like an ordinary keep-up run.
+ *
+ * Two rules, both Core's:
+ *   - a candidate under backoff (or already held, or an anonymity net whose
+ *     dials belong to the helper) is NOT dialled. If every candidate is
+ *     held, NOTHING is dialled this pass: the slot stays dead and the
+ *     caller's retry stamp drives the next look. That is addrman's
+ *     nLastTry/GetTryDuration behaviour -- an address under backoff is not
+ *     offered, not "offered anyway because the pool is small".
+ *   - an operator-named peer IS retried whatever the dial memory says (Core
+ *     does not apply addrman's triedtime to fixed seeds, and `-connect` has
+ *     to mean "keep trying THIS peer"), but no faster than once per
+ *     MANUAL_RETRY_FLOOR_MS. The floor is stamped HERE rather than in the
+ *     callers because several of them zero their own stamp on the way in
+ *     (`mux_out_nextretry[i] = 0`, "re-dial on the next rotation") -- a
+ *     pass helper that crashes does that, and this is the one place a
+ *     crashed helper's re-dial can be bounded.
+ * ------------------------------------------------------------------------ */
+static long long g_leg_manual_next_dial[MUX_MAX_OUT];
+
 static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port){
     if(mux_out_fd[i]>=0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i]=-1; }
     /* setnetworkactive false: leave the slot dead rather than re-dialing.
@@ -3420,6 +3466,7 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
     if(g_node_status && !g_node_status->net_active) return;
     /* rotate to the next seed in the pool (wrap); avoids hammering the same dead host */
     int p = (mux_out_peer[i]+1) % (pool_len>0?pool_len:1);
+    int free_pick = 0;                                     /* a candidate passed every gate */
     /* ...and never onto a host another live leg already holds: each leg
      * rotates its own pointer, so two legs could land on one peer (deploy g,
      * 2026-09-01: legs 1 and 2 both on 108.245.166.132). Compared by HOST,
@@ -3428,22 +3475,44 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
       for(int tries = 0; tries < pool_len; tries++){
           ctl_ip_only(peers[p], me, sizeof me);
           int held = leg_is_anon_net(leg_net_of(peers[p]));   /* anonymity dials belong to the helper, never inline */
-          if(!held && g_dialmem && !dialmem_allowed(g_dialmem, peers[p], dialmem_now())) held = 1;   /* 2026-09-09: under backoff */
+          /* 2026-09-09: under backoff. 2026-09-14: an operator-named peer is
+           * exempt -- the floor below bounds it instead. */
+          if(!held && g_dialmem && !node_config_is_manual(me) &&
+             !dialmem_allowed(g_dialmem, peers[p], dialmem_now())) held = 1;
           for(int k = 0; k < mux_n_out && !held; k++){
               if(k == i || mux_out_fd[k] < 0) continue;
               char other[128]; ctl_ip_only(mux_out_host[k], other, sizeof other);
               if(me[0] && !strcmp(me, other)) held = 1;
           }
-          if(!held) break;
+          if(!held){ free_pick = 1; break; }
           p = (p + 1) % (pool_len > 0 ? pool_len : 1);
       } }
     mux_out_peer[i] = p;
+    /* Every candidate is under backoff or already held: refuse this pass.
+     * The caller's retry stamp re-drives the slot; when the backoff expires
+     * the same candidate is dialled then. */
+    if(!free_pick){
+        fprintf(stderr,"[mux:%d] no dial candidate is free (backoff / already held / anonymity net) -- the leg stays down\n", i);
+        return;
+    }
     /* a banned peer is not dialed. Checked HERE for the same reason: this is
      * the only path to a new outbound leg. */
     { char ip[128]; ctl_ip_only(peers[p], ip, sizeof ip);
       if(ctl_is_banned(ip)){
           fprintf(stderr,"[mux:%d] %s is banned -- not dialing\n", i, peers[p]);
           return;
+      } }
+    /* the manual-peer floor: at most one dial per slot per
+     * MANUAL_RETRY_FLOOR_MS, however often some caller asks. */
+    { char ip[128]; ctl_ip_only(peers[p], ip, sizeof ip);
+      if(node_config_is_manual(ip)){
+          long long now = dh_now_ms();
+          if(now < g_leg_manual_next_dial[i]){
+              fprintf(stderr,"[mux:%d] %s is named by connect=/addnode but was dialled %llds ago -- waiting out the %llds retry floor\n",
+                      i, ip, (g_leg_manual_next_dial[i] - now)/1000, (long long)MANUAL_RETRY_FLOOR_MS/1000);
+              return;
+          }
+          g_leg_manual_next_dial[i] = now + MANUAL_RETRY_FLOOR_MS;
       } }
     /* 2026-09-10: in a helper, never inline (Core's loop never blocks on a
      * connect). The leg stays down until the helper lands; dh_install_leg

@@ -4,7 +4,7 @@
  *
  *   extern u32 net_magic;                       0xd9b4bef9
  *   extern u8  g_v2_active[4096];
- *   extern void *g_p2p_write_hook;  (*)(int fd, u32 plen)
+ *   extern void *g_p2p_write_hook;  (*)(int fd, u32 plen, const char* cmd, u32 cmdlen)
  *   extern long (*g_v2_hook_write)(int, const char*, u32, const void*, u64);
  *   extern long (*g_v2_hook_read)(int, char cmd_out[12], void*, u64, u64);
  *
@@ -65,7 +65,7 @@ u32 net_magic = 0xd9b4bef9u;
 #define V2_FD_MAX 4096
 u8 g_v2_active[V2_FD_MAX];
 
-void *g_p2p_write_hook;   /* void (*)(int fd, u32 plen) */
+void *g_p2p_write_hook;   /* void (*)(int fd, u32 plen, const char *cmd, u32 cmdlen) */
 long (*g_v2_hook_write)(int, const char *, u32, const void *, u64);
 long (*g_v2_hook_read)(int, char cmd_out[12], void *, u64, u64);
 
@@ -177,8 +177,19 @@ u64 p2p_frame(u8 *out, const char *cmd, u32 cmdlen, const void *payload, u64 ple
 long p2p_write(int fd, const char *cmd, u32 cmdlen, const void *payload, u64 plen)
 {
     if (g_p2p_write_hook) {
-        void (*fn)(int, u32) = (void (*)(int, u32))g_p2p_write_hook;
-        fn(fd, (u32)plen);
+        /* FOUR arguments. The hook grew cmd/cmdlen on 2026-09-12 for
+         * getpeerinfo's bytessent_per_msg (asm/bitcoin_net.asm was updated
+         * the same day); this twin was not, and calling the installed hook
+         * through a 2-arg prototype is not "harmless, it ignores the rest" --
+         * the callee reads x2/x3 as cmd/cmdlen whatever the caller left
+         * there. On the 09-12 build the download worker's pass helper died in
+         * rpc_msg_index (a strlen over that garbage pointer) with SIGSEGV at
+         * 0xa, every pass, which the parent logged as "the pass helper ended
+         * (exit 139) without a report" and answered by re-dialling.
+         * Match the x86 asm exactly: (fd, plen, cmd, cmdlen). */
+        void (*fn)(int, u32, const char *, u32) =
+            (void (*)(int, u32, const char *, u32))g_p2p_write_hook;
+        fn(fd, (u32)plen, cmd, cmdlen);
     }
     if ((unsigned)fd < V2_FD_MAX && g_v2_active[fd]) {
         if (g_v2_hook_write) {

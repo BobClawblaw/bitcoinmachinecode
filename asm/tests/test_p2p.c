@@ -25,11 +25,22 @@ static void cbyte(const char* lbl, const unsigned char* got, const unsigned char
 
 
 /* bmc.uploadratelimit (2026-09-08): bitcoin_net.asm calls g_p2p_write_hook
- * BEFORE every write with (fd, payload length), on the v1 and v2 paths. */
-extern void (*g_p2p_write_hook)(int fd, unsigned plen);
+ * BEFORE every write. It gained the command and its length on 2026-09-12 for
+ * getpeerinfo's bytessent_per_msg, so the contract is (fd, plen, cmd, cmdlen).
+ * FOUR arguments, on both transports. The osx twin (port/osx/net_twin.c) kept
+ * calling through a 2-arg prototype and the daemon's hook read x2/x3 as the
+ * command: SIGSEGV in rpc_msg_index on every pass of the download worker.
+ * Pinned here so neither side can drift again. */
+extern void (*g_p2p_write_hook)(int fd, unsigned plen, const char* cmd, unsigned cmdlen);
 extern long p2p_write(int fd, const char* cmd, unsigned cmdlen, const void* pl, unsigned plen);
-static int g_hook_calls, g_hook_fd; static unsigned g_hook_plen;
-static void rec_hook(int fd, unsigned plen){ g_hook_calls++; g_hook_fd = fd; g_hook_plen = plen; }
+static int g_hook_calls, g_hook_fd; static unsigned g_hook_plen, g_hook_cmdlen;
+static char g_hook_cmd[16];
+static void rec_hook(int fd, unsigned plen, const char* cmd, unsigned cmdlen){
+    g_hook_calls++; g_hook_fd = fd; g_hook_plen = plen; g_hook_cmdlen = cmdlen;
+    g_hook_cmd[0] = 0;
+    if(cmd){ unsigned n = cmdlen < 15 ? cmdlen : 15;   /* read it: a bad pointer faults here */
+             memcpy(g_hook_cmd, cmd, n); g_hook_cmd[n] = 0; }
+}
 int main(void){
     const unsigned char hash[32] = {0x3b,0xa3,0xed,0xfd,0x7a,0x7b,0x12,0xb2,0x7a,0xc7,0x2c,0x3e,0x67,0x76,0x8f,0x61,0x7f,0xc8,0x1b,0xc3,0x88,0x8a,0x51,0x32,0x3a,0x9f,0xb8,0xaa,0x4b,0x1e,0x5e,0x4a};
     const unsigned char zero[32] = {0};
@@ -98,6 +109,11 @@ int main(void){
         cki("hook: called exactly once", g_hook_calls, 1);
         cki("hook: with the socket fd", g_hook_fd, sv[0]);
         cki("hook: with the payload length (8)", (long)g_hook_plen, 8);
+        /* the 2026-09-12 arguments: the command, and its length. An argument
+         * register left in place of the pointer is what killed the osx build's
+         * download worker, so read the bytes, not just the pointer. */
+        cki("hook: with the command name", strcmp(g_hook_cmd, "ping"), 0);
+        cki("hook: with the command length (4)", (long)g_hook_cmdlen, 4);
         g_hook_calls = 0; w = p2p_write(sv[0], "ping", 4, nonce, 8);
         cki("hook cleared: p2p_write unchanged", w, 32);
         cki("hook cleared: not called", g_hook_calls, 0);
