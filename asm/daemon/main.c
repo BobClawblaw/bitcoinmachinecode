@@ -9491,6 +9491,66 @@ static int i2p_inbound_start(void){
     return g_i2p_pipe[0];
 }
 
+/* ---- inbound connection rate, per source address --------------------------
+ * 2026-09-14. One LAN host opened ~3,780 connections in 23 minutes -- about
+ * nine a second, sustained -- and this node forked a child for every one of
+ * them. Nothing throttled it. The chain stayed healthy and the children exited
+ * promptly, so it was churn rather than a leak, but load went from 3.9 to 6.4
+ * and the box was forking at ~160/s.
+ *
+ * THIS IS NOT A CORE DIVERGENCE ABOUT THE PROTOCOL. Core does not rate-limit
+ * inbound connections per address either -- it does not need to, because it
+ * serves peers with threads. This node forks a process per connection, so the
+ * same flood costs it far more than it costs Core. The limit protects an
+ * implementation difference, not a policy one, which is why it is deliberately
+ * generous: an honest peer opens ONE connection and reconnects rarely.
+ *
+ * A token bucket per address: INRATE_BURST connections, refilled at
+ * INRATE_PER_SEC. The table is small and fixed -- an attacker with many source
+ * addresses is a different problem (that is what maxconnections and eviction
+ * are for), and an unbounded table would itself be the memory exhaustion this
+ * is meant to prevent. Eviction is least-recently-seen.
+ *
+ * noban peers are exempt: Core's -whitelist promise is that such a peer is not
+ * disconnected for misbehaviour, and refusing its connection would break it.
+ */
+#define INRATE_SLOTS    64
+#define INRATE_BURST    12          /* connections available immediately */
+#define INRATE_PER_SEC   1          /* sustained rate once the burst is spent */
+static struct { char ip[64]; double tokens; time_t seen, last_log; } g_inrate[INRATE_SLOTS];
+
+/* 1 = allow, 0 = refuse. `logged` is set when the caller should print (once
+ * per address per 10s, so a flood does not become a log flood of its own). */
+static int inbound_rate_ok(const char* ip, int* logged)
+{
+    if (logged) *logged = 0;
+    if (!ip || !*ip) return 1;
+    if (netperm_for(ip) & NP_NOBAN) return 1;          /* whitelisted: never refused */
+
+    time_t now = time(NULL);
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < INRATE_SLOTS; i++){
+        if (!strcmp(g_inrate[i].ip, ip)){ slot = i; break; }
+        if (g_inrate[i].seen < g_inrate[oldest].seen) oldest = i;
+    }
+    if (slot < 0){                                      /* first sight, or evicted */
+        slot = oldest;
+        snprintf(g_inrate[slot].ip, sizeof g_inrate[slot].ip, "%s", ip);
+        g_inrate[slot].tokens = INRATE_BURST;
+        g_inrate[slot].last_log = 0;
+    } else {
+        double dt = (double)(now - g_inrate[slot].seen);
+        if (dt > 0){
+            g_inrate[slot].tokens += dt * INRATE_PER_SEC;
+            if (g_inrate[slot].tokens > INRATE_BURST) g_inrate[slot].tokens = INRATE_BURST;
+        }
+    }
+    g_inrate[slot].seen = now;
+    if (g_inrate[slot].tokens >= 1.0){ g_inrate[slot].tokens -= 1.0; return 1; }
+    if (now - g_inrate[slot].last_log >= 10){ g_inrate[slot].last_log = now; if (logged) *logged = 1; }
+    return 0;
+}
+
 static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l, int l6, int lo, int li2p){
     /* Prefer the persisted ADDRESS BOOK over whatever pool the caller passed.
      *
@@ -9677,6 +9737,16 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                     if(ctl_is_banned(bip)){
                         fprintf(stderr,"[serve] refused inbound from banned %s\n", peerdesc);
                         close(c); c = -1;
+                    }
+                    /* BEFORE THE FORK. Refusing after it would have paid the
+                     * cost the limit exists to avoid. */
+                    else { int say = 0;
+                        if(!inbound_rate_ok(bip, &say)){
+                            if(say) fprintf(stderr,"[serve] inbound rate limit: refusing %s "
+                                            "(more than %d connections, then %d/s; noban peers exempt)\n",
+                                            peerdesc, INRATE_BURST, INRATE_PER_SEC);
+                            close(c); c = -1;
+                        }
                     }
                 }
             } else {
