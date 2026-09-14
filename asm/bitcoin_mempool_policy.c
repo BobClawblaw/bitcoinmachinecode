@@ -57,6 +57,7 @@
  * both the structural mempool and this state are untouched.
  */
 
+#include "mempool_cluster.h"   /* the one linearization/chunking implementation */
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -1538,54 +1539,69 @@ static int cluster_members(void* st, uint32_t seed, const uint32_t* child_head, 
     return n;
 }
 
-/* the LAST chunk of the cluster's linearization (its worst): ancestor-set
- * greedy over the members, chunks merged while a later one pays more */
+/* The LAST chunk of the cluster's linearization -- its worst, which is what
+ * TrimToSize evicts.
+ *
+ * UNIFIED 2026-09-14: the linearization and chunking are mempool_cluster.c's.
+ * This file, rpc_chain.c and that module each carried their own copy of the
+ * same idea; the module is the one tested to the letter (74 tests, 3,000
+ * randomised DAGs), and which transaction gets evicted under load should be
+ * decided by tested code.
+ *
+ * The feerate denominator is deliberately UNCHANGED: `size` (vsize) is handed
+ * to the module as its weight, so today's eviction arithmetic is preserved
+ * exactly. Core chunks by sigops-ADJUSTED WEIGHT; changing that changes which
+ * transaction is evicted, and it belongs in its own commit with its own
+ * justification -- not smuggled in alongside a change of implementation.
+ *
+ * Returns 1 with *out filled, 0 if the cluster yields nothing. */
 static int cluster_last_chunk(void* st, const uint32_t* mem, int n, mpol_chunk* out){
     mpol_node* t = mpol_nodes_base(st);
-    unsigned char done[CHUNK_MAX_CLUSTER]; memset(done, 0, sizeof done);
-    mpol_chunk chunks[CHUNK_MAX_CLUSTER]; int nch = 0;
-    int left = n;
-    while (left > 0){
-        /* for every undone member, the feerate of its undone ancestor set */
-        int best = -1; uint64_t bf = 0, bs = 1; uint32_t bestset[CHUNK_MAX_CLUSTER]; int bestn = 0;
-        for (int m = 0; m < n; m++){
-            if (done[m]) continue;
-            /* ancestor set within the cluster (undone only) */
-            unsigned char inset[CHUNK_MAX_CLUSTER]; memset(inset, 0, sizeof inset);
-            uint32_t stk[CHUNK_MAX_CLUSTER]; int sp = 0; inset[m] = 1; stk[sp++] = (uint32_t)m;
-            uint64_t f = 0, sz = 0; int cnt = 0;
-            while (sp > 0){
-                int cur = (int)stk[--sp];
-                f += t[mem[cur]].fee; sz += t[mem[cur]].size; cnt++;
-                for (uint32_t k = 0; k < t[mem[cur]].n_parents; k++){
-                    uint32_t pp = mpol_par_at(st, &t[mem[cur]], k);
-                    if (pp == 0xFFFFFFFFu) continue;
-                    for (int q = 0; q < n; q++) if (mem[q] == pp && !done[q] && !inset[q]){ inset[q] = 1; stk[sp++] = (uint32_t)q; }
-                }
-            }
-            if (sz == 0) sz = 1;
-            if (best < 0 || (unsigned __int128)f * bs > (unsigned __int128)bf * sz){
-                best = m; bf = f; bs = sz; bestn = 0;
-                for (int q = 0; q < n; q++) if (inset[q]) bestset[bestn++] = (uint32_t)q;
-            }
-        }
-        if (best < 0) break;
-        mpol_chunk* c = &chunks[nch++];
-        c->n = 0; c->fee = bf; c->size = bs;
-        for (int q = 0; q < bestn; q++){ done[bestset[q]] = 1; c->idx[c->n++] = mem[bestset[q]]; }
-        left -= bestn;
-        /* merge backwards while this chunk pays more than the one before it */
-        while (nch >= 2){
-            mpol_chunk* a = &chunks[nch-2]; mpol_chunk* b = &chunks[nch-1];
-            if ((unsigned __int128)b->fee * a->size > (unsigned __int128)a->fee * b->size){
-                for (int q = 0; q < b->n && a->n < CHUNK_MAX_CLUSTER; q++) a->idx[a->n++] = b->idx[q];
-                a->fee += b->fee; a->size += b->size; nch--;
-            } else break;
+    if (n <= 0 || n > MPC_MAX_CLUSTER) return 0;
+
+    mpc_cluster cl; memset(&cl, 0, sizeof cl); cl.n = n;
+    for (int m = 0; m < n; m++){
+        cl.m[m].fee = t[mem[m]].fee;
+        cl.m[m].weight = t[mem[m]].size;          /* see the note above */
+        cl.m[m].ancestors = (uint64_t)1 << m;
+        memcpy(cl.txid[m], t[mem[m]].txid, 32);
+    }
+    /* direct parent edges, restricted to the cluster; the module closes them */
+    for (int m = 0; m < n; m++){
+        for (uint32_t k = 0; k < t[mem[m]].n_parents; k++){
+            uint32_t pp = mpol_par_at(st, &t[mem[m]], k);
+            if (pp == 0xFFFFFFFFu) continue;
+            for (int q = 0; q < n; q++)
+                if (mem[q] == pp){ cl.m[m].ancestors |= (uint64_t)1 << q; break; }
         }
     }
-    if (nch == 0) return 0;
-    *out = chunks[nch-1];
-    return 1;
+    /* transitive closure, bounded: a cycle returns rather than spinning */
+    for (int pass = 0; pass < n + 1; pass++){
+        int changed = 0;
+        for (int m = 0; m < n; m++){
+            uint64_t acc = cl.m[m].ancestors, d = cl.m[m].ancestors;
+            while (d){ int p = __builtin_ctzll(d); d &= d - 1; acc |= cl.m[p].ancestors; }
+            if (acc != cl.m[m].ancestors){ cl.m[m].ancestors = acc; changed = 1; }
+        }
+        if (!changed) break;
+        if (pass == n) return 0;
+    }
+    for (int m = 0; m < n; m++)
+        for (int q = 0; q < n; q++)
+            if (cl.m[q].ancestors & ((uint64_t)1 << m)) cl.m[m].descendants |= (uint64_t)1 << q;
+
+    int lin[MPC_MAX_CLUSTER]; mpc_chunking ch;
+    if (mpc_linearize_ancestor_score(&cl, lin) != 0) return 0;
+    mpc_post_linearize(&cl, lin);
+    if (mpc_chunk_linearization(&cl, lin, &ch) != 0 || ch.n == 0) return 0;
+
+    const mpc_chunk* last = &ch.c[ch.n - 1];
+    out->n = 0; out->fee = last->fee; out->size = last->weight;
+    for (int k = 0; k < n && out->n < CHUNK_MAX_CLUSTER; k++){
+        int idx = lin[k];
+        if (last->members & ((uint64_t)1 << idx)) out->idx[out->n++] = mem[idx];
+    }
+    return out->n ? 1 : 0;
 }
 
 /* The worst chunk across all clusters: 1 with *out filled, 0 if the pool is
