@@ -145,3 +145,84 @@ int mpc_linearize_ancestor_score(const mpc_cluster* cl, int* lin)
     }
     return (out == cl->n) ? 0 : -1;
 }
+
+static int mpc_find(const mpc_cluster* cl, const unsigned char txid[32])
+{
+    for (int i = 0; i < cl->n; i++)
+        if (memcmp(cl->txid[i], txid, 32) == 0) return i;
+    return -1;
+}
+
+int mpc_build_cluster(void* ctx, mpc_lookup_fn look,
+                      const unsigned char seed[32], mpc_cluster* out)
+{
+    if (!look || !seed || !out) return -1;
+    memset(out, 0, sizeof *out);
+
+    mpc_entry e;
+    if (look(ctx, seed, &e) != 1) return -1;
+
+    /* --- 1. collect the connected component, breadth-first ---------------
+     * Through parents AND children: a cluster is the whole component, not the
+     * ancestor set. A sibling that shares a parent is in the same cluster even
+     * though neither is an ancestor of the other, and it competes for the same
+     * block space -- which is the entire reason Core groups them. */
+    memcpy(out->txid[0], seed, 32);
+    out->n = 1;
+    for (int head = 0; head < out->n; head++) {
+        if (look(ctx, out->txid[head], &e) != 1) return -1;
+        out->m[head].fee = e.fee;
+        out->m[head].weight = e.weight;
+        for (int side = 0; side < 2; side++) {
+            int cnt = side ? e.n_children : e.n_parents;
+            for (int k = 0; k < cnt; k++) {
+                const unsigned char* id = side ? e.children[k] : e.parents[k];
+                if (mpc_find(out, id) >= 0) continue;
+                if (out->n >= MPC_MAX_CLUSTER) { out->truncated = 1; return 0; }
+                memcpy(out->txid[out->n], id, 32);
+                out->n++;
+            }
+        }
+    }
+
+    /* --- 2. direct parent edges, restricted to the component ------------- */
+    for (int i = 0; i < out->n; i++) {
+        out->m[i].ancestors = (uint64_t)1 << i;         /* includes self */
+        out->m[i].descendants = (uint64_t)1 << i;
+    }
+    uint64_t direct[MPC_MAX_CLUSTER];
+    memset(direct, 0, sizeof direct);
+    for (int i = 0; i < out->n; i++) {
+        if (look(ctx, out->txid[i], &e) != 1) return -1;
+        for (int k = 0; k < e.n_parents; k++) {
+            int p = mpc_find(out, e.parents[k]);
+            if (p >= 0) direct[i] |= (uint64_t)1 << p;
+        }
+    }
+
+    /* --- 3. transitive closure ------------------------------------------
+     * Repeat until nothing changes. Bounded by n passes for a DAG, and n <= 64,
+     * so the loop is bounded whatever the graph shape -- a cycle would
+     * otherwise spin here rather than being reported. */
+    for (int pass = 0; pass < out->n + 1; pass++) {
+        int changed = 0;
+        for (int i = 0; i < out->n; i++) {
+            uint64_t acc = out->m[i].ancestors | direct[i];
+            uint64_t d = direct[i];
+            while (d) {
+                int p = __builtin_ctzll(d); d &= d - 1;
+                acc |= out->m[p].ancestors;
+            }
+            if (acc != out->m[i].ancestors) { out->m[i].ancestors = acc; changed = 1; }
+        }
+        if (!changed) goto closed;
+    }
+    return -1;      /* did not converge: the graph is not a DAG */
+closed:
+    /* --- 4. descendants are the transpose of ancestors ------------------- */
+    for (int i = 0; i < out->n; i++)
+        for (int j = 0; j < out->n; j++)
+            if (out->m[j].ancestors & ((uint64_t)1 << i))
+                out->m[i].descendants |= (uint64_t)1 << j;
+    return 0;
+}

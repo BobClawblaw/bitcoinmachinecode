@@ -9,6 +9,12 @@
 #include <string.h>
 #include "../mempool_cluster.h"
 
+/* test-only: locate a txid in a built cluster */
+static int mpc_find_test(const mpc_cluster* cl, const unsigned char* id){
+    for (int i = 0; i < cl->n; i++) if (!memcmp(cl->txid[i], id, 32)) return i;
+    return -1;
+}
+
 static int pass, fail;
 static void ck(const char* name, int ok){
     if (ok){ printf("ok  : %s\n", name); pass++; }
@@ -192,6 +198,107 @@ int main(void){
         for (int i=1;i<ch.n;i++)
             if (mpc_feerate_cmp(ch.c[i].fee,ch.c[i].weight,ch.c[i-1].fee,ch.c[i-1].weight)>0) mono=0;
         ck("...producing non-increasing chunk feerates", mono);
+    }
+
+    printf("== cluster discovery ==\n");
+    {   /* A tiny in-memory mempool the lookup callback reads. Edges are given
+         * as direct parents only; children are derived, so the fixture cannot
+         * disagree with itself the way a hand-written pair of lists can. */
+        static struct { unsigned char id[32]; uint64_t fee, wt; int np; int par[4]; } POOL[] = {
+            /* 0 */ {{0xA0}, 1000, 1000, 0, {0}},
+            /* 1 */ {{0xA1}, 2000, 1000, 1, {0}},        /* child of 0 */
+            /* 2 */ {{0xA2}, 3000, 1000, 1, {0}},        /* sibling of 1 */
+            /* 3 */ {{0xA3}, 4000, 1000, 2, {1,2}},      /* diamond tip */
+            /* 4 */ {{0xB0}, 9000, 1000, 0, {0}},        /* a SEPARATE cluster */
+        };
+        static const int NPOOL = 5;
+        /* the callback: find by id, report direct parents and derived children */
+        int lookup(void* c, const unsigned char* id, mpc_entry* o){
+            (void)c;
+            for (int i = 0; i < NPOOL; i++){
+                if (memcmp(POOL[i].id, id, 32)) continue;
+                memset(o, 0, sizeof *o);
+                o->fee = POOL[i].fee; o->weight = POOL[i].wt;
+                o->n_parents = POOL[i].np;
+                for (int k = 0; k < POOL[i].np; k++)
+                    memcpy(o->parents[k], POOL[POOL[i].par[k]].id, 32);
+                for (int j = 0; j < NPOOL; j++)
+                    for (int k = 0; k < POOL[j].np; k++)
+                        if (POOL[j].par[k] == i)
+                            memcpy(o->children[o->n_children++], POOL[j].id, 32);
+                return 1;
+            }
+            return 0;
+        }
+        mpc_cluster c2;
+        ck("a diamond cluster is discovered from its ROOT",
+           mpc_build_cluster(0, lookup, POOL[0].id, &c2)==0 && c2.n==4);
+        ck("...and from its TIP, giving the same membership",
+           mpc_build_cluster(0, lookup, POOL[3].id, &c2)==0 && c2.n==4);
+        /* the sibling is in the cluster although it is nobody's ancestor --
+         * this is the whole reason clusters are components, not ancestor sets */
+        ck("...a sibling is included though it is not an ancestor",
+           mpc_find_test(&c2, POOL[2].id) >= 0);
+        ck("...the separate cluster is NOT pulled in",
+           mpc_find_test(&c2, POOL[4].id) < 0);
+        ck("...and that one stands alone",
+           mpc_build_cluster(0, lookup, POOL[4].id, &c2)==0 && c2.n==1);
+
+        mpc_build_cluster(0, lookup, POOL[0].id, &c2);
+        int r = mpc_find_test(&c2, POOL[0].id), t = mpc_find_test(&c2, POOL[3].id);
+        ck("the tip's ancestors are the whole cluster",
+           c2.m[t].ancestors == (((uint64_t)1 << c2.n) - 1));
+        ck("the root's descendants are the whole cluster",
+           c2.m[r].descendants == (((uint64_t)1 << c2.n) - 1));
+        ck("the root has only itself as an ancestor",
+           c2.m[r].ancestors == ((uint64_t)1 << r));
+        int lin[MPC_MAX_CLUSTER];
+        ck("a discovered cluster linearizes topologically",
+           mpc_linearize_ancestor_score(&c2, lin)==0 && mpc_is_topological(&c2, lin));
+        { unsigned char nosuch[32]; memset(nosuch, 0xff, sizeof nosuch);
+          ck("an absent seed is refused",
+             mpc_build_cluster(0, lookup, nosuch, &c2) == -1); }
+    }
+
+    printf("== the 64 bound ==\n");
+    {   /* Core rejects a transaction that would exceed DEFAULT_CLUSTER_LIMIT, so
+         * a real Core cluster always fits. This node's limits are not identical,
+         * so a component CAN exceed it -- and a truncated walk is NOT a cluster.
+         * Reporting one as if it were would describe a block-space competition
+         * that omits most of its competitors. A 100-long chain forces it. */
+        int chain_lookup(void* c, const unsigned char* id, mpc_entry* o){
+            (void)c;
+            int i = id[0] | (id[1] << 8);
+            if (id[2] != 0x5A || i < 0 || i >= 100) return 0;
+            memset(o, 0, sizeof *o);
+            o->fee = 1000; o->weight = 1000;
+            if (i > 0){ o->parents[0][0] = (unsigned char)((i-1) & 0xff);
+                        o->parents[0][1] = (unsigned char)((i-1) >> 8);
+                        o->parents[0][2] = 0x5A; o->n_parents = 1; }
+            if (i < 99){ o->children[0][0] = (unsigned char)((i+1) & 0xff);
+                         o->children[0][1] = (unsigned char)((i+1) >> 8);
+                         o->children[0][2] = 0x5A; o->n_children = 1; }
+            return 1;
+        }
+        unsigned char seed[32]; memset(seed, 0, sizeof seed); seed[2] = 0x5A;
+        mpc_cluster c3;
+        ck("a 100-long chain does not overflow the cluster",
+           mpc_build_cluster(0, chain_lookup, seed, &c3)==0);
+        ck("...it stops at the 64 bound", c3.n <= MPC_MAX_CLUSTER);
+        ck("...and SAYS it was truncated", c3.truncated == 1);
+        /* a component that fits must NOT be flagged */
+        int short_lookup(void* c, const unsigned char* id, mpc_entry* o){
+            (void)c;
+            int i = id[0] | (id[1] << 8);
+            if (id[2] != 0x5A || i < 0 || i >= 10) return 0;
+            memset(o, 0, sizeof *o);
+            o->fee = 1000; o->weight = 1000;
+            if (i > 0){ o->parents[0][0] = (unsigned char)(i-1); o->parents[0][2] = 0x5A; o->n_parents = 1; }
+            if (i < 9){ o->children[0][0] = (unsigned char)(i+1); o->children[0][2] = 0x5A; o->n_children = 1; }
+            return 1;
+        }
+        ck("a 10-long chain fits and is NOT flagged truncated",
+           mpc_build_cluster(0, short_lookup, seed, &c3)==0 && c3.n==10 && c3.truncated==0);
     }
 
     printf("== index order is NOT topological order ==\n");
