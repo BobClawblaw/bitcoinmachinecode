@@ -1505,7 +1505,11 @@ static int worst_package(void* st){
  * trees that dominate real pools; Core's exact search only differs on
  * pathological wide clusters. Clusters larger than CHUNK_MAX_CLUSTER fall
  * back to the per-leaf score for that cluster alone. */
-#define CHUNK_MAX_CLUSTER 128
+/* 2026-09-14: was 128. The accept path already refuses anything that would
+ * build a cluster above 64 (CLUSTER_LIMIT below, Core's DEFAULT_CLUSTER_LIMIT),
+ * so 128 was unreachable headroom that merely disagreed with the two other
+ * cluster bounds in this tree. One bound, Core's, everywhere. */
+#define CHUNK_MAX_CLUSTER 64
 typedef struct { uint32_t idx[CHUNK_MAX_CLUSTER]; int n; uint64_t fee, size; } mpol_chunk;
 
 /* the connected component containing node `seed` (indices), via parent links

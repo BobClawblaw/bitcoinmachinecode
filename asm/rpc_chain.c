@@ -1227,7 +1227,10 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
         for (long i = 1; i < nb; i++){ int v = byroot[i]; long j = i - 1; while (j >= 0 && root_of[byroot[j]] > root_of[v]){ byroot[j+1] = byroot[j]; j--; } byroot[j+1] = v; }
         /* chunks: contiguous member runs in cmem; merging two adjacent chunks
          * of one cluster is a run extension */
-        #define GBT_CLUSTER_MAX 512
+        /* 2026-09-14: was 512. Accept refuses a cluster above 64 (Core's
+         * DEFAULT_CLUSTER_LIMIT), so this was unreachable and disagreed with
+         * the eviction and RPC bounds. One bound, Core's, everywhere. */
+        #define GBT_CLUSTER_MAX 64
         typedef struct { int start, cnt; unsigned long long fee, size; long long w, s; int cluster, seq; } gbt_chunk;
         static gbt_chunk chunks[GBT_MAX_TX]; long nch = 0;
         static int cmem[GBT_MAX_TX]; long ncm = 0;
