@@ -83,3 +83,65 @@ int mpc_chunk_linearization(const mpc_cluster* cl, const int* lin, mpc_chunking*
     }
     return 0;
 }
+
+void mpc_set_totals(const mpc_cluster* cl, uint64_t set, uint64_t* fee, uint64_t* weight)
+{
+    uint64_t f = 0, w = 0;
+    for (int i = 0; i < cl->n; i++)
+        if (set & ((uint64_t)1 << i)) { f += cl->m[i].fee; w += cl->m[i].weight; }
+    if (fee) *fee = f;
+    if (weight) *weight = w;
+}
+
+int mpc_linearize_ancestor_score(const mpc_cluster* cl, int* lin)
+{
+    if (!cl || !lin || cl->n < 0 || cl->n > MPC_MAX_CLUSTER) return -1;
+    uint64_t all = (cl->n >= 64) ? ~(uint64_t)0 : (((uint64_t)1 << cl->n) - 1);
+    uint64_t remaining = all;
+    int out = 0;
+
+    while (remaining) {
+        /* Pick the best ancestor-closed set among what is left. Restricting each
+         * candidate's ancestors to `remaining` is what keeps this correct as the
+         * loop proceeds: ancestors already emitted are no longer a cost, which
+         * is exactly why a CPFP child becomes attractive once its parent is
+         * gone -- and why the parent gets pulled in with it when it is not. */
+        int best = -1;
+        uint64_t best_set = 0, best_fee = 0, best_wt = 0;
+        for (int i = 0; i < cl->n; i++) {
+            if (!(remaining & ((uint64_t)1 << i))) continue;
+            uint64_t set = cl->m[i].ancestors & remaining;
+            if (!set) return -1;                   /* self must be in its own ancestors */
+            uint64_t fee, wt;
+            mpc_set_totals(cl, set, &fee, &wt);
+            if (best < 0) { best = i; best_set = set; best_fee = fee; best_wt = wt; continue; }
+            int c = mpc_feerate_cmp(fee, wt, best_fee, best_wt);
+            /* Core's emission order: feerate high to low, then SMALLER weight,
+             * then lowest index. The last two are not cosmetic -- without a
+             * total order, two runs over the same cluster can disagree and a
+             * differential becomes noise. */
+            int better = (c > 0) || (c == 0 && wt < best_wt) ||
+                         (c == 0 && wt == best_wt && i < best);
+            if (better) { best = i; best_set = set; best_fee = fee; best_wt = wt; }
+        }
+        if (best < 0) return -1;
+
+        /* Emit the chosen set in topological order: repeatedly take the lowest
+         * member whose own ancestors within the set are already placed. */
+        uint64_t placed = 0, todo = best_set;
+        while (todo) {
+            int chosen = -1;
+            for (int i = 0; i < cl->n; i++) {
+                if (!(todo & ((uint64_t)1 << i))) continue;
+                uint64_t need = cl->m[i].ancestors & best_set & ~((uint64_t)1 << i);
+                if ((need & placed) == need) { chosen = i; break; }
+            }
+            if (chosen < 0) return -1;             /* a cycle: not a valid DAG */
+            lin[out++] = chosen;
+            placed |= (uint64_t)1 << chosen;
+            todo   &= ~((uint64_t)1 << chosen);
+        }
+        remaining &= ~best_set;
+    }
+    return (out == cl->n) ? 0 : -1;
+}
