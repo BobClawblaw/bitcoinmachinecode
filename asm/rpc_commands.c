@@ -1128,7 +1128,14 @@ static int cmd_converttopsbt(const rj_val* params, long* ec, const char** em, rj
     unsigned long p=4, cc; int segwit=0;
     if (raw[4]==0x00 && txlen>6 && raw[5]!=0x00){ segwit=1; p=6; }
     unsigned long n_in=srw_varint(raw+p,&cc); p+=cc;
-    if (n_in==0||n_in>10000){ *ec=-22; *em="TX decode failed"; return 0; }
+    /* n_in == 0 is NOT a decode failure. A zero-input transaction cannot go
+     * on the network, but Core accepts one here (verified against v31.1),
+     * and wrapping one is how an empty PSBT template is built. Same root
+     * cause as crt_walk's guard (2026-09-14). Only the upper bound is real.
+     * simulaterawtransaction keeps its n_in == 0 refusal: it needs a loaded
+     * wallet, so Core's behaviour there could not be verified, and changing
+     * unverified behaviour is how a fix becomes a defect. */
+    if (n_in>10000){ *ec=-22; *em="TX decode failed"; return 0; }
     /* build stripped unsigned tx */
     static unsigned char utx[200000]; long u=0; int had_sig=segwit;
     utx[u++]=raw[0];utx[u++]=raw[1];utx[u++]=raw[2];utx[u++]=raw[3];   /* version */
@@ -2439,7 +2446,14 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
 
     /* --- parse the unsigned tx into inputs (outpoint,seq) + outputs region + locktime --- */
     unsigned long p=4, cc; unsigned long n_in=srw_varint(tx+p,&cc); p+=cc;
-    if (n_in==0||n_in>10000){ *ec=-22; *em="TX decode failed"; return 0; }
+    /* n_in == 0 is NOT a decode failure. A zero-input transaction cannot go
+     * on the network, but Core accepts one here (verified against v31.1),
+     * and wrapping one is how an empty PSBT template is built. Same root
+     * cause as crt_walk's guard (2026-09-14). Only the upper bound is real.
+     * simulaterawtransaction keeps its n_in == 0 refusal: it needs a loaded
+     * wallet, so Core's behaviour there could not be verified, and changing
+     * unverified behaviour is how a fix becomes a defect. */
+    if (n_in>10000){ *ec=-22; *em="TX decode failed"; return 0; }
     const unsigned char* in_outpoint[10000]; unsigned in_seq[10000];
     for (unsigned long i=0;i<n_in;i++){
         in_outpoint[i]=tx+p; p+=36;
@@ -3161,7 +3175,14 @@ static int crt_walk(const unsigned char* tx, unsigned long len, crt_in_t* ins, i
     int segwit = (len > 6 && tx[4] == 0x00 && tx[5] == 0x01);
     if (segwit) p = 6;
     unsigned long n_in = srw_varint(tx + p, &cc); p += cc;
-    if (n_in == 0 || (int)n_in > cap) return 0;
+    /* A zero-input transaction is not valid on the network, but it IS a valid
+     * thing to wrap in a PSBT: `createpsbt [] {}` builds an empty template to
+     * be funded later, and Core answers it with a well-formed PSBT. Refusing
+     * n_in == 0 here made the PSBTv2 conversion fail, and createpsbt reported
+     * "oom" (error -7) for a request that was never about memory. Found
+     * 2026-09-14 by extending the RPC shape differential past its first 64
+     * methods. Only the CAP is a real bound. */
+    if ((int)n_in > cap) return 0;
     for (unsigned long i = 0; i < n_in; i++){
         if (p + 36 > len) return 0;
         ins[i].op = tx + p; p += 36;
