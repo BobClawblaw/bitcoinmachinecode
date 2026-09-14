@@ -26,13 +26,29 @@ set -u
 . "$(dirname "$0")/lib/ibd_harness_lib.sh"
 BASE=${BASE:-/mnt/2tbssd/sweep}
 SRC=${SRC:-/storage/bitcoinmachinecode}
-ARMS=${ARMS:-"8 16 24 32"}
+# Arms are capped and the ceiling is deliberate: 8 is Core's own outbound
+# full-relay count, and anything above MAXARM has to be asked for explicitly by
+# someone who has decided the network load is acceptable.
+ARMS=${ARMS:-"4 8 12 16"}
+MAXARM=${MAXARM:-16}
+MAXCONN=${MAXCONN:-24}
 MINUTES=${MINUTES:-6}
 PORT=${PORT:-8472}; RPCPORT=${RPCPORT:-8471}
 CLI="$SRC/asm/daemon/bmc_cli"
 ts(){ date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 say(){ echo "$(ts) $*" | tee -a "$BASE/sweep.log"; }
 
+# Refuse before a single socket is opened, not after.
+for a in $ARMS; do
+    case "$a" in ''|*[!0-9]*) echo "arm '$a' is not a number" >&2; exit 2;; esac
+    if [ "$a" -gt "$MAXARM" ]; then
+        echo "REFUSING: arm w=$a exceeds MAXARM=$MAXARM." >&2
+        echo "  On 2026-09-14 a w=32 arm with no maxconnections opened thousands of" >&2
+        echo "  outbound connections across 35 processes and saturated the LAN." >&2
+        echo "  Raise MAXARM deliberately, with MAXCONN set, if you mean it." >&2
+        exit 2
+    fi
+done
 mkdir -p "$BASE"
 say "=== download worker sweep: arms=[$ARMS] ${MINUTES}min each, commit=$(git -C "$SRC" rev-parse --short HEAD)"
 say "link: $(ip -br link show enp14s0 2>/dev/null | awk '{print $1,$2}') $(sudo ethtool enp14s0 2>/dev/null | awk -F': ' '/Speed/{print $2}')"
@@ -51,6 +67,13 @@ rpcport=$RPCPORT
 dbcache=8192
 bmc.bootcatchup=0
 bmc.catchupworkers=$W
+# 2026-09-14: THIS CAP IS NOT OPTIONAL. Without it, this config placed no bound
+# on connections at all, and the w=32 arm opened thousands of outbound
+# connections across 35 processes and saturated the operator's LAN. The arm's
+# teardown never ran, so nothing bounded it until it was killed by hand.
+# catchupworkers raises download concurrency; maxconnections is what keeps that
+# from becoming a connection storm against the public network.
+maxconnections=$MAXCONN
 CONF
     say "--- arm w=$W : starting"
     # 2026-09-13: this was
