@@ -59,6 +59,37 @@ int mpc_chunk_linearization(const mpc_cluster* cl, const int* lin, mpc_chunking*
  * unusable: it would have a block template spend an output before creating it. */
 int mpc_is_topological(const mpc_cluster* cl, const int* lin);
 
+/* One entry as the mempool sees it: its DIRECT edges and its own fee/weight.
+ * Only direct edges are needed -- the transitive closure is computed here. */
+typedef struct {
+    uint64_t fee;
+    uint64_t weight;                 /* sigops-adjusted, as Core's chunks use */
+    int n_parents, n_children;
+    unsigned char parents[MPC_MAX_CLUSTER][32];
+    unsigned char children[MPC_MAX_CLUSTER][32];
+} mpc_entry;
+
+/* Look one transaction up. 1 found / 0 absent. */
+typedef int (*mpc_lookup_fn)(void* ctx, const unsigned char txid[32], mpc_entry* out);
+
+/* Build the cluster containing `seed`: the connected component of the mempool
+ * dependency graph reachable from it through parents AND children.
+ *
+ * A CALLBACK rather than a direct call into the mempool, deliberately. This
+ * module is linked by tests that do not pull in the policy registry, and a
+ * direct dependency here would be refused by link-check exactly as one was on
+ * 2026-09-12 -- 22 test rules link the RPC object without the mempool.
+ *
+ * Core bounds clusters at 64 transactions and rejects a transaction that would
+ * exceed it, so a real Core cluster always fits. This node's limits are not
+ * identical, so a component CAN exceed the bound here; when it does, the walk
+ * stops and `truncated` is set. A truncated cluster is NOT a cluster and must
+ * not be reported as one -- callers check the flag.
+ *
+ * Returns 0 on success, -1 if the seed is absent or the graph is malformed. */
+int mpc_build_cluster(void* ctx, mpc_lookup_fn look,
+                      const unsigned char seed[32], mpc_cluster* out);
+
 /* Build a linearization: an ordering in which every parent precedes every child.
  *
  * STAGE 3 (see the plan): ancestor-score greedy. Repeatedly take the remaining
