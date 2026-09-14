@@ -477,8 +477,40 @@ static int hexval(int c){ return c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>
  * plausible-looking wrong setting. Core's LocaleIndependentAtoi returns 0 for
  * anything it cannot represent, which the clamp below then reports.
  *
- * Returns 0 (and warns) on overflow, trailing garbage or an empty value, so
- * an unusable setting is visible instead of being quietly reinterpreted. */
+ * Returns 0 (and notes it -- see nodecfg_report_number) on overflow, trailing
+ * garbage or an empty value, so an unusable setting is visible instead of
+ * being quietly reinterpreted. */
+
+/* ---- DMN-9 follow-up (2026-09-14): WHO reports an unusable number -------
+ * The parse used to report it, which meant every line whose value is
+ * legitimately not a number reported it too. A conf holding
+ * `connect=192.168.5.242:8332` printed
+ *     [config] connect=192.168.5.242:8332 is not a usable number -- reading it as 0
+ * at every boot, while cfg_addlist() had parsed host and port perfectly and
+ * stored 8332. That single line is what made a wrong-port conf look like a
+ * broken parser during the 2026-09-14 reconnect-hammering investigation -- a
+ * false lead, raised in the one log an operator reads, about the one setting
+ * whose value is a peer rather than a count.
+ *
+ * So the verdict is taken at the parse and CASHED IN by the key that wanted
+ * the number: clamp_int() for the integer keys, nodecfg_report_number() in
+ * the handful of branches that parse a BTC/kvB amount with atof(). A value no
+ * branch consumed was never a number to begin with, and says nothing.
+ * ---------------------------------------------------------------------- */
+#define NUM_NOT_USABLE "is not a usable number -- reading it as 0"
+#define NUM_NO_FIT     "does not fit an int -- reading it as 0"
+static const char* g_num_pending;                     /* 0 = nothing pending */
+static const char* g_num_key, *g_num_val;
+static void nodecfg_note_number(const char* key, const char* val, const char* why){
+    g_num_pending = why; g_num_key = key; g_num_val = val;
+}
+static void nodecfg_report_number(void){
+    if(!g_num_pending) return;
+    fprintf(stderr, "[config] %s=%s %s\n", g_num_key ? g_num_key : "?",
+            g_num_val ? g_num_val : "", g_num_pending);
+    g_num_pending = 0;                                /* once per line */
+}
+
 static long long nodecfg_strtoll(const char* s, const char* key, int* overflowed){
     if (overflowed) *overflowed = 0;
     if (!s || !*s) return 0;
@@ -487,8 +519,7 @@ static long long nodecfg_strtoll(const char* s, const char* key, int* overflowed
     long long v = strtoll(s, &end, 10);
     if (errno == ERANGE || end == s || (end && *end)){
         if (overflowed) *overflowed = 1;
-        fprintf(stderr, "[config] %s=%s is not a usable number -- reading it as 0\n",
-                key ? key : "?", s);
+        nodecfg_note_number(key, s, NUM_NOT_USABLE);
         return 0;
     }
     return v;
@@ -500,14 +531,14 @@ static int nodecfg_atoi(const char* s, const char* key){
     long long v = nodecfg_strtoll(s, key, &ovf);
     if (ovf) return 0;
     if (v > INT_MAX || v < INT_MIN){
-        fprintf(stderr, "[config] %s=%s does not fit an int -- reading it as 0\n",
-                key ? key : "?", s);
+        nodecfg_note_number(key, s, NUM_NO_FIT);
         return 0;
     }
     return (int)v;
 }
 
 static int clamp_int(int v, int lo, int hi, const char* key, int* bad){
+    nodecfg_report_number();               /* this key needed the number */
     if(v < lo || v > hi){
         fprintf(stderr,"[config] %s=%d out of range [%d,%d] -- ignoring\n", key, v, lo, hi);
         (*bad)++; return -1;
@@ -650,6 +681,7 @@ long node_config_load(const char* path){
          * this parser knows, so a genuine option starting with "no" -- there
          * is none today, but there could be -- is not silently mangled. */
         char negbuf[128];
+        nodecfg_note_number(0, 0, 0);      /* a new line invalidates an unclaimed note */
         if(kl > 2 && key[0]=='n' && key[1]=='o' && nodecfg_known_key(key+2)){
             snprintf(negbuf, sizeof negbuf, "%s", key+2);
             int on = nodecfg_atoi(val, key) ? 0 : 1;    /* noX=1 -> X=0 (DMN-9: bounded) */
@@ -768,6 +800,7 @@ long node_config_load(const char* path){
          * everything between 0.1 and 1 sat/vB that its peers relay. */
         else if(!strcmp(key,"minrelaytxfee") || !strcmp(key,"incrementalrelayfee")){
             double btc = atof(val);
+            nodecfg_report_number();               /* a BTC amount is a number too */
             long satkvb = (long)(btc * 1e8 + 0.5);
             if(satkvb < 0) satkvb = 0;
             if(!strcmp(key,"minrelaytxfee"))      g_cfg.minrelaytxfee_satkvb = satkvb;
@@ -785,6 +818,7 @@ long node_config_load(const char* path){
             g_cfg.mempoolfullrbf = (iv != 0); applied++; }
         else if(!strcmp(key,"dustrelayfee")){  /* Core: BTC/kvB -> sat/kvB */
             double b = atof(val);
+            nodecfg_report_number();
             if(b >= 0 && b < 1.0){ g_cfg.dustrelayfee_satkvb = (long)(b*1e8 + 0.5); applied++; }
             else { fprintf(stderr,"[config] dustrelayfee=%s out of range -- ignoring\n", val); bad++; } }
         else if(!strcmp(key,"datacarrier")){
@@ -885,7 +919,7 @@ long node_config_load(const char* path){
             snprintf(g_cfg.shutdownnotify,sizeof g_cfg.shutdownnotify,"%s",val); applied++; }
         else if(!strcmp(key,"maxtxfee")){
             /* Core takes BTC; stored in satoshis like every other fee here */
-            double b = atof(val); if(b >= 0) g_cfg.maxtxfee_sat = (long)(b * 100000000.0 + 0.5);
+            double b = atof(val); nodecfg_report_number(); if(b >= 0) g_cfg.maxtxfee_sat = (long)(b * 100000000.0 + 0.5);
             applied++; }
         else if(!strcmp(key,"rpccookiefile")){
             snprintf(g_cfg.rpccookiefile,sizeof g_cfg.rpccookiefile,"%s",val); applied++; }
@@ -1071,6 +1105,7 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"blockmintxfee") || !strcmp(key,"mintxfee") || !strcmp(key,"fallbackfee") ||
                 !strcmp(key,"discardfee") || !strcmp(key,"consolidatefeerate")){
             double btc = atof(val);
+            nodecfg_report_number();
             if(btc < 0 || btc >= 1.0){ fprintf(stderr,"[config] %s=%s out of range -- ignoring\n", key, val); bad++; }
             else { long satkvb = (long)(btc * 1e8 + 0.5);
                    if(!strcmp(key,"blockmintxfee"))      g_cfg.blockmintxfee_satkvb = satkvb;
@@ -1081,6 +1116,7 @@ long node_config_load(const char* path){
                    applied++; } }
         else if(!strcmp(key,"maxapsfee")){           /* Core: BTC absolute; -1 = always avoid partial spends */
             double btc = atof(val);
+            nodecfg_report_number();
             if(btc < 0){ g_cfg.maxapsfee_sat = -1; applied++; }
             else if(btc >= 1.0){ fprintf(stderr,"[config] maxapsfee=%s out of range -- ignoring\n", val); bad++; }
             else { g_cfg.maxapsfee_sat = (long)(btc * 1e8 + 0.5); applied++; } }
@@ -1161,7 +1197,7 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"checkaddrman")){ g_cfg.checkaddrman = iv?1:0; applied++; }
         else if(!strcmp(key,"capturemessages")){ g_cfg.capturemessages = iv?1:0; applied++; }
         else if(!strcmp(key,"stopafterblockimport")){ g_cfg.stopafterblockimport = iv?1:0; applied++; }
-        else if(!strcmp(key,"mocktime")){ g_cfg.mocktime = atoll(val); applied++; }
+        else if(!strcmp(key,"mocktime")){ nodecfg_report_number(); g_cfg.mocktime = atoll(val); applied++; }
         else if(!strcmp(key,"includeconf")){
             if(g_include_depth){ fprintf(stderr,"[config] includeconf inside an included file is not allowed (Core rule) -- ignoring %s\n", val); bad++; }
             else if(g_cfg.n_includeconf >= 8){ fprintf(stderr,"[config] includeconf: at most 8 files -- ignoring %s\n", val); bad++; }
