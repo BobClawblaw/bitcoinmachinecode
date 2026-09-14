@@ -113,6 +113,36 @@ int mpc_build_cluster(void* ctx, mpc_lookup_fn look,
  * Writes cl->n indices into lin[]. Returns 0, or -1 on a malformed cluster.  */
 int mpc_linearize_ancestor_score(const mpc_cluster* cl, int* lin);
 
+/* Improve a linearization in place, as Core's PostLinearize does.
+ *
+ * Two passes, backward then forward. Core's own statement of the guarantees:
+ *   - one pass in either direction makes the resulting chunks CONNECTED;
+ *   - a forward pass linearizes optimally any graph where each transaction has
+ *     at most one child; a backward pass does so where each has at most one
+ *     parent;
+ *   - starting with a backward pass gives the moved-tree property: replacing a
+ *     transaction with a same-size higher-fee one cannot worsen the result.
+ *
+ * Each pass is equal-or-better than what it started from, so this can only
+ * improve the input. It is NOT Core's full optimum -- that is a spanning-forest
+ * search under a cost budget -- but it is bounded, deterministic, and its
+ * guarantees are stated rather than hoped for.
+ *
+ * Returns 0, or -1 if lin is not a valid linearization of cl. */
+int mpc_post_linearize(const mpc_cluster* cl, int* lin);
+
+/* Is linearization A at least as good as B in the FEERATE DIAGRAM sense?
+ *
+ * The diagram is the cumulative (weight, fee) curve of the chunked order. A is
+ * at least as good when its curve is nowhere below B's -- i.e. for every weight
+ * budget, A's ordering gets at least as much fee into it. This is the only
+ * honest way to compare two linearizations: Core's is not canonical, so raw
+ * equality would report non-defects, and total fee is identical for both since
+ * they hold the same transactions.
+ *
+ * 1 if A >= B everywhere, 0 otherwise. */
+int mpc_diagram_at_least_as_good(const mpc_cluster* cl, const int* a, const int* b);
+
 /* Sum fee and weight over a member bitset. */
 void mpc_set_totals(const mpc_cluster* cl, uint64_t set, uint64_t* fee, uint64_t* weight);
 

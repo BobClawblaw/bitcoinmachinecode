@@ -423,6 +423,93 @@ int main(void){
         ck("no call failed unexpectedly", bad_rc == 0);
     }
 
+    printf("== post-linearization ==\n");
+    {   /* the diagram comparator must first agree with itself */
+        uint64_t f[3] = {3000,2000,1000}, w[3] = {1000,1000,1000};
+        mk(&cl,3,f,w); int a[3]={0,1,2};
+        ck("a linearization is at least as good as itself",
+           mpc_diagram_at_least_as_good(&cl,a,a));
+        int worse[3]={2,1,0};
+        ck("descending order beats ascending", mpc_diagram_at_least_as_good(&cl,a,worse));
+        ck("...and ascending does NOT beat descending",
+           !mpc_diagram_at_least_as_good(&cl,worse,a));
+    }
+    {   /* a case the greedy leaves improvable: a rich child behind a poor one.
+         * Post-linearization must not make it worse, and must stay topological. */
+        uint64_t f[4] = {1000, 100, 5000, 900}, w[4] = {1000,1000,1000,1000};
+        mk(&cl,4,f,w);
+        cl.m[2].ancestors |= (uint64_t)1 << 1;      /* 2 is a child of 1 */
+        cl.m[1].descendants |= (uint64_t)1 << 2;
+        int lin[4];
+        mpc_linearize_ancestor_score(&cl,lin);
+        int before[4]; memcpy(before,lin,sizeof lin);
+        ck("post-linearization accepts a valid linearization",
+           mpc_post_linearize(&cl,lin)==0);
+        ck("...the result is still topological", mpc_is_topological(&cl,lin));
+        ck("...and never worse in the feerate diagram",
+           mpc_diagram_at_least_as_good(&cl,lin,before));
+    }
+    {   /* it must REFUSE a non-topological input rather than "improve" it */
+        uint64_t f[2] = {1,1}, w[2] = {1,1};
+        mk(&cl,2,f,w);
+        cl.m[1].ancestors |= 1; cl.m[0].descendants |= 2;
+        int bad[2] = {1,0};
+        ck("a non-topological input is refused", mpc_post_linearize(&cl,bad)==-1);
+    }
+    {   /* CHUNKS MUST BE CONNECTED after a pass -- Core's first guarantee. A
+         * chunk holding two transactions with no dependency path between them
+         * means the pass merged groups it should have swapped. */
+        unsigned seed = 771u;
+        int bad_topo=0, bad_worse=0, bad_conn=0, n=0;
+        for (int trial=0; trial<3000; trial++){
+            seed ^= seed<<13; seed ^= seed>>17; seed ^= seed<<5;
+            int nn = 1 + (int)(seed % 12);
+            memset(&cl,0,sizeof cl); cl.n = nn;
+            for (int i=0;i<nn;i++){
+                seed ^= seed<<13; seed ^= seed>>17; seed ^= seed<<5;
+                cl.m[i].fee = seed % 20000; cl.m[i].weight = 400 + (seed % 2000);
+                cl.m[i].ancestors = (uint64_t)1<<i; cl.m[i].descendants = (uint64_t)1<<i;
+            }
+            int perm[MPC_MAX_CLUSTER]; for (int i=0;i<nn;i++) perm[i]=i;
+            for (int i=nn-1;i>0;i--){ seed ^= seed<<13; seed ^= seed>>17; seed ^= seed<<5;
+                int j=(int)(seed%(unsigned)(i+1)); int t=perm[i];perm[i]=perm[j];perm[j]=t; }
+            for (int ci=1;ci<nn;ci++) for (int pi=0;pi<ci;pi++){
+                seed ^= seed<<13; seed ^= seed>>17; seed ^= seed<<5;
+                if (seed%100<30) cl.m[perm[ci]].ancestors |= cl.m[perm[pi]].ancestors; }
+            for (int i=0;i<nn;i++) for (int j=0;j<nn;j++)
+                if (cl.m[j].ancestors & ((uint64_t)1<<i)) cl.m[i].descendants |= (uint64_t)1<<j;
+
+            int lin[MPC_MAX_CLUSTER], before[MPC_MAX_CLUSTER];
+            if (mpc_linearize_ancestor_score(&cl,lin)!=0) continue;
+            memcpy(before,lin,sizeof lin);
+            if (mpc_post_linearize(&cl,lin)!=0){ bad_topo++; continue; }
+            n++;
+            if (!mpc_is_topological(&cl,lin)) bad_topo++;
+            if (!mpc_diagram_at_least_as_good(&cl,lin,before)) bad_worse++;
+            /* connectivity: every chunk of >1 member must be joined through the
+             * dependency relation */
+            mpc_chunking cc; mpc_chunk_linearization(&cl,lin,&cc);
+            for (int k=0;k<cc.n;k++){
+                uint64_t mem = cc.c[k].members;
+                if (!(mem & (mem-1))) continue;             /* singleton */
+                uint64_t reach = mem & (~mem + 1);          /* lowest set bit */
+                for (int it=0; it<nn; it++){
+                    uint64_t grow = reach;
+                    uint64_t r = reach;
+                    while (r){ int b=__builtin_ctzll(r); r &= r-1;
+                        grow |= (cl.m[b].ancestors | cl.m[b].descendants) & mem; }
+                    if (grow == reach) break;
+                    reach = grow;
+                }
+                if (reach != mem){ bad_conn++; break; }
+            }
+        }
+        printf("      %d random DAGs post-linearized\n", n);
+        ck("post-linearization never breaks topology", bad_topo==0);
+        ck("post-linearization is never worse in the diagram", bad_worse==0);
+        ck("every resulting chunk is connected", bad_conn==0);
+    }
+
     printf("\npassed %d, failed %d\n", pass, fail);
     if (fail) { printf("TESTS FAILED (%d failure(s))\n", fail); return 1; }
     printf("ALL TESTS PASSED (0 failures)\n");
