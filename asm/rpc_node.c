@@ -11,6 +11,7 @@
  * values true for THIS node, not the oracle's numbers.
  */
 #include <string.h>
+#include "mempool_cluster.h"
 #include "rpc_node.h"
 
 /* Core's per-message byte breakdown for getpeerinfo. Defined here so exactly
@@ -1361,6 +1362,7 @@ static unsigned long mpe_vs_lookup(const unsigned char id[32]){
 }
 
 /* the per-entry object, shared by getmempoolentry and verbose getrawmempool */
+static int mpc_lookup_here(void* ctx, const unsigned char txid[32], mpc_entry* out);
 static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len);
 static int cmd_getrawmempool(const rj_val* params, rj_val** res){
     /* verbose (params[0]==true) -> object keyed by txid; else -> array of
@@ -1574,6 +1576,37 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
             rj_obj_set(o, "chunkweight", rj_numf("%llu", adjw));
             rj_obj_set(fees, "chunk", rj_numf("%s%lld.%08lld",
                        modified<0?"-":"", am/100000000LL, am%100000000LL));
+        } else if (have_inf && !g_mpe_inf){
+            /* A member of a real cluster: build it, linearize, chunk, and report
+             * the chunk this transaction actually lands in.
+             *
+             * ONLY on the single-transaction path. g_mpe_inf is set when the
+             * caller is getrawmempool in bulk, and building a cluster per entry
+             * there would be quadratic over the whole pool -- the same shape as
+             * the 33x regression that a per-txid graph walk caused in this file
+             * before it was replaced by one pass. The bulk path therefore still
+             * omits these two fields for cluster members, which is a documented
+             * gap rather than a wrong number. */
+            mpc_cluster cl;
+            if (mpc_build_cluster(0, mpc_lookup_here, txid, &cl) == 0 &&
+                !cl.truncated && cl.n > 1){
+                int lin[MPC_MAX_CLUSTER]; mpc_chunking ch;
+                if (mpc_linearize_ancestor_score(&cl, lin) == 0 &&
+                    mpc_chunk_linearization(&cl, lin, &ch) == 0){
+                    int me = -1;
+                    for (int k = 0; k < cl.n; k++)
+                        if (!memcmp(cl.txid[k], txid, 32)) { me = k; break; }
+                    for (int c = 0; c < ch.n && me >= 0; c++){
+                        if (!(ch.c[c].members & ((uint64_t)1 << me))) continue;
+                        unsigned long long cf = (unsigned long long)ch.c[c].fee;
+                        rj_obj_set(o, "chunkweight",
+                                   rj_numf("%llu", (unsigned long long)ch.c[c].weight));
+                        rj_obj_set(fees, "chunk",
+                                   rj_numf("%llu.%08llu", cf/100000000ULL, cf%100000000ULL));
+                        break;
+                    }
+                }
+            }
         } }
       rj_obj_set(o, "fees", fees); }
 
@@ -2909,6 +2942,48 @@ int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
     return 0;
 }
+/* ---- the cluster layer's view of this mempool -----------------------------
+ * mempool_cluster.c knows nothing about this node: it takes a lookup callback.
+ * That is deliberate (link-check refused a direct policy dependency here once
+ * already), and it is also what lets the cluster tests run with no mempool.
+ *
+ * The caller must hold the mempool lock across the whole build: the callback is
+ * invoked many times and a pool that moves underneath it would produce a
+ * cluster assembled from two different mempools. */
+static int mpc_lookup_here(void* ctx, const unsigned char txid[32], mpc_entry* out)
+{
+    (void)ctx;
+    if (!g_mph.mp || !g_mph.get) return 0;
+    unsigned long len = 0;
+    const unsigned char* tx = g_mph.get(g_mph.mp, txid, &len);
+    if (!tx) return 0;
+    mp_entry_info inf;
+    if (!g_mph.pol_entry_info || !g_mph.polstate) return 0;
+    if (!(int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf)) return 0;
+
+    memset(out, 0, sizeof *out);
+    /* fee is the MODIFIED fee: prioritisetransaction moves a transaction in the
+     * block-space competition, so the chunking must see the same number the
+     * miner would. */
+    long long modified = (long long)inf.fee + pri_delta_of(txid);
+    out->fee = modified < 0 ? 0 : (uint64_t)modified;
+    /* Core chunks by sigops-ADJUSTED weight (policy.cpp GetSigOpsAdjustedWeight),
+     * not raw weight -- a sigop-heavy transaction costs a block more than its
+     * bytes suggest, and chunking by bytes would order it wrongly. */
+    { unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
+      unsigned long long w = mp_tx_weight(tx, len);
+      unsigned long long sw = (unsigned long long)inf.sigop_cost * bps;
+      out->weight = sw > w ? sw : w; }
+
+    int np = inf.n_depends > MPC_MAX_CLUSTER ? MPC_MAX_CLUSTER : inf.n_depends;
+    for (int i = 0; i < np; i++) memcpy(out->parents[i], inf.depends[i], 32);
+    out->n_parents = np;
+    int nc = inf.n_spentby > MPC_MAX_CLUSTER ? MPC_MAX_CLUSTER : inf.n_spentby;
+    for (int i = 0; i < nc; i++) memcpy(out->children[i], inf.spentby[i], 32);
+    out->n_children = nc;
+    return 1;
+}
+
 /* getmempoolcluster, for the case that needs no linearization.
  *
  * Core returns the transaction's whole cluster in LINEARIZATION order, split
@@ -2944,44 +3019,63 @@ static int cmd_getmempoolcluster(const rj_val* params, rj_val** res, long* ec, c
         txid[31-i]=(unsigned char)((a<<4)|b);
     }
     if (!g_mph.mp || !g_mph.get){ *ec=-5; *em="Transaction not in mempool"; return 0; }
+
+    /* The whole build under ONE lock hold. mpc_build_cluster calls back many
+     * times; a pool that moved underneath it would assemble a cluster from two
+     * different mempools and report a competition that never existed. */
     mpl();
-    unsigned long len=0;
-    const unsigned char* tx = g_mph.get(g_mph.mp, txid, &len);
-    if (!tx){ mpu(); *ec=-5; *em="Transaction not in mempool"; return 0; }
-    unsigned long w = mp_tx_weight(tx, len);
-    mp_entry_info inf; int have_inf = 0;
-    if (g_mph.pol_entry_info && g_mph.polstate)
-        have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
+    mpc_cluster cl;
+    int rc = mpc_build_cluster(0, mpc_lookup_here, txid, &cl);
     mpu();
-    if (!have_inf){ *ec = -5; *em = "Transaction not in mempool"; return 0; }
-    if (inf.n_anc != 1 || inf.n_desc != 1){
+    if (rc != 0 || cl.n < 1){ *ec=-5; *em="Transaction not in mempool"; return 0; }
+
+    if (cl.truncated){
+        /* Core rejects a transaction that would exceed its 64-transaction
+         * cluster limit, so a Core cluster always fits. This node's limits are
+         * not identical, so a component CAN exceed it -- and a truncated walk is
+         * not a cluster. Reporting one would describe a block-space competition
+         * with most of its competitors missing. */
         snprintf(embuf, sizeof embuf,
-                 "this transaction's cluster holds %d transaction(s) (ancestors %d, "
-                 "descendants %d, both counting itself). Splitting a cluster into chunks "
-                 "IS Core's cluster linearization, which this node does not implement, so "
-                 "the chunks cannot be reported. A singleton cluster is answered in full; "
-                 "see getmempoolancestors/getmempooldescendants for the graph.",
-                 inf.n_anc > inf.n_desc ? inf.n_anc : inf.n_desc, inf.n_anc, inf.n_desc);
+                 "this transaction's cluster exceeds %d transactions, the limit Core "
+                 "enforces at acceptance (DEFAULT_CLUSTER_LIMIT). This node accepted a "
+                 "larger component, so the cluster cannot be reported without omitting "
+                 "members of it.", MPC_MAX_CLUSTER);
         *ec = -1; *em = embuf; return 0;
     }
-    unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
-    unsigned long long adjw = w;
-    { unsigned long long sw = (unsigned long long)inf.sigop_cost * bps;
-      if (sw > adjw) adjw = sw; }
-    long long modified = (long long)inf.fee + pri_delta_of(txid);
-    long long am = modified < 0 ? -modified : modified;
+
+    int lin[MPC_MAX_CLUSTER];
+    if (mpc_linearize_ancestor_score(&cl, lin) != 0){
+        *ec = -1; *em = "the cluster could not be linearized (not a DAG?)"; return 0; }
+    mpc_chunking ch;
+    if (mpc_chunk_linearization(&cl, lin, &ch) != 0){
+        *ec = -1; *em = "the cluster's linearization could not be chunked"; return 0; }
+
+    uint64_t total_w = 0;
+    for (int i = 0; i < cl.n; i++) total_w += cl.m[i].weight;
 
     rj_val* o = rj_obj();
-    rj_obj_set(o, "clusterweight", rj_numf("%llu", adjw));
-    rj_obj_set(o, "txcount", rj_numf("%d", 1));
+    rj_obj_set(o, "clusterweight", rj_numf("%llu", (unsigned long long)total_w));
+    rj_obj_set(o, "txcount", rj_numf("%d", cl.n));
     rj_val* chunks = rj_arr();
-    rj_val* c = rj_obj();
-    rj_obj_set(c, "chunkfee", rj_numf("%s%lld.%08lld", modified<0?"-":"",
-                                      am/100000000LL, am%100000000LL));
-    rj_obj_set(c, "chunkweight", rj_numf("%llu", adjw));
-    rj_val* txs = rj_arr(); rj_arr_push(txs, rj_str(hx));
-    rj_obj_set(c, "txs", txs);
-    rj_arr_push(chunks, c);
+    for (int i = 0; i < ch.n; i++){
+        rj_val* c = rj_obj();
+        unsigned long long fee = (unsigned long long)ch.c[i].fee;
+        rj_obj_set(c, "chunkfee", rj_numf("%llu.%08llu", fee/100000000ULL, fee%100000000ULL));
+        rj_obj_set(c, "chunkweight", rj_numf("%llu", (unsigned long long)ch.c[i].weight));
+        rj_val* txs = rj_arr();
+        /* members in LINEARIZATION order, as Core emits them -- a chunk is an
+         * ordered run, not a set, and a caller reconstructing the block order
+         * from this must get the order. */
+        for (int k = 0; k < cl.n; k++){
+            int idx = lin[k];
+            if (!(ch.c[i].members & ((uint64_t)1 << idx))) continue;
+            char h[65];
+            mpe_hex(h, cl.txid[idx]);       /* display order, as getblock prints */
+            rj_arr_push(txs, rj_str(h));
+        }
+        rj_obj_set(c, "txs", txs);
+        rj_arr_push(chunks, c);
+    }
     rj_obj_set(o, "chunks", chunks);
     *res = o;
     return 1;
