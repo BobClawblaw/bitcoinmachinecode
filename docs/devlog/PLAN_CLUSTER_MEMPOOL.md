@@ -27,7 +27,15 @@
 > - the mining path computes feerate over **vsize** where the module uses
 >   **adjusted weight**, and breaks ties by **txid** where the module uses index.
 >   Both change which transactions land in a block.
-> - the mining path has **no test coverage of selection at all**.
+> - the mining path's selection coverage is PARTIAL, not absent. (An earlier
+>   version of this note said "no test coverage of selection at all". That was
+>   wrong — `test_rpc_chain.c` carries 31 getblocktemplate assertions including
+>   CPFP ordering, `depends` indices, and chunk merging across a sibling cluster.
+>   The claim came from a grep that matched the wrong section.) What is genuinely
+>   uncovered is the part unification would move: the **block weight budget**
+>   (a chunk that does not fit skips the REST OF ITS CLUSTER, not just itself),
+>   the **`-blockmintxfee` floor**, the **sigops budget**, and the **txid
+>   tie-break**.
 >
 > **The order that work has to happen in:** characterisation tests pinning
 > today's selection behaviour, then the unification, then a differential against
