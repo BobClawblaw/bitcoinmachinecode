@@ -1316,6 +1316,101 @@ int main(void){
             ck("grt: unknown txid is still -5", r == NULL && ec == -5);
             rj_free(r); } }
 
+        /* ---- CHARACTERISATION: the selection paths nothing pinned ----------
+         * 2026-09-14. The CPFP and chunk-merge cases above are well covered.
+         * These are the ones that were not, and they are exactly the ones a
+         * unification onto mempool_cluster.c would move: the weight budget, the
+         * -blockmintxfee floor, and the rule that a chunk which does not fit
+         * skips the REST OF ITS CLUSTER rather than just itself.
+         *
+         * These tests describe what this node does TODAY. They are not a claim
+         * that it is right -- that is what the differential against Core is for.
+         * Their job is to make any change to selection show up as a diff here
+         * instead of as a quieter block. */
+        { extern void rpc_chain_set_gbt_policy(long,long,long,int,int);
+          long sel_full = 0;
+          r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+          { rj_val* t = G(r, "transactions");
+            sel_full = (t && t->typ == RJ_ARR) ? (long)t->nitems : -1; }
+          ck("baseline: the pool's transactions are selected", sel_full > 0);
+          rj_free(r);
+
+          /* A floor above every transaction in the pool. Core's BlockAssembler
+           * stops at the first package under -blockmintxfee; nothing here pays
+           * 1000 sat/vB, so the template must come back EMPTY rather than
+           * quietly ignoring the floor. */
+          rpc_chain_set_gbt_policy(4000000, 8000, 1000000 /* sat/kvB */, 0, 0);
+          r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+          { rj_val* t = G(r, "transactions");
+            ck("an unreachable -blockmintxfee selects NOTHING",
+               t && t->typ == RJ_ARR && t->nitems == 0); }
+          ck_str("...and coinbasevalue falls back to the bare subsidy",
+                 S(r,"coinbasevalue"), "5000000000");
+          rj_free(r);
+
+          /* A weight budget too small for the whole pool. What is pinned is the
+           * INVARIANT, not a transaction count: the template must fit inside the
+           * budget and must not be empty just because it is tight. An exact
+           * count here would pin the fixture rather than the rule. */
+          rpc_chain_set_gbt_policy(4000, 3500, 1, 0, 0);   /* budget_w = 500 */
+          r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+          { rj_val* t = G(r, "transactions");
+            long n_sel = (t && t->typ == RJ_ARR) ? (long)t->nitems : -1;
+            ck("a tight weight budget selects FEWER than the pool holds",
+               n_sel >= 0 && n_sel < sel_full);
+            long long wsum = 0; int all_have_w = 1;
+            for (long i = 0; t && i < t->nitems; i++){
+              const char* w = S(t->items[i], "weight");
+              if (!w) { all_have_w = 0; break; }
+              wsum += atoll(w);
+            }
+            ck("...every selected transaction reports a weight", all_have_w);
+            ck("...and the selection fits the budget (4000 - 3500)",
+               all_have_w && wsum <= 500);
+            /* the dependency rule must survive a truncated template: a child
+             * may never be selected without the parent it spends */
+            int dep_ok = 1;
+            for (long i = 0; t && i < t->nitems; i++){
+              rj_val* d = rj_obj_get(t->items[i], "depends");
+              for (long k = 0; d && k < d->nitems; k++){
+                long idx = atol(d->items[k]->str);      /* 1-based */
+                if (idx < 1 || idx > i) { dep_ok = 0; break; }   /* must precede */
+              }
+            }
+            ck("...and no selected child precedes the parent it depends on", dep_ok); }
+          rj_free(r);
+
+          /* restore, and prove the restriction was the cause rather than some
+           * state the earlier calls left behind */
+          rpc_chain_set_gbt_policy(4000000, 8000, 1, 0, 0);
+          r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+          { rj_val* t = G(r, "transactions");
+            ck("restoring the policy restores the full selection",
+               t && t->typ == RJ_ARR && (long)t->nitems == sel_full); }
+          rj_free(r);
+
+          /* KNOWN GAP, stated rather than faked. The rule that a chunk which
+           * does not fit skips the REST OF ITS CLUSTER (cluster_skipped[]) is
+           * NOT pinned by anything above. Reverting it to skip only the chunk
+           * leaves every test here passing.
+           *
+           * Why it cannot be reached with this fixture: chunk feerates are
+           * non-increasing WITHIN a cluster, so on the -blockmintxfee path the
+           * flag is a no-op -- if the first chunk is under the floor, so is
+           * every later one. It bites only on the WEIGHT path, where a later,
+           * LIGHTER chunk could fit where the first did not. Every transaction
+           * built by MKTX here is 61 bytes, so no cluster has a heavy first
+           * chunk and a light second one, and the two behaviours are
+           * indistinguishable.
+           *
+           * Pinning it needs a fixture with transactions of DIFFERENT sizes:
+           * a heavy high-feerate parent and a light low-feerate child, with a
+           * budget between them. Worth building before the mining path is
+           * unified onto mempool_cluster.c, because that is precisely the rule
+           * a unification would have to preserve -- and selecting a later chunk
+           * without its earlier one would emit a child whose parent is absent. */
+        }
+
         /* restore the empty pool for the sections below */
         { rpc_mempool_hooks h0; memset(&h0, 0, sizeof h0);
           rpc_chain_set_mempool(&h0, NULL);
