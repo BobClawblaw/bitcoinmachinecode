@@ -57,6 +57,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include "bitcoin_pow_rules.h"
+#include "mempool_cluster.h"   /* the one linearization/chunking implementation */
 #include "rpc_node.h"     /* rpc_mempool_hooks: getblocktemplate reads the shared pool */
 #include "script_flags_consts.h"
 #include "block_filter.h"   /* BIP158 basic filters, Core-byte-validated */  /* buried-deployment heights, generated from
@@ -1240,35 +1241,87 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
         while (gi < nb){
             long gj = gi; while (gj < nb && root_of[byroot[gj]] == root_of[byroot[gi]]) gj++;
             long msz = gj - gi; const int* mem = &byroot[gi];
-            int merge = msz <= GBT_CLUSTER_MAX;
             long first_chunk = nch;
-            for (long left = msz; left > 0; ){
-                /* the undone member whose undone ancestor set has the best feerate */
-                int best = -1; unsigned long long bf = 0, bs = 1;
+
+            /* UNIFIED 2026-09-14: the linearization and chunking are
+             * mempool_cluster.c's, not a second copy of the same idea. This
+             * file, bitcoin_mempool_policy.c and mempool_cluster.c each carried
+             * their own; one of them is tested to the letter (74 tests, 3,000
+             * randomised DAGs) and that is the one that should decide which
+             * transactions a block holds.
+             *
+             * The feerate denominator is deliberately UNCHANGED: tsize (vsize)
+             * is handed to the module as its weight, so today's ordering
+             * arithmetic is preserved exactly. Core chunks by sigops-ADJUSTED
+             * WEIGHT and this node should too, but that is a change to what the
+             * numbers MEAN, and doing it in the same commit as a change to
+             * WHICH CODE computes them would make the diff unreadable. Separate
+             * commit, separate justification.
+             *
+             * A cluster above the bound cannot occur -- accept refuses one
+             * (too-large-cluster, Core's DEFAULT_CLUSTER_LIMIT) -- but if the
+             * registry ever handed us one, falling back to per-member chunks is
+             * the honest answer: no ordering claim we cannot support. */
+            if (msz > MPC_MAX_CLUSTER){
                 for (long m = 0; m < msz; m++){
                     int t = mem[m]; if (done[t]) continue;
-                    unsigned long long f = tfee[t], z = tsize[t];
-                    for (int a = 0; a < anc_n[t]; a++) if (!done[anc_idx[t][a]]){ f += tfee[anc_idx[t][a]]; z += tsize[anc_idx[t][a]]; }
-                    if (z == 0) z = 1;
-                    int better = (best < 0) || ((unsigned __int128)f * bs > (unsigned __int128)bf * z) ||
-                                 ((unsigned __int128)f * bs == (unsigned __int128)bf * z && memcmp(ents[t].txid, ents[best].txid, 32) < 0);
-                    if (better){ best = t; bf = f; bs = z; }
+                    gbt_chunk* c = &chunks[nch++];
+                    c->start = (int)ncm; c->cnt = 1; c->cluster = cluster_no;
+                    c->seq = (int)(nch - 1 - first_chunk);
+                    c->fee = tfee[t]; c->size = tsize[t]; c->w = tweight[t]; c->s = tsig[t];
+                    done[t] = 1; cmem[ncm++] = t;
                 }
-                if (best < 0) break;
-                gbt_chunk* c = &chunks[nch]; c->start = (int)ncm; c->cnt = 0; c->fee = 0; c->size = 0; c->w = 0; c->s = 0; c->cluster = cluster_no; c->seq = (int)(nch - first_chunk);
-                /* members: undone ancestors + best, parents-first (ascending ancestor count is a topological order inside an ancestor set) */
-                int set[MPE_MAX_SET + 1]; int ns = 0;
-                for (int a = 0; a < anc_n[best]; a++) if (!done[anc_idx[best][a]]) set[ns++] = anc_idx[best][a];
-                set[ns++] = best;
-                for (int x = 0; x < ns; x++) for (int y = x + 1; y < ns; y++) if (anc_n[set[y]] < anc_n[set[x]]){ int t_ = set[x]; set[x] = set[y]; set[y] = t_; }
-                for (int x = 0; x < ns; x++){ int t = set[x]; done[t] = 1; cmem[ncm++] = t; c->cnt++; c->fee += tfee[t]; c->size += tsize[t]; c->w += tweight[t]; c->s += tsig[t]; left--; }
-                nch++;
-                /* merge backwards while this chunk pays more than the one before it */
-                while (merge && nch - first_chunk >= 2){
-                    gbt_chunk* pv = &chunks[nch-2]; gbt_chunk* cu = &chunks[nch-1];
-                    if ((unsigned __int128)cu->fee * pv->size > (unsigned __int128)pv->fee * cu->size){
-                        pv->cnt += cu->cnt; pv->fee += cu->fee; pv->size += cu->size; pv->w += cu->w; pv->s += cu->s; nch--;
-                    } else break;
+            } else {
+                mpc_cluster cl; memset(&cl, 0, sizeof cl); cl.n = (int)msz;
+                for (long m = 0; m < msz; m++){
+                    int t = mem[m];
+                    cl.m[m].fee = tfee[t];
+                    cl.m[m].weight = tsize[t];          /* see the note above */
+                    cl.m[m].ancestors = (uint64_t)1 << m;
+                    memcpy(cl.txid[m], ents[t].txid, 32);
+                }
+                /* ancestor bitsets, restricted to this cluster */
+                for (long m = 0; m < msz; m++){
+                    int t = mem[m];
+                    for (int a = 0; a < anc_n[t]; a++){
+                        int at = anc_idx[t][a];
+                        for (long q = 0; q < msz; q++)
+                            if (mem[q] == at){ cl.m[m].ancestors |= (uint64_t)1 << q; break; }
+                    }
+                }
+                for (long m = 0; m < msz; m++)
+                    for (long q = 0; q < msz; q++)
+                        if (cl.m[q].ancestors & ((uint64_t)1 << m)) cl.m[m].descendants |= (uint64_t)1 << q;
+
+                int lin[MPC_MAX_CLUSTER]; mpc_chunking mch;
+                if (mpc_linearize_ancestor_score(&cl, lin) == 0 &&
+                    (mpc_post_linearize(&cl, lin), 1) &&
+                    mpc_chunk_linearization(&cl, lin, &mch) == 0){
+                    for (int ci2 = 0; ci2 < mch.n; ci2++){
+                        gbt_chunk* c = &chunks[nch++];
+                        c->start = (int)ncm; c->cnt = 0; c->fee = 0; c->size = 0; c->w = 0; c->s = 0;
+                        c->cluster = cluster_no; c->seq = (int)(nch - 1 - first_chunk);
+                        /* members in LINEARIZATION order: a chunk is an ordered
+                         * run, and depends[] downstream is built from it */
+                        for (long k = 0; k < msz; k++){
+                            int idx = lin[k];
+                            if (!(mch.c[ci2].members & ((uint64_t)1 << idx))) continue;
+                            int t = mem[idx];
+                            done[t] = 1; cmem[ncm++] = t; c->cnt++;
+                            c->fee += tfee[t]; c->size += tsize[t];
+                            c->w += tweight[t]; c->s += tsig[t];
+                        }
+                    }
+                } else {
+                    /* the module refused: emit per-member rather than guess */
+                    for (long m = 0; m < msz; m++){
+                        int t = mem[m]; if (done[t]) continue;
+                        gbt_chunk* c = &chunks[nch++];
+                        c->start = (int)ncm; c->cnt = 1; c->cluster = cluster_no;
+                        c->seq = (int)(nch - 1 - first_chunk);
+                        c->fee = tfee[t]; c->size = tsize[t]; c->w = tweight[t]; c->s = tsig[t];
+                        done[t] = 1; cmem[ncm++] = t;
+                    }
                 }
             }
             cluster_no++; gi = gj;
