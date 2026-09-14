@@ -1,5 +1,44 @@
 # Cluster mempool: design and staged plan
 
+> **CORRECTED 2026-09-14.** The staging below was written from Core's source
+> without reading enough of ours, and two of its seven stages describe work that
+> was already done. Kept because the design section is still right and the
+> correction is the useful part.
+>
+> **Eviction (stage 6) was already cluster-aware.** `bitcoin_mempool_policy.c`
+> implements connected components, ancestor-set greedy linearization, chunking
+> and worst-chunk eviction, described in its own comments as Core v31
+> `TrimToSize`, and `test_mempool_chunks` covers the CPFP-versus-single case
+> that cluster eviction exists to fix.
+>
+> **Mining (stage 7) was already cluster-aware.** `rpc_chain.c` builds clusters,
+> chunks them, orders chunks by feerate across clusters, and fills the block by
+> chunk.
+>
+> **Accept already enforces Core's limit** — 64 transactions / 101 kvB, rejecting
+> with `too-large-cluster`, including the wide shapes ancestor limits miss and
+> the post-replacement view for RBF.
+>
+> So the actual state after stages 1-5 is not "a cluster mempool where there was
+> none". It is **three implementations of the same idea in one tree**: the
+> eviction path, the mining path, and `mempool_cluster.c`. That is the problem
+> worth solving now, and it is not a refactor:
+>
+> - the mining path computes feerate over **vsize** where the module uses
+>   **adjusted weight**, and breaks ties by **txid** where the module uses index.
+>   Both change which transactions land in a block.
+> - the mining path has **no test coverage of selection at all**.
+>
+> **The order that work has to happen in:** characterisation tests pinning
+> today's selection behaviour, then the unification, then a differential against
+> Core with `mining_polish_diff.py` on the live node. Rewriting block selection
+> with nothing in the gate that could catch a regression is not a thing to do
+> blind.
+>
+> The cluster bound is now 64 everywhere (it was 64 / 128 / 512), pinned by a
+> test.
+
+
 2026-09-13. Decision taken: implement it, rather than record it as a permanent
 divergence. This file is the design and the staging, written before the code so
 the hard parts are named in advance.
@@ -76,7 +115,9 @@ Each stage lands on its own, gated, and is useful without the next.
 | 6 | wire to eviction | the eviction tests, extended: a parent whose child pays for it must not be evicted first |
 | 7 | wire to mining template | template differential against Core at the same tip |
 
-Stages 1 and 2 are exactly specified and fully testable offline. Stage 3 gives a
+Stages 6 and 7 in the table below were ALREADY DONE before this work started --
+see the correction above. Stages 1 and 2 are exactly specified and fully testable
+offline. Stage 3 gives a
 correct, usable linearization. Stage 5 is where the hard search lives, and it is
 deliberately last among the linearization work: a valid-but-suboptimal
 linearization is a working mempool, while a subtly wrong one is a broken one.
