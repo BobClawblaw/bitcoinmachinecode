@@ -1389,26 +1389,99 @@ int main(void){
                t && t->typ == RJ_ARR && (long)t->nitems == sel_full); }
           rj_free(r);
 
-          /* KNOWN GAP, stated rather than faked. The rule that a chunk which
-           * does not fit skips the REST OF ITS CLUSTER (cluster_skipped[]) is
-           * NOT pinned by anything above. Reverting it to skip only the chunk
-           * leaves every test here passing.
+          /* ---- the cluster-skip rule, pinned with VARIED SIZES --------------
+           * A chunk that does not fit must skip the REST OF ITS CLUSTER, not
+           * just itself. Every transaction elsewhere in this file is 61 bytes,
+           * which makes the rule unobservable: chunk feerates are non-increasing
+           * within a cluster, so a later chunk is never cheaper-to-fit unless it
+           * is also SMALLER.
            *
-           * Why it cannot be reached with this fixture: chunk feerates are
-           * non-increasing WITHIN a cluster, so on the -blockmintxfee path the
-           * flag is a no-op -- if the first chunk is under the floor, so is
-           * every later one. It bites only on the WEIGHT path, where a later,
-           * LIGHTER chunk could fit where the first did not. Every transaction
-           * built by MKTX here is 61 bytes, so no cluster has a heavy first
-           * chunk and a light second one, and the two behaviours are
-           * indistinguishable.
+           * So: PH is a heavy, high-feerate parent (20 outputs, 251 B) and CL is
+           * a light, low-feerate child of it (61 B). They linearize as two
+           * chunks, {PH} then {CL}, because CL pays less and cannot merge. With
+           * a budget of 500 weight units PH (1004 wu) does not fit, while CL
+           * (244 wu) would.
            *
-           * Pinning it needs a fixture with transactions of DIFFERENT sizes:
-           * a heavy high-feerate parent and a light low-feerate child, with a
-           * budget between them. Worth building before the mining path is
-           * unified onto mempool_cluster.c, because that is precisely the rule
-           * a unification would have to preserve -- and selecting a later chunk
-           * without its earlier one would emit a child whose parent is absent. */
+           *   cluster-skip (correct): neither PH nor CL is selected.
+           *   chunk-skip (the bug):   CL is selected WITHOUT PH -- a block that
+           *                           spends an output it never creates.
+           *
+           * That is why this rule is worth a fixture of its own. */
+          { unsigned char prevPH[32], prevS2[32];
+            memset(prevPH, 0xE1, 32); memset(prevS2, 0xE2, 32);
+            utxo_put(ux, prevPH, 0, 100000ULL, 1, 0, (const unsigned char*)"\x51", 1);
+            utxo_put(ux, prevS2, 0, 100000ULL, 1, 0, (const unsigned char*)"\x51", 1);
+
+            /* 1 input, NOUT outputs: 51 + NOUT*10 bytes */
+            #define MKTXN(buf, id, prev, pidx, per, nout) do{ \
+                unsigned char* q = (buf); \
+                memcpy(q, "\x01\x00\x00\x00", 4); q += 4; \
+                *q++ = 1; memcpy(q, (prev), 32); q += 32; \
+                unsigned v_ = (pidx); memcpy(q, &v_, 4); q += 4; \
+                *q++ = 0; memcpy(q, "\xff\xff\xff\xff", 4); q += 4; \
+                *q++ = (unsigned char)(nout); \
+                for (int o_ = 0; o_ < (nout); o_++){ \
+                    unsigned long long a_ = (per); memcpy(q, &a_, 8); q += 8; \
+                    *q++ = 1; *q++ = 0x51; } \
+                memcpy(q, "\x00\x00\x00\x00", 4); q += 4; \
+                sha256d((id), (buf), (unsigned long)(q - (buf))); }while(0)
+
+            static unsigned char txPH[1200], txCL[80], txS2[80];
+            unsigned char idPH[32], idCL[32], idS2[32];
+            /* PH: 100000 in, 100 x 950 out = 95000 -> fee 5000 over 1051 B
+             * (4204 wu). Deliberately the HEAVIEST thing in the pool and a LOW
+             * feerate (4.76 sat/B), so it sorts late and leaves budget behind
+             * it -- which is what makes the next assertion decisive. */
+            MKTXN(txPH, idPH, prevPH, 0, 950ULL, 100);
+            /* CL: spends PH:0 (950) -> 800 out. Fee 150 over 61 B = 2.46 sat/B:
+             * above the relay floor so it is ACCEPTED, below PH's chunk so it
+             * cannot merge with it, and light enough to fit the budget that PH
+             * cannot. */
+            MKTXN(txCL, idCL, idPH,   0, 800ULL, 1);
+            /* S2: a standalone that DOES fit, so an empty template cannot be
+             * mistaken for the rule working */
+            MKTXN(txS2, idS2, prevS2, 0, 99000ULL, 1);
+
+            ck("skip: heavy parent PH accepted",
+               mpool_policy_add(pol, stbuf, mp, txPH, 1051, idPH, ux) == 1);
+            ck("skip: light child CL accepted",
+               mpool_policy_add(pol, stbuf, mp, txCL, 61, idCL, ux) == 1);
+            ck("skip: standalone S2 accepted",
+               mpool_policy_add(pol, stbuf, mp, txS2, 61, idS2, ux) == 1);
+
+            /* budget 2500 wu: room for every 61-byte chunk in the pool AND for
+             * CL (244 wu) -- but not for PH (4204 wu). */
+            rpc_chain_set_gbt_policy(4500, 2000, 1, 0, 0);
+            r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+            { rj_val* t = G(r, "transactions");
+              char hPH[65], hCL[65], hS2[65];
+              trc_hex_rev(hPH, idPH, 32); trc_hex_rev(hCL, idCL, 32); trc_hex_rev(hS2, idS2, 32);
+              int hasPH = 0, hasCL = 0, hasS2 = 0;
+              for (long i = 0; t && i < t->nitems; i++){
+                const char* id = S(t->items[i], "txid");
+                if (!id) continue;
+                if (!strcmp(id, hPH)) hasPH = 1;
+                if (!strcmp(id, hCL)) hasCL = 1;
+                if (!strcmp(id, hS2)) hasS2 = 1; }
+              ck("skip: the heavy parent does not fit and is absent", !hasPH);
+              ck("skip: THE LIGHT CHILD IS ALSO ABSENT -- the whole cluster is skipped",
+                 !hasCL);
+              ck("skip: a standalone that fits is still selected -- the budget "
+                 "was not simply exhausted", hasS2); }
+            rj_free(r);
+            rpc_chain_set_gbt_policy(4000000, 8000, 1, 0, 0);
+            #undef MKTXN
+          }
+
+          /* The gap noted here on 2026-09-14 -- that the cluster-skip rule
+           * survived being reverted with every test passing -- is closed by the
+           * fixture above. It took a second fixture because every other
+           * transaction in this file is 61 bytes, and with uniform sizes
+           * cluster-skip and chunk-skip are indistinguishable: chunk feerates
+           * are non-increasing within a cluster, so a later chunk is never
+           * easier to fit unless it is also SMALLER. Verified by reverting
+           * cluster_skipped[] to skip only the chunk and watching the child
+           * appear without its parent. */
         }
 
         /* restore the empty pool for the sections below */
