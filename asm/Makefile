@@ -248,7 +248,7 @@ WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_glv_c.o secp256k1_poin
 # links DAEMONSRCS or DIALSRCS also links DAEMON_RPCOBJS -- listing it in
 # both bundles puts the object on the command line twice (multiple
 # definition of pow_retarget_bits/pow_expected_bits/pow_check_bits).
-DAEMON_RPCOBJS := rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rpc_acl.c crypto_hkdf.o rpc_commands.o rpc_chain.o bitcoin_pow_rules.o block_filter.o utxo_snapshot.o rpc_signer.o bip32_ckdpub.o descriptor.o psbt_update.o miniscript.o miniscript_sign.o bip340_sign.o musig2.o rpc_json.o rpc_net.o rpc_node.o daemon/mempool_persist.c \
+DAEMON_RPCOBJS := rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rpc_acl.c crypto_hkdf.o rpc_commands.o rpc_chain.o bitcoin_pow_rules.o block_filter.o utxo_snapshot.o rpc_signer.o bip32_ckdpub.o descriptor.o psbt_update.o miniscript.o miniscript_sign.o bip340_sign.o musig2.o rpc_json.o rpc_net.o rpc_node.o mempool_cluster.o daemon/mempool_persist.c \
     rpc_wallet_ops.o wallet_labels.o wallet_scan.o wallet_scan_hash.o wallet_txlog.c \
     daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c wallet_bnb.c wallet_coinsel.c \
     bitcoin_keys.o bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o
@@ -2670,7 +2670,7 @@ RPCOBJS := rpc_json.o rpc_net.o rpc_commands.o
 # path), bitcoin_idx.o (hash->height), bitcoin_tx.o (tx_txid), bitcoin_chainwork.o
 # (block_work/chainwork_add fallback when chainwork.dat is absent).
 RPCCHAIN := rpc_chain.o bitcoin_pow_rules.o block_filter.o bip32_ckdpub.o descriptor.o psbt_update.o miniscript.o miniscript_sign.o bip340_sign.o musig2.o bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_tx.o bitcoin_chainwork.o
-RPCLIBS := daemon/wallet_pass.c wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c wallet_coinsel.c $(WALLETPRIMS) bitcoin_script.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o rpc_node.o daemon/mempool_persist.c rpc_wallet_ops.o wallet_txlog.c wallet_labels.o wallet_scan.o wallet_scan_hash.o rpc_signer.o daemon/bfilter_index.c daemon/index_repair.c daemon/addr_index_tail.c daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c $(RPCCHAIN) addrbook.a
+RPCLIBS := daemon/wallet_pass.c wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c wallet_coinsel.c $(WALLETPRIMS) bitcoin_script.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o rpc_node.o mempool_cluster.o daemon/mempool_persist.c rpc_wallet_ops.o wallet_txlog.c wallet_labels.o wallet_scan.o wallet_scan_hash.o rpc_signer.o daemon/bfilter_index.c daemon/index_repair.c daemon/addr_index_tail.c daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c $(RPCCHAIN) addrbook.a
 
 # rpc_wallet_ops.o -- the rest of Core's Wallet category (labels, wallet
 # inventory, output locks, signmessage, descriptor reporting, and the
@@ -2757,7 +2757,9 @@ rpc_esplora.o: rpc_esplora.c rpc_esplora.h rpc_json.h rpc_commands.h daemon/addr
 rpc_chain.o: rpc_chain.c rpc_chain.h bitcoin_pow_rules.h rpc_json.h rpc_commands.h version_gen.h descriptor.h miniscript.h musig2.h daemon/undo_store.h \
     rpc_node.h script_flags_consts.h block_filter.h mempool_slot.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_chain.c
-rpc_node.o: rpc_node.c rpc_node.h rpc_json.h version_gen.h build_gen.h mempool_slot.h
+mempool_cluster.o: mempool_cluster.c mempool_cluster.h
+	$(CC) -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ mempool_cluster.c
+rpc_node.o: rpc_node.c rpc_node.h rpc_json.h version_gen.h build_gen.h mempool_slot.h mempool_cluster.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_node.c
 
 daemon/bmc_cli: daemon/bmc_cli.c daemon/cli_conf.c daemon/cli_conf.h rpc_net.o rpc_commands.o rpc_json.o $(RPCLIBS)
@@ -3092,8 +3094,8 @@ tests/test_rpc_wallet_ops: tests/test_rpc_wallet_ops.c rpc_commands.o rpc_json.o
 tests/test_rpc_core_fields: tests/test_rpc_core_fields.c tests/core_v31_fields.json rpc_json.o
 	$(CC) $(WARNFLAGS) -O2 -I. -I daemon -I tests -o $@ tests/test_rpc_core_fields.c rpc_json.o
 
-tests/test_rpc_node: addrbook.a tests/test_rpc_node.c daemon/fee_estimator.c rpc_node.o daemon/subnet.c rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o bitcoin_mempool_policy.c daemon/mempool_compact.c daemon/mempool_persist.c mempool_entry.h
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_node.c daemon/fee_estimator.c rpc_node.o daemon/subnet.c rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o bitcoin_mempool_policy.c daemon/mempool_compact.c daemon/mempool_persist.c -lpthread addrbook.a
+tests/test_rpc_node: addrbook.a tests/test_rpc_node.c daemon/fee_estimator.c rpc_node.o mempool_cluster.o daemon/subnet.c rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o bitcoin_mempool_policy.c daemon/mempool_compact.c daemon/mempool_persist.c mempool_entry.h
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_node.c daemon/fee_estimator.c rpc_node.o mempool_cluster.o daemon/subnet.c rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o bitcoin_mempool_policy.c daemon/mempool_compact.c daemon/mempool_persist.c -lpthread addrbook.a
 
 # Core CBlockPolicyEstimator port: policyestimator_tests scenario + map/removal/persistence (2026-09-01)
 tests/test_fee_estimator: tests/test_fee_estimator.c daemon/fee_estimator.c daemon/fee_estimator.h $(TEST_TMPDIR_H)
