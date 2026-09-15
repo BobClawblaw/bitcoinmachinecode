@@ -153,6 +153,34 @@ if SIG:
     CASES += [("verifymessage", [WIFADDR, SIG, MSG]),
               ("signmessagewithprivkey", [WIFKEY, MSG])]
 
+# --- 2026-09-15: the wait* family, help, and the proof pair ------------------
+# waitfor* BLOCK by design. They take a timeout in milliseconds, so 1 makes them
+# return at once -- without it a differential hangs until the next block, which
+# is an hour-shaped bug in a tool meant to run in seconds.
+CASES += [
+    ("waitfornewblock",    ["1"]),
+    ("waitforblockheight", ["1", "1"]),
+    ("help",               ["getblockcount"]),
+    # an all-DIGIT 64-char hash: this exact shape was sent as a JSON number by
+    # bmc_cli until 2026-09-15 and came back -32700. Kept as a case so the
+    # client bug cannot return unnoticed.
+    ("waitforblock", ["0000000000000000000000000000000000000000000000000000000000000000", "1"]),
+    # createpsbt with nothing in it: returned "oom" until 2026-09-15 because a
+    # zero-input transaction was treated as a decode failure.
+    ("createpsbt", ["[]", "{}"]),
+]
+if BH:
+    CASES += [("waitforblock", [BH, "1"])]
+# verifytxoutproof needs a proof, which gettxoutproof makes from a confirmed
+# txid. Built on the ORACLE so both sides are handed identical bytes.
+_blk = call(CORE, ["getblock", BH, "1"]) if BH else None
+_txid0 = (_blk or {}).get("tx", [None])[0]
+PROOF = raw(CORE, ["gettxoutproof", json.dumps([_txid0]), BH]) if _txid0 else None
+if PROOF:
+    CASES += [("verifytxoutproof", [PROOF]), ("gettxoutproof", [json.dumps([_txid0]), BH])]
+if RAWTX:
+    CASES += [("signrawtransactionwithkey", [RAWTX, "[]"])]
+
 # --- the guard this tool did not have, and should have ------------------------
 # 2026-09-12: a survey loop elsewhere invoked every Core method name against the
 # LIVE production node to see which were stubs. Invoking an API is not a

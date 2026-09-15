@@ -151,3 +151,45 @@ records the gap with its size measured rather than guessed.
 reasoning), then hand `max(weight, sigop_cost × bytespersigop)` to
 `mempool_cluster.c` from both call sites. The module itself needs no change — it
 is denominator-agnostic and compares `fee/weight` by cross-multiplication.
+
+---
+
+## OPEN DEFECT: `signrawtransactionwithkey` claims `complete: true` for inputs it cannot resolve
+
+Found 2026-09-15 by the RPC shape differential. **Not yet fixed** — recorded with
+its reproduction so it is not rediscovered from scratch.
+
+**Reproduction.** Take any confirmed transaction and ask both nodes to sign it
+with no keys and no prevtxs:
+
+```
+RAW=$(bitcoin-cli getrawtransaction <txid> 0 <blockhash>)
+signrawtransactionwithkey "$RAW" '[]'
+```
+
+| | Core v31.1 | this node |
+|---|---|---|
+| `complete` | **false** | **true** |
+| `errors` | present, one entry per input | **absent** |
+| error text | `Input not found or already spent` | — |
+
+Core's `errors` entries carry `txid`, `vout`, `witness`, `scriptSig`,
+`sequence` and `error`. This node emits none of them.
+
+**Why it matters beyond the missing field.** `complete: true` is a statement
+that every input carries a valid signature verified against its prevout. When
+the prevout cannot be found, that has not been checked, and a caller reading
+`complete` would believe the transaction is ready to broadcast. The missing
+`errors` array is a shape gap; the wrong `complete` is a correctness one.
+
+**What is known.** The code path looks right on inspection: `prev` is populated
+only from the caller's `prevtxs` argument, so an empty array should leave
+`prev_of[i] == NULL`, set `err = "Input not found or already spent"`, clear
+`complete` and push an `errors` entry. It does not, on a transaction that
+already carries witnesses. Verified on the wire with curl, so this is the
+server's answer and not a CLI artefact. The mechanism was not found before this
+was written down, and finding it is the first step of the fix.
+
+**When fixing:** `complete` must mean "verified against the prevout", and an
+unresolvable input must appear in `errors` with Core's field set. The machinery
+is already there — `rpc_commands.c` builds the array and emits it when non-empty.
