@@ -221,12 +221,18 @@ int main(void){
            errs && errs->typ==RJ_ARR && errs->nitems==1);
         rj_free(r); rj_free(p); }
 
-      /* no wallet loaded -> -4, not a false success */
+      /* no wallet loaded -> -18, not a false success. This asserted -4, which
+       * is RPC_WALLET_ERROR ("a loaded wallet had a problem") -- a different
+       * claim from "there is no wallet", and the retry that follows
+       * (loadwallet) only follows from -18. The assertion's real point, that
+       * an absent wallet is not a false success, is unchanged; the code it
+       * froze was wrong. Verified 2026-09-15 against a Core v31.1 with
+       * genuinely no wallet loaded. */
       { char pj[900]; snprintf(pj,sizeof pj,"[\"%s\"]", UNSIGNED);
         rj_val* p=rj_parse(pj,strlen(pj)); rj_val* r=NULL; long ec=0; const char* em=NULL;
         rpc_wallet empty; memset(&empty,0,sizeof empty);
         int rc=rpc_dispatch("signrawtransactionwithwallet",p,&empty,&r,&ec,&em);
-        ck("no wallet loaded -> -4", rc==0 && ec==-4);
+        ck("no wallet loaded -> -18 (this asserted -4 and pinned it)", rc==0 && ec==-18);
         rj_free(r); rj_free(p); }
 
       /* ==== simulaterawtransaction =================================== */

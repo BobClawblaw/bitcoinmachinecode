@@ -469,3 +469,22 @@ rj_val* rj_parse(const char* s, size_t len) {
     if (c.p != c.end) { rj_free(v); return NULL; }
     return v;
 }
+
+const char* rj_type_name(const rj_val* v) {
+    if (!v) return "null";
+    switch (v->typ) {
+        case RJ_NULL: return "null";  case RJ_BOOL: return "bool";
+        case RJ_NUM:  return "number"; case RJ_STR: return "string";
+        case RJ_ARR:  return "array";  case RJ_OBJ: return "object";
+        default:      return "null";
+    }
+}
+
+const char* rj_wrong_type_msg(char* buf, size_t cap, int position, const char* name,
+                              const rj_val* got, const char* expected) {
+    snprintf(buf, cap,
+             "Wrong type passed:\n{\n    \"Position %d (%s)\": \"JSON value of type %s "
+             "is not of expected type %s\"\n}",
+             position, name, rj_type_name(got), expected);
+    return buf;
+}

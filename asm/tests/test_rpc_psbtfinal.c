@@ -391,13 +391,19 @@ int main(void){
          r == NULL && ec == -5 && em && strstr(em, "not valid"));
       rj_free(r); }
 
-    { /* fundrawtransaction is implemented now (rpc_wallet_ops.c); in this
-       * harness no rescan has run, so it refuses at the coin-knowledge step
-       * rather than pretending to select from coins it cannot see */
+    { /* fundrawtransaction is implemented now (rpc_wallet_ops.c). This harness
+       * has NO WALLET, and that is the first thing Core reports -- it resolves
+       * the wallet before the method body, so "no wallet" beats "no rescan".
+       *
+       * This assertion expected -4 "rescan" and was PINNING THE DEFECT: with no
+       * wallet there is never a completed rescan, so the rescan message was the
+       * only one that could ever appear and the wallet-absent answer was
+       * unreachable. Verified 2026-09-15 against a Core v31.1 with genuinely no
+       * wallet loaded: -18, with the text below. */
       rj_val* r = call("fundrawtransaction",
                        "[\"0200000000010000000000000000000000000000\"]", &ec, &em);
-      ck("fundrawtransaction without a rescan refuses at the funding step",
-         r == NULL && ec == -4 && em && strstr(em, "rescan"));
+      ck("fundrawtransaction with no wallet -> -18 (this asserted the rescan -4 and pinned it)",
+         r == NULL && ec == -18 && em && strstr(em, "No wallet is loaded"));
       rj_free(r);
       r = call("descriptorprocesspsbt", "[\"x\",[]]", &ec, &em);
       ck("descriptorprocesspsbt is real (2026-09-01): a bad PSBT fails at decoding, not at a missing signer",
@@ -489,9 +495,14 @@ int main(void){
         }
         rj_free(wr);
 
-        /* no wallet -> the honest -4 */
+        /* no wallet -> Core's -18. This said "the honest -4"; -4 is
+         * RPC_WALLET_ERROR ("a loaded wallet had a problem"), which is a
+         * different claim from "there is no wallet" and sends a caller down the
+         * wrong branch -- the retry that follows, loadwallet, only follows from
+         * -18. Verified against Core v31.1 with no wallet loaded. */
         { rj_val* r2 = call("walletprocesspsbt", wpj, &ec, &em);
-          ck("without a wallet: -4 refusal", r2 == NULL && ec == -4);
+          ck("without a wallet: -18 refusal (this asserted -4 and pinned it)",
+             r2 == NULL && ec == -18);
           rj_free(r2); }
     }
 

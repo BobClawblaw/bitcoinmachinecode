@@ -228,7 +228,85 @@ is already there — `rpc_commands.c` builds the array and emits it when non-emp
 
 ---
 
-## Wallet-absent error code: this node answers `-4`, Core answers `-18`
+## ~~OPEN~~ FIXED 2026-09-15: wallet-absent and argument-type error codes
+
+> **RESOLVED.** Both recorded mismatches are closed, and closing them turned up
+> two things the records had wrong and one regression the fix introduced.
+>
+> **1. Wallet absent: -4 -> -18 at 15 sites** (the record said ten; it was 12 in
+> `rpc_wallet_ops.c` and 3 in `rpc_commands.c`). Core answers
+> `RPC_WALLET_NOT_FOUND` with a specific text, now a single
+> `RPC_NO_WALLET_CODE`/`RPC_NO_WALLET_MSG` pair in `rpc_wallet_ops.h`:
+>
+> ```
+> No wallet is loaded. Load a wallet using loadwallet or create a new one with
+> createwallet. (Note: A default wallet is no longer automatically created)
+> ```
+>
+> The record claimed "the message matches; the code does not." **The message did
+> not match either** -- this node emitted only the first sentence. The text read
+> close enough to pass for a match, which is how the code stayed wrong: a human
+> skims the text, a caller branches on the number.
+>
+> **2. The order mattered as much as the code.** Core resolves the wallet after
+> the argument type check and before the value check. This file checked the
+> RESCAN first, and with no wallet there is never a completed rescan -- so ten
+> methods answered `-4 "no wallet rescan has completed"` and the new `-18` was
+> unreachable at those sites. Changing the code alone would have been a fix
+> `grep` could see and a caller could not. `wop_need_wallet` now runs first, and
+> `wop_txid_from_arg` is split so the wallet check can sit between the type
+> stage and the value stage where Core puts it.
+>
+> **3. Argument types: -8 -> -3.** Measured on the oracle for every JSON type,
+> Core answers a bad argument three different ways:
+>
+> | condition | Core | this node, before |
+> |---|---|---|
+> | missing required argument | `-1` + the method's full help text | `-8` |
+> | wrong JSON type | `-3`, `Wrong type passed: {"Position 1 (txid)": ...}` | `-8` |
+> | right type, bad value | `-8` + a specific message | `-8` |
+>
+> `getmempoolentry`, `getmempoolancestors`, `getmempooldescendants` and
+> `prioritisetransaction` collapsed the first two into one `-8` **and named the
+> passed type as "null" whatever it really was** -- a caller that sent a number
+> was told it had sent null. The formatter now lives in `rpc_json.c`
+> (`rj_wrong_type_msg`) so the three files that emit it agree.
+>
+> The `-1` text cannot match Core: this node deliberately carries no per-method
+> usage text (`cmd_help`), so it answers Core's CODE with a short usage line.
+> That is what the tests assert -- what this node can honestly produce, not a
+> Core string it will never emit.
+>
+> **Verification.** Two differentials against Core v31.1: 31 argument cases
+> against the oracle and 29 wallet cases against a throwaway regtest Core with
+> **genuinely no wallet loaded**. `CODE DIFFERS: 0` on both; 53 of 60 match the
+> message byte for byte, and all 7 that do not are the missing-argument help
+> text. The no-wallet Core mattered: probing the oracle with a bad `-rpcwallet`
+> name also returns `-18`, but with a DIFFERENT message ("Requested wallet does
+> not exist or is not loaded"), and freezing that string would have pinned the
+> wrong one.
+>
+> Six reintroductions, each watched to fail. Two initially reported ZERO
+> failures and were non-results: one had failed to build, so a stale binary ran;
+> the other passed because a completed rescan was in place in the fixture, which
+> is precisely the state where the guard order is invisible. The test now clears
+> the rescan first, and that reversion fails 8 assertions.
+>
+> **A regression the fix introduced, caught by the existing suite:** a
+> WATCH-ONLY wallet is a loaded wallet with NO SEED, so `w && w->seed` refused
+> every one of those methods for watch-only wallets. The predicate is now
+> `wop_wallet_loaded()`, the one `wop_keyset_cached` already used.
+>
+> **Three existing assertions were pinning the defect** and failed on the fix
+> (`bumpfee with no txid -> -8`, `fundrawtransaction ... refuses at the funding
+> step` expecting the rescan `-4`, and one that named `-4` "the honest
+> refusal"). Each read as a statement that a method was wired up, and each was
+> in fact freezing the wrong answer. The `fundrawtransaction` one is the clearest
+> case of the order problem: with no wallet there is never a completed rescan,
+> so the rescan message was the only one that could ever appear and the test
+> could not have distinguished a correct node from this one.
+
+### The original report, kept as written
 
 Found 2026-09-15, after loading a wallet on the oracle so the wallet methods
 could be diffed at all.
@@ -244,7 +322,9 @@ The message matches; the code does not. A caller branching on the numeric code
 `rpc_wallet_ops.c` return `-4`, and a returned error code is caller-visible
 behaviour: changing ten of them belongs in its own commit with its own release
 note, not bundled into a differential's findings. The same reasoning applied to
-the `-8` versus `-3` mismatch recorded above, which is still open.
+the `-8` versus `-3` mismatch, which was recorded in `PARITY_RPC_FIELDS.md`
+rather than here — narrative cross-references drop things, and this one said
+"recorded above" pointing at a section that was never in this file.
 
 **What WAS fixed in that pass**, because it was a different and worse defect:
 seven of those sites reported **`-7 "out of memory"`** for a missing wallet.
@@ -252,7 +332,6 @@ seven of those sites reported **`-7 "out of memory"`** for a missing wallet.
 fails, and the call sites collapsed the two — telling an operator with no wallet
 that the node was out of RAM. They now distinguish the cases, and match the
 three sites in the same file that always answered correctly.
-
 ---
 
 ## ~~OPEN DEFECT~~ FIXED 2026-09-15: `signrawtransactionwithkey` DROPPED existing witness data
