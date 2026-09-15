@@ -2445,7 +2445,21 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
     if (hashtype==0x100){ hashtype=0x01; ht_explicit=0; }                     /* "DEFAULT": ALL for ECDSA, no hashtype byte for taproot */
 
     /* --- parse the unsigned tx into inputs (outpoint,seq) + outputs region + locktime --- */
-    unsigned long p=4, cc; unsigned long n_in=srw_varint(tx+p,&cc); p+=cc;
+    /* THE SEGWIT MARKER. This read the input count at offset 4 unconditionally.
+     * A segwit transaction carries 0x00 0x01 there, so srw_varint read 0x00 and
+     * n_in came out ZERO: the signing loop never ran, `complete` stayed true and
+     * `errors` stayed empty -- the node answered "fully signed" for a
+     * transaction it had not looked at. converttopsbt in this same file has
+     * always skipped the marker; this function never did.
+     *
+     * Found 2026-09-15. It was MASKED until the same day by the n_in == 0 guard
+     * below, which rejected such a transaction as "TX decode failed" -- wrong,
+     * but safe. Relaxing that guard (correctly, for empty PSBT templates)
+     * removed the accident that was hiding this, and turned a wrong error into
+     * a wrong success. That is the more dangerous of the two. */
+    unsigned long p=4, cc;
+    if (txlen > 6 && tx[4] == 0x00 && tx[5] != 0x00) p = 6;
+    unsigned long n_in=srw_varint(tx+p,&cc); p+=cc;
     /* n_in == 0 is NOT a decode failure. A zero-input transaction cannot go
      * on the network, but Core accepts one here (verified against v31.1),
      * and wrapping one is how an empty PSBT template is built. Same root
