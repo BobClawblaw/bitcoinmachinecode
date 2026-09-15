@@ -3037,7 +3037,7 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_STR){
         *ec = -8; *em = "Invalid parameters, expected a raw transaction hex string"; return 0; }
-    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+    if (!w || !w->seed){ *ec = RPC_NO_WALLET_CODE; *em = RPC_NO_WALLET_MSG; return 0; }
 
     /* [hexstring, [wif...], prevtxs, sighashtype] -- the delegate's shape.
      * Core's signrawtransactionwithwallet takes (hexstring, prevtxs,
@@ -3195,7 +3195,7 @@ static int cmd_simulaterawtransaction(const rj_val* params, const rpc_wallet* w,
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_ARR){
         *ec = -8; *em = "Invalid parameters, expected an array of raw transactions"; return 0; }
-    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+    if (!w || !w->seed){ *ec = RPC_NO_WALLET_CODE; *em = RPC_NO_WALLET_MSG; return 0; }
     const rj_val* list = params->items[0];
     long long delta = 0;
     for (size_t t = 0; t < list->nitems; t++){
@@ -4483,7 +4483,7 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
     if (params->nitems >= 2 && params->items[1]->typ == RJ_BOOL) sign = params->items[1]->str[0]=='1';
     const char* sht = (params->nitems >= 3 && params->items[2]->typ == RJ_STR) ? params->items[2]->str : NULL;
     if (params->nitems >= 5 && params->items[4]->typ == RJ_BOOL) finalize = params->items[4]->str[0]=='1';
-    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+    if (!w || !w->seed){ *ec = RPC_NO_WALLET_CODE; *em = RPC_NO_WALLET_MSG; return 0; }
     /* ==== Updater from the wallet's own descriptors (listdescriptors): scripts, origins, taproot fields ==== */
     static dpp_desc_t* g_wupd_dv; static int g_wupd_nd; g_wupd_nd = 0;
     { rj_val* ld = NULL; long e2 = 0; const char* m2 = NULL; rj_val* np = rj_arr();

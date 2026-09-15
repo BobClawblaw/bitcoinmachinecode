@@ -138,4 +138,20 @@ int  rpc_wops_default_type(int is_change);
  * its keys (the -walletnotify test); 0 otherwise. */
 int  rpc_wops_tx_touches_wallet(const rpc_wallet* w, const unsigned char* tx, unsigned long len);
 
+/* ---- Core's answer when no wallet is loaded ------------------------------
+ * RPC_WALLET_NOT_FOUND (-18), with this exact text -- Core builds it in
+ * wallet/rpc/util.cpp GetWalletForJSONRPCRequest, the `count == 0` branch.
+ * Verified against Core v31.1 on 2026-09-15.
+ *
+ * This node answered -4 (RPC_WALLET_ERROR, "Unspecified problem with wallet")
+ * with only the first sentence. The message was close enough to read as a
+ * match, which is how the code stayed wrong: a human skims the text, a caller
+ * branches on the number. -4 and -18 are different conditions -- -4 says a
+ * loaded wallet failed, -18 says there is no wallet -- and the retry a caller
+ * should make (loadwallet) only follows from -18. */
+#define RPC_NO_WALLET_CODE (-18)
+#define RPC_NO_WALLET_MSG  "No wallet is loaded. Load a wallet using loadwallet " \
+                           "or create a new one with createwallet. (Note: A default " \
+                           "wallet is no longer automatically created)"
+
 #endif

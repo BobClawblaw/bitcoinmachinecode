@@ -191,10 +191,21 @@ available for some time.
 transactions, so a sample of ordinary transactions shows the two as identical
 and would have hidden the rule entirely.
 
-### Open: an error-code divergence, found in passing
+### ~~Open~~ FIXED 2026-09-15: an error-code divergence, found in passing
 
-Core answers a null or absent txid with **-3** (`RPC_TYPE_ERROR`).
-`getmempoolcluster` now does. Three older sites in `rpc_node.c` return **-8**
-for the identical condition (`getmempoolentry` among them) and are wrong about
-it. Not changed here: a returned error code is caller-visible, so it belongs in
-its own change rather than riding along with a feature.
+The original note said "Core answers a null or absent txid with **-3**". Half
+right: measuring every JSON type against Core v31.1 showed **three** answers,
+not two, and *absent* is not one of the -3 cases.
+
+| condition | Core |
+|---|---|
+| missing required argument | `-1` + the method's full help text |
+| wrong JSON type | `-3` (`RPC_TYPE_ERROR`), `Wrong type passed: {"Position 1 (txid)": ...}` |
+| right type, bad value | `-8` (`RPC_INVALID_PARAMETER`) + a specific message |
+
+The three sites in `rpc_node.c` returned `-8` for the first two alike and named
+the passed type as "null" whatever was really sent. Fixed, with the formatter
+moved to `rpc_json.c` (`rj_wrong_type_msg`) so every emitter agrees. The `-1`
+text cannot be matched: this node carries no per-method usage text by decision,
+so it answers Core's code with a short usage line. Full account and the
+verification in `CORE_DIVERGENCES.md`.

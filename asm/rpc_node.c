@@ -1477,10 +1477,40 @@ static long long pri_delta_of(const unsigned char txid[32]);
 static rj_val* mpe_amount(unsigned long long sat){
     return rj_numf("%llu.%08llu", sat/100000000ULL, sat%100000000ULL);
 }
+/* ---- Core's argument type check -------------------------------------------
+ * Measured against Core v31.1 on the oracle, 2026-09-15, for every JSON type.
+ * Core distinguishes THREE answers where this file collapsed two of them:
+ *
+ *   missing required argument -> -1  + the method's full help text
+ *   wrong JSON type           -> -3  (RPC_TYPE_ERROR), wrapped as
+ *        Wrong type passed:
+ *        {
+ *            "Position 1 (txid)": "JSON value of type null is not of expected type string"
+ *        }
+ *   right type, bad value     -> -8  + a specific message ("txid must be of length 64 ...")
+ *
+ * getmempoolentry, getmempoolancestors, getmempooldescendants and
+ * prioritisetransaction answered -8 for the first two cases alike, and named
+ * the type as "null" whatever was actually passed -- so a caller that sent a
+ * number was told it had sent null. The -8/-3 mismatch matters most: -8 is
+ * RPC_INVALID_PARAMETER, and a caller branching on the numeric code (which is
+ * what the code is for) takes the wrong branch.
+ *
+ * The -1 case cannot be matched exactly: this node deliberately carries no
+ * per-method usage text (see cmd_help in rpc_commands.c), so it answers -1 with
+ * a short usage line -- the code Core uses, with the text it can honestly
+ * produce. cmd_prioritisetransaction already did this. */
+static int rpc_wrong_type(long* ec, const char** em, char* buf, size_t cap,
+                          int position, const char* name,
+                          const rj_val* got, const char* expected){
+    *ec = -3; *em = rj_wrong_type_msg(buf, cap, position, name, got, expected); return 0;
+}
 static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, const char** em){
-    static char embuf[128];
-    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_STR){
-        *ec = -8; *em = "JSON value of type null is not of expected type string"; return 0; }
+    static char embuf[256];
+    if (!params || params->typ != RJ_ARR || params->nitems < 1){
+        *ec = -1; *em = "getmempoolentry requires txid"; return 0; }
+    if (params->items[0]->typ != RJ_STR)
+        return rpc_wrong_type(ec, em, embuf, sizeof embuf, 1, "txid", params->items[0], "string");
     const char* hx = params->items[0]->str;
     size_t hl = strlen(hx);
     if (hl != 64){
@@ -1634,9 +1664,12 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
  * uses, filtered to members still in the structural pool. */
 static int cmd_mpe_relatives(const rj_val* params, rj_val** res, long* ec, const char** em,
                              int want_desc){
-    static char embuf[128];
-    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_STR){
-        *ec = -8; *em = "JSON value of type null is not of expected type string"; return 0; }
+    static char embuf[256];
+    if (!params || params->typ != RJ_ARR || params->nitems < 1){
+        *ec = -1; *em = want_desc ? "getmempooldescendants requires txid"
+                                  : "getmempoolancestors requires txid"; return 0; }
+    if (params->items[0]->typ != RJ_STR)
+        return rpc_wrong_type(ec, em, embuf, sizeof embuf, 1, "txid", params->items[0], "string");
     const char* hx = params->items[0]->str;
     size_t hl = strlen(hx);
     if (hl != 64){
@@ -1697,11 +1730,6 @@ extern unsigned long long fest_estimate_smart(const void*, int, int, int*, fest_
 extern unsigned long long fest_estimate_raw(const void*, int, double, int, fest_result_t*) __attribute__((weak));
 extern unsigned fest_highest_target(const void*, int) __attribute__((weak));
 
-static const char* rj_type_name(const rj_val* v){
-    if (!v) return "null";
-    switch (v->typ){ case RJ_NULL: return "null"; case RJ_BOOL: return "bool"; case RJ_NUM: return "number";
-                     case RJ_STR: return "string"; case RJ_ARR: return "array"; case RJ_OBJ: return "object"; default: return "null"; }
-}
 /* Core ParseConfirmTarget: "Invalid conf_target, must be between 1 and <max>" */
 static int fee_parse_target(const rj_val* params, unsigned max_target, long* ec, const char** em, int* out){
     static char msg[96];
@@ -1921,11 +1949,12 @@ static long long pri_delta_of(const unsigned char txid[32]){
         if (g_pri[i].used && !memcmp(g_pri[i].txid, txid, 32)) return g_pri[i].delta;
     return 0;
 }
-/* shared txid-arg validation (Core-exact -8 messages); display -> internal */
+/* shared txid-arg validation; display -> internal. The caller has already
+ * rejected a missing argument with -1, so a non-string here is Core's -3. */
 static int pri_parse_txid(const rj_val* v, unsigned char txid[32], long* ec, const char** em){
-    static char embuf[128];
-    if (!v || v->typ != RJ_STR){
-        *ec = -8; *em = "JSON value of type null is not of expected type string"; return 0; }
+    static char embuf[256];
+    if (!v || v->typ != RJ_STR)
+        return rpc_wrong_type(ec, em, embuf, sizeof embuf, 1, "txid", v, "string");
     size_t hl = strlen(v->str);
     if (hl != 64){
         snprintf(embuf, sizeof embuf, "txid must be of length 64 (not %zu, for '%s')", hl, v->str);
@@ -1953,7 +1982,8 @@ static int cmd_prioritisetransaction(const rj_val* params, rj_val** res, long* e
           *ec = -8; *em = "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.";
           return 0; } }
     if (params->items[2]->typ != RJ_NUM){
-        *ec = -3; *em = "JSON value of type string is not of expected type number"; return 0; }
+        static char dbuf[256];
+        return rpc_wrong_type(ec, em, dbuf, sizeof dbuf, 3, "fee_delta", params->items[2], "number"); }
     long long delta = atoll(params->items[2]->str);
     int slot = -1;
     for (int i = 0; i < PRI_MAX; i++){

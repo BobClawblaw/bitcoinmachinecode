@@ -76,6 +76,25 @@ long rj_write(char* out, long cap, const rj_val* v, int pretty);
  * excl. NUL. For responses of unbounded size. NULL only on OOM. */
 char* rj_write_alloc(const rj_val* v, int pretty, long* len_out);
 
+/* Core's argument-check vocabulary (univalue checkType via RPCHelpMan::Arg).
+ * Measured against Core v31.1 on 2026-09-15: a method answers
+ *   missing required argument -> -1  + the method's full help text
+ *   wrong JSON type           -> -3  + rj_wrong_type_msg() below
+ *   right type, bad value     -> -8  + a method-specific message
+ * and for a wallet method the wallet is resolved BETWEEN the type check and
+ * the value check, so a bad-but-well-typed argument yields the wallet's -18.
+ *
+ * rj_type_name is the name Core prints for a value's actual type. */
+const char* rj_type_name(const rj_val* v);
+/* Formats Core's exact -3 body into buf and returns it:
+ *   Wrong type passed:
+ *   {
+ *       "Position 1 (txid)": "JSON value of type null is not of expected type string"
+ *   }
+ * Give buf at least 256 bytes. */
+const char* rj_wrong_type_msg(char* buf, size_t cap, int position, const char* name,
+                              const rj_val* got, const char* expected);
+
 /* Deep-free a value tree. */
 void rj_free(rj_val* v);
 

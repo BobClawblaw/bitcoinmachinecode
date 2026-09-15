@@ -1125,7 +1125,7 @@ static int cmd_listdescriptors(const rj_val* params, const rpc_wallet* w,
         *res = o;
         return 1;
     }
-    if (!w || !w->seed) return wop_err(ec, em, -4, "No wallet is loaded");
+    if (!w || !w->seed) return wop_err(ec, em, RPC_NO_WALLET_CODE, RPC_NO_WALLET_MSG);
     rj_val* arr = rj_arr();
     int mask = rpc_wops_active_types();
     for (int t = 0; t < 4; t++){
@@ -1333,7 +1333,7 @@ static int cmd_createwalletdescriptor(const rj_val* params, const rpc_wallet* w,
             return wop_err(ec, em, -4,
                 "createwalletdescriptor needs the wallet's HD key; this is a "
                 "watch-only wallet. Use importdescriptors instead.");
-        return wop_err(ec, em, -4, "No wallet is loaded");
+        return wop_err(ec, em, RPC_NO_WALLET_CODE, RPC_NO_WALLET_MSG);
     }
     /* bech32 is always present (for the seed AND every addhdkey key, which
      * join the derivation window the moment they are added); the other three
@@ -1385,7 +1385,7 @@ static int cmd_exportwatchonlywallet(const rj_val* params, const rpc_wallet* w,
             ranges[nd] = g_wd[i].range; nexts[nd] = g_wd[i].next; nd++;
         }
     } else {
-        return wop_err(ec, em, -4, "No wallet is loaded");
+        return wop_err(ec, em, RPC_NO_WALLET_CODE, RPC_NO_WALLET_MSG);
     }
     if (nd == 0)
         return wop_err(ec, em, -4, "this wallet has no descriptors to export "
@@ -2053,6 +2053,23 @@ static void wop_records_invalidate(void){ g_wop_nrec = -1; g_wop_tipscanned = -1
 /* No scan yet is a distinct state from "scanned and found nothing", and the
  * two must not be conflated: reporting 0.00000000 for an address when no
  * scan has run tells the caller something false. */
+/* Core resolves the wallet BEFORE running a method body
+ * (wallet/rpc/util.cpp GetWalletForJSONRPCRequest), so "there is no wallet" is
+ * the first thing a caller hears. This file checked the rescan first, and with
+ * no wallet loaded there is never a completed rescan -- so every method below
+ * answered -4 "no wallet rescan has completed" and the wallet-absent -18 was
+ * unreachable at those sites. Changing the code without changing the order
+ * would have been a fix that grep could see and a caller could not. */
+/* A WATCH-ONLY wallet is a loaded wallet with no seed -- the predicate is the
+ * one wop_keyset_cached already uses, and getting it wrong here refused every
+ * method above for watch-only wallets. The existing suite caught that. */
+static int wop_wallet_loaded(const rpc_wallet* w){
+    return (w && w->seed) || rpc_wops_watchonly();
+}
+static int wop_need_wallet(const rpc_wallet* w, long* ec, const char** em){
+    if (wop_wallet_loaded(w)) return 0;
+    *ec = RPC_NO_WALLET_CODE; *em = RPC_NO_WALLET_MSG; return 1;
+}
 static int wop_need_scan(long* ec, const char** em){
     wscan_rec* r; wop_records(&r);
     if (g_wop_tipscanned >= 0) return 0;
@@ -2188,7 +2205,7 @@ int rpc_wops_wallet_coins(const void* wseed, rpc_wops_coin* out, int cap){
 static int cmd_rescanblockchain(const rj_val* params, const rpc_wallet* w,
                                 long* ec, const char** em, rj_val** res){
     if ((!w || !w->seed) && !g_aw_watchonly)   /* watch-only rescans by descriptor keyset */
-        return wop_err(ec, em, -4, "No wallet is loaded");
+        return wop_err(ec, em, RPC_NO_WALLET_CODE, RPC_NO_WALLET_MSG);
     if (!g_wops_read_block || !g_wops_tip)
         return wop_err(ec, em, -4,
             "no block archive is attached to the RPC layer, so there is "
@@ -2208,12 +2225,12 @@ static int cmd_rescanblockchain(const rj_val* params, const rpc_wallet* w,
     /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
      * loaded, and a genuine allocation failure. Reporting both as "out of
      * memory" told an operator with no wallet that the node was out of RAM.
-     * Three other sites in this file already answer "No wallet is loaded";
+     * Three other sites in this file already reported the wallet as absent;
      * these seven did not. Found 2026-09-15 by the RPC shape differential,
      * once a wallet was loaded on the oracle so these calls could be diffed
-     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
-     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
-    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+     * at all. The absent case is Core's RPC_NO_WALLET_CODE/_MSG (-18), which
+     * every site in this file now returns. */
+    if (!keys) return !wop_wallet_loaded(w) ? wop_err(ec, em, RPC_NO_WALLET_CODE, RPC_NO_WALLET_MSG)
                                        : wop_err(ec, em, -7, "out of memory");
     char pb[512]; const char* path = wop_path(WOP_SCAN_REL, pb, sizeof pb);
     static char err[256];
@@ -2279,6 +2296,7 @@ static int cmd_getreceivedbyaddress(const rj_val* params, const rpc_wallet* w,
                                     long* ec, const char** em, rj_val** res){
     const char* addr = wop_str_arg(params, 0);
     if (!addr) return wop_err(ec, em, -8, "getreceivedbyaddress requires an address");
+    if (wop_need_wallet(w, ec, em)) return 0;
     if (wop_need_scan(ec, em)) return 0;
     unsigned char want[20];
     if (!wop_addr_h160(addr, want, ec, em)) return 0;
@@ -2286,12 +2304,12 @@ static int cmd_getreceivedbyaddress(const rj_val* params, const rpc_wallet* w,
     /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
      * loaded, and a genuine allocation failure. Reporting both as "out of
      * memory" told an operator with no wallet that the node was out of RAM.
-     * Three other sites in this file already answer "No wallet is loaded";
+     * Three other sites in this file already reported the wallet as absent;
      * these seven did not. Found 2026-09-15 by the RPC shape differential,
      * once a wallet was loaded on the oracle so these calls could be diffed
-     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
-     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
-    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+     * at all. The absent case is Core's RPC_NO_WALLET_CODE/_MSG (-18), which
+     * every site in this file now returns. */
+    if (!keys) return !wop_wallet_loaded(w) ? wop_err(ec, em, RPC_NO_WALLET_CODE, RPC_NO_WALLET_MSG)
                                        : wop_err(ec, em, -7, "out of memory");
     /* Core: an address the wallet does not own is an error, not a zero --
      * a zero would look like an owned address that received nothing. */
@@ -2308,17 +2326,18 @@ static int cmd_getreceivedbylabel(const rj_val* params, const rpc_wallet* w,
                                   long* ec, const char** em, rj_val** res){
     const char* label = wop_str_arg(params, 0);
     if (!label) return wop_err(ec, em, -8, "getreceivedbylabel requires a label");
+    if (wop_need_wallet(w, ec, em)) return 0;
     if (wop_need_scan(ec, em)) return 0;
     const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
     /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
      * loaded, and a genuine allocation failure. Reporting both as "out of
      * memory" told an operator with no wallet that the node was out of RAM.
-     * Three other sites in this file already answer "No wallet is loaded";
+     * Three other sites in this file already reported the wallet as absent;
      * these seven did not. Found 2026-09-15 by the RPC shape differential,
      * once a wallet was loaded on the oracle so these calls could be diffed
-     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
-     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
-    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+     * at all. The absent case is Core's RPC_NO_WALLET_CODE/_MSG (-18), which
+     * every site in this file now returns. */
+    if (!keys) return !wop_wallet_loaded(w) ? wop_err(ec, em, RPC_NO_WALLET_CODE, RPC_NO_WALLET_MSG)
                                        : wop_err(ec, em, -7, "out of memory");
     int minconf = wop_minconf_arg(params, 1, 1);
     char pb[512]; const char* lp = wop_path(WOP_LABELS_REL, pb, sizeof pb);
@@ -2352,6 +2371,7 @@ static void wop_label_of(const char* addr, char* out, int cap){
 
 static int cmd_listreceivedbyaddress(const rj_val* params, const rpc_wallet* w,
                                      long* ec, const char** em, rj_val** res){
+    if (wop_need_wallet(w, ec, em)) return 0;
     if (wop_need_scan(ec, em)) return 0;
     int minconf = wop_minconf_arg(params, 0, 1);
     int include_empty = 0;
@@ -2361,12 +2381,12 @@ static int cmd_listreceivedbyaddress(const rj_val* params, const rpc_wallet* w,
     /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
      * loaded, and a genuine allocation failure. Reporting both as "out of
      * memory" told an operator with no wallet that the node was out of RAM.
-     * Three other sites in this file already answer "No wallet is loaded";
+     * Three other sites in this file already reported the wallet as absent;
      * these seven did not. Found 2026-09-15 by the RPC shape differential,
      * once a wallet was loaded on the oracle so these calls could be diffed
-     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
-     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
-    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+     * at all. The absent case is Core's RPC_NO_WALLET_CODE/_MSG (-18), which
+     * every site in this file now returns. */
+    if (!keys) return !wop_wallet_loaded(w) ? wop_err(ec, em, RPC_NO_WALLET_CODE, RPC_NO_WALLET_MSG)
                                        : wop_err(ec, em, -7, "out of memory");
     /* Only keys that actually appear in the scan are candidates, unless the
      * caller asked for empties -- otherwise this would list 2000 addresses. */
@@ -2407,18 +2427,19 @@ static int cmd_listreceivedbyaddress(const rj_val* params, const rpc_wallet* w,
 
 static int cmd_listreceivedbylabel(const rj_val* params, const rpc_wallet* w,
                                    long* ec, const char** em, rj_val** res){
+    if (wop_need_wallet(w, ec, em)) return 0;
     if (wop_need_scan(ec, em)) return 0;
     int minconf = wop_minconf_arg(params, 0, 1);
     const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
     /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
      * loaded, and a genuine allocation failure. Reporting both as "out of
      * memory" told an operator with no wallet that the node was out of RAM.
-     * Three other sites in this file already answer "No wallet is loaded";
+     * Three other sites in this file already reported the wallet as absent;
      * these seven did not. Found 2026-09-15 by the RPC shape differential,
      * once a wallet was loaded on the oracle so these calls could be diffed
-     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
-     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
-    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+     * at all. The absent case is Core's RPC_NO_WALLET_CODE/_MSG (-18), which
+     * every site in this file now returns. */
+    if (!keys) return !wop_wallet_loaded(w) ? wop_err(ec, em, RPC_NO_WALLET_CODE, RPC_NO_WALLET_MSG)
                                        : wop_err(ec, em, -7, "out of memory");
     char pb[512]; const char* lp = wop_path(WOP_LABELS_REL, pb, sizeof pb);
     int ln = lbl_count(lp);
@@ -2467,17 +2488,18 @@ static int cmd_listreceivedbylabel(const rj_val* params, const rpc_wallet* w,
  * it is also the maximally-correct one -- there is no partition of a
  * single-seed wallet into distinct owners. */
 static int cmd_listaddressgroupings(const rpc_wallet* w, long* ec, const char** em, rj_val** res){
+    if (wop_need_wallet(w, ec, em)) return 0;
     if (wop_need_scan(ec, em)) return 0;
     const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
     /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
      * loaded, and a genuine allocation failure. Reporting both as "out of
      * memory" told an operator with no wallet that the node was out of RAM.
-     * Three other sites in this file already answer "No wallet is loaded";
+     * Three other sites in this file already reported the wallet as absent;
      * these seven did not. Found 2026-09-15 by the RPC shape differential,
      * once a wallet was loaded on the oracle so these calls could be diffed
-     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
-     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
-    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+     * at all. The absent case is Core's RPC_NO_WALLET_CODE/_MSG (-18), which
+     * every site in this file now returns. */
+    if (!keys) return !wop_wallet_loaded(w) ? wop_err(ec, em, RPC_NO_WALLET_CODE, RPC_NO_WALLET_MSG)
                                        : wop_err(ec, em, -7, "out of memory");
     wscan_rec* recs; long n = wop_records(&recs);
     rj_val* group = rj_arr();
@@ -2508,6 +2530,7 @@ static int cmd_listaddressgroupings(const rpc_wallet* w, long* ec, const char** 
 /* listsinceblock ( "blockhash" target_confirmations ... ) */
 static int cmd_listsinceblock(const rj_val* params, const rpc_wallet* w,
                               long* ec, const char** em, rj_val** res){
+    if (wop_need_wallet(w, ec, em)) return 0;
     if (wop_need_scan(ec, em)) return 0;
     long since = -1;
     if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
@@ -2528,12 +2551,12 @@ static int cmd_listsinceblock(const rj_val* params, const rpc_wallet* w,
     /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
      * loaded, and a genuine allocation failure. Reporting both as "out of
      * memory" told an operator with no wallet that the node was out of RAM.
-     * Three other sites in this file already answer "No wallet is loaded";
+     * Three other sites in this file already reported the wallet as absent;
      * these seven did not. Found 2026-09-15 by the RPC shape differential,
      * once a wallet was loaded on the oracle so these calls could be diffed
-     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
-     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
-    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+     * at all. The absent case is Core's RPC_NO_WALLET_CODE/_MSG (-18), which
+     * every site in this file now returns. */
+    if (!keys) return !wop_wallet_loaded(w) ? wop_err(ec, em, RPC_NO_WALLET_CODE, RPC_NO_WALLET_MSG)
                                        : wop_err(ec, em, -7, "out of memory");
     wscan_rec* recs; long n = wop_records(&recs);
     rj_val* txs = rj_arr();
@@ -2592,6 +2615,27 @@ static int cmd_listsinceblock(const rj_val* params, const rpc_wallet* w,
  * sidecar so gettransaction can report abandoned:true. */
 #define WOP_ABANDON_REL "abandoned.dat"
 
+/* Core checks a txid argument in three stages and answers differently at each
+ * (measured on the oracle against v31.1, 2026-09-15, for abandontransaction and
+ * bumpfee): a MISSING argument is -1 with the method's help text, a WRONG TYPE
+ * is -3, and only then -- after the wallet has been resolved, so an absent
+ * wallet's -18 wins -- is the VALUE checked, at -8.
+ *
+ * This file collapsed all three into one -8 "Invalid or missing txid", so a
+ * caller with no wallet loaded was told its txid was bad. Split so the wallet
+ * check can sit between the type stage and the value stage where Core puts it. */
+static int wop_txid_typecheck(const rj_val* params, const char* method,
+                              long* ec, const char** em){
+    static char tbuf[256];
+    if (!params || params->typ != RJ_ARR || params->nitems < 1){
+        static char ubuf[96];
+        snprintf(ubuf, sizeof ubuf, "%s requires txid", method);
+        *ec = -1; *em = ubuf; return 0; }
+    if (params->items[0]->typ != RJ_STR){
+        *ec = -3; *em = rj_wrong_type_msg(tbuf, sizeof tbuf, 1, "txid",
+                                          params->items[0], "string"); return 0; }
+    return 1;
+}
 static int wop_txid_from_arg(const rj_val* params, unsigned char out_wire[32],
                              char disp[65], long* ec, const char** em){
     const char* t = wop_str_arg(params, 0);
@@ -2622,8 +2666,11 @@ int rpc_wops_is_abandoned(const char* txid_display){
     return hit;
 }
 
-static int cmd_abandontransaction(const rj_val* params, long* ec, const char** em, rj_val** res){
+static int cmd_abandontransaction(const rj_val* params, const rpc_wallet* w,
+                                  long* ec, const char** em, rj_val** res){
     unsigned char wire[32]; char disp[65];
+    if (!wop_txid_typecheck(params, "abandontransaction", ec, em)) return 0;
+    if (wop_need_wallet(w, ec, em)) return 0;
     if (!wop_txid_from_arg(params, wire, disp, ec, em)) return 0;
     if (wop_need_scan(ec, em)) return 0;
     wscan_rec* recs; long n = wop_records(&recs);
@@ -2985,6 +3032,7 @@ static int wf_fund(const rpc_wallet* w, const wf_out* outs, int nout,
                    unsigned long long* fee_out, int* changepos_out,
                    long* ec, const char** em){
     *hex_out = NULL; *prevtxs_out = NULL; *changepos_out = -1;
+    if (wop_need_wallet(w, ec, em)) return 0;
     if (wop_need_scan(ec, em)) return 0;
     static wf_coin coins[4096];
     int nc = wf_coins(w, coins, 4096, 1);
@@ -3366,6 +3414,7 @@ static int cmd_sendall(const rj_val* params, const rpc_wallet* w,
             "this node's sendall takes exactly one recipient address; splitting "
             "a sweep across several recipients needs Core's per-recipient "
             "proportioning, which is not implemented");
+    if (wop_need_wallet(w, ec, em)) return 0;
     if (wop_need_scan(ec, em)) return 0;
     const char* addr = params->items[0]->items[0]->str;
     unsigned char spk[64]; unsigned long slen;
@@ -3710,7 +3759,7 @@ static int cmd_importprunedfunds(const rj_val* params, const rpc_wallet* w,
 
     /* ---- which outputs are ours -- the SAME question the rescan asks ---- */
     const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
-    if (nk <= 0){ rj_free(dec); return wop_err(ec, em, -4, "No wallet is loaded"); }
+    if (nk <= 0){ rj_free(dec); return wop_err(ec, em, RPC_NO_WALLET_CODE, RPC_NO_WALLET_MSG); }
     /* a coinbase is stated by the decoded transaction itself: its single
      * input carries `coinbase` instead of a txid/vout, which is what
      * tx_to_json emits for the null outpoint */
@@ -3828,6 +3877,8 @@ static int cmd_bumpfee_common(const rj_val* params, const rpc_wallet* w,
     if (rpc_wops_watchonly() && !want_psbt)
         return wop_err(ec, em, -4, "bumpfee is not available with wallets that "
                        "have private keys disabled. Use psbtbumpfee instead.");
+    if (!wop_txid_typecheck(params, want_psbt ? "psbtbumpfee" : "bumpfee", ec, em)) return 0;
+    if (wop_need_wallet(w, ec, em)) return 0;
     if (wop_need_scan(ec, em)) return 0;
 
     unsigned char txw[32]; char txd[65];
@@ -4291,7 +4342,7 @@ int rpc_wops_dispatch(const char* m, const rj_val* params, const rpc_wallet* w,
     if (!strcmp(m, "listreceivedbylabel"))  return cmd_listreceivedbylabel(params, w, ec, em, res);
     if (!strcmp(m, "listaddressgroupings")) return cmd_listaddressgroupings(w, ec, em, res);
     if (!strcmp(m, "listsinceblock"))       return cmd_listsinceblock(params, w, ec, em, res);
-    if (!strcmp(m, "abandontransaction"))   return cmd_abandontransaction(params, ec, em, res);
+    if (!strcmp(m, "abandontransaction"))   return cmd_abandontransaction(params, w, ec, em, res);
 
     /* the spend family -- see WOP_NO_FUNDING for why refusing is the only
      * answer that does not hand the caller a transaction the network will

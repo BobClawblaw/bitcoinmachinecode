@@ -1555,6 +1555,82 @@ int main(void){
         rj_free(r); rj_free(p);
     }
 
+
+    /* ---- argument-error codes: Core's three-way split ---------------------
+     * Measured against Core v31.1 on the oracle, 2026-09-15, for every JSON
+     * type. Core answers a bad argument three different ways and these methods
+     * collapsed the first two into one:
+     *
+     *   missing required argument -> -1  (+ the method's full help text)
+     *   wrong JSON type           -> -3  RPC_TYPE_ERROR, "Wrong type passed: ..."
+     *   right type, bad value     -> -8  RPC_INVALID_PARAMETER, specific message
+     *
+     * They returned -8 for the first two alike AND named the passed type as
+     * "null" whatever it really was, so a caller that sent a number was told it
+     * had sent null. The code is the part that matters: a caller branches on
+     * the number, and -8 sent it down the "your value is wrong" path when the
+     * real answer was "you passed the wrong type" or "you passed nothing".
+     *
+     * The -1 message cannot match Core: this node deliberately carries no
+     * per-method usage text (cmd_help in rpc_commands.c), so it answers with
+     * Core's CODE and a short usage line. That is asserted as such below --
+     * the test pins what this node can honestly produce, not a Core string it
+     * will never emit. */
+    {
+        const char* TYPED[] = { "null", "5", "true", "[]", "{}" };
+        const char* TNAME[] = { "null", "number", "bool", "array", "object" };
+        const char* M[] = { "getmempoolentry", "getmempoolancestors", "getmempooldescendants" };
+        for (int mi = 0; mi < 3; mi++){
+            for (int ti = 0; ti < 5; ti++){
+                char pb[64]; snprintf(pb, sizeof pb, "[%s]", TYPED[ti]);
+                char want[160];
+                snprintf(want, sizeof want,
+                         "Wrong type passed:\n{\n    \"Position 1 (txid)\": \"JSON value of type %s "
+                         "is not of expected type string\"\n}", TNAME[ti]);
+                rj_val* p = rj_parse(pb, strlen(pb));
+                rj_val* r = NULL; long e = 0; const char* m = NULL;
+                int rc2 = rpc_node_dispatch(M[mi], p, &r, &e, &m);
+                char lbl[160];
+                snprintf(lbl, sizeof lbl, "%s(%s) -> -3 with Core's exact message", M[mi], TNAME[ti]);
+                ck(lbl, rc2 == 0 && e == -3 && m && !strcmp(m, want));
+                rj_free(r); rj_free(p);
+            }
+            /* a MISSING argument is a different answer again: Core's -1 */
+            { rj_val* p = rj_parse("[]", 2);
+              rj_val* r = NULL; long e = 0; const char* m = NULL;
+              int rc2 = rpc_node_dispatch(M[mi], p, &r, &e, &m);
+              char lbl[128]; snprintf(lbl, sizeof lbl, "%s() with no argument -> -1, not -3 and not -8", M[mi]);
+              ck(lbl, rc2 == 0 && e == -1 && m && strstr(m, "requires txid"));
+              rj_free(r); rj_free(p); }
+        }
+        /* prioritisetransaction: position 1 is txid, position 3 is fee_delta --
+         * Core names the position and the argument, so a wrong fee_delta must
+         * not report position 1. */
+        { rj_val* p = rj_parse("[5, 0, 100]", 11);
+          rj_val* r = NULL; long e = 0; const char* m = NULL;
+          int rc2 = rpc_node_dispatch("prioritisetransaction", p, &r, &e, &m);
+          ck("prioritisetransaction(number txid) -> -3 naming Position 1 (txid)",
+             rc2 == 0 && e == -3 && m && strstr(m, "\"Position 1 (txid)\"")
+             && strstr(m, "of type number"));
+          rj_free(r); rj_free(p); }
+        { const char* pj = "[\"0000000000000000000000000000000000000000000000000000000000000001\", 0, \"x\"]";
+          rj_val* p = rj_parse(pj, strlen(pj));
+          rj_val* r = NULL; long e = 0; const char* m = NULL;
+          int rc2 = rpc_node_dispatch("prioritisetransaction", p, &r, &e, &m);
+          ck("prioritisetransaction(string fee_delta) -> -3 naming Position 3 (fee_delta)",
+             rc2 == 0 && e == -3 && m && strstr(m, "\"Position 3 (fee_delta)\"")
+             && strstr(m, "of type string is not of expected type number"));
+          rj_free(r); rj_free(p); }
+        /* and the value stage is still -8, unchanged: the split must not have
+         * swallowed the case that was already right */
+        { rj_val* p = rj_parse("[\"abcd\"]", 8);
+          rj_val* r = NULL; long e = 0; const char* m = NULL;
+          int rc2 = rpc_node_dispatch("getmempoolentry", p, &r, &e, &m);
+          ck("a well-typed but wrong-length txid is still -8",
+             rc2 == 0 && e == -8 && m && strstr(m, "txid must be of length 64"));
+          rj_free(r); rj_free(p); }
+    }
+
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);
     return fails ? 1 : 0;
 }
