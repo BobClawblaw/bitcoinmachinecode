@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../rpc_commands.h"
+#include <stdlib.h>
 #include "../rpc_json.h"
 
 /* ---- signrawtransactionwithwallet / simulaterawtransaction ----------------
@@ -335,6 +336,109 @@ int main(void){
       ck("...and the transaction comes back UNCHANGED, witness intact",
          hx && hx->str && !strcmp(hx->str, SEGWIT_TX));
       rj_free(r); rj_free(p2); }
+
+
+    /* ---- the `errors` entries carry Core's witness and scriptSig ----------
+     * Core's TxInErrorToJSON emits txid, vout, witness, scriptSig, sequence,
+     * error (rpc/rawtransaction_util.cpp). This node emitted only txid, vout,
+     * sequence, error, so a caller could not see which input data was already
+     * present on a failed input -- the whole point of the array in a
+     * multi-party signing flow. The fields were unimplementable until the
+     * witness-preservation fix above began parsing that data (2026-09-15).
+     *
+     * Both fixtures are real mainnet transactions and the expected arrays are
+     * Bitcoin Core v31.1's own output for them, byte for byte, rendered
+     * compact so KEY ORDER is pinned as well as the values. Every input errors
+     * because its coin is long spent -- exactly the case where Core reports
+     * the data the transaction arrived with. */
+    /* mainnet 259f72646124bf05d42293ecdc5cdacd43341d33f55329ee95499bad0330900b
+     * one legacy input (scriptSig, empty witness) + one taproot (witness, empty scriptSig) */
+    { const char* hex =
+        "020000000001027001cb94068f4a0dd7c2847921d96d216f65cfd90cf059553926dba323c820a4000000006a"
+        "47304402205295f7ec757af5aa00b10c0dca9b0ee19fb657c174934b9e106c5764d2c8a33002201e188f4fd2"
+        "4a9dab80180a4418cd72cbe7ab61cb23fea69ac545f16178220d3e012102ae8a901ef9d3336264a753291f69"
+        "1d47ed258e9539495b7a78f3447fb744edbeffffffff8addf97956ac2ea39b6185035e1f553d9deb2cafe584"
+        "a1b350e4785008699e560100000000ffffffff0222020000000000001976a914adfb8786f19039b78a78a999"
+        "e04d68348d0571be88ac0e80980000000000225120bc8ae4ec38922b39f35e4970a3cf1196984f740ea583ec"
+        "3418a9b119040c0d8c00014008087516840c65964301dedbe48668990cab2cc6424f7e8fa8e7f1d271c081d8"
+        "aca01de586815a40f88fe0b0329006e43279e2d1f08a1a31ea50d14af28a00b400000000";
+      const char* want =
+        "[{\"txid\":\"a420c823a3db26395559f00cd9cf656f216dd9217984c2d70d4a8f0694cb0170\",\"vout\""
+        ":0,\"witness\":[],\"scriptSig\":\"47304402205295f7ec757af5aa00b10c0dca9b0ee19fb657c17493"
+        "4b9e106c5764d2c8a33002201e188f4fd24a9dab80180a4418cd72cbe7ab61cb23fea69ac545f16178220d3e"
+        "012102ae8a901ef9d3336264a753291f691d47ed258e9539495b7a78f3447fb744edbe\",\"sequence\":42"
+        "94967295,\"error\":\"Input not found or already spent\"},{\"txid\":\"569e69085078e450b3a"
+        "184e5af2ceb9d3d551f5e0385619ba32eac5679f9dd8a\",\"vout\":1,\"witness\":[\"08087516840c65"
+        "964301dedbe48668990cab2cc6424f7e8fa8e7f1d271c081d8aca01de586815a40f88fe0b0329006e43279e2"
+        "d1f08a1a31ea50d14af28a00b4\"],\"scriptSig\":\"\",\"sequence\":4294967295,\"error\":\"Inp"
+        "ut not found or already spent\"}]";
+      char pb[16384]; snprintf(pb,sizeof pb,"[\"%s\",[]]",hex);
+      long ec=0; const char* em=NULL;
+      rj_val* r=call("signrawtransactionwithkey",pb,&ec,&em);
+      rj_val* ea = r ? rj_obj_get(r,"errors") : NULL;
+      char* got = ea ? rj_write_alloc(ea,0,NULL) : NULL;
+      ck("errors[] is Core byte for byte -- witness, scriptSig, key order (one legacy input (scriptSig, empty witness) + one taproot (witness, empty scriptSig))",
+         got && !strcmp(got,want));
+      if (got && strcmp(got,want)) printf("      core: %s\n      ours: %s\n", want, got);
+      free(got); rj_free(r); }
+    /* mainnet 8af4b62182df50cd2e2b0578d7bb50b76ebe1affbe32501c37c6cc536ba792fd
+     * five inputs, one of them P2SH-P2WPKH: scriptSig AND witness on the SAME input */
+    { const char* hex =
+        "02000000000105639f16cead97340691813ff439db64c7fcf5c82298e5d69c5a24b21de57dc9190100000000"
+        "fdffffff52935189c2ee147f968d5835b400c15519756e7692be97d31a1b4aa9757b9d532300000017160014"
+        "e94a42fb0e6f130b63f0e84cbc37cd63a5f570a0fdffffffa7ba5dc410490f286b7c018ffd2d7d0ff1c7ec76"
+        "92c769ebd234fbbfecfee30d0000000000fdffffffc97689c9ac367618ec8f422462fa1e777736226d586c9c"
+        "2d9f17ff787a5b67000200000000fdffffffd7f9abf88fb8dd2d1f12bc648e13c0216c74785d3d6f580e9b2e"
+        "9c18139324504200000000fdffffff02e904140000000000160014d80fd04807dc2155f47d1b7ce224610ad8"
+        "47094aca88fb0200000000160014a6c1c328d18548e1b13287a4fc91d6a77779b19302473044022011cc5adf"
+        "835405b39a3b2d2f442b0563560a1d464cee02622017be9a09793d3f02206d9e7ce1e09a1b317849f4451fa7"
+        "17ffcdff1186384ed130057e623fed34d0ca01210367b45a14714638ab73adb9712c742dfe9b5be26ff84e86"
+        "f75a05474105e926060247304402202ea4d5196a164f255b97a2abfc3026b11a805c16c286eeeb1706331e03"
+        "adc529022031c3007cb59b79952e4afbae2b1a5056471d6b5145a3265538bc261dbd0f14d001210206265212"
+        "30b668ad0ea3630e2e91bceb412647184371cda4f907d9962687da160247304402205633aa1f8d0cde9224ff"
+        "b8f8442c4e545c2bcfa8bab6a53e13751e3c6050939102202cd5622b4450f74b887f724343725257cd5de6dc"
+        "ed41308313bbd5354b02b738012103ed966da33acdb5245427d92ddc46811d51d906fe105ec90e0eced3328f"
+        "f279570247304402200978f4d7d14bf5b71749bd1d60c422554549de1e6dfe2b265798d877c2345750022046"
+        "82aca036d973d58e85f3f4c6e1462992d324052abffaaea58f824a5817adb901210285e5a5052d1468ed0f11"
+        "a2a99652d08fc9bba3b19e7d6fd6a60da83d0bf215c80247304402201b11dd67142600909f644bcd698d2f83"
+        "1e79c2f2cfb06622243eeedf44c42e9c02205e95571be191b7e65d3eaab3f0e0b181fa84379e8ed97499535d"
+        "d3076f6aed2b012103c04ac46c971816e19c7cb9cbeab92bee07e1433f4e99e66571b4d0fc0c2ffd19000000"
+        "00";
+      const char* want =
+        "[{\"txid\":\"19c97de51db2245a9cd6e59822c8f5fcc764db39f43f8191063497adce169f63\",\"vout\""
+        ":1,\"witness\":[\"3044022011cc5adf835405b39a3b2d2f442b0563560a1d464cee02622017be9a09793d"
+        "3f02206d9e7ce1e09a1b317849f4451fa717ffcdff1186384ed130057e623fed34d0ca01\",\"0367b45a147"
+        "14638ab73adb9712c742dfe9b5be26ff84e86f75a05474105e92606\"],\"scriptSig\":\"\",\"sequence"
+        "\":4294967293,\"error\":\"Input not found or already spent\"},{\"txid\":\"539d7b75a94a1b"
+        "1ad397be92766e751955c100b435588d967f14eec289519352\",\"vout\":35,\"witness\":[\"30440220"
+        "2ea4d5196a164f255b97a2abfc3026b11a805c16c286eeeb1706331e03adc529022031c3007cb59b79952e4a"
+        "fbae2b1a5056471d6b5145a3265538bc261dbd0f14d001\",\"020626521230b668ad0ea3630e2e91bceb412"
+        "647184371cda4f907d9962687da16\"],\"scriptSig\":\"160014e94a42fb0e6f130b63f0e84cbc37cd63a"
+        "5f570a0\",\"sequence\":4294967293,\"error\":\"Input not found or already spent\"},{\"txi"
+        "d\":\"0de3feecbffb34d2eb69c79276ecc7f10f7d2dfd8f017c6b280f4910c45dbaa7\",\"vout\":0,\"wi"
+        "tness\":[\"304402205633aa1f8d0cde9224ffb8f8442c4e545c2bcfa8bab6a53e13751e3c6050939102202"
+        "cd5622b4450f74b887f724343725257cd5de6dced41308313bbd5354b02b73801\",\"03ed966da33acdb524"
+        "5427d92ddc46811d51d906fe105ec90e0eced3328ff27957\"],\"scriptSig\":\"\",\"sequence\":4294"
+        "967293,\"error\":\"Input not found or already spent\"},{\"txid\":\"00675b7a78ff179f2d9c6"
+        "c586d223677771efa6224428fec187636acc98976c9\",\"vout\":2,\"witness\":[\"304402200978f4d7"
+        "d14bf5b71749bd1d60c422554549de1e6dfe2b265798d877c234575002204682aca036d973d58e85f3f4c6e1"
+        "462992d324052abffaaea58f824a5817adb901\",\"0285e5a5052d1468ed0f11a2a99652d08fc9bba3b19e7"
+        "d6fd6a60da83d0bf215c8\"],\"scriptSig\":\"\",\"sequence\":4294967293,\"error\":\"Input no"
+        "t found or already spent\"},{\"txid\":\"50249313189c2e9b0e586f3d5d78746c21c0138e64bc121f"
+        "2dddb88ff8abf9d7\",\"vout\":66,\"witness\":[\"304402201b11dd67142600909f644bcd698d2f831e"
+        "79c2f2cfb06622243eeedf44c42e9c02205e95571be191b7e65d3eaab3f0e0b181fa84379e8ed97499535dd3"
+        "076f6aed2b01\",\"03c04ac46c971816e19c7cb9cbeab92bee07e1433f4e99e66571b4d0fc0c2ffd19\"],"
+        "\"scriptSig\":\"\",\"sequence\":4294967293,\"error\":\"Input not found or already spent"
+        "\"}]";
+      char pb[16384]; snprintf(pb,sizeof pb,"[\"%s\",[]]",hex);
+      long ec=0; const char* em=NULL;
+      rj_val* r=call("signrawtransactionwithkey",pb,&ec,&em);
+      rj_val* ea = r ? rj_obj_get(r,"errors") : NULL;
+      char* got = ea ? rj_write_alloc(ea,0,NULL) : NULL;
+      ck("errors[] is Core byte for byte -- witness, scriptSig, key order (five inputs, one of them P2SH-P2WPKH: scriptSig AND witness on the SAME input)",
+         got && !strcmp(got,want));
+      if (got && strcmp(got,want)) printf("      core: %s\n      ours: %s\n", want, got);
+      free(got); rj_free(r); }
 
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);
     return fails?1:0;

@@ -2352,6 +2352,30 @@ static const char* srw_sign_wsh(const srw_prev_t* P, unsigned char* wit, unsigne
     if (got<k){ static char mbuf[64]; snprintf(mbuf,sizeof mbuf,"Missing signatures: have %d of %d",got,k); return mbuf; }
     return NULL;
 }
+/* An `errors` entry carries the input AS IT STANDS after signing was attempted.
+ * That is what Core does: TxInErrorToJSON reads scriptSig and scriptWitness off
+ * mtx.vin[i] AFTER UpdateInput has written back whatever sigdata was produced,
+ * so a partially-signed input reports its partial data, and an input nothing
+ * could be done with reports the bytes it arrived with. These must therefore be
+ * the same bytes this function is about to serialize into `hex` for that input,
+ * never the bare/empty values.
+ *
+ * Core's field order in the entry is txid, vout, witness, scriptSig, sequence,
+ * error (rpc/rawtransaction_util.cpp TxInErrorToJSON). */
+static rj_val* srw_witness_json(const unsigned char* w, unsigned long wlen, unsigned long items){
+    rj_val* a=rj_arr();
+    unsigned long p=0, cc;
+    for (unsigned long k=0;k<items && p<wlen;k++){
+        unsigned long il=srw_varint(w+p,&cc); p+=cc;
+        if (p>wlen || il>wlen-p) break;                  /* truncated stack: emit what parsed */
+        char* h=malloc((size_t)il*2+1); if (!h) break;
+        bin_to_hex(h,w+p,(size_t)il);
+        rj_arr_push(a,rj_str(h)); free(h);
+        p+=il;
+    }
+    return a;
+}
+
 static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const char** em, rj_val** result){
     if (!params || params->typ!=RJ_ARR || params->nitems<2 || params->items[0]->typ!=RJ_STR || params->items[1]->typ!=RJ_ARR){
         *ec=-8; *em="Invalid parameters, expected hexstring and privkeys array"; return 0; }
@@ -2638,6 +2662,16 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
             char idh[65]; unsigned char disp[32]; for(int k=0;k<32;k++) disp[k]=in_outpoint[i][31-k]; bin_to_hex(idh,disp,32);
             rj_obj_set(eo,"txid",rj_str(idh));
             rj_obj_set(eo,"vout",rj_numf("%lu",vo));
+            { const unsigned char* wp = wititems[i] ? witbuf[i] : orig_wit[i];
+              unsigned long wl = wititems[i] ? witlen[i] : orig_witlen[i];
+              unsigned long wn = wititems[i] ? wititems[i] : orig_witn[i];
+              rj_obj_set(eo,"witness", wp ? srw_witness_json(wp,wl,wn) : rj_arr()); }
+            { const unsigned char* sp = sslen[i] ? ss[i] : orig_ss[i];
+              unsigned long sl2 = sslen[i] ? sslen[i] : orig_sslen[i];
+              char* h=malloc((size_t)sl2*2+1);
+              if (!h){ rj_free(eo); rj_free(errors); free(pre); *ec=-7; *em="out of memory"; return 0; }
+              bin_to_hex(h,sp,(size_t)sl2);
+              rj_obj_set(eo,"scriptSig",rj_str(h)); free(h); }
             rj_obj_set(eo,"sequence",rj_numf("%u",in_seq[i]));
             rj_obj_set(eo,"error",rj_str(err));
             rj_arr_push(errors,eo);
