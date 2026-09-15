@@ -292,6 +292,41 @@ int main(void){
         ck("undecodable tx -> -22, not a fabricated balance", rc==0 && ec==-22);
         rj_free(r); rj_free(p); } }
 
+    { /* THE SEGWIT MARKER. signrawtransactionwithkey read the input count at
+       * offset 4 unconditionally. A segwit transaction carries 0x00 0x01 there,
+       * so n_in parsed as ZERO: the signing loop never ran, `complete` came
+       * back TRUE and `errors` was empty -- the node answered "fully signed"
+       * for a transaction it had not looked at. Core answers complete:false
+       * with one error per input.
+       *
+       * It was masked by an n_in == 0 guard that rejected such a transaction as
+       * "TX decode failed" -- wrong, but safe -- until that guard was relaxed
+       * (correctly) for empty PSBT templates on 2026-09-15, turning a wrong
+       * error into a wrong success. Found the same day by the RPC differential.
+       *
+       * A minimal signed segwit tx: version, marker+flag, 1 input, 1 output,
+       * a 2-item witness, locktime. Its prevout is unknown here, so the answer
+       * must be complete:false with exactly one error. */
+      const char* SEGWIT_TX =
+        "02000000000101"                                     /* ver, marker, flag, n_in=1 */
+        "0000000000000000000000000000000000000000000000000000000000000001" "00000000"
+        "00" "ffffffff"                                      /* empty scriptSig, sequence */
+        "01" "a086010000000000" "160014" "0655b93e82502a2183e4f1ca3a1414b5223bad13"
+        "0201aa01bb"                                         /* witness: 2 items */
+        "00000000";                                          /* locktime */
+      char pj[1024]; snprintf(pj, sizeof pj, "[\"%s\",[]]", SEGWIT_TX);
+      rpc_wallet w2; memset(&w2, 0, sizeof w2);      /* no wallet needed: keys come from the argument */
+      rj_val* p2=rj_parse(pj,strlen(pj)); rj_val* r=NULL; long ec=0; const char* em=NULL;
+      int rc=rpc_dispatch("signrawtransactionwithkey",p2,&w2,&r,&ec,&em);
+      ck("a signed SEGWIT tx is decoded, not silently skipped", rc==1 && r);
+      rj_val* comp = r ? rj_obj_get(r,"complete") : NULL;
+      ck("...and an unresolvable input means complete:FALSE, not true",
+         comp && comp->str && !strcmp(comp->str,"0"));
+      rj_val* errs = r ? rj_obj_get(r,"errors") : NULL;
+      ck("...with one errors entry, as Core reports",
+         errs && errs->typ==RJ_ARR && errs->nitems==1);
+      rj_free(r); rj_free(p2); }
+
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);
     return fails?1:0;
 }

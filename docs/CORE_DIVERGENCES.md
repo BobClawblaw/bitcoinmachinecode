@@ -154,7 +154,38 @@ is denominator-agnostic and compares `fee/weight` by cross-multiplication.
 
 ---
 
-## OPEN DEFECT: `signrawtransactionwithkey` claims `complete: true` for inputs it cannot resolve
+## ~~OPEN DEFECT~~ FIXED 2026-09-15: `signrawtransactionwithkey` claimed `complete: true` for inputs it cannot resolve
+
+> **RESOLVED the same day. The mechanism was a segwit parse, and the trigger was
+> my own fix earlier that morning.**
+>
+> `cmd_signrawtransactionwithkey` read the input count at offset 4
+> **unconditionally**. A segwit transaction carries `0x00 0x01` there — marker
+> and flag — so the varint read `0x00` and `n_in` came out **zero**. The signing
+> loop never ran, `complete` stayed true and `errors` stayed empty: the node
+> answered "fully signed" for a transaction it had never looked at.
+> `converttopsbt`, in the same file, has always skipped the marker.
+>
+> **It was masked, and I removed the mask.** The `n_in == 0` guard rejected such
+> a transaction as "TX decode failed" — wrong, but safe. Relaxing that guard
+> (correctly: `createpsbt [] {}` needs it, and Core accepts zero inputs there)
+> removed the accident that was hiding a real parse bug, and turned a wrong
+> ERROR into a wrong SUCCESS. The second is far more dangerous. The lesson is
+> not "do not relax guards" but "ask what else a guard is catching before you
+> relax it".
+>
+> Fixed by skipping the marker, as `converttopsbt` does. Both shapes now match
+> Core exactly — unsigned and signed segwit, `complete: false` with one error
+> each. Three regression tests in `test_rpc_signraw.c`, verified by removing the
+> marker skip and watching all three fail; the first asserts the transaction is
+> DECODED rather than silently skipped, which is the property that was violated.
+>
+> Nothing in the gate would have caught this: no test drove a signed segwit
+> transaction through that path. The RPC shape differential found it, by
+> reporting six missing `errors` fields that were a symptom of a parse that
+> never ran.
+
+### The original report, kept as written
 
 Found 2026-09-15 by the RPC shape differential. **Not yet fixed** — recorded with
 its reproduction so it is not rediscovered from scratch.
