@@ -76,6 +76,30 @@ long rj_write(char* out, long cap, const rj_val* v, int pretty);
  * excl. NUL. For responses of unbounded size. NULL only on OOM. */
 char* rj_write_alloc(const rj_val* v, int pretty, long* len_out);
 
+/* Core reports EVERY positional argument whose type is wrong, in one object,
+ * in position order -- not just the first:
+ *
+ *   Wrong type passed:
+ *   {
+ *       "Position 1 (inputs)": "JSON value of type string is not of expected type array",
+ *       "Position 5 (version)": "JSON value of type string is not of expected type number"
+ *   }
+ *
+ * Measured against v31.1 on 2026-09-15 for createrawtransaction, createpsbt,
+ * getblockheader, gettxoutsetinfo, gettxspendingprevout, estimaterawfee and
+ * prioritisetransaction. A UNION-typed position (createrawtransaction's
+ * outputs, gettxoutsetinfo's hash_or_height) never appears in this object at
+ * all -- RPCHelpMan does not type it, so the body reports it later with the
+ * bare sentence. Check those AFTER rj_typeerr_fail, never inside the collection.
+ *
+ * Collect with rj_typeerr_add, then rj_typeerr_fail: it returns 1 and sets
+ * *ec/-3 and *em when anything was collected, 0 when nothing was. */
+typedef struct { char buf[2048]; int n; } rj_typeerrs;
+void rj_typeerr_init(rj_typeerrs* t);
+void rj_typeerr_add(rj_typeerrs* t, int position, const char* name,
+                    const rj_val* got, const char* expected);
+int  rj_typeerr_fail(rj_typeerrs* t, long* ec, const char** em);
+
 /* Core's argument-check vocabulary (univalue checkType via RPCHelpMan::Arg).
  * Measured against Core v31.1 on 2026-09-15: a method answers
  *   missing required argument -> -1  + the method's full help text
@@ -104,6 +128,13 @@ const char* rj_wrong_type_msg(char* buf, size_t cap, int position, const char* n
  * Both measured against v31.1 on 2026-09-15. Give buf at least 256 bytes. */
 const char* rj_wrong_field_type_msg(char* buf, size_t cap, const char* field,
                                     const rj_val* got, const char* expected);
+
+/* Core's THIRD shape: a UNION-typed argument (createrawtransaction's outputs,
+ * gettxoutsetinfo's hash_or_height) and a nested value inside a container get
+ * the bare sentence -- no wrapper, no position, no field:
+ *   JSON value of type number is not of expected type array
+ * Measured against v31.1 on 2026-09-15. Give buf at least 96 bytes. */
+const char* rj_wrong_type_msg_bare(char* buf, size_t cap, const rj_val* got, const char* expected);
 
 /* Deep-free a value tree. */
 void rj_free(rj_val* v);

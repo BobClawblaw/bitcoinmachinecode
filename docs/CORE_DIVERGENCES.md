@@ -228,6 +228,84 @@ is already there — `rpc_commands.c` builds the array and emits it when non-emp
 
 ---
 
+## ~~OPEN~~ FIXED 2026-09-15: `createrawtransaction` / `createpsbt` argument checking — and a rule the previous commit got wrong
+
+Closes the gap left open above. Two findings, one of which is not a message
+defect at all and one of which invalidates a claim made in the commit before.
+
+### The version argument was ignored, and two arguments were silently defaulted
+
+`createrawtransaction` **always emitted version 2** whatever position 5 said.
+A caller asking for a v3 (TRUC) transaction got a v2 one, with no error.
+`createpsbt` honoured version in its own copy of the parse, which accepted
+**4 and beyond** — Core's standard range is 1..3
+(`TX_MIN/MAX_STANDARD_VERSION`), so this node could build a transaction the
+network will not relay.
+
+Positions 3, 4 and 5 had **no type check at all**: the body tested
+`items[n]->typ == RJ_NUM` and fell through to the default when it was not. So
+
+```
+createrawtransaction [..] {..} "500000"      -> locktime 0, reported as SUCCESS
+createrawtransaction [..] {..} 0 "true"      -> non-replaceable, reported as SUCCESS
+```
+
+A string where a number belongs is an ordinary mistake, and the node answered
+it by building a **different transaction from the one asked for**. That is a
+silent wrong-output defect, not a wrong message, and no error-string test would
+have caught it — the round trips in `tests/test_rpc_rawtx.c` assert the version
+and locktime actually reach the serialized bytes.
+
+### Core reports EVERY failing position, not the first
+
+**The previous commit claimed "the lowest failing position wins." That was
+wrong.** Core collects every positional type failure into one object, in
+position order:
+
+```
+Wrong type passed:
+{
+    "Position 1 (inputs)": "JSON value of type string is not of expected type array",
+    "Position 3 (locktime)": "JSON value of type string is not of expected type number",
+    "Position 4 (replaceable)": "JSON value of type string is not of expected type bool",
+    "Position 5 (version)": "JSON value of type string is not of expected type number"
+}
+```
+
+The error came from reading probe output truncated to ~95 characters, which cut
+everything after the first entry. Two assertions written on that basis —
+`getblockheader 5 5` and `estimaterawfee "y" "x"` — checked only that the lower
+position *appeared*, which is also true of a message naming it alone, so they
+passed against code that dropped the rest. Both are corrected against the full
+message, and `rj_typeerrs` in `rpc_json.c` now accumulates. Every multi-position
+site was converted: `createrawtransaction`, `createpsbt`, `getblockheader`,
+`gettxoutsetinfo`, `gettxspendingprevout`, `estimaterawfee`,
+`prioritisetransaction`.
+
+**A UNION-typed position is never in that object.** `createrawtransaction`'s
+`outputs` (array or object) is not typed by `RPCHelpMan`, so it does not appear
+even when it is wrong — `[.., 5, "a"]` reports Position 3 **alone** — and the
+body reports it afterwards with the bare sentence. The union check therefore
+sits *after* the collection, never inside it. `gettxoutsetinfo`'s
+`hash_or_height` is the same shape; a nested value (an `inputs` entry that is
+not an object) also takes the bare sentence, and was `-8`.
+
+### Boundaries
+
+`version` is parsed as uint32 **first**: `-1` and `4294967296` are
+`-1 "JSON integer out of range"`, not `-8`; `0`, `4`, `2147483648` and
+`4294967295` are `-8 "Invalid parameter, version out of range(1~3)"`; `1` and
+`3` succeed. `locktime` stays int64-then-range, which this node already had.
+Arity is `-1`, not `-8`.
+
+**Verification.** 91 differential cases against the oracle across both methods,
+every position and every JSON type, plus 11 multi-position cases: `DIFFERS: 0`.
+The four remaining message differences are the missing-argument help text.
+Eight reintroductions, each watched to fail — including "report only the first
+position", which fails in all three suites.
+
+---
+
 ## ~~OPEN~~ FIXED 2026-09-15: the `Wrong type passed` wrapper at the remaining nine sites
 
 Follow-up to the error-code change below, which fixed four methods and left

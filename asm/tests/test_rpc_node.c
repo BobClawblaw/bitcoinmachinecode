@@ -1757,11 +1757,19 @@ int main(void){
           ck("...and on its own conf_target 0 is still the -8 range error",
              rc2 == 0 && e == -8 && m && strstr(m, "Invalid conf_target"));
           rj_free(r); rj_free(p); }
-        /* ...but a LOWER position's type still wins over a higher one's */
+        /* BOTH failing positions are reported, in one object, in position
+         * order. The assertion here used to read "the LOWER position wins" and
+         * checked only that Position 1 appeared -- which is true of a message
+         * that names Position 1 alone, so it passed against code that dropped
+         * Position 2. The claim came from reading truncated probe output.
+         * Corrected 2026-09-15 against the FULL message. */
         { p = rj_parse("[\"y\",\"x\"]", 9); r = NULL; e = 0; m = NULL;
           rc2 = rpc_node_dispatch("estimaterawfee", p, &r, &e, &m);
-          ck("both types bad -> the LOWER position wins (conf_target)",
-             rc2 == 0 && e == -3 && m && strstr(m, "\"Position 1 (conf_target)\""));
+          ck("both types bad -> BOTH positions, in one object, in order",
+             rc2 == 0 && e == -3 && m && !strcmp(m,
+               "Wrong type passed:\n{\n"
+               "    \"Position 1 (conf_target)\": \"JSON value of type string is not of expected type number\",\n"
+               "    \"Position 2 (threshold)\": \"JSON value of type string is not of expected type number\"\n}"));
           rj_free(r); rj_free(p); }
 
         /* getmempoolcluster: had -3 already, but hardcoded "null" and folded
