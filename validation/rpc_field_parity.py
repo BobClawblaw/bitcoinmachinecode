@@ -181,6 +181,28 @@ if PROOF:
 if RAWTX:
     CASES += [("signrawtransactionwithkey", [RAWTX, "[]"])]
 
+# --- 2026-09-15: the wallet block ------------------------------------------
+# These need a wallet loaded on BOTH sides. This node carries an implicit one
+# and answers without loading anything; Core does not, so the oracle needs
+# `loadwallet <name>` before this section means anything. If Core answers
+# "No wallet is loaded" the rows below are skipped, not reported as gaps -- an
+# unloaded wallet is a setup difference, not a divergence.
+#
+# READ-ONLY ONLY. fundrawtransaction, walletcreatefundedpsbt and friends can
+# LOCK coins in the wallet they are asked of, which is a state change to the
+# oracle; they stay in NEVER_CALL.
+if "No wallet" not in (raw(CORE, ["getwalletinfo"]) or "No wallet"):
+    CASES += [
+        ("getwalletinfo", []), ("getbalance", []), ("getbalances", []),
+        ("listtransactions", []), ("listunspent", []), ("listlabels", []),
+        ("listaddressgroupings", []), ("listlockunspent", []),
+        ("listreceivedbyaddress", ["0", "true"]),
+        ("listreceivedbylabel", ["0", "true"]),
+        ("listsinceblock", []), ("gethdkeys", []),
+        ("listdescriptors", []),
+        ("simulaterawtransaction", ['["%s"]' % RAWTX] if RAWTX else None),
+    ]
+
 # --- the guard this tool did not have, and should have ------------------------
 # 2026-09-12: a survey loop elsewhere invoked every Core method name against the
 # LIVE production node to see which were stubs. Invoking an API is not a

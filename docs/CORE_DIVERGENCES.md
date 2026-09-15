@@ -224,3 +224,30 @@ was written down, and finding it is the first step of the fix.
 **When fixing:** `complete` must mean "verified against the prevout", and an
 unresolvable input must appear in `errors` with Core's field set. The machinery
 is already there — `rpc_commands.c` builds the array and emits it when non-empty.
+
+---
+
+## Wallet-absent error code: this node answers `-4`, Core answers `-18`
+
+Found 2026-09-15, after loading a wallet on the oracle so the wallet methods
+could be diffed at all.
+
+With no wallet loaded, Core answers wallet RPCs with **`-18`**
+(`RPC_WALLET_NOT_FOUND`). This node answers **`-4`** with the message
+"No wallet is loaded".
+
+The message matches; the code does not. A caller branching on the numeric code
+— which is what the code is for — takes the wrong branch.
+
+**Not changed in the same pass that found it.** Ten call sites across
+`rpc_wallet_ops.c` return `-4`, and a returned error code is caller-visible
+behaviour: changing ten of them belongs in its own commit with its own release
+note, not bundled into a differential's findings. The same reasoning applied to
+the `-8` versus `-3` mismatch recorded above, which is still open.
+
+**What WAS fixed in that pass**, because it was a different and worse defect:
+seven of those sites reported **`-7 "out of memory"`** for a missing wallet.
+`wop_keyset_cached` returns NULL both when no wallet is loaded and when a malloc
+fails, and the call sites collapsed the two — telling an operator with no wallet
+that the node was out of RAM. They now distinguish the cases, and match the
+three sites in the same file that always answered correctly.
