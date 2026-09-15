@@ -2205,7 +2205,16 @@ static int cmd_rescanblockchain(const rj_val* params, const rpc_wallet* w,
     if (to < from) return wop_err(ec, em, -8, "Invalid stop_height: must be >= start_height");
 
     const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
-    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
+     * loaded, and a genuine allocation failure. Reporting both as "out of
+     * memory" told an operator with no wallet that the node was out of RAM.
+     * Three other sites in this file already answer "No wallet is loaded";
+     * these seven did not. Found 2026-09-15 by the RPC shape differential,
+     * once a wallet was loaded on the oracle so these calls could be diffed
+     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
+     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
+    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+                                       : wop_err(ec, em, -7, "out of memory");
     char pb[512]; const char* path = wop_path(WOP_SCAN_REL, pb, sizeof pb);
     static char err[256];
     long n = wscan_run(from, to, keys, nk, g_wops_read_block,
@@ -2274,7 +2283,16 @@ static int cmd_getreceivedbyaddress(const rj_val* params, const rpc_wallet* w,
     unsigned char want[20];
     if (!wop_addr_h160(addr, want, ec, em)) return 0;
     const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
-    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
+     * loaded, and a genuine allocation failure. Reporting both as "out of
+     * memory" told an operator with no wallet that the node was out of RAM.
+     * Three other sites in this file already answer "No wallet is loaded";
+     * these seven did not. Found 2026-09-15 by the RPC shape differential,
+     * once a wallet was loaded on the oracle so these calls could be diffed
+     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
+     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
+    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+                                       : wop_err(ec, em, -7, "out of memory");
     /* Core: an address the wallet does not own is an error, not a zero --
      * a zero would look like an owned address that received nothing. */
     int mine = 0;
@@ -2292,7 +2310,16 @@ static int cmd_getreceivedbylabel(const rj_val* params, const rpc_wallet* w,
     if (!label) return wop_err(ec, em, -8, "getreceivedbylabel requires a label");
     if (wop_need_scan(ec, em)) return 0;
     const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
-    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
+     * loaded, and a genuine allocation failure. Reporting both as "out of
+     * memory" told an operator with no wallet that the node was out of RAM.
+     * Three other sites in this file already answer "No wallet is loaded";
+     * these seven did not. Found 2026-09-15 by the RPC shape differential,
+     * once a wallet was loaded on the oracle so these calls could be diffed
+     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
+     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
+    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+                                       : wop_err(ec, em, -7, "out of memory");
     int minconf = wop_minconf_arg(params, 1, 1);
     char pb[512]; const char* lp = wop_path(WOP_LABELS_REL, pb, sizeof pb);
     int ln = lbl_count(lp), hits = 0;
@@ -2331,7 +2358,16 @@ static int cmd_listreceivedbyaddress(const rj_val* params, const rpc_wallet* w,
     if (params && params->typ == RJ_ARR && params->nitems >= 2 &&
         params->items[1]->typ == RJ_BOOL) include_empty = params->items[1]->str[0] == '1';
     const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
-    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
+     * loaded, and a genuine allocation failure. Reporting both as "out of
+     * memory" told an operator with no wallet that the node was out of RAM.
+     * Three other sites in this file already answer "No wallet is loaded";
+     * these seven did not. Found 2026-09-15 by the RPC shape differential,
+     * once a wallet was loaded on the oracle so these calls could be diffed
+     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
+     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
+    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+                                       : wop_err(ec, em, -7, "out of memory");
     /* Only keys that actually appear in the scan are candidates, unless the
      * caller asked for empties -- otherwise this would list 2000 addresses. */
     wscan_rec* recs; long n = wop_records(&recs);
@@ -2374,7 +2410,16 @@ static int cmd_listreceivedbylabel(const rj_val* params, const rpc_wallet* w,
     if (wop_need_scan(ec, em)) return 0;
     int minconf = wop_minconf_arg(params, 0, 1);
     const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
-    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
+     * loaded, and a genuine allocation failure. Reporting both as "out of
+     * memory" told an operator with no wallet that the node was out of RAM.
+     * Three other sites in this file already answer "No wallet is loaded";
+     * these seven did not. Found 2026-09-15 by the RPC shape differential,
+     * once a wallet was loaded on the oracle so these calls could be diffed
+     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
+     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
+    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+                                       : wop_err(ec, em, -7, "out of memory");
     char pb[512]; const char* lp = wop_path(WOP_LABELS_REL, pb, sizeof pb);
     int ln = lbl_count(lp);
     rj_val* arr = rj_arr();
@@ -2424,7 +2469,16 @@ static int cmd_listreceivedbylabel(const rj_val* params, const rpc_wallet* w,
 static int cmd_listaddressgroupings(const rpc_wallet* w, long* ec, const char** em, rj_val** res){
     if (wop_need_scan(ec, em)) return 0;
     const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
-    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
+     * loaded, and a genuine allocation failure. Reporting both as "out of
+     * memory" told an operator with no wallet that the node was out of RAM.
+     * Three other sites in this file already answer "No wallet is loaded";
+     * these seven did not. Found 2026-09-15 by the RPC shape differential,
+     * once a wallet was loaded on the oracle so these calls could be diffed
+     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
+     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
+    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+                                       : wop_err(ec, em, -7, "out of memory");
     wscan_rec* recs; long n = wop_records(&recs);
     rj_val* group = rj_arr();
     for (int i = 0; i < nk; i++){
@@ -2471,7 +2525,16 @@ static int cmd_listsinceblock(const rj_val* params, const rpc_wallet* w,
         if (since < 0) return wop_err(ec, em, -5, "Block not found");
     }
     const wscan_key* keys; int nk = wop_keyset_cached(w, &keys);
-    if (!keys) return wop_err(ec, em, -7, "out of memory");
+    /* wop_keyset_cached returns NULL for TWO different reasons: no wallet is
+     * loaded, and a genuine allocation failure. Reporting both as "out of
+     * memory" told an operator with no wallet that the node was out of RAM.
+     * Three other sites in this file already answer "No wallet is loaded";
+     * these seven did not. Found 2026-09-15 by the RPC shape differential,
+     * once a wallet was loaded on the oracle so these calls could be diffed
+     * at all. (Core answers -18 here, not -4; that mismatch is recorded in
+     * CORE_DIVERGENCES.md rather than changed across ten sites at once.) */
+    if (!keys) return (!w || !w->seed) ? wop_err(ec, em, -4, "No wallet is loaded")
+                                       : wop_err(ec, em, -7, "out of memory");
     wscan_rec* recs; long n = wop_records(&recs);
     rj_val* txs = rj_arr();
     static const char* HEX = "0123456789abcdef";
