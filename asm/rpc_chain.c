@@ -82,14 +82,6 @@
 #include <sys/stat.h>
 #include <limits.h>
 
-/* Core's positional argument type error: -3 with rj_wrong_type_msg's wrapper,
- * naming the position, the argument and the type ACTUALLY passed. Measured
- * against v31.1 on 2026-09-15; the same helper exists in rpc_node.c. */
-static int rpc_wrong_type(long* ec, const char** em, char* buf, size_t cap,
-                          int position, const char* name,
-                          const rj_val* got, const char* expected){
-    *ec = -3; *em = rj_wrong_type_msg(buf, cap, position, name, got, expected); return 0;
-}
 
 
 typedef unsigned char u8;
@@ -1524,16 +1516,13 @@ static int cmd_getblockheader(const rj_val* params, rj_val** res, long* ec, cons
      * which does the value work -- runs after. (Its own type refusal comes from
      * the shared rpc_param_str, which cannot name a position; the explicit
      * check below is what produces Core's message for this method.) */
-    static char tb[256];
+    rj_typeerrs te; rj_typeerr_init(&te);
     if (param_present(params, 0) && params->items[0]->typ != RJ_STR)
-        return rpc_wrong_type(ec, em, tb, sizeof tb, 1, "blockhash", params->items[0], "string");
-    int verbose = 1;
-    if (param_present(params, 1)){
-        const rj_val* e = params->items[1];
-        if (e->typ != RJ_BOOL)
-            return rpc_wrong_type(ec, em, tb, sizeof tb, 2, "verbose", e, "bool");
-        verbose = e->str[0] == '1';
-    }
+        rj_typeerr_add(&te, 1, "blockhash", params->items[0], "string");
+    if (param_present(params, 1) && params->items[1]->typ != RJ_BOOL)
+        rj_typeerr_add(&te, 2, "verbose", params->items[1], "bool");
+    if (rj_typeerr_fail(&te, ec, em)) return 0;
+    int verbose = param_present(params, 1) ? params->items[1]->str[0] == '1' : 1;
     if (!lookup_block_param(params, 0, 1, &h, ec, em)) return 0;
     if (!verbose){
         u8 hdr[80];
@@ -4560,12 +4549,14 @@ static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, con
      * These checks therefore sit ahead of the block-specific refusals below,
      * which are value errors. */
     if (params && params->typ == RJ_ARR){
-        static char tb[256];
-        if (params->nitems >= 1 && params->items[0]->typ != RJ_STR)
-            return rpc_wrong_type(ec, em, tb, sizeof tb, 1, "hash_type", params->items[0], "string");
+        rj_typeerrs te; rj_typeerr_init(&te);
+        if (params->nitems >= 1 && params->items[0]->typ != RJ_STR &&
+            params->items[0]->typ != RJ_NULL)
+            rj_typeerr_add(&te, 1, "hash_type", params->items[0], "string");
         if (params->nitems >= 3 && params->items[2]->typ != RJ_BOOL &&
             params->items[2]->typ != RJ_NULL)
-            return rpc_wrong_type(ec, em, tb, sizeof tb, 3, "use_index", params->items[2], "bool");
+            rj_typeerr_add(&te, 3, "use_index", params->items[2], "bool");
+        if (rj_typeerr_fail(&te, ec, em)) return 0;
     }
     if (params && params->typ == RJ_ARR && params->nitems >= 2 && params->items[1]->typ != RJ_NULL){   /* Core's order: the block-specific refusals first */
         if (params->items[0]->typ == RJ_STR && !strncmp(params->items[0]->str, "hash_serialized", 15)){

@@ -1266,15 +1266,17 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
     static char tbuf[256];
     if (!params || params->typ != RJ_ARR || params->nitems < 1){
         *ec = -1; *em = "gettxspendingprevout requires outputs"; return 0; }
-    if (params->items[0]->typ != RJ_ARR)
-        return rpc_wrong_type(ec, em, tbuf, sizeof tbuf, 1, "outputs", params->items[0], "array");
-    /* Core type-checks EVERY argument before ANY value: `gettxspendingprevout
-     * [] "x"` reports Position 2 (options), not the empty outputs. Measured
-     * against v31.1, 2026-09-15. So options' type is settled here, ahead of
-     * the outputs value checks below. */
-    if (params->nitems >= 2 && params->items[1]->typ != RJ_OBJ &&
-        params->items[1]->typ != RJ_NULL)
-        return rpc_wrong_type(ec, em, tbuf, sizeof tbuf, 2, "options", params->items[1], "object");
+    /* Core type-checks EVERY argument before ANY value and reports EVERY
+     * failing position in one object: `gettxspendingprevout [] "x"` is
+     * Position 2 (options), not the empty-outputs -8, and `["z","q"]` names
+     * both positions. Measured against v31.1, 2026-09-15. */
+    { rj_typeerrs te; rj_typeerr_init(&te);
+      if (params->items[0]->typ != RJ_ARR)
+          rj_typeerr_add(&te, 1, "outputs", params->items[0], "array");
+      if (params->nitems >= 2 && params->items[1]->typ != RJ_OBJ &&
+          params->items[1]->typ != RJ_NULL)
+          rj_typeerr_add(&te, 2, "options", params->items[1], "object");
+      if (rj_typeerr_fail(&te, ec, em)) return 0; }
     const rj_val* list = params->items[0];
     if (list->nitems == 0){
         *ec = -8; *em = "Invalid parameter, outputs are missing"; return 0; }
@@ -1748,24 +1750,25 @@ extern unsigned long long fest_estimate_raw(const void*, int, double, int, fest_
 extern unsigned fest_highest_target(const void*, int) __attribute__((weak));
 
 /* Core ParseConfirmTarget: "Invalid conf_target, must be between 1 and <max>" */
-/* position 1's arity + type only, so a caller can settle a later position's
- * type before this one's VALUE (see cmd_estimaterawfee) */
-static int fee_parse_target_type(const rj_val* params, const char* method,
-                                 long* ec, const char** em){
-    static char msg[256];
+/* position 1's arity alone, so a caller can collect a LATER position's type
+ * error alongside this one's before any value work (see cmd_estimaterawfee) */
+static int fee_parse_target_arity(const rj_val* params, const char* method,
+                                  long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 1){
         static char ubuf[96];
         snprintf(ubuf, sizeof ubuf, "%s requires conf_target", method);
         *ec = -1; *em = ubuf; return 0; }
-    if (params->items[0]->typ != RJ_NUM)
-        return rpc_wrong_type(ec, em, msg, sizeof msg, 1, "conf_target", params->items[0], "number");
     return 1;
 }
 static int fee_parse_target(const rj_val* params, const char* method, unsigned max_target,
                             long* ec, const char** em, int* out){
     static char msg[256];
-    if (!fee_parse_target_type(params, method, ec, em)) return 0;
+    if (!fee_parse_target_arity(params, method, ec, em)) return 0;
     const rj_val* v = params->items[0];
+    if (v->typ != RJ_NUM){
+        rj_typeerrs te; rj_typeerr_init(&te);
+        rj_typeerr_add(&te, 1, "conf_target", v, "number");
+        rj_typeerr_fail(&te, ec, em); return 0; }
     long t = atol(v->str);
     if (t < 1 || (unsigned long)t > max_target){
         snprintf(msg, sizeof msg, "Invalid conf_target, must be between 1 and %u", max_target);
@@ -1853,10 +1856,13 @@ static int cmd_estimaterawfee(const rj_val* params, rj_val** res, long* ec, cons
     double threshold = 0.95;
     const rj_val* tv = (params && params->typ == RJ_ARR && params->nitems >= 2 &&
                         params->items[1]->typ != RJ_NULL) ? params->items[1] : 0;
-    if (!fee_parse_target_type(params, "estimaterawfee", ec, em)) return 0;
-    if (tv && tv->typ != RJ_NUM){
-        static char msg[256];
-        return rpc_wrong_type(ec, em, msg, sizeof msg, 2, "threshold", tv, "number"); }
+    if (!fee_parse_target_arity(params, "estimaterawfee", ec, em)) return 0;
+    { rj_typeerrs te; rj_typeerr_init(&te);
+      if (params->items[0]->typ != RJ_NUM)
+          rj_typeerr_add(&te, 1, "conf_target", params->items[0], "number");
+      if (tv && tv->typ != RJ_NUM)
+          rj_typeerr_add(&te, 2, "threshold", tv, "number");
+      if (rj_typeerr_fail(&te, ec, em)) return 0; }
     if (!fee_parse_target(params, "estimaterawfee", max_target, ec, em, &target)) return 0;
     if (tv) threshold = atof(tv->str);
     if (threshold < 0 || threshold > 1){ *ec = -8; *em = "Invalid threshold"; return 0; }
@@ -2007,6 +2013,12 @@ static int pri_parse_txid(const rj_val* v, unsigned char txid[32], long* ec, con
 static int cmd_prioritisetransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 3){
         *ec = -1; *em = "prioritisetransaction requires txid, dummy, fee_delta"; return 0; }
+    { rj_typeerrs te; rj_typeerr_init(&te);
+      if (params->items[0]->typ != RJ_STR)
+          rj_typeerr_add(&te, 1, "txid", params->items[0], "string");
+      if (params->items[2]->typ != RJ_NUM)
+          rj_typeerr_add(&te, 3, "fee_delta", params->items[2], "number");
+      if (rj_typeerr_fail(&te, ec, em)) return 0; }
     unsigned char txid[32];
     if (!pri_parse_txid(params->items[0], txid, ec, em)) return 0;
     /* dummy must be 0/null (Core-exact message) */

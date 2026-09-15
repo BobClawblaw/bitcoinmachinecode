@@ -2118,9 +2118,17 @@ int main(void){
          * The second is the one this node got wrong: it resolved the blockhash
          * first, so a bad hash masked a bad verbose. A correct message at a
          * point the caller cannot reach is not a fix. */
+        /* BOTH failing positions are reported, in one object, in position order.
+         * This read "the LOWER position wins" and checked only that Position 1
+         * appeared -- true of a message naming Position 1 alone, so it passed
+         * against code that dropped Position 2. The claim came from reading
+         * truncated probe output; corrected against the FULL message. */
         r = call("getblockheader", "[5,5]", &ec, &em);
-        ck("getblockheader with BOTH types bad -> the LOWER position (blockhash)",
-           r == NULL && ec == -3 && em && strstr(em, "\"Position 1 (blockhash)\""));
+        ck("getblockheader with BOTH types bad -> BOTH positions, in one object",
+           r == NULL && ec == -3 && em && !strcmp(em,
+             "Wrong type passed:\n{\n"
+             "    \"Position 1 (blockhash)\": \"JSON value of type number is not of expected type string\",\n"
+             "    \"Position 2 (verbose)\": \"JSON value of type number is not of expected type bool\"\n}"));
         rj_free(r);
         r = call("getblockheader",
                  "[\"0000000000000000000000000000000000000000000000000000000000000001\",5]", &ec, &em);
@@ -2153,6 +2161,13 @@ int main(void){
         r = call("gettxoutsetinfo", "[\"bogus\"]", &ec, &em);
         ck("...and on its own an invalid hash_type is still the -8 value error",
            r == NULL && ec == -8 && em && strstr(em, "is not a valid hash_type"));
+        rj_free(r);
+        r = call("gettxoutsetinfo", "[5,null,\"q\"]", &ec, &em);
+        ck("gettxoutsetinfo with positions 1 AND 3 bad -> both, in one object",
+           r == NULL && ec == -3 && em && !strcmp(em,
+             "Wrong type passed:\n{\n"
+             "    \"Position 1 (hash_type)\": \"JSON value of type number is not of expected type string\",\n"
+             "    \"Position 3 (use_index)\": \"JSON value of type string is not of expected type bool\"\n}"));
         rj_free(r);
     }
 

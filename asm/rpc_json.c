@@ -498,3 +498,28 @@ const char* rj_wrong_field_type_msg(char* buf, size_t cap, const char* field,
                  rj_type_name(got), field, expected);
     return buf;
 }
+
+const char* rj_wrong_type_msg_bare(char* buf, size_t cap, const rj_val* got, const char* expected) {
+    snprintf(buf, cap, "JSON value of type %s is not of expected type %s",
+             rj_type_name(got), expected);
+    return buf;
+}
+
+void rj_typeerr_init(rj_typeerrs* t) { t->buf[0] = 0; t->n = 0; }
+
+void rj_typeerr_add(rj_typeerrs* t, int position, const char* name,
+                    const rj_val* got, const char* expected) {
+    size_t at = strlen(t->buf);
+    if (at + 200 >= sizeof t->buf) return;              /* keep what fits */
+    snprintf(t->buf + at, sizeof t->buf - at,
+             "%s    \"Position %d (%s)\": \"JSON value of type %s is not of expected type %s\"",
+             t->n ? ",\n" : "", position, name, rj_type_name(got), expected);
+    t->n++;
+}
+
+int rj_typeerr_fail(rj_typeerrs* t, long* ec, const char** em) {
+    static char out[2048 + 32];
+    if (!t->n) return 0;
+    snprintf(out, sizeof out, "Wrong type passed:\n{\n%s\n}", t->buf);
+    *ec = -3; *em = out; return 1;
+}

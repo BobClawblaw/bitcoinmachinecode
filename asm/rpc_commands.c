@@ -932,10 +932,57 @@ static long crt_varint(unsigned char* o, unsigned long long v){
  * request with enough of them cannot run off the end either. */
 #define CRT_NEED(k) do{ if ((long)(k) < 0 || n + (long)(k) > cap){ \
         *ec=-8; *em="Transaction too large for this node's builder"; return 0; } }while(0)
+/* createrawtransaction and createpsbt share positions 1-5 exactly:
+ *   1 inputs (array)  2 outputs (array|object)  3 locktime (number)
+ *   4 replaceable (bool)  5 version (number)
+ * and Core checks EVERY position's TYPE before ANY position's VALUE, lowest
+ * failing position first. Measured against v31.1, 2026-09-15, for both methods
+ * and every JSON type.
+ *
+ * Positions 3, 4 and 5 had NO type check at all: the body tested
+ * `items[n]->typ == RJ_NUM` and fell through to the default when it was not.
+ * So `locktime: "500000"` -- a string, an ordinary mistake -- built a
+ * transaction with locktime 0 and reported success, and `replaceable: "true"`
+ * built a non-replaceable one. That is not a message defect; the node returned
+ * a DIFFERENT TRANSACTION from the one asked for, silently.
+ *
+ * Position 2 is a union (array or object), so Core emits its third message
+ * shape there: the bare sentence, no wrapper and no position. A null output
+ * argument is a VALUE error with its own text. */
+static int crt_typecheck(const rj_val* params, const char* method, int psbt_pos,
+                         long* ec, const char** em){
+    static char tb[256];
+    if (!params || params->typ!=RJ_ARR || params->nitems<2){
+        static char ub[96];
+        snprintf(ub, sizeof ub, "%s requires inputs and outputs", method);
+        *ec=-1; *em=ub; return 0; }
+    /* every failing position, in position order, in ONE message */
+    rj_typeerrs te; rj_typeerr_init(&te);
+    if (params->items[0]->typ!=RJ_ARR)
+        rj_typeerr_add(&te, 1, "inputs", params->items[0], "array");
+    if (params->nitems>=3 && params->items[2]->typ!=RJ_NULL && params->items[2]->typ!=RJ_NUM)
+        rj_typeerr_add(&te, 3, "locktime", params->items[2], "number");
+    if (params->nitems>=4 && params->items[3]->typ!=RJ_NULL && params->items[3]->typ!=RJ_BOOL)
+        rj_typeerr_add(&te, 4, "replaceable", params->items[3], "bool");
+    if (params->nitems>=5 && params->items[4]->typ!=RJ_NULL && params->items[4]->typ!=RJ_NUM)
+        rj_typeerr_add(&te, 5, "version", params->items[4], "number");
+    if (psbt_pos > 0 && params->nitems > (size_t)(psbt_pos-1) &&
+        params->items[psbt_pos-1]->typ!=RJ_NULL && params->items[psbt_pos-1]->typ!=RJ_NUM)
+        rj_typeerr_add(&te, psbt_pos, "psbt_version", params->items[psbt_pos-1], "number");
+    if (rj_typeerr_fail(&te, ec, em)) return 0;
+    /* position 2 is a UNION (array or object), so it is NOT part of the object
+     * above -- Core's RPCHelpMan does not type a union, and the body reports it
+     * afterwards with the bare sentence. Verified: `createrawtransaction [..] 5
+     * "a"` reports Position 3 ALONE, never the bad outputs. */
+    if (params->items[1]->typ==RJ_NULL){
+        *ec=-8; *em="Invalid parameter, output argument must be non-null"; return 0; }
+    if (params->items[1]->typ!=RJ_ARR && params->items[1]->typ!=RJ_OBJ){
+        *ec=-3; *em=rj_wrong_type_msg_bare(tb, sizeof tb, params->items[1], "array"); return 0; }
+    return 1;
+}
 static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long cap, long* out_n,
                               size_t* out_nin, size_t* out_nout, long* ec, const char** em){
-    if (!params || params->typ!=RJ_ARR || params->nitems<2 || params->items[0]->typ!=RJ_ARR){
-        *ec=-8; *em="Invalid parameters, expected an inputs array and outputs"; return 0; }
+    if (!crt_typecheck(params, "createrawtransaction", 0, ec, em)) return 0;
     const rj_val* ins = params->items[0];
     const rj_val* outs = params->items[1];
     long long locktime=0;
@@ -953,13 +1000,36 @@ static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long cap,
     if (params->nitems>=4 && params->items[3]->typ==RJ_BOOL) replaceable=(params->items[3]->str[0]=='1');
     unsigned long defseq = replaceable ? 0xfffffffdUL : (locktime!=0 ? 0xfffffffeUL : 0xffffffffUL);
 
+    /* THE VERSION ARGUMENT WAS IGNORED. createrawtransaction always emitted
+     * version 2 whatever position 5 said -- a caller asking for a v3 (TRUC)
+     * transaction got a v2 one and no error. createpsbt did honour it, in its
+     * own copy of the parse, which also accepted 4 and beyond: Core's standard
+     * range is 1..3 (TX_MIN/MAX_STANDARD_VERSION), so this node could build a
+     * transaction the network will not relay. Both now go through here.
+     *
+     * Core parses the argument as uint32 FIRST -- a negative or a value past
+     * 0xffffffff is -1 "JSON integer out of range", not -8 -- and range-checks
+     * it second. Boundaries measured on the oracle: -1 and 4294967296 give -1;
+     * 0, 4, 2147483648 and 4294967295 give -8; 1 and 3 succeed. */
+    long version = 2;
+    if (params->nitems>=5 && params->items[4]->typ==RJ_NUM){
+        errno = 0; char* vend = 0;
+        long long v = strtoll(params->items[4]->str, &vend, 10);
+        if (errno == ERANGE || (vend && *vend) || v < 0 || v > 0xffffffffLL){
+            *ec=-1; *em="JSON integer out of range"; return 0; }
+        if (v < 1 || v > 3){
+            *ec=-8; *em="Invalid parameter, version out of range(1~3)"; return 0; }
+        version = (long)v;
+    }
     long n=0;
-    tx[n++]=2; tx[n++]=0; tx[n++]=0; tx[n++]=0;                 /* version 2 LE */
+    tx[n++]=(unsigned char)version; tx[n++]=0; tx[n++]=0; tx[n++]=0;   /* version LE */
     CRT_NEED(9);
     n += crt_varint(tx+n, (unsigned long long)ins->nitems);
     for (size_t i=0;i<ins->nitems;i++){
         const rj_val* in=ins->items[i];
-        if (in->typ!=RJ_OBJ){ *ec=-8; *em="Invalid parameter, expected input object"; return 0; }
+        /* a nested value gets Core's bare sentence: no wrapper, no position */
+        if (in->typ!=RJ_OBJ){ static char nb[96];
+            *ec=-3; *em=rj_wrong_type_msg_bare(nb, sizeof nb, in, "object"); return 0; }
         rj_val* tid=rj_obj_get(in,"txid"); rj_val* vout=rj_obj_get(in,"vout");
         if (!tid||tid->typ!=RJ_STR||strlen(tid->str)!=64||!vout||vout->typ!=RJ_NUM){
             *ec=-8; *em="Invalid parameter, missing/invalid txid or vout"; return 0; }
@@ -1102,12 +1172,10 @@ static int psbt_version_type(const rj_val* params, unsigned long idx, long* ec, 
 static char* psbt_wrap_version(const unsigned char* tx, long n, size_t nin, size_t nout, int ver);
 static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     static unsigned char tx[131072]; long n; size_t nin, nout;
-    if (!psbt_version_type(params, 5, ec, em)) return 0;        /* type before body */
+    /* positions 1-5 are checked before position 6: Core reports the LOWEST
+     * failing position, so `createpsbt ... "x" "y"` is Position 5 (version) */
+    if (!crt_typecheck(params, "createpsbt", 6, ec, em)) return 0;   /* 1-5 and 6 together */
     if (!crt_build_unsigned(params, tx, (long)sizeof tx, &n, &nin, &nout, ec, em)) return 0;
-    if (params->nitems >= 5 && params->items[4]->typ == RJ_NUM){                /* Core: tx version */
-        long v = strtol(params->items[4]->str, 0, 10);
-        if (v < 1 || v > 0x7fffffffL){ *ec = -8; *em = "Invalid parameter, version must be between 1 and 2147483647"; return 0; }
-        psbt_wr32(tx, (unsigned)v); }
     int ver; if (!psbt_version_arg(params, 5, &ver, ec, em)) return 0;
     char* b64=psbt_wrap_version(tx,n,nin,nout,ver); if (!b64){ *ec=-7; *em="oom"; return 0; }
     *result=rj_str(b64); free(b64);

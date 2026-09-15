@@ -546,6 +546,173 @@ int main(void){
       }
     }
 
+
+    /* ---- createrawtransaction / createpsbt argument checking --------------
+     * Positions 1-5 are identical in both methods (inputs, outputs, locktime,
+     * replaceable, version). Measured against Core v31.1 on 2026-09-15 for
+     * every JSON type at every position.
+     *
+     * THE WORST OF IT WAS NOT A MESSAGE. Positions 3, 4 and 5 had no type
+     * check at all -- the body tested `items[n]->typ == RJ_NUM` and fell
+     * through to the default when it was not. So `locktime: "500000"` (a
+     * string: an ordinary mistake) built a transaction with locktime 0 and
+     * reported SUCCESS, and `replaceable: "true"` built a non-replaceable one.
+     * And createrawtransaction IGNORED position 5 entirely: it always emitted
+     * version 2, so a caller asking for a v3 (TRUC) transaction got a v2 one
+     * with no error. createpsbt honoured version in its own copy of the parse,
+     * which accepted 4 and beyond -- Core's standard range is 1..3, so this
+     * node could build a transaction the network will not relay.
+     *
+     * Those are silent wrong-output defects. The round trips below are the
+     * assertions that catch them; a test that only checked error strings would
+     * pass against a node that still ignored the arguments. */
+    { rpc_wallet w; memset(&w,0,sizeof w);
+      const char* TYPED[] = { "null", "5", "\"x\"", "true", "[]", "{}" };
+      const char* TNAME[] = { "null", "number", "string", "bool", "array", "object" };
+      const char* IN  = "[{\"txid\":\"0000000000000000000000000000000000000000000000000000000000000001\",\"vout\":0}]";
+      const char* OUT = "{\"bc1q249cv27lc2q7y0x53vkczgfvvgsjzhwxwv42gc\":0.001}";
+      const char* M[] = { "createrawtransaction", "createpsbt" };
+      char pb[900], want[400], lbl[220];
+
+      #define ONE(POS, NAME, EXP, TI) \
+          snprintf(want, sizeof want, \
+            "Wrong type passed:\n{\n    \"Position %d (%s)\": \"JSON value of type %s " \
+            "is not of expected type %s\"\n}", (POS), (NAME), TNAME[TI], (EXP))
+      #define RUN(METHOD, PARAMS) \
+          rj_val* p = rj_parse((PARAMS), strlen(PARAMS)); rj_val* r = NULL; \
+          long e = 0; const char* m = NULL; \
+          int rc = rpc_dispatch((METHOD), p, &w, &r, &e, &m)
+
+      for (int mi = 0; mi < 2; mi++){
+        for (int t = 0; t < 6; t++){
+          if (strcmp(TNAME[t], "array")){                       /* position 1 */
+              snprintf(pb, sizeof pb, "[%s,%s]", TYPED[t], OUT);
+              { RUN(M[mi], pb); ONE(1, "inputs", "array", t);
+                snprintf(lbl, sizeof lbl, "%s inputs=%s -> Position 1", M[mi], TNAME[t]);
+                ck(lbl, rc == 0 && e == -3 && m && !strcmp(m, want));
+                rj_free(r); rj_free(p); } }
+          if (strcmp(TNAME[t], "number") && strcmp(TNAME[t], "null")){   /* position 3 */
+              snprintf(pb, sizeof pb, "[%s,%s,%s]", IN, OUT, TYPED[t]);
+              { RUN(M[mi], pb); ONE(3, "locktime", "number", t);
+                snprintf(lbl, sizeof lbl, "%s locktime=%s -> Position 3 (was SILENTLY IGNORED)", M[mi], TNAME[t]);
+                ck(lbl, rc == 0 && e == -3 && m && !strcmp(m, want));
+                rj_free(r); rj_free(p); } }
+          if (strcmp(TNAME[t], "bool") && strcmp(TNAME[t], "null")){     /* position 4 */
+              snprintf(pb, sizeof pb, "[%s,%s,0,%s]", IN, OUT, TYPED[t]);
+              { RUN(M[mi], pb); ONE(4, "replaceable", "bool", t);
+                snprintf(lbl, sizeof lbl, "%s replaceable=%s -> Position 4 (was SILENTLY IGNORED)", M[mi], TNAME[t]);
+                ck(lbl, rc == 0 && e == -3 && m && !strcmp(m, want));
+                rj_free(r); rj_free(p); } }
+          if (strcmp(TNAME[t], "number") && strcmp(TNAME[t], "null")){   /* position 5 */
+              snprintf(pb, sizeof pb, "[%s,%s,0,false,%s]", IN, OUT, TYPED[t]);
+              { RUN(M[mi], pb); ONE(5, "version", "number", t);
+                snprintf(lbl, sizeof lbl, "%s version=%s -> Position 5 (was SILENTLY IGNORED)", M[mi], TNAME[t]);
+                ck(lbl, rc == 0 && e == -3 && m && !strcmp(m, want));
+                rj_free(r); rj_free(p); } }
+        }
+        /* position 2 is a UNION (array or object): Core's THIRD shape, a bare
+         * sentence with no wrapper and no position -- and it is NOT part of the
+         * object above, so a bad outputs alongside a bad locktime reports the
+         * locktime ALONE. That asymmetry is the whole reason the union check
+         * sits after the collection rather than inside it. */
+        for (int t = 1; t < 4; t++){
+            snprintf(pb, sizeof pb, "[%s,%s]", IN, TYPED[t]);
+            { RUN(M[mi], pb);
+              snprintf(want, sizeof want,
+                "JSON value of type %s is not of expected type array", TNAME[t]);
+              snprintf(lbl, sizeof lbl, "%s outputs=%s -> the BARE sentence (a union has no position)", M[mi], TNAME[t]);
+              ck(lbl, rc == 0 && e == -3 && m && !strcmp(m, want));
+              rj_free(r); rj_free(p); } }
+        snprintf(pb, sizeof pb, "[%s,null]", IN);
+        { RUN(M[mi], pb);
+          snprintf(lbl, sizeof lbl, "%s outputs=null -> the -8 value error, not a type error", M[mi]);
+          ck(lbl, rc == 0 && e == -8 && m && !strcmp(m, "Invalid parameter, output argument must be non-null"));
+          rj_free(r); rj_free(p); }
+        snprintf(pb, sizeof pb, "[%s,5,\"a\"]", IN);
+        { RUN(M[mi], pb);
+          snprintf(lbl, sizeof lbl, "%s bad outputs + bad locktime -> the LOCKTIME alone (the union is excluded)", M[mi]);
+          ck(lbl, rc == 0 && e == -3 && m && strstr(m, "Position 3 (locktime)") && !strstr(m, "Position 2"));
+          rj_free(r); rj_free(p); }
+
+        /* EVERY failing position, in one object, in position order */
+        snprintf(pb, sizeof pb, "[\"z\",%s,\"a\",\"q\",\"x\"]", OUT);
+        { RUN(M[mi], pb);
+          snprintf(want, sizeof want,
+            "Wrong type passed:\n{\n"
+            "    \"Position 1 (inputs)\": \"JSON value of type string is not of expected type array\",\n"
+            "    \"Position 3 (locktime)\": \"JSON value of type string is not of expected type number\",\n"
+            "    \"Position 4 (replaceable)\": \"JSON value of type string is not of expected type bool\",\n"
+            "    \"Position 5 (version)\": \"JSON value of type string is not of expected type number\"\n}");
+          snprintf(lbl, sizeof lbl, "%s four bad positions -> ALL FOUR in one object, in order", M[mi]);
+          ck(lbl, rc == 0 && e == -3 && m && !strcmp(m, want));
+          rj_free(r); rj_free(p); }
+
+        /* arity: Core answers -1, not -8 */
+        { RUN(M[mi], "[]");
+          snprintf(lbl, sizeof lbl, "%s with no arguments -> -1", M[mi]);
+          ck(lbl, rc == 0 && e == -1 && m && strstr(m, "requires inputs and outputs"));
+          rj_free(r); rj_free(p); }
+
+        /* an inputs ENTRY that is not an object: a nested value, so the bare
+           sentence again -- it was -8 "Invalid parameter, expected input object" */
+        snprintf(pb, sizeof pb, "[[5],%s]", OUT);
+        { RUN(M[mi], pb);
+          snprintf(lbl, sizeof lbl, "%s inputs entry not an object -> -3 bare sentence, not -8", M[mi]);
+          ck(lbl, rc == 0 && e == -3 && m &&
+             !strcmp(m, "JSON value of type number is not of expected type object"));
+          rj_free(r); rj_free(p); }
+
+        /* version VALUE boundaries. Core parses it as uint32 FIRST (a negative
+           or a value past 0xffffffff is -1 "JSON integer out of range") and
+           range-checks 1..3 second. */
+        { const long long BAD1[] = { -1, 4294967296LL };
+          for (int i = 0; i < 2; i++){
+            snprintf(pb, sizeof pb, "[%s,%s,0,false,%lld]", IN, OUT, BAD1[i]);
+            { RUN(M[mi], pb);
+              snprintf(lbl, sizeof lbl, "%s version=%lld -> -1 JSON integer out of range", M[mi], BAD1[i]);
+              ck(lbl, rc == 0 && e == -1 && m && !strcmp(m, "JSON integer out of range"));
+              rj_free(r); rj_free(p); } } }
+        { const long long BAD8[] = { 0, 4, 2147483648LL, 4294967295LL };
+          for (int i = 0; i < 4; i++){
+            snprintf(pb, sizeof pb, "[%s,%s,0,false,%lld]", IN, OUT, BAD8[i]);
+            { RUN(M[mi], pb);
+              snprintf(lbl, sizeof lbl, "%s version=%lld -> -8 out of range(1~3)", M[mi], BAD8[i]);
+              ck(lbl, rc == 0 && e == -8 && m &&
+                 !strcmp(m, "Invalid parameter, version out of range(1~3)"));
+              rj_free(r); rj_free(p); } } }
+      }
+
+      /* THE ROUND TRIPS. These are what catch a silently ignored argument: the
+       * version must actually reach the serialized transaction. createraw-
+       * transaction emitted 02000000 for every value of position 5. */
+      { const int V[] = { 1, 2, 3 };
+        const char* PFX[] = { "01000000", "02000000", "03000000" };
+        for (int i = 0; i < 3; i++){
+            snprintf(pb, sizeof pb, "[%s,%s,0,false,%d]", IN, OUT, V[i]);
+            { RUN("createrawtransaction", pb);
+              snprintf(lbl, sizeof lbl,
+                "createrawtransaction version=%d actually EMITS version %d", V[i], V[i]);
+              ck(lbl, rc == 1 && r && r->typ == RJ_STR && !strncmp(r->str, PFX[i], 8));
+              if (rc == 1 && r && r->typ == RJ_STR && strncmp(r->str, PFX[i], 8))
+                  printf("     got prefix: %.8s  want: %s\n", r->str, PFX[i]);
+              rj_free(r); rj_free(p); } } }
+      /* and the default is still 2 when the argument is absent */
+      { snprintf(pb, sizeof pb, "[%s,%s]", IN, OUT);
+        RUN("createrawtransaction", pb);
+        ck("createrawtransaction with no version still defaults to 2",
+           rc == 1 && r && r->typ == RJ_STR && !strncmp(r->str, "02000000", 8));
+        rj_free(r); rj_free(p); }
+      /* locktime reaches the transaction too (last 4 bytes, LE) */
+      { snprintf(pb, sizeof pb, "[%s,%s,500000]", IN, OUT);
+        RUN("createrawtransaction", pb);
+        size_t L = (rc == 1 && r && r->typ == RJ_STR) ? strlen(r->str) : 0;
+        ck("createrawtransaction locktime=500000 reaches the serialized tx",
+           L >= 8 && !strcmp(r->str + L - 8, "20a10700"));
+        rj_free(r); rj_free(p); }
+      #undef RUN
+      #undef ONE
+    }
+
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);
     return fails?1:0;
 }
