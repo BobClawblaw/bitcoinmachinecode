@@ -205,7 +205,8 @@ signrawtransactionwithkey "$RAW" '[]'
 | error text | `Input not found or already spent` | — |
 
 Core's `errors` entries carry `txid`, `vout`, `witness`, `scriptSig`,
-`sequence` and `error`. This node emits none of them.
+`sequence` and `error`. This node emits none of them. **All six are emitted as of
+2026-09-15**, in Core's order.
 
 **Why it matters beyond the missing field.** `complete: true` is a statement
 that every input carries a valid signature verified against its prevout. When
@@ -279,9 +280,28 @@ three sites in the same file that always answered correctly.
 > — asserting only on `complete` or the error count would pass against a signer
 > that still dropped the data.
 >
-> **Still open from the same report:** the `errors` entries do not yet carry
-> Core's `witness` and `scriptSig` fields. The data they need is now parsed and
-> available, so that is a small follow-up rather than the blocked item it was.
+> **Also from the same report, CLOSED 2026-09-15:** the `errors` entries now
+> carry Core's `witness` and `scriptSig`, in Core's field order — `txid`,
+> `vout`, `witness`, `scriptSig`, `sequence`, `error`
+> (`rpc/rawtransaction_util.cpp` `TxInErrorToJSON`). They were unimplementable
+> until the parse above started keeping that data.
+>
+> The subtle part is WHICH bytes an entry reports. Core builds the array from
+> the final `mtx` — `TxInErrorToJSON` reads the fields off `mtx.vin[i]` after
+> `UpdateInput` has written back whatever sigdata was produced — so a partially
+> signed input reports its partial data and an input nothing could be done with
+> reports the bytes it arrived with. These must be the same bytes the function
+> is about to serialize into `hex` for that input, never the bare values.
+>
+> Differentially verified against Core v31.1 on 12 real mainnet transactions
+> from blocks 966,000–966,002: all 12 identical **including key order**. The
+> coverage that matters is a 5-input transaction where only one input is
+> P2SH-P2WPKH — scriptSig and witness on the SAME input, which is where a
+> single is-this-segwit flag goes wrong. Two of those are frozen in
+> `tests/test_rpc_signraw.c` with Core's own compact JSON, so order is pinned
+> as well as the values. Three reintroductions each fail both fixtures: drop
+> the fields; report the witness from our own buffer only; report the scriptSig
+> from our own buffer only.
 
 ### The original report, kept as written
 
