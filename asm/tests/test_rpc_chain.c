@@ -2083,6 +2083,79 @@ int main(void){
     r = call("stop", "[]", &ec, &em); ck_str("stop reply", r ? r->str : NULL, "Bitcoin Machine Code stopping"); rj_free(r);
     ck("stop invoked the handler", g_stopped == 1);
 
+
+    /* ---- Core's "Wrong type passed" wrapper on the chain methods ----------
+     * getblockheader's verbose and gettxoutsetinfo's hash_type had the right
+     * CODE (-3) and a hand-written message that hardcoded the passed type as
+     * "number", so any other type was misreported. Measured against Core v31.1
+     * on 2026-09-15 for every JSON type.
+     *
+     * These two cannot be reached through the plain rpc_dispatch harness: the
+     * chain dispatcher answers -28 "Loading block index..." until a chain is
+     * open, which is Core's own warm-up behaviour. They are asserted HERE
+     * because this suite opens a real chain fixture. */
+    {
+        const char* TYPED[] = { "null", "5", "\"x\"", "true", "[]", "{}" };
+        const char* TNAME[] = { "null", "number", "string", "bool", "array", "object" };
+        char want[256], lbl[200], pb[256];
+        const char* GEN = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+
+        for (int t = 0; t < 6; t++){
+            if (!strcmp(TNAME[t], "bool") || !strcmp(TNAME[t], "null")) continue;
+            snprintf(pb, sizeof pb, "[\"%s\",%s]", GEN, TYPED[t]);
+            r = call("getblockheader", pb, &ec, &em);
+            snprintf(want, sizeof want,
+                "Wrong type passed:\n{\n    \"Position 2 (verbose)\": \"JSON value of type %s "
+                "is not of expected type bool\"\n}", TNAME[t]);
+            snprintf(lbl, sizeof lbl, "getblockheader verbose=%s -> Position 2 (verbose)", TNAME[t]);
+            ck(lbl, r == NULL && ec == -3 && em && !strcmp(em, want));
+            rj_free(r);
+        }
+        /* THE ORDER. Core type-checks every argument before running the body,
+         * and the lowest failing position wins:
+         *   getblockheader 5 5            -> Position 1 (blockhash)
+         *   getblockheader <unknown> 5    -> Position 2 (verbose), NOT the hash
+         * The second is the one this node got wrong: it resolved the blockhash
+         * first, so a bad hash masked a bad verbose. A correct message at a
+         * point the caller cannot reach is not a fix. */
+        r = call("getblockheader", "[5,5]", &ec, &em);
+        ck("getblockheader with BOTH types bad -> the LOWER position (blockhash)",
+           r == NULL && ec == -3 && em && strstr(em, "\"Position 1 (blockhash)\""));
+        rj_free(r);
+        r = call("getblockheader",
+                 "[\"0000000000000000000000000000000000000000000000000000000000000001\",5]", &ec, &em);
+        ck("getblockheader unknown hash + bad verbose TYPE -> Position 2, not -5 Block not found",
+           r == NULL && ec == -3 && em && strstr(em, "\"Position 2 (verbose)\""));
+        rj_free(r);
+        r = call("getblockheader",
+                 "[\"0000000000000000000000000000000000000000000000000000000000000001\"]", &ec, &em);
+        ck("...and on its own an unknown hash is still Block not found",
+           r == NULL && ec == -5);
+        rj_free(r);
+
+        for (int t = 0; t < 6; t++){
+            if (!strcmp(TNAME[t], "string") || !strcmp(TNAME[t], "null")) continue;
+            snprintf(pb, sizeof pb, "[%s]", TYPED[t]);
+            r = call("gettxoutsetinfo", pb, &ec, &em);
+            snprintf(want, sizeof want,
+                "Wrong type passed:\n{\n    \"Position 1 (hash_type)\": \"JSON value of type %s "
+                "is not of expected type string\"\n}", TNAME[t]);
+            snprintf(lbl, sizeof lbl, "gettxoutsetinfo hash_type=%s -> Position 1 (hash_type)", TNAME[t]);
+            ck(lbl, r == NULL && ec == -3 && em && !strcmp(em, want));
+            rj_free(r);
+        }
+        /* use_index sits at position 3 and had no type check at all: a bad
+         * hash_type VALUE at position 1 was reported instead of it */
+        r = call("gettxoutsetinfo", "[\"bogus\",null,\"x\"]", &ec, &em);
+        ck("gettxoutsetinfo invalid hash_type VALUE + bad use_index TYPE -> Position 3",
+           r == NULL && ec == -3 && em && strstr(em, "\"Position 3 (use_index)\""));
+        rj_free(r);
+        r = call("gettxoutsetinfo", "[\"bogus\"]", &ec, &em);
+        ck("...and on its own an invalid hash_type is still the -8 value error",
+           r == NULL && ec == -8 && em && strstr(em, "is not a valid hash_type"));
+        rj_free(r);
+    }
+
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

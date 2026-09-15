@@ -485,6 +485,67 @@ int main(void){
       ck("RPX-6 locktime 0xffffffff (the boundary) is accepted", r && r->typ==RJ_STR);
       rj_free(r); }
 
+
+    /* ---- psbt_version: Core's wrapper, and the stage it is checked at -----
+     * psbt_version_arg had the right CODE and a hand-written message that
+     * hardcoded the type as "string". Worse, it ran at the END of both
+     * methods, so the -3 was UNREACHABLE for any transaction that failed to
+     * decode or carried signatures -- the body's error came first.
+     *
+     * Core splits the two stages (measured against v31.1, 2026-09-15, with a
+     * real signed mainnet transaction):
+     *   converttopsbt <signed tx> false true "x" -> -3  Position 4 (psbt_version)
+     *   converttopsbt <signed tx> false true 7   -> -22 Inputs must not have scriptSigs
+     * a bad TYPE beats the body, a bad VALUE loses to it. */
+    { rpc_wallet w; memset(&w,0,sizeof w);
+      const char* TYPED[] = { "5", "\"x\"", "true", "[]", "{}" };
+      const char* TNAME[] = { "number", "string", "bool", "array", "object" };
+      /* a SIGNED transaction: the body would refuse it with -22, so anything
+         reported here proves the type stage ran first */
+      const char* SIGNED = "02000000010100000000000000000000000000000000000000000000000000000000000000000000006b483045022100d9836bd05f96d48ac2540efe54033e1e1576c92212bfd116b63eea1669ff06ea02207f686907e6d374de78bd500cb6d4d26cd20e2aef4206c7a0b37e3745f7ad56aa0121034f355bdcb7cc0af728ef3cceb9615d90684bb5b2ca5f859ab0f0b704075871aafdffffff01605af405000000001976a914fc7250a211deddc70ee5a2738de5f07817351cef88ac00000000";
+      char pb[1200], want[256], lbl[200];
+      for (int t = 1; t < 5; t++){          /* skip "number": that is the valid type */
+          snprintf(pb, sizeof pb, "[\"%s\",false,true,%s]", SIGNED, TYPED[t]);
+          rj_val* p = rj_parse(pb, strlen(pb)); rj_val* r = NULL; long e = 0; const char* m = NULL;
+          int rc = rpc_dispatch("converttopsbt", p, &w, &r, &e, &m);
+          snprintf(want, sizeof want,
+              "Wrong type passed:\n{\n    \"Position 4 (psbt_version)\": \"JSON value of type %s "
+              "is not of expected type number\"\n}", TNAME[t]);
+          snprintf(lbl, sizeof lbl,
+              "converttopsbt psbt_version=%s -> Position 4, BEFORE the signed-tx -22", TNAME[t]);
+          ck(lbl, rc == 0 && e == -3 && m && !strcmp(m, want));
+          rj_free(r); rj_free(p);
+      }
+      /* the VALUE stage stays behind the body, as Core has it */
+      { snprintf(pb, sizeof pb, "[\"%s\",false,true,7]", SIGNED);
+        rj_val* p = rj_parse(pb, strlen(pb)); rj_val* r = NULL; long e = 0; const char* m = NULL;
+        int rc = rpc_dispatch("converttopsbt", p, &w, &r, &e, &m);
+        ck("converttopsbt psbt_version=7 (a bad VALUE) still loses to the -22",
+           rc == 0 && e == -22 && m && strstr(m, "scriptSigs"));
+        rj_free(r); rj_free(p); }
+      /* and an undecodable tx with a good type reaches the decode error */
+      { const char* dj = "[\"00\",false,true,2]";
+        rj_val* p = rj_parse(dj, strlen(dj));
+        rj_val* r = NULL; long e = 0; const char* m = NULL;
+        int rc = rpc_dispatch("converttopsbt", p, &w, &r, &e, &m);
+        ck("converttopsbt with a well-typed psbt_version reaches the decode error",
+           rc == 0 && e == -22);
+        rj_free(r); rj_free(p); }
+      /* createpsbt carries the same argument at position 6 */
+      for (int t = 1; t < 5; t++){
+          snprintf(pb, sizeof pb,
+              "[[{\"txid\":\"%064d\",\"vout\":0}],{},0,false,2,%s]", 1, TYPED[t]);
+          rj_val* p = rj_parse(pb, strlen(pb)); rj_val* r = NULL; long e = 0; const char* m = NULL;
+          int rc = rpc_dispatch("createpsbt", p, &w, &r, &e, &m);
+          snprintf(want, sizeof want,
+              "Wrong type passed:\n{\n    \"Position 6 (psbt_version)\": \"JSON value of type %s "
+              "is not of expected type number\"\n}", TNAME[t]);
+          snprintf(lbl, sizeof lbl, "createpsbt psbt_version=%s -> Position 6 (psbt_version)", TNAME[t]);
+          ck(lbl, rc == 0 && e == -3 && m && !strcmp(m, want));
+          rj_free(r); rj_free(p);
+      }
+    }
+
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);
     return fails?1:0;
 }

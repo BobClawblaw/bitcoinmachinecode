@@ -47,6 +47,36 @@ int rpc_msg_index(const char* cmd, unsigned cmdlen){
                       * this ABI means int, truncating the returned pointer */
 #include <time.h>
 
+/* ---- Core's argument type check -------------------------------------------
+ * Measured against Core v31.1 on the oracle, 2026-09-15, for every JSON type.
+ * Core distinguishes THREE answers where this file collapsed two of them:
+ *
+ *   missing required argument -> -1  + the method's full help text
+ *   wrong JSON type           -> -3  (RPC_TYPE_ERROR), wrapped as
+ *        Wrong type passed:
+ *        {
+ *            "Position 1 (txid)": "JSON value of type null is not of expected type string"
+ *        }
+ *   right type, bad value     -> -8  + a specific message ("txid must be of length 64 ...")
+ *
+ * getmempoolentry, getmempoolancestors, getmempooldescendants and
+ * prioritisetransaction answered -8 for the first two cases alike, and named
+ * the type as "null" whatever was actually passed -- so a caller that sent a
+ * number was told it had sent null. The -8/-3 mismatch matters most: -8 is
+ * RPC_INVALID_PARAMETER, and a caller branching on the numeric code (which is
+ * what the code is for) takes the wrong branch.
+ *
+ * The -1 case cannot be matched exactly: this node deliberately carries no
+ * per-method usage text (see cmd_help in rpc_commands.c), so it answers -1 with
+ * a short usage line -- the code Core uses, with the text it can honestly
+ * produce. cmd_prioritisetransaction already did this. */
+static int rpc_wrong_type(long* ec, const char** em, char* buf, size_t cap,
+                          int position, const char* name,
+                          const rj_val* got, const char* expected){
+    *ec = -3; *em = rj_wrong_type_msg(buf, cap, position, name, got, expected); return 0;
+}
+
+
 static const node_status_t* g_status;
 static node_status_t*       g_status_rw;     /* writable handle for submission */
 static pthread_mutex_t      g_submit_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1233,9 +1263,18 @@ extern int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsign
                                        long* height_out, unsigned char blockhash_wire[32], unsigned char* txout, long txcap, long* txlen_out) __attribute__((weak));
 static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
                                     long* ec, const char** em){
-    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
-        params->items[0]->typ != RJ_ARR){
-        *ec = -8; *em = "Invalid parameter, outputs is not an array"; return 0; }
+    static char tbuf[256];
+    if (!params || params->typ != RJ_ARR || params->nitems < 1){
+        *ec = -1; *em = "gettxspendingprevout requires outputs"; return 0; }
+    if (params->items[0]->typ != RJ_ARR)
+        return rpc_wrong_type(ec, em, tbuf, sizeof tbuf, 1, "outputs", params->items[0], "array");
+    /* Core type-checks EVERY argument before ANY value: `gettxspendingprevout
+     * [] "x"` reports Position 2 (options), not the empty outputs. Measured
+     * against v31.1, 2026-09-15. So options' type is settled here, ahead of
+     * the outputs value checks below. */
+    if (params->nitems >= 2 && params->items[1]->typ != RJ_OBJ &&
+        params->items[1]->typ != RJ_NULL)
+        return rpc_wrong_type(ec, em, tbuf, sizeof tbuf, 2, "options", params->items[1], "object");
     const rj_val* list = params->items[0];
     if (list->nitems == 0){
         *ec = -8; *em = "Invalid parameter, outputs are missing"; return 0; }
@@ -1246,10 +1285,16 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
     if (params->nitems >= 2 && params->items[1]->typ == RJ_OBJ){
         const rj_val* o = params->items[1];
         rj_val* mo = rj_obj_get((rj_val*)o, "mempool_only"); rj_val* rt = rj_obj_get((rj_val*)o, "return_spending_tx");
-        if (mo){ if (mo->typ != RJ_BOOL){ *ec = -3; *em = "JSON value of type string is not of expected type bool"; return 0; } mempool_only = mo->str[0] == '1'; }
-        if (rt){ if (rt->typ != RJ_BOOL){ *ec = -3; *em = "JSON value of type string is not of expected type bool"; return 0; } return_tx = rt->str[0] == '1'; }
-    } else if (params->nitems >= 2 && params->items[1]->typ != RJ_NULL){
-        *ec = -3; *em = "JSON value of type string is not of expected type object"; return 0; }
+        /* a field inside an options object gets Core's OTHER -3 shape: no
+         * wrapper, no position, the field named inline -- and a null field
+         * drops even the field name. See rj_wrong_field_type_msg. */
+        if (mo){ if (mo->typ != RJ_BOOL){
+            *ec = -3; *em = rj_wrong_field_type_msg(tbuf, sizeof tbuf, "mempool_only", mo, "bool"); return 0; }
+            mempool_only = mo->str[0] == '1'; }
+        if (rt){ if (rt->typ != RJ_BOOL){
+            *ec = -3; *em = rj_wrong_field_type_msg(tbuf, sizeof tbuf, "return_spending_tx", rt, "bool"); return 0; }
+            return_tx = rt->str[0] == '1'; }
+    }
     /* validate the whole list before touching the pool, so a bad entry
      * cannot produce a half-answered array */
     for (size_t i = 0; i < list->nitems; i++){
@@ -1477,34 +1522,6 @@ static long long pri_delta_of(const unsigned char txid[32]);
 static rj_val* mpe_amount(unsigned long long sat){
     return rj_numf("%llu.%08llu", sat/100000000ULL, sat%100000000ULL);
 }
-/* ---- Core's argument type check -------------------------------------------
- * Measured against Core v31.1 on the oracle, 2026-09-15, for every JSON type.
- * Core distinguishes THREE answers where this file collapsed two of them:
- *
- *   missing required argument -> -1  + the method's full help text
- *   wrong JSON type           -> -3  (RPC_TYPE_ERROR), wrapped as
- *        Wrong type passed:
- *        {
- *            "Position 1 (txid)": "JSON value of type null is not of expected type string"
- *        }
- *   right type, bad value     -> -8  + a specific message ("txid must be of length 64 ...")
- *
- * getmempoolentry, getmempoolancestors, getmempooldescendants and
- * prioritisetransaction answered -8 for the first two cases alike, and named
- * the type as "null" whatever was actually passed -- so a caller that sent a
- * number was told it had sent null. The -8/-3 mismatch matters most: -8 is
- * RPC_INVALID_PARAMETER, and a caller branching on the numeric code (which is
- * what the code is for) takes the wrong branch.
- *
- * The -1 case cannot be matched exactly: this node deliberately carries no
- * per-method usage text (see cmd_help in rpc_commands.c), so it answers -1 with
- * a short usage line -- the code Core uses, with the text it can honestly
- * produce. cmd_prioritisetransaction already did this. */
-static int rpc_wrong_type(long* ec, const char** em, char* buf, size_t cap,
-                          int position, const char* name,
-                          const rj_val* got, const char* expected){
-    *ec = -3; *em = rj_wrong_type_msg(buf, cap, position, name, got, expected); return 0;
-}
 static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, const char** em){
     static char embuf[256];
     if (!params || params->typ != RJ_ARR || params->nitems < 1){
@@ -1731,12 +1748,24 @@ extern unsigned long long fest_estimate_raw(const void*, int, double, int, fest_
 extern unsigned fest_highest_target(const void*, int) __attribute__((weak));
 
 /* Core ParseConfirmTarget: "Invalid conf_target, must be between 1 and <max>" */
-static int fee_parse_target(const rj_val* params, unsigned max_target, long* ec, const char** em, int* out){
-    static char msg[96];
-    const rj_val* v = (params && params->typ == RJ_ARR && params->nitems >= 1) ? params->items[0] : 0;
-    if (!v || v->typ != RJ_NUM){
-        snprintf(msg, sizeof msg, "JSON value of type %s is not of expected type number", rj_type_name(v));
-        *ec = -3; *em = msg; return 0; }
+/* position 1's arity + type only, so a caller can settle a later position's
+ * type before this one's VALUE (see cmd_estimaterawfee) */
+static int fee_parse_target_type(const rj_val* params, const char* method,
+                                 long* ec, const char** em){
+    static char msg[256];
+    if (!params || params->typ != RJ_ARR || params->nitems < 1){
+        static char ubuf[96];
+        snprintf(ubuf, sizeof ubuf, "%s requires conf_target", method);
+        *ec = -1; *em = ubuf; return 0; }
+    if (params->items[0]->typ != RJ_NUM)
+        return rpc_wrong_type(ec, em, msg, sizeof msg, 1, "conf_target", params->items[0], "number");
+    return 1;
+}
+static int fee_parse_target(const rj_val* params, const char* method, unsigned max_target,
+                            long* ec, const char** em, int* out){
+    static char msg[256];
+    if (!fee_parse_target_type(params, method, ec, em)) return 0;
+    const rj_val* v = params->items[0];
     long t = atol(v->str);
     if (t < 1 || (unsigned long)t > max_target){
         snprintf(msg, sizeof msg, "Invalid conf_target, must be between 1 and %u", max_target);
@@ -1759,7 +1788,7 @@ static int cmd_estimatesmartfee(const rj_val* params, rj_val** res, long* ec, co
     const void* fe = g_mph.feeest;
     unsigned max_target = (fe && fest_highest_target) ? fest_highest_target(fe, FEST_LONG) : 1008u;
     int target = 0;
-    if (!fee_parse_target(params, max_target, ec, em, &target)) return 0;
+    if (!fee_parse_target(params, "estimatesmartfee", max_target, ec, em, &target)) return 0;
     int conservative = 0;
     if (params->nitems >= 2 && params->items[1]->typ != RJ_NULL){
         const rj_val* mv = params->items[1];
@@ -1815,15 +1844,21 @@ static int cmd_estimaterawfee(const rj_val* params, rj_val** res, long* ec, cons
     const void* fe = g_mph.feeest;
     unsigned max_target = (fe && fest_highest_target) ? fest_highest_target(fe, FEST_LONG) : 1008u;
     int target = 0;
-    if (!fee_parse_target(params, max_target, ec, em, &target)) return 0;
+    /* threshold's TYPE settles before conf_target's RANGE: `estimaterawfee 0
+     * "x"` reports Position 2 (threshold), not the out-of-range target.
+     * Measured against v31.1, 2026-09-15. fee_parse_target checks position 1's
+     * type first (lower position wins) and its range second, so the threshold
+     * check sits between the two -- which is why it is not simply hoisted
+     * above the call. */
     double threshold = 0.95;
-    if (params->nitems >= 2 && params->items[1]->typ != RJ_NULL){
-        const rj_val* tv = params->items[1];
-        if (tv->typ != RJ_NUM){
-            static char msg[96]; snprintf(msg, sizeof msg, "JSON value of type %s is not of expected type number", rj_type_name(tv));
-            *ec = -3; *em = msg; return 0; }
-        threshold = atof(tv->str);
-    }
+    const rj_val* tv = (params && params->typ == RJ_ARR && params->nitems >= 2 &&
+                        params->items[1]->typ != RJ_NULL) ? params->items[1] : 0;
+    if (!fee_parse_target_type(params, "estimaterawfee", ec, em)) return 0;
+    if (tv && tv->typ != RJ_NUM){
+        static char msg[256];
+        return rpc_wrong_type(ec, em, msg, sizeof msg, 2, "threshold", tv, "number"); }
+    if (!fee_parse_target(params, "estimaterawfee", max_target, ec, em, &target)) return 0;
+    if (tv) threshold = atof(tv->str);
     if (threshold < 0 || threshold > 1){ *ec = -8; *em = "Invalid threshold"; return 0; }
     static const char* const names[3] = { "short", "medium", "long" };
     static const unsigned defaults[3] = { 12u, 48u, 1008u };
@@ -3030,14 +3065,15 @@ static int mpc_lookup_here(void* ctx, const unsigned char txid[32], mpc_entry* o
  * than inventing an ordering that would differ from Core's silently. */
 static int cmd_getmempoolcluster(const rj_val* params, rj_val** res, long* ec, const char** em){
     static char embuf[512];
-    /* Core answers a null/absent txid with -3 (RPC_TYPE_ERROR), not -8; see
-     * getmempoolcluster against v31.1. Three older sites in this file
-     * (getmempoolentry and friends) return -8 for the identical condition and
-     * are wrong about it -- recorded in PARITY_RPC_FIELDS.md rather than
-     * changed here, since altering a returned error code is a caller-visible
-     * break that belongs in its own change. */
-    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_STR){
-        *ec = -3; *em = "JSON value of type null is not of expected type string"; return 0; }
+    /* This had the right CODE for a wrong type and the wrong one for a missing
+     * argument, which it folded into the same branch: Core answers -1 there.
+     * It also hardcoded the type as "null" whatever was passed. The three
+     * sibling sites it used to point at were fixed on 2026-09-15; this one is
+     * now the same shape as all of them. */
+    if (!params || params->typ != RJ_ARR || params->nitems < 1){
+        *ec = -1; *em = "getmempoolcluster requires txid"; return 0; }
+    if (params->items[0]->typ != RJ_STR)
+        return rpc_wrong_type(ec, em, embuf, sizeof embuf, 1, "txid", params->items[0], "string");
     const char* hx = params->items[0]->str;
     if (strlen(hx) != 64){
         snprintf(embuf, sizeof embuf, "txid must be of length 64 (not %zu, for '%s')", strlen(hx), hx);

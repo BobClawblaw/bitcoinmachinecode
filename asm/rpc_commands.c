@@ -23,6 +23,16 @@
 /* ---- extern wallet_core command layer (from asm/wallet_core.c) ---- */
 extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64], unsigned index);
 #include "rpc_wallet_ops.h"   /* output types: rpc_wops_type_path / rpc_wops_type_spk / rpc_wops_active_types */
+
+/* Core's positional argument type error: -3 with rj_wrong_type_msg's wrapper,
+ * naming the position, the argument and the type ACTUALLY passed. Measured
+ * against v31.1 on 2026-09-15; the same helper exists in rpc_node.c. */
+static int rpc_wrong_type(long* ec, const char** em, char* buf, size_t cap,
+                          int position, const char* name,
+                          const rj_val* got, const char* expected){
+    *ec = -3; *em = rj_wrong_type_msg(buf, cap, position, name, got, expected); return 0;
+}
+
 extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[64], unsigned index);
 extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20], unsigned char prog32[32]);
 extern long rpc_chain_tip_height(void);
@@ -1088,9 +1098,11 @@ static char* psbt_wrap_unsigned(const unsigned char* tx, long n, size_t nin, siz
 }
 static void psbt_wr32(unsigned char* p, unsigned v);
 static int psbt_version_arg(const rj_val* params, unsigned long idx, int* ver, long* ec, const char** em);
+static int psbt_version_type(const rj_val* params, unsigned long idx, long* ec, const char** em);
 static char* psbt_wrap_version(const unsigned char* tx, long n, size_t nin, size_t nout, int ver);
 static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     static unsigned char tx[131072]; long n; size_t nin, nout;
+    if (!psbt_version_type(params, 5, ec, em)) return 0;        /* type before body */
     if (!crt_build_unsigned(params, tx, (long)sizeof tx, &n, &nin, &nout, ec, em)) return 0;
     if (params->nitems >= 5 && params->items[4]->typ == RJ_NUM){                /* Core: tx version */
         long v = strtol(params->items[4]->str, 0, 10);
@@ -1107,6 +1119,7 @@ static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_va
  * wraps. Errors if the tx carries signature data and permitsigdata is false
  * (default), matching Core. */
 static int cmd_converttopsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    if (!psbt_version_type(params, 3, ec, em)) return 0;        /* type before body */
     const char* hex = rpc_param_str(params,0,ec,em); if (!hex) return 0;
     size_t hl=strlen(hex);
     /* RPX-9: this cap is NOT raised to RPC_DECODE_MAX_TX with
@@ -1481,10 +1494,29 @@ static char* psbt_b64_out(const unsigned char* v0, long v0len, const psbt_v2meta
     crt_b64(b, ob, n); return b;
 }
 /* psbt_version argument (Core: default 2, only 0 or 2) at `idx` */
+/* Core checks this argument's TYPE before the method body and its VALUE after.
+ * Measured against v31.1, 2026-09-15, with a real signed transaction:
+ *   converttopsbt <signed tx> false true "x" -> -3  Position 4 (psbt_version)
+ *   converttopsbt <signed tx> false true 7   -> -22 Inputs must not have scriptSigs
+ * So a bad TYPE beats the decode error and a bad VALUE loses to it. Calling
+ * the whole check at the end, as this did, could only ever produce the second
+ * ordering -- the -3 was written but unreachable for any transaction that
+ * failed to decode or carried signatures. Hence the two stages.
+ *
+ * The position is the caller's index + 1; both callers name it psbt_version
+ * (createpsbt has it at 6, converttopsbt at 4). */
+static int psbt_version_type(const rj_val* params, unsigned long idx, long* ec, const char** em){
+    if (params && params->typ == RJ_ARR && params->nitems > idx &&
+        params->items[idx]->typ != RJ_NULL && params->items[idx]->typ != RJ_NUM){
+        static char tb[256];
+        return rpc_wrong_type(ec, em, tb, sizeof tb, (int)idx + 1, "psbt_version",
+                              params->items[idx], "number"); }
+    return 1;
+}
 static int psbt_version_arg(const rj_val* params, unsigned long idx, int* ver, long* ec, const char** em){
     *ver = 2;
+    if (!psbt_version_type(params, idx, ec, em)) return 0;
     if (params && params->typ == RJ_ARR && params->nitems > idx && params->items[idx]->typ != RJ_NULL){
-        if (params->items[idx]->typ != RJ_NUM){ *ec = -3; *em = "JSON value of type string is not of expected type number"; return 0; }
         long v = strtol(params->items[idx]->str, 0, 10);
         if (v != 0 && v != 2){ *ec = -8; *em = "The PSBT version can only be 2 or 0"; return 0; }
         *ver = (int)v;

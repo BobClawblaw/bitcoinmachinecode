@@ -82,6 +82,16 @@
 #include <sys/stat.h>
 #include <limits.h>
 
+/* Core's positional argument type error: -3 with rj_wrong_type_msg's wrapper,
+ * naming the position, the argument and the type ACTUALLY passed. Measured
+ * against v31.1 on 2026-09-15; the same helper exists in rpc_node.c. */
+static int rpc_wrong_type(long* ec, const char** em, char* buf, size_t cap,
+                          int position, const char* name,
+                          const rj_val* got, const char* expected){
+    *ec = -3; *em = rj_wrong_type_msg(buf, cap, position, name, got, expected); return 0;
+}
+
+
 typedef unsigned char u8;
 typedef unsigned long long u64;
 typedef unsigned int u32;
@@ -1505,13 +1515,26 @@ static int cmd_getblockhash(const rj_val* params, rj_val** res, long* ec, const 
 }
 static int cmd_getblockheader(const rj_val* params, rj_val** res, long* ec, const char** em){
     long tip = refresh(); long h;
-    if (!lookup_block_param(params, 0, 1, &h, ec, em)) return 0;
+    /* Core type-checks EVERY argument before running the body, and the LOWEST
+     * position that fails its type wins -- measured against v31.1, 2026-09-15:
+     *   getblockheader 5 5        -> Position 1 (blockhash)
+     *   getblockheader <bad hash> 5 -> Position 2 (verbose), NOT the hash
+     * A bad hash VALUE is a body error and loses to a type error anywhere. So
+     * both type checks run first, in position order, and lookup_block_param --
+     * which does the value work -- runs after. (Its own type refusal comes from
+     * the shared rpc_param_str, which cannot name a position; the explicit
+     * check below is what produces Core's message for this method.) */
+    static char tb[256];
+    if (param_present(params, 0) && params->items[0]->typ != RJ_STR)
+        return rpc_wrong_type(ec, em, tb, sizeof tb, 1, "blockhash", params->items[0], "string");
     int verbose = 1;
     if (param_present(params, 1)){
         const rj_val* e = params->items[1];
-        if (e->typ != RJ_BOOL){ *ec = -3; *em = "JSON value of type number is not of expected type bool"; return 0; }
+        if (e->typ != RJ_BOOL)
+            return rpc_wrong_type(ec, em, tb, sizeof tb, 2, "verbose", e, "bool");
         verbose = e->str[0] == '1';
     }
+    if (!lookup_block_param(params, 0, 1, &h, ec, em)) return 0;
     if (!verbose){
         u8 hdr[80];
         if (read_block_prefix(h, hdr, 80) != 1){ *ec = -1; *em = "Block not available"; return 0; }
@@ -4530,6 +4553,20 @@ static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, con
      * 965,626 with the right "height" field but the wrong data for what
      * they actually queried. Core's own error text, same meaning. */
     int want_muhash = 1;   /* OUR default (documented divergence, see above) */
+    /* EVERY argument's TYPE is checked before ANY argument's VALUE, and the
+     * lowest-positioned type failure wins. Measured against Core v31.1 on
+     * 2026-09-15 across five methods: `gettxoutsetinfo "bogus" null "x"`
+     * reports Position 3 (use_index), not the invalid hash_type at position 1.
+     * These checks therefore sit ahead of the block-specific refusals below,
+     * which are value errors. */
+    if (params && params->typ == RJ_ARR){
+        static char tb[256];
+        if (params->nitems >= 1 && params->items[0]->typ != RJ_STR)
+            return rpc_wrong_type(ec, em, tb, sizeof tb, 1, "hash_type", params->items[0], "string");
+        if (params->nitems >= 3 && params->items[2]->typ != RJ_BOOL &&
+            params->items[2]->typ != RJ_NULL)
+            return rpc_wrong_type(ec, em, tb, sizeof tb, 3, "use_index", params->items[2], "bool");
+    }
     if (params && params->typ == RJ_ARR && params->nitems >= 2 && params->items[1]->typ != RJ_NULL){   /* Core's order: the block-specific refusals first */
         if (params->items[0]->typ == RJ_STR && !strncmp(params->items[0]->str, "hash_serialized", 15)){
             *ec = -8; *em = "hash_serialized_3 hash type cannot be queried for a specific block"; return 0; }
@@ -4537,8 +4574,6 @@ static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, con
             *ec = -8; *em = "Cannot set use_index to false when querying for a specific block"; return 0; }
     }
     if (params && params->typ == RJ_ARR && params->nitems >= 1){
-        if (params->items[0]->typ != RJ_STR){
-            *ec = -3; *em = "JSON value of type number is not of expected type string"; return 0; }
         const char* ht = params->items[0]->str;
         if (!strcmp(ht, "muhash")) want_muhash = 1;
         else if (!strcmp(ht, "none")) want_muhash = 0;

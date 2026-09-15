@@ -488,3 +488,13 @@ const char* rj_wrong_type_msg(char* buf, size_t cap, int position, const char* n
              position, name, rj_type_name(got), expected);
     return buf;
 }
+
+const char* rj_wrong_field_type_msg(char* buf, size_t cap, const char* field,
+                                    const rj_val* got, const char* expected) {
+    if (!got || got->typ == RJ_NULL)                 /* Core names no field for a null */
+        snprintf(buf, cap, "JSON value of type null is not of expected type %s", expected);
+    else
+        snprintf(buf, cap, "JSON value of type %s for field %s is not of expected type %s",
+                 rj_type_name(got), field, expected);
+    return buf;
+}
