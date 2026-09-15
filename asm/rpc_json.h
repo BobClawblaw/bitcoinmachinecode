@@ -95,6 +95,16 @@ const char* rj_type_name(const rj_val* v);
 const char* rj_wrong_type_msg(char* buf, size_t cap, int position, const char* name,
                               const rj_val* got, const char* expected);
 
+/* The same check for a named field INSIDE an options object has a DIFFERENT
+ * shape in Core -- no wrapper, no position, the field named inline:
+ *   JSON value of type string for field mempool_only is not of expected type bool
+ * and a NULL drops the "for field" clause entirely (Core's checkType throws
+ * before the named-field wrapper is applied):
+ *   JSON value of type null is not of expected type bool
+ * Both measured against v31.1 on 2026-09-15. Give buf at least 256 bytes. */
+const char* rj_wrong_field_type_msg(char* buf, size_t cap, const char* field,
+                                    const rj_val* got, const char* expected);
+
 /* Deep-free a value tree. */
 void rj_free(rj_val* v);
 

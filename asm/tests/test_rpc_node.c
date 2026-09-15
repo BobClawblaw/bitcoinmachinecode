@@ -450,13 +450,19 @@ int main(void){
       /* getmempoolcluster used to refuse everything with -1 and this asserted
        * that refusal. 2026-09-12 it answers a SINGLETON cluster exactly (a lone
        * transaction is its own chunk, no linearization needed), so a missing
-       * txid now takes the parameter path -- and Core answers that with -3
-       * (RPC_TYPE_ERROR), verified against v31.1. The old assertion pinned the
-       * unimplemented state, so it is replaced, not restored. */
+       * txid now takes the parameter path.
+       *
+       * This then asserted -3, "verified against v31.1" -- but the probe that
+       * verified it passed a NULL txid, while the assertion passes NO txid, and
+       * Core answers those differently: -3 for the wrong type, -1 for a missing
+       * required argument. So the replacement pinned the defect in turn. -1 is
+       * what Core answers here, re-measured 2026-09-15 across every JSON type
+       * and the missing case. The lesson is in the memory note: probe every
+       * input shape, not the one that is convenient. */
       { r = NULL; ec = 0; em = NULL;
         int rcb = rpc_node_dispatch("getmempoolcluster", NULL, &r, &ec, &em);
-        ck("getmempoolcluster with no txid -> -3, as Core answers it",
-           rcb == 0 && ec == -3 && em && strstr(em, "not of expected type string"));
+        ck("getmempoolcluster with NO txid -> -1 (a missing argument, not a wrong type)",
+           rcb == 0 && ec == -1 && em && strstr(em, "requires txid"));
         rj_free(r);
         r = NULL; ec = 0; em = NULL;
         rcb = rpc_node_dispatch("getblockfrompeer", NULL, &r, &ec, &em);
@@ -664,7 +670,13 @@ int main(void){
           rj_free(r); rj_free(fp);
           fp=rj_parse("[\"6\"]",5); r=NULL;
           rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&e8,&m8);
-          ck("esf(\"6\") -> -3 type error", rc==0 && e8==-3 && m8 && !strcmp(m8,"JSON value of type string is not of expected type number"));
+          /* the message now carries Core's wrapper and names the position and
+             the argument; it was the bare sentence, which Core never emits for
+             a positional argument */
+          ck("esf(\"6\") -> -3 type error, with Core's wrapper and position",
+             rc==0 && e8==-3 && m8 && !strcmp(m8,
+               "Wrong type passed:\n{\n    \"Position 1 (conf_target)\": "
+               "\"JSON value of type string is not of expected type number\"\n}"));
           rj_free(r); rj_free(fp);
           fp=rj_parse("[6, \"bogus\"]",12); r=NULL;
           rc=rpc_node_dispatch("estimatesmartfee",fp,&r,&e8,&m8);
@@ -1629,6 +1641,147 @@ int main(void){
           ck("a well-typed but wrong-length txid is still -8",
              rc2 == 0 && e == -8 && m && strstr(m, "txid must be of length 64"));
           rj_free(r); rj_free(p); }
+    }
+
+
+    /* ---- the "Wrong type passed" wrapper, and the order it is reached in ----
+     * These sites had the right CODE (-3) and a HAND-WRITTEN message that
+     * hardcoded the passed type, so `mempool_only: 5` reported "type string".
+     * Core's real vocabulary, measured against v31.1 on 2026-09-15:
+     *
+     *   positional argument -> Wrong type passed:\n{\n    "Position N (name)": "..."\n}
+     *   field in an options object -> JSON value of type X for field F is not
+     *                                 of expected type Y   (NO wrapper, NO position)
+     *   a NULL field -> JSON value of type null is not of expected type Y
+     *                   (the "for field" clause is dropped entirely)
+     *
+     * AND: every argument's TYPE is checked before ANY argument's VALUE, with
+     * the lowest failing position winning. `gettxspendingprevout [] "x"` is
+     * Position 2 (options), not the empty-outputs -8. A correct message at a
+     * point the caller cannot reach is not a fix, so the order is asserted
+     * here too -- each of these would pass against code that emitted the right
+     * string from the wrong place. */
+    {
+        const char* TYPED[] = { "null", "5", "\"x\"", "true", "[]", "{}" };
+        const char* TNAME[] = { "null", "number", "string", "bool", "array", "object" };
+        char want[256], lbl[200], pb[256];
+        rj_val* p; rj_val* r; long e; const char* m; int rc2;
+
+        #define WT(POS, NAME, EXP, TI) \
+            snprintf(want, sizeof want, \
+                "Wrong type passed:\n{\n    \"Position %d (%s)\": \"JSON value of type %s " \
+                "is not of expected type %s\"\n}", (POS), (NAME), TNAME[TI], (EXP))
+
+        /* gettxspendingprevout: outputs at position 1, options at position 2 */
+        for (int t = 0; t < 6; t++){
+            if (strcmp(TNAME[t], "array")){
+                snprintf(pb, sizeof pb, "[%s]", TYPED[t]);
+                p = rj_parse(pb, strlen(pb)); r = NULL; e = 0; m = NULL;
+                rc2 = rpc_node_dispatch("gettxspendingprevout", p, &r, &e, &m);
+                WT(1, "outputs", "array", t);
+                snprintf(lbl, sizeof lbl, "gettxspendingprevout outputs=%s -> Position 1 (outputs)", TNAME[t]);
+                ck(lbl, rc2 == 0 && e == -3 && m && !strcmp(m, want));
+                rj_free(r); rj_free(p);
+            }
+            if (strcmp(TNAME[t], "object") && strcmp(TNAME[t], "null")){
+                snprintf(pb, sizeof pb,
+                    "[[{\"txid\":\"%064d\",\"vout\":0}],%s]", 1, TYPED[t]);
+                p = rj_parse(pb, strlen(pb)); r = NULL; e = 0; m = NULL;
+                rc2 = rpc_node_dispatch("gettxspendingprevout", p, &r, &e, &m);
+                WT(2, "options", "object", t);
+                snprintf(lbl, sizeof lbl, "gettxspendingprevout options=%s -> Position 2 (options)", TNAME[t]);
+                ck(lbl, rc2 == 0 && e == -3 && m && !strcmp(m, want));
+                rj_free(r); rj_free(p);
+            }
+        }
+        /* an options FIELD takes Core's other shape, and null drops the name */
+        { const char* F[] = { "mempool_only", "return_spending_tx" };
+          for (int f = 0; f < 2; f++) for (int t = 0; t < 6; t++){
+            if (!strcmp(TNAME[t], "bool")) continue;
+            snprintf(pb, sizeof pb, "[[{\"txid\":\"%064d\",\"vout\":0}],{\"%s\":%s}]", 1, F[f], TYPED[t]);
+            p = rj_parse(pb, strlen(pb)); r = NULL; e = 0; m = NULL;
+            rc2 = rpc_node_dispatch("gettxspendingprevout", p, &r, &e, &m);
+            if (!strcmp(TNAME[t], "null"))
+                snprintf(want, sizeof want, "JSON value of type null is not of expected type bool");
+            else
+                snprintf(want, sizeof want,
+                    "JSON value of type %s for field %s is not of expected type bool", TNAME[t], F[f]);
+            snprintf(lbl, sizeof lbl, "gettxspendingprevout %s=%s -> the FIELD shape%s",
+                     F[f], TNAME[t], !strcmp(TNAME[t], "null") ? " (null drops the field name)" : "");
+            ck(lbl, rc2 == 0 && e == -3 && m && !strcmp(m, want));
+            rj_free(r); rj_free(p);
+          } }
+        /* THE ORDER: a later position's TYPE beats an earlier position's VALUE */
+        { p = rj_parse("[[],\"x\"]", 8); r = NULL; e = 0; m = NULL;
+          rc2 = rpc_node_dispatch("gettxspendingprevout", p, &r, &e, &m);
+          ck("empty outputs + bad options TYPE -> Position 2, not the outputs -8",
+             rc2 == 0 && e == -3 && m && strstr(m, "\"Position 2 (options)\""));
+          rj_free(r); rj_free(p); }
+        { p = rj_parse("[[]]", 4); r = NULL; e = 0; m = NULL;
+          rc2 = rpc_node_dispatch("gettxspendingprevout", p, &r, &e, &m);
+          ck("...and with no options at all the empty-outputs -8 still stands",
+             rc2 == 0 && e == -8 && m && strstr(m, "outputs are missing"));
+          rj_free(r); rj_free(p); }
+
+        /* estimatesmartfee / estimaterawfee: conf_target at 1, threshold at 2 */
+        { const char* FM[] = { "estimatesmartfee", "estimaterawfee" };
+          for (int f = 0; f < 2; f++) for (int t = 0; t < 6; t++){
+            if (!strcmp(TNAME[t], "number")) continue;
+            snprintf(pb, sizeof pb, "[%s]", TYPED[t]);
+            p = rj_parse(pb, strlen(pb)); r = NULL; e = 0; m = NULL;
+            rc2 = rpc_node_dispatch(FM[f], p, &r, &e, &m);
+            WT(1, "conf_target", "number", t);
+            snprintf(lbl, sizeof lbl, "%s conf_target=%s -> Position 1 (conf_target)", FM[f], TNAME[t]);
+            ck(lbl, rc2 == 0 && e == -3 && m && !strcmp(m, want));
+            rj_free(r); rj_free(p);
+          } }
+        for (int t = 0; t < 6; t++){
+            if (!strcmp(TNAME[t], "number") || !strcmp(TNAME[t], "null")) continue;
+            snprintf(pb, sizeof pb, "[6,%s]", TYPED[t]);
+            p = rj_parse(pb, strlen(pb)); r = NULL; e = 0; m = NULL;
+            rc2 = rpc_node_dispatch("estimaterawfee", p, &r, &e, &m);
+            WT(2, "threshold", "number", t);
+            snprintf(lbl, sizeof lbl, "estimaterawfee threshold=%s -> Position 2 (threshold)", TNAME[t]);
+            ck(lbl, rc2 == 0 && e == -3 && m && !strcmp(m, want));
+            rj_free(r); rj_free(p);
+        }
+        /* THE ORDER again: conf_target 0 is out of range (-8), but a bad
+         * threshold TYPE at position 2 is reported instead */
+        { p = rj_parse("[0,\"x\"]", 7); r = NULL; e = 0; m = NULL;
+          rc2 = rpc_node_dispatch("estimaterawfee", p, &r, &e, &m);
+          ck("out-of-range conf_target + bad threshold TYPE -> Position 2, not the -8",
+             rc2 == 0 && e == -3 && m && strstr(m, "\"Position 2 (threshold)\""));
+          rj_free(r); rj_free(p); }
+        { p = rj_parse("[0]", 3); r = NULL; e = 0; m = NULL;
+          rc2 = rpc_node_dispatch("estimaterawfee", p, &r, &e, &m);
+          ck("...and on its own conf_target 0 is still the -8 range error",
+             rc2 == 0 && e == -8 && m && strstr(m, "Invalid conf_target"));
+          rj_free(r); rj_free(p); }
+        /* ...but a LOWER position's type still wins over a higher one's */
+        { p = rj_parse("[\"y\",\"x\"]", 9); r = NULL; e = 0; m = NULL;
+          rc2 = rpc_node_dispatch("estimaterawfee", p, &r, &e, &m);
+          ck("both types bad -> the LOWER position wins (conf_target)",
+             rc2 == 0 && e == -3 && m && strstr(m, "\"Position 1 (conf_target)\""));
+          rj_free(r); rj_free(p); }
+
+        /* getmempoolcluster: had -3 already, but hardcoded "null" and folded
+         * the missing-argument case in with it */
+        for (int t = 0; t < 6; t++){
+            if (!strcmp(TNAME[t], "string")) continue;
+            snprintf(pb, sizeof pb, "[%s]", TYPED[t]);
+            p = rj_parse(pb, strlen(pb)); r = NULL; e = 0; m = NULL;
+            rc2 = rpc_node_dispatch("getmempoolcluster", p, &r, &e, &m);
+            WT(1, "txid", "string", t);
+            snprintf(lbl, sizeof lbl, "getmempoolcluster txid=%s -> Position 1 (txid)", TNAME[t]);
+            ck(lbl, rc2 == 0 && e == -3 && m && !strcmp(m, want));
+            rj_free(r); rj_free(p);
+        }
+        { p = rj_parse("[]", 2); r = NULL; e = 0; m = NULL;
+          rc2 = rpc_node_dispatch("getmempoolcluster", p, &r, &e, &m);
+          ck("getmempoolcluster() with no argument -> -1, not -3",
+             rc2 == 0 && e == -1 && m && strstr(m, "requires txid"));
+          rj_free(r); rj_free(p); }
+        #undef WT
     }
 
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);

@@ -228,6 +228,92 @@ is already there — `rpc_commands.c` builds the array and emits it when non-emp
 
 ---
 
+## ~~OPEN~~ FIXED 2026-09-15: the `Wrong type passed` wrapper at the remaining nine sites
+
+Follow-up to the error-code change below, which fixed four methods and left
+nine sites that had the right CODE (`-3`) with a hand-written message. Measuring
+those against Core v31.1 for every JSON type turned up three rules the codebase
+did not have, and one of them makes most of the others unreachable.
+
+**1. Two message shapes, not one.** A POSITIONAL argument gets the wrapper:
+
+```
+Wrong type passed:
+{
+    "Position 2 (options)": "JSON value of type string is not of expected type object"
+}
+```
+
+A FIELD inside an options object gets a different message with no wrapper and
+no position:
+
+```
+JSON value of type string for field mempool_only is not of expected type bool
+```
+
+and a **null** field drops the `for field` clause entirely:
+
+```
+JSON value of type null is not of expected type bool
+```
+
+Now `rj_wrong_type_msg` and `rj_wrong_field_type_msg` in `rpc_json.c`.
+
+**2. Every site hardcoded the type it reported** — `"string"`, `"number"` or
+`"null"` depending on which one the author happened to hit. Pass a number where
+a bool is expected and the node said you had passed a string.
+
+**3. Every argument's TYPE is checked before ANY argument's VALUE, and the
+lowest failing position wins.** Measured across five methods:
+
+| call | Core answers |
+|---|---|
+| `gettxspendingprevout [] "x"` | Position 2 (options) — not the empty-outputs `-8` |
+| `estimaterawfee 0 "x"` | Position 2 (threshold) — not the out-of-range `-8` |
+| `getblockheader <unknown hash> 5` | Position 2 (verbose) — not `-5 Block not found` |
+| `gettxoutsetinfo "bogus" null "x"` | Position 3 (use_index) — not the invalid hash_type `-8` |
+| `converttopsbt <signed tx> false true "x"` | Position 4 (psbt_version) — not the `-22` |
+| `estimaterawfee "y" "x"` | Position 1 (conf_target) — the lower position wins |
+
+This is the rule that mattered. `psbt_version_arg` ran at the END of both
+`createpsbt` and `converttopsbt`, so its `-3` was **unreachable for any
+transaction that failed to decode or carried signatures** — the message was
+written and could not be produced. Same for `getblockheader`'s verbose, masked
+by the blockhash lookup, and `gettxoutsetinfo`'s `use_index`, which had no type
+check at all. Fixing the strings without the ordering would have left a change
+`grep` could see and a caller could not — the same trap as the previous commit.
+
+Where a helper did both stages it is now split: `fee_parse_target_type` /
+`fee_parse_target`, and `psbt_version_type` / `psbt_version_arg`.
+
+**Verification.** 65 differential cases against the oracle covering every JSON
+type at every site, plus 12 more for `psbt_version` against a real signed
+mainnet transaction. `CODE DIFFERS: 0`. The four remaining message differences
+are all the missing-argument help text this node does not carry. `getblockheader`
+and `gettxoutsetinfo` cannot be reached through the plain dispatch harness — the
+chain dispatcher answers `-28 "Loading block index..."` until a chain is open,
+which is Core's own warm-up behaviour — so they are asserted in
+`tests/test_rpc_chain.c`, which opens a real chain fixture.
+
+Nine reintroductions, each watched to fail: the wrapper, the field clause, the
+null special case, the hardcoded type name, and five orderings.
+
+**Two more assertions were pinning the defect.** One asserted
+`getmempoolcluster` with no txid is `-3` and said it was "verified against
+v31.1" — the probe behind that had passed a **null** txid while the assertion
+passes **no** txid, and Core answers those differently (`-3` vs `-1`). It was
+written as the replacement for an earlier pinned assertion and pinned the next
+defect in turn. The other froze `estimatesmartfee`'s bare message.
+
+**Left open, deliberately:** `createpsbt` has no type check at all on `inputs`,
+`locktime`, `replaceable` or `version` (Core: Positions 1, 3, 4, 5), and its
+version-range message reads `between 1 and 2147483647` where Core says
+`out of range(1~3)`. `gettxoutsetinfo`'s `hash_or_height` is a union type and
+takes Core's third shape, a bare sentence with no position. Those are absent
+checks rather than wrong messages — a different gap, not measured here.
+
+---
+
 ## ~~OPEN~~ FIXED 2026-09-15: wallet-absent and argument-type error codes
 
 > **RESOLVED.** Both recorded mismatches are closed, and closing them turned up
