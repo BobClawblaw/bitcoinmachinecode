@@ -251,3 +251,76 @@ seven of those sites reported **`-7 "out of memory"`** for a missing wallet.
 fails, and the call sites collapsed the two — telling an operator with no wallet
 that the node was out of RAM. They now distinguish the cases, and match the
 three sites in the same file that always answered correctly.
+
+---
+
+## ~~OPEN DEFECT~~ FIXED 2026-09-15: `signrawtransactionwithkey` DROPPED existing witness data
+
+> **RESOLVED the same day, and it needed three changes rather than one.**
+>
+> 1. **The scriptSig and witness are now stored.** The parse skipped each
+>    scriptSig without keeping it and never read the witness section; inputs the
+>    signer does not re-sign now keep what they arrived with.
+> 2. **The locktime was also wrong.** It was read immediately after the outputs,
+>    but in a segwit transaction the WITNESS SECTION sits there — so locktime was
+>    reading witness bytes. Fixed by the same parse.
+> 3. **The segwit marker now follows the input.** `any_segwit` was set only when
+>    THIS function produced a witness, so a transaction that arrived with
+>    witnesses but got no new signature would have been serialized without the
+>    marker, silently discarding them.
+>
+> Verified against Core on three real segwit transactions from block 966,000 —
+> 444, 468 and 632 hex characters, all byte-identical to Core's output. The
+> unsigned legacy path still matches: `complete: false`, one error, hex
+> unchanged.
+>
+> Three defect classes verified by reintroduction. The test asserts the
+> transaction **comes back unchanged**, which is the property that was violated
+> — asserting only on `complete` or the error count would pass against a signer
+> that still dropped the data.
+>
+> **Still open from the same report:** the `errors` entries do not yet carry
+> Core's `witness` and `scriptSig` fields. The data they need is now parsed and
+> available, so that is a small follow-up rather than the blocked item it was.
+
+### The original report, kept as written
+
+Found 2026-09-15 by the RPC shape differential, immediately after the segwit
+marker fix made the input loop run at all. **Not fixed** — recorded with its
+reproduction because a signing path is not a thing to change in a hurry.
+
+**Reproduction.** Sign any already-signed segwit transaction with no keys:
+
+```
+RAW=$(bitcoin-cli getrawtransaction <segwit txid> 0 <blockhash>)   # 444 hex chars
+signrawtransactionwithkey "$RAW" '[]'
+```
+
+| | Core v31.1 | this node |
+|---|---|---|
+| returned `hex` | 444 chars — **unchanged** | **226 chars** |
+| the witness section | preserved | **gone** |
+
+A caller round-tripping a signed transaction through this call gets back an
+unsigned one. In a multi-party signing flow — where passing a partially-signed
+transaction between signers is the whole point — this destroys the previous
+signer's work.
+
+**Cause.** The input parse skips each scriptSig without storing it
+(`p += cc + ssl`) and never reads the witness section after the outputs. The
+serializer then writes what it has, which for an input it did not re-sign is
+nothing. The function has NEVER preserved witnesses; before the segwit marker
+fix the loop did not run at all, so the output was wrong in a different way and
+this was invisible.
+
+**What a fix needs**, in this order:
+1. store each input's original scriptSig (pointer and length) during the parse;
+2. parse the witness section into per-input original witness bytes;
+3. carry both through for any input the signer does not itself sign;
+4. then `errors` entries can finally carry Core's `witness` and `scriptSig`
+   fields, which are the ORIGINAL input's — that is the same data, and the
+   reason those two fields are still missing from the error entries.
+
+Core's error entry order is `txid, vout, witness, scriptSig, sequence, error`
+(`rpc/rawtransaction_util.cpp:178-187`); this node emits txid, vout, sequence,
+error.

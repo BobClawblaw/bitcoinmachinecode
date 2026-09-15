@@ -325,6 +325,15 @@ int main(void){
       rj_val* errs = r ? rj_obj_get(r,"errors") : NULL;
       ck("...with one errors entry, as Core reports",
          errs && errs->typ==RJ_ARR && errs->nitems==1);
+      /* THE WITNESS MUST SURVIVE. This function skipped each scriptSig without
+       * storing it and never read the witness section, so an input it did not
+       * re-sign came out BARE: a 444-character signed transaction returned as
+       * 226, its witness gone, where Core returns it unchanged. In a
+       * multi-party flow that destroys the previous signer's work.
+       * Found 2026-09-15 by the RPC shape differential. */
+      rj_val* hx = r ? rj_obj_get(r,"hex") : NULL;
+      ck("...and the transaction comes back UNCHANGED, witness intact",
+         hx && hx->str && !strcmp(hx->str, SEGWIT_TX));
       rj_free(r); rj_free(p2); }
 
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);

@@ -2468,15 +2468,44 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
      * wallet, so Core's behaviour there could not be verified, and changing
      * unverified behaviour is how a fix becomes a defect. */
     if (n_in>10000){ *ec=-22; *em="TX decode failed"; return 0; }
+    /* THE INPUT'S OWN scriptSig AND WITNESS ARE KEPT (2026-09-15). This loop
+     * skipped the scriptSig without storing it and never read the witness
+     * section at all, so an input this function did not itself re-sign came out
+     * BARE: a 444-character signed transaction returned as 226, with the
+     * witness gone. Core returns it unchanged. In a multi-party flow -- where
+     * handing a partially-signed transaction to the next signer is the whole
+     * point -- that destroyed the previous signer's work.
+     *
+     * It also fixes the locktime, which was read immediately after the outputs.
+     * In a segwit transaction the WITNESS SECTION sits there, so locktime was
+     * reading witness bytes. */
     const unsigned char* in_outpoint[10000]; unsigned in_seq[10000];
+    const unsigned char* orig_ss[10000]; unsigned long orig_sslen[10000];
+    const unsigned char* orig_wit[10000]; unsigned long orig_witlen[10000]; unsigned long orig_witn[10000];
     for (unsigned long i=0;i<n_in;i++){
+        orig_wit[i]=NULL; orig_witlen[i]=0; orig_witn[i]=0;
         in_outpoint[i]=tx+p; p+=36;
-        unsigned long ssl=srw_varint(tx+p,&cc); p+=cc+ssl;
+        unsigned long ssl=srw_varint(tx+p,&cc); p+=cc;
+        orig_ss[i]=tx+p; orig_sslen[i]=ssl; p+=ssl;
         in_seq[i]=(unsigned)tx[p]|((unsigned)tx[p+1]<<8)|((unsigned)tx[p+2]<<16)|((unsigned)tx[p+3]<<24); p+=4;
     }
     unsigned long out_start=p; unsigned long n_out=srw_varint(tx+p,&cc); p+=cc;
     for (unsigned long i=0;i<n_out;i++){ p+=8; unsigned long sl=srw_varint(tx+p,&cc); p+=cc+sl; }
-    unsigned long out_end=p; unsigned long locktime=(unsigned long)tx[p]|((unsigned long)tx[p+1]<<8)|((unsigned long)tx[p+2]<<16)|((unsigned long)tx[p+3]<<24);
+    unsigned long out_end=p;
+    /* the witness section, one stack per input, BEFORE the locktime */
+    int in_segwit = (txlen > 6 && tx[4] == 0x00 && tx[5] != 0x00);
+    if (in_segwit){
+        for (unsigned long i=0;i<n_in && p<txlen;i++){
+            unsigned long items=srw_varint(tx+p,&cc); p+=cc;
+            orig_witn[i]=items; orig_wit[i]=tx+p;
+            for (unsigned long k=0;k<items && p<txlen;k++){
+                unsigned long il=srw_varint(tx+p,&cc); p+=cc+il;
+            }
+            orig_witlen[i]=(unsigned long)((tx+p)-orig_wit[i]);
+        }
+    }
+    if (p+4>txlen){ *ec=-22; *em="TX decode failed"; return 0; }
+    unsigned long locktime=(unsigned long)tx[p]|((unsigned long)tx[p+1]<<8)|((unsigned long)tx[p+2]<<16)|((unsigned long)tx[p+3]<<24);
 
     /* --- BIP143 mid-hashes (SIGHASH_ALL, non-ACP baseline) --- */
     unsigned char zero32[32]; memset(zero32,0,32);
@@ -2503,7 +2532,9 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
         unsigned long vo=(unsigned long)in_outpoint[i][32]|((unsigned long)in_outpoint[i][33]<<8)|((unsigned long)in_outpoint[i][34]<<16)|((unsigned long)in_outpoint[i][35]<<24);
         for (int k=0;k<nprev;k++) if (prev[k].vout==vo && !memcmp(prev[k].txid_wire,in_outpoint[i],32)){ prev_of[i]=&prev[k]; break; }
     }
-    int any_segwit=0, complete=1;
+    /* the marker is needed if we PRODUCE a witness or if one ARRIVED: dropping
+     * it would serialize a transaction whose witnesses are silently discarded */
+    int any_segwit=in_segwit, complete=1;
     rj_val* errors=rj_arr();
     unsigned char* pre=malloc((size_t)txlen+8192); if (!pre){ *ec=-7; *em="oom"; return 0; }
     for (unsigned long i=0;i<n_in;i++){
@@ -2621,14 +2652,22 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
     n+=crt_varint(out+n,(unsigned long long)n_in);
     for (unsigned long i=0;i<n_in;i++){
         memcpy(out+n,in_outpoint[i],36); n+=36;
-        n+=crt_varint(out+n,(unsigned long long)sslen[i]); memcpy(out+n,ss[i],sslen[i]); n+=sslen[i];
+        /* an input this function did not re-sign keeps the scriptSig it arrived
+         * with, rather than being emitted bare (2026-09-15) */
+        { const unsigned char* sp = sslen[i] ? ss[i] : orig_ss[i];
+          unsigned long sl2 = sslen[i] ? sslen[i] : orig_sslen[i];
+          n+=crt_varint(out+n,(unsigned long long)sl2); memcpy(out+n,sp,sl2); n+=sl2; }
         out[n++]=(unsigned char)in_seq[i];out[n++]=(unsigned char)(in_seq[i]>>8);out[n++]=(unsigned char)(in_seq[i]>>16);out[n++]=(unsigned char)(in_seq[i]>>24);
     }
     memcpy(out+n,tx+out_start,out_end-out_start); n+=out_end-out_start;    /* outputs region verbatim */
     if (any_segwit){
         for (unsigned long i=0;i<n_in;i++){
-            if (wititems[i]==0){ out[n++]=0x00; }                          /* empty stack */
-            else { n+=crt_varint(out+n,(unsigned long long)wititems[i]); memcpy(out+n,witbuf[i],witlen[i]); n+=witlen[i]; }
+            if (wititems[i]){ n+=crt_varint(out+n,(unsigned long long)wititems[i]); memcpy(out+n,witbuf[i],witlen[i]); n+=witlen[i]; }
+            else if (orig_witn[i]){                                        /* keep what arrived */
+                n+=crt_varint(out+n,(unsigned long long)orig_witn[i]);
+                memcpy(out+n,orig_wit[i],orig_witlen[i]); n+=orig_witlen[i];
+            }
+            else { out[n++]=0x00; }                                        /* empty stack */
         }
     }
     out[n++]=(unsigned char)locktime;out[n++]=(unsigned char)(locktime>>8);out[n++]=(unsigned char)(locktime>>16);out[n++]=(unsigned char)(locktime>>24);
@@ -2873,7 +2912,14 @@ static void wsl_add_lastprocessedblock(rj_val* o){
  * walletversion 1 and format "bmc" deliberately say this is our own store,
  * not a Core wallet, and descriptors=false because there is no descriptor
  * wallet here. birthtime/lastprocessedblock are omitted rather than faked --
- * this store records neither. */
+ * this store records neither.
+ *
+ * 2026-09-15: the differential reported birthtime as missing. It is NOT a gap:
+ * Core emits it only when the wallet HAS one (`if (birthtime != UNKNOWN_TIME)`,
+ * wallet.cpp:114), so omitting it where none is recorded is Core's own
+ * behaviour. The oracle's wallet happens to have one and this store has no such
+ * concept -- a state difference, not a divergence. keypoolsize_hd_internal, in
+ * the same report, WAS a real gap: Core pushes that one unconditionally. */
 static int cmd_getwalletinfo(const rpc_wallet* w, rj_val** result){
     static wsl_rec_t recs[WSL_MAX];
     int n = wsl_read(recs, WSL_MAX);
@@ -2885,6 +2931,14 @@ static int cmd_getwalletinfo(const rpc_wallet* w, rj_val** result){
     rj_obj_set(o, "format", rj_str("bmc"));
     rj_obj_set(o, "txcount", rj_numf("%d", n));
     rj_obj_set(o, "keypoolsize", rj_numf("%d", 0));
+    /* Core emits keypoolsize_hd_internal UNCONDITIONALLY, immediately after
+     * keypoolsize (wallet/rpc/wallet.cpp:96) -- its RPCResult marks it optional
+     * but the code always pushes it. This store pre-generates no keys at all,
+     * so both figures are zero; emitting one and omitting the other made the
+     * pair look like a wallet that has an external keypool and no internal one,
+     * which is a different claim from "no keypool". Found 2026-09-15 by the RPC
+     * shape differential, once a wallet was loaded on the oracle. */
+    rj_obj_set(o, "keypoolsize_hd_internal", rj_numf("%d", 0));
     rj_obj_set(o, "private_keys_enabled", rj_bool(w && w->seed ? 1 : 0));
     { extern int rpc_wops_avoid_reuse(void);
       rj_obj_set(o, "avoid_reuse", rj_bool(rpc_wops_avoid_reuse() ? 1 : 0)); }
