@@ -2788,11 +2788,26 @@ static ir_t g_ir_bfi, g_ir_addrhist;
 /* row 5's measurement, one line per block that went through the compact
  * receiver: what the mempool supplied and where the rest had gone */
 extern void cmpct_recv_last_block(unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long cls[5]);
-static void cmpct_overlap_line(long height, const char* host){
+/* THE HEIGHT HERE WAS A GUESS, and it made the line lie. The pushed-compact
+ * caller passed `tip + 1` -- the height we EXPECT next, not the reconstructed
+ * block's own, which a block header does not carry. When several peers push
+ * the same block at once the tip differs between calls, so one block was
+ * logged under two heights: a 4,469-transaction block appeared as both 967,238
+ * and 967,239 on 2026-09-16, and an analysis keyed on height therefore counted
+ * one block as two.
+ *
+ * The hash is unambiguous and is what identifies a repeat, so it is printed
+ * when the caller knows it. The height stays, because it is right at the sync
+ * caller (which reads it from the stored block) and is still a useful
+ * approximation at the other -- but it is no longer the only identifier. */
+static void cmpct_overlap_line(long height, const unsigned char* hash32, const char* host){
     unsigned long ntx, pool, pre, miss, mb, cls[5]; cmpct_recv_last_block(&ntx, &pool, &pre, &miss, &mb, cls);
     if(!ntx) return;
-    fprintf(stderr,"[cmpct] block %ld (%s): %lu tx: %lu from the mempool (%.1f%%), %lu prefilled, %lu fetched by getblocktxn (%lu KB): %lu never announced, %lu announced not requested, %lu requested no reply, %lu orphans, %lu rejected by policy\n",
-            height, host, ntx, pool, ntx ? 100.0 * (double)pool / (double)ntx : 0.0, pre, miss, mb / 1024,
+    char hs[20]; hs[0] = 0;
+    if(hash32){ for(int j = 0; j < 8; j++) sprintf(hs + 2*j, "%02x", hash32[31 - j]); hs[16] = 0; }
+    fprintf(stderr,"[cmpct] block %ld%s%s (%s): %lu tx: %lu from the mempool (%.1f%%), %lu prefilled, %lu fetched by getblocktxn (%lu KB): %lu never announced, %lu announced not requested, %lu requested no reply, %lu orphans, %lu rejected by policy\n",
+            height, hs[0] ? " hash=" : "", hs[0] ? hs : "", host,
+            ntx, pool, ntx ? 100.0 * (double)pool / (double)ntx : 0.0, pre, miss, mb / 1024,
             cls[0], cls[1], cls[2], cls[3], cls[4]);
 }
 static long g_announce_inv_n, g_announce_hdr_n, g_push_n, g_push_stored_n, g_push_skipped_n;
@@ -2921,7 +2936,10 @@ static long dl_store_pushed_block(int k, const unsigned char* blk, unsigned long
     g_push_stored_n++; g_stored_now = 1;
     { char hs[17]; for(int j = 0; j < 8; j++) sprintf(hs + 2*j, "%02x", bh[31 - j]);
       fprintf(stderr,"[block] stored height=%ld hash=%s.. bytes=%lu (%s from %s)\n", tip + 1, hs, len, how, mux_out_host[k]); }
-    if(how[0] == 'p' && how[7] == 'c') cmpct_overlap_line(tip + 1, mux_out_host[k]);   /* "pushed compact block..." */
+    /* tip + 1 is the EXPECTED height, not necessarily this block's -- the hash
+     * is what identifies it, and what tells two concurrent pushes of the same
+     * block apart from two different blocks */
+    if(how[0] == 'p' && how[7] == 'c') cmpct_overlap_line(tip + 1, bh, mux_out_host[k]);
     leg_hb_note_block(k);
     return 1;
 }
@@ -3000,7 +3018,8 @@ static long do_outbound_sync(int i){
     if(g_peer_sendcmpct && !mux_out_cmpct[i]){ mux_out_cmpct[i] = 1; fprintf(stderr, "[cmpct] %s accepts compact blocks: requesting MSG_CMPCT_BLOCK on this leg from now on\n", mux_out_host[i]); }
     { unsigned long r, n, f; cmpct_recv_stats(&r, &n, &f);
       if(r != p_r || n != p_n || f != p_f){ fprintf(stderr, "[cmpct] reconstructed %lu block(s) from the mempool (%lu needed a getblocktxn round trip, %lu fell back to a full block)\n", r, n, f);
-                                              cmpct_overlap_line((long)*(int*)(store_buf+24), mux_out_host[i]); } }
+                                              /* this height comes from the STORED block, so it is the block's own */
+                                              cmpct_overlap_line((long)*(int*)(store_buf+24), 0, mux_out_host[i]); } }
     double sync_s = phase_elapsed(&sync_pt);
     int st_tip=*(int*)(store_buf+24);
     /* 2026-09-09: blocks this leg stored off the best header chain came from a
