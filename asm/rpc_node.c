@@ -3090,6 +3090,89 @@ static int cmd_bmcgetmempooljournal(const rj_val* params, rj_val** res, long* ec
     *res = o;
     return 1;
 }
+
+/* ---- bmcgetcapabilities (2026-09-16) ---------------------------------------
+ * ONE call that answers "what is this node, and what can it do that Core
+ * cannot". Core has no counterpart; it is an extension, like the rest of the
+ * bmc* family.
+ *
+ * WHY IT EXISTS. A consumer could not tell this node from Core over RPC.
+ * blockyard, the monitoring front end, wrote the problem down in
+ * server/collect/monitor.js: "both report the same non-Core subversion string.
+ * So RPC cannot tell you whether RPC is complete; only the log's build banner
+ * can." It therefore has to TAIL THE NODE'S LOG FILE to identify what it is
+ * talking to, which is why `log.enabled` is a per-node setting there at all.
+ * A monitor should not need file access to a machine it can already reach over
+ * RPC.
+ *
+ * getnetworkinfo already carries bmc_build_commit, and that is not enough on
+ * its own: a commit hash makes the consumer keep a commit -> capability map,
+ * which is wrong the moment a build lands.
+ *
+ * EVERY FIELD IS LIVE STATE, NOT A COMPILE-TIME LIST, and that is the whole
+ * point. addrindex, the departure journal and the Esplora facade are all
+ * opt-in; a build that CAN serve address history is not the same as a node
+ * that IS serving it, and reporting the first would mislead a consumer exactly
+ * where it matters. Each entry below is read from the running configuration or
+ * from the subsystem itself.
+ *
+ * The reply is deliberately flat and small: it is a handshake, not a status
+ * page. Anything that needs numbers has its own call (bmcgetdownloadinfo,
+ * bmcgetmempooljournal, getindexinfo). */
+/* Weak, so rpc_node.o keeps its no-link-fanout property: the test binaries
+ * that link it without the daemon's config or the address history still build,
+ * and a capability simply reports as absent there -- which is the truthful
+ * answer for a binary that genuinely cannot serve it. */
+extern int  ah_available(void) __attribute__((weak));
+extern int  node_cfg_addrindex_on(void)   __attribute__((weak));
+extern int  node_cfg_esplora_port_get(void) __attribute__((weak));
+static int cmd_bmcgetcapabilities(rj_val** res){
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "node", rj_str("bitcoinmachinecode"));
+    rj_obj_set(o, "subversion", rj_str(g_user_agent[0] ? g_user_agent : NODE_UA_STRING));
+    { rj_val* b = rj_obj();
+      rj_obj_set(b, "commit", rj_str(BMC_BUILD_COMMIT));
+      rj_obj_set(b, "dirty",  rj_bool(BMC_BUILD_DIRTY));
+      rj_obj_set(o, "build", b); }
+
+    rj_val* x = rj_obj();
+    /* address history: Core has NO address index at all, so this is the
+     * capability a consumer most needs to know about. ah_available() is the
+     * same check the Esplora address routes make before answering. */
+    rj_obj_set(x, "addrindex", rj_bool(ah_available && ah_available() ? 1 :
+                                       (node_cfg_addrindex_on && node_cfg_addrindex_on())));
+    /* the Esplora REST facade: the port, or 0 when it is off. A port is more
+     * useful than a bool -- a consumer that gets one can go straight there. */
+    rj_obj_set(x, "esploraport", rj_numf("%d",
+        node_cfg_esplora_port_get ? node_cfg_esplora_port_get() : 0));
+    /* the mempool DEPARTURE journal: why a transaction left the pool, which
+     * Core forgets entirely. Reported with its capacity so a consumer can tell
+     * how far back the answers reach. */
+    if (mpj_is_open()){
+        rj_val* j = rj_obj();
+        rj_obj_set(j, "enabled",  rj_bool(1));
+        rj_obj_set(j, "capacity", rj_numf("%llu", (unsigned long long)mpj_capacity()));
+        rj_obj_set(x, "mempooljournal", j);
+    } else {
+        rj_val* j = rj_obj(); rj_obj_set(j, "enabled", rj_bool(0));
+        rj_obj_set(x, "mempooljournal", j);
+    }
+    /* the forked downloader's worker->peer->chunk map; no Core counterpart */
+    rj_obj_set(x, "downloadinfo", rj_bool(1));
+    rj_obj_set(o, "extensions", x);
+
+    /* The completeness question blockyard actually hit: one build answered
+     * getnettotals 0/0 and getpeerinfo [] while getconnectioncount said 16, so
+     * "RPC only" meant no bandwidth and no peer names. Saying so here lets a
+     * consumer decide whether it needs the log, instead of discovering the
+     * gap from empty charts. */
+    { rj_val* c = rj_obj();
+      rj_obj_set(c, "peerinfo",   rj_bool(1));
+      rj_obj_set(c, "nettotals",  rj_bool(1));
+      rj_obj_set(o, "rpc_complete", c); }
+    *res = o;
+    return 1;
+}
 static int cmd_bmcgetdownloadinfo(rj_val** res){
     rj_val* o = rj_obj();
     const node_status_t* s = g_status;
@@ -3147,6 +3230,7 @@ static const char* const NODE_METHODS[] = {
     "getprivatebroadcastinfo", "abortprivatebroadcast",
     "bmcgetdownloadinfo",   /* 2026-09-10: this node's own, no Core counterpart */
     "bmcgetmempooljournal", /* 2026-09-16: the mempool departure journal */
+    "bmcgetcapabilities",   /* 2026-09-16: what this node is, and what it can do */
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "getrawaddrman", "getorphantxs", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "addpeeraddress", "disconnectnode",
     "setban", "setnetworkactive", "ping", "getzmqnotifications",
@@ -3385,6 +3469,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "getprivatebroadcastinfo")) return cmd_getprivatebroadcastinfo(res, ec, em);
     if (!strcmp(m, "bmcgetdownloadinfo"))  return cmd_bmcgetdownloadinfo(res);
     if (!strcmp(m, "bmcgetmempooljournal")) return cmd_bmcgetmempooljournal(params, res, ec, em);
+    if (!strcmp(m, "bmcgetcapabilities"))  return cmd_bmcgetcapabilities(res);
     if (!strcmp(m, "abortprivatebroadcast"))   return cmd_abortprivatebroadcast(params, res, ec, em);
     if (!strcmp(m, "getmempoolcluster")) return cmd_getmempoolcluster(params, res, ec, em);
     if (!strcmp(m, "getblockfrompeer"))
