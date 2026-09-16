@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
+#include <unistd.h>
+#include <signal.h>
 
 extern void idx_init(void* idx, unsigned long slots);
 extern int  idx_put(void* idx, const unsigned char hash[32], long height);
@@ -16,6 +18,14 @@ extern long idx_count(void* idx);
 
 static double now_s(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec+ts.tv_nsec*1e-9; }
 
+static void on_alarm(int sig){
+    (void)sig;
+    /* write(2), not printf: this runs in a signal handler */
+    static const char m[] = "FAIL full table: idx_put/idx_get did not terminate "
+                            "(probe budget corrupted -- see bitcoin_idx.asm)\n";
+    ssize_t w = write(2, m, sizeof m - 1); (void)w;
+    _exit(1);
+}
 static int failures=0;
 static void ck(const char* l,int g,int e){ if(g==e)printf("PASS %s\n",l); else{printf("FAIL %s got=%d exp=%d\n",l,g,e);failures++;} }
 
@@ -25,6 +35,7 @@ static uint64_t sx=0x9E3779B97F4A7C15ull;
 static uint64_t rnd64(void){ sx^=sx<<13; sx^=sx>>7; sx^=sx<<17; return sx; }
 
 int main(void){
+    setvbuf(stdout, NULL, _IOLBF, 0);
     /* big table: 16384 slots (mask 16383), 5000 inserts (30% load) */
     static unsigned char idxbuf[24 + 16384*48];
     idx_init(idxbuf, 16384);
@@ -129,6 +140,56 @@ int main(void){
          * flake on a slow CI box while still catching a real regression. */
         ck("pow-prefix: insertion stayed fast (no clustering)", dt < 3.0 ? 1 : 0, 1);
         if(dt>=3.0) printf("  (took %.3fs for %d inserts -- clustering regression?)\n", dt, M);
+    }
+
+    /* ---- a FULL table -------------------------------------------------
+     * Everything above runs at a load factor where a probe terminates on an
+     * empty slot, so none of it walks the probe budget to exhaustion. The
+     * budget is the part that was wrong: idx_put and idx_get held it in r8
+     * across `call memcmp_exact`, and memcmp_exact writes r8b on every byte
+     * it compares. Below capacity that is invisible. At capacity it decides
+     * whether the loop terminates at all (idx_put) and whether a key that IS
+     * present is reported present (idx_get).
+     *
+     * Found on run 24 (2026-09-16): getblock answered "Block not found" for
+     * every block above a fixed height for the whole of IBD.
+     *
+     * SIGALRM turns the non-terminating case into a failure instead of a
+     * hung suite. */
+    {
+        enum { SLOTS = 4096 };
+        static unsigned char fh[SLOTS][32];
+        void* idxf = malloc(24 + (size_t)SLOTS*48 + 64);
+        idx_init(idxf, SLOTS);
+        int ins_ok = 1;
+        for(int i=0;i<SLOTS;i++){
+            uint64_t a=rnd64(), b=rnd64(), c=rnd64(), d=rnd64();
+            memcpy(fh[i],&a,8); memcpy(fh[i]+8,&b,8); memcpy(fh[i]+16,&c,8); memcpy(fh[i]+24,&d,8);
+            memcpy(fh[i], &i, sizeof i);          /* unique key */
+            if(idx_put(idxf, fh[i], i) != 1) ins_ok = 0;
+        }
+        ck("full table: every slot filled", ins_ok, 1);
+        ck("full table: count==SLOTS", (int)idx_count(idxf), SLOTS);
+
+        signal(SIGALRM, on_alarm);
+        alarm(30);
+        /* a new key on a completely full table must report full, and must
+         * come back at all */
+        unsigned char nk[32]; memset(nk,0xAB,32);
+        ck("full table: a new key reports full (and terminates)", idx_put(idxf, nk, 1), 2);
+        /* an absent key must report absent, not spin */
+        long gv;
+        ck("full table: absent key reports absent (and terminates)", idx_get(idxf, nk, &gv), 0);
+        /* and every key that IS present must still be found -- this is the
+         * assertion the live getblock failure maps onto */
+        int missing = 0;
+        for(int i=0;i<SLOTS;i++){
+            long g; if(idx_get(idxf, fh[i], &g)!=1 || g!=(long)i) missing++;
+        }
+        ck("full table: every present key is found", missing, 0);
+        if(missing) printf("  %d of %d present keys reported absent\n", missing, SLOTS);
+        alarm(0);
+        free(idxf);
     }
 
     printf(failures? "FAILURES %d\n" : "ALL TESTS PASSED (0 failures)\n", failures);
