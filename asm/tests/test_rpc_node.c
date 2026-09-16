@@ -1792,6 +1792,54 @@ int main(void){
         #undef WT
     }
 
+
+    /* ---- bmcgetcapabilities -----------------------------------------------
+     * One call that answers "what is this node, and what can it do that Core
+     * cannot". It exists because a consumer could NOT tell this node from Core
+     * over RPC: blockyard wrote the problem down in its monitor -- "both report
+     * the same non-Core subversion string ... only the log's build banner can"
+     * -- and therefore tails the node's LOG FILE to identify it. A monitor
+     * should not need file access to a machine it can already reach by RPC.
+     *
+     * THE PROPERTY UNDER TEST is that every extension reports what is ENABLED,
+     * not what is compiled in. This binary links rpc_node.o without the
+     * daemon's config, the address history or the journal, so every one of
+     * them must answer FALSE here -- that is the truthful answer for a process
+     * that genuinely cannot serve them, and a compile-time list would answer
+     * true and mislead a consumer exactly where it matters. */
+    {
+        rj_val* r = NULL; long e = 0; const char* m = NULL;
+        int rc2 = rpc_node_dispatch("bmcgetcapabilities", NULL, &r, &e, &m);
+        ck("bmcgetcapabilities answers", rc2 == 1 && r && r->typ == RJ_OBJ);
+        rj_val* nd = r ? rj_obj_get(r, "node") : NULL;
+        ck("...naming the node, so a consumer need not parse a subversion string",
+           nd && nd->str && !strcmp(nd->str, "bitcoinmachinecode"));
+        rj_val* b = r ? rj_obj_get(r, "build") : NULL;
+        ck("...with the build commit, for correlating against a deploy",
+           b && rj_obj_get(b, "commit") && rj_obj_get(b, "dirty"));
+        rj_val* x = r ? rj_obj_get(r, "extensions") : NULL;
+        ck("...and an extensions block", x && x->typ == RJ_OBJ);
+        /* the part that matters: ENABLED, not compiled in */
+        rj_val* ai = x ? rj_obj_get(x, "addrindex") : NULL;
+        ck("addrindex reports FALSE where it cannot be served, not true-because-built",
+           ai && ai->str && ai->str[0] == '0');
+        rj_val* ep = x ? rj_obj_get(x, "esploraport") : NULL;
+        ck("esploraport is 0 when the facade is off (a port, not a bool: a consumer that gets one can use it)",
+           ep && ep->str && !strcmp(ep->str, "0"));
+        rj_val* mj = x ? rj_obj_get(x, "mempooljournal") : NULL;
+        ck("mempooljournal reports disabled here", mj && rj_obj_get(mj, "enabled") &&
+           rj_obj_get(mj, "enabled")->str[0] == '0');
+        ck("...and carries no capacity when disabled, rather than 0 as if it held nothing",
+           mj && rj_obj_get(mj, "capacity") == NULL);
+        rj_val* di = x ? rj_obj_get(x, "downloadinfo") : NULL;
+        ck("downloadinfo is true: it is served by this object, not by config",
+           di && di->str && di->str[0] == '1');
+        rj_val* rcpl = r ? rj_obj_get(r, "rpc_complete") : NULL;
+        ck("rpc_complete answers the question blockyard actually hit (empty getpeerinfo/getnettotals)",
+           rcpl && rj_obj_get(rcpl, "peerinfo") && rj_obj_get(rcpl, "nettotals"));
+        rj_free(r);
+    }
+
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);
     return fails ? 1 : 0;
 }

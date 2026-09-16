@@ -1426,3 +1426,8 @@ int log_sink_open(const char* path, int printtoconsole){
     return 1;
 }
 
+/* Read by rpc_node.c's bmcgetcapabilities, which must report what is ENABLED
+ * rather than what is compiled in -- both of these are opt-in, and a build
+ * that CAN serve them is not a node that IS serving them. */
+int node_cfg_addrindex_on(void){ return g_cfg.addrindex ? 1 : 0; }
+int node_cfg_esplora_port_get(void){ return (int)g_cfg.esplora_port; }
