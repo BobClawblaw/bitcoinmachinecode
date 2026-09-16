@@ -34,7 +34,8 @@ the sync. The LSM answer:
   at 0; new runs are `<name>.r<from>-<to>.dat`, zero-padded so a listing sorts
   by height. A lookup asks each run (sparse binary search, then the archive
   verifies every candidate as it always did), then the tail.
-- **A trailing builder** (`daemon/index_trail.h`): at the daemon's heartbeat,
+- **A trailing builder** (`daemon/index_trail.h`): at the block choke point
+  (and at the caught-up loop's heartbeat, where the choke point is quiet),
   once `bmc.indexrunblocks` heights (default 20,000) are applied below a safety
   margin of 144 (the undo window; a reorg deeper than that is already the
   node's general limit), it spawns the builder over that range into a new run
@@ -100,6 +101,41 @@ folding the tails every 20,000 blocks, forever. The `[idx]` and `[txindex]` /
   count small. Address balances now come from the history runs' events plus
   the journal, and `getaddresstxids` resolves a run event's txid by reading its
   block — one read per distinct height per call.
+
+## Measured, on a fresh node
+
+Run 26, wiped and restarted from genesis on `b28ffcf1`, five minutes in at
+height 188,400:
+
+```
+txindex                   synced: true    188,400
+txospenderindex           synced: true    188,400
+basic block filter index  synced: true    188,400
+addressindex              synced: true    188,400
+coinstatsindex            synced: false   187,391   (normal apply lag)
+```
+
+Nine runs per index by then, each built in 1-4 seconds, with the tails rotated
+after every one (`[addrindex] journal rotated: 6,285,189 records folded into
+history runs (to 179999), 1,796,864 kept`) and the merger already collapsing
+them: 27 runs built, 12 files on disk. Compare the same node before this
+work: at 43% of the chain its address journal alone was 165 GB, one balance
+query scanned all of it, and four indexes had not started.
+
+## The bug this nearly shipped with
+
+The first version put the supervisors' tick in the caught-up loop's heartbeat.
+Initial block download never reaches that heartbeat -- the node runs the
+parallel catch-up loop instead -- so during the one phase the feature exists
+for, nothing ticked and no run was ever built. Every index looked healthy;
+only the absence of run files showed it, and the supervisors were silent
+because a supervisor idle for a reason logs nothing.
+
+Two things fixed it and both are worth keeping: the tick moved to the block
+choke point (which runs in every phase, and is where the filter index and the
+tails are already fed), and a `[trail]` line every five minutes prints each
+supervisor's state through `it_status()` -- a function the module had and
+nothing ever called. Silence in a log reads exactly like "working".
 
 ## Pins
 

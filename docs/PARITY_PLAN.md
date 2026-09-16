@@ -294,7 +294,7 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       (txindex/coinstatsindex/blockfilterindex), so it returns {} exactly as
       Core does when none are enabled; verified live (Core is also lenient on a
       non-string arg -> {}). The remaining index BUILDS below are the real work.
-- [x] txindex (global) → getrawtransaction without blockhash  **[CLOSED (offline base + live tail; getrawtransaction by txid)]**
+- [x] txindex (global) → getrawtransaction without blockhash  **[CLOSED (2026-09-16: sorted runs the daemon builds during the sync + a live tail; getrawtransaction by txid)]**
 - [x] blockfilterindex → getblockfilter (BIP157/158)  **[CLOSED 2026-08-28 (built AND served; adoption proven vs Core)]**
 
 ### T10 — Networks
