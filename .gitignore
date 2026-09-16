@@ -9,6 +9,7 @@ logs/
 # ---- Compiled binaries (tests + daemon) ----
 asm/tests/fakepeer_headers
 asm/tests/live_block_dl
+asm/tests/live_money_range_chain
 asm/tests/live_blocks
 asm/tests/live_getdata_form
 asm/tests/live_handshake
@@ -449,5 +450,11 @@ asm/daemon/utxo_probe_one
 asm/daemon/utxo_repair_del
 asm/daemon/utxo_setinfo
 asm/daemon/bmc_build_block_filters
+asm/daemon/bmc_merge_index_runs
+asm/daemon/bmc_build_addr_hist
+asm/daemon/bmc_build_coinstats_hist
+asm/daemon/bmc_build_txospender_index
+# the *.run-<date> copies a bench run pins beside the builder it used
+asm/daemon/bmc_build_*.run-*
 asm/daemon/bmc_build_tx_index
 asm/daemon/bmc_utxo_probe_one

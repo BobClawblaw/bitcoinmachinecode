@@ -34,8 +34,10 @@ and cookie, so no other flags are usually needed.
 - `nasm`, `gcc`, `make`, `python3` (build, test suite, build audits).
 - Disk: the mainnet block archive is about 0.7 TB at the current height
   (713 GB across 5,733 `blk*.dat` files) and grows with the chain; the UTXO
-  store is about 13–15 GB; the optional indexes add about 27 GB
-  (`txindex.dat`), 30 GB (`addr_index.dat`) and 13 GB (`bfilters.dat`).
+  store is about 13–15 GB; the optional indexes add about 27 GB (the txid
+  index), 91 GB (the txo-spender index), ~200 GB (the address history) and
+  13 GB (the block filters), each as sorted run files the daemon builds
+  during the sync (2026-09-16, `docs/devlog/INDEX_RUNS.md`).
   The archive re-layout tool needs archive-sized scratch space (about
   1.1 TB). Pruned mode fits in a few GB.
 - RAM: several GB; the initial-sync memtable is sized from `dbcache`
@@ -230,14 +232,21 @@ I2P destination.
   `tcp://<interface>:<port>`; `tcp://*:PORT` is refused, name an interface
   (`127.0.0.1` for local subscribers). A publisher has no authentication.
   `zmqpubsequence` is not supported and is refused.
-- **Address history** (2026-09-08): `daemon/bmc_build_addr_hist <chaindir>`
-  writes `addr_hist.dat` (about 200 GB on mainnet, ~700 GB of temp files
-  beside it while it runs, hours; the archive is all it reads). With the
-  file present the Esplora facade serves the `/address` routes; set
-  `addrindex=1` afterwards so the tail journal keeps the history current
-  (a fresh journal adopts the base's coverage and backfills over the undo
-  data). `/address/:addr/utxo` needs the txospender index too. See
-  `releases/2026-09-08-address-history.md`.
+- **Address history** (`addrindex=1`, 2026-09-16): the daemon builds it
+  DURING the sync. The live journal (`addrindex.tail`) records every
+  funding and spend from genesis; every `bmc.indexrunblocks` heights
+  (default 20,000, kept 144 below the applied height) the trailing builder
+  folds the next range into a sorted run `addr_hist.r<from>-<to>.dat` — its
+  spends read from undo, so a run is self-contained — rotates the journal
+  to drop what the run now covers, and merges runs at six. The Esplora
+  `/address` routes, `getaddressbalance` and `getaddresstxids` read the runs
+  plus the journal. `addrindex=1` must still be set before the sync (or
+  within the undo window of the tip): a journal that starts late cannot
+  reconstruct historic spends. A node with the old single `addr_hist.dat`
+  keeps it: it is simply the run that starts at 0. The whole-chain builder
+  (`daemon/bmc_build_addr_hist <chaindir> [to]`, ~700 GB of temp, hours)
+  still exists for a one-off rebuild; nothing on a fresh sync needs it.
+  `/address/:addr/utxo` needs the txospender index too.
 - **`coinstatsindex=1`** keeps the coin statistics index live (`coinstats.dat`,
   the running MuHash and totals at the applied tip) and, since 2026-09-08,
   one row per committed height in `coinstats_hist.dat` (1 KB each: the
@@ -278,16 +287,32 @@ I2P destination.
   the node's own RPC handlers in process. Keep it on loopback or behind a
   proxy. Address routes need the address history index (above). See
   `releases/2026-09-08-esplora-facade.md`.
-- `txindex=1` has no effect on the daemon: the index is built offline
-  (`daemon/bmc_build_tx_index <datadir>`) and used when `txindex.dat` exists.
-- **txospenderindex** (2026-09-01): same pattern — `daemon/bmc_build_txospender_index
-  <datadir> [from] [to]` writes `txospender.dat` (98 GB for mainnet at height 966,038, measured 2026-09-08; 46 minutes on the reference box; run it
-  while the node is idle, it reads the whole archive once), the daemon then
-  keeps `txospender.tail` current and `gettxspendingprevout` answers
-  confirmed spends. Absent file = index off, exactly as Core without the
-  option.
-  `blockfilterindex` and `coinstatsindex` are opt-in, as in Core (default 0
-  since 2026-09-06); set them to 1 to maintain them.
+- **`txindex=1`** (Core's meaning since 2026-09-16): the daemon builds the
+  txid index during the sync as sorted runs (`txindex.dat` if a base exists,
+  then `txindex.r<from>-<to>.dat`) trailing the applied height by 144, with
+  `txindex.tail` for the heights above the highest run; the tail is rotated
+  after every run and the runs merged at six (`bmc_merge_index_runs`).
+  `getrawtransaction <txid>` asks every run, then the tail. Nothing waits
+  for initial block download, and the same builders keep trailing after it.
+- **`txospenderindex=1`** (2026-09-16): the same shape for Core's
+  txo-spender index (`txospender.dat` / `txospender.r*.dat` /
+  `txospender.tail`); `gettxspendingprevout` answers confirmed spends from
+  the first run on. The whole-chain builders (`daemon/bmc_build_tx_index`,
+  `daemon/bmc_build_txospender_index <datadir> [from] [to] [out]`) remain
+  for a one-off rebuild; a run is the same file under a run name.
+- `bmc.indexrunblocks=<n>` (default 20000, 1000..200000): heights per run
+  for the three trailing builders above. The unsorted tail a lookup scans
+  linearly is never longer than this; a run costs one archive walk over its
+  range, at nice 10, one builder per index at a time.
+- **`blockfilterindex=1`**: the daemon creates `bfilters.dat`/`bfilters.idx`
+  itself and builds every filter from genesis at the new-block choke point
+  (prevouts from undo), closing any gap in slices of 256 heights per block
+  so a catch-up never stalls the apply path. The offline backfill
+  (`daemon/bmc_build_block_filters`) is no longer part of the path.
+  `coinstatsindex=1` is opt-in as in Core (default 0 since 2026-09-06) and,
+  since 2026-09-16, survives the two pre-BIP34 duplicate coinbases on a fresh
+  sync (the overwrite is a remove + add, as Core's coinstatsindex does; it
+  used to invalidate the index at 91,842 and re-seed only at the next boot).
 - `assumevalid=<hash>` skips script evaluation for blocks at and below that
   block (PoW, merkle, structure and every UTXO check still run); the height is
   resolved from the archive at boot (`[utxo_live] assumevalid: block found at
@@ -780,7 +805,7 @@ Extra listeners: onion service target at chain default P2P port + 1
 | `bmcwallet.enc` / `bmcwallet.dat` (+ `.txlog`), `walletkeys.dat`, `walletscan.dat` | wallet container / plaintext store and journal, HD keys, rescan records |
 | `onion_v3_private_key`, `i2p_private_key` | persisted onion service key and I2P destination |
 | `rev%05u.dat` + `undo.idx` | undo data for every block (2026-09-08; Core's rev files). Pruned only with the block store. A node upgraded from the per-height `undo_<h>.dat` files folds them in at start; older history needs `-reindex-chainstate` |
-| `txindex.dat` + `txindex.tail`, `addr_index.dat`, `bfilters.dat` + `bfilters.idx`, `coinstats.dat` | optional indexes |
+| `txindex.dat` / `txindex.r*-*.dat` + `txindex.tail`, `txospender.dat` / `txospender.r*-*.dat` + `txospender.tail`, `addr_hist.dat` / `addr_hist.r*-*.dat` + `addrindex.tail`, `bfilters.dat` + `bfilters.idx`, `coinstats.dat` + `coinstats_hist.dat` | optional indexes: sorted runs the daemon builds during the sync plus a bounded tail each (2026-09-16); `addr_index.dat` is the retired UTXO-by-address snapshot |
 | `debug.log` | the daemon's log, everything, as Core (since 2026-09-08; before that only the leveled logger's lines; `logs/bitcoind.log` before 2026-09-06) |
 
 Outside the chain directory: `<datadir>/bitcoin.conf` or

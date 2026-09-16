@@ -39,10 +39,12 @@ static void emit(void* ctxv, const u8* prev, u32 vout, u32 off, u32 len){
     if (fwrite(&r, 1, sizeof r, c->bucket[r.prefix[0]]) == sizeof r) c->n++;
 }
 int main(int argc, char** argv){
-    if (argc < 2){ fprintf(stderr, "usage: build_txospender_index <datadir> [from] [to]\n"); return 2; }
+    if (argc < 2){ fprintf(stderr, "usage: build_txospender_index <datadir> [from] [to] [out]\n"); return 2; }
     const char* dir = argv[1];
     long from_h = argc > 2 ? atol(argv[2]) : 0;
     long to_h   = argc > 3 ? atol(argv[3]) : -1;
+    const char* out_name = argc > 4 ? argv[4] : TSP_BASE_FILE;    /* a run: index_runs.h */
+    char tmp_name[320]; snprintf(tmp_name, sizeof tmp_name, "%s.tmp", out_name);
     if (chdir(dir)){ perror("chdir"); return 1; }
     static u8 store_buf[4096];
     if (store_init(store_buf) != 1){ fprintf(stderr, "store_init failed\n"); return 1; }
@@ -71,7 +73,7 @@ int main(int argc, char** argv){
     }
     for (int i = 0; i < NBUCKETS; i++) fclose(c.bucket[i]);
     fprintf(stderr, "[txospender] pass1 done: %llu spends in %llds\n", (unsigned long long)c.n, (long long)(time(NULL) - t0));
-    FILE* out = fopen(TSP_BASE_FILE ".tmp", "wb"); if (!out){ fprintf(stderr, "cannot open %s.tmp\n", TSP_BASE_FILE); return 1; }
+    FILE* out = fopen(tmp_name, "wb"); if (!out){ fprintf(stderr, "cannot open %s\n", tmp_name); return 1; }
     { u8 hdr[TSP_HDR]; memset(hdr, 0, sizeof hdr); if (fwrite(hdr, 1, TSP_HDR, out) != TSP_HDR){ fprintf(stderr, "short write\n"); return 1; } }
     u64 written = 0, nsparse = 0;
     u8* sparse = malloc((size_t)(c.n / TSP_STRIDE + 2) * TSP_SPARSE); if (!sparse){ fprintf(stderr, "oom (sparse)\n"); return 1; }
@@ -108,7 +110,7 @@ int main(int argc, char** argv){
       for (int b = 0; b < 4; b++) hdr[36+b] = (u8)((u32)to_h >> (8*b));
       if (fseek(out, 0, SEEK_SET) || fwrite(hdr, 1, TSP_HDR, out) != TSP_HDR){ fprintf(stderr, "short write (header)\n"); return 1; } }
     if (fflush(out) || fsync(fileno(out)) || fclose(out)){ fprintf(stderr, "close failed\n"); return 1; }
-    if (rename(TSP_BASE_FILE ".tmp", TSP_BASE_FILE)){ perror("rename"); return 1; }
+    if (rename(tmp_name, out_name)){ perror("rename"); return 1; }
     fprintf(stderr, "[txospender] DONE: %llu records, %llu sparse, %.2f GB, %llds\n", (unsigned long long)written, (unsigned long long)nsparse, (double)(sparse_off + nsparse * TSP_SPARSE) / 1e9, (long long)(time(NULL) - t0));
     return 0;
 }

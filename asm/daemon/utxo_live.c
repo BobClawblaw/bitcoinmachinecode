@@ -912,16 +912,33 @@ static void live_on_output(void* ctxv, u32 out_index, u64 value, const u8* scrip
         tm_lap(TM_CSI, tm_a0);
     }
     if (r == 0 && ctx->is_coinbase) {
-        /* the OLD coin's fields are not in scope here, so this overwrite's
-         * remove-event cannot be described -- pre-BIP34 heights only, which
-         * a live-seeded index never replays */
-        if (g_csi_inval) g_csi_inval("pre-BIP34 duplicate-coinbase overwrite");
+        /* 2026-09-16: the OLD coin's fields ARE in scope -- it is still in the
+         * set until the del below -- so the overwrite is described to the
+         * coinstats index as a remove of the old coin followed by an add of
+         * the new one, exactly what Core's coinstatsindex does across the
+         * BIP30 overwrites at 91,842 and 91,880. The index used to be
+         * INVALIDATED here on every fresh sync ("will re-seed", and the
+         * re-seed only came at the next boot): run 24 and run 26 both lost
+         * their coinstats index at height 91,842 and never got it back
+         * during the sync. The invalidation stays only for the case the old
+         * coin cannot be read, which would be a corrupt set, not BIP30. */
+        { extern long utxo_lsm_get(void* lst, void* u, const u8 txid[32], u32 index, u64* value,
+                                   unsigned long* height, unsigned long* is_coinbase, const u8** script, unsigned long* slen);
+          u64 ov = 0; unsigned long oh = 0, ocb = 0, osl = 0; const u8* osc = 0;
+          if (g_csi_rm && utxo_lsm_get(&g_utxo_lst, g_utxo_table, ctx->txid, out_index, &ov, &oh, &ocb, &osc, &osl) == 1){
+              g_csi_rm(ctx->txid, out_index, ov, (u64)oh, (u64)ocb, osc, osl);
+          } else if (g_csi_inval) g_csi_inval("pre-BIP34 duplicate-coinbase overwrite (old coin unreadable)"); }
         if (utxo_lsm_del(&g_utxo_lst, g_utxo_table, ctx->txid, out_index) < 0) {
             ctx->fatal = 1; return;
         }
         r = utxo_lsm_put(&g_utxo_lst, g_utxo_table, ctx->txid, out_index, value,
                          (u64)g_apply_height, (u64)ctx->is_coinbase, script, slen);
-        fprintf(stderr, "[utxo_live] h=%ld: duplicate coinbase outpoint overwritten (Core: AddCoins overwrite=fCoinbase)\n",
+        /* ...and the NEW coin is an add. The add above did not fire (the first
+         * put answered "duplicate"), so without this the index would carry
+         * the removal only and drift by one coin per overwrite. */
+        if (r == 1 && g_csi_add)
+            g_csi_add(ctx->txid, out_index, value, (u64)g_apply_height, (u64)ctx->is_coinbase, script, slen);
+        fprintf(stderr, "[utxo_live] h=%ld: duplicate coinbase outpoint overwritten (Core: AddCoins overwrite=fCoinbase); coinstats: remove old + add new\n",
                 g_apply_height);
     } else if (r == 0) {
         if (g_csi_inval) g_csi_inval("non-coinbase duplicate outpoint");

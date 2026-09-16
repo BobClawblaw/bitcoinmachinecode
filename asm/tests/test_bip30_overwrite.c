@@ -65,6 +65,23 @@ long mempool_resolve_confirmed_utxo(void* u, const u8 txid[32], unsigned long in
     fprintf(stderr, "unexpected mempool_resolve_confirmed_utxo\n"); abort();
 }
 
+/* 2026-09-16: the coinstats index must SURVIVE the overwrite. It used to be
+ * invalidated here ("will re-seed", and the re-seed only came at the next
+ * boot), so every fresh sync lost its coinstats index at 91,842. Core's
+ * coinstatsindex describes the overwrite as remove(old) + add(new); so do we
+ * now. These stubs record what the apply path tells the index. */
+typedef unsigned long long u64_;
+static int  g_csi_adds, g_csi_rms, g_csi_invals; static long g_csi_rm_height = -1, g_csi_add_height = -1;
+static void stub_add(const u8 txid[32], u32 index, u64 value, u64 height, u64 coinbase, const u8* script, unsigned long slen){
+    (void)txid;(void)index;(void)value;(void)coinbase;(void)script;(void)slen; g_csi_adds++; g_csi_add_height = (long)height; }
+static void stub_rm(const u8 txid[32], u32 index, u64 value, u64 height, u64 coinbase, const u8* script, unsigned long slen){
+    (void)txid;(void)index;(void)value;(void)coinbase;(void)script;(void)slen; g_csi_rms++; g_csi_rm_height = (long)height; }
+static void stub_inval(const char* why){ (void)why; g_csi_invals++; }
+static void stub_commit(long h){ (void)h; }
+extern void utxo_live_set_coinstats(void (*add)(const u8[32], u32, u64, u64, u64, const u8*, unsigned long),
+                                    void (*rm)(const u8[32], u32, u64, u64, u64, const u8*, unsigned long),
+                                    void (*inval)(const char*), void (*commit)(long));
+
 static int fails = 0;
 static void ck(const char* what, long got, long want){
     if (got == want) printf("PASS %-58s (got %ld)\n", what, got);
@@ -127,8 +144,16 @@ int main(void){
      * does correctly (verified: without this hook the apply below is refused).
      * Forcing the skip models 91,880 without forging a block hash. */
     utxo_live_test_force_bip30_skip(1);
+    utxo_live_set_coinstats(stub_add, stub_rm, stub_inval, stub_commit);
+    g_csi_adds = g_csi_rms = g_csi_invals = 0;
     ck("apply the SAME coinbase again at height 2000 (BIP30 skipped, as at 91,880)",
        utxo_live_test_apply_block(blk, (unsigned long)blklen, 2000), 1);
+    ck("coinstats: the overwrite does NOT invalidate the index", g_csi_invals, 0);
+    ck("coinstats: the OLD coin was removed once...", g_csi_rms, 1);
+    ck("...at its old height (1000)", g_csi_rm_height, 1000);
+    ck("coinstats: the NEW coin was added once...", g_csi_adds, 1);
+    ck("...at the new height (2000)", g_csi_add_height, 2000);
+    utxo_live_set_coinstats(0, 0, 0, 0);
     utxo_live_test_force_bip30_skip(0);
 
     u64 v1; unsigned long h1, cb1, sl1; const u8* sp1;

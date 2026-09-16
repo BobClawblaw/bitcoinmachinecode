@@ -115,35 +115,71 @@ static long txit_scan_max(int fd){
     return maxh;
 }
 
-/* Read the base index's to_height from txindex.dat's header, or -1. Trusts
- * the same torn-build check the reader applies: a header describing more
- * records than the file holds is treated as absent. */
-static long txit_base_to(void){
-    int fd = open("txindex.dat", O_RDONLY);
-    if (fd < 0) return -1;
-    uint8_t b[TXI_HDR];
-    struct stat sb;
-    long to = -1;
-    if (fstat(fd, &sb) == 0 && sb.st_size >= TXI_HDR &&
-        pread(fd, b, TXI_HDR, 0) == TXI_HDR && memcmp(b, TXI_MAGIC, 8) == 0){
-        uint64_t n = 0, so = 0;
-        for (int i = 0; i < 8; i++) n  |= (uint64_t)b[8+i]  << (8*i);
-        for (int i = 0; i < 8; i++) so |= (uint64_t)b[16+i] << (8*i);
-        if (TXI_HDR + n * TXI_REC == so && so <= (uint64_t)sb.st_size){
-            uint32_t t = 0;
-            for (int i = 0; i < 4; i++) t |= (uint32_t)b[36+i] << (8*i);
-            to = (long)t;
-        }
-    }
-    close(fd);
+/* ---- run-set awareness (2026-09-16, index_runs.h) -------------------------
+ * The base is a SET of sorted runs now, built by the daemon behind the
+ * applied height during the sync; the tail covers whatever is above the
+ * highest run. Two consequences for this file:
+ *   - "no base" no longer disables the tail: a fresh sync starts the tail
+ *     at genesis and the first run folds it within run_blocks heights, so
+ *     the linear scan stays bounded by the run interval, never the chain;
+ *   - when a run is committed, the tail's records at or below its to
+ *     height are duplicates of sorted ones and are dropped by rewriting the
+ *     file (the tail is height-ordered, so this is a prefix). Readers that
+ *     mapped the old inode keep a valid mapping; they remap on the next
+ *     size change and rescan from zero when the file shrank. */
+#include "index_runs.h"
+static long txit_runs_to(void){
+    static irunset_t s; static int init;
+    if (!init){ irs_init(&s, "txindex", TXI_MAGIC, TXI_REC, TXI_SPARSE); init = 1; }
+    irs_dirty(&s);
+    long to = irs_covered_to(&s);
+    irs_close_all(&s);                 /* the writer keeps no mappings */
     return to;
 }
+/* a run reaching `to` was committed: drop the tail's records at or below it */
+void txit_runs_advanced(long to){
+    if (g_fd < 0) return;
+    struct stat sb; if (fstat(g_fd, &sb) != 0) return;
+    long nrec = (long)(sb.st_size / TXI_REC);
+    if (nrec == 0) return;
+    enum { CHUNK = 4096 };
+    uint8_t* buf = malloc((size_t)CHUNK * TXI_REC); if (!buf) return;
+    /* records are height-ordered: find the first one above `to` */
+    long keep_from = nrec;
+    for (long i = 0; i < nrec && keep_from == nrec; i += CHUNK){
+        long n = nrec - i < CHUNK ? nrec - i : CHUNK;
+        if (pread(g_fd, buf, (size_t)n * TXI_REC, (off_t)i * TXI_REC) != n * TXI_REC) break;
+        for (long k = 0; k < n; k++){
+            const uint8_t* r = buf + k * TXI_REC; uint32_t hh = 0;
+            for (int b = 0; b < 4; b++) hh |= (uint32_t)r[8+b] << (8*b);
+            if ((long)hh > to){ keep_from = i + k; break; }
+        }
+    }
+    if (keep_from == 0){ free(buf); return; }             /* nothing to drop */
+    const char* tmp = "txindex.tail.rot";
+    int nfd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (nfd < 0){ free(buf); return; }
+    long ok = 1;
+    for (long i = keep_from; i < nrec && ok; i += CHUNK){
+        long n = nrec - i < CHUNK ? nrec - i : CHUNK;
+        if (pread(g_fd, buf, (size_t)n * TXI_REC, (off_t)i * TXI_REC) != n * TXI_REC){ ok = 0; break; }
+        if (write(nfd, buf, (size_t)n * TXI_REC) != n * TXI_REC) ok = 0;
+    }
+    free(buf);
+    if (!ok || fsync(nfd) != 0 || close(nfd) != 0 || rename(tmp, "txindex.tail") != 0){ unlink(tmp); return; }
+    int fd = open("txindex.tail", O_RDWR | O_APPEND);
+    if (fd < 0) return;                                     /* keep appending to the old inode */
+    close(g_fd); g_fd = fd;
+    fprintf(stderr, "[txindex] tail rotated: %ld records folded into runs (to %ld), %ld kept\n", keep_from, to, nrec - keep_from);
+}
+
+static long txit_base_to(void){ return txit_runs_to(); }
 
 /* Bring the tail up to `tip`, reading missed blocks from the archive.
  * Returns the number of blocks appended, or -1 on a read failure (the
  * covered height stays where the failure left it; the next call retries). */
 static long txit_backfill(void* store_buf, long tip){
-    if (g_fd < 0 || g_covered < 0) return 0;
+    if (g_fd < 0) return 0;                /* covered == -1 means "from genesis" now (2026-09-16), not disabled */
     long done = 0;
     static uint8_t* blockbuf;
     if (!blockbuf && !(blockbuf = malloc(TXIT_BLOCKBUF))) return -1;
@@ -164,11 +200,8 @@ static long txit_backfill(void* store_buf, long tip){
  * Establishes coverage and closes any gap up to the current tip. */
 void txit_boot(void* store_buf){
     long base_to = txit_base_to();
-    if (base_to < 0){
-        fprintf(stderr, "[txindex] no base txindex.dat -- tail maintenance disabled "
-                        "(build one with daemon/bmc_build_tx_index first)\n");
-        return;
-    }
+    if (base_to < 0)
+        fprintf(stderr, "[txindex] no run yet -- the tail starts at genesis; the trailing builder folds it into runs\n");
     int fd = open(TXI_TAIL_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
     if (fd < 0){ fprintf(stderr, "[txindex] cannot open %s -- tail disabled\n", TXI_TAIL_FILE); return; }
     long tail_max = txit_scan_max(fd);

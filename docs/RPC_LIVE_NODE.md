@@ -994,6 +994,13 @@ follow the tip. `txindex=1` in the config therefore still changes nothing,
 and now says exactly that rather than claiming the feature is absent.
 Incremental maintenance is the obvious next step.
 
+> **Superseded 2026-09-16.** Both halves of that limit are gone. The tail
+> (slice 20, below) made the index follow the tip, and the trailing builder
+> now makes the BASE during the sync too: the index is a set of sorted runs
+> the daemon builds behind the applied height from the first blocks on, so
+> `txindex=1` means what it means in Core and nothing is built afterwards.
+> See `docs/devlog/INDEX_RUNS.md`.
+
 ## Slice 19 — ZMQ notifications — (2026-08-26)
 `zmqpubhashblock` / `zmqpubhashtx` / `zmqpubrawblock` / `zmqpubrawtx` in
 bitcoin.conf now work, speaking to any libzmq subscriber. This is the
@@ -1113,6 +1120,14 @@ scans the tail after a base miss and reports combined coverage in
 getindexinfo and the covered-range refusal. The per-block walk lives once,
 in `daemon/txi_format.h`, shared by the offline builder and the tail
 writer.
+
+> **Extended 2026-09-16.** The base is no longer offline-only: the same
+> builder is spawned by the daemon over one height range at a time
+> (`daemon/index_trail.h`) and its output is a RUN of the index; the reader
+> asks every run before the tail, and the tail is rotated to drop what a new
+> run covers, so its linear scan is bounded by the run interval rather than
+> by "time since the last offline build". A tail with no base at all now
+> starts at genesis instead of disabling itself.
 
 ## Slice 21 — gettxout answers, the wallet view, and submitpackage — (2026-08-27)
 

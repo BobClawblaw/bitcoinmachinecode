@@ -13,9 +13,9 @@ Landed 2026-09-08 (#99, #100, #102-#108, #111).
 | route family | source | needs |
 |---|---|---|
 | `/blocks/tip/*`, `/block/*`, `/block-height/*`, `/v1/block/*/summary` | the archive and headers | — |
-| `/tx/*` with fees and prevouts, `/tx/*/status`, `/tx/*/outspends`, `/tx/*/merkle-proof` | the archive, the tx index, the rev store, the txospender index | `txindex.dat` (`bmc_build_tx_index`), `txospender.dat` (`bmc_build_txospender_index`) |
+| `/tx/*` with fees and prevouts, `/tx/*/status`, `/tx/*/outspends`, `/tx/*/merkle-proof` | the archive, the tx index, the rev store, the txospender index | `txindex=1`, `txospenderindex=1` |
 | `/mempool`, `/mempool/txids`, `/fees/*`, `POST /tx` | the live mempool | — |
-| `/address/:a`, `/address/:a/txs*`, `/address/:a/utxo` | the address history index + the live address index + the mempool | the history build, then `addrindex=1` |
+| `/address/:a`, `/address/:a/txs*`, `/address/:a/utxo` | the address history runs + the live journal + the mempool | `addrindex=1`, set BEFORE the sync |
 | `/scripthash/*` | — | refused (501) |
 
 Fees and prevouts exist for every block because undo data is kept for the
@@ -28,13 +28,17 @@ needs `-reindex-chainstate`.
 ```ini
 bmc.esploraport=3005          # the facade; 0 (default) leaves it off
 bmc.esplorabind=127.0.0.1     # loopback unless a proxy fronts it
-addrindex=1                   # after the history build (below)
+addrindex=1                   # BEFORE the sync (see below)
+txindex=1                     # the daemon builds these during the sync
+txospenderindex=1
+blockfilterindex=1
+coinstatsindex=1
 ```
 
-The tx index and the txospender index are built offline
-(`daemon/bmc_build_tx_index <datadir>`, `daemon/bmc_build_txospender_index
-<datadir>`) and used when their files exist; the daemon's `txindex=1` key
-has no effect on that. `OPERATIONS.md` has both procedures.
+Since 2026-09-16 the daemon builds every one of these **during** the sync,
+as sorted runs trailing the applied height, so a fresh node is ready for
+mempool.space when it reaches the tip and there is no build step afterwards
+(`docs/devlog/INDEX_RUNS.md`).
 
 The facade is unauthenticated: keep it on loopback or behind a proxy that
 mempool.space's frontend reaches. It takes the RPC lock per dispatch, not
@@ -44,19 +48,25 @@ incident (twelve minutes of RPC stalls under one batch) is why.
 
 ## The address history index
 
-Address pages need every funding and spend event per address for the
-whole chain. Build it once, offline from the daemon's point of view:
+Address pages need every funding and spend event per address for the whole
+chain. Set `addrindex=1` **before the node syncs** and the daemon does the
+rest: the live journal records every event from genesis, and every
+`bmc.indexrunblocks` heights (default 20,000) the trailing builder folds the
+next range into a sorted run whose spends come from undo, rotates the
+journal, and merges runs when they pile up. The facade's `/address` routes
+read the runs plus the journal, so they answer from the first run onward.
+
+`addrindex=1` cannot be enabled on an already-synced node: undo below
+tip−200 is pruned, so historic spends are unreconstructable and boot refuses
+loudly rather than serve a history that under-reports. For a node in that
+position there is still the one-off whole-chain build:
 
 ```sh
-asm/daemon/bmc_build_addr_hist /path/to/data/main       # hours; ~200 GB
+asm/daemon/bmc_build_addr_hist /path/to/data/main       # hours; ~200 GB out, ~700 GB temp
 ```
 
-Three bucketed passes over the archive; the build needs about 700 GB of
-temporary space on the same filesystem, prints one line per bucket, and
-writes `addr_hist.dat`. Then set `addrindex=1` and restart once: the live
-address index's tail journal adopts the build height and carries the
-history forward from there. The facade answers 501 for addresses until
-the file exists and remaps to a rebuilt file on its own.
+which writes `addr_hist.dat` — the same format, simply the run that starts at
+0. Nothing on a fresh sync needs it.
 
 ## Configuring mempool.space
 

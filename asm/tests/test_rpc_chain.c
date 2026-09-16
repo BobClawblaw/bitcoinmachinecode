@@ -205,8 +205,46 @@ static void trc_hex_rev(char* out, const unsigned char* b, size_t n){
  * every later by-txid assertion exercise BOTH lookup paths: the coinbase
  * txids resolve through the base, the height-3 spends through the tail,
  * and the byte-identity check proves the two render identically. */
+typedef struct { unsigned char pre[8]; unsigned int h, off, len; } fx_rec_t;
+/* one sorted run file in the txid index's format (a base is the run that
+ * starts at 0); records sorted by prefix, one sparse sample */
+static void fx_write_sorted(const char* path, fx_rec_t* recs, int n, long from, long to){
+    for (int i = 1; i < n; i++){                  /* sort by prefix */
+        fx_rec_t k = recs[i]; int j = i - 1;
+        while (j >= 0 && memcmp(recs[j].pre, k.pre, 8) > 0){ recs[j+1] = recs[j]; j--; }
+        recs[j+1] = k;
+    }
+    FILE* f = fopen(path, "wb");
+    unsigned char hdr[48]; memset(hdr, 0, sizeof hdr);
+    fwrite(hdr, 1, 48, f);
+    for (int i = 0; i < n; i++){
+        unsigned char r[20];
+        memcpy(r, recs[i].pre, 8);
+        for (int b = 0; b < 4; b++) r[8+b]  = (unsigned char)(recs[i].h   >> (8*b));
+        for (int b = 0; b < 4; b++) r[12+b] = (unsigned char)(recs[i].off >> (8*b));
+        for (int b = 0; b < 4; b++) r[16+b] = (unsigned char)(recs[i].len >> (8*b));
+        fwrite(r, 1, 20, f);
+    }
+    unsigned long long sparse_off = 48 + (unsigned long long)n * 20;
+    unsigned char sp[16];                          /* one sample: record 0 */
+    memcpy(sp, n ? recs[0].pre : (unsigned char*)"\0\0\0\0\0\0\0\0", 8);
+    for (int b = 0; b < 8; b++) sp[8+b] = (unsigned char)(48ULL >> (8*b));
+    fwrite(sp, 1, 16, f);
+    memcpy(hdr, "BMCTXIDX", 8);
+    for (int b = 0; b < 8; b++) hdr[8+b]  = (unsigned char)((unsigned long long)n >> (8*b));
+    for (int b = 0; b < 8; b++) hdr[16+b] = (unsigned char)(sparse_off >> (8*b));
+    for (int b = 0; b < 8; b++) hdr[24+b] = (unsigned char)(1ULL >> (8*b));
+    for (int b = 0; b < 4; b++) hdr[32+b] = (unsigned char)((unsigned int)from >> (8*b));
+    for (int b = 0; b < 4; b++) hdr[36+b] = (unsigned char)((unsigned int)to >> (8*b));
+    fseek(f, 0, SEEK_SET); fwrite(hdr, 1, 48, f);
+    fclose(f);
+}
+/* 2026-09-16: heights (base_to, run_to] go into a RUN file
+ * (txindex.r<from>-<to>.dat, daemon/index_runs.h) so every by-txid assertion
+ * below exercises all THREE lookup paths: base, run, tail. -1 = no run. */
+static long g_fixture_run_to = -1;
 static void build_fixture_txindex(long base_to, long tip){
-    typedef struct { unsigned char pre[8]; unsigned int h, off, len; } rec_t;
+    typedef fx_rec_t rec_t;
     static rec_t recs[64]; int n = 0;
     for (long h = 0; h <= tip; h++){
         static unsigned char blk[4096];
@@ -244,11 +282,13 @@ static void build_fixture_txindex(long base_to, long tip){
             n++;
         }
     }
-    { /* heights above base_to: unsorted 20-byte records in the tail file */
+    { /* heights above base_to: the run file, then unsorted 20-byte records in the tail file */
+        static rec_t run[64]; int nrun = 0;
         FILE* tf = fopen("txindex.tail", "wb");
         int kept = 0;
         for (int i = 0; i < n; i++){
             if (recs[i].h <= (unsigned int)base_to){ recs[kept++] = recs[i]; continue; }
+            if (g_fixture_run_to >= 0 && recs[i].h <= (unsigned int)g_fixture_run_to){ run[nrun++] = recs[i]; continue; }
             unsigned char r[20];
             memcpy(r, recs[i].pre, 8);
             for (int b = 0; b < 4; b++) r[8+b]  = (unsigned char)(recs[i].h   >> (8*b));
@@ -258,36 +298,13 @@ static void build_fixture_txindex(long base_to, long tip){
         }
         fclose(tf);
         n = kept;
+        if (g_fixture_run_to >= 0){
+            char rn[300]; snprintf(rn, sizeof rn, "txindex.r%09ld-%09ld.dat", base_to + 1, g_fixture_run_to);
+            fx_write_sorted(rn, run, nrun, base_to + 1, g_fixture_run_to);
+            printf("      (fixture txindex run %s: %d records)\n", rn, nrun);
+        }
     }
-    for (int i = 1; i < n; i++){                  /* sort by prefix */
-        rec_t k = recs[i]; int j = i - 1;
-        while (j >= 0 && memcmp(recs[j].pre, k.pre, 8) > 0){ recs[j+1] = recs[j]; j--; }
-        recs[j+1] = k;
-    }
-    FILE* f = fopen("txindex.dat", "wb");
-    unsigned char hdr[48]; memset(hdr, 0, sizeof hdr);
-    fwrite(hdr, 1, 48, f);
-    for (int i = 0; i < n; i++){
-        unsigned char r[20];
-        memcpy(r, recs[i].pre, 8);
-        for (int b = 0; b < 4; b++) r[8+b]  = (unsigned char)(recs[i].h   >> (8*b));
-        for (int b = 0; b < 4; b++) r[12+b] = (unsigned char)(recs[i].off >> (8*b));
-        for (int b = 0; b < 4; b++) r[16+b] = (unsigned char)(recs[i].len >> (8*b));
-        fwrite(r, 1, 20, f);
-    }
-    unsigned long long sparse_off = 48 + (unsigned long long)n * 20;
-    unsigned char sp[16];                          /* one sample: record 0 */
-    memcpy(sp, recs[0].pre, 8);
-    for (int b = 0; b < 8; b++) sp[8+b] = (unsigned char)(48ULL >> (8*b));
-    fwrite(sp, 1, 16, f);
-    memcpy(hdr, "BMCTXIDX", 8);
-    for (int b = 0; b < 8; b++) hdr[8+b]  = (unsigned char)((unsigned long long)n >> (8*b));
-    for (int b = 0; b < 8; b++) hdr[16+b] = (unsigned char)(sparse_off >> (8*b));
-    for (int b = 0; b < 8; b++) hdr[24+b] = (unsigned char)(1ULL >> (8*b));
-    for (int b = 0; b < 4; b++) hdr[32+b] = 0;
-    for (int b = 0; b < 4; b++) hdr[36+b] = (unsigned char)((unsigned int)base_to >> (8*b));
-    fseek(f, 0, SEEK_SET); fwrite(hdr, 1, 48, f);
-    fclose(f);
+    fx_write_sorted("txindex.dat", recs, n, 0, base_to);
     printf("      (fixture txindex: %d base records + tail)\n", n);
 }
 
@@ -1879,7 +1896,9 @@ int main(void){
          r2 == NULL && e2 == -5 && m2 && !strstr(m2, "with no txindex") && strstr(m2, "index"));
       rj_free(r2); }
 
-    build_fixture_txindex(2, 3);   /* base covers 0..2; height 3 lives in the TAIL */
+    g_fixture_run_to = 2;            /* height 2: through the RUN file */
+
+    build_fixture_txindex(1, 3);   /* base covers 0..2; height 3 lives in the TAIL */
     /* no reopen needed: txi_open latches on success, so the index is picked
      * up on the next lookup -- which is also what an operator building the
      * index against a running node needs. */
