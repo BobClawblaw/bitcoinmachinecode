@@ -17,7 +17,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <stdlib.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include "../daemon/node_config.h"
 
@@ -215,6 +217,93 @@ int main(void){
            mempool_time_of(ids[1]) == 0);
 
         for (int i = 0; i < N; i++) mempool_forget_for_test(ids[i]);
+    }
+
+    /* ---- CONCURRENT inserts must not lose each other ----------------------
+     * This table is written by SEVERAL PROCESSES with no lock: the node forks
+     * per connection, the mapping is MAP_SHARED, and mempool_note_accept runs
+     * AFTER mp_unlock in daemon/tx_accept.c. Two accepts probing to the same
+     * free slot at the same moment both used to write it, and one of them was
+     * simply lost -- an arrival time gone with no error anywhere.
+     *
+     * A mutex is NOT the fix and the reason belongs next to the test:
+     * mempool_expire_now calls into the policy layer while iterating this
+     * table, and that path returns through mempool_forget, so a lock held
+     * across the iteration would meet itself. mp_lock's mutex has no settype,
+     * i.e. non-recursive, so that deadlocks a production node. The slot is
+     * claimed with an atomic CAS instead.
+     *
+     * The fixture forces CONTENTION rather than hoping for it: every child
+     * inserts the SAME ids, so each id is raced by all of them. */
+    {
+        enum { KIDS = 10, PER = 8000 };
+        unsigned char (*ids)[32] = malloc((size_t)PER * 32);
+        for (int i = 0; i < PER; i++){
+            memset(ids[i], 0, 32);
+            ids[i][0] = (unsigned char)(i & 0xff);
+            ids[i][1] = (unsigned char)((i >> 8) & 0xff);
+            ids[i][2] = 0xB3;
+        }
+        /* A SHARED START BARRIER, because hoping for overlap is not a test.
+         * Forking and letting each child run immediately, the children finished
+         * before the next was forked and the race never happened: the first
+         * version of this caught 889 duplicates once and then detected nothing
+         * on five consecutive runs, including with the fix removed. The
+         * children now spin until the parent releases them together, so the
+         * contention is produced rather than awaited. */
+        int* go = mmap(0, sizeof(int), PROT_READ|PROT_WRITE,
+                       MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+        ck("start barrier mapped", go != MAP_FAILED);
+        *go = 0;
+        for (int k = 0; k < KIDS; k++){
+            pid_t c = fork();
+            if (c == 0){
+                while (!__atomic_load_n(go, __ATOMIC_ACQUIRE)) ;     /* all start together */
+                /* each child walks the same ids from a different offset, so
+                 * every id is raced and the probes interleave */
+                for (int i = 0; i < PER; i++) mempool_note_accept(ids[(i + k * 97) % PER]);
+                _exit(0);
+            }
+        }
+        __atomic_store_n(go, 1, __ATOMIC_RELEASE);
+        for (int k = 0; k < KIDS; k++){ int w; wait(&w); }
+        munmap(go, sizeof(int));
+
+        long missing = 0;
+        for (int i = 0; i < PER; i++) if (mempool_time_of(ids[i]) == 0) missing++;
+        ck("no entry is LOST when several processes insert at once", missing == 0);
+        if (missing) printf("      %ld of %d went missing under %d-way contention\n", missing, PER, KIDS);
+
+        /* A duplicate CAN still happen: the probe-order tie-break closes the
+         * common case, but not the window where the loser scans before the
+         * winner publishes -- 29 of 3,000 survived it under this barrier. What
+         * must NOT happen is a duplicate outliving its removal, because that
+         * leaves an arrival time for a transaction the pool no longer holds
+         * and mempool_time_of keeps answering with it. So the property pinned
+         * here is the one that matters: ONE forget clears EVERY copy. */
+        long ghosts = 0;
+        for (int i = 0; i < PER; i++){
+            mempool_forget_for_test(ids[i]);
+            if (mempool_time_of(ids[i]) != 0) ghosts++;
+        }
+        ck("...and ONE forget clears every copy, leaving no ghost", ghosts == 0);
+        if (ghosts) printf("      %ld entr(ies) survived their own removal\n", ghosts);
+        /* WHAT THIS FIXTURE DOES AND DOES NOT COVER, measured rather than
+         * assumed. Reverting "clear every copy" fails it on 5 runs of 5.
+         * Reverting the atomic slot CLAIM does not fail it at all, and neither
+         * does making a lookup stop at a CLAIMED slot: both need two processes
+         * to reach the same FREE slot at the same instant, and with ~4M slots
+         * against 8,000 ids that does not happen often enough to catch. The
+         * contention this fixture really produces is on the same TXID, which
+         * is what the ghost check exercises.
+         *
+         * The claim is kept on reasoning rather than coverage, and the
+         * reasoning is in mempool_cfg.c: without it two processes memcpy a
+         * txid into one slot and the result matches nothing, so the entry is
+         * unreachable AND unremovable until the expiry sweep. Catching that
+         * would need the table driven near capacity, which is not this test. */
+        for (int i = 0; i < PER; i++) mempool_forget_for_test(ids[i]);
+        free(ids);
     }
 
     /* ---- the persisted arrival time (mempool.dat entry_time) --------------
