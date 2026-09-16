@@ -534,6 +534,37 @@ list this node does not have. All three stay on the warning list.
   the BIP30 overwrite. A fresh sync ends with every index current and the same
   trailing builders keep it so.
 
+- **An idle outbound leg is never pinged and so never times out.** Measured on
+  run 26, 2026-09-16, with `getpeerinfo` and the node's own log:
+
+  ```
+  addr                     conn_age  last_recv  last_send   bytesrecv
+  184.171.208.109:8333        2169s      2169s      2169s        1348
+  173.231.31.178:8333         2169s      2169s      2169s        1348
+  34.102.75.53:8333           2169s      2169s      2169s         150
+  ```
+
+  These are `outbound 0/1/2` -- the relay legs. They completed the handshake,
+  negotiated compact blocks, and then exchanged NOTHING for 36 minutes while
+  the 8 download-worker peers were at 7 s and gigabytes. `ping-timeout` closes
+  this boot: **0**.
+
+  The mechanism is not missing, it is unreachable. `leg_ping_timed_out` is
+  `sent != 0 && pong_at < sent && now - sent >= 1200`, so a leg the node has
+  never pinged (`sent == 0`) can never time out -- and `last_send == conn_age`
+  says it never pinged these. `leg_ping_due` returns true for `sent == 0`, so
+  the ping should go out on the first sweep; `legs_sweep_except` skips any leg
+  where `leg_pass_busy(k)` ("a pass helper owns that socket"), which is the
+  first thing to check.
+
+  Cost: three outbound slots held by peers that will never speak, for the life
+  of the process, and a monitor correctly reporting them as dead. Core pings
+  every 2 minutes and disconnects at 20 (`TIMEOUT_INTERVAL`), which this node
+  copies in the constants and not in the reachable path.
+
+  NOT fixed: found while the index-run work was mid-flight, and filed rather
+  than started, because the session already had one unproven fix in it.
+
 ## Update 2026-08-30 — Erlay: a deliberate stopping point
 
 BIP330 splits into negotiation (`sendtxrcncl`: version and salt exchange, and

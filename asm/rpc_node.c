@@ -121,9 +121,56 @@ static long node_client_version(void){
     return 10000L*NODE_VERSION_MAJOR + 100L*NODE_VERSION_MINOR + NODE_VERSION_PATCH;
 }
 
+/* ---- one definition of "a live connection" (2026-09-16) -------------------
+ * getpeerinfo walks the shared peer table and reports every used slot;
+ * getconnectioncount and getnetworkinfo used to return g_status->n_out +
+ * n_inbound instead, counters that only the serve/leg path maintains. The
+ * download worker fills peer slots but never touches those counters, so
+ * during initial block download the three disagreed: on run 26, getpeerinfo
+ * listed 13 peers, getconnectioncount said 5, and the node was pulling
+ * 11 MB/s from 8 download peers the count could not see. A monitor graphing
+ * getconnectioncount showed a node with no peers while it saturated the link.
+ *
+ * In Core these cannot disagree -- getconnectioncount is the size of the same
+ * vector getpeerinfo renders -- so they are now derived from one walk with
+ * one liveness test. rpc_peer_live() is that test, and getpeerinfo uses it
+ * too, so a slot can never be counted and not listed (or the reverse). */
+static int rpc_peer_live(const rpc_peer_t* p){
+    if (!p->used) return 0;
+    /* a serve child that died holding its slot: the pid is gone */
+    if (p->inbound && p->pid > 0 && kill((pid_t)p->pid, 0) != 0 && errno == ESRCH) return 0;
+    return 1;
+}
+/* live connections, split in/out. Either pointer may be NULL.
+ *
+ * getpeerinfo renders TWO arrays and so does this: the leg/inbound table
+ * (g_status->peers) and the parallel download's peers (g_status->dlpeers,
+ * one per worker holding a connection, added 2026-09-08). Walking only the
+ * first is how the first version of this fix still answered 4 while
+ * getpeerinfo listed 12 on run 26 -- the 8 download peers were the whole
+ * point. Every download peer is outbound. */
+static int rpc_conn_counts(int* out_in, int* out_out){
+    int n_in = 0, n_out = 0;
+    if (g_status){
+        for (int i = 0; i < RPC_MAX_PEERS; i++){
+            const rpc_peer_t* p = &g_status->peers[i];
+            if (!rpc_peer_live(p)) continue;
+            if (p->inbound) n_in++; else n_out++;
+        }
+        int nd = g_status->n_dlpeers; if (nd > 64) nd = 64;
+        for (int i = 0; i < nd; i++){
+            const rpc_peer_t* p = &g_status->dlpeers[i];
+            if (!p->used || !p->addr[0]) continue;   /* getpeerinfo's own test */
+            n_out++;
+        }
+    }
+    if (out_in)  *out_in  = n_in;
+    if (out_out) *out_out = n_out;
+    return n_in + n_out;
+}
+
 static int cmd_getconnectioncount(rj_val** res){
-    int n = g_status ? (g_status->n_out + g_status->n_inbound) : 0;
-    *res = rj_numf("%d", n < 0 ? 0 : n);
+    *res = rj_numf("%d", rpc_conn_counts(NULL, NULL));
     return 1;
 }
 
@@ -192,10 +239,8 @@ void rpc_node_set_relay_floors(unsigned long long minrelay_satkvb, unsigned long
 #define MEMPOOL_MINFEE_BTC ((double)g_minrelay_satkvb / 1e8)      /* min relay fee, BTC/kvB */
 
 static int cmd_getnetworkinfo(rj_val** res){
-    int n_out = g_status ? g_status->n_out : 0;
-    int n_in  = g_status ? g_status->n_inbound : 0;
-    if (n_out < 0) n_out = 0;
-    if (n_in  < 0) n_in  = 0;
+    int n_in = 0, n_out = 0;
+    rpc_conn_counts(&n_in, &n_out);
 
     rj_val* o = rj_obj();
     rj_obj_set(o, "version", rj_numf("%ld", node_client_version()));
@@ -377,8 +422,7 @@ static int cmd_getpeerinfo(rj_val** res){
     if (g_status){
         for (int i = 0; i < RPC_MAX_PEERS; i++){
             const rpc_peer_t* p = &g_status->peers[i];
-            if (!p->used) continue;
-            if (p->inbound && p->pid > 0 && kill((pid_t)p->pid, 0) != 0 && errno == ESRCH) continue;   /* a serve child that died with its slot */
+            if (!rpc_peer_live(p)) continue;   /* the same test getconnectioncount counts with */
             rj_val* o = rj_obj();
             /* RPC-3 (audit 2026-09-03): report the peer's OWN monotonic
              * nodeid, not a counter over the live slots. The counter and the
