@@ -22,6 +22,7 @@
 #include <string.h>
 #include "test_tmpdir.h"
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 extern int  store_init(void* st);
@@ -79,7 +80,7 @@ int main(void){
     tt_isolate();
 
     enum { AT_OPEN = 64, GROWN = 8192 };
-    char hash_at_open[65], hash_grown[65], hash_low[65];
+    char hash_at_open[65], hash_grown[65], hash_low[65], hash_mid[65];
 
     memset(g_st, 0, sizeof g_st);
     if (store_init(g_st) != 1){ printf("FAIL store_init\n"); return 1; }
@@ -106,6 +107,7 @@ int main(void){
           unsigned char blk[128]; long n = mk_block(blk, h);
           sha256d(last, blk, (unsigned long)n);
           if (h == GROWN) tohex_rev(hash_grown, last, 32);
+          if (h == 6000)  tohex_rev(hash_mid, last, 32);
       } }
     { pid_t pid = fork();
       if (pid == 0){
@@ -125,6 +127,33 @@ int main(void){
          WIFEXITED(ws) && WEXITSTATUS(ws) == 0);
     }
 
+    /* ---- records that are NOT THERE YET when a fold runs ------------------
+     * The downloader pre-extends index.dat with zero records up to the header
+     * count, so the store's tip runs ahead of the records that exist. Run 24,
+     * run 25 and a probe node (2026-09-16) all showed the same thing: one fold
+     * ran over the whole extent, inserted the few records present, and marked
+     * the extent folded -- after which no block stored later was ever findable
+     * by hash. Emulated here exactly, BEFORE the reader has folded any of the new
+     * heights: blank a band of the writer's records, make the reader fold over
+     * the blank, put the records back, look one up. (An earlier draft blanked
+     * after the fold and passed against the unfixed code -- the order is the
+     * whole test.) */
+    {
+        enum { BLANK_FROM = 4000 };
+        long nrec = GROWN - BLANK_FROM + 1;
+        unsigned char* saved = malloc((size_t)nrec * 48);
+        unsigned char* zeros = calloc((size_t)nrec, 48);
+        int fd = open("index.dat", O_RDWR);
+        ck("index.dat opens for the blanking", fd >= 0 && saved && zeros);
+        ck("saved the band", pread(fd, saved, (size_t)nrec * 48, (off_t)BLANK_FROM * 48) == (ssize_t)(nrec * 48));
+        ck("blanked the band (records look unwritten)", pwrite(fd, zeros, (size_t)nrec * 48, (off_t)BLANK_FROM * 48) == (ssize_t)(nrec * 48));
+        { rj_val* res = NULL; long ec; const char* em;             /* a fold over the blank */
+          rpc_chain_dispatch("getblockcount", NULL, &res, &ec, &em); if (res) rj_free(res); }
+        ck("restored the band (the writer caught up)", pwrite(fd, saved, (size_t)nrec * 48, (off_t)BLANK_FROM * 48) == (ssize_t)(nrec * 48));
+        close(fd); free(saved); free(zeros);
+        ck("a block whose record landed AFTER a fold over its height resolves", resolves(hash_mid));
+    }
+
     /* the tip advances for the RPC view (this is what getblockcount reports
      * and what drives the index fold) */
     { rj_val* res = NULL; long ec; const char* em;
@@ -133,6 +162,7 @@ int main(void){
 
     ck("a block appended AFTER open resolves by hash", resolves(hash_grown));
     ck("an early block still resolves after growth", resolves(hash_low));
+
 
     printf(fails ? "\nFAILURES: %d\n" : "\nall good\n", fails);
     return fails ? 1 : 0;

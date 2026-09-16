@@ -72,6 +72,7 @@
 #include "daemon/log_ts.h"
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <stdint.h>
 #include <time.h>
 #include <unistd.h>
@@ -245,21 +246,49 @@ static int rec_present(const u8 rec[48]){ return rd32(rec) != 0; }
 
 /* Load index.dat records [from, to] into the table, keyed by the RAW record
  * hash bytes (wire order). Returns 0 ok / 2 table full. */
-static int idx_load_range(void* idx, long from, long to){
+/* fold counters for the [idx] trace: what the last idx_load_range saw */
+static long g_lr_read, g_lr_present, g_lr_new, g_lr_dup, g_lr_short, g_lr_err;
+/* Load index.dat records [from, to] into the table, keyed by the RAW record
+ * hash bytes (wire order). Returns 0 ok / 2 table full.
+ *
+ * *folded_to is the highest height h such that EVERY record in [from, h] was
+ * present (from-1 when the first is absent). It is the only thing the caller
+ * may advance the fold point to. Records above the first hole are still
+ * inserted when present (idx_put dedups a re-read), but they do not move the
+ * fold point, so the hole is read again next time.
+ *
+ * Why (run 24/25 and the probe node, 2026-09-16): the downloader pre-extends
+ * index.dat with ZERO records up to the header count, and the store's tip
+ * follows the file's extent. The fold once ran over 1..967,314 when 13,880
+ * records existed, inserted those, and marked the whole extent folded -- so no
+ * fold ever ran again and every block stored afterwards was "Block not found"
+ * by hash for the rest of IBD. A read error is not a fold either: it used to
+ * return "ok" and advance past whatever it failed to read. */
+static int idx_load_range(void* idx, long from, long to, long* folded_to){
     long fd = ST_IDX_FD(g_st);
     enum { CHUNK = 4096 };
     static u8 buf[CHUNK * 48];
+    long contiguous = from - 1; int hole = 0;
+    g_lr_read = g_lr_present = g_lr_new = g_lr_dup = g_lr_short = g_lr_err = 0;
     for (long h = from; h <= to; h += CHUNK){
         long n = to - h + 1; if (n > CHUNK) n = CHUNK;
         ssize_t got = pread(fd, buf, (size_t)n * 48, (off_t)h * 48);
-        if (got < 0) return 0;
+        if (got < 0){ g_lr_err = errno; *folded_to = contiguous; return 0; }
         long have = got / 48;
+        if (have < n){ g_lr_short++; }
+        g_lr_read += have;
         for (long i = 0; i < have; i++){
             const u8* rec = buf + i * 48;
-            if (!rec_present(rec)) continue;
-            if (idx_put(idx, rec, h + i) == 2) return 2;
+            if (!rec_present(rec)){ hole = 1; continue; }
+            g_lr_present++;
+            int r = idx_put(idx, rec, h + i);
+            if (r == 2){ *folded_to = contiguous; return 2; }
+            if (r == 1) g_lr_new++; else g_lr_dup++;
+            if (!hole) contiguous = h + i;
         }
+        if (have < n) hole = 1;                 /* short read: the rest is absent */
     }
+    *folded_to = contiguous;
     return 0;
 }
 static int idx_alloc(unsigned long slots){
@@ -269,16 +298,31 @@ static int idx_alloc(unsigned long slots){
     free(g_idx); g_idx = n; g_idx_slots = slots; g_idx_tip = -1;
     return 1;
 }
-/* Fold every height in (g_idx_tip, tip] into the hash index, rebuilding
- * bigger if it fills. */
+/* Fold every present height in (g_idx_tip, tip] into the hash index,
+ * rebuilding bigger if it fills. The fold point advances only over records
+ * that were actually there (see idx_load_range). */
 static void idx_sync(long tip){
     if (!g_idx) return;
-    int r = idx_load_range(g_idx, g_idx_tip + 1, tip);
+    long from = g_idx_tip + 1, folded = g_idx_tip;
+    int r = idx_load_range(g_idx, from, tip, &folded);
+    /* [idx] trace: every fold at most once per 5 s, and always when records
+     * were present but none went in -- the anomaly this exists to catch. */
+    { static time_t last; time_t now = time(NULL);
+      int anomaly = g_lr_present > 0 && g_lr_new + g_lr_dup == 0;
+      if (anomaly || now - last >= 5){
+          last = now;
+          fprintf(stderr, "[idx] fold %ld..%ld: read=%ld present=%ld new=%ld dup=%ld short=%ld err=%ld r=%d folded_to=%ld slots=%lu%s\n",
+                  from, tip, g_lr_read, g_lr_present, g_lr_new, g_lr_dup, g_lr_short, g_lr_err, r, folded, g_idx_slots,
+                  anomaly ? "  <-- PRESENT BUT NOT INSERTED" : "");
+      } }
     if (r == 2){
-        if (!idx_alloc(g_idx_slots * 2)) return;
-        if (idx_load_range(g_idx, 0, tip) != 0) return;
+        if (!idx_alloc(g_idx_slots * 2)){ fprintf(stderr, "[idx] grow to %lu slots FAILED (malloc)\n", g_idx_slots * 2); return; }
+        int r2 = idx_load_range(g_idx, 0, tip, &folded);
+        fprintf(stderr, "[idx] table full; grew to %lu slots, reload 0..%ld: present=%ld new=%ld r=%d folded_to=%ld\n",
+                g_idx_slots, tip, g_lr_present, g_lr_new, r2, folded);
+        if (r2 != 0) return;
     }
-    g_idx_tip = tip;
+    if (folded > g_idx_tip) g_idx_tip = folded;
 }
 
 /* Re-sync with the live daemon's appends. Returns current tip (-1 empty). */
@@ -302,6 +346,7 @@ int rpc_chain_open(const char* dir){
     unsigned long slots = 1u << 16;
     while (slots < (unsigned long)(tip + 1) * 4) slots <<= 1;
     if (!idx_alloc(slots)) return 0;
+    fprintf(stderr, "[idx] chain view open: stored tip=%ld, by-hash table %lu slots\n", tip, slots);
     idx_sync(tip);
     g_cw_fd = open("chainwork.dat", O_RDONLY);
     if (!g_blockbuf) g_blockbuf = malloc(BLOCKBUF_CAP);
