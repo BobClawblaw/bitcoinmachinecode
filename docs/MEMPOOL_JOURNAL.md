@@ -101,6 +101,23 @@ The journal failing to open is never fatal: the node runs exactly as before,
 minus the journal, and says so on stderr. A file that is not a journal, or is
 a future version, is **refused and left alone** — never rewritten.
 
+## `first_seen` resets on restart
+
+The arrival-time table the hook reads (`g_seen` in `daemon/mempool_cfg.c`) is
+anonymous shared memory, not a file, so a restart loses it. Transactions
+restored from `mempool.dat` are re-accepted and get a *new* arrival time.
+
+So after a restart, `waited` measures **how long the transaction sat in the
+pool since this node last started**, not how long since it was first
+broadcast. The first live block after the 2026-09-16 deploy recorded 2,189
+`mined` rows with `waited: 1`, which is that effect, not a fast-confirming
+mempool. Over a run of any length it converges on the real figure; read it
+with the node's uptime in mind.
+
+Persisting the arrival times alongside `mempool.dat` would close this. Core
+does write an entry time per transaction into that file, so the data exists —
+it simply is not plumbed back into the arrival table on load.
+
 ## Known limits
 
 - `wtxid` is not populated (above).
@@ -108,5 +125,6 @@ a future version, is **refused and left alone** — never rewritten.
   `mpool_policy_block_connect` by the removal mark; the save/restore of the
   reason around *that* entry point is not covered by a test, because driving
   it needs a real block. `expire_one`'s is.
+- `first_seen` resets on restart (above).
 - Departures are recorded, arrivals are not. "Every transaction this node ever
   saw" would be a different and much larger feature.

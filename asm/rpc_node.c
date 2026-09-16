@@ -2921,7 +2921,15 @@ static rj_val* mpj_row(const mpj_rec* r){
         rj_obj_set(o, "waited", rj_numf("%lld", (long long)(r->departed_at - r->first_seen)));
     rj_obj_set(o, "vsize", rj_numf("%llu", (unsigned long long)r->vsize));
     rj_obj_set(o, "fee", rj_numf("%llu", (unsigned long long)r->fee_sat));
-    if (r->vsize) rj_obj_set(o, "feerate", rj_numf("%llu", (unsigned long long)(r->fee_sat / r->vsize)));
+    /* sat/kvB, not sat/vB. Integer sat/vB truncates: the FIRST live block this
+     * recorded had 188 of 200 rows reporting "feerate": 0, because most real
+     * transactions are under 1 sat/vB once the fee is divided by vsize
+     * (25 sat over 140 vB is 0.179). A field that reads zero for 94% of rows
+     * is worse than no field. sat/kvB is also the unit Core's own fee
+     * estimator speaks, so it needs no conversion on the way in. The name
+     * carries the unit so a consumer cannot assume the other one. */
+    if (r->vsize) rj_obj_set(o, "feerate_satkvb",
+                             rj_numf("%llu", (unsigned long long)((r->fee_sat * 1000ULL) / r->vsize)));
     if (r->reason == MPJ_MINED && r->height) rj_obj_set(o, "height", rj_numf("%u", r->height));
     if (!mpj_all_zero(r->aux, 32)){
         mpj_hex_rev(h, r->aux);
