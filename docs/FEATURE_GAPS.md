@@ -317,6 +317,20 @@ tables and the writers themselves.
   the prose outlived that correction by another week. Documentation that
   explains a deliberate refusal ages exactly like the refusal string does.)*
 
+- **Esplora `/scripthash/*`** — refuses BY DESIGN, with a 501 that says why.
+  Esplora keys these on `sha256(scriptPubKey)`; this node's address index is
+  keyed on `(type_tag, hash)` — the hash160 or the 32-byte witness program —
+  and sha256 does not invert. Serving the route therefore needs a SECOND index
+  mapping `sha256(spk)` back to an address key, built over the 200 GB address
+  history and maintained alongside it.
+  That is real cost, and the consumer it exists for is not the one in use:
+  mempool.space's own backend calls `/address/*` and never `/scripthash/*`
+  (checked against `backend/src/api/bitcoin/esplora-api.ts`). It matters only
+  to Electrum-style clients pointed at the facade. Refusing with an
+  explanation is better than a partial implementation that answers some
+  scripthashes and silently misses others, which is what any shortcut here
+  would produce. Revisit if such a client is actually wanted.
+
 - **`assumeutxo` / `loadtxoutset`** — refuses BY DESIGN. Every parity claim
   this project makes rests on locally-validated coins, and importing a
   snapshot would hollow that out. `dumptxoutset` is real (proven at full
