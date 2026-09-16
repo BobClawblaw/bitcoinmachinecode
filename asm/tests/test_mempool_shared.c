@@ -16,6 +16,7 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include "../daemon/node_config.h"
@@ -25,6 +26,7 @@ extern void mp_lock(void);
 extern void mp_unlock(void);
 extern long mempool_time_of(const unsigned char* txid);
 extern void mempool_note_accept(const unsigned char* txid);
+extern int  mempool_restore_accept_time(const unsigned char* txid, long t);
 extern void* mp_ext_area;
 extern unsigned long mp_ext_slots;
 extern unsigned long mp_ext_inited;
@@ -146,6 +148,50 @@ int main(void){
         mp_unlock();
         alarm(0);
         ck("MEM-20 and remains usable on the next acquisition", 1);
+    }
+
+
+    /* ---- the persisted arrival time (mempool.dat entry_time) --------------
+     * mempool_note_accept stamps "now", which is right off the wire and WRONG
+     * for a transaction being re-admitted from mempool.dat at startup: it may
+     * have been waiting for hours. Without the restore, every restart resets
+     * the pool's sense of age -- the departure journal wrote 2,189 rows with
+     * waited: 1 after the 2026-09-16 deploy, an artifact of the restart, and
+     * -mempoolexpiry likewise began every transaction's 336-hour clock again.
+     *
+     * THE VALUE IS NOT TRUSTED. mempool.dat is read at startup before anything
+     * has vetted it, and this field is an INPUT TO EXPIRY: a time in the
+     * future would keep a transaction in the pool forever, one far in the past
+     * would evict it instantly. Those two refusals are the checks that matter
+     * here -- the happy path is the easy half. */
+    {
+        unsigned char tx_r[32]; memset(tx_r, 0xD1, 32);
+        mempool_note_accept(tx_r);
+        long fresh = mempool_time_of(tx_r);
+        ck("a fresh accept is stamped now", fresh > 0);
+
+        long now = (long)time(0);
+        ck("a plausible past time IS restored",
+           mempool_restore_accept_time(tx_r, now - 3600) == 1);
+        ck("...and the table now reports it", mempool_time_of(tx_r) == now - 3600);
+
+        /* a time in the FUTURE would defeat expiry entirely */
+        ck("a FUTURE time is refused", mempool_restore_accept_time(tx_r, now + 86400) == 0);
+        ck("...and the previous value stands", mempool_time_of(tx_r) == now - 3600);
+
+        /* a time older than the expiry window would evict it on the next sweep */
+        ck("a time PAST the expiry window is refused",
+           mempool_restore_accept_time(tx_r, now - 400L*3600L) == 0);
+        ck("...and the previous value still stands", mempool_time_of(tx_r) == now - 3600);
+
+        ck("a zero time is refused", mempool_restore_accept_time(tx_r, 0) == 0);
+        ck("a negative time is refused", mempool_restore_accept_time(tx_r, -5) == 0);
+
+        /* a transaction that is not in the pool has nothing to correct */
+        unsigned char absent[32]; memset(absent, 0xE7, 32);
+        ck("restoring a time for an absent transaction is a no-op",
+           mempool_restore_accept_time(absent, now - 60) == 0);
+        ck("...and it is NOT inserted by the attempt", mempool_time_of(absent) == 0);
     }
 
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);

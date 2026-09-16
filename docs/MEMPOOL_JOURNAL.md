@@ -101,7 +101,7 @@ The journal failing to open is never fatal: the node runs exactly as before,
 minus the journal, and says so on stderr. A file that is not a journal, or is
 a future version, is **refused and left alone** — never rewritten.
 
-## `first_seen` resets on restart
+## ~~`first_seen` resets on restart~~ FIXED 2026-09-16
 
 The arrival-time table the hook reads (`g_seen` in `daemon/mempool_cfg.c`) is
 anonymous shared memory, not a file, so a restart loses it. Transactions
@@ -114,9 +114,22 @@ broadcast. The first live block after the 2026-09-16 deploy recorded 2,189
 mempool. Over a run of any length it converges on the real figure; read it
 with the node's uptime in mind.
 
-Persisting the arrival times alongside `mempool.dat` would close this. Core
-does write an entry time per transaction into that file, so the data exists —
-it simply is not plumbed back into the arrival table on load.
+**Closed the same day.** The save path already wrote the real arrival time
+into `mempool.dat`; the load path discarded it (`(void)t;`). It now applies it
+after a successful accept, and carries it through the retry buffer as well —
+a child deferred for its parent is exactly as old as the file says, and
+dropping it there would have left a subset of the pool silently re-aged.
+
+The value is **vetted, not trusted**. `mempool.dat` is read at startup before
+anything else has checked it, and this field is an input to expiry: a time in
+the future would keep a transaction in the pool forever, one past the expiry
+window would evict it on the next sweep. Both are refused and the fresh stamp
+stands. Four reintroductions cover it — trust the future, trust the stale,
+insert a phantom entry for a transaction not in the pool, and make the restore
+a no-op.
+
+The load line now reports how many came back:
+`loaded mempool.dat: N accepted, ... ; M arrival time(s) restored`.
 
 ## Known limits
 
@@ -125,6 +138,5 @@ it simply is not plumbed back into the arrival table on load.
   `mpool_policy_block_connect` by the removal mark; the save/restore of the
   reason around *that* entry point is not covered by a test, because driving
   it needs a real block. `expire_one`'s is.
-- `first_seen` resets on restart (above).
 - Departures are recorded, arrivals are not. "Every transaction this node ever
   saw" would be a different and much larger feature.

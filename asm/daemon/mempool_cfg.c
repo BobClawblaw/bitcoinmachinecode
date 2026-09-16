@@ -352,6 +352,46 @@ static void mempool_depart(const unsigned char* txid, unsigned long long vsize,
     mpj_append(&r);
 }
 
+/* Restore a persisted arrival time (mempool.dat's per-transaction entry_time).
+ *
+ * WHY: mempool_note_accept stamps "now", which is right for a transaction
+ * arriving off the wire and WRONG for one being re-admitted from mempool.dat
+ * at startup -- that transaction may have been waiting for hours. Without
+ * this, every restart resets the pool's sense of age: the departure journal
+ * reported 2,189 rows with waited: 1 after the 2026-09-16 deploy, which was
+ * an artifact of the restart rather than a fast-confirming mempool, and
+ * -mempoolexpiry likewise started every transaction's 336-hour clock again.
+ * Core restores the time (node/mempool_persist.cpp LoadMempool); this node
+ * discarded it and said so in RPC_LIVE_NODE.md. Now it does not.
+ *
+ * THE TIME IS NOT TRUSTED BLINDLY. mempool.dat is a file on disk that a
+ * restart reads before anything else has vetted it, and the arrival time is
+ * an INPUT TO EXPIRY: a time far in the future would keep a transaction in
+ * the pool forever, and one far in the past would evict it instantly. So a
+ * value is applied only when it is in the past AND inside the expiry window;
+ * anything else leaves the fresh stamp, which is the safe direction. Core
+ * makes the same judgement differently -- it refuses to re-add a transaction
+ * whose stored time is already past the window -- and this reaches the same
+ * place from the other side, because the accept has already happened by the
+ * time the sink sees the record.
+ *
+ * Returns 1 when the stored time was applied, 0 when it was rejected or the
+ * transaction is not in the table. */
+int mempool_restore_accept_time(const unsigned char txid[32], long t){
+    if(!g_seen || t <= 0) return 0;
+    long now = (long)time(0);
+    if(t > now) return 0;                                  /* the future: refuse */
+    long hours = g_cfg.mempoolexpiry_h > 0 ? g_cfg.mempoolexpiry_h : 336;
+    if(t < now - hours*3600) return 0;                     /* already past expiry: refuse */
+    unsigned long i = tx_hash(txid) & g_seen_mask;
+    for(unsigned long p=0; p<=g_seen_mask; p++){
+        mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
+        if(!e->used) return 0;                             /* not in the pool: nothing to correct */
+        if(!memcmp(e->txid, txid, 32)){ e->t = t; return 1; }
+    }
+    return 0;
+}
+
 /* Clear one arrival-time entry (the policy layer's removal hook). */
 static void mempool_forget(const unsigned char txid[32]){
     fest_on_forget(txid);              /* fee estimation: left the pool unconfirmed (or was booked as mined just before) */

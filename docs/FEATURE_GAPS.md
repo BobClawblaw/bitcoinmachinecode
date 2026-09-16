@@ -328,7 +328,8 @@ tables and the writers themselves.
   read unconditionally; v2's obfuscation key is random so no writer can
   produce a byte-comparable artifact) and read both. `importmempool`
   re-submits each transaction through the normal admission path. Not
-  restored: entry times, fee deltas, and the unbroadcast set — each stated at
+  restored: fee deltas and the unbroadcast set (entry times ARE restored as
+  of 2026-09-16, vetted against the expiry window) — each stated at
   the call site. *(This item was missing from the 2026-08-27 audit of this
   list, which tracked it only in `docs/RPC_LIVE_NODE.md`. The audit was more
   accurate than what it replaced but not complete.)*
