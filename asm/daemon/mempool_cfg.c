@@ -159,7 +159,7 @@ int mp_lock_is_robust(void){ return g_mp_robust; }
  * is written by several processes with no lock (mempool_note_accept runs
  * after mp_unlock in daemon/tx_accept.c). A tombstone write is one word, the
  * same as the flag it replaces, so it is exactly as safe as what it replaces. */
-enum { MPS_EMPTY = 0, MPS_LIVE = 1, MPS_DEAD = 2 };
+enum { MPS_EMPTY = 0, MPS_LIVE = 1, MPS_DEAD = 2, MPS_CLAIMED = 3 };
 typedef struct { unsigned char txid[32]; long t; int used; } mp_seen_t;
 static mp_seen_t*   g_seen = 0;
 static unsigned long g_seen_mask = 0;
@@ -325,28 +325,96 @@ long mempool_time_of(const unsigned char txid[32]){
     unsigned long i = tx_hash(txid) & g_seen_mask;
     for(unsigned long p=0; p<=g_seen_mask; p++){
         mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
-        if(e->used == MPS_EMPTY) return 0;               /* the chain really ends */
-        if(e->used == MPS_LIVE && !memcmp(e->txid, txid, 32)) return e->t;
-        /* MPS_DEAD: walk past it -- the entry may live further along */
+        int st = __atomic_load_n(&e->used, __ATOMIC_ACQUIRE);
+        if(st == MPS_EMPTY) return 0;                    /* the chain really ends */
+        if(st == MPS_LIVE && !memcmp(e->txid, txid, 32)) return e->t;
+        /* MPS_DEAD / MPS_CLAIMED: walk past -- the entry may live further along */
     }
     return 0;
 }
 
-/* Record an accepted tx's arrival time. Called from the accept path. */
+/* Record an accepted tx's arrival time. Called from the accept path.
+ *
+ * THE SLOT IS CLAIMED WITH AN ATOMIC CAS, and that is not decoration. This
+ * table is written by SEVERAL PROCESSES: the node forks per connection, the
+ * mapping is MAP_SHARED, and mempool_note_accept runs AFTER mp_unlock in
+ * daemon/tx_accept.c -- so the pool lock is not held and two accepts can probe
+ * to the same free slot at the same moment. A plain write there loses one of
+ * them, and a plain read of a half-written txid matches nothing, so an arrival
+ * time simply disappears.
+ *
+ * A MUTEX IS NOT THE ANSWER HERE, and the reason is worth recording so nobody
+ * "fixes" this by adding one: mempool_expire_now calls into the POLICY LAYER
+ * while iterating this table, and that path comes back through
+ * mempool_forget. A lock held across the iteration would meet itself, and
+ * mp_lock's mutex has no settype, so it is non-recursive and would deadlock a
+ * production node. Claiming a slot needs no lock, cannot deadlock, and needs
+ * no ordering discipline against the pool lock.
+ *
+ * NOT COVERED BY A TEST, and kept on reasoning: the CAS itself, and lookups
+ * skipping MPS_CLAIMED. Both need two processes at the same FREE slot in the
+ * same instant, and tests/test_mempool_shared cannot produce that against ~4M
+ * slots -- reverting either one does not fail it. Without the CAS, two
+ * processes memcpy a txid into one slot and the result matches nothing: the
+ * entry is unreachable AND unremovable (forget will not match it either)
+ * until the expiry sweep. That is worse than the lost insert it also causes.
+ *
+ * MPS_CLAIMED is why lookups must treat it like a tombstone rather than like
+ * an empty slot: an insert in flight sits in the middle of somebody else's
+ * probe chain, and a lookup that stopped there would miss every entry behind
+ * it -- the same class of bug the tombstone fixed.
+ *
+ * The same-txid duplicate that this creates is resolved after publishing, by
+ * probe-order tie-break -- see the comment at that point. It was first written
+ * off here as "a narrow window"; a contention test then produced 889 of them
+ * out of 3,000, so it is handled rather than tolerated. */
 void mempool_note_accept(const unsigned char txid[32]){
     if(!g_seen) return;
     unsigned long i = tx_hash(txid) & g_seen_mask;
-    mp_seen_t* reuse = 0;
     for(unsigned long p=0; p<=g_seen_mask; p++){
         mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
-        if(e->used == MPS_LIVE){
-            if(!memcmp(e->txid, txid, 32)){ e->t = (long)time(0); return; }  /* already here: refresh */
+        int st = __atomic_load_n(&e->used, __ATOMIC_ACQUIRE);
+        if(st == MPS_LIVE){
+            if(!memcmp(e->txid, txid, 32)){
+                __atomic_store_n(&e->t, (long)time(0), __ATOMIC_RELAXED);   /* already here: refresh */
+                return; }
             continue;                                    /* a collision, keep probing */
         }
-        if(!reuse) reuse = e;                            /* first tombstone or empty: insert here */
-        if(e->used == MPS_EMPTY) break;                  /* chain ends: no duplicate beyond */
+        if(st == MPS_CLAIMED) continue;                  /* somebody else is filling it */
+        /* EMPTY or DEAD: try to take it. Losing the race means another process
+         * got there first, so keep probing rather than overwrite its entry. */
+        int want = st;
+        if(!__atomic_compare_exchange_n(&e->used, &want, MPS_CLAIMED, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
+        memcpy(e->txid, txid, 32);
+        e->t = (long)time(0);
+        __atomic_store_n(&e->used, MPS_LIVE, __ATOMIC_RELEASE);   /* publish last */
+
+        /* INSERT, THEN VERIFY. Two processes accepting the same txid can both
+         * pass the LIVE scan above before either publishes, and both then own
+         * a slot: a duplicate. That is not the rare event it looks like -- six
+         * processes inserting 3,000 shared ids produced 889 of them. It
+         * matters because mempool_forget clears only the FIRST copy, so the
+         * second survives as a ghost holding a stale arrival time for a
+         * transaction the pool no longer has.
+         *
+         * The tie-break is the probe order, which every process computes
+         * identically: walk the chain from the hash position, and whoever sits
+         * EARLIEST keeps the entry. A later duplicate stands itself down. Both
+         * cannot stand down -- the earliest one always finds itself first. */
+        for(unsigned long q=0; q<=g_seen_mask; q++){
+            mp_seen_t* o = &g_seen[(i+q) & g_seen_mask];
+            if(o == e) break;                            /* we are the earliest: keep it */
+            if(__atomic_load_n(&o->used, __ATOMIC_ACQUIRE) == MPS_LIVE &&
+               !memcmp(o->txid, txid, 32)){
+                int mine = MPS_LIVE;                     /* someone earlier has it: stand down */
+                __atomic_compare_exchange_n(&e->used, &mine, MPS_DEAD, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+                break;
+            }
+        }
+        return;
     }
-    if(reuse){ memcpy(reuse->txid, txid, 32); reuse->t = (long)time(0); reuse->used = MPS_LIVE; }
 }
 
 /* ---- the departure journal (2026-09-16) -----------------------------------
@@ -416,8 +484,10 @@ int mempool_restore_accept_time(const unsigned char txid[32], long t){
     unsigned long i = tx_hash(txid) & g_seen_mask;
     for(unsigned long p=0; p<=g_seen_mask; p++){
         mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
-        if(e->used == MPS_EMPTY) return 0;                 /* not in the pool: nothing to correct */
-        if(e->used == MPS_LIVE && !memcmp(e->txid, txid, 32)){ e->t = t; return 1; }
+        int st = __atomic_load_n(&e->used, __ATOMIC_ACQUIRE);
+        if(st == MPS_EMPTY) return 0;                      /* not in the pool: nothing to correct */
+        if(st == MPS_LIVE && !memcmp(e->txid, txid, 32)){
+            __atomic_store_n(&e->t, t, __ATOMIC_RELAXED); return 1; }
     }
     return 0;
 }
@@ -432,8 +502,23 @@ static void mempool_forget(const unsigned char txid[32]){
     unsigned long i = tx_hash(txid) & g_seen_mask;
     for(unsigned long p=0; p<=g_seen_mask; p++){
         mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
-        if(e->used == MPS_EMPTY) return;
-        if(e->used == MPS_LIVE && !memcmp(e->txid, txid, 32)){ e->used = MPS_DEAD; return; }
+        int st = __atomic_load_n(&e->used, __ATOMIC_ACQUIRE);
+        if(st == MPS_EMPTY) return;                      /* the chain ends: done */
+        if(st == MPS_LIVE && !memcmp(e->txid, txid, 32)){
+            /* CAS so a slot being re-claimed underneath is not stamped DEAD */
+            int want = MPS_LIVE;
+            __atomic_compare_exchange_n(&e->used, &want, MPS_DEAD, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+            /* KEEP WALKING: there may be more than one copy. Two processes
+             * accepting the same txid can both publish before either sees the
+             * other -- the probe-order tie-break below closes the common case
+             * but not the window where the loser scans before the winner
+             * publishes. Clearing only the first copy left the second alive as
+             * a GHOST: an arrival time for a transaction the pool no longer
+             * holds, which mempool_time_of would keep answering. Clearing all
+             * of them makes the duplicate cost a slot instead of a wrong
+             * answer, and costs one extra walk of a chain we are already in. */
+        }
     }
 }
 
@@ -450,7 +535,7 @@ long mempool_expire_now(void){
     mp_lock();
     for(unsigned long i=0;i<=g_seen_mask;i++){
         mp_seen_t* e = &g_seen[i];
-        if(e->used != MPS_LIVE || e->t > cutoff) continue;   /* a tombstone is not a transaction */
+        if(__atomic_load_n(&e->used, __ATOMIC_ACQUIRE) != MPS_LIVE || e->t > cutoff) continue;
         unsigned char txid[32]; memcpy(txid, e->txid, 32);
         long r = mpool_policy_expire_one(mp_ext_polstate, g_mp_area, txid);
         if (r > 0) removed += r;
