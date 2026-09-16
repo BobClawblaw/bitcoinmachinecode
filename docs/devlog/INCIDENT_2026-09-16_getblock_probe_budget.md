@@ -1,4 +1,4 @@
-# Incident 2026-09-16 — getblock refused every block above height 10,880 for the whole of IBD (probe budget in a caller-saved register)
+# Incident 2026-09-16 — getblock refused every block above a fixed height for the whole of IBD (two causes: a probe budget in a caller-saved register, and a fold that marked unwritten records as folded)
 
 **Severity:** medium (no data loss, no corruption, production unaffected; every
 syncing node's `getblock` unusable above a fixed height, which blocks BlockYard's
@@ -33,7 +33,13 @@ never been observed because production opens on a complete chain.
 | 16:12 | run 24 stopped cleanly at height 393,520 via the `stop` RPC, binary swapped, relaunched on the same datadir. |
 | 16:2x | Verified live: every height that previously failed now serves, and `getblock <tip> 3` works. Node resumed at 393,520 — no re-sync. |
 
-## Root cause
+> **UPDATED 2026-09-16 19:00Z.** The r8 fix below is real and stays, but it was
+> not the cause of the clean prefix. Run 25's first launch, on the r8-fixed
+> binary, cut at 4,240. The second cause is in `rpc_chain.c`'s fold and is
+> written up in **"Root cause 2"** further down, with the trace line that found
+> it and the prediction it made before the node failed.
+
+## Root cause 1: the probe budget (real, and not the prefix)
 
 `idx_put` and `idx_get` in `asm/bitcoin_idx.asm` held their linear-probe budget
 in **r8** across `call memcmp_exact`:
@@ -118,6 +124,45 @@ reverted**, because whether the corrupted budget loops forever depends on which
 hash bytes land in `r8b`. It is kept as the regression guard that cross-process
 archive growth never had, labelled for what it covers.
 
+## Root cause 2: the fold marked records as folded before they existed
+
+The downloader pre-extends `index.dat` with zero records up to the header
+count, and the store's tip follows the file's extent. `idx_sync` folded
+`(g_idx_tip, tip]`, skipped absent records, and set `g_idx_tip = tip`
+unconditionally. The `[idx]` trace added to `rpc_chain.c` shows it in one line
+from a throwaway node that opened at genesis and folded 36 seconds later:
+
+    [idx] fold 1..967314: read=967314 present=13880 new=13880 dup=0 short=0 err=0 r=0
+
+13,880 records existed; the fold inserted those and marked 967,314 heights as
+folded. After that "tip > g_idx_tip" was never true again, so no fold ever ran
+again, and every block stored later was "Block not found" by hash for the rest
+of IBD. The cut is the number of records present at the first fold: 13,880
+there, 4,240 on run 25's first launch, 10,880 on run 24.
+
+The trace also predicted a failure before it happened. Run 25's second launch
+logged `fold 199481..967314: present=31880`, i.e. records present to 231,360;
+the node was then probed after the tip passed 232,600: 231,300 served,
+231,361 and everything above refused. A pread error was handled the same way
+(reported "ok", fold point advanced past what it failed to read).
+
+**Fix (`8c2bddb6`):** `idx_load_range` reports the highest height up to which
+every record was present, and `idx_sync` advances the fold point only that far.
+Records above the first hole are still inserted when present but do not move
+the fold point, so the hole is read again next time; the re-read is bounded by
+the download window, which is what leaves holes. The trace stays.
+
+**Pin:** `test_rpc_chain_growth` blanks a band of the writer's records BEFORE
+the reader's first fold over them, folds, restores the band, and looks one up:
+2 failures against the committed code, clean against the fix. An earlier draft
+blanked AFTER the fold and passed against the unfixed code — the order is the
+whole test, and the revert check is what caught it.
+
+**Why the r8 fix looked sufficient for an hour:** the two defects have the same
+symptom and the first one had a deterministic hang to pin, so its fix was
+verified on the primitive, not on a syncing node. Run 25 was the first syncing
+node to run the r8 fix, and it cut within a minute.
+
 ## Lessons
 
 1. **A probe budget is loop state; it cannot live in a caller-saved register
@@ -133,6 +178,22 @@ archive growth never had, labelled for what it covers.
    here, and it took three attempts to get an honest pin.
 4. **A node's behaviour depends on what its chain looked like when it opened.**
    The whole class — anything sized from a boot-time tip — deserves a look.
+5. **Fix one cause, then re-run the original symptom before calling it done.**
+   Two defects shared one symptom. The unit pin for the first proved the first;
+   only the live node could show there was a second.
+6. **A fold point must follow what was actually read, never the target.**
+   "Folded to the tip" was a claim about the file's extent, not about records.
+7. **Instrument the live process when the fifth hypothesis dies.** Five
+   hypotheses were argued from source and all were wrong; one trace line
+   settled it, and then predicted the next failure to the block.
+
+## Also found on the way (filed, not fixed here)
+
+- `bitcoin.conf` reads Core's host-valued `connect=` and `addnode=` as numbers
+  (`"not a usable number -- reading it as 0"`); Core takes an address. Register.
+- `debug.log` carries NUL bytes, so GNU grep treats it as binary and `grep -c`
+  prints nothing at all (rc=1). Read these logs with `grep -a` or `awk`. Two
+  earlier log counts in this session were silently empty for this reason.
 
 ## Follow-ups
 

@@ -517,6 +517,16 @@ tested but called from nowhere; wiring the save path touches shutdown, which
 must stay fast for the SIGKILL window. `fixedseeds` gates a hardcoded IP seed
 list this node does not have. All three stay on the warning list.
 
+- **`addnode=<host>` / `connect=<host>` in bitcoin.conf print `"is not a usable
+  number -- reading it as 0"` at boot.** Found 2026-09-16 on a probe node. The
+  PARSE IS FINE: both keys go through `cfg_addlist` and the host is applied
+  (`[config] src: ... addnode=1`, and the node dialled it). The warning comes
+  from `nodecfg_strtoll`, which some generic pass runs over every value before
+  the key is dispatched, so a host-valued key trips the "not a number" check.
+  A boot line that says a setting was read as 0 when it was applied correctly
+  is a lying instrument; either skip list-valued keys in that pass or parse
+  lazily. Not fixed in #237.
+
 ## Update 2026-08-30 — Erlay: a deliberate stopping point
 
 BIP330 splits into negotiation (`sendtxrcncl`: version and salt exchange, and

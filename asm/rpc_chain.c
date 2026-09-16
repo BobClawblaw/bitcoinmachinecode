@@ -287,6 +287,11 @@ static int idx_load_range(void* idx, long from, long to, long* folded_to){
             if (!hole) contiguous = h + i;
         }
         if (have < n) hole = 1;                 /* short read: the rest is absent */
+        /* Past the first hole nothing can move the fold point, and everything
+         * above it is read again next time anyway -- so stop here. Without
+         * this every refresh read the whole pre-extended extent (46 MB on
+         * mainnet) from the fold point to end-of-file, on every RPC call. */
+        if (hole) break;
     }
     *folded_to = contiguous;
     return 0;
