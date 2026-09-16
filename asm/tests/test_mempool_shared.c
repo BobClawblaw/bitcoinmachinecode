@@ -28,6 +28,9 @@ extern void mp_lock(void);
 extern void mp_unlock(void);
 extern long mempool_time_of(const unsigned char* txid);
 extern void mempool_note_accept(const unsigned char* txid);
+extern const unsigned char* mpool_wtxid_at_slot(const void*, unsigned long);
+extern long mpool_del(void*, const unsigned char*);
+extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
 extern int  mempool_restore_accept_time(const unsigned char* txid, long t);
 extern void mempool_forget_for_test(const unsigned char* txid);
 extern void* mp_ext_area;
@@ -153,6 +156,48 @@ int main(void){
         ck("MEM-20 and remains usable on the next acquisition", 1);
     }
 
+
+    /* ---- the journal's wtxid is recomputed, and must MATCH the cache -------
+     * The departure journal records a wtxid by hashing the transaction's
+     * stored bytes, because the pool exposes its cached copy only BY SLOT and
+     * adding a by-txid getter means editing bitcoin_mempool.asm's probe.
+     *
+     * That is only sound while the two agree. If mpool_put ever cached
+     * something else -- a BIP141 wtxid over a re-serialised form, say -- the
+     * recompute would silently write a DIFFERENT value into every record, and
+     * a wrong wtxid is worse than the zero it replaced, because a zero is
+     * documented as "not recorded" and a wrong one is not detectable at all.
+     * This pins the equality that makes the shortcut legitimate. */
+    {
+        unsigned char wtx[64];
+        for (unsigned i = 0; i < sizeof wtx; i++) wtx[i] = (unsigned char)(0x40 + i);
+        unsigned char wid[32]; memset(wid, 0x5E, 32);
+        mp_lock();
+        long put = mpool_put(mp_ext_area, wid, wtx, sizeof wtx);
+        mp_unlock();
+        ck("a tx is in the pool for the wtxid check", put == 1);
+
+        /* the pool's own cached wtxid, found by walking to its slot */
+        const unsigned char* cached = 0;
+        for (unsigned long i = 0; i <= 0xffffful && !cached; i++){
+            const unsigned char* w = mpool_wtxid_at_slot(mp_ext_area, i);
+            if (!w) continue;
+            const unsigned char* slot = (const unsigned char*)mp_ext_area + 40 + i * 80;
+            if (!memcmp(slot + 8, wid, 32)) cached = w;
+        }
+        ck("the pool cached a wtxid for it", cached != 0);
+
+        unsigned long rl = 0;
+        const unsigned char* raw = mpool_get(mp_ext_area, wid, &rl);
+        ck("...and the stored bytes read back", raw && rl == sizeof wtx);
+
+        unsigned char recomputed[32];
+        if (raw && rl) sha256d(recomputed, raw, rl);
+        ck("the journal's RECOMPUTED wtxid equals the pool's cached one",
+           cached && raw && !memcmp(recomputed, cached, 32));
+
+        mp_lock(); mpool_del(mp_ext_area, wid); mp_unlock();
+    }
 
     /* ---- deletion must not hide a colliding entry -------------------------
      * The table is open-addressed with linear probing, and deletion used to

@@ -35,6 +35,8 @@ extern unsigned long mpool_policy_state_size(unsigned long n);
 extern void mpool_policy_state_init(void* st, unsigned long n);
 extern void mpool_policy_set_poolcap(void* st, unsigned long long cap);
 extern void mpool_policy_set_forget_cb(void (*fn)(const unsigned char*));
+extern const unsigned char* mpool_get(const void*, const unsigned char*, unsigned long*);
+extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
 extern void mpool_policy_set_depart_cb(void (*fn)(const unsigned char*, unsigned long long,
                                                   unsigned long long, int));
 static void mempool_depart(const unsigned char* txid, unsigned long long vsize,
@@ -433,15 +435,25 @@ static void mempool_depart(const unsigned char* txid, unsigned long long vsize,
     mpj_rec r;
     memset(&r, 0, sizeof r);
     memcpy(r.txid, txid, 32);
-    /* wtxid is left ZERO, and readers must treat all-zero as "not recorded".
-     * The structural pool caches it, but only reachable by SLOT
-     * (mpool_wtxid_at_slot) -- there is no by-txid getter, and scanning the
-     * table on a path that runs thousands of times per connected block is not
-     * a trade worth making for a display field. Copying the txid in instead
-     * would be worse than leaving it out: it is right only for a non-witness
-     * transaction and silently wrong for every segwit one, which is most of
-     * them. A by-txid getter in bitcoin_mempool.asm would close this; the
-     * field is in the record format so that landing it needs no migration. */
+    /* wtxid. The structural pool caches one per slot but exposes it only BY
+     * SLOT (mpool_wtxid_at_slot), and there is no by-txid getter -- adding one
+     * means editing bitcoin_mempool.asm's probe, which carries the MEM-21
+     * coherence rules and is not a file to touch for a display field.
+     *
+     * It does not need touching. The cached value is sha256d over the tx bytes
+     * AS STORED (bitcoin_mempool.asm's own note; it equals the txid for a
+     * non-witness transaction), and the departure hook fires BEFORE mpool_del
+     * -- so the transaction is still in the pool here and the bytes are still
+     * readable. Recomputing costs one hash per departure, and only when the
+     * journal is enabled, so nothing is paid for a feature that is off.
+     *
+     * Leaving it zero was the honest placeholder; copying the TXID in would
+     * not have been. That is right only for a non-witness transaction and
+     * silently wrong for every segwit one, which is most of them. */
+    { unsigned long rawlen = 0;
+      const unsigned char* raw = g_mp_area ? mpool_get(g_mp_area, txid, &rawlen) : 0;
+      if (raw && rawlen) sha256d(r.wtxid, raw, rawlen);
+      /* else: still zero, and readers treat all-zero as "not recorded" */ }
     r.first_seen  = mempool_time_of(txid);
     r.departed_at = (long)time(0);
     r.vsize       = vsize;
