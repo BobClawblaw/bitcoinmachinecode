@@ -27,6 +27,7 @@ extern void mp_unlock(void);
 extern long mempool_time_of(const unsigned char* txid);
 extern void mempool_note_accept(const unsigned char* txid);
 extern int  mempool_restore_accept_time(const unsigned char* txid, long t);
+extern void mempool_forget_for_test(const unsigned char* txid);
 extern void* mp_ext_area;
 extern unsigned long mp_ext_slots;
 extern unsigned long mp_ext_inited;
@@ -150,6 +151,71 @@ int main(void){
         ck("MEM-20 and remains usable on the next acquisition", 1);
     }
 
+
+    /* ---- deletion must not hide a colliding entry -------------------------
+     * The table is open-addressed with linear probing, and deletion used to
+     * clear the in-use flag outright. That breaks the probe: an entry that
+     * landed PAST a collision becomes unreachable the moment something ahead
+     * of it in its chain is removed, because every lookup stops at the first
+     * empty slot. mempool_time_of then answered 0 with no error -- and that
+     * value feeds getrawmempool's "time", the departure journal's first_seen,
+     * and the mempool.dat arrival-time restore, where 50 of 16,457 restores
+     * failed on 2026-09-16 for exactly this reason.
+     *
+     * Finding a real collision means inserting until two txids share a slot.
+     * Rather than reverse the hash, insert a run of transactions, remove the
+     * FIRST one inserted, and require every survivor to still be findable:
+     * with enough entries some of them collide, and under the old behaviour
+     * the ones behind the hole vanished. */
+    {
+        enum { N = 4096 };
+        unsigned char ids[N][32];
+        for (int i = 0; i < N; i++){
+            memset(ids[i], 0, 32);
+            ids[i][0] = (unsigned char)(i & 0xff);
+            ids[i][1] = (unsigned char)((i >> 8) & 0xff);
+            ids[i][2] = 0xC7;                 /* keep them clear of the other fixtures */
+            mempool_note_accept(ids[i]);
+        }
+        int all_before = 1;
+        for (int i = 0; i < N; i++) if (mempool_time_of(ids[i]) == 0) all_before = 0;
+        ck("every entry is findable before any removal", all_before);
+
+        /* remove a scattered quarter of them */
+        for (int i = 0; i < N; i += 4) mempool_forget_for_test(ids[i]);
+
+        int lost = 0;
+        for (int i = 0; i < N; i++) if (i % 4 && mempool_time_of(ids[i]) == 0) lost++;
+        ck("...and every SURVIVOR is still findable after the removals", lost == 0);
+        if (lost) printf("      %d of %d survivors became unreachable\n", lost, N - N/4);
+
+        int ghosts = 0;
+        for (int i = 0; i < N; i += 4) if (mempool_time_of(ids[i]) != 0) ghosts++;
+        ck("...and every removed entry really is gone", ghosts == 0);
+
+        /* A removed entry can be re-added and found again. NOTE what this does
+         * NOT prove: that the insert REUSED the tombstone. The table has ~4M
+         * slots and this fixture uses 4,096, so an insert that skipped every
+         * tombstone would still find an empty slot and still be findable --
+         * reverting the reuse changes nothing here. Proving reuse needs the
+         * table driven to exhaustion, which is not practical at this size, so
+         * the property is stated in mempool_cfg.c and left uncovered rather
+         * than claimed by an assertion that cannot fail. */
+        for (int i = 0; i < N; i += 4) mempool_note_accept(ids[i]);
+        int back = 0;
+        for (int i = 0; i < N; i += 4) if (mempool_time_of(ids[i]) != 0) back++;
+        ck("a removed entry can be re-added and found (reuse itself is untested)", back == N / 4);
+
+        /* and re-accepting an entry that is already live must not duplicate it:
+         * a duplicate survives the first forget and becomes a ghost */
+        mempool_note_accept(ids[1]);
+        mempool_note_accept(ids[1]);
+        mempool_forget_for_test(ids[1]);
+        ck("re-accepting a live entry does not create a duplicate",
+           mempool_time_of(ids[1]) == 0);
+
+        for (int i = 0; i < N; i++) mempool_forget_for_test(ids[i]);
+    }
 
     /* ---- the persisted arrival time (mempool.dat entry_time) --------------
      * mempool_note_accept stamps "now", which is right off the wire and WRONG

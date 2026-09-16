@@ -135,6 +135,31 @@ int mp_lock_is_robust(void){ return g_mp_robust; }
  * Open-addressed, same shape as the mempool itself so the two stay in step.
  * Sized to the mempool's slot count; a miss just means we cannot expire that
  * tx, never a wrong deletion. */
+/* The arrival-time table: open-addressed, linear probing, MAP_SHARED so every
+ * forked process sees the same entries.
+ *
+ * `used` IS THREE-VALUED, and that is the whole point. It was a flag, and
+ * deletion cleared it -- classic open addressing with no tombstone, which
+ * breaks the probe: an entry that landed past a collision becomes unreachable
+ * the moment something AHEAD of it in its chain is removed, because every
+ * lookup stops at the first empty slot. mempool_time_of then returned 0
+ * silently, which feeds getrawmempool's "time", the departure journal's
+ * first_seen, and the mempool.dat arrival-time restore -- 50 of 16,457
+ * restores failed on 2026-09-16 for exactly this reason. Worse,
+ * mempool_note_accept would then insert a SECOND entry for the same txid at
+ * the freed slot, and mempool_forget clears only the first.
+ *
+ * MPS_DEAD is a tombstone: lookups walk past it, inserts REUSE it. Reuse is
+ * what bounds the table -- every accept can reclaim one departure's slot, so
+ * a steady-state pool does not accumulate them. That reuse is NOT covered by
+ * a test: the table is ~4M slots, so any fixture small enough to run finds an
+ * empty slot whether or not tombstones are reused, and the assertion would
+ * pass either way. It is stated here instead of claimed there. Compaction would be the other
+ * answer and is deliberately NOT done here: it moves entries, and this table
+ * is written by several processes with no lock (mempool_note_accept runs
+ * after mp_unlock in daemon/tx_accept.c). A tombstone write is one word, the
+ * same as the flag it replaces, so it is exactly as safe as what it replaces. */
+enum { MPS_EMPTY = 0, MPS_LIVE = 1, MPS_DEAD = 2 };
 typedef struct { unsigned char txid[32]; long t; int used; } mp_seen_t;
 static mp_seen_t*   g_seen = 0;
 static unsigned long g_seen_mask = 0;
@@ -300,8 +325,9 @@ long mempool_time_of(const unsigned char txid[32]){
     unsigned long i = tx_hash(txid) & g_seen_mask;
     for(unsigned long p=0; p<=g_seen_mask; p++){
         mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
-        if(!e->used) return 0;
-        if(!memcmp(e->txid, txid, 32)) return e->t;
+        if(e->used == MPS_EMPTY) return 0;               /* the chain really ends */
+        if(e->used == MPS_LIVE && !memcmp(e->txid, txid, 32)) return e->t;
+        /* MPS_DEAD: walk past it -- the entry may live further along */
     }
     return 0;
 }
@@ -310,13 +336,17 @@ long mempool_time_of(const unsigned char txid[32]){
 void mempool_note_accept(const unsigned char txid[32]){
     if(!g_seen) return;
     unsigned long i = tx_hash(txid) & g_seen_mask;
+    mp_seen_t* reuse = 0;
     for(unsigned long p=0; p<=g_seen_mask; p++){
         mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
-        if(!e->used || !memcmp(e->txid, txid, 32)){
-            memcpy(e->txid, txid, 32); e->t = (long)time(0); e->used = 1;
-            return;
+        if(e->used == MPS_LIVE){
+            if(!memcmp(e->txid, txid, 32)){ e->t = (long)time(0); return; }  /* already here: refresh */
+            continue;                                    /* a collision, keep probing */
         }
+        if(!reuse) reuse = e;                            /* first tombstone or empty: insert here */
+        if(e->used == MPS_EMPTY) break;                  /* chain ends: no duplicate beyond */
     }
+    if(reuse){ memcpy(reuse->txid, txid, 32); reuse->t = (long)time(0); reuse->used = MPS_LIVE; }
 }
 
 /* ---- the departure journal (2026-09-16) -----------------------------------
@@ -386,21 +416,24 @@ int mempool_restore_accept_time(const unsigned char txid[32], long t){
     unsigned long i = tx_hash(txid) & g_seen_mask;
     for(unsigned long p=0; p<=g_seen_mask; p++){
         mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
-        if(!e->used) return 0;                             /* not in the pool: nothing to correct */
-        if(!memcmp(e->txid, txid, 32)){ e->t = t; return 1; }
+        if(e->used == MPS_EMPTY) return 0;                 /* not in the pool: nothing to correct */
+        if(e->used == MPS_LIVE && !memcmp(e->txid, txid, 32)){ e->t = t; return 1; }
     }
     return 0;
 }
 
 /* Clear one arrival-time entry (the policy layer's removal hook). */
+/* the removal hook, reachable by name so a test can drive the probe directly
+ * (the policy layer reaches it through the callback) */
+void mempool_forget_for_test(const unsigned char txid[32]){ mempool_forget(txid); }
 static void mempool_forget(const unsigned char txid[32]){
     fest_on_forget(txid);              /* fee estimation: left the pool unconfirmed (or was booked as mined just before) */
     if(!g_seen) return;
     unsigned long i = tx_hash(txid) & g_seen_mask;
     for(unsigned long p=0; p<=g_seen_mask; p++){
         mp_seen_t* e = &g_seen[(i+p) & g_seen_mask];
-        if(!e->used) return;
-        if(!memcmp(e->txid, txid, 32)){ e->used = 0; return; }
+        if(e->used == MPS_EMPTY) return;
+        if(e->used == MPS_LIVE && !memcmp(e->txid, txid, 32)){ e->used = MPS_DEAD; return; }
     }
 }
 
@@ -417,11 +450,11 @@ long mempool_expire_now(void){
     mp_lock();
     for(unsigned long i=0;i<=g_seen_mask;i++){
         mp_seen_t* e = &g_seen[i];
-        if(!e->used || e->t > cutoff) continue;
+        if(e->used != MPS_LIVE || e->t > cutoff) continue;   /* a tombstone is not a transaction */
         unsigned char txid[32]; memcpy(txid, e->txid, 32);
         long r = mpool_policy_expire_one(mp_ext_polstate, g_mp_area, txid);
         if (r > 0) removed += r;
-        else e->used = 0;   /* not in the graph (pre-policy legacy entry) */
+        else e->used = MPS_DEAD;   /* not in the graph (pre-policy legacy entry) */
     }
     mp_unlock();
     if(removed)
