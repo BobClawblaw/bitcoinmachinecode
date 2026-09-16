@@ -358,7 +358,10 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
         }
     }
     rj_val* o = rj_obj();
-    rj_obj_set(o, "isvalid", rj_bool(valid));
+    /* isvalid is validateaddress's field. Core's getaddressinfo does not carry
+     * it -- it errors instead (see the branch below) -- and emitting it here
+     * invited exactly the misreading that branch describes. */
+    if (!strcmp(method, "validateaddress")) rj_obj_set(o, "isvalid", rj_bool(valid));
     if (!strcmp(method, "validateaddress")) {
         if (valid) {
             /* Core echoes the CANONICAL encoding (bech32 lower-cased) */
@@ -404,6 +407,18 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
             rj_obj_set(o, "error", rj_str("Invalid address"));
         }
     } else { /* getaddressinfo */
+        /* CORE ERRORS HERE. getaddressinfo throws -5 for an address it cannot
+         * decode; only validateaddress reports the verdict as a field. This
+         * returned {"address":..,"isvalid":false} with a success status, so a
+         * caller testing for an error saw none and read isvalid off a reply it
+         * had no reason to inspect. Measured against v31.1 on 2026-09-16:
+         * getaddressinfo("notanaddress") is -5, not an object.
+         *
+         * Core's texts are per-decoder ("Invalid checksum or length of Base58
+         * address (P2PKH or P2SH)", "Invalid Base 32 character"); this node
+         * reports the classification rather than the diagnostics, the same
+         * choice already made for validateaddress's error_locations. */
+        if (!valid){ rj_free(o); *ec = -5; *em = "Invalid address"; return 0; }
         rj_obj_set(o, "address", rj_str(addr));
         if (valid) {
             /* Real wallet lookup (audit finding, 2026-09-03: these four
@@ -448,8 +463,27 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
                 rj_obj_set(o, "pubkey", rj_str(pubhex));
                 rj_obj_set(o, "iscompressed", rj_bool(plen == 33));
             }
-            rj_obj_set(o, "iswitness", rj_bool(type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH || type == WAL_ADDR_P2TR));
-            rj_obj_set(o, "witness_version", rj_numf("%u", (type == WAL_ADDR_P2TR) ? 1 : 0));
+            /* scriptPubKey / isscript / witness_program are ADDRESS DECODING,
+             * not wallet state: Core reports them whether or not a wallet is
+             * loaded, and this branch omitted all three. validateaddress above
+             * already computes them from the same inputs. */
+            { char spkhex[210]; bin_to_hex(spkhex, s, sl);
+              rj_obj_set(o, "scriptPubKey", rj_str(spkhex)); }
+            rj_obj_set(o, "isscript", rj_bool(type == WAL_ADDR_P2SH || type == WAL_ADDR_P2WSH ||
+                                              type == WAL_ADDR_P2TR));
+            int isw_gai = (type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH ||
+                           type == WAL_ADDR_P2TR   || type == WAL_ADDR_WITNESS_UNKNOWN);
+            rj_obj_set(o, "iswitness", rj_bool(isw_gai));
+            if (isw_gai){
+                rj_obj_set(o, "witness_version", rj_numf("%u",
+                    (type == WAL_ADDR_WITNESS_UNKNOWN) ? (unsigned)witver
+                  : (type == WAL_ADDR_P2TR) ? 1u : 0u));
+                const unsigned char* prog_gai = (type == WAL_ADDR_P2WPKH) ? h160 : prog32;
+                size_t plen_gai = (type == WAL_ADDR_P2WPKH) ? 20
+                                : (type == WAL_ADDR_WITNESS_UNKNOWN) ? (size_t)wprog_len : 32;
+                char proghex[82]; bin_to_hex(proghex, prog_gai, plen_gai);
+                rj_obj_set(o, "witness_program", rj_str(proghex));
+            }
             /* WAL-6: omitted rather than answered false when the wallet
              * cannot tell (own < 0). See the note above. */
             if (own >= 0){

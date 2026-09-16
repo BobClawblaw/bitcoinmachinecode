@@ -1488,6 +1488,70 @@ int main(void){
         W.seed = keep;                                  /* restore the fixture */
     }
 
+
+    /* ---- getaddressinfo: the ADDRESS-DECODING half ------------------------
+     * Three fields here are pure address decoding and have nothing to do with
+     * a wallet -- Core reports them whether or not one is loaded, and this
+     * node omitted all three: scriptPubKey, isscript, witness_program.
+     * validateaddress next door already computed them from the same inputs.
+     *
+     * And getaddressinfo carried "isvalid", which Core's does NOT: Core ERRORS
+     * with -5 on an address it cannot decode, and only validateaddress reports
+     * the verdict as a field. Returning {"address":..,"isvalid":false} with a
+     * SUCCESS status meant a caller testing for an error saw none and read a
+     * field off a reply it had no reason to inspect.
+     *
+     * Verified against Core v31.1 on 2026-09-16 over one address of every
+     * standard type plus two undecodable ones: identical on every non-wallet
+     * field, and -5 on both bad addresses. */
+    {
+        struct { const char* addr; const char* spk; int isscript; int iswitness; } A[] = {
+          { "1QDBhj6F46WtVQ3TMqJT3YhnBMUrkHWs5h",
+            "76a914fe98d17b4c1a568a83b659c611f726d9da044f9388ac", 0, 0 },
+          { "3K9KZZPB8NRwZVP5wNKX4VYhnswrJxpgZ4",
+            "a914bf73ad4cf3a107812bad3deb310611bee49a3c7987",     1, 0 },
+          { "bc1qqe2mj05z2q4zrqly789r59q5k53rhtgn8hznl0",
+            "00140655b93e82502a2183e4f1ca3a1414b5223bad13",       0, 1 },
+        };
+        for (unsigned i = 0; i < sizeof A / sizeof A[0]; i++){
+            char qj[200]; snprintf(qj, sizeof qj, "[\"%s\"]", A[i].addr);
+            rj_val* q = P(qj); DX("getaddressinfo", q);
+            char lbl[200];
+            snprintf(lbl, sizeof lbl, "getaddressinfo(%.14s..) carries scriptPubKey", A[i].addr);
+            ck(lbl, rc == 1 && r && S(r, "scriptPubKey") && !strcmp(S(r, "scriptPubKey"), A[i].spk));
+            snprintf(lbl, sizeof lbl, "...isscript = %d", A[i].isscript);
+            ck(lbl, rc == 1 && r && S(r, "isscript") && S(r, "isscript")[0] == (A[i].isscript ? '1' : '0'));
+            snprintf(lbl, sizeof lbl, "...iswitness = %d", A[i].iswitness);
+            ck(lbl, rc == 1 && r && S(r, "iswitness") && S(r, "iswitness")[0] == (A[i].iswitness ? '1' : '0'));
+            snprintf(lbl, sizeof lbl, "...and NO isvalid (that is validateaddress's field)");
+            ck(lbl, rc == 1 && r && rj_obj_get(r, "isvalid") == NULL);
+            rj_free(r); rj_free(q);
+        }
+        /* a witness address carries its program; a legacy one must not */
+        { rj_val* q = P("[\"bc1qqe2mj05z2q4zrqly789r59q5k53rhtgn8hznl0\"]"); DX("getaddressinfo", q);
+          ck("a witness address carries witness_program",
+             rc == 1 && r && S(r, "witness_program") &&
+             !strcmp(S(r, "witness_program"), "0655b93e82502a2183e4f1ca3a1414b5223bad13"));
+          rj_free(r); rj_free(q); }
+        { rj_val* q = P("[\"1QDBhj6F46WtVQ3TMqJT3YhnBMUrkHWs5h\"]"); DX("getaddressinfo", q);
+          ck("a legacy address carries no witness_program",
+             rc == 1 && r && rj_obj_get(r, "witness_program") == NULL);
+          rj_free(r); rj_free(q); }
+        /* THE BEHAVIOUR CHANGE: an undecodable address is an ERROR, not a
+         * success carrying isvalid:false */
+        { rj_val* q = P("[\"notanaddress\"]"); DX("getaddressinfo", q);
+          ck("an undecodable address is -5, as Core answers it", rc == 0 && ec == -5);
+          rj_free(r); rj_free(q); }
+        { rj_val* q = P("[\"bc1qzzzz\"]"); DX("getaddressinfo", q);
+          ck("...and so is a malformed bech32 one", rc == 0 && ec == -5);
+          rj_free(r); rj_free(q); }
+        /* validateaddress KEEPS isvalid and keeps answering rather than erroring */
+        { rj_val* q = P("[\"notanaddress\"]"); DX("validateaddress", q);
+          ck("validateaddress still ANSWERS for a bad address, with isvalid:false",
+             rc == 1 && r && S(r, "isvalid") && S(r, "isvalid")[0] == '0');
+          rj_free(r); rj_free(q); }
+    }
+
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);
     return fails ? 1 : 0;
 }

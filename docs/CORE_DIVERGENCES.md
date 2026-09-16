@@ -51,6 +51,24 @@ An inventory taken after the 09-09 leg and compact-block work, extended the same
 
 ---
 
+## `getrawaddrman`: `source` and `source_network` are omitted
+
+Found 2026-09-16 by diffing the 26 served methods the parity harness never
+checked. Core reports, per address, **which peer told us about it** (`source`)
+and that peer's network (`source_network`). This node reports neither.
+
+It is not an oversight in the RPC: `ab2_rec_t` (`daemon/addrbook.h`) stores
+`src_group` — the NETGROUP of the peer that told us — and not the address
+itself. The netgroup is what the eviction and diversity rules need, and it is
+all that was ever kept. Reporting Core's field means widening the address-book
+record and rebuilding the book, which is a format change, not an RPC change.
+
+Recorded rather than faked: a `source` reconstructed from a netgroup would be
+a plausible-looking address that no peer ever sent, which is worse than the
+field being absent.
+
+---
+
 ## `getchainstates`: `coins_db_cache_bytes` and `coins_tip_cache_bytes` are omitted
 
 Found 2026-09-12 by `validation/rpc_field_parity.py` once its case table was
