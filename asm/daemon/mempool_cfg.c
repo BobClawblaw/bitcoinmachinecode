@@ -25,6 +25,7 @@
 #include <errno.h>
 #include <sys/mman.h>
 #include "node_config.h"
+#include "mempool_journal.h"
 
 extern unsigned long mpool_struct_size(unsigned long slots);
 extern void mpool_init(void* mp, unsigned long slots, void* blob, unsigned long blob_cap);
@@ -34,6 +35,10 @@ extern unsigned long mpool_policy_state_size(unsigned long n);
 extern void mpool_policy_state_init(void* st, unsigned long n);
 extern void mpool_policy_set_poolcap(void* st, unsigned long long cap);
 extern void mpool_policy_set_forget_cb(void (*fn)(const unsigned char*));
+extern void mpool_policy_set_depart_cb(void (*fn)(const unsigned char*, unsigned long long,
+                                                  unsigned long long, int));
+static void mempool_depart(const unsigned char* txid, unsigned long long vsize,
+                           unsigned long long fee, int reason);   /* defined below */
 extern long mpool_policy_expire_one(void* st, void* mp, const unsigned char txid[32]);
 
 /* Published to bitcoin_serve.asm, which declares these extern. Defined HERE
@@ -225,6 +230,25 @@ int mempool_configure(void){
      * arrival-time entry through this hook so the parallel table cannot
      * accumulate ghosts of txs the pool no longer holds. */
     mpool_policy_set_forget_cb(mempool_forget);
+    /* the departure journal: opened below only when mempooljournal= is set, so
+     * registering the hook unconditionally costs one branch per removal */
+    mpool_policy_set_depart_cb(mempool_depart);
+    /* Open the departure ring if the operator asked for one. A failure here is
+     * NOT fatal and never touches an existing file it does not recognise: the
+     * node runs exactly as it did before, minus the journal, and says so. */
+    if (g_cfg.mempooljournal > 0){
+        /* relative, like addrindex.tail: the daemon has already chdir'd into
+         * the chain datadir by this point */
+        if (mpj_open(MPJ_FILE, (uint64_t)g_cfg.mempooljournal))
+            fprintf(stderr, "[mempool] departure journal: %llu records (%llu MB) in %s%s\n",
+                    (unsigned long long)mpj_capacity(),
+                    (unsigned long long)(MPJ_FILE_BYTES(mpj_capacity()) >> 20), MPJ_FILE,
+                    (uint64_t)g_cfg.mempooljournal != mpj_capacity()
+                        ? " (the EXISTING file's capacity, not the configured one)" : "");
+        else
+            fprintf(stderr, "[mempool] departure journal UNAVAILABLE (%s exists and is not one, "
+                            "or could not be created) -- running without it\n", MPJ_FILE);
+    }
 
     /* MEM-10: the shared "already refused" memory, allocated BEFORE the serve
      * children fork so a transaction one child refused is not re-fetched by
@@ -293,6 +317,39 @@ void mempool_note_accept(const unsigned char txid[32]){
             return;
         }
     }
+}
+
+/* ---- the departure journal (2026-09-16) -----------------------------------
+ * Called by the policy layer as a transaction leaves the pool, with the vsize,
+ * fee and reason it holds at that moment. This is the LAST point at which the
+ * arrival time still exists: mempool_forget clears it immediately after, and
+ * once the pool has dropped the entry there is nowhere left to learn when the
+ * transaction first arrived. That is exactly the fact an explorer needs and
+ * Core cannot give -- "broadcast at T, evicted at T+6h, never mined".
+ *
+ * The journal being closed is the normal case (it is off unless configured),
+ * and mpj_append is a no-op then, so this costs a call and a branch. */
+static void mempool_depart(const unsigned char* txid, unsigned long long vsize,
+                           unsigned long long fee, int reason){
+    if (!mpj_is_open()) return;
+    mpj_rec r;
+    memset(&r, 0, sizeof r);
+    memcpy(r.txid, txid, 32);
+    /* wtxid is left ZERO, and readers must treat all-zero as "not recorded".
+     * The structural pool caches it, but only reachable by SLOT
+     * (mpool_wtxid_at_slot) -- there is no by-txid getter, and scanning the
+     * table on a path that runs thousands of times per connected block is not
+     * a trade worth making for a display field. Copying the txid in instead
+     * would be worse than leaving it out: it is right only for a non-witness
+     * transaction and silently wrong for every segwit one, which is most of
+     * them. A by-txid getter in bitcoin_mempool.asm would close this; the
+     * field is in the record format so that landing it needs no migration. */
+    r.first_seen  = mempool_time_of(txid);
+    r.departed_at = (long)time(0);
+    r.vsize       = vsize;
+    r.fee_sat     = fee;
+    r.reason      = (uint32_t)reason;
+    mpj_append(&r);
 }
 
 /* Clear one arrival-time entry (the policy layer's removal hook). */
