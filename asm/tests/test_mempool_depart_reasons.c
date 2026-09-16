@@ -39,6 +39,8 @@ extern void  mpool_policy_init(void*, u64, unsigned, unsigned, unsigned, unsigne
 extern void  mpool_policy_set_acceptnonstd(void*, unsigned);
 extern long  mpool_policy_add(void*, void*, void*, const u8*, unsigned long, const u8*, void*);
 extern long  mpool_policy_expire_one(void*, void*, const u8*);
+extern long  mpool_policy_block_connect(void*, void*, const u8*, unsigned long);
+extern int   mpool_policy_depart_reason(void);
 extern void  mpool_policy_set_poolcap(void*, unsigned long long);
 extern void  mpool_policy_set_depart_cb(void (*)(const u8*, unsigned long long, unsigned long long, int));
 extern void  mpool_policy_set_depart_reason(int);
@@ -180,6 +182,71 @@ int main(void){
       mpool_policy_add(pol, st, mp, tx, n, id6, ux);
       ck("an eviction that follows an expiry is reported as EVICTED",
          depart_count(MPJ_EXPIRED) == 0); }
+
+    /* ---- MINED vs CONFLICTED, driven by a real block ----------------------
+     * Both leave the pool through mpool_policy_block_connect, and the two are
+     * told apart ONLY by the removal mark: 1 = the block confirmed it, 2 = the
+     * block conflicts with it. Calling the second one "mined" would be the
+     * exact opposite of the truth -- a transaction the user broadcast is gone
+     * for good, and the journal would report it as having made it into a
+     * block. That distinction had no test, because driving it needs a block.
+     * Here is the block. */
+    {
+        /* a fresh pool so the counts below are unambiguous */
+        mpool_init(mp, 64, mblob, sizeof mblob);
+        mpool_policy_state_init(st, 256);
+        mpool_policy_set_poolcap(st, sizeof mblob);
+
+        u8 mined_tx[128];  long mined_n  = mk_tx(mined_tx, 7, 1000000ULL, 500, 0);
+        u8 mined_id[32];   tx_txid(mined_id, mined_tx, mined_n, sc, sizeof sc);
+        ck("the tx to be MINED is admitted",
+           mpool_policy_add(pol, st, mp, mined_tx, mined_n, mined_id, ux) == 1);
+
+        /* a pooled tx spending coin 8, and a DIFFERENT tx in the block that
+         * spends the same coin: the pooled one is conflicted, never mined */
+        u8 pooled_tx[128]; long pooled_n = mk_tx(pooled_tx, 8, 1000000ULL, 600, 0);
+        u8 pooled_id[32];  tx_txid(pooled_id, pooled_tx, pooled_n, sc, sizeof sc);
+        ck("the tx to be CONFLICTED is admitted",
+           mpool_policy_add(pol, st, mp, pooled_tx, pooled_n, pooled_id, ux) == 1);
+
+        u8 winner_tx[128]; long winner_n = mk_tx(winner_tx, 8, 1000000ULL, 900, 1);
+        u8 winner_id[32];  tx_txid(winner_id, winner_tx, winner_n, sc, sizeof sc);
+        ck("...and the block's version of it is a DIFFERENT transaction",
+           memcmp(pooled_id, winner_id, 32) != 0);
+
+        /* block = 80-byte header, then a compact-size count, then the txs.
+         * A COINBASE MUST COME FIRST. block_connect reconciles the pool only
+         * for j > 0, exactly as Core does -- a coinbase cannot be in a mempool
+         * -- so a transaction placed at index 0 is never matched. The first
+         * version of this fixture put the mined tx there and read the silence
+         * as "MINED is broken"; the block was malformed, not the code. */
+        u8 cb_tx[128]; long cb_n = mk_tx(cb_tx, 9, 1000000ULL, 0, 2);
+        static u8 blk[4096];
+        long b = 0;
+        memset(blk, 0, 80); b = 80;
+        blk[b++] = 3;                                  /* coinbase + two */
+        memcpy(blk + b, cb_tx,     cb_n);     b += cb_n;
+        memcpy(blk + b, mined_tx,  mined_n);  b += mined_n;
+        memcpy(blk + b, winner_tx, winner_n); b += winner_n;
+
+        g_ndep = 0;
+        mpool_policy_set_depart_reason(0);
+        long removed = mpool_policy_block_connect(st, mp, blk, (unsigned long)b);
+        ck("connecting the block removed both", removed >= 2);
+
+        ck("the transaction the block CONTAINS is reported as MINED",
+           departed_with(mined_id, MPJ_MINED));
+        ck("the transaction the block CONFLICTS with is reported as CONFLICTED",
+           departed_with(pooled_id, MPJ_CONFLICTED));
+        ck("...and NOT as mined, which would say it made it into a block",
+           !departed_with(pooled_id, MPJ_MINED));
+
+        /* THE DOCUMENTED GAP: block_connect sets its own reason on entry and
+         * must put the caller's back on the way out. Nothing covered this
+         * before, because reaching it needs the block above. */
+        ck("block_connect restored the caller's reason on the way out",
+           mpool_policy_depart_reason() == 0);
+    }
 
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;

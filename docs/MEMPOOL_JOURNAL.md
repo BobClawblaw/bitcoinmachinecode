@@ -140,11 +140,31 @@ a no-op.
 The load line now reports how many came back:
 `loaded mempool.dat: N accepted, ... ; M arrival time(s) restored`.
 
+## Coverage
+
+Every reason is now driven through the real policy engine, not the store:
+
+| reason | how it is exercised |
+|---|---|
+| `evicted` | a pool blob too small for a fifth transaction forces a genuine `TrimToSize` |
+| `expired` | a real expiry sweep over an entry |
+| `mined` | a constructed block containing the transaction |
+| `conflicted` | a block carrying a *different* transaction that spends the same coin |
+| `replaced` | RBF, exercised by the policy suite |
+
+`mined` and `conflicted` share one exit and are told apart only by the removal
+mark, so reporting a conflicted transaction as mined would say a broadcast
+that is gone for good had made it into a block. That block fixture also covers
+`block_connect`'s reason save/restore, which was previously listed here as
+untestable.
+
+One trap the fixture records: **the coinbase must come first.**
+`block_connect` reconciles the pool only for `j > 0`, exactly as Core does,
+so a transaction placed at index 0 is never matched. The first version of the
+fixture put the mined transaction there and read the silence as a broken
+`mined` path — the block was malformed, not the code.
+
 ## Known limits
 
-- The `conflicted` reason is distinguished from `mined` inside
-  `mpool_policy_block_connect` by the removal mark; the save/restore of the
-  reason around *that* entry point is not covered by a test, because driving
-  it needs a real block. `expire_one`'s is.
 - Departures are recorded, arrivals are not. "Every transaction this node ever
   saw" would be a different and much larger feature.
