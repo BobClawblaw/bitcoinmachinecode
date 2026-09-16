@@ -177,13 +177,18 @@ int main(void){
     /* static: node_status_t now carries the 4MB submitblock channel buffer,
      * far too large for the stack. */
     static node_status_t st;
+    /* 2026-09-16: n_out / n_inbound are dead fields for the RPCs -- the counts
+     * come from the peer table now (see the connection-count section at the
+     * end of this file for why). They are set here to values nothing may
+     * read, so a regression that goes back to them shows up as 11 vs 0. */
     st.n_out = 8; st.n_inbound = 3; st.tip_height = 800000; st.start_time = 0;
     rpc_node_set_status(&st);
     long ec; const char* em; rj_val* r;
 
     r = NULL; int rc = rpc_node_dispatch("getconnectioncount", NULL, &r, &ec, &em);
     ck("getconnectioncount dispatched", rc == 1 && r != NULL);
-    ck("getconnectioncount == 11 (8 out + 3 in)", r && r->str && !strcmp(r->str, "11"));
+    ck("getconnectioncount == 0: the peer table is empty, whatever n_out/n_inbound say",
+       r && r->str && !strcmp(r->str, "0"));
     rj_free(r);
 
     r = NULL; rc = rpc_node_dispatch("getnetworkinfo", NULL, &r, &ec, &em);
@@ -197,9 +202,9 @@ int main(void){
          bc && bc->typ == RJ_STR && bc->str && bc->str[0] && strcmp(bc->str, "unknown") != 0);
       ck("...and whether that build had uncommitted changes", bd && bd->typ == RJ_BOOL); }
     ck("localservices NETWORK",  r && S(r,"localservices") && !strcmp(S(r,"localservices"), "0000000000000009"));
-    ck("connections 11",         r && S(r,"connections") && !strcmp(S(r,"connections"), "11"));
-    ck("connections_out 8",      r && S(r,"connections_out") && !strcmp(S(r,"connections_out"), "8"));
-    ck("connections_in 3",       r && S(r,"connections_in") && !strcmp(S(r,"connections_in"), "3"));
+    ck("connections 0 (the table, not the counters)", r && S(r,"connections") && !strcmp(S(r,"connections"), "0"));
+    ck("connections_out 0",      r && S(r,"connections_out") && !strcmp(S(r,"connections_out"), "0"));
+    ck("connections_in 0",       r && S(r,"connections_in") && !strcmp(S(r,"connections_in"), "0"));
     ck("localrelay true",        r && S(r,"localrelay") && !strcmp(S(r,"localrelay"), "1"));
     ck("networkactive reflects the REAL toggle, not a constant "
        "(unset in this status block, so false)",
@@ -1839,6 +1844,72 @@ int main(void){
            rcpl && rj_obj_get(rcpl, "peerinfo") && rj_obj_get(rcpl, "nettotals"));
         rj_free(r);
     }
+    /* ---- the connection counts come from the peer table (2026-09-16) ------
+     * getpeerinfo walks the shared peer table; getconnectioncount and
+     * getnetworkinfo used to return st.n_out + st.n_inbound instead. Only the
+     * serve/leg path maintains those counters -- the download worker fills
+     * peer slots and never touches them -- so during initial block download
+     * the three disagreed. Measured on run 26: getpeerinfo listed 13 peers,
+     * getconnectioncount said 5, and the node was pulling 11 MB/s through 8
+     * download peers the count could not see. A monitor graphing
+     * getconnectioncount drew a node with no peers while it saturated the
+     * link. In Core the two cannot disagree: getconnectioncount is the size
+     * of the vector getpeerinfo renders. */
+    {
+        static node_status_t cs;
+        cs.tip_height = 800000;
+        cs.n_out = 999; cs.n_inbound = -7;        /* nothing may read these */
+        for (int i = 0; i < 8; i++){
+            int slot = i * 2;                      /* gaps, as leg churn leaves */
+            cs.peers[slot].used = 1; cs.peers[slot].inbound = 0;
+            snprintf(cs.peers[slot].addr, sizeof cs.peers[slot].addr, "10.0.0.%d:8333", i + 1);
+            cs.peers[slot].dl_worker = (i < 3) ? i : -1;   /* three download workers */
+            cs.peers[slot].nodeid = 100 + i;
+        }
+        for (int i = 0; i < 3; i++){
+            int slot = 40 + i;
+            cs.peers[slot].used = 1; cs.peers[slot].inbound = 1; cs.peers[slot].pid = 0;
+            snprintf(cs.peers[slot].addr, sizeof cs.peers[slot].addr, "10.1.0.%d:8333", i + 1);
+            cs.peers[slot].dl_worker = -1; cs.peers[slot].nodeid = 200 + i;
+        }
+        /* the parallel download's peers live in their OWN array, which
+         * getpeerinfo renders as a second loop. Counting only peers[] is how
+         * the first version of this fix still said 4 while getpeerinfo listed
+         * 12 on run 26 -- the download peers were the entire point. */
+        cs.n_dlpeers = 5;
+        for (int i = 0; i < 5; i++){
+            cs.dlpeers[i].used = 1; cs.dlpeers[i].inbound = 0;
+            snprintf(cs.dlpeers[i].addr, sizeof cs.dlpeers[i].addr, "10.2.0.%d:8333", i + 1);
+        }
+        rpc_node_set_status(&cs);
+        long e2; const char* m2;
+        rj_val* cc = NULL; rpc_node_dispatch("getconnectioncount", NULL, &cc, &e2, &m2);
+        ck("getconnectioncount counts BOTH arrays: 16 (8 legs out + 5 download peers + 3 in)",
+           cc && cc->str && !strcmp(cc->str, "16"));
+        rj_val* pi = NULL; rpc_node_dispatch("getpeerinfo", NULL, &pi, &e2, &m2);
+        ck("getconnectioncount equals the number of peers getpeerinfo lists (Core's invariant)",
+           pi && cc && cc->str && (long)pi->nitems == atol(cc->str));
+        rj_val* ni = NULL; rpc_node_dispatch("getnetworkinfo", NULL, &ni, &e2, &m2);
+        ck("getnetworkinfo agrees: connections 16, out 13, in 3",
+           ni && S(ni,"connections") && !strcmp(S(ni,"connections"), "16")
+             && S(ni,"connections_out") && !strcmp(S(ni,"connections_out"), "13")
+             && S(ni,"connections_in")  && !strcmp(S(ni,"connections_in"),  "3"));
+        /* the download workers' peers are listed like any other connection --
+         * by address, since bmc_download_worker was deliberately dropped from
+         * getpeerinfo (an additive key in a Core call; the worker index lives
+         * on bmcgetdownloadinfo, which is ours to define) */
+        int dl = 0;
+        for (unsigned long i = 0; pi && i < pi->nitems; i++){
+            const char* a = S(pi->items[i], "addr");
+            if (a && !strncmp(a, "10.2.0.", 7)) dl++;
+        }
+        ck("the 5 parallel-download peers are listed, and counted", dl == 5);
+        if (cc) rj_free(cc);
+        if (pi) rj_free(pi);
+        if (ni) rj_free(ni);
+        rpc_node_set_status(NULL);
+    }
+
 
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);
     return fails ? 1 : 0;
