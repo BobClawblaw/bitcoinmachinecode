@@ -26,6 +26,7 @@
 
 extern int  store_init(void* st);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
+extern void store_reload(void* st);
 extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
 
 /* the mempool policy layer wants this resolver; this test never exercises
@@ -77,7 +78,7 @@ static int resolves(const char* hash_disp){
 int main(void){
     tt_isolate();
 
-    enum { AT_OPEN = 64, GROWN = 4096 };
+    enum { AT_OPEN = 64, GROWN = 8192 };
     char hash_at_open[65], hash_grown[65], hash_low[65];
 
     memset(g_st, 0, sizeof g_st);
@@ -111,6 +112,7 @@ int main(void){
           static unsigned char st2[4096];
           memset(st2, 0, sizeof st2);
           if (store_init(st2) != 1) _exit(2);
+          store_reload(st2);   /* learn the tip already on disk, as rpc_chain_open does -- without this the writer appends from height 0 and overwrites the chain the reader opened on */
           for (unsigned h = AT_OPEN + 1; h <= GROWN; h++){
               unsigned char blk[128]; long n = mk_block(blk, h);
               unsigned char id[32]; sha256d(id, blk, (unsigned long)n);
