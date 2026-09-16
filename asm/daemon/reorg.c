@@ -255,13 +255,14 @@ static int g_cw_open = 0;
 /* ---------------- small helpers ----------------------------------------- */
 
 /* Block hashes are printed the way explorers/RPC show them: byte-reversed,
- * first 8 display bytes. Identical convention (and identical helper shape) to
- * daemon/main.c's log_hash_short so reorg lines can be grep-correlated
- * against [block] stored lines. */
-static void hash_short(char out[17], const unsigned char h[32]){
+ * WHOLE. Identical convention (and identical helper shape) to daemon/main.c's
+ * log_hash_short so reorg lines can be grep-correlated against [block] lines
+ * -- widened with it 2026-09-16, because eight display bytes of a mainnet hash
+ * are all zeros and both helpers were emitting the same useless constant. */
+static void hash_short(char out[65], const unsigned char h[32]){
     static const char hexd[]="0123456789abcdef";
-    for(int k=0;k<8;k++){ unsigned char b=h[31-k]; out[k*2]=hexd[b>>4]; out[k*2+1]=hexd[b&0xf]; }
-    out[16]=0;
+    for(int k=0;k<32;k++){ unsigned char b=h[31-k]; out[k*2]=hexd[b>>4]; out[k*2+1]=hexd[b&0xf]; }
+    out[64]=0;
 }
 /* 128-bit cumulative work, printed as fixed-width hex (high limb then low).
  * Hex rather than decimal because there is no portable 128-bit printf. */
@@ -904,7 +905,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
             return -1;
         }
         unsigned char bh[32]; block_hash(bh, blkbuf);
-        char hs[17]; hash_short(hs, bh);
+        char hs[65]; hash_short(hs, bh);
         fprintf(stderr, "[reorg] disconnecting height %ld hash=%s..\n", h, hs);
         if (g_reorg_mp_set && !disc_overflow){
             if (ndisc >= REORG_DISC_MAX_BLOCKS ||
@@ -1077,7 +1078,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         if (!utxo_live_rewind_to(h)){
             fprintf(stderr, "[reorg] WARNING: could not persist applied height %ld\n", h);
         }
-        char hs[17]; hash_short(hs, bh);
+        char hs[65]; hash_short(hs, bh);
         fprintf(stderr, "[reorg] reconnecting height %ld hash=%s..\n", h, hs);
         connected++;
     }
@@ -1134,7 +1135,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
 
     g_last_fork_height = fork_height;
 
-    unsigned char tiph[32]; char hs[17] = "(none)";
+    unsigned char tiph[32]; char hs[65] = "(none)";
     if (store_get_tip_hash(st, tiph) == 1) hash_short(hs, tiph);
     fprintf(stderr, "[reorg] complete: new tip height=%ld hash=%s.. (%.2fs, -%ld +%ld blocks)\n",
             store_tip(st), hs, now_s()-t0, tip - fork_height, connected);
