@@ -2759,13 +2759,23 @@ static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claime
     pr->used = 1;   /* publish last: readers see a fully-formed slot */
 }
 
-static void log_hash_short(char out[17], const unsigned char hash32[32]){
+/* THE WHOLE HASH, not a prefix. This printed the first EIGHT display bytes,
+ * and a mainnet block hash begins with about ten ZERO bytes -- so every line
+ * using it read "hash=0000000000000000", identically, for every block ever
+ * mined. 78 such lines were in one log before anyone looked. A prefix that has
+ * to be re-guessed as the difficulty rises is not an identifier; the full hash
+ * costs 48 more characters in a line that is already long.
+ *
+ * daemon/reorg.c's hash_short mirrors this one ON PURPOSE so reorg lines can
+ * be grep-correlated against [block] lines -- it is widened in lockstep, or
+ * the correlation this comment promises quietly stops working. */
+static void log_hash_short(char out[65], const unsigned char hash32[32]){
     static const char hexd[]="0123456789abcdef";
-    for(int k=0;k<8;k++){
+    for(int k=0;k<32;k++){
         unsigned char b=hash32[31-k];
         out[k*2]=hexd[b>>4]; out[k*2+1]=hexd[b&0xf];
     }
-    out[16]=0;
+    out[64]=0;
 }
 
 /* ---- Core's shape at the tip (2026-09-10) ----------------------------------
@@ -2803,8 +2813,17 @@ extern void cmpct_recv_last_block(unsigned long*, unsigned long*, unsigned long*
 static void cmpct_overlap_line(long height, const unsigned char* hash32, const char* host){
     unsigned long ntx, pool, pre, miss, mb, cls[5]; cmpct_recv_last_block(&ntx, &pool, &pre, &miss, &mb, cls);
     if(!ntx) return;
-    char hs[20]; hs[0] = 0;
-    if(hash32){ for(int j = 0; j < 8; j++) sprintf(hs + 2*j, "%02x", hash32[31 - j]); hs[16] = 0; }
+    /* THE WHOLE HASH. Eight bytes was useless and measurably so: a mainnet
+     * block hash begins with about ten ZERO bytes, so the first eight of the
+     * display form are "0000000000000000" for every block ever mined. 78 log
+     * lines carried that identical string before this was noticed -- an
+     * identifier that cannot tell any two blocks apart, in a line whose whole
+     * purpose here is telling repeats apart. The pre-existing "[block] stored"
+     * line has the same defect and is fixed with it. 64 characters in a log
+     * line is cheap; a fixed-width prefix that has to be re-guessed as the
+     * difficulty rises is not. */
+    char hs[68]; hs[0] = 0;
+    if(hash32){ for(int j = 0; j < 32; j++) sprintf(hs + 2*j, "%02x", hash32[31 - j]); hs[64] = 0; }
     fprintf(stderr,"[cmpct] block %ld%s%s (%s): %lu tx: %lu from the mempool (%.1f%%), %lu prefilled, %lu fetched by getblocktxn (%lu KB): %lu never announced, %lu announced not requested, %lu requested no reply, %lu orphans, %lu rejected by policy\n",
             height, hs[0] ? " hash=" : "", hs[0] ? hs : "", host,
             ntx, pool, ntx ? 100.0 * (double)pool / (double)ntx : 0.0, pre, miss, mb / 1024,
@@ -2934,8 +2953,8 @@ static long dl_store_pushed_block(int k, const unsigned char* blk, unsigned long
     if(r == -2){ g_push_skipped_n++; return 0; }                        /* the tip moved under us: a sibling stored it first */
     if(r < 0){ fprintf(stderr,"[cmpct] %s from %s: locked append FAILED\n", how, mux_out_host[k]); return -1; }
     g_push_stored_n++; g_stored_now = 1;
-    { char hs[17]; for(int j = 0; j < 8; j++) sprintf(hs + 2*j, "%02x", bh[31 - j]);
-      fprintf(stderr,"[block] stored height=%ld hash=%s.. bytes=%lu (%s from %s)\n", tip + 1, hs, len, how, mux_out_host[k]); }
+    { char hs[68]; for(int j = 0; j < 32; j++) sprintf(hs + 2*j, "%02x", bh[31 - j]);   /* the whole hash: eight bytes of a mainnet hash are all zeros */
+      fprintf(stderr,"[block] stored height=%ld hash=%s bytes=%lu (%s from %s)\n", tip + 1, hs, len, how, mux_out_host[k]); }
     /* tip + 1 is the EXPECTED height, not necessarily this block's -- the hash
      * is what identifies it, and what tells two concurrent pushes of the same
      * block apart from two different blocks */
@@ -3051,10 +3070,10 @@ static long do_outbound_sync(int i){
         if(L<80) continue;
         unsigned char bhash[32]; block_hash(bhash, sb);
         idx_put(ht_idx, bhash, h);
-        char hs[17]; log_hash_short(hs, bhash);
+        char hs[65]; log_hash_short(hs, bhash);
         u64 consumed=0; u64 ntx = L>80 ? utxo_walk_read_varint(sb+80, sb+L, &consumed) : 0;
         if(!consumed) ntx = 0;
-        fprintf(stderr,"[block] stored height=%d hash=%s.. bytes=%ld tx=%llu (via %s)\n", h, hs, L, (unsigned long long)ntx, mux_out_host[i]);
+        fprintf(stderr,"[block] stored height=%d hash=%s bytes=%ld tx=%llu (via %s)\n", h, hs, L, (unsigned long long)ntx, mux_out_host[i]);
         blk_src_note(h, mux_out_host[i]);   /* 3.3: remembered for the reject hook */
     }
     /* STAGE B: keep chainwork.dat in lockstep with index.dat for every block
