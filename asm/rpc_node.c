@@ -2185,6 +2185,7 @@ typedef struct {
      * explanation any more and the old log line saying so was misleading. These
      * count what the worker actually said. */
     long rej_missing, rej_conflict, rej_known, rej_policy, rej_other, rej_noack;
+    long already;           /* in the pool already -- present, not refused */
     const char* abort_why;
 } mpd_import_ctx;
 /* The parent's shutdown flag (main.c installs it): a reload that waits 90 s
@@ -2303,11 +2304,19 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
         if (!acked)                                   c->rej_noack++;
         else if (missing)                             c->rej_missing++;
         else if (strstr(why, "conflict"))             c->rej_conflict++;
-        else if (strstr(why, "already"))              c->rej_known++;
+        else if (strstr(why, "already"))             { /* counted below, and not as a refusal */ }
         else if (why[0])                              c->rej_policy++;
         else                                          c->rej_other++;
     }
     pthread_mutex_unlock(&g_submit_lock);
+    /* "already known" is NOT a refusal: the transaction IS in the pool, it just
+     * arrived from a peer during boot before the dump was read. Counting it as
+     * rejected understated the load badly -- 665 of 753 "refusals" on
+     * 2026-09-16 were duplicates, so 17,122 of 17,210 entries were really in
+     * the pool while the line claimed 753 had failed. */
+    if (!ok && acked && !missing && strstr((const char*)st->tx_submit_reason, "already")){
+        c->rej_known++; c->already++; return 0;
+    }
     if (ok) c->accepted++;
     else if (missing && c->collecting){
         if (c->nretry == c->retry_cap){
@@ -2383,12 +2392,11 @@ long rpc_node_mempool_load(const char* path){
      * that sort landed (1,622 deferred on 2026-09-16 03:08 and 3,630 at 06:09,
      * both zero). The refusals are inputs that genuinely are not there. Saying
      * which is the difference between a number and a diagnosis. */
-    fprintf(stderr, "[mempool] loaded %s: %ld accepted, %ld refused of %ld; "
-                    "refusals: %ld missing-inputs, %ld conflicting, %ld already known, "
-                    "%ld policy, %ld no-ack, %ld other (%ld re-offered, %ld then accepted); "
-                    "%ld arrival time(s) restored\n",
-            path ? path : "mempool.dat", c.accepted, c.rejected, r,
-            c.rej_missing, c.rej_conflict, c.rej_known, c.rej_policy, c.rej_noack, c.rej_other,
+    fprintf(stderr, "[mempool] loaded %s: %ld of %ld in the pool (%ld admitted, %ld already there); "
+                    "%ld refused: %ld missing-inputs, %ld conflicting, %ld policy, %ld no-ack, %ld other "
+                    "(%ld re-offered, %ld then accepted); %ld arrival time(s) restored\n",
+            path ? path : "mempool.dat", c.accepted + c.already, r, c.accepted, c.already,
+            c.rejected, c.rej_missing, c.rej_conflict, c.rej_policy, c.rej_noack, c.rej_other,
             deferred, gained, c.restored_times);
     return c.accepted;
 }
