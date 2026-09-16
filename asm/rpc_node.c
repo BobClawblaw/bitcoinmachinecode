@@ -2184,7 +2184,7 @@ typedef struct {
      * (mpd_order_parents_first), so "it arrived before its parent" is not the
      * explanation any more and the old log line saying so was misleading. These
      * count what the worker actually said. */
-    long rej_missing, rej_conflict, rej_known, rej_policy, rej_other, rej_noack;
+    long rej_missing, rej_conflict, rej_policy, rej_other, rej_noack;
     long already;           /* in the pool already -- present, not refused */
     const char* abort_why;
 } mpd_import_ctx;
@@ -2265,11 +2265,15 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
     (void)d;            /* fee deltas are still not restorable: there is no
                          * prioritisetransaction path to replay one into */
     mpd_import_ctx* c = (mpd_import_ctx*)vctx;
-    { mpd_import_ctx* c0 = (mpd_import_ctx*)vctx; if (c0->aborted){ c0->rejected++; return 0; } }   /* aborted: drain the rest without waiting */
+    { mpd_import_ctx* c0 = (mpd_import_ctx*)vctx;
+      /* counted as "other": the worker was never asked, so there is no reason
+       * to classify -- but it IS a refused entry and has to appear in the
+       * histogram, or the parts stop summing to the total */
+      if (c0->aborted){ c0->rejected++; c0->rej_other++; return 0; } }   /* aborted: drain the rest */
     if (!g_status_rw) return -1;
     node_status_t* st = g_status_rw;
     pthread_mutex_lock(&g_submit_lock);
-    if (len > RPC_TXSUBMIT_MAX){ pthread_mutex_unlock(&g_submit_lock); c->rejected++; return 0; }
+    if (len > RPC_TXSUBMIT_MAX){ pthread_mutex_unlock(&g_submit_lock); c->rejected++; c->rej_other++; return 0; }
     memcpy((void*)st->tx_submit_buf, tx, len);
     st->tx_submit_len = len;
     st->tx_submit_test = 0;
@@ -2299,24 +2303,34 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
     if (acked) c->consec_timeouts = 0;
     else if (!c->aborted && ++c->consec_timeouts >= 2){ c->aborted = 1; c->abort_why = "the worker is not answering"; }
     int missing = !ok && strstr((const char*)st->tx_submit_reason, "missing") != NULL;
+    /* Classify now, while the worker's reason is still in the shared slot, but
+     * do NOT count it yet: an entry about to be DEFERRED comes back through
+     * here on the retry pass and would be counted twice. The first live
+     * histogram showed exactly that -- "16 refused" over a list summing to 23,
+     * the gap being the 7 re-offered entries. These counters must describe
+     * ENTRIES, not attempts, or they do not reconcile with the total they sit
+     * beside. */
+    int why_class = 0;              /* 1 noack, 2 missing, 3 conflict, 4 already, 5 policy, 6 other */
     if (!ok){
         const char* why = (const char*)st->tx_submit_reason;
-        if (!acked)                                   c->rej_noack++;
-        else if (missing)                             c->rej_missing++;
-        else if (strstr(why, "conflict"))             c->rej_conflict++;
-        else if (strstr(why, "already"))             { /* counted below, and not as a refusal */ }
-        else if (why[0])                              c->rej_policy++;
-        else                                          c->rej_other++;
+        if (!acked)                       why_class = 1;
+        else if (missing)                 why_class = 2;
+        else if (strstr(why, "conflict")) why_class = 3;
+        else if (strstr(why, "already"))  why_class = 4;
+        else if (why[0])                  why_class = 5;
+        else                              why_class = 6;
     }
     pthread_mutex_unlock(&g_submit_lock);
+    #define MPD_COUNT_REFUSAL() do { switch (why_class){ \
+            case 1: c->rej_noack++;    break; case 2: c->rej_missing++;  break; \
+            case 3: c->rej_conflict++; break; case 5: c->rej_policy++;   break; \
+            default: c->rej_other++;   break; } } while (0)
     /* "already known" is NOT a refusal: the transaction IS in the pool, it just
      * arrived from a peer during boot before the dump was read. Counting it as
      * rejected understated the load badly -- 665 of 753 "refusals" on
      * 2026-09-16 were duplicates, so 17,122 of 17,210 entries were really in
      * the pool while the line claimed 753 had failed. */
-    if (!ok && acked && !missing && strstr((const char*)st->tx_submit_reason, "already")){
-        c->rej_known++; c->already++; return 0;
-    }
+    if (why_class == 4){ c->already++; return 0; }      /* present already: not a refusal */
     if (ok) c->accepted++;
     else if (missing && c->collecting){
         if (c->nretry == c->retry_cap){
@@ -2330,14 +2344,15 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
                 if (nr) c->retry = nr;
                 if (nl) c->retry_len = nl;
                 if (nt) c->retry_time = nt;
-                c->rejected++; return 0; }
+                c->rejected++; MPD_COUNT_REFUSAL(); return 0; }
             c->retry = nr; c->retry_len = nl; c->retry_time = nt; c->retry_cap = ncap;
         }
         unsigned char* cp = malloc(len);
-        if (!cp){ c->rejected++; return 0; }
+        if (!cp){ c->rejected++; MPD_COUNT_REFUSAL(); return 0; }
         memcpy(cp, tx, len); c->retry[c->nretry] = cp; c->retry_len[c->nretry] = len;
         c->retry_time[c->nretry] = t; c->nretry++;
-    } else c->rejected++;
+    } else { c->rejected++; MPD_COUNT_REFUSAL(); }
+    #undef MPD_COUNT_REFUSAL
     return 0;                       /* a rejected entry is not a file error */
 }
 /* Re-offer the missing-input rejects until a pass admits nothing more. Each
