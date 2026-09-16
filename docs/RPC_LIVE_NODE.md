@@ -1235,11 +1235,19 @@ consensus and policy treatment on the way back in. Core re-validates on load
 too — a dump is a hint about what was interesting, never a licence to skip
 checks.
 
-**Not restored**, stated rather than glossed: entry times and fee deltas (a
-re-admitted transaction gets a fresh time, and there is no
-`prioritisetransaction` path to replay a delta into), and the unbroadcast
-set, which this node does not track because `sendrawtransaction` relays to
-every live leg immediately.
+**Entry times ARE restored as of 2026-09-16.** They were not, and a
+re-admitted transaction got a fresh stamp: every restart reset the pool's
+sense of age, so `-mempoolexpiry` began each transaction's 336-hour clock
+again and the departure journal reported `waited: 1` for transactions that
+had in fact been waiting for hours. The value is vetted rather than trusted —
+`mempool.dat` is read at startup before anything has checked it, and this
+field is an input to expiry, so a time in the future or past the expiry window
+is refused and the fresh stamp stands (`mempool_restore_accept_time`).
+
+**Still not restored**, stated rather than glossed: fee deltas (there is no
+`prioritisetransaction` path to replay one into) and the unbroadcast set,
+which this node does not track because `sendrawtransaction` relays to every
+live leg immediately.
 
 Verified on the live mainnet node: a 284,485-byte dump of 184 real
 transactions that an independent parser walks to exactly the file length,

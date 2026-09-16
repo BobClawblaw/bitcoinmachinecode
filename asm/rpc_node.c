@@ -2174,10 +2174,12 @@ typedef struct {
     /* entries rejected for MISSING INPUTS are kept for retry passes: the dump
      * is written in pool order, not parent-before-child, so a child ahead of
      * its parent fails on the first pass and succeeds once the parent is in. */
-    unsigned char** retry; unsigned long* retry_len; long nretry, retry_cap;
+    unsigned char** retry; unsigned long* retry_len; long long* retry_time;
+    long nretry, retry_cap;
     int collecting;
     int aborted;            /* shutdown requested, or the worker stopped answering */
     int consec_timeouts;    /* entries in a row that drew no ack at all */
+    long restored_times;    /* accepts whose persisted arrival time was applied */
     const char* abort_why;
 } mpd_import_ctx;
 /* The parent's shutdown flag (main.c installs it): a reload that waits 90 s
@@ -2247,10 +2249,15 @@ long mpd_order_parents_first(const mpd_ent* v, long n, long* order){
     free(slot); free(indeg); free(children); free(child_next); free(child_head);
     return placed;
 }
+/* mempool.dat's per-transaction entry_time, applied after the accept succeeds.
+ * Weak so the test binaries that link rpc_node.o without daemon/mempool_cfg.c
+ * still build; absent, the arrival time simply stays as stamped. */
+extern int mempool_restore_accept_time(const unsigned char txid[32], long t) __attribute__((weak));
+
 static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len,
                           long long t, long long d){
-    (void)t; (void)d;   /* entry time and fee delta are not restorable here --
-                         * see the divergence note at the call site */
+    (void)d;            /* fee deltas are still not restorable: there is no
+                         * prioritisetransaction path to replay one into */
     mpd_import_ctx* c = (mpd_import_ctx*)vctx;
     { mpd_import_ctx* c0 = (mpd_import_ctx*)vctx; if (c0->aborted){ c0->rejected++; return 0; } }   /* aborted: drain the rest without waiting */
     if (!g_status_rw) return -1;
@@ -2272,6 +2279,17 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
         struct timespec ts = {0, MPD_POLL_US*1000L}; nanosleep(&ts, NULL);   /* the worker acks within ~0.5 ms once it is servicing the stream */
         waited += MPD_POLL_US;
     }
+    if (ok && t > 0 && mempool_restore_accept_time){
+        /* The worker stamped "now" when it admitted this. Put the time the
+         * transaction ACTUALLY arrived back, so a restart does not reset the
+         * pool's sense of age -- the departure journal's `waited` and
+         * -mempoolexpiry both read this field. The helper vets the value; a
+         * future or already-expired time is refused there, not here. */
+        unsigned char id[32];
+        static unsigned char scratch[RPC_TXSUBMIT_MAX];
+        if (tx_txid(id, tx, len, scratch, sizeof scratch) &&
+            mempool_restore_accept_time(id, (long)t)) c->restored_times++;
+    }
     if (acked) c->consec_timeouts = 0;
     else if (!c->aborted && ++c->consec_timeouts >= 2){ c->aborted = 1; c->abort_why = "the worker is not answering"; }
     int missing = !ok && strstr((const char*)st->tx_submit_reason, "missing") != NULL;
@@ -2282,12 +2300,20 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
             long ncap = c->retry_cap ? c->retry_cap * 2 : 64;
             unsigned char** nr = realloc(c->retry, (size_t)ncap * sizeof *nr);
             unsigned long* nl = realloc(c->retry_len, (size_t)ncap * sizeof *nl);
-            if (!nr || !nl){ free(nr); free(nl); c->rejected++; return 0; }
-            c->retry = nr; c->retry_len = nl; c->retry_cap = ncap;
+            long long*     nt = realloc(c->retry_time, (size_t)ncap * sizeof *nt);
+            if (!nr || !nl || !nt){
+                /* keep whatever realloc DID move, or the next free() is on a
+                 * stale pointer; only the failed one is discarded */
+                if (nr) c->retry = nr;
+                if (nl) c->retry_len = nl;
+                if (nt) c->retry_time = nt;
+                c->rejected++; return 0; }
+            c->retry = nr; c->retry_len = nl; c->retry_time = nt; c->retry_cap = ncap;
         }
         unsigned char* cp = malloc(len);
         if (!cp){ c->rejected++; return 0; }
-        memcpy(cp, tx, len); c->retry[c->nretry] = cp; c->retry_len[c->nretry] = len; c->nretry++;
+        memcpy(cp, tx, len); c->retry[c->nretry] = cp; c->retry_len[c->nretry] = len;
+        c->retry_time[c->nretry] = t; c->nretry++;
     } else c->rejected++;
     return 0;                       /* a rejected entry is not a file error */
 }
@@ -2301,14 +2327,19 @@ static long mpd_retry_passes(mpd_import_ctx* c){
         unsigned char** list = c->retry; unsigned long* lens = c->retry_len;
         c->retry = 0; c->retry_len = 0; c->nretry = c->retry_cap = 0; c->collecting = 1;
         long rej0 = c->rejected;
-        for (long i = 0; i < n; i++){ mpd_import_one(c, list[i], lens[i], 0, 0); free(list[i]); }
-        free(list); free(lens);
+        /* the persisted time travels with the deferred entry: a child held back
+         * for its parent is exactly as old as the file says, and dropping the
+         * time here would leave a subset of the pool silently re-aged */
+        long long* tms = c->retry_time; c->retry_time = 0;
+        for (long i = 0; i < n; i++){ mpd_import_one(c, list[i], lens[i], tms ? tms[i] : 0, 0); free(list[i]); }
+        free(list); free(lens); free(tms);
         passes++; gained += c->accepted - before;
         c->collecting = 0;
         if (c->accepted == before){ c->rejected = rej0 + c->nretry; break; }   /* no progress: the rest are real rejects */
     }
     for (long i = 0; i < c->nretry; i++) free(c->retry[i]);
-    free(c->retry); free(c->retry_len); c->retry = 0; c->retry_len = 0; c->nretry = 0;
+    free(c->retry); free(c->retry_len); free(c->retry_time);
+    c->retry = 0; c->retry_len = 0; c->retry_time = 0; c->nretry = 0;
     return passes ? gained : 0;
 }
 
@@ -2330,8 +2361,9 @@ long rpc_node_mempool_load(const char* path){
     free(col.v); free(order);
     long deferred = c.nretry;
     long gained = mpd_retry_passes(&c);
-    fprintf(stderr, "[mempool] loaded %s: %ld accepted, %ld rejected of %ld (%ld waited for a parent, %ld of them then accepted)\n",
-            path ? path : "mempool.dat", c.accepted, c.rejected, r, deferred, gained);
+    fprintf(stderr, "[mempool] loaded %s: %ld accepted, %ld rejected of %ld (%ld waited for a parent, %ld of them then accepted); "
+                    "%ld arrival time(s) restored\n",
+            path ? path : "mempool.dat", c.accepted, c.rejected, r, deferred, gained, c.restored_times);
     return c.accepted;
 }
 
