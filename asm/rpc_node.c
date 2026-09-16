@@ -46,6 +46,7 @@ int rpc_msg_index(const char* cmd, unsigned cmdlen){
 #include <unistd.h>  /* getcwd -- implicitly declared until 2026-08-27, which on
                       * this ABI means int, truncating the returned pointer */
 #include <time.h>
+#include "daemon/mempool_journal.h"
 
 /* ---- Core's argument type check -------------------------------------------
  * Measured against Core v31.1 on the oracle, 2026-09-15, for every JSON type.
@@ -2883,6 +2884,123 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
  *
  * Answers {"active": false} outside a parallel download rather than failing,
  * so a poller can call it unconditionally. */
+
+/* ---- bmcgetmempooljournal (2026-09-16) -------------------------------------
+ * The mempool DEPARTURE journal. Core has no counterpart: when a transaction
+ * leaves the pool without being mined -- evicted because the pool hit
+ * -maxmempool, expired after -mempoolexpiry, or replaced -- Core forgets it,
+ * so an explorer built on it cannot say what became of a transaction a user
+ * broadcast. It shows a gap, or a "ghost" that was there and then was not.
+ * daemon/mempool_journal.c records one bounded row per departure.
+ *
+ *   bmcgetmempooljournal                 -> stats + the most recent departures
+ *   bmcgetmempooljournal <txid>          -> that transaction's latest departure
+ *   bmcgetmempooljournal <count>         -> the most recent <count>
+ *
+ * Amounts are satoshis (this is an extension, not a Core-shaped reply, so it
+ * uses the unit the record holds rather than Core's decimal BTC strings). */
+static void mpj_hex_rev(char out[65], const unsigned char h[32]){
+    static const char* D = "0123456789abcdef";
+    for (int i = 0; i < 32; i++){ unsigned char b = h[31-i]; out[i*2] = D[b>>4]; out[i*2+1] = D[b&15]; }
+    out[64] = 0;
+}
+static int mpj_all_zero(const unsigned char* p, int n){ for (int i=0;i<n;i++) if (p[i]) return 0; return 1; }
+
+static rj_val* mpj_row(const mpj_rec* r){
+    rj_val* o = rj_obj();
+    char h[65];
+    mpj_hex_rev(h, r->txid);   rj_obj_set(o, "txid", rj_str(h));
+    /* wtxid is not recorded today (see daemon/mempool_cfg.c mempool_depart);
+     * an all-zero field is "not recorded", and omitting it is more honest than
+     * echoing the txid, which is right only for a non-witness transaction. */
+    if (!mpj_all_zero(r->wtxid, 32)){ mpj_hex_rev(h, r->wtxid); rj_obj_set(o, "wtxid", rj_str(h)); }
+    rj_obj_set(o, "reason", rj_str(mpj_reason_name(r->reason)));
+    if (r->first_seen)  rj_obj_set(o, "firstseen", rj_numf("%lld", (long long)r->first_seen));
+    rj_obj_set(o, "departed", rj_numf("%lld", (long long)r->departed_at));
+    if (r->first_seen && r->departed_at >= r->first_seen)
+        rj_obj_set(o, "waited", rj_numf("%lld", (long long)(r->departed_at - r->first_seen)));
+    rj_obj_set(o, "vsize", rj_numf("%llu", (unsigned long long)r->vsize));
+    rj_obj_set(o, "fee", rj_numf("%llu", (unsigned long long)r->fee_sat));
+    if (r->vsize) rj_obj_set(o, "feerate", rj_numf("%llu", (unsigned long long)(r->fee_sat / r->vsize)));
+    if (r->reason == MPJ_MINED && r->height) rj_obj_set(o, "height", rj_numf("%u", r->height));
+    if (!mpj_all_zero(r->aux, 32)){
+        mpj_hex_rev(h, r->aux);
+        rj_obj_set(o, r->reason == MPJ_REPLACED ? "replaced_by" : "blockhash", rj_str(h));
+    }
+    return o;
+}
+typedef struct { rj_val* arr; long cap; } mpj_ctx;
+static int mpj_push(void* c, const mpj_rec* r){
+    mpj_ctx* x = c;
+    if ((long)x->arr->nitems >= x->cap) return 0;
+    rj_arr_push(x->arr, mpj_row(r));
+    return 1;
+}
+static int cmd_bmcgetmempooljournal(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!mpj_is_open()){
+        *ec = -1;
+        *em = "the mempool departure journal is not enabled -- set bmc.mempooljournal=<records> "
+              "(one record is 152 bytes) and restart";
+        return 0;
+    }
+    /* one string argument: a txid to look up */
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 && params->items[0]->typ == RJ_STR){
+        const char* hx = params->items[0]->str;
+        if (strlen(hx) != 64){
+            static char eb[96];
+            snprintf(eb, sizeof eb, "txid must be of length 64 (not %zu, for '%s')", strlen(hx), hx);
+            *ec = -8; *em = eb; return 0;
+        }
+        unsigned char wire[32];
+        for (int i = 0; i < 32; i++){
+            int hi = -1, lo = -1; char a = hx[i*2], b = hx[i*2+1];
+            if (a>='0'&&a<='9') hi=a-'0'; else if ((a|32)>='a'&&(a|32)<='f') hi=(a|32)-'a'+10;
+            if (b>='0'&&b<='9') lo=b-'0'; else if ((b|32)>='a'&&(b|32)<='f') lo=(b|32)-'a'+10;
+            if (hi < 0 || lo < 0){
+                static char eb2[96];
+                snprintf(eb2, sizeof eb2, "txid must be hexadecimal string (not '%s')", hx);
+                *ec = -8; *em = eb2; return 0; }
+            wire[31-i] = (unsigned char)((hi<<4)|lo);
+        }
+        mpj_rec r;
+        if (!mpj_lookup(wire, &r)){
+            /* NOT an error: "the journal has no record of it" is a real and
+             * useful answer -- it means the transaction never left the pool
+             * here, or left longer ago than the ring holds. */
+            rj_val* o = rj_obj();
+            rj_obj_set(o, "found", rj_bool(0));
+            *res = o; return 1;
+        }
+        rj_val* o = mpj_row(&r);
+        rj_obj_set(o, "found", rj_bool(1));
+        *res = o; return 1;
+    }
+    /* optional numeric argument: how many recent departures to return */
+    long want = 10;
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 && params->items[0]->typ == RJ_NUM){
+        want = atol(params->items[0]->str);
+        if (want < 0) want = 0;
+        if (want > 5000) want = 5000;        /* one reply, not a database dump */
+    }
+    mpj_stats_t st; mpj_stats(&st);
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "capacity", rj_numf("%llu", (unsigned long long)st.capacity));
+    rj_obj_set(o, "held",     rj_numf("%llu", (unsigned long long)st.held));
+    rj_obj_set(o, "recorded", rj_numf("%llu", (unsigned long long)st.written));
+    if (st.held){
+        rj_obj_set(o, "oldest", rj_numf("%lld", (long long)st.oldest_departed));
+        rj_obj_set(o, "newest", rj_numf("%lld", (long long)st.newest_departed));
+    }
+    { rj_val* by = rj_obj();
+      for (uint32_t i = 1; i <= MPJ_REASON_MAX; i++)
+          rj_obj_set(by, mpj_reason_name(i), rj_numf("%llu", (unsigned long long)st.by_reason[i]));
+      rj_obj_set(o, "by_reason", by); }
+    { rj_val* a = rj_arr(); mpj_ctx cx = { a, want };
+      if (want > 0) mpj_recent(want, mpj_push, &cx);
+      rj_obj_set(o, "recent", a); }
+    *res = o;
+    return 1;
+}
 static int cmd_bmcgetdownloadinfo(rj_val** res){
     rj_val* o = rj_obj();
     const node_status_t* s = g_status;
@@ -2939,6 +3057,7 @@ static const char* const NODE_METHODS[] = {
     "testmempoolaccept", "submitpackage", "savemempool", "importmempool",
     "getprivatebroadcastinfo", "abortprivatebroadcast",
     "bmcgetdownloadinfo",   /* 2026-09-10: this node's own, no Core counterpart */
+    "bmcgetmempooljournal", /* 2026-09-16: the mempool departure journal */
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "getrawaddrman", "getorphantxs", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "addpeeraddress", "disconnectnode",
     "setban", "setnetworkactive", "ping", "getzmqnotifications",
@@ -3176,6 +3295,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "importmempool")) return cmd_importmempool(params, res, ec, em);
     if (!strcmp(m, "getprivatebroadcastinfo")) return cmd_getprivatebroadcastinfo(res, ec, em);
     if (!strcmp(m, "bmcgetdownloadinfo"))  return cmd_bmcgetdownloadinfo(res);
+    if (!strcmp(m, "bmcgetmempooljournal")) return cmd_bmcgetmempooljournal(params, res, ec, em);
     if (!strcmp(m, "abortprivatebroadcast"))   return cmd_abortprivatebroadcast(params, res, ec, em);
     if (!strcmp(m, "getmempoolcluster")) return cmd_getmempoolcluster(params, res, ec, em);
     if (!strcmp(m, "getblockfrompeer"))

@@ -66,6 +66,7 @@ node_config_t g_cfg = {
     .maxrecvbuffer_kb      = 5000,   /* Core -maxreceivebuffer default       */
     .maxmempool_mb         = 300,    /* Core -maxmempool default (MB)        */
     .mempoolexpiry_h       = 336,    /* Core -mempoolexpiry default (2 weeks)*/
+    .mempooljournal        = 0,      /* EXTENSION: off unless asked for       */
     .maxuploadtarget_mb    = 0,      /* Core -maxuploadtarget default: none  */
     .minrelaytxfee_satkvb  = 100,    /* Core -minrelaytxfee 0.000001 BTC/kvB (v30: 0.1 sat/vB) */
     .incrementalrelayfee_satkvb = 100, /* Core -incrementalrelayfee default (v30)             */
@@ -245,6 +246,7 @@ int nodecfg_is_network_specific(const char* key){
 int nodecfg_known_key(const char* key){
     static const char* known[] = {
         "maxconnections","dbcache","maxmempool","mempoolexpiry","minrelaytxfee",
+        "bmc.mempooljournal",
         "incrementalrelayfee","dustrelayfee","blockmintxfee","datacarrier",
         "datacarriersize","permitbaremultisig","acceptnonstdtxn","blocksonly",
         "whitelistrelay","whitelistforcerelay","listen","discover","dnsseed",
@@ -361,6 +363,7 @@ static void set_defaults(void){
     g_cfg.maxrecvbuffer_kb      = 5000;
     g_cfg.maxmempool_mb         = 300;
     g_cfg.mempoolexpiry_h       = 336;
+    g_cfg.mempooljournal        = 0;
     g_cfg.maxuploadtarget_mb    = 0;
     g_cfg.minrelaytxfee_satkvb  = 100;
     g_cfg.incrementalrelayfee_satkvb = 100;
@@ -761,6 +764,13 @@ long node_config_load(const char* path){
             t=clamp_int(iv,1,65536,key,&bad); if(t>=0){ g_cfg.maxmempool_mb=t; g_cfg.maxmempool_explicit=1; applied++; } }
         else if(!strcmp(key,"mempoolexpiry")){ /* Core: hours */
             t=clamp_int(iv,0,8760,key,&bad);  if(t>=0){ g_cfg.mempoolexpiry_h=t; applied++; } }
+        else if(!strcmp(key,"bmc.mempooljournal")){
+            /* EXTENSION (2026-09-16): records in the mempool departure ring.
+             * Core has nothing like it: when a transaction is evicted or
+             * expires, Core forgets it, so "what happened to my broadcast"
+             * has no answer. Bounded on purpose -- one record is 152 bytes,
+             * so 1,000,000 is ~152 MB. 0 = off. */
+            t=clamp_int(iv,0,8000000,key,&bad); if(t>=0){ g_cfg.mempooljournal=t; applied++; } }
         /* mempool policy limits (Core limit-count/size, relay fees, mempoolfullrbf).
          * The two fees are BTC/kvB in Core's config; keep them in sat/kvB
          * (round(BTC/kvB * 1e8)). Integer sat/vB could not represent Core's

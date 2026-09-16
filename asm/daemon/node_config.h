@@ -149,6 +149,10 @@ typedef struct {
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
     long mempoolexpiry_h;        /* Core -mempoolexpiry (hours, 0 = never)   */
+    long mempooljournal;         /* EXTENSION bmc.mempooljournal: records kept
+                                    in the mempool DEPARTURE ring, 0 = off.
+                                    Core has no counterpart -- it forgets a
+                                    transaction the moment it leaves the pool. */
     long maxuploadtarget_mb;     /* Core -maxuploadtarget (MB, 0 = no limit) */
     /* mempool policy limits (Core exposes each of these). Fees are stored in
      * sat/vByte (Core's config is BTC/kvB; parsed at the boundary). */

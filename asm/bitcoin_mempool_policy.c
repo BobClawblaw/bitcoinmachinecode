@@ -472,6 +472,29 @@ unsigned long long mpool_policy_bytespersigop(void){ return mpol_bytes_per_sigop
 static void (*g_forget_cb)(const unsigned char txid[32]) = 0;
 void mpool_policy_set_forget_cb(void (*fn)(const unsigned char*)){ g_forget_cb = fn; }
 
+/* ---- the departure journal's hook (2026-09-16) ----------------------------
+ * g_forget_cb is told WHICH transaction left but not WHY, and the fee
+ * estimator (its only consumer until now) does not care. The mempool journal
+ * does: "evicted because the pool was full" and "mined" are the opposite
+ * answers to the question it exists to serve. Rather than widen the existing
+ * callback and its consumer, a second one carries the data every removal site
+ * already holds -- vsize and fee live in the node being torn down -- plus a
+ * reason the ENTRY POINTS set, because only they know it.
+ *
+ * The reason is per-process state, not a parameter threaded through a dozen
+ * internal helpers: the removal paths converge on remove_node and
+ * mpol_remove_marked from several directions and passing it down every one of
+ * them would touch far more code than it is worth. It is set on entry and
+ * restored on exit, so a nested removal (a package taking its descendants
+ * with it) cannot leave the wrong reason behind for the next caller. */
+static void (*g_depart_cb)(const unsigned char* txid, unsigned long long vsize,
+                           unsigned long long fee, int reason) = 0;
+void mpool_policy_set_depart_cb(void (*fn)(const unsigned char*, unsigned long long,
+                                           unsigned long long, int)){ g_depart_cb = fn; }
+static int g_depart_reason = 0;                 /* MPJ_* ; 0 = do not record */
+void mpool_policy_set_depart_reason(int r){ g_depart_reason = r; }
+int  mpool_policy_depart_reason(void){ return g_depart_reason; }
+
 /* ========================================================================== */
 /* public API                                                                 */
 /* ========================================================================== */
@@ -1107,6 +1130,8 @@ static void remove_node(void* st, void* mp, int ci){
     mpol_node* t = mpol_nodes_base(st);
     uint32_t* nptr = (uint32_t*)((char*)st+16);
     unsigned char ct[32]; memcpy(ct, t[ci].txid, 32);
+    if (g_depart_cb && g_depart_reason)
+        g_depart_cb(ct, (unsigned long long)t[ci].size, (unsigned long long)t[ci].fee, g_depart_reason);
     decr_ancestors(st, ci, (uint32_t)t[ci].size, t[ci].fee);
     mpool_del(mp, ct);
     { uint64_t* pb = (uint64_t*)((char*)st+64);
@@ -1252,6 +1277,15 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
         if (!mark[i]) continue;
         nremoved++;
         unsigned char ct[32]; memcpy(ct, t[i].txid, 32);
+        if (g_depart_cb && g_depart_reason){
+            /* mark 1 = the block confirmed it, mark 2 = the block CONFLICTS
+             * with it (mark_conflict above). Both leave through this loop, and
+             * calling the second one "mined" would be the opposite of the
+             * truth -- it is the case where a transaction the user broadcast
+             * is gone for good. */
+            int why = (g_depart_reason == 1 && mark[i] == 2) ? 5 /* MPJ_CONFLICTED */ : g_depart_reason;
+            g_depart_cb(ct, (unsigned long long)t[i].size, (unsigned long long)t[i].fee, why);
+        }
         decr_ancestors(st, (int)i, (uint32_t)t[i].size, t[i].fee);
         mpool_del(mp, ct);
         { uint64_t* pb = (uint64_t*)((char*)st+64);
@@ -2493,6 +2527,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     }
 
     /* 1a. RBF eviction (packages: conflicts + descendants, snapshotted) */
+    { int prev_r = g_depart_reason; g_depart_reason = 2 /* MPJ_REPLACED */;
     for (int e=0;e<n_evict;e++){
         int ci = find_node(st, evict_set[e]);
         if (ci >= 0) remove_node(st, mp, ci);
@@ -2501,6 +2536,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         if (_mpol_replaced_n < (int)(sizeof _mpol_replaced / 32))
             memcpy(_mpol_replaced[_mpol_replaced_n++], evict_set[e], 32);
     }
+    g_depart_reason = prev_r; }
     /* the eviction may have invalidated the ancestor INDEX list; parents are
      * re-found below by txid via prev[] when linking, so recompute par_idx. */
     if (n_evict){
@@ -2589,7 +2625,9 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
           unsigned char wt[CHUNK_MAX_CLUSTER][32]; int wn = wc.n;
           for (int q = 0; q < wn; q++) memcpy(wt[q], mpol_nodes_base(st)[wc.idx[q]].txid, 32);
           floor_bump(st, wf * 1000 / ws + pol->incremental_fee);
-          for (int q = 0; q < wn; q++) mpool_policy_remove_package(st, mp, wt[q]);   /* descendants live in the chunk too; a gone txid is a no-op */
+          { int prev_r = g_depart_reason; g_depart_reason = 3 /* MPJ_EVICTED */;
+            for (int q = 0; q < wn; q++) mpool_policy_remove_package(st, mp, wt[q]);   /* descendants live in the chunk too; a gone txid is a no-op */
+            g_depart_reason = prev_r; }
           /* MEM-5 (audit 2026-09-03): the chunk just evicted must not have
            * contained one of THIS transaction's parents -- and the check has
            * to happen BEFORE mpool_put, or the transaction ends up stored in
@@ -2791,11 +2829,16 @@ long mpool_policy_block_connect(void* st, void* mp,
                                 const unsigned char* block, unsigned long blen){
     if (!tx_parse || !tx_txid) return -1;
     if (!st || *(uint32_t*)st != MPOL_MAGIC || blen < 81) return -1;
+    /* Everything this call removes left because it was MINED. A transaction
+     * the block CONFLICTS with (it spends an output the block spent elsewhere)
+     * also leaves here; that is recorded as mined too, which would be wrong --
+     * so the conflict path below re-marks it. See MPJ_CONFLICTED. */
+    int prev_reason = g_depart_reason; g_depart_reason = 1 /* MPJ_MINED */;
     const unsigned char* p = block + 80;
     const unsigned char* end = block + blen;
     int ok;
     uint64_t ntx = rd_varint(&p, end, &ok);
-    if (!ok) return -1;
+    if (!ok){ g_depart_reason = prev_reason; return -1; }
     long removed = 0;
     static unsigned char scratch[1<<20];
 
@@ -2876,6 +2919,7 @@ long mpool_policy_block_connect(void* st, void* mp,
     { extern void serve_rejects_clear(void) __attribute__((weak));
       if (serve_rejects_clear) serve_rejects_clear(); }
     note_block_connected(st);
+    g_depart_reason = prev_reason;
     return removed;
 }
 
@@ -2884,7 +2928,10 @@ long mpool_policy_block_connect(void* st, void* mp,
 /* ========================================================================== */
 /* The caller (daemon/mempool_cfg.c) knows arrival times; it hands txids in. */
 long mpool_policy_expire_one(void* st, void* mp, const unsigned char txid[32]){
-    return mpool_policy_remove_package(st, mp, txid);
+    int prev = g_depart_reason; g_depart_reason = 4 /* MPJ_EXPIRED */;
+    long r = mpool_policy_remove_package(st, mp, txid);
+    g_depart_reason = prev;
+    return r;
 }
 
 /* ---- RPC read helpers ----------------------------------------------------- */
