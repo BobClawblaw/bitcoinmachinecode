@@ -2809,6 +2809,34 @@ extern void txit_runs_advanced(long to);   /* daemon/tx_index_tail.c: drop what 
 extern void tsp_runs_advanced(long to);    /* daemon/txosp_tail.c */
 static void on_txi_run(long to, void* ctx){ (void)ctx; txit_runs_advanced(to); irs_dirty(&g_rs_txi); }
 static void on_tsp_run(long to, void* ctx){ (void)ctx; tsp_runs_advanced(to); irs_dirty(&g_rs_tsp); }
+/* One tick of every trailing index builder, at most once a second.
+ *
+ * 2026-09-16, found on run 26: this used to live ONLY in the caught-up loop's
+ * heartbeat, which initial block download never reaches -- the node runs the
+ * parallel catch-up loop instead -- so during the one phase these builders
+ * exist for, nothing ever ticked and no run was ever built. The block choke
+ * point below runs in every phase (it is where the filter index, the txid
+ * tail and the address journal are fed), so the tick belongs there, with the
+ * heartbeat calling the same function once the node is at the tip. */
+static void dl_index_trail_tick(long applied){
+    static long long last;
+    long long now = (long long)time(NULL);
+    if (now == last) return;
+    last = now;
+    if (g_cfg.txindex){ irs_refresh(&g_rs_txi); it_tick(&g_it_txi, irs_covered_to(&g_rs_txi), g_rs_txi.n, applied, now, on_txi_run, 0); }
+    if (g_cfg.txospenderindex){ irs_refresh(&g_rs_tsp); it_tick(&g_it_tsp, irs_covered_to(&g_rs_tsp), g_rs_tsp.n, applied, now, on_tsp_run, 0); }
+    if (g_cfg.addrindex && ah_to_height && ah_run_count) it_tick(&g_it_ah, ah_to_height(), ah_run_count(), applied, now, on_ah_run, 0);
+    /* a supervisor idle for a reason is otherwise silent, and silence reads
+     * exactly like "working" in a log */
+    { static long long next_log;
+      if (now >= next_log){
+          next_log = now + 300;
+          fprintf(stderr, "[trail] txindex: %s | txospender: %s | addr_hist: %s\n",
+                  g_it_txi.configured ? it_status(&g_it_txi) : "not configured",
+                  g_it_tsp.configured ? it_status(&g_it_tsp) : "not configured",
+                  g_it_ah.configured  ? it_status(&g_it_ah)  : "not configured");
+      } }
+}
 /* row 5's measurement, one line per block that went through the compact
  * receiver: what the mempool supplied and where the rest had gone */
 extern void cmpct_recv_last_block(unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long cls[5]);
@@ -7055,6 +7083,7 @@ static void dl_new_block_choke(void){
                  * (idempotent by height -- a replayed height is a
                  * no-op) */
                 txit_on_block(store_buf, zh, zb, bl);
+                dl_index_trail_tick(g_utxo_live_on ? utxo_live_applied_height() : -1);
                 tsp_on_block(store_buf, zh, zb, bl);
                 /* filter index tail: adopt/append (cheap probe when
                  * the backfill has not closed in yet) */
@@ -8763,24 +8792,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 long target = utxo_live_ok ? utxo_live_applied_height() : (long)*(int*)(store_buf+24);
                 csi_hist_repair_tick(target, dl_tip_is_ibd(), (long long)time(NULL));
             }
-            /* 2026-09-10 (row 2): the block filter index and the address history
-             * repair themselves. The filter index needs a build when it is
-             * absent or more than the adopt gap behind the tip (the live tail
-             * adopts and closes the rest from undo once it is within 144); the
-             * address history when its base is absent. */
-            { long long nows = (long long)time(NULL);
-              /* 2026-09-16: the block filter index builds itself at the choke
-               * point from genesis (bfilter_index.c); no repair supervisor. */
-              if(g_cfg.addrindex && ah_to_height && ah_run_count){
-                  long applied = utxo_live_ok ? utxo_live_applied_height() : -1;
-                  it_tick(&g_it_ah, ah_to_height(), ah_run_count(), applied, nows, on_ah_run, 0);
-              } 
-              /* the trailing index builders tick here too, IBD or not */
-              if(g_cfg.txindex || g_cfg.txospenderindex){
-                  long applied = utxo_live_ok ? utxo_live_applied_height() : -1;
-                  if(g_cfg.txindex){ irs_refresh(&g_rs_txi); it_tick(&g_it_txi, irs_covered_to(&g_rs_txi), g_rs_txi.n, applied, nows, on_txi_run, 0); }
-                  if(g_cfg.txospenderindex){ irs_refresh(&g_rs_tsp); it_tick(&g_it_tsp, irs_covered_to(&g_rs_tsp), g_rs_tsp.n, applied, nows, on_tsp_run, 0); }
-              } }
+            /* 2026-09-16: the block filter index builds itself at the block
+             * choke point from genesis (bfilter_index.c) and the trailing
+             * index builders tick there too, so this heartbeat only has to
+             * cover the caught-up phase, where the choke point is quiet. */
+            dl_index_trail_tick(utxo_live_ok ? utxo_live_applied_height() : -1);
             /* Relay-pool health. Silent when nothing has been parked, so a
              * node with no orphan traffic prints nothing extra. */
             { extern long txrelay_stats(long*,long*,long*,long*,long*,long*);
