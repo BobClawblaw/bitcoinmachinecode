@@ -199,6 +199,18 @@ int main(void){
       long after = 0; mpj_recent(1000, count_cb, &after);
       ck("a record with no reason, or an unknown one, is not written", after == before); }
 
+    /* ---- the feerate unit -------------------------------------------------
+     * The RPC reports sat/kvB. It first shipped as integer sat/vB, and the
+     * first live block showed 188 of 200 rows reading "feerate": 0 -- most
+     * real transactions are under 1 sat/vB once the fee is divided by vsize.
+     * A field that is zero for 94% of rows is worse than no field. Pinned here
+     * as arithmetic so the unit cannot quietly go back.
+     *
+     * 25 sat over 140 vB: 0 in sat/vB, 178 in sat/kvB. */
+    { unsigned long long fee = 25, vsize = 140;
+      ck("sat/vB would truncate this to zero", fee / vsize == 0);
+      ck("sat/kvB keeps it", (fee * 1000ULL) / vsize == 178); }
+
     /* ---- the WIRING: a departure reason really reaches the journal --------
      * The store above is only half the feature. What actually has to hold is
      * that the policy layer calls the departure hook with the right reason,
