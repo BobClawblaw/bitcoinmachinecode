@@ -639,6 +639,53 @@ static long esp_hist_find(const rpc_wallet* w, esp_hist* h, const unsigned char 
     return -1;
 }
 
+
+/* ---- /fee-estimates (2026-09-16) ------------------------------------------
+ * Esplora's flat map of confirmation target -> feerate in sat/vB:
+ *
+ *   {"1": 12.5, "2": 10.1, ..., "144": 2.0, "504": 1.5, "1008": 1.0}
+ *
+ * mempool.space's esplora client calls this; it was the last route in its
+ * client that this facade answered 404 for. The numbers come from the node's
+ * own estimatesmartfee -- the same estimator the JSON-RPC serves, so the two
+ * cannot drift -- reshaped from Core's BTC/kvB decimal string into Esplora's
+ * sat/vB number. BTC/kvB -> sat/vB is x100000000 / 1000, i.e. x100000.
+ *
+ * Targets are Esplora's own set: every block to 25, then 144, 504 and 1008.
+ * A target the estimator cannot answer is OMITTED rather than sent as zero: a
+ * zero feerate is a statement that a transaction pays nothing, and a caller
+ * that fell back to it would build an unrelayable transaction. Esplora omits
+ * for the same reason.
+ *
+ * The estimator is asked once per target. That is 28 dispatches, which is why
+ * the answers are built in one pass here rather than per request from the
+ * frontend: mempool.space polls this route on a timer. */
+static const int ESP_FEE_TARGETS[] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,
+                                       21,22,23,24,25,144,504,1008 };
+static void esplora_fee_estimates(resp_t* r, const rpc_wallet* w){
+    rj_val* o = rj_obj();
+    long ec = 0; const char* em = 0;
+    for (unsigned i = 0; i < sizeof ESP_FEE_TARGETS / sizeof ESP_FEE_TARGETS[0]; i++){
+        int t = ESP_FEE_TARGETS[i];
+        rj_val* p = rj_arr(); rj_arr_push(p, rj_numf("%d", t));
+        rj_val* res = call(w, "estimatesmartfee", p, &ec, &em);
+        if (!res){ continue; }
+        const char* fr = S(res, "feerate");            /* BTC/kvB, decimal string */
+        if (fr){
+            /* string arithmetic, never a double: esplora_sats_of_amount gives
+             * satoshis per kvB, and sat/vB is that over 1000 */
+            long satkvb = esplora_sats_of_amount(fr);
+            if (satkvb > 0){
+                char key[8]; snprintf(key, sizeof key, "%d", t);
+                /* one decimal place, which is what Esplora emits */
+                rj_obj_set(o, key, rj_numf("%ld.%ld", satkvb / 1000, (satkvb % 1000) / 100));
+            }
+        }
+        rj_free(res);
+    }
+    reply_json(r, o);
+}
+
 /* ---- the mempool departure journal, over REST (2026-09-16) ----------------
  * Esplora (and therefore mempool.space) has no route for this because Core
  * has no data for it: once a transaction is evicted or expires, a Core-backed
@@ -952,6 +999,7 @@ int esplora_handle(const char* method, size_t mlen, const char* path, size_t ple
         }
         reply_text(&r, 404, "unknown internal route"); return 1;
     }
+    if (get && ns == 1 && IS(0, "fee-estimates")){ esplora_fee_estimates(&r, w); return 1; }
     if (ns >= 2 && IS(0, "address")){ esplora_address(&r, w, seg, ns, get); return 1; }
     if (ns >= 2 && IS(0, "scripthash")){ reply_text(&r, 501, "scripthash lookups are not served: the address index is keyed by address, not script hash"); return 1; }
     reply_text(&r, 404, "unknown route"); return 1;

@@ -2180,6 +2180,11 @@ typedef struct {
     int aborted;            /* shutdown requested, or the worker stopped answering */
     int consec_timeouts;    /* entries in a row that drew no ack at all */
     long restored_times;    /* accepts whose persisted arrival time was applied */
+    /* WHY entries were refused. The load already orders parents before children
+     * (mpd_order_parents_first), so "it arrived before its parent" is not the
+     * explanation any more and the old log line saying so was misleading. These
+     * count what the worker actually said. */
+    long rej_missing, rej_conflict, rej_known, rej_policy, rej_other, rej_noack;
     const char* abort_why;
 } mpd_import_ctx;
 /* The parent's shutdown flag (main.c installs it): a reload that waits 90 s
@@ -2293,6 +2298,15 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
     if (acked) c->consec_timeouts = 0;
     else if (!c->aborted && ++c->consec_timeouts >= 2){ c->aborted = 1; c->abort_why = "the worker is not answering"; }
     int missing = !ok && strstr((const char*)st->tx_submit_reason, "missing") != NULL;
+    if (!ok){
+        const char* why = (const char*)st->tx_submit_reason;
+        if (!acked)                                   c->rej_noack++;
+        else if (missing)                             c->rej_missing++;
+        else if (strstr(why, "conflict"))             c->rej_conflict++;
+        else if (strstr(why, "already"))              c->rej_known++;
+        else if (why[0])                              c->rej_policy++;
+        else                                          c->rej_other++;
+    }
     pthread_mutex_unlock(&g_submit_lock);
     if (ok) c->accepted++;
     else if (missing && c->collecting){
@@ -2361,9 +2375,21 @@ long rpc_node_mempool_load(const char* path){
     free(col.v); free(order);
     long deferred = c.nretry;
     long gained = mpd_retry_passes(&c);
-    fprintf(stderr, "[mempool] loaded %s: %ld accepted, %ld rejected of %ld (%ld waited for a parent, %ld of them then accepted); "
+    /* The old line read "%ld waited for a parent, %ld of them then accepted",
+     * which said the refusals were an ORDERING problem. They are not: this
+     * function topologically sorts parents before children before submitting
+     * anything, so a child's in-dump parent has always been offered first, and
+     * the retry passes have recovered ZERO entries on every real load since
+     * that sort landed (1,622 deferred on 2026-09-16 03:08 and 3,630 at 06:09,
+     * both zero). The refusals are inputs that genuinely are not there. Saying
+     * which is the difference between a number and a diagnosis. */
+    fprintf(stderr, "[mempool] loaded %s: %ld accepted, %ld refused of %ld; "
+                    "refusals: %ld missing-inputs, %ld conflicting, %ld already known, "
+                    "%ld policy, %ld no-ack, %ld other (%ld re-offered, %ld then accepted); "
                     "%ld arrival time(s) restored\n",
-            path ? path : "mempool.dat", c.accepted, c.rejected, r, deferred, gained, c.restored_times);
+            path ? path : "mempool.dat", c.accepted, c.rejected, r,
+            c.rej_missing, c.rej_conflict, c.rej_known, c.rej_policy, c.rej_noack, c.rej_other,
+            deferred, gained, c.restored_times);
     return c.accepted;
 }
 
