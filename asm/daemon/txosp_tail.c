@@ -51,19 +51,54 @@ static long tspt_scan_max(int fd){
     }
     free(buf); return maxh;
 }
-long tspt_base_to(void){
-    int fd = open(TSP_BASE_FILE, O_RDONLY); if (fd < 0) return -1;
-    uint8_t b[TSP_HDR]; struct stat sb; long to = -1;
-    if (fstat(fd, &sb) == 0 && sb.st_size >= TSP_HDR && pread(fd, b, TSP_HDR, 0) == TSP_HDR && memcmp(b, TSP_MAGIC, 8) == 0){
-        uint64_t n = 0, so = 0;
-        for (int i = 0; i < 8; i++) n  |= (uint64_t)b[8+i]  << (8*i);
-        for (int i = 0; i < 8; i++) so |= (uint64_t)b[16+i] << (8*i);
-        if (TSP_HDR + n * TSP_REC == so && so <= (uint64_t)sb.st_size){ uint32_t t = 0; for (int i = 0; i < 4; i++) t |= (uint32_t)b[36+i] << (8*i); to = (long)t; }
-    }
-    close(fd); return to;
+/* ---- run-set awareness (2026-09-16, index_runs.h): see tx_index_tail.c ---- */
+#include "index_runs.h"
+static long tsp_runs_to(void){
+    static irunset_t s; static int init;
+    if (!init){ irs_init(&s, "txospender", TSP_MAGIC, TSP_REC, TSP_SPARSE); init = 1; }
+    irs_dirty(&s);
+    long to = irs_covered_to(&s);
+    irs_close_all(&s);
+    return to;
 }
+/* a run reaching `to` was committed: drop the tail's records at or below it */
+void tsp_runs_advanced(long to){
+    if (g_fd < 0) return;
+    struct stat sb; if (fstat(g_fd, &sb) != 0) return;
+    long nrec = (long)(sb.st_size / TSP_REC);
+    if (nrec == 0) return;
+    enum { CHUNK = 4096 };
+    uint8_t* buf = malloc((size_t)CHUNK * TSP_REC); if (!buf) return;
+    long keep_from = nrec;
+    for (long i = 0; i < nrec && keep_from == nrec; i += CHUNK){
+        long n = nrec - i < CHUNK ? nrec - i : CHUNK;
+        if (pread(g_fd, buf, (size_t)n * TSP_REC, (off_t)i * TSP_REC) != n * TSP_REC) break;
+        for (long k = 0; k < n; k++){
+            const uint8_t* r = buf + k * TSP_REC; uint32_t hh = 0;
+            for (int b = 0; b < 4; b++) hh |= (uint32_t)r[16+b] << (8*b);
+            if ((long)hh > to){ keep_from = i + k; break; }
+        }
+    }
+    if (keep_from == 0){ free(buf); return; }
+    const char* tmp = TSP_TAIL_FILE ".rot";
+    int nfd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (nfd < 0){ free(buf); return; }
+    long ok = 1;
+    for (long i = keep_from; i < nrec && ok; i += CHUNK){
+        long n = nrec - i < CHUNK ? nrec - i : CHUNK;
+        if (pread(g_fd, buf, (size_t)n * TSP_REC, (off_t)i * TSP_REC) != n * TSP_REC){ ok = 0; break; }
+        if (write(nfd, buf, (size_t)n * TSP_REC) != n * TSP_REC) ok = 0;
+    }
+    free(buf);
+    if (!ok || fsync(nfd) != 0 || close(nfd) != 0 || rename(tmp, TSP_TAIL_FILE) != 0){ unlink(tmp); return; }
+    int fd = open(TSP_TAIL_FILE, O_RDWR | O_APPEND);
+    if (fd < 0) return;
+    close(g_fd); g_fd = fd;
+    fprintf(stderr, "[txospender] tail rotated: %ld records folded into runs (to %ld), %ld kept\n", keep_from, to, nrec - keep_from);
+}
+long tspt_base_to(void){ return tsp_runs_to(); }
 static long tspt_backfill(void* store_buf, long tip){
-    if (g_fd < 0 || g_covered < 0) return 0;
+    if (g_fd < 0) return 0;                /* covered == -1 means "from genesis" now (2026-09-16), not disabled */
     long done = 0; static uint8_t* blockbuf;
     if (!blockbuf && !(blockbuf = malloc(TSPT_BLOCKBUF))) return -1;
     while (g_covered < tip){
@@ -76,7 +111,7 @@ static long tspt_backfill(void* store_buf, long tip){
 }
 void tsp_boot(void* store_buf){
     long base_to = tspt_base_to();
-    if (base_to < 0){ fprintf(stderr, "[txospender] no base %s -- index disabled (build one with daemon/bmc_build_txospender_index)\n", TSP_BASE_FILE); return; }
+    if (base_to < 0) fprintf(stderr, "[txospender] no run yet -- the tail starts at genesis; the trailing builder folds it into runs\n");
     int fd = open(TSP_TAIL_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
     if (fd < 0){ fprintf(stderr, "[txospender] cannot open %s -- tail disabled\n", TSP_TAIL_FILE); return; }
     long tail_max = tspt_scan_max(fd);

@@ -22,6 +22,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 #include "test_tmpdir.h"
 #include "../daemon/addr_index_fmt.h"
 #include "../daemon/addr_hist_fmt.h"
@@ -171,6 +173,36 @@ int main(void){
     nt = axt_read_address(AXF_P2WPKH, keyB, &bal, &rcv, &nu, txids, 64);
     ck("B: balance=140 (50 cb + 90 received) utxos=2", bal == 140 && rcv == 140 && nu == 2 && nt == 2);
     ck("probe agrees with writer", axt_probe_covered() == 2);
+
+    /* 2026-09-16: a history RUN reaching h1 was committed by the trailing
+     * builder: the journal drops its records at or below h1 (a prefix -- it is
+     * height-ordered) and keeps h2's. Coverage is unchanged; the h1 facts now
+     * live in the run, which the RPC layer reads (rpc_chain.c axr_read). */
+    { extern void axt_runs_advanced(long to);
+      struct stat sb; stat(AXF_TAIL_FILE, &sb); long before = (long)(sb.st_size / AXF_TAIL_REC);
+      /* snapshot the journal: the sections below read h1's facts from it, and
+       * in this test nothing stands in for the run that would hold them */
+      static u8 snap[64 * AXF_TAIL_REC]; long snap_n = before;
+      { int fd = open(AXF_TAIL_FILE, O_RDONLY); if (fd >= 0){ if (read(fd, snap, (size_t)snap_n * AXF_TAIL_REC) != (ssize_t)(snap_n * AXF_TAIL_REC)) snap_n = 0; close(fd); } }
+      axt_runs_advanced(1);
+      stat(AXF_TAIL_FILE, &sb); long after = (long)(sb.st_size / AXF_TAIL_REC);
+      ck("rotation after a run to h1: fewer records, none at or below h1", after < before && after > 0);
+      { int fd = open(AXF_TAIL_FILE, O_RDONLY); u8 r[AXF_TAIL_REC]; int ok = fd >= 0 && read(fd, r, AXF_TAIL_REC) == AXF_TAIL_REC;
+        u32 hh = 0; for (int b = 0; b < 4; b++) hh |= (u32)r[78+b] << (8*b);
+        ck("...the first kept record is at h2", ok && hh == 2); if (fd >= 0) close(fd); }
+      ck("...coverage unchanged (2)", axt_covered() == 2 && axt_probe_covered() == 2);
+      nt = axt_read_address(AXF_P2WPKH, keyB, &bal, &rcv, &nu, txids, 64);
+      ck("B from the journal alone after rotation: only h2's two outputs (140)", bal == 140 && nu == 2 && nt == 2);
+      axt_runs_advanced(0);
+      stat(AXF_TAIL_FILE, &sb);
+      ck("a run below everything kept: no change", (long)(sb.st_size / AXF_TAIL_REC) == after);
+      /* put the journal back (same inode the writer holds open) */
+      { int fd = open(AXF_TAIL_FILE, O_WRONLY | O_TRUNC); if (fd >= 0){ ssize_t w = write(fd, snap, (size_t)snap_n * AXF_TAIL_REC); (void)w; close(fd); } }
+      stat(AXF_TAIL_FILE, &sb);
+      ck("journal restored for the sections below", (long)(sb.st_size / AXF_TAIL_REC) == before);
+      /* (the live append after a rotation is covered by test_txindex_tail; appending
+       * h3 here would change the store the sections below were written against) */
+    }
 
     printf("\n== 3: torn tail truncates onto the grid ==\n");
     { FILE* f = fopen(AXF_TAIL_FILE, "ab");

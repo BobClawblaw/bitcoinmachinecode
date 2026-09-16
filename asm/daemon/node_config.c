@@ -93,6 +93,9 @@ node_config_t g_cfg = {
     .listenonion           = 1,      /* Core -listenonion default: on        */
     .bantime               = 86400,  /* Core -bantime default: 24h           */
     .blockfilterindex      = 0,      /* Core default (2026-09-06): both indexes */
+    .txindex               = 0,
+    .txospenderindex       = 0,
+    .indexrunblocks        = 20000,
     .coinstatsindex        = 0,      /* are OPT-IN, as they are in Core         */
     .rpccookie             = 1,      /* Core's default auth method            */
     .permitbaremultisig    = 1,      /* Core DEFAULT_PERMIT_BAREMULTISIG      */
@@ -188,7 +191,6 @@ static const struct { const char* key; const char* why; } k_noeffect[] = {
     {"deprecatedrpc",      "no deprecated-RPC toggles"},
     {"rpcdoccheck",        "debug-only"},
     {"test",               "debug-only"},
-    {"txospenderindex",    "the index is on whenever txospender.dat exists (build it with daemon/bmc_build_txospender_index); the key itself changes nothing"},
     {"fastprune",          "debug-only pruning knob; this node prunes by its own MiB budget"},
     {"testnet",            "testnet3 is refused by design; use testnet4=1"},
     {"version",            "command-line only"},
@@ -246,7 +248,7 @@ int nodecfg_is_network_specific(const char* key){
 int nodecfg_known_key(const char* key){
     static const char* known[] = {
         "maxconnections","dbcache","maxmempool","mempoolexpiry","minrelaytxfee",
-        "bmc.mempooljournal",
+        "bmc.mempooljournal","bmc.indexrunblocks","txospenderindex",
         "incrementalrelayfee","dustrelayfee","blockmintxfee","datacarrier",
         "datacarriersize","permitbaremultisig","acceptnonstdtxn","blocksonly",
         "whitelistrelay","whitelistforcerelay","listen","discover","dnsseed",
@@ -302,6 +304,9 @@ static void set_defaults(void){
     g_cfg.stopafterblockimport = 0; g_cfg.mocktime = 0; g_cfg.n_includeconf = 0;
     g_cfg.bantime               = 86400;
     g_cfg.blockfilterindex      = 0;
+    g_cfg.txindex               = 0;
+    g_cfg.txospenderindex       = 0;
+    g_cfg.indexrunblocks        = 20000;
     g_cfg.coinstatsindex        = 0;
     g_cfg.rpccookie             = 1;
     g_cfg.permitbaremultisig    = 1;
@@ -954,16 +959,18 @@ long node_config_load(const char* path){
          * changes nothing must say so on every boot, not be quietly ignored
          * alongside genuinely foreign keys like rpcuser. */
         else if(!strcmp(key,"txindex")){
-            /* The index EXISTS as of 2026-08-26, but it is built OFFLINE by
-             * daemon/bmc_build_tx_index -- this daemon does not maintain it. So
-             * the flag still changes nothing, and still says so: what it
-             * would mean in Core (the node builds and keeps it current) is
-             * not what happens here. getrawtransaction picks the file up on
-             * its own when it is present, with or without this key. */
-            if(iv) fprintf(stderr,"[config] txindex=1 has no effect -- the txid index is built "
-                                  "OFFLINE (daemon/bmc_build_tx_index <datadir>) and is used "
-                                  "automatically when txindex.dat is present; this daemon "
-                                  "does not build or update it\n"); }
+            /* 2026-09-16: the daemon BUILDS this index now -- as sorted runs
+             * behind the applied height, during the sync and after it
+             * (daemon/index_trail.h) -- so the key means what it means in
+             * Core. The reader picks the files up with or without it. */
+            g_cfg.txindex = iv ? 1 : 0; applied++; }
+        else if(!strcmp(key,"txospenderindex")){
+            g_cfg.txospenderindex = iv ? 1 : 0; applied++; }
+        else if(!strcmp(key,"bmc.indexrunblocks")){
+            /* EXTENSION: heights per run for the trailing index builders. The
+             * unsorted tail a lookup scans linearly is never longer than
+             * this; a run costs one archive walk over its range. */
+            t=clamp_int(iv,1000,200000,key,&bad); if(t>=0){ g_cfg.indexrunblocks=t; applied++; } }
         else if(!strcmp(key,"assumevalid")){
             /* Core's -assumevalid: script evaluation is skipped for blocks
              * that are ancestors of this block; PoW, merkle, structure and

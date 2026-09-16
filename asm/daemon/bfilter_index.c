@@ -349,49 +349,46 @@ static int bfi_append_from_undo(long h, const u8* blk, unsigned long blen){
 
 /* called at the new-block choke point for every applied height, in order */
 void bfi_on_block(void* store_buf, long h, const u8* blk, unsigned long blen){
-    static int adopt_denied_logged;
     if (g_dfd < 0){
-        /* not adopted yet: probe cheaply; adopt only when the gap is
-         * closable from the undo window */
+        /* 2026-09-16: the daemon builds this index ITSELF, from genesis, during
+         * the sync. Undo data is kept for every block now (undo_store.h), so
+         * every prevout script a filter needs is one undo read away and the
+         * offline builder -- which existed because history had no undo -- is
+         * no longer part of the path. No files: create them and start at 0.
+         * Files behind the tip by any amount: adopt them and close the gap
+         * from the archive + undo, a bounded slice per call (below), so a
+         * large catch-up never stalls the choke point. The old rule waited
+         * for an offline backfill to come within the undo window; there is
+         * nothing to wait for any more. */
         long n = bfi_probe_count();
-        if (n < 0) return;                           /* no files: builder not run */
-        /* Judge the gap against the CHAIN TIP, not h. The daemon connects a
-         * catch-up burst by looping h from last_seen_tip+1, so early in a
-         * burst h is small while the tip is already far ahead -- h - n then
-         * goes NEGATIVE and this adopts at an arbitrarily large REAL gap.
-         * Not corrupting (the append below is guarded by g_n == h, and a gap
-         * close that outruns the undo window closes the index rather than
-         * storing a wrong filter) but it takes the index DOWN until
-         * build_block_filters is re-run -- the worst possible outcome for an
-         * unattended overnight backfill. The sibling tails read the tip the
-         * same way: addr_index_tail.c, tx_index_tail.c. Caught 2026-08-28 by
-         * validation/bfi_adopt_regtest_e2e.sh, whose builder happened to
-         * finish mid-burst and got "ADOPTED at 73 records (tip 1)". */
-        long tip = *(int*)((u8*)store_buf + 24);
-        if (tip < h) tip = h;                        /* h wins if the store header lags */
-        if (tip - n > BFI_ADOPT_GAP){
-            if (!adopt_denied_logged){
-                fprintf(stderr, "[bfilter] index at %ld, tip %ld -- waiting for the backfill to close in\n", n, tip);
-                adopt_denied_logged = 1;
-            }
-            return;
+        if (n < 0){
+            if (!bfi_create()){ static int said; if (!said++) fprintf(stderr, "[bfilter] cannot create the index files\n"); return; }
+            n = 0;
         }
         if (bfi_open(1) < 0) return;
-        fprintf(stderr, "[bfilter] ADOPTED at %ld records (tip %ld) -- closing the gap from undo data\n",
-                bfi_count(), tip);
+        long tip = *(int*)((u8*)store_buf + 24);
+        if (tip < h) tip = h;
+        fprintf(stderr, "[bfilter] index open at %ld records (tip %ld)%s\n", bfi_count(), tip,
+                tip - bfi_count() > BFI_ADOPT_GAP ? " -- closing the gap from the archive + undo, in slices" : "");
     }
-    /* close any gap below h from the archive + undo, then append h */
-    static u8* gapbuf;
-    while (g_n < h){
+    /* close any gap below h from the archive + undo, at most GAP_SLICE
+     * heights per call: the choke point is on the apply path and must stay
+     * short; the next call continues where this one stopped, and h itself
+     * is reached by the gap close when it is not appended below. */
+    enum { GAP_SLICE = 256 };
+    static u8* gapbuf; int slice = 0;
+    while (g_n < h && slice < GAP_SLICE){
         if (!gapbuf && !(gapbuf = malloc(8u << 20))) { bfi_close(); return; }
         long gl = store_read_at(store_buf, (unsigned long)g_n, gapbuf, 8u << 20);
         if (gl < 81 || !bfi_append_from_undo(g_n, gapbuf, (unsigned long)gl)){
-            fprintf(stderr, "[bfilter] gap close FAILED at %ld (undo pruned?) -- index closed; "
-                            "re-run build_block_filters\n", g_n);
+            fprintf(stderr, "[bfilter] gap close FAILED at %ld (undo pruned?) -- index closed\n", g_n);
             bfi_close();
             return;
         }
+        slice++;
+        if (g_n % 10000 == 0) fprintf(stderr, "[bfilter] catching up: %ld of %ld\n", g_n, h);
     }
+    if (g_n < h) return;                          /* more next call */
     if (g_n == h && !bfi_append_from_undo(h, blk, blen)){
         fprintf(stderr, "[bfilter] append failed at %ld -- index closed\n", h);
         bfi_close();

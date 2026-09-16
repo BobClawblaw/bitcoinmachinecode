@@ -527,6 +527,13 @@ list this node does not have. All three stay on the warning list.
   is a lying instrument; either skip list-valued keys in that pass or parse
   lazily. Not fixed in #237.
 
+- ~~**Four indexes wait for IBD to finish**~~ — **CLOSED 2026-09-16.** txindex,
+  txospenderindex, the address history and the block filters are all built by
+  the daemon during the sync, as sorted runs trailing the applied height
+  (`docs/devlog/INDEX_RUNS.md`); the coinstats index no longer invalidates at
+  the BIP30 overwrite. A fresh sync ends with every index current and the same
+  trailing builders keep it so.
+
 ## Update 2026-08-30 — Erlay: a deliberate stopping point
 
 BIP330 splits into negotiation (`sendtxrcncl`: version and salt exchange, and

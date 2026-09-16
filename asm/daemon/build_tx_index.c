@@ -96,10 +96,14 @@ static void emit(void* ctxv, const u8* tx, u32 off, u32 len){
 }
 
 int main(int argc, char** argv){
-    if (argc < 2){ fprintf(stderr, "usage: build_tx_index <datadir> [from] [to]\n"); return 2; }
+    if (argc < 2){ fprintf(stderr, "usage: build_tx_index <datadir> [from] [to] [out]\n"); return 2; }
     const char* dir = argv[1];
     long from_h = argc > 2 ? atol(argv[2]) : 0;
     long to_h   = argc > 3 ? atol(argv[3]) : -1;
+    /* 2026-09-16: a RUN of the index (index_runs.h) is this same file under
+     * another name; the daemon names it <name>.r<from>-<to>.dat */
+    const char* out_name = argc > 4 ? argv[4] : "txindex.dat";
+    char tmp_name[320]; snprintf(tmp_name, sizeof tmp_name, "%s.tmp", out_name);
     if (chdir(dir)){ perror("chdir"); return 1; }
 
     static u8 store_buf[4096];
@@ -152,8 +156,8 @@ int main(int argc, char** argv){
             (unsigned long long)c.n, (long long)(time(NULL) - t0));
 
     /* pass 2: sort each bucket, append, sample the sparse index */
-    FILE* out = fopen("txindex.dat.tmp", "wb");
-    if (!out){ fprintf(stderr, "cannot open txindex.dat.tmp\n"); return 1; }
+    FILE* out = fopen(tmp_name, "wb");
+    if (!out){ fprintf(stderr, "cannot open %s\n", tmp_name); return 1; }
     { u8 hdr[TXI_HDR]; memset(hdr, 0, sizeof hdr);
       if (fwrite(hdr, 1, TXI_HDR, out) != TXI_HDR){ fprintf(stderr, "short write\n"); return 1; } }
 
@@ -210,7 +214,7 @@ int main(int argc, char** argv){
       if (fseek(out, 0, SEEK_SET) || fwrite(hdr, 1, TXI_HDR, out) != TXI_HDR){
           fprintf(stderr, "short write (header)\n"); return 1; } }
     if (fflush(out) || fsync(fileno(out)) || fclose(out)){ fprintf(stderr, "close failed\n"); return 1; }
-    if (rename("txindex.dat.tmp", "txindex.dat")){ perror("rename"); return 1; }
+    if (rename(tmp_name, out_name)){ perror("rename"); return 1; }
 
     fprintf(stderr, "[txindex] DONE: %llu records, %llu sparse, %.2f GB, %llds\n",
             (unsigned long long)written, (unsigned long long)nsparse,

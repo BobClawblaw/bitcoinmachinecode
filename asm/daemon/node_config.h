@@ -114,6 +114,11 @@ typedef struct {
     int  have_minchainwork;          /* 0 when neither config nor chain default set one   */
     long bantime;                    /* -bantime seconds (Core default 86400)             */
     int  blockfilterindex;           /* -blockfilterindex (default 1: keep current behaviour) */
+    int  txindex;                    /* -txindex: the daemon builds the txid index as sorted runs behind
+                                        the applied height, during and after the sync (2026-09-16) */
+    int  txospenderindex;            /* -txospenderindex: same shape (Core 30's index) */
+    long indexrunblocks;             /* bmc.indexrunblocks: heights per run the trailing builders make
+                                        (default 20000; the unsorted tail is never longer than this) */
     int  coinstatsindex;             /* -coinstatsindex   (default 1: keep current behaviour) */
     char rpccookiefile[256];         /* -rpccookiefile; empty = <datadir>/.cookie          */
     int  rpccookie;                  /* derived: emit and accept a cookie (default 1)      */

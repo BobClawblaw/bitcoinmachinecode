@@ -1755,40 +1755,25 @@ static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
 #define TXI_REC    20
 #define TXI_SPARSE 16
 
-static const u8* g_txi;            /* mmap base, or NULL */
-static u64 g_txi_n, g_txi_sparse_off, g_txi_nsparse;
-static long g_txi_from = -1, g_txi_to = -1;
-
-/* Latches on SUCCESS, not on the first attempt: an index built while the
- * node is running is then picked up on the next lookup instead of needing a
- * restart. A failed open is one ENOENT syscall and only happens while there
- * is no index at all, so the retry costs nothing worth measuring. */
+#include "daemon/index_runs.h"
+/* 2026-09-16: the txid index is a SET of sorted runs (index_runs.h): the
+ * legacy txindex.dat base plus every txindex.r<from>-<to>.dat the daemon
+ * builds behind the applied height, during the sync and after it. A lookup
+ * asks each run, then the tail. Refreshed before every lookup (at most one
+ * directory scan per second), so a run committed by the trailing builder is
+ * picked up without a restart -- the property the old "latch on success"
+ * open had for the single base. */
+static irunset_t g_txi_runs;
+static int g_txi_runs_init;
 static void txi_open(void){
-    if (g_txi) return;
-    int fd = open("txindex.dat", O_RDONLY);
-    if (fd < 0) return;
-    struct stat sb;
-    if (fstat(fd, &sb) != 0 || sb.st_size < TXI_HDR){ close(fd); return; }
-    void* m = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
-    if (m == MAP_FAILED) return;
-    const u8* b = m;
-    if (memcmp(b, "BMCTXIDX", 8)){ munmap(m, (size_t)sb.st_size); return; }
-    u64 n = 0, so = 0, ns = 0;
-    for (int i = 0; i < 8; i++) n  |= (u64)b[8+i]  << (8*i);
-    for (int i = 0; i < 8; i++) so |= (u64)b[16+i] << (8*i);
-    for (int i = 0; i < 8; i++) ns |= (u64)b[24+i] << (8*i);
-    u32 f = 0, t = 0;
-    for (int i = 0; i < 4; i++) f |= (u32)b[32+i] << (8*i);
-    for (int i = 0; i < 4; i++) t |= (u32)b[36+i] << (8*i);
-    /* a header that describes more than the file holds is a torn build */
-    if (so + ns * TXI_SPARSE > (u64)sb.st_size || TXI_HDR + n * TXI_REC != so){
-        munmap(m, (size_t)sb.st_size); return; }
-    g_txi = b; g_txi_n = n; g_txi_sparse_off = so; g_txi_nsparse = ns;
-    g_txi_from = (long)f; g_txi_to = (long)t;
-    fprintf(stderr, "[txindex] %llu records, heights [%ld,%ld]\n",
-            (unsigned long long)n, g_txi_from, g_txi_to);
+    if (!g_txi_runs_init){ irs_init(&g_txi_runs, "txindex", "BMCTXIDX", TXI_REC, TXI_SPARSE); g_txi_runs_init = 1; }
+    irs_refresh(&g_txi_runs);
 }
+static void txi_tail_refresh(void);
+static const u8* g_txi_tail;
+static int  txi_have(void){ txi_open(); if (g_txi_runs.n > 0) return 1; txi_tail_refresh(); return g_txi_tail != NULL; }
+static long txi_runs_to(void){ txi_open(); long t = -1; for (int i = 0; i < g_txi_runs.n; i++) if (g_txi_runs.r[i].to > t) t = g_txi_runs.r[i].to; return t; }
+static long txi_runs_from(void){ txi_open(); long f = -1; for (int i = 0; i < g_txi_runs.n; i++) if (f < 0 || g_txi_runs.r[i].from < f) f = g_txi_runs.r[i].from; return f; }
 
 /* ---- the incremental tail (daemon/tx_index_tail.c) ----------------------
  * Unsorted records in the same 20-byte layout, appended by the download
@@ -1796,7 +1781,6 @@ static void txi_open(void){
  * the file grows, so lookups see newly accepted blocks without a restart.
  * The scan is linear, which is fine because the tail only ever holds the
  * span since the last offline rebuild. */
-static const u8* g_txi_tail;
 static u64 g_txi_tail_sz;          /* mapped size, bytes (whole records only) */
 static long g_txi_tail_maxh = -1;  /* highest height among mapped records */
 
@@ -1813,7 +1797,8 @@ static long g_txi_tail_maxh = -1;  /* highest height among mapped records */
  * and each names what its own caller should do -- but the range they quote now
  * comes from one function. */
 static long txi_coverage_to(void){
-    return g_txi_tail_maxh > g_txi_to ? g_txi_tail_maxh : g_txi_to;
+    long rt = txi_runs_to();
+    return g_txi_tail_maxh > rt ? g_txi_tail_maxh : rt;
 }
 
 
@@ -1863,12 +1848,14 @@ static int txi_verify_rec(const u8* r, const u8 txid_wire[32],
 /* Look a WIRE-order txid up. Returns 1 and fills height/offset/len, or 0. */
 static int txi_lookup(const u8 txid_wire[32], long* h_out, u32* off_out, u32* len_out){
     txi_open();
-    if (g_txi && g_txi_n){
-        const u8* recs = g_txi + TXI_HDR;
-        const u8* sp   = g_txi + g_txi_sparse_off;
+    for (int ri = 0; ri < g_txi_runs.n; ri++){
+        const irun_t* run = &g_txi_runs.r[ri];
+        if (!run->n) continue;
+        const u8* recs = run->map + TXI_HDR;
+        const u8* sp   = run->map + run->sparse_off;
         /* binary search the sparse index for the last sample <= our prefix */
-        u64 lo = 0, hi = g_txi_nsparse ? g_txi_nsparse - 1 : 0, start = 0;
-        while (g_txi_nsparse && lo <= hi){
+        u64 lo = 0, hi = run->nsparse ? run->nsparse - 1 : 0, start = 0;
+        while (run->nsparse && lo <= hi){
             u64 mid = lo + (hi - lo) / 2;
             int c = memcmp(sp + mid * TXI_SPARSE, txid_wire, 8);
             if (c <= 0){
@@ -1881,7 +1868,7 @@ static int txi_lookup(const u8 txid_wire[32], long* h_out, u32* off_out, u32* le
                 hi = mid - 1;
             }
         }
-        for (u64 i = start; i < g_txi_n; i++){
+        for (u64 i = start; i < run->n; i++){
             const u8* r = recs + i * TXI_REC;
             int c = memcmp(r, txid_wire, 8);
             if (c < 0) continue;
@@ -1889,7 +1876,7 @@ static int txi_lookup(const u8 txid_wire[32], long* h_out, u32* off_out, u32* le
             if (txi_verify_rec(r, txid_wire, h_out, off_out, len_out)) return 1;
         }
     }
-    /* not in the base index -- the tail covers the heights after it */
+    /* not in any run -- the tail covers the heights after them */
     txi_tail_refresh();
     for (u64 o = 0; g_txi_tail && o + TXI_REC <= g_txi_tail_sz; o += TXI_REC){
         const u8* r = g_txi_tail + o;
@@ -1906,25 +1893,16 @@ static int txi_lookup(const u8 txid_wire[32], long* h_out, u32* off_out, u32* le
  * the spending transaction is read at the recorded location and must carry
  * the FULL outpoint among its inputs. */
 #include "daemon/txosp_format.h"
-static const u8* g_tsp; static u64 g_tsp_n, g_tsp_sparse_off, g_tsp_nsparse; static long g_tsp_to = -1;
-static const u8* g_tsp_tail; static u64 g_tsp_tail_sz; static long g_tsp_tail_maxh = -1;
+static irunset_t g_tsp_runs; static int g_tsp_runs_init;
 static void tsp_open(void){
-    if (g_tsp) return;
-    int fd = open(TSP_BASE_FILE, O_RDONLY); if (fd < 0) return;
-    struct stat sb; if (fstat(fd, &sb) != 0 || sb.st_size < TSP_HDR){ close(fd); return; }
-    void* m = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_SHARED, fd, 0); close(fd);
-    if (m == MAP_FAILED) return;
-    const u8* b = m;
-    if (memcmp(b, TSP_MAGIC, 8)){ munmap(m, (size_t)sb.st_size); return; }
-    u64 n = 0, so = 0, ns = 0; u32 t = 0;
-    for (int i = 0; i < 8; i++) n  |= (u64)b[8+i]  << (8*i);
-    for (int i = 0; i < 8; i++) so |= (u64)b[16+i] << (8*i);
-    for (int i = 0; i < 8; i++) ns |= (u64)b[24+i] << (8*i);
-    for (int i = 0; i < 4; i++) t  |= (u32)b[36+i] << (8*i);
-    if (so + ns * TSP_SPARSE > (u64)sb.st_size || TSP_HDR + n * TSP_REC != so){ munmap(m, (size_t)sb.st_size); return; }
-    g_tsp = b; g_tsp_n = n; g_tsp_sparse_off = so; g_tsp_nsparse = ns; g_tsp_to = (long)t;
-    fprintf(stderr, "[txospender] %llu records, to height %ld\n", (unsigned long long)n, g_tsp_to);
+    if (!g_tsp_runs_init){ irs_init(&g_tsp_runs, "txospender", TSP_MAGIC, TSP_REC, TSP_SPARSE); g_tsp_runs_init = 1; }
+    irs_refresh(&g_tsp_runs);
 }
+static void tsp_tail_refresh(void);
+static const u8* g_tsp_tail;
+static int  tsp_have(void){ tsp_open(); if (g_tsp_runs.n > 0) return 1; tsp_tail_refresh(); return g_tsp_tail != NULL; }
+static long tsp_runs_to(void){ tsp_open(); long t = -1; for (int i = 0; i < g_tsp_runs.n; i++) if (g_tsp_runs.r[i].to > t) t = g_tsp_runs.r[i].to; return t; }
+static u64 g_tsp_tail_sz; static long g_tsp_tail_maxh = -1;
 static void tsp_tail_refresh(void){
     struct stat sb;
     if (stat(TSP_TAIL_FILE, &sb) != 0 || (u64)sb.st_size < TSP_REC){ if (g_tsp_tail){ munmap((void*)g_tsp_tail, (size_t)g_tsp_tail_sz); g_tsp_tail = NULL; g_tsp_tail_sz = 0; } return; }
@@ -1960,24 +1938,26 @@ static int tsp_verify_rec(const u8* r, const u8 txid_wire[32], u32 vout, u8 spen
     if (txout && txlen_out){ if ((long)rec.len <= txcap){ memcpy(txout, tx, rec.len); *txlen_out = (long)rec.len; } else *txlen_out = -1; }
     return 1;
 }
-int rpc_chain_txospender_available(void){ tsp_open(); return g_tsp != NULL; }
+int rpc_chain_txospender_available(void){ return tsp_have(); }
 /* 1 = spent by `spender` (wire txid) in block `height` whose hash is filled;
  * 0 = no confirmed spend known (unspent, or beyond the index's coverage). */
 int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsigned vout, unsigned char spender_wire[32],
                                 long* height_out, unsigned char blockhash_wire[32], unsigned char* txout, long txcap, long* txlen_out){
     (void)refresh();                                   /* the tail may name blocks newer than our cached tip */
     tsp_open();
-    if (g_tsp && g_tsp_n){
-        const u8* recs = g_tsp + TSP_HDR; const u8* sp = g_tsp + g_tsp_sparse_off;
-        u64 lo = 0, hi = g_tsp_nsparse ? g_tsp_nsparse - 1 : 0, start = 0;
-        while (g_tsp_nsparse && lo <= hi){
+    for (int ri = 0; ri < g_tsp_runs.n; ri++){
+        const irun_t* run = &g_tsp_runs.r[ri];
+        if (!run->n) continue;
+        const u8* recs = run->map + TSP_HDR; const u8* sp = run->map + run->sparse_off;
+        u64 lo = 0, hi = run->nsparse ? run->nsparse - 1 : 0, start = 0;
+        while (run->nsparse && lo <= hi){
             u64 mid = lo + (hi - lo) / 2; const u8* e = sp + mid * TSP_SPARSE;
             u32 ev = (u32)e[12] | ((u32)e[13] << 8) | ((u32)e[14] << 16) | ((u32)e[15] << 24);
             int c = tsp_key_cmp(e, ev, txid_wire, vout);
             if (c <= 0){ u64 off = 0; for (int i = 0; i < 8; i++) off |= (u64)e[16+i] << (8*i); start = (off - TSP_HDR) / TSP_REC; lo = mid + 1; }
             else { if (mid == 0) break; hi = mid - 1; }
         }
-        for (u64 i = start; i < g_tsp_n; i++){
+        for (u64 i = start; i < run->n; i++){
             const u8* r = recs + i * TSP_REC;
             u32 rv = (u32)r[12] | ((u32)r[13] << 8) | ((u32)r[14] << 16) | ((u32)r[15] << 24);
             int c = tsp_key_cmp(r, rv, txid_wire, vout);
@@ -2069,7 +2049,7 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
         } else {
             txi_open();
             static char nomsg[288];
-            if (g_txi){
+            if (txi_have()){
                 /* An index EXISTS and does not hold it. Say which heights it
                  * covers: "not found" from a PARTIAL index is a different
                  * fact from "not found" on the whole chain, and a caller who
@@ -2080,7 +2060,7 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
                          "covers heights %ld..%ld; if the transaction is outside that "
                          "range, rebuild the index over it or pass the block hash. "
                          "Use gettransaction for wallet transactions.",
-                         g_txi_from, cov_to);
+                         txi_runs_from(), cov_to);
                 *ec = -5; *em = nomsg; return 0;
             }
             *ec = -5; *em = "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.";
@@ -2543,13 +2523,13 @@ static int cmd_gettxoutproof(const rj_val* params, rj_val** res, long* ec, const
             (void)toff; (void)tlen; h = th;
         } else {
             txi_open();
-            if (g_txi){
+            if (txi_have()){
                 static char nomsg[288];
                 long cov_to = txi_coverage_to();     /* RPX-8 */
                 snprintf(nomsg, sizeof nomsg,
                          "Transaction not found in the txid index (covers heights %ld..%ld); "
                          "if the transaction is outside that range, rebuild the index over it "
-                         "or pass the block hash.", g_txi_from, cov_to);
+                         "or pass the block hash.", txi_runs_from(), cov_to);
                 *ec = -5; *em = nomsg; return 0;
             }
             *ec = -5; *em = "No txid index built (daemon/bmc_build_tx_index) and no block hash given -- "
@@ -4384,6 +4364,9 @@ extern long axt_read_address(int type, const unsigned char hash[32],
 extern long axt_probe_covered(void);
 
 #define AXR_TXID_CAP 100000
+#include "daemon/addr_hist_fmt.h"    /* ah_lookup / ah_to_height / ah_available: the history runs */
+#include "daemon/addr_index_fmt.h"   /* AXF_OP_* : the journal records */
+#include "daemon/txi_format.h"       /* txi_rd_varint */
 
 /* collect the address strings from any accepted param shape; returns count
  * or -1 on a malformed request */
@@ -4418,11 +4401,88 @@ static int axr_key(const char* addr, int* type, unsigned char key[32]){
 }
 
 static int axr_enabled(long* ec, const char** em){
-    if (axt_probe_covered() >= 0) return 1;
+    if (axt_probe_covered() >= 0 || ah_available()) return 1;
     *ec = -1;
     *em = "Address index not available (extension; set addrindex=1 in bitcoin.conf "
           "before the node syncs -- Core itself has no address index)";
     return 0;
+}
+
+/* ---- 2026-09-16: balances and txids from the history RUNS + the journal --
+ * The journal (addrindex.tail) used to hold the whole chain and every query
+ * scanned all of it (89 GB at 43% of mainnet on run 24: one getaddressbalance
+ * starved the sync for ten minutes). Now the trailing builder folds it into
+ * sorted history runs (addr_hist_fmt.h) and rotates the journal, so a query
+ * is: the key's events from the runs (sparse-indexed), then the journal
+ * above the runs' reach. Balance = funds - spends, received = funds, utxos =
+ * #funds - #spends; the two sources carry the same facts in two shapes
+ * (events name the transaction by (height, txpos); journal records carry
+ * the txid), so getaddresstxids resolves a run event's txid by reading its
+ * block -- one read per distinct height, cached across the call. */
+extern long axt_read_events(int type, const unsigned char hash[32], long min_height,
+                            int (*cb)(void* ctx, int op, const unsigned char txid[32], unsigned vout, unsigned long long value, unsigned height), void* ctx);
+typedef struct { unsigned long long bal_fund, bal_spend; long nfund, nspend; unsigned char* txids; long ntxid, cap; } axr_acc;
+static int axr_txid_seen(axr_acc* a, const unsigned char txid[32]){
+    for (long t = 0; t < a->ntxid; t++) if (!memcmp(a->txids + t * 32, txid, 32)) return 1;
+    return 0;
+}
+static void axr_txid_push(axr_acc* a, const unsigned char txid[32]){
+    if (a->cap <= 0 || a->ntxid >= a->cap || axr_txid_seen(a, txid)) return;
+    memcpy(a->txids + a->ntxid * 32, txid, 32); a->ntxid++;
+}
+static int axr_tail_cb(void* ctx, int op, const unsigned char txid[32], unsigned vout, unsigned long long value, unsigned height){
+    axr_acc* a = ctx; (void)vout; (void)height;
+    if (op == AXF_OP_ADD){ a->bal_fund += value; a->nfund++; axr_txid_push(a, txid); }
+    else if (op == AXF_OP_DEL){ a->bal_spend += value; a->nspend++; }
+    else if (op == AXF_OP_TOUCH) axr_txid_push(a, txid);
+    return 1;
+}
+/* the txid of the txpos-th transaction of block h (wire order), or 0 */
+static int axr_txid_at(long h, long txpos, unsigned char out[32]){
+    static long cached_h = -1; static long cached_n; static unsigned char* cached; static long cached_cap;
+    if (h != cached_h){
+        long blen = read_block(h); if (blen < 81) return 0;
+        const u8* p = g_blockbuf + 80; const u8* end = g_blockbuf + blen; uint64_t cc;
+        uint64_t ntx = txi_rd_varint(p, end, &cc); if (!cc) return 0; p += cc;
+        if ((long)ntx > cached_cap){ cached_cap = (long)ntx + 64; cached = realloc(cached, (size_t)cached_cap * 32); if (!cached) return 0; }
+        static u8 scratch[4u << 20];
+        cached_n = 0;
+        for (uint64_t t = 0; t < ntx; t++){
+            const u8* s0 = p;
+            if (p + 4 > end) return 0;
+            p += 4;
+            int sw = (p + 2 <= end && p[0] == 0x00 && p[1] == 0x01);
+            if (sw) p += 2;
+            uint64_t nin = txi_rd_varint(p, end, &cc); if (!cc) return 0;
+            p += cc;
+            for (uint64_t i = 0; i < nin; i++){ if (p + 36 > end) return 0; p += 36; uint64_t sl = txi_rd_varint(p, end, &cc); if (!cc) return 0; p += cc + sl + 4; if (p > end) return 0; }
+            uint64_t nout = txi_rd_varint(p, end, &cc); if (!cc) return 0;
+            p += cc;
+            for (uint64_t i = 0; i < nout; i++){ if (p + 8 > end) return 0; p += 8; uint64_t sl = txi_rd_varint(p, end, &cc); if (!cc) return 0; p += cc + sl; if (p > end) return 0; }
+            if (sw){ for (uint64_t i = 0; i < nin; i++){ uint64_t items = txi_rd_varint(p, end, &cc); if (!cc) return 0; p += cc; for (uint64_t k = 0; k < items; k++){ uint64_t il = txi_rd_varint(p, end, &cc); if (!cc) return 0; p += cc + il; if (p > end) return 0; } } }
+            if (p + 4 > end) return 0;
+            p += 4;
+            if (tx_txid(cached + (size_t)cached_n * 32, s0, (unsigned long)(p - s0), scratch, sizeof scratch) != 1) return 0;
+            cached_n++;
+        }
+        cached_h = h;
+    }
+    if (txpos < 0 || txpos >= cached_n) return 0;
+    memcpy(out, cached + (size_t)txpos * 32, 32);
+    return 1;
+}
+/* runs + journal for one key. txid_cap 0 = counts only. -1 on a read failure */
+static long axr_read(int type, const unsigned char key[32], axr_acc* a, unsigned char* txids, long txid_cap){
+    memset(a, 0, sizeof *a); a->txids = txids; a->cap = txid_cap;
+    const ah_event* ev = 0; long n = ah_lookup((uint8_t)type, key, &ev);
+    long runs_to = ah_to_height();
+    for (long i = 0; i < n; i++){
+        ah_event e; memcpy(&e, (const unsigned char*)ev + i * AH_EVENT_BYTES, sizeof e);
+        if (e.kind == AH_FUND){ a->bal_fund += e.value; a->nfund++; } else { a->bal_spend += e.value; a->nspend++; }
+        if (txid_cap > 0 && a->ntxid < txid_cap){ unsigned char t[32]; if (axr_txid_at((long)e.height, (long)e.txpos, t)) axr_txid_push(a, t); }
+    }
+    if (axt_read_events(type, key, runs_to, axr_tail_cb, a) < 0 && n < 0) return -1;
+    return a->ntxid;
 }
 
 static int cmd_getaddressbalance(const rj_val* params, rj_val** res, long* ec, const char** em){
@@ -4431,14 +4491,12 @@ static int cmd_getaddressbalance(const rj_val* params, rj_val** res, long* ec, c
     if (na < 1){ *ec = -8; *em = "getaddressbalance(address | [addresses] | {\"addresses\":[...]})"; return 0; }
     if (!axr_enabled(ec, em)) return 0;
     unsigned long long bal = 0, rcv = 0; long utxos = 0;
-    static unsigned char txids[AXR_TXID_CAP * 32];
     for (long i = 0; i < na; i++){
         int t; unsigned char key[32];
         if (!axr_key(addrs[i]->str, &t, key)){ *ec = -5; *em = "Invalid address"; return 0; }
-        unsigned long long b, r; long nu;
-        if (axt_read_address(t, key, &b, &r, &nu, txids, 0) < 0){
-            *ec = -1; *em = "Address index unreadable"; return 0; }
-        bal += b; rcv += r; utxos += nu;
+        axr_acc a;
+        if (axr_read(t, key, &a, 0, 0) < 0){ *ec = -1; *em = "Address index unreadable"; return 0; }
+        bal += a.bal_fund - a.bal_spend; rcv += a.bal_fund; utxos += a.nfund - a.nspend;
     }
     rj_val* o = rj_obj();
     rj_obj_set(o, "balance",  rj_numf("%llu", bal));
@@ -4458,14 +4516,12 @@ static int cmd_getaddresstxids(const rj_val* params, rj_val** res, long* ec, con
     for (long i = 0; i < na; i++){
         int t; unsigned char key[32];
         if (!axr_key(addrs[i]->str, &t, key)){ rj_free(arr); *ec = -5; *em = "Invalid address"; return 0; }
-        unsigned long long b, r; long nu;
-        long n = axt_read_address(t, key, &b, &r, &nu, txids, AXR_TXID_CAP);
+        axr_acc a;
+        long n = axr_read(t, key, &a, txids, AXR_TXID_CAP);
         if (n < 0){ rj_free(arr); *ec = -1; *em = "Address index unreadable"; return 0; }
         for (long k = 0; k < n; k++){
             char hx[65];
             hex_rev(hx, txids + k * 32, 32);    /* wire -> display order */
-            /* cross-address dedup: linear over what's already in the array
-             * (na is <=64 and per-address lists are already unique) */
             int dup = 0;
             for (unsigned long e = 0; e < arr->nitems; e++)
                 if (!strcmp(arr->items[e]->str, hx)){ dup = 1; break; }
@@ -4485,7 +4541,7 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
         params->items[0]->typ == RJ_STR) want = params->items[0]->str;
     rj_val* o = rj_obj();
     txi_open();
-    if (g_txi && (!want || !strcmp(want, "txindex"))){
+    if (txi_have() && (!want || !strcmp(want, "txindex"))){
         /* Core reports {synced, best_block_height}. Coverage is the offline
          * base index plus the daemon-maintained tail (contiguous by
          * construction -- the tail backfills any gap above the base), so
@@ -4496,17 +4552,17 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
         rj_val* e = rj_obj();
         long tip = refresh();
         txi_tail_refresh();
-        long cov_to = g_txi_tail_maxh > g_txi_to ? g_txi_tail_maxh : g_txi_to;
+        long cov_to = txi_coverage_to();
         rj_obj_set(e, "synced", rj_bool(tip >= 0 && cov_to >= tip));
         rj_obj_set(e, "best_block_height", rj_numf("%ld", cov_to));
         rj_obj_set(o, "txindex", e);
     }
-    tsp_open();
-    if (g_tsp && (!want || !strcmp(want, "txospenderindex"))){
+    if (tsp_have() && (!want || !strcmp(want, "txospenderindex"))){
         rj_val* e = rj_obj();
         long tip = refresh();
         tsp_tail_refresh();
-        long cov_to = g_tsp_tail_maxh > g_tsp_to ? g_tsp_tail_maxh : g_tsp_to;
+        long rt = tsp_runs_to();
+        long cov_to = g_tsp_tail_maxh > rt ? g_tsp_tail_maxh : rt;
         rj_obj_set(e, "synced", rj_bool(tip >= 0 && cov_to >= tip));
         rj_obj_set(e, "best_block_height", rj_numf("%ld", cov_to));
         rj_obj_set(o, "txospenderindex", e);

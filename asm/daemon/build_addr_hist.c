@@ -30,6 +30,15 @@ typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
 extern long store_init(void* st); extern void store_reload(void* st); extern void store_rd_init(void* st);
 extern long store_read_at(void* st, unsigned long h, void* out, long cap);
 extern int  tx_txid(void* out, const void* tx, unsigned long txlen, void* buf, unsigned long buflen);
+/* RUN MODE (2026-09-16): spends come from UNDO, not from a join over every
+ * output in the chain. Undo is kept for every block now (undo_store.h), so a
+ * range [from, to] is self-contained: each spent prevout's script and value
+ * are in that block's own undo records, and the spender's (txpos, vin) are in
+ * the block. That is what lets the daemon build this index in runs behind the
+ * applied height during the sync (index_trail.h) instead of once, afterwards,
+ * with 700 GB of temp. undo_replay is daemon/undo_log.c's reader. */
+typedef int (*undo_cb_t)(void*, const u8*, u32, u64, u32, u8, const u8*, unsigned short);
+extern long undo_replay(long height, undo_cb_t cb, void* ctx);
 #define NB 256
 #define BLOCKBUF (8u << 20)
 #pragma pack(push,1)
@@ -38,6 +47,9 @@ typedef struct { u8 txid[32]; u32 vout; u8 type; u8 hash[32]; u64 value; } outre
 typedef struct { u8 txid[32]; u32 vout; u32 height; u32 txpos; u32 vin; } spendref;      /* 48 B */
 #pragma pack(pop)
 static FILE* kb[NB]; static FILE* ob[NB]; static FILE* sb_[NB];
+static int g_run_mode;                       /* [from,to] with undo: no outref/spendref join */
+typedef struct { u8 prevout[36]; u32 txpos, vin; } run_in_t;
+static run_in_t* g_ins; static long g_nins, g_inscap; static u32 g_run_height;
 static u64 n_fund, n_out, n_spendref, n_spend, n_unmatched;
 static char* nm(char* b, const char* pfx, int i){ sprintf(b, "%s_b%03d.tmp", pfx, i); return b; }
 static u64 rdvi(const u8* p, const u8* end, u64* used){
@@ -83,18 +95,42 @@ static int walk_block(const u8* blk, long blen, u32 height, u8* scratch){
             if (type != AXF_INVALID){
                 krec k; k.type = (u8)type; memcpy(k.hash, hash, 32); k.ev.kind = AH_FUND; k.ev.height = height; k.ev.txpos = (u32)t; k.ev.idx = (u32)o; k.ev.value = value;
                 fwrite(&k, 1, sizeof k, kb[hash[0]]); n_fund++;
-                outref r; memcpy(r.txid, txid, 32); r.vout = (u32)o; r.type = (u8)type; memcpy(r.hash, hash, 32); r.value = value;
-                fwrite(&r, 1, sizeof r, ob[txid[0]]); n_out++;
+                if (!g_run_mode){
+                    outref r; memcpy(r.txid, txid, 32); r.vout = (u32)o; r.type = (u8)type; memcpy(r.hash, hash, 32); r.value = value;
+                    fwrite(&r, 1, sizeof r, ob[txid[0]]); n_out++; }
             }
         }
         /* inputs (not the coinbase's) */
         if (t > 0){ q = ins;
             for (u64 i = 0; i < nin; i++){
+                if (g_run_mode){
+                    if (g_nins == g_inscap){ g_inscap = g_inscap ? g_inscap * 2 : 4096; g_ins = realloc(g_ins, (size_t)g_inscap * sizeof *g_ins); if (!g_ins){ fprintf(stderr, "oom\n"); exit(1); } }
+                    memcpy(g_ins[g_nins].prevout, q, 36); g_ins[g_nins].txpos = (u32)t; g_ins[g_nins].vin = (u32)i; g_nins++;
+                    q += 36; u64 sl = rdvi(q, end, &c); q += c + sl + 4;
+                    continue;
+                }
                 spendref r; memcpy(r.txid, q, 32); memcpy(&r.vout, q + 32, 4); q += 36; u64 sl = rdvi(q, end, &c); q += c + sl + 4;
                 r.height = height; r.txpos = (u32)t; r.vin = (u32)i;
                 fwrite(&r, 1, sizeof r, sb_[r.txid[0]]); n_spendref++;
             } }
     }
+    return 1;
+}
+/* run mode: one undo record (a spent prevout, script + value) -> SPEND event
+ * for its address, attributed to the spender through the block's input table */
+static int run_undo_cb(void* ctx, const u8* txid, u32 index, u64 value, u32 h, u8 coinbase, const u8* script, unsigned short slen){
+    (void)ctx; (void)h; (void)coinbase;
+    u8 hash[32]; int type = axf_classify(script, slen, hash);
+    if (type == AXF_INVALID) return 1;
+    u8 want[36]; memcpy(want, txid, 32); for (int i = 0; i < 4; i++) want[32+i] = (u8)(index >> (8*i));
+    for (long i = 0; i < g_nins; i++){
+        if (memcmp(g_ins[i].prevout, want, 36) == 0){
+            krec k; k.type = (u8)type; memcpy(k.hash, hash, 32); k.ev.kind = AH_SPEND; k.ev.height = g_run_height; k.ev.txpos = g_ins[i].txpos; k.ev.idx = g_ins[i].vin; k.ev.value = value;
+            fwrite(&k, 1, sizeof k, kb[hash[0]]); n_spend++;
+            return 1;
+        }
+    }
+    n_unmatched++;                              /* undo names a prevout the block does not spend: torn/foreign undo */
     return 1;
 }
 static int cmp_outref(const void* a, const void* b){ int c = memcmp(((const outref*)a)->txid, ((const outref*)b)->txid, 32); if (c) return c; u32 x = ((const outref*)a)->vout, y = ((const outref*)b)->vout; return x < y ? -1 : x > y; }
@@ -108,27 +144,43 @@ static void* load(const char* path, size_t rec, size_t* n){
     return a;
 }
 int main(int argc, char** argv){
-    if (argc < 2){ fprintf(stderr, "usage: build_addr_hist <datadir> [to_height]\n"); return 2; }
+    if (argc < 2){ fprintf(stderr, "usage: build_addr_hist <datadir> [to_height]          (whole chain, outref join)\n"
+                                   "       build_addr_hist <datadir> <from> <to> <out>     (a RUN from blocks + undo)\n"); return 2; }
     if (chdir(argv[1])){ perror("chdir"); return 1; }
     static u8 store_buf[4096]; if (store_init(store_buf) != 1){ fprintf(stderr, "store_init failed\n"); return 1; }
     store_reload(store_buf); store_rd_init(store_buf);
-    long tip = *(int*)(store_buf + 24); long to_h = argc > 2 ? atol(argv[2]) : tip; if (to_h > tip) to_h = tip;
+    long tip = *(int*)(store_buf + 24);
+    long from_h = 0, to_h = argc > 2 ? atol(argv[2]) : tip;
+    const char* out_name = AH_FILE; char tmp_name[340];
+    if (argc >= 5){ g_run_mode = 1; from_h = atol(argv[2]); to_h = atol(argv[3]); out_name = argv[4]; }
+    if (to_h > tip) to_h = tip;
     if (tip < 0){ fprintf(stderr, "empty store\n"); return 1; }
-    fprintf(stderr, "[addrhist] dir=%s tip=%ld to=%ld\n", argv[1], tip, to_h);
+    if (from_h < 0 || to_h < from_h){ fprintf(stderr, "empty height range\n"); return 1; }
+    snprintf(tmp_name, sizeof tmp_name, "%s.tmp", out_name);
+    fprintf(stderr, "[addrhist] dir=%s tip=%ld range=[%ld,%ld]%s -> %s\n", argv[1], tip, from_h, to_h, g_run_mode ? " (run: spends from undo)" : "", out_name);
     char b[64];
     for (int i = 0; i < NB; i++){ kb[i] = fopen(nm(b, "ahk", i), "wb"); ob[i] = fopen(nm(b, "aho", i), "wb"); sb_[i] = fopen(nm(b, "ahs", i), "wb"); if (!kb[i] || !ob[i] || !sb_[i]){ perror("bucket"); return 1; } }
     u8* blockbuf = malloc(BLOCKBUF); u8* scratch = malloc(BLOCKBUF); if (!blockbuf || !scratch){ fprintf(stderr, "oom\n"); return 1; }
     time_t t0 = time(NULL);
-    for (long h = 0; h <= to_h; h++){
+    for (long h = from_h; h <= to_h; h++){
         long blen = store_read_at(store_buf, (unsigned long)h, blockbuf, BLOCKBUF);
         if (blen < 81){ fprintf(stderr, "[addrhist] FATAL: block %ld unreadable (%ld)\n", h, blen); return 1; }
+        g_nins = 0; g_run_height = (u32)h;
         if (!walk_block(blockbuf, blen, (u32)h, scratch)){ fprintf(stderr, "[addrhist] FATAL: block %ld malformed\n", h); return 1; }
+        if (g_run_mode && h > 0){
+            /* the block's own spends, from its undo. Fewer undo records than
+             * inputs means the undo is missing or short: refuse the run
+             * rather than write a history that under-reports spends
+             * (addr_index_tail.c's STO-3 argument, applied here). */
+            long ur = undo_replay(h, run_undo_cb, 0);
+            if (ur < 0 || ur < g_nins){ fprintf(stderr, "[addrhist] FATAL: block %ld: undo has %ld record(s) for %ld input(s) -- run abandoned\n", h, ur, g_nins); return 1; }
+        }
         if (h % 20000 == 0) fprintf(stderr, "[addrhist] pass1 %ld/%ld (%llu funds, %llu spendrefs, %llds)\n", h, to_h, (unsigned long long)n_fund, (unsigned long long)n_spendref, (long long)(time(NULL) - t0));
     }
     for (int i = 0; i < NB; i++){ fclose(ob[i]); fclose(sb_[i]); }
     fprintf(stderr, "[addrhist] pass1 done: %llu funds, %llu spendrefs, %llds\n", (unsigned long long)n_fund, (unsigned long long)n_spendref, (long long)(time(NULL) - t0));
-    /* pass 2: join */
-    for (int i = 0; i < NB; i++){
+    /* pass 2: join (whole-chain mode only; a run got its spends from undo) */
+    for (int i = 0; i < NB && !g_run_mode; i++){
         size_t no, ns; outref* o = load(nm(b, "aho", i), sizeof(outref), &no); spendref* s = load(nm(b, "ahs", i), sizeof(spendref), &ns);
         if (o) qsort(o, no, sizeof(outref), cmp_outref);
         if (s) qsort(s, ns, sizeof(spendref), cmp_spendref);
@@ -146,8 +198,8 @@ int main(int argc, char** argv){
     for (int i = 0; i < NB; i++) fclose(kb[i]);
     fprintf(stderr, "[addrhist] pass2 done: %llu spends, %llu unmatched (non-standard prevouts are expected here), %llds\n", (unsigned long long)n_spend, (unsigned long long)n_unmatched, (long long)(time(NULL) - t0));
     /* pass 3: groups */
-    FILE* out = fopen(AH_FILE ".tmp", "wb"); if (!out){ perror("open output"); return 1; }
-    ah_header hd; memset(&hd, 0, sizeof hd); hd.magic = AH_MAGIC; hd.version = AH_VERSION; hd.to_height = (u32)to_h; hd.body_off = AH_HDR_BYTES;
+    FILE* out = fopen(tmp_name, "wb"); if (!out){ perror("open output"); return 1; }
+    ah_header hd; memset(&hd, 0, sizeof hd); hd.magic = AH_MAGIC; hd.version = AH_VERSION; hd.to_height = (u32)to_h; hd.pad = (u32)from_h; hd.body_off = AH_HDR_BYTES;
     u8 zero[AH_HDR_BYTES] = {0}; fwrite(zero, 1, AH_HDR_BYTES, out);
     size_t sp_cap = 1 << 16, sp_n = 0; ah_sparse* sp = malloc(sp_cap * sizeof *sp); u64 body = 0, groups = 0;
     for (int i = 0; i < NB; i++){
@@ -169,7 +221,7 @@ int main(int argc, char** argv){
     fwrite(sp, AH_SPARSE_BYTES, sp_n, out);
     if (fflush(out) != 0 || fseek(out, 0, SEEK_SET) != 0 || fwrite(&hd, 1, sizeof hd, out) != sizeof hd || fflush(out) != 0 || fsync(fileno(out)) != 0){ perror("write header"); return 1; }
     fclose(out);
-    if (rename(AH_FILE ".tmp", AH_FILE)){ perror("rename"); return 1; }
+    if (rename(tmp_name, out_name)){ perror("rename"); return 1; }
     fprintf(stderr, "[addrhist] DONE: %llu keys, %llu events (%llu funds, %llu spends), to height %ld, %.2f GB, %llds\n",
             (unsigned long long)groups, (unsigned long long)hd.n_events, (unsigned long long)n_fund, (unsigned long long)n_spend, to_h, (double)(hd.sparse_off + sp_n * AH_SPARSE_BYTES) / 1e9, (long long)(time(NULL) - t0));
     return 0;

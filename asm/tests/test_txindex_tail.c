@@ -101,10 +101,27 @@ int main(void){
         ck("store_append", store_append(store_buf, hash[h], blk[h], blen[h]), h);
     store_rd_init(store_buf);
 
-    /* no base index => disabled: nothing appears no matter what happens */
+    /* 2026-09-16: no base index => the tail starts at GENESIS (the trailing
+     * builder folds it into runs; the linear scan is bounded by the run
+     * size, never the chain). Boot backfills h0..h2 from the archive. */
     txit_boot(store_buf);
+    long genesis_expect = (long)(ntx_at[0] + ntx_at[1] + ntx_at[2]) * TXI_REC;
+    ck("no base -> boot backfills from genesis", tail_size(), genesis_expect);
     txit_on_block(store_buf, 3, blk[3], blen[3]);
-    ck("no base index -> tail disabled, no file growth", tail_size() <= 0, 1);
+    genesis_expect += (long)ntx_at[3] * TXI_REC;
+    ck("...and the live append continues from there", tail_size(), genesis_expect);
+    /* a run reaching h1 was committed: the tail drops everything at or
+     * below it (a prefix -- the file is height-ordered) and keeps h2..h3 */
+    { extern void txit_runs_advanced(long to); txit_runs_advanced(1); }
+    ck("rotation after a run to h1: only h2..h3 remain", tail_size(), (long)(ntx_at[2] + ntx_at[3]) * TXI_REC);
+    { unsigned char rec[TXI_REC]; int fd = open(TXI_TAIL_FILE, O_RDONLY);
+      ck("rotated tail readable", fd >= 0 && read(fd, rec, TXI_REC) == TXI_REC, 1);
+      ck("...its first record is h2", (long)(rec[8] | rec[9]<<8), 2); if (fd >= 0) close(fd); }
+    { extern void txit_runs_advanced(long to); txit_runs_advanced(0); }
+    ck("a run below everything kept: no change", tail_size(), (long)(ntx_at[2] + ntx_at[3]) * TXI_REC);
+    txit_on_block(store_buf, 4, blk[4], blen[4]);   /* covered+1 with the block in hand: appended from those bytes */
+    ck("the live append after a rotation continues from the kept records", tail_size(), (long)(ntx_at[2] + ntx_at[3] + ntx_at[4]) * TXI_REC);
+    unlink(TXI_TAIL_FILE);                           /* the base-driven flow below starts clean */
 
     /* base covers h0 only; boot must backfill h1..h2 from the archive */
     write_base(0);

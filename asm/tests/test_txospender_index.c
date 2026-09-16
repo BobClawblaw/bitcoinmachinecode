@@ -59,13 +59,21 @@ int main(void){
 
     printf("== 1. no index yet ==\n");
     ck("index unavailable", !rpc_chain_txospender_available());
-    tsp_boot(store_buf); ck("tail disabled without a base", !tsp_active());
-    snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":0}]]", t0d); p = rj_parse(pj, strlen(pj)); r = NULL;
-    ck("gettxspendingprevout defaults to mempool-only and answers (no spender known)", rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em) && r && r->nitems == 1 && !S(r->items[0], "spendingtxid"));
-    rj_free(p); rj_free(r);
     snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":0}],{\"mempool_only\":false}]", t0d); p = rj_parse(pj, strlen(pj)); r = NULL;
-    ck("...mempool_only=false without the index -> Core's error", !rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em) && ec == -1 && em && strstr(em, "txospenderindex is unavailable"));
+    ck("mempool_only=false without the index -> Core's error", !rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em) && ec == -1 && em && strstr(em, "txospenderindex is unavailable"));
     rj_free(p); if (r) rj_free(r);
+    snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":0}]]", t0d); p = rj_parse(pj, strlen(pj)); r = NULL;
+    ck("gettxspendingprevout defaults to mempool-only without the index and answers (no spender known)", rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em) && r && r->nitems == 1 && !S(r->items[0], "spendingtxid"));
+    rj_free(p); rj_free(r);
+    /* 2026-09-16: without a base the tail starts at genesis and the index is
+     * AVAILABLE through it (a run folds the tail later); Core's default for
+     * mempool_only then flips to false, so the confirmed spend is answered */
+    tsp_boot(store_buf); ck("2026-09-16: without a base the tail starts at genesis (a run folds it later)", tsp_active());
+    ck("...and the index is available through the tail", rpc_chain_txospender_available());
+    snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":0}]]", t0d); p = rj_parse(pj, strlen(pj)); r = NULL;
+    ck("gettxspendingprevout (default = the index) names h1's tx as the spender of h0:0",
+       rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em) && r && r->nitems == 1 && S(r->items[0], "spendingtxid") && !strcmp(S(r->items[0], "spendingtxid"), t1d));
+    rj_free(p); rj_free(r);
 
     printf("== 2. base [0,1] built by the tool, tail covers h2..h3 ==\n");
     { char cmd[4300]; snprintf(cmd, sizeof cmd, "%s . 0 1 2>/dev/null", tool); ck("builder ran", system(cmd) == 0); }
