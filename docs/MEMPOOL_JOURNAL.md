@@ -45,13 +45,22 @@ the pool has dropped the entry there is nowhere left to learn when the
 transaction arrived. "Broadcast at T, evicted at T+6h, never mined" is only
 answerable if it is captured at that moment.
 
-`wtxid` is in the record format but **not recorded today**: the structural
-pool caches it only by slot, and scanning that table on a path which runs
-thousands of times per connected block is not a trade worth making for a
-display field. Copying the txid in instead would be right only for
-non-witness transactions and silently wrong for every segwit one. Readers
-treat all-zero as "not recorded" and omit the field. A by-txid getter in
-`bitcoin_mempool.asm` would close it with no format migration.
+`wtxid` **is recorded as of 2026-09-16.** The pool caches one per slot but
+exposes it only *by slot*, and adding a by-txid getter means editing
+`bitcoin_mempool.asm`'s probe — which carries the MEM-21 coherence rules and
+is not a file to touch for a display field. It does not need touching: the
+cached value is `sha256d` over the transaction's stored bytes, and the
+departure hook fires **before** `mpool_del`, so the bytes are still readable
+and recomputing gives the same answer. One hash per departure, paid only when
+the journal is enabled.
+
+`tests/test_mempool_shared.c` pins the equality that makes the shortcut
+legitimate — the recomputed value against the pool's own cached one. Without
+it, a change to what `mpool_put` caches would silently write a *different*
+wtxid into every record, and a wrong one is worse than the zero it replaced:
+a zero is documented as "not recorded", a wrong value is not detectable at
+all. A record still carrying all-zero means the transaction had already left
+the structural pool.
 
 ## Reading it
 
@@ -133,7 +142,6 @@ The load line now reports how many came back:
 
 ## Known limits
 
-- `wtxid` is not populated (above).
 - The `conflicted` reason is distinguished from `mined` inside
   `mpool_policy_block_connect` by the removal mark; the save/restore of the
   reason around *that* entry point is not covered by a test, because driving
