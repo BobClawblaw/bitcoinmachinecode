@@ -19,6 +19,11 @@
 static int fails = 0, checks = 0;
 static void ck(const char* w, int c){ checks++; if (c) printf("ok  : %s\n", w); else { printf("FAIL: %s\n", w); fails++; } }
 
+static int ends_with(const char* s, const char* suf){
+    size_t n = strlen(s), m = strlen(suf);
+    return n >= m && !strcmp(s + n - m, suf);
+}
+
 static rj_val* call(const char* method, const char* pj, long* ec, const char** em){
     rj_val* p = pj ? rj_parse(pj, strlen(pj)) : NULL;
     rj_val* r = NULL; rpc_wallet w; memset(&w, 0, sizeof w);
@@ -74,8 +79,31 @@ int main(void){
          !strcmp(S(ac->items[0], "method"), "getrpcinfo"));
       ck("...with a duration field", ac && ac->nitems && rj_obj_get(ac->items[0], "duration"));
       ck("logpath is absolute", r && S(r, "logpath") && S(r, "logpath")[0] == '/');
-      ck("logpath names the node's own log, not Core's",
-         r && S(r, "logpath") && strstr(S(r, "logpath"), "bitcoind.log"));
+      /* THIS ASSERTION USED TO PIN THE BUG. It required "bitcoind.log" -- the
+       * name the daemon stopped using on 2026-09-06, when the default became
+       * Core's "debug.log" -- so getrpcinfo advertised a file that did not
+       * exist and the suite agreed with it. The contract is: whatever name
+       * the daemon actually opened, resolved against the cwd. */
+      ck("logpath ends in the default name the daemon opens (debug.log, Core's default)",
+         r && S(r, "logpath") && ends_with(S(r, "logpath"), "/debug.log"));
+      rj_free(r); }
+    /* -debuglogfile= moves the log, and getrpcinfo must follow it: a relative
+     * name resolves against the cwd, an absolute one is reported as given
+     * (which is also the -debuglogfile=0 case, where main.c passes /dev/null). */
+    { rpc_set_logpath("elsewhere.log");
+      rj_val* r = call("getrpcinfo", "[]", &ec, &em);
+      ck("logpath follows -debuglogfile= (relative: resolved against the cwd)",
+         r && S(r, "logpath") && ends_with(S(r, "logpath"), "/elsewhere.log"));
+      rj_free(r);
+      rpc_set_logpath("/dev/null");
+      r = call("getrpcinfo", "[]", &ec, &em);
+      ck("logpath reports an absolute name as-is (-debuglogfile=0 -> /dev/null)",
+         r && S(r, "logpath") && !strcmp(S(r, "logpath"), "/dev/null"));
+      rj_free(r);
+      rpc_set_logpath("");   /* back to the default for anything below */
+      r = call("getrpcinfo", "[]", &ec, &em);
+      ck("cleared: back to the default name",
+         r && S(r, "logpath") && ends_with(S(r, "logpath"), "/debug.log"));
       rj_free(r); }
 
     /* ---- logging ------------------------------------------------------- */
