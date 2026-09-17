@@ -1,6 +1,6 @@
 # Serving performance: bitcoinmachinecode vs Bitcoin Core
 
-**Living document.** Last measured 2026-09-17, node commit `ca4ecbec`, against
+**Living document.** Last measured 2026-09-17, node commit `31cffbc0`, against
 the Bitcoin Core v31.99 oracle on the same machine.
 
 This covers the node **after** the sync: the RPC surface, memory, and disk.
@@ -70,24 +70,41 @@ head-to-head rows.**
 The raw `getrawmempool verbose` numbers look like a 10× bmc win. They are not.
 Per transaction it is a wash, and Core is very slightly ahead.
 
-## 4. Concurrency — the real gap, and it is structural
+## 4. Concurrency — partly fixed, and still the largest gap
 
-Total wall time for N simultaneous clients issuing `getblockchaininfo`:
+Total wall time for N simultaneous clients. Three methods, because they now
+behave differently from one another:
 
-| clients | bmc | Core |
-|---|---|---|
-| 1 | 10 ms | 3 ms |
-| 4 | 15 ms | 4 ms |
-| 16 | 46 ms | 5 ms |
-| 32 | **80 ms** | **8 ms** |
+| clients | `getpeerinfo` bmc | Core | `getmempoolinfo` bmc | Core | `getblockchaininfo` bmc | Core |
+|---|---|---|---|---|---|---|
+| 1 | 4 ms | 3 ms | 7 ms | 3 ms | 9 ms | 4 ms |
+| 4 | 4 ms | 4 ms | — | — | — | — |
+| 16 | **5 ms** | 6 ms | 38 ms | 5 ms | 47 ms | 5 ms |
+| 32 | **8 ms** | 10 ms | 55 ms | 22 ms | **82 ms** | 7 ms |
 
-bmc rises roughly linearly; Core is close to flat. **bmc executes RPC handlers
-one at a time** — `g_exec_lock` in `rpc_server.c` — because the wallet and
-chain handlers are not concurrent-safe. Core runs 16 RPC threads by default.
+Three different situations, and the difference between them is the whole
+story:
 
-bmc wins nearly every single-client row above and loses this one by 10× at 32
-clients, and this is the row that decides what a monitoring dashboard, a block
-explorer, or several wallets see at once.
+**`getpeerinfo` is flat and now beats Core.** As of PR #255 it takes the READ
+side of `g_exec_lock`, which became a writer-preferring `pthread_rwlock`. It
+could, because the exec lock was never what protected it: the peer tables and
+`g_node_status` are written by the download worker *without* that lock
+(`dl_publish_peer_table`), so serialising readers against each other bought
+nothing. The same applies to `getconnectioncount` and `getnetworkinfo`.
+
+**`getmempoolinfo` improved and still rises.** It is on the concurrent list,
+but it takes the *mempool's* lock, which is a mutex — so concurrent callers
+now serialise there instead. A different serialiser, a partial win.
+
+**`getblockchaininfo` is unchanged, and stands for every chain read method.**
+`refresh()` calls `store_reload()` on the single shared store handle
+(`g_st`), so two of these cannot run at once. `getblock`,
+`getrawtransaction`, and everything else that reads the archive share that
+handle and one block buffer. They all still take the write side.
+
+So the gap is no longer "bmc serialises everything" — it is "bmc serialises
+everything that touches chain state", which is most of the interesting surface.
+Core runs 16 RPC threads with fine-grained locks (`cs_main`, the mempool lock).
 
 ## 5. Memory
 
@@ -190,17 +207,28 @@ Nothing below has a number yet. Do not let the tables above stand in for them.
 
 ## Closing or exceeding the gaps
 
-**1. RPC concurrency — the biggest one.** The blocking issue is that handlers
-share mutable state. The tractable path is a reader/writer split: make the
-chain read path's shared buffers per-thread (the block buffer, the per-query
-caches, the run-set mappings), then let a whitelist of pure-read methods take a
-read lock while everything else takes the write lock. The risk is real — a
-missed piece of shared state is a data race, not a slow query — so it wants
-its own change with its own tests, not a bolt-on.
+**1. RPC concurrency — still the biggest one, now half done.** The
+reader/writer split landed in PR #255, and the four methods that share no
+mutable state are concurrent. What remains is the chain read path, and the
+specific blocker is named: `refresh()` mutates the single shared store handle
+`g_st`, and the archive readers share one `g_blockbuf`.
 
-A cheaper intermediate: the response write is already outside the lock
-(PR #248); the *render* is not. Rendering a 5 MB `getrawmempool` reply under
-the execution lock still blocks everyone for the duration.
+The tractable path from here:
+  - `g_st` and `g_blockbuf` become thread-local (4 KB and ~4 MB per thread —
+    cheap at 8–16 threads);
+  - `idx_sync` and the `irunset_t` run-set remapping get their own mutex,
+    since those genuinely mutate shared mappings;
+  - the concurrent list then grows to `getblock`, `getrawtransaction`,
+    `getblockchaininfo`, `getblockheader` — the bulk of what an explorer polls.
+
+The risk is real and specific: `store_read_at` and `store_reload` are
+assembly, and whether they keep per-call state in the handle has to be read
+out of `bitcoin_store_fast.asm` before any of this is safe. A missed piece of
+shared state is a data race, not a slow query.
+
+A cheaper intermediate that needs none of that: the response *write* is
+outside the lock (PR #248), but the *render* is not. Rendering a 5 MB
+`getrawmempool` reply still holds the write lock for its duration.
 
 **2. `getmempoolinfo` `bytes`.** Maintain a running byte total the way Core
 does, and keep the full walk as a periodic audit rather than the hot path.
@@ -244,7 +272,28 @@ The root cause of the last three was that `mpool_policy_entry`/`entry_info`
 scanned the node array while a maintained hash index sat unused beside them
 (PR #252), and that no reverse index existed for children (PR #253).
 
+Concurrency (PR #255) is counted separately because it is not a quadratic
+loop: `getpeerinfo` went from rising linearly with client count to flat, by
+taking the read side of a lock that never protected it.
+
+| | before | after |
+|---|---|---|
+| `getpeerinfo`, 32 clients | 80 ms (serialised) | 8 ms |
+
 **One of these was a correctness bug, not a performance bug**: past 2 GB of
 journal, `getaddressbalance` silently answered from the history runs alone and
 returned wrong balances, because a short `pread` was reported as an error and
 the caller discarded it. See PR #246.
+
+---
+
+## Known failing test
+
+`test_rpc_esplora_stress` fails and has since before this work began — the
+Esplora `/address` route makes 371 RPC dispatches where the suite asserts at
+most 2. It is an efficiency assertion, not a wrong answer, and it is
+undiagnosed. Written up in
+[FEATURE_GAPS.md](FEATURE_GAPS.md#update-2026-09-17--a-failing-test-nobody-was-running).
+
+Every other figure in this document comes from a suite that passes, or from a
+direct measurement against the live node.
