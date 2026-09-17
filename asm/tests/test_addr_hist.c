@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <dirent.h>
 #include "../daemon/addr_hist_fmt.h"
 #include "test_tmpdir.h"
 typedef unsigned char u8; typedef unsigned int u32; typedef unsigned long long u64;
@@ -16,6 +17,16 @@ extern int  tx_txid(void* out, const void* tx, unsigned long txlen, void* buf, u
 static int fails = 0, checks = 0;
 static void ck(const char* w, int c){ checks++; printf("%s %s\n", c ? "ok  :" : "FAIL:", w); if (!c) fails++; }
 static u8 store_buf[4096];
+/* The whole-chain join spills into 256 aho_/ahs_ bucket files and unlinks them
+ * in pass 2. A RUN takes its spends from undo and skips pass 2 altogether, so a
+ * run that CREATES those buckets can never remove them: measured on run 26,
+ * every run left 512 empty files in the chain directory. Count what is left. */
+static int bucket_files_left(void){
+    DIR* d = opendir("."); if (!d) return -1;
+    int n = 0; struct dirent* e;
+    while ((e = readdir(d))) if (!strncmp(e->d_name, "aho_b", 5) || !strncmp(e->d_name, "ahs_b", 5)) n++;
+    closedir(d); return n;
+}
 /* tx: version | nin inputs (prevout, empty scriptSig, seq) | nout outputs (value, P2WPKH to `who`) | locktime */
 static long mk_tx(u8* p, int tag, const u8* prev_txid, unsigned prev_vout, int nout, const u8* who, u64 value0){
     u8* s = p; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = (u8)tag; *p++ = 1;
@@ -47,6 +58,7 @@ int main(void){
     store_rd_init(store_buf);
     { u8 k32[32]; memset(k32, 0, 32); memcpy(k32, A, 20); const ah_event* e0; ck("no index yet: ah_available false, ah_lookup -1", !ah_available() && ah_lookup(2, k32, &e0) == -1); }
     { char cmd[4300]; snprintf(cmd, sizeof cmd, "%s . 2>/dev/null", tool); ck("builder ran to the tip", system(cmd) == 0); }
+    ck("whole-chain build leaves no aho_/ahs_ bucket files behind", bucket_files_left() == 0);
     ck("index available, to_height 2", ah_available() && ah_to_height() == 2);
     u8 keyA[32], keyA1[32], keyB[32]; memset(keyA, 0, 32); memcpy(keyA, A, 20); memset(keyA1, 0, 32); memcpy(keyA1, A, 20); keyA1[0] = 0x12; memset(keyB, 0, 32); memcpy(keyB, B, 20);
     const ah_event* ev; long n = ah_lookup(2, keyA, &ev);
@@ -85,6 +97,7 @@ int main(void){
         ck("undo h2 written", undo_append_record(2, txid[2], 0, 4000000000ULL, 1, 0, spkA, 22) >= 0 && undo_commit(2) >= 0);
         { char cmd[4400]; snprintf(cmd, sizeof cmd, "%s . 0 1 addr_hist.r000000000-000000001.dat", tool); ck("run [0,1] built from blocks + undo", system(cmd) == 0);
           snprintf(cmd, sizeof cmd, "%s . 2 2 addr_hist.r000000002-000000002.dat", tool); ck("run [2,2] built", system(cmd) == 0); }
+        ck("a RUN leaves no aho_/ahs_ bucket files behind (run mode skips pass 2, which is what unlinks them)", bucket_files_left() == 0);
         ah_reset_for_test();
         ck("two runs: available, to_height 2 (the highest run)", ah_available() && ah_to_height() == 2 && ah_run_count() == 2);
         { const ah_event* e; long n = ah_lookup(2, keyA, &e);
