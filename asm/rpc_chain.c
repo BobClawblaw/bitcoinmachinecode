@@ -381,11 +381,18 @@ static int read_block_prefix(long h, u8* out, size_t n){
     return 1;
 }
 /* Whole block into g_blockbuf. Returns size, or -3 unavailable / -1 error. */
+/* Which height g_blockbuf currently holds, -1 when its contents are unknown.
+ * read_block is the only writer of g_blockbuf, so this is the whole truth,
+ * and it lets a caller that parsed a block keep using its offsets without
+ * copying the bytes out: it can ask whether the buffer still holds its
+ * block and re-read only if something else has been through since. */
+static long g_blockbuf_h = -1;
 static long read_block(long h){
     long r = store_read_at(g_st, (unsigned long)h, g_blockbuf, BLOCKBUF_CAP);
-    if (r == -3 || r == -2) return -3;
-    if (r < 0) return -1;
-    if (r < 81) return -3; /* hole / short */
+    if (r == -3 || r == -2){ g_blockbuf_h = -1; return -3; }
+    if (r < 0){ g_blockbuf_h = -1; return -1; }
+    if (r < 81){ g_blockbuf_h = -1; return -3; } /* hole / short */
+    g_blockbuf_h = h;
     return r;
 }
 
@@ -4422,13 +4429,27 @@ static int axr_enabled(long* ec, const char** em){
 extern long axt_read_events(int type, const unsigned char hash[32], long min_height,
                             int (*cb)(void* ctx, int op, const unsigned char txid[32], unsigned vout, unsigned long long value, unsigned height), void* ctx);
 typedef struct { unsigned long long bal_fund, bal_spend; long nfund, nspend; unsigned char* txids; long ntxid, cap; } axr_acc;
-static int axr_txid_seen(axr_acc* a, const unsigned char txid[32]){
-    for (long t = 0; t < a->ntxid; t++) if (!memcmp(a->txids + t * 32, txid, 32)) return 1;
-    return 0;
-}
+/* Deduplication used to be a linear scan of everything pushed so far, which is
+ * O(n^2) in the number of distinct txids: at the AXR_TXID_CAP of 100,000 that
+ * is 5e9 32-byte compares for one call. An open-addressed set keyed on the
+ * first 8 bytes of the txid makes it O(n). The table holds indices into
+ * a->txids (so the txid bytes live in one place) and is reset per call --
+ * the RPC server services one call at a time on one thread, which is what
+ * lets it be static, exactly as axr_txid_at's block cache below is. */
+#define AXR_TXID_HASHN (1u << 18)          /* > 2 * AXR_TXID_CAP, power of two */
+static int32_t axr_txid_tab[AXR_TXID_HASHN];
+static void axr_txid_reset(void){ memset(axr_txid_tab, 0xff, sizeof axr_txid_tab); }
 static void axr_txid_push(axr_acc* a, const unsigned char txid[32]){
-    if (a->cap <= 0 || a->ntxid >= a->cap || axr_txid_seen(a, txid)) return;
-    memcpy(a->txids + a->ntxid * 32, txid, 32); a->ntxid++;
+    if (a->cap <= 0 || a->ntxid >= a->cap) return;
+    uint64_t k; memcpy(&k, txid, 8);
+    uint32_t i = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 46) & (AXR_TXID_HASHN - 1);
+    while (axr_txid_tab[i] >= 0){
+        if (!memcmp(a->txids + (size_t)axr_txid_tab[i] * 32, txid, 32)) return;   /* already have it */
+        i = (i + 1) & (AXR_TXID_HASHN - 1);
+    }
+    memcpy(a->txids + a->ntxid * 32, txid, 32);
+    axr_txid_tab[i] = (int32_t)a->ntxid;
+    a->ntxid++;
 }
 static int axr_tail_cb(void* ctx, int op, const unsigned char txid[32], unsigned vout, unsigned long long value, unsigned height){
     axr_acc* a = ctx; (void)vout; (void)height;
@@ -4437,15 +4458,48 @@ static int axr_tail_cb(void* ctx, int op, const unsigned char txid[32], unsigned
     else if (op == AXF_OP_TOUCH) axr_txid_push(a, txid);
     return 1;
 }
-/* the txid of the txpos-th transaction of block h (wire order), or 0 */
+/* the txid of the txpos-th transaction of block h (wire order), or 0.
+ *
+ * This used to compute tx_txid() for EVERY transaction in the block in order
+ * to return one of them. A modern block carries ~3,000 transactions, so one
+ * event cost ~3,000 double-SHA256 passes over full transaction bytes, and the
+ * cache held a single height -- so a getaddresstxids over N distinct heights
+ * hashed N whole blocks. Measured on run 26 at the tip, that was 13 s for a
+ * busy address and 15 s for a nearly empty one: the cost tracked how many
+ * BLOCKS the address touched, not how many events it had, which is the shape
+ * that gave it away.
+ *
+ * Now the block is walked once per height to record each transaction's extent
+ * -- pointer arithmetic, no hashing -- and a txid is computed lazily, only for
+ * the txpos actually asked for, then memoised. Several events in one block
+ * still share the walk, which is what the original cache was for.
+ *
+ * Only the transaction EXTENTS are cached, not the bytes. Copying each block
+ * out cost more than it saved on an address that touches ~100,000 distinct
+ * heights -- that is ~100,000 whole-block memcpys. g_blockbuf_h says which
+ * block the shared buffer holds, so the lazy hash re-reads only when something
+ * else has been through the buffer since the parse, which inside one query is
+ * never. */
 static int axr_txid_at(long h, long txpos, unsigned char out[32]){
-    static long cached_h = -1; static long cached_n; static unsigned char* cached; static long cached_cap;
+    static long cached_h = -1; static long cached_n, cached_cap;
+    static unsigned char* cached;        /* cached_cap * 32 txids                 */
+    static unsigned char* have;          /* cached_cap flags: txid computed yet   */
+    static unsigned long* txoff;         /* per-tx offset into the block          */
+    static unsigned long* txlen;         /* per-tx length                         */
     if (h != cached_h){
+        cached_h = -1;                   /* invalid until the walk completes */
         long blen = read_block(h); if (blen < 81) return 0;
-        const u8* p = g_blockbuf + 80; const u8* end = g_blockbuf + blen; uint64_t cc;
+        const u8* blk = g_blockbuf;
+        const u8* p = blk + 80; const u8* end = blk + blen; uint64_t cc;
         uint64_t ntx = txi_rd_varint(p, end, &cc); if (!cc) return 0; p += cc;
-        if ((long)ntx > cached_cap){ cached_cap = (long)ntx + 64; cached = realloc(cached, (size_t)cached_cap * 32); if (!cached) return 0; }
-        static u8 scratch[4u << 20];
+        if ((long)ntx > cached_cap){
+            long cap = (long)ntx + 64;
+            unsigned char* c1 = realloc(cached, (size_t)cap * 32); if (!c1) return 0; cached = c1;
+            unsigned char* h1 = realloc(have, (size_t)cap);        if (!h1) return 0; have = h1;
+            unsigned long* o1 = realloc(txoff, (size_t)cap * sizeof *txoff); if (!o1) return 0; txoff = o1;
+            unsigned long* l1 = realloc(txlen, (size_t)cap * sizeof *txlen); if (!l1) return 0; txlen = l1;
+            cached_cap = cap;
+        }
         cached_n = 0;
         for (uint64_t t = 0; t < ntx; t++){
             const u8* s0 = p;
@@ -4462,18 +4516,28 @@ static int axr_txid_at(long h, long txpos, unsigned char out[32]){
             if (sw){ for (uint64_t i = 0; i < nin; i++){ uint64_t items = txi_rd_varint(p, end, &cc); if (!cc) return 0; p += cc; for (uint64_t k = 0; k < items; k++){ uint64_t il = txi_rd_varint(p, end, &cc); if (!cc) return 0; p += cc + il; if (p > end) return 0; } } }
             if (p + 4 > end) return 0;
             p += 4;
-            if (tx_txid(cached + (size_t)cached_n * 32, s0, (unsigned long)(p - s0), scratch, sizeof scratch) != 1) return 0;
+            txoff[cached_n] = (unsigned long)(s0 - blk);
+            txlen[cached_n] = (unsigned long)(p - s0);
             cached_n++;
         }
+        memset(have, 0, (size_t)cached_n);
         cached_h = h;
     }
     if (txpos < 0 || txpos >= cached_n) return 0;
+    if (!have[txpos]){
+        static u8 scratch[4u << 20];
+        /* the extents are this block's; make sure the shared buffer still is */
+        if (g_blockbuf_h != h && read_block(h) < 81) return 0;
+        if (tx_txid(cached + (size_t)txpos * 32, g_blockbuf + txoff[txpos], txlen[txpos], scratch, sizeof scratch) != 1) return 0;
+        have[txpos] = 1;
+    }
     memcpy(out, cached + (size_t)txpos * 32, 32);
     return 1;
 }
 /* runs + journal for one key. txid_cap 0 = counts only. -1 on a read failure */
 static long axr_read(int type, const unsigned char key[32], axr_acc* a, unsigned char* txids, long txid_cap){
     memset(a, 0, sizeof *a); a->txids = txids; a->cap = txid_cap;
+    if (txid_cap > 0) axr_txid_reset();
     const ah_event* ev = 0; long n = ah_lookup((uint8_t)type, key, &ev);
     long runs_to = ah_to_height();
     for (long i = 0; i < n; i++){
@@ -4481,7 +4545,15 @@ static long axr_read(int type, const unsigned char key[32], axr_acc* a, unsigned
         if (e.kind == AH_FUND){ a->bal_fund += e.value; a->nfund++; } else { a->bal_spend += e.value; a->nspend++; }
         if (txid_cap > 0 && a->ntxid < txid_cap){ unsigned char t[32]; if (axr_txid_at((long)e.height, (long)e.txpos, t)) axr_txid_push(a, t); }
     }
-    if (axt_read_events(type, key, runs_to, axr_tail_cb, a) < 0 && n < 0) return -1;
+    /* A journal read failure must NEVER be swallowed. This used to be
+     * `... < 0 && n < 0`, so whenever the history runs had anything at all the
+     * journal's error was discarded and the answer was computed from the runs
+     * alone -- a confidently wrong balance, with no error and nothing logged.
+     * That is exactly how the pread() truncation below went unseen: once the
+     * journal passed 2 GB every query silently ignored up to a full run
+     * interval of address activity. A failure here is an error to the caller. */
+    if (axt_read_events(type, key, runs_to, axr_tail_cb, a) < 0) return -1;
+    if (n < 0) return -1;
     return a->ntxid;
 }
 
