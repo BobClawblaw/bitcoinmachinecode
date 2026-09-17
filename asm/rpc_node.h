@@ -491,6 +491,12 @@ typedef struct {
        scan of the node array, so asking it n times is O(n^2). Returns the
        count written, or -1 to say "fall back to the per-txid call". */
     long (*pol_entry_info_all)(void*, struct mp_entry_info*, unsigned char (*)[32], unsigned);
+    /* fee/size/sigop_cost/depends/anc for MANY txids in one call -- the fields
+       a block template reads, without entry_info's unused spentby scan and
+       descendant walk. out[]/found[] are sized by the query count, not the
+       registry. NULL = fall back to the per-txid call. */
+    long (*pol_pkg_many)(void*, const unsigned char (*)[32], unsigned,
+                         struct mp_entry_info*, unsigned char*);
     /* every entry's fee and vsize summed in ONE pass. pol_entry is a linear
        scan, so getmempoolinfo calling it per slot was O(n^2). NULL = fall back
        to that per-slot loop (test rules that do not link the policy module). */
