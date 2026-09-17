@@ -607,7 +607,25 @@ static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
     return reply;
 }
 
-static void handle_request(int cfd, const char* body, size_t blen) {
+/* Build the complete HTTP response for one request into a malloc'd buffer
+ * (headers AND body, one allocation) and hand it back; the CALLER writes it.
+ *
+ * It used to take the client fd and write the reply itself -- while holding
+ * g_exec_lock, because both call sites wrap it in that lock. Execution is
+ * deliberately serial here (the wallet and chain handlers are not
+ * concurrent-safe), so every byte of that socket write was time no other RPC
+ * could run. A reply is routinely megabytes (getblock verbosity 2,
+ * getaddresstxids at its cap is ~6.6 MB), and a client that simply stops
+ * reading applies TCP backpressure until the 30 s SO_SNDTIMEO fires -- so one
+ * slow or malicious authenticated client could hold the single execution lock
+ * for 30 seconds at a time and stall every other caller, including the
+ * monitoring that would have shown it.
+ *
+ * Rendering needs the lock; writing to a socket does not. Separating them
+ * takes network I/O out of the critical section entirely, and the serial
+ * execution contract is untouched. */
+static char* render_request(const char* body, size_t blen, size_t* outlen) {
+    *outlen = 0;
     rj_val* req = rj_parse(body, blen);
     int status = HTTP_OK;
     int is_v2_notification = 0;
@@ -708,26 +726,29 @@ static void handle_request(int cfd, const char* body, size_t blen) {
         "Connection: close\r\n"
         "\r\n",
         status, status_text(status), bodylen);
-    if (write_all(cfd, hdr, (size_t)hl) != 0) {
-        /* RPC-1 (audit 2026-09-03): this used to `return` -- leaking BOTH the
-         * client descriptor and respbody, which for getblock verbosity 2 is
-         * many megabytes. Every other exit in this function frees and closes.
-         *
-         * Reachable by any authenticated client: send a request and reset the
-         * connection, or simply never read a large reply so the 30s
-         * SO_SNDTIMEO fires. Loop that and the process runs out of
-         * descriptors -- at which point the RPC listener AND the P2P inbound
-         * listener in the same process both stop accepting. */
-        free(respbody);
-        close(cfd);
-        return;
-    }
-    for (long off = 0; respbody && off < bodylen; ) {   /* full write, handles short writes */
-        ssize_t wr = write(cfd, respbody + off, (size_t)(bodylen - off));
-        if (wr <= 0) break;
-        off += wr;
-    }
+    /* One buffer, headers then body: the caller writes it after releasing the
+     * execution lock. (A 204 has no body at all -- respbody is NULL and
+     * bodylen 0 -- so the response ends at the header terminator, which
+     * test_rpc_server asserts.) */
+    char* out = malloc((size_t)hl + (size_t)bodylen + 1);
+    if (!out){ free(respbody); return NULL; }
+    memcpy(out, hdr, (size_t)hl);
+    if (respbody && bodylen > 0) memcpy(out + hl, respbody, (size_t)bodylen);
     free(respbody);
+    *outlen = (size_t)hl + (size_t)(bodylen > 0 ? bodylen : 0);
+    out[*outlen] = 0;
+    return out;
+}
+
+/* Write a rendered response and close. Called with NO lock held, so a slow
+ * reader costs only its own connection. */
+static void send_response(int cfd, char* resp, size_t len) {
+    for (size_t off = 0; resp && off < len; ) {
+        ssize_t wr = write(cfd, resp + off, len - off);
+        if (wr <= 0) break;                 /* client gone or timed out: drop it */
+        off += (size_t)wr;
+    }
+    free(resp);
     close(cfd);
 }
 
@@ -863,8 +884,10 @@ static void* lp_waiter(void* arg){
         }
     }
     exec_lock();
-    handle_request(r->cfd, r->buf + r->body_off, r->blen);
+    size_t lp_len = 0;
+    char* lp_resp = render_request(r->buf + r->body_off, r->blen, &lp_len);
     pthread_mutex_unlock(&g_exec_lock);
+    send_response(r->cfd, lp_resp, lp_len);        /* socket write, lock released */
     free(r->buf); free(r);
     lp_waiters_release();                          /* RPC-5 */
     return NULL;
@@ -1032,8 +1055,10 @@ static void service_conn(int cfd) {
           }
       } }
     exec_lock();
-    handle_request(cfd, body, blen);
+    size_t resplen = 0;
+    char* resp = render_request(body, blen, &resplen);
     pthread_mutex_unlock(&g_exec_lock);
+    send_response(cfd, resp, resplen);             /* socket write, lock released */
     free(buf);
 }
 
