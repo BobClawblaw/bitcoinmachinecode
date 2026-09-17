@@ -6010,6 +6010,7 @@ static void dl_publish_peer_table(void* store_buf, int with_tip){
                     }
                 }
             } }
+}
 /* 2026-09-17: the liveness check the ROTATION has always done, moved into the
  * sweep as well. The rotation is the only place that noticed a peer's hangup,
  * and the rotation does not run while the parallel downloader owns the loop
