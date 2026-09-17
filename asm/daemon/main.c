@@ -5904,6 +5904,106 @@ static void leg_pass_stop_all(void){
  * unserved for the whole download -- no pongs, no relay, no announcements
  * -- and the rotation came back to legs that had given up on us. Core keeps
  * serving its peers while it fetches a branch. except = -1 sweeps all. */
+/* Publish the leg peer table the RPC thread reads: live slots with their
+ * kernel byte/last-activity meters, dead slots retired.
+ *
+ * 2026-09-16: this was inline in serve_download_worker's for(;;) loop and
+ * nowhere else, so it did not run during initial block download -- the node
+ * is in dl_catchup's loop then. Everything getpeerinfo says about a RELAY LEG
+ * therefore froze at the moment catch-up began, for the whole sync. Measured
+ * on run 26: getpeerinfo reported 1,412 bytes and 54 minutes of silence for a
+ * socket the kernel showed at 391,956 bytes received and 9.6 SECONDS since the
+ * last send. Closed legs were worse: their slots were never retired, so three
+ * peers that had gone away minutes after boot were still listed an hour later,
+ * which is what a monitor correctly drew as dead peers.
+ *
+ * (The download workers' own peers never had this problem: dl_catchup
+ * publishes those into g_status->dlpeers itself. Only the legs were orphaned.)
+ *
+ * Now one function, called from both loops. The TCP_INFO read is one getsockopt
+ * per live leg -- there are at most a handful -- so it is cheap enough for the
+ * catch-up loop, which already sweeps the same legs for pings. */
+static void dl_publish_peer_table(void* store_buf, int with_tip){
+        if(g_node_status){ int lp=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) lp++;
+            g_node_status->n_out = lp;
+            /* The TIP is deliberately NOT published here. This function is
+             * shared with dl_catchup's loop, and the connected tip during a
+             * catch-up is that loop's own business -- publishing it from here
+             * changed what test_dlc_interleave measures (it caught this: "the
+             * connected tip at the gate is within a chunk of the archive tip"
+             * failed with lag 62). The peer table is the only thing both loops
+             * need in common. */
+            if(with_tip){ g_node_status->tip_height = node_public_tip(store_buf); dl_publish_connected_tip(); }
+            long long nows = (long long)time(NULL);
+            for(int i=0;i<RPC_MAX_PEERS;i++){
+                if(i >= MUX_MAX_OUT) continue;                      /* inbound children own 64..127 */
+                if(!(i < mux_n_out && mux_out_fd[i] >= 0)){ g_node_status->peers[i].used = 0; continue; }
+                /* per-socket byte + last-activity meters from the kernel: no
+                 * asm changes, no double counting -- TCP_INFO is authoritative
+                 * (getpeerinfo bytessent/bytesrecv/lastsend/lastrecv). The
+                 * kernel struct is read by offset into a local mirror of its
+                 * stable uapi layout, so this does not depend on the glibc
+                 * header's tcp_info version (older ones lack the byte fields). */
+                struct bmc_tcp_info {
+                    unsigned char  _s[7];                 /* state..wscale/flags */
+                    unsigned int   rto, ato, snd_mss, rcv_mss;
+                    unsigned int   unacked, sacked, lost, retrans, fackets;
+                    unsigned int   last_data_sent, last_ack_sent, last_data_recv, last_ack_recv;
+                    unsigned int   pmtu, rcv_ssthresh, rtt, rttvar, snd_ssthresh, snd_cwnd, advmss, reordering;
+                    unsigned int   rcv_rtt, rcv_space, total_retrans;
+                    unsigned long long pacing_rate, max_pacing_rate, bytes_acked, bytes_received;
+                } ti;
+                socklen_t tl = sizeof ti;
+                /* TCP_INFO is also the liveness test. mux_out_fd[i] >= 0 only
+                 * means the slot holds a descriptor NUMBER: a leg whose socket
+                 * went away by a path that did not reset the slot leaves a
+                 * stale number behind, and trusting it is how run 26 listed
+                 * five peers that had no socket in any state (2026-09-16).
+                 * getsockopt on a closed or non-socket fd fails; that is the
+                 * signal to retire the slot rather than publish a ghost. */
+                if(getsockopt(mux_out_fd[i], IPPROTO_TCP, TCP_INFO, &ti, &tl) != 0){
+                    g_node_status->peers[i].used = 0;
+                    continue;
+                }
+                /* ...and the descriptor must still be THIS peer's socket. A
+                 * closed leg leaves its number behind, and the kernel hands
+                 * that number to the next socket opened -- a download worker's
+                 * connection, a pipe. TCP_INFO then succeeds on an unrelated
+                 * socket and the slot publishes a stale ADDRESS with somebody
+                 * else's live byte counts. Caught on run 26 (2026-09-17): one
+                 * entry that no socket in any state matched, surviving every
+                 * republish because its fd was perfectly valid. getpeername is
+                 * the only thing that ties the number back to the address. */
+                { struct sockaddr_storage sa; socklen_t sl = sizeof sa;
+                  char host[64] = {0};
+                  if(getpeername(mux_out_fd[i], (struct sockaddr*)&sa, &sl) != 0){
+                      g_node_status->peers[i].used = 0; continue; }
+                  if(sa.ss_family == AF_INET)
+                      inet_ntop(AF_INET, &((struct sockaddr_in*)&sa)->sin_addr, host, sizeof host);
+                  else if(sa.ss_family == AF_INET6)
+                      inet_ntop(AF_INET6, &((struct sockaddr_in6*)&sa)->sin6_addr, host, sizeof host);
+                  /* mux_out_host[i] is the dialled host; compare on the address
+                   * part only (onion/i2p legs have no numeric peer name and are
+                   * left alone rather than wrongly retired). */
+                  if(host[0] && strchr(mux_out_host[i], '.') != NULL
+                     && strncmp(host, mux_out_host[i], strlen(host)) != 0){
+                      g_node_status->peers[i].used = 0; continue;
+                  } }
+                {
+                    rpc_peer_t* pr = &g_node_status->peers[i];
+                    /* byte fields only if the kernel returned a struct large
+                     * enough to include them */
+                    if(tl >= (socklen_t)((char*)(&ti.bytes_received + 1) - (char*)&ti)){
+                        pr->bytes_sent = (long long)ti.bytes_acked;
+                        pr->bytes_recv = (long long)ti.bytes_received;
+                    }
+                    if(tl >= (socklen_t)((char*)(&ti.last_data_recv + 1) - (char*)&ti)){
+                        pr->last_send = nows - (long long)(ti.last_data_sent / 1000);
+                        pr->last_recv = nows - (long long)(ti.last_data_recv / 1000);
+                    }
+                }
+            } }
+}
 static void legs_sweep_except(int except){
     long long nowsec = (long long)time(NULL);
     for(int k = 0; k < mux_n_out; k++){
@@ -6253,6 +6353,7 @@ static long dl_catchup(const char* dir, int min_workers){
         if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);   /* before a connect call that may run for seconds */
         dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms(), live, nlive, banned);   /* Core's rule, every pass (2026-09-10) */
         legs_sweep_except(-1);                                                            /* row 3: the legs stay served through a handoff */
+        dl_publish_peer_table(store_buf, 0);   /* legs only: the tip is this loop's own business */
         if(interleave && dlc_now_ms() >= connect_retry_ms){
             /* (store_reload is the bounded call's first act, so it sees the
              * helpers' appends; a second one here would be redundant.) */
@@ -7766,44 +7867,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     int apply_first_prev = 0;
     long long dl_parallel_last_s = 0;
     for(;;){
-        /* publish outbound peer count + tip + peer table for the RPC thread */
-        if(g_node_status){ int lp=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) lp++;
-            g_node_status->n_out = lp; g_node_status->tip_height = node_public_tip(store_buf);   /* 3.1: the CONNECTED tip */
-            dl_publish_connected_tip();
-            long long nows = (long long)time(NULL);
-            for(int i=0;i<RPC_MAX_PEERS;i++){
-                if(i >= MUX_MAX_OUT) continue;                      /* inbound children own 64..127 */
-                if(!(i < mux_n_out && mux_out_fd[i] >= 0)){ g_node_status->peers[i].used = 0; continue; }
-                /* per-socket byte + last-activity meters from the kernel: no
-                 * asm changes, no double counting -- TCP_INFO is authoritative
-                 * (getpeerinfo bytessent/bytesrecv/lastsend/lastrecv). The
-                 * kernel struct is read by offset into a local mirror of its
-                 * stable uapi layout, so this does not depend on the glibc
-                 * header's tcp_info version (older ones lack the byte fields). */
-                struct bmc_tcp_info {
-                    unsigned char  _s[7];                 /* state..wscale/flags */
-                    unsigned int   rto, ato, snd_mss, rcv_mss;
-                    unsigned int   unacked, sacked, lost, retrans, fackets;
-                    unsigned int   last_data_sent, last_ack_sent, last_data_recv, last_ack_recv;
-                    unsigned int   pmtu, rcv_ssthresh, rtt, rttvar, snd_ssthresh, snd_cwnd, advmss, reordering;
-                    unsigned int   rcv_rtt, rcv_space, total_retrans;
-                    unsigned long long pacing_rate, max_pacing_rate, bytes_acked, bytes_received;
-                } ti;
-                socklen_t tl = sizeof ti;
-                if(getsockopt(mux_out_fd[i], IPPROTO_TCP, TCP_INFO, &ti, &tl) == 0){
-                    rpc_peer_t* pr = &g_node_status->peers[i];
-                    /* byte fields only if the kernel returned a struct large
-                     * enough to include them */
-                    if(tl >= (socklen_t)((char*)(&ti.bytes_received + 1) - (char*)&ti)){
-                        pr->bytes_sent = (long long)ti.bytes_acked;
-                        pr->bytes_recv = (long long)ti.bytes_received;
-                    }
-                    if(tl >= (socklen_t)((char*)(&ti.last_data_recv + 1) - (char*)&ti)){
-                        pr->last_send = nows - (long long)(ti.last_data_sent / 1000);
-                        pr->last_recv = nows - (long long)(ti.last_data_recv / 1000);
-                    }
-                }
-            } }
+        dl_publish_peer_table(store_buf, 1);   /* the peer table the RPC reads (2026-09-16: shared with dl_catchup) */
         /* peer control: one command per ack, executed HERE because this is the
          * process that holds the legs. Every branch reports what it actually
          * did -- 1 done, 0 no-op/not-found -- so the parent can map a no-op to
