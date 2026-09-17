@@ -10383,6 +10383,10 @@ int main(int argc, char** argv){
       if(g_cfg.debuglogfile[0])
           snprintf(g_logpath, sizeof g_logpath, "%s",
                    !strcmp(g_cfg.debuglogfile, "0") ? "/dev/null" : g_cfg.debuglogfile);
+      /* getrpcinfo reports this path; rpc_commands.o has no way to know it
+       * (and links into targets with no daemon), so push it across here --
+       * the same seam as wallet_pass_set_file() below. */
+      rpc_set_logpath(g_logpath);
       node_config_log();
       /* Join the config to the passphrase module HERE. Neither side may
        * reference the other: node_config.o is linked into targets with no

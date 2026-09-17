@@ -4965,6 +4965,13 @@ static int cmd_help(const rj_val* params, long* ec, const char** em, rj_val** re
     return 1;
 }
 
+/* The daemon's resolved debug-log name, pushed across by main.c (see
+ * rpc_set_logpath in rpc_commands.h). Empty until then. */
+static char g_rpc_logpath[512];
+void rpc_set_logpath(const char* p){
+    snprintf(g_rpc_logpath, sizeof g_rpc_logpath, "%s", p && *p ? p : "");
+}
+
 /* getrpcinfo -- Core reports the commands currently executing and the log
  * path. This node's RPC server accepts and services ONE connection at a time
  * on a single thread (rpc_server.c), so at the moment getrpcinfo runs it is
@@ -4978,15 +4985,26 @@ static int cmd_getrpcinfo(rj_val** result){
     rj_arr_push(cmds, c);
     rj_val* o = rj_obj();
     rj_obj_set(o, "active_commands", cmds);
-    /* The daemon opens its log as the bare relative name "bitcoind.log" from
-     * the datadir it runs in (daemon/main.c), so resolving it against the
-     * cwd is the real path, not a guess. */
-    { char cwd[1024];
-      if (getcwd(cwd, sizeof cwd)){
-          char path[1200];
-          snprintf(path, sizeof path, "%s/bitcoind.log", cwd);
-          rj_obj_set(o, "logpath", rj_str(path));
-      } }
+    /* The log's NAME is the daemon's to know: it defaults to "debug.log"
+     * (Core's -debuglogfile default, since 2026-09-06 -- it was
+     * logs/bitcoind.log before that) and -debuglogfile= overrides it, with
+     * "0" meaning /dev/null. Hardcoding "bitcoind.log" here reported a file
+     * that had not existed for eleven days and ignored the override
+     * entirely. main.c pushes the resolved name across with
+     * rpc_set_logpath(); if nobody did (a tool linking rpc_commands.o
+     * without the daemon), fall back to the documented default rather than
+     * omitting the field. An absolute path is reported as-is; a relative one
+     * is resolved against the cwd, which is the chain directory the daemon
+     * chdir()s into. */
+    { const char* name = g_rpc_logpath[0] ? g_rpc_logpath : "debug.log";
+      if (name[0] == '/') rj_obj_set(o, "logpath", rj_str(name));
+      else { char cwd[1024];
+             if (getcwd(cwd, sizeof cwd)){
+                 char path[1600];
+                 snprintf(path, sizeof path, "%s/%s", cwd, name);
+                 rj_obj_set(o, "logpath", rj_str(path));
+             } }
+    }
     *result = o;
     return 1;
 }

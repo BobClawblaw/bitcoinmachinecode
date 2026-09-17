@@ -533,8 +533,19 @@ parity docs. Real tooling batches: electrs, python-bitcoinrpc's `batch_`.)*
 `active_commands` is a one-element array naming `getrpcinfo` itself. That is
 not a simplification: the RPC server accepts and services one connection at a
 time on a single thread, so while `getrpcinfo` runs it is necessarily the
-only active command. `logpath` resolves the bare `bitcoind.log` the daemon
-opens against the datadir it runs in, so it is the real path.
+only active command. `logpath` is the name the daemon actually opened its
+debug log as, resolved against the chain directory it `chdir()`s into:
+`debug.log` by default (Core's `DEFAULT_DEBUGLOGFILE`), or whatever
+`-debuglogfile=` set, reported as-is when that is an absolute path — which
+includes `-debuglogfile=0`, where the daemon opens `/dev/null`.
+
+Until 2026-09-17 this field was the string `bitcoind.log` hardcoded in
+`rpc_commands.c`, a name the daemon stopped using on 2026-09-06 when the
+default became Core's; it named a file that did not exist and ignored
+`-debuglogfile=` entirely. `rpc_commands.o` links into targets that have no
+daemon, so `main.c` pushes the resolved name across with `rpc_set_logpath()`
+— the same seam as `wallet_pass_set_file()` — rather than either side
+referencing the other.
 
 ### `logging` reports this node's kinds, and refuses to pretend they toggle
 `node_log.asm` emits eight fixed kinds — INFO, HSHK, HDRS, BLOCK, CONS,
