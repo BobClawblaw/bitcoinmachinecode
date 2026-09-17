@@ -2406,3 +2406,53 @@ watch loop is meant to survive a transient read failure), with its `sudo dd
 if=/proc/<pid>/mem` root-read of live process memory stated at the top rather
 than discovered at the sudo prompt; `signer_core_diff.sh`'s `rm -rf $TMP` is
 quoted.
+
+## Update 2026-09-17 — leg churn: the nine-an-hour figure was nine restarts
+
+The entry above ("Outbound leg slots churn about nine times an hour and almost
+no departure is logged") counted 42 handshakes and read them as one boot's
+worth of churn. They are not. `/home/xian/bmc-run26/main/debug.log` holds
+**nine `[boot] logging to` lines** between 21:10Z and 00:04Z — another session
+was redeploying the bench binary — and the 42 handshakes are those nine boots'
+initial fills:
+
+```
+boot      1  2  3  4  5  6  7  8  9
+filled    5  3  4  3  3  5  7  6  6   = 42
+peers= at 5  3  4  3  3  5  7  6  --   (the [dl] shutting down line)
+```
+
+Each boot's fill count equals the leg count at its shutdown, so **36 of the 42
+departures were the worker exiting** — which logged nothing per leg, and is now
+logged as `closed ours/shutdown after <age>s`. Within a boot the log carried
+one `theirs (revents 0x2001)`, two `ours/ping-timeout`, and one background
+re-dial. The re-dials-per-slot table was slot *numbering* repeating across
+boots, not a slot changing hands.
+
+**What IS real, and was invisible in the log and in the counts.** On the ninth
+boot, six legs were filled at 00:04:59Z. At 00:30Z the worker still held six
+leg fds, but `ss` showed only ONE of them as an established connection: fds 49,
+70 and 76 were sockets the kernel had already torn down, held as live for up to
+24 minutes, and two more had just hit the 20-minute ping timeout. The
+`[dl] shutting down ... peers=N` count and `legs_live()` both count *held fds*,
+so a dead socket counts as a live leg — which is why the earlier reading of
+"legs alive: 4" agreed with a log that said nothing.
+
+The cause is placement, not policy: the POLLRDHUP/POLLHUP liveness check lived
+only in the rotation, and **the rotation does not run while the parallel
+downloader owns the loop** — hours on a mid-sync node. The only thing running
+in that window is `legs_sweep_except`, which pinged and relayed but never asked
+whether the socket was still there. The check now runs in the sweep too
+(`leg_check_gone`), so a hangup is named within seconds of the FIN instead of
+waiting 20 minutes for a ping timeout or the end of the download.
+
+**Still open after this:** the slot is *closed* in the sweep but not re-dialled
+until the rotation resumes, because the sweep has no peer pool in scope. On a
+long parallel download the slot therefore stays empty — logged now, rather than
+occupied by a corpse.
+
+**Not done, deliberately:** no throughput rule of any kind. A relay leg at
+0 B/s beside a download peer at 11 MB/s is a healthy relay leg; the 32 KB/s
+eviction floor that killed early-chain peers for four benchmark runs stays
+dead, and `tests/test_leg_close_labels` fails if a byte-rate test appears in
+the liveness path.

@@ -3492,7 +3492,14 @@ static int legs_on_net(int net){ int n = 0; for(int k = 0; k < mux_n_out; k++) i
 static int legs_anon(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && leg_is_anon_net(leg_net_of(mux_out_host[k]))) n++; return n; }
 
 static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port){
-    if(mux_out_fd[i]>=0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i]=-1; }
+    /* 2026-09-17: this used to drop a LIVE leg silently -- the slot changed
+     * hands and the log said nothing, so the departure had no owner. Every
+     * caller that already named its reason has closed the leg before it gets
+     * here (mux_out_fd < 0), so this line only ever fires for a path that
+     * forgot to: it names itself rather than vanishing. */
+    if(mux_out_fd[i]>=0) leg_close_ours(i, "redial-unlabelled", "the slot was rotated to the next pool peer without a named reason");
+    /* leg_close_ours closed it. (It declines only inside a pass child, and a
+     * pass child never rotates a slot -- the parent replays from the report.) */
     /* setnetworkactive false: leave the slot dead rather than re-dialing.
      * This is the ONE place outbound legs are established, so gating here
      * gates every reconnect -- a toggle that only dropped the current legs
@@ -3570,8 +3577,8 @@ static long do_outbound_sync_bounded(int i, const char* peers[], int pool_len, i
          * syncing on it -- drop and re-dial a rotated seed. do_outbound_sync
          * already re-anchored the locator at the (possibly advanced) stored
          * tip, so the next pass continues exactly where this one stopped. */
-        fprintf(stderr,"[mux:%d] %s sync exceeded %gs budget; re-dialing\n",
-                i, mux_out_fd[i]>=0?mux_out_host[i]:"?", MUX_SYNC_BUDGET_SECS);
+        { char d[96]; snprintf(d, sizeof d, "the inline pass exceeded the %gs serve budget; the socket may hold a partial frame", MUX_SYNC_BUDGET_SECS);
+          leg_close_ours(i, "sync-budget", d); }
         mux_next_peer(i, peers, pool_len, out_port);
     }
     return n;
@@ -6003,11 +6010,33 @@ static void dl_publish_peer_table(void* store_buf, int with_tip){
                     }
                 }
             } }
+/* 2026-09-17: the liveness check the ROTATION has always done, moved into the
+ * sweep as well. The rotation is the only place that noticed a peer's hangup,
+ * and the rotation does not run while the parallel downloader owns the loop
+ * (hours on a mid-sync node): measured on run 26, three of six legs had dead
+ * sockets the worker still held as live, one for 24 minutes, with nothing in
+ * the log. The sweep runs throughout the download, so the same POLLRDHUP/
+ * POLLHUP test here names the departure within seconds of the FIN.
+ *
+ * This is a LIVENESS rule and nothing else: it fires only on a socket the
+ * kernel says is gone. It is deliberately NOT a throughput rule -- an
+ * absolute 32 KB/s eviction floor killed healthy early-chain peers for four
+ * benchmark runs (docs/FEATURE_GAPS.md, the thresholds entry), and a relay
+ * leg legitimately carries ~0 B/s next to a download peer. */
+static int leg_check_gone(int k){
+    short revents = 0;
+    if(!leg_peer_hung_up(mux_out_fd[k], &revents)) return 0;
+    char how[40]; snprintf(how, sizeof how, "revents 0x%x", (unsigned)revents);
+    char unread[200]; leg_drain_unread(mux_out_fd[k], unread, sizeof unread);
+    leg_close_theirs(k, how, unread);                    /* closes the fd and arms the re-dial */
+    if(ctl_dial_listed(mux_out_host[k])) ctl_dial_report(mux_out_host[k], 0, (long long)time(NULL));
+    return 1;
 }
 static void legs_sweep_except(int except){
     long long nowsec = (long long)time(NULL);
     for(int k = 0; k < mux_n_out; k++){
         if(k == except || mux_out_fd[k] < 0 || leg_pass_busy(k)) continue;   /* a pass helper owns that socket */
+        if(leg_check_gone(k)) continue;
         if(mux_out_kind[k] != LEG_BLOCK_ONLY && txsub_worker_ready()){ extern long txrelay_poll_leg(int, void*, int); (void)txrelay_poll_leg(mux_out_fd[k], txsub_pool(), 0); }
         else if(mux_out_kind[k] == LEG_BLOCK_ONLY){ extern long txrelay_poll_block_only_leg(int); (void)txrelay_poll_block_only_leg(mux_out_fd[k]); }
         if(!mux_out_good[k] && mux_out_since[k] && nowsec - mux_out_since[k] >= DM_GOOD_S){ mux_out_good[k] = 1; if(g_dialmem) dialmem_note_success(g_dialmem, mux_out_host[k]); }
@@ -6017,7 +6046,7 @@ static void legs_sweep_except(int except){
      * helper had taken the socket; with a v2 session the parent's stale cipher
      * made that ping garbage and the peer hung up ("EOF on the first read" on
      * four legs in a minute). Nothing touches a busy leg. */
-    if(except >= 0 && except < mux_n_out && mux_out_fd[except] >= 0 && !leg_pass_busy(except)) leg_ping_tick(except, nowsec);
+    if(except >= 0 && except < mux_n_out && mux_out_fd[except] >= 0 && !leg_pass_busy(except) && !leg_check_gone(except)) leg_ping_tick(except, nowsec);
 }
 /* ---- Core's stall rule (2026-09-10) ----------------------------------------
  * The one judge of slowness in Core's downloader: when the window is full
@@ -7903,9 +7932,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 if(!num){
                     /* Core drops every connection when the network goes down;
                      * anything less would leave the node still talking. */
+                    int dropped = 0;
                     for(int i = 0; i < mux_n_out; i++)
-                        if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
-                    fprintf(stderr,"[ctl] network DISABLED: dropped all outbound legs\n");
+                        if(mux_out_fd[i] >= 0){ leg_close_ours(i, "setnetworkactive-false", "the operator took the network down"); dropped++; }
+                    fprintf(stderr,"[ctl] network DISABLED: dropped all %d outbound leg(s)\n", dropped);
                 } else {
                     fprintf(stderr,"[ctl] network enabled\n");
                 }
@@ -7960,9 +7990,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                 (long long)q->nodeid, i);
                         q->used = 0; break;
                     }
-                    fprintf(stderr,"[ctl] disconnecting %s (nodeid %lld, leg %d)\n",
-                            mux_out_host[i], (long long)q->nodeid, i);
-                    bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1;
+                    { char d[80]; snprintf(d, sizeof d, "disconnectnode, nodeid %lld", (long long)q->nodeid);
+                      leg_close_ours(i, "rpc-disconnectnode", d); }
                     q->used = 0;
                     result = 1; break;
                 }
@@ -8060,8 +8089,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                 if(mux_out_fd[i] < 0) continue;
                                 char ip[128]; ctl_ip_only(mux_out_host[i], ip, sizeof ip);
                                 if(ctl_ban_covers(arg, ip)){
-                                    fprintf(stderr,"[ctl] ban %s drops live leg %s\n", arg, mux_out_host[i]);
-                                    bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1;
+                                    char d[96]; snprintf(d, sizeof d, "setban %s now covers this address", arg);
+                                    leg_close_ours(i, "banned", d);
                                     g_node_status->peers[i].used = 0;
                                 }
                             }
@@ -8446,6 +8475,16 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             int announced_now = 0;
             { int a = leg_announced_pick(-1); if(a >= 0){ announced_now = 1; if(a != i){ i = a; n_--; } } }
             if(g_shutdown_requested){
+                /* 2026-09-17: a restart is a DEPARTURE for every live leg, and
+                 * it was the one path that named nobody -- run 26's log showed
+                 * 42 handshakes across nine boots and 3 logged closes, which
+                 * reads as churn until the boots are counted. Each leg says
+                 * goodbye with its age, so a re-dial after a restart is never
+                 * mistaken for a leg that dropped. */
+                for(int k = 0; k < mux_n_out; k++)
+                    if(mux_out_fd[k] >= 0)
+                        fprintf(stderr,"[dl:%d] %s connection closed ours/shutdown after %llds -- the worker is stopping\n",
+                                k, mux_out_host[k][0] ? mux_out_host[k] : "?", leg_age_s(k));
                 /* CC-4: remember the live block-relay-only legs for the next start */
                 const char* bo[MAX_BLOCK_RELAY_ONLY]; int nb = 0;
                 for(int k = 0; k < mux_n_out && nb < MAX_BLOCK_RELAY_ONLY; k++) if(mux_out_fd[k] >= 0 && mux_out_kind[k] == LEG_BLOCK_ONLY) bo[nb++] = mux_out_host[k];
@@ -8467,20 +8506,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * POLLNVAL pattern (see the accept loop above), mirrored here so
              * the download worker's peer drops are equally visible/handled. */
             if(leg_pass_busy(i)) continue;                     /* row 1: the helper owns the socket until it reports */
-            struct pollfd pf = { mux_out_fd[i], POLLIN, 0 };
-            if(leg_peer_hung_up(mux_out_fd[i], &pf.revents)){
-                /* 2026-09-09: the peer's doing (every close of ours is labelled
-                 * before it reaches here). Read what it left in the socket --
-                 * its last words, if any -- and remember the address: an
-                 * inbound-full node evicting its newest peer, or a listener
-                 * that hangs up after a minute, is not worth the next dial. */
-                char unread[200]; leg_drain_unread(mux_out_fd[i], unread, sizeof unread);
-                long long age = leg_age_s(i);
-                fprintf(stderr,"[dl:%d] %s connection closed theirs (revents 0x%x) after %llds; unread: %s\n",
-                        i, mux_out_host[i], pf.revents, age, unread);
-                if(g_dialmem && age >= 0 && age <= DM_EARLY_S)
-                    dialmem_note_failure(g_dialmem, mux_out_host[i], age <= DM_REFUSED_S ? DM_REFUSED : DM_EARLY_DROP, dialmem_now());
-                if(ctl_dial_listed(mux_out_host[i])) ctl_dial_report(mux_out_host[i], 0, (long long)time(NULL));   /* addnode add: back in the queue */
+            /* 2026-09-09: the peer's doing (every close of ours is labelled
+             * before it reaches here). leg_check_gone reads what it left in
+             * the socket -- its last words, if any -- and remembers the
+             * address: an inbound-full node evicting its newest peer, or a
+             * listener that hangs up after a minute, is not worth the next
+             * dial. 2026-09-17: one implementation, shared with the sweep. */
+            if(leg_check_gone(i)){
                 mux_next_peer(i, srcpool, nsrc, out_port);
                 mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
                 continue;
@@ -9725,7 +9757,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         int fd=outbound_connect(peers[i], 300, out_port);
         if(fd<0){ fprintf(stderr,"[mux] outbound %s failed: %s\n", peers[i], dial_fail_reason()); continue; }
         strncpy(mux_out_host[mux_n_out], peers[i], 127);
-        mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd); mux_out_kind[mux_n_out] = host_is_block_only(peers[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
+        /* 2026-09-17: this was the one install path that did not call
+         * leg_note_installed, so serve_mux's boot legs had mux_out_since == 0
+         * -- every departure they ever logged said "after -1s", and their
+         * sync-fail streak and ping clock were whatever the slot held before. */
+        mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd); leg_note_installed(mux_n_out); mux_out_kind[mux_n_out] = host_is_block_only(peers[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
         mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
         mux_out_peer[mux_n_out]=i;
         anchor_locator(mux_out_loc[mux_n_out]);
@@ -10093,7 +10129,9 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
              * close and re-dial a rotated seed (D2 fix) instead of syncing on a
              * broken socket forever. */
             if(ev & (POLLHUP|POLLERR|POLLNVAL)){
-                fprintf(stderr,"[mux:%d] %s dropped (revents 0x%x); re-dialing\n", i, mux_out_host[i], ev);
+                char how[40]; snprintf(how, sizeof how, "revents 0x%x", (unsigned)ev);
+                char unread[200]; leg_drain_unread(mux_out_fd[i], unread, sizeof unread);
+                leg_close_theirs(i, how, unread);
                 mux_next_peer(i, peers, pool_len, out_port);
                 mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
                 poll_idx++;
