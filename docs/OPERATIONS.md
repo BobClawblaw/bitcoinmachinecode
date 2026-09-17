@@ -247,6 +247,22 @@ I2P destination.
   (`daemon/bmc_build_addr_hist <chaindir> [to]`, ~700 GB of temp, hours)
   still exists for a one-off rebuild; nothing on a fresh sync needs it.
   `/address/:addr/utxo` needs the txospender index too.
+
+  `getaddresstxids` takes an optional inclusive height window, following the
+  addrindex patch set's convention (Core has no address index, so that lineage
+  is the only convention there is):
+
+  ```
+  getaddresstxids {"addresses": ["bc1..."], "start": 800000, "end": 810000}
+  ```
+
+  Both bounds are optional and the bare `getaddresstxids "<addr>"` form is
+  unchanged. The window is applied before a run event's txid is resolved, and
+  resolving one costs a block read, so a windowed query reads only that range's
+  blocks. Without a window the reply is capped at 100,000 txids — page with
+  `start`/`end` rather than relying on that cap, which truncates silently.
+  `getaddressbalance` takes no window: a balance is a property of the whole
+  address, and it is summed over every event regardless.
 - **`coinstatsindex=1`** keeps the coin statistics index live (`coinstats.dat`,
   the running MuHash and totals at the applied tip) and, since 2026-09-08,
   one row per committed height in `coinstats_hist.dat` (1 KB each: the

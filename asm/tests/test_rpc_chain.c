@@ -2190,6 +2190,75 @@ int main(void){
         rj_free(r);
     }
 
+    /* ---- getaddresstxids: the height window (2026-09-17) ----------------
+     * This RPC had NO test at all, which is how three separate quadratic
+     * dedups and a silent 2 GB journal truncation all lived in it at once.
+     *
+     * The fixture is a journal (addrindex.tail), whose records carry their own
+     * txid -- enough to pin the window without needing history runs, and it
+     * exercises the same [start,end] filter the run path uses. Records are
+     * 82 bytes: op | type | hash[32] | txid[32] | vout[4] | value[8] | height[4]. */
+    { const char* ADDR = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";   /* h160 751e76e8... */
+      unsigned char h160[20]; hx(h160, "751e76e8199196d454941c45d1b3a323f1433bd6");
+      unsigned heights[3] = { 10, 20, 30 };
+      char want[3][65];
+      FILE* jf = fopen("addrindex.tail", "wb");
+      ck("address journal fixture created", jf != NULL);
+      for (int i = 0; i < 3 && jf; i++){
+          unsigned char r[82]; memset(r, 0, sizeof r);
+          r[0] = 1;                                  /* AXF_OP_ADD   */
+          r[1] = 2;                                  /* AXF_P2WPKH   */
+          memcpy(r + 2, h160, 20);                   /* key (zero-padded to 32) */
+          memset(r + 34, 0, 32); r[34] = (unsigned char)(0xA0 + i);   /* a distinct txid */
+          unsigned long long v = 1000ULL * (i + 1);
+          unsigned vout = 0;
+          memcpy(r + 66, &vout, 4); memcpy(r + 70, &v, 8); memcpy(r + 78, &heights[i], 4);
+          fwrite(r, 1, sizeof r, jf);
+          tohex_rev(want[i], r + 34, 32);            /* display order, as the RPC returns it */
+      }
+      if (jf) fclose(jf);
+
+      long ec; const char* em;
+      rj_val* r = call("getaddresstxids", "[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"]", &ec, &em);
+      ck("no window: every txid (unchanged behaviour)", r && r->typ == RJ_ARR && r->nitems == 3);
+      if (r) rj_free(r);
+
+      char pj[256];
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"start\":20}]", ADDR);
+      r = call("getaddresstxids", pj, &ec, &em);
+      ck("start=20: drops the height-10 txid", r && r->typ == RJ_ARR && r->nitems == 2);
+      if (r) rj_free(r);
+
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"start\":20,\"end\":20}]", ADDR);
+      r = call("getaddresstxids", pj, &ec, &em);
+      ck("start=end=20: exactly that height's txid, and the right one",
+         r && r->typ == RJ_ARR && r->nitems == 1 && !strcmp(r->items[0]->str, want[1]));
+      if (r) rj_free(r);
+
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"end\":10}]", ADDR);
+      r = call("getaddresstxids", pj, &ec, &em);
+      ck("end=10 alone: only the first", r && r->typ == RJ_ARR && r->nitems == 1 && !strcmp(r->items[0]->str, want[0]));
+      if (r) rj_free(r);
+
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"start\":100,\"end\":200}]", ADDR);
+      r = call("getaddresstxids", pj, &ec, &em);
+      ck("a window past every event: empty, not an error", r && r->typ == RJ_ARR && r->nitems == 0);
+      if (r) rj_free(r);
+
+      /* the same address twice: one hash set spans the call, so no duplicates */
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\",\"%s\"]}]", ADDR, ADDR);
+      r = call("getaddresstxids", pj, &ec, &em);
+      ck("an address listed twice does not duplicate its txids", r && r->typ == RJ_ARR && r->nitems == 3);
+      if (r) rj_free(r);
+
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"start\":30,\"end\":20}]", ADDR);
+      expect_err("end below start is rejected", "getaddresstxids", pj, -8, "end must not be below start");
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"start\":\"x\"}]", ADDR);
+      expect_err("a non-numeric start is rejected", "getaddresstxids", pj, -3, "start must be a block height");
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"start\":-1}]", ADDR);
+      expect_err("a negative start is rejected", "getaddresstxids", pj, -8, "start must not be negative");
+      unlink("addrindex.tail"); }
+
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
 }

@@ -4428,7 +4428,8 @@ static int axr_enabled(long* ec, const char** em){
  * block -- one read per distinct height, cached across the call. */
 extern long axt_read_events(int type, const unsigned char hash[32], long min_height,
                             int (*cb)(void* ctx, int op, const unsigned char txid[32], unsigned vout, unsigned long long value, unsigned height), void* ctx);
-typedef struct { unsigned long long bal_fund, bal_spend; long nfund, nspend; unsigned char* txids; long ntxid, cap; } axr_acc;
+typedef struct { unsigned long long bal_fund, bal_spend; long nfund, nspend; unsigned char* txids; long ntxid, cap;
+                 long lo, hi;   /* txid window, inclusive; hi < 0 = open end */ } axr_acc;
 /* Deduplication used to be a linear scan of everything pushed so far, which is
  * O(n^2) in the number of distinct txids: at the AXR_TXID_CAP of 100,000 that
  * is 5e9 32-byte compares for one call. An open-addressed set keyed on the
@@ -4452,10 +4453,13 @@ static void axr_txid_push(axr_acc* a, const unsigned char txid[32]){
     a->ntxid++;
 }
 static int axr_tail_cb(void* ctx, int op, const unsigned char txid[32], unsigned vout, unsigned long long value, unsigned height){
-    axr_acc* a = ctx; (void)vout; (void)height;
-    if (op == AXF_OP_ADD){ a->bal_fund += value; a->nfund++; axr_txid_push(a, txid); }
+    axr_acc* a = ctx; (void)vout;
+    /* The balance is a property of the whole address and is always summed over
+     * everything; only the txid LIST is windowed. */
+    int in = ((long)height >= a->lo) && (a->hi < 0 || (long)height <= a->hi);
+    if (op == AXF_OP_ADD){ a->bal_fund += value; a->nfund++; if (in) axr_txid_push(a, txid); }
     else if (op == AXF_OP_DEL){ a->bal_spend += value; a->nspend++; }
-    else if (op == AXF_OP_TOUCH) axr_txid_push(a, txid);
+    else if (op == AXF_OP_TOUCH){ if (in) axr_txid_push(a, txid); }
     return 1;
 }
 /* the txid of the txpos-th transaction of block h (wire order), or 0.
@@ -4535,15 +4539,23 @@ static int axr_txid_at(long h, long txpos, unsigned char out[32]){
     return 1;
 }
 /* runs + journal for one key. txid_cap 0 = counts only. -1 on a read failure */
-static long axr_read(int type, const unsigned char key[32], axr_acc* a, unsigned char* txids, long txid_cap){
+/* runs + journal for one key, into an accumulator that may already hold txids
+ * from a previous address in the same call (ntxid_seed). [lo,hi] windows the
+ * TXID LIST only -- hi < 0 means "to the tip". Windowing before axr_txid_at is
+ * the point of it: an event outside the window costs nothing, where resolving
+ * its txid costs a block read. */
+static long axr_read(int type, const unsigned char key[32], axr_acc* a, unsigned char* txids, long txid_cap,
+                     long ntxid_seed, long lo, long hi){
     memset(a, 0, sizeof *a); a->txids = txids; a->cap = txid_cap;
-    if (txid_cap > 0) axr_txid_reset();
+    a->ntxid = ntxid_seed; a->lo = lo; a->hi = hi;
     const ah_event* ev = 0; long n = ah_lookup((uint8_t)type, key, &ev);
     long runs_to = ah_to_height();
     for (long i = 0; i < n; i++){
         ah_event e; memcpy(&e, (const unsigned char*)ev + i * AH_EVENT_BYTES, sizeof e);
         if (e.kind == AH_FUND){ a->bal_fund += e.value; a->nfund++; } else { a->bal_spend += e.value; a->nspend++; }
-        if (txid_cap > 0 && a->ntxid < txid_cap){ unsigned char t[32]; if (axr_txid_at((long)e.height, (long)e.txpos, t)) axr_txid_push(a, t); }
+        if (txid_cap > 0 && a->ntxid < txid_cap && (long)e.height >= lo && (hi < 0 || (long)e.height <= hi)){
+            unsigned char t[32]; if (axr_txid_at((long)e.height, (long)e.txpos, t)) axr_txid_push(a, t);
+        }
     }
     /* A journal read failure must NEVER be swallowed. This used to be
      * `... < 0 && n < 0`, so whenever the history runs had anything at all the
@@ -4553,7 +4565,12 @@ static long axr_read(int type, const unsigned char key[32], axr_acc* a, unsigned
      * journal passed 2 GB every query silently ignored up to a full run
      * interval of address activity. A failure here is an error to the caller. */
     if (axt_read_events(type, key, runs_to, axr_tail_cb, a) < 0) return -1;
-    if (n < 0) return -1;
+    /* ah_lookup answers -1 both for "the runs are unreadable" and for "there
+     * are no run files", and the second is the normal state of a node that has
+     * not built its first history run yet -- the whole early sync. Only the
+     * first is an error, so ask whether runs exist before treating it as one.
+     * Getting this wrong made every address query fail on a journal-only node. */
+    if (n < 0 && ah_available()) return -1;
     return a->ntxid;
 }
 
@@ -4567,7 +4584,7 @@ static int cmd_getaddressbalance(const rj_val* params, rj_val** res, long* ec, c
         int t; unsigned char key[32];
         if (!axr_key(addrs[i]->str, &t, key)){ *ec = -5; *em = "Invalid address"; return 0; }
         axr_acc a;
-        if (axr_read(t, key, &a, 0, 0) < 0){ *ec = -1; *em = "Address index unreadable"; return 0; }
+        if (axr_read(t, key, &a, 0, 0, 0, 0, -1) < 0){ *ec = -1; *em = "Address index unreadable"; return 0; }
         bal += a.bal_fund - a.bal_spend; rcv += a.bal_fund; utxos += a.nfund - a.nspend;
     }
     rj_val* o = rj_obj();
@@ -4578,27 +4595,61 @@ static int cmd_getaddressbalance(const rj_val* params, rj_val** res, long* ec, c
     return 1;
 }
 
+/* getaddresstxids(address | [addresses] | {"addresses":[...], "start":h, "end":h})
+ *
+ * `start`/`end` are inclusive block heights and page the result the way the
+ * addrindex patch set and its descendants do -- Core has no address index, so
+ * that lineage is the only convention there is to match. Both are optional:
+ * without them the call behaves exactly as before, up to AXR_TXID_CAP txids.
+ *
+ * The window is not sugar over a full read. It is applied BEFORE a run event's
+ * txid is resolved, and resolving one costs a block read: on run 26 at the tip
+ * an unwindowed query for a heavily-used address resolved 100,000 txids from
+ * 100,000 distinct blocks across a 716 GB archive. Asking for a range of
+ * heights reads only that range's blocks.
+ *
+ * Dedup spans the whole call through one hash set (axr_txid_reset once, and
+ * each address seeded with the running count), so the result is unique across
+ * addresses. It used to be a strcmp() scan of the JSON array built so far --
+ * O(n^2), ~5e9 compares at the cap, the same shape as the two other quadratic
+ * dedups this path had. */
 static int cmd_getaddresstxids(const rj_val* params, rj_val** res, long* ec, const char** em){
     const rj_val* addrs[64];
     long na = axr_collect(params, addrs, 64);
-    if (na < 1){ *ec = -8; *em = "getaddresstxids(address | [addresses] | {\"addresses\":[...]})"; return 0; }
+    if (na < 1){ *ec = -8; *em = "getaddresstxids(address | [addresses] | {\"addresses\":[...], \"start\":h, \"end\":h})"; return 0; }
     if (!axr_enabled(ec, em)) return 0;
+    long lo = 0, hi = -1;
+    if (params->items[0]->typ == RJ_OBJ){
+        const rj_val* s = rj_obj_get((rj_val*)params->items[0], "start");
+        const rj_val* e = rj_obj_get((rj_val*)params->items[0], "end");
+        if (s && s->typ != RJ_NULL){
+            if (s->typ != RJ_NUM){ *ec = -3; *em = "start must be a block height"; return 0; }
+            lo = (long)strtoll(s->str, NULL, 10);
+            if (lo < 0){ *ec = -8; *em = "start must not be negative"; return 0; }
+        }
+        if (e && e->typ != RJ_NULL){
+            if (e->typ != RJ_NUM){ *ec = -3; *em = "end must be a block height"; return 0; }
+            hi = (long)strtoll(e->str, NULL, 10);
+            if (hi < 0){ *ec = -8; *em = "end must not be negative"; return 0; }
+        }
+        if (hi >= 0 && hi < lo){ *ec = -8; *em = "end must not be below start"; return 0; }
+    }
     static unsigned char txids[AXR_TXID_CAP * 32];
-    rj_val* arr = rj_arr();
+    axr_txid_reset();
+    long total = 0;
     for (long i = 0; i < na; i++){
         int t; unsigned char key[32];
-        if (!axr_key(addrs[i]->str, &t, key)){ rj_free(arr); *ec = -5; *em = "Invalid address"; return 0; }
+        if (!axr_key(addrs[i]->str, &t, key)){ *ec = -5; *em = "Invalid address"; return 0; }
         axr_acc a;
-        long n = axr_read(t, key, &a, txids, AXR_TXID_CAP);
-        if (n < 0){ rj_free(arr); *ec = -1; *em = "Address index unreadable"; return 0; }
-        for (long k = 0; k < n; k++){
-            char hx[65];
-            hex_rev(hx, txids + k * 32, 32);    /* wire -> display order */
-            int dup = 0;
-            for (unsigned long e = 0; e < arr->nitems; e++)
-                if (!strcmp(arr->items[e]->str, hx)){ dup = 1; break; }
-            if (!dup) rj_arr_push(arr, rj_str(hx));
-        }
+        long n = axr_read(t, key, &a, txids, AXR_TXID_CAP, total, lo, hi);
+        if (n < 0){ *ec = -1; *em = "Address index unreadable"; return 0; }
+        total = n;
+    }
+    rj_val* arr = rj_arr();
+    for (long k = 0; k < total; k++){
+        char hx[65];
+        hex_rev(hx, txids + k * 32, 32);        /* wire -> display order */
+        rj_arr_push(arr, rj_str(hx));
     }
     *res = arr;
     return 1;
