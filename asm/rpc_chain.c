@@ -1737,7 +1737,25 @@ static long headers_height(long tip){
     }
     return tip;
 }
-static long long size_on_disk(void){
+/* Total bytes of blk*.dat.
+ *
+ * This read the whole directory and stat()ed every file, EVERY call: 5,763
+ * stat syscalls on a 716 GB archive, inside getblockchaininfo, under the RPC
+ * execution lock. It was most of that call's 5 ms, and with execution
+ * serialised it was most of what 32 concurrent callers waited on.
+ *
+ * The archive is append-only: blk files are written in order and only the
+ * NEWEST one grows -- once the writer rolls over to the next, the previous is
+ * immutable. So the sum of everything but the newest is cached, and the steady
+ * state costs two stats: the newest file, and a probe for the next one having
+ * appeared.
+ *
+ * Two escapes back to the full scan, because "append-only" stops being true:
+ * with pruning enabled files are DELETED, and a reindex can truncate. Pruning
+ * takes the slow path always; everything else revalidates on a timer, so any
+ * drift is bounded by SOD_REVALIDATE_S rather than lasting until restart. */
+#define SOD_REVALIDATE_S 300
+static long long sod_full_scan(void){
     long long total = 0;
     DIR* d = opendir("."); if (!d) return 0;
     struct dirent* e;
@@ -1748,6 +1766,47 @@ static long long size_on_disk(void){
     }
     closedir(d);
     return total;
+}
+static long long size_on_disk(void){
+    static long long prefix = -1;      /* bytes in files [0, newest)          */
+    static long  newest = -1;          /* index of the file still being written */
+    static time_t last_full = 0;
+    time_t now = time(NULL);
+    int pruning = (g_prune_mib != 0 || ST_PRUNE_H(g_st) > 0);
+
+    if (pruning) return sod_full_scan();          /* files can vanish */
+    if (prefix < 0 || now - last_full >= SOD_REVALIDATE_S){
+        /* full scan, and re-derive which file is newest */
+        long long total = sod_full_scan();
+        long n = 0;
+        for (;;){
+            char nm[32]; struct stat sb;
+            snprintf(nm, sizeof nm, "blk%05ld.dat", n);
+            if (stat(nm, &sb) != 0) break;
+            n++;
+        }
+        if (n == 0) return total;
+        newest = n - 1;
+        struct stat sb; char lastnm[32];
+        snprintf(lastnm, sizeof lastnm, "blk%05ld.dat", newest);
+        prefix = (stat(lastnm, &sb) == 0) ? total - sb.st_size : total;
+        last_full = now;
+        return total;
+    }
+    /* steady state: has the writer rolled over? then fold the old newest in */
+    for (;;){
+        char nm[32]; struct stat sb;
+        snprintf(nm, sizeof nm, "blk%05ld.dat", newest + 1);
+        if (stat(nm, &sb) != 0) break;
+        char cur[32]; struct stat cs;
+        snprintf(cur, sizeof cur, "blk%05ld.dat", newest);
+        if (stat(cur, &cs) == 0) prefix += cs.st_size;
+        newest++;
+    }
+    char nm[32]; struct stat sb;
+    snprintf(nm, sizeof nm, "blk%05ld.dat", newest);
+    if (stat(nm, &sb) != 0) return sod_full_scan();
+    return prefix + sb.st_size;
 }
 static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
     long tip = refresh();
