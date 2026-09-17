@@ -573,6 +573,20 @@ list this node does not have. All three stay on the warning list.
 
 
 
+- ~~**Outbound leg slots churn about nine times an hour and almost no departure
+  is logged.**~~ — **WRONG, see "Update 2026-09-17 — leg churn: the nine-an-hour
+  figure was nine restarts" at the end of this file.** The 42 handshakes below
+  span NINE boots of the bench node, not one: they are each boot's initial
+  fill, and 36 of the 42 departures were the worker exiting because I was
+  restarting it to swap binaries. "Slot 0 nine times" was slot numbering
+  starting at 0 on every boot. I measured churn in a log I had churned myself.
+  The genuine defects the investigation did find — a hangup the sweep never
+  saw, and a leg stranded in a pass at the handover — are in that update.
+  Kept, struck through, because the measurement is instructive: **counting
+  events across a log without first counting its boots.**
+
+  The original claim, left as written:
+
 - **Outbound leg slots churn about nine times an hour and almost no departure
   is logged.** Measured on run 26 mid-sync, 2026-09-17, one boot:
 
