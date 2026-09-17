@@ -3173,6 +3173,82 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
     return 1;
 }
 
+/* Fee, size, sigop cost, direct parents and the ancestor set, for MANY txids
+ * in one call -- and NOTHING else.
+ *
+ * getblocktemplate asked mpool_policy_entry_info() once per candidate. That
+ * function also finds `spentby` by scanning EVERY node in the registry, and
+ * enumerates the DESCENDANT set with a nested walk over every node per stack
+ * entry. The template reads neither: it uses fee, size, sigop_cost, depends
+ * and anc. So each call paid two or more full passes over the registry to
+ * build fields nobody looked at, n times over -- measured on run 26, 1,664 ms
+ * to build one template against Bitcoin Core's 53 ms on a mempool eight times
+ * larger.
+ *
+ * Here the self-lookup is a hash built once for the whole batch (it was a
+ * linear scan per call), and the only graph work left is the ancestor DFS,
+ * which is bounded by MPE_MAX_SET. out[] and found[] are sized by the CALLER's
+ * query count, not the registry, so this stays usable on a full mempool --
+ * mp_entry_info is ~8 KB, and one per registry entry is why entry_info_all
+ * refuses a registry larger than the caller's cap.
+ *
+ * found[q] is 1 when the txid was in the registry. Returns nq, or -1. */
+long mpool_policy_entry_pkg_many(void* st, const unsigned char (*txids)[32], uint32_t nq,
+                                 mp_entry_info* out, unsigned char* found){
+    if (!st || *(uint32_t*)st != MPOL_MAGIC || !txids || !out || !found) return -1;
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    uint32_t cap = 16; while (cap < (n ? n * 2 : 16)) cap <<= 1;
+    uint32_t* tab = (uint32_t*)malloc((size_t)cap * sizeof *tab);
+    if (!tab) return -1;
+    for (uint32_t i = 0; i < cap; i++) tab[i] = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < n; i++){
+        uint64_t k; memcpy(&k, t[i].txid, 8);
+        uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 40) & (cap - 1);
+        while (tab[h] != 0xFFFFFFFFu) h = (h + 1) & (cap - 1);
+        tab[h] = i;
+    }
+    for (uint32_t q = 0; q < nq; q++){
+        found[q] = 0;
+        uint64_t k; memcpy(&k, txids[q], 8);
+        uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 40) & (cap - 1);
+        long self = -1;
+        while (tab[h] != 0xFFFFFFFFu){
+            if (!memcmp(t[tab[h]].txid, txids[q], 32)){ self = (long)tab[h]; break; }
+            h = (h + 1) & (cap - 1);
+        }
+        if (self < 0) continue;
+        mp_entry_info* o = &out[q];
+        memset(o, 0, sizeof *o);
+        o->fee = t[self].fee; o->size = t[self].size; o->sigop_cost = t[self].sigop_cost;
+        for (uint32_t kk = 0; kk < t[self].n_parents && o->n_depends < MPE_MAX_SET; kk++){
+            uint32_t pp = mpol_par_at(st, &t[self], kk);
+            if (pp >= n) continue;
+            if (!mpe_seen(o->depends, o->n_depends, t[pp].txid))
+                memcpy(o->depends[o->n_depends++], t[pp].txid, 32);
+        }
+        { uint32_t stack[MPE_MAX_SET]; int sp = 0;
+          memcpy(o->anc[o->n_anc++], t[self].txid, 32);
+          o->anc_fee = t[self].fee; o->anc_size = t[self].size;
+          stack[sp++] = (uint32_t)self;
+          while (sp > 0){
+              uint32_t cur = stack[--sp];
+              for (uint32_t kk = 0; kk < t[cur].n_parents; kk++){
+                  uint32_t pp = mpol_par_at(st, &t[cur], kk);
+                  if (pp >= n || mpe_seen(o->anc, o->n_anc, t[pp].txid)) continue;
+                  if (o->n_anc >= MPE_MAX_SET) break;
+                  memcpy(o->anc[o->n_anc++], t[pp].txid, 32);
+                  o->anc_fee += t[pp].fee;
+                  o->anc_size += t[pp].size;
+                  if (sp < MPE_MAX_SET) stack[sp++] = pp;
+              }
+          } }
+        found[q] = 1;
+    }
+    free(tab);
+    return (long)nq;
+}
+
 /* ==========================================================================
  * PACKAGE policy -- context-free checks (Core policy/packages.cpp).
  *

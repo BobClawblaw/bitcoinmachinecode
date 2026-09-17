@@ -1145,6 +1145,16 @@ static long gbt_slot(void* mp, unsigned long i, gbt_ent* e){
 }
 
 #define GBT_MAX_TX 4000
+/* txid -> position in the emitted template order, so `depends` resolves in
+ * O(1). It used to be a scan of every earlier emitted entry, for every
+ * dependency of every transaction. Open-addressed, rebuilt per template;
+ * 16384 slots against GBT_MAX_TX 4000 keeps the load factor under a quarter. */
+#define GBT_POS_N (1u << 14)
+static int g_gbt_pos[GBT_POS_N];
+static unsigned gbt_pos_h(const u8* t){
+    unsigned long long k; memcpy(&k, t, 8);
+    return (unsigned)((k * 0x9E3779B97F4A7C15ULL) >> 50) & (GBT_POS_N - 1);
+}
 static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, const char** em){
     /* template_request: rules MUST include "segwit" (Core-exact error) */
     int segwit_rule = 0;
@@ -1243,12 +1253,27 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
         static unsigned char have_inf[GBT_MAX_TX];
         static unsigned long long tfee[GBT_MAX_TX], tsize[GBT_MAX_TX];
         static long tweight[GBT_MAX_TX], tsig[GBT_MAX_TX];
+        /* One batched call for every candidate. This was pol_entry_info per
+         * entry, and that scans the registry to locate the transaction, then
+         * scans it AGAIN for spentby, then walks the descendant set with a
+         * nested pass over every node -- none of which this template reads. */
+        static unsigned char pkg_txids[GBT_MAX_TX][32];
+        long pkg_got = -1;
+        if (g_gbt_mph.polstate && g_gbt_mph.pol_pkg_many && n <= GBT_MAX_TX){
+            for (long i = 0; i < n; i++) memcpy(pkg_txids[i], ents[i].txid, 32);
+            pkg_got = g_gbt_mph.pol_pkg_many(g_gbt_mph.polstate,
+                        (const unsigned char (*)[32])pkg_txids, (unsigned)n, infs, have_inf);
+        }
         for (long i = 0; i < n; i++){
-            have_inf[i] = 0;
+            if (pkg_got < 0){
+                have_inf[i] = 0;
+                if (g_gbt_mph.polstate && g_gbt_mph.pol_entry_info &&
+                    g_gbt_mph.pol_entry_info(g_gbt_mph.polstate, ents[i].txid, &infs[i]))
+                    have_inf[i] = 1;
+            }
             tfee[i] = 0; tsize[i] = 1;
-            if (g_gbt_mph.polstate && g_gbt_mph.pol_entry_info &&
-                g_gbt_mph.pol_entry_info(g_gbt_mph.polstate, ents[i].txid, &infs[i])){
-                have_inf[i] = 1; tfee[i] = infs[i].fee; tsize[i] = infs[i].size ? infs[i].size : 1;
+            if (have_inf[i]){
+                tfee[i] = infs[i].fee; tsize[i] = infs[i].size ? infs[i].size : 1;
             }
             { const u8* tp = ents[i].tx; const u8* tend = tp + ents[i].len; txw_t w;
               tweight[i] = tx_walk(tp, tend, &w) ? (long)(w.stripped * 3 + w.len) : (long)(ents[i].len * 4); }
@@ -1424,12 +1449,31 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
         }
         #undef UF_FIND
         /* render in order; depends[] are 1-based indices into this array */
+        memset(g_gbt_pos, 0, sizeof g_gbt_pos);
+        for (long oj = 0; oj < emitted_n; oj++){
+            unsigned h = gbt_pos_h(ents[order[oj]].txid);
+            while (g_gbt_pos[h]) h = (h + 1) & (GBT_POS_N - 1);
+            g_gbt_pos[h] = (int)(oj + 1);                 /* 0 means empty */
+        }
+        #define GBT_POS_FIND(TXID, OUT) do {                                       \
+            (OUT) = -1; unsigned h_ = gbt_pos_h(TXID);                             \
+            while (g_gbt_pos[h_]){                                                 \
+                long p_ = g_gbt_pos[h_] - 1;                                       \
+                if (!memcmp(ents[order[p_]].txid, (TXID), 32)){ (OUT) = p_; break; }\
+                h_ = (h_ + 1) & (GBT_POS_N - 1);                                   \
+            } } while (0)
         for (long oi = 0; oi < emitted_n; oi++){
             long i = order[oi];
-            unsigned long long fee = 0, fsz = 0; long have_fee = 0;
-            if (g_gbt_mph.polstate && g_gbt_mph.pol_entry)
-                have_fee = g_gbt_mph.pol_entry(g_gbt_mph.polstate, ents[i].txid, &fee, &fsz);
-            if (!have_fee) continue;    /* can't price it -> don't offer it */
+            /* Everything this loop needs was already resolved, per entry, in
+             * the pass above: tfee/tsig/tweight and infs[]. It used to ask the
+             * registry again -- pol_entry for the fee, pol_entry_info for the
+             * depends, pol_entry_info a THIRD time for the sigops -- and each
+             * of those is a linear scan of the node array, so the render was
+             * three more O(n^2) passes on top of the one that built the data.
+             * Measured on run 26 at 10,311 transactions, getblocktemplate took
+             * 1,664 ms against Bitcoin Core's 53 ms at 78,342. */
+            if (!have_inf[i]) continue;    /* can't price it -> don't offer it */
+            unsigned long long fee = tfee[i];
             rj_val* t = rj_obj();
             { char* dhex = malloc(ents[i].len*2 + 1);
               if (dhex){ hex_of(dhex, ents[i].tx, ents[i].len);
@@ -1440,31 +1484,24 @@ static int cmd_getblocktemplate(const rj_val* params, rj_val** res, long* ec, co
               if (is_segwit) sha256d(wt, ents[i].tx, ents[i].len); else memcpy(wt, ents[i].txid, 32);
               hex_rev(hx, wt, 32); rj_obj_set(t, "hash", rj_str(hx)); }
             { rj_val* dep = rj_arr();
-              mp_entry_info inf;
-              if (g_gbt_mph.polstate && g_gbt_mph.pol_entry_info &&
-                  g_gbt_mph.pol_entry_info(g_gbt_mph.polstate, ents[i].txid, &inf)){
-                  mp_entry_info* pi = &inf;
-                  for (int k = 0; k < pi->n_depends; k++)
-                      for (long pj = 0; pj < oi; pj++)
-                          if (!memcmp(ents[order[pj]].txid, pi->depends[k], 32)){
-                              rj_arr_push(dep, rj_numf("%ld", pj + 1)); break; }
+              const mp_entry_info* pi = &infs[i];          /* from the pass above */
+              for (int k = 0; k < pi->n_depends; k++){
+                  long pj; GBT_POS_FIND(pi->depends[k], pj);   /* O(1), was a scan of every earlier entry */
+                  if (pj >= 0 && pj < oi) rj_arr_push(dep, rj_numf("%ld", pj + 1));
               }
               rj_obj_set(t, "depends", dep); }
             rj_obj_set(t, "fee", rj_numf("%llu", fee));
             fees_total += fee;
             /* exact BIP141 cost stamped at accept time (tx_accept.c);
              * legacy-x4 lower bound only if the stamp is absent */
-            { mp_entry_info sinf; long ssig = 0;
-              if (g_gbt_mph.pol_entry_info &&
-                  g_gbt_mph.pol_entry_info(g_gbt_mph.polstate, ents[i].txid, &sinf) && sinf.sigop_cost)
-                  ssig = (long)sinf.sigop_cost;
-              else if (g_gbt_sigop_cost) ssig = g_gbt_sigop_cost(ents[i].tx, ents[i].len);
-              rj_obj_set(t, "sigops", rj_numf("%ld", ssig)); }
-            { const u8* p = ents[i].tx; const u8* end = p + ents[i].len; txw_t w;
-              rj_obj_set(t, "weight", rj_numf("%zu",
-                  tx_walk(p, end, &w) ? (w.stripped * 3 + w.len) : ents[i].len * 4)); }
+            /* tsig[] and tweight[] were computed by the pass above with
+             * exactly this logic (stamped BIP141 cost, else the legacy x4
+             * bound; tx_walk weight, else len*4). */
+            rj_obj_set(t, "sigops", rj_numf("%ld", tsig[i]));
+            rj_obj_set(t, "weight", rj_numf("%ld", tweight[i]));
             rj_arr_push(txs, t);
         }
+        #undef GBT_POS_FIND
         if (g_gbt_mph.unlock) g_gbt_mph.unlock();
     }
     rj_obj_set(o, "transactions", txs);
