@@ -2504,3 +2504,36 @@ while a child holds the inherited fd, and the peer would never see the FIN.
 That is the opposite of what happened to the three legs here — their sockets
 were gone from the kernel while the parent still held the fd — but it remains
 worth a look.
+
+## Update 2026-09-17 — a failing test nobody was running
+
+`test_rpc_esplora_stress` fails, and has been failing since at least
+`c6f779c7` (2026-09-16), which is before any of that day's RPC performance
+work. It was found only because the concurrency change (PR #255) prompted
+running a suite that every earlier sweep that day had skipped.
+
+The assertion:
+
+```
+FAIL stats: no txid is resolved -- at most 2 RPC calls for a 60,000-event
+            address (was one getblock per block: 44,001)
+  /address/bc1qaddrA -> 200, 284 bytes, 371 rpc calls, 0.41s
+```
+
+The Esplora `/address` route answers **address statistics** — funded and spent
+counts and sums. It does not return transaction ids, so it should never need
+to resolve one, and the test pins that at "no more than 2 dispatches". It is
+making 371. The route is answering correctly and quickly (284 bytes, 0.41 s on
+a 60,000-event fixture), so this is an efficiency assertion, not a wrong
+answer — but it is the assertion that stops the route regressing back to the
+44,001-call shape it was explicitly fixed out of.
+
+Bisected across `c6f779c7`, `888a3b54`, `5c5a166a`, `f1426e8c` and `4ea82c1b`
+— identical failure at every one, so it predates the address-latency work
+(#246), the pagination (#247) and the concurrency change (#255).
+
+**Not yet diagnosed.** The next step is to find which of the route's calls is
+being made per event rather than once; `rpc_esplora.c`'s `call()` wrapper is
+the counting point, so instrumenting it names the method immediately.
+
+Effort: small to find, unknown to fix until it is found.
