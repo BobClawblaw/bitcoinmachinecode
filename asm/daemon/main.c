@@ -8455,6 +8455,31 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 fprintf(stderr,"[dl] archive at %ld, peers announce %ld: %ld blocks behind -- running the parallel downloader (%d workers)\n",
                         atip, best, best-atip, g_catchup_workers);
                 dl_parallel_last_s = nows;
+                /* 2026-09-17: hand the loop over with NO pass outstanding.
+                 * A pass helper's report is read only by leg_pass_poll, which
+                 * runs in THIS loop -- and dl_catchup does not return for
+                 * hours. A slot left busy is skipped by legs_sweep_except for
+                 * the whole download: nothing reads its socket, no ping tick
+                 * runs on it, and the peer eventually resets a connection we
+                 * stopped reading. Measured on run 26, 2026-09-17: leg 0 held
+                 * 100 KB unread and growing in its receive queue with lastrecv
+                 * climbing past 140 s while the download peers sat at 3-5 s,
+                 * and the three legs whose passes were queued when the
+                 * download started were the three whose sockets were gone --
+                 * with no logged close. The legs that stayed idle survived.
+                 * Drain the reports first; a helper still running when the
+                 * bound expires is retired by leg_pass_poll's own budget rule,
+                 * which names the close. */
+                { long long dead = dh_now_ms() + (long long)leg_budget_secs(1) * 1000 + 20000;
+                  int outstanding = pass_running(), waited = outstanding;
+                  while(outstanding > 0 && dh_now_ms() < dead){
+                      (void)leg_pass_poll(NULL, srcpool, nsrc, out_port);
+                      legs_sweep_except(-1);
+                      usleep(50000);
+                      outstanding = pass_running();
+                  }
+                  if(waited > 0)
+                      fprintf(stderr,"[dl] waited for %d pass helper(s) before the parallel download; %d still running\n", waited, outstanding); }
                 long got = dl_catchup(dir, g_catchup_workers);
                 store_reload(store_buf);
                 if(got <= 0){ noop_best = best; noop_tip = atip; }

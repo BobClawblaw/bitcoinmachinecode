@@ -99,6 +99,20 @@ int main(int argc, char** argv){
               if(strstr(line[i], "bps") || strstr(line[i], "KB/s") || strstr(line[i], "bytes_per")) bad++;
       ok(bad == 0, "leg_check_gone() carries no byte-rate rule (the 32 KB/s eviction floor stays dead)"); }
 
+    printf("== the loop is never handed over with a leg stranded in a pass ==\n");
+    /* leg_pass_poll runs only in the download worker's rotation, and
+     * dl_catchup does not return for hours. A slot still marked busy when the
+     * download starts is skipped by legs_sweep_except for the whole download:
+     * nothing reads its socket and no ping tick runs on it. The reports must
+     * be drained before the handover. */
+    { int at = -1;
+      for(int i = 0; i < nlines; i++) if(strstr(line[i], "= dl_catchup(")){ at = i; break; }
+      ok(at >= 0, "the parallel download's call site found");
+      int drained = 0;
+      for(int i = at - 40; at >= 0 && i < at; i++)
+          if(i >= 0 && strstr(line[i], "pass_running()")) drained = 1;
+      ok(drained, "the pass helpers' reports are drained before the parallel downloader takes the loop"); }
+
     printf("== a restart is a departure too ==\n");
     { int hit = 0;
       for(int i = 0; i < nlines; i++) if(strstr(line[i], "closed ours/shutdown after")) hit = 1;
