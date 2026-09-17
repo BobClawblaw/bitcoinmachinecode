@@ -9355,6 +9355,7 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern long mpool_policy_entry(void*, const unsigned char*,
                                      unsigned long long*, unsigned long long*);
       extern long mpool_policy_entry_info_all(void*, struct mp_entry_info*, unsigned char (*)[32], unsigned);
+      extern long mpool_policy_totals(void*, unsigned long long*, unsigned long long*);
 extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
       extern long mpool_policy_estimate(void*, unsigned long long*, unsigned long long*);
       extern unsigned long long mpool_policy_min_fee(void*);
@@ -9370,6 +9371,7 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
           .pol_entry = mpool_policy_entry,
           .pol_entry_info = mpool_policy_entry_info,
           .pol_entry_info_all = mpool_policy_entry_info_all,
+          .pol_totals = mpool_policy_totals,
           .estimate = mpool_policy_estimate,
           /* main.c's existing extern types the length as long; the hooks
            * member says unsigned long -- ABI-identical on x86-64 SysV. */

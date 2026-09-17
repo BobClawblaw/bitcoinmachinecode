@@ -491,6 +491,10 @@ typedef struct {
        scan of the node array, so asking it n times is O(n^2). Returns the
        count written, or -1 to say "fall back to the per-txid call". */
     long (*pol_entry_info_all)(void*, struct mp_entry_info*, unsigned char (*)[32], unsigned);
+    /* every entry's fee and vsize summed in ONE pass. pol_entry is a linear
+       scan, so getmempoolinfo calling it per slot was O(n^2). NULL = fall back
+       to that per-slot loop (test rules that do not link the policy module). */
+    long (*pol_totals)(void*, unsigned long long*, unsigned long long*);
     long (*estimate)(void*, unsigned long long*,
                      unsigned long long*);                      /* fee EMA+samples */
     void (*sha256d)(unsigned char*, const void*, unsigned long);/* for wtxid */
