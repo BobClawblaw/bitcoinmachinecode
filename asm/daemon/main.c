@@ -4513,6 +4513,13 @@ static void dlc_store_sync_chunk(void* st){
     if(bfd >= 0) fdatasync(bfd);
     if(ifd >= 0) fdatasync(ifd);
 }
+/* Every append, not just the first: the cursor is only known good until
+ * something else moves it, and the probe is one stat when it is already right. */
+static long dlc_append_frontier(void* st, long height, const unsigned char hash[32],
+                                const unsigned char* raw, unsigned len){
+    archive_store_frontier(st);
+    return store_append_shared(st, height, hash, raw, len);
+}
 static int dlc_committer_main(volatile long* ctl, long start_h, long end_h, pid_t parent){
     int lfd = open("append.lock", O_RDWR | O_CREAT, 0644);
     if(lfd < 0){ fprintf(stderr, "[dlc committer] no lock\n"); return 1; }
@@ -4530,7 +4537,7 @@ static int dlc_committer_main(volatile long* ctl, long start_h, long end_h, pid_
      * decided. */
     archive_store_frontier(st);
     store_set_sync(0);                                       /* this process only; synced per chunk below */
-    int r = dlc_committer_run(ctl, start_h, end_h, st, store_append_shared, dlc_index_present, 20, parent, dlc_store_sync_chunk);
+    int r = dlc_committer_run(ctl, start_h, end_h, st, dlc_append_frontier, dlc_index_present, 20, parent, dlc_store_sync_chunk);
     close(lfd);
     return r;
 }
@@ -10675,6 +10682,19 @@ int main(int argc, char** argv){
       if(tr < 0) fprintf(stderr,"[boot] WARNING: could not trim the derived files past the tip: %s\n", strerror(errno)); }
     { extern void par_set(int); par_set(g_cfg.par); }   /* -par: script-verification threads (Core semantics) */
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
+    /* Before ANY append can happen, in the parent -- so the serve loop's
+     * tip appends and the boot catch-up are covered as well as the download.
+     * Children inherit it across fork. */
+    ibd_pipeline_set_frontier(archive_store_frontier);
+    /* NOT archive_store_frontier(store_buf) here. That was tried on 2026-09-17
+     * and it CORRUPTED A BLOCK: the guard advances cur_file_no but leaves
+     * cur_file_pos alone, which is harmless for store_append_shared (it lseeks
+     * to the true end of the file) and WRONG for store_append, which trusts
+     * cur_file_pos. The genesis seed uses store_append, so it wrote 293 bytes
+     * at offset 0 of the newest blk file, over the start of the block already
+     * living there (height 967422 on run 26). The frontier belongs INSIDE
+     * store_append_shared, where the position is re-derived -- see
+     * bitcoin_store.asm's .frontier. */
     /* A fresh non-main datadir self-seeds its own genesis at index 0 (the
      * mainnet archive got genesis by a one-time injection, 5f36dee -- a
      * regtest dir is created empty every time, so the daemon must do it).
