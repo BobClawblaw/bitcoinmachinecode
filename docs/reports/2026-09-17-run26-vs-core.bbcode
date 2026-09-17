@@ -1,0 +1,163 @@
+[size=16pt][b]Run 26: every index built during the sync, and a chain identical to Core's[/b][/size]
+
+2026-09-17. Node commits [tt]e2f1e53c[/tt] -> [tt]3a3289b8[/tt], Bitcoin Core v31.1 oracle on the same machine.
+
+[b]The short version.[/b] A full mainnet initial block download by an independent Bitcoin full node written in x86-64 assembly, finishing with a chain identical to Core's block for block and a UTXO set identical to Core's coin for coin -- while building [b]five indexes concurrently with the sync[/b], including two that Core has no equivalent for. When the download ended, nothing started: no post-sync index build, no adoption pass, no supervisor waiting for the initial download to finish. That absence is the result this run was built to demonstrate.
+
+[hr]
+[size=12pt][b]The claim, and what backs it[/b][/size]
+
+[table]
+[tr][td][b]layer[/b][/td][td][b]test[/b][/td][td][b]result[/b][/td][/tr]
+[tr][td]chain[/td][td]tip hash vs oracle at 967,450[/td][td][b]identical[/b][/td][/tr]
+[tr][td]UTXO set[/td][td][tt]gettxoutsetinfo muhash[/tt], height pinned on both sides[/td][td][b]identical[/b][/td][/tr]
+[tr][td]supply[/td][td][tt]total_amount[/tt][/td][td][b]identical[/b][/td][/tr]
+[tr][td]set size[/td][td][tt]txouts[/tt][/td][td][b]identical[/b][/td][/tr]
+[tr][td]history[/td][td]same test replayed at height 200,000[/td][td][b]identical[/b][/td][/tr]
+[tr][td]txindex[/td][td][tt]getrawtransaction[/tt] by txid alone, block 200,000[/td][td]blockhash matches Core[/td][/tr]
+[tr][td]coinstatsindex[/td][td]muhash at an old height, from the index[/td][td]matches Core[/td][/tr]
+[/table]
+
+At the tip, height 967,450, both nodes:
+
+[code]
+bestblock     00000000000000000002065f1f1fe98d2341da819377fbaa4f940c881dcc0fc7
+txouts        165,222,924
+total_amount  20085554.25431578
+muhash        a464db6b461209f2c14871a9b27013cde9add56b7644419f2f45c42fe806f9b1
+[/code]
+
+And replayed at height 200,000, to show this is not a tip-only coincidence:
+
+[code]
+txouts        2,318,056
+total_amount  9999889.98361183
+muhash        169c05b5de13ef28aa2c4e0cb9085502603e9d274babb84872349af7fa3c8ced
+[/code]
+
+Both heights were [b]pinned on both sides[/b]. An earlier report in this project claimed a UTXO divergence that turned out to be a torn read of a live, still-applying set; every set comparison here names an explicit height so neither side can be hashing something in motion.
+
+[hr]
+[size=12pt][b]The machine, and the configuration[/b][/size]
+
+[table]
+[tr][td]CPU[/td][td]AMD Ryzen 9 9950X3D, 16 cores / 32 threads[/td][/tr]
+[tr][td]RAM[/td][td]123 GB[/td][/tr]
+[tr][td]kernel[/td][td]Linux 7.0.0-31-generic[/td][/tr]
+[tr][td]datadir[/td][td]NVMe-backed LVM volume, 3.6 TB[/td][/tr]
+[/table]
+
+[code]
+dbcache=8192          bmc.catchupworkers=8      maxconnections=48
+txindex=1             coinstatsindex=1          blockfilterindex=1
+addrindex=1           txospenderindex=1         bmc.indexrunblocks=20000
+[/code]
+
+[tt]bmc.catchupworkers=8[/tt] is the download concurrency, matched to Core's [tt]MAX_OUTBOUND_FULL_RELAY_CONNECTIONS = 8[/tt], which is not configurable. The log confirms it held: [tt]connected 6/8 peer(s)[/tt], [tt]connected 7/8 peer(s)[/tt]. Peer concurrency is where IBD comparisons usually go wrong, so it is controlled here.
+
+[hr]
+[size=12pt][b]Timeline, stated honestly[/b][/size]
+
+[table]
+[tr][td]fresh start from genesis[/td][td]2026-09-16 21:10:55 UTC[/td][/tr]
+[tr][td]download complete (967,385/967,385)[/td][td]2026-09-17 16:45:16 UTC[/td][/tr]
+[tr][td][b]wall clock[/b][/td][td][b]19h 34m[/b][/td][/tr]
+[tr][td]node-up time[/td][td]19h 22m[/td][/tr]
+[tr][td]downtime[/td][td]11m 33s across 9 restart gaps[/td][/tr]
+[tr][td]boots[/td][td]10[/td][/tr]
+[tr][td]average throughput[/td][td]10.7 MB/s[/td][/tr]
+[/table]
+
+[b]This is not a benchmark-grade wall clock, and it should not be quoted as one.[/b] Run 26 was restarted ten times. Nine of those were deploy-and-debug cycles on the evening of 09-16 while defects found [i]by[/i] the run were being fixed; the tenth, at 08:12 on 09-17, was a deliberate binary swap to pick up two fixes. The binary therefore changed underneath the run. A clean single-binary IBD number needs a run that is left alone from genesis to tip.
+
+For scale only, the last clean Core baseline measured on this box (2026-09-13, unhandicapped, 8 peers, no [tt]coinstatsindex[/tt]) finished 966,808 blocks in [b]19h 14m[/b]. Run 26 is within about 2% of that while building five indexes. Two caveats keep that from being a headline: run 26's restarts, and the fact that the Core baseline's [tt]txindex[/tt]/[tt]blockfilterindex[/tt] settings were not recorded at the time -- only that it carried no [tt]coinstatsindex[/tt]. The honest statement is [i]comparable wall clock with substantially more index work[/i], not a measured win.
+
+[hr]
+[size=12pt][b]The result this run existed to prove[/b][/size]
+
+Before this work, a fresh sync ended with four things still to build, by hand or by a supervisor that refused to start until IBD was over: [tt]txindex[/tt] and [tt]txospenderindex[/tt] (each a full walk of the archive), the address history (three passes, ~700 GB of temp), and the block filters. [tt]coinstatsindex[/tt] was invalidated at height 91,842 by the first BIP30 duplicate coinbase and stayed gone.
+
+Run 26 ended with all five at the tip and [b]nothing queued[/b]:
+
+[code]
+txindex                    synced=True   967,450
+txospenderindex            synced=True   967,450
+basic block filter index   synced=True   967,450
+addressindex               synced=True   967,450
+coinstatsindex             synced=True   967,450
+[/code]
+
+The trailing builders' state at the tip is the same state they held mid-sync:
+
+[code]
+[trail] txindex: runs reach 959999; the next run starts once 12693 more heights
+        are ready | txospender: ... | addr_hist: ...
+[/code]
+
+The IBD boundary was a non-event. [tt]index_repair[/tt], the supervisor that used to wait for the sync and then walk the whole archive, never logged a line.
+
+Work done during the sync, by the trailing builders:
+
+[table]
+[tr][td][b]index[/b][/td][td][b]runs built[/b][/td][td][b]merges[/b][/td][/tr]
+[tr][td]txindex[/td][td]48[/td][td]8[/td][/tr]
+[tr][td]txospender[/td][td]48[/td][td]8[/td][/tr]
+[tr][td]addr_hist[/td][td]47[/td][td]9[/td][/tr]
+[/table]
+
+[hr]
+[size=12pt][b]Disk, both nodes, measured[/b][/size]
+
+[table]
+[tr][td][b][/b][/td][td][b]bmc run 26[/b][/td][td][b]Core oracle[/b][/td][/tr]
+[tr][td][tt]blk*.dat[/tt] (blocks)[/td][td][b]716.6 GiB[/b][/td][td][b]716.6 GiB[/b][/td][/tr]
+[tr][td][tt]rev*.dat[/tt] (undo)[/td][td]246.6 GiB[/td][td]100.0 GiB[/td][/tr]
+[tr][td]txindex[/td][td]26.2 GiB[/td][td]68.8 GiB[/td][/tr]
+[tr][td]block filter index[/td][td]12.2 GiB[/td][td]12.3 GiB[/td][/tr]
+[tr][td]coinstatsindex[/td][td]1.8 GiB[/td][td]0.2 GiB[/td][/tr]
+[tr][td]UTXO set on disk[/td][td]12.9 GiB (LSM runs)[/td][td]10.6 GiB (chainstate)[/td][/tr]
+[tr][td]address history + tail[/td][td]203.5 GiB[/td][td][i]no equivalent[/i][/td][/tr]
+[tr][td]txospender index[/td][td]91.5 GiB[/td][td][i]no equivalent[/i][/td][/tr]
+[tr][td][b]total datadir[/b][/td][td][b]1312.3 GiB[/b][/td][td][b]917.6 GiB[/b][/td][/tr]
+[/table]
+
+Three things worth reading off that table:
+
+[list]
+[li][b]The block data matches to the tenth of a GiB.[/b] Both nodes store 716.6 GiB of [tt]blk*.dat[/tt]. That is an independent check on the archive alongside the hash comparison.[/li]
+[li][b]The txindex is 2.6x smaller than Core's[/b] -- 26.2 GiB against 68.8 GiB -- because it is a set of sorted runs with a sparse index, not a LevelDB keyspace. The filter index is a wash and [tt]coinstatsindex[/tt] is larger.[/li]
+[li][b]The undo store is 2.5x Core's[/b], 246.6 GiB against 100.0 GiB, and that is a deliberate, load-bearing cost. This node keeps each spent prevout's script and value in its block's undo record, which is what makes a height range self-contained -- and that is precisely what makes the address history buildable in runs during the sync instead of by a whole-chain join afterwards. The 700 GB of temp the old builder needed existed because it had no undo to read.[/li]
+[/list]
+
+Net of the two indexes Core has no equivalent for, the datadir is 1017.2 GiB against Core's 917.6 GiB, and the difference is almost entirely that undo store.
+
+[hr]
+[size=12pt][b]Incidents[/b][/size]
+
+[table]
+[tr][td]bad or invalid blocks[/td][td][b]0[/b][/td][/tr]
+[tr][td]FATAL[/td][td][b]0[/b][/td][/tr]
+[tr][td]trail child failures[/td][td][b]0[/b][/td][/tr]
+[tr][td]runs abandoned[/td][td][b]0[/b][/td][/tr]
+[tr][td]reorgs handled[/td][td]10[/td][/tr]
+[tr][td]peers banned[/td][td]39 of 161[/td][/tr]
+[tr][td]stall evictions[/td][td]32 (2 s timeout)[/td][/tr]
+[/table]
+
+[hr]
+[size=12pt][b]What this does and does not establish[/b][/size]
+
+[b]Does:[/b] that an assembly implementation reaches Core's exact chain and Core's exact UTXO set over the full mainnet history; that five indexes, two of them without a Core counterpart, can be built entirely during the initial download; that the post-sync phase can be removed rather than shortened.
+
+[b]Does not:[/b] a clean IBD wall-clock comparison. Run 26 was restarted ten times and changed binaries mid-run. Nor does it establish steady-state serving performance -- address history on one of the most-used addresses on the chain ([tt]1dice8EM...[/tt], 3.2 M transactions through the Esplora facade) answers a balance in 4.6 s and 100,000 txids in 11.8 s. Acceptable for a page load; unmeasured under concurrency, and worth attention before anyone calls it fast.
+
+[hr]
+[size=12pt][b]Reproducing the parity check[/b][/size]
+
+[code]
+H=967450
+bmc-cli  gettxoutsetinfo muhash $H
+bitcoin-cli gettxoutsetinfo muhash $H
+[/code]
+
+Pin [tt]$H[/tt] on both sides. Comparing a live tip against a live tip is how this project previously talked itself into a UTXO divergence that did not exist.
