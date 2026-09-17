@@ -2950,6 +2950,34 @@ long mpool_policy_entry(void* st, const unsigned char txid[32],
     return 0;
 }
 
+/* Sum fee and vsize over every policy entry in ONE pass.
+ *
+ * getmempoolinfo used to call mpool_policy_entry() once per mempool slot, and
+ * that function is a LINEAR SCAN of this node array -- so the call was O(n^2).
+ * Measured on run 26 with 5,914 transactions it cost 15 ms against Bitcoin
+ * Core's 2 ms for the same RPC; at the oracle's 77,736 transactions the same
+ * loop is ~6 billion 32-byte compares. It ran under both the mempool lock and
+ * the single RPC execution lock, on a call every monitoring tool polls.
+ *
+ * The same "per-txid call x n" shape is already called out above
+ * mpool_policy_entry_info_all, for the same reason. Returns the entry count.
+ * The policy registry and the structural pool are maintained together
+ * (mpool_policy_remove_package takes both), so this covers the same
+ * transactions the per-slot loop did. */
+long mpool_policy_totals(void* st, unsigned long long* total_fee,
+                         unsigned long long* total_vsize){
+    if (total_fee) *total_fee = 0;
+    if (total_vsize) *total_vsize = 0;
+    if (!st || *(uint32_t*)st != MPOL_MAGIC) return -1;
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    unsigned long long f = 0, s = 0;
+    for (uint32_t i = 0; i < n; i++){ f += t[i].fee; s += t[i].size; }
+    if (total_fee) *total_fee = f;
+    if (total_vsize) *total_vsize = s;
+    return (long)n;
+}
+
 #include "mempool_entry.h"
 
 static int mpe_seen(unsigned char set[][32], int n, const unsigned char* txid){
