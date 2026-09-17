@@ -9,6 +9,7 @@ Bitcoin Core. Everything else lives here.
 | | |
 |---|---|
 | [`OPERATIONS.md`](OPERATIONS.md) | installing, configuring, running as a service, upgrading, verifying, backing up, troubleshooting |
+| [`PERFORMANCE.md`](PERFORMANCE.md) | serving performance vs Bitcoin Core after the sync — RPC latency, concurrency, memory, disk; what is measured, what is not, and where the gaps are |
 | [`../config/bitcoin.sample.conf`](../config/bitcoin.sample.conf) | the complete configuration reference: every key at its default, and every Bitcoin Core option the node accepts without effect, does not apply, or does not support |
 | [`RPC_LIVE_NODE.md`](RPC_LIVE_NODE.md) | the embedded JSON-RPC server and its methods |
 | [`MEMPOOL_SPACE.md`](MEMPOOL_SPACE.md) | running mempool.space against the node: the Esplora facade, the address history index, the backend configuration (2026-09-08) |
