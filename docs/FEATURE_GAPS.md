@@ -2456,3 +2456,37 @@ occupied by a corpse.
 eviction floor that killed early-chain peers for four benchmark runs stays
 dead, and `tests/test_leg_close_labels` fails if a byte-rate test appears in
 the liveness path.
+
+### The stranded pass (found the same day, from a live socket)
+
+Leg 0 of run 26 held 92 KB of **unread** data, 103 KB twenty seconds later,
+with `lastsend` 0 s — the node was writing to a peer whose receive queue it
+had stopped draining, `lastrecv` climbing 89 → 101 → 113 → 142 s while every
+download peer sat at 3–5 s. Production's sockets on the same box sit at 2–3 KB.
+
+`leg_pass_poll()` — the only reader of a pass helper's report — is called from
+exactly one place, the download worker's rotation, and `dl_catchup()` is called
+from that same rotation and does not return for hours. `legs_sweep_except()`,
+the only thing running during the download, skips every slot with
+`leg_pass_busy(k)`. A leg whose pass was outstanding at the handover is
+therefore not read, not pinged and not checked for the rest of the download,
+and the peer resets a connection nobody is reading. On the ninth boot the three
+legs that had a block announced at 00:06:11Z (`[tip] … its pass runs next`) are
+exactly the three whose sockets were gone by 00:30Z with no logged close; the
+two that never announced survived to their 20-minute ping timeout.
+
+Fixed by draining the reports before the handover, bounded by the pass budget,
+sweeping the legs while waiting, and logging the wait.
+
+**Unresolved:** leg 0 still had pings going out and pongs coming back (12 sent,
+4 answered in 45 minutes), which is not what a pass-busy slot looks like — so
+its own backlog may be a drain-rate problem in `txrelay_poll_leg` rather than
+the stranded pass. `g_pass[]` could not be read on the live node. The new close
+lines separate the two on the next run.
+
+**Untested hypothesis, recorded:** the dlc workers inherit the leg fds (fd 32
+was held by ten processes), so a leg the parent closes could stay ESTABLISHED
+while a child holds the inherited fd, and the peer would never see the FIN.
+That is the opposite of what happened to the three legs here — their sockets
+were gone from the kernel while the parent still held the fd — but it remains
+worth a look.
