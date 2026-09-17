@@ -2,6 +2,23 @@
 
 2026-09-17. Node commits [tt]e2f1e53c[/tt] -> [tt]3a3289b8[/tt], Bitcoin Core v31.1 oracle on the same machine.
 
+[quote][b]CORRECTED 2026-09-17, and INTERNAL -- not published.[/b] The wall-clock
+comparison this report drew against Bitcoin Core is [b]withdrawn[/b]. It set run 26's
+19h 34m beside a 19h 14m Core baseline and called that "within about 2% while
+building five indexes". Those two runs were not on the same storage: the Core
+baseline ran on a [b]Samsung Portable SSD T5[/b] (0.40 GiB/s sequential write), run 26
+on a [b]Corsair MP600 CORE XT NVMe[/b]. A Core run handicapped by a portable SSD
+against a bmc run on NVMe is a comparison of disks, not of implementations.
+
+The original version listed three caveats on that number -- the ten restarts, the
+mid-run binary swap, the Core baseline's unrecorded index settings -- and missed the
+one that mattered most. [b]There is currently no valid IBD wall-clock comparison
+between this node and Core.[/b] A matched pair is scheduled: both on the same device,
+both with every index they support, both with their config recorded before launch.
+
+Nothing else in this report is affected. The parity results below are comparisons of
+content, not of time, and they stand.[/quote]
+
 [b]The short version.[/b] A full mainnet initial block download by an independent Bitcoin full node written in x86-64 assembly, finishing with a chain identical to Core's block for block and a UTXO set identical to Core's coin for coin -- while building [b]five indexes concurrently with the sync[/b], including two that Core has no equivalent for. When the download ended, nothing started: no post-sync index build, no adoption pass, no supervisor waiting for the initial download to finish. That absence is the result this run was built to demonstrate.
 
 [hr]
@@ -44,7 +61,7 @@ Both heights were [b]pinned on both sides[/b]. An earlier report in this project
 [tr][td]CPU[/td][td]AMD Ryzen 9 9950X3D, 16 cores / 32 threads[/td][/tr]
 [tr][td]RAM[/td][td]123 GB[/td][/tr]
 [tr][td]kernel[/td][td]Linux 7.0.0-31-generic[/td][/tr]
-[tr][td]datadir[/td][td]NVMe-backed LVM volume, 3.6 TB[/td][/tr]
+[tr][td]datadir[/td][td]Corsair MP600 CORE XT NVMe ([tt]nvme0n1[/tt]), LVM, 3.6 TB[/td][/tr]
 [/table]
 
 [code]
@@ -70,7 +87,11 @@ addrindex=1           txospenderindex=1         bmc.indexrunblocks=20000
 
 [b]This is not a benchmark-grade wall clock, and it should not be quoted as one.[/b] Run 26 was restarted ten times. Nine of those were deploy-and-debug cycles on the evening of 09-16 while defects found [i]by[/i] the run were being fixed; the tenth, at 08:12 on 09-17, was a deliberate binary swap to pick up two fixes. The binary therefore changed underneath the run. A clean single-binary IBD number needs a run that is left alone from genesis to tip.
 
-For scale only, the last clean Core baseline measured on this box (2026-09-13, unhandicapped, 8 peers, no [tt]coinstatsindex[/tt]) finished 966,808 blocks in [b]19h 14m[/b]. Run 26 is within about 2% of that while building five indexes. Two caveats keep that from being a headline: run 26's restarts, and the fact that the Core baseline's [tt]txindex[/tt]/[tt]blockfilterindex[/tt] settings were not recorded at the time -- only that it carried no [tt]coinstatsindex[/tt]. The honest statement is [i]comparable wall clock with substantially more index work[/i], not a measured win.
+[b]And there is no Core number to set beside it.[/b] The last clean Core baseline on this box (2026-09-13, unhandicapped, 8 peers, no [tt]coinstatsindex[/tt]) finished 966,808 blocks in 19h 14m -- but it ran on the [b]Samsung Portable SSD T5[/b], 0.40 GiB/s sequential, while run 26 ran on [b]NVMe[/b]. Putting those two numbers in the same sentence compares storage, not software, and the earlier version of this report did exactly that. Withdrawn.
+
+Three further reasons that baseline could not carry the comparison anyway: run 26's ten restarts; the binary changing underneath it; and the baseline's [tt]txindex[/tt]/[tt]blockfilterindex[/tt] settings never having been recorded -- only that it carried no [tt]coinstatsindex[/tt].
+
+So the honest position is that [b]this report measures correctness, not speed.[/b] The wall clock above is an operational fact about run 26 and nothing more. A matched pair -- same device, same day, every index each node supports, configs recorded before launch, per-segment timings so one stalling peer is visible -- is what would settle it, and it has not been run yet.
 
 [hr]
 [size=12pt][b]The result this run existed to prove[/b][/size]
@@ -149,7 +170,7 @@ Net of the two indexes Core has no equivalent for, the datadir is 1017.2 GiB aga
 
 [b]Does:[/b] that an assembly implementation reaches Core's exact chain and Core's exact UTXO set over the full mainnet history; that five indexes, two of them without a Core counterpart, can be built entirely during the initial download; that the post-sync phase can be removed rather than shortened.
 
-[b]Does not:[/b] a clean IBD wall-clock comparison. Run 26 was restarted ten times and changed binaries mid-run. Nor does it establish steady-state serving performance -- address history on one of the most-used addresses on the chain ([tt]1dice8EM...[/tt], 3.2 M transactions through the Esplora facade) answers a balance in 4.6 s and 100,000 txids in 11.8 s. Acceptable for a page load; unmeasured under concurrency, and worth attention before anyone calls it fast.
+[b]Does not:[/b] any IBD wall-clock comparison with Core. Run 26 was restarted ten times, changed binaries mid-run, and the only Core baseline available ran on slower storage. Nor does it establish steady-state serving performance -- address history on one of the most-used addresses on the chain ([tt]1dice8EM...[/tt], 3.2 M transactions through the Esplora facade) answers a balance in 4.6 s and 100,000 txids in 11.8 s. Acceptable for a page load; unmeasured under concurrency, and worth attention before anyone calls it fast.
 
 [hr]
 [size=12pt][b]Reproducing the parity check[/b][/size]
