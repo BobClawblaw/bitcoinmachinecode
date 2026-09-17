@@ -662,6 +662,57 @@ int main(void) {
           } else ck("RPC-10 Content-Length present", 0); }
     }
 
+    /* ---- a client that will not read its reply must not stall the node ----
+     * (2026-09-17) Execution here is deliberately SERIAL: every handler runs
+     * under one lock because the wallet and chain handlers are not
+     * concurrent-safe. The reply used to be written to the client's socket
+     * INSIDE that lock, so a reply large enough to fill the socket buffers
+     * held the single execution lock until the peer read it -- or until the
+     * 30 s send timeout. One authenticated client that simply stops reading
+     * could therefore stall every other RPC on the node, including whatever
+     * monitoring would have shown it.
+     *
+     * The client below sends a batch whose reply is megabytes, shrinks its own
+     * receive buffer so the kernel cannot quietly absorb it, and never reads.
+     * While it hangs there, an ordinary request must still be answered
+     * promptly. Rendering needs the lock; writing to a socket does not. */
+    {
+        int sfd = socket(AF_INET, SOCK_STREAM, 0);
+        int rcv = 2048;                              /* tiny: force backpressure */
+        setsockopt(sfd, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof rcv);
+        struct sockaddr_in sa; memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET; sa.sin_port = htons((unsigned short)port);
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ck("silent-reader client connected", sfd >= 0 && connect(sfd, (struct sockaddr*)&sa, sizeof sa) == 0);
+
+        /* a batch of `help` calls: a small request with a very large reply */
+        size_t bcap = 64u << 10; char* batch = malloc(bcap); size_t bl = 0;
+        bl += (size_t)snprintf(batch + bl, bcap - bl, "[");
+        for (int i = 0; i < 600; i++)
+            bl += (size_t)snprintf(batch + bl, bcap - bl, "%s{\"id\":%d,\"method\":\"help\",\"params\":[]}", i ? "," : "", i);
+        bl += (size_t)snprintf(batch + bl, bcap - bl, "]");
+        char* req = malloc(bl + 4096); 
+        make_post(req, bl + 4096, port, "bitcoin", "bitcoin", batch, NULL);
+        (void)!send(sfd, req, strlen(req), MSG_NOSIGNAL);
+        free(req); free(batch);
+
+        /* give the server time to execute and start writing into our socket */
+        struct timespec pause = { 1, 0 }; nanosleep(&pause, NULL);
+
+        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+        char r2[8192];
+        make_post(r2, sizeof r2, port, "bitcoin", "bitcoin",
+                  "{\"id\":91,\"method\":\"getblockcount\",\"params\":[]}", NULL);
+        raw_exchange(port, r2, strlen(r2));
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        printf("      (ordinary request answered in %ldms while a client refuses to read)\n", ms);
+        ck("an ordinary request is answered while a client refuses to read its reply",
+           has_substr(raw_out, "\"id\":91") || has_substr(raw_out, "result"));
+        ck("...and promptly -- the socket write is not inside the execution lock", ms < 5000);
+        close(sfd);
+    }
+
     /* ---- teardown ---- */
     kill(srv, SIGTERM);
     waitpid(srv, NULL, 0);
