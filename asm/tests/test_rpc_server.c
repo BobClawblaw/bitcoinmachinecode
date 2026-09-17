@@ -154,6 +154,8 @@ static void make_post(char* buf, size_t cap, int port, const char* user,
 static int has_prefix(const char* s, const char* p) { return strncmp(s, p, strlen(p)) == 0; }
 static int has_substr(const char* s, const char* sub) { return strstr(s, sub) != NULL; }
 
+extern int rpc_body_concurrent(const char* body, unsigned long blen);
+
 int main(void) {
     /* ---- spin up the REAL server daemon on an ephemeral port ---- */
     int pout[2]; if (pipe(pout) < 0){ perror("pipe"); return 1; }
@@ -711,6 +713,37 @@ int main(void) {
            has_substr(raw_out, "\"id\":91") || has_substr(raw_out, "result"));
         ck("...and promptly -- the socket write is not inside the execution lock", ms < 5000);
         close(sfd);
+    }
+
+    /* ---- which methods may run concurrently (2026-09-17) ----------------
+     * Handlers run under one lock because they share a store handle, a block
+     * buffer and per-query caches. Four methods share none of that and were
+     * never protected by that lock anyway -- the peer tables are written by
+     * the download worker without it, and getmempoolinfo takes the mempool's
+     * own lock -- so they take the READ side and run concurrently.
+     *
+     * This asserts the CLASSIFICATION, not a timing. A method added to that
+     * list without checking what it touches is a data race, and a race does
+     * not show up as a slow test. */
+    {
+        struct { const char* body; int want; const char* why; } cases[] = {
+          { "{\"method\":\"getpeerinfo\",\"params\":[]}",         1, "getpeerinfo is concurrent" },
+          { "{\"method\":\"getconnectioncount\",\"params\":[]}",  1, "getconnectioncount is concurrent" },
+          { "{\"method\":\"getnetworkinfo\",\"params\":[]}",      1, "getnetworkinfo is concurrent" },
+          { "{\"method\":\"getmempoolinfo\",\"params\":[]}",      1, "getmempoolinfo is concurrent" },
+          { "{\"method\":\"getblockchaininfo\",\"params\":[]}",   0, "getblockchaininfo is NOT (it mutates the shared store handle)" },
+          { "{\"method\":\"getblock\",\"params\":[]}",            0, "getblock is NOT (shared block buffer)" },
+          { "{\"method\":\"getblocktemplate\",\"params\":[]}",    0, "getblocktemplate is NOT (static template arrays)" },
+          { "{\"method\":\"submitblock\",\"params\":[]}",         0, "a writer is NOT" },
+          { "{\"method\":\"sendrawtransaction\",\"params\":[]}",  0, "a writer is NOT" },
+          { "[{\"method\":\"getpeerinfo\",\"params\":[]}]",       0, "a BATCH takes the write lock even when every entry is concurrent" },
+          { "not json at all",                                      0, "an unparseable body takes the write lock" },
+          { "\"a bare string\"",                                    0, "a non-object body takes the write lock" },
+        };
+        for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++){
+            int got = rpc_body_concurrent(cases[i].body, strlen(cases[i].body));
+            ck(cases[i].why, got == cases[i].want);
+        }
     }
 
     /* ---- teardown ---- */

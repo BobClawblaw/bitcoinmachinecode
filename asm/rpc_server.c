@@ -781,14 +781,65 @@ static void send_response(int cfd, char* resp, size_t len) {
  * substantial mempool change -- divergence, documented here) re-enters the
  * SERIAL execution path by taking the same mutex the accept loop holds
  * around every handler. Handlers therefore never run concurrently. */
-static pthread_mutex_t g_exec_lock = PTHREAD_MUTEX_INITIALIZER;
+/* 2026-09-17: a READER/WRITER lock, not a mutex.
+ *
+ * Execution stayed serial because the wallet and chain handlers are not
+ * concurrent-safe -- they share a store handle, one block buffer, and per-query
+ * caches. That is still true, and every one of those handlers still takes the
+ * WRITE side, so nothing about them changes.
+ *
+ * But a handful of the most-polled methods share none of it, and the exec lock
+ * was never what protected them:
+ *   - getpeerinfo / getconnectioncount / getnetworkinfo read the shared peer
+ *     tables and g_node_status, which the download worker writes WITHOUT this
+ *     lock (dl_publish_peer_table) -- so the lock never guarded them against
+ *     their writer; it only serialised them against unrelated RPCs.
+ *   - getmempoolinfo is guarded by the MEMPOOL's own lock (mp_lock/mp_unlock),
+ *     which it takes itself.
+ * None of the four holds static scratch. They now take the read side and run
+ * concurrently with each other.
+ *
+ * Writer-preferring on purpose: with glibc's default a steady stream of these
+ * polls would starve submitblock behind them. */
+static pthread_rwlock_t g_exec_lock;
+static void exec_lock_init(void){
+    pthread_rwlockattr_t a;
+    pthread_rwlockattr_init(&a);
+#ifdef PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP
+    pthread_rwlockattr_setkind_np(&a, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
+    pthread_rwlock_init(&g_exec_lock, &a);
+    pthread_rwlockattr_destroy(&a);
+}
+/* The methods that may run concurrently. Deliberately short, and everything
+ * absent from it takes the write lock -- a method added here without checking
+ * what it touches is a data race, not a slow query. */
+static int rpc_method_is_concurrent(const char* m){
+    return !strcmp(m, "getpeerinfo")        || !strcmp(m, "getconnectioncount")
+        || !strcmp(m, "getnetworkinfo")     || !strcmp(m, "getmempoolinfo");
+}
+/* 1 only for a SINGLE request whose method is on that list. A batch takes the
+ * write lock whatever it contains: its entries are dispatched in one pass. */
+static int rpc_body_is_concurrent(const char* body, size_t blen){
+    rj_val* req = rj_parse(body, blen);
+    if (!req) return 0;
+    int yes = 0;
+    if (req->typ == RJ_OBJ){
+        rj_val* m = rj_obj_get(req, "method");
+        if (m && m->typ == RJ_STR && m->str) yes = rpc_method_is_concurrent(m->str);
+    }
+    rj_free(req);
+    return yes;
+}
 /* 2026-09-08: callers waiting for the exec lock. The Esplora facade's mempool
  * refresher takes the lock once per transaction of a pass and, on an
  * unfair mutex, kept winning it back: JSON-RPC and the facade's own routes
  * stalled for tens of seconds under an 11,900-transaction mempool. The
  * refresher now defers while this is non-zero (rpc_exec_waiters). */
 static volatile int g_exec_waiters = 0;
-static void exec_lock(void){ __sync_fetch_and_add(&g_exec_waiters, 1); pthread_mutex_lock(&g_exec_lock); __sync_fetch_and_sub(&g_exec_waiters, 1); }
+static void exec_lock(void){ __sync_fetch_and_add(&g_exec_waiters, 1); pthread_rwlock_wrlock(&g_exec_lock); __sync_fetch_and_sub(&g_exec_waiters, 1); }
+static void exec_rlock(void){ __sync_fetch_and_add(&g_exec_waiters, 1); pthread_rwlock_rdlock(&g_exec_lock); __sync_fetch_and_sub(&g_exec_waiters, 1); }
+static void exec_unlock(void){ pthread_rwlock_unlock(&g_exec_lock); }
 int rpc_exec_waiters(void){ return g_exec_waiters; }
 #define LP_MAX_WAIT_S  60
 #define LP_POLL_MS     250
@@ -870,6 +921,10 @@ static int lp_is_gbt(const char* body, size_t blen){
     return yes;
 }
 int rpc_lp_is_gbt(const char* body, unsigned long blen){ return lp_is_gbt(body, (size_t)blen); }
+/* Exposed for test_rpc_server: the classification that decides read lock vs
+ * write lock. Getting this wrong is a data race, not a slow query, so the
+ * policy is pinned rather than inferred from timings. */
+int rpc_body_concurrent(const char* body, unsigned long blen){ return rpc_body_is_concurrent(body, (size_t)blen); }
 
 typedef struct { int cfd; char* buf; size_t body_off, blen; unsigned char prev[32]; int have_prev; } lp_req_t;
 
@@ -886,7 +941,7 @@ static void* lp_waiter(void* arg){
     exec_lock();
     size_t lp_len = 0;
     char* lp_resp = render_request(r->buf + r->body_off, r->blen, &lp_len);
-    pthread_mutex_unlock(&g_exec_lock);
+    exec_unlock();
     send_response(r->cfd, lp_resp, lp_len);        /* socket write, lock released */
     free(r->buf); free(r);
     lp_waiters_release();                          /* RPC-5 */
@@ -1054,10 +1109,11 @@ static void service_conn(int cfd) {
               lp_waiters_release();                  /* RPC-5: spawn failed */
           }
       } }
-    exec_lock();
+    int ro = rpc_body_is_concurrent(body, blen);
+    if (ro) exec_rlock(); else exec_lock();
     size_t resplen = 0;
     char* resp = render_request(body, blen, &resplen);
-    pthread_mutex_unlock(&g_exec_lock);
+    exec_unlock();
     send_response(cfd, resp, resplen);             /* socket write, lock released */
     free(buf);
 }
@@ -1121,7 +1177,7 @@ static void* esp_server_thread(void* arg){
     return 0;
 }
 static void esp_lock(void){ exec_lock(); }
-static void esp_unlock(void){ pthread_mutex_unlock(&g_exec_lock); }
+static void esp_unlock(void){ exec_unlock(); }
 /* Core's REST interface (rest=1, 2026-09-08): served by the JSON-RPC listener, dispatch-locked like the facade */
 void rpc_rest_enable(int on){ g_rest_on = on; rest_set_exec_lock(esp_lock, esp_unlock); }
 int rpc_esplora_start(const char* bind_addr, int port, char* errmsg, size_t errcap){
@@ -1217,6 +1273,7 @@ static void* worker_thread(void* arg){
 
 int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
                      char* errmsg, size_t errcap) {
+    exec_lock_init();   /* rwlock: writer-preferring, see g_exec_lock */
     g_user = cfg->user;
     g_pass = cfg->pass;
     g_wallet = cfg->wallet;
