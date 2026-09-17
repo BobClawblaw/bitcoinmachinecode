@@ -2939,15 +2939,16 @@ long mpool_policy_entry(void* st, const unsigned char txid[32],
                         unsigned long long* fee, unsigned long long* size){
     if (!st || *(uint32_t*)st != MPOL_MAGIC) return 0;
     mpol_node* t = mpol_nodes_base(st);
-    uint32_t n = *(uint32_t*)((char*)st+16);
-    for (uint32_t i = n; i > 0; i--){
-        if (!memcmp(t[i-1].txid, txid, 32)){
-            if (fee)  *fee  = t[i-1].fee;
-            if (size) *size = t[i-1].size;   /* vsize (Core reports vsize) */
-            return 1;
-        }
-    }
-    return 0;
+    /* MEM-12's node index has been maintained at every link/unlink since it
+     * landed, and find_node() walks it with the full key re-verified -- but
+     * this function, and the three below, kept scanning the array. Every
+     * caller that asks per transaction was therefore O(n^2): getmempoolinfo
+     * summing fees, getblocktemplate pricing candidates. Use the index. */
+    int self = find_node(st, txid);
+    if (self < 0) return 0;
+    if (fee)  *fee  = t[self].fee;
+    if (size) *size = t[self].size;          /* vsize (Core reports vsize) */
+    return 1;
 }
 
 /* Sum fee and vsize over every policy entry in ONE pass.
@@ -2995,20 +2996,18 @@ static int mpe_seen(unsigned char set[][32], int n, const unsigned char* txid){
 long mpool_policy_n_parents(void* st, const unsigned char txid[32]){
     if (!st || *(uint32_t*)st != MPOL_MAGIC) return -1;
     mpol_node* t = mpol_nodes_base(st);
-    uint32_t n = *(uint32_t*)((char*)st+16);
-    for (uint32_t i = n; i > 0; i--)
-        if (!memcmp(t[i-1].txid, txid, 32)) return (long)t[i-1].n_parents;
-    return -1;
+    int self = find_node(st, txid);
+    return self < 0 ? -1 : (long)t[self].n_parents;
 }
 int mpol_in_package_context(void){ return g_pkg_n > 0; }
 
 long mpool_policy_set_sigops(void* st, const unsigned char txid[32], unsigned int cost){
     if (!st || *(uint32_t*)st != MPOL_MAGIC) return 0;
     mpol_node* t = mpol_nodes_base(st);
-    uint32_t n = *(uint32_t*)((char*)st+16);
-    for (uint32_t i = n; i > 0; i--)
-        if (!memcmp(t[i-1].txid, txid, 32)){ t[i-1].sigop_cost = cost; return 1; }
-    return 0;
+    int self = find_node(st, txid);
+    if (self < 0) return 0;
+    t[self].sigop_cost = cost;
+    return 1;
 }
 
 /* ---- the WHOLE graph in one pass -----------------------------------------
@@ -3111,9 +3110,7 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
     if (!st || *(uint32_t*)st != MPOL_MAGIC || !out) return 0;
     mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
-    long self = -1;
-    for (uint32_t i = n; i > 0; i--)
-        if (!memcmp(t[i-1].txid, txid, 32)){ self = (long)(i-1); break; }
+    long self = find_node(st, txid);       /* was a scan; MEM-12's index answers it */
     if (self < 0) return 0;
     memset(out, 0, sizeof *out);
     out->fee  = t[self].fee;
