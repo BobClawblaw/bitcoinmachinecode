@@ -159,7 +159,18 @@ int main(int argc, char** argv){
     snprintf(tmp_name, sizeof tmp_name, "%s.tmp", out_name);
     fprintf(stderr, "[addrhist] dir=%s tip=%ld range=[%ld,%ld]%s -> %s\n", argv[1], tip, from_h, to_h, g_run_mode ? " (run: spends from undo)" : "", out_name);
     char b[64];
-    for (int i = 0; i < NB; i++){ kb[i] = fopen(nm(b, "ahk", i), "wb"); ob[i] = fopen(nm(b, "aho", i), "wb"); sb_[i] = fopen(nm(b, "ahs", i), "wb"); if (!kb[i] || !ob[i] || !sb_[i]){ perror("bucket"); return 1; } }
+    /* The key buckets feed pass 3 and both modes need them. The outref and
+     * spendref buckets belong to the whole-chain JOIN: a run takes its spends
+     * from undo and skips pass 2 entirely -- and pass 2 is the only place that
+     * unlinks them, so opening them in run mode left 512 empty files behind
+     * after every run. Do not create what this mode never writes. */
+    for (int i = 0; i < NB; i++){
+        kb[i] = fopen(nm(b, "ahk", i), "wb"); if (!kb[i]){ perror("bucket"); return 1; }
+        if (!g_run_mode){
+            ob[i] = fopen(nm(b, "aho", i), "wb"); sb_[i] = fopen(nm(b, "ahs", i), "wb");
+            if (!ob[i] || !sb_[i]){ perror("bucket"); return 1; }
+        }
+    }
     u8* blockbuf = malloc(BLOCKBUF); u8* scratch = malloc(BLOCKBUF); if (!blockbuf || !scratch){ fprintf(stderr, "oom\n"); return 1; }
     time_t t0 = time(NULL);
     for (long h = from_h; h <= to_h; h++){
@@ -177,7 +188,7 @@ int main(int argc, char** argv){
         }
         if (h % 20000 == 0) fprintf(stderr, "[addrhist] pass1 %ld/%ld (%llu funds, %llu spendrefs, %llds)\n", h, to_h, (unsigned long long)n_fund, (unsigned long long)n_spendref, (long long)(time(NULL) - t0));
     }
-    for (int i = 0; i < NB; i++){ fclose(ob[i]); fclose(sb_[i]); }
+    if (!g_run_mode) for (int i = 0; i < NB; i++){ fclose(ob[i]); fclose(sb_[i]); }
     fprintf(stderr, "[addrhist] pass1 done: %llu funds, %llu spendrefs, %llds\n", (unsigned long long)n_fund, (unsigned long long)n_spendref, (long long)(time(NULL) - t0));
     /* pass 2: join (whole-chain mode only; a run got its spends from undo) */
     for (int i = 0; i < NB && !g_run_mode; i++){
