@@ -99,6 +99,18 @@ static long mk_block(u8* out, const u8 prev_hash[32], const u8* txs, long txlen,
 
 static u8 SPK_A[25], SPK_B[22];                                /* P2PKH, P2WPKH */
 
+extern long axt_read_events(int type, const unsigned char hash[32], long min_height,
+                            int (*cb)(void* ctx, int op, const unsigned char txid[32],
+                                      unsigned vout, unsigned long long value, unsigned height),
+                            void* ctx);
+static int big_cb(void* ctx, int op, const unsigned char txid[32], unsigned vout,
+                  unsigned long long value, unsigned height){
+    struct { long n; unsigned long long sum; }* g = ctx;
+    (void)op; (void)txid; (void)vout; (void)height;
+    g->n++; g->sum += value;
+    return 1;
+}
+
 int main(void){
     tt_isolate();
 
@@ -262,6 +274,48 @@ int main(void){
       axt_boot(store);
       ck("without an applied height the boot backfills to the archive tip", axt_active() && axt_covered() == 2);
       axt_set_applied_height(0); }
+
+    /* ---- a journal LARGER THAN 2 GB (2026-09-17) ------------------------
+     * axt_read_events used to malloc() the whole journal and pread() it in one
+     * call. Linux caps a single read at 0x7ffff000 (~2 GB), so the moment the
+     * journal passed that -- about 1,200 blocks after every rotation -- the
+     * pread came back short, the function returned -1, and rpc_chain.c's
+     * caller SWALLOWED that error and answered from the history runs alone.
+     * Measured on run 26 at the tip with a 12.59 GB journal: address
+     * 1BvBMSEY... was missing 81 spends and 2 funds, and reported a balance of
+     * 1,541,800 sat with 79 UTXOs for an address that held nothing.
+     *
+     * The file here is SPARSE: ftruncate past the 2 GB line costs no disk and
+     * the zero records match no key, so the test is cheap. The record that
+     * matters sits beyond the boundary -- reachable only if the whole journal
+     * is really scanned. */
+    { unlink(AXF_TAIL_FILE);
+      const off_t LIMIT = 0x7ffff000;                 /* the kernel's single-read cap */
+      off_t big = ((LIMIT + (off_t)(1 << 20)) / AXF_TAIL_REC) * AXF_TAIL_REC;
+      int fd = open(AXF_TAIL_FILE, O_RDWR | O_CREAT | O_TRUNC, 0644);
+      ck("oversized journal created", fd >= 0);
+      int sized = (fd >= 0 && ftruncate(fd, big + AXF_TAIL_REC) == 0);
+      ck("journal is sparse and past the 2 GB single-read cap", sized && big > LIMIT);
+      unsigned char rec[AXF_TAIL_REC]; memset(rec, 0, sizeof rec);
+      rec[0] = AXF_OP_ADD; rec[1] = AXF_P2WPKH; memcpy(rec + 2, keyB, 32);
+      unsigned long long v = 4242; unsigned vout = 0, ht = 9;
+      memcpy(rec + 66, &vout, 4); memcpy(rec + 70, &v, 8); memcpy(rec + 78, &ht, 4);
+      ck("a record written BEYOND the 2 GB boundary",
+         sized && pwrite(fd, rec, sizeof rec, big) == (ssize_t)sizeof rec);
+      if (fd >= 0) close(fd);
+      /* axt_read_EVENTS is the reader getaddressbalance/getaddresstxids use,
+       * and the one that slurped the file in a single pread. (axt_read_address
+       * reads in 512-record chunks and was never affected -- testing that one
+       * instead is how the first version of this test passed against the bug.) */
+      struct { long n; unsigned long long sum; } got = { 0, 0 };
+      long nt = axt_read_events(AXF_P2WPKH, keyB, 0, big_cb, &got);
+      /* Before the fix: the single pread comes back short, this returns -1,
+       * and the caller in rpc_chain.c discarded that -- a wrong balance with
+       * no error anywhere. */
+      ck("axt_read_events does not fail on a journal past 2 GB", nt >= 0);
+      ck("the record past 2 GB is found (the whole journal is scanned)",
+         got.n == 1 && got.sum == 4242);
+      unlink(AXF_TAIL_FILE); }
 
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
