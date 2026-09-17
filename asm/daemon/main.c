@@ -4521,6 +4521,14 @@ static int dlc_committer_main(volatile long* ctl, long start_h, long end_h, pid_
     { extern unsigned int net_magic; *(int*)((char*)st + 36) = (int)net_magic; }
     *(int*)((char*)st + 28) = 0; *(int*)((char*)st + 0) = -1;
     store_reload(st);
+    /* store_reload is SUPPOSED to move the cursor off file 0 to the tip's
+     * file. When it does not -- a short or unreadable index, an empty one --
+     * the cursor stays at 0 and store_append_shared walks up from
+     * blk00000.dat filling the tail gap of every full file, which is a layout
+     * break per block. Six of those on run 26, one per restart. Belt and
+     * braces: the frontier is the newest file that exists, whatever reload
+     * decided. */
+    archive_store_frontier(st);
     store_set_sync(0);                                       /* this process only; synced per chunk below */
     int r = dlc_committer_run(ctl, start_h, end_h, st, store_append_shared, dlc_index_present, 20, parent, dlc_store_sync_chunk);
     close(lfd);

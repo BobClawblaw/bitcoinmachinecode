@@ -768,7 +768,7 @@ rollback. The scratch copy needs as much space as the archive.
 | `[tor] no onion service: ...` | Control-port authentication failed or the port is unreachable. Check `torcontrol=`, cookie readability (`SupplementaryGroups=debian-tor`) or set `torpassword=`. Outbound onion is unaffected. |
 | `[dial] no IPv6 on this host: ipv6 and cjdns peers are unreachable` | Enable host IPv6 (and run `cjdroute`) for `cjdnsreachable=1`. |
 | `[wallet] walletpassfile "..." not usable: <why>` / `is inside the datadir -- refusing` | Fix path and mode (absolute, outside the datadir, 0640 or stricter, not group-writable). The wallet stays locked until then. |
-| `[boot] archive check found N problem(s)` | Read the `[check]` lines above it. The non-monotonic layout notice is expected on a parallel-downloaded archive (see *Maintenance*); other findings name the height. |
+| `[boot] archive check found N problem(s)` | Read the `[check]` lines above it, and do NOT assume the non-monotonic layout notice is benign. It was expected before the in-order committer (2026-09-08) and is a DEFECT after it: a fresh sync on this build must pass the check. On run 26 it meant six layout breaks, one per restart during the download, each scattering ~33 blocks into the tail gaps of older `blk` files — which disables truncation and pruning. Fixed by the append-frontier guard (2026-09-17); an archive built before that keeps its breaks until `tests/tool_archive_relayout` rewrites it. Other findings name the height. |
 | a second `bmcbitcoind` with the same command line | A compaction child. Check `/proc/<pid>/exe` and the parent PID before assuming a duplicate daemon; never run two daemons on one chain directory. |
 
 ## Running more than one chain
