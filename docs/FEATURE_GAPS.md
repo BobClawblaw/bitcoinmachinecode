@@ -534,36 +534,72 @@ list this node does not have. All three stay on the warning list.
   the BIP30 overwrite. A fresh sync ends with every index current and the same
   trailing builders keep it so.
 
-- **An idle outbound leg is never pinged and so never times out.** Measured on
-  run 26, 2026-09-16, with `getpeerinfo` and the node's own log:
+- ~~**getpeerinfo shows dead peers during initial block download**~~ —
+  **FIXED 2026-09-17** (reported as "3 dead peers" from the monitor, and
+  misdiagnosed twice before it was understood).
+
+  The symptom: three entries reading "connected 54m, last recv 54.3m, 1.3 KB"
+  while the download peers were at 20 s and gigabytes.
+
+  Three distinct causes, each found only by checking the node against the
+  kernel instead of reasoning from the code:
+
+  1. **The peer-table publisher did not run during IBD.** It was inline in
+     `serve_download_worker`'s `for(;;)` loop; the node is in `dl_catchup`'s
+     loop while syncing. Every leg's bytes and last-activity froze at the
+     moment catch-up began: `getpeerinfo` claimed 1,412 bytes and 54 minutes
+     of silence for a socket the kernel showed at 391,956 bytes and 9.6
+     SECONDS since the last send. Closed legs were never retired at all.
+     Fixed by extracting `dl_publish_peer_table()` and calling it from both
+     loops. The tip is deliberately NOT published from the catch-up path --
+     doing so broke `test_dlc_interleave`'s bound, which caught it.
+  2. **A stale descriptor number counted as a live leg.** `mux_out_fd[i] >= 0`
+     only says the slot holds a number. `TCP_INFO` on it is the liveness test;
+     failure now retires the slot.
+  3. **A recycled descriptor published a stale address with another socket's
+     stats.** The number outlives the leg and the kernel hands it to the next
+     socket opened, so `TCP_INFO` succeeds on something unrelated. One entry
+     survived every republish this way. `getpeername` ties the number back to
+     the recorded address; a mismatch retires the slot.
+
+  Verified on run 26 mid-sync: entries 12, connections 12, ghosts **0** across
+  repeated samples, at 11.2 MB/s. Before: 5 of 15 entries had no socket in any
+  state.
+
+  **What this was NOT:** an idle-leg ping bug, which is how I first filed it
+  from `leg_ping_timed_out`'s predicate alone without checking whether the
+  sockets existed. `ss` showed zero sockets for all three addresses. You cannot
+  ping a leg that is not there, and one command separated the two.
+
+
+
+- **Outbound leg slots churn about nine times an hour and almost no departure
+  is logged.** Measured on run 26 mid-sync, 2026-09-17, one boot:
 
   ```
-  addr                     conn_age  last_recv  last_send   bytesrecv
-  184.171.208.109:8333        2169s      2169s      2169s        1348
-  173.231.31.178:8333         2169s      2169s      2169s        1348
-  34.102.75.53:8333           2169s      2169s      2169s         150
+  handshakes : 42   across 32 distinct addresses
+  re-dials   : slot 0 -> 9x, slot 1 -> 9x, slot 2 -> 9x, slot 3 -> 6x, slot 4 -> 5x
+  closes logged : 1   ("theirs (revents 0x2001)")
+  legs alive    : 4
   ```
 
-  These are `outbound 0/1/2` -- the relay legs. They completed the handshake,
-  negotiated compact blocks, and then exchanged NOTHING for 36 minutes while
-  the 8 download-worker peers were at 7 s and gigabytes. `ping-timeout` closes
-  this boot: **0**.
+  41 of 42 departures have no logged reason, so it cannot be said whether the
+  peers hung up or the node dropped them. This is the same signature as the
+  production incident whose lesson was "leg closes need a named owner": a
+  slot-carried three-strike streak and a 60 s budget were closing healthy legs
+  silently, and eight were lost in twelve minutes before anyone could see it.
 
-  The mechanism is not missing, it is unreachable. `leg_ping_timed_out` is
-  `sent != 0 && pong_at < sent && now - sent >= 1200`, so a leg the node has
-  never pinged (`sent == 0`) can never time out -- and `last_send == conn_age`
-  says it never pinged these. `leg_ping_due` returns true for `sent == 0`, so
-  the ping should go out on the first sweep; `legs_sweep_except` skips any leg
-  where `leg_pass_busy(k)` ("a pass helper owns that socket"), which is the
-  first thing to check.
+  Noticed while looking at something else: an operator reported the relay legs
+  as dead peers because they show 0 B/s next to download peers pulling
+  megabytes a second. They were not dead -- they answer within 21-73 s and
+  carry 1 MB against the download path's 8.2 GB, which is what a relay leg
+  does during a sync. The legs are FINE; the churn is the question.
 
-  Cost: three outbound slots held by peers that will never speak, for the life
-  of the process, and a monitor correctly reporting them as dead. Core pings
-  every 2 minutes and disconnects at 20 (`TIMEOUT_INTERVAL`), which this node
-  copies in the constants and not in the reachable path.
-
-  NOT fixed: found while the index-run work was mid-flight, and filed rather
-  than started, because the session already had one unproven fix in it.
+  Do NOT "fix" this by dropping low-throughput legs faster: an absolute
+  32 KB/s eviction floor killed healthy early-chain peers for four benchmark
+  runs (see the thresholds entry). Any rule here has to be about liveness, and
+  the first step is making every close name its owner so the reasons can be
+  counted at all.
 
 ## Update 2026-08-30 — Erlay: a deliberate stopping point
 
