@@ -944,6 +944,44 @@ static int find_node(void* st, const unsigned char txid[32]){
     return -1;
 }
 
+/* Children index: the reverse of parent[], built in O(n + edges).
+ *
+ * The node index answers "where is this txid". It says nothing about who
+ * SPENDS a transaction, and parent[] only points upward, so finding children
+ * meant scanning every node -- once for spentby, and again for every entry
+ * popped during the descendant walk. On an 11,000-transaction mempool that is
+ * up to MPE_MAX_SET full passes for ONE getmempoolentry.
+ *
+ * head[i] is the first edge of node i's child list, nxt[] chains it, chld[]
+ * holds the child's node index. Edges are pushed with i DESCENDING so a walk
+ * yields children in ascending node order -- the order the scans it replaces
+ * produced, so the reported sets keep their shape.
+ *
+ * One allocation pass per call, freed by the caller. mpool_policy_entry_info_all
+ * builds the same thing inline for its whole-registry sweep. */
+static int mpol_children_build(void* st, uint32_t n,
+                               uint32_t** head_o, uint32_t** nxt_o, uint32_t** chld_o){
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t edges = 0;
+    for (uint32_t i = 0; i < n; i++) edges += t[i].n_parents;
+    uint32_t* head = (uint32_t*)malloc((size_t)(n ? n : 1) * sizeof *head);
+    uint32_t* nxt  = (uint32_t*)malloc((size_t)(edges ? edges : 1) * sizeof *nxt);
+    uint32_t* chld = (uint32_t*)malloc((size_t)(edges ? edges : 1) * sizeof *chld);
+    if (!head || !nxt || !chld){ free(head); free(nxt); free(chld); return 0; }
+    for (uint32_t i = 0; i < n; i++) head[i] = MPOL_IDX_NONE;
+    uint32_t e = 0;
+    for (uint32_t ii = n; ii > 0; ii--){          /* descending: walks come out ascending */
+        uint32_t i = ii - 1;
+        for (uint32_t k = 0; k < t[i].n_parents; k++){
+            uint32_t pp = mpol_par_at(st, &t[i], k);
+            if (pp >= n) continue;
+            chld[e] = i; nxt[e] = head[pp]; head[pp] = e; e++;
+        }
+    }
+    *head_o = head; *nxt_o = nxt; *chld_o = chld;
+    return 1;
+}
+
 /* Collect the DISTINCT in-pool parents of a transaction.
  *
  * MEM-3 (audit 2026-09-03) was that this list was capped at 24 and the
@@ -3124,14 +3162,25 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
         if (!mpe_seen(out->depends, out->n_depends, t[p].txid))
             memcpy(out->depends[out->n_depends++], t[p].txid, 32);
     }
-    for (uint32_t i=0; i<n && out->n_spentby<MPE_MAX_SET; i++){
-        if ((long)i == self) continue;
-        for (uint32_t k=0; k<t[i].n_parents; k++)
-            if (mpol_par_at(st, &t[i], k) == (uint32_t)self){
-                if (!mpe_seen(out->spentby, out->n_spentby, t[i].txid))
-                    memcpy(out->spentby[out->n_spentby++], t[i].txid, 32);
-                break;
-            }
+    uint32_t *ch_head = 0, *ch_nxt = 0, *ch_chld = 0;
+    int have_ch = mpol_children_build(st, n, &ch_head, &ch_nxt, &ch_chld);
+    if (have_ch){
+        for (uint32_t e = ch_head[self]; e != MPOL_IDX_NONE && out->n_spentby < MPE_MAX_SET; e = ch_nxt[e]){
+            uint32_t i = ch_chld[e];
+            if ((long)i == self) continue;
+            if (!mpe_seen(out->spentby, out->n_spentby, t[i].txid))
+                memcpy(out->spentby[out->n_spentby++], t[i].txid, 32);
+        }
+    } else {                                   /* allocation failed: the old sweep */
+        for (uint32_t i=0; i<n && out->n_spentby<MPE_MAX_SET; i++){
+            if ((long)i == self) continue;
+            for (uint32_t k=0; k<t[i].n_parents; k++)
+                if (mpol_par_at(st, &t[i], k) == (uint32_t)self){
+                    if (!mpe_seen(out->spentby, out->n_spentby, t[i].txid))
+                        memcpy(out->spentby[out->n_spentby++], t[i].txid, 32);
+                    break;
+                }
+        }
     }
     { uint32_t stack[MPE_MAX_SET]; int sp=0;
       memcpy(out->anc[out->n_anc++], t[self].txid, 32); out->anc_fee = t[self].fee;
@@ -3155,18 +3204,30 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
       stack[sp++] = (uint32_t)self;
       while (sp > 0){
           uint32_t cur = stack[--sp];
-          for (uint32_t i=0; i<n; i++){
-              if (mpe_seen(out->desc, out->n_desc, t[i].txid)) continue;
-              int child = 0;
-              for (uint32_t k=0; k<t[i].n_parents; k++)
-                  if (mpol_par_at(st, &t[i], k) == cur){ child = 1; break; }
-              if (!child) continue;
-              if (out->n_desc >= MPE_MAX_SET) break;
-              memcpy(out->desc[out->n_desc++], t[i].txid, 32);
-              out->desc_fee += t[i].fee;
-              if (sp < MPE_MAX_SET) stack[sp++] = i;
+          if (have_ch){
+              for (uint32_t e = ch_head[cur]; e != MPOL_IDX_NONE; e = ch_nxt[e]){
+                  uint32_t i = ch_chld[e];
+                  if (mpe_seen(out->desc, out->n_desc, t[i].txid)) continue;
+                  if (out->n_desc >= MPE_MAX_SET) break;
+                  memcpy(out->desc[out->n_desc++], t[i].txid, 32);
+                  out->desc_fee += t[i].fee;
+                  if (sp < MPE_MAX_SET) stack[sp++] = i;
+              }
+          } else {
+              for (uint32_t i=0; i<n; i++){
+                  if (mpe_seen(out->desc, out->n_desc, t[i].txid)) continue;
+                  int child = 0;
+                  for (uint32_t k=0; k<t[i].n_parents; k++)
+                      if (mpol_par_at(st, &t[i], k) == cur){ child = 1; break; }
+                  if (!child) continue;
+                  if (out->n_desc >= MPE_MAX_SET) break;
+                  memcpy(out->desc[out->n_desc++], t[i].txid, 32);
+                  out->desc_fee += t[i].fee;
+                  if (sp < MPE_MAX_SET) stack[sp++] = i;
+              }
           }
       } }
+    free(ch_head); free(ch_nxt); free(ch_chld);
     return 1;
 }
 
