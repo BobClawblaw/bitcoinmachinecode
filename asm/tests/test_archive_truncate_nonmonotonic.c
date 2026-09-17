@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include "test_tmpdir.h"
+#include "../daemon/archive_verify.h"
 
 /* state struct layout must mirror bitcoin_store.asm (see tests/test_truncate.c) */
 struct St {
@@ -216,6 +217,57 @@ int main(void){
         unsigned long long meta[3];
         ck("height 4 still readable", store_get_at(&st, 4, meta), 1);
         ck("height 5 now out of range", store_get_at(&st, 5, meta), -2);
+    }
+
+    /* ---- the append frontier (2026-09-17) -------------------------------
+     * store_append_shared self-heals its POSITION (lseek to the true end of
+     * the file it has open) but not its FILE NUMBER, and its rollover walks
+     * forward one file at a time until one has room. A handle whose
+     * cur_file_no is behind therefore does not fail -- it fills the leftover
+     * tail gap of every older file on the way up, and each of those writes
+     * puts a LOWER offset at a HIGHER height.
+     *
+     * Measured on run 26: six layout breaks, each the first block appended
+     * after a restart, scattering ~33 blocks over 16 old files. The committer
+     * sets cur_file_no = 0 and relies on store_reload to move it; when that
+     * does not happen the walk starts at blk00000.dat.
+     *
+     * archive_store_frontier() makes the invariant hold whatever left the
+     * cursor behind: the newest blk file that exists, or nothing to do. */
+    {
+        printf("\n-- append frontier --\n");
+        for (int i = 0; i <= 5; i++){
+            char nm[32]; snprintf(nm, sizeof nm, "blk%05d.dat", i);
+            int fd = open(nm, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0){ (void)!write(fd, "x", 1); close(fd); }
+        }
+        unsigned char h[4096];
+        memset(h, 0, sizeof h);
+        long long minus1 = -1;
+        unsigned int zero = 0;
+        memcpy(h + 0, &minus1, 8);          /* cur_blk_fd = -1, as store_init writes it */
+        memcpy(h + 28, &zero, 4);           /* cur_file_no = 0 -- the stale cursor */
+
+        archive_store_frontier(h);
+        unsigned int got = 0; memcpy(&got, h + 28, 4);
+        ckcond("a cursor left at file 0 is advanced to the newest file that exists", got == 5);
+
+        /* already at the frontier: nothing changes, and the open fd is kept */
+        long long keep = 7; memcpy(h + 0, &keep, 8);
+        archive_store_frontier(h);
+        memcpy(&got, h + 28, 4);
+        long long fdnow = 0; memcpy(&fdnow, h + 0, 8);
+        ckcond("a cursor already at the frontier is left alone", got == 5);
+        ckcond("...and its open block file is not disturbed", fdnow == 7);
+
+        /* a cursor ABOVE every existing file is not dragged backwards */
+        unsigned int high = 99; memcpy(h + 28, &high, 4);
+        memcpy(h + 0, &minus1, 8);
+        archive_store_frontier(h);
+        memcpy(&got, h + 28, 4);
+        ckcond("a cursor above the newest file is not moved down", got == 99);
+
+        for (int i = 0; i <= 5; i++){ char nm[32]; snprintf(nm, sizeof nm, "blk%05d.dat", i); unlink(nm); }
     }
 
     if (failures) printf("\nFAILURES: %d\n", failures);

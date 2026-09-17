@@ -254,6 +254,47 @@ long archive_drop_utxo_state(void){
  *
  * Index record (48B): [0..31] hash, [32..35] file_no u32,
  *                     [36..43] data_pos u64, [44..47] data_size u32. */
+/* Advance a store handle's append cursor to the NEWEST blk file.
+ *
+ * WHY THIS EXISTS. store_append_shared self-heals its POSITION -- it lseeks to
+ * the true end of whatever blk file the handle has open -- but not its FILE
+ * NUMBER, and its rollover walks forward one file at a time until it finds one
+ * with room. So a handle whose cur_file_no is stale or low does not fail: it
+ * quietly fills the leftover tail gap of every older file on the way up, and
+ * every one of those writes puts a lower offset at a higher height.
+ *
+ * Measured on run 26: six breaks, each the FIRST block appended after a
+ * restart, scattering ~33 blocks across 16 old files before appending returned
+ * to the newest. The committer sets cur_file_no = 0 and calls store_reload to
+ * move it to the tip's file; when that does not happen the cursor stays at 0
+ * and the walk starts from blk00000.dat. The archive stays readable and the
+ * chain stays correct -- run 26 matched Core's UTXO set exactly -- but
+ * truncation and pruning both refuse to run on a non-monotonic layout, which
+ * is what archive_layout_monotonic() reports at every boot.
+ *
+ * This makes the invariant hold regardless of WHY the cursor is behind:
+ * probe forward for the highest blk file that exists and point the handle at
+ * it, forcing a reopen. Cheap -- one stat per file above the cursor, normally
+ * none. Handle offsets are the ones daemon/main.c already pokes (+0 blk fd,
+ * +28 cur_file_no); see bitcoin_store.asm's header for the layout. */
+void archive_store_frontier(void* stv){
+    if (!stv) return;
+    unsigned char* st = (unsigned char*)stv;
+    unsigned int cur = 0; memcpy(&cur, st + 28, 4);
+    unsigned int n = cur;
+    for (;;){
+        char p[32]; struct stat sb;
+        snprintf(p, sizeof p, "blk%05u.dat", n + 1);
+        if (stat(p, &sb) != 0) break;
+        n++;
+    }
+    if (n == cur) return;
+    memcpy(st + 28, &n, 4);
+    long long fd = 0; memcpy(&fd, st + 0, 8);
+    if (fd >= 0) close((int)fd);
+    fd = -1; memcpy(st + 0, &fd, 8);      /* qword, as store_init writes it: forces reopen */
+}
+
 long archive_layout_monotonic(long upto){
     int fd = open("index.dat", O_RDONLY);
     if (fd < 0) return -1;
