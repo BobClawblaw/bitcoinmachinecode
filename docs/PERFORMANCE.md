@@ -1,6 +1,6 @@
 # Serving performance: bitcoinmachinecode vs Bitcoin Core
 
-**Living document.** Last measured 2026-09-17, node commit `31cffbc0`, against
+**Living document.** Last measured 2026-09-17, node commit `07256990`, against
 the Bitcoin Core v31.99 oracle on the same machine.
 
 This covers the node **after** the sync: the RPC surface, memory, and disk.
@@ -44,7 +44,7 @@ setup, not the node.
 | `uptime` | 2 ms | 3 ms |
 | `getdifficulty` | 2 ms | 2 ms |
 | `getconnectioncount` | 2 ms | 2 ms |
-| `getblockchaininfo` | 5 ms | 2 ms |
+| `getblockchaininfo` | 2 ms | 2 ms |
 
 ## 2. Fixed workload — directly comparable
 
@@ -70,41 +70,45 @@ head-to-head rows.**
 The raw `getrawmempool verbose` numbers look like a 10× bmc win. They are not.
 Per transaction it is a wash, and Core is very slightly ahead.
 
-## 4. Concurrency — partly fixed, and still the largest gap
+## 4. Concurrency — and a correction to what this document first said
 
-Total wall time for N simultaneous clients. Three methods, because they now
-behave differently from one another:
+Total wall time for N simultaneous clients:
 
-| clients | `getpeerinfo` bmc | Core | `getmempoolinfo` bmc | Core | `getblockchaininfo` bmc | Core |
+| clients | `getpeerinfo` bmc | Core | `getblockchaininfo` bmc | Core | `getmempoolinfo` bmc | Core |
 |---|---|---|---|---|---|---|
-| 1 | 4 ms | 3 ms | 7 ms | 3 ms | 9 ms | 4 ms |
-| 4 | 4 ms | 4 ms | — | — | — | — |
-| 16 | **5 ms** | 6 ms | 38 ms | 5 ms | 47 ms | 5 ms |
-| 32 | **8 ms** | 10 ms | 55 ms | 22 ms | **82 ms** | 7 ms |
+| 1 | 4 ms | 3 ms | 3 ms | 3 ms | 7 ms | 3 ms |
+| 4 | 4 ms | 4 ms | 4 ms | 4 ms | — | — |
+| 16 | 5 ms | 6 ms | 5 ms | 5 ms | 38 ms | 5 ms |
+| 32 | **8 ms** | 10 ms | **7 ms** | 8 ms | 55 ms | 22 ms |
 
-Three different situations, and the difference between them is the whole
-story:
+**The first version of this section was wrong about the cause, and the error
+is worth keeping visible.** It reported `getblockchaininfo` at 80 ms for 32
+clients, called concurrency "the real gap, and it is structural", and pointed
+at the execution lock. Execution *is* serial. But that call was spending its
+time on 5,763 `stat()` syscalls — `size_on_disk()` walked the whole chain
+directory on every invocation — and with that fixed (PR #257) the same 32
+clients complete in **7 ms, without any change to the lock**. The
+serialisation was real and was not what anyone was waiting on.
 
-**`getpeerinfo` is flat and now beats Core.** As of PR #255 it takes the READ
-side of `g_exec_lock`, which became a writer-preferring `pthread_rwlock`. It
-could, because the exec lock was never what protected it: the peer tables and
-`g_node_status` are written by the download worker *without* that lock
-(`dl_publish_peer_table`), so serialising readers against each other bought
-nothing. The same applies to `getconnectioncount` and `getnetworkinfo`.
+The lesson generalises: a serial lock makes per-call cost visible as a
+throughput ceiling, so the first question about a bad concurrency number is
+what the call is doing, not how it is locked.
 
-**`getmempoolinfo` improved and still rises.** It is on the concurrent list,
-but it takes the *mempool's* lock, which is a mutex — so concurrent callers
-now serialise there instead. A different serialiser, a partial win.
+What each row shows now:
 
-**`getblockchaininfo` is unchanged, and stands for every chain read method.**
-`refresh()` calls `store_reload()` on the single shared store handle
-(`g_st`), so two of these cannot run at once. `getblock`,
-`getrawtransaction`, and everything else that reads the archive share that
-handle and one block buffer. They all still take the write side.
+- **`getpeerinfo`** takes the READ side as of PR #255 — it could, because the
+  peer tables are written by the download worker *without* the exec lock, so
+  serialising readers bought nothing. Flat, ahead of Core.
+- **`getblockchaininfo`** is still fully serial and now matches Core anyway,
+  because there is almost nothing left to serialise.
+- **`getmempoolinfo`** is on the concurrent list but takes the *mempool's*
+  lock, so concurrent callers serialise there instead. The remaining
+  per-call cost is the slot walk for `bytes`.
 
-So the gap is no longer "bmc serialises everything" — it is "bmc serialises
-everything that touches chain state", which is most of the interesting surface.
-Core runs 16 RPC threads with fine-grained locks (`cs_main`, the mempool lock).
+The structural limit has not gone away: every chain read method still runs one
+at a time, and a genuinely expensive one (`getblock` verbosity 2 at 31 ms,
+`getrawmempool verbose` at 63 ms) will still queue 32 clients behind it. It is
+now a ceiling on heavy calls rather than on everything.
 
 ## 5. Memory
 
@@ -207,28 +211,27 @@ Nothing below has a number yet. Do not let the tables above stand in for them.
 
 ## Closing or exceeding the gaps
 
-**1. RPC concurrency — still the biggest one, now half done.** The
-reader/writer split landed in PR #255, and the four methods that share no
-mutable state are concurrent. What remains is the chain read path, and the
-specific blocker is named: `refresh()` mutates the single shared store handle
-`g_st`, and the archive readers share one `g_blockbuf`.
+**1. RPC concurrency — reframed, after PR #257.** The cheap chain reads no
+longer need it: `getblockchaininfo` matches Core at 32 clients while still
+fully serial. What remains is the genuinely expensive reads — `getblock`
+verbosity 2, `getrawmempool verbose` — where one call occupies the lock for
+tens of milliseconds and everyone queues.
 
-The tractable path from here:
-  - `g_st` and `g_blockbuf` become thread-local (4 KB and ~4 MB per thread —
-    cheap at 8–16 threads);
-  - `idx_sync` and the `irunset_t` run-set remapping get their own mutex,
-    since those genuinely mutate shared mappings;
-  - the concurrent list then grows to `getblock`, `getrawtransaction`,
-    `getblockchaininfo`, `getblockheader` — the bulk of what an explorer polls.
+For those, per-thread state is still required, and the audit for it is done:
+`store_rd_fd` keeps an **fd cache inside the store handle** (`lea rbx,
+[r12 + FDC_OFF]`, then writes `file_no` and `fd`), so a *read* mutates the
+handle. Two threads sharing one would race on a cache slot — a use-after-close,
+not a theoretical concern. So:
+  - `g_st` and `g_blockbuf` become thread-local (4 KB and ~4 MB per thread);
+  - `idx_sync`, the chainwork cache and the `irunset_t` remapping get a mutex,
+    since those mutate genuinely shared state;
+  - the concurrent list then reaches `getblock` and `getrawtransaction`.
 
-The risk is real and specific: `store_read_at` and `store_reload` are
-assembly, and whether they keep per-call state in the handle has to be read
-out of `bitcoin_store_fast.asm` before any of this is safe. A missed piece of
-shared state is a data race, not a slow query.
+Worth doing only if heavy reads under concurrency turn out to matter; the
+cheap-call case that motivated it originally has been solved a different way.
 
-A cheaper intermediate that needs none of that: the response *write* is
-outside the lock (PR #248), but the *render* is not. Rendering a 5 MB
-`getrawmempool` reply still holds the write lock for its duration.
+A cheaper intermediate that needs none of it: the response *write* is outside
+the lock (PR #248), but the *render* is not.
 
 **2. `getmempoolinfo` `bytes`.** Maintain a running byte total the way Core
 does, and keep the full walk as a periodic audit rather than the hot path.
@@ -267,18 +270,21 @@ the square.
 | `getblocktemplate` | 1,664 ms | 22 ms | four quadratic passes |
 | `getmempoolentry` | 36 ms | 4 ms | full scan per descendant walk |
 | `getmempoolinfo` | 15 ms | 4 ms | fee lookup per slot, each a scan |
+| `getblockchaininfo` | 5 ms | 2 ms | 5,763 `stat()` calls per invocation |
 
 The root cause of the last three was that `mpool_policy_entry`/`entry_info`
 scanned the node array while a maintained hash index sat unused beside them
 (PR #252), and that no reverse index existed for children (PR #253).
 
 Concurrency (PR #255) is counted separately because it is not a quadratic
-loop: `getpeerinfo` went from rising linearly with client count to flat, by
-taking the read side of a lock that never protected it.
+loop: `getpeerinfo` took the read side of a lock that never protected it, and
+is now flat at **8 ms for 32 clients** (Core: 10 ms).
 
-| | before | after |
-|---|---|---|
-| `getpeerinfo`, 32 clients | 80 ms (serialised) | 8 ms |
+No "before" figure is quoted for it because none was taken — the 80 ms in the
+original write-up was `getblockchaininfo`, a different method, and that number
+turned out to be syscalls rather than lock contention anyway (PR #257).
+`getpeerinfo` ran under the serial lock before the change, so it was bounded
+by 32 x its per-call cost, but that is an inference and not a measurement.
 
 **One of these was a correctness bug, not a performance bug**: past 2 GB of
 journal, `getaddressbalance` silently answered from the history runs alone and
