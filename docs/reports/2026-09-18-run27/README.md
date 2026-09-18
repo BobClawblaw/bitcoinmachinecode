@@ -43,3 +43,34 @@ and blockyard. Exceptions, noted as they happen:
 
 - 2026-09-18 ~19:15–20:10Z: a worktree agent built and gated PR #271
   (`make -j8 test` plus regtest differentials against Core v31.1).
+
+## Core's timeline, recovered from its block files
+
+Core's `debug.log` lost everything before 05:08Z (height ~580k) when it
+restarted. Its `blocks/rev*.dat` files still carry the timeline. Each one was
+created when the first block in the matching `blk` file was connected, and
+that block's height comes from the file's first header. v31.1 XOR-obfuscates
+the files, so they are decoded with the 8-byte key in `blocks/xor.dat` before
+hashing. Checked against the surviving `UpdateTip` lines at ten heights between
+616k and 951k, the file time runs 0–143 s earlier than the log, and under 60 s
+at nine of the ten.
+
+| height | Core v31.1 elapsed | last 50k took |
+|---|---|---|
+| 400,000 | 1 h 40 m | |
+| 450,000 | 2 h 39 m | 1.0 h |
+| 500,000 | 3 h 50 m | 1.2 h |
+| 550,000 | 4 h 54 m | 1.1 h |
+| 600,000 | 6 h 14 m | 1.3 h |
+| 650,000 | 7 h 36 m | 1.4 h (includes the 06:12Z restart) |
+| 700,000 | 9 h 08 m | 1.5 h |
+| 750,000 | 10 h 33 m | 1.4 h |
+| 800,000 | 12 h 24 m | 1.9 h |
+| 850,000 | 14 h 37 m | 2.2 h |
+| 900,000 | 16 h 51 m | 2.2 h |
+| 950,000 | 18 h 58 m | 2.1 h |
+| 967,568 (IBD end) | 19 h 40 m | |
+
+At 20:25Z, run 27 had applied 376,320 blocks in 1 h 10 m. Core took 1 h 17 m
+to reach the same height, so bmc was 7.7 min ahead, and the lead had grown at
+every 25k mark from 200k onward.
