@@ -26,6 +26,17 @@
 ;   +32   dword cur_file_pos    (bytes written in the current block file so far)
 ;   +36   dword magic           (mainnet 0xd9b4bef9)
 ;   +40   dword pad             (reserved; store_append_shared uses as flock fd)
+;   +44   dword pos_file_no     (WHICH file cur_file_pos was measured in; 2026-09-18)
+;                                cur_file_pos is a position, and a position only
+;                                means something relative to a file. Whenever
+;                                cur_file_no moves without cur_file_pos being
+;                                retaken, the pair is incoherent -- that is the
+;                                2026-09-17 incident, where an advanced
+;                                cur_file_no and a stale pos=0 put 293 bytes over
+;                                the start of height 967422. store_append compares
+;                                these two and retakes the position when they
+;                                disagree. Every writer of +32 must also write
+;                                +44, which is why they are always adjacent.
 ;   +48   dword prune_height    (PRUNING: first height whose block data is
 ;                                retained; heights below are deleted/unavailable.
 ;                                Default 0 = no pruning. Persisted to prune.dat
@@ -166,6 +177,10 @@ store_init:
     mov  dword [r12+24], -1     ; tip_height = -1 (empty)
     mov  dword [r12+28], 0      ; cur_file_no = 0
     mov  dword [r12+32], 0      ; cur_file_pos = 0
+    push rax
+    mov  eax, [r12+28]
+    mov  [r12+44], eax       ; pos_file_no := cur_file_no (see +44 in the header)
+    pop  rax
     mov  dword [r12+36], 0xd9b4bef9
     mov  dword [r12+40], 0      ; pad / flock fd (set by shared-append caller)
     mov  dword [r12+48], 0      ; prune_height = 0 (no pruning by default)
@@ -326,6 +341,10 @@ store_reload:
     mov  edx, [rbp-0x50+44]
     add  rax, rdx
     mov  [r12+32], eax            ; cur_file_pos
+    push rax
+    mov  eax, [r12+28]
+    mov  [r12+44], eax       ; pos_file_no := cur_file_no (see +44 in the header)
+    pop  rax
     ; tip_height = rbx (the tip computed above); reopen the current block file
     mov  dword [r12+24], ebx
     mov  rdi, r12
@@ -345,6 +364,10 @@ store_reload:
     mov  dword [r12+24], -1     ; tip_height = -1 (empty)
     mov  dword [r12+28], 0      ; cur_file_no = 0
     mov  dword [r12+32], 0      ; cur_file_pos = 0
+    push rax
+    mov  eax, [r12+28]
+    mov  [r12+44], eax       ; pos_file_no := cur_file_no (see +44 in the header)
+    pop  rax
     mov  qword [r12+0], -1
     mov  rax, 1
     add  rsp, 0x50
@@ -1040,7 +1063,6 @@ store_append:
     ;    the two append paths cannot drift apart again. bl records whether it
     ;    moved: cur_file_pos was measured in the OLD file, so if the file
     ;    number changes the position stops meaning anything and must be retaken.
-    xor  ebx, ebx            ; bl = 0: the walk has not moved the cursor
 .frontier:
     mov  eax, [r12+28]
     inc  eax
@@ -1056,7 +1078,6 @@ store_append:
     mov  eax, [r12+28]
     inc  eax
     mov  [r12+28], eax
-    mov  bl, 1               ; the cursor moved
     jmp  .frontier
 .frontier_done:
     ; if no blk file open, open cur_file_no
@@ -1077,8 +1098,9 @@ store_append:
     ;    tests/test_archive_truncate_nonmonotonic pins exactly that: an
     ;    unconditional SEEK_END here makes its parts stack up at 496 -> 992 ->
     ;    1488 bytes and the physical truncate stops reclaiming anything.
-    test bl, bl
-    jz   .pos_ok
+    mov  eax, [r12+28]
+    cmp  eax, [r12+44]
+    je   .pos_ok             ; the position was measured in THIS file: trust it
     mov  rdi, [r12]
     xor  esi, esi
     mov  edx, 2              ; SEEK_END
@@ -1087,6 +1109,10 @@ store_append:
     test rax, rax
     jl   .err
     mov  [r12+32], eax       ; dword; MAX_FILE is 128 MiB so 32 bits is ample
+    push rax
+    mov  eax, [r12+28]
+    mov  [r12+44], eax       ; pos_file_no := cur_file_no (see +44 in the header)
+    pop  rax
 .pos_ok:
     ; rollover check: if cur_file_pos + 8+len > MAX_FILE, roll to next file
     mov  eax, [r12+32]       ; cur_file_pos
@@ -1104,6 +1130,10 @@ store_append:
     add  eax, 1
     mov  [r12+28], eax       ; cur_file_no++
     mov  dword [r12+32], 0   ; cur_file_pos = 0 (the frontier walk above has
+    push rax
+    mov  eax, [r12+28]
+    mov  [r12+44], eax       ; pos_file_no := cur_file_no (see +44 in the header)
+    pop  rax
                              ; already moved us to the newest file, so the one
                              ; the rollover opens here is genuinely new)
     mov  rdi, r12
@@ -1150,6 +1180,10 @@ store_append:
     add  eax, 8
     add  eax, r15d
     mov  [r12+32], eax
+    push rax
+    mov  eax, [r12+28]
+    mov  [r12+44], eax       ; pos_file_no := cur_file_no (see +44 in the header)
+    pop  rax
     ; ---- STO-11: the block bytes must be DURABLE before the index record
     ; that points at them is written. Without this ordering a crash can leave
     ; a record over zeros, which boot detects and never repairs.
@@ -1815,6 +1849,10 @@ store_truncate_to:
     mov  [r12+28], r14d                            ; cur_file_no
     mov  eax, r15d
     mov  [r12+32], eax                               ; cur_file_pos
+    push rax
+    mov  eax, [r12+28]
+    mov  [r12+44], eax       ; pos_file_no := cur_file_no (see +44 in the header)
+    pop  rax
     mov  rax, r13
     add  rax, 1
     imul rax, 48
@@ -1851,6 +1889,10 @@ store_truncate_to:
     mov  dword [r12+24], -1
     mov  dword [r12+28], 0
     mov  dword [r12+32], 0
+    push rax
+    mov  eax, [r12+28]
+    mov  [r12+44], eax       ; pos_file_no := cur_file_no (see +44 in the header)
+    pop  rax
     mov  qword [r12+0], -1                                ; cur_blk_fd = none
     mov  rax, 1
     jmp  .ret
