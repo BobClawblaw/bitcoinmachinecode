@@ -1223,6 +1223,47 @@ store_append_shared_x:
     mov  esi, 2              ; LOCK_EX
     syscall
 .hlock:
+    ; ---- FRONTIER (2026-09-17): never append below the newest blk file ------
+    ; This function self-heals its POSITION (the lseek to SEEK_END below) but
+    ; not its FILE NUMBER, and the rollover walks forward one file at a time
+    ; until one has room. So a cursor that is behind does not fail: it fills the
+    ; leftover tail gap of every older file on the way up, and each of those
+    ; writes puts a LOWER offset at a HIGHER height -- exactly what
+    ; archive_layout_monotonic reports.
+    ;
+    ; The cursor gets behind without anything being "wrong": store_reload sets
+    ; it from the TIP record, so once a break has put the tip block in an old
+    ; file, every later append continues from there. Measured on run 26 the node
+    ; was still walking 2,300 files later, one per block.
+    ;
+    ; It lives HERE rather than at the C call sites because bitcoind.asm and
+    ; bitcoin_idxscan.asm call this directly -- no C wrapper can cover them.
+    ; One access(2) per append in the steady state (blk(cur+1) is absent).
+    ; Inside the flock, so a concurrent creator cannot race the probe.
+.frontier:
+    mov  eax, [r12+28]
+    inc  eax
+    lea  rdi, [rbp-0xC0]      ; name buffer: clear of -0x30/-0x38/-0x40/-0x48/
+    mov  esi, eax             ; -0x5c/-0x60, the record at [-0x90,-0x60) and -0xA0
+    call fmt_blkname          ; (clobbers caller-saved only; r12 survives)
+    lea  rdi, [rbp-0xC0]
+    xor  esi, esi             ; F_OK
+    mov  eax, 21              ; access
+    syscall
+    test eax, eax
+    jnz  .frontier_done       ; blk(cur+1) absent -> cur IS the frontier
+    mov  eax, [r12+28]
+    inc  eax
+    mov  [r12+28], eax        ; advance
+    mov  rax, [r12]           ; drop any open blk fd so the next open is the new file
+    cmp  rax, -1
+    je   .frontier
+    mov  rdi, rax
+    mov  eax, 3               ; close
+    syscall
+    mov  qword [r12], -1
+    jmp  .frontier
+.frontier_done:
     ; ---- ensure idx_fd/blk_fd open ----
     mov  rax, [r12+8]
     test rax, rax
