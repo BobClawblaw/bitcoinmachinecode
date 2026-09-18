@@ -2681,6 +2681,10 @@ static void rpc_fill_peer_slot(int slot, const char* host){
  * download workers (getpeerinfo) */
 static void rpc_peer_from_version(rpc_peer_t* pr, const unsigned char* p, long len){
     if (len < 80) return;
+    /* addr_recv: the peer's view of US -- services at 20, the 16-byte address
+     * at 28, the port big-endian at 44. Core's addrlocal (2026-09-18). */
+    { char al[72]; rpc_fmt_addr_v1(p + 28, ((unsigned)p[44] << 8) | p[45], al, sizeof al);
+      for (unsigned i = 0; i < sizeof al; i++) pr->addrlocal[i] = al[i]; }
     pr->proto = (unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24);
     unsigned long long services; memcpy(&services, p+4, 8); pr->services = services;
     long off = 80; unsigned long long ualen = 0; int ok = 1;
@@ -5187,6 +5191,7 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
                   * true, and useless, because a worker holding a peer that cannot fill
                   * the pipe is active and idle at the same time. */
                  long long wait_ms, wall_ms;
+                 char addrlocal[72];       /* 2026-09-18, for getpeerinfo: our address as this peer saw it */
                } dlc_stat_t;
 static long long dlc_now_ms(void); static long dlc_proc_rchar(pid_t pid);   /* fwd decls: the worker judges its own chunk before these are defined */
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
@@ -5347,7 +5352,8 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                         strncpy((char*)mystat->peer,cand,63);
                         { rpc_peer_t v; memset(&v,0,sizeof v); rpc_peer_from_version(&v, g_peer_version_payload, g_peer_version_len);   /* for getpeerinfo */
                           mystat->proto=v.proto; mystat->services=v.services; mystat->start_height=v.start_height;
-                          memcpy((char*)mystat->subver, v.subver, sizeof mystat->subver); mystat->conn_time=(long long)time(NULL); mystat->bytes_peer=0; }
+                          memcpy((char*)mystat->subver, v.subver, sizeof mystat->subver); mystat->conn_time=(long long)time(NULL); mystat->bytes_peer=0;
+                          memcpy((char*)mystat->addrlocal, (const char*)v.addrlocal, sizeof mystat->addrlocal); }
                         /* fresh peer -- the displayed chunks/blocks/guard
                          * must reflect THIS connection, not accumulate
                          * across every peer this worker slot has ever
@@ -6543,6 +6549,7 @@ static long dl_catchup(const char* dir, int min_workers){
                 strncpy(d->addr, (const char*)stats[w].peer, sizeof d->addr - 1); d->addr[sizeof d->addr - 1] = 0;
                 d->proto = stats[w].proto; d->services = stats[w].services; d->start_height = stats[w].start_height;
                 memcpy(d->subver, (const char*)stats[w].subver, sizeof d->subver); d->subver[sizeof d->subver - 1] = 0;
+                memcpy((char*)d->addrlocal, (const char*)stats[w].addrlocal, sizeof d->addrlocal); d->addrlocal[sizeof d->addrlocal - 1] = 0;
                 d->conn_time = stats[w].conn_time; d->bytes_recv = stats[w].bytes_peer; d->bytes_sent = 0;
                 d->last_recv = d->last_send = (long long)time(NULL);
                 d->inflight_lo = stats[w].cur_lo; d->inflight_hi = stats[w].cur_hi; d->dl_worker = w; d->inbound = 0;

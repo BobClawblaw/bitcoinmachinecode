@@ -39,7 +39,6 @@ static int declared_extension(const char* m, const char* k){
  * cannot quietly become an excuse. */
 static int conditional(const char* m, const char* k){
     if (!strcmp(m, "getpeerinfo")){
-        if (!strcmp(k, "last_block") || !strcmp(k, "last_transaction")) return 1;
         if (!strcmp(k, "minping") || !strcmp(k, "pingtime") || !strcmp(k, "pingwait")) return 1;
         if (!strcmp(k, "addrlocal") || !strcmp(k, "addrbind")) return 1;
     }
@@ -136,8 +135,13 @@ int main(int argc, char** argv){
        !declared_extension("getpeerinfo", "bmc_download_worker") &&
        !declared_extension("getnetworkinfo", "anything_else"));
     ck("getpeerinfo's omitted-until-known fields are marked conditional",
-       conditional("getpeerinfo", "last_block") && conditional("getpeerinfo", "minping"));
+       conditional("getpeerinfo", "addrlocal") && conditional("getpeerinfo", "minping"));
+    /* last_block and last_transaction were listed as conditional, and that
+     * excused the node omitting them at 0. Core v31.1 pushes both for every
+     * peer (rpc/net.cpp), 0 when nothing has arrived. 2026-09-18. */
     ck("a mandatory field is NOT marked conditional",
+       !conditional("getpeerinfo", "last_block") &&
+       !conditional("getpeerinfo", "last_transaction") &&
        !conditional("getpeerinfo", "connection_type") &&
        !conditional("getmempoolinfo", "limitclustercount"));
 

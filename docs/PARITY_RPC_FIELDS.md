@@ -29,7 +29,7 @@ the release this node tracks. Two connected regtest nodes give a real
 
 ## The work
 
-### 1. `getpeerinfo` — **38 of 38, DONE 2026-09-12**
+### 1. `getpeerinfo` — **38 of 38, DONE 2026-09-12; three gaps closed 2026-09-18**
 
 Verified live against a production node: 38 fields, nothing missing, nothing
 additive. Every field is emitted only where a real source exists.
@@ -45,6 +45,28 @@ additive. Every field is emitted only where a real source exists.
 | activity timestamps | `last_block`, `last_transaction` — previously written only by `txann`, whose slot is set for INBOUND children alone, so on a nearly all-outbound node they never appeared at all |
 | per-message byte maps | `bytessent_per_msg` via the asm write hook, extended to carry the command name; `bytesrecv_per_msg` in the drain loops, where the command is already in hand |
 | removed for exactness | `startingheight` (v31.1 dropped it), `bmc_download_worker` (additive key in a Core call) |
+
+**Correction, 2026-09-18.** "38 of 38" was not true. Three gaps survived it,
+found by a live comparison against mainnet peers (0 of 11 entries carried
+`addrlocal` where Core showed 10 of 10) and then checked against v31.1's
+`rpc/net.cpp`:
+
+- `addrlocal` was never emitted: nothing parsed the version message's
+  `addr_recv`. It is now read in `rpc_peer_from_version` for legs, inbound
+  children and download workers, and formatted by `rpc_fmt_addr_v1` exactly as
+  Core's `CNetAddr::V1` read + `ToStringAddrPort` (IPv4-mapped, RFC 5952 IPv6
+  with the *first* longest zero run, and omitted wherever Core's `IsValid()`
+  is false). Core only fills `addr_recv` for a routable peer, so over loopback
+  neither node prints it.
+- `last_block` and `last_transaction` were omitted at 0. Core pushes both for
+  every peer. The gate's fixture test listed them as "conditional", which
+  excused the omission; it no longer does.
+- `bytessent_per_msg` / `bytesrecv_per_msg` were dropped when empty. Core
+  always pushes both objects.
+
+`validation/addrlocal_regtest_e2e.sh` proves the first two against a real
+v31.1: it sends one version message, with a chosen `addr_recv`, to Core and
+to this node and requires the same `addrlocal` from both.
 
 Two things the work itself turned up. The asm write hook was `(fd, plen)` and now
 carries `(fd, plen, cmd, cmdlen)`; the upload pacer ignores the extra arguments,

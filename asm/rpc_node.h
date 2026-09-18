@@ -30,6 +30,13 @@ int rpc_msg_index(const char* cmd, unsigned cmdlen);
 /* the receive side of the per-message counters; the send side is the
    g_p2p_write_hook installed in main.c */
 void rpc_note_msg_recv(int fd, const char* cmd, unsigned plen);
+/* A v1 (16-byte, legacy IPv6) network address and port, rendered as Core's
+ * CService::ToStringAddrPort after a CNetAddr::V1 read: IPv4-mapped as
+ * "a.b.c.d:port", IPv6 as "[rfc5952]:port". Returns 0 and writes "" for what
+ * Core's IsValid() rejects -- :: and the TORv2 prefix (read as ::), 0.0.0.0,
+ * 255.255.255.255, 2001:db8::/32, and the internal prefix -- so a caller
+ * omits the field exactly where Core does. */
+int rpc_fmt_addr_v1(const unsigned char ip[16], unsigned port, char* out, unsigned cap);
 
 #define RPC_MAX_PEERS 128   /* 0..63 outbound legs (the worker), 64..127 inbound children (2026-09-01) */
 /* Shared misbehaviour table size; mirrored by MISBEHAVIOR_SLOTS in
@@ -100,6 +107,13 @@ typedef struct {
      * counts them. */
     volatile long long        sent_per_msg[RPC_MSG_N];
     volatile long long        recv_per_msg[RPC_MSG_N];
+    /* 2026-09-18: Core's addrlocal -- OUR address as this peer saw it, the
+     * addr_recv of the peer's own version message, formatted by
+     * rpc_fmt_addr_v1. Empty when the peer sent an address Core calls
+     * invalid (0.0.0.0, ::, documentation, internal), and then omitted, as
+     * Core omits it. It had no field at all: 0 of 11 peers carried it where
+     * Core's 10 of 10 did. Appended: every offset above is unchanged. */
+    volatile char             addrlocal[72];
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so

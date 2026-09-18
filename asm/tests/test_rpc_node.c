@@ -262,7 +262,60 @@ int main(void){
        * value for it -- verified against a live node, where all three peers
        * read -1. A 0 here would claim a presync that never happened. */
       ck("presynced_headers defaults to Core's -1, not 0",
-         p0 && S(p0,"presynced_headers") && !strcmp(S(p0,"presynced_headers"), "-1")); }
+         p0 && S(p0,"presynced_headers") && !strcmp(S(p0,"presynced_headers"), "-1"));
+      /* 2026-09-18, measured against Core v31.1: last_block and
+       * last_transaction are pushed for EVERY peer, 0 when nothing has come
+       * in, and the two per-message maps are pushed even when empty. A quiet
+       * stub peer is exactly that case. */
+      ck("a peer with no block yet carries last_block 0, as Core does",
+         p0 && S(p0,"last_block") && !strcmp(S(p0,"last_block"), "0"));
+      ck("a peer with no transaction yet carries last_transaction 0, as Core does",
+         p0 && S(p0,"last_transaction") && !strcmp(S(p0,"last_transaction"), "0"));
+      { rj_val* bs = p0 ? rj_obj_get(p0, "bytessent_per_msg") : NULL;
+        rj_val* br = p0 ? rj_obj_get(p0, "bytesrecv_per_msg") : NULL;
+        ck("a quiet peer carries both per-message maps, empty",
+           bs && bs->typ == RJ_OBJ && bs->nmembers == 0 && br && br->typ == RJ_OBJ && br->nmembers == 0); }
+      ck("addrlocal is omitted while unknown, as Core omits it",
+         p0 && rj_obj_get(p0, "addrlocal") == NULL); }
+    rj_free(r);
+    /* addrlocal: what the peer's version message said our address is */
+    { const char* al = "198.51.100.7:8332";
+      for (unsigned i = 0; i <= strlen(al); i++) st.peers[0].addrlocal[i] = al[i];
+      st.peers[0].last_block_time = 1700000300LL; }
+    r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
+    { rj_val* p0 = (r && r->nitems) ? r->items[0] : NULL;
+      ck("a known addrlocal is published", p0 && S(p0,"addrlocal") && !strcmp(S(p0,"addrlocal"), "198.51.100.7:8332"));
+      ck("a real last_block time is published as-is", p0 && S(p0,"last_block") && !strcmp(S(p0,"last_block"), "1700000300")); }
+    st.peers[0].addrlocal[0] = 0; st.peers[0].last_block_time = 0;
+    /* rpc_fmt_addr_v1 against Core's CNetAddr::V1 read + ToStringAddrPort */
+    { char o[72];
+      #define A16(...) ((const unsigned char[16]){__VA_ARGS__})
+      ck("v1 addr: IPv4-mapped renders a.b.c.d:port",
+         rpc_fmt_addr_v1(A16(0,0,0,0,0,0,0,0,0,0,0xff,0xff,203,0,113,5), 8333, o, sizeof o) == 1 && !strcmp(o, "203.0.113.5:8333"));
+      ck("v1 addr: 0.0.0.0 is invalid in Core, so empty",
+         rpc_fmt_addr_v1(A16(0,0,0,0,0,0,0,0,0,0,0xff,0xff,0,0,0,0), 0, o, sizeof o) == 0 && o[0] == 0);
+      ck("v1 addr: 255.255.255.255 is invalid in Core, so empty",
+         rpc_fmt_addr_v1(A16(0,0,0,0,0,0,0,0,0,0,0xff,0xff,255,255,255,255), 8333, o, sizeof o) == 0 && o[0] == 0);
+      ck("v1 addr: :: is invalid in Core, so empty",
+         rpc_fmt_addr_v1(A16(0), 8333, o, sizeof o) == 0 && o[0] == 0);
+      ck("v1 addr: 127.0.0.1 is valid (not routable, but Core reports it)",
+         rpc_fmt_addr_v1(A16(0,0,0,0,0,0,0,0,0,0,0xff,0xff,127,0,0,1), 18444, o, sizeof o) == 1 && !strcmp(o, "127.0.0.1:18444"));
+      ck("v1 addr: IPv6 compresses the longest zero run, bracketed",
+         rpc_fmt_addr_v1(A16(0x2a,0x01,0x04,0xf8,0,0,0,0,0,0,0,0,0,0,0,1), 8333, o, sizeof o) == 1 && !strcmp(o, "[2a01:4f8::1]:8333"));
+      ck("v1 addr: equal zero runs compress the FIRST, as Core does",
+         rpc_fmt_addr_v1(A16(0x2a,0x01,0,0,0,0,0,1,0,0,0,0,0,1,0,1), 1, o, sizeof o) == 1 && !strcmp(o, "[2a01::1:0:0:1:1]:1"));
+      ck("v1 addr: a single zero group is not compressed",
+         rpc_fmt_addr_v1(A16(0x2a,0x01,0,0,0,1,0,2,0,3,0,4,0,5,0,6), 1, o, sizeof o) == 1 && !strcmp(o, "[2a01:0:1:2:3:4:5:6]:1"));
+      ck("v1 addr: ::/96 is hex groups, not glibc's dotted quad",
+         rpc_fmt_addr_v1(A16(0,0,0,0,0,0,0,0,0,0,0,0,1,2,3,4), 1, o, sizeof o) == 1 && !strcmp(o, "[::102:304]:1"));
+      ck("v1 addr: 2001:db8::/32 (documentation) is invalid in Core",
+         rpc_fmt_addr_v1(A16(0x20,0x01,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,1), 1, o, sizeof o) == 0 && o[0] == 0);
+      ck("v1 addr: the TORv2 onioncat prefix reads as :: in Core, so empty",
+         rpc_fmt_addr_v1(A16(0xfd,0x87,0xd8,0x7e,0xeb,0x43,1,2,3,4,5,6,7,8,9,10), 1, o, sizeof o) == 0 && o[0] == 0);
+      ck("v1 addr: the internal prefix is invalid in Core",
+         rpc_fmt_addr_v1(A16(0xfd,0x6b,0x88,0xc0,0x87,0x24,1,2,3,4,5,6,7,8,9,10), 1, o, sizeof o) == 0 && o[0] == 0);
+      #undef A16
+    }
     /* 2026-09-08: the parallel download's peers are listed too, with the chunk in flight */
     rj_free(r);
     st.n_dlpeers = 1; memset(&st.dlpeers[0], 0, sizeof st.dlpeers[0]); st.dlpeers[0].used = 1;
