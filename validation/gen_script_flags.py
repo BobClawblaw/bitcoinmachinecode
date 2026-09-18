@@ -239,6 +239,22 @@ hdr = [
     "#define SFC_T_HEIGHT_CSV    %d" % T_CSV,
     "#define SFC_T_HEIGHT_SEGWIT %d" % T_SEGWIT,
     "",
+    "/* script_verify_flag_name bit positions, and CMainParams' two",
+    " * script_flag_exceptions: the flags Core REPLACES the unconditional",
+    " * P2SH|WITNESS|TAPROOT with for exactly these blocks (display-order hash).",
+    " * getdeploymentinfo's script_flags reports them for a block by hash. */",
+    "#define SFC_BIT_P2SH      %d" % bitpos["SCRIPT_VERIFY_P2SH"],
+    "#define SFC_BIT_DERSIG    %d" % bitpos["SCRIPT_VERIFY_DERSIG"],
+    "#define SFC_BIT_NULLDUMMY %d" % bitpos["SCRIPT_VERIFY_NULLDUMMY"],
+    "#define SFC_BIT_CLTV      %d" % bitpos["SCRIPT_VERIFY_CHECKLOCKTIMEVERIFY"],
+    "#define SFC_BIT_CSV       %d" % bitpos["SCRIPT_VERIFY_CHECKSEQUENCEVERIFY"],
+    "#define SFC_BIT_WITNESS   %d" % bitpos["SCRIPT_VERIFY_WITNESS"],
+    "#define SFC_BIT_TAPROOT   %d" % bitpos["SCRIPT_VERIFY_TAPROOT"],
+] + sum([[
+    "#define SFC_EXC_%s_HASH_HEX \"%s\"" % (label.upper(), hexhash),
+    "#define SFC_EXC_%s_FLAGS %d" % (label.upper(), bits),
+] for label, hexhash, rawbytes, bits in exceptions], []) + [
+    "",
     "#endif",
     "",
 ]
@@ -294,5 +310,13 @@ if (cdef("SFC_R_HEIGHT_BIP34"), cdef("SFC_R_HEIGHT_DERSIG"), cdef("SFC_R_HEIGHT_
 if (cdef("SFC_T_HEIGHT_BIP34"), cdef("SFC_T_HEIGHT_DERSIG"), cdef("SFC_T_HEIGHT_CLTV"),
     cdef("SFC_T_HEIGHT_CSV"), cdef("SFC_T_HEIGHT_SEGWIT")) != (T_BIP34, T_BIP66, T_BIP65, T_CSV, T_SEGWIT):
     sys.exit("SELF-CHECK FAILED: the C header does not match the testnet4 heights")
+for n, key in (("SCRIPT_VERIFY_P2SH", "SFC_BIT_P2SH"), ("SCRIPT_VERIFY_WITNESS", "SFC_BIT_WITNESS"),
+               ("SCRIPT_VERIFY_TAPROOT", "SFC_BIT_TAPROOT")):
+    if cdef(key) != bitpos[n]:
+        sys.exit("SELF-CHECK FAILED: %s in the C header does not match" % key)
+for label, hexhash, rawbytes, bits in exceptions:
+    m = re.search(r'#define SFC_EXC_%s_HASH_HEX "([0-9a-f]{64})"' % label.upper(), again_h)
+    if not m or m.group(1) != hexhash or cdef("SFC_EXC_%s_FLAGS" % label.upper()) != bits:
+        sys.exit("SELF-CHECK FAILED: the C header's %s exception does not match" % label)
 print("self-check ok: %d heights + %d exception hashes re-parse correctly, "
       "and the C mirror agrees" % (4, len(exc_lines)))
