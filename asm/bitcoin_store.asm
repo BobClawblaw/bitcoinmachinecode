@@ -1003,11 +1003,62 @@ store_append:
     push r14
     push r15
     push rbx
-    sub  rsp, 0x80           ; header scratch @ rbp-0x80, idx record @ rbp-0x78
+    sub  rsp, 0xA0           ; header scratch @ rbp-0x80, idx record @ rbp-0x78,
+                             ; blk-name buffer @ rbp-0xA0 (clear of both)
     mov  r12, rdi            ; st
     mov  r13, rsi            ; hash
     mov  r14, rdx            ; raw
     mov  r15, rcx            ; len
+    ; ---- FRONTIER + SELF-HEAL (2026-09-18) ---------------------------------
+    ; store_append_shared got .frontier on 2026-09-17; this function did not,
+    ; and the failure modes are NOT the same. The shared one lseeks to SEEK_END,
+    ; so it self-heals its POSITION and only needed its FILE NUMBER guarded.
+    ; This one TRUSTS cur_file_pos, for the rollover check and for the lseek it
+    ; writes at, AND it reuses an already-open fd without checking which file
+    ; that fd is on. Three things had to be fixed, not one.
+    ;
+    ; The incident this reproduces: on 2026-09-17 a C-side
+    ; archive_store_frontier() advanced cur_file_no to 5762 and left
+    ; cur_file_pos at 0. The genesis seed uses THIS function. Measured in
+    ; tests/test_append_unshared_frontier.c against the unguarded code, the
+    ; damage is worse than "wrote at the wrong offset": the open fd still
+    ; pointed at the OLD file, so the bytes landed there, over an existing
+    ; block, while the index record named a file that never received them.
+    ;
+    ; 1. drop the fd. Everything below then reopens from cur_file_no, so the fd
+    ;    provably matches the cursor. One close+open per append, against a
+    ;    block write and an fdatasync -- not a cost worth reasoning about.
+    mov  rax, [r12]
+    cmp  rax, -1
+    je   .fd_dropped
+    mov  rdi, rax
+    mov  eax, 3              ; close
+    syscall
+    mov  qword [r12], -1
+.fd_dropped:
+    ; 2. the frontier walk, identical in shape to store_append_shared_x's, so
+    ;    the two append paths cannot drift apart again. bl records whether it
+    ;    moved: cur_file_pos was measured in the OLD file, so if the file
+    ;    number changes the position stops meaning anything and must be retaken.
+    xor  ebx, ebx            ; bl = 0: the walk has not moved the cursor
+.frontier:
+    mov  eax, [r12+28]
+    inc  eax
+    lea  rdi, [rbp-0xA0]
+    mov  esi, eax
+    call fmt_blkname
+    lea  rdi, [rbp-0xA0]
+    xor  esi, esi            ; F_OK
+    mov  eax, 21             ; access
+    syscall
+    test eax, eax
+    jnz  .frontier_done      ; blk(cur+1) absent -> cur IS the frontier
+    mov  eax, [r12+28]
+    inc  eax
+    mov  [r12+28], eax
+    mov  bl, 1               ; the cursor moved
+    jmp  .frontier
+.frontier_done:
     ; if no blk file open, open cur_file_no
     mov  rax, [r12]          ; cur_blk_fd
     test rax, rax
@@ -1018,6 +1069,25 @@ store_append:
     test rax, rax
     jl   .err
 .have_fd:
+    ; 3. ONLY if the walk moved the cursor, retake cur_file_pos from the true
+    ;    end of the new file. Do NOT do this unconditionally: cur_file_pos is
+    ;    authoritative for the file it was measured in, and a store re-inited
+    ;    over a leftover directory (an index-less reindex) deliberately has
+    ;    pos=0 against a non-empty blk file so the stale bytes are reclaimed.
+    ;    tests/test_archive_truncate_nonmonotonic pins exactly that: an
+    ;    unconditional SEEK_END here makes its parts stack up at 496 -> 992 ->
+    ;    1488 bytes and the physical truncate stops reclaiming anything.
+    test bl, bl
+    jz   .pos_ok
+    mov  rdi, [r12]
+    xor  esi, esi
+    mov  edx, 2              ; SEEK_END
+    mov  eax, 8              ; lseek
+    syscall
+    test rax, rax
+    jl   .err
+    mov  [r12+32], eax       ; dword; MAX_FILE is 128 MiB so 32 bits is ample
+.pos_ok:
     ; rollover check: if cur_file_pos + 8+len > MAX_FILE, roll to next file
     mov  eax, [r12+32]       ; cur_file_pos
     add  eax, 8
@@ -1033,7 +1103,9 @@ store_append:
     mov  eax, [r12+28]
     add  eax, 1
     mov  [r12+28], eax       ; cur_file_no++
-    mov  dword [r12+32], 0   ; cur_file_pos = 0
+    mov  dword [r12+32], 0   ; cur_file_pos = 0 (the frontier walk above has
+                             ; already moved us to the newest file, so the one
+                             ; the rollover opens here is genuinely new)
     mov  rdi, r12
     mov  esi, eax
     call open_file
@@ -1125,7 +1197,7 @@ store_append:
     mov  [r12+16], rax       ; idx_len += 48
     mov  dword [r12+24], ebx ; tip_height = new height (rbx)
     mov  rax, rbx
-    add  rsp, 0x80
+    add  rsp, 0xA0
     pop  rbx
     pop  r15
     pop  r14
@@ -1135,7 +1207,7 @@ store_append:
     ret
 .err:
     mov  rax, -1
-    add  rsp, 0x80
+    add  rsp, 0xA0
     pop  rbx
     pop  r15
     pop  r14
