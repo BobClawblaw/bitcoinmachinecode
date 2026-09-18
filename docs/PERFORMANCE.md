@@ -185,8 +185,14 @@ Nothing below has a number yet. Do not let the tables above stand in for them.
 1. **Initial block download, head to head.** The only Core baseline on this box
    (19h 14m) ran on a Samsung Portable SSD T5 at 0.40 GB/s while run 26 ran on
    NVMe. That comparison was withdrawn. A matched pair — same device, same day,
-   every index each node supports, configs recorded before launch — is pending
-   the new SSD.
+   every index each node supports, configs recorded before launch — is **in
+   flight as of 2026-09-18**, not yet a number. The Core half is Bitcoin Core
+   v31.1 (`9be056a8`, both the latest final release and the version every prior
+   baseline used) on the 8 TB NVMe at `/mnt/nvme8tb/core-oracle`, measured at
+   4.7 GB/s write / 5.4 GB/s read; its config and unit are recorded in
+   `docs/reports/2026-09-17-core-v31.1-nvme-oracle.{conf,service}`, copied
+   before launch. **Run 27 must use the same device**, or this becomes another
+   storage comparison. Nothing here is closed until both halves have run.
 2. **Block validation throughput** — blocks per second connected, and the
    time from a new block arriving to the tip advancing. This is the number that
    actually matters for a node keeping up with the chain.

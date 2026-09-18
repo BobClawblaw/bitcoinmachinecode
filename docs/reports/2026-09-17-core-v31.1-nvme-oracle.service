@@ -1,0 +1,47 @@
+[Unit]
+# Second Bitcoin Core oracle, on the 8 TB NVMe (/mnt/nvme8tb/core-oracle).
+# Bitcoin Core v31.1 (9be056a8) -- the latest final release, and the version
+# every prior IBD baseline used.
+#
+# Created 2026-09-17, with two jobs: its initial block download IS the queued
+# Core benchmark, and once it reaches the tip it is a permanent oracle sitting
+# on 4.7 GB/s storage instead of the 0.40 GB/s T5 that carried the old
+# baselines.
+#
+# This is NOT bitcoin-oracle.service. That one owns P2P 8333 / RPC 8335 and must
+# stay up -- every IBD capstone compares against it. This one owns 8336/8337 and
+# ZMQ 28433. They share no port, no datadir and no ZMQ endpoint.
+Description=Bitcoin Core oracle on NVMe (v31.1, P2P 8336, RPC 8337)
+Documentation=file:///storage/bitcoinmachinecode/docs/OPERATIONS.md
+After=network-online.target
+Wants=network-online.target
+RequiresMountsFor=/mnt/nvme8tb/core-oracle
+
+[Service]
+Type=simple
+# NOTE: the service account is redacted in this archived copy (the repo is
+# public and the operator's username is on the privacy blocklist). The live
+# unit runs as the operator's own account, not root.
+User=REDACTED
+Group=REDACTED
+ExecStart=/mnt/nvme8tb/core-build/bitcoin-v31.1/build/bin/bitcoind \
+  -conf=/mnt/nvme8tb/core-oracle/bitcoin.conf \
+  -datadir=/mnt/nvme8tb/core-oracle
+# Core flushes a large chainstate on shutdown. Killing it early corrupts the
+# database and costs a multi-day resync, so give it room and never SIGKILL on a
+# normal stop. Same reasoning as bitcoin-oracle.service.
+TimeoutStopSec=900
+KillSignal=SIGTERM
+SendSIGKILL=no
+Restart=always
+RestartSec=15
+# The box has OOM-killed systemd --user before the process that actually grew.
+# Bias the killer away from a node that costs a full IBD to rebuild.
+OOMScoreAdjust=-500
+LimitNOFILE=65536
+# No ionice and no Nice: the benchmark protocol requires an unhandicapped run,
+# and a starved I/O class would measure the scheduler instead of the software.
+Nice=0
+
+[Install]
+WantedBy=multi-user.target
