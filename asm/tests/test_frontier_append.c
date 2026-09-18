@@ -75,6 +75,16 @@ static void mk_blk(unsigned file_no, long n){
     }
     close(fd);
 }
+
+/* a sparse blk file of `size` bytes -- ftruncate, so a 128 MiB "full" file
+ * costs no actual I/O. store_append_shared lseeks SEEK_END, so the append
+ * path sees the true length whatever the cursor believes. */
+static void mk_sparse(unsigned file_no, long size){
+    char nm[32]; snprintf(nm, sizeof nm, "blk%05u.dat", file_no);
+    int fd = open(nm, O_RDWR|O_CREAT|O_TRUNC, 0644);
+    if(fd < 0 || ftruncate(fd, size)){ perror(nm); exit(2); }
+    close(fd);
+}
 static long fsize(const char* nm){
     struct stat s; if(stat(nm, &s)) return -1; return (long)s.st_size;
 }
@@ -183,11 +193,45 @@ int main(void){
     ck_ge("h4 does NOT land in a lower file than h3", (long long)m4[2], (long long)m3[2]);
     ck("h4 payload reads back", readback_ok(m4, b4, 64), 1);
 
+
+    /* ---- THE GUARD AND THE ROLLOVER, COMPOSED --------------------------------
+     * They live in the same function: .frontier runs at the top of
+     * store_append_shared_x, the rollover at .roll_ck below it, and nothing had
+     * ever exercised both in one append. The guard moves the cursor to the
+     * newest file; the rollover then has to notice that file is FULL and walk
+     * past it. .repos falls through into .roll_ck, so the rollover re-checks
+     * each file it lands on -- this test is what makes that a fact rather than
+     * a reading of the listing.
+     *
+     * MAX_FILE is 128 MiB (bitcoin_store.asm: MAX_FILE equ 0x08000000). The
+     * near-full file is sparse, so it costs no real bytes. */
+    {
+        const long MAXF = 0x08000000;
+        mk_blk(4, 100); mk_blk(5, 100); mk_blk(6, 100);  /* contiguous, room to spare */
+        mk_sparse(7, MAXF - 10);                          /* the frontier, effectively FULL */
+
+        /* the cursor falls all the way back, as store_reload can leave it */
+        *(int*)((char*)st+28) = 0;
+        *(int*)((char*)st+0)  = -1;
+
+        unsigned char h5[32], b5[64]; memset(h5, 0xA5, 32); memset(b5, 0x15, 64);
+        unsigned long long m5[3];
+        ck("append h5: cursor at 0, frontier at 7, and 7 is full",
+           store_append_shared(st, 5, h5, b5, 64), 5);
+        ck("get h5 record", rec_get(5, m5, gh), 1);
+        ck("the guard walked to the frontier AND the rollover stepped past it -> blk00008",
+           (long long)m5[2], 8);
+        ck("h5 is at offset 0 of the fresh file", (long long)m5[0], 0);
+        ck("the full frontier file was NOT extended", fsize("blk00007.dat"), MAXF - 10);
+        ck("blk00004 was not filled on the way", fsize("blk00004.dat"), 100);
+        ck("h5 payload reads back", readback_ok(m5, b5, 64), 1);
+    }
+
     /* ---- the property the whole thing exists for: file_no never decreases
      * as height increases (what archive_layout_monotonic checks). */
     int mono = 1;
     unsigned long long prev_file = 0, prev_pos = 0;
-    for(int h=0; h<=4; h++){
+    for(int h=0; h<=5; h++){
         unsigned long long m[3];
         if(rec_get(h, m, NULL) != 1){ mono = 0; break; }
         if(h){
@@ -196,7 +240,7 @@ int main(void){
         }
         prev_file = m[2]; prev_pos = m[0];
     }
-    ck("layout is monotonic across h0..h4", mono, 1);
+    ck("layout is monotonic across h0..h5", mono, 1);
 
     /* ---- h0 must still be readable; the guard must not disturb old records */
     ck("h0 payload still reads back", readback_ok(m0, b0, 64), 1);
