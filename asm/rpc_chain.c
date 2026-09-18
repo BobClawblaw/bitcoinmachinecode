@@ -310,16 +310,38 @@ static void idx_sync(long tip){
     if (!g_idx) return;
     long from = g_idx_tip + 1, folded = g_idx_tip;
     int r = idx_load_range(g_idx, from, tip, &folded);
-    /* [idx] trace: every fold at most once per 5 s, and always when records
-     * were present but none went in -- the anomaly this exists to catch. */
-    { static time_t last; time_t now = time(NULL);
+    /* [idx] trace. Measured on run 26 (2026-09-18): this subsystem wrote 10,017
+     * of the log's 41,810 lines -- 24% of the whole node log -- and 7,922 of
+     * them (79.1%) said present=0 new=0, i.e. nothing happened. err and short
+     * were non-zero ZERO times in 30 hours, and folded_to had only 3,907
+     * distinct values across those 10,017 lines, so most of them did not even
+     * report progress. A fifth of the log was one subsystem saying it was idle.
+     *
+     * Two rules now, not one:
+     *   trouble (err/short) and the present-but-not-inserted anomaly are NEVER
+     *     throttled. They were before -- the old condition was
+     *     `anomaly || now - last >= 5`, so a non-zero err landing inside the
+     *     5 s window was dropped and never reported anywhere. That never bit
+     *     because err stayed zero, which is luck rather than design.
+     *   a pass that did something keeps the 5 s throttle; a pass that did
+     *     nothing gets a 5-minute heartbeat instead, and the heartbeat carries
+     *     how many quiet passes it stands for, so the silence is still counted
+     *     rather than simply absent. */
+    { static time_t last, last_quiet; static long quiet_n, quiet_read;
+      time_t now = time(NULL);
       int anomaly = g_lr_present > 0 && g_lr_new + g_lr_dup == 0;
-      if (anomaly || now - last >= 5){
-          last = now;
-          fprintf(stderr, "[idx] fold %ld..%ld: read=%ld present=%ld new=%ld dup=%ld short=%ld err=%ld r=%d folded_to=%ld slots=%lu%s\n",
+      int trouble = g_lr_err > 0 || g_lr_short > 0;
+      int active  = g_lr_present > 0 || g_lr_new > 0 || g_lr_dup > 0;
+      if (anomaly || trouble || (active && now - last >= 5) || (!active && now - last_quiet >= 300)){
+          char quiet[80]; quiet[0] = 0;
+          if (quiet_n) snprintf(quiet, sizeof quiet, "  (+%ld quiet pass(es), read=%ld)", quiet_n, quiet_read);
+          last = now; if (!active) last_quiet = now;
+          fprintf(stderr, "[idx] fold %ld..%ld: read=%ld present=%ld new=%ld dup=%ld short=%ld err=%ld r=%d folded_to=%ld slots=%lu%s%s\n",
                   from, tip, g_lr_read, g_lr_present, g_lr_new, g_lr_dup, g_lr_short, g_lr_err, r, folded, g_idx_slots,
-                  anomaly ? "  <-- PRESENT BUT NOT INSERTED" : "");
-      } }
+                  anomaly ? "  <-- PRESENT BUT NOT INSERTED" : "", quiet);
+          quiet_n = 0; quiet_read = 0;
+      } else if (!active){ quiet_n++; quiet_read += g_lr_read; }
+    }
     if (r == 2){
         if (!idx_alloc(g_idx_slots * 2)){ fprintf(stderr, "[idx] grow to %lu slots FAILED (malloc)\n", g_idx_slots * 2); return; }
         int r2 = idx_load_range(g_idx, 0, tip, &folded);
