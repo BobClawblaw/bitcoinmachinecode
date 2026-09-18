@@ -32,6 +32,14 @@ DEST=${DEST:-/mnt/2tbssd/bmc-bench}
 SRCREF=${SRCREF:-HEAD}
 P2P=${P2P:-8462}; RPC=${RPC:-8461}
 WORKERS=${WORKERS:-8}
+# NICE: the daemon's CPU niceness. 10 suits a correctness run sharing the box;
+# a TIMED run against Core must use 0, because the Core baseline runs at
+# Nice=0 under systemd and a niced node measures the scheduler, not the code.
+NICE=${NICE:-10}
+# EXTRA_CONF: newline-separated keys appended to the conf, so a benchmark can
+# match the Core baseline's protocol (txindex, blockfilterindex, maxconnections)
+# without editing this file.
+EXTRA_CONF=${EXTRA_CONF:-}
 . "$(dirname "$0")/lib/ibd_harness_lib.sh"
 ORACLE=${ORACLE:-"/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"}
 PH="$DEST/phase.log"; PROG="$DEST/progress.log"
@@ -50,7 +58,11 @@ git -C src fetch -q origin "+refs/heads/*:refs/remotes/origin/*" 2>/dev/null
 git -C src checkout -q --detach "origin/$SRCREF" 2>/dev/null || git -C src checkout -q --detach "$SRCREF" 2>/dev/null
 COMMIT=$(git -C src rev-parse --short HEAD)
 ph "SRC commit=$COMMIT ref=$SRCREF"
-( cd src/asm && make -j8 daemon/bmcbitcoind ) > build.log 2>&1 || { ph "FAIL build"; echo FAIL > RESULT; exit 1; }
+# bmc_cli too: the monitor loop below asks it for the height. Only the daemon
+# was built here, so on a FRESH clone every getblockcount came back empty, the
+# loop's `continue` swallowed it, and the tip and capstone could never fire.
+( cd src/asm && make -j8 daemon/bmcbitcoind daemon/bmc_cli ) > build.log 2>&1 || { ph "FAIL build"; echo FAIL > RESULT; exit 1; }
+[ -x src/asm/daemon/bmc_cli ] || { ph "FAIL build: no bmc_cli"; echo FAIL > RESULT; exit 1; }
 ph "BUILD ok"
 
 mkdir -p data
@@ -67,10 +79,11 @@ bmc.catchupworkers=$WORKERS
 # from Core names the block it diverged on instead of only the tip.
 coinstatsindex=1
 CONF
-ph "CONF port=$P2P rpcport=$RPC dbcache=8192 workers=$WORKERS coinstatsindex=1"
+[ -n "$EXTRA_CONF" ] && printf '%s\n' "$EXTRA_CONF" >> data/bitcoin.conf
+ph "CONF port=$P2P rpcport=$RPC dbcache=8192 workers=$WORKERS coinstatsindex=1 nice=$NICE extra=[$(printf '%s' "$EXTRA_CONF" | tr '\n' ' ')]"
 
 T0=$(date +%s); echo "$T0" > epoch.start
-setsid nohup nice -n 10 src/asm/daemon/bmcbitcoind serve "$DEST/data" > console.log 2>&1 < /dev/null &
+setsid nohup nice -n "$NICE" src/asm/daemon/bmcbitcoind serve "$DEST/data" > console.log 2>&1 < /dev/null &
 echo $! > daemon.pid; sleep 8
 kill -0 "$(cat daemon.pid)" 2>/dev/null || { ph "FAIL daemon exited at once"; echo FAIL > RESULT; exit 1; }
 ph "DAEMON pid=$(cat daemon.pid) epoch=$T0"
