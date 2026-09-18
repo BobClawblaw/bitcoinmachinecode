@@ -215,7 +215,9 @@ Wire existing primitives onto JSON-RPC with Core shapes.
       then live-verify (inbound tx -> parent getrawmempool).
 - [x] getmempoolentry -- full documented field set minus master's
       cluster-mempool extras (vsize_adjusted/chunkweight/fees.chunk;
-      bip125-replaceable is gone in modern Core). Graph fields from a
+      bip125-replaceable is gone in modern Core). [2026-09-18: that list
+      came off the v31.99 dev oracle. v31.1 HAS bip125-replaceable and has
+      no vsize_adjusted; see PARITY_RPC_FIELDS.md.] Graph fields from a
       mp_lock'd snapshot of the shared policy registry
       (mpool_policy_entry_info): depends/spentby direct edges,
       ancestor/descendant transitive closures INCLUDING self, fees summed over

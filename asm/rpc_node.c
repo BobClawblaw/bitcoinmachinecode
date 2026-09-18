@@ -1486,7 +1486,11 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
  * pool anyway, so it records (txid, vsize) as it goes, sorts by txid, and the
  * set sums become binary searches. Single-entry getmempoolentry passes no
  * cache and keeps the old direct path, which is cheaper for one lookup. */
-typedef struct { unsigned char id[32]; unsigned long vs; long inf; } mpe_vs_t;
+/* vs is the ENTRY size Core reports (GetTxSize, sigops-adjusted) once the
+ * graph has supplied the member's sigop cost (inf >= 0), and plain BIP141
+ * until then; w is the BIP141 weight either way. rbf: the tx itself signals
+ * BIP125, so bip125-replaceable over an ancestor set is lookups too. */
+typedef struct { unsigned char id[32]; unsigned long vs, w; long inf; unsigned char rbf; } mpe_vs_t;
 static mpe_vs_t* g_mpe_vs; static unsigned long g_mpe_vs_n;
 /* the whole graph for this call, filled once by pol_entry_info_all; indexed
    by the same sorted txid order as the vsize cache above */
@@ -1513,6 +1517,67 @@ static long mpe_inf_lookup(const unsigned char id[32]){
 static unsigned long mpe_vs_lookup(const unsigned char id[32]){
     long k = mpe_vs_find(id);
     return k >= 0 ? g_mpe_vs[k].vs : 0;
+}
+
+/* Core's entry size, CTxMemPoolEntry::GetTxSize(): the sigops-ADJUSTED
+ * vsize, ceil(max(weight, sigop_cost * bytes_per_sigop) / 4)
+ * (policy.cpp GetVirtualTransactionSize). v31.1 reports it as `vsize`, and
+ * sums it for ancestorsize/descendantsize. */
+static unsigned long mpe_adj_vsize(unsigned long w, unsigned sigop_cost){
+    unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
+    unsigned long long adjw = w, sw = (unsigned long long)sigop_cost * bps;
+    if (sw > adjw) adjw = sw;
+    return (unsigned long)((adjw + 3) / 4);
+}
+
+/* BIP125 signalling (util/rbf.cpp SignalsOptInRBF): any input with
+ * nSequence <= 0xfffffffd. A parse anomaly answers "does not signal". */
+static int mp_tx_signals_rbf(const unsigned char* tx, unsigned long len){
+    if (len < 10) return 0;
+    unsigned long p = (tx[4]==0x00 && tx[5]==0x01) ? 6 : 4, c;
+    unsigned long nin = mp_varint(tx+p,&c); p+=c;
+    for (unsigned long i=0;i<nin;i++){
+        if (p+37 > len) return 0;
+        p+=36; unsigned long sl=mp_varint(tx+p,&c); p+=c+sl;
+        if (p+4 > len) return 0;
+        unsigned long seq = (unsigned long)tx[p] | ((unsigned long)tx[p+1]<<8) |
+                            ((unsigned long)tx[p+2]<<16) | ((unsigned long)tx[p+3]<<24);
+        if (seq <= 0xfffffffdUL) return 1;
+        p+=4;
+    }
+    return 0;
+}
+
+/* One ancestor/descendant member's entry size for the set sums, 0 when it
+ * is no longer in the pool. The bulk cache holds it once the graph has
+ * given the member's sigop cost; otherwise the member's own registry node
+ * does (self's is already in hand). */
+static unsigned long mpe_member_vsize(const unsigned char id[32], const unsigned char* self,
+                                      const mp_entry_info* selfinf){
+    unsigned long w2;
+    if (g_mpe_vs){
+        long k = mpe_vs_find(id);
+        if (k < 0) return 0;
+        if (g_mpe_vs[k].inf >= 0) return g_mpe_vs[k].vs;
+        w2 = g_mpe_vs[k].w;
+    } else {
+        unsigned long l2=0; const unsigned char* t2 = g_mph.get(g_mph.mp, id, &l2);
+        if (!t2) return 0;
+        w2 = mp_tx_weight(t2, l2);
+    }
+    unsigned sc = 0;
+    if (!memcmp(id, self, 32)) sc = selfinf->sigop_cost;
+    else if (g_mph.polstate && g_mph.pol_entry_info){
+        static mp_entry_info mi;             /* ~8 KB: kept off the stack */
+        if (g_mph.pol_entry_info(g_mph.polstate, id, &mi) == 1) sc = mi.sigop_cost;
+    }
+    return mpe_adj_vsize(w2, sc);
+}
+/* does this member signal BIP125 itself? (-1: not in the pool) */
+static int mpe_member_rbf(const unsigned char id[32]){
+    if (g_mpe_vs){ long k = mpe_vs_find(id); return k >= 0 ? g_mpe_vs[k].rbf : -1; }
+    unsigned long l2=0; const unsigned char* t2 = g_mph.get(g_mph.mp, id, &l2);
+    return t2 ? mp_tx_signals_rbf(t2, l2) : -1;
 }
 
 /* the per-entry object, shared by getmempoolentry and verbose getrawmempool */
@@ -1548,7 +1613,15 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
      * determined without any linearization: a lone transaction is its own
      * chunk. For a multi-transaction cluster both depend on Core's cluster
      * linearization, which this node does not implement, and they are omitted
-     * rather than guessed. */
+     * rather than guessed.
+     *
+     * 2026-09-18: `vsize_adjusted` and `vsize_bip141` are gone again. Both
+     * came off the v31.99 development oracle; v31.1 has neither, in any RPC.
+     * What v31.1 does have is the adjusted size under the plain name: its
+     * `vsize` is CTxMemPoolEntry::GetTxSize(), the sigops-adjusted vsize, and
+     * ancestorsize/descendantsize sum the same. So the number vsize_adjusted
+     * carried now travels as `vsize`, and `bip125-replaceable` -- a v31.1
+     * field this entry lacked -- is emitted. */
     int verbose = 0;
     if (params && params->typ == RJ_ARR && params->nitems >= 1){
         const rj_val* v = params->items[0];
@@ -1571,8 +1644,10 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
                 for (unsigned long i=0;i<n;i++){ mp_ent e2;
                     if (mp_slot(g_mph.mp,i,&e2) != 1) continue;
                     memcpy(g_mpe_vs[g_mpe_vs_n].id, e2.txid, 32);
-                    g_mpe_vs[g_mpe_vs_n].vs = (mp_tx_weight(e2.tx, e2.len)+3)/4;
+                    g_mpe_vs[g_mpe_vs_n].w = mp_tx_weight(e2.tx, e2.len);
+                    g_mpe_vs[g_mpe_vs_n].vs = (g_mpe_vs[g_mpe_vs_n].w+3)/4;
                     g_mpe_vs[g_mpe_vs_n].inf = -1;
+                    g_mpe_vs[g_mpe_vs_n].rbf = (unsigned char)mp_tx_signals_rbf(e2.tx, e2.len);
                     g_mpe_vs_n++;
                 }
                 /* the whole graph in one pass; -1 means fall back per entry */
@@ -1587,7 +1662,8 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
                 qsort(g_mpe_vs, g_mpe_vs_n, sizeof *g_mpe_vs, mpe_vs_cmp);
                 for (long q=0;q<g_mpe_inf_n;q++){
                     long k = mpe_vs_find(g_mpe_inf_id[q]);
-                    if (k >= 0) g_mpe_vs[k].inf = q;
+                    if (k >= 0){ g_mpe_vs[k].inf = q;
+                                 g_mpe_vs[k].vs = mpe_adj_vsize(g_mpe_vs[k].w, g_mpe_inf[q].sigop_cost); }
                 }
             }
         }
@@ -1666,11 +1742,6 @@ static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, con
 static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len){
     rj_val* o = rj_obj();
     unsigned long w = mp_tx_weight(tx, len);
-    rj_obj_set(o, "vsize", rj_numf("%lu", (w+3)/4));
-    rj_obj_set(o, "weight", rj_numf("%lu", w));
-    rj_obj_set(o, "vsize_bip141", rj_numf("%lu", (w+3)/4));
-    rj_obj_set(o, "time", rj_numf("%ld", g_mph.time_of ? g_mph.time_of(txid) : 0));
-    rj_obj_set(o, "height", rj_numf("%d", 0));   /* documented gap: entry height untracked */
 
     mp_entry_info inf; int have_inf = 0;
     /* Prefer the one-pass graph when this call built one; otherwise ask per
@@ -1684,18 +1755,34 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
     if (myinf >= 0){ inf = g_mpe_inf[myinf]; have_inf = 1; }
     else if (g_mph.polstate && g_mph.pol_entry_info)
         have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
-    /* ancestor/descendant vsize sums over set members STILL IN THE POOL */
-    unsigned long long anc_vs=0, desc_vs=0; int anc_n=0, desc_n=0;
+    if (!have_inf) inf.sigop_cost = 0;
+    /* vsize is Core's entry size, the sigops-adjusted one (see
+     * mpe_adj_vsize); weight stays BIP141, as in Core. Without the registry
+     * the sigop cost is unknown and the two coincide. */
+    unsigned long vs = mpe_adj_vsize(w, inf.sigop_cost);
+    rj_obj_set(o, "vsize", rj_numf("%lu", vs));
+    rj_obj_set(o, "weight", rj_numf("%lu", w));
+    rj_obj_set(o, "time", rj_numf("%ld", g_mph.time_of ? g_mph.time_of(txid) : 0));
+    rj_obj_set(o, "height", rj_numf("%d", 0));   /* documented gap: entry height untracked */
+
+    /* ancestor/descendant sums of the same entry size, over set members
+     * STILL IN THE POOL; bip125-replaceable over the same ancestor set */
+    unsigned long long anc_vs=0, desc_vs=0; int anc_n=0, desc_n=0, rbf = 0;
     if (have_inf){
         for (int i=0;i<inf.n_anc;i++){
-            if (g_mpe_vs){ unsigned long v = mpe_vs_lookup(inf.anc[i]); if (v){ anc_vs += v; anc_n++; } continue; }
-            unsigned long l2=0; const unsigned char* t2 = g_mph.get(g_mph.mp, inf.anc[i], &l2);
-            if (t2){ anc_vs += (mp_tx_weight(t2,l2)+3)/4; anc_n++; } }
+            unsigned long v = mpe_member_vsize(inf.anc[i], txid, &inf);
+            if (!v) continue;
+            anc_vs += v; anc_n++;
+            if (!rbf && mpe_member_rbf(inf.anc[i]) == 1) rbf = 1;
+        }
         for (int i=0;i<inf.n_desc;i++){
-            if (g_mpe_vs){ unsigned long v = mpe_vs_lookup(inf.desc[i]); if (v){ desc_vs += v; desc_n++; } continue; }
-            unsigned long l2=0; const unsigned char* t2 = g_mph.get(g_mph.mp, inf.desc[i], &l2);
-            if (t2){ desc_vs += (mp_tx_weight(t2,l2)+3)/4; desc_n++; } }
-    } else { anc_n=1; desc_n=1; anc_vs=desc_vs=(w+3)/4; }
+            unsigned long v = mpe_member_vsize(inf.desc[i], txid, &inf);
+            if (v){ desc_vs += v; desc_n++; } }
+    } else { anc_n=1; desc_n=1; anc_vs=desc_vs=vs; }
+    /* Core's IsRBFOptIn: the tx signals itself, or an unconfirmed ancestor
+     * does (the set above holds self as well). Full-RBF does not enter into
+     * it -- v31.1 reports signalling, not replaceability under its policy. */
+    if (!rbf) rbf = mp_tx_signals_rbf(tx, len);
     rj_obj_set(o, "descendantcount", rj_numf("%d", desc_n));
     rj_obj_set(o, "descendantsize", rj_numf("%llu", desc_vs));
     rj_obj_set(o, "ancestorcount", rj_numf("%d", anc_n));
@@ -1715,13 +1802,12 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
       rj_obj_set(fees, "ancestor", mpe_amount(have_inf ? inf.anc_fee : base));
       rj_obj_set(fees, "descendant", mpe_amount(have_inf ? inf.desc_fee : base));
       /* Core's adjusted weight: max(weight, sigop_cost * bytes_per_sigop)
-       * (policy.cpp GetSigOpsAdjustedWeight). vsize_adjusted is that over 4,
-       * rounded up, exactly as GetVirtualTransactionSize does it. */
+       * (policy.cpp GetSigOpsAdjustedWeight) -- `vsize` above is this over
+       * 4, rounded up. */
       { unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
         unsigned long long adjw = w;
         if (have_inf){ unsigned long long sw = (unsigned long long)inf.sigop_cost * bps;
                        if (sw > adjw) adjw = sw; }
-        rj_obj_set(o, "vsize_adjusted", rj_numf("%llu", (adjw+3)/4));
         /* A SINGLETON cluster -- no unconfirmed parents, no unconfirmed
          * children -- is its own chunk, so chunkweight and fees.chunk are
          * determined with no linearization at all. Both counts include the tx
@@ -1777,6 +1863,7 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
           int here = g_mpe_vs ? (mpe_vs_lookup(inf.spentby[i]) != 0) : (g_mph.get(g_mph.mp, inf.spentby[i], &l2) != 0);
           if (here){ char h2[65]; mpe_hex(h2, inf.spentby[i]); rj_arr_push(sb, rj_str(h2)); } }
       rj_obj_set(o, "spentby", sb); }
+    rj_obj_set(o, "bip125-replaceable", rj_bool(rbf));
     rj_obj_set(o, "unbroadcast", rj_bool(0));
     return o;
 }
@@ -2679,7 +2766,7 @@ static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
  * because of its child.
  *
  * The result follows Core's schema rather than a reduced one of our own:
- * package_msg, tx-results keyed by wtxid with txid / vsize / vsize_bip141 /
+ * package_msg, tx-results keyed by wtxid with txid / vsize /
  * fees{base, effective-feerate, effective-includes} / error, and Core's own
  * "package-not-validated" for members that never got an individual verdict
  * because the package was rejected as a whole.
@@ -2799,7 +2886,6 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
         rj_val* e = rj_obj();
         rj_obj_set(e, "txid", rj_str(thex));
         rj_obj_set(e, "vsize", rj_numf("%llu", (unsigned long long)r_vsize[i]));
-        rj_obj_set(e, "vsize_bip141", rj_numf("%llu", (unsigned long long)r_vsize[i]));
         if (r_result[i]){
             rj_val* f = rj_obj();
             rj_obj_set(f, "base", mpe_amount(r_fee[i]));
@@ -2963,7 +3049,6 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
             } else if (r_result[i]){
                 rj_obj_set(e, "allowed", rj_bool(1));
                 rj_obj_set(e, "vsize", rj_numf("%llu", (unsigned long long)r_vsize[i]));
-                rj_obj_set(e, "vsize_bip141", rj_numf("%llu", (unsigned long long)r_vsize[i]));
                 rj_val* f = rj_obj();
                 rj_obj_set(f, "base", mpe_amount(r_fee[i]));
                 if (eff_vsize){
@@ -3025,7 +3110,6 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
             unsigned long vsz = (w + 3) / 4;
             rj_obj_set(e, "allowed", rj_bool(1));
             rj_obj_set(e, "vsize", rj_numf("%lu", vsz));
-            rj_obj_set(e, "vsize_bip141", rj_numf("%lu", vsz));
             rj_val* fees = rj_obj();
             rj_obj_set(fees, "base", rj_numf("%llu.%08llu", fee/100000000ULL, fee%100000000ULL));
             /* effective-feerate/effective-includes describe package feerate,

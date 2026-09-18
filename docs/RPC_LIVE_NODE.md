@@ -1193,7 +1193,7 @@ With no completed rescan these now ERROR rather than answering `0.00000000`:
 
 ### submitpackage
 Real, in Core's shape: `package_msg`, `tx-results` keyed by wtxid with
-`txid` / `vsize` / `vsize_bip141` / `fees{base, effective-feerate,
+`txid` / `vsize` / `fees{base, effective-feerate,
 effective-includes}` / `error`, and Core's own `package-not-validated` for
 members that never got an individual verdict. `replaced-transactions` is
 absent, which is Core's convention (the field is optional there); this node

@@ -42,10 +42,20 @@ if [ "$PEERED" != "1" ]; then
   echo "      Refusing to write a fixture that silently omits it." >&2
   exit 1
 fi
+# A mempool transaction, so getmempoolentry has a contract too (2026-09-18).
+# Without one the fixture could not say whether bip125-replaceable is a v31.1
+# field or vsize_adjusted is not -- and both were answered wrongly off the
+# v31.99 oracle. An explicit fee_rate: regtest has no estimates and no
+# fallbackfee.
+MPTX=$($C1 -rpcwallet=w -named sendtoaddress address="$ADDR" amount=1 fee_rate=10 2>/dev/null)
+if [ -z "$MPTX" ]; then
+  echo "FAIL: could not put a transaction in the regtest mempool; refusing to write a fixture without getmempoolentry." >&2
+  exit 1
+fi
 VER=$($BIN/bitcoin-cli -version 2>/dev/null | head -1)
-python3 - "$A" "$OUT" "$VER" <<'PY'
+python3 - "$A" "$OUT" "$VER" "$MPTX" <<'PY'
 import json,subprocess,sys,os
-A,OUT,VER=sys.argv[1],sys.argv[2],sys.argv[3]
+A,OUT,VER,MPTX=sys.argv[1],sys.argv[2],sys.argv[3],sys.argv[4]
 CLI=[os.environ.get("BIN","/mnt/2tbssd/core-bench/core/bin")+"/bitcoin-cli",
      "-datadir="+A,"-conf="+A+"/bitcoin.conf","-regtest"]
 def call(a):
@@ -58,7 +68,15 @@ CASES={"getblockchaininfo":[],"getmininginfo":[],"getmempoolinfo":[],
        "getnetworkinfo":[],"getnettotals":[],"getchaintxstats":[],
        "getblock":[bh,"1"],"getblockheader":[bh],"getblockstats":["101"],
        "getdeploymentinfo":[],"getrpcinfo":[],"getindexinfo":[],
-       "getpeerinfo":[],"getblocktemplate":['{"rules":["segwit"]}']}
+       "getpeerinfo":[],"getblocktemplate":['{"rules":["segwit"]}'],
+       "getmempoolentry":[MPTX],"getchainstates":[]}
+# Nested objects whose KEYS are the contract: "method.path" -> the keys at
+# that path. getdeploymentinfo's deployment NAMES are how taproot's absence
+# went unseen (the v31.99 oracle has buried it), and getchainstates' two cache
+# fields sit one level down, inside chainstates[0].
+NESTED={"getdeploymentinfo.deployments":("getdeploymentinfo",[],["deployments"]),
+        "getchainstates.chainstates[0]":("getchainstates",[],["chainstates",0]),
+        "getmempoolentry.fees":("getmempoolentry",[MPTX],["fees"])}
 skipped=[]
 out={"_core_version":VER,"_note":"field sets captured from Core on regtest; "
      "regenerate with validation/capture_core_fields.sh"}
@@ -77,6 +95,15 @@ for m,a in CASES.items():
             skipped.append(m); continue
         out[m]=sorted(o.keys())
 json.dump(out,open(OUT,"w"),indent=1,sort_keys=True)
+for name,(m,a,path) in NESTED.items():
+    o=call([m]+a)
+    for step in path:
+        o=o[step] if o is not None else None
+    if isinstance(o,dict) and o:
+        # deployments keep Core's order (DeploymentInfo's), which is part of it
+        out[name]=list(o.keys()) if name=="getdeploymentinfo.deployments" else sorted(o.keys())
+    else:
+        skipped.append(name)
 out["_skipped_empty"]=sorted(skipped)
 json.dump(out,open(OUT,"w"),indent=1,sort_keys=True)
 print("wrote",OUT,"with",len([k for k in out if not k.startswith("_")]),"methods; skipped empty:",skipped)

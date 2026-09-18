@@ -93,6 +93,21 @@ semantics cannot be honoured, the key is absent, not approximated.
 A caller wanting this node's cache sizing should read `bmcgetdownloadinfo` and
 the `dbcache` setting, which describe what is actually allocated.
 
+**Re-examined 2026-09-18 against v31.1's source**, to see whether the two roles
+map onto anything real here. They do not. `coins_db_cache_bytes` is the
+LevelDB block cache for the coins DB (`kernel/caches.h`: `min(total/2, 8 MiB)`
+of what `-dbcache` leaves after the index caches); this node's UTXO reads go to
+LSM run files through the OS page cache, and there is no DB read cache to
+size. `coins_tip_cache_bytes` is the `CCoinsViewCache` budget, a read-and-write
+coin cache; this node's in-memory table is a write buffer of pending changes
+that lookups do not populate, sized by mode (from `-dbcache` in bulk catch-up,
+a fixed 2^16 slots / 64 MB blob in steady state) inside the download worker,
+which the RPC process cannot observe. Reporting `dbcache` or the memtable size
+under Core's names would be the invented number the rule forbids. The
+omission is also declared in `tests/test_rpc_core_fields.c`
+(`declared_omission`), against a fixture that now captures both fields from
+v31.1.
+
 ---
 
 ## `bmc.catchupworkers` is pinned at 8 because Core's is, and is not a tuning knob

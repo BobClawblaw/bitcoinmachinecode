@@ -1667,7 +1667,30 @@ int main(void){
     ck_str("getdeploymentinfo hash is the tip", S(r,"hash"), g_hash[3]);
     ck_str("getdeploymentinfo height is the tip", S(r,"height"), "3");
     { rj_val* dep = r ? rj_obj_get(r,"deployments") : NULL;
-      ck("Core's five buried deployments, no more", dep && dep->nmembers == 5);
+      /* 2026-09-18: this asserted FIVE, "Core's five buried deployments, no
+       * more" -- which was the v31.99 development oracle's list, where taproot
+       * has been buried and dropped. v31.1 lists six on mainnet: the five
+       * buried ones and taproot as bip9. The count pinned the defect. */
+      ck("v31.1's six mainnet deployments: five buried + taproot, no more",
+         dep && dep->nmembers == 6);
+      ck("taproot is listed LAST, after the buried five (DeploymentInfo's order)",
+         dep && dep->nmembers == 6 && !strcmp(dep->members[5].key, "taproot"));
+      rj_val* tr = dep ? rj_obj_get(dep,"taproot") : NULL;
+      rj_val* tb = tr ? rj_obj_get(tr,"bip9") : NULL;
+      ck_str("taproot type is bip9", tr ? S(tr,"type") : NULL, "bip9");
+      ck("taproot at height 3 carries no activation height (not active, not next)",
+         tr && rj_obj_get(tr,"height") == NULL);
+      ck_str("taproot is not active at height 3", tr ? S(tr,"active") : NULL, "0");
+      ck_str("taproot start_time is v31.1's mainnet 1619222400", tb ? S(tb,"start_time") : NULL, "1619222400");
+      ck_str("taproot timeout is v31.1's mainnet 1628640000", tb ? S(tb,"timeout") : NULL, "1628640000");
+      ck_str("taproot min_activation_height 709632", tb ? S(tb,"min_activation_height") : NULL, "709632");
+      ck_str("taproot is DEFINED before its first period boundary", tb ? S(tb,"status") : NULL, "defined");
+      ck_str("...since 0 (DEFINED is the genesis state)", tb ? S(tb,"since") : NULL, "0");
+      ck_str("...and stays defined for the next block", tb ? S(tb,"status_next") : NULL, "defined");
+      ck("no bit/statistics/signalling outside STARTED and LOCKED_IN",
+         tb && !rj_obj_get(tb,"bit") && !rj_obj_get(tb,"statistics") && !rj_obj_get(tb,"signalling"));
+      ck("testdummy is NEVER_ACTIVE on mainnet, so it is not listed",
+         dep && rj_obj_get(dep,"testdummy") == NULL);
       rj_val* seg = dep ? rj_obj_get(dep,"segwit") : NULL;
       ck_str("segwit type is buried", seg ? S(seg,"type") : NULL, "buried");
       ck_str("segwit height is the generated SFC_HEIGHT_SEGWIT",
@@ -1678,16 +1701,70 @@ int main(void){
       ck_str("bip34 height is the generated SFC_HEIGHT_BIP34",
              b34 ? S(b34,"height") : NULL, "227931"); }
     { rj_val* sf = r ? rj_obj_get(r,"script_flags") : NULL;
-      /* at height 4 only the unconditional flags apply */
-      ck("script_flags at a pre-activation height is exactly P2SH + TAPROOT",
-         sf && sf->typ == RJ_ARR && sf->nitems == 2 &&
-         !strcmp(sf->items[0]->str, "P2SH") && !strcmp(sf->items[1]->str, "TAPROOT")); }
+      /* at height 3 only the unconditional flags apply -- and in Core that is
+       * THREE: P2SH, TAPROOT and WITNESS (GetBlockScriptFlags). This asserted
+       * two, pinning a defect that held WITNESS back until segwit's height;
+       * v31.1 on mainnet answers ["P2SH","TAPROOT","WITNESS"] for genesis. */
+      ck("script_flags at a pre-activation height is exactly P2SH + TAPROOT + WITNESS",
+         sf && sf->typ == RJ_ARR && sf->nitems == 3 &&
+         !strcmp(sf->items[0]->str, "P2SH") && !strcmp(sf->items[1]->str, "TAPROOT") &&
+         !strcmp(sf->items[2]->str, "WITNESS")); }
     rj_free(r);
     /* the blockhash argument selects a different block */
     { char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_hash[1]);
       r = call("getdeploymentinfo", pj, &ec, &em);
       ck_str("getdeploymentinfo(blockhash) reports that block", S(r,"height"), "1");
       rj_free(r); }
+    /* The other chains list taproot as ALWAYS_ACTIVE (v31.1 chainparams), and
+     * regtest lists testdummy before it. ALWAYS_ACTIVE has a fixed shape in
+     * Core: active since 0, height 0, start_time -1, NO_TIMEOUT. Run on this
+     * archive under each chain's name -- only the parameters matter here, and
+     * testdummy's first regtest boundary (144) is past the fixture's tip. */
+    { static const char* CH[3] = { "regtest", "testnet4", "signet" };
+      for (int c = 0; c < 3; c++){
+          rpc_chain_set_chainparams(CH[c], 210000, 0, 0, 0x1d00ffffu, 0);
+          r = call("getdeploymentinfo", "[]", &ec, &em);
+          rj_val* dep = r ? rj_obj_get(r,"deployments") : NULL;
+          rj_val* tr = dep ? rj_obj_get(dep,"taproot") : NULL;
+          rj_val* tb = tr ? rj_obj_get(tr,"bip9") : NULL;
+          char what[160];
+          snprintf(what, sizeof what, "%s: taproot is ALWAYS_ACTIVE -- bip9, height 0, active", CH[c]);
+          ck(what, tr && S(tr,"type") && !strcmp(S(tr,"type"),"bip9") && S(tr,"height") && !strcmp(S(tr,"height"),"0")
+                   && S(tr,"active") && !strcmp(S(tr,"active"),"1"));
+          snprintf(what, sizeof what, "%s: taproot start_time -1, timeout NO_TIMEOUT, min_activation_height 0", CH[c]);
+          ck(what, tb && S(tb,"start_time") && !strcmp(S(tb,"start_time"),"-1")
+                   && S(tb,"timeout") && !strcmp(S(tb,"timeout"),"9223372036854775807")
+                   && S(tb,"min_activation_height") && !strcmp(S(tb,"min_activation_height"),"0"));
+          snprintf(what, sizeof what, "%s: taproot status active since 0, status_next active, no statistics", CH[c]);
+          ck(what, tb && S(tb,"status") && !strcmp(S(tb,"status"),"active") && S(tb,"since") && !strcmp(S(tb,"since"),"0")
+                   && S(tb,"status_next") && !strcmp(S(tb,"status_next"),"active") && !rj_obj_get(tb,"statistics"));
+          if (c == 0){
+              rj_val* td = dep ? rj_obj_get(dep,"testdummy") : NULL;
+              rj_val* db = td ? rj_obj_get(td,"bip9") : NULL;
+              ck("regtest: seven deployments, testdummy then taproot LAST",
+                 dep && dep->nmembers == 7 && !strcmp(dep->members[5].key, "testdummy")
+                     && !strcmp(dep->members[6].key, "taproot"));
+              ck("regtest: testdummy is defined before its first 144-block boundary, not active",
+                 db && S(db,"status") && !strcmp(S(db,"status"),"defined") && S(db,"start_time") && !strcmp(S(db,"start_time"),"0")
+                    && td && S(td,"active") && !strcmp(S(td,"active"),"0") && !rj_obj_get(td,"height"));
+              /* script_flags describe the block ITSELF. Regtest buries segwit
+               * at 0 and the other four at 1, so block 0 has NULLDUMMY and
+               * none of DERSIG/CLTV/CSV -- the next block's flags would. */
+              char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_hash[0]);
+              rj_val* r0 = call("getdeploymentinfo", pj, &ec, &em);
+              rj_val* sf = r0 ? rj_obj_get(r0,"script_flags") : NULL;
+              ck("regtest block 0: script_flags are block 0's own -- NULLDUMMY, P2SH, TAPROOT, WITNESS",
+                 sf && sf->typ == RJ_ARR && sf->nitems == 4 && !strcmp(sf->items[0]->str, "NULLDUMMY")
+                    && !strcmp(sf->items[1]->str, "P2SH") && !strcmp(sf->items[2]->str, "TAPROOT")
+                    && !strcmp(sf->items[3]->str, "WITNESS"));
+              rj_free(r0);
+          } else {
+              snprintf(what, sizeof what, "%s: six deployments, no testdummy (NEVER_ACTIVE there)", CH[c]);
+              ck(what, dep && dep->nmembers == 6 && !rj_obj_get(dep,"testdummy"));
+          }
+          rj_free(r);
+      }
+      rpc_chain_set_chainparams("main", 210000, 0, 0, 0x1d00ffffu, 0); }
     expect_err("getdeploymentinfo on an unknown hash -> -5", "getdeploymentinfo",
                "[\"00000000000000000000000000000000000000000000000000000000deadbeef\"]",
                -5, "Block not found");

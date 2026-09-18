@@ -22,6 +22,25 @@ static const unsigned char SPK[22] = {0x00,0x14, 0x99,0x99,0x99,0x99,0x99,0x99,0
     return 1;
 }
 
+/* A one-in, one-out legacy tx (82 bytes): spends prev:0 with nSequence
+ * `seq`, pays `val` to a P2WPKH of 20 x `tag`. */
+static unsigned long mk_tx1(unsigned char* t, const unsigned char prev[32], unsigned seq,
+                            unsigned long long val, unsigned char tag){
+    unsigned long n = 0;
+    t[n++]=2;t[n++]=0;t[n++]=0;t[n++]=0;
+    t[n++]=1; memcpy(t+n, prev, 32); n+=32; t[n++]=0;t[n++]=0;t[n++]=0;t[n++]=0;
+    t[n++]=0;
+    for (int i=0;i<4;i++) t[n++]=(unsigned char)(seq>>(8*i));
+    t[n++]=1; for (int i=0;i<8;i++) t[n++]=(unsigned char)(val>>(8*i));
+    t[n++]=22; t[n++]=0x00; t[n++]=0x14; for (int i=0;i<20;i++) t[n++]=tag;
+    t[n++]=0;t[n++]=0;t[n++]=0;t[n++]=0;
+    return n;
+}
+static void mpe_hex_test(char* dst, const unsigned char* id){   /* display order */
+    for (int k=0;k<32;k++) sprintf(dst+2*k, "%02x", id[31-k]);
+    dst[64]=0;
+}
+
 /* Fake tx-submit worker: acks whatever the parent stages, recording the
  * tx_submit_test flag it saw so the test can prove sendrawtransaction clears
  * it (a stale 1 would turn a real broadcast into a dry run). */
@@ -979,6 +998,123 @@ int main(void){
           /* leave the map clean for later checks */
           pp2=rj_parse("[\"0000000000000000000000000000000000000000000000000000000000000002\", 0, -250]",77);
           r=NULL; rpc_node_dispatch("prioritisetransaction",pp2,&r,&ec,&em); rj_free(r); rj_free(pp2); }
+
+        /* ---- bip125-replaceable and the entry size, against v31.1 (2026-09-18).
+         *
+         * v31.1's entryToJSON emits bip125-replaceable: policy/rbf.cpp
+         * IsRBFOptIn -- the tx signals (an input with nSequence <= 0xfffffffd)
+         * OR an unconfirmed ancestor does. Signalling, not policy: full-RBF
+         * does not make a non-signalling tx report true. Four txs pin the
+         * four cases: A signals; B does not but spends A, so it inherits; D
+         * does not signal (0xfffffffe is the first final-for-BIP125 value);
+         * E spends D and nothing in its ancestry signals.
+         *
+         * And v31.1's `vsize` is the entry size, GetTxSize(): sigops-ADJUSTED.
+         * This node used to report plain BIP141 there plus two v31.99-only
+         * keys, vsize_adjusted and vsize_bip141. S carries 80 sigop-cost units
+         * (x20 bytes per sigop = 1600 weight, 400 vB) in an 82-byte body, and
+         * S2 is an ordinary child of it, so ancestorsize must sum 400 + 82.
+         * Every check runs through both graph paths. ---- */
+        { extern void mpool_policy_set_pending_sigops(unsigned long long);
+          extern long mpool_policy_set_sigops(void*, const unsigned char*, unsigned int);
+          extern long mpool_policy_entry(void*, const unsigned char*,
+                                         unsigned long long*, unsigned long long*);
+          extern long mpool_policy_entry_info_all(void*, struct mp_entry_info*,
+                                                  unsigned char (*)[32], unsigned);
+          static unsigned char ta[128], tb[128], td[128], te[128], ts[128], ts2[128];
+          unsigned char pa[32], pd[32], ps[32]; memset(pa, 0x66, 32); memset(pd, 0x77, 32); memset(ps, 0x88, 32);
+          unsigned char ia[32], ib[32], id_[32], ie[32], is[32], is2[32];
+          unsigned long la = mk_tx1(ta, pa, 0xfffffffdu, 90000, 0xA1);
+          ck("A txid", tx_txid(ia, ta, la, scratch, sizeof scratch)==1);
+          ck("policy add A (signals)", mpool_policy_add(polcfg, polstate, pool, ta, la, ia, (void*)1)==1);
+          unsigned long lb = mk_tx1(tb, ia, 0xffffffffu, 80000, 0xB1);
+          ck("B txid", tx_txid(ib, tb, lb, scratch, sizeof scratch)==1);
+          ck("policy add B (final, child of A)", mpool_policy_add(polcfg, polstate, pool, tb, lb, ib, (void*)1)==1);
+          unsigned long ld = mk_tx1(td, pd, 0xfffffffeu, 90000, 0xD1);
+          ck("D txid", tx_txid(id_, td, ld, scratch, sizeof scratch)==1);
+          ck("policy add D (0xfffffffe: does not signal)", mpool_policy_add(polcfg, polstate, pool, td, ld, id_, (void*)1)==1);
+          unsigned long le = mk_tx1(te, id_, 0xffffffffu, 80000, 0xE1);
+          ck("E txid", tx_txid(ie, te, le, scratch, sizeof scratch)==1);
+          ck("policy add E (final, child of D)", mpool_policy_add(polcfg, polstate, pool, te, le, ie, (void*)1)==1);
+          unsigned long ls = mk_tx1(ts, ps, 0xffffffffu, 90000, 0xC1);
+          ck("S txid", tx_txid(is, ts, ls, scratch, sizeof scratch)==1);
+          mpool_policy_set_pending_sigops(80);
+          ck("policy add S (80 sigop-cost units)", mpool_policy_add(polcfg, polstate, pool, ts, ls, is, (void*)1)==1);
+          mpool_policy_set_pending_sigops(0);
+          /* ...and the registry stamp tx_accept.c's txacc_note_sigops makes
+           * after every successful accept: the pending count prices the
+           * admission, this is what the entry keeps */
+          ck("S's sigop cost stamped on its registry node", mpool_policy_set_sigops(polstate, is, 80)==1);
+          unsigned long ls2 = mk_tx1(ts2, is, 0xffffffffu, 80000, 0xC2);
+          ck("S2 txid", tx_txid(is2, ts2, ls2, scratch, sizeof scratch)==1);
+          ck("policy add S2 (plain child of S)", mpool_policy_add(polcfg, polstate, pool, ts2, ls2, is2, (void*)1)==1);
+          char ha[65], hb[65], hd[65], he[65], hs[65], hs2[65];
+          mpe_hex_test(ha, ia); mpe_hex_test(hb, ib); mpe_hex_test(hd, id_); mpe_hex_test(he, ie);
+          mpe_hex_test(hs, is); mpe_hex_test(hs2, is2);
+          for (int bulk_on = 0; bulk_on < 2; bulk_on++){
+              { rpc_mempool_hooks h; memset(&h,0,sizeof h);
+                h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
+                h.get = mpool_get; h.polstate = polstate;
+                h.pol_entry = mpool_policy_entry;
+                h.pol_entry_info = mpool_policy_entry_info;
+                if (bulk_on) h.pol_entry_info_all = mpool_policy_entry_info_all;
+                rpc_node_set_mempool(&h); }
+              const char* path = bulk_on ? "bulk getrawmempool" : "getmempoolentry";
+              rj_val* all = NULL;
+              if (bulk_on){ rj_val* pv = rj_parse("[true]", 6); rpc_node_dispatch("getrawmempool", pv, &all, &ec, &em); rj_free(pv); }
+              const char* who[6] = { ha, hb, hd, he, hs, hs2 };
+              rj_val* got[6];
+              for (int q = 0; q < 6; q++){
+                  got[q] = NULL;
+                  if (bulk_on){ got[q] = all ? rj_obj_get(all, who[q]) : NULL; continue; }
+                  char one[128]; snprintf(one, sizeof one, "[\"%s\"]", who[q]);
+                  rj_val* op = rj_parse(one, strlen(one));
+                  rpc_node_dispatch("getmempoolentry", op, &got[q], &ec, &em); rj_free(op);
+              }
+              char what[200];
+              #define RBF_IS(q, want, label) do { \
+                  rj_val* b_ = got[q] ? rj_obj_get(got[q], "bip125-replaceable") : NULL; \
+                  snprintf(what, sizeof what, "%s: %s", path, label); \
+                  ck(what, b_ && b_->typ == RJ_BOOL && b_->str && b_->str[0] == ((want) ? '1' : '0')); } while (0)
+              RBF_IS(0, 1, "A signals itself -> bip125-replaceable true");
+              RBF_IS(1, 1, "B is final but its unconfirmed parent A signals -> true (inherited)");
+              RBF_IS(2, 0, "D's 0xfffffffe does not signal, no ancestors -> false");
+              RBF_IS(3, 0, "E is final and its ancestor D does not signal -> false");
+              RBF_IS(4, 0, "S is final, no ancestors -> false");
+              #undef RBF_IS
+              { int keyorder = 1;
+                rj_val* e0 = got[0];
+                /* Core's order: ... depends, spentby, bip125-replaceable, unbroadcast */
+                if (!e0 || e0->nmembers < 3) keyorder = 0;
+                else keyorder = !strcmp(e0->members[e0->nmembers-1].key, "unbroadcast")
+                             && !strcmp(e0->members[e0->nmembers-2].key, "bip125-replaceable")
+                             && !strcmp(e0->members[e0->nmembers-3].key, "spentby");
+                snprintf(what, sizeof what, "%s: bip125-replaceable sits between spentby and unbroadcast, as in Core", path);
+                ck(what, keyorder); }
+              { int none = 1;
+                for (int q = 0; q < 6; q++)
+                    if (!got[q] || rj_obj_get(got[q], "vsize_adjusted") || rj_obj_get(got[q], "vsize_bip141")) none = 0;
+                snprintf(what, sizeof what, "%s: no vsize_adjusted / vsize_bip141 (v31.99-only keys, absent from v31.1)", path);
+                ck(what, none); }
+              rj_val* s = got[4]; rj_val* s2 = got[5];
+              snprintf(what, sizeof what, "%s: S vsize is the ADJUSTED entry size, 400 (80 x 20 / 4), weight stays 328", path);
+              ck(what, s && S(s,"vsize") && !strcmp(S(s,"vsize"),"400") && S(s,"weight") && !strcmp(S(s,"weight"),"328"));
+              snprintf(what, sizeof what, "%s: S descendantsize sums the adjusted sizes, 400 + 82 = 482", path);
+              ck(what, s && S(s,"descendantsize") && !strcmp(S(s,"descendantsize"),"482"));
+              snprintf(what, sizeof what, "%s: S2 vsize 82, ancestorsize 400 + 82 = 482", path);
+              ck(what, s2 && S(s2,"vsize") && !strcmp(S(s2,"vsize"),"82")
+                       && S(s2,"ancestorsize") && !strcmp(S(s2,"ancestorsize"),"482"));
+              if (s && S(s,"vsize")) printf("  (%s: S vsize=%s descendantsize=%s; S2 ancestorsize=%s)\n", path,
+                                             S(s,"vsize"), S(s,"descendantsize"), s2 ? S(s2,"ancestorsize") : "-");
+              if (bulk_on) rj_free(all);
+              else for (int q = 0; q < 6; q++) rj_free(got[q]);
+          }
+          { rpc_mempool_hooks h; memset(&h,0,sizeof h);
+            h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
+            h.get = mpool_get; h.polstate = polstate;
+            h.pol_entry = mpool_policy_entry;
+            h.pol_entry_info = mpool_policy_entry_info;
+            rpc_node_set_mempool(&h); } }
 
         /* error parity: -5 not in mempool; -8 bad txid with Core's message */
         { rj_val* p5=rj_parse("[\"0000000000000000000000000000000000000000000000000000000000000001\"]",68);

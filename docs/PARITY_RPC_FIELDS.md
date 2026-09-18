@@ -231,3 +231,79 @@ moved to `rpc_json.c` (`rj_wrong_type_msg`) so every emitter agrees. The `-1`
 text cannot be matched: this node carries no per-method usage text by decision,
 so it answers Core's code with a short usage line. Full account and the
 verification in `CORE_DIVERGENCES.md`.
+
+## 2026-09-18 — three v31.1 gaps the v31.99 oracle hid
+
+Diffing against the **v31.1 release node** (RPC 8337) instead of the v31.99
+development oracle turned up three things. Two of them had been "confirmed"
+off the dev build, which has since buried taproot and changed the mempool
+entry.
+
+### `getdeploymentinfo`: taproot, and `script_flags` below the tip — FIXED
+
+- v31.1 lists **taproot as a bip9 deployment** after the five buried ones
+  (`DeploymentInfo`'s order; on regtest after `testdummy`). It was missing,
+  and a test pinned the count at five. Now emitted from the real BIP9 state
+  machine (`GetStateFor`, `GetStateSinceHeightFor`, `GetStateStatisticsFor`)
+  walked over this node's headers, with v31.1's per-chain parameters: mainnet
+  1619222400 / 1628640000 / min_activation_height 709632 / 1815 of 2016;
+  ALWAYS_ACTIVE on testnet4, signet and regtest. `testdummy` goes through the
+  same code.
+- `script_flags` had three defects that only show with a `blockhash` below
+  the tip: it described the NEXT block (Core describes the block itself), it
+  held `WITNESS` back until segwit's height (Core sets it unconditionally), and
+  it ignored the two `script_flag_exceptions` (170060 is `[]`, 692261 has no
+  `TAPROOT`). The exception hashes and flag bits are now generated into
+  `script_flags_consts.h` by `validation/gen_script_flags.py`.
+- Verified: whole documents equal to v31.1 on **mainnet at 32 heights** —
+  every buried activation boundary, both exception blocks, and taproot's
+  DEFINED → STARTED (681408) → LOCKED_IN (687456) → ACTIVE (709632) path with
+  its statistics and signalling strings (a header-only archive of mainnet
+  0..712000 served through `rpc_chain.o`) — and on **regtest at 18 heights**
+  across testdummy's whole lifecycle, including a failed signalling period
+  (`validation/v311_rpc_gaps_regtest_diff.sh`).
+- The BIP9 parameters are **transcribed**, not generated: the generator reads
+  a master tree, where `DEPLOYMENT_TAPROOT` no longer exists. The mainnet walk
+  above is what checks them. A pruned node that no longer has taproot's
+  signalling headers omits the deployment rather than guessing its state.
+
+### `getmempoolentry` / `getrawmempool true` / ancestors-descendants verbose — FIXED
+
+| field | v31.1 | was | now |
+|---|---|---|---|
+| `bip125-replaceable` | present | missing | emitted: `IsRBFOptIn` — the tx signals (an input with nSequence ≤ 0xfffffffd) or an in-mempool ancestor does. Signalling, not full-RBF policy. |
+| `vsize_adjusted`, `vsize_bip141` | **absent** (all of `rpc/`) | emitted | removed, also from `testmempoolaccept` / `submitpackage` |
+| `vsize` | `GetTxSize()`: **sigops-adjusted** | plain BIP141 | adjusted — the number `vsize_adjusted` used to carry |
+| `ancestorsize`, `descendantsize` | sums of the adjusted size | BIP141 sums | adjusted sums |
+
+Item 5 above and the 2026-09-12 table listed `vsize_adjusted`/`vsize_bip141` as
+v31.1 fields to emit; that came off the dev build and was wrong. Verified
+against v31.1 on regtest: a signalling tx, a `replaceable=false` tx and a final
+child of a signalling parent, field for field (`unbroadcast` excepted — see
+below).
+
+### `getchainstates`: `coins_db_cache_bytes`, `coins_tip_cache_bytes` — DIVERGENCE, KEPT
+
+Both are real v31.1 fields: the configured LevelDB block cache for the coins
+DB (`min(total/2, 8 MiB)` of what `-dbcache` leaves after the index caches)
+and the `CCoinsViewCache` budget (the rest). This node has **no counterpart
+to either**. Its UTXO set is an LSM: reads go to run files through the OS page
+cache (there is no DB read cache), and the in-memory table is a *write buffer*
+of pending changes, not a coin cache, sized by mode — `-dbcache`-derived in
+bulk catch-up, a fixed 2^16 slots / 64 MB steady-state — in the download
+worker, which the RPC side cannot see. Emitting `dbcache` or the memtable size
+under these names would be an invented number with Core's label on it. The
+omission is now a declared one in the frozen fixture test
+(`declared_omission`) as well as in `CORE_DIVERGENCES.md`.
+
+### Found, not fixed
+
+- `unbroadcast` is a constant `false`. Core is `true` for a transaction its own
+  RPC submitted until a peer requests it; this node keeps no unbroadcast set.
+- `getmempoolinfo.bytes` is still the BIP141 vsize sum; v31.1 sums the adjusted
+  entry size. Equal except for sigop-heavy transactions. The comment there
+  keeps it independent of the policy registry on purpose, so it is left for a
+  decision rather than changed in passing.
+- `testmempoolaccept` (single-tx path) reports BIP141 `vsize`; v31.1 reports
+  the adjusted one. `submitpackage` / package `testmempoolaccept` already
+  report the adjusted size.

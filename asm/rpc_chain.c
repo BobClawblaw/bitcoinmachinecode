@@ -2155,12 +2155,11 @@ static int cmd_getrawtransaction(const rj_val* params, rj_val** res, long* ec, c
                  * present with explicit blockhash argument". Filling any of
                  * them in would assert a confirmation that has not happened.
                  *
-                 * KNOWN OMISSION: Core also adds `vsize_adjusted` (the
-                 * sigop-adjusted vsize) for a mempool hit. This node has no
-                 * -bytespersigop concept anywhere in its RPC surface yet, and
-                 * adding the field in ONE place while getmempoolentry and the
-                 * package RPCs still report plain vsize would be worse than
-                 * omitting it consistently. */
+                 * No `vsize_adjusted` either. This comment used to call it a
+                 * known omission, but that was the v31.99 development oracle
+                 * talking: v31.1's getrawtransaction has no such field
+                 * (checked in its rpc/ tree, 2026-09-18), so leaving it out
+                 * is parity, not a gap. */
                 *res = tx_to_json(mraw, &w, -1);
                 return 1;
             }
@@ -3443,7 +3442,11 @@ static int cmd_getchainstates(rj_val** res, long* ec, const char** em){
     /* coins_db_cache_bytes / coins_tip_cache_bytes are Core's LevelDB and
      * in-memory coin cache sizes. This node has neither -- its UTXO set is
      * an LSM with its own sizing -- so the fields are OMITTED rather than
-     * filled with a number that would describe a cache that does not exist. */
+     * filled with a number that would describe a cache that does not exist.
+     * Re-checked 2026-09-18 against v31.1: there is no coins-DB read cache
+     * here at all (reads go through the page cache), and the memtable is a
+     * write buffer sized by mode inside the download worker, not a coin
+     * cache this process could report. docs/CORE_DIVERGENCES.md. */
     rj_obj_set(cs, "validated", rj_bool(1));
     rj_val* arr = rj_arr(); rj_arr_push(arr, cs);
     rj_val* o = rj_obj();
@@ -3461,9 +3464,16 @@ static int cmd_getchainstates(rj_val** res, long* ec, const char** em){
  * from consensus behaviour by being edited on its own, and a Core upgrade
  * that moved a height would move both together.
  *
- * P2SH, WITNESS and TAPROOT are not listed: Core buries them at height 0
- * unconditionally (with two by-hash exceptions), and this Core reports
- * exactly the five below. */
+ * P2SH and WITNESS are not listed: Core buries them at height 0
+ * unconditionally (with two by-hash exceptions). TAPROOT's script flag is
+ * unconditional in the same way, but v31.1 still LISTS taproot, as a BIP9
+ * deployment -- see gdi_bip9 below.
+ *
+ * 2026-09-18: this comment used to say "this Core reports exactly the five
+ * below", and a test pinned the count at five. "This Core" was the v31.99
+ * development oracle, where taproot has since been buried and dropped from
+ * the list. v31.1 -- the release this node tracks -- reports six on mainnet:
+ * the five buried ones and taproot. */
 static void gdi_dep(rj_val* o, const char* name, long h, long tip){
     rj_val* d = rj_obj();
     rj_obj_set(d, "type", rj_str("buried"));
@@ -3471,50 +3481,132 @@ static void gdi_dep(rj_val* o, const char* name, long h, long tip){
     rj_obj_set(d, "height", rj_numf("%ld", h));
     rj_obj_set(o, name, d);
 }
-/* ---- regtest's testdummy: a live BIP9 deployment (Core's versionbits.cpp) --
- * bit 28, start_time 0, no timeout, min_activation_height 0, threshold 108
- * of a 144-block period. The only chain where it is enabled; the others set
- * NEVER_ACTIVE and Core lists nothing. The state for the block after `prev`
- * is decided at period boundaries from the previous period's blocks, exactly
- * as GetStateFor walks them. */
+/* ---- BIP9 deployments (Core v31.1 versionbits.cpp) ----------------------
+ * v31.1 lists two: testdummy and taproot, in that order (DeploymentInfo).
+ * Master has since buried taproot, which is how its absence here went
+ * unnoticed -- the v31.99 oracle lists neither on mainnet.
+ *
+ * The parameters are per chain, from v31.1's kernel/chainparams.cpp:
+ *   main      taproot    bit 2, start 1619222400, timeout 1628640000,
+ *                        min_activation_height 709632, 1815 of 2016
+ *   testnet4  taproot    ALWAYS_ACTIVE, 1512 of 2016
+ *   signet    taproot    ALWAYS_ACTIVE, 1815 of 2016
+ *   regtest   testdummy  bit 28, start 0, NO_TIMEOUT, 0, 108 of 144
+ *             taproot    ALWAYS_ACTIVE, 108 of 144
+ * testdummy is NEVER_ACTIVE outside regtest, and Core lists nothing for a
+ * NEVER_ACTIVE deployment (DeploymentEnabled).
+ *
+ * TRANSCRIBED, not generated like the buried heights: gen_script_flags.py
+ * reads a master tree, where DEPLOYMENT_TAPROOT no longer exists. The
+ * values are checked against a live v31.1 instead (mainnet at the boundary
+ * heights, and the regtest differential). Taproot's SCRIPT flag does not
+ * come from this table -- it is unconditional, as in Core -- so an error
+ * here could misreport, never misvalidate.
+ *
+ * The state of the block after `prev` is decided at period boundaries from
+ * the previous period's blocks, exactly as GetStateFor walks them. The walk
+ * runs forward from genesis and stops at a terminal state (ACTIVE, FAILED):
+ * on mainnet that is one MTP per boundary until taproot's start, three
+ * signalling periods, and a few LOCKED_IN boundaries -- ~10k header reads. */
+typedef struct {
+    const char* name;
+    int bit;
+    long long start, timeout;          /* Core's nStartTime / nTimeout */
+    long min_act, period, threshold;
+} b9_dep;
+#define B9_ALWAYS_ACTIVE (-1LL)
+#define B9_NO_TIMEOUT    9223372036854775807LL
+static const b9_dep B9_MAIN_TAPROOT  = { "taproot",   2,  1619222400LL,     1628640000LL,  709632, 2016, 1815 };
+static const b9_dep B9_T4_TAPROOT    = { "taproot",   2,  B9_ALWAYS_ACTIVE, B9_NO_TIMEOUT, 0,      2016, 1512 };
+static const b9_dep B9_SIG_TAPROOT   = { "taproot",   2,  B9_ALWAYS_ACTIVE, B9_NO_TIMEOUT, 0,      2016, 1815 };
+static const b9_dep B9_REG_TESTDUMMY = { "testdummy", 28, 0,                B9_NO_TIMEOUT, 0,      144,  108  };
+static const b9_dep B9_REG_TAPROOT   = { "taproot",   2,  B9_ALWAYS_ACTIVE, B9_NO_TIMEOUT, 0,      144,  108  };
+
 enum { TS_DEFINED, TS_STARTED, TS_LOCKED_IN, TS_ACTIVE, TS_FAILED };
 static const char* ts_name(int s){ return s == TS_DEFINED ? "defined" : s == TS_STARTED ? "started" : s == TS_LOCKED_IN ? "locked_in" : s == TS_ACTIVE ? "active" : "failed"; }
-static int bip9_signals(long h){ u8 pre[89 + 9]; if (read_block_prefix(h, pre, sizeof pre) != 1) return 0; u32 v = rd32(pre); return (v & 0xE0000000u) == 0x20000000u && (v & (1u << 28)) != 0; }
-#define TD_PERIOD 144L
-#define TD_THRESHOLD 108L
-static int bip9_state_for(long prev, long* since){
+/* 1 signals, 0 does not, -1 the header is not readable (pruned / hole) */
+static int b9_signals(const b9_dep* d, long h){
+    u8 v4[4]; if (read_block_prefix(h, v4, sizeof v4) != 1) return -1;
+    u32 v = rd32(v4);
+    return (v & 0xE0000000u) == 0x20000000u && (v & (1u << d->bit)) != 0;
+}
+/* median_time_past, except that a header it cannot read is a failure rather
+ * than a shorter window: a state machine fed a wrong MTP reports a wrong
+ * state. */
+static int b9_mtp(long h, long* out){
+    u32 t[11]; int n = 0;
+    for (long i = h; i >= 0 && n < 11; i--){
+        u8 hdr[80]; if (read_block_prefix(i, hdr, 80) != 1) return 0;
+        t[n++] = rd32(hdr + 68);
+    }
+    if (n == 0) return 0;
+    qsort(t, (size_t)n, sizeof t[0], cmp_u32);
+    *out = (long)t[n/2]; return 1;
+}
+/* The state of the block after `prev` (-1: genesis, whose parent is null),
+ * and in *since the first height of the period it has held since
+ * (GetStateSinceHeightFor: 0 for DEFINED and for ALWAYS_ACTIVE). -1 when a
+ * header the walk needs cannot be read. */
+static int b9_state_for(const b9_dep* d, long prev, long* since){
+    *since = 0;
+    if (d->start == B9_ALWAYS_ACTIVE) return TS_ACTIVE;
     int state = TS_DEFINED; long s = 0;
-    for (long b = TD_PERIOD; prev >= 0 && b - 1 <= prev; b += TD_PERIOD){
-        long p = b - 1; int next = state;
+    for (long b = d->period; b - 1 <= prev; b += d->period){
+        long p = b - 1, m; int next = state;
         switch (state){
-        case TS_DEFINED: if (median_time_past(p) >= 0) next = TS_STARTED; break;                       /* start_time 0 */
-        case TS_STARTED: { long count = 0; for (long k = b - TD_PERIOD; k <= p; k++) count += bip9_signals(k);
-                           if (count >= TD_THRESHOLD) next = TS_LOCKED_IN; /* no timeout: NO_TIMEOUT */ } break;
-        case TS_LOCKED_IN: next = TS_ACTIVE; break;                                                     /* min_activation_height 0 */
+        case TS_DEFINED:
+            if (!b9_mtp(p, &m)) return -1;
+            if (m >= d->start) next = TS_STARTED;
+            break;
+        case TS_STARTED: {
+            long count = 0;
+            for (long k = b - d->period; k <= p; k++){ int sg = b9_signals(d, k); if (sg < 0) return -1; count += sg; }
+            if (count >= d->threshold) next = TS_LOCKED_IN;
+            else { if (!b9_mtp(p, &m)) return -1; if (m >= d->timeout) next = TS_FAILED; }
+        } break;
+        case TS_LOCKED_IN:
+            if (p + 1 >= d->min_act) next = TS_ACTIVE;
+            break;
         default: break;
         }
         if (next != state){ state = next; s = b; }
+        if (state == TS_ACTIVE || state == TS_FAILED) break;   /* terminal */
     }
     *since = s; return state;
 }
-static void gdi_testdummy(rj_val* o, long tip){
+/* One deployment, shaped as rpc/blockchain.cpp SoftForkDescPushBack (BIP9).
+ * A walk that hits an unreadable header (a pruned node asked about taproot's
+ * signalling window) OMITS the deployment: every field here is derived from
+ * those headers, and there is nothing true to put in their place. */
+static void gdi_bip9(rj_val* o, const b9_dep* d, long tip){
     long since = 0, since_next = 0;
-    int cur = bip9_state_for(tip - 1, &since), next = bip9_state_for(tip, &since_next);
+    int cur = b9_state_for(d, tip - 1, &since), next = b9_state_for(d, tip, &since_next);
+    if (cur < 0 || next < 0) return;
     int has_signal = (cur == TS_STARTED || cur == TS_LOCKED_IN);
     rj_val* b9 = rj_obj();
-    if (has_signal) rj_obj_set(b9, "bit", rj_num("28"));
-    rj_obj_set(b9, "start_time", rj_num("0"));
-    rj_obj_set(b9, "timeout", rj_num("9223372036854775807"));
-    rj_obj_set(b9, "min_activation_height", rj_num("0"));
+    if (has_signal) rj_obj_set(b9, "bit", rj_numf("%d", d->bit));
+    rj_obj_set(b9, "start_time", rj_numf("%lld", d->start));
+    rj_obj_set(b9, "timeout", rj_numf("%lld", d->timeout));
+    rj_obj_set(b9, "min_activation_height", rj_numf("%ld", d->min_act));
     rj_obj_set(b9, "status", rj_str(ts_name(cur)));
     rj_obj_set(b9, "since", rj_numf("%ld", since));
     rj_obj_set(b9, "status_next", rj_str(ts_name(next)));
     if (has_signal){
-        long in_period = 1 + (tip % TD_PERIOD), elapsed = 0, count = 0; char sig[TD_PERIOD + 1]; memset(sig, '-', sizeof sig); sig[in_period] = 0;
-        for (long k = tip; in_period > 0; k--){ elapsed++; in_period--; if (bip9_signals(k)){ count++; sig[in_period] = '#'; } }
-        rj_val* st = rj_obj(); rj_obj_set(st, "period", rj_numf("%ld", TD_PERIOD)); rj_obj_set(st, "elapsed", rj_numf("%ld", elapsed)); rj_obj_set(st, "count", rj_numf("%ld", count));
-        if (cur == TS_STARTED){ int possible = (TD_PERIOD - elapsed) >= (TD_THRESHOLD - count); rj_obj_set(st, "threshold", rj_numf("%ld", TD_THRESHOLD)); rj_obj_set(st, "possible", rj_bool(possible)); }
+        long in_period = 1 + (tip % d->period), elapsed = 0, count = 0;
+        char* sig = malloc((size_t)in_period + 1);
+        if (!sig){ rj_free(b9); return; }
+        memset(sig, '-', (size_t)in_period); sig[in_period] = 0;
+        for (long k = tip; in_period > 0; k--){
+            elapsed++; in_period--;
+            int sg = b9_signals(d, k);
+            if (sg < 0){ free(sig); rj_free(b9); return; }
+            if (sg){ count++; sig[in_period] = '#'; }
+        }
+        rj_val* st = rj_obj(); rj_obj_set(st, "period", rj_numf("%ld", d->period)); rj_obj_set(st, "elapsed", rj_numf("%ld", elapsed)); rj_obj_set(st, "count", rj_numf("%ld", count));
+        /* LOCKED_IN zeroes threshold and possible, and Core then prints neither */
+        if (cur == TS_STARTED){ int possible = (d->period - d->threshold) >= (elapsed - count); rj_obj_set(st, "threshold", rj_numf("%ld", d->threshold)); rj_obj_set(st, "possible", rj_bool(possible)); }
         rj_obj_set(b9, "statistics", st); rj_obj_set(b9, "signalling", rj_str(sig));
+        free(sig);
     }
     rj_val* rv = rj_obj(); rj_obj_set(rv, "type", rj_str("bip9"));
     int active = 0;
@@ -3522,7 +3614,7 @@ static void gdi_testdummy(rj_val* o, long tip){
     else if (next == TS_ACTIVE){ rj_obj_set(rv, "height", rj_numf("%ld", tip + 1)); active = 1; }
     rj_obj_set(rv, "active", rj_bool(active));
     rj_obj_set(rv, "bip9", b9);
-    rj_obj_set(o, "testdummy", rv);
+    rj_obj_set(o, d->name, rv);
 }
 
 static int cmd_getdeploymentinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
@@ -3547,17 +3639,34 @@ static int cmd_getdeploymentinfo(const rj_val* params, rj_val** res, long* ec, c
     if (regtest){ h_bip34 = SFC_R_HEIGHT_BIP34; h_dersig = SFC_R_HEIGHT_DERSIG; h_cltv = SFC_R_HEIGHT_CLTV; h_csv = SFC_R_HEIGHT_CSV; h_segwit = SFC_R_HEIGHT_SEGWIT; }
     else if (!strcmp(g_chain_name, "testnet4")){ h_bip34 = SFC_T_HEIGHT_BIP34; h_dersig = SFC_T_HEIGHT_DERSIG; h_cltv = SFC_T_HEIGHT_CLTV; h_csv = SFC_T_HEIGHT_CSV; h_segwit = SFC_T_HEIGHT_SEGWIT; }
     else if (!strcmp(g_chain_name, "signet")){ h_bip34 = SFC_S_HEIGHT_BIP34; h_dersig = SFC_S_HEIGHT_DERSIG; h_cltv = SFC_S_HEIGHT_CLTV; h_csv = SFC_S_HEIGHT_CSV; h_segwit = SFC_S_HEIGHT_SEGWIT; }
-    /* script_flags: the flags this node applies to the NEXT block, in Core's
-     * sorted order. P2SH/WITNESS/TAPROOT are unconditional here. */
+    /* script_flags: Core's GetBlockScriptFlags for THIS block, names in
+     * Core's sorted order. P2SH, WITNESS and TAPROOT are on for every block
+     * except CMainParams' two script_flag_exceptions, which replace them
+     * (by hash; generated into script_flags_consts.h); the buried four are
+     * on from their height, DeploymentActiveAt the block itself.
+     *
+     * 2026-09-18: this reported the flags for the NEXT block, held WITNESS
+     * back until segwit's height, and knew nothing of the two exceptions.
+     * All three agree at the tip once everything is buried, which is the only
+     * height the old differential asked about; a blockhash argument showed
+     * them against v31.1 on mainnet (363724 listed DERSIG a block early,
+     * 170060 must be empty, 692261 must lack TAPROOT). */
+    unsigned f = (1u << SFC_BIT_P2SH) | (1u << SFC_BIT_WITNESS) | (1u << SFC_BIT_TAPROOT);
+    if (!strcmp(g_chain_name, "main")){
+        if (!strcmp(hx, SFC_EXC_BIP16_HASH_HEX))        f = SFC_EXC_BIP16_FLAGS;
+        else if (!strcmp(hx, SFC_EXC_TAPROOT_HASH_HEX)) f = SFC_EXC_TAPROOT_FLAGS;
+    }
+    if (tip >= h_dersig) f |= 1u << SFC_BIT_DERSIG;
+    if (tip >= h_cltv)   f |= 1u << SFC_BIT_CLTV;
+    if (tip >= h_csv)    f |= 1u << SFC_BIT_CSV;
+    if (tip >= h_segwit) f |= 1u << SFC_BIT_NULLDUMMY;
+    static const struct { const char* name; int bit; } SFN[] = {
+        { "CHECKLOCKTIMEVERIFY", SFC_BIT_CLTV }, { "CHECKSEQUENCEVERIFY", SFC_BIT_CSV },
+        { "DERSIG", SFC_BIT_DERSIG }, { "NULLDUMMY", SFC_BIT_NULLDUMMY }, { "P2SH", SFC_BIT_P2SH },
+        { "TAPROOT", SFC_BIT_TAPROOT }, { "WITNESS", SFC_BIT_WITNESS } };
     rj_val* sf = rj_arr();
-    long next = tip + 1;
-    if (next >= h_cltv)   rj_arr_push(sf, rj_str("CHECKLOCKTIMEVERIFY"));
-    if (next >= h_csv)    rj_arr_push(sf, rj_str("CHECKSEQUENCEVERIFY"));
-    if (next >= h_dersig) rj_arr_push(sf, rj_str("DERSIG"));
-    if (next >= h_segwit) rj_arr_push(sf, rj_str("NULLDUMMY"));
-    rj_arr_push(sf, rj_str("P2SH"));
-    rj_arr_push(sf, rj_str("TAPROOT"));
-    if (next >= h_segwit) rj_arr_push(sf, rj_str("WITNESS"));
+    for (size_t i = 0; i < sizeof SFN / sizeof SFN[0]; i++)
+        if (f & (1u << SFN[i].bit)) rj_arr_push(sf, rj_str(SFN[i].name));
     rj_obj_set(o, "script_flags", sf);
     rj_val* dep = rj_obj();
     gdi_dep(dep, "bip34",  h_bip34,  tip);
@@ -3565,7 +3674,10 @@ static int cmd_getdeploymentinfo(const rj_val* params, rj_val** res, long* ec, c
     gdi_dep(dep, "bip65",  h_cltv,   tip);
     gdi_dep(dep, "csv",    h_csv,    tip);
     gdi_dep(dep, "segwit", h_segwit, tip);
-    if (regtest) gdi_testdummy(dep, tip);
+    if (regtest){ gdi_bip9(dep, &B9_REG_TESTDUMMY, tip); gdi_bip9(dep, &B9_REG_TAPROOT, tip); }
+    else if (!strcmp(g_chain_name, "testnet4")) gdi_bip9(dep, &B9_T4_TAPROOT, tip);
+    else if (!strcmp(g_chain_name, "signet"))   gdi_bip9(dep, &B9_SIG_TAPROOT, tip);
+    else                                        gdi_bip9(dep, &B9_MAIN_TAPROOT, tip);
     rj_obj_set(o, "deployments", dep);
     *res = o;
     return 1;
