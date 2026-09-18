@@ -466,8 +466,9 @@ void mpool_policy_set_pending_sigops(unsigned long long cost_x4){ mpol_pending_s
 void mpool_policy_set_bytespersigop(unsigned long long n){ mpol_bytes_per_sigop = n ? n : 20; }
 /* 2026-09-12: readable so the RPC layer can compute Core's sigops-ADJUSTED
  * weight, max(weight, sigop_cost * bytes_per_sigop) -- policy.cpp
- * GetSigOpsAdjustedWeight. getmempoolentry's vsize_adjusted and chunkweight are
- * both derived from it. */
+ * GetSigOpsAdjustedWeight. getmempoolentry's vsize (Core's sigops-adjusted
+ * entry size, 2026-09-18; it was a separate vsize_adjusted) and chunkweight
+ * are both derived from it. */
 unsigned long long mpool_policy_bytespersigop(void){ return mpol_bytes_per_sigop; }
 static void (*g_forget_cb)(const unsigned char txid[32]) = 0;
 void mpool_policy_set_forget_cb(void (*fn)(const unsigned char*)){ g_forget_cb = fn; }

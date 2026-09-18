@@ -507,7 +507,7 @@ typedef struct {
     unsigned long long (*min_fee)(void*);   /* dynamic mempoolminfee, sat/kvB (polstate) */
     /* Core -bytespersigop (DEFAULT_BYTES_PER_SIGOP 20), for the sigops-adjusted
      * weight max(weight, sigop_cost * bytes_per_sigop) that getmempoolentry's
-     * vsize_adjusted/chunkweight and getmempoolcluster are computed from. A
+     * vsize (Core's entry size)/chunkweight and getmempoolcluster are computed from. A
      * HOOK rather than a direct call into the policy module: rpc_node.o is
      * linked by 22 test rules that do not pull in bitcoin_mempool_policy.c, and
      * link-check rightly refused the new dependency. Unset means Core's
