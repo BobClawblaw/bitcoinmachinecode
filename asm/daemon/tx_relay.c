@@ -1177,13 +1177,13 @@ static void txr_retry_timeouts(void* mp){
 /* test-only introspection */
 void txrelay_debug_dump(void){
     long long now = txr_now_ms();
-    fprintf(stderr, "[txr-dump] legs:");
+    fprintf(stderr, "[txr_dump] legs:");
     for (int i = 0; i < TXR_LEG_MAX; i++) if (txr_legs[i].fd) fprintf(stderr, " %d(age %lldms)", txr_legs[i].fd, now - txr_legs[i].t);
     fprintf(stderr, "\n");
     for (int i = 0; i < TXR_WANT_MAX; i++){
         txr_want_t* w = &txr_want_tab[i];
         if (!w->used) continue;
-        fprintf(stderr, "[txr-dump] want %02x.. req_fd=%d inflight=%d tries=%d ntried=%d age_req=%lldms announcers:", w->hash[0], w->req_fd, w->inflight, w->tries, w->ntried, now - w->t_req);
+        fprintf(stderr, "[txr_dump] want %02x.. req_fd=%d inflight=%d tries=%d ntried=%d age_req=%lldms announcers:", w->hash[0], w->req_fd, w->inflight, w->tries, w->ntried, now - w->t_req);
         for (int k = 0; k < w->nfd; k++) fprintf(stderr, " %d", w->fds[k]);
         fprintf(stderr, "\n");
     }

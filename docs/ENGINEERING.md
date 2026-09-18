@@ -308,6 +308,46 @@ Corollary for live debugging: **validate the instrument before trusting a
 negative result.** A p2p probe that got silence from our node was only
 meaningful once the same probe got an immediate answer from a real Core.
 
+### 2.3e Log line tags: `[a-z0-9_]+`, and why it is not a style preference
+
+Every log line starts with a bracketed subsystem tag. The grammar is:
+
+```
+[a-z0-9_]+ (: worker-index)?      e.g. [net]  [coinstats_hist]  [dl:0]  [mux:10]
+```
+
+**Lowercase, digits and underscore only. No hyphens.** The `:N` suffix is for
+per-worker streams and is the only punctuation allowed.
+
+This is not cosmetic. Downstream log readers anchor on that shape -- BlockYard's
+parser uses `/^\[[a-z0-9_]+(?::\d+)?\]\s*/` -- and a tag that does not match
+is not merely styled differently, it **cannot be claimed by any rule at all**.
+The line falls through to the unstructured bucket, keeps no figures, and gets a
+timestamp taken at read time rather than its own. The subsystem silently
+disappears from every panel that reads the log.
+
+There is no central logger to enforce this; tags are string literals in
+`fprintf` calls, which is exactly how seven of them drifted. On 2026-09-18,
+`[cmpct-dbg]`, `[coinstats-hist]`, `[get-miss]`, `[get-slen-anomaly]`,
+`[server-test]`, `[txr-dump]` and `[walk-miss]` were renamed to underscores --
+7 of 105 distinct tags in the source, and 0 of the 48 in a real node log, so
+they were outliers in our own codebase rather than a convention anyone had
+chosen. `[coinstats-hist]` was found only because a downstream reader reported
+it.
+
+Note that a CLI mode name is a different namespace: the `server-test` *mode*
+keeps its hyphen, because that is a user-facing argument. Only the log tag
+changed.
+
+To check before adding a tag:
+
+```sh
+grep -rhoE '"\[[a-z0-9_]+-[a-z0-9_-]*\]' --include=*.c --include=*.h --include=*.asm asm/
+# must print nothing. The leading [a-z0-9_]+ matters: a looser pattern also
+# matches the string literals "[-]" and "[-1]", which are not tags.
+# Verified to catch a planted "[bad-tag]".
+```
+
 ### 2.4 Randomized ctypes stress (optional, shared-lib targets)
 
 ```bash

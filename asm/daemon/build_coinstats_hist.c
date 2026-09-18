@@ -130,7 +130,7 @@ static u64 rdvi(const u8* p, const u8* end, u64* used){
     if (p + 9 > end){ *used = 0; return 0; } *used = 9; u64 v; memcpy(&v, p + 1, 8); return v;
 }
 static char* nm(char* b, const char* pfx, int w, int i){ sprintf(b, CSH_TMPDIR "/csh_%s_w%02d_%03d.tmp", pfx, w, i); return b; }
-static void die(const char* m){ fprintf(stderr, "[coinstats-hist] FATAL: %s\n", m); exit(1); }
+static void die(const char* m){ fprintf(stderr, "[coinstats_hist] FATAL: %s\n", m); exit(1); }
 static int g_Wfiles = 8;                 /* the worker count baked into the temp-file names (pass 1's), recorded in the markers */
 
 /* ---- scratch: markers, cleanup, the lock --------------------------------------- */
@@ -159,13 +159,13 @@ static long unlink_prefix(const char* dir, const char* pfx, const char* keep){
 static void scratch_reset(void){
     long a = unlink_prefix(CSH_TMPDIR, "", "lock");
     long b = unlink_prefix(".", "csh_", 0);
-    if (a || b) fprintf(stderr, "[coinstats-hist] discarded %ld stale scratch file(s) and %ld old-layout csh_*.tmp (no pass1 marker: a dead run's leftovers)\n", a, b);
+    if (a || b) fprintf(stderr, "[coinstats_hist] discarded %ld stale scratch file(s) and %ld old-layout csh_*.tmp (no pass1 marker: a dead run's leftovers)\n", a, b);
 }
 static int g_lock_fd = -1;
 static void take_lock(void){
     if (mkdir(CSH_TMPDIR, 0755) != 0 && errno != EEXIST) die("mkdir " CSH_TMPDIR);
     g_lock_fd = open(CSH_TMPDIR "/lock", O_RDWR | O_CREAT, 0644); if (g_lock_fd < 0) die("open lock");
-    if (flock(g_lock_fd, LOCK_EX | LOCK_NB) != 0){ fprintf(stderr, "[coinstats-hist] another builder holds " CSH_TMPDIR "/lock -- exiting\n"); exit(4); }
+    if (flock(g_lock_fd, LOCK_EX | LOCK_NB) != 0){ fprintf(stderr, "[coinstats_hist] another builder holds " CSH_TMPDIR "/lock -- exiting\n"); exit(4); }
 }
 static long long mem_available(void){
     FILE* f = fopen("/proc/meminfo", "r"); if (!f) return -1; char line[256]; long long kb = -1;
@@ -199,7 +199,7 @@ static int pass1_worker(int w, long lo, long hi, u8* store_buf, int addprod_fd){
     time_t t0 = time(NULL);
     for (long h = lo; h <= hi; h++){
         long blen = store_read_at(store_buf, (unsigned long)h, blockbuf, BLOCKBUF);
-        if (blen < 81){ fprintf(stderr, "[coinstats-hist] FATAL: block %ld unreadable (%ld)\n", h, blen); return 1; }
+        if (blen < 81){ fprintf(stderr, "[coinstats_hist] FATAL: block %ld unreadable (%ld)\n", h, blen); return 1; }
         utxo_stats_init(add_st, 1, 0); u64 cb_amt = 0, newcb = 0, scripts = 0;
         const u8* p = blockbuf + 80; const u8* end = blockbuf + blen; u64 c;
         u64 ntx = rdvi(p, end, &c); if (!c) die("malformed block"); p += c;
@@ -239,7 +239,7 @@ static int pass1_worker(int w, long lo, long hi, u8* store_buf, int addprod_fd){
         }
         prod_t pr; memcpy(pr.acc, add_st + ST_ACC, 384); pr.txouts = st_get(add_st, ST_TXOUTS); pr.amount = st_get(add_st, ST_AMOUNT); pr.bogo = st_get(add_st, ST_BOGO); pr.a1 = cb_amt; pr.a2 = newcb; pr.a3 = scripts;
         if (pwrite(addprod_fd, &pr, PROD_REC, (off_t)h * PROD_REC) != (ssize_t)PROD_REC) die("addprod write");
-        if ((h - lo) % 10000 == 0 && h > lo) fprintf(stderr, "[coinstats-hist] pass1 w%d %ld/%ld (%llds)\n", w, h, hi, (long long)(time(NULL) - t0));
+        if ((h - lo) % 10000 == 0 && h > lo) fprintf(stderr, "[coinstats_hist] pass1 w%d %ld/%ld (%llds)\n", w, h, hi, (long long)(time(NULL) - t0));
     }
     for (int i = 0; i < NB; i++){ fclose(ob[i]); fclose(sb[i]); }
     return 0;
@@ -323,7 +323,7 @@ static int pass4(long to_h, int addprod_fd, int remprod_fd){
         sha256_full(row.sum, &row, sizeof row - 32);
         if (pwrite(fd, &row, sizeof row, CSH_HDR + (off_t)h * CSH_REC) != (ssize_t)sizeof row) die("row write");
         memcpy(sums + (size_t)h * 32, row.sum, 32);
-        if (h % 50000 == 0) fprintf(stderr, "[coinstats-hist] pass4 %ld/%ld txouts=%llu (%llds)\n", h, to_h, (unsigned long long)txouts, (long long)(time(NULL) - t0));
+        if (h % 50000 == 0) fprintf(stderr, "[coinstats_hist] pass4 %ld/%ld txouts=%llu (%llds)\n", h, to_h, (unsigned long long)txouts, (long long)(time(NULL) - t0));
     }
     /* every row is on disk before the header says so; the rename makes the base appear whole */
     if (fsync(fd) != 0) die("fsync rows");
@@ -333,18 +333,18 @@ static int pass4(long to_h, int addprod_fd, int remprod_fd){
     if (fsync(fd) != 0) die("fsync header");
     close(fd);
     if (rename(CSH_BASE_TMP, CSH_BASE_FILE) != 0) die("rename base into place");
-    fprintf(stderr, "[coinstats-hist] DONE: rows 0..%ld, txouts=%llu amount=%llu.%08llu prevout_spent=%llu coinbase=%llu scripts=%llu subsidy=%llu (%llds)\n", to_h,
+    fprintf(stderr, "[coinstats_hist] DONE: rows 0..%ld, txouts=%llu amount=%llu.%08llu prevout_spent=%llu coinbase=%llu scripts=%llu subsidy=%llu (%llds)\n", to_h,
             (unsigned long long)txouts, (unsigned long long)(amount / 100000000ULL), (unsigned long long)(amount % 100000000ULL), (unsigned long long)prevout, (unsigned long long)coinbase, (unsigned long long)scripts, (unsigned long long)subsidy, (long long)(time(NULL) - t0));
     return 0;
 }
 static void run_workers(int W, int (*fn)(int w, void* ctx), void* ctx){
     pid_t pids[64]; for (int w = 0; w < W; w++){ pid_t p = fork(); if (p < 0) die("fork"); if (p == 0) _exit(fn(w, ctx)); pids[w] = p; }
-    for (int w = 0; w < W; w++){ int st = 0; waitpid(pids[w], &st, 0); if (!WIFEXITED(st) || WEXITSTATUS(st) != 0){ fprintf(stderr, "[coinstats-hist] worker %d failed\n", w); exit(1); } }
+    for (int w = 0; w < W; w++){ int st = 0; waitpid(pids[w], &st, 0); if (!WIFEXITED(st) || WEXITSTATUS(st) != 0){ fprintf(stderr, "[coinstats_hist] worker %d failed\n", w); exit(1); } }
 }
 typedef struct { long to_h; int W; u8* store_buf; int addprod_fd, remprod_fd; } ctx_t;
 static int p1(int w, void* c){ ctx_t* x = c; long n = x->to_h + 1, lo = n * w / x->W, hi = n * (w + 1) / x->W - 1; return pass1_worker(w, lo, hi, x->store_buf, x->addprod_fd); }
 static int p2(int w, void* c){ ctx_t* x = c; u64 m = 0, u = 0; for (int i = w; i < NB; i += x->W) pass2_bucket(w, i, x->W, x->to_h, &m, &u);
-    fprintf(stderr, "[coinstats-hist] pass2 w%d: %llu spends matched, %llu unmatched\n", w, (unsigned long long)m, (unsigned long long)u); return u ? 3 : 0; }
+    fprintf(stderr, "[coinstats_hist] pass2 w%d: %llu spends matched, %llu unmatched\n", w, (unsigned long long)m, (unsigned long long)u); return u ? 3 : 0; }
 static int p3(int w, void* c){ ctx_t* x = c; for (int r = w; r < NR; r += x->W) pass3_range(r, x->W, x->remprod_fd); return 0; }
 int main(int argc, char** argv){
     if (argc < 2){ fprintf(stderr, "usage: bmc_build_coinstats_hist <chaindir> [to_height] [workers]\n"); return 2; }
@@ -355,7 +355,7 @@ int main(int argc, char** argv){
     int W = argc > 3 ? atoi(argv[3]) : 8; if (W < 1) W = 1; if (W > 64) W = 64;
     { const char* c = getenv("BMC_CHAIN"); if (c && strcmp(c, "main")){ g_mainnet = 0; if (!strcmp(c, "regtest")) g_halving = 150; } }
     if (tip < 0) die("empty store");
-    fprintf(stderr, "[coinstats-hist] dir=%s tip=%ld to=%ld workers=%d chain=%s\n", argv[1], tip, to_h, W, g_mainnet ? "main" : "other");
+    fprintf(stderr, "[coinstats_hist] dir=%s tip=%ld to=%ld workers=%d chain=%s\n", argv[1], tip, to_h, W, g_mainnet ? "main" : "other");
     take_lock();
     /* resume: the highest pass whose marker matches this target; a pass 1 marker
      * fixes the worker count every later pass must read the files with */
@@ -369,27 +369,27 @@ int main(int argc, char** argv){
     if (start == 2 || start == 3){
         char b[64]; long have = 0, want = (long)g_Wfiles * (start == 2 ? NB : NR); struct stat st;
         for (int w = 0; w < g_Wfiles; w++) for (int i = 0; i < (start == 2 ? NB : NR); i++) if (stat(nm(b, start == 2 ? "o" : "r", w, i), &st) == 0) have++;
-        if (have < want){ fprintf(stderr, "[coinstats-hist] pass %d's inputs are missing (%ld of %ld files) -- starting over\n", start, have, want); start = 1; }
+        if (have < want){ fprintf(stderr, "[coinstats_hist] pass %d's inputs are missing (%ld of %ld files) -- starting over\n", start, have, want); start = 1; }
     }
     if (start == 1){ scratch_reset(); g_Wfiles = W; }
-    else fprintf(stderr, "[coinstats-hist] resuming at pass %d (passes below it are marked done for to=%ld with %d workers)\n", start, to_h, g_Wfiles);
+    else fprintf(stderr, "[coinstats_hist] resuming at pass %d (passes below it are marked done for to=%ld with %d workers)\n", start, to_h, g_Wfiles);
     int stop_after = getenv("BMC_CSH_STOP_AFTER") ? atoi(getenv("BMC_CSH_STOP_AFTER")) : 0;
     int addprod_fd = open(CSH_TMPDIR "/csh_addprod.tmp", O_RDWR | O_CREAT | (start == 1 ? O_TRUNC : 0), 0644);
     int remprod_fd = open(CSH_TMPDIR "/csh_remprod.tmp", O_RDWR | O_CREAT | (start <= 3 ? O_TRUNC : 0), 0644);
     if (addprod_fd < 0 || remprod_fd < 0) die("open products");
     ctx_t x = { to_h, g_Wfiles, store_buf, addprod_fd, remprod_fd };
     time_t t0 = time(NULL);
-    if (start <= 1){ run_workers(g_Wfiles, p1, &x); marker_write(1, g_Wfiles, to_h); fprintf(stderr, "[coinstats-hist] pass1 done (%llds)\n", (long long)(time(NULL) - t0));
-        if (stop_after == 1){ fprintf(stderr, "[coinstats-hist] stopping after pass 1 (BMC_CSH_STOP_AFTER)\n"); return 0; } }
+    if (start <= 1){ run_workers(g_Wfiles, p1, &x); marker_write(1, g_Wfiles, to_h); fprintf(stderr, "[coinstats_hist] pass1 done (%llds)\n", (long long)(time(NULL) - t0));
+        if (stop_after == 1){ fprintf(stderr, "[coinstats_hist] stopping after pass 1 (BMC_CSH_STOP_AFTER)\n"); return 0; } }
     if (start <= 2){ unlink_prefix(CSH_TMPDIR, "csh_r_", 0);   /* the range files are appended to: a retried pass 2 starts them empty */
-        run_workers(g_Wfiles, p2, &x); marker_write(2, g_Wfiles, to_h); fprintf(stderr, "[coinstats-hist] pass2 done (%llds)\n", (long long)(time(NULL) - t0));
+        run_workers(g_Wfiles, p2, &x); marker_write(2, g_Wfiles, to_h); fprintf(stderr, "[coinstats_hist] pass2 done (%llds)\n", (long long)(time(NULL) - t0));
         unlink_prefix(CSH_TMPDIR, "csh_o_", 0); unlink_prefix(CSH_TMPDIR, "csh_s_", 0);   /* pass 2's inputs, after its marker */
-        if (stop_after == 2){ fprintf(stderr, "[coinstats-hist] stopping after pass 2 (BMC_CSH_STOP_AFTER)\n"); return 0; } }
+        if (stop_after == 2){ fprintf(stderr, "[coinstats_hist] stopping after pass 2 (BMC_CSH_STOP_AFTER)\n"); return 0; } }
     if (start <= 3){ long need_mb = 0; int W3 = pass3_workers(W, &need_mb);
-        fprintf(stderr, "[coinstats-hist] pass3: %d worker(s) (largest range needs ~%ld MB each; MemAvailable %lld MB)\n", W3, need_mb, mem_available() >> 20);
-        ctx_t x3 = x; x3.W = W3; run_workers(W3, p3, &x3); marker_write(3, g_Wfiles, to_h); fprintf(stderr, "[coinstats-hist] pass3 done (%llds)\n", (long long)(time(NULL) - t0));
+        fprintf(stderr, "[coinstats_hist] pass3: %d worker(s) (largest range needs ~%ld MB each; MemAvailable %lld MB)\n", W3, need_mb, mem_available() >> 20);
+        ctx_t x3 = x; x3.W = W3; run_workers(W3, p3, &x3); marker_write(3, g_Wfiles, to_h); fprintf(stderr, "[coinstats_hist] pass3 done (%llds)\n", (long long)(time(NULL) - t0));
         unlink_prefix(CSH_TMPDIR, "csh_r_", 0);   /* pass 3's inputs, after its marker */
-        if (stop_after == 3){ fprintf(stderr, "[coinstats-hist] stopping after pass 3 (BMC_CSH_STOP_AFTER)\n"); return 0; } }
+        if (stop_after == 3){ fprintf(stderr, "[coinstats_hist] stopping after pass 3 (BMC_CSH_STOP_AFTER)\n"); return 0; } }
     if (pass4(to_h, addprod_fd, remprod_fd) != 0) return 1;
     close(addprod_fd); close(remprod_fd);
     unlink_prefix(CSH_TMPDIR, "", 0); rmdir(CSH_TMPDIR);   /* the lock goes with the scratch; the fd stays held until exit */
