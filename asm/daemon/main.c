@@ -10825,7 +10825,7 @@ int main(int argc, char** argv){
         long ok=node_sync(fd, store_buf, gen, bigbuf, sizeof bigbuf, &cnt);
         close(fd); waitpid(pid,0,0); close(ls);
         int tip=*(int*)(store_buf+24);
-        printf("[server-test] synced ok=%ld blocks=%ld tip=%d\n", ok, cnt, tip);
+        printf("[server_test] synced ok=%ld blocks=%ld tip=%d\n", ok, cnt, tip);
         if(ok!=1||tip<6){ printf("TESTS FAILED (no chain)\n"); return 1; }
         /* the chain lives in-memory only (not yet on disk), so build the O(1)
          * hash->height index directly from store_buf rather than from disk */
@@ -10860,7 +10860,7 @@ int main(int argc, char** argv){
             p2p_write(cfd,"inv",3,invm,37);
             p2p_write(cfd,"ping",4,"\x11\x22\x33\x44\x55\x66\x77\x88",8);
             if(p2p_read(cfd,cmd,pl,sizeof pl,&plen)<=0 || strncmp(cmd,"pong",4)!=0){ printf("FAIL ping->pong\n"); exit(2); }
-            printf("[server-test] getdata-exact=%d getheaders-n=%d (%d blocked)\n", ok0, okh, (int)hp_len);
+            printf("[server_test] getdata-exact=%d getheaders-n=%d (%d blocked)\n", ok0, okh, (int)hp_len);
             exit((ok0&&okh)?0:2);
         }else{
             int lfd=(mkdir("logs", 0755), node_log_open(g_logpath));

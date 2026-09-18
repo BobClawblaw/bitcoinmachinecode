@@ -158,13 +158,13 @@ int main(int argc, char** argv){
             if (utxo_lsm_get(&lst, u, g_keys[i], vo, &v, &hh, &cb, &sc, &sl) == 1){
                 get_hits++;
                 if (sl > 42){
-                    printf("[get-slen-anomaly] ");
+                    printf("[get_slen_anomaly] ");
                     for (int b = 31; b >= 0; b--) printf("%02x", g_keys[i][b]);
                     printf(" %u slen=%lu\n", vo, sl);
                 }
             }
             else {
-                printf("[get-miss] ");
+                printf("[get_miss] ");
                 for (int b = 31; b >= 0; b--) printf("%02x", g_keys[i][b]);
                 printf(" %u\n", vo);
             }
@@ -174,7 +174,7 @@ int main(int argc, char** argv){
         int walk_hits = 0;
         for (int i = 0; i < g_nkeys; i++){
             if (g_found[i]){ walk_hits++; continue; }
-            printf("[walk-miss] ");
+            printf("[walk_miss] ");
             for (int b = 31; b >= 0; b--) printf("%02x", g_keys[i][b]);
             printf(" %u\n", (u32)(g_keys[i][32] | g_keys[i][33]<<8 | g_keys[i][34]<<16 | (u32)g_keys[i][35]<<24));
         }
