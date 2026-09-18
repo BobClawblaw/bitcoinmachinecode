@@ -338,12 +338,49 @@ static void services_names(unsigned long long s, rj_val* arr){
  * the address-relay counters. Emitting any of those as a zero or a guess
  * would be worse than omitting them -- a caller cannot tell an invented zero
  * from a measured one. They are tracked in docs/PARITY_RPC_FIELDS.md. */
+int rpc_fmt_addr_v1(const unsigned char a[16], unsigned port, char* out, unsigned cap)
+{
+    static const unsigned char V4[12]  = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+    static const unsigned char TOR2[6] = {0xfd,0x87,0xd8,0x7e,0xeb,0x43};
+    static const unsigned char INTL[6] = {0xfd,0x6b,0x88,0xc0,0x87,0x24};
+    if (!out || cap == 0) return 0;
+    out[0] = 0;
+    if (!memcmp(a, V4, 12)){
+        unsigned v = ((unsigned)a[12]<<24)|((unsigned)a[13]<<16)|((unsigned)a[14]<<8)|a[15];
+        if (v == 0 || v == 0xffffffffu) return 0;             /* INADDR_ANY, INADDR_NONE */
+        snprintf(out, cap, "%u.%u.%u.%u:%u", a[12], a[13], a[14], a[15], port);
+        return 1;
+    }
+    if (!memcmp(a, TOR2, 6) || !memcmp(a, INTL, 6)) return 0;  /* read as ::, or NET_INTERNAL */
+    if (a[0]==0x20 && a[1]==0x01 && a[2]==0x0d && a[3]==0xb8) return 0;   /* RFC3849 */
+    unsigned g[8]; int allz = 1;
+    for (int i = 0; i < 8; i++){ g[i] = ((unsigned)a[2*i]<<8) | a[2*i+1]; if (g[i]) allz = 0; }
+    if (allz) return 0;                                        /* :: */
+    /* Core's IPv6ToString: the FIRST longest run of zero groups, compressed
+     * only when it is two or more long. glibc's inet_ntop differs (it prints
+     * ::/96 as a dotted quad), so it is not used here. */
+    int bs = 0, bl = 0, cs = 0, cl = 0;
+    for (int i = 0; i < 8; i++){
+        if (g[i]){ cs = i + 1; cl = 0; continue; }
+        if (++cl > bl){ bl = cl; bs = cs; }
+    }
+    char h[48]; int n = 0;
+    for (int i = 0; i < 8; i++){
+        if (bl >= 2 && i >= bs && i < bs + bl){ if (i == bs) n += snprintf(h+n, sizeof h - n, "::"); continue; }
+        n += snprintf(h+n, sizeof h - n, "%s%x", (n && h[n-1] != ':') ? ":" : "", g[i]);
+    }
+    snprintf(out, cap, "[%s]:%u", h, port);
+    return 1;
+}
+
 static void peer_common_fields(rj_val* o, const rpc_peer_t* p)
 {
-    /* Core reports these as seconds since epoch, and omits them at 0 rather
-     * than claiming "at the epoch". */
-    if (p->last_block_time > 0) rj_obj_set(o, "last_block", rj_numf("%lld", (long long)p->last_block_time));
-    if (p->last_tx_time   > 0) rj_obj_set(o, "last_transaction", rj_numf("%lld", (long long)p->last_tx_time));
+    /* Core emits both UNCONDITIONALLY, as seconds since epoch, and 0 for a
+     * peer that has sent neither (rpc/net.cpp pushes count_seconds of the
+     * default time_point). This used to omit them at 0 on the belief that
+     * Core does too; measured 2026-09-18, Core reports 0. */
+    rj_obj_set(o, "last_block", rj_numf("%lld", (long long)(p->last_block_time > 0 ? p->last_block_time : 0)));
+    rj_obj_set(o, "last_transaction", rj_numf("%lld", (long long)(p->last_tx_time > 0 ? p->last_tx_time : 0)));
     /* minping in SECONDS, as Core prints it. min_ping_us is 0 when unmeasured
      * -- this node does not ping inbound peers -- and an unmeasured minimum
      * printed as 0.0 would read as a perfect link. Omitted, like Core. */
@@ -353,17 +390,17 @@ static void peer_common_fields(rj_val* o, const rpc_peer_t* p)
      * block-relay-only, manual, feeler and addr-fetch; none of those exist
      * here, so none are claimed. */
     rj_obj_set(o, "connection_type", rj_str(p->inbound ? "inbound" : "outbound-full-relay"));
-    /* Core's per-message byte breakdown. Emitted whole: a peer that has
-     * exchanged nothing of a kind gets no entry for it, which is what Core
-     * does, and an all-zero map would be indistinguishable from an
-     * unmeasured one. */
-    { rj_val* s = rj_obj(); rj_val* r = rj_obj(); int ns = 0, nr = 0;
+    /* Core's per-message byte breakdown. A peer that has exchanged nothing
+     * of a kind gets no entry for it, which is what Core does. The maps
+     * themselves are ALWAYS present -- Core pushes both objects even when
+     * empty; until 2026-09-18 an empty map was dropped here. */
+    { rj_val* s = rj_obj(); rj_val* r = rj_obj();
       for (int i = 0; i < RPC_MSG_N; i++){
-          if (p->sent_per_msg[i] > 0){ rj_obj_set(s, RPC_MSG_NAMES[i], rj_numf("%lld", (long long)p->sent_per_msg[i])); ns++; }
-          if (p->recv_per_msg[i] > 0){ rj_obj_set(r, RPC_MSG_NAMES[i], rj_numf("%lld", (long long)p->recv_per_msg[i])); nr++; }
+          if (p->sent_per_msg[i] > 0) rj_obj_set(s, RPC_MSG_NAMES[i], rj_numf("%lld", (long long)p->sent_per_msg[i]));
+          if (p->recv_per_msg[i] > 0) rj_obj_set(r, RPC_MSG_NAMES[i], rj_numf("%lld", (long long)p->recv_per_msg[i]));
       }
-      if (ns) rj_obj_set(o, "bytessent_per_msg", s); else rj_free(s);
-      if (nr) rj_obj_set(o, "bytesrecv_per_msg", r); else rj_free(r); }
+      rj_obj_set(o, "bytessent_per_msg", s);
+      rj_obj_set(o, "bytesrecv_per_msg", r); }
     /* the transport that carried this connection, and the session both sides
      * derived. Core names them exactly this. */
     rj_obj_set(o, "transport_protocol_type", rj_str(p->v2transport ? "v2" : "v1"));
@@ -375,6 +412,13 @@ static void peer_common_fields(rj_val* o, const rpc_peer_t* p)
       /* Core emits an EMPTY session_id on a v1 connection, not no field. */
       rj_obj_set(o, "session_id", rj_str(any ? sid : "")); }
     if (p->addrbind[0]) rj_obj_set(o, "addrbind", rj_str((const char*)p->addrbind));
+    /* our address as the peer's version message named it; omitted when the
+     * peer sent one Core calls invalid, as Core omits it */
+    if (p->addrlocal[0]){
+        char al[72]; for (unsigned i = 0; i < sizeof al; i++) al[i] = p->addrlocal[i];
+        al[sizeof al - 1] = 0;
+        rj_obj_set(o, "addrlocal", rj_str(al));
+    }
     /* minfeefilter is a BTC/kvB amount in Core; we hold it in sat/kvB. -1 is
      * "the peer never sent one", which is different from a filter of zero. */
     if (p->minfeefilter >= 0)

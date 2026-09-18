@@ -35,6 +35,14 @@ BMC  = ["/storage/bitcoinmachinecode/asm/daemon/bmc_cli", "-rpcport=8331",
         "-datadir=/storage/bitcoinmachinecode/data"]
 CORE = ["/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli",
         "-conf=/storage/core-oracle/bitcoin.conf", "-datadir=/storage/core-oracle"]
+# The default oracle is a v31.99 DEVELOPMENT build, and diffing against it
+# invents work (docs/PARITY_RPC_FIELDS.md). PARITY_CORE names another
+# bitcoin-cli command line -- the v31.1 release node on the NVMe:
+#   PARITY_CORE="/mnt/nvme8tb/core-build/bitcoin-v31.1/build/bin/bitcoin-cli
+#                -datadir=/mnt/nvme8tb/core-oracle -rpcport=8337"
+import os, shlex
+if os.environ.get("PARITY_CORE"):
+    CORE = shlex.split(os.environ["PARITY_CORE"])
 
 def raw(base, args, timeout=180):
     try:
