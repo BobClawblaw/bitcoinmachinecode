@@ -1,5 +1,5 @@
 {
- "_core_version": "Bitcoin Core RPC client version v31.1.0",
+ "_core_version": "Bitcoin Core RPC client version v31.1",
  "_note": "field sets captured from Core on regtest; regenerate with validation/capture_core_fields.sh",
  "_skipped_empty": [
   "getindexinfo"
@@ -116,6 +116,21 @@
   "version",
   "weightlimit"
  ],
+ "getchainstates": [
+  "chainstates",
+  "headers"
+ ],
+ "getchainstates.chainstates[0]": [
+  "bestblockhash",
+  "bits",
+  "blocks",
+  "coins_db_cache_bytes",
+  "coins_tip_cache_bytes",
+  "difficulty",
+  "target",
+  "validated",
+  "verificationprogress"
+ ],
  "getchaintxstats": [
   "time",
   "txcount",
@@ -131,6 +146,39 @@
   "hash",
   "height",
   "script_flags"
+ ],
+ "getdeploymentinfo.deployments": [
+  "bip34",
+  "bip66",
+  "bip65",
+  "csv",
+  "segwit",
+  "testdummy",
+  "taproot"
+ ],
+ "getmempoolentry": [
+  "ancestorcount",
+  "ancestorsize",
+  "bip125-replaceable",
+  "chunkweight",
+  "depends",
+  "descendantcount",
+  "descendantsize",
+  "fees",
+  "height",
+  "spentby",
+  "time",
+  "unbroadcast",
+  "vsize",
+  "weight",
+  "wtxid"
+ ],
+ "getmempoolentry.fees": [
+  "ancestor",
+  "base",
+  "chunk",
+  "descendant",
+  "modified"
  ],
  "getmempoolinfo": [
   "bytes",
@@ -212,8 +260,10 @@
   "lastrecv",
   "lastsend",
   "minfeefilter",
+  "minping",
   "network",
   "permissions",
+  "pingtime",
   "presynced_headers",
   "relaytxes",
   "services",
