@@ -87,3 +87,24 @@ at nine of the ten.
 At 20:25Z, run 27 had applied 376,320 blocks in 1 h 10 m. Core took 1 h 17 m
 to reach the same height, so bmc was 7.7 min ahead, and the lead had grown at
 every 25k mark from 200k onward.
+
+## A second Core v31.1 run (queued)
+
+The baseline above is one continuous sync, but a 12 s process restart in the
+middle of it is too easy to misread, so it will be rerun with no restart at all.
+It is queued to start automatically when run 27 finishes. The two never share
+the NVMe.
+
+- **datadir:** `/mnt/nvme8tb/bench/core31`, empty; config in
+  `core-v31.1-run2.bitcoin.conf`. The protocol is the same. Only the ports differ,
+  the loopback binds are gone, and `shrinkdebugfile=0` keeps the whole log.
+- **unit:** `bitcoin-core-bench.service`, under systemd from its first second.
+  It is not enabled and has `Restart=no`, so a reboot or a crash ends the run
+  visibly instead of resuming it quietly. It refuses to start on a non-empty
+  datadir and writes `BENCH_START.txt` itself the instant before `bitcoind`
+  starts.
+- **trigger:** `bitcoin-core-bench.path` watches for run 27's `RESULT`. The
+  harness writes that file after the capstone, which has already disabled run
+  27's networking. The trigger fires once and switches itself off. A throwaway
+  copy of the pair was tested: one start, and no second start when the service
+  exited.
