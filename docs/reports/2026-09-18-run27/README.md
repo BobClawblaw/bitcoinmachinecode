@@ -41,5 +41,5 @@ Other load on the box during run 27 matches the baseline's: production bmc, the
 v31.99 oracle, run 26 at the tip (`~/bmc-run26`, a different device),
 and blockyard. Exceptions, noted as they happen:
 
-- 2026-09-18 ~19:15Z: a test gate (`make -j8 test`) for an RPC batch was running
-  in a worktree.
+- 2026-09-18 ~19:15–20:10Z: a worktree agent built and gated PR #271
+  (`make -j8 test` plus regtest differentials against Core v31.1).
