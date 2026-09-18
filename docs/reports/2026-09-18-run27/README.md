@@ -5,23 +5,36 @@ Both configs are in this directory, copied at launch. The bmc file is the exact
 
 ## The baseline (finished)
 
+**Core v31.1 synced once, continuously, from an empty datadir to the tip.**
+It never re-synced and its data was never reset or reused. The 19 h 40 m 09 s
+is one from-scratch IBD, measured from datadir creation to `Leaving
+InitialBlockDownload`.
+
 | | Core v31.1 (`9be056a8`) |
 |---|---|
 | datadir | `/mnt/nvme8tb/core-oracle` (Corsair MP600 PRO XT, ext4) |
-| started | 2026-09-17 23:26:54Z (`BENCH_START.txt`, fresh datadir) |
+| started | 2026-09-17 23:26:54Z on an empty datadir (`BENCH_START.txt`; `blk00000.dat` and `chainstate/` created 23:26:55) |
 | left IBD | 2026-09-18 19:07:03Z (`Leaving InitialBlockDownload`) |
-| **wall clock** | **19 h 40 m 09 s** |
+| **wall clock** | **19 h 40 m 09 s**, one continuous sync |
 | protocol | dbcache=8192, txindex + coinstatsindex + blockfilterindex, maxconnections=48, public network, default logging, Nice=0 |
 
-Two caveats that belong with the figure:
+Footnotes, neither of which touches the data:
 
-- **One restart.** At 06:12:19Z, around height 620k, the node was stopped and
-  restarted within 12 s to move it under the `bitcoin-oracle-nvme` systemd unit.
-  The stop flushed a ~5 GB coins cache and the node resumed with it cold. The
-  figure includes that cost, so it slightly favours bmc.
-- **Early segment timings are gone.** Core shrinks `debug.log` on startup, so the
-  restart kept only the last ~10 MB. The log now begins at 05:08Z (height ~580k).
-  Per-segment comparison is possible only from there.
+- **One 12-second process restart, same data.** At 06:12:19Z, around height
+  620k, the process was stopped and started again to move it under the
+  `bitcoin-oracle-nvme` systemd unit. It resumed from 620k on the same datadir.
+  The cost was ~12 s of downtime plus rebuilding an in-memory coins cache (the
+  stop flushed ~5 GB to disk). The figure includes that cost, so if anything
+  it slightly favours bmc.
+- **Early log lines are gone, not the data.** Core trims `debug.log` when it
+  starts, so that restart kept only the last ~10 MB and the log now begins at
+  05:08Z (height ~580k). The per-height timeline before that is recovered
+  from the block files (below).
+- **Not this run: an earlier, abandoned attempt.** A first attempt at 23:16Z
+  ran with `debug=net` and `debug=validation` on, which slows a sync. It was
+  stopped at ~152k after ten minutes and moved aside, untouched, to
+  `core-oracle-ABORTED-logging-handicap-20260917-2326`. None of its data or
+  time is in the baseline.
 
 ## Run 27 (running)
 
@@ -62,7 +75,7 @@ at nine of the ten.
 | 500,000 | 3 h 50 m | 1.2 h |
 | 550,000 | 4 h 54 m | 1.1 h |
 | 600,000 | 6 h 14 m | 1.3 h |
-| 650,000 | 7 h 36 m | 1.4 h (includes the 06:12Z restart) |
+| 650,000 | 7 h 36 m | 1.4 h (includes the 12 s process restart at 06:12Z) |
 | 700,000 | 9 h 08 m | 1.5 h |
 | 750,000 | 10 h 33 m | 1.4 h |
 | 800,000 | 12 h 24 m | 1.9 h |
