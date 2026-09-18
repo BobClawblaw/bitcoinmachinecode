@@ -322,9 +322,26 @@ per-worker streams and is the only punctuation allowed.
 This is not cosmetic. Downstream log readers anchor on that shape -- BlockYard's
 parser uses `/^\[[a-z0-9_]+(?::\d+)?\]\s*/` -- and a tag that does not match
 is not merely styled differently, it **cannot be claimed by any rule at all**.
-The line falls through to the unstructured bucket, keeps no figures, and gets a
-timestamp taken at read time rather than its own. The subsystem silently
-disappears from every panel that reads the log.
+The line falls through to the unstructured bucket and **no figures are
+extracted from it**, so the subsystem contributes nothing to any panel keyed on
+its tag.
+
+It is still *dated* correctly, though, and the distinction matters. An earlier
+version of this section claimed an unmatched line also gets a timestamp taken
+at read time. **That is wrong for us.** A bmc line that no rule claims still
+becomes a feed row carrying the node's OWN timestamp, because bmc writes the
+timestamp format the reader's `TS_RE` expects -- unparsed is not misdated. The
+read-time stamping is what happens to Bitcoin Core's log, where nothing parses
+at all.
+
+The one bmc exception is the **index builders' child processes**
+(`bmc_build_coinstats_hist`, `bmc_build_tx_index`, `bmc_build_addr_hist`,
+`bmc_build_block_filters`, `bmc_build_txospender_index`): they write to stderr
+with no timestamp whatsoever -- 108 `fprintf(stderr, ...)` call sites between
+them, none stamped -- so those lines genuinely cannot be dated from their
+content, and BlockYard carries a `tsFallback` for them. That fallback exists to
+cover a gap on OUR side. A builder that printed the node's
+`YYYY-MM-DD HH:MM:SS.mmm ` prefix would not need it.
 
 There is no central logger to enforce this; tags are string literals in
 `fprintf` calls, which is exactly how seven of them drifted. On 2026-09-18,
