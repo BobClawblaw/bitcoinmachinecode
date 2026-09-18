@@ -2532,8 +2532,45 @@ Bisected across `c6f779c7`, `888a3b54`, `5c5a166a`, `f1426e8c` and `4ea82c1b`
 — identical failure at every one, so it predates the address-latency work
 (#246), the pagination (#247) and the concurrency change (#255).
 
-**Not yet diagnosed.** The next step is to find which of the route's calls is
-being made per event rather than once; `rpc_esplora.c`'s `call()` wrapper is
-the counting point, so instrumenting it names the method immediately.
+**DIAGNOSED AND CLOSED 2026-09-18.** It was never the route. The route
+resolves no txids and costs exactly **one** RPC call (`getrawmempool`) once the
+mempool cache is warm; the 371 were the *test* paying a cache catch-up inside
+the measured request.
 
-Effort: small to find, unknown to fix until it is found.
+`mp_view_of` does an inline `mp_refresh_locked` slice when no background
+refresher is running. A slice stops at whichever comes first,
+`MP_REFRESH_SLICE` (400) transactions or `MP_REFRESH_MS` (400) milliseconds --
+and at the stress size it is always the TIME, because the budget counts
+transactions while the cost is one `getrawtransaction` for the transaction plus
+one more per input whose parent is not already in the mempool (`mp_prevout`,
+which does not decrement the budget). The test pre-warmed with a fixed
+`for (i = 0; i < 30; i++)`, which does not finish 9,000 transactions, so the
+measured request paid the remainder: 365 calls in 0.41 s -- exactly
+`MP_REFRESH_MS`, the signature of a time-capped slice rather than a per-event
+loop.
+
+The size dependence is what confirms it. Same binary, same fixture, only the
+mempool size varied:
+
+| mempool | route cost |
+| --- | --- |
+| 200 txs | 1 call -- passes |
+| 1,000 txs | 1 call -- passes |
+| 9,000 txs | 365 calls, 0.41 s -- fails |
+
+The daemon never takes this path at all: `esplora_mp_start_refresher` sets
+`g_mp_refresher`, and `mp_view_of` then issues no RPC. The inline slice exists
+for processes with no refresher thread, which is every test.
+
+Fixed test-side: the pre-warm now loops until a refresh fetches nothing new (a
+refresh that finds no new transaction spends exactly one call, so that is the
+fixed point), with an iteration cap and a printed warning if it fails to
+converge -- so an under-warmed cache can never again be read as a route
+regression. At 9,000 transactions the route now measures 1 call.
+
+The assertion was checked to still bite: with `esp_hist_resolve` spliced into
+the `ns == 2` branch the route costs 51 calls and the test fails. It remains
+the guard against the 44,001-call shape.
+
+Effort: was "small to find, unknown to fix". Actual: the fix was five lines of
+test, and the bug was in the measurement.
