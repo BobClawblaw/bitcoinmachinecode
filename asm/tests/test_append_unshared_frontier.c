@@ -106,40 +106,56 @@ int main(void){
     ck("blk00003's original bytes are intact", intact("blk00003.dat", 400, 0x7C), 1);
     ck("blk00002 was NOT filled on the way", fsize("blk00002.dat"), 300);
 
-    /* ---- CASE C: what this change does NOT cover, asserted as the CURRENT
-     * behaviour so the gap is visible rather than forgotten.
+    /* ---- CASE C: the 2026-09-17 incident in its exact shape, and the reason
+     * the struct now carries +44 pos_file_no.
      *
-     * If something sets cur_file_no to a file that has no successor and leaves
-     * cur_file_pos belonging to a different file, the walk cannot move (there
-     * is no blk(cur+1) to find) and the stale position is still trusted. That
-     * is the shape of the 2026-09-17 incident, and closing it needs the struct
-     * to record WHICH file cur_file_pos was measured in -- +44 is free -- so
-     * that a mismatch can be detected. Deliberately not done in this change.
+     * Something sets cur_file_no to a file that has NO successor, and leaves
+     * cur_file_pos belonging to a different file. The frontier walk cannot help
+     * -- there is no blk(cur+1) to find -- so before 2026-09-18 the stale
+     * position was trusted and the write landed at that offset in the wrong
+     * file. That is precisely how 293 bytes went over the start of height
+     * 967422.
      *
-     * cur_file_pos is NOT simply "the end of the file": a store re-inited over
-     * a leftover directory has pos=0 against a non-empty blk file on purpose,
-     * so the stale bytes are reclaimed. test_archive_truncate_nonmonotonic
-     * pins that, and an unconditional SEEK_END here breaks it. */
+     * cur_file_pos is a POSITION, and a position only means anything relative
+     * to a file. +44 records which file it was measured in; store_append
+     * compares the two and retakes the position when they disagree. */
     {
-        long before = fsize("blk00003.dat");
-        CUR_FILE_NO(st)  = 3;      /* the newest file: the walk has nowhere to go */
-        CUR_FILE_POS(st) = 0;      /* a position from some other file */
-        ck("append h4 with a hand-set file_no and a stale pos", store_append(st, h[4], raw[4], 64), 4);
-        ck("KNOWN GAP: the stale position is still trusted (writes at 0)",
-           (store_get_at(st, 4, m), (long long)m[0]), 0);
-        ck("...so blk00003 does not grow -- see CASE C, needs a pos_file_no field",
-           fsize("blk00003.dat"), before);
+        /* h3's append left cur_file_pos measured in file 3. Now two newer files
+         * appear and an outside party advances cur_file_no to the newest of
+         * them WITHOUT retaking the position -- exactly what
+         * archive_store_frontier() did on 2026-09-17. blk00006 does not exist,
+         * so the frontier walk has nowhere to go and cannot rescue this; only
+         * the +44 mismatch can. */
+        mk_blk(4, 200, 0x8D);
+        mk_blk(5, 600, 0x9E);
+        CUR_FILE_NO(st) = 5;       /* advanced ... */
+        /* cur_file_pos deliberately NOT touched: it still describes file 3 */
+        ck("append h4: file_no advanced to 5, position still file 3's",
+           store_append(st, h[4], raw[4], 64), 4);
+        ck("get h4", store_get_at(st, 4, m), 1);
+        ck("h4 is in blk00005", (long long)m[2], 5);
+        ck_ge("the stale position was REJECTED and retaken from blk00005",
+              (long long)m[0], 600);
+        ck("blk00005's 600 existing bytes are intact", intact("blk00005.dat", 600, 0x9E), 1);
+        ck_ge("blk00005 grew rather than being overwritten", fsize("blk00005.dat"), 600 + 8 + 64);
+        ck("blk00004 was not touched", fsize("blk00004.dat"), 200);
+        /* the block sitting where the stale position pointed survives */
+        { unsigned long long m3[3]; store_get_at(st, 3, m3);
+          char nm[32]; snprintf(nm, sizeof nm, "blk%05u.dat", (unsigned)m3[2]);
+          int fd = open(nm, O_RDONLY); unsigned char got[64]; memset(got, 0, 64);
+          if (fd >= 0){ (void)!pread(fd, got, 64, (off_t)m3[0] + 8); close(fd); }
+          ck("h3's block was not clobbered by the stale write", memcmp(got, raw[3], 64) == 0, 1); }
     }
 
     /* ---- the property both halves exist for */
     int mono = 1; unsigned long long pf = 0, pp = 0;
-    for (int i = 0; i <= 3; i++){   /* h4 is CASE C's deliberate break */
+    for (int i = 0; i <= 4; i++){
         unsigned long long mm[3];
         if (store_get_at(st, i, mm) != 1){ mono = 0; break; }
         if (i && (mm[2] < pf || (mm[2] == pf && mm[0] <= pp))) mono = 0;
         pf = mm[2]; pp = mm[0];
     }
-    ck("layout is monotonic across h0..h3", mono, 1);
+    ck("layout is monotonic across h0..h4", mono, 1);
 
     printf(failures ? "\nFAILURES: %d\n" : "\nALL UNSHARED-APPEND CHECKS PASSED\n", failures);
     return failures ? 1 : 0;
