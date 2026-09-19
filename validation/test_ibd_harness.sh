@@ -236,6 +236,39 @@ nula=$(grep -nE "grep (-[a-zA-Z]*)?[a-zA-Z-]* *['\"]?[^|]*debug\.log" \
         | grep -v 'grep -[a-zA-Z]*a' | grep -vc ':[[:space:]]*#' || true)
 ck "every debug.log grep passes -a" "$nula" "0"
 
+echo "== run 28: the tip from the log, no RPC during IBD =="
+# Real heartbeat shapes: run 27 mid-sync, and run 26's LAST line, which ends
+# with applied two behind the tip (the case a strict rule never fires on).
+L2="$T/progress_debug.log"
+printf '2026-09-18 20:25:38.000 [dlc] == elapsed 1:08:33 | eta 00:07:32:51 | overall: 376321/967593 stored (38.89%% of real tip) | in flight 0 of window 4096 through 376320 (no gap, 100.00%% landed) | applied=376320 lag=0 ==\n' > "$L2"
+printf 'a NUL \000 between heartbeats\n' >> "$L2"
+ck "mid-sync progress is APPLIED STORED TIP" "$(ibd_log_progress "$L2")" "376320 376321 967593"
+ibd_log_progress "$L2" | ibd_log_tip_reached; ckc "mid-sync is not the tip" "$?" "1"
+ck "no tip time before the tip" "$(ibd_log_tip_time "$L2")" ""
+printf '2026-09-19 12:00:05.100 [dlc] == elapsed 0:00:12 | eta --:--:--:-- | overall: 967588/967588 stored (100.00%% of real tip) | in flight 0 of window 4096 through 967587 (no gap, 100.00%% landed) | applied=967586 lag=1 ==\n' >> "$L2"
+printf '2026-09-19 12:05:05.100 [dlc] == elapsed 0:05:12 | eta --:--:--:-- | overall: 967590/967590 stored (100.00%% of real tip) | in flight 0 of window 4096 through 967589 (no gap, 100.00%% landed) | applied=967590 lag=0 ==\n' >> "$L2"
+ibd_log_progress "$L2" | ibd_log_tip_reached; ckc "the final heartbeat is the tip" "$?" "0"
+echo "967586 967588 967588" | ibd_log_tip_reached; ckc "run 26's real last line (applied 2 behind) counts as the tip" "$?" "0"
+echo "967500 967588 967588" | ibd_log_tip_reached; ckc "88 behind does not" "$?" "1"
+echo "967588 967587 967588" | ibd_log_tip_reached; ckc "a block still unstored does not" "$?" "1"
+echo "" | ibd_log_tip_reached; ckc "no heartbeat yet is not the tip" "$?" "1"
+ck "the tip time is the FIRST heartbeat at the tip, to the second" "$(ibd_log_tip_time "$L2")" "2026-09-19 12:00:05"
+# ss output as `ss -tnpH state established` prints it: blockyard polling, twice
+SS='0 0 127.0.0.1:51234 127.0.0.1:8461 users:(("node",pid=2975131,fd=31))
+0 0 127.0.0.1:51236 127.0.0.1:8461 users:(("node",pid=2975131,fd=33))
+0 0 127.0.0.1:51300 127.0.0.1:8461 users:(("curl",pid=4242,fd=5))'
+ck "RPC clients are named once each, pid:name" "$(printf '%s\n' "$SS" | ibd_parse_ss_clients | tr '\n' ' ')" "2975131:node 4242:curl "
+ck "no connections, no clients" "$(printf '' | ibd_parse_ss_clients)" ""
+# the harness itself must not call RPC during IBD: between the helper watch and
+# the TIP line, the monitor loop has no $CLI call
+loop=$(awk '/^while :; do/,/ph "TIP reached/' fresh_ibd_run.sh | grep -c '\$CLI ')
+ck "the monitor loop makes no RPC call before the tip" "$loop" "0"
+ck "the monitor loop reads the tip from the log" "$(awk '/^while :; do/,/ph "TIP reached/' fresh_ibd_run.sh | grep -c 'ibd_log_tip_reached')" "1"
+ck "the monitor loop checks for RPC strangers" "$(awk '/^while :; do/,/ph "TIP reached/' fresh_ibd_run.sh | grep -c 'ibd_rpc_clients')" "1"
+ck "the monitor loop also counts short-lived RPC connections" "$(awk '/^while :; do/,/ph "TIP reached/' fresh_ibd_run.sh | grep -c 'ibd_rpc_recent_closes')" "1"
+# live: a port nothing listens on has no TIME-WAIT sockets, and the reader counts
+ck "a quiet port has no recent closes" "$(ibd_rpc_recent_closes 1)" "0"
+
 echo
 echo "passed $pass, failed $fail"
 [ "$fail" -eq 0 ] || exit 1

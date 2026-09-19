@@ -181,3 +181,67 @@ ibd_throughput() {
     local log="$1"
     grep -aoE 'avg [0-9.]+MB/s' "$log" 2>/dev/null | tail -1
 }
+
+# ---- run 28: a timed IBD is read from its LOG, never over RPC (2026-09-19) ----
+# Operator rule after run 27: nothing queries a timed node's RPC until its IBD
+# is over. Run 27's RPC side read 10.2 TB of disk answering a monitor's polls,
+# more than the sync itself read, and a per-minute gettxoutsetinfo forced Core's
+# first baseline to flush its UTXO cache every minute.
+# So the harness takes the tip from the download heartbeat. It makes no RPC call
+# until that heartbeat says the download is complete. The readers below are how
+# it does that, and how it notices anybody else calling in.
+
+# "APPLIED STORED TIP" from the latest heartbeat that carries all three:
+#   [dlc] == elapsed .. | overall: 337441/967593 stored (..) | .. | applied=337440 lag=0 ==
+# Empty until the first such line.
+ibd_log_progress() {
+    local log="$1"
+    grep -a '\[dlc\] == elapsed.*overall: [0-9]*/[0-9]* stored.*applied=[0-9]*' "$log" 2>/dev/null | tail -1 \
+        | sed -E 's/.*overall: ([0-9]+)\/([0-9]+) stored.*applied=([0-9]+).*/\3 \1 \2/'
+}
+
+# rc 0 when the download says it is done: every block up to the real tip is
+# stored and the UTXO engine is within 6 of it. Not "within 1": run 26's final
+# heartbeat reads "967588/967588 stored ... applied=967586", so the last line the
+# download ever writes can be 2 behind, and a strict rule never fires. The
+# capstone waits for a stable height before it hashes anything, so ending a
+# couple of blocks early costs nothing. "APPLIED STORED TIP" on stdin.
+ibd_log_tip_reached() {
+    local a s t
+    read -r a s t || return 1
+    [ -n "${t:-}" ] || return 1
+    [ "$s" -ge "$t" ] && [ "$a" -ge $((t - 6)) ]
+}
+
+# The log's own timestamp of the FIRST heartbeat that reached the tip, as
+# "YYYY-MM-DD HH:MM:SS". This is the run's end, to the second. The monitor loop
+# only looks every 5 minutes, and Core's end is likewise read from its log
+# ("Leaving InitialBlockDownload").
+ibd_log_tip_time() {
+    local log="$1"
+    grep -a '\[dlc\] == elapsed.*overall: [0-9]*/[0-9]* stored.*applied=[0-9]*' "$log" 2>/dev/null \
+        | sed -E 's/^([0-9-]+ [0-9:]+).*overall: ([0-9]+)\/([0-9]+) stored.*applied=([0-9]+).*/\1 \4 \2 \3/' \
+        | awk '$4 >= $5 && $3 >= $5 - 6 { print $1, $2; exit }'
+}
+
+# Clients connected to an RPC port, from `ss -tnpH state established` output on
+# stdin: one "pid:name" per distinct process. The harness makes no RPC call
+# during IBD, so during IBD anything printed here is a stranger.
+ibd_parse_ss_clients() {
+    grep -oE 'users:\(\("[^"]+",pid=[0-9]+' | sed -E 's/users:\(\("([^"]+)",pid=([0-9]+)/\2:\1/' | sort -u
+}
+ibd_rpc_clients() {
+    local port="$1"
+    ss -tnpH state established "( dport = :$port )" 2>/dev/null | ibd_parse_ss_clients
+}
+
+# Connections to the RPC port that CLOSED in the last ~60 s (TCP TIME-WAIT).
+# A poller that opens, asks and closes within milliseconds is never caught by a
+# snapshot of established sockets taken every 5 minutes. Production's pollers
+# showed 0 established and ~60 in TIME-WAIT at once. The closed socket lingers
+# for a minute either way, so this catches them. It cannot name the process;
+# the established check above names it when it happens to be caught open.
+ibd_rpc_recent_closes() {
+    local port="$1"
+    ss -tnH state time-wait "( sport = :$port or dport = :$port )" 2>/dev/null | grep -c .
+}
