@@ -7475,6 +7475,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     /* ZMQ publisher binds HERE, in the worker, because a PUB socket's
      * subscriber fds are per-process and only this process can write to them.
      * Binding is non-fatal: a busy port must not stop the node syncing. */
+    /* the per-topic high-water marks (messages per subscriber queue) before
+     * the first subscriber can connect, not after the archive reload */
+    { extern void zmq_pub_set_hwm(const int*); zmq_pub_set_hwm(g_cfg.zmq_hwm); }
     if (g_cfg.zmq_hashblock[0]) zmqpub_add("hashblock", g_cfg.zmq_hashblock);
     if (g_cfg.zmq_hashtx[0])    zmqpub_add("hashtx",    g_cfg.zmq_hashtx);
     if (g_cfg.zmq_rawblock[0])  zmqpub_add("rawblock",  g_cfg.zmq_rawblock);
@@ -7567,7 +7570,6 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
        * means this node must not learn or announce its clearnet address at
        * all: that address is exactly what running behind Tor hides. */
       { extern void txrelay_set_status(void*); txrelay_set_status(g_node_status); }
-      { extern void zmq_pub_set_hwm(const int*); zmq_pub_set_hwm(g_cfg.zmq_hwm); }
       int may = g_cfg.listen && dialer_may_announce_clearnet();
       addrself_init((unsigned short)g_cfg.port, may);
       /* -externalip: the operator naming the reachable address directly */
@@ -9615,6 +9617,7 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
                             g_cfg.n_addnode);
     rpc_node_set_zmq(g_cfg.zmq_hashblock, g_cfg.zmq_hashtx,
                      g_cfg.zmq_rawblock, g_cfg.zmq_rawtx);
+    rpc_node_set_zmq_hwm(g_cfg.zmq_hwm);
     /* getblockfilter reads spent-prevout scripts from undo_<h>.dat */
     { extern long undo_replay(long, int (*)(void*, const unsigned char*, unsigned int,
                                             unsigned long long, unsigned int, unsigned char,

@@ -542,6 +542,10 @@ typedef struct {
     unsigned long long min_relay_satkvb;    /* -minrelaytxfee, sat/kvB (estimatesmartfee floor) */
 } rpc_mempool_hooks;
 void rpc_node_set_mempool(const rpc_mempool_hooks* h);
+/* Clusters linearized by the mempool-entry builder since start (chunkweight /
+ * fees.chunk). A test reads the delta across one bulk getrawmempool to pin
+ * the cost model: one build per CLUSTER, never one per member. */
+unsigned long rpc_node_cluster_builds(void);
 
 /* Hand the RPC layer the persistent address book (daemon/addrbook.c v2), so
  * getnodeaddresses/getaddrmaninfo report real recorded peers. Injected as
@@ -568,6 +572,10 @@ void rpc_node_set_addednodes(const char (*list)[64], int n);
  * behind getzmqnotifications. Injected like the added-node list above. */
 void rpc_node_set_zmq(const char* hashblock, const char* hashtx,
                       const char* rawblock, const char* rawtx);
+/* The configured -zmqpub<topic>hwm values, in the same four-topic order
+ * (node_config's g_cfg.zmq_hwm, a long-lived global: BORROWED). NULL reports
+ * Core's default, 1000. */
+void rpc_node_set_zmq_hwm(const int* hwm4);
 
 /* 1 if `method` is a live-node method this module serves. */
 int rpc_node_known_method(const char* method);
