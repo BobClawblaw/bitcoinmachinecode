@@ -23,24 +23,40 @@
  *   [topic] [body] [sequence u32 LE]
  * with the sequence counted PER TOPIC, so a subscriber can detect a drop.
  *
- * NOT STALLING IS CORRECT, and this node goes further than libzmq. A PUB
- * socket must never hold up its producer: this is a consensus daemon and a
- * slow subscriber must not be able to delay block connection. Sockets are
- * non-blocking.
+ * NOT STALLING IS CORRECT. A PUB socket must never hold up its producer: this
+ * is a consensus daemon and a slow subscriber must not be able to delay block
+ * connection. So zmqpub_notify never touches a socket. It frames the message
+ * ONCE into a refcounted buffer, appends a pointer to the queue of every
+ * subscriber that wants it, and wakes the servicing thread, which writes each
+ * queue out as its socket drains (POLLOUT) -- the shape of libzmq's I/O
+ * thread and its per-peer pipes.
  *
- * MEM-22 (audit 2026-09-03): this paragraph used to say a full subscriber
- * "has the message DROPPED, which is exactly what libzmq's PUB does". That
- * is NOT what happens here. zp_publish (see the send failure below) CLOSES
- * the subscriber's socket and drops the connection entirely; libzmq's PUB
- * discards the individual message and keeps the peer attached.
+ * THE QUEUE IS libzmq's, IN libzmq's UNIT. Each subscriber's queue holds at
+ * most SNDHWM MESSAGES (-zmqpub<topic>hwm, default 1000; 0 = no count limit,
+ * as in ZMQ). When it is full the NEW message is discarded for that
+ * subscriber alone and the connection is KEPT -- what libzmq's PUB does -- so
+ * the subscriber sees a gap in the per-topic sequence number, not a
+ * disconnect. A message is queued whole or not at all, and a queue is written
+ * strictly in order from one offset, so frames never interleave and a
+ * subscriber never receives half a message.
  *
- * The behaviour is defensible -- a subscriber that cannot keep up would
- * otherwise need unbounded buffering, and disconnection is a signal it can
- * actually detect -- but it is a REAL DIVERGENCE from Core's ZMQ semantics,
- * and a subscriber written against Core's will see its connection vanish
- * rather than a gap in the per-topic sequence number. Recorded here and in
- * docs/FEATURE_GAPS.md rather than left implied by a comment claiming the
- * opposite.
+ * MEM-22 (audit 2026-09-03), CLOSED 2026-09-19. There used to be no queue: the
+ * subscriber's kernel send buffer was sized to hwm x 256 bytes (~256 KB), the
+ * three frames were written with non-blocking send, and a subscriber that
+ * could not take the whole message was CLOSED. A rawblock is 1-2 MB, so it
+ * hit EAGAIN mid-message every time: rawblock was never delivered to anyone,
+ * and every block disconnected every subscriber on its endpoint. Production,
+ * 2026-09-19 01:07Z: a pyzmq subscriber received 3,180 hashtx, 2 hashblock and
+ * ZERO rawblock over two blocks, with 4 per-topic sequence gaps (reconnects).
+ *
+ * ONE DIVERGENCE, deliberate: a BYTE ceiling per subscriber (ZP_SUB_MAX_BYTES,
+ * 512 MiB) on top of the message count. Core's worst case is 1000 rawblocks
+ * (up to 4 GB) held for each stalled subscriber; this node has been OOM-killed
+ * before, and 512 MiB is ~250 full blocks -- more than a day at the tip, so
+ * it only binds during a catch-up burst to a subscriber that has stopped
+ * reading. Past it, new messages drop exactly as at the high-water mark. A
+ * message into an EMPTY queue is always accepted, so no single message is
+ * undeliverable. Recorded in docs/CORE_DIVERGENCES.md.
  */
 #include <stdio.h>
 #include "log_ts.h"   /* timestamped fprintf(stderr), like every other daemon line */
@@ -58,6 +74,8 @@
 #include "../bmc_thread.h"
 #include <stdatomic.h>
 #include <time.h>
+#include <stdint.h>
+#include <sys/eventfd.h>
 
 typedef unsigned char u8;
 typedef unsigned int  u32;
@@ -66,6 +84,16 @@ typedef unsigned int  u32;
 #define ZP_MAX_SUBS      32
 #define ZP_MAX_FILTERS   16
 #define ZP_FILTER_LEN    64
+
+/* One published message, framed for the wire ONCE and shared by every
+ * subscriber queue holding it: a 2 MB rawblock sent to five subscribers is
+ * one allocation, not five (libzmq shares large messages the same way).
+ * refs is only ever touched under g_lock. */
+typedef struct {
+    int    refs;
+    size_t len;
+    u8     wire[];
+} zp_msg;
 
 /* a connected subscriber */
 typedef struct {
@@ -76,6 +104,13 @@ typedef struct {
     u8   filter[ZP_MAX_FILTERS][ZP_FILTER_LEN];
     int  filterlen[ZP_MAX_FILTERS];
     int  nfilter;
+    /* the outbound queue: a ring of whole messages, oldest at qhead, written
+     * from qoff bytes into the oldest. qcap is 0 or a power of two. */
+    zp_msg** q;
+    u32  qcap, qhead, qn;
+    size_t qoff, qbytes;
+    unsigned long drop_run;    /* dropped since the queue last had room */
+    unsigned long drop_total;
 } zp_sub;
 
 typedef struct {
@@ -104,13 +139,15 @@ static int g_nep = 0;
  * It now runs here, on a dedicated thread that blocks in poll() and idles at
  * zero cost -- the same shape as libzmq's I/O thread.
  *
- * WHAT THE LOCK PROTECTS. The servicing thread accepts subscribers and
- * COMPACTS the array when they disconnect; the publishing thread walks that
- * same array and closes subscribers whose send fails. Without the lock the
- * compaction moves entries out from under an in-progress walk, and both sides
- * can close the same fd -- which, once the number is reused, means writing
- * block data into an unrelated socket. Every read or write of subs/nsubs is
- * therefore under g_lock. The endpoint list itself (g_ep, g_nep, listen_fd) is
+ * WHAT THE LOCK PROTECTS. The servicing thread accepts subscribers, writes
+ * their queues and COMPACTS the array when they disconnect; the publishing
+ * thread walks that same array appending to the queues. Without the lock the
+ * compaction moves entries out from under an in-progress walk, and a queue
+ * could be appended to after it was freed -- or an fd closed and its number
+ * reused under a write. Every read or write of subs/nsubs, of a queue and of
+ * a message's refcount is therefore under g_lock; the servicing thread's
+ * sends are non-blocking and budgeted, so the publisher's wait for it is
+ * bounded. The endpoint list itself (g_ep, g_nep, listen_fd) is
  * built once by zmqpub_add before the thread starts and is read-only after.
  * ------------------------------------------------------------------------ */
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -128,21 +165,44 @@ static const char* const ZP_TOPICS[ZP_NTOPIC] =
     { "hashblock", "hashtx", "rawblock", "rawtx", "sequence" };
 static int  g_topic_ep[ZP_NTOPIC] = { -1, -1, -1, -1, -1 };
 static u32  g_topic_seq[ZP_NTOPIC];
-/* Core -zmqpub<topic>hwm: how much a slow subscriber may fall behind before
- * messages are dropped rather than queued. Core counts MESSAGES in its own
- * queue; this publisher has no user-space queue -- it writes the socket
- * directly and already drops on EAGAIN -- so the kernel send buffer IS the
- * queue, and the high-water mark sizes it. Same property (a slow subscriber
- * costs bounded memory and never blocks the node), different unit, stated
- * here rather than silently reinterpreted. 0 leaves the system default. */
-static int g_topic_hwm[ZP_NTOPIC];
+/* Core -zmqpub<topic>hwm: libzmq's ZMQ_SNDHWM, in MESSAGES -- how many a
+ * subscriber's queue may hold before new ones are dropped for it. Default
+ * 1000 (Core's DEFAULT_ZMQ_SNDHWM), so a caller that never sets it gets
+ * Core's value rather than "unlimited". 0 means no count limit, as in ZMQ.
+ *
+ * WHICH topic's value governs a shared endpoint: Core creates one socket per
+ * address, and SNDHWM is set by the notifier that CREATES it -- the first in
+ * its factories map, which is ordered pubhashblock, pubhashtx, pubrawblock,
+ * pubrawtx, pubsequence (zmqpublishnotifier.cpp Initialize; later notifiers
+ * "reuse" the socket as it is). ZP_TOPICS is in that order, so the first
+ * topic bound to an endpoint is the one whose hwm applies, as in Core. */
+static int g_topic_hwm[ZP_NTOPIC] = { 1000, 1000, 1000, 1000, 1000 };
 void zmq_pub_set_hwm(const int* hwm5){
     if (!hwm5) return;
-    for (int i = 0; i < ZP_NTOPIC && i < 5; i++) g_topic_hwm[i] = hwm5[i];
+    for (int i = 0; i < ZP_NTOPIC && i < 5; i++)
+        if (hwm5[i] >= 0) g_topic_hwm[i] = hwm5[i];   /* Core ignores a negative */
 }
-/* a conservative per-message estimate: a rawblock is far larger, but the
- * point is a bound, and oversizing the buffer would defeat the option */
-#define ZP_HWM_MSG_BYTES 256
+static int zp_ep_hwm(int ep){
+    for (int t = 0; t < ZP_NTOPIC; t++) if (g_topic_ep[t] == ep) return g_topic_hwm[t];
+    return 1000;
+}
+/* The divergence stated in the header: a per-subscriber byte ceiling on top
+ * of the message count. Settable only so tests can reach it cheaply. */
+#define ZP_SUB_MAX_BYTES ((size_t)512 << 20)
+static size_t g_sub_max_bytes = ZP_SUB_MAX_BYTES;
+void zmq_pub_set_byte_cap(unsigned long b){ g_sub_max_bytes = b ? (size_t)b : ZP_SUB_MAX_BYTES; }
+
+/* how much one servicing pass writes to one subscriber before moving on, so
+ * a fast reader of a big backlog cannot hold g_lock for long */
+#define ZP_FLUSH_BUDGET ((size_t)4 << 20)
+
+/* wakes the servicing thread when a queue goes from empty to not */
+static int g_wake_fd = -1;
+static void zp_wake(void){
+    if (g_wake_fd < 0) return;
+    uint64_t one = 1;
+    ssize_t w = write(g_wake_fd, &one, sizeof one); (void)w;   /* EAGAIN: already pending */
+}
 
 static void zp_nonblock(int fd){
     int fl = fcntl(fd, F_GETFL, 0);
@@ -289,6 +349,77 @@ static int zp_wants(const zp_sub* s, const char* topic){
     return 0;
 }
 
+/* ---- the per-subscriber outbound queue (all under g_lock) ---------------- */
+static void zp_msg_unref(zp_msg* m){ if (--m->refs == 0) free(m); }
+
+static void zp_queue_free(zp_sub* s){
+    for (u32 i = 0; i < s->qn; i++) zp_msg_unref(s->q[(s->qhead + i) & (s->qcap - 1)]);
+    free(s->q);
+    s->q = NULL; s->qcap = s->qhead = s->qn = 0; s->qoff = s->qbytes = 0;
+}
+
+/* Queue m for s, or drop it for s alone. libzmq's rule: a full pipe discards
+ * the NEW message and keeps the peer. Returns 1 if queued. */
+static int zp_enqueue(zp_sub* s, zp_msg* m, int hwm, const char* addr, const char* topic){
+    const char* why = NULL;
+    if (hwm > 0 && s->qn >= (u32)hwm) why = "high-water mark";
+    else if (s->qn > 0 && s->qbytes + m->len > g_sub_max_bytes) why = "byte ceiling";
+    else if (s->qn == s->qcap){
+        u32 nc = s->qcap ? s->qcap * 2 : 16;
+        zp_msg** nq = nc > s->qcap ? malloc((size_t)nc * sizeof *nq) : NULL;
+        if (!nq) why = "out of memory";
+        else {
+            for (u32 i = 0; i < s->qn; i++) nq[i] = s->q[(s->qhead + i) & (s->qcap - 1)];
+            free(s->q); s->q = nq; s->qcap = nc; s->qhead = 0;
+        }
+    }
+    if (why){
+        /* once per streak, not once per message: a stalled subscriber would
+         * otherwise log every transaction the node relays */
+        if (s->drop_run++ == 0)
+            fprintf(stderr, "[zmq] subscriber on %s is %u message(s) / %zu bytes behind "
+                            "(%s, hwm %d): dropping new messages for it, first a %s; "
+                            "the connection is kept\n",
+                    addr, s->qn, s->qbytes, why, hwm, topic);
+        s->drop_total++;
+        return 0;
+    }
+    if (s->drop_run){
+        fprintf(stderr, "[zmq] subscriber on %s is taking messages again after %lu "
+                        "were dropped for it\n", addr, s->drop_run);
+        s->drop_run = 0;
+    }
+    s->q[(s->qhead + s->qn) & (s->qcap - 1)] = m;
+    s->qn++; s->qbytes += m->len; m->refs++;
+    return 1;
+}
+
+/* Write as much of s's queue as the socket takes now: whole messages, in
+ * order, resuming at qoff. EAGAIN leaves the rest for the next POLLOUT; any
+ * other error means the peer is gone. */
+static void zp_flush(zp_sub* s){
+    size_t budget = ZP_FLUSH_BUDGET;
+    while (s->fd >= 0 && s->qn && budget){
+        zp_msg* m = s->q[s->qhead];
+        size_t want = m->len - s->qoff;
+        if (want > budget) want = budget;
+        ssize_t w = send(s->fd, m->wire + s->qoff, want, MSG_NOSIGNAL | MSG_DONTWAIT);
+        if (w > 0){
+            s->qoff += (size_t)w; budget -= (size_t)w;
+            if (s->qoff == m->len){
+                s->qhead = (s->qhead + 1) & (s->qcap - 1);
+                s->qn--; s->qbytes -= m->len; s->qoff = 0;
+                zp_msg_unref(m);
+            }
+            continue;
+        }
+        if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        close(s->fd); s->fd = -1;
+        return;
+    }
+}
+
 /* Consume whatever complete frames are buffered for this subscriber. */
 static void zp_consume(zp_sub* s){
     for (;;){
@@ -348,20 +479,15 @@ static void zp_poll_locked(void){
         zp_endpoint* e = &g_ep[i];
         for (;;){
             int c = accept(e->listen_fd, NULL, NULL);
-            /* size this subscriber's queue from the topic's high-water mark */
-            if (c >= 0){
-                int hw = 0;
-                for (int t = 0; t < ZP_NTOPIC; t++)
-                    if (g_topic_ep[t] >= 0 && g_topic_hwm[t] > hw) hw = g_topic_hwm[t];
-                if (hw > 0){
-                    int v = hw * ZP_HWM_MSG_BYTES;
-                    setsockopt(c, SOL_SOCKET, SO_SNDBUF, &v, sizeof v);
-                }
-            }
+            /* The kernel send buffer is left to autotune: the high-water mark
+             * is enforced on the user-space queue, in messages, as libzmq
+             * does. (It used to size SO_SNDBUF to hwm x 256 bytes, which is
+             * what made a rawblock undeliverable -- MEM-22, header.) */
             if (c < 0) break;
             if (e->nsubs >= ZP_MAX_SUBS){ close(c); continue; }
             zp_nonblock(c);
             int one = 1; setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+            setsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);   /* Core: ZMQ_TCP_KEEPALIVE=1 */
             zp_sub* s = &e->subs[e->nsubs++];
             memset(s, 0, sizeof *s);
             s->fd = c;
@@ -378,10 +504,21 @@ static void zp_poll_locked(void){
                 if (r == 0){ close(s->fd); s->fd = -1; }
                 break;
             }
+            if (s->fd >= 0 && s->qn) zp_flush(s);
         }
-        /* compact away closed subscribers */
+        /* compact away closed subscribers, releasing what they had queued */
         int w = 0;
-        for (int k = 0; k < e->nsubs; k++) if (e->subs[k].fd >= 0) e->subs[w++] = e->subs[k];
+        for (int k = 0; k < e->nsubs; k++){
+            zp_sub* s = &e->subs[k];
+            if (s->fd >= 0){ if (w != k) e->subs[w] = *s; w++; continue; }
+            if (s->drop_total)
+                fprintf(stderr, "[zmq] subscriber on %s disconnected; %lu message(s) had "
+                                "been dropped for it\n", e->addr, s->drop_total);
+            zp_queue_free(s);
+        }
+        /* the vacated tail holds copies of moved queue pointers: clear it so
+         * nothing can ever free one of those queues twice */
+        for (int k = w; k < e->nsubs; k++){ memset(&e->subs[k], 0, sizeof e->subs[k]); e->subs[k].fd = -1; }
         e->nsubs = w;
     }
 }
@@ -400,8 +537,9 @@ void zmqpub_poll(void){
 static void* zp_thread_main(void* arg){
     (void)arg;
     while (!atomic_load(&g_stop)){
-        struct pollfd pf[ZP_MAX_ENDPOINTS * (ZP_MAX_SUBS + 1)];
+        struct pollfd pf[1 + ZP_MAX_ENDPOINTS * (ZP_MAX_SUBS + 1)];
         int n = 0;
+        pf[n].fd = g_wake_fd; pf[n].events = POLLIN; pf[n].revents = 0; n++;
         pthread_mutex_lock(&g_lock);
         for (int i = 0; i < g_nep && n < (int)(sizeof pf / sizeof pf[0]); i++){
             if (g_ep[i].listen_fd >= 0){
@@ -409,18 +547,25 @@ static void* zp_thread_main(void* arg){
             }
             for (int k = 0; k < g_ep[i].nsubs && n < (int)(sizeof pf / sizeof pf[0]); k++)
                 if (g_ep[i].subs[k].fd >= 0){
-                    pf[n].fd = g_ep[i].subs[k].fd; pf[n].events = POLLIN; pf[n].revents = 0; n++;
+                    /* POLLOUT only while something is queued, or an idle
+                     * writable socket would spin this loop */
+                    pf[n].fd = g_ep[i].subs[k].fd;
+                    pf[n].events = (short)(POLLIN | (g_ep[i].subs[k].qn ? POLLOUT : 0));
+                    pf[n].revents = 0; n++;
                 }
         }
         pthread_mutex_unlock(&g_lock);
 
-        if (n == 0){
+        if (n == 1){
             struct timespec ts = { 0, 100 * 1000 * 1000 };   /* nothing to watch yet */
             nanosleep(&ts, NULL);
             continue;
         }
         int r = poll(pf, (nfds_t)n, 200);
         if (r < 0 && errno != EINTR) break;
+        if (r > 0 && (pf[0].revents & POLLIN)){
+            uint64_t v; ssize_t rd = read(g_wake_fd, &v, sizeof v); (void)rd;
+        }
         if (r > 0) zmqpub_poll();
     }
     return NULL;
@@ -432,6 +577,12 @@ int zmqpub_start(void){
     if (g_thread_up) return 1;
     if (g_nep == 0) return 0;
     atomic_store(&g_stop, 0);
+    if (g_wake_fd < 0) g_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    if (g_wake_fd < 0){
+        fprintf(stderr, "[zmq] could not create the wake-up eventfd: %s -- "
+                        "subscribers will not connect\n", strerror(errno));
+        return 0;
+    }
     if (bmc_pthread_create(&g_thread, zp_thread_main, NULL) != 0){
         fprintf(stderr, "[zmq] could not start the subscriber thread -- "
                         "publishing still works, subscribers will not connect\n");
@@ -448,54 +599,96 @@ static void zp_stop_thread(void){
     g_thread_up = 0;
 }
 
-/* Publish [topic][body][seq u32 LE] to every subscriber of `topic`. */
+static int zp_any_wants_locked(const zp_endpoint* e, const char* topic){
+    for (int k = 0; k < e->nsubs; k++){
+        const zp_sub* s = &e->subs[k];
+        if (s->fd >= 0 && s->state == 2 && zp_wants(s, topic)) return 1;
+    }
+    return 0;
+}
+
+/* Publish [topic][body][seq u32 LE] to every subscriber of `topic`.
+ *
+ * NEVER touches a socket and never waits on one: the cost is one allocation
+ * and one copy of the message (the copy made OUTSIDE the lock), then a
+ * pointer append per subscriber. The servicing thread does the writing. */
 void zmqpub_notify(const char* topic, const void* body, unsigned long blen){
     int t = -1;
     for (int i = 0; i < ZP_NTOPIC; i++) if (!strcmp(topic, ZP_TOPICS[i])) t = i;
     if (t < 0 || g_topic_ep[t] < 0) return;
-    zp_endpoint* e = &g_ep[g_topic_ep[t]];
-    /* nsubs is read under the lock below; the sequence number belongs to the
-     * publisher alone, so it is bumped either way. */
+    int ep = g_topic_ep[t];
+    zp_endpoint* e = &g_ep[ep];
+    /* The sequence number belongs to the publisher alone and is bumped
+     * whether or not anyone takes the message -- Core's nSequence is too,
+     * which is what makes a dropped message visible as a gap. */
+    u32 seq = g_topic_seq[t]++;
+
+    /* nobody subscribed is the common case: answer it without allocating */
+    pthread_mutex_lock(&g_lock);
+    int any = zp_any_wants_locked(e, topic);
+    pthread_mutex_unlock(&g_lock);
+    if (!any) return;
 
     size_t tl = strlen(topic);
     u8 h1[9], h2[9], h3[9];
     size_t n1 = zp_frame_hdr(h1, 1, 0, tl);
     size_t n2 = zp_frame_hdr(h2, 1, 0, blen);
     size_t n3 = zp_frame_hdr(h3, 0, 0, 4);
-    u32 seq = g_topic_seq[t]++;
-    u8 seqb[4];
-    for (int i = 0; i < 4; i++) seqb[i] = (u8)(seq >> (8 * i));   /* little-endian */
+    size_t total = n1 + tl + n2 + blen + n3 + 4;
+    zp_msg* m = malloc(sizeof *m + total);
+    if (!m){
+        fprintf(stderr, "[zmq] cannot allocate %zu bytes for a %s message; not published\n",
+                total, topic);
+        return;
+    }
+    m->refs = 0; m->len = total;
+    u8* p = m->wire;
+    memcpy(p, h1, n1); p += n1; memcpy(p, topic, tl); p += tl;
+    memcpy(p, h2, n2); p += n2; memcpy(p, body, blen); p += blen;
+    memcpy(p, h3, n3); p += n3;
+    for (int i = 0; i < 4; i++) *p++ = (u8)(seq >> (8 * i));   /* little-endian */
 
+    int wake = 0;
     pthread_mutex_lock(&g_lock);
+    int hwm = zp_ep_hwm(ep);
     for (int k = 0; k < e->nsubs; k++){
         zp_sub* s = &e->subs[k];
         if (s->fd < 0 || s->state != 2 || !zp_wants(s, topic)) continue;
-        /* One writev-shaped burst, but plain sends: a partial write on the
-         * FIRST part would desynchronise the stream, so a subscriber that
-         * cannot take the whole message is dropped rather than fed half of
-         * one. That is the honest failure -- half a frame is unparseable. */
-        if (zp_send_all(s->fd, h1, n1) != 1 ||
-            zp_send_all(s->fd, (const u8*)topic, tl) != 1 ||
-            zp_send_all(s->fd, h2, n2) != 1 ||
-            zp_send_all(s->fd, (const u8*)body, blen) != 1 ||
-            zp_send_all(s->fd, h3, n3) != 1 ||
-            zp_send_all(s->fd, seqb, 4) != 1){
-            fprintf(stderr, "[zmq] subscriber could not take a %s message; dropping it\n", topic);
-            close(s->fd); s->fd = -1;
-        }
+        int was_empty = s->qn == 0;
+        /* a non-empty queue is already polled for POLLOUT; only a queue
+         * that just became non-empty needs the thread woken */
+        if (zp_enqueue(s, m, hwm, e->addr, topic) && was_empty) wake = 1;
     }
+    int held = m->refs;
     pthread_mutex_unlock(&g_lock);
+    if (!held) free(m);
+    if (wake) zp_wake();
+}
+
+/* Subscribers past the handshake, across all endpoints (tests, diagnostics). */
+int zmqpub_live_subscribers(void){
+    int n = 0;
+    pthread_mutex_lock(&g_lock);
+    for (int i = 0; i < g_nep; i++)
+        for (int k = 0; k < g_ep[i].nsubs; k++)
+            if (g_ep[i].subs[k].fd >= 0 && g_ep[i].subs[k].state == 2) n++;
+    pthread_mutex_unlock(&g_lock);
+    return n;
 }
 
 void zmqpub_close(void){
     zp_stop_thread();          /* before any fd goes away under it */
     pthread_mutex_lock(&g_lock);
     for (int i = 0; i < g_nep; i++){
-        for (int k = 0; k < g_ep[i].nsubs; k++)
+        for (int k = 0; k < g_ep[i].nsubs; k++){
             if (g_ep[i].subs[k].fd >= 0) close(g_ep[i].subs[k].fd);
+            zp_queue_free(&g_ep[i].subs[k]);
+        }
+        g_ep[i].nsubs = 0;
         if (g_ep[i].listen_fd >= 0) close(g_ep[i].listen_fd);
     }
     g_nep = 0;
-    for (int i = 0; i < ZP_NTOPIC; i++) g_topic_ep[i] = -1;
+    for (int i = 0; i < ZP_NTOPIC; i++){ g_topic_ep[i] = -1; g_topic_seq[i] = 0; }
+    if (g_wake_fd >= 0){ close(g_wake_fd); g_wake_fd = -1; }
     pthread_mutex_unlock(&g_lock);
 }

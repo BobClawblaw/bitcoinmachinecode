@@ -467,6 +467,17 @@ typedef struct {
      * cannot fill it. Measured on run 22 from OUTSIDE the process because the
      * node did not report it: 11-20% per worker while the log said 8/8 active. */
     volatile int              dl_pool_idle_pct;
+    /* 2026-09-19: every WIRE byte the downloader's sockets carried -- the
+     * header phase, the probes' handshakes, each helper's version/getdata/
+     * pong and every block -- counted as Core counts them (full message,
+     * 24-byte header included) by the p2p_write/p2p_read hooks in whichever
+     * process moved them (daemon/main.c dl_wire_note). Cumulative for the
+     * node's life, never reset: dl_bytes_total above is one dl_catchup
+     * call's rchar and restarts with each call. getnettotals adds these to
+     * the relay legs' TCP_INFO figures. Appended: every offset above is
+     * unchanged. */
+    volatile long long        dl_wire_sent;
+    volatile long long        dl_wire_recv;
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 
@@ -531,6 +542,10 @@ typedef struct {
     unsigned long long min_relay_satkvb;    /* -minrelaytxfee, sat/kvB (estimatesmartfee floor) */
 } rpc_mempool_hooks;
 void rpc_node_set_mempool(const rpc_mempool_hooks* h);
+/* Clusters linearized by the mempool-entry builder since start (chunkweight /
+ * fees.chunk). A test reads the delta across one bulk getrawmempool to pin
+ * the cost model: one build per CLUSTER, never one per member. */
+unsigned long rpc_node_cluster_builds(void);
 
 /* Hand the RPC layer the persistent address book (daemon/addrbook.c v2), so
  * getnodeaddresses/getaddrmaninfo report real recorded peers. Injected as
@@ -557,6 +572,10 @@ void rpc_node_set_addednodes(const char (*list)[64], int n);
  * behind getzmqnotifications. Injected like the added-node list above. */
 void rpc_node_set_zmq(const char* hashblock, const char* hashtx,
                       const char* rawblock, const char* rawtx);
+/* The configured -zmqpub<topic>hwm values, in the same four-topic order
+ * (node_config's g_cfg.zmq_hwm, a long-lived global: BORROWED). NULL reports
+ * Core's default, 1000. */
+void rpc_node_set_zmq_hwm(const int* hwm4);
 
 /* 1 if `method` is a live-node method this module serves. */
 int rpc_node_known_method(const char* method);

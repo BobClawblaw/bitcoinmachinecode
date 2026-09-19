@@ -55,6 +55,57 @@ An inventory taken after the 09-09 leg and compact-block work, extended the same
 
 ---
 
+## ZMQ publishing: ~~a slow subscriber is disconnected~~ FIXED 2026-09-19 (MEM-22); one byte ceiling remains
+
+**What was wrong.** The publisher (`asm/daemon/zmq_pub.c`) had no queue. Each
+subscriber's kernel send buffer was sized to `hwm x 256` bytes (~256 KB at the
+default hwm of 1000), the three frames were written with non-blocking `send`,
+and a subscriber that could not take the whole message was **closed**. A
+rawblock is 1-2 MB, so it hit `EAGAIN` mid-message every time: **rawblock was
+never delivered to anyone, and every block disconnected every subscriber on
+its endpoint.** Production, 2026-09-19 01:07Z: a pyzmq (libzmq 4.3.5)
+subscriber got 3,180 hashtx, 3,178 rawtx, 2 hashblock and **zero rawblock**
+over two blocks, with 4 per-topic sequence gaps from the reconnects; the log
+said `subscriber could not take a rawblock message; dropping it`. The audit
+had recorded the disconnect as a known divergence (MEM-22); what it missed is
+that for rawblock it was not an edge case but the only outcome.
+
+**What Core does** (libzmq PUB, `src/zmq/zmqpublishnotifier.cpp`): one socket
+per address, `ZMQ_SNDHWM` = `-zmqpub<topic>hwm` (default 1000) set by the
+notifier that creates the socket. SNDHWM counts **messages** per subscriber
+pipe. When a pipe is full, PUB silently discards the new message for that
+subscriber and keeps the connection; the per-topic sequence number shows the
+gap. `0` means no limit.
+
+**What this node does now.** The same thing, in the same unit. Each
+subscriber has a user-space queue of whole messages, at most hwm of them; the
+publish call frames the message once into a refcounted buffer shared by every
+queue that takes it and never touches a socket (measured: 0.3-0.7 ms for a
+hashblock + 2 MB rawblock publish, with a stalled subscriber attached). The
+servicing thread writes each queue as its socket drains. A full queue drops
+the new message for that subscriber only, and the connection stays. The hwm
+that governs a shared endpoint is the first configured topic's in Core's
+factory order (hashblock, hashtx, rawblock, rawtx), as Core's socket reuse
+gives. `getzmqnotifications` reports each topic's configured `hwm` (it
+reported `0` while there was no queue).
+
+**The divergence that remains, deliberately:** a **512 MiB per-subscriber
+byte ceiling** on top of the message count. Core's worst case is 1000
+rawblocks — up to 4 GB — held for each subscriber that has stopped reading;
+this box has been OOM-killed before, and the download worker that owns the
+publisher is not where that memory should go. 512 MiB is ~250 full blocks,
+more than a day of blocks at the tip, so it binds only during a catch-up
+burst to a subscriber that is not reading. Past it, new messages are dropped
+exactly as at the hwm (gap, connection kept), and a message into an empty
+queue is always accepted so none is undeliverable. With `hwm=0` the ceiling
+is the only limit, where Core would have none.
+
+Tests: `asm/tests/test_zmq_queue.c` (in the gate) and
+`asm/tests/zmq_queue_interop.py` against real libzmq (manual; against the old
+publisher it reproduces production: 0 rawblock, a disconnect per block).
+
+---
+
 ## `getrawaddrman`: `source` and `source_network` are omitted
 
 Found 2026-09-16 by diffing the 26 served methods the parity harness never

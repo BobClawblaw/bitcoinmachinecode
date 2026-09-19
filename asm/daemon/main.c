@@ -39,6 +39,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/file.h>          /* DMN-1: flock() for the datadir lock */
+#include <sys/syscall.h>       /* kcmp: which processes share our datadir lock */
 #include "secure_zero.h"    /* WAL-3: a memset the optimiser may not delete */
 #include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
 #include "peer_timeout.h"      /* CC-7: -peertimeout, the handshake deadline */
@@ -2147,6 +2148,183 @@ static void handle_shutdown_signal(int sig){
     if (g_in_utxo_reload) _exit(0);
 }
 
+/* ==== the datadir lock outlives the parent ================================
+ * (2026-09-19) The lock is a flock on <datadir>/<chain>/.lock (DMN-1, see
+ * datadir_lock_acquire). flock belongs to the OPEN FILE DESCRIPTION, and
+ * every fork shares it: the download worker, the inbound serve children, and
+ * everything THEY fork (the coinstats fold worker, the compaction child, the
+ * pass helpers, the exec'd index builders) all hold the same lock. It is
+ * released when the LAST of them closes it.
+ *
+ * The serve parent used to forward SIGTERM to the worker and _exit(0) on the
+ * spot, so "the main pid exited" never meant "the datadir is free": the
+ * worker was typically still flushing (fee estimates, the UTXO checkpoint,
+ * the fold worker's last commit). Anything that restarts on the main pid --
+ * `kill <pid>; relaunch`, a supervisor, KillMode=mixed/process, the bench
+ * and gate harnesses -- then met "cannot obtain a lock" (tests/
+ * test_stop_waits_for_worker reproduces it: lock held at the parent's exit
+ * every time). Now the parent is the last to leave: it signals its own
+ * children, and exits only when no other process holds its lock.
+ *
+ * "Holds its lock" is decided per process from /proc/<pid>/fd: an fd on the
+ * .lock inode that is the SAME open file description as ours (kcmp
+ * KCMP_FILE). The kcmp matters: a NEW instance that has opened .lock and is
+ * waiting for it (datadir_lock_acquire) holds a different description, and
+ * must not be mistaken for one of ours. Where kcmp is unavailable the inode
+ * alone decides (conservative: we wait for it too, bounded). */
+#ifndef KCMP_FILE
+#define KCMP_FILE 0
+#endif
+static int datadir_lock_fd;              /* defined (= -1) with datadir_lock_acquire below */
+#define LOCK_HOLDERS_MAX 64
+typedef struct { int pid; char comm[20]; } lock_holder_t;
+static void proc_comm(int pid, char* out, size_t cap){
+    char p[64]; snprintf(p, sizeof p, "/proc/%d/comm", pid);
+    int fd = open(p, O_RDONLY); ssize_t n = fd >= 0 ? read(fd, out, cap - 1) : -1;
+    if (fd >= 0) close(fd);
+    if (n <= 0){ snprintf(out, cap, "?"); return; }
+    out[n] = 0; if (n > 0 && out[n-1] == '\n') out[n-1] = 0;
+}
+/* Processes other than this one with an fd on the file `lockfd` is open on;
+ * with match_ofd, only those whose fd is the SAME open file description as
+ * lockfd. Returns the count (the first `cap` are described in out[]).
+ *
+ * Candidates are picked by the fd's link TEXT (readlink never touches the
+ * file system, so a process with an fd on a hung mount cannot stall a
+ * shutdown here) and only then confirmed by stat and kcmp. */
+static int lock_holders_scan(int lockfd, int match_ofd, lock_holder_t* out, int cap){
+    int n = 0, self = (int)getpid();
+    char want[4096], lp[64]; struct stat ls;
+    snprintf(lp, sizeof lp, "/proc/self/fd/%d", lockfd);
+    ssize_t wl = readlink(lp, want, sizeof want - 1);
+    if (wl <= 0 || fstat(lockfd, &ls) != 0) return 0;
+    want[wl] = 0;
+    DIR* pd = opendir("/proc"); if (!pd) return 0;
+    struct dirent* e;
+    while ((e = readdir(pd))){
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        int pid = atoi(e->d_name); if (pid == self) continue;
+        char fdp[64]; snprintf(fdp, sizeof fdp, "/proc/%d/fd", pid);
+        DIR* fdd = opendir(fdp); if (!fdd) continue;      /* not ours to read, or gone */
+        struct dirent* f; int hit = 0;
+        while (!hit && (f = readdir(fdd))){
+            if (f->d_name[0] < '0' || f->d_name[0] > '9') continue;
+            char link[4096]; ssize_t ll = readlinkat(dirfd(fdd), f->d_name, link, sizeof link - 1);
+            if (ll != wl || memcmp(link, want, (size_t)wl) != 0) continue;
+            struct stat s;
+            if (fstatat(dirfd(fdd), f->d_name, &s, 0) != 0) continue;
+            if (s.st_dev != ls.st_dev || s.st_ino != ls.st_ino) continue;
+            if (match_ofd){
+                long r = syscall(SYS_kcmp, (pid_t)self, (pid_t)pid, KCMP_FILE, (unsigned long)lockfd, strtoul(f->d_name, 0, 10));
+                if (r > 0) continue;                         /* another description of the same file */
+            }
+            hit = 1;
+        }
+        closedir(fdd);
+        if (!hit) continue;
+        if (n < cap){ out[n].pid = pid; proc_comm(pid, out[n].comm, sizeof out[n].comm); }
+        n++;
+    }
+    closedir(pd);
+    return n;
+}
+static void lock_holders_fmt(const lock_holder_t* h, int n, char* buf, size_t cap){
+    size_t o = 0; buf[0] = 0;
+    for (int i = 0; i < n && i < LOCK_HOLDERS_MAX && o + 48 < cap; i++)
+        o += (size_t)snprintf(buf + o, cap - o, "%s%d (%s)", i ? ", " : "", h[i].pid, h[i].comm);
+    if (n > LOCK_HOLDERS_MAX && o + 16 < cap) snprintf(buf + o, cap - o, ", +%d more", n - LOCK_HOLDERS_MAX);
+}
+static long long mono_now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000LL + t.tv_nsec/1000000; }
+
+/* Wait until no other process holds this process's datadir lock, so that
+ * our exit releases it. The children were signalled by the caller; each is
+ * expected to stop its own children. What is left holding the lock after the
+ * download WORKER has exited has lost its owner, and gets SIGTERM from here.
+ *
+ * Bounded, deliberately with escalation: after max_s seconds every remaining
+ * holder is named by pid and name and SIGKILLed. Leaving it would not be
+ * safer -- it keeps the lock, so the next instance cannot start, and under
+ * systemd TimeoutStopSec would SIGKILL the whole unit a little later
+ * anyway, without saying who was stuck. Everything the worker writes is
+ * crash-safe by design (the WAL is the truth; an unlanded checkpoint rolls
+ * back at boot), so a kill costs a replay, never a corrupt datadir. max_s is
+ * kept below the production unit's TimeoutStopSec (900 s) for that reason:
+ * the log line naming the stuck process has to be written before systemd's
+ * own kill. Returns the number of holders left at the end (0 = released). */
+#define SHUTDOWN_LOCK_WAIT_S 600
+static int shutdown_wait_lock_released(int max_s, const char* who){
+    if (datadir_lock_fd < 0) return 0;
+    long long t0 = mono_now_ms(), next_log = t0 + 10000, killed_at = 0;
+    int orphans_termed = 0, worker_logged = 0;
+    lock_holder_t h[LOCK_HOLDERS_MAX]; char desc[2048];
+    for (int last = 0;; ){
+        int st; pid_t p;
+        while ((p = waitpid(-1, &st, WNOHANG)) > 0)
+            if (g_dl_worker_pid > 0 && p == g_dl_worker_pid){ g_dl_worker_exited = 1; g_dl_worker_status = st; }
+        if (g_dl_worker_pid > 0 && g_dl_worker_exited && !worker_logged){
+            int ws = (int)g_dl_worker_status; worker_logged = 1;
+            if (WIFSIGNALED(ws)) fprintf(stderr, "[%s] download worker pid %d ended on signal %d (%.1fs)\n", who, (int)g_dl_worker_pid, WTERMSIG(ws), (mono_now_ms() - t0) / 1000.0);
+            else fprintf(stderr, "[%s] download worker pid %d exited with status %d (%.1fs)\n", who, (int)g_dl_worker_pid, WEXITSTATUS(ws), (mono_now_ms() - t0) / 1000.0);
+        }
+        if (last){
+            fprintf(stderr, "[%s] datadir lock held by no other process (waited %.1fs) -- exiting releases it\n", who, (mono_now_ms() - t0) / 1000.0);
+            return 0;
+        }
+        int n = lock_holders_scan(datadir_lock_fd, 1, h, LOCK_HOLDERS_MAX);
+        long long now = mono_now_ms();
+        if (n == 0){ last = 1; continue; }             /* one more pass reaps (and reports) a worker that just left */
+        lock_holders_fmt(h, n, desc, sizeof desc);
+        if ((g_dl_worker_pid <= 0 || g_dl_worker_exited) && !orphans_termed){
+            orphans_termed = 1;
+            fprintf(stderr, "[%s] %d process(es) still hold the datadir lock with the download worker gone: %s -- SIGTERM\n", who, n, desc);
+            for (int i = 0; i < n && i < LOCK_HOLDERS_MAX; i++) kill(h[i].pid, SIGTERM);
+        }
+        if (!killed_at && now - t0 >= (long long)max_s * 1000){
+            fprintf(stderr, "[%s] WARNING: %d process(es) still hold the datadir lock after %ds: %s -- SIGKILL "
+                            "(each would keep the next start from locking the datadir)\n", who, n, max_s, desc);
+            for (int i = 0; i < n && i < LOCK_HOLDERS_MAX; i++) kill(h[i].pid, SIGKILL);
+            killed_at = now;
+        } else if (killed_at && now - killed_at >= 10000){
+            fprintf(stderr, "[%s] ERROR: the datadir lock is STILL held 10s after SIGKILL: %s -- exiting anyway; "
+                            "the next start is refused until they are gone\n", who, desc);
+            return n;
+        } else if (now >= next_log){
+            fprintf(stderr, "[%s] waiting for %d process(es) holding the datadir lock (%.0fs): %s\n", who, n, (now - t0) / 1000.0, desc);
+            next_log = now + 10000;
+        }
+        usleep(now - t0 < 2000 ? 20000 : 200000);
+    }
+}
+/* <datadir>/<chain>/.stopping: this instance's pid while it waits above, so
+ * a start that finds the lock held can tell "the previous instance is
+ * finishing its stop" (wait, bounded) from "another instance is running"
+ * (refuse at once, as Core does). Removed just before the exit. */
+#define STOPPING_MARKER ".stopping"
+static void stopping_marker_write(void){
+    int fd = open(STOPPING_MARKER ".tmp", O_WRONLY|O_CREAT|O_TRUNC, 0600); if (fd < 0) return;
+    char b[32]; int n = snprintf(b, sizeof b, "%d\n", (int)getpid());
+    ssize_t w = write(fd, b, (size_t)n); close(fd);
+    if (w == n) rename(STOPPING_MARKER ".tmp", STOPPING_MARKER); else unlink(STOPPING_MARKER ".tmp");
+}
+/* The parent's last act, on every exit path that runs after the worker fork:
+ * signal the inbound serve children (the worker was signalled by the caller;
+ * a SIGTERM to a serve child is deferred past any mempool critical section
+ * by mp_lock), wait for the lock, then leave. */
+static int is_my_child(int pid){            /* a tracked pid may have been reused since */
+    char p[64], b[512]; snprintf(p, sizeof p, "/proc/%d/stat", pid);
+    int fd = open(p, O_RDONLY); if (fd < 0) return 0;
+    ssize_t n = read(fd, b, sizeof b - 1); close(fd); if (n <= 0) return 0;
+    b[n] = 0; char* rp = strrchr(b, ')'); int ppid = -1;   /* comm may contain spaces: parse after the last ')' */
+    if (!rp || sscanf(rp + 1, " %*c %d", &ppid) != 1) return 0;
+    return ppid == (int)getpid();
+}
+static void parent_stop_and_wait(int max_s){
+    for (int i = 0; i < upl_n; i++) if (upl_pid[i] > 0 && is_my_child(upl_pid[i])) kill(upl_pid[i], SIGTERM);
+    stopping_marker_write();
+    shutdown_wait_lock_released(max_s, "serve");
+    unlink(STOPPING_MARKER);
+}
+
 /* Connect + handshake one outbound seed, returning a long-lived fd (or -1).
  * The handshake reads the seed's version/verack plus its post-verack chatter
  * (sendheaders/sendaddrv2/feefilter/addr), which can take longer than the
@@ -2830,6 +3008,29 @@ static void on_tsp_run(long to, void* ctx){ (void)ctx; tsp_runs_advanced(to); ir
  * point below runs in every phase (it is where the filter index, the txid
  * tail and the address journal are fed), so the tick belongs there, with the
  * heartbeat calling the same function once the node is at the tip. */
+/* Configure the trailing builders from the keys: the builders live beside
+ * this executable (bmc_build_tx_index, bmc_build_txospender_index,
+ * bmc_build_addr_hist, and bmc_merge_index_runs to merge their runs). */
+static void dl_index_trail_configure(const char* dir){
+    char exe[512]; ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n > 0){ exe[n] = 0; char* sl = strrchr(exe, '/'); if (sl) *sl = 0; }
+    char bb[600], mm[600];
+    snprintf(mm, sizeof mm, "%s/bmc_merge_index_runs", n > 0 ? exe : ".");
+    /* 2026-09-16: the address history builds itself DURING the sync as runs
+     * (build_addr_hist's run mode reads blocks + undo), like the txid index;
+     * the post-IBD repair supervisor is gone */
+    snprintf(bb, sizeof bb, "%s/bmc_build_addr_hist", n > 0 ? exe : ".");
+    it_configure(&g_it_ah, "addr_hist", bb, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.addrindex);
+    /* runs of indexrunblocks heights, kept 144 below the applied height (the
+     * undo window: a reorg deeper than that is already the node's general
+     * limit), merged at 6 runs */
+    snprintf(bb, sizeof bb, "%s/bmc_build_tx_index", n > 0 ? exe : ".");
+    it_configure(&g_it_txi, "txindex", bb, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.txindex);
+    snprintf(bb, sizeof bb, "%s/bmc_build_txospender_index", n > 0 ? exe : ".");
+    it_configure(&g_it_tsp, "txospender", bb, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.txospenderindex);
+    irs_init(&g_rs_txi, "txindex", "BMCTXIDX", 20, 16);
+    irs_init(&g_rs_tsp, "txospender", "BMCTXOSP", 28, 24);
+}
 static void dl_index_trail_tick(long applied){
     static long long last;
     long long now = (long long)time(NULL);
@@ -4637,8 +4838,10 @@ static int peer_slot_of_fd(int fd){
  * node without a rate limit still has to answer that. The pacing half stays
  * conditional on ul_gate_configure having been given a rate. Counted WITH
  * the 24-byte header, as Core counts them. */
+static int dl_wire_note(int fd, int recv, const char* cmd, unsigned cmdlen, unsigned plen);
 static void p2p_upload_pace(int fd, unsigned plen, const char* cmd, unsigned cmdlen){
     ul_gate_account((long)plen);
+    if (dl_wire_note(fd, 0, cmd, cmdlen, plen)) return;   /* the downloader's own sockets (2026-09-19) */
     if (g_node_status){
         int s = peer_slot_of_fd(fd);
         if (s >= 0) g_node_status->peers[s].sent_per_msg[rpc_msg_index(cmd, cmdlen)] += (long long)plen + 24;
@@ -5200,7 +5403,80 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
                   * the pipe is active and idle at the same time. */
                  long long wait_ms, wall_ms;
                  char addrlocal[72];       /* 2026-09-18, for getpeerinfo: our address as this peer saw it */
+                 /* 2026-09-19, for getpeerinfo bytessent/bytesrecv and their
+                  * per-message maps: the WIRE bytes of the connection this
+                  * worker holds now, written by the worker's own p2p hooks
+                  * (dl_wire_note) and copied out by the parent every pass. The
+                  * published bytes_sent was a hard-coded 0, and bytes_peer is
+                  * the process's rchar, which also counts its file reads. */
+                 long long wire_sent, wire_recv;
+                 long long sent_pm[RPC_MSG_N], recv_pm[RPC_MSG_N];
                } dlc_stat_t;
+/* ---- the downloader's wire accounting (2026-09-19) ------------------------
+ * getnettotals.totalbytessent and every download worker's getpeerinfo
+ * bytessent were 0 for the whole of an IBD: the relay legs are counted from
+ * TCP_INFO in the process that holds them, and nothing counted the sockets
+ * the downloader opens -- the header phase, the helpers' getdata for every
+ * block. Run 27 pulled ~73 GB and reported ~0 sent.
+ *
+ * Counted where the bytes cross: p2p_write's hook (the upload pacer's) and
+ * p2p_read's (installed for the downloader's scope), both in every process
+ * the download runs in. Core's accounting: each message counts its full wire
+ * size, the 24-byte header included, into the peer's total and its
+ * per-message map (net.cpp AccountForSentBytes / mapRecvBytesPerMsgType).
+ * The downloader dials v1 only (node_handshake), so plen + 24 IS the wire.
+ *
+ * Totals go to node_status_t.dl_wire_sent / dl_wire_recv, atomically --
+ * several helpers add at once -- and never reset, as Core's never do. The
+ * per-connection figures go to the worker's own stats slot. A connection
+ * still handshaking counts into a private pending set first: the parent
+ * keeps publishing the previous peer until the handshake succeeds, and those
+ * bytes are the NEW peer's. */
+static int g_dl_wire_scope = 0;                    /* 1 inside dl_catchup; forked helpers inherit it */
+static volatile dlc_stat_t* g_dlc_me = NULL;       /* a helper's own stats slot; NULL in the parent */
+static int g_dlc_conn_fd = -1;                     /* the connection g_dlc_me publishes */
+static long long g_dlc_pend_sent, g_dlc_pend_recv, g_dlc_pend_spm[RPC_MSG_N], g_dlc_pend_rpm[RPC_MSG_N];
+/* The BOOT catch-up (bmc.bootcatchup=1, the default) runs before main()
+ * creates the shared status table, so its bytes go to this pair instead --
+ * MAP_SHARED, for the helpers it forks -- and main() folds them into the
+ * table when it creates it. [0] sent, [1] received. */
+static volatile long long* g_dl_wire_boot = NULL;
+static int peer_slot_of_fd(int fd);
+static int dl_wire_note(int fd, int recv, const char* cmd, unsigned cmdlen, unsigned plen){
+    if(!g_dl_wire_scope) return 0;
+    volatile long long* tot = g_node_status ? (recv ? &g_node_status->dl_wire_recv : &g_node_status->dl_wire_sent)
+                            : g_dl_wire_boot ? &g_dl_wire_boot[recv ? 1 : 0] : NULL;
+    if(!tot) return 0;
+    if(!g_dlc_me && peer_slot_of_fd(fd) >= 0) return 0;     /* a relay leg in the parent: TCP_INFO counts those */
+    long long n = (long long)plen + 24;
+    int mi = rpc_msg_index(cmd, cmdlen);
+    __sync_fetch_and_add((long long*)tot, n);
+    if(g_dlc_me){
+        if(fd == g_dlc_conn_fd){
+            if(recv){ g_dlc_me->wire_recv += n; g_dlc_me->recv_pm[mi] += n; }
+            else    { g_dlc_me->wire_sent += n; g_dlc_me->sent_pm[mi] += n; }
+        } else {
+            if(recv){ g_dlc_pend_recv += n; g_dlc_pend_rpm[mi] += n; }
+            else    { g_dlc_pend_sent += n; g_dlc_pend_spm[mi] += n; }
+        }
+    }
+    return 1;
+}
+/* p2p_read's hook for the download's scope (installed by dl_catchup) */
+static void dl_read_note(int fd, const char* cmd, unsigned plen){ (void)dl_wire_note(fd, 1, cmd, 12, plen); }
+/* a helper dialled a new peer: nothing is published for it until it hands */
+static void dlc_wire_dial(void){
+    g_dlc_conn_fd = -1;
+    g_dlc_pend_sent = g_dlc_pend_recv = 0;
+    memset(g_dlc_pend_spm, 0, sizeof g_dlc_pend_spm); memset(g_dlc_pend_rpm, 0, sizeof g_dlc_pend_rpm);
+}
+/* ...and the handshake succeeded: the slot now describes THIS connection */
+static void dlc_wire_adopt(int fd){
+    if(!g_dlc_me) return;
+    g_dlc_me->wire_sent = g_dlc_pend_sent; g_dlc_me->wire_recv = g_dlc_pend_recv;
+    for(int i = 0; i < RPC_MSG_N; i++){ g_dlc_me->sent_pm[i] = g_dlc_pend_spm[i]; g_dlc_me->recv_pm[i] = g_dlc_pend_rpm[i]; }
+    g_dlc_conn_fd = fd;
+}
 static long long dlc_now_ms(void); static long dlc_proc_rchar(pid_t pid);   /* fwd decls: the worker judges its own chunk before these are defined */
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
 static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
@@ -5219,6 +5495,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
      * flag either way, so an early/idle delivery is harmless -- the next
      * guarded call resets the flag before it matters. */
     { struct sigaction sa0; memset(&sa0,0,sizeof sa0); sa0.sa_handler=mux_budget_alarm; sigemptyset(&sa0.sa_mask); sigaction(SIGUSR1,&sa0,NULL); }
+    g_dlc_me = mystat; dlc_wire_dial();   /* this process's p2p bytes are its peer's (dl_wire_note) */
     int lfd=open("append.lock", O_RDWR|O_CREAT, 0644);
     if(lfd<0){ fprintf(stderr,"[dlc w%d] no lock\n",w); return 1; }
     static unsigned char st[4096]; store_init(st);
@@ -5345,6 +5622,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                     dial_gate_wait();
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)cp2));
                     if(fdc<0){ if(ema[idx]<=0.0) ema[idx]=1.0; claimed[idx]=0; continue; }   /* tried, unreachable: the picker must not offer it as untried again */
+                    dlc_wire_dial();                  /* the handshake's bytes belong to this connection, published once it succeeds */
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
                     /* 2026-09-06: a getdata is small and is the ONLY thing
                      * standing between this worker and the peer's reply, so
@@ -5356,6 +5634,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                     { int one=1; setsockopt(fdc,IPPROTO_TCP,TCP_NODELAY,&one,sizeof one); }
                     if(node_handshake(fdc)==1 && peer_has_witness(cand)){
                         fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
+                        dlc_wire_adopt(fdc);    /* getpeerinfo's bytes are this connection's, handshake included */
                         mystat->held_idx=idx;   /* so the parent can ban THIS peer on early-kill */
                         strncpy((char*)mystat->peer,cand,63);
                         { rpc_peer_t v; memset(&v,0,sizeof v); rpc_peer_from_version(&v, g_peer_version_payload, g_peer_version_len);   /* for getpeerinfo */
@@ -6030,7 +6309,13 @@ static void dl_publish_peer_table(void* store_buf, int with_tip){
                     /* byte fields only if the kernel returned a struct large
                      * enough to include them */
                     if(tl >= (socklen_t)((char*)(&ti.bytes_received + 1) - (char*)&ti)){
-                        pr->bytes_sent = (long long)ti.bytes_acked;
+                        /* bytes_acked advances with snd_una, and the peer's
+                         * ACK of our SYN moves it by one sequence number that
+                         * carried no data: measured against Core on regtest
+                         * (2026-09-19) a leg read 679 where Core had received
+                         * 678. bytes_received has no such step (the peer's
+                         * SYN sets rcv_nxt directly) and matched exactly. */
+                        pr->bytes_sent = ti.bytes_acked > 0 ? (long long)ti.bytes_acked - 1 : 0;
                         pr->bytes_recv = (long long)ti.bytes_received;
                     }
                     if(tl >= (socklen_t)((char*)(&ti.last_data_recv + 1) - (char*)&ti)){
@@ -6143,7 +6428,56 @@ static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t
 static void dlc_publish_applied(volatile long* ctl){
     ctl[DLC_CTL_APPLIED] = g_utxo_live_on ? utxo_live_applied_height() + 1 : -1;
 }
+/* publish the workers' peers for getpeerinfo (2026-09-08). Every PASS of the
+ * parent's loop since 2026-09-19, not only the 10 s status tick: the byte
+ * counters move continuously, and a download shorter than one tick (a
+ * handoff, a regtest sync) never appeared at all. */
+static void dlc_publish_dlpeers(volatile dlc_stat_t* stats, const pid_t* kids, int nw){
+    if(!g_node_status) return;
+    int nd = nw > 64 ? 64 : nw;
+    for(int w=0; w<nd; w++){
+        rpc_peer_t* d = &g_node_status->dlpeers[w];
+        if(kids[w]==0 || !stats[w].peer[0]){ d->used = 0; continue; }
+        strncpy(d->addr, (const char*)stats[w].peer, sizeof d->addr - 1); d->addr[sizeof d->addr - 1] = 0;
+        d->proto = stats[w].proto; d->services = stats[w].services; d->start_height = stats[w].start_height;
+        memcpy(d->subver, (const char*)stats[w].subver, sizeof d->subver); d->subver[sizeof d->subver - 1] = 0;
+        memcpy((char*)d->addrlocal, (const char*)stats[w].addrlocal, sizeof d->addrlocal); d->addrlocal[sizeof d->addrlocal - 1] = 0;
+        /* the connection's wire bytes, counted by the worker's own p2p hooks
+         * (dl_wire_note); bytes_sent was a hard-coded 0 until 2026-09-19 */
+        d->conn_time = stats[w].conn_time; d->bytes_recv = stats[w].wire_recv; d->bytes_sent = stats[w].wire_sent;
+        for(int i = 0; i < RPC_MSG_N; i++){ d->sent_per_msg[i] = stats[w].sent_pm[i]; d->recv_per_msg[i] = stats[w].recv_pm[i]; }
+        d->last_recv = d->last_send = (long long)time(NULL);
+        d->inflight_lo = stats[w].cur_lo; d->inflight_hi = stats[w].cur_hi; d->dl_worker = w; d->inbound = 0;
+        d->idle_pct = stats[w].wall_ms > 0
+            ? (int)((stats[w].wait_ms * 100) / stats[w].wall_ms) : -1;
+        d->bps_recv = (long long)stats[w].last_bw_bps;   /* 2026-09-10: for bmcgetdownloadinfo */
+        d->used = 1;
+    }
+    g_node_status->n_dlpeers = nd;
+}
+static long dl_catchup_run(const char* dir, int min_workers);
+/* The download's scope for the wire accounting: the receive hook is this
+ * scope's alone (a relay leg's receive side is counted where its command is
+ * parsed), and the send hook is the node-wide one main() installs -- put in
+ * place here too when nothing has, as in a test driving this directly. */
 static long dl_catchup(const char* dir, int min_workers){
+    extern void (*g_p2p_write_hook)(int fd, unsigned plen, const char* cmd, unsigned cmdlen);
+    extern void (*g_p2p_read_hook)(int fd, const char* cmd, unsigned plen);
+    void (*prev_w)(int, unsigned, const char*, unsigned) = g_p2p_write_hook;
+    void (*prev_r)(int, const char*, unsigned) = g_p2p_read_hook;
+    if(!g_p2p_write_hook) g_p2p_write_hook = p2p_upload_pace;
+    g_p2p_read_hook = dl_read_note;
+    if(!g_node_status && !g_dl_wire_boot){           /* the boot catch-up: no status table yet */
+        void* m = mmap(NULL, 2 * sizeof(long long), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+        if(m != MAP_FAILED) g_dl_wire_boot = (volatile long long*)m;
+    }
+    g_dl_wire_scope = 1;
+    long r = dl_catchup_run(dir, min_workers);
+    g_dl_wire_scope = 0;
+    g_p2p_read_hook = prev_r; g_p2p_write_hook = prev_w;
+    return r;
+}
+static long dl_catchup_run(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
     ab2_t* ab = addr_book();
     if(!ab){ fprintf(stderr,"[dlc] address book unavailable\n"); return 0; }
@@ -6413,6 +6747,7 @@ static long dl_catchup(const char* dir, int min_workers){
         dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms(), live, nlive, banned);   /* Core's rule, every pass (2026-09-10) */
         legs_sweep_except(-1);                                                            /* row 3: the legs stay served through a handoff */
         dl_publish_peer_table(store_buf, 0);   /* legs only: the tip is this loop's own business */
+        dlc_publish_dlpeers(stats, kids, nw);  /* the helpers' peers and their bytes, every pass (2026-09-19) */
         if(interleave && dlc_now_ms() >= connect_retry_ms){
             /* (store_reload is the bounded call's first act, so it sees the
              * helpers' appends; a second one here would be redundant.) */
@@ -6550,23 +6885,7 @@ static long dl_catchup(const char* dir, int min_workers){
         next_claim[DLC_CTL_FREE_PEERS] = free_peers;
         /* publish the workers' peers for getpeerinfo / getnettotals (2026-09-08) */
         if(g_node_status){
-            int nd = nw > 64 ? 64 : nw;
-            for(int w=0; w<nd; w++){
-                rpc_peer_t* d = &g_node_status->dlpeers[w];
-                if(kids[w]==0 || !stats[w].peer[0]){ d->used = 0; continue; }
-                strncpy(d->addr, (const char*)stats[w].peer, sizeof d->addr - 1); d->addr[sizeof d->addr - 1] = 0;
-                d->proto = stats[w].proto; d->services = stats[w].services; d->start_height = stats[w].start_height;
-                memcpy(d->subver, (const char*)stats[w].subver, sizeof d->subver); d->subver[sizeof d->subver - 1] = 0;
-                memcpy((char*)d->addrlocal, (const char*)stats[w].addrlocal, sizeof d->addrlocal); d->addrlocal[sizeof d->addrlocal - 1] = 0;
-                d->conn_time = stats[w].conn_time; d->bytes_recv = stats[w].bytes_peer; d->bytes_sent = 0;
-                d->last_recv = d->last_send = (long long)time(NULL);
-                d->inflight_lo = stats[w].cur_lo; d->inflight_hi = stats[w].cur_hi; d->dl_worker = w; d->inbound = 0;
-                d->idle_pct = stats[w].wall_ms > 0
-                    ? (int)((stats[w].wait_ms * 100) / stats[w].wall_ms) : -1;
-                d->bps_recv = (long long)stats[w].last_bw_bps;   /* 2026-09-10: for bmcgetdownloadinfo */
-                d->used = 1;
-            }
-            g_node_status->n_dlpeers = nd;
+            dlc_publish_dlpeers(stats, kids, nw);
             g_node_status->dl_bytes_total = (long long)cumulative_bytes;
             /* the aggregate state bmcgetdownloadinfo serves (2026-09-10) */
             g_node_status->dl_active          = 1;
@@ -7342,6 +7661,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     /* ZMQ publisher binds HERE, in the worker, because a PUB socket's
      * subscriber fds are per-process and only this process can write to them.
      * Binding is non-fatal: a busy port must not stop the node syncing. */
+    /* the per-topic high-water marks (messages per subscriber queue) before
+     * the first subscriber can connect, not after the archive reload */
+    { extern void zmq_pub_set_hwm(const int*); zmq_pub_set_hwm(g_cfg.zmq_hwm); }
     if (g_cfg.zmq_hashblock[0]) zmqpub_add("hashblock", g_cfg.zmq_hashblock);
     if (g_cfg.zmq_hashtx[0])    zmqpub_add("hashtx",    g_cfg.zmq_hashtx);
     if (g_cfg.zmq_rawblock[0])  zmqpub_add("rawblock",  g_cfg.zmq_rawblock);
@@ -7434,7 +7756,6 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
        * means this node must not learn or announce its clearnet address at
        * all: that address is exactly what running behind Tor hides. */
       { extern void txrelay_set_status(void*); txrelay_set_status(g_node_status); }
-      { extern void zmq_pub_set_hwm(const int*); zmq_pub_set_hwm(g_cfg.zmq_hwm); }
       int may = g_cfg.listen && dialer_may_announce_clearnet();
       addrself_init((unsigned short)g_cfg.port, may);
       /* -externalip: the operator naming the reachable address directly */
@@ -7486,9 +7807,19 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * offline base build (or the previous run's tail) and the current tip.
      * After the archive verify -- a repair may have truncated heights the
      * tail would otherwise trust. No base index => logs once and disables. */
-    if(archive_ok) txit_boot(store_buf);
+    /* 2026-09-19: each ONLY when its key asks for it, as Core builds an index
+     * only under its option. Both used to boot on every node: run 27, with
+     * txindex/coinstatsindex/blockfilterindex set and txospenderindex
+     * absent (default 0), kept a txo-spender tail to ~600k and getindexinfo
+     * listed it. A tail that is never booted appends nothing (its fd stays
+     * -1: txit_on_block/tsp_on_block, the truncate and run-advance hooks all
+     * return at once), creates no file, and the trailing builder is
+     * configured disabled below. */
+    if(archive_ok && g_cfg.txindex) txit_boot(store_buf);
+    else if(archive_ok) fprintf(stderr, "[txindex] txindex=0 -- not maintaining the txid index\n");
     /* txo-spender index tail (Core -txospenderindex): same shape, same rules */
-    if(archive_ok) tsp_boot(store_buf);
+    if(archive_ok && g_cfg.txospenderindex) tsp_boot(store_buf);
+    else if(archive_ok) fprintf(stderr, "[txospender] txospenderindex=0 -- not maintaining the txo-spender index\n");
     /* the live address index (EXTENSION) boots AFTER the UTXO engine below:
      * its backfill replays undo, which exists only for applied blocks */
 
@@ -7557,6 +7888,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * operator who does not want the write amplification had no way to
          * say so; now they do, and getindexinfo stops advertising an index
          * that is deliberately off. */
+        /* the trailing index builders (2026-09-16), each enabled by its own
+         * key. They were configured INSIDE the coinstatsindex branch below,
+         * so coinstatsindex=0 silently left txindex, txospenderindex and the
+         * address history with no builder at all (2026-09-19). */
+        dl_index_trail_configure(dir);
         if (!g_cfg.coinstatsindex)
             fprintf(stderr,"[dl] coinstatsindex=0 -- not maintaining the coin statistics index\n");
         else {
@@ -7587,25 +7923,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               char exe[512], builder[600]; ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
               if (n > 0){ exe[n] = 0; char* sl = strrchr(exe, '/'); if (sl) *sl = 0; snprintf(builder, sizeof builder, "%s/bmc_build_coinstats_hist", exe); }
               else snprintf(builder, sizeof builder, "bmc_build_coinstats_hist");
-              csi_hist_repair_configure(builder, dir, g_chainp->name, g_cfg.coinstatshist_workers, g_cfg.coinstatshist_repair);
-              /* 2026-09-16: the address history builds itself DURING the sync
-               * as runs (build_addr_hist's run mode reads blocks + undo), like
-               * the txid index below; the post-IBD repair supervisor is gone */
-              { char b2[600], mm[600];
-                snprintf(mm, sizeof mm, "%s/bmc_merge_index_runs", n > 0 ? exe : ".");
-                snprintf(b2, sizeof b2, "%s/bmc_build_addr_hist", n > 0 ? exe : ".");
-                it_configure(&g_it_ah, "addr_hist", b2, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.addrindex); }
-              /* the trailing builders: runs of indexrunblocks heights, kept 144
-               * below the applied height (the undo window: a reorg deeper than
-               * that is already the node's general limit), merged at 6 runs */
-              { char bb[600], mm[600];
-                snprintf(mm, sizeof mm, "%s/bmc_merge_index_runs", n > 0 ? exe : ".");
-                snprintf(bb, sizeof bb, "%s/bmc_build_tx_index", n > 0 ? exe : ".");
-                it_configure(&g_it_txi, "txindex", bb, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.txindex);
-                snprintf(bb, sizeof bb, "%s/bmc_build_txospender_index", n > 0 ? exe : ".");
-                it_configure(&g_it_tsp, "txospender", bb, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.txospenderindex);
-                irs_init(&g_rs_txi, "txindex", "BMCTXIDX", 20, 16);
-                irs_init(&g_rs_tsp, "txospender", "BMCTXOSP", 28, 24); } }
+              csi_hist_repair_configure(builder, dir, g_chainp->name, g_cfg.coinstatshist_workers, g_cfg.coinstatshist_repair); }
             utxo_live_set_coinstats(csi_on_add, csi_on_remove, csi_invalidate, csi_commit);
             { extern void csi_on_block(long); extern void utxo_live_set_coinstats_block(void (*)(long)); utxo_live_set_coinstats_block(csi_on_block); }
             undo_set_coin_observer(csi_on_remove);
@@ -8437,6 +8755,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * persist coinstats.dat (bounded; a kill only costs a re-seed). */
             { extern void csi_worker_stop(void) __attribute__((weak));
               if (csi_worker_stop) csi_worker_stop(); }
+            /* same rule as the serve parent's exit: no thread of this
+             * process may be inside the mempool lock when _exit kills it */
+            { extern int mp_quiesce(long) __attribute__((weak)); if (mp_quiesce) mp_quiesce(5000); }
             _exit(0);
         }
         long long now_ms = 0;
@@ -9268,6 +9589,10 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       rpc_chain_set_proposal(rpc_node_submit_proposal); }
     rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
     rpc_chain_set_public_tip_fn(rpc_public_tip);   /* 3.1: every chain RPC's tip is the CONNECTED tip */
+    /* 2026-09-19: an index is consulted and listed only when its key is on */
+    { extern void rpc_chain_set_index_config(int, int, int, int, int) __attribute__((weak));   /* rules that build this file without rpc_chain.o */
+      if (rpc_chain_set_index_config)
+          rpc_chain_set_index_config(g_cfg.txindex, g_cfg.txospenderindex, g_cfg.blockfilterindex, g_cfg.coinstatsindex, g_cfg.addrindex); }
     /* getnetworkinfo tells the truth about the transports: reachability from
      * the dialer, our i2p destination, and (once the tor listener is up,
      * below in tor_onion_listener) the onion hostname. */
@@ -9499,6 +9824,7 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
                             g_cfg.n_addnode);
     rpc_node_set_zmq(g_cfg.zmq_hashblock, g_cfg.zmq_hashtx,
                      g_cfg.zmq_rawblock, g_cfg.zmq_rawtx);
+    rpc_node_set_zmq_hwm(g_cfg.zmq_hwm);
     /* getblockfilter reads spent-prevout scripts from undo_<h>.dat */
     { extern long undo_replay(long, int (*)(void*, const unsigned char*, unsigned int,
                                             unsigned long long, unsigned int, unsigned char,
@@ -9888,6 +10214,10 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             int st = (int)g_dl_worker_status;
             if (WIFSIGNALED(st)) fprintf(stderr,"[serve] FATAL: download worker pid %d died on signal %d -- exiting so systemd restarts the unit\n", (int)g_dl_worker_pid, WTERMSIG(st));
             else fprintf(stderr,"[serve] FATAL: download worker pid %d exited with status %d -- exiting so systemd restarts the unit\n", (int)g_dl_worker_pid, WEXITSTATUS(st));
+            /* the restart must find the datadir free: the worker's orphans
+             * and the serve children still hold the lock */
+            { extern int mp_quiesce(long) __attribute__((weak)); if (mp_quiesce) mp_quiesce(5000); }
+            parent_stop_and_wait(60);
             _exit(1);
         }
         if(g_shutdown_requested){
@@ -9902,6 +10232,15 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 if(w >= 0) fprintf(stderr,"[mempool] saved %ld transaction(s) to mempool.dat\n", w);
                 else       fprintf(stderr,"[mempool] could not save mempool.dat\n");
             }
+            /* This process's RPC and Esplora threads take the mempool lock;
+             * the _exit below kills them wherever they are, so none may be
+             * inside it then (mempool_cfg.c, 2026-09-19). From here on they
+             * park at the lock instead of entering. Bounded: a thread still
+             * inside after 5 s is named by count and left to EOWNERDEAD, the
+             * recovery path that exists for exactly this. */
+            { extern int mp_quiesce(long) __attribute__((weak));
+              int in = mp_quiesce ? mp_quiesce(5000) : 0;
+              if(in > 0) fprintf(stderr,"[serve] WARNING: %d thread(s) still inside the mempool lock after 5s -- exiting anyway (the next locker recovers it)\n", in); }
             if(g_dl_worker_pid>0){
                 kill(g_dl_worker_pid, SIGTERM);
                 fprintf(stderr,"[serve] forwarded SIGTERM to download worker pid %d\n", (int)g_dl_worker_pid);
@@ -9909,9 +10248,13 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             /* run BEFORE the credential and pidfile go, so a hook that
              * wants to read either still can */
             if(g_cfg.shutdownnotify[0]) notify_run(g_cfg.shutdownnotify, "", "shutdownnotify");
-            /* a dead node must not leave a usable credential on disk, nor a
-             * pidfile pointing at a pid that is about to be reused */
+            /* a dead node must not leave a usable credential on disk */
             rpc_cookie_remove();
+            /* The main pid's exit must MEAN the datadir is free (see
+             * shutdown_wait_lock_released): wait for the worker and every
+             * other process sharing the lock. */
+            parent_stop_and_wait(SHUTDOWN_LOCK_WAIT_S);
+            /* ...nor a pidfile pointing at a pid that is about to be reused */
             if(g_cfg.pidfile[0]) unlink(g_cfg.pidfile);
             _exit(0);
         }
@@ -10100,6 +10443,10 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                      * inbound peers waited for all N (systemd: up to 900 s). */
                     signal(SIGTERM, SIG_DFL);
                     signal(SIGINT,  SIG_DFL);
+                    /* the mempool lock's per-process gate: a parent RPC thread
+                     * inside it at the fork left a count no thread here owns */
+                    { extern void mp_fork_child_reset(void) __attribute__((weak));
+                      if (mp_fork_child_reset) mp_fork_child_reset(); }
                     /* This child serves exactly one peer, so the permissions
                      * its listener granted are simply this process's. No
                      * shared table, no fd keying, nothing to clean up when the
@@ -10314,16 +10661,56 @@ static int datadir_lock_acquire(const char* effdir){
         fprintf(stderr,"[boot] FATAL: cannot open %s/.lock: %s\n", effdir, strerror(errno));
         return 0;
     }
-    if(flock(datadir_lock_fd, LOCK_EX|LOCK_NB) != 0){
-        if(errno == EWOULDBLOCK)
-            fprintf(stderr,"[boot] FATAL: cannot obtain a lock on data directory %s. "
-                           "bmcbitcoind is probably already running.\n", effdir);
-        else
-            fprintf(stderr,"[boot] FATAL: cannot lock %s/.lock: %s\n", effdir, strerror(errno));
+    if(flock(datadir_lock_fd, LOCK_EX|LOCK_NB) == 0) return 1;
+    if(errno != EWOULDBLOCK){
+        fprintf(stderr,"[boot] FATAL: cannot lock %s/.lock: %s\n", effdir, strerror(errno));
         close(datadir_lock_fd); datadir_lock_fd = -1;
         return 0;
     }
-    return 1;
+    /* 2026-09-19: held. Refuse at once, as Core does, when another instance
+     * is RUNNING. Wait, bounded, in the two cases where the holder is on its
+     * way out:
+     *   - the previous instance is finishing its stop: its parent now stays
+     *     until the lock is free and says so in .stopping (its pid). A
+     *     relaunch that does not wait for that pid lands here.
+     *   - no process we can see holds it. Three production restarts
+     *     (2026-09-15 10:10:06 and 15:25:38, 2026-09-18 21:16:19) failed here
+     *     ~50 ms after systemd had reported the whole old unit gone -- its
+     *     control-group stop waits for every process, and flock is released
+     *     before a process leaves its cgroup, so which process held it then
+     *     is NOT established. Retrying for a few seconds costs nothing when
+     *     the holder is truly gone, and the holder list below is logged
+     *     either way so the next occurrence names it. */
+    lock_holder_t h[LOCK_HOLDERS_MAX]; char desc[2048];
+    int n = lock_holders_scan(datadir_lock_fd, 0, h, LOCK_HOLDERS_MAX);
+    lock_holders_fmt(h, n, desc, sizeof desc);
+    int stopper = 0; char own_comm[20], their_comm[20];
+    { FILE* f = fopen(STOPPING_MARKER, "r");
+      if (f){ if (fscanf(f, "%d", &stopper) != 1) stopper = 0; fclose(f); }
+      proc_comm((int)getpid(), own_comm, sizeof own_comm);
+      if (stopper > 0){ proc_comm(stopper, their_comm, sizeof their_comm);
+                        if (kill(stopper, 0) != 0 || strcmp(own_comm, their_comm) != 0) stopper = 0; } }
+    int wait_s = stopper > 0 ? 120 : n == 0 ? 5 : 0;
+    if (wait_s > 0){
+        if (stopper > 0) fprintf(stderr,"[boot] data directory %s is locked by the previous instance (pid %d), which is stopping; "
+                                        "waiting up to %ds (holders: %s)\n", effdir, stopper, wait_s, n ? desc : "none visible");
+        else fprintf(stderr,"[boot] data directory %s is locked but no process visible to us holds it; retrying for %ds\n", effdir, wait_s);
+        long long t0 = mono_now_ms();
+        while (mono_now_ms() - t0 < (long long)wait_s * 1000){
+            usleep(50000);
+            if (flock(datadir_lock_fd, LOCK_EX|LOCK_NB) == 0){
+                fprintf(stderr,"[boot] data directory lock obtained after %.2fs\n", (mono_now_ms() - t0) / 1000.0);
+                return 1;
+            }
+        }
+        n = lock_holders_scan(datadir_lock_fd, 0, h, LOCK_HOLDERS_MAX);
+        lock_holders_fmt(h, n, desc, sizeof desc);
+    }
+    fprintf(stderr,"[boot] FATAL: cannot obtain a lock on data directory %s. "
+                   "bmcbitcoind is probably already running.\n", effdir);
+    fprintf(stderr,"[boot]        held by: %s\n", n ? desc : "no process visible to this user");
+    close(datadir_lock_fd); datadir_lock_fd = -1;
+    return 0;
 }
 
 int main(int argc, char** argv){
@@ -11200,6 +11587,7 @@ int main(int argc, char** argv){
              * worker's start under the pending SIGTERM left utxo.idx empty
              * (a full UTXO rebuild followed). A stop is a stop. */
             fprintf(stderr,"[boot] shutdown requested during the catch-up -- exiting before the worker starts\n");
+            parent_stop_and_wait(60);
             _exit(0);
         }
         if(caught>0){
@@ -11240,6 +11628,9 @@ int main(int argc, char** argv){
                              MAP_SHARED|MAP_ANONYMOUS, -1, 0);
         if (g_node_status == MAP_FAILED){ g_node_status = NULL; }
         else { g_node_status->n_out = 0; g_node_status->n_inbound = 0;
+               /* the boot catch-up's wire bytes, counted before this table
+                * existed (dl_wire_note): getnettotals covers them too */
+               if (g_dl_wire_boot){ g_node_status->dl_wire_sent = g_dl_wire_boot[0]; g_node_status->dl_wire_recv = g_dl_wire_boot[1]; }
                /* 3.1: seed the connected tip from the persisted applied height
                 * so the RPCs and the serve children cap by it from the first
                 * request, before the worker has loaded the set and started
@@ -11288,6 +11679,8 @@ int main(int argc, char** argv){
 
         pid_t dl = fork();
         if(dl==0){
+            { extern void mp_fork_child_reset(void) __attribute__((weak));
+              if (mp_fork_child_reset) mp_fork_child_reset(); }
             if(g_txoq_parent >= 0){ close(g_txoq_parent); g_txoq_parent = -1; }
             /* TXOQ-1 (2026-09-05 benchmark): register the between-block
              * service hook before the worker's first utxo_live_catchup, so a

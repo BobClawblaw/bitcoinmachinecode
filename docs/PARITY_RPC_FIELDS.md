@@ -201,8 +201,8 @@ and the policy layer knows `-bytespersigop`, so:
 |---|---|
 | `vsize_bip141` | emitted always — `(weight + 3) / 4` |
 | `vsize_adjusted` | emitted always — adjusted weight over 4, rounded up |
-| `chunkweight` | emitted for a singleton cluster; omitted otherwise |
-| `fees.chunk` | emitted for a singleton cluster; omitted otherwise |
+| `chunkweight` | emitted for a singleton cluster; omitted otherwise (every entry since 2026-09-19, below) |
+| `fees.chunk` | emitted for a singleton cluster; omitted otherwise (every entry since 2026-09-19, below) |
 
 The comment in `rpc_node.c` calling these "absent, and deliberately" was stale:
 it was written before the registry carried `sigop_cost`, and the data had been
@@ -307,3 +307,86 @@ omission is now a declared one in the frozen fixture test
 - `testmempoolaccept` (single-tx path) reports BIP141 `vsize`; v31.1 reports
   the adjusted one. `submitpackage` / package `testmempoolaccept` already
   report the adjusted size.
+
+## 2026-09-19 — `chunkweight` and `fees.chunk` on every entry — FIXED
+
+**Measured on production, 2026-09-18 21:27Z:** `getrawmempool true` had
+79,626 entries. All 71,710 in a multi-transaction cluster lacked both keys;
+the 7,916 singletons had them. v31.1 reports both on every entry
+(`rpc/mempool.cpp` `entryToJSON` → `CTxMemPool::GetMainChunkFeerate` →
+txgraph `m_main_chunk_feerate`): `chunkweight` is the **sigops-adjusted
+weight** of the chunk the transaction lands in, `fees.chunk` that chunk's
+summed **modified** fee in BTC.
+
+**Why they were missing: deliberately omitted on the bulk path.** Not a
+refresher that never got there, and not unpublished state. The per-entry
+builder already linearized a member's cluster (`mempool_cluster.c`: greedy +
+PostLinearize) for a single `getmempoolentry`, and a read on production showed
+those values matching v31.1. The bulk path skipped it (`else if (have_inf &&
+!g_mpe_inf)`) because a cluster build *per entry* would be quadratic, and the
+table above ("emitted for a singleton cluster; omitted otherwise") recorded the
+gap as intended.
+
+**Fix.** Bulk `getrawmempool true` now carries a per-call chunk cache parallel
+to its sorted txid cache. The first member of a cluster to be rendered builds
+it from the call's one-pass graph (`mpc_lookup_bulk`: no registry walk per
+member), linearizes and chunks it, and records the answer for **every**
+member; the rest read it. One build per cluster per call. The single-entry and
+ancestors/descendants-verbose paths share the same function (`mpe_chunk_of`).
+Both lookups now drop edges to transactions no longer in the pool, as
+`depends`/`spentby` already did. The keys are omitted only where no honest
+answer exists: a component beyond the 64-transaction bound, or an entry with
+no registry node.
+
+**Cost** (`tests/test_rpc_chunk_scale`, 32,000 entries shaped like
+production: 1,240 chains of 25 plus 1,000 singletons, best of 3; the whole
+call runs under the pool lock, so this is also how long the lock is held):
+
+| build | `getrawmempool true` | cluster builds | entries with the keys |
+|---|---|---|---|
+| main (keys omitted) | 256 ms | 0 | 1,000 |
+| per-member build (no cache) | 80,397 ms | 31,000 | 32,000 |
+| this fix | 293 ms (+14%) | 1,240 | 32,000 |
+
+The per-member row is the naive fix, measured to show what it would have
+cost: 80 seconds under the pool lock. The test asserts the count (builds ==
+multi-member clusters), not the time.
+
+**Linearization vs Core.** Core v31.1 linearizes with a spanning-forest
+search that reaches the optimum for clusters this size; this node uses
+ancestor-score greedy followed by Core's PostLinearize. They agree wherever
+greedy + PostLinearize is optimal, which PostLinearize guarantees when every
+member has at most one parent or at most one child (chains, fan-outs, CPFP),
+and which also holds for the diamond tested here. A cluster where they could
+differ needs members with several parents and several children, where the
+best chunk is not an ancestor set that greedy picks and PostLinearize's
+merges do not recover it. There bmc would report a valid chunking that is
+not Core's. No such case is in the tests: none was constructed, so how often
+it happens is unknown. No such cluster turned up on
+production (below). Two smaller known differences: a negative modified fee
+(from `prioritisetransaction`) is clamped to 0 inside a multi-member cluster,
+where Core keeps the sign; a singleton reports it signed, as Core does.
+
+**Verified:**
+- `tests/test_rpc_node`: singleton, CPFP, 3-chain, diamond, sigop-heavy
+  parent (adjusted weight 1600 → chunk 1928, where raw weight would say 656),
+  and an equal-feerate pair (no merge, Core's strict `>>`). Each runs on both
+  the per-txid and the bulk path, plus "every registry entry carries both
+  keys" and "one build per cluster". With the fix reverted, all 13 bulk
+  checks, the coverage check and the build-count check FAIL. The per-txid
+  checks pass against the old code too: that path was already correct, and
+  they stay as its regression guard. The build-count check also FAILS against
+  a build with the cache disabled (17 builds for 7 clusters).
+- `validation/chunk_fields_regtest_diff.sh`, v31.1 regtest against bmc
+  regtest, the same signed transactions submitted to both: singleton, CPFP,
+  3-chain, diamond, equal pair, 1→3 fan-out, and a 12-chain whose chunks
+  split and merge. **28 of 28** txs agree on both keys across Core bulk, Core
+  entry, bmc bulk and bmc entry. Against main's binary: 27 of 28 bulk entries
+  lack the keys and the script fails.
+- Production, read-only (bmc 8331 against the v31.1 oracle on 8337, 01:16Z):
+  of the 349 multi-member clusters present in both pools, 336 had the same
+  membership at query time (325 chains, 11 non-chain). `getmempoolcluster` was
+  chunk-for-chunk identical on all 336, and `getmempoolentry` chunk fields were
+  identical on all 5,815 members still present. A first pass without the
+  membership check reported 203 "diffs"; all came from one cluster whose last
+  transaction had been replaced on bmc and not yet on the oracle.

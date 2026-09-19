@@ -21,6 +21,14 @@
  *      record is a wrong digest, never a silently wrong answer;
  *   4. negative control: no status block -> inline folding of the same
  *      records, same digest as the worker's; csi_worker_start refuses.
+ *   5. (2026-09-19) a SIGTERM to the WORKER does not end it. systemd's
+ *      control-group stop signals every process of the unit at once; the
+ *      worker quit as soon as its ring was momentarily empty, and a commit
+ *      the connect process pushed after that -- its shutdown checkpoint --
+ *      was never folded: coinstats.dat stayed a block behind the applied
+ *      height and the next boot re-seeded from a full walk. Now only the
+ *      STOP marker (or the connect process's death) ends it, and with the
+ *      daemon's SIGCHLD reaper installed the stop is reported as a stop.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +38,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <time.h>
 #include "../rpc_node.h"
 #include "test_tmpdir.h"
@@ -87,6 +96,8 @@ static void ck(const char* l, int cond){
     if (cond) printf("  ok  %s\n", l);
     else { printf("  FAIL %s\n", l); failures++; }
 }
+static volatile sig_atomic_t g_reaped = 0;
+static void reap_any(int sig){ (void)sig; int st; while (waitpid(-1, &st, WNOHANG) > 0) g_reaped = 1; }
 static long long ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (long long)t.tv_sec*1000 + t.tv_nsec/1000000; }
 
 /* ---- the coin set --------------------------------------------------------
@@ -265,6 +276,38 @@ int main(void){
     ck("live read", csi_read_live(&h, d_inline, &tx, &amt, &bg) == 1 && h == 501);
     ck("control: SAME digest as the worker produced", memcmp(d_inline, d_ring, 32) == 0);
     ck("control: same counters", tx == rtx && amt == ramt && bg == rbg);
+
+    printf("\n== 5: a SIGTERM to the worker does not end it before the STOP marker ==\n");
+    if (chdir("..") || mkdir("sigterm", 0755) || chdir("sigterm")){ perror("chdir"); return 1; }
+    csi_set_status(st);
+    memset(st, 0, sizeof *st);
+    { struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = reap_any;   /* the daemon's reap_children shape */
+      sigemptyset(&sa.sa_mask); sa.sa_flags = SA_RESTART | SA_NOCLDSTOP; sigaction(SIGCHLD, &sa, NULL); }
+    struct lsm_state l5; void* t5;
+    { const coin_t* s5[2] = { &A, &B }; lsm_build(&l5, &t5, s5, 2); }
+    ck("seed {A,B} at 600", csi_seed_from_walk(&l5, t5, 600) == 1);
+    ck("worker started", csi_worker_start() == 1);
+    int p5 = csi_worker_pid();
+    csi_commit(601);
+    ck("watermark 601", wait_watermark(st, 601, 10000));
+    kill(p5, SIGTERM);                                   /* what the control-group stop delivers */
+    usleep(300000);                                      /* the ring is empty: the old worker left here */
+    ck("the worker is still running 300 ms after its SIGTERM", kill(p5, 0) == 0 && !g_reaped);
+    { coin_t E; mk_coin(&E, 91, 25); csi_on_add(E.txid, E.idx, E.val, E.h, E.cb, E.spk, E.slen); }
+    csi_commit(602);                                     /* the connect process's shutdown checkpoint */
+    fflush(stderr);
+    int saved = dup(2), lf = open("stop.log", O_WRONLY|O_CREAT|O_TRUNC, 0600);
+    dup2(lf, 2); close(lf);
+    csi_worker_stop();
+    fflush(stderr); dup2(saved, 2); close(saved);
+    ck("coinstats.dat reached 602: the commit pushed AFTER the SIGTERM was folded", csi_file_height() == 602);
+    { char buf[4096] = {0}; int fd = open("stop.log", O_RDONLY); ssize_t r = fd >= 0 ? read(fd, buf, sizeof buf - 1) : 0;
+      if (fd >= 0) close(fd);
+      if (r > 0) buf[r] = 0;
+      printf("      stop said: %s", buf[0] ? buf : "(nothing)\n");
+      ck("the stop is reported as a stop, not \"the index cannot be maintained\"",
+         strstr(buf, "stopped (coinstats.dat through height 602)") != NULL && strstr(buf, "cannot be maintained") == NULL); }
+    signal(SIGCHLD, SIG_DFL);
 
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;

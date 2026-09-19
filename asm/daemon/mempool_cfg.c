@@ -24,6 +24,8 @@
 #include <pthread.h>
 #include <errno.h>
 #include <sys/mman.h>
+#include <signal.h>
+#include <unistd.h>
 #include "node_config.h"
 #include "mempool_journal.h"
 
@@ -114,12 +116,51 @@ static int g_mp_robust = 0;               /* MEM-20: PTHREAD_MUTEX_ROBUST armed 
  * keeps exactly today's behaviour rather than failing mempool_configure and
  * dropping the node to the built-in 2 MiB pool.
  */
+/* ---------------------------------------------------------------- 2026-09-19
+ * Nothing on a NORMAL stop may die inside this critical section. EOWNERDEAD
+ * is the crash path, yet all thirteen of these warnings in the production
+ * logs (2026-09-08 through 2026-09-18) were printed during a STOP, by the
+ * download worker's first lock after the serve parent's _exit. Two shapes
+ * can do it; (1) is the one those logs show:
+ *
+ *   1. THE PARENT. Its RPC worker threads and the Esplora facade's
+ *      connection threads take this lock (getrawmempool, /mempool/txids --
+ *      a whole-pool walk that allocates one string per tx under it). The
+ *      parent's shutdown ended in _exit(0) from the main thread, which kills
+ *      every other thread wherever it is. On 2026-09-18 21:16:18.850 the
+ *      mempool.space backend logged "socket hang up" on /mempool/txids at
+ *      the same instant the worker logged the warning.
+ *   2. AN INBOUND SERVE CHILD. It takes SIGTERM with the default action
+ *      (main.c: so a stop does not wait for its peer), and it holds this
+ *      lock across a whole accept. systemd's control-group stop signals it
+ *      directly, at whatever point it has reached.
+ *
+ * (2) is closed per thread: SIGTERM and SIGINT are blocked from lock to
+ * unlock, so a default-action termination lands just AFTER the unlock. (1) is
+ * closed per process by mp_quiesce(), below, which the parent calls before
+ * it exits: new entrants park, current holders finish.
+ *
+ * The gate is process-PRIVATE state (plain statics, copied at fork), which
+ * is the point: the parent closing its gate must not close the worker's. A
+ * child forked while a parent thread was inside inherits a count that no
+ * thread of its own will ever decrement; mp_fork_child_reset() clears it. */
+static volatile int g_mp_inflight = 0;      /* this process's threads entering or inside */
+static volatile int g_mp_closed   = 0;      /* mp_quiesce ran: park, do not enter */
+static unsigned long g_mp_owner_died = 0;   /* EOWNERDEAD recoveries seen by this process */
+static __thread sigset_t g_mp_saved_mask;
+static void mp_park(void){ for (;;) sleep(3600); }   /* until the process exits */
 void mp_lock(void){
     if (!g_mp_mutex) return;
+    if (g_mp_closed) mp_park();
+    __atomic_add_fetch(&g_mp_inflight, 1, __ATOMIC_SEQ_CST);
+    if (g_mp_closed){ __atomic_sub_fetch(&g_mp_inflight, 1, __ATOMIC_SEQ_CST); mp_park(); }
+    { sigset_t term; sigemptyset(&term); sigaddset(&term, SIGTERM); sigaddset(&term, SIGINT);
+      pthread_sigmask(SIG_BLOCK, &term, &g_mp_saved_mask); }
     int r = pthread_mutex_lock(g_mp_mutex);
     if (r == EOWNERDEAD){
         /* the previous holder died inside the critical section */
         pthread_mutex_consistent(g_mp_mutex);
+        g_mp_owner_died++;
         fprintf(stderr,
             "[mempool] WARNING: a process died holding the mempool lock; the lock has\n"
             "[mempool]          been recovered and the node keeps running, but the pool\n"
@@ -128,7 +169,30 @@ void mp_lock(void){
             "[mempool]          want it rebuilt now.\n");
     }
 }
-void mp_unlock(void){ if (g_mp_mutex) pthread_mutex_unlock(g_mp_mutex); }
+void mp_unlock(void){
+    if (!g_mp_mutex) return;
+    pthread_mutex_unlock(g_mp_mutex);
+    sigset_t m = g_mp_saved_mask;                /* copy first: a pending SIGTERM may end us in the call */
+    __atomic_sub_fetch(&g_mp_inflight, 1, __ATOMIC_SEQ_CST);
+    pthread_sigmask(SIG_SETMASK, &m, NULL);
+}
+/* Close this process's gate and wait (bounded) for its threads to leave the
+ * critical section. Returns how many are still inside at the bound (0 = the
+ * process may now exit without leaving the lock EOWNERDEAD). The calling
+ * thread must not be inside, and must not take the lock afterwards. */
+int mp_quiesce(long max_ms){
+    __atomic_store_n(&g_mp_closed, 1, __ATOMIC_SEQ_CST);
+    struct timespec t0, t; clock_gettime(CLOCK_MONOTONIC, &t0);
+    for (;;){
+        int n = __atomic_load_n(&g_mp_inflight, __ATOMIC_SEQ_CST);
+        if (n <= 0) return 0;
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        if ((t.tv_sec - t0.tv_sec) * 1000L + (t.tv_nsec - t0.tv_nsec) / 1000000L >= max_ms) return n;
+        usleep(1000);
+    }
+}
+void mp_fork_child_reset(void){ g_mp_inflight = 0; g_mp_closed = 0; }
+unsigned long mp_lock_owner_died_count(void){ return g_mp_owner_died; }
 
 /* for the test: 1 when the shared lock was created ROBUST */
 int mp_lock_is_robust(void){ return g_mp_robust; }
