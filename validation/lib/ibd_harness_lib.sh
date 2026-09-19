@@ -230,9 +230,14 @@ ibd_log_tip_time() {
 ibd_parse_ss_clients() {
     grep -oE 'users:\(\("[^"]+",pid=[0-9]+' | sed -E 's/users:\(\("([^"]+)",pid=([0-9]+)/\2:\1/' | sort -u
 }
+# LOOPBACK ONLY. The first version matched "dport = :$port" on any address, and
+# on 2026-09-19 it named the Core benchmark itself as an RPC stranger: Core had an
+# outbound P2P connection to a remote peer whose listening port happened to be
+# the benchmark's RPC port (67.250.1.176:8340). RPC binds 127.0.0.1, so a real
+# caller always connects to 127.0.0.1:<port>.
 ibd_rpc_clients() {
     local port="$1"
-    ss -tnpH state established "( dport = :$port )" 2>/dev/null | ibd_parse_ss_clients
+    ss -tnpH state established "( dst 127.0.0.1:$port )" 2>/dev/null | ibd_parse_ss_clients
 }
 
 # Connections to the RPC port that CLOSED in the last ~60 s (TCP TIME-WAIT).
@@ -243,5 +248,5 @@ ibd_rpc_clients() {
 # the established check above names it when it happens to be caught open.
 ibd_rpc_recent_closes() {
     local port="$1"
-    ss -tnH state time-wait "( sport = :$port or dport = :$port )" 2>/dev/null | grep -c .
+    ss -tnH state time-wait "( src 127.0.0.1:$port or dst 127.0.0.1:$port )" 2>/dev/null | grep -c .   # loopback only, as above
 }
