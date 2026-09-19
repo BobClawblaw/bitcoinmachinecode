@@ -1,0 +1,300 @@
+[size=16pt][b]THE MEASURING EQUIPMENT[/b][/size]
+[i]Bitcoin Machine Code, days 22 to 38: the state of the project on 2026-09-19[/i]
+
+A follow-up to "21 FOR 21", which covered 2026-08-11 to 2026-09-02. This report covers 2026-09-02 to 2026-09-19. It was compiled from the project's own records: the git history of [url=https://github.com/BobClawblaw/bitcoinmachinecode]https://github.com/BobClawblaw/bitcoinmachinecode[/url], the pull requests, the daily worklogs, docs/devlog (LOG.md, DEPLOYMENT_HISTORY.md, the RESUME and incident notes), docs/reports (the IBD reports), the registers (CORE_DIVERGENCES, CORE_BEHAVIORAL_COMPAT, FEATURE_GAPS, PARITY_RPC_FIELDS), the audits, the benchmark harness logs on disk, and the assistant's own persistent memory notes. Every quote is verbatim from one of those. As in the first report, the counts are true as of the date given and will drift.
+
+[quote]"The measuring equipment was not trustworthy."
+[i]-- worklog/2026-09-13.md[/i][/quote]
+
+[b]Contents[/b]
+[list][li]PROLOGUE: WHERE THE FIRST REPORT STOPPED[/li][li]PART I: THE NUMBERS — what seventeen days added[/li][li]PART II: WHAT WAS BUILT — from a node to a node that behaves like Core[/li][li]PART III: THE LEDGER — consensus, and one block the AI destroyed[/li][li]PART IV: THE MEASURING EQUIPMENT — seventeen days of benchmarks that lied[/li][li]PART V: PARITY — a name is not a contract[/li][li]PART VI: SECURITY — 182 findings, one that fell through, and a leak[/li][li]PART VII: THE SCAR TISSUE — incidents, and the patterns they share[/li][li]PART VIII: THE COLLABORATION — from standing authorization to a gated contract[/li][li]PART IX: WHAT IS STILL OPEN[/li][li]APPENDIX A: THE NUMBERS, ON ONE PAGE[/li][li]APPENDIX B: RECOVERING A TIMELINE FROM BLOCK FILES[/li][li]APPENDIX C: READING ORDER — AUDITING THIS REPORT AGAINST THE SOURCE[/li][/list]
+
+[hr]
+[size=14pt][b]PROLOGUE: WHERE THE FIRST REPORT STOPPED[/b][/size]
+
+"21 FOR 21" ended on 2026-09-02 with a node, written entirely in hand-crafted x86-64 assembly and C with no human-typed code, whose UTXO set was MuHash-identical to Bitcoin Core's at a chain height of 963,967. It ended on a question it could not yet answer: was the node any good at the thing a node is for, syncing the chain from nothing and keeping up with it, measured honestly against Core on the same machine?
+
+Seventeen days later the answer is "probably, and here is exactly how sure we are". Most of this report is about that last clause.
+
+The short version of the state on 2026-09-19:
+
+[list][li]Correctness. A fresh bmc sync (run 27) ended with a UTXO set whose MuHash is identical to Bitcoin Core v31.1's at height 967,712: 09f5cd877189dc269f505f2066aa2a0b39eb0b8e3384a48449880affd6490ee7. That is the ninth full-set comparison against Core in the period. Every one that ran matched. The two that "failed" were both failures of the measuring harness, not of the node (Part III).[/li][li]Speed. On the same NVMe drive, run 27 reached the tip in 18 h 40 m 23 s. The first Core v31.1 baseline took 19 h 40 m 09 s. That is about 60 minutes (~5%) in bmc's favour. The report that records it says "Treat that as indicative, not clean", and so does this one: both runs were loaded by a monitoring tool, in different ways (Part IV). The clean pair, an unpolled Core rerun and run 28 on today's code, was in progress when this was written: [b][[PENDING: Core rerun wall clock]][/b] and [b][[PENDING: run 28 wall clock]][/b].[/li][li]Parity. Every one of Core v31.1's RPC method names exists on the node and none is a stub. More usefully, the response shapes are now diffed field by field against a real v31.1, which is what found most of the defects in this period (Part V).[/li][li]The work. 927 commits on main and 282 merged pull requests in seventeen days, written by three Claude models, with one human operator deciding, merging and deploying (Parts I and VIII).[/li][/list]
+
+The title is not a metaphor. In this period, the most expensive defects were not in the node. They were in the things that measured it: a capstone that had compared an empty string with an empty string "for months", a harness that read a moving UTXO set and reported corruption, a benchmark that compared two disks instead of two implementations, a parity check against the wrong version of Core, a monitor that loaded both sides of a timed race. Each was found, named and fixed, and each left a rule behind. That is the main result of these seventeen days, and it is what makes the other results believable.
+
+[hr]
+[size=14pt][b]PART I: THE NUMBERS — what seventeen days added[/b][/size]
+
+[size=12pt][b]Chapter 1: Counting commits when the history exists twice[/b][/size]
+
+A warning first, because it changes every commit count in this report. On 2026-09-04 two rewritten copies of the project history were reconciled into one main branch:
+
+[quote]"origin/main and this branch are two REWRITES of the same project history
+[i]-- they share only an ancient base, 881 commits on one side and 956 on the[/i]
+other"
+[i]-- commit dfbdf36d, 2026-09-04[/i][/quote]
+
+The merge kept one tree and recorded the other side as a second parent, so that nothing was force-overwritten. As a result the same logical commit often appears twice in [tt]git log[/tt], and a raw [tt]git rev-list --count main[/tt] (2,844) roughly doubles the older work. The honest figure excludes the discarded side ([tt]main ^7de98563[/tt]):
+
+[table]
+[tr][td][/td][td][b]2026-09-02[/b][/td][td][b]2026-09-19[/b][/td][/tr]
+[tr][td]commits on main (deduplicated)[/td][td]1,036[/td][td]1,774[/td][/tr]
+[tr][td]commits on main since 09-02[/td][td][/td][td]927 (642 non-merge, 285 merges)[/td][/tr]
+[tr][td]merged pull requests[/td][td]0 (work went straight to main)[/td][td]282 (#2 to #283)[/td][/tr]
+[tr][td]test programs in the gate[/td][td]324[/td][td]428[/td][/tr]
+[tr][td]RPC methods in the dispatch tables[/td][td]161[/td][td]166[/td][/tr]
+[tr][td]tags[/td][td]3[/td][td]108[/td][/tr]
+[/table]
+
+"21 FOR 21" quoted 1,023 commits on main for 2026-09-02. That matches the count at about 14:00Z that day; the last commit of the day brings it to 1,036.
+
+The pull-request era began on 2026-09-05. Before that, work was committed straight to main. After a forum reviewer asked for squashed history, the operator chose the opposite: every batch of work lands as one pull request and one merge commit, never squashed, never force-pushed, so that [tt]git log --first-parent main[/tt] reads as one line per batch while the granular commits stay intact. The busiest day was 2026-09-06, with 48 merged pull requests. On 2026-09-11 there were none.
+
+[size=12pt][b]Chapter 2: Lines of code[/b][/size]
+
+[table]
+[tr][td][/td][td][b]2026-09-02[/b][/td][td][b]2026-09-19[/b][/td][td][b]change[/b][/td][/tr]
+[tr][td]assembly, source[/td][td]57,001[/td][td]60,477[/td][td]+3,476[/td][/tr]
+[tr][td]assembly, tests[/td][td]11,187[/td][td]11,187[/td][td]0[/td][/tr]
+[tr][td]C, source[/td][td]71,797[/td][td]97,872[/td][td]+26,075[/td][/tr]
+[tr][td]C, tests[/td][td]87,288[/td][td]116,837[/td][td]+29,549[/td][/tr]
+[tr][td]Python[/td][td]22,230[/td][td]24,415[/td][td]+2,185[/td][/tr]
+[tr][td]shell[/td][td]4,223[/td][td]7,420[/td][td]+3,197[/td][/tr]
+[tr][td]total, code and tests[/td][td]~253,700[/td][td]~318,200[/td][td]+25%[/td][/tr]
+[/table]
+
+Raw lines, comments and blank lines included; tests are paths under tests/ or files named test_*. The book's own "~166,000 lines" used a different method, so the two figures are not comparable.
+
+The shape of the growth matters more than its size. The assembly barely moved. Everything that was added (the parallel download, the indexes, the RPC and REST surfaces, the Esplora facade, the cluster mempool, the ZMQ publisher) was added in C around an assembly core that stayed stable: SHA-256, the script interpreter, the secp256k1 arithmetic, the block and transaction parsers, the archive store, the UTXO engine's inner loops. The tests grew faster than the code: 29,549 new lines of C tests against 26,075 new lines of C source.
+
+[size=12pt][b]Chapter 3: Who wrote it[/b][/size]
+
+Every commit is authored as the project's pseudonymous account. The models that wrote them are named in Co-Authored-By trailers:
+
+[table]
+[tr][td][b]model[/b][/td][td][b]commits co-authored since 09-02 (main, deduplicated)[/b][/td][/tr]
+[tr][td]Claude Fable 5.1[/td][td]310[/td][/tr]
+[tr][td]Claude Opus 5 (1M context)[/td][td]269[/td][/tr]
+[tr][td]Claude Sonnet 5[/td][td]10[/td][/tr]
+[/table]
+
+The hand-offs are visible by date. Sonnet 5 appears only on 09-03. Opus 5 carried the audit remediation on 09-04 and 09-05. Fable 5.1 carried 09-06 to 09-10 almost alone. From 09-11, it is Opus 5. "21 FOR 21" named seven models, several of them outside Claude; in this period, no model outside Claude appears in a trailer. The 09-03 codebase audit itself was run by Claude Fable 5.1 as thirteen parallel module reviewers.
+
+62 of the 642 non-merge commits carry no trailer. The commits trace to five separate Claude sessions, linked by hand-off files (Part VIII).
+
+[hr]
+[size=14pt][b]PART II: WHAT WAS BUILT — from a node to a node that behaves like Core[/b][/size]
+
+The first report described a node that could validate the chain. The work of these seventeen days was mostly about behaving like Core while doing it: the same download shape, the same chain selection, the same RPC shapes, the same indexes, the same notifications. The operator's instruction, repeated in different words on several days, was the same: "Do what core does!"
+
+[size=12pt][b]Chapter 4: The audit, and the start of the pull-request era (09-03 to 09-05)[/b][/size]
+
+On 2026-09-03 a full module-by-module codebase audit ran as thirteen parallel reviewers. It returned 182 findings: 5 CRITICAL, 32 HIGH, 44 MEDIUM, 68 LOW and 33 INFO. Its headline:
+
+[quote]"a block Core rejects can be accepted, stored and applied by this node"
+[i]-- docs/audits/CODEBASE_AUDIT_2026-09-03.md[/i][/quote]
+
+The coinbase-value check (VAL-1) and the MAX_MONEY check (VAL-2) were among them; the only MAX_MONEY check "lives in a function with zero call sites". Three interpreter findings were false accepts, and one (SCR-2) was an out-of-bounds write an attacker could reach. All 29 distinct CRITICAL and HIGH findings were closed by 14:54Z on 09-04. Part VI covers how closure was tracked, and the one finding that fell through the tracking.
+
+[size=12pt][b]Chapter 5: The UTXO set moves inside the download (09-06)[/b][/size]
+
+On 09-04 a fresh install synced in 24.1 hours: 19.5 hours of download at 11.1 MB/s, then 4.5 hours of a serial UTXO catch-up. The gap to Core was not a slower UTXO engine; it was a UTXO engine that ran after the download instead of during it. On 09-06 the connect moved inside the parallel download (#27, tag [tt]utxo-interleave-2026-09-06[/tt]). The same day's decomposition of the remaining gap found the largest single term: a MuHash fold per coin on the bulk path, about 1.66 µs times some 6.4 billion coin events, roughly three hours. The 3072-bit modular multiply went from 944 ns to 301 ns with BMI2, ADX and AVX-512 IFMA; the flush sort went from a 541 ms merge sort to a 91 ms radix sort for four million keys.
+
+[size=12pt][b]Chapter 6: The download in Core's shape (09-07 to 09-10)[/b][/size]
+
+Over four days the parallel downloader was rebuilt to match Core's design (#77, #78, #157): every live peer downloads, blocks are requested in 40-block chunks within a window anchored to the connected tip, and only the tail of that window judges whether a peer is too slow. One in-order committer appends the archive in height order (#97). Download concurrency defaults to eight peers, because Core's is pinned at eight: sixteen workers against sixty-four had measured 11.2 against 11.3 MB/s, "Four times the workers buys about one percent" (#178).
+
+Chain selection became Core's on 09-09 (#137): a fork tree that retains both branches' headers, after a peer stuck on a real stale branch held a benchmark for four hours. Compact blocks, marked DONE on 09-06, were finally received on 09-09 (#145; Chapter 30 explains the three-day gap). BIP324 v2 sessions were handed across a fork to dial helpers on 09-10 (#167, #174).
+
+[size=12pt][b]Chapter 7: The node as a backend (09-08)[/b][/size]
+
+On 09-08 the node started serving mempool.space in process through an Esplora HTTP facade (#100), gained an address history index (#107, #108), Core's REST interface (#115, checked byte for byte against Core with 82 route-level checks), and a coinstats history that answers [tt]gettxoutsetinfo[/tt] at any height (#119, #120). Undo data is kept for every block, as Core's rev files are (#99).
+
+[size=12pt][b]Chapter 8: Every index during the sync (09-16)[/b][/size]
+
+The operator's instruction on 09-16:
+
+[quote]"Make it so there is nothing left to do after ibd but just sit and update. Everything should be generated during ibd."[/quote]
+
+Since #238, all five indexes (txindex, txospenderindex, coinstatsindex, blockfilterindex and the address index) are built while the chain syncs. Run 26 was the first run to finish with all five complete.
+
+[size=12pt][b]Chapter 9: The mempool (09-14 to 09-16)[/b][/size]
+
+The cluster mempool landed in five stages on 09-14 (#197 to #203): linearization, cluster discovery, [tt]getmempoolcluster[/tt] on real clusters, post-linearization, one bound. The plan was corrected on the way: "two of its seven stages were already done". Block templates and eviction were moved onto the same tested linearization (#204 to #207).
+
+On 09-16 the node gained something Core does not have: a departure journal (#220 onward). Core forgets an evicted or expired transaction entirely, so "what happened to the one I broadcast" has no answer. The journal records one 152-byte entry per departure, naming why the transaction left: mined, replaced, evicted, expired or conflicted. It is sized for about eleven days of mainnet traffic.
+
+[size=12pt][b]Chapter 10: The archive frontier (09-17, 09-18)[/b][/size]
+
+The block archive's append cursor could fall behind the newest block file after a restart, and then silently fill the leftover tail of every older file on its way forward, putting a lower offset at a higher height. Run 26 had six such "layout breaks", each the first block after a restart. The fix took four pull requests and, on the way, destroyed a block (Chapter 15).
+
+[size=12pt][b]Chapter 11: The last three days (09-17 to 09-19)[/b][/size]
+
+The final days were a parity push against a real Core v31.1 (Part V), fixes to the ZMQ publisher so that notifications are delivered at all (Chapter 24), transaction relay defects found by a regtest differential (Chapter 25), a restart that waits for every process holding the datadir lock, and the changes that make run 28 a fair measurement: every index gated on its config key as in Core, every helper binary built, and no RPC to the node while it syncs.
+
+[hr]
+[size=14pt][b]PART III: THE LEDGER — consensus, and one block the AI destroyed[/b][/size]
+
+[size=12pt][b]Chapter 12: Nine comparisons with Core[/b][/size]
+
+A UTXO set comparison is the strongest correctness check this project has: the node's entire set of unspent coins, hashed with MuHash, against Core's at the same height. Every one run in the period:
+
+[table]
+[tr][td][b]date[/b][/td][td][b]node[/b][/td][td][b]height[/b][/td][td][b]result[/b][/td][/tr]
+[tr][td]09-02[/td][td]production[/td][td]965,135[/td][td]identical, 165,632,732 coins[/td][/tr]
+[tr][td]09-04[/td][td]fresh-install script[/td][td]—[/td][td]printed PASS on two empty strings[/td][/tr]
+[tr][td]09-05[/td][td]two independently synced datadirs[/td][td]965,651[/td][td]identical[/td][/tr]
+[tr][td]09-09[/td][td]production, rebuilt coinstats history[/td][td]963,967[/td][td]identical in every field[/td][/tr]
+[tr][td]09-11[/td][td]run 22, live[/td][td]966,494[/td][td]FAIL: a torn read, not a divergence[/td][/tr]
+[tr][td]09-12[/td][td]run 22, walked offline[/td][td]966,496[/td][td]identical on all five fields[/td][/tr]
+[tr][td]09-12[/td][td]run 23[/td][td]966,674[/td][td]identical[/td][/tr]
+[tr][td]09-17[/td][td]run 26, five indexes built during the sync[/td][td]967,450 and 200,000[/td][td]identical at both[/td][/tr]
+[tr][td]09-19[/td][td]run 27, same NVMe as the Core baseline[/td][td]967,712[/td][td]identical[/td][/tr]
+[/table]
+
+Sources: docs/PARITY_ATTESTATION.md, docs/reports/*, the run 27 phase.log.
+
+Two rows are not results. On 09-04 the fresh-install script compared two empty strings, found them equal and printed PASS. On 09-11 the capstone read the live node's set while its UTXO engine was still applying blocks and reported a failure. Both are harness defects, covered in Part IV. Every comparison that actually compared two sets matched.
+
+[size=12pt][b]Chapter 13: "If core has no cap, we should not have one either" (09-09)[/b][/size]
+
+At 00:31Z on 09-09 a benchmark, 91% through a fresh sync, rejected valid mainnet block 880,338 as [tt]bad-txns-nonBIP68-final[/tt]: one transaction had 7,244 inputs, and the node recorded at most 2,048 sequence numbers per transaction. That cap had been a deliberate choice on 09-04 (VAL-4). Production carried the same code.
+
+[quote]"A valid block, rejected; a consensus failure. Production ... would have forked on the next such block."
+[i]-- docs/releases/2026-09-09-bip68-seq-cap.md[/i][/quote]
+
+The first fix derived a new cap from the block weight limit: 24,576. The operator's answer was short:
+
+[quote]"If core has no cap, we should not have one either. Follow their behavior wherever possible for consensus."[/quote]
+
+The cap was removed the same night (#129). The rule now reads: "Consensus follows Core's behaviour wherever Core has one; where Core has none, we invent none." A follow-up audit (#131) found two more places where the node bounds something Core does not, and both are still open: a UTXO record stores a script's length in two bytes, so a valid output script over 65,535 bytes cannot be stored, and [tt]submitblock[/tt] refuses blocks with more than 16,384 transactions where a valid block could hold 16,666.
+
+[size=12pt][b]Chapter 14: Two more ways to be wrong about coins[/b][/size]
+
+On 09-09 the coinstats history disagreed with Core from height 91,722. Core's [tt]IsBIP30Unspendable[/tt] names the two original coinbases that were later duplicated; the node named the duplicates instead. The coin counts converged, but every affected coin hashed with the wrong height (#133).
+
+The same day, run 18 rejected mainnet block 963,311 for spending a coin that was present. One compaction run held 11,362 keys twice. The [tt]live=[/tt] figure in the logs agreed with Core's count throughout, because "The [tt]live=[/tt] figure in the logs is a counter, not a scan, so an equal count proved nothing." One of the existing tests had expected the duplicate tombstones: a test that encoded the defect (#139).
+
+[size=12pt][b]Chapter 15: Block 967,422[/b][/size]
+
+On 2026-09-17, fixing the archive append frontier (Chapter 10), the assistant wrote a guard on the C side that advanced the cursor's file number without its position. The next append wrote 293 bytes of the genesis block over offset 0 of blk05762.dat, where block 967,422 began, and the node then served a one-transaction block under that block's correct hash. The hand-off file for the next session opens:
+
+[quote]"Block 967422 on run 26 is corrupt and I caused it."
+[i]-- docs/devlog/RESUME_2026-09-17.md[/i][/quote]
+
+The repair was a single 293-byte write, reconstructed from production's copy of the same block. The permission classifier that governs the assistant's actions blocked it, "correctly, it guards writes into archive files", until the operator gave an explicit go-ahead. The work was committed as "WIP (NOT REVIEWED)" and left unmerged on purpose.
+
+The next day the block was repaired and hash-verified, and a closer look found the damage was worse than the write offset: the bytes had gone to the old file while the index named the new one. Three further pull requests (#266 to #268) made the store record which file a position was measured in, and the guard was then proven on a live restart that put the cursor 2,363 files behind the frontier. The next block landed exactly at the end of the frontier file. Six layout breaks before the restart, six after.
+
+The damage was confined to the stored copy of that one block: "Everything else in the archive is intact; the rest of that block is byte-identical to Core's copy" (RESUME_2026-09-17.md). The six older layout breaks never affected the chain either, though they still make truncation and pruning refuse to run on run 26's archive.
+
+[hr]
+[size=14pt][b]PART IV: THE MEASURING EQUIPMENT — seventeen days of benchmarks that lied[/b][/size]
+
+The central question after "21 FOR 21" was how long a fresh sync takes against Core on the same machine. Twenty-seven numbered runs later, the project has one comparison it is willing to call indicative, and a second one in flight that it means to call clean. What took seventeen days was not making the node faster. It was making the measurement true.
+
+[size=12pt][b]Chapter 16: The capstone that never ran[/b][/size]
+
+Every benchmark run ends with a capstone: hash the node's UTXO set, hash Core's at the same height, compare. On 2026-09-11, run 22's capstone failed, and the report written that day contains this sentence:
+
+[quote]"This is the first time the muhash comparison has ever completed. Earlier runs timed out, and an empty result compared equal to an empty oracle value, so the harness printed nothing and the run passed."
+[i]-- docs/reports/2026-09-11-run22-muhash-divergence.md[/i][/quote]
+
+Every "passing" run before 2026-09-11 had passed a check that never executed. The fix was a rule the harness still carries: an empty hash is a failure, and a value that is not 64 hex characters from both sides is refused.
+
+The failure it then reported was also false. The capstone had hashed the live node's set six minutes after the tip, while the UTXO engine was still applying blocks it had already stored. [tt]setnetworkactive false[/tt] stopped new blocks arriving but not the engine. The report concluded that fresh syncs write correct coins with wrong height metadata, because every aggregate matched and only the hash differed. The next day, the stored set was walked offline, quiesced, and matched Core on all five fields. The correction reads:
+
+[quote]"A walk over a moving LSM is not a set."
+"Aggregates agreeing with a hash that disagrees is the signature of a torn read."[/quote]
+
+The aggregates agreed because [tt]txouts[/tt] on the live path is a maintained counter, not the walk's own count. The capstone now quiesces the node, asks it for its current set with no height argument, and pins Core to whatever height that answer reports.
+
+Run 23 then produced no hash at all: the harness had asked its own node for the set at a height its coinstats index had not reached yet. The Core baseline on 09-13 produced an empty hash three times, because the call did not name a hash type and Core's default response has no [tt]muhash[/tt] key. The new guard "did its job: it reported FAIL with both values printed rather than comparing empty to empty." A gate check now requires every such call to name muhash.
+
+A census of the harness on 09-12 found "FIVE defects in the benchmark harness and ZERO in the node". The progress heartbeat had recorded nothing for three runs, because it read the console log instead of debug.log, matched [tt][dl][/tt] against lines tagged [tt][dlc][/tt], and ran grep without [tt]-a[/tt] on a log containing NUL bytes, which makes grep print nothing at all. 09-13 was spent almost entirely on instruments. All seventeen differential scripts were found to print "ALL 0 MATCH" and exit 0 when their case set was empty; they now exit 2.
+
+[size=12pt][b]Chapter 17: The Core baseline was handicapped by us[/b][/size]
+
+On 09-06 the Core benchmark script turned out to set [tt]par=8[/tt] and [tt]maxconnections=64[/tt] for Core, "added 2026-09-04; no justification in the script, the memo or the commit". The 21-hour Core figure every comparison had used was measured with Core on eight verification threads and half its default connections. Separately, bmc's own [tt]par[/tt] key set its number of download workers, not verification threads. The operator's response became two rules:
+
+[quote]"Our flags need to match core. Never do something different unless we discuss it."
+"Don't ever take liberties with Core again."[/quote]
+
+Three more asymmetries surfaced over the next week. Every published comparison had run bmc with 16 to 64 downloading peers against Core's fixed 8 (09-10). The Core runner had used [tt]ionice -c3[/tt], the idle I/O class, for Core only (09-12). And the "hour ahead of Core" in the 09-11 report came down to one bad peer: Core's run had spent 2 h 18 m on heights 835,000 to 840,000, a stretch every other run crossed in 11 to 16 minutes. The corrected report says the published version was "wrong in both directions", and concludes:
+
+[quote]"on this box, at 8 peers a side, the two implementations are within a few percent ... A single number from any one run is noise."
+[i]-- docs/reports/2026-09-11-ibd-vs-core.md, correction[/i][/quote]
+
+[size=12pt][b]Chapter 18: Two disks, not two implementations[/b][/size]
+
+On 09-17 run 26 finished in 19 h 34 m, having built all five indexes during the sync. Its report set that beside a clean Core baseline of 19 h 14 m. The comparison was withdrawn within hours:
+
+[quote]"A Core run handicapped by a portable SSD against a bmc run on NVMe is a comparison of disks, not of implementations."
+"There is currently no valid IBD wall-clock comparison between this node and Core."
+[i]-- docs/reports/2026-09-17-run26-vs-core.md, correction[/i][/quote]
+
+Core had run on a Samsung Portable SSD T5 (0.40 GiB/s) and run 26 on an NVMe. The report's original caveats (ten boots, a binary swap mid-run, Core's unrecorded index settings) had "missed the one that mattered most".
+
+That night an 8 TB NVMe was installed, and a protocol written down: the same device for both, a fresh datadir, [tt]txindex[/tt], [tt]coinstatsindex[/tt] and [tt]blockfilterindex[/tt], [tt]dbcache=8192[/tt], eight download peers, no [tt]ionice[/tt], and each side's config copied into the report before launch. The Core version was fixed at v31.1, the release the node targets and every earlier baseline's version, not the v31.99 development build that serves as the box's oracle. A first Core attempt with debug logging on was stopped after ten minutes and moved aside, so that its logging cost would not count against Core.
+
+[size=12pt][b]Chapter 19: Run 27, and what was wrong with it[/b][/size]
+
+The Core v31.1 baseline ran from 2026-09-17 23:26:54Z until it logged [tt]Leaving InitialBlockDownload[/tt] at 2026-09-18 19:07:03Z, at height 967,454: 19 h 40 m 09 s. Its process was restarted once, for twelve seconds at 06:12Z, to move it under systemd, and resumed with a cold cache.
+
+Run 27 started on the same NVMe at 19:15:29Z on 09-18, on build [tt]ad77e46e[/tt]. It had every block stored after 18 h 36 m 24 s, applied the tip 18 h 40 m 23 s in (13:55:52Z in its log), and its harness, which checks every five minutes, recorded the tip at 18 h 43 m 11 s. Its capstone:
+
+[code]2026-09-19T13:59:41Z PASS muhash identical at 967712
+    (09f5cd877189dc269f505f2066aa2a0b39eb0b8e3384a48449880affd6490ee7)[/code]
+
+At every 50,000-block mark from 400,000 on, run 27 was ahead of Core's time for the same height. Core's early timeline had to be recovered from the creation times of its block files, because the twelve-second restart had trimmed its log (Appendix B describes the method).
+
+[table]
+[tr][td][b]height[/b][/td][td][b]Core v31.1[/b][/td][td][b]bmc run 27 (at most)[/b][/td][td][b]bmc ahead (at least)[/b][/td][/tr]
+[tr][td]400,000[/td][td]1 h 40 m[/td][td]1 h 35 m[/td][td]5 m[/td][/tr]
+[tr][td]500,000[/td][td]3 h 50 m[/td][td]3 h 41 m[/td][td]9 m[/td][/tr]
+[tr][td]600,000[/td][td]6 h 14 m[/td][td]5 h 56 m[/td][td]18 m[/td][/tr]
+[tr][td]700,000[/td][td]9 h 08 m[/td][td]8 h 48 m[/td][td]20 m[/td][/tr]
+[tr][td]800,000[/td][td]12 h 24 m[/td][td]12 h 02 m[/td][td]22 m[/td][/tr]
+[tr][td]900,000[/td][td]16 h 51 m[/td][td]16 h 13 m[/td][td]38 m[/td][/tr]
+[tr][td]950,000[/td][td]18 h 58 m[/td][td]18 h 03 m[/td][td]55 m[/td][/tr]
+[tr][td]tip[/td][td]19 h 40 m 09 s[/td][td]18 h 40 m 23 s[/td][td]~60 m[/td][/tr]
+[/table]
+
+The run's own report treats this as indicative, not clean, for these reasons:
+
+[list type=decimal][li]Both runs were polled by a monitoring tool (Blockyard, a sibling project on the same machine), which the operator had asked to follow them. Core was polled for about 17 of its 19 h 40 m. Core's [tt]gettxoutsetinfo[/tt] forces a UTXO cache flush on every call, so Core flushed its cache about once a minute for most of its run. Run 27 was polled for about 14 hours. On its build, each poll re-read a large index tail from the start and re-walked the chain. Measured from the kernel's per-process I/O counters, run 27's RPC side read 10.2 TB over the run (203 MB/s on average), while the sync itself read 136 MB/s. In the minute after polling stopped, the RPC side read nothing.[/li][li]Run 27 maintained an index nobody had asked for. The node started the txo-spender index tail on every boot, whatever the config said, so run 27 wrote an index Core did not (about 98 GB by the end).[/li][li]Run 27 skipped work Core did. The harness had not built the helper binaries that fold the txindex into its final form, so the node logged that the builder was missing 222 times and never built it.[/li][li]Run 27's final hour overlapped a test gate and a production restart on the same machine.[/li][/list]
+
+The first two burdened bmc, the third favoured it, and the polling burdened both sides differently. Most of bmc's lead was gained after 850,000, which is after its polling stopped at 09:07Z on 09-19, while Core's polling had continued to the end. The run's contaminants are listed in its report so that nobody quotes the 60 minutes without them.
+
+[size=12pt][b]Chapter 20: The clean pair[/b][/size]
+
+Every one of those contaminants now has a fix:
+
+[list][li]Indexes run only when their config key is set, as in Core (#275).[/li][li]The harness builds every helper binary and refuses to start without them (#275).[/li][li]Trivial RPC calls answer in milliseconds during a sync (#280). Before, one slow call could hold the lock every other call waited on, and on run 27 [tt]uptime[/tt] took 15 seconds.[/li][li]The harness makes no RPC call to the node until the download's own heartbeat says the sync is complete. Every five minutes it names any process connected to the node's RPC port and counts connections that closed in the last minute, which is how a poller that is in and out in milliseconds shows up (#281).[/li][/list]
+
+And an operator rule, from 2026-09-19:
+
+[quote]"never add an IBD node to blockyard. Let the run finish before anything queries its RPC."[/quote]
+
+The Core rerun started at 14:28:33Z on 09-19, on a fresh datadir on the same NVMe, under its own systemd unit from its first second, not enabled and not restarted on failure, so that a crash or reboot would end the run visibly instead of resuming it quietly. It is watched without RPC: a script reads its log for [tt]Leaving InitialBlockDownload[/tt] and the kernel's socket table for anyone calling in. Its first launch failed in its first second, and that was the assistant's error: with no [tt]bind=[/tt] line, Core also binds its onion listener on 127.0.0.1 at the P2P port plus one, and that was where the assistant had put RPC. A regtest agent had reported the same trap earlier that day, and the finding did not reach the benchmark config. The one-second-old datadir was moved aside, not deleted, and the rerun began 29 minutes after run 27 ended.
+
+Results of the clean pair:
+
+[table]
+[tr][td][/td][td][b]Core v31.1 rerun[/b][/td][td][b]bmc run 28[/b][/td][/tr]
+[tr][td]started[/td][td]2026-09-19 14:28:33Z[/td][td][b][[PENDING]][/b][/td][/tr]
+[tr][td]build[/td][td]v31.1 [tt]9be056a8[/tt][/td][td][b][[PENDING: main commit]][/b][/td][/tr]
+[tr][td]left IBD / reached tip[/td][td][b][[PENDING: watch.log IBD_END]][/b][/td][td][b][[PENDING: phase.log IBD_END]][/b][/td][/tr]
+[tr][td]wall clock[/td][td][b][[PENDING]][/b][/td][td][b][[PENDING]][/b][/td][/tr]
+[tr][td]UTXO set vs Core[/td][td](the oracle)[/td][td][b][[PENDING: capstone]][/b][/td][/tr]
+[tr][td]strangers on the RPC port[/td][td][b][[PENDING: watch.log]][/b][/td][td][b][[PENDING: phase.log]][/b][/td][/tr]
+[/table]
+
+Comparing the two Core runs will also measure what the polling cost Core, segment by segment, from height ~580,000 onward, where the first run's log survives: [b][[PENDING]][/b].
+
+[size=12pt][b]Chapter 21: Where the time goes[/b][/size]
+
+[list][li]The download is flat at about 11 MB/s in every run, whatever the worker count, on a 2.5 Gb/s link with no shaping: "an external pipe, not a peer-supply limit". On run 22, sampled at 96% of the chain, the block-apply thread used 20% of one core, the workers spent 11 to 20% of their time waiting for peer bytes, and iowait was zero.[/li][li]Mid-chain, 46 to 91% of per-block apply time is UTXO lookups. Script verification is small until the assumevalid point (938,343), where it rises to 29 to 46%. Core applies the same assumevalid default.[/li][li]Run 27 was bound by the download for almost its whole length. The one stretch where applying blocks set the pace was 07:45 to 08:31Z on 09-19, heights 811,000 to 824,000, under the monitor's load.[/li][li]At the tip the two nodes use about the same memory: bmc 7.0 GB resident across three processes, Core 6.7 GB across two.[/li][li]On disk, the block files are identical to within a tenth of a GiB. bmc's undo data is 2.5 times Core's, deliberately, because it keeps each spent output's script and value. Its txindex is 2.6 times smaller (26.2 against 68.8 GiB). It also carries two indexes Core has no equivalent of: the address history (203.5 GiB) and the txo-spender index (91.5 GiB).[/li][li]In the micro-benchmarks, nothing changed in this period: "on every operation this suite could compare directly, this project is at or behind Bitcoin Core". RIPEMD-160 is 3.16 times slower, SHA-512 1.79 times, ECDSA 1.12 times; only SHA-256 on 32 bytes is faster, by 1.06 times. The end-to-end sync is competitive because it is bound by the network and the UTXO set, not by hashing.[/li][/list]
+
+[hr]
+[i]Continued in the next post (2 of 2).[/i]

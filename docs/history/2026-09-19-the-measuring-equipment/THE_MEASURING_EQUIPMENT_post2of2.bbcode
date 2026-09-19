@@ -1,0 +1,235 @@
+[size=16pt][b]THE MEASURING EQUIPMENT[/b][/size] [i](part 2 of 2)[/i]
+
+[hr]
+[size=14pt][b]PART V: PARITY — a name is not a contract[/b][/size]
+
+[size=12pt][b]Chapter 22: Method names, and then shapes[/b][/size]
+
+By 09-12 every one of Core v31.1's 156 RPC method names existed on the node, and none was a stub. The parity plan, which had tracked method names, gained a new first line that day:
+
+[quote]"2026-09-12: this file tracks METHOD NAMES, and that is not parity."
+"A name is not a contract."
+[i]-- docs/PARITY_PLAN.md[/i][/quote]
+
+A script that diffs the full JSON key paths of each response against a live Core found more than thirty missing fields in its first run. [tt]getrawmempool true[/tt] returned 4 of Core's 16 fields per entry; [tt]getpeerinfo[/tt] returned 19 of 38. The response shapes of 18 methods were then captured from Core v31.1 on regtest and frozen into a test that runs in the gate, so that a missing field fails the build instead of waiting to be noticed.
+
+One correction on the way is worth recording. The 09-03 audit had removed the [tt]coinbase_tx[/tt] field from [tt]getblock[/tt], reasoning that "Core's blockToJSON has no such member", and added a test pinning its absence. v31.1 returns it. The field was restored on 09-12. An audit, too, can be wrong.
+
+The live survey that found these gaps also found a hazard: its probe loop "called [tt]clearbanned[/tt], [tt]ping[/tt], then [tt]stop[/tt], and took production down for ninety seconds". It now carries a list of methods it must never call.
+
+[size=12pt][b]Chapter 23: The wrong Core[/b][/size]
+
+The box's long-running Core oracle is a v31.99 development build, and for a week field diffs ran against it. On 09-18 the first diff against a real v31.1 release showed what that had cost, in both directions:
+
+[quote]"diffing against it invented work"
+[i]-- docs/PARITY_RPC_FIELDS.md, on fields that exist only in the[/i]
+development build[/quote]
+
+And it hid real gaps. [tt]getdeploymentinfo[/tt] and [tt]getmempoolentry[/tt] had "matched" because the development build had buried taproot's deployment entry and added two mempool fields that v31.1 does not have. Against v31.1, the node was missing the taproot entry and [tt]bip125-replaceable[/tt], and carried the two development-only fields as extras. Three pull requests (#269, #271, #273) closed those and more:
+
+[list][li][tt]getpeerinfo[/tt] had been called 38 of 38 on 09-12, and was not: [tt]addrlocal[/tt] was never emitted (0 of 11 peers against Core's 10 of 10), and the fixture test had excused two missing fields as "conditional".[/li][li]taproot is now reported from a real BIP9 state machine walked over the node's own headers, and matches Core at 32 mainnet heights across its whole lifecycle. The comparison also found three existing defects in the [tt]script_flags[/tt] field.[/li][li][tt]chunkweight[/tt] and [tt]fees.chunk[/tt] were missing from 71,710 of 79,626 mempool entries on production, every entry in a multi-transaction cluster. They are now reported for all, and matched Core chunk for chunk on 336 production clusters.[/li][/list]
+
+The rule that came out of it: "never quote a parity figure taken against 8335", the development oracle's port.
+
+[size=12pt][b]Chapter 24: ZMQ[/b][/size]
+
+When the operator asked for ZMQ to be turned on for production on 09-19, a real libzmq subscriber received 3,180 [tt]hashtx[/tt], 3,178 [tt]rawtx[/tt], 2 [tt]hashblock[/tt] and no [tt]rawblock[/tt] at all over two blocks. The publisher sized each subscriber's socket buffer at about 256 KB and wrote without blocking; a 1 to 2 MB block never fit, so the publisher disconnected the subscriber instead:
+
+[quote]"rawblock was never delivered to anyone, and every block disconnected every subscriber on its endpoint."
+[i]-- docs/CORE_DIVERGENCES.md[/i][/quote]
+
+It now has a per-subscriber queue bounded in messages, as libzmq's publisher does, which drops individual messages for a slow subscriber and keeps the connection (#274). The same day, the [tt]sequence[/tt] topic, which the node had refused because it "could publish adds but not removes", was implemented (#278). The single point that sees every mempool removal had existed since 09-16, in the departure journal; the refusal predated it. Event for event, the node's sequence stream matches Core v31.1's on adds, replacements, block conflicts, [tt]invalidateblock[/tt], [tt]reconsiderblock[/tt] and a one-step reorg. Building it found that [tt]invalidateblock[/tt] over RPC had never worked.
+
+Deployed, the queue exposed one more loss: transaction notifications were staged in a 64-slot ring and silently overwritten under load. The overrun was counted in the log but never shown to subscribers as a gap. On a mempool reload, 256 of 6,000 reloaded transactions reached [tt]hashtx[/tt] on regtest. After #283, the production node reloaded 72,366 transactions, and a subscriber received 74,280 [tt]hashtx[/tt] and 74,280 [tt]sequence[/tt] additions, the same set, with no gaps.
+
+[size=12pt][b]Chapter 25: Relay[/b][/size]
+
+On 09-19 a regtest differential set up to measure something else showed that the node never accepted a transaction Core relayed to it, in either direction. It found three defects (#277). Two affect mainnet:
+
+[list][li]Every block announcement the node sent by [tt]inv[/tt] carried the block hash with its bytes reversed, so "every inv(MSG_BLOCK) named a block nobody has". A test asserted the reversed bytes.[/li][li]Inbound connections validated transactions against a snapshot of the UTXO set taken when the process started, so they rejected any transaction spending a newer coin as missing its inputs. "On mainnet the loss grows with uptime and was masked by the outbound legs."[/li][/list]
+
+The third affected only nodes configured with [tt]connect=[/tt], which production is not: the node's only connection asked its peer not to relay transactions at all.
+
+[size=12pt][b]Chapter 26: What still differs, on purpose[/b][/size]
+
+docs/CORE_DIVERGENCES.md lists every deliberate difference with its reason. As of 09-19 they include:
+
+[list][li]a process per download peer, where Core uses threads;[/li][li]a 512 MiB per-subscriber byte ceiling on the ZMQ queues on top of Core's message limit, because "this box has been OOM-killed before";[/li][li]six stated differences in the [tt]sequence[/tt] stream's ordering during multi-block reorgs;[/li][li][tt]getchainstates[/tt] omits Core's two cache-size fields, because the node has no caches those numbers would describe, and reporting [tt]dbcache[/tt] under Core's names would invent them;[/li][li][tt]getrawaddrman[/tt] omits [tt]source[/tt], because the address book stores the source's network group only, and "a plausible-looking address that no peer ever sent" would be worse than no field;[/li][li]additions under a [tt]bmc[/tt] prefix, never inside Core's own shapes: [tt]bmcgetdownloadinfo[/tt], [tt]bmcgetmempooljournal[/tt], [tt]bmcgetcapabilities[/tt], and a build attestation in [tt]getnetworkinfo[/tt].[/li][/list]
+
+[hr]
+[size=14pt][b]PART VI: SECURITY — 182 findings, one that fell through, and a leak[/b][/size]
+
+[size=12pt][b]Chapter 27: Closing an audit by ID[/b][/size]
+
+By the morning of 09-04 all 29 distinct CRITICAL and HIGH findings of the 09-03 audit were closed, and 43 of the 44 MEDIUM. The remediation log said what that sentence leaves out:
+
+[quote]"the 65 LOW and 32 INFO -- 97 findings, more than half the audit -- have never been examined at all. 'All CRITICAL+HIGH and 43 of 44 MEDIUM' is true and is also the flattering way to say it."
+[i]-- docs/audits/AUDIT_2026-09-03_REMEDIATION.md[/i][/quote]
+
+(The audit's own table gives 68 LOW and 33 INFO; the two documents disagree, and this report quotes each as written.)
+
+On 09-05 a commit announced the LOW tier closed, "68 of 68". The next commit opened:
+
+[quote]"CORRECTION FIRST. My previous commit said this audit's LOW tier was '68 of 68'. It was 67. STO-10 was dropped ... a comm of the audit's LOW ids against every id mentioned in any commit message is what caught it."
+[i]-- commit a12cfc5a[/i][/quote]
+
+STO-10 was a real defect: after a reorg, a serving process could answer a request for a block hash with whatever block sat at that height. Since then, closure is tracked by re-deriving the open list from the finding IDs, never from the narrative of what was done. The audit was declared fully closed on 09-05, "every audit finding closed, accepted or deferred with a reason", with zero findings unaccounted for.
+
+Every fix carried a negative control: revert the fix, watch the test fail. "Four of those negative controls found the test rather than the fix." Six new tests passed against the unfixed code. One of them, for STO-10, installed its fixture after the harness forked, so the fixture existed only in the parent: "A fixture written after a fork does not exist for the child."
+
+The audit's findings themselves needed checking. Some were already fixed under other IDs. Some were understated: a finding rated benign was a potential crash, and a cryptographic bound quoted as 2^223 was about 2^112. Some came with suggested fixes that would have introduced bugs, one of which would have left the wallet unlocked forever. The project's rule: an audit finding is a hypothesis, to be verified against the code before it is fixed.
+
+A second review on 09-05 went over the script interpreter with eight different search angles: 36 candidate findings, 17 kept after verification, 5 refuted. The one CRITICAL finding (IR-1) was a discarded return value when the stack reaches 1,000 items, next to a fix made two days earlier.
+
+[size=12pt][b]Chapter 28: Keys in a backup folder[/b][/size]
+
+On 09-04 a pre-deploy snapshot folder, backups/, was committed to the public repository with the rest of the tree. It held the live node's onion v3 private key, its I2P private key and its encrypted wallet, byte for byte the same as the live ones. They were public for three days. On 09-07 the folder was removed (#84), backups/ was added to .gitignore, the history was rewritten in a mirror with the paths dropped, and the live keys were renamed with a [tt].compromised-20260904[/tt] suffix so that the node generates new ones. The force-push of the rewritten history and the request to GitHub to purge orphaned commits are the operator's to run; the assistant's permission classifier blocks both.
+
+In the same period the assistant committed under the operator's personal email address, taken from session context instead of the repository's configured identity. GitHub attributes commits by email address, which linked the pseudonymous account to a real person. The history rewrite covered those commits too. The rule that followed: the project has one identity, and the personal name and address "are never to leave this machine".
+
+Earlier, a live password for the Core oracle's RPC had sat in two validation scripts since 08-16. It was rotated by moving the oracle to cookie authentication only: "It remains in git history and always will."
+
+[hr]
+[size=14pt][b]PART VII: THE SCAR TISSUE — incidents, and the patterns they share[/b][/size]
+
+The first report counted its incidents by the part of the node they hit. In these seventeen days the incident register has 35 entries, and they are better grouped by shape: most of them are the same few mistakes in different clothes. Each has a rule now, and the project's rulebook explains why every rule cites its incident: "a rule without its scar tissue gets argued away".
+
+[size=12pt][b]Chapter 29: A green suite that measured nothing[/b][/size]
+
+[list][li]A link check ran before anything was built, failed in a fresh worktree, and stopped every test from running; the log "read exactly like a clean build". (09-03)[/li][li]A differential oracle for false accepts was silently dead for more than a day after a commit replaced its protocol. Its headline read "ZERO DIVERGENCES", "technically true and completely meaningless", above a line nobody read: "engine failures: 7879". (09-03)[/li][li]Six new tests passed against unfixed code. (09-03 to 09-05)[/li][li]The capstone compared empty to empty for months. (until 09-11)[/li][li]Seventeen differentials printed "ALL 0 MATCH" on empty case sets. (09-13)[/li][li]Three times in one day, a test run after a failed build ran the previous binary and printed ALL TESTS PASSED, twice during a check meant to prove a test could fail. "A reversion that does not compile is a NON-RESULT." (09-15)[/li][/list]
+
+The countermeasures are the revert-the-fix control, a refusal to pass on an empty result (exit 2), and checking the build's exit code before trusting any test output.
+
+[size=12pt][b]Chapter 30: DONE on paper, zero at runtime[/b][/size]
+
+Compact-block receive was marked DONE on 09-06. On 09-08 an outside review said the node could not receive compact blocks; the assistant told the operator the claim was outdated and rewrote three documents to say so. Two hours later production's own counter read 0 blocks reconstructed. The cause, found the next day: the node recognised a [tt]block[/tt] message by comparing five bytes, and [tt]blocktxn[/tt] begins with the same five. Every reply to a compact block was taken for a full block and failed. Production counted 1,262 round trips and 0 blocks. "I corrected the docs and the user a second time."
+
+The same shape recurred: [tt]addnode[/tt] answered "done" and dialed nothing, because the runtime list had no reader; a dial backoff that was "designed, tested and reported" never applied on production, because its shared table was created in the wrong process; the index builder's periodic tick could not be reached during a sync, so "every index looked healthy on run 26 and no run was ever built". The rule: a feature is done when a counter on a live node shows it working.
+
+[size=12pt][b]Chapter 31: A comment that ends the inquiry[/b][/size]
+
+The node logged a non-monotonic archive warning 44 times in one day, and nobody looked, because the operations guide called it "expected on a parallel-downloaded archive". That was true before 09-08 and false after it. The warning was a real defect: six layout breaks, which disable truncation and pruning, and the path to Chapter 15. A monitoring tool's config disabled a data source on the strength of a similar stale comment. The rule: date a claim that something is benign against the change it describes.
+
+[size=12pt][b]Chapter 32: A threshold calibrated at one point[/b][/size]
+
+A 32 KB/s floor for evicting slow download peers was calibrated for megabyte-sized blocks. At height 50,000 a block is about 200 bytes and a healthy peer moves about 9 KB/s. Run 7 evicted 655 peers in 30 minutes, 181 of them peers that had served two full chunks. The operator:
+
+[quote]"We are killing peers that have served us blocks. wtf!"
+"Run 4 was a crime against good coding. That should be taught as 'what not to do'."[/quote]
+
+It became rule 11 of the project's engineering rules: a threshold is relative to the population it judges, and every eviction prints the value and the bar. The same family includes the 2,048-input sequence ledger that rejected block 880,338, and a sizing rule that booted every fresh sync on a 64 MB memory table while [tt]dbcache=8192[/tt] sat unused, because it asked whether the node was at the tip without asking which tip: "When a rule says 'tip', ask which tip."
+
+[size=12pt][b]Chapter 33: The tools as an adversary[/b][/size]
+
+A category that barely existed in the first report: the assistant's own tools producing false evidence.
+
+[list][li][tt]pgrep -f[/tt] matched the shell that was waiting on it, so three gate waiters waited on themselves, and one [tt]pkill -f[/tt] killed its own session.[/li][li]An unquoted heredoc executed the backtick code spans in a report as shell commands, and the mangled text was committed.[/li][li][tt]open(p, 'w').write(open(p).read()...)[/tt] truncates the file before reading it, and emptied a document that was then pushed.[/li][li][tt]git add -A[/tt] in the same step as a .gitignore edit committed ten 31 MB binaries.[/li][li]A background gate inherited a stale working directory and produced a two-line log that "was nearly read as a real result".[/li][li][tt]chmod +x[/tt] never reaches a commit when git ignores file modes. Four failures in one day, "each time disguised as something else"; a check later found fifteen harness scripts that could not run.[/li][li]The agent harness killed a background task, with its whole process tree, for "low memory" while 100 GB were free.[/li][/list]
+
+Each has a one-line rule in the assistant's memory.
+
+[size=12pt][b]Chapter 34: Misreading the human[/b][/size]
+
+The costliest incidents of the period were not code defects. They were requests understood wrongly.
+
+On 09-08 the operator said "relaunch with updated binary". The assistant ran the fresh-run procedure it had used since run 10, which starts by deleting the datadir, and destroyed run 16 at 704,169 blocks after nine hours. "The operator meant: swap the binary, keep the data, resume." And: "I never said 'this wipes the run' before doing it." The rule: a relaunch reuses the datadir, and a wipe is announced in the sentence that proposes it.
+
+On 09-18 the operator asked for run 27 to be followed in the monitoring tool. The assistant added it, without saying that a monitor polling a timed node perturbs the measurement. It cost the measurement its cleanness (Chapter 19). The rule now is to say so, and to offer the run's log files instead.
+
+On 09-10 the operator said "Ignore the wifi". The assistant stopped investigating the wifi interface, which was the cause of the outage it was investigating.
+
+Each of these produced the same rule in different words: state the consequence before acting on an ambiguous request.
+
+[size=12pt][b]Chapter 35: The rules now in force[/b][/size]
+
+The operator's rules, in their own words where they exist:
+
+[table]
+[tr][td][b]rule[/b][/td][td][b]wording[/b][/td][td][b]since[/b][/td][/tr]
+[tr][td]one identity[/td][td]the personal name and email "are never to leave this machine"[/td][td]09-04[/td][/tr]
+[tr][td]batches land as merge commits[/td][td]"PR per batch, merge commit, never squash or force-push"[/td][td]09-05[/td][/tr]
+[tr][td]flags match Core[/td][td]"Our flags need to match core. Never do something different unless we discuss it."[/td][td]09-06[/td][/tr]
+[tr][td]Core is compared at Core's defaults[/td][td]"Don't ever take liberties with Core again."[/td][td]09-06[/td][/tr]
+[tr][td]no consensus caps Core lacks[/td][td]"If core has no cap, we should not have one either."[/td][td]09-09[/td][/tr]
+[tr][td]do what Core does[/td][td]"Do what core does! Retain both branch headers!"[/td][td]09-09[/td][/tr]
+[tr][td]fix causes[/td][td]"Fix the cause, not the symptom."[/td][td]09-09[/td][/tr]
+[tr][td]LAN only[/td][td]"Never over tailscale when we have ethernet"[/td][td]09-10[/td][/tr]
+[tr][td]benchmarks on flash[/td][td]"never platter drives"[/td][td]09-11[/td][/tr]
+[tr][td]everything builds during IBD[/td][td]"Everything should be generated during ibd."[/td][td]09-16[/td][/tr]
+[tr][td]named directories[/td][td]"Always create a named subdirectory and work inside it."[/td][td]09-17[/td][/tr]
+[tr][td]separate projects stay separate[/td][td]"You stick to bmc work."[/td][td]09-18[/td][/tr]
+[tr][td]no restarts in a baseline[/td][td]a benchmark node is never restarted or migrated mid-run[/td][td]09-18[/td][/tr]
+[tr][td]never poll a benchmark[/td][td]"never add an IBD node to blockyard. Let the run finish before anything queries its RPC."[/td][td]09-19[/td][/tr]
+[/table]
+
+The assistant's own rules, each from an incident in this period, include: verify tests by reverting the fix; a test that asserts the bug is a defect in the test; audit findings are hypotheses; track closure by ID; check linkage with [tt]nm[/tt], not grep; performance tests measure the finding's cost model; dry-run assembly patches on a scratch copy; name the writer and the reader of every new field before starting a twenty-minute gate; pin the height on both sides of a comparison; verify DONE by runtime counters; diff whole documents, not fields.
+
+[hr]
+[size=14pt][b]PART VIII: THE COLLABORATION — from standing authorization to a gated contract[/b][/size]
+
+[size=12pt][b]Chapter 36: The operator as the merge and deploy button[/b][/size]
+
+"21 FOR 21" described a mode of standing authorization: "just fix them, and redeploy the server if you need to". From about 09-08 an automatic permission classifier stands between the assistant and any action that is destructive or visible outside the machine. In this period it refused: deleting benchmark datadirs, killing processes, merging pull requests, restarting or deploying production, rolling production back, changing the firewall, force-pushing the rewritten history, writing the 293-byte archive repair, and temporarily reintroducing a consensus bug to test whether a test would catch it.
+
+The assistant's recorded stance toward these refusals is cooperative. On the consensus-bug experiment: "I did not look for a way around that." The same point was proved another way. On the archive repair: "correctly, it guards writes into archive files". Merges now happen only on the operator's explicit instruction. Some refusals held even after the operator had approved in the conversation, above all production deploys, and the operator then ran the command themselves or repeated the instruction in so many words. The operator decides what merges and what deploys; the assistant prepares, gates and hands over.
+
+The effect on the work is visible in the records: a finished, gated batch waits for a human to land it, and hand-off messages end with the exact command to run.
+
+[size=12pt][b]Chapter 37: Parallel agents[/b][/size]
+
+In "21 FOR 21" one model worked one change at a time. In this period the assistant began splitting independent work across subagents, each in its own git worktree on its own batch branch, each running the full gate before reporting back. On 09-19 alone, nine such agents worked on the fixes needed for a clean run 28, several at a time, and six of their pull requests merged within four minutes of each other.
+
+This introduced two new failure modes. The first is additive merge conflicts. Every branch appends its tests to the same line of the Makefile, and the combination of all branches is a tree that no single gate has tested. On 09-19 the combined tree failed its gate once on a stale-object false alarm, and once on a real interaction: a test that each branch had passed alone failed 1 run in 5 together. The second is knowledge that does not cross between agents: the Core port trap in Chapter 20 was known to one agent and not to the one who needed it.
+
+[size=12pt][b]Chapter 38: Memory as the institutional record[/b][/size]
+
+The assistant keeps a directory of short memory notes, loaded into every new session. Each records one lesson: what happened, why it matters, and how to apply it. On 09-19 it held more than sixty. Many cite dates, counts and the operator's words verbatim. They are how a rule made in one session reaches the next, and they were the richest single source for this report.
+
+They can also be wrong. Two notes told future sessions to rebuild indexes that were already correct; following them "would mean a multi-hour rebuild of indexes that are already correct". A note about a coin-height defect is kept, marked DISPROVED, "only so the claim is not re-made". Notes are corrected, not deleted, and the correction says why.
+
+[size=12pt][b]Chapter 39: Neighbours[/b][/size]
+
+The machine is shared. Blockyard, a web monitor and explorer for this node, is also written entirely by AI, directed by the same operator, in its own session. The two coordinate through the operator: bmc advertises what it can do through an RPC of its own, Blockyard reads bmc's logs and RPC, and each session reports the other's defects instead of fixing them. On 09-18 the operator drew the line: "the blockyard task is handling the rules. You stick to bmc work." The coupling has costs as well as benefits: Blockyard's polling perturbed both benchmark runs, and a stale comment in Blockyard's config had hidden a bmc defect.
+
+Another AI agent, a Hermes agent, works in the same checkout and pushes on top of the same branch. On 09-02 one of its jobs exhausted the machine's memory and forced a hard reset. After a global out-of-memory event on 09-08 killed the user session manager (and every terminal with it), the operator doubled the machine's RAM from 60 to 123 GB.
+
+[hr]
+[size=14pt][b]PART IX: WHAT IS STILL OPEN[/b][/size]
+
+Recorded as open in the project's own registers on 2026-09-19:
+
+[list][li]The clean benchmark pair: [b][[PENDING: Core rerun and run 28]][/b].[/li][li]A full-verification sync with [tt]assumevalid=0[/tt] was parked at 77% on 09-06 and has never completed. The compatibility register still says RUNNING.[/li][li]A UTXO record cannot store an output script longer than 65,535 bytes; [tt]submitblock[/tt] refuses blocks with more than 16,384 transactions.[/li][li]The node's cluster linearization is a greedy approximation; Core v31.1 searches for the optimal one. They agree on every shape tested, and may differ on clusters where transactions have several parents and several children.[/li][li][tt]getrawtransaction[/tt] and [tt]gettxspendingprevout[/tt] scan their index's unfolded tail linearly on every lookup.[/li][li]Core publishes [tt]hashtx[/tt] and [tt]rawtx[/tt] for every transaction in a connected block; the node publishes them only for mempool accepts.[/li][li]The node sends no [tt]feefilter[/tt] on outbound connections and ignores [tt]sendheaders[/tt] there.[/li][li]Every bulk [tt]getrawmempool true[/tt] allocates about 8.4 KB per entry, about 670 MB at production's mempool size.[/li][li]The first [tt]getchaintxstats[/tt] after each restart takes 9 to 23 seconds.[/li][li]Six old layout breaks remain in run 26's archive.[/li][li]Whether the rewritten history reached GitHub is recorded only as the operator's action.[/li][li]The micro-benchmarks are unchanged since August: the hashing and signature primitives are at or behind Core's.[/li][/list]
+
+[hr]
+[size=14pt][b]APPENDIX A: THE NUMBERS, ON ONE PAGE[/b][/size]
+
+[table]
+[tr][td][/td][td][b]value[/b][/td][td][b]source[/b][/td][/tr]
+[tr][td]period[/td][td]2026-09-02 to 2026-09-19 (days 22 to 38 of the git record)[/td][td]git[/td][/tr]
+[tr][td]commits on main since 09-02[/td][td]927 (642 non-merge, 285 merges)[/td][td]git, deduplicated[/td][/tr]
+[tr][td]merged pull requests[/td][td]282 (#2 to #283)[/td][td]GitHub[/td][/tr]
+[tr][td]code and tests[/td][td]~318,200 lines (+25%)[/td][td]git[/td][/tr]
+[tr][td]gate test programs[/td][td]428 (from 324)[/td][td]asm/Makefile[/td][/tr]
+[tr][td]RPC methods[/td][td]166, including all 156 of Core v31.1's[/td][td]dispatch tables, PR #188[/td][/tr]
+[tr][td]models[/td][td]Claude Fable 5.1 (310), Opus 5 (269), Sonnet 5 (10)[/td][td]commit trailers[/td][/tr]
+[tr][td]audit findings[/td][td]182 (5 CRITICAL, 32 HIGH, 44 MEDIUM, 68 LOW, 33 INFO)[/td][td]CODEBASE_AUDIT_2026-09-03[/td][/tr]
+[tr][td]UTXO set comparisons with Core[/td][td]9, every real one identical[/td][td]Part III[/td][/tr]
+[tr][td]run 27[/td][td]tip in 18 h 40 m 23 s, muhash identical at 967,712[/td][td]debug.log, phase.log[/td][/tr]
+[tr][td]Core v31.1 baseline #1[/td][td]19 h 40 m 09 s (polled)[/td][td]debug.log[/td][/tr]
+[tr][td]Core v31.1 rerun (unpolled)[/td][td][b][[PENDING]][/b][/td][td]watch.log[/td][/tr]
+[tr][td]run 28 (unpolled, fixed code)[/td][td][b][[PENDING]][/b][/td][td]phase.log[/td][/tr]
+[tr][td]download rate[/td][td]~11 MB/s in every run[/td][td]debug.log[/td][/tr]
+[tr][td]memory at the tip[/td][td]bmc 7.0 GB, Core 6.7 GB[/td][td]PERFORMANCE.md[/td][/tr]
+[tr][td]incidents in the register[/td][td]35[/td][td]memory, worklogs[/td][/tr]
+[/table]
+
+[hr]
+[size=14pt][b]APPENDIX B: RECOVERING A TIMELINE FROM BLOCK FILES[/b][/size]
+
+The twelve-second restart of the first Core baseline trimmed its debug.log to the last ten megabytes, which erased every progress line before height ~580,000. The timeline was recovered from the block files themselves. Core creates each [tt]rev?????.dat[/tt] undo file when it connects the first block stored in the matching [tt]blk?????.dat[/tt] file. The height of that block is the height of the first header in the blk file. Core v31.1 obfuscates block files with an XOR key kept in [tt]blocks/xor.dat[/tt], so each header is decoded with that key before hashing, and the hash is looked up to get its height. Checked against the surviving log at ten heights between 616,000 and 951,000, the file creation time ran 0 to 143 seconds earlier than the log, and under 60 seconds at nine of the ten.
+
+The Core rerun sets [tt]shrinkdebugfile=0[/tt], so it will not need this.
+
+[hr]
+[size=14pt][b]APPENDIX C: READING ORDER — AUDITING THIS REPORT AGAINST THE SOURCE[/b][/size]
+
+[list type=decimal][li]docs/reports/2026-09-18-run27/README.md: the headline benchmark, its contaminants, and the Core rerun's setup.[/li][li]docs/reports/2026-09-11-ibd-vs-core.md and docs/reports/2026-09-11-run22-muhash-divergence.md, with their correction boxes: the capstone that never ran, and the torn read.[/li][li]docs/reports/2026-09-17-run26-vs-core.md: two disks, not two implementations.[/li][li]docs/devlog/RESUME_2026-09-17.md and docs/devlog/2026-09-18-frontier-verified-on-a-live-restart.md: block 967,422.[/li][li]docs/audits/CODEBASE_AUDIT_2026-09-03.md, then docs/audits/AUDIT_2026-09-03_REMEDIATION.md, then commits fa6594c8 and a12cfc5a: an audit, its closure, and the finding that fell through.[/li][li]docs/PARITY_RPC_FIELDS.md and docs/CORE_DIVERGENCES.md: parity as measured, and every deliberate difference.[/li][li]docs/devlog/DEPLOYMENT_HISTORY.md: what production ran, and when.[/li][li]The daily worklogs, worklog/2026-09-*.md (09-11 to 09-15 were written after the fact, from the commit record).[/li][/list]
