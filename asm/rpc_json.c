@@ -518,7 +518,7 @@ void rj_typeerr_add(rj_typeerrs* t, int position, const char* name,
 }
 
 int rj_typeerr_fail(rj_typeerrs* t, long* ec, const char** em) {
-    static char out[2048 + 32];
+    static __thread char out[2048 + 32];   /* per thread: lane methods run concurrently */
     if (!t->n) return 0;
     snprintf(out, sizeof out, "Wrong type passed:\n{\n%s\n}", t->buf);
     *ec = -3; *em = out; return 1;

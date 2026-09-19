@@ -154,7 +154,8 @@ static void make_post(char* buf, size_t cap, int port, const char* user,
 static int has_prefix(const char* s, const char* p) { return strncmp(s, p, strlen(p)) == 0; }
 static int has_substr(const char* s, const char* sub) { return strstr(s, sub) != NULL; }
 
-extern int rpc_body_concurrent(const char* body, unsigned long blen);
+extern int rpc_method_lock_class(const char* m);
+extern int rpc_body_fast(const char* body, unsigned long blen);
 
 int main(void) {
     /* ---- spin up the REAL server daemon on an ephemeral port ---- */
@@ -715,35 +716,59 @@ int main(void) {
         close(sfd);
     }
 
-    /* ---- which methods may run concurrently (2026-09-17) ----------------
-     * Handlers run under one lock because they share a store handle, a block
-     * buffer and per-query caches. Four methods share none of that and were
-     * never protected by that lock anyway -- the peer tables are written by
-     * the download worker without it, and getmempoolinfo takes the mempool's
-     * own lock -- so they take the READ side and run concurrently.
+    /* ---- how each method executes (2026-09-17, reclassified 2026-09-19) ---
+     * 1 FAST: no execution lock, answered on the intake thread.
+     * 2 NOLOCK: no execution lock, but may be slow: the execution pool.
+     * 3 SHARED: the read side.  4 EXCL: the write side.
+     * A method is FAST or NOLOCK only because its handler was made independent
+     * of what the write lock protects (rpc_chain.c "lanes": a private store
+     * handle under its own mutex; the peer tables were never guarded by it).
      *
-     * This asserts the CLASSIFICATION, not a timing. A method added to that
-     * list without checking what it touches is a data race, and a race does
-     * not show up as a slow test. */
+     * This asserts the CLASSIFICATION, not a timing. A method added to those
+     * lists without checking what it touches is a data race, and a race does
+     * not show up as a slow test. test_rpc_responsive measures the timing. */
     {
-        struct { const char* body; int want; const char* why; } cases[] = {
-          { "{\"method\":\"getpeerinfo\",\"params\":[]}",         1, "getpeerinfo is concurrent" },
-          { "{\"method\":\"getconnectioncount\",\"params\":[]}",  1, "getconnectioncount is concurrent" },
-          { "{\"method\":\"getnetworkinfo\",\"params\":[]}",      1, "getnetworkinfo is concurrent" },
-          { "{\"method\":\"getmempoolinfo\",\"params\":[]}",      1, "getmempoolinfo is concurrent" },
-          { "{\"method\":\"getblockchaininfo\",\"params\":[]}",   0, "getblockchaininfo is NOT (it mutates the shared store handle)" },
-          { "{\"method\":\"getblock\",\"params\":[]}",            0, "getblock is NOT (shared block buffer)" },
-          { "{\"method\":\"getblocktemplate\",\"params\":[]}",    0, "getblocktemplate is NOT (static template arrays)" },
-          { "{\"method\":\"submitblock\",\"params\":[]}",         0, "a writer is NOT" },
-          { "{\"method\":\"sendrawtransaction\",\"params\":[]}",  0, "a writer is NOT" },
-          { "[{\"method\":\"getpeerinfo\",\"params\":[]}]",       0, "a BATCH takes the write lock even when every entry is concurrent" },
-          { "not json at all",                                      0, "an unparseable body takes the write lock" },
-          { "\"a bare string\"",                                    0, "a non-object body takes the write lock" },
+        struct { const char* m; int want; const char* why; } mc[] = {
+          { "uptime",             1, "uptime is FAST (reads a start time)" },
+          { "getblockcount",      1, "getblockcount is FAST (fast lane)" },
+          { "getbestblockhash",   1, "getbestblockhash is FAST (fast lane)" },
+          { "getblockchaininfo",  1, "getblockchaininfo is FAST (fast lane: its own store handle)" },
+          { "getdifficulty",      1, "getdifficulty is FAST (fast lane)" },
+          { "getindexinfo",       1, "getindexinfo is FAST (O(1) tail probes, its own run sets)" },
+          { "getpeerinfo",        1, "getpeerinfo is FAST (shared peer tables)" },
+          { "getconnectioncount", 1, "getconnectioncount is FAST" },
+          { "getnetworkinfo",     1, "getnetworkinfo is FAST" },
+          { "getchaintxstats",    2, "getchaintxstats is lock-free but may be slow (its own lane)" },
+          { "waitfornewblock",    2, "waitfornewblock is lock-free but slow (a handle per call)" },
+          { "waitforblockheight", 2, "waitforblockheight likewise" },
+          { "waitforblock",       2, "waitforblock likewise" },
+          { "getmempoolinfo",     3, "getmempoolinfo takes the read side" },
+          { "getblock",           4, "getblock is EXCL (shared block buffer)" },
+          { "getblockheader",     4, "getblockheader is EXCL (shared store handle)" },
+          { "getblockstats",      4, "getblockstats is EXCL" },
+          { "getblocktemplate",   4, "getblocktemplate is EXCL (static template arrays)" },
+          { "getrawtransaction",  4, "getrawtransaction is EXCL (index readers)" },
+          { "submitblock",        4, "a writer is EXCL" },
+          { "sendrawtransaction", 4, "a writer is EXCL" },
+          { "nosuchmethod",       4, "an unknown method takes the write lock" },
         };
-        for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++){
-            int got = rpc_body_concurrent(cases[i].body, strlen(cases[i].body));
-            ck(cases[i].why, got == cases[i].want);
-        }
+        for (unsigned i = 0; i < sizeof mc / sizeof mc[0]; i++)
+            ck(mc[i].why, rpc_method_lock_class(mc[i].m) == mc[i].want);
+
+        struct { const char* body; int want; const char* why; } bc[] = {
+          { "{\"method\":\"uptime\",\"params\":[]}",            1, "a FAST request runs on the intake thread" },
+          { "{\"method\":\"getpeerinfo\",\"params\":[]}",       1, "getpeerinfo runs on the intake thread" },
+          { "[{\"method\":\"uptime\"},{\"method\":\"getblockcount\"}]", 1, "a batch of FAST entries runs on the intake thread" },
+          { "[{\"method\":\"uptime\"},{\"method\":\"getblock\"}]", 0, "a batch with ANY non-FAST entry goes to the pool" },
+          { "{\"method\":\"getchaintxstats\",\"params\":[]}",   0, "getchaintxstats goes to the pool (a first build is slow)" },
+          { "{\"method\":\"getmempoolinfo\",\"params\":[]}",    0, "a SHARED request goes to the pool (it may wait on the lock)" },
+          { "{\"method\":\"getblock\",\"params\":[]}",          0, "an EXCL request goes to the pool" },
+          { "[]",                                                    0, "an empty batch goes to the pool" },
+          { "not json at all",                                       0, "an unparseable body goes to the pool" },
+          { "\"a bare string\"",                                   0, "a non-object body goes to the pool" },
+        };
+        for (unsigned i = 0; i < sizeof bc / sizeof bc[0]; i++)
+            ck(bc[i].why, rpc_body_fast(bc[i].body, strlen(bc[i].body)) == bc[i].want);
     }
 
     /* ---- teardown ---- */

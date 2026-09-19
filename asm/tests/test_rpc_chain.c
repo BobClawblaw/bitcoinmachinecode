@@ -1774,9 +1774,15 @@ int main(void){
     ck("getchaintxstats -> object", r && r->typ == RJ_OBJ);
     ck_str("window_final_block_height", S(r,"window_final_block_height"), "3");
     /* the fixture is shorter than the 4320-block default, so the window
-     * clamps to the chain */
-    ck_str("window clamps to the chain length", S(r,"window_block_count"), "3");
-    ck_str("window_tx_count counts heights 1..3 = 1+1+3", S(r,"window_tx_count"), "5");
+     * clamps -- to height - 1, as Core's does:
+     *   blockcount = std::max(0, std::min(blockcount, pindex->nHeight - 1));
+     * These two asserted 3 and 5 (the whole chain) until 2026-09-19, which
+     * pinned the old clamp to `height` rather than Core's `height - 1`. */
+    ck_str("window clamps to height - 1, as Core's does", S(r,"window_block_count"), "2");
+    ck_str("window_tx_count counts heights 2..3 = 1+3", S(r,"window_tx_count"), "4");
+    /* window_interval is the MEDIAN-TIME-PAST difference, not the header
+     * times': MTP(3) = t0+1200 (median of 4), MTP(1) = t0+600 (median of 2) */
+    ck_str("window_interval is MTP(final) - MTP(final - window)", S(r,"window_interval"), "600");
     ck_str("txcount is the CUMULATIVE count including genesis", S(r,"txcount"), "6");
     ck("txrate present when the window has a positive interval",
        rj_obj_get(r,"txrate") != NULL);
@@ -1792,6 +1798,20 @@ int main(void){
       rj_free(r); }
     expect_err("a window past the chain -> -8", "getchaintxstats", "[9999]", -8,
                "Invalid block count: should be between 0 and the block's height - 1");
+    /* Core: blockcount > 0 && blockcount >= height is refused -- a window
+     * equal to the height would need the block below genesis */
+    expect_err("a window equal to the height -> -8", "getchaintxstats", "[3]", -8,
+               "Invalid block count: should be between 0 and the block's height - 1");
+    { char p[160]; snprintf(p, sizeof p, "[1, \"%s\"]", g_hash[2]);
+      r = call("getchaintxstats", p, &ec, &em);
+      ck_str("a historical blockhash ends the window there", S(r,"window_final_block_height"), "2");
+      ck_str("...with the cumulative count through it (1+1+1)", S(r,"txcount"), "3");
+      rj_free(r); }
+    expect_err("an unknown blockhash -> -5", "getchaintxstats",
+               "[1, \"00000000000000000000000000000000000000000000000000000000deadbeef\"]",
+               -5, "Block not found");
+    expect_err("a malformed blockhash names the parameter, as ParseHashV does", "getchaintxstats",
+               "[1, \"abc\"]", -8, "blockhash must be of length 64 (not 3, for 'abc')");
 
     /* ---- verifychain ----
      * The fixture's synthetic headers carry bits 0x1d00ffff with nonce 0, so

@@ -82,6 +82,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <pthread.h>
 
 
 
@@ -124,6 +125,60 @@ static long g_prune_mib = 0;
 static time_t g_start = 0;
 static u8*  g_blockbuf = NULL;
 #define BLOCKBUF_CAP (8u<<20)
+
+/* ---- lanes: which store handle a thread reads through (2026-09-19) -------
+ * Every handler here used to share g_st, the hash index, one block buffer and
+ * a handful of static caches, so the RPC server ran them all under ONE write
+ * lock. Any slow call -- getchaintxstats re-walking 960k blocks (46 s on
+ * production), getindexinfo rescanning a 61 GB txospender tail (run 27),
+ * waitfornewblock sleeping 30 s -- therefore stalled uptime and getblockcount
+ * behind it. uptime took 44 s on run 27 during IBD.
+ *
+ * A LANE is a private store handle plus the mutex that owns it. A method that
+ * runs in a lane reads the archive through that handle and touches nothing
+ * the write-locked handlers share, so the server can run it without the
+ * execution lock:
+ *   - the fast lane (g_fast_mu, g_fst): getblockcount, getbestblockhash,
+ *     getblockchaininfo, getdifficulty, getindexinfo -- bounded, a few preads;
+ *   - the chain-tx lane (g_ctx_mu, g_ctx_st): getchaintxstats and the
+ *     cumulative-count cache behind it;
+ *   - a per-call handle: waitfornewblock / waitforblockheight / waitforblock,
+ *     which may legitimately wait 30 s and must not hold anything shared.
+ * The handle a thread reads through is t_st; NULL means g_st (the write-locked
+ * handlers). read_idx_rec / read_block_prefix / refresh all go through CUR_ST.
+ *
+ * Shared by every lane, and so locked on its own: the hash->height table
+ * (g_idx_mu -- folded by refresh, read by the by-hash lookups) and the
+ * computed-chainwork fallback (g_cw_mu). g_blockbuf and read_block stay
+ * write-lock-only; no lane method calls them.
+ *
+ * Lock order: exec lock -> a lane mutex -> g_idx_mu / g_cw_mu. No lane mutex
+ * is ever held while taking the exec lock or another lane's mutex. */
+static __thread u8* t_st = NULL;
+#define CUR_ST (t_st ? t_st : g_st)
+static pthread_mutex_t g_idx_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_cw_mu  = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_fast_mu = PTHREAD_MUTEX_INITIALIZER;
+static u8  g_fst[ST_SIZE];  static int g_fst_ok;
+extern void store_rd_close(void* st);
+/* Open a lane's private handle on the archive in the cwd (rpc_chain_open
+ * chdir()ed there). Its own index.dat descriptor -- store_reload lseeks it,
+ * so two handles must never share one -- and its own block-file fd cache. */
+static int lane_handle_open(u8* st, int* ok){
+    if (*ok) return 1;
+    memset(st, 0, ST_SIZE);
+    if (store_init(st) != 1) return 0;
+    store_reload(st);
+    store_rd_init(st);
+    *ok = 1;
+    return 1;
+}
+static void lanes_open(void);   /* after the chain-tx lane's state, below */
+static void lane_handle_close(u8* st){
+    store_rd_close(st);
+    long fd = *(long*)(st + 8);   if (fd > 0) close((int)fd);     /* +8 idx_fd       */
+    long bf = *(long*)st;          if (bf >= 0) close((int)bf);    /* +0 cur_blk_fd   */
+}
 
 static void default_stop(void){ kill(getpid(), SIGTERM); }
 static void (*g_stop_fn)(void) = default_stop;
@@ -220,7 +275,7 @@ static u64 read_varint(const u8* p, const u8* end, u64* consumed){
 /* Core ParseHashV: "parameter N must be of length 64 (not M, for 'x')" /
  * "parameter N must be hexadecimal string (not 'x')". Writes the 32-byte
  * DISPLAY-order bytes to out. */
-static char g_hasherr[256];
+static __thread char g_hasherr[256];   /* per thread: lanes run concurrently */
 static int parse_hash_param(const char* s, int pnum, u8 out[32], long* ec, const char** em){
     size_t n = strlen(s);
     if (n != 64){
@@ -237,7 +292,7 @@ static int parse_hash_param(const char* s, int pnum, u8 out[32], long* ec, const
 
 /* ---- archive access ---- */
 static int read_idx_rec(long h, u8 rec[48]){
-    long fd = ST_IDX_FD(g_st);
+    long fd = ST_IDX_FD(CUR_ST);
     if (fd < 0) return 0;
     if (pread(fd, rec, 48, (off_t)h * 48) != 48) return 0;
     return 1;
@@ -352,11 +407,42 @@ static void idx_sync(long tip){
     if (folded > g_idx_tip) g_idx_tip = folded;
 }
 
-/* Re-sync with the live daemon's appends. Returns current tip (-1 empty). */
+/* A reorg rewrites index.dat records at heights the table has already folded
+ * (reorg.c truncates the store and appends the new branch), and the fold only
+ * ever moved forward -- so a block reorged IN below the old fold point was
+ * never findable by hash. Before folding, confirm the record at the fold
+ * point is still the block the table has there; walk the fold point down
+ * until one is, and the fold re-reads everything above it. One pread and one
+ * probe per refresh when nothing changed. Caller holds g_idx_mu. */
+#define IDX_UNFOLD_MAX 10000   /* deeper than any reorg; past it, something else is wrong */
+static void idx_unfold_reorged(void){
+    long fd = ST_IDX_FD(g_st);
+    if (!g_idx || fd < 0) return;
+    long from = g_idx_tip, walked = 0;
+    while (g_idx_tip >= 0 && walked < IDX_UNFOLD_MAX){
+        u8 rec[48]; long hh = -1;
+        if (pread(fd, rec, 48, (off_t)g_idx_tip * 48) == 48 && rec_present(rec) &&
+            idx_get(g_idx, rec, &hh) == 1 && hh == g_idx_tip) break;
+        g_idx_tip--; walked++;
+    }
+    if (walked){
+        /* a 10,000-deep walk is not a reorg: refold from where it stopped
+         * rather than walking on (and re-reading the archive) every call */
+        fprintf(stderr, "[idx] records rewritten below the fold (reorg?): fold point %ld -> %ld%s\n",
+                from, g_idx_tip, walked >= IDX_UNFOLD_MAX ? "  <-- WALK CAPPED" : "");
+    }
+}
+
+/* Re-sync with the live daemon's appends. Returns current tip (-1 empty).
+ * Reloads the CALLING lane's handle (CUR_ST); the fold into the shared hash
+ * index reads g_st's index.dat descriptor with pread only, under g_idx_mu. */
 static long refresh(void){
-    store_reload(g_st);
-    long tip = ST_TIP(g_st);
+    store_reload(CUR_ST);
+    long tip = ST_TIP(CUR_ST);
+    pthread_mutex_lock(&g_idx_mu);
+    idx_unfold_reorged();
     if (tip > g_idx_tip) idx_sync(tip);       /* the index follows the ARCHIVE: by-hash lookups see every stored block */
+    pthread_mutex_unlock(&g_idx_mu);
     return public_tip_cap(tip);               /* the tip the RPCs report is the CONNECTED one (3.1) */
 }
 
@@ -374,30 +460,48 @@ int rpc_chain_open(const char* dir){
     while (slots < (unsigned long)(tip + 1) * 4) slots <<= 1;
     if (!idx_alloc(slots)) return 0;
     fprintf(stderr, "[idx] chain view open: stored tip=%ld, by-hash table %lu slots\n", tip, slots);
+    pthread_mutex_lock(&g_idx_mu);
     idx_sync(tip);
+    pthread_mutex_unlock(&g_idx_mu);
     g_cw_fd = open("chainwork.dat", O_RDONLY);
     if (!g_blockbuf) g_blockbuf = malloc(BLOCKBUF_CAP);
     g_open = g_blockbuf != NULL;
+    if (g_open) lanes_open();
     return g_open;
 }
 
 /* Records are keyed by their raw (wire-order) bytes; an RPC hash string is
  * display order, so reverse it to look up. */
-static int height_by_hash(const u8 display[32], long* h){
-    if (!g_idx) return 0;   /* no index built: treat as not-found, never crash */
+/* The table as it stands: a hash it has ever folded, and the height it was
+ * folded at. A block reorged OUT keeps its entry (the table never forgets). */
+static int height_by_hash_raw(const u8 display[32], long* h){
     u8 wire[32]; for (int i = 0; i < 32; i++) wire[i] = display[31-i];
-    return idx_get(g_idx, wire, h) == 1;
+    pthread_mutex_lock(&g_idx_mu);
+    int ok = g_idx && idx_get(g_idx, wire, h) == 1;   /* no index built: not-found, never crash */
+    pthread_mutex_unlock(&g_idx_mu);
+    return ok;
+}
+/* ... and only if the archive still holds that block at that height. Before
+ * 2026-09-19 a reorged-out hash resolved to its old height, and getblock
+ * served whatever block the new branch had put there. This archive keeps no
+ * stale blocks, so "not found" is the honest answer. */
+static int height_by_hash(const u8 display[32], long* h){
+    if (!height_by_hash_raw(display, h)) return 0;
+    u8 rec[48];
+    if (!read_idx_rec(*h, rec)) return 0;
+    for (int i = 0; i < 32; i++) if (rec[i] != display[31-i]) return 0;
+    return 1;
 }
 
 /* First `n` bytes of block at `h` (header + tx-count prefix). 1 ok / -3 pruned
  * or hole / -1 error. */
 static int read_block_prefix(long h, u8* out, size_t n){
     u64 meta[3];
-    int r = store_get_at(g_st, (u64)h, meta);
+    int r = store_get_at(CUR_ST, (u64)h, meta);
     if (r != 1) return r == -3 ? -3 : -1;
     if (meta[1] == 0) return -3;                       /* hole record */
     if (n > meta[1]) n = (size_t)meta[1];
-    int fd = store_rd_fd(g_st, (unsigned)meta[2]);
+    int fd = store_rd_fd(CUR_ST, (unsigned)meta[2]);
     if (fd < 0) return -1;
     if (pread(fd, out, n, (off_t)(meta[0] + 8)) != (ssize_t)n) return -1;
     return 1;
@@ -421,18 +525,19 @@ static long read_block(long h){
 /* ---- chainwork ---- */
 static int chainwork_at(long h, u8 out[16]){
     if (g_cw_fd >= 0 && pread(g_cw_fd, out, 16, (off_t)h * 16) == 16) return 1;
-    /* fallback: accumulate from headers, cached */
+    /* fallback: accumulate from headers, cached -- shared by every lane */
+    pthread_mutex_lock(&g_cw_mu);
     if (h >= g_cw_cache_n){
         if (h >= g_cw_cache_cap){
             long cap = g_cw_cache_cap ? g_cw_cache_cap : 4096;
             while (cap <= h) cap *= 2;
             void* n = realloc(g_cw_cache, (size_t)cap * 16);
-            if (!n) return 0;
+            if (!n){ pthread_mutex_unlock(&g_cw_mu); return 0; }
             g_cw_cache = n; g_cw_cache_cap = cap;
         }
         for (long i = g_cw_cache_n; i <= h; i++){
             u8 hdr[80];
-            if (read_block_prefix(i, hdr, 80) != 1) return 0;
+            if (read_block_prefix(i, hdr, 80) != 1){ pthread_mutex_unlock(&g_cw_mu); return 0; }
             u8 w[16]; block_work(w, rd32(hdr + 72));
             if (i == 0) memcpy(g_cw_cache[0], w, 16);
             else chainwork_add(g_cw_cache[i], g_cw_cache[i-1], w);
@@ -440,6 +545,7 @@ static int chainwork_at(long h, u8 out[16]){
         }
     }
     memcpy(out, g_cw_cache[h], 16);
+    pthread_mutex_unlock(&g_cw_mu);
     return 1;
 }
 static void chainwork_hex(const u8 w[16], char out[65]){
@@ -1794,7 +1900,7 @@ static long long size_on_disk(void){
     static long  newest = -1;          /* index of the file still being written */
     static time_t last_full = 0;
     time_t now = time(NULL);
-    int pruning = (g_prune_mib != 0 || ST_PRUNE_H(g_st) > 0);
+    int pruning = (g_prune_mib != 0 || ST_PRUNE_H(CUR_ST) > 0);
 
     if (pruning) return sod_full_scan();          /* files can vanish */
     if (prefix < 0 || now - last_full >= SOD_REVALIDATE_S){
@@ -1855,10 +1961,10 @@ static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
     rj_obj_set(o, "initialblockdownload", rj_bool((time_t)t < time(NULL) - g_maxtipage));   /* -maxtipage */
     u8 cw[16]; if (chainwork_at(tip, cw)){ chainwork_hex(cw, hx); rj_obj_set(o, "chainwork", rj_str(hx)); }
     rj_obj_set(o, "size_on_disk", rj_numf("%lld", size_on_disk()));
-    int pruned = g_prune_mib != 0 || ST_PRUNE_H(g_st) > 0;
+    int pruned = g_prune_mib != 0 || ST_PRUNE_H(CUR_ST) > 0;
     rj_obj_set(o, "pruned", rj_bool(pruned));
     if (pruned){
-        rj_obj_set(o, "pruneheight", rj_numf("%d", ST_PRUNE_H(g_st)));
+        rj_obj_set(o, "pruneheight", rj_numf("%d", ST_PRUNE_H(CUR_ST)));
         int automatic = g_prune_mib > 1;
         rj_obj_set(o, "automatic_pruning", rj_bool(automatic));
         if (automatic) rj_obj_set(o, "prune_target_size", rj_numf("%lld", (long long)g_prune_mib * 1024 * 1024));
@@ -2046,8 +2152,13 @@ static void tsp_open(void){
 static void tsp_tail_refresh(void);
 static const u8* g_tsp_tail;
 static int  tsp_have(void){ if (!ix_on(g_ix_txospender)) return 0; tsp_open(); if (g_tsp_runs.n > 0) return 1; tsp_tail_refresh(); return g_tsp_tail != NULL; }
-static long tsp_runs_to(void){ tsp_open(); long t = -1; for (int i = 0; i < g_tsp_runs.n; i++) if (g_tsp_runs.r[i].to > t) t = g_tsp_runs.r[i].to; return t; }
-static u64 g_tsp_tail_sz; static long g_tsp_tail_maxh = -1;
+static u64 g_tsp_tail_sz;
+/* 2026-09-19: remap only. This also scanned every record for the highest
+ * height -- from byte 0, every time the file grew -- for getindexinfo alone.
+ * Run 27's txospender tail reached 61.6 GB during IBD and grew every block,
+ * so each getindexinfo read 61 GB under the RPC execution lock; uptime took
+ * 44 s behind it. getindexinfo now reads the tail's last record instead
+ * (gii_tail_last), and nothing else here wanted the maximum. */
 static void tsp_tail_refresh(void){
     struct stat sb;
     if (stat(TSP_TAIL_FILE, &sb) != 0 || (u64)sb.st_size < TSP_REC){ if (g_tsp_tail){ munmap((void*)g_tsp_tail, (size_t)g_tsp_tail_sz); g_tsp_tail = NULL; g_tsp_tail_sz = 0; } return; }
@@ -2057,8 +2168,7 @@ static void tsp_tail_refresh(void){
     int fd = open(TSP_TAIL_FILE, O_RDONLY); if (fd < 0) return;
     void* m = mmap(NULL, (size_t)sz, PROT_READ, MAP_SHARED, fd, 0); close(fd);
     if (m == MAP_FAILED) return;
-    g_tsp_tail = m; g_tsp_tail_sz = sz; g_tsp_tail_maxh = -1;
-    for (u64 o = 0; o + TSP_REC <= sz; o += TSP_REC){ tsp_rec r; tsp_unpack(&r, g_tsp_tail + o); if ((long)r.height > g_tsp_tail_maxh) g_tsp_tail_maxh = (long)r.height; }
+    g_tsp_tail = m; g_tsp_tail_sz = sz;
 }
 /* verify: the tx at (height, off, len) spends (txid_wire, vout); on success
  * fills the spender's txid, height, and optionally copies the tx bytes */
@@ -3708,95 +3818,272 @@ static int cmd_getdeploymentinfo(const rj_val* params, rj_val** res, long* ec, c
 }
 
 /* ---- getchaintxstats ----------------------------------------------------
- * The window figures are a cheap scan: only the tx-count varint that follows
- * each 80-byte header is needed, so this reads ~89 bytes per block, not the
- * blocks themselves.
+ * Core keeps the cumulative transaction count (m_chain_tx_count, "nChainTx")
+ * in every block-index entry, so getchaintxstats is O(1) there. This node
+ * stores no such field, and until 2026-09-19 this handler cached the count for
+ * exactly ONE height -- the tip it last answered -- and re-walked every block
+ * from genesis whenever the tip moved. On production that was 46,616 ms after
+ * each new block (12 ms the evening before, while the tip happened to stand
+ * still), under the RPC execution lock, so every other call waited too.
  *
- * `txcount` is the CUMULATIVE count to the tip, which Core keeps in its
- * block index (nChainTx) and this node does not store anywhere. It is
- * computed here by the same cheap prefix scan over the whole chain and
- * cached against the tip, so the first call pays for it once. If ANY height
- * is unreadable -- a pruned or holed archive -- the field is omitted rather
- * than reported low: a short count that looks like a real one is worse than
- * an absent one, because the caller cannot tell the difference. */
-static long gcts_txn_at(long h){
-    u8 pre[89];
-    if (read_block_prefix(h, pre, sizeof pre) != 1) return -1;
-    u64 c; u64 n = read_varint(pre + 80, pre + sizeof pre, &c);
-    if (c == 0) return -1;
-    return (long)n;
+ * Now the count is a per-height cumulative array, built once and extended by
+ * exactly the new blocks:
+ *   cum[h] = transactions in blocks 0..h, tag[h] = first 8 bytes of block
+ *   h's hash (sha256d of its header, which is what index.dat records).
+ * The tip case costs O(new blocks) block-prefix reads (header + tx-count
+ * varint, ~89 bytes); any historical height already covered is O(1).
+ *
+ * REORGS. The array is only ever read at a height whose tag still matches the
+ * block index.dat names there; a mismatch means the chain changed under the
+ * cache. Matching is monotone along a chain (true up to the fork, false
+ * above), so the fork point is found by binary search over index records and
+ * everything above it is dropped and re-walked. While extending, each new
+ * header must link (prevhash prefix) to the tag below it; a break means a
+ * reorg landed mid-walk, handled the same way.
+ *
+ * MEMORY: 16 bytes per height (15.5 MB at 967k heights), growing only with
+ * the chain.
+ *
+ * THREADS. Everything here -- the array, the counters, and a private store
+ * handle (g_ctx_st) -- belongs to g_ctx_mu. The handler touches nothing the
+ * write-locked handlers share (the hash->height lookup takes g_idx_mu), so
+ * the server runs it WITHOUT the execution lock: a cold first build blocks
+ * only other getchaintxstats callers, never uptime or getblock.
+ *
+ * UNKNOWN COUNTS. If any height up to the one asked for is unreadable -- a
+ * pruned or holed archive -- the count is unknown, and Core's rule for an
+ * unknown m_chain_tx_count applies: txcount, window_tx_count and txrate are
+ * omitted. A short count that looks like a real one would be worse than an
+ * absent one, because the caller cannot tell the difference. */
+static pthread_mutex_t g_ctx_mu = PTHREAD_MUTEX_INITIALIZER;
+static u8   g_ctx_st[ST_SIZE]; static int g_ctx_st_ok;
+static unsigned long long* g_ctx_cum;      /* cum[h]: txs in blocks 0..h */
+static u64* g_ctx_tag;                     /* first 8 bytes (wire) of block h's hash */
+static long g_ctx_n, g_ctx_cap;            /* heights [0, g_ctx_n) are cached */
+static unsigned long long g_ctx_reads;     /* block prefixes read: the cost, for tests */
+#define CTX_PREFETCH 4096                  /* prefixes requested ahead per batch */
+
+static u64 ctx_tag_of(const u8* hash_wire){ u64 t; memcpy(&t, hash_wire, 8); return t; }
+
+/* Is cached height h still the block the archive has at h? */
+static int ctx_matches(long h){
+    u8 rec[48];
+    if (h < 0 || h >= g_ctx_n) return 0;
+    if (!read_idx_rec(h, rec) || !rec_present(rec)) return 0;
+    return ctx_tag_of(rec) == g_ctx_tag[h];
+}
+/* `bad` is a height known not to match (or the first one past the cache):
+ * keep the longest prefix that still matches. */
+static void ctx_unwind(long bad){
+    long lo = 0, hi = (bad < g_ctx_n ? bad : g_ctx_n) - 1, keep = -1;
+    while (lo <= hi){
+        long mid = lo + (hi - lo) / 2;
+        if (ctx_matches(mid)){ keep = mid; lo = mid + 1; } else hi = mid - 1;
+    }
+    g_ctx_n = keep + 1;
+}
+/* Extend the cache through height `to`. 1 covered, 0 some height is
+ * unreadable (pruned, a hole, not stored yet), -1 the headers stopped linking
+ * (a reorg landed mid-walk; the caller unwinds and retries). */
+static int ctx_extend(long to){
+    if (to < g_ctx_n) return 1;
+    if (to >= g_ctx_cap){
+        long cap = g_ctx_cap ? g_ctx_cap : 4096;
+        while (cap <= to) cap *= 2;
+        unsigned long long* c = realloc(g_ctx_cum, (size_t)cap * sizeof *c);
+        if (!c) return 0;
+        g_ctx_cum = c;
+        u64* t = realloc(g_ctx_tag, (size_t)cap * sizeof *t);
+        if (!t) return 0;
+        g_ctx_tag = t; g_ctx_cap = cap;
+    }
+    long prefetched_to = g_ctx_n - 1;
+    for (long h = g_ctx_n; h <= to; h++){
+        /* A cold build is ~967k scattered 89-byte reads, one at a time --
+         * 145 s against production's archive, all of it waiting on the disk
+         * at queue depth 1. So ask for the next batch's prefixes up front
+         * (POSIX_FADV_WILLNEED queues the reads asynchronously) and then
+         * read them in order; the disk sees the whole batch at once. */
+        if (h > prefetched_to && to - h >= 64){
+            long end = h + CTX_PREFETCH - 1; if (end > to) end = to;
+            prefetched_to = end;
+            for (long k = h; k <= end; k++){
+                u64 meta[3];
+                if (store_get_at(CUR_ST, (u64)k, meta) != 1 || meta[1] == 0) continue;
+                int fd = store_rd_fd(CUR_ST, (unsigned)meta[2]);
+                if (fd >= 0) posix_fadvise(fd, (off_t)(meta[0] + 8), 89, POSIX_FADV_WILLNEED);
+            }
+        }
+        u8 pre[89]; memset(pre, 0, sizeof pre);
+        if (read_block_prefix(h, pre, sizeof pre) != 1) return 0;
+        g_ctx_reads++;
+        u64 c; u64 n = read_varint(pre + 80, pre + sizeof pre, &c);
+        if (c == 0) return 0;
+        if (h > 0 && memcmp(pre + 4, &g_ctx_tag[h - 1], 8) != 0) return -1;
+        u8 id[32]; sha256d(id, pre, 80);
+        g_ctx_tag[h] = ctx_tag_of(id);
+        g_ctx_cum[h] = (h ? g_ctx_cum[h - 1] : 0) + n;
+        g_ctx_n = h + 1;
+    }
+    return 1;
+}
+/* Cumulative count through height h on the CURRENT chain, -1 if unknown.
+ * Caller holds g_ctx_mu with t_st == g_ctx_st (and has refreshed it). */
+static long long ctx_at(long h){
+    for (int attempt = 0; attempt < 4; attempt++){
+        if (h < g_ctx_n){
+            if (ctx_matches(h)) return (long long)g_ctx_cum[h];
+            ctx_unwind(h);
+            continue;
+        }
+        /* extending: the cached top must still be on the chain first */
+        if (g_ctx_n > 0 && !ctx_matches(g_ctx_n - 1)){ ctx_unwind(g_ctx_n - 1); continue; }
+        int r = ctx_extend(h);
+        if (r == 0) return -1;
+        if (r < 0){ ctx_unwind(g_ctx_n - 1); continue; }
+        /* the walked headers must be the chain the index names at h */
+        if (ctx_matches(h)) return (long long)g_ctx_cum[h];
+        ctx_unwind(h);
+    }
+    return -1;
+}
+/* Test/diagnostic hook: block prefixes the cache has read so far. */
+unsigned long long rpc_chain_chaintx_reads(void){
+    pthread_mutex_lock(&g_ctx_mu); unsigned long long n = g_ctx_reads; pthread_mutex_unlock(&g_ctx_mu); return n;
+}
+/* The cumulative count through height h, -1 unknown -- the cache's own entry
+ * point, safe from any thread. */
+long long rpc_chain_chaintx_at(long h){
+    if (!g_open || h < 0) return -1;
+    pthread_mutex_lock(&g_ctx_mu);
+    long long v = -1;
+    if (lane_handle_open(g_ctx_st, &g_ctx_st_ok)){
+        u8* prev = t_st; t_st = g_ctx_st;
+        store_reload(g_ctx_st);
+        v = ctx_at(h);
+        t_st = prev;
+    }
+    pthread_mutex_unlock(&g_ctx_mu);
+    return v;
 }
 
-static int cmd_getchaintxstats(const rj_val* params, rj_val** res, long* ec, const char** em){
+/* Open every lane's handle now, while the cwd is certainly the archive
+ * (rpc_chain_open chdir()ed there) -- not lazily on a first call. A reopen
+ * replaces the handles and forgets the counts: it may be a different chain. */
+static void lanes_open(void){
+    pthread_mutex_lock(&g_fast_mu);
+    if (g_fst_ok){ lane_handle_close(g_fst); g_fst_ok = 0; }
+    lane_handle_open(g_fst, &g_fst_ok);
+    pthread_mutex_unlock(&g_fast_mu);
+    pthread_mutex_lock(&g_ctx_mu);
+    if (g_ctx_st_ok){ lane_handle_close(g_ctx_st); g_ctx_st_ok = 0; }
+    lane_handle_open(g_ctx_st, &g_ctx_st_ok);
+    g_ctx_n = 0;
+    pthread_mutex_unlock(&g_ctx_mu);
+}
+
+/* Core ParseHashV(v, "blockhash"): the NAME, not a position, in the text. */
+static int ctx_parse_blockhash(const char* s, u8 disp[32], long* ec, const char** em){
+    size_t n = strlen(s);
+    if (n != 64){
+        snprintf(g_hasherr, sizeof g_hasherr, "blockhash must be of length 64 (not %zu, for '%s')", n, s);
+        *ec = -8; *em = g_hasherr; return 0;
+    }
+    if (!is_hex_str(s)){
+        snprintf(g_hasherr, sizeof g_hasherr, "blockhash must be hexadecimal string (not '%s')", s);
+        *ec = -8; *em = g_hasherr; return 0;
+    }
+    for (int i = 0; i < 32; i++) disp[i] = (u8)((hexv(s[i*2])<<4) | hexv(s[i*2+1]));
+    return 1;
+}
+
+/* The body, under g_ctx_mu with t_st == g_ctx_st. Core v31.1
+ * rpc/blockchain.cpp getchaintxstats, statement for statement:
+ *   - the window defaults to one month of blocks (30*24*60*60 / 600), clamped
+ *     to max(0, min(that, height - 1));
+ *   - an explicit window must satisfy 0 <= n and (n == 0 or n < height);
+ *   - window_interval is the MEDIAN-TIME-PAST difference between the final
+ *     block and the block `window` below it (not the header times);
+ *   - window_tx_count = count(final) - count(past), only when both are known;
+ *     txrate only when window_interval > 0 as well. */
+static int gcts_body(const rj_val* params, rj_val** res, long* ec, const char** em){
     long tip = refresh();
     if (tip < 0){ *ec = -28; *em = "Loading block index..."; return 0; }
     long final_h = tip;
-    if (params && params->typ == RJ_ARR && params->nitems >= 2 &&
-        params->items[1]->typ == RJ_STR){
-        if (!lookup_block_param(params, 1, 2, &final_h, ec, em)) return 0;
+    if (param_present(params, 1)){
+        u8 disp[32]; long h;
+        if (!ctx_parse_blockhash(params->items[1]->str, disp, ec, em)) return 0;
+        if (!height_by_hash_raw(disp, &h)){ *ec = -5; *em = "Block not found"; return 0; }
+        /* the by-hash table never forgets a hash, so a block reorged away still
+         * resolves to its old height -- Core knows such a block and says -8, not
+         * -5; and a stored block above the connected tip is not in the active
+         * chain either */
+        u8 rec[48], wire[32];
+        for (int i = 0; i < 32; i++) wire[i] = disp[31 - i];
+        if (h > tip || !read_idx_rec(h, rec) || memcmp(rec, wire, 32) != 0){
+            *ec = -8; *em = "Block is not in main chain"; return 0; }
+        final_h = h;
     }
-    /* Core's default window is one month of blocks, clamped to the chain. */
-    long window = 30L * 24 * 60 * 60 / 600;          /* 4320 */
-    if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
-        params->items[0]->typ == RJ_NUM){
-        window = atol(params->items[0]->str);
-        if (window < 0 || window > final_h){
+    long window;
+    if (!param_present(params, 0)){
+        window = 30L * 24 * 60 * 60 / 600;              /* 4320 */
+        if (window > final_h - 1) window = final_h - 1;
+        if (window < 0) window = 0;
+    } else {
+        long long v; if (!rpc_param_i64(params, 0, &v, ec, em)) return 0;
+        if (v < 0 || (v > 0 && v >= final_h)){
             *ec = -8; *em = "Invalid block count: should be between 0 and the block's height - 1";
             return 0; }
+        window = (long)v;
     }
-    if (window > final_h) window = final_h;
 
     u8 hdr[80];
     if (read_block_prefix(final_h, hdr, 80) != 1){ *ec = -1; *em = "Block not available"; return 0; }
-    u32 final_time = rd32(hdr + 68);
-    u8 rec[48]; read_idx_rec(final_h, rec);
+    u8 rec[48];
+    if (!read_idx_rec(final_h, rec)){ *ec = -1; *em = "Block not available"; return 0; }
     char hx[65]; hex_rev(hx, rec, 32);
 
-    long long win_tx = 0; int win_ok = 1;
-    for (long h = final_h - window + 1; h <= final_h && window > 0; h++){
-        long n = gcts_txn_at(h);
-        if (n < 0){ win_ok = 0; break; }
-        win_tx += n;
-    }
-    long win_interval = 0;
-    if (window > 0){
-        u8 h0[80];
-        if (read_block_prefix(final_h - window, h0, 80) == 1)
-            win_interval = (long)final_time - (long)rd32(h0 + 68);
-    }
-
-    /* cumulative count, cached per tip */
-    static long  gcts_cached_h = -1;
-    static long long gcts_cached_n = -1;
-    long long total = -1;
-    if (gcts_cached_h == final_h) total = gcts_cached_n;
-    else {
-        long long acc = 0; int ok = 1;
-        for (long h = 0; h <= final_h; h++){
-            long n = gcts_txn_at(h);
-            if (n < 0){ ok = 0; break; }
-            acc += n;
-        }
-        if (ok){ total = acc; gcts_cached_h = final_h; gcts_cached_n = acc; }
-    }
+    long long total = ctx_at(final_h);
+    long long past  = window > 0 && total >= 0 ? ctx_at(final_h - window) : -1;
 
     rj_val* o = rj_obj();
-    rj_obj_set(o, "time", rj_numf("%u", final_time));
-    /* omitted when the archive could not be walked end to end -- see above */
-    if (total >= 0) rj_obj_set(o, "txcount", rj_numf("%lld", total));
+    rj_obj_set(o, "time", rj_numf("%u", rd32(hdr + 68)));
+    if (total > 0) rj_obj_set(o, "txcount", rj_numf("%lld", total));
     rj_obj_set(o, "window_final_block_hash", rj_str(hx));
     rj_obj_set(o, "window_final_block_height", rj_numf("%ld", final_h));
     rj_obj_set(o, "window_block_count", rj_numf("%ld", window));
     if (window > 0){
-        rj_obj_set(o, "window_interval", rj_numf("%ld", win_interval));
-        if (win_ok){
-            rj_obj_set(o, "window_tx_count", rj_numf("%lld", win_tx));
-            if (win_interval > 0)
-                rj_obj_set(o, "txrate", rj_double((double)win_tx / (double)win_interval));
+        long interval = median_time_past(final_h) - median_time_past(final_h - window);
+        rj_obj_set(o, "window_interval", rj_numf("%ld", interval));
+        if (total > 0 && past > 0){
+            long long wtx = total - past;
+            rj_obj_set(o, "window_tx_count", rj_numf("%lld", wtx));
+            if (interval > 0)
+                rj_obj_set(o, "txrate", rj_double((double)wtx / (double)interval));
         }
     }
     *res = o;
     return 1;
+}
+
+static int cmd_getchaintxstats(const rj_val* params, rj_val** res, long* ec, const char** em){
+    /* Core type-checks both arguments before the body runs (RPCHelpMan) */
+    rj_typeerrs te; rj_typeerr_init(&te);
+    if (param_present(params, 0) && params->items[0]->typ != RJ_NUM)
+        rj_typeerr_add(&te, 1, "nblocks", params->items[0], "number");
+    if (param_present(params, 1) && params->items[1]->typ != RJ_STR)
+        rj_typeerr_add(&te, 2, "blockhash", params->items[1], "string");
+    if (rj_typeerr_fail(&te, ec, em)) return 0;
+    pthread_mutex_lock(&g_ctx_mu);
+    int r;
+    if (!lane_handle_open(g_ctx_st, &g_ctx_st_ok)){ *ec = -28; *em = "Loading block index..."; r = 0; }
+    else {
+        u8* prev = t_st; t_st = g_ctx_st;
+        r = gcts_body(params, res, ec, em);
+        t_st = prev;
+    }
+    pthread_mutex_unlock(&g_ctx_mu);
+    return r;
 }
 
 /* ---- verifychain --------------------------------------------------------
@@ -3909,15 +4196,31 @@ static int cmd_verifychain(const rj_val* params, rj_val** res, long* ec, const c
  * Real: the tip is polled through the same refresh() every other method
  * uses, so these see a new block as soon as the index does.
  *
- * DOCUMENTED DIVERGENCE: Core treats timeout 0 as "wait indefinitely". This
- * node's RPC server accepts and services ONE connection at a time on a
- * single thread (rpc_server.c's server_thread), so an indefinite wait would
- * wedge every other RPC for as long as no block arrived. The wait is
- * therefore capped at WFB_CAP_MS. On expiry these return the CURRENT tip,
+ * DOCUMENTED DIVERGENCE: Core treats timeout 0 as "wait indefinitely". The
+ * wait is capped at WFB_CAP_MS here. On expiry these return the CURRENT tip,
  * which is exactly what Core returns when its own timeout expires -- the
  * result shape is identical; only the ceiling on how long it will wait
- * differs, and the caller can simply call again. */
+ * differs, and the caller can simply call again.
+ *
+ * 2026-09-19: the wait no longer holds anything shared. It used to run under
+ * the RPC execution lock like every chain handler, so one waitfornewblock
+ * stalled every other RPC -- uptime included -- for up to 30 s. Core waits on
+ * a condition variable without cs_main. Each wait now polls through a store
+ * handle of its own (wfb_run), and the server runs these three without the
+ * execution lock; a wait occupies one RPC thread, as it does in Core. */
 #define WFB_CAP_MS 30000
+
+/* Run a wait on a private handle, opened for this call and closed after. */
+static int wfb_run(int (*body)(const rj_val*, rj_val**, long*, const char**),
+                   const rj_val* params, rj_val** res, long* ec, const char** em){
+    u8* st = malloc(ST_SIZE); int ok = 0;
+    if (!st || !lane_handle_open(st, &ok)){ free(st); *ec = -28; *em = "Loading block index..."; return 0; }
+    u8* prev = t_st; t_st = st;
+    int r = body(params, res, ec, em);
+    t_st = prev;
+    lane_handle_close(st); free(st);
+    return r;
+}
 
 static void wfb_result(long h, rj_val** res){
     u8 rec[48]; char hx[65];
@@ -4925,6 +5228,36 @@ static int cmd_getaddresstxids(const rj_val* params, rj_val** res, long* ec, con
     return 1;
 }
 
+/* getindexinfo runs in the FAST lane (no execution lock), so it reads the
+ * index files through state of its own rather than the txid/txo-spender
+ * readers the lookups use:
+ *   - its own run sets (irs_* is single-threaded per set), and
+ *   - an O(1) probe of each tail: the height of its LAST whole record. The
+ *     writers append in strictly ascending height order, one block per
+ *     write(2) (tx_index_tail.c, txosp_tail.c), so the last record carries
+ *     the tail's highest height -- the same fact bfi_probe_count and
+ *     axt_probe_covered already read that way.
+ * It used to call txi_have()/tsp_have(), which map and scan the tails. The
+ * txospender scan restarted from byte 0 whenever the file grew, and on run 27
+ * (2026-09-19, IBD) the file was 61.6 GB and grew every block: every
+ * getindexinfo read it end to end under the execution lock, the RPC process
+ * held 15.7 GB of it resident, and uptime took 44 s behind it. */
+static irunset_t g_gii_txi, g_gii_tsp; static int g_gii_init;
+static long gii_txi_height(const u8* r){ u32 hh = 0; for (int b = 0; b < 4; b++) hh |= (u32)r[8+b] << (8*b); return (long)hh; }
+static long gii_tsp_height(const u8* r){ tsp_rec x; tsp_unpack(&x, r); return (long)x.height; }
+static long gii_tail_last(const char* file, int rec, long (*height_of)(const u8*), int* present){
+    *present = 0;
+    int fd = open(file, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat sb; long h = -1; u8 r[64];
+    if (fstat(fd, &sb) == 0 && sb.st_size >= rec && rec <= (int)sizeof r){
+        long n = (long)(sb.st_size / rec);
+        *present = 1;
+        if (pread(fd, r, (size_t)rec, (off_t)(n - 1) * rec) == rec) h = height_of(r);
+    }
+    close(fd);
+    return h;
+}
 static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const char** em){
     (void)ec; (void)em;
     /* Core does not type-check the arg -- it returns {} for a non-matching
@@ -4933,38 +5266,45 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
     if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
         params->items[0]->typ == RJ_STR) want = params->items[0]->str;
     rj_val* o = rj_obj();
-    txi_open();
-    if (txi_have() && (!want || !strcmp(want, "txindex"))){
-        /* Core reports {synced, best_block_height}. Coverage is the offline
-         * base index plus the daemon-maintained tail (contiguous by
-         * construction -- the tail backfills any gap above the base), so
+    if (!g_gii_init){
+        irs_init(&g_gii_txi, "txindex", "BMCTXIDX", TXI_REC, TXI_SPARSE);
+        irs_init(&g_gii_tsp, "txospender", TSP_MAGIC, TSP_REC, TSP_SPARSE);
+        g_gii_init = 1;
+    }
+    long tip = g_open ? refresh() : -1;
+    if (ix_on(g_ix_txindex) && (!want || !strcmp(want, "txindex"))){
+        /* Core reports {synced, best_block_height}. Coverage is the index's
+         * sorted runs plus the daemon-maintained tail (contiguous by
+         * construction -- the tail backfills any gap above the runs), so
          * "synced" means that combined range reaches the tip; a partial
          * index reports false with its own best height, which is the honest
          * reading and what a caller needs to decide whether to trust a
          * miss. */
-        rj_val* e = rj_obj();
-        long tip = refresh();
-        txi_tail_refresh();
-        long cov_to = txi_coverage_to();
-        rj_obj_set(e, "synced", rj_bool(tip >= 0 && cov_to >= tip));
-        rj_obj_set(e, "best_block_height", rj_numf("%ld", cov_to));
-        rj_obj_set(o, "txindex", e);
+        int present; long th = gii_tail_last("txindex.tail", TXI_REC, gii_txi_height, &present);
+        long rt = irs_covered_to(&g_gii_txi);
+        if (g_gii_txi.n > 0 || present){
+            long cov_to = th > rt ? th : rt;
+            rj_val* e = rj_obj();
+            rj_obj_set(e, "synced", rj_bool(tip >= 0 && cov_to >= tip));
+            rj_obj_set(e, "best_block_height", rj_numf("%ld", cov_to));
+            rj_obj_set(o, "txindex", e);
+        }
     }
-    if (tsp_have() && (!want || !strcmp(want, "txospenderindex"))){
-        rj_val* e = rj_obj();
-        long tip = refresh();
-        tsp_tail_refresh();
-        long rt = tsp_runs_to();
-        long cov_to = g_tsp_tail_maxh > rt ? g_tsp_tail_maxh : rt;
-        rj_obj_set(e, "synced", rj_bool(tip >= 0 && cov_to >= tip));
-        rj_obj_set(e, "best_block_height", rj_numf("%ld", cov_to));
-        rj_obj_set(o, "txospenderindex", e);
+    if (ix_on(g_ix_txospender) && (!want || !strcmp(want, "txospenderindex"))){
+        int present; long th = gii_tail_last(TSP_TAIL_FILE, TSP_REC, gii_tsp_height, &present);
+        long rt = irs_covered_to(&g_gii_tsp);
+        if (g_gii_tsp.n > 0 || present){
+            long cov_to = th > rt ? th : rt;
+            rj_val* e = rj_obj();
+            rj_obj_set(e, "synced", rj_bool(tip >= 0 && cov_to >= tip));
+            rj_obj_set(e, "best_block_height", rj_numf("%ld", cov_to));
+            rj_obj_set(o, "txospenderindex", e);
+        }
     }
     { extern long bfi_probe_count(void);
       long bn = ix_on(g_ix_bfilter) ? bfi_probe_count() : -1;
       if (bn >= 0 && (!want || !strcmp(want, "basic block filter index"))){
           rj_val* e = rj_obj();
-          long tip = refresh();
           rj_obj_set(e, "synced", rj_bool(tip >= 0 && bn - 1 >= tip));
           rj_obj_set(e, "best_block_height", rj_numf("%ld", bn - 1));
           rj_obj_set(o, "basic block filter index", e);
@@ -4974,7 +5314,6 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
           /* EXTENSION index (Core has no address index); reported here so an
            * operator can see coverage the same way as the real Core indexes */
           rj_val* e = rj_obj();
-          long tip = refresh();
           rj_obj_set(e, "synced", rj_bool(tip >= 0 && an >= tip));
           rj_obj_set(e, "best_block_height", rj_numf("%ld", an));
           rj_obj_set(o, "addressindex", e);
@@ -4983,7 +5322,6 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
         long ch = g_csi_h();
         if (ch >= 0){
             rj_val* e = rj_obj();
-            long tip = refresh();
             /* "synced" against the UTXO applied height would always be true
              * by construction; against the CHAIN tip it reports whether the
              * apply loop itself is caught up -- the honest reading. */
@@ -5303,6 +5641,33 @@ static int cmd_scantxoutset(const rj_val* params, rj_val** res, long* ec, const 
     return 1;
 }
 
+/* The fast lane: g_fast_mu and its private handle (see "lanes" at the top).
+ * Everything run here is a handful of preads and stats, never a walk. */
+#define FAST_LANE(call) do {                                                  \
+        pthread_mutex_lock(&g_fast_mu);                                       \
+        int r_;                                                               \
+        if (!lane_handle_open(g_fst, &g_fst_ok)){                             \
+            *ec = -28; *em = "Loading block index..."; r_ = 0; }              \
+        else { u8* p_ = t_st; t_st = g_fst; r_ = (call); t_st = p_; }        \
+        pthread_mutex_unlock(&g_fast_mu);                                     \
+        return r_;                                                            \
+    } while (0)
+
+/* Methods whose handlers here need NO execution lock: they run in a lane of
+ * their own (see "lanes" at the top). rpc_server.c asks this to decide how to
+ * dispatch; 1 = fast (bounded, may run on the connection's own thread),
+ * 2 = lock-free but possibly slow (a first getchaintxstats build, a 30 s
+ * wait), 0 = the execution lock is required. */
+int rpc_chain_method_lane(const char* m){
+    if (!strcmp(m, "uptime") || !strcmp(m, "getblockcount") || !strcmp(m, "getbestblockhash")
+     || !strcmp(m, "getblockchaininfo") || !strcmp(m, "getdifficulty") || !strcmp(m, "getindexinfo"))
+        return 1;
+    if (!strcmp(m, "getchaintxstats") || !strcmp(m, "waitfornewblock")
+     || !strcmp(m, "waitforblockheight") || !strcmp(m, "waitforblock"))
+        return 2;
+    return 0;
+}
+
 int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!rpc_chain_known_method(m)) return -1;
     if (!strcmp(m, "uptime")) return cmd_uptime(res);
@@ -5312,12 +5677,15 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "deriveaddresses")) return cmd_deriveaddresses(params, res, ec, em);
     if (!strcmp(m, "decodescript")) return cmd_decodescript(params, res, ec, em);
     if (!strcmp(m, "createmultisig")) return cmd_createmultisig(params, res, ec, em);
-    if (!strcmp(m, "getindexinfo")) return cmd_getindexinfo(params, res, ec, em);
+    if (!strcmp(m, "getindexinfo")){
+        if (!g_open){ pthread_mutex_lock(&g_fast_mu); int r = cmd_getindexinfo(params, res, ec, em); pthread_mutex_unlock(&g_fast_mu); return r; }
+        FAST_LANE(cmd_getindexinfo(params, res, ec, em));
+    }
     if (!strcmp(m, "getaddressbalance")) return cmd_getaddressbalance(params, res, ec, em);
     if (!strcmp(m, "getaddresstxids")) return cmd_getaddresstxids(params, res, ec, em);
     if (!g_open){ *ec = -28; *em = "Loading block index..."; return 0; }
-    if (!strcmp(m, "getblockcount")) return cmd_getblockcount(res);
-    if (!strcmp(m, "getbestblockhash")) return cmd_getbestblockhash(res, ec, em);
+    if (!strcmp(m, "getblockcount")) FAST_LANE(cmd_getblockcount(res));
+    if (!strcmp(m, "getbestblockhash")) FAST_LANE(cmd_getbestblockhash(res, ec, em));
     if (!strcmp(m, "getchaintips")) return cmd_getchaintips(res, ec, em);
     if (!strcmp(m, "getblockhash")) return cmd_getblockhash(params, res, ec, em);
     if (!strcmp(m, "getblockheader")) return cmd_getblockheader(params, res, ec, em);
@@ -5328,16 +5696,16 @@ int rpc_chain_dispatch(const char* m, const rj_val* params, rj_val** res, long* 
     if (!strcmp(m, "getblocktemplate")) return cmd_getblocktemplate(params, res, ec, em);
     if (!strcmp(m, "gettxoutsetinfo")) return cmd_gettxoutsetinfo(params, res, ec, em);
     if (!strcmp(m, "scantxoutset")) return cmd_scantxoutset(params, res, ec, em);
-    if (!strcmp(m, "getblockchaininfo")) return cmd_getblockchaininfo(res, ec, em);
-    if (!strcmp(m, "getdifficulty")) return cmd_getdifficulty(res, ec, em);
+    if (!strcmp(m, "getblockchaininfo")) FAST_LANE(cmd_getblockchaininfo(res, ec, em));
+    if (!strcmp(m, "getdifficulty")) FAST_LANE(cmd_getdifficulty(res, ec, em));
     if (!strcmp(m, "submitheader")) return cmd_submitheader(params, res, ec, em);
     if (!strcmp(m, "getchainstates")) return cmd_getchainstates(res, ec, em);
     if (!strcmp(m, "getdeploymentinfo")) return cmd_getdeploymentinfo(params, res, ec, em);
     if (!strcmp(m, "getchaintxstats")) return cmd_getchaintxstats(params, res, ec, em);
     if (!strcmp(m, "verifychain")) return cmd_verifychain(params, res, ec, em);
-    if (!strcmp(m, "waitfornewblock")) return cmd_waitfornewblock(params, res, ec, em);
-    if (!strcmp(m, "waitforblockheight")) return cmd_waitforblockheight(params, res, ec, em);
-    if (!strcmp(m, "waitforblock")) return cmd_waitforblock(params, res, ec, em);
+    if (!strcmp(m, "waitfornewblock")) return wfb_run(cmd_waitfornewblock, params, res, ec, em);
+    if (!strcmp(m, "waitforblockheight")) return wfb_run(cmd_waitforblockheight, params, res, ec, em);
+    if (!strcmp(m, "waitforblock")) return wfb_run(cmd_waitforblock, params, res, ec, em);
     if (!strcmp(m, "getblockfilter")) return cmd_getblockfilter(params, res, ec, em);
     if (!strcmp(m, "scanblocks")) return cmd_scanblocks(params, res, ec, em);
     if (!strcmp(m, "getdescriptoractivity")) return cmd_getdescriptoractivity(params, res, ec, em);
