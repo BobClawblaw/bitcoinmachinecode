@@ -111,3 +111,36 @@ the NVMe.
   27's networking. The trigger fires once and switches itself off. A throwaway
   copy of the pair was tested: one start, and no second start when the service
   exited.
+
+## Run 27 result (2026-09-19)
+
+**PASS: the UTXO set is identical to Core's.** At height 967,712, bmc's muhash equals
+the v31.1 node's: `09f5cd877189dc269f505f2066aa2a0b39eb0b8e3384a48449880affd6490ee7`.
+
+| | bmc run 27 | Core v31.1 (first run) |
+|---|---|---|
+| download complete | 18 h 36 m 24 s (13:53:40Z, every block stored, ~485 still to apply) | |
+| at the tip | **≤ 18 h 43 m 11 s** (13:58:40Z, from the harness's 5-minute RPC check) | **19 h 40 m 09 s** (`Leaving InitialBlockDownload`) |
+
+bmc was about 57 min (~5%) faster. **Treat that as indicative, not clean.** Both runs
+were perturbed:
+- Blockyard polled Core for 17 h, and each `gettxoutsetinfo` forced a UTXO flush.
+- Blockyard polled run 27 for 14 h (until 09:07Z). Its RPC side read 10.2 TB.
+- Run 27 also maintained an unrequested 61.6 GB txo-spender tail, and its txindex
+  was never folded (the harness did not build the helpers).
+- Run 27's last hour overlapped a test gate (13:31–13:45Z) and a production
+  restart (13:46Z).
+
+The unpolled Core rerun below and run 28 (#275, #280, #281) are the clean pair.
+
+## Core v31.1 rerun: started 14:28:33Z
+
+- **Status:** running, unpolled, watched without RPC (`core31/watch.log`). Its config
+  is `core-v31.1-run2.bitcoin.conf`, updated.
+- **The first launch failed in its first second** (13:59:41Z). With no `bind=` line,
+  Core also binds its onion listener on 127.0.0.1 at P2P port + 1 = 8339, and RPC
+  had been put on 8339. RPC is now on 8340.
+- **The failed datadir** (one second old) was moved aside, not deleted, as
+  `core31-FAILED-onion-port-clash-20260919-1359`.
+- **The rerun began 29 min after run 27 ended.** Run 27's node is still up with
+  networking off: 3.4% of one core and no disk reads.
