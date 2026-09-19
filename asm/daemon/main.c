@@ -2502,7 +2502,15 @@ static int host_is_block_only(const char* host){
     for(int i = 0; i < g_bo_n; i++) if(!strcmp(g_bo_hosts[i], host)) return 1;
     return 0;
 }
-static int bo_want(void){ return g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY; }
+/* 2026-09-19: none under connect=. Core makes only MANUAL (full-relay)
+ * connections to the -connect list -- no block-relay-only, no feelers, no
+ * anchors. This filler used to run under connect= too, and it runs BEFORE
+ * the full-relay top-up: with one connect= host (a node behind its own Core,
+ * or any regtest pair) that host became the block-relay-only leg, the
+ * top-up then skipped it as already connected, and the node sent fRelay=0
+ * on its only leg -- Core's getpeerinfo relaytxes=false, not one
+ * transaction relayed to us, ever. */
+static int bo_want(void){ if(g_cfg.connect_only) return 0; return g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY; }
 static void bo_add(const char* host){ if(g_bo_n < MAX_BLOCK_RELAY_ONLY && !host_is_block_only(host)) snprintf(g_bo_hosts[g_bo_n++], sizeof g_bo_hosts[0], "%s", host); }
 static int legs_block_only(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && mux_out_kind[k] == LEG_BLOCK_ONLY) n++; return n; }
 /* every outbound dial funnels through here: a block-only host gets fRelay=0
@@ -7737,7 +7745,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     }
     /* CC-4: Core anchors.dat -- the block-relay-only peers of the last run are
      * dialled first, as block-only again; the file is deleted on read. */
-    { char anc[MAX_BLOCK_RELAY_ONLY][128]; long na = anchors_read("anchors.dat", anc, MAX_BLOCK_RELAY_ONLY, g_chainp->magic);
+    /* not under connect= (Core reads anchors only when it picks its own
+     * peers): an anchor is a host the operator did not list */
+    { char anc[MAX_BLOCK_RELAY_ONLY][128]; long na = g_cfg.connect_only ? 0 : anchors_read("anchors.dat", anc, MAX_BLOCK_RELAY_ONLY, g_chainp->magic);
       if(na > 0){
           for(long i = na - 1; i >= 0; i--){
               if(nsrc >= 64) break;
@@ -7801,6 +7811,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(dialer_proxy_configured()){ cfd[nc++]=-1; continue; }
             int spport = 0;
             ip = pool_ipv4(srcpool[i], &spport);
+            /* connect=/addnode= keep the host bare and its port beside it
+             * (node_config.c): without this a regtest connect=127.0.0.1:19310
+             * was dialled on 18444 here, refused, and left to the top-up */
+            if(!spport) spport = node_config_peer_port(srcpool[i]);
             if(!ip){
                 struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
                 /* never hand an anonymity-network name to the system
@@ -8734,6 +8748,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * shared ring; hand them to the outbound announcer so they reach
              * the outbound legs too (the worker's own accepts are already
              * queued by tx_relay.c and are skipped by the drain). */
+            /* transactions inbound peers sent: the serve children queued them
+             * for validation here, against the live set (daemon/tx_handoff.c).
+             * Before the ann-ring drain, so this rotation announces them. */
+            { extern long txrelay_drain_handoff(void*, long); (void)txrelay_drain_handoff(txsub_pool(), 256); }
             { extern void txrelay_announce_own(const unsigned char txid[32]);
               txann_worker_drain(txrelay_announce_own); }
             { int rfds[MUX_MAX_OUT]; int free_fds[MUX_MAX_OUT];                                 /* 2026-09-10: never a busy leg */
@@ -8796,7 +8814,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * Validates a book entry and drops it. This is what keeps the address
          * book from rotting -- without it we only discover the rot at boot,
          * as happened on 2026-08-18 (1,974 entries, ~4% still answering). */
-        if(g_cfg.max_feeler > 0 && now_ms >= next_feeler_ms && nsrc > 0){
+        if(g_cfg.max_feeler > 0 && !g_cfg.connect_only && now_ms >= next_feeler_ms && nsrc > 0){   /* Core: no feelers under -connect */
             next_feeler_ms = now_ms + g_cfg.feeler_interval_ms;
             int pick = (int)((unsigned)rot * 2654435761u % (unsigned)nsrc);
             unsigned char saved_relay = node_relay_flag; node_relay_flag = 0;   /* Core: feelers get fRelay=0 */
@@ -8957,6 +8975,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 if (dr || t_pr)
                     fprintf(stderr,"[txrelay] orphan drops: %ld ttl, %ld evicted, %ld rejected | parents requested %ld, notfound %ld, re-requested after timeout %ld, retried on another peer %ld, drained %ld (gave up %ld, in flight %ld), sync deferred %ld\n",
                             t_ttl, t_ev, t_rj, t_pr, t_nf, t_rf, txrelay_drained_count(), t_ro, t_gu, t_wa, txrelay_sync_deferred_count()); } }
+            /* the inbound handoff ring: silent unless it dropped something */
+            { extern void txho_stats(unsigned long long*, unsigned long long*, unsigned long long*, unsigned long long*);
+              static unsigned long long prev_drop;
+              unsigned long long hp = 0, hq = 0, hf = 0, hb = 0; txho_stats(&hp, &hq, &hf, &hb);
+              if(hf + hb != prev_drop){
+                  fprintf(stderr, "[txhandoff] inbound transactions: %llu queued, %llu validated, dropped %llu (ring full) %llu (over %lu bytes)\n",
+                          hp, hq, hf, hb, 400000UL);
+                  prev_drop = hf + hb; } }
             next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
         if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
@@ -10628,6 +10654,11 @@ int main(int argc, char** argv){
      * copy-on-write, which also stops each peer mapping its own copy.
      * Non-fatal: on failure the serve path drops inbound tx rather than
      * accepting unvalidated ones, exactly as before. */
+    /* inbound serve children hand received transactions to the worker,
+     * which validates them against the live set (daemon/tx_handoff.c); the
+     * ring must exist before either fork so every process maps the same one */
+    { extern int txho_create(void);
+      if(!txho_create()) fprintf(stderr, "[boot] tx handoff ring unavailable -- inbound peers' transactions are validated against the boot snapshot\n"); }
     { extern int serve_txdv_preinit(void);
       phase_timer_t txdv_pt; phase_start(&txdv_pt);
       int ok = serve_txdv_preinit();

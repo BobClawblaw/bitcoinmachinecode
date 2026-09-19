@@ -1316,9 +1316,112 @@ long txrelay_poll_block_only_leg(int fd){
     }
     return seen;
 }
+/* One received transaction through the relay pipeline: validate against the
+ * live set, then announce / cascade orphans / 1p1c / park and fetch parents.
+ *
+ * fd >= 0: it came in on this outbound leg (txrelay_poll_leg), and a missing
+ * parent is requested from the same leg, as Core asks the peer that sent the
+ * orphan. fd < 0: an inbound serve child handed it over (daemon/tx_handoff.c)
+ * -- that peer's socket belongs to another process, so missing parents go
+ * through the want table to whichever live leg can serve them, and the
+ * accept is announced through the shared ann ring under the child's slot
+ * (src_slot), which is what keeps it from being announced back to the peer
+ * that sent it. *outstanding counts getdata entries written on fd. */
+extern void txann_set_my_slot(int slot) __attribute__((weak));
+static long txr_take_tx(void* mp, const u8* pl, unsigned long plen, int fd, int src_slot, int* outstanding){
+    static u8 scratch[2000*81 + 8];      /* worker is single-threaded */
+    long accepted = 0;
+    u8 txid[32];
+    if (plen < 60 || tx_txid(txid, pl, plen, scratch, sizeof scratch) != 1) return 0;
+    { extern void sha256d(u8 out[32], const void* p, unsigned long n);
+      u8 wtxid[32]; sha256d(wtxid, pl, plen);       /* BIP339 announcements key by this */
+      txr_want_clear(txid); txr_want_clear(wtxid); }
+    /* a handed-off tx is attributed to its inbound peer's slot for the one
+     * validation: txann_push records it as the source (no echo to that peer,
+     * and CC-3's last_tx_time eviction protection credits the right peer) */
+    if (fd < 0 && txann_set_my_slot) txann_set_my_slot(src_slot);
+    long r = tx_accept_validate_p2p(mp, txid, pl, plen);
+    if (fd < 0 && txann_set_my_slot) txann_set_my_slot(-1);
+    if (r == 1){
+        accepted++;
+        if (fd >= 0 && txrelay_on_tx_accepted) txrelay_on_tx_accepted(fd);   /* getpeerinfo last_transaction */
+        if (txr_on_accept) txr_on_accept(txid, pl, plen);   /* -walletnotify */
+        if (fd >= 0) txr_ann_add(txid, fd);   /* handed off: txann_worker_drain announces it from the ring */
+        accepted += txr_orphan_resolve_ann(mp, txid, fd);   /* cascade waiting children */
+    } else if (r == -28){
+        /* fee-only reject -- the one verdict a CPFP child can
+         * overturn. If a child is already parked for this
+         * parent, the two go in together; if not, remember the
+         * parent as reconsiderable so that when a child does
+         * turn up we are allowed to fetch this parent again. */
+        long got = txr_try_1p1c(mp, txid, pl, plen);
+        if (got) accepted += got;
+        else     txr_recon_add(txid);
+    } else if (r == -25){
+        /* missing inputs: ordinary out-of-order relay. Park the
+         * child and fetch its parents from THIS leg right now --
+         * the resolve sweep on the parent's accept finishes the
+         * job. */
+        txr_orphan_add(txid, pl, plen);
+        u8 par[TXR_ORPHAN_PARENTS][32];
+        u32 npar = txr_tx_parents(pl, plen, par, TXR_ORPHAN_PARENTS);
+        static u8 gd[1 + TXR_ORPHAN_PARENTS*36];
+        unsigned want = 0;
+        for (u32 k = 0; k < npar; k++){
+            unsigned long got_len;
+            /* a parent we rejected on fee alone is exactly the
+             * one we DO want again, now that its child is here:
+             * the ring would otherwise suppress the re-fetch
+             * that 1p1c is built on */
+            if (txr_ring_has(par[k]) && !txr_recon_allow_refetch(par[k])) continue;
+            if (mpool_get(mp, par[k], &got_len)) continue;
+            if (fd < 0 || txr_nf_has(fd, par[k])){
+                /* THIS peer already notfounded that parent (or the
+                 * peer is an inbound child's): do not ask it --
+                 * route the request to another leg through the want
+                 * table instead. */
+                txr_want_note(par[k], TXR_MSG_WITNESS_TX, fd, 0);
+                { txr_want_t* w = txr_want_find(par[k]);
+                  if (w && !w->inflight){ txr_parent_req++; txr_want_failover(w); } }
+                continue;
+            }
+            u8* o = gd + 1 + want*36;
+            o[0] = (u8)(TXR_MSG_WITNESS_TX);       o[1] = 0;
+            o[2] = 0; o[3] = (u8)(TXR_MSG_WITNESS_TX >> 24);
+            memcpy(o + 4, par[k], 32);
+            txr_ring_add(par[k]);
+            txr_want_note(par[k], TXR_MSG_WITNESS_TX, fd, 1);
+            want++;
+        }
+        if (want){
+            gd[0] = (u8)want;
+            if (p2p_write(fd, "getdata", 7, gd, 1 + want*36) > 0){
+                *outstanding += (int)want; txr_parent_req += (long)want;
+            }
+        }
+    }
+    /* other rejects are counted in tx_accept's own summary */
+    return accepted;
+}
+
+/* The worker's half of daemon/tx_handoff.c: validate what the inbound serve
+ * children queued since the last rotation. Weak, so link sets without the
+ * ring (the relay unit tests) build and simply drain nothing. */
+extern long txho_drain(void (*fn)(const u8*, unsigned long, int, void*), void* ctx, long max) __attribute__((weak));
+static long txr_handoff_accepted;
+static void txr_handoff_one(const u8* tx, unsigned long len, int src_slot, void* mp){
+    int unused = 0;
+    txr_handoff_accepted += txr_take_tx(mp, tx, len, -1, src_slot, &unused);
+}
+long txrelay_drain_handoff(void* mp, long max){
+    if (!txho_drain || !mp) return 0;
+    txr_handoff_accepted = 0;
+    txho_drain(txr_handoff_one, mp, max);
+    return txr_handoff_accepted;
+}
+
 long txrelay_poll_leg(int fd, void* mp, int max_ms){
     u8* pl = txr_pl;
-    static u8 scratch[2000*81 + 8];      /* worker is single-threaded */
     char cmd[12];
     unsigned plen;
     long accepted = 0;
@@ -1436,71 +1539,7 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
         if (!memcmp(cmd, "tx", 3)){
             if (txr_blocksonly()) return -2;             /* Core: "transaction sent in violation of protocol" */
             if (outstanding > 0) outstanding--;
-            u8 txid[32];
-            if (plen >= 60 && tx_txid(txid, pl, plen, scratch, sizeof scratch) == 1){
-                { extern void sha256d(u8 out[32], const void* p, unsigned long n);
-                  u8 wtxid[32]; sha256d(wtxid, pl, plen);       /* BIP339 announcements key by this */
-                  txr_want_clear(txid); txr_want_clear(wtxid); }
-                long r = tx_accept_validate_p2p(mp, txid, pl, plen);
-                if (r == 1){
-                    accepted++;
-                    if (txrelay_on_tx_accepted) txrelay_on_tx_accepted(fd);   /* getpeerinfo last_transaction */
-                    if (txr_on_accept) txr_on_accept(txid, pl, plen);   /* -walletnotify */
-                    txr_ann_add(txid, fd);
-                    accepted += txr_orphan_resolve_ann(mp, txid, fd);   /* cascade waiting children */
-                } else if (r == -28){
-                    /* fee-only reject -- the one verdict a CPFP child can
-                     * overturn. If a child is already parked for this
-                     * parent, the two go in together; if not, remember the
-                     * parent as reconsiderable so that when a child does
-                     * turn up we are allowed to fetch this parent again. */
-                    long got = txr_try_1p1c(mp, txid, pl, plen);
-                    if (got) accepted += got;
-                    else     txr_recon_add(txid);
-                } else if (r == -25){
-                    /* missing inputs: ordinary out-of-order relay. Park the
-                     * child and fetch its parents from THIS leg right now --
-                     * the resolve sweep on the parent's accept finishes the
-                     * job. */
-                    txr_orphan_add(txid, pl, plen);
-                    u8 par[TXR_ORPHAN_PARENTS][32];
-                    u32 npar = txr_tx_parents(pl, plen, par, TXR_ORPHAN_PARENTS);
-                    static u8 gd[1 + TXR_ORPHAN_PARENTS*36];
-                    unsigned want = 0;
-                    for (u32 k = 0; k < npar; k++){
-                        unsigned long got_len;
-                        /* a parent we rejected on fee alone is exactly the
-                         * one we DO want again, now that its child is here:
-                         * the ring would otherwise suppress the re-fetch
-                         * that 1p1c is built on */
-                        if (txr_ring_has(par[k]) && !txr_recon_allow_refetch(par[k])) continue;
-                        if (mpool_get(mp, par[k], &got_len)) continue;
-                        if (txr_nf_has(fd, par[k])){
-                            /* THIS peer already notfounded that parent: do
-                             * not ask it again -- route the request to
-                             * another leg through the want table instead. */
-                            txr_want_note(par[k], TXR_MSG_WITNESS_TX, fd, 0);
-                            { txr_want_t* w = txr_want_find(par[k]);
-                              if (w && !w->inflight){ txr_parent_req++; txr_want_failover(w); } }
-                            continue;
-                        }
-                        u8* o = gd + 1 + want*36;
-                        o[0] = (u8)(TXR_MSG_WITNESS_TX);       o[1] = 0;
-                        o[2] = 0; o[3] = (u8)(TXR_MSG_WITNESS_TX >> 24);
-                        memcpy(o + 4, par[k], 32);
-                        txr_ring_add(par[k]);
-                        txr_want_note(par[k], TXR_MSG_WITNESS_TX, fd, 1);
-                        want++;
-                    }
-                    if (want){
-                        gd[0] = (u8)want;
-                        if (p2p_write(fd, "getdata", 7, gd, 1 + want*36) > 0){
-                            outstanding += (int)want; txr_parent_req += (long)want;
-                        }
-                    }
-                }
-                /* other rejects are counted in tx_accept's own summary */
-            }
+            accepted += txr_take_tx(mp, pl, plen, fd, -1, &outstanding);
             continue;
         }
         if (!memcmp(cmd, "getdata", 8)){

@@ -58,7 +58,7 @@ extern serve_block_ctx_ok
     extern mpool_count
     extern tx_dispatch_init
     extern tx_policy_init
-    extern tx_accept_validate
+    extern tx_accept_serve_tx
     extern log_block_stored_inbound
     extern tx_txid
     extern bip152_shortid
@@ -719,18 +719,20 @@ node_serve_loop:
     call tx_txid
     test rax, rax
     jz   .viol_tx_malformed  ; N3: does not parse -> score, then drop
-    ; tx_accept_validate(mp_cur, s_txid, pl_buf, s_plen) -- full mempool
-    ; policy (fee/RBF/ancestor-descendant limits) + whole-tx signature
-    ; validation before storing for relay, replacing the previous
-    ; unconditional mpool_put (which called it on every syntactically-
-    ; minimal tx with zero validation).
-    cmp  byte [tx_dv_ok], 1
-    jne  .next               ; validation unavailable this connection -- drop, don't relay unvalidated
+    ; tx_accept_serve_tx(mp_cur, s_txid, pl_buf, s_plen, tx_dv_ok) -- hands
+    ; the tx to the download worker, which validates it against the LIVE
+    ; UTXO set (daemon/tx_handoff.c). 2026-09-19: this called
+    ; tx_accept_validate here, against the boot-time snapshot this child
+    ; inherited, which holds no coin created after the node started -- so
+    ; every relayed tx spending one was dropped as missing-inputs. Without a
+    ; handoff ring (test harnesses) it still validates locally, and only
+    ; when tx_dv_ok says this connection can: never relay unvalidated.
     mov  rdi, [mp_cur]
     lea  rsi, [s_txid]
     lea  rdx, [pl_buf]
     mov  rcx, [s_plen]
-    call tx_accept_validate
+    movzx r8d, byte [tx_dv_ok]
+    call tx_accept_serve_tx
     jmp  .next
 
 .do_block:
@@ -2039,22 +2041,15 @@ node_announce_tip:
     ; build inv: hp_buf[0]=count 1, hp_buf[1..4]=type u32 LE=2, hp_buf[5..36]=hashLE
     mov  byte [hp_buf], 1
     mov  dword [hp_buf+1], 2
-    ; reverse the 32-byte hash (internal order at sb_buf+0x200000..+31) into
-    ; hp_buf+5 in LE wire order. Use base+index (2 MB displacement not encodable
-    ; with a scaled register index directly).
-    lea  r10, [sb_buf+0x200000+31]  ; src base (last hash byte)
-    lea  r11, [hp_buf+5]            ; dst base
-    xor  ecx, ecx
-.at_rev:
-    cmp  rcx, 32
-    jae  .at_rev_done
-    mov  r9, rcx
-    neg  r9
-    mov  al, [r10+r9]
-    mov  [r11+rcx], al
-    inc  rcx
-    jmp  .at_rev
-.at_rev_done:
+    ; the hash goes on the wire in INTERNAL order -- block_hash's sha256d
+    ; output as-is, the same bytes a getdata or a headers prev-hash carries.
+    ; 2026-09-19: this reversed it into display order, so every inv(MSG_BLOCK)
+    ; this node sent named a block nobody has: Core v31.1 logged
+    ; "got inv: block c8f7be...9204 new" for its own tip 04922a...f7c8.
+    lea  rdi, [hp_buf+5]
+    lea  rsi, [sb_buf+0x200000]
+    mov  rdx, 32
+    call memcpy_len
     mov  rdi, r12
     lea  rsi, [cn_inv]
     mov  rdx, 3
