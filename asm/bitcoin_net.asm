@@ -75,11 +75,19 @@ global g_v2_hook_write
 global g_v2_hook_read
 global g_v2_active
 global g_p2p_write_hook
+global g_p2p_read_hook
 ; bmc.uploadratelimit (2026-09-08): a C pacer called BEFORE every p2p_write,
 ; v1 and v2 alike, with (fd, payload length). 0 = no hook. It sleeps out the
 ; byte debt of what this process has already sent, so the node's upload
 ; stays under the operator's KB/s ceiling.
 g_p2p_write_hook: dq 0         ; void (*)(int fd, u32 plen)
+; 2026-09-19: the RECEIVE-side counterpart, called AFTER p2p_read (v1 and v2)
+; returns a message: (fd, cmd[12], announced payload length). Only a read
+; that consumed a whole frame reports -- 1 (ok) and -2 (truncated: the excess
+; was drained, so every byte of it still crossed the wire). 0 = no hook, and
+; then p2p_read is exactly the old routine (a tail jump, no frame). Installed
+; by the download's processes, whose socket reads getpeerinfo could not see.
+g_p2p_read_hook: dq 0          ; void (*)(int fd, const char* cmd, u32 plen)
 g_v2_hook_write: dq 0          ; long (*)(int fd, const char* cmd, u32 cmdlen,
                                ;         const void* payload, u32 plen)
 g_v2_hook_read:  dq 0          ; int  (*)(int fd, char cmd_out[12], void* payload,
@@ -525,6 +533,44 @@ p2p_write:
 ; ============================================================================
 global p2p_read
 p2p_read:
+    ; the receive hook (see g_p2p_read_hook above). Unset: tail-jump into the
+    ; unchanged routine, arguments untouched. Set: call it, then report the
+    ; frame. fd, cmd_out and plen_out are kept in this frame across the
+    ; call; the routine's return value is carried back unchanged.
+    mov  rax, [rel g_p2p_read_hook]
+    test rax, rax
+    je   p2p_read_core
+    push rbp
+    mov  rbp, rsp
+    push rdi                ; [rbp-0x08] fd
+    push rsi                ; [rbp-0x10] cmd_out
+    push r8                 ; [rbp-0x18] plen_out
+    push rax                ; [rbp-0x20] the routine's result, below
+    and  rsp, -16
+    call p2p_read_core
+    mov  [rbp-0x20], rax
+    ; compare the low 32 bits: p2p_read is int-valued, and the v2 branch
+    ; returns a C int whose upper half of rax is not defined
+    cmp  eax, 1
+    je   .report
+    cmp  eax, -2
+    jne  .out
+.report:
+    mov  rax, [rel g_p2p_read_hook]
+    test rax, rax
+    je   .out
+    mov  rdx, [rbp-0x18]
+    mov  edx, [rdx]         ; arg3 = announced payload length
+    mov  rsi, [rbp-0x10]    ; arg2 = cmd_out
+    mov  edi, [rbp-0x08]    ; arg1 = fd
+    call rax
+.out:
+    mov  rax, [rbp-0x20]
+    mov  rsp, rbp
+    pop  rbp
+    ret
+
+p2p_read_core:
     ; v2 dispatch (see g_v2_active above); falls through to v1 untouched
     cmp  edi, V2_FD_MAX
     jae  .v1

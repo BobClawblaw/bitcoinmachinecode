@@ -21,6 +21,8 @@
 #include <sys/wait.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <signal.h>
+#include <pthread.h>
 #include "../daemon/node_config.h"
 
 extern int  mempool_configure(void);
@@ -45,6 +47,18 @@ extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
                                       unsigned long* out_len);
 extern long mpool_policy_entry(void*, const unsigned char*,
                                unsigned long long*, unsigned long long*);
+
+/* 2026-09-19 case (b): one thread holds the lock for 300 ms; one arrives late */
+static void* hold_lock_thread(void* a){
+    int wfd = *(int*)a;
+    mp_lock();
+    if (write(wfd, "L", 1) != 1) {}
+    usleep(300000);
+    mp_unlock();
+    return NULL;
+}
+static volatile int g_late_entered = 0;
+static void* late_lock_thread(void* a){ (void)a; mp_lock(); g_late_entered = 1; mp_unlock(); return NULL; }
 
 static int fails=0, checks=0;
 static void ck(const char* what, int cond){ checks++; if(cond) printf("ok  : %s\n",what); else { printf("FAIL: %s\n",what); fails++; } }
@@ -154,6 +168,68 @@ int main(void){
         mp_unlock();
         alarm(0);
         ck("MEM-20 and remains usable on the next acquisition", 1);
+    }
+
+    /* ---- 2026-09-19: a NORMAL stop must not die inside the lock ------------
+     * All thirteen EOWNERDEAD warnings in the production logs were printed
+     * during a stop. Two shapes, each reproduced here against the real lock:
+     *   (a) an inbound serve child takes SIGTERM with the default action and
+     *       is signalled mid-accept (systemd's control-group stop);
+     *   (b) the serve parent _exit()s from its main thread while an RPC or
+     *       Esplora thread is inside (getrawmempool walks the whole pool
+     *       under it).
+     * The assertion is the recovery counter: every EOWNERDEAD bumps it. */
+    {
+        extern unsigned long mp_lock_owner_died_count(void);
+        unsigned long d0 = mp_lock_owner_died_count();
+        int pp[2]; if (pipe(pp) != 0){ perror("pipe"); return 2; }
+        pid_t cp = fork();
+        if (cp == 0){
+            signal(SIGTERM, SIG_DFL);                 /* main.c's serve child */
+            mp_lock();
+            if (write(pp[1], "L", 1) != 1) _exit(9);
+            usleep(300000);                           /* the SIGTERM arrives in here... */
+            mp_unlock();
+            for (;;) pause();                         /* ...and must land here */
+        }
+        char c = 0; if (read(pp[0], &c, 1) != 1) c = 0;
+        kill(cp, SIGTERM);
+        int cst = 0; waitpid(cp, &cst, 0);
+        ck("(a) the serve-child shape was ended by its SIGTERM", c == 'L' && WIFSIGNALED(cst) && WTERMSIG(cst) == SIGTERM);
+        alarm(10); mp_lock(); mp_unlock(); alarm(0);
+        ck("(a) ...only after its unlock: the next locker saw no EOWNERDEAD", mp_lock_owner_died_count() == d0);
+
+        extern int mp_quiesce(long);
+        unsigned long d1 = mp_lock_owner_died_count();
+        pid_t qp = fork();
+        if (qp == 0){
+            pthread_t th;
+            if (pthread_create(&th, NULL, hold_lock_thread, &pp[1]) != 0) _exit(8);
+            char h = 0; if (read(pp[0], &h, 1) != 1 || h != 'L') _exit(7);   /* the thread is inside */
+            int left = mp_quiesce(5000);              /* the parent's shutdown step... */
+            _exit(left != 0 ? 5 : 0);                 /* ...then its _exit, which kills every thread */
+        }
+        int qst = 0; waitpid(qp, &qst, 0);
+        ck("(b) mp_quiesce returned with no thread left inside", WIFEXITED(qst) && WEXITSTATUS(qst) == 0);
+        alarm(10); mp_lock(); mp_unlock(); alarm(0);
+        ck("(b) the process _exit()ed with no thread inside: no EOWNERDEAD", mp_lock_owner_died_count() == d1);
+
+        pid_t zp = fork();
+        if (zp == 0){
+            pthread_t th, late;
+            if (pthread_create(&th, NULL, hold_lock_thread, &pp[1]) != 0) _exit(8);
+            char h = 0; if (read(pp[0], &h, 1) != 1 || h != 'L') _exit(7);
+            mp_quiesce(5000);
+            g_late_entered = 0;
+            if (pthread_create(&late, NULL, late_lock_thread, NULL) != 0) _exit(6);
+            pthread_join(th, NULL);                   /* the holder is out: the lock is free */
+            usleep(200000);
+            _exit(g_late_entered ? 4 : 0);
+        }
+        int zst = 0; waitpid(zp, &zst, 0);
+        ck("(b) after the quiesce, a thread arriving at a FREE lock parks instead of entering",
+           WIFEXITED(zst) && WEXITSTATUS(zst) == 0);
+        close(pp[0]); close(pp[1]);
     }
 
 

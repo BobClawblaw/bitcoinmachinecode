@@ -937,6 +937,24 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     return 1;
 }
 
+/* tx_accept_serve_tx: bitcoin_serve.asm's `.do_tx` entry, in an inbound
+ * serve child. The child's own validation view is the boot-time snapshot
+ * (serve_txdv_preinit), blind to every coin newer than the process, so the
+ * transaction is handed to the download worker, which validates against the
+ * live set (daemon/tx_handoff.c has the whole story). Local validation is
+ * the fallback for a process with no handoff ring -- the test harnesses
+ * that drive node_serve_loop directly. dv_ok is the child's tx_dv_ok.
+ * Returns 1 queued or accepted, 0 dropped. */
+long tx_accept_serve_tx(void* mp_area, const u8 txid[32], const u8* tx, unsigned long txlen, long dv_ok){
+    extern int txho_push(const unsigned char*, unsigned long, int) __attribute__((weak));
+    if (txho_push){
+        int q = txho_push(tx, txlen, txann_my_slot());
+        if (q >= 0) return q;
+    }
+    if (!dv_ok) return 0;
+    return tx_accept_validate(mp_area, txid, tx, txlen) == 1;
+}
+
 /* The two -- and only two -- policy verdicts a package may overturn, in
  * Core's words. Exported so the relay drain and the submitpackage path
  * cannot drift apart on what "reconsiderable" means. */

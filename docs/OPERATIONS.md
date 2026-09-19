@@ -48,10 +48,18 @@ and cookie, so no other flags are usually needed.
 
 ```sh
 cd /path/to/repo/asm
-make daemon/bmcbitcoind              # the daemon (about 31 MB)
+make runtime                  # the daemon, bmc_cli, and every helper the daemon execs
+make daemon/bmcbitcoind              # the daemon alone (about 31 MB)
 make daemon/bmc_cli           # the RPC client
 make tests/tool_archive_relayout  # archive maintenance tool (optional)
 ```
+
+The daemon runs its index builders (`bmc_build_tx_index`,
+`bmc_build_txospender_index`, `bmc_build_addr_hist`,
+`bmc_build_coinstats_hist`, `bmc_merge_index_runs`) from its own directory.
+Without them it keeps running and logs `builder ... not executable`, and the
+configured indexes are never folded into runs; `make runtime` builds the whole
+set (`make print-runtime-helpers` lists it).
 
 `asm/build.sh` is an equivalent wrapper. The build uses `gcc -no-pie -O2`
 and `nasm -f elf64`.

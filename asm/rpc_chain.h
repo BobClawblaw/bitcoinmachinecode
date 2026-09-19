@@ -35,6 +35,12 @@ long rpc_chain_read_block_at(long h, unsigned char* buf, long cap);
 long rpc_chain_tip_height(void);
 /* 3.1: reader of the connected tip (NODE_TIP_UNTRACKED = use the stored tip) */
 void rpc_chain_set_public_tip_fn(long (*fn)(void));
+/* 2026-09-19: which optional indexes the node is configured to keep (Core's
+ * -txindex, -txospenderindex, -blockfilterindex, -coinstatsindex, and the
+ * addrindex extension). An index configured off is neither consulted nor
+ * listed by getindexinfo, whatever files the datadir holds. Never called =
+ * the files decide (a standalone reader, the unit tests). */
+void rpc_chain_set_index_config(int txindex, int txospenderindex, int blockfilterindex, int coinstatsindex, int addrindex);
 /* RPX-4: block hash at a height, WIRE order (reverse it for display). */
 int  rpc_chain_hash_at(long height, unsigned char out[32]);
 

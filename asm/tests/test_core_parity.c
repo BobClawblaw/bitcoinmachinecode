@@ -20,6 +20,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/file.h>
+#include <fcntl.h>
 #include "../daemon/node_config.h"
 #include "../daemon/chainparams.h"
 
@@ -249,6 +251,28 @@ int main(void){
     { /* an empty template must be a no-op, not a shell invocation */
       notify_run("", "anything", "test");
       ck("an unconfigured hook does nothing", 1); }
+
+    /* 2026-09-19: a hook must not hold the daemon's descriptors -- above all
+     * the datadir .lock, whose flock belongs to the open file description a
+     * forked child shares. The hook is double-forked, so nothing waits for
+     * it; if it inherited the lock, a running hook would keep the NEXT
+     * instance from starting after this one had gone. Core's lock is fcntl,
+     * which no child ever holds. Here: lock a file, start a hook that
+     * outlives our close, close, and the lock must be free at once. */
+    { char lp[64]; snprintf(lp, sizeof lp, "/tmp/bmc_notify_lock_%d", (int)getpid());
+      const char* done = "/tmp/bmc_notify_lock_done.txt"; unlink(done);
+      int lfd = open(lp, O_RDWR|O_CREAT, 0600);
+      ck("took a lock the hook would inherit", lfd >= 0 && flock(lfd, LOCK_EX|LOCK_NB) == 0);
+      char cmd[256]; snprintf(cmd, sizeof cmd, "sleep 2; echo %%s > %s", done);
+      notify_run(cmd, "x", "test");
+      usleep(400000);                                   /* the hook is running (in its sleep) */
+      close(lfd);
+      int pfd = open(lp, O_RDWR);
+      int free_now = pfd >= 0 && flock(pfd, LOCK_EX|LOCK_NB) == 0;
+      if (pfd >= 0) close(pfd);
+      ck("a RUNNING hook does not hold the daemon's lock (its fds above stderr are closed)", free_now);
+      ck("  and the hook still ran to completion", wait_for_file(done, 50));
+      unlink(done); unlink(lp); }
 
     printf("== 8. an unimplemented Core option is REPORTED, not swallowed ==\n");
     { extern int nodecfg_unimplemented(const char*);

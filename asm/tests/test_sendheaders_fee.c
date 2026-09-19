@@ -82,15 +82,15 @@ int main(void){
     if(rr>0 && !strncmp(cmd,"inv",3)){
         ck("inv count==1", buf[0]==1);
         ck("inv type==MSG_BLOCK(2)", (buf[1]|(buf[2]<<8)|(buf[3]<<16)|(buf[4]<<24))==2);
-        /* wire-order hash = reverse of internal blkhash */
+        /* the wire carries the hash in INTERNAL order (sha256d output, as
+         * Core serializes a uint256). 2026-09-19: this used to assert the
+         * REVERSED bytes -- pinning the defect: Core v31.1 logged every one
+         * of our block invs as an unknown ("new") block, the byte-reversal
+         * of its own tip. */
         ck("inv len==37", (int)bl==37);
-        int m=1;
-        for(int k=0;k<32;k++) if(buf[5+k]!=blkhash[31-k]) m=0;
-        ck("inv hash == block tip (wire order)", m);
-        /* wire hash must equal reversed block-hash; cross-check against header */
-        unsigned char rh[32]; for(int k=0;k<32;k++) rh[k]=buf[5+k];  /* wire order */
-        unsigned char hr[32]; for(int k=0;k<32;k++) hr[31-k]=rh[k];  /* -> internal */
-        ck("inv hash == stored tip hash", memcmp(hr,blkhash,32)==0);
+        ck("inv hash == stored tip hash (internal order, as on the wire)", memcmp(buf+5,blkhash,32)==0);
+        unsigned char rev[32]; for(int k=0;k<32;k++) rev[k]=blkhash[31-k];
+        ck("inv hash is NOT the display-order (reversed) hash", memcmp(buf+5,rev,32)!=0);
     }
 
     /* A2: sendheaders form -> headers message with the 80-byte header */

@@ -2009,6 +2009,45 @@ int main(void){
       ck("every fixture tx resolves by txid alone", all);
       ck("...and byte-identically to the blockhash path (one render path)", same); }
 
+    { /* 2026-09-19 (run-28 bench fidelity, defect B): an index CONFIGURED OFF
+       * is Core without the option, whatever files the datadir holds. The
+       * reader used to decide from the files alone, so a node with txindex=0
+       * still answered by txid -- and listed the index -- from a previous
+       * configuration's (or an unconditional tail's) leftovers.
+       * Watched to FAIL with the gate removed: the by-txid lookup succeeds,
+       * getindexinfo lists txindex, getblockfilter serves a filter. */
+      rpc_chain_set_index_config(0, 0, 0, 0, 0);
+      char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_tx1_txid);
+      long e2 = 0; const char* m2 = NULL; rj_val* r2 = call("getrawtransaction", pj, &e2, &m2);
+      ck("txindex=0 with the index files present: getrawtransaction by txid answers Core's -5",
+         r2 == NULL && e2 == -5 && m2 && !strcmp(m2, "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions."));
+      rj_free(r2);
+      { char pj2[200]; snprintf(pj2, sizeof pj2, "[\"%s\",0,\"%s\"]", g_tx1_txid, g_hash[3]);
+        r2 = call("getrawtransaction", pj2, &e2, &m2);
+        ck("...while the blockhash form still works (it needs no index)", r2 && r2->str && r2->str[0]); rj_free(r2); }
+      { char pj3[160]; snprintf(pj3, sizeof pj3, "[[\"%s\"]]", g_tx1_txid);
+        r2 = call("gettxoutproof", pj3, &e2, &m2);
+        ck("...gettxoutproof by txid alone: Core's \"Transaction not yet in block\"",
+           r2 == NULL && e2 == -5 && m2 && !strcmp(m2, "Transaction not yet in block")); rj_free(r2); }
+      r2 = call("getindexinfo", "[]", &e2, &m2);
+      ck("...getindexinfo lists no txindex", r2 && r2->typ == RJ_OBJ && rj_obj_get(r2, "txindex") == NULL); rj_free(r2);
+      { char pj4[200]; snprintf(pj4, sizeof pj4, "[\"%s\"]", g_hash[1]);
+        r2 = call("getblockfilter", pj4, &e2, &m2);
+        ck("blockfilterindex=0: getblockfilter answers Core's -1 \"Index is not enabled for filtertype basic\"",
+           r2 == NULL && e2 == -1 && m2 && !strcmp(m2, "Index is not enabled for filtertype basic")); rj_free(r2);
+        snprintf(pj4, sizeof pj4, "[\"%s\",\"extended\"]", g_hash[1]);
+        r2 = call("getblockfilter", pj4, &e2, &m2);
+        ck("...an unknown filter type is still -5 first, as in Core", r2 == NULL && e2 == -5 && m2 && !strcmp(m2, "Unknown filtertype")); rj_free(r2);
+        r2 = call("getblockfilter", "[\"zz\"]", &e2, &m2);
+        ck("...and a malformed hash is still -8 before either", r2 == NULL && e2 == -8); rj_free(r2); }
+      r2 = call("scanblocks", "[\"start\",[\"raw(51)\"]]", &e2, &m2);
+      ck("blockfilterindex=0: scanblocks start refuses as Core does", r2 == NULL && e2 == -1 && m2 && !strcmp(m2, "Index is not enabled for filtertype basic")); rj_free(r2);
+      rpc_chain_set_index_config(1, 1, 1, 1, 1);
+      r2 = call("getrawtransaction", pj, &e2, &m2);
+      ck("txindex=1 again: the same lookup resolves", r2 && r2->str && r2->str[0]); rj_free(r2);
+      r2 = call("getindexinfo", "[]", &e2, &m2);
+      ck("...and getindexinfo lists txindex", r2 && r2->typ == RJ_OBJ && rj_obj_get(r2, "txindex") != NULL); rj_free(r2); }
+
     { /* gettxoutproof by txid alone, via the txid index -- the audit fix.
        * Must resolve to the SAME proof bytes the explicit-blockhash path
        * produces (one render path, not two that could drift), and that
