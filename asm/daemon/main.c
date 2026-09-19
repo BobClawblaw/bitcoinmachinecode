@@ -2064,9 +2064,19 @@ extern long utxo_live_lsm_get(const unsigned char txid_wire[32], unsigned int vo
 static long txoq_mark_block(void* store_buf, const unsigned char hash[32], int op, long* out_h){
     *out_h = -1;
     if(op == 2){ int r = invset_remove(hash); invset_save("invalid.dat"); fprintf(stderr, "[chain] reconsiderblock: %s\n", r ? "mark removed" : "not marked"); return 1; }
-    static unsigned char hb[4096]; hst_init(hb);
+    /* hst_init only OPENS the file and sets the count to 0; hst_reload is
+     * what reads the count from its size. Without it n was always 0, the
+     * scan never ran, and every invalidateblock answered -5 "Block not
+     * found" -- found by the ZMQ sequence regtest differential
+     * (2026-09-19), the first thing to call it over RPC on a live node. The
+     * fd hst_init opens is closed again: this ran once per call and kept
+     * every one. */
+    static unsigned char hb[4096];
+    if(hst_init(hb) != 1) return -1;
+    hst_reload(hb);
     long n = hst_count(hb), h = -1; unsigned char rec[112];
     for(long k = n - 1; k >= 0; k--){ if(hst_get_at(hb, (unsigned long long)k, rec) != 1) break; if(!memcmp(rec + 80, hash, 32)){ h = k; break; } }
+    close((int)*(long*)hb);
     if(h < 0) return 0;
     /* 3.3: the mark + disconnect + headers rollback is chain_invalidate_block
      * (daemon/reorg.c) -- the same path the node takes on its own when a
