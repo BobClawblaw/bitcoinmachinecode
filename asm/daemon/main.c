@@ -2188,7 +2188,7 @@ static void handle_shutdown_signal(int sig){
 #endif
 static int datadir_lock_fd;              /* defined (= -1) with datadir_lock_acquire below */
 #define LOCK_HOLDERS_MAX 64
-typedef struct { int pid; char comm[20]; } lock_holder_t;
+typedef struct { int pid; int tid; unsigned long long start; char comm[20]; } lock_holder_t;
 static void proc_comm(int pid, char* out, size_t cap){
     char p[64]; snprintf(p, sizeof p, "/proc/%d/comm", pid);
     int fd = open(p, O_RDONLY); ssize_t n = fd >= 0 ? read(fd, out, cap - 1) : -1;
@@ -2196,13 +2196,74 @@ static void proc_comm(int pid, char* out, size_t cap){
     if (n <= 0){ snprintf(out, cap, "?"); return; }
     out[n] = 0; if (n > 0 && out[n-1] == '\n') out[n-1] = 0;
 }
+/* A /proc .../stat file's state, flags and start time (fields 3, 9, 22).
+ * comm may contain spaces and ')': parse after the LAST ')'. 1 = read. */
+static int proc_stat_fields(const char* path, char* state, unsigned* flags, unsigned long long* start){
+    char b[1024]; int fd = open(path, O_RDONLY); if (fd < 0) return 0;
+    ssize_t n = read(fd, b, sizeof b - 1); close(fd); if (n <= 0) return 0;
+    b[n] = 0; char* rp = strrchr(b, ')'); if (!rp) return 0;
+    return sscanf(rp + 1, " %c %*d %*d %*d %*d %*d %u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu",
+                  state, flags, start) == 3;
+}
+#define PF_EXITING_BIT 0x4u    /* PF_EXITING (include/linux/sched.h), as /proc/<pid>/stat field 9 shows it */
+/* 1 = the process that was `pid` (started at `start`) is still ON ITS WAY
+ * OUT: it exists, and one of its threads has begun do_exit (PF_EXITING) and
+ * has not reached exit_notify (state Z/X) -- the stretch in which it can
+ * still hold the lock with no fd left to show for it (see
+ * shutdown_wait_lock_released). 0 = gone, reused, running, or finished. */
+static int proc_exit_pending(int pid, unsigned long long start){
+    char p[96], st; unsigned fl; unsigned long long s0;
+    snprintf(p, sizeof p, "/proc/%d/stat", pid);
+    if (!proc_stat_fields(p, &st, &fl, &s0) || s0 != start) return 0;
+    snprintf(p, sizeof p, "/proc/%d/task", pid);
+    DIR* td = opendir(p); if (!td) return 0;
+    struct dirent* t; int pending = 0;
+    while (!pending && (t = readdir(td))){
+        if (t->d_name[0] < '1' || t->d_name[0] > '9') continue;
+        snprintf(p, sizeof p, "/proc/%d/task/%.24s/stat", pid, t->d_name);
+        unsigned long long s1;
+        if (proc_stat_fields(p, &st, &fl, &s1) && (fl & PF_EXITING_BIT) && st != 'Z' && st != 'X') pending = 1;
+    }
+    closedir(td);
+    return pending;
+}
+/* 1 = the fd directory `fdp` has an fd on our lock (with match_ofd: the SAME
+ * open file description, by kcmp against task `tid`); 0 = not; -1 = not
+ * readable. *nfd counts the fds listed, so "none of them is the lock" can be
+ * told from "there are none". */
+static int fd_dir_holds(const char* fdp, int self, int tid, int lockfd, int match_ofd,
+                        const char* want, ssize_t wl, const struct stat* ls, int* nfd){
+    DIR* fdd = opendir(fdp); if (!fdd) return -1;          /* not ours to read, or gone */
+    struct dirent* f; int hit = 0;
+    while (!hit && (f = readdir(fdd))){
+        if (f->d_name[0] < '0' || f->d_name[0] > '9') continue;
+        (*nfd)++;
+        char link[4096]; ssize_t ll = readlinkat(dirfd(fdd), f->d_name, link, sizeof link - 1);
+        if (ll != wl || memcmp(link, want, (size_t)wl) != 0) continue;
+        struct stat s;
+        if (fstatat(dirfd(fdd), f->d_name, &s, 0) != 0) continue;
+        if (s.st_dev != ls->st_dev || s.st_ino != ls->st_ino) continue;
+        if (match_ofd){
+            long r = syscall(SYS_kcmp, (pid_t)self, (pid_t)tid, KCMP_FILE, (unsigned long)lockfd, strtoul(f->d_name, 0, 10));
+            if (r > 0) continue;                             /* another description of the same file */
+        }
+        hit = 1;
+    }
+    closedir(fdd);
+    return hit;
+}
 /* Processes other than this one with an fd on the file `lockfd` is open on;
  * with match_ofd, only those whose fd is the SAME open file description as
  * lockfd. Returns the count (the first `cap` are described in out[]).
  *
  * Candidates are picked by the fd's link TEXT (readlink never touches the
  * file system, so a process with an fd on a hung mount cannot stall a
- * shutdown here) and only then confirmed by stat and kcmp. */
+ * shutdown here) and only then confirmed by stat and kcmp.
+ *
+ * /proc/<pid>/fd is the MAIN THREAD's fd table. A main thread past its
+ * exit_files() lists none while the process's other threads still share the
+ * table -- and the lock with it -- so a process whose main thread lists no fd
+ * at all is looked at thread by thread (out[].tid names the one). */
 static int lock_holders_scan(int lockfd, int match_ofd, lock_holder_t* out, int cap){
     int n = 0, self = (int)getpid();
     char want[4096], lp[64]; struct stat ls;
@@ -2215,25 +2276,30 @@ static int lock_holders_scan(int lockfd, int match_ofd, lock_holder_t* out, int 
     while ((e = readdir(pd))){
         if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
         int pid = atoi(e->d_name); if (pid == self) continue;
-        char fdp[64]; snprintf(fdp, sizeof fdp, "/proc/%d/fd", pid);
-        DIR* fdd = opendir(fdp); if (!fdd) continue;      /* not ours to read, or gone */
-        struct dirent* f; int hit = 0;
-        while (!hit && (f = readdir(fdd))){
-            if (f->d_name[0] < '0' || f->d_name[0] > '9') continue;
-            char link[4096]; ssize_t ll = readlinkat(dirfd(fdd), f->d_name, link, sizeof link - 1);
-            if (ll != wl || memcmp(link, want, (size_t)wl) != 0) continue;
-            struct stat s;
-            if (fstatat(dirfd(fdd), f->d_name, &s, 0) != 0) continue;
-            if (s.st_dev != ls.st_dev || s.st_ino != ls.st_ino) continue;
-            if (match_ofd){
-                long r = syscall(SYS_kcmp, (pid_t)self, (pid_t)pid, KCMP_FILE, (unsigned long)lockfd, strtoul(f->d_name, 0, 10));
-                if (r > 0) continue;                         /* another description of the same file */
+        char fdp[96]; snprintf(fdp, sizeof fdp, "/proc/%d/fd", pid);
+        int nfd = 0, tid = pid;
+        int hit = fd_dir_holds(fdp, self, pid, lockfd, match_ofd, want, wl, &ls, &nfd);
+        if (hit == 0 && nfd == 0){
+            char tdp[64]; snprintf(tdp, sizeof tdp, "/proc/%d/task", pid);
+            DIR* td = opendir(tdp);
+            if (td){
+                struct dirent* t;
+                while (hit <= 0 && (t = readdir(td))){
+                    if (t->d_name[0] < '1' || t->d_name[0] > '9') continue;
+                    int t_id = atoi(t->d_name), tn = 0; if (t_id == pid) continue;
+                    snprintf(fdp, sizeof fdp, "/proc/%d/task/%d/fd", pid, t_id);
+                    if (fd_dir_holds(fdp, self, t_id, lockfd, match_ofd, want, wl, &ls, &tn) > 0){ hit = 1; tid = t_id; }
+                }
+                closedir(td);
             }
-            hit = 1;
         }
-        closedir(fdd);
-        if (!hit) continue;
-        if (n < cap){ out[n].pid = pid; proc_comm(pid, out[n].comm, sizeof out[n].comm); }
+        if (hit <= 0) continue;
+        if (n < cap){
+            char sp[64], st; unsigned fl; snprintf(sp, sizeof sp, "/proc/%d/stat", pid);
+            out[n].pid = pid; out[n].tid = tid;
+            if (!proc_stat_fields(sp, &st, &fl, &out[n].start)) out[n].start = 0;
+            proc_comm(pid, out[n].comm, sizeof out[n].comm);
+        }
         n++;
     }
     closedir(pd);
@@ -2242,7 +2308,9 @@ static int lock_holders_scan(int lockfd, int match_ofd, lock_holder_t* out, int 
 static void lock_holders_fmt(const lock_holder_t* h, int n, char* buf, size_t cap){
     size_t o = 0; buf[0] = 0;
     for (int i = 0; i < n && i < LOCK_HOLDERS_MAX && o + 48 < cap; i++)
-        o += (size_t)snprintf(buf + o, cap - o, "%s%d (%s)", i ? ", " : "", h[i].pid, h[i].comm);
+        o += (size_t)(h[i].tid && h[i].tid != h[i].pid
+             ? snprintf(buf + o, cap - o, "%s%d (%s, through thread %d)", i ? ", " : "", h[i].pid, h[i].comm, h[i].tid)
+             : snprintf(buf + o, cap - o, "%s%d (%s)", i ? ", " : "", h[i].pid, h[i].comm));
     if (n > LOCK_HOLDERS_MAX && o + 16 < cap) snprintf(buf + o, cap - o, ", +%d more", n - LOCK_HOLDERS_MAX);
 }
 static long long mono_now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000LL + t.tv_nsec/1000000; }
@@ -2263,11 +2331,13 @@ static long long mono_now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOT
  * the log line naming the stuck process has to be written before systemd's
  * own kill. Returns the number of holders left at the end (0 = released). */
 #define SHUTDOWN_LOCK_WAIT_S 600
+#define LOCK_SEEN_MAX 256
 static int shutdown_wait_lock_released(int max_s, const char* who){
     if (datadir_lock_fd < 0) return 0;
     long long t0 = mono_now_ms(), next_log = t0 + 10000, killed_at = 0;
-    int orphans_termed = 0, worker_logged = 0;
+    int orphans_termed = 0, worker_logged = 0, exit_logged = 0;
     lock_holder_t h[LOCK_HOLDERS_MAX]; char desc[2048];
+    lock_holder_t seen[LOCK_SEEN_MAX]; int nseen = 0;       /* every holder seen, for the exit check */
     for (int last = 0;; ){
         int st; pid_t p;
         while ((p = waitpid(-1, &st, WNOHANG)) > 0)
@@ -2283,7 +2353,48 @@ static int shutdown_wait_lock_released(int max_s, const char* who){
         }
         int n = lock_holders_scan(datadir_lock_fd, 1, h, LOCK_HOLDERS_MAX);
         long long now = mono_now_ms();
-        if (n == 0){ last = 1; continue; }             /* one more pass reaps (and reports) a worker that just left */
+        for (int i = 0; i < n && i < LOCK_HOLDERS_MAX; i++){
+            int k = 0; while (k < nseen && !(seen[k].pid == h[i].pid && seen[k].start == h[i].start)) k++;
+            if (k == nseen && nseen < LOCK_SEEN_MAX) seen[nseen++] = h[i];
+        }
+        if (n == 0){
+            /* No fd on the lock is LISTED -- which is not yet "no process
+             * holds it". An exiting process drops its fd table in
+             * exit_files() and releases its flock only later, when the
+             * deferred final close runs (exit_task_work); in between,
+             * /proc/<pid>/fd lists nothing or cannot be read at all, while
+             * the lock is still held. Caught 2026-09-19 (tests/
+             * test_stop_waits_for_worker, ~1 run in 5 on main): the download
+             * worker, single-threaded, PF_EXITING, state R, address space
+             * already torn down, fd dir unreadable -- and the lock free a
+             * moment after this parent had exited. So a holder is done only
+             * when its exit is COMPLETE: the worker when it is reaped (a
+             * child is reported only after its exit has run through), any
+             * other process seen holding the lock when no thread of it is
+             * still between PF_EXITING and exit_notify. */
+            lock_holder_t pend[LOCK_HOLDERS_MAX]; int np = 0;
+            if (g_dl_worker_pid > 0 && !g_dl_worker_exited && kill(g_dl_worker_pid, 0) == 0){
+                memset(&pend[np], 0, sizeof pend[np]);
+                pend[np].pid = pend[np].tid = (int)g_dl_worker_pid; snprintf(pend[np].comm, sizeof pend[np].comm, "download worker");
+                np++;
+            }
+            for (int k = 0; k < nseen && np < LOCK_HOLDERS_MAX; k++)
+                if (seen[k].pid != (int)g_dl_worker_pid && proc_exit_pending(seen[k].pid, seen[k].start)) pend[np++] = seen[k];
+            if (np == 0){ last = 1; continue; }        /* one more pass reaps (and reports) a worker that just left */
+            lock_holders_fmt(pend, np, desc, sizeof desc);
+            if (!exit_logged || now >= next_log){
+                fprintf(stderr, "[%s] no process lists the datadir lock, but %d still hold(s) it on the way out: %s -- "
+                                "waiting for the exit to complete (%.1fs)\n", who, np, desc, (now - t0) / 1000.0);
+                exit_logged = 1; next_log = now + 10000;
+            }
+            if (now - t0 >= (long long)max_s * 1000 + 10000){
+                fprintf(stderr, "[%s] ERROR: %s still exiting after %ds -- exiting anyway; "
+                                "the next start waits for the lock\n", who, desc, max_s + 10);
+                return np;
+            }
+            usleep(2000);                               /* the stretch is milliseconds */
+            continue;
+        }
         lock_holders_fmt(h, n, desc, sizeof desc);
         if ((g_dl_worker_pid <= 0 || g_dl_worker_exited) && !orphans_termed){
             orphans_termed = 1;
@@ -4745,7 +4856,7 @@ static long dlc_append_frontier(void* st, long height, const unsigned char hash[
     return store_append_shared(st, height, hash, raw, len);
 }
 static int dlc_committer_main(volatile long* ctl, long start_h, long end_h, pid_t parent){
-    int lfd = open("append.lock", O_RDWR | O_CREAT, 0644);
+    int lfd = open("append.lock", O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if(lfd < 0){ fprintf(stderr, "[dlc committer] no lock\n"); return 1; }
     static unsigned char st[4096]; store_init(st);
     *(int*)((char*)st + 40) = lfd;
@@ -5507,7 +5618,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
      * guarded call resets the flag before it matters. */
     { struct sigaction sa0; memset(&sa0,0,sizeof sa0); sa0.sa_handler=mux_budget_alarm; sigemptyset(&sa0.sa_mask); sigaction(SIGUSR1,&sa0,NULL); }
     g_dlc_me = mystat; dlc_wire_dial();   /* this process's p2p bytes are its peer's (dl_wire_note) */
-    int lfd=open("append.lock", O_RDWR|O_CREAT, 0644);
+    int lfd=open("append.lock", O_RDWR|O_CREAT|O_CLOEXEC, 0644);
     if(lfd<0){ fprintf(stderr,"[dlc w%d] no lock\n",w); return 1; }
     static unsigned char st[4096]; store_init(st);
     *(int*)((char*)st+40)=lfd;
@@ -11453,8 +11564,12 @@ int main(int argc, char** argv){
             fprintf(stderr,"[boot] checklevel=0 -- skipping archive verification\n");
         }
         /* shared-append flock fd: open append.lock once so any concurrent-safe
-         * store_append_shared writes (and the boot catch-up) serialize. */
-        int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
+         * store_append_shared writes (and the boot catch-up) serialize.
+         * O_CLOEXEC: forked writers inherit it as before, but an exec'd
+         * helper (the index builders) has no use for it, and holding a
+         * reference would keep a flock taken by a writer that then died
+         * mid-append alive for as long as the helper runs. */
+        int apfd=open("append.lock", O_RDWR|O_CREAT|O_CLOEXEC, 0644);
         if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;
         /* LISTENER FIRST: bind+listen the inbound socket before the (possibly
          * long) catch-up so the node is live to inbound peers immediately.
@@ -11750,7 +11865,7 @@ int main(int argc, char** argv){
         if(nwant<1) nwant=1;
         if(nwant>1) nwant=1;   /* one loopback peer */
         store_reload(store_buf);
-        int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
+        int apfd=open("append.lock", O_RDWR|O_CREAT|O_CLOEXEC, 0644);
         if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;
         build_hash_index();
         int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));
