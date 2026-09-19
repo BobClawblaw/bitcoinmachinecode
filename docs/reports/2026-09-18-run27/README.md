@@ -31,18 +31,19 @@ Footnotes, neither of which touches the data:
   05:08Z (height ~580k). The per-height timeline before that is recovered
   from the block files (below).
 - **Not this run: an earlier, abandoned attempt.** A first attempt at 23:16Z
-  ran with `debug=net` and `debug=validation` on, which slows a sync. It was
-  stopped at ~152k after ten minutes and moved aside, untouched, to
+  ran with `debug=net`, `debug=validation` and `debug=bench` on, which slows a
+  sync. It was stopped after ten minutes at height 195,921 and moved aside,
+  untouched, to
   `core-oracle-ABORTED-logging-handicap-20260917-2326`. None of its data or
   time is in the baseline.
 
-## Run 27 (running)
+## Run 27 (finished; result below)
 
 | | bmc |
 |---|---|
 | build | `ad77e46e` (main), `bmc_build_dirty=false`, verified over RPC |
 | datadir | `/mnt/nvme8tb/bench/run27/data`, same device as the baseline |
-| launched | 2026-09-18 19:15:37Z (epoch 1789758929) |
+| launched | daemon started 2026-09-18 19:15:29Z (epoch 1789758929, the start of its clock); the harness logged the DAEMON line at 19:15:37Z |
 | harness | `validation/fresh_ibd_run.sh`, DEST=/mnt/nvme8tb/bench/run27, NICE=0, WORKERS=8 |
 | protocol | dbcache=8192, bmc.bootcatchup=0, 8 download workers, txindex + coinstatsindex + blockfilterindex, maxconnections=48, public network |
 | capstone oracle | the baseline node above (RPC 8337): the muhash at bmc's quiesced height, O(1) through its coinstatsindex |
@@ -85,7 +86,7 @@ at nine of the ten.
 | 850,000 | 14 h 37 m | 2.2 h |
 | 900,000 | 16 h 51 m | 2.2 h |
 | 950,000 | 18 h 58 m | 2.1 h |
-| 967,568 (IBD end) | 19 h 40 m | |
+| 967,454 (`Leaving InitialBlockDownload`, 19:07:03Z) | 19 h 40 m 09 s | |
 
 At 20:25Z, run 27 had applied 376,320 blocks in 1 h 10 m. Core took 1 h 17 m
 to reach the same height, so bmc was 7.7 min ahead, and the lead had grown at
@@ -120,13 +121,15 @@ the v31.1 node's: `09f5cd877189dc269f505f2066aa2a0b39eb0b8e3384a48449880affd6490
 | | bmc run 27 | Core v31.1 (first run) |
 |---|---|---|
 | download complete | 18 h 36 m 24 s (13:53:40Z, every block stored, ~485 still to apply) | |
-| at the tip | **≤ 18 h 43 m 11 s** (13:58:40Z, from the harness's 5-minute RPC check) | **19 h 40 m 09 s** (`Leaving InitialBlockDownload`) |
+| at the tip | **18 h 40 m 23 s** (13:55:52Z, the node's own log: `catchup progress: height=967709/967709`) | **19 h 40 m 09 s** (`Leaving InitialBlockDownload` at 967,454, 19:07:03Z) |
+| harness saw the tip | 18 h 43 m 11 s (13:58:40Z; it checks every 5 minutes, so this is an upper bound) | |
 
-bmc was about 57 min (~5%) faster. **Treat that as indicative, not clean.** Both runs
+bmc was about 60 min (~5%) faster. **Treat that as indicative, not clean.** Both runs
 were perturbed:
 - Blockyard polled Core for 17 h, and each `gettxoutsetinfo` forced a UTXO flush.
 - Blockyard polled run 27 for 14 h (until 09:07Z). Its RPC side read 10.2 TB.
-- Run 27 also maintained an unrequested 61.6 GB txo-spender tail, and its txindex
+- Run 27 also maintained an unrequested txo-spender tail (61.6 GB mid-run, 98.0 GB
+  at the end), and its txindex
   was never folded (the harness did not build the helpers).
 - Run 27's last hour overlapped a test gate (13:31–13:45Z) and a production
   restart (13:46Z).
@@ -137,6 +140,10 @@ The unpolled Core rerun below and run 28 (#275, #280, #281) are the clean pair.
 
 - **Status:** running, unpolled, watched without RPC (`core31/watch.log`). Its config
   is `core-v31.1-run2.bitcoin.conf`, updated.
+- **The watcher's 14:30:04Z warning was a false positive.** It named bitcoind
+  itself: Core's outbound P2P connection to a remote peer that happened to
+  listen on :8340 matched a socket filter that was not loopback-only. Fixed in
+  #285, and noted in `watch.log`. Nothing has called the node's RPC.
 - **The first launch failed in its first second** (13:59:41Z). With no `bind=` line,
   Core also binds its onion listener on 127.0.0.1 at P2P port + 1 = 8339, and RPC
   had been put on 8339. RPC is now on 8340.
@@ -144,3 +151,10 @@ The unpolled Core rerun below and run 28 (#275, #280, #281) are the clean pair.
   `core31-FAILED-onion-port-clash-20260919-1359`.
 - **The rerun began 29 min after run 27 ended.** Run 27's node is still up with
   networking off: 3.4% of one core and no disk reads.
+
+**Corrected 2026-09-19** against the logs: Core's IBD-end height (967,454, not
+967,568), run 27's tip time (18 h 40 m 23 s from its own log; 18 h 43 m 11 s is
+when the 5-minute harness noticed), its start instant (19:15:29Z), the
+txo-spender tail's final size (98.0 GB) and the aborted attempt's height
+(195,921). The margin over the polled Core baseline is about 60 minutes, and it
+remains indicative, not clean.
