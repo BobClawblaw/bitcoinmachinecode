@@ -48,7 +48,9 @@
 #define MEMPOOL_SEQ_H
 
 /* 65,536 events. A reorg or a mempool.dat reload is a burst of A/R events;
- * the worker drains once per loop and once per connected block. 56 bytes per
+ * the worker drains once per loop, once per connected block, and -- since
+ * 2026-09-19 -- after each of its own accepts (zmq_notify.c), so a reload
+ * never stages more than a handful ahead of the drain. 56 bytes per
  * slot -> 3.5 MiB of anonymous shared memory, touched only as it is used. */
 #define MPSEQ_RING 65536u
 

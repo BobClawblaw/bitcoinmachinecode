@@ -2903,9 +2903,10 @@ tests/test_rpc_whitelist: tests/test_rpc_whitelist.c daemon/bmc_rpcd
 # throwaway temp dir: real mainnet genesis + 3 constructed blocks (one with a
 # segwit coinbase, a legacy spend and a P2WPKH spend). Exercises every method
 # in-process through rpc_dispatch, plus the error paths.
-# The ZMQ notification ring, with REAL forked producers (see the file header).
-tests/test_zmq_ring: tests/test_zmq_ring.c daemon/zmq_notify.c daemon/zmq_pub.c
-	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_zmq_ring.c daemon/zmq_notify.c daemon/zmq_pub.c -lpthread
+# The ZMQ notification ring, with REAL forked producers and a recording fake
+# publisher in place of zmq_pub.c (see the file header).
+tests/test_zmq_ring: tests/test_zmq_ring.c daemon/zmq_notify.c rpc_node.h
+	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_zmq_ring.c daemon/zmq_notify.c -lpthread
 
 # The publisher's bind policy (audit finding 8).
 # Concurrency of the servicing thread against the publisher (audit finding 8).
