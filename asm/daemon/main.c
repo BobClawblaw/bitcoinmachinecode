@@ -11349,7 +11349,7 @@ int main(int argc, char** argv){
          * live synchronization loop over the verified asm IB D core. */
         store_reload(store_buf);            /* continue from persisted tip */
         int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));
-        node_log_str(lfd, 0, "node start (follow mode)", 23);
+        node_log_str(lfd, 0, "node start (follow mode)", (int)strlen("node start (follow mode)"));
         int ls=socket(AF_INET,SOCK_STREAM,0);
         struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
         bind(ls,(struct sockaddr*)&a,sizeof a); socklen_t al=sizeof a; getsockname(ls,(struct sockaddr*)&a,&al);
@@ -11746,7 +11746,10 @@ int main(int argc, char** argv){
         fprintf(stderr,"[boot] hash index build done (%.2fs)\n", phase_elapsed(&hidx_pt));
 
         int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));   /* all-asm leveled logger */
-        node_log_str(lfd, 0, "node start (serve mode / download worker)", 42);
+        /* strlen, not a hand count: this passed 42 for 41 characters and wrote the
+         * terminating NUL into debug.log, which makes grep treat the whole log as
+         * binary (2026-09-19). scripts/log_literal_len_check.py guards the rest. */
+        node_log_str(lfd, 0, "node start (serve mode / download worker)", (int)strlen("node start (serve mode / download worker)"));
         /* Serve-as-full-node (option 2): SERVICE our client calls instantly
          * (fork-based inbound serving in the parent) AND continuously download
          * the chain to tip (a dedicated forked DOWNLOAD-WORKER child; see
@@ -11875,7 +11878,7 @@ int main(int argc, char** argv){
         if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;
         build_hash_index();
         int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));
-        node_log_str(lfd, 0, "serve-test outbound mux", 22);
+        node_log_str(lfd, 0, "serve-test outbound mux", (int)strlen("serve-test outbound mux"));
         int l = lsock(port);
         wb_listen_open();
         if(l<0){ fprintf(stderr,"lsock failed: %s\n", strerror(errno)); return 1; }
