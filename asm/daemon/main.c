@@ -4856,7 +4856,7 @@ static long dlc_append_frontier(void* st, long height, const unsigned char hash[
     return store_append_shared(st, height, hash, raw, len);
 }
 static int dlc_committer_main(volatile long* ctl, long start_h, long end_h, pid_t parent){
-    int lfd = open("append.lock", O_RDWR | O_CREAT, 0644);
+    int lfd = open("append.lock", O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if(lfd < 0){ fprintf(stderr, "[dlc committer] no lock\n"); return 1; }
     static unsigned char st[4096]; store_init(st);
     *(int*)((char*)st + 40) = lfd;
@@ -5618,7 +5618,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
      * guarded call resets the flag before it matters. */
     { struct sigaction sa0; memset(&sa0,0,sizeof sa0); sa0.sa_handler=mux_budget_alarm; sigemptyset(&sa0.sa_mask); sigaction(SIGUSR1,&sa0,NULL); }
     g_dlc_me = mystat; dlc_wire_dial();   /* this process's p2p bytes are its peer's (dl_wire_note) */
-    int lfd=open("append.lock", O_RDWR|O_CREAT, 0644);
+    int lfd=open("append.lock", O_RDWR|O_CREAT|O_CLOEXEC, 0644);
     if(lfd<0){ fprintf(stderr,"[dlc w%d] no lock\n",w); return 1; }
     static unsigned char st[4096]; store_init(st);
     *(int*)((char*)st+40)=lfd;
@@ -11564,8 +11564,12 @@ int main(int argc, char** argv){
             fprintf(stderr,"[boot] checklevel=0 -- skipping archive verification\n");
         }
         /* shared-append flock fd: open append.lock once so any concurrent-safe
-         * store_append_shared writes (and the boot catch-up) serialize. */
-        int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
+         * store_append_shared writes (and the boot catch-up) serialize.
+         * O_CLOEXEC: forked writers inherit it as before, but an exec'd
+         * helper (the index builders) has no use for it, and holding a
+         * reference would keep a flock taken by a writer that then died
+         * mid-append alive for as long as the helper runs. */
+        int apfd=open("append.lock", O_RDWR|O_CREAT|O_CLOEXEC, 0644);
         if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;
         /* LISTENER FIRST: bind+listen the inbound socket before the (possibly
          * long) catch-up so the node is live to inbound peers immediately.
@@ -11861,7 +11865,7 @@ int main(int argc, char** argv){
         if(nwant<1) nwant=1;
         if(nwant>1) nwant=1;   /* one loopback peer */
         store_reload(store_buf);
-        int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
+        int apfd=open("append.lock", O_RDWR|O_CREAT|O_CLOEXEC, 0644);
         if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;
         build_hash_index();
         int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));
