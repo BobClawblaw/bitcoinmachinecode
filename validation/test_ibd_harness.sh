@@ -91,6 +91,49 @@ chmod 755 "$T/runner.sh"
 out=$(ibd_require_exec "$T/runner.sh"); ckc "mode 755 passes" "$?" "0"
 out=$(ibd_require_exec "$T/nope.sh");   ckc "a missing program is refused" "$?" "1"
 
+echo "== the daemon's helpers (run 27: built without them) =="
+# The daemon execs its index builders from its own directory and, without them,
+# runs on and never builds those indexes. Run 27's harness built only the daemon
+# and bmc_cli: its log said "builder ... not executable", then "missing beside
+# the daemon" every five minutes, and nothing read either line.
+mkdir -p "$T/bin"
+for h in bmc_build_tx_index bmc_merge_index_runs; do printf '#!/bin/sh\n' > "$T/bin/$h"; chmod 755 "$T/bin/$h"; done
+out=$(ibd_require_helpers "$T/bin" bmc_build_tx_index bmc_merge_index_runs); ckc "every helper present and executable -> rc 0" "$?" "0"
+out=$(ibd_require_helpers "$T/bin" bmc_build_tx_index bmc_build_txospender_index bmc_merge_index_runs); ckc "one helper absent -> rc 1" "$?" "1"
+ck "...and the refusal names it" "$out" "FAIL missing beside the daemon: bmc_build_txospender_index"
+chmod 644 "$T/bin/bmc_merge_index_runs"
+out=$(ibd_require_helpers "$T/bin" bmc_build_tx_index bmc_merge_index_runs); ckc "a helper at mode 644 counts as missing" "$?" "1"
+out=$(ibd_require_helpers "$T/bin"); ckc "NO names (an empty print-runtime-helpers) is refused, not a pass" "$?" "1"
+# the list itself comes from the Makefile, so the harness and the build cannot drift
+rh=$(make -s --no-print-directory -C ../asm print-runtime-helpers 2>/dev/null)
+case " $rh " in *" bmc_build_tx_index "*" bmc_merge_index_runs"*) ck "make print-runtime-helpers names the builders and the merger" "yes" "yes";;
+                *) ck "make print-runtime-helpers names the builders and the merger" "$rh" "... bmc_build_tx_index ... bmc_merge_index_runs";; esac
+printf '2026-09-18 19:10:00.000 [boot] config: datadir=/x\n' > "$T/helpers.log"
+printf 'a NUL \000 here\n' >> "$T/helpers.log"
+ibd_missing_helper "$T/helpers.log" >/dev/null; ckc "a log with no missing-helper line -> rc 1" "$?" "1"
+ck "...and prints nothing" "$(ibd_missing_helper "$T/helpers.log")" ""
+# run 27's two lines, verbatim, each on its own (after the NUL: grep -a matters)
+L1='2026-09-18 19:17:11.522 [txindex] trail: builder /mnt/nvme8tb/bench/run27/src/asm/daemon/bmc_build_tx_index not executable -- the index cannot be built'
+L2='2026-09-18 19:22:32.163 [trail] txindex: the txindex index needs a run and its builder is missing beside the daemon | txospender: not checked yet | addr_hist: not checked yet'
+cp "$T/helpers.log" "$T/h1.log"; printf '%s\n' "$L1" >> "$T/h1.log"
+out=$(ibd_missing_helper "$T/h1.log"); ckc "run 27's \"builder ... not executable\" line -> rc 0" "$?" "0"
+ck "...and it is the line printed" "$out" "$L1"
+cp "$T/helpers.log" "$T/h2.log"; printf '%s\n' "$L2" >> "$T/h2.log"
+ibd_missing_helper "$T/h2.log" >/dev/null; ckc "run 27's \"missing beside the daemon\" status line alone -> rc 0" "$?" "0"
+cp "$T/helpers.log" "$T/h3.log"; printf '2026-09-18 20:00:00.000 [txindex] trail: merger /x/bmc_merge_index_runs not executable\n' >> "$T/h3.log"
+ibd_missing_helper "$T/h3.log" >/dev/null; ckc "the merger's line -> rc 0" "$?" "0"
+cp "$T/helpers.log" "$T/h4.log"; printf '2026-09-18 20:00:00.000 [coinstats] repair: builder /x/bmc_build_coinstats_hist not executable -- cannot rebuild the history base\n' >> "$T/h4.log"
+ibd_missing_helper "$T/h4.log" >/dev/null; ckc "the coinstats repair's line -> rc 0" "$?" "0"
+cp "$T/helpers.log" "$T/h5.log"; printf '2026-09-18 20:00:00.000 [trail] txindex: idle, runs to 200000 | txospender: not configured | addr_hist: not configured\n' >> "$T/h5.log"
+ibd_missing_helper "$T/h5.log" >/dev/null; ckc "a healthy [trail] status line is not a hit" "$?" "1"
+# and the benchmark harness actually uses all three (static: running it would start a node)
+ck "fresh_ibd_run.sh builds the runtime set (make runtime), not just the daemon" \
+   "$(grep -c 'make -j8 runtime' ./fresh_ibd_run.sh)" "1"
+ck "...refuses to launch without every helper" \
+   "$(grep -c 'ibd_require_helpers src/asm/daemon' ./fresh_ibd_run.sh)" "1"
+ck "...and fails on the daemon's own missing-helper line, early and on every tick" \
+   "$(grep -c 'ibd_missing_helper' ./fresh_ibd_run.sh)" "2"
+
 echo "== core-bench readers =="
 J='{"blocks":740351,"headers":966753,"verificationprogress":0.5257,"chain":"main"}'
 ck "a present field is read"            "$(bench_json_field "$J" blocks)" "740351"

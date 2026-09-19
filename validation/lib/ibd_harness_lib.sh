@@ -86,6 +86,34 @@ ibd_require_exec() {
     printf 'OK %s' "$p"; return 0
 }
 
+# Every helper the daemon execs must sit, executable, beside it. The daemon
+# finds them by its own path (readlink /proc/self/exe) and, without one, keeps
+# running and never builds that index: run 27 built only bmcbitcoind and
+# bmc_cli, so its txindex tail was never folded into a run -- work Core does --
+# for the whole benchmark. The names come from `make print-runtime-helpers`
+# (asm/Makefile RUNTIME_HELPERS), so the harness and the build cannot drift.
+#   ibd_require_helpers <daemon dir> <name>...   rc 1 names every one missing
+ibd_require_helpers() {
+    local dir="$1"; shift
+    [ $# -gt 0 ] || { printf 'FAIL no helper names given (is print-runtime-helpers broken?)'; return 1; }
+    local miss="" h
+    for h in "$@"; do [ -x "$dir/$h" ] || miss="$miss $h"; done
+    [ -z "$miss" ] || { printf 'FAIL missing beside the daemon:%s' "$miss"; return 1; }
+    printf 'OK %d helper(s) beside the daemon' "$#"; return 0
+}
+
+# The daemon's own admission that a helper is missing: the index trail and
+# the coinstats repair print "builder ... not executable" (merger, too) once,
+# and "... missing beside the daemon" on every status line after. Prints the
+# first such line and returns 0 when one is there; prints nothing, rc 1, when
+# none is. grep -a: the log carries NUL bytes.
+ibd_missing_helper() {
+    local log="$1" l
+    l=$(grep -aE '(builder|merger) [^ ]+ not executable|missing beside the daemon' "$log" 2>/dev/null | head -1)
+    [ -n "$l" ] || return 1
+    printf '%s' "$l"; return 0
+}
+
 # --------------------------------------------------------------------------
 # Readers for the Core-side bench runner (run_core_bench.sh).
 #
