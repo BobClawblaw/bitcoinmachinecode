@@ -1235,3 +1235,38 @@ that would have hit any fresh sync of the live build.
   the old build logged 77,683 since 01:05, a few at a time in steady state. The new
   one dropped 56,243 during the boot reload of mempool.dat, when 78k transactions
   enter at once.
+
+## 2026-09-19 13:46Z — `deploy-20260919b`: ZMQ notifications no longer lost (PR #283)
+
+- **What:** `main` at `e8152f88`, full gate green (MAKE_EXIT=0).
+  Stop, wait for every old process, start. `NRestarts=0`.
+- **The first production stop under #276/#279's shutdown code.** The fold worker
+  stopped cleanly ("coinstats.dat through height 967712"). The parent saw the
+  worker still holding the lock on its way out, waited 0.1 s for its exit, and
+  only then released it.
+- **Verified live:** a real libzmq subscriber, connected through the
+  mempool.dat reload (72,366 transactions), received 74,280 `hashtx` and
+  74,280 `sequence` A events: the same set, 0 gaps, and 0 "ring overrun" lines.
+  The previous build had dropped 56,243 notifications during the same kind of
+  reload.
+- Timed to land before run 27 ended, so the restart fell on run 27's last minutes
+  and not on the Core rerun's first.
+
+## 2026-09-19 18:55Z — `deploy-20260919c`: log literal lengths (PR #287)
+
+- **What:** `main` at `3f02898a`. Its tree is identical to the gated #287 branch
+  (MAKE_EXIT=0), so it was rebuilt to stamp the commit, not re-gated.
+  Stop at 18:54:57Z, all old processes gone 1 s later, start 18:54:58Z, RPC up
+  at 18:56:32Z. `NRestarts=0`.
+- **Verified live:**
+  - `bmc_build_commit 3f02898a`, not dirty, at the tip (967,731).
+  - 5 indexes synced; 5 ZMQ topics.
+  - No FATAL and no false config warnings.
+  - Production's debug.log has 0 NUL bytes.
+- **Effect on the Core v31.1 rerun, which was running on a different NVMe:**
+  - Its blocks per minute were 443 at 18:56, against 507 to 1,465 (mean 889) in
+    the 15 minutes before. From 18:57 it was at its usual pace while
+    production's mempool reload ran (to 19:01:18).
+  - At most ~30 to 40 s of Core time, within Core's own minute-to-minute noise
+    (it did 507 at 18:34 with no restart).
+  - Recorded in docs/reports/2026-09-18-run27/README.md.
