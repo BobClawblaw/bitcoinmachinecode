@@ -7808,6 +7808,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * failure is logged -- only new subscribers would fail to connect. */
     { extern int zmqpub_start(void);
       if (zmqpub_active()) zmqpub_start(); }
+    /* ...and this process's own accepts -- nearly all of them, a
+     * mempool.dat reload included -- publish as they are staged, not a
+     * rotation later through a ring they would lap (daemon/zmq_notify.c). */
+    { extern void zmqn_set_publisher(void);
+      if (zmqpub_active()) zmqn_set_publisher(); }
     fprintf(stderr,"[dl] worker: reloading chain archive...\n");
     phase_timer_t dl_load_pt; phase_start(&dl_load_pt);
     { long ni = invset_load("invalid.dat"); if(ni) fprintf(stderr, "[chain] invalid.dat: %ld operator-invalidated block(s)\n", ni);   /* CC-10 */
@@ -9373,9 +9378,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             }
         }
         dl_new_block_choke();   /* the 3.1 choke point; shared with the parallel downloader (step 1) */
-        /* Drain transactions staged by the serve children (and by this
-         * worker's own sendrawtransaction path) and service subscriber
-         * handshakes. Both are cheap no-ops when ZMQ is unconfigured. */
+        /* Drain transactions staged by other processes (this worker's own
+         * accepts publish as they are staged -- zmqn_set_publisher above)
+         * and service subscriber handshakes. Both are cheap no-ops when ZMQ
+         * is unconfigured. */
         /* audit finding 8: subscriber servicing has its own thread now
          * (daemon/zmq_pub.c), so this loop -- whose job is block download --
          * no longer walks the subscriber list at all. Only the staged-tx

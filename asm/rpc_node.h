@@ -159,13 +159,21 @@ typedef struct {
 #define RPC_MAX_BANS           64
 
 /* ZMQ transaction notification ring (see zmq_ring at the end of the struct).
- * 16 slots looked generous -- the worker drains every rotation -- but a
- * mempool.dat reload streams hundreds of accepts per second while the worker
- * is busy doing the accepting, and production lapped a 16-slot ring by
- * thousands (2026-08-31). 64 slots is ~26MB of the MAP_SHARED block
- * (404KB payload each) and rides out the bursts; overrun past that is
- * counted and reported, which is all a lossy PUB feed owes anyone. */
-#define RPC_ZMQ_RING           64
+ * History: 16 fixed 404KB slots lapped by thousands during a mempool.dat
+ * reload (2026-08-31); 64 slots (26MB) still lapped -- 61,836 transactions
+ * lost in the four minutes of deploy-20260919a's 72,952-tx reload, and a
+ * few dozen an hour in steady state -- because the worker ACCEPTS up to
+ * 2,048 submissions per rotation (TXSUB_ROTATION_BUDGET, plus the relay
+ * and handoff paths) but drained once per rotation. Two changes
+ * (2026-09-19): the publisher's own process publishes at accept time
+ * (zmq_notify.c), so nothing it accepts waits in the ring at all; and what
+ * other processes stage lands in a byte ARENA indexed by a 65,536-entry
+ * ring, so an entry costs the transaction's size, not the largest possible
+ * one. Bound: 3.5MB index + 32MB arena of the MAP_SHARED block, touched only
+ * as it is used; a lap past either is counted, logged and published to
+ * subscribers as a per-topic sequence gap. */
+#define RPC_ZMQ_RING           65536u               /* index entries (a power of two) */
+#define RPC_ZMQ_ARENA          (32ul << 20)         /* staged raw-tx bytes */
 #define RPC_ANN_RING           1024   /* CC-1 announce ring (see ann_ring) */
 /* Coinstats fold ring (see csi_ring): a few blocks' worth of coin records --
  * a heavy block creates/spends ~10k coins, so 64k entries is 5-6 blocks of
@@ -321,31 +329,36 @@ typedef struct {
 
     /* ==== ZMQ transaction notification ring ====
      * MANY producers, ONE consumer, and that asymmetry is the whole reason
-     * this exists. Transactions are accepted into the mempool by the INBOUND
-     * SERVE CHILDREN (bitcoin_serve.asm -> tx_accept_validate), which are
-     * separate processes, while the ZMQ publisher owns a listening socket and
-     * its subscriber fds and so can live in only ONE process (the download
-     * worker). A child cannot write to the worker's sockets, so accepted
-     * transactions are staged HERE -- in the pre-fork MAP_SHARED status block
-     * every process inherits -- and the worker drains them.
+     * this exists. Transactions are accepted into the mempool in more than
+     * one process (the download worker's relay, submission and handoff
+     * paths; an inbound serve child's fallback validation), while the ZMQ
+     * publisher owns a listening socket and its subscriber fds and so can
+     * live in only ONE process (the download worker). Another process cannot
+     * write to the worker's sockets, so its accepted transactions are staged
+     * HERE -- in the pre-fork MAP_SHARED status block every process inherits
+     * -- and the worker drains them. (The worker's own accepts are staged
+     * the same way and drained on the spot: zmq_notify.c.)
      *
-     * Without this, zmqpubrawtx would carry only this node's OWN
-     * sendrawtransaction submissions and would miss every transaction
-     * arriving from the network, which is the entire point of the topic.
-     *
-     * A producer claims a slot with an atomic increment on zmq_seq, fills it,
-     * and publishes `ready` LAST behind a barrier, so the consumer never sees
-     * a half-written slot. Overrun (producers lapping the consumer) is
-     * detected by the consumer, which skips ahead and counts what it lost:
-     * dropping is correct for a PUB socket, but dropping SILENTLY is not. */
-    volatile unsigned long long zmq_seq;    /* slots claimed (producers)       */
-    volatile unsigned long long zmq_lost;   /* messages lost to overrun        */
+     * A producer claims an index entry with an atomic increment on zmq_seq
+     * and its bytes with one on zmq_bytes (the arena is a byte ring: the
+     * transaction lives at zmq_arena[off % RPC_ZMQ_ARENA], wrapping), fills
+     * both, and publishes `ready` LAST, so the consumer never sees a
+     * half-written entry. Overrun -- producers lapping the consumer, in the
+     * index or in the arena -- is detected by the consumer, which counts it
+     * and advances the hashtx/rawtx topic sequences by the loss (zmqpub_skip),
+     * so a subscriber sees the gap: dropping SILENTLY is the one thing a PUB
+     * feed must not do. */
+    volatile unsigned long long zmq_seq;    /* index entries claimed (producers) */
+    volatile unsigned long long zmq_lost;   /* transactions lost to overrun      */
+    volatile unsigned long long zmq_bytes;  /* arena bytes claimed (producers)   */
+    volatile unsigned long long zmq_pad;
     struct {
-        volatile unsigned long long ready;  /* seq+1 once filled; 0 = empty    */
-        volatile unsigned long      len;    /* raw tx length                   */
-        unsigned char               txid[32];          /* WIRE order           */
-        unsigned char               tx[RPC_ZMQ_TXMAX];
+        volatile unsigned long long ready;  /* seq+1 once filled; 0 = empty/refilling */
+        volatile unsigned long long off;    /* arena byte position (unwrapped)   */
+        volatile unsigned long      len;    /* raw tx length                     */
+        unsigned char               txid[32];          /* WIRE order             */
     } zmq_ring[RPC_ZMQ_RING];
+    unsigned char zmq_arena[RPC_ZMQ_ARENA];
 
     /* ---- peer misbehaviour scores (audit finding 7) ----------------------
      * These live HERE, in the pre-fork MAP_SHARED block, for the same reason
