@@ -56,6 +56,9 @@ and blockyard. Exceptions, noted as they happen:
 
 - 2026-09-18 ~19:15–20:10Z: a worktree agent built and gated PR #271
   (`make -j8 test` plus regtest differentials against Core v31.1).
+- 2026-09-18 ~20:58–21:11Z: the full gate on merged `main` (`make -j8 test`).
+- 2026-09-18 21:16Z: production bmc restarted onto `deploy-20260918a`. It
+  rebooted in ~7 min, reloaded a 78k-transaction mempool and rejoined the network.
 
 ## Core's timeline, recovered from its block files
 
