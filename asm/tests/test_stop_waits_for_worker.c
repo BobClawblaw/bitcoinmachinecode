@@ -37,6 +37,14 @@
  *   With the parent's wait removed (the pre-2026-09-19 _exit), 1, 2 and 3
  *   fail on every cycle.
  *
+ *   2 also failed ~1 run in 5 on the parent that DID wait, when it took "no
+ *   fd on the lock is listed" for "no process holds it": the worker, mid-exit
+ *   (PF_EXITING, address space gone, /proc/<pid>/fd unreadable), still held
+ *   the flock until its deferred final close ran, and the parent had not
+ *   reaped it. The parent now waits for a holder's exit to COMPLETE. When 2
+ *   fails, lock_holders_report() prints the worker's state at that instant
+ *   and every process with an fd on the lock.
+ *
  * SEAM NOTE. The test waitpid()s only the daemon's MAIN pid, which is its own
  * child. It never waits on the daemon's children -- that would steal the
  * statuses the daemon's own shutdown is waiting to collect.
@@ -55,6 +63,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <dirent.h>
 #include "test_tmpdir.h"
 
 #define CYCLES 4
@@ -109,6 +118,72 @@ static int worker_pid(int n){
     }
     fclose(f);
     return pid;
+}
+/* On a failed probe: name every process with an fd on the lock file (pid,
+ * ppid, state, thread count, comm, cmdline), then how long the lock stays
+ * held. A bare "not free" says nothing about who. */
+static void proc_field(int pid, const char* f, char* out, size_t cap){
+    char p[64]; snprintf(p, sizeof p, "/proc/%d/%s", pid, f);
+    int fd = open(p, O_RDONLY); ssize_t n = fd >= 0 ? read(fd, out, cap - 1) : -1;
+    if (fd >= 0) close(fd);
+    if (n <= 0){ snprintf(out, cap, "?"); return; }
+    for (ssize_t i = 0; i < n; i++) if (!out[i] || out[i] == '\n') out[i] = ' ';
+    out[n] = 0;
+}
+static int lock_free_now(void);
+static void lock_holders_report(int wpid){
+    {   /* the download worker first, while it is still whatever it was at the probe */
+        char tdp[64]; snprintf(tdp, sizeof tdp, "/proc/%d/task", wpid);
+        DIR* td = opendir(tdp);
+        if (!td) printf("  download worker %d: gone\n", wpid);
+        else {
+            struct dirent* t;
+            while ((t = readdir(td))){
+                if (t->d_name[0] < '1' || t->d_name[0] > '9') continue;
+                char tsp[64], tst[512], fdp[128]; int nfd = 0;
+                snprintf(tsp, sizeof tsp, "task/%.32s/stat", t->d_name); proc_field(wpid, tsp, tst, sizeof tst);
+                snprintf(fdp, sizeof fdp, "/proc/%d/task/%.32s/fd", wpid, t->d_name);
+                DIR* fdd = opendir(fdp); struct dirent* f;
+                if (fdd){ while ((f = readdir(fdd))) if (f->d_name[0] >= '0' && f->d_name[0] <= '9') nfd++; closedir(fdd); }
+                printf("  download worker %d task %s: %d fd(s)%s; stat %.120s\n", wpid, t->d_name, nfd, fdd ? "" : " (fd dir unreadable)", tst);
+            }
+            closedir(td);
+        }
+    }
+    struct stat ls; if (stat(g_lock, &ls) != 0){ printf("  (lock file gone)\n"); return; }
+    DIR* pd = opendir("/proc"); if (!pd) return;
+    struct dirent* e; int found = 0;
+    while ((e = readdir(pd))){
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        int pid = atoi(e->d_name);
+        char tdp[64]; snprintf(tdp, sizeof tdp, "/proc/%d/task", pid);
+        DIR* td = opendir(tdp); if (!td) continue;
+        struct dirent* t;                            /* every thread: a leader past exit_files shows no fds */
+        while ((t = readdir(td))){
+            if (t->d_name[0] < '1' || t->d_name[0] > '9') continue;
+            char fdp[384]; snprintf(fdp, sizeof fdp, "/proc/%d/task/%.32s/fd", pid, t->d_name);
+            DIR* fdd = opendir(fdp); if (!fdd) continue;
+            struct dirent* f; int hit = 0;
+            while ((f = readdir(fdd))){
+                struct stat s;
+                if (f->d_name[0] < '0' || f->d_name[0] > '9') continue;
+                if (fstatat(dirfd(fdd), f->d_name, &s, 0) == 0 && s.st_dev == ls.st_dev && s.st_ino == ls.st_ino){ hit = 1; break; }
+            }
+            closedir(fdd);
+            if (!hit) continue;
+            char st[512], cmd[512], comm[64], tst[512];
+            proc_field(pid, "stat", st, sizeof st); proc_field(pid, "cmdline", cmd, sizeof cmd); proc_field(pid, "comm", comm, sizeof comm);
+            char tsp[64]; snprintf(tsp, sizeof tsp, "task/%.32s/stat", t->d_name); proc_field(pid, tsp, tst, sizeof tst);
+            printf("  holder: pid %d tid %s comm %s\n    stat: %.200s\n    task stat: %.200s\n    cmdline: %.300s\n", pid, t->d_name, comm, st, tst, cmd);
+            found++;
+        }
+        closedir(td);
+    }
+    closedir(pd);
+    if (!found) printf("  no process shows an fd on the lock inode (%lu)\n", (unsigned long)ls.st_ino);
+    long long t0 = ms();
+    while (!lock_free_now() && ms() - t0 < 5000) usleep(1000);
+    printf("  the lock became free %lld ms after the probe%s\n", ms() - t0, lock_free_now() ? "" : " (NOT within 5 s)");
 }
 static int lock_free_now(void){
     int fd = open(g_lock, O_RDWR);
@@ -165,6 +240,7 @@ int main(void){
         }
         long long dt = ms() - t0;
         int freed = b < 0 ? lock_free_now() : -1;           /* THE assertion, at the instant of exit */
+        if (freed == 0) lock_holders_report(wpid);              /* before the relaunch opens .lock too */
         if (b < 0) b = spawn(daemon, n + 1);                /* ...and the relaunch at that instant */
         snprintf(l, sizeof l, "main pid exited 0 on SIGTERM (%lld ms, 1000 of them with the worker stopped)", dt);
         ck(l, w == a && WIFEXITED(st) && WEXITSTATUS(st) == 0);
