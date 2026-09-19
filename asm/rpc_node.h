@@ -467,6 +467,17 @@ typedef struct {
      * cannot fill it. Measured on run 22 from OUTSIDE the process because the
      * node did not report it: 11-20% per worker while the log said 8/8 active. */
     volatile int              dl_pool_idle_pct;
+    /* 2026-09-19: every WIRE byte the downloader's sockets carried -- the
+     * header phase, the probes' handshakes, each helper's version/getdata/
+     * pong and every block -- counted as Core counts them (full message,
+     * 24-byte header included) by the p2p_write/p2p_read hooks in whichever
+     * process moved them (daemon/main.c dl_wire_note). Cumulative for the
+     * node's life, never reset: dl_bytes_total above is one dl_catchup
+     * call's rchar and restarts with each call. getnettotals adds these to
+     * the relay legs' TCP_INFO figures. Appended: every offset above is
+     * unchanged. */
+    volatile long long        dl_wire_sent;
+    volatile long long        dl_wire_recv;
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 

@@ -353,9 +353,18 @@ int main(void){
        * pinned the divergence -- it now pins its absence. */
       ck("getpeerinfo carries no additive bmc_ key", d && rj_obj_get(d, "bmc_download_worker") == NULL); }
     rj_free(r);
+    /* 2026-09-19: the download's totals are the WIRE counters its p2p hooks
+     * keep (dl_wire_sent / dl_wire_recv), both directions. This used to feed
+     * totalbytesrecv from dl_bytes_total -- one dl_catchup call's process
+     * rchar, restarting with each call -- and totalbytessent from nothing:
+     * run 27 requested ~73 GB of blocks and reported ~0 sent. */
+    st.dl_wire_recv = 50000000000LL; st.dl_wire_sent = 7000000LL;
     r = NULL; rc = rpc_node_dispatch("getnettotals", NULL, &r, &ec, &em);
     { rj_val* tr = r ? rj_obj_get(r, "totalbytesrecv") : NULL;
-      ck("getnettotals counts the download's bytes (50 GB + the legs)", rc == 1 && tr && strtoll(tr->str, NULL, 10) >= 50000000000LL); }
+      rj_val* ts = r ? rj_obj_get(r, "totalbytessent") : NULL;
+      ck("getnettotals counts the download's received bytes (50 GB + the legs)", rc == 1 && tr && strtoll(tr->str, NULL, 10) >= 50000000000LL);
+      ck("getnettotals counts the download's SENT bytes (7 MB + the legs)", rc == 1 && ts && strtoll(ts->str, NULL, 10) >= 7000000LL);
+      ck("...and not dl_bytes_total on top (one call's rchar, not wire bytes)", rc == 1 && tr && strtoll(tr->str, NULL, 10) < 100000000000LL); }
     /* 2026-09-10: bmcgetdownloadinfo -- the window state getpeerinfo cannot
      * carry. Core has no counterpart, so nothing here mirrors a Core shape. */
     st.dl_active = 1; st.dl_workers = 8; st.dl_pool = 120; st.dl_banned = 10; st.dl_free_peers = 37;
@@ -387,7 +396,7 @@ int main(void){
          rc == 1 && a && a->typ == RJ_BOOL && a->str && a->str[0] == '0' && bt); }
     rj_free(r);
 
-    st.n_dlpeers = 0; st.dl_bytes_total = 0;
+    st.n_dlpeers = 0; st.dl_bytes_total = 0; st.dl_wire_recv = 0; st.dl_wire_sent = 0;
     r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em);
     ck("with the download over, getpeerinfo is back to the 2 legs", rc == 1 && r && r->nitems == 2);
     { rj_val* p0 = (r && r->nitems) ? r->items[0] : 0;

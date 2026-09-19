@@ -2822,6 +2822,29 @@ static void on_tsp_run(long to, void* ctx){ (void)ctx; tsp_runs_advanced(to); ir
  * point below runs in every phase (it is where the filter index, the txid
  * tail and the address journal are fed), so the tick belongs there, with the
  * heartbeat calling the same function once the node is at the tip. */
+/* Configure the trailing builders from the keys: the builders live beside
+ * this executable (bmc_build_tx_index, bmc_build_txospender_index,
+ * bmc_build_addr_hist, and bmc_merge_index_runs to merge their runs). */
+static void dl_index_trail_configure(const char* dir){
+    char exe[512]; ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n > 0){ exe[n] = 0; char* sl = strrchr(exe, '/'); if (sl) *sl = 0; }
+    char bb[600], mm[600];
+    snprintf(mm, sizeof mm, "%s/bmc_merge_index_runs", n > 0 ? exe : ".");
+    /* 2026-09-16: the address history builds itself DURING the sync as runs
+     * (build_addr_hist's run mode reads blocks + undo), like the txid index;
+     * the post-IBD repair supervisor is gone */
+    snprintf(bb, sizeof bb, "%s/bmc_build_addr_hist", n > 0 ? exe : ".");
+    it_configure(&g_it_ah, "addr_hist", bb, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.addrindex);
+    /* runs of indexrunblocks heights, kept 144 below the applied height (the
+     * undo window: a reorg deeper than that is already the node's general
+     * limit), merged at 6 runs */
+    snprintf(bb, sizeof bb, "%s/bmc_build_tx_index", n > 0 ? exe : ".");
+    it_configure(&g_it_txi, "txindex", bb, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.txindex);
+    snprintf(bb, sizeof bb, "%s/bmc_build_txospender_index", n > 0 ? exe : ".");
+    it_configure(&g_it_tsp, "txospender", bb, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.txospenderindex);
+    irs_init(&g_rs_txi, "txindex", "BMCTXIDX", 20, 16);
+    irs_init(&g_rs_tsp, "txospender", "BMCTXOSP", 28, 24);
+}
 static void dl_index_trail_tick(long applied){
     static long long last;
     long long now = (long long)time(NULL);
@@ -4629,8 +4652,10 @@ static int peer_slot_of_fd(int fd){
  * node without a rate limit still has to answer that. The pacing half stays
  * conditional on ul_gate_configure having been given a rate. Counted WITH
  * the 24-byte header, as Core counts them. */
+static int dl_wire_note(int fd, int recv, const char* cmd, unsigned cmdlen, unsigned plen);
 static void p2p_upload_pace(int fd, unsigned plen, const char* cmd, unsigned cmdlen){
     ul_gate_account((long)plen);
+    if (dl_wire_note(fd, 0, cmd, cmdlen, plen)) return;   /* the downloader's own sockets (2026-09-19) */
     if (g_node_status){
         int s = peer_slot_of_fd(fd);
         if (s >= 0) g_node_status->peers[s].sent_per_msg[rpc_msg_index(cmd, cmdlen)] += (long long)plen + 24;
@@ -5192,7 +5217,80 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
                   * the pipe is active and idle at the same time. */
                  long long wait_ms, wall_ms;
                  char addrlocal[72];       /* 2026-09-18, for getpeerinfo: our address as this peer saw it */
+                 /* 2026-09-19, for getpeerinfo bytessent/bytesrecv and their
+                  * per-message maps: the WIRE bytes of the connection this
+                  * worker holds now, written by the worker's own p2p hooks
+                  * (dl_wire_note) and copied out by the parent every pass. The
+                  * published bytes_sent was a hard-coded 0, and bytes_peer is
+                  * the process's rchar, which also counts its file reads. */
+                 long long wire_sent, wire_recv;
+                 long long sent_pm[RPC_MSG_N], recv_pm[RPC_MSG_N];
                } dlc_stat_t;
+/* ---- the downloader's wire accounting (2026-09-19) ------------------------
+ * getnettotals.totalbytessent and every download worker's getpeerinfo
+ * bytessent were 0 for the whole of an IBD: the relay legs are counted from
+ * TCP_INFO in the process that holds them, and nothing counted the sockets
+ * the downloader opens -- the header phase, the helpers' getdata for every
+ * block. Run 27 pulled ~73 GB and reported ~0 sent.
+ *
+ * Counted where the bytes cross: p2p_write's hook (the upload pacer's) and
+ * p2p_read's (installed for the downloader's scope), both in every process
+ * the download runs in. Core's accounting: each message counts its full wire
+ * size, the 24-byte header included, into the peer's total and its
+ * per-message map (net.cpp AccountForSentBytes / mapRecvBytesPerMsgType).
+ * The downloader dials v1 only (node_handshake), so plen + 24 IS the wire.
+ *
+ * Totals go to node_status_t.dl_wire_sent / dl_wire_recv, atomically --
+ * several helpers add at once -- and never reset, as Core's never do. The
+ * per-connection figures go to the worker's own stats slot. A connection
+ * still handshaking counts into a private pending set first: the parent
+ * keeps publishing the previous peer until the handshake succeeds, and those
+ * bytes are the NEW peer's. */
+static int g_dl_wire_scope = 0;                    /* 1 inside dl_catchup; forked helpers inherit it */
+static volatile dlc_stat_t* g_dlc_me = NULL;       /* a helper's own stats slot; NULL in the parent */
+static int g_dlc_conn_fd = -1;                     /* the connection g_dlc_me publishes */
+static long long g_dlc_pend_sent, g_dlc_pend_recv, g_dlc_pend_spm[RPC_MSG_N], g_dlc_pend_rpm[RPC_MSG_N];
+/* The BOOT catch-up (bmc.bootcatchup=1, the default) runs before main()
+ * creates the shared status table, so its bytes go to this pair instead --
+ * MAP_SHARED, for the helpers it forks -- and main() folds them into the
+ * table when it creates it. [0] sent, [1] received. */
+static volatile long long* g_dl_wire_boot = NULL;
+static int peer_slot_of_fd(int fd);
+static int dl_wire_note(int fd, int recv, const char* cmd, unsigned cmdlen, unsigned plen){
+    if(!g_dl_wire_scope) return 0;
+    volatile long long* tot = g_node_status ? (recv ? &g_node_status->dl_wire_recv : &g_node_status->dl_wire_sent)
+                            : g_dl_wire_boot ? &g_dl_wire_boot[recv ? 1 : 0] : NULL;
+    if(!tot) return 0;
+    if(!g_dlc_me && peer_slot_of_fd(fd) >= 0) return 0;     /* a relay leg in the parent: TCP_INFO counts those */
+    long long n = (long long)plen + 24;
+    int mi = rpc_msg_index(cmd, cmdlen);
+    __sync_fetch_and_add((long long*)tot, n);
+    if(g_dlc_me){
+        if(fd == g_dlc_conn_fd){
+            if(recv){ g_dlc_me->wire_recv += n; g_dlc_me->recv_pm[mi] += n; }
+            else    { g_dlc_me->wire_sent += n; g_dlc_me->sent_pm[mi] += n; }
+        } else {
+            if(recv){ g_dlc_pend_recv += n; g_dlc_pend_rpm[mi] += n; }
+            else    { g_dlc_pend_sent += n; g_dlc_pend_spm[mi] += n; }
+        }
+    }
+    return 1;
+}
+/* p2p_read's hook for the download's scope (installed by dl_catchup) */
+static void dl_read_note(int fd, const char* cmd, unsigned plen){ (void)dl_wire_note(fd, 1, cmd, 12, plen); }
+/* a helper dialled a new peer: nothing is published for it until it hands */
+static void dlc_wire_dial(void){
+    g_dlc_conn_fd = -1;
+    g_dlc_pend_sent = g_dlc_pend_recv = 0;
+    memset(g_dlc_pend_spm, 0, sizeof g_dlc_pend_spm); memset(g_dlc_pend_rpm, 0, sizeof g_dlc_pend_rpm);
+}
+/* ...and the handshake succeeded: the slot now describes THIS connection */
+static void dlc_wire_adopt(int fd){
+    if(!g_dlc_me) return;
+    g_dlc_me->wire_sent = g_dlc_pend_sent; g_dlc_me->wire_recv = g_dlc_pend_recv;
+    for(int i = 0; i < RPC_MSG_N; i++){ g_dlc_me->sent_pm[i] = g_dlc_pend_spm[i]; g_dlc_me->recv_pm[i] = g_dlc_pend_rpm[i]; }
+    g_dlc_conn_fd = fd;
+}
 static long long dlc_now_ms(void); static long dlc_proc_rchar(pid_t pid);   /* fwd decls: the worker judges its own chunk before these are defined */
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
 static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
@@ -5211,6 +5309,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
      * flag either way, so an early/idle delivery is harmless -- the next
      * guarded call resets the flag before it matters. */
     { struct sigaction sa0; memset(&sa0,0,sizeof sa0); sa0.sa_handler=mux_budget_alarm; sigemptyset(&sa0.sa_mask); sigaction(SIGUSR1,&sa0,NULL); }
+    g_dlc_me = mystat; dlc_wire_dial();   /* this process's p2p bytes are its peer's (dl_wire_note) */
     int lfd=open("append.lock", O_RDWR|O_CREAT, 0644);
     if(lfd<0){ fprintf(stderr,"[dlc w%d] no lock\n",w); return 1; }
     static unsigned char st[4096]; store_init(st);
@@ -5337,6 +5436,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                     dial_gate_wait();
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)cp2));
                     if(fdc<0){ if(ema[idx]<=0.0) ema[idx]=1.0; claimed[idx]=0; continue; }   /* tried, unreachable: the picker must not offer it as untried again */
+                    dlc_wire_dial();                  /* the handshake's bytes belong to this connection, published once it succeeds */
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
                     /* 2026-09-06: a getdata is small and is the ONLY thing
                      * standing between this worker and the peer's reply, so
@@ -5348,6 +5448,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                     { int one=1; setsockopt(fdc,IPPROTO_TCP,TCP_NODELAY,&one,sizeof one); }
                     if(node_handshake(fdc)==1 && peer_has_witness(cand)){
                         fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
+                        dlc_wire_adopt(fdc);    /* getpeerinfo's bytes are this connection's, handshake included */
                         mystat->held_idx=idx;   /* so the parent can ban THIS peer on early-kill */
                         strncpy((char*)mystat->peer,cand,63);
                         { rpc_peer_t v; memset(&v,0,sizeof v); rpc_peer_from_version(&v, g_peer_version_payload, g_peer_version_len);   /* for getpeerinfo */
@@ -6022,7 +6123,13 @@ static void dl_publish_peer_table(void* store_buf, int with_tip){
                     /* byte fields only if the kernel returned a struct large
                      * enough to include them */
                     if(tl >= (socklen_t)((char*)(&ti.bytes_received + 1) - (char*)&ti)){
-                        pr->bytes_sent = (long long)ti.bytes_acked;
+                        /* bytes_acked advances with snd_una, and the peer's
+                         * ACK of our SYN moves it by one sequence number that
+                         * carried no data: measured against Core on regtest
+                         * (2026-09-19) a leg read 679 where Core had received
+                         * 678. bytes_received has no such step (the peer's
+                         * SYN sets rcv_nxt directly) and matched exactly. */
+                        pr->bytes_sent = ti.bytes_acked > 0 ? (long long)ti.bytes_acked - 1 : 0;
                         pr->bytes_recv = (long long)ti.bytes_received;
                     }
                     if(tl >= (socklen_t)((char*)(&ti.last_data_recv + 1) - (char*)&ti)){
@@ -6135,7 +6242,56 @@ static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t
 static void dlc_publish_applied(volatile long* ctl){
     ctl[DLC_CTL_APPLIED] = g_utxo_live_on ? utxo_live_applied_height() + 1 : -1;
 }
+/* publish the workers' peers for getpeerinfo (2026-09-08). Every PASS of the
+ * parent's loop since 2026-09-19, not only the 10 s status tick: the byte
+ * counters move continuously, and a download shorter than one tick (a
+ * handoff, a regtest sync) never appeared at all. */
+static void dlc_publish_dlpeers(volatile dlc_stat_t* stats, const pid_t* kids, int nw){
+    if(!g_node_status) return;
+    int nd = nw > 64 ? 64 : nw;
+    for(int w=0; w<nd; w++){
+        rpc_peer_t* d = &g_node_status->dlpeers[w];
+        if(kids[w]==0 || !stats[w].peer[0]){ d->used = 0; continue; }
+        strncpy(d->addr, (const char*)stats[w].peer, sizeof d->addr - 1); d->addr[sizeof d->addr - 1] = 0;
+        d->proto = stats[w].proto; d->services = stats[w].services; d->start_height = stats[w].start_height;
+        memcpy(d->subver, (const char*)stats[w].subver, sizeof d->subver); d->subver[sizeof d->subver - 1] = 0;
+        memcpy((char*)d->addrlocal, (const char*)stats[w].addrlocal, sizeof d->addrlocal); d->addrlocal[sizeof d->addrlocal - 1] = 0;
+        /* the connection's wire bytes, counted by the worker's own p2p hooks
+         * (dl_wire_note); bytes_sent was a hard-coded 0 until 2026-09-19 */
+        d->conn_time = stats[w].conn_time; d->bytes_recv = stats[w].wire_recv; d->bytes_sent = stats[w].wire_sent;
+        for(int i = 0; i < RPC_MSG_N; i++){ d->sent_per_msg[i] = stats[w].sent_pm[i]; d->recv_per_msg[i] = stats[w].recv_pm[i]; }
+        d->last_recv = d->last_send = (long long)time(NULL);
+        d->inflight_lo = stats[w].cur_lo; d->inflight_hi = stats[w].cur_hi; d->dl_worker = w; d->inbound = 0;
+        d->idle_pct = stats[w].wall_ms > 0
+            ? (int)((stats[w].wait_ms * 100) / stats[w].wall_ms) : -1;
+        d->bps_recv = (long long)stats[w].last_bw_bps;   /* 2026-09-10: for bmcgetdownloadinfo */
+        d->used = 1;
+    }
+    g_node_status->n_dlpeers = nd;
+}
+static long dl_catchup_run(const char* dir, int min_workers);
+/* The download's scope for the wire accounting: the receive hook is this
+ * scope's alone (a relay leg's receive side is counted where its command is
+ * parsed), and the send hook is the node-wide one main() installs -- put in
+ * place here too when nothing has, as in a test driving this directly. */
 static long dl_catchup(const char* dir, int min_workers){
+    extern void (*g_p2p_write_hook)(int fd, unsigned plen, const char* cmd, unsigned cmdlen);
+    extern void (*g_p2p_read_hook)(int fd, const char* cmd, unsigned plen);
+    void (*prev_w)(int, unsigned, const char*, unsigned) = g_p2p_write_hook;
+    void (*prev_r)(int, const char*, unsigned) = g_p2p_read_hook;
+    if(!g_p2p_write_hook) g_p2p_write_hook = p2p_upload_pace;
+    g_p2p_read_hook = dl_read_note;
+    if(!g_node_status && !g_dl_wire_boot){           /* the boot catch-up: no status table yet */
+        void* m = mmap(NULL, 2 * sizeof(long long), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+        if(m != MAP_FAILED) g_dl_wire_boot = (volatile long long*)m;
+    }
+    g_dl_wire_scope = 1;
+    long r = dl_catchup_run(dir, min_workers);
+    g_dl_wire_scope = 0;
+    g_p2p_read_hook = prev_r; g_p2p_write_hook = prev_w;
+    return r;
+}
+static long dl_catchup_run(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
     ab2_t* ab = addr_book();
     if(!ab){ fprintf(stderr,"[dlc] address book unavailable\n"); return 0; }
@@ -6405,6 +6561,7 @@ static long dl_catchup(const char* dir, int min_workers){
         dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms(), live, nlive, banned);   /* Core's rule, every pass (2026-09-10) */
         legs_sweep_except(-1);                                                            /* row 3: the legs stay served through a handoff */
         dl_publish_peer_table(store_buf, 0);   /* legs only: the tip is this loop's own business */
+        dlc_publish_dlpeers(stats, kids, nw);  /* the helpers' peers and their bytes, every pass (2026-09-19) */
         if(interleave && dlc_now_ms() >= connect_retry_ms){
             /* (store_reload is the bounded call's first act, so it sees the
              * helpers' appends; a second one here would be redundant.) */
@@ -6542,23 +6699,7 @@ static long dl_catchup(const char* dir, int min_workers){
         next_claim[DLC_CTL_FREE_PEERS] = free_peers;
         /* publish the workers' peers for getpeerinfo / getnettotals (2026-09-08) */
         if(g_node_status){
-            int nd = nw > 64 ? 64 : nw;
-            for(int w=0; w<nd; w++){
-                rpc_peer_t* d = &g_node_status->dlpeers[w];
-                if(kids[w]==0 || !stats[w].peer[0]){ d->used = 0; continue; }
-                strncpy(d->addr, (const char*)stats[w].peer, sizeof d->addr - 1); d->addr[sizeof d->addr - 1] = 0;
-                d->proto = stats[w].proto; d->services = stats[w].services; d->start_height = stats[w].start_height;
-                memcpy(d->subver, (const char*)stats[w].subver, sizeof d->subver); d->subver[sizeof d->subver - 1] = 0;
-                memcpy((char*)d->addrlocal, (const char*)stats[w].addrlocal, sizeof d->addrlocal); d->addrlocal[sizeof d->addrlocal - 1] = 0;
-                d->conn_time = stats[w].conn_time; d->bytes_recv = stats[w].bytes_peer; d->bytes_sent = 0;
-                d->last_recv = d->last_send = (long long)time(NULL);
-                d->inflight_lo = stats[w].cur_lo; d->inflight_hi = stats[w].cur_hi; d->dl_worker = w; d->inbound = 0;
-                d->idle_pct = stats[w].wall_ms > 0
-                    ? (int)((stats[w].wait_ms * 100) / stats[w].wall_ms) : -1;
-                d->bps_recv = (long long)stats[w].last_bw_bps;   /* 2026-09-10: for bmcgetdownloadinfo */
-                d->used = 1;
-            }
-            g_node_status->n_dlpeers = nd;
+            dlc_publish_dlpeers(stats, kids, nw);
             g_node_status->dl_bytes_total = (long long)cumulative_bytes;
             /* the aggregate state bmcgetdownloadinfo serves (2026-09-10) */
             g_node_status->dl_active          = 1;
@@ -7478,9 +7619,19 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * offline base build (or the previous run's tail) and the current tip.
      * After the archive verify -- a repair may have truncated heights the
      * tail would otherwise trust. No base index => logs once and disables. */
-    if(archive_ok) txit_boot(store_buf);
+    /* 2026-09-19: each ONLY when its key asks for it, as Core builds an index
+     * only under its option. Both used to boot on every node: run 27, with
+     * txindex/coinstatsindex/blockfilterindex set and txospenderindex
+     * absent (default 0), kept a txo-spender tail to ~600k and getindexinfo
+     * listed it. A tail that is never booted appends nothing (its fd stays
+     * -1: txit_on_block/tsp_on_block, the truncate and run-advance hooks all
+     * return at once), creates no file, and the trailing builder is
+     * configured disabled below. */
+    if(archive_ok && g_cfg.txindex) txit_boot(store_buf);
+    else if(archive_ok) fprintf(stderr, "[txindex] txindex=0 -- not maintaining the txid index\n");
     /* txo-spender index tail (Core -txospenderindex): same shape, same rules */
-    if(archive_ok) tsp_boot(store_buf);
+    if(archive_ok && g_cfg.txospenderindex) tsp_boot(store_buf);
+    else if(archive_ok) fprintf(stderr, "[txospender] txospenderindex=0 -- not maintaining the txo-spender index\n");
     /* the live address index (EXTENSION) boots AFTER the UTXO engine below:
      * its backfill replays undo, which exists only for applied blocks */
 
@@ -7549,6 +7700,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * operator who does not want the write amplification had no way to
          * say so; now they do, and getindexinfo stops advertising an index
          * that is deliberately off. */
+        /* the trailing index builders (2026-09-16), each enabled by its own
+         * key. They were configured INSIDE the coinstatsindex branch below,
+         * so coinstatsindex=0 silently left txindex, txospenderindex and the
+         * address history with no builder at all (2026-09-19). */
+        dl_index_trail_configure(dir);
         if (!g_cfg.coinstatsindex)
             fprintf(stderr,"[dl] coinstatsindex=0 -- not maintaining the coin statistics index\n");
         else {
@@ -7579,25 +7735,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               char exe[512], builder[600]; ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
               if (n > 0){ exe[n] = 0; char* sl = strrchr(exe, '/'); if (sl) *sl = 0; snprintf(builder, sizeof builder, "%s/bmc_build_coinstats_hist", exe); }
               else snprintf(builder, sizeof builder, "bmc_build_coinstats_hist");
-              csi_hist_repair_configure(builder, dir, g_chainp->name, g_cfg.coinstatshist_workers, g_cfg.coinstatshist_repair);
-              /* 2026-09-16: the address history builds itself DURING the sync
-               * as runs (build_addr_hist's run mode reads blocks + undo), like
-               * the txid index below; the post-IBD repair supervisor is gone */
-              { char b2[600], mm[600];
-                snprintf(mm, sizeof mm, "%s/bmc_merge_index_runs", n > 0 ? exe : ".");
-                snprintf(b2, sizeof b2, "%s/bmc_build_addr_hist", n > 0 ? exe : ".");
-                it_configure(&g_it_ah, "addr_hist", b2, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.addrindex); }
-              /* the trailing builders: runs of indexrunblocks heights, kept 144
-               * below the applied height (the undo window: a reorg deeper than
-               * that is already the node's general limit), merged at 6 runs */
-              { char bb[600], mm[600];
-                snprintf(mm, sizeof mm, "%s/bmc_merge_index_runs", n > 0 ? exe : ".");
-                snprintf(bb, sizeof bb, "%s/bmc_build_tx_index", n > 0 ? exe : ".");
-                it_configure(&g_it_txi, "txindex", bb, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.txindex);
-                snprintf(bb, sizeof bb, "%s/bmc_build_txospender_index", n > 0 ? exe : ".");
-                it_configure(&g_it_tsp, "txospender", bb, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.txospenderindex);
-                irs_init(&g_rs_txi, "txindex", "BMCTXIDX", 20, 16);
-                irs_init(&g_rs_tsp, "txospender", "BMCTXOSP", 28, 24); } }
+              csi_hist_repair_configure(builder, dir, g_chainp->name, g_cfg.coinstatshist_workers, g_cfg.coinstatshist_repair); }
             utxo_live_set_coinstats(csi_on_add, csi_on_remove, csi_invalidate, csi_commit);
             { extern void csi_on_block(long); extern void utxo_live_set_coinstats_block(void (*)(long)); utxo_live_set_coinstats_block(csi_on_block); }
             undo_set_coin_observer(csi_on_remove);
@@ -9242,6 +9380,10 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       rpc_chain_set_proposal(rpc_node_submit_proposal); }
     rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
     rpc_chain_set_public_tip_fn(rpc_public_tip);   /* 3.1: every chain RPC's tip is the CONNECTED tip */
+    /* 2026-09-19: an index is consulted and listed only when its key is on */
+    { extern void rpc_chain_set_index_config(int, int, int, int, int) __attribute__((weak));   /* rules that build this file without rpc_chain.o */
+      if (rpc_chain_set_index_config)
+          rpc_chain_set_index_config(g_cfg.txindex, g_cfg.txospenderindex, g_cfg.blockfilterindex, g_cfg.coinstatsindex, g_cfg.addrindex); }
     /* getnetworkinfo tells the truth about the transports: reachability from
      * the dialer, our i2p destination, and (once the tor listener is up,
      * below in tor_onion_listener) the onion hostname. */
@@ -11209,6 +11351,9 @@ int main(int argc, char** argv){
                              MAP_SHARED|MAP_ANONYMOUS, -1, 0);
         if (g_node_status == MAP_FAILED){ g_node_status = NULL; }
         else { g_node_status->n_out = 0; g_node_status->n_inbound = 0;
+               /* the boot catch-up's wire bytes, counted before this table
+                * existed (dl_wire_note): getnettotals covers them too */
+               if (g_dl_wire_boot){ g_node_status->dl_wire_sent = g_dl_wire_boot[0]; g_node_status->dl_wire_recv = g_dl_wire_boot[1]; }
                /* 3.1: seed the connected tip from the persisted applied height
                 * so the RPCs and the serve children cap by it from the first
                 * request, before the worker has loaded the set and started

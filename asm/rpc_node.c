@@ -620,7 +620,13 @@ static int cmd_getnettotals(rj_val** res){
             if (!p->used) continue;
             sent += p->bytes_sent; recv += p->bytes_recv;
         }
-    if (g_status) recv += g_status->dl_bytes_total;   /* the parallel download's bytes (2026-09-08): this read 3 KB against a 50 GB archive */
+    /* the parallel download's bytes, both directions. Its receive side was
+     * dl_bytes_total (2026-09-08: this read 3 KB against a 50 GB archive),
+     * which is one dl_catchup call's process rchar -- file reads included,
+     * restarting at every call -- and its SEND side was not counted at all
+     * (run 27: ~73 GB of blocks requested, ~0 bytes sent). Both are now the
+     * wire bytes the downloader's own p2p hooks counted (2026-09-19). */
+    if (g_status){ sent += g_status->dl_wire_sent; recv += g_status->dl_wire_recv; }
     rj_val* o = rj_obj();
     /* Core counts bytes for the process lifetime including closed peers; we
      * sum the LIVE peer table plus everything the download received this
@@ -1452,8 +1458,20 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
     }
     if (g_mph.mp) mpu();
     if (npending){
-        /* Core: "Mempool lacks a relevant spend, and txospenderindex is unavailable." */
-        if (!index_ok || !rpc_chain_txospender_lookup){ rj_free(arr); free(pending); *ec = -1; *em = "Mempool lacks a relevant spend, and txospenderindex is unavailable."; return 0; }
+        /* Core v31.1 (rpc/mempool.cpp): the FIRST outpoint, in request
+         * order, that the mempool does not spend names itself:
+         * "No spending tx for the outpoint <txid>:<n> in mempool, and
+         * txospenderindex is unavailable." -- RPC_MISC_ERROR. The text
+         * here was an older wording. */
+        if (!index_ok || !rpc_chain_txospender_lookup){
+            static char nomsg[200];
+            const rj_val* e0 = list->items[pending[0]];
+            char lx[65]; const char* tx0 = rj_obj_get((rj_val*)e0, "txid")->str;   /* validated: 64 hex digits */
+            for (int b = 0; b < 64; b++) lx[b] = (char)((tx0[b] >= 'A' && tx0[b] <= 'F') ? tx0[b] - 'A' + 'a' : tx0[b]);
+            lx[64] = 0;                                   /* Core prints uint256::GetHex, lower case */
+            snprintf(nomsg, sizeof nomsg, "No spending tx for the outpoint %s:%lu in mempool, and txospenderindex is unavailable.",
+                     lx, (unsigned long)atol(rj_obj_get((rj_val*)e0, "vout")->str));
+            rj_free(arr); free(pending); *ec = -1; *em = nomsg; return 0; }
         static unsigned char txbuf[4u << 20];
         for (int q = 0; q < npending; q++){
             int i = pending[q]; rj_val* o = arr->items[i]; const rj_val* e = list->items[i];

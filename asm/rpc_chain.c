@@ -1888,6 +1888,25 @@ static int cmd_getblockchaininfo(rj_val** res, long* ec, const char** em){
  * directory scan per second), so a run committed by the trailing builder is
  * picked up without a restart -- the property the old "latch on success"
  * open had for the single base. */
+/* ---- which optional indexes the node is CONFIGURED to keep (2026-09-19) --
+ * Core builds and consults an index only when its option is set: without
+ * -txindex, getrawtransaction answers from the mempool (or a given block) and
+ * says "Use -txindex"; without -txospenderindex, gettxspendingprevout is
+ * mempool-only; without -blockfilterindex, getblockfilter refuses; and
+ * getindexinfo lists only the indexes that are enabled. This reader used to
+ * decide from the FILES alone, so a node whose operator never asked for an
+ * index still served -- and advertised -- whatever an earlier configuration
+ * (or an unconditional tail, run 27's txospender) had left in the datadir.
+ *
+ * The daemon passes its configuration here at start-up. -1 = never told: a
+ * standalone reader (bmc_rpcd) and the unit tests, where the files decide as
+ * before. */
+static int g_ix_txindex = -1, g_ix_txospender = -1, g_ix_bfilter = -1, g_ix_coinstats = -1, g_ix_addrindex = -1;
+void rpc_chain_set_index_config(int txindex, int txospenderindex, int blockfilterindex, int coinstatsindex, int addrindex){
+    g_ix_txindex = txindex ? 1 : 0; g_ix_txospender = txospenderindex ? 1 : 0; g_ix_bfilter = blockfilterindex ? 1 : 0;
+    g_ix_coinstats = coinstatsindex ? 1 : 0; g_ix_addrindex = addrindex ? 1 : 0;
+}
+static int ix_on(int v){ return v != 0; }        /* configured on, or not told */
 static irunset_t g_txi_runs;
 static int g_txi_runs_init;
 static void txi_open(void){
@@ -1896,7 +1915,7 @@ static void txi_open(void){
 }
 static void txi_tail_refresh(void);
 static const u8* g_txi_tail;
-static int  txi_have(void){ txi_open(); if (g_txi_runs.n > 0) return 1; txi_tail_refresh(); return g_txi_tail != NULL; }
+static int  txi_have(void){ if (!ix_on(g_ix_txindex)) return 0; txi_open(); if (g_txi_runs.n > 0) return 1; txi_tail_refresh(); return g_txi_tail != NULL; }
 static long txi_runs_to(void){ txi_open(); long t = -1; for (int i = 0; i < g_txi_runs.n; i++) if (g_txi_runs.r[i].to > t) t = g_txi_runs.r[i].to; return t; }
 static long txi_runs_from(void){ txi_open(); long f = -1; for (int i = 0; i < g_txi_runs.n; i++) if (f < 0 || g_txi_runs.r[i].from < f) f = g_txi_runs.r[i].from; return f; }
 
@@ -1972,6 +1991,7 @@ static int txi_verify_rec(const u8* r, const u8 txid_wire[32],
 
 /* Look a WIRE-order txid up. Returns 1 and fills height/offset/len, or 0. */
 static int txi_lookup(const u8 txid_wire[32], long* h_out, u32* off_out, u32* len_out){
+    if (!ix_on(g_ix_txindex)) return 0;          /* txindex=0: no index, whatever the datadir holds */
     txi_open();
     for (int ri = 0; ri < g_txi_runs.n; ri++){
         const irun_t* run = &g_txi_runs.r[ri];
@@ -2025,7 +2045,7 @@ static void tsp_open(void){
 }
 static void tsp_tail_refresh(void);
 static const u8* g_tsp_tail;
-static int  tsp_have(void){ tsp_open(); if (g_tsp_runs.n > 0) return 1; tsp_tail_refresh(); return g_tsp_tail != NULL; }
+static int  tsp_have(void){ if (!ix_on(g_ix_txospender)) return 0; tsp_open(); if (g_tsp_runs.n > 0) return 1; tsp_tail_refresh(); return g_tsp_tail != NULL; }
 static long tsp_runs_to(void){ tsp_open(); long t = -1; for (int i = 0; i < g_tsp_runs.n; i++) if (g_tsp_runs.r[i].to > t) t = g_tsp_runs.r[i].to; return t; }
 static u64 g_tsp_tail_sz; static long g_tsp_tail_maxh = -1;
 static void tsp_tail_refresh(void){
@@ -2068,6 +2088,7 @@ int rpc_chain_txospender_available(void){ return tsp_have(); }
  * 0 = no confirmed spend known (unspent, or beyond the index's coverage). */
 int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsigned vout, unsigned char spender_wire[32],
                                 long* height_out, unsigned char blockhash_wire[32], unsigned char* txout, long txcap, long* txlen_out){
+    if (!ix_on(g_ix_txospender)) return 0;             /* txospenderindex=0 */
     (void)refresh();                                   /* the tail may name blocks newer than our cached tip */
     tsp_open();
     for (int ri = 0; ri < g_tsp_runs.n; ri++){
@@ -2656,6 +2677,9 @@ static int cmd_gettxoutproof(const rj_val* params, rj_val** res, long* ec, const
                          "or pass the block hash.", txi_runs_from(), cov_to);
                 *ec = -5; *em = nomsg; return 0;
             }
+            /* txindex=0 is Core without -txindex: after its UTXO lookup
+             * misses, Core's words are "Transaction not yet in block" */
+            if (!ix_on(g_ix_txindex)){ *ec = -5; *em = "Transaction not yet in block"; return 0; }
             *ec = -5; *em = "No txid index built (daemon/bmc_build_tx_index) and no block hash given -- "
                             "pass the block hash, or build the index to locate a confirmed "
                             "transaction by txid alone."; return 0;
@@ -4070,6 +4094,15 @@ static long gbf_count_spends(const u8* blk, unsigned long blen){
 
 static int cmd_getblockfilter(const rj_val* params, rj_val** res, long* ec, const char** em){
     long h;
+    if (!ix_on(g_ix_bfilter)){
+        /* blockfilterindex=0: Core's order -- the hash's format, the
+         * filter type, then "Index is not enabled", before any lookup */
+        const char* bs = rpc_param_str(params, 0, ec, em); if (!bs) return 0;
+        u8 bd[32]; if (!parse_hash_param(bs, 1, bd, ec, em)) return 0;
+        const char* ft = (params->nitems >= 2 && params->items[1]->typ == RJ_STR) ? params->items[1]->str : "basic";
+        if (strcmp(ft, "basic")){ *ec = -5; *em = "Unknown filtertype"; return 0; }
+        *ec = -1; *em = "Index is not enabled for filtertype basic"; return 0;
+    }
     if (!lookup_block_param(params, 0, 1, &h, ec, em)) return 0;
     if (params->nitems >= 2 && params->items[1]->typ == RJ_STR &&
         strcmp(params->items[1]->str, "basic")){
@@ -4294,6 +4327,13 @@ static int cmd_scanblocks(const rj_val* params, rj_val** res, long* ec, const ch
     if (!strcmp(action, "status")){ *res = rj_null(); return 1; }
     if (!strcmp(action, "abort")){ *res = rj_bool(0); return 1; }
     if (strcmp(action, "start")){ *ec = -8; *em = "Invalid action"; return 0; }
+    if (!ix_on(g_ix_bfilter)){
+        /* blockfilterindex=0: Core refuses a scan outright, whatever this
+         * node's exact block walk could have done without the index */
+        const char* ft = (params && params->nitems >= 5 && params->items[4]->typ == RJ_STR) ? params->items[4]->str : "basic";
+        if (strcmp(ft, "basic")){ *ec = -5; *em = "Unknown filtertype"; return 0; }
+        *ec = -1; *em = "Index is not enabled for filtertype basic"; return 0;
+    }
     if (!params || params->typ != RJ_ARR || params->nitems < 2 || params->items[1]->typ != RJ_ARR){
         *ec = -8; *em = "scanobjects argument is required for the start action"; return 0; }
     long tip = refresh();
@@ -4921,7 +4961,7 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
         rj_obj_set(o, "txospenderindex", e);
     }
     { extern long bfi_probe_count(void);
-      long bn = bfi_probe_count();
+      long bn = ix_on(g_ix_bfilter) ? bfi_probe_count() : -1;
       if (bn >= 0 && (!want || !strcmp(want, "basic block filter index"))){
           rj_val* e = rj_obj();
           long tip = refresh();
@@ -4929,7 +4969,7 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
           rj_obj_set(e, "best_block_height", rj_numf("%ld", bn - 1));
           rj_obj_set(o, "basic block filter index", e);
       } }
-    { long an = axt_probe_covered();
+    { long an = ix_on(g_ix_addrindex) ? axt_probe_covered() : -1;
       if (an >= 0 && (!want || !strcmp(want, "addressindex"))){
           /* EXTENSION index (Core has no address index); reported here so an
            * operator can see coverage the same way as the real Core indexes */
@@ -4939,7 +4979,7 @@ static int cmd_getindexinfo(const rj_val* params, rj_val** res, long* ec, const 
           rj_obj_set(e, "best_block_height", rj_numf("%ld", an));
           rj_obj_set(o, "addressindex", e);
       } }
-    if (g_csi_h && (!want || !strcmp(want, "coinstatsindex"))){
+    if (g_csi_h && ix_on(g_ix_coinstats) && (!want || !strcmp(want, "coinstatsindex"))){
         long ch = g_csi_h();
         if (ch >= 0){
             rj_val* e = rj_obj();
