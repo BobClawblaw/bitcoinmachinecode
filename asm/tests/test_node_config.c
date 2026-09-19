@@ -592,6 +592,51 @@ int main(void){
     if (g_cfg.max_connections == 64) printf("PASS DMN-9: an ordinary maxconnections is untouched\n");
     else { printf("FAIL DMN-9: maxconnections=64 read as %d\n", g_cfg.max_connections); failures++; }
 
+    /* ---- 2026-09-19: the number warning fired for every STRING key ----
+     * The value was parsed as an integer before the key was dispatched, so
+     * production logged "bind=192.168.5.242 is not a usable number -- reading
+     * it as 0" and the same for all four zmqpub* addresses, while applying
+     * each value correctly. A monitor parses these lines. The warning must
+     * be absent for string keys AND still present for a bad numeric one --
+     * a fix that silenced the parse everywhere would pass the first half. */
+    { node_config_load("/nonexistent/reset.conf");
+      wr("strkeys.conf",
+         "bind=192.168.5.242\n"
+         "zmqpubrawblock=tcp://127.0.0.1:28332\n"
+         "zmqpubhashtx=tcp://127.0.0.1:28333\n"
+         "maxconnections=lots\n"
+         "zmqpubrawtxhwm=12\n"
+         "blockfilterindex=basic\n");
+      fflush(stderr);
+      int saved = dup(2);
+      FILE* cap = fopen("strkeys.err", "w+");
+      dup2(fileno(cap), 2);
+      node_config_load("strkeys.conf");
+      fflush(stderr);
+      dup2(saved, 2); close(saved);
+      rewind(cap);
+      char ln[512]; int bind_w = 0, zmq_w = 0, bfi_w = 0, maxc_w = 0;
+      while (fgets(ln, sizeof ln, cap)){
+          if (!strstr(ln, "is not a usable number")) continue;
+          if (strstr(ln, "bind="))             bind_w++;
+          if (strstr(ln, "zmqpub"))            zmq_w++;
+          if (strstr(ln, "blockfilterindex=")) bfi_w++;
+          if (strstr(ln, "maxconnections="))   maxc_w++;
+      }
+      fclose(cap);
+      if (!bind_w && !zmq_w && !bfi_w)
+          printf("PASS: string-valued keys (bind, zmqpub*, blockfilterindex=basic) log no number warning\n");
+      else { printf("FAIL: false number warning: bind %d, zmqpub %d, blockfilterindex %d\n",
+                    bind_w, zmq_w, bfi_w); failures++; }
+      if (maxc_w == 1)
+          printf("PASS: a bad numeric value still warns, exactly once (maxconnections=lots)\n");
+      else { printf("FAIL: maxconnections=lots warned %d time(s), want 1\n", maxc_w); failures++; }
+      if (!strcmp(g_cfg.zmq_rawblock, "tcp://127.0.0.1:28332") && g_cfg.zmq_hwm[3] == 12
+          && g_cfg.blockfilterindex == 1)
+          printf("PASS: the string and numeric values are still applied\n");
+      else { printf("FAIL: values not applied (rawblock=%s rawtxhwm=%d bfi=%d)\n",
+                    g_cfg.zmq_rawblock, g_cfg.zmq_hwm[3], g_cfg.blockfilterindex); failures++; } }
+
     printf("\n");
     node_config_log();
     if (failures) printf("\nFAILURES: %d\n", failures);
