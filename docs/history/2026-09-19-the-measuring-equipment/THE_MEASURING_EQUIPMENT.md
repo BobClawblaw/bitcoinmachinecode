@@ -42,9 +42,9 @@ The short version of the state on 2026-09-19:
   that ran matched. The two that "failed" were both failures of the
   measuring harness, not of the node (Part III).
 
-- Speed. On the same NVMe drive, run 27 reached the tip in 18 h 40 m to
-  18 h 43 m. The first Core v31.1 baseline took 19 h 40 m 09 s. That is about
-  57 minutes (~5%) in bmc's favour. The report that records it says "Treat that
+- Speed. On the same NVMe drive, run 27 reached the tip in 18 h 40 m 23 s.
+  The first Core v31.1 baseline took 19 h 40 m 09 s. That is about 60 minutes
+  (~5%) in bmc's favour. The report that records it says "Treat that
   as indicative, not clean", and so does this one: both runs were loaded by a
   monitoring tool, in different ways (Part IV). The clean pair, an unpolled Core
   rerun and run 28 on today's code, was in progress when this was written:
@@ -489,7 +489,7 @@ The Core v31.1 baseline ran from 2026-09-17 23:26:54Z until it logged
 move it under systemd, and resumed with a cold cache.
 
 Run 27 started on the same NVMe at 19:15:29Z on 09-18, on build `ad77e46e`. It
-had every block stored after 18 h 36 m 24 s, applied the tip about 18 h 40 m in
+had every block stored after 18 h 36 m 24 s, applied the tip 18 h 40 m 23 s in
 (13:55:52Z in its log), and its harness, which checks every five minutes,
 recorded the tip at 18 h 43 m 11 s. Its capstone:
 
@@ -510,7 +510,7 @@ times of its block files, because the twelve-second restart had trimmed its log
 | 800,000 | 12 h 24 m | 12 h 02 m | 22 m |
 | 900,000 | 16 h 51 m | 16 h 13 m | 38 m |
 | 950,000 | 18 h 58 m | 18 h 03 m | 55 m |
-| tip | 19 h 40 m 09 s | 18 h 40–43 m | ~57 m |
+| tip | 19 h 40 m 09 s | 18 h 40 m 23 s | ~60 m |
 
 The run's own report treats this as indicative, not clean, for these reasons:
 
@@ -539,7 +539,7 @@ The first two burdened bmc, the third favoured it, and the polling burdened
 both sides differently. Most of bmc's lead was gained after 850,000, which is
 after its polling stopped at 09:07Z on 09-19, while Core's polling had continued
 to the end. The run's contaminants are listed in its report so that nobody quotes
-the 57 minutes without them.
+the 60 minutes without them.
 
 Chapter 20: The clean pair
 
@@ -1107,7 +1107,7 @@ Appendix A: The Numbers
 | models | Claude Fable 5.1 (310), Opus 5 (269), Sonnet 5 (10) | commit trailers |
 | audit findings | 182 (5 CRITICAL, 32 HIGH, 44 MEDIUM, 68 LOW, 33 INFO) | CODEBASE_AUDIT_2026-09-03 |
 | UTXO set comparisons with Core | 9, every real one identical | Part III |
-| run 27 | tip in 18 h 40–43 m, muhash identical at 967,712 | phase.log |
+| run 27 | tip in 18 h 40 m 23 s, muhash identical at 967,712 | debug.log, phase.log |
 | Core v31.1 baseline #1 | 19 h 40 m 09 s (polled) | debug.log |
 | Core v31.1 rerun (unpolled) | [[PENDING]] | watch.log |
 | run 28 (unpolled, fixed code) | [[PENDING]] | phase.log |

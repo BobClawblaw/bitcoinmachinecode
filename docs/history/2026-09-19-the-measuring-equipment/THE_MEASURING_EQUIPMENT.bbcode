@@ -18,7 +18,7 @@ Seventeen days later the answer is "probably, and here is exactly how sure we ar
 
 The short version of the state on 2026-09-19:
 
-[list][li]Correctness. A fresh bmc sync (run 27) ended with a UTXO set whose MuHash is identical to Bitcoin Core v31.1's at height 967,712: 09f5cd877189dc269f505f2066aa2a0b39eb0b8e3384a48449880affd6490ee7. That is the ninth full-set comparison against Core in the period. Every one that ran matched. The two that "failed" were both failures of the measuring harness, not of the node (Part III).[/li][li]Speed. On the same NVMe drive, run 27 reached the tip in 18 h 40 m to 18 h 43 m. The first Core v31.1 baseline took 19 h 40 m 09 s. That is about 57 minutes (~5%) in bmc's favour. The report that records it says "Treat that as indicative, not clean", and so does this one: both runs were loaded by a monitoring tool, in different ways (Part IV). The clean pair, an unpolled Core rerun and run 28 on today's code, was in progress when this was written: [b][[PENDING: Core rerun wall clock]][/b] and [b][[PENDING: run 28 wall clock]][/b].[/li][li]Parity. Every one of Core v31.1's RPC method names exists on the node and none is a stub. More usefully, the response shapes are now diffed field by field against a real v31.1, which is what found most of the defects in this period (Part V).[/li][li]The work. 927 commits on main and 282 merged pull requests in seventeen days, written by three Claude models, with one human operator deciding, merging and deploying (Parts I and VIII).[/li][/list]
+[list][li]Correctness. A fresh bmc sync (run 27) ended with a UTXO set whose MuHash is identical to Bitcoin Core v31.1's at height 967,712: 09f5cd877189dc269f505f2066aa2a0b39eb0b8e3384a48449880affd6490ee7. That is the ninth full-set comparison against Core in the period. Every one that ran matched. The two that "failed" were both failures of the measuring harness, not of the node (Part III).[/li][li]Speed. On the same NVMe drive, run 27 reached the tip in 18 h 40 m 23 s. The first Core v31.1 baseline took 19 h 40 m 09 s. That is about 60 minutes (~5%) in bmc's favour. The report that records it says "Treat that as indicative, not clean", and so does this one: both runs were loaded by a monitoring tool, in different ways (Part IV). The clean pair, an unpolled Core rerun and run 28 on today's code, was in progress when this was written: [b][[PENDING: Core rerun wall clock]][/b] and [b][[PENDING: run 28 wall clock]][/b].[/li][li]Parity. Every one of Core v31.1's RPC method names exists on the node and none is a stub. More usefully, the response shapes are now diffed field by field against a real v31.1, which is what found most of the defects in this period (Part V).[/li][li]The work. 927 commits on main and 282 merged pull requests in seventeen days, written by three Claude models, with one human operator deciding, merging and deploying (Parts I and VIII).[/li][/list]
 
 The title is not a metaphor. In this period, the most expensive defects were not in the node. They were in the things that measured it: a capstone that had compared an empty string with an empty string "for months", a harness that read a moving UTXO set and reported corruption, a benchmark that compared two disks instead of two implementations, a parity check against the wrong version of Core, a monitor that loaded both sides of a timed race. Each was found, named and fixed, and each left a rule behind. That is the main result of these seventeen days, and it is what makes the other results believable.
 
@@ -241,7 +241,7 @@ That night an 8 TB NVMe was installed, and a protocol written down: the same dev
 
 The Core v31.1 baseline ran from 2026-09-17 23:26:54Z until it logged [tt]Leaving InitialBlockDownload[/tt] at 2026-09-18 19:07:03Z, at height 967,454: 19 h 40 m 09 s. Its process was restarted once, for twelve seconds at 06:12Z, to move it under systemd, and resumed with a cold cache.
 
-Run 27 started on the same NVMe at 19:15:29Z on 09-18, on build [tt]ad77e46e[/tt]. It had every block stored after 18 h 36 m 24 s, applied the tip about 18 h 40 m in (13:55:52Z in its log), and its harness, which checks every five minutes, recorded the tip at 18 h 43 m 11 s. Its capstone:
+Run 27 started on the same NVMe at 19:15:29Z on 09-18, on build [tt]ad77e46e[/tt]. It had every block stored after 18 h 36 m 24 s, applied the tip 18 h 40 m 23 s in (13:55:52Z in its log), and its harness, which checks every five minutes, recorded the tip at 18 h 43 m 11 s. Its capstone:
 
 [code]2026-09-19T13:59:41Z PASS muhash identical at 967712
     (09f5cd877189dc269f505f2066aa2a0b39eb0b8e3384a48449880affd6490ee7)[/code]
@@ -257,14 +257,14 @@ At every 50,000-block mark from 400,000 on, run 27 was ahead of Core's time for 
 [tr][td]800,000[/td][td]12 h 24 m[/td][td]12 h 02 m[/td][td]22 m[/td][/tr]
 [tr][td]900,000[/td][td]16 h 51 m[/td][td]16 h 13 m[/td][td]38 m[/td][/tr]
 [tr][td]950,000[/td][td]18 h 58 m[/td][td]18 h 03 m[/td][td]55 m[/td][/tr]
-[tr][td]tip[/td][td]19 h 40 m 09 s[/td][td]18 h 40–43 m[/td][td]~57 m[/td][/tr]
+[tr][td]tip[/td][td]19 h 40 m 09 s[/td][td]18 h 40 m 23 s[/td][td]~60 m[/td][/tr]
 [/table]
 
 The run's own report treats this as indicative, not clean, for these reasons:
 
 [list type=decimal][li]Both runs were polled by a monitoring tool (Blockyard, a sibling project on the same machine), which the operator had asked to follow them. Core was polled for about 17 of its 19 h 40 m. Core's [tt]gettxoutsetinfo[/tt] forces a UTXO cache flush on every call, so Core flushed its cache about once a minute for most of its run. Run 27 was polled for about 14 hours. On its build, each poll re-read a large index tail from the start and re-walked the chain. Measured from the kernel's per-process I/O counters, run 27's RPC side read 10.2 TB over the run (203 MB/s on average), while the sync itself read 136 MB/s. In the minute after polling stopped, the RPC side read nothing.[/li][li]Run 27 maintained an index nobody had asked for. The node started the txo-spender index tail on every boot, whatever the config said, so run 27 wrote an index Core did not (about 98 GB by the end).[/li][li]Run 27 skipped work Core did. The harness had not built the helper binaries that fold the txindex into its final form, so the node logged that the builder was missing 222 times and never built it.[/li][li]Run 27's final hour overlapped a test gate and a production restart on the same machine.[/li][/list]
 
-The first two burdened bmc, the third favoured it, and the polling burdened both sides differently. Most of bmc's lead was gained after 850,000, which is after its polling stopped at 09:07Z on 09-19, while Core's polling had continued to the end. The run's contaminants are listed in its report so that nobody quotes the 57 minutes without them.
+The first two burdened bmc, the third favoured it, and the polling burdened both sides differently. Most of bmc's lead was gained after 850,000, which is after its polling stopped at 09:07Z on 09-19, while Core's polling had continued to the end. The run's contaminants are listed in its report so that nobody quotes the 60 minutes without them.
 
 [size=12pt][b]Chapter 20: The clean pair[/b][/size]
 
@@ -509,7 +509,7 @@ Recorded as open in the project's own registers on 2026-09-19:
 [tr][td]models[/td][td]Claude Fable 5.1 (310), Opus 5 (269), Sonnet 5 (10)[/td][td]commit trailers[/td][/tr]
 [tr][td]audit findings[/td][td]182 (5 CRITICAL, 32 HIGH, 44 MEDIUM, 68 LOW, 33 INFO)[/td][td]CODEBASE_AUDIT_2026-09-03[/td][/tr]
 [tr][td]UTXO set comparisons with Core[/td][td]9, every real one identical[/td][td]Part III[/td][/tr]
-[tr][td]run 27[/td][td]tip in 18 h 40–43 m, muhash identical at 967,712[/td][td]phase.log[/td][/tr]
+[tr][td]run 27[/td][td]tip in 18 h 40 m 23 s, muhash identical at 967,712[/td][td]debug.log, phase.log[/td][/tr]
 [tr][td]Core v31.1 baseline #1[/td][td]19 h 40 m 09 s (polled)[/td][td]debug.log[/td][/tr]
 [tr][td]Core v31.1 rerun (unpolled)[/td][td][b][[PENDING]][/b][/td][td]watch.log[/td][/tr]
 [tr][td]run 28 (unpolled, fixed code)[/td][td][b][[PENDING]][/b][/td][td]phase.log[/td][/tr]
