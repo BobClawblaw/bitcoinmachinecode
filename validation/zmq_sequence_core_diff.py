@@ -48,6 +48,9 @@ Usage: <venv with pyzmq>/bin/python3 validation/zmq_sequence_core_diff.py
        env: CORE_BIN, BMC_BIN, WORK (default $TMPDIR/bmc-zseq-<pid>), KEEP=1
 """
 import base64, json, os, shutil, signal, subprocess, sys, threading, time, urllib.request
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib'))
+from diffguard import require_sources   # a phase that compared no events must not read as a pass
+COMPARED = {}                            # phase -> events compared (core side)
 import zmq
 
 CORE_BIN = os.environ.get('CORE_BIN', '/mnt/nvme8tb/core-build/bitcoin-v31.1/build/bin')
@@ -152,6 +155,7 @@ def show(evs):
 def compare(phase, cs, bs, m_c, m_b, want):
     settle([(cs, m_c), (bs, m_b)], want)
     ce = cs.since(m_c); be = bs.since(m_b)
+    COMPARED[phase] = min(len(ce), len(be))
     print('  %s core: %s' % (phase, show(ce)))
     print('  %s bmc : %s' % (phase, show(be)))
     for e in ce + be:
@@ -395,6 +399,9 @@ def main():
         ok([e[2] for e in adds] == list(range(snap['mempool_sequence'] - len(adds), snap['mempool_sequence'])),
            'reload: %s numbers what it published consecutively, ending at n' % s.name)
 
+    # every exact-comparison phase must have compared at least one event on
+    # BOTH streams (a dead subscriber compares [] == [] and would "match")
+    require_sources({p: COMPARED.get(p, 0) for p in ('add', 'rbf', 'block', 'invalidate', 'reconsider', 'reorg')})
     print('\n%s: %d passed, %d failed' % ('PASS' if not FAILS else 'FAIL', PASSES, len(FAILS)))
     for f in FAILS: print('  - ' + f)
     return 1 if FAILS else 0
