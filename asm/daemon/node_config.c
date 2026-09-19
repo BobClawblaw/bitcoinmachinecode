@@ -666,20 +666,28 @@ long node_config_load(const char* path){
             val = on ? (char*)"1" : (char*)"0";
         }
 
-        int iv = nodecfg_atoi(val, key); int t;   /* DMN-9: bounded, not atoi */
+        /* DMN-9: bounded, not atoi -- and parsed only when a key's branch
+         * actually reads it. It used to be parsed for EVERY key before the
+         * dispatch, so every string-valued key logged "is not a usable
+         * number -- reading it as 0" (production: bind=192.168.5.242 and all
+         * four zmqpub* addresses) although its value was applied correctly;
+         * a monitor parses these lines. IV parses on first use and memoises,
+         * so a numeric key still warns exactly once on a bad value. */
+        int iv_have = 0, iv_memo = 0; int t;
+#define IV (iv_have ? iv_memo : (iv_have = 1, iv_memo = nodecfg_atoi(val, key)))
 
         /* ---- keys Bitcoin Core actually defines: same name, same units ----
          * A real bitcoin.conf must work here unchanged, and our file must not
          * break Core. Core ignores unknown keys and so do we, so the file
          * stays genuinely shared. */
-        if     (!strcmp(key,"maxconnections")){ t=clamp_int(iv,16,4096,key,&bad); if(t>=0){g_cfg.max_connections=t;applied++;} }
+        if     (!strcmp(key,"maxconnections")){ t=clamp_int(IV,16,4096,key,&bad); if(t>=0){g_cfg.max_connections=t;applied++;} }
         else if(!strcmp(key,"dbcache")){
             /* Core's -dbcache is the UTXO cache size in MB (default 450) --
              * exactly the knob this node needs for catch-up memtable sizing,
              * so honour it rather than inventing a parallel setting. Split it
              * ~1:3 between the slot table and the value/script blob, and
              * derive slots_log2 from the table's share at ~64B per slot. */
-            t=clamp_int(iv,4,262144,key,&bad);
+            t=clamp_int(IV,4,262144,key,&bad);
             if(t>=0){
                 g_cfg.dbcache_mb = t;
                 double table_bytes = (double)t * 1048576.0 * 0.25;
@@ -690,31 +698,31 @@ long node_config_load(const char* path){
             }
         }
         else if(!strcmp(key,"timeout")){      /* Core: connect timeout, ms  */
-            t=clamp_int(iv,1000,120000,key,&bad); if(t>=0){g_cfg.connect_timeout_ms=t;applied++;} }
+            t=clamp_int(IV,1000,120000,key,&bad); if(t>=0){g_cfg.connect_timeout_ms=t;applied++;} }
         else if(!strcmp(key,"peertimeout")){  /* Core: peer inactivity, s   */
-            t=clamp_int(iv,5,3600,key,&bad);  if(t>=0){g_cfg.peer_timeout_s=t;applied++;} }
+            t=clamp_int(IV,5,3600,key,&bad);  if(t>=0){g_cfg.peer_timeout_s=t;applied++;} }
         else if(!strcmp(key,"port")){         /* Core: P2P listen port      */
-            t=clamp_int(iv,1,65535,key,&bad); if(t>=0){g_cfg.port=t;g_cfg.port_explicit=1;applied++;} }
+            t=clamp_int(IV,1,65535,key,&bad); if(t>=0){g_cfg.port=t;g_cfg.port_explicit=1;applied++;} }
         else if(!strcmp(key,"chain")){        /* Core: -chain=main|regtest  */
             snprintf(g_cfg.chain,sizeof g_cfg.chain,"%s",val); applied++; }
         else if(!strcmp(key,"addrindex")){    /* EXTENSION: live addr index */
-            t=clamp_int(iv,0,1,key,&bad); if(t>=0){g_cfg.addrindex=t;applied++;} }
+            t=clamp_int(IV,0,1,key,&bad); if(t>=0){g_cfg.addrindex=t;applied++;} }
         else if(!strcmp(key,"regtest")){      /* Core: -regtest (bool form) */
-            t=clamp_int(iv,0,1,key,&bad);
+            t=clamp_int(IV,0,1,key,&bad);
             if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"regtest"); applied++; } }
         else if(!strcmp(key,"testnet4")){     /* Core: -testnet4 (bool form) */
-            t=clamp_int(iv,0,1,key,&bad);
+            t=clamp_int(IV,0,1,key,&bad);
             if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"testnet4"); applied++; } }
         else if(!strcmp(key,"signet")){       /* Core: -signet (bool form) */
-            t=clamp_int(iv,0,1,key,&bad);
+            t=clamp_int(IV,0,1,key,&bad);
             if(t==1){ snprintf(g_cfg.chain,sizeof g_cfg.chain,"signet"); applied++; } }
         else if(!strcmp(key,"bytespersigop")){ /* Core: -bytespersigop=<n> */
-            t=clamp_int(iv,1,100000,key,&bad);
+            t=clamp_int(IV,1,100000,key,&bad);
             if(!bad){ g_cfg.bytespersigop=t; applied++; } }
         else if(!strcmp(key,"disablewallet")){ /* Core: -disablewallet */
-            g_cfg.disablewallet = iv?1:0; applied++; }
+            g_cfg.disablewallet = IV?1:0; applied++; }
         else if(!strcmp(key,"reindex")){       /* Core -reindex (one-shot, see main.c) */
-            g_cfg.reindex = iv?1:0; applied++; }
+            g_cfg.reindex = IV?1:0; applied++; }
         else if(!strcmp(key,"walletdir")){     /* Core -walletdir=<dir> (absolute, or relative to the chain dir) */
             snprintf(g_cfg.walletdir,sizeof g_cfg.walletdir,"%s",val); applied++; }
         else if(!strcmp(key,"debuglogfile")){ /* Core: -debuglogfile=<file>, 0 = none */
@@ -731,51 +739,51 @@ long node_config_load(const char* path){
              * 0 = off. Run 14 hammered one peer at 12 reconnects a second; the
              * fail-backoff ended that, and this is the operator's ceiling on
              * the node as a whole, probes and crawlers included. */
-            t=clamp_int(iv,0,10000,key,&bad); if(t!=-1){ g_cfg.dial_rate_limit=t; applied++; } }
+            t=clamp_int(IV,0,10000,key,&bad); if(t!=-1){ g_cfg.dial_rate_limit=t; applied++; } }
         else if(!strcmp(key,"bmc.downloadratelimit")){
             /* KB/s the sync may pull, node-wide (2026-09-07). 0 = off. Charged
              * per block in the parallel download and per page in the header
              * fetch; probes and the keep-up legs are exempt. */
-            t=clamp_int(iv,0,10000000,key,&bad); if(t!=-1){ g_cfg.download_rate_limit_kbps=t; applied++; } }
+            t=clamp_int(IV,0,10000000,key,&bad); if(t!=-1){ g_cfg.download_rate_limit_kbps=t; applied++; } }
         else if(!strcmp(key,"bmc.coinstatshistrepair")){   /* EXTENSION (2026-09-08): the coinstats history base repairs itself */
-            g_cfg.coinstatshist_repair = iv?1:0; applied++; }
+            g_cfg.coinstatshist_repair = IV?1:0; applied++; }
         else if(!strcmp(key,"bmc.coinstatshistworkers")){
-            t=clamp_int(iv,0,64,key,&bad); if(t>=0){g_cfg.coinstatshist_workers=t;applied++;} }
+            t=clamp_int(IV,0,64,key,&bad); if(t>=0){g_cfg.coinstatshist_workers=t;applied++;} }
         else if(!strcmp(key,"bmc.esploraport")){   /* EXTENSION: the Esplora facade (rpc_esplora.c), 0 = off */
-            t=clamp_int(iv,0,65535,key,&bad); if(t>=0){g_cfg.esplora_port=t;applied++;} }
+            t=clamp_int(IV,0,65535,key,&bad); if(t>=0){g_cfg.esplora_port=t;applied++;} }
         else if(!strcmp(key,"bmc.esplorabind")){
             snprintf(g_cfg.esplora_bind,sizeof g_cfg.esplora_bind,"%s",val); applied++; }
         else if(!strcmp(key,"bmc.uploadratelimit")){
             /* KB/s the node may SEND, node-wide (2026-09-08). 0 = off. A
              * rate, unlike Core's -maxuploadtarget (a MiB/day budget, kept
              * separately with Core's semantics). */
-            t=clamp_int(iv,0,10000000,key,&bad); if(t!=-1){ g_cfg.upload_rate_limit_kbps=t; applied++; } }
+            t=clamp_int(IV,0,10000000,key,&bad); if(t!=-1){ g_cfg.upload_rate_limit_kbps=t; applied++; } }
         else if(!strcmp(key,"bmc.catchupworkers")){
             /* the PARALLEL DOWNLOAD ceiling: at most this many peers download
              * at once; every live peer does, up to it (2026-09-10, Core's
              * shape). Not -par: that is Core's script-verification thread
              * count and means exactly that here (2026-09-06). */
-            t=clamp_int(iv,1,64,key,&bad); if(t!=-1){ g_cfg.catchup_workers=t; applied++; } }
+            t=clamp_int(IV,1,64,key,&bad); if(t!=-1){ g_cfg.catchup_workers=t; applied++; } }
         else if(!strcmp(key,"par")){
             /* Core -par: worker threads. 0 = auto, and NEGATIVE means "leave
              * that many cores free", which is why the lower bound is not 0.
              * Drives the chunk-claiming catch-up worker count. */
-            t=clamp_int(iv,-64,64,key,&bad); if(t!=-1 || iv>=-64){ g_cfg.par=iv; applied++; } }
+            t=clamp_int(IV,-64,64,key,&bad); if(t!=-1 || IV>=-64){ g_cfg.par=IV; applied++; } }
         else if(!strcmp(key,"maxreceivebuffer")){
             /* Core -maxreceivebuffer is in units of 1000 bytes. Bounds how
              * much a single peer can make us buffer for one message. */
-            t=clamp_int(iv,64,262144,key,&bad); if(t>=0){ g_cfg.maxrecvbuffer_kb=t; applied++; } }
+            t=clamp_int(IV,64,262144,key,&bad); if(t>=0){ g_cfg.maxrecvbuffer_kb=t; applied++; } }
         else if(!strcmp(key,"maxmempool")){    /* Core: MB */
-            t=clamp_int(iv,1,65536,key,&bad); if(t>=0){ g_cfg.maxmempool_mb=t; g_cfg.maxmempool_explicit=1; applied++; } }
+            t=clamp_int(IV,1,65536,key,&bad); if(t>=0){ g_cfg.maxmempool_mb=t; g_cfg.maxmempool_explicit=1; applied++; } }
         else if(!strcmp(key,"mempoolexpiry")){ /* Core: hours */
-            t=clamp_int(iv,0,8760,key,&bad);  if(t>=0){ g_cfg.mempoolexpiry_h=t; applied++; } }
+            t=clamp_int(IV,0,8760,key,&bad);  if(t>=0){ g_cfg.mempoolexpiry_h=t; applied++; } }
         else if(!strcmp(key,"bmc.mempooljournal")){
             /* EXTENSION (2026-09-16): records in the mempool departure ring.
              * Core has nothing like it: when a transaction is evicted or
              * expires, Core forgets it, so "what happened to my broadcast"
              * has no answer. Bounded on purpose -- one record is 152 bytes,
              * so 1,000,000 is ~152 MB. 0 = off. */
-            t=clamp_int(iv,0,8000000,key,&bad); if(t>=0){ g_cfg.mempooljournal=t; applied++; } }
+            t=clamp_int(IV,0,8000000,key,&bad); if(t>=0){ g_cfg.mempooljournal=t; applied++; } }
         /* mempool policy limits (Core limit-count/size, relay fees, mempoolfullrbf).
          * The two fees are BTC/kvB in Core's config; keep them in sat/kvB
          * (round(BTC/kvB * 1e8)). Integer sat/vB could not represent Core's
@@ -789,27 +797,27 @@ long node_config_load(const char* path){
             else                                  g_cfg.incrementalrelayfee_satkvb = satkvb;
             applied++; }
         else if(!strcmp(key,"limitancestorcount")){
-            t=clamp_int(iv,1,10000,key,&bad); if(t>=0){ g_cfg.limitancestorcount=t; applied++; } }
+            t=clamp_int(IV,1,10000,key,&bad); if(t>=0){ g_cfg.limitancestorcount=t; applied++; } }
         else if(!strcmp(key,"limitancestorsize")){   /* Core: kvB */
-            t=clamp_int(iv,1,100000,key,&bad); if(t>=0){ g_cfg.limitancestorsize_kvb=t; applied++; } }
+            t=clamp_int(IV,1,100000,key,&bad); if(t>=0){ g_cfg.limitancestorsize_kvb=t; applied++; } }
         else if(!strcmp(key,"limitdescendantcount")){
-            t=clamp_int(iv,1,10000,key,&bad); if(t>=0){ g_cfg.limitdescendantcount=t; applied++; } }
+            t=clamp_int(IV,1,10000,key,&bad); if(t>=0){ g_cfg.limitdescendantcount=t; applied++; } }
         else if(!strcmp(key,"limitdescendantsize")){ /* Core: kvB */
-            t=clamp_int(iv,1,100000,key,&bad); if(t>=0){ g_cfg.limitdescendantsize_kvb=t; applied++; } }
+            t=clamp_int(IV,1,100000,key,&bad); if(t>=0){ g_cfg.limitdescendantsize_kvb=t; applied++; } }
         else if(!strcmp(key,"mempoolfullrbf")){
-            g_cfg.mempoolfullrbf = (iv != 0); applied++; }
+            g_cfg.mempoolfullrbf = (IV != 0); applied++; }
         else if(!strcmp(key,"dustrelayfee")){  /* Core: BTC/kvB -> sat/kvB */
             double b = atof(val);
             if(b >= 0 && b < 1.0){ g_cfg.dustrelayfee_satkvb = (long)(b*1e8 + 0.5); applied++; }
             else { fprintf(stderr,"[config] dustrelayfee=%s out of range -- ignoring\n", val); bad++; } }
         else if(!strcmp(key,"datacarrier")){
-            t=clamp_int(iv,0,1,key,&bad); if(t>=0){g_cfg.datacarrier=t;applied++;} }
+            t=clamp_int(IV,0,1,key,&bad); if(t>=0){g_cfg.datacarrier=t;applied++;} }
         else if(!strcmp(key,"datacarriersize")){
-            t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.datacarriersize=t;applied++;} }
+            t=clamp_int(IV,0,1000000,key,&bad); if(t>=0){g_cfg.datacarriersize=t;applied++;} }
         else if(!strcmp(key,"acceptnonstdtxn")){
-            t=clamp_int(iv,0,1,key,&bad); if(t>=0){g_cfg.acceptnonstdtxn=t;applied++;} }
+            t=clamp_int(IV,0,1,key,&bad); if(t>=0){g_cfg.acceptnonstdtxn=t;applied++;} }
         else if(!strcmp(key,"maxuploadtarget")){ /* Core: MB per 24h, 0=off */
-            t=clamp_int(iv,0,1048576,key,&bad); if(t>=0){ g_cfg.maxuploadtarget_mb=t; applied++; } }
+            t=clamp_int(IV,0,1048576,key,&bad); if(t>=0){ g_cfg.maxuploadtarget_mb=t; applied++; } }
         /* ---- anonymity networks (2026-08-28) ---- */
         else if(!strcmp(key,"proxy")){        /* Core -proxy=ip:port        */
             snprintf(g_cfg.proxy,sizeof g_cfg.proxy,"%s",val); applied++; }
@@ -820,7 +828,7 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"torpassword")){
             snprintf(g_cfg.torpassword,sizeof g_cfg.torpassword,"%s",val); applied++; }
         else if(!strcmp(key,"listenonion")){
-            g_cfg.listenonion = iv?1:0; applied++; }
+            g_cfg.listenonion = IV?1:0; applied++; }
         else if(!strcmp(key,"bantime")){      /* Core -bantime, seconds      */
             /* DMN-9: an unbounded bantime is FAIL-OPEN. main.c computes
              * time(NULL) + bantime, so bantime=9223372036854775807 wraps
@@ -838,17 +846,17 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"blockfilterindex")){
             /* Core takes "basic"/"0"/"1"; "basic" is the only index type
              * that exists in Core either, so treat it as on. */
-            g_cfg.blockfilterindex = (!strcmp(val,"basic") || iv) ? 1 : 0; applied++; }
+            g_cfg.blockfilterindex = (!strcmp(val,"basic") || IV) ? 1 : 0; applied++; }
         else if(!strcmp(key,"coinstatsindex")){
-            g_cfg.coinstatsindex = iv?1:0; applied++; }
+            g_cfg.coinstatsindex = IV?1:0; applied++; }
         else if(!strcmp(key,"permitbaremultisig")){
-            g_cfg.permitbaremultisig = iv?1:0; applied++; }
+            g_cfg.permitbaremultisig = IV?1:0; applied++; }
         else if(!strcmp(key,"v2transport")){
-            g_cfg.v2transport = iv?1:0; applied++; }
+            g_cfg.v2transport = IV?1:0; applied++; }
         else if(!strcmp(key,"persistmempool")){
-            g_cfg.persistmempool = iv?1:0; applied++; }
+            g_cfg.persistmempool = IV?1:0; applied++; }
         else if(!strcmp(key,"reindex-chainstate")){
-            g_cfg.reindex_chainstate = iv?1:0; applied++; }
+            g_cfg.reindex_chainstate = IV?1:0; applied++; }
         else if(!strcmp(key,"whitebind")){    /* Core: permissions by listener */
             const char* wberr = 0;
             if(netperm_whitebind_add(val, &wberr)) applied++;
@@ -871,18 +879,18 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"walletpassfile")){
             snprintf(g_cfg.walletpassfile, sizeof g_cfg.walletpassfile, "%s", val); applied++; }
         else if(!strcmp(key,"networkactive")){
-            g_cfg.networkactive = iv?1:0; applied++; }
+            g_cfg.networkactive = IV?1:0; applied++; }
         else if(!strcmp(key,"forcednsseed")){
-            g_cfg.forcednsseed = iv?1:0; applied++; }
+            g_cfg.forcednsseed = IV?1:0; applied++; }
         else if(!strcmp(key,"pid")){
             snprintf(g_cfg.pidfile,sizeof g_cfg.pidfile,"%s",val); applied++; }
         else if(!strcmp(key,"maxsendbuffer")){
-            t=clamp_int(iv,1,1000000,key,&bad); if(t>=0){ g_cfg.maxsendbuffer_kb=t; applied++; } }
-        else if(!strcmp(key,"zmqpubhashblockhwm")){ t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[0]=t;applied++;} }
-        else if(!strcmp(key,"zmqpubhashtxhwm")){    t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[1]=t;applied++;} }
-        else if(!strcmp(key,"zmqpubrawblockhwm")){  t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[2]=t;applied++;} }
-        else if(!strcmp(key,"zmqpubrawtxhwm")){     t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[3]=t;applied++;} }
-        else if(!strcmp(key,"zmqpubsequencehwm")){  t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[4]=t;applied++;} }
+            t=clamp_int(IV,1,1000000,key,&bad); if(t>=0){ g_cfg.maxsendbuffer_kb=t; applied++; } }
+        else if(!strcmp(key,"zmqpubhashblockhwm")){ t=clamp_int(IV,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[0]=t;applied++;} }
+        else if(!strcmp(key,"zmqpubhashtxhwm")){    t=clamp_int(IV,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[1]=t;applied++;} }
+        else if(!strcmp(key,"zmqpubrawblockhwm")){  t=clamp_int(IV,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[2]=t;applied++;} }
+        else if(!strcmp(key,"zmqpubrawtxhwm")){     t=clamp_int(IV,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[3]=t;applied++;} }
+        else if(!strcmp(key,"zmqpubsequencehwm")){  t=clamp_int(IV,0,1000000,key,&bad); if(t>=0){g_cfg.zmq_hwm[4]=t;applied++;} }
         else if(!strcmp(key,"rpcauth")){    /* repeatable, like onlynet */
             if (g_cfg.n_rpcauth < 8){
                 snprintf(g_cfg.rpcauth[g_cfg.n_rpcauth], 256, "%s", val);
@@ -916,42 +924,42 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"i2psam")){       /* Core -i2psam=ip:port       */
             snprintf(g_cfg.i2psam,sizeof g_cfg.i2psam,"%s",val); applied++; }
         else if(!strcmp(key,"i2pacceptincoming")){
-            g_cfg.i2pacceptincoming = iv?1:0; applied++; }
+            g_cfg.i2pacceptincoming = IV?1:0; applied++; }
         else if(!strcmp(key,"cjdnsreachable")){
-            g_cfg.cjdnsreachable = iv?1:0; applied++; }
+            g_cfg.cjdnsreachable = IV?1:0; applied++; }
         else if(!strcmp(key,"dns")){          /* Core -dns                  */
-            g_cfg.dns = iv?1:0; applied++; }
+            g_cfg.dns = IV?1:0; applied++; }
         else if(!strcmp(key,"discover")){     /* Core -discover             */
-            g_cfg.discover = iv?1:0; applied++; }
+            g_cfg.discover = IV?1:0; applied++; }
         else if(!strcmp(key,"externalip")){   /* Core -externalip           */
             snprintf(g_cfg.externalip,sizeof g_cfg.externalip,"%s",val); applied++; }
         else if(!strcmp(key,"proxyrandomize")){
-            g_cfg.proxyrandomize = iv?1:0; applied++; }
+            g_cfg.proxyrandomize = IV?1:0; applied++; }
         else if(!strcmp(key,"privatebroadcast")){   /* Core -privatebroadcast */
-            g_cfg.privatebroadcast = iv?1:0; applied++; }
+            g_cfg.privatebroadcast = IV?1:0; applied++; }
         else if(!strcmp(key,"onlynet")){      /* Core -onlynet, repeatable  */
             if(g_cfg.n_onlynet < 6){
                 snprintf(g_cfg.onlynet[g_cfg.n_onlynet],8,"%s",val);
                 g_cfg.n_onlynet++; applied++;
             } else fprintf(stderr,"[config] onlynet: at most 6 networks\n"); }
-        else if(!strcmp(key,"bmc.bootcatchup")){ g_cfg.boot_catchup = iv ? 1 : 0; applied++; }
+        else if(!strcmp(key,"bmc.bootcatchup")){ g_cfg.boot_catchup = IV ? 1 : 0; applied++; }
         else if(!strcmp(key,"listen")){       /* Core: accept inbound       */
-            g_cfg.listen = iv?1:0; saw_listen = 1; applied++; }
+            g_cfg.listen = IV?1:0; saw_listen = 1; applied++; }
         else if(!strcmp(key,"rest")){         /* Core: the REST interface on the RPC listener, unauthenticated (rest.c, 2026-09-08) */
-            g_cfg.rest = iv?1:0; applied++; }
+            g_cfg.rest = IV?1:0; applied++; }
         else if(!strcmp(key,"prune")){
             /* Core -prune: 0 disabled, 1 manual-only (no automatic deletion),
              * >=550 a target size in MiB for the block data. Values in 2..549
              * are refused by Core too -- a budget that small cannot hold the
              * blocks a node must keep to stay usable. */
-            if(iv==0 || iv==1){ g_cfg.prune_mib=iv; applied++; }
-            else { t=clamp_int(iv,550,1073741824,key,&bad); if(t>=0){ g_cfg.prune_mib=t; applied++; } } }
+            if(IV==0 || IV==1){ g_cfg.prune_mib=IV; applied++; }
+            else { t=clamp_int(IV,550,1073741824,key,&bad); if(t>=0){ g_cfg.prune_mib=t; applied++; } } }
         else if(!strcmp(key,"checkblocks")){  /* Core: 0 = all              */
-            t=clamp_int(iv,0,1000000,key,&bad); if(t>=0){ g_cfg.checkblocks=t; applied++; } }
+            t=clamp_int(IV,0,1000000,key,&bad); if(t>=0){ g_cfg.checkblocks=t; applied++; } }
         else if(!strcmp(key,"checklevel")){   /* Core: 0..4                 */
-            t=clamp_int(iv,0,4,key,&bad); if(t>=0){ g_cfg.checklevel=t; applied++; } }
+            t=clamp_int(IV,0,4,key,&bad); if(t>=0){ g_cfg.checklevel=t; applied++; } }
         else if(!strcmp(key,"stopatheight")){
-            t=clamp_int(iv,0,100000000,key,&bad); if(t>=0){ g_cfg.stopatheight=iv; applied++; } }
+            t=clamp_int(IV,0,100000000,key,&bad); if(t>=0){ g_cfg.stopatheight=IV; applied++; } }
 
         /* ---- Core keys we PARSE ONLY TO SAY WE DO NOT HONOUR THEM ----
          * Silence would be worse than a warning: this repo's own bitcoin.conf
@@ -963,14 +971,14 @@ long node_config_load(const char* path){
              * behind the applied height, during the sync and after it
              * (daemon/index_trail.h) -- so the key means what it means in
              * Core. The reader picks the files up with or without it. */
-            g_cfg.txindex = iv ? 1 : 0; applied++; }
+            g_cfg.txindex = IV ? 1 : 0; applied++; }
         else if(!strcmp(key,"txospenderindex")){
-            g_cfg.txospenderindex = iv ? 1 : 0; applied++; }
+            g_cfg.txospenderindex = IV ? 1 : 0; applied++; }
         else if(!strcmp(key,"bmc.indexrunblocks")){
             /* EXTENSION: heights per run for the trailing index builders. The
              * unsorted tail a lookup scans linearly is never longer than
              * this; a run costs one archive walk over its range. */
-            t=clamp_int(iv,1000,200000,key,&bad); if(t>=0){ g_cfg.indexrunblocks=t; applied++; } }
+            t=clamp_int(IV,1000,200000,key,&bad); if(t>=0){ g_cfg.indexrunblocks=t; applied++; } }
         else if(!strcmp(key,"assumevalid")){
             /* Core's -assumevalid: script evaluation is skipped for blocks
              * that are ancestors of this block; PoW, merkle, structure and
@@ -994,7 +1002,7 @@ long node_config_load(const char* path){
             } else { fprintf(stderr,"[config] assumevalid: not a 64-hex block hash -- ignored\n"); bad++; } }
 
         else if(!strcmp(key,"dnsseed")){      /* Core: query the DNS seeds  */
-            g_cfg.dnsseed = iv?1:0; saw_dnsseed = 1; applied++; }
+            g_cfg.dnsseed = IV?1:0; saw_dnsseed = 1; applied++; }
         else if(!strcmp(key,"seednode")){     /* Core: getaddr from, then drop */
             if(cfg_addlist(g_cfg.seednode,g_cfg.seednode_port,&g_cfg.n_seednode,val,key,&bad)) applied++; }
         else if(!strcmp(key,"addnode")){      /* Core: prefer + keep connected */
@@ -1045,23 +1053,23 @@ long node_config_load(const char* path){
             /* Core: do not participate in tx relay. We honour it by setting
              * relay=0 on ordinary outbound legs too, which is what the flag
              * means on the wire. */
-            g_cfg.blocksonly = iv?1:0; applied++; }
+            g_cfg.blocksonly = IV?1:0; applied++; }
 
         /* ---- extensions: Core has no equivalent option (these are
          * compile-time constants there). Prefixed so they are obviously not
          * Core keys and cannot collide with a future Core option. ---- */
-        else if(!strcmp(key,"bmc.blockrelayonly"))    { t=clamp_int(iv,0,16,key,&bad);     if(t>=0){g_cfg.max_block_relay_only=t;applied++;} }
-        else if(!strcmp(key,"bmc.feelers"))           { t=clamp_int(iv,0,8,key,&bad);      if(t>=0){g_cfg.max_feeler=t;applied++;} }
-        else if(!strcmp(key,"bmc.feelerinterval"))    { t=clamp_int(iv,10000,3600000,key,&bad); if(t>=0){g_cfg.feeler_interval_ms=t;applied++;} }
-        else if(!strcmp(key,"bmc.maxoutbound"))       { t=clamp_int(iv,1,64,key,&bad);     if(t>=0){g_cfg.max_outbound=t;applied++;} }
-        else if(!strcmp(key,"bmc.peerminbps"))        { t=clamp_int(iv,1024,10485760,key,&bad); if(t>=0){g_cfg.dead_weight_bps=(double)t;applied++;} }
-        else if(!strcmp(key,"bmc.peerminticks"))      { t=clamp_int(iv,1,60,key,&bad);     if(t>=0){g_cfg.dead_weight_ticks=t;applied++;} }
-        else if(!strcmp(key,"bmc.peerminusable"))     { t=clamp_int(iv,1,256,key,&bad);    if(t>=0){g_cfg.min_usable_peers=t;applied++;} }
-        else if(!strcmp(key,"bmc.peerpool"))          { t=clamp_int(iv,16,8192,key,&bad);  if(t>=0){g_cfg.maxpool=t;applied++;} }
-        else if(!strcmp(key,"bmc.addrmaxperresponse")){ t=clamp_int(iv,1,1000,key,&bad);   if(t>=0){g_cfg.addr_max_per_response=t;applied++;} }
-        else if(!strcmp(key,"bmc.addrmaxpernetgroup")){ t=clamp_int(iv,1,256,key,&bad);    if(t>=0){g_cfg.addr_max_per_netgroup=t;applied++;} }
-        else if(!strcmp(key,"bmc.utxobulkgapblocks")) { t=clamp_int(iv,0,1000000,key,&bad);if(t>=0){g_cfg.utxo_bulk_gap_blocks=t;applied++;} }
-        else if(!strcmp(key,"bmc.utxocompactthreshold")){ t=clamp_int(iv,2,4096,key,&bad); if(t>=0){g_cfg.utxo_compact_threshold=t;applied++;} }
+        else if(!strcmp(key,"bmc.blockrelayonly"))    { t=clamp_int(IV,0,16,key,&bad);     if(t>=0){g_cfg.max_block_relay_only=t;applied++;} }
+        else if(!strcmp(key,"bmc.feelers"))           { t=clamp_int(IV,0,8,key,&bad);      if(t>=0){g_cfg.max_feeler=t;applied++;} }
+        else if(!strcmp(key,"bmc.feelerinterval"))    { t=clamp_int(IV,10000,3600000,key,&bad); if(t>=0){g_cfg.feeler_interval_ms=t;applied++;} }
+        else if(!strcmp(key,"bmc.maxoutbound"))       { t=clamp_int(IV,1,64,key,&bad);     if(t>=0){g_cfg.max_outbound=t;applied++;} }
+        else if(!strcmp(key,"bmc.peerminbps"))        { t=clamp_int(IV,1024,10485760,key,&bad); if(t>=0){g_cfg.dead_weight_bps=(double)t;applied++;} }
+        else if(!strcmp(key,"bmc.peerminticks"))      { t=clamp_int(IV,1,60,key,&bad);     if(t>=0){g_cfg.dead_weight_ticks=t;applied++;} }
+        else if(!strcmp(key,"bmc.peerminusable"))     { t=clamp_int(IV,1,256,key,&bad);    if(t>=0){g_cfg.min_usable_peers=t;applied++;} }
+        else if(!strcmp(key,"bmc.peerpool"))          { t=clamp_int(IV,16,8192,key,&bad);  if(t>=0){g_cfg.maxpool=t;applied++;} }
+        else if(!strcmp(key,"bmc.addrmaxperresponse")){ t=clamp_int(IV,1,1000,key,&bad);   if(t>=0){g_cfg.addr_max_per_response=t;applied++;} }
+        else if(!strcmp(key,"bmc.addrmaxpernetgroup")){ t=clamp_int(IV,1,256,key,&bad);    if(t>=0){g_cfg.addr_max_per_netgroup=t;applied++;} }
+        else if(!strcmp(key,"bmc.utxobulkgapblocks")) { t=clamp_int(IV,0,1000000,key,&bad);if(t>=0){g_cfg.utxo_bulk_gap_blocks=t;applied++;} }
+        else if(!strcmp(key,"bmc.utxocompactthreshold")){ t=clamp_int(IV,2,4096,key,&bad); if(t>=0){g_cfg.utxo_compact_threshold=t;applied++;} }
         /* anything else (rpcport, rpcuser, dbcache, ...) belongs to another
          * consumer of this shared file -- ignore rather than warn.
          *
@@ -1082,9 +1090,9 @@ long node_config_load(const char* path){
             else if(strlen(val) > 63){ fprintf(stderr,"[config] uacomment=%s too long (max 63) -- ignoring\n", val); bad++; }
             else { snprintf(g_cfg.uacomment[g_cfg.n_uacomment++], 64, "%s", val); applied++; } }
         else if(!strcmp(key,"blockmaxweight")){
-            t=clamp_int(iv,4000,4000000,key,&bad); if(t>=0){ g_cfg.blockmaxweight=t; applied++; } }
+            t=clamp_int(IV,4000,4000000,key,&bad); if(t>=0){ g_cfg.blockmaxweight=t; applied++; } }
         else if(!strcmp(key,"blockreservedweight")){
-            t=clamp_int(iv,2000,4000000,key,&bad); if(t>=0){ g_cfg.blockreservedweight=t; applied++; } }
+            t=clamp_int(IV,2000,4000000,key,&bad); if(t>=0){ g_cfg.blockreservedweight=t; applied++; } }
         else if(!strcmp(key,"blockmintxfee") || !strcmp(key,"mintxfee") || !strcmp(key,"fallbackfee") ||
                 !strcmp(key,"discardfee") || !strcmp(key,"consolidatefeerate")){
             double btc = atof(val);
@@ -1101,16 +1109,16 @@ long node_config_load(const char* path){
             if(btc < 0){ g_cfg.maxapsfee_sat = -1; applied++; }
             else if(btc >= 1.0){ fprintf(stderr,"[config] maxapsfee=%s out of range -- ignoring\n", val); bad++; }
             else { g_cfg.maxapsfee_sat = (long)(btc * 1e8 + 0.5); applied++; } }
-        else if(!strcmp(key,"blockversion")){ g_cfg.blockversion = iv; applied++; }
-        else if(!strcmp(key,"printpriority")){ g_cfg.printpriority = iv?1:0; applied++; }
-        else if(!strcmp(key,"avoidpartialspends")){ g_cfg.avoidpartialspends = iv?1:0; applied++; }
-        else if(!strcmp(key,"spendzeroconfchange")){ g_cfg.spendzeroconfchange = iv?1:0; applied++; }
-        else if(!strcmp(key,"walletrbf")){ g_cfg.walletrbf = iv?1:0; applied++; }
-        else if(!strcmp(key,"walletbroadcast")){ g_cfg.walletbroadcast = iv?1:0; applied++; }
+        else if(!strcmp(key,"blockversion")){ g_cfg.blockversion = IV; applied++; }
+        else if(!strcmp(key,"printpriority")){ g_cfg.printpriority = IV?1:0; applied++; }
+        else if(!strcmp(key,"avoidpartialspends")){ g_cfg.avoidpartialspends = IV?1:0; applied++; }
+        else if(!strcmp(key,"spendzeroconfchange")){ g_cfg.spendzeroconfchange = IV?1:0; applied++; }
+        else if(!strcmp(key,"walletrbf")){ g_cfg.walletrbf = IV?1:0; applied++; }
+        else if(!strcmp(key,"walletbroadcast")){ g_cfg.walletbroadcast = IV?1:0; applied++; }
         else if(!strcmp(key,"txconfirmtarget")){
-            t=clamp_int(iv,1,1008,key,&bad); if(t>=0){ g_cfg.txconfirmtarget=t; applied++; } }
+            t=clamp_int(IV,1,1008,key,&bad); if(t>=0){ g_cfg.txconfirmtarget=t; applied++; } }
         else if(!strcmp(key,"keypool")){
-            t=clamp_int(iv,1,1000000,key,&bad); if(t>=0){ g_cfg.keypool=t; applied++; } }
+            t=clamp_int(IV,1,1000000,key,&bad); if(t>=0){ g_cfg.keypool=t; applied++; } }
         else if(!strcmp(key,"walletnotify")){
             snprintf(g_cfg.walletnotify,sizeof g_cfg.walletnotify,"%s",val); applied++; }
         else if(!strcmp(key,"wallet")){
@@ -1126,41 +1134,41 @@ long node_config_load(const char* path){
             if(lv < 0){ fprintf(stderr,"[config] maxtipage=%s out of range -- ignoring\n", val); bad++; }
             else { g_cfg.maxtipage = (long)lv; applied++; } }
         else if(!strcmp(key,"inboundrelaypercent")){
-            t=clamp_int(iv,0,100,key,&bad); if(t>=0){ g_cfg.inboundrelaypercent=t; applied++; } }
-        else if(!strcmp(key,"whitelistrelay")){ g_cfg.whitelistrelay = iv?1:0; g_cfg.whitelistrelay_explicit = 1; applied++; }
-        else if(!strcmp(key,"acceptstalefeeestimates")){ g_cfg.acceptstalefeeestimates = iv?1:0; applied++; }
-        else if(!strcmp(key,"whitelistforcerelay")){ g_cfg.whitelistforcerelay = iv?1:0; applied++; }
+            t=clamp_int(IV,0,100,key,&bad); if(t>=0){ g_cfg.inboundrelaypercent=t; applied++; } }
+        else if(!strcmp(key,"whitelistrelay")){ g_cfg.whitelistrelay = IV?1:0; g_cfg.whitelistrelay_explicit = 1; applied++; }
+        else if(!strcmp(key,"acceptstalefeeestimates")){ g_cfg.acceptstalefeeestimates = IV?1:0; applied++; }
+        else if(!strcmp(key,"whitelistforcerelay")){ g_cfg.whitelistforcerelay = IV?1:0; applied++; }
         else if(!strcmp(key,"peerbloomfilters")){
-            g_cfg.peerbloomfilters = iv?1:0;
-            if(iv) fprintf(stderr,"[config] peerbloomfilters=1: BIP37 bloom filtering is not implemented -- NODE_BLOOM is not advertised\n");
+            g_cfg.peerbloomfilters = IV?1:0;
+            if(IV) fprintf(stderr,"[config] peerbloomfilters=1: BIP37 bloom filtering is not implemented -- NODE_BLOOM is not advertised\n");
             applied++; }
-        else if(!strcmp(key,"peerblockfilters")){ g_cfg.peerblockfilters = iv?1:0; applied++; }
-        else if(!strcmp(key,"fixedseeds")){ g_cfg.fixedseeds = iv?1:0; applied++; }
-        else if(!strcmp(key,"txreconciliation")){ g_cfg.txreconciliation = iv?1:0; applied++; }
+        else if(!strcmp(key,"peerblockfilters")){ g_cfg.peerblockfilters = IV?1:0; applied++; }
+        else if(!strcmp(key,"fixedseeds")){ g_cfg.fixedseeds = IV?1:0; applied++; }
+        else if(!strcmp(key,"txreconciliation")){ g_cfg.txreconciliation = IV?1:0; applied++; }
         else if(!strcmp(key,"signetseednode")){
             if(g_cfg.n_signetseednode >= 4){ fprintf(stderr,"[config] signetseednode: at most 4 entries -- ignoring %s\n", val); bad++; }
             else if(strlen(val) > 79 || !*val){ fprintf(stderr,"[config] signetseednode=%s rejected\n", val); bad++; }
             else { snprintf(g_cfg.signetseednode[g_cfg.n_signetseednode++], 80, "%s", val); applied++; } }
-        else if(!strcmp(key,"logips")){ g_cfg.logips = iv?1:0; applied++; }
-        else if(!strcmp(key,"logtimestamps")){ g_cfg.logtimestamps = iv?1:0; applied++; }
-        else if(!strcmp(key,"logtimemicros")){ g_cfg.logtimemicros = iv?1:0; applied++; }
-        else if(!strcmp(key,"logthreadnames")){ g_cfg.logthreadnames = iv?1:0; applied++; }
-        else if(!strcmp(key,"logsourcelocations")){ g_cfg.logsourcelocations = iv?1:0; applied++; }
-        else if(!strcmp(key,"shrinkdebugfile")){ g_cfg.shrinkdebugfile = iv?1:0; applied++; }
-        else if(!strcmp(key,"printtoconsole")){ g_cfg.printtoconsole = iv?1:0; applied++; }
+        else if(!strcmp(key,"logips")){ g_cfg.logips = IV?1:0; applied++; }
+        else if(!strcmp(key,"logtimestamps")){ g_cfg.logtimestamps = IV?1:0; applied++; }
+        else if(!strcmp(key,"logtimemicros")){ g_cfg.logtimemicros = IV?1:0; applied++; }
+        else if(!strcmp(key,"logthreadnames")){ g_cfg.logthreadnames = IV?1:0; applied++; }
+        else if(!strcmp(key,"logsourcelocations")){ g_cfg.logsourcelocations = IV?1:0; applied++; }
+        else if(!strcmp(key,"shrinkdebugfile")){ g_cfg.shrinkdebugfile = IV?1:0; applied++; }
+        else if(!strcmp(key,"printtoconsole")){ g_cfg.printtoconsole = IV?1:0; applied++; }
         else if(!strcmp(key,"loglevel")){ snprintf(g_cfg.loglevel,sizeof g_cfg.loglevel,"%s",val); applied++; }
         else if(!strcmp(key,"rpcthreads")){
-            t=clamp_int(iv,1,256,key,&bad); if(t>=0){ g_cfg.rpcthreads=t; applied++; } }
+            t=clamp_int(IV,1,256,key,&bad); if(t>=0){ g_cfg.rpcthreads=t; applied++; } }
         else if(!strcmp(key,"rpcworkqueue")){
-            t=clamp_int(iv,1,4096,key,&bad); if(t>=0){ g_cfg.rpcworkqueue=t; applied++; } }
+            t=clamp_int(IV,1,4096,key,&bad); if(t>=0){ g_cfg.rpcworkqueue=t; applied++; } }
         else if(!strcmp(key,"rpcservertimeout")){
-            t=clamp_int(iv,1,86400,key,&bad); if(t>=0){ g_cfg.rpcservertimeout=t; applied++; } }
+            t=clamp_int(IV,1,86400,key,&bad); if(t>=0){ g_cfg.rpcservertimeout=t; applied++; } }
         else if(!strcmp(key,"rpcwhitelist")){
             if(!strchr(val,':')){ fprintf(stderr,"[config] rpcwhitelist=%s: expected <user>:<rpc1>,<rpc2>,... -- ignoring\n", val); bad++; }
             else if(g_cfg.n_rpcwhitelist >= 16){ fprintf(stderr,"[config] rpcwhitelist: at most 16 entries -- ignoring %s\n", val); bad++; }
             else if(strlen(val) > 511){ fprintf(stderr,"[config] rpcwhitelist entry too long -- ignoring\n"); bad++; }
             else { snprintf(g_cfg.rpcwhitelist[g_cfg.n_rpcwhitelist++], 512, "%s", val); applied++; } }
-        else if(!strcmp(key,"rpcwhitelistdefault")){ g_cfg.rpcwhitelistdefault = iv?1:0; applied++; }
+        else if(!strcmp(key,"rpcwhitelistdefault")){ g_cfg.rpcwhitelistdefault = IV?1:0; applied++; }
         else if(!strcmp(key,"rpccookieperms")){
             if(!strcmp(val,"owner")) g_cfg.rpccookieperms = 0;
             else if(!strcmp(val,"group")) g_cfg.rpccookieperms = 1;
@@ -1170,14 +1178,14 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"limitclustercount")){
             /* Core v31 bounds a mempool cluster; this mempool's ancestor/descendant
              * limits are the same bound seen from either end of a chain */
-            t=clamp_int(iv,1,10000,key,&bad); if(t>=0){ g_cfg.limitclustercount=t; g_cfg.limitancestorcount=t; g_cfg.limitdescendantcount=t; applied++; } }
+            t=clamp_int(IV,1,10000,key,&bad); if(t>=0){ g_cfg.limitclustercount=t; g_cfg.limitancestorcount=t; g_cfg.limitdescendantcount=t; applied++; } }
         else if(!strcmp(key,"limitclustersize")){    /* Core: kvB */
-            t=clamp_int(iv,1,100000,key,&bad); if(t>=0){ g_cfg.limitclustersize_kvb=t; g_cfg.limitancestorsize_kvb=t; g_cfg.limitdescendantsize_kvb=t; applied++; } }
-        else if(!strcmp(key,"checkblockindex")){ g_cfg.checkblockindex = iv?1:0; applied++; }
-        else if(!strcmp(key,"checkmempool")){ g_cfg.checkmempool = iv?1:0; applied++; }
-        else if(!strcmp(key,"checkaddrman")){ g_cfg.checkaddrman = iv?1:0; applied++; }
-        else if(!strcmp(key,"capturemessages")){ g_cfg.capturemessages = iv?1:0; applied++; }
-        else if(!strcmp(key,"stopafterblockimport")){ g_cfg.stopafterblockimport = iv?1:0; applied++; }
+            t=clamp_int(IV,1,100000,key,&bad); if(t>=0){ g_cfg.limitclustersize_kvb=t; g_cfg.limitancestorsize_kvb=t; g_cfg.limitdescendantsize_kvb=t; applied++; } }
+        else if(!strcmp(key,"checkblockindex")){ g_cfg.checkblockindex = IV?1:0; applied++; }
+        else if(!strcmp(key,"checkmempool")){ g_cfg.checkmempool = IV?1:0; applied++; }
+        else if(!strcmp(key,"checkaddrman")){ g_cfg.checkaddrman = IV?1:0; applied++; }
+        else if(!strcmp(key,"capturemessages")){ g_cfg.capturemessages = IV?1:0; applied++; }
+        else if(!strcmp(key,"stopafterblockimport")){ g_cfg.stopafterblockimport = IV?1:0; applied++; }
         else if(!strcmp(key,"mocktime")){ g_cfg.mocktime = atoll(val); applied++; }
         else if(!strcmp(key,"includeconf")){
             if(g_include_depth){ fprintf(stderr,"[config] includeconf inside an included file is not allowed (Core rule) -- ignoring %s\n", val); bad++; }
@@ -1189,6 +1197,7 @@ long node_config_load(const char* path){
                     key, nodecfg_noeffect_reason(key));
             unimpl++;
         }
+#undef IV
     }
     fclose(f);
     if(unimpl)

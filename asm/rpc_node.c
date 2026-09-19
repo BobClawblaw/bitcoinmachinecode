@@ -620,7 +620,13 @@ static int cmd_getnettotals(rj_val** res){
             if (!p->used) continue;
             sent += p->bytes_sent; recv += p->bytes_recv;
         }
-    if (g_status) recv += g_status->dl_bytes_total;   /* the parallel download's bytes (2026-09-08): this read 3 KB against a 50 GB archive */
+    /* the parallel download's bytes, both directions. Its receive side was
+     * dl_bytes_total (2026-09-08: this read 3 KB against a 50 GB archive),
+     * which is one dl_catchup call's process rchar -- file reads included,
+     * restarting at every call -- and its SEND side was not counted at all
+     * (run 27: ~73 GB of blocks requested, ~0 bytes sent). Both are now the
+     * wire bytes the downloader's own p2p hooks counted (2026-09-19). */
+    if (g_status){ sent += g_status->dl_wire_sent; recv += g_status->dl_wire_recv; }
     rj_val* o = rj_obj();
     /* Core counts bytes for the process lifetime including closed peers; we
      * sum the LIVE peer table plus everything the download received this
@@ -827,19 +833,21 @@ void rpc_node_set_addednodes(const char (*list)[64], int n){
  * Core's answer is [{type:"pubhashtx", address, hwm}, ...], one entry per
  * CONFIGURED topic, in Core's own fixed order.
  *
- * hwm is reported as 0, and that is a statement, not a shrug: Core's field
- * is libzmq's send high-water mark (default 1000 queued messages). This
- * publisher has no such queue -- the kernel socket buffer is the only
- * buffering, and a subscriber that falls behind it is dropped (see
- * zmq_pub.c). 0 is ZMQ's own encoding of "no limit set here", which is the
- * closest true description of that behaviour. */
+ * hwm is each topic's CONFIGURED -zmqpub<topic>hwm, as Core prints it
+ * (zmqrpc.cpp: n->GetOutboundMessageHighWaterMark(), the notifier's own
+ * value). Since 2026-09-19 it is a real limit here, in Core's unit: the
+ * publisher queues at most that many MESSAGES per subscriber and drops new
+ * ones past it (zmq_pub.c). It used to be reported as 0 because there was no
+ * queue. Default 1000, Core's DEFAULT_ZMQ_SNDHWM, when nothing is injected. */
 static const char* g_zmq_ep[4];   /* hashblock, hashtx, rawblock, rawtx */
+static const int*  g_zmq_hwm;     /* same order; BORROWED, like the endpoints */
 
 void rpc_node_set_zmq(const char* hashblock, const char* hashtx,
                       const char* rawblock, const char* rawtx){
     g_zmq_ep[0] = hashblock; g_zmq_ep[1] = hashtx;
     g_zmq_ep[2] = rawblock;  g_zmq_ep[3] = rawtx;
 }
+void rpc_node_set_zmq_hwm(const int* hwm4){ g_zmq_hwm = hwm4; }
 
 static int cmd_getzmqnotifications(rj_val** res){
     static const char* const NAMES[4] =
@@ -850,7 +858,9 @@ static int cmd_getzmqnotifications(rj_val** res){
         rj_val* o = rj_obj();
         rj_obj_set(o, "type",    rj_str(NAMES[i]));
         rj_obj_set(o, "address", rj_str(g_zmq_ep[i]));
-        rj_obj_set(o, "hwm",     rj_num("0"));
+        char hb[16];
+        snprintf(hb, sizeof hb, "%d", g_zmq_hwm ? g_zmq_hwm[i] : 1000);
+        rj_obj_set(o, "hwm",     rj_num(hb));
         rj_arr_push(arr, o);
     }
     *res = arr;
@@ -1452,8 +1462,20 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
     }
     if (g_mph.mp) mpu();
     if (npending){
-        /* Core: "Mempool lacks a relevant spend, and txospenderindex is unavailable." */
-        if (!index_ok || !rpc_chain_txospender_lookup){ rj_free(arr); free(pending); *ec = -1; *em = "Mempool lacks a relevant spend, and txospenderindex is unavailable."; return 0; }
+        /* Core v31.1 (rpc/mempool.cpp): the FIRST outpoint, in request
+         * order, that the mempool does not spend names itself:
+         * "No spending tx for the outpoint <txid>:<n> in mempool, and
+         * txospenderindex is unavailable." -- RPC_MISC_ERROR. The text
+         * here was an older wording. */
+        if (!index_ok || !rpc_chain_txospender_lookup){
+            static char nomsg[200];
+            const rj_val* e0 = list->items[pending[0]];
+            char lx[65]; const char* tx0 = rj_obj_get((rj_val*)e0, "txid")->str;   /* validated: 64 hex digits */
+            for (int b = 0; b < 64; b++) lx[b] = (char)((tx0[b] >= 'A' && tx0[b] <= 'F') ? tx0[b] - 'A' + 'a' : tx0[b]);
+            lx[64] = 0;                                   /* Core prints uint256::GetHex, lower case */
+            snprintf(nomsg, sizeof nomsg, "No spending tx for the outpoint %s:%lu in mempool, and txospenderindex is unavailable.",
+                     lx, (unsigned long)atol(rj_obj_get((rj_val*)e0, "vout")->str));
+            rj_free(arr); free(pending); *ec = -1; *em = nomsg; return 0; }
         static unsigned char txbuf[4u << 20];
         for (int q = 0; q < npending; q++){
             int i = pending[q]; rj_val* o = arr->items[i]; const rj_val* e = list->items[i];
@@ -1495,6 +1517,16 @@ static mpe_vs_t* g_mpe_vs; static unsigned long g_mpe_vs_n;
 /* the whole graph for this call, filled once by pol_entry_info_all; indexed
    by the same sorted txid order as the vsize cache above */
 static mp_entry_info* g_mpe_inf; static unsigned char (*g_mpe_inf_id)[32]; static long g_mpe_inf_n;
+/* the per-call chunk cache (2026-09-19), parallel to g_mpe_vs: st 0 = not
+ * yet computed, 1 = fee/weight hold this entry's chunk, -1 = no honest answer
+ * (component beyond the 64 bound, or a graph that did not build). One cluster
+ * linearization fills every member's slot, which is what keeps bulk
+ * getrawmempool linear in the pool rather than in pool x cluster size. */
+typedef struct { unsigned long long fee, weight; signed char st; } mpe_chunk_t;
+static mpe_chunk_t* g_mpe_chunk;
+/* clusters linearized since start: the cost model, exported for the tests */
+static unsigned long g_mpe_cluster_builds;
+unsigned long rpc_node_cluster_builds(void){ return g_mpe_cluster_builds; }
 static int mpe_vs_cmp(const void* a, const void* b){
     return memcmp(((const mpe_vs_t*)a)->id, ((const mpe_vs_t*)b)->id, 32);
 }
@@ -1615,6 +1647,10 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
      * linearization, which this node does not implement, and they are omitted
      * rather than guessed.
      *
+     * 2026-09-19: superseded -- the cluster layer (mempool_cluster.c) does
+     * linearize, and every entry now carries both keys on this path too; see
+     * mpe_chunk_of and the per-call chunk cache.
+     *
      * 2026-09-18: `vsize_adjusted` and `vsize_bip141` are gone again. Both
      * came off the v31.99 development oracle; v31.1 has neither, in any RPC.
      * What v31.1 does have is the adjusted size under the plain name: its
@@ -1665,6 +1701,10 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
                     if (k >= 0){ g_mpe_vs[k].inf = q;
                                  g_mpe_vs[k].vs = mpe_adj_vsize(g_mpe_vs[k].w, g_mpe_inf[q].sigop_cost); }
                 }
+                /* chunk cache: only with the one-pass graph (the lookup it
+                 * drives reads g_mpe_inf); without it, per-entry builds */
+                if (g_mpe_inf && g_mpe_vs_n)
+                    g_mpe_chunk = (mpe_chunk_t*)calloc(g_mpe_vs_n, sizeof *g_mpe_chunk);
             }
         }
         for (unsigned long i=0;i<n;i++){ mp_ent e;
@@ -1676,6 +1716,7 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
             /* the same builder getmempoolentry uses, under the same pool lock */
             rj_obj_set(out, hx, mpe_entry_obj(e.txid, e.tx, e.len));
         }
+        free(g_mpe_chunk); g_mpe_chunk = 0;
         free(g_mpe_vs); g_mpe_vs = 0; g_mpe_vs_n = 0;
         free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf = 0; g_mpe_inf_id = 0; g_mpe_inf_n = 0;
         mpu();
@@ -1735,6 +1776,97 @@ static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, con
     mpu();
     *res = o;
     return 1;
+}
+
+/* The cluster layer's view of the pool during a BULK call: the same fields
+ * mpc_lookup_here reads (modified fee, sigops-adjusted weight, direct edges),
+ * taken from this call's one-pass graph and weight cache instead of one
+ * registry walk per member. Edges are filtered to transactions still in the
+ * pool -- the rule `depends`/`spentby` already apply -- so a stale registry
+ * edge cannot fail the build. */
+static int mpc_lookup_bulk(void* ctx, const unsigned char txid[32], mpc_entry* out)
+{
+    (void)ctx;
+    long k = mpe_vs_find(txid);
+    if (k < 0 || g_mpe_vs[k].inf < 0) return 0;
+    const mp_entry_info* inf = &g_mpe_inf[g_mpe_vs[k].inf];
+    memset(out, 0, sizeof *out);
+    long long modified = (long long)inf->fee + pri_delta_of(txid);
+    out->fee = modified < 0 ? 0 : (uint64_t)modified;
+    { unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
+      unsigned long long w = g_mpe_vs[k].w;
+      unsigned long long sw = (unsigned long long)inf->sigop_cost * bps;
+      out->weight = sw > w ? sw : w; }
+    for (int i = 0; i < inf->n_depends && out->n_parents < MPC_MAX_CLUSTER; i++)
+        if (mpe_vs_find(inf->depends[i]) >= 0)
+            memcpy(out->parents[out->n_parents++], inf->depends[i], 32);
+    for (int i = 0; i < inf->n_spentby && out->n_children < MPC_MAX_CLUSTER; i++)
+        if (mpe_vs_find(inf->spentby[i]) >= 0)
+            memcpy(out->children[out->n_children++], inf->spentby[i], 32);
+    return 1;
+}
+
+/* The chunk `txid` belongs to in its cluster's linearization: Core's
+ * GetMainChunkFeerate (txgraph), which entryToJSON reports as chunkweight
+ * (sigops-adjusted WEIGHT, not vsize) and fees.chunk (the chunk's summed
+ * MODIFIED fee). 1 with *fee and *weight set, 0 when there is no honest answer.
+ *
+ * Linearization: ancestor-score greedy, then Core's PostLinearize (see
+ * mempool_cluster.h). Core v31.1 searches for the optimum with a
+ * spanning-forest algorithm; the two agree wherever the greedy+post result is
+ * optimal, which PostLinearize guarantees for chains and trees (at most one
+ * parent, or at most one child, per member) and which covers the CPFP, chain
+ * and diamond shapes pinned in the tests. A cluster where they differ is one
+ * where Core found a strictly better chunking than greedy -- the number here
+ * would then be a valid chunking, not Core's. Recorded in
+ * docs/PARITY_RPC_FIELDS.md.
+ *
+ * Under the pool lock (the caller holds it). With the bulk chunk cache the
+ * first member to ask pays for the cluster and every other member reads the
+ * answer: one build per cluster per call. */
+static int mpe_chunk_of(const unsigned char txid[32], unsigned long long* fee,
+                        unsigned long long* weight)
+{
+    int bulk = (g_mpe_chunk && g_mpe_inf && g_mpe_vs);
+    long self_k = bulk ? mpe_vs_find(txid) : -1;
+    if (bulk && self_k >= 0 && g_mpe_chunk[self_k].st){
+        if (g_mpe_chunk[self_k].st < 0) return 0;
+        *fee = g_mpe_chunk[self_k].fee; *weight = g_mpe_chunk[self_k].weight;
+        return 1;
+    }
+    mpc_cluster cl;                   /* ~4 KB + 1.5 KB, as getmempoolcluster */
+    mpc_chunking ch;
+    int lin[MPC_MAX_CLUSTER];
+    g_mpe_cluster_builds++;
+    int ok = mpc_build_cluster(0, (bulk && self_k >= 0) ? mpc_lookup_bulk : mpc_lookup_here,
+                               txid, &cl) == 0
+          && !cl.truncated && cl.n >= 1
+          && mpc_linearize_ancestor_score(&cl, lin) == 0
+          && mpc_post_linearize(&cl, lin) == 0
+          && mpc_chunk_linearization(&cl, lin, &ch) == 0;
+    if (!ok){
+        /* mark what was collected, so a >64 component is not rebuilt by
+         * each of its members in turn */
+        if (bulk){
+            if (self_k >= 0) g_mpe_chunk[self_k].st = -1;
+            for (int m = 0; m < cl.n; m++){ long k2 = mpe_vs_find(cl.txid[m]);
+                if (k2 >= 0 && !g_mpe_chunk[k2].st) g_mpe_chunk[k2].st = -1; }
+        }
+        return 0;
+    }
+    int found = 0;
+    for (int c = 0; c < ch.n; c++){
+        for (int m = 0; m < cl.n; m++){
+            if (!(ch.c[c].members & ((uint64_t)1 << m))) continue;
+            if (!found && !memcmp(cl.txid[m], txid, 32)){
+                *fee = ch.c[c].fee; *weight = ch.c[c].weight; found = 1; }
+            if (bulk){ long k2 = mpe_vs_find(cl.txid[m]);
+                if (k2 >= 0){ g_mpe_chunk[k2].fee = ch.c[c].fee;
+                              g_mpe_chunk[k2].weight = ch.c[c].weight;
+                              g_mpe_chunk[k2].st = 1; } }
+        }
+    }
+    return found;
 }
 
 /* Build one getmempoolentry-shaped object (assumes mp_lock HELD; also the
@@ -1811,44 +1943,29 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
         /* A SINGLETON cluster -- no unconfirmed parents, no unconfirmed
          * children -- is its own chunk, so chunkweight and fees.chunk are
          * determined with no linearization at all. Both counts include the tx
-         * itself, so 1 and 1 is the lone-transaction case. Anything larger
-         * needs Core's cluster linearization, which this node does not
-         * implement: the two keys are then OMITTED rather than approximated. */
+         * itself, so 1 and 1 is the lone-transaction case. */
         if (have_inf && inf.n_anc == 1 && inf.n_desc == 1){
             rj_obj_set(o, "chunkweight", rj_numf("%llu", adjw));
             rj_obj_set(fees, "chunk", rj_numf("%s%lld.%08lld",
                        modified<0?"-":"", am/100000000LL, am%100000000LL));
-        } else if (have_inf && !g_mpe_inf){
-            /* A member of a real cluster: build it, linearize, chunk, and report
-             * the chunk this transaction actually lands in.
+        } else if (have_inf){
+            /* A member of a real cluster: the chunk this transaction lands in
+             * when its cluster is linearized and chunked (mpe_chunk_of).
              *
-             * ONLY on the single-transaction path. g_mpe_inf is set when the
-             * caller is getrawmempool in bulk, and building a cluster per entry
-             * there would be quadratic over the whole pool -- the same shape as
-             * the 33x regression that a per-txid graph walk caused in this file
-             * before it was replaced by one pass. The bulk path therefore still
-             * omits these two fields for cluster members, which is a documented
-             * gap rather than a wrong number. */
-            mpc_cluster cl;
-            if (mpc_build_cluster(0, mpc_lookup_here, txid, &cl) == 0 &&
-                !cl.truncated && cl.n > 1){
-                int lin[MPC_MAX_CLUSTER]; mpc_chunking ch;
-                if (mpc_linearize_ancestor_score(&cl, lin) == 0 &&
-                    (mpc_post_linearize(&cl, lin), 1) &&
-                    mpc_chunk_linearization(&cl, lin, &ch) == 0){
-                    int me = -1;
-                    for (int k = 0; k < cl.n; k++)
-                        if (!memcmp(cl.txid[k], txid, 32)) { me = k; break; }
-                    for (int c = 0; c < ch.n && me >= 0; c++){
-                        if (!(ch.c[c].members & ((uint64_t)1 << me))) continue;
-                        unsigned long long cf = (unsigned long long)ch.c[c].fee;
-                        rj_obj_set(o, "chunkweight",
-                                   rj_numf("%llu", (unsigned long long)ch.c[c].weight));
-                        rj_obj_set(fees, "chunk",
-                                   rj_numf("%llu.%08llu", cf/100000000ULL, cf%100000000ULL));
-                        break;
-                    }
-                }
+             * 2026-09-19: on BOTH paths. Until today this branch ran only for
+             * a single getmempoolentry, and bulk getrawmempool omitted the two
+             * keys for every cluster member -- 71,710 of 79,626 production
+             * entries -- because building a cluster per entry there would have
+             * been quadratic. The bulk call now carries a per-call chunk cache:
+             * the first member of a cluster to be rendered linearizes it and
+             * records the answer for EVERY member, so the whole call costs one
+             * linearization per cluster. The keys are omitted only where no
+             * honest answer exists: a component beyond the 64-transaction
+             * bound, or a graph that does not build. */
+            unsigned long long cf = 0, cw = 0;
+            if (mpe_chunk_of(txid, &cf, &cw)){
+                rj_obj_set(o, "chunkweight", rj_numf("%llu", cw));
+                rj_obj_set(fees, "chunk", mpe_amount(cf));
             }
         } }
       rj_obj_set(o, "fees", fees); }
@@ -3535,12 +3652,18 @@ static int mpc_lookup_here(void* ctx, const unsigned char txid[32], mpc_entry* o
       unsigned long long sw = (unsigned long long)inf.sigop_cost * bps;
       out->weight = sw > w ? sw : w; }
 
-    int np = inf.n_depends > MPC_MAX_CLUSTER ? MPC_MAX_CLUSTER : inf.n_depends;
-    for (int i = 0; i < np; i++) memcpy(out->parents[i], inf.depends[i], 32);
-    out->n_parents = np;
-    int nc = inf.n_spentby > MPC_MAX_CLUSTER ? MPC_MAX_CLUSTER : inf.n_spentby;
-    for (int i = 0; i < nc; i++) memcpy(out->children[i], inf.spentby[i], 32);
-    out->n_children = nc;
+    /* edges filtered to transactions still in the pool, as depends/spentby
+     * are: a stale registry edge would otherwise fail the whole build */
+    for (int i = 0; i < inf.n_depends && out->n_parents < MPC_MAX_CLUSTER; i++){
+        unsigned long l2 = 0;
+        if (g_mph.get(g_mph.mp, inf.depends[i], &l2))
+            memcpy(out->parents[out->n_parents++], inf.depends[i], 32);
+    }
+    for (int i = 0; i < inf.n_spentby && out->n_children < MPC_MAX_CLUSTER; i++){
+        unsigned long l2 = 0;
+        if (g_mph.get(g_mph.mp, inf.spentby[i], &l2))
+            memcpy(out->children[out->n_children++], inf.spentby[i], 32);
+    }
     return 1;
 }
 

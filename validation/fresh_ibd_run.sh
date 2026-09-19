@@ -58,12 +58,19 @@ git -C src fetch -q origin "+refs/heads/*:refs/remotes/origin/*" 2>/dev/null
 git -C src checkout -q --detach "origin/$SRCREF" 2>/dev/null || git -C src checkout -q --detach "$SRCREF" 2>/dev/null
 COMMIT=$(git -C src rev-parse --short HEAD)
 ph "SRC commit=$COMMIT ref=$SRCREF"
-# bmc_cli too: the monitor loop below asks it for the height. Only the daemon
-# was built here, so on a FRESH clone every getblockcount came back empty, the
-# loop's `continue` swallowed it, and the tip and capstone could never fire.
-( cd src/asm && make -j8 daemon/bmcbitcoind daemon/bmc_cli ) > build.log 2>&1 || { ph "FAIL build"; echo FAIL > RESULT; exit 1; }
+# `make runtime`: the daemon, bmc_cli, and every helper the daemon execs from
+# its own directory (asm/Makefile RUNTIME_HELPERS). bmc_cli because the
+# monitor loop below asks it for the height -- only the daemon was built here
+# once, so on a FRESH clone every getblockcount came back empty and the tip
+# and capstone could never fire. The helpers because run 27 built neither
+# them nor the index they make: its log said "builder ... not executable" and
+# its txindex was never folded into a run, for the whole benchmark.
+( cd src/asm && make -j8 runtime ) > build.log 2>&1 || { ph "FAIL build"; echo FAIL > RESULT; exit 1; }
 [ -x src/asm/daemon/bmc_cli ] || { ph "FAIL build: no bmc_cli"; echo FAIL > RESULT; exit 1; }
-ph "BUILD ok"
+HELPERS=$(make -s -C src/asm print-runtime-helpers 2>/dev/null)
+# shellcheck disable=SC2086  # one word per helper, by design
+hc=$(ibd_require_helpers src/asm/daemon $HELPERS) || { ph "FAIL build: $hc"; echo FAIL > RESULT; exit 1; }
+ph "BUILD ok ($hc: $HELPERS)"
 
 mkdir -p data
 cp src/config/bitcoin.sample.conf data/bitcoin.conf 2>/dev/null
@@ -88,6 +95,22 @@ echo $! > daemon.pid; sleep 8
 kill -0 "$(cat daemon.pid)" 2>/dev/null || { ph "FAIL daemon exited at once"; echo FAIL > RESULT; exit 1; }
 ph "DAEMON pid=$(cat daemon.pid) epoch=$T0"
 
+# A missing helper is a benchmark that cannot be compared with Core: the node
+# skips index work Core does. The pre-launch check above covers the build;
+# this covers the daemon's own view (a path it resolves differently, a helper
+# that is present but refuses to run). Watched closely for the first
+# HELPER_WATCH_S seconds, then on every monitor tick below. On a hit the run
+# is over: the daemon is stopped and the line that proved it is in phase.log.
+HELPER_WATCH_S=${HELPER_WATCH_S:-900}
+helper_fail(){ ph "FAIL helper missing: $1"; kill -TERM "$(cat daemon.pid)" 2>/dev/null; echo FAIL > RESULT; exit 1; }
+w=0
+while [ "$w" -lt "$HELPER_WATCH_S" ]; do
+    mh=$(ibd_missing_helper "$(ibd_daemon_log "$DEST/data")") && helper_fail "$mh"
+    kill -0 "$(cat daemon.pid)" 2>/dev/null || { ph "FAIL daemon exited during the first $w s"; echo FAIL > RESULT; exit 1; }
+    sleep 15; w=$((w+15))
+done
+ph "HELPERS no missing-helper line in the first ${HELPER_WATCH_S}s"
+
 # -rpcclienttimeout=0 (wait forever): gettxoutsetinfo walks the whole UTXO set
 # and blows past the 900s default on a mainnet-sized node.
 CLI="src/asm/daemon/bmc_cli -rpcport=$RPC -datadir=$DEST/data -rpcclienttimeout=0"
@@ -101,6 +124,7 @@ while :; do
     LOG=data/main/debug.log
     hb=$(ibd_heartbeat "$LOG")
     bad=$(ibd_bad_markers "$LOG")
+    mh=$(ibd_missing_helper "$LOG") && helper_fail "$mh"
     du=$(du -sh data 2>/dev/null | cut -f1)
     idle=$(ibd_occupancy "$LOG")
     echo "$(ts) hb='$hb' disk=$du ${idle:+$idle} bad=$bad" >> "$PROG"

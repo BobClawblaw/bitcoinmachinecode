@@ -14,6 +14,14 @@
  * blocks and the easiest one to get wrong.
  *
  *   zmq_pub_drill <addr> <seconds>
+ *   zmq_pub_drill <addr> <seconds> queue
+ *
+ * The `queue` mode is the production shape for tests/zmq_queue_interop.py
+ * (MEM-22): the servicing thread runs, and every 250 ms it publishes a
+ * hashblock, a 2 MB rawblock and a burst of 200 rawtx -- so a subscriber that
+ * stops reading overruns the 1000-message high-water mark within seconds.
+ * rawblock body: byte j = (j*7 + 3) & 0xff, then bytes 0-3 overwritten with
+ * the block's index (u32 LE).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,11 +41,51 @@ int main(int argc, char** argv){
     const char* addr = argv[1];
     double secs = atof(argv[2]);
 
+    /* queue mode configures the high-water marks exactly as the daemon does
+     * (node_config's default 1000 per topic, set before the first
+     * subscriber), so the drill reproduces production rather than a
+     * publisher nobody runs */
+    if (argc > 3 && !strcmp(argv[3], "queue")){
+        extern void zmq_pub_set_hwm(const int*);
+        static const int hwm[5] = { 1000, 1000, 1000, 1000, 1000 };
+        zmq_pub_set_hwm(hwm);
+    }
     if (!zmqpub_add("hashblock", addr) || !zmqpub_add("hashtx", addr) ||
         !zmqpub_add("rawblock", addr)  || !zmqpub_add("rawtx", addr)){
         fprintf(stderr, "drill: bind failed\n"); return 1;
     }
     if (!zmqpub_active()){ fprintf(stderr, "drill: publisher inactive\n"); return 1; }
+
+    if (argc > 3 && !strcmp(argv[3], "queue")){
+        extern int zmqpub_start(void);
+        if (!zmqpub_start()){ fprintf(stderr, "drill: no servicing thread\n"); return 1; }
+        static unsigned char blk[2 * 1024 * 1024];
+        for (int j = 0; j < (int)sizeof blk; j++) blk[j] = (unsigned char)(j * 7 + 3);
+        unsigned char tx[300];
+        struct timespec q0; clock_gettime(CLOCK_MONOTONIC, &q0);
+        struct timespec gs = {1, 0}; nanosleep(&gs, NULL);   /* subscribers attach */
+        double worst = 0;
+        for (unsigned idx = 0;; idx++){
+            struct timespec now; clock_gettime(CLOCK_MONOTONIC, &now);
+            if ((double)(now.tv_sec - q0.tv_sec) > secs) break;
+            for (int i = 0; i < 4; i++) blk[i] = (unsigned char)(idx >> (8 * i));
+            unsigned char h[32]; memset(h, (int)idx, 32);
+            struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+            zmqpub_notify("hashblock", h, 32);
+            zmqpub_notify("rawblock", blk, sizeof blk);
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            double ms = (double)(b.tv_sec - a.tv_sec) * 1e3 + (double)(b.tv_nsec - a.tv_nsec) / 1e6;
+            if (ms > worst) worst = ms;
+            for (int k = 0; k < 200; k++){
+                memset(tx, k, sizeof tx); tx[0] = (unsigned char)idx;
+                zmqpub_notify("rawtx", tx, sizeof tx);
+            }
+            struct timespec sl = {0, 250*1000*1000};
+            nanosleep(&sl, NULL);
+        }
+        fprintf(stderr, "drill: worst hashblock+2MB rawblock publish %.3f ms\n", worst);
+        return 0;
+    }
 
     unsigned char hash[32];
     for (int i = 0; i < 32; i++) hash[i] = (unsigned char)i;
