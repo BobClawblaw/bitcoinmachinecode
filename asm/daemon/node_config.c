@@ -1029,25 +1029,24 @@ long node_config_load(const char* path){
         else if(!strcmp(key,"zmqpubrawblock")) { snprintf(g_cfg.zmq_rawblock, sizeof g_cfg.zmq_rawblock, "%s",val); applied++; }
         else if(!strcmp(key,"zmqpubrawtx"))    { snprintf(g_cfg.zmq_rawtx,    sizeof g_cfg.zmq_rawtx,    "%s",val); applied++; }
         else if(!strcmp(key,"zmqpubsequence")){
-            /* REFUSED, deliberately, and this is not laziness.
+            /* Core's `sequence` topic: A(dd)/R(emove) with the mempool
+             * sequence number, C(onnect)/D(isconnect) per block, so a
+             * subscriber can track mempool membership EXACTLY.
              *
-             * Core's `sequence` topic exists so a subscriber can track mempool
-             * membership EXACTLY: it carries A(dd) and R(emove) alongside
-             * C(onnect)/D(isconnect). This node has one clean choke point for
-             * "accepted" but no single one for "removed" -- eviction, expiry
-             * and reorg each call mpool_del independently.
-             *
-             * Publishing A without R would be worse than publishing nothing:
-             * a subscriber's model of the mempool would grow and never shrink,
-             * and it would have no way to know. So the topic refuses, loudly,
-             * instead of emitting a stream that quietly lies. */
-            fprintf(stderr,"[config] zmqpubsequence is NOT supported: this node has no single "
-                           "mempool-removal choke point, so it could publish adds but not "
-                           "removes -- a subscriber tracking membership from that would drift "
-                           "silently. Use zmqpubrawtx/zmqpubhashtx for arrivals.\n");
-            bad++; }
+             * This was REFUSED until 2026-09-19, and rightly: the node then had
+             * one choke point for "accepted" but none for "removed" (reorg
+             * emptied the pool with raw mpool_del), and publishing A without R
+             * would have let a subscriber's model grow and never shrink. What
+             * changed: every insert is mpool_policy_add's and every removal is
+             * the policy layer's remove_node/mpol_remove_marked, which carry
+             * one hook (bitcoin_mempool_policy.c g_seq_cb); the reorg rebuild
+             * suppresses that hook and publishes its NET difference instead
+             * (daemon/reorg.c). The counter and the event ring are MAP_SHARED
+             * and written under the pool lock from whichever process mutated
+             * the pool; the worker publishes (daemon/mempool_seq.h). */
+            snprintf(g_cfg.zmq_sequence, sizeof g_cfg.zmq_sequence, "%s", val); applied++; }
         else if(!strncmp(key,"zmqpub",6)){
-            fprintf(stderr,"[config] unknown ZMQ topic '%s' (have: hashblock, hashtx, rawblock, rawtx)\n", key);
+            fprintf(stderr,"[config] unknown ZMQ topic '%s' (have: hashblock, hashtx, rawblock, rawtx, sequence)\n", key);
             bad++; }
         else if(!strcmp(key,"blocksonly")){
             /* Core: do not participate in tx relay. We honour it by setting

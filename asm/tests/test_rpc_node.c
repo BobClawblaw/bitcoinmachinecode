@@ -192,6 +192,14 @@ static int fails = 0;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
 static const char* S(const rj_val* o, const char* k){ rj_val* v = o ? rj_obj_get(o,k) : 0; return v ? v->str : 0; }
 
+/* getrawmempool mempool_sequence: the value must be read INSIDE the pool lock
+ * that covers the txid walk, or the pair is not one snapshot. The fake lock
+ * records whether it is held when the sequence is asked for. */
+static int g_fk_locked = 0, g_fk_seq_under_lock = -1;
+static void fk_lock(void){ g_fk_locked = 1; }
+static void fk_unlock(void){ g_fk_locked = 0; }
+static unsigned long long fk_seq(void){ g_fk_seq_under_lock = g_fk_locked; return 42; }
+
 int main(void){
     /* static: node_status_t now carries the 4MB submitblock channel buffer,
      * far too large for the stack. */
@@ -437,6 +445,32 @@ int main(void){
       r = NULL; rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
       ck("getrawmempool true -> empty object", r && r->typ == RJ_OBJ && r->nmembers == 0);
       rj_free(r); rj_free(pv); }
+    /* mempool_sequence (Core MempoolToJSON), measured against v31.1:
+     *   getrawmempool false true -> {"txids":[...],"mempool_sequence":n}
+     *   getrawmempool true true  -> -8 "Verbose results cannot contain
+     *                               mempool sequence values."
+     * With no pool injected the counter is Core's initial value, 1. */
+    { rj_val* pv = rj_parse("[false,true]", 12);
+      r = NULL; int rc2 = rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+      rj_val* ids = r ? rj_obj_get(r, "txids") : 0;
+      ck("getrawmempool false true -> {txids, mempool_sequence}",
+         rc2 == 1 && r && r->typ == RJ_OBJ && ids && ids->typ == RJ_ARR && ids->nitems == 0 &&
+         S(r, "mempool_sequence") && !strcmp(S(r, "mempool_sequence"), "1"));
+      rj_free(r); rj_free(pv); }
+    { rj_val* pv = rj_parse("[true,true]", 11);
+      r = NULL; ec = 0; em = NULL; int rc2 = rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+      ck("getrawmempool true true -> -8, Core's message verbatim",
+         rc2 == 0 && ec == -8 && em && !strcmp(em, "Verbose results cannot contain mempool sequence values."));
+      rj_free(r); rj_free(pv); }
+    { rj_val* pv = rj_parse("[false,1]", 9);
+      r = NULL; ec = 0; em = NULL; int rc2 = rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+      ck("getrawmempool false 1 -> -3 naming Position 2 (mempool_sequence)",
+         rc2 == 0 && ec == -3 && em && strstr(em, "Position 2 (mempool_sequence)") && strstr(em, "expected type bool"));
+      rj_free(r); rj_free(pv); }
+    { rj_val* pv = rj_parse("[false,false]", 13);
+      r = NULL; rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+      ck("getrawmempool false false -> the plain array", r && r->typ == RJ_ARR);
+      rj_free(r); rj_free(pv); }
 
     /* ---- injected SHARED mempool (2026-08-25 coherence slice): the daemon
      * hands the pre-fork MAP_SHARED pool to this layer via
@@ -473,6 +507,7 @@ int main(void){
       ck("test pool: put segwit", mpool_put(pool, wid, wtx, wln) == 1);
       { rpc_mempool_hooks h; memset(&h,0,sizeof h);
         h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
+        h.lock = fk_lock; h.unlock = fk_unlock; h.mempool_sequence = fk_seq;
         rpc_node_set_mempool(&h); }
 
       /* ---- gettxspendingprevout (Core lists it under Blockchain; the pool
@@ -557,6 +592,15 @@ int main(void){
       }
       ck("shared pool: both txids present (display order)", saw_l && saw_w);
       rj_free(r);
+      { rj_val* pv = rj_parse("[false,true]", 12);
+        r = NULL; g_fk_seq_under_lock = -1;
+        rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
+        rj_val* ids = r ? rj_obj_get(r, "txids") : 0;
+        ck("shared pool: mempool_sequence=true wraps the same 2 txids",
+           r && r->typ == RJ_OBJ && ids && ids->typ == RJ_ARR && ids->nitems == 2);
+        ck("shared pool: ...with the hook's value", S(r, "mempool_sequence") && !strcmp(S(r, "mempool_sequence"), "42"));
+        ck("shared pool: ...read INSIDE the lock that covered the txid walk", g_fk_seq_under_lock == 1);
+        rj_free(r); rj_free(pv); }
 
       { rj_val* pv = rj_parse("[true]", 6);
         r = NULL; rpc_node_dispatch("getrawmempool", pv, &r, &ec, &em);
@@ -1677,6 +1721,27 @@ int main(void){
           ck("pubrawtx hwm = configured 0",       h2 && h2->str && !strcmp(h2->str, "0"));
       }
       rj_free(r);
+      rpc_node_set_zmq_hwm(NULL);
+      rpc_node_set_zmq(NULL, NULL, NULL, NULL); }
+
+    /* -zmqpubsequence (2026-09-19; refused before): listed LAST, as Core's
+     * factory map orders its notifiers by name, with its own hwm */
+    { static const int hwm5[5] = { 250, 1000, 7, 0, 33 };
+      rpc_node_set_zmq_hwm(hwm5);
+      rpc_node_set_zmq("tcp://127.0.0.1:28332", NULL, NULL, NULL);
+      rpc_node_set_zmq_sequence("tcp://127.0.0.1:28334");
+      r = NULL; rc = rpc_node_dispatch("getzmqnotifications", NULL, &r, &ec, &em);
+      ck("getzmqnotifications with sequence -> 2 entries", rc == 1 && r && r->nitems == 2);
+      if (r && r->nitems == 2){
+          rj_val* t1 = rj_obj_get(r->items[1], "type");
+          rj_val* a1 = rj_obj_get(r->items[1], "address");
+          rj_val* h1 = rj_obj_get(r->items[1], "hwm");
+          ck("pubsequence is listed last, at its address",
+             t1 && !strcmp(t1->str, "pubsequence") && a1 && !strcmp(a1->str, "tcp://127.0.0.1:28334"));
+          ck("pubsequence hwm = configured -zmqpubsequencehwm (33)", h1 && h1->str && !strcmp(h1->str, "33"));
+      }
+      rj_free(r);
+      rpc_node_set_zmq_sequence(NULL);
       rpc_node_set_zmq_hwm(NULL);
       rpc_node_set_zmq(NULL, NULL, NULL, NULL); }
 

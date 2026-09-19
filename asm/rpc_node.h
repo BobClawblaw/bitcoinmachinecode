@@ -529,6 +529,12 @@ typedef struct {
     unsigned long long (*bytespersigop)(void);
     void*     feeest;         /* shared fee estimator (daemon/fee_estimator.c); NULL = none */
     unsigned long long min_relay_satkvb;    /* -minrelaytxfee, sat/kvB (estimatesmartfee floor) */
+    /* Core CTxMemPool::GetSequence(): the mempool sequence number the ZMQ
+     * `sequence` topic numbers its 'A'/'R' events with, for getrawmempool's
+     * mempool_sequence (daemon/mempool_seq.h). Called under `lock`, together
+     * with the txid walk, so the pair is one consistent snapshot. NULL = the
+     * initial value, 1 (no pool has ever changed). */
+    unsigned long long (*mempool_sequence)(void);
 } rpc_mempool_hooks;
 void rpc_node_set_mempool(const rpc_mempool_hooks* h);
 
@@ -561,6 +567,11 @@ void rpc_node_set_zmq(const char* hashblock, const char* hashtx,
  * (node_config's g_cfg.zmq_hwm, a long-lived global: BORROWED). NULL reports
  * Core's default, 1000. */
 void rpc_node_set_zmq_hwm(const int* hwm4);
+/* The fifth topic, -zmqpubsequence (BORROWED like the others). Its hwm is
+ * element [4] of the array above, which is read ONLY when this endpoint is
+ * set -- so callers that pass a four-element array and no sequence endpoint
+ * stay in bounds. */
+void rpc_node_set_zmq_sequence(const char* sequence);
 
 /* 1 if `method` is a live-node method this module serves. */
 int rpc_node_known_method(const char* method);

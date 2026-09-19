@@ -16,9 +16,12 @@
 #include <stdio.h>
 #include "log_ts.h"   /* timestamped fprintf(stderr), like every other daemon line */
 #include "../rpc_node.h"
+#include "mempool_seq.h"
 
 extern void zmqpub_notify(const char* topic, const void* body, unsigned long blen);
 extern int  zmqpub_active(void);
+extern int  zmqpub_topic_active(const char* topic);
+extern void zmqpub_skip(const char* topic, unsigned long n);
 
 static node_status_t* g_zn_status = 0;
 static unsigned long long g_zn_cursor = 0;   /* consumer position (worker only) */
@@ -46,10 +49,62 @@ void zmqn_tx_accepted(const unsigned char txid[32], const unsigned char* tx,
     st->zmq_ring[k].ready = seq + 1;
 }
 
+/* ---- the `sequence` topic (Core -zmqpubsequence) ---------------------------
+ * The events are staged by the mempool itself, in daemon/mempool_cfg.c's
+ * shared ring (mempool_seq.h has the why), under the pool lock and in the
+ * order the pool changed. This is the consumer: download worker only, one
+ * cursor, publishing Core's body -- the hash in DISPLAY order (Core's
+ * SendSequenceMsg reverses it like every other hash topic), the label, and
+ * for 'A'/'R' the 8-byte little-endian mempool sequence.
+ *
+ * mpseq_area is WEAK: several test binaries link this file without the
+ * mempool, and then there is simply nothing to drain. */
+extern mpseq_area_t* mpseq_area(void) __attribute__((weak));
+static unsigned long long g_zs_cursor = 0;
+int zmqn_drain_sequence(void){
+    mpseq_area_t* a = mpseq_area ? mpseq_area() : 0;
+    if (!a) return 0;
+    unsigned long long head = __atomic_load_n(&a->head, __ATOMIC_ACQUIRE);
+    if (head == g_zs_cursor) return 0;
+    /* nobody publishes the topic: keep up, build nothing */
+    if (!zmqpub_active() || !zmqpub_topic_active("sequence")){ g_zs_cursor = head; return 0; }
+    if (head - g_zs_cursor > MPSEQ_RING){
+        unsigned long long lost = head - g_zs_cursor - MPSEQ_RING;
+        a->lost += lost;
+        zmqpub_skip("sequence", (unsigned long)lost);   /* the gap a subscriber can see */
+        { static long last; long now = (long)time(NULL);
+          if (now - last >= 60){
+              fprintf(stderr, "[zmq] sequence ring overrun: %llu event(s) not published (total %llu); "
+                              "subscribers see the gap in the topic sequence\n", lost, a->lost);
+              last = now; } }
+        g_zs_cursor = head - MPSEQ_RING;
+    }
+    int n = 0;
+    while (g_zs_cursor < head){
+        const mpseq_ev* e = &a->ev[g_zs_cursor % MPSEQ_RING];
+        if (__atomic_load_n(&e->ready, __ATOMIC_ACQUIRE) != g_zs_cursor + 1) break;  /* mid-write: next time */
+        unsigned char body[41];
+        for (int b = 0; b < 32; b++) body[b] = e->hash[31 - b];
+        body[32] = e->label;
+        unsigned long blen = 33;
+        if (e->label == 'A' || e->label == 'R'){
+            for (int b = 0; b < 8; b++) body[33 + b] = (unsigned char)(e->mseq >> (8 * b));
+            blen = 41;
+        }
+        /* the slot may have been lapped while it was read: publish only what
+         * was still this slot's event after the copy */
+        if (__atomic_load_n(&e->ready, __ATOMIC_ACQUIRE) != g_zs_cursor + 1) continue;
+        zmqpub_notify("sequence", body, blen);
+        g_zs_cursor++; n++;
+    }
+    return n;
+}
+
 /* CONSUMER -- download worker only. Drains everything staged since the last
  * call and publishes hashtx/rawtx for each. Returns the number published. */
 int zmqn_drain(void){
     node_status_t* st = g_zn_status;
+    zmqn_drain_sequence();
     if (!st || !zmqpub_active()) return 0;
     unsigned long long head = st->zmq_seq;
     if (head == g_zn_cursor) return 0;

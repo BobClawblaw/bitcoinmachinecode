@@ -26,6 +26,7 @@
 #include <sys/mman.h>
 #include "node_config.h"
 #include "mempool_journal.h"
+#include "mempool_seq.h"
 
 extern unsigned long mpool_struct_size(unsigned long slots);
 extern void mpool_init(void* mp, unsigned long slots, void* blob, unsigned long blob_cap);
@@ -180,6 +181,9 @@ static void mempool_forget(const unsigned char txid[32]);
  * because mpool indexes with a mask. Returns 1 if a region was published. */
 unsigned long mp_ext_blob_cap = 0;   /* the published byte budget (tests; getmempoolinfo reads the pool's own) */
 int mempool_configure(void){
+    /* The sequence area first, and unconditionally: 'C'/'D' and the counter
+     * getrawmempool reports exist whatever the pool is sized to. */
+    mempool_seq_configure();
     long mb = g_cfg.maxmempool_mb;
     if(mb <= 0) return 0;                       /* 0 == keep the asm statics */
 
@@ -558,4 +562,78 @@ long mempool_expire_now(void){
         fprintf(stderr,"[mempool] expired %ld tx older than %ldh incl. descendants (%ld remain)\n",
                 removed, hours, mpool_count(g_mp_area));
     return removed;
+}
+
+/* ---- the mempool sequence (Core m_sequence_number) and the ZMQ `sequence`
+ * event ring. The why is in mempool_seq.h; what is here is the mechanics.
+ *
+ * WRITERS: mempool_seq_note (the policy layer's hook: every accept and every
+ * removal, from whichever process mutated the pool, under mp_lock),
+ * mempool_seq_emit (the reorg reconcile's net difference, under mp_lock),
+ * mempool_seq_block[_locked] (block connect in tx_accept.c / main.c, block
+ * disconnect in reorg.c). READERS: the download worker's zmqn_drain (the
+ * ring) and getrawmempool's mempool_sequence through rpc_mempool_hooks (the
+ * counter). */
+extern void mpool_policy_set_seq_cb(void (*fn)(const unsigned char*, int));
+static mpseq_area_t* g_seq = 0;
+/* per PROCESS, and that is enough: only the worker's reorg reconcile sets it,
+ * and it does so while holding mp_lock, so no other process can mutate the
+ * pool -- and so reach the hook -- while it is set */
+static int g_seq_hold = 0;
+
+mpseq_area_t* mpseq_area(void){ return g_seq; }
+
+int mempool_seq_configure(void){
+    if (g_seq) return 1;
+    void* a = mmap(0, sizeof(mpseq_area_t), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    if (a == MAP_FAILED){
+        fprintf(stderr, "[mempool] sequence area unavailable (%zu bytes): the ZMQ sequence topic "
+                        "and getrawmempool's mempool_sequence will not advance\n", sizeof(mpseq_area_t));
+        return 0;
+    }
+    g_seq = (mpseq_area_t*)a;       /* anonymous mappings arrive zeroed */
+    g_seq->next = 1;                /* Core: m_sequence_number{1} */
+    mpool_policy_set_seq_cb(mempool_seq_note);
+    return 1;
+}
+
+unsigned long long mempool_sequence(void){
+    return g_seq ? __atomic_load_n(&g_seq->next, __ATOMIC_ACQUIRE) : 1;
+}
+
+void mempool_seq_hold(int on){ g_seq_hold = on ? 1 : 0; }
+
+static void mpseq_push(const unsigned char hash[32], int label, unsigned long long mseq){
+    unsigned long long slot = __atomic_fetch_add(&g_seq->head, 1ULL, __ATOMIC_ACQ_REL);
+    mpseq_ev* e = &g_seq->ev[slot % MPSEQ_RING];
+    /* a reader lapped onto this slot must not take it while it is refilled */
+    __atomic_store_n(&e->ready, 0ULL, __ATOMIC_RELEASE);
+    memcpy(e->hash, hash, 32);
+    e->label = (unsigned char)label;
+    e->mseq  = mseq;
+    __atomic_store_n(&e->ready, slot + 1, __ATOMIC_RELEASE);   /* fill BEFORE announcing */
+}
+
+void mempool_seq_emit(const unsigned char txid[32], int kind){
+    if (!g_seq || !txid) return;
+    /* Every add and every removal takes a number -- a BLOCK removal ('M')
+     * too, which is the one kind Core does not publish (removeUnchecked). */
+    unsigned long long mseq = __atomic_fetch_add(&g_seq->next, 1ULL, __ATOMIC_ACQ_REL);
+    if (kind == 'A' || kind == 'R') mpseq_push(txid, kind, mseq);
+}
+
+void mempool_seq_note(const unsigned char txid[32], int kind){
+    if (g_seq_hold) return;
+    mempool_seq_emit(txid, kind);
+}
+
+void mempool_seq_block_locked(const unsigned char hash[32], int label){
+    if (!g_seq || !hash || (label != 'C' && label != 'D')) return;
+    mpseq_push(hash, label, 0);
+}
+
+void mempool_seq_block(const unsigned char hash[32], int label){
+    mp_lock();
+    mempool_seq_block_locked(hash, label);
+    mp_unlock();
 }

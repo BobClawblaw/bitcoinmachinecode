@@ -69,6 +69,7 @@ static void mempool_refresh_seqlocks(void* store_buf, long now_tip);
 #include "torcontrol.h"  /* inbound: our own onion service */
 #include "asmap.h"       /* -asmap: AS-level address bucketing */
 #include "node_config.h"
+#include "mempool_seq.h"  /* -zmqpubsequence: the mempool sequence + its event ring */
 #include "archive_reindex.h" /* durable, file-backed tuning (bitcoin.conf) */
 #include "netperm.h"   /* -whitelist peer permissions */
 #include "subnet.h"    /* one CIDR matcher, shared with the ban list */
@@ -7275,11 +7276,22 @@ static void dl_new_block_choke(void){
                   /* fee estimation's "chainstate is current": this block's time */
                   { unsigned int bt; memcpy(&bt, zb + 68, 4); tx_accept_set_tip_time((long)bt, -1); }
                   if (txsub_worker_ready() && mp_ext_area){
+                      /* stages the ZMQ sequence topic's 'C' under the pool
+                       * lock, after the block's own removals */
                       long mr = tx_accept_block_connect_h(mp_ext_area, zb, (unsigned long)bl, (long)zh);
                       if (mr > 0)
                           fprintf(stderr,"[mempool] block %d: removed %ld pool tx (confirmed/conflicted)\n", zh, mr);
+                  } else {
+                      /* no pool to reconcile, but the block WAS connected:
+                       * Core's BlockConnected fires regardless */
+                      unsigned char cbh[32]; sha256d(cbh, zb, 80);
+                      mempool_seq_block(cbh, 'C');
                   } }
                 if (!zmqpub_active()) continue;
+                /* Publish what this block staged (the sequence topic's 'R's
+                 * and 'C') now, not at the end of a catch-up burst: a burst
+                 * of thousands of blocks would otherwise lap the ring. */
+                zmqn_drain();
                 /* The block HASH is sha256d over the 80-byte
                  * header, REVERSED: Core's notifier flips the bytes
                  * (data[31-i] = hash.begin()[i]) so the hashblock
@@ -7341,6 +7353,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     if (g_cfg.zmq_hashtx[0])    zmqpub_add("hashtx",    g_cfg.zmq_hashtx);
     if (g_cfg.zmq_rawblock[0])  zmqpub_add("rawblock",  g_cfg.zmq_rawblock);
     if (g_cfg.zmq_rawtx[0])     zmqpub_add("rawtx",     g_cfg.zmq_rawtx);
+    if (g_cfg.zmq_sequence[0])  zmqpub_add("sequence",  g_cfg.zmq_sequence);
     /* Subscriber servicing runs on its own thread from here on, so no hot
      * loop in this worker ever walks the subscriber list (audit finding 8).
      * Non-fatal: if the thread cannot start, publishing still works and the
@@ -9404,6 +9417,7 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
           .sha256d = (void(*)(unsigned char*, const void*, unsigned long))sha256d,
           .min_fee = mpool_policy_min_fee,
           .bytespersigop = mpool_policy_bytespersigop,
+          .mempool_sequence = mempool_sequence,     /* getrawmempool mempool_sequence (mempool_seq.h) */
           .feeest = mp_ext_feeest,
           .min_relay_satkvb = g_cfg.minrelaytxfee_satkvb > 0 ? (unsigned long long)g_cfg.minrelaytxfee_satkvb : 100ULL };
       rpc_node_set_mempool(&h);
@@ -9476,6 +9490,7 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
     rpc_node_set_zmq(g_cfg.zmq_hashblock, g_cfg.zmq_hashtx,
                      g_cfg.zmq_rawblock, g_cfg.zmq_rawtx);
     rpc_node_set_zmq_hwm(g_cfg.zmq_hwm);
+    rpc_node_set_zmq_sequence(g_cfg.zmq_sequence);
     /* getblockfilter reads spent-prevout scripts from undo_<h>.dat */
     { extern long undo_replay(long, int (*)(void*, const unsigned char*, unsigned int,
                                             unsigned long long, unsigned int, unsigned char,

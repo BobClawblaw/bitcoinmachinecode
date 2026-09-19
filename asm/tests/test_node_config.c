@@ -637,6 +637,18 @@ int main(void){
       else { printf("FAIL: values not applied (rawblock=%s rawtxhwm=%d bfi=%d)\n",
                     g_cfg.zmq_rawblock, g_cfg.zmq_hwm[3], g_cfg.blockfilterindex); failures++; } }
 
+    /* -zmqpubsequence: REFUSED until 2026-09-19 (the node could publish adds
+     * but not removals); now a topic like the other four, with its hwm. */
+    { node_config_load("/nonexistent/reset.conf");
+      wr("zmqseq.conf",
+         "zmqpubsequence=tcp://127.0.0.1:28334\n"
+         "zmqpubsequencehwm=77\n");
+      node_config_load("zmqseq.conf");
+      if (!strcmp(g_cfg.zmq_sequence, "tcp://127.0.0.1:28334") && g_cfg.zmq_hwm[4] == 77)
+          printf("PASS: zmqpubsequence is accepted and applied, with its hwm\n");
+      else { printf("FAIL: zmqpubsequence not applied (address '%s', hwm %d)\n",
+                    g_cfg.zmq_sequence, g_cfg.zmq_hwm[4]); failures++; } }
+
     printf("\n");
     node_config_log();
     if (failures) printf("\nFAILURES: %d\n", failures);

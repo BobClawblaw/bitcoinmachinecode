@@ -1543,8 +1543,8 @@ that served BIP157 before this change must now set it explicitly.
 | `zmqpubrawblockhwm` | Set publish raw block outbound message high water mark (default: 1000) | implemented |
 | `zmqpubrawtx` | Enable publish raw transaction in <address> | implemented |
 | `zmqpubrawtxhwm` | Set publish raw transaction outbound message high water mark (default: 1000) | implemented |
-| `zmqpubsequence` | Enable publish hash block and tx sequence in <address> | **REFUSED** (MEM-22, 2026-09-05: this said "implemented"; `node_config.c:950` rejects the option outright, and `zmq_pub.c` never publishes the topic. See the refusal's own comment for why: Core's `sequence` carries A/R alongside C/D, and this node has no single choke point for "removed" -- eviction, expiry and reorg each call `mpool_del` independently.) |
-| `zmqpubsequencehwm` | Set publish hash sequence message high water mark (default: 1000) | parsed, but inert -- the topic it sizes is refused (MEM-22) |
+| `zmqpubsequence` | Enable publish hash block and tx sequence in <address> | implemented (2026-09-19; REFUSED from 2026-09-05 until then, because removals had no single choke point). A/R with Core's mempool sequence, C/D per block, from one hook in the policy layer (`bitcoin_mempool_policy.c` g_seq_cb) staged into a MAP_SHARED ring under the pool lock (`daemon/mempool_seq.h`) and published by the worker. getrawmempool's `mempool_sequence` argument and REST `?mempool_sequence=true` answer from the same counter. Regtest differential against v31.1 (`validation/zmq_sequence_core_diff.py`): add, RBF, conflict-in-block, invalidate, reconsider and a one-step reorg identical event for event, sequence numbers included. Divergences: `docs/CORE_DIVERGENCES.md` ("ZMQ `sequence`"). |
+| `zmqpubsequencehwm` | Set publish hash sequence message high water mark (default: 1000) | implemented (sizes the `sequence` topic's per-subscriber queue, as for the other four) |
 ## Update 2026-09-01 — Miniscript and `musig()` descriptors
 
 Closed: **Miniscript** (`asm/miniscript.c/.h`, Core's `script/miniscript.h`
