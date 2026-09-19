@@ -1420,6 +1420,13 @@ int log_sink_open(const char* path, int printtoconsole){
     if(p < 0){ close(pfd[0]); close(pfd[1]); close(console); close(fd); return 0; }
     if(p == 0){                                                 /* the pump: copies every byte to file and console, exits on EOF */
         close(pfd[1]); close(2);
+        /* Keep only the three descriptors it pumps between. It is forked
+         * after the datadir lock is taken, and it lives until the LAST
+         * writer of fd 2 has gone -- the serve parent included, which now
+         * waits for every holder of that lock before it exits (main.c,
+         * 2026-09-19). Holding it here was a wait that could never end. */
+        { long maxfd = sysconf(_SC_OPEN_MAX); if(maxfd < 0 || maxfd > 65536) maxfd = 65536;
+          for(long k = 3; k < maxfd; k++) if(k != pfd[0] && k != fd && k != console) close((int)k); }
         char buf[8192]; ssize_t n;
         while((n = read(pfd[0], buf, sizeof buf)) > 0){
             ssize_t o = 0; while(o < n){ ssize_t w = write(fd, buf + o, (size_t)(n - o)); if(w <= 0) break; o += w; }
