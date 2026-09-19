@@ -1233,6 +1233,13 @@ Confirmed absent:
   `getzmqnotifications` dispatched. Core only exposes that method when built
   WITH zmq, which the census Core was not — so this is one method BEYOND the
   surface the census measured.
+  **2026-09-19 (MEM-22 closed):** until then a subscriber that could not take
+  a whole message was disconnected, and a 1-2 MB rawblock never fit the
+  ~256 KB socket buffer, so rawblock reached no one and every block dropped
+  every subscriber. The publisher now keeps a per-subscriber queue bounded
+  by `-zmqpub<topic>hwm` in MESSAGES and drops the new message (sequence gap,
+  connection kept) as libzmq does; one stated extra, a 512 MiB per-subscriber
+  byte ceiling — see `docs/CORE_DIVERGENCES.md`.
 - ~~**REST interface** (separate from JSON-RPC)~~ — **implemented 2026-09-08** (`rest=1`, `asm/rest.c`).
 - **UPnP / NAT-PMP** automatic port forwarding — zero hits.
 - ~~Addr self-advertisement~~ — **DONE 2026-08-26** (`daemon/addr_self.c`):

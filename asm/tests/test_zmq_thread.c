@@ -3,10 +3,11 @@
  *
  * The thread is the fix; the race is what it costs. The servicing thread
  * accepts subscribers and COMPACTS the array when they drop, while the
- * publishing thread walks that same array and closes subscribers whose send
- * fails. Unsynchronised, compaction moves entries out from under a walk in
- * progress and both sides can close the same descriptor -- which, once the
- * number is reused, means writing block data into an unrelated socket.
+ * publishing thread walks that same array appending to each subscriber's
+ * queue (2026-09-19; it used to write the sockets itself and close the ones
+ * that could not keep up). Unsynchronised, compaction moves entries out from
+ * under a walk in progress and a freed queue can be appended to -- or a
+ * closed descriptor's reused number written to.
  *
  * So this test does not check that publishing works (test_zmq_ring does). It
  * hammers both sides at once, under ASan/TSan when available, and checks that

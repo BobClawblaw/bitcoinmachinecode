@@ -827,19 +827,21 @@ void rpc_node_set_addednodes(const char (*list)[64], int n){
  * Core's answer is [{type:"pubhashtx", address, hwm}, ...], one entry per
  * CONFIGURED topic, in Core's own fixed order.
  *
- * hwm is reported as 0, and that is a statement, not a shrug: Core's field
- * is libzmq's send high-water mark (default 1000 queued messages). This
- * publisher has no such queue -- the kernel socket buffer is the only
- * buffering, and a subscriber that falls behind it is dropped (see
- * zmq_pub.c). 0 is ZMQ's own encoding of "no limit set here", which is the
- * closest true description of that behaviour. */
+ * hwm is each topic's CONFIGURED -zmqpub<topic>hwm, as Core prints it
+ * (zmqrpc.cpp: n->GetOutboundMessageHighWaterMark(), the notifier's own
+ * value). Since 2026-09-19 it is a real limit here, in Core's unit: the
+ * publisher queues at most that many MESSAGES per subscriber and drops new
+ * ones past it (zmq_pub.c). It used to be reported as 0 because there was no
+ * queue. Default 1000, Core's DEFAULT_ZMQ_SNDHWM, when nothing is injected. */
 static const char* g_zmq_ep[4];   /* hashblock, hashtx, rawblock, rawtx */
+static const int*  g_zmq_hwm;     /* same order; BORROWED, like the endpoints */
 
 void rpc_node_set_zmq(const char* hashblock, const char* hashtx,
                       const char* rawblock, const char* rawtx){
     g_zmq_ep[0] = hashblock; g_zmq_ep[1] = hashtx;
     g_zmq_ep[2] = rawblock;  g_zmq_ep[3] = rawtx;
 }
+void rpc_node_set_zmq_hwm(const int* hwm4){ g_zmq_hwm = hwm4; }
 
 static int cmd_getzmqnotifications(rj_val** res){
     static const char* const NAMES[4] =
@@ -850,7 +852,9 @@ static int cmd_getzmqnotifications(rj_val** res){
         rj_val* o = rj_obj();
         rj_obj_set(o, "type",    rj_str(NAMES[i]));
         rj_obj_set(o, "address", rj_str(g_zmq_ep[i]));
-        rj_obj_set(o, "hwm",     rj_num("0"));
+        char hb[16];
+        snprintf(hb, sizeof hb, "%d", g_zmq_hwm ? g_zmq_hwm[i] : 1000);
+        rj_obj_set(o, "hwm",     rj_num(hb));
         rj_arr_push(arr, o);
     }
     *res = arr;

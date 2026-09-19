@@ -1653,9 +1653,32 @@ int main(void){
            t0 && !strcmp(t0->str, "pubhashblock") && a0 && !strcmp(a0->str, "tcp://127.0.0.1:28332"));
         ck("entry 1 is pubrawtx at its address (unset topics skipped, order kept)",
            t1 && !strcmp(t1->str, "pubrawtx") && a1 && !strcmp(a1->str, "tcp://127.0.0.1:28333"));
-        ck("hwm present", rj_obj_get(e0, "hwm") != NULL);
+        /* nothing injected: Core's default, 1000 -- not the 0 this reported
+         * while the publisher had no queue */
+        rj_val* w0 = rj_obj_get(e0, "hwm");
+        ck("hwm defaults to Core's 1000", w0 && w0->str && !strcmp(w0->str, "1000"));
     }
     rj_free(r);
+
+    /* the CONFIGURED per-topic value, as Core prints each notifier's own
+     * (zmqrpc.cpp GetOutboundMessageHighWaterMark); 0 is a legal value
+     * (no limit) and must come through as 0, not as the default */
+    { static const int hwm4[4] = { 250, 1000, 7, 0 };
+      rpc_node_set_zmq_hwm(hwm4);
+      rpc_node_set_zmq("tcp://127.0.0.1:28332", NULL, "tcp://127.0.0.1:28332", "tcp://127.0.0.1:28333");
+      r = NULL; rc = rpc_node_dispatch("getzmqnotifications", NULL, &r, &ec, &em);
+      ck("getzmqnotifications -> 3 configured entries", rc == 1 && r && r->nitems == 3);
+      if (r && r->nitems == 3){
+          rj_val* h0 = rj_obj_get(r->items[0], "hwm");
+          rj_val* h1 = rj_obj_get(r->items[1], "hwm");
+          rj_val* h2 = rj_obj_get(r->items[2], "hwm");
+          ck("pubhashblock hwm = configured 250", h0 && h0->str && !strcmp(h0->str, "250"));
+          ck("pubrawblock hwm = configured 7",    h1 && h1->str && !strcmp(h1->str, "7"));
+          ck("pubrawtx hwm = configured 0",       h2 && h2->str && !strcmp(h2->str, "0"));
+      }
+      rj_free(r);
+      rpc_node_set_zmq_hwm(NULL);
+      rpc_node_set_zmq(NULL, NULL, NULL, NULL); }
 
     /* ---- mempool.dat reload: parents-first ordering (2026-09-01) ----
      * A dump written in pool order can list a child before its parent; the
