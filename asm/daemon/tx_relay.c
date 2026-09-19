@@ -1336,6 +1336,11 @@ static long txr_take_tx(void* mp, const u8* pl, unsigned long plen, int fd, int 
     { extern void sha256d(u8 out[32], const void* p, unsigned long n);
       u8 wtxid[32]; sha256d(wtxid, pl, plen);       /* BIP339 announcements key by this */
       txr_want_clear(txid); txr_want_clear(wtxid); }
+    /* already in the pool (Core AlreadyHaveTx): two inbound peers can both
+     * hand over the same tx before the first is accepted, and a duplicate
+     * that reaches the policy check costs a full script verify and ends in
+     * the recent-rejects filter as "txn-already-in-mempool" */
+    { unsigned long have_len; if (mpool_get(mp, txid, &have_len)) return 0; }
     /* a handed-off tx is attributed to its inbound peer's slot for the one
      * validation: txann_push records it as the source (no echo to that peer,
      * and CC-3's last_tx_time eviction protection credits the right peer) */
