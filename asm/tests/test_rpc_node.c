@@ -40,6 +40,28 @@ static void mpe_hex_test(char* dst, const unsigned char* id){   /* display order
     for (int k=0;k<32;k++) sprintf(dst+2*k, "%02x", id[31-k]);
     dst[64]=0;
 }
+/* An n-in, m-out legacy tx: spends prev[i]:vout[i] (nSequence final), pays
+ * val[j] to a P2WPKH of 20 x (tag+j). 2026-09-19, for the chunk-field
+ * clusters: a diamond needs a 2-output parent and a 2-input grandchild. */
+static unsigned long mk_txn(unsigned char* t, int nin, const unsigned char (*prev)[32],
+                            const unsigned* vout, int nout, const unsigned long long* val,
+                            unsigned char tag){
+    unsigned long n = 0;
+    t[n++]=2;t[n++]=0;t[n++]=0;t[n++]=0;
+    t[n++]=(unsigned char)nin;
+    for (int i=0;i<nin;i++){
+        memcpy(t+n, prev[i], 32); n+=32;
+        for (int b=0;b<4;b++) t[n++]=(unsigned char)(vout[i]>>(8*b));
+        t[n++]=0; t[n++]=0xff;t[n++]=0xff;t[n++]=0xff;t[n++]=0xff;
+    }
+    t[n++]=(unsigned char)nout;
+    for (int j=0;j<nout;j++){
+        for (int b=0;b<8;b++) t[n++]=(unsigned char)(val[j]>>(8*b));
+        t[n++]=22; t[n++]=0x00; t[n++]=0x14; for (int i=0;i<20;i++) t[n++]=(unsigned char)(tag+j);
+    }
+    t[n++]=0;t[n++]=0;t[n++]=0;t[n++]=0;
+    return n;
+}
 
 /* Fake tx-submit worker: acks whatever the parent stages, recording the
  * tx_submit_test flag it saw so the test can prove sendrawtransaction clears
@@ -1108,6 +1130,153 @@ int main(void){
                                              S(s,"vsize"), S(s,"descendantsize"), s2 ? S(s2,"ancestorsize") : "-");
               if (bulk_on) rj_free(all);
               else for (int q = 0; q < 6; q++) rj_free(got[q]);
+          }
+
+          /* ---- chunkweight / fees.chunk on EVERY entry (2026-09-19).
+           *
+           * Core v31.1 entryToJSON reports GetMainChunkFeerate for every
+           * entry: the chunk the tx lands in when its cluster is linearized,
+           * as sigops-adjusted WEIGHT and the chunk's summed modified fee in
+           * BTC. Bulk getrawmempool used to emit them for singletons only and
+           * omit them for every cluster member (71,710 of 79,626 entries on
+           * production, 2026-09-18). The expected numbers are the UNIQUE
+           * optimal chunkings of shapes no valid linearization could chunk
+           * differently:
+           *   singleton  Q: 328 wu, 3000 sat
+           *   CPFP       P (100 sat) <- C (10000): one chunk, 656 wu, 10100
+           *   chain      A (5000) <- B (100) <- C (3000): [A] 328/5000, then
+           *              [B,C] 656/3100 (C lifts B; together still below A)
+           *   diamond    D0 (2 outs, 200 sat, 452 wu) <- D1 (100), D2 (5000)
+           *              <- D3 (spends both, 1000 sat, 492 wu): [D0,D2]
+           *              780/5200, then [D1,D3] 820/1100
+           *   sigops     S (80 sigop units: ADJUSTED weight 1600, 10000 sat)
+           *              <- S2 (328, 10000): one chunk, 1928 wu, 20000 --
+           *              chunking by raw weight would say 656
+           *   equal      A <- B above, both 10000 sat / 328 wu: equal
+           *              feerates do NOT merge (Core's strict >>), 328 each
+           * Every check runs through both graph paths, and the bulk path is
+           * held to one cluster build per CLUSTER. ---- */
+          { unsigned char c0[32], c1[32], c2[32], c3[32];
+            memset(c0, 0xa0, 32); memset(c1, 0xa1, 32); memset(c2, 0xa2, 32); memset(c3, 0xa3, 32);
+            static unsigned char tq[128], tp[128], tc[128], x1[128], x2[128], x3[128],
+                                 d0[256], d1[128], d2[128], d3[256];
+            unsigned char iq[32], ip[32], ic[32], ix1[32], ix2[32], ix3[32],
+                          id0[32], id1[32], id2[32], id3[32];
+            #define ADDTX(buf, len, idv, label) do { \
+                ck(label " txid", tx_txid(idv, buf, len, scratch, sizeof scratch)==1); \
+                ck("policy add " label, mpool_policy_add(polcfg, polstate, pool, buf, len, idv, (void*)1)==1); \
+              } while (0)
+            unsigned long l;
+            l = mk_tx1(tq, c3, 0xffffffffu, 97000, 0xF0); ADDTX(tq, l, iq, "Q (singleton)");
+            l = mk_tx1(tp, c0, 0xffffffffu, 99900, 0xF1); ADDTX(tp, l, ip, "P (CPFP parent, 100 sat)");
+            l = mk_tx1(tc, ip, 0xffffffffu, 89900, 0xF2); ADDTX(tc, l, ic, "C (CPFP child, 10000 sat)");
+            l = mk_tx1(x1, c1, 0xffffffffu, 95000, 0xF3); ADDTX(x1, l, ix1, "chain A (5000 sat)");
+            l = mk_tx1(x2, ix1, 0xffffffffu, 94900, 0xF4); ADDTX(x2, l, ix2, "chain B (100 sat)");
+            l = mk_tx1(x3, ix2, 0xffffffffu, 91900, 0xF5); ADDTX(x3, l, ix3, "chain C (3000 sat)");
+            { unsigned vo[2] = {0, 1}; unsigned long long v2[2] = {49900, 49900};
+              l = mk_txn(d0, 1, (const unsigned char (*)[32])c2, vo, 2, v2, 0xE0);
+              ck("D0 is 113 bytes (452 wu)", l == 113);
+              ADDTX(d0, l, id0, "diamond D0 (200 sat)"); }
+            l = mk_tx1(d1, id0, 0xffffffffu, 49800, 0xE4); ADDTX(d1, l, id1, "diamond D1 (100 sat)");
+            { unsigned char pv[1][32]; memcpy(pv[0], id0, 32); unsigned vo[1] = {1};
+              unsigned long long v1[1] = {44900};
+              l = mk_txn(d2, 1, (const unsigned char (*)[32])pv, vo, 1, v1, 0xE5);
+              ADDTX(d2, l, id2, "diamond D2 (5000 sat)"); }
+            { unsigned char pv[2][32]; memcpy(pv[0], id1, 32); memcpy(pv[1], id2, 32);
+              unsigned vo[2] = {0, 0}; unsigned long long v1[1] = {93700};
+              l = mk_txn(d3, 2, (const unsigned char (*)[32])pv, vo, 1, v1, 0xE6);
+              ck("D3 is 123 bytes (492 wu)", l == 123);
+              ADDTX(d3, l, id3, "diamond D3 (1000 sat)"); }
+            #undef ADDTX
+            struct { const unsigned char* id; const char* name; const char* cw; const char* cf; } W[] = {
+                { iq,  "singleton Q", "328",  "0.00003000" },
+                { ip,  "CPFP parent", "656",  "0.00010100" },
+                { ic,  "CPFP child",  "656",  "0.00010100" },
+                { ix1, "chain A",     "328",  "0.00005000" },
+                { ix2, "chain B",     "656",  "0.00003100" },
+                { ix3, "chain C",     "656",  "0.00003100" },
+                { id0, "diamond D0",  "780",  "0.00005200" },
+                { id2, "diamond D2",  "780",  "0.00005200" },
+                { id1, "diamond D1",  "820",  "0.00001100" },
+                { id3, "diamond D3",  "820",  "0.00001100" },
+                { is,  "sigops S",    "1928", "0.00020000" },
+                { is2, "sigops S2",   "1928", "0.00020000" },
+                { ia,  "equal-feerate A", "328", "0.00010000" },
+                { ib,  "equal-feerate B", "328", "0.00010000" },
+            };
+            int nw = (int)(sizeof W / sizeof *W);
+            for (int bulk_on = 0; bulk_on < 2; bulk_on++){
+                { rpc_mempool_hooks h; memset(&h,0,sizeof h);
+                  h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
+                  h.get = mpool_get; h.polstate = polstate;
+                  h.pol_entry = mpool_policy_entry;
+                  h.pol_entry_info = mpool_policy_entry_info;
+                  if (bulk_on) h.pol_entry_info_all = mpool_policy_entry_info_all;
+                  rpc_node_set_mempool(&h); }
+                const char* path = bulk_on ? "bulk getrawmempool" : "getmempoolentry";
+                rj_val* all = NULL;
+                unsigned long b0 = rpc_node_cluster_builds();
+                if (bulk_on){ rj_val* pv = rj_parse("[true]", 6);
+                              rpc_node_dispatch("getrawmempool", pv, &all, &ec, &em); rj_free(pv); }
+                unsigned long b1 = rpc_node_cluster_builds();
+                char what[240];
+                for (int q = 0; q < nw; q++){
+                    char hx[65]; mpe_hex_test(hx, W[q].id);
+                    rj_val* e = NULL;
+                    if (bulk_on) e = all ? rj_obj_get(all, hx) : NULL;
+                    else { char one[128]; snprintf(one, sizeof one, "[\"%s\"]", hx);
+                           rj_val* op = rj_parse(one, strlen(one));
+                           rpc_node_dispatch("getmempoolentry", op, &e, &ec, &em); rj_free(op); }
+                    rj_val* f = e ? rj_obj_get(e, "fees") : NULL;
+                    const char* cw = e ? S(e, "chunkweight") : NULL;
+                    const char* cf = f ? S(f, "chunk") : NULL;
+                    snprintf(what, sizeof what, "%s: %s chunkweight %s, fees.chunk %s (got %s / %s)",
+                             path, W[q].name, W[q].cw, W[q].cf, cw ? cw : "(absent)", cf ? cf : "(absent)");
+                    ck(what, cw && cf && !strcmp(cw, W[q].cw) && !strcmp(cf, W[q].cf));
+                    if (!bulk_on) rj_free(e);
+                }
+                if (bulk_on){
+                    /* every registry-backed entry carries both keys, not just
+                     * the ones named above. The fixture's first two entries
+                     * went in by raw mpool_put and have no registry node (fee
+                     * unknown, fees.base 0): no node can report a chunk for
+                     * those, and a real pool has none of them. */
+                    int n_reg = 0, n_have = 0;
+                    for (unsigned m = 0; all && m < all->nmembers; m++){
+                        rj_val* e = all->members[m].val;
+                        rj_val* f = rj_obj_get(e, "fees");
+                        if (!f || !S(f, "base") || !strcmp(S(f, "base"), "0.00000000")) continue;
+                        n_reg++;
+                        if (S(e, "chunkweight") && S(f, "chunk")) n_have++;
+                    }
+                    snprintf(what, sizeof what, "bulk getrawmempool: all %d registry entries carry chunkweight and fees.chunk (%d do)", n_reg, n_have);
+                    ck(what, n_reg >= nw && n_have == n_reg);
+                    /* the cost model: multi-member clusters in the pool, counted
+                     * independently by union-find over the rendered `depends` */
+                    int nm = all ? (int)all->nmembers : 0;
+                    int* par = calloc(nm ? nm : 1, sizeof *par);
+                    int* sz = calloc(nm ? nm : 1, sizeof *sz);
+                    for (int m = 0; m < nm; m++) par[m] = m;
+                    for (int m = 0; m < nm; m++){
+                        rj_val* dp = rj_obj_get(all->members[m].val, "depends");
+                        for (unsigned j = 0; dp && j < dp->nitems; j++)
+                            for (int o = 0; o < nm; o++)
+                                if (!strcmp(all->members[o].key, dp->items[j]->str)){
+                                    int a = m, b = o;
+                                    while (par[a] != a) a = par[a];
+                                    while (par[b] != b) b = par[b];
+                                    par[a] = b; break; }
+                    }
+                    int multi = 0;
+                    for (int m = 0; m < nm; m++){ int a = m; while (par[a] != a) a = par[a]; sz[a]++; }
+                    for (int m = 0; m < nm; m++) if (sz[m] > 1) multi++;
+                    free(par); free(sz);
+                    snprintf(what, sizeof what, "bulk getrawmempool: %lu cluster builds for %d multi-member clusters (one per cluster, not per member)",
+                             b1 - b0, multi);
+                    ck(what, multi >= 6 && b1 - b0 == (unsigned long)multi);
+                    rj_free(all);
+                }
+            }
           }
           { rpc_mempool_hooks h; memset(&h,0,sizeof h);
             h.mp = pool; h.maxbytes = 8388608; h.count = mpool_count;
