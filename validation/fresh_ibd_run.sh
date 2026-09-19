@@ -114,6 +114,8 @@ ph "HELPERS no missing-helper line in the first ${HELPER_WATCH_S}s"
 # -rpcclienttimeout=0 (wait forever): gettxoutsetinfo walks the whole UTXO set
 # and blows past the 900s default on a mainnet-sized node.
 CLI="src/asm/daemon/bmc_cli -rpcport=$RPC -datadir=$DEST/data -rpcclienttimeout=0"
+SEEN_CLIENTS=""; LAST_PROG=""; PROG_AT=$(date +%s); STALE_SAID=0; TW_SAID=0
+HB_STALE_S=${HB_STALE_S:-3600}
 while :; do
     sleep 300
     # The readers live in lib/ibd_harness_lib.sh and are tested by
@@ -129,11 +131,35 @@ while :; do
     idle=$(ibd_occupancy "$LOG")
     echo "$(ts) hb='$hb' disk=$du ${idle:+$idle} bad=$bad" >> "$PROG"
     [ "${bad:-0}" != "0" ] && { ph "FAIL bad markers"; echo FAIL > RESULT; exit 1; }
-    ours=$($CLI getblockcount 2>/dev/null); theirs=$($ORACLE getblockcount 2>/dev/null)
-    [ -z "$ours" ] || [ -z "$theirs" ] && continue
-    [ "$ours" -ge $((theirs-1)) ] || continue
+    # NO RPC TO THE NODE UNTIL ITS IBD IS OVER (operator rule, 2026-09-19).
+    # Run 27's RPC side read 10.2 TB answering a monitor's polls. So the tip is
+    # read from the download's own heartbeat, and anyone else connected to the
+    # RPC port is named in phase.log. The harness itself has no connection open
+    # here, so any client is a stranger. Each one is reported once.
+    for c in $(ibd_rpc_clients "$RPC"); do
+        case " $SEEN_CLIENTS " in *" $c "*) ;; *) SEEN_CLIENTS="$SEEN_CLIENTS $c"
+            ph "WARN rpc client during IBD: $c ($(tr '\0' ' ' < /proc/${c%%:*}/cmdline 2>/dev/null | cut -c1-120)) -- the run is being perturbed";; esac
+    done
+    tw=$(ibd_rpc_recent_closes "$RPC")
+    if [ "${tw:-0}" -gt 0 ]; then
+        [ "$TW_SAID" = 0 ] && ph "WARN $tw connection(s) to the RPC port closed in the last minute during IBD -- something is polling the run"
+        TW_SAID=1
+    else TW_SAID=0; fi
+    prog=$(ibd_log_progress "$LOG")
+    if [ "$prog" != "$LAST_PROG" ]; then LAST_PROG=$prog; PROG_AT=$(date +%s); STALE_SAID=0
+    elif [ $(( $(date +%s) - PROG_AT )) -ge "$HB_STALE_S" ] && [ "$STALE_SAID" = 0 ]; then
+        ph "WARN the heartbeat has not moved in $(( ($(date +%s) - PROG_AT) / 60 )) min (last: '$prog')"; STALE_SAID=1
+    fi
+    printf '%s\n' "$prog" | ibd_log_tip_reached || continue
+    # The download's "real tip" is the best header it saw. The oracle confirms
+    # it is not stale. The oracle is not being timed, so asking it costs nothing.
+    set -- $prog; theirs=$($ORACLE getblockcount 2>/dev/null)
+    [ -n "$theirs" ] && [ "$3" -lt $((theirs - 6)) ] && { ph "WAIT the download finished at $3 but the oracle is at $theirs"; continue; }
+    END_TS=$(ibd_log_tip_time "$LOG")
+    END_EPOCH=$(date -u -d "$END_TS" +%s 2>/dev/null || echo 0)
+    ph "IBD_END $END_TS UTC (from the log) elapsed=$(( END_EPOCH - T0 ))s -- applied=$1 stored=$2/$3 oracle=$theirs"
 
-    ph "TIP reached: ours=$ours oracle=$theirs elapsed=$(( $(date +%s)-T0 ))s"
+    ph "TIP reached: applied=$1 tip=$3 oracle=$theirs elapsed=$(( $(date +%s)-T0 ))s (RPC to the node is allowed from here)"
 
     # ------------------------------------------------------------------
     # THE CAPSTONE. Three ways this has lied, all fixed here:
