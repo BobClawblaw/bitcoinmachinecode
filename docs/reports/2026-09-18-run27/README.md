@@ -140,6 +140,11 @@ The unpolled Core rerun below and run 28 (#275, #280, #281) are the clean pair.
 
 - **Status:** running, unpolled, watched without RPC (`core31/watch.log`). Its config
   is `core-v31.1-run2.bitcoin.conf`, updated.
+- **Production was redeployed at 18:54:57Z** (a different NVMe). Core's blocks
+  per minute dipped to 443 at 18:56 against a mean of 889 over the 15 minutes
+  before (range 507 to 1,465), and were back to normal from 18:57, while
+  production's mempool reload ran to 19:01. That is at most ~30 to 40 s, within
+  Core's own minute-to-minute noise. Details in DEPLOYMENT_HISTORY.md.
 - **The watcher's 14:30:04Z warning was a false positive.** It named bitcoind
   itself: Core's outbound P2P connection to a remote peer that happened to
   listen on :8340 matched a socket filter that was not loopback-only. Fixed in
