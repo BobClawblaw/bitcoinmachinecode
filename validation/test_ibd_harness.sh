@@ -259,6 +259,11 @@ SS='0 0 127.0.0.1:51234 127.0.0.1:8461 users:(("node",pid=2975131,fd=31))
 0 0 127.0.0.1:51300 127.0.0.1:8461 users:(("curl",pid=4242,fd=5))'
 ck "RPC clients are named once each, pid:name" "$(printf '%s\n' "$SS" | ibd_parse_ss_clients | tr '\n' ' ')" "2975131:node 4242:curl "
 ck "no connections, no clients" "$(printf '' | ibd_parse_ss_clients)" ""
+# the socket filters must be loopback-only: an outbound P2P connection to a remote
+# peer that listens on the same port number is not an RPC client (2026-09-19)
+ck "the RPC-client filter is loopback-only" "$(grep -c 'established "( dst 127.0.0.1:\$port )"' lib/ibd_harness_lib.sh)" "1"
+ck "the recent-close filter is loopback-only" "$(grep -c 'time-wait "( src 127.0.0.1:\$port or dst 127.0.0.1:\$port )"' lib/ibd_harness_lib.sh)" "1"
+ck "no filter matches the port on any address" "$(grep -c -E '"\( (d|s)port = :\$port' lib/ibd_harness_lib.sh)" "0"
 # the harness itself must not call RPC during IBD: between the helper watch and
 # the TIP line, the monitor loop has no $CLI call
 loop=$(awk '/^while :; do/,/ph "TIP reached/' fresh_ibd_run.sh | grep -c '\$CLI ')
