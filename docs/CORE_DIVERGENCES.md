@@ -106,6 +106,80 @@ publisher it reproduces production: 0 rawblock, a disconnect per block).
 
 ---
 
+## ZMQ `sequence` (-zmqpubsequence): implemented 2026-09-19; where it is not Core's
+
+Refused until 2026-09-19 (removals had no choke point; the reorg reconcile
+emptied the pool with raw `mpool_del`). Now: one hook in the policy layer
+(`bitcoin_mempool_policy.c` `g_seq_cb`) sees every insert (`mpool_policy_add`)
+and every removal (`remove_node`, `mpol_remove_marked`); the counter (Core's
+`m_sequence_number`, from 1) and a 65,536-event ring live in a MAP_SHARED
+region created before the fork and are written under the pool lock by
+whichever process changed the pool; the worker publishes
+(`asm/daemon/mempool_seq.h`). A block's own transactions take a number and
+publish nothing, as Core's `BLOCK` removal does, and the conflicts it causes
+are numbered in block order. `getrawmempool(false, true)` and REST
+`?mempool_sequence=true` read the same counter under the same lock as the
+txid list.
+
+**Measured against v31.1** (`validation/zmq_sequence_core_diff.py`, regtest):
+add, child add, RBF (R before A), a block with a mined tx and a conflict
+(R, silent number, C), invalidateblock (D, A, A), reconsiderblock (C, two
+silent numbers) and a one-step two-block reorg delivered by submitblock
+(D, R, A, C, C) are **identical event for event, hashes and mempool sequence
+numbers included**, and the two `getrawmempool` snapshots agree on txids and
+`mempool_sequence`. What is not the same:
+
+1. **Where the pool counts itself full.** Core measures DynamicMemoryUsage,
+   this node raw transaction bytes. With `maxmempool=5` and 80 KB
+   transactions at rising feerates, Core began trimming one transaction
+   earlier (14 evictions to 13); the evictions came in the same order and each
+   'R' followed the 'A' that forced it on both. The accounting, not the topic.
+2. **A multi-block reorg's interleaving.** The reconcile rebuilds the pool
+   and publishes its NET change (`asm/daemon/reorg.c`, section 5, says why
+   the rebuild stays). So the D's come from the disconnect loop, then every
+   'R' and every 'A' of the reconcile, then the C's from the block-connect
+   choke point. Core publishes, per ActivateBestChain step, D's, the
+   connected blocks' conflict R's, the re-adds, then R's for anything
+   `removeForReorg` or `LimitMempoolSize` then drops, then the C's. For a
+   one-step reorg the two orders coincide (measured); they differ when the
+   reorg also drops a transaction for finality/maturity (here its 'R' comes
+   before the re-adds, in Core after them), and for a MULTI-block
+   `invalidateblock`, where Core re-adds after each block (D, A.., D, A..)
+   and this node after the last (D, D, A..). Core also stops re-adding after
+   ten invalidated blocks; this node re-offers the whole captured branch
+   (20 MB / 256 blocks, as before).
+3. **Order inside one multi-transaction removal.** An expiry or a conflict
+   takes a transaction's descendants with it; the numbers go to this
+   engine's order (descendants first), Core's to its txgraph's. The set, the
+   count and the position of the group in the stream are the same.
+4. **When expiry happens.** Core expires on the next accept after
+   -mempoolexpiry (so its 'R's follow that accept's 'A'); this node sweeps
+   every 60 s on the wall clock. Not driven in the differential (Core's is
+   mocktime-driven); `asm/tests/test_mempool_sequence.c` covers the path.
+5. **Loss.** Core has no staging step; here a worker that falls 65,536
+   events behind skips to the oldest intact one, counts the loss, and
+   advances the topic's 4-byte sequence by it, so a subscriber sees the same
+   gap a high-water-mark drop leaves (and a jump in the mempool sequence).
+6. **A reloaded mempool.dat** publishes an 'A' per transaction on both; on
+   Core it usually happens before a restarted subscriber has rejoined (the
+   PUB slow joiner), so the differential checks Core's counter there, not
+   its stream.
+
+Tests: `asm/tests/test_mempool_sequence.c` (every event path through the real
+engine, the cross-process counter, the wire bytes, the overrun gap, the cost
+per event: ~8 ns), the reorg cases in `asm/tests/test_reorg.c`, and the RPC /
+REST / config cases in `test_rpc_node`, `test_rest`, `test_node_config`.
+
+**Open, found while reading Core for this, not fixed:** Core's
+`BlockConnected` and `BlockDisconnected` also publish `hashtx`/`rawtx` for
+EVERY transaction of the block (`zmqnotificationinterface.cpp`), coinbase
+included. This node publishes those two topics only for mempool accepts
+(`daemon/zmq_notify.c`), so a `hashtx` subscriber here never sees a
+transaction that arrived in a block without passing through the pool, nor a
+disconnected block's transactions.
+
+---
+
 ## `getrawaddrman`: `source` and `source_network` are omitted
 
 Found 2026-09-16 by diffing the 26 served methods the parity harness never

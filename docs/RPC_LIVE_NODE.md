@@ -1059,14 +1059,21 @@ real-block check below and reading them against Core's own output.
 `tests/zmq_realblock_check` now asserts, for real archived blocks, that
 hex(published bytes) equals Core's `getblockhash` string exactly.
 
-### What refuses, and why
-`zmqpubsequence` is refused at config parse, loudly. Core's `sequence`
-topic exists to track mempool MEMBERSHIP — adds and removes. This node has
+### What refused, and why (until 2026-09-19)
+`zmqpubsequence` was refused at config parse, loudly. Core's `sequence`
+topic exists to track mempool MEMBERSHIP — adds and removes. This node had
 one clean choke point for "accepted" but none for "removed" (eviction,
-expiry and reorg each call mpool_del independently), so it could publish
-adds without removes: a subscriber's mempool model would grow forever and
-never learn it was wrong. A stream that quietly lies is worse than a
-refusal that explains itself.
+expiry and reorg each called mpool_del independently), so it could have
+published adds without removes: a subscriber's mempool model would grow
+forever and never learn it was wrong. A stream that quietly lies is worse
+than a refusal that explains itself.
+
+2026-09-19: implemented. Every insert and every removal now passes one hook
+in the policy layer; the reorg rebuild holds that hook and publishes its net
+change; the counter and event ring are shared across the node's processes
+and written under the pool lock. getrawmempool's `mempool_sequence` argument
+reads the same counter. See `docs/CORE_DIVERGENCES.md` ("ZMQ `sequence`")
+for the measured parity and what differs.
 
 Blocks are published from the tip-watch choke point in the worker, one
 notification per block even in catch-up bursts — a subscriber must see

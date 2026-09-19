@@ -41,6 +41,7 @@
 #include <signal.h>
 #include <sys/file.h>
 #include "../daemon/reorg.h"
+#include "../daemon/mempool_seq.h"   /* case_mempool: the ZMQ sequence topic's D / net A,R */
 #include "test_tmpdir.h"
 
 typedef unsigned char u8;
@@ -956,6 +957,28 @@ static void case_undo_preflight_gate(void){
     utxo_live_close();
 }
 
+/* ---- the ZMQ `sequence` topic's view of a reorg (2026-09-19) ------------
+ * Events staged in the shared ring since `from`, flattened for the checks
+ * below. mempool_seq_configure is the daemon's own (mempool_cfg.c): the
+ * ring, the counter and the policy hook are the production ones. */
+typedef struct { u8 label; u8 hash[32]; unsigned long long mseq; } sq_ev;
+static int sq_since(unsigned long long from, sq_ev* out, int max){
+    mpseq_area_t* a = mpseq_area();
+    int n = 0;
+    for (unsigned long long s = from; a && s < a->head && n < max; s++){
+        const mpseq_ev* e = &a->ev[s % MPSEQ_RING];
+        out[n].label = e->label; memcpy(out[n].hash, e->hash, 32); out[n].mseq = e->mseq; n++;
+    }
+    return n;
+}
+static int sq_find(const sq_ev* ev, int n, u8 label, const u8* hash){
+    for (int i = 0; i < n; i++) if (ev[i].label == label && !memcmp(ev[i].hash, hash, 32)) return i;
+    return -1;
+}
+static int sq_count(const sq_ev* ev, int n, u8 label){
+    int c = 0; for (int i = 0; i < n; i++) if (ev[i].label == label) c++; return c;
+}
+
 /* ======================================================================== */
 /* CASE: mempool reconciliation                                             */
 /* ======================================================================== */
@@ -967,6 +990,7 @@ static void case_mempool(void){
 
     harness_open();
     store_chain(nbase, nlose);
+    ckm("sequence: the shared area is created", mempool_seq_configure() == 1);
 
     /* mempool + policy */
     static u8 mp[40 + 1024*80 + 8];
@@ -1015,7 +1039,21 @@ static void case_mempool(void){
     ck("doomed accepted into mempool (valid on the losing branch)",
        mpool_policy_add(pol, pol_state, mp, doomed.raw, doomed.len, doomed.txid, (void*)1), 1);
 
-    ck("mempool holds 2 before the reorg", mpool_count(mp), 2);
+    /* MINED-BY-THE-NEW-BRANCH: a second losing-branch-only spend. It leaves
+     * in the rebuild exactly as `doomed` does; the only difference is that
+     * the reconcile is TOLD it was confirmed (below), which is the one input
+     * that decides 'M' (numbered, unpublished -- Core's BLOCK removal) over
+     * 'R'. A synthetic confirmation, because a real one needs a pool tx the
+     * winner mines, and these fixtures' branches contest every such output. */
+    /* It spends the losing tip's own spend-tx output (nothing in the losing
+     * branch consumes it, and that tx cannot come back: its input is lose[0]'s
+     * coinbase, which the reorg erases) -- NOT doomed's coin, which would
+     * make it a replacement of doomed. */
+    tx_t minedx; mk_spend(&minedx, lose[nlose-1].tx[1].txid, 0, lose[nlose-1].tx[1].out_value - 1000000ULL);
+    ck("mined-by-winner stand-in accepted into mempool",
+       mpool_policy_add(pol, pol_state, mp, minedx.raw, minedx.len, minedx.txid, (void*)1), 1);
+
+    ck("mempool holds 3 before the reorg", mpool_count(mp), 3);
 
     /* keep copies of the disconnected blocks for reconciliation */
     static const u8* disc[MAXBLK]; static uint32_t disclen[MAXBLK];
@@ -1026,12 +1064,35 @@ static void case_mempool(void){
     cand_from_blocks(&c, win, nwin);
     ck("mempool case analyze", reorg_analyze(store_buf,&c), 2);
     memsrc_t src = { win, nwin };
+    unsigned long long h0 = mpseq_area()->head;
     ck("mempool case reorg_execute", reorg_execute(store_buf, c.fork_height, nwin, memsrc, &src), 1);
+    { static sq_ev ev[64]; int n = sq_since(h0, ev, 64);
+      /* Core's BlockDisconnected: one 'D' per disconnected block, TIP FIRST */
+      ck("sequence: reorg_execute staged one D per disconnected block", sq_count(ev, n, 'D'), nlose);
+      ckm("sequence: ...the losing tip first, then its parent",
+          n >= 2 && ev[0].label == 'D' && !memcmp(ev[0].hash, lose[nlose-1].hash, 32) &&
+          ev[1].label == 'D' && !memcmp(ev[1].hash, lose[nlose-2].hash, 32));
+      ck("sequence: ...and no mempool event (the reconcile has not run)", sq_count(ev, n, 'A') + sq_count(ev, n, 'R'), 0); }
 
     reorg_mempool_t rm = { mp, pol, pol_state, pol_n, (void*)1 };
     /* Disconnected blocks are offered oldest-first. */
-    long after = reorg_mempool_reconcile(&rm, disc, disclen, nlose);
+    unsigned long long h1 = mpseq_area()->head, s1 = mempool_sequence();
+    long after = reorg_mempool_reconcile_ex(&rm, disc, disclen, nlose, (const u8 (*)[32])minedx.txid, 1);
     ckm("reconcile returned a count", after >= 0);
+    { static sq_ev ev[64]; int n = sq_since(h1, ev, 64);
+      /* the NET change: survivor never left (no event, although the rebuild
+       * deleted and re-added it); doomed left and was not mined ('R'); the
+       * mined stand-in left and WAS mined (numbered, not published); no
+       * disconnected tx came back (both spent outputs the winner took) */
+      ckm("sequence: survivor gets NO event (the rebuild's delete+re-add is not published)",
+          sq_find(ev, n, 'R', survivor.txid) < 0 && sq_find(ev, n, 'A', survivor.txid) < 0);
+      ckm("sequence: doomed is published as removed (R)", sq_find(ev, n, 'R', doomed.txid) >= 0);
+      ckm("sequence: a tx the new branch mined is NOT published", sq_find(ev, n, 'R', minedx.txid) < 0);
+      { unsigned long lx; ckm("sequence: ...and really left the pool", mpool_get(mp, minedx.txid, &lx) == NULL); }
+      ck("sequence: ...but takes a number: 2 departures, 2 numbers", (long)(mempool_sequence() - s1), 2);
+      ck("sequence: nothing re-entered, so no A", sq_count(ev, n, 'A'), 0);
+      int k = sq_find(ev, n, 'R', doomed.txid);
+      ckm("sequence: the R carries a number from this reconcile", k >= 0 && ev[k].mseq >= s1 && ev[k].mseq < mempool_sequence()); }
 
     unsigned long l;
     ckm("survivor (still valid on the winning branch) is STILL in the mempool",
@@ -1072,9 +1133,16 @@ static void case_mempool(void){
         mk_block(&extra, base[nbase-1].hash, 1900000000u);
 
         const u8* d2[1] = { extra.raw }; uint32_t l2[1] = { (uint32_t)extra.len };
+        unsigned long long h2 = mpseq_area()->head, s2 = mempool_sequence();
         reorg_mempool_reconcile(&rm, d2, l2, 1);
         ckm("a still-spendable tx from a disconnected block IS reinjected",
             mpool_get(mp, extra.tx[1].txid, &l) != NULL);
+        { static sq_ev ev[64]; int n = sq_since(h2, ev, 64);
+          int k = sq_find(ev, n, 'A', extra.tx[1].txid);
+          ckm("sequence: the re-entered tx is published as added (A)", k >= 0);
+          ck("sequence: ...and it is the ONLY event (survivor again silent)", n, 1);
+          ckm("sequence: ...numbered with the next mempool sequence", k >= 0 && ev[k].mseq == s2);
+          ck("sequence: the counter moved by exactly one", (long)(mempool_sequence() - s2), 1); }
         ckm("survivor survived the second reconcile too",
             mpool_get(mp, survivor.txid, &l) != NULL);
     }

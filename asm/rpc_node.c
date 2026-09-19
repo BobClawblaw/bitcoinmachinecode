@@ -849,15 +849,20 @@ void rpc_node_set_zmq(const char* hashblock, const char* hashtx,
 }
 void rpc_node_set_zmq_hwm(const int* hwm4){ g_zmq_hwm = hwm4; }
 
+static const char* g_zmq_seq_ep;   /* -zmqpubsequence; hwm is g_zmq_hwm[4] */
+void rpc_node_set_zmq_sequence(const char* sequence){ g_zmq_seq_ep = sequence; }
 static int cmd_getzmqnotifications(rj_val** res){
-    static const char* const NAMES[4] =
-        { "pubhashblock", "pubhashtx", "pubrawblock", "pubrawtx" };
+    /* Core lists its notifiers in its factory map's order, which is sorted
+     * by name: pubhashblock, pubhashtx, pubrawblock, pubrawtx, pubsequence. */
+    static const char* const NAMES[5] =
+        { "pubhashblock", "pubhashtx", "pubrawblock", "pubrawtx", "pubsequence" };
     rj_val* arr = rj_arr();
-    for (int i = 0; i < 4; i++){
-        if (!g_zmq_ep[i] || !g_zmq_ep[i][0]) continue;
+    for (int i = 0; i < 5; i++){
+        const char* ep = i < 4 ? g_zmq_ep[i] : g_zmq_seq_ep;
+        if (!ep || !ep[0]) continue;
         rj_val* o = rj_obj();
         rj_obj_set(o, "type",    rj_str(NAMES[i]));
-        rj_obj_set(o, "address", rj_str(g_zmq_ep[i]));
+        rj_obj_set(o, "address", rj_str(ep));
         char hb[16];
         snprintf(hb, sizeof hb, "%d", g_zmq_hwm ? g_zmq_hwm[i] : 1000);
         rj_obj_set(o, "hwm",     rj_num(hb));
@@ -1615,7 +1620,7 @@ static int mpe_member_rbf(const unsigned char id[32]){
 /* the per-entry object, shared by getmempoolentry and verbose getrawmempool */
 static int mpc_lookup_here(void* ctx, const unsigned char txid[32], mpc_entry* out);
 static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len);
-static int cmd_getrawmempool(const rj_val* params, rj_val** res){
+static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const char** em){
     /* verbose (params[0]==true) -> object keyed by txid; else -> array of
      * txids (display byte order).
      *
@@ -1658,12 +1663,41 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
      * ancestorsize/descendantsize sum the same. So the number vsize_adjusted
      * carried now travels as `vsize`, and `bip125-replaceable` -- a v31.1
      * field this entry lacked -- is emitted. */
-    int verbose = 0;
-    if (params && params->typ == RJ_ARR && params->nitems >= 1){
-        const rj_val* v = params->items[0];
-        if (v && v->typ == RJ_BOOL && v->str && v->str[0] == '1') verbose = 1;
+    /* 2026-09-19: the second argument, mempool_sequence (Core rpc/mempool.cpp
+     * MempoolToJSON). With verbose=false it wraps the txid list as
+     * {"txids": [...], "mempool_sequence": n}, n being the sequence the ZMQ
+     * `sequence` topic numbers its A/R events with, read under the SAME pool
+     * lock as the txids -- that pairing is what lets a subscriber line a
+     * snapshot up with the stream. With verbose=true Core refuses:
+     * RPC_INVALID_PARAMETER (-8) "Verbose results cannot contain mempool
+     * sequence values." Both arguments are type-checked first, lowest
+     * position first, as Core's RPCHelpMan does; null means "default". */
+    int verbose = 0, want_seq = 0;
+    if (params && params->typ == RJ_ARR){
+        rj_typeerrs te; rj_typeerr_init(&te);
+        if (params->nitems >= 1 && params->items[0] && params->items[0]->typ != RJ_NULL &&
+            params->items[0]->typ != RJ_BOOL)
+            rj_typeerr_add(&te, 1, "verbose", params->items[0], "bool");
+        if (params->nitems >= 2 && params->items[1] && params->items[1]->typ != RJ_NULL &&
+            params->items[1]->typ != RJ_BOOL)
+            rj_typeerr_add(&te, 2, "mempool_sequence", params->items[1], "bool");
+        if (rj_typeerr_fail(&te, ec, em)) return 0;
+        if (params->nitems >= 1){
+            const rj_val* v = params->items[0];
+            if (v && v->typ == RJ_BOOL && v->str && v->str[0] == '1') verbose = 1;
+        }
+        if (params->nitems >= 2){
+            const rj_val* v = params->items[1];
+            if (v && v->typ == RJ_BOOL && v->str && v->str[0] == '1') want_seq = 1;
+        }
+    }
+    if (verbose && want_seq){
+        *ec = -8; *em = "Verbose results cannot contain mempool sequence values.";
+        return 0;
     }
     rj_val* out = verbose ? rj_obj() : rj_arr();
+    unsigned long long mseq = 1;          /* Core's initial m_sequence_number */
+    if (!g_mph.mp && g_mph.mempool_sequence) mseq = g_mph.mempool_sequence();
     if (g_mph.mp){
         static const char* HEXD = "0123456789abcdef";
         mpl();
@@ -1719,7 +1753,16 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
         free(g_mpe_chunk); g_mpe_chunk = 0;
         free(g_mpe_vs); g_mpe_vs = 0; g_mpe_vs_n = 0;
         free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf = 0; g_mpe_inf_id = 0; g_mpe_inf_n = 0;
+        /* still inside the lock that covered the walk above */
+        if (g_mph.mempool_sequence) mseq = g_mph.mempool_sequence();
         mpu();
+    }
+    if (want_seq){
+        rj_val* o = rj_obj();
+        rj_obj_set(o, "txids", out);
+        char nb[24]; snprintf(nb, sizeof nb, "%llu", mseq);
+        rj_obj_set(o, "mempool_sequence", rj_num(nb));
+        out = o;
     }
     *res = out;
     return 1;
@@ -3811,7 +3854,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "ping"))               return cmd_ping(res, ec, em);
     if (!strcmp(m, "getzmqnotifications")) return cmd_getzmqnotifications(res);
     if (!strcmp(m, "getmempoolinfo"))     return cmd_getmempoolinfo(res);
-    if (!strcmp(m, "getrawmempool"))      return cmd_getrawmempool(params, res);
+    if (!strcmp(m, "getrawmempool"))      return cmd_getrawmempool(params, res, ec, em);
     if (!strcmp(m, "getmempoolentry"))    return cmd_getmempoolentry(params, res, ec, em);
     if (!strcmp(m, "getmempoolancestors"))   return cmd_getmempoolancestors(params, res, ec, em);
     if (!strcmp(m, "getmempooldescendants")) return cmd_getmempooldescendants(params, res, ec, em);

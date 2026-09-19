@@ -236,10 +236,11 @@ I2P destination.
 
 ### ZMQ and other keys
 
-- `zmqpubhashblock`, `zmqpubhashtx`, `zmqpubrawblock`, `zmqpubrawtx` take
-  `tcp://<interface>:<port>`; `tcp://*:PORT` is refused, name an interface
-  (`127.0.0.1` for local subscribers). A publisher has no authentication.
-  `zmqpubsequence` is not supported and is refused.
+- `zmqpubhashblock`, `zmqpubhashtx`, `zmqpubrawblock`, `zmqpubrawtx`,
+  `zmqpubsequence` take `tcp://<interface>:<port>`; `tcp://*:PORT` is
+  refused, name an interface (`127.0.0.1` for local subscribers). A
+  publisher has no authentication. `zmqpubsequence` (Core's A/R/C/D stream
+  with the mempool sequence number) was refused until 2026-09-19.
 - **Address history** (`addrindex=1`, 2026-09-16): the daemon builds it
   DURING the sync. The live journal (`addrindex.tail`) records every
   funding and spend from genesis; every `bmc.indexrunblocks` heights

@@ -665,6 +665,24 @@ void zmqpub_notify(const char* topic, const void* body, unsigned long blen){
     if (wake) zp_wake();
 }
 
+/* Is `topic` bound to an endpoint? (The drain of a staging ring asks, so a
+ * topic nobody configured costs a cursor move rather than a message build.) */
+int zmqpub_topic_active(const char* topic){
+    for (int i = 0; i < ZP_NTOPIC; i++)
+        if (!strcmp(topic, ZP_TOPICS[i])) return g_topic_ep[i] >= 0;
+    return 0;
+}
+
+/* Account for `n` messages of `topic` that were lost BEFORE reaching this
+ * publisher (a lapped staging ring). Core's per-topic sequence counts every
+ * message the notifier was asked to send, so a loss upstream must show up as
+ * the same gap a high-water-mark drop leaves -- a subscriber checking the
+ * 4-byte sequence is how it learns to resynchronise. */
+void zmqpub_skip(const char* topic, unsigned long n){
+    for (int i = 0; i < ZP_NTOPIC; i++)
+        if (!strcmp(topic, ZP_TOPICS[i]) && g_topic_ep[i] >= 0) g_topic_seq[i] += (u32)n;
+}
+
 /* Subscribers past the handshake, across all endpoints (tests, diagnostics). */
 int zmqpub_live_subscribers(void){
     int n = 0;

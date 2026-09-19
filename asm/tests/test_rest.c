@@ -44,7 +44,10 @@ int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, 
         if (mp && p0 && !strcmp(p0, TX1) && p1 == 1){ *result = J("{\"bestblock\":\"" BH2 "\",\"confirmations\":0,\"value\":1.00000000,\"scriptPubKey\":{\"asm\":\"\",\"desc\":\"raw(51)#00\",\"hex\":\"51\",\"type\":\"nonstandard\"},\"coinbase\":false}"); return 1; }
         *result = rj_null(); return 1; }
     if (!strcmp(method, "getmempoolinfo")){ *result = J("{\"loaded\":true,\"size\":1,\"bytes\":110}"); return 1; }
-    if (!strcmp(method, "getrawmempool")){ if (p0 && p0[0] == '1'){ *result = J("{\"" TX2 "\":{\"vsize\":110}}"); return 1; } *result = J("[\"" TX2 "\"]"); return 1; }
+    if (!strcmp(method, "getrawmempool")){
+        if (params->nitems > 1 && params->items[1]->typ == RJ_BOOL && params->items[1]->str[0] == '1'){
+            *result = J("{\"txids\":[\"" TX2 "\"],\"mempool_sequence\":7}"); return 1; }
+        if (p0 && p0[0] == '1'){ *result = J("{\"" TX2 "\":{\"vsize\":110}}"); return 1; } *result = J("[\"" TX2 "\"]"); return 1; }
     if (!strcmp(method, "getdeploymentinfo")){ *result = J(p0 ? "{\"hash\":\"" BH "\",\"height\":699999,\"deployments\":{}}" : "{\"hash\":\"" BH2 "\",\"height\":700000,\"deployments\":{}}"); return 1; }
     if (!strcmp(method, "getblockfilter")){ if (!g_filter_index){ *ec = -1; *em = "Index is not enabled for filtertype basic"; return 0; }
         if (p0 && !strcmp(p0, BH)){ *result = J("{\"filter\":\"0189aabb\",\"header\":\"" TX1 "\"}"); return 1; }
@@ -114,7 +117,14 @@ int main(void){
     GET("/rest/mempool/contents.json?verbose=false"); { rj_val* o = JSON(); ok(o && o->typ == RJ_ARR && o->nitems == 1, "mempool/contents.json?verbose=false: txids"); if (o) rj_free(o); }
     GET("/rest/mempool/contents.json?verbose=maybe"); ok(err_is(400, "The \"verbose\" query parameter must be either \"true\" or \"false\"."), "mempool contents bad verbose");
     GET("/rest/mempool/contents.json?mempool_sequence=true"); ok(err_is(400, "Verbose results cannot contain mempool sequence values. (hint: set \"verbose=false\")"), "mempool contents: verbose + sequence refused as Core does");
-    GET("/rest/mempool/contents.json?verbose=false&mempool_sequence=true"); ok(g_status == 400 && strstr(g_out, "mempool_sequence is not available"), "mempool_sequence: an explicit refusal (no sequence counter on this node)");
+    /* 2026-09-19: this used to pin a REFUSAL ("no sequence counter on this
+     * node"). The node keeps Core's mempool sequence now, so the route answers
+     * as Core's rest_mempool does: getrawmempool(false, true)'s object. */
+    GET("/rest/mempool/contents.json?verbose=false&mempool_sequence=true");
+    { rj_val* o = JSON(); const rj_val* ids = o ? rj_obj_get(o, "txids") : 0;
+      ok(o && o->typ == RJ_OBJ && ids && ids->typ == RJ_ARR && ids->nitems == 1 && !strcmp(S(o, "mempool_sequence"), "7"),
+         "mempool_sequence=true: {txids, mempool_sequence}, the second argument passed through");
+      if (o) rj_free(o); }
     GET("/rest/mempool/other.json"); ok(err_is(400, "Invalid URI format. Expected /rest/mempool/<info|contents>.json"), "mempool other");
     GET("/rest/mempool/info.hex"); ok(err_is(404, "output format not found (available: json)"), "mempool info.hex");
     /* blockfilter */

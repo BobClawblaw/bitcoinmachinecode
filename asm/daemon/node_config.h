@@ -79,6 +79,7 @@ typedef struct {
     char zmq_hashtx[64];
     char zmq_rawblock[64];
     char zmq_rawtx[64];
+    char zmq_sequence[64];       /* Core -zmqpubsequence (daemon/mempool_seq.h) */
     char bind_addr[64];          /* Core -bind: listen address (empty = any) */
     /* ---- anonymity networks (2026-08-28). Core's names and defaults. ---- */
     char proxy[64];              /* -proxy=ip:port   SOCKS5 for every network that has no more specific proxy */

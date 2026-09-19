@@ -496,6 +496,47 @@ static int g_depart_reason = 0;                 /* MPJ_* ; 0 = do not record */
 void mpool_policy_set_depart_reason(int r){ g_depart_reason = r; }
 int  mpool_policy_depart_reason(void){ return g_depart_reason; }
 
+/* ---- the mempool SEQUENCE hook (2026-09-19, Core -zmqpubsequence) ---------
+ * Core numbers every mempool add and every removal (m_sequence_number) and
+ * publishes 'A' for each add and 'R' for each removal EXCEPT a block's own
+ * transactions (txmempool.cpp removeUnchecked: BLOCK takes a number and
+ * publishes nothing). This hook is the one place both happen here: every
+ * insert is mpol_add_core's, and every removal is remove_node's or
+ * mpol_remove_marked's. kind: 'A' add, 'R' removed, 'M' mined (numbered,
+ * not published). Unlike the departure hook it is NOT gated on
+ * g_depart_reason -- a removal nobody labelled is still a removal, and a
+ * subscriber that missed it would hold a transaction the pool does not.
+ *
+ * ORDER, measured against Core rather than assumed: Core adds a transaction
+ * and THEN trims the pool (AcceptSingleTransaction -> LimitMempoolSize), so a
+ * newcomer's 'A' precedes the 'R's of what it pushed out, while the 'R's of
+ * what it REPLACED precede its 'A' (FinalizeSubpackage). This engine evicts
+ * BEFORE it stores (MEM-5/MEM-6, for reasons of its own), so eviction 'R's
+ * are held in g_seq_dbuf while the add runs and published after its 'A'. */
+static void (*g_seq_cb)(const unsigned char* txid, int kind) = 0;
+void mpool_policy_set_seq_cb(void (*fn)(const unsigned char*, int)){ g_seq_cb = fn; }
+static int       g_seq_defer = 0;
+static unsigned char (*g_seq_dbuf)[32] = 0;
+static uint32_t  g_seq_dn = 0, g_seq_dcap = 0;
+static void mpol_seq_removed(const unsigned char* txid, int mined){
+    if (!g_seq_cb) return;
+    if (g_seq_defer && !mined){
+        if (g_seq_dn == g_seq_dcap){
+            uint32_t want = g_seq_dcap ? g_seq_dcap * 2 : 256;
+            unsigned char (*nb)[32] = realloc(g_seq_dbuf, (size_t)want * 32);
+            if (!nb){ g_seq_cb(txid, 'R'); return; }   /* out of memory: early beats never */
+            g_seq_dbuf = nb; g_seq_dcap = want;
+        }
+        memcpy(g_seq_dbuf[g_seq_dn++], txid, 32);
+        return;
+    }
+    g_seq_cb(txid, mined ? 'M' : 'R');
+}
+static void mpol_seq_flush(void){
+    for (uint32_t i = 0; i < g_seq_dn; i++) if (g_seq_cb) g_seq_cb(g_seq_dbuf[i], 'R');
+    g_seq_dn = 0;
+}
+
 /* ========================================================================== */
 /* public API                                                                 */
 /* ========================================================================== */
@@ -1171,6 +1212,10 @@ static void remove_node(void* st, void* mp, int ci){
     unsigned char ct[32]; memcpy(ct, t[ci].txid, 32);
     if (g_depart_cb && g_depart_reason)
         g_depart_cb(ct, (unsigned long long)t[ci].size, (unsigned long long)t[ci].fee, g_depart_reason);
+    /* MINED is the only reason set around a confirmed transaction's removal
+     * (block_connect's per-transaction fallback); a conflict in that same
+     * path is re-labelled CONFLICTED before it gets here */
+    mpol_seq_removed(ct, g_depart_reason == 1 /* MPJ_MINED */);
     decr_ancestors(st, ci, (uint32_t)t[ci].size, t[ci].fee);
     mpool_del(mp, ct);
     { uint64_t* pb = (uint64_t*)((char*)st+64);
@@ -1289,6 +1334,10 @@ void mpool_policy_set_batch_connect(int on){ g_batch_connect = on ? 1 : 0; }
  * than reserved in .bss for every process that links this file. */
 static uint8_t*  g_rm_mark;
 static uint32_t* g_rm_remap;
+/* the index of the block transaction that marked each node: the sequence
+ * hook publishes removals in BLOCK order, as Core's removeForBlock walks the
+ * block (see mpol_remove_marked step 0) */
+static uint32_t* g_rm_order;
 static uint32_t  g_rm_cap;
 static int mpol_rm_reserve(uint32_t n){
     if (n <= g_rm_cap) return 1;
@@ -1296,11 +1345,20 @@ static int mpol_rm_reserve(uint32_t n){
     while (want < n){ if (want > 0x40000000u){ want = n; break; } want *= 2; }
     uint8_t*  m = realloc(g_rm_mark,  want);
     uint32_t* r = realloc(g_rm_remap, (size_t)want * sizeof *r);
+    uint32_t* o = realloc(g_rm_order, (size_t)want * sizeof *o);
     if (m) g_rm_mark = m;
     if (r) g_rm_remap = r;
-    if (!m || !r) return 0;
+    if (o) g_rm_order = o;
+    if (!m || !r || !o) return 0;
     g_rm_cap = want;
     return 1;
+}
+
+/* sort key for step 0 below: (block tx index, confirmed before conflicted,
+ * node index) packed so one integer compare orders them */
+static int mpol_u64_cmp(const void* a, const void* b){
+    uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+    return x < y ? -1 : x > y;
 }
 
 /* Remove every node whose mark byte is set, in one compaction.
@@ -1309,6 +1367,43 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
     mpol_node* t = mpol_nodes_base(st);
     uint8_t* mark = g_rm_mark;
     uint32_t* remap = g_rm_remap;
+
+    /* ---- 0. the sequence hook, in BLOCK order ----
+     * Core's removeForBlock walks the block: for each transaction, the
+     * transaction itself leaves (numbered, unpublished), then whatever
+     * conflicts with it (removeConflicts -> 'R'). Each removal takes the next
+     * mempool sequence number, so the numbers a subscriber sees on the 'R's
+     * depend on that order. Step 1 walks the NODE array instead, so the hook
+     * runs here, first, sorted by the block index that marked each node --
+     * mined before conflicted at the same index, node order after that. Only
+     * marked nodes are sorted: nothing is paid for the survivors. */
+    if (g_seq_cb){
+        uint64_t* key = NULL; uint32_t nk = 0, cap = 0;
+        for (uint32_t i = 0; i < n; i++){
+            if (!mark[i]) continue;
+            if (nk == cap){
+                uint32_t want = cap ? cap * 2 : 256;
+                uint64_t* nb = realloc(key, (size_t)want * sizeof *nb);
+                if (!nb){ free(key); key = NULL; nk = 0; break; }
+                key = nb; cap = want;
+            }
+            key[nk++] = ((uint64_t)(g_rm_order[i] & 0x7FFFFFFFu) << 33) |
+                        ((uint64_t)(mark[i] == 2) << 32) | i;
+        }
+        if (key && nk) qsort(key, nk, sizeof *key, mpol_u64_cmp);
+        if (key){
+            for (uint32_t k = 0; k < nk; k++){
+                uint32_t i = (uint32_t)(key[k] & 0xFFFFFFFFu);
+                /* mark 1 under a block connect = the block confirmed it */
+                mpol_seq_removed(t[i].txid, g_depart_reason == 1 && mark[i] == 1);
+            }
+            free(key);
+        } else {
+            /* no scratch: node order is still every removal, once */
+            for (uint32_t i = 0; i < n; i++)
+                if (mark[i]) mpol_seq_removed(t[i].txid, g_depart_reason == 1 && mark[i] == 1);
+        }
+    }
 
     /* ---- 1. per-node bookkeeping, while indices are still valid ---- */
     long nremoved = 0;
@@ -1437,8 +1532,9 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
  * A node already marked 1 that turns out to be a descendant of a conflict is
  * upgraded to 2: it is leaving either way, but its own descendants must then
  * follow it. */
-static void mpol_mark_with_descendants(void* st, uint32_t n, uint32_t root){
+static void mpol_mark_with_descendants(void* st, uint32_t n, uint32_t root, uint32_t order){
     if (root >= n || g_rm_mark[root] == 2) return;
+    if (!g_rm_mark[root]) g_rm_order[root] = order;
     g_rm_mark[root] = 2;
     mpol_node* t = mpol_nodes_base(st);
     int changed = 1, rounds = 0;
@@ -1448,7 +1544,9 @@ static void mpol_mark_with_descendants(void* st, uint32_t n, uint32_t root){
             if (g_rm_mark[i] == 2) continue;
             for (uint32_t k = 0; k < t[i].n_parents; k++){
                 uint32_t pv = mpol_par_at(st, &t[i], k);
-                if (pv < n && g_rm_mark[pv] == 2){ g_rm_mark[i] = 2; changed = 1; break; }
+                if (pv < n && g_rm_mark[pv] == 2){
+                    if (!g_rm_mark[i]) g_rm_order[i] = order;
+                    g_rm_mark[i] = 2; changed = 1; break; }
             }
         }
     }
@@ -2665,7 +2763,11 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
           for (int q = 0; q < wn; q++) memcpy(wt[q], mpol_nodes_base(st)[wc.idx[q]].txid, 32);
           floor_bump(st, wf * 1000 / ws + pol->incremental_fee);
           { int prev_r = g_depart_reason; g_depart_reason = 3 /* MPJ_EVICTED */;
+            /* the sequence topic publishes these AFTER the newcomer's 'A', as
+             * Core's add-then-trim does (see g_seq_cb) */
+            g_seq_defer = 1;
             for (int q = 0; q < wn; q++) mpool_policy_remove_package(st, mp, wt[q]);   /* descendants live in the chunk too; a gone txid is a no-op */
+            g_seq_defer = 0;
             g_depart_reason = prev_r; }
           /* MEM-5 (audit 2026-09-03): the chunk just evicted must not have
            * contained one of THIS transaction's parents -- and the check has
@@ -2829,7 +2931,15 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
 long mpool_policy_add(mpol_cfg* pol, void* st, void* mp,
                       const unsigned char* tx, unsigned long txlen,
                       const unsigned char txid[32], void* utxo){
-    return mpol_add_core(pol, st, mp, tx, txlen, txid, utxo, 1, NULL, NULL);
+    long r = mpol_add_core(pol, st, mp, tx, txlen, txid, utxo, 1, NULL, NULL);
+    /* The ONE insert point, so the one 'A'. Then the evictions it caused
+     * (held back by g_seq_defer), which are real departures whether or not
+     * the add went on to succeed -- MEM-5 can evict and still refuse. */
+    if (g_seq_cb){
+        if (r == 1) g_seq_cb(txid, 'A');
+        mpol_seq_flush();
+    }
+    return r;
 }
 
 long mpool_policy_test(mpol_cfg* pol, void* st, void* mp,
@@ -2909,7 +3019,10 @@ long mpool_policy_block_connect(void* st, void* mp,
             int self_ci = -1;
             if (batch){
                 self_ci = find_node(st, txid);
-                if (self_ci >= 0) g_rm_mark[self_ci] = 1;   /* confirmed: alone */
+                if (self_ci >= 0){
+                    if (!g_rm_mark[self_ci]) g_rm_order[self_ci] = (uint32_t)j;
+                    g_rm_mark[self_ci] = 1;                 /* confirmed: alone */
+                }
             } else {
                 removed += remove_confirmed(st, mp, txid);
             }
@@ -2938,11 +3051,18 @@ long mpool_policy_block_connect(void* st, void* mp,
                          * outpoint, so if this transaction is the claimer,
                          * no other in-pool transaction is. */
                         if (cl != self_ci)
-                            mpol_mark_with_descendants(st, n_nodes, (uint32_t)cl);
+                            mpol_mark_with_descendants(st, n_nodes, (uint32_t)cl, (uint32_t)j);
                     } else {
                         unsigned char ct[32];
                         memcpy(ct, mpol_nodes_base(st)[cl].txid, 32);
+                        /* a CONFLICT, not a confirmation: labelled as one, as
+                         * the batch path's mark 2 is. This fallback left it
+                         * under MINED, which told the departure journal the
+                         * opposite of the truth and would have kept the
+                         * sequence topic's 'R' from firing. */
+                        int prev_c = g_depart_reason; g_depart_reason = 5 /* MPJ_CONFLICTED */;
                         removed += mpool_policy_remove_package(st, mp, ct);
+                        g_depart_reason = prev_c;
                     }
                 }
             }
