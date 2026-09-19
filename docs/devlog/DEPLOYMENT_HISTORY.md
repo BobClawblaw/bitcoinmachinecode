@@ -1170,3 +1170,35 @@ that would have hit any fresh sync of the live build.
   history base is being rebuilt (builder pid 1884083, rows 0..966124,
   attempt 1)". Pass 1 at ~1.7k blocks/s per worker.
 
+
+## 2026-09-18 21:16Z — `deploy-20260918a`: v31.1 RPC parity (PRs #269, #271)
+
+- **Why:** `getpeerinfo` never reported `addrlocal` and omitted
+  `last_block`/`last_transaction` at 0 (#269). Against the v31.1 release node
+  (RPC 8337), `getdeploymentinfo` lacked taproot and mempool entries lacked
+  `bip125-replaceable` while carrying two dev-build-only fields (#271). #270
+  (harness) and #266–#268 (archive frontier guard, `+44` position file number)
+  ride along; the previous deploy was `deploy-20260916h`.
+- **What:** `main` at `323e657b`, full gate green on the merged tree
+  (MAKE_EXIT=0). `cp -a daemon/bmcbitcoind daemon/bmcbitcoind.deploy-20260918a`,
+  atomic relink of `bmcbitcoind.live`, `sudo systemctl restart bmcbitcoind`.
+- **The first start failed, and systemd retried it.** The parent exited at
+  21:16:18 while its download worker (pid 24243, SIGTERM forwarded at
+  18.850) still held the datadir lock. The new process hit `FATAL: cannot obtain
+  a lock` at 21:16:19. `Restart=on-failure` started it again at 21:16:29, and
+  that start succeeded. This is the 2026-09-06 lesson again ("wait for the
+  WORKER, not the parent"): the service reports stopped before its worker has
+  released the lock. Not fixed here.
+- **Verified live:**
+  - `bmc_build_commit 323e657b`, `dirty false`, at the tip (967,610).
+  - The UTXO engine reloaded at 967,610 with `live=165258639`, exactly the
+    shutdown's `txouts=`.
+  - The mempool reloaded 78,256 of 78,278 saved transactions (21:23:41).
+  - `getpeerinfo`: 4 of 6 peers carry `addrlocal` (the other two sent Core's
+    empty `addr_recv`), and every entry has both times and both byte maps.
+  - The v31.1 field diff now matches on `getdeploymentinfo` and
+    `bip125-replaceable`.
+- **Still open, found by the same diff:** `chunkweight`/`fees.chunk` are
+  missing on every mempool entry that belongs to a multi-transaction cluster
+  (71,710 of 79,626); only singletons carry them. Core reports both on every
+  entry. This predates the deploy.
