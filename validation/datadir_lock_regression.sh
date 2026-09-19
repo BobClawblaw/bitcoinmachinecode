@@ -52,8 +52,10 @@ if [ $? -eq 0 ]; then ck "instance B never reached the worker fork" 1
                  else ck "instance B never reached the worker fork" 0; fi
 
 # ---- and the lock must be released when A goes away ----------------------
+# No sleep between A's exit and C's start (there was a `sleep 2` here): since
+# 2026-09-19 the main pid exits only once no other process of it holds the
+# lock, and that is the property a restart relies on.
 kill "$A_PID" 2>/dev/null; wait "$A_PID" 2>/dev/null; A_PID=
-sleep 2
 "$BIN" -conf="$D/bitcoin.conf" serve "$D" 19556 > "$D/c.log" 2>&1 &
 C_PID=$!
 sleep 5

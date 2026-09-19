@@ -39,6 +39,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <sys/file.h>          /* DMN-1: flock() for the datadir lock */
+#include <sys/syscall.h>       /* kcmp: which processes share our datadir lock */
 #include "secure_zero.h"    /* WAL-3: a memset the optimiser may not delete */
 #include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
 #include "peer_timeout.h"      /* CC-7: -peertimeout, the handshake deadline */
@@ -2145,6 +2146,183 @@ static volatile sig_atomic_t g_in_utxo_reload = 0;
 static void handle_shutdown_signal(int sig){
     g_shutdown_requested = sig;
     if (g_in_utxo_reload) _exit(0);
+}
+
+/* ==== the datadir lock outlives the parent ================================
+ * (2026-09-19) The lock is a flock on <datadir>/<chain>/.lock (DMN-1, see
+ * datadir_lock_acquire). flock belongs to the OPEN FILE DESCRIPTION, and
+ * every fork shares it: the download worker, the inbound serve children, and
+ * everything THEY fork (the coinstats fold worker, the compaction child, the
+ * pass helpers, the exec'd index builders) all hold the same lock. It is
+ * released when the LAST of them closes it.
+ *
+ * The serve parent used to forward SIGTERM to the worker and _exit(0) on the
+ * spot, so "the main pid exited" never meant "the datadir is free": the
+ * worker was typically still flushing (fee estimates, the UTXO checkpoint,
+ * the fold worker's last commit). Anything that restarts on the main pid --
+ * `kill <pid>; relaunch`, a supervisor, KillMode=mixed/process, the bench
+ * and gate harnesses -- then met "cannot obtain a lock" (tests/
+ * test_stop_waits_for_worker reproduces it: lock held at the parent's exit
+ * every time). Now the parent is the last to leave: it signals its own
+ * children, and exits only when no other process holds its lock.
+ *
+ * "Holds its lock" is decided per process from /proc/<pid>/fd: an fd on the
+ * .lock inode that is the SAME open file description as ours (kcmp
+ * KCMP_FILE). The kcmp matters: a NEW instance that has opened .lock and is
+ * waiting for it (datadir_lock_acquire) holds a different description, and
+ * must not be mistaken for one of ours. Where kcmp is unavailable the inode
+ * alone decides (conservative: we wait for it too, bounded). */
+#ifndef KCMP_FILE
+#define KCMP_FILE 0
+#endif
+static int datadir_lock_fd;              /* defined (= -1) with datadir_lock_acquire below */
+#define LOCK_HOLDERS_MAX 64
+typedef struct { int pid; char comm[20]; } lock_holder_t;
+static void proc_comm(int pid, char* out, size_t cap){
+    char p[64]; snprintf(p, sizeof p, "/proc/%d/comm", pid);
+    int fd = open(p, O_RDONLY); ssize_t n = fd >= 0 ? read(fd, out, cap - 1) : -1;
+    if (fd >= 0) close(fd);
+    if (n <= 0){ snprintf(out, cap, "?"); return; }
+    out[n] = 0; if (n > 0 && out[n-1] == '\n') out[n-1] = 0;
+}
+/* Processes other than this one with an fd on the file `lockfd` is open on;
+ * with match_ofd, only those whose fd is the SAME open file description as
+ * lockfd. Returns the count (the first `cap` are described in out[]).
+ *
+ * Candidates are picked by the fd's link TEXT (readlink never touches the
+ * file system, so a process with an fd on a hung mount cannot stall a
+ * shutdown here) and only then confirmed by stat and kcmp. */
+static int lock_holders_scan(int lockfd, int match_ofd, lock_holder_t* out, int cap){
+    int n = 0, self = (int)getpid();
+    char want[4096], lp[64]; struct stat ls;
+    snprintf(lp, sizeof lp, "/proc/self/fd/%d", lockfd);
+    ssize_t wl = readlink(lp, want, sizeof want - 1);
+    if (wl <= 0 || fstat(lockfd, &ls) != 0) return 0;
+    want[wl] = 0;
+    DIR* pd = opendir("/proc"); if (!pd) return 0;
+    struct dirent* e;
+    while ((e = readdir(pd))){
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        int pid = atoi(e->d_name); if (pid == self) continue;
+        char fdp[64]; snprintf(fdp, sizeof fdp, "/proc/%d/fd", pid);
+        DIR* fdd = opendir(fdp); if (!fdd) continue;      /* not ours to read, or gone */
+        struct dirent* f; int hit = 0;
+        while (!hit && (f = readdir(fdd))){
+            if (f->d_name[0] < '0' || f->d_name[0] > '9') continue;
+            char link[4096]; ssize_t ll = readlinkat(dirfd(fdd), f->d_name, link, sizeof link - 1);
+            if (ll != wl || memcmp(link, want, (size_t)wl) != 0) continue;
+            struct stat s;
+            if (fstatat(dirfd(fdd), f->d_name, &s, 0) != 0) continue;
+            if (s.st_dev != ls.st_dev || s.st_ino != ls.st_ino) continue;
+            if (match_ofd){
+                long r = syscall(SYS_kcmp, (pid_t)self, (pid_t)pid, KCMP_FILE, (unsigned long)lockfd, strtoul(f->d_name, 0, 10));
+                if (r > 0) continue;                         /* another description of the same file */
+            }
+            hit = 1;
+        }
+        closedir(fdd);
+        if (!hit) continue;
+        if (n < cap){ out[n].pid = pid; proc_comm(pid, out[n].comm, sizeof out[n].comm); }
+        n++;
+    }
+    closedir(pd);
+    return n;
+}
+static void lock_holders_fmt(const lock_holder_t* h, int n, char* buf, size_t cap){
+    size_t o = 0; buf[0] = 0;
+    for (int i = 0; i < n && i < LOCK_HOLDERS_MAX && o + 48 < cap; i++)
+        o += (size_t)snprintf(buf + o, cap - o, "%s%d (%s)", i ? ", " : "", h[i].pid, h[i].comm);
+    if (n > LOCK_HOLDERS_MAX && o + 16 < cap) snprintf(buf + o, cap - o, ", +%d more", n - LOCK_HOLDERS_MAX);
+}
+static long long mono_now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000LL + t.tv_nsec/1000000; }
+
+/* Wait until no other process holds this process's datadir lock, so that
+ * our exit releases it. The children were signalled by the caller; each is
+ * expected to stop its own children. What is left holding the lock after the
+ * download WORKER has exited has lost its owner, and gets SIGTERM from here.
+ *
+ * Bounded, deliberately with escalation: after max_s seconds every remaining
+ * holder is named by pid and name and SIGKILLed. Leaving it would not be
+ * safer -- it keeps the lock, so the next instance cannot start, and under
+ * systemd TimeoutStopSec would SIGKILL the whole unit a little later
+ * anyway, without saying who was stuck. Everything the worker writes is
+ * crash-safe by design (the WAL is the truth; an unlanded checkpoint rolls
+ * back at boot), so a kill costs a replay, never a corrupt datadir. max_s is
+ * kept below the production unit's TimeoutStopSec (900 s) for that reason:
+ * the log line naming the stuck process has to be written before systemd's
+ * own kill. Returns the number of holders left at the end (0 = released). */
+#define SHUTDOWN_LOCK_WAIT_S 600
+static int shutdown_wait_lock_released(int max_s, const char* who){
+    if (datadir_lock_fd < 0) return 0;
+    long long t0 = mono_now_ms(), next_log = t0 + 10000, killed_at = 0;
+    int orphans_termed = 0, worker_logged = 0;
+    lock_holder_t h[LOCK_HOLDERS_MAX]; char desc[2048];
+    for (int last = 0;; ){
+        int st; pid_t p;
+        while ((p = waitpid(-1, &st, WNOHANG)) > 0)
+            if (g_dl_worker_pid > 0 && p == g_dl_worker_pid){ g_dl_worker_exited = 1; g_dl_worker_status = st; }
+        if (g_dl_worker_pid > 0 && g_dl_worker_exited && !worker_logged){
+            int ws = (int)g_dl_worker_status; worker_logged = 1;
+            if (WIFSIGNALED(ws)) fprintf(stderr, "[%s] download worker pid %d ended on signal %d (%.1fs)\n", who, (int)g_dl_worker_pid, WTERMSIG(ws), (mono_now_ms() - t0) / 1000.0);
+            else fprintf(stderr, "[%s] download worker pid %d exited with status %d (%.1fs)\n", who, (int)g_dl_worker_pid, WEXITSTATUS(ws), (mono_now_ms() - t0) / 1000.0);
+        }
+        if (last){
+            fprintf(stderr, "[%s] datadir lock held by no other process (waited %.1fs) -- exiting releases it\n", who, (mono_now_ms() - t0) / 1000.0);
+            return 0;
+        }
+        int n = lock_holders_scan(datadir_lock_fd, 1, h, LOCK_HOLDERS_MAX);
+        long long now = mono_now_ms();
+        if (n == 0){ last = 1; continue; }             /* one more pass reaps (and reports) a worker that just left */
+        lock_holders_fmt(h, n, desc, sizeof desc);
+        if ((g_dl_worker_pid <= 0 || g_dl_worker_exited) && !orphans_termed){
+            orphans_termed = 1;
+            fprintf(stderr, "[%s] %d process(es) still hold the datadir lock with the download worker gone: %s -- SIGTERM\n", who, n, desc);
+            for (int i = 0; i < n && i < LOCK_HOLDERS_MAX; i++) kill(h[i].pid, SIGTERM);
+        }
+        if (!killed_at && now - t0 >= (long long)max_s * 1000){
+            fprintf(stderr, "[%s] WARNING: %d process(es) still hold the datadir lock after %ds: %s -- SIGKILL "
+                            "(each would keep the next start from locking the datadir)\n", who, n, max_s, desc);
+            for (int i = 0; i < n && i < LOCK_HOLDERS_MAX; i++) kill(h[i].pid, SIGKILL);
+            killed_at = now;
+        } else if (killed_at && now - killed_at >= 10000){
+            fprintf(stderr, "[%s] ERROR: the datadir lock is STILL held 10s after SIGKILL: %s -- exiting anyway; "
+                            "the next start is refused until they are gone\n", who, desc);
+            return n;
+        } else if (now >= next_log){
+            fprintf(stderr, "[%s] waiting for %d process(es) holding the datadir lock (%.0fs): %s\n", who, n, (now - t0) / 1000.0, desc);
+            next_log = now + 10000;
+        }
+        usleep(now - t0 < 2000 ? 20000 : 200000);
+    }
+}
+/* <datadir>/<chain>/.stopping: this instance's pid while it waits above, so
+ * a start that finds the lock held can tell "the previous instance is
+ * finishing its stop" (wait, bounded) from "another instance is running"
+ * (refuse at once, as Core does). Removed just before the exit. */
+#define STOPPING_MARKER ".stopping"
+static void stopping_marker_write(void){
+    int fd = open(STOPPING_MARKER ".tmp", O_WRONLY|O_CREAT|O_TRUNC, 0600); if (fd < 0) return;
+    char b[32]; int n = snprintf(b, sizeof b, "%d\n", (int)getpid());
+    ssize_t w = write(fd, b, (size_t)n); close(fd);
+    if (w == n) rename(STOPPING_MARKER ".tmp", STOPPING_MARKER); else unlink(STOPPING_MARKER ".tmp");
+}
+/* The parent's last act, on every exit path that runs after the worker fork:
+ * signal the inbound serve children (the worker was signalled by the caller;
+ * a SIGTERM to a serve child is deferred past any mempool critical section
+ * by mp_lock), wait for the lock, then leave. */
+static int is_my_child(int pid){            /* a tracked pid may have been reused since */
+    char p[64], b[512]; snprintf(p, sizeof p, "/proc/%d/stat", pid);
+    int fd = open(p, O_RDONLY); if (fd < 0) return 0;
+    ssize_t n = read(fd, b, sizeof b - 1); close(fd); if (n <= 0) return 0;
+    b[n] = 0; char* rp = strrchr(b, ')'); int ppid = -1;   /* comm may contain spaces: parse after the last ')' */
+    if (!rp || sscanf(rp + 1, " %*c %d", &ppid) != 1) return 0;
+    return ppid == (int)getpid();
+}
+static void parent_stop_and_wait(int max_s){
+    for (int i = 0; i < upl_n; i++) if (upl_pid[i] > 0 && is_my_child(upl_pid[i])) kill(upl_pid[i], SIGTERM);
+    stopping_marker_write();
+    shutdown_wait_lock_released(max_s, "serve");
+    unlink(STOPPING_MARKER);
 }
 
 /* Connect + handshake one outbound seed, returning a long-lived fd (or -1).
@@ -8563,6 +8741,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * persist coinstats.dat (bounded; a kill only costs a re-seed). */
             { extern void csi_worker_stop(void) __attribute__((weak));
               if (csi_worker_stop) csi_worker_stop(); }
+            /* same rule as the serve parent's exit: no thread of this
+             * process may be inside the mempool lock when _exit kills it */
+            { extern int mp_quiesce(long) __attribute__((weak)); if (mp_quiesce) mp_quiesce(5000); }
             _exit(0);
         }
         long long now_ms = 0;
@@ -10007,6 +10188,10 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             int st = (int)g_dl_worker_status;
             if (WIFSIGNALED(st)) fprintf(stderr,"[serve] FATAL: download worker pid %d died on signal %d -- exiting so systemd restarts the unit\n", (int)g_dl_worker_pid, WTERMSIG(st));
             else fprintf(stderr,"[serve] FATAL: download worker pid %d exited with status %d -- exiting so systemd restarts the unit\n", (int)g_dl_worker_pid, WEXITSTATUS(st));
+            /* the restart must find the datadir free: the worker's orphans
+             * and the serve children still hold the lock */
+            { extern int mp_quiesce(long) __attribute__((weak)); if (mp_quiesce) mp_quiesce(5000); }
+            parent_stop_and_wait(60);
             _exit(1);
         }
         if(g_shutdown_requested){
@@ -10021,6 +10206,15 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 if(w >= 0) fprintf(stderr,"[mempool] saved %ld transaction(s) to mempool.dat\n", w);
                 else       fprintf(stderr,"[mempool] could not save mempool.dat\n");
             }
+            /* This process's RPC and Esplora threads take the mempool lock;
+             * the _exit below kills them wherever they are, so none may be
+             * inside it then (mempool_cfg.c, 2026-09-19). From here on they
+             * park at the lock instead of entering. Bounded: a thread still
+             * inside after 5 s is named by count and left to EOWNERDEAD, the
+             * recovery path that exists for exactly this. */
+            { extern int mp_quiesce(long) __attribute__((weak));
+              int in = mp_quiesce ? mp_quiesce(5000) : 0;
+              if(in > 0) fprintf(stderr,"[serve] WARNING: %d thread(s) still inside the mempool lock after 5s -- exiting anyway (the next locker recovers it)\n", in); }
             if(g_dl_worker_pid>0){
                 kill(g_dl_worker_pid, SIGTERM);
                 fprintf(stderr,"[serve] forwarded SIGTERM to download worker pid %d\n", (int)g_dl_worker_pid);
@@ -10028,9 +10222,13 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             /* run BEFORE the credential and pidfile go, so a hook that
              * wants to read either still can */
             if(g_cfg.shutdownnotify[0]) notify_run(g_cfg.shutdownnotify, "", "shutdownnotify");
-            /* a dead node must not leave a usable credential on disk, nor a
-             * pidfile pointing at a pid that is about to be reused */
+            /* a dead node must not leave a usable credential on disk */
             rpc_cookie_remove();
+            /* The main pid's exit must MEAN the datadir is free (see
+             * shutdown_wait_lock_released): wait for the worker and every
+             * other process sharing the lock. */
+            parent_stop_and_wait(SHUTDOWN_LOCK_WAIT_S);
+            /* ...nor a pidfile pointing at a pid that is about to be reused */
             if(g_cfg.pidfile[0]) unlink(g_cfg.pidfile);
             _exit(0);
         }
@@ -10219,6 +10417,10 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                      * inbound peers waited for all N (systemd: up to 900 s). */
                     signal(SIGTERM, SIG_DFL);
                     signal(SIGINT,  SIG_DFL);
+                    /* the mempool lock's per-process gate: a parent RPC thread
+                     * inside it at the fork left a count no thread here owns */
+                    { extern void mp_fork_child_reset(void) __attribute__((weak));
+                      if (mp_fork_child_reset) mp_fork_child_reset(); }
                     /* This child serves exactly one peer, so the permissions
                      * its listener granted are simply this process's. No
                      * shared table, no fd keying, nothing to clean up when the
@@ -10433,16 +10635,56 @@ static int datadir_lock_acquire(const char* effdir){
         fprintf(stderr,"[boot] FATAL: cannot open %s/.lock: %s\n", effdir, strerror(errno));
         return 0;
     }
-    if(flock(datadir_lock_fd, LOCK_EX|LOCK_NB) != 0){
-        if(errno == EWOULDBLOCK)
-            fprintf(stderr,"[boot] FATAL: cannot obtain a lock on data directory %s. "
-                           "bmcbitcoind is probably already running.\n", effdir);
-        else
-            fprintf(stderr,"[boot] FATAL: cannot lock %s/.lock: %s\n", effdir, strerror(errno));
+    if(flock(datadir_lock_fd, LOCK_EX|LOCK_NB) == 0) return 1;
+    if(errno != EWOULDBLOCK){
+        fprintf(stderr,"[boot] FATAL: cannot lock %s/.lock: %s\n", effdir, strerror(errno));
         close(datadir_lock_fd); datadir_lock_fd = -1;
         return 0;
     }
-    return 1;
+    /* 2026-09-19: held. Refuse at once, as Core does, when another instance
+     * is RUNNING. Wait, bounded, in the two cases where the holder is on its
+     * way out:
+     *   - the previous instance is finishing its stop: its parent now stays
+     *     until the lock is free and says so in .stopping (its pid). A
+     *     relaunch that does not wait for that pid lands here.
+     *   - no process we can see holds it. Three production restarts
+     *     (2026-09-15 10:10:06 and 15:25:38, 2026-09-18 21:16:19) failed here
+     *     ~50 ms after systemd had reported the whole old unit gone -- its
+     *     control-group stop waits for every process, and flock is released
+     *     before a process leaves its cgroup, so which process held it then
+     *     is NOT established. Retrying for a few seconds costs nothing when
+     *     the holder is truly gone, and the holder list below is logged
+     *     either way so the next occurrence names it. */
+    lock_holder_t h[LOCK_HOLDERS_MAX]; char desc[2048];
+    int n = lock_holders_scan(datadir_lock_fd, 0, h, LOCK_HOLDERS_MAX);
+    lock_holders_fmt(h, n, desc, sizeof desc);
+    int stopper = 0; char own_comm[20], their_comm[20];
+    { FILE* f = fopen(STOPPING_MARKER, "r");
+      if (f){ if (fscanf(f, "%d", &stopper) != 1) stopper = 0; fclose(f); }
+      proc_comm((int)getpid(), own_comm, sizeof own_comm);
+      if (stopper > 0){ proc_comm(stopper, their_comm, sizeof their_comm);
+                        if (kill(stopper, 0) != 0 || strcmp(own_comm, their_comm) != 0) stopper = 0; } }
+    int wait_s = stopper > 0 ? 120 : n == 0 ? 5 : 0;
+    if (wait_s > 0){
+        if (stopper > 0) fprintf(stderr,"[boot] data directory %s is locked by the previous instance (pid %d), which is stopping; "
+                                        "waiting up to %ds (holders: %s)\n", effdir, stopper, wait_s, n ? desc : "none visible");
+        else fprintf(stderr,"[boot] data directory %s is locked but no process visible to us holds it; retrying for %ds\n", effdir, wait_s);
+        long long t0 = mono_now_ms();
+        while (mono_now_ms() - t0 < (long long)wait_s * 1000){
+            usleep(50000);
+            if (flock(datadir_lock_fd, LOCK_EX|LOCK_NB) == 0){
+                fprintf(stderr,"[boot] data directory lock obtained after %.2fs\n", (mono_now_ms() - t0) / 1000.0);
+                return 1;
+            }
+        }
+        n = lock_holders_scan(datadir_lock_fd, 0, h, LOCK_HOLDERS_MAX);
+        lock_holders_fmt(h, n, desc, sizeof desc);
+    }
+    fprintf(stderr,"[boot] FATAL: cannot obtain a lock on data directory %s. "
+                   "bmcbitcoind is probably already running.\n", effdir);
+    fprintf(stderr,"[boot]        held by: %s\n", n ? desc : "no process visible to this user");
+    close(datadir_lock_fd); datadir_lock_fd = -1;
+    return 0;
 }
 
 int main(int argc, char** argv){
@@ -11314,6 +11556,7 @@ int main(int argc, char** argv){
              * worker's start under the pending SIGTERM left utxo.idx empty
              * (a full UTXO rebuild followed). A stop is a stop. */
             fprintf(stderr,"[boot] shutdown requested during the catch-up -- exiting before the worker starts\n");
+            parent_stop_and_wait(60);
             _exit(0);
         }
         if(caught>0){
@@ -11405,6 +11648,8 @@ int main(int argc, char** argv){
 
         pid_t dl = fork();
         if(dl==0){
+            { extern void mp_fork_child_reset(void) __attribute__((weak));
+              if (mp_fork_child_reset) mp_fork_child_reset(); }
             if(g_txoq_parent >= 0){ close(g_txoq_parent); g_txoq_parent = -1; }
             /* TXOQ-1 (2026-09-05 benchmark): register the between-block
              * service hook before the worker's first utxo_live_catchup, so a
