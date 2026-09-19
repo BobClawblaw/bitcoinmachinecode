@@ -1202,3 +1202,36 @@ that would have hit any fresh sync of the live build.
   missing on every mempool entry that belongs to a multi-transaction cluster
   (71,710 of 79,626); only singletons carry them. Core reports both on every
   entry. This predates the deploy.
+
+## 2026-09-19 11:50Z — `deploy-20260919a`: the 2026-09-19 batches (PRs #273–#280)
+
+- **What:** `main` at `d66005c9`, full gate green on the merged tree (MAKE_EXIT=0,
+  all six new suites ran). Binary and all five index helpers from the same build.
+  `cp -a`, atomic relink of `bmcbitcoind.live`, then `systemctl stop`, a wait until no
+  process ran the old binary, and `systemctl start`. The old build stopped in under
+  1 s with nothing left over. The new one started first time (`NRestarts=0`) and
+  answered RPC 102 s later.
+- **Config, same step** (backup `bitcoin.conf.bak-20260919-deploy`): `txindex=1` and
+  `txospenderindex=1`. #275 gates each index on its key and production had neither
+  line, though the Esplora facade serves /tx and outspends from both.
+  `zmqpubsequence=tcp://127.0.0.1:28334`, which #278 implemented.
+- **Verified live:**
+  - `bmc_build_commit d66005c9`, not dirty, at the tip (967,700); all five indexes synced.
+  - `getzmqnotifications`: five topics, hwm 1000 each.
+  - The index tails resumed from their runs: txindex base 964,174, txospender base
+    966,038.
+  - No false "not a usable number" warnings (#274).
+  - RPC: uptime 2 ms, getblockcount 1 ms, getblockchaininfo 1 ms, getindexinfo
+    18 ms. getchaintxstats took 22.9 s on its first call (a cold build of the
+    per-height array) and 1 ms after that (#280).
+  - `getrawmempool false true` returns `mempool_sequence`.
+  - getpeerinfo: 5 of 6 peers carry addrlocal, every entry has
+    last_block/last_transaction, and all 6 show bytessent > 0.
+  - A real libzmq subscriber on all three sockets got a 1,532,344-byte rawblock
+    whose header hash equals its hashblock (#274; before this, rawblock was never
+    delivered), and a `sequence` stream of A 721 / R 4 / C 1 with 0 per-topic gaps.
+- **Found:** `[zmq] notification ring overrun: N transaction(s) not published`.
+  Mempool accepts that never reach hashtx/rawtx/sequence. This predates the deploy:
+  the old build logged 77,683 since 01:05, a few at a time in steady state. The new
+  one dropped 56,243 during the boot reload of mempool.dat, when 78k transactions
+  enter at once.
