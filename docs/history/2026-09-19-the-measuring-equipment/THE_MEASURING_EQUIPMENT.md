@@ -47,8 +47,10 @@ The short version of the state on 2026-09-19:
   (~5%) in bmc's favour. The report that records it says "Treat that
   as indicative, not clean", and so does this one: both runs were loaded by a
   monitoring tool, in different ways (Part IV). The clean pair, an unpolled Core
-  rerun and run 28 on today's code, was in progress when this was written:
-  [[PENDING: Core rerun wall clock]] and [[PENDING: run 28 wall clock]].
+  rerun and run 28 on today's code, was in progress when this was written.
+  Both finished by 2026-09-21: Core v31.1 left IBD in 19 h 32 m 54 s and
+  run 28 in 18 h 24 m 02 s. That is 1 h 08 m 52 s (5.9%) in bmc's favour, and
+  run 28's UTXO set was MuHash-identical to Core's at 968,025 (Chapter 20).
 
 - Parity. Every one of Core v31.1's RPC method names exists on the node and
   none is a stub. More usefully, the response shapes are now diffed field by
@@ -573,20 +575,55 @@ RPC. A regtest agent had reported the same trap earlier that day, and the
 finding did not reach the benchmark config. The one-second-old datadir was
 moved aside, not deleted, and the rerun began 29 minutes after run 27 ended.
 
-Results of the clean pair:
+Results of the clean pair (filled in on 2026-09-21 from the runs' own logs):
 
 | | Core v31.1 rerun | bmc run 28 |
 |---|---|---|
-| started | 2026-09-19 14:28:33Z | [[PENDING]] |
-| build | v31.1 `9be056a8` | [[PENDING: main commit]] |
-| left IBD / reached tip | [[PENDING: watch.log IBD_END]] | [[PENDING: phase.log IBD_END]] |
-| wall clock | [[PENDING]] | [[PENDING]] |
-| UTXO set vs Core | (the oracle) | [[PENDING: capstone]] |
-| strangers on the RPC port | [[PENDING: watch.log]] | [[PENDING: phase.log]] |
+| started | 2026-09-19 14:28:33Z | 2026-09-20 21:36:53Z |
+| build | v31.1 `9be056a8` | main `1562ae86` |
+| left IBD / reached tip | 2026-09-20 10:01:27Z, `Leaving InitialBlockDownload` at 967,690 | 2026-09-21 16:00:55Z, `[dlc] catch-up done` with the connected tip at 967,898 |
+| wall clock | 19 h 32 m 54 s | 18 h 24 m 02 s |
+| UTXO set vs Core | (the oracle) | MuHash identical at 968,025 |
+| strangers on the RPC port | none (one false positive, fixed in #285) | one burst: 15 connections closed within a minute at 05:07Z, caller not identified |
 
-Comparing the two Core runs will also measure what the polling cost Core, segment
-by segment, from height ~580,000 onward, where the first run's log survives:
-[[PENDING]].
+bmc was 1 h 08 m 52 s ahead, 5.9% of Core's time. From 500,000 on, run 28 was
+4% to 7% faster than Core in every 100,000-block segment. The two runs were
+sequential, on different days and different peers, and each side ran once.
+
+Run 28 needed a harness repair before its capstone could run. Once the node
+logged `catch-up done`, it stopped writing the progress lines the harness read,
+so the monitor never saw the end and reported that the heartbeat had stopped
+moving. The monitor was restarted with the fix (PR #289); the node was not.
+The capstone ran at 17:45Z:
+
+    2026-09-21T17:45:46Z PASS muhash identical at 968025
+        (6e867a52c419fef00cec1768da7e8fbdf38a610c410cd4c4d01f02eef017fe2e)
+
+The end time comes from the node's own log line, so the delay did not change
+it. The full comparison is in the separate report
+"Run 28 vs Core" (docs/history/2026-09-21-run-28-vs-core/).
+
+This chapter expected the two Core runs to measure what the polling cost Core.
+They do not. From height 580,000, where the first run's log survives, the
+two runs differ by only 7 m 15 s at the end of IBD (0.6%), and the polled run
+was the faster one until somewhere between 850,000 and 900,000:
+
+| height | Core, polled (09-17/18) | Core, unpolled rerun (09-19/20) | polled minus unpolled, per segment |
+|---|---|---|---|
+| 580,000 | 5 h 41 m 55 s | 5 h 48 m 10 s | |
+| 650,000 | 7 h 36 m 46 s | 7 h 47 m 13 s | -4 m 12 s |
+| 750,000 | 10 h 33 m 06 s | 10 h 47 m 31 s | -3 m 58 s |
+| 850,000 | 14 h 37 m 50 s | 14 h 45 m 53 s | +6 m 22 s |
+| 950,000 | 18 h 58 m 39 s | 18 h 47 m 43 s | +18 m 59 s |
+| left IBD | 19 h 40 m 09 s | 19 h 32 m 54 s | -3 m 41 s |
+
+Per 50,000-block segment the two runs differ by up to 8% in both directions.
+The first run also resumed from a cold cache after its twelve-second restart
+at 06:12Z, and the two runs left IBD at different heights (967,454 and
+967,690). A difference that size cannot be attributed to the polling. What the
+pair does give is the first measure of how far two Core runs on the same
+machine drift apart: a few percent per segment, and under 1% over the whole
+sync.
 
 Chapter 21: Where the time goes
 
@@ -1066,7 +1103,9 @@ Part IX: What Is Still Open
 
 Recorded as open in the project's own registers on 2026-09-19:
 
-- The clean benchmark pair: [[PENDING: Core rerun and run 28]].
+- The clean benchmark pair. Closed on 2026-09-21: Core 19 h 32 m 54 s, run 28
+  18 h 24 m 02 s, UTXO set identical (Chapter 20). Each side has run once, so
+  the run-to-run spread of bmc is still unmeasured.
 - A full-verification sync with `assumevalid=0` was parked at 77% on 09-06 and
   has never completed. The compatibility register still says RUNNING.
 - A UTXO record cannot store an output script longer than 65,535 bytes;
@@ -1106,11 +1145,11 @@ Appendix A: The Numbers
 | RPC methods | 166, including all 156 of Core v31.1's | dispatch tables, PR #188 |
 | models | Claude Fable 5.1 (310), Opus 5 (269), Sonnet 5 (10) | commit trailers |
 | audit findings | 182 (5 CRITICAL, 32 HIGH, 44 MEDIUM, 68 LOW, 33 INFO) | CODEBASE_AUDIT_2026-09-03 |
-| UTXO set comparisons with Core | 9, every real one identical | Part III |
+| UTXO set comparisons with Core | 9, every real one identical (10 with run 28, on 09-21) | Part III |
 | run 27 | tip in 18 h 40 m 23 s, muhash identical at 967,712 | debug.log, phase.log |
 | Core v31.1 baseline #1 | 19 h 40 m 09 s (polled) | debug.log |
-| Core v31.1 rerun (unpolled) | [[PENDING]] | watch.log |
-| run 28 (unpolled, fixed code) | [[PENDING]] | phase.log |
+| Core v31.1 rerun (unpolled) | 19 h 32 m 54 s (left IBD 2026-09-20 10:01:27Z) | watch.log |
+| run 28 (unpolled, fixed code) | 18 h 24 m 02 s, muhash identical at 968,025 | phase.log |
 | download rate | ~11 MB/s in every run | debug.log |
 | memory at the tip | bmc 7.0 GB, Core 6.7 GB | PERFORMANCE.md |
 | incidents in the register | 35 | memory, worklogs |

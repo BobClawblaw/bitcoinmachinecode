@@ -10,6 +10,7 @@ A follow-up to [21 FOR 21](../2026-09-02-21-for-21/), covering 2026-09-02 to
   edition, split at a part boundary to fit bitcointalk's 64,000-character post limit;
   `THE_MEASURING_EQUIPMENT.bbcode` is the whole text in one file
 
-**Status:** the figures marked `[[PENDING]]` wait on the clean benchmark pair,
-the unpolled Core v31.1 rerun and bmc run 28. Fill them from those runs' own
-logs, then rebuild with `python3 make_pdf.py` and `python3 make_bbcode.py`.
+**Status:** complete. The `[[PENDING]]` figures were filled in on 2026-09-21
+from the clean benchmark pair's own logs; the full comparison is in
+[Run 28 vs Core](../2026-09-21-run-28-vs-core/). Rebuild with
+`python3 make_pdf.py` and `python3 make_bbcode.py` after any edit.
