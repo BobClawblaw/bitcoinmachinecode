@@ -253,6 +253,44 @@ echo "967500 967588 967588" | ibd_log_tip_reached; ckc "88 behind does not" "$?"
 echo "967588 967587 967588" | ibd_log_tip_reached; ckc "a block still unstored does not" "$?" "1"
 echo "" | ibd_log_tip_reached; ckc "no heartbeat yet is not the tip" "$?" "1"
 ck "the tip time is the FIRST heartbeat at the tip, to the second" "$(ibd_log_tip_time "$L2")" "2026-09-19 12:00:05"
+
+echo "== run 28: catch-up done stops [dlc] lines, a finished run must not look stale =="
+# Real shape, from run 28's own log (2026-09-21): catch-up finished with applied
+# 152 blocks behind the last [dlc] snapshot ("... overall: 967899/967899 stored
+# ... applied=967746 lag=152"), then no [dlc] progress line was EVER written
+# again -- the module that writes them stops for good once it reports done. The
+# daemon kept applying blocks and advancing via steady-state relay, logged as
+# "[dl] heartbeat: tip=N ...", and reached the live tip over an hour later. The
+# harness read the frozen [dlc] snapshot forever: ibd_log_tip_reached never saw
+# applied catch up (nothing was updating it), and separately logged
+# "WARN the heartbeat has not moved in 60 min" on a run that had, in fact,
+# already finished.
+L3="$T/postcatchup_debug.log"
+printf '2026-09-21 17:02:11.000 [dlc] == elapsed 18:21:52 | eta 00:00:00:00 | overall: 967899/967899 stored (100.00%% of real tip) | in flight 0 of window 4096 through 967898 (no gap, 100.00%% landed) | applied=967746 lag=152 ==\n' > "$L3"
+ck "before catch-up-done: no [dlc] line means empty" "$(ibd_catchup_done_time "$L3")" ""
+ck "before catch-up-done: progress still comes from the frozen [dlc] snapshot" \
+   "$(ibd_log_progress "$L3")" "967746 967899 967899"
+ibd_log_progress "$L3" | ibd_log_tip_reached; ckc "before catch-up-done: 152 behind is not the tip" "$?" "1"
+printf 'a NUL \000 right after the last [dlc] line\n' >> "$L3"
+printf '2026-09-21 17:15:04.522 [dlc] catch-up done: 968258 new blocks written\n' >> "$L3"
+ck "the catch-up-done line gives the run's real end time, to the second" \
+   "$(ibd_catchup_done_time "$L3")" "2026-09-21 17:15:04"
+ck "ibd_log_tip_time now prefers catch-up-done over the [dlc] convergence heuristic" \
+   "$(ibd_log_tip_time "$L3")" "2026-09-21 17:15:04"
+ck "right after catch-up-done, before the first [dl] heartbeat: still bridges on the last [dlc] snapshot" \
+   "$(ibd_log_progress "$L3")" "967746 967899 967899"
+printf '2026-09-21 17:16:04.910 [dl] heartbeat: tip=967990 peers=11/11 txouts=165240012 uptime=00:19:39:03\n' >> "$L3"
+ck "once a [dl] heartbeat arrives, progress reads its tip -- applied=stored=tip" \
+   "$(ibd_log_progress "$L3")" "967990 967990 967990"
+ibd_log_progress "$L3" | ibd_log_tip_reached; ckc "a post-catch-up heartbeat IS the tip, even short of the old 967899 snapshot" "$?" "0"
+ck "the heartbeat reader also follows the live [dl] heartbeat, not the stale [dlc] line" \
+   "$(ibd_heartbeat "$L3")" "tip=967990 peers=11/11 txouts=165240012 uptime=00:19:39:03"
+printf '2026-09-21 17:25:35.175 [dl] heartbeat: tip=968022 peers=11/11 txouts=165245653 uptime=00:19:48:39\n' >> "$L3"
+ck "progress keeps moving on later heartbeats -- a live run is never mistaken for stale" \
+   "$(ibd_log_progress "$L3")" "968022 968022 968022"
+ck "...and two different heartbeats give two different progress readings" \
+   "$([ "$(ibd_log_progress "$L3")" != '967990 967990 967990' ] && echo yes)" "yes"
+
 # ss output as `ss -tnpH state established` prints it: blockyard polling, twice
 SS='0 0 127.0.0.1:51234 127.0.0.1:8461 users:(("node",pid=2975131,fd=31))
 0 0 127.0.0.1:51236 127.0.0.1:8461 users:(("node",pid=2975131,fd=33))
