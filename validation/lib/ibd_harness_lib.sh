@@ -28,14 +28,44 @@
 # Every reader takes the log path as an argument and uses grep -a. Do not
 # "simplify" that flag away: without it a log with one NUL byte reads as empty.
 
-# The download heartbeat, e.g. "elapsed 18:55:25 | eta ... | applied=966241 lag=287".
-# Empty output means no heartbeat has been written yet -- a legitimate state
-# early in a run, and the reason this cannot simply fail when it finds nothing.
+# The download heartbeat, e.g. "elapsed 18:55:25 | eta ... | applied=966241 lag=287"
+# during catch-up, or "tip=968022 peers=11/11 txouts=165245653 uptime=..." once
+# catch-up is done and steady-state relay logging has taken over. Empty output
+# means no heartbeat has been written yet -- a legitimate state early in a run,
+# and the reason this cannot simply fail when it finds nothing.
+#
+# Picks whichever tag's line is CHRONOLOGICALLY LAST in the file, not whichever
+# tag matches first. The previous version always preferred a [dlc] line if the
+# log had ever written one, even a stale one from hours ago, and only looked at
+# [dl] heartbeat when no [dlc] line existed at all -- so once catch-up finished
+# and [dlc] lines stopped for good, this kept returning the frozen last [dlc]
+# snapshot forever instead of the live [dl] heartbeat lines that kept arriving
+# (run 28, 2026-09-21).
 ibd_heartbeat() {
     local log="$1" hb
-    hb=$(grep -a '\[dlc\] == elapsed' "$log" 2>/dev/null | tail -1 | sed 's/.*== //;s/ ==.*//')
-    [ -z "$hb" ] && hb=$(grep -a '\[dl\] heartbeat' "$log" 2>/dev/null | tail -1 | sed 's/.*heartbeat: //')
-    printf '%s' "$hb"
+    hb=$(grep -aE '\[dlc\] == elapsed|\[dl\] heartbeat' "$log" 2>/dev/null | tail -1)
+    case "$hb" in
+        *'[dl] heartbeat'*)   printf '%s' "$hb" | sed 's/.*heartbeat: //' ;;
+        *'[dlc] == elapsed'*) printf '%s' "$hb" | sed 's/.*== //;s/ ==.*//' ;;
+        *) printf '' ;;
+    esac
+}
+
+# The catch-up module's own end-of-IBD line: "[dlc] catch-up done: N new
+# blocks written". After this, the module never logs another [dlc] progress
+# line -- steady-state relay logging ([dl] heartbeat) takes over for good.
+# This is the log's own single, unambiguous "IBD is over" instant, directly
+# comparable to how Core's end is read (its own "Leaving InitialBlockDownload"
+# line), and is used below instead of the stored/applied convergence
+# heuristic, which cannot fire once catch-up is done: run 28 (2026-09-21)
+# reached catch-up done with applied 152 blocks behind the last [dlc]
+# snapshot, no more [dlc] lines were ever going to arrive to close that gap,
+# and the run sat there over an hour looking stalled to the harness while it
+# had, in fact, already finished.
+ibd_catchup_done_time() {
+    local log="$1"
+    grep -a '\[dlc\] catch-up done:' "$log" 2>/dev/null \
+        | tail -1 | sed -E 's/^([0-9-]+ [0-9:]+)\.[0-9]+ .*/\1/'
 }
 
 # Count of lines that mean the run is compromised. The [reorg] exclusions are
@@ -194,8 +224,33 @@ ibd_throughput() {
 # "APPLIED STORED TIP" from the latest heartbeat that carries all three:
 #   [dlc] == elapsed .. | overall: 337441/967593 stored (..) | .. | applied=337440 lag=0 ==
 # Empty until the first such line.
+#
+# Once "[dlc] catch-up done" has been logged, no more [dlc] progress lines are
+# ever coming -- the module that writes them has finished for good, and the
+# daemon is now in steady-state relay, logging "[dl] heartbeat: tip=N ...".
+# From that point APPLIED, STORED and TIP are all just the heartbeat's tip: a
+# heartbeat's tip only advances once the block behind it has been connected,
+# so tip already IS "applied". Reporting the frozen last [dlc] snapshot here
+# instead made a finished run (run 28, 2026-09-21) look stuck 152 blocks short
+# of its target forever, since nothing was ever going to update that snapshot
+# again -- ibd_log_tip_reached could never fire and the stale-heartbeat check
+# fired instead, on a run that had already been done for over an hour.
 ibd_log_progress() {
-    local log="$1"
+    local log="$1" hb t
+    if grep -aq '\[dlc\] catch-up done:' "$log" 2>/dev/null; then
+        hb=$(grep -a '\[dl\] heartbeat' "$log" 2>/dev/null | tail -1)
+        t=$(printf '%s' "$hb" | sed -nE 's/.*tip=([0-9]+).*/\1/p')
+        if [ -n "$t" ]; then
+            # the trailing newline matters: ibd_log_tip_reached's `read` reports
+            # failure on EOF without one, even though it still fills the
+            # variables, and its caller trusts that failure at face value.
+            printf '%s %s %s\n' "$t" "$t" "$t"
+            return
+        fi
+        # catch-up just finished and no [dl] heartbeat has printed yet (it
+        # ticks about once a minute): bridge on the last [dlc] snapshot below
+        # rather than going empty.
+    fi
     grep -a '\[dlc\] == elapsed.*overall: [0-9]*/[0-9]* stored.*applied=[0-9]*' "$log" 2>/dev/null | tail -1 \
         | sed -E 's/.*overall: ([0-9]+)\/([0-9]+) stored.*applied=([0-9]+).*/\3 \1 \2/'
 }
@@ -217,8 +272,17 @@ ibd_log_tip_reached() {
 # "YYYY-MM-DD HH:MM:SS". This is the run's end, to the second. The monitor loop
 # only looks every 5 minutes, and Core's end is likewise read from its log
 # ("Leaving InitialBlockDownload").
+#
+# Prefers the catch-up module's own "done" line (ibd_catchup_done_time):
+# unambiguous, to the second, and the moment actually comparable to Core's own
+# "Leaving InitialBlockDownload" timestamp. Falls back to the old
+# stored/applied-converged heartbeat for a log that finished IBD without ever
+# writing that line (a build that predates it, or a run killed just before
+# catch-up completed).
 ibd_log_tip_time() {
-    local log="$1"
+    local log="$1" t
+    t=$(ibd_catchup_done_time "$log")
+    [ -n "$t" ] && { printf '%s\n' "$t"; return; }
     grep -a '\[dlc\] == elapsed.*overall: [0-9]*/[0-9]* stored.*applied=[0-9]*' "$log" 2>/dev/null \
         | sed -E 's/^([0-9-]+ [0-9:]+).*overall: ([0-9]+)\/([0-9]+) stored.*applied=([0-9]+).*/\1 \4 \2 \3/' \
         | awk '$4 >= $5 && $3 >= $5 - 6 { print $1, $2; exit }'
