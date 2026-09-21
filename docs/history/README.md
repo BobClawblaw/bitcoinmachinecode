@@ -8,7 +8,8 @@ over everything else in docs/: what happened, why, and what it taught.
 | report | covers | status |
 |---|---|---|
 | [21 FOR 21](2026-09-02-21-for-21/) | 2026-08-11 to 2026-09-02: from SHA-256 in assembly to a mainnet node whose UTXO set is MuHash-identical to Core's | published |
-| [The Measuring Equipment](2026-09-19-the-measuring-equipment/) | 2026-09-02 to 2026-09-19: parity with Core v31.1, and making the benchmarks true | awaiting the Core v31.1 rerun and run 28 |
+| [The Measuring Equipment](2026-09-19-the-measuring-equipment/) | 2026-09-02 to 2026-09-19: parity with Core v31.1, and making the benchmarks true | awaiting the Core v31.1 rerun and run 28 (results now in the report below; the `[[PENDING]]` figures are not yet filled in) |
+| [Run 28 vs Core](2026-09-21-run-28-vs-core/) | 2026-09-19 to 2026-09-21: the clean benchmark pair, 18 h 24 m 02 s against 19 h 32 m 54 s, UTXO set MuHash-identical | ready to post |
 
 Each directory holds the Markdown source (the single source of truth), the
 rendered editions (PDF, and for forum posting BBCode) and the scripts that

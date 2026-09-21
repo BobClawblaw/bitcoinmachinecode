@@ -1,0 +1,97 @@
+[size=16pt][b]RUN 28: BITCOIN MACHINE CODE vs BITCOIN CORE v31.1[/b][/size]
+
+[i]A from-genesis mainnet sync, measured from the nodes' own logs, 2026-09-19 to 2026-09-21[/i]
+
+"The Measuring Equipment" (2026-09-19) left two numbers marked PENDING: an unpolled rerun of Core v31.1 and run 28, a fresh bmc sync on the current code with nothing calling its RPC. Both runs have finished. This post gives their results, how they were measured, and what was not clean about them.
+
+[hr]
+[size=12pt][b]The result[/b][/size]
+
+[table]
+[tr][td][/td][td][b]bmc, run 28[/b][/td][td][b]Core v31.1, rerun[/b][/td][/tr]
+[tr][td]start[/td][td]2026-09-20 21:36:53Z[/td][td]2026-09-19 14:28:33Z[/td][/tr]
+[tr][td]end of IBD, from its own log[/td][td]2026-09-21 16:00:55Z ([tt][dlc] catch-up done[/tt])[/td][td]2026-09-20 10:01:27Z ([tt]Leaving InitialBlockDownload[/tt])[/td][/tr]
+[tr][td][b]elapsed to the end of IBD[/b][/td][td][b]18 h 24 m 02 s[/b][/td][td][b]19 h 32 m 54 s[/b][/td][/tr]
+[tr][td]elapsed to the live tip[/td][td]18 h 25 m 28 s (height 967,924)[/td][td]19 h 33 m 09 s (height 967,813)[/td][/tr]
+[tr][td]UTXO set[/td][td]MuHash identical to Core at 968,025[/td][td][/td][/tr]
+[/table]
+
+[b]bmc finished 1 h 08 m 52 s sooner, 5.9% of Core's time.[/b]
+
+The UTXO set check ran after the sync. The harness turned off bmc's networking, waited for a stable height, and compared bmc's MuHash with a separate Core v31.1 node at the same height:
+
+[quote][tt]2026-09-21T17:45:46Z PASS muhash identical at 968025 (6e867a52c419fef00cec1768da7e8fbdf38a610c410cd4c4d01f02eef017fe2e)[/tt]
+[i]-- run28/phase.log[/i][/quote]
+
+[hr]
+[size=12pt][b]How it was measured[/b][/size]
+
+Both runs used the same machine and the same drive, one after the other:
+
+[list][li]AMD Ryzen 9 9950X3D (16 cores, 32 threads), 123 GiB RAM[/li][li]Corsair MP600 PRO XT 8 TB NVMe for both datadirs[/li][li]the public mainnet peer-to-peer network, no local peers[/li][/list]
+
+Both nodes had the same settings:
+
+[table]
+[tr][td][b]setting[/b][/td][td][b]bmc[/b][/td][td][b]Core[/b][/td][/tr]
+[tr][td]dbcache[/td][td]8192[/td][td]8192[/td][/tr]
+[tr][td]txindex, blockfilterindex, coinstatsindex[/td][td]on[/td][td]on[/td][/tr]
+[tr][td]maxconnections[/td][td]48[/td][td]48[/td][/tr]
+[tr][td]peers downloading blocks at once[/td][td]8[/td][td]8 (fixed in Core)[/td][/tr]
+[tr][td]assumevalid[/td][td]Core's default block, height 938,343[/td][td]default, same block[/td][/tr]
+[tr][td]CPU niceness[/td][td]0[/td][td]0 (systemd default)[/td][/tr]
+[tr][td]build[/td][td]commit [tt]1562ae86[/tt][/td][td]v31.1 release, built from source[/td][/tr]
+[/table]
+
+[b]Nobody called either node's RPC during IBD.[/b] This rule was added after run 27, when a monitoring tool polled that run for 14 hours. Its polls made bmc's RPC side read 10.2 TB from disk, and each [tt]gettxoutsetinfo[/tt] sent to the first Core baseline forced a UTXO cache flush. This time, all progress came from each node's own log. The IBD-end times in the tables are timestamps written by the nodes themselves, not the moment a monitor noticed.
+
+[hr]
+[size=12pt][b]Time to height[/b][/size]
+
+The heights come from each node's own log: bmc's [tt][utxo_live] catchup progress: height=N[/tt] and Core's [tt]UpdateTip ... height=N[/tt]. Elapsed time is counted from each run's start. The segment columns give the time each node took for that stretch of 100,000 blocks.
+
+[table]
+[tr][td][b]height[/b][/td][td][b]bmc elapsed[/b][/td][td][b]Core elapsed[/b][/td][td][b]bmc ahead by[/b][/td][td][b]%[/b][/td][td][b]bmc segment[/b][/td][td][b]Core segment[/b][/td][/tr]
+[tr][td]100,000[/td][td]0:02:58[/td][td]0:06:01[/td][td]0:03:03[/td][td]50.7%[/td][td]0:02:58[/td][td]0:06:01[/td][/tr]
+[tr][td]200,000[/td][td]0:08:52[/td][td]0:11:25[/td][td]0:02:33[/td][td]22.3%[/td][td]0:05:54[/td][td]0:05:24[/td][/tr]
+[tr][td]300,000[/td][td]0:30:49[/td][td]0:36:14[/td][td]0:05:25[/td][td]14.9%[/td][td]0:21:57[/td][td]0:24:49[/td][/tr]
+[tr][td]400,000[/td][td]1:31:36[/td][td]1:43:35[/td][td]0:11:59[/td][td]11.6%[/td][td]1:00:47[/td][td]1:07:21[/td][/tr]
+[tr][td]500,000[/td][td]3:36:20[/td][td]3:54:13[/td][td]0:17:53[/td][td]7.6%[/td][td]2:04:44[/td][td]2:10:38[/td][/tr]
+[tr][td]600,000[/td][td]5:54:41[/td][td]6:20:15[/td][td]0:25:34[/td][td]6.7%[/td][td]2:18:21[/td][td]2:26:02[/td][/tr]
+[tr][td]700,000[/td][td]8:44:09[/td][td]9:19:15[/td][td]0:35:06[/td][td]6.3%[/td][td]2:49:28[/td][td]2:59:00[/td][/tr]
+[tr][td]800,000[/td][td]11:56:48[/td][td]12:39:54[/td][td]0:43:06[/td][td]5.7%[/td][td]3:12:39[/td][td]3:20:39[/td][/tr]
+[tr][td]900,000[/td][td]15:53:25[/td][td]16:50:44[/td][td]0:57:19[/td][td]5.7%[/td][td]3:56:37[/td][td]4:10:50[/td][/tr]
+[tr][td]end of IBD[/td][td]18:24:02[/td][td]19:32:54[/td][td]1:08:52[/td][td]5.9%[/td][td]2:30:37[/td][td]2:42:10[/td][/tr]
+[/table]
+
+Four things stand out in this table:
+
+[list][li]The large early percentages are only minutes. At 100,000 blocks bmc is 51% ahead, but that is three minutes. The early blocks are small.[/li][li]bmc was slower in one segment. It took 5 m 54 s for blocks 100,000 to 200,000, where Core took 5 m 24 s.[/li][li]From 500,000 on, bmc was 4% to 7% faster in every segment, and its total lead settled at about 6% of elapsed time.[/li][li]Both nodes spent about two-thirds of their run above height 600,000: 12 h 29 m for bmc, 13 h 13 m for Core.[/li][/list]
+
+[hr]
+[size=12pt][b]What was not clean[/b][/size]
+
+[list][li][b]The runs were not simultaneous.[/b] Core ran on 09-19 and 09-20, and bmc on 09-20 and 09-21. They used different peers under different network conditions. Running both at once on one drive would have measured contention for that drive, not the two implementations.[/li][li][b]Each side ran once.[/b] Nobody has measured the run-to-run spread yet.[/li][li][b]Run 28's RPC was hit once.[/b] This line is in phase.log: [tt]2026-09-21T05:07:06Z WARN 15 connection(s) to the RPC port closed in the last minute during IBD -- something is polling the run[/tt]. The caller was never identified. The check only sees sockets that have already closed, so it cannot name a process. A 30-minute watch later in the day saw no further connections. This was one minute of unknown calls, not 14 hours of UTXO walks as in run 27, but it is on the record.[/li][li][b]Core's rerun was disturbed once.[/b] Production was redeployed at 18:54:57Z on a different NVMe drive. Core's block rate dropped for about one minute. The estimated cost is 30 to 40 seconds.[/li][li][b]The two nodes mark the end of IBD differently.[/b] bmc logs [tt]catch-up done[/tt] when it has stored and connected every block up to the best header it saw at startup (967,898). Core logs [tt]Leaving InitialBlockDownload[/tt] when its tip is less than 24 hours old. The table also gives the time each node reached the live tip: 86 seconds later for bmc, 15 seconds later for Core. The gap between them is 1 h 07 m 41 s by that measure, against 1 h 08 m 52 s by the logged end of IBD.[/li][li][b]The benchmark harness had a defect.[/b] Once bmc logged [tt]catch-up done[/tt], it stopped writing the progress lines the harness was reading. The harness therefore never saw the run finish, and it warned that the heartbeat had stopped moving. The monitor script was restarted with a fix. The node was not restarted, and it kept following the live chain in the meantime. The UTXO check ran at 17:45Z, 1 h 45 m after the end of IBD. The end time itself comes from the node's own log line, so the defect did not change it. The fix is PR #289, with tests built from run 28's own log lines.[/li][/list]
+
+[hr]
+[size=12pt][b]Against the first pair[/b][/size]
+
+[table]
+[tr][td][/td][td][b]bmc[/b][/td][td][b]Core v31.1[/b][/td][/tr]
+[tr][td]first pair, both polled by a monitor[/td][td]run 27: 18 h 40 m 23 s[/td][td]19 h 40 m 09 s[/td][/tr]
+[tr][td]this pair, neither polled during IBD[/td][td]run 28: 18 h 24 m 02 s[/td][td]19 h 32 m 54 s[/td][/tr]
+[/table]
+
+The first pair gave about 5% and this pair gives about 6%. The two bmc runs used different code: run 27 was on 09-18 and run 28 on 09-20. Run 27's time was taken from its own "at the tip" line. On the same measure, run 28 took 18 h 25 m 28 s.
+
+[hr]
+[size=12pt][b]What this does and does not show[/b][/size]
+
+This pair shows that on this machine, with Core's settings, bmc synced mainnet from genesis about 6% faster than Core v31.1. It also shows that bmc ended with a UTXO set identical to Core's. This is the tenth full comparison of a bmc UTXO set with Core's, and every one that actually ran has matched.
+
+It does not show that bmc is faster in general, on other hardware, or by design. There is one run per side, on one machine. This post does not say where the difference comes from. The micro-benchmarks from August, which have not changed since, put bmc's hashing and signature primitives at or behind Core's.
+
+[hr]
+[size=12pt][b]Sources[/b][/size]
+
+[list][li][tt]run28/phase.log[/tt]: start, configuration, the RPC warning, IBD_END, the capstone[/li][li][tt]run28/data/main/debug.log[/tt]: the per-height [tt]catchup progress[/tt] lines, and [tt][dlc] catch-up done[/tt] at 16:00:55.219[/li][li][tt]core31/debug.log[/tt]: [tt]UpdateTip[/tt] lines, and [tt]Leaving InitialBlockDownload[/tt] at 10:01:27Z[/li][li][tt]core31/watch.log[/tt]: the rerun's start, its IBD_END (70,374 s), and the record that nothing called its RPC[/li][li][tt]docs/reports/2026-09-18-run27/README.md[/tt]: run 27 and the first Core baseline[/li][li]PR #289: the harness fix[/li][/list]
