@@ -36,6 +36,10 @@ Usage:  synth_corpus_diff.py [--only feature] [--seed S] [--oracle P] [--shim P]
 Exit 0 iff zero divergences. Writes synth_corpus_diff_report.{json,txt}.
 """
 import sys, os, json, time, hashlib, argparse, random
+
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
 import coincurve
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1542,6 +1546,10 @@ def main():
             for d in (res['false_accept'] or res['accept_div'] + res['mut_div'])[:40]:
                 f.write(json.dumps(d) + '\n')
     print('\n%s' % open(REPORT_TXT).read())
+    # res['cases'] is how many synthesised spends were actually compared. A
+    # synthesis step that produced nothing reports ndiv == 0, nbad == 0 and
+    # returns 0 -- a clean pass over an empty corpus.
+    require_cases(res['cases'], 'synthesised cases')
     return 0 if (ndiv == 0 and nbad == 0) else 1
 
 if __name__ == '__main__':

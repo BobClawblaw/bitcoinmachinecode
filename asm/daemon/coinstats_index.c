@@ -860,18 +860,29 @@ int csi_read_file(long* height, unsigned char blockhash[32], unsigned char diges
 }
 
 /* ---- the fold ring: producer side (connect process) --------------------- */
-/* 0 = still running; otherwise dead (reaped here, or auto-reaped by the
- * download worker's SIGCHLD=SIG_IGN, in which case waitpid says ECHILD). */
-static int csi_worker_dead(void){
+/* 0 = still running; otherwise dead (reaped here, or already reaped by the
+ * download worker's SIGCHLD handler -- main.c's reap_children, inherited
+ * across the fork, which waits on ANY child -- in which case waitpid says
+ * ECHILD). `stopping` is csi_worker_stop's call: the exit was asked for, so
+ * it is reported as the stop it is. It used to print "gone ... the index
+ * cannot be maintained" on EVERY stop, because that handler usually reaps
+ * the worker before this poll does -- an alarm that fired on the healthy
+ * path and so meant nothing on the unhealthy one. */
+static int csi_worker_dead_ex(int stopping){
     if (!g_worker_pid) return 1;
     int st; pid_t r = waitpid(g_worker_pid, &st, WNOHANG);
     if (r == 0) return 0;
-    csi_logf("[coinstats] fold worker pid %d is gone (%s) -- the index cannot be maintained\n",
-             (int)g_worker_pid, r < 0 ? "already reaped" : WIFSIGNALED(st) ? "signal" : "exited");
+    if (stopping && (r < 0 || (WIFEXITED(st) && WEXITSTATUS(st) == 0)))
+        csi_logf("[coinstats] fold worker pid %d stopped (coinstats.dat through height %lld)\n",
+                 (int)g_worker_pid, g_st ? (long long)g_st->csi_folded_height : -1LL);
+    else
+        csi_logf("[coinstats] fold worker pid %d is gone (%s) -- the index cannot be maintained\n",
+                 (int)g_worker_pid, r < 0 ? "already reaped" : WIFSIGNALED(st) ? "signal" : "exited");
     g_worker_pid = 0; g_ring_on = 0;
     if (g_st) g_st->csi_worker_pid = 0;
     return 1;
 }
+static int csi_worker_dead(void){ return csi_worker_dead_ex(0); }
 
 /* Wait for n free slots. 1 = room; 0 = bound hit (the push proceeds and laps
  * the worker, which detects it and invalidates); -1 = the worker is gone. */
@@ -928,8 +939,23 @@ static int ring_push(unsigned kind, const u8* key36, u64 value, u64 code,
 }
 
 /* ---- the fold worker ------------------------------------------------------ */
+/* g_w_stop means "the connect process is GONE": it is set when getppid()
+ * stops being that process, never by a signal.
+ *
+ * It used to be set by SIGTERM, and a stop under systemd's control-group
+ * kill mode SIGTERMs every process in the unit at once. The worker then
+ * quit as soon as the ring was momentarily empty -- before the download
+ * worker had run its shutdown (utxo_live_close's checkpoint pushes the last
+ * COMMIT marker, csi_worker_stop the STOP behind it). A commit pushed after
+ * that point went into a ring nobody read, coinstats.dat stayed a block
+ * behind utxo_applied_height, and the next boot paid a full UTXO walk to
+ * re-seed. Every production stop from 2026-09-10 on shows the worker
+ * leaving first ("fold worker exiting" above the download worker's
+ * "shutting down") in every production stop log we have. Now only the STOP marker ends it; a connect process that
+ * dies without sending one is noticed through getppid() (PR_SET_PDEATHSIG
+ * delivers its SIGTERM to wake a sleep, nothing more). */
 static volatile sig_atomic_t g_w_stop;
-static void w_sig(int s){ (void)s; g_w_stop = 1; }
+static void w_sig(int s){ (void)s; }
 
 static void worker_run(u64 cursor, pid_t parent){
     node_status_t* st = g_st;
@@ -1062,7 +1088,7 @@ void csi_worker_stop(void){
     if (!csi_worker_dead()){
         ring_push(CSI_K_STOP, 0, 0, 0, 0, 0, 0, 0);
         long long t0 = mono_ms();
-        while (!csi_worker_dead()){
+        while (!csi_worker_dead_ex(1)){
             if (mono_ms() - t0 > 15000){
                 csi_logf("[coinstats] fold worker pid %d did not stop in 15 s -- killing it (the index re-seeds if its last commit is missing)\n", (int)p);
                 kill(p, SIGKILL);

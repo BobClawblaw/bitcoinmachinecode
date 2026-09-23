@@ -42,7 +42,7 @@
 	.extern _tx_policy_init
 	.extern _serve_idx_topup
 	.extern _serve_cfilters
-	.extern _tx_accept_validate
+	.extern _tx_accept_serve_tx
 	.extern _log_block_stored_inbound
 	.extern _tx_txid
 	.extern _bip152_shortid
@@ -730,17 +730,23 @@ _node_serve_loop:
 	movk x4, #0x2, lsl #16
 	bl   _tx_txid
 	cbz  x0, .viol_tx_malformed   /* N3: does not parse -> score, drop */
-	LOADADDR x9, tx_dv_ok
-	ldrb w9, [x9]
-	cmp  w9, #1
-	b.ne .next
+	/* _tx_accept_serve_tx(mp_cur, s_txid, pl_buf, s_plen, tx_dv_ok) --
+	 * hands the tx to the download worker, which validates it against the
+	 * LIVE UTXO set (daemon/tx_handoff.c). 2026-09-19: the old call ran
+	 * tx_accept_validate here, against the boot-time snapshot this child
+	 * inherited, which holds no coin created after the node started -- so
+	 * every relayed tx spending one was dropped as missing-inputs. Without
+	 * a handoff ring (test harnesses) it still validates locally, and only
+	 * when tx_dv_ok says this connection can: never relay unvalidated. */
 	LOADADDR x0, mp_cur
 	ldr  x0, [x0]
 	LOADADDR x1, s_txid
 	LOADADDR x2, pl_buf
 	LOADADDR x10, s_plen
 	ldr  x3, [x10]
-	bl   _tx_accept_validate
+	LOADADDR x9, tx_dv_ok
+	ldrb w4, [x9]
+	bl   _tx_accept_serve_tx
 	b    .next
 
 .do_block:
@@ -1995,21 +2001,17 @@ _node_announce_tip:
 	strb w10, [x9]
 	mov  w10, #2
 	str  w10, [x9, #1]               /* type u32 LE = 2 */
-	/* reverse hash -> hp_buf+5 */
-	add  x9, x9, #5                   /* dst base */
+	/* the hash goes on the wire in INTERNAL order -- block_hash's sha256d
+	 * output as-is, the same bytes a getdata or a headers prev-hash carries
+	 * (x86 2026-09-19: this reversed it into display order, so every
+	 * inv(MSG_BLOCK) this node sent named a block nobody has). */
+	add  x9, x9, #5                   /* dst = hp_buf+5 */
 	LOADADDR x10, sb_buf
 	add  x10, x10, #0x200000
-	add  x10, x10, #31                /* src last byte */
-	mov  x11, #0
-.LSV_at_rev:
-	cmp  x11, #32
-	b.hs .LSV_at_rev_done
-	sub  x12, x10, x11
-	ldrb w13, [x12]
-	strb w13, [x9, x11]
-	add  x11, x11, #1
-	b    .LSV_at_rev
-.LSV_at_rev_done:
+	mov  x0, x9
+	mov  x1, x10
+	mov  x2, #32
+	bl   .Ls_memcpy_len
 	mov  x0, x19
 	LOADADDR x1, cn_inv
 	mov  x2, #3

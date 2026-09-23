@@ -35,6 +35,12 @@ long rpc_chain_read_block_at(long h, unsigned char* buf, long cap);
 long rpc_chain_tip_height(void);
 /* 3.1: reader of the connected tip (NODE_TIP_UNTRACKED = use the stored tip) */
 void rpc_chain_set_public_tip_fn(long (*fn)(void));
+/* 2026-09-19: which optional indexes the node is configured to keep (Core's
+ * -txindex, -txospenderindex, -blockfilterindex, -coinstatsindex, and the
+ * addrindex extension). An index configured off is neither consulted nor
+ * listed by getindexinfo, whatever files the datadir holds. Never called =
+ * the files decide (a standalone reader, the unit tests). */
+void rpc_chain_set_index_config(int txindex, int txospenderindex, int blockfilterindex, int coinstatsindex, int addrindex);
 /* RPX-4: block hash at a height, WIRE order (reverse it for display). */
 int  rpc_chain_hash_at(long height, unsigned char out[32]);
 
@@ -78,6 +84,18 @@ void rpc_chain_set_stop_handler(void (*fn)(void));
  * -1 "not one of my methods" (caller keeps looking). */
 int rpc_chain_dispatch(const char* method, const rj_val* params,
                        rj_val** result, long* ec, const char** em);
+
+/* Does `method` run WITHOUT the RPC execution lock? (2026-09-19; see "lanes"
+ * in rpc_chain.c.) 1 = yes and bounded (a few preads: safe to run on the
+ * connection's own thread), 2 = yes but may be slow (getchaintxstats' first
+ * build, the waitfor* family), 0 = needs the execution lock. */
+int rpc_chain_method_lane(const char* method);
+
+/* getchaintxstats' cumulative-count cache: the count through height h on the
+ * current chain (-1 unknown), and how many block prefixes it has read in
+ * total -- the cost, which tests assert is O(new blocks). Thread-safe. */
+long long rpc_chain_chaintx_at(long h);
+unsigned long long rpc_chain_chaintx_reads(void);
 
 /* Core's descriptor checksum (the 8 chars after '#') over a descriptor's
  * inner span. Returns 1 and fills out[9] on success, 0 if the span contains

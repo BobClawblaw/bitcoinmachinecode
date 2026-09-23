@@ -9,6 +9,7 @@ Bitcoin Core. Everything else lives here.
 | | |
 |---|---|
 | [`OPERATIONS.md`](OPERATIONS.md) | installing, configuring, running as a service, upgrading, verifying, backing up, troubleshooting |
+| [`PERFORMANCE.md`](PERFORMANCE.md) | serving performance vs Bitcoin Core after the sync — RPC latency, concurrency, memory, disk; what is measured, what is not, and where the gaps are |
 | [`../config/bitcoin.sample.conf`](../config/bitcoin.sample.conf) | the complete configuration reference: every key at its default, and every Bitcoin Core option the node accepts without effect, does not apply, or does not support |
 | [`RPC_LIVE_NODE.md`](RPC_LIVE_NODE.md) | the embedded JSON-RPC server and its methods |
 | [`MEMPOOL_SPACE.md`](MEMPOOL_SPACE.md) | running mempool.space against the node: the Esplora facade, the address history index, the backend configuration (2026-09-08) |
@@ -137,6 +138,12 @@ also annotated tags.
 record, written for the people building this rather than as a description
 of the finished node. They hold the incident log, plans, measurements,
 dead ends and the day-by-day action log, and are not tidied after the fact.
+
+[`history/`](history/) holds the long-form reports written from that record:
+[21 FOR 21](history/2026-09-02-21-for-21/) (2026-08-11 to 2026-09-02) and
+[The Measuring Equipment](history/2026-09-19-the-measuring-equipment/)
+(2026-09-02 to 2026-09-19), each with its source, PDF, forum edition and
+build scripts.
 
 | | |
 |---|---|

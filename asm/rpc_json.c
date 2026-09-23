@@ -469,3 +469,57 @@ rj_val* rj_parse(const char* s, size_t len) {
     if (c.p != c.end) { rj_free(v); return NULL; }
     return v;
 }
+
+const char* rj_type_name(const rj_val* v) {
+    if (!v) return "null";
+    switch (v->typ) {
+        case RJ_NULL: return "null";  case RJ_BOOL: return "bool";
+        case RJ_NUM:  return "number"; case RJ_STR: return "string";
+        case RJ_ARR:  return "array";  case RJ_OBJ: return "object";
+        default:      return "null";
+    }
+}
+
+const char* rj_wrong_type_msg(char* buf, size_t cap, int position, const char* name,
+                              const rj_val* got, const char* expected) {
+    snprintf(buf, cap,
+             "Wrong type passed:\n{\n    \"Position %d (%s)\": \"JSON value of type %s "
+             "is not of expected type %s\"\n}",
+             position, name, rj_type_name(got), expected);
+    return buf;
+}
+
+const char* rj_wrong_field_type_msg(char* buf, size_t cap, const char* field,
+                                    const rj_val* got, const char* expected) {
+    if (!got || got->typ == RJ_NULL)                 /* Core names no field for a null */
+        snprintf(buf, cap, "JSON value of type null is not of expected type %s", expected);
+    else
+        snprintf(buf, cap, "JSON value of type %s for field %s is not of expected type %s",
+                 rj_type_name(got), field, expected);
+    return buf;
+}
+
+const char* rj_wrong_type_msg_bare(char* buf, size_t cap, const rj_val* got, const char* expected) {
+    snprintf(buf, cap, "JSON value of type %s is not of expected type %s",
+             rj_type_name(got), expected);
+    return buf;
+}
+
+void rj_typeerr_init(rj_typeerrs* t) { t->buf[0] = 0; t->n = 0; }
+
+void rj_typeerr_add(rj_typeerrs* t, int position, const char* name,
+                    const rj_val* got, const char* expected) {
+    size_t at = strlen(t->buf);
+    if (at + 200 >= sizeof t->buf) return;              /* keep what fits */
+    snprintf(t->buf + at, sizeof t->buf - at,
+             "%s    \"Position %d (%s)\": \"JSON value of type %s is not of expected type %s\"",
+             t->n ? ",\n" : "", position, name, rj_type_name(got), expected);
+    t->n++;
+}
+
+int rj_typeerr_fail(rj_typeerrs* t, long* ec, const char** em) {
+    static __thread char out[2048 + 32];   /* per thread: lane methods run concurrently */
+    if (!t->n) return 0;
+    snprintf(out, sizeof out, "Wrong type passed:\n{\n%s\n}", t->buf);
+    *ec = -3; *em = out; return 1;
+}

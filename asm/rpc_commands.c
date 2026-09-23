@@ -23,6 +23,16 @@
 /* ---- extern wallet_core command layer (from asm/wallet_core.c) ---- */
 extern long wallet_derive_p2wpkh_address(char* out, long cap, const unsigned char seed[64], unsigned index);
 #include "rpc_wallet_ops.h"   /* output types: rpc_wops_type_path / rpc_wops_type_spk / rpc_wops_active_types */
+
+/* Core's positional argument type error: -3 with rj_wrong_type_msg's wrapper,
+ * naming the position, the argument and the type ACTUALLY passed. Measured
+ * against v31.1 on 2026-09-15; the same helper exists in rpc_node.c. */
+static int rpc_wrong_type(long* ec, const char** em, char* buf, size_t cap,
+                          int position, const char* name,
+                          const rj_val* got, const char* expected){
+    *ec = -3; *em = rj_wrong_type_msg(buf, cap, position, name, got, expected); return 0;
+}
+
 extern long wallet_derive_p2wpkh_change(char* out, long cap, const unsigned char seed[64], unsigned index);
 extern int  wallet_validate_address(const char* str, int* type_, unsigned char* version, unsigned char h160[20], unsigned char prog32[32]);
 extern long rpc_chain_tip_height(void);
@@ -348,7 +358,10 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
         }
     }
     rj_val* o = rj_obj();
-    rj_obj_set(o, "isvalid", rj_bool(valid));
+    /* isvalid is validateaddress's field. Core's getaddressinfo does not carry
+     * it -- it errors instead (see the branch below) -- and emitting it here
+     * invited exactly the misreading that branch describes. */
+    if (!strcmp(method, "validateaddress")) rj_obj_set(o, "isvalid", rj_bool(valid));
     if (!strcmp(method, "validateaddress")) {
         if (valid) {
             /* Core echoes the CANONICAL encoding (bech32 lower-cased) */
@@ -394,6 +407,18 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
             rj_obj_set(o, "error", rj_str("Invalid address"));
         }
     } else { /* getaddressinfo */
+        /* CORE ERRORS HERE. getaddressinfo throws -5 for an address it cannot
+         * decode; only validateaddress reports the verdict as a field. This
+         * returned {"address":..,"isvalid":false} with a success status, so a
+         * caller testing for an error saw none and read isvalid off a reply it
+         * had no reason to inspect. Measured against v31.1 on 2026-09-16:
+         * getaddressinfo("notanaddress") is -5, not an object.
+         *
+         * Core's texts are per-decoder ("Invalid checksum or length of Base58
+         * address (P2PKH or P2SH)", "Invalid Base 32 character"); this node
+         * reports the classification rather than the diagnostics, the same
+         * choice already made for validateaddress's error_locations. */
+        if (!valid){ rj_free(o); *ec = -5; *em = "Invalid address"; return 0; }
         rj_obj_set(o, "address", rj_str(addr));
         if (valid) {
             /* Real wallet lookup (audit finding, 2026-09-03: these four
@@ -438,8 +463,27 @@ static int cmd_validate(const char* method, const rj_val* params, const rpc_wall
                 rj_obj_set(o, "pubkey", rj_str(pubhex));
                 rj_obj_set(o, "iscompressed", rj_bool(plen == 33));
             }
-            rj_obj_set(o, "iswitness", rj_bool(type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH || type == WAL_ADDR_P2TR));
-            rj_obj_set(o, "witness_version", rj_numf("%u", (type == WAL_ADDR_P2TR) ? 1 : 0));
+            /* scriptPubKey / isscript / witness_program are ADDRESS DECODING,
+             * not wallet state: Core reports them whether or not a wallet is
+             * loaded, and this branch omitted all three. validateaddress above
+             * already computes them from the same inputs. */
+            { char spkhex[210]; bin_to_hex(spkhex, s, sl);
+              rj_obj_set(o, "scriptPubKey", rj_str(spkhex)); }
+            rj_obj_set(o, "isscript", rj_bool(type == WAL_ADDR_P2SH || type == WAL_ADDR_P2WSH ||
+                                              type == WAL_ADDR_P2TR));
+            int isw_gai = (type == WAL_ADDR_P2WPKH || type == WAL_ADDR_P2WSH ||
+                           type == WAL_ADDR_P2TR   || type == WAL_ADDR_WITNESS_UNKNOWN);
+            rj_obj_set(o, "iswitness", rj_bool(isw_gai));
+            if (isw_gai){
+                rj_obj_set(o, "witness_version", rj_numf("%u",
+                    (type == WAL_ADDR_WITNESS_UNKNOWN) ? (unsigned)witver
+                  : (type == WAL_ADDR_P2TR) ? 1u : 0u));
+                const unsigned char* prog_gai = (type == WAL_ADDR_P2WPKH) ? h160 : prog32;
+                size_t plen_gai = (type == WAL_ADDR_P2WPKH) ? 20
+                                : (type == WAL_ADDR_WITNESS_UNKNOWN) ? (size_t)wprog_len : 32;
+                char proghex[82]; bin_to_hex(proghex, prog_gai, plen_gai);
+                rj_obj_set(o, "witness_program", rj_str(proghex));
+            }
             /* WAL-6: omitted rather than answered false when the wallet
              * cannot tell (own < 0). See the note above. */
             if (own >= 0){
@@ -922,10 +966,57 @@ static long crt_varint(unsigned char* o, unsigned long long v){
  * request with enough of them cannot run off the end either. */
 #define CRT_NEED(k) do{ if ((long)(k) < 0 || n + (long)(k) > cap){ \
         *ec=-8; *em="Transaction too large for this node's builder"; return 0; } }while(0)
+/* createrawtransaction and createpsbt share positions 1-5 exactly:
+ *   1 inputs (array)  2 outputs (array|object)  3 locktime (number)
+ *   4 replaceable (bool)  5 version (number)
+ * and Core checks EVERY position's TYPE before ANY position's VALUE, lowest
+ * failing position first. Measured against v31.1, 2026-09-15, for both methods
+ * and every JSON type.
+ *
+ * Positions 3, 4 and 5 had NO type check at all: the body tested
+ * `items[n]->typ == RJ_NUM` and fell through to the default when it was not.
+ * So `locktime: "500000"` -- a string, an ordinary mistake -- built a
+ * transaction with locktime 0 and reported success, and `replaceable: "true"`
+ * built a non-replaceable one. That is not a message defect; the node returned
+ * a DIFFERENT TRANSACTION from the one asked for, silently.
+ *
+ * Position 2 is a union (array or object), so Core emits its third message
+ * shape there: the bare sentence, no wrapper and no position. A null output
+ * argument is a VALUE error with its own text. */
+static int crt_typecheck(const rj_val* params, const char* method, int psbt_pos,
+                         long* ec, const char** em){
+    static char tb[256];
+    if (!params || params->typ!=RJ_ARR || params->nitems<2){
+        static char ub[96];
+        snprintf(ub, sizeof ub, "%s requires inputs and outputs", method);
+        *ec=-1; *em=ub; return 0; }
+    /* every failing position, in position order, in ONE message */
+    rj_typeerrs te; rj_typeerr_init(&te);
+    if (params->items[0]->typ!=RJ_ARR)
+        rj_typeerr_add(&te, 1, "inputs", params->items[0], "array");
+    if (params->nitems>=3 && params->items[2]->typ!=RJ_NULL && params->items[2]->typ!=RJ_NUM)
+        rj_typeerr_add(&te, 3, "locktime", params->items[2], "number");
+    if (params->nitems>=4 && params->items[3]->typ!=RJ_NULL && params->items[3]->typ!=RJ_BOOL)
+        rj_typeerr_add(&te, 4, "replaceable", params->items[3], "bool");
+    if (params->nitems>=5 && params->items[4]->typ!=RJ_NULL && params->items[4]->typ!=RJ_NUM)
+        rj_typeerr_add(&te, 5, "version", params->items[4], "number");
+    if (psbt_pos > 0 && params->nitems > (size_t)(psbt_pos-1) &&
+        params->items[psbt_pos-1]->typ!=RJ_NULL && params->items[psbt_pos-1]->typ!=RJ_NUM)
+        rj_typeerr_add(&te, psbt_pos, "psbt_version", params->items[psbt_pos-1], "number");
+    if (rj_typeerr_fail(&te, ec, em)) return 0;
+    /* position 2 is a UNION (array or object), so it is NOT part of the object
+     * above -- Core's RPCHelpMan does not type a union, and the body reports it
+     * afterwards with the bare sentence. Verified: `createrawtransaction [..] 5
+     * "a"` reports Position 3 ALONE, never the bad outputs. */
+    if (params->items[1]->typ==RJ_NULL){
+        *ec=-8; *em="Invalid parameter, output argument must be non-null"; return 0; }
+    if (params->items[1]->typ!=RJ_ARR && params->items[1]->typ!=RJ_OBJ){
+        *ec=-3; *em=rj_wrong_type_msg_bare(tb, sizeof tb, params->items[1], "array"); return 0; }
+    return 1;
+}
 static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long cap, long* out_n,
                               size_t* out_nin, size_t* out_nout, long* ec, const char** em){
-    if (!params || params->typ!=RJ_ARR || params->nitems<2 || params->items[0]->typ!=RJ_ARR){
-        *ec=-8; *em="Invalid parameters, expected an inputs array and outputs"; return 0; }
+    if (!crt_typecheck(params, "createrawtransaction", 0, ec, em)) return 0;
     const rj_val* ins = params->items[0];
     const rj_val* outs = params->items[1];
     long long locktime=0;
@@ -943,13 +1034,36 @@ static int crt_build_unsigned(const rj_val* params, unsigned char* tx, long cap,
     if (params->nitems>=4 && params->items[3]->typ==RJ_BOOL) replaceable=(params->items[3]->str[0]=='1');
     unsigned long defseq = replaceable ? 0xfffffffdUL : (locktime!=0 ? 0xfffffffeUL : 0xffffffffUL);
 
+    /* THE VERSION ARGUMENT WAS IGNORED. createrawtransaction always emitted
+     * version 2 whatever position 5 said -- a caller asking for a v3 (TRUC)
+     * transaction got a v2 one and no error. createpsbt did honour it, in its
+     * own copy of the parse, which also accepted 4 and beyond: Core's standard
+     * range is 1..3 (TX_MIN/MAX_STANDARD_VERSION), so this node could build a
+     * transaction the network will not relay. Both now go through here.
+     *
+     * Core parses the argument as uint32 FIRST -- a negative or a value past
+     * 0xffffffff is -1 "JSON integer out of range", not -8 -- and range-checks
+     * it second. Boundaries measured on the oracle: -1 and 4294967296 give -1;
+     * 0, 4, 2147483648 and 4294967295 give -8; 1 and 3 succeed. */
+    long version = 2;
+    if (params->nitems>=5 && params->items[4]->typ==RJ_NUM){
+        errno = 0; char* vend = 0;
+        long long v = strtoll(params->items[4]->str, &vend, 10);
+        if (errno == ERANGE || (vend && *vend) || v < 0 || v > 0xffffffffLL){
+            *ec=-1; *em="JSON integer out of range"; return 0; }
+        if (v < 1 || v > 3){
+            *ec=-8; *em="Invalid parameter, version out of range(1~3)"; return 0; }
+        version = (long)v;
+    }
     long n=0;
-    tx[n++]=2; tx[n++]=0; tx[n++]=0; tx[n++]=0;                 /* version 2 LE */
+    tx[n++]=(unsigned char)version; tx[n++]=0; tx[n++]=0; tx[n++]=0;   /* version LE */
     CRT_NEED(9);
     n += crt_varint(tx+n, (unsigned long long)ins->nitems);
     for (size_t i=0;i<ins->nitems;i++){
         const rj_val* in=ins->items[i];
-        if (in->typ!=RJ_OBJ){ *ec=-8; *em="Invalid parameter, expected input object"; return 0; }
+        /* a nested value gets Core's bare sentence: no wrapper, no position */
+        if (in->typ!=RJ_OBJ){ static char nb[96];
+            *ec=-3; *em=rj_wrong_type_msg_bare(nb, sizeof nb, in, "object"); return 0; }
         rj_val* tid=rj_obj_get(in,"txid"); rj_val* vout=rj_obj_get(in,"vout");
         if (!tid||tid->typ!=RJ_STR||strlen(tid->str)!=64||!vout||vout->typ!=RJ_NUM){
             *ec=-8; *em="Invalid parameter, missing/invalid txid or vout"; return 0; }
@@ -1088,14 +1202,14 @@ static char* psbt_wrap_unsigned(const unsigned char* tx, long n, size_t nin, siz
 }
 static void psbt_wr32(unsigned char* p, unsigned v);
 static int psbt_version_arg(const rj_val* params, unsigned long idx, int* ver, long* ec, const char** em);
+static int psbt_version_type(const rj_val* params, unsigned long idx, long* ec, const char** em);
 static char* psbt_wrap_version(const unsigned char* tx, long n, size_t nin, size_t nout, int ver);
 static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
     static unsigned char tx[131072]; long n; size_t nin, nout;
+    /* positions 1-5 are checked before position 6: Core reports the LOWEST
+     * failing position, so `createpsbt ... "x" "y"` is Position 5 (version) */
+    if (!crt_typecheck(params, "createpsbt", 6, ec, em)) return 0;   /* 1-5 and 6 together */
     if (!crt_build_unsigned(params, tx, (long)sizeof tx, &n, &nin, &nout, ec, em)) return 0;
-    if (params->nitems >= 5 && params->items[4]->typ == RJ_NUM){                /* Core: tx version */
-        long v = strtol(params->items[4]->str, 0, 10);
-        if (v < 1 || v > 0x7fffffffL){ *ec = -8; *em = "Invalid parameter, version must be between 1 and 2147483647"; return 0; }
-        psbt_wr32(tx, (unsigned)v); }
     int ver; if (!psbt_version_arg(params, 5, &ver, ec, em)) return 0;
     char* b64=psbt_wrap_version(tx,n,nin,nout,ver); if (!b64){ *ec=-7; *em="oom"; return 0; }
     *result=rj_str(b64); free(b64);
@@ -1107,6 +1221,7 @@ static int cmd_createpsbt(const rj_val* params, long* ec, const char** em, rj_va
  * wraps. Errors if the tx carries signature data and permitsigdata is false
  * (default), matching Core. */
 static int cmd_converttopsbt(const rj_val* params, long* ec, const char** em, rj_val** result){
+    if (!psbt_version_type(params, 3, ec, em)) return 0;        /* type before body */
     const char* hex = rpc_param_str(params,0,ec,em); if (!hex) return 0;
     size_t hl=strlen(hex);
     /* RPX-9: this cap is NOT raised to RPC_DECODE_MAX_TX with
@@ -1128,7 +1243,14 @@ static int cmd_converttopsbt(const rj_val* params, long* ec, const char** em, rj
     unsigned long p=4, cc; int segwit=0;
     if (raw[4]==0x00 && txlen>6 && raw[5]!=0x00){ segwit=1; p=6; }
     unsigned long n_in=srw_varint(raw+p,&cc); p+=cc;
-    if (n_in==0||n_in>10000){ *ec=-22; *em="TX decode failed"; return 0; }
+    /* n_in == 0 is NOT a decode failure. A zero-input transaction cannot go
+     * on the network, but Core accepts one here (verified against v31.1),
+     * and wrapping one is how an empty PSBT template is built. Same root
+     * cause as crt_walk's guard (2026-09-14). Only the upper bound is real.
+     * simulaterawtransaction keeps its n_in == 0 refusal: it needs a loaded
+     * wallet, so Core's behaviour there could not be verified, and changing
+     * unverified behaviour is how a fix becomes a defect. */
+    if (n_in>10000){ *ec=-22; *em="TX decode failed"; return 0; }
     /* build stripped unsigned tx */
     static unsigned char utx[200000]; long u=0; int had_sig=segwit;
     utx[u++]=raw[0];utx[u++]=raw[1];utx[u++]=raw[2];utx[u++]=raw[3];   /* version */
@@ -1474,10 +1596,29 @@ static char* psbt_b64_out(const unsigned char* v0, long v0len, const psbt_v2meta
     crt_b64(b, ob, n); return b;
 }
 /* psbt_version argument (Core: default 2, only 0 or 2) at `idx` */
+/* Core checks this argument's TYPE before the method body and its VALUE after.
+ * Measured against v31.1, 2026-09-15, with a real signed transaction:
+ *   converttopsbt <signed tx> false true "x" -> -3  Position 4 (psbt_version)
+ *   converttopsbt <signed tx> false true 7   -> -22 Inputs must not have scriptSigs
+ * So a bad TYPE beats the decode error and a bad VALUE loses to it. Calling
+ * the whole check at the end, as this did, could only ever produce the second
+ * ordering -- the -3 was written but unreachable for any transaction that
+ * failed to decode or carried signatures. Hence the two stages.
+ *
+ * The position is the caller's index + 1; both callers name it psbt_version
+ * (createpsbt has it at 6, converttopsbt at 4). */
+static int psbt_version_type(const rj_val* params, unsigned long idx, long* ec, const char** em){
+    if (params && params->typ == RJ_ARR && params->nitems > idx &&
+        params->items[idx]->typ != RJ_NULL && params->items[idx]->typ != RJ_NUM){
+        static char tb[256];
+        return rpc_wrong_type(ec, em, tb, sizeof tb, (int)idx + 1, "psbt_version",
+                              params->items[idx], "number"); }
+    return 1;
+}
 static int psbt_version_arg(const rj_val* params, unsigned long idx, int* ver, long* ec, const char** em){
     *ver = 2;
+    if (!psbt_version_type(params, idx, ec, em)) return 0;
     if (params && params->typ == RJ_ARR && params->nitems > idx && params->items[idx]->typ != RJ_NULL){
-        if (params->items[idx]->typ != RJ_NUM){ *ec = -3; *em = "JSON value of type string is not of expected type number"; return 0; }
         long v = strtol(params->items[idx]->str, 0, 10);
         if (v != 0 && v != 2){ *ec = -8; *em = "The PSBT version can only be 2 or 0"; return 0; }
         *ver = (int)v;
@@ -2345,6 +2486,30 @@ static const char* srw_sign_wsh(const srw_prev_t* P, unsigned char* wit, unsigne
     if (got<k){ static char mbuf[64]; snprintf(mbuf,sizeof mbuf,"Missing signatures: have %d of %d",got,k); return mbuf; }
     return NULL;
 }
+/* An `errors` entry carries the input AS IT STANDS after signing was attempted.
+ * That is what Core does: TxInErrorToJSON reads scriptSig and scriptWitness off
+ * mtx.vin[i] AFTER UpdateInput has written back whatever sigdata was produced,
+ * so a partially-signed input reports its partial data, and an input nothing
+ * could be done with reports the bytes it arrived with. These must therefore be
+ * the same bytes this function is about to serialize into `hex` for that input,
+ * never the bare/empty values.
+ *
+ * Core's field order in the entry is txid, vout, witness, scriptSig, sequence,
+ * error (rpc/rawtransaction_util.cpp TxInErrorToJSON). */
+static rj_val* srw_witness_json(const unsigned char* w, unsigned long wlen, unsigned long items){
+    rj_val* a=rj_arr();
+    unsigned long p=0, cc;
+    for (unsigned long k=0;k<items && p<wlen;k++){
+        unsigned long il=srw_varint(w+p,&cc); p+=cc;
+        if (p>wlen || il>wlen-p) break;                  /* truncated stack: emit what parsed */
+        char* h=malloc((size_t)il*2+1); if (!h) break;
+        bin_to_hex(h,w+p,(size_t)il);
+        rj_arr_push(a,rj_str(h)); free(h);
+        p+=il;
+    }
+    return a;
+}
+
 static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const char** em, rj_val** result){
     if (!params || params->typ!=RJ_ARR || params->nitems<2 || params->items[0]->typ!=RJ_STR || params->items[1]->typ!=RJ_ARR){
         *ec=-8; *em="Invalid parameters, expected hexstring and privkeys array"; return 0; }
@@ -2438,17 +2603,67 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
     if (hashtype==0x100){ hashtype=0x01; ht_explicit=0; }                     /* "DEFAULT": ALL for ECDSA, no hashtype byte for taproot */
 
     /* --- parse the unsigned tx into inputs (outpoint,seq) + outputs region + locktime --- */
-    unsigned long p=4, cc; unsigned long n_in=srw_varint(tx+p,&cc); p+=cc;
-    if (n_in==0||n_in>10000){ *ec=-22; *em="TX decode failed"; return 0; }
+    /* THE SEGWIT MARKER. This read the input count at offset 4 unconditionally.
+     * A segwit transaction carries 0x00 0x01 there, so srw_varint read 0x00 and
+     * n_in came out ZERO: the signing loop never ran, `complete` stayed true and
+     * `errors` stayed empty -- the node answered "fully signed" for a
+     * transaction it had not looked at. converttopsbt in this same file has
+     * always skipped the marker; this function never did.
+     *
+     * Found 2026-09-15. It was MASKED until the same day by the n_in == 0 guard
+     * below, which rejected such a transaction as "TX decode failed" -- wrong,
+     * but safe. Relaxing that guard (correctly, for empty PSBT templates)
+     * removed the accident that was hiding this, and turned a wrong error into
+     * a wrong success. That is the more dangerous of the two. */
+    unsigned long p=4, cc;
+    if (txlen > 6 && tx[4] == 0x00 && tx[5] != 0x00) p = 6;
+    unsigned long n_in=srw_varint(tx+p,&cc); p+=cc;
+    /* n_in == 0 is NOT a decode failure. A zero-input transaction cannot go
+     * on the network, but Core accepts one here (verified against v31.1),
+     * and wrapping one is how an empty PSBT template is built. Same root
+     * cause as crt_walk's guard (2026-09-14). Only the upper bound is real.
+     * simulaterawtransaction keeps its n_in == 0 refusal: it needs a loaded
+     * wallet, so Core's behaviour there could not be verified, and changing
+     * unverified behaviour is how a fix becomes a defect. */
+    if (n_in>10000){ *ec=-22; *em="TX decode failed"; return 0; }
+    /* THE INPUT'S OWN scriptSig AND WITNESS ARE KEPT (2026-09-15). This loop
+     * skipped the scriptSig without storing it and never read the witness
+     * section at all, so an input this function did not itself re-sign came out
+     * BARE: a 444-character signed transaction returned as 226, with the
+     * witness gone. Core returns it unchanged. In a multi-party flow -- where
+     * handing a partially-signed transaction to the next signer is the whole
+     * point -- that destroyed the previous signer's work.
+     *
+     * It also fixes the locktime, which was read immediately after the outputs.
+     * In a segwit transaction the WITNESS SECTION sits there, so locktime was
+     * reading witness bytes. */
     const unsigned char* in_outpoint[10000]; unsigned in_seq[10000];
+    const unsigned char* orig_ss[10000]; unsigned long orig_sslen[10000];
+    const unsigned char* orig_wit[10000]; unsigned long orig_witlen[10000]; unsigned long orig_witn[10000];
     for (unsigned long i=0;i<n_in;i++){
+        orig_wit[i]=NULL; orig_witlen[i]=0; orig_witn[i]=0;
         in_outpoint[i]=tx+p; p+=36;
-        unsigned long ssl=srw_varint(tx+p,&cc); p+=cc+ssl;
+        unsigned long ssl=srw_varint(tx+p,&cc); p+=cc;
+        orig_ss[i]=tx+p; orig_sslen[i]=ssl; p+=ssl;
         in_seq[i]=(unsigned)tx[p]|((unsigned)tx[p+1]<<8)|((unsigned)tx[p+2]<<16)|((unsigned)tx[p+3]<<24); p+=4;
     }
     unsigned long out_start=p; unsigned long n_out=srw_varint(tx+p,&cc); p+=cc;
     for (unsigned long i=0;i<n_out;i++){ p+=8; unsigned long sl=srw_varint(tx+p,&cc); p+=cc+sl; }
-    unsigned long out_end=p; unsigned long locktime=(unsigned long)tx[p]|((unsigned long)tx[p+1]<<8)|((unsigned long)tx[p+2]<<16)|((unsigned long)tx[p+3]<<24);
+    unsigned long out_end=p;
+    /* the witness section, one stack per input, BEFORE the locktime */
+    int in_segwit = (txlen > 6 && tx[4] == 0x00 && tx[5] != 0x00);
+    if (in_segwit){
+        for (unsigned long i=0;i<n_in && p<txlen;i++){
+            unsigned long items=srw_varint(tx+p,&cc); p+=cc;
+            orig_witn[i]=items; orig_wit[i]=tx+p;
+            for (unsigned long k=0;k<items && p<txlen;k++){
+                unsigned long il=srw_varint(tx+p,&cc); p+=cc+il;
+            }
+            orig_witlen[i]=(unsigned long)((tx+p)-orig_wit[i]);
+        }
+    }
+    if (p+4>txlen){ *ec=-22; *em="TX decode failed"; return 0; }
+    unsigned long locktime=(unsigned long)tx[p]|((unsigned long)tx[p+1]<<8)|((unsigned long)tx[p+2]<<16)|((unsigned long)tx[p+3]<<24);
 
     /* --- BIP143 mid-hashes (SIGHASH_ALL, non-ACP baseline) --- */
     unsigned char zero32[32]; memset(zero32,0,32);
@@ -2475,7 +2690,9 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
         unsigned long vo=(unsigned long)in_outpoint[i][32]|((unsigned long)in_outpoint[i][33]<<8)|((unsigned long)in_outpoint[i][34]<<16)|((unsigned long)in_outpoint[i][35]<<24);
         for (int k=0;k<nprev;k++) if (prev[k].vout==vo && !memcmp(prev[k].txid_wire,in_outpoint[i],32)){ prev_of[i]=&prev[k]; break; }
     }
-    int any_segwit=0, complete=1;
+    /* the marker is needed if we PRODUCE a witness or if one ARRIVED: dropping
+     * it would serialize a transaction whose witnesses are silently discarded */
+    int any_segwit=in_segwit, complete=1;
     rj_val* errors=rj_arr();
     unsigned char* pre=malloc((size_t)txlen+8192); if (!pre){ *ec=-7; *em="oom"; return 0; }
     for (unsigned long i=0;i<n_in;i++){
@@ -2579,6 +2796,16 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
             char idh[65]; unsigned char disp[32]; for(int k=0;k<32;k++) disp[k]=in_outpoint[i][31-k]; bin_to_hex(idh,disp,32);
             rj_obj_set(eo,"txid",rj_str(idh));
             rj_obj_set(eo,"vout",rj_numf("%lu",vo));
+            { const unsigned char* wp = wititems[i] ? witbuf[i] : orig_wit[i];
+              unsigned long wl = wititems[i] ? witlen[i] : orig_witlen[i];
+              unsigned long wn = wititems[i] ? wititems[i] : orig_witn[i];
+              rj_obj_set(eo,"witness", wp ? srw_witness_json(wp,wl,wn) : rj_arr()); }
+            { const unsigned char* sp = sslen[i] ? ss[i] : orig_ss[i];
+              unsigned long sl2 = sslen[i] ? sslen[i] : orig_sslen[i];
+              char* h=malloc((size_t)sl2*2+1);
+              if (!h){ rj_free(eo); rj_free(errors); free(pre); *ec=-7; *em="out of memory"; return 0; }
+              bin_to_hex(h,sp,(size_t)sl2);
+              rj_obj_set(eo,"scriptSig",rj_str(h)); free(h); }
             rj_obj_set(eo,"sequence",rj_numf("%u",in_seq[i]));
             rj_obj_set(eo,"error",rj_str(err));
             rj_arr_push(errors,eo);
@@ -2593,14 +2820,22 @@ static int cmd_signrawtransactionwithkey(const rj_val* params, long* ec, const c
     n+=crt_varint(out+n,(unsigned long long)n_in);
     for (unsigned long i=0;i<n_in;i++){
         memcpy(out+n,in_outpoint[i],36); n+=36;
-        n+=crt_varint(out+n,(unsigned long long)sslen[i]); memcpy(out+n,ss[i],sslen[i]); n+=sslen[i];
+        /* an input this function did not re-sign keeps the scriptSig it arrived
+         * with, rather than being emitted bare (2026-09-15) */
+        { const unsigned char* sp = sslen[i] ? ss[i] : orig_ss[i];
+          unsigned long sl2 = sslen[i] ? sslen[i] : orig_sslen[i];
+          n+=crt_varint(out+n,(unsigned long long)sl2); memcpy(out+n,sp,sl2); n+=sl2; }
         out[n++]=(unsigned char)in_seq[i];out[n++]=(unsigned char)(in_seq[i]>>8);out[n++]=(unsigned char)(in_seq[i]>>16);out[n++]=(unsigned char)(in_seq[i]>>24);
     }
     memcpy(out+n,tx+out_start,out_end-out_start); n+=out_end-out_start;    /* outputs region verbatim */
     if (any_segwit){
         for (unsigned long i=0;i<n_in;i++){
-            if (wititems[i]==0){ out[n++]=0x00; }                          /* empty stack */
-            else { n+=crt_varint(out+n,(unsigned long long)wititems[i]); memcpy(out+n,witbuf[i],witlen[i]); n+=witlen[i]; }
+            if (wititems[i]){ n+=crt_varint(out+n,(unsigned long long)wititems[i]); memcpy(out+n,witbuf[i],witlen[i]); n+=witlen[i]; }
+            else if (orig_witn[i]){                                        /* keep what arrived */
+                n+=crt_varint(out+n,(unsigned long long)orig_witn[i]);
+                memcpy(out+n,orig_wit[i],orig_witlen[i]); n+=orig_witlen[i];
+            }
+            else { out[n++]=0x00; }                                        /* empty stack */
         }
     }
     out[n++]=(unsigned char)locktime;out[n++]=(unsigned char)(locktime>>8);out[n++]=(unsigned char)(locktime>>16);out[n++]=(unsigned char)(locktime>>24);
@@ -2845,7 +3080,14 @@ static void wsl_add_lastprocessedblock(rj_val* o){
  * walletversion 1 and format "bmc" deliberately say this is our own store,
  * not a Core wallet, and descriptors=false because there is no descriptor
  * wallet here. birthtime/lastprocessedblock are omitted rather than faked --
- * this store records neither. */
+ * this store records neither.
+ *
+ * 2026-09-15: the differential reported birthtime as missing. It is NOT a gap:
+ * Core emits it only when the wallet HAS one (`if (birthtime != UNKNOWN_TIME)`,
+ * wallet.cpp:114), so omitting it where none is recorded is Core's own
+ * behaviour. The oracle's wallet happens to have one and this store has no such
+ * concept -- a state difference, not a divergence. keypoolsize_hd_internal, in
+ * the same report, WAS a real gap: Core pushes that one unconditionally. */
 static int cmd_getwalletinfo(const rpc_wallet* w, rj_val** result){
     static wsl_rec_t recs[WSL_MAX];
     int n = wsl_read(recs, WSL_MAX);
@@ -2857,6 +3099,14 @@ static int cmd_getwalletinfo(const rpc_wallet* w, rj_val** result){
     rj_obj_set(o, "format", rj_str("bmc"));
     rj_obj_set(o, "txcount", rj_numf("%d", n));
     rj_obj_set(o, "keypoolsize", rj_numf("%d", 0));
+    /* Core emits keypoolsize_hd_internal UNCONDITIONALLY, immediately after
+     * keypoolsize (wallet/rpc/wallet.cpp:96) -- its RPCResult marks it optional
+     * but the code always pushes it. This store pre-generates no keys at all,
+     * so both figures are zero; emitting one and omitting the other made the
+     * pair look like a wallet that has an external keypool and no internal one,
+     * which is a different claim from "no keypool". Found 2026-09-15 by the RPC
+     * shape differential, once a wallet was loaded on the oracle. */
+    rj_obj_set(o, "keypoolsize_hd_internal", rj_numf("%d", 0));
     rj_obj_set(o, "private_keys_enabled", rj_bool(w && w->seed ? 1 : 0));
     { extern int rpc_wops_avoid_reuse(void);
       rj_obj_set(o, "avoid_reuse", rj_bool(rpc_wops_avoid_reuse() ? 1 : 0)); }
@@ -2921,7 +3171,7 @@ static int cmd_signrawtransactionwithwallet(const rj_val* params, const rpc_wall
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_STR){
         *ec = -8; *em = "Invalid parameters, expected a raw transaction hex string"; return 0; }
-    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+    if (!w || !w->seed){ *ec = RPC_NO_WALLET_CODE; *em = RPC_NO_WALLET_MSG; return 0; }
 
     /* [hexstring, [wif...], prevtxs, sighashtype] -- the delegate's shape.
      * Core's signrawtransactionwithwallet takes (hexstring, prevtxs,
@@ -3079,7 +3329,7 @@ static int cmd_simulaterawtransaction(const rj_val* params, const rpc_wallet* w,
     if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
         params->items[0]->typ != RJ_ARR){
         *ec = -8; *em = "Invalid parameters, expected an array of raw transactions"; return 0; }
-    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+    if (!w || !w->seed){ *ec = RPC_NO_WALLET_CODE; *em = RPC_NO_WALLET_MSG; return 0; }
     const rj_val* list = params->items[0];
     long long delta = 0;
     for (size_t t = 0; t < list->nitems; t++){
@@ -3161,7 +3411,14 @@ static int crt_walk(const unsigned char* tx, unsigned long len, crt_in_t* ins, i
     int segwit = (len > 6 && tx[4] == 0x00 && tx[5] == 0x01);
     if (segwit) p = 6;
     unsigned long n_in = srw_varint(tx + p, &cc); p += cc;
-    if (n_in == 0 || (int)n_in > cap) return 0;
+    /* A zero-input transaction is not valid on the network, but it IS a valid
+     * thing to wrap in a PSBT: `createpsbt [] {}` builds an empty template to
+     * be funded later, and Core answers it with a well-formed PSBT. Refusing
+     * n_in == 0 here made the PSBTv2 conversion fail, and createpsbt reported
+     * "oom" (error -7) for a request that was never about memory. Found
+     * 2026-09-14 by extending the RPC shape differential past its first 64
+     * methods. Only the CAP is a real bound. */
+    if ((int)n_in > cap) return 0;
     for (unsigned long i = 0; i < n_in; i++){
         if (p + 36 > len) return 0;
         ins[i].op = tx + p; p += 36;
@@ -4360,7 +4617,7 @@ int rpc_cmd_walletprocesspsbt(const rj_val* params, const rpc_wallet* w,
     if (params->nitems >= 2 && params->items[1]->typ == RJ_BOOL) sign = params->items[1]->str[0]=='1';
     const char* sht = (params->nitems >= 3 && params->items[2]->typ == RJ_STR) ? params->items[2]->str : NULL;
     if (params->nitems >= 5 && params->items[4]->typ == RJ_BOOL) finalize = params->items[4]->str[0]=='1';
-    if (!w || !w->seed){ *ec = -4; *em = "No wallet is loaded"; return 0; }
+    if (!w || !w->seed){ *ec = RPC_NO_WALLET_CODE; *em = RPC_NO_WALLET_MSG; return 0; }
     /* ==== Updater from the wallet's own descriptors (listdescriptors): scripts, origins, taproot fields ==== */
     static dpp_desc_t* g_wupd_dv; static int g_wupd_nd; g_wupd_nd = 0;
     { rj_val* ld = NULL; long e2 = 0; const char* m2 = NULL; rj_val* np = rj_arr();
@@ -4708,6 +4965,13 @@ static int cmd_help(const rj_val* params, long* ec, const char** em, rj_val** re
     return 1;
 }
 
+/* The daemon's resolved debug-log name, pushed across by main.c (see
+ * rpc_set_logpath in rpc_commands.h). Empty until then. */
+static char g_rpc_logpath[512];
+void rpc_set_logpath(const char* p){
+    snprintf(g_rpc_logpath, sizeof g_rpc_logpath, "%s", p && *p ? p : "");
+}
+
 /* getrpcinfo -- Core reports the commands currently executing and the log
  * path. This node's RPC server accepts and services ONE connection at a time
  * on a single thread (rpc_server.c), so at the moment getrpcinfo runs it is
@@ -4721,15 +4985,26 @@ static int cmd_getrpcinfo(rj_val** result){
     rj_arr_push(cmds, c);
     rj_val* o = rj_obj();
     rj_obj_set(o, "active_commands", cmds);
-    /* The daemon opens its log as the bare relative name "bitcoind.log" from
-     * the datadir it runs in (daemon/main.c), so resolving it against the
-     * cwd is the real path, not a guess. */
-    { char cwd[1024];
-      if (getcwd(cwd, sizeof cwd)){
-          char path[1200];
-          snprintf(path, sizeof path, "%s/bitcoind.log", cwd);
-          rj_obj_set(o, "logpath", rj_str(path));
-      } }
+    /* The log's NAME is the daemon's to know: it defaults to "debug.log"
+     * (Core's -debuglogfile default, since 2026-09-06 -- it was
+     * logs/bitcoind.log before that) and -debuglogfile= overrides it, with
+     * "0" meaning /dev/null. Hardcoding "bitcoind.log" here reported a file
+     * that had not existed for eleven days and ignored the override
+     * entirely. main.c pushes the resolved name across with
+     * rpc_set_logpath(); if nobody did (a tool linking rpc_commands.o
+     * without the daemon), fall back to the documented default rather than
+     * omitting the field. An absolute path is reported as-is; a relative one
+     * is resolved against the cwd, which is the chain directory the daemon
+     * chdir()s into. */
+    { const char* name = g_rpc_logpath[0] ? g_rpc_logpath : "debug.log";
+      if (name[0] == '/') rj_obj_set(o, "logpath", rj_str(name));
+      else { char cwd[1024];
+             if (getcwd(cwd, sizeof cwd)){
+                 char path[1600];
+                 snprintf(path, sizeof path, "%s/%s", cwd, name);
+                 rj_obj_set(o, "logpath", rj_str(path));
+             } }
+    }
     *result = o;
     return 1;
 }

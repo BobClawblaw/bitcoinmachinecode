@@ -29,6 +29,7 @@
 #include "rpc_esplora.h"
 #include "rpc_json.h"
 #include "daemon/addr_hist_fmt.h"
+#include "daemon/mempool_journal.h"
 /* the address routes' sources (stage 2, 2026-09-08) */
 extern int  wallet_validate_address(const char* addr, int* type, unsigned char* ver, unsigned char h160[20], unsigned char prog[32]);
 extern long axt_read_events(int type, const unsigned char hash[32], long min_height,
@@ -637,6 +638,113 @@ static long esp_hist_find(const rpc_wallet* w, esp_hist* h, const unsigned char 
     for (long i = 0; i < h->nrefs; i++) if (!h->refs[i].has_txid && h->refs[i].height == height && h->refs[i].txpos == txpos) return i;
     return -1;
 }
+
+
+/* ---- /fee-estimates (2026-09-16) ------------------------------------------
+ * Esplora's flat map of confirmation target -> feerate in sat/vB:
+ *
+ *   {"1": 12.5, "2": 10.1, ..., "144": 2.0, "504": 1.5, "1008": 1.0}
+ *
+ * mempool.space's esplora client calls this; it was the last route in its
+ * client that this facade answered 404 for. The numbers come from the node's
+ * own estimatesmartfee -- the same estimator the JSON-RPC serves, so the two
+ * cannot drift -- reshaped from Core's BTC/kvB decimal string into Esplora's
+ * sat/vB number. BTC/kvB -> sat/vB is x100000000 / 1000, i.e. x100000.
+ *
+ * Targets are Esplora's own set: every block to 25, then 144, 504 and 1008.
+ * A target the estimator cannot answer is OMITTED rather than sent as zero: a
+ * zero feerate is a statement that a transaction pays nothing, and a caller
+ * that fell back to it would build an unrelayable transaction. Esplora omits
+ * for the same reason.
+ *
+ * The estimator is asked once per target. That is 28 dispatches, which is why
+ * the answers are built in one pass here rather than per request from the
+ * frontend: mempool.space polls this route on a timer. */
+static const int ESP_FEE_TARGETS[] = { 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,
+                                       21,22,23,24,25,144,504,1008 };
+static void esplora_fee_estimates(resp_t* r, const rpc_wallet* w){
+    rj_val* o = rj_obj();
+    long ec = 0; const char* em = 0;
+    for (unsigned i = 0; i < sizeof ESP_FEE_TARGETS / sizeof ESP_FEE_TARGETS[0]; i++){
+        int t = ESP_FEE_TARGETS[i];
+        rj_val* p = rj_arr(); rj_arr_push(p, rj_numf("%d", t));
+        rj_val* res = call(w, "estimatesmartfee", p, &ec, &em);
+        if (!res){ continue; }
+        const char* fr = S(res, "feerate");            /* BTC/kvB, decimal string */
+        if (fr){
+            /* string arithmetic, never a double: esplora_sats_of_amount gives
+             * satoshis per kvB, and sat/vB is that over 1000 */
+            long satkvb = esplora_sats_of_amount(fr);
+            if (satkvb > 0){
+                char key[8]; snprintf(key, sizeof key, "%d", t);
+                /* one decimal place, which is what Esplora emits */
+                rj_obj_set(o, key, rj_numf("%ld.%ld", satkvb / 1000, (satkvb % 1000) / 100));
+            }
+        }
+        rj_free(res);
+    }
+    reply_json(r, o);
+}
+
+/* ---- the mempool departure journal, over REST (2026-09-16) ----------------
+ * Esplora (and therefore mempool.space) has no route for this because Core
+ * has no data for it: once a transaction is evicted or expires, a Core-backed
+ * explorer can only show that it is gone, not why. These two routes expose
+ * daemon/mempool_journal.c so the app can say "replaced by X", "evicted when
+ * the pool filled", "expired after 14 days" instead of showing a gap.
+ *
+ * Both are EXTENSIONS. Nothing in the standard Esplora contract changes: a
+ * client that does not know about them is unaffected, and /tx/:txid keeps its
+ * exact shape -- the departure is added under its own key, so a consumer that
+ * reads only Esplora's fields sees no difference. */
+static rj_val* esp_departure(const unsigned char wire[32]){
+    mpj_rec d;
+    if (!mpj_is_open() || !mpj_lookup(wire, &d)) return 0;
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "reason", rj_str(mpj_reason_name(d.reason)));
+    rj_obj_set(o, "mined", rj_bool(d.reason == MPJ_MINED));
+    if (d.first_seen) rj_obj_set(o, "first_seen", rj_numf("%lld", (long long)d.first_seen));
+    rj_obj_set(o, "departed_at", rj_numf("%lld", (long long)d.departed_at));
+    if (d.first_seen && d.departed_at >= d.first_seen)
+        rj_obj_set(o, "waited", rj_numf("%lld", (long long)(d.departed_at - d.first_seen)));
+    rj_obj_set(o, "vsize", rj_numf("%llu", (unsigned long long)d.vsize));
+    rj_obj_set(o, "fee", rj_numf("%llu", (unsigned long long)d.fee_sat));
+    if (d.reason == MPJ_MINED && d.height) rj_obj_set(o, "block_height", rj_numf("%u", d.height));
+    { int nz = 0; for (int i = 0; i < 32; i++) if (d.aux[i]){ nz = 1; break; }
+      if (nz){ char h[65]; static const char* D = "0123456789abcdef";
+        for (int i = 0; i < 32; i++){ unsigned char b = d.aux[31-i]; h[i*2]=D[b>>4]; h[i*2+1]=D[b&15]; } h[64]=0;
+        rj_obj_set(o, d.reason == MPJ_REPLACED ? "replaced_by" : "block_hash", rj_str(h)); } }
+    return o;
+}
+static int esp_txid_wire(const char* hx, unsigned char wire[32]){
+    if (!hx || strlen(hx) != 64) return 0;
+    for (int i = 0; i < 32; i++){
+        int hi = -1, lo = -1; char a = hx[i*2], b = hx[i*2+1];
+        if (a>='0'&&a<='9') hi=a-'0'; else if ((a|32)>='a'&&(a|32)<='f') hi=(a|32)-'a'+10;
+        if (b>='0'&&b<='9') lo=b-'0'; else if ((b|32)>='a'&&(b|32)<='f') lo=(b|32)-'a'+10;
+        if (hi < 0 || lo < 0) return 0;
+        wire[31-i] = (unsigned char)((hi<<4)|lo);
+    }
+    return 1;
+}
+
+typedef struct { rj_val* arr; long cap; } esp_dep_ctx;
+static int esp_dep_push(void* c, const mpj_rec* d){
+    esp_dep_ctx* x = c;
+    if ((long)x->arr->nitems >= x->cap) return 0;
+    rj_val* o = rj_obj();
+    { char h[65]; static const char* D = "0123456789abcdef";
+      for (int i = 0; i < 32; i++){ unsigned char b = d->txid[31-i]; h[i*2]=D[b>>4]; h[i*2+1]=D[b&15]; } h[64]=0;
+      rj_obj_set(o, "txid", rj_str(h)); }
+    rj_obj_set(o, "reason", rj_str(mpj_reason_name(d->reason)));
+    rj_obj_set(o, "mined", rj_bool(d->reason == MPJ_MINED));
+    if (d->first_seen) rj_obj_set(o, "first_seen", rj_numf("%lld", (long long)d->first_seen));
+    rj_obj_set(o, "departed_at", rj_numf("%lld", (long long)d->departed_at));
+    rj_obj_set(o, "vsize", rj_numf("%llu", (unsigned long long)d->vsize));
+    rj_obj_set(o, "fee", rj_numf("%llu", (unsigned long long)d->fee_sat));
+    rj_arr_push(x->arr, o);
+    return 1;
+}
 #define IS(k, s) (!strcmp(seg[k], s))
 static void esplora_address(resp_t* r, const rpc_wallet* w, char seg[][80], int ns, int get){
     int type; unsigned char key[32];
@@ -798,12 +906,26 @@ int esplora_handle(const char* method, size_t mlen, const char* path, size_t ple
     }
     if (get && ns >= 2 && IS(0, "tx")){
         const char* txid = seg[1]; if (!is_hex64(txid, strlen(txid))){ reply_text(&r, 400, "invalid txid"); return 1; }
-        if (ns == 2){ rj_val* e = tx_by_id(w, txid, &ec, &em); if (!e){ reply_rpc_error(&r, ec, em); return 1; } reply_json(&r, e); return 1; }
+        if (ns == 2){ rj_val* e = tx_by_id(w, txid, &ec, &em); if (!e){ reply_rpc_error(&r, ec, em); return 1; }
+            /* EXTENSION: if this transaction has left the pool, say why. Added
+             * under its own key so every Esplora field keeps its exact shape. */
+            { unsigned char wire[32]; rj_val* d;
+              if (esp_txid_wire(txid, wire) && (d = esp_departure(wire))) rj_obj_set(e, "departure", d); }
+            reply_json(&r, e); return 1; }
         if (IS(2, "hex") || IS(2, "raw")){ rj_val* h = call(w, "getrawtransaction", P1s1n(txid, 0), &ec, &em); if (!h){ reply_rpc_error(&r, ec, em); return 1; }
             if (IS(2, "hex")){ reply_text(&r, 200, h->str ? h->str : ""); rj_free(h); return 1; }
             long n = h->str ? (long)strlen(h->str) / 2 : 0; u8* bin = malloc((size_t)n + 1); long got = unhex(h->str ? h->str : "", bin, n); rj_free(h);
             *out = (char*)bin; *outlen = (size_t)(got < 0 ? 0 : got); *status = 200; *ctype = "application/octet-stream"; return 1; }
         if (IS(2, "status")){ rj_val* e = tx_by_id(w, txid, &ec, &em); if (!e){ reply_rpc_error(&r, ec, em); return 1; } rj_val* st = rj_clone(G(e, "status")); rj_free(e); reply_json(&r, st); return 1; }
+        if (IS(2, "departure")){
+            unsigned char wire[32];
+            if (!esp_txid_wire(txid, wire)){ reply_text(&r, 400, "invalid txid"); return 1; }
+            if (!mpj_is_open()){ reply_text(&r, 501, "mempool departure journal not enabled (bmc.mempooljournal)"); return 1; }
+            rj_val* d = esp_departure(wire);
+            /* 404 is the honest answer for "no record": either it never left
+             * the pool here, or it left longer ago than the ring holds. */
+            if (!d){ reply_text(&r, 404, "no departure recorded for this txid"); return 1; }
+            reply_json(&r, d); return 1; }
         if (IS(2, "outspends")){ rj_val* a = outspends_of(w, txid, &ec, &em); if (!a){ reply_rpc_error(&r, ec, em); return 1; } reply_json(&r, a); return 1; }
         if (IS(2, "outspend") && ns == 4){ rj_val* a = outspends_of(w, txid, &ec, &em); if (!a){ reply_rpc_error(&r, ec, em); return 1; }
             long v = strtol(seg[3], 0, 10); if (v < 0 || (size_t)v >= a->nitems){ rj_free(a); reply_text(&r, 404, "vout out of range"); return 1; }
@@ -835,6 +957,14 @@ int esplora_handle(const char* method, size_t mlen, const char* path, size_t ple
             rj_val* o = rj_obj(); rj_obj_set(o, "count", rj_numf("%lld", N(mi, "size"))); rj_obj_set(o, "vsize", rj_numf("%lld", N(mi, "bytes")));
             rj_obj_set(o, "total_fee", rj_numf("%ld", S(mi, "total_fee") ? esplora_sats_of_amount(S(mi, "total_fee")) : 0)); rj_obj_set(o, "fee_histogram", rj_arr());
             rj_free(mi); reply_json(&r, o); return 1; }
+        if (IS(1, "departures")){
+            if (!mpj_is_open()){ reply_text(&r, 501, "mempool departure journal not enabled (bmc.mempooljournal)"); return 1; }
+            long want = 25;                       /* Esplora's page size */
+            if (ns >= 3){ long v = strtol(seg[2], 0, 10); if (v > 0) want = v > 1000 ? 1000 : v; }
+            rj_val* a = rj_arr();
+            esp_dep_ctx cx = { a, want };
+            mpj_recent(want, esp_dep_push, &cx);
+            reply_json(&r, a); return 1; }
         if (IS(1, "txids")){ rj_val* m = call(w, "getrawmempool", (rj_val*)({ rj_val* a = rj_arr(); rj_arr_push(a, rj_bool(0)); a; }), &ec, &em); if (!m){ reply_rpc_error(&r, ec, em); return 1; } reply_json(&r, m); return 1; }
         if (IS(1, "recent")){ rj_val* m = call(w, "getrawmempool", (rj_val*)({ rj_val* a = rj_arr(); rj_arr_push(a, rj_bool(1)); a; }), &ec, &em); if (!m){ reply_rpc_error(&r, ec, em); return 1; }
             rj_val* arr = rj_arr(); size_t shown = 0;
@@ -869,6 +999,7 @@ int esplora_handle(const char* method, size_t mlen, const char* path, size_t ple
         }
         reply_text(&r, 404, "unknown internal route"); return 1;
     }
+    if (get && ns == 1 && IS(0, "fee-estimates")){ esplora_fee_estimates(&r, w); return 1; }
     if (ns >= 2 && IS(0, "address")){ esplora_address(&r, w, seg, ns, get); return 1; }
     if (ns >= 2 && IS(0, "scripthash")){ reply_text(&r, 501, "scripthash lookups are not served: the address index is keyed by address, not script hash"); return 1; }
     reply_text(&r, 404, "unknown route"); return 1;

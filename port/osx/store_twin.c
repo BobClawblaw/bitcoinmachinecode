@@ -17,7 +17,16 @@
  *   +32  i32 cur_file_pos (bytes written in current blk file)
  *   +36  i32 magic        (0xd9b4bef9)
  *   +40  i32 pad          (shared-append flock fd, set by caller)
- *   +44  i32 pad2
+ *   +44  i32 pos_file_no  (WHICH file cur_file_pos was measured in; 2026-09-18)
+ *                                cur_file_pos is a position, and a position only
+ *                                means something relative to a file. Whenever
+ *                                cur_file_no moves without cur_file_pos being
+ *                                retaken, the pair is incoherent -- that is the
+ *                                2026-09-17 incident, where an advanced
+ *                                cur_file_no and a stale pos=0 put 293 bytes over
+ *                                the start of height 967422. Every writer of +32
+ *                                here also writes +44, which is why they are
+ *                                always adjacent (matches the x86 store header).
  *   +48  i32 prune_height (first retained height; persisted in prune.dat)
  *
  * Exports (semantics byte-matched to the asm):
@@ -110,6 +119,7 @@ int store_init(void *st)
     *(i32 *)(S + 32) = 0;                           /* cur_file_pos */
     *(i32 *)(S + 36) = (i32)0xd9b4bef9;             /* magic */
     *(i32 *)(S + 40) = 0;                           /* pad / flock fd */
+    *(i32 *)(S + 44) = 0;                           /* pos_file_no := cur_file_no */
     *(i32 *)(S + 48) = 0;                           /* prune_height */
     /* restore persisted prune gate */
     int pfd = open(prunename, O_RDONLY);
@@ -136,6 +146,7 @@ int store_reload(void *st)
         *(i32 *)(S + 24) = -1;                      /* empty */
         *(i32 *)(S + 28) = 0;
         *(i32 *)(S + 32) = 0;
+        *(i32 *)(S + 44) = 0;                       /* pos_file_no := cur_file_no */
         *(u64 *)(S + 0)  = (u64)-1;
         return 1;
     }
@@ -150,6 +161,7 @@ int store_reload(void *st)
     memcpy(&size, rec + 44, 4);
     *(i32 *)(S + 28) = fno;
     *(i32 *)(S + 32) = (i32)(pos + 8 + size);
+    *(i32 *)(S + 44) = fno;                         /* pos_file_no := cur_file_no */
     *(i32 *)(S + 24) = (i32)tip;
     if (open_file(st, (u32)fno) < 0) return -1;
     return 1;
@@ -196,6 +208,7 @@ int store_get_at(void *st, u64 height, u64 out_meta[3])
     memcpy(&out_meta[1], rec + 44, 4);              /* data_size (u32) */
     out_meta[1] &= 0xFFFFFFFFu;
     memcpy(&out_meta[2], rec + 32, 4);              /* file_no */
+    out_meta[2] &= 0xFFFFFFFFu;                     /* the u32 zero-extends (x86 loads a dword); the high half must not carry stack garbage */
     return 1;
 }
 
@@ -294,8 +307,41 @@ int store_prune(void *st, int prune_height)
 int store_append(void *st, const u8 hash[32], const void *raw, u64 len)
 {
     u8 *S = (u8 *)st;
+    /* FRONTIER + SELF-HEAL (x86 2026-09-18). The incident: a C-side
+     * archive_store_frontier() advanced cur_file_no and left cur_file_pos
+     * at 0; the open fd still pointed at the OLD file, so bytes landed over
+     * an existing block while the index record named a file that never
+     * received them (tests/test_append_unshared_frontier.c on x86).
+     * 1. drop the fd. Everything below reopens from cur_file_no, so the fd
+     *    provably matches the cursor.
+     * 2. the frontier walk, identical in shape to store_append_shared_x's,
+     *    so the two append paths cannot drift apart again.
+     * 3. retake cur_file_pos ONLY when the walk moved the cursor (or the
+     *    pair is otherwise incoherent): cur_file_pos is authoritative for
+     *    the file it was measured in, and a store re-inited over a leftover
+     *    directory deliberately has pos=0 against a non-empty blk file so
+     *    the stale bytes are reclaimed (x86: test_archive_truncate_nonmonotonic). */
+    if ((long)*(u64 *)(S + 0) >= 0) {
+        close((int)*(u64 *)(S + 0));
+        *(u64 *)(S + 0) = (u64)-1;
+    }
+    for (;;) {
+        char nb[16];
+        u32 next = (u32)*(i32 *)(S + 28) + 1;
+        fmt_blkname(nb, next);
+        if (access(nb, F_OK) != 0) break;           /* blk(cur+1) absent -> cur IS the frontier */
+        *(i32 *)(S + 28) = (i32)next;
+    }
     if (*(u64 *)(S + 0) == (u64)-1 || (long)*(u64 *)(S + 0) < 0) {
         if (open_file(st, (u32)*(i32 *)(S + 28)) < 0) return -1;
+    }
+    /* pos_file_no (+44) != cur_file_no: the position was NOT measured in
+     * this file -- retake it from the true end */
+    if (*(i32 *)(S + 44) != *(i32 *)(S + 28)) {
+        off_t sz = lseek((int)*(u64 *)(S + 0), 0, SEEK_END);
+        if (sz < 0) return -1;
+        *(i32 *)(S + 32) = (i32)sz;                 /* MAX_FILE is 128 MiB: 32 bits ample */
+        *(i32 *)(S + 44) = *(i32 *)(S + 28);        /* pos_file_no := cur_file_no */
     }
     /* rollover: cur_file_pos + 8 + len > MAX_FILE -> next file */
     if ((u64)(u32)*(i32 *)(S + 32) + 8 + len > MAX_FILE) {
@@ -303,6 +349,7 @@ int store_append(void *st, const u8 hash[32], const void *raw, u64 len)
         *(u64 *)(S + 0) = (u64)-1;
         *(i32 *)(S + 28) += 1;
         *(i32 *)(S + 32) = 0;
+        *(i32 *)(S + 44) = *(i32 *)(S + 28);        /* pos_file_no := cur_file_no */
         if (open_file(st, (u32)*(i32 *)(S + 28)) < 0) return -1;
     }
     u64 pos    = (u64)(u32)*(i32 *)(S + 32);        /* data_pos */
@@ -316,6 +363,7 @@ int store_append(void *st, const u8 hash[32], const void *raw, u64 len)
     if (pwrite(blk_fd, hdr, 8, (off_t)pos) != 8) return -1;
     if (pwrite(blk_fd, raw, len, (off_t)pos + 8) != (ssize_t)len) return -1;
     *(i32 *)(S + 32) = (i32)(pos + 8 + len);
+    *(i32 *)(S + 44) = (i32)file_no;                /* pos_file_no := cur_file_no */
     /* STO-11: block bytes durable before the index record */
     if (store_sync_enabled) {
         if (fdatasync(blk_fd) < 0) return -1;
@@ -344,6 +392,24 @@ static long store_append_shared_x(void *st, long height, const u8 hash[32],
         flock(lock_fd, LOCK_EX);
     long ret = -1;
     for (;;) {                                      /* single-pass body */
+        /* FRONTIER (x86 2026-09-17): never append below the newest blk file.
+         * This path self-heals its POSITION (the lseek below) but not its
+         * FILE NUMBER, and the rollover walks forward one file at a time --
+         * a cursor left behind fills the leftover tail gap of every older
+         * file, each write putting a LOWER offset at a HIGHER height. One
+         * access(2) per append in the steady state (blk(cur+1) is absent).
+         * Inside the flock, so a concurrent creator cannot race the probe. */
+        for (;;) {
+            char nb[16];
+            u32 next = (u32)*(i32 *)(S + 28) + 1;
+            fmt_blkname(nb, next);
+            if (access(nb, F_OK) != 0) break;       /* blk(cur+1) absent -> cur IS the frontier */
+            *(i32 *)(S + 28) = (i32)next;
+            if ((long)*(u64 *)(S + 0) >= 0) {       /* drop the fd: the next open is the new file */
+                close((int)*(u64 *)(S + 0));
+                *(u64 *)(S + 0) = (u64)-1;
+            }
+        }
         if ((int)*(u64 *)(S + 8) < 0) {             /* stale idx_fd: reopen */
             int fd = open(idxname, O_RDWR | O_CREAT, 0644);
             if (fd >= 0) *(u64 *)(S + 8) = (u64)fd;
@@ -468,6 +534,7 @@ long long store_truncate_to(void *st, long long target_height)
         *(i32 *)(S + 24) = -1;
         *(i32 *)(S + 28) = 0;
         *(i32 *)(S + 32) = 0;
+        *(i32 *)(S + 44) = 0;                       /* pos_file_no := cur_file_no */
         *(u64 *)(S + 0)  = (u64)-1;
         return 1;
     }
@@ -494,6 +561,7 @@ long long store_truncate_to(void *st, long long target_height)
     /* in-memory state */
     *(i32 *)(S + 28) = (i32)bfile;
     *(i32 *)(S + 32) = (i32)bpos;
+    *(i32 *)(S + 44) = (i32)bfile;                  /* pos_file_no := cur_file_no */
     *(u64 *)(S + 16) = ((u64)target_height + 1) * 48;
     *(i32 *)(S + 24) = (i32)target_height;
     return 1;

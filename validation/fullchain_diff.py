@@ -71,6 +71,10 @@ Exit 0 if zero divergences across every block, 1 otherwise.
 Writes validation/fullchain_diff_report.{json,txt} (cwd-independent).
 """
 import sys, os, json, time, struct, subprocess, hashlib, base64, random, threading
+
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
 import http.client
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
@@ -763,6 +767,9 @@ def main():
     log('report -> %s' % REPORT_JSON)
     log('report -> %s' % REPORT_TXT)
     log('divergences: %d' % len(all_divs))
+    # stats['blocks'] is how many real blocks were walked. Zero of them prints
+    # 'divergences: 0' and returns 0.
+    require_cases(stats['blocks'], 'mainnet blocks walked')
     return 0 if not all_divs else 1
 
 if __name__ == '__main__':

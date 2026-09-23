@@ -19,6 +19,10 @@ Exit 0 if zero divergences.
 """
 import os, sys, subprocess
 
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, '..'))
 ORACLE = os.environ.get('P2SH_ORACLE', '/tmp/core_verify_oracle')
@@ -67,6 +71,9 @@ def main():
                 divs.append({'case': name, 'flags': hex(flags), 'core': (cok, cerr), 'asm': (aok, aerr)})
     finally:
         eng.close()
+    # total[0] is how many cases ran; zero of them prints agree=0/0
+    # divergences=0 and returns 0 -- a pass over nothing.
+    require_cases(total[0], 'P2SH cases')
     print('\n==== P2SH differential ==== agree=%d/%d divergences=%d'
           % (total[1], total[0], len(divs)))
     for dd in divs: print('  DIVERGENCE', dd)

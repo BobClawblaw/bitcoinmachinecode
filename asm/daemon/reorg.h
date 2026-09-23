@@ -161,6 +161,16 @@ long reorg_last_fork_height(void);
 long reorg_mempool_reconcile(reorg_mempool_t* m,
                              const unsigned char* const* disc_blocks,
                              const uint32_t* disc_lens, long ndisc);
+/* The same, told which transactions the REPLACEMENT blocks confirmed
+ * (`conf`, `nconf` txids in wire order, any order): a pool transaction that
+ * leaves because the new branch mined it is numbered but not published on
+ * the ZMQ sequence topic, exactly as Core's removeForBlock (BLOCK) does;
+ * every other departure is an 'R', every re-entry from the disconnected
+ * blocks an 'A'. reorg_mempool_reconcile is this with no confirmed set. */
+long reorg_mempool_reconcile_ex(reorg_mempool_t* m,
+                                const unsigned char* const* disc_blocks,
+                                const uint32_t* disc_lens, long ndisc,
+                                const unsigned char (*conf)[32], long nconf);
 
 /* ---- top-level network driver ---- */
 /* One fork-detection pass against an already-handshaked peer fd.

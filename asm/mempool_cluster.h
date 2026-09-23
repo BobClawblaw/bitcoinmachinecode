@@ -1,0 +1,166 @@
+/* mempool_cluster.h -- Core's cluster mempool: clusters, linearization, chunks.
+ *
+ * See docs/devlog/PLAN_CLUSTER_MEMPOOL.md for the design and the staging.
+ *
+ * A CLUSTER is a connected component of the in-mempool dependency graph,
+ * bounded at MPC_MAX_CLUSTER transactions (Core's DEFAULT_CLUSTER_LIMIT, 64).
+ * That bound is why this header can be as simple as it is: membership and the
+ * ancestor/descendant sets are one uint64_t each, so set algebra is a single
+ * instruction and a cluster costs 24 bytes per member.
+ *
+ * THE WEIGHT FIELD IS WHATEVER THE CALLER MEASURES IN. This module compares
+ * fee/weight by cross-multiplication and never divides, so it is
+ * denominator-agnostic. Both callers currently hand it the sigops-ADJUSTED
+ * VSIZE, which is what this node's mempool stores and what Core's own
+ * CTxMemPoolEntry::GetTxSize() returns. Core's linearization divides by adjusted
+ * WEIGHT instead (txmempool.cpp: FeePerWeight(fee, GetSigOpsAdjustedWeight(...))),
+ * which differs only by the division by four -- the orderings disagree in about
+ * 3 pairs per million, at rounding boundaries. Measured and recorded in
+ * docs/CORE_DIVERGENCES.md. If it is ever closed, close it in BOTH callers at
+ * once: one of them using weight while the other uses vsize would re-split the
+ * implementation this module exists to unify.
+ *
+ * A LINEARIZATION is an ordering of the cluster in which every parent precedes
+ * every child. CHUNKS are that ordering split into runs of non-increasing
+ * feerate, by the rule in Core's ChunkLinearizationInfo.
+ */
+#ifndef MEMPOOL_CLUSTER_H
+#define MEMPOOL_CLUSTER_H
+#include <stdint.h>
+
+#define MPC_MAX_CLUSTER 64          /* Core DEFAULT_CLUSTER_LIMIT (policy.h) */
+
+/* One member of a cluster. `ancestors` and `descendants` INCLUDE self, which is
+ * Core's convention in DepGraph::Entry and matches this node's existing
+ * ancestorcount/descendantcount semantics. Bit k refers to members[k]. */
+typedef struct {
+    uint64_t ancestors;
+    uint64_t descendants;
+    uint64_t fee;               /* sat */
+    uint64_t weight;            /* Core's sigops-ADJUSTED weight */
+} mpc_member;
+
+typedef struct {
+    int         n;                          /* members in use */
+    int         truncated;                  /* the component exceeded the bound */
+    mpc_member  m[MPC_MAX_CLUSTER];
+    unsigned char txid[MPC_MAX_CLUSTER][32];
+} mpc_cluster;
+
+/* One chunk: a set of members and their summed fee/weight. */
+typedef struct {
+    uint64_t members;           /* bitset over cluster member indices */
+    uint64_t fee;
+    uint64_t weight;
+} mpc_chunk;
+
+typedef struct {
+    int       n;
+    mpc_chunk c[MPC_MAX_CLUSTER];
+} mpc_chunking;
+
+/* Split a linearization into chunks, exactly as Core's ChunkLinearizationInfo:
+ * each transaction starts as a singleton chunk, and while the new chunk's
+ * feerate exceeds the previous chunk's, the previous is absorbed into it.
+ * `lin` holds cl->n member indices in linearization order.
+ * Returns 0, or -1 if lin is not a permutation of the cluster's members. */
+int mpc_chunk_linearization(const mpc_cluster* cl, const int* lin, mpc_chunking* out);
+
+/* Is `lin` topologically valid -- does every parent precede every child?
+ * 1 yes / 0 no. A linearization that fails this is not merely suboptimal, it is
+ * unusable: it would have a block template spend an output before creating it. */
+int mpc_is_topological(const mpc_cluster* cl, const int* lin);
+
+/* One entry as the mempool sees it: its DIRECT edges and its own fee/weight.
+ * Only direct edges are needed -- the transitive closure is computed here. */
+typedef struct {
+    uint64_t fee;
+    uint64_t weight;                 /* sigops-adjusted, as Core's chunks use */
+    int n_parents, n_children;
+    unsigned char parents[MPC_MAX_CLUSTER][32];
+    unsigned char children[MPC_MAX_CLUSTER][32];
+} mpc_entry;
+
+/* Look one transaction up. 1 found / 0 absent. */
+typedef int (*mpc_lookup_fn)(void* ctx, const unsigned char txid[32], mpc_entry* out);
+
+/* Build the cluster containing `seed`: the connected component of the mempool
+ * dependency graph reachable from it through parents AND children.
+ *
+ * A CALLBACK rather than a direct call into the mempool, deliberately. This
+ * module is linked by tests that do not pull in the policy registry, and a
+ * direct dependency here would be refused by link-check exactly as one was on
+ * 2026-09-12 -- 22 test rules link the RPC object without the mempool.
+ *
+ * Core bounds clusters at 64 transactions and rejects a transaction that would
+ * exceed it, so a real Core cluster always fits. This node's limits are not
+ * identical, so a component CAN exceed the bound here; when it does, the walk
+ * stops and `truncated` is set. A truncated cluster is NOT a cluster and must
+ * not be reported as one -- callers check the flag.
+ *
+ * Returns 0 on success, -1 if the seed is absent or the graph is malformed. */
+int mpc_build_cluster(void* ctx, mpc_lookup_fn look,
+                      const unsigned char seed[32], mpc_cluster* out);
+
+/* Build a linearization: an ordering in which every parent precedes every child.
+ *
+ * STAGE 3 (see the plan): ancestor-score greedy. Repeatedly take the remaining
+ * ancestor-closed set with the best feerate and emit it, topologically, then
+ * remove it and repeat. This is the classic mining ordering and is what this
+ * node already selects by; it is deterministic, always topologically valid, and
+ * never worse than emitting in arrival order.
+ *
+ * It is NOT Core's optimum. Core v31 searches with a spanning-forest algorithm
+ * under a cost budget and a seeded RNG, and reports whether it reached the
+ * optimum; two correct implementations agree only where both do. Improving on
+ * this is stage 5 and is deliberately separate: a valid-but-suboptimal
+ * linearization is a working mempool, a subtly wrong one is a broken one.
+ *
+ * Ties are broken as Core breaks them when emitting ready chunks
+ * (SpanningForestState::GetLinearization): better feerate first, then SMALLER
+ * weight, then lowest member index. Deterministic ordering matters beyond
+ * tidiness -- an unstable order makes two runs over the same mempool disagree
+ * and turns a differential into noise.
+ *
+ * Writes cl->n indices into lin[]. Returns 0, or -1 on a malformed cluster.  */
+int mpc_linearize_ancestor_score(const mpc_cluster* cl, int* lin);
+
+/* Improve a linearization in place, as Core's PostLinearize does.
+ *
+ * Two passes, backward then forward. Core's own statement of the guarantees:
+ *   - one pass in either direction makes the resulting chunks CONNECTED;
+ *   - a forward pass linearizes optimally any graph where each transaction has
+ *     at most one child; a backward pass does so where each has at most one
+ *     parent;
+ *   - starting with a backward pass gives the moved-tree property: replacing a
+ *     transaction with a same-size higher-fee one cannot worsen the result.
+ *
+ * Each pass is equal-or-better than what it started from, so this can only
+ * improve the input. It is NOT Core's full optimum -- that is a spanning-forest
+ * search under a cost budget -- but it is bounded, deterministic, and its
+ * guarantees are stated rather than hoped for.
+ *
+ * Returns 0, or -1 if lin is not a valid linearization of cl. */
+int mpc_post_linearize(const mpc_cluster* cl, int* lin);
+
+/* Is linearization A at least as good as B in the FEERATE DIAGRAM sense?
+ *
+ * The diagram is the cumulative (weight, fee) curve of the chunked order. A is
+ * at least as good when its curve is nowhere below B's -- i.e. for every weight
+ * budget, A's ordering gets at least as much fee into it. This is the only
+ * honest way to compare two linearizations: Core's is not canonical, so raw
+ * equality would report non-defects, and total fee is identical for both since
+ * they hold the same transactions.
+ *
+ * 1 if A >= B everywhere, 0 otherwise. */
+int mpc_diagram_at_least_as_good(const mpc_cluster* cl, const int* a, const int* b);
+
+/* Sum fee and weight over a member bitset. */
+void mpc_set_totals(const mpc_cluster* cl, uint64_t set, uint64_t* fee, uint64_t* weight);
+
+/* Compare two feerates as Core's FeeFrac does: a.fee/a.weight vs b.fee/b.weight
+ * by cross-multiplication, so no division and no floating point. Returns
+ * -1/0/1. 64x64 products can overflow 64 bits, so this uses __int128. */
+int mpc_feerate_cmp(uint64_t fee_a, uint64_t wt_a, uint64_t fee_b, uint64_t wt_b);
+
+#endif

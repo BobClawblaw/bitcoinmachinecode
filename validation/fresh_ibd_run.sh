@@ -32,6 +32,15 @@ DEST=${DEST:-/mnt/2tbssd/bmc-bench}
 SRCREF=${SRCREF:-HEAD}
 P2P=${P2P:-8462}; RPC=${RPC:-8461}
 WORKERS=${WORKERS:-8}
+# NICE: the daemon's CPU niceness. 10 suits a correctness run sharing the box;
+# a TIMED run against Core must use 0, because the Core baseline runs at
+# Nice=0 under systemd and a niced node measures the scheduler, not the code.
+NICE=${NICE:-10}
+# EXTRA_CONF: newline-separated keys appended to the conf, so a benchmark can
+# match the Core baseline's protocol (txindex, blockfilterindex, maxconnections)
+# without editing this file.
+EXTRA_CONF=${EXTRA_CONF:-}
+. "$(dirname "$0")/lib/ibd_harness_lib.sh"
 ORACLE=${ORACLE:-"/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle"}
 PH="$DEST/phase.log"; PROG="$DEST/progress.log"
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -49,8 +58,19 @@ git -C src fetch -q origin "+refs/heads/*:refs/remotes/origin/*" 2>/dev/null
 git -C src checkout -q --detach "origin/$SRCREF" 2>/dev/null || git -C src checkout -q --detach "$SRCREF" 2>/dev/null
 COMMIT=$(git -C src rev-parse --short HEAD)
 ph "SRC commit=$COMMIT ref=$SRCREF"
-( cd src/asm && make -j8 daemon/bmcbitcoind ) > build.log 2>&1 || { ph "FAIL build"; echo FAIL > RESULT; exit 1; }
-ph "BUILD ok"
+# `make runtime`: the daemon, bmc_cli, and every helper the daemon execs from
+# its own directory (asm/Makefile RUNTIME_HELPERS). bmc_cli because the
+# monitor loop below asks it for the height -- only the daemon was built here
+# once, so on a FRESH clone every getblockcount came back empty and the tip
+# and capstone could never fire. The helpers because run 27 built neither
+# them nor the index they make: its log said "builder ... not executable" and
+# its txindex was never folded into a run, for the whole benchmark.
+( cd src/asm && make -j8 runtime ) > build.log 2>&1 || { ph "FAIL build"; echo FAIL > RESULT; exit 1; }
+[ -x src/asm/daemon/bmc_cli ] || { ph "FAIL build: no bmc_cli"; echo FAIL > RESULT; exit 1; }
+HELPERS=$(make -s -C src/asm print-runtime-helpers 2>/dev/null)
+# shellcheck disable=SC2086  # one word per helper, by design
+hc=$(ibd_require_helpers src/asm/daemon $HELPERS) || { ph "FAIL build: $hc"; echo FAIL > RESULT; exit 1; }
+ph "BUILD ok ($hc: $HELPERS)"
 
 mkdir -p data
 cp src/config/bitcoin.sample.conf data/bitcoin.conf 2>/dev/null
@@ -66,45 +86,80 @@ bmc.catchupworkers=$WORKERS
 # from Core names the block it diverged on instead of only the tip.
 coinstatsindex=1
 CONF
-ph "CONF port=$P2P rpcport=$RPC dbcache=8192 workers=$WORKERS coinstatsindex=1"
+[ -n "$EXTRA_CONF" ] && printf '%s\n' "$EXTRA_CONF" >> data/bitcoin.conf
+ph "CONF port=$P2P rpcport=$RPC dbcache=8192 workers=$WORKERS coinstatsindex=1 nice=$NICE extra=[$(printf '%s' "$EXTRA_CONF" | tr '\n' ' ')]"
 
 T0=$(date +%s); echo "$T0" > epoch.start
-setsid nohup nice -n 10 src/asm/daemon/bmcbitcoind serve "$DEST/data" > console.log 2>&1 < /dev/null &
+setsid nohup nice -n "$NICE" src/asm/daemon/bmcbitcoind serve "$DEST/data" > console.log 2>&1 < /dev/null &
 echo $! > daemon.pid; sleep 8
 kill -0 "$(cat daemon.pid)" 2>/dev/null || { ph "FAIL daemon exited at once"; echo FAIL > RESULT; exit 1; }
 ph "DAEMON pid=$(cat daemon.pid) epoch=$T0"
 
+# A missing helper is a benchmark that cannot be compared with Core: the node
+# skips index work Core does. The pre-launch check above covers the build;
+# this covers the daemon's own view (a path it resolves differently, a helper
+# that is present but refuses to run). Watched closely for the first
+# HELPER_WATCH_S seconds, then on every monitor tick below. On a hit the run
+# is over: the daemon is stopped and the line that proved it is in phase.log.
+HELPER_WATCH_S=${HELPER_WATCH_S:-900}
+helper_fail(){ ph "FAIL helper missing: $1"; kill -TERM "$(cat daemon.pid)" 2>/dev/null; echo FAIL > RESULT; exit 1; }
+w=0
+while [ "$w" -lt "$HELPER_WATCH_S" ]; do
+    mh=$(ibd_missing_helper "$(ibd_daemon_log "$DEST/data")") && helper_fail "$mh"
+    kill -0 "$(cat daemon.pid)" 2>/dev/null || { ph "FAIL daemon exited during the first $w s"; echo FAIL > RESULT; exit 1; }
+    sleep 15; w=$((w+15))
+done
+ph "HELPERS no missing-helper line in the first ${HELPER_WATCH_S}s"
+
 # -rpcclienttimeout=0 (wait forever): gettxoutsetinfo walks the whole UTXO set
 # and blows past the 900s default on a mainnet-sized node.
 CLI="src/asm/daemon/bmc_cli -rpcport=$RPC -datadir=$DEST/data -rpcclienttimeout=0"
+SEEN_CLIENTS=""; LAST_PROG=""; PROG_AT=$(date +%s); STALE_SAID=0; TW_SAID=0
+HB_STALE_S=${HB_STALE_S:-3600}
 while :; do
     sleep 300
-    # 2026-09-12: this read console.log, which holds ONLY the startup banner --
-    # the daemon redirects its running log to data/main/debug.log (its [boot]
-    # line says so). Every tick therefore recorded hb='' and bad=0 for three
-    # runs: no heartbeat, and, worse, a bad-marker check that could never fire.
-    # Three separate mistakes, all of which had to be fixed to get one number:
-    #   - the file: data/main/debug.log, not console.log
-    #   - the pattern: the heartbeat is "[dlc] == elapsed ...", and "\[dl\] "
-    #     cannot match "[dlc]" because it demands "] " straight after "dl"
-    #   - grep -a: debug.log carries NUL bytes, so grep calls it binary and
-    #     prints nothing at all, counts included
+    # The readers live in lib/ibd_harness_lib.sh and are tested by
+    # test_ibd_harness.sh. They were inline here until 2026-09-12, which is how
+    # three of them stayed broken for three runs: nothing could call a piece of
+    # this script, so nothing ever checked that the heartbeat it recorded was a
+    # heartbeat. Two of those defects reported success rather than failing.
     LOG=data/main/debug.log
-    hb=$(grep -a '\[dlc\] == elapsed' "$LOG" 2>/dev/null | tail -1 | sed 's/.*== //;s/ ==.*//')
-    [ -z "$hb" ] && hb=$(grep -a '\[dl\] heartbeat' "$LOG" 2>/dev/null | tail -1 | sed 's/.*heartbeat: //')
-    bad=$(grep -aE 'FATAL|REJECT|HALTED|SEGV' "$LOG" 2>/dev/null | grep -vE '\[reorg\] (candidate REJECTED|probe of )' | grep -c .)
+    hb=$(ibd_heartbeat "$LOG")
+    bad=$(ibd_bad_markers "$LOG")
+    mh=$(ibd_missing_helper "$LOG") && helper_fail "$mh"
     du=$(du -sh data 2>/dev/null | cut -f1)
-    # the 2026-09-11 occupancy figure: the share of worker wall-clock spent
-    # blocked in the socket read. Recorded every tick so the sync's throughput
-    # can be read against whether the peers were ever able to fill the pipe.
-    idle=$(grep -aoE 'pool idle [0-9]+%' "$LOG" 2>/dev/null | tail -1)
+    idle=$(ibd_occupancy "$LOG")
     echo "$(ts) hb='$hb' disk=$du ${idle:+$idle} bad=$bad" >> "$PROG"
     [ "${bad:-0}" != "0" ] && { ph "FAIL bad markers"; echo FAIL > RESULT; exit 1; }
-    ours=$($CLI getblockcount 2>/dev/null); theirs=$($ORACLE getblockcount 2>/dev/null)
-    [ -z "$ours" ] || [ -z "$theirs" ] && continue
-    [ "$ours" -ge $((theirs-1)) ] || continue
+    # NO RPC TO THE NODE UNTIL ITS IBD IS OVER (operator rule, 2026-09-19).
+    # Run 27's RPC side read 10.2 TB answering a monitor's polls. So the tip is
+    # read from the download's own heartbeat, and anyone else connected to the
+    # RPC port is named in phase.log. The harness itself has no connection open
+    # here, so any client is a stranger. Each one is reported once.
+    for c in $(ibd_rpc_clients "$RPC"); do
+        case " $SEEN_CLIENTS " in *" $c "*) ;; *) SEEN_CLIENTS="$SEEN_CLIENTS $c"
+            ph "WARN rpc client during IBD: $c ($(tr '\0' ' ' < /proc/${c%%:*}/cmdline 2>/dev/null | cut -c1-120)) -- the run is being perturbed";; esac
+    done
+    tw=$(ibd_rpc_recent_closes "$RPC")
+    if [ "${tw:-0}" -gt 0 ]; then
+        [ "$TW_SAID" = 0 ] && ph "WARN $tw connection(s) to the RPC port closed in the last minute during IBD -- something is polling the run"
+        TW_SAID=1
+    else TW_SAID=0; fi
+    prog=$(ibd_log_progress "$LOG")
+    if [ "$prog" != "$LAST_PROG" ]; then LAST_PROG=$prog; PROG_AT=$(date +%s); STALE_SAID=0
+    elif [ $(( $(date +%s) - PROG_AT )) -ge "$HB_STALE_S" ] && [ "$STALE_SAID" = 0 ]; then
+        ph "WARN the heartbeat has not moved in $(( ($(date +%s) - PROG_AT) / 60 )) min (last: '$prog')"; STALE_SAID=1
+    fi
+    printf '%s\n' "$prog" | ibd_log_tip_reached || continue
+    # The download's "real tip" is the best header it saw. The oracle confirms
+    # it is not stale. The oracle is not being timed, so asking it costs nothing.
+    set -- $prog; theirs=$($ORACLE getblockcount 2>/dev/null)
+    [ -n "$theirs" ] && [ "$3" -lt $((theirs - 6)) ] && { ph "WAIT the download finished at $3 but the oracle is at $theirs"; continue; }
+    END_TS=$(ibd_log_tip_time "$LOG")
+    END_EPOCH=$(date -u -d "$END_TS" +%s 2>/dev/null || echo 0)
+    ph "IBD_END $END_TS UTC (from the log) elapsed=$(( END_EPOCH - T0 ))s -- applied=$1 stored=$2/$3 oracle=$theirs"
 
-    ph "TIP reached: ours=$ours oracle=$theirs elapsed=$(( $(date +%s)-T0 ))s"
+    ph "TIP reached: applied=$1 tip=$3 oracle=$theirs elapsed=$(( $(date +%s)-T0 ))s (RPC to the node is allowed from here)"
 
     # ------------------------------------------------------------------
     # THE CAPSTONE. Three ways this has lied, all fixed here:

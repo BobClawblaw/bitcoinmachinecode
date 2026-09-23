@@ -124,8 +124,14 @@ idx_put:
     mov  rdi, r13
     call idx_hash            ; rax = start slot
     mov  r15, rax            ; current probe slot
-    mov  r8,  [r12+8]        ; probe budget
-    inc  r8
+    ; PROBE BUDGET LIVES ON THE STACK, NOT IN r8. memcmp_exact below writes
+    ; r8b on every byte it compares, and r8 is caller-saved, so a budget held
+    ; there is corrupted by the first collision. On a FULL table that turns
+    ; "dec, jz .full" into a loop that may never terminate.
+    sub  rsp, 16
+    mov  rax, [r12+8]
+    inc  rax
+    mov  [rsp], rax          ; probe budget
     lea  rbx, [r12+24]       ; array base
 .probe:
     ; slot = rbx + r15*48 ; empty if [slot] == -1
@@ -143,7 +149,9 @@ idx_put:
     test eax, eax
     jz   .dup                 ; equal -> duplicate
 .next:
-    dec  r8
+    mov  rax, [rsp]
+    dec  rax
+    mov  [rsp], rax
     jz   .full
     add  r15, 1
     and  r15, [r12+8]        ; wrap
@@ -168,6 +176,7 @@ idx_put:
     mov  [r12], rax          ; n++
     mov  eax, 1
 .done:
+    add  rsp, 16
     pop  r15
     pop  r14
     pop  r13
@@ -195,8 +204,14 @@ idx_get:
     mov  rdi, r13
     call idx_hash
     mov  rbx, rax            ; current probe slot
-    mov  r8,  [r12+8]        ; probe budget
-    inc  r8
+    ; Same reason as idx_put: memcmp_exact clobbers r8b. Here a corrupted
+    ; budget makes "dec, jz .notfound" fire EARLY, so a hash that IS in the
+    ; table reports as absent -- getblock answering "Block not found" for a
+    ; block the archive holds.
+    sub  rsp, 16
+    mov  rax, [r12+8]
+    inc  rax
+    mov  [rsp], rax          ; probe budget
     lea  r15, [r12+24]       ; array base
 .getprobe:
     mov  rax, rbx
@@ -220,7 +235,9 @@ idx_get:
     mov  eax, 1
     jmp  .done
 .getnext:
-    dec  r8
+    mov  rax, [rsp]
+    dec  rax
+    mov  [rsp], rax
     jz   .notfound           ; exhausted the table -> not present
     add  rbx, 1
     and  rbx, [r12+8]
@@ -228,6 +245,7 @@ idx_get:
 .notfound:
     xor  eax, eax
 .done:
+    add  rsp, 16
     pop  r15
     pop  r14
     pop  r13

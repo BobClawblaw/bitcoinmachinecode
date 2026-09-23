@@ -127,9 +127,27 @@ int main(int argc, char** argv) {
      * sent its inputs as a string. This node's CLI converts by shape rather
      * than by table: true/false/null, and any argument that starts with [
      * or { and parses as JSON. A label that happens to be the word "true"
-     * needs the -stdin route, as with bitcoin-cli's named-argument path. */
+     * needs the -stdin route, as with bitcoin-cli's named-argument path.
+     *
+     * 2026-09-15: converting BY SHAPE has one sharp edge, found by the RPC
+     * shape differential. A 64-character hash made only of DIGITS -- a block
+     * hash or txid with no letters in it -- looked numeric and was sent as a
+     * JSON number. `waitforblock 000...0 1` came back "Parse error" (-32700)
+     * and `waitforblock 111...1 1` came back "expected string parameter",
+     * while the same call with a mixed-case hash worked. The SERVER was right
+     * in every case: checked on the wire, it answers exactly as Core does. The
+     * CLI was mangling the request.
+     *
+     * The guard is narrow on purpose: NO Bitcoin RPC takes a 64-digit NUMBER,
+     * and many take a 64-character hash, so a token of that length is a hash
+     * whatever it is made of. A full per-method conversion table is Core's
+     * answer and would fix the whole class, but it is a second specification to
+     * keep in step with the dispatch tables by hand -- the reason this CLI
+     * converts by shape in the first place. */
+#define CLI_HASHLEN 64
 #define CLI_PUSH_ARG(s) do { const char* s_ = (s); int numeric = (*s_ == '-' || (*s_ >= '0' && *s_ <= '9')); \
         if (numeric) { for (const char* p = s_ + (s_[0] == '-'); *p; p++) if (*p < '0' || *p > '9') { numeric = 0; break; } } \
+        if (numeric && strlen(s_) == CLI_HASHLEN) numeric = 0;   /* a 64-digit token is a hash */ \
         rj_val* jv_ = NULL; \
         if (!numeric && (*s_ == '[' || *s_ == '{')) jv_ = rj_parse(s_, strlen(s_)); \
         if (numeric) rj_arr_push(params, (rj_val*)rj_numf("%s", s_)); \

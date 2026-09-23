@@ -31,6 +31,7 @@
 #include <stdint.h>
 #include "log_ts.h"
 #include "node_config.h"
+#include "mempool_seq.h"   /* the ZMQ sequence topic's C event (tx_accept_block_connect_h) */
 
 typedef unsigned char u8;
 typedef unsigned long u64;
@@ -936,6 +937,24 @@ long tx_accept_validate(void* mp_area, const u8 txid[32], const u8* tx, unsigned
     return 1;
 }
 
+/* tx_accept_serve_tx: bitcoin_serve.asm's `.do_tx` entry, in an inbound
+ * serve child. The child's own validation view is the boot-time snapshot
+ * (serve_txdv_preinit), blind to every coin newer than the process, so the
+ * transaction is handed to the download worker, which validates against the
+ * live set (daemon/tx_handoff.c has the whole story). Local validation is
+ * the fallback for a process with no handoff ring -- the test harnesses
+ * that drive node_serve_loop directly. dv_ok is the child's tx_dv_ok.
+ * Returns 1 queued or accepted, 0 dropped. */
+long tx_accept_serve_tx(void* mp_area, const u8 txid[32], const u8* tx, unsigned long txlen, long dv_ok){
+    extern int txho_push(const unsigned char*, unsigned long, int) __attribute__((weak));
+    if (txho_push){
+        int q = txho_push(tx, txlen, txann_my_slot());
+        if (q >= 0) return q;
+    }
+    if (!dv_ok) return 0;
+    return tx_accept_validate(mp_area, txid, tx, txlen) == 1;
+}
+
 /* The two -- and only two -- policy verdicts a package may overturn, in
  * Core's words. Exported so the relay drain and the submitpackage path
  * cannot drift apart on what "reconsiderable" means. */
@@ -1128,7 +1147,19 @@ long tx_accept_test_reason(void* mp_area, const u8 txid[32], const u8* tx,
 long tx_accept_block_connect_h(void* mp_area, const unsigned char* block,
                                unsigned long blen, long height){
     extern long mpool_policy_block_connect(void*, void*, const unsigned char*, unsigned long);
-    if (!g_pol_ready || !g_pol_state || !mp_area) return 0;
+    extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
+    /* The ZMQ sequence topic's 'C' is staged HERE, under the same hold of the
+     * pool lock as the removals the block caused, so it lands after the
+     * block's conflict 'R's and before any accept another process makes
+     * against the new tip -- Core's order (removeForBlock inside ConnectTip,
+     * BlockConnected after). Every path out of this function stages it: the
+     * block was connected whether or not a pool exists to reconcile. */
+    unsigned char bh[32];
+    if (blen >= 80) sha256d(bh, block, 80);
+    if (!g_pol_ready || !g_pol_state || !mp_area){
+        if (blen >= 80) mempool_seq_block(bh, 'C');
+        return 0;
+    }
     mp_lock();
     /* fee estimation: roll the block counters first; the policy's confirmed
      * hook then books each mined tx (txacc_note_confirmed), and the forget
@@ -1136,6 +1167,7 @@ long tx_accept_block_connect_h(void* mp_area, const unsigned char* block,
     fest_on_block_begin(height);
     long r = mpool_policy_block_connect(g_pol_state, mp_area, block, blen);
     fest_on_block_end();
+    if (blen >= 80) mempool_seq_block_locked(bh, 'C');
     mp_unlock();
     return r;
 }

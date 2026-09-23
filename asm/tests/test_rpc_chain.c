@@ -205,8 +205,46 @@ static void trc_hex_rev(char* out, const unsigned char* b, size_t n){
  * every later by-txid assertion exercise BOTH lookup paths: the coinbase
  * txids resolve through the base, the height-3 spends through the tail,
  * and the byte-identity check proves the two render identically. */
+typedef struct { unsigned char pre[8]; unsigned int h, off, len; } fx_rec_t;
+/* one sorted run file in the txid index's format (a base is the run that
+ * starts at 0); records sorted by prefix, one sparse sample */
+static void fx_write_sorted(const char* path, fx_rec_t* recs, int n, long from, long to){
+    for (int i = 1; i < n; i++){                  /* sort by prefix */
+        fx_rec_t k = recs[i]; int j = i - 1;
+        while (j >= 0 && memcmp(recs[j].pre, k.pre, 8) > 0){ recs[j+1] = recs[j]; j--; }
+        recs[j+1] = k;
+    }
+    FILE* f = fopen(path, "wb");
+    unsigned char hdr[48]; memset(hdr, 0, sizeof hdr);
+    fwrite(hdr, 1, 48, f);
+    for (int i = 0; i < n; i++){
+        unsigned char r[20];
+        memcpy(r, recs[i].pre, 8);
+        for (int b = 0; b < 4; b++) r[8+b]  = (unsigned char)(recs[i].h   >> (8*b));
+        for (int b = 0; b < 4; b++) r[12+b] = (unsigned char)(recs[i].off >> (8*b));
+        for (int b = 0; b < 4; b++) r[16+b] = (unsigned char)(recs[i].len >> (8*b));
+        fwrite(r, 1, 20, f);
+    }
+    unsigned long long sparse_off = 48 + (unsigned long long)n * 20;
+    unsigned char sp[16];                          /* one sample: record 0 */
+    memcpy(sp, n ? recs[0].pre : (unsigned char*)"\0\0\0\0\0\0\0\0", 8);
+    for (int b = 0; b < 8; b++) sp[8+b] = (unsigned char)(48ULL >> (8*b));
+    fwrite(sp, 1, 16, f);
+    memcpy(hdr, "BMCTXIDX", 8);
+    for (int b = 0; b < 8; b++) hdr[8+b]  = (unsigned char)((unsigned long long)n >> (8*b));
+    for (int b = 0; b < 8; b++) hdr[16+b] = (unsigned char)(sparse_off >> (8*b));
+    for (int b = 0; b < 8; b++) hdr[24+b] = (unsigned char)(1ULL >> (8*b));
+    for (int b = 0; b < 4; b++) hdr[32+b] = (unsigned char)((unsigned int)from >> (8*b));
+    for (int b = 0; b < 4; b++) hdr[36+b] = (unsigned char)((unsigned int)to >> (8*b));
+    fseek(f, 0, SEEK_SET); fwrite(hdr, 1, 48, f);
+    fclose(f);
+}
+/* 2026-09-16: heights (base_to, run_to] go into a RUN file
+ * (txindex.r<from>-<to>.dat, daemon/index_runs.h) so every by-txid assertion
+ * below exercises all THREE lookup paths: base, run, tail. -1 = no run. */
+static long g_fixture_run_to = -1;
 static void build_fixture_txindex(long base_to, long tip){
-    typedef struct { unsigned char pre[8]; unsigned int h, off, len; } rec_t;
+    typedef fx_rec_t rec_t;
     static rec_t recs[64]; int n = 0;
     for (long h = 0; h <= tip; h++){
         static unsigned char blk[4096];
@@ -244,11 +282,13 @@ static void build_fixture_txindex(long base_to, long tip){
             n++;
         }
     }
-    { /* heights above base_to: unsorted 20-byte records in the tail file */
+    { /* heights above base_to: the run file, then unsorted 20-byte records in the tail file */
+        static rec_t run[64]; int nrun = 0;
         FILE* tf = fopen("txindex.tail", "wb");
         int kept = 0;
         for (int i = 0; i < n; i++){
             if (recs[i].h <= (unsigned int)base_to){ recs[kept++] = recs[i]; continue; }
+            if (g_fixture_run_to >= 0 && recs[i].h <= (unsigned int)g_fixture_run_to){ run[nrun++] = recs[i]; continue; }
             unsigned char r[20];
             memcpy(r, recs[i].pre, 8);
             for (int b = 0; b < 4; b++) r[8+b]  = (unsigned char)(recs[i].h   >> (8*b));
@@ -258,36 +298,13 @@ static void build_fixture_txindex(long base_to, long tip){
         }
         fclose(tf);
         n = kept;
+        if (g_fixture_run_to >= 0){
+            char rn[300]; snprintf(rn, sizeof rn, "txindex.r%09ld-%09ld.dat", base_to + 1, g_fixture_run_to);
+            fx_write_sorted(rn, run, nrun, base_to + 1, g_fixture_run_to);
+            printf("      (fixture txindex run %s: %d records)\n", rn, nrun);
+        }
     }
-    for (int i = 1; i < n; i++){                  /* sort by prefix */
-        rec_t k = recs[i]; int j = i - 1;
-        while (j >= 0 && memcmp(recs[j].pre, k.pre, 8) > 0){ recs[j+1] = recs[j]; j--; }
-        recs[j+1] = k;
-    }
-    FILE* f = fopen("txindex.dat", "wb");
-    unsigned char hdr[48]; memset(hdr, 0, sizeof hdr);
-    fwrite(hdr, 1, 48, f);
-    for (int i = 0; i < n; i++){
-        unsigned char r[20];
-        memcpy(r, recs[i].pre, 8);
-        for (int b = 0; b < 4; b++) r[8+b]  = (unsigned char)(recs[i].h   >> (8*b));
-        for (int b = 0; b < 4; b++) r[12+b] = (unsigned char)(recs[i].off >> (8*b));
-        for (int b = 0; b < 4; b++) r[16+b] = (unsigned char)(recs[i].len >> (8*b));
-        fwrite(r, 1, 20, f);
-    }
-    unsigned long long sparse_off = 48 + (unsigned long long)n * 20;
-    unsigned char sp[16];                          /* one sample: record 0 */
-    memcpy(sp, recs[0].pre, 8);
-    for (int b = 0; b < 8; b++) sp[8+b] = (unsigned char)(48ULL >> (8*b));
-    fwrite(sp, 1, 16, f);
-    memcpy(hdr, "BMCTXIDX", 8);
-    for (int b = 0; b < 8; b++) hdr[8+b]  = (unsigned char)((unsigned long long)n >> (8*b));
-    for (int b = 0; b < 8; b++) hdr[16+b] = (unsigned char)(sparse_off >> (8*b));
-    for (int b = 0; b < 8; b++) hdr[24+b] = (unsigned char)(1ULL >> (8*b));
-    for (int b = 0; b < 4; b++) hdr[32+b] = 0;
-    for (int b = 0; b < 4; b++) hdr[36+b] = (unsigned char)((unsigned int)base_to >> (8*b));
-    fseek(f, 0, SEEK_SET); fwrite(hdr, 1, 48, f);
-    fclose(f);
+    fx_write_sorted("txindex.dat", recs, n, 0, base_to);
     printf("      (fixture txindex: %d base records + tail)\n", n);
 }
 
@@ -1316,6 +1333,174 @@ int main(void){
             ck("grt: unknown txid is still -5", r == NULL && ec == -5);
             rj_free(r); } }
 
+        /* ---- CHARACTERISATION: the selection paths nothing pinned ----------
+         * 2026-09-14. The CPFP and chunk-merge cases above are well covered.
+         * These are the ones that were not, and they are exactly the ones a
+         * unification onto mempool_cluster.c would move: the weight budget, the
+         * -blockmintxfee floor, and the rule that a chunk which does not fit
+         * skips the REST OF ITS CLUSTER rather than just itself.
+         *
+         * These tests describe what this node does TODAY. They are not a claim
+         * that it is right -- that is what the differential against Core is for.
+         * Their job is to make any change to selection show up as a diff here
+         * instead of as a quieter block. */
+        { extern void rpc_chain_set_gbt_policy(long,long,long,int,int);
+          long sel_full = 0;
+          r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+          { rj_val* t = G(r, "transactions");
+            sel_full = (t && t->typ == RJ_ARR) ? (long)t->nitems : -1; }
+          ck("baseline: the pool's transactions are selected", sel_full > 0);
+          rj_free(r);
+
+          /* A floor above every transaction in the pool. Core's BlockAssembler
+           * stops at the first package under -blockmintxfee; nothing here pays
+           * 1000 sat/vB, so the template must come back EMPTY rather than
+           * quietly ignoring the floor. */
+          rpc_chain_set_gbt_policy(4000000, 8000, 1000000 /* sat/kvB */, 0, 0);
+          r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+          { rj_val* t = G(r, "transactions");
+            ck("an unreachable -blockmintxfee selects NOTHING",
+               t && t->typ == RJ_ARR && t->nitems == 0); }
+          ck_str("...and coinbasevalue falls back to the bare subsidy",
+                 S(r,"coinbasevalue"), "5000000000");
+          rj_free(r);
+
+          /* A weight budget too small for the whole pool. What is pinned is the
+           * INVARIANT, not a transaction count: the template must fit inside the
+           * budget and must not be empty just because it is tight. An exact
+           * count here would pin the fixture rather than the rule. */
+          rpc_chain_set_gbt_policy(4000, 3500, 1, 0, 0);   /* budget_w = 500 */
+          r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+          { rj_val* t = G(r, "transactions");
+            long n_sel = (t && t->typ == RJ_ARR) ? (long)t->nitems : -1;
+            ck("a tight weight budget selects FEWER than the pool holds",
+               n_sel >= 0 && n_sel < sel_full);
+            long long wsum = 0; int all_have_w = 1;
+            for (long i = 0; t && i < t->nitems; i++){
+              const char* w = S(t->items[i], "weight");
+              if (!w) { all_have_w = 0; break; }
+              wsum += atoll(w);
+            }
+            ck("...every selected transaction reports a weight", all_have_w);
+            ck("...and the selection fits the budget (4000 - 3500)",
+               all_have_w && wsum <= 500);
+            /* the dependency rule must survive a truncated template: a child
+             * may never be selected without the parent it spends */
+            int dep_ok = 1;
+            for (long i = 0; t && i < t->nitems; i++){
+              rj_val* d = rj_obj_get(t->items[i], "depends");
+              for (long k = 0; d && k < d->nitems; k++){
+                long idx = atol(d->items[k]->str);      /* 1-based */
+                if (idx < 1 || idx > i) { dep_ok = 0; break; }   /* must precede */
+              }
+            }
+            ck("...and no selected child precedes the parent it depends on", dep_ok); }
+          rj_free(r);
+
+          /* restore, and prove the restriction was the cause rather than some
+           * state the earlier calls left behind */
+          rpc_chain_set_gbt_policy(4000000, 8000, 1, 0, 0);
+          r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+          { rj_val* t = G(r, "transactions");
+            ck("restoring the policy restores the full selection",
+               t && t->typ == RJ_ARR && (long)t->nitems == sel_full); }
+          rj_free(r);
+
+          /* ---- the cluster-skip rule, pinned with VARIED SIZES --------------
+           * A chunk that does not fit must skip the REST OF ITS CLUSTER, not
+           * just itself. Every transaction elsewhere in this file is 61 bytes,
+           * which makes the rule unobservable: chunk feerates are non-increasing
+           * within a cluster, so a later chunk is never cheaper-to-fit unless it
+           * is also SMALLER.
+           *
+           * So: PH is a heavy, high-feerate parent (20 outputs, 251 B) and CL is
+           * a light, low-feerate child of it (61 B). They linearize as two
+           * chunks, {PH} then {CL}, because CL pays less and cannot merge. With
+           * a budget of 500 weight units PH (1004 wu) does not fit, while CL
+           * (244 wu) would.
+           *
+           *   cluster-skip (correct): neither PH nor CL is selected.
+           *   chunk-skip (the bug):   CL is selected WITHOUT PH -- a block that
+           *                           spends an output it never creates.
+           *
+           * That is why this rule is worth a fixture of its own. */
+          { unsigned char prevPH[32], prevS2[32];
+            memset(prevPH, 0xE1, 32); memset(prevS2, 0xE2, 32);
+            utxo_put(ux, prevPH, 0, 100000ULL, 1, 0, (const unsigned char*)"\x51", 1);
+            utxo_put(ux, prevS2, 0, 100000ULL, 1, 0, (const unsigned char*)"\x51", 1);
+
+            /* 1 input, NOUT outputs: 51 + NOUT*10 bytes */
+            #define MKTXN(buf, id, prev, pidx, per, nout) do{ \
+                unsigned char* q = (buf); \
+                memcpy(q, "\x01\x00\x00\x00", 4); q += 4; \
+                *q++ = 1; memcpy(q, (prev), 32); q += 32; \
+                unsigned v_ = (pidx); memcpy(q, &v_, 4); q += 4; \
+                *q++ = 0; memcpy(q, "\xff\xff\xff\xff", 4); q += 4; \
+                *q++ = (unsigned char)(nout); \
+                for (int o_ = 0; o_ < (nout); o_++){ \
+                    unsigned long long a_ = (per); memcpy(q, &a_, 8); q += 8; \
+                    *q++ = 1; *q++ = 0x51; } \
+                memcpy(q, "\x00\x00\x00\x00", 4); q += 4; \
+                sha256d((id), (buf), (unsigned long)(q - (buf))); }while(0)
+
+            static unsigned char txPH[1200], txCL[80], txS2[80];
+            unsigned char idPH[32], idCL[32], idS2[32];
+            /* PH: 100000 in, 100 x 950 out = 95000 -> fee 5000 over 1051 B
+             * (4204 wu). Deliberately the HEAVIEST thing in the pool and a LOW
+             * feerate (4.76 sat/B), so it sorts late and leaves budget behind
+             * it -- which is what makes the next assertion decisive. */
+            MKTXN(txPH, idPH, prevPH, 0, 950ULL, 100);
+            /* CL: spends PH:0 (950) -> 800 out. Fee 150 over 61 B = 2.46 sat/B:
+             * above the relay floor so it is ACCEPTED, below PH's chunk so it
+             * cannot merge with it, and light enough to fit the budget that PH
+             * cannot. */
+            MKTXN(txCL, idCL, idPH,   0, 800ULL, 1);
+            /* S2: a standalone that DOES fit, so an empty template cannot be
+             * mistaken for the rule working */
+            MKTXN(txS2, idS2, prevS2, 0, 99000ULL, 1);
+
+            ck("skip: heavy parent PH accepted",
+               mpool_policy_add(pol, stbuf, mp, txPH, 1051, idPH, ux) == 1);
+            ck("skip: light child CL accepted",
+               mpool_policy_add(pol, stbuf, mp, txCL, 61, idCL, ux) == 1);
+            ck("skip: standalone S2 accepted",
+               mpool_policy_add(pol, stbuf, mp, txS2, 61, idS2, ux) == 1);
+
+            /* budget 2500 wu: room for every 61-byte chunk in the pool AND for
+             * CL (244 wu) -- but not for PH (4204 wu). */
+            rpc_chain_set_gbt_policy(4500, 2000, 1, 0, 0);
+            r = call("getblocktemplate", "[{\"rules\":[\"segwit\"]}]", &ec, &em);
+            { rj_val* t = G(r, "transactions");
+              char hPH[65], hCL[65], hS2[65];
+              trc_hex_rev(hPH, idPH, 32); trc_hex_rev(hCL, idCL, 32); trc_hex_rev(hS2, idS2, 32);
+              int hasPH = 0, hasCL = 0, hasS2 = 0;
+              for (long i = 0; t && i < t->nitems; i++){
+                const char* id = S(t->items[i], "txid");
+                if (!id) continue;
+                if (!strcmp(id, hPH)) hasPH = 1;
+                if (!strcmp(id, hCL)) hasCL = 1;
+                if (!strcmp(id, hS2)) hasS2 = 1; }
+              ck("skip: the heavy parent does not fit and is absent", !hasPH);
+              ck("skip: THE LIGHT CHILD IS ALSO ABSENT -- the whole cluster is skipped",
+                 !hasCL);
+              ck("skip: a standalone that fits is still selected -- the budget "
+                 "was not simply exhausted", hasS2); }
+            rj_free(r);
+            rpc_chain_set_gbt_policy(4000000, 8000, 1, 0, 0);
+            #undef MKTXN
+          }
+
+          /* The gap noted here on 2026-09-14 -- that the cluster-skip rule
+           * survived being reverted with every test passing -- is closed by the
+           * fixture above. It took a second fixture because every other
+           * transaction in this file is 61 bytes, and with uniform sizes
+           * cluster-skip and chunk-skip are indistinguishable: chunk feerates
+           * are non-increasing within a cluster, so a later chunk is never
+           * easier to fit unless it is also SMALLER. Verified by reverting
+           * cluster_skipped[] to skip only the chunk and watching the child
+           * appear without its parent. */
+        }
+
         /* restore the empty pool for the sections below */
         { rpc_mempool_hooks h0; memset(&h0, 0, sizeof h0);
           rpc_chain_set_mempool(&h0, NULL);
@@ -1482,7 +1667,30 @@ int main(void){
     ck_str("getdeploymentinfo hash is the tip", S(r,"hash"), g_hash[3]);
     ck_str("getdeploymentinfo height is the tip", S(r,"height"), "3");
     { rj_val* dep = r ? rj_obj_get(r,"deployments") : NULL;
-      ck("Core's five buried deployments, no more", dep && dep->nmembers == 5);
+      /* 2026-09-18: this asserted FIVE, "Core's five buried deployments, no
+       * more" -- which was the v31.99 development oracle's list, where taproot
+       * has been buried and dropped. v31.1 lists six on mainnet: the five
+       * buried ones and taproot as bip9. The count pinned the defect. */
+      ck("v31.1's six mainnet deployments: five buried + taproot, no more",
+         dep && dep->nmembers == 6);
+      ck("taproot is listed LAST, after the buried five (DeploymentInfo's order)",
+         dep && dep->nmembers == 6 && !strcmp(dep->members[5].key, "taproot"));
+      rj_val* tr = dep ? rj_obj_get(dep,"taproot") : NULL;
+      rj_val* tb = tr ? rj_obj_get(tr,"bip9") : NULL;
+      ck_str("taproot type is bip9", tr ? S(tr,"type") : NULL, "bip9");
+      ck("taproot at height 3 carries no activation height (not active, not next)",
+         tr && rj_obj_get(tr,"height") == NULL);
+      ck_str("taproot is not active at height 3", tr ? S(tr,"active") : NULL, "0");
+      ck_str("taproot start_time is v31.1's mainnet 1619222400", tb ? S(tb,"start_time") : NULL, "1619222400");
+      ck_str("taproot timeout is v31.1's mainnet 1628640000", tb ? S(tb,"timeout") : NULL, "1628640000");
+      ck_str("taproot min_activation_height 709632", tb ? S(tb,"min_activation_height") : NULL, "709632");
+      ck_str("taproot is DEFINED before its first period boundary", tb ? S(tb,"status") : NULL, "defined");
+      ck_str("...since 0 (DEFINED is the genesis state)", tb ? S(tb,"since") : NULL, "0");
+      ck_str("...and stays defined for the next block", tb ? S(tb,"status_next") : NULL, "defined");
+      ck("no bit/statistics/signalling outside STARTED and LOCKED_IN",
+         tb && !rj_obj_get(tb,"bit") && !rj_obj_get(tb,"statistics") && !rj_obj_get(tb,"signalling"));
+      ck("testdummy is NEVER_ACTIVE on mainnet, so it is not listed",
+         dep && rj_obj_get(dep,"testdummy") == NULL);
       rj_val* seg = dep ? rj_obj_get(dep,"segwit") : NULL;
       ck_str("segwit type is buried", seg ? S(seg,"type") : NULL, "buried");
       ck_str("segwit height is the generated SFC_HEIGHT_SEGWIT",
@@ -1493,16 +1701,70 @@ int main(void){
       ck_str("bip34 height is the generated SFC_HEIGHT_BIP34",
              b34 ? S(b34,"height") : NULL, "227931"); }
     { rj_val* sf = r ? rj_obj_get(r,"script_flags") : NULL;
-      /* at height 4 only the unconditional flags apply */
-      ck("script_flags at a pre-activation height is exactly P2SH + TAPROOT",
-         sf && sf->typ == RJ_ARR && sf->nitems == 2 &&
-         !strcmp(sf->items[0]->str, "P2SH") && !strcmp(sf->items[1]->str, "TAPROOT")); }
+      /* at height 3 only the unconditional flags apply -- and in Core that is
+       * THREE: P2SH, TAPROOT and WITNESS (GetBlockScriptFlags). This asserted
+       * two, pinning a defect that held WITNESS back until segwit's height;
+       * v31.1 on mainnet answers ["P2SH","TAPROOT","WITNESS"] for genesis. */
+      ck("script_flags at a pre-activation height is exactly P2SH + TAPROOT + WITNESS",
+         sf && sf->typ == RJ_ARR && sf->nitems == 3 &&
+         !strcmp(sf->items[0]->str, "P2SH") && !strcmp(sf->items[1]->str, "TAPROOT") &&
+         !strcmp(sf->items[2]->str, "WITNESS")); }
     rj_free(r);
     /* the blockhash argument selects a different block */
     { char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_hash[1]);
       r = call("getdeploymentinfo", pj, &ec, &em);
       ck_str("getdeploymentinfo(blockhash) reports that block", S(r,"height"), "1");
       rj_free(r); }
+    /* The other chains list taproot as ALWAYS_ACTIVE (v31.1 chainparams), and
+     * regtest lists testdummy before it. ALWAYS_ACTIVE has a fixed shape in
+     * Core: active since 0, height 0, start_time -1, NO_TIMEOUT. Run on this
+     * archive under each chain's name -- only the parameters matter here, and
+     * testdummy's first regtest boundary (144) is past the fixture's tip. */
+    { static const char* CH[3] = { "regtest", "testnet4", "signet" };
+      for (int c = 0; c < 3; c++){
+          rpc_chain_set_chainparams(CH[c], 210000, 0, 0, 0x1d00ffffu, 0);
+          r = call("getdeploymentinfo", "[]", &ec, &em);
+          rj_val* dep = r ? rj_obj_get(r,"deployments") : NULL;
+          rj_val* tr = dep ? rj_obj_get(dep,"taproot") : NULL;
+          rj_val* tb = tr ? rj_obj_get(tr,"bip9") : NULL;
+          char what[160];
+          snprintf(what, sizeof what, "%s: taproot is ALWAYS_ACTIVE -- bip9, height 0, active", CH[c]);
+          ck(what, tr && S(tr,"type") && !strcmp(S(tr,"type"),"bip9") && S(tr,"height") && !strcmp(S(tr,"height"),"0")
+                   && S(tr,"active") && !strcmp(S(tr,"active"),"1"));
+          snprintf(what, sizeof what, "%s: taproot start_time -1, timeout NO_TIMEOUT, min_activation_height 0", CH[c]);
+          ck(what, tb && S(tb,"start_time") && !strcmp(S(tb,"start_time"),"-1")
+                   && S(tb,"timeout") && !strcmp(S(tb,"timeout"),"9223372036854775807")
+                   && S(tb,"min_activation_height") && !strcmp(S(tb,"min_activation_height"),"0"));
+          snprintf(what, sizeof what, "%s: taproot status active since 0, status_next active, no statistics", CH[c]);
+          ck(what, tb && S(tb,"status") && !strcmp(S(tb,"status"),"active") && S(tb,"since") && !strcmp(S(tb,"since"),"0")
+                   && S(tb,"status_next") && !strcmp(S(tb,"status_next"),"active") && !rj_obj_get(tb,"statistics"));
+          if (c == 0){
+              rj_val* td = dep ? rj_obj_get(dep,"testdummy") : NULL;
+              rj_val* db = td ? rj_obj_get(td,"bip9") : NULL;
+              ck("regtest: seven deployments, testdummy then taproot LAST",
+                 dep && dep->nmembers == 7 && !strcmp(dep->members[5].key, "testdummy")
+                     && !strcmp(dep->members[6].key, "taproot"));
+              ck("regtest: testdummy is defined before its first 144-block boundary, not active",
+                 db && S(db,"status") && !strcmp(S(db,"status"),"defined") && S(db,"start_time") && !strcmp(S(db,"start_time"),"0")
+                    && td && S(td,"active") && !strcmp(S(td,"active"),"0") && !rj_obj_get(td,"height"));
+              /* script_flags describe the block ITSELF. Regtest buries segwit
+               * at 0 and the other four at 1, so block 0 has NULLDUMMY and
+               * none of DERSIG/CLTV/CSV -- the next block's flags would. */
+              char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_hash[0]);
+              rj_val* r0 = call("getdeploymentinfo", pj, &ec, &em);
+              rj_val* sf = r0 ? rj_obj_get(r0,"script_flags") : NULL;
+              ck("regtest block 0: script_flags are block 0's own -- NULLDUMMY, P2SH, TAPROOT, WITNESS",
+                 sf && sf->typ == RJ_ARR && sf->nitems == 4 && !strcmp(sf->items[0]->str, "NULLDUMMY")
+                    && !strcmp(sf->items[1]->str, "P2SH") && !strcmp(sf->items[2]->str, "TAPROOT")
+                    && !strcmp(sf->items[3]->str, "WITNESS"));
+              rj_free(r0);
+          } else {
+              snprintf(what, sizeof what, "%s: six deployments, no testdummy (NEVER_ACTIVE there)", CH[c]);
+              ck(what, dep && dep->nmembers == 6 && !rj_obj_get(dep,"testdummy"));
+          }
+          rj_free(r);
+      }
+      rpc_chain_set_chainparams("main", 210000, 0, 0, 0x1d00ffffu, 0); }
     expect_err("getdeploymentinfo on an unknown hash -> -5", "getdeploymentinfo",
                "[\"00000000000000000000000000000000000000000000000000000000deadbeef\"]",
                -5, "Block not found");
@@ -1512,9 +1774,15 @@ int main(void){
     ck("getchaintxstats -> object", r && r->typ == RJ_OBJ);
     ck_str("window_final_block_height", S(r,"window_final_block_height"), "3");
     /* the fixture is shorter than the 4320-block default, so the window
-     * clamps to the chain */
-    ck_str("window clamps to the chain length", S(r,"window_block_count"), "3");
-    ck_str("window_tx_count counts heights 1..3 = 1+1+3", S(r,"window_tx_count"), "5");
+     * clamps -- to height - 1, as Core's does:
+     *   blockcount = std::max(0, std::min(blockcount, pindex->nHeight - 1));
+     * These two asserted 3 and 5 (the whole chain) until 2026-09-19, which
+     * pinned the old clamp to `height` rather than Core's `height - 1`. */
+    ck_str("window clamps to height - 1, as Core's does", S(r,"window_block_count"), "2");
+    ck_str("window_tx_count counts heights 2..3 = 1+3", S(r,"window_tx_count"), "4");
+    /* window_interval is the MEDIAN-TIME-PAST difference, not the header
+     * times': MTP(3) = t0+1200 (median of 4), MTP(1) = t0+600 (median of 2) */
+    ck_str("window_interval is MTP(final) - MTP(final - window)", S(r,"window_interval"), "600");
     ck_str("txcount is the CUMULATIVE count including genesis", S(r,"txcount"), "6");
     ck("txrate present when the window has a positive interval",
        rj_obj_get(r,"txrate") != NULL);
@@ -1530,6 +1798,20 @@ int main(void){
       rj_free(r); }
     expect_err("a window past the chain -> -8", "getchaintxstats", "[9999]", -8,
                "Invalid block count: should be between 0 and the block's height - 1");
+    /* Core: blockcount > 0 && blockcount >= height is refused -- a window
+     * equal to the height would need the block below genesis */
+    expect_err("a window equal to the height -> -8", "getchaintxstats", "[3]", -8,
+               "Invalid block count: should be between 0 and the block's height - 1");
+    { char p[160]; snprintf(p, sizeof p, "[1, \"%s\"]", g_hash[2]);
+      r = call("getchaintxstats", p, &ec, &em);
+      ck_str("a historical blockhash ends the window there", S(r,"window_final_block_height"), "2");
+      ck_str("...with the cumulative count through it (1+1+1)", S(r,"txcount"), "3");
+      rj_free(r); }
+    expect_err("an unknown blockhash -> -5", "getchaintxstats",
+               "[1, \"00000000000000000000000000000000000000000000000000000000deadbeef\"]",
+               -5, "Block not found");
+    expect_err("a malformed blockhash names the parameter, as ParseHashV does", "getchaintxstats",
+               "[1, \"abc\"]", -8, "blockhash must be of length 64 (not 3, for 'abc')");
 
     /* ---- verifychain ----
      * The fixture's synthetic headers carry bits 0x1d00ffff with nonce 0, so
@@ -1711,7 +1993,9 @@ int main(void){
          r2 == NULL && e2 == -5 && m2 && !strstr(m2, "with no txindex") && strstr(m2, "index"));
       rj_free(r2); }
 
-    build_fixture_txindex(2, 3);   /* base covers 0..2; height 3 lives in the TAIL */
+    g_fixture_run_to = 2;            /* height 2: through the RUN file */
+
+    build_fixture_txindex(1, 3);   /* base covers 0..2; height 3 lives in the TAIL */
     /* no reopen needed: txi_open latches on success, so the index is picked
      * up on the next lookup -- which is also what an operator building the
      * index against a running node needs. */
@@ -1744,6 +2028,45 @@ int main(void){
       }
       ck("every fixture tx resolves by txid alone", all);
       ck("...and byte-identically to the blockhash path (one render path)", same); }
+
+    { /* 2026-09-19 (run-28 bench fidelity, defect B): an index CONFIGURED OFF
+       * is Core without the option, whatever files the datadir holds. The
+       * reader used to decide from the files alone, so a node with txindex=0
+       * still answered by txid -- and listed the index -- from a previous
+       * configuration's (or an unconditional tail's) leftovers.
+       * Watched to FAIL with the gate removed: the by-txid lookup succeeds,
+       * getindexinfo lists txindex, getblockfilter serves a filter. */
+      rpc_chain_set_index_config(0, 0, 0, 0, 0);
+      char pj[96]; snprintf(pj, sizeof pj, "[\"%s\"]", g_tx1_txid);
+      long e2 = 0; const char* m2 = NULL; rj_val* r2 = call("getrawtransaction", pj, &e2, &m2);
+      ck("txindex=0 with the index files present: getrawtransaction by txid answers Core's -5",
+         r2 == NULL && e2 == -5 && m2 && !strcmp(m2, "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions."));
+      rj_free(r2);
+      { char pj2[200]; snprintf(pj2, sizeof pj2, "[\"%s\",0,\"%s\"]", g_tx1_txid, g_hash[3]);
+        r2 = call("getrawtransaction", pj2, &e2, &m2);
+        ck("...while the blockhash form still works (it needs no index)", r2 && r2->str && r2->str[0]); rj_free(r2); }
+      { char pj3[160]; snprintf(pj3, sizeof pj3, "[[\"%s\"]]", g_tx1_txid);
+        r2 = call("gettxoutproof", pj3, &e2, &m2);
+        ck("...gettxoutproof by txid alone: Core's \"Transaction not yet in block\"",
+           r2 == NULL && e2 == -5 && m2 && !strcmp(m2, "Transaction not yet in block")); rj_free(r2); }
+      r2 = call("getindexinfo", "[]", &e2, &m2);
+      ck("...getindexinfo lists no txindex", r2 && r2->typ == RJ_OBJ && rj_obj_get(r2, "txindex") == NULL); rj_free(r2);
+      { char pj4[200]; snprintf(pj4, sizeof pj4, "[\"%s\"]", g_hash[1]);
+        r2 = call("getblockfilter", pj4, &e2, &m2);
+        ck("blockfilterindex=0: getblockfilter answers Core's -1 \"Index is not enabled for filtertype basic\"",
+           r2 == NULL && e2 == -1 && m2 && !strcmp(m2, "Index is not enabled for filtertype basic")); rj_free(r2);
+        snprintf(pj4, sizeof pj4, "[\"%s\",\"extended\"]", g_hash[1]);
+        r2 = call("getblockfilter", pj4, &e2, &m2);
+        ck("...an unknown filter type is still -5 first, as in Core", r2 == NULL && e2 == -5 && m2 && !strcmp(m2, "Unknown filtertype")); rj_free(r2);
+        r2 = call("getblockfilter", "[\"zz\"]", &e2, &m2);
+        ck("...and a malformed hash is still -8 before either", r2 == NULL && e2 == -8); rj_free(r2); }
+      r2 = call("scanblocks", "[\"start\",[\"raw(51)\"]]", &e2, &m2);
+      ck("blockfilterindex=0: scanblocks start refuses as Core does", r2 == NULL && e2 == -1 && m2 && !strcmp(m2, "Index is not enabled for filtertype basic")); rj_free(r2);
+      rpc_chain_set_index_config(1, 1, 1, 1, 1);
+      r2 = call("getrawtransaction", pj, &e2, &m2);
+      ck("txindex=1 again: the same lookup resolves", r2 && r2->str && r2->str[0]); rj_free(r2);
+      r2 = call("getindexinfo", "[]", &e2, &m2);
+      ck("...and getindexinfo lists txindex", r2 && r2->typ == RJ_OBJ && rj_obj_get(r2, "txindex") != NULL); rj_free(r2); }
 
     { /* gettxoutproof by txid alone, via the txid index -- the audit fix.
        * Must resolve to the SAME proof bytes the explicit-blockhash path
@@ -1914,6 +2237,163 @@ int main(void){
     r = call("uptime", "[]", &ec, &em); ck("uptime is a non-negative number", r && r->typ == RJ_NUM && atol(r->str) >= 0); rj_free(r);
     r = call("stop", "[]", &ec, &em); ck_str("stop reply", r ? r->str : NULL, "Bitcoin Machine Code stopping"); rj_free(r);
     ck("stop invoked the handler", g_stopped == 1);
+
+
+    /* ---- Core's "Wrong type passed" wrapper on the chain methods ----------
+     * getblockheader's verbose and gettxoutsetinfo's hash_type had the right
+     * CODE (-3) and a hand-written message that hardcoded the passed type as
+     * "number", so any other type was misreported. Measured against Core v31.1
+     * on 2026-09-15 for every JSON type.
+     *
+     * These two cannot be reached through the plain rpc_dispatch harness: the
+     * chain dispatcher answers -28 "Loading block index..." until a chain is
+     * open, which is Core's own warm-up behaviour. They are asserted HERE
+     * because this suite opens a real chain fixture. */
+    {
+        const char* TYPED[] = { "null", "5", "\"x\"", "true", "[]", "{}" };
+        const char* TNAME[] = { "null", "number", "string", "bool", "array", "object" };
+        char want[256], lbl[200], pb[256];
+        const char* GEN = "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f";
+
+        for (int t = 0; t < 6; t++){
+            if (!strcmp(TNAME[t], "bool") || !strcmp(TNAME[t], "null")) continue;
+            snprintf(pb, sizeof pb, "[\"%s\",%s]", GEN, TYPED[t]);
+            r = call("getblockheader", pb, &ec, &em);
+            snprintf(want, sizeof want,
+                "Wrong type passed:\n{\n    \"Position 2 (verbose)\": \"JSON value of type %s "
+                "is not of expected type bool\"\n}", TNAME[t]);
+            snprintf(lbl, sizeof lbl, "getblockheader verbose=%s -> Position 2 (verbose)", TNAME[t]);
+            ck(lbl, r == NULL && ec == -3 && em && !strcmp(em, want));
+            rj_free(r);
+        }
+        /* THE ORDER. Core type-checks every argument before running the body,
+         * and the lowest failing position wins:
+         *   getblockheader 5 5            -> Position 1 (blockhash)
+         *   getblockheader <unknown> 5    -> Position 2 (verbose), NOT the hash
+         * The second is the one this node got wrong: it resolved the blockhash
+         * first, so a bad hash masked a bad verbose. A correct message at a
+         * point the caller cannot reach is not a fix. */
+        /* BOTH failing positions are reported, in one object, in position order.
+         * This read "the LOWER position wins" and checked only that Position 1
+         * appeared -- true of a message naming Position 1 alone, so it passed
+         * against code that dropped Position 2. The claim came from reading
+         * truncated probe output; corrected against the FULL message. */
+        r = call("getblockheader", "[5,5]", &ec, &em);
+        ck("getblockheader with BOTH types bad -> BOTH positions, in one object",
+           r == NULL && ec == -3 && em && !strcmp(em,
+             "Wrong type passed:\n{\n"
+             "    \"Position 1 (blockhash)\": \"JSON value of type number is not of expected type string\",\n"
+             "    \"Position 2 (verbose)\": \"JSON value of type number is not of expected type bool\"\n}"));
+        rj_free(r);
+        r = call("getblockheader",
+                 "[\"0000000000000000000000000000000000000000000000000000000000000001\",5]", &ec, &em);
+        ck("getblockheader unknown hash + bad verbose TYPE -> Position 2, not -5 Block not found",
+           r == NULL && ec == -3 && em && strstr(em, "\"Position 2 (verbose)\""));
+        rj_free(r);
+        r = call("getblockheader",
+                 "[\"0000000000000000000000000000000000000000000000000000000000000001\"]", &ec, &em);
+        ck("...and on its own an unknown hash is still Block not found",
+           r == NULL && ec == -5);
+        rj_free(r);
+
+        for (int t = 0; t < 6; t++){
+            if (!strcmp(TNAME[t], "string") || !strcmp(TNAME[t], "null")) continue;
+            snprintf(pb, sizeof pb, "[%s]", TYPED[t]);
+            r = call("gettxoutsetinfo", pb, &ec, &em);
+            snprintf(want, sizeof want,
+                "Wrong type passed:\n{\n    \"Position 1 (hash_type)\": \"JSON value of type %s "
+                "is not of expected type string\"\n}", TNAME[t]);
+            snprintf(lbl, sizeof lbl, "gettxoutsetinfo hash_type=%s -> Position 1 (hash_type)", TNAME[t]);
+            ck(lbl, r == NULL && ec == -3 && em && !strcmp(em, want));
+            rj_free(r);
+        }
+        /* use_index sits at position 3 and had no type check at all: a bad
+         * hash_type VALUE at position 1 was reported instead of it */
+        r = call("gettxoutsetinfo", "[\"bogus\",null,\"x\"]", &ec, &em);
+        ck("gettxoutsetinfo invalid hash_type VALUE + bad use_index TYPE -> Position 3",
+           r == NULL && ec == -3 && em && strstr(em, "\"Position 3 (use_index)\""));
+        rj_free(r);
+        r = call("gettxoutsetinfo", "[\"bogus\"]", &ec, &em);
+        ck("...and on its own an invalid hash_type is still the -8 value error",
+           r == NULL && ec == -8 && em && strstr(em, "is not a valid hash_type"));
+        rj_free(r);
+        r = call("gettxoutsetinfo", "[5,null,\"q\"]", &ec, &em);
+        ck("gettxoutsetinfo with positions 1 AND 3 bad -> both, in one object",
+           r == NULL && ec == -3 && em && !strcmp(em,
+             "Wrong type passed:\n{\n"
+             "    \"Position 1 (hash_type)\": \"JSON value of type number is not of expected type string\",\n"
+             "    \"Position 3 (use_index)\": \"JSON value of type string is not of expected type bool\"\n}"));
+        rj_free(r);
+    }
+
+    /* ---- getaddresstxids: the height window (2026-09-17) ----------------
+     * This RPC had NO test at all, which is how three separate quadratic
+     * dedups and a silent 2 GB journal truncation all lived in it at once.
+     *
+     * The fixture is a journal (addrindex.tail), whose records carry their own
+     * txid -- enough to pin the window without needing history runs, and it
+     * exercises the same [start,end] filter the run path uses. Records are
+     * 82 bytes: op | type | hash[32] | txid[32] | vout[4] | value[8] | height[4]. */
+    { const char* ADDR = "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4";   /* h160 751e76e8... */
+      unsigned char h160[20]; hx(h160, "751e76e8199196d454941c45d1b3a323f1433bd6");
+      unsigned heights[3] = { 10, 20, 30 };
+      char want[3][65];
+      FILE* jf = fopen("addrindex.tail", "wb");
+      ck("address journal fixture created", jf != NULL);
+      for (int i = 0; i < 3 && jf; i++){
+          unsigned char r[82]; memset(r, 0, sizeof r);
+          r[0] = 1;                                  /* AXF_OP_ADD   */
+          r[1] = 2;                                  /* AXF_P2WPKH   */
+          memcpy(r + 2, h160, 20);                   /* key (zero-padded to 32) */
+          memset(r + 34, 0, 32); r[34] = (unsigned char)(0xA0 + i);   /* a distinct txid */
+          unsigned long long v = 1000ULL * (i + 1);
+          unsigned vout = 0;
+          memcpy(r + 66, &vout, 4); memcpy(r + 70, &v, 8); memcpy(r + 78, &heights[i], 4);
+          fwrite(r, 1, sizeof r, jf);
+          tohex_rev(want[i], r + 34, 32);            /* display order, as the RPC returns it */
+      }
+      if (jf) fclose(jf);
+
+      long ec; const char* em;
+      rj_val* r = call("getaddresstxids", "[\"bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4\"]", &ec, &em);
+      ck("no window: every txid (unchanged behaviour)", r && r->typ == RJ_ARR && r->nitems == 3);
+      if (r) rj_free(r);
+
+      char pj[256];
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"start\":20}]", ADDR);
+      r = call("getaddresstxids", pj, &ec, &em);
+      ck("start=20: drops the height-10 txid", r && r->typ == RJ_ARR && r->nitems == 2);
+      if (r) rj_free(r);
+
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"start\":20,\"end\":20}]", ADDR);
+      r = call("getaddresstxids", pj, &ec, &em);
+      ck("start=end=20: exactly that height's txid, and the right one",
+         r && r->typ == RJ_ARR && r->nitems == 1 && !strcmp(r->items[0]->str, want[1]));
+      if (r) rj_free(r);
+
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"end\":10}]", ADDR);
+      r = call("getaddresstxids", pj, &ec, &em);
+      ck("end=10 alone: only the first", r && r->typ == RJ_ARR && r->nitems == 1 && !strcmp(r->items[0]->str, want[0]));
+      if (r) rj_free(r);
+
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"start\":100,\"end\":200}]", ADDR);
+      r = call("getaddresstxids", pj, &ec, &em);
+      ck("a window past every event: empty, not an error", r && r->typ == RJ_ARR && r->nitems == 0);
+      if (r) rj_free(r);
+
+      /* the same address twice: one hash set spans the call, so no duplicates */
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\",\"%s\"]}]", ADDR, ADDR);
+      r = call("getaddresstxids", pj, &ec, &em);
+      ck("an address listed twice does not duplicate its txids", r && r->typ == RJ_ARR && r->nitems == 3);
+      if (r) rj_free(r);
+
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"start\":30,\"end\":20}]", ADDR);
+      expect_err("end below start is rejected", "getaddresstxids", pj, -8, "end must not be below start");
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"start\":\"x\"}]", ADDR);
+      expect_err("a non-numeric start is rejected", "getaddresstxids", pj, -3, "start must be a block height");
+      snprintf(pj, sizeof pj, "[{\"addresses\":[\"%s\"],\"start\":-1}]", ADDR);
+      expect_err("a negative start is rejected", "getaddresstxids", pj, -8, "start must not be negative");
+      unlink("addrindex.tail"); }
 
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;

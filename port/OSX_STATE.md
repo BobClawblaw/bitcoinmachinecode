@@ -4,6 +4,45 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-23 — main merged (245 commits, #190–#292); five Darwin guards; serve/store/net re-ports; stop-wait e2e 35/35 on Darwin
+
+- Merge of #190–#292: index runs + trailing builders, the departure
+  journal, tx handoff to the download worker, zmq `sequence`, cluster
+  mempool completion, stop-waits-for-worker, RPC parity rounds, three new
+  harness suites. Conflicts: node_config.c (main's lazy `IV` parse
+  supersedes the branch's deferred note/report — same DMN-9 bug, main's
+  fix is the keeper) and the 09-12/09-14 worklogs (both streams, as
+  before).
+- New daemon sources in build_daemon.sh: index_runs, index_trail,
+  mempool_journal, tx_handoff, mempool_cluster (merge_index_runs is the
+  standalone bmc_merge_index_runs TOOL — own main — not a daemon object).
+- Darwin guards: SYS_close_range (notify.c; loop is the path), eventfd →
+  pipe pair (zmq_pub.c), posix_fadvise → F_RDADVISE (rpc_chain.c),
+  robust-mutex refuse (tx_handoff.c; MEM-20 road, degrade documented),
+  and main.c's stop-wait lock-holder scan rebuilt on libproc (KERN_PROC +
+  PROC_PIDLISTFDS + PROC_PIDFDVNODEPATHINFO by dev+ino; proc_pidpath for
+  comm; PROC_PIDTBSDINFO for is_my_child — the /proc version silently
+  orphaned every serve child's SIGTERM at stop; _NSGetExecutablePath for
+  /proc/self/exe; proc_exit_pending 0 with our own worker still tracked
+  via waitpid + kill(0)).
+- Re-ports of changed x86 asm: bitcoin_net's g_p2p_read_hook wrapper
+  (net_twin.c, v1+v2, announced plen), bitcoin_serve's
+  tx_accept_serve_tx + internal-order inv tip (bitcoin_serve.S),
+  bitcoin_store's pos_file_no (+44) invariant + drop-fd/frontier/retake
+  (store_twin.c). bitcoin_idx's probe-budget fix was born correct in the
+  twin (6fed3a71).
+- store_get_at meta[2] high-half garbage caught by main's new
+  test_append_unshared_frontier (4 file-no assertions at 2^32+k); masked.
+- Gates native green: stop-wait e2e 35/35 (real daemon, 4 cycles — the
+  libproc scan names/clears holders, never counts the stopping parent),
+  tx_handoff 13/13 (section 6 robust-recovery SKIPped on Darwin — no
+  robust mutexes; skipped, not weakened), node_config, frontier, store,
+  p2p_msgsize, net, zmq_queue. bmcbitcoind + bmc_wallet_cli LINK OK,
+  zero undefined.
+- Known degrade recorded: tx_handoff's ring mutex is not robust on
+  macOS; a crash mid-hold (two memcpys) stalls the survivor's next
+  push. Darwin death-safe lock = follow-up decision.
+
 ## 2026-09-12 — main merged (131 commits); daemon relinked green; deploy home is ~/bmc_osx_deploy; mainnet IBD resumed after a 21.5h stall
 
 - Merge cce2f5d7 (#175–#189). Two add/add worklog conflicts resolved by

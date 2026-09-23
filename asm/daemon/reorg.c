@@ -54,6 +54,7 @@
 #include "reorg.h"
 #include "../bitcoin_pow_rules.h"
 #include "../mempool_slot.h"   /* the structural mempool's slot layout */
+#include "mempool_seq.h"    /* the ZMQ sequence topic: D per disconnected block, the reconcile's net A/R */
 #include "utxo_walk.h"
 #include "hdr_tree.h"      /* 2026-09-09: the fork tree -- branches off the best chain, retained like Core's block index */
 
@@ -137,6 +138,7 @@ extern long mpool_policy_add(void* pol, void* st, void* mp,
                              const unsigned char* tx, unsigned long txlen,
                              const unsigned char txid[32], void* utxo);
 extern void mpool_policy_state_init(void* st, unsigned n);
+extern const unsigned char* mpool_get(const void* mp, const unsigned char txid[32], unsigned long* out_len);
 
 /* ---------------- tunables ---------------------------------------------- */
 /* Distinct getheaders pages we will pull while trying to establish whether a
@@ -229,6 +231,41 @@ void reorg_set_mempool(const reorg_mempool_t* m){
 #define REORG_DISC_MAX_BLOCKS 256
 static unsigned char* g_disc_buf = 0;
 
+/* The txids the REPLACEMENT blocks confirm, gathered as each one is
+ * reconnected. The reconcile needs them to tell the two reasons a pool
+ * transaction can fail to come back apart: the new branch MINED it (Core:
+ * removeForBlock, BLOCK -- numbered, not published on the ZMQ sequence topic)
+ * or it is simply no longer valid (conflict / reorg -- published as 'R').
+ * Grown on demand and kept, like g_disc_buf. */
+static unsigned char (*g_conf_ids)[32] = 0;
+static long g_conf_n = 0, g_conf_cap = 0;
+static void conf_collect(const unsigned char* blk, uint64_t len){
+    if (len < 81) return;
+    const unsigned char* p = blk + 80;
+    const unsigned char* end = blk + len;
+    u64 consumed;
+    u64 ntx = utxo_walk_read_varint(p, end, &consumed);
+    if (!consumed) return;
+    p += consumed;
+    static unsigned char scratch[4<<20];
+    for (u64 t = 0; t < ntx; t++){
+        unsigned char info[64];
+        if (!tx_parse(info, p, (unsigned long)(end - p))) return;
+        u64 txlen; memcpy(&txlen, info, 8);
+        if (t > 0){                                    /* a coinbase is never in a pool */
+            if (g_conf_n == g_conf_cap){
+                long want = g_conf_cap ? g_conf_cap * 2 : 4096;
+                unsigned char (*nb)[32] = realloc(g_conf_ids, (size_t)want * 32);
+                if (!nb) return;   /* then those read as 'R': over-reports a departure, never hides one */
+                g_conf_ids = nb; g_conf_cap = want;
+            }
+            if (tx_txid(g_conf_ids[g_conf_n], p, (unsigned long)txlen, scratch, sizeof scratch) == 1)
+                g_conf_n++;
+        }
+        p += txlen;
+    }
+}
+
 /* STO-7 (second half): the fork height of the most recently COMPLETED reorg,
  * -1 if none. daemon/main.c's new-block choke point processes only heights
  * last_seen_tip+1..now_tip, so after a reorg the replacement blocks at or
@@ -255,13 +292,14 @@ static int g_cw_open = 0;
 /* ---------------- small helpers ----------------------------------------- */
 
 /* Block hashes are printed the way explorers/RPC show them: byte-reversed,
- * first 8 display bytes. Identical convention (and identical helper shape) to
- * daemon/main.c's log_hash_short so reorg lines can be grep-correlated
- * against [block] stored lines. */
-static void hash_short(char out[17], const unsigned char h[32]){
+ * WHOLE. Identical convention (and identical helper shape) to daemon/main.c's
+ * log_hash_short so reorg lines can be grep-correlated against [block] lines
+ * -- widened with it 2026-09-16, because eight display bytes of a mainnet hash
+ * are all zeros and both helpers were emitting the same useless constant. */
+static void hash_short(char out[65], const unsigned char h[32]){
     static const char hexd[]="0123456789abcdef";
-    for(int k=0;k<8;k++){ unsigned char b=h[31-k]; out[k*2]=hexd[b>>4]; out[k*2+1]=hexd[b&0xf]; }
-    out[16]=0;
+    for(int k=0;k<32;k++){ unsigned char b=h[31-k]; out[k*2]=hexd[b>>4]; out[k*2+1]=hexd[b&0xf]; }
+    out[64]=0;
 }
 /* 128-bit cumulative work, printed as fixed-width hex (high limb then low).
  * Hex rather than decimal because there is no portable 128-bit printf. */
@@ -904,7 +942,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
             return -1;
         }
         unsigned char bh[32]; block_hash(bh, blkbuf);
-        char hs[17]; hash_short(hs, bh);
+        char hs[65]; hash_short(hs, bh);
         fprintf(stderr, "[reorg] disconnecting height %ld hash=%s..\n", h, hs);
         if (g_reorg_mp_set && !disc_overflow){
             if (ndisc >= REORG_DISC_MAX_BLOCKS ||
@@ -971,6 +1009,11 @@ long reorg_execute(void* st, long fork_height, long nblocks,
             hdr_fd_close();
             return -1;
         }
+        /* ZMQ `sequence`: Core's BlockDisconnected, one 'D' per block, tip
+         * first -- for CONNECTED heights only, which are the ones that were
+         * announced with a 'C' (the never-connected heights above conn_top
+         * were stored, not connected, and are dropped without one). */
+        mempool_seq_block(bh, 'D');
     }
     hdr_fd_close();   /* the blk files may be about to be truncated/unlinked */
 
@@ -1029,6 +1072,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
 
     /* ---------------- RECONNECT ---------------- */
     long connected = 0;
+    g_conf_n = 0;                      /* this reorg's confirmed set starts empty */
     for (long i = 0; i < nblocks; i++){
         long len = src(srcctx, i, blkbuf, sizeof blkbuf);
         if (len < 81){
@@ -1077,9 +1121,12 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         if (!utxo_live_rewind_to(h)){
             fprintf(stderr, "[reorg] WARNING: could not persist applied height %ld\n", h);
         }
-        char hs[17]; hash_short(hs, bh);
+        char hs[65]; hash_short(hs, bh);
         fprintf(stderr, "[reorg] reconnecting height %ld hash=%s..\n", h, hs);
         connected++;
+        /* the txids this replacement block confirms, for the reconcile's
+         * mined-vs-removed call (reorg_mempool_reconcile_ex) */
+        if (g_reorg_mp_set) conf_collect(blkbuf, (uint64_t)len);
     }
 
     if (g_index_rebuild) g_index_rebuild();
@@ -1116,7 +1163,8 @@ long reorg_execute(void* st, long fork_height, long nblocks,
             dptr[i] = g_disc_buf + disc_off[n - 1 - i];
             dlen[i] = disc_len[n - 1 - i];
         }
-        long after = reorg_mempool_reconcile(&g_reorg_mp, n ? dptr : NULL, n ? dlen : NULL, n);
+        long after = reorg_mempool_reconcile_ex(&g_reorg_mp, n ? dptr : NULL, n ? dlen : NULL, n,
+                                                (const unsigned char (*)[32])g_conf_ids, g_conf_n);
         if (after < 0){
             /* Not fatal: the chain is already correct and durable. A failed
              * rebuild leaves the pool possibly holding now-invalid entries,
@@ -1134,7 +1182,7 @@ long reorg_execute(void* st, long fork_height, long nblocks,
 
     g_last_fork_height = fork_height;
 
-    unsigned char tiph[32]; char hs[17] = "(none)";
+    unsigned char tiph[32]; char hs[65] = "(none)";
     if (store_get_tip_hash(st, tiph) == 1) hash_short(hs, tiph);
     fprintf(stderr, "[reorg] complete: new tip height=%ld hash=%s.. (%.2fs, -%ld +%ld blocks)\n",
             store_tip(st), hs, now_s()-t0, tip - fork_height, connected);
@@ -1178,6 +1226,27 @@ long reorg_execute(void* st, long fork_height, long nblocks,
  * for an unresolvable input. Rather than topologically sorting, the offer
  * pass simply repeats while it keeps making progress (a child accepted on
  * pass 2 after its parent landed on pass 1), bounded by the candidate count.
+ *
+ * THE ZMQ `sequence` TOPIC (2026-09-19) is why this section had to change,
+ * and why it changed the way it did. The rebuild was the one mempool
+ * mutation with no removal events at all -- raw mpool_del -- which is what
+ * kept -zmqpubsequence refused. Two ways to close it:
+ *   (a) make the reconcile SURGICAL, as Core's is (re-add the disconnected
+ *       blocks' transactions, then remove only what the new tip invalidates)
+ *       and let the policy hook publish as it goes; or
+ *   (b) keep the rebuild, hold the hook while it runs, and publish the NET
+ *       difference between the pool before and after.
+ * (b) is what is here. The two produce the same events -- a subscriber can
+ * only observe membership, and the net difference IS the membership change
+ * -- while (a) would replace a validated, audited reconcile (MEM-8, STO-7)
+ * with new policy code on a path that runs a few times a year, which is the
+ * trade this section's first paragraph already declined. What (b) cannot
+ * reproduce exactly is the INTERLEAVING of a multi-block reorg: Core
+ * publishes D, then per connected block its conflict R's, then the re-adds,
+ * then C; here the D's come from the disconnect loop, the R's and A's from
+ * this one reconcile, and the C's from the daemon's block-connect choke point
+ * afterwards. A pure one-block disconnect (invalidateblock) is identical.
+ * docs/CORE_DIVERGENCES.md records the rest.
  * ======================================================================== */
 
 typedef struct { unsigned char txid[32]; const unsigned char* tx; unsigned long len; } rtx_t;
@@ -1243,9 +1312,18 @@ static long collect_block_txs(const unsigned char* blk, uint64_t len,
 #define REORG_MEMPOOL_MAX_TX   8192
 #define REORG_MEMPOOL_ARENA    (16u<<20)
 
+static int cmp_txid32(const void* a, const void* b){ return memcmp(a, b, 32); }
+
 long reorg_mempool_reconcile(reorg_mempool_t* m,
                              const unsigned char* const* disc_blocks,
                              const uint32_t* disc_lens, long ndisc){
+    return reorg_mempool_reconcile_ex(m, disc_blocks, disc_lens, ndisc, NULL, 0);
+}
+
+long reorg_mempool_reconcile_ex(reorg_mempool_t* m,
+                                const unsigned char* const* disc_blocks,
+                                const uint32_t* disc_lens, long ndisc,
+                                const unsigned char (*conf)[32], long nconf){
     if (!m || !m->mp) return 0;
 
     unsigned char* arena = (unsigned char*)malloc(REORG_MEMPOOL_ARENA);
@@ -1332,6 +1410,15 @@ long reorg_mempool_reconcile(reorg_mempool_t* m,
                 ncand, cand_cap, arena_used, REORG_MEMPOOL_ARENA);
     }
 
+    /* ZMQ `sequence` (2026-09-19): the rebuild below empties the pool and
+     * re-adds nearly all of it, and if the policy layer's hook saw that it
+     * would publish an 'R' and an 'A' for every transaction that never
+     * actually left -- a stream that is true about this implementation and
+     * false about the mempool. So the hook is held for the rebuild, and what
+     * is published afterwards is the NET change (see below the offer pass),
+     * which is what Core's surgical reorg produces. */
+    mempool_seq_hold(1);
+
     /* Empty the structural mempool and reset the policy graph. */
     for (long i = 0; i < from_mempool; i++) mpool_del(m->mp, cand[i].txid);
     if (m->pol_state && m->pol_n) mpool_policy_state_init(m->pol_state, m->pol_n);
@@ -1354,6 +1441,43 @@ long reorg_mempool_reconcile(reorg_mempool_t* m,
         }
         free(done);
     }
+    mempool_seq_hold(0);
+
+    /* The NET change, published in Core's order for a reorg: removals first
+     * (Core's removeForBlock/removeConflicts run inside ConnectTip, before
+     * MaybeUpdateMempoolForReorg re-adds), then the re-entries from the
+     * disconnected blocks, oldest block first, in block order -- the order
+     * MaybeUpdateMempoolForReorg walks its disconnectpool in.
+     *   held before, held after      nothing (Core never touched it)
+     *   held before, gone after      'M' if a replacement block confirmed it
+     *                                (Core: BLOCK -- numbered, unpublished),
+     *                                else 'R' (conflict / no longer valid)
+     *   from a disconnected block,   'A'
+     *   held after
+     * Membership is read back from the pool rather than from the offer
+     * pass's verdicts: an add can be undone by a later add's eviction within
+     * the same rebuild, and only the pool knows the final answer. Still under
+     * mp_lock, so the numbers these take are contiguous and in ring order. */
+    { unsigned char (*cs)[32] = NULL;
+      if (conf && nconf > 0){
+          cs = malloc((size_t)nconf * 32);
+          if (cs){ memcpy(cs, conf, (size_t)nconf * 32); qsort(cs, (size_t)nconf, 32, cmp_txid32); }
+      }
+      long n_rm = 0, n_mined = 0, n_add = 0;
+      for (long i = 0; i < from_mempool; i++){
+          unsigned long l = 0;
+          if (mpool_get(m->mp, cand[i].txid, &l)) continue;
+          int mined = cs && bsearch(cand[i].txid, cs, (size_t)nconf, 32, cmp_txid32);
+          mempool_seq_emit(cand[i].txid, mined ? 'M' : 'R');
+          if (mined) n_mined++; else n_rm++;
+      }
+      for (long i = from_mempool; i < ncand; i++){
+          unsigned long l = 0;
+          if (mpool_get(m->mp, cand[i].txid, &l)){ mempool_seq_emit(cand[i].txid, 'A'); n_add++; }
+      }
+      free(cs);
+      fprintf(stderr, "[reorg] mempool net change: %ld re-entered from disconnected blocks, %ld mined by the new branch, %ld removed\n",
+              n_add, n_mined, n_rm); }
 
     long final_n = mpool_count(m->mp);
     mp_unlock();

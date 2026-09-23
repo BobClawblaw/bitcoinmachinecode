@@ -60,6 +60,10 @@ Usage:
 Exit 0 iff zero divergences. Writes spend_corpus_diff_report.{json,txt}.
 """
 import sys, os, json, time, subprocess, random, base64, argparse
+
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
 import http.client, select
 from concurrent.futures import ThreadPoolExecutor
 
@@ -533,6 +537,9 @@ def main():
             for d in (res['false_accept'] or res['accept_div'] + res['mut_div'])[:40]:
                 f.write(json.dumps(d) + '\n')
     print('\n%s' % open(REPORT_TXT).read())
+    # res['spends'] is how many spends were actually compared. A corpus that
+    # failed to load reports ndiv == 0 and returns 0 -- a pass over nothing.
+    require_cases(res['spends'], 'spends compared')
     return 0 if ndiv == 0 else 1
 
 if __name__ == '__main__':

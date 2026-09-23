@@ -58,6 +58,22 @@ static long mk_v2(u8* ps, unsigned txver, int has_fb, unsigned fb, int has_mod, 
 int main(void){
     long ec; const char* em; rj_val* r; static char pj[8000], b1[8000], b2[8000];
     const char* TXID = "a3b1c2d4e5f6079889abcdef0123456789abcdef0123456789abcdef01234567";   /* display order; wire = 67452301...a3 */
+    printf("== 0. createpsbt with no inputs and no outputs ==\n");
+    {   /* Core answers `createpsbt [] {}` with a well-formed empty PSBT -- it is
+         * how a template is built to be funded later. This node reported
+         * "oom" (error -7) because the transaction walker refused a zero-input
+         * transaction: not valid on the network, but perfectly valid to wrap.
+         * Found 2026-09-14 by extending the RPC shape differential past its
+         * first 64 methods; Core's exact answer is pinned below. */
+        long ec0 = 0; const char* em0 = 0;
+        rj_val* r0 = call("createpsbt", "[[],{}]", &ec0, &em0);
+        ck("createpsbt with empty inputs and outputs is answered, not refused",
+           r0 && r0->str && ec0 == 0);
+        ck("...and it is Core's byte-for-byte answer",
+           r0 && r0->str && !strcmp(r0->str, "cHNidP8BAgQCAAAAAQMEAAAAAAEEAQABBQEAAfsEAgAAAAA="));
+        rj_free(r0);
+    }
+
     printf("== 1. createpsbt / converttopsbt versions ==\n");
     snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":0}],[{\"1Q1pE5vPGEEMqRcVRMbtBK842Y6Pzo6nK9\":0.001}]]", TXID);
     r = call("createpsbt", pj, &ec, &em); ck("createpsbt defaults to v2", r && r->str && strncmp(r->str, "cHNidP8BAgQC", 12) == 0); if (r) strcpy(b2, r->str); rj_free(r);

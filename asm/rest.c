@@ -221,8 +221,11 @@ static void r_mempool(resp_t* r, const rpc_wallet* w, const char* uri, size_t ul
     if (qget(path, plen, "verbose", verbose, sizeof verbose) && strcmp(verbose, "true") && strcmp(verbose, "false")){ rerr(r, 400, "The \"verbose\" query parameter must be either \"true\" or \"false\"."); return; }
     if (qget(path, plen, "mempool_sequence", seq, sizeof seq) && strcmp(seq, "true") && strcmp(seq, "false")){ rerr(r, 400, "The \"mempool_sequence\" query parameter must be either \"true\" or \"false\"."); return; }
     if (!strcmp(verbose, "true") && !strcmp(seq, "true")){ rerr(r, 400, "Verbose results cannot contain mempool sequence values. (hint: set \"verbose=false\")"); return; }
-    if (!strcmp(seq, "true")){ rerr(r, 400, "mempool_sequence is not available on this node (it keeps no mempool sequence number)"); return; }   /* an explicit refusal, not a made-up counter */
-    rj_val* m = call(w, "getrawmempool", (rj_val*)({ rj_val* a = rj_arr(); rj_arr_push(a, rj_bool(!strcmp(verbose, "true"))); a; }), &ec, &em);
+    /* 2026-09-19: the node keeps Core's mempool sequence now (the ZMQ
+     * `sequence` topic's counter), so ?mempool_sequence=true is answered, as
+     * Core's rest_mempool does, with getrawmempool(false, true)'s object. */
+    rj_val* m = call(w, "getrawmempool", (rj_val*)({ rj_val* a = rj_arr(); rj_arr_push(a, rj_bool(!strcmp(verbose, "true")));
+                                                     rj_arr_push(a, rj_bool(!strcmp(seq, "true"))); a; }), &ec, &em);
     if (!m){ rerr(r, 500, em ? em : "rpc error"); return; }
     rjson(r, m);
 }

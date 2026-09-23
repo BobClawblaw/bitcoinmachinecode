@@ -99,8 +99,38 @@ int main(int argc, char** argv){
         for (int i = 0; i < threads && i < 16; i++) pthread_join(th[i], 0);
         ok(1, "concurrent address requests survive (the cache is locked; 2026-09-08's double free)");
     }
-    /* the cache is current after the threads (or after one inline slice per view) */
-    if (esplora_mp_refresh) for (int i = 0; i < 30; i++) esplora_mp_refresh(0, 400);
+    /* Warm the mempool cache to COMPLETION, not for a fixed number of slices.
+     *
+     * This was `for (i = 0; i < 30; i++) esplora_mp_refresh(0, 400)` and it
+     * silently under-warmed at this size, which is what made the next
+     * assertion fail from 2026-09-16 on. A slice stops at whichever comes
+     * first, MP_REFRESH_SLICE transactions or MP_REFRESH_MS milliseconds --
+     * and at 9,000 transactions it is always the TIME that runs out, because
+     * the budget counts transactions while the cost is one getrawtransaction
+     * for the transaction PLUS one more per input whose parent is not already
+     * in the mempool (mp_prevout). 30 slices therefore did not finish, and the
+     * measured request below paid the catch-up: 365 RPC calls in 0.41 s,
+     * exactly MP_REFRESH_MS. At 200 and 1,000 transactions the same 30 slices
+     * did finish and the route cost 1 call, which is why this only ever failed
+     * at the stress size.
+     *
+     * A refresh that fetches nothing new spends exactly one call
+     * (getrawmempool), so that is the fixed point. Loop until we see it. The
+     * iteration cap only stops a runaway; reaching it means the cache never
+     * converged, and the assertion below will say so.
+     *
+     * The daemon never takes this path -- esplora_mp_start_refresher sets
+     * g_mp_refresher and mp_view_of then does NO RPC at all. The inline slice
+     * exists for processes with no refresher thread, which is every test. */
+    if (esplora_mp_refresh){
+        int warm = 0;
+        for (int i = 0; i < 4000; i++){
+            long c = g_calls;
+            esplora_mp_refresh(0, 400);
+            if (g_calls - c <= 1){ warm = 1; break; }   /* nothing new fetched */
+        }
+        if (!warm) printf("  WARNING: mempool cache did not converge; the next assertion measures catch-up, not the route\n");
+    }
     long c_stats = run("/address/bc1qaddrA");
     ok(g_status == 200 && c_stats <= 2, "stats: no txid is resolved -- at most 2 RPC calls for a 60,000-event address (was one getblock per block: 44,001)");
     long c_txs = run("/address/bc1qaddrA/txs");

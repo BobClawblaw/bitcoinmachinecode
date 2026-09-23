@@ -227,7 +227,7 @@ serve_hdrctx.o: daemon/serve_hdrctx.c daemon/hdrrules.h bitcoin_pow_rules.h
 	$(CC) $(WARNFLAGS) -O2 -c -o $@ daemon/serve_hdrctx.c
 addrbook.a: $(ADDRBOOKOBJS)
 	ar rcs $@ $(ADDRBOOKOBJS)
-SERVETXVALSRCS := daemon/tx_accept.c daemon/tx_verify.c daemon/zmq_notify.c daemon/zmq_pub.c daemon/mempool_cfg.c daemon/node_config.c daemon/netperm.c daemon/subnet.c bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_scriptverify.c \
+SERVETXVALSRCS := daemon/tx_accept.c daemon/tx_verify.c daemon/zmq_notify.c daemon/zmq_pub.c daemon/mempool_cfg.c daemon/mempool_journal.c daemon/node_config.c daemon/netperm.c daemon/subnet.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c bitcoin_scriptverify.c \
     bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_strip.c tests/txacc_bidx_stub.c daemon/serve_addr.c daemon/serve_rejects.c daemon/serve_invbounds.c daemon/relay_policy.c addrbook.a daemon/stale_tip.c daemon/txann.c
 # asm/wallet_core.c's verified asm primitives (keys, addresses, sighash, ECDSA,
 # BIP39/BIP32, field/scalar/point ops).
@@ -248,7 +248,7 @@ WALLETPRIMS := secp256k1_fe.o secp256k1_point.o secp256k1_glv_c.o secp256k1_poin
 # links DAEMONSRCS or DIALSRCS also links DAEMON_RPCOBJS -- listing it in
 # both bundles puts the object on the command line twice (multiple
 # definition of pow_retarget_bits/pow_expected_bits/pow_check_bits).
-DAEMON_RPCOBJS := rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rpc_acl.c crypto_hkdf.o rpc_commands.o rpc_chain.o bitcoin_pow_rules.o block_filter.o utxo_snapshot.o rpc_signer.o bip32_ckdpub.o descriptor.o psbt_update.o miniscript.o miniscript_sign.o bip340_sign.o musig2.o rpc_json.o rpc_net.o rpc_node.o daemon/mempool_persist.c \
+DAEMON_RPCOBJS := rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rpc_acl.c crypto_hkdf.o rpc_commands.o rpc_chain.o bitcoin_pow_rules.o block_filter.o utxo_snapshot.o rpc_signer.o bip32_ckdpub.o descriptor.o psbt_update.o miniscript.o miniscript_sign.o bip340_sign.o musig2.o rpc_json.o rpc_net.o rpc_node.o mempool_cluster.a daemon/mempool_persist.c \
     rpc_wallet_ops.o wallet_labels.o wallet_scan.o wallet_scan_hash.o wallet_txlog.c \
     daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c wallet_bnb.c wallet_coinsel.c \
     bitcoin_keys.o bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o
@@ -558,7 +558,7 @@ tests/test_undo_asm_diff: tests/test_undo_asm_diff.c tests/undo_log_ref.o bitcoi
 SIGNETSRCS := daemon/signet.c daemon/signet_verify.c daemon/signet_block.c
 
 REORGSRCS := tests/test_reorg.c daemon/reorg.c daemon/hdr_tree.c daemon/invalid_set.c daemon/minchainwork.c daemon/notify.c daemon/archive_verify.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/block_witness.c $(SIGNETSRCS) daemon/chainparams.c daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
+    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c daemon/mempool_journal.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
 
@@ -690,7 +690,7 @@ tests/fuzz_verify_diff: tests/fuzz_verify_diff.c $(VERIFYSRCS) $(TXVBWPSOBJS)
 # checkpoint periodically during a long catch-up, not just on a (rare, during
 # bulk mode) compaction or at the very end of the call.
 CKPTSRCS := tests/test_utxo_checkpoint.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
+    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c daemon/mempool_journal.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
 tests/test_utxo_checkpoint: $(CKPTSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -709,7 +709,7 @@ tests/test_public_tip: $(PUBTIPSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPD
 # back everything it already committed (coinbase + any earlier-in-block tx),
 # not just the failing tx -- see rollback_partial_apply in daemon/utxo_live.c daemon/lsm_manifest.c daemon/block_witness.c. bitcoin_cmpct.o
 ROLLBACKSRCS := tests/test_apply_block_rollback.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
+    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c daemon/mempool_journal.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
 tests/test_apply_block_rollback: $(ROLLBACKSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -749,7 +749,7 @@ tests/test_scr7_cms_bounds: tests/test_scr7_cms_bounds.o bitcoin_interp.o bitcoi
 # block get re-verified against UTXO state it already spent -- see the
 # per-block persist_applied_height() call in daemon/utxo_live.c daemon/lsm_manifest.c daemon/block_witness.c. bitcoin_cmpct.o
 CRASHRESUMESRCS := tests/test_utxo_catchup_crash_resume.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
+    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c daemon/mempool_journal.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
 tests/test_utxo_catchup_crash_resume: $(CRASHRESUMESRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -766,7 +766,7 @@ tests/test_utxo_ckpt_batch: $(CKPTBATCHSRCS) daemon/utxo_walk.h $(REORGOBJS) $(T
 # destroy its own repair data (the 2026-08-24 height-963915 production
 # failure, distilled). See utxo_live.c's ghost guard in apply_block_at.
 GHOSTRESUMESRCS := tests/test_utxo_ghost_resume.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
+    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c daemon/mempool_journal.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
 tests/test_utxo_ghost_resume: $(GHOSTRESUMESRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -790,7 +790,7 @@ tests/test_utxo_recover_gate: $(RECOVERGATESRCS) daemon/utxo_walk.h $(REORGOBJS)
 # persisted, instead of being ignored until systemd's TimeoutStopSec SIGKILLs
 # the worker mid-block (every stop/restart did exactly that until 2026-08-22).
 SHUTDOWNSRCS := tests/test_utxo_catchup_shutdown.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
+    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c daemon/mempool_journal.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
 tests/test_utxo_catchup_shutdown: $(SHUTDOWNSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -824,7 +824,7 @@ tests/test_utxo_catchup_bounded: $(BOUNDEDSRCS) daemon/utxo_walk.h $(REORGOBJS) 
 # re-applied, never rejected as "already-spent". Three kill points incl. a
 # forced mac_flush inside the block; key-by-key diff vs a never-crashed run.
 CRASHRECSRCS := tests/test_utxo_crash_recovery.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
+    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c daemon/mempool_journal.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
 tests/test_utxo_crash_recovery: $(CRASHRECSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -843,7 +843,7 @@ tests/test_utxo_crash_recovery_bulk: $(CRASHRECSRCS) daemon/utxo_walk.h $(REORGO
 # must both genuinely exercise the block-wide worker pool and still report
 # the correct failing tx.
 CROSSTXSRCS := tests/test_cross_tx_verify.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
+    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c daemon/mempool_journal.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
 tests/test_cross_tx_verify: $(CROSSTXSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -863,7 +863,7 @@ tests/test_txv_many_inputs: $(MANYINSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST
 # input's script correctly, not read corrupted/dangling memory. See the
 # test file's own header comment for full root-cause detail.
 BYTEPOOLSRCS := tests/test_tx_verify_bytepool_realloc.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
+    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c daemon/mempool_journal.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
 tests/test_tx_verify_bytepool_realloc: $(BYTEPOOLSRCS) daemon/utxo_walk.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -908,12 +908,51 @@ daemon/bmc_build_addr_index: daemon/build_addr_index.c daemon/addr_index_fmt.h
 daemon/bmc_build_block_filters: daemon/build_block_filters.c daemon/bfilter_index.c daemon/txi_format.h block_filter.c block_filter.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_block_filters.c daemon/bfilter_index.c block_filter.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o -lpthread
 
+# 2026-09-16: sorted index RUNS (daemon/index_runs.h) -- the merger folds a
+# pile of runs into one; the trailing supervisor (index_trail.h) spawns it.
+daemon/bmc_merge_index_runs: daemon/merge_index_runs.c daemon/index_runs.c daemon/index_runs.h
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/merge_index_runs.c daemon/index_runs.c
+
+tests/test_index_runs: tests/test_index_runs.c daemon/index_runs.c daemon/index_runs.h daemon/merge_index_runs.c $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_index_runs.c daemon/index_runs.c
+
+tests/test_index_trail: tests/test_index_trail.c daemon/index_trail.c daemon/index_trail.h daemon/index_runs.c $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_index_trail.c daemon/index_trail.c daemon/index_runs.c
+
 daemon/bmc_build_tx_index: daemon/build_tx_index.c daemon/txi_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/build_tx_index.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 
 # txo-spender index base build (Core -txospenderindex), 2026-09-01
 daemon/bmc_build_txospender_index: daemon/build_txospender_index.c daemon/txosp_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_txospender_index.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
+
+# ---- the daemon's RUNTIME SET (2026-09-19) --------------------------------
+# The daemon execs these from its OWN directory (readlink /proc/self/exe):
+# the trailing index builders and their run merger (daemon/index_trail.c,
+# configured by main.c's dl_index_trail_configure) and the coinstats history
+# builder (daemon/coinstats_index.c). A daemon without them runs, and never
+# builds those indexes: run 27's harness built only bmcbitcoind and bmc_cli,
+# and its log said "builder ... not executable" once and "missing beside the
+# daemon" every five minutes after, for a whole benchmark.
+#   make runtime               -- the daemon, the CLI and every helper it execs
+#   make print-runtime-helpers -- their names, for a harness to check
+#   make runtime-check         -- every "%s/bmc_*" the daemon sources exec is
+#                                 listed here (a gate prerequisite), so a new
+#                                 helper cannot be left out of this list
+# bmc_build_block_filters is an OPERATOR tool: nothing in the daemon execs it
+# (index_repair.c's supervisor is not configured), so it is not in the set.
+RUNTIME_HELPERS := daemon/bmc_build_tx_index daemon/bmc_build_txospender_index daemon/bmc_build_addr_hist \
+                   daemon/bmc_build_coinstats_hist daemon/bmc_merge_index_runs
+.PHONY: runtime print-runtime-helpers runtime-check
+runtime: daemon/bmcbitcoind daemon/bmc_cli $(RUNTIME_HELPERS)
+print-runtime-helpers:
+	@echo $(notdir $(RUNTIME_HELPERS))
+runtime-check: daemon/main.c daemon/coinstats_index.c daemon/index_trail.c daemon/index_repair.c
+	@execd=`grep -ohE '"%s/bmc_[a-z_]+"' daemon/main.c daemon/coinstats_index.c daemon/index_trail.c daemon/index_repair.c | sed -E 's|.*/(bmc_[a-z_]+)"|\1|' | sort -u`; \
+	[ -n "$$execd" ] || { echo "RUNTIME CHECK FAILED: found no helper the daemon execs -- the scan is broken"; exit 1; }; \
+	miss=""; for h in $$execd; do case " $(notdir $(RUNTIME_HELPERS)) " in *" $$h "*) ;; *) miss="$$miss $$h";; esac; done; \
+	if [ -n "$$miss" ]; then echo "RUNTIME CHECK FAILED: the daemon execs$$miss, which RUNTIME_HELPERS does not list"; exit 1; fi; \
+	echo "runtime-check: the daemon execs" $$execd "-- all in RUNTIME_HELPERS"
 
 daemon/bmc_build_utxo: daemon/build_utxo.c $(BUILDUTXOOBJS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/build_utxo.c $(BUILDUTXOOBJS)
@@ -1010,11 +1049,18 @@ tests/test_peer_timeout: tests/test_peer_timeout.c daemon/peer_timeout.c daemon/
 # outbound legs. Negative control = the switch off (the pre-CC-1 node).
 tests/test_txann: tests/test_txann.c daemon/txann.c daemon/txann.h rpc_node.h
 	$(CC) $(WARNFLAGS) -O2 -D_GNU_SOURCE -I. -I daemon -o $@ tests/test_txann.c daemon/txann.c
+# test_tx_handoff -- 2026-09-19: inbound serve children hand received
+# transactions to the worker (daemon/tx_handoff.c), which validates them
+# against the live UTXO set instead of the boot-time snapshot.
+tests/test_tx_handoff: tests/test_tx_handoff.c daemon/tx_handoff.c daemon/tx_handoff.h
+	$(CC) $(WARNFLAGS) -O2 -D_GNU_SOURCE -I. -I daemon -o $@ tests/test_tx_handoff.c daemon/tx_handoff.c -lpthread
 
 # test_inbound_evict -- CC-3 (2026-09-06): Core's SelectNodeToEvict over the
 # shared peer table: protect recent tx/block senders, measured low pings, and
 # half by longest connection; evict the youngest of the largest netgroup;
 # never NoBan. Negative control = the full table with no eviction.
+tests/test_inbound_rate: tests/test_inbound_rate.c
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_inbound_rate.c
 tests/test_inbound_evict: tests/test_inbound_evict.c daemon/inbound_evict.c daemon/inbound_evict.h rpc_node.h daemon/netperm.h
 	$(CC) $(WARNFLAGS) -O2 -I. -I daemon -o $@ tests/test_inbound_evict.c daemon/inbound_evict.c
 
@@ -1045,7 +1091,7 @@ tests/test_ibd_pipeline: tests/test_ibd_pipeline.c daemon/ibd_pipeline.c daemon/
 # count (total, caller included), not the download worker count it used to be
 # wired to. Asserts the READER, which is what was missing.
 tests/test_par_threads: tests/test_par_threads.c wallet_core.c $(TXACCEPTOBJS) $(WALLETPRIMS) $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_par_threads.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_par_threads.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o %.a,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
 
 # test_banlist_persist -- 2026-09-06: the ban list survives a restart, in
 # Core's banlist.json format (net_types.cpp / addrdb.cpp key names).
@@ -1153,8 +1199,8 @@ tests/test_private_broadcast: tests/test_private_broadcast.c daemon/private_broa
 # It still gets a rule so it is built/compiled-checked on demand rather than
 # rotting the way daemon/bmc_build_utxo did with no target at all.
 RECOVERSRCS := tests/test_utxo_recover.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/tx_accept.c daemon/zmq_notify.c daemon/zmq_pub.c \
-    daemon/mempool_cfg.c daemon/reorg.c daemon/hdr_tree.c daemon/invalid_set.c daemon/minchainwork.c daemon/notify.c daemon/locator_build.c daemon/archive_verify.c \
-    daemon/node_config.c daemon/netperm.c daemon/subnet.c bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_txval_modern.c bitcoin_segwit.c \
+    daemon/mempool_cfg.c daemon/mempool_journal.c daemon/reorg.c daemon/hdr_tree.c daemon/invalid_set.c daemon/minchainwork.c daemon/notify.c daemon/locator_build.c daemon/archive_verify.c \
+    daemon/node_config.c daemon/netperm.c daemon/subnet.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c \
     daemon/block_strip.c daemon/serve_invbounds.c daemon/serve_rejects.c daemon/relay_policy.c bitcoin_pow_rules.o daemon/stale_tip.c daemon/txann.c
 tests/test_utxo_recover: $(RECOVERSRCS) daemon/utxo_walk.h $(DAEMONOBJS)
@@ -1166,14 +1212,14 @@ tests/test_utxo_recover: $(RECOVERSRCS) daemon/utxo_walk.h $(DAEMONOBJS)
 # outbound_connect is static in daemon/main.c, so the test #includes that TU
 # directly (renaming its main) and therefore links the same objects the daemon
 # does, minus daemon/main.c itself (it comes in via the #include).
-DIALSRCS := tests/test_dial_budget.c daemon/private_broadcast.c daemon/utxo_live.c daemon/archive_reindex.c daemon/lsm_manifest.c daemon/block_witness.c $(SIGNETSRCS) daemon/block_strip.c daemon/tx_accept.c daemon/zmq_notify.c daemon/zmq_pub.c daemon/mempool_cfg.c \
+DIALSRCS := tests/test_dial_budget.c daemon/private_broadcast.c daemon/utxo_live.c daemon/archive_reindex.c daemon/lsm_manifest.c daemon/block_witness.c $(SIGNETSRCS) daemon/block_strip.c daemon/tx_accept.c daemon/zmq_notify.c daemon/zmq_pub.c daemon/mempool_cfg.c daemon/mempool_journal.c \
     daemon/upload_cap.c daemon/blk_submit.c daemon/reorg.c daemon/hdr_tree.c daemon/minchainwork.c daemon/notify.c daemon/undo_log.c daemon/locator_build.c \
     daemon/archive_verify.c daemon/addr_ingest.c daemon/net_policy.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/chainparams.c \
-    bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
-    daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c daemon/tx_submit.c daemon/tx_relay.c daemon/tx_index_tail.c daemon/txosp_tail.c daemon/utxo_setinfo_rpc.c daemon/coinstats_index.c daemon/addr_self.c daemon/bfilter_index.c daemon/index_repair.c daemon/addr_index_tail.c wallet_store.c wallet_msgsign.c \
+    bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
+    daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c daemon/tx_submit.c daemon/tx_relay.c daemon/tx_index_tail.c daemon/txosp_tail.c daemon/index_runs.c daemon/index_trail.c daemon/utxo_setinfo_rpc.c daemon/coinstats_index.c daemon/addr_self.c daemon/bfilter_index.c daemon/index_repair.c daemon/addr_index_tail.c wallet_store.c wallet_msgsign.c \
     daemon/serve_invbounds.c daemon/serve_rejects.c daemon/relay_policy.c daemon/wallet_pass.c daemon/v2transport.c crypto_bip324_transport.c crypto_bip324.c crypto_bip324_fs.c \
     crypto_chacha20.c crypto_poly1305.c crypto_ellswift_ecdh.c \
-    crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c daemon/stale_tip.c daemon/peer_timeout.c daemon/txann.c daemon/inbound_evict.c daemon/anchors.c daemon/archive_seed.c daemon/ibd_pipeline.c daemon/hdr_lowwork.c daemon/invalid_set.c daemon/cmpct_recv.c daemon/banlist.c
+    crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c daemon/stale_tip.c daemon/peer_timeout.c daemon/txann.c daemon/tx_handoff.c daemon/inbound_evict.c daemon/anchors.c daemon/archive_seed.c daemon/ibd_pipeline.c daemon/hdr_lowwork.c daemon/invalid_set.c daemon/cmpct_recv.c daemon/banlist.c
 tests/test_dial_budget: addrbook.a $(DIALSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(DIALSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
@@ -1224,6 +1270,17 @@ tests/test_parallel_trigger: addrbook.a $(TRIGSRCS) daemon/main.c daemon/archive
 INTERLEAVESRCS := $(patsubst tests/test_dial_budget.c,tests/test_dlc_interleave.c,$(DIALSRCS))
 tests/test_dlc_interleave: addrbook.a $(INTERLEAVESRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(INTERLEAVESRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
+
+# test_dlc_wire_bytes -- defect A of the run-28 bench-fidelity batch
+# (2026-09-19): the real dl_catchup against two loopback fixture peers; the
+# node's own count of the bytes its downloader sent and received
+# (node_status_t.dl_wire_sent / dl_wire_recv, getnettotals) must equal what
+# the fixtures' kernels say crossed their sockets, and a published download
+# peer must carry bytessent and its per-message maps. Same main.c-as-a-TU
+# shape as test_dlc_interleave.
+WIREBYTESSRCS := $(patsubst tests/test_dial_budget.c,tests/test_dlc_wire_bytes.c,$(DIALSRCS))
+tests/test_dlc_wire_bytes: addrbook.a $(WIREBYTESSRCS) daemon/main.c daemon/archive_reindex.c daemon/archive_reindex.h daemon/rpc_acl.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/reorg.h daemon/utxo_walk.h $(DAEMONOBJS) $(DAEMON_RPCOBJS) $(VERSION_GEN_H) wallet_core.c $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(WIREBYTESSRCS) $(DAEMONOBJS) $(DAEMON_RPCOBJS) wallet_core.c addrbook.a -lpthread
 
 tests/test_cons: tests/test_cons.c $(CONSOBJS)
 	$(CC) $(CFLAGS) -o $@ tests/test_cons.c $(CONSOBJS)
@@ -1581,13 +1638,23 @@ MEMPOOLOBJS := bitcoin_mempool.o bitcoin_hash.o sha256.o
 tests/test_mempool: tests/test_mempool.c $(MEMPOOLOBJS)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool.c $(MEMPOOLOBJS)
 
-# Mempool POLICY layer (bitcoin_mempool_policy.c -- pure C glue over the asm
+# Mempool POLICY layer (bitcoin_mempool_policy.c mempool_cluster.a -- pure C glue over the asm
 # mempool + asm UTXO): fee/relay floor, double-spend, BIP125 RBF, ancestor/
 # descendant limits, fee estimator. Vectors generated by an independent Python
 # oracle (tests/gen_mempool_policy_vectors.py -> tests/mempool_policy_vec.h).
 POLICYOBJS := bitcoin_mempool.o bitcoin_utxo.o
-tests/test_mempool_evict: tests/test_mempool_evict.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_evict.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+tests/test_mempool_depart_reasons: tests/test_mempool_depart_reasons.c daemon/mempool_journal_fmt.h bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_depart_reasons.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+
+# -zmqpubsequence (2026-09-19): every mempool event path through the real
+# engine and the daemon's own hook/ring (mempool_cfg.c), the cross-process
+# counter, and the bytes zmq_notify.c/zmq_pub.c put on the `sequence` topic.
+# The reorg paths are in test_reorg.
+MPSEQSRCS := tests/test_mempool_sequence.c daemon/mempool_seq.h daemon/mempool_cfg.c daemon/mempool_journal.c daemon/node_config.c daemon/netperm.c daemon/subnet.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c daemon/zmq_notify.c daemon/zmq_pub.c
+tests/test_mempool_sequence: $(MPSEQSRCS) $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ $(filter-out %.h,$(MPSEQSRCS)) $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o -lpthread
+tests/test_mempool_evict: tests/test_mempool_evict.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_evict.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 
 # test_mempool_evict_64k -- MEM-2 (audit 2026-09-03): the chunk evictor's
 # working arrays used to be fixed 65,536-entry statics behind `if (n > 65536)
@@ -1598,42 +1665,44 @@ tests/test_mempool_evict: tests/test_mempool_evict.c bitcoin_mempool_policy.c da
 # test_mempool_finality -- MEM-1 (audit 2026-09-03): parse_tx never decoded
 # nLockTime, so a non-final transaction entered the pool, was relayed, and was
 # selected by getblocktemplate -- producing a block Core rejects.
-tests/test_mempool_finality: tests/test_mempool_finality.c bitcoin_mempool_policy.c daemon/mempool_compact.c daemon/seqlocks.h $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_finality.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+tests/test_mempool_finality: tests/test_mempool_finality.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c daemon/seqlocks.h $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_finality.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 
-tests/test_mempool_evict_64k: tests/test_mempool_evict_64k.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_evict_64k.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+tests/test_mempool_evict_64k: tests/test_mempool_evict_64k.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_evict_64k.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 
-tests/test_mempool_chunks: tests/test_mempool_chunks.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_chunks.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+tests/test_mempool_chunks: tests/test_mempool_chunks.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_chunks.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 
 # Core-parity policy semantics: standardness strings, vsize floors, package
 # eviction, full RBF, block reconcile, expiry-with-descendants.
-tests/test_mempool_core_parity: tests/test_mempool_core_parity.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_core_parity.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+tests/test_mempool_core_parity: tests/test_mempool_core_parity.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_core_parity.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 
-tests/test_mempool_policy: tests/test_mempool_policy.c tests/mempool_policy_vec.h bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_policy.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_hash.o sha256.o
+tests/test_mempool_cluster: tests/test_mempool_cluster.c mempool_cluster.c mempool_cluster.h
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_cluster.c mempool_cluster.c
+tests/test_mempool_policy: tests/test_mempool_policy.c tests/mempool_policy_vec.h bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_policy.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_hash.o sha256.o
 
 # NOTE: placed BELOW $(POLICYOBJS). Prerequisite lists expand IMMEDIATELY,
 # so a rule above the variable gets an EMPTY list -- the mistake this pass
 # has now made four times, and which only prereq-check and link-check catch.
-tests/bench_mempool_scale: tests/bench_mempool_scale.c bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_tx.o bitcoin_hash.o sha256.o $(POLICYOBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/bench_mempool_scale.c bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_tx.o bitcoin_hash.o sha256.o $(POLICYOBJS)
+tests/bench_mempool_scale: tests/bench_mempool_scale.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c bitcoin_tx.o bitcoin_hash.o sha256.o $(POLICYOBJS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/bench_mempool_scale.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c bitcoin_tx.o bitcoin_hash.o sha256.o $(POLICYOBJS)
 
 # test_package_policy -- context-free package checks, same objects as the
 # single-tx policy test since they share parse_tx.
-tests/test_package_policy: tests/test_package_policy.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_package_policy.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+tests/test_package_policy: tests/test_package_policy.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_package_policy.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 
 # BIP431 TRUC topology, driven straight through mpool_policy_add with
 # standardness ON (TRUC is policy, so -acceptnonstdtxn switches it off).
-tests/test_truc_policy: tests/test_truc_policy.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_truc_policy.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+tests/test_truc_policy: tests/test_truc_policy.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_truc_policy.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 
 # Core's ephemeral dust carve-out: 0-fee dust, swept by the child.
-tests/test_ephemeral_dust: tests/test_ephemeral_dust.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_ephemeral_dust.c bitcoin_mempool_policy.c daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+tests/test_ephemeral_dust: tests/test_ephemeral_dust.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_ephemeral_dust.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_tx.o bitcoin_hash.o sha256.o
 
 # regenerate the policy vectors from the independent Python oracle
 tests/mempool_policy_vec.h: tests/gen_mempool_policy_vectors.py
@@ -1646,6 +1715,8 @@ tests/test_txtxid: tests/test_txtxid.c $(TXIDOBJS)
 # test_mempool_persist -- Core's mempool.dat format (v1 write, v1+v2 read).
 # Needs bitcoin_tx.o for tx_parse, which is how the reader finds each
 # transaction's length in the stream.
+tests/test_mempool_journal: tests/test_mempool_journal.c daemon/mempool_journal.c daemon/mempool_journal.h daemon/mempool_journal_fmt.h bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_journal.c daemon/mempool_journal.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c $(POLICYOBJS) bitcoin_hash.o sha256.o
 tests/test_mempool_persist: tests/test_mempool_persist.c daemon/mempool_persist.c bitcoin_tx.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I. -o $@ tests/test_mempool_persist.c daemon/mempool_persist.c bitcoin_tx.o bitcoin_hash.o sha256.o
 
@@ -2377,15 +2448,15 @@ TAPSIGHASHOBJS := bitcoin_taproot_sighash.c secp256k1_schnorr.o secp256k1_taproo
 # test_scr5_spkrun -- SCR-5 (audit 2026-09-03): the BIP341 spks run with a
 # >= 253-byte co-input, pinned against validation/scr5_spkrun_oracle.py.
 tests/test_scr5_spkrun: tests/test_scr5_spkrun.c $(TAPSIGHASHOBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_scr5_spkrun.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o,$(TAPSIGHASHOBJS))
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_scr5_spkrun.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o %.a,$(TAPSIGHASHOBJS))
 tests/test_taproot_sighash: tests/test_taproot_sighash.c tests/taproot_spend.h tests/taproot_vec.h $(TAPSIGHASHOBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_taproot_sighash.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o,$(TAPSIGHASHOBJS))
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_taproot_sighash.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o %.a,$(TAPSIGHASHOBJS))
 
 # BIP341/BIP342 script-path spend dispatch (taproot_verify_input): witness
 # classification, control-block Merkle commitment, and full tapscript
 # execution via the shared script_eval interpreter.
 tests/test_taproot_scriptpath: tests/test_taproot_scriptpath.c tests/taproot_scriptpath_vec.h $(TAPSIGHASHOBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_taproot_scriptpath.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o,$(TAPSIGHASHOBJS))
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_taproot_scriptpath.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o %.a,$(TAPSIGHASHOBJS))
 
 # test_taproot_bounds_fuzz -- bitcoin_taproot_sighash.c must never read past
 # the end of the transaction, for any byte string a peer can send. The
@@ -2398,7 +2469,7 @@ tests/test_taproot_scriptpath: tests/test_taproot_scriptpath.c tests/taproot_scr
 # and it SEGVs on main -- that file's read_cs took no `end` at all.
 TAPFUZZOBJS := $(TAPSIGHASHOBJS) bitcoin_script.o secp256k1_ecdsa.o bitcoin_addr.o
 tests/test_taproot_bounds_fuzz: tests/test_taproot_bounds_fuzz.c bitcoin_segwit.c $(TAPFUZZOBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I tests -o $@ tests/test_taproot_bounds_fuzz.c bitcoin_segwit.c $(filter %.c,$(TAPFUZZOBJS)) $(filter %.o,$(TAPFUZZOBJS))
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I tests -o $@ tests/test_taproot_bounds_fuzz.c bitcoin_segwit.c $(filter %.c,$(TAPFUZZOBJS)) $(filter %.o %.a,$(TAPFUZZOBJS))
 
 # bench_taproot_sighash -- CPU time per BIP341 sighash across the same five
 # transaction shapes bench_segwit_sighash uses, so the two tables are directly
@@ -2407,7 +2478,7 @@ tests/test_taproot_bounds_fuzz: tests/test_taproot_bounds_fuzz.c bitcoin_segwit.
 # numbers mean something. Run: make tests/bench_taproot_sighash && \
 #   tests/bench_taproot_sighash [runs]
 tests/bench_taproot_sighash: tests/bench_taproot_sighash.c $(TAPSIGHASHOBJS)
-	$(CC) $(CFLAGS) -I tests -o $@ tests/bench_taproot_sighash.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o,$(TAPSIGHASHOBJS))
+	$(CC) $(CFLAGS) -I tests -o $@ tests/bench_taproot_sighash.c $(filter %.c,$(TAPSIGHASHOBJS)) $(filter %.o %.a,$(TAPSIGHASHOBJS))
 
 # BIP143 segwit-v0 sighash + P2WPKH/P2WSH spend verification (bitcoin_segwit.c)
 # over the verified asm primitives (sha256_full, ecdsa_verify, pubkey_parse,
@@ -2420,10 +2491,10 @@ SEGWITOBJS := bitcoin_segwit.c bitcoin_taproot_sighash.c secp256k1_schnorr.o sec
     secp256k1_scalar_c.o sha256.o bitcoin_hash.o ripemd160.o \
     bitcoin_addr.o bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
 tests/test_p2wpkh_real: tests/test_p2wpkh_real.c $(SEGWITOBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_p2wpkh_real.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o,$(SEGWITOBJS))
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_p2wpkh_real.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o %.a,$(SEGWITOBJS))
 
 tests/test_segwit_sighash: tests/test_segwit_sighash.c tests/modern_vec.h tests/modern_spend.h $(SEGWITOBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_segwit_sighash.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o,$(SEGWITOBJS))
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_segwit_sighash.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o %.a,$(SEGWITOBJS))
 
 # bench_segwit_sighash -- CPU time per BIP143 sighash across five transaction
 # shapes (1-in to 1,372-in, 2-out to 3,000-out). PERF_SCOPE.md section 7 put
@@ -2433,7 +2504,7 @@ tests/test_segwit_sighash: tests/test_segwit_sighash.c tests/modern_vec.h tests/
 # numbers mean something. Run: make tests/bench_segwit_sighash && \
 #   tests/bench_segwit_sighash [runs]
 tests/bench_segwit_sighash: tests/bench_segwit_sighash.c $(SEGWITOBJS)
-	$(CC) $(CFLAGS) -o $@ tests/bench_segwit_sighash.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o,$(SEGWITOBJS))
+	$(CC) $(CFLAGS) -o $@ tests/bench_segwit_sighash.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o %.a,$(SEGWITOBJS))
 
 # ---------------------------------------------------------------------------
 # BENCHMARKS.md tier 1 / tier 2 -- harnesses whose SHAPE mirrors a specific
@@ -2520,7 +2591,7 @@ bench-vs-core: tests/bench_ecdsa tests/bench_schnorr tests/bench_hash_core \
 # before and after the fix -- that half is the proof this changed bounds and
 # not behaviour.
 tests/test_segwit_txout_bound: tests/test_segwit_txout_bound.c tests/segwit_txout_vec.h bitcoin_witness_v0.c bitcoin_scriptverify.c $(SEGWITOBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_segwit_txout_bound.c bitcoin_witness_v0.c bitcoin_scriptverify.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o,$(SEGWITOBJS))
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_segwit_txout_bound.c bitcoin_witness_v0.c bitcoin_scriptverify.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o %.a,$(SEGWITOBJS))
 
 # test_segwit_bounds_fuzz -- bitcoin_segwit.c must never read past the end of
 # the transaction, for any byte string a peer can send. The transaction is
@@ -2531,19 +2602,19 @@ tests/test_segwit_txout_bound: tests/test_segwit_txout_bound.c tests/segwit_txou
 # than by a test; this is the test. It SEGVs on the pre-#21 tree and passes
 # on it afterwards.
 tests/test_segwit_bounds_fuzz: tests/test_segwit_bounds_fuzz.c tests/segwit_txout_vec.h $(SEGWITOBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I tests -o $@ tests/test_segwit_bounds_fuzz.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o,$(SEGWITOBJS))
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I tests -o $@ tests/test_segwit_bounds_fuzz.c $(filter %.c,$(SEGWITOBJS)) $(filter %.o %.a,$(SEGWITOBJS))
 
 # FULL mempool acceptance pipeline for modern outputs: mempool policy +
 # whole-tx validation + ECDSA/Schnorr verify (bitcoin_txval_modern.c +
 # bitcoin_segwit.c + bitcoin_taproot_sighash.c + asm utxo/mempool/tx/taproot).
-MEMPACCOBJS := bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
+MEMPACCOBJS := bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c \
     bitcoin_utxo.o bitcoin_mempool.o bitcoin_tx.o secp256k1_schnorr.o \
     secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o bitcoin_pubkey.o \
     secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o \
     secp256k1_scalar.o secp256k1_scalar_c.o sha256.o bitcoin_hash.o \
     ripemd160.o bitcoin_addr.o bitcoin_interp.o bitcoin_scriptcodec.o sha1.o
 tests/test_mempool_accept_modern: tests/test_mempool_accept_modern.c tests/modern_vec.h tests/modern_spend.h $(MEMPACCOBJS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_accept_modern.c $(filter %.c,$(MEMPACCOBJS)) $(filter %.o,$(MEMPACCOBJS))
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_accept_modern.c $(filter %.c,$(MEMPACCOBJS)) $(filter %.o %.a,$(MEMPACCOBJS))
 
 # incident #37: bitcoin_txval_modern.c mv_parse had an unbounded compactsize
 # reader and pointer-overflow bounds on the no-PoW inbound-tx path.
@@ -2566,7 +2637,7 @@ tests/test_money_range: tests/test_money_range.c $(REORGSRCS_NOMAIN) $(REORGOBJS
 # txval_modern -> tx_accept_validate's accept/reject + mempool storage) --
 # NOT covered by test_mempool_accept_modern, which only exercises the old
 # bitcoin_utxo.asm-backed passthrough shim, never tx_accept.c itself.
-TXACCEPTOBJS := bitcoin_scriptverify.c daemon/tx_accept.c daemon/tx_verify.c daemon/zmq_notify.c daemon/zmq_pub.c daemon/mempool_cfg.c daemon/node_config.c daemon/netperm.c daemon/subnet.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
+TXACCEPTOBJS := bitcoin_scriptverify.c daemon/tx_accept.c daemon/tx_verify.c daemon/zmq_notify.c daemon/zmq_pub.c daemon/mempool_cfg.c daemon/mempool_journal.c daemon/node_config.c daemon/netperm.c daemon/subnet.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c \
     bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c bitcoin_utxo_lsm.o utxo_lsm_mm.o \
     bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_mempool.o bitcoin_tx.o \
     secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
@@ -2586,34 +2657,34 @@ TXACCEPTOBJS := bitcoin_scriptverify.c daemon/tx_accept.c daemon/tx_verify.c dae
 # placed below TXACCEPTOBJS/WALLETPRIMS for the usual reason -- prerequisite
 # lists expand immediately.
 tests/test_txaccept_corpus: tests/test_txaccept_corpus.c tests/txaccept_vec.h wallet_core.c $(TXACCEPTOBJS) $(WALLETPRIMS) $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_txaccept_corpus.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_txaccept_corpus.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o %.a,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
 
 # IR-9: mempool policy flags reach a tapscript leaf (same link set as the corpus)
 tests/test_ir9_tapscript_policy: tests/test_ir9_tapscript_policy.c wallet_core.c $(TXACCEPTOBJS) $(WALLETPRIMS) $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_ir9_tapscript_policy.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_ir9_tapscript_policy.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o %.a,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
 
 # IR-5: per-transaction sighash memo -- equality, key guard, and the 6,000-signature cost
 tests/test_ir5_sighash_cache: tests/test_ir5_sighash_cache.c wallet_core.c $(TXACCEPTOBJS) $(WALLETPRIMS) $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_ir5_sighash_cache.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_ir5_sighash_cache.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o %.a,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
 
 tests/test_scr9_policy_flags: tests/test_scr9_policy_flags.c wallet_core.c $(TXACCEPTOBJS) $(WALLETPRIMS) $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_scr9_policy_flags.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_scr9_policy_flags.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o %.a,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
 
 tests/test_mempool_consensus_verify: tests/test_mempool_consensus_verify.c wallet_core.c $(TXACCEPTOBJS) $(WALLETPRIMS) $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_consensus_verify.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_consensus_verify.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o %.a,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
 
 # The tx-validation snapshot sized to the WAL it replays (2026-08-31 boot wedge).
 tests/test_txacc_snapshot_size: tests/test_txacc_snapshot_size.c wallet_core.c $(TXACCEPTOBJS) $(WALLETPRIMS) $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_txacc_snapshot_size.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_txacc_snapshot_size.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o %.a,$(TXACCEPTOBJS)) $(WALLETPRIMS)) -lpthread
 
 # Core v30/v31 policy prechecks: legacy/accurate sigop caps, P2WSH witness standardness.
 # (Placed BELOW the TXACCEPTOBJS := definition -- a rule above it reads empty
 # prerequisites at parse time, the exact := ordering trap prereq-check exists for.)
 tests/test_policy_v31: tests/test_policy_v31.c $(TXACCEPTOBJS) $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_policy_v31.c $(filter %.c,$(TXACCEPTOBJS)) $(filter %.o,$(TXACCEPTOBJS))
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_policy_v31.c $(filter %.c,$(TXACCEPTOBJS)) $(filter %.o %.a,$(TXACCEPTOBJS))
 
 tests/test_tx_accept_e2e: tests/test_tx_accept_e2e.c tests/modern_spend.h $(TXACCEPTOBJS) $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_tx_accept_e2e.c $(filter %.c,$(TXACCEPTOBJS)) $(filter %.o,$(TXACCEPTOBJS))
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_tx_accept_e2e.c $(filter %.c,$(TXACCEPTOBJS)) $(filter %.o %.a,$(TXACCEPTOBJS))
 
 # sendrawtransaction worker-side handler (daemon/tx_submit.c: accept + relay
 # over a socketpair). Reuses the tx-accept object set + bitcoin_net.o (p2p_write).
@@ -2621,15 +2692,15 @@ tests/test_tx_accept_e2e: tests/test_tx_accept_e2e.c tests/modern_spend.h $(TXAC
 # inv -> getdata(MSG_WITNESS_TX) -> validate+accept over a socketpair leg,
 # pool/ring dedupe, reject handling, and the consumed-ping pong.
 tests/test_tx_relay: addrbook.a tests/test_tx_relay.c tests/modern_spend.h daemon/tx_relay.c daemon/addr_ingest.c daemon/net_policy.c wallet_core.c $(TXACCEPTOBJS) $(WALLETPRIMS) bitcoin_net.o bitcoin_addrmgr.o $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_tx_relay.c daemon/tx_relay.c daemon/addr_ingest.c daemon/net_policy.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o,$(TXACCEPTOBJS)) $(WALLETPRIMS) bitcoin_net.o bitcoin_addrmgr.o) addrbook.a
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_tx_relay.c daemon/tx_relay.c daemon/addr_ingest.c daemon/net_policy.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o %.a,$(TXACCEPTOBJS)) $(WALLETPRIMS) bitcoin_net.o bitcoin_addrmgr.o) addrbook.a
 
 # NOTE: placed BELOW $(TXACCEPTOBJS)/$(WALLETPRIMS), immediately after the
 # rule it borrows its link set from. See the note on bench_mempool_scale.
 tests/test_txrelay_invscale: addrbook.a tests/test_txrelay_invscale.c daemon/tx_relay.c daemon/addr_ingest.c daemon/net_policy.c wallet_core.c $(TXACCEPTOBJS) $(WALLETPRIMS) bitcoin_net.o bitcoin_addrmgr.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_txrelay_invscale.c daemon/tx_relay.c daemon/addr_ingest.c daemon/net_policy.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o,$(TXACCEPTOBJS)) $(WALLETPRIMS) bitcoin_net.o bitcoin_addrmgr.o) addrbook.a
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_txrelay_invscale.c daemon/tx_relay.c daemon/addr_ingest.c daemon/net_policy.c wallet_core.c $(filter %.c,$(TXACCEPTOBJS)) $(sort $(filter %.o %.a,$(TXACCEPTOBJS)) $(WALLETPRIMS) bitcoin_net.o bitcoin_addrmgr.o) addrbook.a
 
 tests/test_tx_submit: tests/test_tx_submit.c tests/modern_spend.h daemon/tx_submit.c $(TXACCEPTOBJS) bitcoin_net.o $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_tx_submit.c daemon/tx_submit.c $(filter %.c,$(TXACCEPTOBJS)) $(filter %.o,$(TXACCEPTOBJS)) bitcoin_net.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_tx_submit.c daemon/tx_submit.c $(filter %.c,$(TXACCEPTOBJS)) $(filter %.o %.a,$(TXACCEPTOBJS)) bitcoin_net.o
 
 # Wallet CLI: generate key, show address, sign a P2PKH tx, and -- via BIP39 +
 # BIP32 -- produce/restore recoverable seeds.
@@ -2668,7 +2739,7 @@ RPCOBJS := rpc_json.o rpc_net.o rpc_commands.o
 # path), bitcoin_idx.o (hash->height), bitcoin_tx.o (tx_txid), bitcoin_chainwork.o
 # (block_work/chainwork_add fallback when chainwork.dat is absent).
 RPCCHAIN := rpc_chain.o bitcoin_pow_rules.o block_filter.o bip32_ckdpub.o descriptor.o psbt_update.o miniscript.o miniscript_sign.o bip340_sign.o musig2.o bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_tx.o bitcoin_chainwork.o
-RPCLIBS := daemon/wallet_pass.c wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c wallet_coinsel.c $(WALLETPRIMS) bitcoin_script.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o rpc_node.o daemon/mempool_persist.c rpc_wallet_ops.o wallet_txlog.c wallet_labels.o wallet_scan.o wallet_scan_hash.o rpc_signer.o daemon/bfilter_index.c daemon/index_repair.c daemon/addr_index_tail.c daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c $(RPCCHAIN) addrbook.a
+RPCLIBS := daemon/index_runs.c daemon/addr_hist.o daemon/mempool_journal.c daemon/wallet_pass.c wallet_core.c wallet_msgsign.c wallet_store.c wallet_bnb.c wallet_coinsel.c $(WALLETPRIMS) bitcoin_script.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o rpc_node.o mempool_cluster.a daemon/mempool_persist.c rpc_wallet_ops.o wallet_txlog.c wallet_labels.o wallet_scan.o wallet_scan_hash.o rpc_signer.o daemon/bfilter_index.c daemon/index_repair.c daemon/addr_index_tail.c daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c $(RPCCHAIN) addrbook.a
 
 # rpc_wallet_ops.o -- the rest of Core's Wallet category (labels, wallet
 # inventory, output locks, signmessage, descriptor reporting, and the
@@ -2733,20 +2804,20 @@ rpc_commands.o: rpc_commands.c rpc_commands.h rpc_json.h rpc_node.h
 # the Esplora facade's routes against a canned rpc_dispatch (the test defines it)
 tests/test_rest: tests/test_rest.c rest.o rpc_json.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rest.c rest.o rpc_json.o
-tests/test_rpc_esplora: tests/test_rpc_esplora.c rpc_esplora.o daemon/addr_hist.o rpc_json.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_esplora.c rpc_esplora.o daemon/addr_hist.o rpc_json.o bitcoin_hash.o sha256.o
-tests/test_rpc_esplora_stress: tests/test_rpc_esplora_stress.c rpc_esplora.o daemon/addr_hist.o rpc_json.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -pthread -o $@ tests/test_rpc_esplora_stress.c rpc_esplora.o daemon/addr_hist.o rpc_json.o bitcoin_hash.o sha256.o
+tests/test_rpc_esplora: tests/test_rpc_esplora.c daemon/mempool_journal.c rpc_esplora.o daemon/addr_hist.o rpc_json.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_esplora.c daemon/mempool_journal.c rpc_esplora.o daemon/addr_hist.o rpc_json.o bitcoin_hash.o sha256.o
+tests/test_rpc_esplora_stress: tests/test_rpc_esplora_stress.c daemon/mempool_journal.c rpc_esplora.o daemon/addr_hist.o rpc_json.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -pthread -o $@ tests/test_rpc_esplora_stress.c daemon/mempool_journal.c rpc_esplora.o daemon/addr_hist.o rpc_json.o bitcoin_hash.o sha256.o
 
-tests/test_addr_hist: tests/test_addr_hist.c daemon/bmc_build_addr_hist daemon/addr_hist.o daemon/addr_hist_fmt.h bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_addr_hist.c daemon/addr_hist.o bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
+tests/test_addr_hist: tests/test_addr_hist.c daemon/bmc_build_addr_hist daemon/bmc_merge_index_runs daemon/addr_hist.o daemon/addr_hist_fmt.h daemon/undo_log.o $(UTXOLSMOBJS) bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_addr_hist.c daemon/addr_hist.o daemon/undo_log.o $(UTXOLSMOBJS) bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_hash.o sha256.o
 daemon/addr_hist.o: daemon/addr_hist.c daemon/addr_hist_fmt.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ daemon/addr_hist.c
 # the address history index builder (offline; see daemon/addr_hist_fmt.h)
 daemon/bmc_build_coinstats_hist: daemon/build_coinstats_hist.c daemon/coinstats_hist_fmt.h bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_utxo_stats.o bitcoin_muhash.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/build_coinstats_hist.c bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_utxo_stats.o bitcoin_muhash.o
-daemon/bmc_build_addr_hist: daemon/build_addr_hist.c daemon/addr_hist_fmt.h daemon/addr_index_fmt.h bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/build_addr_hist.c bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o
+daemon/bmc_build_addr_hist: daemon/build_addr_hist.c daemon/addr_hist_fmt.h daemon/addr_index_fmt.h daemon/undo_log.o $(UTXOLSMOBJS) bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/build_addr_hist.c daemon/undo_log.o $(UTXOLSMOBJS) bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o
 rest.o: rest.c rest.h rpc_json.h rpc_commands.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rest.c
 rpc_esplora.o: rpc_esplora.c rpc_esplora.h rpc_json.h rpc_commands.h daemon/addr_hist_fmt.h
@@ -2755,7 +2826,16 @@ rpc_esplora.o: rpc_esplora.c rpc_esplora.h rpc_json.h rpc_commands.h daemon/addr
 rpc_chain.o: rpc_chain.c rpc_chain.h bitcoin_pow_rules.h rpc_json.h rpc_commands.h version_gen.h descriptor.h miniscript.h musig2.h daemon/undo_store.h \
     rpc_node.h script_flags_consts.h block_filter.h mempool_slot.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_chain.c
-rpc_node.o: rpc_node.c rpc_node.h rpc_json.h version_gen.h build_gen.h mempool_slot.h
+mempool_cluster.o: mempool_cluster.c mempool_cluster.h
+	$(CC) -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ mempool_cluster.c
+# An ARCHIVE, not a bare object. is needed by rules that
+# already pull it through another variable, and listing the same object twice
+# on a link line is a multiple-definition error -- the gate proved it. A
+# linker takes an archive member once however many times the archive appears,
+# which is why addrbook.a exists in this file for the same reason.
+mempool_cluster.a: mempool_cluster.o
+	$(AR) rcs $@ $<
+rpc_node.o: rpc_node.c rpc_node.h rpc_json.h version_gen.h build_gen.h mempool_slot.h mempool_cluster.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_node.c
 
 daemon/bmc_cli: daemon/bmc_cli.c daemon/cli_conf.c daemon/cli_conf.h rpc_net.o rpc_commands.o rpc_json.o $(RPCLIBS)
@@ -2792,23 +2872,28 @@ crypto_hkdf.o: crypto_hkdf.c crypto_hkdf.h
 rpc_server.o: rpc_server.c rpc_server.h rpc_commands.h rpc_net.h rpc_json.h crypto_hkdf.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ rpc_server.c
 
-daemon/bmc_rpcd: daemon/bitcoin_rpcd.c rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o rpc_net.o rpc_commands.o rpc_json.o $(RPCLIBS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/bitcoin_rpcd.c rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o rpc_net.o rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
+daemon/bmc_rpcd: daemon/bitcoin_rpcd.c rpc_server.o rpc_esplora.o rest.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o rpc_net.o rpc_commands.o rpc_json.o $(RPCLIBS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) $(HARDENFLAGS) -o $@ daemon/bitcoin_rpcd.c rpc_server.o rpc_esplora.o rest.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o rpc_net.o rpc_commands.o rpc_json.o $(RPCLIBS) -lpthread
 
 # NOTE: this rule must stay BELOW the RPCLIBS definition. Prerequisites are
 # expanded when the rule is READ, so $(RPCLIBS) above its definition expands
 # to nothing -- the link still works (recipes expand at run time) but the
 # rule silently depends on none of it. prereq-check catches exactly this.
-tests/test_core_parity: tests/test_core_parity.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/chainparams.c daemon/minchainwork.c daemon/notify.c rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rpc_acl.c crypto_hkdf.o rpc_net.o rpc_commands.o rpc_json.o bitcoin_hash.o sha256.o bitcoin_script_flags.o bitcoin_net.o $(RPCLIBS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_core_parity.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/chainparams.c daemon/minchainwork.c daemon/notify.c rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rpc_acl.c crypto_hkdf.o rpc_net.o rpc_commands.o rpc_json.o bitcoin_script_flags.o bitcoin_net.o $(RPCLIBS) -lpthread
+tests/test_core_parity: tests/test_core_parity.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/chainparams.c daemon/minchainwork.c daemon/notify.c rpc_server.o rpc_esplora.o rest.o daemon/rpc_acl.c crypto_hkdf.o rpc_net.o rpc_commands.o rpc_json.o bitcoin_hash.o sha256.o bitcoin_script_flags.o bitcoin_net.o $(RPCLIBS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_core_parity.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/chainparams.c daemon/minchainwork.c daemon/notify.c rpc_server.o rpc_esplora.o rest.o daemon/rpc_acl.c crypto_hkdf.o rpc_net.o rpc_commands.o rpc_json.o bitcoin_script_flags.o bitcoin_net.o $(RPCLIBS) -lpthread
 
 # RPC-18: the RPC listener binds IPv6. Links the same object set as
 # test_rpc_server (below it, so $(RPCLIBS) has expanded).
-tests/test_rpc18_ipv6: tests/test_rpc18_ipv6.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o $(RPCLIBS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc18_ipv6.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o $(RPCLIBS) -lpthread
+tests/test_rpc18_ipv6: tests/test_rpc18_ipv6.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o rpc_esplora.o rest.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o $(RPCLIBS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc18_ipv6.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o rpc_esplora.o rest.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o $(RPCLIBS) -lpthread
 
-tests/test_rpc_server: tests/test_rpc_server.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o daemon/bmc_cli daemon/bmc_rpcd $(RPCLIBS)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_server.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o $(RPCLIBS) -lpthread
+tests/test_rpc_server: tests/test_rpc_server.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o rpc_esplora.o rest.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o daemon/bmc_cli daemon/bmc_rpcd $(RPCLIBS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_server.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o rpc_esplora.o rest.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o $(RPCLIBS) -lpthread
+
+# the trivial RPCs answer within 100 ms with slow calls in flight or the
+# execution lock held (2026-09-19): an in-process server over a synthetic archive
+tests/test_rpc_responsive: tests/test_rpc_responsive.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o rpc_esplora.o rest.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o $(RPCLIBS) $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_responsive.c rpc_net.o rpc_commands.o rpc_json.o rpc_server.o rpc_esplora.o rest.o daemon/rpc_acl.c daemon/subnet.c crypto_hkdf.o $(RPCLIBS) -lpthread
 
 # -rpcwhitelist/-rpcwhitelistdefault/-rpcthreads/-rpcworkqueue on the real server (2026-09-01)
 tests/test_rpc_whitelist: tests/test_rpc_whitelist.c daemon/bmc_rpcd
@@ -2818,9 +2903,10 @@ tests/test_rpc_whitelist: tests/test_rpc_whitelist.c daemon/bmc_rpcd
 # throwaway temp dir: real mainnet genesis + 3 constructed blocks (one with a
 # segwit coinbase, a legacy spend and a P2WPKH spend). Exercises every method
 # in-process through rpc_dispatch, plus the error paths.
-# The ZMQ notification ring, with REAL forked producers (see the file header).
-tests/test_zmq_ring: tests/test_zmq_ring.c daemon/zmq_notify.c daemon/zmq_pub.c
-	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_zmq_ring.c daemon/zmq_notify.c daemon/zmq_pub.c -lpthread
+# The ZMQ notification ring, with REAL forked producers and a recording fake
+# publisher in place of zmq_pub.c (see the file header).
+tests/test_zmq_ring: tests/test_zmq_ring.c daemon/zmq_notify.c rpc_node.h
+	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_zmq_ring.c daemon/zmq_notify.c -lpthread
 
 # The publisher's bind policy (audit finding 8).
 # Concurrency of the servicing thread against the publisher (audit finding 8).
@@ -2933,13 +3019,31 @@ tests/test_rpc_start_policy: tests/test_rpc_start_policy.c
 tests/test_zmq_thread: tests/test_zmq_thread.c daemon/zmq_pub.c
 	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_zmq_thread.c daemon/zmq_pub.c -lpthread
 
+# test_zmq_queue -- the per-subscriber queue (MEM-22): hwm in messages, drop
+# the new message and keep the subscriber, 2 MB rawblocks intact, publish timed
+tests/test_zmq_queue: tests/test_zmq_queue.c daemon/zmq_pub.c
+	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_zmq_queue.c daemon/zmq_pub.c -lpthread
+
 tests/test_zmq_bind: tests/test_zmq_bind.c daemon/zmq_pub.c
 	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_zmq_bind.c daemon/zmq_pub.c -lpthread
 
+tests/test_rpc_chain_growth: tests/test_rpc_chain_growth.c rpc_commands.o rpc_json.o $(RPCLIBS) $(TEST_TMPDIR_H) \
+    bitcoin_mempool.o bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c mempool_entry.h
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_chain_growth.c rpc_commands.o rpc_json.o $(RPCLIBS) \
+	    bitcoin_mempool.o bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c -lpthread
+
+# getchaintxstats: O(new blocks) per tip advance, reorg-correct, historical
+# heights cheap, concurrent callers safe (2026-09-19). --wrap=pread counts the
+# chain module's block-file reads -- the cost the test asserts on.
+tests/test_rpc_chaintxstats: tests/test_rpc_chaintxstats.c rpc_commands.o rpc_json.o $(RPCLIBS) $(TEST_TMPDIR_H) \
+    bitcoin_mempool.o bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c mempool_entry.h
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wl,--wrap=pread -o $@ tests/test_rpc_chaintxstats.c rpc_commands.o rpc_json.o $(RPCLIBS) \
+	    bitcoin_mempool.o bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c -lpthread
+
 tests/test_rpc_chain: tests/test_rpc_chain.c rpc_commands.o rpc_json.o $(RPCLIBS) $(TEST_TMPDIR_H) \
-    bitcoin_mempool.o bitcoin_mempool_policy.c daemon/mempool_compact.c mempool_entry.h
+    bitcoin_mempool.o bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c mempool_entry.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_chain.c rpc_commands.o rpc_json.o $(RPCLIBS) \
-	    bitcoin_mempool.o bitcoin_mempool_policy.c daemon/mempool_compact.c -lpthread
+	    bitcoin_mempool.o bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c -lpthread
 
 # BIP37 partial merkle tree behind gettxoutproof/verifytxoutproof: a
 # known-answer vector (block 100000) plus proof round-trips. No archive/oracle.
@@ -3081,7 +3185,7 @@ tests/test_rpc_wallet_ops: tests/test_rpc_wallet_ops.c rpc_commands.o rpc_json.o
 
 # RPC-8 (audit 2026-09-03): daemon/subnet.c is linked here because cmd_setban
 # validates through subnet_parse. It is a WEAK reference (bmc_cli links
-# rpc_node.o without a subnet parser), so omitting it here silently skipped
+# rpc_node.o mempool_cluster.a without a subnet parser), so omitting it here silently skipped
 # the validation and the test asserted nothing.
 # The RPC field sets against a frozen capture of Core v31.1. The live
 # differential (validation/rpc_field_parity.py) needs a running Core and
@@ -3090,8 +3194,13 @@ tests/test_rpc_wallet_ops: tests/test_rpc_wallet_ops.c rpc_commands.o rpc_json.o
 tests/test_rpc_core_fields: tests/test_rpc_core_fields.c tests/core_v31_fields.json rpc_json.o
 	$(CC) $(WARNFLAGS) -O2 -I. -I daemon -I tests -o $@ tests/test_rpc_core_fields.c rpc_json.o
 
-tests/test_rpc_node: addrbook.a tests/test_rpc_node.c daemon/fee_estimator.c rpc_node.o daemon/subnet.c rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o bitcoin_mempool_policy.c daemon/mempool_compact.c daemon/mempool_persist.c mempool_entry.h
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_node.c daemon/fee_estimator.c rpc_node.o daemon/subnet.c rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o bitcoin_mempool_policy.c daemon/mempool_compact.c daemon/mempool_persist.c -lpthread addrbook.a
+tests/test_rpc_node: addrbook.a tests/test_rpc_node.c daemon/mempool_journal.c daemon/fee_estimator.c rpc_node.o daemon/subnet.c rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c daemon/mempool_persist.c mempool_entry.h
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_node.c daemon/mempool_journal.c daemon/fee_estimator.c rpc_node.o daemon/subnet.c rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c daemon/mempool_persist.c -lpthread addrbook.a
+
+# chunkweight / fees.chunk on a production-shaped 32k pool: one cluster build
+# per cluster per bulk getrawmempool, every entry carrying both keys (2026-09-19)
+tests/test_rpc_chunk_scale: addrbook.a tests/test_rpc_chunk_scale.c daemon/mempool_journal.c daemon/fee_estimator.c rpc_node.o daemon/subnet.c rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c daemon/mempool_persist.c mempool_entry.h
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_rpc_chunk_scale.c daemon/mempool_journal.c daemon/fee_estimator.c rpc_node.o daemon/subnet.c rpc_json.o bitcoin_tx.o bitcoin_hash.o sha256.o bitcoin_mempool.o bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c daemon/mempool_persist.c -lpthread addrbook.a
 
 # Core CBlockPolicyEstimator port: policyestimator_tests scenario + map/removal/persistence (2026-09-01)
 tests/test_fee_estimator: tests/test_fee_estimator.c daemon/fee_estimator.c daemon/fee_estimator.h $(TEST_TMPDIR_H)
@@ -3120,6 +3229,15 @@ tests/test_dial_memory: tests/test_dial_memory.c daemon/dial_memory.c daemon/inf
 # the second-highest claim; a chain far below it is refused)
 tests/test_dlc_rules: tests/test_dlc_rules.c daemon/dlc_rules.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_dlc_rules.c
+
+# test_leg_close_labels -- 2026-09-17: every outbound leg departure names its
+# owner. A structural audit of daemon/main.c: the leg fd is closed only in
+# leg_close_ours()/leg_close_theirs(), the two functions that print a reason,
+# a slot, an address and an age. Reads main.c; nothing to link.
+# (daemon/main.c is READ at runtime, not linked -- naming it as a prerequisite
+# makes the link audit believe this rule must resolve main.c's symbols)
+tests/test_leg_close_labels: tests/test_leg_close_labels.c
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_leg_close_labels.c
 # test_hdr_tree -- the fork tree: headers off the best chain retained with
 # their work, the heaviest tip, pruning, the file, eviction of the lightest tip
 tests/test_hdr_tree: tests/test_hdr_tree.c daemon/hdr_tree.c daemon/hdr_tree.h bitcoin_hash.o sha256.o bitcoin_chainwork.o $(TEST_TMPDIR_H)
@@ -3183,7 +3301,7 @@ tests/test_coinstats_fold_ring: tests/test_coinstats_fold_ring.c daemon/coinstat
 # folding in steady state, same digest. Driven through the real
 # utxo_live_catchup; the CKPTSRCS link set plus the index itself.
 BULKSEEDSRCS := tests/test_coinstats_bulk_seed.c daemon/coinstats_index.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c \
-    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c bitcoin_mempool_policy.c daemon/mempool_compact.c \
+    daemon/locator_build.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/mempool_cfg.c daemon/mempool_journal.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c \
     daemon/tx_verify.c bitcoin_witness_v0.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_segwit.c \
     bitcoin_taproot_sighash.c bitcoin_pow_rules.o
 tests/test_coinstats_bulk_seed: $(BULKSEEDSRCS) daemon/utxo_walk.h daemon/muhash_p2.inc.h rpc_node.h $(REORGOBJS) $(TEST_TMPDIR_H)
@@ -3192,8 +3310,8 @@ tests/test_coinstats_bulk_seed: $(BULKSEEDSRCS) daemon/utxo_walk.h daemon/muhash
 # test_txindex_tail -- the txid index's incremental tail: boot backfill,
 # monotonic append (replay-safe), gap fill, torn-record truncate-and-recover,
 # disabled-without-base, and fold-into-rebuilt-base truncation.
-tests/test_txindex_tail: tests/test_txindex_tail.c daemon/tx_index_tail.c daemon/txosp_tail.c daemon/txi_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_idxscan.o bitcoin_idx.o bitcoin_tx.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_txindex_tail.c daemon/tx_index_tail.c daemon/txosp_tail.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idxscan.o bitcoin_idx.o bitcoin_tx.o bitcoin_hash.o sha256.o -lpthread
+tests/test_txindex_tail: tests/test_txindex_tail.c daemon/tx_index_tail.c daemon/txosp_tail.c daemon/index_runs.c daemon/index_trail.c daemon/txi_format.h bitcoin_store.o bitcoin_store_fast.o bitcoin_idxscan.o bitcoin_idx.o bitcoin_tx.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_txindex_tail.c daemon/tx_index_tail.c daemon/index_runs.c daemon/txosp_tail.c bitcoin_store.o bitcoin_store_fast.o bitcoin_idxscan.o bitcoin_idx.o bitcoin_tx.o bitcoin_hash.o sha256.o -lpthread
 
 # test_append_linkage -- incident #46: idxscan_append_locked's linkage gate
 # (a stale duplicate must be refused inside the height-assigning lock).
@@ -3208,8 +3326,8 @@ tests/test_blk_submit: tests/test_blk_submit.c daemon/blk_submit.c daemon/block_
 # test_mempool_shared -- the MAP_SHARED pre-fork mempool: child writes under
 # the cross-process lock, parent sees the txs; init-once (mp_ext_inited)
 # survives fork. The property the 2026-08-25 coherence slice exists for.
-tests/test_mempool_shared: tests/test_mempool_shared.c daemon/mempool_cfg.c daemon/node_config.c daemon/netperm.c daemon/subnet.c bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_mempool.o bitcoin_hash.o sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_shared.c daemon/mempool_cfg.c daemon/node_config.c daemon/netperm.c daemon/subnet.c bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_mempool.o bitcoin_hash.o sha256.o -lpthread
+tests/test_mempool_shared: tests/test_mempool_shared.c daemon/mempool_cfg.c daemon/mempool_journal.c daemon/node_config.c daemon/netperm.c daemon/subnet.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c bitcoin_mempool.o bitcoin_hash.o sha256.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_mempool_shared.c daemon/mempool_cfg.c daemon/mempool_journal.c daemon/node_config.c daemon/netperm.c daemon/subnet.c bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c bitcoin_mempool.o bitcoin_hash.o sha256.o -lpthread
 
 
 # bitcoin_p2p.asm inv parsers (incoming protocol codecs).
@@ -3238,12 +3356,12 @@ tests/test_p2p_inv: tests/test_p2p_inv.c $(P2PINVOBS)
 # bitcoin_chainwork.o for the cumulative-work primitives they run on.
 DAEMONSRCS := daemon/main.c daemon/private_broadcast.c daemon/fee_estimator.c daemon/fee_hooks.c daemon/archive_reindex.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/block_witness.c $(SIGNETSRCS) daemon/tx_accept.c daemon/zmq_notify.c daemon/zmq_pub.c daemon/reorg.c daemon/hdr_tree.c daemon/minchainwork.c daemon/notify.c \
     daemon/undo_log.c daemon/locator_build.c daemon/archive_verify.c daemon/addr_ingest.c \
-    daemon/net_policy.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/chainparams.c daemon/mempool_cfg.c daemon/upload_cap.c daemon/tx_submit.c daemon/tx_relay.c daemon/tx_index_tail.c daemon/txosp_tail.c daemon/blk_submit.c daemon/utxo_setinfo_rpc.c daemon/coinstats_index.c daemon/addr_self.c daemon/bfilter_index.c daemon/index_repair.c daemon/serve_cfilters.c daemon/serve_addr.c daemon/serve_rejects.c daemon/addr_index_tail.c daemon/block_strip.c wallet_store.c \
-    bitcoin_mempool_policy.c daemon/mempool_compact.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
+    daemon/net_policy.c daemon/node_config.c daemon/netperm.c daemon/subnet.c daemon/ctl_dial.c daemon/dial_memory.c daemon/inflight.c daemon/chainparams.c daemon/mempool_cfg.c daemon/mempool_journal.c daemon/upload_cap.c daemon/tx_submit.c daemon/tx_relay.c daemon/tx_index_tail.c daemon/txosp_tail.c daemon/index_runs.c daemon/index_trail.c daemon/blk_submit.c daemon/utxo_setinfo_rpc.c daemon/coinstats_index.c daemon/addr_self.c daemon/bfilter_index.c daemon/index_repair.c daemon/serve_cfilters.c daemon/serve_addr.c daemon/serve_rejects.c daemon/addr_index_tail.c daemon/block_strip.c wallet_store.c \
+    bitcoin_mempool_policy.c mempool_cluster.a daemon/mempool_compact.c bitcoin_txval_modern.c bitcoin_segwit.c bitcoin_taproot_sighash.c \
     daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_witness_v0.c wallet_msgsign.c \
     daemon/serve_invbounds.c daemon/relay_policy.c daemon/wallet_pass.c daemon/v2transport.c crypto_bip324_transport.c crypto_bip324.c crypto_bip324_fs.c \
     crypto_chacha20.c crypto_poly1305.c crypto_ellswift_ecdh.c \
-    crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c daemon/stale_tip.c daemon/peer_timeout.c daemon/txann.c daemon/inbound_evict.c daemon/anchors.c daemon/archive_seed.c daemon/ibd_pipeline.c daemon/hdr_lowwork.c daemon/invalid_set.c daemon/cmpct_recv.c daemon/banlist.c
+    crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c daemon/stale_tip.c daemon/peer_timeout.c daemon/txann.c daemon/tx_handoff.c daemon/inbound_evict.c daemon/anchors.c daemon/archive_seed.c daemon/ibd_pipeline.c daemon/hdr_lowwork.c daemon/invalid_set.c daemon/cmpct_recv.c daemon/banlist.c
 # Embedded RPC server (docs/RPC_LIVE_NODE.md): DAEMON_RPCOBJS is defined near
 # the top (with WALLETPRIMS) so its prereqs expand for every rule that uses it.
 # HARDENFLAGS (audit 2026-08-29 finding 9): full RELRO -- the GOT is made
@@ -3280,6 +3398,26 @@ daemon/bmc_pverify: daemon/pverify.c $(CONSOBJS)
 # bitcoin_store.asm shared-append: concurrent-safe single-store write (standalone).
 tests/test_shared: tests/test_shared.c bitcoin_store.o $(TEST_TMPDIR_H)
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_shared.c bitcoin_store.o
+# test_frontier_append -- THE GATE for the .frontier guard in
+# store_append_shared_x. The branch was dry-run assembled with 18 suites green,
+# but none of them exercised an append LANDING at a frontier, which is the one
+# thing the guard exists to do. Reverting the guard turns 8 of these checks red.
+tests/test_frontier_append: tests/test_frontier_append.c bitcoin_store.o $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_frontier_append.c bitcoin_store.o
+# test_append_unshared_frontier -- store_append (the NON-shared path) got the
+# frontier walk, the fd drop and the cur_file_pos self-heal on 2026-09-18. This
+# is the incident of 2026-09-17 reduced: an advanced cur_file_no with a stale
+# cur_file_pos, which wrote over a live block AND recorded a file that never
+# received the bytes. Reverting the guard turns 6 of these checks red.
+tests/test_append_unshared_frontier: tests/test_append_unshared_frontier.c bitcoin_store.o $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_append_unshared_frontier.c bitcoin_store.o
+# test_stop_waits_for_worker -- 2026-09-19: SIGTERM a real regtest daemon and,
+# the instant its main pid has exited, the datadir lock must be free and a new
+# instance must boot. The serve parent used to _exit while the download worker
+# (and everything sharing the flock) still held it; restoring that _exit turns
+# the "lock is FREE" and "boots" checks red on the first cycle.
+tests/test_stop_waits_for_worker: tests/test_stop_waits_for_worker.c daemon/bmcbitcoind $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_stop_waits_for_worker.c
 # test_shared_stress -- 2026-09-06: the concurrent append under the load that
 # left the archive inconsistent on disk (16 writers, interleaved chunks,
 # variable sizes, re-appends). Reproduces the pipelined downloader's failure
@@ -3466,10 +3604,19 @@ runlist-check:
 script-flags-check:
 	cd .. && sh scripts/script_flags_check.sh
 
+# A node_log_* call with a hand-counted length one too high writes the string's
+# NUL into debug.log, and grep then reads the whole log as binary (2026-09-19).
+.PHONY: log-literal-check
+log-literal-check:
+	python3 ../scripts/log_literal_len_check.py
 
 
-test: abi-check callee-saved-check prereq-check runlist-check clean-check san-check script-flags-check link-audit-selftest gate-log-selftest daemon/bmc_build_utxo daemon/bmcbitcoind link-check tests/test_abi_coverage tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_cry6_sha_paths tests/test_sha512 tests/test_aes tests/test_wallet_crypter tests/test_wallet_store tests/test_cli_prompt tests/test_chainparams tests/test_pow_rules tests/test_coinselect_bnb tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip32_ckdpub tests/test_bip39 tests/test_bip39_passbound tests/test_sha512_thread_stress tests/test_secret_wipe tests/test_ripemd160 tests/test_ripemd160_thread_stress tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_msg_sign tests/test_net_policy tests/test_private_broadcast tests/test_wallet_txlog tests/test_lsm_bloomsat tests/test_lsm_pick_budget tests/test_lsm_flush_sparse tests/test_lsm_lost_tombstones tests/test_lsm_lost_tombstones_bad tests/test_utxo_lost_tombstones tests/test_utxo_put_wal_fail tests/test_utxo_wal_reset_fail tests/test_utxo_reload_truncated tests/test_utxo_manifest_bad tests/test_reorg_crash_ordering tests/test_utxo_lost_tombstones_bad tests/test_interp_legacy_spend tests/test_ir10_p2pkh_bounds tests/test_package_policy tests/test_truc_policy \
-tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tests/test_mempool_evict_64k tests/test_mempool_finality tests/test_mempool_core_parity tests/test_txtxid tests/test_mempool_persist tests/test_block tests/test_tx tests/test_net tests/test_net_timeouts tests/test_inbound_idle_timeout tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_sto11_append_durability tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_cmpct_fallback tests/test_sync_gate tests/test_sync_dup tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_serve_violation tests/test_serve_block_ctx tests/test_p2p_msgsize tests/test_wallet_pass tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_addrv2_serve tests/test_addr_ingest_parse tests/test_addr_ingest_violation tests/test_sha3 tests/test_base32 tests/test_netaddr tests/test_addrbook tests/test_addrbook_net10 tests/test_stale_tip tests/test_peer_timeout tests/test_txann tests/test_inbound_evict tests/test_anchors tests/test_ibd_pipeline tests/test_archive_seed tests/test_hdr_lowwork tests/test_coinsel tests/test_invalid_set tests/test_cmpct_recv tests/test_socks5 tests/test_torcontrol tests/test_i2psam tests/test_net6 tests/test_privacy_dns tests/test_chacha20 tests/test_poly1305 tests/test_hkdf tests/test_bip324_fs tests/test_bip324 tests/test_bip324_transport tests/test_v2transport tests/test_fe_sqrt tests/test_ellswift tests/test_ellswift_ecdh tests/test_asmap tests/test_core_parity tests/test_outbound_mux tests/test_redial tests/test_elf_hardening tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_wal_buffer tests/test_utxo_torn_tail tests/test_utxo_lsm tests/test_utxo_lsm_dups tests/test_utxo_probe_bound tests/test_utxo_prefetch_race tests/test_utxo_live_count tests/test_sparse_offsets tests/test_compact_async tests/test_compact_leveled tests/test_policy_v31 tests/test_utxo_ckpt_batch tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/test_scr_interp_bounds tests/smoke_interp tests/test_interp tests/test_csv_disable_flag tests/test_interp_core_vectors tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_scr10_sigops_bounds tests/test_schnorr tests/test_taproot tests/test_taproot_thread_stress tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_tx_submit tests/test_tx_relay tests/test_txrelay_invscale tests/test_mempool_consensus_verify tests/test_txacc_snapshot_size tests/test_rpc_json tests/test_rpc_amount tests/test_rpc_transport tests/test_rpc_server tests/test_rpc18_ipv6 tests/test_mempool_shared tests/test_append_linkage tests/test_txindex_tail tests/test_coinstats_index tests/test_coinstats_hist tests/test_coinstats_hist_build tests/test_addr_self tests/test_ctl_dial tests/test_dlc_rules tests/test_dial_memory tests/test_inflight tests/test_utxo_sizing tests/test_compact_policy tests/test_index_repair tests/test_hdr_tree tests/test_bfilter_index tests/test_cfheaders_bounds tests/test_serve_rejects tests/test_secure_lock tests/test_block_strip tests/test_addr_index_tail tests/test_blk_submit tests/test_blk_dryrun tests/test_val_connect tests/test_val_read_tx tests/test_bip68_locks tests/test_hdr_contextual tests/test_tx_bounds_fuzz tests/test_pow_check tests/test_scr5_spkrun tests/test_scr7_cms_bounds tests/test_scr9_policy_flags tests/test_txaccept_corpus tests/test_ir9_tapscript_policy tests/test_ir5_sighash_cache tests/test_rpc_chain tests/test_zmq_ring tests/test_zmq_bind tests/test_zmq_thread tests/test_rpc_start_policy tests/test_rpc_json_depth tests/test_txrecon tests/test_mempool_persist_wiring tests/test_reindex_chainstate tests/test_archive_trim tests/test_reindex tests/test_descriptor_vectors tests/test_miniscript tests/test_bip340_sign tests/test_signet_solution tests/test_signet_txs tests/test_signet_verify tests/test_signet_block tests/test_netperm tests/test_subnet tests/test_rpc_acl tests/test_cli_conf tests/test_misbehavior_shared tests/test_txoutproof tests/test_rpc_msg tests/test_rpc_rawtx tests/test_rpc_psbtfinal tests/test_psbt_v2 tests/test_txospender_index tests/test_rpc_psbt_taproot tests/test_rpc_control tests/test_wallet_scan tests/test_block_filter tests/test_utxo_snapshot tests/test_rpc_signer tests/test_taproot_parity tests/test_multisig_opcount tests/test_rpc_signraw tests/test_rpc_miniscript_sign tests/test_rpc_node tests/test_rpc_core_fields tests/test_rest tests/test_rpc_esplora tests/test_addr_hist tests/test_rpc_wallet_ops tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_bip30_daemon tests/test_bip30_overwrite tests/test_utxo_unspendable tests/test_txv_parse_diff tests/test_txv_classify_diff tests/test_segwit_classify_diff tests/test_txvb_parse_diff tests/test_txv_pools_diff tests/test_strip_witness_diff tests/test_tapagg_diff tests/test_txv_dispatch_diff tests/test_wv0_drv_diff tests/test_svs_drv_diff tests/test_checksig_diff tests/test_bip143_diff tests/test_taproot_verify_diff tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul tests/test_muhash tests/test_utxo_setinfo tests/test_schnorr_diff tests/test_schnorr_thread_stress tests/test_merkle_batch tests/test_mv_parse_bounds tests/test_money_range tests/test_txv_cs_maxsize tests/test_compact_threshold tests/test_bip341_diff tests/test_musig2 tests/test_musig2_psbt tests/test_rpc_whitelist tests/test_fee_estimator tests/test_psbt_update tests/test_psbt_bounds tests/test_relay_policy tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_undo_asm_diff tests/test_reorg tests/test_dial_budget tests/test_sync_budget tests/test_dlc_peer_parse tests/test_dialhelper tests/test_i2p_inbound tests/test_pool_diversity tests/test_parallel_trigger tests/test_txoq_ipc tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_txv_many_inputs tests/test_compact_manifest_order tests/test_utxo_compact_gen_tiebreak tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_utxo_ghost_resume tests/test_lsm_count_drift tests/test_utxo_recover_gate tests/test_taproot_scriptpath tests/test_mul_carry_regression tests/test_fe_repr tests/test_fe_inline tests/test_point_repr tests/test_ecdsa_inverse tests/test_lsm_mmap_diff tests/test_utxo_catchup_shutdown tests/test_utxo_catchup_timing tests/test_utxo_crash_recovery tests/test_utxo_crash_recovery_bulk tests/test_lsm_sparse_diff tests/soak_lsm_mm tests/test_ecdsa_glv_switch tests/test_witness_commitment tests/test_compactsize_canonical tests/test_txvb_wprog_stable tests/test_taproot_exception_block tests/test_dersig_encoding tests/test_scr8_der_lax tests/test_verify_core_vectors tests/test_scriptnum_bool tests/test_segwit_real tests/test_segwit_coverage tests/test_tapscript_scale tests/test_block_481827_pool_stack tests/test_segwit_txout_bound tests/test_segwit_bounds_fuzz tests/test_taproot_bounds_fuzz tests/test_taproot_parallel_arena tests/test_taproot_block_diff tests/test_public_tip tests/test_connect_reject tests/test_utxo_tiered_compact tests/test_lsm_flush_sort_diff tests/test_muhash_mul_diff tests/test_mempool_wtxid tests/test_coinstats_bulk_seed tests/test_coinstats_fold_ring tests/test_utxo_probe_diff tests/test_utxo_catchup_bounded tests/test_dlc_interleave tests/test_banlist_persist tests/test_shared_stress tests/test_rpc_esplora_stress
+
+test: abi-check callee-saved-check prereq-check runlist-check runtime-check clean-check san-check script-flags-check log-literal-check link-audit-selftest gate-log-selftest daemon/bmc_build_utxo daemon/bmcbitcoind link-check tests/test_abi_coverage tests/bench_abi_audit tests/test_abi_stack_align tests/test_node_config tests/test_archive_check tests/test_scriptverify_parity tests/test_sha256 tests/test_cry6_sha_paths tests/test_sha512 tests/test_aes tests/test_wallet_crypter tests/test_wallet_store tests/test_cli_prompt tests/test_chainparams tests/test_pow_rules tests/test_coinselect_bnb tests/test_hmac tests/test_fe tests/test_point tests/test_addm tests/test_scalarmul tests/test_scalarmul_ct tests/test_add tests/test_scalar tests/test_ecdsa tests/test_keys tests/test_bip32_master tests/test_bip32_chain tests/test_bip32_extkey tests/test_bip32_ckdpub tests/test_bip39 tests/test_bip39_passbound tests/test_sha512_thread_stress tests/test_secret_wipe tests/test_ripemd160 tests/test_ripemd160_thread_stress tests/test_addr tests/test_bech32 tests/test_mempool tests/test_mempool_policy tests/test_mempool_cluster tests/test_msg_sign tests/test_net_policy tests/test_private_broadcast tests/test_wallet_txlog tests/test_lsm_bloomsat tests/test_lsm_pick_budget tests/test_lsm_flush_sparse tests/test_lsm_lost_tombstones tests/test_lsm_lost_tombstones_bad tests/test_utxo_lost_tombstones tests/test_utxo_put_wal_fail tests/test_utxo_wal_reset_fail tests/test_utxo_reload_truncated tests/test_utxo_manifest_bad tests/test_reorg_crash_ordering tests/test_utxo_lost_tombstones_bad tests/test_interp_legacy_spend tests/test_ir10_p2pkh_bounds tests/test_package_policy tests/test_truc_policy \
+tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tests/test_mempool_evict_64k tests/test_mempool_finality tests/test_mempool_journal tests/test_mempool_depart_reasons tests/test_mempool_sequence tests/test_mempool_core_parity tests/test_txtxid tests/test_mempool_persist tests/test_block tests/test_tx tests/test_net tests/test_net_timeouts tests/test_inbound_idle_timeout tests/test_p2p tests/fakepeer_headers tests/test_store tests/test_sto11_append_durability tests/test_prune tests/test_cons tests/test_block_genesis tests/test_bitcoind tests/test_bitcoind_sync tests/test_cmpct_fallback tests/test_sync_gate tests/test_sync_dup tests/test_log tests/test_cli tests/test_headers tests/test_ibd_headers tests/test_ibd_blocks tests/test_ibd_full tests/test_addrmgr tests/test_shared tests/test_shared2 tests/test_idx tests/test_serve tests/test_serve_violation tests/test_serve_block_ctx tests/test_p2p_msgsize tests/test_wallet_pass tests/test_keepup tests/test_p2p_inv tests/test_bip152 tests/test_bip152_loop tests/test_sendheaders_fee tests/test_addrv2_serve tests/test_addr_ingest_parse tests/test_addr_ingest_violation tests/test_sha3 tests/test_base32 tests/test_netaddr tests/test_addrbook tests/test_addrbook_net10 tests/test_stale_tip tests/test_peer_timeout tests/test_txann tests/test_tx_handoff tests/test_inbound_evict tests/test_inbound_rate tests/test_anchors tests/test_ibd_pipeline tests/test_archive_seed tests/test_hdr_lowwork tests/test_coinsel tests/test_invalid_set tests/test_cmpct_recv tests/test_socks5 tests/test_torcontrol tests/test_i2psam tests/test_net6 tests/test_privacy_dns tests/test_chacha20 tests/test_poly1305 tests/test_hkdf tests/test_bip324_fs tests/test_bip324 tests/test_bip324_transport tests/test_v2transport tests/test_fe_sqrt tests/test_ellswift tests/test_ellswift_ecdh tests/test_asmap tests/test_core_parity tests/test_outbound_mux tests/test_redial tests/test_elf_hardening tests/test_pubkey tests/test_sighash tests/test_sighash_oob tests/test_script tests/test_p2pkh tests/test_utxo tests/test_utxo_store tests/test_utxo_wal_buffer tests/test_utxo_torn_tail tests/test_utxo_lsm tests/test_utxo_lsm_dups tests/test_utxo_probe_bound tests/test_utxo_prefetch_race tests/test_utxo_live_count tests/test_sparse_offsets tests/test_compact_async tests/test_compact_leveled tests/test_policy_v31 tests/test_utxo_ckpt_batch tests/test_txval tests/test_multisig tests/test_wallet tests/test_e2e_sighash tests/test_send tests/test_wrpc_addr tests/test_wrpc_utxo tests/test_wrpc_decoderaw tests/test_wrpc_sign tests/test_wrpc_send tests/test_scr_interp_bounds tests/smoke_interp tests/test_interp tests/test_csv_disable_flag tests/test_interp_core_vectors tests/test_tapscript_interp tests/run_batch tests/consensus_shim tests/test_sigops tests/test_scr10_sigops_bounds tests/test_schnorr tests/test_taproot tests/test_taproot_thread_stress tests/test_taproot_sighash tests/test_segwit_sighash tests/test_p2wpkh_real tests/test_mempool_accept_modern tests/test_tx_accept_e2e tests/test_tx_submit tests/test_tx_relay tests/test_txrelay_invscale tests/test_mempool_consensus_verify tests/test_txacc_snapshot_size tests/test_rpc_json tests/test_rpc_amount tests/test_rpc_transport tests/test_rpc_server tests/test_rpc18_ipv6 tests/test_mempool_shared tests/test_append_linkage tests/test_txindex_tail tests/test_coinstats_index tests/test_coinstats_hist tests/test_coinstats_hist_build tests/test_addr_self tests/test_ctl_dial tests/test_dlc_rules tests/test_leg_close_labels tests/test_dial_memory tests/test_inflight tests/test_utxo_sizing tests/test_compact_policy tests/test_index_repair tests/test_index_runs tests/test_index_trail tests/test_hdr_tree tests/test_bfilter_index tests/test_cfheaders_bounds tests/test_serve_rejects tests/test_secure_lock tests/test_block_strip tests/test_addr_index_tail tests/test_blk_submit tests/test_blk_dryrun tests/test_val_connect tests/test_val_read_tx tests/test_bip68_locks tests/test_hdr_contextual tests/test_tx_bounds_fuzz tests/test_pow_check tests/test_scr5_spkrun tests/test_scr7_cms_bounds tests/test_scr9_policy_flags tests/test_txaccept_corpus tests/test_ir9_tapscript_policy tests/test_ir5_sighash_cache tests/test_rpc_chain tests/test_rpc_chain_growth tests/test_rpc_chaintxstats tests/test_rpc_responsive tests/test_zmq_ring tests/test_zmq_bind tests/test_zmq_thread tests/test_zmq_queue tests/test_rpc_start_policy tests/test_rpc_json_depth tests/test_txrecon tests/test_mempool_persist_wiring tests/test_reindex_chainstate tests/test_archive_trim tests/test_reindex tests/test_descriptor_vectors tests/test_miniscript tests/test_bip340_sign tests/test_signet_solution tests/test_signet_txs tests/test_signet_verify tests/test_signet_block tests/test_netperm tests/test_subnet tests/test_rpc_acl tests/test_cli_conf tests/test_misbehavior_shared tests/test_txoutproof tests/test_rpc_msg tests/test_rpc_rawtx tests/test_rpc_psbtfinal tests/test_psbt_v2 tests/test_txospender_index tests/test_rpc_psbt_taproot tests/test_rpc_control tests/test_wallet_scan tests/test_block_filter tests/test_utxo_snapshot tests/test_rpc_signer tests/test_taproot_parity tests/test_multisig_opcount tests/test_rpc_signraw tests/test_rpc_miniscript_sign tests/test_rpc_node tests/test_rpc_chunk_scale tests/test_rpc_core_fields tests/test_rest tests/test_rpc_esplora tests/test_addr_hist tests/test_rpc_wallet_ops tests/verify_p2sh_shim tests/test_verify_p2sh tests/bip30_shim tests/test_bip30 tests/test_bip30_daemon tests/test_bip30_overwrite tests/test_utxo_unspendable tests/test_txv_parse_diff tests/test_txv_classify_diff tests/test_segwit_classify_diff tests/test_txvb_parse_diff tests/test_txv_pools_diff tests/test_strip_witness_diff tests/test_tapagg_diff tests/test_txv_dispatch_diff tests/test_wv0_drv_diff tests/test_svs_drv_diff tests/test_checksig_diff tests/test_bip143_diff tests/test_taproot_verify_diff tests/test_point_inf tests/test_glv_split tests/test_glv_wnaf tests/test_glv_pointmul tests/test_muhash tests/test_utxo_setinfo tests/test_schnorr_diff tests/test_schnorr_thread_stress tests/test_merkle_batch tests/test_mv_parse_bounds tests/test_money_range tests/test_txv_cs_maxsize tests/test_compact_threshold tests/test_bip341_diff tests/test_musig2 tests/test_musig2_psbt tests/test_rpc_whitelist tests/test_fee_estimator tests/test_psbt_update tests/test_psbt_bounds tests/test_relay_policy tests/test_chainwork tests/test_locator tests/test_prevhash tests/test_truncate tests/test_undo_log tests/test_undo_asm_diff tests/test_reorg tests/test_dial_budget tests/test_sync_budget tests/test_dlc_peer_parse tests/test_dialhelper tests/test_i2p_inbound tests/test_pool_diversity tests/test_parallel_trigger tests/test_txoq_ipc tests/test_legacy_sighash tests/test_find_and_delete tests/test_hashtype_e2e tests/test_script_flags tests/test_archive_repair tests/test_archive_truncate_nonmonotonic tests/test_prune_nonmonotonic tests/test_tx_verify_parallel tests/test_utxo_checkpoint tests/diff_add_ct_homog tests/test_nop1_regression tests/test_checkmultisig_findanddelete tests/test_checkmultisig_zero_keys tests/test_checkmultisigverify_pop tests/test_sig_pushonly_75 tests/test_cltv_csv tests/test_apply_block_rollback tests/test_scriptverify_thread_stress tests/test_cross_tx_verify tests/test_txv_many_inputs tests/test_compact_manifest_order tests/test_utxo_compact_gen_tiebreak tests/test_tx_verify_bytepool_realloc tests/test_stack_push_len tests/test_utxo_catchup_crash_resume tests/test_utxo_ghost_resume tests/test_lsm_count_drift tests/test_utxo_recover_gate tests/test_taproot_scriptpath tests/test_mul_carry_regression tests/test_fe_repr tests/test_fe_inline tests/test_point_repr tests/test_ecdsa_inverse tests/test_lsm_mmap_diff tests/test_utxo_catchup_shutdown tests/test_utxo_catchup_timing tests/test_utxo_crash_recovery tests/test_utxo_crash_recovery_bulk tests/test_lsm_sparse_diff tests/soak_lsm_mm tests/test_ecdsa_glv_switch tests/test_witness_commitment tests/test_compactsize_canonical tests/test_txvb_wprog_stable tests/test_taproot_exception_block tests/test_dersig_encoding tests/test_scr8_der_lax tests/test_verify_core_vectors tests/test_scriptnum_bool tests/test_segwit_real tests/test_segwit_coverage tests/test_tapscript_scale tests/test_block_481827_pool_stack tests/test_segwit_txout_bound tests/test_segwit_bounds_fuzz tests/test_taproot_bounds_fuzz tests/test_taproot_parallel_arena tests/test_taproot_block_diff tests/test_public_tip tests/test_connect_reject tests/test_utxo_tiered_compact tests/test_lsm_flush_sort_diff tests/test_muhash_mul_diff tests/test_mempool_wtxid tests/test_coinstats_bulk_seed tests/test_coinstats_fold_ring tests/test_utxo_probe_diff tests/test_utxo_catchup_bounded tests/test_dlc_interleave tests/test_dlc_wire_bytes tests/test_banlist_persist tests/test_shared_stress tests/test_rpc_esplora_stress tests/test_frontier_append tests/test_append_unshared_frontier tests/test_stop_waits_for_worker
+	@echo "== harness self-test (the instruments that measure this node) =="
+	../validation/test_ibd_harness.sh
+	python3 ../validation/test_diffguard.py
 	./tests/test_abi_stack_align
 	./tests/bench_abi_audit $(ABI_AUDIT_BLOCK)
 	./tests/test_abi_coverage
@@ -3525,6 +3672,7 @@ tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tes
 	./tests/test_coinselect_bnb
 	./tests/test_mempool
 	./tests/test_mempool_policy
+	./tests/test_mempool_cluster
 	./tests/test_msg_sign
 	./tests/test_net_policy
 	./tests/test_private_broadcast
@@ -3564,11 +3712,14 @@ tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tes
 	./tests/test_ctl_dial
 	./tests/test_hdr_tree
 	./tests/test_dlc_rules
+	./tests/test_leg_close_labels
 	./tests/test_dial_memory
 	./tests/test_inflight
 	./tests/test_utxo_sizing
 	./tests/test_compact_policy
 	./tests/test_index_repair
+	./tests/test_index_runs
+	./tests/test_index_trail
 	./tests/test_bfilter_index
 	./tests/test_cfheaders_bounds
 	./tests/test_serve_rejects
@@ -3590,6 +3741,9 @@ tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tes
 	./tests/test_ir9_tapscript_policy
 	./tests/test_ir5_sighash_cache
 	./tests/test_txtxid
+	./tests/test_mempool_journal
+	./tests/test_mempool_depart_reasons
+	./tests/test_mempool_sequence
 	./tests/test_mempool_persist
 	./tests/test_pubkey
 	./tests/test_sighash
@@ -3678,9 +3832,13 @@ tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tes
 	./tests/test_rpc18_ipv6
 	./tests/test_rpc_whitelist
 	./tests/test_rpc_chain
+	./tests/test_rpc_chain_growth
+	./tests/test_rpc_chaintxstats
+	./tests/test_rpc_responsive
 	./tests/test_zmq_ring
 	./tests/test_zmq_bind
 	./tests/test_zmq_thread
+	./tests/test_zmq_queue
 	./tests/test_rpc_start_policy
 	./tests/test_rpc_json_depth
 	./tests/test_txrecon
@@ -3722,6 +3880,7 @@ tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tes
 	./tests/test_rpc_signraw
 	./tests/test_rpc_miniscript_sign
 	./tests/test_rpc_node
+	./tests/test_rpc_chunk_scale
 	./tests/test_rpc_core_fields
 	./tests/test_rest
 	./tests/test_rpc_esplora
@@ -3756,6 +3915,8 @@ tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tes
 	./tests/test_shared
 	./tests/test_shared2
 	./tests/test_shared_stress
+	./tests/test_frontier_append
+	./tests/test_append_unshared_frontier
 	./tests/test_idx
 	./tests/test_serve
 	./tests/test_serve_violation
@@ -3779,7 +3940,9 @@ tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tes
 	./tests/test_stale_tip
 	./tests/test_peer_timeout
 	./tests/test_txann
+	./tests/test_tx_handoff
 	./tests/test_inbound_evict
+	./tests/test_inbound_rate
 	./tests/test_anchors
 	./tests/test_ibd_pipeline
 	./tests/test_banlist_persist
@@ -3815,6 +3978,7 @@ tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tes
 	./tests/test_verify_p2sh
 	./tests/test_bip30
 	./tests/test_bip30_daemon
+	./tests/test_stop_waits_for_worker
 	./tests/test_bip30_overwrite
 	./tests/test_utxo_unspendable
 	./tests/test_txv_parse_diff $(CORE_BENCH_BLOCK)
@@ -3875,6 +4039,7 @@ tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tes
 	./tests/test_utxo_catchup_timing
 	./tests/test_utxo_catchup_bounded
 	./tests/test_dlc_interleave
+	./tests/test_dlc_wire_bytes
 	./tests/test_utxo_crash_recovery
 	./tests/test_utxo_crash_recovery_bulk
 	./tests/test_cross_tx_verify

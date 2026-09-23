@@ -66,6 +66,7 @@ u32 net_magic = 0xd9b4bef9u;
 u8 g_v2_active[V2_FD_MAX];
 
 void *g_p2p_write_hook;   /* void (*)(int fd, u32 plen, const char *cmd, u32 cmdlen) */
+void *g_p2p_read_hook;    /* void (*)(int fd, const char *cmd, u32 announced)  -- the receive hook the x86 p2p_read wrapper fires (2026-09 merge) */
 long (*g_v2_hook_write)(int, const char *, u32, const void *, u64);
 long (*g_v2_hook_read)(int, char cmd_out[12], void *, u64, u64);
 
@@ -215,17 +216,33 @@ long p2p_write(int fd, const char *cmd, u32 cmdlen, const void *payload, u64 ple
  * p2p_read(fd, cmd_out[12], payload, cap, plen_out) -> 1 ok / 0 eof / -1 err
  *                                                           / -2 trunc / -3 oversize
  * ------------------------------------------------------------------------- */
+static long p2p_read_v1(int fd, char cmd_out[12], void *payload, u64 cap, unsigned *plen_out);
 long p2p_read(int fd, char cmd_out[12], void *payload, u64 cap, unsigned *plen_out)
 {
+    long r;
     if ((unsigned)fd < V2_FD_MAX && g_v2_active[fd]) {
         if (g_v2_hook_read) {
             long (*fn)(int, char *, void *, u64, u64) =
                 (long (*)(int, char *, void *, u64, u64))g_v2_hook_read;
             /* x86 tail-calls with the ARGUMENTS UNMOVED: 5th arg is the
              * plen_out pointer itself, not *plen_out. */
-            return fn(fd, cmd_out, payload, cap, (u64)plen_out);
+            r = fn(fd, cmd_out, payload, cap, (u64)plen_out);
+        } else {
+            r = p2p_read_v1(fd, cmd_out, payload, cap, plen_out);
         }
+    } else {
+        r = p2p_read_v1(fd, cmd_out, payload, cap, plen_out);
     }
+    /* the receive hook (the x86 p2p_read wrapper, 2026-09 merge): after a
+     * frame is IN (1 = whole, -2 = truncated past cap), report fd, command
+     * and the ANNOUNCED payload length (*plen_out is set on both paths). */
+    if ((r == 1 || r == -2) && g_p2p_read_hook)
+        ((void (*)(int, const char *, unsigned))g_p2p_read_hook)(fd, cmd_out, *plen_out);
+    return r;
+}
+
+static long p2p_read_v1(int fd, char cmd_out[12], void *payload, u64 cap, unsigned *plen_out)
+{
     u8 hdr[24];
     if (fd_read_full(fd, hdr, 24) != 24) return -1;
     u32 magic;

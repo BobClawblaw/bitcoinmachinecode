@@ -533,8 +533,19 @@ parity docs. Real tooling batches: electrs, python-bitcoinrpc's `batch_`.)*
 `active_commands` is a one-element array naming `getrpcinfo` itself. That is
 not a simplification: the RPC server accepts and services one connection at a
 time on a single thread, so while `getrpcinfo` runs it is necessarily the
-only active command. `logpath` resolves the bare `bitcoind.log` the daemon
-opens against the datadir it runs in, so it is the real path.
+only active command. `logpath` is the name the daemon actually opened its
+debug log as, resolved against the chain directory it `chdir()`s into:
+`debug.log` by default (Core's `DEFAULT_DEBUGLOGFILE`), or whatever
+`-debuglogfile=` set, reported as-is when that is an absolute path — which
+includes `-debuglogfile=0`, where the daemon opens `/dev/null`.
+
+Until 2026-09-17 this field was the string `bitcoind.log` hardcoded in
+`rpc_commands.c`, a name the daemon stopped using on 2026-09-06 when the
+default became Core's; it named a file that did not exist and ignored
+`-debuglogfile=` entirely. `rpc_commands.o` links into targets that have no
+daemon, so `main.c` pushes the resolved name across with `rpc_set_logpath()`
+— the same seam as `wallet_pass_set_file()` — rather than either side
+referencing the other.
 
 ### `logging` reports this node's kinds, and refuses to pretend they toggle
 `node_log.asm` emits eight fixed kinds — INFO, HSHK, HDRS, BLOCK, CONS,
@@ -994,6 +1005,13 @@ follow the tip. `txindex=1` in the config therefore still changes nothing,
 and now says exactly that rather than claiming the feature is absent.
 Incremental maintenance is the obvious next step.
 
+> **Superseded 2026-09-16.** Both halves of that limit are gone. The tail
+> (slice 20, below) made the index follow the tip, and the trailing builder
+> now makes the BASE during the sync too: the index is a set of sorted runs
+> the daemon builds behind the applied height from the first blocks on, so
+> `txindex=1` means what it means in Core and nothing is built afterwards.
+> See `docs/devlog/INDEX_RUNS.md`.
+
 ## Slice 19 — ZMQ notifications — (2026-08-26)
 `zmqpubhashblock` / `zmqpubhashtx` / `zmqpubrawblock` / `zmqpubrawtx` in
 bitcoin.conf now work, speaking to any libzmq subscriber. This is the
@@ -1041,14 +1059,21 @@ real-block check below and reading them against Core's own output.
 `tests/zmq_realblock_check` now asserts, for real archived blocks, that
 hex(published bytes) equals Core's `getblockhash` string exactly.
 
-### What refuses, and why
-`zmqpubsequence` is refused at config parse, loudly. Core's `sequence`
-topic exists to track mempool MEMBERSHIP — adds and removes. This node has
+### What refused, and why (until 2026-09-19)
+`zmqpubsequence` was refused at config parse, loudly. Core's `sequence`
+topic exists to track mempool MEMBERSHIP — adds and removes. This node had
 one clean choke point for "accepted" but none for "removed" (eviction,
-expiry and reorg each call mpool_del independently), so it could publish
-adds without removes: a subscriber's mempool model would grow forever and
-never learn it was wrong. A stream that quietly lies is worse than a
-refusal that explains itself.
+expiry and reorg each called mpool_del independently), so it could have
+published adds without removes: a subscriber's mempool model would grow
+forever and never learn it was wrong. A stream that quietly lies is worse
+than a refusal that explains itself.
+
+2026-09-19: implemented. Every insert and every removal now passes one hook
+in the policy layer; the reorg rebuild holds that hook and publishes its net
+change; the counter and event ring are shared across the node's processes
+and written under the pool lock. getrawmempool's `mempool_sequence` argument
+reads the same counter. See `docs/CORE_DIVERGENCES.md` ("ZMQ `sequence`")
+for the measured parity and what differs.
 
 Blocks are published from the tip-watch choke point in the worker, one
 notification per block even in catch-up bursts — a subscriber must see
@@ -1114,6 +1139,14 @@ getindexinfo and the covered-range refusal. The per-block walk lives once,
 in `daemon/txi_format.h`, shared by the offline builder and the tail
 writer.
 
+> **Extended 2026-09-16.** The base is no longer offline-only: the same
+> builder is spawned by the daemon over one height range at a time
+> (`daemon/index_trail.h`) and its output is a RUN of the index; the reader
+> asks every run before the tail, and the tail is rotated to drop what a new
+> run covers, so its linear scan is bounded by the run interval rather than
+> by "time since the last offline build". A tail with no base at all now
+> starts at genesis instead of disabling itself.
+
 ## Slice 21 — gettxout answers, the wallet view, and submitpackage — (2026-08-27)
 
 Three RPCs that were answering the wrong thing, or nothing, now answer.
@@ -1167,7 +1200,7 @@ With no completed rescan these now ERROR rather than answering `0.00000000`:
 
 ### submitpackage
 Real, in Core's shape: `package_msg`, `tx-results` keyed by wtxid with
-`txid` / `vsize` / `vsize_bip141` / `fees{base, effective-feerate,
+`txid` / `vsize` / `fees{base, effective-feerate,
 effective-includes}` / `error`, and Core's own `package-not-validated` for
 members that never got an individual verdict. `replaced-transactions` is
 absent, which is Core's convention (the field is optional there); this node
@@ -1235,11 +1268,19 @@ consensus and policy treatment on the way back in. Core re-validates on load
 too — a dump is a hint about what was interesting, never a licence to skip
 checks.
 
-**Not restored**, stated rather than glossed: entry times and fee deltas (a
-re-admitted transaction gets a fresh time, and there is no
-`prioritisetransaction` path to replay a delta into), and the unbroadcast
-set, which this node does not track because `sendrawtransaction` relays to
-every live leg immediately.
+**Entry times ARE restored as of 2026-09-16.** They were not, and a
+re-admitted transaction got a fresh stamp: every restart reset the pool's
+sense of age, so `-mempoolexpiry` began each transaction's 336-hour clock
+again and the departure journal reported `waited: 1` for transactions that
+had in fact been waiting for hours. The value is vetted rather than trusted —
+`mempool.dat` is read at startup before anything has checked it, and this
+field is an input to expiry, so a time in the future or past the expiry window
+is refused and the fresh stamp stands (`mempool_restore_accept_time`).
+
+**Still not restored**, stated rather than glossed: fee deltas (there is no
+`prioritisetransaction` path to replay one into) and the unbroadcast set,
+which this node does not track because `sendrawtransaction` relays to every
+live leg immediately.
 
 Verified on the live mainnet node: a 284,485-byte dump of 184 real
 transactions that an independent parser walks to exactly the file length,

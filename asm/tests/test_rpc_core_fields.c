@@ -34,12 +34,28 @@ static int declared_extension(const char* m, const char* k){
            (!strcmp(k, "bmc_build_commit") || !strcmp(k, "bmc_build_dirty"));
 }
 
+/* Fields Core returns that this node DELIBERATELY omits, each with its reason
+ * in docs/CORE_DIVERGENCES.md. The mirror of declared_extension: short, named,
+ * and pinned below so it cannot grow quietly.
+ *   getchainstates: coins_db_cache_bytes / coins_tip_cache_bytes size a
+ *   LevelDB block cache and a CCoinsViewCache; this node has neither (its
+ *   UTXO set is an LSM with a write-buffer memtable and no read cache). */
+static int declared_omission(const char* m, const char* k){
+    return !strcmp(m, "getchainstates.chainstates[0]") &&
+           (!strcmp(k, "coins_db_cache_bytes") || !strcmp(k, "coins_tip_cache_bytes"));
+}
+static int fixture_has(rj_val* v, const char* m, const char* k){
+    rj_val* a = rj_obj_get(v, m);
+    if (a) for (unsigned j = 0; j < a->nitems; j++)
+        if (a->items[j]->str && !strcmp(a->items[j]->str, k)) return 1;
+    return 0;
+}
+
 /* Fields Core emits CONDITIONALLY, which a fixture taken at one instant cannot
  * tell from mandatory ones. Each is named with its condition so this list
  * cannot quietly become an excuse. */
 static int conditional(const char* m, const char* k){
     if (!strcmp(m, "getpeerinfo")){
-        if (!strcmp(k, "last_block") || !strcmp(k, "last_transaction")) return 1;
         if (!strcmp(k, "minping") || !strcmp(k, "pingtime") || !strcmp(k, "pingwait")) return 1;
         if (!strcmp(k, "addrlocal") || !strcmp(k, "addrbind")) return 1;
     }
@@ -127,6 +143,31 @@ int main(int argc, char** argv){
       ck("getblock's captured set HAS coinbase_tx (the field an audit deleted "
          "on the premise Core has no such member)", has_cb); }
 
+    /* 2026-09-18: three answers the v31.99 oracle gave wrongly, each now held
+     * by the v31.1 capture. getmempoolentry HAS bip125-replaceable and has
+     * neither vsize_adjusted nor vsize_bip141; taproot IS a listed deployment
+     * (bip9), after testdummy on regtest; and getchainstates' cache fields are
+     * real v31.1 fields, so their absence here must stay a declared one. */
+    ck("getmempoolentry's fixture has bip125-replaceable (v31.1 has it)",
+       fixture_has(v, "getmempoolentry", "bip125-replaceable"));
+    ck("getmempoolentry's fixture has chunkweight and fees.chunk",
+       fixture_has(v, "getmempoolentry", "chunkweight") && fixture_has(v, "getmempoolentry.fees", "chunk"));
+    ck("getmempoolentry's fixture has NO vsize_adjusted / vsize_bip141 (v31.99-only)",
+       rj_obj_get(v, "getmempoolentry") && !fixture_has(v, "getmempoolentry", "vsize_adjusted") &&
+       !fixture_has(v, "getmempoolentry", "vsize_bip141"));
+    { rj_val* d = rj_obj_get(v, "getdeploymentinfo.deployments");
+      ck("regtest deployments end testdummy, taproot -- in Core's order",
+         d && d->nitems >= 2 && d->items[d->nitems-2]->str && !strcmp(d->items[d->nitems-2]->str, "testdummy") &&
+         d->items[d->nitems-1]->str && !strcmp(d->items[d->nitems-1]->str, "taproot")); }
+    ck("getchainstates' chainstate has both cache fields in v31.1",
+       fixture_has(v, "getchainstates.chainstates[0]", "coins_db_cache_bytes") &&
+       fixture_has(v, "getchainstates.chainstates[0]", "coins_tip_cache_bytes"));
+    ck("...and both are DECLARED omissions here, nothing else in that object is",
+       declared_omission("getchainstates.chainstates[0]", "coins_db_cache_bytes") &&
+       declared_omission("getchainstates.chainstates[0]", "coins_tip_cache_bytes") &&
+       !declared_omission("getchainstates.chainstates[0]", "bestblockhash") &&
+       !declared_omission("getmempoolentry", "bip125-replaceable"));
+
     /* the two policy helpers above are rules, and a rule nothing exercises
      * rots. Pin the shape of each. */
     ck("getnetworkinfo's two bmc_ keys are declared extensions",
@@ -136,8 +177,13 @@ int main(int argc, char** argv){
        !declared_extension("getpeerinfo", "bmc_download_worker") &&
        !declared_extension("getnetworkinfo", "anything_else"));
     ck("getpeerinfo's omitted-until-known fields are marked conditional",
-       conditional("getpeerinfo", "last_block") && conditional("getpeerinfo", "minping"));
+       conditional("getpeerinfo", "addrlocal") && conditional("getpeerinfo", "minping"));
+    /* last_block and last_transaction were listed as conditional, and that
+     * excused the node omitting them at 0. Core v31.1 pushes both for every
+     * peer (rpc/net.cpp), 0 when nothing has arrived. 2026-09-18. */
     ck("a mandatory field is NOT marked conditional",
+       !conditional("getpeerinfo", "last_block") &&
+       !conditional("getpeerinfo", "last_transaction") &&
        !conditional("getpeerinfo", "connection_type") &&
        !conditional("getmempoolinfo", "limitclustercount"));
 

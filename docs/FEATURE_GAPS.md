@@ -317,6 +317,20 @@ tables and the writers themselves.
   the prose outlived that correction by another week. Documentation that
   explains a deliberate refusal ages exactly like the refusal string does.)*
 
+- **Esplora `/scripthash/*`** — refuses BY DESIGN, with a 501 that says why.
+  Esplora keys these on `sha256(scriptPubKey)`; this node's address index is
+  keyed on `(type_tag, hash)` — the hash160 or the 32-byte witness program —
+  and sha256 does not invert. Serving the route therefore needs a SECOND index
+  mapping `sha256(spk)` back to an address key, built over the 200 GB address
+  history and maintained alongside it.
+  That is real cost, and the consumer it exists for is not the one in use:
+  mempool.space's own backend calls `/address/*` and never `/scripthash/*`
+  (checked against `backend/src/api/bitcoin/esplora-api.ts`). It matters only
+  to Electrum-style clients pointed at the facade. Refusing with an
+  explanation is better than a partial implementation that answers some
+  scripthashes and silently misses others, which is what any shortcut here
+  would produce. Revisit if such a client is actually wanted.
+
 - **`assumeutxo` / `loadtxoutset`** — refuses BY DESIGN. Every parity claim
   this project makes rests on locally-validated coins, and importing a
   snapshot would hollow that out. `dumptxoutset` is real (proven at full
@@ -328,7 +342,8 @@ tables and the writers themselves.
   read unconditionally; v2's obfuscation key is random so no writer can
   produce a byte-comparable artifact) and read both. `importmempool`
   re-submits each transaction through the normal admission path. Not
-  restored: entry times, fee deltas, and the unbroadcast set — each stated at
+  restored: fee deltas and the unbroadcast set (entry times ARE restored as
+  of 2026-09-16, vetted against the expiry window) — each stated at
   the call site. *(This item was missing from the 2026-08-27 audit of this
   list, which tracked it only in `docs/RPC_LIVE_NODE.md`. The audit was more
   accurate than what it replaced but not complete.)*
@@ -501,6 +516,104 @@ either state.
 tested but called from nowhere; wiring the save path touches shutdown, which
 must stay fast for the SIGKILL window. `fixedseeds` gates a hardcoded IP seed
 list this node does not have. All three stay on the warning list.
+
+- **`addnode=<host>` / `connect=<host>` in bitcoin.conf print `"is not a usable
+  number -- reading it as 0"` at boot.** Found 2026-09-16 on a probe node. The
+  PARSE IS FINE: both keys go through `cfg_addlist` and the host is applied
+  (`[config] src: ... addnode=1`, and the node dialled it). The warning comes
+  from `nodecfg_strtoll`, which some generic pass runs over every value before
+  the key is dispatched, so a host-valued key trips the "not a number" check.
+  A boot line that says a setting was read as 0 when it was applied correctly
+  is a lying instrument; either skip list-valued keys in that pass or parse
+  lazily. Not fixed in #237.
+
+- ~~**Four indexes wait for IBD to finish**~~ — **CLOSED 2026-09-16.** txindex,
+  txospenderindex, the address history and the block filters are all built by
+  the daemon during the sync, as sorted runs trailing the applied height
+  (`docs/devlog/INDEX_RUNS.md`); the coinstats index no longer invalidates at
+  the BIP30 overwrite. A fresh sync ends with every index current and the same
+  trailing builders keep it so.
+
+- ~~**getpeerinfo shows dead peers during initial block download**~~ —
+  **FIXED 2026-09-17** (reported as "3 dead peers" from the monitor, and
+  misdiagnosed twice before it was understood).
+
+  The symptom: three entries reading "connected 54m, last recv 54.3m, 1.3 KB"
+  while the download peers were at 20 s and gigabytes.
+
+  Three distinct causes, each found only by checking the node against the
+  kernel instead of reasoning from the code:
+
+  1. **The peer-table publisher did not run during IBD.** It was inline in
+     `serve_download_worker`'s `for(;;)` loop; the node is in `dl_catchup`'s
+     loop while syncing. Every leg's bytes and last-activity froze at the
+     moment catch-up began: `getpeerinfo` claimed 1,412 bytes and 54 minutes
+     of silence for a socket the kernel showed at 391,956 bytes and 9.6
+     SECONDS since the last send. Closed legs were never retired at all.
+     Fixed by extracting `dl_publish_peer_table()` and calling it from both
+     loops. The tip is deliberately NOT published from the catch-up path --
+     doing so broke `test_dlc_interleave`'s bound, which caught it.
+  2. **A stale descriptor number counted as a live leg.** `mux_out_fd[i] >= 0`
+     only says the slot holds a number. `TCP_INFO` on it is the liveness test;
+     failure now retires the slot.
+  3. **A recycled descriptor published a stale address with another socket's
+     stats.** The number outlives the leg and the kernel hands it to the next
+     socket opened, so `TCP_INFO` succeeds on something unrelated. One entry
+     survived every republish this way. `getpeername` ties the number back to
+     the recorded address; a mismatch retires the slot.
+
+  Verified on run 26 mid-sync: entries 12, connections 12, ghosts **0** across
+  repeated samples, at 11.2 MB/s. Before: 5 of 15 entries had no socket in any
+  state.
+
+  **What this was NOT:** an idle-leg ping bug, which is how I first filed it
+  from `leg_ping_timed_out`'s predicate alone without checking whether the
+  sockets existed. `ss` showed zero sockets for all three addresses. You cannot
+  ping a leg that is not there, and one command separated the two.
+
+
+
+- ~~**Outbound leg slots churn about nine times an hour and almost no departure
+  is logged.**~~ — **WRONG, see "Update 2026-09-17 — leg churn: the nine-an-hour
+  figure was nine restarts" at the end of this file.** The 42 handshakes below
+  span NINE boots of the bench node, not one: they are each boot's initial
+  fill, and 36 of the 42 departures were the worker exiting because I was
+  restarting it to swap binaries. "Slot 0 nine times" was slot numbering
+  starting at 0 on every boot. I measured churn in a log I had churned myself.
+  The genuine defects the investigation did find — a hangup the sweep never
+  saw, and a leg stranded in a pass at the handover — are in that update.
+  Kept, struck through, because the measurement is instructive: **counting
+  events across a log without first counting its boots.**
+
+  The original claim, left as written:
+
+- **Outbound leg slots churn about nine times an hour and almost no departure
+  is logged.** Measured on run 26 mid-sync, 2026-09-17, one boot:
+
+  ```
+  handshakes : 42   across 32 distinct addresses
+  re-dials   : slot 0 -> 9x, slot 1 -> 9x, slot 2 -> 9x, slot 3 -> 6x, slot 4 -> 5x
+  closes logged : 1   ("theirs (revents 0x2001)")
+  legs alive    : 4
+  ```
+
+  41 of 42 departures have no logged reason, so it cannot be said whether the
+  peers hung up or the node dropped them. This is the same signature as the
+  production incident whose lesson was "leg closes need a named owner": a
+  slot-carried three-strike streak and a 60 s budget were closing healthy legs
+  silently, and eight were lost in twelve minutes before anyone could see it.
+
+  Noticed while looking at something else: an operator reported the relay legs
+  as dead peers because they show 0 B/s next to download peers pulling
+  megabytes a second. They were not dead -- they answer within 21-73 s and
+  carry 1 MB against the download path's 8.2 GB, which is what a relay leg
+  does during a sync. The legs are FINE; the churn is the question.
+
+  Do NOT "fix" this by dropping low-throughput legs faster: an absolute
+  32 KB/s eviction floor killed healthy early-chain peers for four benchmark
+  runs (see the thresholds entry). Any rule here has to be about liveness, and
+  the first step is making every close name its owner so the reasons can be
+  counted at all.
 
 ## Update 2026-08-30 — Erlay: a deliberate stopping point
 
@@ -1120,6 +1233,13 @@ Confirmed absent:
   `getzmqnotifications` dispatched. Core only exposes that method when built
   WITH zmq, which the census Core was not — so this is one method BEYOND the
   surface the census measured.
+  **2026-09-19 (MEM-22 closed):** until then a subscriber that could not take
+  a whole message was disconnected, and a 1-2 MB rawblock never fit the
+  ~256 KB socket buffer, so rawblock reached no one and every block dropped
+  every subscriber. The publisher now keeps a per-subscriber queue bounded
+  by `-zmqpub<topic>hwm` in MESSAGES and drops the new message (sequence gap,
+  connection kept) as libzmq does; one stated extra, a 512 MiB per-subscriber
+  byte ceiling — see `docs/CORE_DIVERGENCES.md`.
 - ~~**REST interface** (separate from JSON-RPC)~~ — **implemented 2026-09-08** (`rest=1`, `asm/rest.c`).
 - **UPnP / NAT-PMP** automatic port forwarding — zero hits.
 - ~~Addr self-advertisement~~ — **DONE 2026-08-26** (`daemon/addr_self.c`):
@@ -1423,8 +1543,8 @@ that served BIP157 before this change must now set it explicitly.
 | `zmqpubrawblockhwm` | Set publish raw block outbound message high water mark (default: 1000) | implemented |
 | `zmqpubrawtx` | Enable publish raw transaction in <address> | implemented |
 | `zmqpubrawtxhwm` | Set publish raw transaction outbound message high water mark (default: 1000) | implemented |
-| `zmqpubsequence` | Enable publish hash block and tx sequence in <address> | **REFUSED** (MEM-22, 2026-09-05: this said "implemented"; `node_config.c:950` rejects the option outright, and `zmq_pub.c` never publishes the topic. See the refusal's own comment for why: Core's `sequence` carries A/R alongside C/D, and this node has no single choke point for "removed" -- eviction, expiry and reorg each call `mpool_del` independently.) |
-| `zmqpubsequencehwm` | Set publish hash sequence message high water mark (default: 1000) | parsed, but inert -- the topic it sizes is refused (MEM-22) |
+| `zmqpubsequence` | Enable publish hash block and tx sequence in <address> | implemented (2026-09-19; REFUSED from 2026-09-05 until then, because removals had no single choke point). A/R with Core's mempool sequence, C/D per block, from one hook in the policy layer (`bitcoin_mempool_policy.c` g_seq_cb) staged into a MAP_SHARED ring under the pool lock (`daemon/mempool_seq.h`) and published by the worker. getrawmempool's `mempool_sequence` argument and REST `?mempool_sequence=true` answer from the same counter. Regtest differential against v31.1 (`validation/zmq_sequence_core_diff.py`): add, RBF, conflict-in-block, invalidate, reconsider and a one-step reorg identical event for event, sequence numbers included. Divergences: `docs/CORE_DIVERGENCES.md` ("ZMQ `sequence`"). |
+| `zmqpubsequencehwm` | Set publish hash sequence message high water mark (default: 1000) | implemented (sizes the `sequence` topic's per-subscriber queue, as for the other four) |
 ## Update 2026-09-01 — Miniscript and `musig()` descriptors
 
 Closed: **Miniscript** (`asm/miniscript.c/.h`, Core's `script/miniscript.h`
@@ -2307,3 +2427,157 @@ watch loop is meant to survive a transient read failure), with its `sudo dd
 if=/proc/<pid>/mem` root-read of live process memory stated at the top rather
 than discovered at the sudo prompt; `signer_core_diff.sh`'s `rm -rf $TMP` is
 quoted.
+
+## Update 2026-09-17 — leg churn: the nine-an-hour figure was nine restarts
+
+The entry above ("Outbound leg slots churn about nine times an hour and almost
+no departure is logged") counted 42 handshakes and read them as one boot's
+worth of churn. They are not. `/home/xian/bmc-run26/main/debug.log` holds
+**nine `[boot] logging to` lines** between 21:10Z and 00:04Z — another session
+was redeploying the bench binary — and the 42 handshakes are those nine boots'
+initial fills:
+
+```
+boot      1  2  3  4  5  6  7  8  9
+filled    5  3  4  3  3  5  7  6  6   = 42
+peers= at 5  3  4  3  3  5  7  6  --   (the [dl] shutting down line)
+```
+
+Each boot's fill count equals the leg count at its shutdown, so **36 of the 42
+departures were the worker exiting** — which logged nothing per leg, and is now
+logged as `closed ours/shutdown after <age>s`. Within a boot the log carried
+one `theirs (revents 0x2001)`, two `ours/ping-timeout`, and one background
+re-dial. The re-dials-per-slot table was slot *numbering* repeating across
+boots, not a slot changing hands.
+
+**What IS real, and was invisible in the log and in the counts.** On the ninth
+boot, six legs were filled at 00:04:59Z. At 00:30Z the worker still held six
+leg fds, but `ss` showed only ONE of them as an established connection: fds 49,
+70 and 76 were sockets the kernel had already torn down, held as live for up to
+24 minutes, and two more had just hit the 20-minute ping timeout. The
+`[dl] shutting down ... peers=N` count and `legs_live()` both count *held fds*,
+so a dead socket counts as a live leg — which is why the earlier reading of
+"legs alive: 4" agreed with a log that said nothing.
+
+The cause is placement, not policy: the POLLRDHUP/POLLHUP liveness check lived
+only in the rotation, and **the rotation does not run while the parallel
+downloader owns the loop** — hours on a mid-sync node. The only thing running
+in that window is `legs_sweep_except`, which pinged and relayed but never asked
+whether the socket was still there. The check now runs in the sweep too
+(`leg_check_gone`), so a hangup is named within seconds of the FIN instead of
+waiting 20 minutes for a ping timeout or the end of the download.
+
+**Still open after this:** the slot is *closed* in the sweep but not re-dialled
+until the rotation resumes, because the sweep has no peer pool in scope. On a
+long parallel download the slot therefore stays empty — logged now, rather than
+occupied by a corpse.
+
+**Not done, deliberately:** no throughput rule of any kind. A relay leg at
+0 B/s beside a download peer at 11 MB/s is a healthy relay leg; the 32 KB/s
+eviction floor that killed early-chain peers for four benchmark runs stays
+dead, and `tests/test_leg_close_labels` fails if a byte-rate test appears in
+the liveness path.
+
+### The stranded pass (found the same day, from a live socket)
+
+Leg 0 of run 26 held 92 KB of **unread** data, 103 KB twenty seconds later,
+with `lastsend` 0 s — the node was writing to a peer whose receive queue it
+had stopped draining, `lastrecv` climbing 89 → 101 → 113 → 142 s while every
+download peer sat at 3–5 s. Production's sockets on the same box sit at 2–3 KB.
+
+`leg_pass_poll()` — the only reader of a pass helper's report — is called from
+exactly one place, the download worker's rotation, and `dl_catchup()` is called
+from that same rotation and does not return for hours. `legs_sweep_except()`,
+the only thing running during the download, skips every slot with
+`leg_pass_busy(k)`. A leg whose pass was outstanding at the handover is
+therefore not read, not pinged and not checked for the rest of the download,
+and the peer resets a connection nobody is reading. On the ninth boot the three
+legs that had a block announced at 00:06:11Z (`[tip] … its pass runs next`) are
+exactly the three whose sockets were gone by 00:30Z with no logged close; the
+two that never announced survived to their 20-minute ping timeout.
+
+Fixed by draining the reports before the handover, bounded by the pass budget,
+sweeping the legs while waiting, and logging the wait.
+
+**Unresolved:** leg 0 still had pings going out and pongs coming back (12 sent,
+4 answered in 45 minutes), which is not what a pass-busy slot looks like — so
+its own backlog may be a drain-rate problem in `txrelay_poll_leg` rather than
+the stranded pass. `g_pass[]` could not be read on the live node. The new close
+lines separate the two on the next run.
+
+**Untested hypothesis, recorded:** the dlc workers inherit the leg fds (fd 32
+was held by ten processes), so a leg the parent closes could stay ESTABLISHED
+while a child holds the inherited fd, and the peer would never see the FIN.
+That is the opposite of what happened to the three legs here — their sockets
+were gone from the kernel while the parent still held the fd — but it remains
+worth a look.
+
+## Update 2026-09-17 — a failing test nobody was running
+
+`test_rpc_esplora_stress` fails, and has been failing since at least
+`c6f779c7` (2026-09-16), which is before any of that day's RPC performance
+work. It was found only because the concurrency change (PR #255) prompted
+running a suite that every earlier sweep that day had skipped.
+
+The assertion:
+
+```
+FAIL stats: no txid is resolved -- at most 2 RPC calls for a 60,000-event
+            address (was one getblock per block: 44,001)
+  /address/bc1qaddrA -> 200, 284 bytes, 371 rpc calls, 0.41s
+```
+
+The Esplora `/address` route answers **address statistics** — funded and spent
+counts and sums. It does not return transaction ids, so it should never need
+to resolve one, and the test pins that at "no more than 2 dispatches". It is
+making 371. The route is answering correctly and quickly (284 bytes, 0.41 s on
+a 60,000-event fixture), so this is an efficiency assertion, not a wrong
+answer — but it is the assertion that stops the route regressing back to the
+44,001-call shape it was explicitly fixed out of.
+
+Bisected across `c6f779c7`, `888a3b54`, `5c5a166a`, `f1426e8c` and `4ea82c1b`
+— identical failure at every one, so it predates the address-latency work
+(#246), the pagination (#247) and the concurrency change (#255).
+
+**DIAGNOSED AND CLOSED 2026-09-18.** It was never the route. The route
+resolves no txids and costs exactly **one** RPC call (`getrawmempool`) once the
+mempool cache is warm; the 371 were the *test* paying a cache catch-up inside
+the measured request.
+
+`mp_view_of` does an inline `mp_refresh_locked` slice when no background
+refresher is running. A slice stops at whichever comes first,
+`MP_REFRESH_SLICE` (400) transactions or `MP_REFRESH_MS` (400) milliseconds --
+and at the stress size it is always the TIME, because the budget counts
+transactions while the cost is one `getrawtransaction` for the transaction plus
+one more per input whose parent is not already in the mempool (`mp_prevout`,
+which does not decrement the budget). The test pre-warmed with a fixed
+`for (i = 0; i < 30; i++)`, which does not finish 9,000 transactions, so the
+measured request paid the remainder: 365 calls in 0.41 s -- exactly
+`MP_REFRESH_MS`, the signature of a time-capped slice rather than a per-event
+loop.
+
+The size dependence is what confirms it. Same binary, same fixture, only the
+mempool size varied:
+
+| mempool | route cost |
+| --- | --- |
+| 200 txs | 1 call -- passes |
+| 1,000 txs | 1 call -- passes |
+| 9,000 txs | 365 calls, 0.41 s -- fails |
+
+The daemon never takes this path at all: `esplora_mp_start_refresher` sets
+`g_mp_refresher`, and `mp_view_of` then issues no RPC. The inline slice exists
+for processes with no refresher thread, which is every test.
+
+Fixed test-side: the pre-warm now loops until a refresh fetches nothing new (a
+refresh that finds no new transaction spends exactly one call, so that is the
+fixed point), with an iteration cap and a printed warning if it fails to
+converge -- so an under-warmed cache can never again be read as a route
+regression. At 9,000 transactions the route now measures 1 call.
+
+The assertion was checked to still bite: with `esp_hist_resolve` spliced into
+the `ns == 2` branch the route costs 51 calls and the test fails. It remains
+the guard against the 44,001-call shape.
+
+Effort: was "small to find, unknown to fix". Actual: the fix was five lines of
+test, and the bug was in the measurement.

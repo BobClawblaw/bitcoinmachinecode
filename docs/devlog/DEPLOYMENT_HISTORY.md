@@ -1170,3 +1170,103 @@ that would have hit any fresh sync of the live build.
   history base is being rebuilt (builder pid 1884083, rows 0..966124,
   attempt 1)". Pass 1 at ~1.7k blocks/s per worker.
 
+
+## 2026-09-18 21:16Z — `deploy-20260918a`: v31.1 RPC parity (PRs #269, #271)
+
+- **Why:** `getpeerinfo` never reported `addrlocal` and omitted
+  `last_block`/`last_transaction` at 0 (#269). Against the v31.1 release node
+  (RPC 8337), `getdeploymentinfo` lacked taproot and mempool entries lacked
+  `bip125-replaceable` while carrying two dev-build-only fields (#271). #270
+  (harness) and #266–#268 (archive frontier guard, `+44` position file number)
+  ride along; the previous deploy was `deploy-20260916h`.
+- **What:** `main` at `323e657b`, full gate green on the merged tree
+  (MAKE_EXIT=0). `cp -a daemon/bmcbitcoind daemon/bmcbitcoind.deploy-20260918a`,
+  atomic relink of `bmcbitcoind.live`, `sudo systemctl restart bmcbitcoind`.
+- **The first start failed, and systemd retried it.** The parent exited at
+  21:16:18 while its download worker (pid 24243, SIGTERM forwarded at
+  18.850) still held the datadir lock. The new process hit `FATAL: cannot obtain
+  a lock` at 21:16:19. `Restart=on-failure` started it again at 21:16:29, and
+  that start succeeded. This is the 2026-09-06 lesson again ("wait for the
+  WORKER, not the parent"): the service reports stopped before its worker has
+  released the lock. Not fixed here.
+- **Verified live:**
+  - `bmc_build_commit 323e657b`, `dirty false`, at the tip (967,610).
+  - The UTXO engine reloaded at 967,610 with `live=165258639`, exactly the
+    shutdown's `txouts=`.
+  - The mempool reloaded 78,256 of 78,278 saved transactions (21:23:41).
+  - `getpeerinfo`: 4 of 6 peers carry `addrlocal` (the other two sent Core's
+    empty `addr_recv`), and every entry has both times and both byte maps.
+  - The v31.1 field diff now matches on `getdeploymentinfo` and
+    `bip125-replaceable`.
+- **Still open, found by the same diff:** `chunkweight`/`fees.chunk` are
+  missing on every mempool entry that belongs to a multi-transaction cluster
+  (71,710 of 79,626); only singletons carry them. Core reports both on every
+  entry. This predates the deploy.
+
+## 2026-09-19 11:50Z — `deploy-20260919a`: the 2026-09-19 batches (PRs #273–#280)
+
+- **What:** `main` at `d66005c9`, full gate green on the merged tree (MAKE_EXIT=0,
+  all six new suites ran). Binary and all five index helpers from the same build.
+  `cp -a`, atomic relink of `bmcbitcoind.live`, then `systemctl stop`, a wait until no
+  process ran the old binary, and `systemctl start`. The old build stopped in under
+  1 s with nothing left over. The new one started first time (`NRestarts=0`) and
+  answered RPC 102 s later.
+- **Config, same step** (backup `bitcoin.conf.bak-20260919-deploy`): `txindex=1` and
+  `txospenderindex=1`. #275 gates each index on its key and production had neither
+  line, though the Esplora facade serves /tx and outspends from both.
+  `zmqpubsequence=tcp://127.0.0.1:28334`, which #278 implemented.
+- **Verified live:**
+  - `bmc_build_commit d66005c9`, not dirty, at the tip (967,700); all five indexes synced.
+  - `getzmqnotifications`: five topics, hwm 1000 each.
+  - The index tails resumed from their runs: txindex base 964,174, txospender base
+    966,038.
+  - No false "not a usable number" warnings (#274).
+  - RPC: uptime 2 ms, getblockcount 1 ms, getblockchaininfo 1 ms, getindexinfo
+    18 ms. getchaintxstats took 22.9 s on its first call (a cold build of the
+    per-height array) and 1 ms after that (#280).
+  - `getrawmempool false true` returns `mempool_sequence`.
+  - getpeerinfo: 5 of 6 peers carry addrlocal, every entry has
+    last_block/last_transaction, and all 6 show bytessent > 0.
+  - A real libzmq subscriber on all three sockets got a 1,532,344-byte rawblock
+    whose header hash equals its hashblock (#274; before this, rawblock was never
+    delivered), and a `sequence` stream of A 721 / R 4 / C 1 with 0 per-topic gaps.
+- **Found:** `[zmq] notification ring overrun: N transaction(s) not published`.
+  Mempool accepts that never reach hashtx/rawtx/sequence. This predates the deploy:
+  the old build logged 77,683 since 01:05, a few at a time in steady state. The new
+  one dropped 56,243 during the boot reload of mempool.dat, when 78k transactions
+  enter at once.
+
+## 2026-09-19 13:46Z — `deploy-20260919b`: ZMQ notifications no longer lost (PR #283)
+
+- **What:** `main` at `e8152f88`, full gate green (MAKE_EXIT=0).
+  Stop, wait for every old process, start. `NRestarts=0`.
+- **The first production stop under #276/#279's shutdown code.** The fold worker
+  stopped cleanly ("coinstats.dat through height 967712"). The parent saw the
+  worker still holding the lock on its way out, waited 0.1 s for its exit, and
+  only then released it.
+- **Verified live:** a real libzmq subscriber, connected through the
+  mempool.dat reload (72,366 transactions), received 74,280 `hashtx` and
+  74,280 `sequence` A events: the same set, 0 gaps, and 0 "ring overrun" lines.
+  The previous build had dropped 56,243 notifications during the same kind of
+  reload.
+- Timed to land before run 27 ended, so the restart fell on run 27's last minutes
+  and not on the Core rerun's first.
+
+## 2026-09-19 18:55Z — `deploy-20260919c`: log literal lengths (PR #287)
+
+- **What:** `main` at `3f02898a`. Its tree is identical to the gated #287 branch
+  (MAKE_EXIT=0), so it was rebuilt to stamp the commit, not re-gated.
+  Stop at 18:54:57Z, all old processes gone 1 s later, start 18:54:58Z, RPC up
+  at 18:56:32Z. `NRestarts=0`.
+- **Verified live:**
+  - `bmc_build_commit 3f02898a`, not dirty, at the tip (967,731).
+  - 5 indexes synced; 5 ZMQ topics.
+  - No FATAL and no false config warnings.
+  - Production's debug.log has 0 NUL bytes.
+- **Effect on the Core v31.1 rerun, which was running on a different NVMe:**
+  - Its blocks per minute were 443 at 18:56, against 507 to 1,465 (mean 889) in
+    the 15 minutes before. From 18:57 it was at its usual pace while
+    production's mempool reload ran (to 19:01:18).
+  - At most ~30 to 40 s of Core time, within Core's own minute-to-minute noise
+    (it did 507 at 18:34 with no restart).
+  - Recorded in docs/reports/2026-09-18-run27/README.md.

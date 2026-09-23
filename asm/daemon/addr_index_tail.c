@@ -52,6 +52,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include "addr_index_fmt.h"
 /* the address history base (daemon/addr_hist.c), WEAK: the tail's own tests
  * and the binaries that link the tail without the facade still build; the
@@ -203,6 +204,47 @@ static int axt_undo_cb_fn(void* ctxv, const u8* txid, u32 index, u64 value,
         }
     }
     return 1;
+}
+
+/* ---- rotation (2026-09-16) ------------------------------------------------
+ * A history run reaching `to` was committed by the trailing builder: the
+ * journal's records at or below it are now in a sorted run and are dropped
+ * by rewriting the file (records are height-ordered, so this is a prefix).
+ * The daemon's readers open the file fresh per query; the RPC parent maps
+ * it and remaps on a size change. Without this the journal held the whole
+ * chain -- 165 GB at 43% of mainnet on run 24 -- and every query scanned
+ * all of it. */
+void axt_runs_advanced(long to){
+    if (g_fd < 0) return;
+    struct stat sb; if (fstat(g_fd, &sb) != 0) return;
+    long nrec = (long)(sb.st_size / AXF_TAIL_REC);
+    if (nrec == 0) return;
+    enum { CHUNK = 2048 };
+    u8* buf = malloc((size_t)CHUNK * AXF_TAIL_REC); if (!buf) return;
+    long keep_from = nrec;
+    for (long i = 0; i < nrec && keep_from == nrec; i += CHUNK){
+        long n = nrec - i < CHUNK ? nrec - i : CHUNK;
+        if (pread(g_fd, buf, (size_t)n * AXF_TAIL_REC, (off_t)i * AXF_TAIL_REC) != n * AXF_TAIL_REC) break;
+        for (long k = 0; k < n; k++){
+            if ((long)axt_rec_height(buf + k * AXF_TAIL_REC) > to){ keep_from = i + k; break; }
+        }
+    }
+    if (keep_from == 0){ free(buf); return; }
+    const char* tmp = AXF_TAIL_FILE ".rot";
+    int nfd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (nfd < 0){ free(buf); return; }
+    int ok = 1;
+    for (long i = keep_from; i < nrec && ok; i += CHUNK){
+        long n = nrec - i < CHUNK ? nrec - i : CHUNK;
+        if (pread(g_fd, buf, (size_t)n * AXF_TAIL_REC, (off_t)i * AXF_TAIL_REC) != n * AXF_TAIL_REC){ ok = 0; break; }
+        if (write(nfd, buf, (size_t)n * AXF_TAIL_REC) != n * AXF_TAIL_REC) ok = 0;
+    }
+    free(buf);
+    if (!ok || fsync(nfd) != 0 || close(nfd) != 0 || rename(tmp, AXF_TAIL_FILE) != 0){ unlink(tmp); return; }
+    int fd = open(AXF_TAIL_FILE, O_RDWR | O_APPEND);
+    if (fd < 0) return;
+    close(g_fd); g_fd = fd;
+    fprintf(stderr, "[addrindex] journal rotated: %ld records folded into history runs (to %ld), %ld kept\n", keep_from, to, nrec - keep_from);
 }
 
 /* Append one block's records as ONE write. 1 ok / 0 failed. Height 0 is a
@@ -478,12 +520,35 @@ long axt_read_address(int type, const u8 hash[32],
  * value, height. Returns the number delivered, -1 without a journal. */
 long axt_read_events(int type, const u8 hash[32], long min_height,
                      int (*cb)(void* ctx, int op, const u8 txid[32], u32 vout, u64 value, u32 height), void* ctx){
+    /* This used to malloc() the WHOLE journal and pread() it in, on every
+     * single query: measured on run 26 at the tip, 12.59 GB allocated and
+     * copied per getaddressbalance/getaddresstxids call, and the journal keeps
+     * growing until the next history run rotates it (bmc.indexrunblocks=20000
+     * -> roughly 33 GB before the next rotation). Besides the copy it evicted
+     * the page cache that the history runs and the block archive depend on, so
+     * two address queries in a row made each other slower.
+     *
+     * A read-only shared mapping scans exactly the same bytes with no
+     * allocation and no copy, and leaves the page cache to the kernel. The
+     * mapping is kept between calls and refreshed when the file grows -- the
+     * daemon appends to this journal at the block choke point, so the size is
+     * what changes; only whole records are ever scanned. */
+    static int      map_fd = -1;
+    static u8*      map_p;
+    static size_t   map_sz;
     int fd = open(AXF_TAIL_FILE, O_RDONLY); if (fd < 0) return -1;
     struct stat sb; if (fstat(fd, &sb) != 0){ close(fd); return -1; }
     size_t sz = (size_t)(sb.st_size / AXF_TAIL_REC) * AXF_TAIL_REC;
-    u8* buf = sz ? malloc(sz) : 0;
-    if (sz && (!buf || pread(fd, buf, sz, 0) != (ssize_t)sz)){ free(buf); close(fd); return -1; }
-    close(fd);
+    if (sz != map_sz || map_fd < 0){
+        if (map_p){ munmap(map_p, map_sz); map_p = 0; }
+        if (map_fd >= 0){ close(map_fd); map_fd = -1; }
+        if (sz){
+            u8* m = mmap(0, sz, PROT_READ, MAP_SHARED, fd, 0);
+            if (m == MAP_FAILED){ close(fd); map_sz = 0; return -1; }
+            map_p = m; map_fd = fd; map_sz = sz;
+        } else { close(fd); map_sz = 0; }
+    } else close(fd);
+    const u8* buf = map_p;
     long n = 0;
     for (size_t off = 0; off + AXF_TAIL_REC <= sz; off += AXF_TAIL_REC){
         const u8* r = buf + off;
@@ -493,7 +558,6 @@ long axt_read_events(int type, const u8 hash[32], long min_height,
         if (cb && !cb(ctx, r[0], r + 34, vout, value, height)) break;
         n++;
     }
-    free(buf);
     return n;
 }
 

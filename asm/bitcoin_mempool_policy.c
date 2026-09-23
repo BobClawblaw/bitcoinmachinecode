@@ -57,6 +57,7 @@
  * both the structural mempool and this state are untouched.
  */
 
+#include "mempool_cluster.h"   /* the one linearization/chunking implementation */
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -465,11 +466,76 @@ void mpool_policy_set_pending_sigops(unsigned long long cost_x4){ mpol_pending_s
 void mpool_policy_set_bytespersigop(unsigned long long n){ mpol_bytes_per_sigop = n ? n : 20; }
 /* 2026-09-12: readable so the RPC layer can compute Core's sigops-ADJUSTED
  * weight, max(weight, sigop_cost * bytes_per_sigop) -- policy.cpp
- * GetSigOpsAdjustedWeight. getmempoolentry's vsize_adjusted and chunkweight are
- * both derived from it. */
+ * GetSigOpsAdjustedWeight. getmempoolentry's vsize (Core's sigops-adjusted
+ * entry size, 2026-09-18; it was a separate vsize_adjusted) and chunkweight
+ * are both derived from it. */
 unsigned long long mpool_policy_bytespersigop(void){ return mpol_bytes_per_sigop; }
 static void (*g_forget_cb)(const unsigned char txid[32]) = 0;
 void mpool_policy_set_forget_cb(void (*fn)(const unsigned char*)){ g_forget_cb = fn; }
+
+/* ---- the departure journal's hook (2026-09-16) ----------------------------
+ * g_forget_cb is told WHICH transaction left but not WHY, and the fee
+ * estimator (its only consumer until now) does not care. The mempool journal
+ * does: "evicted because the pool was full" and "mined" are the opposite
+ * answers to the question it exists to serve. Rather than widen the existing
+ * callback and its consumer, a second one carries the data every removal site
+ * already holds -- vsize and fee live in the node being torn down -- plus a
+ * reason the ENTRY POINTS set, because only they know it.
+ *
+ * The reason is per-process state, not a parameter threaded through a dozen
+ * internal helpers: the removal paths converge on remove_node and
+ * mpol_remove_marked from several directions and passing it down every one of
+ * them would touch far more code than it is worth. It is set on entry and
+ * restored on exit, so a nested removal (a package taking its descendants
+ * with it) cannot leave the wrong reason behind for the next caller. */
+static void (*g_depart_cb)(const unsigned char* txid, unsigned long long vsize,
+                           unsigned long long fee, int reason) = 0;
+void mpool_policy_set_depart_cb(void (*fn)(const unsigned char*, unsigned long long,
+                                           unsigned long long, int)){ g_depart_cb = fn; }
+static int g_depart_reason = 0;                 /* MPJ_* ; 0 = do not record */
+void mpool_policy_set_depart_reason(int r){ g_depart_reason = r; }
+int  mpool_policy_depart_reason(void){ return g_depart_reason; }
+
+/* ---- the mempool SEQUENCE hook (2026-09-19, Core -zmqpubsequence) ---------
+ * Core numbers every mempool add and every removal (m_sequence_number) and
+ * publishes 'A' for each add and 'R' for each removal EXCEPT a block's own
+ * transactions (txmempool.cpp removeUnchecked: BLOCK takes a number and
+ * publishes nothing). This hook is the one place both happen here: every
+ * insert is mpol_add_core's, and every removal is remove_node's or
+ * mpol_remove_marked's. kind: 'A' add, 'R' removed, 'M' mined (numbered,
+ * not published). Unlike the departure hook it is NOT gated on
+ * g_depart_reason -- a removal nobody labelled is still a removal, and a
+ * subscriber that missed it would hold a transaction the pool does not.
+ *
+ * ORDER, measured against Core rather than assumed: Core adds a transaction
+ * and THEN trims the pool (AcceptSingleTransaction -> LimitMempoolSize), so a
+ * newcomer's 'A' precedes the 'R's of what it pushed out, while the 'R's of
+ * what it REPLACED precede its 'A' (FinalizeSubpackage). This engine evicts
+ * BEFORE it stores (MEM-5/MEM-6, for reasons of its own), so eviction 'R's
+ * are held in g_seq_dbuf while the add runs and published after its 'A'. */
+static void (*g_seq_cb)(const unsigned char* txid, int kind) = 0;
+void mpool_policy_set_seq_cb(void (*fn)(const unsigned char*, int)){ g_seq_cb = fn; }
+static int       g_seq_defer = 0;
+static unsigned char (*g_seq_dbuf)[32] = 0;
+static uint32_t  g_seq_dn = 0, g_seq_dcap = 0;
+static void mpol_seq_removed(const unsigned char* txid, int mined){
+    if (!g_seq_cb) return;
+    if (g_seq_defer && !mined){
+        if (g_seq_dn == g_seq_dcap){
+            uint32_t want = g_seq_dcap ? g_seq_dcap * 2 : 256;
+            unsigned char (*nb)[32] = realloc(g_seq_dbuf, (size_t)want * 32);
+            if (!nb){ g_seq_cb(txid, 'R'); return; }   /* out of memory: early beats never */
+            g_seq_dbuf = nb; g_seq_dcap = want;
+        }
+        memcpy(g_seq_dbuf[g_seq_dn++], txid, 32);
+        return;
+    }
+    g_seq_cb(txid, mined ? 'M' : 'R');
+}
+static void mpol_seq_flush(void){
+    for (uint32_t i = 0; i < g_seq_dn; i++) if (g_seq_cb) g_seq_cb(g_seq_dbuf[i], 'R');
+    g_seq_dn = 0;
+}
 
 /* ========================================================================== */
 /* public API                                                                 */
@@ -920,6 +986,44 @@ static int find_node(void* st, const unsigned char txid[32]){
     return -1;
 }
 
+/* Children index: the reverse of parent[], built in O(n + edges).
+ *
+ * The node index answers "where is this txid". It says nothing about who
+ * SPENDS a transaction, and parent[] only points upward, so finding children
+ * meant scanning every node -- once for spentby, and again for every entry
+ * popped during the descendant walk. On an 11,000-transaction mempool that is
+ * up to MPE_MAX_SET full passes for ONE getmempoolentry.
+ *
+ * head[i] is the first edge of node i's child list, nxt[] chains it, chld[]
+ * holds the child's node index. Edges are pushed with i DESCENDING so a walk
+ * yields children in ascending node order -- the order the scans it replaces
+ * produced, so the reported sets keep their shape.
+ *
+ * One allocation pass per call, freed by the caller. mpool_policy_entry_info_all
+ * builds the same thing inline for its whole-registry sweep. */
+static int mpol_children_build(void* st, uint32_t n,
+                               uint32_t** head_o, uint32_t** nxt_o, uint32_t** chld_o){
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t edges = 0;
+    for (uint32_t i = 0; i < n; i++) edges += t[i].n_parents;
+    uint32_t* head = (uint32_t*)malloc((size_t)(n ? n : 1) * sizeof *head);
+    uint32_t* nxt  = (uint32_t*)malloc((size_t)(edges ? edges : 1) * sizeof *nxt);
+    uint32_t* chld = (uint32_t*)malloc((size_t)(edges ? edges : 1) * sizeof *chld);
+    if (!head || !nxt || !chld){ free(head); free(nxt); free(chld); return 0; }
+    for (uint32_t i = 0; i < n; i++) head[i] = MPOL_IDX_NONE;
+    uint32_t e = 0;
+    for (uint32_t ii = n; ii > 0; ii--){          /* descending: walks come out ascending */
+        uint32_t i = ii - 1;
+        for (uint32_t k = 0; k < t[i].n_parents; k++){
+            uint32_t pp = mpol_par_at(st, &t[i], k);
+            if (pp >= n) continue;
+            chld[e] = i; nxt[e] = head[pp]; head[pp] = e; e++;
+        }
+    }
+    *head_o = head; *nxt_o = nxt; *chld_o = chld;
+    return 1;
+}
+
 /* Collect the DISTINCT in-pool parents of a transaction.
  *
  * MEM-3 (audit 2026-09-03) was that this list was capped at 24 and the
@@ -1106,6 +1210,12 @@ static void remove_node(void* st, void* mp, int ci){
     mpol_node* t = mpol_nodes_base(st);
     uint32_t* nptr = (uint32_t*)((char*)st+16);
     unsigned char ct[32]; memcpy(ct, t[ci].txid, 32);
+    if (g_depart_cb && g_depart_reason)
+        g_depart_cb(ct, (unsigned long long)t[ci].size, (unsigned long long)t[ci].fee, g_depart_reason);
+    /* MINED is the only reason set around a confirmed transaction's removal
+     * (block_connect's per-transaction fallback); a conflict in that same
+     * path is re-labelled CONFLICTED before it gets here */
+    mpol_seq_removed(ct, g_depart_reason == 1 /* MPJ_MINED */);
     decr_ancestors(st, ci, (uint32_t)t[ci].size, t[ci].fee);
     mpool_del(mp, ct);
     { uint64_t* pb = (uint64_t*)((char*)st+64);
@@ -1224,6 +1334,10 @@ void mpool_policy_set_batch_connect(int on){ g_batch_connect = on ? 1 : 0; }
  * than reserved in .bss for every process that links this file. */
 static uint8_t*  g_rm_mark;
 static uint32_t* g_rm_remap;
+/* the index of the block transaction that marked each node: the sequence
+ * hook publishes removals in BLOCK order, as Core's removeForBlock walks the
+ * block (see mpol_remove_marked step 0) */
+static uint32_t* g_rm_order;
 static uint32_t  g_rm_cap;
 static int mpol_rm_reserve(uint32_t n){
     if (n <= g_rm_cap) return 1;
@@ -1231,11 +1345,20 @@ static int mpol_rm_reserve(uint32_t n){
     while (want < n){ if (want > 0x40000000u){ want = n; break; } want *= 2; }
     uint8_t*  m = realloc(g_rm_mark,  want);
     uint32_t* r = realloc(g_rm_remap, (size_t)want * sizeof *r);
+    uint32_t* o = realloc(g_rm_order, (size_t)want * sizeof *o);
     if (m) g_rm_mark = m;
     if (r) g_rm_remap = r;
-    if (!m || !r) return 0;
+    if (o) g_rm_order = o;
+    if (!m || !r || !o) return 0;
     g_rm_cap = want;
     return 1;
+}
+
+/* sort key for step 0 below: (block tx index, confirmed before conflicted,
+ * node index) packed so one integer compare orders them */
+static int mpol_u64_cmp(const void* a, const void* b){
+    uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+    return x < y ? -1 : x > y;
 }
 
 /* Remove every node whose mark byte is set, in one compaction.
@@ -1245,12 +1368,58 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
     uint8_t* mark = g_rm_mark;
     uint32_t* remap = g_rm_remap;
 
+    /* ---- 0. the sequence hook, in BLOCK order ----
+     * Core's removeForBlock walks the block: for each transaction, the
+     * transaction itself leaves (numbered, unpublished), then whatever
+     * conflicts with it (removeConflicts -> 'R'). Each removal takes the next
+     * mempool sequence number, so the numbers a subscriber sees on the 'R's
+     * depend on that order. Step 1 walks the NODE array instead, so the hook
+     * runs here, first, sorted by the block index that marked each node --
+     * mined before conflicted at the same index, node order after that. Only
+     * marked nodes are sorted: nothing is paid for the survivors. */
+    if (g_seq_cb){
+        uint64_t* key = NULL; uint32_t nk = 0, cap = 0;
+        for (uint32_t i = 0; i < n; i++){
+            if (!mark[i]) continue;
+            if (nk == cap){
+                uint32_t want = cap ? cap * 2 : 256;
+                uint64_t* nb = realloc(key, (size_t)want * sizeof *nb);
+                if (!nb){ free(key); key = NULL; nk = 0; break; }
+                key = nb; cap = want;
+            }
+            key[nk++] = ((uint64_t)(g_rm_order[i] & 0x7FFFFFFFu) << 33) |
+                        ((uint64_t)(mark[i] == 2) << 32) | i;
+        }
+        if (key && nk) qsort(key, nk, sizeof *key, mpol_u64_cmp);
+        if (key){
+            for (uint32_t k = 0; k < nk; k++){
+                uint32_t i = (uint32_t)(key[k] & 0xFFFFFFFFu);
+                /* mark 1 under a block connect = the block confirmed it */
+                mpol_seq_removed(t[i].txid, g_depart_reason == 1 && mark[i] == 1);
+            }
+            free(key);
+        } else {
+            /* no scratch: node order is still every removal, once */
+            for (uint32_t i = 0; i < n; i++)
+                if (mark[i]) mpol_seq_removed(t[i].txid, g_depart_reason == 1 && mark[i] == 1);
+        }
+    }
+
     /* ---- 1. per-node bookkeeping, while indices are still valid ---- */
     long nremoved = 0;
     for (uint32_t i = 0; i < n; i++){
         if (!mark[i]) continue;
         nremoved++;
         unsigned char ct[32]; memcpy(ct, t[i].txid, 32);
+        if (g_depart_cb && g_depart_reason){
+            /* mark 1 = the block confirmed it, mark 2 = the block CONFLICTS
+             * with it (mark_conflict above). Both leave through this loop, and
+             * calling the second one "mined" would be the opposite of the
+             * truth -- it is the case where a transaction the user broadcast
+             * is gone for good. */
+            int why = (g_depart_reason == 1 && mark[i] == 2) ? 5 /* MPJ_CONFLICTED */ : g_depart_reason;
+            g_depart_cb(ct, (unsigned long long)t[i].size, (unsigned long long)t[i].fee, why);
+        }
         decr_ancestors(st, (int)i, (uint32_t)t[i].size, t[i].fee);
         mpool_del(mp, ct);
         { uint64_t* pb = (uint64_t*)((char*)st+64);
@@ -1363,8 +1532,9 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
  * A node already marked 1 that turns out to be a descendant of a conflict is
  * upgraded to 2: it is leaving either way, but its own descendants must then
  * follow it. */
-static void mpol_mark_with_descendants(void* st, uint32_t n, uint32_t root){
+static void mpol_mark_with_descendants(void* st, uint32_t n, uint32_t root, uint32_t order){
     if (root >= n || g_rm_mark[root] == 2) return;
+    if (!g_rm_mark[root]) g_rm_order[root] = order;
     g_rm_mark[root] = 2;
     mpol_node* t = mpol_nodes_base(st);
     int changed = 1, rounds = 0;
@@ -1374,7 +1544,9 @@ static void mpol_mark_with_descendants(void* st, uint32_t n, uint32_t root){
             if (g_rm_mark[i] == 2) continue;
             for (uint32_t k = 0; k < t[i].n_parents; k++){
                 uint32_t pv = mpol_par_at(st, &t[i], k);
-                if (pv < n && g_rm_mark[pv] == 2){ g_rm_mark[i] = 2; changed = 1; break; }
+                if (pv < n && g_rm_mark[pv] == 2){
+                    if (!g_rm_mark[i]) g_rm_order[i] = order;
+                    g_rm_mark[i] = 2; changed = 1; break; }
             }
         }
     }
@@ -1505,7 +1677,11 @@ static int worst_package(void* st){
  * trees that dominate real pools; Core's exact search only differs on
  * pathological wide clusters. Clusters larger than CHUNK_MAX_CLUSTER fall
  * back to the per-leaf score for that cluster alone. */
-#define CHUNK_MAX_CLUSTER 128
+/* 2026-09-14: was 128. The accept path already refuses anything that would
+ * build a cluster above 64 (CLUSTER_LIMIT below, Core's DEFAULT_CLUSTER_LIMIT),
+ * so 128 was unreachable headroom that merely disagreed with the two other
+ * cluster bounds in this tree. One bound, Core's, everywhere. */
+#define CHUNK_MAX_CLUSTER 64
 typedef struct { uint32_t idx[CHUNK_MAX_CLUSTER]; int n; uint64_t fee, size; } mpol_chunk;
 
 /* the connected component containing node `seed` (indices), via parent links
@@ -1534,54 +1710,69 @@ static int cluster_members(void* st, uint32_t seed, const uint32_t* child_head, 
     return n;
 }
 
-/* the LAST chunk of the cluster's linearization (its worst): ancestor-set
- * greedy over the members, chunks merged while a later one pays more */
+/* The LAST chunk of the cluster's linearization -- its worst, which is what
+ * TrimToSize evicts.
+ *
+ * UNIFIED 2026-09-14: the linearization and chunking are mempool_cluster.c's.
+ * This file, rpc_chain.c and that module each carried their own copy of the
+ * same idea; the module is the one tested to the letter (74 tests, 3,000
+ * randomised DAGs), and which transaction gets evicted under load should be
+ * decided by tested code.
+ *
+ * The feerate denominator is deliberately UNCHANGED: `size` (vsize) is handed
+ * to the module as its weight, so today's eviction arithmetic is preserved
+ * exactly. Core chunks by sigops-ADJUSTED WEIGHT; changing that changes which
+ * transaction is evicted, and it belongs in its own commit with its own
+ * justification -- not smuggled in alongside a change of implementation.
+ *
+ * Returns 1 with *out filled, 0 if the cluster yields nothing. */
 static int cluster_last_chunk(void* st, const uint32_t* mem, int n, mpol_chunk* out){
     mpol_node* t = mpol_nodes_base(st);
-    unsigned char done[CHUNK_MAX_CLUSTER]; memset(done, 0, sizeof done);
-    mpol_chunk chunks[CHUNK_MAX_CLUSTER]; int nch = 0;
-    int left = n;
-    while (left > 0){
-        /* for every undone member, the feerate of its undone ancestor set */
-        int best = -1; uint64_t bf = 0, bs = 1; uint32_t bestset[CHUNK_MAX_CLUSTER]; int bestn = 0;
-        for (int m = 0; m < n; m++){
-            if (done[m]) continue;
-            /* ancestor set within the cluster (undone only) */
-            unsigned char inset[CHUNK_MAX_CLUSTER]; memset(inset, 0, sizeof inset);
-            uint32_t stk[CHUNK_MAX_CLUSTER]; int sp = 0; inset[m] = 1; stk[sp++] = (uint32_t)m;
-            uint64_t f = 0, sz = 0; int cnt = 0;
-            while (sp > 0){
-                int cur = (int)stk[--sp];
-                f += t[mem[cur]].fee; sz += t[mem[cur]].size; cnt++;
-                for (uint32_t k = 0; k < t[mem[cur]].n_parents; k++){
-                    uint32_t pp = mpol_par_at(st, &t[mem[cur]], k);
-                    if (pp == 0xFFFFFFFFu) continue;
-                    for (int q = 0; q < n; q++) if (mem[q] == pp && !done[q] && !inset[q]){ inset[q] = 1; stk[sp++] = (uint32_t)q; }
-                }
-            }
-            if (sz == 0) sz = 1;
-            if (best < 0 || (unsigned __int128)f * bs > (unsigned __int128)bf * sz){
-                best = m; bf = f; bs = sz; bestn = 0;
-                for (int q = 0; q < n; q++) if (inset[q]) bestset[bestn++] = (uint32_t)q;
-            }
-        }
-        if (best < 0) break;
-        mpol_chunk* c = &chunks[nch++];
-        c->n = 0; c->fee = bf; c->size = bs;
-        for (int q = 0; q < bestn; q++){ done[bestset[q]] = 1; c->idx[c->n++] = mem[bestset[q]]; }
-        left -= bestn;
-        /* merge backwards while this chunk pays more than the one before it */
-        while (nch >= 2){
-            mpol_chunk* a = &chunks[nch-2]; mpol_chunk* b = &chunks[nch-1];
-            if ((unsigned __int128)b->fee * a->size > (unsigned __int128)a->fee * b->size){
-                for (int q = 0; q < b->n && a->n < CHUNK_MAX_CLUSTER; q++) a->idx[a->n++] = b->idx[q];
-                a->fee += b->fee; a->size += b->size; nch--;
-            } else break;
+    if (n <= 0 || n > MPC_MAX_CLUSTER) return 0;
+
+    mpc_cluster cl; memset(&cl, 0, sizeof cl); cl.n = n;
+    for (int m = 0; m < n; m++){
+        cl.m[m].fee = t[mem[m]].fee;
+        cl.m[m].weight = t[mem[m]].size;          /* see the note above */
+        cl.m[m].ancestors = (uint64_t)1 << m;
+        memcpy(cl.txid[m], t[mem[m]].txid, 32);
+    }
+    /* direct parent edges, restricted to the cluster; the module closes them */
+    for (int m = 0; m < n; m++){
+        for (uint32_t k = 0; k < t[mem[m]].n_parents; k++){
+            uint32_t pp = mpol_par_at(st, &t[mem[m]], k);
+            if (pp == 0xFFFFFFFFu) continue;
+            for (int q = 0; q < n; q++)
+                if (mem[q] == pp){ cl.m[m].ancestors |= (uint64_t)1 << q; break; }
         }
     }
-    if (nch == 0) return 0;
-    *out = chunks[nch-1];
-    return 1;
+    /* transitive closure, bounded: a cycle returns rather than spinning */
+    for (int pass = 0; pass < n + 1; pass++){
+        int changed = 0;
+        for (int m = 0; m < n; m++){
+            uint64_t acc = cl.m[m].ancestors, d = cl.m[m].ancestors;
+            while (d){ int p = __builtin_ctzll(d); d &= d - 1; acc |= cl.m[p].ancestors; }
+            if (acc != cl.m[m].ancestors){ cl.m[m].ancestors = acc; changed = 1; }
+        }
+        if (!changed) break;
+        if (pass == n) return 0;
+    }
+    for (int m = 0; m < n; m++)
+        for (int q = 0; q < n; q++)
+            if (cl.m[q].ancestors & ((uint64_t)1 << m)) cl.m[m].descendants |= (uint64_t)1 << q;
+
+    int lin[MPC_MAX_CLUSTER]; mpc_chunking ch;
+    if (mpc_linearize_ancestor_score(&cl, lin) != 0) return 0;
+    mpc_post_linearize(&cl, lin);
+    if (mpc_chunk_linearization(&cl, lin, &ch) != 0 || ch.n == 0) return 0;
+
+    const mpc_chunk* last = &ch.c[ch.n - 1];
+    out->n = 0; out->fee = last->fee; out->size = last->weight;
+    for (int k = 0; k < n && out->n < CHUNK_MAX_CLUSTER; k++){
+        int idx = lin[k];
+        if (last->members & ((uint64_t)1 << idx)) out->idx[out->n++] = mem[idx];
+    }
+    return out->n ? 1 : 0;
 }
 
 /* The worst chunk across all clusters: 1 with *out filled, 0 if the pool is
@@ -2473,6 +2664,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
     }
 
     /* 1a. RBF eviction (packages: conflicts + descendants, snapshotted) */
+    { int prev_r = g_depart_reason; g_depart_reason = 2 /* MPJ_REPLACED */;
     for (int e=0;e<n_evict;e++){
         int ci = find_node(st, evict_set[e]);
         if (ci >= 0) remove_node(st, mp, ci);
@@ -2481,6 +2673,7 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
         if (_mpol_replaced_n < (int)(sizeof _mpol_replaced / 32))
             memcpy(_mpol_replaced[_mpol_replaced_n++], evict_set[e], 32);
     }
+    g_depart_reason = prev_r; }
     /* the eviction may have invalidated the ancestor INDEX list; parents are
      * re-found below by txid via prev[] when linking, so recompute par_idx. */
     if (n_evict){
@@ -2569,7 +2762,13 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
           unsigned char wt[CHUNK_MAX_CLUSTER][32]; int wn = wc.n;
           for (int q = 0; q < wn; q++) memcpy(wt[q], mpol_nodes_base(st)[wc.idx[q]].txid, 32);
           floor_bump(st, wf * 1000 / ws + pol->incremental_fee);
-          for (int q = 0; q < wn; q++) mpool_policy_remove_package(st, mp, wt[q]);   /* descendants live in the chunk too; a gone txid is a no-op */
+          { int prev_r = g_depart_reason; g_depart_reason = 3 /* MPJ_EVICTED */;
+            /* the sequence topic publishes these AFTER the newcomer's 'A', as
+             * Core's add-then-trim does (see g_seq_cb) */
+            g_seq_defer = 1;
+            for (int q = 0; q < wn; q++) mpool_policy_remove_package(st, mp, wt[q]);   /* descendants live in the chunk too; a gone txid is a no-op */
+            g_seq_defer = 0;
+            g_depart_reason = prev_r; }
           /* MEM-5 (audit 2026-09-03): the chunk just evicted must not have
            * contained one of THIS transaction's parents -- and the check has
            * to happen BEFORE mpool_put, or the transaction ends up stored in
@@ -2732,7 +2931,15 @@ static long mpol_add_core(mpol_cfg* pol, void* st, void* mp,
 long mpool_policy_add(mpol_cfg* pol, void* st, void* mp,
                       const unsigned char* tx, unsigned long txlen,
                       const unsigned char txid[32], void* utxo){
-    return mpol_add_core(pol, st, mp, tx, txlen, txid, utxo, 1, NULL, NULL);
+    long r = mpol_add_core(pol, st, mp, tx, txlen, txid, utxo, 1, NULL, NULL);
+    /* The ONE insert point, so the one 'A'. Then the evictions it caused
+     * (held back by g_seq_defer), which are real departures whether or not
+     * the add went on to succeed -- MEM-5 can evict and still refuse. */
+    if (g_seq_cb){
+        if (r == 1) g_seq_cb(txid, 'A');
+        mpol_seq_flush();
+    }
+    return r;
 }
 
 long mpool_policy_test(mpol_cfg* pol, void* st, void* mp,
@@ -2771,11 +2978,16 @@ long mpool_policy_block_connect(void* st, void* mp,
                                 const unsigned char* block, unsigned long blen){
     if (!tx_parse || !tx_txid) return -1;
     if (!st || *(uint32_t*)st != MPOL_MAGIC || blen < 81) return -1;
+    /* Everything this call removes left because it was MINED. A transaction
+     * the block CONFLICTS with (it spends an output the block spent elsewhere)
+     * also leaves here; that is recorded as mined too, which would be wrong --
+     * so the conflict path below re-marks it. See MPJ_CONFLICTED. */
+    int prev_reason = g_depart_reason; g_depart_reason = 1 /* MPJ_MINED */;
     const unsigned char* p = block + 80;
     const unsigned char* end = block + blen;
     int ok;
     uint64_t ntx = rd_varint(&p, end, &ok);
-    if (!ok) return -1;
+    if (!ok){ g_depart_reason = prev_reason; return -1; }
     long removed = 0;
     static unsigned char scratch[1<<20];
 
@@ -2807,7 +3019,10 @@ long mpool_policy_block_connect(void* st, void* mp,
             int self_ci = -1;
             if (batch){
                 self_ci = find_node(st, txid);
-                if (self_ci >= 0) g_rm_mark[self_ci] = 1;   /* confirmed: alone */
+                if (self_ci >= 0){
+                    if (!g_rm_mark[self_ci]) g_rm_order[self_ci] = (uint32_t)j;
+                    g_rm_mark[self_ci] = 1;                 /* confirmed: alone */
+                }
             } else {
                 removed += remove_confirmed(st, mp, txid);
             }
@@ -2836,11 +3051,18 @@ long mpool_policy_block_connect(void* st, void* mp,
                          * outpoint, so if this transaction is the claimer,
                          * no other in-pool transaction is. */
                         if (cl != self_ci)
-                            mpol_mark_with_descendants(st, n_nodes, (uint32_t)cl);
+                            mpol_mark_with_descendants(st, n_nodes, (uint32_t)cl, (uint32_t)j);
                     } else {
                         unsigned char ct[32];
                         memcpy(ct, mpol_nodes_base(st)[cl].txid, 32);
+                        /* a CONFLICT, not a confirmation: labelled as one, as
+                         * the batch path's mark 2 is. This fallback left it
+                         * under MINED, which told the departure journal the
+                         * opposite of the truth and would have kept the
+                         * sequence topic's 'R' from firing. */
+                        int prev_c = g_depart_reason; g_depart_reason = 5 /* MPJ_CONFLICTED */;
                         removed += mpool_policy_remove_package(st, mp, ct);
+                        g_depart_reason = prev_c;
                     }
                 }
             }
@@ -2856,6 +3078,7 @@ long mpool_policy_block_connect(void* st, void* mp,
     { extern void serve_rejects_clear(void) __attribute__((weak));
       if (serve_rejects_clear) serve_rejects_clear(); }
     note_block_connected(st);
+    g_depart_reason = prev_reason;
     return removed;
 }
 
@@ -2864,7 +3087,10 @@ long mpool_policy_block_connect(void* st, void* mp,
 /* ========================================================================== */
 /* The caller (daemon/mempool_cfg.c) knows arrival times; it hands txids in. */
 long mpool_policy_expire_one(void* st, void* mp, const unsigned char txid[32]){
-    return mpool_policy_remove_package(st, mp, txid);
+    int prev = g_depart_reason; g_depart_reason = 4 /* MPJ_EXPIRED */;
+    long r = mpool_policy_remove_package(st, mp, txid);
+    g_depart_reason = prev;
+    return r;
 }
 
 /* ---- RPC read helpers ----------------------------------------------------- */
@@ -2872,15 +3098,44 @@ long mpool_policy_entry(void* st, const unsigned char txid[32],
                         unsigned long long* fee, unsigned long long* size){
     if (!st || *(uint32_t*)st != MPOL_MAGIC) return 0;
     mpol_node* t = mpol_nodes_base(st);
+    /* MEM-12's node index has been maintained at every link/unlink since it
+     * landed, and find_node() walks it with the full key re-verified -- but
+     * this function, and the three below, kept scanning the array. Every
+     * caller that asks per transaction was therefore O(n^2): getmempoolinfo
+     * summing fees, getblocktemplate pricing candidates. Use the index. */
+    int self = find_node(st, txid);
+    if (self < 0) return 0;
+    if (fee)  *fee  = t[self].fee;
+    if (size) *size = t[self].size;          /* vsize (Core reports vsize) */
+    return 1;
+}
+
+/* Sum fee and vsize over every policy entry in ONE pass.
+ *
+ * getmempoolinfo used to call mpool_policy_entry() once per mempool slot, and
+ * that function is a LINEAR SCAN of this node array -- so the call was O(n^2).
+ * Measured on run 26 with 5,914 transactions it cost 15 ms against Bitcoin
+ * Core's 2 ms for the same RPC; at the oracle's 77,736 transactions the same
+ * loop is ~6 billion 32-byte compares. It ran under both the mempool lock and
+ * the single RPC execution lock, on a call every monitoring tool polls.
+ *
+ * The same "per-txid call x n" shape is already called out above
+ * mpool_policy_entry_info_all, for the same reason. Returns the entry count.
+ * The policy registry and the structural pool are maintained together
+ * (mpool_policy_remove_package takes both), so this covers the same
+ * transactions the per-slot loop did. */
+long mpool_policy_totals(void* st, unsigned long long* total_fee,
+                         unsigned long long* total_vsize){
+    if (total_fee) *total_fee = 0;
+    if (total_vsize) *total_vsize = 0;
+    if (!st || *(uint32_t*)st != MPOL_MAGIC) return -1;
+    mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
-    for (uint32_t i = n; i > 0; i--){
-        if (!memcmp(t[i-1].txid, txid, 32)){
-            if (fee)  *fee  = t[i-1].fee;
-            if (size) *size = t[i-1].size;   /* vsize (Core reports vsize) */
-            return 1;
-        }
-    }
-    return 0;
+    unsigned long long f = 0, s = 0;
+    for (uint32_t i = 0; i < n; i++){ f += t[i].fee; s += t[i].size; }
+    if (total_fee) *total_fee = f;
+    if (total_vsize) *total_vsize = s;
+    return (long)n;
 }
 
 #include "mempool_entry.h"
@@ -2900,20 +3155,18 @@ static int mpe_seen(unsigned char set[][32], int n, const unsigned char* txid){
 long mpool_policy_n_parents(void* st, const unsigned char txid[32]){
     if (!st || *(uint32_t*)st != MPOL_MAGIC) return -1;
     mpol_node* t = mpol_nodes_base(st);
-    uint32_t n = *(uint32_t*)((char*)st+16);
-    for (uint32_t i = n; i > 0; i--)
-        if (!memcmp(t[i-1].txid, txid, 32)) return (long)t[i-1].n_parents;
-    return -1;
+    int self = find_node(st, txid);
+    return self < 0 ? -1 : (long)t[self].n_parents;
 }
 int mpol_in_package_context(void){ return g_pkg_n > 0; }
 
 long mpool_policy_set_sigops(void* st, const unsigned char txid[32], unsigned int cost){
     if (!st || *(uint32_t*)st != MPOL_MAGIC) return 0;
     mpol_node* t = mpol_nodes_base(st);
-    uint32_t n = *(uint32_t*)((char*)st+16);
-    for (uint32_t i = n; i > 0; i--)
-        if (!memcmp(t[i-1].txid, txid, 32)){ t[i-1].sigop_cost = cost; return 1; }
-    return 0;
+    int self = find_node(st, txid);
+    if (self < 0) return 0;
+    t[self].sigop_cost = cost;
+    return 1;
 }
 
 /* ---- the WHOLE graph in one pass -----------------------------------------
@@ -3016,9 +3269,7 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
     if (!st || *(uint32_t*)st != MPOL_MAGIC || !out) return 0;
     mpol_node* t = mpol_nodes_base(st);
     uint32_t n = *(uint32_t*)((char*)st+16);
-    long self = -1;
-    for (uint32_t i = n; i > 0; i--)
-        if (!memcmp(t[i-1].txid, txid, 32)){ self = (long)(i-1); break; }
+    long self = find_node(st, txid);       /* was a scan; MEM-12's index answers it */
     if (self < 0) return 0;
     memset(out, 0, sizeof *out);
     out->fee  = t[self].fee;
@@ -3032,14 +3283,25 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
         if (!mpe_seen(out->depends, out->n_depends, t[p].txid))
             memcpy(out->depends[out->n_depends++], t[p].txid, 32);
     }
-    for (uint32_t i=0; i<n && out->n_spentby<MPE_MAX_SET; i++){
-        if ((long)i == self) continue;
-        for (uint32_t k=0; k<t[i].n_parents; k++)
-            if (mpol_par_at(st, &t[i], k) == (uint32_t)self){
-                if (!mpe_seen(out->spentby, out->n_spentby, t[i].txid))
-                    memcpy(out->spentby[out->n_spentby++], t[i].txid, 32);
-                break;
-            }
+    uint32_t *ch_head = 0, *ch_nxt = 0, *ch_chld = 0;
+    int have_ch = mpol_children_build(st, n, &ch_head, &ch_nxt, &ch_chld);
+    if (have_ch){
+        for (uint32_t e = ch_head[self]; e != MPOL_IDX_NONE && out->n_spentby < MPE_MAX_SET; e = ch_nxt[e]){
+            uint32_t i = ch_chld[e];
+            if ((long)i == self) continue;
+            if (!mpe_seen(out->spentby, out->n_spentby, t[i].txid))
+                memcpy(out->spentby[out->n_spentby++], t[i].txid, 32);
+        }
+    } else {                                   /* allocation failed: the old sweep */
+        for (uint32_t i=0; i<n && out->n_spentby<MPE_MAX_SET; i++){
+            if ((long)i == self) continue;
+            for (uint32_t k=0; k<t[i].n_parents; k++)
+                if (mpol_par_at(st, &t[i], k) == (uint32_t)self){
+                    if (!mpe_seen(out->spentby, out->n_spentby, t[i].txid))
+                        memcpy(out->spentby[out->n_spentby++], t[i].txid, 32);
+                    break;
+                }
+        }
     }
     { uint32_t stack[MPE_MAX_SET]; int sp=0;
       memcpy(out->anc[out->n_anc++], t[self].txid, 32); out->anc_fee = t[self].fee;
@@ -3063,19 +3325,107 @@ long mpool_policy_entry_info(void* st, const unsigned char txid[32], mp_entry_in
       stack[sp++] = (uint32_t)self;
       while (sp > 0){
           uint32_t cur = stack[--sp];
-          for (uint32_t i=0; i<n; i++){
-              if (mpe_seen(out->desc, out->n_desc, t[i].txid)) continue;
-              int child = 0;
-              for (uint32_t k=0; k<t[i].n_parents; k++)
-                  if (mpol_par_at(st, &t[i], k) == cur){ child = 1; break; }
-              if (!child) continue;
-              if (out->n_desc >= MPE_MAX_SET) break;
-              memcpy(out->desc[out->n_desc++], t[i].txid, 32);
-              out->desc_fee += t[i].fee;
-              if (sp < MPE_MAX_SET) stack[sp++] = i;
+          if (have_ch){
+              for (uint32_t e = ch_head[cur]; e != MPOL_IDX_NONE; e = ch_nxt[e]){
+                  uint32_t i = ch_chld[e];
+                  if (mpe_seen(out->desc, out->n_desc, t[i].txid)) continue;
+                  if (out->n_desc >= MPE_MAX_SET) break;
+                  memcpy(out->desc[out->n_desc++], t[i].txid, 32);
+                  out->desc_fee += t[i].fee;
+                  if (sp < MPE_MAX_SET) stack[sp++] = i;
+              }
+          } else {
+              for (uint32_t i=0; i<n; i++){
+                  if (mpe_seen(out->desc, out->n_desc, t[i].txid)) continue;
+                  int child = 0;
+                  for (uint32_t k=0; k<t[i].n_parents; k++)
+                      if (mpol_par_at(st, &t[i], k) == cur){ child = 1; break; }
+                  if (!child) continue;
+                  if (out->n_desc >= MPE_MAX_SET) break;
+                  memcpy(out->desc[out->n_desc++], t[i].txid, 32);
+                  out->desc_fee += t[i].fee;
+                  if (sp < MPE_MAX_SET) stack[sp++] = i;
+              }
           }
       } }
+    free(ch_head); free(ch_nxt); free(ch_chld);
     return 1;
+}
+
+/* Fee, size, sigop cost, direct parents and the ancestor set, for MANY txids
+ * in one call -- and NOTHING else.
+ *
+ * getblocktemplate asked mpool_policy_entry_info() once per candidate. That
+ * function also finds `spentby` by scanning EVERY node in the registry, and
+ * enumerates the DESCENDANT set with a nested walk over every node per stack
+ * entry. The template reads neither: it uses fee, size, sigop_cost, depends
+ * and anc. So each call paid two or more full passes over the registry to
+ * build fields nobody looked at, n times over -- measured on run 26, 1,664 ms
+ * to build one template against Bitcoin Core's 53 ms on a mempool eight times
+ * larger.
+ *
+ * Here the self-lookup is a hash built once for the whole batch (it was a
+ * linear scan per call), and the only graph work left is the ancestor DFS,
+ * which is bounded by MPE_MAX_SET. out[] and found[] are sized by the CALLER's
+ * query count, not the registry, so this stays usable on a full mempool --
+ * mp_entry_info is ~8 KB, and one per registry entry is why entry_info_all
+ * refuses a registry larger than the caller's cap.
+ *
+ * found[q] is 1 when the txid was in the registry. Returns nq, or -1. */
+long mpool_policy_entry_pkg_many(void* st, const unsigned char (*txids)[32], uint32_t nq,
+                                 mp_entry_info* out, unsigned char* found){
+    if (!st || *(uint32_t*)st != MPOL_MAGIC || !txids || !out || !found) return -1;
+    mpol_node* t = mpol_nodes_base(st);
+    uint32_t n = *(uint32_t*)((char*)st+16);
+    uint32_t cap = 16; while (cap < (n ? n * 2 : 16)) cap <<= 1;
+    uint32_t* tab = (uint32_t*)malloc((size_t)cap * sizeof *tab);
+    if (!tab) return -1;
+    for (uint32_t i = 0; i < cap; i++) tab[i] = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < n; i++){
+        uint64_t k; memcpy(&k, t[i].txid, 8);
+        uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 40) & (cap - 1);
+        while (tab[h] != 0xFFFFFFFFu) h = (h + 1) & (cap - 1);
+        tab[h] = i;
+    }
+    for (uint32_t q = 0; q < nq; q++){
+        found[q] = 0;
+        uint64_t k; memcpy(&k, txids[q], 8);
+        uint32_t h = (uint32_t)((k * 0x9E3779B97F4A7C15ULL) >> 40) & (cap - 1);
+        long self = -1;
+        while (tab[h] != 0xFFFFFFFFu){
+            if (!memcmp(t[tab[h]].txid, txids[q], 32)){ self = (long)tab[h]; break; }
+            h = (h + 1) & (cap - 1);
+        }
+        if (self < 0) continue;
+        mp_entry_info* o = &out[q];
+        memset(o, 0, sizeof *o);
+        o->fee = t[self].fee; o->size = t[self].size; o->sigop_cost = t[self].sigop_cost;
+        for (uint32_t kk = 0; kk < t[self].n_parents && o->n_depends < MPE_MAX_SET; kk++){
+            uint32_t pp = mpol_par_at(st, &t[self], kk);
+            if (pp >= n) continue;
+            if (!mpe_seen(o->depends, o->n_depends, t[pp].txid))
+                memcpy(o->depends[o->n_depends++], t[pp].txid, 32);
+        }
+        { uint32_t stack[MPE_MAX_SET]; int sp = 0;
+          memcpy(o->anc[o->n_anc++], t[self].txid, 32);
+          o->anc_fee = t[self].fee; o->anc_size = t[self].size;
+          stack[sp++] = (uint32_t)self;
+          while (sp > 0){
+              uint32_t cur = stack[--sp];
+              for (uint32_t kk = 0; kk < t[cur].n_parents; kk++){
+                  uint32_t pp = mpol_par_at(st, &t[cur], kk);
+                  if (pp >= n || mpe_seen(o->anc, o->n_anc, t[pp].txid)) continue;
+                  if (o->n_anc >= MPE_MAX_SET) break;
+                  memcpy(o->anc[o->n_anc++], t[pp].txid, 32);
+                  o->anc_fee += t[pp].fee;
+                  o->anc_size += t[pp].size;
+                  if (sp < MPE_MAX_SET) stack[sp++] = pp;
+              }
+          } }
+        found[q] = 1;
+    }
+    free(tab);
+    return (long)nq;
 }
 
 /* ==========================================================================

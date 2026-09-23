@@ -1107,10 +1107,14 @@ int main(void){
            rc == 0 && ec == -4 && em && strstr(em, "no download worker"));
         rj_free(r); rj_free(p); }
 
-      { /* bumpfee is real: with no/bad txid it is an ordinary -8, and with
-           an unknown txid it is Core's -5 (no journal, not-in-mempool) */
+      { /* bumpfee is real: with a bad txid VALUE it is an ordinary -8, and with
+           an unknown txid it is Core's -5 (no journal, not-in-mempool).
+           A MISSING txid is NOT -8: Core answers -1 there, and this assertion
+           pinned the defect until 2026-09-15 -- it read as "bumpfee is wired"
+           and was in fact freezing the wrong code for the argument check. */
         D("bumpfee", NULL);
-        ck("bumpfee with no txid -> -8 (wired, not a stub)", rc == 0 && ec == -8);
+        ck("bumpfee with no txid -> -1 (Core's answer; this asserted -8 and pinned it)",
+           rc == 0 && ec == -1);
         rj_free(r);
         rj_val* pb = P("[\"00000000000000000000000000000000000000000000000000000000000000ff\"]");
         D("bumpfee", pb);
@@ -1398,6 +1402,154 @@ int main(void){
       D("unloadwallet", NULL); rj_free(r);
       rpc_wops_set_seed_installer(0);
       W.seed = SEED;
+    }
+
+
+    /* ---- with NO wallet loaded, Core answers -18 ---------------------------
+     * RPC_WALLET_NOT_FOUND, with the text below verbatim (wallet/rpc/util.cpp
+     * GetWalletForJSONRPCRequest, the count == 0 branch). This node answered
+     * -4 (RPC_WALLET_ERROR, "Unspecified problem with wallet") with only the
+     * first sentence. The message read close enough to pass for a match, which
+     * is how the code stayed wrong: a human skims the text, a caller branches
+     * on the number, and the retry that follows (loadwallet) only follows
+     * from -18.
+     *
+     * Verified 2026-09-15 against a Core v31.1 with genuinely no wallet loaded
+     * -- not against the oracle with a wallet and a bad -rpcwallet name, which
+     * returns -18 with a DIFFERENT message ("Requested wallet does not exist
+     * or is not loaded") and would have frozen the wrong string here.
+     *
+     * The ORDER matters as much as the code. Core resolves the wallet after
+     * the argument type check and before the value check, and this file
+     * checked the rescan first: with no wallet there is never a completed
+     * rescan, so every method below answered -4 "no wallet rescan has
+     * completed" and the -18 was unreachable. Changing the code alone would
+     * have been a fix that grep could see and a caller could not. */
+    {
+        const char* WANT =
+            "No wallet is loaded. Load a wallet using loadwallet or create a new one "
+            "with createwallet. (Note: A default wallet is no longer automatically created)";
+        const unsigned char* keep = W.seed;
+        /* The rescan state must be CLEARED, or these assertions pass for the
+         * wrong reason. With a completed rescan in place, wop_need_scan never
+         * fires and the guard ORDER is invisible: the block passed identically
+         * with the rescan check still ahead of the wallet check. Removing the
+         * scan file and invalidating the cache puts the node in the state a
+         * real no-wallet node is always in -- no wallet, therefore no rescan --
+         * which is the only state where the ordering can be observed. */
+        D("unloadwallet", NULL); rj_free(r);
+        remove("walletscan.dat"); remove("data/walletscan.dat");
+        W.seed = NULL;                                  /* no wallet */
+
+        const char* NOARG[] = { "listaddressgroupings", "listsinceblock",
+                                "listreceivedbyaddress", "listreceivedbylabel",
+                                "listdescriptors", "rescanblockchain" };
+        for (int i = 0; i < 6; i++){
+            rj_val* p0 = rj_parse("[]", 2);
+            D(NOARG[i], p0);
+            char lbl[128]; snprintf(lbl, sizeof lbl, "%s with no wallet -> -18, Core's exact text", NOARG[i]);
+            ck(lbl, rc == 0 && ec == -18 && em && !strcmp(em, WANT));
+            rj_free(r); rj_free(p0);
+        }
+        { rj_val* p0 = P("[\"bc1q249cv27lc2q7y0x53vkczgfvvgsjzhwxwv42gc\"]");
+          D("getreceivedbyaddress", p0);
+          ck("getreceivedbyaddress with no wallet -> -18, not the rescan -4",
+             rc == 0 && ec == -18 && em && !strcmp(em, WANT));
+          rj_free(r); rj_free(p0); }
+        { rj_val* p0 = P("[\"somelabel\"]");
+          D("getreceivedbylabel", p0);
+          ck("getreceivedbylabel with no wallet -> -18, not the rescan -4",
+             rc == 0 && ec == -18 && em && !strcmp(em, WANT));
+          rj_free(r); rj_free(p0); }
+
+        /* The three-stage order, measured on Core: a MISSING argument beats the
+         * wallet (-1), a WRONG TYPE beats the wallet (-3), and a well-typed but
+         * invalid VALUE does NOT -- the wallet answers first (-18). A txid
+         * parser that collapses all three into one -8, as this one did, cannot
+         * produce that ordering at all. */
+        const char* TXM[] = { "abandontransaction", "bumpfee", "psbtbumpfee" };
+        for (int i = 0; i < 3; i++){
+            { rj_val* p0 = rj_parse("[]", 2); D(TXM[i], p0);
+              char lbl[128]; snprintf(lbl, sizeof lbl, "%s(): a missing txid beats the wallet -> -1", TXM[i]);
+              ck(lbl, rc == 0 && ec == -1 && em && strstr(em, "requires txid"));
+              rj_free(r); rj_free(p0); }
+            { rj_val* p0 = rj_parse("[5]", 3); D(TXM[i], p0);
+              char lbl[128]; snprintf(lbl, sizeof lbl, "%s(number): a wrong TYPE beats the wallet -> -3", TXM[i]);
+              ck(lbl, rc == 0 && ec == -3 && em
+                      && strstr(em, "\"Position 1 (txid)\"")
+                      && strstr(em, "of type number is not of expected type string"));
+              rj_free(r); rj_free(p0); }
+            { rj_val* p0 = P("[\"abcd\"]"); D(TXM[i], p0);
+              char lbl[160]; snprintf(lbl, sizeof lbl,
+                  "%s(\"abcd\"): a well-typed bad VALUE does NOT beat the wallet -> -18", TXM[i]);
+              ck(lbl, rc == 0 && ec == -18 && em && !strcmp(em, WANT));
+              rj_free(r); rj_free(p0); }
+        }
+        W.seed = keep;                                  /* restore the fixture */
+    }
+
+
+    /* ---- getaddressinfo: the ADDRESS-DECODING half ------------------------
+     * Three fields here are pure address decoding and have nothing to do with
+     * a wallet -- Core reports them whether or not one is loaded, and this
+     * node omitted all three: scriptPubKey, isscript, witness_program.
+     * validateaddress next door already computed them from the same inputs.
+     *
+     * And getaddressinfo carried "isvalid", which Core's does NOT: Core ERRORS
+     * with -5 on an address it cannot decode, and only validateaddress reports
+     * the verdict as a field. Returning {"address":..,"isvalid":false} with a
+     * SUCCESS status meant a caller testing for an error saw none and read a
+     * field off a reply it had no reason to inspect.
+     *
+     * Verified against Core v31.1 on 2026-09-16 over one address of every
+     * standard type plus two undecodable ones: identical on every non-wallet
+     * field, and -5 on both bad addresses. */
+    {
+        struct { const char* addr; const char* spk; int isscript; int iswitness; } A[] = {
+          { "1QDBhj6F46WtVQ3TMqJT3YhnBMUrkHWs5h",
+            "76a914fe98d17b4c1a568a83b659c611f726d9da044f9388ac", 0, 0 },
+          { "3K9KZZPB8NRwZVP5wNKX4VYhnswrJxpgZ4",
+            "a914bf73ad4cf3a107812bad3deb310611bee49a3c7987",     1, 0 },
+          { "bc1qqe2mj05z2q4zrqly789r59q5k53rhtgn8hznl0",
+            "00140655b93e82502a2183e4f1ca3a1414b5223bad13",       0, 1 },
+        };
+        for (unsigned i = 0; i < sizeof A / sizeof A[0]; i++){
+            char qj[200]; snprintf(qj, sizeof qj, "[\"%s\"]", A[i].addr);
+            rj_val* q = P(qj); DX("getaddressinfo", q);
+            char lbl[200];
+            snprintf(lbl, sizeof lbl, "getaddressinfo(%.14s..) carries scriptPubKey", A[i].addr);
+            ck(lbl, rc == 1 && r && S(r, "scriptPubKey") && !strcmp(S(r, "scriptPubKey"), A[i].spk));
+            snprintf(lbl, sizeof lbl, "...isscript = %d", A[i].isscript);
+            ck(lbl, rc == 1 && r && S(r, "isscript") && S(r, "isscript")[0] == (A[i].isscript ? '1' : '0'));
+            snprintf(lbl, sizeof lbl, "...iswitness = %d", A[i].iswitness);
+            ck(lbl, rc == 1 && r && S(r, "iswitness") && S(r, "iswitness")[0] == (A[i].iswitness ? '1' : '0'));
+            snprintf(lbl, sizeof lbl, "...and NO isvalid (that is validateaddress's field)");
+            ck(lbl, rc == 1 && r && rj_obj_get(r, "isvalid") == NULL);
+            rj_free(r); rj_free(q);
+        }
+        /* a witness address carries its program; a legacy one must not */
+        { rj_val* q = P("[\"bc1qqe2mj05z2q4zrqly789r59q5k53rhtgn8hznl0\"]"); DX("getaddressinfo", q);
+          ck("a witness address carries witness_program",
+             rc == 1 && r && S(r, "witness_program") &&
+             !strcmp(S(r, "witness_program"), "0655b93e82502a2183e4f1ca3a1414b5223bad13"));
+          rj_free(r); rj_free(q); }
+        { rj_val* q = P("[\"1QDBhj6F46WtVQ3TMqJT3YhnBMUrkHWs5h\"]"); DX("getaddressinfo", q);
+          ck("a legacy address carries no witness_program",
+             rc == 1 && r && rj_obj_get(r, "witness_program") == NULL);
+          rj_free(r); rj_free(q); }
+        /* THE BEHAVIOUR CHANGE: an undecodable address is an ERROR, not a
+         * success carrying isvalid:false */
+        { rj_val* q = P("[\"notanaddress\"]"); DX("getaddressinfo", q);
+          ck("an undecodable address is -5, as Core answers it", rc == 0 && ec == -5);
+          rj_free(r); rj_free(q); }
+        { rj_val* q = P("[\"bc1qzzzz\"]"); DX("getaddressinfo", q);
+          ck("...and so is a malformed bech32 one", rc == 0 && ec == -5);
+          rj_free(r); rj_free(q); }
+        /* validateaddress KEEPS isvalid and keeps answering rather than erroring */
+        { rj_val* q = P("[\"notanaddress\"]"); DX("validateaddress", q);
+          ck("validateaddress still ANSWERS for a bad address, with isvalid:false",
+             rc == 1 && r && S(r, "isvalid") && S(r, "isvalid")[0] == '0');
+          rj_free(r); rj_free(q); }
     }
 
     printf(fails ? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);

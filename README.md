@@ -162,11 +162,16 @@ testnet4, signet (public or custom) and regtest.
   plus the filter-header chain), all tip-following; `getindexinfo`.
 - `addrindex` (an extension with no Core equivalent): `getaddressbalance`
   and `getaddresstxids`.
+- **Every index is built by the daemon DURING the initial sync** (2026-09-16),
+  as sorted runs trailing the applied height with a bounded tail each, merged
+  as they accumulate: a node that reaches the tip has them all and there is no
+  build step afterwards — the same builders simply keep trailing. See
+  [`docs/devlog/INDEX_RUNS.md`](docs/devlog/INDEX_RUNS.md).
 - An Esplora-contract listener (`bmc.esploraport`, 2026-09-08) answers
   mempool.space's `BACKEND: "esplora"` in-process from the same RPC
   dispatch: blocks, transactions with fees and prevouts, outspends, merkle
   proofs, the mempool, fee estimates, and address pages from a native
-  address history index (`bmc_build_addr_hist`, about 200 GB on mainnet).
+  address history index (about 200 GB on mainnet, built during the sync).
   mempool.space runs against the node unpatched; see
   [`docs/MEMPOOL_SPACE.md`](docs/MEMPOOL_SPACE.md).
 - `getblocktemplate`/`submitblock`/`submitheader`,
@@ -286,7 +291,8 @@ included:
   main/                        one directory per chain: main, testnet4, signet, regtest
     blk*.dat index.dat headers.dat chainwork.dat     block archive
     utxo.dat utxo_run_*.dat utxo_manifest.dat ...    LSM UTXO store
-    txindex.dat, filters, coinstats, addrindex       optional indexes
+    txindex.* txospender.* addr_hist.* bfilters.* coinstats.*   optional indexes:
+                                 sorted runs + a bounded tail each, built during the sync
     peers2.dat                 address book (all networks)
     bmcwallet.enc | bmcwallet.dat, *.txlog           wallet store and journal
     mempool.dat                mempool persistence
@@ -357,7 +363,8 @@ log echoes the resolved values.
 | `dbcache` | `1024` MiB | UTXO memtable sizing |
 | `par` | `0` (auto) | script-verification threads |
 | `prune` | `0` | `0` off, `1` manual-only, `>=550` target size in MiB |
-| `txindex` / `addrindex` / `blockfilterindex` / `coinstatsindex` | `0` / `0` / `0` / `0` | optional indexes; `txindex` is adopted automatically when `txindex.dat` exists |
+| `txindex` / `txospenderindex` / `addrindex` / `blockfilterindex` / `coinstatsindex` | `0` | optional indexes, all built by the daemon during the sync; `addrindex` must be set BEFORE syncing (historic spends need undo) |
+| `bmc.indexrunblocks` | `20000` | heights per sorted run for the trailing index builders |
 | `checkblocks` / `checklevel` / `stopatheight` / `minimumchainwork` | `6` / `3` / `0` / chain default | startup verification and sync bounds |
 | `persistmempool` | `1` | reload `mempool.dat` at boot, write it at shutdown |
 | `walletpassfile` | — | absolute path, outside the datadir, to the wallet passphrase; refused if world-readable, group-writable or inside the datadir |

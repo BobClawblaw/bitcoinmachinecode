@@ -79,6 +79,7 @@ typedef struct {
     char zmq_hashtx[64];
     char zmq_rawblock[64];
     char zmq_rawtx[64];
+    char zmq_sequence[64];       /* Core -zmqpubsequence (daemon/mempool_seq.h) */
     char bind_addr[64];          /* Core -bind: listen address (empty = any) */
     /* ---- anonymity networks (2026-08-28). Core's names and defaults. ---- */
     char proxy[64];              /* -proxy=ip:port   SOCKS5 for every network that has no more specific proxy */
@@ -114,6 +115,11 @@ typedef struct {
     int  have_minchainwork;          /* 0 when neither config nor chain default set one   */
     long bantime;                    /* -bantime seconds (Core default 86400)             */
     int  blockfilterindex;           /* -blockfilterindex (default 1: keep current behaviour) */
+    int  txindex;                    /* -txindex: the daemon builds the txid index as sorted runs behind
+                                        the applied height, during and after the sync (2026-09-16) */
+    int  txospenderindex;            /* -txospenderindex: same shape (Core 30's index) */
+    long indexrunblocks;             /* bmc.indexrunblocks: heights per run the trailing builders make
+                                        (default 20000; the unsorted tail is never longer than this) */
     int  coinstatsindex;             /* -coinstatsindex   (default 1: keep current behaviour) */
     char rpccookiefile[256];         /* -rpccookiefile; empty = <datadir>/.cookie          */
     int  rpccookie;                  /* derived: emit and accept a cookie (default 1)      */
@@ -149,6 +155,10 @@ typedef struct {
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
     long mempoolexpiry_h;        /* Core -mempoolexpiry (hours, 0 = never)   */
+    long mempooljournal;         /* EXTENSION bmc.mempooljournal: records kept
+                                    in the mempool DEPARTURE ring, 0 = off.
+                                    Core has no counterpart -- it forgets a
+                                    transaction the moment it leaves the pool. */
     long maxuploadtarget_mb;     /* Core -maxuploadtarget (MB, 0 = no limit) */
     /* mempool policy limits (Core exposes each of these). Fees are stored in
      * sat/vByte (Core's config is BTC/kvB; parsed at the boundary). */

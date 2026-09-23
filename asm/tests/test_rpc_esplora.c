@@ -52,6 +52,21 @@ static int g_locks = 0, g_unlocks = 0; static void tlock(void){ g_locks++; } sta
 int rpc_dispatch(const char* method, const rj_val* params, const rpc_wallet* w, rj_val** result, long* ec, const char** em){
     (void)w; const char* p0 = params && params->typ == RJ_ARR && params->nitems ? params->items[0]->str : 0;
     long p1 = params && params->nitems > 1 && params->items[1]->str ? strtol(params->items[1]->str, 0, 10) : -1;
+    if (!strcmp(method, "estimatesmartfee")){
+        /* BTC/kvB, as Core reports it. Targets 1..6 and 144 answer; everything
+         * else has "no answer", which the route must OMIT rather than send as
+         * zero -- a zero feerate is a claim that a transaction pays nothing. */
+        long t = p0 ? strtol(p0, 0, 10) : 0;
+        if (t == 1)        { *result = J("{\"feerate\":0.00012500,\"blocks\":1}");  return 1; }
+        if (t == 2)        { *result = J("{\"feerate\":0.00010100,\"blocks\":2}");  return 1; }
+        if (t >= 3 && t <= 6){ *result = J("{\"feerate\":0.00002000,\"blocks\":6}"); return 1; }
+        if (t == 144)      { *result = J("{\"feerate\":0.00001000,\"blocks\":144}"); return 1; }
+        /* a target that answers with a ZERO feerate. Distinct from "no answer"
+         * above: the field is PRESENT, so only the value check can reject it.
+         * Without this case the omission rule is enforced by the missing-field
+         * guard alone and a reintroduction of the zero passes unnoticed. */
+        if (t == 7)        { *result = J("{\"feerate\":0.00000000,\"blocks\":7}");   return 1; }
+        *result = J("{\"errors\":[\"Insufficient data or no feerate found\"],\"blocks\":0}"); return 1; }
     if (!strcmp(method, "getblockchaininfo")){ *result = rj_parse("{\"blocks\":700000,\"bestblockhash\":\"" BH "\"}", strlen("{\"blocks\":700000,\"bestblockhash\":\"" BH "\"}")); return 1; }
     if (!strcmp(method, "getblockhash")){ if (p0 && !strcmp(p0, "700000")){ *result = rj_str(BH); return 1; } *ec = -8; *em = "Block height out of range"; return 0; }
     if (!strcmp(method, "getblockheader")){ if (!p0 || strcmp(p0, BH)){ *ec = -5; *em = "Block not found"; return 0; }
@@ -238,6 +253,28 @@ int main(void){
     /* a response over 1 MiB: the writer reports the needed length, the reply must grow (found live: garbage after the first MiB) */
     { g_big = 1; rj_val* m = POST("/internal/txs", "[\"" TX2 "\"]"); g_big = 0;
       ok(m && m->nitems == 1 && g_outlen > (1u << 20) && g_out[g_outlen - 1] == ']', "a >1 MiB response is complete and well-formed"); rj_free(m); }
+    /* ---- /fee-estimates ---------------------------------------------------
+     * The last route mempool.space's esplora client called that this facade
+     * answered 404 for. Esplora's shape is a FLAT MAP of confirmation target
+     * to feerate in sat/vB; Core reports BTC/kvB, so the conversion is x100000
+     * and it is done as string arithmetic, never a double.
+     *
+     * The rule that matters is the OMISSION: a target the estimator cannot
+     * answer is left out, not sent as zero. A caller that fell back to a zero
+     * feerate would build a transaction the network will not relay, so a
+     * missing key is the safe answer and a zero is a dangerous one. */
+    { rj_val* f = GET("/fee-estimates");
+      ok(f && f->typ == RJ_OBJ, "/fee-estimates answers a JSON object");
+      /* 0.000125 BTC/kvB = 12500 sat/kvB = 12.5 sat/vB */
+      ok(f && S(f, "1") && !strcmp(S(f, "1"), "12.5"), "target 1: BTC/kvB converted to sat/vB");
+      ok(f && S(f, "2") && !strcmp(S(f, "2"), "10.1"), "target 2");
+      ok(f && S(f, "6") && !strcmp(S(f, "6"), "2.0"),  "target 6");
+      ok(f && S(f, "144") && !strcmp(S(f, "144"), "1.0"), "the long target");
+      ok(f && !rj_obj_get(f, "7"),   "a target answering ZERO is OMITTED (the value check, not the missing-field one)");
+      ok(f && !rj_obj_get(f, "8"),   "a target with no answer at all is omitted too");
+      ok(f && !rj_obj_get(f, "1008"), "...and so is the longest one");
+      rj_free(f); }
+
     free(g_out);
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;

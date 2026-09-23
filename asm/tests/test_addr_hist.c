@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <dirent.h>
 #include "../daemon/addr_hist_fmt.h"
 #include "test_tmpdir.h"
 typedef unsigned char u8; typedef unsigned int u32; typedef unsigned long long u64;
@@ -16,6 +17,16 @@ extern int  tx_txid(void* out, const void* tx, unsigned long txlen, void* buf, u
 static int fails = 0, checks = 0;
 static void ck(const char* w, int c){ checks++; printf("%s %s\n", c ? "ok  :" : "FAIL:", w); if (!c) fails++; }
 static u8 store_buf[4096];
+/* The whole-chain join spills into 256 aho_/ahs_ bucket files and unlinks them
+ * in pass 2. A RUN takes its spends from undo and skips pass 2 altogether, so a
+ * run that CREATES those buckets can never remove them: measured on run 26,
+ * every run left 512 empty files in the chain directory. Count what is left. */
+static int bucket_files_left(void){
+    DIR* d = opendir("."); if (!d) return -1;
+    int n = 0; struct dirent* e;
+    while ((e = readdir(d))) if (!strncmp(e->d_name, "aho_b", 5) || !strncmp(e->d_name, "ahs_b", 5)) n++;
+    closedir(d); return n;
+}
 /* tx: version | nin inputs (prevout, empty scriptSig, seq) | nout outputs (value, P2WPKH to `who`) | locktime */
 static long mk_tx(u8* p, int tag, const u8* prev_txid, unsigned prev_vout, int nout, const u8* who, u64 value0){
     u8* s = p; *p++ = 1; *p++ = 0; *p++ = 0; *p++ = (u8)tag; *p++ = 1;
@@ -28,6 +39,7 @@ static long mk_tx(u8* p, int tag, const u8* prev_txid, unsigned prev_vout, int n
 }
 int main(void){
     char tool[4096]; if (!getcwd(tool, sizeof tool - 40)) return 1; strcat(tool, "/daemon/bmc_build_addr_hist");
+    char merger_path[4096]; if (!getcwd(merger_path, sizeof merger_path - 40)) return 1; strcat(merger_path, "/daemon/bmc_merge_index_runs");
     tt_isolate();
     memset(store_buf, 0, sizeof store_buf);
     ck("store_init", store_init(store_buf) == 1);
@@ -46,6 +58,7 @@ int main(void){
     store_rd_init(store_buf);
     { u8 k32[32]; memset(k32, 0, 32); memcpy(k32, A, 20); const ah_event* e0; ck("no index yet: ah_available false, ah_lookup -1", !ah_available() && ah_lookup(2, k32, &e0) == -1); }
     { char cmd[4300]; snprintf(cmd, sizeof cmd, "%s . 2>/dev/null", tool); ck("builder ran to the tip", system(cmd) == 0); }
+    ck("whole-chain build leaves no aho_/ahs_ bucket files behind", bucket_files_left() == 0);
     ck("index available, to_height 2", ah_available() && ah_to_height() == 2);
     u8 keyA[32], keyA1[32], keyB[32]; memset(keyA, 0, 32); memcpy(keyA, A, 20); memset(keyA1, 0, 32); memcpy(keyA1, A, 20); keyA1[0] = 0x12; memset(keyB, 0, 32); memcpy(keyB, B, 20);
     const ah_event* ev; long n = ah_lookup(2, keyA, &ev);
@@ -63,6 +76,49 @@ int main(void){
     if (n == 3){ ah_event e; memcpy(&e, (const u8*)ev + 2 * AH_EVENT_BYTES, sizeof e); ck("B's last event: FUND at height 2, txpos 1, 39 BTC", e.kind == AH_FUND && e.height == 2 && e.txpos == 1 && e.value == 3900000000ULL); }
     { u8 none[32]; memset(none, 0x99, 32); ck("an unknown address: 0 events", ah_lookup(2, none, &ev) == 0); }
     ck("the A key at the wrong type: 0 events", ah_lookup(1, keyA, &ev) == 0);
+    /* ---- 2026-09-16: RUN mode (spends from undo) + the multi-run reader + the merger --
+     * The daemon builds this index DURING the sync as runs behind the applied
+     * height. A run over [from,to] must equal the corresponding slice of the
+     * whole-chain build above, and two runs must read as one index. The
+     * spends' undo records are written here the way the engine writes them. */
+    {
+        extern long undo_append_record(long height, const u8 txid[32], u32 index, u64 value, u32 utxo_height, u8 is_coinbase, const u8* script, unsigned short slen);
+        extern long undo_commit(long height);
+        extern void ah_reset_for_test(void);
+        /* the whole-chain answers, kept for comparison */
+        static u8 wholeA[16 * AH_EVENT_BYTES], wholeB[16 * AH_EVENT_BYTES]; long nA, nB;
+        { const ah_event* e; nA = ah_lookup(2, keyA, &e); if (nA > 0) memcpy(wholeA, e, (size_t)nA * AH_EVENT_BYTES);
+          nB = ah_lookup(2, keyB, &e); if (nB > 0) memcpy(wholeB, e, (size_t)nB * AH_EVENT_BYTES); }
+        unlink(AH_FILE); ah_reset_for_test();
+        ck("no runs: unavailable", !ah_available());
+        /* undo for the two spends: h1 spends h0's coinbase (50 BTC to A); h2 spends tx1's output 0 (40 BTC to A) */
+        u8 spkA[22] = {0x00,0x14}; memcpy(spkA + 2, A, 20);        /* A is P2WPKH in this fixture (type 2) */
+        ck("undo h1 written", undo_append_record(1, txid[0], 0, 5000000000ULL, 0, 1, spkA, 22) >= 0 && undo_commit(1) >= 0);
+        ck("undo h2 written", undo_append_record(2, txid[2], 0, 4000000000ULL, 1, 0, spkA, 22) >= 0 && undo_commit(2) >= 0);
+        { char cmd[4400]; snprintf(cmd, sizeof cmd, "%s . 0 1 addr_hist.r000000000-000000001.dat", tool); ck("run [0,1] built from blocks + undo", system(cmd) == 0);
+          snprintf(cmd, sizeof cmd, "%s . 2 2 addr_hist.r000000002-000000002.dat", tool); ck("run [2,2] built", system(cmd) == 0); }
+        ck("a RUN leaves no aho_/ahs_ bucket files behind (run mode skips pass 2, which is what unlinks them)", bucket_files_left() == 0);
+        ah_reset_for_test();
+        ck("two runs: available, to_height 2 (the highest run)", ah_available() && ah_to_height() == 2 && ah_run_count() == 2);
+        { const ah_event* e; long n = ah_lookup(2, keyA, &e);
+          ck("A over two runs: the same 4 events as the whole-chain build, in the same order", n == nA && nA == 4 && !memcmp(e, wholeA, (size_t)nA * AH_EVENT_BYTES));
+          if (!(n == nA && nA == 4 && !memcmp(e, wholeA, (size_t)nA * AH_EVENT_BYTES))){
+              printf("      two-run A (%ld):", n); for (long i = 0; i < n; i++){ ah_event x; memcpy(&x, (const u8*)e + i * AH_EVENT_BYTES, sizeof x); printf(" [k%u h%u t%u i%u v%llu]", x.kind, x.height, x.txpos, x.idx, (unsigned long long)x.value); }
+              printf("\n      whole   A (%ld):", nA); for (long i = 0; i < nA; i++){ ah_event x; memcpy(&x, wholeA + i * AH_EVENT_BYTES, sizeof x); printf(" [k%u h%u t%u i%u v%llu]", x.kind, x.height, x.txpos, x.idx, (unsigned long long)x.value); }
+              printf("\n"); }
+          n = ah_lookup(2, keyB, &e);
+          ck("B over two runs: the same 3 events", n == nB && nB == 3 && !memcmp(e, wholeB, (size_t)nB * AH_EVENT_BYTES)); }
+        /* the merger folds the two runs into one; the reader sees one run with the same answers */
+        { char cmd[4400]; snprintf(cmd, sizeof cmd, "%s . addr_hist", merger_path);
+          ck("merger ran", system(cmd) == 0); }
+        ah_reset_for_test();
+        ck("after the merge: one run, to_height 2", ah_available() && ah_run_count() == 1 && ah_to_height() == 2);
+        { const ah_event* e; long n = ah_lookup(2, keyA, &e);
+          ck("A after the merge: still the 4 events", n == 4 && !memcmp(e, wholeA, 4 * AH_EVENT_BYTES));
+          n = ah_lookup(2, keyB, &e); ck("B after the merge: still the 3 events", n == 3 && !memcmp(e, wholeB, 3 * AH_EVENT_BYTES)); }
+        { char rn[64] = "addr_hist.r000000000-000000002.dat"; struct stat sb; ck("the merged run has the union name", stat(rn, &sb) == 0); unlink(rn); }
+        ah_reset_for_test();
+    }
     unlink(AH_FILE);
 
     /* the sparse search: 700 keys (> 2 strides), every key found, gaps not */

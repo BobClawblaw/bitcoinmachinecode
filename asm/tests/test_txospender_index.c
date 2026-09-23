@@ -59,13 +59,21 @@ int main(void){
 
     printf("== 1. no index yet ==\n");
     ck("index unavailable", !rpc_chain_txospender_available());
-    tsp_boot(store_buf); ck("tail disabled without a base", !tsp_active());
-    snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":0}]]", t0d); p = rj_parse(pj, strlen(pj)); r = NULL;
-    ck("gettxspendingprevout defaults to mempool-only and answers (no spender known)", rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em) && r && r->nitems == 1 && !S(r->items[0], "spendingtxid"));
-    rj_free(p); rj_free(r);
     snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":0}],{\"mempool_only\":false}]", t0d); p = rj_parse(pj, strlen(pj)); r = NULL;
-    ck("...mempool_only=false without the index -> Core's error", !rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em) && ec == -1 && em && strstr(em, "txospenderindex is unavailable"));
+    ck("mempool_only=false without the index -> Core's error", !rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em) && ec == -1 && em && strstr(em, "txospenderindex is unavailable"));
     rj_free(p); if (r) rj_free(r);
+    snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":0}]]", t0d); p = rj_parse(pj, strlen(pj)); r = NULL;
+    ck("gettxspendingprevout defaults to mempool-only without the index and answers (no spender known)", rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em) && r && r->nitems == 1 && !S(r->items[0], "spendingtxid"));
+    rj_free(p); rj_free(r);
+    /* 2026-09-16: without a base the tail starts at genesis and the index is
+     * AVAILABLE through it (a run folds the tail later); Core's default for
+     * mempool_only then flips to false, so the confirmed spend is answered */
+    tsp_boot(store_buf); ck("2026-09-16: without a base the tail starts at genesis (a run folds it later)", tsp_active());
+    ck("...and the index is available through the tail", rpc_chain_txospender_available());
+    snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":0}]]", t0d); p = rj_parse(pj, strlen(pj)); r = NULL;
+    ck("gettxspendingprevout (default = the index) names h1's tx as the spender of h0:0",
+       rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em) && r && r->nitems == 1 && S(r->items[0], "spendingtxid") && !strcmp(S(r->items[0], "spendingtxid"), t1d));
+    rj_free(p); rj_free(r);
 
     printf("== 2. base [0,1] built by the tool, tail covers h2..h3 ==\n");
     { char cmd[4300]; snprintf(cmd, sizeof cmd, "%s . 0 1 2>/dev/null", tool); ck("builder ran", system(cmd) == 0); }
@@ -105,6 +113,32 @@ int main(void){
       rj_val* ti = ok && r ? rj_obj_get(r, "txospenderindex") : NULL;
       ck("getindexinfo lists txospenderindex synced to the tip", ti && S(ti, "synced") && S(ti, "synced")[0] == '1' && S(ti, "best_block_height") && !strcmp(S(ti, "best_block_height"), "3"));
       rj_free(p); if (r) rj_free(r); }
+    printf("== 5. txospenderindex=0 with the index files present (2026-09-19) ==\n");
+    /* Core without -txospenderindex: gettxspendingprevout is mempool-only by
+     * default, mempool_only=false names the first unanswered outpoint, and
+     * getindexinfo does not list the index. The reader used to go by the
+     * files alone -- run 27 listed a txospender index nobody configured.
+     * Watched to FAIL with the gate removed: the index stays available, the
+     * default answer carries the confirmed spender, getindexinfo lists it. */
+    rpc_chain_set_index_config(1, 0, 1, 1, 0);
+    ck("configured off: unavailable although txospender.dat and the tail exist", !rpc_chain_txospender_available());
+    ck("...and the lookup answers nothing", !rpc_chain_txospender_lookup(txid[0], 0, sp, &h, bh, NULL, 0, NULL));
+    snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":0}]]", t0d); p = rj_parse(pj, strlen(pj)); r = NULL;
+    ck("...gettxspendingprevout defaults to mempool-only: no confirmed spender reported",
+       rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em) && r && r->nitems == 1 && !S(r->items[0], "spendingtxid") && !S(r->items[0], "blockhash"));
+    rj_free(p); if (r) rj_free(r);
+    { char want[256]; snprintf(want, sizeof want, "No spending tx for the outpoint %s:0 in mempool, and txospenderindex is unavailable.", t0d);
+      snprintf(pj, sizeof pj, "[[{\"txid\":\"%s\",\"vout\":0}],{\"mempool_only\":false}]", t0d); p = rj_parse(pj, strlen(pj)); r = NULL;
+      ck("...mempool_only=false: Core v31.1's -1 text, naming the outpoint",
+         !rpc_node_dispatch("gettxspendingprevout", p, &r, &ec, &em) && ec == -1 && em && !strcmp(em, want));
+      rj_free(p); if (r) rj_free(r); }
+    { extern int rpc_chain_dispatch(const char* method, const rj_val* params, rj_val** res, long* ec, const char** em);
+      p = rj_parse("[]", 2); r = NULL;
+      int ok = rpc_chain_dispatch("getindexinfo", p, &r, &ec, &em);
+      ck("...getindexinfo does not list txospenderindex", ok && r && rj_obj_get(r, "txospenderindex") == NULL);
+      rj_free(p); if (r) rj_free(r); }
+    rpc_chain_set_index_config(1, 1, 1, 1, 0);
+    ck("configured on again: available", rpc_chain_txospender_available());
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
 }

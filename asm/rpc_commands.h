@@ -84,4 +84,12 @@ void rpc_commands_set_utxo_store(void* lst, void* u);
  * it -- restart/remap to pick up a freshly rebuilt file. */
 void rpc_commands_set_addr_index(const void* base, unsigned long long size);
 
+/* The name the daemon actually opened its debug log as ("debug.log" by
+ * default, or whatever -debuglogfile= set, "0" meaning /dev/null), for
+ * getrpcinfo's `logpath`. Relative names are reported against the cwd.
+ * rpc_commands.o links into targets that have no daemon, so the daemon
+ * pushes the value across here rather than either side referencing the
+ * other -- the same seam as wallet_pass_set_file(). */
+void rpc_set_logpath(const char* path);
+
 #endif /* RPC_COMMANDS_H */

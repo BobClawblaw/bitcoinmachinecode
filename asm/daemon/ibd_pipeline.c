@@ -36,8 +36,25 @@ extern long store_append_shared(void* st, long height, const unsigned char hash[
 /* 2026-09-08: the sink (see ibd_pipeline.h). NULL = store_append_shared. */
 static ibd_sink_fn g_sink = 0;
 void ibd_pipeline_set_sink(ibd_sink_fn sink){ g_sink = sink; }
+/* 2026-09-17: the frontier guard, on the SAME seam as the sink and for the same
+ * link reason -- ibd_pipeline.o is linked by targets that do not pull in
+ * daemon/archive_verify.c, so the daemon pushes the function in rather than
+ * this file referencing it.
+ *
+ * Why it belongs HERE and not only at the committer: store_append_shared is
+ * reached by three appenders, not one. The committer during the download, the
+ * serve loop storing a new block at the tip, and the boot catch-up -- each with
+ * its OWN store handle. A handle whose cur_file_no is behind does not fail; it
+ * fills the tail gap of every older blk file on the way up, putting a lower
+ * offset at a higher height. Guarding only the committer left the other two
+ * able to break the layout after the sync, which is exactly when a node is
+ * expected to run untouched for months. */
+static void (*g_frontier)(void*) = 0;
+void ibd_pipeline_set_frontier(void (*f)(void*)){ g_frontier = f; }
 static long ibd_sink(void* st, long height, const unsigned char hash[32], const unsigned char* raw, unsigned len){
-    return g_sink ? g_sink(st, height, hash, raw, len) : store_append_shared(st, height, hash, raw, len);
+    if (g_sink) return g_sink(st, height, hash, raw, len);   /* staged; the committer appends it */
+    if (g_frontier) g_frontier(st);                          /* never append below the frontier */
+    return store_append_shared(st, height, hash, raw, len);
 }
 
 static long g_last_batch = 0; static int g_last_fail = 0;

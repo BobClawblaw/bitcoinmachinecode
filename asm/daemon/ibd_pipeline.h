@@ -71,4 +71,8 @@ void ibd_pipeline_set_bytes(void (*cb)(long));
  * chunk, exactly as the store did. Returns <0 to fail the chunk. */
 typedef long (*ibd_sink_fn)(void* st, long height, const unsigned char hash[32], const unsigned char* raw, unsigned len);
 void ibd_pipeline_set_sink(ibd_sink_fn sink);
+/* Called on the store handle before every UNSTAGED append, so an append can
+ * never land below the archive frontier and break the layout. Pass
+ * archive_store_frontier. NULL = no guard (tests). */
+void ibd_pipeline_set_frontier(void (*f)(void*));
 #endif

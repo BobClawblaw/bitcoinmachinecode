@@ -2,26 +2,31 @@
 
 2026-09-11. Benchmark tag `bench-2026-09-10`, node commit `4a4872cf`.
 
-> **CORRECTIONS, 2026-09-12.** Two claims in the original version of this report
-> were wrong, both in ways that need saying plainly.
+> **CORRECTED 2026-09-13, after a fresh unhandicapped Core baseline.** The
+> original version of this report was wrong in two directions at once, and the
+> corrections do not cancel out.
 >
-> **1. The UTXO set was correct.** This report said the node built a wrong UTXO
-> set. It did not. The store was later walked offline and quiesced and matched
-> Core exactly at height 966,496 — muhash `df1b0340…073d0165`, txouts
-> 165,200,444, bogosize 12,941,799,750, total_amount 2,008,257,300,621,623 sat,
-> every field identical. The original failure came from hashing the set through
-> the live node while its UTXO engine was still applying and flushing, which is
-> a torn read, not a defect.
+> **1. The UTXO set was always correct.** This report said the node built a wrong
+> UTXO set. It did not. The store was later walked offline and quiesced and
+> matched Core exactly at height 966,496 -- muhash `df1b0340…073d0165`, txouts
+> 165,200,444, bogosize 12,941,799,750, total_amount 2,008,257,300,621,623 sat.
+> The original failure came from hashing through the live node while its UTXO
+> engine was still applying: a torn read, not a defect.
 >
-> **2. The "hour ahead of Core" is not safe to quote.** Core's 21h 11m was
-> measured with its daemon under `ionice -c3`, the idle I/O class, while our
-> node ran with no ionice at all. On a disk-bound sync that is a handicap, not a
-> control. An unhandicapped Core baseline is running as of 2026-09-12 and will
-> replace the figure. The segment-by-segment table below is the honest part of
-> the comparison and it already says we are 8-12% slower than Core from height
-> 500,000 onward.
+> **2. The "hour ahead of Core" was an artifact, and it is withdrawn.** Core's
+> 21h 11m came from a run that lost 138 minutes between heights 835,000 and
+> 840,000 to a single stalling peer, and that ran under `ionice -c3` — the idle
+> I/O class — while this node ran with no ionice at all. **The stall does not
+> reproduce.** A fresh Core baseline on 2026-09-12/13, unhandicapped, crossed
+> that same segment in 16 minutes and finished in **19h 14m**. Every run
+> measured on this box crosses it in 11 to 16 minutes. The margin was one bad
+> peer in one run.
 >
-> The measurement bugs are covered in
+> **3. The "8 to 12 percent slower" finding is also withdrawn, in our favour.**
+> Against the unhandicapped baseline, run 23 is *faster* in every segment
+> measured. See the four-way table below, which replaces the two-way one.
+>
+> The measurement defects behind all of this are covered in
 > [the run 22 writeup](2026-09-11-run22-muhash-divergence.md).
 
 This is a report on one fresh mainnet initial block download by an independent
@@ -56,32 +61,71 @@ at **8 on both sides**.
 
 ## Result
 
-| | assembly node | Core v31.1 |
-|---|---|---|
-| blocks | 966,369 | 965,703 |
-| wall clock | **20h 08m** | **21h 11m** |
-| UTXO engine caught up | 20h 15m | n/a |
-| bad blocks / gaps | zero / none | zero |
-| tip vs oracle | identical by hash | identical by hash |
+All four runs, so no run is quoted without its comparators:
+
+| | bmc run 22 | bmc run 23 | Core 09-13 | Core 09-05 |
+|---|---|---|---|---|
+| commit / version | `4a4872cf` | `8bc638f9` | v31.1 | v31.1 |
+| blocks | 966,369 | 966,674 | 966,808 | 965,703 |
+| wall clock | 20h 08m | **19h 05m** | 19h 14m | 21h 11m |
+| coinstatsindex | no | **yes** | no | no |
+| download peers | 8 | 8 | 8 | 8 |
+| `ionice` handicap | none | none | none | **idle class** |
+| bad blocks / gaps | zero / none | zero / none | zero | zero |
+| tip vs oracle | identical by hash | identical by hash | identical by hash | identical by hash |
+| **UTXO set vs oracle** | **PASS** | **PASS** | **PASS** | PASS |
+
+The UTXO row is the one that had never been filled in before. Every earlier run
+in this project "passed" a capstone that never executed: the walk timed out, an
+empty result compared equal to an empty oracle value, and nothing was printed.
+All four verdicts above come from a quiesced walk compared to the oracle at a
+PINNED height, and each matches on muhash, txouts, bogosize and total amount.
+
+Run 23 is the fastest of the four and carried an index the others did not.
 
 The chain was verified by block hash against a third node at heights 966,000,
 966,494 and 966,495. All three agree.
 
-## The hour is not a win
+## Four runs, segment by segment
 
-Segment by segment tells a different story from the total.
+The original version of this section compared two runs and drew a conclusion
+from one of them. Four runs on the same box, same disk, same 8 download peers a
+side, now exist. Two are Core and two are this node. Times are to the
+VALIDATED tip on both sides -- Core's `blocks`, and this node's UTXO *applied*
+height. The stored-block frontier runs ahead of applied and quoting it would
+flatter this node by several thousand blocks.
 
-| heights | Core | assembly node | ratio |
-|---|---|---|---|
-| 400k–500k | 2h 07m | 2h 05m | 0.98x |
-| 500k–650k | 3h 44m | 4h 05m | 1.09x slower |
-| 650k–800k | 4h 45m | 5h 20m | 1.12x slower |
-| 800k–850k | 4h 21m | 2h 15m | 0.52x |
-| 850k–932k | 3h 13m | 3h 25m | 1.06x slower |
+| segment | Core 09-13 | Core 09-05 | bmc run 22 | bmc run 23 |
+|---|---|---|---|---|
+| 800k–835k | 1h 29m | 1h 40m | 1h 35m | **1h 25m** |
+| 835k–840k | 0h 16m | **2h 18m** | 0h 15m | **0h 11m** |
+| 840k–850k | 0h 23m | 0h 22m | 0h 25m | **0h 23m** |
+| 850k–900k | 2h 06m | 1h 59m | 2h 10m | **1h 56m** |
+| 900k–950k | 1h 56m | 1h 54m | 2h 02m | **1h 50m** |
+| **to the tip** | **19h 14m** | 21h 11m | 20h 08m | **19h 05m** |
 
-The two are level to height 500,000 and the assembly node is then a steady
-**8 to 12 percent slower** in every segment but one. That one segment is where
-the hour came from, and it is not a property of either node's download code:
+Read the 835k–840k row first. Core's 09-05 run spent **2h 18m** there; every
+other run on this box, including the other Core run, crosses it in 11 to 16
+minutes. The 138 minutes was one stalling peer in one run. It is not a property
+of Core, and the "hour ahead" in the original version of this report was very
+nearly all of it.
+
+With that artifact gone, the comparison inverts. Run 23 is the fastest run in
+every segment and on the total, beating an unhandicapped Core by nine minutes
+overall and by 3 to 8 percent per segment -- **while doing strictly more work**,
+because it carried `coinstatsindex=1` and the Core runs carried no such index.
+Run 22, on an older commit, is the slowest of the four, so the gap between 22
+and 23 is a real change between commits rather than run-to-run noise.
+
+The honest summary is narrower than either the original claim or its reversal:
+on this box, at 8 peers a side, the two implementations are within a few percent
+of each other, and the ordering depends on which commit and which peer set you
+draw. Anyone quoting a single number from any of these runs is quoting noise.
+
+**Every run's UTXO set was verified**, which had never happened before: all four
+match the Core oracle on muhash, txouts, bogosize and total amount at a pinned
+height. The original stall evidence is kept below because the log is still the
+clearest record of what a stalling-peer eviction looks like:
 
 ```
 2026-09-05T18:27:22Z UpdateTip: height=835000

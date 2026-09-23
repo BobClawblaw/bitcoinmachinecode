@@ -20,6 +20,10 @@ line per check and a final RESULT line; exit 0 only if every check passed.
 """
 import base64, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
 
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CORE = os.environ.get("CORE_BIN", "/storage/bitcoin-core-source/build-zmq/bin")
 PORT, RPCPORT = 18580, 18581
@@ -399,6 +403,9 @@ def main():
         except Exception: pass
         core.stop()
         shutil.rmtree(tmp, ignore_errors=True)
+    # checks counts comparisons actually made; zero of them prints
+    # 'RESULT: 0 ok, 0 fail' and exits 0.
+    require_cases(checks, 'miniscript checks')
     print(f"RESULT: {checks - fails} ok, {fails} fail")
     sys.exit(1 if fails else 0)
 if __name__ == "__main__": main()

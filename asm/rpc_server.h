@@ -55,9 +55,11 @@ typedef struct {
      * checking nothing would leave the ACL a comment. */
     int (*allows)(const char* ip);
     /* 2026-09-01 (Core -rpcthreads/-rpcworkqueue/-rpcservertimeout): 0 =
-     * Core's defaults (16 / 64 / 30 s). Handlers still execute one at a
-     * time (g_exec_lock); the pool bounds how many CLIENTS are being read,
-     * and the queue how many wait beyond that -- past it Core answers 503. */
+     * Core's defaults (16 / 64 / 30 s). -rpcthreads sizes BOTH pools (the
+     * intake threads that read, authenticate and answer the lock-free
+     * methods, and the execution threads that run the rest -- 2026-09-19),
+     * and the queue bounds how many wait beyond that -- past it Core answers
+     * 503. Write-locked handlers still run one at a time (g_exec_lock). */
     int threads;
     int workqueue;
     int timeout_s;

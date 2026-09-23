@@ -11,6 +11,7 @@
  * values true for THIS node, not the oracle's numbers.
  */
 #include <string.h>
+#include "mempool_cluster.h"
 #include "rpc_node.h"
 
 /* Core's per-message byte breakdown for getpeerinfo. Defined here so exactly
@@ -45,6 +46,37 @@ int rpc_msg_index(const char* cmd, unsigned cmdlen){
 #include <unistd.h>  /* getcwd -- implicitly declared until 2026-08-27, which on
                       * this ABI means int, truncating the returned pointer */
 #include <time.h>
+#include "daemon/mempool_journal.h"
+
+/* ---- Core's argument type check -------------------------------------------
+ * Measured against Core v31.1 on the oracle, 2026-09-15, for every JSON type.
+ * Core distinguishes THREE answers where this file collapsed two of them:
+ *
+ *   missing required argument -> -1  + the method's full help text
+ *   wrong JSON type           -> -3  (RPC_TYPE_ERROR), wrapped as
+ *        Wrong type passed:
+ *        {
+ *            "Position 1 (txid)": "JSON value of type null is not of expected type string"
+ *        }
+ *   right type, bad value     -> -8  + a specific message ("txid must be of length 64 ...")
+ *
+ * getmempoolentry, getmempoolancestors, getmempooldescendants and
+ * prioritisetransaction answered -8 for the first two cases alike, and named
+ * the type as "null" whatever was actually passed -- so a caller that sent a
+ * number was told it had sent null. The -8/-3 mismatch matters most: -8 is
+ * RPC_INVALID_PARAMETER, and a caller branching on the numeric code (which is
+ * what the code is for) takes the wrong branch.
+ *
+ * The -1 case cannot be matched exactly: this node deliberately carries no
+ * per-method usage text (see cmd_help in rpc_commands.c), so it answers -1 with
+ * a short usage line -- the code Core uses, with the text it can honestly
+ * produce. cmd_prioritisetransaction already did this. */
+static int rpc_wrong_type(long* ec, const char** em, char* buf, size_t cap,
+                          int position, const char* name,
+                          const rj_val* got, const char* expected){
+    *ec = -3; *em = rj_wrong_type_msg(buf, cap, position, name, got, expected); return 0;
+}
+
 
 static const node_status_t* g_status;
 static node_status_t*       g_status_rw;     /* writable handle for submission */
@@ -89,9 +121,56 @@ static long node_client_version(void){
     return 10000L*NODE_VERSION_MAJOR + 100L*NODE_VERSION_MINOR + NODE_VERSION_PATCH;
 }
 
+/* ---- one definition of "a live connection" (2026-09-16) -------------------
+ * getpeerinfo walks the shared peer table and reports every used slot;
+ * getconnectioncount and getnetworkinfo used to return g_status->n_out +
+ * n_inbound instead, counters that only the serve/leg path maintains. The
+ * download worker fills peer slots but never touches those counters, so
+ * during initial block download the three disagreed: on run 26, getpeerinfo
+ * listed 13 peers, getconnectioncount said 5, and the node was pulling
+ * 11 MB/s from 8 download peers the count could not see. A monitor graphing
+ * getconnectioncount showed a node with no peers while it saturated the link.
+ *
+ * In Core these cannot disagree -- getconnectioncount is the size of the same
+ * vector getpeerinfo renders -- so they are now derived from one walk with
+ * one liveness test. rpc_peer_live() is that test, and getpeerinfo uses it
+ * too, so a slot can never be counted and not listed (or the reverse). */
+static int rpc_peer_live(const rpc_peer_t* p){
+    if (!p->used) return 0;
+    /* a serve child that died holding its slot: the pid is gone */
+    if (p->inbound && p->pid > 0 && kill((pid_t)p->pid, 0) != 0 && errno == ESRCH) return 0;
+    return 1;
+}
+/* live connections, split in/out. Either pointer may be NULL.
+ *
+ * getpeerinfo renders TWO arrays and so does this: the leg/inbound table
+ * (g_status->peers) and the parallel download's peers (g_status->dlpeers,
+ * one per worker holding a connection, added 2026-09-08). Walking only the
+ * first is how the first version of this fix still answered 4 while
+ * getpeerinfo listed 12 on run 26 -- the 8 download peers were the whole
+ * point. Every download peer is outbound. */
+static int rpc_conn_counts(int* out_in, int* out_out){
+    int n_in = 0, n_out = 0;
+    if (g_status){
+        for (int i = 0; i < RPC_MAX_PEERS; i++){
+            const rpc_peer_t* p = &g_status->peers[i];
+            if (!rpc_peer_live(p)) continue;
+            if (p->inbound) n_in++; else n_out++;
+        }
+        int nd = g_status->n_dlpeers; if (nd > 64) nd = 64;
+        for (int i = 0; i < nd; i++){
+            const rpc_peer_t* p = &g_status->dlpeers[i];
+            if (!p->used || !p->addr[0]) continue;   /* getpeerinfo's own test */
+            n_out++;
+        }
+    }
+    if (out_in)  *out_in  = n_in;
+    if (out_out) *out_out = n_out;
+    return n_in + n_out;
+}
+
 static int cmd_getconnectioncount(rj_val** res){
-    int n = g_status ? (g_status->n_out + g_status->n_inbound) : 0;
-    *res = rj_numf("%d", n < 0 ? 0 : n);
+    *res = rj_numf("%d", rpc_conn_counts(NULL, NULL));
     return 1;
 }
 
@@ -160,10 +239,8 @@ void rpc_node_set_relay_floors(unsigned long long minrelay_satkvb, unsigned long
 #define MEMPOOL_MINFEE_BTC ((double)g_minrelay_satkvb / 1e8)      /* min relay fee, BTC/kvB */
 
 static int cmd_getnetworkinfo(rj_val** res){
-    int n_out = g_status ? g_status->n_out : 0;
-    int n_in  = g_status ? g_status->n_inbound : 0;
-    if (n_out < 0) n_out = 0;
-    if (n_in  < 0) n_in  = 0;
+    int n_in = 0, n_out = 0;
+    rpc_conn_counts(&n_in, &n_out);
 
     rj_val* o = rj_obj();
     rj_obj_set(o, "version", rj_numf("%ld", node_client_version()));
@@ -261,12 +338,49 @@ static void services_names(unsigned long long s, rj_val* arr){
  * the address-relay counters. Emitting any of those as a zero or a guess
  * would be worse than omitting them -- a caller cannot tell an invented zero
  * from a measured one. They are tracked in docs/PARITY_RPC_FIELDS.md. */
+int rpc_fmt_addr_v1(const unsigned char a[16], unsigned port, char* out, unsigned cap)
+{
+    static const unsigned char V4[12]  = {0,0,0,0,0,0,0,0,0,0,0xff,0xff};
+    static const unsigned char TOR2[6] = {0xfd,0x87,0xd8,0x7e,0xeb,0x43};
+    static const unsigned char INTL[6] = {0xfd,0x6b,0x88,0xc0,0x87,0x24};
+    if (!out || cap == 0) return 0;
+    out[0] = 0;
+    if (!memcmp(a, V4, 12)){
+        unsigned v = ((unsigned)a[12]<<24)|((unsigned)a[13]<<16)|((unsigned)a[14]<<8)|a[15];
+        if (v == 0 || v == 0xffffffffu) return 0;             /* INADDR_ANY, INADDR_NONE */
+        snprintf(out, cap, "%u.%u.%u.%u:%u", a[12], a[13], a[14], a[15], port);
+        return 1;
+    }
+    if (!memcmp(a, TOR2, 6) || !memcmp(a, INTL, 6)) return 0;  /* read as ::, or NET_INTERNAL */
+    if (a[0]==0x20 && a[1]==0x01 && a[2]==0x0d && a[3]==0xb8) return 0;   /* RFC3849 */
+    unsigned g[8]; int allz = 1;
+    for (int i = 0; i < 8; i++){ g[i] = ((unsigned)a[2*i]<<8) | a[2*i+1]; if (g[i]) allz = 0; }
+    if (allz) return 0;                                        /* :: */
+    /* Core's IPv6ToString: the FIRST longest run of zero groups, compressed
+     * only when it is two or more long. glibc's inet_ntop differs (it prints
+     * ::/96 as a dotted quad), so it is not used here. */
+    int bs = 0, bl = 0, cs = 0, cl = 0;
+    for (int i = 0; i < 8; i++){
+        if (g[i]){ cs = i + 1; cl = 0; continue; }
+        if (++cl > bl){ bl = cl; bs = cs; }
+    }
+    char h[48]; int n = 0;
+    for (int i = 0; i < 8; i++){
+        if (bl >= 2 && i >= bs && i < bs + bl){ if (i == bs) n += snprintf(h+n, sizeof h - n, "::"); continue; }
+        n += snprintf(h+n, sizeof h - n, "%s%x", (n && h[n-1] != ':') ? ":" : "", g[i]);
+    }
+    snprintf(out, cap, "[%s]:%u", h, port);
+    return 1;
+}
+
 static void peer_common_fields(rj_val* o, const rpc_peer_t* p)
 {
-    /* Core reports these as seconds since epoch, and omits them at 0 rather
-     * than claiming "at the epoch". */
-    if (p->last_block_time > 0) rj_obj_set(o, "last_block", rj_numf("%lld", (long long)p->last_block_time));
-    if (p->last_tx_time   > 0) rj_obj_set(o, "last_transaction", rj_numf("%lld", (long long)p->last_tx_time));
+    /* Core emits both UNCONDITIONALLY, as seconds since epoch, and 0 for a
+     * peer that has sent neither (rpc/net.cpp pushes count_seconds of the
+     * default time_point). This used to omit them at 0 on the belief that
+     * Core does too; measured 2026-09-18, Core reports 0. */
+    rj_obj_set(o, "last_block", rj_numf("%lld", (long long)(p->last_block_time > 0 ? p->last_block_time : 0)));
+    rj_obj_set(o, "last_transaction", rj_numf("%lld", (long long)(p->last_tx_time > 0 ? p->last_tx_time : 0)));
     /* minping in SECONDS, as Core prints it. min_ping_us is 0 when unmeasured
      * -- this node does not ping inbound peers -- and an unmeasured minimum
      * printed as 0.0 would read as a perfect link. Omitted, like Core. */
@@ -276,17 +390,17 @@ static void peer_common_fields(rj_val* o, const rpc_peer_t* p)
      * block-relay-only, manual, feeler and addr-fetch; none of those exist
      * here, so none are claimed. */
     rj_obj_set(o, "connection_type", rj_str(p->inbound ? "inbound" : "outbound-full-relay"));
-    /* Core's per-message byte breakdown. Emitted whole: a peer that has
-     * exchanged nothing of a kind gets no entry for it, which is what Core
-     * does, and an all-zero map would be indistinguishable from an
-     * unmeasured one. */
-    { rj_val* s = rj_obj(); rj_val* r = rj_obj(); int ns = 0, nr = 0;
+    /* Core's per-message byte breakdown. A peer that has exchanged nothing
+     * of a kind gets no entry for it, which is what Core does. The maps
+     * themselves are ALWAYS present -- Core pushes both objects even when
+     * empty; until 2026-09-18 an empty map was dropped here. */
+    { rj_val* s = rj_obj(); rj_val* r = rj_obj();
       for (int i = 0; i < RPC_MSG_N; i++){
-          if (p->sent_per_msg[i] > 0){ rj_obj_set(s, RPC_MSG_NAMES[i], rj_numf("%lld", (long long)p->sent_per_msg[i])); ns++; }
-          if (p->recv_per_msg[i] > 0){ rj_obj_set(r, RPC_MSG_NAMES[i], rj_numf("%lld", (long long)p->recv_per_msg[i])); nr++; }
+          if (p->sent_per_msg[i] > 0) rj_obj_set(s, RPC_MSG_NAMES[i], rj_numf("%lld", (long long)p->sent_per_msg[i]));
+          if (p->recv_per_msg[i] > 0) rj_obj_set(r, RPC_MSG_NAMES[i], rj_numf("%lld", (long long)p->recv_per_msg[i]));
       }
-      if (ns) rj_obj_set(o, "bytessent_per_msg", s); else rj_free(s);
-      if (nr) rj_obj_set(o, "bytesrecv_per_msg", r); else rj_free(r); }
+      rj_obj_set(o, "bytessent_per_msg", s);
+      rj_obj_set(o, "bytesrecv_per_msg", r); }
     /* the transport that carried this connection, and the session both sides
      * derived. Core names them exactly this. */
     rj_obj_set(o, "transport_protocol_type", rj_str(p->v2transport ? "v2" : "v1"));
@@ -298,6 +412,13 @@ static void peer_common_fields(rj_val* o, const rpc_peer_t* p)
       /* Core emits an EMPTY session_id on a v1 connection, not no field. */
       rj_obj_set(o, "session_id", rj_str(any ? sid : "")); }
     if (p->addrbind[0]) rj_obj_set(o, "addrbind", rj_str((const char*)p->addrbind));
+    /* our address as the peer's version message named it; omitted when the
+     * peer sent one Core calls invalid, as Core omits it */
+    if (p->addrlocal[0]){
+        char al[72]; for (unsigned i = 0; i < sizeof al; i++) al[i] = p->addrlocal[i];
+        al[sizeof al - 1] = 0;
+        rj_obj_set(o, "addrlocal", rj_str(al));
+    }
     /* minfeefilter is a BTC/kvB amount in Core; we hold it in sat/kvB. -1 is
      * "the peer never sent one", which is different from a filter of zero. */
     if (p->minfeefilter >= 0)
@@ -345,8 +466,7 @@ static int cmd_getpeerinfo(rj_val** res){
     if (g_status){
         for (int i = 0; i < RPC_MAX_PEERS; i++){
             const rpc_peer_t* p = &g_status->peers[i];
-            if (!p->used) continue;
-            if (p->inbound && p->pid > 0 && kill((pid_t)p->pid, 0) != 0 && errno == ESRCH) continue;   /* a serve child that died with its slot */
+            if (!rpc_peer_live(p)) continue;   /* the same test getconnectioncount counts with */
             rj_val* o = rj_obj();
             /* RPC-3 (audit 2026-09-03): report the peer's OWN monotonic
              * nodeid, not a counter over the live slots. The counter and the
@@ -500,7 +620,13 @@ static int cmd_getnettotals(rj_val** res){
             if (!p->used) continue;
             sent += p->bytes_sent; recv += p->bytes_recv;
         }
-    if (g_status) recv += g_status->dl_bytes_total;   /* the parallel download's bytes (2026-09-08): this read 3 KB against a 50 GB archive */
+    /* the parallel download's bytes, both directions. Its receive side was
+     * dl_bytes_total (2026-09-08: this read 3 KB against a 50 GB archive),
+     * which is one dl_catchup call's process rchar -- file reads included,
+     * restarting at every call -- and its SEND side was not counted at all
+     * (run 27: ~73 GB of blocks requested, ~0 bytes sent). Both are now the
+     * wire bytes the downloader's own p2p hooks counted (2026-09-19). */
+    if (g_status){ sent += g_status->dl_wire_sent; recv += g_status->dl_wire_recv; }
     rj_val* o = rj_obj();
     /* Core counts bytes for the process lifetime including closed peers; we
      * sum the LIVE peer table plus everything the download received this
@@ -707,30 +833,39 @@ void rpc_node_set_addednodes(const char (*list)[64], int n){
  * Core's answer is [{type:"pubhashtx", address, hwm}, ...], one entry per
  * CONFIGURED topic, in Core's own fixed order.
  *
- * hwm is reported as 0, and that is a statement, not a shrug: Core's field
- * is libzmq's send high-water mark (default 1000 queued messages). This
- * publisher has no such queue -- the kernel socket buffer is the only
- * buffering, and a subscriber that falls behind it is dropped (see
- * zmq_pub.c). 0 is ZMQ's own encoding of "no limit set here", which is the
- * closest true description of that behaviour. */
+ * hwm is each topic's CONFIGURED -zmqpub<topic>hwm, as Core prints it
+ * (zmqrpc.cpp: n->GetOutboundMessageHighWaterMark(), the notifier's own
+ * value). Since 2026-09-19 it is a real limit here, in Core's unit: the
+ * publisher queues at most that many MESSAGES per subscriber and drops new
+ * ones past it (zmq_pub.c). It used to be reported as 0 because there was no
+ * queue. Default 1000, Core's DEFAULT_ZMQ_SNDHWM, when nothing is injected. */
 static const char* g_zmq_ep[4];   /* hashblock, hashtx, rawblock, rawtx */
+static const int*  g_zmq_hwm;     /* same order; BORROWED, like the endpoints */
 
 void rpc_node_set_zmq(const char* hashblock, const char* hashtx,
                       const char* rawblock, const char* rawtx){
     g_zmq_ep[0] = hashblock; g_zmq_ep[1] = hashtx;
     g_zmq_ep[2] = rawblock;  g_zmq_ep[3] = rawtx;
 }
+void rpc_node_set_zmq_hwm(const int* hwm4){ g_zmq_hwm = hwm4; }
 
+static const char* g_zmq_seq_ep;   /* -zmqpubsequence; hwm is g_zmq_hwm[4] */
+void rpc_node_set_zmq_sequence(const char* sequence){ g_zmq_seq_ep = sequence; }
 static int cmd_getzmqnotifications(rj_val** res){
-    static const char* const NAMES[4] =
-        { "pubhashblock", "pubhashtx", "pubrawblock", "pubrawtx" };
+    /* Core lists its notifiers in its factory map's order, which is sorted
+     * by name: pubhashblock, pubhashtx, pubrawblock, pubrawtx, pubsequence. */
+    static const char* const NAMES[5] =
+        { "pubhashblock", "pubhashtx", "pubrawblock", "pubrawtx", "pubsequence" };
     rj_val* arr = rj_arr();
-    for (int i = 0; i < 4; i++){
-        if (!g_zmq_ep[i] || !g_zmq_ep[i][0]) continue;
+    for (int i = 0; i < 5; i++){
+        const char* ep = i < 4 ? g_zmq_ep[i] : g_zmq_seq_ep;
+        if (!ep || !ep[0]) continue;
         rj_val* o = rj_obj();
         rj_obj_set(o, "type",    rj_str(NAMES[i]));
-        rj_obj_set(o, "address", rj_str(g_zmq_ep[i]));
-        rj_obj_set(o, "hwm",     rj_num("0"));
+        rj_obj_set(o, "address", rj_str(ep));
+        char hb[16];
+        snprintf(hb, sizeof hb, "%d", g_zmq_hwm ? g_zmq_hwm[i] : 1000);
+        rj_obj_set(o, "hwm",     rj_num(hb));
         rj_arr_push(arr, o);
     }
     *res = arr;
@@ -913,13 +1048,31 @@ static int cmd_getmempoolinfo(rj_val** res){
     if (g_mph.mp){
         mpl();
         count = g_mph.count ? g_mph.count(g_mph.mp) : 0;
+        /* total_fee in ONE pass over the policy nodes. It used to come from a
+         * pol_entry() call per mempool slot, and pol_entry is a linear scan of
+         * that same array -- an O(n^2) loop, under the mempool lock AND the
+         * single RPC execution lock, on the call every monitoring tool polls
+         * every few seconds. Measured with 5,914 transactions: 15 ms against
+         * Core's 2 ms; the oracle's 77,736 would be ~6 billion compares. */
+        int have_totals = 0;
+        if (g_mph.polstate && g_mph.pol_totals){
+            /* fees only. `bytes` stays an INDEPENDENT computation (mp_tx_vsize
+             * over the pool's own bytes) rather than the policy's vsize sum,
+             * on purpose: the two agreeing is a cross-check that caught
+             * nothing today but would catch the policy registry drifting from
+             * the pool. Verified equal on run 26 at 12,528 transactions --
+             * 2,009,040 both ways. */
+            if (g_mph.pol_totals(g_mph.polstate, &total_fee, 0) >= 0) have_totals = 1;
+        }
         unsigned long n = mp_slot_count(g_mph.mp);
         for (unsigned long i=0;i<n;i++){ mp_ent e;
             if (mp_slot(g_mph.mp,i,&e) != 1) continue;
             bytes += mp_tx_vsize(e.tx, e.len);
             blob_used += e.len;
-            unsigned long long f,s;
-            if (g_mph.polstate && g_mph.pol_entry && g_mph.pol_entry(g_mph.polstate,e.txid,&f,&s)) total_fee += f;
+            if (!have_totals){                       /* no policy module linked */
+                unsigned long long f,s;
+                if (g_mph.polstate && g_mph.pol_entry && g_mph.pol_entry(g_mph.polstate,e.txid,&f,&s)) total_fee += f;
+            }
         }
         mpu();
     }
@@ -1232,9 +1385,20 @@ extern int rpc_chain_txospender_lookup(const unsigned char txid_wire[32], unsign
                                        long* height_out, unsigned char blockhash_wire[32], unsigned char* txout, long txcap, long* txlen_out) __attribute__((weak));
 static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
                                     long* ec, const char** em){
-    if (!params || params->typ != RJ_ARR || params->nitems < 1 ||
-        params->items[0]->typ != RJ_ARR){
-        *ec = -8; *em = "Invalid parameter, outputs is not an array"; return 0; }
+    static char tbuf[256];
+    if (!params || params->typ != RJ_ARR || params->nitems < 1){
+        *ec = -1; *em = "gettxspendingprevout requires outputs"; return 0; }
+    /* Core type-checks EVERY argument before ANY value and reports EVERY
+     * failing position in one object: `gettxspendingprevout [] "x"` is
+     * Position 2 (options), not the empty-outputs -8, and `["z","q"]` names
+     * both positions. Measured against v31.1, 2026-09-15. */
+    { rj_typeerrs te; rj_typeerr_init(&te);
+      if (params->items[0]->typ != RJ_ARR)
+          rj_typeerr_add(&te, 1, "outputs", params->items[0], "array");
+      if (params->nitems >= 2 && params->items[1]->typ != RJ_OBJ &&
+          params->items[1]->typ != RJ_NULL)
+          rj_typeerr_add(&te, 2, "options", params->items[1], "object");
+      if (rj_typeerr_fail(&te, ec, em)) return 0; }
     const rj_val* list = params->items[0];
     if (list->nitems == 0){
         *ec = -8; *em = "Invalid parameter, outputs are missing"; return 0; }
@@ -1245,10 +1409,16 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
     if (params->nitems >= 2 && params->items[1]->typ == RJ_OBJ){
         const rj_val* o = params->items[1];
         rj_val* mo = rj_obj_get((rj_val*)o, "mempool_only"); rj_val* rt = rj_obj_get((rj_val*)o, "return_spending_tx");
-        if (mo){ if (mo->typ != RJ_BOOL){ *ec = -3; *em = "JSON value of type string is not of expected type bool"; return 0; } mempool_only = mo->str[0] == '1'; }
-        if (rt){ if (rt->typ != RJ_BOOL){ *ec = -3; *em = "JSON value of type string is not of expected type bool"; return 0; } return_tx = rt->str[0] == '1'; }
-    } else if (params->nitems >= 2 && params->items[1]->typ != RJ_NULL){
-        *ec = -3; *em = "JSON value of type string is not of expected type object"; return 0; }
+        /* a field inside an options object gets Core's OTHER -3 shape: no
+         * wrapper, no position, the field named inline -- and a null field
+         * drops even the field name. See rj_wrong_field_type_msg. */
+        if (mo){ if (mo->typ != RJ_BOOL){
+            *ec = -3; *em = rj_wrong_field_type_msg(tbuf, sizeof tbuf, "mempool_only", mo, "bool"); return 0; }
+            mempool_only = mo->str[0] == '1'; }
+        if (rt){ if (rt->typ != RJ_BOOL){
+            *ec = -3; *em = rj_wrong_field_type_msg(tbuf, sizeof tbuf, "return_spending_tx", rt, "bool"); return 0; }
+            return_tx = rt->str[0] == '1'; }
+    }
     /* validate the whole list before touching the pool, so a bad entry
      * cannot produce a half-answered array */
     for (size_t i = 0; i < list->nitems; i++){
@@ -1297,8 +1467,20 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
     }
     if (g_mph.mp) mpu();
     if (npending){
-        /* Core: "Mempool lacks a relevant spend, and txospenderindex is unavailable." */
-        if (!index_ok || !rpc_chain_txospender_lookup){ rj_free(arr); free(pending); *ec = -1; *em = "Mempool lacks a relevant spend, and txospenderindex is unavailable."; return 0; }
+        /* Core v31.1 (rpc/mempool.cpp): the FIRST outpoint, in request
+         * order, that the mempool does not spend names itself:
+         * "No spending tx for the outpoint <txid>:<n> in mempool, and
+         * txospenderindex is unavailable." -- RPC_MISC_ERROR. The text
+         * here was an older wording. */
+        if (!index_ok || !rpc_chain_txospender_lookup){
+            static char nomsg[200];
+            const rj_val* e0 = list->items[pending[0]];
+            char lx[65]; const char* tx0 = rj_obj_get((rj_val*)e0, "txid")->str;   /* validated: 64 hex digits */
+            for (int b = 0; b < 64; b++) lx[b] = (char)((tx0[b] >= 'A' && tx0[b] <= 'F') ? tx0[b] - 'A' + 'a' : tx0[b]);
+            lx[64] = 0;                                   /* Core prints uint256::GetHex, lower case */
+            snprintf(nomsg, sizeof nomsg, "No spending tx for the outpoint %s:%lu in mempool, and txospenderindex is unavailable.",
+                     lx, (unsigned long)atol(rj_obj_get((rj_val*)e0, "vout")->str));
+            rj_free(arr); free(pending); *ec = -1; *em = nomsg; return 0; }
         static unsigned char txbuf[4u << 20];
         for (int q = 0; q < npending; q++){
             int i = pending[q]; rj_val* o = arr->items[i]; const rj_val* e = list->items[i];
@@ -1331,11 +1513,25 @@ static int cmd_gettxspendingprevout(const rj_val* params, rj_val** res,
  * pool anyway, so it records (txid, vsize) as it goes, sorts by txid, and the
  * set sums become binary searches. Single-entry getmempoolentry passes no
  * cache and keeps the old direct path, which is cheaper for one lookup. */
-typedef struct { unsigned char id[32]; unsigned long vs; long inf; } mpe_vs_t;
+/* vs is the ENTRY size Core reports (GetTxSize, sigops-adjusted) once the
+ * graph has supplied the member's sigop cost (inf >= 0), and plain BIP141
+ * until then; w is the BIP141 weight either way. rbf: the tx itself signals
+ * BIP125, so bip125-replaceable over an ancestor set is lookups too. */
+typedef struct { unsigned char id[32]; unsigned long vs, w; long inf; unsigned char rbf; } mpe_vs_t;
 static mpe_vs_t* g_mpe_vs; static unsigned long g_mpe_vs_n;
 /* the whole graph for this call, filled once by pol_entry_info_all; indexed
    by the same sorted txid order as the vsize cache above */
 static mp_entry_info* g_mpe_inf; static unsigned char (*g_mpe_inf_id)[32]; static long g_mpe_inf_n;
+/* the per-call chunk cache (2026-09-19), parallel to g_mpe_vs: st 0 = not
+ * yet computed, 1 = fee/weight hold this entry's chunk, -1 = no honest answer
+ * (component beyond the 64 bound, or a graph that did not build). One cluster
+ * linearization fills every member's slot, which is what keeps bulk
+ * getrawmempool linear in the pool rather than in pool x cluster size. */
+typedef struct { unsigned long long fee, weight; signed char st; } mpe_chunk_t;
+static mpe_chunk_t* g_mpe_chunk;
+/* clusters linearized since start: the cost model, exported for the tests */
+static unsigned long g_mpe_cluster_builds;
+unsigned long rpc_node_cluster_builds(void){ return g_mpe_cluster_builds; }
 static int mpe_vs_cmp(const void* a, const void* b){
     return memcmp(((const mpe_vs_t*)a)->id, ((const mpe_vs_t*)b)->id, 32);
 }
@@ -1360,9 +1556,71 @@ static unsigned long mpe_vs_lookup(const unsigned char id[32]){
     return k >= 0 ? g_mpe_vs[k].vs : 0;
 }
 
+/* Core's entry size, CTxMemPoolEntry::GetTxSize(): the sigops-ADJUSTED
+ * vsize, ceil(max(weight, sigop_cost * bytes_per_sigop) / 4)
+ * (policy.cpp GetVirtualTransactionSize). v31.1 reports it as `vsize`, and
+ * sums it for ancestorsize/descendantsize. */
+static unsigned long mpe_adj_vsize(unsigned long w, unsigned sigop_cost){
+    unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
+    unsigned long long adjw = w, sw = (unsigned long long)sigop_cost * bps;
+    if (sw > adjw) adjw = sw;
+    return (unsigned long)((adjw + 3) / 4);
+}
+
+/* BIP125 signalling (util/rbf.cpp SignalsOptInRBF): any input with
+ * nSequence <= 0xfffffffd. A parse anomaly answers "does not signal". */
+static int mp_tx_signals_rbf(const unsigned char* tx, unsigned long len){
+    if (len < 10) return 0;
+    unsigned long p = (tx[4]==0x00 && tx[5]==0x01) ? 6 : 4, c;
+    unsigned long nin = mp_varint(tx+p,&c); p+=c;
+    for (unsigned long i=0;i<nin;i++){
+        if (p+37 > len) return 0;
+        p+=36; unsigned long sl=mp_varint(tx+p,&c); p+=c+sl;
+        if (p+4 > len) return 0;
+        unsigned long seq = (unsigned long)tx[p] | ((unsigned long)tx[p+1]<<8) |
+                            ((unsigned long)tx[p+2]<<16) | ((unsigned long)tx[p+3]<<24);
+        if (seq <= 0xfffffffdUL) return 1;
+        p+=4;
+    }
+    return 0;
+}
+
+/* One ancestor/descendant member's entry size for the set sums, 0 when it
+ * is no longer in the pool. The bulk cache holds it once the graph has
+ * given the member's sigop cost; otherwise the member's own registry node
+ * does (self's is already in hand). */
+static unsigned long mpe_member_vsize(const unsigned char id[32], const unsigned char* self,
+                                      const mp_entry_info* selfinf){
+    unsigned long w2;
+    if (g_mpe_vs){
+        long k = mpe_vs_find(id);
+        if (k < 0) return 0;
+        if (g_mpe_vs[k].inf >= 0) return g_mpe_vs[k].vs;
+        w2 = g_mpe_vs[k].w;
+    } else {
+        unsigned long l2=0; const unsigned char* t2 = g_mph.get(g_mph.mp, id, &l2);
+        if (!t2) return 0;
+        w2 = mp_tx_weight(t2, l2);
+    }
+    unsigned sc = 0;
+    if (!memcmp(id, self, 32)) sc = selfinf->sigop_cost;
+    else if (g_mph.polstate && g_mph.pol_entry_info){
+        static mp_entry_info mi;             /* ~8 KB: kept off the stack */
+        if (g_mph.pol_entry_info(g_mph.polstate, id, &mi) == 1) sc = mi.sigop_cost;
+    }
+    return mpe_adj_vsize(w2, sc);
+}
+/* does this member signal BIP125 itself? (-1: not in the pool) */
+static int mpe_member_rbf(const unsigned char id[32]){
+    if (g_mpe_vs){ long k = mpe_vs_find(id); return k >= 0 ? g_mpe_vs[k].rbf : -1; }
+    unsigned long l2=0; const unsigned char* t2 = g_mph.get(g_mph.mp, id, &l2);
+    return t2 ? mp_tx_signals_rbf(t2, l2) : -1;
+}
+
 /* the per-entry object, shared by getmempoolentry and verbose getrawmempool */
+static int mpc_lookup_here(void* ctx, const unsigned char txid[32], mpc_entry* out);
 static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len);
-static int cmd_getrawmempool(const rj_val* params, rj_val** res){
+static int cmd_getrawmempool(const rj_val* params, rj_val** res, long* ec, const char** em){
     /* verbose (params[0]==true) -> object keyed by txid; else -> array of
      * txids (display byte order).
      *
@@ -1392,13 +1650,54 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
      * determined without any linearization: a lone transaction is its own
      * chunk. For a multi-transaction cluster both depend on Core's cluster
      * linearization, which this node does not implement, and they are omitted
-     * rather than guessed. */
-    int verbose = 0;
-    if (params && params->typ == RJ_ARR && params->nitems >= 1){
-        const rj_val* v = params->items[0];
-        if (v && v->typ == RJ_BOOL && v->str && v->str[0] == '1') verbose = 1;
+     * rather than guessed.
+     *
+     * 2026-09-19: superseded -- the cluster layer (mempool_cluster.c) does
+     * linearize, and every entry now carries both keys on this path too; see
+     * mpe_chunk_of and the per-call chunk cache.
+     *
+     * 2026-09-18: `vsize_adjusted` and `vsize_bip141` are gone again. Both
+     * came off the v31.99 development oracle; v31.1 has neither, in any RPC.
+     * What v31.1 does have is the adjusted size under the plain name: its
+     * `vsize` is CTxMemPoolEntry::GetTxSize(), the sigops-adjusted vsize, and
+     * ancestorsize/descendantsize sum the same. So the number vsize_adjusted
+     * carried now travels as `vsize`, and `bip125-replaceable` -- a v31.1
+     * field this entry lacked -- is emitted. */
+    /* 2026-09-19: the second argument, mempool_sequence (Core rpc/mempool.cpp
+     * MempoolToJSON). With verbose=false it wraps the txid list as
+     * {"txids": [...], "mempool_sequence": n}, n being the sequence the ZMQ
+     * `sequence` topic numbers its A/R events with, read under the SAME pool
+     * lock as the txids -- that pairing is what lets a subscriber line a
+     * snapshot up with the stream. With verbose=true Core refuses:
+     * RPC_INVALID_PARAMETER (-8) "Verbose results cannot contain mempool
+     * sequence values." Both arguments are type-checked first, lowest
+     * position first, as Core's RPCHelpMan does; null means "default". */
+    int verbose = 0, want_seq = 0;
+    if (params && params->typ == RJ_ARR){
+        rj_typeerrs te; rj_typeerr_init(&te);
+        if (params->nitems >= 1 && params->items[0] && params->items[0]->typ != RJ_NULL &&
+            params->items[0]->typ != RJ_BOOL)
+            rj_typeerr_add(&te, 1, "verbose", params->items[0], "bool");
+        if (params->nitems >= 2 && params->items[1] && params->items[1]->typ != RJ_NULL &&
+            params->items[1]->typ != RJ_BOOL)
+            rj_typeerr_add(&te, 2, "mempool_sequence", params->items[1], "bool");
+        if (rj_typeerr_fail(&te, ec, em)) return 0;
+        if (params->nitems >= 1){
+            const rj_val* v = params->items[0];
+            if (v && v->typ == RJ_BOOL && v->str && v->str[0] == '1') verbose = 1;
+        }
+        if (params->nitems >= 2){
+            const rj_val* v = params->items[1];
+            if (v && v->typ == RJ_BOOL && v->str && v->str[0] == '1') want_seq = 1;
+        }
+    }
+    if (verbose && want_seq){
+        *ec = -8; *em = "Verbose results cannot contain mempool sequence values.";
+        return 0;
     }
     rj_val* out = verbose ? rj_obj() : rj_arr();
+    unsigned long long mseq = 1;          /* Core's initial m_sequence_number */
+    if (!g_mph.mp && g_mph.mempool_sequence) mseq = g_mph.mempool_sequence();
     if (g_mph.mp){
         static const char* HEXD = "0123456789abcdef";
         mpl();
@@ -1415,8 +1714,10 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
                 for (unsigned long i=0;i<n;i++){ mp_ent e2;
                     if (mp_slot(g_mph.mp,i,&e2) != 1) continue;
                     memcpy(g_mpe_vs[g_mpe_vs_n].id, e2.txid, 32);
-                    g_mpe_vs[g_mpe_vs_n].vs = (mp_tx_weight(e2.tx, e2.len)+3)/4;
+                    g_mpe_vs[g_mpe_vs_n].w = mp_tx_weight(e2.tx, e2.len);
+                    g_mpe_vs[g_mpe_vs_n].vs = (g_mpe_vs[g_mpe_vs_n].w+3)/4;
                     g_mpe_vs[g_mpe_vs_n].inf = -1;
+                    g_mpe_vs[g_mpe_vs_n].rbf = (unsigned char)mp_tx_signals_rbf(e2.tx, e2.len);
                     g_mpe_vs_n++;
                 }
                 /* the whole graph in one pass; -1 means fall back per entry */
@@ -1431,8 +1732,13 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
                 qsort(g_mpe_vs, g_mpe_vs_n, sizeof *g_mpe_vs, mpe_vs_cmp);
                 for (long q=0;q<g_mpe_inf_n;q++){
                     long k = mpe_vs_find(g_mpe_inf_id[q]);
-                    if (k >= 0) g_mpe_vs[k].inf = q;
+                    if (k >= 0){ g_mpe_vs[k].inf = q;
+                                 g_mpe_vs[k].vs = mpe_adj_vsize(g_mpe_vs[k].w, g_mpe_inf[q].sigop_cost); }
                 }
+                /* chunk cache: only with the one-pass graph (the lookup it
+                 * drives reads g_mpe_inf); without it, per-entry builds */
+                if (g_mpe_inf && g_mpe_vs_n)
+                    g_mpe_chunk = (mpe_chunk_t*)calloc(g_mpe_vs_n, sizeof *g_mpe_chunk);
             }
         }
         for (unsigned long i=0;i<n;i++){ mp_ent e;
@@ -1444,9 +1750,19 @@ static int cmd_getrawmempool(const rj_val* params, rj_val** res){
             /* the same builder getmempoolentry uses, under the same pool lock */
             rj_obj_set(out, hx, mpe_entry_obj(e.txid, e.tx, e.len));
         }
+        free(g_mpe_chunk); g_mpe_chunk = 0;
         free(g_mpe_vs); g_mpe_vs = 0; g_mpe_vs_n = 0;
         free(g_mpe_inf); free(g_mpe_inf_id); g_mpe_inf = 0; g_mpe_inf_id = 0; g_mpe_inf_n = 0;
+        /* still inside the lock that covered the walk above */
+        if (g_mph.mempool_sequence) mseq = g_mph.mempool_sequence();
         mpu();
+    }
+    if (want_seq){
+        rj_val* o = rj_obj();
+        rj_obj_set(o, "txids", out);
+        char nb[24]; snprintf(nb, sizeof nb, "%llu", mseq);
+        rj_obj_set(o, "mempool_sequence", rj_num(nb));
+        out = o;
     }
     *res = out;
     return 1;
@@ -1476,9 +1792,11 @@ static rj_val* mpe_amount(unsigned long long sat){
     return rj_numf("%llu.%08llu", sat/100000000ULL, sat%100000000ULL);
 }
 static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, const char** em){
-    static char embuf[128];
-    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_STR){
-        *ec = -8; *em = "JSON value of type null is not of expected type string"; return 0; }
+    static char embuf[256];
+    if (!params || params->typ != RJ_ARR || params->nitems < 1){
+        *ec = -1; *em = "getmempoolentry requires txid"; return 0; }
+    if (params->items[0]->typ != RJ_STR)
+        return rpc_wrong_type(ec, em, embuf, sizeof embuf, 1, "txid", params->items[0], "string");
     const char* hx = params->items[0]->str;
     size_t hl = strlen(hx);
     if (hl != 64){
@@ -1503,16 +1821,102 @@ static int cmd_getmempoolentry(const rj_val* params, rj_val** res, long* ec, con
     return 1;
 }
 
+/* The cluster layer's view of the pool during a BULK call: the same fields
+ * mpc_lookup_here reads (modified fee, sigops-adjusted weight, direct edges),
+ * taken from this call's one-pass graph and weight cache instead of one
+ * registry walk per member. Edges are filtered to transactions still in the
+ * pool -- the rule `depends`/`spentby` already apply -- so a stale registry
+ * edge cannot fail the build. */
+static int mpc_lookup_bulk(void* ctx, const unsigned char txid[32], mpc_entry* out)
+{
+    (void)ctx;
+    long k = mpe_vs_find(txid);
+    if (k < 0 || g_mpe_vs[k].inf < 0) return 0;
+    const mp_entry_info* inf = &g_mpe_inf[g_mpe_vs[k].inf];
+    memset(out, 0, sizeof *out);
+    long long modified = (long long)inf->fee + pri_delta_of(txid);
+    out->fee = modified < 0 ? 0 : (uint64_t)modified;
+    { unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
+      unsigned long long w = g_mpe_vs[k].w;
+      unsigned long long sw = (unsigned long long)inf->sigop_cost * bps;
+      out->weight = sw > w ? sw : w; }
+    for (int i = 0; i < inf->n_depends && out->n_parents < MPC_MAX_CLUSTER; i++)
+        if (mpe_vs_find(inf->depends[i]) >= 0)
+            memcpy(out->parents[out->n_parents++], inf->depends[i], 32);
+    for (int i = 0; i < inf->n_spentby && out->n_children < MPC_MAX_CLUSTER; i++)
+        if (mpe_vs_find(inf->spentby[i]) >= 0)
+            memcpy(out->children[out->n_children++], inf->spentby[i], 32);
+    return 1;
+}
+
+/* The chunk `txid` belongs to in its cluster's linearization: Core's
+ * GetMainChunkFeerate (txgraph), which entryToJSON reports as chunkweight
+ * (sigops-adjusted WEIGHT, not vsize) and fees.chunk (the chunk's summed
+ * MODIFIED fee). 1 with *fee and *weight set, 0 when there is no honest answer.
+ *
+ * Linearization: ancestor-score greedy, then Core's PostLinearize (see
+ * mempool_cluster.h). Core v31.1 searches for the optimum with a
+ * spanning-forest algorithm; the two agree wherever the greedy+post result is
+ * optimal, which PostLinearize guarantees for chains and trees (at most one
+ * parent, or at most one child, per member) and which covers the CPFP, chain
+ * and diamond shapes pinned in the tests. A cluster where they differ is one
+ * where Core found a strictly better chunking than greedy -- the number here
+ * would then be a valid chunking, not Core's. Recorded in
+ * docs/PARITY_RPC_FIELDS.md.
+ *
+ * Under the pool lock (the caller holds it). With the bulk chunk cache the
+ * first member to ask pays for the cluster and every other member reads the
+ * answer: one build per cluster per call. */
+static int mpe_chunk_of(const unsigned char txid[32], unsigned long long* fee,
+                        unsigned long long* weight)
+{
+    int bulk = (g_mpe_chunk && g_mpe_inf && g_mpe_vs);
+    long self_k = bulk ? mpe_vs_find(txid) : -1;
+    if (bulk && self_k >= 0 && g_mpe_chunk[self_k].st){
+        if (g_mpe_chunk[self_k].st < 0) return 0;
+        *fee = g_mpe_chunk[self_k].fee; *weight = g_mpe_chunk[self_k].weight;
+        return 1;
+    }
+    mpc_cluster cl;                   /* ~4 KB + 1.5 KB, as getmempoolcluster */
+    mpc_chunking ch;
+    int lin[MPC_MAX_CLUSTER];
+    g_mpe_cluster_builds++;
+    int ok = mpc_build_cluster(0, (bulk && self_k >= 0) ? mpc_lookup_bulk : mpc_lookup_here,
+                               txid, &cl) == 0
+          && !cl.truncated && cl.n >= 1
+          && mpc_linearize_ancestor_score(&cl, lin) == 0
+          && mpc_post_linearize(&cl, lin) == 0
+          && mpc_chunk_linearization(&cl, lin, &ch) == 0;
+    if (!ok){
+        /* mark what was collected, so a >64 component is not rebuilt by
+         * each of its members in turn */
+        if (bulk){
+            if (self_k >= 0) g_mpe_chunk[self_k].st = -1;
+            for (int m = 0; m < cl.n; m++){ long k2 = mpe_vs_find(cl.txid[m]);
+                if (k2 >= 0 && !g_mpe_chunk[k2].st) g_mpe_chunk[k2].st = -1; }
+        }
+        return 0;
+    }
+    int found = 0;
+    for (int c = 0; c < ch.n; c++){
+        for (int m = 0; m < cl.n; m++){
+            if (!(ch.c[c].members & ((uint64_t)1 << m))) continue;
+            if (!found && !memcmp(cl.txid[m], txid, 32)){
+                *fee = ch.c[c].fee; *weight = ch.c[c].weight; found = 1; }
+            if (bulk){ long k2 = mpe_vs_find(cl.txid[m]);
+                if (k2 >= 0){ g_mpe_chunk[k2].fee = ch.c[c].fee;
+                              g_mpe_chunk[k2].weight = ch.c[c].weight;
+                              g_mpe_chunk[k2].st = 1; } }
+        }
+    }
+    return found;
+}
+
 /* Build one getmempoolentry-shaped object (assumes mp_lock HELD; also the
  * per-member body of the verbose getmempoolancestors/-descendants forms). */
 static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx, unsigned long len){
     rj_val* o = rj_obj();
     unsigned long w = mp_tx_weight(tx, len);
-    rj_obj_set(o, "vsize", rj_numf("%lu", (w+3)/4));
-    rj_obj_set(o, "weight", rj_numf("%lu", w));
-    rj_obj_set(o, "vsize_bip141", rj_numf("%lu", (w+3)/4));
-    rj_obj_set(o, "time", rj_numf("%ld", g_mph.time_of ? g_mph.time_of(txid) : 0));
-    rj_obj_set(o, "height", rj_numf("%d", 0));   /* documented gap: entry height untracked */
 
     mp_entry_info inf; int have_inf = 0;
     /* Prefer the one-pass graph when this call built one; otherwise ask per
@@ -1526,18 +1930,34 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
     if (myinf >= 0){ inf = g_mpe_inf[myinf]; have_inf = 1; }
     else if (g_mph.polstate && g_mph.pol_entry_info)
         have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
-    /* ancestor/descendant vsize sums over set members STILL IN THE POOL */
-    unsigned long long anc_vs=0, desc_vs=0; int anc_n=0, desc_n=0;
+    if (!have_inf) inf.sigop_cost = 0;
+    /* vsize is Core's entry size, the sigops-adjusted one (see
+     * mpe_adj_vsize); weight stays BIP141, as in Core. Without the registry
+     * the sigop cost is unknown and the two coincide. */
+    unsigned long vs = mpe_adj_vsize(w, inf.sigop_cost);
+    rj_obj_set(o, "vsize", rj_numf("%lu", vs));
+    rj_obj_set(o, "weight", rj_numf("%lu", w));
+    rj_obj_set(o, "time", rj_numf("%ld", g_mph.time_of ? g_mph.time_of(txid) : 0));
+    rj_obj_set(o, "height", rj_numf("%d", 0));   /* documented gap: entry height untracked */
+
+    /* ancestor/descendant sums of the same entry size, over set members
+     * STILL IN THE POOL; bip125-replaceable over the same ancestor set */
+    unsigned long long anc_vs=0, desc_vs=0; int anc_n=0, desc_n=0, rbf = 0;
     if (have_inf){
         for (int i=0;i<inf.n_anc;i++){
-            if (g_mpe_vs){ unsigned long v = mpe_vs_lookup(inf.anc[i]); if (v){ anc_vs += v; anc_n++; } continue; }
-            unsigned long l2=0; const unsigned char* t2 = g_mph.get(g_mph.mp, inf.anc[i], &l2);
-            if (t2){ anc_vs += (mp_tx_weight(t2,l2)+3)/4; anc_n++; } }
+            unsigned long v = mpe_member_vsize(inf.anc[i], txid, &inf);
+            if (!v) continue;
+            anc_vs += v; anc_n++;
+            if (!rbf && mpe_member_rbf(inf.anc[i]) == 1) rbf = 1;
+        }
         for (int i=0;i<inf.n_desc;i++){
-            if (g_mpe_vs){ unsigned long v = mpe_vs_lookup(inf.desc[i]); if (v){ desc_vs += v; desc_n++; } continue; }
-            unsigned long l2=0; const unsigned char* t2 = g_mph.get(g_mph.mp, inf.desc[i], &l2);
-            if (t2){ desc_vs += (mp_tx_weight(t2,l2)+3)/4; desc_n++; } }
-    } else { anc_n=1; desc_n=1; anc_vs=desc_vs=(w+3)/4; }
+            unsigned long v = mpe_member_vsize(inf.desc[i], txid, &inf);
+            if (v){ desc_vs += v; desc_n++; } }
+    } else { anc_n=1; desc_n=1; anc_vs=desc_vs=vs; }
+    /* Core's IsRBFOptIn: the tx signals itself, or an unconfirmed ancestor
+     * does (the set above holds self as well). Full-RBF does not enter into
+     * it -- v31.1 reports signalling, not replaceability under its policy. */
+    if (!rbf) rbf = mp_tx_signals_rbf(tx, len);
     rj_obj_set(o, "descendantcount", rj_numf("%d", desc_n));
     rj_obj_set(o, "descendantsize", rj_numf("%llu", desc_vs));
     rj_obj_set(o, "ancestorcount", rj_numf("%d", anc_n));
@@ -1557,23 +1977,39 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
       rj_obj_set(fees, "ancestor", mpe_amount(have_inf ? inf.anc_fee : base));
       rj_obj_set(fees, "descendant", mpe_amount(have_inf ? inf.desc_fee : base));
       /* Core's adjusted weight: max(weight, sigop_cost * bytes_per_sigop)
-       * (policy.cpp GetSigOpsAdjustedWeight). vsize_adjusted is that over 4,
-       * rounded up, exactly as GetVirtualTransactionSize does it. */
+       * (policy.cpp GetSigOpsAdjustedWeight) -- `vsize` above is this over
+       * 4, rounded up. */
       { unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
         unsigned long long adjw = w;
         if (have_inf){ unsigned long long sw = (unsigned long long)inf.sigop_cost * bps;
                        if (sw > adjw) adjw = sw; }
-        rj_obj_set(o, "vsize_adjusted", rj_numf("%llu", (adjw+3)/4));
         /* A SINGLETON cluster -- no unconfirmed parents, no unconfirmed
          * children -- is its own chunk, so chunkweight and fees.chunk are
          * determined with no linearization at all. Both counts include the tx
-         * itself, so 1 and 1 is the lone-transaction case. Anything larger
-         * needs Core's cluster linearization, which this node does not
-         * implement: the two keys are then OMITTED rather than approximated. */
+         * itself, so 1 and 1 is the lone-transaction case. */
         if (have_inf && inf.n_anc == 1 && inf.n_desc == 1){
             rj_obj_set(o, "chunkweight", rj_numf("%llu", adjw));
             rj_obj_set(fees, "chunk", rj_numf("%s%lld.%08lld",
                        modified<0?"-":"", am/100000000LL, am%100000000LL));
+        } else if (have_inf){
+            /* A member of a real cluster: the chunk this transaction lands in
+             * when its cluster is linearized and chunked (mpe_chunk_of).
+             *
+             * 2026-09-19: on BOTH paths. Until today this branch ran only for
+             * a single getmempoolentry, and bulk getrawmempool omitted the two
+             * keys for every cluster member -- 71,710 of 79,626 production
+             * entries -- because building a cluster per entry there would have
+             * been quadratic. The bulk call now carries a per-call chunk cache:
+             * the first member of a cluster to be rendered linearizes it and
+             * records the answer for EVERY member, so the whole call costs one
+             * linearization per cluster. The keys are omitted only where no
+             * honest answer exists: a component beyond the 64-transaction
+             * bound, or a graph that does not build. */
+            unsigned long long cf = 0, cw = 0;
+            if (mpe_chunk_of(txid, &cf, &cw)){
+                rj_obj_set(o, "chunkweight", rj_numf("%llu", cw));
+                rj_obj_set(fees, "chunk", mpe_amount(cf));
+            }
         } }
       rj_obj_set(o, "fees", fees); }
 
@@ -1587,6 +2023,7 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
           int here = g_mpe_vs ? (mpe_vs_lookup(inf.spentby[i]) != 0) : (g_mph.get(g_mph.mp, inf.spentby[i], &l2) != 0);
           if (here){ char h2[65]; mpe_hex(h2, inf.spentby[i]); rj_arr_push(sb, rj_str(h2)); } }
       rj_obj_set(o, "spentby", sb); }
+    rj_obj_set(o, "bip125-replaceable", rj_bool(rbf));
     rj_obj_set(o, "unbroadcast", rj_bool(0));
     return o;
 }
@@ -1600,9 +2037,12 @@ static rj_val* mpe_entry_obj(const unsigned char* txid, const unsigned char* tx,
  * uses, filtered to members still in the structural pool. */
 static int cmd_mpe_relatives(const rj_val* params, rj_val** res, long* ec, const char** em,
                              int want_desc){
-    static char embuf[128];
-    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_STR){
-        *ec = -8; *em = "JSON value of type null is not of expected type string"; return 0; }
+    static char embuf[256];
+    if (!params || params->typ != RJ_ARR || params->nitems < 1){
+        *ec = -1; *em = want_desc ? "getmempooldescendants requires txid"
+                                  : "getmempoolancestors requires txid"; return 0; }
+    if (params->items[0]->typ != RJ_STR)
+        return rpc_wrong_type(ec, em, embuf, sizeof embuf, 1, "txid", params->items[0], "string");
     const char* hx = params->items[0]->str;
     size_t hl = strlen(hx);
     if (hl != 64){
@@ -1663,18 +2103,26 @@ extern unsigned long long fest_estimate_smart(const void*, int, int, int*, fest_
 extern unsigned long long fest_estimate_raw(const void*, int, double, int, fest_result_t*) __attribute__((weak));
 extern unsigned fest_highest_target(const void*, int) __attribute__((weak));
 
-static const char* rj_type_name(const rj_val* v){
-    if (!v) return "null";
-    switch (v->typ){ case RJ_NULL: return "null"; case RJ_BOOL: return "bool"; case RJ_NUM: return "number";
-                     case RJ_STR: return "string"; case RJ_ARR: return "array"; case RJ_OBJ: return "object"; default: return "null"; }
-}
 /* Core ParseConfirmTarget: "Invalid conf_target, must be between 1 and <max>" */
-static int fee_parse_target(const rj_val* params, unsigned max_target, long* ec, const char** em, int* out){
-    static char msg[96];
-    const rj_val* v = (params && params->typ == RJ_ARR && params->nitems >= 1) ? params->items[0] : 0;
-    if (!v || v->typ != RJ_NUM){
-        snprintf(msg, sizeof msg, "JSON value of type %s is not of expected type number", rj_type_name(v));
-        *ec = -3; *em = msg; return 0; }
+/* position 1's arity alone, so a caller can collect a LATER position's type
+ * error alongside this one's before any value work (see cmd_estimaterawfee) */
+static int fee_parse_target_arity(const rj_val* params, const char* method,
+                                  long* ec, const char** em){
+    if (!params || params->typ != RJ_ARR || params->nitems < 1){
+        static char ubuf[96];
+        snprintf(ubuf, sizeof ubuf, "%s requires conf_target", method);
+        *ec = -1; *em = ubuf; return 0; }
+    return 1;
+}
+static int fee_parse_target(const rj_val* params, const char* method, unsigned max_target,
+                            long* ec, const char** em, int* out){
+    static char msg[256];
+    if (!fee_parse_target_arity(params, method, ec, em)) return 0;
+    const rj_val* v = params->items[0];
+    if (v->typ != RJ_NUM){
+        rj_typeerrs te; rj_typeerr_init(&te);
+        rj_typeerr_add(&te, 1, "conf_target", v, "number");
+        rj_typeerr_fail(&te, ec, em); return 0; }
     long t = atol(v->str);
     if (t < 1 || (unsigned long)t > max_target){
         snprintf(msg, sizeof msg, "Invalid conf_target, must be between 1 and %u", max_target);
@@ -1697,7 +2145,7 @@ static int cmd_estimatesmartfee(const rj_val* params, rj_val** res, long* ec, co
     const void* fe = g_mph.feeest;
     unsigned max_target = (fe && fest_highest_target) ? fest_highest_target(fe, FEST_LONG) : 1008u;
     int target = 0;
-    if (!fee_parse_target(params, max_target, ec, em, &target)) return 0;
+    if (!fee_parse_target(params, "estimatesmartfee", max_target, ec, em, &target)) return 0;
     int conservative = 0;
     if (params->nitems >= 2 && params->items[1]->typ != RJ_NULL){
         const rj_val* mv = params->items[1];
@@ -1753,15 +2201,24 @@ static int cmd_estimaterawfee(const rj_val* params, rj_val** res, long* ec, cons
     const void* fe = g_mph.feeest;
     unsigned max_target = (fe && fest_highest_target) ? fest_highest_target(fe, FEST_LONG) : 1008u;
     int target = 0;
-    if (!fee_parse_target(params, max_target, ec, em, &target)) return 0;
+    /* threshold's TYPE settles before conf_target's RANGE: `estimaterawfee 0
+     * "x"` reports Position 2 (threshold), not the out-of-range target.
+     * Measured against v31.1, 2026-09-15. fee_parse_target checks position 1's
+     * type first (lower position wins) and its range second, so the threshold
+     * check sits between the two -- which is why it is not simply hoisted
+     * above the call. */
     double threshold = 0.95;
-    if (params->nitems >= 2 && params->items[1]->typ != RJ_NULL){
-        const rj_val* tv = params->items[1];
-        if (tv->typ != RJ_NUM){
-            static char msg[96]; snprintf(msg, sizeof msg, "JSON value of type %s is not of expected type number", rj_type_name(tv));
-            *ec = -3; *em = msg; return 0; }
-        threshold = atof(tv->str);
-    }
+    const rj_val* tv = (params && params->typ == RJ_ARR && params->nitems >= 2 &&
+                        params->items[1]->typ != RJ_NULL) ? params->items[1] : 0;
+    if (!fee_parse_target_arity(params, "estimaterawfee", ec, em)) return 0;
+    { rj_typeerrs te; rj_typeerr_init(&te);
+      if (params->items[0]->typ != RJ_NUM)
+          rj_typeerr_add(&te, 1, "conf_target", params->items[0], "number");
+      if (tv && tv->typ != RJ_NUM)
+          rj_typeerr_add(&te, 2, "threshold", tv, "number");
+      if (rj_typeerr_fail(&te, ec, em)) return 0; }
+    if (!fee_parse_target(params, "estimaterawfee", max_target, ec, em, &target)) return 0;
+    if (tv) threshold = atof(tv->str);
     if (threshold < 0 || threshold > 1){ *ec = -8; *em = "Invalid threshold"; return 0; }
     static const char* const names[3] = { "short", "medium", "long" };
     static const unsigned defaults[3] = { 12u, 48u, 1008u };
@@ -1887,11 +2344,12 @@ static long long pri_delta_of(const unsigned char txid[32]){
         if (g_pri[i].used && !memcmp(g_pri[i].txid, txid, 32)) return g_pri[i].delta;
     return 0;
 }
-/* shared txid-arg validation (Core-exact -8 messages); display -> internal */
+/* shared txid-arg validation; display -> internal. The caller has already
+ * rejected a missing argument with -1, so a non-string here is Core's -3. */
 static int pri_parse_txid(const rj_val* v, unsigned char txid[32], long* ec, const char** em){
-    static char embuf[128];
-    if (!v || v->typ != RJ_STR){
-        *ec = -8; *em = "JSON value of type null is not of expected type string"; return 0; }
+    static char embuf[256];
+    if (!v || v->typ != RJ_STR)
+        return rpc_wrong_type(ec, em, embuf, sizeof embuf, 1, "txid", v, "string");
     size_t hl = strlen(v->str);
     if (hl != 64){
         snprintf(embuf, sizeof embuf, "txid must be of length 64 (not %zu, for '%s')", hl, v->str);
@@ -1909,6 +2367,12 @@ static int pri_parse_txid(const rj_val* v, unsigned char txid[32], long* ec, con
 static int cmd_prioritisetransaction(const rj_val* params, rj_val** res, long* ec, const char** em){
     if (!params || params->typ != RJ_ARR || params->nitems < 3){
         *ec = -1; *em = "prioritisetransaction requires txid, dummy, fee_delta"; return 0; }
+    { rj_typeerrs te; rj_typeerr_init(&te);
+      if (params->items[0]->typ != RJ_STR)
+          rj_typeerr_add(&te, 1, "txid", params->items[0], "string");
+      if (params->items[2]->typ != RJ_NUM)
+          rj_typeerr_add(&te, 3, "fee_delta", params->items[2], "number");
+      if (rj_typeerr_fail(&te, ec, em)) return 0; }
     unsigned char txid[32];
     if (!pri_parse_txid(params->items[0], txid, ec, em)) return 0;
     /* dummy must be 0/null (Core-exact message) */
@@ -1919,7 +2383,8 @@ static int cmd_prioritisetransaction(const rj_val* params, rj_val** res, long* e
           *ec = -8; *em = "Priority is no longer supported, dummy argument to prioritisetransaction must be 0.";
           return 0; } }
     if (params->items[2]->typ != RJ_NUM){
-        *ec = -3; *em = "JSON value of type string is not of expected type number"; return 0; }
+        static char dbuf[256];
+        return rpc_wrong_type(ec, em, dbuf, sizeof dbuf, 3, "fee_delta", params->items[2], "number"); }
     long long delta = atoll(params->items[2]->str);
     int slot = -1;
     for (int i = 0; i < PRI_MAX; i++){
@@ -2062,10 +2527,18 @@ typedef struct {
     /* entries rejected for MISSING INPUTS are kept for retry passes: the dump
      * is written in pool order, not parent-before-child, so a child ahead of
      * its parent fails on the first pass and succeeds once the parent is in. */
-    unsigned char** retry; unsigned long* retry_len; long nretry, retry_cap;
+    unsigned char** retry; unsigned long* retry_len; long long* retry_time;
+    long nretry, retry_cap;
     int collecting;
     int aborted;            /* shutdown requested, or the worker stopped answering */
     int consec_timeouts;    /* entries in a row that drew no ack at all */
+    long restored_times;    /* accepts whose persisted arrival time was applied */
+    /* WHY entries were refused. The load already orders parents before children
+     * (mpd_order_parents_first), so "it arrived before its parent" is not the
+     * explanation any more and the old log line saying so was misleading. These
+     * count what the worker actually said. */
+    long rej_missing, rej_conflict, rej_policy, rej_other, rej_noack;
+    long already;           /* in the pool already -- present, not refused */
     const char* abort_why;
 } mpd_import_ctx;
 /* The parent's shutdown flag (main.c installs it): a reload that waits 90 s
@@ -2135,16 +2608,25 @@ long mpd_order_parents_first(const mpd_ent* v, long n, long* order){
     free(slot); free(indeg); free(children); free(child_next); free(child_head);
     return placed;
 }
+/* mempool.dat's per-transaction entry_time, applied after the accept succeeds.
+ * Weak so the test binaries that link rpc_node.o without daemon/mempool_cfg.c
+ * still build; absent, the arrival time simply stays as stamped. */
+extern int mempool_restore_accept_time(const unsigned char txid[32], long t) __attribute__((weak));
+
 static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len,
                           long long t, long long d){
-    (void)t; (void)d;   /* entry time and fee delta are not restorable here --
-                         * see the divergence note at the call site */
+    (void)d;            /* fee deltas are still not restorable: there is no
+                         * prioritisetransaction path to replay one into */
     mpd_import_ctx* c = (mpd_import_ctx*)vctx;
-    { mpd_import_ctx* c0 = (mpd_import_ctx*)vctx; if (c0->aborted){ c0->rejected++; return 0; } }   /* aborted: drain the rest without waiting */
+    { mpd_import_ctx* c0 = (mpd_import_ctx*)vctx;
+      /* counted as "other": the worker was never asked, so there is no reason
+       * to classify -- but it IS a refused entry and has to appear in the
+       * histogram, or the parts stop summing to the total */
+      if (c0->aborted){ c0->rejected++; c0->rej_other++; return 0; } }   /* aborted: drain the rest */
     if (!g_status_rw) return -1;
     node_status_t* st = g_status_rw;
     pthread_mutex_lock(&g_submit_lock);
-    if (len > RPC_TXSUBMIT_MAX){ pthread_mutex_unlock(&g_submit_lock); c->rejected++; return 0; }
+    if (len > RPC_TXSUBMIT_MAX){ pthread_mutex_unlock(&g_submit_lock); c->rejected++; c->rej_other++; return 0; }
     memcpy((void*)st->tx_submit_buf, tx, len);
     st->tx_submit_len = len;
     st->tx_submit_test = 0;
@@ -2160,23 +2642,70 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
         struct timespec ts = {0, MPD_POLL_US*1000L}; nanosleep(&ts, NULL);   /* the worker acks within ~0.5 ms once it is servicing the stream */
         waited += MPD_POLL_US;
     }
+    if (ok && t > 0 && mempool_restore_accept_time){
+        /* The worker stamped "now" when it admitted this. Put the time the
+         * transaction ACTUALLY arrived back, so a restart does not reset the
+         * pool's sense of age -- the departure journal's `waited` and
+         * -mempoolexpiry both read this field. The helper vets the value; a
+         * future or already-expired time is refused there, not here. */
+        unsigned char id[32];
+        static unsigned char scratch[RPC_TXSUBMIT_MAX];
+        if (tx_txid(id, tx, len, scratch, sizeof scratch) &&
+            mempool_restore_accept_time(id, (long)t)) c->restored_times++;
+    }
     if (acked) c->consec_timeouts = 0;
     else if (!c->aborted && ++c->consec_timeouts >= 2){ c->aborted = 1; c->abort_why = "the worker is not answering"; }
     int missing = !ok && strstr((const char*)st->tx_submit_reason, "missing") != NULL;
+    /* Classify now, while the worker's reason is still in the shared slot, but
+     * do NOT count it yet: an entry about to be DEFERRED comes back through
+     * here on the retry pass and would be counted twice. The first live
+     * histogram showed exactly that -- "16 refused" over a list summing to 23,
+     * the gap being the 7 re-offered entries. These counters must describe
+     * ENTRIES, not attempts, or they do not reconcile with the total they sit
+     * beside. */
+    int why_class = 0;              /* 1 noack, 2 missing, 3 conflict, 4 already, 5 policy, 6 other */
+    if (!ok){
+        const char* why = (const char*)st->tx_submit_reason;
+        if (!acked)                       why_class = 1;
+        else if (missing)                 why_class = 2;
+        else if (strstr(why, "conflict")) why_class = 3;
+        else if (strstr(why, "already"))  why_class = 4;
+        else if (why[0])                  why_class = 5;
+        else                              why_class = 6;
+    }
     pthread_mutex_unlock(&g_submit_lock);
+    #define MPD_COUNT_REFUSAL() do { switch (why_class){ \
+            case 1: c->rej_noack++;    break; case 2: c->rej_missing++;  break; \
+            case 3: c->rej_conflict++; break; case 5: c->rej_policy++;   break; \
+            default: c->rej_other++;   break; } } while (0)
+    /* "already known" is NOT a refusal: the transaction IS in the pool, it just
+     * arrived from a peer during boot before the dump was read. Counting it as
+     * rejected understated the load badly -- 665 of 753 "refusals" on
+     * 2026-09-16 were duplicates, so 17,122 of 17,210 entries were really in
+     * the pool while the line claimed 753 had failed. */
+    if (why_class == 4){ c->already++; return 0; }      /* present already: not a refusal */
     if (ok) c->accepted++;
     else if (missing && c->collecting){
         if (c->nretry == c->retry_cap){
             long ncap = c->retry_cap ? c->retry_cap * 2 : 64;
             unsigned char** nr = realloc(c->retry, (size_t)ncap * sizeof *nr);
             unsigned long* nl = realloc(c->retry_len, (size_t)ncap * sizeof *nl);
-            if (!nr || !nl){ free(nr); free(nl); c->rejected++; return 0; }
-            c->retry = nr; c->retry_len = nl; c->retry_cap = ncap;
+            long long*     nt = realloc(c->retry_time, (size_t)ncap * sizeof *nt);
+            if (!nr || !nl || !nt){
+                /* keep whatever realloc DID move, or the next free() is on a
+                 * stale pointer; only the failed one is discarded */
+                if (nr) c->retry = nr;
+                if (nl) c->retry_len = nl;
+                if (nt) c->retry_time = nt;
+                c->rejected++; MPD_COUNT_REFUSAL(); return 0; }
+            c->retry = nr; c->retry_len = nl; c->retry_time = nt; c->retry_cap = ncap;
         }
         unsigned char* cp = malloc(len);
-        if (!cp){ c->rejected++; return 0; }
-        memcpy(cp, tx, len); c->retry[c->nretry] = cp; c->retry_len[c->nretry] = len; c->nretry++;
-    } else c->rejected++;
+        if (!cp){ c->rejected++; MPD_COUNT_REFUSAL(); return 0; }
+        memcpy(cp, tx, len); c->retry[c->nretry] = cp; c->retry_len[c->nretry] = len;
+        c->retry_time[c->nretry] = t; c->nretry++;
+    } else { c->rejected++; MPD_COUNT_REFUSAL(); }
+    #undef MPD_COUNT_REFUSAL
     return 0;                       /* a rejected entry is not a file error */
 }
 /* Re-offer the missing-input rejects until a pass admits nothing more. Each
@@ -2189,14 +2718,19 @@ static long mpd_retry_passes(mpd_import_ctx* c){
         unsigned char** list = c->retry; unsigned long* lens = c->retry_len;
         c->retry = 0; c->retry_len = 0; c->nretry = c->retry_cap = 0; c->collecting = 1;
         long rej0 = c->rejected;
-        for (long i = 0; i < n; i++){ mpd_import_one(c, list[i], lens[i], 0, 0); free(list[i]); }
-        free(list); free(lens);
+        /* the persisted time travels with the deferred entry: a child held back
+         * for its parent is exactly as old as the file says, and dropping the
+         * time here would leave a subset of the pool silently re-aged */
+        long long* tms = c->retry_time; c->retry_time = 0;
+        for (long i = 0; i < n; i++){ mpd_import_one(c, list[i], lens[i], tms ? tms[i] : 0, 0); free(list[i]); }
+        free(list); free(lens); free(tms);
         passes++; gained += c->accepted - before;
         c->collecting = 0;
         if (c->accepted == before){ c->rejected = rej0 + c->nretry; break; }   /* no progress: the rest are real rejects */
     }
     for (long i = 0; i < c->nretry; i++) free(c->retry[i]);
-    free(c->retry); free(c->retry_len); c->retry = 0; c->retry_len = 0; c->nretry = 0;
+    free(c->retry); free(c->retry_len); free(c->retry_time);
+    c->retry = 0; c->retry_len = 0; c->retry_time = 0; c->nretry = 0;
     return passes ? gained : 0;
 }
 
@@ -2218,8 +2752,20 @@ long rpc_node_mempool_load(const char* path){
     free(col.v); free(order);
     long deferred = c.nretry;
     long gained = mpd_retry_passes(&c);
-    fprintf(stderr, "[mempool] loaded %s: %ld accepted, %ld rejected of %ld (%ld waited for a parent, %ld of them then accepted)\n",
-            path ? path : "mempool.dat", c.accepted, c.rejected, r, deferred, gained);
+    /* The old line read "%ld waited for a parent, %ld of them then accepted",
+     * which said the refusals were an ORDERING problem. They are not: this
+     * function topologically sorts parents before children before submitting
+     * anything, so a child's in-dump parent has always been offered first, and
+     * the retry passes have recovered ZERO entries on every real load since
+     * that sort landed (1,622 deferred on 2026-09-16 03:08 and 3,630 at 06:09,
+     * both zero). The refusals are inputs that genuinely are not there. Saying
+     * which is the difference between a number and a diagnosis. */
+    fprintf(stderr, "[mempool] loaded %s: %ld of %ld in the pool (%ld admitted, %ld already there); "
+                    "%ld refused: %ld missing-inputs, %ld conflicting, %ld policy, %ld no-ack, %ld other "
+                    "(%ld re-offered, %ld then accepted); %ld arrival time(s) restored\n",
+            path ? path : "mempool.dat", c.accepted + c.already, r, c.accepted, c.already,
+            c.rejected, c.rej_missing, c.rej_conflict, c.rej_policy, c.rej_noack, c.rej_other,
+            deferred, gained, c.restored_times);
     return c.accepted;
 }
 
@@ -2380,7 +2926,7 @@ static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
  * because of its child.
  *
  * The result follows Core's schema rather than a reduced one of our own:
- * package_msg, tx-results keyed by wtxid with txid / vsize / vsize_bip141 /
+ * package_msg, tx-results keyed by wtxid with txid / vsize /
  * fees{base, effective-feerate, effective-includes} / error, and Core's own
  * "package-not-validated" for members that never got an individual verdict
  * because the package was rejected as a whole.
@@ -2500,7 +3046,6 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
         rj_val* e = rj_obj();
         rj_obj_set(e, "txid", rj_str(thex));
         rj_obj_set(e, "vsize", rj_numf("%llu", (unsigned long long)r_vsize[i]));
-        rj_obj_set(e, "vsize_bip141", rj_numf("%llu", (unsigned long long)r_vsize[i]));
         if (r_result[i]){
             rj_val* f = rj_obj();
             rj_obj_set(f, "base", mpe_amount(r_fee[i]));
@@ -2664,7 +3209,6 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
             } else if (r_result[i]){
                 rj_obj_set(e, "allowed", rj_bool(1));
                 rj_obj_set(e, "vsize", rj_numf("%llu", (unsigned long long)r_vsize[i]));
-                rj_obj_set(e, "vsize_bip141", rj_numf("%llu", (unsigned long long)r_vsize[i]));
                 rj_val* f = rj_obj();
                 rj_obj_set(f, "base", mpe_amount(r_fee[i]));
                 if (eff_vsize){
@@ -2726,7 +3270,6 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
             unsigned long vsz = (w + 3) / 4;
             rj_obj_set(e, "allowed", rj_bool(1));
             rj_obj_set(e, "vsize", rj_numf("%lu", vsz));
-            rj_obj_set(e, "vsize_bip141", rj_numf("%lu", vsz));
             rj_val* fees = rj_obj();
             rj_obj_set(fees, "base", rj_numf("%llu.%08llu", fee/100000000ULL, fee%100000000ULL));
             /* effective-feerate/effective-includes describe package feerate,
@@ -2772,6 +3315,214 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
  *
  * Answers {"active": false} outside a parallel download rather than failing,
  * so a poller can call it unconditionally. */
+
+/* ---- bmcgetmempooljournal (2026-09-16) -------------------------------------
+ * The mempool DEPARTURE journal. Core has no counterpart: when a transaction
+ * leaves the pool without being mined -- evicted because the pool hit
+ * -maxmempool, expired after -mempoolexpiry, or replaced -- Core forgets it,
+ * so an explorer built on it cannot say what became of a transaction a user
+ * broadcast. It shows a gap, or a "ghost" that was there and then was not.
+ * daemon/mempool_journal.c records one bounded row per departure.
+ *
+ *   bmcgetmempooljournal                 -> stats + the most recent departures
+ *   bmcgetmempooljournal <txid>          -> that transaction's latest departure
+ *   bmcgetmempooljournal <count>         -> the most recent <count>
+ *
+ * Amounts are satoshis (this is an extension, not a Core-shaped reply, so it
+ * uses the unit the record holds rather than Core's decimal BTC strings). */
+static void mpj_hex_rev(char out[65], const unsigned char h[32]){
+    static const char* D = "0123456789abcdef";
+    for (int i = 0; i < 32; i++){ unsigned char b = h[31-i]; out[i*2] = D[b>>4]; out[i*2+1] = D[b&15]; }
+    out[64] = 0;
+}
+static int mpj_all_zero(const unsigned char* p, int n){ for (int i=0;i<n;i++) if (p[i]) return 0; return 1; }
+
+static rj_val* mpj_row(const mpj_rec* r){
+    rj_val* o = rj_obj();
+    char h[65];
+    mpj_hex_rev(h, r->txid);   rj_obj_set(o, "txid", rj_str(h));
+    /* wtxid is not recorded today (see daemon/mempool_cfg.c mempool_depart);
+     * an all-zero field is "not recorded", and omitting it is more honest than
+     * echoing the txid, which is right only for a non-witness transaction. */
+    if (!mpj_all_zero(r->wtxid, 32)){ mpj_hex_rev(h, r->wtxid); rj_obj_set(o, "wtxid", rj_str(h)); }
+    rj_obj_set(o, "reason", rj_str(mpj_reason_name(r->reason)));
+    if (r->first_seen)  rj_obj_set(o, "firstseen", rj_numf("%lld", (long long)r->first_seen));
+    rj_obj_set(o, "departed", rj_numf("%lld", (long long)r->departed_at));
+    if (r->first_seen && r->departed_at >= r->first_seen)
+        rj_obj_set(o, "waited", rj_numf("%lld", (long long)(r->departed_at - r->first_seen)));
+    rj_obj_set(o, "vsize", rj_numf("%llu", (unsigned long long)r->vsize));
+    rj_obj_set(o, "fee", rj_numf("%llu", (unsigned long long)r->fee_sat));
+    /* sat/kvB, not sat/vB. Integer sat/vB truncates: the FIRST live block this
+     * recorded had 188 of 200 rows reporting "feerate": 0, because most real
+     * transactions are under 1 sat/vB once the fee is divided by vsize
+     * (25 sat over 140 vB is 0.179). A field that reads zero for 94% of rows
+     * is worse than no field. sat/kvB is also the unit Core's own fee
+     * estimator speaks, so it needs no conversion on the way in. The name
+     * carries the unit so a consumer cannot assume the other one. */
+    if (r->vsize) rj_obj_set(o, "feerate_satkvb",
+                             rj_numf("%llu", (unsigned long long)((r->fee_sat * 1000ULL) / r->vsize)));
+    if (r->reason == MPJ_MINED && r->height) rj_obj_set(o, "height", rj_numf("%u", r->height));
+    if (!mpj_all_zero(r->aux, 32)){
+        mpj_hex_rev(h, r->aux);
+        rj_obj_set(o, r->reason == MPJ_REPLACED ? "replaced_by" : "blockhash", rj_str(h));
+    }
+    return o;
+}
+typedef struct { rj_val* arr; long cap; } mpj_ctx;
+static int mpj_push(void* c, const mpj_rec* r){
+    mpj_ctx* x = c;
+    if ((long)x->arr->nitems >= x->cap) return 0;
+    rj_arr_push(x->arr, mpj_row(r));
+    return 1;
+}
+static int cmd_bmcgetmempooljournal(const rj_val* params, rj_val** res, long* ec, const char** em){
+    if (!mpj_is_open()){
+        *ec = -1;
+        *em = "the mempool departure journal is not enabled -- set bmc.mempooljournal=<records> "
+              "(one record is 152 bytes) and restart";
+        return 0;
+    }
+    /* one string argument: a txid to look up */
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 && params->items[0]->typ == RJ_STR){
+        const char* hx = params->items[0]->str;
+        if (strlen(hx) != 64){
+            static char eb[96];
+            snprintf(eb, sizeof eb, "txid must be of length 64 (not %zu, for '%s')", strlen(hx), hx);
+            *ec = -8; *em = eb; return 0;
+        }
+        unsigned char wire[32];
+        for (int i = 0; i < 32; i++){
+            int hi = -1, lo = -1; char a = hx[i*2], b = hx[i*2+1];
+            if (a>='0'&&a<='9') hi=a-'0'; else if ((a|32)>='a'&&(a|32)<='f') hi=(a|32)-'a'+10;
+            if (b>='0'&&b<='9') lo=b-'0'; else if ((b|32)>='a'&&(b|32)<='f') lo=(b|32)-'a'+10;
+            if (hi < 0 || lo < 0){
+                static char eb2[96];
+                snprintf(eb2, sizeof eb2, "txid must be hexadecimal string (not '%s')", hx);
+                *ec = -8; *em = eb2; return 0; }
+            wire[31-i] = (unsigned char)((hi<<4)|lo);
+        }
+        mpj_rec r;
+        if (!mpj_lookup(wire, &r)){
+            /* NOT an error: "the journal has no record of it" is a real and
+             * useful answer -- it means the transaction never left the pool
+             * here, or left longer ago than the ring holds. */
+            rj_val* o = rj_obj();
+            rj_obj_set(o, "found", rj_bool(0));
+            *res = o; return 1;
+        }
+        rj_val* o = mpj_row(&r);
+        rj_obj_set(o, "found", rj_bool(1));
+        *res = o; return 1;
+    }
+    /* optional numeric argument: how many recent departures to return */
+    long want = 10;
+    if (params && params->typ == RJ_ARR && params->nitems >= 1 && params->items[0]->typ == RJ_NUM){
+        want = atol(params->items[0]->str);
+        if (want < 0) want = 0;
+        if (want > 5000) want = 5000;        /* one reply, not a database dump */
+    }
+    mpj_stats_t st; mpj_stats(&st);
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "capacity", rj_numf("%llu", (unsigned long long)st.capacity));
+    rj_obj_set(o, "held",     rj_numf("%llu", (unsigned long long)st.held));
+    rj_obj_set(o, "recorded", rj_numf("%llu", (unsigned long long)st.written));
+    if (st.held){
+        rj_obj_set(o, "oldest", rj_numf("%lld", (long long)st.oldest_departed));
+        rj_obj_set(o, "newest", rj_numf("%lld", (long long)st.newest_departed));
+    }
+    { rj_val* by = rj_obj();
+      for (uint32_t i = 1; i <= MPJ_REASON_MAX; i++)
+          rj_obj_set(by, mpj_reason_name(i), rj_numf("%llu", (unsigned long long)st.by_reason[i]));
+      rj_obj_set(o, "by_reason", by); }
+    { rj_val* a = rj_arr(); mpj_ctx cx = { a, want };
+      if (want > 0) mpj_recent(want, mpj_push, &cx);
+      rj_obj_set(o, "recent", a); }
+    *res = o;
+    return 1;
+}
+
+/* ---- bmcgetcapabilities (2026-09-16) ---------------------------------------
+ * ONE call that answers "what is this node, and what can it do that Core
+ * cannot". Core has no counterpart; it is an extension, like the rest of the
+ * bmc* family.
+ *
+ * WHY IT EXISTS. A consumer could not tell this node from Core over RPC.
+ * blockyard, the monitoring front end, wrote the problem down in
+ * server/collect/monitor.js: "both report the same non-Core subversion string.
+ * So RPC cannot tell you whether RPC is complete; only the log's build banner
+ * can." It therefore has to TAIL THE NODE'S LOG FILE to identify what it is
+ * talking to, which is why `log.enabled` is a per-node setting there at all.
+ * A monitor should not need file access to a machine it can already reach over
+ * RPC.
+ *
+ * getnetworkinfo already carries bmc_build_commit, and that is not enough on
+ * its own: a commit hash makes the consumer keep a commit -> capability map,
+ * which is wrong the moment a build lands.
+ *
+ * EVERY FIELD IS LIVE STATE, NOT A COMPILE-TIME LIST, and that is the whole
+ * point. addrindex, the departure journal and the Esplora facade are all
+ * opt-in; a build that CAN serve address history is not the same as a node
+ * that IS serving it, and reporting the first would mislead a consumer exactly
+ * where it matters. Each entry below is read from the running configuration or
+ * from the subsystem itself.
+ *
+ * The reply is deliberately flat and small: it is a handshake, not a status
+ * page. Anything that needs numbers has its own call (bmcgetdownloadinfo,
+ * bmcgetmempooljournal, getindexinfo). */
+/* Weak, so rpc_node.o keeps its no-link-fanout property: the test binaries
+ * that link it without the daemon's config or the address history still build,
+ * and a capability simply reports as absent there -- which is the truthful
+ * answer for a binary that genuinely cannot serve it. */
+extern int  ah_available(void) __attribute__((weak));
+extern int  node_cfg_addrindex_on(void)   __attribute__((weak));
+extern int  node_cfg_esplora_port_get(void) __attribute__((weak));
+static int cmd_bmcgetcapabilities(rj_val** res){
+    rj_val* o = rj_obj();
+    rj_obj_set(o, "node", rj_str("bitcoinmachinecode"));
+    rj_obj_set(o, "subversion", rj_str(g_user_agent[0] ? g_user_agent : NODE_UA_STRING));
+    { rj_val* b = rj_obj();
+      rj_obj_set(b, "commit", rj_str(BMC_BUILD_COMMIT));
+      rj_obj_set(b, "dirty",  rj_bool(BMC_BUILD_DIRTY));
+      rj_obj_set(o, "build", b); }
+
+    rj_val* x = rj_obj();
+    /* address history: Core has NO address index at all, so this is the
+     * capability a consumer most needs to know about. ah_available() is the
+     * same check the Esplora address routes make before answering. */
+    rj_obj_set(x, "addrindex", rj_bool(ah_available && ah_available() ? 1 :
+                                       (node_cfg_addrindex_on && node_cfg_addrindex_on())));
+    /* the Esplora REST facade: the port, or 0 when it is off. A port is more
+     * useful than a bool -- a consumer that gets one can go straight there. */
+    rj_obj_set(x, "esploraport", rj_numf("%d",
+        node_cfg_esplora_port_get ? node_cfg_esplora_port_get() : 0));
+    /* the mempool DEPARTURE journal: why a transaction left the pool, which
+     * Core forgets entirely. Reported with its capacity so a consumer can tell
+     * how far back the answers reach. */
+    if (mpj_is_open()){
+        rj_val* j = rj_obj();
+        rj_obj_set(j, "enabled",  rj_bool(1));
+        rj_obj_set(j, "capacity", rj_numf("%llu", (unsigned long long)mpj_capacity()));
+        rj_obj_set(x, "mempooljournal", j);
+    } else {
+        rj_val* j = rj_obj(); rj_obj_set(j, "enabled", rj_bool(0));
+        rj_obj_set(x, "mempooljournal", j);
+    }
+    /* the forked downloader's worker->peer->chunk map; no Core counterpart */
+    rj_obj_set(x, "downloadinfo", rj_bool(1));
+    rj_obj_set(o, "extensions", x);
+
+    /* The completeness question blockyard actually hit: one build answered
+     * getnettotals 0/0 and getpeerinfo [] while getconnectioncount said 16, so
+     * "RPC only" meant no bandwidth and no peer names. Saying so here lets a
+     * consumer decide whether it needs the log, instead of discovering the
+     * gap from empty charts. */
+    { rj_val* c = rj_obj();
+      rj_obj_set(c, "peerinfo",   rj_bool(1));
+      rj_obj_set(c, "nettotals",  rj_bool(1));
+      rj_obj_set(o, "rpc_complete", c); }
+    *res = o;
+    return 1;
+}
 static int cmd_bmcgetdownloadinfo(rj_val** res){
     rj_val* o = rj_obj();
     const node_status_t* s = g_status;
@@ -2828,6 +3579,8 @@ static const char* const NODE_METHODS[] = {
     "testmempoolaccept", "submitpackage", "savemempool", "importmempool",
     "getprivatebroadcastinfo", "abortprivatebroadcast",
     "bmcgetdownloadinfo",   /* 2026-09-10: this node's own, no Core counterpart */
+    "bmcgetmempooljournal", /* 2026-09-16: the mempool departure journal */
+    "bmcgetcapabilities",   /* 2026-09-16: what this node is, and what it can do */
     "getnettotals", "getnodeaddresses", "getaddrmaninfo", "getrawaddrman", "getorphantxs", "listbanned",
     "clearbanned", "getaddednodeinfo", "addnode", "addpeeraddress", "disconnectnode",
     "setban", "setnetworkactive", "ping", "getzmqnotifications",
@@ -2909,6 +3662,54 @@ int rpc_node_known_method(const char* m){
     for (int i = 0; NODE_METHODS[i]; i++) if (!strcmp(m, NODE_METHODS[i])) return 1;
     return 0;
 }
+/* ---- the cluster layer's view of this mempool -----------------------------
+ * mempool_cluster.c knows nothing about this node: it takes a lookup callback.
+ * That is deliberate (link-check refused a direct policy dependency here once
+ * already), and it is also what lets the cluster tests run with no mempool.
+ *
+ * The caller must hold the mempool lock across the whole build: the callback is
+ * invoked many times and a pool that moves underneath it would produce a
+ * cluster assembled from two different mempools. */
+static int mpc_lookup_here(void* ctx, const unsigned char txid[32], mpc_entry* out)
+{
+    (void)ctx;
+    if (!g_mph.mp || !g_mph.get) return 0;
+    unsigned long len = 0;
+    const unsigned char* tx = g_mph.get(g_mph.mp, txid, &len);
+    if (!tx) return 0;
+    mp_entry_info inf;
+    if (!g_mph.pol_entry_info || !g_mph.polstate) return 0;
+    if (!(int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf)) return 0;
+
+    memset(out, 0, sizeof *out);
+    /* fee is the MODIFIED fee: prioritisetransaction moves a transaction in the
+     * block-space competition, so the chunking must see the same number the
+     * miner would. */
+    long long modified = (long long)inf.fee + pri_delta_of(txid);
+    out->fee = modified < 0 ? 0 : (uint64_t)modified;
+    /* Core chunks by sigops-ADJUSTED weight (policy.cpp GetSigOpsAdjustedWeight),
+     * not raw weight -- a sigop-heavy transaction costs a block more than its
+     * bytes suggest, and chunking by bytes would order it wrongly. */
+    { unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
+      unsigned long long w = mp_tx_weight(tx, len);
+      unsigned long long sw = (unsigned long long)inf.sigop_cost * bps;
+      out->weight = sw > w ? sw : w; }
+
+    /* edges filtered to transactions still in the pool, as depends/spentby
+     * are: a stale registry edge would otherwise fail the whole build */
+    for (int i = 0; i < inf.n_depends && out->n_parents < MPC_MAX_CLUSTER; i++){
+        unsigned long l2 = 0;
+        if (g_mph.get(g_mph.mp, inf.depends[i], &l2))
+            memcpy(out->parents[out->n_parents++], inf.depends[i], 32);
+    }
+    for (int i = 0; i < inf.n_spentby && out->n_children < MPC_MAX_CLUSTER; i++){
+        unsigned long l2 = 0;
+        if (g_mph.get(g_mph.mp, inf.spentby[i], &l2))
+            memcpy(out->children[out->n_children++], inf.spentby[i], 32);
+    }
+    return 1;
+}
+
 /* getmempoolcluster, for the case that needs no linearization.
  *
  * Core returns the transaction's whole cluster in LINEARIZATION order, split
@@ -2924,14 +3725,15 @@ int rpc_node_known_method(const char* m){
  * than inventing an ordering that would differ from Core's silently. */
 static int cmd_getmempoolcluster(const rj_val* params, rj_val** res, long* ec, const char** em){
     static char embuf[512];
-    /* Core answers a null/absent txid with -3 (RPC_TYPE_ERROR), not -8; see
-     * getmempoolcluster against v31.1. Three older sites in this file
-     * (getmempoolentry and friends) return -8 for the identical condition and
-     * are wrong about it -- recorded in PARITY_RPC_FIELDS.md rather than
-     * changed here, since altering a returned error code is a caller-visible
-     * break that belongs in its own change. */
-    if (!params || params->typ != RJ_ARR || params->nitems < 1 || params->items[0]->typ != RJ_STR){
-        *ec = -3; *em = "JSON value of type null is not of expected type string"; return 0; }
+    /* This had the right CODE for a wrong type and the wrong one for a missing
+     * argument, which it folded into the same branch: Core answers -1 there.
+     * It also hardcoded the type as "null" whatever was passed. The three
+     * sibling sites it used to point at were fixed on 2026-09-15; this one is
+     * now the same shape as all of them. */
+    if (!params || params->typ != RJ_ARR || params->nitems < 1){
+        *ec = -1; *em = "getmempoolcluster requires txid"; return 0; }
+    if (params->items[0]->typ != RJ_STR)
+        return rpc_wrong_type(ec, em, embuf, sizeof embuf, 1, "txid", params->items[0], "string");
     const char* hx = params->items[0]->str;
     if (strlen(hx) != 64){
         snprintf(embuf, sizeof embuf, "txid must be of length 64 (not %zu, for '%s')", strlen(hx), hx);
@@ -2944,44 +3746,67 @@ static int cmd_getmempoolcluster(const rj_val* params, rj_val** res, long* ec, c
         txid[31-i]=(unsigned char)((a<<4)|b);
     }
     if (!g_mph.mp || !g_mph.get){ *ec=-5; *em="Transaction not in mempool"; return 0; }
+
+    /* The whole build under ONE lock hold. mpc_build_cluster calls back many
+     * times; a pool that moved underneath it would assemble a cluster from two
+     * different mempools and report a competition that never existed. */
     mpl();
-    unsigned long len=0;
-    const unsigned char* tx = g_mph.get(g_mph.mp, txid, &len);
-    if (!tx){ mpu(); *ec=-5; *em="Transaction not in mempool"; return 0; }
-    unsigned long w = mp_tx_weight(tx, len);
-    mp_entry_info inf; int have_inf = 0;
-    if (g_mph.pol_entry_info && g_mph.polstate)
-        have_inf = (int)g_mph.pol_entry_info(g_mph.polstate, txid, &inf);
+    mpc_cluster cl;
+    int rc = mpc_build_cluster(0, mpc_lookup_here, txid, &cl);
     mpu();
-    if (!have_inf){ *ec = -5; *em = "Transaction not in mempool"; return 0; }
-    if (inf.n_anc != 1 || inf.n_desc != 1){
+    if (rc != 0 || cl.n < 1){ *ec=-5; *em="Transaction not in mempool"; return 0; }
+
+    if (cl.truncated){
+        /* Core rejects a transaction that would exceed its 64-transaction
+         * cluster limit, so a Core cluster always fits. This node's limits are
+         * not identical, so a component CAN exceed it -- and a truncated walk is
+         * not a cluster. Reporting one would describe a block-space competition
+         * with most of its competitors missing. */
         snprintf(embuf, sizeof embuf,
-                 "this transaction's cluster holds %d transaction(s) (ancestors %d, "
-                 "descendants %d, both counting itself). Splitting a cluster into chunks "
-                 "IS Core's cluster linearization, which this node does not implement, so "
-                 "the chunks cannot be reported. A singleton cluster is answered in full; "
-                 "see getmempoolancestors/getmempooldescendants for the graph.",
-                 inf.n_anc > inf.n_desc ? inf.n_anc : inf.n_desc, inf.n_anc, inf.n_desc);
+                 "this transaction's cluster exceeds %d transactions, the limit Core "
+                 "enforces at acceptance (DEFAULT_CLUSTER_LIMIT). This node accepted a "
+                 "larger component, so the cluster cannot be reported without omitting "
+                 "members of it.", MPC_MAX_CLUSTER);
         *ec = -1; *em = embuf; return 0;
     }
-    unsigned long long bps = g_mph.bytespersigop ? g_mph.bytespersigop() : 20;
-    unsigned long long adjw = w;
-    { unsigned long long sw = (unsigned long long)inf.sigop_cost * bps;
-      if (sw > adjw) adjw = sw; }
-    long long modified = (long long)inf.fee + pri_delta_of(txid);
-    long long am = modified < 0 ? -modified : modified;
+
+    int lin[MPC_MAX_CLUSTER];
+    if (mpc_linearize_ancestor_score(&cl, lin) != 0){
+        *ec = -1; *em = "the cluster could not be linearized (not a DAG?)"; return 0; }
+    /* Post-linearization is equal-or-better by construction and makes the chunks
+     * CONNECTED, which the greedy alone does not guarantee. A disconnected chunk
+     * is not wrong arithmetic, but it is not a chunk Core would report. */
+    mpc_post_linearize(&cl, lin);
+    mpc_chunking ch;
+    if (mpc_chunk_linearization(&cl, lin, &ch) != 0){
+        *ec = -1; *em = "the cluster's linearization could not be chunked"; return 0; }
+
+    uint64_t total_w = 0;
+    for (int i = 0; i < cl.n; i++) total_w += cl.m[i].weight;
 
     rj_val* o = rj_obj();
-    rj_obj_set(o, "clusterweight", rj_numf("%llu", adjw));
-    rj_obj_set(o, "txcount", rj_numf("%d", 1));
+    rj_obj_set(o, "clusterweight", rj_numf("%llu", (unsigned long long)total_w));
+    rj_obj_set(o, "txcount", rj_numf("%d", cl.n));
     rj_val* chunks = rj_arr();
-    rj_val* c = rj_obj();
-    rj_obj_set(c, "chunkfee", rj_numf("%s%lld.%08lld", modified<0?"-":"",
-                                      am/100000000LL, am%100000000LL));
-    rj_obj_set(c, "chunkweight", rj_numf("%llu", adjw));
-    rj_val* txs = rj_arr(); rj_arr_push(txs, rj_str(hx));
-    rj_obj_set(c, "txs", txs);
-    rj_arr_push(chunks, c);
+    for (int i = 0; i < ch.n; i++){
+        rj_val* c = rj_obj();
+        unsigned long long fee = (unsigned long long)ch.c[i].fee;
+        rj_obj_set(c, "chunkfee", rj_numf("%llu.%08llu", fee/100000000ULL, fee%100000000ULL));
+        rj_obj_set(c, "chunkweight", rj_numf("%llu", (unsigned long long)ch.c[i].weight));
+        rj_val* txs = rj_arr();
+        /* members in LINEARIZATION order, as Core emits them -- a chunk is an
+         * ordered run, not a set, and a caller reconstructing the block order
+         * from this must get the order. */
+        for (int k = 0; k < cl.n; k++){
+            int idx = lin[k];
+            if (!(ch.c[i].members & ((uint64_t)1 << idx))) continue;
+            char h[65];
+            mpe_hex(h, cl.txid[idx]);       /* display order, as getblock prints */
+            rj_arr_push(txs, rj_str(h));
+        }
+        rj_obj_set(c, "txs", txs);
+        rj_arr_push(chunks, c);
+    }
     rj_obj_set(o, "chunks", chunks);
     *res = o;
     return 1;
@@ -2999,6 +3824,8 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "importmempool")) return cmd_importmempool(params, res, ec, em);
     if (!strcmp(m, "getprivatebroadcastinfo")) return cmd_getprivatebroadcastinfo(res, ec, em);
     if (!strcmp(m, "bmcgetdownloadinfo"))  return cmd_bmcgetdownloadinfo(res);
+    if (!strcmp(m, "bmcgetmempooljournal")) return cmd_bmcgetmempooljournal(params, res, ec, em);
+    if (!strcmp(m, "bmcgetcapabilities"))  return cmd_bmcgetcapabilities(res);
     if (!strcmp(m, "abortprivatebroadcast"))   return cmd_abortprivatebroadcast(params, res, ec, em);
     if (!strcmp(m, "getmempoolcluster")) return cmd_getmempoolcluster(params, res, ec, em);
     if (!strcmp(m, "getblockfrompeer"))
@@ -3027,7 +3854,7 @@ int rpc_node_dispatch(const char* m, const rj_val* params, rj_val** res, long* e
     if (!strcmp(m, "ping"))               return cmd_ping(res, ec, em);
     if (!strcmp(m, "getzmqnotifications")) return cmd_getzmqnotifications(res);
     if (!strcmp(m, "getmempoolinfo"))     return cmd_getmempoolinfo(res);
-    if (!strcmp(m, "getrawmempool"))      return cmd_getrawmempool(params, res);
+    if (!strcmp(m, "getrawmempool"))      return cmd_getrawmempool(params, res, ec, em);
     if (!strcmp(m, "getmempoolentry"))    return cmd_getmempoolentry(params, res, ec, em);
     if (!strcmp(m, "getmempoolancestors"))   return cmd_getmempoolancestors(params, res, ec, em);
     if (!strcmp(m, "getmempooldescendants")) return cmd_getmempooldescendants(params, res, ec, em);

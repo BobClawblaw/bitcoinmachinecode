@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
 #include <signal.h>
 #include "notify.h"
 #include "log_ts.h"
@@ -85,6 +86,20 @@ void notify_run(const char* cmd_template, const char* value, const char* what){
              * start from a clean slate or it inherits both */
             signal(SIGPIPE, SIG_DFL);
             signal(SIGCHLD, SIG_DFL);
+            /* ...and without the daemon's descriptors. Every fd above stderr
+             * was inherited, the datadir .lock among them: a hook is
+             * double-forked away from us, so nothing waits for it, yet it
+             * held the datadir lock for as long as it ran, so a slow
+             * shutdownnotify could keep the NEXT instance from starting after
+             * this one had gone (none is configured in production today). Core's lock is fcntl (per process, never
+             * inherited), so its hooks never hold it; closing is the same
+             * rule. Peer sockets and the RPC listener go too (DMN-6's leak,
+             * by another door). */
+            { long maxfd = sysconf(_SC_OPEN_MAX); if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+#ifdef SYS_close_range
+              if (syscall(SYS_close_range, 3U, ~0U, 0U) != 0)
+#endif
+                  for (long fd = 3; fd < maxfd; fd++) close((int)fd); }   /* Darwin: no close_range, the loop is the whole path (osx port) */
             execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
             _exit(127);
         }

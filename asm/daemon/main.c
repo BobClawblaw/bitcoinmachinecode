@@ -38,7 +38,13 @@
 #include <stdbool.h>
 #include <fcntl.h>
 #include <dirent.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#include <sys/sysctl.h>
+#include <mach-o/dyld.h>
+#endif
 #include <sys/file.h>          /* DMN-1: flock() for the datadir lock */
+#include <sys/syscall.h>       /* kcmp: which processes share our datadir lock */
 #include "secure_zero.h"    /* WAL-3: a memset the optimiser may not delete */
 #include "hdrrules.h"          /* VAL-5: ContextualCheckBlockHeader rules */
 #include "peer_timeout.h"      /* CC-7: -peertimeout, the handshake deadline */
@@ -69,6 +75,7 @@ static void mempool_refresh_seqlocks(void* store_buf, long now_tip);
 #include "torcontrol.h"  /* inbound: our own onion service */
 #include "asmap.h"       /* -asmap: AS-level address bucketing */
 #include "node_config.h"
+#include "mempool_seq.h"  /* -zmqpubsequence: the mempool sequence + its event ring */
 #include "archive_reindex.h" /* durable, file-backed tuning (bitcoin.conf) */
 #include "netperm.h"   /* -whitelist peer permissions */
 #include "subnet.h"    /* one CIDR matcher, shared with the ban list */
@@ -2067,9 +2074,19 @@ extern long utxo_live_lsm_get(const unsigned char txid_wire[32], unsigned int vo
 static long txoq_mark_block(void* store_buf, const unsigned char hash[32], int op, long* out_h){
     *out_h = -1;
     if(op == 2){ int r = invset_remove(hash); invset_save("invalid.dat"); fprintf(stderr, "[chain] reconsiderblock: %s\n", r ? "mark removed" : "not marked"); return 1; }
-    static unsigned char hb[4096]; hst_init(hb);
+    /* hst_init only OPENS the file and sets the count to 0; hst_reload is
+     * what reads the count from its size. Without it n was always 0, the
+     * scan never ran, and every invalidateblock answered -5 "Block not
+     * found" -- found by the ZMQ sequence regtest differential
+     * (2026-09-19), the first thing to call it over RPC on a live node. The
+     * fd hst_init opens is closed again: this ran once per call and kept
+     * every one. */
+    static unsigned char hb[4096];
+    if(hst_init(hb) != 1) return -1;
+    hst_reload(hb);
     long n = hst_count(hb), h = -1; unsigned char rec[112];
     for(long k = n - 1; k >= 0; k--){ if(hst_get_at(hb, (unsigned long long)k, rec) != 1) break; if(!memcmp(rec + 80, hash, 32)){ h = k; break; } }
+    close((int)*(long*)hb);
     if(h < 0) return 0;
     /* 3.3: the mark + disconnect + headers rollback is chain_invalidate_block
      * (daemon/reorg.c) -- the same path the node takes on its own when a
@@ -2149,6 +2166,368 @@ static volatile sig_atomic_t g_in_utxo_reload = 0;
 static void handle_shutdown_signal(int sig){
     g_shutdown_requested = sig;
     if (g_in_utxo_reload) _exit(0);
+}
+
+/* ==== the datadir lock outlives the parent ================================
+ * (2026-09-19) The lock is a flock on <datadir>/<chain>/.lock (DMN-1, see
+ * datadir_lock_acquire). flock belongs to the OPEN FILE DESCRIPTION, and
+ * every fork shares it: the download worker, the inbound serve children, and
+ * everything THEY fork (the coinstats fold worker, the compaction child, the
+ * pass helpers, the exec'd index builders) all hold the same lock. It is
+ * released when the LAST of them closes it.
+ *
+ * The serve parent used to forward SIGTERM to the worker and _exit(0) on the
+ * spot, so "the main pid exited" never meant "the datadir is free": the
+ * worker was typically still flushing (fee estimates, the UTXO checkpoint,
+ * the fold worker's last commit). Anything that restarts on the main pid --
+ * `kill <pid>; relaunch`, a supervisor, KillMode=mixed/process, the bench
+ * and gate harnesses -- then met "cannot obtain a lock" (tests/
+ * test_stop_waits_for_worker reproduces it: lock held at the parent's exit
+ * every time). Now the parent is the last to leave: it signals its own
+ * children, and exits only when no other process holds its lock.
+ *
+ * "Holds its lock" is decided per process from /proc/<pid>/fd: an fd on the
+ * .lock inode that is the SAME open file description as ours (kcmp
+ * KCMP_FILE). The kcmp matters: a NEW instance that has opened .lock and is
+ * waiting for it (datadir_lock_acquire) holds a different description, and
+ * must not be mistaken for one of ours. Where kcmp is unavailable the inode
+ * alone decides (conservative: we wait for it too, bounded). */
+#ifndef KCMP_FILE
+#define KCMP_FILE 0
+#endif
+static int datadir_lock_fd;              /* defined (= -1) with datadir_lock_acquire below */
+#define LOCK_HOLDERS_MAX 64
+typedef struct { int pid; int tid; unsigned long long start; char comm[20]; } lock_holder_t;
+#ifdef __APPLE__
+/* ---- Darwin (osx port, 2026-09 merge): no /proc, no kcmp. The fd tables
+ * are read through libproc; where Linux compares open file descriptions
+ * (kcmp KCMP_FILE) the inode alone decides -- the conservative fallback
+ * this code already documents. The /proc-only exit-pending window
+ * (exit_files before the flock release) has no equivalent here -- a
+ * Darwin close releases the lock at the close -- so proc_exit_pending is
+ * 0, and our own download worker is tracked portably (waitpid + kill(0))
+ * in shutdown_wait_lock_released. ---- */
+static void proc_comm(int pid, char* out, size_t cap){
+    char p[PROC_PIDPATHINFO_SIZE];
+    if (proc_pidpath((pid_t)pid, p, sizeof p) <= 0){ snprintf(out, cap, "?"); return; }
+    char* sl = strrchr(p, '/');
+    snprintf(out, cap, "%s", sl ? sl + 1 : p);
+}
+static unsigned long long darwin_pid_start(int pid){
+    struct proc_bsdinfo b;
+    if (proc_pidinfo((pid_t)pid, PROC_PIDTBSDINFO, 0, &b, sizeof b) != (int)sizeof b) return 0;
+    return (unsigned long long)b.pbi_start_tvsec;
+}
+static int proc_exit_pending(int pid, unsigned long long start){
+    (void)pid; (void)start;
+    return 0;                            /* see block comment above */
+}
+/* Every process other than this one with an fd on the file `lockfd` is
+ * open on: libproc PROC_PIDLISTFDS + PROC_PIDFDVNODEPATHINFO, matched by
+ * dev+ino. match_ofd is not implementable without kcmp, so a NEW instance
+ * waiting on .lock is reported too -- conservative, bounded. */
+static int lock_holders_scan(int lockfd, int match_ofd, lock_holder_t* out, int cap){
+    (void)match_ofd;
+    struct stat ls;
+    if (fstat(lockfd, &ls) != 0) return 0;
+    int self = (int)getpid(), n = 0;
+    int mib[3] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL };
+    size_t sz = 0;
+    if (sysctl(mib, 3, NULL, &sz, NULL, 0) != 0 || sz == 0) return 0;
+    sz += 16 * sizeof(struct kinfo_proc);          /* processes born since the sizing call */
+    struct kinfo_proc* kp = malloc(sz);
+    if (!kp) return 0;
+    if (sysctl(mib, 3, kp, &sz, NULL, 0) != 0){ free(kp); return 0; }
+    int np = (int)(sz / sizeof(struct kinfo_proc));
+    for (int i = 0; i < np && n < cap; i++){
+        int pid = (int)kp[i].kp_proc.p_pid;
+        if (pid <= 0 || pid == self) continue;
+        int nf = proc_pidinfo((pid_t)pid, PROC_PIDLISTFDS, 0, 0, 0);
+        if (nf <= 0 || nf % (int)sizeof(struct proc_fdinfo) != 0) continue;
+        struct proc_fdinfo* fds = malloc((size_t)nf);
+        if (!fds) continue;
+        if (proc_pidinfo((pid_t)pid, PROC_PIDLISTFDS, 0, fds, (size_t)nf) != nf){ free(fds); continue; }
+        int hit = 0;
+        for (int k = 0; k < nf / (int)sizeof(struct proc_fdinfo) && !hit; k++){
+            if (fds[k].proc_fdtype != PROX_FDTYPE_VNODE) continue;
+            struct vnode_fdinfowithpath vi;
+            if (proc_pidfdinfo((pid_t)pid, fds[k].proc_fd, PROC_PIDFDVNODEPATHINFO, &vi, sizeof vi) != (int)sizeof vi) continue;
+            if (vi.pvip.vip_vi.vi_stat.vst_dev == ls.st_dev && vi.pvip.vip_vi.vi_stat.vst_ino == ls.st_ino) hit = 1;
+        }
+        free(fds);
+        if (!hit) continue;
+        out[n].pid = out[n].tid = pid;
+        out[n].start = darwin_pid_start(pid);
+        proc_comm(pid, out[n].comm, sizeof out[n].comm);
+        n++;
+    }
+    free(kp);
+    return n;
+}
+#else
+static void proc_comm(int pid, char* out, size_t cap){
+    char p[64]; snprintf(p, sizeof p, "/proc/%d/comm", pid);
+    int fd = open(p, O_RDONLY); ssize_t n = fd >= 0 ? read(fd, out, cap - 1) : -1;
+    if (fd >= 0) close(fd);
+    if (n <= 0){ snprintf(out, cap, "?"); return; }
+    out[n] = 0; if (n > 0 && out[n-1] == '\n') out[n-1] = 0;
+}
+/* A /proc .../stat file's state, flags and start time (fields 3, 9, 22).
+ * comm may contain spaces and ')': parse after the LAST ')'. 1 = read. */
+static int proc_stat_fields(const char* path, char* state, unsigned* flags, unsigned long long* start){
+    char b[1024]; int fd = open(path, O_RDONLY); if (fd < 0) return 0;
+    ssize_t n = read(fd, b, sizeof b - 1); close(fd); if (n <= 0) return 0;
+    b[n] = 0; char* rp = strrchr(b, ')'); if (!rp) return 0;
+    return sscanf(rp + 1, " %c %*d %*d %*d %*d %*d %u %*u %*u %*u %*u %*u %*u %*d %*d %*d %*d %*d %*d %llu",
+                  state, flags, start) == 3;
+}
+#define PF_EXITING_BIT 0x4u    /* PF_EXITING (include/linux/sched.h), as /proc/<pid>/stat field 9 shows it */
+/* 1 = the process that was `pid` (started at `start`) is still ON ITS WAY
+ * OUT: it exists, and one of its threads has begun do_exit (PF_EXITING) and
+ * has not reached exit_notify (state Z/X) -- the stretch in which it can
+ * still hold the lock with no fd left to show for it (see
+ * shutdown_wait_lock_released). 0 = gone, reused, running, or finished. */
+static int proc_exit_pending(int pid, unsigned long long start){
+    char p[96], st; unsigned fl; unsigned long long s0;
+    snprintf(p, sizeof p, "/proc/%d/stat", pid);
+    if (!proc_stat_fields(p, &st, &fl, &s0) || s0 != start) return 0;
+    snprintf(p, sizeof p, "/proc/%d/task", pid);
+    DIR* td = opendir(p); if (!td) return 0;
+    struct dirent* t; int pending = 0;
+    while (!pending && (t = readdir(td))){
+        if (t->d_name[0] < '1' || t->d_name[0] > '9') continue;
+        snprintf(p, sizeof p, "/proc/%d/task/%.24s/stat", pid, t->d_name);
+        unsigned long long s1;
+        if (proc_stat_fields(p, &st, &fl, &s1) && (fl & PF_EXITING_BIT) && st != 'Z' && st != 'X') pending = 1;
+    }
+    closedir(td);
+    return pending;
+}
+/* 1 = the fd directory `fdp` has an fd on our lock (with match_ofd: the SAME
+ * open file description, by kcmp against task `tid`); 0 = not; -1 = not
+ * readable. *nfd counts the fds listed, so "none of them is the lock" can be
+ * told from "there are none". */
+static int fd_dir_holds(const char* fdp, int self, int tid, int lockfd, int match_ofd,
+                        const char* want, ssize_t wl, const struct stat* ls, int* nfd){
+    DIR* fdd = opendir(fdp); if (!fdd) return -1;          /* not ours to read, or gone */
+    struct dirent* f; int hit = 0;
+    while (!hit && (f = readdir(fdd))){
+        if (f->d_name[0] < '0' || f->d_name[0] > '9') continue;
+        (*nfd)++;
+        char link[4096]; ssize_t ll = readlinkat(dirfd(fdd), f->d_name, link, sizeof link - 1);
+        if (ll != wl || memcmp(link, want, (size_t)wl) != 0) continue;
+        struct stat s;
+        if (fstatat(dirfd(fdd), f->d_name, &s, 0) != 0) continue;
+        if (s.st_dev != ls->st_dev || s.st_ino != ls->st_ino) continue;
+        if (match_ofd){
+            long r = syscall(SYS_kcmp, (pid_t)self, (pid_t)tid, KCMP_FILE, (unsigned long)lockfd, strtoul(f->d_name, 0, 10));
+            if (r > 0) continue;                             /* another description of the same file */
+        }
+        hit = 1;
+    }
+    closedir(fdd);
+    return hit;
+}
+/* Processes other than this one with an fd on the file `lockfd` is open on;
+ * with match_ofd, only those whose fd is the SAME open file description as
+ * lockfd. Returns the count (the first `cap` are described in out[]).
+ *
+ * Candidates are picked by the fd's link TEXT (readlink never touches the
+ * file system, so a process with an fd on a hung mount cannot stall a
+ * shutdown here) and only then confirmed by stat and kcmp.
+ *
+ * /proc/<pid>/fd is the MAIN THREAD's fd table. A main thread past its
+ * exit_files() lists none while the process's other threads still share the
+ * table -- and the lock with it -- so a process whose main thread lists no fd
+ * at all is looked at thread by thread (out[].tid names the one). */
+static int lock_holders_scan(int lockfd, int match_ofd, lock_holder_t* out, int cap){
+    int n = 0, self = (int)getpid();
+    char want[4096], lp[64]; struct stat ls;
+    snprintf(lp, sizeof lp, "/proc/self/fd/%d", lockfd);
+    ssize_t wl = readlink(lp, want, sizeof want - 1);
+    if (wl <= 0 || fstat(lockfd, &ls) != 0) return 0;
+    want[wl] = 0;
+    DIR* pd = opendir("/proc"); if (!pd) return 0;
+    struct dirent* e;
+    while ((e = readdir(pd))){
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        int pid = atoi(e->d_name); if (pid == self) continue;
+        char fdp[96]; snprintf(fdp, sizeof fdp, "/proc/%d/fd", pid);
+        int nfd = 0, tid = pid;
+        int hit = fd_dir_holds(fdp, self, pid, lockfd, match_ofd, want, wl, &ls, &nfd);
+        if (hit == 0 && nfd == 0){
+            char tdp[64]; snprintf(tdp, sizeof tdp, "/proc/%d/task", pid);
+            DIR* td = opendir(tdp);
+            if (td){
+                struct dirent* t;
+                while (hit <= 0 && (t = readdir(td))){
+                    if (t->d_name[0] < '1' || t->d_name[0] > '9') continue;
+                    int t_id = atoi(t->d_name), tn = 0; if (t_id == pid) continue;
+                    snprintf(fdp, sizeof fdp, "/proc/%d/task/%d/fd", pid, t_id);
+                    if (fd_dir_holds(fdp, self, t_id, lockfd, match_ofd, want, wl, &ls, &tn) > 0){ hit = 1; tid = t_id; }
+                }
+                closedir(td);
+            }
+        }
+        if (hit <= 0) continue;
+        if (n < cap){
+            char sp[64], st; unsigned fl; snprintf(sp, sizeof sp, "/proc/%d/stat", pid);
+            out[n].pid = pid; out[n].tid = tid;
+            if (!proc_stat_fields(sp, &st, &fl, &out[n].start)) out[n].start = 0;
+            proc_comm(pid, out[n].comm, sizeof out[n].comm);
+        }
+        n++;
+    }
+    closedir(pd);
+    return n;
+}
+#endif   /* __APPLE__ */
+static void lock_holders_fmt(const lock_holder_t* h, int n, char* buf, size_t cap){
+    size_t o = 0; buf[0] = 0;
+    for (int i = 0; i < n && i < LOCK_HOLDERS_MAX && o + 48 < cap; i++)
+        o += (size_t)(h[i].tid && h[i].tid != h[i].pid
+             ? snprintf(buf + o, cap - o, "%s%d (%s, through thread %d)", i ? ", " : "", h[i].pid, h[i].comm, h[i].tid)
+             : snprintf(buf + o, cap - o, "%s%d (%s)", i ? ", " : "", h[i].pid, h[i].comm));
+    if (n > LOCK_HOLDERS_MAX && o + 16 < cap) snprintf(buf + o, cap - o, ", +%d more", n - LOCK_HOLDERS_MAX);
+}
+static long long mono_now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec*1000LL + t.tv_nsec/1000000; }
+
+/* Wait until no other process holds this process's datadir lock, so that
+ * our exit releases it. The children were signalled by the caller; each is
+ * expected to stop its own children. What is left holding the lock after the
+ * download WORKER has exited has lost its owner, and gets SIGTERM from here.
+ *
+ * Bounded, deliberately with escalation: after max_s seconds every remaining
+ * holder is named by pid and name and SIGKILLed. Leaving it would not be
+ * safer -- it keeps the lock, so the next instance cannot start, and under
+ * systemd TimeoutStopSec would SIGKILL the whole unit a little later
+ * anyway, without saying who was stuck. Everything the worker writes is
+ * crash-safe by design (the WAL is the truth; an unlanded checkpoint rolls
+ * back at boot), so a kill costs a replay, never a corrupt datadir. max_s is
+ * kept below the production unit's TimeoutStopSec (900 s) for that reason:
+ * the log line naming the stuck process has to be written before systemd's
+ * own kill. Returns the number of holders left at the end (0 = released). */
+#define SHUTDOWN_LOCK_WAIT_S 600
+#define LOCK_SEEN_MAX 256
+static int shutdown_wait_lock_released(int max_s, const char* who){
+    if (datadir_lock_fd < 0) return 0;
+    long long t0 = mono_now_ms(), next_log = t0 + 10000, killed_at = 0;
+    int orphans_termed = 0, worker_logged = 0, exit_logged = 0;
+    lock_holder_t h[LOCK_HOLDERS_MAX]; char desc[2048];
+    lock_holder_t seen[LOCK_SEEN_MAX]; int nseen = 0;       /* every holder seen, for the exit check */
+    for (int last = 0;; ){
+        int st; pid_t p;
+        while ((p = waitpid(-1, &st, WNOHANG)) > 0)
+            if (g_dl_worker_pid > 0 && p == g_dl_worker_pid){ g_dl_worker_exited = 1; g_dl_worker_status = st; }
+        if (g_dl_worker_pid > 0 && g_dl_worker_exited && !worker_logged){
+            int ws = (int)g_dl_worker_status; worker_logged = 1;
+            if (WIFSIGNALED(ws)) fprintf(stderr, "[%s] download worker pid %d ended on signal %d (%.1fs)\n", who, (int)g_dl_worker_pid, WTERMSIG(ws), (mono_now_ms() - t0) / 1000.0);
+            else fprintf(stderr, "[%s] download worker pid %d exited with status %d (%.1fs)\n", who, (int)g_dl_worker_pid, WEXITSTATUS(ws), (mono_now_ms() - t0) / 1000.0);
+        }
+        if (last){
+            fprintf(stderr, "[%s] datadir lock held by no other process (waited %.1fs) -- exiting releases it\n", who, (mono_now_ms() - t0) / 1000.0);
+            return 0;
+        }
+        int n = lock_holders_scan(datadir_lock_fd, 1, h, LOCK_HOLDERS_MAX);
+        long long now = mono_now_ms();
+        for (int i = 0; i < n && i < LOCK_HOLDERS_MAX; i++){
+            int k = 0; while (k < nseen && !(seen[k].pid == h[i].pid && seen[k].start == h[i].start)) k++;
+            if (k == nseen && nseen < LOCK_SEEN_MAX) seen[nseen++] = h[i];
+        }
+        if (n == 0){
+            /* No fd on the lock is LISTED -- which is not yet "no process
+             * holds it". An exiting process drops its fd table in
+             * exit_files() and releases its flock only later, when the
+             * deferred final close runs (exit_task_work); in between,
+             * /proc/<pid>/fd lists nothing or cannot be read at all, while
+             * the lock is still held. Caught 2026-09-19 (tests/
+             * test_stop_waits_for_worker, ~1 run in 5 on main): the download
+             * worker, single-threaded, PF_EXITING, state R, address space
+             * already torn down, fd dir unreadable -- and the lock free a
+             * moment after this parent had exited. So a holder is done only
+             * when its exit is COMPLETE: the worker when it is reaped (a
+             * child is reported only after its exit has run through), any
+             * other process seen holding the lock when no thread of it is
+             * still between PF_EXITING and exit_notify. */
+            lock_holder_t pend[LOCK_HOLDERS_MAX]; int np = 0;
+            if (g_dl_worker_pid > 0 && !g_dl_worker_exited && kill(g_dl_worker_pid, 0) == 0){
+                memset(&pend[np], 0, sizeof pend[np]);
+                pend[np].pid = pend[np].tid = (int)g_dl_worker_pid; snprintf(pend[np].comm, sizeof pend[np].comm, "download worker");
+                np++;
+            }
+            for (int k = 0; k < nseen && np < LOCK_HOLDERS_MAX; k++)
+                if (seen[k].pid != (int)g_dl_worker_pid && proc_exit_pending(seen[k].pid, seen[k].start)) pend[np++] = seen[k];
+            if (np == 0){ last = 1; continue; }        /* one more pass reaps (and reports) a worker that just left */
+            lock_holders_fmt(pend, np, desc, sizeof desc);
+            if (!exit_logged || now >= next_log){
+                fprintf(stderr, "[%s] no process lists the datadir lock, but %d still hold(s) it on the way out: %s -- "
+                                "waiting for the exit to complete (%.1fs)\n", who, np, desc, (now - t0) / 1000.0);
+                exit_logged = 1; next_log = now + 10000;
+            }
+            if (now - t0 >= (long long)max_s * 1000 + 10000){
+                fprintf(stderr, "[%s] ERROR: %s still exiting after %ds -- exiting anyway; "
+                                "the next start waits for the lock\n", who, desc, max_s + 10);
+                return np;
+            }
+            usleep(2000);                               /* the stretch is milliseconds */
+            continue;
+        }
+        lock_holders_fmt(h, n, desc, sizeof desc);
+        if ((g_dl_worker_pid <= 0 || g_dl_worker_exited) && !orphans_termed){
+            orphans_termed = 1;
+            fprintf(stderr, "[%s] %d process(es) still hold the datadir lock with the download worker gone: %s -- SIGTERM\n", who, n, desc);
+            for (int i = 0; i < n && i < LOCK_HOLDERS_MAX; i++) kill(h[i].pid, SIGTERM);
+        }
+        if (!killed_at && now - t0 >= (long long)max_s * 1000){
+            fprintf(stderr, "[%s] WARNING: %d process(es) still hold the datadir lock after %ds: %s -- SIGKILL "
+                            "(each would keep the next start from locking the datadir)\n", who, n, max_s, desc);
+            for (int i = 0; i < n && i < LOCK_HOLDERS_MAX; i++) kill(h[i].pid, SIGKILL);
+            killed_at = now;
+        } else if (killed_at && now - killed_at >= 10000){
+            fprintf(stderr, "[%s] ERROR: the datadir lock is STILL held 10s after SIGKILL: %s -- exiting anyway; "
+                            "the next start is refused until they are gone\n", who, desc);
+            return n;
+        } else if (now >= next_log){
+            fprintf(stderr, "[%s] waiting for %d process(es) holding the datadir lock (%.0fs): %s\n", who, n, (now - t0) / 1000.0, desc);
+            next_log = now + 10000;
+        }
+        usleep(now - t0 < 2000 ? 20000 : 200000);
+    }
+}
+/* <datadir>/<chain>/.stopping: this instance's pid while it waits above, so
+ * a start that finds the lock held can tell "the previous instance is
+ * finishing its stop" (wait, bounded) from "another instance is running"
+ * (refuse at once, as Core does). Removed just before the exit. */
+#define STOPPING_MARKER ".stopping"
+static void stopping_marker_write(void){
+    int fd = open(STOPPING_MARKER ".tmp", O_WRONLY|O_CREAT|O_TRUNC, 0600); if (fd < 0) return;
+    char b[32]; int n = snprintf(b, sizeof b, "%d\n", (int)getpid());
+    ssize_t w = write(fd, b, (size_t)n); close(fd);
+    if (w == n) rename(STOPPING_MARKER ".tmp", STOPPING_MARKER); else unlink(STOPPING_MARKER ".tmp");
+}
+/* The parent's last act, on every exit path that runs after the worker fork:
+ * signal the inbound serve children (the worker was signalled by the caller;
+ * a SIGTERM to a serve child is deferred past any mempool critical section
+ * by mp_lock), wait for the lock, then leave. */
+static int is_my_child(int pid){            /* a tracked pid may have been reused since */
+#ifdef __APPLE__
+    struct proc_bsdinfo b;
+    if (proc_pidinfo((pid_t)pid, PROC_PIDTBSDINFO, 0, &b, sizeof b) != (int)sizeof b) return 0;
+    return (int)b.pbi_ppid == (int)getpid();
+#else
+    char p[64], b[512]; snprintf(p, sizeof p, "/proc/%d/stat", pid);
+    int fd = open(p, O_RDONLY); if (fd < 0) return 0;
+    ssize_t n = read(fd, b, sizeof b - 1); close(fd); if (n <= 0) return 0;
+    b[n] = 0; char* rp = strrchr(b, ')'); int ppid = -1;   /* comm may contain spaces: parse after the last ')' */
+    if (!rp || sscanf(rp + 1, " %*c %d", &ppid) != 1) return 0;
+    return ppid == (int)getpid();
+#endif
+}
+static void parent_stop_and_wait(int max_s){
+    for (int i = 0; i < upl_n; i++) if (upl_pid[i] > 0 && is_my_child(upl_pid[i])) kill(upl_pid[i], SIGTERM);
+    stopping_marker_write();
+    shutdown_wait_lock_released(max_s, "serve");
+    unlink(STOPPING_MARKER);
 }
 
 /* Connect + handshake one outbound seed, returning a long-lived fd (or -1).
@@ -2506,7 +2885,15 @@ static int host_is_block_only(const char* host){
     for(int i = 0; i < g_bo_n; i++) if(!strcmp(g_bo_hosts[i], host)) return 1;
     return 0;
 }
-static int bo_want(void){ return g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY; }
+/* 2026-09-19: none under connect=. Core makes only MANUAL (full-relay)
+ * connections to the -connect list -- no block-relay-only, no feelers, no
+ * anchors. This filler used to run under connect= too, and it runs BEFORE
+ * the full-relay top-up: with one connect= host (a node behind its own Core,
+ * or any regtest pair) that host became the block-relay-only leg, the
+ * top-up then skipped it as already connected, and the node sent fRelay=0
+ * on its only leg -- Core's getpeerinfo relaytxes=false, not one
+ * transaction relayed to us, ever. */
+static int bo_want(void){ if(g_cfg.connect_only) return 0; return g_cfg.max_block_relay_only < MAX_BLOCK_RELAY_ONLY ? g_cfg.max_block_relay_only : MAX_BLOCK_RELAY_ONLY; }
 static void bo_add(const char* host){ if(g_bo_n < MAX_BLOCK_RELAY_ONLY && !host_is_block_only(host)) snprintf(g_bo_hosts[g_bo_n++], sizeof g_bo_hosts[0], "%s", host); }
 static int legs_block_only(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && mux_out_kind[k] == LEG_BLOCK_ONLY) n++; return n; }
 /* every outbound dial funnels through here: a block-only host gets fRelay=0
@@ -2685,6 +3072,10 @@ static void rpc_fill_peer_slot(int slot, const char* host){
  * download workers (getpeerinfo) */
 static void rpc_peer_from_version(rpc_peer_t* pr, const unsigned char* p, long len){
     if (len < 80) return;
+    /* addr_recv: the peer's view of US -- services at 20, the 16-byte address
+     * at 28, the port big-endian at 44. Core's addrlocal (2026-09-18). */
+    { char al[72]; rpc_fmt_addr_v1(p + 28, ((unsigned)p[44] << 8) | p[45], al, sizeof al);
+      for (unsigned i = 0; i < sizeof al; i++) pr->addrlocal[i] = al[i]; }
     pr->proto = (unsigned)p[0] | ((unsigned)p[1]<<8) | ((unsigned)p[2]<<16) | ((unsigned)p[3]<<24);
     unsigned long long services; memcpy(&services, p+4, 8); pr->services = services;
     long off = 80; unsigned long long ualen = 0; int ok = 1;
@@ -2763,13 +3154,23 @@ static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claime
     pr->used = 1;   /* publish last: readers see a fully-formed slot */
 }
 
-static void log_hash_short(char out[17], const unsigned char hash32[32]){
+/* THE WHOLE HASH, not a prefix. This printed the first EIGHT display bytes,
+ * and a mainnet block hash begins with about ten ZERO bytes -- so every line
+ * using it read "hash=0000000000000000", identically, for every block ever
+ * mined. 78 such lines were in one log before anyone looked. A prefix that has
+ * to be re-guessed as the difficulty rises is not an identifier; the full hash
+ * costs 48 more characters in a line that is already long.
+ *
+ * daemon/reorg.c's hash_short mirrors this one ON PURPOSE so reorg lines can
+ * be grep-correlated against [block] lines -- it is widened in lockstep, or
+ * the correlation this comment promises quietly stops working. */
+static void log_hash_short(char out[65], const unsigned char hash32[32]){
     static const char hexd[]="0123456789abcdef";
-    for(int k=0;k<8;k++){
+    for(int k=0;k<32;k++){
         unsigned char b=hash32[31-k];
         out[k*2]=hexd[b>>4]; out[k*2+1]=hexd[b&0xf];
     }
-    out[16]=0;
+    out[64]=0;
 }
 
 /* ---- Core's shape at the tip (2026-09-10) ----------------------------------
@@ -2788,15 +3189,111 @@ static void log_hash_short(char out[17], const unsigned char hash32[32]){
  * the rotation so the apply runs at once. */
 static int g_stored_now = 0;                            /* a pushed block was stored during this rotation's sweeps */
 #include "index_repair.h"                                /* 2026-09-10, row 2: the filter index and the address history repair themselves */
-static ir_t g_ir_bfi, g_ir_addrhist;
+/* 2026-09-16: the txid and txo-spender indexes build THEMSELVES during the
+ * sync as sorted runs trailing the applied height (daemon/index_trail.h,
+ * index_runs.h). Nothing waits for initial block download to finish. */
+#include "index_trail.h"
+#include "index_runs.h"
+static itrail_t g_it_txi, g_it_tsp, g_it_ah;
+static irunset_t g_rs_txi, g_rs_tsp;
+extern long ah_to_height(void) __attribute__((weak));   /* daemon/addr_hist.c: the history runs' reach */
+extern int  ah_run_count(void) __attribute__((weak));
+extern void axt_runs_advanced(long to);                  /* daemon/addr_index_tail.c: drop what a run now covers */
+static void on_ah_run(long to, void* ctx){ (void)ctx; axt_runs_advanced(to); }
+extern void txit_runs_advanced(long to);   /* daemon/tx_index_tail.c: drop what a run now covers */
+extern void tsp_runs_advanced(long to);    /* daemon/txosp_tail.c */
+static void on_txi_run(long to, void* ctx){ (void)ctx; txit_runs_advanced(to); irs_dirty(&g_rs_txi); }
+static void on_tsp_run(long to, void* ctx){ (void)ctx; tsp_runs_advanced(to); irs_dirty(&g_rs_tsp); }
+/* One tick of every trailing index builder, at most once a second.
+ *
+ * 2026-09-16, found on run 26: this used to live ONLY in the caught-up loop's
+ * heartbeat, which initial block download never reaches -- the node runs the
+ * parallel catch-up loop instead -- so during the one phase these builders
+ * exist for, nothing ever ticked and no run was ever built. The block choke
+ * point below runs in every phase (it is where the filter index, the txid
+ * tail and the address journal are fed), so the tick belongs there, with the
+ * heartbeat calling the same function once the node is at the tip. */
+/* Configure the trailing builders from the keys: the builders live beside
+ * this executable (bmc_build_tx_index, bmc_build_txospender_index,
+ * bmc_build_addr_hist, and bmc_merge_index_runs to merge their runs). */
+static void dl_index_trail_configure(const char* dir){
+    char exe[512];
+#ifdef __APPLE__
+    /* /proc/self/exe does not exist on Darwin (osx port) */
+    uint32_t xs = (uint32_t)sizeof exe;
+    ssize_t n = _NSGetExecutablePath(exe, &xs) == 0 ? (ssize_t)strlen(exe) : -1;
+#else
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+#endif
+    if (n > 0){ exe[n] = 0; char* sl = strrchr(exe, '/'); if (sl) *sl = 0; }
+    char bb[600], mm[600];
+    snprintf(mm, sizeof mm, "%s/bmc_merge_index_runs", n > 0 ? exe : ".");
+    /* 2026-09-16: the address history builds itself DURING the sync as runs
+     * (build_addr_hist's run mode reads blocks + undo), like the txid index;
+     * the post-IBD repair supervisor is gone */
+    snprintf(bb, sizeof bb, "%s/bmc_build_addr_hist", n > 0 ? exe : ".");
+    it_configure(&g_it_ah, "addr_hist", bb, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.addrindex);
+    /* runs of indexrunblocks heights, kept 144 below the applied height (the
+     * undo window: a reorg deeper than that is already the node's general
+     * limit), merged at 6 runs */
+    snprintf(bb, sizeof bb, "%s/bmc_build_tx_index", n > 0 ? exe : ".");
+    it_configure(&g_it_txi, "txindex", bb, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.txindex);
+    snprintf(bb, sizeof bb, "%s/bmc_build_txospender_index", n > 0 ? exe : ".");
+    it_configure(&g_it_tsp, "txospender", bb, mm, dir, g_chainp->name, g_cfg.indexrunblocks, 144, 6, g_cfg.txospenderindex);
+    irs_init(&g_rs_txi, "txindex", "BMCTXIDX", 20, 16);
+    irs_init(&g_rs_tsp, "txospender", "BMCTXOSP", 28, 24);
+}
+static void dl_index_trail_tick(long applied){
+    static long long last;
+    long long now = (long long)time(NULL);
+    if (now == last) return;
+    last = now;
+    if (g_cfg.txindex){ irs_refresh(&g_rs_txi); it_tick(&g_it_txi, irs_covered_to(&g_rs_txi), g_rs_txi.n, applied, now, on_txi_run, 0); }
+    if (g_cfg.txospenderindex){ irs_refresh(&g_rs_tsp); it_tick(&g_it_tsp, irs_covered_to(&g_rs_tsp), g_rs_tsp.n, applied, now, on_tsp_run, 0); }
+    if (g_cfg.addrindex && ah_to_height && ah_run_count) it_tick(&g_it_ah, ah_to_height(), ah_run_count(), applied, now, on_ah_run, 0);
+    /* a supervisor idle for a reason is otherwise silent, and silence reads
+     * exactly like "working" in a log */
+    { static long long next_log;
+      if (now >= next_log){
+          next_log = now + 300;
+          fprintf(stderr, "[trail] txindex: %s | txospender: %s | addr_hist: %s\n",
+                  g_it_txi.configured ? it_status(&g_it_txi) : "not configured",
+                  g_it_tsp.configured ? it_status(&g_it_tsp) : "not configured",
+                  g_it_ah.configured  ? it_status(&g_it_ah)  : "not configured");
+      } }
+}
 /* row 5's measurement, one line per block that went through the compact
  * receiver: what the mempool supplied and where the rest had gone */
 extern void cmpct_recv_last_block(unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long*, unsigned long cls[5]);
-static void cmpct_overlap_line(long height, const char* host){
+/* THE HEIGHT HERE WAS A GUESS, and it made the line lie. The pushed-compact
+ * caller passed `tip + 1` -- the height we EXPECT next, not the reconstructed
+ * block's own, which a block header does not carry. When several peers push
+ * the same block at once the tip differs between calls, so one block was
+ * logged under two heights: a 4,469-transaction block appeared as both 967,238
+ * and 967,239 on 2026-09-16, and an analysis keyed on height therefore counted
+ * one block as two.
+ *
+ * The hash is unambiguous and is what identifies a repeat, so it is printed
+ * when the caller knows it. The height stays, because it is right at the sync
+ * caller (which reads it from the stored block) and is still a useful
+ * approximation at the other -- but it is no longer the only identifier. */
+static void cmpct_overlap_line(long height, const unsigned char* hash32, const char* host){
     unsigned long ntx, pool, pre, miss, mb, cls[5]; cmpct_recv_last_block(&ntx, &pool, &pre, &miss, &mb, cls);
     if(!ntx) return;
-    fprintf(stderr,"[cmpct] block %ld (%s): %lu tx: %lu from the mempool (%.1f%%), %lu prefilled, %lu fetched by getblocktxn (%lu KB): %lu never announced, %lu announced not requested, %lu requested no reply, %lu orphans, %lu rejected by policy\n",
-            height, host, ntx, pool, ntx ? 100.0 * (double)pool / (double)ntx : 0.0, pre, miss, mb / 1024,
+    /* THE WHOLE HASH. Eight bytes was useless and measurably so: a mainnet
+     * block hash begins with about ten ZERO bytes, so the first eight of the
+     * display form are "0000000000000000" for every block ever mined. 78 log
+     * lines carried that identical string before this was noticed -- an
+     * identifier that cannot tell any two blocks apart, in a line whose whole
+     * purpose here is telling repeats apart. The pre-existing "[block] stored"
+     * line has the same defect and is fixed with it. 64 characters in a log
+     * line is cheap; a fixed-width prefix that has to be re-guessed as the
+     * difficulty rises is not. */
+    char hs[68]; hs[0] = 0;
+    if(hash32){ for(int j = 0; j < 32; j++) sprintf(hs + 2*j, "%02x", hash32[31 - j]); hs[64] = 0; }
+    fprintf(stderr,"[cmpct] block %ld%s%s (%s): %lu tx: %lu from the mempool (%.1f%%), %lu prefilled, %lu fetched by getblocktxn (%lu KB): %lu never announced, %lu announced not requested, %lu requested no reply, %lu orphans, %lu rejected by policy\n",
+            height, hs[0] ? " hash=" : "", hs[0] ? hs : "", host,
+            ntx, pool, ntx ? 100.0 * (double)pool / (double)ntx : 0.0, pre, miss, mb / 1024,
             cls[0], cls[1], cls[2], cls[3], cls[4]);
 }
 static long g_announce_inv_n, g_announce_hdr_n, g_push_n, g_push_stored_n, g_push_skipped_n;
@@ -2923,9 +3420,12 @@ static long dl_store_pushed_block(int k, const unsigned char* blk, unsigned long
     if(r == -2){ g_push_skipped_n++; return 0; }                        /* the tip moved under us: a sibling stored it first */
     if(r < 0){ fprintf(stderr,"[cmpct] %s from %s: locked append FAILED\n", how, mux_out_host[k]); return -1; }
     g_push_stored_n++; g_stored_now = 1;
-    { char hs[17]; for(int j = 0; j < 8; j++) sprintf(hs + 2*j, "%02x", bh[31 - j]);
-      fprintf(stderr,"[block] stored height=%ld hash=%s.. bytes=%lu (%s from %s)\n", tip + 1, hs, len, how, mux_out_host[k]); }
-    if(how[0] == 'p' && how[7] == 'c') cmpct_overlap_line(tip + 1, mux_out_host[k]);   /* "pushed compact block..." */
+    { char hs[68]; for(int j = 0; j < 32; j++) sprintf(hs + 2*j, "%02x", bh[31 - j]);   /* the whole hash: eight bytes of a mainnet hash are all zeros */
+      fprintf(stderr,"[block] stored height=%ld hash=%s bytes=%lu (%s from %s)\n", tip + 1, hs, len, how, mux_out_host[k]); }
+    /* tip + 1 is the EXPECTED height, not necessarily this block's -- the hash
+     * is what identifies it, and what tells two concurrent pushes of the same
+     * block apart from two different blocks */
+    if(how[0] == 'p' && how[7] == 'c') cmpct_overlap_line(tip + 1, bh, mux_out_host[k]);
     leg_hb_note_block(k);
     return 1;
 }
@@ -3004,7 +3504,8 @@ static long do_outbound_sync(int i){
     if(g_peer_sendcmpct && !mux_out_cmpct[i]){ mux_out_cmpct[i] = 1; fprintf(stderr, "[cmpct] %s accepts compact blocks: requesting MSG_CMPCT_BLOCK on this leg from now on\n", mux_out_host[i]); }
     { unsigned long r, n, f; cmpct_recv_stats(&r, &n, &f);
       if(r != p_r || n != p_n || f != p_f){ fprintf(stderr, "[cmpct] reconstructed %lu block(s) from the mempool (%lu needed a getblocktxn round trip, %lu fell back to a full block)\n", r, n, f);
-                                              cmpct_overlap_line((long)*(int*)(store_buf+24), mux_out_host[i]); } }
+                                              /* this height comes from the STORED block, so it is the block's own */
+                                              cmpct_overlap_line((long)*(int*)(store_buf+24), 0, mux_out_host[i]); } }
     double sync_s = phase_elapsed(&sync_pt);
     int st_tip=*(int*)(store_buf+24);
     /* 2026-09-09: blocks this leg stored off the best header chain came from a
@@ -3036,10 +3537,10 @@ static long do_outbound_sync(int i){
         if(L<80) continue;
         unsigned char bhash[32]; block_hash(bhash, sb);
         idx_put(ht_idx, bhash, h);
-        char hs[17]; log_hash_short(hs, bhash);
+        char hs[65]; log_hash_short(hs, bhash);
         u64 consumed=0; u64 ntx = L>80 ? utxo_walk_read_varint(sb+80, sb+L, &consumed) : 0;
         if(!consumed) ntx = 0;
-        fprintf(stderr,"[block] stored height=%d hash=%s.. bytes=%ld tx=%llu (via %s)\n", h, hs, L, (unsigned long long)ntx, mux_out_host[i]);
+        fprintf(stderr,"[block] stored height=%d hash=%s bytes=%ld tx=%llu (via %s)\n", h, hs, L, (unsigned long long)ntx, mux_out_host[i]);
         blk_src_note(h, mux_out_host[i]);   /* 3.3: remembered for the reject hook */
     }
     /* STAGE B: keep chainwork.dat in lockstep with index.dat for every block
@@ -3458,7 +3959,14 @@ static int legs_anon(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux
 static long long g_leg_manual_next_dial[MUX_MAX_OUT];
 
 static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port){
-    if(mux_out_fd[i]>=0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i]=-1; }
+    /* 2026-09-17: this used to drop a LIVE leg silently -- the slot changed
+     * hands and the log said nothing, so the departure had no owner. Every
+     * caller that already named its reason has closed the leg before it gets
+     * here (mux_out_fd < 0), so this line only ever fires for a path that
+     * forgot to: it names itself rather than vanishing. */
+    if(mux_out_fd[i]>=0) leg_close_ours(i, "redial-unlabelled", "the slot was rotated to the next pool peer without a named reason");
+    /* leg_close_ours closed it. (It declines only inside a pass child, and a
+     * pass child never rotates a slot -- the parent replays from the report.) */
     /* setnetworkactive false: leave the slot dead rather than re-dialing.
      * This is the ONE place outbound legs are established, so gating here
      * gates every reconnect -- a toggle that only dropped the current legs
@@ -3559,8 +4067,8 @@ static long do_outbound_sync_bounded(int i, const char* peers[], int pool_len, i
          * syncing on it -- drop and re-dial a rotated seed. do_outbound_sync
          * already re-anchored the locator at the (possibly advanced) stored
          * tip, so the next pass continues exactly where this one stopped. */
-        fprintf(stderr,"[mux:%d] %s sync exceeded %gs budget; re-dialing\n",
-                i, mux_out_fd[i]>=0?mux_out_host[i]:"?", MUX_SYNC_BUDGET_SECS);
+        { char d[96]; snprintf(d, sizeof d, "the inline pass exceeded the %gs serve budget; the socket may hold a partial frame", MUX_SYNC_BUDGET_SECS);
+          leg_close_ours(i, "sync-budget", d); }
         mux_next_peer(i, peers, pool_len, out_port);
     }
     return n;
@@ -4495,16 +5003,31 @@ static void dlc_store_sync_chunk(void* st){
     if(bfd >= 0) fdatasync(bfd);
     if(ifd >= 0) fdatasync(ifd);
 }
+/* Every append, not just the first: the cursor is only known good until
+ * something else moves it, and the probe is one stat when it is already right. */
+static long dlc_append_frontier(void* st, long height, const unsigned char hash[32],
+                                const unsigned char* raw, unsigned len){
+    archive_store_frontier(st);
+    return store_append_shared(st, height, hash, raw, len);
+}
 static int dlc_committer_main(volatile long* ctl, long start_h, long end_h, pid_t parent){
-    int lfd = open("append.lock", O_RDWR | O_CREAT, 0644);
+    int lfd = open("append.lock", O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if(lfd < 0){ fprintf(stderr, "[dlc committer] no lock\n"); return 1; }
     static unsigned char st[4096]; store_init(st);
     *(int*)((char*)st + 40) = lfd;
     { extern unsigned int net_magic; *(int*)((char*)st + 36) = (int)net_magic; }
     *(int*)((char*)st + 28) = 0; *(int*)((char*)st + 0) = -1;
     store_reload(st);
+    /* store_reload is SUPPOSED to move the cursor off file 0 to the tip's
+     * file. When it does not -- a short or unreadable index, an empty one --
+     * the cursor stays at 0 and store_append_shared walks up from
+     * blk00000.dat filling the tail gap of every full file, which is a layout
+     * break per block. Six of those on run 26, one per restart. Belt and
+     * braces: the frontier is the newest file that exists, whatever reload
+     * decided. */
+    archive_store_frontier(st);
     store_set_sync(0);                                       /* this process only; synced per chunk below */
-    int r = dlc_committer_run(ctl, start_h, end_h, st, store_append_shared, dlc_index_present, 20, parent, dlc_store_sync_chunk);
+    int r = dlc_committer_run(ctl, start_h, end_h, st, dlc_append_frontier, dlc_index_present, 20, parent, dlc_store_sync_chunk);
     close(lfd);
     return r;
 }
@@ -4592,8 +5115,10 @@ static int peer_slot_of_fd(int fd){
  * node without a rate limit still has to answer that. The pacing half stays
  * conditional on ul_gate_configure having been given a rate. Counted WITH
  * the 24-byte header, as Core counts them. */
+static int dl_wire_note(int fd, int recv, const char* cmd, unsigned cmdlen, unsigned plen);
 static void p2p_upload_pace(int fd, unsigned plen, const char* cmd, unsigned cmdlen){
     ul_gate_account((long)plen);
+    if (dl_wire_note(fd, 0, cmd, cmdlen, plen)) return;   /* the downloader's own sockets (2026-09-19) */
     if (g_node_status){
         int s = peer_slot_of_fd(fd);
         if (s >= 0) g_node_status->peers[s].sent_per_msg[rpc_msg_index(cmd, cmdlen)] += (long long)plen + 24;
@@ -5154,7 +5679,81 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
                   * true, and useless, because a worker holding a peer that cannot fill
                   * the pipe is active and idle at the same time. */
                  long long wait_ms, wall_ms;
+                 char addrlocal[72];       /* 2026-09-18, for getpeerinfo: our address as this peer saw it */
+                 /* 2026-09-19, for getpeerinfo bytessent/bytesrecv and their
+                  * per-message maps: the WIRE bytes of the connection this
+                  * worker holds now, written by the worker's own p2p hooks
+                  * (dl_wire_note) and copied out by the parent every pass. The
+                  * published bytes_sent was a hard-coded 0, and bytes_peer is
+                  * the process's rchar, which also counts its file reads. */
+                 long long wire_sent, wire_recv;
+                 long long sent_pm[RPC_MSG_N], recv_pm[RPC_MSG_N];
                } dlc_stat_t;
+/* ---- the downloader's wire accounting (2026-09-19) ------------------------
+ * getnettotals.totalbytessent and every download worker's getpeerinfo
+ * bytessent were 0 for the whole of an IBD: the relay legs are counted from
+ * TCP_INFO in the process that holds them, and nothing counted the sockets
+ * the downloader opens -- the header phase, the helpers' getdata for every
+ * block. Run 27 pulled ~73 GB and reported ~0 sent.
+ *
+ * Counted where the bytes cross: p2p_write's hook (the upload pacer's) and
+ * p2p_read's (installed for the downloader's scope), both in every process
+ * the download runs in. Core's accounting: each message counts its full wire
+ * size, the 24-byte header included, into the peer's total and its
+ * per-message map (net.cpp AccountForSentBytes / mapRecvBytesPerMsgType).
+ * The downloader dials v1 only (node_handshake), so plen + 24 IS the wire.
+ *
+ * Totals go to node_status_t.dl_wire_sent / dl_wire_recv, atomically --
+ * several helpers add at once -- and never reset, as Core's never do. The
+ * per-connection figures go to the worker's own stats slot. A connection
+ * still handshaking counts into a private pending set first: the parent
+ * keeps publishing the previous peer until the handshake succeeds, and those
+ * bytes are the NEW peer's. */
+static int g_dl_wire_scope = 0;                    /* 1 inside dl_catchup; forked helpers inherit it */
+static volatile dlc_stat_t* g_dlc_me = NULL;       /* a helper's own stats slot; NULL in the parent */
+static int g_dlc_conn_fd = -1;                     /* the connection g_dlc_me publishes */
+static long long g_dlc_pend_sent, g_dlc_pend_recv, g_dlc_pend_spm[RPC_MSG_N], g_dlc_pend_rpm[RPC_MSG_N];
+/* The BOOT catch-up (bmc.bootcatchup=1, the default) runs before main()
+ * creates the shared status table, so its bytes go to this pair instead --
+ * MAP_SHARED, for the helpers it forks -- and main() folds them into the
+ * table when it creates it. [0] sent, [1] received. */
+static volatile long long* g_dl_wire_boot = NULL;
+static int peer_slot_of_fd(int fd);
+static int dl_wire_note(int fd, int recv, const char* cmd, unsigned cmdlen, unsigned plen){
+    if(!g_dl_wire_scope) return 0;
+    volatile long long* tot = g_node_status ? (recv ? &g_node_status->dl_wire_recv : &g_node_status->dl_wire_sent)
+                            : g_dl_wire_boot ? &g_dl_wire_boot[recv ? 1 : 0] : NULL;
+    if(!tot) return 0;
+    if(!g_dlc_me && peer_slot_of_fd(fd) >= 0) return 0;     /* a relay leg in the parent: TCP_INFO counts those */
+    long long n = (long long)plen + 24;
+    int mi = rpc_msg_index(cmd, cmdlen);
+    __sync_fetch_and_add((long long*)tot, n);
+    if(g_dlc_me){
+        if(fd == g_dlc_conn_fd){
+            if(recv){ g_dlc_me->wire_recv += n; g_dlc_me->recv_pm[mi] += n; }
+            else    { g_dlc_me->wire_sent += n; g_dlc_me->sent_pm[mi] += n; }
+        } else {
+            if(recv){ g_dlc_pend_recv += n; g_dlc_pend_rpm[mi] += n; }
+            else    { g_dlc_pend_sent += n; g_dlc_pend_spm[mi] += n; }
+        }
+    }
+    return 1;
+}
+/* p2p_read's hook for the download's scope (installed by dl_catchup) */
+static void dl_read_note(int fd, const char* cmd, unsigned plen){ (void)dl_wire_note(fd, 1, cmd, 12, plen); }
+/* a helper dialled a new peer: nothing is published for it until it hands */
+static void dlc_wire_dial(void){
+    g_dlc_conn_fd = -1;
+    g_dlc_pend_sent = g_dlc_pend_recv = 0;
+    memset(g_dlc_pend_spm, 0, sizeof g_dlc_pend_spm); memset(g_dlc_pend_rpm, 0, sizeof g_dlc_pend_rpm);
+}
+/* ...and the handshake succeeded: the slot now describes THIS connection */
+static void dlc_wire_adopt(int fd){
+    if(!g_dlc_me) return;
+    g_dlc_me->wire_sent = g_dlc_pend_sent; g_dlc_me->wire_recv = g_dlc_pend_recv;
+    for(int i = 0; i < RPC_MSG_N; i++){ g_dlc_me->sent_pm[i] = g_dlc_pend_spm[i]; g_dlc_me->recv_pm[i] = g_dlc_pend_rpm[i]; }
+    g_dlc_conn_fd = fd;
+}
 static long long dlc_now_ms(void); static long dlc_proc_rchar(pid_t pid);   /* fwd decls: the worker judges its own chunk before these are defined */
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec); /* fwd decls, defined below */
 static void dlc_fmt_bytes(char* buf, size_t cap, double bytes);
@@ -5173,7 +5772,8 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
      * flag either way, so an early/idle delivery is harmless -- the next
      * guarded call resets the flag before it matters. */
     { struct sigaction sa0; memset(&sa0,0,sizeof sa0); sa0.sa_handler=mux_budget_alarm; sigemptyset(&sa0.sa_mask); sigaction(SIGUSR1,&sa0,NULL); }
-    int lfd=open("append.lock", O_RDWR|O_CREAT, 0644);
+    g_dlc_me = mystat; dlc_wire_dial();   /* this process's p2p bytes are its peer's (dl_wire_note) */
+    int lfd=open("append.lock", O_RDWR|O_CREAT|O_CLOEXEC, 0644);
     if(lfd<0){ fprintf(stderr,"[dlc w%d] no lock\n",w); return 1; }
     static unsigned char st[4096]; store_init(st);
     *(int*)((char*)st+40)=lfd;
@@ -5299,6 +5899,7 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                     dial_gate_wait();
                     int fdc=tcp_connect_ip(ip,(unsigned short)htons((unsigned short)cp2));
                     if(fdc<0){ if(ema[idx]<=0.0) ema[idx]=1.0; claimed[idx]=0; continue; }   /* tried, unreachable: the picker must not offer it as untried again */
+                    dlc_wire_dial();                  /* the handshake's bytes belong to this connection, published once it succeeds */
                     struct timeval tv; tv.tv_sec=20; tv.tv_usec=0; setsockopt(fdc,SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
                     /* 2026-09-06: a getdata is small and is the ONLY thing
                      * standing between this worker and the peer's reply, so
@@ -5310,11 +5911,13 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                     { int one=1; setsockopt(fdc,IPPROTO_TCP,TCP_NODELAY,&one,sizeof one); }
                     if(node_handshake(fdc)==1 && peer_has_witness(cand)){
                         fd=fdc; ok=1; held=idx; slot=(idx+1)%nlive;
+                        dlc_wire_adopt(fdc);    /* getpeerinfo's bytes are this connection's, handshake included */
                         mystat->held_idx=idx;   /* so the parent can ban THIS peer on early-kill */
                         strncpy((char*)mystat->peer,cand,63);
                         { rpc_peer_t v; memset(&v,0,sizeof v); rpc_peer_from_version(&v, g_peer_version_payload, g_peer_version_len);   /* for getpeerinfo */
                           mystat->proto=v.proto; mystat->services=v.services; mystat->start_height=v.start_height;
-                          memcpy((char*)mystat->subver, v.subver, sizeof mystat->subver); mystat->conn_time=(long long)time(NULL); mystat->bytes_peer=0; }
+                          memcpy((char*)mystat->subver, v.subver, sizeof mystat->subver); mystat->conn_time=(long long)time(NULL); mystat->bytes_peer=0;
+                          memcpy((char*)mystat->addrlocal, (const char*)v.addrlocal, sizeof mystat->addrlocal); }
                         /* fresh peer -- the displayed chunks/blocks/guard
                          * must reflect THIS connection, not accumulate
                          * across every peer this worker slot has ever
@@ -5893,10 +6496,139 @@ static void leg_pass_stop_all(void){
  * unserved for the whole download -- no pongs, no relay, no announcements
  * -- and the rotation came back to legs that had given up on us. Core keeps
  * serving its peers while it fetches a branch. except = -1 sweeps all. */
+/* Publish the leg peer table the RPC thread reads: live slots with their
+ * kernel byte/last-activity meters, dead slots retired.
+ *
+ * 2026-09-16: this was inline in serve_download_worker's for(;;) loop and
+ * nowhere else, so it did not run during initial block download -- the node
+ * is in dl_catchup's loop then. Everything getpeerinfo says about a RELAY LEG
+ * therefore froze at the moment catch-up began, for the whole sync. Measured
+ * on run 26: getpeerinfo reported 1,412 bytes and 54 minutes of silence for a
+ * socket the kernel showed at 391,956 bytes received and 9.6 SECONDS since the
+ * last send. Closed legs were worse: their slots were never retired, so three
+ * peers that had gone away minutes after boot were still listed an hour later,
+ * which is what a monitor correctly drew as dead peers.
+ *
+ * (The download workers' own peers never had this problem: dl_catchup
+ * publishes those into g_status->dlpeers itself. Only the legs were orphaned.)
+ *
+ * Now one function, called from both loops. The TCP_INFO read is one getsockopt
+ * per live leg -- there are at most a handful -- so it is cheap enough for the
+ * catch-up loop, which already sweeps the same legs for pings. */
+static void dl_publish_peer_table(void* store_buf, int with_tip){
+        if(g_node_status){ int lp=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) lp++;
+            g_node_status->n_out = lp;
+            /* The TIP is deliberately NOT published here. This function is
+             * shared with dl_catchup's loop, and the connected tip during a
+             * catch-up is that loop's own business -- publishing it from here
+             * changed what test_dlc_interleave measures (it caught this: "the
+             * connected tip at the gate is within a chunk of the archive tip"
+             * failed with lag 62). The peer table is the only thing both loops
+             * need in common. */
+            if(with_tip){ g_node_status->tip_height = node_public_tip(store_buf); dl_publish_connected_tip(); }
+            long long nows = (long long)time(NULL);
+            for(int i=0;i<RPC_MAX_PEERS;i++){
+                if(i >= MUX_MAX_OUT) continue;                      /* inbound children own 64..127 */
+                if(!(i < mux_n_out && mux_out_fd[i] >= 0)){ g_node_status->peers[i].used = 0; continue; }
+                /* per-socket byte + last-activity meters from the kernel: no
+                 * asm changes, no double counting -- TCP_INFO is authoritative
+                 * (getpeerinfo bytessent/bytesrecv/lastsend/lastrecv). The
+                 * kernel struct is read by offset into a local mirror of its
+                 * stable uapi layout, so this does not depend on the glibc
+                 * header's tcp_info version (older ones lack the byte fields). */
+                struct bmc_tcp_info {
+                    unsigned char  _s[7];                 /* state..wscale/flags */
+                    unsigned int   rto, ato, snd_mss, rcv_mss;
+                    unsigned int   unacked, sacked, lost, retrans, fackets;
+                    unsigned int   last_data_sent, last_ack_sent, last_data_recv, last_ack_recv;
+                    unsigned int   pmtu, rcv_ssthresh, rtt, rttvar, snd_ssthresh, snd_cwnd, advmss, reordering;
+                    unsigned int   rcv_rtt, rcv_space, total_retrans;
+                    unsigned long long pacing_rate, max_pacing_rate, bytes_acked, bytes_received;
+                } ti;
+                socklen_t tl = sizeof ti;
+                /* TCP_INFO is also the liveness test. mux_out_fd[i] >= 0 only
+                 * means the slot holds a descriptor NUMBER: a leg whose socket
+                 * went away by a path that did not reset the slot leaves a
+                 * stale number behind, and trusting it is how run 26 listed
+                 * five peers that had no socket in any state (2026-09-16).
+                 * getsockopt on a closed or non-socket fd fails; that is the
+                 * signal to retire the slot rather than publish a ghost. */
+                if(getsockopt(mux_out_fd[i], IPPROTO_TCP, TCP_INFO, &ti, &tl) != 0){
+                    g_node_status->peers[i].used = 0;
+                    continue;
+                }
+                /* ...and the descriptor must still be THIS peer's socket. A
+                 * closed leg leaves its number behind, and the kernel hands
+                 * that number to the next socket opened -- a download worker's
+                 * connection, a pipe. TCP_INFO then succeeds on an unrelated
+                 * socket and the slot publishes a stale ADDRESS with somebody
+                 * else's live byte counts. Caught on run 26 (2026-09-17): one
+                 * entry that no socket in any state matched, surviving every
+                 * republish because its fd was perfectly valid. getpeername is
+                 * the only thing that ties the number back to the address. */
+                { struct sockaddr_storage sa; socklen_t sl = sizeof sa;
+                  char host[64] = {0};
+                  if(getpeername(mux_out_fd[i], (struct sockaddr*)&sa, &sl) != 0){
+                      g_node_status->peers[i].used = 0; continue; }
+                  if(sa.ss_family == AF_INET)
+                      inet_ntop(AF_INET, &((struct sockaddr_in*)&sa)->sin_addr, host, sizeof host);
+                  else if(sa.ss_family == AF_INET6)
+                      inet_ntop(AF_INET6, &((struct sockaddr_in6*)&sa)->sin6_addr, host, sizeof host);
+                  /* mux_out_host[i] is the dialled host; compare on the address
+                   * part only (onion/i2p legs have no numeric peer name and are
+                   * left alone rather than wrongly retired). */
+                  if(host[0] && strchr(mux_out_host[i], '.') != NULL
+                     && strncmp(host, mux_out_host[i], strlen(host)) != 0){
+                      g_node_status->peers[i].used = 0; continue;
+                  } }
+                {
+                    rpc_peer_t* pr = &g_node_status->peers[i];
+                    /* byte fields only if the kernel returned a struct large
+                     * enough to include them */
+                    if(tl >= (socklen_t)((char*)(&ti.bytes_received + 1) - (char*)&ti)){
+                        /* bytes_acked advances with snd_una, and the peer's
+                         * ACK of our SYN moves it by one sequence number that
+                         * carried no data: measured against Core on regtest
+                         * (2026-09-19) a leg read 679 where Core had received
+                         * 678. bytes_received has no such step (the peer's
+                         * SYN sets rcv_nxt directly) and matched exactly. */
+                        pr->bytes_sent = ti.bytes_acked > 0 ? (long long)ti.bytes_acked - 1 : 0;
+                        pr->bytes_recv = (long long)ti.bytes_received;
+                    }
+                    if(tl >= (socklen_t)((char*)(&ti.last_data_recv + 1) - (char*)&ti)){
+                        pr->last_send = nows - (long long)(ti.last_data_sent / 1000);
+                        pr->last_recv = nows - (long long)(ti.last_data_recv / 1000);
+                    }
+                }
+            } }
+}
+/* 2026-09-17: the liveness check the ROTATION has always done, moved into the
+ * sweep as well. The rotation is the only place that noticed a peer's hangup,
+ * and the rotation does not run while the parallel downloader owns the loop
+ * (hours on a mid-sync node): measured on run 26, three of six legs had dead
+ * sockets the worker still held as live, one for 24 minutes, with nothing in
+ * the log. The sweep runs throughout the download, so the same POLLRDHUP/
+ * POLLHUP test here names the departure within seconds of the FIN.
+ *
+ * This is a LIVENESS rule and nothing else: it fires only on a socket the
+ * kernel says is gone. It is deliberately NOT a throughput rule -- an
+ * absolute 32 KB/s eviction floor killed healthy early-chain peers for four
+ * benchmark runs (docs/FEATURE_GAPS.md, the thresholds entry), and a relay
+ * leg legitimately carries ~0 B/s next to a download peer. */
+static int leg_check_gone(int k){
+    short revents = 0;
+    if(!leg_peer_hung_up(mux_out_fd[k], &revents)) return 0;
+    char how[40]; snprintf(how, sizeof how, "revents 0x%x", (unsigned)revents);
+    char unread[200]; leg_drain_unread(mux_out_fd[k], unread, sizeof unread);
+    leg_close_theirs(k, how, unread);                    /* closes the fd and arms the re-dial */
+    if(ctl_dial_listed(mux_out_host[k])) ctl_dial_report(mux_out_host[k], 0, (long long)time(NULL));
+    return 1;
+}
 static void legs_sweep_except(int except){
     long long nowsec = (long long)time(NULL);
     for(int k = 0; k < mux_n_out; k++){
         if(k == except || mux_out_fd[k] < 0 || leg_pass_busy(k)) continue;   /* a pass helper owns that socket */
+        if(leg_check_gone(k)) continue;
         if(mux_out_kind[k] != LEG_BLOCK_ONLY && txsub_worker_ready()){ extern long txrelay_poll_leg(int, void*, int); (void)txrelay_poll_leg(mux_out_fd[k], txsub_pool(), 0); }
         else if(mux_out_kind[k] == LEG_BLOCK_ONLY){ extern long txrelay_poll_block_only_leg(int); (void)txrelay_poll_block_only_leg(mux_out_fd[k]); }
         if(!mux_out_good[k] && mux_out_since[k] && nowsec - mux_out_since[k] >= DM_GOOD_S){ mux_out_good[k] = 1; if(g_dialmem) dialmem_note_success(g_dialmem, mux_out_host[k]); }
@@ -5906,7 +6638,7 @@ static void legs_sweep_except(int except){
      * helper had taken the socket; with a v2 session the parent's stale cipher
      * made that ping garbage and the peer hung up ("EOF on the first read" on
      * four legs in a minute). Nothing touches a busy leg. */
-    if(except >= 0 && except < mux_n_out && mux_out_fd[except] >= 0 && !leg_pass_busy(except)) leg_ping_tick(except, nowsec);
+    if(except >= 0 && except < mux_n_out && mux_out_fd[except] >= 0 && !leg_pass_busy(except) && !leg_check_gone(except)) leg_ping_tick(except, nowsec);
 }
 /* ---- Core's stall rule (2026-09-10) ----------------------------------------
  * The one judge of slowness in Core's downloader: when the window is full
@@ -5973,7 +6705,56 @@ static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t
 static void dlc_publish_applied(volatile long* ctl){
     ctl[DLC_CTL_APPLIED] = g_utxo_live_on ? utxo_live_applied_height() + 1 : -1;
 }
+/* publish the workers' peers for getpeerinfo (2026-09-08). Every PASS of the
+ * parent's loop since 2026-09-19, not only the 10 s status tick: the byte
+ * counters move continuously, and a download shorter than one tick (a
+ * handoff, a regtest sync) never appeared at all. */
+static void dlc_publish_dlpeers(volatile dlc_stat_t* stats, const pid_t* kids, int nw){
+    if(!g_node_status) return;
+    int nd = nw > 64 ? 64 : nw;
+    for(int w=0; w<nd; w++){
+        rpc_peer_t* d = &g_node_status->dlpeers[w];
+        if(kids[w]==0 || !stats[w].peer[0]){ d->used = 0; continue; }
+        strncpy(d->addr, (const char*)stats[w].peer, sizeof d->addr - 1); d->addr[sizeof d->addr - 1] = 0;
+        d->proto = stats[w].proto; d->services = stats[w].services; d->start_height = stats[w].start_height;
+        memcpy(d->subver, (const char*)stats[w].subver, sizeof d->subver); d->subver[sizeof d->subver - 1] = 0;
+        memcpy((char*)d->addrlocal, (const char*)stats[w].addrlocal, sizeof d->addrlocal); d->addrlocal[sizeof d->addrlocal - 1] = 0;
+        /* the connection's wire bytes, counted by the worker's own p2p hooks
+         * (dl_wire_note); bytes_sent was a hard-coded 0 until 2026-09-19 */
+        d->conn_time = stats[w].conn_time; d->bytes_recv = stats[w].wire_recv; d->bytes_sent = stats[w].wire_sent;
+        for(int i = 0; i < RPC_MSG_N; i++){ d->sent_per_msg[i] = stats[w].sent_pm[i]; d->recv_per_msg[i] = stats[w].recv_pm[i]; }
+        d->last_recv = d->last_send = (long long)time(NULL);
+        d->inflight_lo = stats[w].cur_lo; d->inflight_hi = stats[w].cur_hi; d->dl_worker = w; d->inbound = 0;
+        d->idle_pct = stats[w].wall_ms > 0
+            ? (int)((stats[w].wait_ms * 100) / stats[w].wall_ms) : -1;
+        d->bps_recv = (long long)stats[w].last_bw_bps;   /* 2026-09-10: for bmcgetdownloadinfo */
+        d->used = 1;
+    }
+    g_node_status->n_dlpeers = nd;
+}
+static long dl_catchup_run(const char* dir, int min_workers);
+/* The download's scope for the wire accounting: the receive hook is this
+ * scope's alone (a relay leg's receive side is counted where its command is
+ * parsed), and the send hook is the node-wide one main() installs -- put in
+ * place here too when nothing has, as in a test driving this directly. */
 static long dl_catchup(const char* dir, int min_workers){
+    extern void (*g_p2p_write_hook)(int fd, unsigned plen, const char* cmd, unsigned cmdlen);
+    extern void (*g_p2p_read_hook)(int fd, const char* cmd, unsigned plen);
+    void (*prev_w)(int, unsigned, const char*, unsigned) = g_p2p_write_hook;
+    void (*prev_r)(int, const char*, unsigned) = g_p2p_read_hook;
+    if(!g_p2p_write_hook) g_p2p_write_hook = p2p_upload_pace;
+    g_p2p_read_hook = dl_read_note;
+    if(!g_node_status && !g_dl_wire_boot){           /* the boot catch-up: no status table yet */
+        void* m = mmap(NULL, 2 * sizeof(long long), PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+        if(m != MAP_FAILED) g_dl_wire_boot = (volatile long long*)m;
+    }
+    g_dl_wire_scope = 1;
+    long r = dl_catchup_run(dir, min_workers);
+    g_dl_wire_scope = 0;
+    g_p2p_read_hook = prev_r; g_p2p_write_hook = prev_w;
+    return r;
+}
+static long dl_catchup_run(const char* dir, int min_workers){
     (void)dir; /* CWD is already the data dir; kept for logging/API clarity */
     ab2_t* ab = addr_book();
     if(!ab){ fprintf(stderr,"[dlc] address book unavailable\n"); return 0; }
@@ -6242,6 +7023,8 @@ static long dl_catchup(const char* dir, int min_workers){
         if(next_claim[DLC_CTL_WANT_ANCHOR]) dlc_publish_anchor(next_claim, start_h);   /* before a connect call that may run for seconds */
         dlc_stall_tick(next_claim, stats, kids, opid, nw, start_h, end_h, dlc_now_ms(), live, nlive, banned);   /* Core's rule, every pass (2026-09-10) */
         legs_sweep_except(-1);                                                            /* row 3: the legs stay served through a handoff */
+        dl_publish_peer_table(store_buf, 0);   /* legs only: the tip is this loop's own business */
+        dlc_publish_dlpeers(stats, kids, nw);  /* the helpers' peers and their bytes, every pass (2026-09-19) */
         if(interleave && dlc_now_ms() >= connect_retry_ms){
             /* (store_reload is the bounded call's first act, so it sees the
              * helpers' appends; a second one here would be redundant.) */
@@ -6379,22 +7162,7 @@ static long dl_catchup(const char* dir, int min_workers){
         next_claim[DLC_CTL_FREE_PEERS] = free_peers;
         /* publish the workers' peers for getpeerinfo / getnettotals (2026-09-08) */
         if(g_node_status){
-            int nd = nw > 64 ? 64 : nw;
-            for(int w=0; w<nd; w++){
-                rpc_peer_t* d = &g_node_status->dlpeers[w];
-                if(kids[w]==0 || !stats[w].peer[0]){ d->used = 0; continue; }
-                strncpy(d->addr, (const char*)stats[w].peer, sizeof d->addr - 1); d->addr[sizeof d->addr - 1] = 0;
-                d->proto = stats[w].proto; d->services = stats[w].services; d->start_height = stats[w].start_height;
-                memcpy(d->subver, (const char*)stats[w].subver, sizeof d->subver); d->subver[sizeof d->subver - 1] = 0;
-                d->conn_time = stats[w].conn_time; d->bytes_recv = stats[w].bytes_peer; d->bytes_sent = 0;
-                d->last_recv = d->last_send = (long long)time(NULL);
-                d->inflight_lo = stats[w].cur_lo; d->inflight_hi = stats[w].cur_hi; d->dl_worker = w; d->inbound = 0;
-                d->idle_pct = stats[w].wall_ms > 0
-                    ? (int)((stats[w].wait_ms * 100) / stats[w].wall_ms) : -1;
-                d->bps_recv = (long long)stats[w].last_bw_bps;   /* 2026-09-10: for bmcgetdownloadinfo */
-                d->used = 1;
-            }
-            g_node_status->n_dlpeers = nd;
+            dlc_publish_dlpeers(stats, kids, nw);
             g_node_status->dl_bytes_total = (long long)cumulative_bytes;
             /* the aggregate state bmcgetdownloadinfo serves (2026-09-10) */
             g_node_status->dl_active          = 1;
@@ -7072,6 +7840,7 @@ static void dl_new_block_choke(void){
                  * (idempotent by height -- a replayed height is a
                  * no-op) */
                 txit_on_block(store_buf, zh, zb, bl);
+                dl_index_trail_tick(g_utxo_live_on ? utxo_live_applied_height() : -1);
                 tsp_on_block(store_buf, zh, zb, bl);
                 /* filter index tail: adopt/append (cheap probe when
                  * the backfill has not closed in yet) */
@@ -7110,11 +7879,22 @@ static void dl_new_block_choke(void){
                   /* fee estimation's "chainstate is current": this block's time */
                   { unsigned int bt; memcpy(&bt, zb + 68, 4); tx_accept_set_tip_time((long)bt, -1); }
                   if (txsub_worker_ready() && mp_ext_area){
+                      /* stages the ZMQ sequence topic's 'C' under the pool
+                       * lock, after the block's own removals */
                       long mr = tx_accept_block_connect_h(mp_ext_area, zb, (unsigned long)bl, (long)zh);
                       if (mr > 0)
                           fprintf(stderr,"[mempool] block %d: removed %ld pool tx (confirmed/conflicted)\n", zh, mr);
+                  } else {
+                      /* no pool to reconcile, but the block WAS connected:
+                       * Core's BlockConnected fires regardless */
+                      unsigned char cbh[32]; sha256d(cbh, zb, 80);
+                      mempool_seq_block(cbh, 'C');
                   } }
                 if (!zmqpub_active()) continue;
+                /* Publish what this block staged (the sequence topic's 'R's
+                 * and 'C') now, not at the end of a catch-up burst: a burst
+                 * of thousands of blocks would otherwise lap the ring. */
+                zmqn_drain();
                 /* The block HASH is sha256d over the 80-byte
                  * header, REVERSED: Core's notifier flips the bytes
                  * (data[31-i] = hash.begin()[i]) so the hashblock
@@ -7199,16 +7979,25 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     /* ZMQ publisher binds HERE, in the worker, because a PUB socket's
      * subscriber fds are per-process and only this process can write to them.
      * Binding is non-fatal: a busy port must not stop the node syncing. */
+    /* the per-topic high-water marks (messages per subscriber queue) before
+     * the first subscriber can connect, not after the archive reload */
+    { extern void zmq_pub_set_hwm(const int*); zmq_pub_set_hwm(g_cfg.zmq_hwm); }
     if (g_cfg.zmq_hashblock[0]) zmqpub_add("hashblock", g_cfg.zmq_hashblock);
     if (g_cfg.zmq_hashtx[0])    zmqpub_add("hashtx",    g_cfg.zmq_hashtx);
     if (g_cfg.zmq_rawblock[0])  zmqpub_add("rawblock",  g_cfg.zmq_rawblock);
     if (g_cfg.zmq_rawtx[0])     zmqpub_add("rawtx",     g_cfg.zmq_rawtx);
+    if (g_cfg.zmq_sequence[0])  zmqpub_add("sequence",  g_cfg.zmq_sequence);
     /* Subscriber servicing runs on its own thread from here on, so no hot
      * loop in this worker ever walks the subscriber list (audit finding 8).
      * Non-fatal: if the thread cannot start, publishing still works and the
      * failure is logged -- only new subscribers would fail to connect. */
     { extern int zmqpub_start(void);
       if (zmqpub_active()) zmqpub_start(); }
+    /* ...and this process's own accepts -- nearly all of them, a
+     * mempool.dat reload included -- publish as they are staged, not a
+     * rotation later through a ring they would lap (daemon/zmq_notify.c). */
+    { extern void zmqn_set_publisher(void);
+      if (zmqpub_active()) zmqn_set_publisher(); }
     fprintf(stderr,"[dl] worker: reloading chain archive...\n");
     phase_timer_t dl_load_pt; phase_start(&dl_load_pt);
     { long ni = invset_load("invalid.dat"); if(ni) fprintf(stderr, "[chain] invalid.dat: %ld operator-invalidated block(s)\n", ni);   /* CC-10 */
@@ -7291,7 +8080,6 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
        * means this node must not learn or announce its clearnet address at
        * all: that address is exactly what running behind Tor hides. */
       { extern void txrelay_set_status(void*); txrelay_set_status(g_node_status); }
-      { extern void zmq_pub_set_hwm(const int*); zmq_pub_set_hwm(g_cfg.zmq_hwm); }
       int may = g_cfg.listen && dialer_may_announce_clearnet();
       addrself_init((unsigned short)g_cfg.port, may);
       /* -externalip: the operator naming the reachable address directly */
@@ -7343,9 +8131,19 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * offline base build (or the previous run's tail) and the current tip.
      * After the archive verify -- a repair may have truncated heights the
      * tail would otherwise trust. No base index => logs once and disables. */
-    if(archive_ok) txit_boot(store_buf);
+    /* 2026-09-19: each ONLY when its key asks for it, as Core builds an index
+     * only under its option. Both used to boot on every node: run 27, with
+     * txindex/coinstatsindex/blockfilterindex set and txospenderindex
+     * absent (default 0), kept a txo-spender tail to ~600k and getindexinfo
+     * listed it. A tail that is never booted appends nothing (its fd stays
+     * -1: txit_on_block/tsp_on_block, the truncate and run-advance hooks all
+     * return at once), creates no file, and the trailing builder is
+     * configured disabled below. */
+    if(archive_ok && g_cfg.txindex) txit_boot(store_buf);
+    else if(archive_ok) fprintf(stderr, "[txindex] txindex=0 -- not maintaining the txid index\n");
     /* txo-spender index tail (Core -txospenderindex): same shape, same rules */
-    if(archive_ok) tsp_boot(store_buf);
+    if(archive_ok && g_cfg.txospenderindex) tsp_boot(store_buf);
+    else if(archive_ok) fprintf(stderr, "[txospender] txospenderindex=0 -- not maintaining the txo-spender index\n");
     /* the live address index (EXTENSION) boots AFTER the UTXO engine below:
      * its backfill replays undo, which exists only for applied blocks */
 
@@ -7414,6 +8212,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * operator who does not want the write amplification had no way to
          * say so; now they do, and getindexinfo stops advertising an index
          * that is deliberately off. */
+        /* the trailing index builders (2026-09-16), each enabled by its own
+         * key. They were configured INSIDE the coinstatsindex branch below,
+         * so coinstatsindex=0 silently left txindex, txospenderindex and the
+         * address history with no builder at all (2026-09-19). */
+        dl_index_trail_configure(dir);
         if (!g_cfg.coinstatsindex)
             fprintf(stderr,"[dl] coinstatsindex=0 -- not maintaining the coin statistics index\n");
         else {
@@ -7441,17 +8244,17 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             /* 2026-09-08: the history base repairs itself. The builder lives
              * beside this executable; the supervisor ticks at the heartbeat. */
             { extern void csi_hist_repair_configure(const char*, const char*, const char*, int, int);
-              char exe[512], builder[600]; ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+              char exe[512], builder[600];
+#ifdef __APPLE__
+              /* /proc/self/exe does not exist on Darwin (osx port) */
+              uint32_t xs = (uint32_t)sizeof exe;
+              ssize_t n = _NSGetExecutablePath(exe, &xs) == 0 ? (ssize_t)strlen(exe) : -1;
+#else
+              ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+#endif
               if (n > 0){ exe[n] = 0; char* sl = strrchr(exe, '/'); if (sl) *sl = 0; snprintf(builder, sizeof builder, "%s/bmc_build_coinstats_hist", exe); }
               else snprintf(builder, sizeof builder, "bmc_build_coinstats_hist");
-              csi_hist_repair_configure(builder, dir, g_chainp->name, g_cfg.coinstatshist_workers, g_cfg.coinstatshist_repair);
-              /* 2026-09-10 (CORE_DIVERGENCES row 2): the block filter index and
-               * the address history repair themselves the same way -- the
-               * builders beside this executable, ticked at the heartbeat */
-              { char b2[600]; snprintf(b2, sizeof b2, "%s/bmc_build_block_filters", n > 0 ? exe : ".");
-                ir_configure(&g_ir_bfi, "bfilter", b2, dir, g_chainp->name, "", g_cfg.blockfilterindex);
-                snprintf(b2, sizeof b2, "%s/bmc_build_addr_hist", n > 0 ? exe : ".");
-                ir_configure(&g_ir_addrhist, "addrhist", b2, dir, g_chainp->name, "", g_cfg.addrindex); } }
+              csi_hist_repair_configure(builder, dir, g_chainp->name, g_cfg.coinstatshist_workers, g_cfg.coinstatshist_repair); }
             utxo_live_set_coinstats(csi_on_add, csi_on_remove, csi_invalidate, csi_commit);
             { extern void csi_on_block(long); extern void utxo_live_set_coinstats_block(void (*)(long)); utxo_live_set_coinstats_block(csi_on_block); }
             undo_set_coin_observer(csi_on_remove);
@@ -7591,7 +8394,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     }
     /* CC-4: Core anchors.dat -- the block-relay-only peers of the last run are
      * dialled first, as block-only again; the file is deleted on read. */
-    { char anc[MAX_BLOCK_RELAY_ONLY][128]; long na = anchors_read("anchors.dat", anc, MAX_BLOCK_RELAY_ONLY, g_chainp->magic);
+    /* not under connect= (Core reads anchors only when it picks its own
+     * peers): an anchor is a host the operator did not list */
+    { char anc[MAX_BLOCK_RELAY_ONLY][128]; long na = g_cfg.connect_only ? 0 : anchors_read("anchors.dat", anc, MAX_BLOCK_RELAY_ONLY, g_chainp->magic);
       if(na > 0){
           for(long i = na - 1; i >= 0; i--){
               if(nsrc >= 64) break;
@@ -7655,6 +8460,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(dialer_proxy_configured()){ cfd[nc++]=-1; continue; }
             int spport = 0;
             ip = pool_ipv4(srcpool[i], &spport);
+            /* connect=/addnode= keep the host bare and its port beside it
+             * (node_config.c): without this a regtest connect=127.0.0.1:19310
+             * was dialled on 18444 here, refused, and left to the top-up */
+            if(!spport) spport = node_config_peer_port(srcpool[i]);
             if(!ip){
                 struct addrinfo h,*res=0; memset(&h,0,sizeof h); h.ai_family=AF_INET; h.ai_socktype=SOCK_STREAM;
                 /* never hand an anonymity-network name to the system
@@ -7773,44 +8582,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
     int apply_first_prev = 0;
     long long dl_parallel_last_s = 0;
     for(;;){
-        /* publish outbound peer count + tip + peer table for the RPC thread */
-        if(g_node_status){ int lp=0; for(int i=0;i<mux_n_out;i++) if(mux_out_fd[i]>=0) lp++;
-            g_node_status->n_out = lp; g_node_status->tip_height = node_public_tip(store_buf);   /* 3.1: the CONNECTED tip */
-            dl_publish_connected_tip();
-            long long nows = (long long)time(NULL);
-            for(int i=0;i<RPC_MAX_PEERS;i++){
-                if(i >= MUX_MAX_OUT) continue;                      /* inbound children own 64..127 */
-                if(!(i < mux_n_out && mux_out_fd[i] >= 0)){ g_node_status->peers[i].used = 0; continue; }
-                /* per-socket byte + last-activity meters from the kernel: no
-                 * asm changes, no double counting -- TCP_INFO is authoritative
-                 * (getpeerinfo bytessent/bytesrecv/lastsend/lastrecv). The
-                 * kernel struct is read by offset into a local mirror of its
-                 * stable uapi layout, so this does not depend on the glibc
-                 * header's tcp_info version (older ones lack the byte fields). */
-                struct bmc_tcp_info {
-                    unsigned char  _s[7];                 /* state..wscale/flags */
-                    unsigned int   rto, ato, snd_mss, rcv_mss;
-                    unsigned int   unacked, sacked, lost, retrans, fackets;
-                    unsigned int   last_data_sent, last_ack_sent, last_data_recv, last_ack_recv;
-                    unsigned int   pmtu, rcv_ssthresh, rtt, rttvar, snd_ssthresh, snd_cwnd, advmss, reordering;
-                    unsigned int   rcv_rtt, rcv_space, total_retrans;
-                    unsigned long long pacing_rate, max_pacing_rate, bytes_acked, bytes_received;
-                } ti;
-                socklen_t tl = sizeof ti;
-                if(getsockopt(mux_out_fd[i], IPPROTO_TCP, TCP_INFO, &ti, &tl) == 0){
-                    rpc_peer_t* pr = &g_node_status->peers[i];
-                    /* byte fields only if the kernel returned a struct large
-                     * enough to include them */
-                    if(tl >= (socklen_t)((char*)(&ti.bytes_received + 1) - (char*)&ti)){
-                        pr->bytes_sent = (long long)ti.bytes_acked;
-                        pr->bytes_recv = (long long)ti.bytes_received;
-                    }
-                    if(tl >= (socklen_t)((char*)(&ti.last_data_recv + 1) - (char*)&ti)){
-                        pr->last_send = nows - (long long)(ti.last_data_sent / 1000);
-                        pr->last_recv = nows - (long long)(ti.last_data_recv / 1000);
-                    }
-                }
-            } }
+        dl_publish_peer_table(store_buf, 1);   /* the peer table the RPC reads (2026-09-16: shared with dl_catchup) */
         /* peer control: one command per ack, executed HERE because this is the
          * process that holds the legs. Every branch reports what it actually
          * did -- 1 done, 0 no-op/not-found -- so the parent can map a no-op to
@@ -7846,9 +8618,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 if(!num){
                     /* Core drops every connection when the network goes down;
                      * anything less would leave the node still talking. */
+                    int dropped = 0;
                     for(int i = 0; i < mux_n_out; i++)
-                        if(mux_out_fd[i] >= 0){ bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1; }
-                    fprintf(stderr,"[ctl] network DISABLED: dropped all outbound legs\n");
+                        if(mux_out_fd[i] >= 0){ leg_close_ours(i, "setnetworkactive-false", "the operator took the network down"); dropped++; }
+                    fprintf(stderr,"[ctl] network DISABLED: dropped all %d outbound leg(s)\n", dropped);
                 } else {
                     fprintf(stderr,"[ctl] network enabled\n");
                 }
@@ -7903,9 +8676,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                 (long long)q->nodeid, i);
                         q->used = 0; break;
                     }
-                    fprintf(stderr,"[ctl] disconnecting %s (nodeid %lld, leg %d)\n",
-                            mux_out_host[i], (long long)q->nodeid, i);
-                    bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1;
+                    { char d[80]; snprintf(d, sizeof d, "disconnectnode, nodeid %lld", (long long)q->nodeid);
+                      leg_close_ours(i, "rpc-disconnectnode", d); }
                     q->used = 0;
                     result = 1; break;
                 }
@@ -8003,8 +8775,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                                 if(mux_out_fd[i] < 0) continue;
                                 char ip[128]; ctl_ip_only(mux_out_host[i], ip, sizeof ip);
                                 if(ctl_ban_covers(arg, ip)){
-                                    fprintf(stderr,"[ctl] ban %s drops live leg %s\n", arg, mux_out_host[i]);
-                                    bmc_v2_close(mux_out_fd[i]), close(mux_out_fd[i]); mux_out_fd[i] = -1;
+                                    char d[96]; snprintf(d, sizeof d, "setban %s now covers this address", arg);
+                                    leg_close_ours(i, "banned", d);
                                     g_node_status->peers[i].used = 0;
                                 }
                             }
@@ -8314,6 +9086,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * persist coinstats.dat (bounded; a kill only costs a re-seed). */
             { extern void csi_worker_stop(void) __attribute__((weak));
               if (csi_worker_stop) csi_worker_stop(); }
+            /* same rule as the serve parent's exit: no thread of this
+             * process may be inside the mempool lock when _exit kills it */
+            { extern int mp_quiesce(long) __attribute__((weak)); if (mp_quiesce) mp_quiesce(5000); }
             _exit(0);
         }
         long long now_ms = 0;
@@ -8369,6 +9144,31 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 fprintf(stderr,"[dl] archive at %ld, peers announce %ld: %ld blocks behind -- running the parallel downloader (%d workers)\n",
                         atip, best, best-atip, g_catchup_workers);
                 dl_parallel_last_s = nows;
+                /* 2026-09-17: hand the loop over with NO pass outstanding.
+                 * A pass helper's report is read only by leg_pass_poll, which
+                 * runs in THIS loop -- and dl_catchup does not return for
+                 * hours. A slot left busy is skipped by legs_sweep_except for
+                 * the whole download: nothing reads its socket, no ping tick
+                 * runs on it, and the peer eventually resets a connection we
+                 * stopped reading. Measured on run 26, 2026-09-17: leg 0 held
+                 * 100 KB unread and growing in its receive queue with lastrecv
+                 * climbing past 140 s while the download peers sat at 3-5 s,
+                 * and the three legs whose passes were queued when the
+                 * download started were the three whose sockets were gone --
+                 * with no logged close. The legs that stayed idle survived.
+                 * Drain the reports first; a helper still running when the
+                 * bound expires is retired by leg_pass_poll's own budget rule,
+                 * which names the close. */
+                { long long dead = dh_now_ms() + (long long)leg_budget_secs(1) * 1000 + 20000;
+                  int outstanding = pass_running(), waited = outstanding;
+                  while(outstanding > 0 && dh_now_ms() < dead){
+                      (void)leg_pass_poll(NULL, srcpool, nsrc, out_port);
+                      legs_sweep_except(-1);
+                      usleep(50000);
+                      outstanding = pass_running();
+                  }
+                  if(waited > 0)
+                      fprintf(stderr,"[dl] waited for %d pass helper(s) before the parallel download; %d still running\n", waited, outstanding); }
                 long got = dl_catchup(dir, g_catchup_workers);
                 store_reload(store_buf);
                 if(got <= 0){ noop_best = best; noop_tip = atip; }
@@ -8389,6 +9189,16 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             int announced_now = 0;
             { int a = leg_announced_pick(-1); if(a >= 0){ announced_now = 1; if(a != i){ i = a; n_--; } } }
             if(g_shutdown_requested){
+                /* 2026-09-17: a restart is a DEPARTURE for every live leg, and
+                 * it was the one path that named nobody -- run 26's log showed
+                 * 42 handshakes across nine boots and 3 logged closes, which
+                 * reads as churn until the boots are counted. Each leg says
+                 * goodbye with its age, so a re-dial after a restart is never
+                 * mistaken for a leg that dropped. */
+                for(int k = 0; k < mux_n_out; k++)
+                    if(mux_out_fd[k] >= 0)
+                        fprintf(stderr,"[dl:%d] %s connection closed ours/shutdown after %llds -- the worker is stopping\n",
+                                k, mux_out_host[k][0] ? mux_out_host[k] : "?", leg_age_s(k));
                 /* CC-4: remember the live block-relay-only legs for the next start */
                 const char* bo[MAX_BLOCK_RELAY_ONLY]; int nb = 0;
                 for(int k = 0; k < mux_n_out && nb < MAX_BLOCK_RELAY_ONLY; k++) if(mux_out_fd[k] >= 0 && mux_out_kind[k] == LEG_BLOCK_ONLY) bo[nb++] = mux_out_host[k];
@@ -8410,20 +9220,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * POLLNVAL pattern (see the accept loop above), mirrored here so
              * the download worker's peer drops are equally visible/handled. */
             if(leg_pass_busy(i)) continue;                     /* row 1: the helper owns the socket until it reports */
-            struct pollfd pf = { mux_out_fd[i], POLLIN, 0 };
-            if(leg_peer_hung_up(mux_out_fd[i], &pf.revents)){
-                /* 2026-09-09: the peer's doing (every close of ours is labelled
-                 * before it reaches here). Read what it left in the socket --
-                 * its last words, if any -- and remember the address: an
-                 * inbound-full node evicting its newest peer, or a listener
-                 * that hangs up after a minute, is not worth the next dial. */
-                char unread[200]; leg_drain_unread(mux_out_fd[i], unread, sizeof unread);
-                long long age = leg_age_s(i);
-                fprintf(stderr,"[dl:%d] %s connection closed theirs (revents 0x%x) after %llds; unread: %s\n",
-                        i, mux_out_host[i], pf.revents, age, unread);
-                if(g_dialmem && age >= 0 && age <= DM_EARLY_S)
-                    dialmem_note_failure(g_dialmem, mux_out_host[i], age <= DM_REFUSED_S ? DM_REFUSED : DM_EARLY_DROP, dialmem_now());
-                if(ctl_dial_listed(mux_out_host[i])) ctl_dial_report(mux_out_host[i], 0, (long long)time(NULL));   /* addnode add: back in the queue */
+            /* 2026-09-09: the peer's doing (every close of ours is labelled
+             * before it reaches here). leg_check_gone reads what it left in
+             * the socket -- its last words, if any -- and remembers the
+             * address: an inbound-full node evicting its newest peer, or a
+             * listener that hangs up after a minute, is not worth the next
+             * dial. 2026-09-17: one implementation, shared with the sweep. */
+            if(leg_check_gone(i)){
                 mux_next_peer(i, srcpool, nsrc, out_port);
                 mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
                 continue;
@@ -8597,6 +9400,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * shared ring; hand them to the outbound announcer so they reach
              * the outbound legs too (the worker's own accepts are already
              * queued by tx_relay.c and are skipped by the drain). */
+            /* transactions inbound peers sent: the serve children queued them
+             * for validation here, against the live set (daemon/tx_handoff.c).
+             * Before the ann-ring drain, so this rotation announces them. */
+            { extern long txrelay_drain_handoff(void*, long); (void)txrelay_drain_handoff(txsub_pool(), 256); }
             { extern void txrelay_announce_own(const unsigned char txid[32]);
               txann_worker_drain(txrelay_announce_own); }
             { int rfds[MUX_MAX_OUT]; int free_fds[MUX_MAX_OUT];                                 /* 2026-09-10: never a busy leg */
@@ -8659,7 +9466,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * Validates a book entry and drops it. This is what keeps the address
          * book from rotting -- without it we only discover the rot at boot,
          * as happened on 2026-08-18 (1,974 entries, ~4% still answering). */
-        if(g_cfg.max_feeler > 0 && now_ms >= next_feeler_ms && nsrc > 0){
+        if(g_cfg.max_feeler > 0 && !g_cfg.connect_only && now_ms >= next_feeler_ms && nsrc > 0){   /* Core: no feelers under -connect */
             next_feeler_ms = now_ms + g_cfg.feeler_interval_ms;
             int pick = (int)((unsigned)rot * 2654435761u % (unsigned)nsrc);
             unsigned char saved_relay = node_relay_flag; node_relay_flag = 0;   /* Core: feelers get fRelay=0 */
@@ -8763,9 +9570,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             }
         }
         dl_new_block_choke();   /* the 3.1 choke point; shared with the parallel downloader (step 1) */
-        /* Drain transactions staged by the serve children (and by this
-         * worker's own sendrawtransaction path) and service subscriber
-         * handshakes. Both are cheap no-ops when ZMQ is unconfigured. */
+        /* Drain transactions staged by other processes (this worker's own
+         * accepts publish as they are staged -- zmqn_set_publisher above)
+         * and service subscriber handshakes. Both are cheap no-ops when ZMQ
+         * is unconfigured. */
         /* audit finding 8: subscriber servicing has its own thread now
          * (daemon/zmq_pub.c), so this loop -- whose job is block download --
          * no longer walks the subscriber list at all. Only the staged-tx
@@ -8799,23 +9607,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 long target = utxo_live_ok ? utxo_live_applied_height() : (long)*(int*)(store_buf+24);
                 csi_hist_repair_tick(target, dl_tip_is_ibd(), (long long)time(NULL));
             }
-            /* 2026-09-10 (row 2): the block filter index and the address history
-             * repair themselves. The filter index needs a build when it is
-             * absent or more than the adopt gap behind the tip (the live tail
-             * adopts and closes the rest from undo once it is within 144); the
-             * address history when its base is absent. */
-            { long atip = (long)*(int*)(store_buf+24); long long nows = (long long)time(NULL); int ibd = dl_tip_is_ibd();
-              if(g_cfg.blockfilterindex){
-                  extern long bfi_count(void); extern long bfi_probe_count(void);
-                  long have = bfi_probe_count(); int needed = bfi_count() < 0 && (have < 0 || atip - have > 144);
-                  ir_tick(&g_ir_bfi, needed, atip, ibd, nows);
-              }
-              if(g_cfg.addrindex){
-                  extern int ah_available(void) __attribute__((weak));
-                  int needed = ah_available ? !ah_available() : 0;
-                  long target = utxo_live_ok ? utxo_live_applied_height() : atip;
-                  ir_tick(&g_ir_addrhist, needed, target, ibd, nows);
-              } }
+            /* 2026-09-16: the block filter index builds itself at the block
+             * choke point from genesis (bfilter_index.c) and the trailing
+             * index builders tick there too, so this heartbeat only has to
+             * cover the caught-up phase, where the choke point is quiet. */
+            dl_index_trail_tick(utxo_live_ok ? utxo_live_applied_height() : -1);
             /* Relay-pool health. Silent when nothing has been parked, so a
              * node with no orphan traffic prints nothing extra. */
             { extern long txrelay_stats(long*,long*,long*,long*,long*,long*);
@@ -8832,6 +9628,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 if (dr || t_pr)
                     fprintf(stderr,"[txrelay] orphan drops: %ld ttl, %ld evicted, %ld rejected | parents requested %ld, notfound %ld, re-requested after timeout %ld, retried on another peer %ld, drained %ld (gave up %ld, in flight %ld), sync deferred %ld\n",
                             t_ttl, t_ev, t_rj, t_pr, t_nf, t_rf, txrelay_drained_count(), t_ro, t_gu, t_wa, txrelay_sync_deferred_count()); } }
+            /* the inbound handoff ring: silent unless it dropped something */
+            { extern void txho_stats(unsigned long long*, unsigned long long*, unsigned long long*, unsigned long long*);
+              static unsigned long long prev_drop;
+              unsigned long long hp = 0, hq = 0, hf = 0, hb = 0; txho_stats(&hp, &hq, &hf, &hb);
+              if(hf + hb != prev_drop){
+                  fprintf(stderr, "[txhandoff] inbound transactions: %llu queued, %llu validated, dropped %llu (ring full) %llu (over %lu bytes)\n",
+                          hp, hq, hf, hb, 400000UL);
+                  prev_drop = hf + hb; } }
             next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
         if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
@@ -9117,6 +9921,10 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       rpc_chain_set_proposal(rpc_node_submit_proposal); }
     rpc_node_set_status_rw(g_node_status);   /* writable: enables sendrawtransaction staging */
     rpc_chain_set_public_tip_fn(rpc_public_tip);   /* 3.1: every chain RPC's tip is the CONNECTED tip */
+    /* 2026-09-19: an index is consulted and listed only when its key is on */
+    { extern void rpc_chain_set_index_config(int, int, int, int, int) __attribute__((weak));   /* rules that build this file without rpc_chain.o */
+      if (rpc_chain_set_index_config)
+          rpc_chain_set_index_config(g_cfg.txindex, g_cfg.txospenderindex, g_cfg.blockfilterindex, g_cfg.coinstatsindex, g_cfg.addrindex); }
     /* getnetworkinfo tells the truth about the transports: reachability from
      * the dialer, our i2p destination, and (once the tor listener is up,
      * below in tor_onion_listener) the onion hostname. */
@@ -9252,6 +10060,8 @@ static void serve_start_rpc(const char* dir, const char* cfgpath){
       extern long mpool_policy_entry(void*, const unsigned char*,
                                      unsigned long long*, unsigned long long*);
       extern long mpool_policy_entry_info_all(void*, struct mp_entry_info*, unsigned char (*)[32], unsigned);
+      extern long mpool_policy_totals(void*, unsigned long long*, unsigned long long*);
+      extern long mpool_policy_entry_pkg_many(void*, const unsigned char (*)[32], unsigned, struct mp_entry_info*, unsigned char*);
 extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry_info*);
       extern long mpool_policy_estimate(void*, unsigned long long*, unsigned long long*);
       extern unsigned long long mpool_policy_min_fee(void*);
@@ -9267,12 +10077,15 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
           .pol_entry = mpool_policy_entry,
           .pol_entry_info = mpool_policy_entry_info,
           .pol_entry_info_all = mpool_policy_entry_info_all,
+          .pol_totals = mpool_policy_totals,
+          .pol_pkg_many = mpool_policy_entry_pkg_many,
           .estimate = mpool_policy_estimate,
           /* main.c's existing extern types the length as long; the hooks
            * member says unsigned long -- ABI-identical on x86-64 SysV. */
           .sha256d = (void(*)(unsigned char*, const void*, unsigned long))sha256d,
           .min_fee = mpool_policy_min_fee,
           .bytespersigop = mpool_policy_bytespersigop,
+          .mempool_sequence = mempool_sequence,     /* getrawmempool mempool_sequence (mempool_seq.h) */
           .feeest = mp_ext_feeest,
           .min_relay_satkvb = g_cfg.minrelaytxfee_satkvb > 0 ? (unsigned long long)g_cfg.minrelaytxfee_satkvb : 100ULL };
       rpc_node_set_mempool(&h);
@@ -9344,6 +10157,8 @@ extern long mpool_policy_entry_info(void*, const unsigned char*, struct mp_entry
                             g_cfg.n_addnode);
     rpc_node_set_zmq(g_cfg.zmq_hashblock, g_cfg.zmq_hashtx,
                      g_cfg.zmq_rawblock, g_cfg.zmq_rawtx);
+    rpc_node_set_zmq_hwm(g_cfg.zmq_hwm);
+    rpc_node_set_zmq_sequence(g_cfg.zmq_sequence);
     /* getblockfilter reads spent-prevout scripts from undo_<h>.dat */
     { extern long undo_replay(long, int (*)(void*, const unsigned char*, unsigned int,
                                             unsigned long long, unsigned int, unsigned char,
@@ -9590,6 +10405,66 @@ static int i2p_inbound_start(void){
     return g_i2p_pipe[0];
 }
 
+/* ---- inbound connection rate, per source address --------------------------
+ * 2026-09-14. One LAN host opened ~3,780 connections in 23 minutes -- about
+ * nine a second, sustained -- and this node forked a child for every one of
+ * them. Nothing throttled it. The chain stayed healthy and the children exited
+ * promptly, so it was churn rather than a leak, but load went from 3.9 to 6.4
+ * and the box was forking at ~160/s.
+ *
+ * THIS IS NOT A CORE DIVERGENCE ABOUT THE PROTOCOL. Core does not rate-limit
+ * inbound connections per address either -- it does not need to, because it
+ * serves peers with threads. This node forks a process per connection, so the
+ * same flood costs it far more than it costs Core. The limit protects an
+ * implementation difference, not a policy one, which is why it is deliberately
+ * generous: an honest peer opens ONE connection and reconnects rarely.
+ *
+ * A token bucket per address: INRATE_BURST connections, refilled at
+ * INRATE_PER_SEC. The table is small and fixed -- an attacker with many source
+ * addresses is a different problem (that is what maxconnections and eviction
+ * are for), and an unbounded table would itself be the memory exhaustion this
+ * is meant to prevent. Eviction is least-recently-seen.
+ *
+ * noban peers are exempt: Core's -whitelist promise is that such a peer is not
+ * disconnected for misbehaviour, and refusing its connection would break it.
+ */
+#define INRATE_SLOTS    64
+#define INRATE_BURST    12          /* connections available immediately */
+#define INRATE_PER_SEC   1          /* sustained rate once the burst is spent */
+static struct { char ip[64]; double tokens; time_t seen, last_log; } g_inrate[INRATE_SLOTS];
+
+/* 1 = allow, 0 = refuse. `logged` is set when the caller should print (once
+ * per address per 10s, so a flood does not become a log flood of its own). */
+static int inbound_rate_ok(const char* ip, int* logged)
+{
+    if (logged) *logged = 0;
+    if (!ip || !*ip) return 1;
+    if (netperm_for(ip) & NP_NOBAN) return 1;          /* whitelisted: never refused */
+
+    time_t now = time(NULL);
+    int slot = -1, oldest = 0;
+    for (int i = 0; i < INRATE_SLOTS; i++){
+        if (!strcmp(g_inrate[i].ip, ip)){ slot = i; break; }
+        if (g_inrate[i].seen < g_inrate[oldest].seen) oldest = i;
+    }
+    if (slot < 0){                                      /* first sight, or evicted */
+        slot = oldest;
+        snprintf(g_inrate[slot].ip, sizeof g_inrate[slot].ip, "%s", ip);
+        g_inrate[slot].tokens = INRATE_BURST;
+        g_inrate[slot].last_log = 0;
+    } else {
+        double dt = (double)(now - g_inrate[slot].seen);
+        if (dt > 0){
+            g_inrate[slot].tokens += dt * INRATE_PER_SEC;
+            if (g_inrate[slot].tokens > INRATE_BURST) g_inrate[slot].tokens = INRATE_BURST;
+        }
+    }
+    g_inrate[slot].seen = now;
+    if (g_inrate[slot].tokens >= 1.0){ g_inrate[slot].tokens -= 1.0; return 1; }
+    if (now - g_inrate[slot].last_log >= 10){ g_inrate[slot].last_log = now; if (logged) *logged = 1; }
+    return 0;
+}
+
 static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int out_port, int l, int l6, int lo, int li2p){
     /* Prefer the persisted ADDRESS BOOK over whatever pool the caller passed.
      *
@@ -9620,7 +10495,11 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
         int fd=outbound_connect(peers[i], 300, out_port);
         if(fd<0){ fprintf(stderr,"[mux] outbound %s failed: %s\n", peers[i], dial_fail_reason()); continue; }
         strncpy(mux_out_host[mux_n_out], peers[i], 127);
-        mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd); mux_out_kind[mux_n_out] = host_is_block_only(peers[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
+        /* 2026-09-17: this was the one install path that did not call
+         * leg_note_installed, so serve_mux's boot legs had mux_out_since == 0
+         * -- every departure they ever logged said "after -1s", and their
+         * sync-fail streak and ping clock were whatever the slot held before. */
+        mux_out_fd[mux_n_out]=fd; txrelay_leg_reset(fd); leg_note_installed(mux_n_out); mux_out_kind[mux_n_out] = host_is_block_only(peers[i]) ? LEG_BLOCK_ONLY : LEG_FULL;   /* CC-4 */ mux_out_cmpct[mux_n_out] = 0;
         mux_out_wants_v2[mux_n_out]=(unsigned char)g_peer_wants_addrv2;
         mux_out_peer[mux_n_out]=i;
         anchor_locator(mux_out_loc[mux_n_out]);
@@ -9669,6 +10548,10 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             int st = (int)g_dl_worker_status;
             if (WIFSIGNALED(st)) fprintf(stderr,"[serve] FATAL: download worker pid %d died on signal %d -- exiting so systemd restarts the unit\n", (int)g_dl_worker_pid, WTERMSIG(st));
             else fprintf(stderr,"[serve] FATAL: download worker pid %d exited with status %d -- exiting so systemd restarts the unit\n", (int)g_dl_worker_pid, WEXITSTATUS(st));
+            /* the restart must find the datadir free: the worker's orphans
+             * and the serve children still hold the lock */
+            { extern int mp_quiesce(long) __attribute__((weak)); if (mp_quiesce) mp_quiesce(5000); }
+            parent_stop_and_wait(60);
             _exit(1);
         }
         if(g_shutdown_requested){
@@ -9683,6 +10566,15 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                 if(w >= 0) fprintf(stderr,"[mempool] saved %ld transaction(s) to mempool.dat\n", w);
                 else       fprintf(stderr,"[mempool] could not save mempool.dat\n");
             }
+            /* This process's RPC and Esplora threads take the mempool lock;
+             * the _exit below kills them wherever they are, so none may be
+             * inside it then (mempool_cfg.c, 2026-09-19). From here on they
+             * park at the lock instead of entering. Bounded: a thread still
+             * inside after 5 s is named by count and left to EOWNERDEAD, the
+             * recovery path that exists for exactly this. */
+            { extern int mp_quiesce(long) __attribute__((weak));
+              int in = mp_quiesce ? mp_quiesce(5000) : 0;
+              if(in > 0) fprintf(stderr,"[serve] WARNING: %d thread(s) still inside the mempool lock after 5s -- exiting anyway (the next locker recovers it)\n", in); }
             if(g_dl_worker_pid>0){
                 kill(g_dl_worker_pid, SIGTERM);
                 fprintf(stderr,"[serve] forwarded SIGTERM to download worker pid %d\n", (int)g_dl_worker_pid);
@@ -9690,9 +10582,13 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
             /* run BEFORE the credential and pidfile go, so a hook that
              * wants to read either still can */
             if(g_cfg.shutdownnotify[0]) notify_run(g_cfg.shutdownnotify, "", "shutdownnotify");
-            /* a dead node must not leave a usable credential on disk, nor a
-             * pidfile pointing at a pid that is about to be reused */
+            /* a dead node must not leave a usable credential on disk */
             rpc_cookie_remove();
+            /* The main pid's exit must MEAN the datadir is free (see
+             * shutdown_wait_lock_released): wait for the worker and every
+             * other process sharing the lock. */
+            parent_stop_and_wait(SHUTDOWN_LOCK_WAIT_S);
+            /* ...nor a pidfile pointing at a pid that is about to be reused */
             if(g_cfg.pidfile[0]) unlink(g_cfg.pidfile);
             _exit(0);
         }
@@ -9776,6 +10672,16 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                     if(ctl_is_banned(bip)){
                         fprintf(stderr,"[serve] refused inbound from banned %s\n", peerdesc);
                         close(c); c = -1;
+                    }
+                    /* BEFORE THE FORK. Refusing after it would have paid the
+                     * cost the limit exists to avoid. */
+                    else { int say = 0;
+                        if(!inbound_rate_ok(bip, &say)){
+                            if(say) fprintf(stderr,"[serve] inbound rate limit: refusing %s "
+                                            "(more than %d connections, then %d/s; noban peers exempt)\n",
+                                            peerdesc, INRATE_BURST, INRATE_PER_SEC);
+                            close(c); c = -1;
+                        }
                     }
                 }
             } else {
@@ -9871,6 +10777,10 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
                      * inbound peers waited for all N (systemd: up to 900 s). */
                     signal(SIGTERM, SIG_DFL);
                     signal(SIGINT,  SIG_DFL);
+                    /* the mempool lock's per-process gate: a parent RPC thread
+                     * inside it at the fork left a count no thread here owns */
+                    { extern void mp_fork_child_reset(void) __attribute__((weak));
+                      if (mp_fork_child_reset) mp_fork_child_reset(); }
                     /* This child serves exactly one peer, so the permissions
                      * its listener granted are simply this process's. No
                      * shared table, no fd keying, nothing to clean up when the
@@ -9978,7 +10888,9 @@ static int serve_mux(int port, const char* peers[], int nwant, int pool_len, int
              * close and re-dial a rotated seed (D2 fix) instead of syncing on a
              * broken socket forever. */
             if(ev & (POLLHUP|POLLERR|POLLNVAL)){
-                fprintf(stderr,"[mux:%d] %s dropped (revents 0x%x); re-dialing\n", i, mux_out_host[i], ev);
+                char how[40]; snprintf(how, sizeof how, "revents 0x%x", (unsigned)ev);
+                char unread[200]; leg_drain_unread(mux_out_fd[i], unread, sizeof unread);
+                leg_close_theirs(i, how, unread);
                 mux_next_peer(i, peers, pool_len, out_port);
                 mux_out_nextretry[i]=now_ms+REDIAL_BACKOFF_MS;
                 poll_idx++;
@@ -10083,16 +10995,56 @@ static int datadir_lock_acquire(const char* effdir){
         fprintf(stderr,"[boot] FATAL: cannot open %s/.lock: %s\n", effdir, strerror(errno));
         return 0;
     }
-    if(flock(datadir_lock_fd, LOCK_EX|LOCK_NB) != 0){
-        if(errno == EWOULDBLOCK)
-            fprintf(stderr,"[boot] FATAL: cannot obtain a lock on data directory %s. "
-                           "bmcbitcoind is probably already running.\n", effdir);
-        else
-            fprintf(stderr,"[boot] FATAL: cannot lock %s/.lock: %s\n", effdir, strerror(errno));
+    if(flock(datadir_lock_fd, LOCK_EX|LOCK_NB) == 0) return 1;
+    if(errno != EWOULDBLOCK){
+        fprintf(stderr,"[boot] FATAL: cannot lock %s/.lock: %s\n", effdir, strerror(errno));
         close(datadir_lock_fd); datadir_lock_fd = -1;
         return 0;
     }
-    return 1;
+    /* 2026-09-19: held. Refuse at once, as Core does, when another instance
+     * is RUNNING. Wait, bounded, in the two cases where the holder is on its
+     * way out:
+     *   - the previous instance is finishing its stop: its parent now stays
+     *     until the lock is free and says so in .stopping (its pid). A
+     *     relaunch that does not wait for that pid lands here.
+     *   - no process we can see holds it. Three production restarts
+     *     (2026-09-15 10:10:06 and 15:25:38, 2026-09-18 21:16:19) failed here
+     *     ~50 ms after systemd had reported the whole old unit gone -- its
+     *     control-group stop waits for every process, and flock is released
+     *     before a process leaves its cgroup, so which process held it then
+     *     is NOT established. Retrying for a few seconds costs nothing when
+     *     the holder is truly gone, and the holder list below is logged
+     *     either way so the next occurrence names it. */
+    lock_holder_t h[LOCK_HOLDERS_MAX]; char desc[2048];
+    int n = lock_holders_scan(datadir_lock_fd, 0, h, LOCK_HOLDERS_MAX);
+    lock_holders_fmt(h, n, desc, sizeof desc);
+    int stopper = 0; char own_comm[20], their_comm[20];
+    { FILE* f = fopen(STOPPING_MARKER, "r");
+      if (f){ if (fscanf(f, "%d", &stopper) != 1) stopper = 0; fclose(f); }
+      proc_comm((int)getpid(), own_comm, sizeof own_comm);
+      if (stopper > 0){ proc_comm(stopper, their_comm, sizeof their_comm);
+                        if (kill(stopper, 0) != 0 || strcmp(own_comm, their_comm) != 0) stopper = 0; } }
+    int wait_s = stopper > 0 ? 120 : n == 0 ? 5 : 0;
+    if (wait_s > 0){
+        if (stopper > 0) fprintf(stderr,"[boot] data directory %s is locked by the previous instance (pid %d), which is stopping; "
+                                        "waiting up to %ds (holders: %s)\n", effdir, stopper, wait_s, n ? desc : "none visible");
+        else fprintf(stderr,"[boot] data directory %s is locked but no process visible to us holds it; retrying for %ds\n", effdir, wait_s);
+        long long t0 = mono_now_ms();
+        while (mono_now_ms() - t0 < (long long)wait_s * 1000){
+            usleep(50000);
+            if (flock(datadir_lock_fd, LOCK_EX|LOCK_NB) == 0){
+                fprintf(stderr,"[boot] data directory lock obtained after %.2fs\n", (mono_now_ms() - t0) / 1000.0);
+                return 1;
+            }
+        }
+        n = lock_holders_scan(datadir_lock_fd, 0, h, LOCK_HOLDERS_MAX);
+        lock_holders_fmt(h, n, desc, sizeof desc);
+    }
+    fprintf(stderr,"[boot] FATAL: cannot obtain a lock on data directory %s. "
+                   "bmcbitcoind is probably already running.\n", effdir);
+    fprintf(stderr,"[boot]        held by: %s\n", n ? desc : "no process visible to this user");
+    close(datadir_lock_fd); datadir_lock_fd = -1;
+    return 0;
 }
 
 int main(int argc, char** argv){
@@ -10204,6 +11156,10 @@ int main(int argc, char** argv){
       if(g_cfg.debuglogfile[0])
           snprintf(g_logpath, sizeof g_logpath, "%s",
                    !strcmp(g_cfg.debuglogfile, "0") ? "/dev/null" : g_cfg.debuglogfile);
+      /* getrpcinfo reports this path; rpc_commands.o has no way to know it
+       * (and links into targets with no daemon), so push it across here --
+       * the same seam as wallet_pass_set_file() below. */
+      rpc_set_logpath(g_logpath);
       node_config_log();
       /* Join the config to the passphrase module HERE. Neither side may
        * reference the other: node_config.o is linked into targets with no
@@ -10419,6 +11375,11 @@ int main(int argc, char** argv){
      * copy-on-write, which also stops each peer mapping its own copy.
      * Non-fatal: on failure the serve path drops inbound tx rather than
      * accepting unvalidated ones, exactly as before. */
+    /* inbound serve children hand received transactions to the worker,
+     * which validates them against the live set (daemon/tx_handoff.c); the
+     * ring must exist before either fork so every process maps the same one */
+    { extern int txho_create(void);
+      if(!txho_create()) fprintf(stderr, "[boot] tx handoff ring unavailable -- inbound peers' transactions are validated against the boot snapshot\n"); }
     { extern int serve_txdv_preinit(void);
       phase_timer_t txdv_pt; phase_start(&txdv_pt);
       int ok = serve_txdv_preinit();
@@ -10480,6 +11441,19 @@ int main(int argc, char** argv){
       if(tr < 0) fprintf(stderr,"[boot] WARNING: could not trim the derived files past the tip: %s\n", strerror(errno)); }
     { extern void par_set(int); par_set(g_cfg.par); }   /* -par: script-verification threads (Core semantics) */
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
+    /* Before ANY append can happen, in the parent -- so the serve loop's
+     * tip appends and the boot catch-up are covered as well as the download.
+     * Children inherit it across fork. */
+    ibd_pipeline_set_frontier(archive_store_frontier);
+    /* NOT archive_store_frontier(store_buf) here. That was tried on 2026-09-17
+     * and it CORRUPTED A BLOCK: the guard advances cur_file_no but leaves
+     * cur_file_pos alone, which is harmless for store_append_shared (it lseeks
+     * to the true end of the file) and WRONG for store_append, which trusts
+     * cur_file_pos. The genesis seed uses store_append, so it wrote 293 bytes
+     * at offset 0 of the newest blk file, over the start of the block already
+     * living there (height 967422 on run 26). The frontier belongs INSIDE
+     * store_append_shared, where the position is re-derived -- see
+     * bitcoin_store.asm's .frontier. */
     /* A fresh non-main datadir self-seeds its own genesis at index 0 (the
      * mainnet archive got genesis by a one-time injection, 5f36dee -- a
      * regtest dir is created empty every time, so the daemon must do it).
@@ -10567,7 +11541,7 @@ int main(int argc, char** argv){
          * live synchronization loop over the verified asm IB D core. */
         store_reload(store_buf);            /* continue from persisted tip */
         int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));
-        node_log_str(lfd, 0, "node start (follow mode)", 23);
+        node_log_str(lfd, 0, "node start (follow mode)", (int)strlen("node start (follow mode)"));
         int ls=socket(AF_INET,SOCK_STREAM,0);
         struct sockaddr_in a; memset(&a,0,sizeof a); a.sin_family=AF_INET; a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
         bind(ls,(struct sockaddr*)&a,sizeof a); socklen_t al=sizeof a; getsockname(ls,(struct sockaddr*)&a,&al);
@@ -10630,7 +11604,7 @@ int main(int argc, char** argv){
         long ok=node_sync(fd, store_buf, gen, bigbuf, sizeof bigbuf, &cnt);
         close(fd); waitpid(pid,0,0); close(ls);
         int tip=*(int*)(store_buf+24);
-        printf("[server-test] synced ok=%ld blocks=%ld tip=%d\n", ok, cnt, tip);
+        printf("[server_test] synced ok=%ld blocks=%ld tip=%d\n", ok, cnt, tip);
         if(ok!=1||tip<6){ printf("TESTS FAILED (no chain)\n"); return 1; }
         /* the chain lives in-memory only (not yet on disk), so build the O(1)
          * hash->height index directly from store_buf rather than from disk */
@@ -10665,7 +11639,7 @@ int main(int argc, char** argv){
             p2p_write(cfd,"inv",3,invm,37);
             p2p_write(cfd,"ping",4,"\x11\x22\x33\x44\x55\x66\x77\x88",8);
             if(p2p_read(cfd,cmd,pl,sizeof pl,&plen)<=0 || strncmp(cmd,"pong",4)!=0){ printf("FAIL ping->pong\n"); exit(2); }
-            printf("[server-test] getdata-exact=%d getheaders-n=%d (%d blocked)\n", ok0, okh, (int)hp_len);
+            printf("[server_test] getdata-exact=%d getheaders-n=%d (%d blocked)\n", ok0, okh, (int)hp_len);
             exit((ok0&&okh)?0:2);
         }else{
             int lfd=(mkdir("logs", 0755), node_log_open(g_logpath));
@@ -10788,8 +11762,12 @@ int main(int argc, char** argv){
             fprintf(stderr,"[boot] checklevel=0 -- skipping archive verification\n");
         }
         /* shared-append flock fd: open append.lock once so any concurrent-safe
-         * store_append_shared writes (and the boot catch-up) serialize. */
-        int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
+         * store_append_shared writes (and the boot catch-up) serialize.
+         * O_CLOEXEC: forked writers inherit it as before, but an exec'd
+         * helper (the index builders) has no use for it, and holding a
+         * reference would keep a flock taken by a writer that then died
+         * mid-append alive for as long as the helper runs. */
+        int apfd=open("append.lock", O_RDWR|O_CREAT|O_CLOEXEC, 0644);
         if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;
         /* LISTENER FIRST: bind+listen the inbound socket before the (possibly
          * long) catch-up so the node is live to inbound peers immediately.
@@ -10947,6 +11925,7 @@ int main(int argc, char** argv){
              * worker's start under the pending SIGTERM left utxo.idx empty
              * (a full UTXO rebuild followed). A stop is a stop. */
             fprintf(stderr,"[boot] shutdown requested during the catch-up -- exiting before the worker starts\n");
+            parent_stop_and_wait(60);
             _exit(0);
         }
         if(caught>0){
@@ -10959,7 +11938,10 @@ int main(int argc, char** argv){
         fprintf(stderr,"[boot] hash index build done (%.2fs)\n", phase_elapsed(&hidx_pt));
 
         int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));   /* all-asm leveled logger */
-        node_log_str(lfd, 0, "node start (serve mode / download worker)", 42);
+        /* strlen, not a hand count: this passed 42 for 41 characters and wrote the
+         * terminating NUL into debug.log, which makes grep treat the whole log as
+         * binary (2026-09-19). scripts/log_literal_len_check.py guards the rest. */
+        node_log_str(lfd, 0, "node start (serve mode / download worker)", (int)strlen("node start (serve mode / download worker)"));
         /* Serve-as-full-node (option 2): SERVICE our client calls instantly
          * (fork-based inbound serving in the parent) AND continuously download
          * the chain to tip (a dedicated forked DOWNLOAD-WORKER child; see
@@ -10987,6 +11969,9 @@ int main(int argc, char** argv){
                              MAP_SHARED|MAP_ANONYMOUS, -1, 0);
         if (g_node_status == MAP_FAILED){ g_node_status = NULL; }
         else { g_node_status->n_out = 0; g_node_status->n_inbound = 0;
+               /* the boot catch-up's wire bytes, counted before this table
+                * existed (dl_wire_note): getnettotals covers them too */
+               if (g_dl_wire_boot){ g_node_status->dl_wire_sent = g_dl_wire_boot[0]; g_node_status->dl_wire_recv = g_dl_wire_boot[1]; }
                /* 3.1: seed the connected tip from the persisted applied height
                 * so the RPCs and the serve children cap by it from the first
                 * request, before the worker has loaded the set and started
@@ -11035,6 +12020,8 @@ int main(int argc, char** argv){
 
         pid_t dl = fork();
         if(dl==0){
+            { extern void mp_fork_child_reset(void) __attribute__((weak));
+              if (mp_fork_child_reset) mp_fork_child_reset(); }
             if(g_txoq_parent >= 0){ close(g_txoq_parent); g_txoq_parent = -1; }
             /* TXOQ-1 (2026-09-05 benchmark): register the between-block
              * service hook before the worker's first utxo_live_catchup, so a
@@ -11079,11 +12066,11 @@ int main(int argc, char** argv){
         if(nwant<1) nwant=1;
         if(nwant>1) nwant=1;   /* one loopback peer */
         store_reload(store_buf);
-        int apfd=open("append.lock", O_RDWR|O_CREAT, 0644);
+        int apfd=open("append.lock", O_RDWR|O_CREAT|O_CLOEXEC, 0644);
         if(apfd>=0) *(int*)((char*)store_buf+40)=apfd;
         build_hash_index();
         int lfd = (mkdir("logs", 0755), node_log_open(g_logpath));
-        node_log_str(lfd, 0, "serve-test outbound mux", 22);
+        node_log_str(lfd, 0, "serve-test outbound mux", (int)strlen("serve-test outbound mux"));
         int l = lsock(port);
         wb_listen_open();
         if(l<0){ fprintf(stderr,"lsock failed: %s\n", strerror(errno)); return 1; }

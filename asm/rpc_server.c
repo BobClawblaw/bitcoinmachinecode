@@ -10,6 +10,7 @@ static volatile int g_rest_on = 0;
 #include "crypto_hkdf.h"   /* hmac_sha256, shared with BIP324 */
 #include "rpc_net.h"
 #include "rpc_json.h"
+#include "rpc_chain.h"      /* rpc_chain_method_lane: which chain methods need no execution lock */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -552,6 +553,12 @@ static int wl_forbidden(const char* user, const char* body, size_t blen){
  * top-level -32700; only a top level that is neither object nor array gets
  * that one.
  */
+/* method classes: see rpc_method_class below */
+enum { RPC_CLASS_FAST = 1, RPC_CLASS_NOLOCK = 2, RPC_CLASS_SHARED = 3, RPC_CLASS_EXCL = 4 };
+static void exec_lock(void);
+static void exec_rlock(void);
+static void exec_unlock(void);
+static int  rpc_method_class(const char* m);
 static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
     *status = HTTP_OK;
     *is_notification = 0;
@@ -578,7 +585,12 @@ static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
             *status = HTTP_BAD_REQUEST; /* -32600 -> 400 */
         } else {
             rj_val* result = NULL; long dec = 0; const char* dem = NULL;
+            /* the lock this METHOD needs, held for its dispatch only -- a
+             * batch takes it per entry (see rpc_method_class) */
+            int cls = rpc_method_class(method);
+            if (cls == RPC_CLASS_EXCL) exec_lock(); else if (cls == RPC_CLASS_SHARED) exec_rlock();
             int ok = rpc_dispatch(method, params, g_wallet, &result, &dec, &dem);
+            if (cls == RPC_CLASS_EXCL || cls == RPC_CLASS_SHARED) exec_unlock();
             /* A V2 NOTIFICATION (no id) gets no response whatever the
              * method did. This flag used to be set only on the success
              * path, so a notification whose method FAILED was answered
@@ -608,7 +620,25 @@ static rj_val* exec_one(rj_val* req, int* status, int* is_notification) {
     return reply;
 }
 
-static void handle_request(int cfd, const char* body, size_t blen) {
+/* Build the complete HTTP response for one request into a malloc'd buffer
+ * (headers AND body, one allocation) and hand it back; the CALLER writes it.
+ *
+ * It used to take the client fd and write the reply itself -- while holding
+ * g_exec_lock, because both call sites wrap it in that lock. Execution is
+ * deliberately serial here (the wallet and chain handlers are not
+ * concurrent-safe), so every byte of that socket write was time no other RPC
+ * could run. A reply is routinely megabytes (getblock verbosity 2,
+ * getaddresstxids at its cap is ~6.6 MB), and a client that simply stops
+ * reading applies TCP backpressure until the 30 s SO_SNDTIMEO fires -- so one
+ * slow or malicious authenticated client could hold the single execution lock
+ * for 30 seconds at a time and stall every other caller, including the
+ * monitoring that would have shown it.
+ *
+ * Rendering needs the lock; writing to a socket does not. Separating them
+ * takes network I/O out of the critical section entirely, and the serial
+ * execution contract is untouched. */
+static char* render_request(const char* body, size_t blen, size_t* outlen) {
+    *outlen = 0;
     rj_val* req = rj_parse(body, blen);
     int status = HTTP_OK;
     int is_v2_notification = 0;
@@ -709,26 +739,29 @@ static void handle_request(int cfd, const char* body, size_t blen) {
         "Connection: close\r\n"
         "\r\n",
         status, status_text(status), bodylen);
-    if (write_all(cfd, hdr, (size_t)hl) != 0) {
-        /* RPC-1 (audit 2026-09-03): this used to `return` -- leaking BOTH the
-         * client descriptor and respbody, which for getblock verbosity 2 is
-         * many megabytes. Every other exit in this function frees and closes.
-         *
-         * Reachable by any authenticated client: send a request and reset the
-         * connection, or simply never read a large reply so the 30s
-         * SO_SNDTIMEO fires. Loop that and the process runs out of
-         * descriptors -- at which point the RPC listener AND the P2P inbound
-         * listener in the same process both stop accepting. */
-        free(respbody);
-        close(cfd);
-        return;
-    }
-    for (long off = 0; respbody && off < bodylen; ) {   /* full write, handles short writes */
-        ssize_t wr = write(cfd, respbody + off, (size_t)(bodylen - off));
-        if (wr <= 0) break;
-        off += wr;
-    }
+    /* One buffer, headers then body: the caller writes it after releasing the
+     * execution lock. (A 204 has no body at all -- respbody is NULL and
+     * bodylen 0 -- so the response ends at the header terminator, which
+     * test_rpc_server asserts.) */
+    char* out = malloc((size_t)hl + (size_t)bodylen + 1);
+    if (!out){ free(respbody); return NULL; }
+    memcpy(out, hdr, (size_t)hl);
+    if (respbody && bodylen > 0) memcpy(out + hl, respbody, (size_t)bodylen);
     free(respbody);
+    *outlen = (size_t)hl + (size_t)(bodylen > 0 ? bodylen : 0);
+    out[*outlen] = 0;
+    return out;
+}
+
+/* Write a rendered response and close. Called with NO lock held, so a slow
+ * reader costs only its own connection. */
+static void send_response(int cfd, char* resp, size_t len) {
+    for (size_t off = 0; resp && off < len; ) {
+        ssize_t wr = write(cfd, resp + off, len - off);
+        if (wr <= 0) break;                 /* client gone or timed out: drop it */
+        off += (size_t)wr;
+    }
+    free(resp);
     close(cfd);
 }
 
@@ -761,14 +794,106 @@ static void handle_request(int cfd, const char* body, size_t blen) {
  * substantial mempool change -- divergence, documented here) re-enters the
  * SERIAL execution path by taking the same mutex the accept loop holds
  * around every handler. Handlers therefore never run concurrently. */
-static pthread_mutex_t g_exec_lock = PTHREAD_MUTEX_INITIALIZER;
+/* 2026-09-17: a READER/WRITER lock, not a mutex.
+ *
+ * Execution stayed serial because the wallet and chain handlers are not
+ * concurrent-safe -- they share a store handle, one block buffer, and per-query
+ * caches. That is still true, and every one of those handlers still takes the
+ * WRITE side, so nothing about them changes.
+ *
+ * But a handful of the most-polled methods share none of it, and the exec lock
+ * was never what protected them:
+ *   - getpeerinfo / getconnectioncount / getnetworkinfo read the shared peer
+ *     tables and g_node_status, which the download worker writes WITHOUT this
+ *     lock (dl_publish_peer_table) -- so the lock never guarded them against
+ *     their writer; it only serialised them against unrelated RPCs.
+ *   - getmempoolinfo is guarded by the MEMPOOL's own lock (mp_lock/mp_unlock),
+ *     which it takes itself.
+ * None of the four holds static scratch. They now take the read side and run
+ * concurrently with each other.
+ *
+ * Writer-preferring on purpose: with glibc's default a steady stream of these
+ * polls would starve submitblock behind them.
+ *
+ * 2026-09-19: three of the four (the peer-table readers) and six chain methods
+ * now take NO side of this lock, and the lock is taken per METHOD inside
+ * exec_one rather than around a whole request -- see rpc_method_class. */
+static pthread_rwlock_t g_exec_lock;
+static void exec_lock_init(void){
+    pthread_rwlockattr_t a;
+    pthread_rwlockattr_init(&a);
+#ifdef PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP
+    pthread_rwlockattr_setkind_np(&a, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
+#endif
+    pthread_rwlock_init(&g_exec_lock, &a);
+    pthread_rwlockattr_destroy(&a);
+}
+/* ---- how each METHOD executes (2026-09-19) ----------------------------------
+ * Four classes, decided per method -- and so per batch ENTRY, not per request:
+ *
+ *   FAST    no execution lock, and bounded: run on the connection's own
+ *           intake thread. uptime, getblockcount, getbestblockhash,
+ *           getblockchaininfo, getdifficulty, getindexinfo (rpc_chain.c's fast
+ *           lane: a private store handle under its own mutex), and
+ *           getpeerinfo / getconnectioncount / getnetworkinfo (the shared peer
+ *           tables, which the download worker writes without this lock anyway).
+ *   NOLOCK  no execution lock, but possibly slow: getchaintxstats (its own
+ *           lane; the first build walks the chain once) and the waitfor*
+ *           family (a private handle per call; up to 30 s).
+ *   SHARED  the read side: getmempoolinfo (the mempool's own lock guards it).
+ *   EXCL    the write side: everything else -- the handlers that share
+ *           rpc_chain's g_st, block buffer and caches, the wallet, submitters.
+ *
+ * WHY. Until today every one of these took the write lock but the four
+ * SHARED ones, so one slow call stalled them all: on run 27 (IBD, 2026-09-19)
+ * uptime took 44 s and getblockcount/getindexinfo/getchaintxstats each more
+ * than 60 s, behind getindexinfo rescanning a 61 GB index tail and
+ * getchaintxstats re-walking 780k blocks per new tip -- and the writer-
+ * preferring rwlock parked even the SHARED readers behind the queued writers.
+ *
+ * A method goes on the FAST or NOLOCK list only when its handler has been
+ * made independent of what the write lock protects (see "lanes" in
+ * rpc_chain.c). Adding one without that is a data race, not a slow query. */
+static int rpc_method_class(const char* m){
+    int lane = rpc_chain_method_lane(m);
+    if (lane == 1) return RPC_CLASS_FAST;
+    if (lane == 2) return RPC_CLASS_NOLOCK;
+    if (!strcmp(m, "getpeerinfo") || !strcmp(m, "getconnectioncount") || !strcmp(m, "getnetworkinfo"))
+        return RPC_CLASS_FAST;
+    if (!strcmp(m, "getmempoolinfo")) return RPC_CLASS_SHARED;
+    return RPC_CLASS_EXCL;
+}
+/* Can this whole request run on the intake thread? Only when EVERY entry is
+ * FAST: a single object, or a non-empty batch of them. Anything else --
+ * including an unparseable body, which renders an error -- goes to the
+ * execution pool, so no intake thread ever waits on the execution lock. */
+static int rpc_body_is_fast(const char* body, size_t blen){
+    rj_val* req = rj_parse(body, blen);
+    if (!req) return 0;
+    int yes = 0;
+    if (req->typ == RJ_OBJ){
+        rj_val* m = rj_obj_get(req, "method");
+        yes = m && m->typ == RJ_STR && m->str && rpc_method_class(m->str) == RPC_CLASS_FAST;
+    } else if (req->typ == RJ_ARR && req->nitems > 0){
+        yes = 1;
+        for (size_t i = 0; i < req->nitems && yes; i++){
+            const rj_val* e = req->items[i];
+            rj_val* m = (e && e->typ == RJ_OBJ) ? rj_obj_get((rj_val*)e, "method") : NULL;
+            yes = m && m->typ == RJ_STR && m->str && rpc_method_class(m->str) == RPC_CLASS_FAST;
+        }
+    }
+    rj_free(req);
+    return yes;
+}
 /* 2026-09-08: callers waiting for the exec lock. The Esplora facade's mempool
  * refresher takes the lock once per transaction of a pass and, on an
  * unfair mutex, kept winning it back: JSON-RPC and the facade's own routes
  * stalled for tens of seconds under an 11,900-transaction mempool. The
  * refresher now defers while this is non-zero (rpc_exec_waiters). */
 static volatile int g_exec_waiters = 0;
-static void exec_lock(void){ __sync_fetch_and_add(&g_exec_waiters, 1); pthread_mutex_lock(&g_exec_lock); __sync_fetch_and_sub(&g_exec_waiters, 1); }
+static void exec_lock(void){ __sync_fetch_and_add(&g_exec_waiters, 1); pthread_rwlock_wrlock(&g_exec_lock); __sync_fetch_and_sub(&g_exec_waiters, 1); }
+static void exec_rlock(void){ __sync_fetch_and_add(&g_exec_waiters, 1); pthread_rwlock_rdlock(&g_exec_lock); __sync_fetch_and_sub(&g_exec_waiters, 1); }
+static void exec_unlock(void){ pthread_rwlock_unlock(&g_exec_lock); }
 int rpc_exec_waiters(void){ return g_exec_waiters; }
 #define LP_MAX_WAIT_S  60
 #define LP_POLL_MS     250
@@ -850,6 +975,16 @@ static int lp_is_gbt(const char* body, size_t blen){
     return yes;
 }
 int rpc_lp_is_gbt(const char* body, unsigned long blen){ return lp_is_gbt(body, (size_t)blen); }
+/* Exposed for test_rpc_server: the classification that decides which lock a
+ * method takes and where a request runs. Getting this wrong is a data race,
+ * not a slow query, so the policy is pinned rather than inferred from
+ * timings. */
+int rpc_method_lock_class(const char* m){ return rpc_method_class(m); }
+/* test_rpc_responsive: hold / release the execution lock's WRITE side from
+ * outside any handler -- the shape of a long write-locked handler. The same
+ * thread must release what it took (a pthread rwlock rule). */
+void rpc_exec_hold_for_test(int take){ if (take) exec_lock(); else exec_unlock(); }
+int rpc_body_fast(const char* body, unsigned long blen){ return rpc_body_is_fast(body, (size_t)blen); }
 
 typedef struct { int cfd; char* buf; size_t body_off, blen; unsigned char prev[32]; int have_prev; } lp_req_t;
 
@@ -863,9 +998,9 @@ static void* lp_waiter(void* arg){
             nanosleep(&ts, NULL);
         }
     }
-    exec_lock();
-    handle_request(r->cfd, r->buf + r->body_off, r->blen);
-    pthread_mutex_unlock(&g_exec_lock);
+    size_t lp_len = 0;   /* exec_one takes the method's lock for its dispatch */
+    char* lp_resp = render_request(r->buf + r->body_off, r->blen, &lp_len);
+    send_response(r->cfd, lp_resp, lp_len);        /* socket write, lock released */
     free(r->buf); free(r);
     lp_waiters_release();                          /* RPC-5 */
     return NULL;
@@ -893,6 +1028,43 @@ static int lp_extract_prev(const char* body, size_t blen, unsigned char out[32])
         out[31-b] = (unsigned char)((hi<<4)|lo);   /* display -> wire */
     }
     return 1;
+}
+
+/* ---- the execution pool (2026-09-19) ---------------------------------------
+ * Requests that need the execution lock, or may be slow, run here: -rpcthreads
+ * threads of their own, fed by a queue bounded by -rpcworkqueue (Core's 503
+ * past it). The intake threads read, authenticate and classify; they hand
+ * these over and go back to accepting, so FAST calls keep being answered
+ * however many slow ones are queued. Each job owns its request buffer and the
+ * client socket, and is rendered (exec_one takes each entry's lock) and
+ * written here. */
+typedef struct { int cfd; char* buf; size_t body_off, blen; } xjob_t;
+static xjob_t g_xq[RPC_QUEUE_CAP]; static int g_xq_head, g_xq_tail, g_xq_n;
+static pthread_mutex_t g_xq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_xq_cond = PTHREAD_COND_INITIALIZER;
+static pthread_t g_xworkers[256]; static int g_n_xworkers;
+static int xq_push(int cfd, char* buf, size_t body_off, size_t blen){
+    pthread_mutex_lock(&g_xq_lock);
+    if (!g_run || g_xq_n >= g_workqueue || g_xq_n >= RPC_QUEUE_CAP){ pthread_mutex_unlock(&g_xq_lock); return 0; }
+    g_xq[g_xq_tail] = (xjob_t){ cfd, buf, body_off, blen };
+    g_xq_tail = (g_xq_tail + 1) % RPC_QUEUE_CAP; g_xq_n++;
+    pthread_cond_signal(&g_xq_cond);
+    pthread_mutex_unlock(&g_xq_lock);
+    return 1;
+}
+static void* exec_thread(void* arg){
+    (void)arg;
+    for (;;){
+        pthread_mutex_lock(&g_xq_lock);
+        while (g_xq_n == 0 && g_run) pthread_cond_wait(&g_xq_cond, &g_xq_lock);
+        if (!g_run){ pthread_mutex_unlock(&g_xq_lock); return NULL; }   /* stop: queued jobs are closed by rpc_server_stop */
+        xjob_t j = g_xq[g_xq_head]; g_xq_head = (g_xq_head + 1) % RPC_QUEUE_CAP; g_xq_n--;
+        pthread_mutex_unlock(&g_xq_lock);
+        size_t resplen = 0;
+        char* resp = render_request(j.buf + j.body_off, j.blen, &resplen);
+        send_response(j.cfd, resp, resplen);     /* socket write, no lock held */
+        free(j.buf);
+    }
 }
 
 static void service_conn(int cfd) {
@@ -1032,10 +1204,22 @@ static void service_conn(int cfd) {
               lp_waiters_release();                  /* RPC-5: spawn failed */
           }
       } }
-    exec_lock();
-    handle_request(cfd, body, blen);
-    pthread_mutex_unlock(&g_exec_lock);
-    free(buf);
+    /* FAST requests are answered here, on the intake thread, without the
+     * execution lock. Everything else goes to the execution pool, so an
+     * intake thread never waits on that lock: before 2026-09-19 a handful of
+     * slow calls parked every -rpcthreads worker on it and the next uptime
+     * sat in the accept queue (run 27: 44 s). */
+    if (rpc_body_is_fast(body, blen)){
+        size_t resplen = 0;
+        char* resp = render_request(body, blen, &resplen);
+        send_response(cfd, resp, resplen);
+        free(buf);
+        return;
+    }
+    if (!xq_push(cfd, buf, (size_t)(body - buf), blen)){
+        const char* e = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 25\r\n\r\nWork queue depth exceeded";
+        (void)write_all(cfd, e, strlen(e)); close(cfd); free(buf);
+    }
 }
 
 /* ---- the Esplora facade listener (2026-09-08) ------------------------------
@@ -1097,7 +1281,7 @@ static void* esp_server_thread(void* arg){
     return 0;
 }
 static void esp_lock(void){ exec_lock(); }
-static void esp_unlock(void){ pthread_mutex_unlock(&g_exec_lock); }
+static void esp_unlock(void){ exec_unlock(); }
 /* Core's REST interface (rest=1, 2026-09-08): served by the JSON-RPC listener, dispatch-locked like the facade */
 void rpc_rest_enable(int on){ g_rest_on = on; rest_set_exec_lock(esp_lock, esp_unlock); }
 int rpc_esplora_start(const char* bind_addr, int port, char* errmsg, size_t errcap){
@@ -1193,6 +1377,7 @@ static void* worker_thread(void* arg){
 
 int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
                      char* errmsg, size_t errcap) {
+    exec_lock_init();   /* rwlock: writer-preferring, see g_exec_lock */
     g_user = cfg->user;
     g_pass = cfg->pass;
     g_wallet = cfg->wallet;
@@ -1301,14 +1486,20 @@ int rpc_server_start(const rpc_server_cfg* cfg, int* actual_port,
           if (g_req_deadline_s < g_timeout_s) g_req_deadline_s = g_timeout_s;
       } }
     g_q_head = g_q_tail = g_q_n = 0;
+    g_xq_head = g_xq_tail = g_xq_n = 0;
     g_run = 1;
-    g_n_workers = 0;
+    g_n_workers = 0; g_n_xworkers = 0;
     for (int i = 0; i < g_threads; i++)
         if (bmc_pthread_create(&g_workers[g_n_workers], worker_thread, NULL) == 0) g_n_workers++;
-    if (g_n_workers == 0 || bmc_pthread_create(&g_thread, server_thread, NULL) != 0) {
+    for (int i = 0; i < g_threads; i++)          /* the execution pool: -rpcthreads of its own */
+        if (bmc_pthread_create(&g_xworkers[g_n_xworkers], exec_thread, NULL) == 0) g_n_xworkers++;
+    if (g_n_workers == 0 || g_n_xworkers == 0 || bmc_pthread_create(&g_thread, server_thread, NULL) != 0) {
         if (errmsg && errcap) snprintf(errmsg, errcap, "pthread_create failed");
         g_run = 0; pthread_cond_broadcast(&g_q_cond);
+        pthread_mutex_lock(&g_xq_lock); pthread_cond_broadcast(&g_xq_cond); pthread_mutex_unlock(&g_xq_lock);
         for (int i = 0; i < g_n_workers; i++) pthread_join(g_workers[i], NULL);
+        for (int i = 0; i < g_n_xworkers; i++) pthread_join(g_xworkers[i], NULL);
+        g_n_workers = g_n_xworkers = 0;
         close(g_listen_fd); g_listen_fd = -1;
         return -1;
     }
@@ -1325,6 +1516,10 @@ void rpc_server_stop(void) {
     pthread_mutex_lock(&g_q_lock); pthread_cond_broadcast(&g_q_cond); pthread_mutex_unlock(&g_q_lock);
     for (int i = 0; i < g_n_workers; i++) pthread_join(g_workers[i], NULL);
     g_n_workers = 0;
+    pthread_mutex_lock(&g_xq_lock); pthread_cond_broadcast(&g_xq_cond); pthread_mutex_unlock(&g_xq_lock);
+    for (int i = 0; i < g_n_xworkers; i++) pthread_join(g_xworkers[i], NULL);
+    g_n_xworkers = 0;
     /* connections still queued are closed unanswered (Core does the same on shutdown) */
     while (g_q_n > 0){ close(g_q[g_q_head]); g_q_head = (g_q_head + 1) % RPC_QUEUE_CAP; g_q_n--; }
+    while (g_xq_n > 0){ close(g_xq[g_xq_head].cfd); free(g_xq[g_xq_head].buf); g_xq_head = (g_xq_head + 1) % RPC_QUEUE_CAP; g_xq_n--; }
 }

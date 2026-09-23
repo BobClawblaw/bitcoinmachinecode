@@ -8,7 +8,7 @@
  *      manual bf_header fold;
  *   2. torn-tail reconciliation: a partial idx record AND orphan data
  *      bytes are truncated away, and appends continue on the grid;
- *   3. lazy adoption: denied while the gap to the tip exceeds the undo
+ *   3. self-build from genesis when no index exists; adoption of a partial one (the old lazy-adoption denial is gone: undo is kept for every block, 2026-09-16)
  *      window, taken when it closes, gap filled through undo records
  *      (stubbed here), tail appended per block;
  *   4. reorg truncate drops records and the chain re-appends cleanly.
@@ -161,11 +161,19 @@ int main(void){
         ck("store_append", store_append(store_buf, bh[h], blk[h], blen[h]) == h);
     }
     store_rd_init(store_buf);
-    /* no files yet: on_block is a silent no-op */
+    /* 2026-09-16: no files yet -> the daemon CREATES the index and builds it
+     * from genesis at the choke point (archive + undo). The old contract --
+     * a silent no-op until an offline backfill came within the undo window --
+     * is gone: undo is kept for every block, so there is nothing to wait for. */
     bfi_on_block(store_buf, 5, blk[5], (unsigned long)blen[5]);
-    ck("no files -> stays inactive", !bfi_active());
-    /* builder produces 0..2, then the daemon adopts at tip 5 (gap 3 <= 144)
-     * and closes 3..4 from (stubbed) undo before appending 5 */
+    ck("no files -> the daemon creates the index and builds 0..5 itself", bfi_active() && bfi_count() == 6);
+    { static u8 ef[1<<16]; long efl = expected_filter(blk[3], blen[3], ef, sizeof ef);
+      ck("self-built record 3 content", efl > 0 && bfi_get(3, got, sizeof got, &gl, hdr0) == 1 && (long)gl == efl && !memcmp(got, ef, gl)); }
+    bfi_close();
+    { unlink("bfilters.idx"); unlink("bfilters.dat"); }
+    /* a PARTIAL index left behind (an earlier run, or the offline builder):
+     * 0..2 exist; the daemon adopts it at tip 5 and closes 3..4 from undo
+     * before appending 5 */
     ck("builder create", bfi_create() == 1);
     for (int h = 0; h < 3; h++){
         static u8 f[1<<16];

@@ -29,7 +29,7 @@ the release this node tracks. Two connected regtest nodes give a real
 
 ## The work
 
-### 1. `getpeerinfo` — **38 of 38, DONE 2026-09-12**
+### 1. `getpeerinfo` — **38 of 38, DONE 2026-09-12; three gaps closed 2026-09-18**
 
 Verified live against a production node: 38 fields, nothing missing, nothing
 additive. Every field is emitted only where a real source exists.
@@ -45,6 +45,28 @@ additive. Every field is emitted only where a real source exists.
 | activity timestamps | `last_block`, `last_transaction` — previously written only by `txann`, whose slot is set for INBOUND children alone, so on a nearly all-outbound node they never appeared at all |
 | per-message byte maps | `bytessent_per_msg` via the asm write hook, extended to carry the command name; `bytesrecv_per_msg` in the drain loops, where the command is already in hand |
 | removed for exactness | `startingheight` (v31.1 dropped it), `bmc_download_worker` (additive key in a Core call) |
+
+**Correction, 2026-09-18.** "38 of 38" was not true. Three gaps survived it,
+found by a live comparison against mainnet peers (0 of 11 entries carried
+`addrlocal` where Core showed 10 of 10) and then checked against v31.1's
+`rpc/net.cpp`:
+
+- `addrlocal` was never emitted: nothing parsed the version message's
+  `addr_recv`. It is now read in `rpc_peer_from_version` for legs, inbound
+  children and download workers, and formatted by `rpc_fmt_addr_v1` exactly as
+  Core's `CNetAddr::V1` read + `ToStringAddrPort` (IPv4-mapped, RFC 5952 IPv6
+  with the *first* longest zero run, and omitted wherever Core's `IsValid()`
+  is false). Core only fills `addr_recv` for a routable peer, so over loopback
+  neither node prints it.
+- `last_block` and `last_transaction` were omitted at 0. Core pushes both for
+  every peer. The gate's fixture test listed them as "conditional", which
+  excused the omission; it no longer does.
+- `bytessent_per_msg` / `bytesrecv_per_msg` were dropped when empty. Core
+  always pushes both objects.
+
+`validation/addrlocal_regtest_e2e.sh` proves the first two against a real
+v31.1: it sends one version message, with a chosen `addr_recv`, to Core and
+to this node and requires the same `addrlocal` from both.
 
 Two things the work itself turned up. The asm write hook was `(fd, plen)` and now
 carries `(fd, plen, cmd, cmdlen)`; the upload pacer ignores the extra arguments,
@@ -179,8 +201,8 @@ and the policy layer knows `-bytespersigop`, so:
 |---|---|
 | `vsize_bip141` | emitted always — `(weight + 3) / 4` |
 | `vsize_adjusted` | emitted always — adjusted weight over 4, rounded up |
-| `chunkweight` | emitted for a singleton cluster; omitted otherwise |
-| `fees.chunk` | emitted for a singleton cluster; omitted otherwise |
+| `chunkweight` | emitted for a singleton cluster; omitted otherwise (every entry since 2026-09-19, below) |
+| `fees.chunk` | emitted for a singleton cluster; omitted otherwise (every entry since 2026-09-19, below) |
 
 The comment in `rpc_node.c` calling these "absent, and deliberately" was stale:
 it was written before the registry carried `sigop_cost`, and the data had been
@@ -191,10 +213,180 @@ available for some time.
 transactions, so a sample of ordinary transactions shows the two as identical
 and would have hidden the rule entirely.
 
-### Open: an error-code divergence, found in passing
+### ~~Open~~ FIXED 2026-09-15: an error-code divergence, found in passing
 
-Core answers a null or absent txid with **-3** (`RPC_TYPE_ERROR`).
-`getmempoolcluster` now does. Three older sites in `rpc_node.c` return **-8**
-for the identical condition (`getmempoolentry` among them) and are wrong about
-it. Not changed here: a returned error code is caller-visible, so it belongs in
-its own change rather than riding along with a feature.
+The original note said "Core answers a null or absent txid with **-3**". Half
+right: measuring every JSON type against Core v31.1 showed **three** answers,
+not two, and *absent* is not one of the -3 cases.
+
+| condition | Core |
+|---|---|
+| missing required argument | `-1` + the method's full help text |
+| wrong JSON type | `-3` (`RPC_TYPE_ERROR`), `Wrong type passed: {"Position 1 (txid)": ...}` |
+| right type, bad value | `-8` (`RPC_INVALID_PARAMETER`) + a specific message |
+
+The three sites in `rpc_node.c` returned `-8` for the first two alike and named
+the passed type as "null" whatever was really sent. Fixed, with the formatter
+moved to `rpc_json.c` (`rj_wrong_type_msg`) so every emitter agrees. The `-1`
+text cannot be matched: this node carries no per-method usage text by decision,
+so it answers Core's code with a short usage line. Full account and the
+verification in `CORE_DIVERGENCES.md`.
+
+## 2026-09-18 — three v31.1 gaps the v31.99 oracle hid
+
+Diffing against the **v31.1 release node** (RPC 8337) instead of the v31.99
+development oracle turned up three things. Two of them had been "confirmed"
+off the dev build, which has since buried taproot and changed the mempool
+entry.
+
+### `getdeploymentinfo`: taproot, and `script_flags` below the tip — FIXED
+
+- v31.1 lists **taproot as a bip9 deployment** after the five buried ones
+  (`DeploymentInfo`'s order; on regtest after `testdummy`). It was missing,
+  and a test pinned the count at five. Now emitted from the real BIP9 state
+  machine (`GetStateFor`, `GetStateSinceHeightFor`, `GetStateStatisticsFor`)
+  walked over this node's headers, with v31.1's per-chain parameters: mainnet
+  1619222400 / 1628640000 / min_activation_height 709632 / 1815 of 2016;
+  ALWAYS_ACTIVE on testnet4, signet and regtest. `testdummy` goes through the
+  same code.
+- `script_flags` had three defects that only show with a `blockhash` below
+  the tip: it described the NEXT block (Core describes the block itself), it
+  held `WITNESS` back until segwit's height (Core sets it unconditionally), and
+  it ignored the two `script_flag_exceptions` (170060 is `[]`, 692261 has no
+  `TAPROOT`). The exception hashes and flag bits are now generated into
+  `script_flags_consts.h` by `validation/gen_script_flags.py`.
+- Verified: whole documents equal to v31.1 on **mainnet at 32 heights** —
+  every buried activation boundary, both exception blocks, and taproot's
+  DEFINED → STARTED (681408) → LOCKED_IN (687456) → ACTIVE (709632) path with
+  its statistics and signalling strings (a header-only archive of mainnet
+  0..712000 served through `rpc_chain.o`) — and on **regtest at 18 heights**
+  across testdummy's whole lifecycle, including a failed signalling period
+  (`validation/v311_rpc_gaps_regtest_diff.sh`).
+- The BIP9 parameters are **transcribed**, not generated: the generator reads
+  a master tree, where `DEPLOYMENT_TAPROOT` no longer exists. The mainnet walk
+  above is what checks them. A pruned node that no longer has taproot's
+  signalling headers omits the deployment rather than guessing its state.
+
+### `getmempoolentry` / `getrawmempool true` / ancestors-descendants verbose — FIXED
+
+| field | v31.1 | was | now |
+|---|---|---|---|
+| `bip125-replaceable` | present | missing | emitted: `IsRBFOptIn` — the tx signals (an input with nSequence ≤ 0xfffffffd) or an in-mempool ancestor does. Signalling, not full-RBF policy. |
+| `vsize_adjusted`, `vsize_bip141` | **absent** (all of `rpc/`) | emitted | removed, also from `testmempoolaccept` / `submitpackage` |
+| `vsize` | `GetTxSize()`: **sigops-adjusted** | plain BIP141 | adjusted — the number `vsize_adjusted` used to carry |
+| `ancestorsize`, `descendantsize` | sums of the adjusted size | BIP141 sums | adjusted sums |
+
+Item 5 above and the 2026-09-12 table listed `vsize_adjusted`/`vsize_bip141` as
+v31.1 fields to emit; that came off the dev build and was wrong. Verified
+against v31.1 on regtest: a signalling tx, a `replaceable=false` tx and a final
+child of a signalling parent, field for field (`unbroadcast` excepted — see
+below).
+
+### `getchainstates`: `coins_db_cache_bytes`, `coins_tip_cache_bytes` — DIVERGENCE, KEPT
+
+Both are real v31.1 fields: the configured LevelDB block cache for the coins
+DB (`min(total/2, 8 MiB)` of what `-dbcache` leaves after the index caches)
+and the `CCoinsViewCache` budget (the rest). This node has **no counterpart
+to either**. Its UTXO set is an LSM: reads go to run files through the OS page
+cache (there is no DB read cache), and the in-memory table is a *write buffer*
+of pending changes, not a coin cache, sized by mode — `-dbcache`-derived in
+bulk catch-up, a fixed 2^16 slots / 64 MB steady-state — in the download
+worker, which the RPC side cannot see. Emitting `dbcache` or the memtable size
+under these names would be an invented number with Core's label on it. The
+omission is now a declared one in the frozen fixture test
+(`declared_omission`) as well as in `CORE_DIVERGENCES.md`.
+
+### Found, not fixed
+
+- `unbroadcast` is a constant `false`. Core is `true` for a transaction its own
+  RPC submitted until a peer requests it; this node keeps no unbroadcast set.
+- `getmempoolinfo.bytes` is still the BIP141 vsize sum; v31.1 sums the adjusted
+  entry size. Equal except for sigop-heavy transactions. The comment there
+  keeps it independent of the policy registry on purpose, so it is left for a
+  decision rather than changed in passing.
+- `testmempoolaccept` (single-tx path) reports BIP141 `vsize`; v31.1 reports
+  the adjusted one. `submitpackage` / package `testmempoolaccept` already
+  report the adjusted size.
+
+## 2026-09-19 — `chunkweight` and `fees.chunk` on every entry — FIXED
+
+**Measured on production, 2026-09-18 21:27Z:** `getrawmempool true` had
+79,626 entries. All 71,710 in a multi-transaction cluster lacked both keys;
+the 7,916 singletons had them. v31.1 reports both on every entry
+(`rpc/mempool.cpp` `entryToJSON` → `CTxMemPool::GetMainChunkFeerate` →
+txgraph `m_main_chunk_feerate`): `chunkweight` is the **sigops-adjusted
+weight** of the chunk the transaction lands in, `fees.chunk` that chunk's
+summed **modified** fee in BTC.
+
+**Why they were missing: deliberately omitted on the bulk path.** Not a
+refresher that never got there, and not unpublished state. The per-entry
+builder already linearized a member's cluster (`mempool_cluster.c`: greedy +
+PostLinearize) for a single `getmempoolentry`, and a read on production showed
+those values matching v31.1. The bulk path skipped it (`else if (have_inf &&
+!g_mpe_inf)`) because a cluster build *per entry* would be quadratic, and the
+table above ("emitted for a singleton cluster; omitted otherwise") recorded the
+gap as intended.
+
+**Fix.** Bulk `getrawmempool true` now carries a per-call chunk cache parallel
+to its sorted txid cache. The first member of a cluster to be rendered builds
+it from the call's one-pass graph (`mpc_lookup_bulk`: no registry walk per
+member), linearizes and chunks it, and records the answer for **every**
+member; the rest read it. One build per cluster per call. The single-entry and
+ancestors/descendants-verbose paths share the same function (`mpe_chunk_of`).
+Both lookups now drop edges to transactions no longer in the pool, as
+`depends`/`spentby` already did. The keys are omitted only where no honest
+answer exists: a component beyond the 64-transaction bound, or an entry with
+no registry node.
+
+**Cost** (`tests/test_rpc_chunk_scale`, 32,000 entries shaped like
+production: 1,240 chains of 25 plus 1,000 singletons, best of 3; the whole
+call runs under the pool lock, so this is also how long the lock is held):
+
+| build | `getrawmempool true` | cluster builds | entries with the keys |
+|---|---|---|---|
+| main (keys omitted) | 256 ms | 0 | 1,000 |
+| per-member build (no cache) | 80,397 ms | 31,000 | 32,000 |
+| this fix | 293 ms (+14%) | 1,240 | 32,000 |
+
+The per-member row is the naive fix, measured to show what it would have
+cost: 80 seconds under the pool lock. The test asserts the count (builds ==
+multi-member clusters), not the time.
+
+**Linearization vs Core.** Core v31.1 linearizes with a spanning-forest
+search that reaches the optimum for clusters this size; this node uses
+ancestor-score greedy followed by Core's PostLinearize. They agree wherever
+greedy + PostLinearize is optimal, which PostLinearize guarantees when every
+member has at most one parent or at most one child (chains, fan-outs, CPFP),
+and which also holds for the diamond tested here. A cluster where they could
+differ needs members with several parents and several children, where the
+best chunk is not an ancestor set that greedy picks and PostLinearize's
+merges do not recover it. There bmc would report a valid chunking that is
+not Core's. No such case is in the tests: none was constructed, so how often
+it happens is unknown. No such cluster turned up on
+production (below). Two smaller known differences: a negative modified fee
+(from `prioritisetransaction`) is clamped to 0 inside a multi-member cluster,
+where Core keeps the sign; a singleton reports it signed, as Core does.
+
+**Verified:**
+- `tests/test_rpc_node`: singleton, CPFP, 3-chain, diamond, sigop-heavy
+  parent (adjusted weight 1600 → chunk 1928, where raw weight would say 656),
+  and an equal-feerate pair (no merge, Core's strict `>>`). Each runs on both
+  the per-txid and the bulk path, plus "every registry entry carries both
+  keys" and "one build per cluster". With the fix reverted, all 13 bulk
+  checks, the coverage check and the build-count check FAIL. The per-txid
+  checks pass against the old code too: that path was already correct, and
+  they stay as its regression guard. The build-count check also FAILS against
+  a build with the cache disabled (17 builds for 7 clusters).
+- `validation/chunk_fields_regtest_diff.sh`, v31.1 regtest against bmc
+  regtest, the same signed transactions submitted to both: singleton, CPFP,
+  3-chain, diamond, equal pair, 1→3 fan-out, and a 12-chain whose chunks
+  split and merge. **28 of 28** txs agree on both keys across Core bulk, Core
+  entry, bmc bulk and bmc entry. Against main's binary: 27 of 28 bulk entries
+  lack the keys and the script fails.
+- Production, read-only (bmc 8331 against the v31.1 oracle on 8337, 01:16Z):
+  of the 349 multi-member clusters present in both pools, 336 had the same
+  membership at query time (325 chains, 11 non-chain). `getmempoolcluster` was
+  chunk-for-chunk identical on all 336, and `getmempoolentry` chunk fields were
+  identical on all 5,815 members still present. A first pass without the
+  membership check reported 203 "diffs"; all came from one cluster whose last
+  transaction had been replaced on bmc and not yet on the oracle.

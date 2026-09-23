@@ -34,4 +34,20 @@
 #define SFC_T_HEIGHT_CSV    1
 #define SFC_T_HEIGHT_SEGWIT 1
 
+/* script_verify_flag_name bit positions, and CMainParams' two
+ * script_flag_exceptions: the flags Core REPLACES the unconditional
+ * P2SH|WITNESS|TAPROOT with for exactly these blocks (display-order hash).
+ * getdeploymentinfo's script_flags reports them for a block by hash. */
+#define SFC_BIT_P2SH      0
+#define SFC_BIT_DERSIG    2
+#define SFC_BIT_NULLDUMMY 4
+#define SFC_BIT_CLTV      9
+#define SFC_BIT_CSV       10
+#define SFC_BIT_WITNESS   11
+#define SFC_BIT_TAPROOT   17
+#define SFC_EXC_BIP16_HASH_HEX "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22"
+#define SFC_EXC_BIP16_FLAGS 0
+#define SFC_EXC_TAPROOT_HASH_HEX "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad"
+#define SFC_EXC_TAPROOT_FLAGS 2049
+
 #endif

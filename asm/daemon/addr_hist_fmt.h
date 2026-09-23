@@ -71,6 +71,7 @@ static inline int ah_event_cmp(const ah_event* a, const ah_event* b){
 }
 /* the reader (daemon/addr_hist.c) */
 int  ah_available(void);                       /* addr_hist.dat exists and opens */
-long ah_to_height(void);                       /* the base's coverage, -1 if none */
+long ah_to_height(void);                       /* the runs' coverage (highest to), -1 if none */
+int  ah_run_count(void);                       /* how many runs (2026-09-16) */
 long ah_lookup(uint8_t type, const uint8_t hash[32], const ah_event** events);   /* count (0 absent, -1 no index) */
 #endif

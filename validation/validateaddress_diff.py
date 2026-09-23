@@ -26,6 +26,10 @@ COMPARISON RULE
 """
 import os, sys, json, subprocess, urllib.request, base64
 
+import os as _dg_os, sys as _dg_sys
+_dg_sys.path.insert(0, _dg_os.path.join(_dg_os.path.dirname(_dg_os.path.abspath(__file__)), "lib"))
+from diffguard import require_cases, require_sources
+
 RPC_URL = os.environ.get("RPC_URL", "http://127.0.0.1:18545")
 RPC_USER = os.environ.get("RPC_USER", "x")
 RPC_PASS = os.environ.get("RPC_PASS", "y")
@@ -64,6 +68,8 @@ ADDRS = {
 
 
 def main():
+    # An empty ADDRS prints ALL MATCH and exits 0.
+    require_cases(len(ADDRS), 'validateaddress cases')
     fails = 0
     for name, a in ADDRS.items():
         o, c = ours(a), core(a)

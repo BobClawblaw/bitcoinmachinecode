@@ -16,8 +16,13 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
+#include <stdlib.h>
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <unistd.h>
+#include <signal.h>
+#include <pthread.h>
 #include "../daemon/node_config.h"
 
 extern int  mempool_configure(void);
@@ -25,6 +30,11 @@ extern void mp_lock(void);
 extern void mp_unlock(void);
 extern long mempool_time_of(const unsigned char* txid);
 extern void mempool_note_accept(const unsigned char* txid);
+extern const unsigned char* mpool_wtxid_at_slot(const void*, unsigned long);
+extern long mpool_del(void*, const unsigned char*);
+extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
+extern int  mempool_restore_accept_time(const unsigned char* txid, long t);
+extern void mempool_forget_for_test(const unsigned char* txid);
 extern void* mp_ext_area;
 extern unsigned long mp_ext_slots;
 extern unsigned long mp_ext_inited;
@@ -37,6 +47,18 @@ extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32],
                                       unsigned long* out_len);
 extern long mpool_policy_entry(void*, const unsigned char*,
                                unsigned long long*, unsigned long long*);
+
+/* 2026-09-19 case (b): one thread holds the lock for 300 ms; one arrives late */
+static void* hold_lock_thread(void* a){
+    int wfd = *(int*)a;
+    mp_lock();
+    if (write(wfd, "L", 1) != 1) {}
+    usleep(300000);
+    mp_unlock();
+    return NULL;
+}
+static volatile int g_late_entered = 0;
+static void* late_lock_thread(void* a){ (void)a; mp_lock(); g_late_entered = 1; mp_unlock(); return NULL; }
 
 static int fails=0, checks=0;
 static void ck(const char* what, int cond){ checks++; if(cond) printf("ok  : %s\n",what); else { printf("FAIL: %s\n",what); fails++; } }
@@ -146,6 +168,306 @@ int main(void){
         mp_unlock();
         alarm(0);
         ck("MEM-20 and remains usable on the next acquisition", 1);
+    }
+
+    /* ---- 2026-09-19: a NORMAL stop must not die inside the lock ------------
+     * All thirteen EOWNERDEAD warnings in the production logs were printed
+     * during a stop. Two shapes, each reproduced here against the real lock:
+     *   (a) an inbound serve child takes SIGTERM with the default action and
+     *       is signalled mid-accept (systemd's control-group stop);
+     *   (b) the serve parent _exit()s from its main thread while an RPC or
+     *       Esplora thread is inside (getrawmempool walks the whole pool
+     *       under it).
+     * The assertion is the recovery counter: every EOWNERDEAD bumps it. */
+    {
+        extern unsigned long mp_lock_owner_died_count(void);
+        unsigned long d0 = mp_lock_owner_died_count();
+        int pp[2]; if (pipe(pp) != 0){ perror("pipe"); return 2; }
+        pid_t cp = fork();
+        if (cp == 0){
+            signal(SIGTERM, SIG_DFL);                 /* main.c's serve child */
+            mp_lock();
+            if (write(pp[1], "L", 1) != 1) _exit(9);
+            usleep(300000);                           /* the SIGTERM arrives in here... */
+            mp_unlock();
+            for (;;) pause();                         /* ...and must land here */
+        }
+        char c = 0; if (read(pp[0], &c, 1) != 1) c = 0;
+        kill(cp, SIGTERM);
+        int cst = 0; waitpid(cp, &cst, 0);
+        ck("(a) the serve-child shape was ended by its SIGTERM", c == 'L' && WIFSIGNALED(cst) && WTERMSIG(cst) == SIGTERM);
+        alarm(10); mp_lock(); mp_unlock(); alarm(0);
+        ck("(a) ...only after its unlock: the next locker saw no EOWNERDEAD", mp_lock_owner_died_count() == d0);
+
+        extern int mp_quiesce(long);
+        unsigned long d1 = mp_lock_owner_died_count();
+        pid_t qp = fork();
+        if (qp == 0){
+            pthread_t th;
+            if (pthread_create(&th, NULL, hold_lock_thread, &pp[1]) != 0) _exit(8);
+            char h = 0; if (read(pp[0], &h, 1) != 1 || h != 'L') _exit(7);   /* the thread is inside */
+            int left = mp_quiesce(5000);              /* the parent's shutdown step... */
+            _exit(left != 0 ? 5 : 0);                 /* ...then its _exit, which kills every thread */
+        }
+        int qst = 0; waitpid(qp, &qst, 0);
+        ck("(b) mp_quiesce returned with no thread left inside", WIFEXITED(qst) && WEXITSTATUS(qst) == 0);
+        alarm(10); mp_lock(); mp_unlock(); alarm(0);
+        ck("(b) the process _exit()ed with no thread inside: no EOWNERDEAD", mp_lock_owner_died_count() == d1);
+
+        pid_t zp = fork();
+        if (zp == 0){
+            pthread_t th, late;
+            if (pthread_create(&th, NULL, hold_lock_thread, &pp[1]) != 0) _exit(8);
+            char h = 0; if (read(pp[0], &h, 1) != 1 || h != 'L') _exit(7);
+            mp_quiesce(5000);
+            g_late_entered = 0;
+            if (pthread_create(&late, NULL, late_lock_thread, NULL) != 0) _exit(6);
+            pthread_join(th, NULL);                   /* the holder is out: the lock is free */
+            usleep(200000);
+            _exit(g_late_entered ? 4 : 0);
+        }
+        int zst = 0; waitpid(zp, &zst, 0);
+        ck("(b) after the quiesce, a thread arriving at a FREE lock parks instead of entering",
+           WIFEXITED(zst) && WEXITSTATUS(zst) == 0);
+        close(pp[0]); close(pp[1]);
+    }
+
+
+    /* ---- the journal's wtxid is recomputed, and must MATCH the cache -------
+     * The departure journal records a wtxid by hashing the transaction's
+     * stored bytes, because the pool exposes its cached copy only BY SLOT and
+     * adding a by-txid getter means editing bitcoin_mempool.asm's probe.
+     *
+     * That is only sound while the two agree. If mpool_put ever cached
+     * something else -- a BIP141 wtxid over a re-serialised form, say -- the
+     * recompute would silently write a DIFFERENT value into every record, and
+     * a wrong wtxid is worse than the zero it replaced, because a zero is
+     * documented as "not recorded" and a wrong one is not detectable at all.
+     * This pins the equality that makes the shortcut legitimate. */
+    {
+        unsigned char wtx[64];
+        for (unsigned i = 0; i < sizeof wtx; i++) wtx[i] = (unsigned char)(0x40 + i);
+        unsigned char wid[32]; memset(wid, 0x5E, 32);
+        mp_lock();
+        long put = mpool_put(mp_ext_area, wid, wtx, sizeof wtx);
+        mp_unlock();
+        ck("a tx is in the pool for the wtxid check", put == 1);
+
+        /* the pool's own cached wtxid, found by walking to its slot */
+        const unsigned char* cached = 0;
+        for (unsigned long i = 0; i <= 0xffffful && !cached; i++){
+            const unsigned char* w = mpool_wtxid_at_slot(mp_ext_area, i);
+            if (!w) continue;
+            const unsigned char* slot = (const unsigned char*)mp_ext_area + 40 + i * 80;
+            if (!memcmp(slot + 8, wid, 32)) cached = w;
+        }
+        ck("the pool cached a wtxid for it", cached != 0);
+
+        unsigned long rl = 0;
+        const unsigned char* raw = mpool_get(mp_ext_area, wid, &rl);
+        ck("...and the stored bytes read back", raw && rl == sizeof wtx);
+
+        unsigned char recomputed[32];
+        if (raw && rl) sha256d(recomputed, raw, rl);
+        ck("the journal's RECOMPUTED wtxid equals the pool's cached one",
+           cached && raw && !memcmp(recomputed, cached, 32));
+
+        mp_lock(); mpool_del(mp_ext_area, wid); mp_unlock();
+    }
+
+    /* ---- deletion must not hide a colliding entry -------------------------
+     * The table is open-addressed with linear probing, and deletion used to
+     * clear the in-use flag outright. That breaks the probe: an entry that
+     * landed PAST a collision becomes unreachable the moment something ahead
+     * of it in its chain is removed, because every lookup stops at the first
+     * empty slot. mempool_time_of then answered 0 with no error -- and that
+     * value feeds getrawmempool's "time", the departure journal's first_seen,
+     * and the mempool.dat arrival-time restore, where 50 of 16,457 restores
+     * failed on 2026-09-16 for exactly this reason.
+     *
+     * Finding a real collision means inserting until two txids share a slot.
+     * Rather than reverse the hash, insert a run of transactions, remove the
+     * FIRST one inserted, and require every survivor to still be findable:
+     * with enough entries some of them collide, and under the old behaviour
+     * the ones behind the hole vanished. */
+    {
+        enum { N = 4096 };
+        unsigned char ids[N][32];
+        for (int i = 0; i < N; i++){
+            memset(ids[i], 0, 32);
+            ids[i][0] = (unsigned char)(i & 0xff);
+            ids[i][1] = (unsigned char)((i >> 8) & 0xff);
+            ids[i][2] = 0xC7;                 /* keep them clear of the other fixtures */
+            mempool_note_accept(ids[i]);
+        }
+        int all_before = 1;
+        for (int i = 0; i < N; i++) if (mempool_time_of(ids[i]) == 0) all_before = 0;
+        ck("every entry is findable before any removal", all_before);
+
+        /* remove a scattered quarter of them */
+        for (int i = 0; i < N; i += 4) mempool_forget_for_test(ids[i]);
+
+        int lost = 0;
+        for (int i = 0; i < N; i++) if (i % 4 && mempool_time_of(ids[i]) == 0) lost++;
+        ck("...and every SURVIVOR is still findable after the removals", lost == 0);
+        if (lost) printf("      %d of %d survivors became unreachable\n", lost, N - N/4);
+
+        int ghosts = 0;
+        for (int i = 0; i < N; i += 4) if (mempool_time_of(ids[i]) != 0) ghosts++;
+        ck("...and every removed entry really is gone", ghosts == 0);
+
+        /* A removed entry can be re-added and found again. NOTE what this does
+         * NOT prove: that the insert REUSED the tombstone. The table has ~4M
+         * slots and this fixture uses 4,096, so an insert that skipped every
+         * tombstone would still find an empty slot and still be findable --
+         * reverting the reuse changes nothing here. Proving reuse needs the
+         * table driven to exhaustion, which is not practical at this size, so
+         * the property is stated in mempool_cfg.c and left uncovered rather
+         * than claimed by an assertion that cannot fail. */
+        for (int i = 0; i < N; i += 4) mempool_note_accept(ids[i]);
+        int back = 0;
+        for (int i = 0; i < N; i += 4) if (mempool_time_of(ids[i]) != 0) back++;
+        ck("a removed entry can be re-added and found (reuse itself is untested)", back == N / 4);
+
+        /* and re-accepting an entry that is already live must not duplicate it:
+         * a duplicate survives the first forget and becomes a ghost */
+        mempool_note_accept(ids[1]);
+        mempool_note_accept(ids[1]);
+        mempool_forget_for_test(ids[1]);
+        ck("re-accepting a live entry does not create a duplicate",
+           mempool_time_of(ids[1]) == 0);
+
+        for (int i = 0; i < N; i++) mempool_forget_for_test(ids[i]);
+    }
+
+    /* ---- CONCURRENT inserts must not lose each other ----------------------
+     * This table is written by SEVERAL PROCESSES with no lock: the node forks
+     * per connection, the mapping is MAP_SHARED, and mempool_note_accept runs
+     * AFTER mp_unlock in daemon/tx_accept.c. Two accepts probing to the same
+     * free slot at the same moment both used to write it, and one of them was
+     * simply lost -- an arrival time gone with no error anywhere.
+     *
+     * A mutex is NOT the fix and the reason belongs next to the test:
+     * mempool_expire_now calls into the policy layer while iterating this
+     * table, and that path returns through mempool_forget, so a lock held
+     * across the iteration would meet itself. mp_lock's mutex has no settype,
+     * i.e. non-recursive, so that deadlocks a production node. The slot is
+     * claimed with an atomic CAS instead.
+     *
+     * The fixture forces CONTENTION rather than hoping for it: every child
+     * inserts the SAME ids, so each id is raced by all of them. */
+    {
+        enum { KIDS = 10, PER = 8000 };
+        unsigned char (*ids)[32] = malloc((size_t)PER * 32);
+        for (int i = 0; i < PER; i++){
+            memset(ids[i], 0, 32);
+            ids[i][0] = (unsigned char)(i & 0xff);
+            ids[i][1] = (unsigned char)((i >> 8) & 0xff);
+            ids[i][2] = 0xB3;
+        }
+        /* A SHARED START BARRIER, because hoping for overlap is not a test.
+         * Forking and letting each child run immediately, the children finished
+         * before the next was forked and the race never happened: the first
+         * version of this caught 889 duplicates once and then detected nothing
+         * on five consecutive runs, including with the fix removed. The
+         * children now spin until the parent releases them together, so the
+         * contention is produced rather than awaited. */
+        int* go = mmap(0, sizeof(int), PROT_READ|PROT_WRITE,
+                       MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+        ck("start barrier mapped", go != MAP_FAILED);
+        *go = 0;
+        for (int k = 0; k < KIDS; k++){
+            pid_t c = fork();
+            if (c == 0){
+                while (!__atomic_load_n(go, __ATOMIC_ACQUIRE)) ;     /* all start together */
+                /* each child walks the same ids from a different offset, so
+                 * every id is raced and the probes interleave */
+                for (int i = 0; i < PER; i++) mempool_note_accept(ids[(i + k * 97) % PER]);
+                _exit(0);
+            }
+        }
+        __atomic_store_n(go, 1, __ATOMIC_RELEASE);
+        for (int k = 0; k < KIDS; k++){ int w; wait(&w); }
+        munmap(go, sizeof(int));
+
+        long missing = 0;
+        for (int i = 0; i < PER; i++) if (mempool_time_of(ids[i]) == 0) missing++;
+        ck("no entry is LOST when several processes insert at once", missing == 0);
+        if (missing) printf("      %ld of %d went missing under %d-way contention\n", missing, PER, KIDS);
+
+        /* A duplicate CAN still happen: the probe-order tie-break closes the
+         * common case, but not the window where the loser scans before the
+         * winner publishes -- 29 of 3,000 survived it under this barrier. What
+         * must NOT happen is a duplicate outliving its removal, because that
+         * leaves an arrival time for a transaction the pool no longer holds
+         * and mempool_time_of keeps answering with it. So the property pinned
+         * here is the one that matters: ONE forget clears EVERY copy. */
+        long ghosts = 0;
+        for (int i = 0; i < PER; i++){
+            mempool_forget_for_test(ids[i]);
+            if (mempool_time_of(ids[i]) != 0) ghosts++;
+        }
+        ck("...and ONE forget clears every copy, leaving no ghost", ghosts == 0);
+        if (ghosts) printf("      %ld entr(ies) survived their own removal\n", ghosts);
+        /* WHAT THIS FIXTURE DOES AND DOES NOT COVER, measured rather than
+         * assumed. Reverting "clear every copy" fails it on 5 runs of 5.
+         * Reverting the atomic slot CLAIM does not fail it at all, and neither
+         * does making a lookup stop at a CLAIMED slot: both need two processes
+         * to reach the same FREE slot at the same instant, and with ~4M slots
+         * against 8,000 ids that does not happen often enough to catch. The
+         * contention this fixture really produces is on the same TXID, which
+         * is what the ghost check exercises.
+         *
+         * The claim is kept on reasoning rather than coverage, and the
+         * reasoning is in mempool_cfg.c: without it two processes memcpy a
+         * txid into one slot and the result matches nothing, so the entry is
+         * unreachable AND unremovable until the expiry sweep. Catching that
+         * would need the table driven near capacity, which is not this test. */
+        for (int i = 0; i < PER; i++) mempool_forget_for_test(ids[i]);
+        free(ids);
+    }
+
+    /* ---- the persisted arrival time (mempool.dat entry_time) --------------
+     * mempool_note_accept stamps "now", which is right off the wire and WRONG
+     * for a transaction being re-admitted from mempool.dat at startup: it may
+     * have been waiting for hours. Without the restore, every restart resets
+     * the pool's sense of age -- the departure journal wrote 2,189 rows with
+     * waited: 1 after the 2026-09-16 deploy, an artifact of the restart, and
+     * -mempoolexpiry likewise began every transaction's 336-hour clock again.
+     *
+     * THE VALUE IS NOT TRUSTED. mempool.dat is read at startup before anything
+     * has vetted it, and this field is an INPUT TO EXPIRY: a time in the
+     * future would keep a transaction in the pool forever, one far in the past
+     * would evict it instantly. Those two refusals are the checks that matter
+     * here -- the happy path is the easy half. */
+    {
+        unsigned char tx_r[32]; memset(tx_r, 0xD1, 32);
+        mempool_note_accept(tx_r);
+        long fresh = mempool_time_of(tx_r);
+        ck("a fresh accept is stamped now", fresh > 0);
+
+        long now = (long)time(0);
+        ck("a plausible past time IS restored",
+           mempool_restore_accept_time(tx_r, now - 3600) == 1);
+        ck("...and the table now reports it", mempool_time_of(tx_r) == now - 3600);
+
+        /* a time in the FUTURE would defeat expiry entirely */
+        ck("a FUTURE time is refused", mempool_restore_accept_time(tx_r, now + 86400) == 0);
+        ck("...and the previous value stands", mempool_time_of(tx_r) == now - 3600);
+
+        /* a time older than the expiry window would evict it on the next sweep */
+        ck("a time PAST the expiry window is refused",
+           mempool_restore_accept_time(tx_r, now - 400L*3600L) == 0);
+        ck("...and the previous value still stands", mempool_time_of(tx_r) == now - 3600);
+
+        ck("a zero time is refused", mempool_restore_accept_time(tx_r, 0) == 0);
+        ck("a negative time is refused", mempool_restore_accept_time(tx_r, -5) == 0);
+
+        /* a transaction that is not in the pool has nothing to correct */
+        unsigned char absent[32]; memset(absent, 0xE7, 32);
+        ck("restoring a time for an absent transaction is a no-op",
+           mempool_restore_accept_time(absent, now - 60) == 0);
+        ck("...and it is NOT inserted by the attempt", mempool_time_of(absent) == 0);
     }
 
     printf("\n%s (%d checks, %d failures)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", checks, fails);

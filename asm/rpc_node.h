@@ -30,6 +30,13 @@ int rpc_msg_index(const char* cmd, unsigned cmdlen);
 /* the receive side of the per-message counters; the send side is the
    g_p2p_write_hook installed in main.c */
 void rpc_note_msg_recv(int fd, const char* cmd, unsigned plen);
+/* A v1 (16-byte, legacy IPv6) network address and port, rendered as Core's
+ * CService::ToStringAddrPort after a CNetAddr::V1 read: IPv4-mapped as
+ * "a.b.c.d:port", IPv6 as "[rfc5952]:port". Returns 0 and writes "" for what
+ * Core's IsValid() rejects -- :: and the TORv2 prefix (read as ::), 0.0.0.0,
+ * 255.255.255.255, 2001:db8::/32, and the internal prefix -- so a caller
+ * omits the field exactly where Core does. */
+int rpc_fmt_addr_v1(const unsigned char ip[16], unsigned port, char* out, unsigned cap);
 
 #define RPC_MAX_PEERS 128   /* 0..63 outbound legs (the worker), 64..127 inbound children (2026-09-01) */
 /* Shared misbehaviour table size; mirrored by MISBEHAVIOR_SLOTS in
@@ -100,6 +107,13 @@ typedef struct {
      * counts them. */
     volatile long long        sent_per_msg[RPC_MSG_N];
     volatile long long        recv_per_msg[RPC_MSG_N];
+    /* 2026-09-18: Core's addrlocal -- OUR address as this peer saw it, the
+     * addr_recv of the peer's own version message, formatted by
+     * rpc_fmt_addr_v1. Empty when the peer sent an address Core calls
+     * invalid (0.0.0.0, ::, documentation, internal), and then omitted, as
+     * Core omits it. It had no field at all: 0 of 11 peers carried it where
+     * Core's 10 of 10 did. Appended: every offset above is unchanged. */
+    volatile char             addrlocal[72];
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
@@ -145,13 +159,21 @@ typedef struct {
 #define RPC_MAX_BANS           64
 
 /* ZMQ transaction notification ring (see zmq_ring at the end of the struct).
- * 16 slots looked generous -- the worker drains every rotation -- but a
- * mempool.dat reload streams hundreds of accepts per second while the worker
- * is busy doing the accepting, and production lapped a 16-slot ring by
- * thousands (2026-08-31). 64 slots is ~26MB of the MAP_SHARED block
- * (404KB payload each) and rides out the bursts; overrun past that is
- * counted and reported, which is all a lossy PUB feed owes anyone. */
-#define RPC_ZMQ_RING           64
+ * History: 16 fixed 404KB slots lapped by thousands during a mempool.dat
+ * reload (2026-08-31); 64 slots (26MB) still lapped -- 61,836 transactions
+ * lost in the four minutes of deploy-20260919a's 72,952-tx reload, and a
+ * few dozen an hour in steady state -- because the worker ACCEPTS up to
+ * 2,048 submissions per rotation (TXSUB_ROTATION_BUDGET, plus the relay
+ * and handoff paths) but drained once per rotation. Two changes
+ * (2026-09-19): the publisher's own process publishes at accept time
+ * (zmq_notify.c), so nothing it accepts waits in the ring at all; and what
+ * other processes stage lands in a byte ARENA indexed by a 65,536-entry
+ * ring, so an entry costs the transaction's size, not the largest possible
+ * one. Bound: 3.5MB index + 32MB arena of the MAP_SHARED block, touched only
+ * as it is used; a lap past either is counted, logged and published to
+ * subscribers as a per-topic sequence gap. */
+#define RPC_ZMQ_RING           65536u               /* index entries (a power of two) */
+#define RPC_ZMQ_ARENA          (32ul << 20)         /* staged raw-tx bytes */
 #define RPC_ANN_RING           1024   /* CC-1 announce ring (see ann_ring) */
 /* Coinstats fold ring (see csi_ring): a few blocks' worth of coin records --
  * a heavy block creates/spends ~10k coins, so 64k entries is 5-6 blocks of
@@ -307,31 +329,36 @@ typedef struct {
 
     /* ==== ZMQ transaction notification ring ====
      * MANY producers, ONE consumer, and that asymmetry is the whole reason
-     * this exists. Transactions are accepted into the mempool by the INBOUND
-     * SERVE CHILDREN (bitcoin_serve.asm -> tx_accept_validate), which are
-     * separate processes, while the ZMQ publisher owns a listening socket and
-     * its subscriber fds and so can live in only ONE process (the download
-     * worker). A child cannot write to the worker's sockets, so accepted
-     * transactions are staged HERE -- in the pre-fork MAP_SHARED status block
-     * every process inherits -- and the worker drains them.
+     * this exists. Transactions are accepted into the mempool in more than
+     * one process (the download worker's relay, submission and handoff
+     * paths; an inbound serve child's fallback validation), while the ZMQ
+     * publisher owns a listening socket and its subscriber fds and so can
+     * live in only ONE process (the download worker). Another process cannot
+     * write to the worker's sockets, so its accepted transactions are staged
+     * HERE -- in the pre-fork MAP_SHARED status block every process inherits
+     * -- and the worker drains them. (The worker's own accepts are staged
+     * the same way and drained on the spot: zmq_notify.c.)
      *
-     * Without this, zmqpubrawtx would carry only this node's OWN
-     * sendrawtransaction submissions and would miss every transaction
-     * arriving from the network, which is the entire point of the topic.
-     *
-     * A producer claims a slot with an atomic increment on zmq_seq, fills it,
-     * and publishes `ready` LAST behind a barrier, so the consumer never sees
-     * a half-written slot. Overrun (producers lapping the consumer) is
-     * detected by the consumer, which skips ahead and counts what it lost:
-     * dropping is correct for a PUB socket, but dropping SILENTLY is not. */
-    volatile unsigned long long zmq_seq;    /* slots claimed (producers)       */
-    volatile unsigned long long zmq_lost;   /* messages lost to overrun        */
+     * A producer claims an index entry with an atomic increment on zmq_seq
+     * and its bytes with one on zmq_bytes (the arena is a byte ring: the
+     * transaction lives at zmq_arena[off % RPC_ZMQ_ARENA], wrapping), fills
+     * both, and publishes `ready` LAST, so the consumer never sees a
+     * half-written entry. Overrun -- producers lapping the consumer, in the
+     * index or in the arena -- is detected by the consumer, which counts it
+     * and advances the hashtx/rawtx topic sequences by the loss (zmqpub_skip),
+     * so a subscriber sees the gap: dropping SILENTLY is the one thing a PUB
+     * feed must not do. */
+    volatile unsigned long long zmq_seq;    /* index entries claimed (producers) */
+    volatile unsigned long long zmq_lost;   /* transactions lost to overrun      */
+    volatile unsigned long long zmq_bytes;  /* arena bytes claimed (producers)   */
+    volatile unsigned long long zmq_pad;
     struct {
-        volatile unsigned long long ready;  /* seq+1 once filled; 0 = empty    */
-        volatile unsigned long      len;    /* raw tx length                   */
-        unsigned char               txid[32];          /* WIRE order           */
-        unsigned char               tx[RPC_ZMQ_TXMAX];
+        volatile unsigned long long ready;  /* seq+1 once filled; 0 = empty/refilling */
+        volatile unsigned long long off;    /* arena byte position (unwrapped)   */
+        volatile unsigned long      len;    /* raw tx length                     */
+        unsigned char               txid[32];          /* WIRE order             */
     } zmq_ring[RPC_ZMQ_RING];
+    unsigned char zmq_arena[RPC_ZMQ_ARENA];
 
     /* ---- peer misbehaviour scores (audit finding 7) ----------------------
      * These live HERE, in the pre-fork MAP_SHARED block, for the same reason
@@ -453,6 +480,17 @@ typedef struct {
      * cannot fill it. Measured on run 22 from OUTSIDE the process because the
      * node did not report it: 11-20% per worker while the log said 8/8 active. */
     volatile int              dl_pool_idle_pct;
+    /* 2026-09-19: every WIRE byte the downloader's sockets carried -- the
+     * header phase, the probes' handshakes, each helper's version/getdata/
+     * pong and every block -- counted as Core counts them (full message,
+     * 24-byte header included) by the p2p_write/p2p_read hooks in whichever
+     * process moved them (daemon/main.c dl_wire_note). Cumulative for the
+     * node's life, never reset: dl_bytes_total above is one dl_catchup
+     * call's rchar and restarts with each call. getnettotals adds these to
+     * the relay legs' TCP_INFO figures. Appended: every offset above is
+     * unchanged. */
+    volatile long long        dl_wire_sent;
+    volatile long long        dl_wire_recv;
 } node_status_t;
 #define NODE_TIP_UNTRACKED (-2LL)
 
@@ -491,13 +529,23 @@ typedef struct {
        scan of the node array, so asking it n times is O(n^2). Returns the
        count written, or -1 to say "fall back to the per-txid call". */
     long (*pol_entry_info_all)(void*, struct mp_entry_info*, unsigned char (*)[32], unsigned);
+    /* fee/size/sigop_cost/depends/anc for MANY txids in one call -- the fields
+       a block template reads, without entry_info's unused spentby scan and
+       descendant walk. out[]/found[] are sized by the query count, not the
+       registry. NULL = fall back to the per-txid call. */
+    long (*pol_pkg_many)(void*, const unsigned char (*)[32], unsigned,
+                         struct mp_entry_info*, unsigned char*);
+    /* every entry's fee and vsize summed in ONE pass. pol_entry is a linear
+       scan, so getmempoolinfo calling it per slot was O(n^2). NULL = fall back
+       to that per-slot loop (test rules that do not link the policy module). */
+    long (*pol_totals)(void*, unsigned long long*, unsigned long long*);
     long (*estimate)(void*, unsigned long long*,
                      unsigned long long*);                      /* fee EMA+samples */
     void (*sha256d)(unsigned char*, const void*, unsigned long);/* for wtxid */
     unsigned long long (*min_fee)(void*);   /* dynamic mempoolminfee, sat/kvB (polstate) */
     /* Core -bytespersigop (DEFAULT_BYTES_PER_SIGOP 20), for the sigops-adjusted
      * weight max(weight, sigop_cost * bytes_per_sigop) that getmempoolentry's
-     * vsize_adjusted/chunkweight and getmempoolcluster are computed from. A
+     * vsize (Core's entry size)/chunkweight and getmempoolcluster are computed from. A
      * HOOK rather than a direct call into the policy module: rpc_node.o is
      * linked by 22 test rules that do not pull in bitcoin_mempool_policy.c, and
      * link-check rightly refused the new dependency. Unset means Core's
@@ -505,8 +553,18 @@ typedef struct {
     unsigned long long (*bytespersigop)(void);
     void*     feeest;         /* shared fee estimator (daemon/fee_estimator.c); NULL = none */
     unsigned long long min_relay_satkvb;    /* -minrelaytxfee, sat/kvB (estimatesmartfee floor) */
+    /* Core CTxMemPool::GetSequence(): the mempool sequence number the ZMQ
+     * `sequence` topic numbers its 'A'/'R' events with, for getrawmempool's
+     * mempool_sequence (daemon/mempool_seq.h). Called under `lock`, together
+     * with the txid walk, so the pair is one consistent snapshot. NULL = the
+     * initial value, 1 (no pool has ever changed). */
+    unsigned long long (*mempool_sequence)(void);
 } rpc_mempool_hooks;
 void rpc_node_set_mempool(const rpc_mempool_hooks* h);
+/* Clusters linearized by the mempool-entry builder since start (chunkweight /
+ * fees.chunk). A test reads the delta across one bulk getrawmempool to pin
+ * the cost model: one build per CLUSTER, never one per member. */
+unsigned long rpc_node_cluster_builds(void);
 
 /* Hand the RPC layer the persistent address book (daemon/addrbook.c v2), so
  * getnodeaddresses/getaddrmaninfo report real recorded peers. Injected as
@@ -533,6 +591,15 @@ void rpc_node_set_addednodes(const char (*list)[64], int n);
  * behind getzmqnotifications. Injected like the added-node list above. */
 void rpc_node_set_zmq(const char* hashblock, const char* hashtx,
                       const char* rawblock, const char* rawtx);
+/* The configured -zmqpub<topic>hwm values, in the same four-topic order
+ * (node_config's g_cfg.zmq_hwm, a long-lived global: BORROWED). NULL reports
+ * Core's default, 1000. */
+void rpc_node_set_zmq_hwm(const int* hwm4);
+/* The fifth topic, -zmqpubsequence (BORROWED like the others). Its hwm is
+ * element [4] of the array above, which is read ONLY when this endpoint is
+ * set -- so callers that pass a four-element array and no sequence endpoint
+ * stay in bounds. */
+void rpc_node_set_zmq_sequence(const char* sequence);
 
 /* 1 if `method` is a live-node method this module serves. */
 int rpc_node_known_method(const char* method);

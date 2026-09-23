@@ -35,6 +35,14 @@ BMC  = ["/storage/bitcoinmachinecode/asm/daemon/bmc_cli", "-rpcport=8331",
         "-datadir=/storage/bitcoinmachinecode/data"]
 CORE = ["/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli",
         "-conf=/storage/core-oracle/bitcoin.conf", "-datadir=/storage/core-oracle"]
+# The default oracle is a v31.99 DEVELOPMENT build, and diffing against it
+# invents work (docs/PARITY_RPC_FIELDS.md). PARITY_CORE names another
+# bitcoin-cli command line -- the v31.1 release node on the NVMe:
+#   PARITY_CORE="/mnt/nvme8tb/core-build/bitcoin-v31.1/build/bin/bitcoin-cli
+#                -datadir=/mnt/nvme8tb/core-oracle -rpcport=8337"
+import os, shlex
+if os.environ.get("PARITY_CORE"):
+    CORE = shlex.split(os.environ["PARITY_CORE"])
 
 def raw(base, args, timeout=180):
     try:
@@ -152,6 +160,56 @@ if PSBT:
 if SIG:
     CASES += [("verifymessage", [WIFADDR, SIG, MSG]),
               ("signmessagewithprivkey", [WIFKEY, MSG])]
+
+# --- 2026-09-15: the wait* family, help, and the proof pair ------------------
+# waitfor* BLOCK by design. They take a timeout in milliseconds, so 1 makes them
+# return at once -- without it a differential hangs until the next block, which
+# is an hour-shaped bug in a tool meant to run in seconds.
+CASES += [
+    ("waitfornewblock",    ["1"]),
+    ("waitforblockheight", ["1", "1"]),
+    ("help",               ["getblockcount"]),
+    # an all-DIGIT 64-char hash: this exact shape was sent as a JSON number by
+    # bmc_cli until 2026-09-15 and came back -32700. Kept as a case so the
+    # client bug cannot return unnoticed.
+    ("waitforblock", ["0000000000000000000000000000000000000000000000000000000000000000", "1"]),
+    # createpsbt with nothing in it: returned "oom" until 2026-09-15 because a
+    # zero-input transaction was treated as a decode failure.
+    ("createpsbt", ["[]", "{}"]),
+]
+if BH:
+    CASES += [("waitforblock", [BH, "1"])]
+# verifytxoutproof needs a proof, which gettxoutproof makes from a confirmed
+# txid. Built on the ORACLE so both sides are handed identical bytes.
+_blk = call(CORE, ["getblock", BH, "1"]) if BH else None
+_txid0 = (_blk or {}).get("tx", [None])[0]
+PROOF = raw(CORE, ["gettxoutproof", json.dumps([_txid0]), BH]) if _txid0 else None
+if PROOF:
+    CASES += [("verifytxoutproof", [PROOF]), ("gettxoutproof", [json.dumps([_txid0]), BH])]
+if RAWTX:
+    CASES += [("signrawtransactionwithkey", [RAWTX, "[]"])]
+
+# --- 2026-09-15: the wallet block ------------------------------------------
+# These need a wallet loaded on BOTH sides. This node carries an implicit one
+# and answers without loading anything; Core does not, so the oracle needs
+# `loadwallet <name>` before this section means anything. If Core answers
+# "No wallet is loaded" the rows below are skipped, not reported as gaps -- an
+# unloaded wallet is a setup difference, not a divergence.
+#
+# READ-ONLY ONLY. fundrawtransaction, walletcreatefundedpsbt and friends can
+# LOCK coins in the wallet they are asked of, which is a state change to the
+# oracle; they stay in NEVER_CALL.
+if "No wallet" not in (raw(CORE, ["getwalletinfo"]) or "No wallet"):
+    CASES += [
+        ("getwalletinfo", []), ("getbalance", []), ("getbalances", []),
+        ("listtransactions", []), ("listunspent", []), ("listlabels", []),
+        ("listaddressgroupings", []), ("listlockunspent", []),
+        ("listreceivedbyaddress", ["0", "true"]),
+        ("listreceivedbylabel", ["0", "true"]),
+        ("listsinceblock", []), ("gethdkeys", []),
+        ("listdescriptors", []),
+        ("simulaterawtransaction", ['["%s"]' % RAWTX] if RAWTX else None),
+    ]
 
 # --- the guard this tool did not have, and should have ------------------------
 # 2026-09-12: a survey loop elsewhere invoked every Core method name against the

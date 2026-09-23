@@ -138,7 +138,8 @@ there are no per-worker shards. The directory contains only these files:
   chunk, waiting for the committer, which appends chunks to the archive in
   height order so `blk*.dat` are laid out monotonically. Stale files are
   swept at boot and on every commit pass.
-- `addr_hist.dat` (2026-09-08, optional; `bmc_build_addr_hist`) — the
+- `addr_hist.dat` / `addr_hist.r<from>-<to>.dat` (2026-09-08; sorted runs
+  built during the sync since 2026-09-16, `docs/devlog/INDEX_RUNS.md`) — the
   address history index: every funding and spend event per script key,
   grouped and sparse-indexed, about 200 GB on mainnet; `addr_index.dat` +
   `addrindex.tail` (the live address index) carry it forward from the
@@ -306,6 +307,63 @@ as it arrives on the wire.
 Corollary for live debugging: **validate the instrument before trusting a
 negative result.** A p2p probe that got silence from our node was only
 meaningful once the same probe got an immediate answer from a real Core.
+
+### 2.3e Log line tags: `[a-z0-9_]+`, and why it is not a style preference
+
+Every log line starts with a bracketed subsystem tag. The grammar is:
+
+```
+[a-z0-9_]+ (: worker-index)?      e.g. [net]  [coinstats_hist]  [dl:0]  [mux:10]
+```
+
+**Lowercase, digits and underscore only. No hyphens.** The `:N` suffix is for
+per-worker streams and is the only punctuation allowed.
+
+This is not cosmetic. Downstream log readers anchor on that shape -- BlockYard's
+parser uses `/^\[[a-z0-9_]+(?::\d+)?\]\s*/` -- and a tag that does not match
+is not merely styled differently, it **cannot be claimed by any rule at all**.
+The line falls through to the unstructured bucket and **no figures are
+extracted from it**, so the subsystem contributes nothing to any panel keyed on
+its tag.
+
+It is still *dated* correctly, though, and the distinction matters. An earlier
+version of this section claimed an unmatched line also gets a timestamp taken
+at read time. **That is wrong for us.** A bmc line that no rule claims still
+becomes a feed row carrying the node's OWN timestamp, because bmc writes the
+timestamp format the reader's `TS_RE` expects -- unparsed is not misdated. The
+read-time stamping is what happens to Bitcoin Core's log, where nothing parses
+at all.
+
+The one bmc exception is the **index builders' child processes**
+(`bmc_build_coinstats_hist`, `bmc_build_tx_index`, `bmc_build_addr_hist`,
+`bmc_build_block_filters`, `bmc_build_txospender_index`): they write to stderr
+with no timestamp whatsoever -- 108 `fprintf(stderr, ...)` call sites between
+them, none stamped -- so those lines genuinely cannot be dated from their
+content, and BlockYard carries a `tsFallback` for them. That fallback exists to
+cover a gap on OUR side. A builder that printed the node's
+`YYYY-MM-DD HH:MM:SS.mmm ` prefix would not need it.
+
+There is no central logger to enforce this; tags are string literals in
+`fprintf` calls, which is exactly how seven of them drifted. On 2026-09-18,
+`[cmpct-dbg]`, `[coinstats-hist]`, `[get-miss]`, `[get-slen-anomaly]`,
+`[server-test]`, `[txr-dump]` and `[walk-miss]` were renamed to underscores --
+7 of 105 distinct tags in the source, and 0 of the 48 in a real node log, so
+they were outliers in our own codebase rather than a convention anyone had
+chosen. `[coinstats-hist]` was found only because a downstream reader reported
+it.
+
+Note that a CLI mode name is a different namespace: the `server-test` *mode*
+keeps its hyphen, because that is a user-facing argument. Only the log tag
+changed.
+
+To check before adding a tag:
+
+```sh
+grep -rhoE '"\[[a-z0-9_]+-[a-z0-9_-]*\]' --include=*.c --include=*.h --include=*.asm asm/
+# must print nothing. The leading [a-z0-9_]+ matters: a looser pattern also
+# matches the string literals "[-]" and "[-1]", which are not tags.
+# Verified to catch a planted "[bad-tag]".
+```
 
 ### 2.4 Randomized ctypes stress (optional, shared-lib targets)
 
@@ -487,9 +545,15 @@ check_chain <dir> [deep]                    # integrity audit: dups/holes/corrup
 verify <dir> [start] [end]                  # hash/chain/PoW/consensus validation
 pverify <dir> [start] [end]                 # parallel variant of verify
 dumpblock <dir> <height> [raw]              # inspect a stored block
-bmc_build_addr_hist <chaindir> [to_height]  # the address history index (three
-                                            # bucketed passes over the archive;
-                                            # hours, ~200 GB + ~700 GB of temp)
+bmc_build_addr_hist <chaindir> [to_height]           # whole-chain rebuild: three
+                                            #   bucketed passes over the archive;
+                                            #   hours, ~200 GB out + ~700 GB temp
+bmc_build_addr_hist <chaindir> <from> <to> <out>    # ONE RUN, spends from undo --
+                                            #   the mode the daemon uses during the
+                                            #   sync (docs/devlog/INDEX_RUNS.md)
+bmc_build_tx_index <datadir> [from] [to] [out]           # a run of the txid index
+bmc_build_txospender_index <datadir> [from] [to] [out]   # a run of the spender index
+bmc_merge_index_runs <chaindir> <txindex|txospender|addr_hist>   # fold runs into one
 nodecheck.sh <dir>                          # one-shot health: audit+progress+serve
 chainprogress.sh <dir>                      # coverage toward a complete 0..tip
 peerstats.sh                                # tail -f live dl_catchup status

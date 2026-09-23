@@ -111,6 +111,28 @@ int main(void){
     snprintf(cmd, sizeof cmd, "BMC_CLI_DRYRUN=1 %s -rpcport=1 -rpcuser=u -rpcpassword=p getblock 00aa 2 2>&1", BCLI);
     rc = run_sh(cmd, out, sizeof out);
     ck("a hash stays a string and a verbosity stays a number", rc == 0 && strstr(out, "\"params\":[\"00aa\",2]") != NULL);
+    /* A 64-character hash made only of DIGITS looked numeric and was sent as a
+     * JSON number: `waitforblock 000...0 1` came back -32700 "Parse error" and
+     * `111...1` came back "expected string parameter", while a mixed-case hash
+     * worked. The SERVER was right in both cases -- checked on the wire, it
+     * answers exactly as Core does. The CLI was mangling the request.
+     * Found 2026-09-15 by the RPC shape differential. */
+    snprintf(cmd, sizeof cmd, "BMC_CLI_DRYRUN=1 %s -rpcport=1 -rpcuser=u -rpcpassword=p waitforblock "
+             "0000000000000000000000000000000000000000000000000000000000000000 1 2>&1", BCLI);
+    rc = run_sh(cmd, out, sizeof out);
+    ck("an all-zero 64-char hash stays a STRING, not a number",
+       rc == 0 && strstr(out, "\"params\":[\"0000000000000000000000000000000000000000000000000000000000000000\",1]") != NULL);
+    snprintf(cmd, sizeof cmd, "BMC_CLI_DRYRUN=1 %s -rpcport=1 -rpcuser=u -rpcpassword=p waitforblock "
+             "1111111111111111111111111111111111111111111111111111111111111111 1 2>&1", BCLI);
+    rc = run_sh(cmd, out, sizeof out);
+    ck("an all-digit 64-char hash stays a STRING too",
+       rc == 0 && strstr(out, "\"params\":[\"1111111111111111111111111111111111111111111111111111111111111111\",1]") != NULL);
+    /* and a real number of any other length is still a number -- the guard is
+     * narrow, not a blanket "digits are strings" */
+    snprintf(cmd, sizeof cmd, "BMC_CLI_DRYRUN=1 %s -rpcport=1 -rpcuser=u -rpcpassword=p getblockhash 966000 2>&1", BCLI);
+    rc = run_sh(cmd, out, sizeof out);
+    ck("a height is still sent as a number", rc == 0 && strstr(out, "\"params\":[966000]") != NULL);
+
     snprintf(cmd, sizeof cmd, "BMC_CLI_DRYRUN=1 %s -rpcport=1 -rpcuser=u -rpcpassword=p setlabel bc1qx '[not json' false null 2>&1", BCLI);
     rc = run_sh(cmd, out, sizeof out);
     ck("false and null convert; a bracket that is not JSON stays a string", rc == 0 && strstr(out, "\"params\":[\"bc1qx\",\"[not json\",false,null]") != NULL);
