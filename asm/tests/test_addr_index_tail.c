@@ -244,6 +244,22 @@ int main(void){
       ck("the history base is visible", ah_available());
       axt_boot(store);
       ck("a fresh journal with a history base to height 1 adopts it and backfills to the tip", axt_active() && axt_covered() == (long)(*(int*)((u8*)store + 24)));
+      /* 2026-09-24: a journal BEHIND the base (m5ultra: journal 274442, base
+       * rebuilt to 799999) is superseded -- set aside, a fresh journal adopts
+       * the base -- where the gap rule used to disable the index. Here: the
+       * journal just built covers 1, the base now reaches 2, the tip is 2. */
+      unlink(AH_FILE); unlink(AXF_TAIL_FILE ".stale"); unlink(AXF_TAIL_FILE); ah_reset_for_test();
+      axt_boot(store);                    /* no base: a real journal, backfilled from genesis to the tip (1) */
+      *(int*)(store + 24) = 2;
+      f = fopen(AH_FILE, "wb"); memset(&hd, 0, sizeof hd); hd.magic = AH_MAGIC; hd.version = AH_VERSION; hd.to_height = 2; hd.body_off = AH_HDR_BYTES;
+      fwrite(zero, 1, AH_HDR_BYTES, f); hd.sparse_off = AH_HDR_BYTES; fseek(f, 0, SEEK_SET); fwrite(&hd, 1, sizeof hd, f); fclose(f);
+      ck("the journal covers 1 before the boot", axt_probe_covered() == 1);
+      axt_boot(store);
+      struct stat sst;
+      ck("a journal behind the history base is set aside, not deleted", stat(AXF_TAIL_FILE ".stale", &sst) == 0 && sst.st_size > 0);
+      ck("...and a fresh journal adopts the base's coverage (live, covered=2)", axt_active() && axt_covered() == 2);
+      unlink(AXF_TAIL_FILE ".stale");
+      *(int*)(store + 24) = 1;
       unlink(AH_FILE); ah_reset_for_test(); }
     printf("\n== 6: boot while the archive is ahead of the UTXO engine (2026-09-08) ==\n");
     { /* Production, every boot from 17:16Z: the archive held blocks the
