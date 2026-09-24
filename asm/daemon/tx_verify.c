@@ -830,16 +830,21 @@ typedef struct {
                                     workers must not read the file-scope
                                     names -- they would get their own
                                     empty instances) */
+    txv_result_t* res_base;      /* ...and its results array, same reason:
+                                    a worker writing g_txv_results by name
+                                    wrote through ITS OWN NULL instance
+                                    (SIGSEGV on any tx of TXV_PARALLEL_MIN+
+                                    inputs, tests/test_tx_verify_parallel) */
     const tapagg_t* t1_tap; const bytepool_t* t1_tap_pool; int t1_tap_built;
 } txv_worker_arg_t;
 
 static void* txv_worker_thread(void* argp){
     txv_worker_arg_t* a = (txv_worker_arg_t*)argp;
     static __thread u8* sv_work; BMC_TLS_BUF(sv_work, 1<<20);   /* per-THREAD, not per-process --
-                                          * threads share g_txv_results and
-                                          * the process's other statics, so
-                                          * this one specifically must stay
-                                          * __thread or concurrent workers
+                                          * the workers write the DISPATCHER's
+                                          * results through a->res_base, so
+                                          * this scratch must be each worker's
+                                          * own: shared, concurrent workers
                                           * would race on it (exactly the
                                           * class of bug
                                           * test_scriptverify_thread_stress.c
@@ -849,9 +854,9 @@ static void* txv_worker_thread(void* argp){
         /* the dispatcher's arenas, carried in the args */
         const char* r = 0;
         int ok = txv_verify_one(a->tx, a->txlen, &a->in_base[i], i, a->flags,
-                                a->t1_tap, &a->t1_tap_pool[0] == a->t1_tap ? a->t1_tap : a->t1_tap, a->t1_tap_built, sv_work, 1<<20, &r);
-        g_txv_results[i].ok = ok ? 1 : 0;
-        if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(g_txv_results[i].reason, r, n); g_txv_results[i].reason[n]=0; }
+                                a->t1_tap, a->t1_tap_pool, a->t1_tap_built, sv_work, 1<<20, &r);
+        a->res_base[i].ok = ok ? 1 : 0;
+        if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(a->res_base[i].reason, r, n); a->res_base[i].reason[n]=0; }
     }
     txv_session_end();
     return 0;
@@ -903,7 +908,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
         args[spawned].tx = tx; args[spawned].txlen = txlen; args[spawned].flags = flags;
         args[spawned].lo = lo; args[spawned].hi = hi;
         args[spawned].key = key;                                   /* IR-5 */
-        args[spawned].in_base = g_txv_in;
+        args[spawned].in_base = g_txv_in; args[spawned].res_base = g_txv_results;
         args[spawned].t1_tap = &g_t1_tap; args[spawned].t1_tap_pool = &g_t1_tap_pool;
         args[spawned].t1_tap_built = g_t1_tap_built;
         if (bmc_pthread_create(&tids[spawned], txv_worker_thread, &args[spawned]) != 0){

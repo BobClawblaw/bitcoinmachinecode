@@ -6424,8 +6424,11 @@ static void dlc_stop_workers(pid_t* kids, int nw, const char* why){
         struct timespec g={0,10000000L}; nanosleep(&g,NULL);
     }
     for(int w=0;w<nw;w++) if(kids[w]) kill(kids[w], SIGKILL);
-    for(int w=0;w<nw;w++) if(kids[w]){ int stt; if(!dl_reap_bounded(kids[w],&stt,5000))
-        fprintf(stderr,"[dlc] worker pid %d survived SIGKILL for 5 s -- not waiting on it\n", (int)kids[w]); kids[w]=0; }
+    for(int w=0;w<nw;w++) if(kids[w]){ int stt;
+        if(!dl_reap_bounded(kids[w],&stt,5000))
+            fprintf(stderr,"[dlc] worker pid %d survived SIGKILL for 5 s -- not waiting on it\n", (int)kids[w]);
+        kids[w]=0;                              /* gone or abandoned: either way no longer ours */
+    }
     dlc_stop_committer();                       /* before anything truncates the archive under it */
 }
 /* The reject hook's half (see dl_reject_block): a no-op unless dl_catchup is
