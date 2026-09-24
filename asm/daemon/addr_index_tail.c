@@ -351,6 +351,31 @@ void axt_boot(void* store_buf){
      * the engine applies each block. */
     long archive_tip = *(int*)((u8*)store_buf + 24);
     long tip = axt_limit(archive_tip);
+    /* 2026-09-24: a journal that fell BEHIND the history base holds nothing
+     * the base does not (every record it has is at or below its coverage,
+     * which is below the base's), so it is superseded: set it aside and take
+     * the fresh-journal path below, which adopts the base and backfills only
+     * the rest. m5ultra mainnet: the journal stopped at 274442 with the UTXO
+     * engine's halt, the rebuild rebuilt the base to 799999 from the new
+     * undo, and the gap rule below disabled the index for 539k blocks it
+     * could close in 13.6k. Renamed, not deleted (one fixed name, the next
+     * one replaces it); a healthy journal leads the base and never lands
+     * here. */
+    if (max_h >= 0 && ah_available && ah_to_height && ah_available()){
+        long base_to = ah_to_height();
+        if (base_to > max_h && base_to <= tip){
+            close(fd);
+            if (rename(AXF_TAIL_FILE, AXF_TAIL_FILE ".stale") != 0){
+                fprintf(stderr, "[addrindex] journal at %ld is behind the history base (%ld) but cannot be set aside -- disabled\n", max_h, base_to);
+                return;
+            }
+            fd = open(AXF_TAIL_FILE, O_RDWR | O_CREAT | O_APPEND, 0644);
+            if (fd < 0){ fprintf(stderr, "[addrindex] cannot open a fresh %s -- disabled\n", AXF_TAIL_FILE); return; }
+            fprintf(stderr, "[addrindex] journal at %ld is behind the history base (%ld): superseded, set aside as %s.stale "
+                            "(safe to delete) -- starting a fresh journal on the base\n", max_h, base_to, AXF_TAIL_FILE);
+            max_h = -1;
+        }
+    }
     long covered = max_h;                        /* -1 for a fresh file */
     /* 2026-09-08: a fresh journal on a node that has the address HISTORY base
      * (addr_hist.dat, built to its to_height) starts right after that base:
