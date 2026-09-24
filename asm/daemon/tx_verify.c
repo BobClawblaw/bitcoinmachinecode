@@ -85,7 +85,6 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "../bmc_thread.h"
-#include <semaphore.h>
 #include <time.h>
 
 typedef unsigned char u8;
@@ -1433,9 +1432,10 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
  * bottleneck fixed tonight, just applied to OS threads instead of memory:
  * a fixed-size (TXVB_MAX_WORKERS) pool of worker threads started lazily
  * (grown, never shrunk, via txvb_pool_ensure) and parked on their own
- * semaphore between rounds instead of exiting. The main thread posts one
- * work descriptor + wakes each worker's semaphore, then waits on a shared
- * "done" semaphore once per worker to know the round finished -- same
+ * condition variable between rounds instead of exiting (semaphores until
+ * 2026-09-24 -- see the slot struct). The main thread posts one work
+ * descriptor + bumps each worker's round, then waits on a shared "done"
+ * count to reach the number it woke to know the round finished -- same
  * fan-out/barrier shape as before, just without tearing down and
  * recreating the OS threads themselves every time.
  *
@@ -1456,7 +1456,16 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
  * this section's header is unchanged. */
 typedef struct {
     pthread_t tid;
-    sem_t work_sem;
+    /* 2026-09-24 (bmc_osx 182c0d87): mutex+condvar with an explicit round
+     * generation, not sem_t. macOS has no working unnamed semaphores
+     * (sem_init fails; sem_wait/sem_post then no-op), so both barriers were
+     * silent there: workers read unfilled slots, and the verdict was read
+     * before the workers finished. Linux semaphores work; this is the same
+     * barrier on both, so the two trees keep one copy of the pool. */
+    pthread_mutex_t lock;
+    pthread_cond_t  cv;
+    u64 round;                 /* bumped per dispatch; a worker runs when round != seen */
+    u64 seen;                  /* worker-private: the last round it ran */
     txvb_in_t* flat; txvb_result_t* res; unsigned long long flags;
     u64* next;                 /* shared claim counter for this round */
     u64  total;                /* one past the last claimable index */
@@ -1464,8 +1473,8 @@ typedef struct {
 
 static txvb_worker_slot_t g_txvb_pool[TXVB_MAX_WORKERS];
 static int g_txvb_pool_size = 0;
-static sem_t g_txvb_done_sem;
-static int g_txvb_done_sem_ready = 0;
+static struct { pthread_mutex_t lock; pthread_cond_t cv; u64 count; }
+    g_txvb_done = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0 };
 
 /* Loops forever -- these workers live for the process's whole lifetime,
  * same as this codebase's convention elsewhere of never gracefully
@@ -1479,11 +1488,16 @@ static void* txvb_worker_loop(void* argp){
                                          * whole process-lifetime, not once per
                                          * dispatch round either. */
     for (;;){
-        /* sem_wait/sem_post are the round's memory barriers: everything the
-         * main thread wrote into flat[]/g_spk_pool/g_tap_pool before posting
-         * work_sem is visible here, and everything written into res[] here
-         * is visible to the main thread after it drains g_txvb_done_sem. */
-        sem_wait(&w->work_sem);
+        /* the slot lock and the done counter are the round's memory
+         * barriers: everything the main thread wrote into flat[]/g_spk_pool/
+         * g_tap_pool before bumping round is visible here, and everything
+         * written into res[] here is visible to the main thread once the
+         * done count reaches its spawned total. */
+        pthread_mutex_lock(&w->lock);
+        while (w->seen == w->round)
+            pthread_cond_wait(&w->cv, &w->lock);
+        w->seen = w->round;
+        pthread_mutex_unlock(&w->lock);
         for (;;){
             u64 i = __atomic_fetch_add(w->next, 1, __ATOMIC_RELAXED);
             if (i >= w->total) break;
@@ -1493,7 +1507,10 @@ static void* txvb_worker_loop(void* argp){
             if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(w->res[i].reason, r, n); w->res[i].reason[n]=0; }
         }
         txv_session_end();      /* IR-5: never leave a key set past the scope that owns it */
-        sem_post(&g_txvb_done_sem);
+        pthread_mutex_lock(&g_txvb_done.lock);
+        g_txvb_done.count++;
+        pthread_cond_signal(&g_txvb_done.cv);
+        pthread_mutex_unlock(&g_txvb_done.lock);
     }
     return 0;   /* unreachable -- for(;;) above never exits, see this
                  * function's own header comment */
@@ -1505,10 +1522,11 @@ static void* txvb_worker_loop(void* argp){
  * fails, matching txvb_verify_all's existing "finish inline" fallback
  * story for whatever didn't get a thread). */
 static int txvb_pool_ensure(int need){
-    if (!g_txvb_done_sem_ready) { sem_init(&g_txvb_done_sem, 0, 0); g_txvb_done_sem_ready = 1; }
     while (g_txvb_pool_size < need){
         txvb_worker_slot_t* w = &g_txvb_pool[g_txvb_pool_size];
-        sem_init(&w->work_sem, 0, 0);
+        pthread_mutex_init(&w->lock, 0);
+        pthread_cond_init(&w->cv, 0);
+        w->round = 0; w->seen = 0;
         if (bmc_pthread_create(&w->tid, txvb_worker_loop, w) != 0) break;
         g_txvb_pool_size++;
     }
@@ -1554,15 +1572,24 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
     static u64 claim;            /* one round at a time; the pool is not
                                   * re-entrant and never has been */
     claim = 0;
+    pthread_mutex_lock(&g_txvb_done.lock);
+    g_txvb_done.count = 0;               /* this round's baseline */
+    pthread_mutex_unlock(&g_txvb_done.lock);
     int spawned = 0;
     for (int w=0; w<nspawn; w++){
         txvb_worker_slot_t* slot = &g_txvb_pool[w];
+        pthread_mutex_lock(&slot->lock);
         slot->flat=flat; slot->res=res; slot->flags=flags;
         slot->next=&claim; slot->total=total;
-        sem_post(&slot->work_sem);
+        slot->round++;                   /* release this worker */
+        pthread_cond_signal(&slot->cv);
+        pthread_mutex_unlock(&slot->lock);
         spawned++;
     }
-    for (int w=0; w<spawned; w++) sem_wait(&g_txvb_done_sem);
+    pthread_mutex_lock(&g_txvb_done.lock);   /* join: every spawned worker posted for THIS round */
+    while (g_txvb_done.count < (u64)spawned)
+        pthread_cond_wait(&g_txvb_done.cv, &g_txvb_done.lock);
+    pthread_mutex_unlock(&g_txvb_done.lock);
 
     /* plain static, not __thread -- runs only after every worker has
      * already joined above (sequential), same as txv_verify_all's own
