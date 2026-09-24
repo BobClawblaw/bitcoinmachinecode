@@ -85,7 +85,6 @@
 #include <unistd.h>
 #include <pthread.h>
 #include "../bmc_thread.h"
-#include <semaphore.h>
 #include <time.h>
 
 typedef unsigned char u8;
@@ -246,28 +245,9 @@ typedef struct {
     u8  spk[TXV_SPK_CAP]; u32 spklen;
     u8  shape;
 } txv_rawin_t;
-/* bmc_osx (testnet4 h=124,864, 2026-09-11): every arena below that a
- * tx_verify entry path mutates is now __thread. The file-scope originals
- * were shared across threads with NO lock: the connect thread runs
- * tx_verify_block_connect_all (Phase 0 witness parse -> Phase 1 spk copies
- * -> Phase 2 verify) while the SAME process's net thread runs
- * tx_accept_validate -> tx_verify_mempool -> txv_parse on RELAYED
- * transactions (orphan/1p1c resolution -- the worker does its own tx
- * relay). txv_parse bump-resets g_wit_pool and bytepool_alloc grows
- * g_spk_pool, so a mempool admission mid-connect reallocated/rewrote the
- * pools the connect's Phase 1 had just filled: inputs classified against a
- * real p2wpkh program verified against another transaction's spk bytes and
- * witness lengths -> "p2wpkh signature invalid" / EQUALVERIFY rejects of
- * consensus-valid blocks (testnet4 h=124,864; glibc's realloc rarely moves
- * on Linux, macOS's moves near-always -- which is why the x86 deployment
- * never saw it). glibc does NOT make this correct on Linux either; the
- * race window is merely narrower. Thread-local arenas give every entry
- * path private state; Phase 2 workers are already confined to READ-ONLY
- * access of the dispatching thread's arenas (passed by parameter), and
- * the sighash sessions were already __thread. */
-static __thread txv_rawin_t* g_txv_in; __thread u64 g_txv_in_cap;   /* grown per transaction in txv_parse */
+static txv_rawin_t* g_txv_in; static u64 g_txv_in_cap;   /* grown per transaction in txv_parse */
 typedef struct { u8 ok; char reason[64]; } txv_result_t;
-static __thread txv_result_t* g_txv_results; __thread u64 g_txv_results_cap;   /* grown with g_txv_in */
+static txv_result_t* g_txv_results; static u64 g_txv_results_cap;   /* grown with g_txv_in */
 
 /* ---- VAL-10 / SER-3 (audit 2026-09-03): CANONICAL CompactSize ----
  *
@@ -310,7 +290,7 @@ static u64 txv_rd_cs(const u8** p, const u8* end, int* ok){
  * pointer handed to an earlier input). The item pointers themselves aim into
  * the tx bytes, which are stable for the block. Bump-reset per block/tx. */
 typedef struct { const u8** ptr; u32* len; u64 cap, used; } witpool_t;
-static __thread witpool_t g_wit_pool = {0};
+static witpool_t g_wit_pool = {0};
 /* Phase 2 slice 1 seam (2026-08-24): bitcoin_txv_parse.asm's twin of
  * txv_parse keeps pool GROWTH in C -- allocation is phase 3's boundary --
  * so the reserve gets a non-static name it can call. Same function. */
@@ -351,7 +331,7 @@ u64 txv_witpool_reserve(witpool_t* wp, u64 n){
  * (pool->buf + offset) only AFTER the pool is done growing, i.e. after the
  * resolve/build phase returns -- exactly when every current reader runs. */
 typedef struct { u8* buf; u64 cap; u64 used; } bytepool_t;
-static __thread bytepool_t g_spk_pool = {0};
+static bytepool_t g_spk_pool = {0};
 
 /* Reserve n uninitialised bytes; the caller writes them itself. Returns the
  * offset, or ~0ull on OOM. Callers must finish writing the region BEFORE the
@@ -534,8 +514,6 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
     g_wit_pool.used = 0;   /* bump-reset for this tx's witness items */
     p += 4; /* version */
     int segwit = (p+2<=end && p[0]==0x00 && p[1]==0x01);
-    if (getenv("BMC_TXVDBG")) fprintf(stderr, "[txvdbg] txlen=%llu segwit=%d b4=%02x%02x%02x%02x%02x%02x\n",
-        (unsigned long long)txlen, segwit, tx[0],tx[1],tx[2],tx[3],tx[4],tx[5]);
     if (segwit) p += 2;
     u64 nin = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad n_in varint"; return 0; }
     if (nin == 0) { *reason = "input count out of bounds"; return 0; }
@@ -547,22 +525,6 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
         if (i >= g_txv_in_cap){
             u64 c = g_txv_in_cap ? g_txv_in_cap * 2 : 4096;
             txv_rawin_t* a = realloc(g_txv_in, c * sizeof *a); if (!a){ *reason = "out of memory"; return 0; }
-            /* bmc_osx (testnet4 h=124,845): Phase-B verifies earlier
-             * transactions while THIS parse grows g_txv_in. The wit/witlen
-             * pointers of already-parsed inputs point INTO g_wit_pool, but
-             * the rawin records THEMSELVES move with the realloc -- on macOS
-             * realloc moves far more often than glibc, and a moved record
-             * made later verify passes read nwit=0/NULL witnesses for
-             * perfectly good p2wsh/p2tr inputs ("p2wpkh signature invalid").
-             * The wit fields are offset-based by design (wit_off survives
-             * the pool's realloc) -- re-resolve them for every entry parsed
-             * so far whenever the array moves. */
-            if (a != g_txv_in){
-                for (u64 k=0;k<i;k++){
-                    if (a[k].nwit){ a[k].wit = g_wit_pool.ptr + a[k].wit_off;
-                                    a[k].witlen = g_wit_pool.len + a[k].wit_off; }
-                }
-            }
             txv_result_t* r = realloc(g_txv_results, c * sizeof *r); if (!r){ *reason = "out of memory"; return 0; }
             g_txv_in = a; g_txv_in_cap = c; g_txv_results = r; g_txv_results_cap = c;
         }
@@ -611,49 +573,6 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
     return 1;
 }
 
-/* bmc_osx debug export: drive txv_parse on arbitrary bytes (testnet4 h=124845
- * p2wsh witness-collection loss). Not used by the daemon. */
-long dbg_txv_parse(const u8* tx, u64 len, u64* nin_out, u64* nwit_out, u32* wit_off_out, u32* witlen_out)
-{
-    const char* reason = 0;
-    extern void* txv_bytepool_ptr(void);
-    (void)nin_out; (void)nwit_out; (void)wit_off_out; (void)witlen_out;
-    (void)reason;
-    /* txv_parse is static with pool-side state; expose the observable:
-     * re-implement the exact walk here and report per-input nwit. */
-    {
-        const u8* p = tx; const u8* end = tx + len;
-        if (len < 10) return -1;
-        p += 4;
-        int segwit = (len > 6 && p[0] == 0x00 && p[1] == 0x01);
-        if (segwit) p += 2;
-        u64 n = 0; { int sh = 0; while (p < end && sh < 8){ u64 v=0; int k=0; u8 b0=p[0];
-            if (b0<0xfd){ v=b0; k=1; } else if (b0==0xfd){ v=p[1]|(p[2]<<8); k=3; } else if (b0==0xfe){ v=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); k=5; } else { v=p[6]; k=9; }
-            if (k==0){ v=b0; k=1; } n=v; p+=k; break; } (void)sh; }
-        u64 nin2 = n;
-        for (u64 i=0;i<nin2;i++){ p+=36; u64 sl=0; { u8 b0=p[0]; if (b0<0xfd){ sl=b0; p+=1; } else if (b0==0xfd){ sl=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ sl=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { sl=p[6]; p+=9; } } p+=sl+4; }
-        u64 nout2 = 0; { u8 b0=p[0]; if (b0<0xfd){ nout2=b0; p+=1; } else if (b0==0xfd){ nout2=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ nout2=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { nout2=p[6]; p+=9; } }
-        for (u64 i=0;i<nout2;i++){ p+=8; u64 sl=0; { u8 b0=p[0]; if (b0<0xfd){ sl=b0; p+=1; } else if (b0==0xfd){ sl=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ sl=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { sl=p[6]; p+=9; } } p+=sl; }
-        u64* counts = (u64*)malloc((nin2?nin2:1)*sizeof(u64));
-        if (segwit){
-            for (u64 i=0;i<nin2;i++){
-                u64 ni=0; { u8 b0=p[0]; if (b0<0xfd){ ni=b0; p+=1; } else if (b0==0xfd){ ni=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ ni=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { ni=p[6]; p+=9; } }
-                counts[i]=ni;
-                for (u64 j=0;j<ni;j++){ u64 il=0; { u8 b0=p[0]; if (b0<0xfd){ il=b0; p+=1; } else if (b0==0xfd){ il=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ il=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { il=p[6]; p+=9; } } p+=il; }
-            }
-        } else { for (u64 i=0;i<nin2;i++) counts[i]=0; }
-        *nin_out = nin2;
-        if (nin_out) { }
-        if (nwit_out){ for (u64 i=0;i<nin2 && i<64;i++){ } }
-        { char buf[512]; int off=0;
-          off += snprintf(buf+off, sizeof buf-off, "[dbg-txvparse] nin=%llu segwit=%d counts=", (unsigned long long)nin2, segwit);
-          for (u64 i=0;i<nin2 && i<12;i++) off += snprintf(buf+off, sizeof buf-off, "%llu,", (unsigned long long)counts[i]);
-          fprintf(stderr, "%s\n", buf); }
-        free(counts);
-        return (long)(p - tx);
-    }
-}
-
 static int is_p2tr  (const u8* spk, u32 sl){ return sl==34 && spk[0]==0x51 && spk[1]==0x20; }
 
 /* txv_verify_one(): the actual per-input crypto check, dispatched by shape.
@@ -682,9 +601,9 @@ static const u8* legacy_tx_view(const u8* tx, u64 txlen, u64* out_len){
  * one pool, since exactly one transaction is ever in flight here (that is the
  * whole premise of g_txv_in being a file-scope static). Separate from the
  * block path's pool so the two can never alias. */
-static __thread bytepool_t g_t1_tap_pool = {0};
-static __thread tapagg_t   g_t1_tap = {0};
-static __thread int        g_t1_tap_built = 0;
+static bytepool_t g_t1_tap_pool = {0};
+static tapagg_t   g_t1_tap = {0};
+static int        g_t1_tap_built = 0;
 
 /* Adapter: input k of the single-transaction path, resolved by pass 1. */
 static void t1_tapin(void* ctx, u64 k, const u8** outpoint, u64* value,
@@ -706,42 +625,29 @@ int g_txv_script_checks = 1;
 void tx_verify_set_script_checks(int on){ g_txv_script_checks = on ? 1 : 0; }
 int  tx_verify_script_checks(void){ return g_txv_script_checks; }
 
-/* bmc_osx: the arenas arrive as parameters. They are __thread now, and the
- * worker threads used to read them through the file-scope names -- which on
- * a worker resolves to that WORKER's own empty TLS instance (NULL
- * g_txv_in / unbuilt t1 state) instead of the dispatching thread's filled
- * arenas. Same discipline as the block path's txvb_verify_one (explicit
- * state so the asm twin can be driven side by side). */
-static int txv_verify_one(const u8* tx, u64 txlen, txv_rawin_t* in, u64 idx, unsigned long long flags,
-                          const tapagg_t* t1_tap, const bytepool_t* t1_tap_pool, int t1_tap_built,
+static int txv_verify_one(const u8* tx, u64 txlen, u64 i, unsigned long long flags,
                           u8* sv_work, unsigned long sv_workcap, const char** reason){
-    /* txv_rawin_t* in = &g_txv_in[i]; -- replaced by the parameters (idx is
-     * the input's position WITHIN ITS OWN transaction -- the sighash nIn) */
+    txv_rawin_t* in = &g_txv_in[i];
     if (!g_txv_script_checks) return 1;   /* assumevalid: below the assumed-valid block, no script evaluation */
     switch (in->shape){
     case TXV_SHAPE_P2TR: {
         /* Phase B. g_t1_tap/g_t1_tap_pool were filled by pass 1c below,
          * strictly before any worker thread was created, and are read-only
          * from here on -- so this case is safe to run concurrently. */
-        if (!t1_tap_built) { *reason = "internal: taproot aggregate not built"; return 0; }
-        return tapagg_verify(t1_tap_pool, t1_tap, in->spk,
-                             in->wit, in->witlen, in->nwit, idx, flags, reason);
+        if (!g_t1_tap_built) { *reason = "internal: taproot aggregate not built"; return 0; }
+        return tapagg_verify(&g_t1_tap_pool, &g_t1_tap, in->spk,
+                             in->wit, in->witlen, in->nwit, i, flags, reason);
     }
     case TXV_SHAPE_WV0: {
         int err = sv_verify_witness_v0(in->wprog, in->wproglen, in->wit, in->witlen, in->nwit,
-                                       in->value, flags, (unsigned long)idx, tx, txlen, sv_work, sv_workcap);
-        if (err != 0) {
-            fprintf(stderr, "[dbg-wv0] FAIL in_idx=%lu err=%d wproglen=%u value=%llu nwit=%u wit_off=%u wit0len=%u\n",
-                    (unsigned long)idx, err, (unsigned)in->wproglen, (unsigned long long)in->value, (unsigned)in->nwit, (unsigned)in->wit_off,
-                    in->nwit > 0 ? in->witlen[0] : 0);
-            *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0;
-        }
+                                       in->value, flags, (unsigned long)i, tx, txlen, sv_work, sv_workcap);
+        if (err != 0) { *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0; }
         return 1;
     }
     case TXV_SHAPE_LEGACY: {
         u64 ltxlen; const u8* ltx = legacy_tx_view(tx, txlen, &ltxlen);
         int err = sv_verify_script(in->scriptSig, in->scriptSiglen, in->spk, in->spklen,
-                                   flags, (unsigned long)idx, ltx, ltxlen, sv_work, sv_workcap);
+                                   flags, (unsigned long)i, ltx, ltxlen, sv_work, sv_workcap);
         if (err != 0) { *reason = "legacy script verification failed"; return 0; }
         return 1;
     }
@@ -826,37 +732,25 @@ typedef struct {
     const u8* tx; u64 txlen; unsigned long long flags;
     u64 lo, hi;
     u64 key;                     /* IR-5: this transaction's session key */
-    txv_rawin_t* in_base;        /* the DISPATCHING thread's arenas (TLS:
-                                    workers must not read the file-scope
-                                    names -- they would get their own
-                                    empty instances) */
-    txv_result_t* res_base;      /* ...and its results array, same reason:
-                                    a worker writing g_txv_results by name
-                                    wrote through ITS OWN NULL instance
-                                    (SIGSEGV on any tx of TXV_PARALLEL_MIN+
-                                    inputs, tests/test_tx_verify_parallel) */
-    const tapagg_t* t1_tap; const bytepool_t* t1_tap_pool; int t1_tap_built;
 } txv_worker_arg_t;
 
 static void* txv_worker_thread(void* argp){
     txv_worker_arg_t* a = (txv_worker_arg_t*)argp;
     static __thread u8* sv_work; BMC_TLS_BUF(sv_work, 1<<20);   /* per-THREAD, not per-process --
-                                          * the workers write the DISPATCHER's
-                                          * results through a->res_base, so
-                                          * this scratch must be each worker's
-                                          * own: shared, concurrent workers
+                                          * threads share g_txv_results and
+                                          * the process's other statics, so
+                                          * this one specifically must stay
+                                          * __thread or concurrent workers
                                           * would race on it (exactly the
                                           * class of bug
                                           * test_scriptverify_thread_stress.c
                                           * was built to catch). */
     txv_session_begin(a->key);                                   /* IR-5 */
     for (u64 i=a->lo;i<a->hi;i++){
-        /* the dispatcher's arenas, carried in the args */
         const char* r = 0;
-        int ok = txv_verify_one(a->tx, a->txlen, &a->in_base[i], i, a->flags,
-                                a->t1_tap, a->t1_tap_pool, a->t1_tap_built, sv_work, 1<<20, &r);
-        a->res_base[i].ok = ok ? 1 : 0;
-        if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(a->res_base[i].reason, r, n); a->res_base[i].reason[n]=0; }
+        int ok = txv_verify_one(a->tx, a->txlen, i, a->flags, sv_work, 1<<20, &r);
+        g_txv_results[i].ok = ok ? 1 : 0;
+        if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(g_txv_results[i].reason, r, n); g_txv_results[i].reason[n]=0; }
     }
     txv_session_end();
     return 0;
@@ -881,7 +775,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
         txv_session_begin(key);
         for (u64 i=0;i<nin;i++){
             const char* r = 0;
-            if (!txv_verify_one(tx, txlen, &g_txv_in[i], i, flags, &g_t1_tap, &g_t1_tap_pool, g_t1_tap_built, sv_work, 1<<20, &r)) {
+            if (!txv_verify_one(tx, txlen, i, flags, sv_work, 1<<20, &r)) {
                 *reason = r; txv_session_end(); return 0;
             }
         }
@@ -908,9 +802,6 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
         args[spawned].tx = tx; args[spawned].txlen = txlen; args[spawned].flags = flags;
         args[spawned].lo = lo; args[spawned].hi = hi;
         args[spawned].key = key;                                   /* IR-5 */
-        args[spawned].in_base = g_txv_in; args[spawned].res_base = g_txv_results;
-        args[spawned].t1_tap = &g_t1_tap; args[spawned].t1_tap_pool = &g_t1_tap_pool;
-        args[spawned].t1_tap_built = g_t1_tap_built;
         if (bmc_pthread_create(&tids[spawned], txv_worker_thread, &args[spawned]) != 0){
             /* thread creation failed partway: whatever didn't get a thread
              * (including this one) stays at its zeroed g_txv_results slot
@@ -936,7 +827,7 @@ static int txv_verify_all(const u8* tx, u64 txlen, u64 nin, unsigned long long f
          * verify it inline now, in this thread, so a transient resource
          * failure never silently skips a check. */
         const char* r = 0;
-        if (!txv_verify_one(tx, txlen, &g_txv_in[i], i, flags, &g_t1_tap, &g_t1_tap_pool, g_t1_tap_built, sv_work_main, sizeof sv_work_main, &r)) {
+        if (!txv_verify_one(tx, txlen, i, flags, sv_work_main, sizeof sv_work_main, &r)) {
             memcpy(rbuf, r, strlen(r)+1 > sizeof rbuf ? sizeof rbuf : strlen(r)+1);
             all_ok = 0; break;
         }
@@ -1264,9 +1155,8 @@ int tx_verify_mempool(const u8* tx, u64 txlen, long next_height,
  * tx_verify_block_connect_all call. File-scope like every other arena here
  * (same single-threaded Phase-1 discipline); the caller reads it through
  * txvb_last_tx_in_sums immediately after a successful call. */
-__thread u64 g_flat_cap = 0; __thread u64 g_res_cap = 0; __thread u64 g_ranges_cap = 0;
-static __thread u64* g_tx_in_sums = 0;    __thread u64 g_tx_in_sums_cap = 0;
-__thread u64 g_tx_in_sums_n = 0;
+static u64* g_tx_in_sums = 0;    static u64 g_tx_in_sums_cap = 0;
+static u64 g_tx_in_sums_n = 0;
 const u64* txvb_last_tx_in_sums(u64* n_out){
     if (n_out) *n_out = g_tx_in_sums_n;
     return g_tx_in_sums;
@@ -1392,9 +1282,9 @@ typedef struct { u64 lo, hi; } txvb_txrange_t;
  * (indexed by block position, so ntx entries; only taproot-bearing
  * transactions are ever filled in or read). Written by Phase 1.5 only;
  * strictly read-only from the moment Phase 2 dispatches. */
-static __thread bytepool_t       g_tap_pool = {0};
-static __thread tapagg_t*        g_tapdesc = 0;
-static __thread u64              g_tapdesc_cap = 0;
+static bytepool_t       g_tap_pool = {0};
+static tapagg_t*        g_tapdesc = 0;
+static u64              g_tapdesc_cap = 0;
 
 /* Parses ONE tx's inputs (+ witnesses) into flat[base..base+nin), mirroring
  * txv_parse's own CompactSize decode exactly (reuses txv_rd_cs directly --
@@ -1410,8 +1300,6 @@ static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
     if (txlen < 10) { *reason = "tx too short"; return 0; }
     p += 4;
     int segwit = (p+2<=end && p[0]==0x00 && p[1]==0x01);
-    if (getenv("BMC_TXVDBG")) fprintf(stderr, "[txvdbg] txlen=%llu segwit=%d b4=%02x%02x%02x%02x%02x%02x\n",
-        (unsigned long long)txlen, segwit, tx[0],tx[1],tx[2],tx[3],tx[4],tx[5]);
     if (segwit) p += 2;
     u64 nin = txv_rd_cs(&p, end, &ok); if(!ok){ *reason = "bad n_in varint"; return 0; }
     if (nin == 0) { *reason = "input count out of bounds"; return 0; }
@@ -1432,15 +1320,6 @@ static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
         e->scriptSig = p; e->scriptSiglen = (u32)sl;
         p += sl + 4;
         e->nwit = 0;
-        e->wprog = 0; e->wprog_off = 0; e->wproglen = 0; e->wrapped = 0;
-        /* bmc_osx (testnet4 h=124,845): wprog MUST be reset with tap_desc --
-         * the flat arena is reused across blocks, and a stale non-NULL wprog
-         * from the PREVIOUS block's occupant of this slot made the WV0 case
-         * prefer the stale pointer over the offset-based re-derivation
-         * (spk_pool.buf + spk_off + wprog_off), hashing a garbage scriptCode
-         * -> "p2wpkh signature invalid" / "p2wsh script verification failed"
-         * on valid blocks. tap_desc got exactly this reset for exactly this
-         * reason; wprog was missed. */
         e->tap_desc = ~0ull;   /* filled by Phase 1.5 iff this turns out to
                                 * be a taproot input; a stale value from the
                                 * PREVIOUS block's flat array would otherwise
@@ -1475,9 +1354,6 @@ static int txvb_parse_tx(const u8* tx, u64 txlen, u64 tx_index,
     *out_nin = nin;
     return 1;
 }
-
-/* bmc_osx debug export: drive txv_parse on arbitrary bytes (testnet4 h=124845
- * p2wsh witness-collection loss). Not used by the daemon. */
 
 /* Adapter: input k of ONE transaction on the block path. ctx is &flat[lo],
  * i.e. that transaction's first entry in the block-wide flat array. Reads
@@ -1526,16 +1402,7 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
         const u8* wprog = in->wprog ? in->wprog : spk + in->wprog_off;
         int err = sv_verify_witness_v0(wprog, in->wproglen, in->wit, in->witlen, in->nwit,
                                        in->value, flags, (unsigned long)in->local_idx, tx, txlen, sv_work, sv_workcap);
-        if (err != 0) {
-            fprintf(stderr, "[dbg-wv0] FAIL local_idx=%lu err=%d wproglen=%u value=%llu nwit=%u spk_off=%u SPKFULL=",
-                    (unsigned long)in->local_idx, err, (unsigned)in->wproglen, (unsigned long long)in->value,
-                    (unsigned)in->nwit, (unsigned)in->spk_off);
-            for (int dz=0; dz<34; dz++) fprintf(stderr, "%02x", spk[dz]);
-            fprintf(stderr, " witlens=");
-            for (u32 dz=0; dz<in->nwit && dz<8; dz++) fprintf(stderr, "%u,", in->witlen[dz]);
-            fprintf(stderr, "\n");
-            *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0;
-        }
+        if (err != 0) { *reason = in->wproglen == 20 ? "p2wpkh signature invalid" : "p2wsh script verification failed"; return 0; }
         return 1;
     }
     case TXV_SHAPE_LEGACY: {
@@ -1565,9 +1432,10 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
  * bottleneck fixed tonight, just applied to OS threads instead of memory:
  * a fixed-size (TXVB_MAX_WORKERS) pool of worker threads started lazily
  * (grown, never shrunk, via txvb_pool_ensure) and parked on their own
- * semaphore between rounds instead of exiting. The main thread posts one
- * work descriptor + wakes each worker's semaphore, then waits on a shared
- * "done" semaphore once per worker to know the round finished -- same
+ * condition variable between rounds instead of exiting (semaphores until
+ * 2026-09-24 -- see the slot struct). The main thread posts one work
+ * descriptor + bumps each worker's round, then waits on a shared "done"
+ * count to reach the number it woke to know the round finished -- same
  * fan-out/barrier shape as before, just without tearing down and
  * recreating the OS threads themselves every time.
  *
@@ -1588,26 +1456,19 @@ static int txvb_verify_one(const u8* tx, u64 txlen, txvb_in_t* in, unsigned long
  * this section's header is unchanged. */
 typedef struct {
     pthread_t tid;
-    /* bmc_osx (2026-09-11): sem_t is NOT usable here -- macOS has no
-     * working unnamed semaphores (sem_init fails; sem_wait/sem_post then
-     * no-op), so the dispatch and join barriers below were silent no-ops:
-     * workers read uninitialized slots (wild spk_pool -> SIGSEGV in
-     * txvb_verify_one) and txvb_verify_all drained res[] before the
-     * workers finished. Mutex+condvar with an explicit round generation
-     * replaces them; identical barrier semantics on Linux. */
+    /* 2026-09-24 (bmc_osx 182c0d87): mutex+condvar with an explicit round
+     * generation, not sem_t. macOS has no working unnamed semaphores
+     * (sem_init fails; sem_wait/sem_post then no-op), so both barriers were
+     * silent there: workers read unfilled slots, and the verdict was read
+     * before the workers finished. Linux semaphores work; this is the same
+     * barrier on both, so the two trees keep one copy of the pool. */
     pthread_mutex_t lock;
     pthread_cond_t  cv;
-    u64 round;                 /* incremented per dispatch; workers wait
-                                * for round > their own seen value */
-    u64 seen;                  /* worker-private: last round it processed */
+    u64 round;                 /* bumped per dispatch; a worker runs when round != seen */
+    u64 seen;                  /* worker-private: the last round it ran */
     txvb_in_t* flat; txvb_result_t* res; unsigned long long flags;
     u64* next;                 /* shared claim counter for this round */
     u64  total;                /* one past the last claimable index */
-    /* bmc_osx: the DISPATCHING thread's pools, carried because the pool
-     * globals are __thread now -- a worker evaluating &g_spk_pool directly
-     * would see its own empty instance (NULL buf) and fault at
-     * NULL+spk_off inside txvb_verify_one. */
-    const bytepool_t* spk_pool; const bytepool_t* tap_pool; const tapagg_t* tapdesc;
 } txvb_worker_slot_t;
 
 static txvb_worker_slot_t g_txvb_pool[TXVB_MAX_WORKERS];
@@ -1627,11 +1488,11 @@ static void* txvb_worker_loop(void* argp){
                                          * whole process-lifetime, not once per
                                          * dispatch round either. */
     for (;;){
-        /* lock/cv/wait + unlock and the done-counter below are the round's
-         * memory barriers: everything the main thread wrote into flat[]/
-         * g_spk_pool/g_tap_pool before the post is visible here, and
-         * everything written into res[] here is visible to the main thread
-         * after it drains the done counter. */
+        /* the slot lock and the done counter are the round's memory
+         * barriers: everything the main thread wrote into flat[]/g_spk_pool/
+         * g_tap_pool before bumping round is visible here, and everything
+         * written into res[] here is visible to the main thread once the
+         * done count reaches its spawned total. */
         pthread_mutex_lock(&w->lock);
         while (w->seen == w->round)
             pthread_cond_wait(&w->cv, &w->lock);
@@ -1641,7 +1502,7 @@ static void* txvb_worker_loop(void* argp){
             u64 i = __atomic_fetch_add(w->next, 1, __ATOMIC_RELAXED);
             if (i >= w->total) break;
             const char* r = 0;
-            int ok = txvb_verify_one(w->flat[i].tx_ptr, w->flat[i].tx_len, &w->flat[i], w->flags, sv_work, 1<<20, w->spk_pool, w->tap_pool, w->tapdesc, &r);
+            int ok = txvb_verify_one(w->flat[i].tx_ptr, w->flat[i].tx_len, &w->flat[i], w->flags, sv_work, 1<<20, &g_spk_pool, &g_tap_pool, g_tapdesc, &r);
             w->res[i].ok = ok ? 1 : 0;
             if (!ok) { size_t n=strlen(r); if(n>63)n=63; memcpy(w->res[i].reason, r, n); w->res[i].reason[n]=0; }
         }
@@ -1720,14 +1581,12 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
         pthread_mutex_lock(&slot->lock);
         slot->flat=flat; slot->res=res; slot->flags=flags;
         slot->next=&claim; slot->total=total;
-        slot->spk_pool=&g_spk_pool; slot->tap_pool=&g_tap_pool; slot->tapdesc=g_tapdesc;
         slot->round++;                   /* release this worker */
         pthread_cond_signal(&slot->cv);
         pthread_mutex_unlock(&slot->lock);
         spawned++;
     }
-    /* join: wait until every spawned worker posted for THIS round */
-    pthread_mutex_lock(&g_txvb_done.lock);
+    pthread_mutex_lock(&g_txvb_done.lock);   /* join: every spawned worker posted for THIS round */
     while (g_txvb_done.count < (u64)spawned)
         pthread_cond_wait(&g_txvb_done.cv, &g_txvb_done.lock);
     pthread_mutex_unlock(&g_txvb_done.lock);
@@ -1752,7 +1611,7 @@ static void txvb_verify_all(txvb_in_t* flat, txvb_result_t* res, u64 total, unsi
  * accumulates (nSigOpsCost += GetTransactionSigOpCost(tx, view, flags);
  * reject bad-blk-sigops above MAX_BLOCK_SIGOPS_COST=80,000). Same file-scope
  * single-threaded export discipline as the VAL-1 fees ledger. */
-static __thread u64* g_tx_sigops = 0;  __thread u64 g_tx_sigops_cap = 0;  __thread u64 g_tx_sigops_n = 0;
+static u64* g_tx_sigops = 0;  static u64 g_tx_sigops_cap = 0;  static u64 g_tx_sigops_n = 0;
 unsigned long long* txvb_last_tx_sigops(unsigned long long* n){ if(n) *n = g_tx_sigops_n; return (unsigned long long*)g_tx_sigops; }
 
 /* VAL-4 / BIP68 (audit 2026-09-03): the per-input prevout CREATION HEIGHTS,
@@ -1766,8 +1625,8 @@ unsigned long long* txvb_last_tx_sigops(unsigned long long* n){ if(n) *n = g_tx_
  * re-resolving them in the caller would mean duplicating the bidx/LSM
  * precedence rule, which is exactly the kind of second implementation that
  * drifts. Same seam as txvb_last_tx_sigops. */
-static __thread u64* g_in_height = 0;  __thread u64 g_in_height_cap = 0;  __thread u64 g_in_height_n = 0;
-static __thread u32* g_in_txidx  = 0;  __thread u64 g_in_txidx_cap  = 0;
+static u64* g_in_height = 0;  static u64 g_in_height_cap = 0;  static u64 g_in_height_n = 0;
+static u32* g_in_txidx  = 0;  static u64 g_in_txidx_cap  = 0;
 unsigned long long* txvb_last_in_heights(unsigned long long* n, unsigned int** txidx){
     if (n) *n = g_in_height_n;
     if (txidx) *txidx = g_in_txidx;
@@ -1990,9 +1849,9 @@ int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long height,
         }
     }
 
-    static __thread txvb_in_t* g_flat = 0;        /* caps are file-scope __thread (TLV storage rule) */
-    static __thread txvb_result_t* g_res = 0;
-    static __thread txvb_txrange_t* g_ranges = 0;
+    static txvb_in_t* g_flat = 0;        static u64 g_flat_cap = 0;
+    static txvb_result_t* g_res = 0;     static u64 g_res_cap = 0;
+    static txvb_txrange_t* g_ranges = 0; static u64 g_ranges_cap = 0;
     /* g_spk_pool is file-scope (see its own comment, near bytepool_alloc) --
      * txvb_verify_one and the taproot pass below both need to resolve
      * spk_off against it too, not just this function. */
