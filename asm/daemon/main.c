@@ -28,6 +28,7 @@
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <sys/un.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -3647,6 +3648,40 @@ static int leg_is_anon_net(int net){ return net == BMC_NET_TORV3 || net == BMC_N
 static int dh_inflight_net(int net){ for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0 && g_dh[i].net == net) return 1; return 0; }
 static int dh_inflight_count(void){ int n = 0; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0) n++; return n; }
 static long long dh_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
+/* [dial-handoff] probe (2026-09-24). The m5ultra serve-mode storm installed
+ * helper-dialed legs that were ALREADY dead -- "closed theirs (revents 0x11)
+ * after 0s; unread: (nothing)" in the same millisecond as the install -- so
+ * the socket died somewhere between the helper's handshake and the worker's
+ * recvmsg. One line on each side of the SCM_RIGHTS handoff says where: bytes
+ * pending, the first pending v1 command, peer EOF / HUP / socket error, and
+ * the kernel's TCP state. Read-only: MSG_PEEK, FIONREAD, poll(.., 0). */
+static const char* dh_tcp_state(int fd){
+#if defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
+    struct tcp_connection_info ci; socklen_t l = sizeof ci;
+    if(getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &ci, &l) != 0) return "?";
+    static const char* n[] = { "CLOSED","LISTEN","SYN_SENT","SYN_RCVD","ESTABLISHED","CLOSE_WAIT",
+                               "FIN_WAIT_1","CLOSING","LAST_ACK","FIN_WAIT_2","TIME_WAIT" };
+    return ci.tcpi_state < sizeof n / sizeof n[0] ? n[ci.tcpi_state] : "?";
+#elif defined(TCP_INFO)
+    struct tcp_info ti; socklen_t l = sizeof ti;
+    if(getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &l) != 0) return "?";
+    static const char* n[] = { "?","ESTABLISHED","SYN_SENT","SYN_RECV","FIN_WAIT1","FIN_WAIT2",
+                               "TIME_WAIT","CLOSE","CLOSE_WAIT","LAST_ACK","LISTEN","CLOSING" };
+    return ti.tcpi_state < sizeof n / sizeof n[0] ? n[ti.tcpi_state] : "?";
+#else
+    (void)fd; return "?";
+#endif
+}
+static void dh_sock_probe(int fd, char* out, size_t cap){
+    int pend = -1; ioctl(fd, FIONREAD, &pend);
+    struct pollfd pf = { fd, POLLIN, 0 }; poll(&pf, 1, 0);
+    int serr = 0; socklen_t el = sizeof serr; getsockopt(fd, SOL_SOCKET, SO_ERROR, &serr, &el);
+    unsigned char hdr[24]; ssize_t pk = recv(fd, hdr, sizeof hdr, MSG_PEEK | MSG_DONTWAIT);
+    char first[16] = "-";
+    if(pk >= 16){ memcpy(first, hdr + 4, 12); first[12] = 0; for(int k = 0; k < 12; k++) if(first[k] && (first[k] < 32 || first[k] > 126)) first[k] = '.'; }
+    snprintf(out, cap, "pend=%d first=%s eof=%d hup=%d err=%d so_error=%d tcp=%s",
+             pend, first[0] ? first : "-", pk == 0, !!(pf.revents & POLLHUP), !!(pf.revents & POLLERR), serr, dh_tcp_state(fd));
+}
 /* The next candidate of `net` for a reserved-slot dial: a rotating cursor
  * per network, so a failed background dial is followed by the NEXT address
  * rather than the same one every pass (deploy l on 2026-09-01 re-dialled
@@ -3693,6 +3728,7 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
     if(pid < 0){ close(sp[0]); close(sp[1]); return 0; }
     if(pid == 0){
         close(sp[0]); g_in_dial_helper = 1;
+        long long t_dial0 = dh_now_ms();
         dh_result_t r; memset(&r, 0, sizeof r);
         snprintf(g_dial_fail, sizeof g_dial_fail, "refused before dialing");   /* not the parent's last reason (2026-09-10: "timed out (10s)" after 1.4 s) */
         int fd = outbound_connect(host, 300, out_port);
@@ -3709,6 +3745,9 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
                 else r.v2_len = (unsigned long)n;
             }
         } else snprintf(r.why, sizeof r.why, "%s", dial_fail_reason());
+        if(fd >= 0){ char pb[192]; dh_sock_probe(fd, pb, sizeof pb);
+                     fprintf(stderr, "[dial-handoff] %s: helper hands fd over %lldms after the dial began (%s) %s\n",
+                             host, dh_now_ms() - t_dial0, r.v2_len ? "v2" : "v1", pb); }
         struct iovec iov = { &r, sizeof r };
         char cbuf[CMSG_SPACE(sizeof(int))]; memset(cbuf, 0, sizeof cbuf);
         struct msghdr mh; memset(&mh, 0, sizeof mh); mh.msg_iov = &iov; mh.msg_iovlen = 1;
@@ -3719,6 +3758,18 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
         }
         (void)!sendmsg(sp[1], &mh, 0);
         if(r.v2_len){ unsigned long off = 0; while(off < r.v2_len){ ssize_t w = write(sp[1], blob + off, r.v2_len - off); if(w <= 0) break; off += (unsigned long)w; } }
+        /* Hold on until the worker has the fd: dh_poll closes its end after
+         * the recvmsg, which wakes this poll. On Darwin a socket passed with
+         * SCM_RIGHTS arrives DEAD (EOF + HUP, its buffered bytes discarded)
+         * when the sender exits before the receiver's recvmsg; the worker
+         * collects results once per rotation, so exiting right after the
+         * sendmsg delivered nearly every v1 leg dead -- the m5ultra serve
+         * storm (2026-09-24): "closed theirs (revents 0x11) after 0s" in the
+         * install's own millisecond, each dead leg a dial-memory backoff,
+         * the pool drained ("no dial candidate is free" x5866). v2 legs
+         * survived only because the blob write above kept the helper alive
+         * until the worker read it. Bounded by the worker's own give-up. */
+        { struct pollfd hp = { sp[1], POLLIN, 0 }; poll(&hp, 1, (int)g_dh_timeout_ms); }
         _exit(0);
     }
     close(sp[1]);
@@ -3895,6 +3946,9 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
             for(struct cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm))
                 if(cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS){ memcpy(fd_out, CMSG_DATA(cm), sizeof(int)); break; }
             if(*fd_out < 0) out->ok = 0;
+            else { char pb[192]; dh_sock_probe(*fd_out, pb, sizeof pb);
+                   fprintf(stderr, "[dial-handoff] %s: worker received fd %d %lldms after the dial began %s\n",
+                           g_dh[i].host, *fd_out, dh_now_ms() - g_dh[i].t0, pb); }
             if(out->ok && out->v2_len){                     /* the session bytes follow; the child wrote them right after the struct */
                 if(out->v2_len > DH_V2_BLOB_CAP){ out->ok = 0; snprintf(out->why, sizeof out->why, "v2 session too large"); }
                 else { unsigned long off = 0; struct pollfd pf = { g_dh[i].sp, POLLIN, 0 };
@@ -3903,8 +3957,9 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
                 if(!out->ok && *fd_out >= 0){ close(*fd_out); *fd_out = -1; }
             }
         } else if(n != (ssize_t)sizeof *out){ out->ok = 0; snprintf(out->why, sizeof out->why, "helper exited without a result"); }
+        close(g_dh[i].sp);                              /* first: the helper waits for this close before it exits */
         { int st; if(!dl_reap_bounded(g_dh[i].pid, &st, 5000)) dl_kill_reap(g_dh[i].pid, &st, "dial helper"); }
-        close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1; g_dh_last_slot = g_dh[i].want_slot;
+        g_dh[i].pid = 0; g_dh[i].sp = -1; g_dh_last_slot = g_dh[i].want_slot;
         snprintf(host_out, hcap, "%s", g_dh[i].host);
         return 1;
     }
