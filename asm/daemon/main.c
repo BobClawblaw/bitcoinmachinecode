@@ -11418,6 +11418,8 @@ int main(int argc, char** argv){
                             "this node enforces ONLY noban\n");
     }
     if(!chainparams_select(g_cfg.chain)) return 1;
+    { extern void archive_set_chain_magic(unsigned);   /* the frame check accepts this chain's magic too (NET-15 frames) */
+      archive_set_chain_magic(g_chainp->magic); }
     { extern void wallet_set_chain(const char*, unsigned char, unsigned char);
       wallet_set_chain(g_chainp->bech32_hrp, g_chainp->p2pkh_version, g_chainp->p2sh_version); }
     if(g_chainp->dns_seed_hosts && g_chainp->n_dns_seed_hosts > 0){

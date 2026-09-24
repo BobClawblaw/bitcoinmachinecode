@@ -412,6 +412,20 @@ extern int  cons_verify(const void* block, long len, void* scratch, unsigned cap
  * change the on-disk format and invalidate every existing non-mainnet
  * archive, for a property the genesis check already provides. */
 #define ARCHIVE_MAGIC     0xd9b4bef9u
+/* 2026-09-24: ...and since NET-15 (audit 2026-09-03) not the only one. The
+ * download worker and its committer now frame with net_magic, the chain's
+ * wire magic, while the serve path's store keeps this constant -- so a
+ * testnet4/signet/regtest archive carries BOTH, and a check that accepted
+ * only 0xd9b4bef9 flagged every committer-written block as "bad frame
+ * magic". STO-11's repair then zeroed those valid records and, with
+ * bmc.bootcatchup=0, nothing re-fetched them: testnet4 node B (m5ultra)
+ * stuck at 153,876 below two blanked heights. Both values are accepted; the
+ * daemon names the chain's via archive_set_chain_magic once
+ * chainparams_select has run (a tool that never calls it checks the
+ * constant alone, as before). Mainnet: the two are the same number. */
+static unsigned g_archive_chain_magic = ARCHIVE_MAGIC;
+void archive_set_chain_magic(unsigned m){ g_archive_chain_magic = m; }
+static int archive_frame_magic_ok(unsigned m){ return m == ARCHIVE_MAGIC || m == g_archive_chain_magic; }
 
 /* STO-11 (audit 2026-09-03): archive_check_collect() is archive_check() with
  * an out-list. Every height whose BODY cannot be trusted -- missing block
@@ -503,7 +517,7 @@ long archive_check_collect(long nblocks, int level, long* bad, long bad_cap, lon
             unsigned flen, fmagic;
             memcpy(&flen,   fr,     4);
             memcpy(&fmagic, fr + 4, 4);
-            if (fmagic != ARCHIVE_MAGIC){
+            if (!archive_frame_magic_ok(fmagic)){
                 fprintf(stderr,"[check] height %ld: bad frame magic 0x%08x at blk%05u.dat+%llu\n",
                         h, fmagic, fno, (unsigned long long)pos);
                 problems++;
