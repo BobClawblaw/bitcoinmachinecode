@@ -2059,7 +2059,26 @@ out:
 
 /* Worker side: answer every pending query, then return. Called ONLY from the
  * quiescent point in the worker loop. Never blocks -- a parent that went away
- * or a partial request just ends the round. */
+ * or a partial request just ends the round, and (2026-09-24) so does a
+ * channel without room for a whole reply.
+ *
+ * The replies go out with a blocking send(). Replies to queries the RPC side
+ * timed out on are never read, and on the m5ultra the channel was Darwin's
+ * 8 KB: a burst of gettxout queries could fill it and leave the worker in
+ * send() until the parent read again -- or, at a stop, until the parent
+ * EXITED, since a shutdown() of the parent's end does not wake a Darwin
+ * sender (tests/test_txoq_shutdown). A request is now read only when POLLOUT
+ * says the largest possible reply fits (SO_SNDLOWAT below; Linux reports
+ * POLLOUT at <= 1/4 of a 256 KB buffer used, 192 KB free). A parent that
+ * stops reading gets no answers -- its query times out and gettxout
+ * refuses -- and the worker keeps connecting blocks. */
+#define TXOQ_REPLY_MAX ((int)sizeof(txoq_resp) + (int)TXOQ_SPK_CAP)
+static void txoq_channel_tune(int sv[2]){              /* sv[0] the parent's end, sv[1] the worker's */
+    int bsz = 256 * 1024;
+    for(int e = 0; e < 2; e++){ setsockopt(sv[e], SOL_SOCKET, SO_SNDBUF, &bsz, sizeof bsz); setsockopt(sv[e], SOL_SOCKET, SO_RCVBUF, &bsz, sizeof bsz); }
+    int lw = TXOQ_REPLY_MAX;
+    (void)setsockopt(sv[1], SOL_SOCKET, SO_SNDLOWAT, &lw, sizeof lw);   /* Linux: fixed at 1, ENOPROTOOPT -- its POLLOUT rule suffices */
+}
 extern long utxo_live_lsm_get(const unsigned char txid_wire[32], unsigned int vout,
                               unsigned long long* value, unsigned long* height,
                               unsigned long* is_coinbase,
@@ -2108,8 +2127,10 @@ static void dl_apply_hook(void){ dl_publish_connected_tip(); txoq_service(); }
 static void txoq_service(void){
     if(g_txoq_worker < 0) return;
     for(int guard = 0; guard < 64; guard++){
-        struct pollfd pf = { g_txoq_worker, POLLIN, 0 };
-        if(poll(&pf, 1, 0) <= 0) return;               /* nothing pending */
+        struct pollfd pf = { g_txoq_worker, POLLIN | POLLOUT, 0 };
+        if(poll(&pf, 1, 0) <= 0) return;
+        if(!(pf.revents & POLLIN)) return;             /* nothing pending */
+        if(!(pf.revents & POLLOUT)) return;            /* no room for a whole reply: the parent is not reading */
         txoq_req q;
         if(!txoq_read_all(g_txoq_worker, &q, sizeof q, 50)) return;
         if(q.magic == TXOQ_MAGIC_MARK){                /* CC-10: invalidateblock / reconsiderblock */
@@ -11986,7 +12007,18 @@ int main(int argc, char** argv){
          * the query hook and gettxout keeps refusing -- degraded, never
          * wrong. */
         { int sv[2];
-          if(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0){ g_txoq_parent = sv[0]; g_txoq_worker = sv[1]; }
+          if(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0){
+              g_txoq_parent = sv[0]; g_txoq_worker = sv[1];
+              /* 2026-09-24: Darwin gives an AF_UNIX stream 8 KB each way
+               * (net.local.stream.sendspace/recvspace), Linux ~208 KB. The
+               * worker answers up to 64 queued queries per pass, and
+               * replies to queries the RPC side already timed out on sit
+               * unread; 8 KB is about 64 replies. Linux's headroom, set
+               * explicitly -- and the worker takes a request only when its
+               * whole reply fits (SO_SNDLOWAT, see txoq_service), so a
+               * parent that stops reading can never hold it in send(). */
+              txoq_channel_tune(sv);
+          }
           else fprintf(stderr,"[serve] gettxout IPC unavailable (socketpair: %s) -- gettxout will refuse\n", strerror(errno)); }
 
         pid_t dl = fork();
