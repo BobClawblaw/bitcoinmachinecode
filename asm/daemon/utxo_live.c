@@ -3771,6 +3771,9 @@ long utxo_live_verify_after_recovery(long count_before){
 }
 
 long utxo_live_applied_height(void){ return g_applied_height; }
+/* TEST-ONLY: raise/clear the halt flag, so test_public_tip can drive the
+ * halted branch of utxo_live_public_tip without corrupting a real store. */
+void utxo_live_test_set_halted(int h){ g_halted = h ? 1 : 0; }
 
 /* ---- 3.1 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): the node's PUBLIC tip is
  * the CONNECTED tip, never the stored one.
@@ -3786,10 +3789,21 @@ long utxo_live_applied_height(void){ return g_applied_height; }
  * One rule, read by every outward-facing site: with live tracking on, the
  * tip is min(stored, applied); with it off (the "continuing WITHOUT live
  * UTXO tracking" degraded mode) the stored tip, as before. The store's own
- * tip stays the archive's high-water mark for the downloader. */
+ * tip stays the archive's high-water mark for the downloader.
+ *
+ * A HALT is not that degraded mode. The halt path turns tracking off too,
+ * but the set was live up to a known height and every block past it is
+ * unvalidated -- so the tip freezes at the applied height. m5ultra mainnet,
+ * 2026-09-24: the h=274443 store-inconsistency halt switched tracking off
+ * and the public tip jumped 274442 -> 968338 in one step; getblockcount /
+ * getbestblockhash / announces / header serving all spoke for ~694k blocks
+ * the node never connected, and getblockstats on them failed "Can't read
+ * undo data" (undo is written at connect) -- reported as missing undo. The
+ * never-tracked modes (init / archive-integrity failure) have no applied
+ * height to freeze at and keep the stored tip. */
 long utxo_live_public_tip(void* store_buf, long live){
     long stored = (long)*(int*)((char*)store_buf + 24);
-    if (!live) return stored;
+    if (!live && !g_halted) return stored;
     long ah = g_applied_height;
     return ah < stored ? ah : stored;
 }
