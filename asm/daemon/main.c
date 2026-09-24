@@ -5041,8 +5041,10 @@ static void dlc_fmt_eta(char* buf, size_t cap, long secs){               /* DD:H
     memcpy(buf, tmp, n); if (cap) buf[n] = 0;
 }
 /* the pipeline's progress hook: every wanted block that arrives restarts the
- * stall clock, so a peer that keeps delivering is never dropped by it. */
-static void dlc_chunk_progress(void* arg){ (void)arg; alarm(DLC_CHUNK_BUDGET_SECS); }
+ * stall clock, so a peer that keeps delivering is never dropped by it --
+ * this worker's own alarm, and (2026-09-24) the parent's window-tail rule,
+ * which reads last_block_ms from the shared stats slot. */
+static void dlc_chunk_progress(void* arg);   /* defined beside g_dlc_me, which it writes */
 static void dlc_chunk_bytes(long n){ dl_gate_account(n); }   /* bmc.downloadratelimit */
 /* bitcoin_net.asm calls this before every p2p_write. It gained the command
  * and its length on 2026-09-12, for getpeerinfo's bytessent_per_msg; the
@@ -5635,6 +5637,10 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
                   * the process's rchar, which also counts its file reads. */
                  long long wire_sent, wire_recv;
                  long long sent_pm[RPC_MSG_N], recv_pm[RPC_MSG_N];
+                 /* 2026-09-24: when this worker's chunk last received a wanted
+                  * block (dlc_now_ms, CLOCK_MONOTONIC, one clock across the
+                  * fork); the stall rule restarts the tail's clock from it */
+                 long long last_block_ms;
                } dlc_stat_t;
 /* ---- the downloader's wire accounting (2026-09-19) ------------------------
  * getnettotals.totalbytessent and every download worker's getpeerinfo
@@ -5658,6 +5664,8 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
  * bytes are the NEW peer's. */
 static int g_dl_wire_scope = 0;                    /* 1 inside dl_catchup; forked helpers inherit it */
 static volatile dlc_stat_t* g_dlc_me = NULL;       /* a helper's own stats slot; NULL in the parent */
+static long long dlc_now_ms(void);
+static void dlc_chunk_progress(void* arg){ (void)arg; alarm(DLC_CHUNK_BUDGET_SECS); if(g_dlc_me) g_dlc_me->last_block_ms = dlc_now_ms(); }
 static int g_dlc_conn_fd = -1;                     /* the connection g_dlc_me publishes */
 static long long g_dlc_pend_sent, g_dlc_pend_recv, g_dlc_pend_spm[RPC_MSG_N], g_dlc_pend_rpm[RPC_MSG_N];
 /* The BOOT catch-up (bmc.bootcatchup=1, the default) runs before main()
@@ -6660,6 +6668,7 @@ static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t
     int w = -1; for(int i = 0; i < nw; i++) if(kids[i] && stats[i].cur_lo == lo){ w = i; break; }
     if(w < 0){ holder = -1; since = now_ms; return; }        /* nobody holds it: it is in the retry ring or the cursor help's */
     if(w != holder){ holder = w; since = now_ms; return; }   /* a new holder gets a fresh clock */
+    since = dlc_stall_clock(since, stats[w].last_block_ms);  /* ...and every block it delivers restarts it (Core) */
     if(!dlc_tail_stalled(full, (long)(now_ms - since), g_dlc_stall_timeout_s)) return;
     stats[w].kill_reason = 1;
     kill(opid[w], SIGUSR1);
