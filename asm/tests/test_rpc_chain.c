@@ -1062,6 +1062,25 @@ int main(void){
       rj_val* r0 = call("getblockstats", "[0]", &ec, &em);
       ck("gbs genesis answers without undo (Core: the genesis block has no undo data)", r0 != NULL && S(r0,"height") && !strcmp(S(r0,"height"), "0"));
       if (r0) rj_free(r0);
+      /* the stats filter (2026-09-24; it was ignored). Expected shapes are
+       * Core 29.4's, taken live: a std::set of the names -- byte order,
+       * duplicates folded -- an empty list means every stat, and the type
+       * and name errors below verbatim. */
+      rj_val* rf = call("getblockstats", "[3,[\"txs\",\"height\",\"avgfee\",\"height\"]]", &ec, &em);
+      ck("gbs stats filter: 3 keys (duplicate folded)", rf && rf->nmembers == 3);
+      ck("gbs stats filter: Core's std::set order avgfee, height, txs",
+         rf && rf->nmembers == 3 && !strcmp(rf->members[0].key, "avgfee") && !strcmp(rf->members[1].key, "height") && !strcmp(rf->members[2].key, "txs"));
+      ck("gbs stats filter: values are the unfiltered ones", rf && S(rf,"height") && !strcmp(S(rf,"height"), "3") && S(rf,"txs") && !strcmp(S(rf,"txs"), "3"));
+      if (rf) rj_free(rf);
+      rj_val* rall = call("getblockstats", "[3,[]]", &ec, &em);
+      rj_val* rnone = call("getblockstats", "[3]", &ec, &em);
+      ck("gbs empty stats list = every stat", rall && rnone && rall->nmembers == rnone->nmembers && rall->nmembers > 20);
+      if (rall) rj_free(rall);
+      if (rnone) rj_free(rnone);
+      expect_err("gbs unknown stat name", "getblockstats", "[3,[\"height\",\"nope\"]]", -8, "Invalid selected statistic 'nope'");
+      expect_err("gbs stats entry not a string", "getblockstats", "[3,[5]]", -3, "JSON value of type number is not of expected type string");
+      expect_err("gbs stats not an array", "getblockstats", "[3,\"height\"]", -3,
+                 "Wrong type passed:\n{\n    \"Position 2 (stats)\": \"JSON value of type string is not of expected type array\"\n}");
     }
 
     /* ---- getnetworkhashps / getmininginfo (chainwork from the header fallback,

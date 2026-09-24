@@ -3447,7 +3447,16 @@ typedef struct { long long fr, wt; } gbs_frp;
 static int gbs_cmp_frp(const void* a, const void* b){ long long x=((const gbs_frp*)a)->fr, y=((const gbs_frp*)b)->fr; return (x<y)?-1:(x>y)?1:0; }
 static long long gbs_median(u64* a, long n){ if (n==0) return 0; qsort(a,(size_t)n,sizeof(u64),gbs_cmp_u64); if (n%2==0) return (long long)((a[n/2-1]+a[n/2])/2); return (long long)a[n/2]; }
 
+static int gbs_cmp_str(const void* a, const void* b){ return strcmp(*(const char* const*)a, *(const char* const*)b); }
 static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const char** em){
+    /* stats (position 2): Core's RPCHelpMan type-checks it before anything
+     * runs -- an array (or null / absent = every stat) of strings. */
+    static char gbs_eb[256];
+    const rj_val* a1 = (params && params->typ==RJ_ARR && params->nitems>=2) ? params->items[1] : NULL;
+    if (a1 && a1->typ != RJ_NULL && a1->typ != RJ_ARR){ *ec=-3; *em=rj_wrong_type_msg(gbs_eb, sizeof gbs_eb, 2, "stats", a1, "array"); return 0; }
+    if (a1 && a1->typ == RJ_ARR)
+        for (size_t i = 0; i < a1->nitems; i++)
+            if (!a1->items[i] || a1->items[i]->typ != RJ_STR){ *ec=-3; *em=rj_wrong_type_msg_bare(gbs_eb, sizeof gbs_eb, a1->items[i], "string"); return 0; }
     long tip = refresh(); long h;
     const rj_val* a0 = (params && params->typ==RJ_ARR && params->nitems>=1) ? params->items[0] : NULL;
     if (a0 && a0->typ==RJ_NUM){            /* height form */
@@ -3567,6 +3576,28 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
     if (have_undo) rj_obj_set(o,"utxo_size_inc", rj_numf("%lld", utxo_size_inc));
     rj_obj_set(o,"utxo_increase_actual", rj_numf("%lld", utxos-inputs));
     if (have_undo) rj_obj_set(o,"utxo_size_inc_actual", rj_numf("%lld", utxo_size_inc_actual));
+    /* The stats filter (2026-09-24; it used to be ignored -- every call got
+     * all 31 keys). Core collects the names into a std::set -- so the reply
+     * is in byte order with duplicates folded, whatever order they were
+     * asked in -- and an empty list means every stat. A name that is not a
+     * statistic is -8 "Invalid selected statistic '<name>'". */
+    if (a1 && a1->typ == RJ_ARR && a1->nitems > 0){
+        const char** names = malloc(a1->nitems * sizeof *names); size_t nn = 0;
+        if (!names){ rj_free(o); *ec=-32603; *em="Out of memory"; return 0; }
+        for (size_t i = 0; i < a1->nitems; i++) names[nn++] = a1->items[i]->str;
+        qsort(names, nn, sizeof names[0], gbs_cmp_str);
+        rj_val* sel = rj_obj();
+        for (size_t i = 0; i < nn; i++){
+            if (i && !strcmp(names[i], names[i-1])) continue;
+            const rj_val* v = rj_obj_get(o, names[i]);
+            if (!v){
+                snprintf(gbs_eb, sizeof gbs_eb, "Invalid selected statistic '%s'", names[i]);
+                free(names); rj_free(sel); rj_free(o); *ec=-8; *em=gbs_eb; return 0;
+            }
+            rj_obj_set(sel, names[i], rj_clone(v));
+        }
+        free(names); rj_free(o); o = sel;
+    }
     *res=o;
     return 1;
 }
