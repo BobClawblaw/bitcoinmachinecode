@@ -2149,6 +2149,37 @@ static void reap_children(int sig){
         else if(g_inbound_n > 0) g_inbound_n--;
     }
 }
+/* Reap one child without ever blocking on it; 1 = gone, 0 = still alive
+ * after timeout_ms. The download worker runs with SIGCHLD = SIG_IGN, and
+ * there a blocking waitpid(pid, .., 0) on a child that is still ALIVE does
+ * not return when that child exits: the kernel auto-reaps it and the call
+ * sleeps until EVERY child has exited, then fails ECHILD (verified on
+ * Darwin; Linux documents the same) -- and with the committer, the index
+ * helpers and the other download helpers alive, that is never. A child
+ * already gone fails ECHILD at once, which is why the wait-after-result
+ * paths mostly worked; every kill-then-waitpid, though, is a wait on a live
+ * child, since kill is asynchronous. It hung the 2026-09-24
+ * mainnet worker in dlc_stop_workers for 2.5 h after the h=274443 reject:
+ * waiting on the first SIGKILLed helper, the other seven -- SIGTERMed only,
+ * which is advisory for them -- never got their SIGKILL, and the worker
+ * never saw the serve parent's SIGTERM, so shutdown gave up on it with the
+ * datadir lock still held. WNOHANG is exact under either disposition: 0
+ * alive, pid reaped, -1/ECHILD already auto-reaped. */
+static int dl_reap_bounded(pid_t pid, int* st, long timeout_ms){
+    for(long waited = 0;; waited += 10){
+        pid_t r = waitpid(pid, st, WNOHANG);
+        if(r == pid || (r < 0 && errno != EINTR)) return 1;
+        if(waited >= timeout_ms) return 0;
+        struct timespec ts = {0, 10000000L}; nanosleep(&ts, NULL);
+    }
+}
+/* SIGKILL a child that did not stop in time, and reap it -- bounded, so a
+ * child stuck in an uninterruptible kernel wait is logged, not waited on. */
+static void dl_kill_reap(pid_t pid, int* st, const char* what){
+    kill(pid, SIGKILL);
+    if(!dl_reap_bounded(pid, st, 5000))
+        fprintf(stderr, "[reap] %s pid %d survived SIGKILL for 5 s -- not waiting on it\n", what, (int)pid);
+}
 /* Set only while the worker is inside utxo_live_init()'s UTXO reload. That
  * reload is a tight assembly loop (utxo_lsm_reload -> the WAL-tail replay)
  * which never consults a shutdown flag, and on a large tail it runs for
@@ -3765,7 +3796,8 @@ static void pbh_poll(void){
                 kill(g_pbh[i].pid, SIGKILL); r.rc = 0; snprintf(r.why, sizeof r.why, "helper gave up");
             } else continue;
         } else if(n != (ssize_t)sizeof r){ r.rc = 0; snprintf(r.why, sizeof r.why, "helper exited without a result"); }
-        waitpid(g_pbh[i].pid, NULL, 0); close(g_pbh[i].sp); g_pbh[i].pid = 0; g_pbh[i].sp = -1;
+        { int st; if(!dl_reap_bounded(g_pbh[i].pid, &st, 5000)) dl_kill_reap(g_pbh[i].pid, &st, "broadcast helper"); }
+        close(g_pbh[i].sp); g_pbh[i].pid = 0; g_pbh[i].sp = -1;
         if(r.rc == 2){ pb_queue_mark_received(g_pbh[i].tx_index, g_pbh[i].peer_slot, pb_wall_s()); g_pb_sent++; g_pb_confirmed++;
             fprintf(stderr, "[privbcast] %s acknowledged the transaction (pong)\n", g_pbh[i].host); }
         else if(r.rc == 1){ g_pb_sent++; fprintf(stderr, "[privbcast] %s took the transaction but sent no pong (%s)\n", g_pbh[i].host, r.why[0] ? r.why : "timeout"); }
@@ -3846,7 +3878,7 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
         if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)){
             if(dh_now_ms() - g_dh[i].t0 > g_dh_timeout_ms){
                 fprintf(stderr, "[dial] %s: background dial gave up after %llds\n", g_dh[i].host, g_dh_timeout_ms / 1000);
-                kill(g_dh[i].pid, SIGKILL); waitpid(g_dh[i].pid, NULL, 0);
+                { int st; dl_kill_reap(g_dh[i].pid, &st, "dial helper"); }
                 close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1; g_dh_last_slot = g_dh[i].want_slot;
                 out->ok = 0; snprintf(out->why, sizeof out->why, "timeout"); *fd_out = -1;
                 snprintf(host_out, hcap, "%s", g_dh[i].host);
@@ -3868,7 +3900,7 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
                 if(!out->ok && *fd_out >= 0){ close(*fd_out); *fd_out = -1; }
             }
         } else if(n != (ssize_t)sizeof *out){ out->ok = 0; snprintf(out->why, sizeof out->why, "helper exited without a result"); }
-        waitpid(g_dh[i].pid, NULL, 0);
+        { int st; if(!dl_reap_bounded(g_dh[i].pid, &st, 5000)) dl_kill_reap(g_dh[i].pid, &st, "dial helper"); }
         close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1; g_dh_last_slot = g_dh[i].want_slot;
         snprintf(host_out, hcap, "%s", g_dh[i].host);
         return 1;
@@ -5042,7 +5074,11 @@ static void dlc_drain_committer(volatile long* ctl){
     ctl[DLC_CTL_STOP_COMMIT]=1;
     int cst; long waited_ms=0;
     while(waitpid(g_dlc_committer,&cst,WNOHANG)==0){
-        if(g_shutdown_requested){ kill(g_dlc_committer,SIGTERM); waitpid(g_dlc_committer,&cst,0); break; }
+        if(g_shutdown_requested){
+            kill(g_dlc_committer,SIGTERM);
+            if(!dl_reap_bounded(g_dlc_committer,&cst,5000)) dl_kill_reap(g_dlc_committer,&cst,"committer");
+            break;
+        }
         struct timespec ts={0,50000000L}; nanosleep(&ts,NULL); waited_ms+=50;
         if(waited_ms%10000==0) fprintf(stderr,"[dlc] waiting for the committer: %ld staged chunk(s) left\n", ctl[DLC_CTL_STAGED]);
     }
@@ -5053,8 +5089,7 @@ static void dlc_drain_committer(volatile long* ctl){
 static void dlc_stop_committer(void){
     if(g_dlc_committer <= 0) return;
     int stt; kill(g_dlc_committer, SIGTERM);
-    { struct timespec g = {1, 0}; nanosleep(&g, NULL); }
-    if(waitpid(g_dlc_committer, &stt, WNOHANG) == 0){ kill(g_dlc_committer, SIGKILL); waitpid(g_dlc_committer, &stt, 0); }
+    if(!dl_reap_bounded(g_dlc_committer, &stt, 1000)) dl_kill_reap(g_dlc_committer, &stt, "committer");
     g_dlc_committer = 0;
 }
 /* ---- boundary rotation (2026-09-07) --------------------------------------
@@ -6284,14 +6319,23 @@ static long long dlc_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOT
 /* Tell every live helper to stop, give it a moment, then kill and reap it.
  * Workers inherit the flag-only SIGTERM handler, so SIGTERM is advisory and
  * the SIGKILL a second later is what actually ends a helper blocked in a
- * socket read. kids[w] is zeroed for every stopped helper. */
+ * socket read. kids[w] is zeroed for every stopped helper. Every survivor
+ * is SIGKILLed before any is waited on, and every wait is bounded (see
+ * dl_reap_bounded: a blocking waitpid here is what wedged the worker). */
 static void dlc_stop_workers(pid_t* kids, int nw, const char* why){
     int n = 0; for(int w=0;w<nw;w++) if(kids[w]) n++;
     if(!n) return;
     fprintf(stderr,"[dlc] %s -- stopping %d worker(s)\n", why, n);
     for(int w=0;w<nw;w++) if(kids[w]) kill(kids[w], SIGTERM);
-    { struct timespec g={1,0}; nanosleep(&g,NULL); }
-    for(int w=0;w<nw;w++) if(kids[w]){ int stt; if(waitpid(kids[w],&stt,WNOHANG)==0){ kill(kids[w], SIGKILL); waitpid(kids[w],&stt,0); } kids[w]=0; }
+    for(long waited = 0; waited < 1000; waited += 10){          /* the SIGTERM grace, early out */
+        int left = 0;
+        for(int w=0;w<nw;w++) if(kids[w]){ int stt; if(dl_reap_bounded(kids[w],&stt,0)) kids[w]=0; else left++; }
+        if(!left) break;
+        struct timespec g={0,10000000L}; nanosleep(&g,NULL);
+    }
+    for(int w=0;w<nw;w++) if(kids[w]) kill(kids[w], SIGKILL);
+    for(int w=0;w<nw;w++) if(kids[w]){ int stt; if(!dl_reap_bounded(kids[w],&stt,5000))
+        fprintf(stderr,"[dlc] worker pid %d survived SIGKILL for 5 s -- not waiting on it\n", (int)kids[w]); kids[w]=0; }
     dlc_stop_committer();                       /* before anything truncates the archive under it */
 }
 /* The reject hook's half (see dl_reject_block): a no-op unless dl_catchup is
@@ -6367,7 +6411,10 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
             }
             kids[k] = pid;
         }
-        for (int k = 0; k < n; k++) if (kids[k] > 0){ int st; waitpid(kids[k], &st, 0); }
+        /* bounded: in the worker (SIGCHLD SIG_IGN) a blocking waitpid would
+         * also wait out every long-lived child -- see dl_reap_bounded */
+        for (int k = 0; k < n; k++) if (kids[k] > 0){ int st;
+            if (!dl_reap_bounded(kids[k], &st, (RANK_TIMEOUT_S + 2) * 1000L)) dl_kill_reap(kids[k], &st, "rank probe"); }
     }
     /* sort fastest first; a peer with no sample ranks last, ties keep order */
     static int idx[DLC_MAXPOOL]; for (int i = 0; i < nlive; i++) idx[i] = i;
@@ -6479,7 +6526,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
         long long age = dh_now_ms() - g_pass[i].t0;
         if(pr <= 0){
             if(age > (long long)g_pass[i].budget_s * 1000 + 15000){          /* the alarm did not end it: kill, treat as budget */
-                kill(g_pass[i].pid, SIGKILL); waitpid(g_pass[i].pid, NULL, 0); close(g_pass[i].fd); g_pass[i].pid = 0;
+                { int st; dl_kill_reap(g_pass[i].pid, &st, "pass helper"); } close(g_pass[i].fd); g_pass[i].pid = 0;
                 g_pass_crashed++;
                 leg_close_ours(i, "sync-budget", "the pass helper overran its budget and was killed");
                 mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
@@ -6490,7 +6537,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
         while(off < sizeof r){ ssize_t n = read(g_pass[i].fd, q + off, sizeof r - off); if(n <= 0){ good = 0; break; } off += (unsigned long)n; }
         static unsigned char blob[DH_V2_BLOB_CAP]; unsigned long got = 0;
         if(good && r.v2_len){ if(r.v2_len > DH_V2_BLOB_CAP) good = 0; else while(got < r.v2_len){ ssize_t n = read(g_pass[i].fd, blob + got, r.v2_len - got); if(n <= 0) break; got += (unsigned long)n; } }
-        int st = 0; waitpid(g_pass[i].pid, &st, 0); close(g_pass[i].fd); g_pass[i].pid = 0;
+        int st = 0; if(!dl_reap_bounded(g_pass[i].pid, &st, 5000)) dl_kill_reap(g_pass[i].pid, &st, "pass helper"); close(g_pass[i].fd); g_pass[i].pid = 0;
         if(!good || (r.v2_len && got != r.v2_len)){
             g_pass_crashed++;
             char d[96];
@@ -6514,7 +6561,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
     return stored;
 }
 static void leg_pass_stop_all(void){
-    for(int i = 0; i < MUX_MAX_OUT; i++) if(g_pass[i].pid > 0){ kill(g_pass[i].pid, SIGTERM); waitpid(g_pass[i].pid, NULL, 0); close(g_pass[i].fd); g_pass[i].pid = 0; }
+    for(int i = 0; i < MUX_MAX_OUT; i++) if(g_pass[i].pid > 0){ int st; kill(g_pass[i].pid, SIGTERM); if(!dl_reap_bounded(g_pass[i].pid, &st, 5000)) dl_kill_reap(g_pass[i].pid, &st, "pass helper"); close(g_pass[i].fd); g_pass[i].pid = 0; }
 }
 /* ---- the legs' sweep (2026-09-09; factored 2026-09-10) ---------------------
  * Every OTHER leg's buffered messages now -- a ping used to wait for its
