@@ -4,6 +4,61 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-24 — mainnet at the tip in production; ad4f0d9b reverted; the reorg gap and the int/long twin returns fixed
+
+- **Production (m5ultra, `~/bmc_osx_deploy`):** mainnet IBD finished.
+  The UTXO set was rebuilt from the archive after the sorter fix
+  (f9368f9e: a u32 index wrapped on a 71M-entry flush, halting at
+  274,443). The node reached the tip, 968,463 with IBD false, and
+  follows it (968,467 at 23:28Z, 11 peers, 165.2M txouts). Redeployed
+  on e1d90861 at 23:29Z; rollback `bmcbitcoind.pre-e1d90861`.
+- **Apply rate ~5 -> ~11.5-14 blk/s (343bc1a7):** the LSM per-thread
+  mapping cache was direct-mapped (run_no % 64). The 15 GB base run
+  shared a slot with a fresh run, so every lookup remapped both. It is
+  now fully associative with LRU. x86 had the same bug, ported to main
+  as #299.
+- **ad4f0d9b reverted (deab9fe2):** `tx_verify.c` is main's copy whole.
+  The testnet4 h=124,864 failure was 182c0d87's no-op semaphores
+  (Darwin has no unnamed `sem_init`), not a thread race: no second thread
+  calls into tx_verify.c. Shown three ways:
+  - on x86 (19f26cfc);
+  - natively with the same replay (main's file 18/18 in 3 of 3 runs,
+    ad4f0d9b SIGSEGV at 124,864 in 2 of 2;
+    `worklog/2026-09-24-ad4f0d9b-repro/build_osx.sh`);
+  - on a testnet4 node from the network (synced through all three
+    failure heights).
+  This also removes the tx_verify.c merge conflict and the gcc -Werror
+  blocker between main and bmc_osx.
+- **Found by the testnet4 node, fixed:**
+  - 56519b5b (shared): the archive check wrongly flagged non-mainnet
+    NET-15 frames, and STO-11 then blanked valid blocks.
+  - bd1700d4: a hole below the archive tip is now re-fetched under
+    `bmc.bootcatchup=0`.
+  - **05c01822 (shared, x86 porting to main):** a reorg forking above
+    the applied height moved the apply past never-connected blocks.
+    Testnet4, 23:01Z: applied 153,876 -> 153,892 with 153,877-887 never
+    applied, so the UTXO set was silently wrong. The rewind now only
+    moves down, and replacements apply only in turn.
+  - **a419e3e0 (osx only):** `chainwork_cmp` and nine store twins
+    returned `int` where callers declare `extern long` (the x86 returns
+    rax). On arm64 -1 read as 4294967295: lighter chains compared
+    heavier, and store_append's failure read as a valid height. main's
+    test_reorg passes on arm64 for the first time (19 failures -> 0).
+- Also today: the dial storm (Darwin ignores `SO_SNDTIMEO` on connect;
+  SCM_RIGHTS sockets arrive dead if the sender exits first), the
+  SIGTERM-deaf worker, the 10-minute stop (Darwin's 8 KB socketpair),
+  #297's NULL-TLS worker crash, and getpeerinfo 0 on a Mac (e1d90861:
+  `TCP_CONNECTION_INFO` for Linux's `TCP_INFO`).
+- **Tests that don't run on a Mac as written:**
+  - test_dlc_interleave, test_dlc_wire_bytes, test_mux_dial_gate: they
+    need 127.0.0.x aliases on `lo0` (root), and the first two use
+    Linux-only `TCP_QUICKACK`.
+  - test_ir5_sighash_cache: uses Linux's `cpu_set_t`.
+  - The six tx_verify `*_diff` tests: they compare against x86 asm twins
+    that were never ported.
+- Known degrade unchanged: tx_handoff's ring mutex isn't robust on macOS.
+  Remaining p3/p4: signet IBD, the phase-4 parity sweep.
+
 ## 2026-09-23 — main merged (245 commits, #190–#292); five Darwin guards; serve/store/net re-ports; stop-wait e2e 35/35 on Darwin
 
 - Merge of #190–#292: index runs + trailing builders, the departure

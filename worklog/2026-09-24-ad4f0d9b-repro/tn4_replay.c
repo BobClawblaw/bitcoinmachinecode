@@ -11,7 +11,19 @@
 #include "test_tmpdir.h"
 /* utxo_live.c as part of this TU: g_bip30_store (the handle the
  * median-time-past check reads headers through) is static there */
+#ifdef __APPLE__
+/* ld64 has no -Wl,--wrap: rename utxo_live.c's two calls onto the wrappers
+ * below instead, and let __real_* name the real store (build_osx.sh) */
+#define store_get_at __wrap_store_get_at
+#define store_rd_fd  __wrap_store_rd_fd
 #include "../daemon/utxo_live.c"
+#undef store_get_at
+#undef store_rd_fd
+#define __real_store_get_at store_get_at
+#define __real_store_rd_fd  store_rd_fd
+#else
+#include "../daemon/utxo_live.c"
+#endif
 extern long store_init(void* st);
 extern int  chainparams_select(const char* name);
 /* headers the MTP window needs, served from a small framed file: store_get_at
