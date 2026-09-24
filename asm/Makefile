@@ -599,8 +599,12 @@ tests/test_connect_reject: $(CONNREJSRCS) daemon/reorg.h daemon/invalid_set.h da
 # multi-signed P2WPKH tx (see tests/multi_p2wpkh_vec.h / gen_multi_p2wpkh.py).
 TXVPARSRCS := tests/test_tx_verify_parallel.c daemon/tx_verify.c bitcoin_scriptverify.c \
     bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+# 2026-09-24: utxo_live.c is #included by the test (its static g_bip30_store
+# is pointed at the test's store), so it is a prerequisite but not a compile
+# input; store_get_at/store_rd_fd are wrapped to serve the 11-header
+# median-time-past window from tests/fixtures/blk_481827.headers.
 tests/test_block_481827_pool_stack: tests/test_block_481827_pool_stack.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c daemon/netperm.c daemon/subnet.c $(REORGOBJS) $(TEST_TMPDIR_H) bitcoin_pow_rules.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ tests/test_block_481827_pool_stack.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c daemon/netperm.c daemon/subnet.c $(REORGOBJS) -lpthread bitcoin_pow_rules.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -Wl,--wrap=store_get_at -Wl,--wrap=store_rd_fd -o $@ tests/test_block_481827_pool_stack.c daemon/lsm_manifest.c daemon/chainparams.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c daemon/netperm.c daemon/subnet.c $(REORGOBJS) -lpthread bitcoin_pow_rules.o
 # NB: filter out the real LSM objects -- this test supplies its own adversarial
 # utxo_lsm_get (single reused return buffer) to pin the transient-spk contract.
 TXVBWPSOBJS := $(filter-out bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoind.o,$(REORGOBJS))
