@@ -12,9 +12,10 @@
  *     extracted from the scratch Core oracle's blk*.dat (XOR-obfuscated,
  *     blocks/xor.dat) -- the smallest block found that exercises every
  *     negative below. Height resolvable via `getblockheader` on the oracle.
- * Optional large fixtures (tests/fixtures/blk_<height>.bin, gitignored, from
- * validation/fetch_witness_blocks.py): 481823, 481824, 600000 -- SKIP if
- * absent, never silently pass.
+ * Large real fixtures (tests/fixtures/blk_<height>.bin, from
+ * validation/fetch_witness_blocks.py): 481823, 481824, 600000 -- COMMITTED
+ * since 2026-09-24 (2.9 MB); until then they were gitignored and every gate
+ * SKIPped them. A missing one is now a FAIL.
  *
  * Negatives are built by byte surgery on real blocks: (a) strip every witness
  * -- byte-for-byte what the archive held for >= 481824 until 2026-08-22 --
@@ -213,7 +214,7 @@ int main(void){
         {"tests/fixtures/blk_481823.bin", 0, 0}, {"tests/fixtures/blk_481824.bin", 1, 1}, {"tests/fixtures/blk_600000.bin", 1, 1} };
     for (unsigned i=0;i<3;i++){
         b = load(big[i].f, &len);
-        if (!b){ skips++; printf("SKIP %s (run validation/fetch_witness_blocks.py)\n", big[i].f); continue; }
+        if (!b){ fails++; printf("FAIL %s missing (committed; regenerate with validation/fetch_witness_blocks.py)\n", big[i].f); continue; }
         v=run(big[i].f, b, len, big[i].act, &r); CHECK(v==1, "%s passes as stored by Core (%s)", big[i].f, r);
         if (!big[i].act){
             /* Pre-activation block evaluated AS IF segwit were active: Core's

@@ -253,6 +253,22 @@ DAEMON_RPCOBJS := rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rp
     daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c wallet_bnb.c wallet_coinsel.c \
     bitcoin_keys.o bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o
 
+# ---- oracle-derived fixtures (2026-09-24) ---------------------------------
+# The small ones are committed: blk_481827.{bin,prevouts,headers} and
+# blk_481823/481824/600000.bin. The large ones stay out of git (tests/.gitignore)
+# and are fetched from the scratch Core oracle by `make fixtures`:
+# tapscript_big.txt (8.6 MB) and the 36 taproot-dense blocks + prevouts for
+# test_taproot_block_diff (89 MB). The gate runs whatever is present; a clone
+# without them SKIPs exactly those cases, loudly.
+TAPROOT_DIFF_HEIGHTS := $(shell seq 825000 825015) $(shell seq 840000 840007) \
+                        $(shell seq 870000 870007) 850000 850001 860000 860001
+.PHONY: fixtures
+fixtures:
+	python3 validation/fetch_block_prevouts.py 481827
+	python3 validation/fetch_witness_blocks.py
+	python3 validation/fetch_tapscript_scale.py --big tests/fixtures
+	python3 validation/fetch_taproot_blocks.py $(TAPROOT_DIFF_HEIGHTS)
+
 .PHONY: all asm test clean abi-check callee-saved-check prereq-check gate-log-selftest link-check link-audit-selftest
 
 # Per-test private working directory helper. Every test that includes it must
@@ -599,8 +615,12 @@ tests/test_connect_reject: $(CONNREJSRCS) daemon/reorg.h daemon/invalid_set.h da
 # multi-signed P2WPKH tx (see tests/multi_p2wpkh_vec.h / gen_multi_p2wpkh.py).
 TXVPARSRCS := tests/test_tx_verify_parallel.c daemon/tx_verify.c bitcoin_scriptverify.c \
     bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c
+# 2026-09-24: utxo_live.c is #included by the test (its static g_bip30_store
+# is pointed at the test's store), so it is a prerequisite but not a compile
+# input; store_get_at/store_rd_fd are wrapped to serve the 11-header
+# median-time-past window from tests/fixtures/blk_481827.headers.
 tests/test_block_481827_pool_stack: tests/test_block_481827_pool_stack.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c daemon/netperm.c daemon/subnet.c $(REORGOBJS) $(TEST_TMPDIR_H) bitcoin_pow_rules.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -o $@ tests/test_block_481827_pool_stack.c daemon/utxo_live.c daemon/lsm_manifest.c daemon/chainparams.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c daemon/netperm.c daemon/subnet.c $(REORGOBJS) -lpthread bitcoin_pow_rules.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -Wall -Wl,--wrap=store_get_at -Wl,--wrap=store_rd_fd -o $@ tests/test_block_481827_pool_stack.c daemon/lsm_manifest.c daemon/chainparams.c daemon/tx_verify.c bitcoin_scriptverify.c bitcoin_txval_modern.c bitcoin_witness_v0.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/block_witness.c $(SIGNETSRCS) daemon/undo_log.c daemon/node_config.c daemon/netperm.c daemon/subnet.c $(REORGOBJS) -lpthread bitcoin_pow_rules.o
 # NB: filter out the real LSM objects -- this test supplies its own adversarial
 # utxo_lsm_get (single reused return buffer) to pin the transient-spk contract.
 TXVBWPSOBJS := $(filter-out bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoind.o,$(REORGOBJS))
@@ -3846,7 +3866,7 @@ tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tes
 # No heights: SKIPs unless validation/fetch_taproot_blocks.py has been run
 # against the scratch oracle. Run it by hand with heights before deploying a
 # change to the taproot path -- see the rule above.
-	./tests/test_taproot_block_diff
+	./tests/test_taproot_block_diff $(TAPROOT_DIFF_HEIGHTS)
 	./tests/test_p2wpkh_real
 	./tests/test_mempool_accept_modern
 	./tests/test_mv_parse_bounds
