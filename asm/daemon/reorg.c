@@ -853,9 +853,11 @@ long reorg_execute(void* st, long fork_height, long nblocks,
         fprintf(stderr, "[reorg] refusing: disconnect depth %ld exceeds max %d\n", conn_top - fork_height, REORG_MAX_DEPTH);
         return 0;
     }
-    if (tip > conn_top)
+    if (tip > conn_top){
+        long drop_lo = (fork_height > conn_top ? fork_height : conn_top) + 1;   /* 2026-09-24: never below the fork */
         fprintf(stderr, "[reorg] heights %ld..%ld are stored but were never connected (applied %ld): dropped without unapply\n",
-                conn_top + 1, tip, applied);
+                drop_lo, tip, applied);
+    }
     if (nblocks <= 0 && !g_pure_disconnect){
         fprintf(stderr, "[reorg] refusing: no replacement blocks supplied\n");
         return 0;
@@ -1062,9 +1064,17 @@ long reorg_execute(void* st, long fork_height, long nblocks,
      * kept because the loop does not run at all when tip == fork_height, and
      * because a redundant write of the value it already holds costs nothing
      * and keeps the invariant obvious at the end of the disconnect. */
-    if (!utxo_live_rewind_to(fork_height)){
-        fprintf(stderr, "[reorg] WARNING: could not persist the rewound applied height %ld (next boot may re-apply from an older height, which is safe)\n", fork_height);
-    }
+    /* 2026-09-24: a rewind never moves the apply FORWARD. With the fork
+     * above the connected tip nothing was disconnected, and this call used to
+     * set -- and persist -- the applied height to the fork, marking every
+     * block between as connected without applying one (testnet4 node B,
+     * m5ultra: 153,876 -> the fork, 153,877..887 never applied). */
+    { long ap_after = utxo_live_applied_height();
+      if (ap_after < 0 || fork_height <= ap_after){
+          if (!utxo_live_rewind_to(fork_height)){
+              fprintf(stderr, "[reorg] WARNING: could not persist the rewound applied height %ld (next boot may re-apply from an older height, which is safe)\n", fork_height);
+          }
+      } }
     if (g_index_rebuild) g_index_rebuild();
 
     /* NOTE: the append lock is deliberately NOT released here -- it is held
@@ -1113,16 +1123,31 @@ long reorg_execute(void* st, long fork_height, long nblocks,
             if (locked) flock(lfd, LOCK_UN);
             return -1;
         }
-        if (!utxo_live_apply_block(blkbuf, (uint64_t)len, h)){
-            fprintf(stderr, "[reorg] FATAL: UTXO apply failed at height %ld\n", h);
-            if (locked) flock(lfd, LOCK_UN);
-            return -1;
-        }
-        if (!utxo_live_rewind_to(h)){
-            fprintf(stderr, "[reorg] WARNING: could not persist applied height %ld\n", h);
+        /* 2026-09-24: only the NEXT height goes into the UTXO set. With the
+         * fork at or below the connected tip the disconnect above left the
+         * apply at the fork, so every replacement block is next in turn. With
+         * the fork ABOVE it (the archive ran ahead of a held apply) nothing
+         * was disconnected, and applying here put block fork+1 onto the set
+         * at `applied`, then persisted it as connected: testnet4 node B
+         * (m5ultra) went from applied 153,876 to 153,892 with 153,877..887
+         * never applied. Such blocks are only STORED; the catch-up connects
+         * [applied+1 .. new tip] in order. (applied < 0: no UTXO engine in
+         * this process -- unchanged.) */
+        long ap_now = utxo_live_applied_height();
+        int apply_now = ap_now < 0 || h == ap_now + 1;
+        if (apply_now){
+            if (!utxo_live_apply_block(blkbuf, (uint64_t)len, h)){
+                fprintf(stderr, "[reorg] FATAL: UTXO apply failed at height %ld\n", h);
+                if (locked) flock(lfd, LOCK_UN);
+                return -1;
+            }
+            if (!utxo_live_rewind_to(h)){
+                fprintf(stderr, "[reorg] WARNING: could not persist applied height %ld\n", h);
+            }
         }
         char hs[65]; hash_short(hs, bh);
-        fprintf(stderr, "[reorg] reconnecting height %ld hash=%s..\n", h, hs);
+        if (apply_now) fprintf(stderr, "[reorg] reconnecting height %ld hash=%s..\n", h, hs);
+        else           fprintf(stderr, "[reorg] storing height %ld hash=%s.. (the apply is at %ld: the catch-up connects it in order)\n", h, hs, ap_now);
         connected++;
         /* the txids this replacement block confirms, for the reconcile's
          * mined-vs-removed call (reorg_mempool_reconcile_ex) */
