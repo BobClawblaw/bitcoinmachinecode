@@ -48,6 +48,7 @@ extern int  utxo_live_init(const char* dir);
 extern long utxo_live_catchup(void* store_buf);
 extern long utxo_live_applied_height(void);
 extern long utxo_live_public_tip(void* store_buf, long live);
+extern void utxo_live_test_set_halted(int h);
 extern long utxo_live_persisted_height(void);
 extern void utxo_live_close(void);
 
@@ -140,6 +141,16 @@ int main(void){
     ck("store 10 / applied 7 -> public tip 7 (live)", utxo_live_public_tip(store_buf, 1), 7);
     /* negative control: live tracking OFF = the pre-3.1 node = the stored tip */
     ck("store 10 / applied 7 -> public tip 10 with live tracking OFF (negative control)",
+       utxo_live_public_tip(store_buf, 0), 10);
+    /* a HALT also turns tracking off, but must NOT hand out the stored tip:
+     * the node froze at its last connected height (m5ultra 2026-09-24: the
+     * 274443 halt made the public tip jump to the ~968k archive tip) */
+    utxo_live_test_set_halted(1);
+    ck("HALTED, tracking off: store 10 / applied 7 -> public tip 7 (frozen at the last connected height)",
+       utxo_live_public_tip(store_buf, 0), 7);
+    ck("HALTED, tracking still on: public tip 7", utxo_live_public_tip(store_buf, 1), 7);
+    utxo_live_test_set_halted(0);
+    ck("halt cleared, tracking off: stored 10 again (the never-tracked degraded mode)",
        utxo_live_public_tip(store_buf, 0), 10);
 
     /* ---- the serve children's reader: caps the stored tip by the published

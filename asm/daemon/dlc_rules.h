@@ -84,6 +84,16 @@ static inline long dlc_stall_timeout_after(long cur_s, int evicted){
 static inline int dlc_tail_stalled(int window_full, long tail_age_ms, long timeout_s){
     return window_full && tail_age_ms >= timeout_s * 1000;
 }
+/* the stall clock restarts on every block the holder delivers. Core clears
+ * m_stalling_since in RemoveBlockRequest, so its 2 s is a gap BETWEEN
+ * blocks, not a budget for everything in flight. Ours timed the whole
+ * 40-block chunk from the moment it became the tail (2026-09-24, m5ultra
+ * at h=823,243): ~60 MB of recent blocks against 2-8 s, so a peer sending
+ * 855 KB/s was dropped with "0 block(s)" and banned, three in a row, and
+ * the tail never landed. */
+static inline long long dlc_stall_clock(long long since_ms, long long last_block_ms){
+    return last_block_ms > since_ms ? last_block_ms : since_ms;
+}
 /* a peer is replaced (rotation, the rate floor) only when a replacement exists;
  * otherwise the window's tail is the only judge, as in Core */
 static inline int dlc_replace_allowed(int free_peers){ return free_peers > 0; }

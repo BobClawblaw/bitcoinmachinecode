@@ -89,6 +89,9 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/file.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <dirent.h>
 #include <errno.h>
 #include "coinstats_hist_fmt.h"
@@ -168,9 +171,16 @@ static void take_lock(void){
     if (flock(g_lock_fd, LOCK_EX | LOCK_NB) != 0){ fprintf(stderr, "[coinstats_hist] another builder holds " CSH_TMPDIR "/lock -- exiting\n"); exit(4); }
 }
 static long long mem_available(void){
+#ifdef __APPLE__
+    /* no /proc/meminfo on Darwin; hw.usermem is the same number (osx port) */
+    unsigned long long kb = 0; size_t sz = sizeof kb;
+    if (sysctlbyname("hw.usermem", &kb, &sz, NULL, 0) != 0) return -1;
+    return (long long)(kb / 1024) * 1024;
+#else
     FILE* f = fopen("/proc/meminfo", "r"); if (!f) return -1; char line[256]; long long kb = -1;
     while (fgets(line, sizeof line, f)) if (sscanf(line, "MemAvailable: %lld kB", &kb) == 1) break;
     fclose(f); return kb < 0 ? -1 : kb * 1024;
+#endif
 }
 /* pass 3 concurrency: each worker holds one whole range (its files across every
  * pass-2 writer) plus a 16-byte index per event; size it from the largest range

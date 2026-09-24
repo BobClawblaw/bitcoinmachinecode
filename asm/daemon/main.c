@@ -28,6 +28,7 @@
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <sys/un.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -38,6 +39,12 @@
 #include <stdbool.h>
 #include <fcntl.h>
 #include <dirent.h>
+#ifdef __APPLE__
+#include <libproc.h>
+#include <sys/resource.h>
+#include <sys/sysctl.h>
+#include <mach-o/dyld.h>
+#endif
 #include <sys/file.h>          /* DMN-1: flock() for the datadir lock */
 #include <sys/syscall.h>       /* kcmp: which processes share our datadir lock */
 #include "secure_zero.h"    /* WAL-3: a memset the optimiser may not delete */
@@ -306,7 +313,10 @@ static long node_public_tip(void* st){ return utxo_live_public_tip(st, g_utxo_li
  * catch-up apply hook, so a long catch-up call keeps it fresh per block. */
 static void dl_publish_connected_tip(void){
     if(!g_node_status) return;
-    g_node_status->connected_tip = g_utxo_live_on ? utxo_live_applied_height() : NODE_TIP_UNTRACKED;
+    /* halted (tracking switched off by the halt path) is still TRACKED: the
+     * RPC and the serve children must stay at the last connected height --
+     * see utxo_live_public_tip; UNTRACKED would hand them the stored tip */
+    g_node_status->connected_tip = (g_utxo_live_on || utxo_live_halted()) ? utxo_live_applied_height() : NODE_TIP_UNTRACKED;
 }
 static long rpc_public_tip(void){ return g_node_status ? (long)g_node_status->connected_tip : (long)NODE_TIP_UNTRACKED; }
 extern int  archive_verify_and_repair(void* store_buf, int repair); /* daemon/archive_verify.c */
@@ -2049,7 +2059,26 @@ out:
 
 /* Worker side: answer every pending query, then return. Called ONLY from the
  * quiescent point in the worker loop. Never blocks -- a parent that went away
- * or a partial request just ends the round. */
+ * or a partial request just ends the round, and (2026-09-24) so does a
+ * channel without room for a whole reply.
+ *
+ * The replies go out with a blocking send(). Replies to queries the RPC side
+ * timed out on are never read, and on the m5ultra the channel was Darwin's
+ * 8 KB: a burst of gettxout queries could fill it and leave the worker in
+ * send() until the parent read again -- or, at a stop, until the parent
+ * EXITED, since a shutdown() of the parent's end does not wake a Darwin
+ * sender (tests/test_txoq_shutdown). A request is now read only when POLLOUT
+ * says the largest possible reply fits (SO_SNDLOWAT below; Linux reports
+ * POLLOUT at <= 1/4 of a 256 KB buffer used, 192 KB free). A parent that
+ * stops reading gets no answers -- its query times out and gettxout
+ * refuses -- and the worker keeps connecting blocks. */
+#define TXOQ_REPLY_MAX ((int)sizeof(txoq_resp) + (int)TXOQ_SPK_CAP)
+static void txoq_channel_tune(int sv[2]){              /* sv[0] the parent's end, sv[1] the worker's */
+    int bsz = 256 * 1024;
+    for(int e = 0; e < 2; e++){ setsockopt(sv[e], SOL_SOCKET, SO_SNDBUF, &bsz, sizeof bsz); setsockopt(sv[e], SOL_SOCKET, SO_RCVBUF, &bsz, sizeof bsz); }
+    int lw = TXOQ_REPLY_MAX;
+    (void)setsockopt(sv[1], SOL_SOCKET, SO_SNDLOWAT, &lw, sizeof lw);   /* Linux: fixed at 1, ENOPROTOOPT -- its POLLOUT rule suffices */
+}
 extern long utxo_live_lsm_get(const unsigned char txid_wire[32], unsigned int vout,
                               unsigned long long* value, unsigned long* height,
                               unsigned long* is_coinbase,
@@ -2098,8 +2127,10 @@ static void dl_apply_hook(void){ dl_publish_connected_tip(); txoq_service(); }
 static void txoq_service(void){
     if(g_txoq_worker < 0) return;
     for(int guard = 0; guard < 64; guard++){
-        struct pollfd pf = { g_txoq_worker, POLLIN, 0 };
-        if(poll(&pf, 1, 0) <= 0) return;               /* nothing pending */
+        struct pollfd pf = { g_txoq_worker, POLLIN | POLLOUT, 0 };
+        if(poll(&pf, 1, 0) <= 0) return;
+        if(!(pf.revents & POLLIN)) return;             /* nothing pending */
+        if(!(pf.revents & POLLOUT)) return;            /* no room for a whole reply: the parent is not reading */
         txoq_req q;
         if(!txoq_read_all(g_txoq_worker, &q, sizeof q, 50)) return;
         if(q.magic == TXOQ_MAGIC_MARK){                /* CC-10: invalidateblock / reconsiderblock */
@@ -2138,6 +2169,37 @@ static void reap_children(int sig){
         if (g_dl_worker_pid > 0 && p == g_dl_worker_pid){ g_dl_worker_exited = 1; g_dl_worker_status = st; }
         else if(g_inbound_n > 0) g_inbound_n--;
     }
+}
+/* Reap one child without ever blocking on it; 1 = gone, 0 = still alive
+ * after timeout_ms. The download worker runs with SIGCHLD = SIG_IGN, and
+ * there a blocking waitpid(pid, .., 0) on a child that is still ALIVE does
+ * not return when that child exits: the kernel auto-reaps it and the call
+ * sleeps until EVERY child has exited, then fails ECHILD (verified on
+ * Darwin; Linux documents the same) -- and with the committer, the index
+ * helpers and the other download helpers alive, that is never. A child
+ * already gone fails ECHILD at once, which is why the wait-after-result
+ * paths mostly worked; every kill-then-waitpid, though, is a wait on a live
+ * child, since kill is asynchronous. It hung the 2026-09-24
+ * mainnet worker in dlc_stop_workers for 2.5 h after the h=274443 reject:
+ * waiting on the first SIGKILLed helper, the other seven -- SIGTERMed only,
+ * which is advisory for them -- never got their SIGKILL, and the worker
+ * never saw the serve parent's SIGTERM, so shutdown gave up on it with the
+ * datadir lock still held. WNOHANG is exact under either disposition: 0
+ * alive, pid reaped, -1/ECHILD already auto-reaped. */
+static int dl_reap_bounded(pid_t pid, int* st, long timeout_ms){
+    for(long waited = 0;; waited += 10){
+        pid_t r = waitpid(pid, st, WNOHANG);
+        if(r == pid || (r < 0 && errno != EINTR)) return 1;
+        if(waited >= timeout_ms) return 0;
+        struct timespec ts = {0, 10000000L}; nanosleep(&ts, NULL);
+    }
+}
+/* SIGKILL a child that did not stop in time, and reap it -- bounded, so a
+ * child stuck in an uninterruptible kernel wait is logged, not waited on. */
+static void dl_kill_reap(pid_t pid, int* st, const char* what){
+    kill(pid, SIGKILL);
+    if(!dl_reap_bounded(pid, st, 5000))
+        fprintf(stderr, "[reap] %s pid %d survived SIGKILL for 5 s -- not waiting on it\n", what, (int)pid);
 }
 /* Set only while the worker is inside utxo_live_init()'s UTXO reload. That
  * reload is a tight assembly loop (utxo_lsm_reload -> the WAL-tail replay)
@@ -2714,6 +2776,9 @@ static int outbound_connect_raw(const char* host, int rcv_ms, int out_port){
 
     if(fd<0){
         if(proxied) snprintf(g_dial_fail,sizeof g_dial_fail,"ipv4 dial via proxy: %.60s", pwhy);
+        /* the budget alarm interrupting connect() surfaces as EINTR: that is
+         * the dial budget expiring, not a signal from somewhere else */
+        else if(fired && fd == -EINTR) snprintf(g_dial_fail,sizeof g_dial_fail,"connect timed out (dial budget %ds)", OUTBOUND_DIAL_BUDGET_SECS);
         else dial_fail_errno("connect", fd);
         return -1;
     }
@@ -3522,6 +3587,40 @@ static int leg_is_anon_net(int net){ return net == BMC_NET_TORV3 || net == BMC_N
 static int dh_inflight_net(int net){ for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0 && g_dh[i].net == net) return 1; return 0; }
 static int dh_inflight_count(void){ int n = 0; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid > 0) n++; return n; }
 static long long dh_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
+/* [dial-handoff] probe (2026-09-24). The m5ultra serve-mode storm installed
+ * helper-dialed legs that were ALREADY dead -- "closed theirs (revents 0x11)
+ * after 0s; unread: (nothing)" in the same millisecond as the install -- so
+ * the socket died somewhere between the helper's handshake and the worker's
+ * recvmsg. One line on each side of the SCM_RIGHTS handoff says where: bytes
+ * pending, the first pending v1 command, peer EOF / HUP / socket error, and
+ * the kernel's TCP state. Read-only: MSG_PEEK, FIONREAD, poll(.., 0). */
+static const char* dh_tcp_state(int fd){
+#if defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
+    struct tcp_connection_info ci; socklen_t l = sizeof ci;
+    if(getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &ci, &l) != 0) return "?";
+    static const char* n[] = { "CLOSED","LISTEN","SYN_SENT","SYN_RCVD","ESTABLISHED","CLOSE_WAIT",
+                               "FIN_WAIT_1","CLOSING","LAST_ACK","FIN_WAIT_2","TIME_WAIT" };
+    return ci.tcpi_state < sizeof n / sizeof n[0] ? n[ci.tcpi_state] : "?";
+#elif defined(TCP_INFO)
+    struct tcp_info ti; socklen_t l = sizeof ti;
+    if(getsockopt(fd, IPPROTO_TCP, TCP_INFO, &ti, &l) != 0) return "?";
+    static const char* n[] = { "?","ESTABLISHED","SYN_SENT","SYN_RECV","FIN_WAIT1","FIN_WAIT2",
+                               "TIME_WAIT","CLOSE","CLOSE_WAIT","LAST_ACK","LISTEN","CLOSING" };
+    return ti.tcpi_state < sizeof n / sizeof n[0] ? n[ti.tcpi_state] : "?";
+#else
+    (void)fd; return "?";
+#endif
+}
+static void dh_sock_probe(int fd, char* out, size_t cap){
+    int pend = -1; ioctl(fd, FIONREAD, &pend);
+    struct pollfd pf = { fd, POLLIN, 0 }; poll(&pf, 1, 0);
+    int serr = 0; socklen_t el = sizeof serr; getsockopt(fd, SOL_SOCKET, SO_ERROR, &serr, &el);
+    unsigned char hdr[24]; ssize_t pk = recv(fd, hdr, sizeof hdr, MSG_PEEK | MSG_DONTWAIT);
+    char first[16] = "-";
+    if(pk >= 16){ memcpy(first, hdr + 4, 12); first[12] = 0; for(int k = 0; k < 12; k++) if(first[k] && (first[k] < 32 || first[k] > 126)) first[k] = '.'; }
+    snprintf(out, cap, "pend=%d first=%s eof=%d hup=%d err=%d so_error=%d tcp=%s",
+             pend, first[0] ? first : "-", pk == 0, !!(pf.revents & POLLHUP), !!(pf.revents & POLLERR), serr, dh_tcp_state(fd));
+}
 /* The next candidate of `net` for a reserved-slot dial: a rotating cursor
  * per network, so a failed background dial is followed by the NEXT address
  * rather than the same one every pass (deploy l on 2026-09-01 re-dialled
@@ -3568,6 +3667,7 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
     if(pid < 0){ close(sp[0]); close(sp[1]); return 0; }
     if(pid == 0){
         close(sp[0]); g_in_dial_helper = 1;
+        long long t_dial0 = dh_now_ms();
         dh_result_t r; memset(&r, 0, sizeof r);
         snprintf(g_dial_fail, sizeof g_dial_fail, "refused before dialing");   /* not the parent's last reason (2026-09-10: "timed out (10s)" after 1.4 s) */
         int fd = outbound_connect(host, 300, out_port);
@@ -3584,6 +3684,9 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
                 else r.v2_len = (unsigned long)n;
             }
         } else snprintf(r.why, sizeof r.why, "%s", dial_fail_reason());
+        if(fd >= 0){ char pb[192]; dh_sock_probe(fd, pb, sizeof pb);
+                     fprintf(stderr, "[dial-handoff] %s: helper hands fd over %lldms after the dial began (%s) %s\n",
+                             host, dh_now_ms() - t_dial0, r.v2_len ? "v2" : "v1", pb); }
         struct iovec iov = { &r, sizeof r };
         char cbuf[CMSG_SPACE(sizeof(int))]; memset(cbuf, 0, sizeof cbuf);
         struct msghdr mh; memset(&mh, 0, sizeof mh); mh.msg_iov = &iov; mh.msg_iovlen = 1;
@@ -3594,6 +3697,18 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
         }
         (void)!sendmsg(sp[1], &mh, 0);
         if(r.v2_len){ unsigned long off = 0; while(off < r.v2_len){ ssize_t w = write(sp[1], blob + off, r.v2_len - off); if(w <= 0) break; off += (unsigned long)w; } }
+        /* Hold on until the worker has the fd: dh_poll closes its end after
+         * the recvmsg, which wakes this poll. On Darwin a socket passed with
+         * SCM_RIGHTS arrives DEAD (EOF + HUP, its buffered bytes discarded)
+         * when the sender exits before the receiver's recvmsg; the worker
+         * collects results once per rotation, so exiting right after the
+         * sendmsg delivered nearly every v1 leg dead -- the m5ultra serve
+         * storm (2026-09-24): "closed theirs (revents 0x11) after 0s" in the
+         * install's own millisecond, each dead leg a dial-memory backoff,
+         * the pool drained ("no dial candidate is free" x5866). v2 legs
+         * survived only because the blob write above kept the helper alive
+         * until the worker read it. Bounded by the worker's own give-up. */
+        { struct pollfd hp = { sp[1], POLLIN, 0 }; poll(&hp, 1, (int)g_dh_timeout_ms); }
         _exit(0);
     }
     close(sp[1]);
@@ -3674,7 +3789,8 @@ static void pbh_poll(void){
                 kill(g_pbh[i].pid, SIGKILL); r.rc = 0; snprintf(r.why, sizeof r.why, "helper gave up");
             } else continue;
         } else if(n != (ssize_t)sizeof r){ r.rc = 0; snprintf(r.why, sizeof r.why, "helper exited without a result"); }
-        waitpid(g_pbh[i].pid, NULL, 0); close(g_pbh[i].sp); g_pbh[i].pid = 0; g_pbh[i].sp = -1;
+        { int st; if(!dl_reap_bounded(g_pbh[i].pid, &st, 5000)) dl_kill_reap(g_pbh[i].pid, &st, "broadcast helper"); }
+        close(g_pbh[i].sp); g_pbh[i].pid = 0; g_pbh[i].sp = -1;
         if(r.rc == 2){ pb_queue_mark_received(g_pbh[i].tx_index, g_pbh[i].peer_slot, pb_wall_s()); g_pb_sent++; g_pb_confirmed++;
             fprintf(stderr, "[privbcast] %s acknowledged the transaction (pong)\n", g_pbh[i].host); }
         else if(r.rc == 1){ g_pb_sent++; fprintf(stderr, "[privbcast] %s took the transaction but sent no pong (%s)\n", g_pbh[i].host, r.why[0] ? r.why : "timeout"); }
@@ -3755,7 +3871,7 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
         if(n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)){
             if(dh_now_ms() - g_dh[i].t0 > g_dh_timeout_ms){
                 fprintf(stderr, "[dial] %s: background dial gave up after %llds\n", g_dh[i].host, g_dh_timeout_ms / 1000);
-                kill(g_dh[i].pid, SIGKILL); waitpid(g_dh[i].pid, NULL, 0);
+                { int st; dl_kill_reap(g_dh[i].pid, &st, "dial helper"); }
                 close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1; g_dh_last_slot = g_dh[i].want_slot;
                 out->ok = 0; snprintf(out->why, sizeof out->why, "timeout"); *fd_out = -1;
                 snprintf(host_out, hcap, "%s", g_dh[i].host);
@@ -3769,6 +3885,9 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
             for(struct cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm))
                 if(cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS){ memcpy(fd_out, CMSG_DATA(cm), sizeof(int)); break; }
             if(*fd_out < 0) out->ok = 0;
+            else { char pb[192]; dh_sock_probe(*fd_out, pb, sizeof pb);
+                   fprintf(stderr, "[dial-handoff] %s: worker received fd %d %lldms after the dial began %s\n",
+                           g_dh[i].host, *fd_out, dh_now_ms() - g_dh[i].t0, pb); }
             if(out->ok && out->v2_len){                     /* the session bytes follow; the child wrote them right after the struct */
                 if(out->v2_len > DH_V2_BLOB_CAP){ out->ok = 0; snprintf(out->why, sizeof out->why, "v2 session too large"); }
                 else { unsigned long off = 0; struct pollfd pf = { g_dh[i].sp, POLLIN, 0 };
@@ -3777,8 +3896,9 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
                 if(!out->ok && *fd_out >= 0){ close(*fd_out); *fd_out = -1; }
             }
         } else if(n != (ssize_t)sizeof *out){ out->ok = 0; snprintf(out->why, sizeof out->why, "helper exited without a result"); }
-        waitpid(g_dh[i].pid, NULL, 0);
-        close(g_dh[i].sp); g_dh[i].pid = 0; g_dh[i].sp = -1; g_dh_last_slot = g_dh[i].want_slot;
+        close(g_dh[i].sp);                              /* first: the helper waits for this close before it exits */
+        { int st; if(!dl_reap_bounded(g_dh[i].pid, &st, 5000)) dl_kill_reap(g_dh[i].pid, &st, "dial helper"); }
+        g_dh[i].pid = 0; g_dh[i].sp = -1; g_dh_last_slot = g_dh[i].want_slot;
         snprintf(host_out, hcap, "%s", g_dh[i].host);
         return 1;
     }
@@ -4886,7 +5006,11 @@ static void dlc_drain_committer(volatile long* ctl){
     ctl[DLC_CTL_STOP_COMMIT]=1;
     int cst; long waited_ms=0;
     while(waitpid(g_dlc_committer,&cst,WNOHANG)==0){
-        if(g_shutdown_requested){ kill(g_dlc_committer,SIGTERM); waitpid(g_dlc_committer,&cst,0); break; }
+        if(g_shutdown_requested){
+            kill(g_dlc_committer,SIGTERM);
+            if(!dl_reap_bounded(g_dlc_committer,&cst,5000)) dl_kill_reap(g_dlc_committer,&cst,"committer");
+            break;
+        }
         struct timespec ts={0,50000000L}; nanosleep(&ts,NULL); waited_ms+=50;
         if(waited_ms%10000==0) fprintf(stderr,"[dlc] waiting for the committer: %ld staged chunk(s) left\n", ctl[DLC_CTL_STAGED]);
     }
@@ -4897,8 +5021,7 @@ static void dlc_drain_committer(volatile long* ctl){
 static void dlc_stop_committer(void){
     if(g_dlc_committer <= 0) return;
     int stt; kill(g_dlc_committer, SIGTERM);
-    { struct timespec g = {1, 0}; nanosleep(&g, NULL); }
-    if(waitpid(g_dlc_committer, &stt, WNOHANG) == 0){ kill(g_dlc_committer, SIGKILL); waitpid(g_dlc_committer, &stt, 0); }
+    if(!dl_reap_bounded(g_dlc_committer, &stt, 1000)) dl_kill_reap(g_dlc_committer, &stt, "committer");
     g_dlc_committer = 0;
 }
 /* ---- boundary rotation (2026-09-07) --------------------------------------
@@ -4939,8 +5062,10 @@ static void dlc_fmt_eta(char* buf, size_t cap, long secs){               /* DD:H
     memcpy(buf, tmp, n); if (cap) buf[n] = 0;
 }
 /* the pipeline's progress hook: every wanted block that arrives restarts the
- * stall clock, so a peer that keeps delivering is never dropped by it. */
-static void dlc_chunk_progress(void* arg){ (void)arg; alarm(DLC_CHUNK_BUDGET_SECS); }
+ * stall clock, so a peer that keeps delivering is never dropped by it --
+ * this worker's own alarm, and (2026-09-24) the parent's window-tail rule,
+ * which reads last_block_ms from the shared stats slot. */
+static void dlc_chunk_progress(void* arg);   /* defined beside g_dlc_me, which it writes */
 static void dlc_chunk_bytes(long n){ dl_gate_account(n); }   /* bmc.downloadratelimit */
 /* bitcoin_net.asm calls this before every p2p_write. It gained the command
  * and its length on 2026-09-12, for getpeerinfo's bytessent_per_msg; the
@@ -5533,6 +5658,10 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
                   * the process's rchar, which also counts its file reads. */
                  long long wire_sent, wire_recv;
                  long long sent_pm[RPC_MSG_N], recv_pm[RPC_MSG_N];
+                 /* 2026-09-24: when this worker's chunk last received a wanted
+                  * block (dlc_now_ms, CLOCK_MONOTONIC, one clock across the
+                  * fork); the stall rule restarts the tail's clock from it */
+                 long long last_block_ms;
                } dlc_stat_t;
 /* ---- the downloader's wire accounting (2026-09-19) ------------------------
  * getnettotals.totalbytessent and every download worker's getpeerinfo
@@ -5556,6 +5685,8 @@ typedef struct { char peer[64]; long chunks; long blocks; long guard; double las
  * bytes are the NEW peer's. */
 static int g_dl_wire_scope = 0;                    /* 1 inside dl_catchup; forked helpers inherit it */
 static volatile dlc_stat_t* g_dlc_me = NULL;       /* a helper's own stats slot; NULL in the parent */
+static long long dlc_now_ms(void);
+static void dlc_chunk_progress(void* arg){ (void)arg; alarm(DLC_CHUNK_BUDGET_SECS); if(g_dlc_me) g_dlc_me->last_block_ms = dlc_now_ms(); }
 static int g_dlc_conn_fd = -1;                     /* the connection g_dlc_me publishes */
 static long long g_dlc_pend_sent, g_dlc_pend_recv, g_dlc_pend_spm[RPC_MSG_N], g_dlc_pend_rpm[RPC_MSG_N];
 /* The BOOT catch-up (bmc.bootcatchup=1, the default) runs before main()
@@ -5819,7 +5950,14 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
              * 16 real peers moved 0.23-1.2 MB/s each on the fresh-sync
              * benchmark. Core keeps 16 blocks in flight per peer for the same
              * reason. Same validation per block, block for block. */
-            long long chunk_t0 = dlc_now_ms(); long chunk_r0 = dlc_proc_rchar(getpid());   /* for the boundary-rotation verdict */
+            long long chunk_t0 = dlc_now_ms();
+#ifdef __APPLE__
+            /* the wire total of THIS connection is the self-sample (see the
+             * dlc_proc_wbytes_darwin note); rchar has no Darwin equivalent */
+            long chunk_r0 = (long)mystat->wire_recv;
+#else
+            long chunk_r0 = dlc_proc_rchar(getpid());   /* for the boundary-rotation verdict */
+#endif
             /* 2026-09-08: the chunk goes to a staging file, not the archive;
              * the committer appends it in height order (see dlc_commit_chunk) */
             char stmp[96]; int sfd=dlc_stage_open_tmp(stmp,sizeof stmp,lo);
@@ -5866,7 +6004,11 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                  * under 2 s (the early chain) are not judged: round-trip
                  * bound, and the rate would be noise. */
                 double secs = (double)(dlc_now_ms() - chunk_t0) / 1000.0;
+#ifdef __APPLE__
+                long chunk_r1 = (long)mystat->wire_recv;
+#else
                 long chunk_r1 = dlc_proc_rchar(getpid());
+#endif
                 double chunk_bps = (secs >= 2.0 && chunk_r0 >= 0 && chunk_r1 >= chunk_r0) ? (double)(chunk_r1 - chunk_r0) / secs : -1.0;
                 double med = mystat->pool_median_bps;
                 if(dlc_rotate_after_chunk(chunk_bps, med) && dlc_replace_allowed((int)next_claim[DLC_CTL_FREE_PEERS])){   /* 2026-09-10: no free peer, no rotation -- the window's tail judges */
@@ -6036,6 +6178,25 @@ static long dlc_proc_rchar(pid_t pid){ return dlc_proc_iofield(pid,"rchar:"); }
  * status log can show network-received and disk-written rates separately
  * instead of one figure trying to represent both. */
 static long dlc_proc_wbytes(pid_t pid){ return dlc_proc_iofield(pid,"write_bytes:"); }
+#ifdef __APPLE__
+/* Darwin (osx port, 2026-09-23): no /proc/<pid>/io. The DISK side has a
+ * kernel equivalent -- proc_pid_rusage's ri_diskio_byteswritten, the same
+ * block-level accounting write_bytes reports. The NETWORK side has no
+ * per-pid kernel counter at all, so the rchar role is filled by the
+ * download's own wire accounting: each helper publishes its connection's
+ * wire_recv into its MAP_SHARED stats slot (dl_wire_note counts plen+24
+ * per message, Core's rule), and the status tick reads that instead.
+ * P2P-only by construction -- closer to what this line always claimed to
+ * show ("network-received") than Linux's rchar, whose file reads made the
+ * aggregate run behind du. Unlike rchar the published counter RESETS when
+ * a helper adopts a new peer; every consumer below treats a smaller
+ * reading as a rotation, never a negative rate. */
+static long dlc_proc_wbytes_darwin(pid_t pid){
+    struct rusage_info_v4 ru;
+    if (proc_pid_rusage(pid, RUSAGE_INFO_V4, (rusage_info_t*)&ru) != 0) return -1;
+    return (long)ru.ri_diskio_byteswritten;
+}
+#endif
 
 /* human-scaled "N.NUNIT/s" into buf (>=16 bytes). */
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec){
@@ -6098,14 +6259,26 @@ static long long dlc_now_ms(void){ struct timespec ts; clock_gettime(CLOCK_MONOT
 /* Tell every live helper to stop, give it a moment, then kill and reap it.
  * Workers inherit the flag-only SIGTERM handler, so SIGTERM is advisory and
  * the SIGKILL a second later is what actually ends a helper blocked in a
- * socket read. kids[w] is zeroed for every stopped helper. */
+ * socket read. kids[w] is zeroed for every stopped helper. Every survivor
+ * is SIGKILLed before any is waited on, and every wait is bounded (see
+ * dl_reap_bounded: a blocking waitpid here is what wedged the worker). */
 static void dlc_stop_workers(pid_t* kids, int nw, const char* why){
     int n = 0; for(int w=0;w<nw;w++) if(kids[w]) n++;
     if(!n) return;
     fprintf(stderr,"[dlc] %s -- stopping %d worker(s)\n", why, n);
     for(int w=0;w<nw;w++) if(kids[w]) kill(kids[w], SIGTERM);
-    { struct timespec g={1,0}; nanosleep(&g,NULL); }
-    for(int w=0;w<nw;w++) if(kids[w]){ int stt; if(waitpid(kids[w],&stt,WNOHANG)==0){ kill(kids[w], SIGKILL); waitpid(kids[w],&stt,0); } kids[w]=0; }
+    for(long waited = 0; waited < 1000; waited += 10){          /* the SIGTERM grace, early out */
+        int left = 0;
+        for(int w=0;w<nw;w++) if(kids[w]){ int stt; if(dl_reap_bounded(kids[w],&stt,0)) kids[w]=0; else left++; }
+        if(!left) break;
+        struct timespec g={0,10000000L}; nanosleep(&g,NULL);
+    }
+    for(int w=0;w<nw;w++) if(kids[w]) kill(kids[w], SIGKILL);
+    for(int w=0;w<nw;w++) if(kids[w]){ int stt;
+        if(!dl_reap_bounded(kids[w],&stt,5000))
+            fprintf(stderr,"[dlc] worker pid %d survived SIGKILL for 5 s -- not waiting on it\n", (int)kids[w]);
+        kids[w]=0;                              /* gone or abandoned: either way no longer ours */
+    }
     dlc_stop_committer();                       /* before anything truncates the archive under it */
 }
 /* The reject hook's half (see dl_reject_block): a no-op unless dl_catchup is
@@ -6181,7 +6354,10 @@ static void dlc_rank_by_throughput(char live[][DL_POOL_SLOT], int nlive){
             }
             kids[k] = pid;
         }
-        for (int k = 0; k < n; k++) if (kids[k] > 0){ int st; waitpid(kids[k], &st, 0); }
+        /* bounded: in the worker (SIGCHLD SIG_IGN) a blocking waitpid would
+         * also wait out every long-lived child -- see dl_reap_bounded */
+        for (int k = 0; k < n; k++) if (kids[k] > 0){ int st;
+            if (!dl_reap_bounded(kids[k], &st, (RANK_TIMEOUT_S + 2) * 1000L)) dl_kill_reap(kids[k], &st, "rank probe"); }
     }
     /* sort fastest first; a peer with no sample ranks last, ties keep order */
     static int idx[DLC_MAXPOOL]; for (int i = 0; i < nlive; i++) idx[i] = i;
@@ -6293,7 +6469,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
         long long age = dh_now_ms() - g_pass[i].t0;
         if(pr <= 0){
             if(age > (long long)g_pass[i].budget_s * 1000 + 15000){          /* the alarm did not end it: kill, treat as budget */
-                kill(g_pass[i].pid, SIGKILL); waitpid(g_pass[i].pid, NULL, 0); close(g_pass[i].fd); g_pass[i].pid = 0;
+                { int st; dl_kill_reap(g_pass[i].pid, &st, "pass helper"); } close(g_pass[i].fd); g_pass[i].pid = 0;
                 g_pass_crashed++;
                 leg_close_ours(i, "sync-budget", "the pass helper overran its budget and was killed");
                 mux_next_peer(i, srcpool, nsrc, out_port); mux_out_nextretry[i] = dh_now_ms() + REDIAL_BACKOFF_MS;
@@ -6304,7 +6480,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
         while(off < sizeof r){ ssize_t n = read(g_pass[i].fd, q + off, sizeof r - off); if(n <= 0){ good = 0; break; } off += (unsigned long)n; }
         static unsigned char blob[DH_V2_BLOB_CAP]; unsigned long got = 0;
         if(good && r.v2_len){ if(r.v2_len > DH_V2_BLOB_CAP) good = 0; else while(got < r.v2_len){ ssize_t n = read(g_pass[i].fd, blob + got, r.v2_len - got); if(n <= 0) break; got += (unsigned long)n; } }
-        int st = 0; waitpid(g_pass[i].pid, &st, 0); close(g_pass[i].fd); g_pass[i].pid = 0;
+        int st = 0; if(!dl_reap_bounded(g_pass[i].pid, &st, 5000)) dl_kill_reap(g_pass[i].pid, &st, "pass helper"); close(g_pass[i].fd); g_pass[i].pid = 0;
         if(!good || (r.v2_len && got != r.v2_len)){
             g_pass_crashed++;
             char d[96];
@@ -6328,7 +6504,7 @@ static long leg_pass_poll(int* stored_leg, const char* srcpool[], int nsrc, int 
     return stored;
 }
 static void leg_pass_stop_all(void){
-    for(int i = 0; i < MUX_MAX_OUT; i++) if(g_pass[i].pid > 0){ kill(g_pass[i].pid, SIGTERM); waitpid(g_pass[i].pid, NULL, 0); close(g_pass[i].fd); g_pass[i].pid = 0; }
+    for(int i = 0; i < MUX_MAX_OUT; i++) if(g_pass[i].pid > 0){ int st; kill(g_pass[i].pid, SIGTERM); if(!dl_reap_bounded(g_pass[i].pid, &st, 5000)) dl_kill_reap(g_pass[i].pid, &st, "pass helper"); close(g_pass[i].fd); g_pass[i].pid = 0; }
 }
 /* ---- the legs' sweep (2026-09-09; factored 2026-09-10) ---------------------
  * Every OTHER leg's buffered messages now -- a ping used to wait for its
@@ -6516,6 +6692,7 @@ static void dlc_stall_tick(volatile long* ctl, volatile dlc_stat_t* stats, pid_t
     int w = -1; for(int i = 0; i < nw; i++) if(kids[i] && stats[i].cur_lo == lo){ w = i; break; }
     if(w < 0){ holder = -1; since = now_ms; return; }        /* nobody holds it: it is in the retry ring or the cursor help's */
     if(w != holder){ holder = w; since = now_ms; return; }   /* a new holder gets a fresh clock */
+    since = dlc_stall_clock(since, stats[w].last_block_ms);  /* ...and every block it delivers restarts it (Core) */
     if(!dlc_tail_stalled(full, (long)(now_ms - since), g_dlc_stall_timeout_s)) return;
     stats[w].kill_reason = 1;
     kill(opid[w], SIGUSR1);
@@ -7032,12 +7209,22 @@ static long dl_catchup_run(const char* dir, int min_workers){
         }
         for(int w=0;w<nw;w++){
             long b=stats[w].blocks; long blkrate=(long)((double)(b-prev_blocks[w])/tick_s);
+#ifdef __APPLE__
+            /* the helper's published wire_recv (dl_wire_note) stands in for
+             * its rchar; dlc_proc_wbytes_darwin keeps the disk side */
+            long rc=kids[w]!=0 ? (long)stats[w].wire_recv : -1;
+            long wc=kids[w]!=0 ? dlc_proc_wbytes_darwin(opid[w]) : -1;
+#else
             long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
             long wc=kids[w]!=0 ? dlc_proc_wbytes(opid[w]) : -1;
+#endif
             char bw[16]="--"; double byte_rate=-1.0;
             if(rc>=0){
                 if(prev_rchar[w]>0){
                     double delta=(double)(rc-prev_rchar[w]);
+#ifdef __APPLE__
+                    if(delta<0){ prev_rchar[w]=0; delta=(double)rc; }   /* peer rotation: the counter restarted */
+#endif
                     tick_total_bytes+=delta;
                     byte_rate=delta/tick_s;
                     dlc_fmt_rate(bw,sizeof bw,byte_rate);
@@ -11823,7 +12010,18 @@ int main(int argc, char** argv){
          * the query hook and gettxout keeps refusing -- degraded, never
          * wrong. */
         { int sv[2];
-          if(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0){ g_txoq_parent = sv[0]; g_txoq_worker = sv[1]; }
+          if(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0){
+              g_txoq_parent = sv[0]; g_txoq_worker = sv[1];
+              /* 2026-09-24: Darwin gives an AF_UNIX stream 8 KB each way
+               * (net.local.stream.sendspace/recvspace), Linux ~208 KB. The
+               * worker answers up to 64 queued queries per pass, and
+               * replies to queries the RPC side already timed out on sit
+               * unread; 8 KB is about 64 replies. Linux's headroom, set
+               * explicitly -- and the worker takes a request only when its
+               * whole reply fits (SO_SNDLOWAT, see txoq_service), so a
+               * parent that stops reading can never hold it in send(). */
+              txoq_channel_tune(sv);
+          }
           else fprintf(stderr,"[serve] gettxout IPC unavailable (socketpair: %s) -- gettxout will refuse\n", strerror(errno)); }
 
         pid_t dl = fork();

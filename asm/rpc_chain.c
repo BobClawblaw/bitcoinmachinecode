@@ -3414,16 +3414,49 @@ static int cmd_createmultisig(const rj_val* params, rj_val** res, long* ec, cons
  * `stats.feerate_percentiles[2]` of undefined and died on the first block
  * below production's undo history. A caller that must have the block-only
  * fields for such a height has getblock (whose fee omission matches Core).
- * Constants match Core: PER_UTXO_OVERHEAD = sizeof(COutPoint)+4 = 40. */
+ * Constants match Core: PER_UTXO_OVERHEAD = sizeof(COutPoint) +
+ * sizeof(uint32_t) + sizeof(bool) = 36+4+1 = 41 (rpc/blockchain.cpp). It was
+ * 40 here -- the coinbase bool missing -- so utxo_size_inc{,_actual} ran
+ * short by exactly (outputs - inputs) bytes on every block (caught against
+ * a local Core 29.4 on 2026-09-24: h=170 232 vs 234, h=812400 -73742 vs
+ * -74799). */
+#define GBS_PER_UTXO_OVERHEAD 41
 static u64 gbs_subsidy(long h){ long era=h/g_halving_interval; if (era>=64) return 0; return 5000000000ULL >> era; }
 static long gbs_cs(u64 n){ if (n<253) return 1; if (n<=0xffff) return 3; if (n<=0xffffffffULL) return 5; return 9; }
 static int gbs_unspendable(const u8* s, u64 len){ return (len>0 && s[0]==0x6a) || len>10000; }
+/* Core's IsBIP30Repeat (validation.cpp): the two mainnet blocks whose
+ * coinbase repeats an earlier coinbase's txid and so OVERWRITES that coin
+ * instead of adding one. getblockstats leaves their coinbase outputs out of
+ * utxo_increase_actual / utxo_size_inc_actual ("don't change the UTXO set
+ * counts"); matched by height AND hash, so no other chain can trip it.
+ * Caught against a local Core 29.4 on 2026-09-24: h=91842 actual 116 vs 0. */
+static int gbs_bip30_repeat(long h, const u8* hdr){
+    static const struct { long h; const char* hash; } k[] = {
+        { 91842, "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec" },
+        { 91880, "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721" },
+    };
+    for (unsigned i = 0; i < sizeof k / sizeof k[0]; i++){
+        if (h != k[i].h) continue;
+        u8 d[32]; char hx[65]; sha256d(d, hdr, 80); hex_rev(hx, d, 32);
+        return !strcmp(hx, k[i].hash);
+    }
+    return 0;
+}
 static int gbs_cmp_u64(const void* a, const void* b){ u64 x=*(const u64*)a, y=*(const u64*)b; return (x<y)?-1:(x>y)?1:0; }
 typedef struct { long long fr, wt; } gbs_frp;
 static int gbs_cmp_frp(const void* a, const void* b){ long long x=((const gbs_frp*)a)->fr, y=((const gbs_frp*)b)->fr; return (x<y)?-1:(x>y)?1:0; }
 static long long gbs_median(u64* a, long n){ if (n==0) return 0; qsort(a,(size_t)n,sizeof(u64),gbs_cmp_u64); if (n%2==0) return (long long)((a[n/2-1]+a[n/2])/2); return (long long)a[n/2]; }
 
+static int gbs_cmp_str(const void* a, const void* b){ return strcmp(*(const char* const*)a, *(const char* const*)b); }
 static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const char** em){
+    /* stats (position 2): Core's RPCHelpMan type-checks it before anything
+     * runs -- an array (or null / absent = every stat) of strings. */
+    static char gbs_eb[256];
+    const rj_val* a1 = (params && params->typ==RJ_ARR && params->nitems>=2) ? params->items[1] : NULL;
+    if (a1 && a1->typ != RJ_NULL && a1->typ != RJ_ARR){ *ec=-3; *em=rj_wrong_type_msg(gbs_eb, sizeof gbs_eb, 2, "stats", a1, "array"); return 0; }
+    if (a1 && a1->typ == RJ_ARR)
+        for (size_t i = 0; i < a1->nitems; i++)
+            if (!a1->items[i] || a1->items[i]->typ != RJ_STR){ *ec=-3; *em=rj_wrong_type_msg_bare(gbs_eb, sizeof gbs_eb, a1->items[i], "string"); return 0; }
     long tip = refresh(); long h;
     const rj_val* a0 = (params && params->typ==RJ_ARR && params->nitems>=1) ? params->items[0] : NULL;
     if (a0 && a0->typ==RJ_NUM){            /* height form */
@@ -3443,6 +3476,7 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
     int have_undo = (undo_n >= 0); long undo_cur = 0;
     if (!have_undo && h > 0){ *ec=-1; *em="Can't read undo data from disk"; return 0; }   /* Core: GetUndoChecked */
 
+    const int bip30_repeat = gbs_bip30_repeat(h, blk);
     long long inputs=0, outputs=0, total_out=0, total_size=0, total_weight=0;
     long long swtotal_size=0, swtotal_weight=0, swtxs=0;
     long long maxtxsize=0, mintxsize=0; int have_txsz=0;
@@ -3461,9 +3495,9 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
         for (u64 j=0;j<w.n_out;j++){
             u64 val=rd64(op); op+=8; u64 cc2; u64 sl=read_varint(op,end,&cc2); const u8* spk=op+cc2; op+=cc2+sl;
             tx_total_out += val;
-            long out_size = 8 + gbs_cs(sl) + (long)sl + 40;
+            long out_size = 8 + gbs_cs(sl) + (long)sl + GBS_PER_UTXO_OVERHEAD;
             outputs++; utxo_size_inc += out_size;
-            if (h==0) continue;
+            if (h==0 || (coinbase && bip30_repeat)) continue;   /* Core: genesis + IsBIP30Repeat coinbases */
             if (gbs_unspendable(spk, sl)) continue;
             utxos++; utxo_size_inc_actual += out_size;
         }
@@ -3478,7 +3512,7 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
         if (have_undo && undo_cur+(long)w.n_in <= undo_n){
             u64 tx_total_in=0;
             for (u64 k=0;k<w.n_in;k++){ tx_total_in += uvals[undo_cur+k];
-                long ps=8+gbs_cs(uslens[undo_cur+k])+(long)uslens[undo_cur+k]+40; utxo_size_inc-=ps; utxo_size_inc_actual-=ps; }
+                long ps=8+gbs_cs(uslens[undo_cur+k])+(long)uslens[undo_cur+k]+GBS_PER_UTXO_OVERHEAD; utxo_size_inc-=ps; utxo_size_inc_actual-=ps; }
             long long txfee=(long long)tx_total_in-(long long)tx_total_out;
             fee_arr[fee_n++]=(u64)txfee;
             if (!have_fee){ maxfee=minfee=txfee; have_fee=1; } else { if(txfee>maxfee)maxfee=txfee; if(txfee<minfee)minfee=txfee; }
@@ -3542,6 +3576,28 @@ static int cmd_getblockstats(const rj_val* params, rj_val** res, long* ec, const
     if (have_undo) rj_obj_set(o,"utxo_size_inc", rj_numf("%lld", utxo_size_inc));
     rj_obj_set(o,"utxo_increase_actual", rj_numf("%lld", utxos-inputs));
     if (have_undo) rj_obj_set(o,"utxo_size_inc_actual", rj_numf("%lld", utxo_size_inc_actual));
+    /* The stats filter (2026-09-24; it used to be ignored -- every call got
+     * all 31 keys). Core collects the names into a std::set -- so the reply
+     * is in byte order with duplicates folded, whatever order they were
+     * asked in -- and an empty list means every stat. A name that is not a
+     * statistic is -8 "Invalid selected statistic '<name>'". */
+    if (a1 && a1->typ == RJ_ARR && a1->nitems > 0){
+        const char** names = malloc(a1->nitems * sizeof *names); size_t nn = 0;
+        if (!names){ rj_free(o); *ec=-32603; *em="Out of memory"; return 0; }
+        for (size_t i = 0; i < a1->nitems; i++) names[nn++] = a1->items[i]->str;
+        qsort(names, nn, sizeof names[0], gbs_cmp_str);
+        rj_val* sel = rj_obj();
+        for (size_t i = 0; i < nn; i++){
+            if (i && !strcmp(names[i], names[i-1])) continue;
+            const rj_val* v = rj_obj_get(o, names[i]);
+            if (!v){
+                snprintf(gbs_eb, sizeof gbs_eb, "Invalid selected statistic '%s'", names[i]);
+                free(names); rj_free(sel); rj_free(o); *ec=-8; *em=gbs_eb; return 0;
+            }
+            rj_obj_set(sel, names[i], rj_clone(v));
+        }
+        free(names); rj_free(o); o = sel;
+    }
     *res=o;
     return 1;
 }

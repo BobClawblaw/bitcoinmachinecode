@@ -49,6 +49,12 @@ int main(void){
     ck("...never under 2 s", dlc_stall_timeout_after(2, 0) == 2);
     ck("the tail's holder is a staller only while the window is full", !dlc_tail_stalled(0, 10000, 2) && dlc_tail_stalled(1, 2000, 2));
     ck("1,999 ms at a 2 s timeout: not yet", !dlc_tail_stalled(1, 1999, 2));
+    ck("the stall clock restarts on a block the holder delivers", dlc_stall_clock(1000, 5000) == 5000);
+    ck("...and a block from before the holder took the tail does not move it", dlc_stall_clock(5000, 1000) == 5000);
+    ck("no block yet (0): the clock stays where it started", dlc_stall_clock(5000, 0) == 5000);
+    ck("855 KB/s on a 60 MB chunk, a block every ~1.9 s: never a staller at 2 s",
+       !dlc_tail_stalled(1, 7000 - dlc_stall_clock(0, 5100), 2));
+    ck("a peer silent for the timeout after its last block is one", dlc_tail_stalled(1, 7200 - dlc_stall_clock(0, 5100), 2));
     ck("a peer is replaced only when a free peer exists", dlc_replace_allowed(1) && !dlc_replace_allowed(0));
     printf("%s (%d failure(s))\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
