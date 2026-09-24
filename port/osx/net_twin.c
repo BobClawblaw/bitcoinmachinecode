@@ -48,6 +48,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <poll.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -118,10 +119,17 @@ void fd_close(int fd) { close(fd); }
  * tcp_connect_ip(ip, port): ip and port both in NETWORK byte order (x86
  * stores them into sockaddr_in verbatim). 10s SO_RCVTIMEO bounds a peer that
  * stops replying (2026-08-15 live-IBD finding); 10s SO_SNDTIMEO bounds the
- * blocking connect() itself (2026-08-31 / 2026-09-01 dial-wedge findings).
+ * blocking connect() itself (2026-08-31 / 2026-09-01 dial-wedge findings)
+ * on Linux -- but Darwin does NOT apply SO_SNDTIMEO to connect(): a silent
+ * peer blocked the dial until main.c's 20 s SIGALRM budget interrupted it,
+ * reported as "connect: Interrupted system call" (m5ultra, 2026-09-24).
+ * So the 10 s bound is explicit here: a non-blocking connect() waited on
+ * with poll(), the socket back to blocking before it is returned, and an
+ * expiry reported as -ETIMEDOUT (main.c's dial_fail_errno: "timed out").
  * setsockopt errors are ignored (best-effort, as on x86).
  * Return: fd, or the raw negative errno from socket()/connect().
  * ------------------------------------------------------------------------- */
+#define TCP_CONNECT_TIMEOUT_MS 10000
 long tcp_connect_ip(u32 ip, u16 port)
 {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -134,11 +142,33 @@ long tcp_connect_ip(u32 ip, u16 port)
     sa.sin_family = AF_INET;
     sa.sin_port = port;                       /* already network order */
     sa.sin_addr.s_addr = ip;
-    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0 || fcntl(fd, F_SETFL, fl | O_NONBLOCK) < 0) {
         int e = errno;
+        close(fd);
+        return -(long)e;
+    }
+    int e = 0;
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) < 0) {
+        e = errno;
+        if (e == EINPROGRESS) {
+            /* EINTR (the caller's dial-budget alarm) ends the wait as a
+             * failure, exactly as it ended the blocking connect */
+            struct pollfd pf = { fd, POLLOUT, 0 };
+            int pr = poll(&pf, 1, TCP_CONNECT_TIMEOUT_MS);
+            if (pr == 0) e = ETIMEDOUT;
+            else if (pr < 0) e = errno;
+            else {
+                socklen_t el = sizeof e;
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &e, &el) < 0) e = errno;
+            }
+        }
+    }
+    if (e) {
         close(fd);
         return -(long)e;                      /* x86 returns the raw -errno */
     }
+    fcntl(fd, F_SETFL, fl);                   /* blocking again: every caller expects it */
     return fd;
 }
 

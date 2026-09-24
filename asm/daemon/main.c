@@ -2829,6 +2829,9 @@ static int outbound_connect_raw(const char* host, int rcv_ms, int out_port){
 
     if(fd<0){
         if(proxied) snprintf(g_dial_fail,sizeof g_dial_fail,"ipv4 dial via proxy: %.60s", pwhy);
+        /* the budget alarm interrupting connect() surfaces as EINTR: that is
+         * the dial budget expiring, not a signal from somewhere else */
+        else if(fired && fd == -EINTR) snprintf(g_dial_fail,sizeof g_dial_fail,"connect timed out (dial budget %ds)", OUTBOUND_DIAL_BUDGET_SECS);
         else dial_fail_errno("connect", fd);
         return -1;
     }
