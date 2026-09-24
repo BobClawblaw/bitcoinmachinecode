@@ -160,6 +160,34 @@ static long mac_fl_drain(int fd)
     return r ? -1 : 0;
 }
 
+/* compaction output writer (x86: mac_out_begin/_write/_flush/_tell over
+ * mac_ow_buf). The twin kept the buffer and its state but never ported the
+ * functions, so utxo_lsm_compact_range wrote every record straight to the
+ * fd: key+type, value/slen/height/cb and the script as three write(2)s --
+ * ~370M syscalls per full compaction of a 122M-coin mainnet set, a
+ * many-minute pre-catchup compaction at boot (m5ultra, 2026-09-24: the
+ * worker's samples were all write()). The sparse index's record offsets
+ * are fd offset + bytes still buffered, as on x86. */
+static long mac_out_flush(void)
+{
+    if (!mac_ow_fill) return 0;
+    long r = write_exact((int)mac_ow_fd, mac_ow_buf, mac_ow_fill) ? -1 : 0;
+    mac_ow_fill = 0;
+    return r;
+}
+
+static long mac_out_write(const void *src, u64 len)
+{
+    if (mac_ow_fill + len > MAC_OWBUF) {
+        if (mac_out_flush()) return -1;
+        if (len > MAC_OWBUF)
+            return write_exact((int)mac_ow_fd, src, len) ? -1 : 0;
+    }
+    memcpy(mac_ow_buf + mac_ow_fill, src, len);
+    mac_ow_fill += len;
+    return 0;
+}
+
 static int write_exact(int fd, const void *buf, u64 len)
 {
     const u8 *p = buf;
@@ -1381,15 +1409,15 @@ long utxo_lsm_compact_range(void *lst, u64 lo, u64 k)
             u8 kt[37];
             memcpy(kt, key, 36);
             kt[36] = w->type;
-            if (write_exact(ofd, kt, 37)) goto fail_compact;
+            if (mac_out_write(kt, 37)) goto fail_compact;
             if (w->type == 1) {
                 u8 vp[15];
                 memcpy(vp, &w->value, 8);
                 memcpy(vp + 8, &w->slen, 2);
                 memcpy(vp + 10, &w->height, 4);
                 vp[14] = w->is_coinbase;
-                if (write_exact(ofd, vp, 15)) goto fail_compact;
-                if (w->slen && write_exact(ofd, w->script, w->slen))
+                if (mac_out_write(vp, 15)) goto fail_compact;
+                if (w->slen && mac_out_write(w->script, w->slen))
                     goto fail_compact;
                 mac_bloom_setbit(key, 0x811c9dc5u, bloom, (u32)bits_mask);
                 mac_bloom_setbit(key, 0xa1b2c3d4u, bloom, (u32)bits_mask);
@@ -1405,6 +1433,7 @@ long utxo_lsm_compact_range(void *lst, u64 lo, u64 k)
         }
     }
 
+    if (mac_out_flush()) goto fail_compact;           /* every record on disk before the seeks */
     /* patch bloom + nrec, append sparse, patch sparse_off/n */
     if (lseek(ofd, 44, SEEK_SET) < 0) goto fail_compact;
     if (write_exact(ofd, bloom, bloom_bytes)) goto fail_compact;
