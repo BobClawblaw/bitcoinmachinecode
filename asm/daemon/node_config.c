@@ -491,6 +491,12 @@ int node_config_is_manual(const char* ip){
     for(int i=0;i<g_cfg.n_connect;i++) if(!strcmp(g_cfg.connectn[i], ip)) return 1;
     return 0;
 }
+int node_config_manual_kind(const char* ip){
+    if(!ip || !*ip) return 0;
+    for(int i=0;i<g_cfg.n_connect;i++) if(!strcmp(g_cfg.connectn[i], ip)) return 2;
+    for(int i=0;i<g_cfg.n_addnode;i++) if(!strcmp(g_cfg.addnode[i], ip)) return 1;
+    return 0;
+}
 
 /* Clamp to values that cannot wedge the node. A config file is operator input,
  * not trusted input: a typo that sets min_usable_peers to 0 or maxpool to -1

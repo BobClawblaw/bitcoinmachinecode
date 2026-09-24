@@ -66,6 +66,8 @@
  *
  * BOUNDED FOOTPRINT
  * -----------------
+ * [bmc_osx 2026-09-24: now fully associative with LRU eviction -- see
+ * slot_get; the direct-mapped premise below did not hold at 24 runs.]
  * Direct-mapped cache, LSM_MM_SLOTS (64) entries per thread, indexed by
  * run_no % 64; a colliding slot is unmapped and replaced. 64 comfortably
  * exceeds UTXO_LIVE_COMPACT_THRESHOLD (12, the steady-state run count) while
@@ -122,6 +124,7 @@ typedef struct {
     /* parsed header */
     u64   nrec, bloom_bytes, bits_mask, header_size, sparse_off, sparse_n, rec_v2;
     u64   records_start;
+    u64   last_use;      /* this thread's lookup tick at the last hit: LRU eviction */
 } lsm_run_t;
 
 /* Cache epoch. utxo_lsm_init / utxo_lsm_reload bump this; every thread
@@ -145,6 +148,7 @@ static volatile unsigned long g_epoch = 1;
 static __thread unsigned long t_epoch;
 
 static __thread lsm_run_t g_cache[LSM_MM_SLOTS];
+static __thread u64       g_tick;
 static __thread u8        g_script[SCRIPT_MAX_BYTES];
 
 static void slot_release(lsm_run_t *s);
@@ -237,10 +241,34 @@ static lsm_run_t *slot_get(u64 run_no, u64 gen){
             if (g_cache[i].valid) slot_release(&g_cache[i]);
         t_epoch = g_epoch;
     }
-    lsm_run_t *s = &g_cache[run_no % LSM_MM_SLOTS];
-
-    if (s->valid && s->run_no == run_no && s->gen == gen) { g_stat_hit++; return s; }
-    if (s->valid) slot_release(s);          /* collision, or stale gen */
+    /* 2026-09-24 (bmc_osx): FULLY ASSOCIATIVE, least-recently-used. The
+     * cache was direct-mapped (slot = run_no % 64) on the premise, in the
+     * header above, that ~12 live runs make collisions essentially absent.
+     * A mid-catchup manifest holds up to 24 runs with scattered numbers --
+     * 24 into 64 slots collide ~99% of the time -- and on the m5ultra the
+     * 15 GB base run (9040) shared slot 16 with a fresh run (9232). A
+     * lookup checks the newer run, then finds an old coin in the base, so
+     * EVERY lookup unmapped and re-mapped both: about half the apply
+     * thread in munmap/open/mmap (tests/test_lsm_mm_collide: 2,001 maps for
+     * 2,000 lookups). A 64-entry scan is noise next to one syscall, and 64
+     * slots hold every live run (the manifest waits under 24 runs), so a
+     * live run is never evicted by another. A stale gen of this run_no is
+     * released on the spot. */
+    g_tick++;
+    lsm_run_t *s = NULL, *free_slot = NULL, *lru = NULL;
+    for (int i = 0; i < LSM_MM_SLOTS; i++) {
+        lsm_run_t *c = &g_cache[i];
+        if (!c->valid) { if (!free_slot) free_slot = c; continue; }
+        if (c->run_no == run_no) {
+            if (c->gen == gen) { c->last_use = g_tick; g_stat_hit++; return c; }
+            slot_release(c);                  /* stale gen: this run_no was reused */
+            if (!free_slot) free_slot = c;
+            continue;
+        }
+        if (!lru || c->last_use < lru->last_use) lru = c;
+    }
+    s = free_slot ? free_slot : lru;
+    if (s->valid) slot_release(s);           /* all 64 live: evict the least recently used */
 
     memset(s, 0, sizeof *s);
     s->fd = -1;
@@ -266,8 +294,9 @@ static lsm_run_t *slot_get(u64 run_no, u64 gen){
      * Guards against a run_no whose file was replaced underneath us. */
     if (s->gen != gen) { slot_release(s); return NULL; }
 
-    s->run_no = run_no;
-    s->valid  = 1;
+    s->run_no   = run_no;
+    s->valid    = 1;
+    s->last_use = g_tick;
     g_stat_map++;
     return s;
 }
