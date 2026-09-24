@@ -64,6 +64,16 @@ found by a live comparison against mainnet peers (0 of 11 entries carried
 - `bytessent_per_msg` / `bytesrecv_per_msg` were dropped when empty. Core
   always pushes both objects.
 
+- `synced_headers` / `synced_blocks` were a constant `-1` for every relay leg
+  (2026-09-24). Core: `pindexBestKnownBlock`'s and `pindexLastCommonBlock`'s
+  heights. Now from `rpc_peer_t.best_known_height`, which the worker raises
+  when a block the peer announced or sent is stored, or when a sync pass on
+  its connection stores blocks. `synced_blocks` is that, capped at the
+  connected tip. Still `-1`: inbound peers (their serve child does not track
+  it), and a peer that has announced nothing since connecting, which is also
+  `-1` in Core. Our value only counts blocks we have, so it can trail Core's
+  while a peer is ahead of us by headers only.
+
 `validation/addrlocal_regtest_e2e.sh` proves the first two against a real
 v31.1: it sends one version message, with a chosen `addr_recv`, to Core and
 to this node and requires the same `addrlocal` from both.
