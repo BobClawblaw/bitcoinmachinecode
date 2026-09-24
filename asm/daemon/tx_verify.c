@@ -615,7 +615,7 @@ static int txv_parse(const u8* tx, u64 txlen, u64* out_nin, const char** reason)
  * p2wsh witness-collection loss). Not used by the daemon. */
 long dbg_txv_parse(const u8* tx, u64 len, u64* nin_out, u64* nwit_out, u32* wit_off_out, u32* witlen_out)
 {
-    const char* reason = 0; u64 nin = 0;
+    const char* reason = 0;
     extern void* txv_bytepool_ptr(void);
     (void)nin_out; (void)nwit_out; (void)wit_off_out; (void)witlen_out;
     (void)reason;
@@ -631,7 +631,7 @@ long dbg_txv_parse(const u8* tx, u64 len, u64* nin_out, u64* nwit_out, u32* wit_
             if (b0<0xfd){ v=b0; k=1; } else if (b0==0xfd){ v=p[1]|(p[2]<<8); k=3; } else if (b0==0xfe){ v=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); k=5; } else { v=p[6]; k=9; }
             if (k==0){ v=b0; k=1; } n=v; p+=k; break; } (void)sh; }
         u64 nin2 = n;
-        for (u64 i=0;i<nin2;i++){ p+=36; u64 sl=0; { u8 b0=p[0]; int k; if (b0<0xfd){ sl=b0; p+=1; } else if (b0==0xfd){ sl=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ sl=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { sl=p[6]; p+=9; } } p+=sl+4; }
+        for (u64 i=0;i<nin2;i++){ p+=36; u64 sl=0; { u8 b0=p[0]; if (b0<0xfd){ sl=b0; p+=1; } else if (b0==0xfd){ sl=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ sl=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { sl=p[6]; p+=9; } } p+=sl+4; }
         u64 nout2 = 0; { u8 b0=p[0]; if (b0<0xfd){ nout2=b0; p+=1; } else if (b0==0xfd){ nout2=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ nout2=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { nout2=p[6]; p+=9; } }
         for (u64 i=0;i<nout2;i++){ p+=8; u64 sl=0; { u8 b0=p[0]; if (b0<0xfd){ sl=b0; p+=1; } else if (b0==0xfd){ sl=p[1]|(p[2]<<8); p+=3; } else if (b0==0xfe){ sl=p[2]|(p[3]<<8)|(p[4]<<16)|(p[5]<<24); p+=5; } else { sl=p[6]; p+=9; } } p+=sl; }
         u64* counts = (u64*)malloc((nin2?nin2:1)*sizeof(u64));
