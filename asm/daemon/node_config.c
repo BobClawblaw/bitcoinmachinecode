@@ -320,7 +320,28 @@ static void set_defaults(void){
     g_cfg.reindex_chainstate    = 0;
     g_cfg.walletpassfile[0]     = 0;
     g_cfg.signetchallenge[0]    = 0;
-    g_cfg.boot_catchup          = 1;
+    /* 0 since 2026-09-24 (was 1). The boot catch-up runs the parallel block download INSIDE
+     * the boot phase, and serve_start_rpc() is only reached after it, so on an empty mainnet
+     * datadir the node bound no RPC port and wrote no cookie until the whole sync had
+     * finished: eighteen hours of a node downloading and validating correctly while being
+     * indistinguishable, to anything watching it, from one that failed to start. The natural
+     * debugging move -- rpcbind, rpcallowip, the cookie path -- finds nothing wrong, because
+     * nothing is.
+     *
+     * Measured both ways on one empty mainnet datadir, 2026-09-24: with 1, no cookie after
+     * four minutes and none due until the end; with 0, "[boot] boot phase complete (0.07s
+     * total)" and "[rpc] block archive opened (chain RPCs live)" in the same second.
+     *
+     * This is also the setting every published benchmark already used: validation/
+     * fresh_ibd_run.sh writes bmc.bootcatchup=0, and the captured configs of runs 27, 28 and
+     * 29 all carry it. So 18 h 40 m, 18 h 24 m and 18 h 29 m -- and three UTXO sets
+     * MuHash-identical to Core's -- are figures for THIS path. The old default is the one no
+     * published mainnet run ever exercised.
+     *
+     * The download still happens: the worker's far-behind trigger runs the parallel downloader
+     * when the gap warrants it. What changes is that it no longer runs before anything can
+     * observe it. See issues/293. */
+    g_cfg.boot_catchup          = 0;
     g_cfg.rpcbind[0]            = 0;
     g_cfg.n_rpcallowip          = 0;
     g_cfg.networkactive         = 1;
