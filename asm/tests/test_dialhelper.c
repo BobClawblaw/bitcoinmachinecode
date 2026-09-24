@@ -55,6 +55,23 @@ static void fake_peer(int cfd){
     for(int i=0;i<6;i++) if (p2p_read(cfd,cmd,rbuf,sizeof(rbuf),&plen)<=0) break;   /* wtxidrelay, sendaddrv2, verack, ... */
     sleep(3);
 }
+/* fake_peer, plus Core's post-verack chatter: a sendcmpct right behind its
+ * verack, so the handed-over socket has bytes buffered in it */
+static void fake_peer_chatty(int cfd){
+    unsigned char rbuf[4096]; char cmd[12]; unsigned plen=0;
+    if (p2p_read(cfd,cmd,rbuf,sizeof(rbuf),&plen)<=0) return;      /* our version */
+    unsigned char v[102]; int o=0;
+    put_u32le(v+o,70016);o+=4; put_u64le(v+o,0x409);o+=8; put_u64le(v+o,(unsigned long long)time(NULL));o+=8;
+    put_u64le(v+o,1);o+=8; o+=16; put_u16be(v+o,8333);o+=2;
+    put_u64le(v+o,1);o+=8; o+=16; put_u16be(v+o,0);o+=2;
+    put_u64le(v+o,0x4444444444444444ULL);o+=8; const char*u="/fakepeer:0.1/"; v[o]=strlen(u);o++;memcpy(v+o,u,strlen(u));o+=strlen(u);
+    put_u32le(v+o,900000);o+=4; v[o]=1;o++;
+    p2p_write(cfd,"version",7,v,o);
+    p2p_write(cfd,"verack",6,"",0);
+    unsigned char sc[9] = {0}; sc[1] = 2; p2p_write(cfd,"sendcmpct",9,sc,9);
+    for(int i=0;i<6;i++) if (p2p_read(cfd,cmd,rbuf,sizeof(rbuf),&plen)<=0) break;
+    sleep(3);
+}
 /* a peer that completes the handshake, then answers the first getheaders
  * with a canned headers page (mode 0: 2 headers continuing OUR tip; mode 1:
  * 2 headers continuing an unrelated hash; mode 2: a ping first, then the
@@ -121,6 +138,32 @@ int main(void){
     { char pv[256]; format_peer_version_info(pv, sizeof pv); ok(strstr(pv, "fakepeer") != 0, "getpeerinfo-style version text reflects the peer"); }
     ok(dh_install_leg(h, fd, &r) == 0, "a second install of the same host is refused (dedupe)");
     close(mux_out_fd[mux_n_out - 1]); mux_out_fd[mux_n_out - 1] = -1;
+
+    printf("== 1b. the handed-over socket is still alive when the worker gets to it late ==\n");
+    /* Darwin (m5ultra, 2026-09-24): a socket passed with SCM_RIGHTS arrived
+     * DEAD -- EOF + HUP, its buffered bytes gone -- whenever the helper
+     * _exit()ed before the worker's recvmsg, and the worker collects once per
+     * rotation. The helper now waits for dh_poll to close its end. Linux
+     * keeps the socket either way; this guards the Darwin build. */
+    { int l2 = socket(AF_INET, SOCK_STREAM, 0); setsockopt(l2, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+      struct sockaddr_in s2; memset(&s2, 0, sizeof s2); s2.sin_family = AF_INET; s2.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      bind(l2, (struct sockaddr*)&s2, sizeof s2); listen(l2, 4); socklen_t a2 = sizeof s2; getsockname(l2, (struct sockaddr*)&s2, &a2);
+      pid_t fp2 = fork();
+      if (fp2 == 0){ int c = accept(l2, NULL, NULL); if (c >= 0) fake_peer_chatty(c); _exit(0); }
+      char host2[64]; snprintf(host2, sizeof host2, "127.0.0.1:%d", ntohs(s2.sin_port));
+      ok(dh_start(host2, ntohs(s2.sin_port)) == 1, "helper started");
+      usleep(400000);                                   /* the helper is done long before the worker looks */
+      dh_result_t r2; int fd2 = -1; char hh[128]; int got2 = 0;
+      for (int i = 0; i < 300 && !got2; i++){ got2 = dh_poll(&r2, &fd2, hh, sizeof hh); if (!got2) usleep(50000); }
+      ok(got2 && r2.ok == 1 && fd2 >= 0, "the late-collected dial succeeded");
+      if (fd2 >= 0){
+          struct pollfd pf = { fd2, POLLIN, 0 }; poll(&pf, 1, 0);
+          unsigned char pk[24]; ssize_t n = recv(fd2, pk, sizeof pk, MSG_PEEK | MSG_DONTWAIT);
+          ok(!(pf.revents & POLLHUP), "the socket is not hung up");
+          ok(n >= 16 && !memcmp(pk + 4, "sendcmpct", 9), "the peer's buffered sendcmpct is still there to read");
+          close(fd2);
+      }
+      close(l2); }
 
     printf("== 2. a dial that never completes is given up, not waited for ==\n");
     dial_helper_test_set_timeout_ms(1500);
