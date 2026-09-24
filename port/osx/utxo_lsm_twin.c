@@ -384,7 +384,16 @@ static void mac_rsort_rec(u8 *src, u8 *dst, u64 n, u32 bitoff, unsigned depth)
     unsigned width = n >= 65536 ? 12u : 8u;
     if (bitoff >= 96) {
         /* variant C: the digit is a KEY BYTE (bytes 12..35) read through the
-         * descriptor array -- the compact entry only carries 96 bits. */
+         * descriptor array -- the compact entry only carries 96 bits. The
+         * level is always 8 bits wide (x86 fixes [rbp-0x38] = 8 here), and
+         * the descriptor offset is 64-bit (x86: mov eax / shl rax, 6): a u32
+         * eidx * 64 wraps once eidx >= 2^26, so a flush of more than 67.1M
+         * descriptors read a stranger's key byte as the digit for every
+         * entry gathered past that point. The tombstones gather LAST, so a
+         * same-txid tie group came out with its tombstones scattered around
+         * its pushes, the run's first-match scan hit a strictly greater key
+         * and reported live coins absent -- the 2026-09-24 mainnet FATAL at
+         * h=274443 (outpoint ae1b..460f:10, a 70,992,972-descriptor flush). */
         u64 counts[256];
         memset(counts, 0, sizeof counts);
         u64 byteoff = bitoff >> 3;
@@ -392,7 +401,7 @@ static void mac_rsort_rec(u8 *src, u8 *dst, u64 n, u32 bitoff, unsigned depth)
         for (u64 i = 0; i < n; i++) {
             u32 eidx;
             memcpy(&eidx, src + i * 16 + 8, 4);
-            counts[A[eidx * 64 + byteoff]]++;
+            counts[A[(u64)eidx * 64 + byteoff]]++;
         }
         u64 pos[256];
         u64 acc = 0;
@@ -401,11 +410,11 @@ static void mac_rsort_rec(u8 *src, u8 *dst, u64 n, u32 bitoff, unsigned depth)
         int shared = 0;
         for (int d = 0; d < 256; d++)
             if (counts[d] == n) { shared = 1; break; }
-        if (shared) { mac_rsort_rec(src, dst, n, bitoff + width, depth + 1); return; }
+        if (shared) { mac_rsort_rec(src, dst, n, bitoff + 8, depth + 1); return; }
         for (u64 i = 0; i < n; i++) {
             u32 eidx;
             memcpy(&eidx, src + i * 16 + 8, 4);
-            u8 digit = A[eidx * 64 + byteoff];
+            u8 digit = A[(u64)eidx * 64 + byteoff];
             memcpy(dst + pos[digit] * 16, src + i * 16, 16);
             pos[digit]++;                            /* pos[d] = bucket END */
         }
@@ -413,17 +422,18 @@ static void mac_rsort_rec(u8 *src, u8 *dst, u64 n, u32 bitoff, unsigned depth)
         for (int d = 0; d < 256; d++) {
             u64 end = pos[d];
             if (end > start) {
-                if (dst == (u8 *)mac_rs_final)
-                    mac_rsort_rec(dst + start * 16, src + start * 16, end - start,
-                                  bitoff + width, depth + 1);
-                else
-                    mac_rsort_rec(dst + start * 16, src + start * 16, end - start,
-                                  bitoff + width, depth + 1);
+                mac_rsort_rec(dst + start * 16, src + start * 16, end - start,
+                              bitoff + 8, depth + 1);
             }
             start = end;
         }
         return;
     }
+    /* never read past the 96 compact key bits: x86 clamps the width to the
+     * bits left (bit 92 -> a 4-bit level), so variant C starts byte-aligned
+     * at 96. Unclamped, the bit-92 level's low nibble was gather-index bits
+     * 28..31 -- same-key groups split by gather order once n >= 2^28. */
+    if (width > 96 - bitoff) width = 96 - bitoff;
     /* variants A/B on the compact entry */
     u64 nbuckets = 1ull << width;
     u64 *counts = malloc(nbuckets * 8);
