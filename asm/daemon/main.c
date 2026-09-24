@@ -3675,6 +3675,17 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
     if(pid < 0){ close(sp[0]); close(sp[1]); return 0; }
     if(pid == 0){
         close(sp[0]); g_in_dial_helper = 1;
+        /* Drop what this helper inherited and has no use for (2026-09-24). A
+         * helper forked while another was in flight held the worker's end of
+         * THAT helper's socketpair: dh_poll's close() of it then woke nobody,
+         * the other helper sat out its wait, and dl_reap_bounded blocked the
+         * worker's rotation for its full 5 s -- once per overlapping dial
+         * (mainnet: a socket handed over at 461 ms reached the worker at
+         * 10,820 ms, two reaps late). The live legs are the same shape: a copy
+         * here keeps a leg the worker has closed open to its peer, no FIN,
+         * until this helper exits. Pinned by tests/test_dialhelper.c 1c, 1d. */
+        for(int i = 0; i < DH_MAX; i++) if(i != slot && g_dh[i].pid > 0 && g_dh[i].sp >= 0) close(g_dh[i].sp);
+        for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0) close(mux_out_fd[k]);
         long long t_dial0 = dh_now_ms();
         dh_result_t r; memset(&r, 0, sizeof r);
         snprintf(g_dial_fail, sizeof g_dial_fail, "refused before dialing");   /* not the parent's last reason (2026-09-10: "timed out (10s)" after 1.4 s) */
