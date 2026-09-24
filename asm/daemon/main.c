@@ -6720,10 +6720,27 @@ static void dl_publish_peer_table(void* store_buf, int with_tip){
                  * five peers that had no socket in any state (2026-09-16).
                  * getsockopt on a closed or non-socket fd fails; that is the
                  * signal to retire the slot rather than publish a ghost. */
+#if defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
+                /* bmc_osx 2026-09-24: Darwin has no Linux TCP_INFO -- the compat
+                 * header maps it to an unassigned option so getsockopt FAILS --
+                 * and since this failure became the liveness test (run 26) every
+                 * live leg was retired on every sweep: getpeerinfo,
+                 * getconnectioncount and getnetworkinfo all answered 0 on the
+                 * m5ultra while the worker held 11 legs and followed the tip.
+                 * TCP_CONNECTION_INFO is Darwin's equivalent (dh_tcp_state uses it
+                 * too): the liveness test and the byte meters. */
+                struct tcp_connection_info ci; socklen_t cil = sizeof ci;
+                (void)ti; (void)tl;
+                if(getsockopt(mux_out_fd[i], IPPROTO_TCP, TCP_CONNECTION_INFO, &ci, &cil) != 0){
+                    g_node_status->peers[i].used = 0;
+                    continue;
+                }
+#else
                 if(getsockopt(mux_out_fd[i], IPPROTO_TCP, TCP_INFO, &ti, &tl) != 0){
                     g_node_status->peers[i].used = 0;
                     continue;
                 }
+#endif
                 /* ...and the descriptor must still be THIS peer's socket. A
                  * closed leg leaves its number behind, and the kernel hands
                  * that number to the next socket opened -- a download worker's
@@ -6750,6 +6767,14 @@ static void dl_publish_peer_table(void* store_buf, int with_tip){
                   } }
                 {
                     rpc_peer_t* pr = &g_node_status->peers[i];
+#if defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
+                    /* the connection's payload bytes; Darwin keeps no
+                     * last-data timestamps here, so lastsend/lastrecv keep
+                     * what the fill set */
+                    pr->bytes_sent = (long long)ci.tcpi_txbytes;
+                    pr->bytes_recv = (long long)ci.tcpi_rxbytes;
+                    (void)nows;
+#else
                     /* byte fields only if the kernel returned a struct large
                      * enough to include them */
                     if(tl >= (socklen_t)((char*)(&ti.bytes_received + 1) - (char*)&ti)){
@@ -6766,6 +6791,7 @@ static void dl_publish_peer_table(void* store_buf, int with_tip){
                         pr->last_send = nows - (long long)(ti.last_data_sent / 1000);
                         pr->last_recv = nows - (long long)(ti.last_data_recv / 1000);
                     }
+#endif
                 }
             } }
 }
