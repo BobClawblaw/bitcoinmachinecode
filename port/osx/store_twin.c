@@ -90,7 +90,7 @@ void fmt_blkname(char *buf, u32 file_no)
 /* STO-11 durability switch (default ON, like the x86 .data dq 1). */
 static u64 store_sync_enabled = 1;
 void store_set_sync(int on) { store_sync_enabled = on ? 1 : 0; }
-int  store_get_sync(void)   { return (int)store_sync_enabled; }
+long  store_get_sync(void)   { return (int)store_sync_enabled; }
 
 /* ---- open_file(st, file_no) -> fd; closes any previous blk fd first ----- */
 static long open_file(void *st, u32 file_no)
@@ -106,7 +106,7 @@ static long open_file(void *st, u32 file_no)
     return fd;
 }
 
-int store_init(void *st)
+long store_init(void *st)
 {
     u8 *S = (u8 *)st;
     int fd = open(idxname, O_RDWR | O_CREAT, 0644);
@@ -135,7 +135,7 @@ int store_init(void *st)
     return 1;
 }
 
-int store_reload(void *st)
+long store_reload(void *st)
 {
     u8 *S = (u8 *)st;
     int idx_fd = (int)*(u64 *)(S + 8);
@@ -167,7 +167,7 @@ int store_reload(void *st)
     return 1;
 }
 
-int store_get_file_fd(void *st, u32 file_no)
+long store_get_file_fd(void *st, u32 file_no)
 {
     return (int)open_file(st, file_no);
 }
@@ -192,7 +192,7 @@ static long write_idx_rec(void *st, i64 height, const u8 *buf)
     return 1;
 }
 
-int store_get_at(void *st, u64 height, u64 out_meta[3])
+long store_get_at(void *st, u64 height, u64 out_meta[3])
 {
     u8 *S = (u8 *)st;
     i64 tip = (i64)(*(u64 *)(S + 16) / 48) - 1;
@@ -212,7 +212,7 @@ int store_get_at(void *st, u64 height, u64 out_meta[3])
     return 1;
 }
 
-int store_get_tip(void *st, u64 out_meta[3])
+long store_get_tip(void *st, u64 out_meta[3])
 {
     u8 *S = (u8 *)st;
     i64 tip = (i64)(*(u64 *)(S + 16) / 48) - 1;
@@ -304,7 +304,7 @@ int store_prune(void *st, int prune_height)
 }
 
 /* ---- STO-5: single-writer append (batch tools/tests only on x86 too) ---- */
-int store_append(void *st, const u8 hash[32], const void *raw, u64 len)
+long store_append(void *st, const u8 hash[32], const void *raw, u64 len)
 {
     u8 *S = (u8 *)st;
     /* FRONTIER + SELF-HEAL (x86 2026-09-18). The incident: a C-side
@@ -490,7 +490,7 @@ int store_validates_prevhash(void *st, const u8 block_header[80])
     return memcmp(block_header + 4, tip_hash, 32) == 0 ? 1 : 0;
 }
 
-int store_layout_monotonic(void *st, long upto_height)
+long store_layout_monotonic(void *st, long upto_height)
 {
     u8 *S = (u8 *)st;
     int idx_fd = (int)*(u64 *)(S + 8);
@@ -567,7 +567,7 @@ long long store_truncate_to(void *st, long long target_height)
     return 1;
 }
 
-int store_truncate_index_only(void *st, long long target_height)
+long store_truncate_index_only(void *st, long long target_height)
 {
     u8 *S = (u8 *)st;
     i32 tip = *(i32 *)(S + 24);

@@ -31,7 +31,7 @@ typedef unsigned char u8;
 
 extern void muhash_insert(u64 acc[48], const void *data, unsigned long len);
 
-int utxo_script_unspendable(const u8 *script, unsigned long slen)
+long utxo_script_unspendable(const u8 *script, unsigned long slen)
 {
     if (slen > MAX_SCRIPT_SIZE) return 1;
     if (slen == 0) return 0;

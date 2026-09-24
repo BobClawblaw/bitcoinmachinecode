@@ -6,7 +6,7 @@
  *   void u256_div(u8 q_le[32], const u8 a_le[32], const u8 b_le[32]);
  *   void block_work(u64 work[2], u32 bits);
  *   void chainwork_add(u64 out[2], const u64 a[2], const u64 b[2]);
- *   int  chainwork_cmp(const u64 a[2], const u64 b[2]);
+ *   long chainwork_cmp(const u64 a[2], const u64 b[2]);
  *   int  store_chainwork_init(void *st);
  *   int  store_chainwork_append(void *st, long height, const u64 work[2]);
  *   int  store_chainwork_get_at(void *st, long height, u64 out[2]);
@@ -150,7 +150,13 @@ void chainwork_add(u64 out[2], const u64 a[2], const u64 b[2])
     out[0] = s0; out[1] = s1;
 }
 
-int chainwork_cmp(const u64 a[2], const u64 b[2])
+/* 2026-09-24: LONG, as the x86 returns it in rax and every caller declares
+ * it (reorg.c, tests: `extern long chainwork_cmp`). As `int`, -1 left w0 =
+ * 0xffffffff with x0's upper half zero, so a caller reading the long saw
+ * 4294967295: a LIGHTER candidate compared as heavier and reorg_analyze
+ * would reorg onto it (test_reorg: "cmp b<a" / "a lighter competing chain:
+ * no action" failed on arm64 before this). */
+long chainwork_cmp(const u64 a[2], const u64 b[2])
 {
     if (a[1] != b[1]) return a[1] > b[1] ? 1 : -1;
     if (a[0] != b[0]) return a[0] > b[0] ? 1 : -1;
@@ -217,7 +223,7 @@ long store_chainwork_reload(void *st)
     return n;
 }
 
-int store_chainwork_truncate(void *st, long target_height)
+long store_chainwork_truncate(void *st, long target_height)
 {
     (void)st;
     if (target_height < -1) return -1;

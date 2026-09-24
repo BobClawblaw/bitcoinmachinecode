@@ -30,7 +30,7 @@ void num3072_set_one(u64 r[NLIMBS])
 
 void muhash_init(u64 r[NLIMBS]) { num3072_set_one(r); }
 
-int num3072_is_overflow(const u64 a[NLIMBS])
+long num3072_is_overflow(const u64 a[NLIMBS])
 {
     if (a[0] <= (u64)0 - 1 - MAX_PRIME_DIFF) return 0;
     for (int i = 1; i < NLIMBS; i++)
