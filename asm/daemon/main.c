@@ -321,6 +321,13 @@ static void dl_publish_connected_tip(void){
 static long rpc_public_tip(void){ return g_node_status ? (long)g_node_status->connected_tip : (long)NODE_TIP_UNTRACKED; }
 extern int  archive_verify_and_repair(void* store_buf, int repair); /* daemon/archive_verify.c */
 extern long archive_repair_bad_bodies(long nblocks, int level);  /* STO-11 */
+/* 2026-09-24: heights this boot's repairs (STO-11 bad bodies, duplicate
+ * hashes) blanked into holes. Both repairs rely on the boot catch-up to
+ * re-fetch them, so a nonzero count runs it even under bmc.bootcatchup=0 --
+ * the worker's far-behind trigger never fires for a hole of a few blocks
+ * below the stored tip (testnet4 node B, m5ultra: stuck at 153,876 for an
+ * hour below two blanked heights). */
+static long g_boot_repaired_holes = 0;
 extern long archive_drop_utxo_state(void);                /* daemon/archive_verify.c */
 #include "archive_verify.h"                               /* archive_* + prune verdict */
 extern int  store_set_prune(void* st, int h);             /* bitcoin_store.asm       */
@@ -7893,6 +7900,17 @@ static long dl_trigger_height(const long* hs, int n){
     for(int i=0;i<n;i++){ if(hs[i] > top){ second = top; top = hs[i]; } else if(hs[i] > second) second = hs[i]; }
     return n >= 2 ? second : top;
 }
+/* 2026-09-24: the apply is stopped AT a hole below the archive tip -- the
+ * next height it needs is missing while blocks above it are stored. Peers
+ * announce nothing past the tip, so the far-behind rule above never fires,
+ * and the legs only fetch past the tip: nothing re-fetched it. Holes like
+ * this come from a boot repair (STO-11 bad bodies, duplicate hashes) whose
+ * re-fetch was the boot catch-up that bmc.bootcatchup=0 skips, or from a
+ * repair on an earlier boot. testnet4 node B (m5ultra) sat at 153,876 for an
+ * hour below two blanked heights with 11 peers connected. */
+static int dl_hole_blocks_apply(long archive_tip, long first_hole, long applied){
+    return applied >= 0 && first_hole >= 0 && first_hole <= archive_tip && applied == first_hole - 1;
+}
 static int dl_should_parallel_fetch(long archive_tip, long best_peer_height,
                                     long apply_backlog, long long now_s, long long last_run_s){
     if(best_peer_height <= 0 || archive_tip < 0) return 0;
@@ -9285,11 +9303,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * connected), and the loop goes straight to catch-up. Normal
          * behaviour resumes the moment the backlog is under the threshold,
          * which at the tip is always. */
-        long apply_backlog = 0;
+        long apply_backlog = 0; int hole_blocks = 0; long hole_at = -1;
         if(utxo_live_ok){
             long ah = utxo_live_applied_height();
             long atip0 = (long)(*(int*)(store_buf+24));
-            if(ah >= 0) apply_backlog = dl_apply_backlog(atip0, atip0 >= 0 ? dlc_first_hole(atip0) : -1, ah);
+            long fh0 = atip0 >= 0 ? dlc_first_hole(atip0) : -1;
+            if(ah >= 0) apply_backlog = dl_apply_backlog(atip0, fh0, ah);
+            if(dl_hole_blocks_apply(atip0, fh0, ah)){ hole_blocks = 1; hole_at = fh0; }
         }
         int apply_first = apply_backlog > DL_APPLY_FIRST_BACKLOG;
         {
@@ -9311,6 +9331,15 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             static long noop_best = -1, noop_tip = -1;
             if(g_dl_parallel_now){ g_dl_parallel_now = 0; noop_best = -1; noop_tip = -1; dl_parallel_last_s = 0; }   /* a reorg handoff: fetch now */
             if(best == noop_best && atip == noop_tip) best = atip;        /* the same claim already came to nothing at this tip */
+            if(hole_blocks && best < atip + DL_PARALLEL_GAP){                 /* 2026-09-24: a hole below the tip holds the apply */
+                static long said_hole = -1;
+                if(hole_at != said_hole && dl_should_parallel_fetch(atip, atip + DL_PARALLEL_GAP, apply_backlog, nows, dl_parallel_last_s)){
+                    said_hole = hole_at;
+                    fprintf(stderr,"[dl] the apply is stopped at a hole at height %ld below the archive tip %ld -- running the parallel downloader to re-fetch it\n",
+                            hole_at, atip);
+                }
+                best = atip + DL_PARALLEL_GAP;
+            }
             if(dl_should_parallel_fetch(atip, best, apply_backlog, nows, dl_parallel_last_s)){
                 fprintf(stderr,"[dl] archive at %ld, peers announce %ld: %ld blocks behind -- running the parallel downloader (%d workers)\n",
                         atip, best, best-atip, g_catchup_workers);
@@ -11917,6 +11946,7 @@ int main(int argc, char** argv){
                  * keeps its own narrower trigger and is untouched. */
                 if(g_cfg.checklevel >= 3){
                     long healed = archive_repair_bad_bodies(g_cfg.checkblocks, g_cfg.checklevel);
+                    if(healed > 0) g_boot_repaired_holes += healed;
                     if(healed > 0)
                         fprintf(stderr,"[boot] archive self-heal: %ld height(s) marked for re-download\n",
                                 healed);
@@ -12047,7 +12077,7 @@ int main(int argc, char** argv){
          * state this archive was already in. */
         {
             long rep = archive_repair_duplicates();
-            if(rep > 0) store_reload(store_buf);   /* our copy predates the zeroed records */
+            if(rep > 0){ store_reload(store_buf); g_boot_repaired_holes += rep; }   /* our copy predates the zeroed records */
             else if(rep < 0)
                 fprintf(stderr,"[boot] duplicate-hash repair scan failed -- continuing without it\n");
         }
@@ -12087,8 +12117,12 @@ int main(int argc, char** argv){
         if(g_cfg.boot_catchup)
             fprintf(stderr,"[boot] boot catch-up runs BEFORE the UTXO engine starts: its blocks are connected by the worker afterwards "
                            "(bmc.bootcatchup=0 leaves the download to the worker, which connects while it downloads)\n");
-        long caught = g_cfg.boot_catchup ? dl_catchup(dir, catchup_workers) : 0;
-        if(!g_cfg.boot_catchup) fprintf(stderr,"[boot] bmc.bootcatchup=0 -- skipping the boot catch-up; the worker's far-behind trigger will run it if needed\n");
+        int run_catchup = g_cfg.boot_catchup || g_boot_repaired_holes > 0;
+        if(!g_cfg.boot_catchup && run_catchup)
+            fprintf(stderr,"[boot] bmc.bootcatchup=0, but this boot's archive repair blanked %ld height(s) -- running the boot catch-up to re-fetch them\n",
+                    g_boot_repaired_holes);
+        long caught = run_catchup ? dl_catchup(dir, catchup_workers) : 0;
+        if(!run_catchup) fprintf(stderr,"[boot] bmc.bootcatchup=0 -- skipping the boot catch-up; the worker's far-behind trigger will run it if needed\n");
         fprintf(stderr,"[boot] catch-up check done: %ld block(s) written (%.2fs)\n",
                 caught, phase_elapsed(&catchup_pt));
         if(g_shutdown_requested){
