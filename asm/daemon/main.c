@@ -40,6 +40,7 @@
 #include <dirent.h>
 #ifdef __APPLE__
 #include <libproc.h>
+#include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <mach-o/dyld.h>
 #endif
@@ -5974,7 +5975,14 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
              * 16 real peers moved 0.23-1.2 MB/s each on the fresh-sync
              * benchmark. Core keeps 16 blocks in flight per peer for the same
              * reason. Same validation per block, block for block. */
-            long long chunk_t0 = dlc_now_ms(); long chunk_r0 = dlc_proc_rchar(getpid());   /* for the boundary-rotation verdict */
+            long long chunk_t0 = dlc_now_ms();
+#ifdef __APPLE__
+            /* the wire total of THIS connection is the self-sample (see the
+             * dlc_proc_wbytes_darwin note); rchar has no Darwin equivalent */
+            long chunk_r0 = (long)mystat->wire_recv;
+#else
+            long chunk_r0 = dlc_proc_rchar(getpid());   /* for the boundary-rotation verdict */
+#endif
             /* 2026-09-08: the chunk goes to a staging file, not the archive;
              * the committer appends it in height order (see dlc_commit_chunk) */
             char stmp[96]; int sfd=dlc_stage_open_tmp(stmp,sizeof stmp,lo);
@@ -6021,7 +6029,11 @@ static int dlc_worker(int w, long end_h, char live[][DL_POOL_SLOT], int nlive,
                  * under 2 s (the early chain) are not judged: round-trip
                  * bound, and the rate would be noise. */
                 double secs = (double)(dlc_now_ms() - chunk_t0) / 1000.0;
+#ifdef __APPLE__
+                long chunk_r1 = (long)mystat->wire_recv;
+#else
                 long chunk_r1 = dlc_proc_rchar(getpid());
+#endif
                 double chunk_bps = (secs >= 2.0 && chunk_r0 >= 0 && chunk_r1 >= chunk_r0) ? (double)(chunk_r1 - chunk_r0) / secs : -1.0;
                 double med = mystat->pool_median_bps;
                 if(dlc_rotate_after_chunk(chunk_bps, med) && dlc_replace_allowed((int)next_claim[DLC_CTL_FREE_PEERS])){   /* 2026-09-10: no free peer, no rotation -- the window's tail judges */
@@ -6191,6 +6203,25 @@ static long dlc_proc_rchar(pid_t pid){ return dlc_proc_iofield(pid,"rchar:"); }
  * status log can show network-received and disk-written rates separately
  * instead of one figure trying to represent both. */
 static long dlc_proc_wbytes(pid_t pid){ return dlc_proc_iofield(pid,"write_bytes:"); }
+#ifdef __APPLE__
+/* Darwin (osx port, 2026-09-23): no /proc/<pid>/io. The DISK side has a
+ * kernel equivalent -- proc_pid_rusage's ri_diskio_byteswritten, the same
+ * block-level accounting write_bytes reports. The NETWORK side has no
+ * per-pid kernel counter at all, so the rchar role is filled by the
+ * download's own wire accounting: each helper publishes its connection's
+ * wire_recv into its MAP_SHARED stats slot (dl_wire_note counts plen+24
+ * per message, Core's rule), and the status tick reads that instead.
+ * P2P-only by construction -- closer to what this line always claimed to
+ * show ("network-received") than Linux's rchar, whose file reads made the
+ * aggregate run behind du. Unlike rchar the published counter RESETS when
+ * a helper adopts a new peer; every consumer below treats a smaller
+ * reading as a rotation, never a negative rate. */
+static long dlc_proc_wbytes_darwin(pid_t pid){
+    struct rusage_info_v4 ru;
+    if (proc_pid_rusage(pid, RUSAGE_INFO_V4, (rusage_info_t*)&ru) != 0) return -1;
+    return (long)ru.ri_diskio_byteswritten;
+}
+#endif
 
 /* human-scaled "N.NUNIT/s" into buf (>=16 bytes). */
 static void dlc_fmt_rate(char* buf, size_t cap, double bytes_per_sec){
@@ -7187,12 +7218,22 @@ static long dl_catchup_run(const char* dir, int min_workers){
         }
         for(int w=0;w<nw;w++){
             long b=stats[w].blocks; long blkrate=(long)((double)(b-prev_blocks[w])/tick_s);
+#ifdef __APPLE__
+            /* the helper's published wire_recv (dl_wire_note) stands in for
+             * its rchar; dlc_proc_wbytes_darwin keeps the disk side */
+            long rc=kids[w]!=0 ? (long)stats[w].wire_recv : -1;
+            long wc=kids[w]!=0 ? dlc_proc_wbytes_darwin(opid[w]) : -1;
+#else
             long rc=kids[w]!=0 ? dlc_proc_rchar(opid[w]) : -1;
             long wc=kids[w]!=0 ? dlc_proc_wbytes(opid[w]) : -1;
+#endif
             char bw[16]="--"; double byte_rate=-1.0;
             if(rc>=0){
                 if(prev_rchar[w]>0){
                     double delta=(double)(rc-prev_rchar[w]);
+#ifdef __APPLE__
+                    if(delta<0){ prev_rchar[w]=0; delta=(double)rc; }   /* peer rotation: the counter restarted */
+#endif
                     tick_total_bytes+=delta;
                     byte_rate=delta/tick_s;
                     dlc_fmt_rate(bw,sizeof bw,byte_rate);
