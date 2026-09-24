@@ -1365,6 +1365,14 @@ static void leg_ping_tick(int k, long long now){
     if(p2p_write(mux_out_fd[k], "ping", 4, pl, 8) > 0){ mux_out_ping_nonce[k] = nonce; mux_out_ping_sent[k] = now; mux_out_ping_sent_ms[k] = dh_now_ms(); }
 }
 #define REDIAL_BACKOFF_MS 30000L             /* min gap between re-dial tries on a dead slot */
+/* The floor on re-dialling a peer the OPERATOR named, which the dial memory's
+ * backoff does not gate (see mux_next_peer). Core's own rates, v31.1 net.cpp:
+ * -connect: ThreadOpenConnections walks the list every pass, sleeping up to
+ * 10 x 500 ms per address and 500 ms per pass -- one try per ~5.5 s at
+ * steady state; -addnode: ThreadOpenAddedConnections sleeps 60 s after a
+ * pass that tried something. */
+#define CONNECT_RETRY_FLOOR_MS 5500L
+#define ADDNODE_RETRY_FLOOR_MS 60000L
 
 /* ---- runtime peer control (RPC ctl_* channel) ---------------------------
  * The worker owns the legs, so it owns these. The parent asks; this decides.
@@ -3946,6 +3954,35 @@ static int dh_install_leg(const char* host, int fd, const dh_result_t* r){
 static int legs_on_net(int net){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && leg_net_of(mux_out_host[k]) == net) n++; return n; }
 static int legs_anon(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && leg_is_anon_net(leg_net_of(mux_out_host[k]))) n++; return n; }
 
+/* The dial gate (2026-09-24, from bmc_osx 5e71979a). The candidate loop in
+ * mux_next_peer marked a host `held` -- under dial-memory backoff, already
+ * carried by another live leg, or an anonymity net whose dials belong to the
+ * helper -- and then, with no free candidate found, dialled peers[p] ANYWAY:
+ * nothing sat between the loop and the dial. With a one-host pool that is
+ * every pass. The osx mainnet deploy (2026-09-14) named a peer's RPC port in
+ * connect=; TCP completed, the peer hung up at once, and the node re-dialled
+ * it 8,986 times in 33 minutes (4.5/s) while the dial memory answered NO.
+ *
+ * Two rules, both Core's:
+ *   - no free candidate, no dial this pass: the slot stays down and the
+ *     caller's retry stamp drives the next look (addrman does not offer an
+ *     address under backoff because the pool is small);
+ *   - a connect=/addnode= peer is exempt from the dial memory -- Core does
+ *     not gate manual connections on addrman's try times -- but re-dialled
+ *     no faster than Core re-dials it (CONNECT_/ADDNODE_RETRY_FLOOR_MS),
+ *     stamped here because several callers zero their own stamp on the way
+ *     in ("re-dial on the next rotation"), a crashed pass helper among them. */
+static long long g_leg_manual_next_dial[MUX_MAX_OUT];
+/* a refusal is logged once per slot per minute: in exactly the storm this
+ * gate stops, callers ask several times a second (osx: "no dial candidate
+ * is free" x5,866) */
+static long long g_mux_refuse_logged[MUX_MAX_OUT];
+static int mux_refuse_log_due(int i){
+    long long now = dh_now_ms();
+    if(now - g_mux_refuse_logged[i] < 60000) return 0;
+    g_mux_refuse_logged[i] = now; return 1;
+}
+
 static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port){
     /* 2026-09-17: this used to drop a LIVE leg silently -- the slot changed
      * hands and the log said nothing, so the departure had no owner. Every
@@ -3962,6 +3999,7 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
     if(g_node_status && !g_node_status->net_active) return;
     /* rotate to the next seed in the pool (wrap); avoids hammering the same dead host */
     int p = (mux_out_peer[i]+1) % (pool_len>0?pool_len:1);
+    int free_pick = 0;                                     /* a candidate passed every gate */
     /* ...and never onto a host another live leg already holds: each leg
      * rotates its own pointer, so two legs could land on one peer (deploy g,
      * 2026-09-01: legs 1 and 2 both on 108.245.166.132). Compared by HOST,
@@ -3970,22 +4008,42 @@ static void mux_next_peer(int i, const char* peers[], int pool_len, int out_port
       for(int tries = 0; tries < pool_len; tries++){
           ctl_ip_only(peers[p], me, sizeof me);
           int held = leg_is_anon_net(leg_net_of(peers[p]));   /* anonymity dials belong to the helper, never inline */
-          if(!held && g_dialmem && !dialmem_allowed(g_dialmem, peers[p], dialmem_now())) held = 1;   /* 2026-09-09: under backoff */
+          /* 2026-09-09: under backoff. 2026-09-24: a manual peer is exempt;
+           * the retry floor below bounds it instead. */
+          if(!held && g_dialmem && !node_config_is_manual(me) &&
+             !dialmem_allowed(g_dialmem, peers[p], dialmem_now())) held = 1;
           for(int k = 0; k < mux_n_out && !held; k++){
               if(k == i || mux_out_fd[k] < 0) continue;
               char other[128]; ctl_ip_only(mux_out_host[k], other, sizeof other);
               if(me[0] && !strcmp(me, other)) held = 1;
           }
-          if(!held) break;
+          if(!held){ free_pick = 1; break; }
           p = (p + 1) % (pool_len > 0 ? pool_len : 1);
       } }
     mux_out_peer[i] = p;
+    if(!free_pick){
+        if(mux_refuse_log_due(i)) fprintf(stderr,"[mux:%d] no dial candidate is free (backoff / already held / anonymity net) -- the leg stays down\n", i);
+        return;
+    }
     /* a banned peer is not dialed. Checked HERE for the same reason: this is
      * the only path to a new outbound leg. */
     { char ip[128]; ctl_ip_only(peers[p], ip, sizeof ip);
       if(ctl_is_banned(ip)){
           fprintf(stderr,"[mux:%d] %s is banned -- not dialing\n", i, peers[p]);
           return;
+      } }
+    /* the manual-peer retry floor: at most one dial per slot per floor */
+    { char ip[128]; ctl_ip_only(peers[p], ip, sizeof ip);
+      int kind = node_config_manual_kind(ip);
+      if(kind){
+          long long now = dh_now_ms(), floor_ms = kind == 2 ? CONNECT_RETRY_FLOOR_MS : ADDNODE_RETRY_FLOOR_MS;
+          if(now < g_leg_manual_next_dial[i]){
+              if(mux_refuse_log_due(i))
+                  fprintf(stderr,"[mux:%d] %s (%s) was dialled less than %.1fs ago -- the next dial waits %.1fs\n",
+                          i, ip, kind == 2 ? "connect=" : "addnode=", floor_ms/1000.0, (g_leg_manual_next_dial[i] - now)/1000.0);
+              return;
+          }
+          g_leg_manual_next_dial[i] = now + floor_ms;
       } }
     /* 2026-09-10: in a helper, never inline (Core's loop never blocks on a
      * connect). The leg stays down until the helper lands; dh_install_leg

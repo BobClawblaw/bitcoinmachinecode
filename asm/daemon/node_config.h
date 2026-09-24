@@ -327,6 +327,10 @@ const char* node_config_path(const char* datadir, char* buf, unsigned long cap);
  * otherwise the dead-weight eviction pass would ban the very nodes the
  * operator pinned, and a connect= node list would empty itself. */
 int node_config_is_manual(const char* ip);
+/* Which list named <ip>: 2 connect=, 1 addnode=, 0 neither (connect= wins
+ * when both do). Core re-dials the two at different rates -- see
+ * mux_next_peer's retry floor. */
+int node_config_manual_kind(const char* ip);
 
 /* The P2P port configured for a named peer via "host:port" in bitcoin.conf,
  * or 0 when that entry named no port (callers dial the chain default). Any
