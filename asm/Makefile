@@ -253,6 +253,22 @@ DAEMON_RPCOBJS := rpc_server.o rpc_esplora.o rest.o daemon/addr_hist.o daemon/rp
     daemon/wallet_enc_state.c daemon/wallet_crypter.c bitcoin_aes.c wallet_bnb.c wallet_coinsel.c \
     bitcoin_keys.o bitcoin_bip39.o sha512.o bitcoin_hmac.o bitcoin_bip32.o bech32.o
 
+# ---- oracle-derived fixtures (2026-09-24) ---------------------------------
+# The small ones are committed: blk_481827.{bin,prevouts,headers} and
+# blk_481823/481824/600000.bin. The large ones stay out of git (tests/.gitignore)
+# and are fetched from the scratch Core oracle by `make fixtures`:
+# tapscript_big.txt (8.6 MB) and the 36 taproot-dense blocks + prevouts for
+# test_taproot_block_diff (89 MB). The gate runs whatever is present; a clone
+# without them SKIPs exactly those cases, loudly.
+TAPROOT_DIFF_HEIGHTS := $(shell seq 825000 825015) $(shell seq 840000 840007) \
+                        $(shell seq 870000 870007) 850000 850001 860000 860001
+.PHONY: fixtures
+fixtures:
+	python3 validation/fetch_block_prevouts.py 481827
+	python3 validation/fetch_witness_blocks.py
+	python3 validation/fetch_tapscript_scale.py --big tests/fixtures
+	python3 validation/fetch_taproot_blocks.py $(TAPROOT_DIFF_HEIGHTS)
+
 .PHONY: all asm test clean abi-check callee-saved-check prereq-check gate-log-selftest link-check link-audit-selftest
 
 # Per-test private working directory helper. Every test that includes it must
@@ -3850,7 +3866,7 @@ tests/test_ephemeral_dust tests/test_mempool_evict tests/test_mempool_chunks tes
 # No heights: SKIPs unless validation/fetch_taproot_blocks.py has been run
 # against the scratch oracle. Run it by hand with heights before deploying a
 # change to the taproot path -- see the rule above.
-	./tests/test_taproot_block_diff
+	./tests/test_taproot_block_diff $(TAPROOT_DIFF_HEIGHTS)
 	./tests/test_p2wpkh_real
 	./tests/test_mempool_accept_modern
 	./tests/test_mv_parse_bounds
