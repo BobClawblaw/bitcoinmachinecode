@@ -313,7 +313,10 @@ static long node_public_tip(void* st){ return utxo_live_public_tip(st, g_utxo_li
  * catch-up apply hook, so a long catch-up call keeps it fresh per block. */
 static void dl_publish_connected_tip(void){
     if(!g_node_status) return;
-    g_node_status->connected_tip = g_utxo_live_on ? utxo_live_applied_height() : NODE_TIP_UNTRACKED;
+    /* halted (tracking switched off by the halt path) is still TRACKED: the
+     * RPC and the serve children must stay at the last connected height --
+     * see utxo_live_public_tip; UNTRACKED would hand them the stored tip */
+    g_node_status->connected_tip = (g_utxo_live_on || utxo_live_halted()) ? utxo_live_applied_height() : NODE_TIP_UNTRACKED;
 }
 static long rpc_public_tip(void){ return g_node_status ? (long)g_node_status->connected_tip : (long)NODE_TIP_UNTRACKED; }
 extern int  archive_verify_and_repair(void* store_buf, int repair); /* daemon/archive_verify.c */
