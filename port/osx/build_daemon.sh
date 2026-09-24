@@ -66,10 +66,17 @@ CSRC=(
 SIGNET=$(grep -m1 '^SIGNETSRCS' Makefile | sed 's/^SIGNETSRCS *:= *//' | tr ' ' '\n' | grep '\.c$')
 for f in $SIGNET; do CSRC+=("$f"); done
 
+# No per-file header dependencies here, so an object is stale when its source
+# OR THE NEWEST HEADER is newer than it. 2026-09-24: rpc_node.h grew
+# rpc_peer_t, and an incremental build recompiled only the .c files that had
+# changed -- every other object would have kept the old peers[] stride. Coarse
+# (any header edit rebuilds everything, ~15 s) and correct.
+NEWEST_H=$(ls -t *.h daemon/*.h ../port/osx/*.h ../port/osx/compat/*.h ../port/osx/compat/*/*.h 2>/dev/null | head -1)
+stale(){ [ ! -f "$2" ] || [ "$1" -nt "$2" ] || { [ -n "$NEWEST_H" ] && [ "$NEWEST_H" -nt "$2" ]; }; }
 fail=0
 for f in "${CSRC[@]}"; do
   obj="$OUT/$(basename ${f%.c}).o"
-  if [ ! -f "$obj" ] || [ "$f" -nt "$obj" ]; then
+  if stale "$f" "$obj"; then
     if ! $CC -c -o "$obj" "$f" 2>>"$ERRLOG"; then
       echo "COMPILE FAIL: $f" | tee -a "$ERRLOG"
       fail=1
@@ -83,7 +90,7 @@ if [ "${1:-}" = "compile" ]; then exit $fail; fi
 for f in ../port/osx/*.c ../port/osx/*.S; do
   case "$f" in *bitcoin_hmac_c.c) continue;; esac
   base=$(basename "$f"); obj="$OUT/px_${base%.*}.o"
-  if [ ! -f "$obj" ] || [ "$f" -nt "$obj" ]; then
+  if stale "$f" "$obj"; then
     if ! $CC -c -o "$obj" "$f" 2>>"$ERRLOG"; then echo "PORTOBJ FAIL: $f" >> "$ERRLOG"; fi
   fi
 done
