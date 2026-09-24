@@ -11,7 +11,7 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
   (f9368f9e: a u32 index wrapped on a 71M-entry flush, halting at
   274,443). The node reached the tip, 968,463 with IBD false, and
   follows it (968,467 at 23:28Z, 11 peers, 165.2M txouts). Redeployed
-  on e1d90861 at 23:29Z; rollback `bmcbitcoind.pre-e1d90861`.
+  on 9e728d57 at 23:29Z; rollback `bmcbitcoind.pre-9e728d57`.
 - **Apply rate ~5 -> ~11.5-14 blk/s (343bc1a7):** the LSM per-thread
   mapping cache was direct-mapped (run_no % 64). The 15 GB base run
   shared a slot with a fresh run, so every lookup remapped both. It is
@@ -47,7 +47,7 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 - Also today: the dial storm (Darwin ignores `SO_SNDTIMEO` on connect;
   SCM_RIGHTS sockets arrive dead if the sender exits first), the
   SIGTERM-deaf worker, the 10-minute stop (Darwin's 8 KB socketpair),
-  #297's NULL-TLS worker crash, and getpeerinfo 0 on a Mac (e1d90861:
+  #297's NULL-TLS worker crash, and getpeerinfo 0 on a Mac (9e728d57:
   `TCP_CONNECTION_INFO` for Linux's `TCP_INFO`).
 - **Tests that don't run on a Mac as written:**
   - test_dlc_interleave, test_dlc_wire_bytes, test_mux_dial_gate: they
