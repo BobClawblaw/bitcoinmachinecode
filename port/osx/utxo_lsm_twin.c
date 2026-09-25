@@ -848,8 +848,16 @@ long utxo_lsm_del(void *lst, void *u, const u8 txid[32], u32 index)
     u8 *key = (u8 *)*(u64 *)(L + 64) + *(u64 *)(L + 80) * 36;
     memcpy(key, txid, 32);
     memcpy(key + 32, &index, 4);
-    *mac_tomb_hash_probe(lst, key) = *(u64 *)(L + 80);
-    (*(u64 *)(L + 80))++;
+    /* x86 174d7db7 (2026-09-09, bench run 18; never ported -- this twin was
+     * translated from the asm just before it): del K, put K, del K in one
+     * generation (a stale block's spend, its unapply, the replacement's
+     * spend) appended K twice and mac_flush wrote both. One tombstone per key
+     * per generation: if the probe finds K listed, keep that slot. */
+    u64 *tslot = mac_tomb_hash_probe(lst, key);
+    if (*tslot == (u64)-1) {
+        *tslot = *(u64 *)(L + 80);
+        (*(u64 *)(L + 80))++;
+    }
     (*(u64 *)(L + 40))++;
     (*(u64 *)(L + 88))--;                            /* total_live-- */
     if (*(u64 *)(L + 40) >= *(u64 *)(L + 48) ||
@@ -1146,9 +1154,18 @@ static long mac_lsm_recount(void *lst, void *u,
         /* advance every active slot holding the winning key */
         for (u64 i = 0; i < nruns; i++) {
             if (!slots[i].active) continue;
-            if (mac_cmp_key(slots[i].key, key) != 1) continue;
-            if (!slots[i].remaining) { slots[i].active = 0; continue; }
-            if (mac_compact_read_rec(&slots[i]) == -1) goto cleanup;
+            /* x86 174d7db7: past EVERY copy of the key in this slot. An input
+             * holding a key twice (a run written before del deduplicated)
+             * handed the second copy to the next iteration, which emitted it
+             * again: after a newer PUSH, the stale DEL followed it into the
+             * output and the point lookup took whichever came first --
+             * resurrecting a spent coin or hiding a live one (x86 run 18
+             * rejected a valid block). A pre-fix run is repaired by its next
+             * compaction. */
+            while (slots[i].active && mac_cmp_key(slots[i].key, key) == 1) {
+                if (!slots[i].remaining) { slots[i].active = 0; break; }
+                if (mac_compact_read_rec(&slots[i]) == -1) goto cleanup;
+            }
         }
     }
     for (u64 i = 0; i < nruns; i++)
@@ -1428,17 +1445,36 @@ long utxo_lsm_compact_range(void *lst, u64 lo, u64 k)
                 if (mac_out_write(vp, 15)) goto fail_compact;
                 if (w->slen && mac_out_write(w->script, w->slen))
                     goto fail_compact;
-                mac_bloom_setbit(key, 0x811c9dc5u, bloom, (u32)bits_mask);
-                mac_bloom_setbit(key, 0xa1b2c3d4u, bloom, (u32)bits_mask);
-                mac_bloom_setbit(key, 0x5bd1e995u, bloom, (u32)bits_mask);
             }
+            /* 2026-09-25 (phase-4 sweep: test_compact_leveled, test_utxo_
+             * tiered_compact): EVERY emitted record goes into the bloom, a
+             * kept DEL as much as a PUSH -- as the x86 (`DEL: key+type only`
+             * falls through to .cc_wr_bloom) and as mac_flush. This set the
+             * bits for PUSHes only, so a tail merge (lo > 0, keep_dels) wrote
+             * its tombstones where no lookup could find them: the run's bloom
+             * said "absent", the lookup moved on to an older run and returned
+             * the coin the tombstone had spent -- 457-957 resurrected keys per
+             * compaction in the tiered test. The walk never saw it (it reads
+             * every record); point lookups -- the apply's input fetch -- did. */
+            mac_bloom_setbit(key, 0x811c9dc5u, bloom, (u32)bits_mask);
+            mac_bloom_setbit(key, 0xa1b2c3d4u, bloom, (u32)bits_mask);
+            mac_bloom_setbit(key, 0x5bd1e995u, bloom, (u32)bits_mask);
             true_nrec++;
         }
         for (u64 i = 0; i < batch; i++) {
             if (!slots[i].active) continue;
-            if (mac_cmp_key(slots[i].key, key) != 1) continue;
-            if (!slots[i].remaining) { slots[i].active = 0; continue; }
-            if (mac_compact_read_rec(&slots[i]) == -1) goto fail_compact;
+            /* x86 174d7db7: past EVERY copy of the key in this slot. An input
+             * holding a key twice (a run written before del deduplicated)
+             * handed the second copy to the next iteration, which emitted it
+             * again: after a newer PUSH, the stale DEL followed it into the
+             * output and the point lookup took whichever came first --
+             * resurrecting a spent coin or hiding a live one (x86 run 18
+             * rejected a valid block). A pre-fix run is repaired by its next
+             * compaction. */
+            while (slots[i].active && mac_cmp_key(slots[i].key, key) == 1) {
+                if (!slots[i].remaining) { slots[i].active = 0; break; }
+                if (mac_compact_read_rec(&slots[i]) == -1) goto fail_compact;
+            }
         }
     }
 
