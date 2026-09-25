@@ -100,10 +100,12 @@ _node_make_version:
 	adrp x2, _node_services@PAGE
 	ldr  x2, [x2, _node_services@PAGEOFF]
 	str  x2, [x19, #4]
-	/* timestamp 1700000000 = 0x6553F100 */
-	movz x3, #0xF100
-	movk x3, #0x6553, lsl #16
-	str  x3, [x19, #12]
+	/* timestamp: the wall clock. x86 2026-09-09 (never ported): it was a
+	 * fixed 1700000000, a November-2023 clock, on every version we sent --
+	 * Core logs the offset and a peer's time-offset warning counts it. */
+	mov  x0, #0
+	bl   _time
+	str  x0, [x19, #12]
 	/* addr_recv[26] at +20: zeros then port at +44 (0x8d20 = bytes 20 8d) */
 	mov  x4, x19
 	add  x4, x4, #20
@@ -131,12 +133,14 @@ _node_make_version:
 	sub  x5, x5, #1
 	b    3b
 4:	strh w6, [x19, #70]
-	/* nonce at +72 */
-	movz x7, #0x7788
-	movk x7, #0x5566, lsl #16
-	movk x7, #0x3344, lsl #32
-	movk x7, #0x1122, lsl #48
-	str  x7, [x19, #72]
+	/* nonce at +72: random per connection, as Core's. x86 2026-09-09 (never
+	 * ported): it was the constant 0x1122334455667788 -- Core uses the nonce
+	 * to detect a connection to itself, and one constant shared by every
+	 * connection is the classic self-disconnect trap. arc4random_buf is
+	 * Darwin's getrandom and cannot fail, so no fallback constant. */
+	add  x0, x19, #72
+	mov  x1, #8
+	bl   _arc4random_buf
 	/* user_agent varstr at +80: len byte + UA bytes. x86 2026-09-01 parity:
 	 * the UA is read from _node_ua_buf/_node_ua_len at RUNTIME so daemon/main.c
 	 * can append -uacomment (Core: "/Name:ver(c1; c2)/"). The buffer starts
