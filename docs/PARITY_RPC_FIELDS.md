@@ -69,10 +69,18 @@ found by a live comparison against mainnet peers (0 of 11 entries carried
   heights. Now from `rpc_peer_t.best_known_height`, which the worker raises
   when a block the peer announced or sent is stored, or when a sync pass on
   its connection stores blocks. `synced_blocks` is that, capped at the
-  connected tip. Still `-1`: inbound peers (their serve child does not track
-  it), and a peer that has announced nothing since connecting, which is also
-  `-1` in Core. Our value only counts blocks we have, so it can trail Core's
-  while a peer is ahead of us by headers only.
+  connected tip. Live on mainnet (2cb7a418): after block 968,471, 10 of 11
+  legs read 968,471 for both. Remaining gaps:
+  - [x] A leg that had announced nothing since connecting stayed `-1`; Core
+    reads the tip within seconds by sending every new peer (with a recent
+    tip) a `getheaders` from `m_best_header->pprev`. Done 2026-09-25
+    (ad11ac5a, 61eaa0f9): each new leg gets that request; on mainnet 8 of 9
+    legs read the tip seconds after a restart. A leg still reads `-1` when
+    its peer answers with no headers (its tip is at or below our `pprev`)
+    or never answers, which is what Core records too.
+  - [ ] Inbound peers stay `-1` (their serve child does not track it).
+  - Ours counts only blocks we have, so it trails Core's while a peer is
+    ahead of us by headers only.
 
 `validation/addrlocal_regtest_e2e.sh` proves the first two against a real
 v31.1: it sends one version message, with a chosen `addr_recv`, to Core and
