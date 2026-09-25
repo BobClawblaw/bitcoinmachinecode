@@ -1276,7 +1276,29 @@ extern int sync_fail_code;                        /* bitcoind.asm: where the las
  * strike of two predecessors (production, 16:30-16:42Z: eight legs closed by
  * us within 50-160 s, none logged). */
 static unsigned char g_pass_last_empty[MUX_MAX_OUT];   /* the leg's last pass report stored nothing (the reorg probe's trigger, 2026-09-10) */
-static int dl_tip_is_ibd(void);   /* Core's IBD test (tip older than maxtipage); defined with the new-block choke point */
+static int dl_announce_allowed(unsigned long tip_time, long long now, long maxtipage);   /* defined with the new-block choke point */
+/* leg_note_installed's recency test -- Core asks every new peer for headers
+ * when its best header is under a day old. Not dl_tip_is_ibd: that reads the
+ * tip block through the worker's store handle and fails CLOSED, and the
+ * handle lags a block a pass child appended moments before -- exactly when
+ * the rotation installs legs (signet 2026-09-25: boot legs installed at
+ * 08:05:41 saw ibd=0, the two background legs 3 s later, after a pass
+ * stored 323,615, saw ibd=1 and were never asked). So: a block or two back
+ * answers the same question to within a block interval; node_serve_block
+ * (what the pass report itself reads fresh blocks with) when store_read_at
+ * fails; and the last tip time read, when every read fails -- the window
+ * is a day, a time from minutes ago decides it the same way. */
+static int leg_tip_recent(void){
+    static unsigned char hb[8u<<20]; static unsigned long last_t = 0;
+    long tip = *(int*)(store_buf+24);
+    for(long h = tip; h >= 0 && h > tip - 6; h--){
+        if(store_read_at(store_buf, (unsigned long)h, hb, (long)sizeof hb) < 80 &&
+           node_serve_block(store_buf, h, hb, (long)sizeof hb) < 80) continue;
+        last_t = (unsigned long)hb[68] | ((unsigned long)hb[69]<<8) | ((unsigned long)hb[70]<<16) | ((unsigned long)hb[71]<<24);
+        break;
+    }
+    return last_t && dl_announce_allowed(last_t, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
+}
 static void leg_note_installed(int i){
     mux_out_since[i] = (long long)time(NULL); mux_out_good[i] = 0; g_sync_fail_streak[i] = 0; mux_out_ping_sent[i] = 0; mux_out_pong_at[i] = 0; mux_out_ping_ms[i] = -1;
     mux_out_announced[i] = 0; mux_out_hb[i] = 0; mux_out_hb_since[i] = 0; mux_out_lastpass_ms[i] = 0; g_pass_last_empty[i] = 0;
@@ -1296,7 +1318,7 @@ static void leg_note_installed(int i){
          * lands in the sweep (leg_on_headers) or in a pass that reads it
          * first (block_fetch_gate); both record the peer's best-known
          * block. In IBD Core does not ask every peer, and neither do we. */
-        if(!dl_tip_is_ibd()){
+        if(leg_tip_recent()){
             unsigned char loc[REORG_LOCATOR_MAX*32]; long n = locator_build(store_buf, loc);
             if(n >= 2){
                 static unsigned char gh[5 + REORG_LOCATOR_MAX*32 + 32 + 16]; unsigned char stop[32] = {0};
