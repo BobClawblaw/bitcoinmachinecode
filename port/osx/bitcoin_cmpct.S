@@ -13,10 +13,10 @@
  *   long _p2p_blocktxn_build(out, bh32, txs*, lens*, n) -> len  (txs = array of ptr, lens array)
  *   long _cmpctblock_shorttxids_count(payload, plen) -> n / -1
  *   long _cmpctblock_shorttxid(out6, payload, i) -> 1/0
- *   long _block_txcount(blockbuf, blen) -> n/-1 (single-byte txcount only)
+ *   long _block_txcount(blockbuf, blen) -> n/-1 (the block's tx count as a real CompactSize, SER-4)
  *   long _block_tx_at(blockbuf, blen, index, out_ptr*, out_len*) -> 1/0
  *   void _tx_wtxid(out32, tx, txlen)
- *   long _cmpctblock_build(out, blockbuf, blen, nonce) -> len / -1
+ *   long _cmpctblock_build(out, blockbuf, blen, nonce) -> len / -1 (short-id count written as a 1- or 3-byte CompactSize)
  * NOTE: _p2p_blocktxn_build's `txs` is an array of pointers (like x86). */
         .section __TEXT,__const
     .p2align 4
@@ -564,9 +564,29 @@ _cmpctblock_build:
     bl   cs_read
     cbz  x1,.Lcbf		/* malformed/truncated count */
     mov  x25,x0			/* ntx (callee-saved, loop bound) */
-    sub  w10,w25,#1
-    strb w10,[x19,#88]         /* nshort */
+    /* nshort = ntx-1 as a real CompactSize (BIP152). 2026-09-25: this was
+     * `strb` of the low byte with the short ids at +89 -- the x86 has the
+     * same -- so every cmpctblock for a block of 254+ transactions (nearly
+     * all of them) was malformed on the wire. The readers below already take
+     * a 1- or 3-byte count. A block's short-id count cannot pass 0xffff (1 MB
+     * of non-witness bytes / the smallest transaction ~ 16,600), so the 0xfe
+     * form is refused rather than written. */
+    sub  x10,x25,#1            /* nshort */
+    cmp  x10,#0xfd
+    b.hs 1f
+    strb w10,[x19,#88]         /* < 0xfd: one byte */
     add  x23,x19,#89           /* sid ptr */
+    b    2f
+1:  mov  x11,#0xffff
+    cmp  x10,x11
+    b.hi .Lcbf                 /* not a real block */
+    mov  w11,#0xfd
+    strb w11,[x19,#88]         /* 0xfd marker */
+    strb w10,[x19,#89]         /* u16 LE */
+    lsr  w11,w10,#8
+    strb w11,[x19,#90]
+    add  x23,x19,#91           /* sid ptr */
+2:
     mov  x24,#1                /* i */
 .Lcbl:
     cmp  x24,x25
