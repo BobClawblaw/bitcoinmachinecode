@@ -4,6 +4,19 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-25 (evening) — phase 4: the UTXO set is identical to Core's; three real bugs fixed, one repaired in production
+
+- Attested against a local Bitcoin Core at mainnet 968,570: all five fields
+  identical (muhash once printed in Core's byte order). Sample of 16,528
+  coins identical to Core's gettxout.
+- Fixed: the muhash computation (9634b5a9) and display (c42cc03f, shared);
+  fe_mul's dropped fold carry (f4938f99); the LSM twin's duplicate keys and
+  unbloomed tombstones (0e3d6ed2), which made 17% of recently spent coins
+  answer as unspent on mainnet -- repaired by an offline full compaction
+  (set preserved, muhash identical before and after), 0 after.
+- Phase 4 is under way: the native sweep's remaining failures are listed in
+  the worklog (Round 6).
+
 ## 2026-09-25 — the Mac sync pass drifted from x86; synced_headers on quiet legs
 
 - port/osx/bitcoind.S (node_sync_multi, the handshake) was last re-ported
