@@ -336,6 +336,40 @@ int main(void){
       ck("a known addrlocal is published", p0 && S(p0,"addrlocal") && !strcmp(S(p0,"addrlocal"), "198.51.100.7:8332"));
       ck("a real last_block time is published as-is", p0 && S(p0,"last_block") && !strcmp(S(p0,"last_block"), "1700000300")); }
     st.peers[0].addrlocal[0] = 0; st.peers[0].last_block_time = 0;
+    /* 2026-09-24: synced_headers / synced_blocks were a constant -1 for every
+     * relay leg. Core: pindexBestKnownBlock's height, and pindexLastCommonBlock's
+     * -- the best block the peer has shown us, capped at our connected tip. */
+    rj_free(r);   /* the addrlocal call's result; the last SYNCED result is freed after the v1 checks below */
+    { long long ct0 = st.connected_tip, tip0 = st.tip_height;
+      const char* SH; const char* SB;
+      #define SYNCED(bk, ct, tip) do { st.peers[0].best_known_height = (bk); st.connected_tip = (ct); st.tip_height = (tip); \
+          r = NULL; rc = rpc_node_dispatch("getpeerinfo", NULL, &r, &ec, &em); \
+          { rj_val* p0 = (r && r->nitems) ? r->items[0] : NULL; SH = p0 ? S(p0,"synced_headers") : NULL; SB = p0 ? S(p0,"synced_blocks") : NULL; } } while (0)
+      SYNCED(-1, 800000, 800000);
+      ck("a peer that has shown us nothing: synced_headers -1, as Core", SH && !strcmp(SH, "-1"));
+      ck("...and synced_blocks -1", SB && !strcmp(SB, "-1"));
+      rj_free(r);
+      SYNCED(0, 800000, 800000);
+      ck("a zeroed slot (memset, no fill) is unknown, not genesis", SH && !strcmp(SH, "-1") && SB && !strcmp(SB, "-1"));
+      rj_free(r);
+      SYNCED(800000, 800000, 800000);
+      ck("a peer at our tip: synced_headers is the tip", SH && !strcmp(SH, "800000"));
+      ck("...and so is synced_blocks", SB && !strcmp(SB, "800000"));
+      rj_free(r);
+      SYNCED(800005, 800002, 800005);
+      ck("a peer ahead of the connected tip: synced_headers is its best block", SH && !strcmp(SH, "800005"));
+      ck("...synced_blocks stops at the connected tip (stored is not connected)", SB && !strcmp(SB, "800002"));
+      rj_free(r);
+      SYNCED(799990, 800000, 800000);
+      ck("a peer behind us: synced_blocks is the peer's best block", SB && !strcmp(SB, "799990"));
+      rj_free(r);
+      SYNCED(800005, -2LL /* NODE_TIP_UNTRACKED */, 800003);
+      ck("live UTXO tracking off: the cap is the public tip", SB && !strcmp(SB, "800003"));
+      rj_free(r);
+      SYNCED(800005, -1, 800003);
+      ck("tracking on, nothing connected yet: synced_blocks -1", SB && !strcmp(SB, "-1"));
+      #undef SYNCED
+      st.peers[0].best_known_height = -1; st.connected_tip = ct0; st.tip_height = tip0; }
     /* rpc_fmt_addr_v1 against Core's CNetAddr::V1 read + ToStringAddrPort */
     { char o[72];
       #define A16(...) ((const unsigned char[16]){__VA_ARGS__})

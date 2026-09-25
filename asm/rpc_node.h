@@ -114,6 +114,15 @@ typedef struct {
      * Core omits it. It had no field at all: 0 of 11 peers carried it where
      * Core's 10 of 10 did. Appended: every offset above is unchanged. */
     volatile char             addrlocal[72];
+    /* 2026-09-24: Core's pindexBestKnownBlock, as a height -- the best block
+     * this peer has shown us that we also have: one it announced (inv,
+     * pushed headers) or sent, or one a sync pass on its connection stored.
+     * Only rises for the life of the slot; -1 = nothing known yet. getpeerinfo
+     * derives synced_headers (this) and synced_blocks (this, capped at the
+     * connected tip) from it; both were a constant -1 for every relay leg.
+     * Written by the worker and its pass children; inbound children leave
+     * it at -1. Appended: every offset above is unchanged. */
+    volatile long             best_known_height;
 } rpc_peer_t;
 
 /* Shared live-node status. POD, fixed size, lives in a MAP_SHARED region so
