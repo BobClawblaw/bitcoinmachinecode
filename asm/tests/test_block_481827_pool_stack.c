@@ -29,14 +29,28 @@
  * served through the store the rule reads: utxo_live.c is part of this TU so
  * its static g_bip30_store can point at our store, and store_get_at /
  * store_rd_fd are wrapped (-Wl,--wrap in the Makefile rule) to answer for
- * those 11 heights from a small framed file. Production code is untouched. */
+ * those 11 heights from a small framed file (on macOS, #define renames around
+ * the include stand in for --wrap). Production code is untouched. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <stdint.h>
 #include "test_tmpdir.h"
+#ifdef __APPLE__
+/* ld64 has no -Wl,--wrap (bmc_osx 2026-09-25): rename utxo_live.c's two
+ * calls onto the wrappers below instead, and let __real_* name the real
+ * store. Same trick as worklog/2026-09-24-ad4f0d9b-repro/tn4_replay.c. */
+#define store_get_at __wrap_store_get_at
+#define store_rd_fd  __wrap_store_rd_fd
 #include "../daemon/utxo_live.c"
+#undef store_get_at
+#undef store_rd_fd
+#define __real_store_get_at store_get_at
+#define __real_store_rd_fd  store_rd_fd
+#else
+#include "../daemon/utxo_live.c"
+#endif
 extern long store_init(void* st);
 
 /* ---- the median-time-past window: 11 real headers from a framed file ---- */
