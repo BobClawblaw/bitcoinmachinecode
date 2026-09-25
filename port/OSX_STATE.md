@@ -4,6 +4,19 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-25 — the Mac sync pass drifted from x86; synced_headers on quiet legs
+
+- port/osx/bitcoind.S (node_sync_multi, the handshake) was last re-ported
+  2026-09-10 and missed x86's later changes. Fixed today (4500868c): the
+  fetch gate (one request per block across legs; skip stored blocks) and a
+  refused duplicate ending the pass well. Still missing: compact blocks in
+  the pass and the version message's live fields (timestamp, per-connection
+  nonce, start_height, addr_from port) -- test_cmpct_fallback and
+  test_bitcoind fail natively, identically before and after.
+- New legs get Core's getheaders from pprev (ad11ac5a, 61eaa0f9), so
+  getpeerinfo's synced_headers/synced_blocks read the tip within seconds.
+  Mainnet and signet run 61eaa0f9.
+
 ## 2026-09-24 (night) — signet IBD green: phase 3 complete; getpeerinfo synced_blocks
 
 - **Signet synced from genesis on 2cb7a418** (`~/bmc_signet/`): 323,566
