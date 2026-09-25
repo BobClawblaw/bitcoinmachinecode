@@ -138,6 +138,26 @@ int main(void){
             printf("ok: SCR-1 combined rule fires at 901+100 (both stacks individually under 1000)\n");
         else { printf("FAIL: SCR-1c got r=%d err=%llu (want r=0 err=8: only the SUM can reject)\n", r,(unsigned long long)g_err); fails++; }
     }
+    /* --- SCR-1d (2026-09-25): the vectors above cannot tell the combined rule
+     * from the per-stack cap. `0x01 0x01 0x01` is not one push: 0x01 pushes
+     * the NEXT byte, so three bytes are a push plus the start of another --
+     * "900 pushes" are 1350, and main's own guard fires first with the same
+     * error. (SCR-1c's 0x6c is also OP_FROMALTSTACK, not TOALTSTACK.) The Mac
+     * interpreter had NO combined check and still passed both. This one
+     * separates them: 1000 x OP_1 (main 1000), OP_TOALTSTACK (main 999,
+     * alt 1), OP_1 (main 1000, alt 1): each stack at or under its own 1000,
+     * the SUM 1001 -- only the combined rule can reject, and Core does. */
+    {
+        static uint8_t scr[8192];
+        size_t n=0;
+        for (int i=0;i<1000;i++) scr[n++]=0x51;   /* OP_1 x1000: main 1000 */
+        scr[n++]=0x6b;                             /* OP_TOALTSTACK: main 999, alt 1 */
+        scr[n++]=0x51;                             /* OP_1: main 1000, alt 1 = 1001 */
+        int r = run(scr,n,SIGV_TAPSCRIPT,0,1,0,0);
+        if (r==0 && g_err==SCRIPT_ERR_STACK_SIZE)
+            printf("ok: SCR-1d combined rule fires at 1000 main + 1 alt (each stack within its own cap)\n");
+        else { printf("FAIL: SCR-1d got r=%d err=%llu (want r=0 err=8: only the SUM can reject)\n", r,(unsigned long long)g_err); fails++; }
+    }
     /* --- SCR-2 balanced deep nesting: 1030 x (OP_1 OP_IF), 1030 x OP_ENDIF,
      * OP_1 -> a valid script that MUST pass. Pre-fix the 1025th push zeroed
      * vfexec_sp's low bytes and the first executed ENDIF at the corrupted
