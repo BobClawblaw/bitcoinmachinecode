@@ -2138,6 +2138,20 @@ _script_eval:
 	b    .err_ret0
 
 .next_op:
+	/* SCR-1 (x86 56cb0e72, audit 2026-09-03; never ported -- found by the
+	 * phase-4 audit): Core checks AFTER EVERY OPCODE that
+	 * stack.size() + altstack.size() <= MAX_STACK_SIZE and fails with
+	 * SCRIPT_ERR_STACK_SIZE (interpreter.cpp, the end of EvalScript's loop).
+	 * The per-stack guards cap each stack at 1000 independently, so without
+	 * this a script could run with up to 2000 live elements -- e.g. a
+	 * scriptSig of 1000 x OP_1 and a scriptPubKey of OP_TOALTSTACK OP_1 --
+	 * which Core REJECTS: a consensus false accept (a mined non-standard
+	 * block). main_sp is [state+8], alt_sp [state+24]; state is x20 (r12). */
+	ldr  x2,[x20,#8]
+	ldr  x3,[x20,#24]
+	add  x2,x2,x3
+	cmp  x2,#MAX_STACK_SIZE
+	b.hi .stack_size_err
 	ldr  x2,[sp,#SL_CSP]
 	add  x2,x2,#1
 	str  x2,[sp,#SL_CSP]
