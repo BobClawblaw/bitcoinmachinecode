@@ -508,12 +508,35 @@ int main(void){
       /* 2026-09-09, second leg batch: the peer's half-close is seen at once, and
        * a leg's socket ticks at 3 s after the handshake so the drains get their
        * designed patience (they counted 300 ms ticks: 2.4 s for headers) */
+#ifdef __APPLE__
+      /* Darwin has no POLLRDHUP; a TCP half-close raises POLLHUP there
+       * (measured, also with unread bytes ahead of the FIN), but an AF_UNIX
+       * socketpair's raises nothing but POLLIN. So the Mac checks a real
+       * loopback TCP leg, the only kind the rotation polls. */
+      { int sp[2] = { -1, -1 };
+        { int l = socket(AF_INET, SOCK_STREAM, 0); struct sockaddr_in la; memset(&la, 0, sizeof la);
+          la.sin_family = AF_INET; la.sin_addr.s_addr = htonl(INADDR_LOOPBACK); socklen_t ll = sizeof la;
+          if (bind(l, (struct sockaddr*)&la, sizeof la) == 0 && listen(l, 1) == 0 && getsockname(l, (struct sockaddr*)&la, &ll) == 0){
+              sp[0] = socket(AF_INET, SOCK_STREAM, 0);
+              if (connect(sp[0], (struct sockaddr*)&la, sizeof la) == 0) sp[1] = accept(l, NULL, NULL); }
+          close(l); }
+        ok(sp[0] >= 0 && sp[1] >= 0, "loopback TCP pair for the hang-up checks");
+        const short FIN_BITS = POLLRDHUP | POLLHUP;
+        short rv = 0;
+        ok(leg_peer_hung_up(sp[0], &rv) == 0, "an open, quiet peer has not hung up");
+        shutdown(sp[1], SHUT_WR); usleep(50000);             /* loopback FIN delivery */
+#else
       { int sp[2]; ok(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0, "socketpair for the hang-up checks");
+        const short FIN_BITS = POLLRDHUP;
         short rv = 0;
         ok(leg_peer_hung_up(sp[0], &rv) == 0, "an open, quiet peer has not hung up");
         shutdown(sp[1], SHUT_WR);
-        ok(leg_peer_hung_up(sp[0], &rv) == 1 && (rv & POLLRDHUP), "the peer's half-close (FIN) is a hang-up: POLLRDHUP");
+#endif
+        ok(leg_peer_hung_up(sp[0], &rv) == 1 && (rv & FIN_BITS), "the peer's half-close (FIN) is a hang-up: POLLRDHUP");
         close(sp[1]);
+#ifdef __APPLE__
+        usleep(50000);
+#endif
         ok(leg_peer_hung_up(sp[0], &rv) == 1, "... and its full close still is");
         close(sp[0]);
         int sq[2]; socketpair(AF_UNIX, SOCK_STREAM, 0, sq);

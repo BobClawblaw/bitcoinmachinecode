@@ -11,6 +11,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include "test_tmpdir.h"
 extern long node_handshake(int fd);
@@ -87,7 +88,10 @@ int main(void){
     cki("gate says fetch: the pass stores both blocks", cnt, 2);
     cki("... two getdata reached the peer", ng, 2);
     cki("... the gate was asked once per block", g_gate_calls, 2);
-    (void)!chdir("/"); tt_isolate();
+    /* a fresh, empty store for the second pass. This was chdir("/") then
+     * tt_isolate() -- but tt_isolate is once per process, so the pass ran in
+     * "/" and store_init could not create index.dat (unless run as root). */
+    (void)!mkdir("run2", 0755); (void)!chdir("run2");
     if(run(0, &sr, &cnt, &ng)) return 1;
     cki("gate says another leg has it: the pass ends cleanly (ok=1)", sr, 1);
     cki("... storing nothing", cnt, 0);

@@ -15,6 +15,11 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include "test_tmpdir.h"
+#ifdef __APPLE__
+#define TRUE_BIN "/usr/bin/true"   /* macOS has no /bin/true */
+#else
+#define TRUE_BIN "/bin/true"
+#endif
 
 
 static int fails = 0;
@@ -24,13 +29,17 @@ static int  g_exit_code = 0;                 /* what the next child exits with *
 static int  g_spawns, g_last_kind; static long g_last_from, g_last_to;
 static pid_t stub_spawn(const itrail_t* t, int kind, long from, long to){
     (void)t; g_spawns++; g_last_kind = kind; g_last_from = from; g_last_to = to;
-    pid_t p = fork(); if (p == 0) _exit(g_exit_code); return p;
+    /* the child lives 50 ms so "a running child is left alone" is observable:
+     * one that exits at once is already dead by the next tick wherever the
+     * child runs first after fork (macOS), and that tick reaps it and
+     * spawns again (test_index_repair's stub lives 150 ms for the same reason) */
+    pid_t p = fork(); if (p == 0){ usleep(50000); _exit(g_exit_code); } return p;
 }
 static long g_runs_reported[16]; static int g_nreported;
 static void on_run(long to, void* ctx){ (void)ctx; if (g_nreported < 16) g_runs_reported[g_nreported] = to; g_nreported++; }
 
 static int tick_until_reaped(itrail_t* t, long covered, int nruns, long applied, long long* now){
-    /* the child exits at once; tick until the SUPERVISOR has reaped it. The
+    /* the child exits within 50 ms; tick until the SUPERVISOR has reaped it. The
      * test must not waitpid() itself: that would steal the exit status and
      * the supervisor would read the child as gone-without-status. (The first
      * draft did exactly that, and every failure case passed as a success.) */
@@ -45,7 +54,7 @@ int main(void){
     tt_isolate();
     it_spawn_hook = stub_spawn;
     itrail_t t; long long now = 1000;
-    it_configure(&t, "txindex", "/bin/true", "/bin/true", ".", "main", 100 /* run_blocks */, 10 /* safety */, 3 /* merge_at */, 1);
+    it_configure(&t, "txindex", TRUE_BIN, TRUE_BIN, ".", "main", 100 /* run_blocks */, 10 /* safety */, 3 /* merge_at */, 1);
     /* The tick that reaps a child may spawn the next one at once -- that is
      * the supervisor doing its job. To inspect one step at a time, every reap
      * below is ticked with an applied height ONE SHORT of the next run
@@ -115,13 +124,13 @@ int main(void){
     st = tick_until_reaped(&t, 499, 3, 509, &now);
 
     /* disabled: nothing, ever */
-    itrail_t d; it_configure(&d, "txospender", "/bin/true", "", ".", "main", 100, 10, 0, 0);
+    itrail_t d; it_configure(&d, "txospender", TRUE_BIN, "", ".", "main", 100, 10, 0, 0);
     spawns_before = g_spawns;
     st = it_tick(&d, -1, 0, 100000, ++now, on_run, 0);
     ck("a disabled index never spawns", st == IT_DISABLED && g_spawns == spawns_before);
 
     /* no applied height yet (engine not up): nothing */
-    itrail_t e; it_configure(&e, "txindex", "/bin/true", "", ".", "main", 100, 10, 0, 1);
+    itrail_t e; it_configure(&e, "txindex", TRUE_BIN, "", ".", "main", 100, 10, 0, 1);
     st = it_tick(&e, -1, 0, -1, ++now, on_run, 0);
     ck("without an applied height nothing is built", st == IT_IDLE && g_spawns == spawns_before);
 

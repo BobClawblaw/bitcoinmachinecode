@@ -202,6 +202,12 @@ int main(void){
      * and the 64 KB blob could not hold it. The state in flight must travel. */
     { int sv[2], pp[2];
       if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0 || pipe(pp) != 0){ printf("  FAIL socketpair/pipe\n"); return 1; }
+#ifdef __APPLE__
+      /* Darwin's AF_UNIX stream buffers default to 8 KB (net.local.stream.
+       * sendspace/recvspace), so the helper's one read would take 8 KB, not
+       * the 64 KB this scenario needs in flight; Linux defaults to ~208 KB. */
+      { int sz = 256 * 1024; for (int k = 0; k < 2; k++){ setsockopt(sv[k], SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz); setsockopt(sv[k], SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz); } }
+#endif
       pid_t rp = fork();
       if (rp == 0){ close(sv[0]); close(pp[0]); close(pp[1]); _exit(responder(sv[1], 1)); }
       close(sv[1]);

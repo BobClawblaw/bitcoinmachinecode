@@ -56,6 +56,19 @@ extern void txrelay_stats3(long*, long*, long*);
 extern void txrelay_stats2(long*,long*,long*,long*,long*,long*);
 extern long tx_accept_block_connect(void* mp_area, const unsigned char* block, unsigned long blen);
 #include "../daemon/addrbook.h"
+#ifdef __APPLE__
+/* Darwin's AF_UNIX stream buffers default to 8 KB (net.local.stream.
+ * sendspace/recvspace); Linux's ~208 KB is what lets this single-threaded
+ * test write a whole message (the 30 KB addr flood in 5c) before draining
+ * it. With 8 KB the write blocks for ever. Every pair gets 1 MB. */
+#include <sys/socket.h>
+static int socketpair_big(int d, int t, int p, int sv[2]){
+    int r = socketpair(d, t, p, sv);
+    if (r == 0){ int sz = 1 << 20; for (int k = 0; k < 2; k++){ setsockopt(sv[k], SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz); setsockopt(sv[k], SOL_SOCKET, SO_RCVBUF, &sz, sizeof sz); } }
+    return r;
+}
+#define socketpair socketpair_big
+#endif
 static long book_count(void){ ab2_t* b = ab2_open(".", 0); long n = ab2_count(b); ab2_close(b); return n; }
 static int  book_has(const char* hp, unsigned char* port_bytes){
     ab2_t* b = ab2_open(".", 0); bmc_addr_t a; ab2_rec_t r; int ok = 0;

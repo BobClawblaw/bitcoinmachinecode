@@ -133,9 +133,14 @@ int main(void){
       int rc2 = rpc_signer_enumerate(&r, &ec, &em);
       ck("RPC-17: a signer killed by a signal is refused",
          rc2 == 0 && ec == -1);
-      ck("RPC-17: ...reported as 128+signal, not a raw wait status",
-         em && strstr(em, "exited 139") && !strstr(em, "35584"));
-      if (em && !strstr(em, "exited 139")) printf("      got: %s\n", em);
+      /* Which one depends on /bin/sh: dash forks the script and exits 139;
+       * bash (macOS's /bin/sh) execs a lone -c command, so the signer IS
+       * popen's child and WIFSIGNALED reports the signal itself. Either is an
+       * honest report; the raw wait status is not. */
+      int honest = em && (strstr(em, "exited 139") || strstr(em, "killed by signal 11"));
+      ck("RPC-17: ...reported as 128+signal (or the signal), not a raw wait status",
+         honest && !strstr(em, "35584"));
+      if (em && !honest) printf("      got: %s\n", em);
       rj_free(r); }
     { write_script("notjson", "echo 'i am not json'\n");
       char cmd[1100]; snprintf(cmd, sizeof cmd, "%s/notjson", tt_workdir());
