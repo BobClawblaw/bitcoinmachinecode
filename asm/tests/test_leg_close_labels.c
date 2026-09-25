@@ -58,6 +58,22 @@ int main(int argc, char** argv){
     int ours_a = 0, ours_b = 0, theirs_a = 0, theirs_b = 0;
     ok(fn_range("static void leg_close_ours(",   &ours_a,   &ours_b),   "leg_close_ours() found");
     ok(fn_range("static void leg_close_theirs(", &theirs_a, &theirs_b), "leg_close_theirs() found");
+    /* The one close that is not a departure (2026-09-24): a forked dial helper
+     * dropping its inherited DUPLICATE of each leg, so a leg the worker closes
+     * is closed to its peer. The worker keeps its own descriptor; nothing
+     * leaves. Admitted only while it is called from the helper child and
+     * nowhere else -- checked below, so this cannot become a quiet way out. */
+    int drop_a = 0, drop_b = 0;
+    ok(fn_range("static void dh_drop_inherited_fds(", &drop_a, &drop_b), "dh_drop_inherited_fds() found");
+    { int calls = 0, in_child = 0;
+      for(int i = 0; i < nlines; i++){
+          if(!strstr(line[i], "dh_drop_inherited_fds(") || strstr(line[i], "static void dh_drop_inherited_fds(")) continue;
+          if(strstr(line[i], "/*") && strstr(line[i], "dh_drop_inherited_fds(") > strstr(line[i], "/*")) continue;   /* named in a comment */
+          calls++;
+          /* the child's first line sets g_in_dial_helper; the call follows it directly */
+          if(i > 0 && strstr(line[i - 1], "g_in_dial_helper = 1")) in_child++;
+      }
+      ok(calls == 1 && in_child == 1, "dh_drop_inherited_fds() is called once, in the dial helper child, right after it marks itself one"); }
 
     printf("== every close of a leg fd is inside one of the two labelled helpers ==\n");
     int strays = 0;
@@ -78,7 +94,7 @@ int main(int argc, char** argv){
                                                             if(v[0] == '-' && v[1] == '1') clears = 1; } }
                     p = strstr(p + 1, "mux_out_fd["); } }
         if(!closes && !clears) continue;
-        if(in_range(i, ours_a, ours_b) || in_range(i, theirs_a, theirs_b)) continue;
+        if(in_range(i, ours_a, ours_b) || in_range(i, theirs_a, theirs_b) || in_range(i, drop_a, drop_b)) continue;
         strays++;
         printf("       unlabelled leg close at %s:%d: %s", path, i + 1, l);
     }

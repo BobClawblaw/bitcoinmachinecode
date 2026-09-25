@@ -165,6 +165,58 @@ int main(void){
       }
       close(l2); }
 
+    printf("== 1c. two dials in flight: collecting the first does not wait on the second ==\n");
+    /* mainnet bmc, 2026-09-24: two dials landed 84 ms apart and the worker took
+     * the second socket 10,820 ms after its dial began. A helper forked second
+     * inherited the worker's end of the FIRST helper's socketpair; dh_poll's
+     * close() of that end then woke nobody, the first helper sat out its wait,
+     * and dl_reap_bounded blocked the worker's rotation for its whole 5 s --
+     * once per overlapping dial. Every helper must close the other helpers'
+     * worker ends. */
+    { int l3[2], p3[2]; char hx[2][64];               /* two peers, one listener each: two distinct hosts */
+      for (int k = 0; k < 2; k++){
+          l3[k] = socket(AF_INET, SOCK_STREAM, 0); setsockopt(l3[k], SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+          struct sockaddr_in s3; memset(&s3, 0, sizeof s3); s3.sin_family = AF_INET; s3.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+          bind(l3[k], (struct sockaddr*)&s3, sizeof s3); listen(l3[k], 4); socklen_t a3 = sizeof s3; getsockname(l3[k], (struct sockaddr*)&s3, &a3);
+          p3[k] = ntohs(s3.sin_port); snprintf(hx[k], sizeof hx[k], "127.0.0.1:%d", p3[k]);
+          pid_t f = fork(); if (f == 0){ int c = accept(l3[k], NULL, NULL); if (c >= 0) fake_peer(c); _exit(0); }
+      }
+      dial_helper_test_set_timeout_ms(20000);           /* long enough that a helper left waiting shows */
+      ok(dh_start(hx[0], p3[0]) == 1 && dh_start(hx[1], p3[1]) == 1, "two helpers started, one after the other");
+      usleep(800000);                                   /* both have handed over and are waiting on the worker */
+      int seen = 0; double worst = 0;
+      for (int i = 0; i < 100 && seen < 2; i++){
+          dh_result_t r3; int fd3 = -1; char h3[128];
+          struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+          int g = dh_poll(&r3, &fd3, h3, sizeof h3);
+          clock_gettime(CLOCK_MONOTONIC, &t1);
+          double s1 = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+          if (g){ seen++; if (s1 > worst) worst = s1; if (fd3 >= 0) close(fd3); ok(r3.ok == 1, "a dial landed"); }
+          else usleep(50000);
+      }
+      ok(seen == 2, "both dials collected");
+      printf("     slowest dh_poll that returned a socket: %.3f s\n", worst);
+      ok(worst < 1.0, "no collection waited out the 5 s reap for a helper that could not see its close");
+      close(l3[0]); close(l3[1]); }
+
+    printf("== 1d. a leg the worker closes is closed, whatever helpers are running ==\n");
+    /* The same inheritance, on the peer sockets: a helper forked while a leg was
+     * open held a copy of it, so the worker's close() sent no FIN until that
+     * helper exited. */
+    { int lp[2]; ok(socketpair(AF_UNIX, SOCK_STREAM, 0, lp) == 0, "a stand-in leg");
+      int k = mux_n_out++; mux_out_fd[k] = lp[0]; snprintf(mux_out_host[k], sizeof mux_out_host[k], "leg-under-test");
+      dial_helper_test_set_timeout_ms(3000);
+      ok(dh_start("198.51.100.11:8333", 8333) == 1, "a helper is dialling (a blackhole: it stays up)");
+      usleep(200000);
+      close(lp[0]); mux_out_fd[k] = -1;
+      struct pollfd pf = { lp[1], POLLIN, 0 }; int pr = poll(&pf, 1, 1000);
+      char c; ssize_t n = pr > 0 ? recv(lp[1], &c, 1, MSG_DONTWAIT) : -1;
+      ok(pr > 0 && n == 0, "the far end sees EOF at once, not when the helper exits");
+      close(lp[1]);
+      dh_result_t r4; int fd4; char h4[128];
+      for (int i = 0; i < 100 && dh_inflight_count(); i++){ dh_poll(&r4, &fd4, h4, sizeof h4); usleep(50000); }
+      ok(dh_inflight_count() == 0, "the helper drained"); }
+
     printf("== 2. a dial that never completes is given up, not waited for ==\n");
     dial_helper_test_set_timeout_ms(1500);
     ok(dh_start("198.51.100.1:8333", 8333) == 1, "helper started against a blackhole");
