@@ -134,6 +134,27 @@ int main(int argc, char** argv){
       for(int i = 0; i < nlines; i++) if(strstr(line[i], "closed ours/shutdown after")) hit = 1;
       ok(hit, "the worker's shutdown names each live leg's departure with its age"); }
 
+    printf("== the boot fill closes a failed candidate once ==\n");
+    /* 2026-09-25 (bmc_osx 132c6f7e): serve_download_worker's boot fill
+     * closed a candidate that was not ready / had SO_ERROR / failed its
+     * handshake but left cfd[i] set, and the cleanup loop closed it AGAIN.
+     * Since the fill reads the store (leg_note_installed's tip-recency test,
+     * #303), the store's read cache can be handed the freed number in
+     * between, and the second close() takes it away: production stalled at
+     * 968,555 for 70 minutes with the next six blocks stored and unread
+     * (heartbeat tip=968555 stored=968561). Every close in the fill must
+     * clear the slot; only the cleanup loop's `if(!kept)` close may not. */
+    { int a = 0, b = 0, bare = 0, reset = 0;
+      if(fn_range("static void serve_download_worker(", &a, &b))
+          for(int i = a; i < b; i++){
+              if(!strstr(line[i], "close(cfd[i]);")) continue;
+              if(strstr(line[i], "if(!kept) close(cfd[i]);")) continue;
+              if(strstr(line[i], "cfd[i] = -1")) reset++; else bare++;
+          }
+      ok(b > a, "serve_download_worker found");
+      ok(bare == 0, "no close(cfd[i]) in the boot fill leaves cfd[i] set (the cleanup loop would close it twice)");
+      ok(reset == 3, "the three failure closes (not ready, SO_ERROR, handshake) each clear cfd[i]"); }
+
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
 }
