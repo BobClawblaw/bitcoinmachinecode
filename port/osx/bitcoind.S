@@ -739,7 +739,17 @@ _node_sync_multi:
 	add  x1, sp, #128                /* blockhash */
 	bl   _p2p_getdata_block
 	str  w0, [sp, #40]               /* getdata_len */
-	mov  x4, x0
+	/* CC-2 (x86 2026-09-09, never ported): MSG_CMPCT_BLOCK when this leg's
+	 * peer sent sendcmpct, else the MSG_WITNESS_BLOCK p2p_getdata_block
+	 * wrote -- the type is the u32 at getdata+1. */
+	adrp x9, _g_cmpct_hook_type@PAGE
+	ldr  x9, [x9, _g_cmpct_hook_type@PAGEOFF]
+	cbz  x9, 18f
+	adrp x0, _g_peer_sendcmpct@PAGE
+	ldr  x0, [x0, _g_peer_sendcmpct@PAGEOFF]
+	blr  x9
+	str  w0, [sp, #177]              /* unaligned u32 store: fine on normal memory */
+18:	ldr  w4, [sp, #40]               /* getdata_len (the hook clobbered x4) */
 	mov  x0, x19
 	adrp x1, _getdata@PAGE
 	add  x1, x1, _getdata@PAGEOFF
@@ -755,6 +765,8 @@ _node_sync_multi:
 	b    .NSfail
 15:	mov  w0, #0
 	str  w0, [sp, #60]               /* blk_retry = 0 */
+	str  wzr, [sp, #3376]            /* this block not assembled from a compact block (yet) */
+	str  wzr, [sp, #3380]            /* no full-block fallback sent for it (yet) */
 .LNSblk_drain:
 	mov  x0, x19
 	add  x1, sp, #96                 /* cmd */
@@ -785,10 +797,70 @@ _node_sync_multi:
 16:	add  x0, sp, #96
 	adrp x1, _block@PAGE
 	add  x1, x1, _block@PAGEOFF
-	mov  x2, #5
+	mov  x2, #6                      /* "block" AND its NUL: 5 bytes matched "blocktxn" (x86 2026-09-09) */
 	bl   .Lcmpeq
 	cbnz x0, .LNS_have_block
+	/* CC-2: a compact block for the block we asked for.
+	 * cmpct_recv_cmpctblock(fd, mp, payload, plen, out, cap, want_hash):
+	 *   > 0 the full block is in buf (in place) -> validate it
+	 *   0   getblocktxn or a full getdata was sent -> keep draining
+	 *   -1  not ours / disabled -> ignore */
 	add  x0, sp, #96
+	adrp x1, _cmpctblock@PAGE
+	add  x1, x1, _cmpctblock@PAGEOFF
+	mov  x2, #11
+	bl   .Lcmpeq
+	cbz  x0, 19f
+	adrp x9, _g_cmpct_hook_cmpct@PAGE
+	ldr  x9, [x9, _g_cmpct_hook_cmpct@PAGEOFF]
+	cbz  x9, .LNSblk_drain           /* receive not installed: ignore, as before */
+	mov  x0, x19                     /* fd */
+	adrp x1, _g_sync_mp@PAGE
+	ldr  x1, [x1, _g_sync_mp@PAGEOFF]
+	mov  x2, x22                     /* payload */
+	ldr  w3, [sp, #32]               /* plen */
+	mov  x4, x22                     /* out (in place) */
+	ldr  x5, [sp, #8]                /* cap = buflen */
+	add  x6, sp, #128                /* the hash we asked for */
+	blr  x9
+	cmp  x0, #0
+	b.le .LNSblk_drain
+	str  w0, [sp, #32]               /* plen = the assembled block */
+	mov  w1, #1
+	str  w1, [sp, #3376]             /* from a compact block: a verification failure falls back */
+	b    .LNS_have_block
+19:	add  x0, sp, #96
+	adrp x1, _blocktxn@PAGE
+	add  x1, x1, _blocktxn@PAGEOFF
+	mov  x2, #9
+	bl   .Lcmpeq
+	cbz  x0, 20f
+	adrp x9, _g_cmpct_hook_blocktxn@PAGE
+	ldr  x9, [x9, _g_cmpct_hook_blocktxn@PAGEOFF]
+	cbz  x9, .LNSblk_drain
+	mov  x0, x19                     /* cmpct_recv_blocktxn(fd, pl, plen, out, cap) */
+	mov  x1, x22
+	ldr  w2, [sp, #32]
+	mov  x3, x22
+	ldr  x4, [sp, #8]
+	blr  x9
+	cmp  x0, #0
+	b.le .LNSblk_drain
+	str  w0, [sp, #32]
+	mov  w1, #1
+	str  w1, [sp, #3376]
+	b    .LNS_have_block
+20:	add  x0, sp, #96
+	adrp x1, _sendcmpct@PAGE
+	add  x1, x1, _sendcmpct@PAGEOFF
+	mov  x2, #10
+	bl   .Lcmpeq
+	cbz  x0, 21f
+	mov  x9, #1
+	adrp x10, _g_peer_sendcmpct@PAGE
+	str  x9, [x10, _g_peer_sendcmpct@PAGEOFF]
+	b    .LNSblk_drain
+21:	add  x0, sp, #96
 	adrp x1, _ping@PAGE
 	add  x1, x1, _ping@PAGEOFF
 	mov  x2, #4
@@ -811,7 +883,36 @@ _node_sync_multi:
 	movz x3, #0x3880
 	movk x3, #0x1, lsl #16
 	bl   _cons_verify
-	cbz  w0, .LNS_fail8
+	cbnz w0, 22f
+	/* x86 2026-09-09: a block ASSEMBLED FROM A COMPACT BLOCK that fails
+	 * verification is re-requested in full, once, and the drain continues
+	 * -- Core's PartiallyDownloadedBlock fallback. */
+	ldr  w1, [sp, #3376]
+	cbz  w1, .LNS_fail8
+	ldr  w1, [sp, #3380]
+	cbnz w1, .LNS_fail8              /* the full block failed too: genuinely bad */
+	mov  w1, #1
+	str  w1, [sp, #3380]
+	str  wzr, [sp, #3376]
+	add  x0, sp, #176
+	add  x1, sp, #128
+	bl   _p2p_getdata_block          /* MSG_WITNESS_BLOCK: the full block */
+	mov  x4, x0
+	mov  x0, x19
+	adrp x1, _getdata@PAGE
+	add  x1, x1, _getdata@PAGEOFF
+	mov  x2, #7
+	add  x3, sp, #176
+	bl   _p2p_write
+	cmp  x0, #24
+	b.lt .LNS_fail8
+	adrp x9, _g_cmpct_hook_fallback@PAGE
+	ldr  x9, [x9, _g_cmpct_hook_fallback@PAGEOFF]
+	cbz  x9, 23f
+	blr  x9                          /* cmpct_recv_note_fallback: the stats line */
+23:	str  wzr, [sp, #60]              /* a fresh block-drain patience for the full block */
+	b    .LNSblk_drain
+22:
 	/* store */
 	mov  x0, x20
 	add  x1, sp, #128                /* blockhash */
@@ -1946,6 +2047,8 @@ _sendheaders:	.ascii "sendheaders\0"
 _sendaddrv2:	.ascii "sendaddrv2\0"
 _wtxidrelay:	.ascii "wtxidrelay\0"
 _sendcmpct:	.ascii "sendcmpct\0"
+_cmpctblock:	.ascii "cmpctblock\0"   /* CC-2 */
+_blocktxn:	.ascii "blocktxn\0"
 ua_str:		.ascii "/BitcoinMachineCode:0.0.1/"
 
 /* ---- runtime UA + relay byte + accept hook (x86 2026-09-01 parity) ----
