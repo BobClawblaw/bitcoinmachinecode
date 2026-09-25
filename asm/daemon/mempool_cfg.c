@@ -672,6 +672,7 @@ static void mpseq_push(const unsigned char hash[32], int label, unsigned long lo
     mpseq_ev* e = &g_seq->ev[slot % MPSEQ_RING];
     /* a reader lapped onto this slot must not take it while it is refilled */
     __atomic_store_n(&e->ready, 0ULL, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_RELEASE);   /* ARM64: keep the payload stores below behind ready=0 */
     memcpy(e->hash, hash, 32);
     e->label = (unsigned char)label;
     e->mseq  = mseq;

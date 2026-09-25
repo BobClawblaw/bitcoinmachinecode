@@ -152,11 +152,17 @@ void mpj_append(const mpj_rec* r){
 /* Decode slot `seq` if it holds a complete record for that sequence. */
 static int read_slot(uint64_t seq, mpj_rec* out){
     const unsigned char* s = slot_at(seq);
-    uint64_t head = ld64(s + MPJ_OFF_SEQ_HEAD);
-    if (head != seq) return 0;                 /* empty, or already lapped by the ring */
+    /* 2026-09-25 (ARM ordering review; the bug is on x86 too): check the
+     * TAIL stamp FIRST. The writer stamps HEAD before the body and TAIL after
+     * it, so HEAD==seq only says a write has STARTED; a reader that checked
+     * HEAD, copied a half-written body and then saw the writer's final
+     * TAIL==seq returned a torn record as whole. TAIL==seq says the body is
+     * complete; the re-check below (TAIL and HEAD still seq) says no new
+     * write -- which zeroes TAIL and restamps HEAD first -- began meanwhile. */
+    if (ld64(s + MPJ_OFF_SEQ_TAIL) != seq) return 0;   /* empty, incomplete, or already lapped */
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     mpj_rec r;
-    r.seq = head;
+    r.seq = seq;
     memcpy(r.txid,  s + MPJ_OFF_TXID,  32);
     memcpy(r.wtxid, s + MPJ_OFF_WTXID, 32);
     memcpy(r.aux,   s + MPJ_OFF_AUX,   32);
@@ -167,7 +173,7 @@ static int read_slot(uint64_t seq, mpj_rec* out){
     r.reason      = ld32(s + MPJ_OFF_REASON);
     r.height      = ld32(s + MPJ_OFF_HEIGHT);
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
-    if (ld64(s + MPJ_OFF_SEQ_TAIL) != seq) return 0;   /* torn, or overwritten while we read */
+    if (ld64(s + MPJ_OFF_SEQ_TAIL) != seq || ld64(s + MPJ_OFF_SEQ_HEAD) != seq) return 0;   /* overwritten while we read */
     if (r.reason == 0 || r.reason > MPJ_REASON_MAX) return 0;
     *out = r;
     return 1;

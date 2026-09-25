@@ -74,8 +74,10 @@ static void drain(unsigned long long* cursor, int (*fn)(const unsigned char*, un
     while (*cursor < head){
         unsigned k = (unsigned)(*cursor % RPC_ANN_RING);
         if (st->ann_ring[k].ready != *cursor + 1) break;        /* claimed, not yet filled: come back */
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);                /* ARM64: payload after `ready` (x86 never reorders load/load) */
         unsigned char id[32]; memcpy(id, (const void*)st->ann_ring[k].txid, 32);
         unsigned long long fee = st->ann_ring[k].fee; unsigned long vs = st->ann_ring[k].vsize; int src = st->ann_ring[k].src_slot;
+        __atomic_thread_fence(__ATOMIC_ACQUIRE);                /* ...and the payload loads complete before the re-check */
         if (st->ann_ring[k].ready != *cursor + 1) break;        /* overwritten under us: it will be re-read after resync */
         if (!fn(id, fee, vs, src)) return;                      /* consumer full: keep the cursor here */
         (*cursor)++;

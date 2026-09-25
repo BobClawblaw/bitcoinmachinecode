@@ -1172,7 +1172,7 @@ static int ctl_send(int op, const char* arg, long long num,
     int waited = 0, done = 0, result = 0;
     reason[0] = 0;
     while (waited < CTL_WAIT_MS * 1000){
-        if (s->ctl_ack == myseq){
+        if (s->ctl_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */
             result = s->ctl_result;
             memcpy(reason, (const void*)s->ctl_reason, sizeof reason);
             reason[sizeof reason - 1] = 0;
@@ -2302,7 +2302,7 @@ static long sbk_stage(const char* hex, int proposal, int* result,
 
     int waited = 0, done = 0;
     while (waited < SBK_WAIT_MS*1000){
-        if (st->blk_submit_ack == myseq){
+        if (st->blk_submit_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */
             *result = st->blk_submit_result;
             if (reason && rcap){
                 unsigned long rl = rcap < sizeof st->blk_submit_reason ? rcap : sizeof st->blk_submit_reason;
@@ -2651,7 +2651,7 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
     st->tx_submit_seq = myseq;
     int waited = 0, ok = 0, acked = 0;
     while (waited < SRT_WAIT_MS*1000){
-        if (st->tx_submit_ack == myseq){ ok = (st->tx_submit_result == 1); acked = 1; break; }
+        if (st->tx_submit_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */ ok = (st->tx_submit_result == 1); acked = 1; break; }
         if (g_mpd_shutdown_flag && *g_mpd_shutdown_flag){ c->aborted = 1; c->abort_why = "shutdown requested"; break; }
         struct timespec ts = {0, MPD_POLL_US*1000L}; nanosleep(&ts, NULL);   /* the worker acks within ~0.5 ms once it is servicing the stream */
         waited += MPD_POLL_US;
@@ -2859,7 +2859,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     int waited = 0, done = 0, result = 0;
     reason[0] = 0;
     while (waited < SRT_WAIT_MS*1000){
-        if (s->tx_submit_ack == myseq){
+        if (s->tx_submit_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */
             result = s->tx_submit_result;
             memcpy(reason, (const void*)s->tx_submit_reason, sizeof reason);
             reason[sizeof reason-1]=0;
@@ -2916,7 +2916,7 @@ static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
     s->tx_submit_seq = myseq;
     int waited = 0;
     while (waited < SRT_WAIT_MS*1000){
-        if (s->tx_submit_ack == myseq){
+        if (s->tx_submit_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */
             *result_out = s->tx_submit_result;
             *fee_out = s->tx_submit_fee;
             memcpy(reason, (const void*)s->tx_submit_reason, 128);
@@ -3017,7 +3017,7 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
     st->tx_submit_seq = myseq;
     int waited = 0, got = 0;
     while (waited < SRT_WAIT_MS*1000){
-        if (st->tx_submit_ack == myseq){ got = 1; break; }
+        if (st->tx_submit_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */ got = 1; break; }
         struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
         waited += SRT_POLL_US;
     }
@@ -3168,7 +3168,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
         s->tx_submit_seq = myseq;
         int waited = 0, got = 0;
         while (waited < SRT_WAIT_MS*1000){
-            if (s->tx_submit_ack == myseq){ got = 1; break; }
+            if (s->tx_submit_ack == myseq){ __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64: the result/reason loads after the ack (the worker fenced before publishing it) */ got = 1; break; }
             struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
             waited += SRT_POLL_US;
         }

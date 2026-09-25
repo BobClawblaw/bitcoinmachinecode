@@ -981,6 +981,12 @@ static void worker_run(u64 cursor, pid_t parent){
         while (cursor < head){
             volatile typeof(st->csi_ring[0])* e = &st->csi_ring[cursor % RPC_CSI_RING];
             if (e->ready != cursor + 1) break;                 /* claimed, not yet filled (or lapped: re-check above) */
+            /* ARM64 (2026-09-25): acquire -- the payload loads below must not
+             * be satisfied before `ready` is. x86 never reorders loads with
+             * loads; ARM does, and a previous lap's coin would fold under this
+             * seq (a wrong muhash persisted to coinstats.dat). The fence after
+             * the copy only catches an overwrite AFTER it. */
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);
             unsigned kind = e->kind, slen = e->slen;
             u8 body[RPC_CSI_BODY]; memcpy(body, (const void*)e->body, RPC_CSI_BODY);
             __sync_synchronize();
@@ -998,6 +1004,7 @@ static void worker_run(u64 cursor, pid_t parent){
                     for (unsigned long i = 1; i < n && ok; i++){
                         volatile typeof(st->csi_ring[0])* c = &st->csi_ring[(cursor + i) % RPC_CSI_RING];
                         if (c->ready != cursor + i + 1){ ok = 0; break; }
+                        __atomic_thread_fence(__ATOMIC_ACQUIRE);    /* as for the head slot */
                         unsigned cl = c->slen;
                         if (c->kind != CSI_K_CONT || cl > RPC_CSI_BODY || off + cl > slen){ ok = -1; break; }
                         memcpy(script + off, (const void*)c->body, cl);

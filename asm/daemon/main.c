@@ -1467,9 +1467,18 @@ int ctl_is_banned(const char* ip){
     if(!g_node_status) return 0;
     long long now = (long long)time(NULL);
     for(int i = 0; i < RPC_MAX_BANS; i++){
-        if(!g_node_status->bans[i].until) continue;
-        if(g_node_status->bans[i].until <= now){
-            g_node_status->bans[i].until = 0;      /* lazily expire */
+        /* ARM64 (2026-09-25): `until` is published after a full barrier
+         * (ctl_ban_add); read it with ACQUIRE so the subnet load below cannot
+         * be satisfied first -- a fresh slot's old/empty subnet would miss the
+         * new ban for this check. A control dependency does not order
+         * load->load on ARM. */
+        long long until = __atomic_load_n(&g_node_status->bans[i].until, __ATOMIC_ACQUIRE);
+        if(!until) continue;
+        if(until <= now){
+            /* lazily expire -- by CAS from the value observed, so a ban another
+             * process published into this slot meanwhile is not wiped (a
+             * plain store could, on any architecture) */
+            __sync_bool_compare_and_swap(&g_node_status->bans[i].until, until, 0);
             continue;
         }
         if(ctl_ban_covers((const char*)g_node_status->bans[i].subnet, ip)) return 1;
@@ -4981,16 +4990,16 @@ static int dlc_retry_push(volatile long* ctl, long lo){
     for(;;){
         long h = ctl[DLC_CTL_RETRY_HEAD], t = ctl[DLC_CTL_RETRY_TAIL];
         if(h - t >= DLC_RETRY_MAX) return 0;                                   /* full: the next pass will find the hole */
-        if(__sync_bool_compare_and_swap(&ctl[DLC_CTL_RETRY_HEAD], h, h + 1)){ ctl[DLC_CTL_RING + (h % DLC_RETRY_MAX)] = lo; return 1; }
+        if(__sync_bool_compare_and_swap(&ctl[DLC_CTL_RETRY_HEAD], h, h + 1)){ __atomic_store_n(&ctl[DLC_CTL_RING + (h % DLC_RETRY_MAX)], lo, __ATOMIC_RELEASE); return 1; }   /* ARM64: release/acquire on the slot (2026-09-25) */
     }
 }
 static long dlc_retry_pop(volatile long* ctl){
     for(;;){
         long t = ctl[DLC_CTL_RETRY_TAIL], h = ctl[DLC_CTL_RETRY_HEAD];
         if(t >= h) return -1;
-        long lo = ctl[DLC_CTL_RING + (t % DLC_RETRY_MAX)];
+        long lo = __atomic_load_n(&ctl[DLC_CTL_RING + (t % DLC_RETRY_MAX)], __ATOMIC_ACQUIRE);
         if(lo < 0) continue;                                                    /* the push reserved the slot but has not written it yet */
-        if(__sync_bool_compare_and_swap(&ctl[DLC_CTL_RETRY_TAIL], t, t + 1)){ ctl[DLC_CTL_RING + (t % DLC_RETRY_MAX)] = -1; return lo; }
+        if(__sync_bool_compare_and_swap(&ctl[DLC_CTL_RETRY_TAIL], t, t + 1)){ __atomic_store_n(&ctl[DLC_CTL_RING + (t % DLC_RETRY_MAX)], -1L, __ATOMIC_RELEASE); return lo; }
     }
 }
 
@@ -8895,6 +8904,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * Core's error rather than reporting a success that changed nothing. */
         if(g_node_status && g_node_status->ctl_seq != ctl_last_seq){
             ctl_last_seq = g_node_status->ctl_seq;
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64 (2026-09-25): the command's fields after its seq -- the RPC side fenced before publishing; a stale tx_submit_private/_test or ctl_op/arg would act on the previous request */
             int op = g_node_status->ctl_op;
             long long num = g_node_status->ctl_num;
             char arg[128];
@@ -9136,6 +9146,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 }
                 if(--budget < 0 || txsub_now_ms() - t_enter > TXSUB_ROTATION_MS) break;   /* back to the main loop; next rotation continues */
                 txsub_last_seq = g_node_status->tx_submit_seq;
+                __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64 (2026-09-25): the command's fields after its seq -- the RPC side fenced before publishing; a stale tx_submit_private/_test or ctl_op/arg would act on the previous request */
             int result; char reason[128]; reason[0]=0;
             if(g_node_status->tx_submit_pkg_n > 0){
                 result = txsub_package(reason, sizeof reason);
@@ -9218,6 +9229,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
          * word for it) until the UTXO dry-run slice lands. */
         if(g_node_status && g_node_status->blk_submit_seq != blksub_last_seq){
             blksub_last_seq = g_node_status->blk_submit_seq;
+            __atomic_thread_fence(__ATOMIC_ACQUIRE);   /* ARM64 (2026-09-25): the command's fields after its seq -- the RPC side fenced before publishing; a stale tx_submit_private/_test or ctl_op/arg would act on the previous request */
             extern long blk_submit_evaluate_ex(const unsigned char*, unsigned long,
                                                const unsigned char*, long, int, char*, unsigned long);
             char reason[64]; reason[0]=0;
