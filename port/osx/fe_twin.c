@@ -153,6 +153,7 @@ static void reduce512(u64 r[4], const u64 t[8])
             v[i] = (u64)s2; carry = (u64)(s2 >> 64);
         }
     }
+    u64 top = carry;   /* 2026-09-25: this carry out of v[3] was dropped */
     if (oh) {
         /* oh*2^64*C: l2 has weight 2^64 (lands in v[1]), h2 weight
          * 2^128 (lands in v[2]) */
@@ -163,6 +164,22 @@ static void reduce512(u64 r[4], const u64 t[8])
         s = (u128)v[2] + h2 + carry;
         v[2] = (u64)s; carry = (u64)(s >> 64);
         for (int i = 3; i < 4; i++) {
+            u128 s2 = (u128)v[i] + carry;
+            v[i] = (u64)s2; carry = (u64)(s2 >> 64);
+        }
+        top += carry;      /* ...and so was this one */
+    }
+    /* 2026-09-25 (phase-4 sweep, test_mul_carry_regression): a carry out of
+     * the second fold is a lost 2^256 == C (mod p) -- the same bug x86's
+     * secp256k1_fe.asm fold 2 had until 2026-08-21, reproduced in this
+     * independent C port. (p-2^31)^2 came out 2^62 - C; fe_inv(p-k) was
+     * wrong for small k (238 of 1024 structured inverses). ~2^-190 on random
+     * operands, which is why ECDSA differentials never saw it. Fold it back:
+     * v wrapped, so it is small, and top*C (top <= 2) cannot carry again. */
+    if (top) {
+        u128 f0 = (u128)v[0] + (u128)top * C_LO;
+        v[0] = (u64)f0; carry = (u64)(f0 >> 64);
+        for (int i = 1; i < 4 && carry; i++) {
             u128 s2 = (u128)v[i] + carry;
             v[i] = (u64)s2; carry = (u64)(s2 >> 64);
         }
