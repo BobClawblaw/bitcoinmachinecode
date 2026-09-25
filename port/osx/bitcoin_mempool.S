@@ -165,14 +165,22 @@ _mpool_put:
     str  x9,[x8,#40]          /* slot.blob_off = fill */
     /* slot.wtxid = _sha256d(tx bytes as stored): computed once here, read by
      * _mpool_wtxid_at_slot. Written BEFORE the txid so that, as for len and
-     * blob_off (MEM-21), a txid match under ARM's observed ordering implies
-     * the cached wtxid is published too. _sha256d clobbers scratch: re-derive
+     * blob_off (MEM-21), a txid match implies the cached wtxid is
+     * published too -- given the dmb ishst below (ARM does not order stores). _sha256d clobbers scratch: re-derive
      * the slot pointer. */
     add  x0,x8,#48
     mov  x1,x21
     mov  x2,x22
     bl   _sha256d
     add  x8,x19,x23
+    /* 2026-09-25 (phase-4 ARM ordering review): the txid is the publication.
+     * x86 TSO shows every earlier store (the tx bytes in the blob, len,
+     * blob_off, wtxid) to other cores no later than this one; ARM64 does not
+     * -- a lock-free reader in another process could match the new txid and
+     * still read the previous len/blob_off or not-yet-visible tx bytes. The
+     * comment above ("ARM's observed ordering") was an observation, not a
+     * guarantee. dmb ishst orders all prior stores before the txid's. */
+    dmb  ishst
     add  x0,x8,#8
     mov  x1,x20
     mov  x2,#32
@@ -269,17 +277,23 @@ _mpool_get:
      * is what happens for a transaction evicted a microsecond earlier anyway.
      * Taking _mp_lock here instead would hold a node-wide, process-shared lock
      * across full script verification -- strictly worse than the defect. */
+    /* 2026-09-25 (phase-4 ARM ordering review): the acquire half of put's
+     * dmb ishst. Without it ARM may satisfy the len/blob_off loads below --
+     * and the caller's loads of the tx bytes -- from before the txid matched. */
+    dmb  ishld
     ldr  x9,[x11]             /* len */
-    ldr  x10,[x11,#40]        /* blob_off */
-    adds x10,x10,x9           /* blob_off + len (neither is attacker-huge alone) */
+    ldr  x13,[x11,#40]        /* blob_off -- read ONCE: the pointer below is built from
+                                 this checked value. It was re-read after the check, so a
+                                 concurrent del between the two loads could pair a checked
+                                 len with an unchecked blob_off (x86 has the same re-read). */
+    adds x10,x13,x9           /* blob_off + len (neither is attacker-huge alone) */
     b.hs .mg_miss             /* wrapped: incoherent, treat as absent */
     ldr  x12,[x19,#24]        /* blob_cap */
     cmp  x10,x12
     b.hi .mg_miss             /* would read past the blob mapping */
     str  x9,[x21]             /* len -> *out_len (coherent only) */
-    ldr  x9,[x11,#40]         /* blob_off */
     ldr  x10,[x19,#16]        /* blob */
-    add  x0,x9,x10
+    add  x0,x13,x10
     b    .mg_ret
 .mg_miss:
     mov  w0,#0
