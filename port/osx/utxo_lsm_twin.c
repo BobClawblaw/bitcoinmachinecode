@@ -633,6 +633,15 @@ long utxo_lsm_init(void *lst)
 static long mac_flush(void *lst, void *u)
 {
     u8 *L = (u8 *)lst;
+    /* 2026-09-25 (phase-4 sweep, test_compact_async): the flush hook runs
+     * FIRST, before anything here touches the manifest -- as the x86 mac_flush
+     * does. The twin stored it (utxo_lsm_set_flush_hook) and never called it,
+     * so utxo_live's compact_flush_hook -- adopt a finished background
+     * compaction so the flush builds on the merged set, and stamp the flush's
+     * step-0 timing -- never ran on the Mac; adoption waited for the next
+     * poll. Safe either way (run numbers are reserved, adoption reconciles),
+     * but it is the x86's contract. */
+    if (mac_flush_hook) ((void (*)(void))mac_flush_hook)();
     if (utxo_store_wal_drain(lst) == -1) return -1;
 
     long desc_cap = mac_calc_desc_cap(lst);
