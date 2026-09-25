@@ -1555,6 +1555,12 @@ int main(void){
       ck_str("usi.bogosize", S(r,"bogosize"), "999");
       ck_str("usi.total_amount", S(r,"total_amount"), "123.45678900");
       ck("usi.muhash present (64 hex)", S(r,"muhash") && strlen(S(r,"muhash"))==64);
+      /* 2026-09-25: Core prints the digest as a uint256 (byte-reversed); the
+       * stub's digest is bytes 00..1f, so the display must start 1f1e.. and
+       * end ..0100. It printed forward, and a set identical to Core's read
+       * as a mismatch. */
+      ck("usi.muhash printed as Core does (uint256, byte-reversed)", S(r,"muhash") &&
+         !strcmp(S(r,"muhash"), "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100"));
       { rj_val* bb = call("getbestblockhash", "[]", &ec, &em);
         ck("usi.bestblock == header hash at reported height (tip=3 here)",
            bb && S(r,"bestblock") && !strcmp(S(r,"bestblock"), bb->str));

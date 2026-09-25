@@ -5541,7 +5541,12 @@ static int cmd_gettxoutsetinfo(const rj_val* params, rj_val** res, long* ec, con
       } }
     rj_obj_set(out, "txouts", rj_numf("%llu", o.txouts));
     rj_obj_set(out, "bogosize", rj_numf("%llu", o.bogosize));
-    if (o.muhash_valid){ char mh[65]; hex_of(mh, o.muhash, 32); rj_obj_set(out, "muhash", rj_str(mh)); }
+    /* Core prints the digest as a uint256 (GetHex: byte-reversed), as the
+     * coinstatsindex path above already does with hex_rev. This live-walk
+     * path printed it forward, so a set identical to Core's read as a
+     * mismatch (2026-09-25: Mac mainnet at 968,570, every other field equal;
+     * reversed, the digest was Core's exactly). */
+    if (o.muhash_valid){ char mh[65]; hex_rev(mh, o.muhash, 32); rj_obj_set(out, "muhash", rj_str(mh)); }
     rj_obj_set(out, "total_amount", rj_numf("%llu.%08llu",
         o.total_amount/100000000ULL, o.total_amount%100000000ULL));
     *res = out;
