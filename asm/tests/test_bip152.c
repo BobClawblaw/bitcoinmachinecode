@@ -261,6 +261,49 @@ int main(void){
             (long)(tp - b2), last_off);
     }
 
+    /* ---- 2026-09-25: cmpctblock_build on a REAL block of 254+ transactions.
+     * The short-id count was written as ONE byte (the low byte of ntx-1) with
+     * the short ids at +89, so every cmpctblock for such a block -- nearly
+     * all of mainnet -- was malformed on the wire; 3f's reference block is
+     * small, so it never showed. Block 481,827 (committed fixture, ~1 MB):
+     * the count must be a 3-byte CompactSize == ntx-1, every short id must be
+     * the one computed here from that transaction's wtxid, and the prefilled
+     * coinbase must follow the last short id. ---- */
+    {
+        FILE* f = fopen("tests/fixtures/blk_481827.bin", "rb");
+        if (!f) { printf("FAIL fixture tests/fixtures/blk_481827.bin missing (run from asm/)\n"); failures++; }
+        else {
+            static unsigned char blk[1<<21], out[1<<21];
+            long bl = (long)fread(blk, 1, sizeof blk, f); fclose(f);
+            long ntx = block_txcount(blk, bl);
+            ck("481827: a real block of 254+ transactions", ntx >= 254);
+            const uint64_t nonce = 0x0123456789abcdefULL;
+            long l = cmpctblock_build(out, blk, bl, nonce);
+            ck("481827: cmpctblock_build succeeds", l > 0);
+            if (l > 0 && ntx >= 254) {
+                long nshort = ntx - 1;
+                ck("481827: the short-id count is a CompactSize (0xfd + u16 LE), not one byte",
+                   out[88] == 0xfd && (long)(out[89] | (out[90] << 8)) == nshort);
+                cki("481827: cmpctblock_shorttxids_count reads ntx-1 back", cmpctblock_shorttxids_count(out, l), nshort);
+                long bad = 0;
+                for (long i = 1; i < ntx; i++) {
+                    unsigned char* tp; long tl; unsigned char w[32], exp6[6], got6[6];
+                    if (!block_tx_at(blk, bl, i, &tp, &tl)) { bad++; continue; }
+                    tx_wtxid(w, tp, tl);
+                    bip152_shortid(exp6, blk, nonce, w);
+                    if (!cmpctblock_shorttxid(got6, out, i - 1) || memcmp(got6, exp6, 6) || memcmp(out + 91 + (i - 1) * 6, exp6, 6)) bad++;
+                }
+                cki("481827: every short id is its transaction's (at 91 + 6*i)", bad, 0);
+                unsigned char* cb; long cbl;
+                block_tx_at(blk, bl, 0, &cb, &cbl);
+                long pf = 91 + nshort * 6;
+                ck("481827: prefilled count 1, index 0, then the coinbase bytes",
+                   out[pf] == 1 && out[pf + 1] == 0 && memcmp(out + pf + 2, cb, (size_t)cbl) == 0);
+                cki("481827: total length = 88 + 3 + 6*nshort + 2 + coinbase", l, pf + 2 + cbl);
+            }
+        }
+    }
+
     printf("\n%s (%d failures)\n", failures?"TESTS FAILED":"ALL TESTS PASSED", failures);
     return failures?1:0;
 }
