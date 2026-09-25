@@ -207,8 +207,20 @@ static void apply_sizing(int tiny){
         g_cfg.utxo_bulk_gap_blocks = 0;
         g_cfg.utxo_bulk_slots_log2 = 2;
         g_cfg.utxo_bulk_blob_mb    = 1;
+        /* 2026-09-25: no compaction may run inside this scenario. The base
+         * chain leaves ~50 runs at 3 puts per flush; at the default bulk
+         * threshold (12 x 4 = 48) a background compaction starts during it,
+         * and whether it is ADOPTED before utxo_live_close is timing: when
+         * it is killed instead, the crashed child's init runs a pre-catchup
+         * compaction (50 -> 1) that unlinks 49 run files, and "run files grew"
+         * fails although the flush inside the block happened (seen on the Mac,
+         * where the recovery checks all passed). 16 x 4 = 64, the cap: the
+         * scenario's ~51 runs never reach it, so the file count measures the
+         * flush alone. */
+        g_cfg.utxo_compact_threshold = 16;
         { extern void utxo_live_test_force_sizing(int); utxo_live_test_force_sizing(1); }
     } else {
+        g_cfg.utxo_compact_threshold = 0;   /* the default, for (a)/(b) */
         /* steady-state 2^16 slots. 2026-09-09: a fresh datadir takes the bulk
          * sizing by itself now (utxo_live_sizing.h), so this variant asks for
          * the small memtable explicitly. Under the bulk memtable the mid-block
