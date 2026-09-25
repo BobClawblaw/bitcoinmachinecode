@@ -114,7 +114,18 @@ int pubkey_parse(const u8 *pub, unsigned long publen, u64 qx[4], u64 qy[4])
         return 1;
     }
     if (publen == 65) {
-        if (pub[0] != 0x04) return 0;
+        /* CRY-2 (x86 ac76dd43, 2026-09-03; never ported -- found by the
+         * phase-4 sweep's test_pubkey): libsecp256k1's parse, which Core's
+         * CPubKey::Verify uses, accepts 0x04 and the HYBRID prefixes 0x06 /
+         * 0x07, whose low bit must equal y's parity. Core rejects hybrids
+         * only under STRICTENC, a policy flag never set for block validation,
+         * so a valid signature under a hybrid key is consensus-valid for
+         * legacy / P2PK / P2SH / P2WSH-v0 spends. Accepting 0x04 alone was a
+         * FALSE REJECT of such a block. */
+        if (pub[0] != 0x04) {
+            if (pub[0] != 0x06 && pub[0] != 0x07) return 0;
+            if ((pub[0] & 1) != (pub[64] & 1)) return 0;
+        }
         load_be(x, pub + 1);
         load_be(y, pub + 33);
         if (!lt_p(x) || !lt_p(y)) return 0;
