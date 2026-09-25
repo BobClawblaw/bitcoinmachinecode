@@ -336,7 +336,9 @@ _sha256_cpu_has_sha:
 	adrp x0, _sha256_feat_name@PAGE
 	add  x0, x0, _sha256_feat_name@PAGEOFF
 	mov  x1, sp			/* int value out */
-	add  x2, sp, #8			/* size_t size out */
+	mov  x9, #4			/* 2026-09-25 (phase-4 audit): *oldlenp is IN/OUT -- */
+	str  x9, [sp, #8]		/* the buffer's size must be set; it was stack garbage, */
+	add  x2, sp, #8			/* so the probe could fail at random and pin the scalar path */
 	mov  x3, #0
 	mov  x4, #0
 	bl   _sysctlbyname

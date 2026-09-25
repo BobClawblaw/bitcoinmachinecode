@@ -93,7 +93,7 @@ s_blen_spill: .zero 8
 s_txptr:     .zero 8
 s_txlen:     .zero 8
 s_j:         .zero 8
-mp_area:     .zero (40 + 1024*48 + 8)
+mp_area:     .zero (40 + 1024*80 + 8)   /* 80-byte slots carry the cached wtxid (x86 c1f891ae; phase-4 audit 2026-09-25: this was still 48, and _mpool_init's 80-byte stride ran slots 615+ into mp_blob) */
 mp_blob:     .zero (2<<20)
 mp_initdone: .zero 1
 mp_cur:      .zero 8

@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 typedef uint64_t u64;
+typedef unsigned __int128 u128;
 typedef unsigned int u32;
 typedef unsigned char u8;
 
@@ -133,21 +134,17 @@ void block_work(u64 work[2], u32 bits)
 /* ---- chainwork_add: 128-bit saturating add ------------------------------ */
 void chainwork_add(u64 out[2], const u64 a[2], const u64 b[2])
 {
-    u64 s0 = a[0] + b[0];
-    u64 s1 = a[1] + b[1] + (s0 < a[0] ? 1 : 0);
-    if (s1 < a[1] && (s0 < a[0])) {
-        /* carry out of bit 127 -> saturate to all-ones (x86 .no_ovf) */
-        out[0] = ~(u64)0; out[1] = ~(u64)0;
-        return;
-    }
-    /* x86 semantics: the saturation fires when the ADD OF LIMB1 carries;
-     * limb0's carry is consumed by limb1's adc, so only limb1's carry
-     * saturates. */
-    if (s1 < a[1]) {
-        out[0] = ~(u64)0; out[1] = ~(u64)0;
-        return;
-    }
-    out[0] = s0; out[1] = s1;
+    /* x86: add limb0; adc limb1; jc -> saturate to all-ones. The carry OUT
+     * of the adc is the test. 2026-09-25 (phase-4 audit, x86 2cb991f3): this
+     * detected it as `s1 < a1`, which misses the one case where limb0's carry
+     * is 1 and b1 is all-ones -- s1 wraps back to exactly a1, a real carry,
+     * and the wrapped value was returned where the x86 saturates. u128 limb
+     * arithmetic states the adc carry directly. (Needs a 2^127 operand, so
+     * unreachable on any real chain; still the x86's semantics.) */
+    u128 lo = (u128)a[0] + b[0];
+    u128 hi = (u128)a[1] + b[1] + (u64)(lo >> 64);
+    if (hi >> 64) { out[0] = ~(u64)0; out[1] = ~(u64)0; return; }
+    out[0] = (u64)lo; out[1] = (u64)hi;
 }
 
 /* 2026-09-24: LONG, as the x86 returns it in rax and every caller declares
