@@ -3781,8 +3781,10 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
         }
         (void)!sendmsg(sp[1], &mh, 0);
         if(r.v2_len){ unsigned long off = 0; while(off < r.v2_len){ ssize_t w = write(sp[1], blob + off, r.v2_len - off); if(w <= 0) break; off += (unsigned long)w; } }
-        /* Hold on until the worker has the fd: dh_poll closes its end after
-         * the recvmsg, which wakes this poll. On Darwin a socket passed with
+        /* Hold on until the worker has the fd: dh_poll writes one byte and
+         * closes its end after the recvmsg, and the byte wakes this poll even
+         * when another process still holds that end (2026-09-25; the close
+         * alone did not, see dh_poll). On Darwin a socket passed with
          * SCM_RIGHTS arrives DEAD (EOF + HUP, its buffered bytes discarded)
          * when the sender exits before the receiver's recvmsg; the worker
          * collects results once per rotation, so exiting right after the
@@ -3980,7 +3982,15 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
                 if(!out->ok && *fd_out >= 0){ close(*fd_out); *fd_out = -1; }
             }
         } else if(n != (ssize_t)sizeof *out){ out->ok = 0; snprintf(out->why, sizeof out->why, "helper exited without a result"); }
-        close(g_dh[i].sp);                              /* first: the helper waits for this close before it exits */
+        /* Tell the helper it may go: one byte, THEN the close (2026-09-25). The close alone
+         * wakes it only if no other process holds this end, and any child the worker forks
+         * while the dial is in flight -- a pass helper for a block announced mid-dial, on
+         * mainnet -- inherits it. The helper then slept on, and the reap below sat out its
+         * full 5 s in the worker's rotation ("worker received" 13:56:00.233, "leg replaced"
+         * 13:56:05.283). A byte is POLLIN whoever else holds the socket. NOSIGNAL: a helper
+         * already gone must not SIGPIPE the worker. Pinned by tests/test_dialhelper.c 1e. */
+        (void)!send(g_dh[i].sp, "k", 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+        close(g_dh[i].sp);
         { int st; if(!dl_reap_bounded(g_dh[i].pid, &st, 5000)) dl_kill_reap(g_dh[i].pid, &st, "dial helper"); }
         g_dh[i].pid = 0; g_dh[i].sp = -1; g_dh_last_slot = g_dh[i].want_slot;
         snprintf(host_out, hcap, "%s", g_dh[i].host);
