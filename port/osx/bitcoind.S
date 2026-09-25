@@ -120,7 +120,10 @@ _node_make_version:
 	add  x4, x4, #1
 	sub  x5, x5, #1
 	b    1b
-2:	mov  w6, #0x8d20
+2:	/* the port we listen on, big-endian, as the daemon set it from -port.
+	 * x86 2026-09-09 (never ported): it was the constant 0x8d20 (8333). */
+	adrp x6, _node_listen_port_be@PAGE
+	ldrh w6, [x6, _node_listen_port_be@PAGEOFF]
 	strh w6, [x19, #44]
 	/* addr_from[26] at +46: zeros then port at +70 */
 	mov  x4, x19
@@ -158,7 +161,11 @@ _node_make_version:
 	/* start_height u32 then relay byte, CURSOR-RELATIVE (past the UA) */
 	add  x1, x19, #81
 	add  x1, x1, x8
-	str  wzr, [x1], #4
+	/* our tip, as the daemon set it before dialling. x86 2026-09-09 (never
+	 * ported): it was 0 at 966k. */
+	adrp x2, _node_start_height@PAGE
+	ldr  w2, [x2, _node_start_height@PAGEOFF]
+	str  w2, [x1], #4
 	adrp x2, _node_relay_flag@PAGE
 	ldrb w2, [x2, _node_relay_flag@PAGEOFF]
 	strb w2, [x1]
