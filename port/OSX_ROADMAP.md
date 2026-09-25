@@ -496,7 +496,16 @@ have caught all three).
 - [x] worker stability soak  the mainnet node has run unattended for
       hours (3.5h+ catch-up, restarts included) with zero worker crashes
       since the syscall/ services fixes; DiagnosticReports monitored.
-- [ ] signet IBD green (same shape as testnet4, unstarted)
+- [x] signet IBD green  DONE 2026-09-24 on 2cb7a418 (`~/bmc_signet`): 39
+      DNS-seeded candidates (sprovoost + achownodes), 30 confirmed live;
+      323,566 headers in 23 s; every block from genesis across 8 workers,
+      downloaded in 21:51 (1 of 30 peers banned) and applied to the tip in
+      25 min with zero rejects. Script evaluation skipped below assumevalid
+      (293,175) and run for the ~30k blocks above it. Tip 323,567 = hash
+      0000000eaf18..2de9, identical to mempool.space's; IBD false,
+      verificationprogress 1, 77.3M txouts. Apply-bound, not wire-bound,
+      through ~255k-275k (33-47 ms/blk, all LSM get/put), the same perf
+      gap as testnet4.
 
 ## Phase 4 — parity
 - [ ] differential run vs x86 reference (Linux container on this Mac)

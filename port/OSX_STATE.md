@@ -4,6 +4,22 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-24 (night) — signet IBD green: phase 3 complete; getpeerinfo synced_blocks
+
+- **Signet synced from genesis on 2cb7a418** (`~/bmc_signet/`): 323,566
+  headers in 23 s, every block in 21:51, applied to the tip in 25 min, zero
+  rejects; tip 323,567 hash identical to mempool.space's. All four chains
+  (regtest, testnet4, signet, mainnet) have now synced natively: **phase 3
+  is done.** Left: the phase-4 parity sweep, and the LSM apply gap
+  (33-47 ms/blk in output-heavy stretches, vs x86's ~13).
+- getpeerinfo `synced_headers`/`synced_blocks` were constant -1 (aada0228,
+  shared, for main); live on mainnet. Remaining gap: a leg that has
+  announced nothing stays -1, where Core reads the tip via a getheaders from
+  `pprev` (docs/PARITY_RPC_FIELDS.md).
+- build_daemon.sh now rebuilds on any header change (2cb7a418); it had no
+  header dependencies, so struct changes could link mismatched objects.
+  Nothing stale was in production.
+
 ## 2026-09-24 — mainnet at the tip in production; ad4f0d9b reverted; the reorg gap and the int/long twin returns fixed
 
 - **Production (m5ultra, `~/bmc_osx_deploy`):** mainnet IBD finished.
@@ -57,7 +73,8 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
   - The six tx_verify `*_diff` tests: they compare against x86 asm twins
     that were never ported.
 - Known degrade unchanged: tx_handoff's ring mutex isn't robust on macOS.
-  Remaining p3/p4: signet IBD, the phase-4 parity sweep.
+  Remaining p3/p4 at the time: signet IBD (done that night), the phase-4
+  parity sweep.
 
 ## 2026-09-23 — main merged (245 commits, #190–#292); five Darwin guards; serve/store/net re-ports; stop-wait e2e 35/35 on Darwin
 
