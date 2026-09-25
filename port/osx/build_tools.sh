@@ -23,7 +23,14 @@ CC="cc -O2 -arch arm64 -I. -Idaemon -Itests -I../port/osx/compat -D_DARWIN_C_SOU
 W=$(mktemp -d "${TMPDIR:-/tmp}/bmc_tools.XXXX")
 trap 'rm -rf "$W"' EXIT
 
-if [ $# -gt 0 ]; then TOOLS="$*"
+# --test-helpers: the binaries tests spawn but the test: recipe never runs
+# itself (tests/bip30_shim for test_bip30 and test_bip30_daemon, the shims
+# the recipe pipes into), built from their own tests/ rules the same way.
+PREFIX=daemon
+if [ "${1:-}" = "--test-helpers" ]; then
+    PREFIX=tests; shift
+    TOOLS="${*:-bip30_shim bip30_daemon_shim consensus_shim fullchain_shim bfilter_shim run_batch}"
+elif [ $# -gt 0 ]; then TOOLS="$*"
 else TOOLS=$(grep -o -E '^daemon/bmc_[a-z0-9_]+:' Makefile | sed 's#^daemon/##; s#:$##' | sort -u); fi
 
 ok=0; fail=0; failed=""
@@ -35,7 +42,7 @@ for t in $TOOLS; do
         continue;;
     esac
     # the rule's first recipe line (tab-indented, right after the target line)
-    recipe=$(awk -v tgt="daemon/$t:" 'found && /^\t/ {print; exit} index($0, tgt) == 1 {found=1}' Makefile)
+    recipe=$(awk -v tgt="$PREFIX/$t:" 'found && /^\t/ {print; exit} index($0, tgt) == 1 {found=1}' Makefile)
     srcs=$(echo "$recipe" | tr ' ' '\n' | grep -E '\.c$' | tr '\n' ' ')
     [ -n "$srcs" ] || { echo "  skip $t (no .c on its recipe line)"; continue; }
     # daemon_out minus main.o and minus the objects of this tool's own sources
@@ -45,16 +52,16 @@ for t in $TOOLS; do
     # with `if (fn)` before any call: ELF leaves an undefined weak reference
     # NULL; ld64 still refuses it unless told the symbol may stay undefined.
     WEAK="-Wl,-U,_rpc_note_msg_recv -Wl,-U,_txr_report_violation_fd -Wl,-U,_txr_source_group_fd"
-    if $CC -o "daemon/$t" $srcs "$W/lib.a" "$OUT/addrbook.a" -lpthread $WEAK 2>"$W/$t.err"; then
+    if $CC -o "$PREFIX/$t" $srcs "$W/lib.a" "$OUT/addrbook.a" -lpthread $WEAK 2>"$W/$t.err"; then
         echo "  ok   $t"; ok=$((ok+1))
     else
         miss=$(grep -o -E '"_[A-Za-z0-9_]+"' "$W/$t.err" | tr -d '"' | sed 's/^_//' | sort -u | head -6 | tr '\n' ' ')
         err=$(grep -m1 -E 'error' "$W/$t.err" | cut -c1-100)
         echo "  FAIL $t -- ${miss:+missing: $miss}${miss:-$err}"; fail=$((fail+1)); failed="$failed $t"
-        rm -f "daemon/$t"
+        rm -f "$PREFIX/$t"
     fi
 done
 # the daemon itself, where the tests that start one look for it
-[ $# -eq 0 ] && cp "$OUT/bmcbitcoind" daemon/bmcbitcoind && echo "  ok   bmcbitcoind (copied from daemon_out)"
+[ $# -eq 0 ] && [ "$PREFIX" = daemon ] && cp "$OUT/bmcbitcoind" daemon/bmcbitcoind && echo "  ok   bmcbitcoind (copied from daemon_out)"
 echo "built $ok, failed $fail${failed:+:$failed}"
 [ $fail -eq 0 ]
