@@ -709,6 +709,20 @@ _node_sync_multi:
 	add  x1, sp, x9
 	mov  x2, #32
 	bl   .Lcopy
+	/* 2026-09-25, x86 74ee984e (2026-09-09), never ported: one request per
+	 * block across the legs -- ask the daemon (block_fetch_gate) whether
+	 * to fetch this hash. 0 = already stored or another leg holds it: this
+	 * pass ends with what it has (ok=1), as x86's `jz .done`. Without it a
+	 * header naming a stored block (a sibling leg landed it; a new leg's
+	 * getheaders-from-pprev reply) was fetched again and failed the append
+	 * (where=9/10), costing the leg a strike. */
+	adrp x9, _g_block_fetch_hook@PAGE
+	ldr  x9, [x9, _g_block_fetch_hook@PAGEOFF]
+	cbz  x9, 17f
+	add  x0, sp, #128                /* blockhash */
+	blr  x9
+	cbz  x0, .LNS_done
+17:
 	/* getdata build */
 	add  x0, sp, #176                /* getdata */
 	add  x1, sp, #128                /* blockhash */
@@ -825,11 +839,16 @@ _node_sync_multi:
 	str  w1, [x2]
 	b    .NSfail
 .LNS_fail10:
+	/* -2: not tip-linked -- a sibling leg stored this block first, or the
+	 * peer served a stale one. x86 2026-09-09 (never ported): the pass ends
+	 * WELL; the code stays set for the log and the next rotation rebuilds
+	 * the locator from the true tip. Failing here closed legs as
+	 * "sync-failed-3x ... where=10" for another leg's success. */
 	mov  w1, #10
 	adrp x2, _sync_fail_code@PAGE
 	add  x2, x2, _sync_fail_code@PAGEOFF
 	str  w1, [x2]
-	b    .NSfail
+	b    .LNS_done
 .LNS_sync_loop_next:
 	b    .LNS_sync_loop
 .LNS_done:
