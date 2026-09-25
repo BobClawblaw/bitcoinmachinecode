@@ -5,9 +5,9 @@ for tests/test_witness_commitment.c.
 The test always runs against the ONE committed fixture
 (tests/fixtures/blk_witness_small.bin, block 0000...ee137e5e, 1563 bytes, a
 segwit-era block small enough to keep in git), genesis (from constants) and
-the regtest block in tests/block_vec.h. The ~1 MB mainnet blocks below are
-optional and gitignored: when present the test runs the same checks on them,
-when absent it reports SKIP for those cases only (never a silent pass).
+the regtest block in tests/block_vec.h. The ~1 MB mainnet blocks below were
+optional and gitignored until 2026-09-24; they are committed now (2.9 MB)
+and the test FAILS without them. This script regenerates them.
 
 Usage (oracle must be up; see memory/project_core_oracle):
     python3 validation/fetch_witness_blocks.py            # 481823 481824 600000

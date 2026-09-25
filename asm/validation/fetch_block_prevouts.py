@@ -1,27 +1,80 @@
 #!/usr/bin/env python3
-"""fetch_block_prevouts.py HEIGHT -- write tests/fixtures/blk_HEIGHT.bin (raw block,
-read from the live archive's index.dat/blk files, read-only) and
-tests/fixtures/blk_HEIGHT.prevouts (one line per non-coinbase input:
-txid_hex index value_sat spk_hex, from the scratch Core oracle's txindex).
-Gitignored; tests skip when absent. Used by test_block_481827_pool_stack."""
-import sys, os, struct, json, subprocess
-H=int(sys.argv[1]); D='/storage/bitcoinmachinecode/data'
-CLI="/storage/bitcoin-core-source/build/bin/bitcoin-cli -conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle".split()
-def rpc(*a): return subprocess.run(CLI+list(a),capture_output=True,text=True).stdout
-with open(os.path.join(D,'index.dat'),'rb') as f:
-    f.seek(H*48); r=f.read(48)
-h=r[:32][::-1].hex(); fno,pos,size=struct.unpack('<IQI',r[32:48])
-with open(os.path.join(D,'blk%05d.dat'%fno),'rb') as f:
-    f.seek(pos+8); blk=f.read(size)
-assert rpc("getblockhash",str(H)).strip()==h, "archive/oracle hash mismatch"
-here=os.path.dirname(os.path.abspath(__file__)); fx=os.path.join(here,'..','tests','fixtures')
-open(os.path.join(fx,'blk_%d.bin'%H),'wb').write(blk)
-b=json.loads(rpc("getblock",h,"2")); cache={}; n=0
-with open(os.path.join(fx,'blk_%d.prevouts'%H),'w') as out:
-    for tx in b['tx'][1:]:
-        for v in tx['vin']:
-            t=v['txid']
-            if t not in cache: cache[t]=json.loads(rpc("getrawtransaction",t,"true"))['vout']
-            o=cache[t][v['vout']]
-            out.write("%s %d %d %s\n"%(t,v['vout'],int(round(o['value']*1e8)),o['scriptPubKey']['hex'])); n+=1
-print("block %d: %d bytes, %d prevouts, %d distinct prev txs"%(H,len(blk),n,len(cache)))
+"""fetch_block_prevouts.py HEIGHT... -- a mainnet block and every prevout it
+spends, as the apply-path fixtures under tests/fixtures expect them (used by
+test_block_481827_pool_stack):
+
+    blk_<h>.bin        the raw block (getblock <hash> 0)
+    blk_<h>.prevouts   one line per non-coinbase input:
+                       <txid hex, display order> <vout> <value sat> <scriptPubKey hex>
+    blk_<h>.headers    the 11 headers before it, "<height> <80-byte hex>" per
+                       line: the median-time-past window the finality rule
+                       (VAL-4, BIP113) reads once CSV is active
+
+Prevouts created inside the block itself are left out (the apply path creates
+them). The block comes from Core, not this project's archive: the fixture
+must carry witnesses. Needs a Core node with the block and its undo data
+(getblock verbosity 3).
+
+2026-09-24: rewritten. The previous version read the block from the
+production archive and the prevouts from Core's txindex, wrote prevouts for
+outputs the block itself creates, and fetched no headers.
+
+Usage (from asm/):
+    validation/fetch_block_prevouts.py <height> [<height> ...]
+
+The node is reached with $BITCOIN_CLI, split on whitespace; the default is
+the reference host's scratch oracle.
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests", "fixtures")
+DEFAULT_CLI = ("/storage/bitcoin-core-source/build-zmq/bin/bitcoin-cli "
+               "-conf=/storage/core-oracle/bitcoin.conf -datadir=/storage/core-oracle")
+
+
+def rpc(cli, *args):
+    return subprocess.run(cli + [str(a) for a in args], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def fetch(cli, height):
+    bh = rpc(cli, "getblockhash", height)
+    raw = bytes.fromhex(rpc(cli, "getblock", bh, 0))
+    blk = json.loads(rpc(cli, "getblock", bh, 3))
+    created, lines = set(), []
+    for tx in blk["tx"]:
+        for vin in tx["vin"]:
+            if "coinbase" in vin:
+                continue
+            if (vin["txid"], vin["vout"]) in created:
+                continue
+            p = vin["prevout"]
+            sats = round(p["value"] * 100_000_000)
+            lines.append(f'{vin["txid"]} {vin["vout"]} {sats} {p["scriptPubKey"]["hex"]}')
+        for o in tx["vout"]:
+            created.add((tx["txid"], o["n"]))
+    os.makedirs(OUT, exist_ok=True)
+    with open(os.path.join(OUT, f"blk_{height}.bin"), "wb") as f:
+        f.write(raw)
+    with open(os.path.join(OUT, f"blk_{height}.prevouts"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    with open(os.path.join(OUT, f"blk_{height}.headers"), "w") as f:
+        for h in range(max(0, height - 11), height):
+            f.write(f'{h} {rpc(cli, "getblockheader", rpc(cli, "getblockhash", h), "false")}\n')
+    print(f"{height} {bh}: {len(raw)} bytes, {len(lines)} prevouts, headers {max(0, height - 11)}..{height - 1}")
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    cli = shlex.split(os.environ.get("BITCOIN_CLI", DEFAULT_CLI))
+    for h in sys.argv[1:]:
+        fetch(cli, int(h))
+
+
+if __name__ == "__main__":
+    main()
