@@ -505,8 +505,22 @@ static int cmd_getpeerinfo(rj_val** res){
              * operator's call -- it was the only field we returned that Core
              * does not. The handshake height is still kept internally and is on
              * bmcgetdownloadinfo, which is ours to define. */
-            rj_obj_set(o, "synced_headers", rj_numf("%d", -1));
-            rj_obj_set(o, "synced_blocks", rj_numf("%d", -1));
+            /* Core: synced_headers is pindexBestKnownBlock's height,
+             * synced_blocks pindexLastCommonBlock's -- the best block the
+             * peer has shown us, and how much of it our active chain shares.
+             * Both were a constant -1 here (2026-09-24). best_known_height
+             * only counts blocks we have, so it is on our chain; the common
+             * block is that, capped at the CONNECTED tip. -1 = unknown, as
+             * Core (a peer that has announced nothing since connecting).
+             * Only a POSITIVE height counts, the presynced_headers rule: a
+             * slot published from a memset record reads 0, and 0 would claim
+             * the peer's best block is genesis. */
+            { long bk = p->best_known_height > 0 ? p->best_known_height : -1;
+              long long ct = g_status->connected_tip;
+              if (ct == NODE_TIP_UNTRACKED) ct = g_status->tip_height;
+              long common = bk < 0 || ct < 0 ? -1 : (ct < bk ? (long)ct : bk);
+              rj_obj_set(o, "synced_headers", rj_numf("%ld", bk < 0 ? -1L : bk));
+              rj_obj_set(o, "synced_blocks", rj_numf("%ld", common)); }
             { bmc_addr_t pa; const char* nn = "ipv4";
               if (bmc_addr_from_string_port(&pa, p->addr, 0)) nn = bmc_net_name(pa.net);
               rj_obj_set(o, "network", rj_str(nn)); }

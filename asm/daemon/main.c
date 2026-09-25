@@ -1203,6 +1203,7 @@ static unsigned char mux_out_cmpct[MUX_MAX_OUT];        /* CC-2: the peer sent s
  * last pass (inv, or a pushed `headers`: we send sendheaders), and whether the
  * leg is one of the three high-bandwidth compact-block sources */
 static unsigned char mux_out_announced[MUX_MAX_OUT];
+static unsigned char mux_out_announced_hash[MUX_MAX_OUT][32];   /* the last block announced on the leg that we did not have */
 static unsigned char mux_out_hb[MUX_MAX_OUT];
 static long long     mux_out_hb_since[MUX_MAX_OUT];
 /* Core sends getheaders only with cause (a new peer, a header that does not
@@ -1268,6 +1269,7 @@ static unsigned char g_pass_last_empty[MUX_MAX_OUT];   /* the leg's last pass re
 static void leg_note_installed(int i){
     mux_out_since[i] = (long long)time(NULL); mux_out_good[i] = 0; g_sync_fail_streak[i] = 0; mux_out_ping_sent[i] = 0; mux_out_pong_at[i] = 0; mux_out_ping_ms[i] = -1;
     mux_out_announced[i] = 0; mux_out_hb[i] = 0; mux_out_hb_since[i] = 0; mux_out_lastpass_ms[i] = 0; g_pass_last_empty[i] = 0;
+    memset(mux_out_announced_hash[i], 0, 32);   /* the previous peer's announcement is not this one's best-known block */
     /* 2026-09-10: Core sends sendheaders after verack so peers PUSH new
      * headers instead of announcing by inv; the sweep acts on either. Only
      * with the receive side installed, like sendcmpct: the sync harnesses'
@@ -3134,7 +3136,7 @@ static void rpc_fill_peer_slot_ex(int slot, const char* host, int already_claime
     /* UNKNOWN, not zero. The memset above made every one of these 0, and 0 is
      * a legitimate measured value for several of them. */
     pr->minfeefilter = -1; pr->hb_to = -1; pr->hb_from = -1;
-    pr->addr_relay_enabled = -1; pr->presynced_headers = -1;
+    pr->addr_relay_enabled = -1; pr->presynced_headers = -1; pr->best_known_height = -1;
     rpc_peer_from_version(pr, p, len);
     { extern int rp_version_frelay(const unsigned char*, long);
       pr->relaytxes = rp_version_frelay(p, len) != 0; }   /* Core relaytxes: the peer's fRelay */
@@ -3281,10 +3283,18 @@ static void cmpct_overlap_line(long height, const unsigned char* hash32, const c
 }
 static long g_announce_inv_n, g_announce_hdr_n, g_push_n, g_push_stored_n, g_push_skipped_n;
 static int leg_of_fd(int fd){ for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0 && mux_out_fd[k] == fd) return k; return -1; }
-static unsigned char mux_out_announced_hash[MUX_MAX_OUT][32];
+/* getpeerinfo's synced_headers/synced_blocks (rpc_node.h best_known_height):
+ * the peer has shown us block height h -- raise its best-known height. Every
+ * source is one Core's UpdateBlockAvailability counts: an announcement of a
+ * block we have, a block it sent us, headers a pass on its connection stored. */
+static void leg_note_best_known(int k, long h){
+    if(!g_node_status || g_in_dial_helper || k < 0 || k >= MUX_MAX_OUT || h < 0) return;
+    rpc_peer_t* pr = &g_node_status->peers[k];
+    if(h > pr->best_known_height) pr->best_known_height = h;
+}
 static void leg_on_block_announce(int fd, const unsigned char hash[32], const char* how){
     int k = leg_of_fd(fd); if(k < 0) return;
-    long h; if(ht_idx && idx_get(ht_idx, hash, &h)) return;         /* already stored */
+    long h; if(ht_idx && idx_get(ht_idx, hash, &h)){ leg_note_best_known(k, h); return; }   /* already stored: the peer has it too */
     if(mux_out_announced[k] && !memcmp(mux_out_announced_hash[k], hash, 32)) return;   /* the same block, again */
     mux_out_announced[k] = 1; memcpy(mux_out_announced_hash[k], hash, 32);
     /* getpeerinfo's last_block. It was written only by txann, whose slot is
@@ -3436,9 +3446,10 @@ static long leg_on_block(int fd, const unsigned char* pl, unsigned long plen){
     int k = leg_of_fd(fd); if(k < 0 || plen < 81) return -1;
     unsigned char bh[32]; sha256d(bh, pl, 80);
     if(g_push_pending && !memcmp(bh, g_push_hash, 32)){ g_push_pending = 0; }
-    long h; if(ht_idx && idx_get(ht_idx, bh, &h)){ inflight_release_leg(&g_inflight, k); g_push_skipped_n++; return 0; }
+    long h; if(ht_idx && idx_get(ht_idx, bh, &h)){ leg_note_best_known(k, h); inflight_release_leg(&g_inflight, k); g_push_skipped_n++; return 0; }
     long r = dl_store_pushed_block(k, pl, plen, bh, "pushed full block");
     inflight_release_leg(&g_inflight, k);
+    if(ht_idx && idx_get(ht_idx, bh, &h)) leg_note_best_known(k, h);
     return r;
 }
 static long g_last_sync_ok = 0;   /* node_sync_multi's verdict of the last pass, for the helper's report */
@@ -3543,6 +3554,7 @@ static long do_outbound_sync(int i){
     fprintf(stderr,"[mux:%d] stored tip height=%d from %s (announced on connect)\n", i, st_tip, mux_out_host[i]);
     /* advance this peer's persistent locator to our new stored tip */
     anchor_locator(mux_out_loc[i]);
+    leg_note_best_known(i, st_tip);   /* the blocks just stored came over this peer's connection */
     fprintf(stderr,"[mux:%d] %-22s sync ok=%ld new=%ld tip=%d (%.2fs)\n", i, mux_out_host[i], ok, cnt, st_tip, sync_s);
     return cnt;
 }
@@ -6679,6 +6691,12 @@ static void dl_publish_peer_table(void* store_buf, int with_tip){
                      && strncmp(host, mux_out_host[i], strlen(host)) != 0){
                       g_node_status->peers[i].used = 0; continue;
                   } }
+                /* a block this peer announced before we had it, stored since
+                 * (by any leg or the downloader): Core's hashLastUnknownBlock,
+                 * resolved */
+                { static const unsigned char z32[32]; long bh;
+                  if(ht_idx && memcmp(mux_out_announced_hash[i], z32, 32) && idx_get(ht_idx, mux_out_announced_hash[i], &bh))
+                      leg_note_best_known(i, bh); }
                 {
                     rpc_peer_t* pr = &g_node_status->peers[i];
                     /* byte fields only if the kernel returned a struct large
