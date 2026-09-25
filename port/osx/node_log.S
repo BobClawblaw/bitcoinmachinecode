@@ -33,9 +33,12 @@ kind_len:
 _node_log_open:
 	mov  x9, x0		/* path (AAPCS64 arg0 is x0; save before clobbering) */
 	mov  x16, #463		/* openat (Darwin BSD nr, in x16; x8 is the Linux convention) */
-	mov  x0, #-100		/* AT_FDCWD (dirfd) */
+	mov  x0, #-2		/* AT_FDCWD (dirfd): -2 on Darwin; x86's -100 is Linux's, and EBADF here */
 	mov  x1, x9		/* path */
-	mov  x2, #0x441		/* O_WRONLY|O_APPEND|O_CREAT */
+	mov  x2, #0x209		/* O_WRONLY|O_APPEND|O_CREAT in DARWIN values (1|8|0x200).
+				 * This was x86's 0x441 -- the LINUX values -- which Darwin reads as
+				 * O_WRONLY|O_ASYNC|O_TRUNC: every open failed, fd 0 came back, and
+				 * every node_log line was written to stdin (phase 4, test_log) */
 	mov  x3, #0x1b4		/* 0644 */
 	svc #0x80
 	b.cs .nlo_fail
