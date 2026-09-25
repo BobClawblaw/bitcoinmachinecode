@@ -22,10 +22,16 @@ typedef unsigned char u8;
 #define ST_RAW_N         40
 #define ST_ZEROH         48
 #define ST_WANT_MUHASH   56
-#define ST_EXCL_GENESIS  64
-#define ST_GENESIS_N     72
+/* 2026-09-25: offsets as bitcoin_utxo_stats.asm's (and utxo_setinfo.c's
+ * utxo_stats_t, "offset for offset"). The twin had EXCL_GENESIS/GENESIS_N at
+ * 64/72 and MUHASH at 480 -- so C read the digest from where the twin kept two
+ * zero counters: gettxoutsetinfo muhash was all zeros on the Mac (found by the
+ * phase-4 attestation against Core at 968,562: txouts, total_amount and
+ * bogosize identical, muhash 0000...). */
+#define ST_MUHASH        64
 #define ST_ACC           96
-#define ST_MUHASH        480
+#define ST_EXCL_GENESIS  480
+#define ST_GENESIS_N     488
 #define MAX_SCRIPT_SIZE  10000
 #define OP_RETURN        0x6a
 
@@ -47,11 +53,18 @@ static const u8 genesis_coinbase_key[36] = {
     0x00,0x00,0x00,0x00
 };
 
+extern void muhash_init(u64 acc[48]);
 void utxo_stats_init(u8 st[512], u64 want_muhash, u64 excl_genesis)
 {
-    memset(st, 0, 512);
+    /* As the x86: each field by name -- the caller's struct is 496 bytes (a
+     * memset of 512 wrote 16 past it) -- and the accumulator set to the empty
+     * set, 1. Zeroed, every insert multiplied into 0 and the digest was 0. */
+    memset(st, 0, ST_WANT_MUHASH);                  /* the seven counters */
     *(u64 *)(st + ST_WANT_MUHASH) = want_muhash;
+    memset(st + ST_MUHASH, 0, 32);
     *(u64 *)(st + ST_EXCL_GENESIS) = excl_genesis;
+    *(u64 *)(st + ST_GENESIS_N) = 0;
+    muhash_init((u64 *)(st + ST_ACC));
 }
 
 void utxo_stats_add(u8 st[512], const u8 key36[36], u64 value,

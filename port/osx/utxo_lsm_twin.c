@@ -1173,8 +1173,17 @@ static long walk_bridge_cb(void *ctx, const u8 *key, unsigned long index,
                            u64 value, unsigned height, unsigned is_coinbase,
                            const void *script, unsigned long slen)
 {
-    (void)index;
-    g_walk_bridge.cb(ctx, key, value, ((u64)height << 1) | is_coinbase,
+    /* 2026-09-25: the memtable walker hands a 32-byte txid and the index
+     * SEPARATELY; the visitor takes a 36-byte key (txid || vout LE u32). This
+     * forwarded the bare txid, so utxo_stats_add hashed 4 bytes of the
+     * walker's stack as every memtable coin's vout: counts and amounts right,
+     * the MuHash wrong (phase-4 attestation vs Core; test_utxo_setinfo's
+     * independent model). */
+    u8 key36[36];
+    memcpy(key36, key, 32);
+    u32 n32 = (u32)index;
+    memcpy(key36 + 32, &n32, 4);
+    g_walk_bridge.cb(ctx, key36, value, ((u64)height << 1) | is_coinbase,
                      script, slen);
     return 0;
 }
