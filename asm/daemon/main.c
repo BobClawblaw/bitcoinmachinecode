@@ -3666,6 +3666,24 @@ static int dh_extra_allowed(void){ return dh_inflight_count() < DH_MAX - DH_RESE
 static int g_dh_last_slot = -1;   /* the want_slot of the result dh_poll just returned */
 static int dh_start_slot(const char* host, int out_port, int want_slot);
 static int __attribute__((unused)) dh_start(const char* host, int out_port){ return dh_start_slot(host, out_port, -1); }   /* the tests' entry; the daemon names a slot */
+/* In a freshly forked dial helper ONLY: drop what it inherited and has no use
+ * for (2026-09-24). A helper forked while another was in flight held the
+ * worker's end of THAT helper's socketpair: dh_poll's close() of it then woke
+ * nobody, the other helper sat out its wait, and dl_reap_bounded blocked the
+ * worker's rotation for its full 5 s -- once per overlapping dial (mainnet: a
+ * socket handed over at 461 ms reached the worker at 10,820 ms, two reaps
+ * late). The live legs are the same shape: a copy held here keeps a leg the
+ * worker has closed open to its peer, no FIN, until this helper exits.
+ *
+ * Closing a leg fd here is NOT a departure, so it is not leg_close_ours() or
+ * leg_close_theirs(): the worker still holds its own descriptor and the leg
+ * stays up; this process only drops its duplicate. tests/test_leg_close_labels
+ * admits this one function for that reason, and checks it is called from the
+ * helper child alone. Pinned by tests/test_dialhelper.c 1c, 1d. */
+static void dh_drop_inherited_fds(int keep_slot){
+    for(int i = 0; i < DH_MAX; i++) if(i != keep_slot && g_dh[i].pid > 0 && g_dh[i].sp >= 0) close(g_dh[i].sp);
+    for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0) close(mux_out_fd[k]);
+}
 static int dh_start_slot(const char* host, int out_port, int want_slot){
     if(dh_inflight_host(host)) return 0;                  /* one dial per host at a time */
     int slot = -1; for(int i = 0; i < DH_MAX; i++) if(g_dh[i].pid <= 0){ slot = i; break; }
@@ -3675,6 +3693,7 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
     if(pid < 0){ close(sp[0]); close(sp[1]); return 0; }
     if(pid == 0){
         close(sp[0]); g_in_dial_helper = 1;
+        dh_drop_inherited_fds(slot);
         long long t_dial0 = dh_now_ms();
         dh_result_t r; memset(&r, 0, sizeof r);
         snprintf(g_dial_fail, sizeof g_dial_fail, "refused before dialing");   /* not the parent's last reason (2026-09-10: "timed out (10s)" after 1.4 s) */
