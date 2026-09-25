@@ -113,6 +113,7 @@ void store_rd_advise(void *st, u64 height, u64 nblocks)
 }
 
 /* ---- random-map cache: 8 slots of {file_no, map, size} at st+128 ------- */
+static int g_map_random;   /* store_map_random */
 #define MAP_OFF    128
 #define MAP_SLOTS  8
 #define MAP_MAGIC  0x4D41504300000001ULL   /* "MAPC" + version */
@@ -162,6 +163,7 @@ static void map_file(void *st, u32 file_no, u64 need_end, u8 **out_map, u64 *out
     void *m = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
     if (m == MAP_FAILED) { *out_map = 0; *out_size = 0; return; }
+    if (g_map_random) (void)madvise(m, (size_t)sb.st_size, MADV_RANDOM);   /* store_map_random: advisory */
     memcpy(e + 0, &file_no, 4);
     u64 m64 = (u64)(uintptr_t)m, s64 = (u64)sb.st_size;
     memcpy(e + 8, &m64, 8);
@@ -169,6 +171,14 @@ static void map_file(void *st, u32 file_no, u64 need_end, u8 **out_map, u64 *out
     *out_map = (u8 *)m;
     *out_size = s64;
 }
+
+/* store_map_random(on) -- x86 bitcoin_store_fast.asm (2026-09-25 port; the
+ * phase-4 tool build found bmc_build_block_filters needing it). Ask the
+ * kernel NOT to read ahead on the mappings created from here on. Off by
+ * default: every caller that reads a block WHOLE wants readahead. On for the
+ * filter backfill, which reads one ~250-byte transaction from a random block
+ * (x86 measured ~45 KB dragged in to use 250 bytes). */
+void store_map_random(long on) { g_map_random = on ? 1 : 0; }
 
 void store_map_init(void *st)
 {

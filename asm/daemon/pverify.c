@@ -21,6 +21,9 @@
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <pthread.h>
 #include "../bmc_thread.h"
 #include <signal.h>
@@ -103,8 +106,16 @@ int main(int argc,char**argv){
 
     /* ---- machine-adaptive sizing ---- */
     long ncpu=sysconf(_SC_NPROCESSORS_ONLN); if(ncpu<1)ncpu=1; if(ncpu>MAX_WORKERS)ncpu=MAX_WORKERS;
+#ifdef __APPLE__
+    /* bmc_osx: no _SC_LEVEL2/3_CACHE_SIZE on Darwin; hw.l2cachesize is the
+     * same number (Apple silicon reports no L3 -- its SLC is not exposed). */
+    long l2=0, l3=0;
+    { size_t sz=sizeof l2; if(sysctlbyname("hw.l2cachesize",&l2,&sz,NULL,0)!=0) l2=0;
+      sz=sizeof l3; if(sysctlbyname("hw.l3cachesize",&l3,&sz,NULL,0)!=0) l3=0; }
+#else
     long l2=sysconf(_SC_LEVEL2_CACHE_SIZE); if(l2<0)l2=0;
     long l3=sysconf(_SC_LEVEL3_CACHE_SIZE); if(l3<0)l3=0;
+#endif
     long pages=sysconf(_SC_PHYS_PAGES), pgsz=sysconf(_SC_PAGESIZE);
     long mem= pages>0&&pgsz>0? pages*pgsz : 0;
 
