@@ -1249,9 +1249,12 @@ static long long mux_out_since[MUX_MAX_OUT];      /* 2026-09-09: when the leg in
 #include "inflight.h"
 static inflight_t g_inflight; static int g_sync_leg = -1;
 extern void* g_block_fetch_hook;
+static void leg_note_best_known(int k, long h);   /* getpeerinfo's synced_headers; defined with the leg hooks */
 static long block_fetch_gate(const unsigned char* hash){
     long h;
-    if(ht_idx && idx_get(ht_idx, hash, &h)) { g_inflight.refused++; return 0; }   /* already stored (a sibling leg landed it): nothing to fetch */
+    if(ht_idx && idx_get(ht_idx, hash, &h)) {                                   /* already stored (a sibling leg landed it): nothing to fetch -- */
+        leg_note_best_known(g_sync_leg, h);                                     /* but this peer's headers named it: it has the block (2026-09-25) */
+        g_inflight.refused++; return 0; }
     return inflight_claim(&g_inflight, hash, g_sync_leg, (long long)time(NULL));
 }
 /* 2026-09-09: we ping every leg, as Core does (2 min), and a leg that has not
@@ -1273,6 +1276,7 @@ extern int sync_fail_code;                        /* bitcoind.asm: where the las
  * strike of two predecessors (production, 16:30-16:42Z: eight legs closed by
  * us within 50-160 s, none logged). */
 static unsigned char g_pass_last_empty[MUX_MAX_OUT];   /* the leg's last pass report stored nothing (the reorg probe's trigger, 2026-09-10) */
+static int dl_tip_is_ibd(void);   /* Core's IBD test (tip older than maxtipage); defined with the new-block choke point */
 static void leg_note_installed(int i){
     mux_out_since[i] = (long long)time(NULL); mux_out_good[i] = 0; g_sync_fail_streak[i] = 0; mux_out_ping_sent[i] = 0; mux_out_pong_at[i] = 0; mux_out_ping_ms[i] = -1;
     mux_out_announced[i] = 0; mux_out_hb[i] = 0; mux_out_hb_since[i] = 0; mux_out_lastpass_ms[i] = 0; g_pass_last_empty[i] = 0;
@@ -1281,7 +1285,26 @@ static void leg_note_installed(int i){
      * headers instead of announcing by inv; the sweep acts on either. Only
      * with the receive side installed, like sendcmpct: the sync harnesses'
      * fake peers depend on the bare stream. */
-    if(mux_out_fd[i] >= 0 && g_cmpct_hook_cmpct) p2p_write(mux_out_fd[i], "sendheaders", 11, 0, 0);
+    if(mux_out_fd[i] >= 0 && g_cmpct_hook_cmpct){
+        p2p_write(mux_out_fd[i], "sendheaders", 11, 0, 0);
+        /* 2026-09-25, Core's initial getheaders (net_processing SendMessages,
+         * fSyncStarted): with a recent tip every new peer is asked for
+         * headers from the block BELOW our best -- "so that we get at least
+         * one header back" -- and a synced peer answers with our tip.
+         * Without it a leg that announced nothing read synced_headers -1 for
+         * as long as it stayed quiet (mainnet: 20 min, 2cb7a418). The reply
+         * lands in the sweep (leg_on_headers) or in a pass that reads it
+         * first (block_fetch_gate); both record the peer's best-known
+         * block. In IBD Core does not ask every peer, and neither do we. */
+        if(!dl_tip_is_ibd()){
+            unsigned char loc[REORG_LOCATOR_MAX*32]; long n = locator_build(store_buf, loc);
+            if(n >= 2){
+                static unsigned char gh[5 + REORG_LOCATOR_MAX*32 + 32 + 16]; unsigned char stop[32] = {0};
+                long plen = p2p_getheaders(gh, loc + 32, (int)(n - 1), stop);   /* the locator minus the tip: it starts at pprev */
+                if(plen > 0) p2p_write(mux_out_fd[i], "getheaders", 10, gh, (unsigned)plen);
+            }
+        }
+    }
 }
 static long long leg_age_s(int i){ return mux_out_since[i] ? (long long)time(NULL) - mux_out_since[i] : -1; }
 static int legs_live(void){ int n = 0; for(int k = 0; k < mux_n_out; k++) if(mux_out_fd[k] >= 0) n++; return n; }
