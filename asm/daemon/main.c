@@ -8833,14 +8833,14 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(cfd[i]<0) continue;
             int ready=0;
             for(int j=0;j<nf;j++) if(pidx[j]==i){ ready=rdy[j]; break; }
-            if(!ready){ close(cfd[i]); continue; }
+            if(!ready){ close(cfd[i]); cfd[i] = -1; continue; }
             int soerr=0; socklen_t sl=sizeof soerr;
-            if(getsockopt(cfd[i],SOL_SOCKET,SO_ERROR,&soerr,&sl)<0||soerr!=0){ close(cfd[i]); continue; }
+            if(getsockopt(cfd[i],SOL_SOCKET,SO_ERROR,&soerr,&sl)<0||soerr!=0){ close(cfd[i]); cfd[i] = -1; continue; }
             /* it connected: clear non-blocking, then handshake (bounded recv) */
             int fl=fcntl(cfd[i],F_GETFL,0); fcntl(cfd[i],F_SETFL,fl&~O_NONBLOCK);
             struct timeval tv; tv.tv_sec=6; tv.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&tv,sizeof tv);
             int hk=node_handshake(cfd[i]);
-            if(hk!=1 || !peer_has_witness(srcpool[i])){ close(cfd[i]); continue; }
+            if(hk!=1 || !peer_has_witness(srcpool[i])){ close(cfd[i]); cfd[i] = -1; continue; }
             { extern void addrself_note_peer_view(const unsigned char*, long);
               addrself_note_peer_view(g_peer_version_payload, g_peer_version_len); }
             struct timeval t2; t2.tv_sec=3; t2.tv_usec=0; setsockopt(cfd[i],SOL_SOCKET,SO_RCVTIMEO,&t2,sizeof t2);
@@ -8857,6 +8857,15 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             mux_n_out++;
         }
         /* close every candidate fd that was NOT promoted into a live leg */
+        /* 2026-09-25: a candidate closed above is -1 by now, so this loop
+         * closes only the ones never tried. It used to close those three
+         * a SECOND time: harmless while the number stayed free, but
+         * leg_note_installed (ad11ac5a) reads the store during the fill, so
+         * the store's read cache could be handed a number freed by an
+         * earlier candidate -- which the second close() then took from it.
+         * The cache kept the dead number, the next file opened reused it,
+         * and the apply read blk data from a UTXO run file (signet 323,651,
+         * caught by a close() watcher; mainnet 968,554, 12 minutes stalled). */
         for(int i=0;i<nc;i++){
             if(cfd[i]<0) continue;
             int kept=0;
