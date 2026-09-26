@@ -211,6 +211,17 @@ int main(void){
       ck("wrote a 67 MB txospender tail", f && fwrite(buf, TSP_REC, NREC, f) == NREC);
       if (f) fclose(f);
       free(buf);
+      /* One UNMEASURED call first. The first getindexinfo a thread makes pays
+       * a one-time cost that has nothing to do with the tail: on the Mac
+       * 0.55-1.07 ms for the first call against ANY tail size (1 record, 24k
+       * or 2.4M), then ~0.025 ms for every later one at every size -- so with
+       * the first call measured, worst-of-3 was the warm-up, not the scan
+       * (2026-09-26). The regression this guards is still caught: each
+       * measured round below GROWS the tail first, which is exactly when the
+       * old reader re-scanned it from byte 0. */
+      { rj_val* res = NULL; long ec = 0; const char* em = NULL;
+        rpc_chain_dispatch("getindexinfo", NULL, &res, &ec, &em);
+        if (res) rj_free(res); }
       double worst_cpu_ms = 0; int right = 1;
       for (int round = 0; round < 3; round++){
           /* the tail grows by a block's records, as it does every block in IBD */
