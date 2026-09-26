@@ -3655,6 +3655,22 @@ static int legs_heard_within(int i, long long window_ms){
     }
     return others ? 0 : -1;
 }
+/* Has the host heard nothing on any leg for PROBE_SILENCE_MS? Then a reorg
+ * probe must not start (see its call site): 1 silent, 0 not (or no legs).
+ *
+ * 2026-09-26: the probe runs inline under a DL_BUDGET_SECS alarm whose
+ * handler shuts the socket down -- the only way to end a read the retry
+ * loops would otherwise resume -- so a probe that times out always costs
+ * its leg. In the 06:24 outage three long-lived legs were closed that way
+ * (probe-budget, 06:25:45 / 06:26:47 / 06:27:48). The second and third began
+ * 75 s and 135 s into the silence and could only time out. The first began
+ * seconds before it and is not saved: once the outage ended, TCP's
+ * retransmit backoff held our getheaders until ~06:28:52, and holding the
+ * worker inside a probe that long is worse than one re-dial. */
+#ifndef PROBE_SILENCE_MS
+#define PROBE_SILENCE_MS 20000
+#endif
+static int reorg_probe_host_silent(void){ return legs_heard_within(-1, PROBE_SILENCE_MS) == 0; }
 /* Test seam: the extra window over the pass's own duration that still counts
  * as "during the pass" -- the report is read a rotation after the pass ends. */
 #ifndef PASS_SILENCE_SLACK_MS
@@ -9600,8 +9616,21 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * millisecond of the fork), two readers interleaved the frames, the
              * probe tore the leg down and Core saw a reset ("EOF on the first
              * read", every leg, every 30-70 s). Now it runs BEFORE the pass, on an
-             * idle leg whose last REPORT was empty. */
-            if(reorg_ok && utxo_live_ok && g_pass_last_empty[i] && mux_out_fd[i]>=0 && now_ms>=next_reorg_probe_ms){
+             * idle leg whose last REPORT was empty.
+             * 2026-09-26: and not while the host hears nothing on any leg --
+             * a probe then can only time out, and its timeout costs the leg
+             * (reorg_probe_host_silent). It runs as soon as a leg hears again. */
+            static int probe_deferred_logged = 0;
+            int probe_due = reorg_ok && utxo_live_ok && g_pass_last_empty[i] && mux_out_fd[i]>=0 && now_ms>=next_reorg_probe_ms;
+            if(probe_due && reorg_probe_host_silent()){
+                if(!probe_deferred_logged){
+                    fprintf(stderr,"[reorg] probe of %s deferred: no leg has received anything for %ds -- the host's network, not a peer\n",
+                            mux_out_host[i], PROBE_SILENCE_MS / 1000);
+                    probe_deferred_logged = 1;
+                }
+                probe_due = 0;
+            } else if(probe_due) probe_deferred_logged = 0;
+            if(probe_due){
                 next_reorg_probe_ms = now_ms + REORG_PROBE_INTERVAL_MS;
                 struct sigaction psa, pold; memset(&psa,0,sizeof psa);
                 psa.sa_handler=mux_budget_alarm; sigemptyset(&psa.sa_mask);

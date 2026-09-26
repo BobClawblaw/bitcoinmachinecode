@@ -14,6 +14,11 @@
  * loopback TCP connections; PASS_SILENCE_SLACK_MS is 0 so the window is the
  * pass's own duration.
  *
+ * The reorg probe (6.): the same outage closed three more long-lived legs as
+ * probe-budget -- a probe's timeout always costs its leg (the alarm shuts the
+ * socket down) -- so a probe does not start while no leg has heard anything
+ * for PROBE_SILENCE_MS (300 ms here). reorg_probe_host_silent is the gate.
+ *
  * pass_fail_bookkeeping lives beside main(), so this includes that TU
  * (renaming its main), as tests/test_dial_budget.c does.
  */
@@ -22,6 +27,7 @@
 #include <time.h>
 
 #define PASS_SILENCE_SLACK_MS 0
+#define PROBE_SILENCE_MS 300
 #define main daemon_main_disabled
 #include "../daemon/main.c"
 #undef main
@@ -115,6 +121,17 @@ int main(void){
     pass_fail_bookkeeping(0, 1, 0, 0.3);
     ck("a good pass resets the streak", g_sync_fail_streak[0] == 0);
     leg_shut(0); leg_shut(1);
+
+    /* ---- 6. the reorg probe's gate: no probe while the host hears nothing ---- */
+    mux_n_out = 3;
+    leg_open(0, "198.51.100.17:8333"); leg_open(1, "198.51.100.18:8333"); leg_open(2, "198.51.100.19:8333");
+    nap_ms(800);
+    ck("probe gate: every leg silent past the window -> the host is silent, no probe", reorg_probe_host_silent() == 1);
+    if (write(srv_fd[2], "p", 1) != 1){ perror("write"); return 2; }
+    nap_ms(20);
+    ck("probe gate: one leg just received data -> the probe may run", reorg_probe_host_silent() == 0);
+    leg_shut(0); leg_shut(1); leg_shut(2);
+    ck("probe gate: no legs at all -> not 'silent' (nothing to judge by)", reorg_probe_host_silent() == 0);
 
     close(g_lfd);
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
