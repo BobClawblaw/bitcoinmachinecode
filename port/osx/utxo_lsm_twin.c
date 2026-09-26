@@ -751,7 +751,14 @@ static long mac_flush(void *lst, void *u)
         if ((i & (SPARSE_STRIDE - 1)) == 0) {
             off_t cur = lseek(fd, 0, SEEK_CUR);
             if (cur < 0) goto fail_close;
+#ifndef LSM_REPRO_BAD_SPARSE
             u64 foff = (u64)cur + mac_fl_fill;       /* logical offset */
+#else
+            u64 foff = (u64)cur;                     /* the b3d47a9 bug, compiled in ONLY for the
+                                                      * _bad negative controls (test_support/
+                                                      * bitcoin_utxo_lsm_badsparse_twin.c), as x86's
+                                                      * -DLSM_REPRO_BAD_SPARSE build of the asm */
+#endif
             memcpy(sparse_buf + sparse_n * SPARSE_ENT_SIZE, rec, 36);
             memcpy(sparse_buf + sparse_n * SPARSE_ENT_SIZE + 36, &foff, 8);
             sparse_n++;
