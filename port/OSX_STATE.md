@@ -6,7 +6,7 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
 ## 2026-09-26 — the native test sweep: every gated test runs on the Mac, bar 14 that are x86-only by nature
 
-The phase-4 sweep (every `./tests/*` command of `make test`, built natively against `port/osx/daemon_out`) is worked through. Real bugs it found today, all fixed:
+The phase-4 sweep (every `./tests/*` command of `make test`, built natively against `port/osx/daemon_out`) is worked through. **It is repeatable: `port/osx/run_tests.sh` builds the daemon objects, tools and test helpers and runs the whole suite (or named tests) the same way; exit 0 = every test PASS, SKIP or N/A.** Real bugs it found today, all fixed:
 
 - **Mac port:**
   - `node_log_open` used Linux open flags and AT_FDCWD (every open failed);
