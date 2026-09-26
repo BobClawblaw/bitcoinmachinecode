@@ -1883,11 +1883,31 @@ static void case_node_sync_multi(void){
 
     /* Sentinel values in the callee-saved registers node_sync_multi's frame
      * would trash if the payload buffer overran its save area. */
+#if defined(__aarch64__)
+    /* AArch64 (the Mac's hand-written node_sync_multi in bitcoind.S): the
+     * callee-saved x19..x23 carry the sentinels instead. */
+    register long s_rbx asm("x19") = 0x1111111111111111L;
+    register long s_r12 asm("x20") = 0x2222222222222222L;
+    register long s_r13 asm("x21") = 0x3333333333333333L;
+    register long s_r14 asm("x22") = 0x4444444444444444L;
+    register long s_r15 asm("x23") = 0x5555555555555555L;
+#define SENT_A "x19"
+#define SENT_B "x20"
+#define SENT_C "x21"
+#define SENT_D "x22"
+#define SENT_E "x23"
+#else
     register long s_rbx asm("rbx") = 0x1111111111111111L;
     register long s_r12 asm("r12") = 0x2222222222222222L;
     register long s_r13 asm("r13") = 0x3333333333333333L;
     register long s_r14 asm("r14") = 0x4444444444444444L;
     register long s_r15 asm("r15") = 0x5555555555555555L;
+#define SENT_A "rbx"
+#define SENT_B "r12"
+#define SENT_C "r13"
+#define SENT_D "r14"
+#define SENT_E "r15"
+#endif
     asm volatile("" : "+r"(s_rbx), "+r"(s_r12), "+r"(s_r13), "+r"(s_r14), "+r"(s_r15));
 
     static u8 cbuf[4<<20];
@@ -1895,11 +1915,11 @@ static void case_node_sync_multi(void){
     long ok = node_sync_multi(fd, store_buf, loc, nloc, cbuf, (long)sizeof cbuf, &cnt);
 
     asm volatile("" : "+r"(s_rbx), "+r"(s_r12), "+r"(s_r13), "+r"(s_r14), "+r"(s_r15));
-    ckm("node_sync_multi preserved rbx", s_rbx == 0x1111111111111111L);
-    ckm("node_sync_multi preserved r12", s_r12 == 0x2222222222222222L);
-    ckm("node_sync_multi preserved r13", s_r13 == 0x3333333333333333L);
-    ckm("node_sync_multi preserved r14", s_r14 == 0x4444444444444444L);
-    ckm("node_sync_multi preserved r15", s_r15 == 0x5555555555555555L);
+    ckm("node_sync_multi preserved " SENT_A, s_rbx == 0x1111111111111111L);
+    ckm("node_sync_multi preserved " SENT_B, s_r12 == 0x2222222222222222L);
+    ckm("node_sync_multi preserved " SENT_C, s_r13 == 0x3333333333333333L);
+    ckm("node_sync_multi preserved " SENT_D, s_r14 == 0x4444444444444444L);
+    ckm("node_sync_multi preserved " SENT_E, s_r15 == 0x5555555555555555L);
 
     ck("node_sync_multi returned ok", ok, 1);
     ck("node_sync_multi stored the whole extension", cnt, nwin);

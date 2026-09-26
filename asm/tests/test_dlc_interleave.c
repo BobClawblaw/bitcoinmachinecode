@@ -37,6 +37,7 @@
 extern void utxo_live_close(void);
 #define main daemon_main_disabled
 #include "../daemon/main.c"
+#include "loopback_alias.h"
 #undef main
 
 static int failures = 0;
@@ -148,7 +149,11 @@ static void fp_serve(int cfd, long delay_us){
          * side the payload waits for our ACK of the header -- a 40 ms
          * delayed-ACK stall per getdata, which would turn this fixture
          * into a 25 blk/s peer whatever the delay below says. */
+#ifdef TCP_QUICKACK
         { int qa=1; setsockopt(cfd,IPPROTO_TCP,TCP_QUICKACK,&qa,sizeof qa); }
+#elif defined(TCP_SENDMOREACKS)
+        { int qa=1; setsockopt(cfd,IPPROTO_TCP,TCP_SENDMOREACKS,&qa,sizeof qa); }   /* Darwin: no QUICKACK; ack every other segment */
+#endif
         plen=0; if(p2p_read(cfd,cmd,rb,sizeof rb,&plen)<=0) return;
         cmd[11]=0;
         if(!strncmp(cmd,"version",7)){
@@ -285,6 +290,7 @@ static long run_download(const char* tag, int interleave, long* out_gate_applied
 }
 
 int main(void){
+    require_loopback_aliases(3);   /* distinct peer IPs 127.0.0.2..3 */
     /* 2026-09-09: a fresh datadir takes the dbcache-sized bulk memtable by
      * itself now; this test is about the interleave and its lag assertions
      * are timing-sensitive under the gate's load, so it keeps the small

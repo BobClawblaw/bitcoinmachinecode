@@ -29,6 +29,7 @@
  * and MADV_DONTDUMP, which are not done and remain open under WAL-3.
  */
 #include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -39,14 +40,32 @@ extern int  bip39_mnemonic_to_seed(u8 seed[64], const char* mn,
 extern void wcrypt_derive(const char* pass, long passlen, const u8 salt[8],
                           unsigned iters, u8 key[32], u8 iv[16]);
 
+#ifdef __APPLE__
+/* Mach-O has no __data_start/_end: the same range is the main image's
+ * __DATA segment (.data, .bss and common all live in it), slide applied. */
+#include <mach-o/getsect.h>
+#include <mach-o/dyld.h>
+static char *bmc_data_lo, *bmc_data_hi;
+static void bmc_data_bounds(void){
+    if (bmc_data_lo) return;
+    unsigned long sz = 0;
+    uint8_t* p = getsegmentdata((const struct mach_header_64*)_dyld_get_image_header(0), "__DATA", &sz);
+    bmc_data_lo = (char*)p; bmc_data_hi = (char*)p + sz;
+}
+#define DATA_LO (bmc_data_bounds(), bmc_data_lo)
+#define DATA_HI (bmc_data_bounds(), bmc_data_hi)
+#else
 extern char __data_start[], _end[];
+#define DATA_LO __data_start
+#define DATA_HI _end
+#endif
 
 static int fails = 0;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
 
 /* Is `needle` present anywhere in this process's writable data segment? */
 static int in_static_data(const void* needle, size_t n){
-    for (char* q = __data_start; q + (long)n <= _end; q++)
+    for (char* q = DATA_LO; q + (long)n <= DATA_HI; q++)
         if (!memcmp(q, needle, n)) return 1;
     return 0;
 }

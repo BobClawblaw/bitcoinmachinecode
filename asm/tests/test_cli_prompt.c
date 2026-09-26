@@ -11,7 +11,11 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <poll.h>
+#ifdef __APPLE__
+#include <util.h>      /* forkpty on macOS */
+#else
 #include <pty.h>
+#endif
 #include <sys/wait.h>
 #include <sys/stat.h>
 extern int wallet_store_create(const char* path, const char* mnemonic, const char* pass);

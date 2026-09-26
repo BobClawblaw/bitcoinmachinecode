@@ -137,7 +137,9 @@ int main(void){
         pid_t pid = fork();
         if (pid == 0){
             alarm(300);
+#ifndef __APPLE__
             { cpu_set_t one; CPU_ZERO(&one); CPU_SET(0, &one); sched_setaffinity(0, sizeof one, &one); }   /* one core */
+#endif                                                                   /* (macOS has no thread pinning) */
             const char* r = "";
             struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
             int ok = tx_verify_at_height(full, fl, 900000, resolve_p2wpkh, NULL, &r);
