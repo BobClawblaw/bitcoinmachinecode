@@ -359,16 +359,22 @@ mpool_get:
     ; shared lock across full script verification -- turning a rare race into
     ; an attacker-triggerable stall of every serve child, the download worker
     ; and GBT at once. That trade is strictly worse.
+    ;
+    ; blob_off is loaded ONCE and the returned pointer is built from that
+    ; checked value (bmc_osx 99c940ca; tests/test_mpool_get_once). It used to
+    ; be re-loaded after the check, so a move between the two loads paired
+    ; the checked len with an unchecked offset -- this same race, re-opened
+    ; one instruction later.
     mov  rax, [r11]          ; len
-    mov  rdx, [r11+40]       ; blob_off
+    mov  rcx, [r11+40]       ; blob_off (rcx is scratch here)
+    mov  rdx, rcx
     add  rdx, rax            ; blob_off + len  (neither is attacker-huge alone)
     jc   .miss               ; wrapped: incoherent, treat as absent
     cmp  rdx, [r12+24]       ; blob_cap
     ja   .miss               ; would read past the blob mapping
     mov  [r14], rax          ; len -> *out_len
-    mov  rax, [r11+40]       ; blob_off
-    mov  rdx, [r12+16]       ; blob base
-    add  rax, rdx            ; -> tx pointer
+    mov  rax, [r12+16]       ; blob base
+    add  rax, rcx            ; + the CHECKED blob_off -> tx pointer
     jmp  .ret
 .miss:
     xor  eax, eax
