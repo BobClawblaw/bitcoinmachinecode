@@ -19,7 +19,7 @@
  */
 #include <string.h>
 #include <stdlib.h>
-#include "bmc_thread.h"
+#include "../bmc_thread.h"
 #include "signet.h"
 #include "signet_block.h"
 
