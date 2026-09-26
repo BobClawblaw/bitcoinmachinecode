@@ -17,6 +17,9 @@ typedef struct { inflight_ent_t e[INFLIGHT_MAX]; unsigned long claims, refused, 
 void inflight_init(inflight_t* t);
 /* 1 = this leg may fetch the block (free, its own, or a stale claim taken over); 0 = another leg has it */
 int  inflight_claim(inflight_t* t, const unsigned char hash[32], int leg, long long now);
+/* the same answer without claiming (the rotation picks an announced leg with it
+ * and claims only when that leg's pass actually starts) */
+int  inflight_would_allow(const inflight_t* t, const unsigned char hash[32], int leg, long long now);
 void inflight_release(inflight_t* t, const unsigned char hash[32]);
 void inflight_release_leg(inflight_t* t, int leg);
 int  inflight_count(const inflight_t* t);
