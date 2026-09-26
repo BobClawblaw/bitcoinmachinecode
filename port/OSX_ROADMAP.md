@@ -438,6 +438,9 @@ Heavy svc counts from the x86 .asm (measured 2026-09-09):
       natively via build_wallet_cli.sh; its two raw syscalls route through
       the same libc surface. Gate = a wallet round-trip against a running
       osx node, still open.
+      bitcoin_cli.asm itself (the S6 offline STORE CLI, cli_main) -> C twin
+      port/osx/cli_twin.c DONE 2026-09-26; test_cli 27/27 (it segfaulted on
+      the unresolved cli_main).
 Darwin syscall deltas to apply per site: `svc #0x80`, nr in x16, args x0-x7,
 error = negative errno in x0 with carry set (b.cs); fdatasync sites that
 mean durability -> F_FULLFSYNC via fcntl; C shims (_bmcshim_*) only where no
