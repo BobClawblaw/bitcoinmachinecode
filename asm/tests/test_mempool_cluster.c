@@ -31,6 +31,63 @@ static void mk(mpc_cluster* cl, int n, const uint64_t* fees, const uint64_t* wts
     }
 }
 
+/* the diamond fixture and its lookup callback, at FILE scope: they were a
+ * GCC nested function inside main, which clang does not compile and which,
+ * its address taken, needs an executable-stack trampoline under GCC. */
+static struct { unsigned char id[32]; uint64_t fee, wt; int np; int par[4]; } POOL[] = {
+    /* 0 */ {{0xA0}, 1000, 1000, 0, {0}},
+    /* 1 */ {{0xA1}, 2000, 1000, 1, {0}},        /* child of 0 */
+    /* 2 */ {{0xA2}, 3000, 1000, 1, {0}},        /* sibling of 1 */
+    /* 3 */ {{0xA3}, 4000, 1000, 2, {1,2}},      /* diamond tip */
+    /* 4 */ {{0xB0}, 9000, 1000, 0, {0}},        /* a SEPARATE cluster */
+};
+static const int NPOOL = 5;
+/* the callback: find by id, report direct parents and derived children */
+static int lookup(void* c, const unsigned char* id, mpc_entry* o){
+    (void)c;
+    for (int i = 0; i < NPOOL; i++){
+        if (memcmp(POOL[i].id, id, 32)) continue;
+        memset(o, 0, sizeof *o);
+        o->fee = POOL[i].fee; o->weight = POOL[i].wt;
+        o->n_parents = POOL[i].np;
+        for (int k = 0; k < POOL[i].np; k++)
+            memcpy(o->parents[k], POOL[POOL[i].par[k]].id, 32);
+        for (int j = 0; j < NPOOL; j++)
+            for (int k = 0; k < POOL[j].np; k++)
+                if (POOL[j].par[k] == i)
+                    memcpy(o->children[o->n_children++], POOL[j].id, 32);
+        return 1;
+    }
+    return 0;
+}
+
+/* the chain fixtures for the truncation checks (file scope, as above) */
+static int chain_lookup(void* c, const unsigned char* id, mpc_entry* o){
+    (void)c;
+    int i = id[0] | (id[1] << 8);
+    if (id[2] != 0x5A || i < 0 || i >= 100) return 0;
+    memset(o, 0, sizeof *o);
+    o->fee = 1000; o->weight = 1000;
+    if (i > 0){ o->parents[0][0] = (unsigned char)((i-1) & 0xff);
+                o->parents[0][1] = (unsigned char)((i-1) >> 8);
+                o->parents[0][2] = 0x5A; o->n_parents = 1; }
+    if (i < 99){ o->children[0][0] = (unsigned char)((i+1) & 0xff);
+                 o->children[0][1] = (unsigned char)((i+1) >> 8);
+                 o->children[0][2] = 0x5A; o->n_children = 1; }
+    return 1;
+}
+
+static int short_lookup(void* c, const unsigned char* id, mpc_entry* o){
+    (void)c;
+    int i = id[0] | (id[1] << 8);
+    if (id[2] != 0x5A || i < 0 || i >= 10) return 0;
+    memset(o, 0, sizeof *o);
+    o->fee = 1000; o->weight = 1000;
+    if (i > 0){ o->parents[0][0] = (unsigned char)(i-1); o->parents[0][2] = 0x5A; o->n_parents = 1; }
+    if (i < 9){ o->children[0][0] = (unsigned char)(i+1); o->children[0][2] = 0x5A; o->n_children = 1; }
+    return 1;
+}
+
 int main(void){
     printf("== feerate comparison (Core FeeFrac semantics) ==\n");
     ck("2000/1000 > 1000/1000", mpc_feerate_cmp(2000,1000,1000,1000) > 0);
@@ -204,32 +261,6 @@ int main(void){
     {   /* A tiny in-memory mempool the lookup callback reads. Edges are given
          * as direct parents only; children are derived, so the fixture cannot
          * disagree with itself the way a hand-written pair of lists can. */
-        static struct { unsigned char id[32]; uint64_t fee, wt; int np; int par[4]; } POOL[] = {
-            /* 0 */ {{0xA0}, 1000, 1000, 0, {0}},
-            /* 1 */ {{0xA1}, 2000, 1000, 1, {0}},        /* child of 0 */
-            /* 2 */ {{0xA2}, 3000, 1000, 1, {0}},        /* sibling of 1 */
-            /* 3 */ {{0xA3}, 4000, 1000, 2, {1,2}},      /* diamond tip */
-            /* 4 */ {{0xB0}, 9000, 1000, 0, {0}},        /* a SEPARATE cluster */
-        };
-        static const int NPOOL = 5;
-        /* the callback: find by id, report direct parents and derived children */
-        int lookup(void* c, const unsigned char* id, mpc_entry* o){
-            (void)c;
-            for (int i = 0; i < NPOOL; i++){
-                if (memcmp(POOL[i].id, id, 32)) continue;
-                memset(o, 0, sizeof *o);
-                o->fee = POOL[i].fee; o->weight = POOL[i].wt;
-                o->n_parents = POOL[i].np;
-                for (int k = 0; k < POOL[i].np; k++)
-                    memcpy(o->parents[k], POOL[POOL[i].par[k]].id, 32);
-                for (int j = 0; j < NPOOL; j++)
-                    for (int k = 0; k < POOL[j].np; k++)
-                        if (POOL[j].par[k] == i)
-                            memcpy(o->children[o->n_children++], POOL[j].id, 32);
-                return 1;
-            }
-            return 0;
-        }
         mpc_cluster c2;
         ck("a diamond cluster is discovered from its ROOT",
            mpc_build_cluster(0, lookup, POOL[0].id, &c2)==0 && c2.n==4);
@@ -266,20 +297,6 @@ int main(void){
          * so a component CAN exceed it -- and a truncated walk is NOT a cluster.
          * Reporting one as if it were would describe a block-space competition
          * that omits most of its competitors. A 100-long chain forces it. */
-        int chain_lookup(void* c, const unsigned char* id, mpc_entry* o){
-            (void)c;
-            int i = id[0] | (id[1] << 8);
-            if (id[2] != 0x5A || i < 0 || i >= 100) return 0;
-            memset(o, 0, sizeof *o);
-            o->fee = 1000; o->weight = 1000;
-            if (i > 0){ o->parents[0][0] = (unsigned char)((i-1) & 0xff);
-                        o->parents[0][1] = (unsigned char)((i-1) >> 8);
-                        o->parents[0][2] = 0x5A; o->n_parents = 1; }
-            if (i < 99){ o->children[0][0] = (unsigned char)((i+1) & 0xff);
-                         o->children[0][1] = (unsigned char)((i+1) >> 8);
-                         o->children[0][2] = 0x5A; o->n_children = 1; }
-            return 1;
-        }
         unsigned char seed[32]; memset(seed, 0, sizeof seed); seed[2] = 0x5A;
         mpc_cluster c3;
         ck("a 100-long chain does not overflow the cluster",
@@ -287,16 +304,6 @@ int main(void){
         ck("...it stops at the 64 bound", c3.n <= MPC_MAX_CLUSTER);
         ck("...and SAYS it was truncated", c3.truncated == 1);
         /* a component that fits must NOT be flagged */
-        int short_lookup(void* c, const unsigned char* id, mpc_entry* o){
-            (void)c;
-            int i = id[0] | (id[1] << 8);
-            if (id[2] != 0x5A || i < 0 || i >= 10) return 0;
-            memset(o, 0, sizeof *o);
-            o->fee = 1000; o->weight = 1000;
-            if (i > 0){ o->parents[0][0] = (unsigned char)(i-1); o->parents[0][2] = 0x5A; o->n_parents = 1; }
-            if (i < 9){ o->children[0][0] = (unsigned char)(i+1); o->children[0][2] = 0x5A; o->n_children = 1; }
-            return 1;
-        }
         ck("a 10-long chain fits and is NOT flagged truncated",
            mpc_build_cluster(0, short_lookup, seed, &c3)==0 && c3.n==10 && c3.truncated==0);
     }
