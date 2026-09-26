@@ -3538,16 +3538,33 @@ static void leg_on_headers(int fd, const unsigned char* hdrs, unsigned long n){
     leg_on_block_announce(fd, bh, "headers");
 }
 static int leg_pass_busy(int i);   /* defined with the pass helper below */
-/* the rotation asks: is a leg other than `except` announced? (clears the mark) */
+/* the rotation asks: which leg announced a block we do not have? -1 if none.
+ *
+ * 2026-09-26: this used to clear the leg's mark AND claim the block (inflight)
+ * the moment it picked the leg. Every later check in the rotation that skipped
+ * the leg -- the relay deferral, apply-first, a gone socket -- then left the
+ * claim held with no pass behind it and the announcement lost, and the claim
+ * refused the block to every other leg until INFLIGHT_STALE_S (600 s).
+ * 968,681 was stored 605 s after Core had it, 968,680 552 s. Now the pick only
+ * looks: the claim is taken when the pass starts (leg_pass_launch), the mark
+ * stays until then, and a leg is offered at most once per rotation
+ * (g_pick_tried, cleared at the top of each rotation) so a skipped leg waits
+ * for the next rotation instead of being picked again at once. The mark IS
+ * cleared when the leg is gone or another leg's pass already holds the
+ * block. */
+static unsigned char g_pick_tried[MUX_MAX_OUT];
 static int leg_announced_pick(int except){
+    long long now = (long long)time(NULL);
     for(int a = 0; a < mux_n_out; a++){
-        if(a == except || !mux_out_announced[a] || leg_pass_busy(a)) continue;
-        mux_out_announced[a] = 0;
-        if(mux_out_fd[a] < 0) continue;
+        if(a == except || !mux_out_announced[a] || g_pick_tried[a] || leg_pass_busy(a)) continue;
+        if(mux_out_fd[a] < 0){ mux_out_announced[a] = 0; continue; }
         /* 2026-09-10 (snapshot y): with passes in helpers, every leg that announced
          * the same block fetched it -- six reconstructions of block 966,312. One
          * pass per announced block: the claim is released when its pass reports. */
-        if(!inflight_claim(&g_inflight, mux_out_announced_hash[a], a, (long long)time(NULL))) continue;
+        if(!inflight_would_allow(&g_inflight, mux_out_announced_hash[a], a, now)){
+            mux_out_announced[a] = 0; g_inflight.refused++; continue;
+        }
+        g_pick_tried[a] = 1;
         return a;
     }
     return -1;
@@ -6767,6 +6784,42 @@ static int leg_pass_start(int i, unsigned budget_s){
     g_pass_started++;
     return 1;
 }
+/* ---- the last two steps before a leg's pass (2026-09-26) -------------------
+ * leg_pass_gate: may leg i's pass go ahead this rotation? The 30 s spacing
+ * between passes, and the relay deferral -- a pass would feed replies still
+ * owed to the relay layer into the drain's discard. Two changes from the inline
+ * version: a leg that announced a block we do not have is never deferred
+ * (a block outranks a few tx replies, which are re-requested), and the 30 s
+ * stamp is taken only when the pass goes ahead -- it was taken BEFORE the
+ * deferral, so a leg that was mid-relay at each of its turns got no pass for
+ * minutes (leg 5, 12:33-12:39, holding 968,680's claim).
+ * leg_pass_launch: take the announced block's claim and start the helper;
+ * with no helper the claim is released at once, never left held. */
+#ifndef TXRELAY_REPLIES_PENDING
+#define TXRELAY_REPLIES_PENDING(fd) txrelay_replies_pending(fd)
+#endif
+#ifndef LEG_PASS_START
+#define LEG_PASS_START(i, budget_s) leg_pass_start(i, budget_s)
+#endif
+extern int txrelay_replies_pending(int); extern void txrelay_note_sync_deferred(void);
+static int leg_pass_gate(int i, int announced_now, long long now_ms){
+    if(!announced_now && mux_out_lastpass_ms[i] && now_ms - mux_out_lastpass_ms[i] < LEG_PASS_EVERY_MS) return 0;   /* no polling for headers between announcements */
+    if(!announced_now && mux_out_fd[i] >= 0 && TXRELAY_REPLIES_PENDING(mux_out_fd[i])){ txrelay_note_sync_deferred(); return 0; }   /* retried next rotation */
+    mux_out_lastpass_ms[i] = now_ms;
+    return 1;
+}
+static int leg_pass_launch(int i, int announced_now, unsigned budget_s){
+    if(announced_now && !inflight_claim(&g_inflight, mux_out_announced_hash[i], i, (long long)time(NULL))){
+        mux_out_announced[i] = 0; return 0;    /* another leg's pass took it since the pick */
+    }
+    if(!LEG_PASS_START(i, budget_s)){
+        if(announced_now) inflight_release(&g_inflight, mux_out_announced_hash[i]);   /* no pass: no claim */
+        g_pass_fallback++; mux_out_lastpass_ms[i] = 0;    /* no helper (fork failed): never inline -- the next rotation tries again */
+        return 0;
+    }
+    mux_out_announced[i] = 0;                             /* the pass consumed whatever was announced on this leg */
+    return 1;
+}
 /* the parent, on a report: what the synchronous path did in memory */
 static long leg_pass_finish(int i, const pass_result_t* r, const unsigned char* v2, unsigned long v2_len){
     store_reload(store_buf);
@@ -9467,6 +9520,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 : "[dl] UTXO backlog %ld -- resuming normal leg rotation\n", apply_backlog);
             apply_first_prev = apply_first;
         }
+        memset(g_pick_tried, 0, sizeof g_pick_tried);    /* each announced leg is offered once per rotation */
         for(int n_=0;n_<mux_n_out;n_++){
             int i = (leg_start + n_) % mux_n_out;
             /* 2026-09-10: a leg whose peer announced a block we do not have
@@ -9581,13 +9635,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(mux_out_fd[i]>=0 && mux_out_kind[i] == LEG_BLOCK_ONLY){ extern long txrelay_poll_block_only_leg(int); (void)txrelay_poll_block_only_leg(mux_out_fd[i]); }   /* 2026-09-10: block announcements from block-relay-only legs too */
             if(g_stored_now) stored_break = 1;
             if(apply_first) continue;        /* see APPLY FIRST above */
-            if(!announced_now && mux_out_lastpass_ms[i] && now_ms - mux_out_lastpass_ms[i] < LEG_PASS_EVERY_MS) continue;   /* 2026-09-10: no polling for headers between announcements */
-            mux_out_lastpass_ms[i] = now_ms;
-            /* A sync pass on this leg would feed any reply still owed to the
-             * relay layer into .drain's discard. Skip it while replies are
-             * pending (bounded: the relay layer forgets after 1.5 s). */
-            { extern int txrelay_replies_pending(int); extern void txrelay_note_sync_deferred(void);
-              if(mux_out_fd[i]>=0 && txrelay_replies_pending(mux_out_fd[i])){ txrelay_note_sync_deferred(); continue; } }
+            if(!leg_pass_gate(i, announced_now, now_ms)) continue;   /* 30 s spacing; the relay deferral (never for an announced leg) */
             /* 2026-09-10 (row 1): the pass runs in a helper under its budget;
              * the report comes back through leg_pass_poll on a later rotation.
              * A leg whose pass is running is skipped by the sweep and the
@@ -9674,9 +9722,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             }
             if(mux_out_fd[i] < 0) continue;                    /* the probe closed it */
             unsigned budget_s = leg_budget_secs(legs_live());
-            if(leg_pass_start(i, budget_s)){ did = 1; }
-            else { g_pass_fallback++; mux_out_lastpass_ms[i] = 0; continue; }   /* no helper (fork failed): never inline -- the next rotation tries again */
-            mux_out_announced[i] = 0;                          /* the pass consumed whatever was announced on this leg */
+            if(leg_pass_launch(i, announced_now, budget_s)){ did = 1; }   /* the announced block's claim is taken here, with the pass */
+            else continue;
             /* 2026-09-09: service every OTHER leg's buffered messages now --
              * a ping used to wait for its leg's turn in the rotation (75 s
              * measured; Core's eviction protects its lowest-ping peers, and a
