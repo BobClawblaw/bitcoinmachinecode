@@ -1463,21 +1463,27 @@ void bmc_alert_deliver(const char* msg){
     if (g_cfg.alertnotify[0]) notify_run(g_cfg.alertnotify, msg, "alertnotify");
 }
 
+/* Test seam: runs between the load of an expired `until` and its expiry
+ * store (tests/test_ban_expiry_race). Nothing in the daemon defines it. */
+#ifndef BAN_EXPIRY_OBSERVED
+#define BAN_EXPIRY_OBSERVED(i) ((void)0)
+#endif
 int ctl_is_banned(const char* ip){
     if(!g_node_status) return 0;
     long long now = (long long)time(NULL);
     for(int i = 0; i < RPC_MAX_BANS; i++){
-        /* ARM64 (2026-09-25): `until` is published after a full barrier
-         * (ctl_ban_add); read it with ACQUIRE so the subnet load below cannot
-         * be satisfied first -- a fresh slot's old/empty subnet would miss the
-         * new ban for this check. A control dependency does not order
-         * load->load on ARM. */
+        /* `until` is published last, after a full barrier (ctl_ban_add, the
+         * worker's setban); an acquire load keeps the subnet read below behind
+         * it (a no-op on x86, needed on ARM -- bmc_osx 0e916bca). */
         long long until = __atomic_load_n(&g_node_status->bans[i].until, __ATOMIC_ACQUIRE);
         if(!until) continue;
         if(until <= now){
-            /* lazily expire -- by CAS from the value observed, so a ban another
-             * process published into this slot meanwhile is not wiped (a
-             * plain store could, on any architecture) */
+            BAN_EXPIRY_OBSERVED(i);
+            /* Lazily expire by CAS from the value observed. The table is
+             * shared by every process: between the load and this store another
+             * checker can expire the slot and a setban claim it (a free slot is
+             * until==0) and publish a new ban there. A plain `until = 0` wiped
+             * that ban; the CAS leaves any value but the one we saw. */
             __sync_bool_compare_and_swap(&g_node_status->bans[i].until, until, 0);
             continue;
         }
@@ -1533,6 +1539,11 @@ static struct { char ip[64]; int score; } g_misbehavior[MISBEHAVIOR_SLOTS];
  * {score, ip} with no pointers and no allocation, so the worst case of a
  * reclaim mid-update is one garbled misbehaviour score -- a heuristic that is
  * already approximate -- rather than a corrupted structure.
+ *
+ * It also serialises the ban table's writers (ban_table_add, setban remove,
+ * clearbanned; 2026-09-26). A reclaim mid-claim leaves at worst a slot whose
+ * subnet was written and whose `until` -- published last -- was not: still
+ * free, never a half ban.
  *
  * The pid fits: mis_lock is an int and this is Linux, where pid_max is well
  * under INT_MAX. */
@@ -1832,10 +1843,24 @@ static long dl_reject_block(void* st, long h, const unsigned char hash[32], cons
  * PARTIAL: "scored ... not persisted across restart".
  *
  * Called after every mutation of g_node_status->bans[]; cheap (64 entries)
- * and rare (a ban, an unban, a clear). */
+ * and rare (a ban, an unban, a clear).
+ *
+ * Any process can call it (misbehaving() in a serve child, the worker's
+ * setban), so the snapshot, the write and the rename run under an flock on
+ * banlist.json.lock (2026-09-26). Without it two saves shared the one temp
+ * file -- a failed rename, or a torn file renamed into place -- and an
+ * OLDER snapshot could be renamed last, dropping the newer ban from disk.
+ * Under the lock whoever renames last also snapshotted last. flock, not
+ * mis_lock: this holds across an fsync, and the kernel drops it if the
+ * holder dies. BANLIST_SNAPSHOT_TAKEN is a test seam between the snapshot
+ * and the save (tests/test_banlist_persist_race). */
+#ifndef BANLIST_SNAPSHOT_TAKEN
+#define BANLIST_SNAPSHOT_TAKEN() ((void)0)
+#endif
 static void banlist_persist(void)
 {
     if (!g_node_status) return;
+    int lfd = banlist_lock();                   /* -1: save unlocked rather than not at all */
     static ban_entry_t snap[RPC_MAX_BANS];
     int n = 0;
     for (int i = 0; i < RPC_MAX_BANS; i++){
@@ -1845,8 +1870,10 @@ static void banlist_persist(void)
         snap[n].created = g_node_status->bans[i].created;
         n++;
     }
+    BANLIST_SNAPSHOT_TAKEN();
     if (banlist_save(snap, n) != 0)
         fprintf(stderr, "[ban] WARNING: could not write banlist.json -- bans will not survive a restart\n");
+    banlist_unlock(lfd);
 }
 /* the loader's sink: same table, same rules, no RPC round trip */
 int ctl_ban_add(const char* subnet, long long until);   /* defined just below */
@@ -1862,6 +1889,43 @@ static int banlist_restore_one(const char* subnet, long long until, long long cr
     return 1;
 }
 /* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
+/* Claim a free slot and publish a ban: 1 added, 0 already banned, -1 full.
+ *
+ * Every writer of the ban table comes through here, under mis_lock: this
+ * function (from misbehaving() in any process, and the banlist loader) and
+ * the worker's setban. Both used to scan for a free slot (until == 0) and
+ * then write it with no lock, so two processes banning at once could pick
+ * the same slot -- one ban lost, or published under the other's subnet
+ * (bmc_osx note-for-x86-2 item 6). The lock is held for the scan and the
+ * publish only; the caller persists after it is released. ctl_is_banned's
+ * lazy expiry stays lock-free: it only ever CASes an expired value to 0,
+ * which a claim under the lock can at worst not see yet.
+ *
+ * BAN_SLOT_CHOSEN is a test seam between the choice of a slot and its
+ * write (tests/test_ban_slot_claim); nothing in the daemon defines it. */
+#ifndef BAN_SLOT_CHOSEN
+#define BAN_SLOT_CHOSEN(slot) ((void)0)
+#endif
+static int ban_table_add(const char* subnet, long long until){
+    node_status_t* st = g_node_status;
+    mis_lock_acquire(st);
+    int slot = -1;
+    for(int i = 0; i < RPC_MAX_BANS; i++){
+        if(st->bans[i].until && !strcmp((const char*)st->bans[i].subnet, subnet)){
+            mis_lock_release(st); return 0;       /* already */
+        }
+        if(!st->bans[i].until && slot < 0) slot = i;
+    }
+    if(slot < 0){ mis_lock_release(st); return -1; }
+    BAN_SLOT_CHOSEN(slot);
+    snprintf((char*)st->bans[slot].subnet, 64, "%s", subnet);
+    st->bans[slot].created = (long long)time(NULL);
+    __sync_synchronize();
+    st->bans[slot].until = until;                /* published last */
+    mis_lock_release(st);
+    return 1;
+}
+
 int ctl_ban_add(const char* subnet, long long until){
     if(!g_node_status || !subnet || !*subnet) return 0;
     /* NET-17 (audit 2026-09-03): refuse a key enforcement can never match.
@@ -1883,18 +1947,80 @@ int ctl_ban_add(const char* subnet, long long until){
                           "(onion/I2P peers are dropped on violation, not banned)\n", subnet);
           return 0;
       } }
-    int slot = -1;
-    for(int i = 0; i < RPC_MAX_BANS; i++){
-        if(g_node_status->bans[i].until &&
-           !strcmp((const char*)g_node_status->bans[i].subnet, subnet)) return 0;  /* already */
-        if(!g_node_status->bans[i].until && slot < 0) slot = i;
-    }
-    if(slot < 0) return 0;                       /* list full: no silent evict */
-    snprintf((char*)g_node_status->bans[slot].subnet, 64, "%s", subnet);
-    g_node_status->bans[slot].created = (long long)time(NULL);
-    __sync_synchronize();
-    g_node_status->bans[slot].until = until;     /* published last */
+    if(ban_table_add(subnet, until) != 1) return 0;   /* already, or list full: no silent evict */
     banlist_persist(); return 1;
+}
+
+/* setban, from the worker's control channel (RPC_CTL_SETBAN): num == 0
+ * removes `arg`, otherwise bans it until `num`. Returns the channel's result
+ * (1 done, 0 no-op, -1 refused with `reason`). A function of its own so
+ * tests/test_banlist_persist_race can drive it. */
+static int ctl_setban(const char* arg, long long num, char* reason, size_t rlen){
+    int result = 0;
+    if(num == 0){                                  /* remove */
+        /* under mis_lock, like every claim (ban_table_add): the
+         * slot matched here cannot be re-claimed for another
+         * subnet before this store */
+        mis_lock_acquire(g_node_status);
+        for(int i = 0; i < RPC_MAX_BANS; i++)
+            if(g_node_status->bans[i].until &&
+               !strcmp((const char*)g_node_status->bans[i].subnet, arg)){
+                g_node_status->bans[i].until = 0;
+                result = 1; break;
+            }
+        mis_lock_release(g_node_status);
+        if(result == 1) banlist_persist();
+    } else {
+        /* ---- RPC-8 (audit 2026-09-03) ----
+         * This used to refuse any prefix that was not a multiple
+         * of 8 in [8,32], claiming the matcher could not enforce
+         * it. That was true of the OLD string-comparing matcher
+         * and has been false since subnet.c landed:
+         * subnet_parse/subnet_covers handle any prefix 0..128 for
+         * both families, and ctl_ban_covers is a one-line
+         * passthrough to them. tests/test_subnet.c already proves
+         * /28, /12, /20 and IPv6 including ::/0.
+         *
+         * Worse, the rule read the prefix without looking at the
+         * family, so it ACCEPTED 2001:db8::/32 while refusing
+         * ::1/128 and 2001:db8::/64 -- the exact inversion the
+         * comment above ctl_ban_covers says was fixed.
+         *
+         * Now: parse it. An unparseable spec is refused (Core
+         * raises -30 at the RPC, which cmd_setban also does now);
+         * anything the matcher can actually evaluate is allowed. */
+        subnet_t sn_probe;
+        if(!subnet_parse(arg, &sn_probe)){
+            result = -1;
+            snprintf(reason, rlen,
+                     "not a valid IP or subnet: %s", arg);
+        } else {
+            int added = ban_table_add(arg, num);   /* claims under mis_lock */
+            if(added == 0) result = 0;             /* already banned */
+            else if(added < 0){
+                result = -1;
+                snprintf(reason, rlen, "the ban list is full (%d)", RPC_MAX_BANS);
+            } else {
+                /* drop any live leg the new ban now covers */
+                for(int i = 0; i < mux_n_out; i++){
+                    if(mux_out_fd[i] < 0) continue;
+                    char ip[128]; ctl_ip_only(mux_out_host[i], ip, sizeof ip);
+                    if(ctl_ban_covers(arg, ip)){
+                        char d[96]; snprintf(d, sizeof d, "setban %s now covers this address", arg);
+                        leg_close_ours(i, "banned", d);
+                        g_node_status->peers[i].used = 0;
+                    }
+                }
+                fprintf(stderr,"[ctl] banned %s until %lld\n", arg, num);
+                /* Core's setban writes banlist.json (banman.cpp Ban ->
+                 * DumpBanlist). This path never did: a setban survived a
+                 * restart only if some later change happened to persist it. */
+                banlist_persist();
+                result = 1;
+            }
+        }
+    }
+    return result;
 }
 
 /* Score a peer for a protocol violation. Returns 1 if this call banned it,
@@ -3878,8 +4004,10 @@ static int dh_start_slot(const char* host, int out_port, int want_slot){
         }
         (void)!sendmsg(sp[1], &mh, 0);
         if(r.v2_len){ unsigned long off = 0; while(off < r.v2_len){ ssize_t w = write(sp[1], blob + off, r.v2_len - off); if(w <= 0) break; off += (unsigned long)w; } }
-        /* Hold on until the worker has the fd: dh_poll closes its end after
-         * the recvmsg, which wakes this poll. On Darwin a socket passed with
+        /* Hold on until the worker has the fd: dh_poll writes one byte and
+         * closes its end after the recvmsg, and the byte wakes this poll even
+         * when another process still holds that end (2026-09-25; the close
+         * alone did not, see dh_poll). On Darwin a socket passed with
          * SCM_RIGHTS arrives DEAD (EOF + HUP, its buffered bytes discarded)
          * when the sender exits before the receiver's recvmsg; the worker
          * collects results once per rotation, so exiting right after the
@@ -4077,7 +4205,15 @@ static int dh_poll(dh_result_t* out, int* fd_out, char* host_out, size_t hcap){
                 if(!out->ok && *fd_out >= 0){ close(*fd_out); *fd_out = -1; }
             }
         } else if(n != (ssize_t)sizeof *out){ out->ok = 0; snprintf(out->why, sizeof out->why, "helper exited without a result"); }
-        close(g_dh[i].sp);                              /* first: the helper waits for this close before it exits */
+        /* Tell the helper it may go: one byte, THEN the close (2026-09-25). The close alone
+         * wakes it only if no other process holds this end, and any child the worker forks
+         * while the dial is in flight -- a pass helper for a block announced mid-dial, on
+         * mainnet -- inherits it. The helper then slept on, and the reap below sat out its
+         * full 5 s in the worker's rotation ("worker received" 13:56:00.233, "leg replaced"
+         * 13:56:05.283). A byte is POLLIN whoever else holds the socket. NOSIGNAL: a helper
+         * already gone must not SIGPIPE the worker. Pinned by tests/test_dialhelper.c 1e. */
+        (void)!send(g_dh[i].sp, "k", 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+        close(g_dh[i].sp);
         { int st; if(!dl_reap_bounded(g_dh[i].pid, &st, 5000)) dl_kill_reap(g_dh[i].pid, &st, "dial helper"); }
         g_dh[i].pid = 0; g_dh[i].sp = -1; g_dh_last_slot = g_dh[i].want_slot;
         snprintf(host_out, hcap, "%s", g_dh[i].host);
@@ -9038,71 +9174,11 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     if(rc == 1) fprintf(stderr,"[ctl] addpeeraddress: %s -> book (%s)\n", arg, bmc_net_name(a.net));
                 }
             } else if(op == RPC_CTL_SETBAN){
-                if(num == 0){                                  /* remove */
-                    for(int i = 0; i < RPC_MAX_BANS; i++)
-                        if(g_node_status->bans[i].until &&
-                           !strcmp((const char*)g_node_status->bans[i].subnet, arg)){
-                            g_node_status->bans[i].until = 0;
-                            result = 1; break;
-                        }
-                    if(result == 1) banlist_persist();
-                } else {
-                    /* ---- RPC-8 (audit 2026-09-03) ----
-                     * This used to refuse any prefix that was not a multiple
-                     * of 8 in [8,32], claiming the matcher could not enforce
-                     * it. That was true of the OLD string-comparing matcher
-                     * and has been false since subnet.c landed:
-                     * subnet_parse/subnet_covers handle any prefix 0..128 for
-                     * both families, and ctl_ban_covers is a one-line
-                     * passthrough to them. tests/test_subnet.c already proves
-                     * /28, /12, /20 and IPv6 including ::/0.
-                     *
-                     * Worse, the rule read the prefix without looking at the
-                     * family, so it ACCEPTED 2001:db8::/32 while refusing
-                     * ::1/128 and 2001:db8::/64 -- the exact inversion the
-                     * comment above ctl_ban_covers says was fixed.
-                     *
-                     * Now: parse it. An unparseable spec is refused (Core
-                     * raises -30 at the RPC, which cmd_setban also does now);
-                     * anything the matcher can actually evaluate is allowed. */
-                    subnet_t sn_probe;
-                    if(!subnet_parse(arg, &sn_probe)){
-                        result = -1;
-                        snprintf(reason, sizeof reason,
-                                 "not a valid IP or subnet: %s", arg);
-                    } else {
-                        int dup = 0, slot = -1;
-                        for(int i = 0; i < RPC_MAX_BANS; i++){
-                            if(g_node_status->bans[i].until &&
-                               !strcmp((const char*)g_node_status->bans[i].subnet, arg)) dup = 1;
-                            if(!g_node_status->bans[i].until && slot < 0) slot = i;
-                        }
-                        if(dup) result = 0;
-                        else if(slot < 0){
-                            result = -1;
-                            snprintf(reason, sizeof reason, "the ban list is full (%d)", RPC_MAX_BANS);
-                        } else {
-                            snprintf((char*)g_node_status->bans[slot].subnet, 64, "%s", arg);
-                            g_node_status->bans[slot].created = (long long)time(NULL);
-                            __sync_synchronize();
-                            g_node_status->bans[slot].until = num;   /* published last */
-                            /* drop any live leg the new ban now covers */
-                            for(int i = 0; i < mux_n_out; i++){
-                                if(mux_out_fd[i] < 0) continue;
-                                char ip[128]; ctl_ip_only(mux_out_host[i], ip, sizeof ip);
-                                if(ctl_ban_covers(arg, ip)){
-                                    char d[96]; snprintf(d, sizeof d, "setban %s now covers this address", arg);
-                                    leg_close_ours(i, "banned", d);
-                                    g_node_status->peers[i].used = 0;
-                                }
-                            }
-                            fprintf(stderr,"[ctl] banned %s until %lld\n", arg, num);
-                            result = 1;
-                        }
-                    }
-                }
+                result = ctl_setban(arg, num, reason, sizeof reason);
             } else if(op == RPC_CTL_CLEARBANNED){
+                mis_lock_acquire(g_node_status);        /* no claim half-done under the clear */
                 for(int i = 0; i < RPC_MAX_BANS; i++) g_node_status->bans[i].until = 0;
+                mis_lock_release(g_node_status);
                 fprintf(stderr,"[ctl] ban list cleared\n");
                 banlist_persist();
                 result = 1;

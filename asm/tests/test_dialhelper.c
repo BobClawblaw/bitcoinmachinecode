@@ -217,6 +217,36 @@ int main(void){
       for (int i = 0; i < 100 && dh_inflight_count(); i++){ dh_poll(&r4, &fd4, h4, sizeof h4); usleep(50000); }
       ok(dh_inflight_count() == 0, "the helper drained"); }
 
+    printf("== 1e. any child forked during a dial: the helper is still woken ==\n");
+    /* mainnet, 2026-09-25 (after 1c's fix): a block arrived mid-dial and the worker forked a
+     * PASS helper, which inherited the worker's end of the dial helper's socketpair. 1c only
+     * taught DIAL helpers to drop what they inherit, so dh_poll's close() again woke nobody
+     * and the reap sat out its 5 s ("worker received" 13:56:00.233, "leg replaced"
+     * 13:56:05.283). Whatever else the worker forks, the helper must still be told. */
+    { int l5 = socket(AF_INET, SOCK_STREAM, 0); setsockopt(l5, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+      struct sockaddr_in s5; memset(&s5, 0, sizeof s5); s5.sin_family = AF_INET; s5.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      bind(l5, (struct sockaddr*)&s5, sizeof s5); listen(l5, 4); socklen_t a5 = sizeof s5; getsockname(l5, (struct sockaddr*)&s5, &a5);
+      pid_t fp5 = fork(); if (fp5 == 0){ int c = accept(l5, NULL, NULL); if (c >= 0) fake_peer(c); _exit(0); }
+      char h5[64]; snprintf(h5, sizeof h5, "127.0.0.1:%d", ntohs(s5.sin_port));
+      dial_helper_test_set_timeout_ms(20000);
+      ok(dh_start(h5, ntohs(s5.sin_port)) == 1, "helper started");
+      pid_t pass = fork();                               /* the stand-in pass helper: holds everything it inherited */
+      if (pass == 0){ sleep(15); _exit(0); }
+      usleep(800000);                                    /* the helper has handed over and is waiting */
+      dh_result_t r5; int fd5 = -1; char hh5[128]; int got5 = 0; double took = 0;
+      for (int i = 0; i < 100 && !got5; i++){
+          struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+          got5 = dh_poll(&r5, &fd5, hh5, sizeof hh5);
+          clock_gettime(CLOCK_MONOTONIC, &t1);
+          if (got5) took = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9; else usleep(50000);
+      }
+      ok(got5 && r5.ok == 1 && fd5 >= 0, "the dial landed");
+      printf("     dh_poll that returned it: %.3f s\n", took);
+      ok(took < 1.0, "collecting it did not sit out the 5 s reap behind a child that holds the worker's end");
+      if (fd5 >= 0) close(fd5);
+      kill(pass, SIGKILL); waitpid(pass, NULL, 0);
+      close(l5); }
+
     printf("== 2. a dial that never completes is given up, not waited for ==\n");
     dial_helper_test_set_timeout_ms(1500);
     ok(dh_start("198.51.100.1:8333", 8333) == 1, "helper started against a blackhole");
