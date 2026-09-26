@@ -27,13 +27,21 @@ static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l
 
 static int  g_exit_code = 0;                 /* what the next child exits with */
 static int  g_spawns, g_last_kind; static long g_last_from, g_last_to;
+/* 2026-09-25: the stub child is HELD until the test releases it. It used to
+ * _exit at once, so "a running child is left alone" raced the child's exit:
+ * when the child won, the very next tick reaped it, reported the run and
+ * spawned the next build, and every later "reported" count was off by one
+ * (7 failures, 10 of 20 standalone runs on a loaded box). Now the child
+ * blocks on a pipe; tick_until_reaped releases it (closes the write end). */
+static int g_hold_fd = -1;                   /* write end holding the current child */
+static void release_child(void){ if (g_hold_fd >= 0){ close(g_hold_fd); g_hold_fd = -1; } }
 static pid_t stub_spawn(const itrail_t* t, int kind, long from, long to){
     (void)t; g_spawns++; g_last_kind = kind; g_last_from = from; g_last_to = to;
-    /* the child lives 50 ms so "a running child is left alone" is observable:
-     * one that exits at once is already dead by the next tick wherever the
-     * child runs first after fork (macOS), and that tick reaps it and
-     * spawns again (test_index_repair's stub lives 150 ms for the same reason) */
-    pid_t p = fork(); if (p == 0){ usleep(50000); _exit(g_exit_code); } return p;
+    int pp[2]; if (pipe(pp) != 0){ perror("pipe"); exit(2); }
+    pid_t p = fork();
+    if (p == 0){ close(pp[1]); char c; ssize_t r = read(pp[0], &c, 1); (void)r; _exit(g_exit_code); }
+    close(pp[0]); release_child(); g_hold_fd = pp[1];
+    return p;
 }
 static long g_runs_reported[16]; static int g_nreported;
 static void on_run(long to, void* ctx){ (void)ctx; if (g_nreported < 16) g_runs_reported[g_nreported] = to; g_nreported++; }
@@ -44,6 +52,7 @@ static int tick_until_reaped(itrail_t* t, long covered, int nruns, long applied,
      * the supervisor would read the child as gone-without-status. (The first
      * draft did exactly that, and every failure case passed as a success.) */
     int st = t->state; pid_t was = t->pid;
+    release_child();                         /* let the held child exit now */
     /* stop at the tick that reaped THIS child -- that tick may already have
      * spawned the next one, which is the supervisor's business, not ours */
     for (int i = 0; i < 2000 && t->pid == was; i++){ usleep(1000); *now += 1; st = it_tick(t, covered, nruns, applied, *now, on_run, 0); }

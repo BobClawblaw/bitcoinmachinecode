@@ -9,6 +9,8 @@ typedef struct {
 } ban_entry_t;
 /* replace banlist.json atomically (tmp + fsync + rename + dir fsync); 0 = ok */
 int banlist_save(const ban_entry_t* e, int n);
+int banlist_lock(void);          /* flock banlist.json.lock; fd, or -1 */
+void banlist_unlock(int fd);
 /* load, dropping already-expired entries; returns how many were handed to add() */
 int banlist_load(long long now, int (*add)(const char* subnet, long long until, long long created));
 #endif

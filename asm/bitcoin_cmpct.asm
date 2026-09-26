@@ -754,10 +754,20 @@ cmpctblock_build:
     test rdx, rdx
     jz   .cb_fail
     mov  [rbp-0x50], rax   ; ntx
-    lea  rax, [rax-1]
-    mov  byte [r12+88], al
-    lea  rax, [r12+89]     ; sid ptr
-    mov  [rbp-0x48], rax
+    lea  rax, [rax-1]      ; nshort, as a real CompactSize (BIP152)
+    cmp  rax, 0xfd
+    jae  .cb_cs3
+    mov  byte [r12+88], al ; < 0xfd: one byte
+    lea  rax, [r12+89]
+    jmp  .cb_cs_done
+.cb_cs3:
+    cmp  rax, 0xffff       ; no real block has more (1 MB non-witness / ~60-byte tx); ntx=0 lands here too
+    ja   .cb_fail
+    mov  byte [r12+88], 0xfd
+    mov  word [r12+89], ax ; u16 LE
+    lea  rax, [r12+91]
+.cb_cs_done:
+    mov  [rbp-0x48], rax   ; sid ptr
     mov  qword [rbp-0x40], 1  ; i = 1 (short-id tx index)
 .cbloop:
     mov  rax, [rbp-0x40]
