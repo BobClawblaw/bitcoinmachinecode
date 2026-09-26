@@ -157,8 +157,9 @@ static void tagged_hash(const char *tag, unsigned long taglen,
 
 static const char CHALLENGE_TAG[] = "BIP0340/challenge";
 
-/* forward decl of the x-eq-r helper (defined below) */
-static int schnorr_x_eq_r_pub(const u64 r[4], const u64 X[4], const u64 Z[4]);
+/* forward decl of the x-eq-r helper (defined below; exported under the x86
+ * name so test_schnorr_diff can drive the very compare the verifier uses) */
+int schnorr_x_eq_r(const u64 r[4], const u64 X[4], const u64 Z[4]);
 
 int schnorr_verify(const unsigned char sig[64], const unsigned char pub_xonly[32],
                    const unsigned char *msg, int msglen)
@@ -232,7 +233,7 @@ int schnorr_verify(const unsigned char sig[64], const unsigned char pub_xonly[32
     point_add(RPT, SG, EP);
     if ((RPT[8] | RPT[9] | RPT[10] | RPT[11]) == 0) return 0;
 
-    if (!schnorr_x_eq_r_pub(rL, RPT, RPT + 8)) return 0;
+    if (!schnorr_x_eq_r(rL, RPT, RPT + 8)) return 0;
 
     /* y(R) must be even: yr = Y * Z^{-3}; test bit 0 */
     fe_inv(zi, RPT + 8);
@@ -244,8 +245,10 @@ int schnorr_verify(const unsigned char sig[64], const unsigned char pub_xonly[32
     return 1;
 }
 
-/* x(R) == r (mod n), projective: r*Z^2 == X (mod p) */
-static int schnorr_x_eq_r_pub(const u64 r[4], const u64 X[4], const u64 Z[4])
+/* x(R) == r (mod n), projective: r*Z^2 == X (mod p) -> 1 / 0. Exported as
+ * x86's secp256k1_schnorr.asm exports it (it was a static, so the Mac could
+ * not run test_schnorr_diff: 2026-09-26). */
+int schnorr_x_eq_r(const u64 r[4], const u64 X[4], const u64 Z[4])
 {
     u64 t[4], lhs[4];
     fe_sqr(t, Z);
