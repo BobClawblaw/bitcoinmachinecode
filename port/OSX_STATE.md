@@ -4,6 +4,37 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-26 — the native test sweep: every gated test runs on the Mac, bar 14 that are x86-only by nature
+
+The phase-4 sweep (every `./tests/*` command of `make test`, built natively against `port/osx/daemon_out`) is worked through. Real bugs it found today, all fixed:
+
+- **Mac port:**
+  - `node_log_open` used Linux open flags and AT_FDCWD (every open failed);
+  - no robust mempool lock on Darwin (MEM-20);
+  - `utxo_prefetch` was a no-op: 210 → 78 ns per memtable miss once it was implemented.
+- **Shared code:**
+  - `wallet_cli`'s passphrase prompt dropped an answer typed right after it (TCSAFLUSH after the prompt);
+  - `addr_hist` was not thread-safe under concurrent Esplora `/address`;
+  - `getmemoryinfo "mallocinfo"` now refuses as Core does without glibc.
+- **Missing twins:** `cli_main`, `multisig_verify`/`p2sh_hash`, an exported `schnorr_x_eq_r`, and `utxo_prefetch_n`.
+
+Test-only stand-ins live in `port/osx/test_support/`, outside the daemon build:
+
+- the frozen field, point and ECDSA references;
+- the fe-inline probe;
+- the bad-sparse LSM variant;
+- the AAPCS64 callee-saved probe (19 registers).
+
+The ABI audits, `test_abi_stack_align`, `test_elf_hardening` (Mach-O) and `test_mpool_get_once` (load emulation, no ptrace) have Darwin branches that check the same property.
+
+**Environment prerequisite.** `test_mux_dial_gate`, `test_dlc_interleave` and `test_dlc_wire_bytes` need distinct loopback IPs, and macOS answers only 127.0.0.1. Without aliases they SKIP with the command; with `sudo ifconfig lo0 alias 127.0.0.{2,3,4} up` all three pass (verified 2026-09-26, aliases removed afterwards).
+
+**x86-only by nature (not run on the Mac).** Each of these checks an x86 ASSEMBLY TWIN, bug for bug, against the C function it was converted from. No production code calls any of these twins on either platform (`txv_parse_asm`'s only reference is a test hook in `tx_verify.c`). Both daemons run the C side, which is covered on the Mac by its own tests.
+
+- `test_txv_parse_diff`, `test_txv_classify_diff`, `test_segwit_classify_diff`, `test_txvb_parse_diff`, `test_txv_pools_diff`, `test_tapagg_diff`, `test_txv_dispatch_diff`
+- `test_wv0_drv_diff`, `test_svs_drv_diff`, `test_checksig_diff`, `test_bip143_diff`, `test_taproot_verify_diff`, `test_bip341_diff`
+- `test_undo_asm_diff`: `bitcoin_undo.asm` against a frozen copy of the pre-rev-file `undo_log.c`. Both daemons now link `daemon/undo_log.c`, whose on-disk format moved to Core-style rev files in ec2979c2.
+
 ## 2026-09-25 (evening) — phase 4: the UTXO set is identical to Core's; three real bugs fixed, one repaired in production
 
 - Attested against a local Bitcoin Core at mainnet 968,570: all five fields
