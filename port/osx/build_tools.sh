@@ -37,7 +37,7 @@ ok=0; fail=0; failed=""
 for t in $TOOLS; do
     case "$t" in
       bmc_wallet_cli)                                   # its own script (build_wallet_cli.sh)
-        bash ../port/osx/build_wallet_cli.sh >/dev/null 2>&1 && cp "$OUT/bmc_wallet_cli" daemon/ \
+        bash ../port/osx/build_wallet_cli.sh >/dev/null 2>&1 && rm -f daemon/bmc_wallet_cli && cp "$OUT/bmc_wallet_cli" daemon/ \
             && { echo "  ok   $t"; ok=$((ok+1)); } || { echo "  FAIL $t (build_wallet_cli.sh)"; fail=$((fail+1)); failed="$failed $t"; }
         continue;;
     esac
@@ -62,6 +62,8 @@ for t in $TOOLS; do
     fi
 done
 # the daemon itself, where the tests that start one look for it
-[ $# -eq 0 ] && [ "$PREFIX" = daemon ] && cp "$OUT/bmcbitcoind" daemon/bmcbitcoind && echo "  ok   bmcbitcoind (copied from daemon_out)"
+# rm first: cp over an existing binary keeps its inode, and Apple silicon then
+# SIGKILLs it at launch (the cached code signature no longer matches)
+[ $# -eq 0 ] && [ "$PREFIX" = daemon ] && rm -f daemon/bmcbitcoind && cp "$OUT/bmcbitcoind" daemon/bmcbitcoind && echo "  ok   bmcbitcoind (copied from daemon_out)"
 echo "built $ok, failed $fail${failed:+:$failed}"
 [ $fail -eq 0 ]

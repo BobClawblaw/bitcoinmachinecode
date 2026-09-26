@@ -625,8 +625,14 @@ static int secret_prompt(const char* what, char* out, int cap) {
         if (!tty) return 0;
         int fd = fileno(tty);
         struct termios old, raw; int have = tcgetattr(fd, &old) == 0;
-        fprintf(tty, "Passphrase for %s: ", what); fflush(tty);
+        /* Echo off BEFORE the prompt, as readpassphrase(3) does. TCSAFLUSH
+         * discards unread input, so doing it after the prompt threw away an
+         * answer that arrived in between (a fast typist, a paste, a script
+         * answering the prompt it just saw) and then waited forever for it
+         * -- test_cli_prompt hung on exactly that under load (2026-09-26).
+         * Flushing first only drops stale type-ahead from before the prompt. */
         if (have) { raw = old; raw.c_lflag &= ~(tcflag_t)ECHO; tcsetattr(fd, TCSAFLUSH, &raw); }
+        fprintf(tty, "Passphrase for %s: ", what); fflush(tty);
         char* r = fgets(out, cap, tty);
         if (have) tcsetattr(fd, TCSAFLUSH, &old);
         fputc('\n', tty); fclose(tty);
