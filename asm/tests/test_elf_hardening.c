@@ -18,6 +18,62 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#ifdef __APPLE__
+/* ---- the Mac build: the same two regressions, in Mach-O terms ----------
+ *   executable stack  -> the MH_ALLOW_STACK_EXECUTION header flag must be
+ *                        clear (and the image must be PIE);
+ *   BIND_NOW / RELRO  -> no lazy binding (chained fixups bind every import at
+ *                        load; with classic dyld info, lazy_bind_size must be
+ *                        0), and the fixed-up pointers live in a __DATA_CONST
+ *                        segment flagged SG_READ_ONLY, which dyld makes
+ *                        read-only once fixups are done. */
+#include <mach-o/loader.h>
+static int fails = 0;
+static void ck(const char* l, int c){ if (c) printf("  ok  %s\n", l); else { printf("  FAIL %s\n", l); fails++; } }
+int main(int argc, char** argv){
+    const char* path = argc > 1 ? argv[1] : "daemon/bmcbitcoind";
+    FILE* f = fopen(path, "rb");
+    if (!f){ printf("  FAIL cannot open %s\n", path); return 1; }
+    if (fseek(f, 0, SEEK_END)) { fclose(f); return 1; }
+    long sz = ftell(f); rewind(f);
+    unsigned char* b = malloc((size_t)sz);
+    if (!b || fread(b, 1, (size_t)sz, f) != (size_t)sz){ printf("  FAIL read %s\n", path); fclose(f); return 1; }
+    fclose(f);
+    const struct mach_header_64* mh = (const struct mach_header_64*)b;
+    if (sz < (long)sizeof *mh || mh->magic != MH_MAGIC_64){ printf("  FAIL %s is not a thin 64-bit Mach-O\n", path); return 1; }
+
+    printf("== the stack is not executable ==\n");
+    ck("MH_ALLOW_STACK_EXECUTION is NOT set", !(mh->flags & MH_ALLOW_STACK_EXECUTION));
+    ck("  and the image is position independent (MH_PIE)", (mh->flags & MH_PIE) != 0);
+
+    printf("== relocations are read-only and bound at load ==\n");
+    int chained = 0, dyldinfo = 0, lazy = 0, dconst = 0, dconst_ro = 0;
+    const unsigned char* p = b + sizeof *mh;
+    for (uint32_t i = 0; i < mh->ncmds && p + sizeof(struct load_command) <= b + sz; i++){
+        const struct load_command* lc = (const struct load_command*)p;
+        if (lc->cmd == LC_DYLD_CHAINED_FIXUPS) chained = 1;
+        if (lc->cmd == LC_DYLD_INFO || lc->cmd == LC_DYLD_INFO_ONLY){
+            dyldinfo = 1;
+            if (((const struct dyld_info_command*)lc)->lazy_bind_size) lazy = 1;
+        }
+        if (lc->cmd == LC_SEGMENT_64){
+            const struct segment_command_64* sg = (const struct segment_command_64*)lc;
+            if (!strncmp(sg->segname, "__DATA_CONST", 16)){ dconst = 1; if (sg->flags & SG_READ_ONLY) dconst_ro = 1; }
+        }
+        if (!lc->cmdsize) break;
+        p += lc->cmdsize;
+    }
+    ck("every import is bound at load: chained fixups, or no lazy-bind info (the BIND_NOW analogue)",
+       chained || (dyldinfo && !lazy));
+    ck("a __DATA_CONST segment exists", dconst);
+    ck("  and is SG_READ_ONLY, read-only after fixups (the RELRO analogue)", dconst_ro);
+
+    free(b);
+    if (fails) printf("\nFAILURES: %d\n", fails);
+    else printf("\nALL TESTS PASSED (0 failures)\n");
+    return fails ? 1 : 0;
+}
+#else
 #include <elf.h>
 
 static int fails = 0;
@@ -77,3 +133,4 @@ int main(int argc, char** argv){
     else printf("\nALL TESTS PASSED (0 failures)\n");
     return fails ? 1 : 0;
 }
+#endif

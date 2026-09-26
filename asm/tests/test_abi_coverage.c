@@ -59,7 +59,7 @@ typedef uint64_t u64;
 typedef uint8_t  u8;
 
 extern long bench_abi_probe(void* fn, const unsigned long args[6],
-                            unsigned long got[6]);
+                            unsigned long got[]);   /* got[ABI_NREG] */
 
 /* Addresses only -- bench_abi_probe builds the real argument registers. */
 extern void fe_add(void); extern void fe_sub(void); extern void fe_mul(void);
@@ -81,19 +81,32 @@ extern void block_work(void); extern void chainwork_add(void);
 extern void chainwork_cmp(void); extern void u256_div(void);
 extern void hash160(void); extern void base58check_encode(void);
 
-static const char* RN[6] = { "rbx", "rbp", "r12", "r13", "r14", "r15" };
+#if defined(__aarch64__)
+/* AAPCS64 (the Mac): x19..x28, x29 and d8..d15 -- port/osx/test_support/
+ * bench_abi_guard_twin.S loads sentinel i = 0x0101010101010101*(i+1) */
+#define ABI_NREG 19
+static const char* RN[ABI_NREG] = { "x19","x20","x21","x22","x23","x24","x25","x26","x27","x28","x29",
+                                    "d8","d9","d10","d11","d12","d13","d14","d15" };
+#define ABI_SENT(i) (0x0101010101010101UL * (unsigned long)((i)+1))
+#define ABI_REGS_TEXT "x19-x28, x29 and d8-d15"
+#else
+#define ABI_NREG 6
+static const char* RN[ABI_NREG] = {"rbx","rbp","r12","r13","r14","r15"};
+#define ABI_SENT(i) (0x1111111111111111UL * (unsigned long)((i)+1))
+#define ABI_REGS_TEXT "rbx, rbp, r12-r15"
+#endif
 static int g_clean = 0, g_bad = 0;
 
 static void probe6(const char* name, void* fn,
                    u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5)
 {
     unsigned long args[6] = { a0, a1, a2, a3, a4, a5 };
-    unsigned long got[6];
+    unsigned long got[ABI_NREG];
     long bad = bench_abi_probe(fn, args, got);
     if (!bad){ g_clean++; return; }
     printf("  FAIL %-22s CLOBBERS", name);
-    for (int i = 0; i < 6; i++)
-        if (got[i] != (0x1111111111111111UL * (unsigned long)(i+1)))
+    for (int i = 0; i < ABI_NREG; i++)
+        if (got[i] != ABI_SENT(i))
             printf(" %s", RN[i]);
     printf("   ABI VIOLATION\n");
     g_bad++;
@@ -132,7 +145,7 @@ int main(void)
     memcpy(r12b, r12a, 96);
 
     printf("callee-saved sentinel probe over the consensus crypto layer\n");
-    printf("  (rbx, rbp, r12-r15 must survive every call)\n\n");
+    printf("  (" ABI_REGS_TEXT " must survive every call)\n\n");
 
     /* ---- field ---- */
     P4("fe_add",  fe_add,  f2, f0, f1, 0);
