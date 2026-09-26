@@ -1456,13 +1456,28 @@ void bmc_alert_deliver(const char* msg){
     if (g_cfg.alertnotify[0]) notify_run(g_cfg.alertnotify, msg, "alertnotify");
 }
 
+/* Test seam: runs between the load of an expired `until` and its expiry
+ * store (tests/test_ban_expiry_race). Nothing in the daemon defines it. */
+#ifndef BAN_EXPIRY_OBSERVED
+#define BAN_EXPIRY_OBSERVED(i) ((void)0)
+#endif
 int ctl_is_banned(const char* ip){
     if(!g_node_status) return 0;
     long long now = (long long)time(NULL);
     for(int i = 0; i < RPC_MAX_BANS; i++){
-        if(!g_node_status->bans[i].until) continue;
-        if(g_node_status->bans[i].until <= now){
-            g_node_status->bans[i].until = 0;      /* lazily expire */
+        /* `until` is published last, after a full barrier (ctl_ban_add, the
+         * worker's setban); an acquire load keeps the subnet read below behind
+         * it (a no-op on x86, needed on ARM -- bmc_osx 0e916bca). */
+        long long until = __atomic_load_n(&g_node_status->bans[i].until, __ATOMIC_ACQUIRE);
+        if(!until) continue;
+        if(until <= now){
+            BAN_EXPIRY_OBSERVED(i);
+            /* Lazily expire by CAS from the value observed. The table is
+             * shared by every process: between the load and this store another
+             * checker can expire the slot and a setban claim it (a free slot is
+             * until==0) and publish a new ban there. A plain `until = 0` wiped
+             * that ban; the CAS leaves any value but the one we saw. */
+            __sync_bool_compare_and_swap(&g_node_status->bans[i].until, until, 0);
             continue;
         }
         if(ctl_ban_covers((const char*)g_node_status->bans[i].subnet, ip)) return 1;
