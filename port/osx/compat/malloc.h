@@ -8,9 +8,8 @@
 #include <stdio.h>
 #include <sys/types.h>
 
-/* glibc declares this in <malloc.h>; the implementation is the failure stub
- * in port/osx/darwin_stubs.c (no macOS equivalent -- the RPC refuses). */
-int malloc_info(int options, FILE* stream);
+/* (malloc_info is not declared: rpc_commands.c only calls it under
+ * __GLIBC__ and refuses the mode elsewhere, as Core does on macOS.) */
 
 /* Linux getrandom(2) -> arc4random_buf (CSPRNG, no fd, no EINTR) */
 static inline long bmc_getrandom_shim(void* buf, size_t n, unsigned flags)

@@ -123,8 +123,13 @@ int main(void){
 
     /* ---- getmemoryinfo ------------------------------------------------- */
     { rj_val* r = call("getmemoryinfo", "[\"mallocinfo\"]", &ec, &em);
+#ifdef __GLIBC__
       ck("mallocinfo returns real glibc XML",
          r && r->typ == RJ_STR && strstr(r->str, "<malloc"));
+#else
+      ck("mallocinfo without glibc is refused as Core refuses it (-8 \"mallocinfo mode not available\")",
+         r == NULL && ec == -8 && em && !strcmp(em, "mallocinfo mode not available"));
+#endif
       rj_free(r); }
     { rj_val* r = call("getmemoryinfo", "[]", &ec, &em);
       ck("the default \"stats\" mode is refused, naming the absent secure allocator",
