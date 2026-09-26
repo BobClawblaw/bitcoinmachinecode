@@ -17,7 +17,166 @@
  * after the checked load. The returned pointer must then be the checked
  * one: the test fails if it points anywhere else, in particular past the
  * blob mapping.
+ *
+ * ON THE MAC (Apple silicon) the same race is driven without a debugger:
+ * reading a child's registers there needs task_for_pid, which only a
+ * debugger-entitled or root process gets. Instead, in one process:
+ *   - the pool is mapped TWICE from one file: mpool_get runs on a view whose
+ *     pages are PROT_NONE, the test keeps a readable view of the same bytes;
+ *   - every load mpool_get makes from the pool faults, and a SIGBUS/SIGSEGV
+ *     handler EMULATES it: decodes the AArch64 load at the faulting pc (the
+ *     two forms the Mac mpool_get and its memcmp32 use on the pool -- LDR
+ *     unsigned-immediate and LDR register-offset -- anything else aborts
+ *     loudly), reads the value through the readable view, writes the
+ *     destination register in the signal context and steps pc past it;
+ *   - the FIRST read of the slot's blob_off answers the checked value, every
+ *     later read answers the moved one -- the record moving between two
+ *     loads, deterministically, with no timing involved.
+ * A control arm runs a four-instruction routine that re-loads blob_off after
+ * checking it (the old bug) under the same handler and must come back with
+ * the moved pointer, so the harness is shown to catch what it looks for.
  */
+#if defined(__APPLE__) && defined(__aarch64__)
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/ucontext.h>
+#include "test_tmpdir.h"
+
+extern unsigned long mpool_struct_size(unsigned long slots);
+extern void mpool_init(void* mp, unsigned long slots, void* blob, unsigned long blob_cap);
+extern long mpool_put(void* mp, const unsigned char txid[32], const unsigned char* tx, unsigned long txlen);
+extern const unsigned char* mpool_get(void* mp, const unsigned char txid[32], unsigned long* out_len);
+
+static int fails = 0, checks = 0;
+static void ck(const char* w, int c){ checks++; if (c) printf("ok  : %s\n", w); else { printf("FAIL: %s\n", w); fails++; } }
+
+#define SLOTS     64ul
+#define BLOB_CAP  (1ul << 18)
+#define TXLEN     100ul
+#define GOOD_OFF  0x2a5c3ul          /* distinctive, and GOOD_OFF + TXLEN <= BLOB_CAP */
+#define BAD_OFF   0x7fff0000ul       /* far past the blob mapping */
+
+/* the two views, the watched word, and what the handler saw */
+static unsigned char *g_prot, *g_open;          /* PROT_NONE view (mpool_get's), readable view */
+static size_t g_len;
+static uintptr_t g_watch;                        /* &blob_off in the protected view */
+static volatile int g_watch_reads, g_emulated, g_unknown;
+
+static uint64_t* xreg(ucontext_t* uc, unsigned n){   /* x0..x30; n == 31 handled by callers */
+    if (n < 29) return (uint64_t*)&uc->uc_mcontext->__ss.__x[n];
+    if (n == 29) return (uint64_t*)&uc->uc_mcontext->__ss.__fp;
+    return (uint64_t*)&uc->uc_mcontext->__ss.__lr;
+}
+static void on_fault(int sig, siginfo_t* si, void* ctx){
+    ucontext_t* uc = ctx;
+    uintptr_t a = (uintptr_t)si->si_addr;
+    if (a < (uintptr_t)g_prot || a >= (uintptr_t)g_prot + g_len){      /* not ours: crash for real */
+        signal(sig, SIG_DFL); return;
+    }
+    uint32_t insn = *(const uint32_t*)(uintptr_t)uc->uc_mcontext->__ss.__pc;
+    unsigned size, rt = insn & 31, rn = (insn >> 5) & 31;
+    uintptr_t ea;
+    if ((insn & 0x3FC00000u) == 0x39400000u){                          /* LDR (unsigned imm), zero-extending */
+        size = insn >> 30;
+        ea = (rn == 31 ? (uintptr_t)uc->uc_mcontext->__ss.__sp : (uintptr_t)*xreg(uc, rn))
+             + (((insn >> 10) & 0xFFFu) << size);
+    } else if ((insn & 0x3FE00C00u) == 0x38600800u && ((insn >> 13) & 7) == 3 && !((insn >> 12) & 1)){
+        size = insn >> 30;                                               /* LDR (register, LSL #0) */
+        unsigned rm = (insn >> 16) & 31;
+        ea = (uintptr_t)*xreg(uc, rn) + (rm == 31 ? 0 : (uintptr_t)*xreg(uc, rm));
+    } else { g_unknown = 1; signal(sig, SIG_DFL); return; }            /* refuse to guess */
+    if (ea != a){ g_unknown = 1; signal(sig, SIG_DFL); return; }
+    uint64_t v = 0;
+    memcpy(&v, g_open + (a - (uintptr_t)g_prot), (size_t)1 << size);   /* little-endian: low bytes */
+    if (a == g_watch && size == 3){
+        if (g_watch_reads++ > 0) v = BAD_OFF;                            /* moved after the first (checked) read */
+    }
+    if (rt != 31) *xreg(uc, rt) = v;                                     /* W destinations zero-extend: v is */
+    uc->uc_mcontext->__ss.__pc += 4;
+    g_emulated++;
+    (void)sig;
+}
+
+/* control arm: the pre-fix shape -- check blob_off, then load it AGAIN to
+ * build the pointer. x0 = slot, x1 = blob. */
+__attribute__((naked)) static const unsigned char* reload_get(const unsigned char* slot, const unsigned char* blob){
+    __asm__ volatile(
+        "ldr x9,  [x0, #40]\n"      /* blob_off (checked) */
+        "ldr x10, [x0]\n"           /* len */
+        "add x11, x9, x10\n"        /* the check would use x11 */
+        "ldr x9,  [x0, #40]\n"      /* ...and the re-load builds the pointer */
+        "add x0,  x1, x9\n"
+        "ret\n");
+}
+
+int main(void){
+    setvbuf(stdout, NULL, _IONBF, 0);
+    tt_isolate();
+    size_t pg = (size_t)getpagesize();
+    g_len = (mpool_struct_size(SLOTS) + pg - 1) & ~(pg - 1);
+    int fd = open("pool.map", O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || ftruncate(fd, (off_t)g_len) != 0){ printf("FAIL: pool file\n"); return 1; }
+    g_prot = mmap(0, g_len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    g_open = mmap(0, g_len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    unsigned char* blob = mmap(0, BLOB_CAP, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANONYMOUS, -1, 0);
+    if (g_prot == MAP_FAILED || g_open == MAP_FAILED || blob == MAP_FAILED){ printf("FAIL: mmap\n"); return 1; }
+    mpool_init(g_prot, SLOTS, blob, BLOB_CAP);
+
+    unsigned char txid[32], tx[TXLEN];
+    for (int i = 0; i < 32; i++) txid[i] = (unsigned char)(0xa0 + i);
+    for (unsigned i = 0; i < TXLEN; i++) tx[i] = (unsigned char)(i * 7);
+    ck("put the transaction", mpool_put(g_prot, txid, tx, TXLEN) == 1);
+    unsigned char* slot = 0;                     /* 80-byte records from +40: len@0, txid@8, blob_off@40 */
+    for (unsigned long i = 0; i <= SLOTS; i++){
+        unsigned char* s = g_prot + 40 + i * 80;
+        if (memcmp(s + 8, txid, 32) == 0){ slot = s; break; }
+    }
+    ck("found its slot", slot != 0);
+    if (!slot) return 1;
+    *(unsigned long*)(slot + 40) = GOOD_OFF;
+    memcpy(blob + GOOD_OFF, tx, TXLEN);
+    { unsigned long l = 0; const unsigned char* p = mpool_get(g_prot, txid, &l);
+      ck("undisturbed, mpool_get returns blob + blob_off", p == blob + GOOD_OFF && l == TXLEN); }
+
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_fault; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
+    sigaction(SIGBUS, &sa, 0); sigaction(SIGSEGV, &sa, 0);
+    g_watch = (uintptr_t)(slot + 40);
+
+    /* the control arm first: a double load must be caught */
+    g_watch_reads = 0; g_emulated = 0;
+    mprotect(g_prot, g_len, PROT_NONE);
+    const unsigned char* cp = reload_get(slot, blob);
+    mprotect(g_prot, g_len, PROT_READ|PROT_WRITE);
+    ck("control: every pool load was emulated (no unknown instruction)", !g_unknown && g_emulated == 3);
+    ck("control: a routine that re-loads blob_off after checking it gets the MOVED offset",
+       g_watch_reads == 2 && cp == blob + BAD_OFF);
+
+    /* the real mpool_get under the same handler */
+    g_watch_reads = 0; g_emulated = 0;
+    unsigned long l = 0;
+    mprotect(g_prot, g_len, PROT_NONE);
+    const unsigned char* p = mpool_get(g_prot, txid, &l);
+    mprotect(g_prot, g_len, PROT_READ|PROT_WRITE);
+    printf("      mpool_get: %d pool loads emulated, blob_off read %d time(s)\n", g_emulated, g_watch_reads);
+    ck("every pool load mpool_get made was emulated (no unknown instruction)", !g_unknown && g_emulated > 0);
+    ck("mpool_get read the slot's blob_off exactly once", g_watch_reads == 1);
+    int inside = p == 0 || (p >= blob && p + l <= blob + BLOB_CAP);
+    ck("the returned pointer is inside the blob mapping (or a miss)", inside);
+    ck("...and it is the checked one, blob + the offset that was verified", p == blob + GOOD_OFF && l == TXLEN);
+    if (!inside) printf("      returned blob + 0x%lx (blob_cap 0x%lx)\n", (unsigned long)(p - blob), BLOB_CAP);
+
+    printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
+    return fails ? 1 : 0;
+}
+
+#else   /* x86-64 Linux: the ptrace single-step harness */
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -131,3 +290,5 @@ int main(void){
     printf("\n%s (%d checks, %d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", checks, fails);
     return fails ? 1 : 0;
 }
+
+#endif
