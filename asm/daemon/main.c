@@ -1836,10 +1836,24 @@ static long dl_reject_block(void* st, long h, const unsigned char hash[32], cons
  * PARTIAL: "scored ... not persisted across restart".
  *
  * Called after every mutation of g_node_status->bans[]; cheap (64 entries)
- * and rare (a ban, an unban, a clear). */
+ * and rare (a ban, an unban, a clear).
+ *
+ * Any process can call it (misbehaving() in a serve child, the worker's
+ * setban), so the snapshot, the write and the rename run under an flock on
+ * banlist.json.lock (2026-09-26). Without it two saves shared the one temp
+ * file -- a failed rename, or a torn file renamed into place -- and an
+ * OLDER snapshot could be renamed last, dropping the newer ban from disk.
+ * Under the lock whoever renames last also snapshotted last. flock, not
+ * mis_lock: this holds across an fsync, and the kernel drops it if the
+ * holder dies. BANLIST_SNAPSHOT_TAKEN is a test seam between the snapshot
+ * and the save (tests/test_banlist_persist_race). */
+#ifndef BANLIST_SNAPSHOT_TAKEN
+#define BANLIST_SNAPSHOT_TAKEN() ((void)0)
+#endif
 static void banlist_persist(void)
 {
     if (!g_node_status) return;
+    int lfd = banlist_lock();                   /* -1: save unlocked rather than not at all */
     static ban_entry_t snap[RPC_MAX_BANS];
     int n = 0;
     for (int i = 0; i < RPC_MAX_BANS; i++){
@@ -1849,8 +1863,10 @@ static void banlist_persist(void)
         snap[n].created = g_node_status->bans[i].created;
         n++;
     }
+    BANLIST_SNAPSHOT_TAKEN();
     if (banlist_save(snap, n) != 0)
         fprintf(stderr, "[ban] WARNING: could not write banlist.json -- bans will not survive a restart\n");
+    banlist_unlock(lfd);
 }
 /* the loader's sink: same table, same rules, no RPC round trip */
 int ctl_ban_add(const char* subnet, long long until);   /* defined just below */
@@ -1926,6 +1942,78 @@ int ctl_ban_add(const char* subnet, long long until){
       } }
     if(ban_table_add(subnet, until) != 1) return 0;   /* already, or list full: no silent evict */
     banlist_persist(); return 1;
+}
+
+/* setban, from the worker's control channel (RPC_CTL_SETBAN): num == 0
+ * removes `arg`, otherwise bans it until `num`. Returns the channel's result
+ * (1 done, 0 no-op, -1 refused with `reason`). A function of its own so
+ * tests/test_banlist_persist_race can drive it. */
+static int ctl_setban(const char* arg, long long num, char* reason, size_t rlen){
+    int result = 0;
+    if(num == 0){                                  /* remove */
+        /* under mis_lock, like every claim (ban_table_add): the
+         * slot matched here cannot be re-claimed for another
+         * subnet before this store */
+        mis_lock_acquire(g_node_status);
+        for(int i = 0; i < RPC_MAX_BANS; i++)
+            if(g_node_status->bans[i].until &&
+               !strcmp((const char*)g_node_status->bans[i].subnet, arg)){
+                g_node_status->bans[i].until = 0;
+                result = 1; break;
+            }
+        mis_lock_release(g_node_status);
+        if(result == 1) banlist_persist();
+    } else {
+        /* ---- RPC-8 (audit 2026-09-03) ----
+         * This used to refuse any prefix that was not a multiple
+         * of 8 in [8,32], claiming the matcher could not enforce
+         * it. That was true of the OLD string-comparing matcher
+         * and has been false since subnet.c landed:
+         * subnet_parse/subnet_covers handle any prefix 0..128 for
+         * both families, and ctl_ban_covers is a one-line
+         * passthrough to them. tests/test_subnet.c already proves
+         * /28, /12, /20 and IPv6 including ::/0.
+         *
+         * Worse, the rule read the prefix without looking at the
+         * family, so it ACCEPTED 2001:db8::/32 while refusing
+         * ::1/128 and 2001:db8::/64 -- the exact inversion the
+         * comment above ctl_ban_covers says was fixed.
+         *
+         * Now: parse it. An unparseable spec is refused (Core
+         * raises -30 at the RPC, which cmd_setban also does now);
+         * anything the matcher can actually evaluate is allowed. */
+        subnet_t sn_probe;
+        if(!subnet_parse(arg, &sn_probe)){
+            result = -1;
+            snprintf(reason, rlen,
+                     "not a valid IP or subnet: %s", arg);
+        } else {
+            int added = ban_table_add(arg, num);   /* claims under mis_lock */
+            if(added == 0) result = 0;             /* already banned */
+            else if(added < 0){
+                result = -1;
+                snprintf(reason, rlen, "the ban list is full (%d)", RPC_MAX_BANS);
+            } else {
+                /* drop any live leg the new ban now covers */
+                for(int i = 0; i < mux_n_out; i++){
+                    if(mux_out_fd[i] < 0) continue;
+                    char ip[128]; ctl_ip_only(mux_out_host[i], ip, sizeof ip);
+                    if(ctl_ban_covers(arg, ip)){
+                        char d[96]; snprintf(d, sizeof d, "setban %s now covers this address", arg);
+                        leg_close_ours(i, "banned", d);
+                        g_node_status->peers[i].used = 0;
+                    }
+                }
+                fprintf(stderr,"[ctl] banned %s until %lld\n", arg, num);
+                /* Core's setban writes banlist.json (banman.cpp Ban ->
+                 * DumpBanlist). This path never did: a setban survived a
+                 * restart only if some later change happened to persist it. */
+                banlist_persist();
+                result = 1;
+            }
+        }
+    }
+    return result;
 }
 
 /* Score a peer for a protocol violation. Returns 1 if this call banned it,
@@ -8923,65 +9011,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     if(rc == 1) fprintf(stderr,"[ctl] addpeeraddress: %s -> book (%s)\n", arg, bmc_net_name(a.net));
                 }
             } else if(op == RPC_CTL_SETBAN){
-                if(num == 0){                                  /* remove */
-                    /* under mis_lock, like every claim (ban_table_add): the
-                     * slot matched here cannot be re-claimed for another
-                     * subnet before this store */
-                    mis_lock_acquire(g_node_status);
-                    for(int i = 0; i < RPC_MAX_BANS; i++)
-                        if(g_node_status->bans[i].until &&
-                           !strcmp((const char*)g_node_status->bans[i].subnet, arg)){
-                            g_node_status->bans[i].until = 0;
-                            result = 1; break;
-                        }
-                    mis_lock_release(g_node_status);
-                    if(result == 1) banlist_persist();
-                } else {
-                    /* ---- RPC-8 (audit 2026-09-03) ----
-                     * This used to refuse any prefix that was not a multiple
-                     * of 8 in [8,32], claiming the matcher could not enforce
-                     * it. That was true of the OLD string-comparing matcher
-                     * and has been false since subnet.c landed:
-                     * subnet_parse/subnet_covers handle any prefix 0..128 for
-                     * both families, and ctl_ban_covers is a one-line
-                     * passthrough to them. tests/test_subnet.c already proves
-                     * /28, /12, /20 and IPv6 including ::/0.
-                     *
-                     * Worse, the rule read the prefix without looking at the
-                     * family, so it ACCEPTED 2001:db8::/32 while refusing
-                     * ::1/128 and 2001:db8::/64 -- the exact inversion the
-                     * comment above ctl_ban_covers says was fixed.
-                     *
-                     * Now: parse it. An unparseable spec is refused (Core
-                     * raises -30 at the RPC, which cmd_setban also does now);
-                     * anything the matcher can actually evaluate is allowed. */
-                    subnet_t sn_probe;
-                    if(!subnet_parse(arg, &sn_probe)){
-                        result = -1;
-                        snprintf(reason, sizeof reason,
-                                 "not a valid IP or subnet: %s", arg);
-                    } else {
-                        int added = ban_table_add(arg, num);   /* claims under mis_lock */
-                        if(added == 0) result = 0;             /* already banned */
-                        else if(added < 0){
-                            result = -1;
-                            snprintf(reason, sizeof reason, "the ban list is full (%d)", RPC_MAX_BANS);
-                        } else {
-                            /* drop any live leg the new ban now covers */
-                            for(int i = 0; i < mux_n_out; i++){
-                                if(mux_out_fd[i] < 0) continue;
-                                char ip[128]; ctl_ip_only(mux_out_host[i], ip, sizeof ip);
-                                if(ctl_ban_covers(arg, ip)){
-                                    char d[96]; snprintf(d, sizeof d, "setban %s now covers this address", arg);
-                                    leg_close_ours(i, "banned", d);
-                                    g_node_status->peers[i].used = 0;
-                                }
-                            }
-                            fprintf(stderr,"[ctl] banned %s until %lld\n", arg, num);
-                            result = 1;
-                        }
-                    }
-                }
+                result = ctl_setban(arg, num, reason, sizeof reason);
             } else if(op == RPC_CTL_CLEARBANNED){
                 mis_lock_acquire(g_node_status);        /* no claim half-done under the clear */
                 for(int i = 0; i < RPC_MAX_BANS; i++) g_node_status->bans[i].until = 0;
