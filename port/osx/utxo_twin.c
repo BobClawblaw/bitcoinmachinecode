@@ -207,10 +207,28 @@ unsigned long utxo_struct_size(unsigned long slots)
     return 40 + slots * 48 + 8;
 }
 
+/* utxo_prefetch_n(u, txid, index, lines): warm `lines` consecutive 64-byte
+ * lines from the home slot's first byte (0 = none, clamped to 64) -- the x86
+ * seam, whose (…, 2) is the 2026-08-23 two-line hint test_utxo_probe_diff
+ * runs as its control arm. A pure hint: prfm never faults, even past the
+ * mapping. The stride stays x86's 64 bytes; Apple silicon's lines are 128,
+ * so every other hint lands on a line already requested, which is free.
+ *
+ * utxo_prefetch = UTXO_PREFETCH_LINES (6) of them, x86's 2026-09-06 value
+ * (a 75%-load miss at 2^26 slots ~105 -> 60-75 ns there). Until 2026-09-26
+ * the twin's utxo_prefetch was a no-op and utxo_prefetch_n did not exist:
+ * utxo_live issued the hint a phase ahead for every prevout and it did
+ * nothing, and the probe-diff test called a null utxo_prefetch_n. */
+#define UTXO_PREFETCH_LINES 6
+void utxo_prefetch_n(void *u, const u8 txid[32], unsigned long index, unsigned long lines);
+void utxo_prefetch_n(void *u, const u8 txid[32], unsigned long index, unsigned long lines)
+{
+    const u8 *p = (const u8 *)u + utxo_hash(txid, index, *(const u64 *)((const u8 *)u + 8));
+    if (lines > 64) lines = 64;
+    for (; lines; lines--, p += 64) __builtin_prefetch(p, 0, 3);
+}
 void utxo_prefetch(void *u, const u8 txid[32], unsigned long index);
 void utxo_prefetch(void *u, const u8 txid[32], unsigned long index)
 {
-    /* AArch64 has no prefetcht0 equivalent needed for correctness; the
-     * harness treats prefetch as a pure hint.  Volatile touch: */
-    (void)u; (void)txid; (void)index;
+    utxo_prefetch_n(u, txid, index, UTXO_PREFETCH_LINES);
 }
