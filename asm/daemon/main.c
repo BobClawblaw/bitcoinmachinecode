@@ -1533,6 +1533,11 @@ static struct { char ip[64]; int score; } g_misbehavior[MISBEHAVIOR_SLOTS];
  * reclaim mid-update is one garbled misbehaviour score -- a heuristic that is
  * already approximate -- rather than a corrupted structure.
  *
+ * It also serialises the ban table's writers (ban_table_add, setban remove,
+ * clearbanned; 2026-09-26). A reclaim mid-claim leaves at worst a slot whose
+ * subnet was written and whose `until` -- published last -- was not: still
+ * free, never a half ban.
+ *
  * The pid fits: mis_lock is an int and this is Linux, where pid_max is well
  * under INT_MAX. */
 static void mis_lock_acquire(node_status_t* st){
@@ -1861,6 +1866,43 @@ static int banlist_restore_one(const char* subnet, long long until, long long cr
     return 1;
 }
 /* Add `subnet` to the shared ban list until `until`. 1 if newly banned. */
+/* Claim a free slot and publish a ban: 1 added, 0 already banned, -1 full.
+ *
+ * Every writer of the ban table comes through here, under mis_lock: this
+ * function (from misbehaving() in any process, and the banlist loader) and
+ * the worker's setban. Both used to scan for a free slot (until == 0) and
+ * then write it with no lock, so two processes banning at once could pick
+ * the same slot -- one ban lost, or published under the other's subnet
+ * (bmc_osx note-for-x86-2 item 6). The lock is held for the scan and the
+ * publish only; the caller persists after it is released. ctl_is_banned's
+ * lazy expiry stays lock-free: it only ever CASes an expired value to 0,
+ * which a claim under the lock can at worst not see yet.
+ *
+ * BAN_SLOT_CHOSEN is a test seam between the choice of a slot and its
+ * write (tests/test_ban_slot_claim); nothing in the daemon defines it. */
+#ifndef BAN_SLOT_CHOSEN
+#define BAN_SLOT_CHOSEN(slot) ((void)0)
+#endif
+static int ban_table_add(const char* subnet, long long until){
+    node_status_t* st = g_node_status;
+    mis_lock_acquire(st);
+    int slot = -1;
+    for(int i = 0; i < RPC_MAX_BANS; i++){
+        if(st->bans[i].until && !strcmp((const char*)st->bans[i].subnet, subnet)){
+            mis_lock_release(st); return 0;       /* already */
+        }
+        if(!st->bans[i].until && slot < 0) slot = i;
+    }
+    if(slot < 0){ mis_lock_release(st); return -1; }
+    BAN_SLOT_CHOSEN(slot);
+    snprintf((char*)st->bans[slot].subnet, 64, "%s", subnet);
+    st->bans[slot].created = (long long)time(NULL);
+    __sync_synchronize();
+    st->bans[slot].until = until;                /* published last */
+    mis_lock_release(st);
+    return 1;
+}
+
 int ctl_ban_add(const char* subnet, long long until){
     if(!g_node_status || !subnet || !*subnet) return 0;
     /* NET-17 (audit 2026-09-03): refuse a key enforcement can never match.
@@ -1882,17 +1924,7 @@ int ctl_ban_add(const char* subnet, long long until){
                           "(onion/I2P peers are dropped on violation, not banned)\n", subnet);
           return 0;
       } }
-    int slot = -1;
-    for(int i = 0; i < RPC_MAX_BANS; i++){
-        if(g_node_status->bans[i].until &&
-           !strcmp((const char*)g_node_status->bans[i].subnet, subnet)) return 0;  /* already */
-        if(!g_node_status->bans[i].until && slot < 0) slot = i;
-    }
-    if(slot < 0) return 0;                       /* list full: no silent evict */
-    snprintf((char*)g_node_status->bans[slot].subnet, 64, "%s", subnet);
-    g_node_status->bans[slot].created = (long long)time(NULL);
-    __sync_synchronize();
-    g_node_status->bans[slot].until = until;     /* published last */
+    if(ban_table_add(subnet, until) != 1) return 0;   /* already, or list full: no silent evict */
     banlist_persist(); return 1;
 }
 
@@ -8892,12 +8924,17 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 }
             } else if(op == RPC_CTL_SETBAN){
                 if(num == 0){                                  /* remove */
+                    /* under mis_lock, like every claim (ban_table_add): the
+                     * slot matched here cannot be re-claimed for another
+                     * subnet before this store */
+                    mis_lock_acquire(g_node_status);
                     for(int i = 0; i < RPC_MAX_BANS; i++)
                         if(g_node_status->bans[i].until &&
                            !strcmp((const char*)g_node_status->bans[i].subnet, arg)){
                             g_node_status->bans[i].until = 0;
                             result = 1; break;
                         }
+                    mis_lock_release(g_node_status);
                     if(result == 1) banlist_persist();
                 } else {
                     /* ---- RPC-8 (audit 2026-09-03) ----
@@ -8924,21 +8961,12 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                         snprintf(reason, sizeof reason,
                                  "not a valid IP or subnet: %s", arg);
                     } else {
-                        int dup = 0, slot = -1;
-                        for(int i = 0; i < RPC_MAX_BANS; i++){
-                            if(g_node_status->bans[i].until &&
-                               !strcmp((const char*)g_node_status->bans[i].subnet, arg)) dup = 1;
-                            if(!g_node_status->bans[i].until && slot < 0) slot = i;
-                        }
-                        if(dup) result = 0;
-                        else if(slot < 0){
+                        int added = ban_table_add(arg, num);   /* claims under mis_lock */
+                        if(added == 0) result = 0;             /* already banned */
+                        else if(added < 0){
                             result = -1;
                             snprintf(reason, sizeof reason, "the ban list is full (%d)", RPC_MAX_BANS);
                         } else {
-                            snprintf((char*)g_node_status->bans[slot].subnet, 64, "%s", arg);
-                            g_node_status->bans[slot].created = (long long)time(NULL);
-                            __sync_synchronize();
-                            g_node_status->bans[slot].until = num;   /* published last */
                             /* drop any live leg the new ban now covers */
                             for(int i = 0; i < mux_n_out; i++){
                                 if(mux_out_fd[i] < 0) continue;
@@ -8955,7 +8983,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     }
                 }
             } else if(op == RPC_CTL_CLEARBANNED){
+                mis_lock_acquire(g_node_status);        /* no claim half-done under the clear */
                 for(int i = 0; i < RPC_MAX_BANS; i++) g_node_status->bans[i].until = 0;
+                mis_lock_release(g_node_status);
                 fprintf(stderr,"[ctl] ban list cleared\n");
                 banlist_persist();
                 result = 1;
