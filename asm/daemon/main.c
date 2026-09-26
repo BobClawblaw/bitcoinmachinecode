@@ -3637,12 +3637,52 @@ static long g_last_sync_ok = 0;   /* node_sync_multi's verdict of the last pass,
  * it in place, the helper's parent runs it from the report (the comments
  * that used to sit here -- incident #33, the health-signal rule, the
  * three-strike replacement -- are in the git history of 2026-08/09) */
+/* Did the host receive anything on ANY leg -- leg `i` included -- in the last
+ * `window_ms`? 1 yes; 0 no, and at least one other live leg was there to hear
+ * it; -1 no, but leg `i` is the only leg, so silence proves nothing. The
+ * kernel's per-socket tcpi_last_data_recv counts every byte that arrived,
+ * whichever process (the worker, a pass helper) read it or not, and
+ * getsockopt consumes nothing, so a leg whose pass is running in a helper is
+ * measured too. */
+static int legs_heard_within(int i, long long window_ms){
+    int others = 0;
+    for(int k = 0; k < mux_n_out; k++){
+        if(mux_out_fd[k] < 0) continue;
+        struct tcp_info ti; socklen_t tl = sizeof ti;
+        if(getsockopt(mux_out_fd[k], IPPROTO_TCP, TCP_INFO, &ti, &tl) != 0) continue;   /* not a live socket */
+        if(k != i) others++;
+        if((long long)ti.tcpi_last_data_recv <= window_ms) return 1;
+    }
+    return others ? 0 : -1;
+}
+/* Test seam: the extra window over the pass's own duration that still counts
+ * as "during the pass" -- the report is read a rotation after the pass ends. */
+#ifndef PASS_SILENCE_SLACK_MS
+#define PASS_SILENCE_SLACK_MS 5000
+#endif
 static void pass_fail_bookkeeping(int i, long ok, int fail_code, double sync_s){
     anchor_locator(mux_out_loc[i]);
     if(ok == 1){ g_sync_fail_streak[i] = 0; return; }   /* peer had nothing: normal at tip */
     if(fail_code == 4 && sync_s < 0.5){   /* EOF before the peer said anything: it hung up */
         leg_close_theirs(i, "EOF on the first read", "(nothing)");
         g_sync_fail_streak[i] = 0;
+        return;
+    }
+    /* 2026-09-26: a failing pass is not a strike against the peer when NO
+     * leg -- this one included -- received anything during it: the silence
+     * is the host's network, not this peer. (A peer that sent chatter but
+     * no headers, like the Bitcore node of 09-25, still takes the strike.) A 3-minute outage at 06:24 UTC (no
+     * packet of any kind in or out, LAN included; the capture in
+     * /storage/forensics/2026-09-26-sync-failed-where3) made every leg's
+     * pass fail "where=3 in 24.1s", and five legs up for over an hour were
+     * closed as sync-failed-3x and entered in the dial memory as early
+     * drops. 21% of the sync-failed-3x closes since 09-11 came in such
+     * clusters. Core keeps a peer through that (its ping timeout is 20 min).
+     * With no other leg to compare against, the strike counts as before. */
+    if(legs_heard_within(i, (long long)(sync_s * 1000.0) + PASS_SILENCE_SLACK_MS) == 0){
+        fprintf(stderr,"[mux:%d] %s: the pass failed (where=%d in %.1fs) while no leg received anything -- "
+                       "the host's network, not this peer: not a strike (%d of 3)\n",
+                i, mux_out_host[i], fail_code, sync_s, g_sync_fail_streak[i]);
         return;
     }
     g_sync_fail_streak[i]++;
