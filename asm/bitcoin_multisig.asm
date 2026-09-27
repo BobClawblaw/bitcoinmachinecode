@@ -159,6 +159,12 @@ multisig_verify:
     mov   r9, rax          ; pushLen (current)
     lea   rdi, [rdi+1]     ; current data start
     mov   [rbp-0x78], rdi  ; save data start (for .advance recompute)
+    ; The push must FIT: a scriptSig ending in a length byte that claims
+    ; pubLen bytes was compared byte by byte past its end (2026-09-27; the
+    ; Mac twin refused it, and the differential caught this side).
+    lea   rax, [rdi+r9]    ; end of this push's data
+    cmp   rax, rsi
+    ja    .not_found       ; malformed: never read past the scriptSig
     ; Check if this push equals pubKey
     cmp   r9, r15
     jne   .advance         ; length differs -> not the pubkey
