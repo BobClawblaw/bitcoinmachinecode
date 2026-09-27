@@ -12,6 +12,10 @@
  */
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <signal.h>
 
 extern int p2sh_hash(const unsigned char *script, unsigned long script_len,
                       unsigned char out20[20]);
@@ -165,6 +169,34 @@ int main(void) {
     int r5 = multisig_verify(scriptSig, scriptSigLen, wrong_pub, wpub_n,
                              tx, tn, 0, work, sizeof(work), redeem, rn);
     ck("multisig_verify wrong pubkey -> 0", r5, 0);
+
+    /* ---- Negative: a malformed push that does not fit the scriptSig ----
+     * [0x00] <0x21> then ONE byte where 33 are claimed, placed at the very end
+     * of a page with a PROT_NONE page after it. Until 2026-09-27 the scan
+     * compared the candidate against the pubkey byte by byte without checking
+     * that the push fits, so it read 32 bytes past the scriptSig -- here into
+     * the guard page. Run in a child: the old code dies of SIGSEGV, the fixed
+     * one returns 0. (Only the tests and the ABI bench call multisig_verify;
+     * consensus multisig is the interpreter's.) */
+    { long pg = sysconf(_SC_PAGESIZE);
+      unsigned char* m = mmap(0, (size_t)pg * 2, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+      if (m == MAP_FAILED){ printf("FAIL: mmap\n"); fails++; }
+      else {
+        mprotect(m + pg, (size_t)pg, PROT_NONE);
+        unsigned char* ss = m + pg - 3;
+        ss[0] = 0x00; ss[1] = (unsigned char)pub_n; ss[2] = pub[0];   /* claims 33, has 1 */
+        pid_t c = fork();
+        if (c == 0){
+            int r = multisig_verify(ss, 3, pub, pub_n, tx, tn, 0, work, sizeof(work), redeem, rn);
+            _exit(r == 0 ? 0 : 3);
+        }
+        int st = 0; waitpid(c, &st, 0);
+        int ok = WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        if (ok) printf("PASS: multisig_verify truncated push at a page end -> 0, no over-read\n");
+        else { printf("FAIL: multisig_verify truncated push: %s\n",
+                      WIFSIGNALED(st) ? (WTERMSIG(st) == SIGSEGV ? "SIGSEGV -- read past the scriptSig" : "killed by a signal") : "returned non-zero"); fails++; }
+        munmap(m, (size_t)pg * 2);
+      } }
 
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
