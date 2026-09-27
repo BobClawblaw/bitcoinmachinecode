@@ -57,6 +57,19 @@ struct fx_tcp_info {
     unsigned long long pacing_rate, max_pacing_rate, bytes_acked, bytes_received;
 };
 static void fx_tally(int c){
+#if defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
+    /* Darwin has no Linux TCP_INFO; its kernel's view of the same socket is
+     * TCP_CONNECTION_INFO. tcpi_rxbytes counts payload bytes (no FIN
+     * sequence number to subtract), and what this side sent is tcpi_txbytes
+     * less any retransmitted bytes (none on loopback, subtracted anyway). */
+    { struct tcp_connection_info ci; socklen_t cl = sizeof ci; memset(&ci, 0, sizeof ci);
+      if (getsockopt(c, IPPROTO_TCP, TCP_CONNECTION_INFO, &ci, &cl) == 0){
+          __sync_fetch_and_add(&g_fx->rx, (long long)ci.tcpi_rxbytes);
+          __sync_fetch_and_add(&g_fx->tx, (long long)(ci.tcpi_txbytes - ci.tcpi_txretransmitbytes));
+      }
+      __sync_fetch_and_add(&g_fx->finished, 1L);
+      return; }
+#endif
     struct fx_tcp_info ti; socklen_t tl = sizeof ti; memset(&ti, 0, sizeof ti);
     if (getsockopt(c, IPPROTO_TCP, TCP_INFO, &ti, &tl) == 0){
         /* the kernel's bytes_received advances with rcv_nxt, and the node's

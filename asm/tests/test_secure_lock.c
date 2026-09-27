@@ -18,6 +18,14 @@
  * Two separate mmap regions are used rather than two statics, because
  * statics share one mapping and the control would then be measuring the same
  * region as the subject -- and a control that cannot fail is not a control.
+ *
+ * ON DARWIN there is no /proc and no MADV_DONTDUMP. The lock is read back
+ * from the kernel instead through mach_vm_region_recurse on our own task
+ * (user_wired_count per region; no privileges needed), with the same control.
+ * DONTDUMP is not asserted there: Darwin has no per-mapping core exclusion,
+ * so secure_lock's madvise is compiled out (its #ifdef MADV_DONTDUMP). What
+ * stands in on a Mac is platform policy, printed as a NOTE: the core-file
+ * limit (0 by default) and encrypted swap (always on since 10.7).
  */
 #include <stdio.h>
 #include <string.h>
@@ -29,6 +37,24 @@
 static int fails = 0;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
 
+#ifdef __APPLE__
+#include <unistd.h>
+#include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+/* Darwin: the region containing `addr` -- wired (mlock'd) or not, per the
+ * kernel's own vm map. locked_kb = the region's size when wired, else 0;
+ * dontdump = -1 (no such flag on Darwin). */
+static int smaps_probe(const void* addr, long* locked_kb, int* dontdump){
+    *locked_kb = -1; *dontdump = -1;
+    mach_vm_address_t a = (mach_vm_address_t)addr; mach_vm_size_t sz = 0; natural_t depth = 0;
+    vm_region_submap_info_data_64_t in; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+    if (mach_vm_region_recurse(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_t)&in, &cnt) != KERN_SUCCESS) return 0;
+    if (a > (mach_vm_address_t)addr) return 0;
+    *locked_kb = in.user_wired_count ? (long)(sz / 1024) : 0;
+    return 1;
+}
+#else
 /* Read the smaps entry containing `addr`: locked kB, and whether "dd" is set. */
 static int smaps_probe(const void* addr, long* locked_kb, int* dontdump){
     *locked_kb = -1; *dontdump = -1;
@@ -53,13 +79,18 @@ static int smaps_probe(const void* addr, long* locked_kb, int* dontdump){
     fclose(f);
     return found;
 }
+#endif
 
 int main(void){
     struct rlimit rl;
     if (getrlimit(RLIMIT_MEMLOCK, &rl) == 0)
         printf("RLIMIT_MEMLOCK soft=%lu\n", (unsigned long)rl.rlim_cur);
 
+#ifdef __APPLE__
+    size_t page = (size_t)getpagesize();     /* 16 KB on Apple silicon */
+#else
     size_t page = 4096;
+#endif
     void* secret = mmap(0, page, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     void* plain  = mmap(0, page, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
     if (secret == MAP_FAILED || plain == MAP_FAILED){ printf("SKIP: mmap failed\n"); return 0; }
@@ -83,15 +114,30 @@ int main(void){
     printf("      (secret: Locked=%ldkB dd=%d ; control: Locked=%ldkB dd=%d)\n", lk, dd, pk, pdd);
 
     ck("the kernel reports the mapping found", f1 && f2);
+#ifdef __APPLE__
+    ck("WAL-3 the locked region really is LOCKED (wired, per the kernel's vm map)", lk > 0);
+    { struct rlimit rc; int enc = -1; struct xsw_usage sw; size_t swl = sizeof sw;
+      if (sysctlbyname("vm.swapusage", &sw, &swl, NULL, 0) == 0) enc = sw.xsu_encrypted ? 1 : 0;
+      getrlimit(RLIMIT_CORE, &rc);
+      printf("NOTE: no MADV_DONTDUMP on Darwin (secure_lock compiles it out); stand-ins here:\n"
+             "      core-file limit %s, swap %s\n",
+             rc.rlim_cur == 0 ? "0 (no core files)" : "NONZERO (a core would include the wallet page)",
+             enc == 1 ? "encrypted" : enc == 0 ? "NOT encrypted" : "unknown"); }
+#else
     ck("WAL-3 the locked region really is LOCKED per /proc/self/smaps", lk > 0);
     ck("WAL-3 ...and is marked DONTDUMP, so it stays out of a core file", dd == 1);
+#endif
 
     /* The control: an identical mapping that was never passed to
      * secure_lock. If this were also locked or dd, the assertions above would
      * be measuring something the process does by default rather than
      * something secure_lock did. */
     ck("WAL-3 control: an untouched mapping is NOT locked", pk == 0);
+#ifndef __APPLE__
     ck("WAL-3 control: ...and is NOT marked DONTDUMP", pdd == 0);
+#else
+    (void)dd; (void)pdd;
+#endif
 
     /* And secure_zero still works on locked memory -- locking must not have
      * turned the wipe into a no-op. */
