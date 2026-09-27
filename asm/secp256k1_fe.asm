@@ -43,6 +43,18 @@ DEFAULT REL
 ; ----------------------------------------------------------------------------
 section .rodata
 align 16
+; p in 5 signed 62-bit limbs and p^{-1} mod 2^62, for fe_inv_var (the
+; safegcd_var.inc instance): limbs = p >> 62k & (2^62-1); the inverse by
+; Newton from x = p. Checked in Python and by tests/test_fe_inv_var.
+P62_LIMBS:
+    dq 0x3FFFFFFEFFFFFC2F
+    dq 0x3FFFFFFFFFFFFFFF
+    dq 0x3FFFFFFFFFFFFFFF
+    dq 0x3FFFFFFFFFFFFFFF
+    dq 0x00000000000000FF
+PINV62:
+    dq 0x27C7F6E22DDACACF
+align 16
 P_LIMBS:
     dq 0xFFFFFFFEFFFFFC2F   ; limb0 of p  (p mod 2^64)
     dq 0xFFFFFFFFFFFFFFFF   ; limb1
@@ -722,6 +734,107 @@ fe_inv:
     pop rbx
     pop rbp
     ret
+
+; ============================================================================
+; void fe_pow_sqrt(r[4], a[4]) : r = a^((p+1)/4) mod p  -- CONSTANT-TIME.
+;   The square-root candidate: since p == 3 (mod 4), if a is a square then
+;   r^2 == a, and if not, r^2 == -a. The CALLER checks r^2 == a (pubkey_parse
+;   does); this function only exponentiates.
+;
+;   Replaces pubkey_parse's generic fe_pow (square-and-multiply over the
+;   exponent's bits) on 2026-09-27. (p+1)/4 = 2^254 - 2^30 - 244 is almost all
+;   one-bits, so that loop paid ~254 squarings AND ~250 multiplies: 4.1 us per
+;   parse on this box, paid by every compressed-key ECDSA input and every
+;   BIP340 verify. This is fe_inv's addition chain (x2 .. x223, same frame,
+;   same macros) with a different tail -- 253 squarings, 13 multiplies:
+;     (p+1)/4 = ((x223 << 23) + x22) << 6 + x2) << 2,  xk = a^(2^k - 1)
+;   checked in Python (validation note in tests/test_fe_pow_sqrt.c) and
+;   against fe_pow(a, (p+1)/4) by that test.
+;
+;   TIMING: the operation sequence depends only on p, never on a, so this is
+;   as constant-time as fe_inv and safe on any path.
+;   FRAME / REGISTERS: identical to fe_inv above; the tail reads only the
+;   X22 and X2 boxes.
+; ============================================================================
+global fe_pow_sqrt
+fe_pow_sqrt:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0xf8              ; rsp = rbp-0x120, 0 mod 16 at nested calls
+
+    mov  rbx, rdi
+    FEINV_CPY rbp-0x50, rsi     ; A := a  -- FIRST, so r[] may alias a[]
+
+    ; ---- x2, x3 ----
+    lea  rdi, [rbp-0xf0]
+    lea  rsi, [rbp-0x50]
+    call fe_sqr
+    FEINV_MUL rbp-0x50
+    FEINV_CPY rbp-0x70, rbp-0xf0        ; X2
+    FEINV_SQN 1
+    FEINV_MUL rbp-0x50
+    FEINV_CPY rbp-0x90, rbp-0xf0        ; X3
+
+    ; ---- x6, x9, x11, x22, x44, x88, x176, x220, x223 (as fe_inv) ----
+    FEINV_SQN 3
+    FEINV_MUL rbp-0x90
+    FEINV_SQN 3
+    FEINV_MUL rbp-0x90
+    FEINV_SQN 2
+    FEINV_MUL rbp-0x70                  ; x11
+    FEINV_CPY rbp-0x110, rbp-0xf0
+    FEINV_SQN 11
+    FEINV_MUL rbp-0x110                 ; x22
+    FEINV_CPY rbp-0xb0, rbp-0xf0        ; X22
+    FEINV_SQN 22
+    FEINV_MUL rbp-0xb0                  ; x44
+    FEINV_CPY rbp-0xd0, rbp-0xf0        ; X44
+    FEINV_SQN 44
+    FEINV_MUL rbp-0xd0                  ; x88
+    FEINV_CPY rbp-0x110, rbp-0xf0
+    FEINV_SQN 88
+    FEINV_MUL rbp-0x110                 ; x176
+    FEINV_SQN 44
+    FEINV_MUL rbp-0xd0                  ; x220
+    FEINV_SQN 3
+    FEINV_MUL rbp-0x90                  ; x223
+
+    ; ---- the tail of (p+1)/4 ----
+    FEINV_SQN 23
+    FEINV_MUL rbp-0xb0                  ; * x22
+    FEINV_SQN 6
+    FEINV_MUL rbp-0x70                  ; * x2
+    FEINV_SQN 1
+    mov  rdi, rbx                       ; last squaring lands straight in r[]
+    lea  rsi, [rbp-0xf0]
+    call fe_sqr
+
+    add rsp, 0xf8
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    pop rbp
+    ret
+
+; ============================================================================
+; int fe_inv_var(r[4], a[4]) : r = a^-1 mod p  --  VARIABLE-TIME.
+;   Bernstein-Yang safegcd (safegcd_var.inc, the same body as sc_inv_var,
+;   instantiated for p). PUBLIC inputs only: schnorr_verify's Z^{-1} for the
+;   even-Y test and secp256k1_taproot.asm's affine conversions of public
+;   points. fe_inv above stays the constant-time path for everything a wallet
+;   or signer computes. 2026-09-27: fe_inv is 2.07 us (bound by 255
+;   sequential squarings); this is ~0.7 us.
+;   Returns eax=1 and writes r; eax=0 with r untouched when a == 0 (mod p).
+; ============================================================================
+%include "safegcd_var.inc"
+SAFEGCD_INV_VAR fe_inv_var, P62_LIMBS, PINV62, P_LIMBS
 
 ; ----------------------------------------------------------------------------
 ; Non-executable stack marker (consistent with sha256.asm hygiene).
