@@ -28,6 +28,7 @@ extern int tx_verify_block_connect_all(const block_tx_t* txs, u64 ntx, long heig
                                        const u8 block_hash32[32], void* lst, void* u, void* bx,
                                        u64* fail_tx_index, const char** reason);
 extern void block_hash(u8 out[32], const u8 hdr[80]);
+extern void sha256d(u8 out[32], const void* m, long l);
 
 /* ---- prevout table: (txid_wire,vout) -> (value, spk) ---- */
 typedef struct { u8 key[36]; u64 value; u32 spklen; u8 spk[10000]; } prev_t;
@@ -85,7 +86,7 @@ int main(void){
     if(!fb||!fp){ printf("SKIP: fixtures absent (run validation/fetch_block_prevouts.py 482566)\n"); return 0; }
     static u8 blk[1<<21]; long blen = fread(blk,1,sizeof blk,fb); fclose(fb);
 
-    g_prev = calloc(6000, sizeof(prev_t));
+    g_prev = calloc(10000, sizeof(prev_t));      /* 5015 fetched + 3087 created in the block */
     char line[8192];
     while(fgets(line,sizeof line,fp)){
         char txh[80], spkh[6000]; unsigned idx; unsigned long long val;
@@ -111,6 +112,42 @@ int main(void){
         p += tl;
     }
     if (p != blk + blen){ printf("FAIL parse: consumed %ld of %ld bytes\n",(long)(p-blk),blen); return 1; }
+
+    /* Outputs created INSIDE the block: this store (bx == NULL, no in-block
+     * index) is the only place a later tx of the block can find them.
+     * validation/fetch_block_prevouts.py leaves them out since its 09-24
+     * rewrite (the apply path creates them), so a freshly fetched fixture
+     * made this test reject tx 271 on any platform. Add them here, keyed by
+     * the txid (sha256d of the witness-stripped tx), unless the file already
+     * carries them (an old-format fixture) -- 2026-09-26. */
+    { long added = 0; static u8 strip[1 << 20];
+      for (u64 t = 0; t < ntx; t++){
+          const u8* q = txs[t].ptr; const u8* e = q + txs[t].len;
+          int wit = (q[4] == 0x00 && q[5] == 0x01);
+          u64 sl = 0;
+          memcpy(strip, q, 4); sl = 4;                               /* version */
+          const u8* r = q + 4 + (wit ? 2 : 0);
+          const u8* ins = r; u32 nin; { const u8* rr = r; nin = (u32)rd_cs(&rr);
+            for (u32 i = 0; i < nin; i++){ rr += 36; u64 l = rd_cs(&rr); rr += l + 4; }
+            const u8* outs = rr; u64 nout = rd_cs(&rr);
+            const u8* out0 = rr;
+            for (u64 i = 0; i < nout; i++){ rr += 8; u64 l = rd_cs(&rr); rr += l; }
+            memcpy(strip + sl, ins, (size_t)(rr - ins)); sl += (u64)(rr - ins);   /* inputs + outputs */
+            memcpy(strip + sl, e - 4, 4); sl += 4;                                  /* locktime */
+            u8 txid[32]; sha256d(txid, strip, (long)sl);
+            const u8* o = out0; (void)outs;
+            for (u64 i = 0; i < nout; i++){
+                u64 val; memcpy(&val, o, 8); o += 8; u64 l = rd_cs(&o);
+                u8 key[36]; memcpy(key, txid, 32); u32 vi = (u32)i; memcpy(key + 32, &vi, 4);
+                if (!bsearch(key, g_prev, g_nprev, sizeof(prev_t), prev_cmp) && g_nprev < 10000 && l <= sizeof g_prev[0].spk){
+                    prev_t* n = &g_prev[g_nprev++]; memcpy(n->key, key, 36); n->value = val;
+                    n->spklen = (u32)l; memcpy(n->spk, o, l); added++;
+                }
+                o += l;
+            } }
+      }
+      qsort(g_prev, g_nprev, sizeof(prev_t), prev_cmp);
+      printf("added %ld outputs created inside the block\n", added); }
 
     u64 fail_tx = 0; const char* reason = "?";
     int ok = tx_verify_block_connect_all(txs, ntx, 482566, bh, NULL, NULL, NULL, &fail_tx, &reason);
