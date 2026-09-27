@@ -33,7 +33,15 @@ testnet4, signet (public or custom) and regtest.
 - `assumevalid` follows Core: the chain's built-in assumed-valid block (mainnet
   938343 in Core v31) unless overridden; script evaluation is skipped at and
   below it, every other check runs. `assumevalid=0` evaluates every signature
-  in every block.
+  in every block, and a mainnet sync run that way completed on 2026-09-27:
+  8 h 0 m to the tip at nice 10, with the UTXO set's per-height MuHash equal
+  to Core's at every height checked
+  ([`docs/releases/2026-09-27-crypto-parity-and-the-full-verification-sync.md`](docs/releases/2026-09-27-crypto-parity-and-the-full-verification-sync.md)).
+- secp256k1 in hand-written x86-64 assembly, at the speed of Core's own
+  library: ECDSA 20.7 µs and BIP340 22.4 µs per verification on one core
+  against libsecp256k1's 21.0 and 22.0 (2026-09-27; safegcd scalar
+  inversion, addition-chain square roots), proven byte for byte against
+  Core's vectors, a frozen reference and a randomized differential.
 - Signet (BIP325) block-signature enforcement through the same script
   interpreter used for transactions.
 - Reorg handling with cumulative-work fork choice, an undo log, and crash
@@ -74,7 +82,8 @@ testnet4, signet (public or custom) and regtest.
   leveled compaction in a background child process, WAL-checkpointed.
 - The stored set holds exactly what Core's chainstate holds (provably
   unspendable outputs are filtered at write time); its MuHash3072 digest is
-  compared against Core's `gettxoutsetinfo muhash` as the parity check.
+  compared against Core's `gettxoutsetinfo muhash` at the same height as the
+  parity check, both sides pinned to that height.
 - Pruning (`prune=<MiB>`), with whole-file-granular deletion and a refusal to
   delete anything below a sync hole.
 - Startup verification (`checkblocks`/`checklevel`) at Core's defaults;
@@ -111,13 +120,16 @@ testnet4, signet (public or custom) and regtest.
 - BIP339 `wtxidrelay`, BIP144 witness transport with witness-only peer
   preference, stripped-block serving to legacy peers, `sendheaders`,
   `feefilter`.
-- BIP152 compact blocks: this node answers `MSG_CMPCT_BLOCK` getdata and
-  `getblocktxn` and negotiates `sendcmpct`. A receive path exists since
-  2026-09-06 (`daemon/cmpct_recv.c`) but has not yet completed a
-  reconstruction that needed a `getblocktxn` round trip (2026-09-08:
-  production counted 14 such blocks, 0 reconstructed, 0 fallen back;
-  blocks arrive in full from other legs). `bmc.cmpctrecv=0` makes every
-  outbound leg request full blocks; the defect is open.
+- BIP152 compact blocks in both directions: this node answers
+  `MSG_CMPCT_BLOCK` getdata and `getblocktxn`, negotiates `sendcmpct`, and
+  reconstructs announced blocks from its mempool with a `getblocktxn` round
+  trip for what it lacks (`daemon/cmpct_recv.c`; the receive path completed
+  its first reconstruction on 2026-09-09 — a 5-byte command compare had
+  swallowed every `blocktxn` until then). Every reconstruction is checked
+  against the witness commitment before it is stored (2026-09-27): a mutated
+  one — a witness-stripped coinbase, a changed nonce — is fetched in full and
+  never marked invalid, as Core's `BLOCK_MUTATED`. `bmc.cmpctrecv=0` makes
+  every outbound leg request full blocks.
 - BIP157/158 compact block filter serving (`getcfilters`, `getcfheaders`,
   `getcfcheckpt`) backed by the whole-chain filter index.
 - BIP324 v2 encrypted transport, inbound and outbound, with in-band v1
@@ -563,11 +575,14 @@ Experimental software, AI-authored throughout, verified differentially
 against Bitcoin Core rather than independently audited by humans. It is not
 a replacement for Bitcoin Core and should not hold funds.
 
-Fresh-sync benchmarks against Bitcoin Core v31.1 on the same box are being
-run through September 2026; Core's measured time is 21 h 3 m. Run 18
-(2026-09-08) was level with Core through 400,000 blocks and half an hour
-behind at 634,000, the half hour being the day's eight relaunches. The
-landing notes in [`docs/releases/`](docs/releases/) record each change and
-the run that measured it; the daily record is in [`worklog/`](worklog/).
+Fresh-sync benchmarks against Bitcoin Core v31.1 on the same box ran through
+September 2026. The clean pair (2026-09-21): Core 19 h 32 m 54 s, this node
+18 h 24 m 02 s, with the UTXO set identical by MuHash. A full-verification
+sync (`assumevalid=0`, every script of every block) completed on 2026-09-27
+in 8 h 0 m at nice 10 on the benchmark box, its per-height digests equal to
+Core's throughout. Signature verification is level with libsecp256k1 on one
+core (2026-09-27). The landing notes in [`docs/releases/`](docs/releases/)
+record each change and the run that measured it; the daily record is in
+[`worklog/`](worklog/).
 mempool.space runs against the production node through the Esplora facade
 ([`docs/MEMPOOL_SPACE.md`](docs/MEMPOOL_SPACE.md)).

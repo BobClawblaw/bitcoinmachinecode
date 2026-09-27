@@ -131,6 +131,35 @@ also annotated tags.
 | [`releases/2026-09-09-leg-lifecycle.md`](releases/2026-09-09-leg-lifecycle.md) | Outbound legs: every close says whose it is, a failed dial is remembered, the streak is per peer, pongs within one pass |
 | [`releases/2026-09-09-pings-and-one-request-per-block.md`](releases/2026-09-09-pings-and-one-request-per-block.md) | Pings on every leg, and one request per block across the legs |
 | [`releases/2026-09-09-version-truth.md`](releases/2026-09-09-version-truth.md) | The version message tells the truth |
+| [`releases/2026-09-07-assumevalid-header-chain.md`](releases/2026-09-07-assumevalid-header-chain.md) | 2026-09-07 — assumevalid resolves on the header chain |
+| [`releases/2026-09-07-index-holes-and-bmc-tools.md`](releases/2026-09-07-index-holes-and-bmc-tools.md) | 2026-09-07 — A hole in the index is in-flight work; the whole suite carries the `bmc_` prefix |
+| [`releases/2026-09-09-compaction-under-the-apply.md`](releases/2026-09-09-compaction-under-the-apply.md) | 2026-09-09 — A background merge waits while the apply is behind, and yields when it runs |
+| [`releases/2026-09-09-duplicate-block-ends-the-pass-well.md`](releases/2026-09-09-duplicate-block-ends-the-pass-well.md) | 2026-09-09 — A block another leg just stored is not the peer's fault |
+| [`releases/2026-09-09-fresh-sync-uses-dbcache.md`](releases/2026-09-09-fresh-sync-uses-dbcache.md) | 2026-09-09 — A fresh sync uses the dbcache |
+| [`releases/2026-09-10-bmcgetdownloadinfo.md`](releases/2026-09-10-bmcgetdownloadinfo.md) | 2026-09-10 — `bmcgetdownloadinfo`, the first RPC of our own |
+| [`releases/2026-09-10-build-attestation.md`](releases/2026-09-10-build-attestation.md) | 2026-09-10 — getnetworkinfo names the build; the download RPC is renamed so a monitor may call it |
+| [`releases/2026-09-10-checkpoint-cadence-in-bulk.md`](releases/2026-09-10-checkpoint-cadence-in-bulk.md) | 2026-09-10 — Bulk mode checkpoints on its own cadence, and a bounded pass never downshifts |
+| [`releases/2026-09-10-coinstats-folds-per-block.md`](releases/2026-09-10-coinstats-folds-per-block.md) | 2026-09-10 — The coinstats index folds per block during a bulk sync, like Core's |
+| [`releases/2026-09-10-core-download-shape.md`](releases/2026-09-10-core-download-shape.md) | 2026-09-10 — The parallel download takes Core's shape |
+| [`releases/2026-09-10-counter-drift-after-a-crash.md`](releases/2026-09-10-counter-drift-after-a-crash.md) | 2026-09-10 — The live coin counter after a crash in bulk mode |
+| [`releases/2026-09-10-eight-download-peers.md`](releases/2026-09-10-eight-download-peers.md) | 2026-09-10 — Eight download peers, the number Core uses |
+| [`releases/2026-09-10-helper-budget.md`](releases/2026-09-10-helper-budget.md) | 2026-09-10 — A budget for the dial helpers |
+| [`releases/2026-09-10-helper-dials-v1-and-the-workers-dial-memory.md`](releases/2026-09-10-helper-dials-v1-and-the-workers-dial-memory.md) | 2026-09-10 — Helper-dialed legs speak v1, and the worker finally has a dial memory |
+| [`releases/2026-09-10-indexes-repair-themselves.md`](releases/2026-09-10-indexes-repair-themselves.md) | 2026-09-10 — The block filter index and the address history repair themselves |
+| [`releases/2026-09-10-legs-through-handoff.md`](releases/2026-09-10-legs-through-handoff.md) | 2026-09-10 — The legs stay served through a reorg handoff |
+| [`releases/2026-09-10-overlap-measure-and-helper-dials.md`](releases/2026-09-10-overlap-measure-and-helper-dials.md) | 2026-09-10 — Row 5's measurement, and no dial ever blocks the leg loop again |
+| [`releases/2026-09-10-pass-in-a-helper.md`](releases/2026-09-10-pass-in-a-helper.md) | 2026-09-10 — A leg's pass runs in a helper, so a slow fetch stalls nobody |
+| [`releases/2026-09-10-probe-off-busy-legs.md`](releases/2026-09-10-probe-off-busy-legs.md) | 2026-09-10 — The reorg probe runs before the pass, on an idle leg; no pass runs inline |
+| [`releases/2026-09-10-request-drain.md`](releases/2026-09-10-request-drain.md) | 2026-09-10 — The transaction request queue drains, as Core's does |
+| [`releases/2026-09-10-session-in-flight.md`](releases/2026-09-10-session-in-flight.md) | 2026-09-10 — A BIP324 session hands over with the message in flight |
+| [`releases/2026-09-10-stall-eviction-remembers.md`](releases/2026-09-10-stall-eviction-remembers.md) | 2026-09-10 — A stalling peer is remembered, not handed the same chunk again |
+| [`releases/2026-09-10-sweep-records-sendcmpct.md`](releases/2026-09-10-sweep-records-sendcmpct.md) | 2026-09-10 — The sweep records the peer's sendcmpct |
+| [`releases/2026-09-10-tip-latency-core-shape.md`](releases/2026-09-10-tip-latency-core-shape.md) | 2026-09-10 — At the tip, Core's shape: announcements drive the pass, high-bandwidth compact blocks, the apply follows the store |
+| [`releases/2026-09-10-v2-session-handover.md`](releases/2026-09-10-v2-session-handover.md) | 2026-09-10 — A BIP324 session travels with its socket across the dial helper's fork |
+| [`releases/2026-09-11-download-occupancy.md`](releases/2026-09-11-download-occupancy.md) | 2026-09-11 — The download reports its occupancy |
+| [`releases/2026-09-12-getrawmempool-graph.md`](releases/2026-09-12-getrawmempool-graph.md) | 2026-09-12 — Verbose `getrawmempool` carries the ancestor graph |
+| [`releases/2026-09-16-indexes-build-during-the-sync.md`](releases/2026-09-16-indexes-build-during-the-sync.md) | Every index builds during the sync (2026-09-16) |
+| [`releases/2026-09-27-crypto-parity-and-the-full-verification-sync.md`](releases/2026-09-27-crypto-parity-and-the-full-verification-sync.md) | Signature verification at libsecp256k1's speed, the full-verification sync, and a byte order (2026-09-27) |
 
 ## Development history
 
