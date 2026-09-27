@@ -4,6 +4,13 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-28 (early) — main #324–#326 merged (`c891ce14`); the CLI's two x86 parities dropped with x86's
+
+- **#325 (the mutated-block fix and the Darwin `legs_heard_within`) is on main** as `b022c0f9`/`f573b0ec`, with the x86 session's own addition `5c24fbc2` (`test_cmpct_fallback` links `block_witness.c` too — the Mac hunk covered only `test_cmpct_recv`'s rule; the Mac harness links every test against the daemon archive, so it never saw the gap).
+- **#324 (store CLI + `multisig_verify`).** `bitcoin_cli.S` had kept, on purpose, the two x86 behaviours the twin documented — uppercase hex digits rejected, and per-command stack block buffers (0x180 / 0x800 / 0x4000) that made a real block "not found"; x86 fixed both, so the Mac follows: `HEXVAL` takes `'A'-'F'`, and the five block-reading commands share one static 4 MiB `Lblockbuf` (the old frames stay, their buffer bytes unused). `bitcoin_multisig.S` already refused a push that does not fit the scriptSig (its header says so: the C twin's rule, which is how the differential caught x86's over-read), so main's guard-page test passes unchanged. Main's `test_cli` (uppercase, a 20 KB block through every command) and `test_multisig` PASS.
+- **`docs/PARITY_ATTESTATION.md`** merged by hand: x86's two 2026-09-27 rows above the Mac's 09-25 row.
+- **Full suite:** 413 PASS, 10 SKIP, 15 N/A, 0 FAIL.
+
 ## 2026-09-27 (night) — safegcd inversion and the square-root chain in AArch64: `fe_inv_var`, `fe_pow_sqrt`, and `sc_inv_var` replaced
 
 Main #319/#320 gave x86 an addition-chain square root for `pubkey_parse` and a Bernstein-Yang safegcd inverse mod p for the public inversions; the Mac assembly now exports both, and its `sc_inv_var` is the same safegcd body instantiated for n.

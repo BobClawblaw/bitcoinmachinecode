@@ -14,12 +14,17 @@
  * Commands: help, getblockcount / stop, getbestblockhash, getblockhash <h>,
  * getblock <h | hash64>, gettx <txid64>, getbalance, prune <h>.
  *
- * The x86 parity the twin documents is kept: uppercase hex digits are
- * REJECTED (the asm's 'A'-'F' branch falls into .bad); the block buffers are
- * the asm's -- 0x180 bytes for getblock / gettx / getbalance, 0x800 for
- * getblockhash, 0x4000 (a static buffer) for getbestblockhash -- so a larger
- * block is "not found" / skipped / "height out of range", as on x86; cap is
- * never checked (nor on x86). The varint bounds are the twin's real ones.
+ * Until 2026-09-27 (x86 main #324) this kept two x86 parities the twin
+ * documented: uppercase hex digits were REJECTED (the asm's 'A'-'F' branch
+ * fell into .bad), and the block buffers were the asm's -- 0x180 bytes for
+ * getblock / gettx / getbalance, 0x800 for getblockhash, 0x4000 for
+ * getbestblockhash -- so a real block was "not found" / skipped / "height
+ * out of range". Now, as x86: HEXVAL takes 'A'-'F', and every command that
+ * reads a block uses the one static Lblockbuf (4 MiB, above
+ * MAX_BLOCK_SERIALIZED_SIZE; cli_main is single-threaded and the commands
+ * never overlap). The frames below still reserve the old stack buffers'
+ * bytes at sp+0; they are unused. cap is never checked (nor on x86). The
+ * varint bounds are the twin's real ones.
  * ========================================================================== */
     .text
 
@@ -63,17 +68,27 @@ _cli_atoi:
     cneg  x0, x9, ne
     ret
 
-/* HEXVAL wd, ws: wd = the digit's value, or branch to \bad ; 0-9 a-f only */
+/* HEXVAL wd, ws: wd = the digit's value, or branch to \bad ; 0-9 a-f A-F */
 .macro HEXVAL wd, ws, bad
     sub   \wd, \ws, #'0'
     cmp   \wd, #9
     b.ls  91f
     sub   \wd, \ws, #'a'
     cmp   \wd, #5
+    b.ls  92f
+    sub   \wd, \ws, #'A'                 /* uppercase: rejected until 2026-09-27 */
+    cmp   \wd, #5
     b.hi  \bad
-    add   \wd, \wd, #10
+92: add   \wd, \wd, #10
 91:
 .endm
+
+/* BLOCKBUF reg: the static block buffer (see the header) */
+.macro BLOCKBUF reg
+    adrp  \reg, Lblockbuf@PAGE
+    add   \reg, \reg, Lblockbuf@PAGEOFF
+.endm
+#define BLOCKBUF_CAP 0x400000
 
 /* cli_hex_to_bin(out=x0, h=x1) ; leaf */
     .p2align 2
@@ -276,15 +291,13 @@ Lcmd_best:
     ldr   w1, [x0, #24]                   /* (u32) tip, zero-extended */
     cmn   w1, #1
     b.eq  9f
-    adrp  x2, Lbestbuf@PAGE
-    add   x2, x2, Lbestbuf@PAGEOFF
-    mov   x3, #0x4000
+    BLOCKBUF x2
+    mov   x3, #BLOCKBUF_CAP
     bl    Lload_block
     cmp   x0, #80
     b.lt  9f
     mov   x0, x19
-    adrp  x1, Lbestbuf@PAGE
-    add   x1, x1, Lbestbuf@PAGEOFF
+    BLOCKBUF x1
     bl    Lhash_line
     b     10f
 9:  mov   x0, #0
@@ -312,13 +325,13 @@ Lcmd_bhash:
     b.hi  9f
     mov   x0, x19
     mov   x1, x21
-    mov   x2, sp
-    mov   x3, #0x800
+    BLOCKBUF x2
+    mov   x3, #BLOCKBUF_CAP
     bl    Lload_block
     cmp   x0, #80
     b.lt  9f
     mov   x0, x20
-    mov   x1, sp
+    BLOCKBUF x1
     bl    Lhash_line
     b     10f
 9:  mov   x0, #0
@@ -365,14 +378,14 @@ Lcmd_block:
     b.hi  Lcb_none
     mov   x0, x19
     mov   w1, w22
-    mov   x2, sp
-    mov   x3, #0x180
+    BLOCKBUF x2
+    mov   x3, #BLOCKBUF_CAP
     bl    Lload_block
     cmp   x0, #80
     b.lt  3f
     mov   x24, x0
     add   x0, sp, #0x1c0
-    mov   x1, sp
+    BLOCKBUF x1
     bl    _block_hash
     add   x9, sp, #0x1c0
     add   x10, sp, #0x1a0
@@ -399,15 +412,15 @@ Lcb_height:
     b.hi  Lcb_none
     mov   x1, x0
     mov   x0, x19
-    mov   x2, sp
-    mov   x3, #0x180
+    BLOCKBUF x2
+    mov   x3, #BLOCKBUF_CAP
     bl    Lload_block
     cmp   x0, #0
     b.le  Lcb_none
 Lcb_emit:                                 /* x0 = the length */
     mov   x2, x0
     mov   x0, x21
-    mov   x1, sp
+    BLOCKBUF x1
     bl    _cli_hex
     mov   w9, #'\n'
     strb  w9, [x0], #1
@@ -454,19 +467,21 @@ Lcmd_tx:
     b.hi  Ltx_none
     mov   x0, x19
     mov   w1, w21
-    mov   x2, sp
-    mov   x3, #0x180
+    BLOCKBUF x2
+    mov   x3, #BLOCKBUF_CAP
     bl    Lload_block
     cmp   x0, #80
     b.le  5f
     mov   x27, x0
-    add   x0, sp, #80
+    BLOCKBUF x0
+    add   x0, x0, #80
     sub   x1, x27, #80
     bl    Lread_varint
     tbnz  x0, #63, 5f
     cbz   x1, 5f
     mov   x25, x1                         /* ntx */
-    add   x23, sp, #80
+    BLOCKBUF x23
+    add   x23, x23, #80
     add   x23, x23, x0                    /* p */
     sub   x24, x27, #80
     sub   x24, x24, x0                    /* rem */
@@ -560,18 +575,20 @@ Lcmd_balance:
     b.hi  Lbal_done
     mov   x0, x19
     mov   w1, w21
-    mov   x2, sp
-    mov   x3, #0x180
+    BLOCKBUF x2
+    mov   x3, #BLOCKBUF_CAP
     bl    Lload_block
     cmp   x0, #80
     b.le  5f
     mov   x28, x0
-    add   x0, sp, #80
+    BLOCKBUF x0
+    add   x0, x0, #80
     sub   x1, x28, #80
     bl    Lread_varint
     tbnz  x0, #63, 5f
     cbz   x1, 5f
-    add   x24, sp, #80
+    BLOCKBUF x24
+    add   x24, x24, #80
     add   x24, x24, x0                    /* the coinbase */
     sub   x2, x28, #80
     sub   x2, x2, x0
@@ -583,7 +600,8 @@ Lcmd_balance:
     ldr   w27, [sp, #0x180 + 16]          /* n_out */
     ldr   x9, [sp, #0x180 + 40]           /* out0 value offset */
     add   x24, x24, x9
-    add   x25, sp, x28                    /* end = buf + n */
+    BLOCKBUF x25
+    add   x25, x25, x28                   /* end = buf + n */
     mov   w26, #0
 2:  cmp   w26, w27
     b.hs  5f
@@ -786,4 +804,4 @@ Lc_tx:      .asciz "gettx"
 Lc_balance: .asciz "getbalance"
 Lc_prune:   .asciz "prune"
 
-.zerofill __DATA,__bss,Lbestbuf,0x4000,4
+.zerofill __DATA,__bss,Lblockbuf,0x400000,4   /* BLOCKBUF_CAP */
