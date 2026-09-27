@@ -23,6 +23,13 @@ args=()
 for a in "$@"; do
     if [ "$a" = "--no-build" ]; then build=0; else args+=("$a"); fi
 done
+# the block Core's benchmarks use, when port/osx/fetch_fixtures.sh has put it
+# here: bench_abi_audit's cons_verify / hash160 sections and
+# test_strip_witness_diff run instead of SKIPping (the Makefile's `?=` takes
+# the environment)
+if [ -z "${CORE_BENCH_BLOCK:-}" ] && [ -f "$here/../../asm/tests/fixtures/block413567.raw" ]; then
+    export CORE_BENCH_BLOCK=tests/fixtures/block413567.raw
+fi
 if [ $build -eq 1 ]; then
     echo "== building: daemon objects, tools, test helpers"
     bash "$here/build_daemon.sh" 2>&1 | tail -1 || exit 2

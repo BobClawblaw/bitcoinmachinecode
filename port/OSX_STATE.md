@@ -4,6 +4,12 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-27 — the large fixtures fetch from the local Core; test_taproot_block_diff runs on the Mac
+
+- **`port/osx/fetch_fixtures.sh`** fetches the gitignored fixtures from this Mac's Bitcoin Core (txindex) instead of the x86 box's scratch oracle: `validation/fetch_taproot_blocks.py` now honours `CORE_CLI`, and `port/osx/core_cli.py` is the bitcoin-cli stand-in it gets (JSON-RPC on 8332, credentials from bitcoin.conf, never printed).
+- **`test_taproot_block_diff`**: all 36 taproot-dense blocks (825000–825015, 840000–840007, 870000–870007, 850000/1, 860000/1), both directions, 0 failures on the assembly build. It was SKIP on the Mac until today.
+- **block413567.raw**: `run_tests.sh` exports `CORE_BENCH_BLOCK` when it is present. `bench_abi_audit` then audits 16 primitives (12 without it) and `test_strip_witness_diff` runs; both PASS. The remaining consumers of that block are the x86-only twin tests.
+
 ## 2026-09-26 (night) — the C twins are assembly: every x86 module has an AArch64 assembly counterpart
 
 **Every `port/osx/*_twin.c` that the daemon linked is now AArch64 assembly**: 37 modules in 5 batches. Each twin moved to `port/osx/test_support/` as the differential oracle. The daemon build globs `port/osx/*.{c,S}`, so a twin there can never be linked again by accident. `sc_mul`/`sc_mul_512`, which still tail-called C, are assembly too.
