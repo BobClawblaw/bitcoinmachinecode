@@ -1714,3 +1714,26 @@ long chain_invalidate_block(void* st, long h, const unsigned char hash[32]){
             h, added ? "new mark" : "already marked", store_tip(st), h);
     return 1;
 }
+
+/* A MUTATED block (2026-09-27; utxo_live's mutated hook): the bytes stored at
+ * h are not the block their header names -- a witness mutation, which the
+ * block hash does not commit to. Step 2 of chain_invalidate_block alone: the
+ * archive back to h-1 through the reorg module's disconnect. NO mark (the
+ * hash is the real chain's; a mark would refuse it for as long as it stood)
+ * and NO headers rollback (the header chain is right; the next fetch
+ * delivers the block again, from whichever peer answers). 1 done, 0
+ * refused, -1 failed part way (the reorg log says where). */
+long chain_drop_mutated_block(void* st, long h){
+    if (h < 0) return 0;
+    long tip = store_tip(st);
+    if (h > tip) return 1;                              /* nothing stored at h: nothing to drop */
+    long applied = utxo_live_applied_height();
+    fprintf(stderr, "[chain] mutated block at height %ld (tip %ld, connected %ld) -- dropping the archive back to %ld, no mark\n",
+            h, tip, applied, h - 1);
+    long r = reorg_disconnect_to(st, h - 1);
+    if (r != 1){
+        fprintf(stderr, "[chain] mutated: disconnect %s\n", r == 0 ? "refused (see the reorg log)" : "FAILED PART WAY -- see the reorg log");
+        return r == 0 ? 0 : -1;
+    }
+    return 1;
+}

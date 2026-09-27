@@ -1417,8 +1417,8 @@ tests/test_sync_dup: tests/test_sync_dup.c $(SERVETXVALSRCS) $(DAEMONOBJS) bitco
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_sync_dup.c $(SERVETXVALSRCS) $(DAEMONOBJS) bitcoin_pow_rules.o
 # test_cmpct_fallback -- a compact block that reconstructs into a block that
 # fails verification is re-requested in full, once (Core's fallback; 2026-09-09)
-tests/test_cmpct_fallback: tests/test_cmpct_fallback.c daemon/cmpct_recv.c daemon/cmpct_recv.h $(SERVETXVALSRCS) $(DAEMONOBJS) bitcoin_pow_rules.o $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I. -I daemon -o $@ tests/test_cmpct_fallback.c daemon/cmpct_recv.c $(SERVETXVALSRCS) $(DAEMONOBJS) bitcoin_pow_rules.o
+tests/test_cmpct_fallback: tests/test_cmpct_fallback.c daemon/cmpct_recv.c daemon/cmpct_recv.h daemon/block_witness.c daemon/block_witness.h $(SERVETXVALSRCS) $(DAEMONOBJS) bitcoin_pow_rules.o $(TEST_TMPDIR_H)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I. -I daemon -o $@ tests/test_cmpct_fallback.c daemon/cmpct_recv.c daemon/block_witness.c $(SERVETXVALSRCS) $(DAEMONOBJS) bitcoin_pow_rules.o
 
 # all-asm leveled logger (uses fd_write_all from bitcoin_net.asm)
 # BLD-5 (2026-09-05): -O2 now. Formerly -O0: same gcc -O2 vs deep-asm-call-chain interaction as the sync
@@ -1632,8 +1632,8 @@ tests/test_invalid_set: tests/test_invalid_set.c daemon/invalid_set.c daemon/inv
 # rule holds (two entries sharing a short id -> missing), and the stamped build
 # is at least 3x faster on one pinned core at 50,000. Negative control =
 # cmpct_recv_set_ht_clear(1): the whole-table memset, full width, per-entry key.
-tests/test_cmpct_recv: tests/test_cmpct_recv.c daemon/cmpct_recv.c daemon/cmpct_recv.h mempool_slot.h bitcoin_cmpct.o bitcoin_hash.o bitcoin_tx.o bitcoin_mempool.o sha256.o wallet_coinsel.c
-	$(CC) $(WARNFLAGS) -O2 -I. -I daemon -o $@ tests/test_cmpct_recv.c daemon/cmpct_recv.c bitcoin_cmpct.o bitcoin_hash.o bitcoin_tx.o bitcoin_mempool.o sha256.o wallet_coinsel.c
+tests/test_cmpct_recv: tests/test_cmpct_recv.c daemon/cmpct_recv.c daemon/cmpct_recv.h daemon/block_witness.c daemon/block_witness.h mempool_slot.h bitcoin_cmpct.o bitcoin_hash.o bitcoin_tx.o bitcoin_mempool.o sha256.o wallet_coinsel.c
+	$(CC) $(WARNFLAGS) -O2 -I. -I daemon -o $@ tests/test_cmpct_recv.c daemon/cmpct_recv.c daemon/block_witness.c bitcoin_cmpct.o bitcoin_hash.o bitcoin_tx.o bitcoin_mempool.o sha256.o wallet_coinsel.c
 
 # test_mempool_wtxid -- 2026-09-06: every mempool slot caches its entry's wtxid
 # (sha256d of the stored bytes; == txid for a non-witness tx), computed once by

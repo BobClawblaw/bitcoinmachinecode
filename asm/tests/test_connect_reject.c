@@ -197,6 +197,16 @@ static long reject_via_chain(void* st, long h, const u8 hash[32], const char* re
     return chain_invalidate_block(st, h, hash);
 }
 
+/* the mutated hook the worker registers is main.c's dl_drop_mutated_block:
+ * chain_drop_mutated_block + peer scoring; the chain half is what is tested */
+extern long chain_drop_mutated_block(void* st, long h);
+static int g_drop_calls = 0;
+static long drop_via_chain(void* st, long h, const u8 hash[32], const char* reason){
+    (void)hash; g_drop_calls++;
+    printf("  mutated hook: height %ld reason=%s\n", h, reason ? reason : "(null)");
+    return chain_drop_mutated_block(st, h);
+}
+
 static void append_and_mirror(long h, const u8* raw, long len, const u8 hash[32]){
     long r = store_append(store_buf, hash, raw, len);
     if (r != h) { printf("FAIL store_append h=%ld got=%ld\n", h, r); failures++; }
@@ -319,6 +329,72 @@ int main(void){
     invset_clear();
     ck("guard: invalid.dat still holds exactly one mark", invset_load("invalid.dat"), 1);
     ck("guard: not halted", utxo_live_halted(), 0);
+
+    /* ---- Phase 5: a MUTATED block is dropped and re-fetched, never marked ---- */
+    printf("\n-- phase 5: a mutated block (a witness where none may be) is dropped, nothing marked\n");
+    {
+        extern void utxo_live_set_mutated_fn(long (*)(void*, long, const u8[32], const char*));
+        extern long utxo_live_call_mutated_height(void);
+        extern long utxo_live_mutated_count(void);
+        extern long store_truncate_to(void* st, long long target);
+        /* phase 4 left the second poison stored, unconnected, at 151: drop it */
+        ck("archive back to 150 for this phase", store_truncate_to(store_buf, 150), 1);
+        u8 prev150[32];
+        { static u8 blk[1<<16]; extern long store_read_at(void*, unsigned long, void*, long);
+          long l = store_read_at(store_buf, 150, blk, sizeof blk); ck("read block 150 back", l >= 80, 1);
+          block_hash(prev150, blk); }
+        /* the block at 151 whose coinbase carries a witness (marker, flag, one
+         * item) with segwit not active at this height: "unexpected-witness",
+         * one of the three witness mutations. Its txid -- and so the block
+         * hash -- is the witness-stripped one: a valid block with these bytes
+         * under it MUTATED, exactly what a peer can deliver. */
+        u8 raw[512], mut_hash[32];
+        long len;
+        {
+            u8 cb[128], cb_txid[32]; u8* q = cb;
+            put32(q,1); q+=4; *q++ = 0; *q++ = 1;                 /* marker, flag */
+            *q++ = 1; memset(q,0,32); q+=32; put32(q,0xffffffffu); q+=4;
+            *q++ = 4; put32(q, 0x71000000u); q+=4; put32(q,0xffffffffu); q+=4;
+            *q++ = 1; put64(q, 50000000ULL); q+=8; *q++ = 1; *q++ = 0x51;
+            *q++ = 1; *q++ = 32; memset(q, 0x42, 32); q+=32;      /* the witness: one 32-byte item */
+            put32(q,0); q+=4;
+            long cblen = q - cb;
+            if (!tx_txid(cb_txid, cb, (unsigned long)cblen, g_txid_scratch, sizeof g_txid_scratch)){ printf("FAIL tx_txid (witness coinbase)\n"); failures++; }
+            const u8* txs[1] = { cb }; long lens[1] = { cblen };
+            len = finish_block(raw, mut_hash, prev150, cb_txid, 1800400000u, txs, lens, 1);
+        }
+        append_and_mirror(151, raw, len, mut_hash);
+        long hc_before = headers_count();
+        ck("mutated block appended at 151", (long)*(int*)(store_buf+24), 151);
+        utxo_live_set_mutated_fn(drop_via_chain);
+        long r5 = utxo_live_catchup(store_buf);
+        ck("mutated: the call does not fail (>= 0): the drop hook ran", r5 >= 0, 1);
+        ck("mutated: the drop hook ran once", g_drop_calls, 1);
+        ck("mutated: reported as MUTATED at 151 for this call", utxo_live_call_mutated_height(), 151);
+        ck("mutated: NOT reported as a rejection", utxo_live_call_rejected_height(), -1);
+        ck("mutated: failure kind mutated (4)", utxo_live_last_fail_kind(), 4);
+        ck("mutated: the reason is unexpected-witness", strcmp(utxo_live_last_reject(), "unexpected-witness") == 0, 1);
+        ck("mutated: mutated count 1", utxo_live_mutated_count(), 1);
+        ck("mutated: the archive is back at 150 (the bytes dropped)", (long)*(int*)(store_buf+24), 150);
+        ck("mutated: headers.dat is NOT rolled back", headers_count(), hc_before);
+        invset_clear();
+        ck("mutated: invalid.dat still holds exactly the one mark from phase 2", invset_load("invalid.dat"), 1);
+        ck("mutated: ... and NOT this block's hash", invset_has(mut_hash), 0);
+        ck("mutated: the reject hook did NOT run", g_hook_calls, 1);
+        ck("mutated: rejected count still 1", utxo_live_rejected_count(), 1);
+        ck("mutated: applied height stays 150", utxo_live_applied_height(), 150);
+        ck("mutated: not halted", utxo_live_halted(), 0);
+        /* the block as it really is arrives next: the same hash connects */
+        {
+            u8 raw2[256], hash2[32];
+            long len2 = mk_and_mine(raw2, hash2, prev150, 0x72000000u, 1800400001u);
+            append_and_mirror(151, raw2, len2, hash2);
+        }
+        ck("the real block at 151 connects (1 applied)", utxo_live_catchup(store_buf), 1);
+        ck("applied height 151", utxo_live_applied_height(), 151);
+        ck("no mutation reported for that call", utxo_live_call_mutated_height(), -1);
+        utxo_live_set_mutated_fn(NULL);
+    }
 
     utxo_live_set_reject_fn(NULL);
     utxo_live_close();
