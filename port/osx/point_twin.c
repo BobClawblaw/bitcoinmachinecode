@@ -4,7 +4,7 @@
  *
  * Same formulas, same 4x64 limb convention, same 12-limb Jacobian / 8-limb
  * affine layout, same infinity representation (Z=0 with X=Y=1) as the x86
- * asm.  Field ops come from fe_twin.c (fe_mul/fe_sqr/fe_add/fe_sub), scalar
+ * asm.  Field ops come from secp256k1_fe.S (fe_mul/fe_sqr/fe_add/fe_sub), scalar
  * split from port/osx/secp256k1_scalar.S, wNAF from secp256k1_glv_c.c.
  *
  * API (AAPCS64):

@@ -94,6 +94,14 @@ for f in ../port/osx/*.c ../port/osx/*.S; do
     if ! $CC -c -o "$obj" "$f" 2>>"$ERRLOG"; then echo "PORTOBJ FAIL: $f" >> "$ERRLOG"; fi
   fi
 done
+# drop px_ objects whose source is gone: when a C twin becomes assembly (fe_twin.c
+# -> secp256k1_fe.S, 2026-09-26) the old object would otherwise stay in
+# daemon_out, be linked with everything else, and collide with its replacement
+for obj in "$OUT"/px_*.o; do
+  [ -e "$obj" ] || continue
+  b=$(basename "$obj" .o); b=${b#px_}
+  [ -f "../port/osx/$b.c" ] || [ -f "../port/osx/$b.S" ] || rm -f "$obj"
+done
 # secp256k1_glv_c + scalar_c built already via CSRC; bitcoin_tx.S etc. included above
 # NOTE: bitcoin_net/bitcoin_p2p/bitcoin_headers/bitcoin_addrmgr/bitcoin_idx/
 # bitcoin_store*/bitcoin_utxo* are covered by the C twins in port/osx (they

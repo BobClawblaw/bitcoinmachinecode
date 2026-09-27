@@ -1,5 +1,11 @@
 /* ============================================================================
  * fe_twin.c -- C twin for secp256k1_fe (the 256-bit prime field mod
+ *
+ * 2026-09-26: RETIRED from the daemon. port/osx/secp256k1_fe.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * p = 2^256 - 2^32 - 977) on the macOS port.
  *
  * The x86 body (asm/secp256k1_fe.asm) is a hand-scheduled ADcx/ADox/MULX

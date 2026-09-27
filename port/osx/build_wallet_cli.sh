@@ -12,7 +12,7 @@ $CC -o "$OUT/bmc_wallet_cli" \
     daemon/wallet_cli.c wallet_core.c wallet_store.c daemon/wallet_crypter.c \
     bitcoin_aes.c wallet_book.c wallet_txlog.c wallet_msgsign.c \
     ../port/osx/script_twin.c \
-    ../port/osx/fe_twin.c ../port/osx/point_twin.c ../port/osx/point_ct_twin.c \
+    ../port/osx/secp256k1_fe.S ../port/osx/point_twin.c ../port/osx/point_ct_twin.c \
     ../port/osx/ecdsa_twin.c ../port/osx/pubkey_schnorr_twin.c \
     ../port/osx/secp256k1_scalar.S ../port/osx/sc_mul_c.c ../port/osx/sc_mul_512_c.c \
     secp256k1_scalar_c.c secp256k1_glv_c.c ../port/osx/g_comb_table_data.c \

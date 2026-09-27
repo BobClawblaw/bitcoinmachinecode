@@ -18,12 +18,12 @@
  *     ecdsa_x_eq_mod_n(r, X, Z) == 1  iff  X * Z^-2 == r (mod n)
  * The function compares FIELD elements limb-for-limb, so the Jacobian
  * numerator for affine x under Z is X = x * Z^2 (mod p) -- built here with
- * the same fe_twin primitives the module itself uses.
+ * the same field primitives the module itself uses (secp256k1_fe.S).
  *
  * Build (osx, from asm/):
  *   cc -O2 -arch arm64 -I. -Itests -I../port/osx/compat -D_DARWIN_C_SOURCE \
  *     -o test_ecdsa_xmod tests/test_ecdsa_xmod.c ../port/osx/ecdsa_twin.c \
- *     ../port/osx/fe_twin.c ../port/osx/point_twin.c \
+ *     ../port/osx/secp256k1_fe.S ../port/osx/point_twin.c \
  *     ../port/osx/g_comb_table_data.c ../port/osx/sc_mul_c.c \
  *     ../port/osx/sc_mul_512_c.c secp256k1_scalar_c.c secp256k1_glv_c.c \
  *     ../port/osx/secp256k1_scalar.S

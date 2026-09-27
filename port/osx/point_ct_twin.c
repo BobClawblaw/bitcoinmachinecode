@@ -6,7 +6,7 @@
  *   pointh_double(r, p)           -- complete doubling, a=0 (RCB Alg 9 shape)
  *   point_scalar_mul_ct(r, xy, k) -- fixed 256-round ladder, cmov select
  *
- * Transcribed step-for-step from the x86 asm.  fe ops from fe_twin.c.
+ * Transcribed step-for-step from the x86 asm.  fe ops from secp256k1_fe.S.
  * The scalar_mul_ct emit stage preserves the x86's exact T mapping:
  *   out.x = Z!=0 ? X*Z : 1 ; out.y = Z!=0 ? Y*Z^2 : 1 ; out.z = Z.
  * (Not affine: the contract callers -- bip32_ckdpub/bip340_sign -- consume.)

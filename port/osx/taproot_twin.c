@@ -31,7 +31,7 @@
  * C twin per the escape hatch (TLS scratch + Core-quirk ordering); every
  * bound and rule transcribed.  Calls: sha256_full (sha256.S), pubkey_parse
  * (pubkey_schnorr_twin), point_scalar_mul/point_add (point_twin), fe_sqr/
- * fe_mul/fe_inv (fe_twin).
+ * fe_mul/fe_inv (secp256k1_fe.S).
  * ==========================================================================*/
 #include <stdint.h>
 #include <stdlib.h>
