@@ -20,8 +20,12 @@
 ;   point_scalar_mul_fixed for the constant-base s*G and point_scalar_mul_glv
 ;   (GLV endomorphism + width-5 wNAF) for the variable-base e*P. The x(R)==r
 ;   test is decided projectively (r*Z^2 == X mod p) so it costs no inversion
-;   and rejects before the single remaining fe_inv, which exists only because
-;   the even-Y test needs the real affine y. See PERF_SCOPE.md section 13.
+;   and rejects before the single remaining inversion, which exists only
+;   because the even-Y test needs the real affine y. See PERF_SCOPE.md
+;   section 13. That inversion is fe_inv_var (safegcd, ~0.7 us) since
+;   2026-09-27, not the constant-time fe_inv chain (2.1 us): R is public.
+;   lift_x's square root (pubkey_parse) became an addition chain the same
+;   day (4.1 -> 2.1 us). Together: 25.9 -> ~22 us per verify, one core.
 ;
 ;   Buffer table (offsets from rbp; each box is [off-N+1, off] inclusive):
 ;     s_limbs   -0x40  (32)   r_limbs    -0x70  (32)
@@ -70,7 +74,7 @@ extern bmc_ecdsa_glv_enabled      ; BMC_ECDSA_GLV kill switch, secp256k1_glv_c.c
 extern point_add
 extern fe_mul
 extern fe_sqr
-extern fe_inv
+extern fe_inv_var
 extern sha256_full
 
 %define S_SLIMS    -0x50
@@ -453,7 +457,7 @@ schnorr_verify:
     ;   inverted Z^3 as well.)  Z != 0 was established by the infinity check.
     lea rdi, [rbp+ZI]
     lea rsi, [rbp+RPT+64]
-    call fe_inv                 ; zi = Z^{-1}
+    call fe_inv_var             ; zi = Z^{-1} (public: safegcd, not the constant-time chain)
     lea rdi, [rbp+Z3]
     lea rsi, [rbp+ZI]
     call fe_sqr                 ; z3 = zi^2

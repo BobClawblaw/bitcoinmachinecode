@@ -40,7 +40,7 @@ extern sha256_full
 extern pubkey_parse
 extern point_scalar_mul
 extern point_add
-extern fe_inv
+extern fe_inv_var
 extern fe_mul
 extern fe_sqr
 
@@ -473,7 +473,7 @@ taproot_tweak_pubkey:
     call fe_sqr
     lea  rdi, [rbp+TW_ZI]
     lea  rsi, [rbp+TW_Z2]
-    call fe_inv
+    call fe_inv_var         ; public point: safegcd
     lea  rdi, [rbp+TW_XR]
     lea  rsi, [rbp+TW_Q]
     lea  rdx, [rbp+TW_ZI]
@@ -484,7 +484,7 @@ taproot_tweak_pubkey:
     call fe_mul
     lea  rdi, [rbp+TW_ZI]
     lea  rsi, [rbp+TW_Z3]
-    call fe_inv
+    call fe_inv_var         ; public point: safegcd
     lea  rdi, [rbp+TW_YR]
     lea  rsi, [rbp+TW_Q+32]
     lea  rdx, [rbp+TW_ZI]
