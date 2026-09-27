@@ -31,7 +31,7 @@ The **work list** at the end orders every GAP, PARTIAL and PROOF row.
 | BIP30, BIP34, BIP65, BIP66, BIP68/112/113, nBits schedule | height/MTP activations | same; nBits replayed against every mainnet + testnet4 header | **DONE** |
 | `MAX_MONEY`, coinbase maturity, sigops per block (80,000) | | same (VAL-2, SCR-6) | **DONE** |
 | `assumevalid` | skip scripts at/below a pinned block; `=0` verifies all | both modes, per-chain defaults | **DONE** |
-| **Full-verification replay of mainnet** (`assumevalid=0`) | Core has been run this way by many parties | **never completed here**. Two false-accepts found on 2026-09-05 sat *below* the assumevalid height — the region a default sync never executes. Run reached **744,367 of 965,599 blocks (77%)** on 2026-09-06 and is PARKED at that archive to give the box to the fresh-sync benchmark; it resumes with the same command | **PROOF** |
+| **Full-verification replay of mainnet** (`assumevalid=0`) | Core has been run this way by many parties | **COMPLETED 2026-09-27**: a fresh mainnet sync with `assumevalid=0` reached the tip (968,807) in 8 h 0 m at nice 10, every script evaluated, the UTXO set's per-height MuHash equal to Core's at every height checked (`docs/FEATURE_GAPS.md`, update 2026-09-27). History: never completed before that. Two false-accepts found on 2026-09-05 sat *below* the assumevalid height — the region a default sync never executes. Run reached **744,367 of 965,599 blocks (77%)** on 2026-09-06 and is PARKED at that archive to give the box to the fresh-sync benchmark; it resumes with the same command | **PROOF** |
 | `assumeutxo` snapshot load | `loadtxoutset` | absent | **DECIDED** (`FEATURE_GAPS.md` "genuinely still open": large lift, no need) |
 | UTXO set identity | | MuHash byte-identical to Core at two heights on two datadirs; re-runnable (`validation/muhash_vs_core.sh`) | **DONE** |
 | Reorg handling, undo, crash consistency | | same; tested | **DONE** |
@@ -183,7 +183,7 @@ by size. Each carries the test that would prove it.
 
 | # | Item | Why it is first | Size | Scope |
 |---|---|---|---|---|
-| 8 | **Full-verification replay** (`assumevalid=0`, §1) | **RUNNING** since 2026-09-06 01:12Z from the Core oracle; `stopatheight=965598`. Restarted 04:55Z on `305c1b4` (interleave) from its 250,913-block archive; that binary's header phase was abandoned by CC-5's four-page bound and the node fell back to its serial leg; restarted 05:26Z on the bound fix (`ab7087e`; 284 held pages released) and 05:28Z with `bmc.bootcatchup=0` — from 05:32Z the worker downloads and connects together (`applied=371745 lag=1`) | wall-clock | CC-8 |
+| 8 | **Full-verification replay** (`assumevalid=0`, §1) | **DONE 2026-09-27** (8 h 0 m to the tip, digests equal to Core's; see §1). Earlier: **RUNNING** since 2026-09-06 01:12Z from the Core oracle; `stopatheight=965598`. Restarted 04:55Z on `305c1b4` (interleave) from its 250,913-block archive; that binary's header phase was abandoned by CC-5's four-page bound and the node fell back to its serial leg; restarted 05:26Z on the bound fix (`ab7087e`; 284 held pages released) and 05:28Z with `bmc.bootcatchup=0` — from 05:32Z the worker downloads and connects together (`applied=371745 lag=1`) | wall-clock | CC-8 |
 | 10 | taproot script-path PSBT signing and finalization (all key types) | **done 2026-09-08**: signing proven under the consensus verifier (`test_rpc_psbt_taproot`), finalization byte-identical to Core (`test_rpc_psbtfinal`) | — | CC-10 |
 
 Every row is scoped in `docs/audits/CORE_COMPAT_SCOPES_2026-09-06.md`.
