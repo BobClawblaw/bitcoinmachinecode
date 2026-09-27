@@ -992,6 +992,40 @@ int main(void){
         ck("...and a third poll requests nothing more", read_msg_nb(sp[1], cmd, pl, sizeof pl) < 0);
         close(sp[0]); close(sp[1]);
     }
+    printf("\n== 20: a gettxout query cuts the relay poll's getdata wait short (2026-09-26) ==\n");
+    {
+        /* The worker's rotation waits in this poll for replies to its own
+         * getdata, up to max_ms per leg; gettxout waited behind it. With
+         * txrelay_wake_fd readable (a query pending) the poll returns at
+         * once; without it the same poll waits out the deadline. */
+        extern int txrelay_wake_fd, txrelay_wake_pid;
+        int sp[2], wk[2];
+        ck("leg + wake pairs", socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, wk) == 0);
+        u8 inv[1 + 36]; inv[0] = 1; inv[1] = 1; memset(inv + 2, 0, 3);
+        for (int round = 0; round < 2; round++){
+            for (int i = 0; i < 32; i++) inv[5 + i] = (u8)(0xC0 + i + round);   /* a fresh txid: we will request it */
+            p2p_write(sp[1], "inv", 3, inv, sizeof inv);
+            if (round == 0){ txrelay_wake_fd = wk[0]; txrelay_wake_pid = (int)getpid(); (void)!write(wk[1], "q", 1); }
+            else { txrelay_wake_fd = -1; }
+            struct timespec a, b; clock_gettime(CLOCK_MONOTONIC, &a);
+            txrelay_poll_leg(sp[0], mp_area, 1500);                          /* sends getdata, then waits for the tx */
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+            char cmd[13]; static u8 pl3[2048]; int plen = read_msg_nb(sp[1], cmd, pl3, sizeof pl3);
+            char l[160];
+            if (round == 0){
+                snprintf(l, sizeof l, "with a query pending, the poll returned in %.0f ms (deadline 1500)", ms);
+                ck(l, ms < 300);
+                ck("...having still requested the announced tx", plen > 0 && !strcmp(cmd, "getdata"));
+                char c; (void)!read(wk[0], &c, 1);
+            } else {
+                snprintf(l, sizeof l, "control: without a wake fd the same poll waits out its deadline (%.0f ms)", ms);
+                ck(l, ms > 1200);
+            }
+        }
+        txrelay_wake_fd = -1; close(sp[0]); close(sp[1]); close(wk[0]); close(wk[1]);
+    }
+
     printf("\n%s (%d checks, %d failures)\n", g_fails==0 ? "ALL PASS" : "SOME FAILED", g_checks, g_fails);
     return g_fails ? 1 : 0;
 }

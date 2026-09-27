@@ -1425,6 +1425,12 @@ long txrelay_drain_handoff(void* mp, long max){
     return txr_handoff_accepted;
 }
 
+/* 2026-09-26: an fd the relay poll also watches while it waits for getdata
+ * replies (the download worker's gettxout channel). When it becomes readable
+ * the poll returns at once so the caller can answer; the outstanding replies
+ * are carried to the next poll (txr_pend), as when the deadline passes. */
+int txrelay_wake_fd = -1;
+int txrelay_wake_pid = -1;       /* only the process that set it: forked helpers inherit the fd but do not answer */
 long txrelay_poll_leg(int fd, void* mp, int max_ms){
     u8* pl = txr_pl;
     char cmd[12];
@@ -1447,9 +1453,12 @@ long txrelay_poll_leg(int fd, void* mp, int max_ms){
             if (left <= 0) break;
             wait = (int)left;
         }
-        struct pollfd pf = { fd, POLLIN, 0 };
-        int pr = poll(&pf, 1, wait);
-        if (pr <= 0 || !(pf.revents & POLLIN)) break;
+        int wk = txrelay_wake_fd >= 0 && txrelay_wake_pid == (int)getpid();
+        struct pollfd pf[2] = { { fd, POLLIN, 0 }, { txrelay_wake_fd, POLLIN, 0 } };
+        int pr = poll(pf, wk ? 2 : 1, wait);
+        if (pr <= 0) break;
+        if (wk && (pf[1].revents & POLLIN) && !(pf[0].revents & POLLIN)) break;   /* a query cuts the WAIT short; buffered leg messages are still read (bounded by TXR_MAX_MSGS) */
+        if (!(pf[0].revents & POLLIN)) break;
         if (p2p_read(fd, cmd, pl, TXR_PAYLOAD_CAP, &plen) != 1) break;
         /* getpeerinfo bytesrecv_per_msg: the command is in hand here, and the
          * asm read path has two exits whose frames are not worth disturbing. */

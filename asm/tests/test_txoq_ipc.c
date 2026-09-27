@@ -96,6 +96,30 @@ int main(void){
       g_txoq_parent = save;
       ck("no worker channel is a refusal", rc == -1); }
 
+    /* 6. the WORKER side between legs (2026-09-26): txoq_service_mode(0)
+     * answers a gettxout query but leaves a block MARK (invalidateblock /
+     * reconsiderblock) in the socket for the full service point -- a mark
+     * changes chain state and must not run mid-rotation. */
+    { int wv[2]; ck("worker-side pair", socketpair(AF_UNIX, SOCK_STREAM, 0, wv) == 0);
+      int save_w = g_txoq_worker; g_txoq_worker = wv[1];
+      txoq_req mq; memset(&mq, 0, sizeof mq); mq.magic = TXOQ_MAGIC_MARK; mq.vout = 1; fill(mq.txid, 0x77);
+      ck("a MARK request is sent", send(wv[0], &mq, sizeof mq, 0) == (ssize_t)sizeof mq);
+      txoq_service_mode(0);
+      txoq_req peek; ssize_t pk = recv(wv[1], &peek, sizeof peek, MSG_PEEK | MSG_DONTWAIT);
+      ck("between legs the MARK is left in the socket, unconsumed", pk == (ssize_t)sizeof peek && peek.magic == TXOQ_MAGIC_MARK);
+      struct pollfd pp = { wv[0], POLLIN, 0 };
+      ck("...and nothing was answered for it", poll(&pp, 1, 50) == 0);
+      /* take the mark out by hand (the full point would), then a query */
+      ck("drain the mark", recv(wv[1], &peek, sizeof peek, 0) == (ssize_t)sizeof peek);
+      txoq_req q; memset(&q, 0, sizeof q); q.magic = TXOQ_MAGIC; q.vout = 3; fill(q.txid, 0x5c);
+      ck("a gettxout query is sent", send(wv[0], &q, sizeof q, 0) == (ssize_t)sizeof q);
+      txoq_service_mode(0);
+      txoq_resp rp; memset(&rp, 0, sizeof rp);
+      ck("between legs the query IS answered", txoq_read_all(wv[0], &rp, sizeof rp, 500) == 1);
+      ck("...echoing its outpoint (absent: no UTXO set in this process)",
+         rp.magic == TXOQ_MAGIC && rp.vout == 3 && rp.txid[0] == 0x5c && rp.found == 0);
+      g_txoq_worker = save_w; close(wv[0]); close(wv[1]); }
+
     close(sv[0]); close(sv[1]);
     if(failures) printf("\nFAILURES: %d\n", failures);
     else printf("\nALL TESTS PASSED (0 failures)\n");

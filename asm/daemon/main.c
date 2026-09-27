@@ -2317,17 +2317,33 @@ static long txoq_mark_block(void* store_buf, const unsigned char hash[32], int o
 }
 static void* g_txoq_store = NULL;                 /* CC-10: set by the worker before its rotation */
 static void txoq_service(void);
+static void txoq_service_mode(int allow_marks);
 /* The catch-up loop's between-block hook: publish the connected tip (3.1) so
  * the parent's RPCs and the serve children follow a long catch-up call block
  * by block, then answer pending gettxout queries (a no-op without the IPC). */
 static void dl_apply_hook(void){ dl_publish_connected_tip(); txoq_service(); }
-static void txoq_service(void){
+static void txoq_service(void){ txoq_service_mode(1); }
+/* 2026-09-26: the rotation's legs call this with allow_marks = 0. gettxout
+ * waited for the worker's next pass over its one service point -- a whole
+ * leg rotation, each relay leg polling up to 250 ms for its getdata replies:
+ * 23-1166 ms (median 268) on the Mac mainnet node with 9 peers, for a lookup
+ * that takes microseconds. The worker applies nothing inside the rotation
+ * (the apply runs after it), so a point query is as safe between two legs as
+ * after the catch-up. A block MARK (invalidateblock / reconsiderblock, CC-10)
+ * changes chain state, so it is left in the socket for the full service
+ * point: the request is peeked first and not consumed. */
+static void txoq_service_mode(int allow_marks){
     if(g_txoq_worker < 0) return;
     for(int guard = 0; guard < 64; guard++){
         struct pollfd pf = { g_txoq_worker, POLLIN | POLLOUT, 0 };
         if(poll(&pf, 1, 0) <= 0) return;
         if(!(pf.revents & POLLIN)) return;             /* nothing pending */
         if(!(pf.revents & POLLOUT)) return;            /* no room for a whole reply: the parent is not reading */
+        if(!allow_marks){
+            unsigned int magic = 0;
+            if(recv(g_txoq_worker, &magic, sizeof magic, MSG_PEEK | MSG_DONTWAIT) != (ssize_t)sizeof magic) return;
+            if(magic == TXOQ_MAGIC_MARK) return;       /* the full service point takes it */
+        }
         txoq_req q;
         if(!txoq_read_all(g_txoq_worker, &q, sizeof q, 50)) return;
         if(q.magic == TXOQ_MAGIC_MARK){                /* CC-10: invalidateblock / reconsiderblock */
@@ -9589,6 +9605,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
         }
         for(int n_=0;n_<mux_n_out;n_++){
             int i = (leg_start + n_) % mux_n_out;
+            txoq_service_mode(0);   /* gettxout between legs, not once a rotation (see txoq_service_mode) */
             /* 2026-09-10: a leg whose peer announced a block we do not have
              * goes first (its pass fetches it); this slot is revisited */
             int announced_now = 0;
@@ -12446,6 +12463,9 @@ int main(int argc, char** argv){
             { extern void mp_fork_child_reset(void) __attribute__((weak));
               if (mp_fork_child_reset) mp_fork_child_reset(); }
             if(g_txoq_parent >= 0){ close(g_txoq_parent); g_txoq_parent = -1; }
+            /* 2026-09-26: the relay poll's getdata wait wakes on a gettxout
+             * query, so the rotation answers it at the next leg boundary */
+            { extern int txrelay_wake_fd, txrelay_wake_pid; txrelay_wake_fd = g_txoq_worker; txrelay_wake_pid = (int)getpid(); }
             /* TXOQ-1 (2026-09-05 benchmark): register the between-block
              * service hook before the worker's first utxo_live_catchup, so a
              * long catch-up pass answers gettxout queries at its block
