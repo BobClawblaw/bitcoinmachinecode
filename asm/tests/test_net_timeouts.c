@@ -59,7 +59,15 @@ int main(void){
     secs = (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
     printf("  wrote %ld bytes in %d round(s), then rc=%ld after %.1f s\n", wr, rounds, rc, secs);
     ck("the blocked write gives up (-1)", rc < 0);
-    ck("...within the 10 s bound plus margin", secs >= 9.0 && secs <= 25.0);
+#ifdef __APPLE__
+    /* Darwin returns a blocked write's partial count after 15 s under a 10 s
+     * SO_SNDTIMEO (measured: 825624 bytes at 15.00 s), then the poll before
+     * the next write times out at 10 s: 25.0 s exactly, on the old ceiling. */
+    const double wmax = 30.0;
+#else
+    const double wmax = 25.0;
+#endif
+    ck("...within the 10 s bound plus margin", secs >= 9.0 && secs <= wmax);
     close(fd); close(c); close(l);
     printf("\n%s (%d failures)\n", fails ? "TESTS FAILED" : "ALL TESTS PASSED", fails);
     return fails ? 1 : 0;
