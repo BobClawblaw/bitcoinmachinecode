@@ -449,6 +449,11 @@ tests/bench_store_read: tests/bench_store_read.c bitcoin_store.o bitcoin_store_f
 tests/bench_ckeys: tests/bench_ckeys.c crypto_chacha20.c crypto_poly1305.c bitcoin_sha3.c sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I. -o $@ tests/bench_ckeys.c crypto_chacha20.c crypto_poly1305.c bitcoin_sha3.c sha256.o
 
+# bench_sc_inv -- sc_inv_var (ecdsa_verify's s^{-1}) per call, one core; the
+# libsecp256k1 counterpart is `bench_internal scalar` -> scalar_inverse_var.
+tests/bench_sc_inv: tests/bench_sc_inv.c secp256k1_scalar.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/bench_sc_inv.c secp256k1_scalar.o
+
 # bench_ecdsa -- signature verifications/sec on one core. Scoping input for
 # block script verification: the chain needs ~1e9 of these, so this rate
 # decides whether assumevalid is a prerequisite or just an optimisation.

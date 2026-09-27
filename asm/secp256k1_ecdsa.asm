@@ -20,7 +20,7 @@
 ;
 ;   Algorithm (standard ECDSA, verify is over PUBLIC inputs -> variable time):
 ;     if !(1<=r<n and 1<=s<n): return 0
-;     w  = s^{-1} mod n            [sc_inv_var: variable-time binary xgcd]
+;     w  = s^{-1} mod n            [sc_inv_var: variable-time safegcd]
 ;     u1 = z*w mod n ; u2 = r*w mod n
 ;     P  = u1*G + u2*Q             (Jacobian X:Y:Z)
 ;     if P infinity: return 0
@@ -36,7 +36,8 @@
 ;                             or  (r + n < p  and  (r+n)*Z^2 == X (mod p)).
 ;        Pure algebra; identical verdict on every input.
 ;     B. w = s^{-1} uses sc_inv_var (secp256k1_scalar.asm), a variable-time
-;        binary extended GCD. s is PUBLIC (it is in the signature), so the
+;        inverse (binary extended GCD until 2026-09-27, Bernstein-Yang
+;        safegcd since: 3.6 -> 0.7 us per call). s is PUBLIC (it is in the signature), so the
 ;        variable-time policy that already covers point_scalar_mul applies
 ;        (see secp256k1_point_ct.asm header). Secret-scalar paths (signing,
 ;        wallet) keep the constant-time Fermat sc_inv.
