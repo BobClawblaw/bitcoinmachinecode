@@ -2323,6 +2323,20 @@ static void txoq_service_mode(int allow_marks);
  * by block, then answer pending gettxout queries (a no-op without the IPC). */
 static void dl_apply_hook(void){ dl_publish_connected_tip(); txoq_service(); }
 static void txoq_service(void){ txoq_service_mode(1); }
+/* 2026-09-26: the worker's idle rest (all legs quiet: 200 ms before the next
+ * rotation) was a blind usleep, and on a quiet node it was where gettxout
+ * waited -- signet measured 88-97 ms median, ~208 ms max, AFTER the leg-level
+ * service points went in, because the worker is mostly resting there. Rest on
+ * the query channel instead: a query ends the wait and is answered at once
+ * (queries only, as between legs) and the rest ends -- a MARK too, left
+ * unconsumed for the full service point, so a readable channel can never
+ * make this spin. Without a channel it is the plain sleep it was. */
+static void txoq_idle_rest(int ms){
+    if(g_txoq_worker < 0){ usleep((useconds_t)ms * 1000); return; }
+    struct pollfd pf = { g_txoq_worker, POLLIN, 0 };
+    if(poll(&pf, 1, ms) > 0 && (pf.revents & POLLIN))
+        txoq_service_mode(0);          /* answer the queries; a MARK is left for the full point */
+}                                      /* either way the rest ends: the next rotation starts now */
 /* 2026-09-26: the rotation's legs call this with allow_marks = 0. gettxout
  * waited for the worker's next pass over its one service point -- a whole
  * leg rotation, each relay leg polling up to 250 ms for its getdata replies:
@@ -10060,7 +10074,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                   prev_drop = hf + hb; } }
             next_heartbeat_ms = now_ms + DL_HEARTBEAT_MS;
         }
-        if(!did){ usleep(200000); }   /* all idle: rest before next rotation */
+        if(!did) txoq_idle_rest(200);   /* all idle: rest before next rotation -- awake for gettxout */
         /* background leg-fill: gradually acquire live legs toward MUX_MAX_OUT
          * from the discovered candidate pool. Boot rarely lands all 8 at once
          * on a variable network, so keep trying to add a leg occasionally

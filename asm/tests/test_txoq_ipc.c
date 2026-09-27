@@ -120,6 +120,40 @@ int main(void){
          rp.magic == TXOQ_MAGIC && rp.vout == 3 && rp.txid[0] == 0x5c && rp.found == 0);
       g_txoq_worker = save_w; close(wv[0]); close(wv[1]); }
 
+    /* 7. the worker's idle rest (2026-09-26): it rests ON the query channel.
+     * A query arriving mid-rest is answered at once and ends the rest; a
+     * MARK ends it without being consumed (no spinning on a readable fd);
+     * with nothing to do it lasts its full length. */
+    { int wv[2]; ck("idle-rest pair", socketpair(AF_UNIX, SOCK_STREAM, 0, wv) == 0);
+      int save_w = g_txoq_worker; g_txoq_worker = wv[1];
+      struct timespec a, b;
+      /* (a) a query 50 ms into a 2 s rest */
+      pid_t p = fork();
+      if (p == 0){ usleep(50000); txoq_req q; memset(&q, 0, sizeof q); q.magic = TXOQ_MAGIC; q.vout = 9; fill(q.txid, 0x31);
+                   (void)!send(wv[0], &q, sizeof q, 0); _exit(0); }
+      clock_gettime(CLOCK_MONOTONIC, &a); txoq_idle_rest(2000); clock_gettime(CLOCK_MONOTONIC, &b);
+      int st; waitpid(p, &st, 0);
+      double ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+      txoq_resp rp; memset(&rp, 0, sizeof rp);
+      int got = txoq_read_all(wv[0], &rp, sizeof rp, 500);
+      char l[160]; snprintf(l, sizeof l, "a query 50 ms into a 2000 ms rest is answered and ends it (%.0f ms)", ms);
+      ck(l, got == 1 && rp.vout == 9 && rp.txid[0] == 0x31 && ms < 1000);
+      /* (b) a MARK: the rest returns at once, the MARK stays */
+      txoq_req mq; memset(&mq, 0, sizeof mq); mq.magic = TXOQ_MAGIC_MARK; fill(mq.txid, 0x42);
+      (void)!send(wv[0], &mq, sizeof mq, 0);
+      clock_gettime(CLOCK_MONOTONIC, &a); txoq_idle_rest(2000); clock_gettime(CLOCK_MONOTONIC, &b);
+      ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+      txoq_req pk; ssize_t n = recv(wv[1], &pk, sizeof pk, MSG_PEEK | MSG_DONTWAIT);
+      snprintf(l, sizeof l, "a pending MARK ends the rest at once (%.0f ms), left for the full service point", ms);
+      ck(l, ms < 100 && n == (ssize_t)sizeof pk && pk.magic == TXOQ_MAGIC_MARK);
+      (void)!recv(wv[1], &pk, sizeof pk, 0);
+      /* (c) nothing to do: the full rest */
+      clock_gettime(CLOCK_MONOTONIC, &a); txoq_idle_rest(150); clock_gettime(CLOCK_MONOTONIC, &b);
+      ms = (b.tv_sec - a.tv_sec) * 1e3 + (b.tv_nsec - a.tv_nsec) / 1e6;
+      snprintf(l, sizeof l, "an idle channel rests the full 150 ms (%.0f ms)", ms);
+      ck(l, ms >= 140 && ms < 600);
+      g_txoq_worker = save_w; close(wv[0]); close(wv[1]); }
+
     close(sv[0]); close(sv[1]);
     if(failures) printf("\nFAILURES: %d\n", failures);
     else printf("\nALL TESTS PASSED (0 failures)\n");
