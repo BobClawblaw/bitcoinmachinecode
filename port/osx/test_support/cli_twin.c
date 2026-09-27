@@ -2,6 +2,11 @@
  * the osx port. The last x86 module without a Mac counterpart (phase-4 sweep,
  * 2026-09-26: test_cli segfaulted calling an unresolved cli_main).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_cli.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * Exports (same contracts as the x86 asm):
  *   char* cli_hex(char *out, const u8 *src, u64 n)   -> out advanced past 2n hex chars
  *   long  cli_atoi(const char *s)                    -> value ('-' sign, stops at a non-digit)

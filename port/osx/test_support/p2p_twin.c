@@ -3,6 +3,11 @@
  * Functional twin of asm/bitcoin_p2p.asm (branch bmc_osx). Pure compute --
  * no syscalls; all wire integers LITTLE-endian (Bitcoin convention).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_p2p.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  *   long p2p_getheaders(u8 *out, const u8 *locator, long count,
  *                       const u8 stop[32]);
  *       -> payload length 5 + count*32 + 32, or -1 (count outside [1,252]).

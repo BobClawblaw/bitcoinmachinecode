@@ -2,6 +2,11 @@
  * net_twin.c -- BIP314 wire framing + fd plumbing for the macOS/AArch64 port.
  * Functional twin of asm/bitcoin_net.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_net.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  *   extern u32 net_magic;                       0xd9b4bef9
  *   extern u8  g_v2_active[4096];
  *   extern void *g_p2p_write_hook;  (*)(int fd, u32 plen, const char* cmd, u32 cmdlen)

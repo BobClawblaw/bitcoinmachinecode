@@ -2,6 +2,11 @@
  * store_twin.c -- persistent multi-file block storage + block index,
  * macOS/AArch64. Functional twin of asm/bitcoin_store.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_store.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * Modeled on Bitcoin Core's layout: rolling 128 MiB blk%05u.dat files, each
  * block framed as [u32 len LE][u32 magic f9beb4d9][raw block bytes] at a
  * file-LOCAL offset, plus a positional index.dat with one 48-byte record per

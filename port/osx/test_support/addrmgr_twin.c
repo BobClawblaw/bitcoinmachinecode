@@ -2,6 +2,11 @@
  * addrmgr_twin.c -- peer address book + addr/addrv2 wire codecs, macOS/AArch64.
  * Functional twin of asm/bitcoin_addrmgr.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_addrmgr.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * Persisted address book (peers.dat, CWD), fixed 18-byte records, dedup by IP:
  *   [0..3]   ip        u32 (network order, as inet_pton yields)
  *   [4..5]   port      u16 BE (callers pass htons(host_port))
