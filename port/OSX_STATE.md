@@ -4,6 +4,19 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-27 (evening) — a mutated block is dropped and re-fetched, never marked invalid (mainnet 968824)
+
+**The incident.** At 10:00 the mainnet node invalidated the real block 968,824 (its hash is Core's). A peer's compact block prefilled a coinbase WITHOUT its witness; the reconstruction passed the sync drain's `cons_verify` (PoW, txid merkle root — the witness is not in either), was stored, and the apply's witness-commitment phase refused it with `bad-witness-nonce-size`. The apply took that for a consensus rejection: `invalid.dat` got the hash, the archive was truncated, headers rolled back. The chain moved on only because the next peer's compact block, applied 10 s later on a path that never consults the mark, was the block as it really is. The wrong mark stayed in `invalid.dat` for ten hours, until `reconsiderblock` removed it by hand — any header re-sync through that height would have refused the real chain.
+
+**Why it is wrong.** The block hash does not commit to witness data. Core (`IsBlockMutated`, `BLOCK_MUTATED`) never marks a header for a witness mismatch: the bytes are not the block, the block is fine; the peer misbehaved and the block is fetched again. `bad-witness-nonce-size`, `bad-witness-merkle-match` and `unexpected-witness` are all of that kind.
+
+**The fix, shared C on both platforms:**
+- `daemon/cmpct_recv.c`: every completed reconstruction is checked against the witness commitment before a caller sees it (Core's `FillBlock` → `CheckBlock`); a failure is a full `MSG_WITNESS_BLOCK` getdata, never a stored block. Both completion paths (mempool-only, and after `blocktxn`).
+- `daemon/utxo_live.c`: a witness-commitment failure at apply is a new failure kind, MUTATED, not REJECT. A new hook (`utxo_live_set_mutated_fn`) drops the bytes: `reorg.c`'s `chain_drop_mutated_block` takes the archive back to h−1 through the reorg module's disconnect, with no mark and no headers rollback; `main.c`'s `dl_drop_mutated_block` stops the helpers first and scores the delivering peer when known. The same height mutated three times running is said out loud.
+- Tests: `test_cmpct_recv` (a witness-stripped coinbase and a flipped nonce byte, on both completion paths → getdata, the real block → reconstructed) and `test_connect_reject` phase 5 (a mutated block at 151 is dropped: archive back to 150, headers.dat untouched, `invalid.dat` unchanged, then the real block at 151 connects).
+
+**For the x86 side:** the same code, the same bug (note item 16).
+
 ## 2026-09-27 — the large fixtures fetch from the local Core; test_taproot_block_diff runs on the Mac
 
 - **WAL-3 on Darwin: `secure_lock` sets the core-file limit to 0, soft and hard.** Darwin has no `MADV_DONTDUMP`, so a wallet page could not be kept out of a core file per mapping; until today a Mac relied on the default soft limit of 0, which `ulimit -c` undoes. Now the process that holds a secret can never write a core, and cannot raise the limit back. `test_secure_lock` raises the soft limit first and asserts the zero, the refused raise, and the lock itself (wired, per the kernel's vm map). Trade: no core dumps of the daemon once a wallet is loaded, which is what "excluded from core dumps" in the startup line has meant on x86 all along.

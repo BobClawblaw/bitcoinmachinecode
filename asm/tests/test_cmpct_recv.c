@@ -88,6 +88,53 @@ int main(void){
       unsigned char bt[64]; memcpy(bt, bh, 32); bt[32] = 1;   /* wrong count */
       writes = 0; n = cmpct_recv_blocktxn(9, bt, 33, out, sizeof out); ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getdata"), "a blocktxn with the wrong count falls back to a full getdata"); }
     unsigned long r, need, fb; cmpct_recv_stats(&r, &need, &fb); ok(r == 3 && need >= 3 && fb == 2, "stats: 3 reconstructed (the row 5 scenario reconstructed once more), getblocktxn needed, 2 fallbacks");
+    printf("== a reconstruction that is not the block: the witness commitment (Core FillBlock -> CheckBlock; mainnet 968824, 2026-09-27) ==\n");
+    { extern void merkle_root(unsigned char out[32], unsigned char* hashes, unsigned long n);
+      /* one non-witness tx, and a coinbase with a witness nonce and the
+       * BIP141 commitment output: commit = sha256d(witness root || nonce),
+       * the witness root over wtxids with the coinbase's taken as 0 */
+      static unsigned char t1[256]; unsigned long t1l = mktx(t1, 7000);
+      unsigned char nonce[32]; memset(nonce, 0x42, 32);
+      unsigned char leaves[64]; memset(leaves, 0, 32); sha256d(leaves + 32, t1, t1l);
+      unsigned char wroot[32]; merkle_root(wroot, leaves, 2);
+      unsigned char cbuf[64], commit[32]; memcpy(cbuf, wroot, 32); memcpy(cbuf + 32, nonce, 32); sha256d(commit, cbuf, 64);
+      /* the coinbase, with (wit=1) and without (wit=0) its witness -- the
+       * txid, and so the block hash, are the same either way */
+      unsigned char cbw[256], cbs[256]; unsigned long cbwl = 0, cbsl = 0;
+      for (int wit = 1; wit >= 0; wit--){
+          unsigned char* t = wit ? cbw : cbs; unsigned long o = 0;
+          t[o++]=1; t[o++]=0; t[o++]=0; t[o++]=0;
+          if (wit){ t[o++]=0; t[o++]=1; }
+          t[o++]=1; memset(t+o, 0, 32); o += 32; memset(t+o, 0xff, 4); o += 4; t[o++]=0; memset(t+o, 0xff, 4); o += 4;
+          t[o++]=2; memset(t+o, 0, 8); t[o]=50; o += 8; t[o++]=1; t[o++]=0x51;
+          memset(t+o, 0, 8); o += 8; t[o++]=38; t[o++]=0x6a; t[o++]=0x24; t[o++]=0xaa; t[o++]=0x21; t[o++]=0xa9; t[o++]=0xed; memcpy(t+o, commit, 32); o += 32;
+          if (wit){ t[o++]=1; t[o++]=32; memcpy(t+o, nonce, 32); o += 32; }
+          memset(t+o, 0, 4); o += 4;
+          if (wit) cbwl = o; else cbsl = o;
+      }
+      static unsigned char blk2[8192], blk3[8192], blk4[8192], cb2[8192], cb3[8192], cb4[8192], out2[8192];
+      memset(blk2, 0x22, 80); blk2[80] = 2; unsigned long bo2 = 81; memcpy(blk2 + bo2, cbw, cbwl); bo2 += cbwl; memcpy(blk2 + bo2, t1, t1l); bo2 += t1l;
+      memcpy(blk3, blk2, 81); unsigned long bo3 = 81; memcpy(blk3 + bo3, cbs, cbsl); bo3 += cbsl; memcpy(blk3 + bo3, t1, t1l); bo3 += t1l;   /* the coinbase stripped */
+      memcpy(blk4, blk2, bo2); unsigned long bo4 = bo2; blk4[81 + cbwl - 4 - 32] ^= 0x01;                                                  /* one nonce byte flipped */
+      unsigned char bh2[32]; block_hash(bh2, blk2);
+      unsigned char* mp2 = calloc(1, mpool_struct_size(64)); static unsigned char blob2[65536]; mpool_init(mp2, 64, blob2, sizeof blob2);
+      { unsigned char id[32]; sha256d(id, t1, t1l); mpool_put(mp2, id, t1, t1l); }
+      long cl2 = cmpctblock_build(cb2, blk2, bo2, 0x77ULL), cl3 = cmpctblock_build(cb3, blk3, bo3, 0x77ULL), cl4 = cmpctblock_build(cb4, blk4, bo4, 0x77ULL);
+      ok(cl2 > 0 && cl3 > 0 && cl4 > 0, "three compact blocks: the block, its coinbase witness-stripped, one nonce byte flipped -- one block hash");
+      writes = 0; n = cmpct_recv_cmpctblock(9, mp2, cb2, (unsigned long)cl2, out2, sizeof out2, bh2);
+      ok(n == (long)bo2 && !memcmp(out2, blk2, bo2) && writes == 0, "control: the real block reconstructs, nothing sent");
+      writes = 0; n = cmpct_recv_cmpctblock(9, mp2, cb3, (unsigned long)cl3, out2, sizeof out2, bh2);
+      ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getdata") && cap[1] == 2 && cap[4] == 0x40, "a witness-less coinbase (bad-witness-nonce-size): not returned -- a full MSG_WITNESS_BLOCK getdata instead");
+      writes = 0; n = cmpct_recv_cmpctblock(9, mp2, cb4, (unsigned long)cl4, out2, sizeof out2, bh2);
+      ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getdata") && cap[4] == 0x40, "a flipped nonce byte (bad-witness-merkle-match): the same fallback");
+      /* the same through the getblocktxn round trip: the pool lacks t1 */
+      { unsigned char id[32]; sha256d(id, t1, t1l); mpool_del(mp2, id); }
+      writes = 0; n = cmpct_recv_cmpctblock(9, mp2, cb3, (unsigned long)cl3, out2, sizeof out2, bh2);
+      ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getblocktxn"), "with t1 missing: getblocktxn first");
+      { const unsigned char* txs[1] = { t1 }; long lens[1] = { (long)t1l }; static unsigned char bt[8192]; long btl = p2p_blocktxn_build(bt, bh2, txs, lens, 1);
+        writes = 0; n = cmpct_recv_blocktxn(9, bt, (unsigned long)btl, out2, sizeof out2);
+        ok(n == 0 && writes == 1 && !strcmp(cap_cmd, "getdata") && cap[4] == 0x40, "the blocktxn completes a mutated block: not returned, the full block requested"); }
+      free(mp2); }
     printf("== the inventory type we request with ==\n");
     ok(cmpct_getdata_type(1) == 4 && cmpct_getdata_type(0) == 0x40000002u, "a leg that negotiated sendcmpct is asked for MSG_CMPCT_BLOCK; one that did not, MSG_WITNESS_BLOCK");
     printf("== the wtxid cache: reconstruction hashes no pool entry ==\n");

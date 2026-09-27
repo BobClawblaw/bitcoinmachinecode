@@ -1330,7 +1330,9 @@ const char* utxo_live_last_reject(void){ return g_last_reject; }
 #define UTXO_FAIL_REJECT 1   /* verification refused the block: utxo_live_last_reject() names it */
 #define UTXO_FAIL_STORE  2   /* a put/del/flush/WAL step returned an error */
 #define UTXO_FAIL_OTHER  3   /* hole/short block, partial-block recovery failure */
+#define UTXO_FAIL_MUTATED 4  /* the bytes are not the block their header names (witness mutation): Core BLOCK_MUTATED */
 static int  g_last_fail_kind = UTXO_FAIL_NONE;
+static int  g_last_mutated = 0;     /* set by the witness-commitment phase; classifies the failure */
 long utxo_live_store_inconsistencies(void){ return g_store_inconsistent; }
 static long g_last_fail_height = -1;
 long utxo_live_last_fail_kind(void){ return g_last_fail_kind; }
@@ -1338,7 +1340,7 @@ long utxo_live_last_fail_height(void){ return g_last_fail_height; }
 long utxo_live_halted(void){ return g_halted; }
 const char* utxo_live_fail_kind_name(long k){
     return k == UTXO_FAIL_REJECT ? "consensus-reject" : k == UTXO_FAIL_STORE ? "store-error"
-         : k == UTXO_FAIL_OTHER ? "archive/recovery" : "none";
+         : k == UTXO_FAIL_OTHER ? "archive/recovery" : k == UTXO_FAIL_MUTATED ? "mutated" : "none";
 }
 
 /* ---- 3.3 (UTXO_INLINE_CONNECT_SCOPE, 2026-09-06): a block that fails to
@@ -1389,6 +1391,25 @@ static long g_call_rejected = -1;          /* height rejected by the CURRENT/las
 long utxo_live_last_rejected_height(void){ return g_last_rejected_height; }
 long utxo_live_rejected_count(void){ return g_rejected_total; }
 long utxo_live_call_rejected_height(void){ return g_call_rejected; }
+
+/* A MUTATED block is not a rejected one (Core: BLOCK_MUTATED, never
+ * BLOCK_FAILED_VALID). The header is the chain's; the bytes under it are not
+ * the block it names -- a witness stripped, a nonce or a witness byte
+ * changed, a witness where none may be. The block hash commits to none of
+ * that, so marking it would refuse the REAL block for as long as the mark
+ * stands: mainnet 968824 on 2026-09-27, a compact-block reconstruction with
+ * a witness-less coinbase from one peer, was invalidated on this node and
+ * connected from the next peer only because that path never consults the
+ * mark. The hook drops the bytes (the archive back to h-1, no mark, no
+ * headers rollback) so the next fetch delivers the block again; the same
+ * height mutated repeatedly is said out loud, since a peer feeding it can
+ * hold the tip back until it is disconnected. */
+typedef long (*utxo_mutated_fn)(void* store_buf, long height, const unsigned char hash[32], const char* reason);
+static utxo_mutated_fn g_mutated_fn = 0;
+void utxo_live_set_mutated_fn(utxo_mutated_fn fn){ g_mutated_fn = fn; }
+static long g_mutated_total = 0, g_call_mutated = -1, g_mutated_last_h = -1, g_mutated_same = 0;
+long utxo_live_mutated_count(void){ return g_mutated_total; }
+long utxo_live_call_mutated_height(void){ return g_call_mutated; }
 
 /* Point query against the LIVE UTXO set, for the gettxout IPC (daemon/main.c).
  * The RPC server runs in the serve PARENT and has no handle on this state --
@@ -1725,7 +1746,7 @@ static int val_build_height_push(u64 h, u8* want){
 }
 
 static int apply_block_inner(const u8* blockbuf, u64 blocklen){
-    g_last_reject = "";
+    g_last_reject = ""; g_last_mutated = 0;
     if (blocklen < 81) return 0;
     const u8* p = blockbuf + 80;
     const u8* blkend = blockbuf + blocklen;
@@ -1914,8 +1935,14 @@ static int apply_block_inner(const u8* blockbuf, u64 blocklen){
         long wr = block_check_witness_commitment(txs, ntx, sizeof(block_tx_t), segwit_active,
                                                  txid_scratch, sizeof txid_scratch, &wreason);
         if (wr != 1) {
-            fprintf(stderr, "[utxo_live] REJECT h=%ld: %s\n", g_apply_height, wreason);
-            g_last_reject = "bad-witness-merkle-match";
+            fprintf(stderr, "[utxo_live] %s h=%ld: %s\n", wr == 0 ? "MUTATED" : "REJECT", g_apply_height, wreason);
+            /* wr == 0: the witness does not match the commitment, i.e. these
+             * bytes are not the block -- a MUTATION, never a rejection (see
+             * utxo_live_set_mutated_fn); wr == -1: malformed, a real refusal */
+            g_last_reject = wr == 0 && !strcmp(wreason, "bad-witness-nonce-size") ? "bad-witness-nonce-size"
+                          : wr == 0 && !strcmp(wreason, "unexpected-witness")      ? "unexpected-witness"
+                          : "bad-witness-merkle-match";
+            if (wr == 0) g_last_mutated = 1;
             return 0;
         }
     }
@@ -2346,9 +2373,10 @@ static int apply_block_at(const u8* blockbuf, u64 blocklen, long height){
         /* apply_block_inner clears g_last_reject at entry and sets it on
          * every verification refusal; a failure with it still empty came
          * from the store (put/del -1, table full) -- see live_on_input/output. */
-        g_last_fail_kind = g_last_reject[0] ? UTXO_FAIL_REJECT : UTXO_FAIL_STORE;
+        g_last_fail_kind = g_last_mutated ? UTXO_FAIL_MUTATED : g_last_reject[0] ? UTXO_FAIL_REJECT : UTXO_FAIL_STORE;
         g_last_fail_height = height;
     }
+    g_last_mutated = 0;
     return r;
 }
 static int apply_block_at_inner(const u8* blockbuf, u64 blocklen, long height){
@@ -3333,6 +3361,7 @@ static int archive_hash_at(long h, unsigned char out[32]){
 static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
     g_bip30_store = store_buf;   /* for BIP30's BIP34-ancestor test; see bip30_enforced */
     g_call_rejected = -1;        /* 3.3: per-call report, cleared before any early return */
+    g_call_mutated = -1;
     g_last_stop_reason = UTXO_STOP_TIP;
     if (g_ckpt_last_ms == 0) g_ckpt_last_ms = mono_ms();   /* the first batch is a batch, not a checkpoint on block one */
     store_reload(store_buf);
@@ -3427,6 +3456,27 @@ static long catchup_run(void* store_buf, long max_ms, int stop_at_hole){
               arch_retry = 0;
           } }
         if (!apply_block_at(blockbuf, (u64)len, h)) {
+            /* a MUTATED block (Core BLOCK_MUTATED): the bytes are dropped and
+             * fetched again; nothing is marked -- see utxo_live_set_mutated_fn */
+            if (g_last_fail_kind == UTXO_FAIL_MUTATED && !g_halted){
+                unsigned char bh[32]; char hex[65];
+                block_hash(bh, blockbuf);
+                for (int b = 0; b < 32; b++) sprintf(hex + b*2, "%02x", bh[31-b]);
+                g_mutated_same = (h == g_mutated_last_h) ? g_mutated_same + 1 : 1;
+                g_mutated_last_h = h; g_mutated_total++; g_call_mutated = h;
+                fprintf(stderr, "[utxo_live] MUTATED block at height %ld hash=%s: %s -- these bytes are not the block its header names "
+                                "(Core: BLOCK_MUTATED, never marked invalid); dropping them so the next fetch delivers it again%s\n",
+                        h, hex, g_last_reject,
+                        g_mutated_same >= 3 ? " -- THE SAME HEIGHT, AGAIN: a peer keeps delivering a mutated block; disconnect it" : "");
+                if (g_mutated_fn && g_mutated_fn(store_buf, h, bh, g_last_reject) == 1){
+                    g_last_stop_reason = UTXO_STOP_FAIL;
+                    store_reload(store_buf);          /* the archive was truncated to h-1 under us */
+                    break;                            /* what was applied before h stands */
+                }
+                tm_lap(TM_WALL, tm_call_t0); if (g_tm_on) g_tm_total_blocks += (u64)applied;
+                g_last_stop_reason = UTXO_STOP_FAIL;
+                return -1;                            /* no hook (tools, tests): the caller retries */
+            }
             /* 3.3: a VALIDATION failure rejects the block; see the reject
              * hook's comment above for what qualifies and what does not. */
             if (g_last_fail_kind == UTXO_FAIL_REJECT && !g_halted && g_reject_fn){
