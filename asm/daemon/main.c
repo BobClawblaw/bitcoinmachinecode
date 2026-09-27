@@ -3681,16 +3681,33 @@ static void leg_on_headers(int fd, const unsigned char* hdrs, unsigned long n){
     leg_on_block_announce(fd, bh, "headers");
 }
 static int leg_pass_busy(int i);   /* defined with the pass helper below */
-/* the rotation asks: is a leg other than `except` announced? (clears the mark) */
+/* the rotation asks: which leg announced a block we do not have? -1 if none.
+ *
+ * 2026-09-26: this used to clear the leg's mark AND claim the block (inflight)
+ * the moment it picked the leg. Every later check in the rotation that skipped
+ * the leg -- the relay deferral, apply-first, a gone socket -- then left the
+ * claim held with no pass behind it and the announcement lost, and the claim
+ * refused the block to every other leg until INFLIGHT_STALE_S (600 s).
+ * 968,681 was stored 605 s after Core had it, 968,680 552 s. Now the pick only
+ * looks: the claim is taken when the pass starts (leg_pass_launch), the mark
+ * stays until then, and a leg is offered at most once per rotation
+ * (g_pick_tried, cleared at the top of each rotation) so a skipped leg waits
+ * for the next rotation instead of being picked again at once. The mark IS
+ * cleared when the leg is gone or another leg's pass already holds the
+ * block. */
+static unsigned char g_pick_tried[MUX_MAX_OUT];
 static int leg_announced_pick(int except){
+    long long now = (long long)time(NULL);
     for(int a = 0; a < mux_n_out; a++){
-        if(a == except || !mux_out_announced[a] || leg_pass_busy(a)) continue;
-        mux_out_announced[a] = 0;
-        if(mux_out_fd[a] < 0) continue;
+        if(a == except || !mux_out_announced[a] || g_pick_tried[a] || leg_pass_busy(a)) continue;
+        if(mux_out_fd[a] < 0){ mux_out_announced[a] = 0; continue; }
         /* 2026-09-10 (snapshot y): with passes in helpers, every leg that announced
          * the same block fetched it -- six reconstructions of block 966,312. One
          * pass per announced block: the claim is released when its pass reports. */
-        if(!inflight_claim(&g_inflight, mux_out_announced_hash[a], a, (long long)time(NULL))) continue;
+        if(!inflight_would_allow(&g_inflight, mux_out_announced_hash[a], a, now)){
+            mux_out_announced[a] = 0; g_inflight.refused++; continue;
+        }
+        g_pick_tried[a] = 1;
         return a;
     }
     return -1;
@@ -3780,12 +3797,68 @@ static long g_last_sync_ok = 0;   /* node_sync_multi's verdict of the last pass,
  * it in place, the helper's parent runs it from the report (the comments
  * that used to sit here -- incident #33, the health-signal rule, the
  * three-strike replacement -- are in the git history of 2026-08/09) */
+/* Did the host receive anything on ANY leg -- leg `i` included -- in the last
+ * `window_ms`? 1 yes; 0 no, and at least one other live leg was there to hear
+ * it; -1 no, but leg `i` is the only leg, so silence proves nothing. The
+ * kernel's per-socket tcpi_last_data_recv counts every byte that arrived,
+ * whichever process (the worker, a pass helper) read it or not, and
+ * getsockopt consumes nothing, so a leg whose pass is running in a helper is
+ * measured too. */
+static int legs_heard_within(int i, long long window_ms){
+    int others = 0;
+    for(int k = 0; k < mux_n_out; k++){
+        if(mux_out_fd[k] < 0) continue;
+        struct tcp_info ti; socklen_t tl = sizeof ti;
+        if(getsockopt(mux_out_fd[k], IPPROTO_TCP, TCP_INFO, &ti, &tl) != 0) continue;   /* not a live socket */
+        if(k != i) others++;
+        if((long long)ti.tcpi_last_data_recv <= window_ms) return 1;
+    }
+    return others ? 0 : -1;
+}
+/* Has the host heard nothing on any leg for PROBE_SILENCE_MS? Then a reorg
+ * probe must not start (see its call site): 1 silent, 0 not (or no legs).
+ *
+ * 2026-09-26: the probe runs inline under a DL_BUDGET_SECS alarm whose
+ * handler shuts the socket down -- the only way to end a read the retry
+ * loops would otherwise resume -- so a probe that times out always costs
+ * its leg. In the 06:24 outage three long-lived legs were closed that way
+ * (probe-budget, 06:25:45 / 06:26:47 / 06:27:48). The second and third began
+ * 75 s and 135 s into the silence and could only time out. The first began
+ * seconds before it and is not saved: once the outage ended, TCP's
+ * retransmit backoff held our getheaders until ~06:28:52, and holding the
+ * worker inside a probe that long is worse than one re-dial. */
+#ifndef PROBE_SILENCE_MS
+#define PROBE_SILENCE_MS 20000
+#endif
+static int reorg_probe_host_silent(void){ return legs_heard_within(-1, PROBE_SILENCE_MS) == 0; }
+/* Test seam: the extra window over the pass's own duration that still counts
+ * as "during the pass" -- the report is read a rotation after the pass ends. */
+#ifndef PASS_SILENCE_SLACK_MS
+#define PASS_SILENCE_SLACK_MS 5000
+#endif
 static void pass_fail_bookkeeping(int i, long ok, int fail_code, double sync_s){
     anchor_locator(mux_out_loc[i]);
     if(ok == 1){ g_sync_fail_streak[i] = 0; return; }   /* peer had nothing: normal at tip */
     if(fail_code == 4 && sync_s < 0.5){   /* EOF before the peer said anything: it hung up */
         leg_close_theirs(i, "EOF on the first read", "(nothing)");
         g_sync_fail_streak[i] = 0;
+        return;
+    }
+    /* 2026-09-26: a failing pass is not a strike against the peer when NO
+     * leg -- this one included -- received anything during it: the silence
+     * is the host's network, not this peer. (A peer that sent chatter but
+     * no headers, like the Bitcore node of 09-25, still takes the strike.) A 3-minute outage at 06:24 UTC (no
+     * packet of any kind in or out, LAN included; the capture in
+     * /storage/forensics/2026-09-26-sync-failed-where3) made every leg's
+     * pass fail "where=3 in 24.1s", and five legs up for over an hour were
+     * closed as sync-failed-3x and entered in the dial memory as early
+     * drops. 21% of the sync-failed-3x closes since 09-11 came in such
+     * clusters. Core keeps a peer through that (its ping timeout is 20 min).
+     * With no other leg to compare against, the strike counts as before. */
+    if(legs_heard_within(i, (long long)(sync_s * 1000.0) + PASS_SILENCE_SLACK_MS) == 0){
+        fprintf(stderr,"[mux:%d] %s: the pass failed (where=%d in %.1fs) while no leg received anything -- "
+                       "the host's network, not this peer: not a strike (%d of 3)\n",
+                i, mux_out_host[i], fail_code, sync_s, g_sync_fail_streak[i]);
         return;
     }
     g_sync_fail_streak[i]++;
@@ -6854,6 +6927,42 @@ static int leg_pass_start(int i, unsigned budget_s){
     g_pass_started++;
     return 1;
 }
+/* ---- the last two steps before a leg's pass (2026-09-26) -------------------
+ * leg_pass_gate: may leg i's pass go ahead this rotation? The 30 s spacing
+ * between passes, and the relay deferral -- a pass would feed replies still
+ * owed to the relay layer into the drain's discard. Two changes from the inline
+ * version: a leg that announced a block we do not have is never deferred
+ * (a block outranks a few tx replies, which are re-requested), and the 30 s
+ * stamp is taken only when the pass goes ahead -- it was taken BEFORE the
+ * deferral, so a leg that was mid-relay at each of its turns got no pass for
+ * minutes (leg 5, 12:33-12:39, holding 968,680's claim).
+ * leg_pass_launch: take the announced block's claim and start the helper;
+ * with no helper the claim is released at once, never left held. */
+#ifndef TXRELAY_REPLIES_PENDING
+#define TXRELAY_REPLIES_PENDING(fd) txrelay_replies_pending(fd)
+#endif
+#ifndef LEG_PASS_START
+#define LEG_PASS_START(i, budget_s) leg_pass_start(i, budget_s)
+#endif
+extern int txrelay_replies_pending(int); extern void txrelay_note_sync_deferred(void);
+static int leg_pass_gate(int i, int announced_now, long long now_ms){
+    if(!announced_now && mux_out_lastpass_ms[i] && now_ms - mux_out_lastpass_ms[i] < LEG_PASS_EVERY_MS) return 0;   /* no polling for headers between announcements */
+    if(!announced_now && mux_out_fd[i] >= 0 && TXRELAY_REPLIES_PENDING(mux_out_fd[i])){ txrelay_note_sync_deferred(); return 0; }   /* retried next rotation */
+    mux_out_lastpass_ms[i] = now_ms;
+    return 1;
+}
+static int leg_pass_launch(int i, int announced_now, unsigned budget_s){
+    if(announced_now && !inflight_claim(&g_inflight, mux_out_announced_hash[i], i, (long long)time(NULL))){
+        mux_out_announced[i] = 0; return 0;    /* another leg's pass took it since the pick */
+    }
+    if(!LEG_PASS_START(i, budget_s)){
+        if(announced_now) inflight_release(&g_inflight, mux_out_announced_hash[i]);   /* no pass: no claim */
+        g_pass_fallback++; mux_out_lastpass_ms[i] = 0;    /* no helper (fork failed): never inline -- the next rotation tries again */
+        return 0;
+    }
+    mux_out_announced[i] = 0;                             /* the pass consumed whatever was announced on this leg */
+    return 1;
+}
 /* the parent, on a report: what the synchronous path did in memory */
 static long leg_pass_finish(int i, const pass_result_t* r, const unsigned char* v2, unsigned long v2_len){
     store_reload(store_buf);
@@ -9648,6 +9757,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                 : "[dl] UTXO backlog %ld -- resuming normal leg rotation\n", apply_backlog);
             apply_first_prev = apply_first;
         }
+        memset(g_pick_tried, 0, sizeof g_pick_tried);    /* each announced leg is offered once per rotation */
         for(int n_=0;n_<mux_n_out;n_++){
             int i = (leg_start + n_) % mux_n_out;
             txoq_service_mode(0);   /* gettxout between legs, not once a rotation (see txoq_service_mode) */
@@ -9763,13 +9873,7 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             if(mux_out_fd[i]>=0 && mux_out_kind[i] == LEG_BLOCK_ONLY){ extern long txrelay_poll_block_only_leg(int); (void)txrelay_poll_block_only_leg(mux_out_fd[i]); }   /* 2026-09-10: block announcements from block-relay-only legs too */
             if(g_stored_now) stored_break = 1;
             if(apply_first) continue;        /* see APPLY FIRST above */
-            if(!announced_now && mux_out_lastpass_ms[i] && now_ms - mux_out_lastpass_ms[i] < LEG_PASS_EVERY_MS) continue;   /* 2026-09-10: no polling for headers between announcements */
-            mux_out_lastpass_ms[i] = now_ms;
-            /* A sync pass on this leg would feed any reply still owed to the
-             * relay layer into .drain's discard. Skip it while replies are
-             * pending (bounded: the relay layer forgets after 1.5 s). */
-            { extern int txrelay_replies_pending(int); extern void txrelay_note_sync_deferred(void);
-              if(mux_out_fd[i]>=0 && txrelay_replies_pending(mux_out_fd[i])){ txrelay_note_sync_deferred(); continue; } }
+            if(!leg_pass_gate(i, announced_now, now_ms)) continue;   /* 30 s spacing; the relay deferral (never for an announced leg) */
             /* 2026-09-10 (row 1): the pass runs in a helper under its budget;
              * the report comes back through leg_pass_poll on a later rotation.
              * A leg whose pass is running is skipped by the sweep and the
@@ -9798,8 +9902,21 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * millisecond of the fork), two readers interleaved the frames, the
              * probe tore the leg down and Core saw a reset ("EOF on the first
              * read", every leg, every 30-70 s). Now it runs BEFORE the pass, on an
-             * idle leg whose last REPORT was empty. */
-            if(reorg_ok && utxo_live_ok && g_pass_last_empty[i] && mux_out_fd[i]>=0 && now_ms>=next_reorg_probe_ms){
+             * idle leg whose last REPORT was empty.
+             * 2026-09-26: and not while the host hears nothing on any leg --
+             * a probe then can only time out, and its timeout costs the leg
+             * (reorg_probe_host_silent). It runs as soon as a leg hears again. */
+            static int probe_deferred_logged = 0;
+            int probe_due = reorg_ok && utxo_live_ok && g_pass_last_empty[i] && mux_out_fd[i]>=0 && now_ms>=next_reorg_probe_ms;
+            if(probe_due && reorg_probe_host_silent()){
+                if(!probe_deferred_logged){
+                    fprintf(stderr,"[reorg] probe of %s deferred: no leg has received anything for %ds -- the host's network, not a peer\n",
+                            mux_out_host[i], PROBE_SILENCE_MS / 1000);
+                    probe_deferred_logged = 1;
+                }
+                probe_due = 0;
+            } else if(probe_due) probe_deferred_logged = 0;
+            if(probe_due){
                 next_reorg_probe_ms = now_ms + REORG_PROBE_INTERVAL_MS;
                 struct sigaction psa, pold; memset(&psa,0,sizeof psa);
                 psa.sa_handler=mux_budget_alarm; sigemptyset(&psa.sa_mask);
@@ -9843,9 +9960,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             }
             if(mux_out_fd[i] < 0) continue;                    /* the probe closed it */
             unsigned budget_s = leg_budget_secs(legs_live());
-            if(leg_pass_start(i, budget_s)){ did = 1; }
-            else { g_pass_fallback++; mux_out_lastpass_ms[i] = 0; continue; }   /* no helper (fork failed): never inline -- the next rotation tries again */
-            mux_out_announced[i] = 0;                          /* the pass consumed whatever was announced on this leg */
+            if(leg_pass_launch(i, announced_now, budget_s)){ did = 1; }   /* the announced block's claim is taken here, with the pass */
+            else continue;
             /* 2026-09-09: service every OTHER leg's buffered messages now --
              * a ping used to wait for its leg's turn in the rotation (75 s
              * measured; Core's eviction protects its lowest-ping peers, and a

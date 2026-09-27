@@ -481,6 +481,17 @@ store_rd_advise:
 ;     +128 + slot*32 +24 : qword reserved
 ;   slot = file_no & 3, four entries = up to 512 MiB of mapped blk files.
 ;
+;   The cache's "initialised" magic is a DWORD at st+52, the one gap in
+;   bitcoin_store.asm's fields (prune_height is the dword at +48; the read-fd
+;   cache's own magic takes +56..+63). Until 2026-09-27 it was a qword at
+;   st+120 -- which is read-fd cache slot 7 (+64 + 7*8). store_rd_fd of any
+;   file_no & 7 == 7 overwrote it, the next map call took the cache for
+;   uninitialised and cleared its slots WITHOUT munmap, leaking a mapping of
+;   up to 128 MiB and losing the cache each time; and store_map_init's magic
+;   write clobbered fd slot 7 in return. Found by the Mac port's differential
+;   test of this module (its note item 15); tests/test_store_map_magic.c
+;   pins both directions here.
+;
 ; APPEND SAFETY
 ;   A blk file grows under an appending writer. The mapping is sized from
 ;   fstat at map time; if a later request needs bytes past maplen the entry is
@@ -492,7 +503,7 @@ store_rd_advise:
 MAP_OFF     equ 128
 MAP_SLOTS   equ 4
 MAP_MASK    equ 3
-MAP_MAGIC   equ 0x4d415000000001    ; at st+120
+MAP_MAGIC   equ 0x4d415032          ; "MAP2", a DWORD at st+52 (see the layout note)
 
 SYS_mmap    equ 9
 SYS_munmap  equ 11
@@ -536,8 +547,7 @@ store_map_init:
     sub  rsp, 0x18
     mov  r12, rdi
 
-    mov  rax, MAP_MAGIC
-    cmp  [r12+120], rax
+    cmp  dword [r12+52], MAP_MAGIC
     jne  .fresh
     xor  r13, r13
 .uloop:
@@ -578,8 +588,7 @@ store_map_init:
     inc  r13
     cmp  r13, MAP_SLOTS
     jb   .cloop
-    mov  rax, MAP_MAGIC
-    mov  [r12+120], rax
+    mov  dword [r12+52], MAP_MAGIC
 
     add  rsp, 0x18
     pop  r15
@@ -613,8 +622,7 @@ map_file:
     mov  r13d, esi                ; file_no
     mov  r14, rdx                 ; need_end
 
-    mov  rax, MAP_MAGIC
-    cmp  [r12+120], rax
+    cmp  dword [r12+52], MAP_MAGIC
     je   .ready
     mov  rdi, r12
     call store_map_init

@@ -32,6 +32,7 @@
     extern fe_mul
     extern fe_sub
     extern fe_add
+    extern fe_pow_sqrt
 
 ; ---- exponent (p+1)/4 for square-root (y = x^((p+1)/4)) as 4 LE limbs ----
 section .rodata
@@ -276,11 +277,12 @@ pubkey_parse:
     lea   rsi, [rbp-0x90]
     lea   rdx, [CURVE7]
     call  fe_add
-    ; ---- y = t^((p+1)/4)
+    ; ---- y = t^((p+1)/4): fe_pow_sqrt's addition chain (253 sqr + 13 mul).
+    ;      Was fe_pow(t, EXP_QR), square-and-multiply over an all-ones-ish
+    ;      exponent: ~500 field ops, 4.1 us of every parse (2026-09-27).
     lea   rdi, [rbp-0x1b8]
     lea   rsi, [rbp-0x168]
-    lea   rdx, [EXP_QR]
-    call  fe_pow
+    call  fe_pow_sqrt
     ; ---- verify y^2 == t
     lea   rdi, [rbp-0xc8]
     ; reuse x2 slot as y2

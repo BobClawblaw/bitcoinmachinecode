@@ -4,7 +4,10 @@
  *      projective test ecdsa_x_eq_mod_n: r*Z^2 == X  or  (r+n < p and
  *      (r+n)*Z^2 == X).
  *   B. w = s^{-1} moved from Fermat sc_inv (450 sc_mul) to the variable-time
- *      binary-xgcd sc_inv_var.
+ *      sc_inv_var: a binary xgcd at first, Bernstein-Yang safegcd since
+ *      2026-09-27. Campaign 1 is that rewrite's proof; it was revert-checked
+ *      by breaking n^{-1} mod 2^62, the sign fix-up and the final reduction
+ *      in turn (1,112-2,052 failures each).
  *
  * Three campaigns, every one a byte-exact comparison against something that
  * did NOT change:
