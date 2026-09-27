@@ -275,6 +275,7 @@ extern long utxo_live_catchup(void* store_buf);        /* daemon/utxo_live.c */
 extern long utxo_live_catchup_bounded(void* store_buf, long max_ms, int stop_at_hole);   /* step 1: the interleaved connect */
 extern long utxo_live_last_stop_reason(void);           /* why the last catch-up call returned (UTXO_STOP_*) */
 extern long utxo_live_call_rejected_height(void);       /* 3.3: the height the last call rejected, or -1 */
+extern long utxo_live_call_mutated_height(void);        /* the height the last call dropped as MUTATED, or -1 (2026-09-27) */
 extern void utxo_live_set_shutdown_flag(const volatile sig_atomic_t* flag); /* daemon/utxo_live.c */
 extern long utxo_live_count(void);                      /* daemon/utxo_live.c */
 extern long utxo_live_recovery_applicable(void);         /* daemon/utxo_live.c: incident 2026-09-01 */
@@ -1824,6 +1825,30 @@ static long dl_reject_block(void* st, long h, const unsigned char hash[32], cons
         if(host[0]) peer_misbehaving(host, 100, why);
     } else {
         fprintf(stderr,"[chain] rejected block %ld: delivering peer unknown (parallel downloader or inbound push) -- no peer scored\n", h);
+    }
+    return 1;
+}
+/* The mutated hook (2026-09-27; utxo_live_set_mutated_fn): the same helper
+ * stop, then chain_drop_mutated_block -- the archive back to h-1 and NOTHING
+ * marked, because the hash is the real chain's and only the bytes under it
+ * are wrong (Core: BLOCK_MUTATED). The delivering peer, when known, is
+ * scored as for a consensus violation: Core does (a mutated block is a
+ * misbehaving peer, not a different chain), and it is what stops a peer that
+ * keeps delivering one from holding the tip back. */
+static long dl_drop_mutated_block(void* st, long h, const unsigned char hash[32], const char* reason){
+    extern long chain_drop_mutated_block(void*, long);
+    (void)hash;
+    dlc_stop_workers_for_reject(h);
+    long r = chain_drop_mutated_block(st, h);
+    if(r != 1) return r;
+    const char* src = blk_src_lookup(h);
+    char why[160]; snprintf(why, sizeof why, "block %ld was delivered mutated: %s", h, reason && reason[0] ? reason : "witness mismatch");
+    if(src){
+        char host[128]; snprintf(host, sizeof host, "%s", src); host_strip_port(host);
+        fprintf(stderr,"[chain] mutated block %ld was delivered by %s -- scoring it\n", h, src);
+        if(host[0]) peer_misbehaving(host, 100, why);
+    } else {
+        fprintf(stderr,"[chain] mutated block %ld: delivering peer unknown -- no peer scored; the next fetch takes whichever leg answers\n", h);
     }
     return 1;
 }
@@ -7451,6 +7476,10 @@ static long dl_catchup_run(const char* dir, int min_workers){
                 fprintf(stderr,"[dlc] block at height %ld REJECTED (%s) and invalidated mid-download -- helpers stopped, connected %ld; "
                                "the rotation fetches the chain that avoids it\n",
                         utxo_live_call_rejected_height(), utxo_live_last_reject(), utxo_live_applied_height());
+            } else if(utxo_live_call_mutated_height() >= 0){
+                fprintf(stderr,"[dlc] block at height %ld MUTATED (%s) mid-download -- dropped, nothing marked, helpers stopped, connected %ld; "
+                               "the rotation fetches it again\n",
+                        utxo_live_call_mutated_height(), utxo_live_last_reject(), utxo_live_applied_height());
             } else if(done < 0){
                 fprintf(stderr,"[dlc] connect FAILED at height %ld (%s) -- the download continues; connect retries in %lds, "
                                "the rotation's recovery path owns it after the download\n",
@@ -8710,6 +8739,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
      * dl_reject_block, not left in the archive as a fatal retry loop */
     { extern void utxo_live_set_reject_fn(long (*)(void*, long, const unsigned char[32], const char*));
       utxo_live_set_reject_fn(dl_reject_block); }
+    { extern void utxo_live_set_mutated_fn(long (*)(void*, long, const unsigned char[32], const char*));
+      utxo_live_set_mutated_fn(dl_drop_mutated_block); }   /* a mutated block is dropped and re-fetched, never marked */
     /* STO-7: hand reorg.c the SHARED mempool and the accept path's own policy
      * objects, so a completed reorg rebuilds the pool against the new branch
      * instead of leaving it holding transactions the new branch invalidated.
@@ -9836,7 +9867,10 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
               long rj = utxo_live_call_rejected_height();
               if(rj >= 0)
                   fprintf(stderr,"[dl] block at height %ld REJECTED (%s) and invalidated -- archive at %d, connected %ld; the next rotation fetches the chain that avoids it\n",
-                          rj, utxo_live_last_reject(), *(int*)(store_buf+24), utxo_live_applied_height()); }
+                          rj, utxo_live_last_reject(), *(int*)(store_buf+24), utxo_live_applied_height());
+              else if(utxo_live_call_mutated_height() >= 0)
+                  fprintf(stderr,"[dl] block at height %ld MUTATED (%s) -- dropped, nothing marked, archive at %d, connected %ld; the next rotation fetches it again\n",
+                          utxo_live_call_mutated_height(), utxo_live_last_reject(), *(int*)(store_buf+24), utxo_live_applied_height()); }
             if(ar < 0){
                 /* Incident 2026-09-01: recovery is no longer blind. Compaction
                  * runs ONLY when utxo_live says the failure is a store error

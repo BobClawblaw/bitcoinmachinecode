@@ -1632,8 +1632,8 @@ tests/test_invalid_set: tests/test_invalid_set.c daemon/invalid_set.c daemon/inv
 # rule holds (two entries sharing a short id -> missing), and the stamped build
 # is at least 3x faster on one pinned core at 50,000. Negative control =
 # cmpct_recv_set_ht_clear(1): the whole-table memset, full width, per-entry key.
-tests/test_cmpct_recv: tests/test_cmpct_recv.c daemon/cmpct_recv.c daemon/cmpct_recv.h mempool_slot.h bitcoin_cmpct.o bitcoin_hash.o bitcoin_tx.o bitcoin_mempool.o sha256.o wallet_coinsel.c
-	$(CC) $(WARNFLAGS) -O2 -I. -I daemon -o $@ tests/test_cmpct_recv.c daemon/cmpct_recv.c bitcoin_cmpct.o bitcoin_hash.o bitcoin_tx.o bitcoin_mempool.o sha256.o wallet_coinsel.c
+tests/test_cmpct_recv: tests/test_cmpct_recv.c daemon/cmpct_recv.c daemon/cmpct_recv.h daemon/block_witness.c daemon/block_witness.h mempool_slot.h bitcoin_cmpct.o bitcoin_hash.o bitcoin_tx.o bitcoin_mempool.o sha256.o wallet_coinsel.c
+	$(CC) $(WARNFLAGS) -O2 -I. -I daemon -o $@ tests/test_cmpct_recv.c daemon/cmpct_recv.c daemon/block_witness.c bitcoin_cmpct.o bitcoin_hash.o bitcoin_tx.o bitcoin_mempool.o sha256.o wallet_coinsel.c
 
 # test_mempool_wtxid -- 2026-09-06: every mempool slot caches its entry's wtxid
 # (sha256d of the stored bytes; == txid for a non-witness tx), computed once by

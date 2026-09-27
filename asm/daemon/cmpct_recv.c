@@ -10,6 +10,7 @@ extern void sha256_full(unsigned char out[32], const void* msg, long len);
 extern void tx_wtxid(unsigned char out[32], const unsigned char* tx, unsigned long txlen);
 extern int  tx_parse(unsigned char info[64], const unsigned char* p, unsigned long cap);
 extern void block_hash(unsigned char out[32], const unsigned char hdr[80]);
+#include "block_witness.h"
 
 static int g_enabled = 1; static cmpct_writer_t g_write = 0;
 static unsigned long g_st_recon = 0, g_st_need = 0, g_st_fb = 0;
@@ -166,6 +167,44 @@ static long fallback_full(int fd){
     unsigned char gd[37]; gd[0] = 1; unsigned t = MSG_WITNESS_BLOCK_T; memcpy(gd + 1, &t, 4); memcpy(gd + 5, S.hash, 32);
     S.active = 0; g_st_fb++; wr(fd, "getdata", 7, gd, 37); return 0;
 }
+/* Core's FillBlock runs CheckBlock on the reconstruction and, when it fails,
+ * asks the peer for the block in full: the header is right, the BYTES are
+ * not the block it names. The txid merkle root is checked by cons_verify
+ * where the block is stored (the sync drain, the push path's evaluator),
+ * and a failure there already re-requests the full block. The WITNESS
+ * commitment was checked nowhere before the apply -- and the apply took its
+ * failure for a consensus rejection and marked the block hash INVALID:
+ * mainnet 968824 on 2026-09-27, reconstructed from a peer whose prefilled
+ * coinbase carried no witness ("bad-witness-nonce-size"), was invalidated on
+ * this node and connected 10 s later from another peer only because the
+ * mark is not consulted on that path. So the check runs here, on both
+ * completion paths, before any caller sees the bytes: a bad reconstruction
+ * is a full-block getdata, never a stored block. segwit is active on every
+ * chain a compact block can be at the tip of. */
+static long assembled_is_the_block(const unsigned char* blk, unsigned long n, const char** why){
+    static bw_txref_t refs[CR_MAX_TX];
+    static unsigned char scratch[CR_MAX_TX * 32];
+    const unsigned char* end = blk + n;
+    unsigned long o = 80; unsigned long long ntx; long c = get_cs(blk + o, n - o, &ntx);
+    if (!c || ntx == 0 || ntx > CR_MAX_TX){ *why = "tx count"; return 0; }
+    o += (unsigned long)c;
+    for (unsigned long long i = 0; i < ntx; i++){
+        unsigned char info[64];
+        if (!tx_parse(info, blk + o, (unsigned long)(end - (blk + o)))){ *why = "malformed tx"; return 0; }
+        refs[i].ptr = blk + o; refs[i].len = *(unsigned long long*)info; o += (unsigned long)refs[i].len;
+    }
+    if (o != n){ *why = "trailing bytes"; return 0; }
+    return block_check_witness_commitment(refs, ntx, sizeof refs[0], 1, scratch, sizeof scratch, why) == 1;
+}
+static long finish(int fd, unsigned char* out, long n){
+    const char* why = "?";
+    if (n > 0 && !assembled_is_the_block(out, (unsigned long)n, &why)){
+        fprintf(stderr, "[cmpct] the reconstruction of %02x%02x%02x%02x.. is not the block (%s): asking for it in full\n",
+                S.hash[31], S.hash[30], S.hash[29], S.hash[28], why);
+        return fallback_full(fd);
+    }
+    return n > 0 ? n : fallback_full(fd);
+}
 /* BMC_CMPCT_DEBUG=1 traces every path through the receiver (2026-09-09: the
  * trace showed getblocktxn sent and no blocktxn ever reaching this file --
  * the sync drain's 5-byte "block" compare had swallowed it) */
@@ -204,7 +243,7 @@ long cmpct_recv_cmpctblock(int fd, void* mp, const unsigned char* pl, unsigned l
         if (tx){ S.ptr[i] = tx; S.len[i] = l; } else S.nmiss++;
     }
     g_last.miss = S.nmiss; g_last.pool = S.ntx - (unsigned long)npre - S.nmiss;
-    if (S.nmiss == 0){ long n = assemble(out, cap); if (dbg()) fprintf(stderr, "[cmpct_dbg] assembled from the mempool and the prefilled: %ld bytes, ntx=%lu\n", n, S.ntx); return n > 0 ? n : fallback_full(fd); }
+    if (S.nmiss == 0){ long n = assemble(out, cap); if (dbg()) fprintf(stderr, "[cmpct_dbg] assembled from the mempool and the prefilled: %ld bytes, ntx=%lu\n", n, S.ntx); return finish(fd, out, n); }
     /* getblocktxn: blockhash || count || differential indexes of the missing */
     unsigned char req[32 + 9 + CR_MAX_TX * 5]; unsigned long ro = 32; memcpy(req, S.hash, 32);
     ro += (unsigned long)put_cs(req + ro, S.nmiss); unsigned long last = 0; int first = 1;
@@ -230,5 +269,5 @@ long cmpct_recv_blocktxn(int fd, const unsigned char* pl, unsigned long plen, un
     }
     long r = assemble(out, cap);
     if (dbg()) fprintf(stderr, "[cmpct_dbg] assembled after blocktxn: %ld bytes\n", r);
-    return r > 0 ? r : fallback_full(fd);
+    return finish(fd, out, r);
 }
