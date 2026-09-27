@@ -2173,11 +2173,12 @@ needs to prove.
 
 ### Confirmed genuinely still open (verified against source, not stale)
 
-- **Full-verification IBD benchmark vs Core** (`-assumevalid=0
-  -stopatheight`, second scratch datadir) — still never run. Now doubly
-  the point, given the finding above: this is the one way to get the
-  strong "every script, every block" claim rather than the default
-  "matches Core's own trust boundary" one.
+- ~~**Full-verification IBD benchmark vs Core** (`-assumevalid=0
+  -stopatheight`, second scratch datadir) — still never run.~~ **DONE
+  2026-09-27** (see the update of that date): a fresh mainnet sync with
+  `assumevalid=0` reached the tip in 8 h 0 m with every script evaluated and
+  the per-height MuHash equal to Core's at every height checked. The strong
+  "every script, every block" claim now has its run behind it.
 - `assumeutxo` / snapshot import — absent, large lift, no current need.
 - MuSig2 signing inside tapscript LEAF scripts (key-path MuSig2 is done;
   a script-path leaf using MuSig2 is not signed — `asm/rpc_commands.c`).
@@ -2581,3 +2582,57 @@ the guard against the 44,001-call shape.
 
 Effort: was "small to find, unknown to fix". Actual: the fix was five lines of
 test, and the bug was in the measurement.
+
+## Update 2026-09-27 — the full-verification sync completed; a byte order; the compact-block reconstruction is checked; the Mac notes' items closed
+
+- **The `assumevalid=0` sync is done.** `/mnt/2tbssd/bmc-bench`, main
+  `a3e598f9`, nice 10, coinstatsindex on: 8 h 0 m to the tip at 968,807
+  (08:25Z), `bad=0`, every script of every block evaluated (the run's
+  `verify` share of block time was 35–55% where the default-assumevalid runs
+  27 and 28 showed 1–3%). The per-height rows equal Core's at every height
+  checked, 968,806 through 968,821.
+- **Its verdict was a false FAIL, and that found a real defect.** The harness
+  wrote `FAIL first-divergent-height=968807` because it took our side from
+  the no-height `gettxoutsetinfo muhash` (the coinstats index's live record)
+  and the oracle's from the indexed row at H, and its bisect never tested the
+  top of its window. The live answer was the same 32 bytes as Core's,
+  printed in the opposite order: the index's RPC adapter had reversed the
+  digest since 2026-08-26, and the walk path's forward printing was fixed on
+  2026-09-25 with a `hex_rev` on the line that serves the adapter too — a
+  double reversal on every node with the index, production included, for two
+  days. Fixed in #321 (one reversal, at the RPC layer, for all three
+  readers); the two tests that had pinned the adapter's reversal now pin the
+  raw bytes; the harness pins both sides to H and checks the live answer
+  against the row first.
+- **Verification speed.** #319 (`sc_inv_var` safegcd, 3.55 → 0.67 µs) and
+  #320 (`fe_pow_sqrt`, `fe_inv_var`): ECDSA 21.9 → 20.7 µs, BIP340 25.9 →
+  22.4 µs per verification on one core; libsecp256k1 on the same core: 21.0
+  and 22.0. `docs/PERFORMANCE.md` §7.
+- **The Mac notes' x86 items are all closed** (`worklog/2026-09-25-note-for-x86-2.md`,
+  items 1–16): #322 the shared fixes (addr_hist thread safety, confirmed
+  real on x86 under ThreadSanitizer; the wallet CLI's passphrase flush,
+  reproduced with strace's ioctl delay injection), #323 the map-cache magic
+  off read-fd cache slot 7, #324 the store CLI's uppercase hex and 384-byte
+  block buffers plus `multisig_verify`'s over-read, #325 a mutated compact
+  block dropped and re-fetched instead of marking the real block invalid.
+  One of the notes' "on any platform" claims (the `test_txvb_wprog_stable`
+  fixture) did not hold on x86: main's test passed with the same fixture,
+  because x86's verifier resolves in-block spends itself.
+- **Compact-block reconstruction is checked (#325).** Before it, a peer's
+  witness-stripped coinbase in a compact block passed `cons_verify` (PoW and
+  the txid merkle root see no witness), and the apply's witness-commitment
+  refusal was taken for a consensus rejection: the REAL block's hash went to
+  `invalid.dat`, the archive was truncated, headers rolled back. Core never
+  marks a header for a witness mismatch (`BLOCK_MUTATED`). Now every
+  reconstruction is checked against the commitment before a caller sees it
+  (a failure is a full `MSG_WITNESS_BLOCK` getdata), and a mismatch at apply
+  is a MUTATED failure with its own hook: the archive back to h-1, no mark,
+  no headers rollback, the delivering peer scored. It happened on the Mac at
+  968,824; x86 production was not hit.
+- **Still open from this day:** the outage rule's tail. A ~3-minute
+  host-wide silence at 12:44Z (the second in two days; cause upstream of the
+  box) had #316 withholding strikes while no leg received anything, but the
+  passes whose 24.1 s window straddled the end of the silence still counted,
+  and five legs lost their third strike within 33 s of it. A design call:
+  no strike for N s after a silence ends.
+

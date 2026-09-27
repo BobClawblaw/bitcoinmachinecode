@@ -65,6 +65,20 @@ err_notfound_len equ $ - err_notfound
 
 hexdig: db "0123456789abcdef"
 
+; ---- the block buffer (2026-09-27) --------------------------------------
+; Every command that reads a block used a buffer on its own stack frame:
+; getbestblockhash 16 KB, getblockhash 2 KB, getblock/gettx/getbalance 384
+; bytes. cli_load_block refuses a block larger than the buffer, so on a real
+; chain those commands answered "not found" / "height out of range" and
+; getbalance silently skipped every block over 384 bytes. One static buffer
+; above MAX_BLOCK_SERIALIZED_SIZE (4,000,000) serves them all; cli_main is
+; single-threaded and the commands never overlap. (The frame comments below
+; still name the old stack buffers' offsets; those bytes are unused now.)
+CLI_BLOCKBUF_CAP equ 0x400000
+section .bss
+align 16
+cli_blockbuf: resb CLI_BLOCKBUF_CAP
+
 section .text
 
 ; ============================================================================
@@ -195,7 +209,8 @@ cli_hexval:
     jmp  .done
 .try_a:
     cmp  cl, 'a'
-    jb   .bad
+    jb   .try_A             ; 'A'..'F' sit below 'a': this was `jb .bad`, so the
+                            ; uppercase branch below was never reached (2026-09-27)
     cmp  cl, 'f'
     ja   .try_A
     sub  cl, 'a'
@@ -210,6 +225,7 @@ cli_hexval:
     sub  cl, 'A'
     add  cl, 10
     mov  al, cl
+    jmp  .done              ; fell into .bad until 2026-09-27: every uppercase hex digit read as invalid
 .bad:
     mov  al, 0xFF
 .done:
@@ -466,15 +482,15 @@ cmd_getbestblockhash:
     je   .fail
     mov  rdi, r12
     mov  esi, eax
-    lea  rdx, [rbp-0x4000]
-    mov  rcx, 0x4000
+    lea  rdx, [rel cli_blockbuf]
+    mov  rcx, CLI_BLOCKBUF_CAP
     call cli_load_block
     test rax, rax
     jle  .fail
     cmp  rax, 80
     jb   .fail
     lea  rdi, [rbp-0x40]
-    lea  rsi, [rbp-0x4000]
+    lea  rsi, [rel cli_blockbuf]
     call block_hash
     lea  rdi, [rbp-0x60]
     lea  rsi, [rbp-0x40]
@@ -535,15 +551,15 @@ cmd_getblockhash:
     ja   .fail
     mov  rdi, r12
     mov  rsi, rbx
-    lea  rdx, [rbp-0x800]
-    mov  rcx, 0x800
+    lea  rdx, [rel cli_blockbuf]
+    mov  rcx, CLI_BLOCKBUF_CAP
     call cli_load_block
     test rax, rax
     jle  .fail
     cmp  rax, 80
     jb   .fail
     lea  rdi, [rbp-0x40]
-    lea  rsi, [rbp-0x800]
+    lea  rsi, [rel cli_blockbuf]
     call block_hash
     lea  rdi, [rbp-0x60]
     lea  rsi, [rbp-0x40]
@@ -697,15 +713,15 @@ cmd_getblock:
     ja   .fail
     mov  rdi, r12
     mov  rsi, rbx
-    lea  rdx, [rbp-0x2b0]
-    mov  rcx, 0x180
+    lea  rdx, [rel cli_blockbuf]
+    mov  rcx, CLI_BLOCKBUF_CAP
     call cli_load_block
     test rax, rax
     jle  .fail
     mov  rbx, rax           ; block length
     ; hex out
     mov  rdi, r14
-    lea  rsi, [rbp-0x2b0]
+    lea  rsi, [rel cli_blockbuf]
     mov  rdx, rbx
     call cli_hex
     mov  byte [rax], 10
@@ -731,8 +747,8 @@ cmd_getblock:
     ja   .fail
     mov  rdi, r12
     mov  esi, ebx
-    lea  rdx, [rbp-0x2b0]
-    mov  rcx, 0x180
+    lea  rdx, [rel cli_blockbuf]
+    mov  rcx, CLI_BLOCKBUF_CAP
     call cli_load_block
     test rax, rax
     jle  .next
@@ -740,7 +756,7 @@ cmd_getblock:
     jb   .next
     ; hash header
     lea  rdi, [rbp-0x80]
-    lea  rsi, [rbp-0x2b0]
+    lea  rsi, [rel cli_blockbuf]
     call block_hash
     ; compare rev(raw hash) vs requested raw
     lea  rsi, [rbp-0x80]
@@ -755,14 +771,14 @@ cmd_getblock:
     ; re-load the matched block (bx) to get length
     mov  rdi, r12
     mov  esi, ebx
-    lea  rdx, [rbp-0x2b0]
-    mov  rcx, 0x180
+    lea  rdx, [rel cli_blockbuf]
+    mov  rcx, CLI_BLOCKBUF_CAP
     call cli_load_block
     test rax, rax
     jle  .fail
     mov  rbx, rax
     mov  rdi, r14
-    lea  rsi, [rbp-0x2b0]
+    lea  rsi, [rel cli_blockbuf]
     mov  rdx, rbx
     call cli_hex
     mov  byte [rax], 10
@@ -899,28 +915,32 @@ cmd_gettx:
     mov  eax, [r12+24]
     cmp  ebx, eax
     ja   .fail
-    lea  rdx, [rbp-0x2e0]
+    lea  rdx, [rel cli_blockbuf]
     mov  rdi, r12
     mov  esi, ebx
-    mov  rcx, 0x180
+    mov  rcx, CLI_BLOCKBUF_CAP
     call cli_load_block
     test rax, rax
     jle  .next
     mov  [rbp-0x48], eax    ; blen
-    lea  rdi, [rbp-0x2e0+80]
+    lea  rdi, [rel cli_blockbuf+80]
     mov  eax, [rbp-0x48]
     sub  eax, 80
     mov  esi, eax
-    lea  rdx, [rbp-0x4c]
+    lea  rdx, [rbp-0x2e0]       ; qword scratch (the old blockbuf base, free since 2026-09-27):
+                                ; cli_read_varint stores 8 bytes, and pointed at the dword
+                                ; ntx@-0x4c it overwrote blen@-0x48 with the value's high half (0)
     call cli_read_varint
     cmp  rax, -1
     je   .next
-    mov  dword [rbp-0x50], eax  ; vsize (DWORD; qword would clobber ntx@-0x4c)
+    mov  ecx, [rbp-0x2e0]
+    mov  [rbp-0x4c], ecx        ; ntx
+    mov  dword [rbp-0x50], eax  ; vsize (DWORD)
     mov  ecx, [rbp-0x4c]
     test ecx, ecx
     jz   .next
     mov  [rbp-0x54], ecx        ; txcount
-    lea  rax, [rbp-0x2e0+80]
+    lea  rax, [rel cli_blockbuf+80]
     mov  edx, [rbp-0x50]        ; vsize (dword; NOT a 64-bit add)
     add  rax, rdx
     mov  [rbp-0x60], rax        ; loop tx pointer (qword at -0x60..-0x67; txidx at -0x6c is clear)
@@ -1040,27 +1060,30 @@ cmd_getbalance:
     mov  eax, [r12+24]
     cmp  ebx, eax
     ja   .emit
-    lea  rdx, [rbp-0x2b0]
+    lea  rdx, [rel cli_blockbuf]
     mov  rdi, r12
     mov  esi, ebx
-    mov  rcx, 0x180
+    mov  rcx, CLI_BLOCKBUF_CAP
     call cli_load_block
     test rax, rax
     jle  .next
     mov  [rbp-0x38], eax    ; blen
-    lea  rdi, [rbp-0x2b0+80]
+    lea  rdi, [rel cli_blockbuf+80]
     mov  eax, [rbp-0x38]
     sub  eax, 80
     mov  esi, eax
-    lea  rdx, [rbp-0x3c]    ; n_tx
+    lea  rdx, [rbp-0x2b0]   ; qword scratch (the old blockbuf base): an 8-byte store
+                            ; at n_tx@-0x3c overwrote blen@-0x38 (2026-09-27)
     call cli_read_varint
     cmp  rax, -1
     je   .next
-    mov  dword [rbp-0x40], eax  ; vsize (DWORD: a qword would clobber n_tx@-0x3c)
+    mov  ecx, [rbp-0x2b0]
+    mov  [rbp-0x3c], ecx    ; n_tx
+    mov  dword [rbp-0x40], eax  ; vsize (DWORD)
     mov  ecx, [rbp-0x3c]
     test ecx, ecx
     jz   .next
-    lea  rax, [rbp-0x2b0+80]
+    lea  rax, [rel cli_blockbuf+80]
     mov  edx, [rbp-0x40]     ; vsize (dword; zero-extends, not a 64-bit load)
     add  rax, rdx
     mov  [rbp-0x48], rax    ; txbase

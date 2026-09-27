@@ -694,7 +694,10 @@ rules prevent, which is why the daemon refuses a passphrase file inside the
 datadir. Do not copy UTXO files or point tools at a datadir while the daemon
 writes it; stop it first. `daemon/bmc_utxo_setinfo <datadir> --muhash` on a
 stopped datadir is the instrument for comparing the set with a trusted
-node's `gettxoutsetinfo muhash`.
+node's `gettxoutsetinfo muhash`. Live, ask both nodes for the same height
+(`gettxoutsetinfo muhash <height>`): the no-height answer was printed
+byte-reversed on an indexed node from 2026-09-25 to 2026-09-27 (#321), and
+Core's no-height call forces a UTXO flush on the oracle.
 
 **A coin the node calls spent that a trusted node calls unspent** (a block
 rejected for "input references a missing/already-spent UTXO" that Core

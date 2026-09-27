@@ -4,6 +4,7 @@
  * values computed here via the PROVEN asm block_hash/sha256d + a C hex fmt.
  */
 #include <stdio.h>
+#include <ctype.h>
 #include <string.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -118,6 +119,50 @@ int main(void){
     n=cli_main(st,1,av7,out,sizeof out); out[n]=0;
     { char e[32]; strcpy(e,"64000000\n"); cks("getbalance",(char*)out,e); }
 
+    /* ---- 2026-09-27: uppercase hex, and a block larger than the old buffers ----
+     * cli_hexval's 'A'-'F' branch fell into .bad, so any uppercase hash answered
+     * "not found"; and every block-reading command used a stack buffer (384 B
+     * for getblock/gettx/getbalance, 2 KB getblockhash, 16 KB getbestblockhash)
+     * that cli_load_block refused to overflow, so a real block failed them all
+     * and getbalance skipped it silently. */
+    { char up[65]; for(int i=0;i<64;i++) up[i]=(char)toupper((unsigned char)hx[i]); up[64]=0;
+      void* avu[8]; avu[0]=cmd3; avu[1]=up;
+      n=cli_main(st,2,avu,out,sizeof out); out[n]=0;
+      char e[1600]; hexfmt(e,blk[2],(int)blen[2]); strcat(e,"\n"); cks("getblock by UPPERCASE hash",(char*)out,e); }
+    { char up[65]; for(int i=0;i<64;i++) up[i]=(char)toupper((unsigned char)thx[i]); up[64]=0;
+      void* avu[8]; avu[0]=cmd4; avu[1]=up;
+      n=cli_main(st,2,avu,out,sizeof out); out[n]=0;
+      char e[700]; strcpy(e,"found in block 0\n"); char th[600]; hexfmt(th,cbtx[0],(int)cbtxlen[0]); strcat(e,th); strcat(e,"\n");
+      cks("gettx by UPPERCASE txid",(char*)out,e); }
+    /* block 8: a coinbase with 2,000 OP_TRUE outputs of 1,000 each -> ~20 KB */
+    static unsigned char big[24000], bigtx[24000]; static unsigned char bighash[32], bigtxid[32];
+    long biglen, bigtxlen;
+    { unsigned char* q=bigtx;
+      put_u32(q,1);q+=4; q[0]=1;q+=1; memset(q,0,32);q+=32; put_u32(q,0xffffffff);q+=4;
+      q[0]=3; q[1]=8; q[2]=0; q[3]=0; q+=4; put_u32(q,0xffffffff);q+=4;
+      q[0]=0xfd; q[1]=(unsigned char)(2000&0xff); q[2]=(unsigned char)(2000>>8); q+=3;   /* n_out = 2000 */
+      for(int k=0;k<2000;k++){ put_u64(q,1000);q+=8; q[0]=1;q[1]=0x51;q+=2; }
+      put_u32(q,0);q+=4; bigtxlen=q-bigtx; sha256d(bigtxid,bigtx,bigtxlen);
+      unsigned char* o=big; put_u32(o,1);o+=4; memcpy(o,bhash[7],32);o+=32; memcpy(o,bigtxid,32);o+=32;
+      put_u32(o,1300000000u);o+=4; put_u32(o,0x207fffff);o+=4; put_u32(o,0);o+=4;
+      o[0]=1;o+=1; memcpy(o,bigtx,bigtxlen);o+=bigtxlen; biglen=o-big; block_hash(bighash,big); }
+    cki("append block 8 (big)", store_append(st,bighash,big,biglen), 8);
+    if (biglen <= 16384) { printf("FAIL: big block is only %ld bytes; it must exceed every old buffer\n", biglen); failures++; }
+    { char* h8="8"; void* avb[8]; avb[0]=cmd3; avb[1]=h8;
+      n=cli_main(st,2,avb,out,sizeof out); out[n]=0;
+      static char e[50000]; hexfmt(e,big,(int)biglen); strcat(e,"\n"); cks("getblock 8 (20 KB block)",(char*)out,e); }
+    { char* h8="8"; void* avb[8]; avb[0]=cmd2; avb[1]=h8;
+      n=cli_main(st,2,avb,out,sizeof out); out[n]=0;
+      unsigned char rv[32]; rev32(rv,bighash); char e[67]; hexfmt(e,rv,32); strcat(e,"\n"); cks("getblockhash 8 (20 KB block)",(char*)out,e); }
+    { n=cli_main(st,1,av1,out,sizeof out); out[n]=0;
+      unsigned char rv[32]; rev32(rv,bighash); char e[67]; hexfmt(e,rv,32); strcat(e,"\n"); cks("getbestblockhash (20 KB tip)",(char*)out,e); }
+    { unsigned char rv[32]; rev32(rv,bigtxid); char tx8[65]; hexfmt(tx8,rv,32);
+      void* avb[8]; avb[0]=cmd4; avb[1]=tx8;
+      n=cli_main(st,2,avb,out,sizeof out); out[n]=0;
+      static char e[50000]; strcpy(e,"found in block 8\n"); hexfmt(e+strlen(e),bigtx,(int)bigtxlen); strcat(e,"\n"); cks("gettx in the 20 KB block",(char*)out,e); }
+    { n=cli_main(st,1,av7,out,sizeof out); out[n]=0;
+      char e[32]; strcpy(e,"66000000\n"); cks("getbalance counts the 20 KB block (64,000,000 + 2,000 x 1,000)",(char*)out,e); }
+
     /* unknown command */
     char* cmd6="bogus"; void* av8[8]; av8[0]=cmd6;
     n=cli_main(st,1,av8,out,sizeof out); out[n]=0;
@@ -132,7 +177,7 @@ int main(void){
 
     /* stop -> block count (now with trailing newline like the other commands) */
     char* cmd8="stop"; void* ava[8]; ava[0]=cmd8;
-    n=cli_main(st,1,ava,out,sizeof out); out[n]=0; cks("stop",(char*)out,"8\n");
+    n=cli_main(st,1,ava,out,sizeof out); out[n]=0; cks("stop",(char*)out,"9\n");   /* 9 blocks since the 20 KB block 8 above */
 
     /* ---- prune (Core-style -prune): delete blk data below a height ----
      * NB blocks have blen: b[0] has a compact tx. Retain only blocks >= 4. */
@@ -141,7 +186,7 @@ int main(void){
     if(strncmp((char*)out,"pruned to height ",17)==0){ if(n>0&&out[n-1]=='\n')out[n-1]=0; printf("PASS prune cmd (got %.20s)\n",(char*)out); }
     else { printf("FAIL prune cmd got=%.30s\n",(char*)out); failures++; }
     /* block count still reports the full stored chain (index retained) */
-    n=cli_main(st,1,ava,out,sizeof out); out[n]=0; cks("count after prune",(char*)out,"8\n");
+    n=cli_main(st,1,ava,out,sizeof out); out[n]=0; cks("count after prune",(char*)out,"9\n");   /* pruning never moves the tip */
     /* pruned height (<4) -> unavailable (error output) */
     char* h1="1"; void* avc[8]; avc[0]=cmd3; avc[1]=h1;   /* getblock 1 */
     n=cli_main(st,2,avc,out,sizeof out); out[n]=0;

@@ -139,6 +139,29 @@ the archive alongside the hash comparison in
 
 ---
 
+## 7. Signature verification — parity with libsecp256k1
+
+Measured 2026-09-27 on one pinned core (`taskset -c 31`), thread CPU time,
+min of rounds; the libsecp256k1 column is Core's own library built from
+`/storage/bitcoin-core-source/src/secp256k1` (`bench` / `bench_internal`)
+on the same core.
+
+| per operation | bmc (asm) | libsecp256k1 | bench |
+|---|---|---|---|
+| ECDSA verify | 20.7 µs | 21.0 µs | `tests/bench_ecdsa` |
+| BIP340 (Schnorr) verify | 22.4 µs | 22.0 µs | `tests/bench_schnorr` |
+| scalar inverse, variable time (`sc_inv_var`) | 0.67 µs | 0.68 µs | `tests/bench_sc_inv` |
+| field multiply, latency | 8.7 ns | 9.3 ns | `tests/bench_fe` |
+| mixed point add | 96 ns | 105 ns | `tests/bench_point` |
+
+What closed the gap on 2026-09-27 (#319, #320): `sc_inv_var` was a binary
+extended GCD at 3.55 µs (16% of an ECDSA verify) and is now Bernstein–Yang
+safegcd; `pubkey_parse`'s square root was a bit-by-bit power over `(p+1)/4`
+at 4.1 µs and is now an addition chain at 2.1 µs; BIP340's even-Y inversion
+uses safegcd mod p (0.7 µs) instead of the constant-time chain (2.1 µs).
+Before: ECDSA 21.9 µs, BIP340 25.9 µs. A full-verification sync
+(`assumevalid=0`) on the benchmark box took 8 h 0 m to the tip at nice 10.
+
 ## Why each difference exists
 
 **txindex, 2.6× smaller than Core's.** It is a set of sorted runs with a sparse
