@@ -2,6 +2,11 @@
  * sighash_twin.c -- legacy SignatureHash builders for the macOS/AArch64 port.
  * Functional twin of asm/bitcoin_sighash.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_sighash.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  *   int  sighash_all(u8 out32[32], const u8 *tx, u64 txlen, u64 input_index,
  *                    const u8 *script, u64 script_len, u8 *preimg, u64 cap);
  *   int  legacy_sighash(u8 out32[32], const u8* tx, u64 txlen, u64 nIn,

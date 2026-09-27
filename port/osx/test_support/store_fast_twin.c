@@ -2,6 +2,11 @@
  * store_fast_twin.c -- read-cache layer for the macOS/AArch64 port.
  * Functional twin of asm/bitcoin_store_fast.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_store_fast.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * Layout additions to the store struct:
  *   +56 FDC magic 0x5244464300000001 ("RDFC"+version)
  *   +64 fd cache: 8 slots x {file_no u32, fd i32} (LRU-by-slot, direct map)
@@ -65,8 +70,15 @@ long store_rd_fd(void *st, u32 file_no)
     if (fd >= 0) {
         if (cached_no == file_no) return fd;
         close(fd);                          /* evict */
+        *(int *)(e + 4) = -1;               /* 2026-09-26: and empty the slot,
+                                             * as x86 does -- if the open below
+                                             * failed, the closed fd stayed
+                                             * cached, and once the kernel
+                                             * reused the number the old file's
+                                             * reads went to another file */
     }
-    char name[13];
+    char name[16];                          /* x86 fmt_blkname's 16: 13 cut a
+                                             * file number past 99999 short */
     snprintf(name, sizeof name, "blk%05u.dat", file_no);
     fd = open(name, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return -1;
@@ -117,6 +129,11 @@ static int g_map_random;   /* store_map_random */
 #define MAP_OFF    128
 #define MAP_SLOTS  8
 #define MAP_MAGIC  0x4D41504300000001ULL   /* "MAPC" + version */
+/* 2026-09-26: at +384, past the map slots. It was +120 (as on x86), inside
+ * the fd cache: fd slot 7 (+120..127) overwrote it, and the next map call
+ * cleared the map slots without munmap -- a leaked blk-file mapping each
+ * time. Found by the differential test of bitcoin_store_fast.S. */
+#define MAP_MAGIC_OFF 384
 #define MAP_MASK   (MAP_SLOTS - 1)
 
 extern long store_rd_fd(void *st, u32 file_no);
@@ -127,14 +144,14 @@ extern long store_rd_fd(void *st, u32 file_no);
 static void map_file(void *st, u32 file_no, u64 need_end, u8 **out_map, u64 *out_size)
 {
     u8 *S = (u8 *)st;
-    if (*(u64 *)(S + 120) != MAP_MAGIC) {
+    if (*(u64 *)(S + MAP_MAGIC_OFF) != MAP_MAGIC) {
         for (u32 i = 0; i < MAP_SLOTS; i++) {
             u8 *e = S + MAP_OFF + i * 32;
             *(u32 *)(e + 0) = 0;
             *(u64 *)(e + 8) = 0;
             *(u64 *)(e + 16) = 0;
         }
-        *(u64 *)(S + 120) = MAP_MAGIC;
+        *(u64 *)(S + MAP_MAGIC_OFF) = MAP_MAGIC;
     }
     u8 *e = S + MAP_OFF + (u64)(file_no & MAP_MASK) * 32;
     u32 cached_no;
@@ -150,7 +167,7 @@ static void map_file(void *st, u32 file_no, u64 need_end, u8 **out_map, u64 *out
     /* replace */
     if (map) munmap((void *)(uintptr_t)map, size);
     *(u64 *)(e + 8) = 0;
-    char name[13];
+    char name[16];
     snprintf(name, sizeof name, "blk%05u.dat", file_no);
     int fd = open(name, O_RDONLY);
     if (fd < 0) { *out_map = 0; *out_size = 0; return; }
@@ -196,7 +213,7 @@ void store_map_init(void *st)
         *(u64 *)(e + 8) = 0;
         *(u64 *)(e + 16) = 0;
     }
-    *(u64 *)(S + 120) = MAP_MAGIC;
+    *(u64 *)(S + MAP_MAGIC_OFF) = MAP_MAGIC;
 }
 
 void store_map_close(void *st) { store_map_init(st); }

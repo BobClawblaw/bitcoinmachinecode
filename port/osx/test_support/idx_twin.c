@@ -2,6 +2,11 @@
  * idx_twin.c -- persisted block hash -> height open-addressing index,
  * macOS/AArch64. Functional twin of asm/bitcoin_idx.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_idx.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * Memory layout of the index object (caller supplies a zero-initialized
  * buffer) -- MUST match the x86 layout byte-for-byte:
  *   +0   qword  n           (number of live entries)

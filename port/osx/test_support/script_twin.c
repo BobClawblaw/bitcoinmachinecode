@@ -2,6 +2,11 @@
  * script_twin.c -- P2PKH spend validation + DER sig parsing for the
  * macOS/AArch64 port.  Functional twin of asm/bitcoin_script.asm.
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_script.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  *   int  der_parse_sig(const u8* sig, u64 slen, u64 r[4], u64 s[4],
  *                      u32 *hashtype);
  *   void be_to_limbs(u64 out[4], const u8* bytes, u64 len);

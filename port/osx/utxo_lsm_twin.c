@@ -4,7 +4,7 @@
  *
  * Architecture (mirrors the x86 module):
  *   - memtable+WAL tier is utxo_store_* + the in-memory table (this twin
- *     delegates to utxo_store_twin.c / utxo_twin.c; the state struct's first
+ *     delegates to bitcoin_utxo_store.S / bitcoin_utxo.S; the state struct's first
  *     40 bytes are utxo_store's own layout, so `lst` doubles as its `st`).
  *   - THIS module adds: flush (memtable live entries + this generation's
  *     tombstones -> sorted immutable run file, MAGIC_RUN3 44-byte header,
@@ -88,7 +88,7 @@ extern long lsm_run_lookup_mm(void *lst, u64 run_no, u64 gen, const u8 *txid,
                               u32 *out_slen);
 extern void lsm_mm_invalidate_all(void);
 
-/* ---- memtable + WAL tier (utxo_store_twin.c / utxo_twin.c) --------------- */
+/* ---- memtable + WAL tier (bitcoin_utxo_store.S / bitcoin_utxo.S) --------- */
 extern long utxo_store_init(void *st);
 extern long utxo_store_init_ro(void *st);
 extern long utxo_store_put(void *st, void *u, const u8 txid[32], unsigned index,

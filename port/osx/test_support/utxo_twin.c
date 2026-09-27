@@ -2,6 +2,11 @@
  * utxo_twin.c -- in-memory UTXO set for the macOS/AArch64 port.
  * Functional twin of asm/bitcoin_utxo.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_utxo.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * Layout (offsets from the x86 listing, 48-byte slots):
  *   u+0   slots (count)          u+8   mask = slots-1
  *   u+16  blob base              u+24  blob cap

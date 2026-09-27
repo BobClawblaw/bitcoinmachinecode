@@ -2,6 +2,11 @@
  * utxo_stats_twin.c -- UTXO-set statistics layer for the macOS/AArch64 port.
  * Functional twin of asm/bitcoin_utxo_stats.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_utxo_stats.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * struct layout (offsets MUST match the x86 -- tests poke them directly):
  *   0 TXOUTS, 8 AMOUNT, 16 BOGOSIZE, 24 UNSP_N, 32 UNSP_AMT, 40 RAW_N,
  *   48 ZEROH, 56 WANT_MUHASH, 64 EXCL_GENESIS, 72 GENESIS_N,

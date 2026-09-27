@@ -27,7 +27,7 @@
  *   cc -O2 -arch arm64 -I. -Idaemon -Itests -I../port/osx/compat \
  *     -D_DARWIN_C_SOURCE -o /tmp/wv0x_osx ../port/osx/tests/wv0_zero_drv.c \
  *     ../port/osx/bitcoin_interp.S ../port/osx/bitcoin_scriptcodec.S \
- *     ../port/osx/sha256.S ../port/osx/bitcoin_hash.S sighash_twin.c \
+ *     ../port/osx/sha256.S ../port/osx/bitcoin_hash.S ../port/osx/bitcoin_sighash.S \
  *     ../port/osx/sha1.S ../port/osx/ripemd160.S ../port/osx/tls_bitcoin_interp.c \
  *     ../port/osx/tls_bitcoin_scriptcodec.c
  * Build (x86, on .242 from asm/):

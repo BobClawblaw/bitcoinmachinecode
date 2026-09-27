@@ -2,6 +2,11 @@
  * utxo_store_twin.c -- persistent UTXO store (WAL + checkpoint) for the
  * macOS/AArch64 port. Functional twin of asm/bitcoin_utxo_store.asm.
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_utxo_store.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * Files (bare relative names, CWD):
  *   utxo.dat  -- append-only WAL. PUSH: [u32 magic "UTXO"][u8 op=1][3 pad]
  *                [txid32][u32 index][u64 value][u32 height][u8 is_coinbase]
