@@ -218,8 +218,9 @@ int main(void){
     { rpc_out_t o; memset(&o, 0, sizeof o); char msg[256];
       if (chdir("../ring")){ perror("chdir"); return 1; }
       long r = csi_rpc_run(1, &o, msg, sizeof msg);
-      unsigned char rev[32]; for (int i = 0; i < 32; i++) rev[i] = d_ring[31 - i];
-      ck("csi_rpc_run serves 501 with the worker's digest", r == 1 && o.height == 501 && o.muhash_valid && memcmp(o.muhash, rev, 32) == 0); }
+      /* raw finalize bytes (rpc_chain.c reverses once, for every reader; the
+       * adapter's own reversal was a double one from 2026-09-25 to 09-27) */
+      ck("csi_rpc_run serves 501 with the worker's digest", r == 1 && o.height == 501 && o.muhash_valid && memcmp(o.muhash, d_ring, 32) == 0); }
 
     printf("\n== 2: the watermark gates the RPC ==\n");
     csi_test_ring_pause(1);
