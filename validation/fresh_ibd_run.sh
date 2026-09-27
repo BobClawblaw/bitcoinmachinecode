@@ -205,16 +205,30 @@ while :; do
     H=$(echo  "$OURJSON" | sed -n 's/.*"height": *\([0-9]*\).*/\1/p' | head -1)
     case "$H" in ''|*[!0-9]*) ph "FAIL capstone: our side reported no height"; echo FAIL > RESULT; exit 1;; esac
     ph "CAPSTONE ours is at height $H; asking the oracle for the same height"
+    # BOTH sides pinned to H. Until 2026-09-27 our side was the no-height
+    # answer (the live record) and the oracle's the indexed row at H: two
+    # different RPC paths, and the bisect below only ever compared rows, so
+    # a defect confined to the live path's presentation (its hash was
+    # printed byte-reversed, 695a719c) read as "the set diverges at the tip".
+    # The row at H is what the bisect compares, so it is what the verdict
+    # compares; the live answer is checked against it first, as an
+    # RPC-consistency check that names the right culprit.
+    OR=$($CLI gettxoutsetinfo muhash "$H" 2>/dev/null | sed -n 's/.*"muhash": *"\([0-9a-f]*\)".*/\1/p' | head -1)
     CM=$($ORACLE gettxoutsetinfo muhash "$H" 2>/dev/null | sed -n 's/.*"muhash": *"\([0-9a-f]*\)".*/\1/p' | head -1)
     # THE GUARD THAT WAS MISSING: an empty answer is not a passing answer.
     case "$OM" in *[!0-9a-f]*|"") ph "FAIL muhash: our side returned no usable hash ('$OM')"; echo FAIL > RESULT; exit 1;; esac
+    case "$OR" in *[!0-9a-f]*|"") ph "FAIL muhash: our per-height row at $H returned no usable hash ('$OR')"; echo FAIL > RESULT; exit 1;; esac
     case "$CM" in *[!0-9a-f]*|"") ph "FAIL muhash: the oracle returned no usable hash ('$CM')"; echo FAIL > RESULT; exit 1;; esac
-    [ ${#OM} -eq 64 ] && [ ${#CM} -eq 64 ] || { ph "FAIL muhash: a hash was not 64 hex chars (ours ${#OM}, oracle ${#CM})"; echo FAIL > RESULT; exit 1; }
+    [ ${#OM} -eq 64 ] && [ ${#OR} -eq 64 ] && [ ${#CM} -eq 64 ] || { ph "FAIL muhash: a hash was not 64 hex chars (live ${#OM}, row ${#OR}, oracle ${#CM})"; echo FAIL > RESULT; exit 1; }
 
-    if [ "$OM" = "$CM" ]; then
-        ph "PASS muhash identical at $H ($OM)"; echo "PASS $H" > RESULT; exit 0
+    if [ "$OM" != "$OR" ]; then
+        ph "FAIL our two RPC paths disagree at $H: live=$OM row=$OR -- the presentation or the index, not the set"
+        echo "FAIL live-vs-row-at=$H" > RESULT; exit 1
     fi
-    ph "FAIL muhash differs at $H: ours=$OM oracle=$CM"
+    if [ "$OR" = "$CM" ]; then
+        ph "PASS muhash identical at $H ($OR), live answer agrees"; echo "PASS $H" > RESULT; exit 0
+    fi
+    ph "FAIL muhash differs at $H: ours=$OR oracle=$CM"
     # The bisect reads OUR per-height digests, which come from the
     # coinstatsindex. On a fresh sync that index trails the chain, and asking it
     # for a height it has not reached returns nothing -- which is how run 23
@@ -230,7 +244,7 @@ while :; do
         exit 1
     fi
     ph "BISECT: finding the first height whose set diverges (coinstatsindex at $CSI)"
-    LO=1; HI=$H
+    LO=1; HI=$H     # H itself was compared row-vs-row above, so the window's top is a tested DIFFERS
     while [ $LO -lt $HI ]; do
         MID=$(( (LO+HI)/2 ))
         A=$($CLI gettxoutsetinfo muhash "$MID" 2>/dev/null | sed -n 's/.*"muhash": *"\([0-9a-f]*\)".*/\1/p' | head -1)

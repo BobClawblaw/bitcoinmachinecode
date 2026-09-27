@@ -159,13 +159,14 @@ int main(void){
       memset(&o, 0, sizeof o);
       char msg[64];
       ck("csi_rpc_run serves", csi_rpc_run(1, &o, msg, sizeof msg) == 1);
-      /* the adapter REVERSES for presentation (Core's printed order --
-       * pinned after the first live parity check read identical digests as
-       * a mismatch) */
-      unsigned char d_rev[32];
-      for (int i = 0; i < 32; i++) d_rev[i] = d_idx[31 - i];
-      ck("...same digest (presentation order) and counters",
-         o.muhash_valid && memcmp(o.muhash, d_rev, 32) == 0
+      /* RAW finalize bytes, exactly what csi_hist_query and the walk reader
+       * hand over: rpc_chain.c applies Core's uint256 reversal once, for all
+       * three. Until 2026-09-27 this assertion pinned a reversal INSIDE the
+       * adapter, which became a double reversal when the RPC layer gained
+       * its own on 2026-09-25 -- the no-height muhash then printed backwards
+       * and a set identical to Core's read as divergent at 968,807. */
+      ck("...same digest (raw finalize order) and counters",
+         o.muhash_valid && memcmp(o.muhash, d_idx, 32) == 0
          && o.txouts == tx && o.total_amount == amt);
     }
 
