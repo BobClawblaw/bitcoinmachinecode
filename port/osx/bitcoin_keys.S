@@ -22,7 +22,7 @@
  *   pub[0] = 0x02 | (ay limb0 & 1); pub[1..32] = ax bytes reversed to BE.
  *
  * Calls (AAPCS64, all proven on this port):
- *   point_scalar_mul_ct (point_ct_twin.c), fe_mul/fe_sqr/fe_inv (secp256k1_fe.S).
+ *   point_scalar_mul_ct (secp256k1_point_ct.S), fe_mul/fe_sqr/fe_inv (secp256k1_fe.S).
  *
  * Darwin pitfalls honoured here: sp 16-aligned at every bl (stp x29,x30
  * prologue); no x18/x28; w-regs never touch parked x19/x20 halves; data

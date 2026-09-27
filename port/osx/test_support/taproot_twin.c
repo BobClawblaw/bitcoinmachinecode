@@ -2,6 +2,11 @@
  * taproot_twin.c -- BIP341 taproot commitment/tweak layer for the
  * macOS/AArch64 port.  Functional twin of asm/secp256k1_taproot.asm.
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/secp256k1_taproot.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  *   void tagged_hash256(u8 out[32], const char* tag, u64 taglen,
  *                       const u8* msg, u64 msglen);
  *   void tap_branch_hash(u8 out[32], const u8* a, const u8* b);

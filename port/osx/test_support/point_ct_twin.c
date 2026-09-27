@@ -2,6 +2,11 @@
  * point_ct_twin.c -- constant-time point layer for the macOS/AArch64 port.
  * Functional twin of asm/secp256k1_point_ct.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/secp256k1_point_ct.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  *   pointh_add(r, p, q)           -- RCB Algorithm 7 (complete, branch-free)
  *   pointh_double(r, p)           -- complete doubling, a=0 (RCB Alg 9 shape)
  *   point_scalar_mul_ct(r, xy, k) -- fixed 256-round ladder, cmov select

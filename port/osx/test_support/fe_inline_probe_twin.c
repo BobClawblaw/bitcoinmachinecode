@@ -7,8 +7,8 @@
  * test_fe_inline can check them against the shipped routines AND against a
  * 320-bit C oracle.
  *
- * The Mac has no inline form: port/osx/point_twin.c and point_ct_twin.c call
- * fe_add / fe_sub directly (point_ct_twin.c's fe_dbl2 is fe_add(a, a)). So
+ * The Mac has no inline form: port/osx/secp256k1_point.S and _point_ct.S call
+ * fe_add / fe_sub directly (the ct layer's doubling-by-add is fe_add(a, a)). So
  * here the *_inl entry points ARE the shipped routines, and on the Mac:
  *   - test_fe_inline's check 1 (inline == shipped) is vacuous, by design;
  *   - its check 2 is the real content: the shipped fe_add / fe_sub / 2a that

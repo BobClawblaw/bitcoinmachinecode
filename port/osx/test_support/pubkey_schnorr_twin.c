@@ -3,6 +3,11 @@
  * for the macOS/AArch64 port.  Functional twins of asm/bitcoin_pubkey.asm
  * and asm/secp256k1_schnorr.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_pubkey.S + secp256k1_schnorr.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  *   int pubkey_parse(const u8 *pub, unsigned long publen,
  *                    u64 qx[4], u64 qy[4]);
  *   int  schnorr_verify(const u8 sig[64], const u8 pub_xonly[32],
@@ -221,7 +226,7 @@ int schnorr_verify(const unsigned char sig[64], const unsigned char pub_xonly[32
         point_scalar_mul(EP, P_aff, eL);
 
     /* R = sG - eP : negate EP's Y (p - y) if not infinity */
-    if ((EP[5] | EP[6] | EP[7]) != 0) {
+    if ((EP[4] | EP[5] | EP[6] | EP[7]) != 0) {   /* all four Y limbs, as x86 */
         u64 borrow = 0, v[4];
         for (int i = 0; i < 4; i++) {
             u128 t = (u128)P_LIMBS[i] - EP[4 + i] - borrow;

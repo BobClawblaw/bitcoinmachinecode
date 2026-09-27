@@ -2,6 +2,11 @@
  * ecdsa_twin.c -- ECDSA verify for the macOS/AArch64 port.  Functional twin
  * of asm/secp256k1_ecdsa.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/secp256k1_ecdsa.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  *   int  ecdsa_verify(const u64 z[4], const u64 r[4], const u64 s[4],
  *                     const u64 Qx[4], const u64 Qy[4]);
  *   int  ecdsa_x_eq_mod_n(const u64 r[4], const u64 X[4], const u64 Z[4]);

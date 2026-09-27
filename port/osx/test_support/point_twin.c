@@ -2,6 +2,11 @@
  * point_twin.c -- secp256k1 Jacobian point arithmetic for the macOS/AArch64
  * port.  Functional twin of asm/secp256k1_point.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/secp256k1_point.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * Same formulas, same 4x64 limb convention, same 12-limb Jacobian / 8-limb
  * affine layout, same infinity representation (Z=0 with X=Y=1) as the x86
  * asm.  Field ops come from secp256k1_fe.S (fe_mul/fe_sqr/fe_add/fe_sub), scalar

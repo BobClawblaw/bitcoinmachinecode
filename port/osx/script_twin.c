@@ -27,8 +27,8 @@
  *
  * C twin per the escape hatch: dense cursor arithmetic + the Core-quirk DER
  * shape; every bound and strip rule of the x86 transcribed as-is.
- * Calls: sighash_all (sighash_twin), pubkey_parse (pubkey_schnorr_twin),
- * ecdsa_verify (ecdsa_twin).
+ * Calls: sighash_all (sighash_twin), pubkey_parse (bitcoin_pubkey.S),
+ * ecdsa_verify (secp256k1_ecdsa.S).
  * ==========================================================================*/
 #include <stdint.h>
 #include <string.h>

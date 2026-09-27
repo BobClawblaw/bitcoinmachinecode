@@ -13,8 +13,8 @@
  *   per asm field call, the same destination (a numbered scratch slot, or the
  *   output limb it wrote), in the same order. Squarings stay fe_mul(a, a),
  *   as in the frozen code. It was transcribed from the .asm files, not from
- *   port/osx/point_twin.c, which is what makes the test a differential and
- *   not a tautology.
+ *   the Mac point layer (secp256k1_point.S; point_twin.c before it), which
+ *   is what makes the test a differential and not a tautology.
  *
  *   Like the x86 reference it links the LIVE field layer (fe_add/fe_sub/
  *   fe_mul, all alias-safe) and the live sc_split_lambda / glv_wnaf: the
