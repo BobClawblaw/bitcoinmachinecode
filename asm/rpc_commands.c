@@ -5040,12 +5040,20 @@ static int cmd_logging(const rj_val* params, long* ec, const char** em, rj_val**
  * Core's default mode reports its SECURE ALLOCATOR's locked pool. This node
  * has no secure allocator, so those six numbers describe nothing here and
  * are refused rather than zeroed. Mode "mallocinfo" is real: glibc's
- * malloc_info(3) emits the same XML Core forwards. */
+ * malloc_info(3) emits the same XML Core forwards. Without glibc (macOS) it
+ * is refused as Core refuses it there: -8 "mallocinfo mode not available". */
 static int cmd_getmemoryinfo(const rj_val* params, long* ec, const char** em, rj_val** result){
     const char* mode = "stats";
     if (params && params->typ == RJ_ARR && params->nitems >= 1 &&
         params->items[0]->typ == RJ_STR) mode = params->items[0]->str;
     if (!strcmp(mode, "mallocinfo")){
+#ifndef __GLIBC__
+        /* No malloc_info(3) outside glibc (macOS). Core's rpc/node.cpp answers
+         * exactly this when built without HAVE_MALLOC_INFO, which is every
+         * non-glibc build, so a Mac node now refuses the way a Mac Core does. */
+        *ec = -8; *em = "mallocinfo mode not available";
+        return 0;
+#else
         char* buf = NULL; size_t len = 0;
         FILE* f = open_memstream(&buf, &len);
         if (!f){ *ec = -7; *em = "oom"; return 0; }
@@ -5055,13 +5063,17 @@ static int cmd_getmemoryinfo(const rj_val* params, long* ec, const char** em, rj
         *result = rj_str(buf ? buf : "");
         free(buf);
         return 1;
+#endif
     }
     if (!strcmp(mode, "stats")){
         *ec = -1;
         *em = "getmemoryinfo \"stats\" reports Bitcoin Core's SECURE ALLOCATOR "
               "locked-page pool. This node has no secure allocator, so those "
-              "numbers would describe nothing. Use mode \"mallocinfo\", which "
-              "returns glibc's real malloc_info(3) XML";
+              "numbers would describe nothing."
+#ifdef __GLIBC__
+              " Use mode \"mallocinfo\", which returns glibc's real malloc_info(3) XML"
+#endif
+              ;
         return 0;
     }
     *ec = -8; *em = "mode must be \"stats\" or \"mallocinfo\"";
