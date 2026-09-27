@@ -1,6 +1,11 @@
 /* ============================================================================
  * bech32_twin.c -- C twin for the bech32/bech32m codec on the macOS port.
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bech32.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * The x86 body (asm/bech32.asm, 674 lines) carries two audited security
  * fixes in its control flow -- the 90-character input cap (SER-1/WAL-1)
  * and the mixed-case rejection (SER-5/WAL-9) -- plus a 256-byte CHAR2IDX

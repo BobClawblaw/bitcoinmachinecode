@@ -1,5 +1,10 @@
 /* multisig_twin.c -- C twin of asm/bitcoin_multisig.asm for the osx port.
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_multisig.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  *   int p2sh_hash(const u8 *script, ulong script_len, u8 out20[20])
  *       RIPEMD160(SHA256(script)); 1, or 0 for an empty script.
  *   int multisig_verify(const u8 *scriptSig, ulong sigLen,

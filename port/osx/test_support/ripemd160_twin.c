@@ -1,6 +1,11 @@
 /*
  * ripemd160_twin.c -- C twin for the RIPEMD-160 module on the macOS port.
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/ripemd160.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * The bmc_osx port prefers hand-written AArch64 assembly with C twins as
  * oracles, mirroring the x86 tree. RIPEMD-160's x86 body is a fully
  * unrolled 2x80-round kernel with register renaming; two AArch64

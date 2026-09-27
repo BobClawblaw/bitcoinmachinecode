@@ -1,6 +1,11 @@
 /*
  * sha1_twin.c -- C twin for the SHA-1 module on the macOS port.
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/sha1.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * Two AArch64 asm translations of asm/sha1.asm (scalar, unrolled-free)
  * both computed wrong W[0]/compression state; dynamic dumps showed W[0]
  * itself loaded/store incorrectly with everything static checking out.

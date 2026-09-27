@@ -2,6 +2,11 @@
  * chainwork_twin.c -- Bitcoin chainwork layer for the macOS/AArch64 port.
  * Functional twin of asm/bitcoin_chainwork.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_chainwork.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  *   void compact_to_target_le(u8 out_le[32], u32 bits);
  *   void u256_div(u8 q_le[32], const u8 a_le[32], const u8 b_le[32]);
  *   void block_work(u64 work[2], u32 bits);
@@ -66,12 +71,14 @@ void u256_div(u8 q_le[32], const u8 a_le[32], const u8 b_le[32])
         u64 t[4];
         u64 borrow = 0;
         for (int i = 0; i < 4; i++) {
-            /* 128-bit limb subtraction with borrow */
-            u64 bi = B[i] + borrow;
-            if (R[i] < bi) { t[i] = R[i] - bi; borrow = 1; }
-            else if (bi == 0) { t[i] = R[i]; borrow = 0; }
-            else if (R[i] >= bi) { t[i] = R[i] - bi; borrow = 0; }
-            else { t[i] = R[i] - bi; borrow = 1; }
+            /* the x86 sbb chain. 2026-09-26: this was `R < B[i]+borrow`,
+             * which lost the borrow when B[i] is all-ones and a borrow comes
+             * in (B[i]+1 wraps to 0); found fuzzing bitcoin_chainwork.S.
+             * Unreachable from block_work (a compact target has <= 3 nonzero
+             * bytes), but u256_div is exported. */
+            u128 d = (u128)R[i] - B[i] - borrow;
+            t[i] = (u64)d;
+            borrow = (u64)(d >> 64) & 1;
         }
         /* x86: commit iff (no-borrow from sub) OR (carry-out of shift) */
         if (!borrow || cout) {

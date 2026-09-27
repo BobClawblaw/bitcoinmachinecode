@@ -4,6 +4,11 @@
  * num3072 path, muhash_to_num3072 (SHA256 + ChaCha20 keystream), insert,
  * combine, finalize, and the utxo_stats layer on top.
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_muhash.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  *   p = 2^3072 - 1103717, 48 x u64 little-endian limbs.
  * -------------------------------------------------------------------------- */
 #include <stdint.h>

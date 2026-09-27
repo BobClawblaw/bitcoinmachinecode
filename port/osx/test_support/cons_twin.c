@@ -2,6 +2,11 @@
  * cons_twin.c -- block consensus verifier for the macOS/AArch64 port.
  * Functional twin of asm/bitcoin_cons.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_cons.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  *   int cons_verify(const u8 *block, u64 len, u8 *txids_out, u64 cap);
  *
  * Returns 1 iff: pow_check passes; the compact-size tx count parses;

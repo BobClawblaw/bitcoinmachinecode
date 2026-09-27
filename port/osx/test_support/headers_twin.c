@@ -2,6 +2,11 @@
  * headers_twin.c -- header chain store for the macOS/AArch64 port.
  * Functional twin of asm/bitcoin_headers.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_headers.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against (symbols renamed with -D by the
+ * harness). It is not part of any daemon build.
+ *
  * hst struct: +0 fd (i64), +8 count (u64).
  * File "headers.dat": 112-byte records = header[80] || hash[32].
  *

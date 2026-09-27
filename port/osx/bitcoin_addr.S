@@ -20,7 +20,7 @@
  * the x86's saved-register-overrun history cannot recur.
  *
  * Calls: sha256d (bitcoin_hash.S), sha256_full (sha256.S), ripemd160
- * (ripemd160_twin.c) -- all proven on this port.  Locals are sp-relative;
+ * (ripemd160.S) -- all proven on this port.  Locals are sp-relative;
  * sp stays 16-aligned at every bl (48B save area + 0x180 locals = 432).
  * ==========================================================================*/
 

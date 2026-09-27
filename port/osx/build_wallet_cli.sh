@@ -17,8 +17,8 @@ $CC -o "$OUT/bmc_wallet_cli" \
     ../port/osx/secp256k1_scalar.S ../port/osx/sc_mul_c.c ../port/osx/sc_mul_512_c.c \
     secp256k1_scalar_c.c secp256k1_glv_c.c ../port/osx/g_comb_table_data.c \
     ../port/osx/sighash_twin.c \
-    ../port/osx/bitcoin_hash.S ../port/osx/sha256.S ../port/osx/ripemd160_twin.c \
+    ../port/osx/bitcoin_hash.S ../port/osx/sha256.S ../port/osx/ripemd160.S \
     ../port/osx/bitcoin_bip39.S ../port/osx/sha512.S ../port/osx/bitcoin_hmac.S \
     ../port/osx/bitcoin_bip32.S ../port/osx/bitcoin_keys.S ../port/osx/bitcoin_addr.S \
-    ../port/osx/bech32_twin.c ../port/osx/utxo_twin.c \
+    ../port/osx/bech32.S ../port/osx/utxo_twin.c \
     ../port/osx/darwin_stubs.c ../port/osx/bmcshim.c -lpthread
