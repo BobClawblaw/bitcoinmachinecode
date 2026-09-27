@@ -7,4 +7,4 @@
  * x86 assembles bitcoin_utxo_lsm.asm with -DLSM_REPRO_BAD_SPARSE; this is the
  * same switch on the Mac twin. Test-only: never part of a daemon. */
 #define LSM_REPRO_BAD_SPARSE 1
-#include "../utxo_lsm_twin.c"
+#include "utxo_lsm_twin.c"

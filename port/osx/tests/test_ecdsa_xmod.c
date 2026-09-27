@@ -24,8 +24,8 @@
  *   cc -O2 -arch arm64 -I. -Itests -I../port/osx/compat -D_DARWIN_C_SOURCE \
  *     -o test_ecdsa_xmod tests/test_ecdsa_xmod.c ../port/osx/secp256k1_ecdsa.S \
  *     ../port/osx/secp256k1_fe.S ../port/osx/secp256k1_point.S \
- *     ../port/osx/g_comb_table_data.c ../port/osx/sc_mul_c.c \
- *     ../port/osx/sc_mul_512_c.c secp256k1_scalar_c.c secp256k1_glv_c.c \
+ *     ../port/osx/g_comb_table_data.c \
+ *     secp256k1_scalar_c.c secp256k1_glv_c.c \
  *     ../port/osx/secp256k1_scalar.S
  */
 #include <stdio.h>

@@ -287,10 +287,8 @@ _sc_sub:
 	stp	x11, x12, [x25, #16]
 .endm
 
-	.align	2
-_sc_mul:
-	/* portable C implementation while the AArch64 fold is debugged */
-	b	_sc_mul_c
+/* sc_mul, sc_mul_512 and their product helper: see the block at the end of
+ * this file (2026-09-26: assembly; they tail-called sc_mul_c.c / sc_mul_512_c.c) */
 
 _sc_sqr:
 	/* sc_sqr(r,a) = sc_mul(r,a,a) */
@@ -623,104 +621,6 @@ _sc_inv_var:
 	ret
 
 /* ---------------------------------------------------------------------------
- * void sc_mul_512(r[8], a[4], b[4]): full 512-bit product, no reduction.
- * Same frame/discipline as sc_mul; stores cur[0..7] at the end.
- * --------------------------------------------------------------------------- */
-	.align	2
-_sc_mul_512_asm:
-	stp	x29, x30, [sp, #-16]!
-	stp	x19, x20, [sp, #-16]!
-	stp	x21, x22, [sp, #-16]!
-	stp	x23, x24, [sp, #-16]!
-	stp	x25, x26, [sp, #-16]!
-	str	x27, [sp, #-16]!
-	mov	x29, sp
-	sub	sp, sp, #352			/* locals BELOW x29 (a/b/cur) */
-
-	mov	x19, x1			/* a */
-	mov	x20, x2			/* b */
-	mov	x21, x0			/* out */
-	ldp	x9, x10, [x19, #0]
-	stp	x9, x10, [x29, #-64]
-	ldp	x11, x12, [x19, #16]
-	stp	x11, x12, [x29, #-48]
-	ldp	x9, x10, [x20, #0]
-	stp	x9, x10, [x29, #-128]
-	ldp	x11, x12, [x20, #16]
-	stp	x11, x12, [x29, #-112]
-	str	x21, [x29, #-136]
-
-	add	x25, x29, #-240
-	mov	x9, xzr
-	stp	x9, x9, [x25, #0]
-	stp	x9, x9, [x25, #16]
-	stp	x9, x9, [x25, #32]
-	stp	x9, x9, [x25, #48]
-	stp	x9, x9, [x25, #64]
-	str	x9, [x25, #72]
-
-	/* Row-carry schoolbook (mirrors ref_mul_512, the validated oracle):
-	 *   for i in 0..3:  carry = 0
-	 *     for j in 0..3:  t = acc[i+j] + a[i]*b[j] + carry  (128-bit)
-	 *                     acc[i+j] = lo(t) ; carry = hi(t)
-	 *     acc[i+4] += carry
-	 * x22 = i, x24 = j, x13 = acc ptr tmp, x15 = carry. */
-	mov	x22, #0				/* i */
-.Lm512_i:
-	mov	x15, xzr			/* carry = 0 */
-	mov	x24, #0				/* j */
-.Lm512_j:
-	ldr	x9,  [x19, x22, lsl #3]		/* a[i] */
-	ldr	x10, [x20, x24, lsl #3]		/* b[j] */
-	mul	x11, x9, x10			/* lo */
-	umulh	x12, x9, x10			/* hi */
-	add	x23, x22, x24			/* k = i+j */
-	ldr	x13, [x25, x23, lsl #3]		/* acc[k] */
-	adds	x13, x13, x15			/* + carry */
-	adcs	x13, x13, x11			/* + lo */
-	adcs	x12, x12, xzr			/* hi + carry-out -> new carry */
-	str	x13, [x25, x23, lsl #3]
-	mov	x15, x12			/* carry = hi(t) */
-	add	x24, x24, #1
-	cmp	x24, #4
-	b.lt	.Lm512_j
-	/* acc[i+4] += carry */
-	add	x23, x22, #4
-	ldr	x13, [x25, x23, lsl #3]
-	adds	x13, x13, x15
-	str	x13, [x25, x23, lsl #3]
-	add	x22, x22, #1
-	cmp	x22, #4
-	b.lt	.Lm512_i
-
-	ldr	x14, [x29, #-136]
-	ldp	x9, x10,  [x25, #0]
-	stp	x9, x10,  [x14, #0]
-	ldp	x9, x10,  [x25, #16]
-	stp	x9, x10,  [x14, #16]
-	ldp	x9, x10,  [x25, #32]
-	stp	x9, x10,  [x14, #32]
-	ldp	x9, x10,  [x25, #48]
-	stp	x9, x10,  [x14, #48]
-
-	add	sp, sp, #352
-	ldr	x27, [sp], #16
-	ldp	x25, x26, [sp], #16
-	ldp	x23, x24, [sp], #16
-	ldp	x21, x22, [sp], #16
-	ldp	x19, x20, [sp], #16
-	ldp	x29, x30, [sp], #16
-	ret
-
-
-/* sc_mul_512: temporarily routed to the portable C implementation while the
- * asm variant is being debugged (identical semantics; validated vs x86). */
-	.align	2
-_sc_mul_512:
-	/* C prototype (r, a, b) == sc_mul_512_c(r, a, b): tail-call. */
-	b	_sc_mul_512_c
-
-/* ---------------------------------------------------------------------------
  * int sc_split_lambda(r1[4], r2[4], k[4]):
  *   c1 = round((k*G1)>>384); c2 = round((k*G2)>>384)
  *   c1 *= MINUS_B1 ; c2 *= MINUS_B2 ; r2 = c1 + c2 (mod n)
@@ -856,3 +756,210 @@ _sc_split_lambda:
 	ldp	x19, x20, [sp], #16
 	ldp	x29, x30, [sp], #16
 	ret
+
+/* ===========================================================================
+ * sc_mul / sc_sqr's multiply and sc_mul_512, in assembly (2026-09-26). They
+ * tail-called the portable C (sc_mul_c.c, sc_mul_512_c.c -- now the oracles in
+ * test_support) "while the AArch64 fold is debugged"; the unused
+ * _sc_mul_512_asm beside them carried the bug: its first add's carry went back
+ * in at bit 0 instead of bit 64. sc_mul is CONSTANT-TIME (fixed folds, a csel
+ * subtract), as the x86's; the C was not. Both give the canonical a*b mod n,
+ * so the answers are the same (5M cases vs the C, edge operands, aliasing).
+ * ========================================================================= */
+	.text
+/* Lsc_prod(a=x1, b=x2) -> p0..p7 in x3..x10 ; leaf, uses x11..x17 */
+    .p2align 2
+Lsc_prod:
+    ldp   x11, x12, [x1]                  /* a0 a1 */
+    ldp   x13, x14, [x1, #16]             /* a2 a3 */
+    ldp   x15, x16, [x2]                  /* b0 b1 */
+    ldp   x1, x2, [x2, #16]               /* b2 b3 (a, b pointers spent) */
+    /* column accumulation: (x17:acc_hi2) -- use x3.. as outputs */
+    /* col 0 */
+    mul   x3, x11, x15
+    umulh x4, x11, x15
+    mov   x5, xzr
+    mov   x6, xzr
+    /* col 1: a0b1 + a1b0 */
+.macro MAC lo, hi, top, ra, rb
+    mul   x17, \ra, \rb
+    adds  \lo, \lo, x17
+    umulh x17, \ra, \rb
+    adcs  \hi, \hi, x17
+    adc   \top, \top, xzr
+.endm
+    MAC   x4, x5, x6, x11, x16
+    MAC   x4, x5, x6, x12, x15
+    /* col 2: a0b2 a1b1 a2b0 */
+    mov   x7, xzr
+    MAC   x5, x6, x7, x11, x1
+    MAC   x5, x6, x7, x12, x16
+    MAC   x5, x6, x7, x13, x15
+    /* col 3: a0b3 a1b2 a2b1 a3b0 */
+    mov   x8, xzr
+    MAC   x6, x7, x8, x11, x2
+    MAC   x6, x7, x8, x12, x1
+    MAC   x6, x7, x8, x13, x16
+    MAC   x6, x7, x8, x14, x15
+    /* col 4: a1b3 a2b2 a3b1 */
+    mov   x9, xzr
+    MAC   x7, x8, x9, x12, x2
+    MAC   x7, x8, x9, x13, x1
+    MAC   x7, x8, x9, x14, x16
+    /* col 5: a2b3 a3b2 */
+    mov   x10, xzr
+    MAC   x8, x9, x10, x13, x2
+    MAC   x8, x9, x10, x14, x1
+    /* col 6: a3b3 */
+    mul   x17, x14, x2
+    adds  x9, x9, x17
+    umulh x17, x14, x2
+    adc   x10, x10, x17
+    ret
+
+/* void sc_mul_512(r[8], a[4], b[4]): the full product, no reduction */
+    .p2align 2
+    .globl _sc_mul_512
+_sc_mul_512:
+    stp   x29, x30, [sp, #-16]!
+    mov   x29, sp
+    str   x0, [sp, #-16]!
+    bl    Lsc_prod
+    ldr   x0, [sp], #16
+    stp   x3, x4, [x0]
+    stp   x5, x6, [x0, #16]
+    stp   x7, x8, [x0, #32]
+    stp   x9, x10, [x0, #48]
+    ldp   x29, x30, [sp], #16
+    ret
+
+/* ---------------------------------------------------------------------------
+ * void sc_mul(r[4], a[4], b[4]) = a*b mod n, CONSTANT-TIME, canonical.
+ * The 512-bit product L + H*2^256, then four folds of 2^256 = DELTA (mod n),
+ * DELTA = 2^256 - n = d0 + d1*2^64 + 2^128 (129 bits):
+ *   fold 1: H (256 bits) -> L + H*DELTA        <= 386 bits (7 limbs)
+ *   fold 2: bits 256.. (<= 130) -> ...          <= 260 bits (5 limbs)
+ *   fold 3: bits 256.. (<= 4)   -> ...          <= 257 bits
+ *   fold 4: bit 256 (0 / 1)     -> ...          <  2^256 (cannot carry: when
+ *           that bit is set the low 256 bits are tiny)
+ * then one csel subtract of n (the value is < 2^256 < 2n). No branch or
+ * address depends on the operands. Every fold is always performed.
+ * ------------------------------------------------------------------------- */
+/* MUL4x1 (h0..h3 in x7..x10, d) -> r0..r4 in x1, x2, x16, x17, x0 ; x20 temp */
+.macro MUL4x1 d
+    mul   x1, x7, \d
+    umulh x2, x7, \d
+    mul   x20, x8, \d
+    adds  x2, x2, x20
+    umulh x16, x8, \d
+    mul   x20, x9, \d
+    adcs  x16, x16, x20
+    umulh x17, x9, \d
+    mul   x20, x10, \d
+    adcs  x17, x17, x20
+    umulh x0, x10, \d
+    adc   x0, x0, xzr
+.endm
+/* MUL3x1 (h0..h2 in x13..x15, d) -> r0..r3 in x1, x2, x17, x0 ; x20 temp */
+.macro MUL3x1 d
+    mul   x1, x13, \d
+    umulh x2, x13, \d
+    mul   x20, x14, \d
+    adds  x2, x2, x20
+    umulh x17, x14, \d
+    mul   x20, x15, \d
+    adcs  x17, x17, x20
+    umulh x0, x15, \d
+    adc   x0, x0, xzr
+.endm
+
+    .p2align 2
+    .globl _sc_mul
+_sc_mul:
+    stp   x29, x30, [sp, #-32]!
+    stp   x19, x20, [sp, #16]
+    mov   x29, sp
+    mov   x19, x0
+    bl    Lsc_prod                        /* p0..p7 in x3..x10: L = x3..x6, H = x7..x10 */
+    adrp  x17, LSC_DELTA@PAGE
+    add   x17, x17, LSC_DELTA@PAGEOFF
+    ldp   x11, x12, [x17]                 /* d0, d1 (d2 = 1) */
+    /* ---- fold 1: acc (x3..x6, x13, x14, x15) = L + H*d0 + H*d1<<64 + H<<128 */
+    MUL4x1 x11                            /* H*d0 -> limbs 0..4 */
+    adds  x3, x3, x1
+    adcs  x4, x4, x2
+    adcs  x5, x5, x16
+    adcs  x6, x6, x17
+    adcs  x13, x0, xzr
+    cset  x14, cs
+    mov   x15, xzr
+    MUL4x1 x12                            /* H*d1 -> limbs 1..5 */
+    adds  x4, x4, x1
+    adcs  x5, x5, x2
+    adcs  x6, x6, x16
+    adcs  x13, x13, x17
+    adcs  x14, x14, x0
+    adc   x15, x15, xzr
+    adds  x5, x5, x7                      /* H -> limbs 2..5 */
+    adcs  x6, x6, x8
+    adcs  x13, x13, x9
+    adcs  x14, x14, x10
+    adc   x15, x15, xzr
+    /* ---- fold 2: H' = x13, x14, x15 (<= 130 bits); limb 4 in x16 */
+    MUL3x1 x11                            /* H'*d0 -> limbs 0..3 */
+    adds  x3, x3, x1
+    adcs  x4, x4, x2
+    adcs  x5, x5, x17
+    adcs  x6, x6, x0
+    cset  x16, cs
+    MUL3x1 x12                            /* H'*d1 -> limbs 1..4 */
+    adds  x4, x4, x1
+    adcs  x5, x5, x2
+    adcs  x6, x6, x17
+    adc   x16, x16, x0
+    adds  x5, x5, x13                     /* H' -> limbs 2..4 */
+    adcs  x6, x6, x14
+    adc   x16, x16, x15                   /* the value is < 2^260: x16 < 16 */
+    /* ---- fold 3: h = x16 */
+    mul   x1, x16, x11
+    umulh x2, x16, x11
+    mul   x17, x16, x12
+    umulh x0, x16, x12
+    adds  x3, x3, x1
+    adcs  x4, x4, x2
+    adcs  x5, x5, x16
+    adcs  x6, x6, xzr
+    cset  x13, cs
+    adds  x4, x4, x17
+    adcs  x5, x5, x0
+    adcs  x6, x6, xzr
+    cinc  x13, x13, cs                    /* bit 256: 0 / 1 */
+    /* ---- fold 4: that bit (DELTA masked in, no branch) */
+    neg   x14, x13
+    and   x1, x11, x14
+    and   x2, x12, x14
+    adds  x3, x3, x1
+    adcs  x4, x4, x2
+    adcs  x5, x5, x13
+    adc   x6, x6, xzr
+    /* ---- v >= n  <=>  v + DELTA carries out of 2^256: then take v - n */
+    adds  x7, x3, x11
+    adcs  x8, x4, x12
+    mov   x16, #1
+    adcs  x9, x5, x16
+    adcs  x10, x6, xzr
+    csel  x3, x7, x3, cs
+    csel  x4, x8, x4, cs
+    csel  x5, x9, x5, cs
+    csel  x6, x10, x6, cs
+    stp   x3, x4, [x19]
+    stp   x5, x6, [x19, #16]
+    ldp   x19, x20, [sp, #16]
+    ldp   x29, x30, [sp], #32
+    ret
+
+    .section __TEXT,__const
+    .p2align 4
+LSC_DELTA:
+    .quad 0x402DA1732FC9BEBF, 0x4551231950B75FC4
+    .text

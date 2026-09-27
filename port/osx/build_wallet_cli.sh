@@ -14,7 +14,7 @@ $CC -o "$OUT/bmc_wallet_cli" \
     ../port/osx/bitcoin_script.S \
     ../port/osx/secp256k1_fe.S ../port/osx/secp256k1_point.S ../port/osx/secp256k1_point_ct.S \
     ../port/osx/secp256k1_ecdsa.S ../port/osx/bitcoin_pubkey.S ../port/osx/secp256k1_schnorr.S \
-    ../port/osx/secp256k1_scalar.S ../port/osx/sc_mul_c.c ../port/osx/sc_mul_512_c.c \
+    ../port/osx/secp256k1_scalar.S \
     secp256k1_scalar_c.c secp256k1_glv_c.c ../port/osx/g_comb_table_data.c \
     ../port/osx/bitcoin_sighash.S \
     ../port/osx/bitcoin_hash.S ../port/osx/sha256.S ../port/osx/ripemd160.S \

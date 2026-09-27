@@ -4,6 +4,10 @@
  * subtracts.  Bit-exact with asm/secp256k1_scalar.asm's sc_mul (same
  * algorithm the x86 validates against secp256k1_scalar_c.c).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/secp256k1_scalar.S (sc_mul) (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against. It is not part of any daemon build.
+ *
  * NOTE: not constant-time (folds use data-dependent full propagation).
  * The x86 asm is CT; swap back in once the AArch64 fold bug is root-
  * caused.  Fine for IBD/block verification paths that only touch public

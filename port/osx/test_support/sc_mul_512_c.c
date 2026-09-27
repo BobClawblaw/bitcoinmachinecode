@@ -3,6 +3,10 @@
  * macOS/AArch64 stopgap for sc_mul_512 while the asm variant is being
  * debugged; matches asm/secp256k1_scalar.asm's sc_mul_512 bit-exactly
  * (same row-carry structure as the validated ref_mul_512 oracle).
+ *
+ * 2026-09-26: RETIRED from the daemon. port/osx/secp256k1_scalar.S (sc_mul_512) (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against. It is not part of any daemon build.
  */
 #include <stdint.h>
 #include <string.h>

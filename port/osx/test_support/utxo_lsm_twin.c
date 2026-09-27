@@ -2,6 +2,10 @@
  * utxo_lsm_twin.c -- LSM-tree-style persistent UTXO store, macOS/AArch64.
  * Functional twin of asm/bitcoin_utxo_lsm.asm (branch bmc_osx).
  *
+ * 2026-09-26: RETIRED from the daemon. port/osx/bitcoin_utxo_lsm.S (AArch64
+ * assembly) replaced it; this stays in test_support as the differential
+ * oracle the assembly is fuzzed against. It is not part of any daemon build.
+ *
  * Architecture (mirrors the x86 module):
  *   - memtable+WAL tier is utxo_store_* + the in-memory table (this twin
  *     delegates to bitcoin_utxo_store.S / bitcoin_utxo.S; the state struct's first
@@ -1120,6 +1124,12 @@ static long mac_lsm_recount(void *lst, void *u,
                              PROT_READ | PROT_WRITE,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (slots == MAP_FAILED) return -1;
+    /* 2026-09-26: every fd -1 BEFORE any open. The cleanup closes each
+     * slot's fd >= 0, and a slot the loop never reached is still the
+     * mapping's zero fill -- a failed open or header read closed fd 0 (and,
+     * once reused, whatever file then had it: a store's WAL in the
+     * bitcoin_utxo_lsm.S differential test). */
+    for (u64 i = 0; i < nruns; i++) slots[i].fd = -1;
     for (u64 i = 0; i < nruns; i++) {
         lsm_slot_t *sl = &slots[i];
         memset(sl, 0, sizeof *sl);
@@ -1361,6 +1371,7 @@ long utxo_lsm_compact_range(void *lst, u64 lo, u64 k)
                              PROT_READ | PROT_WRITE,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (slots == MAP_FAILED) return -1;
+    for (u64 i = 0; i < batch; i++) slots[i].fd = -1;   /* see mac_lsm_recount */
     u64 upper_bound = 0;
     for (u64 i = 0; i < batch; i++) {
         lsm_slot_t *sl = &slots[i];

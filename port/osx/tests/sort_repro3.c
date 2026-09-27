@@ -1,7 +1,7 @@
 /* sort_repro3.c -- full-scale flush simulation: 71M descriptors, push gather
  * in REAL base-slot order (utxo_hash), tomb gather last in del order, then
  * utxo_lsm_sort_desc -- print the resulting order of the real tie group. */
-#include "../utxo_lsm_twin.c"
+#include "../test_support/utxo_lsm_twin.c"
 #include <stdlib.h>
 
 static u64 rng_state = 0x9e3779b97f4a7c15ull;

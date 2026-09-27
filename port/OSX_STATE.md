@@ -4,6 +4,41 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-26 (night) — the C twins are assembly: every x86 module has an AArch64 assembly counterpart
+
+**Every `port/osx/*_twin.c` that the daemon linked is now AArch64 assembly**: 37 modules in 5 batches. Each twin moved to `port/osx/test_support/` as the differential oracle. The daemon build globs `port/osx/*.{c,S}`, so a twin there can never be linked again by accident. `sc_mul`/`sc_mul_512`, which still tail-called C, are assembly too.
+
+- **The modules:**
+  - EC: fe, point, point_ct, ecdsa, pubkey, schnorr, taproot;
+  - hashing: muhash, sha1 (the ARMv8 SHA-1 instructions), ripemd160;
+  - script: sighash, script, multisig, bech32;
+  - chain and consensus: chainwork, cons, headers;
+  - storage: utxo, utxo_stats, utxo_store, store, store_fast, idx, utxo_lsm;
+  - network and CLI: net, p2p, addrmgr, cli.
+- **The method, per module:**
+  - a differential fuzz against the renamed twin; where the twin itself was suspect, also against an independent answer (Python bigints, hashlib, real mainnet blocks, real file bytes);
+  - the module's own tests;
+  - the AAPCS64 probe (a 9/11-argument variant for the stack-argument functions);
+  - `run_tests.sh` in full after each batch: 406 PASS, 13 SKIP, 14 N/A, 0 FAIL every time.
+- **Real-data check (utxo_lsm):** `bmc_utxo_setinfo --muhash`, built against the assembly and against the twin, over a snapshot of the signet node's UTXO set: 77,497,355 coins at 323,861, identical counts, amount and MuHash.
+- **Darwin arm64 ABI points that mattered:**
+  - variadic arguments (`open`'s mode, `fcntl`'s arg, `snprintf`'s values) go on the stack;
+  - stack arguments are packed by natural size;
+  - thread-locals are Mach-O TLVs.
+  - Large stack buffers are taken in touched 4 KiB steps, or avoided: cons hashes the stripped tx in pieces rather than copying it into 1 MiB.
+- **Bugs the differential tests found in the twins** (production code until today; each twin is corrected with its assembly):
+  - `store_fast`: an evicted fd-cache slot kept its closed fd when the re-open failed. Once the number was reused, a read of the old file returned another file's bytes (x86 empties the slot). The map-cache magic sat inside fd-cache slot 7 (x86 too: note item 15), leaking a blk mapping each time.
+  - `utxo_lsm`: a failed recount or compaction closed fd 0, and whatever file had it next, because unreached slots were still zero-filled.
+  - `chainwork`: `u256_div` lost the borrow when a divisor limb was all-ones.
+  - `schnorr`: the e·P negation tested 3 of the 4 Y limbs.
+  - `store`: blk names past 99999 were cut to 12 characters.
+- **What remains C on the Mac, and why:**
+  - `utxo_lsm_mm.c`: the vendored mmap fast path, C on x86 as well;
+  - `base32.c`: C on x86 as well;
+  - `g_comb_table_data.c`: a data table;
+  - `tls_*.c`: thread-local definitions;
+  - `darwin_stubs.c`, `bmcshim.c`: Darwin glue.
+
 ## 2026-09-26 — the native test sweep: every gated test runs on the Mac, bar 14 that are x86-only by nature
 
 The phase-4 sweep (every `./tests/*` command of `make test`, built natively against `port/osx/daemon_out`) is worked through. **It is repeatable: `port/osx/run_tests.sh` builds the daemon objects, tools and test helpers and runs the whole suite (or named tests) the same way; exit 0 = every test PASS, SKIP or N/A.** Real bugs it found today, all fixed:
