@@ -3804,6 +3804,44 @@ static long g_last_sync_ok = 0;   /* node_sync_multi's verdict of the last pass,
  * whichever process (the worker, a pass helper) read it or not, and
  * getsockopt consumes nothing, so a leg whose pass is running in a helper is
  * measured too. */
+#if defined(__APPLE__) && defined(TCP_CONNECTION_INFO)
+/* Darwin (2026-09-27): no tcpi_last_data_recv. tcp_connection_info's
+ * tcpi_rxbytes counts every byte that arrived on the socket, whoever read
+ * it, so a leg's last-heard time is the last time that count was SEEN to
+ * change -- remembered per leg here, at the granularity of the calls (every
+ * pass's bookkeeping, every probe gate). A socket observed for the first
+ * time in its slot (a new fd, a new local port, or a count that went DOWN --
+ * the fd number can be reused by the next dial) has been heard only if its
+ * count is already non-zero, and then at some time <= now, taken as now;
+ * with nothing received yet it has never been heard, however long ago it
+ * was opened. Same contract as the Linux branch below. */
+#define LEGS_NEVER_HEARD (-(1LL << 62))
+static unsigned long long legs_rx_seen[MUX_MAX_OUT]; static long long legs_rx_when[MUX_MAX_OUT];
+static int legs_rx_fd[MUX_MAX_OUT]; static unsigned legs_rx_lport[MUX_MAX_OUT];
+static int legs_heard_within(int i, long long window_ms){
+    int others = 0;
+    long long now; { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); now = ts.tv_sec*1000LL + ts.tv_nsec/1000000; }
+    for(int k = 0; k < mux_n_out; k++){
+        int fd = mux_out_fd[k];
+        if(fd < 0) continue;
+        struct tcp_connection_info ci; socklen_t l = sizeof ci;
+        if(getsockopt(fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &ci, &l) != 0) continue;   /* not a live socket */
+        unsigned long long rx = (unsigned long long)ci.tcpi_rxbytes;
+        unsigned lport = 0;
+        { struct sockaddr_storage ss; socklen_t sl = sizeof ss;
+          if(getsockname(fd, (struct sockaddr*)&ss, &sl) == 0)
+              lport = ss.ss_family == AF_INET6 ? ntohs(((struct sockaddr_in6*)&ss)->sin6_port)
+                                                : ntohs(((struct sockaddr_in*)&ss)->sin_port); }
+        if(legs_rx_fd[k] != fd || legs_rx_lport[k] != lport || rx < legs_rx_seen[k]){   /* a socket new to the slot */
+            legs_rx_fd[k] = fd; legs_rx_lport[k] = lport; legs_rx_seen[k] = rx;
+            legs_rx_when[k] = rx ? now : LEGS_NEVER_HEARD;
+        } else if(rx != legs_rx_seen[k]){ legs_rx_seen[k] = rx; legs_rx_when[k] = now; }
+        if(k != i) others++;
+        if(now - legs_rx_when[k] <= window_ms) return 1;
+    }
+    return others ? 0 : -1;
+}
+#else
 static int legs_heard_within(int i, long long window_ms){
     int others = 0;
     for(int k = 0; k < mux_n_out; k++){
@@ -3815,6 +3853,7 @@ static int legs_heard_within(int i, long long window_ms){
     }
     return others ? 0 : -1;
 }
+#endif
 /* Has the host heard nothing on any leg for PROBE_SILENCE_MS? Then a reorg
  * probe must not start (see its call site): 1 silent, 0 not (or no legs).
  *

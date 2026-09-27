@@ -17,6 +17,8 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
 **For the x86 side:** the same code, the same bug (note item 16).
 
+**Main merged in the same evening (#316–#323, via the x86 session's `9e62e210`/`2087395d`):** `legs_heard_within` (#316) needed a Darwin branch (`tcp_connection_info`'s `tcpi_rxbytes`, seen-to-change per leg; note item 17); `test_fe_pow_sqrt`, `test_fe_inv_var` (x86 NASM exports the Mac assembly does not have yet: `fe_pow_sqrt`, `fe_inv_var` — the safegcd inversion and the addition-chain square root would carry to AArch64 when wanted) and `test_store_map_magic` (`/proc/self/maps`) are N/A on the Mac. x86's map magic went to a dword at st+52 (#323); the Mac keeps st+384.
+
 ## 2026-09-27 — the large fixtures fetch from the local Core; test_taproot_block_diff runs on the Mac
 
 - **WAL-3 on Darwin: `secure_lock` sets the core-file limit to 0, soft and hard.** Darwin has no `MADV_DONTDUMP`, so a wallet page could not be kept out of a core file per mapping; until today a Mac relied on the default soft limit of 0, which `ulimit -c` undoes. Now the process that holds a secret can never write a core, and cannot raise the limit back. `test_secure_lock` raises the soft limit first and asserts the zero, the refused raise, and the lock itself (wired, per the kernel's vm map). Trade: no core dumps of the daemon once a wallet is loaded, which is what "excluded from core dumps" in the startup line has meant on x86 all along.

@@ -59,6 +59,11 @@ X86_ONLY = {
     "test_txv_pools_diff", "test_tapagg_diff", "test_txv_dispatch_diff", "test_wv0_drv_diff",
     "test_svs_drv_diff", "test_checksig_diff", "test_bip143_diff", "test_taproot_verify_diff",
     "test_bip341_diff", "test_undo_asm_diff",
+    # 2026-09-27 (main #319, #320, #323): fe_pow_sqrt / fe_inv_var are x86 NASM
+    # additions the Mac assembly does not export yet; test_store_map_magic counts
+    # mappings through /proc/self/maps (a Darwin branch would walk
+    # mach_vm_region_recurse, as test_secure_lock does)
+    "test_fe_pow_sqrt", "test_fe_inv_var", "test_store_map_magic",
 }
 FINAL_OK = {"PASS", "SKIP", "N/A"}
 
