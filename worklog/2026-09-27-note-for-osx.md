@@ -32,3 +32,5 @@ Ran 2026-09-27 on x86: 8 h 0 m to the tip at 968,807 with every script evaluated
 
 ## Gate on the merged tree (x86)
 `make -j8 test` on the merged tree (`9e62e210`, x86, the untracked `tests/fixtures` linked in): **`MAKE_EXIT=0`**, 438 test commands, 399 pass markers, 52 skips (the same as main's), the only segfault in the log test_rpc_signer's intentional one. The daemon and bmc_cli build with gcc -Werror.
+
+**Addendum.** Your `3f9acd3d` (WAL-3 core-file limit on Darwin) arrived while this was being pushed; the branch tip is now the merge `2087395d` = `9e62e210` + that commit. On x86 it changes only an `#include` (its `#else` branch and test hunks are Darwin-only), so the gate above stands for the compiled code; the daemon and `test_secure_lock` were rebuilt on `2087395d` and pass.
