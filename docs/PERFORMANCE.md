@@ -162,6 +162,16 @@ uses safegcd mod p (0.7 µs) instead of the constant-time chain (2.1 µs).
 Before: ECDSA 21.9 µs, BIP340 25.9 µs. A full-verification sync
 (`assumevalid=0`) on the benchmark box took 8 h 0 m to the tip at nice 10.
 
+Module by module against Core's own `src/bench` suite — 31 Core benchmarks
+paired (script verification, compact-block reconstruction, GCS filters, the
+block archive, MuHash, ChaCha20/Poly1305 and the BIP324 AEAD, ElligatorSwift,
+Bech32/Base58, plus the hash, merkle and CheckBlock rows) and every one of
+the 59 files classified — is in `docs/devlog/BENCHMARKS.md`, addendum
+2026-09-27. The largest gaps there: `MuHashFinalize` (66×, a Fermat inverse
+against Core's safegcd; per RPC call, not per block), ElligatorSwift (6.6×)
+and its ECDH (3.2×), ChaCha20 (1.6×), Base58Check (3.1×); ahead on the block
+archive (2.8–3×), MuHash insert/multiply (2.8× / 7.7×) and Bech32.
+
 ## Why each difference exists
 
 **txindex, 2.6× smaller than Core's.** It is a set of sorted runs with a sparse

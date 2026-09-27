@@ -2678,10 +2678,27 @@ tests/bench_abi_audit: tests/bench_abi_audit.c tests/bench_abi_guard.S $(CONSOBJ
 	    $(sort bitcoin_utxo.o $(CONSOBJS) $(INTERPOBJS) bitcoin_multisig.o bitcoin_sighash.o \
 	    secp256k1_ecdsa.o bitcoin_script.o $(TAPRIMSOBJS) sha512.o bitcoin_addr.o bech32.o)
 
+# bench_core_modules -- one section per Core benchmark the suite did not pair
+# before 2026-09-27: VerifyScript (P2WPKH, P2TR key/script path),
+# BlockEncoding, GCS filter construct/hash, block read/write, MuHash, ChaCha20,
+# Poly1305, the BIP324 AEAD, ElligatorSwift/ECDH, Bech32, Base58Check. Each
+# section mirrors the Core benchmark's shape; the file header says what differs.
+CORE_MODULES_SRCS := bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/cmpct_recv.c daemon/block_witness.c \
+    crypto_bip324.c crypto_bip324_fs.c crypto_chacha20.c crypto_poly1305.c crypto_hkdf.c \
+    crypto_ellswift_ecdh.c crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c wallet_coinsel.c
+CORE_MODULES_OBJS := bip340_sign.o secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
+    bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o \
+    secp256k1_scalar.o secp256k1_scalar_c.o sha256.o bitcoin_hash.o ripemd160.o bitcoin_addr.o bitcoin_interp.o \
+    bitcoin_scriptcodec.o sha1.o bitcoin_cmpct.o bitcoin_tx.o bitcoin_mempool.o block_filter.o bitcoin_store.o \
+    bitcoin_store_fast.o bitcoin_muhash.o bitcoin_utxo_stats.o bech32.o
+tests/bench_core_modules: tests/bench_core_modules.c tests/taproot_scriptpath_vec.h daemon/muhash_p2.inc.h \
+    $(CORE_MODULES_SRCS) $(CORE_MODULES_OBJS)
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I. -I daemon -I tests -o $@ tests/bench_core_modules.c $(CORE_MODULES_SRCS) $(CORE_MODULES_OBJS) -lpthread
+
 .PHONY: bench-vs-core
 bench-vs-core: tests/bench_ecdsa tests/bench_schnorr tests/bench_hash_core \
     tests/bench_merkle tests/bench_checkblock tests/bench_abi_audit tests/bench_fe \
-    tests/bench_segwit_sighash tests/bench_taproot_sighash tests/bench_lsm_get
+    tests/bench_segwit_sighash tests/bench_taproot_sighash tests/bench_lsm_get tests/bench_core_modules
 	@echo "built. run ../scripts/bench_vs_core.sh from the repo root"
 
 # test_segwit_txout_bound -- incident #21: sw_ser_txout() serialized a CTxOut

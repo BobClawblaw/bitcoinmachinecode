@@ -1136,3 +1136,183 @@ Added by the 2026-09-06 module work (`PERF_SCOPE.md` §15):
 | `asm/tests/bench_muhash.c` | ns per `num3072_mul` (chained, the shape every caller has) and per `muhash_insert` of a 100-byte coin, per dispatch body | `bench muhash` (`MuHash3072::Insert`) |
 | `asm/tests/bench_lsm_flush_sort.c` | the memtable flush's descriptor sort alone, 2^22 slots, three reps restoring the unsorted input | none — Core has no flush sort; its cache flushes into LevelDB |
 | `asm/tests/bench_utxo_probe.c` | one `utxo_get` at 2^16 / 2^22 / 2^26 slots, 50% and 75% load, dependent and independent, with and without prefetch; every answer checked against a mirror | `CCoinsViewCache::GetCoin` (unordered_map lookup) |
+
+## Addendum 2026-09-27 — every Core benchmark classified, the suite rerun, and a new tier for the modules it did not cover
+
+The question asked on 2026-09-27 was "where are we against Core, module by
+module". This addendum answers it three ways: the existing tiers rerun on that
+day's code (the crypto rows above are a month old and describe a kernel that
+no longer exists), a new tier 2b that pairs the Core benchmarks the suite had
+never paired, and a classification of all 59 files in Core's `src/bench`, so
+"not measured" is a stated reason rather than an omission.
+
+### Conditions
+
+| | |
+|---|---|
+| date | 2026-09-27T23:16Z (full run, tiers 1–2) and the tier-2 rerun that followed |
+| box | AMD Ryzen 9 9950X3D, 16 cores / 32 threads, governor `powersave`, Linux 7.0.0 |
+| load average at start | 3.95 / 4.43 / 4.75 — the production node (`deploy-20260927f`) and the Core oracle were running, as always on this box |
+| our git HEAD | `dcef453d` (main; the harness and script of this addendum on top) |
+| Bitcoin Core | v31.99.0-67efced1fc83, `bench_bitcoin` built `RelWithDebInfo` (Core's default) out of tree |
+| Core worst cpu/wall | 1.000 over every group of 3 processes: no preemption inside Core's timed loops |
+
+Core is `bench_bitcoin` built from the oracle's source (v31.99.0-67efced1fc83)
+out of tree in `/storage/core-bench-build`, RelWithDebInfo; libsecp256k1 is Core's
+vendored copy with Core's shipped config. Both sides pinned to one core
+(`taskset -c 25`), Core at nanobench `-min-time=1000` over 3 processes (min),
+ours as thread CPU time, min of 15 rounds (`tests/bench_core_modules` prints
+the round count). The spread is in the raw output directory.
+
+### Tier 1 and 2, rerun
+
+| operation | Core / libsecp256k1 | this project | ratio |
+|---|---:|---:|---|
+| ECDSA verify (per signature) | 20.80 µs | 20.02 µs | **0.96× — 4% faster** (was 1.12× slower on 08-22) |
+| BIP340 verify (per signature) | 21.10 µs | 22.09 µs | 1.05× slower (was 3.35×) |
+| SHA-256, 1,000,000 B | 0.359 ns/B | 0.410 ns/B | 1.14× slower |
+| SHA-256, 32 B | 36.5 ns | 34.3 ns | **0.94× — faster** |
+| SHA-256d, 64 B × 1024 | 45.5 µs | 52.4 µs | 1.15× slower |
+| SHA-1, 1,000,000 B | 0.637 ns/B | 1.581 ns/B | 2.48× slower |
+| SHA-512, 1,000,000 B | 0.955 ns/B | 1.627 ns/B | 1.70× slower |
+| RIPEMD-160, 1,000,000 B | 1.118 ns/B | 1.170 ns/B | 1.05× — parity |
+| Merkle root, 9,001 leaves | 45.0 ns/leaf | 53.0 ns/leaf | 1.18× slower |
+| CheckBlock, block 413,567 (1,557 tx) | 370 µs | 647 µs (`cons_verify`) | 1.75× slower, Core doing more (see `tests/bench_checkblock.c`) |
+| DeserializeBlock, block 413,567 | 908 µs | 19.9 µs (tx walk) | not like-for-like: Core builds objects, we index bytes |
+| ReadBlock (deserialise + check) | 942 µs | — | raw read is paired in tier 2b |
+| ConnectBlock (Core's synthetic 1,000-input block) | 111–114 ms | — | no unit counterpart; tier 4 measures the connect path end to end |
+| CCoinsCaching | 155 ns | — | different objects (tier 2 above) |
+
+What moved since 2026-08-22: ECDSA verify from 23.7 µs to 19.9 (safegcd
+`s^{-1}`, #319) — now ahead of libsecp256k1's 20.9 on the same core; BIP340
+verify from ~31 to 21.8 (#320) against libsecp's 20.9. The hash rows did not
+change: SHA-256 over a megabyte is still 1.25× behind Core's SHA-NI path,
+SHA-1 2.5× and SHA-512 1.7× behind, RIPEMD-160 and the 32-byte SHA-256 at
+parity, the merkle root 1.2× behind. `cons_verify` on block 413,567 is 630 µs
+against Core's CheckBlock at 366 µs, with Core doing more (the header of
+`tests/bench_checkblock.c` lists what).
+
+### Tier 2b — the modules Core benchmarks that were not paired before
+
+`tests/bench_core_modules.c` (built by `make bench-vs-core`, run by the
+script's tier 2b, joined by `scripts/bench_modules_table.py`). One section per
+Core benchmark, the same shape per iteration; the note column names every
+difference.
+
+| Core benchmark | this project | Core | ours | unit | ours/Core | note |
+|---|---|---:|---:|---|---:|---|
+| `VerifyScriptP2WPKH` | `p2wpkh_verify` | 20,055.90 | 22,523.78 | ns/op | **1.12x slower** | Core precomputes the sighash midstates once; ours hashes per op |
+| `VerifyScriptP2TR_KeyPath` | `taproot_keypath_verify` | 20,277.25 | 22,255.96 | ns/op | **1.10x slower** | Core precomputes the sighash midstates once; ours hashes per op |
+| `VerifyScriptP2TR_ScriptPath` | `taproot_verify_input(script)` | 35,811.52 | 49,288.39 | ns/op | **1.38x slower** | ours spends a 2-leaf tree (one more merkle step); Core a 1-leaf tree |
+| `BlockEncodingNoExtra` | `cmpct_recv_cmpctblock(50k_pool,_3k_ids)` | 1,242,931.78 | 1,251,625.50 | ns/op | parity | 50,000-tx pool, 3,000 short ids, none present, both sides |
+| `GCSFilterConstruct` | `bf_basic_build_(100k_elements)` | 5,137,558.00 | 21,069,626.67 | ns/op | **4.10x slower** | 100,000 unique 32-byte elements on both sides; ours also parses the 4 MB block carrying them |
+| `GCSBlockFilterGetHash` | `bf_header_(100k-element_filter)` | 61,595.43 | 106,500.60 | ns/op | **1.73x slower** | the encoded 100,000-element filter hashed on both sides |
+| `ReadRawBlockBench` | `store_read_at_(block_413567)` | 36,248.07 | 13,119.30 | ns/op | **2.76x faster** | raw bytes on both sides |
+| `WriteBlockBench` | `store_append_(block_413567)` | 422,174.08 | 143,092.20 | ns/op | **2.95x faster** | the same block appended each op on both sides |
+| `MuHash` | `muhash_insert` | 2,646.58 | 944.52 | ns/op | **2.80x faster** |  |
+| `MuHashMul` | `num3072_mul` | 2,301.74 | 297.80 | ns/op | **7.73x faster** |  |
+| `MuHashPrecompute` | `muhash_insert_-_num3072_mul` | 340.86 | 646.72 | ns/op | **1.90x slower** |  |
+| `MuHashFinalize` | `num3072_inv_+_mul_+_muhash_finalize` | 27,973.80 | 1,860,980.00 | ns/op | **66.53x slower** | Core inverts by safegcd; ours by Fermat exponentiation (6,142 modmuls) |
+| `CHACHA20_64BYTES` | `chacha20_crypt_64_B` | 0.77 | 1.18 | ns/byte | **1.52x slower** |  |
+| `CHACHA20_256BYTES` | `chacha20_crypt_256_B` | 0.72 | 1.18 | ns/byte | **1.64x slower** |  |
+| `CHACHA20_1MB` | `chacha20_crypt_1048576_B` | 0.71 | 1.15 | ns/byte | **1.63x slower** |  |
+| `POLY1305_64BYTES` | `poly1305_64_B` | 0.44 | 0.53 | ns/byte | **1.21x slower** |  |
+| `POLY1305_256BYTES` | `poly1305_256_B` | 0.31 | 0.33 | ns/byte | **1.08x slower** |  |
+| `POLY1305_1MB` | `poly1305_1048576_B` | 0.26 | 0.26 | ns/byte | parity |  |
+| `FSCHACHA20POLY1305_64BYTES` | `bip324_encrypt_64_B` | 2.24 | 4.39 | ns/byte | **1.95x slower** |  |
+| `FSCHACHA20POLY1305_256BYTES` | `bip324_encrypt_256_B` | 1.30 | 2.19 | ns/byte | **1.68x slower** |  |
+| `FSCHACHA20POLY1305_1MB` | `bip324_encrypt_1048576_B` | 0.97 | 1.43 | ns/byte | **1.47x slower** |  |
+| `EllSwiftCreate` | `ellswift_create` | 18,027.24 | 119,786.20 | ns/op | **6.64x slower** |  |
+| `BIP324_ECDH` | `ellswift_ecdh` | 20,965.12 | 66,598.88 | ns/op | **3.18x slower** |  |
+| `Bech32Encode` | `bech32_encode_(per_input_byte)` | 6.33 | 4.27 | ns/byte | **1.48x faster** |  |
+| `Bech32Decode` | `bech32_decode_+_verify_(per_char)` | 3.33 | 2.80 | ns/byte | **1.19x faster** | decode + checksum verification on both sides |
+| `Base58CheckEncode` | `base58check_encode_(per_byte)` | 47.16 | 145.64 | ns/byte | **3.09x slower** | no plain Base58Encode / Base58Decode on our side |
+
+The two filter rows use Core's exact input, 100,000 unique 32-byte elements; ours arrive as the outputs of one 4 MB transaction, which `bf_basic_build` parses first. Core's 61.6 µs for hashing a ~263 KB encoded filter is 0.23 ns/byte, faster than its own 1 MB SHA-256 row (0.36); not understood, and the row stands as measured.
+
+Reading the table:
+
+- **Parity or ahead:** block reconstruction from a compact block
+  (`BlockEncodingNoExtra`, 1.25 ms both sides over a 50,000-tx pool); the
+  block archive's raw read (2.7× faster) and append (3.1× faster); MuHash
+  insert (2.8× faster) and the 3072-bit multiply (8× faster: the IFMA/ADX
+  path in `bitcoin_muhash.asm`); Poly1305 at parity from 256 bytes up;
+  Bech32 encode and decode ahead.
+- **Behind, by how much, and why:**
+  - **`MuHashFinalize`, 64×.** Core inverts its Num3072 with a safegcd
+    variant (28 µs); ours is a Fermat exponentiation, 6,142 modular
+    multiplies (1.8 ms). It is paid once per `gettxoutsetinfo` and per
+    parity check, never per block — but it is the largest gap in the table
+    and the same algorithm that closed the scalar-inverse gap this morning
+    (`asm/safegcd_var.inc`) applies, at 3072 bits.
+  - **ElligatorSwift, 6.5× on `EllSwiftCreate` and 3.1× on the ECDH.** Both
+    are C (`crypto_ellswift*.c`) over the asm field arithmetic; Core's are
+    libsecp256k1's. Paid once per BIP324 connection.
+  - **ChaCha20, 1.5–1.65×; the AEAD packet, 1.5–2×.** `crypto_chacha20.c` is
+    plain C; Core's is a two-way SSE/AVX implementation. Per byte on the v2
+    transport.
+  - **Base58Check, 3.1×.** `base58check_encode` is the straightforward
+    base conversion; Core's is too, but with a wider limb. Address display
+    only.
+  - **Script verification, 1.08–1.13× on P2WPKH and P2TR key path.** The
+    signature verification itself is level (tier 1); the difference is the
+    sighash, which Core's `PrecomputedTransactionData` computes once for the
+    transaction while our per-input entry hashes per call. The script-path
+    row (1.37×) also spends a 2-leaf tree against Core's 1-leaf.
+  - **GCS filter construction, 4.1×** on Core's exact input (100,000
+    elements): ours parses the 4 MB block that carries them, then hashes,
+    sorts and Golomb-codes; Core starts from the element set. The real-block
+    figure is 253 ns per element (block 482,566: 1.65 ms for 6,500 elements).
+
+### Every Core benchmark, classified (src/bench, v31.99 at 67efced, 59 files)
+
+| Core bench file | paired? | with | where |
+|---|---|---|---|
+| `addrman` (AddrManAdd/Select/GetAddr/Good…) | no | our address book (`bitcoin_addrmgr`/`addrbook`) is a different structure with no tried/new buckets; a pair would measure the design, not the code | — |
+| `asmap` | no | we have asmap decoding for tests only; no hot path | — |
+| `base58` (Encode/CheckEncode/Decode) | partly | `base58check_encode` (32 bytes) — no plain encode, no decode outside the wallet | tier 2b |
+| `bech32` (Encode/Decode) | yes | `bech32_encode` / `bech32_decode` + `bech32_verify_checksum` | tier 2b |
+| `bench` / `nanobench` / `examples` | no | Core's harness itself | — |
+| `bip324_ecdh` | yes | `ellswift_ecdh` | tier 2b |
+| `block_assemble` (AssembleBlock) | no | our `getblocktemplate` assembles from the cluster mempool; measured at the RPC level in PERFORMANCE.md, not as a unit | — |
+| `blockencodings` (NoExtra/StdExtra/LargeExtra) | NoExtra | `cmpct_recv_cmpctblock`; we keep no extra-transaction pool, so the two Extra variants have no counterpart | tier 2b |
+| `ccoins_caching` | no | Core's AreInputsStandard over a CCoinsViewCache; ours would be a memtable/LSM probe plus a standardness check — different objects (BENCHMARKS.md tier 2 says why) | — |
+| `chacha20` (64 B / 256 B / 1 MB, plus FSChaCha20Poly1305) | yes | `chacha20_crypt`, `bip324_encrypt` | tier 2b |
+| `checkblock` (CheckBlockTest, DeserializeBlockTest) | yes | `cons_verify`, tx walk | tier 2 |
+| `checkblockindex` | no | Core's internal consistency check of its block index; no counterpart | — |
+| `checkqueue` | no | Core's parallel script-check queue; ours is `tx_verify.c`'s persistent worker pool, measured whole-block by `bench_taproot_block` | — |
+| `cluster_linearize` | no (candidate) | `mempool_cluster.a` has the linearizer; a shape-matched harness is a day's work | — |
+| `coin_selection` (BnB, knapsack) | no (candidate) | `wallet_bnb.c` / `wallet_coinsel.c` | — |
+| `connectblock` (AllEcdsa/AllSchnorr/Mixed) | no | Core connects a synthetic 1,000-input block through its chainstate; ours would go through `utxo_live` and the LSM — the closest thing is tier 4, the IBD itself | — |
+| `crypto_hash` (SHA256 shapes, SHA1, SHA512, RIPEMD160, MuHash*) | yes | `bench_hash_core`, `bench_core_modules` (MuHash) | tiers 1, 2b |
+| `descriptors` (ExpandDescriptor) | no (candidate) | `descriptor.o` | — |
+| `disconnected_transactions` | no | a reorg's mempool re-add; no unit counterpart | — |
+| `duplicate_inputs` | no | a CheckBlock over a crafted block; `cons_verify` is measured on the real block instead | — |
+| `ellswift` (EllSwiftCreate) | yes | `ellswift_create` | tier 2b |
+| `gcs_filter` (Construct, Decode, DecodeSkipCheck, Match, GetHash) | Construct, GetHash | `bf_basic_build`, `bf_header`; we build filters from blocks (no element-set constructor), do not decode them, and match nothing (no wallet rescan by filter) | tier 2b |
+| `hashpadding` | no | Core's SHA256 padding micro-case | — |
+| `index_blockfilter` | no | `bmc_build_block_filters` builds offline over the archive; per-block cost is `bf_basic_build` | — |
+| `load_external` | no | Core's `loadblock`; no counterpart | — |
+| `lockedpool`, `logging`, `obfuscation`, `pool`, `prevector`, `random`, `streams_findbyte`, `strencodings`, `parse_hex`, `util_time` | no | C++ runtime and utility micro-benchmarks with no equivalent module | — |
+| `mempool_ephemeral_spends`, `mempool_eviction`, `mempool_stress` | no (candidate) | `bench_mempool_scale` measures our policy layer's scaling; a TrimToSize-shaped pair is possible | — |
+| `merkle_root` | yes | `merkle_root` 9,001 leaves | tier 1 |
+| `peer_eviction` | no (candidate) | `inbound_evict.c` | — |
+| `poly1305` | yes | `poly1305_*` | tier 2b |
+| `readwriteblock` (Write, Read, ReadRaw) | ReadRaw, Write | `store_read_at`, `store_append`; Core's ReadBlockBench deserialises and checks the block too | tier 2b |
+| `rollingbloom` | no | no rolling bloom filter here (the recent-rejects filter is a plain set) | — |
+| `rpc_blockchain` (BlockToJsonVerbose) | no | measured at the RPC level (`getblock` verbosity 2) in PERFORMANCE.md | — |
+| `rpc_mempool` | no | measured at the RPC level (`getrawmempool`) in PERFORMANCE.md | — |
+| `sign_transaction` (ECDSA / Schnorr) | no (candidate) | the wallet signer and `bip340_sign` | — |
+| `txgraph` | no | Core v31's TxGraph; our cluster mempool has no separate graph object | — |
+| `txorphanage` | no | our orphan handling is in `tx_relay.c`, shaped differently (parked/resolved) | — |
+| `verify_script` (P2WPKH, P2TR key path, P2TR script path, NestedIf) | 3 of 4 | `p2wpkh_verify`, `taproot_keypath_verify`, `taproot_verify_input`; VerifyNestedIfScript is an interpreter-only script with no equivalent harness | tier 2b |
+| `wallet_balance`, `wallet_create`, `wallet_create_tx`, `wallet_encrypt`, `wallet_ismine`, `wallet_loading`, `wallet_migration` | no | Core's descriptor wallet; ours is a journal-backed seed wallet with a different shape | — |
+
+Paired: 31 Core benchmark names across 14 files. Candidates named above are the ones a shape-matched harness could pair with a day's work each.
+
+### Reproducing
+
+`scripts/bench_vs_core.sh` (tier 2b runs with tier 2; `--tiers 2` for it
+alone). The raw output directory named at the end holds Core's CSVs, our
+harness output and `modules_table.md`. Core's bench builds itself out of tree
+on first use.
