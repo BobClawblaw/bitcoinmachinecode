@@ -6,6 +6,8 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
 ## 2026-09-27 — the large fixtures fetch from the local Core; test_taproot_block_diff runs on the Mac
 
+- **WAL-3 on Darwin: `secure_lock` sets the core-file limit to 0, soft and hard.** Darwin has no `MADV_DONTDUMP`, so a wallet page could not be kept out of a core file per mapping; until today a Mac relied on the default soft limit of 0, which `ulimit -c` undoes. Now the process that holds a secret can never write a core, and cannot raise the limit back. `test_secure_lock` raises the soft limit first and asserts the zero, the refused raise, and the lock itself (wired, per the kernel's vm map). Trade: no core dumps of the daemon once a wallet is loaded, which is what "excluded from core dumps" in the startup line has meant on x86 all along.
+
 - **`port/osx/fetch_fixtures.sh`** fetches the gitignored fixtures from this Mac's Bitcoin Core (txindex) instead of the x86 box's scratch oracle: `validation/fetch_taproot_blocks.py` now honours `CORE_CLI`, and `port/osx/core_cli.py` is the bitcoin-cli stand-in it gets (JSON-RPC on 8332, credentials from bitcoin.conf, never printed).
 - **`test_taproot_block_diff`**: all 36 taproot-dense blocks (825000–825015, 840000–840007, 870000–870007, 850000/1, 860000/1), both directions, 0 failures on the assembly build. It was SKIP on the Mac until today.
 - **block413567.raw**: `run_tests.sh` exports `CORE_BENCH_BLOCK` when it is present. `bench_abi_audit` then audits 16 primitives (12 without it) and `test_strip_witness_diff` runs; both PASS. The remaining consumers of that block are the x86-only twin tests.
