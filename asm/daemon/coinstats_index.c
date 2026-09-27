@@ -831,12 +831,16 @@ long csi_rpc_run(int want_muhash, void* outv, char* msg, unsigned long mcap){
 #undef MSG
     o->height = h; o->txouts = tx; o->total_amount = amt; o->bogosize = bg;
     if (want_muhash){
-        /* PRESENTATION byte order: the raw finalize output is the exact
-         * byte-reverse of what Core prints (the same trap utxo_setinfo.c
-         * documents and reverses) -- the first live parity check against
-         * the oracle read as a "total mismatch" that was really identical.
-         * Reverse here so the RPC's hex compares directly. */
-        for (int i = 0; i < 32; i++) o->muhash[i] = digest[31 - i];
+        /* RAW finalize bytes, the same order the walk reader
+         * (utxo_setinfo_rpc.c) and the per-height rows (csi_hist_query) hand
+         * over: rpc_chain.c prints all three with hex_rev, which is Core's
+         * uint256 order. This adapter used to reverse here (2026-08-26, when
+         * the RPC layer printed forward); when the walk path's forward
+         * printing was fixed at the RPC layer instead (2026-09-25, 695a719c)
+         * the same line served this path too, and the no-height muhash came
+         * out double-reversed -- a set identical to Core's read as different
+         * at 968,807 and 968,821 (2026-09-27). One reversal, in one place. */
+        memcpy(o->muhash, digest, 32);
         o->muhash_valid = 1;
     }
     else o->muhash_valid = 0;
