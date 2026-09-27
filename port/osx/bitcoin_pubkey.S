@@ -163,11 +163,11 @@ Lpk33:
     bl    _bmc_lt_p
     cbz   w0, Lpk_no
     RHS
-    add   x0, sp, #64                     /* y = rhs^((p+1)/4) */
+    add   x0, sp, #64                     /* y = rhs^((p+1)/4): fe_pow_sqrt's addition
+                                             chain (253 sqr + 13 mul); was fe_pow over
+                                             the exponent's bits, ~500 field ops (2026-09-27) */
     add   x1, sp, #32
-    adrp  x2, Lexpqr@PAGE
-    add   x2, x2, Lexpqr@PAGEOFF
-    bl    _fe_pow
+    bl    _fe_pow_sqrt
     add   x0, sp, #96                     /* t = y^2 */
     add   x1, sp, #64
     bl    _fe_sqr
@@ -245,7 +245,5 @@ Lpk_ret:
     .p2align 4
 Lp:     /* p */
     .quad 0xFFFFFFFEFFFFFC2F, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF
-Lexpqr: /* (p+1)/4 */
-    .quad 0xFFFFFFFFBFFFFF0C, 0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF, 0x3FFFFFFFFFFFFFFF
 L7:
     .quad 7, 0, 0, 0

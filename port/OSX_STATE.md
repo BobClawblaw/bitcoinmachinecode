@@ -4,6 +4,17 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-27 (night) — safegcd inversion and the square-root chain in AArch64: `fe_inv_var`, `fe_pow_sqrt`, and `sc_inv_var` replaced
+
+Main #319/#320 gave x86 an addition-chain square root for `pubkey_parse` and a Bernstein-Yang safegcd inverse mod p for the public inversions; the Mac assembly now exports both, and its `sc_inv_var` is the same safegcd body instantiated for n.
+
+- **`port/osx/safegcd_var.h`** — the safegcd macro (`SAFEGCD_INV_VAR name, M62, MINV62, M4`), an assembly include the two .S files `#include` (the `.h` suffix is what `build_daemon.sh`'s staleness rule watches). Step for step the x86 `safegcd_var.inc`: 62 divsteps on the low words with the transition matrix in x22..x25, then the matrix applied to (d, e) mod m and to (f, g) over the live length, the top limb pair folded when both are 0/−1, d·sign(f) reduced into [0, m). Leaf; x19..x28 saved; a 160-byte frame. Variable-time: public inputs only, as on x86.
+- **`secp256k1_fe.S`**: `fe_inv_var` (p's 5×62 limbs and p⁻¹ mod 2⁶² re-derived in Python) and `fe_pow_sqrt` (`fe_inv`'s chain to x223 with the (p+1)/4 tail: 253 squarings, 13 multiplies; the same frame and macros). **`secp256k1_scalar.S`**: `sc_inv_var` is the n instance. The binary extended GCD it replaces (u=a, v=n, halve mod n) took 1.4 µs and **looped forever on a ≥ n** — `test_fe_inv_var`'s non-canonical section would have hung on it; nothing in the daemon passes such a scalar (ecdsa_verify checks s < n first), so this was latent.
+- **Users switched** (the same sites as x86): `schnorr_verify`'s Z⁻¹ for the even-Y test, `secp256k1_taproot.S`'s two affine conversions of the tweaked public point, `pubkey_parse`'s square root (the `Lexpqr` exponent constant is gone with `fe_pow`'s call; `fe_pow` itself stays exported for the test). `fe_inv` and `sc_inv` remain the constant-time paths for everything a signer computes.
+- **Method.** A C prototype of exactly the x86 steps first, checked against `fe_inv`/`sc_inv` on 4×10⁵ inputs (9 outer iterations on average, 10 at most, as on x86); then the assembly against the prototype, `fe_inv`, `sc_inv` and `fe_pow` on 10⁶ inputs of every shape — canonical, ≥ m, up to 2²⁵⁶−1, short, aliased r == a, 0, p and n (return 0, r untouched): 0 mismatches. Then main's own `test_fe_inv_var` (3,020,828 checks, including the `sc_inv_var` ≥ n section) and `test_fe_pow_sqrt`, both un-gated in `run_tests.py`, plus the ECDSA/schnorr/taproot/musig/ellswift tests and both ABI checks: all PASS.
+- **Timing on this Mac** (M-series, 2×10⁵ calls each): `fe_inv` 3.11 µs → `fe_inv_var` 0.84 µs; `sc_inv_var` 1.43 → 0.88 µs; `fe_pow` 5.79 µs → `fe_pow_sqrt` 3.19 µs per compressed-key parse.
+- **Full suite:** 413 PASS, 10 SKIP, 15 N/A, 0 FAIL (`test_taproot_block_diff`: 36 mainnet blocks, 0 failures, on the safegcd inversion).
+
 ## 2026-09-27 (evening) — a mutated block is dropped and re-fetched, never marked invalid (mainnet 968824)
 
 **The incident.** At 10:00 the mainnet node invalidated the real block 968,824 (its hash is Core's). A peer's compact block prefilled a coinbase WITHOUT its witness; the reconstruction passed the sync drain's `cons_verify` (PoW, txid merkle root — the witness is not in either), was stored, and the apply's witness-commitment phase refused it with `bad-witness-nonce-size`. The apply took that for a consensus rejection: `invalid.dat` got the hash, the archive was truncated, headers rolled back. The chain moved on only because the next peer's compact block, applied 10 s later on a path that never consults the mark, was the block as it really is. The wrong mark stayed in `invalid.dat` for ten hours, until `reconsiderblock` removed it by hand — any header re-sync through that height would have refused the real chain.
@@ -17,7 +28,7 @@ status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
 **For the x86 side:** the same code, the same bug (note item 16).
 
-**Main merged in the same evening (#316–#323, via the x86 session's `9e62e210`/`2087395d`):** `legs_heard_within` (#316) needed a Darwin branch (`tcp_connection_info`'s `tcpi_rxbytes`, seen-to-change per leg; note item 17); `test_fe_pow_sqrt`, `test_fe_inv_var` (x86 NASM exports the Mac assembly does not have yet: `fe_pow_sqrt`, `fe_inv_var` — the safegcd inversion and the addition-chain square root would carry to AArch64 when wanted) and `test_store_map_magic` (`/proc/self/maps`) are N/A on the Mac. x86's map magic went to a dword at st+52 (#323); the Mac keeps st+384.
+**Main merged in the same evening (#316–#323, via the x86 session's `9e62e210`/`2087395d`):** `legs_heard_within` (#316) needed a Darwin branch (`tcp_connection_info`'s `tcpi_rxbytes`, seen-to-change per leg; note item 17); `test_fe_pow_sqrt`, `test_fe_inv_var` (x86 NASM exports the Mac assembly did not have: `fe_pow_sqrt`, `fe_inv_var` — carried to AArch64 the same night, next entry up) and `test_store_map_magic` (`/proc/self/maps`) were N/A on the Mac; the last still is. x86's map magic went to a dword at st+52 (#323); the Mac keeps st+384.
 
 ## 2026-09-27 — the large fixtures fetch from the local Core; test_taproot_block_diff runs on the Mac
 

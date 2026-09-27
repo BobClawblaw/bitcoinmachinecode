@@ -10,6 +10,8 @@
  *   void fe_mul(u64 r[4], const u64 a[4], const u64 b[4])
  *   void fe_sqr(u64 r[4], const u64 a[4])
  *   void fe_inv(u64 r[4], const u64 a[4])        a^(p-2); fe_inv(0) = 0
+ *   void fe_pow_sqrt(u64 r[4], const u64 a[4])   a^((p+1)/4), constant-time
+ *   int  fe_inv_var(u64 r[4], const u64 a[4])    a^-1, VARIABLE-TIME (safegcd)
  * r may alias a and/or b: every routine loads all its inputs first.
  *
  * WHAT MUST MATCH, AND HOW
@@ -40,9 +42,40 @@
  * 255 squarings, 15 multiplies; its exponent was checked equal to p-2 over
  * the integers before this was written).
  *
+ * fe_pow_sqrt (2026-09-27, x86 main #319): the same chain up to x223 with
+ * the tail of (p+1)/4 = ((x223 << 23) + x22) << 6 + x2) << 2 -- 253
+ * squarings, 13 multiplies -- for pubkey_parse's square root, which used
+ * fe_pow over the exponent's bits (~500 field ops). The caller checks
+ * r^2 == a. Constant-time like fe_inv: the sequence depends only on p.
+ *
+ * fe_inv_var (2026-09-27, x86 main #320): Bernstein-Yang safegcd from
+ * safegcd_var.h, for PUBLIC inputs only (schnorr_verify's Z^{-1} for the
+ * even-Y test, secp256k1_taproot.S's affine conversions); fe_inv stays the
+ * constant-time path for everything a wallet or signer computes.
+ *
  * Registers: x18 is never touched (Apple reserves it); x19..x25 are saved
  * where used (AAPCS64 callee-saved; the port's ABI audit checks them).
  * ========================================================================== */
+    .section __TEXT,__const
+    .balign 16
+/* p in 5 signed 62-bit limbs and p^{-1} mod 2^62, for fe_inv_var (the
+ * safegcd_var.h instance): limbs = p >> 62k & (2^62-1); the inverse by
+ * Newton. Re-derived in Python for this port; tests/test_fe_inv_var. */
+LP62_LIMBS:
+    .quad 0x3FFFFFFEFFFFFC2F
+    .quad 0x3FFFFFFFFFFFFFFF
+    .quad 0x3FFFFFFFFFFFFFFF
+    .quad 0x3FFFFFFFFFFFFFFF
+    .quad 0x00000000000000FF
+LPINV62:
+    .quad 0x27C7F6E22DDACACF
+    .balign 16
+LP_LIMBS:
+    .quad 0xFFFFFFFEFFFFFC2F
+    .quad 0xFFFFFFFFFFFFFFFF
+    .quad 0xFFFFFFFFFFFFFFFF
+    .quad 0xFFFFFFFFFFFFFFFF
+
     .text
 
 /* C = 2^32 + 977 = 0x1000003D1 into \reg */
@@ -357,3 +390,70 @@ _fe_inv:
     ldp   x29, x30, [sp, #288]
     add   sp, sp, #304
     ret
+
+/* ---------------------------------------------------------------------------
+ * fe_pow_sqrt(r=x0, a=x1): r = a^((p+1)/4) -- fe_inv's chain to x223, then
+ * the tail << 23 * x22, << 6 * x2, << 2 (see the header). Same frame.
+ * ------------------------------------------------------------------------- */
+    .p2align 2
+    .globl _fe_pow_sqrt
+_fe_pow_sqrt:
+    sub   sp, sp, #304
+    stp   x29, x30, [sp, #288]
+    add   x29, sp, #288
+    stp   x19, x20, [sp, #0]
+    str   x0, [sp, #272]                /* r (the frame keeps a's copy: r may alias a) */
+    ldp   x9, x10, [x1]
+    ldp   x11, x12, [x1, #16]
+    stp   x9, x10, [sp, #F_A]
+    stp   x11, x12, [sp, #F_A + 16]
+
+    CP    F_X2, F_A
+    SQRN  F_X2, 1
+    MUL3  F_X2, F_X2, F_A               /* x2  */
+    CP    F_X3, F_X2
+    SQRN  F_X3, 1
+    MUL3  F_X3, F_X3, F_A               /* x3  */
+    CP    F_T, F_X3
+    SQRN  F_T, 3
+    MUL3  F_T, F_T, F_X3                /* x6  */
+    SQRN  F_T, 3
+    MUL3  F_T, F_T, F_X3                /* x9  */
+    SQRN  F_T, 2
+    MUL3  F_X11, F_T, F_X2              /* x11 */
+    CP    F_T, F_X11
+    SQRN  F_T, 11
+    MUL3  F_X22, F_T, F_X11             /* x22 */
+    CP    F_T, F_X22
+    SQRN  F_T, 22
+    MUL3  F_X44, F_T, F_X22             /* x44 */
+    CP    F_T, F_X44
+    SQRN  F_T, 44
+    MUL3  F_T, F_T, F_X44               /* x88 */
+    CP    F_U, F_T
+    SQRN  F_U, 88
+    MUL3  F_U, F_U, F_T                 /* x176 */
+    SQRN  F_U, 44
+    MUL3  F_U, F_U, F_X44               /* x220 */
+    SQRN  F_U, 3
+    MUL3  F_U, F_U, F_X3                /* x223 */
+    /* the tail of (p+1)/4 */
+    SQRN  F_U, 23
+    MUL3  F_U, F_U, F_X22
+    SQRN  F_U, 6
+    MUL3  F_U, F_U, F_X2
+    SQRN  F_U, 1
+    ldr   x0, [sp, #272]                /* the last squaring lands in r */
+    add   x1, sp, #F_U
+    bl    _fe_sqr
+
+    ldp   x19, x20, [sp, #0]
+    ldp   x29, x30, [sp, #288]
+    add   sp, sp, #304
+    ret
+
+/* ---------------------------------------------------------------------------
+ * int fe_inv_var(r=x0, a=x1): safegcd mod p (safegcd_var.h)
+ * ------------------------------------------------------------------------- */
+#include "safegcd_var.h"
+SAFEGCD_INV_VAR fe_inv_var, LP62_LIMBS, LPINV62, LP_LIMBS

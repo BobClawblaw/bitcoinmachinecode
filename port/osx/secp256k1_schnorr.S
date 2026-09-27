@@ -182,10 +182,10 @@ _schnorr_verify:
     add   x2, sp, #S_RPT + 64
     bl    _schnorr_x_eq_r
     cbz   w0, Lsv_no
-    /* y(R) = Y * Z^-3 must be even */
+    /* y(R) = Y * Z^-3 must be even; Z != 0 was established above */
     add   x0, sp, #S_ZI
     add   x1, sp, #S_RPT + 64
-    bl    _fe_inv
+    bl    _fe_inv_var                     /* public: safegcd, not the constant-time chain */
     add   x0, sp, #S_Z3
     add   x1, sp, #S_ZI
     bl    _fe_sqr

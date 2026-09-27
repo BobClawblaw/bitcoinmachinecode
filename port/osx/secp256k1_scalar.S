@@ -8,7 +8,7 @@
  *   void sc_mul (u64 r[4], const u64 a[4], const u64 b[4]);  CONSTANT-TIME
  *   void sc_sqr (u64 r[4], const u64 a[4]);                  tail-jump to mul
  *   void sc_inv (u64 r[4], const u64 a[4]);                  Fermat, 255 muls
- *   int  sc_inv_var(u64 r[4], const u64 a[4]);               binary xgcd, VT
+ *   int  sc_inv_var(u64 r[4], const u64 a[4]);               safegcd, VT
  *   void sc_mul_512(u64 r[8], const u64 a[4], const u64 b[4]);
  *   int  sc_split_lambda(u64 r1[4], u64 r2[4], const u64 k[4]);
  *
@@ -43,6 +43,18 @@ DELTA:					/* 2^256 - n */
 	.quad	0x4551231950B75FC4
 	.quad	0x0000000000000001
 	.quad	0x0000000000000000
+/* n in 5 signed 62-bit limbs (sc_inv_var's safegcd representation) and
+ * n^{-1} mod 2^62, as asm/secp256k1_scalar.asm: limbs = n >> 62k & (2^62-1),
+ * the inverse by Newton. Re-derived in Python for this port (2026-09-27). */
+	.balign	16
+N62_LIMBS:
+	.quad	0x3FD25E8CD0364141
+	.quad	0x2ABB739ABD2280EE
+	.quad	0x3FFFFFFFFFFFFFEB
+	.quad	0x3FFFFFFFFFFFFFFF
+	.quad	0x00000000000000FF
+NINV62:
+	.quad	0x34F20099AA774EC1
 	.balign	16
 LAMBDA_LIMBS:
 	.quad	0xDF02967C1B23BD72
@@ -362,263 +374,17 @@ _sc_inv:
 	ret
 
 /* ---------------------------------------------------------------------------
- * int sc_inv_var(r[4], a[4]): binary extended GCD, VARIABLE-TIME (public
- * scalars only -- mirrors the x86 doc).  u=a, v=n, x1=1, x2=0.
- *   strip 2s from u (halve x1 mod n), then from v (halve x2 mod n);
- *   both odd: subtract smaller from larger, x's mod n (sc_sub); loop.
- *   u==1 -> x1 ; v==1 -> x2.  a==0 -> return 0.
- * Frame (x29 base): u@-64 v@-96 x1@-128 x2@-160.  5 pushes(80)+160=240=15*16.
+ * int sc_inv_var(r[4], a[4]) : r = a^-1 mod n  --  VARIABLE-TIME.
+ *   Bernstein-Yang safegcd (safegcd_var.h, the same body as fe_inv_var,
+ *   instantiated for n). PUBLIC scalars only: ecdsa_verify's s^{-1}. sc_inv
+ *   above stays the constant-time path for everything a signer computes.
+ *   2026-09-27: replaces the binary extended GCD (u=a, v=n, halve-mod-n),
+ *   which took 1.4 us here and looped forever on a >= n; this is 0.9 us
+ *   and reduces a >= n first (a == n -> 0, as a == 0).
+ *   Returns w0 = 1 and writes r; w0 = 0 with r untouched when a == 0 (mod n).
  * --------------------------------------------------------------------------- */
-	.align	2
-_sc_inv_var:
-	stp	x29, x30, [sp, #-16]!
-	stp	x19, x20, [sp, #-16]!
-	stp	x21, x22, [sp, #-16]!
-	stp	x23, x24, [sp, #-16]!
-	str	x25, [sp, #-16]!
-	nop
-	mov	x29, sp
-	sub	sp, sp, #160			/* u@-64 v@-96 x1@-128 x2@-160 */
-
-	mov	x20, x0			/* out */
-	mov	x19, x1			/* a */
-
-	/* a == 0 -> fail */
-	ldr	x9,  [x19, #0]
-	ldr	x10, [x19, #8]
-	orr	x9, x9, x10
-	ldr	x10, [x19, #16]
-	orr	x9, x9, x10
-	ldr	x10, [x19, #24]
-	orr	x9, x9, x10
-	cbz	x9, .Lsciv_fail
-
-	/* u = a */
-	ldp	x9, x10, [x19, #0]
-	stp	x9, x10, [x29, #-64]
-	ldp	x11, x12, [x19, #16]
-	stp	x11, x12, [x29, #-48]
-	/* v = n */
-	adrp	x22, N_LIMBS@PAGE
-	add	x22, x22, N_LIMBS@PAGEOFF
-	ldp	x9, x10, [x22, #0]
-	stp	x9, x10, [x29, #-96]
-	ldp	x11, x12, [x22, #16]
-	stp	x11, x12, [x29, #-80]
-	/* x1 = 1 ; x2 = 0 */
-	mov	x9, #1
-	str	x9, [x29, #-128]
-	str	xzr, [x29, #-120]
-	str	xzr, [x29, #-112]
-	str	xzr, [x29, #-104]
-	str	xzr, [x29, #-160]
-	str	xzr, [x29, #-152]
-	str	xzr, [x29, #-144]
-	str	xzr, [x29, #-136]
-
-.Lsciv_loop:
-	/* u == 1 ? */
-	ldr	x9, [x29, #-64]
-	cmp	x9, #1
-	b.ne	.Lsciv_chk_v
-	ldr	x10, [x29, #-56]
-	ldr	x11, [x29, #-48]
-	ldr	x12, [x29, #-40]
-	orr	x10, x10, x11
-	orr	x10, x10, x12
-	cbz	x10, .Lsciv_ret_x1
-.Lsciv_chk_v:
-	/* v == 1 ? */
-	ldr	x9, [x29, #-96]
-	cmp	x9, #1
-	b.ne	.Lsciv_strip_u
-	ldr	x10, [x29, #-88]
-	ldr	x11, [x29, #-80]
-	ldr	x12, [x29, #-72]
-	orr	x10, x10, x11
-	orr	x10, x10, x12
-	cbz	x10, .Lsciv_ret_x2
-
-.Lsciv_strip_u:
-	ldrb	w9, [x29, #-64]
-	tbnz	w9, #0, .Lsciv_strip_v
-	/* u >>= 1 (plain) ; x1 = halve_mod_n(x1) */
-	mov	x0, x29
-	sub	x0, x0, #64
-	bl	.Lshr1
-	mov	x0, x29
-	sub	x0, x0, #128
-	bl	.Lhalve_mod_n
-	b	.Lsciv_strip_u
-.Lsciv_strip_v:
-	ldrb	w9, [x29, #-96]
-	tbnz	w9, #0, .Lsciv_cmp
-	mov	x0, x29
-	sub	x0, x0, #96
-	bl	.Lshr1
-	mov	x0, x29
-	sub	x0, x0, #160
-	bl	.Lhalve_mod_n
-	b	.Lsciv_strip_v
-
-.Lsciv_cmp:
-	/* u >= v ? compare top limbs down */
-	ldr	x9,  [x29, #-40]
-	ldr	x10, [x29, #-72]
-	cmp	x9, x10
-	b.lo	.Lsciv_vbig
-	b.hi	.Lsciv_ubig
-	ldr	x9,  [x29, #-48]
-	ldr	x10, [x29, #-80]
-	cmp	x9, x10
-	b.lo	.Lsciv_vbig
-	b.hi	.Lsciv_ubig
-	ldr	x9,  [x29, #-56]
-	ldr	x10, [x29, #-88]
-	cmp	x9, x10
-	b.lo	.Lsciv_vbig
-	b.hi	.Lsciv_ubig
-	/* limb0: u >= v iff u0 >= v0 (u >= v overall reached here means
-	   equal so far); the x86 falls through to u_big when equal. */
-	ldr	x9,  [x29, #-64]
-	ldr	x10, [x29, #-96]
-	cmp	x9, x10
-	b.lo	.Lsciv_vbig
-.Lsciv_ubig:
-	/* u -= v (no borrow) */
-	ldr	x9,  [x29, #-64]
-	ldr	x13, [x29, #-96]
-	subs	x9, x9, x13
-	str	x9,  [x29, #-64]
-	ldr	x10, [x29, #-56]
-	ldr	x13, [x29, #-88]
-	sbcs	x10, x10, x13
-	str	x10, [x29, #-56]
-	ldr	x11, [x29, #-48]
-	ldr	x13, [x29, #-80]
-	sbcs	x11, x11, x13
-	str	x11, [x29, #-48]
-	ldr	x12, [x29, #-40]
-	ldr	x13, [x29, #-72]
-	sbcs	x12, x12, x13
-	str	x12, [x29, #-40]
-	/* x1 = x1 - x2 mod n */
-	mov	x0, x29
-	sub	x0, x0, #128
-	mov	x1, x0
-	mov	x2, x29
-	sub	x2, x2, #160
-	bl	_sc_sub
-	b	.Lsciv_loop
-.Lsciv_vbig:
-	/* v -= u (no borrow) */
-	ldr	x9,  [x29, #-96]
-	ldr	x13, [x29, #-64]
-	subs	x9, x9, x13
-	str	x9,  [x29, #-96]
-	ldr	x10, [x29, #-88]
-	ldr	x13, [x29, #-56]
-	sbcs	x10, x10, x13
-	str	x10, [x29, #-88]
-	ldr	x11, [x29, #-80]
-	ldr	x13, [x29, #-48]
-	sbcs	x11, x11, x13
-	str	x11, [x29, #-80]
-	ldr	x12, [x29, #-72]
-	ldr	x13, [x29, #-40]
-	sbcs	x12, x12, x13
-	str	x12, [x29, #-72]
-	/* x2 = x2 - x1 mod n */
-	mov	x0, x29
-	sub	x0, x0, #160
-	mov	x1, x0
-	mov	x2, x29
-	sub	x2, x2, #128
-	bl	_sc_sub
-	b	.Lsciv_loop
-
-.Lsciv_ret_x1:
-	mov	x21, x29
-	sub	x21, x21, #128
-	b	.Lsciv_store
-.Lsciv_ret_x2:
-	mov	x21, x29
-	sub	x21, x21, #160
-.Lsciv_store:
-	ldp	x9, x10, [x21, #0]
-	ldp	x11, x12, [x21, #16]
-	stp	x9, x10, [x20, #0]
-	stp	x11, x12, [x20, #16]
-	mov	w0, #1
-	b	.Lsciv_out
-.Lsciv_fail:
-	mov	w0, #0
-.Lsciv_out:
-	add	sp, sp, #160
-	ldr	x25, [sp], #16
-	nop
-	ldp	x23, x24, [sp], #16
-	ldp	x21, x22, [sp], #16
-	ldp	x19, x20, [sp], #16
-	ldp	x29, x30, [sp], #16
-	ret
-
-/* .Lshr1: [x0] >>= 1 over 4 limbs, plain.  Clobbers x9-x12. */
-	.align	2
-.Lshr1:
-	ldr	x9,  [x0, #0]
-	ldr	x10, [x0, #8]
-	ldr	x11, [x0, #16]
-	ldr	x12, [x0, #24]
-	extr	x9, x10, x9, #1		/* (x10:x9) >> 1 low half */
-	extr	x10, x11, x10, #1
-	extr	x11, x12, x11, #1
-	lsr	x12, x12, #1
-	str	x9,  [x0, #0]
-	str	x10, [x0, #8]
-	str	x11, [x0, #16]
-	str	x12, [x0, #24]
-	ret
-
-/* .Lhalve_mod_n: [x0] = ([x0] + (odd ? n : 0)) / 2, for [x0] < n.
- *   odd: (x+n)>>1 with the 257th carry bit folded back as bit 255.
- *   Clobbers x9-x12, x13 (mask), x14. */
-	.align	2
-.Lhalve_mod_n:
-	ldr	x9,  [x0, #0]
-	ldr	x10, [x0, #8]
-	ldr	x11, [x0, #16]
-	ldr	x12, [x0, #24]
-	tbnz	x9, #0, .Lhm_odd
-	extr	x9, x10, x9, #1
-	extr	x10, x11, x10, #1
-	extr	x11, x12, x11, #1
-	lsr	x12, x12, #1
-	b	.Lhm_store
-.Lhm_odd:
-	adrp	x14, N_LIMBS@PAGE
-	add	x14, x14, N_LIMBS@PAGEOFF
-	ldr	x13, [x14, #0]
-	adds	x9, x9, x13		/* carry -> next (MUST be adds) */
-	ldr	x13, [x14, #8]
-	adcs	x10, x10, x13
-	ldr	x13, [x14, #16]
-	adcs	x11, x11, x13
-	ldr	x13, [x14, #24]
-	adcs	x12, x12, x13
-	adcs	x13, xzr, xzr		/* 257th bit (0/1) */
-	extr	x9, x10, x9, #1
-	extr	x10, x11, x10, #1
-	extr	x11, x12, x11, #1
-	lsr	x12, x12, #1
-	lsl	x13, x13, #63
-	orr	x12, x12, x13
-.Lhm_store:
-	str	x9,  [x0, #0]
-	str	x10, [x0, #8]
-	str	x11, [x0, #16]
-	str	x12, [x0, #24]
-	ret
+#include "safegcd_var.h"
+SAFEGCD_INV_VAR sc_inv_var, N62_LIMBS, NINV62, N_LIMBS
 
 /* ---------------------------------------------------------------------------
  * int sc_split_lambda(r1[4], r2[4], k[4]):

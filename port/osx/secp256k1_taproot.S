@@ -358,14 +358,14 @@ _taproot_tweak_pubkey:
     bl    _fe_mul
     add   x0, sp, #T_ZI
     add   x1, sp, #T_Z2
-    bl    _fe_inv
+    bl    _fe_inv_var                     /* public point: safegcd */
     add   x0, sp, #T_XR
     add   x1, sp, #T_Q
     add   x2, sp, #T_ZI
     bl    _fe_mul
     add   x0, sp, #T_ZI
     add   x1, sp, #T_Z3
-    bl    _fe_inv
+    bl    _fe_inv_var                     /* public point: safegcd */
     add   x0, sp, #T_Z2                   /* yr (z2 is spent) */
     add   x1, sp, #T_Q + 32
     add   x2, sp, #T_ZI
