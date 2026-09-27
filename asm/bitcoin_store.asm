@@ -41,6 +41,9 @@
 ;                                retained; heights below are deleted/unavailable.
 ;                                Default 0 = no pruning. Persisted to prune.dat
 ;                                and reloaded by store_init on restart.)
+;   +52   dword map_magic       (bitcoin_store_fast.asm's mapping-cache
+;                                "initialised" word; +56..+63 is its read-fd
+;                                cache magic, +64..+255 its two caches)
 ;
 ; PRUNING (mirrors Bitcoin Core's -prune): store_prune(st, prune_height) retains
 ;   only the UTXO set + block data at height >= prune_height, unlinks the fully
