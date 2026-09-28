@@ -199,6 +199,34 @@ int main(void){
     if (flip_byte(bf, POS1+4)!=0) printf("FAIL: restore magic\n");
     close(bf);
 
+    /* 5c2. NET-15 frames (2026-09-24). The download worker and its committer
+     *      frame with the CHAIN's wire magic, so a testnet4 archive carries
+     *      0x283f161c frames beside 0xd9b4bef9 ones. Checked against the
+     *      mainnet constant alone, every such block was "bad frame magic" --
+     *      and STO-11 blanked valid records (testnet4 node B, m5ultra). The
+     *      daemon names the chain's magic; both then pass, and a frame with
+     *      neither is still caught. */
+    {
+        extern void archive_set_chain_magic(unsigned);
+        const unsigned T4 = 0x283f161cu, JUNK = 0x12345678u;
+        bf = open("blk00000.dat", O_RDWR);
+        if (pwrite(bf, &T4, 4, POS1+4) != 4) printf("FAIL: write t4 magic\n");
+        close(bf);
+        cki("a testnet4-magic frame, chain magic unset (the old check): flagged", archive_check(1,3), 1);
+        archive_set_chain_magic(T4);
+        cki("...with the chain's magic named: accepted", archive_check(1,3), 0);
+        cki("...and a mainnet-constant frame still passes beside it", archive_check(0,3), 0);
+        bf = open("blk00000.dat", O_RDWR);
+        if (pwrite(bf, &JUNK, 4, POS1+4) != 4) printf("FAIL: write junk magic\n");
+        close(bf);
+        cki("a frame with neither magic is still caught", archive_check(1,3), 1);
+        unsigned mm = MAGIC;
+        bf = open("blk00000.dat", O_RDWR);
+        if (pwrite(bf, &mm, 4, POS1+4) != 4) printf("FAIL: restore mainnet magic\n");
+        close(bf);
+        archive_set_chain_magic(MAGIC);
+    }
+
     /* 5d. STO-11: DETECTION IS NOT REPAIR. test_archive_check has always
      *     pinned that a bad frame is caught; nothing pinned what happens
      *     next, and the answer was "nothing" -- the record stayed, and

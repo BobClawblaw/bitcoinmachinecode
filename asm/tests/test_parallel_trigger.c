@@ -27,6 +27,17 @@ int main(void){
     printf("== re-arm ==\n");
     ok(!dl_should_parallel_fetch(1000, 320000, 0, 5000, 5000-DL_PARALLEL_REARM_S+1), "ran just under the re-arm interval ago: waits");
     ok( dl_should_parallel_fetch(1000, 320000, 0, 5000, 5000-DL_PARALLEL_REARM_S),   "ran exactly the interval ago: fires again");
+    /* 2026-09-24: a hole BELOW the archive tip holding the apply (testnet4 node
+     * B: applied 153,876, heights 153,877-8 blanked by a boot repair, archive
+     * to 153,885, peers announcing 153,885). The far-behind rule alone never
+     * fires there; the worker treats this as a trigger. */
+    ok( dl_hole_blocks_apply(153885, 153877, 153876),    "applied 153,876, hole at 153,877 under a 153,885 tip: the hole holds the apply");
+    ok(!dl_should_parallel_fetch(153885, 153885, dl_apply_backlog(153885, 153877, 153876), 5000, 0), "...and the far-behind rule alone does NOT fire (the node sat there an hour)");
+    ok( dl_should_parallel_fetch(153885, 153885+DL_PARALLEL_GAP, dl_apply_backlog(153885, 153877, 153876), 5000, 0), "...the worker's hole trigger (best = tip + gap) does");
+    ok(!dl_hole_blocks_apply(153885, 153880, 153876),    "the apply is below the hole (still connecting): not held by it");
+    ok(!dl_hole_blocks_apply(153885, -1, 153885),        "no hole: nothing");
+    ok(!dl_hole_blocks_apply(153885, 153886, 153885),    "the first 'hole' is just past the tip: the ordinary tip, not a hole below it");
+    ok(!dl_hole_blocks_apply(153885, 153877, -1),        "no engine (applied -1): nothing");
     printf("\n%s (%d failure%s)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", fails, fails==1?"":"s");
     return fails ? 1 : 0;
 }

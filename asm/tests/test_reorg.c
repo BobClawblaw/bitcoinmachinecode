@@ -757,6 +757,60 @@ static void case_reorg_depth12(void){ do_reorg_case(10, 12, 13, 0x207fffffu, "de
 static void case_reorg_shorter_but_heavier(void){ do_reorg_case(6, 5, 1, 0x1f00ffffu, "heavier-but-shorter"); }
 
 /* ======================================================================== */
+/* CASE: the fork is ABOVE the applied height (2026-09-24, testnet4 node B). */
+/*                                                                           */
+/* The apply sat at 153,876 below a hole while the archive ran to 153,889;  */
+/* a reorg forking at 153,887 "reconnected" 153,888..153,892 by applying     */
+/* them straight onto the set at 153,876 and persisting 153,892 as applied:  */
+/* eleven blocks never entered the UTXO set. Nothing is disconnected when    */
+/* the fork is above the connected tip, so the replacement blocks must only  */
+/* be STORED; the catch-up connects [applied+1 .. new tip] in order.         */
+/* ======================================================================== */
+static long harness_store_only(const blk_t* b){      /* the archive runs ahead of the apply */
+    long h = idxscan_append_locked(store_buf, b->hash, b->raw, b->len);
+    if (h < 0) return -1;
+    if (reorg_chainwork_sync(store_buf, 0) < 0) return -1;
+    rebuild_index();
+    return h;
+}
+static void case_fork_above_applied(void){
+    const long nbase = 8, napplied = 4, nlose = 1, nwin = 2;   /* applied 0..3, stored 0..8, fork at 7 */
+    build_base(nbase, 0x207fffffu);
+    build_branch(lose, nlose, nbase, 0x20000000u, 0x207fffffu);
+    build_branch(win,  nwin,  nbase, 0x30000000u, 0x207fffffu);
+    harness_open();
+    for (long h=0;h<napplied;h++) ckm("store+apply base block", harness_store(&base[h]) == h);
+    for (long h=napplied;h<nbase;h++) ckm("store-only base block (the archive runs ahead)", harness_store_only(&base[h]) == h);
+    for (long i=0;i<nlose;i++) ckm("store-only losing block", harness_store_only(&lose[i]) == nbase+i);
+    ck("applied height below the fork before the reorg", utxo_live_applied_height(), napplied-1);
+
+    static reorg_cand_t c; memset(&c,0,sizeof c);
+    ckm("build locator", reorg_build_locator(store_buf, &c) > 0);
+    cand_from_blocks(&c, win, nwin);
+    ck("analyze -> fork AND heavier", reorg_analyze(store_buf, &c), 2);
+    ck("fork point is above the applied height", c.fork_height, nbase-1);
+
+    memsrc_t src = { win, nwin };
+    ck("reorg_execute", reorg_execute(store_buf, c.fork_height, nwin, memsrc, &src), 1);
+    ckm("released the append lock", lock_is_free());
+    ck("the reorg did NOT move the apply past the gap", utxo_live_applied_height(), napplied-1);
+
+    /* the ordinary catch-up now connects base[4..7] + win[0..1], in order */
+    ckm("catch-up runs", utxo_live_catchup(store_buf) >= 0);
+    ck("catch-up reaches the new tip", utxo_live_applied_height(), nbase+nwin-1);
+
+    model_reset();
+    for (long h=0;h<nbase;h++) model_apply(&base[h]);
+    for (long i=0;i<nwin;i++)  model_apply(&win[i]);
+    static blk_t chain[MAXBLK];
+    for (long h=0;h<nbase;h++) chain[h] = base[h];
+    for (long i=0;i<nwin;i++)  chain[nbase+i] = win[i];
+    verify_ondisk_chain("fork-above-applied", chain, nbase+nwin);
+    verify_utxo_against_model("fork-above-applied", lose, nlose);
+    utxo_live_close();
+}
+
+/* ======================================================================== */
 /* CASE: a chain that is NOT heavier must be ignored, with zero side effects */
 /* ======================================================================== */
 static void case_not_heavier(void){
@@ -1895,6 +1949,7 @@ int main(void){
     total += run_case("reorg depth 3",                  case_reorg_depth3);
     total += run_case("reorg depth 12 (undo window)",   case_reorg_depth12);
     total += run_case("reorg shorter-but-heavier",      case_reorg_shorter_but_heavier);
+    total += run_case("fork above the applied height",  case_fork_above_applied);
     total += run_case("competing chain not heavier",    case_not_heavier);
     total += run_case("invalid candidate chains",       case_invalid_candidates);
     total += run_case("nBits schedule wired into analyze", case_bad_diffbits_wired);
