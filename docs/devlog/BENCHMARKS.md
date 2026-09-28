@@ -1209,10 +1209,10 @@ difference.
 | `GCSBlockFilterGetHash` | `bf_header_(100k-element_filter)` | 61,595.43 | 106,500.60 | ns/op | **1.73x slower** | the encoded 100,000-element filter hashed on both sides |
 | `ReadRawBlockBench` | `store_read_at_(block_413567)` | 36,248.07 | 13,119.30 | ns/op | **2.76x faster** | raw bytes on both sides |
 | `WriteBlockBench` | `store_append_(block_413567)` | 422,174.08 | 143,092.20 | ns/op | **2.95x faster** | the same block appended each op on both sides |
-| `MuHash` | `muhash_insert` | 2,646.58 | 944.52 | ns/op | **2.80x faster** |  |
-| `MuHashMul` | `num3072_mul` | 2,301.74 | 297.80 | ns/op | **7.73x faster** |  |
-| `MuHashPrecompute` | `muhash_insert_-_num3072_mul` | 340.86 | 646.72 | ns/op | **1.90x slower** |  |
-| `MuHashFinalize` | `num3072_inv_+_mul_+_muhash_finalize` | 27,973.80 | 1,860,980.00 | ns/op | **66.53x slower** | Core inverts by safegcd; ours by Fermat exponentiation (6,142 modmuls) |
+| `MuHash` | `muhash_insert` | 2,646.58 | 991.99 | ns/op | **2.67x faster** | expand + one multiply here; Core's `*=` also multiplies its denominator (two) |
+| `MuHashMul` | `num3072_mul` | 1,150.87 | 300.99 | ns/multiply | **3.82x faster** | per 3072-bit multiply: Core's `*=` runs two (numerator and denominator), ours one — the 2026-09-27 row compared one of ours with two of Core's and said 7.7x |
+| `MuHashPrecompute` | `muhash_to_num3072` | 340.86 | 689.56 | ns/op | **2.02x slower** | SHA-256 + ChaCha20 expansion of one element, both sides (measured directly; the 09-27 row was derived) |
+| `MuHashFinalize` | `num3072_inv_+_mul_+_finalize_+_divide` | 27,973.80 | ~~1,860,980.00~~ → **27,891.55** (2026-09-28) | ns/op | ~~66.53x slower~~ → **parity** | was a Fermat exponentiation (6,142 modmuls); a safegcd since 2026-09-28 (`daemon/num3072_inv.c`, Core's `Num3072::GetInverse` step for step). The row is Core's loop: Finalize, then the digest divided back in |
 | `CHACHA20_64BYTES` | `chacha20_crypt_64_B` | 0.77 | 1.18 | ns/byte | **1.52x slower** |  |
 | `CHACHA20_256BYTES` | `chacha20_crypt_256_B` | 0.72 | 1.18 | ns/byte | **1.64x slower** |  |
 | `CHACHA20_1MB` | `chacha20_crypt_1048576_B` | 0.71 | 1.15 | ns/byte | **1.63x slower** |  |
@@ -1235,16 +1235,27 @@ Reading the table:
 - **Parity or ahead:** block reconstruction from a compact block
   (`BlockEncodingNoExtra`, 1.25 ms both sides over a 50,000-tx pool); the
   block archive's raw read (2.7× faster) and append (3.1× faster); MuHash
-  insert (2.8× faster) and the 3072-bit multiply (8× faster: the IFMA/ADX
-  path in `bitcoin_muhash.asm`); Poly1305 at parity from 256 bytes up;
-  Bech32 encode and decode ahead.
+  insert (2.7× faster per op) and the 3072-bit multiply (3.8× faster per
+  multiply: the IFMA/ADX path in `bitcoin_muhash.asm`; Core's `*=` runs two
+  multiplies per op, which is why the 09-27 table said 8×); Poly1305 at
+  parity from 256 bytes up; Bech32 encode and decode ahead.
 - **Behind, by how much, and why:**
-  - **`MuHashFinalize`, 64×.** Core inverts its Num3072 with a safegcd
-    variant (28 µs); ours is a Fermat exponentiation, 6,142 modular
-    multiplies (1.8 ms). It is paid once per `gettxoutsetinfo` and per
-    parity check, never per block — but it is the largest gap in the table
-    and the same algorithm that closed the scalar-inverse gap this morning
-    (`asm/safegcd_var.inc`) applies, at 3072 bits.
+  - **`MuHashFinalize`, 66× — closed to parity 2026-09-28.** Core inverts its
+    Num3072 with a safegcd variant; ours was a Fermat exponentiation, 6,142
+    modular multiplies (1.8 ms). `daemon/num3072_inv.c` now carries the same
+    safegcd (Core's `Num3072::GetInverse` step for step, in C): the inverse
+    alone is 23.0 µs in Core's library and 22.8–24.0 µs here, on the same
+    core — level, as the same C algorithm under the same compiler should be.
+    The row (Core's loop: Finalize, then the digest divided back in) is
+    27.9 µs against Core's 28.0. The asm multiply and hash save under a
+    microsecond of it; what is left of the row is the inverse, and the
+    inverse is C on both sides. Proof: `tests/test_num3072_inv`, 2,536
+    checks against the Fermat inverse byte for byte and `x·x⁻¹ = 1` through
+    the asm multiply, over edges, random values, elements and running
+    products. Follow-up from the split: `muhash_to_num3072` (SHA-256 +
+    ChaCha20 expansion of one element) is 690 ns against Core's 341 — the
+    ChaCha20 keystream in `bitcoin_muhash.asm` at 1.7 ns/byte is the whole
+    difference, and 70% of every insert.
   - **ElligatorSwift, 6.5× on `EllSwiftCreate` and 3.1× on the ECDH.** Both
     are C (`crypto_ellswift*.c`) over the asm field arithmetic; Core's are
     libsecp256k1's. Paid once per BIP324 connection.

@@ -19,6 +19,7 @@ CORE_UNIT = {
     'CHACHA20_64BYTES': (64, 'ns/byte'), 'CHACHA20_256BYTES': (256, 'ns/byte'), 'CHACHA20_1MB': (1 << 20, 'ns/byte'),
     'POLY1305_64BYTES': (64, 'ns/byte'), 'POLY1305_256BYTES': (256, 'ns/byte'), 'POLY1305_1MB': (1 << 20, 'ns/byte'),
     'FSCHACHA20POLY1305_64BYTES': (64, 'ns/byte'), 'FSCHACHA20POLY1305_256BYTES': (256, 'ns/byte'), 'FSCHACHA20POLY1305_1MB': (1 << 20, 'ns/byte'),
+    'MuHashMul': (2, 'ns/multiply'),   # Core's `acc *= x` multiplies numerator and denominator
     'Bech32Encode': (32, 'ns/byte'), 'Bech32Decode': (52, 'ns/byte'), 'Base58CheckEncode': (32, 'ns/byte'),
 }
 # pairs whose two sides do not do the same work; the table says so
@@ -30,7 +31,10 @@ CAVEAT = {
     'GCSBlockFilterGetHash': 'the encoded 100,000-element filter hashed on both sides',
     'ReadRawBlockBench': 'raw bytes on both sides',
     'WriteBlockBench': 'the same block appended each op on both sides',
-    'MuHashFinalize': 'Core inverts by safegcd; ours by Fermat exponentiation (6,142 modmuls)',
+    'MuHash': "expand + one multiply here; Core's `*=` also multiplies its denominator (two)",
+    'MuHashMul': "per 3072-bit multiply: Core's `*=` runs two (numerator and denominator), ours one",
+    'MuHashPrecompute': 'SHA-256 + ChaCha20 expansion of one element, both sides',
+    'MuHashFinalize': "inverse + multiply + hash, then the digest divided back in, as Core's loop; Core's divide carries a second multiply",
     'Bech32Decode': 'decode + checksum verification on both sides',
     'Base58CheckEncode': 'no plain Base58Encode / Base58Decode on our side',
     'BlockEncodingNoExtra': '50,000-tx pool, 3,000 short ids, none present, both sides',
