@@ -8376,25 +8376,41 @@ static long dl_trigger_height(const long* hs, int n){
  *     HOST for DL_CLAIM_MEMO_S, across tips, and does not vote meanwhile --
  *     whatever it claims next (the false chain keeps growing).
  * The memo is in-memory (a restart runs once at most, and then remembers). */
-#define DL_CLAIM_MEMO    32
-#define DL_CLAIM_MEMO_S  (6L*3600L)
-typedef struct { char host[128]; long claim; long long until; } dl_claim_t;
-static dl_claim_t g_dl_claims[DL_CLAIM_MEMO];
-static int dl_claim_memo_active(const char* host, long long now_s){
-    for(int i=0;i<DL_CLAIM_MEMO;i++)
-        if(g_dl_claims[i].until > now_s && !strcmp(g_dl_claims[i].host, host)) return 1;
+/* A host memo: "do not do X with this peer again until T". Two users: the
+ * claim memo below and the reorg probe's rejection memo (2026-09-28, the
+ * same evening: the same Knots cluster fed the probe its 7,400-deep fork
+ * every 30 s -- the probe interval rotates over legs whose last pass was
+ * empty, and that leg was the only such leg). */
+#define HOST_MEMO_N 32
+typedef struct { char host[128]; long long until; } host_memo_t;
+static int host_memo_active(const host_memo_t* m, const char* host, long long now_s){
+    for(int i=0;i<HOST_MEMO_N;i++)
+        if(m[i].until > now_s && !strcmp(m[i].host, host)) return 1;
     return 0;
 }
-static void dl_claim_memo_note(const char* host, long claim, long long now_s){
+static void host_memo_note(host_memo_t* m, const char* host, long long until){
     int slot = 0;                                   /* the host's own entry, else the one expiring soonest */
-    for(int i=0;i<DL_CLAIM_MEMO;i++){
-        if(!strcmp(g_dl_claims[i].host, host)){ slot = i; break; }
-        if(g_dl_claims[i].until < g_dl_claims[slot].until) slot = i;
+    for(int i=0;i<HOST_MEMO_N;i++){
+        if(!strcmp(m[i].host, host)){ slot = i; break; }
+        if(m[i].until < m[slot].until) slot = i;
     }
-    snprintf(g_dl_claims[slot].host, sizeof g_dl_claims[slot].host, "%s", host);
-    g_dl_claims[slot].claim = claim;
-    g_dl_claims[slot].until = now_s + DL_CLAIM_MEMO_S;
+    snprintf(m[slot].host, sizeof m[slot].host, "%s", host);
+    m[slot].until = until;
 }
+#define DL_CLAIM_MEMO    HOST_MEMO_N
+#define DL_CLAIM_MEMO_S  (6L*3600L)
+static host_memo_t g_dl_claims[HOST_MEMO_N];
+static int dl_claim_memo_active(const char* host, long long now_s){ return host_memo_active(g_dl_claims, host, now_s); }
+static void dl_claim_memo_note(const char* host, long claim, long long now_s){ (void)claim; host_memo_note(g_dl_claims, host, now_s + DL_CLAIM_MEMO_S); }
+/* The reorg probe's rejection memo: a leg whose probe just rejected a
+ * candidate chain (too deep, no more work, does not connect) is not probed
+ * again for PROBE_REJECT_MEMO_S. Its branch is still there next hour; a
+ * probe every rotation re-fetched 7,409 headers of it each time on
+ * 2026-09-28 (108.233.254.177, fork at 961,631) and said so twice a minute. */
+#define PROBE_REJECT_MEMO_S (3600L)
+static host_memo_t g_probe_rejects[HOST_MEMO_N];
+static int probe_memo_active(const char* host, long long now_s){ return host_memo_active(g_probe_rejects, host, now_s); }
+static void probe_memo_note(const char* host, long long now_s){ host_memo_note(g_probe_rejects, host, now_s + PROBE_REJECT_MEMO_S); }
 /* does this leg's announce count toward the trigger? */
 static int dl_claim_believed(int i, long long now_s){
     return g_sync_fail_streak[i] == 0 && !dl_claim_memo_active(mux_out_host[i], now_s);
@@ -9996,7 +10012,8 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * a probe then can only time out, and its timeout costs the leg
              * (reorg_probe_host_silent). It runs as soon as a leg hears again. */
             static int probe_deferred_logged = 0;
-            int probe_due = reorg_ok && utxo_live_ok && g_pass_last_empty[i] && mux_out_fd[i]>=0 && now_ms>=next_reorg_probe_ms;
+            int probe_due = reorg_ok && utxo_live_ok && g_pass_last_empty[i] && mux_out_fd[i]>=0 && now_ms>=next_reorg_probe_ms
+                            && !probe_memo_active(mux_out_host[i], now_ms / 1000);   /* its last probe rejected a candidate: not again for an hour */
             if(probe_due && reorg_probe_host_silent()){
                 if(!probe_deferred_logged){
                     fprintf(stderr,"[reorg] probe of %s deferred: no leg has received anything for %ds -- the host's network, not a peer\n",
@@ -10044,7 +10061,9 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                     { extern long reorg_last_handoff_fork(void); long fh = reorg_last_handoff_fork();
                       if(fh >= 0 && fh < (long)g_dl_last_seen_tip) g_dl_last_seen_tip = (int)fh; }
                 } else if(pr < 0){
-                    fprintf(stderr,"[reorg] probe of %s rejected a candidate chain (no action taken)\n", mux_out_host[i]);
+                    probe_memo_note(mux_out_host[i], now_ms / 1000);
+                    fprintf(stderr,"[reorg] probe of %s rejected a candidate chain (no action taken); not probed again for %ld min\n",
+                            mux_out_host[i], PROBE_REJECT_MEMO_S / 60);
                 }
             }
             if(mux_out_fd[i] < 0) continue;                    /* the probe closed it */
