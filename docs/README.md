@@ -59,6 +59,7 @@ project, in Markdown, HTML and BBCode forms of the same text.
 |---|---|
 | [`reports/MINED_TX_CORPUS.md`](reports/MINED_TX_CORPUS.md) | the mined-transaction corpus: 17 real chain transactions replayed at their own heights as a consensus-acceptance test, the two controls that prove the corpus discriminates, and the gap those controls left named |
 | [`reports/2026-09-27-core-vs-bmc-modules.md`](reports/2026-09-27-core-vs-bmc-modules.md) ([BBCode](reports/2026-09-27-core-vs-bmc-modules.bbcode)) | Bitcoin Machine Code vs Bitcoin Core, module by module: 31 of Core's own benchmarks side by side on one core -- ahead on the block archive, MuHash and Bech32, level on signatures and compact-block reconstruction, behind on the MuHash finalize inverse (66x), ElligatorSwift, ChaCha20, Base58; the other 28 Core bench files classified with reasons |
+| [`reports/2026-09-28-core-vs-bmc-modules.md`](reports/2026-09-28-core-vs-bmc-modules.md) ([BBCode](reports/2026-09-28-core-vs-bmc-modules.bbcode)) | The 2026-09-27 report rerun in full after the day's ports: ahead on Base58 (7.9x), MuHash (6x), ChaCha20 (2.4x), the archive, SHA-1 (1.6x); parity on signatures, SHA-512, RIPEMD-160, compact blocks; behind on the ECDH window (1.8x), filter construction (different work), 64-byte packets, long SHA-256 |
 
 ## Milestones
 
@@ -161,6 +162,7 @@ also annotated tags.
 | [`releases/2026-09-12-getrawmempool-graph.md`](releases/2026-09-12-getrawmempool-graph.md) | 2026-09-12 — Verbose `getrawmempool` carries the ancestor graph |
 | [`releases/2026-09-16-indexes-build-during-the-sync.md`](releases/2026-09-16-indexes-build-during-the-sync.md) | Every index builds during the sync (2026-09-16) |
 | [`releases/2026-09-27-crypto-parity-and-the-full-verification-sync.md`](releases/2026-09-27-crypto-parity-and-the-full-verification-sync.md) | Signature verification at libsecp256k1's speed, the full-verification sync, and a byte order (2026-09-27) |
+| [`releases/2026-09-28-the-module-benchmarks-gaps-closed.md`](releases/2026-09-28-the-module-benchmarks-gaps-closed.md) | The module benchmark's gaps closed: MuHash, ElligatorSwift, ChaCha20, SHA-1, SHA-512, Base58 (2026-09-28) |
 
 ## Development history
 

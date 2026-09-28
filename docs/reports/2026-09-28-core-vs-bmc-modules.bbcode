@@ -1,0 +1,58 @@
+[size=16pt][b]Bitcoin Machine Code vs Bitcoin Core, module by module: the 2026-09-28 rerun[/b][/size]
+
+2026-09-28. Bitcoin Machine Code (an all-assembly x86-64 node, [url]https://github.com/BobClawblaw/bitcoinmachinecode[/url]) measured against Bitcoin Core's own benchmark suite (src/bench, v31.99.0-67efced1fc83), on the same box, the same core, the same inputs -- the 2026-09-27 report rerun in full after one day of work on the gaps it named: the MuHash inverse (a port of Core's safegcd), ElligatorSwift (constant-time comb and window multiplies, a Jacobi square test, and an encoder that draws its branch at random as libsecp256k1 does -- the fixed order was biased), ChaCha20 in AVX2, SHA-1 by SHA-NI, SHA-512 unrolled, Base58Check by 64-bit limbs.
+
+[b]How it was measured.[/b] Core's numbers come from Core's bench_bitcoin (nanobench, -min-time=1000, the minimum over 3 processes), built RelWithDebInfo as Core's own default; the secp256k1 rows from libsecp256k1's own bench, Core's vendored copy with Core's shipped config. Ours come from harnesses that mirror each Core benchmark's loop -- the same work per iteration, the same sizes and element counts -- as thread CPU time, the minimum of 15 rounds. Both sides pinned to one core (taskset -c 25) of an AMD Ryzen 9 9950X3D with the production node and a Core oracle running (load average 3.3 on 32 threads); Core's timed loops showed no preemption (cpu/wall 1.000). Where the two sides do not do the same work, the row says so. The 09-27 report's MuHashMul row compared one multiply with Core's two; every row here is per the same unit on both sides.
+
+[size=12pt][b]Where this node is ahead[/b][/size]
+
+[table]
+[tr][td][b]module[/b][/td][td][b]Core[/b][/td][td][b]bmc[/b][/td][td][b]ratio[/b][/td][td][b]note[/b][/td][/tr]
+[tr][td]Base58Check encode ([tt]Base58CheckEncode[/tt])[/td][td]47.7 ns/B[/td][td]6.1 ns/B[/td][td][b]7.9x faster[/b][/td][td]64-bit limbs divided by 58^10; was 3.2x slower on 09-27[/td][/tr]
+[tr][td]MuHash insert of one coin ([tt]MuHash[/tt])[/td][td]2.66 us[/td][td]0.45 us[/td][td][b]6.0x faster[/b][/td][td]expand + one multiply; Core's op is expand + two multiplies[/td][/tr]
+[tr][td]MuHash 3072-bit multiply ([tt]MuHashMul[/tt], per multiply)[/td][td]1.16 us[/td][td]0.29 us[/td][td][b]4.0x faster[/b][/td][td]AVX-512 IFMA / ADX paths; Core's [tt]*=[/tt] is two multiplies, so the row is per multiply[/td][/tr]
+[tr][td]block archive: raw read ([tt]ReadRawBlockBench[/tt])[/td][td]37.4 us[/td][td]13.3 us[/td][td][b]2.8x faster[/b][/td][td]raw bytes on both sides[/td][/tr]
+[tr][td]ChaCha20, 1 MB[/td][td]0.71 ns/B[/td][td]0.30 ns/B[/td][td][b]2.4x faster[/b][/td][td]AVX2, two blocks per register, three pairs in flight; was 1.6x slower[/td][/tr]
+[tr][td]MuHash element expansion ([tt]MuHashPrecompute[/tt])[/td][td]350 ns[/td][td]160 ns[/td][td][b]2.2x faster[/b][/td][td]SHA-256 + ChaCha20; was 1.9x slower[/td][/tr]
+[tr][td]block archive: append a 1 MB block ([tt]WriteBlockBench[/tt])[/td][td]310 us[/td][td]144 us[/td][td][b]2.1x faster[/b][/td][td]the same block appended each op on both sides[/td][/tr]
+[tr][td]BIP324 packet AEAD, 1 MB ([tt]FSCHACHA20POLY1305_1MB[/tt])[/td][td]0.98 ns/B[/td][td]0.58 ns/B[/td][td][b]1.7x faster[/b][/td][td]was 1.5x slower[/td][/tr]
+[tr][td]SHA-1, 1 MB[/td][td]0.64 ns/B[/td][td]0.39 ns/B[/td][td][b]1.6x faster[/b][/td][td]SHA-NI body; Core's is plain C++; was 2.5x slower[/td][/tr]
+[tr][td]ChaCha20, 256 B[/td][td]0.74 ns/B[/td][td]0.48 ns/B[/td][td][b]1.55x faster[/b][/td][td]four blocks served by the six-block group; was 1.6x slower[/td][/tr]
+[tr][td]Bech32 encode[/td][td]6.4 ns/B[/td][td]5.2 ns/B[/td][td][b]1.2x faster[/b][/td][td][/td][/tr]
+[tr][td]MuHash finalize ([tt]MuHashFinalize[/tt]: the [tt]gettxoutsetinfo[/tt] digest)[/td][td]28.2 us[/td][td]26.0 us[/td][td][b]1.08x faster[/b][/td][td]the same safegcd inverse Core uses (ported); was 66x slower[/td][/tr]
+[tr][td]ECDSA verify[/td][td]21.0 us[/td][td]20.2 us[/td][td][b]4% faster[/b][/td][td]libsecp256k1's own bench for Core's side[/td][/tr]
+[/table]
+
+[size=12pt][b]Parity[/b][/size]
+
+[table]
+[tr][td][b]module[/b][/td][td][b]Core[/b][/td][td][b]bmc[/b][/td][td][b]verdict[/b][/td][/tr]
+[tr][td]SHA-256, 32 B[/td][td]36.6 ns[/td][td]35.1 ns[/td][td]parity[/td][/tr]
+[tr][td]SHA-512, 1 MB[/td][td]0.97 ns/B[/td][td]1.01 ns/B[/td][td]within 4%; was 1.7x slower[/td][/tr]
+[tr][td]RIPEMD-160, 1 MB[/td][td]1.13 ns/B[/td][td]1.18 ns/B[/td][td]within 4%[/td][/tr]
+[tr][td]BIP340 verify[/td][td]21.6 us[/td][td]22.3 us[/td][td]within 3%[/td][/tr]
+[tr][td]compact-block reconstruction ([tt]BlockEncodingNoExtra[/tt])[/td][td]1.24 ms[/td][td]1.29 ms[/td][td]within 4%[/td][/tr]
+[tr][td]Poly1305, 256 B / 1 MB[/td][td]0.31 / 0.27 ns/B[/td][td]0.33 / 0.27 ns/B[/td][td]within 8% / parity[/td][/tr]
+[tr][td]Bech32 decode + verify[/td][td]3.3 ns/B[/td][td]3.2 ns/B[/td][td]parity[/td][/tr]
+[tr][td]BIP324 packet AEAD, 256 B[/td][td]1.31 ns/B[/td][td]1.40 ns/B[/td][td]within 7%; was 1.7x slower[/td][/tr]
+[tr][td]ElligatorSwift key creation ([tt]EllSwiftCreate[/tt])[/td][td]18.2 us[/td][td]20.9 us[/td][td]1.15x slower; was 6.6x[/td][/tr]
+[/table]
+
+[size=12pt][b]Where Core is ahead, and why[/b][/size]
+
+[table]
+[tr][td][b]module[/b][/td][td][b]Core[/b][/td][td][b]bmc[/b][/td][td][b]ratio[/b][/td][td][b]why[/b][/td][/tr]
+[tr][td]GCS filter construct, 100,000 elements[/td][td]4.9 ms[/td][td]21.6 ms[/td][td][b]4.4x slower[/b][/td][td]our side also parses the 4 MB block and dedups its scripts; Core hashes ready-made elements[/td][/tr]
+[tr][td]GCS filter header hash[/td][td]62 us[/td][td]119 us[/td][td][b]1.9x slower[/b][/td][td]SHA-256d over the encoded filter[/td][/tr]
+[tr][td]BIP324 ECDH[/td][td]21.6 us[/td][td]39.7 us[/td][td][b]1.8x slower[/b][/td][td]a constant-time w=4 window vs libsecp256k1's GLV-split ecmult_const; was 3.2x[/td][/tr]
+[tr][td]CheckBlock, block 413,567[/td][td]370 us[/td][td]669 us[/td][td][b]1.8x slower[/b][/td][td]Core does more per block (see tests/bench_checkblock.c)[/td][/tr]
+[tr][td]BIP324 packet AEAD, 64 B[/td][td]2.29 ns/B[/td][td]3.81 ns/B[/td][td][b]1.7x slower[/b][/td][td]three single ChaCha20 blocks per small packet: their latency is the row[/td][/tr]
+[tr][td]taproot script-path verify[/td][td]36.0 us[/td][td]50.1 us[/td][td][b]1.4x slower[/b][/td][td]ours spends a 2-leaf tree; Core a 1-leaf[/td][/tr]
+[tr][td]ChaCha20, 64 B / Poly1305, 64 B[/td][td]0.79 / 0.44 ns/B[/td][td]0.94 / 0.53 ns/B[/td][td][b]1.2x slower[/b][/td][td]one block is a dependent chain either way[/td][/tr]
+[tr][td]SHA-256, 1 MB / SHA-256d 64 B x1024 / merkle root[/td][td]0.36 ns/B / 45.8 us / 45.7 ns/leaf[/td][td]0.42 / 52.9 / 53.0[/td][td][b]1.15x slower[/b][/td][td]Core's 2-way SHA-NI interleave vs our 1-way[/td][/tr]
+[tr][td]P2WPKH / taproot key-path verify[/td][td]20.4 / 20.8 us[/td][td]22.9 / 22.3 us[/td][td][b]1.1x slower[/b][/td][td]the sighash is recomputed per input; Core precomputes midstates per transaction[/td][/tr]
+[/table]
+
+[size=12pt][b]Verdict[/b][/size]
+
+The consensus kernel -- signature verification, the hashes on the hot path, compact-block reconstruction, the block archive -- is at or ahead of Core. Since 09-27 the transport cipher, the MuHash set hash and the address encoder moved from behind to well ahead, and SHA-1 and SHA-512 from behind to ahead and parity. What is left behind is named: the BIP324 ECDH's window against a GLV split, single-block latency on 64-byte packets, a filter-construction row whose two sides do different work, and Core's 2-way SHA-NI interleave on long SHA-256 inputs. Every number, harness and script is in the repository (docs/devlog/BENCHMARKS.md, addendum 2026-09-28).

@@ -167,7 +167,8 @@ paired (script verification, compact-block reconstruction, GCS filters, the
 block archive, MuHash, ChaCha20/Poly1305 and the BIP324 AEAD, ElligatorSwift,
 Bech32/Base58, plus the hash, merkle and CheckBlock rows) and every one of
 the 59 files classified — is in `docs/devlog/BENCHMARKS.md`, addendum
-2026-09-27. The largest gaps there: ~~`MuHashFinalize` (66×)~~ closed to
+2026-09-27, and the complete rerun after the 2026-09-28 ports (addendum
+2026-09-28; forum report `docs/reports/2026-09-28-core-vs-bmc-modules.md`). The largest gaps there: ~~`MuHashFinalize` (66×)~~ closed to
 parity on 2026-09-28 by the same safegcd inverse Core uses (the inverse is C
 on both sides and level; the row is 27.9 µs against Core's 28.0);
 ElligatorSwift ~~(6.6×)~~ 1.15× and its ECDH ~~(3.2×)~~ 1.9× since 2026-09-28
