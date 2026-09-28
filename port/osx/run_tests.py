@@ -59,11 +59,9 @@ X86_ONLY = {
     "test_txv_pools_diff", "test_tapagg_diff", "test_txv_dispatch_diff", "test_wv0_drv_diff",
     "test_svs_drv_diff", "test_checksig_diff", "test_bip143_diff", "test_taproot_verify_diff",
     "test_bip341_diff", "test_undo_asm_diff",
-    # 2026-09-27 (main #323): test_store_map_magic counts mappings through
-    # /proc/self/maps (a Darwin branch would walk mach_vm_region_recurse, as
-    # test_secure_lock does). fe_pow_sqrt / fe_inv_var (#319, #320) were
-    # x86-only until the evening of 09-27; the Mac assembly has them now.
-    "test_store_map_magic",
+    # 2026-09-27: fe_pow_sqrt / fe_inv_var (main #319, #320) were x86-only
+    # until the evening of 09-27, and test_store_map_magic (#323) read
+    # /proc/self/maps until 09-28; the Mac has all three now.
 }
 FINAL_OK = {"PASS", "SKIP", "N/A"}
 
