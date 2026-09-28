@@ -4,6 +4,11 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-28 (night, 2) — the port's debug prints removed from the shared C
+
+The x86 side's audit of `bmc_osx` against `main` (their 09-28 worklog, #341) took every shared fix and left "Darwin-guarded code, ARM64 fences and Mac-side debug printfs" behind. The printfs were the port's own debugging from the twin era, never meant to stay: `[ls-cs]` and `[wv0-cs]` env-gated hex dumps in `bitcoin_scriptverify.c` / `bitcoin_witness_v0.c`, an unconditional `[dbg-ctx]` dump of the script, prevouts and witness on every failed tapscript in `bitcoin_taproot_sighash.c`, and `ibd_pipeline.c` writing a failing block to `/tmp/ibd_bad_*.bin`. All four removed, with the includes that served only them; those files now differ from `main` only by the `BMC_TLS_BUF` thread-local shims (`ibd_pipeline.c` is identical). The covering tests (scriptverify, segwit, tapscript, taproot block diff, IBD pipeline) pass unchanged.
+- **Full suite:** 416 PASS, 10 SKIP, 14 N/A, 1 FAIL — `test_net_timeouts`, a timing test on untouched code, PASS when rerun alone and in the three earlier full runs today: a load flake.
+
 ## 2026-09-28 (night) — the reorg probe's rejection memo (shared C)
 
 The #304 cluster peer reappeared on the mainnet node at 19:23 and became the only leg with an empty pass, so the 30 s probe slot fell on it every time: 29 probes in 15 minutes, each fetching the 7,409-deep fork at 961,631 and rejecting it (correctly; the tip stayed at Core's). Now a leg whose probe rejected a candidate is not probed again for an hour (`probe_memo_*`, on a `host_memo_t` helper the #304 claim memo shares). `test_parallel_trigger` pins it. Note item 20 for the x86 side.
