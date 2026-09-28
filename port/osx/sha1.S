@@ -14,10 +14,17 @@
  * The compression uses the ARMv8 SHA-1 instructions (sha1c/p/m four rounds
  * each, sha1h for the next e, sha1su0/su1 for the schedule) -- the AArch64
  * counterpart of SHA-NI, present on every Apple silicon core (FEAT_SHA1 is
- * mandatory with the crypto extension Apple ships), so there is no scalar
- * fallback or probe here. The x86 module is scalar; the output is the same
- * standard function, which the differential fuzz against the twin and the
- * hashlib vectors of test_sha1-using tests pin.
+ * mandatory with the crypto extension Apple ships). Since 2026-09-28 (x86
+ * main #332 gave sha1.asm a SHA-NI body beside its scalar one, and
+ * tests/test_sha1 drives both) the same two-body shape is here:
+ *   sha1_block_shani   the crypto-extension body (the one above, renamed)
+ *   sha1_block_scalar  a plain FIPS 180-4 round loop, the test's second body
+ *   sha1_block         dispatches: the probe once (sysctlbyname
+ *                      hw.optional.arm.FEAT_SHA1, as sha256.S's), then the
+ *                      cached path; sha1_force_path(0 re-probe, 1 crypto,
+ *                      2 scalar) pins it for the test; sha1_cpu_has_sha.
+ * The output is the same standard function, which the differential fuzz
+ * against the twin and the hashlib vectors of test_sha1-using tests pin.
  *
  * The first two AArch64 attempts (2026-09-08, scalar translations of the
  * x86) loaded W[0] wrong; this one is written against the instruction
@@ -37,10 +44,197 @@ _sha1_init:
     str   w10, [x0, #16]
     ret
 
-/* sha1_block(state=x0, block=x1) ; leaf, uses v0-v7, v16-v22 (no v8-v15) */
+/* sha1_block(state=x0, block=x1): the dispatcher */
     .p2align 2
     .globl _sha1_block
 _sha1_block:
+    adrp  x9, Lsha1_path@PAGE
+    add   x9, x9, Lsha1_path@PAGEOFF
+    ldrb  w10, [x9]
+    cbnz  w10, 1f
+    stp   x29, x30, [sp, #-32]!           /* probe once: park the arguments */
+    stp   x0, x1, [sp, #16]
+    bl    _sha1_cpu_has_sha
+    mov   w10, #2
+    cmp   w0, #1
+    csel  w10, w0, w10, eq                /* 1 -> crypto, else 2 -> scalar */
+    adrp  x9, Lsha1_path@PAGE
+    add   x9, x9, Lsha1_path@PAGEOFF
+    strb  w10, [x9]
+    ldp   x0, x1, [sp, #16]
+    ldp   x29, x30, [sp], #32
+1:  cmp   w10, #1
+    b.eq  _sha1_block_shani
+    b     _sha1_block_scalar
+
+/* sha1_force_path(p): 0 re-probe on the next call, 1 crypto, 2 scalar */
+    .p2align 2
+    .globl _sha1_force_path
+_sha1_force_path:
+    adrp  x9, Lsha1_path@PAGE
+    add   x9, x9, Lsha1_path@PAGEOFF
+    strb  w0, [x9]
+    ret
+
+/* int sha1_cpu_has_sha(void): sysctlbyname("hw.optional.arm.FEAT_SHA1") */
+    .p2align 2
+    .globl _sha1_cpu_has_sha
+_sha1_cpu_has_sha:
+    stp   x29, x30, [sp, #-16]!
+    sub   sp, sp, #16                     /* [sp] value, [sp+8] size (in/out) */
+    adrp  x0, Lsha1_feat@PAGE
+    add   x0, x0, Lsha1_feat@PAGEOFF
+    mov   x1, sp
+    mov   x9, #4
+    str   x9, [sp, #8]
+    add   x2, sp, #8
+    mov   x3, #0
+    mov   x4, #0
+    bl    _sysctlbyname
+    cbnz  w0, 2f
+    ldr   w9, [sp]
+    cmp   w9, #1
+    b.ne  2f
+    mov   w0, #1
+    b     3f
+2:  mov   w0, #0
+3:  add   sp, sp, #16
+    ldp   x29, x30, [sp], #16
+    ret
+
+/* sha1_block_scalar(state=x0, block=x1): FIPS 180-4 section 6.1.2 as
+ * written -- W[80] on the stack, one round per iteration, the four stages
+ * as four loops. Not for speed: the crypto body is 4x faster and is what
+ * the dispatcher takes on every Apple core; this is the second body the
+ * test holds it to. x9..x17 only. */
+    .p2align 2
+    .globl _sha1_block_scalar
+_sha1_block_scalar:
+    sub   sp, sp, #320
+    mov   x9, #0
+1:  ldr   w10, [x1, x9, lsl #2]           /* W[t] = big-endian word t */
+    rev   w10, w10
+    str   w10, [sp, x9, lsl #2]
+    add   x9, x9, #1
+    cmp   x9, #16
+    b.lo  1b
+2:  sub   x10, x9, #3                     /* W[t] = rol(W[t-3]^W[t-8]^W[t-14]^W[t-16], 1) */
+    ldr   w11, [sp, x10, lsl #2]
+    sub   x10, x9, #8
+    ldr   w12, [sp, x10, lsl #2]
+    eor   w11, w11, w12
+    sub   x10, x9, #14
+    ldr   w12, [sp, x10, lsl #2]
+    eor   w11, w11, w12
+    sub   x10, x9, #16
+    ldr   w12, [sp, x10, lsl #2]
+    eor   w11, w11, w12
+    ror   w11, w11, #31
+    str   w11, [sp, x9, lsl #2]
+    add   x9, x9, #1
+    cmp   x9, #80
+    b.lo  2b
+    ldp   w10, w11, [x0]                  /* a b */
+    ldp   w12, w13, [x0, #8]              /* c d */
+    ldr   w14, [x0, #16]                  /* e */
+    mov   x9, #0
+    /* stage 1: t = 0..19, f = d ^ (b & (c ^ d)), K = 0x5A827999 */
+    movz  w17, #0x7999
+    movk  w17, #0x5A82, lsl #16
+3:  eor   w15, w12, w13
+    and   w15, w15, w11
+    eor   w15, w15, w13
+    ldr   w16, [sp, x9, lsl #2]
+    add   w15, w15, w16
+    add   w15, w15, w17
+    add   w15, w15, w14
+    ror   w16, w10, #27                   /* rol(a, 5) */
+    add   w15, w15, w16
+    mov   w14, w13
+    mov   w13, w12
+    ror   w12, w11, #2                    /* c = rol(b, 30) */
+    mov   w11, w10
+    mov   w10, w15
+    add   x9, x9, #1
+    cmp   x9, #20
+    b.lo  3b
+    /* stage 2: t = 20..39, f = b ^ c ^ d, K = 0x6ED9EBA1 */
+    movz  w17, #0xEBA1
+    movk  w17, #0x6ED9, lsl #16
+4:  eor   w15, w11, w12
+    eor   w15, w15, w13
+    ldr   w16, [sp, x9, lsl #2]
+    add   w15, w15, w16
+    add   w15, w15, w17
+    add   w15, w15, w14
+    ror   w16, w10, #27
+    add   w15, w15, w16
+    mov   w14, w13
+    mov   w13, w12
+    ror   w12, w11, #2
+    mov   w11, w10
+    mov   w10, w15
+    add   x9, x9, #1
+    cmp   x9, #40
+    b.lo  4b
+    /* stage 3: t = 40..59, f = (b & c) | (d & (b | c)), K = 0x8F1BBCDC */
+    movz  w17, #0xBCDC
+    movk  w17, #0x8F1B, lsl #16
+5:  and   w15, w11, w12
+    orr   w16, w11, w12
+    and   w16, w16, w13
+    orr   w15, w15, w16
+    ldr   w16, [sp, x9, lsl #2]
+    add   w15, w15, w16
+    add   w15, w15, w17
+    add   w15, w15, w14
+    ror   w16, w10, #27
+    add   w15, w15, w16
+    mov   w14, w13
+    mov   w13, w12
+    ror   w12, w11, #2
+    mov   w11, w10
+    mov   w10, w15
+    add   x9, x9, #1
+    cmp   x9, #60
+    b.lo  5b
+    /* stage 4: t = 60..79, f = b ^ c ^ d, K = 0xCA62C1D6 */
+    movz  w17, #0xC1D6
+    movk  w17, #0xCA62, lsl #16
+6:  eor   w15, w11, w12
+    eor   w15, w15, w13
+    ldr   w16, [sp, x9, lsl #2]
+    add   w15, w15, w16
+    add   w15, w15, w17
+    add   w15, w15, w14
+    ror   w16, w10, #27
+    add   w15, w15, w16
+    mov   w14, w13
+    mov   w13, w12
+    ror   w12, w11, #2
+    mov   w11, w10
+    mov   w10, w15
+    add   x9, x9, #1
+    cmp   x9, #80
+    b.lo  6b
+    ldp   w15, w16, [x0]
+    add   w10, w10, w15
+    add   w11, w11, w16
+    ldp   w15, w16, [x0, #8]
+    add   w12, w12, w15
+    add   w13, w13, w16
+    ldr   w15, [x0, #16]
+    add   w14, w14, w15
+    stp   w10, w11, [x0]
+    stp   w12, w13, [x0, #8]
+    str   w14, [x0, #16]
+    add   sp, sp, #320
+    ret
+
+/* sha1_block_shani(state=x0, block=x1) ; leaf, uses v0-v7, v16-v22 (no v8-v15) */
+    .p2align 2
+    .globl _sha1_block_shani
+_sha1_block_shani:
     adrp  x9, Lsha1_k@PAGE
     add   x9, x9, Lsha1_k@PAGEOFF
     ld1r  {v16.4s}, [x9], #4
@@ -240,6 +434,12 @@ _sha1_full:
     ldp   x29, x30, [sp], #48
     ret
 
+    .section __DATA,__data
+Lsha1_path:
+    .byte 0                               /* 0 unprobed, 1 crypto, 2 scalar */
+    .section __TEXT,__cstring
+Lsha1_feat:
+    .asciz "hw.optional.arm.FEAT_SHA1"
     .section __TEXT,__const
     .p2align 4
 Lsha1_iv:

@@ -16,13 +16,13 @@
  *
  * scalar_to_pubkey: pub = compressed secp256k1 pubkey of secret scalar k:
  *   limbs[j] = bswap64(load64(k + (3-j)*8))      BE bytes -> 4 LE limbs
- *   point = point_scalar_mul_ct(G, k)            (CT ladder: k is SECRET)
+ *   point = point_scalar_mul_gen_ct(k)            (CT comb over G: k is SECRET)
  *   z2 = Z^2, z3 = Z*z2, inv2 = 1/z2, inv3 = 1/z3
  *   ax = X*inv2, ay = Y*inv3
  *   pub[0] = 0x02 | (ay limb0 & 1); pub[1..32] = ax bytes reversed to BE.
  *
  * Calls (AAPCS64, all proven on this port):
- *   point_scalar_mul_ct (secp256k1_point_ct.S), fe_mul/fe_sqr/fe_inv (secp256k1_fe.S).
+ *   point_scalar_mul_gen_ct (secp256k1_point_ct.S), fe_mul/fe_sqr/fe_inv (secp256k1_fe.S).
  *
  * Darwin pitfalls honoured here: sp 16-aligned at every bl (stp x29,x30
  * prologue); no x18/x28; w-regs never touch parked x19/x20 halves; data
@@ -93,12 +93,10 @@ _scalar_to_pubkey:
     rev     x9, x9
     str     x9, [sp, #24]
 
-    // ---- point = k * G (constant-time ladder; k is secret) ----
+    // ---- point = k * G (constant time; k is secret) ----
     add     x0, sp, #0x20               // r (12-limb Jacobian)
-    adrp    x1, _G_AFF@PAGE
-    add     x1, x1, _G_AFF@PAGEOFF      // affine (X,Y) 8 limbs
-    mov     x2, sp                      // k limbs
-    bl      _point_scalar_mul_ct
+    mov     x1, sp                      // k limbs
+    bl      _point_scalar_mul_gen_ct    // the csel-scanned comb (2026-09-28, as x86): the ladder was 6x slower
 
     // ---- affinize: z2 = Z^2 (Z at point+64) ----
     add     x0, sp, #0x80
