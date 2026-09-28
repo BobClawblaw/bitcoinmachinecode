@@ -4,6 +4,14 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-28 (evening) — issues #294 and #304 fixed (shared C)
+
+Two open issues from the BlockYard sync of 09-24/25, both in the daemon's C:
+- **#294** — a restart mid-sync with a small gap, a just-under-threshold WAL and 17 runs of 42 GB took the 64 MB steady-state memtable and ground for 25 minutes in silence. A third sizing rule on the store's shape (`utxo_live_pick_bulk_shape`: runs ≥ the compaction threshold, or run bytes ≥ the 35%-of-RAM run budget), fed by a directory scan for `utxo_run_*.dat` before the load, and a "store shape" line either way so the silence has its reason. `test_utxo_sizing` pins it. On this Mac's mainnet node: 5 runs / 13 GB → steady-state, unchanged.
+- **#304** — a cluster of Knots peers on a rejected fork passed the two-agreeing-peers gate and ran the full parallel downloader (60–130 s, 0 blocks) after every start and re-arm. Now a leg whose sync pass is failing does not vote, and a peer whose claim ran the downloader for nothing is remembered by host for 6 h across tips. `test_parallel_trigger` pins both.
+- Note items 18 and 19 for the x86 side; the PR to main follows.
+- **Full suite:** 417 PASS, 10 SKIP, 14 N/A, 0 FAIL.
+
 ## 2026-09-28 — main #327–#336 merged (`c891ce14`→): the comb, window and GLV multiplies, the SHA-1 second body, the chacha20/num3072 glue
 
 The x86 session's benchmark day (`worklog/2026-09-28.md`: #329 MuHash safegcd in C, #330 ElligatorSwift comb/window, #331 ChaCha20 AVX2, #332 SHA-1 SHA-NI / SHA-512 / Base58, #334 GLV ECDH + the comb for every k·G caller + SHA-256 runs + the filter builder, #336 the three testnet4 fixes cherry-picked from this tree) merged cleanly, then failed to link: the shared C now calls x86 exports the Mac did not have. What the Mac got:
