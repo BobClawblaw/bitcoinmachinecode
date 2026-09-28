@@ -58,6 +58,7 @@ project, in Markdown, HTML and BBCode forms of the same text.
 | | |
 |---|---|
 | [`reports/MINED_TX_CORPUS.md`](reports/MINED_TX_CORPUS.md) | the mined-transaction corpus: 17 real chain transactions replayed at their own heights as a consensus-acceptance test, the two controls that prove the corpus discriminates, and the gap those controls left named |
+| [`reports/2026-09-27-core-vs-bmc-modules.md`](reports/2026-09-27-core-vs-bmc-modules.md) ([BBCode](reports/2026-09-27-core-vs-bmc-modules.bbcode)) | Bitcoin Machine Code vs Bitcoin Core, module by module: 31 of Core's own benchmarks side by side on one core -- ahead on the block archive, MuHash and Bech32, level on signatures and compact-block reconstruction, behind on the MuHash finalize inverse (66x), ElligatorSwift, ChaCha20, Base58; the other 28 Core bench files classified with reasons |
 
 ## Milestones
 
