@@ -167,10 +167,12 @@ paired (script verification, compact-block reconstruction, GCS filters, the
 block archive, MuHash, ChaCha20/Poly1305 and the BIP324 AEAD, ElligatorSwift,
 Bech32/Base58, plus the hash, merkle and CheckBlock rows) and every one of
 the 59 files classified — is in `docs/devlog/BENCHMARKS.md`, addendum
-2026-09-27. The largest gaps there: `MuHashFinalize` (66×, a Fermat inverse
-against Core's safegcd; per RPC call, not per block), ElligatorSwift (6.6×)
-and its ECDH (3.2×), ChaCha20 (1.6×), Base58Check (3.1×); ahead on the block
-archive (2.8–3×), MuHash insert/multiply (2.8× / 7.7×) and Bech32.
+2026-09-27. The largest gaps there: ~~`MuHashFinalize` (66×)~~ closed to
+parity on 2026-09-28 by the same safegcd inverse Core uses (the inverse is C
+on both sides and level; the row is 27.9 µs against Core's 28.0);
+ElligatorSwift (6.6×) and its ECDH (3.2×), ChaCha20 (1.6×), Base58Check
+(3.1×); ahead on the block archive (2.8–3×), MuHash insert (2.7× per op) and
+the 3072-bit multiply (3.8× per multiply) and Bech32.
 
 ## Why each difference exists
 

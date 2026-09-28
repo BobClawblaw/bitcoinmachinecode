@@ -2,6 +2,8 @@
 
 2026-09-27. Bitcoin Machine Code (an all-assembly x86-64 node, <https://github.com/BobClawblaw/bitcoinmachinecode>) measured against Bitcoin Core's own benchmark suite (`src/bench`, v31.99.0-67efced1fc83), on the same box, the same core, the same inputs.
 
+> **Correction 2026-09-28.** The `MuHashMul` row compares one of our multiplies with Core's `acc *= x`, which runs two (numerator and denominator): per multiply the figure is 1.15 us vs 0.30 us, **3.8x faster**, not 7.7x. The `MuHash` insert row has the same shape difference (Core's op is expand + two multiplies, ours expand + one). `MuHashFinalize` was closed to **parity** the same day (27.9 us vs 28.0 us) by porting Core's own safegcd inverse; the current table is in `docs/devlog/BENCHMARKS.md`, addendum 2026-09-27.
+
 **How it was measured.** Core's numbers come from Core's `bench_bitcoin` (nanobench, `-min-time=1000`, the minimum over 3 processes), built RelWithDebInfo as Core's own default; the secp256k1 rows from libsecp256k1's own `bench`, Core's vendored copy with Core's shipped config. Our numbers come from harnesses that mirror the shape of each Core benchmark -- the same work per iteration, the same buffer sizes, the same element counts -- as thread CPU time, the minimum of 15 rounds. Both sides pinned to one core (`taskset -c 25`) of an AMD Ryzen 9 9950X3D. The production node and a Core oracle were running on the box at the time (load average 3.95 on 32 threads); Core's timed loops showed no preemption (cpu/wall 1.000 in every group). Where the two sides do not do the same work, the row says so.
 
 ## Where this node is ahead

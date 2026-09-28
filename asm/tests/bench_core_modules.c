@@ -39,7 +39,6 @@
 #include "crypto_bip324.h"
 #include "crypto_ellswift.h"
 #include "block_filter.h"
-#include "../daemon/muhash_p2.inc.h"
 
 typedef unsigned char u8; typedef uint64_t u64;
 
@@ -259,23 +258,41 @@ static void bench_store(const char* raw_path){
 }
 
 /* ---- 5. MuHash ---------------------------------------------------------- */
-static void num3072_inv(u8 out[384], const u8 in[384]){
-    num3072_set_one(out);
-    for (int byte = 383; byte >= 0; byte--) for (int bit = 7; bit >= 0; bit--){ num3072_mul(out, out); if ((MUHASH_P_MINUS_2[byte] >> bit) & 1) num3072_mul(out, in); }
-}
+/* Core's four loops, each op shaped as Core's (src/bench/crypto_hash.cpp):
+ *   MuHash            acc *= MuHash3072(key)   expand + TWO multiplies (numerator, and
+ *                                              the denominator by the element's unit
+ *                                              denominator); ours: expand + one
+ *   MuHashMul         acc *= muhash            two multiplies in Core; one in ours
+ *   MuHashPrecompute  MuHash3072{key}          the expansion alone (SHA-256 + ChaCha20)
+ *   MuHashFinalize    Finalize + acc /= {out}  inverse + multiply + hash, then expand
+ *                                              + two multiplies; ours: one multiply
+ * Our accumulator carries one product per side (the coinstats index keeps a numerator
+ * and a denominator and multiplies the side an event touches), so the rows do our
+ * node's work per op and the table's note names Core's second multiply. The per-
+ * multiply line makes the multiply-vs-multiply figure explicit.
+ * The inverse is daemon/num3072_inv.c (safegcd since 2026-09-28; the Fermat loop it
+ * replaced measured 1.8 ms here). */
+extern int  num3072_inv_var(u8 out[384], const u8 in[384]);
+extern void muhash_to_num3072(void* out384, const void* data, unsigned long len);
+static void num3072_inv(u8 out[384], const u8 in[384]){ if (!num3072_inv_var(out, in)) exit(3); }
 static void bench_muhash(void){
     printf("== MuHash3072 (Core src/bench/crypto_hash.cpp): insert, multiply, precompute, finalize ==\n");
-    static u64 acc[48], elem[48], inv[48], tmp[48]; u8 key[32] = {0}; uint32_t i = 0;
-    muhash_init(acc);
-    double ins = MEASURE(2000, key[0] = (u8)(++i); muhash_insert(acc, key, 32));
-    result("muhash_insert", "MuHash", ins, "ns/op", "(SHA256 + ChaCha20 expansion + one 3072-bit modmul)");
-    muhash_init(elem); memset(key, 0x5a, 32); muhash_insert(elem, key, 32);   /* one element, as a num3072 */
-    double mul = MEASURE(5000, num3072_mul(acc, elem));
-    result("num3072_mul", "MuHashMul", mul, "ns/op", NULL);
-    result("muhash_insert - num3072_mul", "MuHashPrecompute", ins - mul, "ns/op", "(derived: the element hash alone)");
-    memcpy(tmp, acc, 384);
-    double fin = MEASURE(1, num3072_inv((u8*)inv, (u8*)elem); memcpy(tmp, acc, 384); num3072_mul(tmp, inv); u8 o[32]; muhash_finalize(o, tmp));
-    result("num3072_inv + mul + muhash_finalize", "MuHashFinalize", fin, "ns/op", "(Fermat inverse of the denominator, then the digest; Core's Finalize does the same inverse)");
+    static u64 num[48], den[48], elem[48], inv[48], tmp[48]; u8 key[32] = {0}; uint32_t i = 0;
+    muhash_init(num); muhash_init(den);
+    double ins = MEASURE(2000, key[0] = (u8)(++i); muhash_insert(num, key, 32));
+    result("muhash_insert", "MuHash", ins, "ns/op", "(expand + one multiply; Core's op is expand + two multiplies)");
+    memset(key, 0x5a, 32); muhash_to_num3072(elem, key, 32);   /* one element, as a num3072 */
+    double mul = MEASURE(5000, num3072_mul(num, elem));
+    result("num3072_mul", "MuHashMul", mul, "ns/multiply", "(Core's op is two multiplies; the table divides Core's by two)");
+    double pre = MEASURE(5000, key[0] = (u8)(++i); muhash_to_num3072(elem, key, 32));
+    result("muhash_to_num3072", "MuHashPrecompute", pre, "ns/op", "(SHA-256 + ChaCha20 expansion, as Core's MuHash3072{key})");
+    /* a realistic denominator: 500 elements */
+    for (int k = 0; k < 500; k++){ key[0] = (u8)k; key[1] = (u8)(k >> 8); muhash_insert(den, key, 32); }
+    double fin = MEASURE(200, num3072_inv((u8*)inv, (u8*)den); memcpy(tmp, num, 384); num3072_mul(tmp, inv); u8 o[32]; muhash_finalize(o, tmp);
+                              muhash_to_num3072(elem, o, 32); num3072_mul(den, elem));
+    result("num3072_inv + mul + finalize + divide", "MuHashFinalize", fin, "ns/op", "(Core's loop: Finalize, then acc /= {out}; Core's divide carries a second multiply)");
+    double inv_only = MEASURE(200, num3072_inv((u8*)inv, (u8*)den));
+    printf("  %-38s %12.2f ns/op   (the safegcd alone, for the split)\n", "num3072_inv_var", inv_only);
 }
 
 /* ---- 6. ChaCha20 / Poly1305 / the BIP324 AEAD --------------------------- */
