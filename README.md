@@ -38,7 +38,7 @@ testnet4, signet (public or custom) and regtest.
   to Core's at every height checked
   ([`docs/releases/2026-09-27-crypto-parity-and-the-full-verification-sync.md`](docs/releases/2026-09-27-crypto-parity-and-the-full-verification-sync.md)).
 - secp256k1 in hand-written x86-64 assembly, at the speed of Core's own
-  library: ECDSA 20.7 µs and BIP340 22.4 µs per verification on one core
+  library: ECDSA 20.2 µs and BIP340 22.3 µs per verification on one core
   against libsecp256k1's 21.0 and 22.0 (2026-09-27; safegcd scalar
   inversion, addition-chain square roots), proven byte for byte against
   Core's vectors, a frozen reference and a randomized differential.
