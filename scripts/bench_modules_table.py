@@ -24,8 +24,8 @@ CORE_UNIT = {
 }
 # pairs whose two sides do not do the same work; the table says so
 CAVEAT = {
-    'VerifyScriptP2WPKH': 'Core precomputes the sighash midstates once; ours hashes per op',
-    'VerifyScriptP2TR_KeyPath': 'Core precomputes the sighash midstates once; ours hashes per op',
+    'VerifyScriptP2WPKH': 'both sides hold the sighash midstates per transaction (a sighash session here, PrecomputedTransactionData there); the rest is the compressed-pubkey square root',
+    'VerifyScriptP2TR_KeyPath': 'both sides hold the sighash midstates per transaction (a sighash session here, PrecomputedTransactionData there)',
     'VerifyScriptP2TR_ScriptPath': 'ours spends a 2-leaf tree (one more merkle step); Core a 1-leaf tree',
     'GCSFilterConstruct': '100,000 unique 32-byte elements handed to the builder on both sides (since 2026-09-28; the row had included our block parse)',
     'GCSBlockFilterGetHash': 'the encoded 100,000-element filter hashed on both sides',
