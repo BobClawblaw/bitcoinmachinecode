@@ -4,6 +4,11 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-28 (night) — the reorg probe's rejection memo (shared C)
+
+The #304 cluster peer reappeared on the mainnet node at 19:23 and became the only leg with an empty pass, so the 30 s probe slot fell on it every time: 29 probes in 15 minutes, each fetching the 7,409-deep fork at 961,631 and rejecting it (correctly; the tip stayed at Core's). Now a leg whose probe rejected a candidate is not probed again for an hour (`probe_memo_*`, on a `host_memo_t` helper the #304 claim memo shares). `test_parallel_trigger` pins it. Note item 20 for the x86 side.
+- **Full suite:** 417 PASS, 10 SKIP, 14 N/A, 0 FAIL. The peer is on the Bitcoin Knots BIP-110 split (nodes enforcing it stopped accepting the SHA256d chain's blocks on 2026-08-08; our fork point 961,631): eight SHA256d blocks 961,632–961,639, of which Core holds two as headers-only (bits 1702353d, version 0x200be010, 08-06/08), then BLAKE2b proof-of-work from block 961,640 on 08-30 (bitcoin-blake2b.org/faq) with a new header format. The ~974k it announces is that chain's height (its coinbase-maturity rule starts at 973,440); neither node can read those headers, which is why the probe sees only the 961,631 fork and rejects it on depth.
+
 ## 2026-09-28 (late) — the roadmap brought current; the wallet round-trip gate run
 
 - `OSX_ROADMAP.md` had not been touched since the C-twin era: 42 entries still said "as a C TWIN", four boxes were open (bip341/342, the script VM modules, the wallet CLI gate, Phase 4 parity). A dated status section at its top now states what is true (every daemon-linked x86 module has a `.S`; the 13 shadow twins; the suite; the nodes; parity by vectors), and each open box is closed in place with what closed it.
