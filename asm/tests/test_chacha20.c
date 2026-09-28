@@ -119,6 +119,59 @@ int main(void){
       ck("encrypt/decrypt round-trips", memcmp(msg, pt, 100) == 0);
       ck("  and the ciphertext is not the plaintext", memcmp(msg, ct, 100) != 0); }
 
+
+    /* ---- the AVX2 path against the C block, both driven through the same
+     * entry point with the path forced (2026-09-28). Random keys, nonces and
+     * counters (one in seven starts within 8 blocks of 2^32, so the wrap is
+     * crossed inside a call), lengths 0..1600 and a few of 1 MB, raw and
+     * XOR, and split calls whose pieces straddle the two-block threshold so
+     * the counter hand-over between the paths is exercised. */
+    printf("== chacha20_xor_avx2 against the C block ==\n");
+    {
+        extern int chacha20_force_path(int);
+        extern int chacha20_cpu_has_avx2(void);
+        if (!chacha20_cpu_has_avx2()){
+            ck("(no AVX2 on this CPU: the vector path is not exercised here)", 1);
+        } else {
+            static unsigned char in[(1 << 20) + 64], want[(1 << 20) + 64], got[(1 << 20) + 64];
+            unsigned long long rs = 0xC0FFEE1234567ULL;
+            #define RND() (rs ^= rs << 13, rs ^= rs >> 7, rs ^= rs << 17, rs)
+            long bad = 0, cases = 0;
+            for (int it = 0; it < 3000; it++){
+                unsigned char key[32], nonce[12];
+                for (int i = 0; i < 32; i++) key[i] = (unsigned char)RND();
+                for (int i = 0; i < 12; i++) nonce[i] = (unsigned char)RND();
+                unsigned ctr = (it % 7 == 0) ? 0xFFFFFFFFu - (unsigned)(RND() % 8) : (unsigned)RND();
+                unsigned long len = it < 2990 ? (unsigned long)(RND() % 1601) : (1u << 20);
+                for (unsigned long i = 0; i < len; i++) in[i] = (unsigned char)RND();
+                int raw = (int)(RND() & 1);
+                /* the pieces are decided first and replayed on both paths: a
+                 * call always consumes whole blocks (a 41-byte call advances
+                 * the counter by one), so the split itself changes the stream
+                 * and the reference must see the same split */
+                unsigned long pieces[64]; int np = 0;
+                if (it & 1){ pieces[np++] = len; }
+                else { unsigned long done = 0; while (done < len && np < 63){ unsigned long n = (unsigned long)(RND() % 300); if (n > len - done) n = len - done; pieces[np++] = n; done += n; } if (done < len) pieces[np++] = len - done; }
+                chacha20_ctx a, b;
+                chacha20_force_path(0);
+                chacha20_init(&a, key); chacha20_seek(&a, nonce, ctr);
+                { unsigned long done = 0; for (int q = 0; q < np; q++){ chacha20_crypt(&a, raw ? NULL : in + done, want + done, pieces[q]); done += pieces[q]; } }
+                chacha20_force_path(1);
+                chacha20_init(&b, key); chacha20_seek(&b, nonce, ctr);
+                memset(got, 0xAA, len + 64);
+                { unsigned long done = 0; for (int q = 0; q < np; q++){ chacha20_crypt(&b, raw ? NULL : in + done, got + done, pieces[q]); done += pieces[q]; } }
+                cases++;
+                if (memcmp(got, want, len) || got[len] != 0xAA || memcmp(a.s, b.s, 64)){
+                    bad++;
+                    if (bad < 6) printf("  MISMATCH it=%d len=%lu ctr=%08x raw=%d state%s\n", it, len, ctr, raw, memcmp(a.s, b.s, 64) ? " differs" : " same");
+                }
+            }
+            chacha20_force_path(-1);
+            char l[96]; snprintf(l, sizeof l, "AVX2 == C on %ld random cases (lengths, counters, raw/XOR, split calls)", cases);
+            ck(l, bad == 0);
+        }
+    }
+
     if (fails) printf("\nFAILURES: %d\n", fails);
     else printf("\nALL TESTS PASSED (0 failures)\n");
     return fails ? 1 : 0;

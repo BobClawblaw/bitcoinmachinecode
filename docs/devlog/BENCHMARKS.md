@@ -1209,19 +1209,19 @@ difference.
 | `GCSBlockFilterGetHash` | `bf_header_(100k-element_filter)` | 61,595.43 | 106,500.60 | ns/op | **1.73x slower** | the encoded 100,000-element filter hashed on both sides |
 | `ReadRawBlockBench` | `store_read_at_(block_413567)` | 36,248.07 | 13,119.30 | ns/op | **2.76x faster** | raw bytes on both sides |
 | `WriteBlockBench` | `store_append_(block_413567)` | 422,174.08 | 143,092.20 | ns/op | **2.95x faster** | the same block appended each op on both sides |
-| `MuHash` | `muhash_insert` | 2,646.58 | 991.99 | ns/op | **2.67x faster** | expand + one multiply here; Core's `*=` also multiplies its denominator (two) |
+| `MuHash` | `muhash_insert` | 2,646.58 | ~~991.99~~ → **443.69** (2026-09-28, AVX2 keystream) | ns/op | **5.97x faster** | expand + one multiply here; Core's `*=` also multiplies its denominator (two) |
 | `MuHashMul` | `num3072_mul` | 1,150.87 | 300.99 | ns/multiply | **3.82x faster** | per 3072-bit multiply: Core's `*=` runs two (numerator and denominator), ours one — the 2026-09-27 row compared one of ours with two of Core's and said 7.7x |
-| `MuHashPrecompute` | `muhash_to_num3072` | 340.86 | 689.56 | ns/op | **2.02x slower** | SHA-256 + ChaCha20 expansion of one element, both sides (measured directly; the 09-27 row was derived) |
+| `MuHashPrecompute` | `muhash_to_num3072` | 340.86 | ~~689.56~~ → **159.28** (2026-09-28) | ns/op | ~~2.02x slower~~ → **2.14x faster** | SHA-256 + ChaCha20 expansion of one element, both sides; the expansion now runs through `chacha20_avx2.asm` (six blocks in one throughput-bound group) |
 | `MuHashFinalize` | `num3072_inv_+_mul_+_finalize_+_divide` | 27,973.80 | ~~1,860,980.00~~ → **27,891.55** (2026-09-28) | ns/op | ~~66.53x slower~~ → **parity** | was a Fermat exponentiation (6,142 modmuls); a safegcd since 2026-09-28 (`daemon/num3072_inv.c`, Core's `Num3072::GetInverse` step for step). The row is Core's loop: Finalize, then the digest divided back in |
-| `CHACHA20_64BYTES` | `chacha20_crypt_64_B` | 0.77 | 1.18 | ns/byte | **1.52x slower** |  |
-| `CHACHA20_256BYTES` | `chacha20_crypt_256_B` | 0.72 | 1.18 | ns/byte | **1.64x slower** |  |
-| `CHACHA20_1MB` | `chacha20_crypt_1048576_B` | 0.71 | 1.15 | ns/byte | **1.63x slower** |  |
+| `CHACHA20_64BYTES` | `chacha20_crypt_64_B` | 0.77 | ~~1.18~~ → **0.94** (2026-09-28) | ns/byte | ~~1.52x~~ → **1.22x slower** | one block is latency-bound whichever way it is written; this is the C block, unrolled and register-resident |
+| `CHACHA20_256BYTES` | `chacha20_crypt_256_B` | 0.72 | ~~1.18~~ → **0.47** (2026-09-28) | ns/byte | ~~1.64x slower~~ → **1.53x faster** | `chacha20_avx2.asm`: four blocks served by the six-block group |
+| `CHACHA20_1MB` | `chacha20_crypt_1048576_B` | 0.71 | ~~1.15~~ → **0.30** (2026-09-28) | ns/byte | ~~1.63x slower~~ → **2.37x faster** | AVX2, two blocks per register, three pairs in flight |
 | `POLY1305_64BYTES` | `poly1305_64_B` | 0.44 | 0.53 | ns/byte | **1.21x slower** |  |
 | `POLY1305_256BYTES` | `poly1305_256_B` | 0.31 | 0.33 | ns/byte | **1.08x slower** |  |
 | `POLY1305_1MB` | `poly1305_1048576_B` | 0.26 | 0.26 | ns/byte | parity |  |
-| `FSCHACHA20POLY1305_64BYTES` | `bip324_encrypt_64_B` | 2.24 | 4.39 | ns/byte | **1.95x slower** |  |
-| `FSCHACHA20POLY1305_256BYTES` | `bip324_encrypt_256_B` | 1.30 | 2.19 | ns/byte | **1.68x slower** |  |
-| `FSCHACHA20POLY1305_1MB` | `bip324_encrypt_1048576_B` | 0.97 | 1.43 | ns/byte | **1.47x slower** |  |
+| `FSCHACHA20POLY1305_64BYTES` | `bip324_encrypt_64_B` | 2.24 | ~~4.39~~ → **3.71** (2026-09-28) | ns/byte | ~~1.95x~~ → **1.66x slower** | three single ChaCha20 blocks per small packet (length cipher, Poly1305 key, payload): the single-block cost is the whole of this row |
+| `FSCHACHA20POLY1305_256BYTES` | `bip324_encrypt_256_B` | 1.30 | ~~2.19~~ → **1.39** (2026-09-28) | ns/byte | ~~1.68x~~ → **1.07x slower** |  |
+| `FSCHACHA20POLY1305_1MB` | `bip324_encrypt_1048576_B` | 0.97 | ~~1.43~~ → **0.58** (2026-09-28) | ns/byte | ~~1.47x slower~~ → **1.67x faster** |  |
 | `EllSwiftCreate` | `ellswift_create` | 18,027.24 | ~~119,786.20~~ → **20,776.04** (2026-09-28) | ns/op | ~~6.64x slower~~ → **1.15x slower** | the key rotates each op, as Core's loop; the constant-time comb (`point_scalar_mul_gen_ct`, 9 µs) replaced the 52 µs ladder, and the encoder draws u and the branch from the hash per attempt as libsecp256k1 does |
 | `BIP324_ECDH` | `ellswift_ecdh` | 20,965.12 | ~~66,598.88~~ → **39,575.22** (2026-09-28) | ns/op | ~~3.18x slower~~ → **1.89x slower** | random encodings on both sides, as Core's bench; the constant-time w=4 window (`point_scalar_mul_win_ct`, 33 µs) replaced the ladder; the rest of the gap is that window against libsecp256k1's GLV `ecmult_const` |
 | `Bech32Encode` | `bech32_encode_(per_input_byte)` | 6.33 | 4.27 | ns/byte | **1.48x faster** |  |
@@ -1275,9 +1275,22 @@ Reading the table:
     down to ~4) — which also makes the encoding uniform over the valid
     (u, t), where the fixed branch order was not. What is left on the ECDH
     is the window against libsecp256k1's GLV-split `ecmult_const`.
-  - **ChaCha20, 1.5–1.65×; the AEAD packet, 1.5–2×.** `crypto_chacha20.c` is
-    plain C; Core's is a two-way SSE/AVX implementation. Per byte on the v2
-    transport.
+  - **ChaCha20, 1.5–1.65×; the AEAD packet, 1.5–2× — closed 2026-09-28,
+    ahead from four blocks up.** `crypto_chacha20.c` was plain C; Core's is
+    plain C++ too (no SIMD in `chacha20.cpp`) but better scheduled.
+    `chacha20_avx2.asm` now holds each block's four rows in the two lanes of
+    a ymm register (two blocks per register, a column round as one
+    lane-wise sequence, the diagonals by `vpshufd`), runs three such pairs
+    in flight and serves three to six blocks from one ~112 ns group; the C
+    block, unrolled and register-resident, keeps the single-block calls and
+    the tails (60 ns; one block is a dependent chain whichever way it is
+    written, and Core's 49 ns is the scalar floor). 1 MB: 1.15 → 0.30
+    ns/byte (Core 0.71); 256 B: 1.18 → 0.47 (Core 0.72); 64 B: 1.18 → 0.94
+    (Core 0.77). The same routine now expands MuHash elements
+    (`chacha20_keystream_k0` dispatches to it): insert 992 → 444 ns, 6×
+    ahead of Core's op. The AEAD packet follows: 1 MB 1.43 → 0.58 (ahead
+    1.7×), 256 B 2.19 → 1.39 (parity), 64 B 4.39 → 3.71 — a 64-byte packet
+    is three single ChaCha20 blocks and their latency is the row.
   - **Base58Check, 3.1×.** `base58check_encode` is the straightforward
     base conversion; Core's is too, but with a wider limb. Address display
     only.

@@ -183,7 +183,7 @@ DAEMONOBJS := serve_hdrctx.o sha256.o bitcoin_hash.o bitcoin_net.o bitcoin_p2p.o
     secp256k1_fe.o secp256k1_scalar.o secp256k1_scalar_c.o ripemd160.o \
     bitcoin_addr.o bitcoin_chainwork.o bitcoin_interp.o bitcoin_scriptcodec.o \
     bitcoin_script_flags.o sha1.o \
-    bitcoin_utxo_stats.o bitcoin_muhash.o bitcoin_strip_witness.o
+    bitcoin_utxo_stats.o bitcoin_muhash.o chacha20_avx2.o bitcoin_strip_witness.o
 # C sources of the tx-accept / script-verify path linked into the serve and
 # daemon harnesses.
 # ADDRBOOK (2026-08-28): the generic BIP155 address type, the version-2 book,
@@ -452,8 +452,8 @@ tests/bench_store_read: tests/bench_store_read.c bitcoin_store.o bitcoin_store_f
 # bench_ckeys -- throughput of the C crypto primitives that still have
 # no asm twin (chacha20, poly1305, AEAD, sha3-256), against the asm sha256
 # reference. Scoping input for any conversion decision (2026-09-04).
-tests/bench_ckeys: tests/bench_ckeys.c crypto_chacha20.c crypto_poly1305.c bitcoin_sha3.c sha256.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I. -o $@ tests/bench_ckeys.c crypto_chacha20.c crypto_poly1305.c bitcoin_sha3.c sha256.o
+tests/bench_ckeys: tests/bench_ckeys.c crypto_chacha20.c crypto_poly1305.c bitcoin_sha3.c sha256.o chacha20_avx2.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -I. -o $@ tests/bench_ckeys.c crypto_chacha20.c crypto_poly1305.c bitcoin_sha3.c sha256.o chacha20_avx2.o
 
 # bench_sc_inv -- sc_inv_var (ecdsa_verify's s^{-1}) per call, one core; the
 # libsecp256k1 counterpart is `bench_internal scalar` -> scalar_inverse_var.
@@ -601,7 +601,7 @@ REORGOBJS := bitcoin_store.o bitcoin_store_fast.o bitcoin_idx.o bitcoin_idxscan.
     bitcoin_sighash.o bitcoin_script.o bitcoin_pubkey.o secp256k1_ecdsa.o \
     secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o secp256k1_scalar.o \
     secp256k1_scalar_c.o secp256k1_schnorr.o secp256k1_taproot.o ripemd160.o \
-    bitcoin_addr.o sha1.o bitcoin_utxo_stats.o bitcoin_muhash.o \
+    bitcoin_addr.o sha1.o bitcoin_utxo_stats.o bitcoin_muhash.o chacha20_avx2.o \
     bitcoin_sigops.o
 # reorg_drill -- REAL-DATA reorg exercise (tools, not part of `make test`:
 # it needs a real datadir COPY, which CI does not have). Same sources as
@@ -916,7 +916,7 @@ tests/test_tx_verify_bytepool_realloc: $(BYTEPOOLSRCS) daemon/utxo_walk.h $(REOR
 # is not part of `make test`, so nothing caught it (fixed 2026-08-27).
 BUILDUTXOOBJS := sha256.o bitcoin_hash.o bitcoin_tx.o bitcoin_store.o \
     bitcoin_store_fast.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o \
-    bitcoin_utxo_stats.o bitcoin_muhash.o bitcoin_idxscan.o
+    bitcoin_utxo_stats.o bitcoin_muhash.o chacha20_avx2.o bitcoin_idxscan.o
 # txid -> (height, offset, len) index. Same two-pass external sort as
 # build_addr_index (the record set is far too large for one qsort), and the
 # same header-last durability discipline as wallet_scan.
@@ -1155,34 +1155,34 @@ tests/test_torcontrol: tests/test_torcontrol.c daemon/torcontrol.c daemon/torcon
 tests/test_asmap: tests/test_asmap.c daemon/asmap.c daemon/asmap.h daemon/netaddr.c bitcoin_sha3.c base32.c tests/data_asmap.raw
 	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_asmap.c daemon/asmap.c daemon/netaddr.c bitcoin_sha3.c base32.c
 
-tests/test_chacha20: tests/test_chacha20.c crypto_chacha20.c crypto_chacha20.h
-	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_chacha20.c crypto_chacha20.c
-tests/test_poly1305: tests/test_poly1305.c crypto_poly1305.c crypto_poly1305.h crypto_chacha20.c crypto_chacha20.h
-	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_poly1305.c crypto_poly1305.c crypto_chacha20.c
+tests/test_chacha20: tests/test_chacha20.c crypto_chacha20.c crypto_chacha20.h chacha20_avx2.o
+	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_chacha20.c crypto_chacha20.c chacha20_avx2.o
+tests/test_poly1305: tests/test_poly1305.c crypto_poly1305.c crypto_poly1305.h crypto_chacha20.c crypto_chacha20.h chacha20_avx2.o
+	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_poly1305.c crypto_poly1305.c crypto_chacha20.c chacha20_avx2.o
 tests/test_hkdf: tests/test_hkdf.c crypto_hkdf.c crypto_hkdf.h sha256.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_hkdf.c crypto_hkdf.c sha256.o
 tests/test_v2transport: tests/test_v2transport.c daemon/v2transport.c daemon/v2transport.h \
                      crypto_bip324_transport.c crypto_bip324.c crypto_bip324_fs.c \
                      crypto_chacha20.c crypto_poly1305.c crypto_hkdf.c crypto_ellswift_ecdh.c \
                      crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c \
-                     secp256k1_fe.o secp256k1_point_ct.o sha256.o bitcoin_net.o bitcoin_hash.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_v2transport.c daemon/wallet_pass.c daemon/v2transport.c crypto_bip324_transport.c crypto_bip324.c crypto_bip324_fs.c crypto_chacha20.c crypto_poly1305.c crypto_hkdf.c crypto_ellswift_ecdh.c crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c secp256k1_fe.o secp256k1_point_ct.o sha256.o bitcoin_net.o bitcoin_hash.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o
+                     secp256k1_fe.o secp256k1_point_ct.o sha256.o bitcoin_net.o bitcoin_hash.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o chacha20_avx2.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_v2transport.c daemon/wallet_pass.c daemon/v2transport.c crypto_bip324_transport.c crypto_bip324.c crypto_bip324_fs.c crypto_chacha20.c crypto_poly1305.c crypto_hkdf.c crypto_ellswift_ecdh.c crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c secp256k1_fe.o secp256k1_point_ct.o sha256.o bitcoin_net.o bitcoin_hash.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o chacha20_avx2.o
 tests/test_bip324_transport: tests/test_bip324_transport.c crypto_bip324_transport.c crypto_bip324_transport.h \
                      crypto_bip324.c crypto_bip324.h crypto_bip324_fs.c crypto_bip324_fs.h \
                      crypto_chacha20.c crypto_chacha20.h crypto_poly1305.c crypto_poly1305.h \
                      crypto_hkdf.c crypto_hkdf.h crypto_ellswift_ecdh.c crypto_ellswift.c \
                      crypto_ellswift_enc.c crypto_ellswift.h crypto_fe_sqrt.c crypto_fe_sqrt.h \
-                     secp256k1_fe.o secp256k1_point_ct.o sha256.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_bip324_transport.c crypto_bip324_transport.c crypto_bip324.c crypto_bip324_fs.c crypto_chacha20.c crypto_poly1305.c crypto_hkdf.c crypto_ellswift_ecdh.c crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c secp256k1_fe.o secp256k1_point_ct.o sha256.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o
+                     secp256k1_fe.o secp256k1_point_ct.o sha256.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o chacha20_avx2.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_bip324_transport.c crypto_bip324_transport.c crypto_bip324.c crypto_bip324_fs.c crypto_chacha20.c crypto_poly1305.c crypto_hkdf.c crypto_ellswift_ecdh.c crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c secp256k1_fe.o secp256k1_point_ct.o sha256.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o chacha20_avx2.o
 tests/test_bip324: tests/test_bip324.c tests/bip324_packet_vectors.h crypto_bip324.c crypto_bip324.h \
                      crypto_bip324_fs.c crypto_bip324_fs.h crypto_chacha20.c crypto_chacha20.h \
                      crypto_poly1305.c crypto_poly1305.h crypto_hkdf.c crypto_hkdf.h \
                      crypto_ellswift_ecdh.c crypto_ellswift.c crypto_ellswift_enc.c crypto_ellswift.h \
-                     crypto_fe_sqrt.c crypto_fe_sqrt.h secp256k1_fe.o secp256k1_point_ct.o sha256.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_bip324.c crypto_bip324.c crypto_bip324_fs.c crypto_chacha20.c crypto_poly1305.c crypto_hkdf.c crypto_ellswift_ecdh.c crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c secp256k1_fe.o secp256k1_point_ct.o sha256.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o
+                     crypto_fe_sqrt.c crypto_fe_sqrt.h secp256k1_fe.o secp256k1_point_ct.o sha256.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o chacha20_avx2.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_bip324.c crypto_bip324.c crypto_bip324_fs.c crypto_chacha20.c crypto_poly1305.c crypto_hkdf.c crypto_ellswift_ecdh.c crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c secp256k1_fe.o secp256k1_point_ct.o sha256.o secp256k1_point.o secp256k1_glv_c.o secp256k1_scalar.o chacha20_avx2.o
 tests/test_bip324_fs: tests/test_bip324_fs.c tests/bip324_fs_vectors.h crypto_bip324_fs.c crypto_bip324_fs.h \
-                     crypto_chacha20.c crypto_chacha20.h crypto_poly1305.c crypto_poly1305.h
-	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_bip324_fs.c crypto_bip324_fs.c crypto_chacha20.c crypto_poly1305.c
+                     crypto_chacha20.c crypto_chacha20.h crypto_poly1305.c crypto_poly1305.h chacha20_avx2.o
+	$(CC) $(WARNFLAGS) -O2 -o $@ tests/test_bip324_fs.c crypto_bip324_fs.c crypto_chacha20.c crypto_poly1305.c chacha20_avx2.o
 # test_fe_inv_var -- safegcd mod p (safegcd_var.inc) against the constant-time
 # fe_inv, and the shared macro's entry reduction on sc_inv_var.
 tests/test_fe_inv_var: tests/test_fe_inv_var.c secp256k1_fe.o secp256k1_scalar.o
@@ -2075,7 +2075,7 @@ tests/tool_archive_relayout: tests/tool_archive_relayout.c bitcoin_hash.o sha256
 # serialization that turn our LSM set into a figure comparable with
 # `gettxoutsetinfo`. bitcoin_muhash.o needs sha256.o (SHA256 both as the
 # ChaCha20 key derivation and as the final digest).
-UTXOSTATSOBJS := bitcoin_utxo_stats.o bitcoin_muhash.o sha256.o
+UTXOSTATSOBJS := bitcoin_utxo_stats.o bitcoin_muhash.o sha256.o chacha20_avx2.o
 
 # The vectors are GENERATED from Core's own muhash.cpp/chacha20.cpp and
 # committed, so `make test` needs no Core build tree; regenerate with
@@ -2695,7 +2695,7 @@ tests/bench_abi_audit: tests/bench_abi_audit.c tests/bench_abi_guard.S $(CONSOBJ
 CORE_MODULES_SRCS := daemon/num3072_inv.c bitcoin_segwit.c bitcoin_taproot_sighash.c daemon/cmpct_recv.c daemon/block_witness.c \
     crypto_bip324.c crypto_bip324_fs.c crypto_chacha20.c crypto_poly1305.c crypto_hkdf.c \
     crypto_ellswift_ecdh.c crypto_ellswift.c crypto_ellswift_enc.c crypto_fe_sqrt.c wallet_coinsel.c
-CORE_MODULES_OBJS := bip340_sign.o secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
+CORE_MODULES_OBJS := chacha20_avx2.o bip340_sign.o secp256k1_schnorr.o secp256k1_taproot.o bitcoin_script.o bitcoin_sighash.o \
     bitcoin_pubkey.o secp256k1_ecdsa.o secp256k1_point.o secp256k1_glv_c.o secp256k1_point_ct.o secp256k1_fe.o \
     secp256k1_scalar.o secp256k1_scalar_c.o sha256.o bitcoin_hash.o ripemd160.o bitcoin_addr.o bitcoin_interp.o \
     bitcoin_scriptcodec.o sha1.o bitcoin_cmpct.o bitcoin_tx.o bitcoin_mempool.o block_filter.o bitcoin_store.o \
@@ -2944,8 +2944,8 @@ tests/test_addr_hist: tests/test_addr_hist.c daemon/bmc_build_addr_hist daemon/b
 daemon/addr_hist.o: daemon/addr_hist.c daemon/addr_hist_fmt.h
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -c -o $@ daemon/addr_hist.c
 # the address history index builder (offline; see daemon/addr_hist_fmt.h)
-daemon/bmc_build_coinstats_hist: daemon/build_coinstats_hist.c daemon/coinstats_hist_fmt.h bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_utxo_stats.o bitcoin_muhash.o
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/build_coinstats_hist.c bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_utxo_stats.o bitcoin_muhash.o
+daemon/bmc_build_coinstats_hist: daemon/build_coinstats_hist.c daemon/coinstats_hist_fmt.h bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_utxo_stats.o bitcoin_muhash.o chacha20_avx2.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/build_coinstats_hist.c bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o bitcoin_utxo_stats.o bitcoin_muhash.o chacha20_avx2.o
 daemon/bmc_build_addr_hist: daemon/build_addr_hist.c daemon/addr_hist_fmt.h daemon/addr_index_fmt.h daemon/undo_log.o $(UTXOLSMOBJS) bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o
 	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ daemon/build_addr_hist.c daemon/undo_log.o $(UTXOLSMOBJS) bitcoin_store.o bitcoin_store_fast.o bitcoin_hash.o sha256.o bitcoin_tx.o
 rest.o: rest.c rest.h rpc_json.h rpc_commands.h
@@ -3408,20 +3408,20 @@ tests/test_bfilter_index: tests/test_bfilter_index.c daemon/bfilter_index.c bloc
 # test_coinstats_index -- the incremental coinstats index: Fermat-inverse
 # removal, event stream == independent full walk (digest + all counters),
 # persistence/adapter round-trip, exact net-zero of add-then-remove pairs.
-tests/test_coinstats_hist_build: tests/test_coinstats_hist_build.c daemon/coinstats_index.c daemon/num3072_inv.c daemon/coinstats_hist_fmt.h daemon/bmc_build_coinstats_hist bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_coinstats_hist_build.c daemon/coinstats_index.c daemon/num3072_inv.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o -lpthread
-tests/test_coinstats_hist: tests/test_coinstats_hist.c daemon/coinstats_index.c daemon/num3072_inv.c daemon/coinstats_hist_fmt.h daemon/muhash_p2.inc.h rpc_node.h bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_coinstats_hist.c daemon/coinstats_index.c daemon/num3072_inv.c bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o -lpthread
-tests/test_coinstats_index: tests/test_coinstats_index.c daemon/coinstats_index.c daemon/num3072_inv.c daemon/muhash_p2.inc.h rpc_node.h bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_coinstats_index.c daemon/coinstats_index.c daemon/num3072_inv.c bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o -lpthread
+tests/test_coinstats_hist_build: tests/test_coinstats_hist_build.c daemon/coinstats_index.c daemon/num3072_inv.c daemon/coinstats_hist_fmt.h daemon/bmc_build_coinstats_hist bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H) chacha20_avx2.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_coinstats_hist_build.c daemon/coinstats_index.c daemon/num3072_inv.c bitcoin_store.o bitcoin_store_fast.o bitcoin_tx.o bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o -lpthread chacha20_avx2.o
+tests/test_coinstats_hist: tests/test_coinstats_hist.c daemon/coinstats_index.c daemon/num3072_inv.c daemon/coinstats_hist_fmt.h daemon/muhash_p2.inc.h rpc_node.h bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H) chacha20_avx2.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_coinstats_hist.c daemon/coinstats_index.c daemon/num3072_inv.c bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o -lpthread chacha20_avx2.o
+tests/test_coinstats_index: tests/test_coinstats_index.c daemon/coinstats_index.c daemon/num3072_inv.c daemon/muhash_p2.inc.h rpc_node.h bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H) chacha20_avx2.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_coinstats_index.c daemon/coinstats_index.c daemon/num3072_inv.c bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o -lpthread chacha20_avx2.o
 
 # test_coinstats_fold_ring -- (2026-09-06, UTXO_INLINE_BUILD_PERF_SCOPE.md
 # lever 2): steady-state coin events go to a MAP_SHARED ring (rpc_node.h
 # csi_ring) and a FORKED fold worker folds them; the commit watermark gates
 # csi_rpc_run; lapping is counted and invalidates. Negative control = no
 # status block -> inline folding, same digest.
-tests/test_coinstats_fold_ring: tests/test_coinstats_fold_ring.c daemon/coinstats_index.c daemon/num3072_inv.c daemon/muhash_p2.inc.h rpc_node.h bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H)
-	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_coinstats_fold_ring.c daemon/coinstats_index.c daemon/num3072_inv.c bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o -lpthread
+tests/test_coinstats_fold_ring: tests/test_coinstats_fold_ring.c daemon/coinstats_index.c daemon/num3072_inv.c daemon/muhash_p2.inc.h rpc_node.h bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o $(TEST_TMPDIR_H) chacha20_avx2.o
+	$(CC) -no-pie -O2 $(HARDEN_CC) $(WARNFLAGS) -o $@ tests/test_coinstats_fold_ring.c daemon/coinstats_index.c daemon/num3072_inv.c bitcoin_muhash.o bitcoin_utxo_stats.o bitcoin_utxo_lsm.o utxo_lsm_mm.o bitcoin_utxo_store.o bitcoin_utxo.o bitcoin_hash.o sha256.o -lpthread chacha20_avx2.o
 
 # test_coinstats_bulk_seed -- (2026-09-06; rewritten 2026-09-10): the
 # coinstats index folds per block during BULK catch-up too, through the fold
