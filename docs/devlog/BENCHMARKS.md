@@ -1485,3 +1485,116 @@ Core's (different object). Raw block read: 13.3 µs against Core's 37.4.
   Core's 2-way SHA-NI interleave against our 1-way.
 - **`EllSwiftCreate`, 1.15×**: the comb is 9 µs against `ecmult_gen`'s ~8;
   the encoder's remaining cost is two real square roots per success.
+
+## Addendum 2026-09-28, second rerun — after the afternoon's batch (#334)
+
+The morning's rerun (02:30Z, above) left a list; the afternoon took it in
+order (#334: the GLV endomorphism for the ECDH, the comb at every k·G
+caller, the inlined ChaCha20 block, `sha256_full` in place with a
+multi-block SHA-NI run, the block filter builder split and rebuilt, the
+script rows in a sighash session — `worklog/2026-09-28.md`). This is the
+whole suite again on the result: same script, same shapes, same box.
+
+### Conditions
+
+| | |
+|---|---|
+| date | 2026-09-28T04:08:07Z, tiers 1, 2 and 2b in one run |
+| box | AMD Ryzen 9 9950X3D, governor `powersave`, Linux 7.0.0, pinned to cpu 25 |
+| load average at start | 3.38 / 4.21 / 4.94 — the production node (`deploy-20260928e`, restarted 30 s earlier) and the Core oracle running |
+| our git HEAD | `31c65846` (main: #319–#334) |
+| Bitcoin Core | v31.99.0-67efced1fc83, `bench_bitcoin` RelWithDebInfo, nanobench `-min-time=1000`, min over 3 processes |
+| Core worst cpu/wall | 1.000 / 0.999 / 0.986 (tiers 1, 2, 2b) |
+| raw output | `bench-results/20260928T040807Z/` (untracked) |
+
+### Tier 1
+
+| operation | Core / libsecp256k1 | this project | ratio | note |
+|---|---:|---:|---|---|
+| ECDSA verify (per signature) | 21.10 µs | 20.35 µs | **0.96× — 4% faster** | libsecp256k1's own bench for Core's side |
+| BIP340 verify (per signature) | 21.40 µs | 22.19 µs | 1.04× slower |  |
+| SHA-256, 1,000,000 B | 0.357 ns/B | 0.361 ns/B | **parity** (was 1.16× at 02:30, 1.25× on 09-27) | `sha256_full` in place, `sha256_blocks_shani` (#334) |
+| SHA-256, 32 B | 36.4 ns | 34.7 ns | **0.95× — faster** |  |
+| SHA-256d, 64 B × 1024 | 45.6 µs | 52.5 µs | 1.15× slower | a two-lane SHA-NI body was exact but no faster: the core already overlaps the two calls |
+| SHA-1, 1,000,000 B | 0.637 ns/B | 0.372 ns/B | **0.58× — 1.7× faster** | SHA-NI (#332) |
+| SHA-512, 1,000,000 B | 0.958 ns/B | 0.993 ns/B | 1.04× — parity band | unrolled (#332) |
+| RIPEMD-160, 1,000,000 B | 1.118 ns/B | 1.171 ns/B | 1.05× — parity |  |
+| Merkle root, 9,001 leaves | 45.1 ns/leaf | 52.9 ns/leaf | 1.17× slower |  |
+| CheckBlock, block 413,567 (1,557 tx) | 367 µs | 585 µs (`cons_verify`) | 1.59× slower, Core doing more (was 1.81×) | see `tests/bench_checkblock.c` |
+| DeserializeBlock, block 413,567 | 899 µs | 19.8 µs (tx walk) | not like-for-like | Core builds objects, we index bytes |
+
+### Tier 2
+
+`cons_verify` on block 413,567: 585 µs against Core's CheckBlock at 367 (Core
+does more; it was 669 at 02:30 — the in-place SHA-256 and the comb reach
+this path too). Raw block read 13.3 µs against Core's 36.2. The sighash rows
+are within noise of the morning.
+
+### Tier 2b
+
+| Core benchmark | this project | Core | ours | unit | ours/Core | note |
+|---|---|---:|---:|---|---:|---|
+| `VerifyScriptP2WPKH` | `p2wpkh_verify` | 20,139.40 | 22,678.91 | ns/op | **1.13x slower** | both sides hold the sighash midstates per transaction (a sighash session here, PrecomputedTransactionData there) |
+| `VerifyScriptP2TR_KeyPath` | `taproot_keypath_verify` | 20,431.67 | 22,231.35 | ns/op | **1.09x slower** | both sides hold the sighash midstates per transaction (a sighash session here, PrecomputedTransactionData there) |
+| `VerifyScriptP2TR_ScriptPath` | `taproot_verify_input(script)` | 35,982.18 | 49,287.83 | ns/op | **1.37x slower** | ours spends a 2-leaf tree (one more merkle step); Core a 1-leaf tree |
+| `BlockEncodingNoExtra` | `cmpct_recv_cmpctblock(50k_pool,_3k_ids)` | 1,232,357.74 | 1,269,601.00 | ns/op | parity | 50,000-tx pool, 3,000 short ids, none present, both sides |
+| `GCSFilterConstruct` | `bf_build_hashed_(100k_elements)` | 4,858,887.63 | 3,758,366.67 | ns/op | **1.29x faster** | 100,000 unique 32-byte elements handed to the builder on both sides (since 2026-09-28; the row had included our block parse) |
+| `GCSBlockFilterGetHash` | `bf_header_(100k-element_filter)` | 62,176.87 | 94,808.20 | ns/op | **1.52x slower** | the encoded 100,000-element filter hashed on both sides |
+| `ReadRawBlockBench` | `store_read_at_(block_413567)` | 36,545.27 | 13,311.00 | ns/op | **2.75x faster** | raw bytes on both sides |
+| `WriteBlockBench` | `store_append_(block_413567)` | 417,741.00 | 146,101.80 | ns/op | **2.86x faster** | the same block appended each op on both sides |
+| `MuHash` | `muhash_insert` | 2,646.97 | 449.82 | ns/op | **5.88x faster** | expand + one multiply here; Core's `*=` also multiplies its denominator (two) |
+| `MuHashMul` | `num3072_mul` | 1,150.93 | 291.73 | ns/multiply | **3.95x faster** | per 3072-bit multiply: Core's `*=` runs two (numerator and denominator), ours one |
+| `MuHashPrecompute` | `muhash_to_num3072` | 343.55 | 159.96 | ns/op | **2.15x faster** | SHA-256 + ChaCha20 expansion of one element, both sides |
+| `MuHashFinalize` | `num3072_inv_+_mul_+_finalize_+_divide` | 28,123.40 | 25,493.25 | ns/op | **1.10x faster** | inverse + multiply + hash, then the digest divided back in, as Core's loop; Core's divide carries a second multiply |
+| `CHACHA20_64BYTES` | `chacha20_crypt_64_B` | 0.78 | 0.83 | ns/byte | **1.07x slower** |  |
+| `CHACHA20_256BYTES` | `chacha20_crypt_256_B` | 0.72 | 0.47 | ns/byte | **1.52x faster** |  |
+| `CHACHA20_1MB` | `chacha20_crypt_1048576_B` | 0.71 | 0.30 | ns/byte | **2.36x faster** |  |
+| `POLY1305_64BYTES` | `poly1305_64_B` | 0.44 | 0.54 | ns/byte | **1.22x slower** |  |
+| `POLY1305_256BYTES` | `poly1305_256_B` | 0.31 | 0.33 | ns/byte | **1.09x slower** |  |
+| `POLY1305_1MB` | `poly1305_1048576_B` | 0.26 | 0.27 | ns/byte | parity |  |
+| `FSCHACHA20POLY1305_64BYTES` | `bip324_encrypt_64_B` | 2.26 | 3.65 | ns/byte | **1.62x slower** |  |
+| `FSCHACHA20POLY1305_256BYTES` | `bip324_encrypt_256_B` | 1.31 | 1.36 | ns/byte | parity |  |
+| `FSCHACHA20POLY1305_1MB` | `bip324_encrypt_1048576_B` | 0.97 | 0.58 | ns/byte | **1.68x faster** |  |
+| `EllSwiftCreate` | `ellswift_create` | 17,981.81 | 20,805.40 | ns/op | **1.16x slower** |  |
+| `BIP324_ECDH` | `ellswift_ecdh` | 20,965.58 | 30,861.16 | ns/op | **1.47x slower** |  |
+| `Bech32Encode` | `bech32_encode_(per_input_byte)` | 6.35 | 4.16 | ns/byte | **1.53x faster** |  |
+| `Bech32Decode` | `bech32_decode_+_verify_(per_char)` | 3.33 | 2.60 | ns/byte | **1.28x faster** | decode + checksum verification on both sides |
+| `Base58CheckEncode` | `base58check_encode_(per_byte)` | 47.23 | 6.00 | ns/byte | **7.88x faster** | no plain Base58Encode / Base58Decode on our side |
+
+### What changed since the morning rerun (02:30Z)
+
+| row | 02:30 | 04:08 | by |
+|---|---:|---:|---|
+| `BIP324_ECDH` | 1.84× slower | 1.47× slower | `point_scalar_mul_glv_ct` (33 → 24 µs for the multiply) |
+| `GCSFilterConstruct` | 4.37× slower | **1.29× faster** | `bf_build_hashed` (like-for-like row), hash-table dedup, radix sort, word bit-writer |
+| `GCSBlockFilterGetHash` | 1.92× slower | 1.52× slower | the in-place SHA-256 |
+| `SHA256` 1 MB (tier 1) | 1.16× slower | **parity** | `sha256_full` in place + `sha256_blocks_shani` |
+| `CHACHA20_64BYTES` | 1.19× slower | 1.07× slower | the block inlined, XOR in place |
+| `FSCHACHA20POLY1305_64BYTES` / `256BYTES` | 1.67× / 1.07× | 1.62× / parity | follows the single block |
+| `VerifyScriptP2WPKH` / `P2TR_KeyPath` | 1.12× / 1.08× | 1.13× / 1.09× | unchanged within noise: the session made no difference (the midstates were not the cost) |
+| `CheckBlock` (tier 1) | 1.81× | 1.59× | the same two |
+| `WriteBlockBench` | 2.15× faster | 2.86× faster | Core's number moved back (310 → 418 µs); ours did not |
+| everything else | | within 5% | |
+
+### Still behind, and why
+
+- **`BIP324_ECDH`, 1.47×** — 24 µs of the 31 is the GLV multiply, and its
+  cost is the complete formulas: 132 doubles at 84 ns and 94 adds at 117,
+  where the field multiply is 5.4 ns and the rest is the 19 additions each
+  formula needs. The next step is a Jacobian complete addition as
+  libsecp256k1's `gej_add_ge` (cheaper formulas with the exceptional cases
+  handled by cmov), not more table tricks: the AVX2 scan was worth 1 µs.
+- **`GCSBlockFilterGetHash`, 1.52×** — SHA-256d over a 263 KB filter: 0.36
+  ns/byte for the first hash is at parity now; the row's 95 µs includes the
+  header link and the copy.
+- **Script verification, 1.09–1.13×** — the compressed-pubkey square root
+  (`fe_pow_sqrt`, 2.0 µs: 253 dependent squarings at 7.5 ns each — the
+  chain's latency, not its throughput); the script-path row (1.37×) also
+  spends a 2-leaf tree against Core's 1-leaf.
+- **64-byte rows** (ChaCha20 1.07×, Poly1305 1.22×, the 64-byte packet
+  1.62×) — a single block is a dependent chain either way; ours is 53 ns,
+  Core's 49.
+- **SHA-256d64 1.15×, merkle root 1.17×** — Core's schedule ordering; a
+  two-lane SHA-NI body was exact and no faster than two calls.
+- **`EllSwiftCreate`, 1.16×** — the comb (9 µs) against `ecmult_gen` (~8),
+  and two real square roots per successful encode.
