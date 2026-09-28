@@ -174,9 +174,11 @@ ElligatorSwift ~~(6.6×)~~ 1.15× and its ECDH ~~(3.2×)~~ 1.9× since 2026-09-2
 (constant-time comb and window multiplies in place of the ladder, a Jacobi
 square test in the map), ~~ChaCha20 (1.6×)~~ ahead 1.5–2.4× from four blocks
 up since 2026-09-28 (`chacha20_avx2.asm`; the lone 64-byte block stays 1.2×
-behind), Base58Check (3.1×); ahead on the block archive (2.8–3×), MuHash
-insert (6× per op, the AVX2 keystream) and the 3072-bit multiply (3.8× per
-multiply), the AEAD packet from 256 bytes up, and Bech32.
+behind), ~~Base58Check (3.1×)~~ 7.9× ahead since 2026-09-28 (limb division),
+~~SHA-1 (2.5×)~~ 1.7× ahead (SHA-NI), ~~SHA-512 (1.7×)~~ within 4% (unrolled);
+ahead on the block archive (2.8–3×), MuHash insert (6× per op, the AVX2
+keystream) and the 3072-bit multiply (3.8× per multiply), the AEAD packet from
+256 bytes up, and Bech32.
 
 ## Why each difference exists
 

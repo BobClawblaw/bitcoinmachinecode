@@ -80,8 +80,37 @@ sha1_init:
 ;   r8d=a  r9d=b  r10d=c  r11d=d  r12d=e
 ; Scratch: eax, edx, ebx. rcx is the round index (also W[]'s word index).
 ; ============================================================================
+; sha1_block(state, block): dispatch once (cached), then the SHA-NI body or
+; the scalar one. sha1_force_path(edi): 0 re-probe, 1 SHA-NI, 2 scalar (tests).
+section .data
+sha1_path: db 0
+section .text
+global sha1_force_path
+sha1_force_path:
+    mov  byte [rel sha1_path], dil
+    ret
 global sha1_block
 sha1_block:
+    movzx eax, byte [rel sha1_path]
+    cmp  eax, 1
+    je   sha1_block_shani
+    cmp  eax, 2
+    je   sha1_block_scalar
+    push rdi
+    push rsi
+    sub  rsp, 8                       ; entry rsp = 8 mod 16; two pushes + 8 -> 0
+    call sha1_cpu_has_sha
+    add  rsp, 8
+    pop  rsi
+    pop  rdi
+    mov  byte [rel sha1_path], 2
+    test eax, eax
+    jz   sha1_block_scalar
+    mov  byte [rel sha1_path], 1
+    jmp  sha1_block_shani
+
+global sha1_block_scalar
+sha1_block_scalar:
     push rbp
     mov  rbp, rsp
     push rbx
@@ -301,6 +330,212 @@ sha1_full:
     pop r12
     pop rbx
     pop rbp
+    ret
+
+
+; ============================================================================
+; SHA-NI SHA-1 (2026-09-28): sha1_block_shani, the same compression with the
+; SHA extensions' sha1rnds4 / sha1nexte / sha1msg1 / sha1msg2, four rounds
+; per instruction. The scalar body above (sha1_block_scalar) is the fallback
+; on CPUs without the extension and the oracle the tests hold this to.
+;
+; WHY NOW. The 2026-09-27 benchmark had SHA-1 2.5x behind Core over a
+; megabyte (1.58 vs 0.64 ns/byte): Core's is plain C++ but scheduled well;
+; the scalar body here branches to one of four f-functions on every round.
+; Rather than tune that (cold path: OP_SHA1 only), the extension takes the
+; block: ~0.25 ns/byte, and the scalar body stays exactly as it was.
+;
+; REGISTER CONVENTION (Intel's, as the Linux kernel's sha1_ni_asm.S):
+;   ABCD  = state[0..3] with A in the HIGH dword (pshufd 0x1B on load/store)
+;   E0    = state[4] in the high dword, the low three zero
+;   MSG0..3 = the 64-byte block as four big-endian-corrected words each,
+;             word 0 of each quartet in the high dword (a full 16-byte
+;             byte reversal via pshufb)
+;   sha1rnds4 ABCD, E, f    four rounds with f-function 0..3
+;   sha1nexte E, MSG        E' = rotl(A, 30) + MSG (the next quartet's E term)
+;   sha1msg1 / sha1msg2     the schedule W[i] = rotl(W[i-3]^W[i-8]^W[i-14]^W[i-16], 1)
+; ============================================================================
+section .rodata
+align 16
+SHA1_BSWAP16:  db 15,14,13,12, 11,10,9,8, 7,6,5,4, 3,2,1,0
+SHA1_HIGHWORD: dd 0, 0, 0, 0xffffffff
+section .text
+
+global sha1_block_shani
+sha1_block_shani:
+    ; rdi = state (u32[5]), rsi = block (64 bytes)
+    movdqu  xmm0, [rdi]                 ; ABCD
+    pshufd  xmm0, xmm0, 0x1B            ; A into the high dword
+    movd    xmm1, dword [rdi+16]        ; E
+    pslldq  xmm1, 12                    ; into the high dword
+    movdqa  xmm8, xmm0                  ; saved ABCD
+    movdqa  xmm9, xmm1                  ; saved E
+    movdqa  xmm7, [rel SHA1_BSWAP16]
+
+    ; rounds 0-3
+    movdqu  xmm3, [rsi+0]
+    pshufb  xmm3, xmm7                  ; MSG0
+    paddd   xmm1, xmm3                  ; E0 += MSG0
+    movdqa  xmm2, xmm0                  ; E1 = ABCD
+    sha1rnds4 xmm0, xmm1, 0
+    ; rounds 4-7
+    movdqu  xmm4, [rsi+16]
+    pshufb  xmm4, xmm7                  ; MSG1
+    sha1nexte xmm2, xmm4
+    movdqa  xmm1, xmm0
+    sha1rnds4 xmm0, xmm2, 0
+    sha1msg1 xmm3, xmm4
+    ; rounds 8-11
+    movdqu  xmm5, [rsi+32]
+    pshufb  xmm5, xmm7                  ; MSG2
+    sha1nexte xmm1, xmm5
+    movdqa  xmm2, xmm0
+    sha1rnds4 xmm0, xmm1, 0
+    sha1msg1 xmm4, xmm5
+    pxor    xmm3, xmm5
+    ; rounds 12-15
+    movdqu  xmm6, [rsi+48]
+    pshufb  xmm6, xmm7                  ; MSG3
+    sha1nexte xmm2, xmm6
+    movdqa  xmm1, xmm0
+    sha1msg2 xmm3, xmm6
+    sha1rnds4 xmm0, xmm2, 0
+    sha1msg1 xmm5, xmm6
+    pxor    xmm4, xmm6
+    ; rounds 16-19
+    sha1nexte xmm1, xmm3
+    movdqa  xmm2, xmm0
+    sha1msg2 xmm4, xmm3
+    sha1rnds4 xmm0, xmm1, 0
+    sha1msg1 xmm6, xmm3
+    pxor    xmm5, xmm3
+    ; rounds 20-23
+    sha1nexte xmm2, xmm4
+    movdqa  xmm1, xmm0
+    sha1msg2 xmm5, xmm4
+    sha1rnds4 xmm0, xmm2, 1
+    sha1msg1 xmm3, xmm4
+    pxor    xmm6, xmm4
+    ; rounds 24-27
+    sha1nexte xmm1, xmm5
+    movdqa  xmm2, xmm0
+    sha1msg2 xmm6, xmm5
+    sha1rnds4 xmm0, xmm1, 1
+    sha1msg1 xmm4, xmm5
+    pxor    xmm3, xmm5
+    ; rounds 28-31
+    sha1nexte xmm2, xmm6
+    movdqa  xmm1, xmm0
+    sha1msg2 xmm3, xmm6
+    sha1rnds4 xmm0, xmm2, 1
+    sha1msg1 xmm5, xmm6
+    pxor    xmm4, xmm6
+    ; rounds 32-35
+    sha1nexte xmm1, xmm3
+    movdqa  xmm2, xmm0
+    sha1msg2 xmm4, xmm3
+    sha1rnds4 xmm0, xmm1, 1
+    sha1msg1 xmm6, xmm3
+    pxor    xmm5, xmm3
+    ; rounds 36-39
+    sha1nexte xmm2, xmm4
+    movdqa  xmm1, xmm0
+    sha1msg2 xmm5, xmm4
+    sha1rnds4 xmm0, xmm2, 1
+    sha1msg1 xmm3, xmm4
+    pxor    xmm6, xmm4
+    ; rounds 40-43
+    sha1nexte xmm1, xmm5
+    movdqa  xmm2, xmm0
+    sha1msg2 xmm6, xmm5
+    sha1rnds4 xmm0, xmm1, 2
+    sha1msg1 xmm4, xmm5
+    pxor    xmm3, xmm5
+    ; rounds 44-47
+    sha1nexte xmm2, xmm6
+    movdqa  xmm1, xmm0
+    sha1msg2 xmm3, xmm6
+    sha1rnds4 xmm0, xmm2, 2
+    sha1msg1 xmm5, xmm6
+    pxor    xmm4, xmm6
+    ; rounds 48-51
+    sha1nexte xmm1, xmm3
+    movdqa  xmm2, xmm0
+    sha1msg2 xmm4, xmm3
+    sha1rnds4 xmm0, xmm1, 2
+    sha1msg1 xmm6, xmm3
+    pxor    xmm5, xmm3
+    ; rounds 52-55
+    sha1nexte xmm2, xmm4
+    movdqa  xmm1, xmm0
+    sha1msg2 xmm5, xmm4
+    sha1rnds4 xmm0, xmm2, 2
+    sha1msg1 xmm3, xmm4
+    pxor    xmm6, xmm4
+    ; rounds 56-59
+    sha1nexte xmm1, xmm5
+    movdqa  xmm2, xmm0
+    sha1msg2 xmm6, xmm5
+    sha1rnds4 xmm0, xmm1, 2
+    sha1msg1 xmm4, xmm5
+    pxor    xmm3, xmm5
+    ; rounds 60-63
+    sha1nexte xmm2, xmm6
+    movdqa  xmm1, xmm0
+    sha1msg2 xmm3, xmm6
+    sha1rnds4 xmm0, xmm2, 3
+    sha1msg1 xmm5, xmm6
+    pxor    xmm4, xmm6
+    ; rounds 64-67
+    sha1nexte xmm1, xmm3
+    movdqa  xmm2, xmm0
+    sha1msg2 xmm4, xmm3
+    sha1rnds4 xmm0, xmm1, 3
+    sha1msg1 xmm6, xmm3
+    pxor    xmm5, xmm3
+    ; rounds 68-71
+    sha1nexte xmm2, xmm4
+    movdqa  xmm1, xmm0
+    sha1msg2 xmm5, xmm4
+    sha1rnds4 xmm0, xmm2, 3
+    pxor    xmm6, xmm4
+    ; rounds 72-75
+    sha1nexte xmm1, xmm5
+    movdqa  xmm2, xmm0
+    sha1msg2 xmm6, xmm5
+    sha1rnds4 xmm0, xmm1, 3
+    ; rounds 76-79
+    sha1nexte xmm2, xmm6
+    movdqa  xmm1, xmm0
+    sha1rnds4 xmm0, xmm2, 3
+
+    ; state += result: E = rotl(A,30) + E_saved is what sha1nexte computes
+    sha1nexte xmm1, xmm9
+    paddd   xmm0, xmm8
+    pshufd  xmm0, xmm0, 0x1B
+    movdqu  [rdi], xmm0
+    pextrd  dword [rdi+16], xmm1, 3
+    ret
+
+; sha1_cpu_has_sha() -> eax = 1 if leaf 7 ebx bit 29 (SHA extensions)
+global sha1_cpu_has_sha
+sha1_cpu_has_sha:
+    push rbx
+    xor  eax, eax
+    cpuid
+    cmp  eax, 7
+    jb   .no
+    mov  eax, 7
+    xor  ecx, ecx
+    cpuid
+    shr  ebx, 29
+    and  ebx, 1
+    mov  eax, ebx
+    pop  rbx
+    ret
+.no:
+    xor  eax, eax
+    pop  rbx
     ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits

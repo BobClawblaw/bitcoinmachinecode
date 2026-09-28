@@ -3,6 +3,7 @@
  * All buffers are static to avoid -O0 stack-frame layout interactions. */
 #include <stdio.h>
 #include <string.h>
+#include "base58_vectors.h"
 extern void hash160(unsigned char out[20], const void* in, long long len);
 extern void base58check_encode(char* out, const unsigned char* payload, long long paylen);
 static int failures=0;
@@ -40,6 +41,28 @@ int main(void){
     memcpy(WIKI,w,33);
     hash160(WIKIP+1,WIKI,33); WIKIP[0]=0x00;
     ck_addr("addr(wiki)",WIKIP,21,"1PRTTaJesdNovgne6Ehcdu1fpEdX7913CK",1);
+
+    /* ---- Base58Check against Python's big integers (2026-09-28): every
+     * payload length 0..78 with 0/1/2/5 leading zero bytes, all-zero and
+     * all-0xff payloads, and Core's 32-byte benchmark input. The encoder
+     * divides by 58^10 a limb at a time since this date; this is the
+     * independent oracle that holds it to the definition. */
+    {
+        int bad = 0;
+        for (unsigned i = 0; i < BASE58_NVEC; i++){
+            unsigned char p[96]; int n = 0;
+            for (const char* h = BASE58_VEC[i].payload_hex; h[0] && h[1]; h += 2){
+                int hi = (h[0] <= '9') ? h[0]-'0' : (h[0]|32)-'a'+10, lo = (h[1] <= '9') ? h[1]-'0' : (h[1]|32)-'a'+10;
+                p[n++] = (unsigned char)((hi << 4) | lo);
+            }
+            char out[128]; memset(out, 0x7e, sizeof out);
+            base58check_encode(out, p, n);
+            if (strcmp(out, BASE58_VEC[i].want)){ bad++; if (bad < 4) printf("  FAIL base58 vector %u (len %d): got %s want %s\n", i, n, out, BASE58_VEC[i].want); }
+        }
+        if (bad){ printf("base58check vs Python: %d of %u FAIL\n", bad, (unsigned)BASE58_NVEC); failures++; }
+        else printf("base58check vs Python: %u vectors PASS\n", (unsigned)BASE58_NVEC);
+    }
+
     printf(failures? "FAILURES %d\n" : "ALL TESTS PASSED (0 failures)\n", failures);
     return failures?1:0;
 }
