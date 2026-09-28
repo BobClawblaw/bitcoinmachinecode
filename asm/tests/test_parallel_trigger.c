@@ -64,6 +64,14 @@ int main(void){
     ok(!dl_claim_believed(1, 6001), "a leg whose sync pass is failing does not vote (its headers do not connect)");
     g_sync_fail_streak[1] = 0;
     ok( dl_claim_believed(1, 6001), "...and votes again once a pass succeeds");
+    printf("== the reorg probe's rejection memo (2026-09-28) ==\n");
+    ok(!probe_memo_active("108.233.254.177:8333", 7000), "a host never probed is due");
+    probe_memo_note("108.233.254.177:8333", 7000);
+    ok( probe_memo_active("108.233.254.177:8333", 7001), "a host whose probe rejected a candidate is not probed again");
+    ok( probe_memo_active("108.233.254.177:8333", 7000 + PROBE_REJECT_MEMO_S - 1), "...for PROBE_REJECT_MEMO_S");
+    ok(!probe_memo_active("108.233.254.177:8333", 7000 + PROBE_REJECT_MEMO_S), "...and is due again after it");
+    ok(!probe_memo_active("108.53.180.124:8333", 7001), "another host is due meanwhile");
+    ok(!dl_claim_memo_active("108.233.254.177:8333", 7001), "the probe memo and the claim memo are separate tables");
     printf("\n%s (%d failure%s)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", fails, fails==1?"":"s");
     return fails ? 1 : 0;
 }
