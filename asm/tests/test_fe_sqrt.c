@@ -113,6 +113,50 @@ int main(void){
       }
       ck("the vector set contains a non-residue to test with", found); }
 
+    /* ---- fe_is_square_var: the Jacobi symbol against the exponentiation ----
+     * Every vector, then the edges, then random values across the whole field
+     * (rejection-sampled below p) and random squares; the oracle is
+     * fe_is_square, which squares-and-compares and cannot be wrong about it. */
+    printf("== fe_is_square_var (Jacobi by safegcd) against fe_is_square ==\n");
+    {
+        long n = 0, bad = 0;
+        for (int i = 0; i < FE_SQRT_NVEC; i++){
+            unsigned long long a[4]; hex2fe(a, FE_SQRT_VEC[i].a);
+            n++; if (fe_is_square_var(a) != FE_SQRT_VEC[i].is_square){ bad++; printf("  FAIL jacobi %s\n", FE_SQRT_VEC[i].a); }
+        }
+        static const unsigned long long P[4] = { 0xFFFFFFFEFFFFFC2FULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL };
+        unsigned long long e[4];
+        /* expectations from Python's pow(a, (p-1)//2, p) (validation: the same
+         * Euler criterion the oracle uses, computed independently): -1 is a
+         * non-residue (p = 3 mod 4), 2 a residue (p = 7 mod 8), so -2 is not
+         * and -3 is (c0 = sqrt(-3) is the constant the whole map rests on) */
+        static const struct { unsigned long long lo; int sub_from_p; int want; } edges[] = {
+            {1,0,1},{2,0,1},{3,0,0},{4,0,1},{7,0,0},{1,1,0},{2,1,0},{3,1,1},{4,1,0},{0x1000003D1ULL,1,0}
+        };
+        for (unsigned k = 0; k < sizeof edges / sizeof edges[0]; k++){
+            if (edges[k].sub_from_p){ memcpy(e, P, 32); e[0] -= edges[k].lo; } else { memset(e, 0, 32); e[0] = edges[k].lo; }
+            int want = fe_is_square(e), got = fe_is_square_var(e);
+            n++; if (got != want || want != edges[k].want){ bad++; printf("  FAIL edge %u: got %d want %d (table %d)\n", k, got, want, edges[k].want); }
+        }
+        memset(e, 0, 32); e[3] = 1ULL << 63; n++; if (fe_is_square_var(e) != fe_is_square(e)){ bad++; printf("  FAIL 2^255\n"); }
+        memset(e, 0, 32); n++; if (fe_is_square_var(e) != 1){ bad++; printf("  FAIL 0 must count as a square\n"); }
+        unsigned long long rs = 0x5EEDF00DCAFEBABEULL;
+        #define RND() (rs ^= rs << 13, rs ^= rs >> 7, rs ^= rs << 17, rs)
+        long nsqv = 0;
+        for (int i = 0; i < 20000; i++){
+            unsigned long long a[4], r[4];
+            do { for (int k = 0; k < 4; k++) a[k] = RND(); }
+            while (a[3] == ~0ULL && a[2] == ~0ULL && a[1] == ~0ULL && a[0] >= P[0]);   /* below p */
+            int want = fe_is_square(a), got = fe_is_square_var(a);
+            n++; nsqv += want; if (got != want){ bad++; if (bad < 10) printf("  FAIL random %d: got %d want %d\n", i, got, want); }
+            fe_sqr(r, a);                                       /* a square, by construction */
+            n++; if (fe_is_square_var(r) != 1){ bad++; if (bad < 10) printf("  FAIL square %d\n", i); }
+        }
+        printf("  %ld checks, %ld residues among 20000 random values (expect ~10000)\n", n, nsqv);
+        ck("fe_is_square_var agrees with fe_is_square on every input", bad == 0);
+        ck("about half of random values are residues", nsqv > 9500 && nsqv < 10500);
+    }
+
     if (fails) printf("\nFAILURES: %d\n", fails);
     else printf("\nALL TESTS PASSED (0 failures)\n");
     return fails ? 1 : 0;

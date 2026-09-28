@@ -170,9 +170,11 @@ the 59 files classified — is in `docs/devlog/BENCHMARKS.md`, addendum
 2026-09-27. The largest gaps there: ~~`MuHashFinalize` (66×)~~ closed to
 parity on 2026-09-28 by the same safegcd inverse Core uses (the inverse is C
 on both sides and level; the row is 27.9 µs against Core's 28.0);
-ElligatorSwift (6.6×) and its ECDH (3.2×), ChaCha20 (1.6×), Base58Check
-(3.1×); ahead on the block archive (2.8–3×), MuHash insert (2.7× per op) and
-the 3072-bit multiply (3.8× per multiply) and Bech32.
+ElligatorSwift ~~(6.6×)~~ 1.15× and its ECDH ~~(3.2×)~~ 1.9× since 2026-09-28
+(constant-time comb and window multiplies in place of the ladder, a Jacobi
+square test in the map), ChaCha20 (1.6×), Base58Check (3.1×); ahead on the
+block archive (2.8–3×), MuHash insert (2.7× per op) and the 3072-bit multiply
+(3.8× per multiply) and Bech32.
 
 ## Why each difference exists
 

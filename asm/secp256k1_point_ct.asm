@@ -51,6 +51,10 @@
 ;   Cost: 256 doublings + 256 additions, ~4x the variable-time windowed
 ;   version. Signing is not a hot path; block validation, which is, keeps
 ;   using the fast variable-time routine.
+;   (2026-09-28: point_scalar_mul_gen_ct and point_scalar_mul_win_ct at the
+;   end of this file keep the same properties at 64 adds / 256 doubles + 64
+;   adds -- 9 us and 33 us against the ladder's 52 -- by scanning a table
+;   with cmov instead of indexing it; see their header.)
 ;
 ; ABI (System V AMD64), matching secp256k1_point.asm:
 ;   void point_scalar_mul_ct(u64 r[12], const u64 xy[8], const u64 k[4])
@@ -588,6 +592,334 @@ point_scalar_mul_ct:
     pop r12
     pop rbx
     pop rbp
+    ret
+
+
+; ============================================================================
+; TWO MORE CONSTANT-TIME MULTIPLIES (2026-09-28), for the BIP324 handshake.
+;
+;   The ladder above costs 256 complete doubles + 256 complete adds (52 us):
+;   it was written for signing, which is not a hot path. ElligatorSwift is
+;   not one either -- once per connection -- but it was 6.6x/3.2x behind
+;   libsecp256k1 (docs/devlog/BENCHMARKS.md, 2026-09-27), and the ladder was
+;   the whole gap. Both routines below keep every property listed in the
+;   header (fixed iteration counts, no secret-dependent branch, no
+;   secret-indexed load) and gain by shape, not by weakening anything:
+;
+;   point_scalar_mul_gen_ct(out[12], k[4])      out = k*G,   64 complete adds
+;   point_scalar_mul_win_ct(out[12], xy[8], k[4]) out = k*P, 256 doubles + 64 adds
+;
+;   HOW A TABLE IS READ WITHOUT LEAKING THE DIGIT. A precomputed table indexed
+;   by a secret digit leaks it through the cache line touched. Both routines
+;   instead read EVERY entry of the column, in order, and keep the wanted one
+;   with cmov: the digit only ever reaches a `cmp`, never an address, and the
+;   loads are the same for every scalar. (libsecp256k1's ecmult_gen /
+;   ecmult_const do the same scan.)
+;
+;   The fixed-base routine uses the w=4 comb table G_COMB_TABLE from
+;   secp256k1_point.asm (T[j][i] = i * 2^(4j) * G, affine, i = 1..15): the
+;   digit-0 case selects nothing and adds the identity (0:1:0), which the
+;   complete formula handles like any other input. That table is what
+;   point_scalar_mul_fixed indexes DIRECTLY with the digit -- fine for the
+;   public u1 of ecdsa_verify, and the reason that routine must never see a
+;   private key.
+;
+;   The variable-base routine builds its own 16-entry table (identity, P,
+;   2P .. 15P) with 14 complete adds, then walks the 64 nibbles of k from the
+;   top: 4 complete doubles, a full scan of the table, one complete add.
+;
+;   Both end in pointh_to_jac (below): the same homogeneous -> Jacobian
+;   conversion and branch-free infinity canonicalisation as the ladder's
+;   tail, as a function so it is written once.
+;
+;   Proof: tests/test_pointmul_ct_variants (against the ladder and the
+;   variable-time multiplies on random and edge scalars, random base points).
+; ============================================================================
+
+extern G_COMB_TABLE            ; secp256k1_point.asm, .rodata
+
+; ----------------------------------------------------------------------------
+; pointh_to_jac(out[12], R[12]) -- homogeneous (X:Y:Z) -> Jacobian
+;   (X*Z, Y*Z^2, Z); Z == 0 yields the canonical infinity (1,1,0), selected
+;   with cmov so the timing does not say whether k reduced to zero.
+;   Scratch T @ rbp-0x90 (96 B); sub rsp, 0x88 (== 8 mod 16).
+; ----------------------------------------------------------------------------
+pointh_to_jac:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x88
+    mov  r12, rdi                  ; out
+    mov  r13, rsi                  ; R
+
+    lea  rdi, [rbp-0x90]
+    lea  rsi, [r13+64]
+    call fe_sqr                    ; T[0..3]  = Z^2
+    lea  rdi, [rbp-0x90+32]
+    lea  rsi, [r13+32]
+    lea  rdx, [rbp-0x90]
+    call fe_mul                    ; T[4..7]  = Y*Z^2   (Jacobian Y)
+    lea  rdi, [rbp-0x90+64]
+    mov  rsi, r13
+    lea  rdx, [r13+64]
+    call fe_mul                    ; T[8..11] = X*Z     (Jacobian X)
+
+    ; r10/r11 loaded BEFORE the or-chain: xor writes flags.
+    mov  r10, 1
+    xor  r11d, r11d
+    mov  rax, [r13+64]
+    or   rax, [r13+72]
+    or   rax, [r13+80]
+    or   rax, [r13+88]             ; ZF = 1 <=> Z == 0
+    ; X
+    mov  r8, [rbp-0x90+64]
+    cmovz r8, r10
+    mov  [r12+0], r8
+    mov  r8, [rbp-0x90+72]
+    cmovz r8, r11
+    mov  [r12+8], r8
+    mov  r8, [rbp-0x90+80]
+    cmovz r8, r11
+    mov  [r12+16], r8
+    mov  r8, [rbp-0x90+88]
+    cmovz r8, r11
+    mov  [r12+24], r8
+    ; Y
+    mov  r8, [rbp-0x90+32]
+    cmovz r8, r10
+    mov  [r12+32], r8
+    mov  r8, [rbp-0x90+40]
+    cmovz r8, r11
+    mov  [r12+40], r8
+    mov  r8, [rbp-0x90+48]
+    cmovz r8, r11
+    mov  [r12+48], r8
+    mov  r8, [rbp-0x90+56]
+    cmovz r8, r11
+    mov  [r12+56], r8
+    ; Z (already 0 in the infinity case, copied verbatim)
+    mov  r8, [r13+64]
+    mov  [r12+64], r8
+    mov  r8, [r13+72]
+    mov  [r12+72], r8
+    mov  r8, [r13+80]
+    mov  [r12+80], r8
+    mov  r8, [r13+88]
+    mov  [r12+88], r8
+
+    add  rsp, 0x88
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; sets the 12 limbs at [base] to the identity (0 : 1 : 0); clobbers rax
+%macro POINTH_SET_IDENTITY 1
+    xor  eax, eax
+    mov  [%1+0],  rax
+    mov  [%1+8],  rax
+    mov  [%1+16], rax
+    mov  [%1+24], rax
+    mov  qword [%1+32], 1
+    mov  [%1+40], rax
+    mov  [%1+48], rax
+    mov  [%1+56], rax
+    mov  [%1+64], rax
+    mov  [%1+72], rax
+    mov  [%1+80], rax
+    mov  [%1+88], rax
+%endmacro
+
+; ebx = nibble j (in r14) of the scalar at [kbuf]: (k >> 4j) & 15.
+; The shift count depends on j only, never on k.
+%macro NIBBLE_OF_K 1
+    mov  rcx, r14
+    and  ecx, 15
+    shl  ecx, 2                    ; bit offset within the limb
+    mov  rax, r14
+    shr  rax, 4                    ; limb index
+    mov  rax, [%1 + rax*8]
+    shr  rax, cl
+    and  eax, 15
+    mov  ebx, eax
+%endmacro
+
+; ----------------------------------------------------------------------------
+; point_scalar_mul_gen_ct(out[12], k[4]) : out = k*G, CONSTANT TIME.
+;   R = identity; for j = 0..63: T = cmov-scan of column j for digit_j (the
+;   identity when the digit is 0); R = R + T (complete). 64 adds, no doubling.
+;   k is the 256-bit integer as given (k >= n wraps like the ladder does).
+;   Slots: R @ rbp-0xa0 (96), T @ rbp-0x100 (96), kbuf @ rbp-0x120 (32).
+;   sub rsp, 0xf8 (== 8 mod 16).
+; ----------------------------------------------------------------------------
+global point_scalar_mul_gen_ct
+point_scalar_mul_gen_ct:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0xf8
+    mov  r12, rdi                  ; out
+    mov  rax, [rsi+0]
+    mov  [rbp-0x120+0], rax
+    mov  rax, [rsi+8]
+    mov  [rbp-0x120+8], rax
+    mov  rax, [rsi+16]
+    mov  [rbp-0x120+16], rax
+    mov  rax, [rsi+24]
+    mov  [rbp-0x120+24], rax
+
+    POINTH_SET_IDENTITY rbp-0xa0
+    xor  r14d, r14d                ; j = 0
+.col:
+    NIBBLE_OF_K rbp-0x120          ; ebx = digit
+    POINTH_SET_IDENTITY rbp-0x100  ; T = identity: what digit 0 selects
+    imul r15, r14, 960             ; column j = 15 entries * 64 bytes
+    lea  r15, [G_COMB_TABLE + r15]
+    mov  r10, 1
+    mov  ecx, 1                    ; i = 1..15
+.scan:
+    cmp  ecx, ebx                  ; ZF = (i == digit); no flag writes below until add
+%assign off 0
+%rep 8
+    mov  r8, [r15 + off]
+    mov  r9, [rbp-0x100 + off]
+    cmovz r9, r8
+    mov  [rbp-0x100 + off], r9
+%assign off off+8
+%endrep
+    mov  r9, [rbp-0x100+64]
+    cmovz r9, r10                  ; Z = 1 for a selected affine entry
+    mov  [rbp-0x100+64], r9
+    add  r15, 64
+    inc  ecx
+    cmp  ecx, 16
+    jb   .scan                     ; counter only
+    lea  rdi, [rbp-0xa0]
+    lea  rsi, [rbp-0xa0]
+    lea  rdx, [rbp-0x100]
+    call pointh_add                ; R = R + T, always
+    inc  r14
+    cmp  r14, 64
+    jb   .col                      ; counter only
+
+    mov  rdi, r12
+    lea  rsi, [rbp-0xa0]
+    call pointh_to_jac
+    add  rsp, 0xf8
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
+; ----------------------------------------------------------------------------
+; point_scalar_mul_win_ct(out[12], xy[8], k[4]) : out = k*affine(xy), CONSTANT
+;   TIME, fixed window w=4 over the complete formulas.
+;   TB[0] = identity, TB[1] = (x:y:1), TB[i] = TB[i-1] + TB[1] (14 adds);
+;   R = identity; for j = 63 downto 0: R = 16R (4 doubles); T = cmov-scan of
+;   TB for digit_j; R = R + T. 256 doubles + 64 adds, all complete.
+;   Slots: R @ rbp-0xa0 (96), T @ rbp-0x100 (96), kbuf @ rbp-0x120 (32),
+;   TB @ rbp-0x720 (16 * 96 = 0x600). sub rsp, 0x6f8 (== 8 mod 16).
+; ----------------------------------------------------------------------------
+global point_scalar_mul_win_ct
+point_scalar_mul_win_ct:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0x6f8
+    mov  r12, rdi                  ; out
+    mov  r13, rsi                  ; affine xy
+    mov  rax, [rdx+0]
+    mov  [rbp-0x120+0], rax
+    mov  rax, [rdx+8]
+    mov  [rbp-0x120+8], rax
+    mov  rax, [rdx+16]
+    mov  [rbp-0x120+16], rax
+    mov  rax, [rdx+24]
+    mov  [rbp-0x120+24], rax
+
+    ; TB[0] = identity, TB[1] = (x : y : 1)
+    POINTH_SET_IDENTITY rbp-0x720
+    lea  rdi, [rbp-0x720+96]
+    mov  rsi, r13
+    mov  rcx, 8
+    rep movsq
+    mov  qword [rbp-0x720+96+64], 1
+    mov  qword [rbp-0x720+96+72], 0
+    mov  qword [rbp-0x720+96+80], 0
+    mov  qword [rbp-0x720+96+88], 0
+    ; TB[i] = TB[i-1] + TB[1], i = 2..15
+    mov  ebx, 2
+.tab:
+    imul rax, rbx, 96
+    lea  rdi, [rbp-0x720]
+    add  rdi, rax                  ; TB[i]
+    lea  rsi, [rdi-96]             ; TB[i-1]
+    lea  rdx, [rbp-0x720+96]       ; TB[1]
+    call pointh_add
+    inc  ebx
+    cmp  ebx, 16
+    jb   .tab                      ; counter only
+
+    POINTH_SET_IDENTITY rbp-0xa0
+    mov  r14, 63                   ; j = 63 downto 0
+.win:
+%rep 4
+    lea  rdi, [rbp-0xa0]
+    lea  rsi, [rbp-0xa0]
+    call pointh_double
+%endrep
+    NIBBLE_OF_K rbp-0x120          ; ebx = digit
+    lea  r15, [rbp-0x720]          ; TB[0]
+    xor  ecx, ecx                  ; i = 0..15: exactly one entry matches
+.scan:
+    cmp  ecx, ebx                  ; ZF = (i == digit)
+%assign off 0
+%rep 12
+    mov  r8, [r15 + off]
+    mov  r9, [rbp-0x100 + off]
+    cmovz r9, r8
+    mov  [rbp-0x100 + off], r9
+%assign off off+8
+%endrep
+    add  r15, 96
+    inc  ecx
+    cmp  ecx, 16
+    jb   .scan                     ; counter only
+    lea  rdi, [rbp-0xa0]
+    lea  rsi, [rbp-0xa0]
+    lea  rdx, [rbp-0x100]
+    call pointh_add                ; R = R + T, always
+    dec  r14
+    jns  .win                      ; counter only
+
+    mov  rdi, r12
+    lea  rsi, [rbp-0xa0]
+    call pointh_to_jac
+    add  rsp, 0x6f8
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
     ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits

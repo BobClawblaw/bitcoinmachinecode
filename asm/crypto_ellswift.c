@@ -30,6 +30,16 @@
  * evaluating X and Y explicitly, which is worth it there and not here: BIP324
  * decodes one key per connection, and the algebraic form above can be read
  * straight against the specification.
+ *
+ * TIMING. Every value the map touches -- u, t, x, and the candidates -- is
+ * public (it is on the wire, or is the public key), so the inversions are
+ * fe_inv_var (safegcd, 0.5 us) rather than the constant-time fe_inv (2 us),
+ * the square test is the Jacobi symbol (fe_is_square_var) rather than a root
+ * that is thrown away, and 1/2 is a constant. That is libsecp256k1's posture
+ * too (its whole ellswift module is _var). The secret-scalar multiply and the
+ * affine conversion of ITS result stay constant time in crypto_ellswift_ecdh.c.
+ * Measured 2026-09-28: decode 8.3 -> ~2.5 us, a failing branch of the inverse
+ * map 4.2 -> ~1.2 us, a succeeding one 10.6 -> ~4 us.
  */
 #include <string.h>
 #include "crypto_ellswift.h"
@@ -43,7 +53,7 @@ extern void fe_add(unsigned long long r[4], const unsigned long long a[4], const
 extern void fe_sub(unsigned long long r[4], const unsigned long long a[4], const unsigned long long b[4]);
 extern void fe_mul(unsigned long long r[4], const unsigned long long a[4], const unsigned long long b[4]);
 extern void fe_sqr(unsigned long long r[4], const unsigned long long a[4]);
-extern void fe_inv(unsigned long long r[4], const unsigned long long a[4]);
+extern void fe_inv_var(unsigned long long r[4], const unsigned long long a[4]);   /* safegcd; public inputs only */
 
 typedef unsigned long long fe4[4];
 
@@ -59,6 +69,12 @@ static const fe4 FE_C0 = {
     0x233770c2a797962cULL, 0x0a2d2ba93507f1dfULL
 };
 
+/* 1/2 mod p = (p+1)/2, checked in Python (2*INV2 mod p == 1) */
+static const fe4 FE_INV2 = {
+    0xffffffff7ffffe18ULL, 0xffffffffffffffffULL,
+    0xffffffffffffffffULL, 0x7fffffffffffffffULL
+};
+
 static void fe_set_u64(fe4 r, unsigned long long v){ r[0]=v; r[1]=r[2]=r[3]=0; }
 static void fe_neg(fe4 r, const fe4 a){ fe4 z; fe_set_u64(z,0); fe_sub(r, z, a); }
 static void fe_copy4(fe4 r, const fe4 a){ memcpy(r, a, 32); }
@@ -69,12 +85,12 @@ static int valid_x(const fe4 x){
     fe_sqr(t, x); fe_mul(t, t, x);
     fe_set_u64(seven, 7);
     fe_add(t, t, seven);
-    return fe_is_square(t);
+    return fe_is_square_var(t);
 }
 
 void ellswift_xswiftec(unsigned long long x[4],
                        const unsigned long long u_in[4], const unsigned long long t_in[4]){
-    fe4 u, t, s, g, seven, tmp, X, Y, Yinv, x1, x2, x3, inv2;
+    fe4 u, t, s, g, seven, tmp, X, Y, Yinv, x1, x2, x3;
 
     fe_copy4(u, u_in); fe_copy4(t, t_in);
     if (fe_is_zero(u)) fe_set_u64(u, 1);
@@ -91,13 +107,11 @@ void ellswift_xswiftec(unsigned long long x[4],
 
     /* X = (g - s) / (2t) */
     fe_sub(tmp, g, s);
-    { fe4 t2; fe_add(t2, t, t); fe_inv(t2, t2); fe_mul(X, tmp, t2); }
+    { fe4 t2; fe_add(t2, t, t); fe_inv_var(t2, t2); fe_mul(X, tmp, t2); }
 
     /* Y = (X + t) / (c0 * u) */
     fe_add(tmp, X, t);
-    { fe4 d; fe_mul(d, FE_C0, u); fe_inv(d, d); fe_mul(Y, tmp, d); }
-
-    fe_set_u64(inv2, 2); fe_inv(inv2, inv2);
+    { fe4 d; fe_mul(d, FE_C0, u); fe_inv_var(d, d); fe_mul(Y, tmp, d); }
 
     /* x3 = u + 4Y^2 */
     fe_sqr(tmp, Y);
@@ -106,13 +120,13 @@ void ellswift_xswiftec(unsigned long long x[4],
     if (valid_x(x3)){ fe_copy4(x, x3); return; }
 
     /* x2 = (-X/Y - u)/2 */
-    fe_inv(Yinv, Y);
+    fe_inv_var(Yinv, Y);
     fe_mul(tmp, X, Yinv);                            /* X/Y */
-    { fe4 n; fe_neg(n, tmp); fe_sub(n, n, u); fe_mul(x2, n, inv2); }
+    { fe4 n; fe_neg(n, tmp); fe_sub(n, n, u); fe_mul(x2, n, FE_INV2); }
     if (valid_x(x2)){ fe_copy4(x, x2); return; }
 
     /* x1 = (X/Y - u)/2 -- guaranteed valid at this point */
-    { fe4 n; fe_sub(n, tmp, u); fe_mul(x1, n, inv2); }
+    { fe4 n; fe_sub(n, tmp, u); fe_mul(x1, n, FE_INV2); }
     fe_copy4(x, x1);
 }
 
@@ -148,10 +162,9 @@ static const fe4 FE_C4 = {
 int ellswift_xswiftec_inv(unsigned long long t_out[4],
                           const unsigned long long x_in[4],
                           const unsigned long long u_in[4], int c){
-    fe4 x, u, g, v, s, m, r, w, tmp, tmp2, seven, inv2;
+    fe4 x, u, g, v, s, m, r, w, tmp, tmp2, seven;
     fe_copy4(x, x_in); fe_copy4(u, u_in);
     fe_set_u64(seven, 7);
-    fe_set_u64(inv2, 2); fe_inv(inv2, inv2);
 
     /* g = u^3 + 7 */
     fe_sqr(g, u); fe_mul(g, g, u); fe_add(g, g, seven);
@@ -167,15 +180,15 @@ int ellswift_xswiftec_inv(unsigned long long t_out[4],
         fe_sqr(tmp2, x);                      /* x^2 */
         fe_add(tmp, tmp, tmp2);
         if (fe_is_zero(tmp)) return 0;
-        fe_inv(tmp, tmp);
+        fe_inv_var(tmp, tmp);
         fe_neg(tmp2, g);
         fe_mul(s, tmp2, tmp);
-        if (!fe_is_square(s)) return 0;
+        if (!fe_is_square_var(s)) return 0;
         fe_copy4(v, x);
     } else {
         /* s = x - u */
         fe_sub(s, x, u);
-        if (!fe_is_square(s)) return 0;
+        if (!fe_is_square_var(s)) return 0;
         /* r = sqrt(-s * (4g + 3*u^2*s)) */
         fe_add(tmp, g, g); fe_add(tmp, tmp, tmp);        /* 4g */
         fe_sqr(tmp2, u); fe_mul(tmp2, tmp2, s);          /* u^2*s */
@@ -186,9 +199,9 @@ int ellswift_xswiftec_inv(unsigned long long t_out[4],
         if ((c & 1) && fe_is_zero(r)) return 0;
         if (fe_is_zero(s)) return 0;
         /* v = (r/s - u)/2 */
-        fe_inv(tmp, s); fe_mul(tmp, r, tmp);
+        fe_inv_var(tmp, s); fe_mul(tmp, r, tmp);
         fe_sub(tmp, tmp, u);
-        fe_mul(v, tmp, inv2);
+        fe_mul(v, tmp, FE_INV2);
     }
 
     if (!fe_sqrt(w, s)) return 0;
