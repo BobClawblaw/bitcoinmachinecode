@@ -162,6 +162,25 @@ uses safegcd mod p (0.7 µs) instead of the constant-time chain (2.1 µs).
 Before: ECDSA 21.9 µs, BIP340 25.9 µs. A full-verification sync
 (`assumevalid=0`) on the benchmark box took 8 h 0 m to the tip at nice 10.
 
+Module by module against Core's own `src/bench` suite — 31 Core benchmarks
+paired (script verification, compact-block reconstruction, GCS filters, the
+block archive, MuHash, ChaCha20/Poly1305 and the BIP324 AEAD, ElligatorSwift,
+Bech32/Base58, plus the hash, merkle and CheckBlock rows) and every one of
+the 59 files classified — is in `docs/devlog/BENCHMARKS.md`, addendum
+2026-09-27, and the complete rerun after the 2026-09-28 ports (addendum
+2026-09-28; forum report `docs/reports/2026-09-28-core-vs-bmc-modules.md`). The largest gaps there: ~~`MuHashFinalize` (66×)~~ closed to
+parity on 2026-09-28 by the same safegcd inverse Core uses (the inverse is C
+on both sides and level; the row is 27.9 µs against Core's 28.0);
+ElligatorSwift ~~(6.6×)~~ 1.15× and its ECDH ~~(3.2×)~~ 1.9× since 2026-09-28
+(constant-time comb and window multiplies in place of the ladder, a Jacobi
+square test in the map), ~~ChaCha20 (1.6×)~~ ahead 1.5–2.4× from four blocks
+up since 2026-09-28 (`chacha20_avx2.asm`; the lone 64-byte block stays 1.2×
+behind), ~~Base58Check (3.1×)~~ 7.9× ahead since 2026-09-28 (limb division),
+~~SHA-1 (2.5×)~~ 1.7× ahead (SHA-NI), ~~SHA-512 (1.7×)~~ within 4% (unrolled);
+ahead on the block archive (2.8–3×), MuHash insert (6× per op, the AVX2
+keystream) and the 3072-bit multiply (3.8× per multiply), the AEAD packet from
+256 bytes up, and Bech32.
+
 ## Why each difference exists
 
 **txindex, 2.6× smaller than Core's.** It is a set of sorted runs with a sparse

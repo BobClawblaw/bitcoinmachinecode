@@ -151,55 +151,34 @@ base58check_encode:
     push r14
     push r15
     sub  rsp, 0x200
-
-    ; ---- refuse a payload that would not fit `data` (see frame note) ----
-    ; Unsigned compare, so a negative paylen is caught here too.
     cmp  rdx, 78
     jbe  .len_ok
     mov  byte [rdi], 0
-    add  rsp, 0x200
-    pop  r15
-    pop  r14
-    pop  r13
-    pop  r12
-    pop  rbx
-    pop  rbp
-    ret
+    jmp  .epilogue
 .len_ok:
-
     mov  r13, rdi            ; out
-    ; persistent regs: out(rbx), payload(r14), paylen(r15) -- all callee-saved
-    mov  rbx, rdi            ; out
     mov  r14, rsi            ; payload
     mov  r15, rdx            ; paylen
-
-    ; ---- build data[] at [rbp-0x90]: payload then checksum ----
-    lea  rdi, [rbp-0x90]     ; data dst
-    mov  rsi, r14
+    ; ---- data = payload || sha256d(payload)[0..3], at [rbp-0x90] ----
+    lea  rdi, [rbp-0x90]
     xor  r11, r11
 .cp1:
     cmp  r11, r15
     jae  .cp1_done
-    mov  al, [rsi + r11]
+    mov  al, [r14 + r11]
     mov  [rdi + r11], al
     inc  r11
     jmp  .cp1
 .cp1_done:
-    ; checksum = sha256d(out=[rbp-0xb0], in=payload(r14), len(r15))
-    lea  rdi, [rbp-0xb0]
+    lea  rdi, [rbp-0xb0]     ; checksum
     mov  rsi, r14
     mov  rdx, r15
     call sha256d
-    ; append first 4 checksum bytes at data+paylen
-    lea  rsi, [rbp-0xb0]
+    mov  eax, [rbp-0xb0]
     lea  rdi, [rbp-0x90]
-    add  rdi, r15
-    mov  rax, [rsi]
-    mov  [rdi], eax
-    ; total length = paylen + 4
-    add  r15, 4
-
-    ; ---- count leading zero bytes of data ----
+    mov  [rdi + r15], eax
+    add  r15, 4              ; n = data length (5..82)
+    ; ---- leading zero bytes -> that many '1' characters ----
     xor  r10, r10
     lea  rsi, [rbp-0x90]
 .czl:
@@ -210,92 +189,131 @@ base58check_encode:
     inc  r10
     jmp  .czl
 .czl_done:
-    ; emit r10 leading '1's
-    mov  rdi, rbx
-    xor  r12, r12             ; output cursor
-    xor  r11, r11
-.ez:
-    cmp  r11, r10
-    jae  .ez_done
-    mov  byte [rdi + r12], '1'
+    xor  r12, r12            ; out cursor
+.ones:
+    cmp  r12, r10
+    jae  .ones_done
+    mov  byte [r13 + r12], '1'
     inc  r12
-    inc  r11
-    jmp  .ez
-.ez_done:
-    ; ---- copy data to work [rbp-0x110], then repeatedly divide by 58 ----
+    jmp  .ones
+.ones_done:
+    ; ---- the number as big-endian 64-bit limbs at [rbp-0x110] (2026-09-28) ----
+    ;   nl = ceil(n / 8) limbs; the data bytes are placed right-aligned in a
+    ;   zeroed nl*8-byte buffer and each limb is loaded with bswap. The old
+    ;   loop divided the number BYTE by byte, one `div` per byte per digit
+    ;   (~4.8 us for a 32-byte payload, 3.1x behind Core); this divides it
+    ;   LIMB by limb by 58^10 (the largest power of 58 below 2^64), ten
+    ;   digits per pass, and splits each remainder with ten more `div`s:
+    ;   ~25 + 44 divisions for the 44 digits of a 32-byte payload instead
+    ;   of ~1,600.
+    lea  rbx, [r15 + 7]
+    shr  rbx, 3              ; nl
     lea  rdi, [rbp-0x110]
+    xor  eax, eax
+    mov  rcx, 11
+.zl:
+    mov  [rdi + rcx*8 - 8], rax
+    dec  rcx
+    jnz  .zl
+    mov  rax, rbx
+    shl  rax, 3
+    sub  rax, r15            ; pad = nl*8 - n (0..7)
+    lea  rdi, [rbp-0x110]
+    add  rdi, rax            ; data goes at buffer + pad
     lea  rsi, [rbp-0x90]
-    mov  rcx, r15
-    xor  r8, r8
-.bcopy:
-    cmp  r8, rcx
-    jae  .bcopy_done
-    mov  al, [rsi + r8]
-    mov  [rdi + r8], al
-    inc  r8
-    jmp  .bcopy
-.bcopy_done:
-    mov  r9, r15              ; length of work number
-    xor  r14, r14             ; ndigits (in r14; r14's payload value no longer needed)
-.divloop:
-    ; is work [[rbp-0x110]..+r9) all zero?
-    lea  rsi, [rbp-0x110]
     xor  r11, r11
-    xor  rcx, rcx
-.iszero:
-    cmp  r11, r9
-    jae  .iszero_done
-    cmp  byte [rsi + r11], 0
-    je   .iszero_next
-    mov  rcx, 1
-.iszero_next:
+.cp2:
+    cmp  r11, r15
+    jae  .cp2_done
+    mov  al, [rsi + r11]
+    mov  [rdi + r11], al
     inc  r11
-    jmp  .iszero
-.iszero_done:
-    test rcx, rcx
-    jz   .divide_done
-    ; one division pass: divide work by 58 (MSB->LSB), quotient back to work,
-    ; final remainder is the base58 digit for this pass.
-    xor  eax, eax             ; rem
-    xor  r11, r11             ; index
-    lea  rsi, [rbp-0x110]
-.dv:
-    cmp  r11, r9
-    jae  .dv_done
-    movzx edx, byte [rsi + r11]   ; b
-    imul eax, eax, 256
-    add  eax, edx
-    mov  ecx, 58
+    jmp  .cp2
+.cp2_done:
+    lea  rdi, [rbp-0x110]
+    xor  r11, r11
+.bs:
+    cmp  r11, rbx
+    jae  .bs_done
+    mov  rax, [rdi + r11*8]
+    bswap rax
+    mov  [rdi + r11*8], rax
+    inc  r11
+    jmp  .bs
+.bs_done:
+    ; ---- digits, least significant first, into digitRev at [rbp-0x1b0] ----
+    xor  r14, r14            ; ndigits
+    mov  r8, 430804206899405824   ; 58^10
+    mov  r9, 58
+    xor  r11, r11            ; top = first limb that may be non-zero
+.skip0:
+    cmp  r11, rbx
+    jae  .digits_done        ; the number is zero: base58 of it is empty
+    cmp  qword [rdi + r11*8], 0
+    jne  .pass
+    inc  r11
+    jmp  .skip0
+.pass:
+    ; limbs[top..nl) /= 58^10, remainder in rdx
     xor  edx, edx
-    div  ecx
-    mov  [rsi + r11], al
-    mov  eax, edx
+    mov  rcx, r11
+.dl:
+    mov  rax, [rdi + rcx*8]
+    div  r8
+    mov  [rdi + rcx*8], rax
+    inc  rcx
+    cmp  rcx, rbx
+    jb   .dl
+    mov  rsi, rdx            ; r = the remainder, < 58^10
+    ; drop leading zero limbs of the quotient
+.skipq:
+    cmp  r11, rbx
+    jae  .last_chunk
+    cmp  qword [rdi + r11*8], 0
+    jne  .full_chunk
     inc  r11
-    jmp  .dv
-.dv_done:
-    ; eax = remainder = least-significant base58 digit now
-    lea  r8, [ALPHABET]
-    movzx ecx, byte [r8 + rax]      ; base58 char
-    lea  r8, [rbp-0x1b0]             ; digitRev buffer (accumulate LSB-first)
-    mov  [r8 + r14], cl
-    inc  r14                        ; ndigits++
-    jmp  .divloop
-.divide_done:
-    ; reverse-copy ndigits(r14) chars from [rbp-0x1b0] into out after the '1's
-    mov  rdi, rbx
-    add  rdi, r12                   ; past the leading '1's
-    lea  rsi, [rbp-0x1b0]
-    mov  r8, r14                    ; count
-.rv:
-    test r8, r8
-    jz   .rv_done
-    dec  r8
-    mov  al, [rsi + r8]
-    mov  [rdi], al
-    inc  rdi
-    jmp  .rv
-.rv_done:
-    mov  byte [rdi], 0
+    jmp  .skipq
+.full_chunk:
+    ; quotient non-zero: exactly ten digits of r (zeros included)
+    mov  ecx, 10
+.fd:
+    mov  rax, rsi
+    xor  edx, edx
+    div  r9
+    mov  rsi, rax
+    lea  rax, [ALPHABET]
+    movzx edx, byte [rax + rdx]
+    mov  [rbp-0x1b0 + r14], dl
+    inc  r14
+    dec  ecx
+    jnz  .fd
+    jmp  .pass
+.last_chunk:
+    ; quotient zero: the digits of r until it is exhausted (no leading zeros)
+    test rsi, rsi
+    jz   .digits_done
+    mov  rax, rsi
+    xor  edx, edx
+    div  r9
+    mov  rsi, rax
+    lea  rax, [ALPHABET]
+    movzx edx, byte [rax + rdx]
+    mov  [rbp-0x1b0 + r14], dl
+    inc  r14
+    jmp  .last_chunk
+.digits_done:
+    ; ---- reverse into out after the '1's, NUL-terminate ----
+.rev:
+    test r14, r14
+    jz   .rev_done
+    dec  r14
+    mov  al, [rbp-0x1b0 + r14]
+    mov  [r13 + r12], al
+    inc  r12
+    jmp  .rev
+.rev_done:
+    mov  byte [r13 + r12], 0
+.epilogue:
     add  rsp, 0x200
     pop  r15
     pop  r14

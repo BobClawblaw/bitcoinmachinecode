@@ -76,7 +76,6 @@ extern void utxo_stats_add(void* st, const u8 key36[36], unsigned long value,
                            unsigned long code, const u8* script, unsigned long slen);
 extern void sha256_full(unsigned char out[32], const void* data, unsigned long len);
 
-#include "muhash_p2.inc.h"
 
 /* ---- the fold worker (2026-09-06, UTXO_INLINE_BUILD_PERF_SCOPE.md lever 2)
  *
@@ -518,18 +517,17 @@ u64 csi_test_fold_count(void){ return g_csi_folds; }
 
 static u64 st_get(const u8* st, int off){ u64 v; memcpy(&v, st+off, 8); return v; }
 
-/* den^(p-2) mod p by square-and-multiply, using the asm's own modmul.
- * MSB-first over the little-endian exponent bytes. ~3072 squarings + ~3070
- * multiplies (the exponent is nearly all ones); tens of ms. */
+/* den^{-1} mod p by safegcd (daemon/num3072_inv.c, Core's Num3072::GetInverse
+ * step for step): ~30 us. Until 2026-09-28 this was den^(p-2) by
+ * square-and-multiply over MUHASH_P_MINUS_2 -- 3,072 squarings and 3,070
+ * multiplies, 1.8 ms, 66x Core's finalize -- paid on every gettxoutsetinfo
+ * call and parity check. A denominator is never 0 mod p (it starts at 1 and
+ * only ever multiplies in non-zero elements), so the 0 return is unreachable;
+ * it leaves out untouched, and the digest computed from it would be wrong
+ * rather than a crash. */
+extern int num3072_inv_var(u8 out[384], const u8 in[384]);
 static void num3072_inv(u8 out[384], const u8 in[384]){
-    num3072_set_one(out);
-    for (int byte = 383; byte >= 0; byte--){
-        for (int bit = 7; bit >= 0; bit--){
-            num3072_mul(out, out);
-            if ((MUHASH_P_MINUS_2[byte] >> bit) & 1)
-                num3072_mul(out, in);
-        }
-    }
+    if (!num3072_inv_var(out, in)) memset(out, 0, 384);   /* unreachable: den != 0 */
 }
 
 static int csi_worker_dead(void);

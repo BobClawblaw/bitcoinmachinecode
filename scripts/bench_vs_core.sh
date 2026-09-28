@@ -184,6 +184,7 @@ ours(){ "${PIN[@]}" "$@" 2>&1; }
 if [ "$LIST_ONLY" = 1 ]; then
     say "tier 1  ecdsa_verify, schnorrsig_verify, SHA256(1MB/32B), SHA256d64, SHA1, SHA512, RIPEMD160, MerkleRoot"
     say "tier 2  CheckBlock, block deserialize/walk, BIP143 + BIP341 sighash, UTXO lookup, block read"
+    say "tier 2b VerifyScript, BlockEncoding, GCS filter, block read/write, MuHash, ChaCha20/Poly1305/AEAD, EllSwift/ECDH, Bech32/Base58"
     say "tier 3  full-verification replay over a bounded height range -- see BENCHMARKS.md for the protocol"
     exit 0
 fi
@@ -277,6 +278,29 @@ say
 say
 say "-- UTXO lookup (NOT comparable to Core's CCoinsCaching -- different object, see BENCHMARKS.md) --"
 ( cd "$ASM_DIR" && ours ./tests/bench_lsm_get 200000 ) | tee "$OUT/our_lsm_get.txt"
+fi
+
+# ==========================================================================
+if has_tier 2; then
+say
+say "############ TIER 2b -- the other modules Core benchmarks (2026-09-27) ############"
+say
+say "One harness, tests/bench_core_modules, a section per Core benchmark the"
+say "tiers above did not pair: VerifyScript (P2WPKH, P2TR key/script path),"
+say "BlockEncoding, GCS filter construct/hash, block read/write, MuHash,"
+say "ChaCha20, Poly1305, the BIP324 AEAD, ElligatorSwift/ECDH, Bech32, Base58."
+say "Each section mirrors the Core benchmark's shape; the table's note column"
+say "names every difference. scripts/bench_modules_table.py joins the two sides."
+say
+say "-- Core --"
+core_bench 'VerifyScript.*|BlockEncodingNoExtra|GCSFilterConstruct|GCSBlockFilterGetHash|ReadRawBlockBench|WriteBlockBench|MuHash|MuHashMul|MuHashPrecompute|MuHashFinalize|CHACHA20_.*|POLY1305_.*|FSCHACHA20POLY1305_.*|EllSwiftCreate|BIP324_ECDH|Bech32.*|Base58.*' modules | sed 's/^/   /'
+say "   Core worst cpu/wall over $REPS processes: $(cat "$OUT/core-modules.ratio")"
+say "-- this project --"
+( cd "$ASM_DIR" && ours ./tests/bench_core_modules "$BLOCK_RAW" "$ROUNDS" ) | tee "$OUT/our_modules.txt" | grep -v '^RESULT' | sed 's/^/   /'
+say
+say "-- side by side (min of reps, same unit per row) --"
+python3 "$REPO_ROOT/scripts/bench_modules_table.py" "$OUT"/core-modules.*.csv "$OUT/our_modules.txt" | tee "$OUT/modules_table.txt" | sed 's/^/   /'
+python3 "$REPO_ROOT/scripts/bench_modules_table.py" --md "$OUT"/core-modules.*.csv "$OUT/our_modules.txt" > "$OUT/modules_table.md"
 fi
 
 # ==========================================================================

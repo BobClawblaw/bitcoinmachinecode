@@ -8,6 +8,9 @@
  * libsecp256k1 -- negate explicitly if you need a particular parity. */
 int fe_sqrt(unsigned long long r[4], const unsigned long long a[4]);
 int fe_is_square(const unsigned long long a[4]);
+/* the same predicate by the Jacobi symbol (safegcd, ~0.5 us instead of a
+ * 2 us exponentiation); VARIABLE TIME, for public inputs only */
+int fe_is_square_var(const unsigned long long a[4]);
 int fe_is_zero(const unsigned long long a[4]);
 int fe_equal(const unsigned long long a[4], const unsigned long long b[4]);
 #endif

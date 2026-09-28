@@ -1,0 +1,78 @@
+[size=16pt][b]Bitcoin Machine Code vs Bitcoin Core, module by module: 31 of Core's own benchmarks, side by side[/b][/size]
+
+2026-09-27. Bitcoin Machine Code (an all-assembly x86-64 node, [url]https://github.com/BobClawblaw/bitcoinmachinecode[/url]) measured against Bitcoin Core's own benchmark suite ([tt]src/bench[/tt], v31.99.0-67efced1fc83), on the same box, the same core, the same inputs.
+
+[b]Correction 2026-09-28.[/b] The [tt]MuHashMul[/tt] row compares one of our multiplies with Core's [tt]acc *= x[/tt], which runs two (numerator and denominator): per multiply the figure is 1.15 us vs 0.30 us, [b]3.8x faster[/b], not 7.7x. The [tt]MuHash[/tt] insert row has the same shape difference (Core's op is expand + two multiplies, ours expand + one). [tt]MuHashFinalize[/tt] was closed to [b]parity[/b] the same day (27.9 us vs 28.0 us) by porting Core's own safegcd inverse; the current table is in [tt]docs/devlog/BENCHMARKS.md[/tt], addendum 2026-09-27.
+
+[b]How it was measured.[/b] Core's numbers come from Core's [tt]bench_bitcoin[/tt] (nanobench, [tt]-min-time=1000[/tt], the minimum over 3 processes), built RelWithDebInfo as Core's own default; the secp256k1 rows from libsecp256k1's own [tt]bench[/tt], Core's vendored copy with Core's shipped config. Our numbers come from harnesses that mirror the shape of each Core benchmark -- the same work per iteration, the same buffer sizes, the same element counts -- as thread CPU time, the minimum of 15 rounds. Both sides pinned to one core ([tt]taskset -c 25[/tt]) of an AMD Ryzen 9 9950X3D. The production node and a Core oracle were running on the box at the time (load average 3.95 on 32 threads); Core's timed loops showed no preemption (cpu/wall 1.000 in every group). Where the two sides do not do the same work, the row says so.
+
+[size=12pt][b]Where this node is ahead[/b][/size]
+
+[table]
+[tr][td][b]module[/b][/td][td][b]Core[/b][/td][td][b]bmc[/b][/td][td][b]ratio[/b][/td][td][b]note[/b][/td][/tr]
+[tr][td]MuHash 3072-bit modular multiply ([tt]MuHashMul[/tt])[/td][td]2.30 us[/td][td]0.30 us[/td][td][b]7.7x faster[/b][/td][td]AVX-512 IFMA / ADX paths in [tt]bitcoin_muhash.asm[/tt][/td][/tr]
+[tr][td]block archive: append a 1 MB block ([tt]WriteBlockBench[/tt])[/td][td]422 us[/td][td]143 us[/td][td][b]3.0x faster[/b][/td][td]block 413,567, the same block appended each op on both sides[/td][/tr]
+[tr][td]block archive: raw read of that block ([tt]ReadRawBlockBench[/tt])[/td][td]36.2 us[/td][td]13.1 us[/td][td][b]2.8x faster[/b][/td][td]raw bytes on both sides[/td][/tr]
+[tr][td]MuHash insert of one coin ([tt]MuHash[/tt])[/td][td]2.65 us[/td][td]0.94 us[/td][td][b]2.8x faster[/b][/td][td]SHA-256 + ChaCha20 expansion + one multiply[/td][/tr]
+[tr][td]Bech32 encode / decode+verify[/td][td]6.3 / 3.3 ns/byte[/td][td]4.3 / 2.8 ns/byte[/td][td][b]1.5x / 1.2x faster[/b][/td][td]Core's decode bench never checks its result; ours decodes a valid address and verifies[/td][/tr]
+[tr][td]ECDSA verify ([tt]ecdsa_verify[/tt])[/td][td]20.80 us[/td][td]20.02 us[/td][td][b]4% faster[/b][/td][td]was 1.12x slower a month ago (safegcd scalar inverse, 2026-09-27)[/td][/tr]
+[tr][td]SHA-256, 32 bytes[/td][td]36.5 ns[/td][td]34.3 ns[/td][td][b]6% faster[/b][/td][td]Core: SHA-NI[/td][/tr]
+[/table]
+
+[size=12pt][b]Parity (within 5%)[/b][/size]
+
+[table]
+[tr][td][b]module[/b][/td][td][b]Core[/b][/td][td][b]bmc[/b][/td][td][b]note[/b][/td][/tr]
+[tr][td]compact-block reconstruction ([tt]BlockEncodingNoExtra[/tt])[/td][td]1.243 ms[/td][td]1.252 ms[/td][td]a 3,000-short-id block against a 50,000-tx mempool holding none of them; short ids of every pool tx computed and matched[/td][/tr]
+[tr][td]BIP340 Schnorr verify ([tt]schnorrsig_verify[/tt])[/td][td]21.10 us[/td][td]22.09 us[/td][td]was 3.35x slower a month ago[/td][/tr]
+[tr][td]RIPEMD-160, 1 MB[/td][td]1.118 ns/byte[/td][td]1.170 ns/byte[/td][td][/td][/tr]
+[tr][td]Poly1305, 256 B / 1 MB[/td][td]0.31 / 0.26 ns/byte[/td][td]0.33 / 0.26 ns/byte[/td][td]1.2x slower at 64 bytes[/td][/tr]
+[/table]
+
+[size=12pt][b]Where this node is behind[/b][/size]
+
+[table]
+[tr][td][b]module[/b][/td][td][b]Core[/b][/td][td][b]bmc[/b][/td][td][b]ratio[/b][/td][td][b]why[/b][/td][/tr]
+[tr][td]MuHash finalize ([tt]MuHashFinalize[/tt]: the [tt]gettxoutsetinfo[/tt] digest)[/td][td]28.0 us[/td][td]1,861 us[/td][td][b]66x slower[/b][/td][td]our 3072-bit inverse is a Fermat exponentiation, 6,142 modular multiplies; Core's is a safegcd. Paid once per RPC call, never per block.[/td][/tr]
+[tr][td]ElligatorSwift key creation ([tt]EllSwiftCreate[/tt])[/td][td]18.0 us[/td][td]119.8 us[/td][td][b]6.6x slower[/b][/td][td]plain C over the asm field arithmetic; once per BIP324 connection[/td][/tr]
+[tr][td]BIP324 ECDH[/td][td]21.0 us[/td][td]66.6 us[/td][td][b]3.2x slower[/b][/td][td]same[/td][/tr]
+[tr][td]GCS block filter construction, 100,000 elements ([tt]GCSFilterConstruct[/tt])[/td][td]5.14 ms[/td][td]21.07 ms[/td][td][b]4.1x slower[/b][/td][td]same 100,000 unique 32-byte elements; ours arrive as the outputs of a 4 MB block that is parsed first, Core starts from the element set[/td][/tr]
+[tr][td]Base58Check encode, 32 bytes[/td][td]47 ns/byte[/td][td]146 ns/byte[/td][td][b]3.1x slower[/b][/td][td]address display only[/td][/tr]
+[tr][td]SHA-1, 1 MB[/td][td]0.637 ns/byte[/td][td]1.581 ns/byte[/td][td][b]2.5x slower[/b][/td][td]not on any hot path[/td][/tr]
+[tr][td]CheckBlock, block 413,567 (1,557 tx) vs our [tt]cons_verify[/tt][/td][td]370 us[/td][td]647 us[/td][td][b]1.75x slower[/b][/td][td]Core's CheckBlock does more per block (the harness header lists what)[/td][/tr]
+[tr][td]hash of the encoded 100,000-element filter ([tt]GCSBlockFilterGetHash[/tt])[/td][td]61.6 us[/td][td]106.5 us[/td][td][b]1.7x slower[/b][/td][td]Core's figure is 0.23 ns/byte over ~263 KB, faster than its own 1 MB SHA-256 row; not understood, reported as measured[/td][/tr]
+[tr][td]SHA-512, 1 MB[/td][td]0.955 ns/byte[/td][td]1.627 ns/byte[/td][td][b]1.7x slower[/b][/td][td][/td][/tr]
+[tr][td]ChaCha20, 64 B / 256 B / 1 MB[/td][td]0.77 / 0.72 / 0.71 ns/byte[/td][td]1.18 / 1.18 / 1.15 ns/byte[/td][td][b]1.5-1.6x slower[/b][/td][td]plain C; Core's is a 2-way SIMD implementation. Per byte on the v2 transport.[/td][/tr]
+[tr][td]BIP324 AEAD packet ([tt]FSCHACHA20POLY1305[/tt]), 64 B / 256 B / 1 MB[/td][td]2.24 / 1.30 / 0.97 ns/byte[/td][td]4.39 / 2.19 / 1.43 ns/byte[/td][td][b]1.5-2x slower[/b][/td][td]the whole packet: length cipher + ChaCha20-Poly1305 with rekeying[/td][/tr]
+[tr][td]script verification, P2TR script path ([tt]VerifyScriptP2TR_ScriptPath[/tt])[/td][td]35.8 us[/td][td]49.3 us[/td][td][b]1.38x slower[/b][/td][td]our fixture spends a 2-leaf tree (one more merkle step) against Core's 1-leaf; plus the sighash point below[/td][/tr]
+[tr][td]merkle root, 9,001 leaves[/td][td]45.0 ns/leaf[/td][td]53.0 ns/leaf[/td][td][b]1.18x slower[/b][/td][td][/td][/tr]
+[tr][td]SHA-256d, 64 B x 1024 (the merkle inner node)[/td][td]45.5 us[/td][td]52.4 us[/td][td][b]1.15x slower[/b][/td][td][/td][/tr]
+[tr][td]SHA-256, 1 MB[/td][td]0.359 ns/byte[/td][td]0.410 ns/byte[/td][td][b]1.14x slower[/b][/td][td]Core: SHA-NI[/td][/tr]
+[tr][td]script verification, P2WPKH / P2TR key path[/td][td]20.06 / 20.28 us[/td][td]22.52 / 22.26 us[/td][td][b]1.12x / 1.10x slower[/b][/td][td]the signature verifications are level (above); Core precomputes the sighash midstates once per transaction, we hash per input[/td][/tr]
+[/table]
+
+[size=12pt][b]What is not in these tables, and why[/b][/size]
+
+Core's [tt]src/bench[/tt] has 59 files. 31 benchmark names across 14 of them are paired above. The rest, with the reason:
+
+[list]
+[*][b]No counterpart by design:[/b] [tt]addrman[/tt] (a different address-book structure), [tt]ccoins_caching[/tt] (Core's coins cache is a different object from our memtable/LSM), [tt]checkqueue[/tt] (our parallel verify is measured whole-block), [tt]connectblock[/tt] (Core connects a synthetic block through its chainstate; ours is measured end to end by the IBD comparisons), [tt]rollingbloom[/tt], [tt]txgraph[/tt], [tt]txorphanage[/tt], [tt]disconnected_transactions[/tt], [tt]checkblockindex[/tt], [tt]load_external[/tt], [tt]index_blockfilter[/tt].
+[*][b]Measured at the RPC level instead[/b] (the project's PERFORMANCE.md): [tt]block_assemble[/tt] ([tt]getblocktemplate[/tt]), [tt]rpc_blockchain[/tt], [tt]rpc_mempool[/tt].
+[*][b]C++ runtime and utility micro-benchmarks with no equivalent module:[/b] [tt]prevector[/tt], [tt]pool[/tt], [tt]lockedpool[/tt], [tt]random[/tt], [tt]logging[/tt], [tt]streams_findbyte[/tt], [tt]strencodings[/tt], [tt]parse_hex[/tt], [tt]util_time[/tt], [tt]hashpadding[/tt], [tt]obfuscation[/tt], the harness itself.
+[*][b]Different wallet:[/b] the seven [tt]wallet_*[/tt] benches (Core's descriptor wallet vs a journal-backed seed wallet).
+[*][b]Candidates a day's harness each would pair:[/b] [tt]cluster_linearize[/tt], [tt]coin_selection[/tt], [tt]descriptors[/tt], the three [tt]mempool_*[/tt] eviction/stress benches, [tt]peer_eviction[/tt], [tt]sign_transaction[/tt].
+[*][b]Partly paired:[/b] [tt]blockencodings[/tt] (we keep no extra-transaction pool, so only the NoExtra variant), [tt]gcs_filter[/tt] (construct and hash; we neither decode nor match filters), [tt]base58[/tt] (Base58Check encode only), [tt]readwriteblock[/tt] (raw read and write; Core's ReadBlock deserialises and checks too), [tt]verify_script[/tt] (3 of 4; VerifyNestedIfScript is interpreter-only).
+[/list]
+
+[size=12pt][b]What this says[/b][/size]
+
+The consensus kernel -- signature verification, the hashes on the hot path, block reconstruction from a compact block, the block archive, the UTXO set's MuHash -- is level with Core or ahead. The gaps are in the parts still written in C on this side (ElligatorSwift, ChaCha20, the AEAD), in code that runs once per RPC call (the MuHash finalize inverse), in the two hashes nothing hot uses (SHA-1, SHA-512), and in per-input sighash recomputation that Core amortises per transaction. Each gap is named with its cause so the next piece of assembly can be chosen by the number, not by guesswork.
+
+[size=12pt][b]Reproducing[/b][/size]
+
+[code]
+git clone https://github.com/BobClawblaw/bitcoinmachinecode
+cd bitcoinmachinecode && scripts/bench_vs_core.sh          # tiers 1-2, including 2b
+[/code]
+
+The script builds Core's [tt]bench_bitcoin[/tt] out of tree on first use, builds our harnesses ([tt]make bench-vs-core[/tt]), runs both sides pinned, and writes the raw CSVs, our harness output and the joined table into [tt]bench-results/<timestamp>/[/tt]. The harness is [tt]asm/tests/bench_core_modules.c[/tt]; every difference between a pair is stated in its file header and in the table's note column. The full write-up, including the classification above and the earlier tiers, is [tt]docs/devlog/BENCHMARKS.md[/tt], addendum 2026-09-27.

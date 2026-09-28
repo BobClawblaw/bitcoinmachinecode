@@ -23,6 +23,7 @@
  * this form.
  */
 #include <string.h>
+#include <stdint.h>
 #include "crypto_fe_sqrt.h"
 
 extern void fe_mul(unsigned long long r[4], const unsigned long long a[4], const unsigned long long b[4]);
@@ -84,4 +85,132 @@ int fe_is_square(const unsigned long long a[4]){
     fe4 r;
     if (fe_is_zero(a)) return 1;
     return fe_sqrt(r, a);
+}
+
+/* ---- the square predicate WITHOUT a root: the Jacobi symbol by safegcd ----
+ *
+ * fe_is_square above answers by exponentiation (a full 255-squaring chain,
+ * ~2.1 us) and then throws the root away. ElligatorSwift asks the question
+ * far more often than it needs a root -- valid_x on every decode candidate,
+ * and two or three times per branch of the inverse map -- so the predicate
+ * is where the encode/decode time went.
+ *
+ * The Jacobi symbol (a|p) is +1 exactly when a is a non-zero square mod p
+ * (p is prime, so Jacobi = Legendre). It can be read off a binary gcd: each
+ * "divide g by 2" flips the sign when f = 3 or 5 mod 8, each swap flips it
+ * when both are 3 mod 4. libsecp256k1's secp256k1_jacobi64_maybe_var tracks
+ * exactly that through its 62-bit safegcd rounds (modinv64_impl.h), and this
+ * is that routine, step for step, over the same signed-62-bit limbs. It runs
+ * in about the time of one fe_inv_var, and it is VARIABLE TIME: the inputs
+ * on every path that calls it (u, t, x of the ElligatorSwift map) are public.
+ *
+ * "maybe": libsecp256k1 bounds the round count (25 rounds of 62 posdivsteps)
+ * and reports "unknown" if f has not reached 1 by then, which for random
+ * input is astronomically rare; fe_is_square_var then falls back to the
+ * exponentiation, so the answer is always exact. */
+typedef struct { int64_t v[5]; } fe_s62;
+
+static void fe_to_s62(fe_s62* r, const unsigned long long a[4]){
+    const unsigned long long M62 = ~0ULL >> 2;
+    r->v[0] = (int64_t)(a[0] & M62);
+    r->v[1] = (int64_t)(((a[0] >> 62) | (a[1] << 2)) & M62);
+    r->v[2] = (int64_t)(((a[1] >> 60) | (a[2] << 4)) & M62);
+    r->v[3] = (int64_t)(((a[2] >> 58) | (a[3] << 6)) & M62);
+    r->v[4] = (int64_t)(a[3] >> 56);
+}
+
+typedef struct { int64_t u, v, q, r; } fe_trans2x2;
+
+/* 62 "posdivsteps" on the low limbs of f and g (both kept positive), the
+ * aggregate transition matrix in t, the Jacobi sign bit accumulated in *jacp.
+ * libsecp256k1's secp256k1_modinv64_posdivsteps_62_var. */
+static int64_t fe_posdivsteps_62_var(int64_t eta, uint64_t f0, uint64_t g0, fe_trans2x2* t, int* jacp){
+    uint64_t u = 1, v = 0, q = 0, r = 1;
+    uint64_t f = f0, g = g0, m;
+    uint32_t w;
+    int i = 62, limit, zeros;
+    int jac = *jacp;
+    for (;;){
+        zeros = __builtin_ctzll(g | (~0ULL << i));   /* a sentinel bit caps the count at i */
+        g >>= zeros; u <<= zeros; v <<= zeros; eta -= zeros; i -= zeros;
+        /* dividing g by an odd power of two flips the symbol when f = 3 or 5 mod 8 */
+        jac ^= (int)(zeros & ((f >> 1) ^ (f >> 2)));
+        if (i == 0) break;
+        if (eta < 0){
+            uint64_t tmp;
+            eta = -eta;
+            tmp = f; f = g; g = tmp;
+            tmp = u; u = q; q = tmp;
+            tmp = v; v = r; r = tmp;
+            /* swapping f and g flips the symbol when both are 3 mod 4 */
+            jac ^= (int)((f & g) >> 1);
+            limit = ((int)eta + 1) > i ? i : ((int)eta + 1);
+            m = (~0ULL >> (64 - limit)) & 63U;
+            w = (uint32_t)((f * g * (f * f - 2)) & m);   /* cancels up to 6 low bits of g */
+        } else {
+            limit = ((int)eta + 1) > i ? i : ((int)eta + 1);
+            m = (~0ULL >> (64 - limit)) & 15U;
+            w = (uint32_t)(f + (((f + 1) & 4) << 1));
+            w = (uint32_t)((-(uint64_t)w * g) & m);       /* cancels up to 4 low bits of g */
+        }
+        g += f * w; q += u * w; r += v * w;
+    }
+    t->u = (int64_t)u; t->v = (int64_t)v; t->q = (int64_t)q; t->r = (int64_t)r;
+    *jacp = jac;
+    return eta;
+}
+
+/* [f, g] = t * [f, g] / 2^62 over `len` limbs (the low 62 bits are zero by
+ * construction). libsecp256k1's secp256k1_modinv64_update_fg_62_var. */
+static void fe_update_fg_62_var(int len, fe_s62* f, fe_s62* g, const fe_trans2x2* t){
+    const uint64_t M62 = ~0ULL >> 2;
+    const int64_t u = t->u, v = t->v, q = t->q, r = t->r;
+    __int128 cf, cg;
+    int64_t fi = f->v[0], gi = g->v[0];
+    cf = (__int128)u * fi + (__int128)v * gi;
+    cg = (__int128)q * fi + (__int128)r * gi;
+    cf >>= 62; cg >>= 62;
+    for (int i = 1; i < len; i++){
+        fi = f->v[i]; gi = g->v[i];
+        cf += (__int128)u * fi + (__int128)v * gi;
+        cg += (__int128)q * fi + (__int128)r * gi;
+        f->v[i - 1] = (int64_t)((uint64_t)cf & M62); cf >>= 62;
+        g->v[i - 1] = (int64_t)((uint64_t)cg & M62); cg >>= 62;
+    }
+    f->v[len - 1] = (int64_t)cf;
+    g->v[len - 1] = (int64_t)cg;
+}
+
+/* (x|p) for 0 < x < p: +1 / -1, or 0 when the bounded loop did not converge.
+ * libsecp256k1's secp256k1_jacobi64_maybe_var with the field's modulus
+ * p = 2^256 - 2^32 - 977 = {-0x1000003D1, 0, 0, 0, 256} in signed-62 limbs. */
+static int fe_jacobi_maybe_var(const fe_s62* x){
+    fe_s62 f = {{ -0x1000003D1LL, 0, 0, 0, 256 }};
+    fe_s62 g = *x;
+    int len = 5, jac = 0;
+    int64_t eta = -1, cond, fn, gn;
+    for (int count = 0; count < 25; count++){
+        fe_trans2x2 t;
+        eta = fe_posdivsteps_62_var(eta, (uint64_t)f.v[0] | ((uint64_t)f.v[1] << 62),
+                                         (uint64_t)g.v[0] | ((uint64_t)g.v[1] << 62), &t, &jac);
+        fe_update_fg_62_var(len, &f, &g, &t);
+        if (f.v[0] == 1){                        /* f may be 1: then (g|f) = 1 and the sign is jac */
+            cond = 0;
+            for (int j = 1; j < len; j++) cond |= f.v[j];
+            if (cond == 0) return 1 - 2 * (jac & 1);
+        }
+        fn = f.v[len - 1]; gn = g.v[len - 1];
+        cond = ((int64_t)len - 2) >> 63;
+        cond |= fn; cond |= gn;
+        if (cond == 0) --len;                    /* both top limbs empty: shrink */
+    }
+    return 0;
+}
+
+int fe_is_square_var(const unsigned long long a[4]){
+    if (fe_is_zero(a)) return 1;                 /* 0 = 0*0; the gcd loop cannot take it */
+    fe_s62 s; fe_to_s62(&s, a);
+    int jac = fe_jacobi_maybe_var(&s);
+    if (jac == 0){ unsigned long long dummy[4]; return fe_sqrt(dummy, a); }
+    return jac > 0;
 }

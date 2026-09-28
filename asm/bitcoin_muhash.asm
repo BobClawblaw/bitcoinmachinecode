@@ -993,8 +993,70 @@ num3072_cpu_has_ifma:
 ;     [rbp-0x80 .. -0x41]  j[16], the initial state (survives across blocks)
 ;     [rbp-0x40 .. -0x01]  x[16], the working state
 ; ============================================================================
+extern chacha20_xor_avx2              ; chacha20_avx2.asm
+extern chacha20_cpu_has_avx2
+section .data
+chacha20_k0_path: db 0                ; 0 = unprobed, 1 = AVX2, 2 = the scalar body below
+section .text
+;   Dispatch (2026-09-28): with AVX2 the six blocks go through
+;   chacha20_xor_avx2 (three pairs in flight: 0.69 -> ~0.2 us per element,
+;   70% of a MuHash insert); the scalar body below is the fallback and the
+;   reference the AVX2 routine is proven against (tests/test_muhash,
+;   tests/test_chacha20). The probe runs once, cached like num3072_mul_path.
+; chacha20_k0_force_path(edi): 0 re-probe on the next call, 1 AVX2, 2 scalar
+; (tests/test_muhash runs Core's keystream vectors down both bodies)
+global chacha20_k0_force_path
+chacha20_k0_force_path:
+    mov  byte [rel chacha20_k0_path], dil
+    ret
 global chacha20_keystream_k0
 chacha20_keystream_k0:
+    movzx eax, byte [rel chacha20_k0_path]
+    cmp  eax, 1
+    je   .avx2
+    cmp  eax, 2
+    je   .scalar
+    push rdi                          ; probe: entry rsp = 8 mod 16, three pushes -> 0
+    push rsi
+    push rdx
+    call chacha20_cpu_has_avx2
+    pop  rdx
+    pop  rsi
+    pop  rdi
+    mov  byte [rel chacha20_k0_path], 2
+    test eax, eax
+    jz   .scalar
+    mov  byte [rel chacha20_k0_path], 1
+.avx2:
+    ; the RFC state on the stack: sigma, key, counter 0, nonce 0
+    sub  rsp, 72                      ; 72 = 8 mod 16 -> rsp 0 mod 16 at the call
+    mov  dword [rsp+0],  0x61707865
+    mov  dword [rsp+4],  0x3320646e
+    mov  dword [rsp+8],  0x79622d32
+    mov  dword [rsp+12], 0x6b206574
+    mov  rax, [rdx+0]
+    mov  [rsp+16], rax
+    mov  rax, [rdx+8]
+    mov  [rsp+24], rax
+    mov  rax, [rdx+16]
+    mov  [rsp+32], rax
+    mov  rax, [rdx+24]
+    mov  [rsp+40], rax
+    xor  eax, eax
+    mov  [rsp+48], rax
+    mov  [rsp+56], rax
+    mov  rcx, rsi                     ; nblocks
+    mov  rdx, rsp                     ; state
+    xor  esi, esi                     ; in = NULL: raw keystream
+    call chacha20_xor_avx2
+    xor  eax, eax                     ; the key leaves the stack
+    mov  [rsp+16], rax
+    mov  [rsp+24], rax
+    mov  [rsp+32], rax
+    mov  [rsp+40], rax
+    add  rsp, 72
+    ret
+.scalar:
     push rbx
     push r12
     push r13

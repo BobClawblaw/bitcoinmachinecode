@@ -34,7 +34,7 @@ extern void sc_inv(uint64_t r[4], const uint64_t a[4]);
  * FINDING 1: signing multiplies by the SECRET nonce k, so it must use the
  * constant-time ladder (secp256k1_point_ct.asm), not the variable-time
  * windowed point_scalar_mul used on public-scalar verification paths. */
-extern void point_scalar_mul_ct(uint64_t r[12], const uint64_t xy[8], const uint64_t k[4]);
+extern void point_scalar_mul_gen_ct(uint64_t r[12], const uint64_t k[4]);   /* k*G, constant time (the comb, 2026-09-28) */
 /* field ops over prime p: r,a,b = 4 ascending little-endian u64 */
 extern void fe_mul(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]);
 extern void fe_sqr(uint64_t r[4], const uint64_t a[4]);
@@ -73,10 +73,6 @@ static const uint64_t N_HALF[4] = {
     0xFFFFFFFFFFFFFFFFULL, 0x7FFFFFFFFFFFFFFFULL
 };
 /* generator G affine (LE limbs): [x0..x3, y0..y3] */
-static const uint64_t G_AFF[8] = {
-    0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL, 0x55A06295CE870B07ULL, 0x79BE667EF9DCBBACULL,
-    0x9C47D08FFB10D4B8ULL, 0xFD17B448A6855419ULL, 0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL
-};
 
 /* ---------------- byte/limb helpers (C, endianness glue) ------------------- */
 /* 32 big-endian bytes -> 4 ascending little-endian limbs */
@@ -232,7 +228,7 @@ int wallet_ecdsa_sign(uint64_t out_r[4], uint64_t out_s[4],
     if ((k[0] | k[1] | k[2] | k[3]) == 0) return 0;
 
     /* R = k*G (Jacobian 12 limbs) -- CONSTANT TIME in k (FINDING 1) */
-    point_scalar_mul_ct(R, G_AFF, k);
+    point_scalar_mul_gen_ct(R, k);
 
     /* affine x = X * (1/Z^2) mod p */
     fe_sqr(z2, R + 8);          /* Z^2 */
