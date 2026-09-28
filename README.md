@@ -200,8 +200,10 @@ testnet4, signet (public or custom) and regtest.
 
 ## Requirements
 
-- Linux on x86-64. The assembly is NASM ELF64 targeting the System V ABI;
-  nothing else runs it.
+- Linux on x86-64. The assembly is NASM ELF64 targeting the System V ABI.
+  On macOS / Apple silicon the `bmc_osx` branch builds the same node
+  natively from an AArch64 rewrite of every module (see
+  [macOS / Apple silicon](#macos--apple-silicon) below).
 - `nasm`, `gcc`, GNU `ld`, `make`, and `python3` (build tooling, audits and
   test oracles).
 - Disk: about 1 TB for a full mainnet archive plus the UTXO store. A pruned
@@ -240,6 +242,38 @@ Other binaries built under `asm/daemon/`: `bmc_cli` (Core-compatible
 JSON-RPC client), `cli` (query the stored chain directly), `wallet_cli`,
 and the archive tools (`check_chain`, `verify`, `dumpblock`, `unified_ibd`,
 `chainctl`).
+
+## macOS / Apple silicon
+
+The `bmc_osx` branch carries the node to Apple silicon: every x86 assembly
+module the daemon runs has an AArch64 / Mach-O counterpart in `port/osx/`
+(the same exported symbols, so the shared C — daemon, RPC, tests — is
+unchanged), and the repo's own test harness runs natively.
+
+```sh
+port/osx/build_daemon.sh        # bmcbitcoind + the tools, into port/osx/daemon_out/
+port/osx/build_wallet_cli.sh    # bmc_wallet_cli
+port/osx/run_tests.sh           # the full gate, natively (--no-build to skip the build; names to run a subset)
+port/osx/fetch_fixtures.sh      # the large gitignored fixtures, from a local Bitcoin Core
+```
+
+Requirements: Apple clang (`cc -arch arm64`), `python3`; the daemon and the
+tools link against the system libc, so no NASM, no GNU toolchain. The gate
+reports 417 PASS, 10 SKIP, 14 N/A, 0 FAIL on 441 commands (2026-09-28): the
+N/A rows are the x86-only differential tests of shadow twins that no daemon
+links; the SKIPs are self-declared. Both a mainnet and a signet node run
+from this branch on an M-series Mac, at Bitcoin Core's tip, with the mainnet
+UTXO set identical to Core's on every `gettxoutsetinfo` field
+([`docs/PARITY_ATTESTATION.md`](docs/PARITY_ATTESTATION.md)).
+
+| document | contents |
+|---|---|
+| [`port/OSX_STATE.md`](port/OSX_STATE.md) | the port's dated state: what landed, how it was proven, the numbers (read first) |
+| [`port/OSX_ROADMAP.md`](port/OSX_ROADMAP.md) | per-module status and verification method; a status summary at its top |
+| [`port/OSX_PORT.md`](port/OSX_PORT.md) | the branch model, how `main` is merged in, the layout |
+| [`port/OSX_STRATEGY.md`](port/OSX_STRATEGY.md) | the plan of record, written before the port began |
+| [`port/osx/BENCHMARKS_OSX.md`](port/osx/BENCHMARKS_OSX.md) | timings on Apple silicon |
+| `worklog/*-osx.md`, `worklog/*-note-for-x86*.md` | the Mac side's daily trail and its notes to the x86 side |
 
 ## Quick start
 
@@ -565,7 +599,8 @@ in [`docs/FEATURE_GAPS.md`](docs/FEATURE_GAPS.md):
 | [`docs/ABI_STACK_ALIGNMENT.md`](docs/ABI_STACK_ALIGNMENT.md) | the SysV stack-alignment contract and the audit that enforces it |
 | [`docs/audits/`](docs/audits/) | external security audits and the project's responses |
 | [`docs/devlog/`](docs/devlog/) | development log: incident log, plans, benchmarks, assessments |
-| `worklog/` | dated development action logs |
+| `worklog/` | dated development action logs (`*-osx.md` the Mac side's; `*-note-for-osx*.md` / `*-note-for-x86*.md` the two sides' notes to each other) |
+| [`port/OSX_STATE.md`](port/OSX_STATE.md) | the macOS / Apple silicon port: state, roadmap and branch model under `port/` |
 | [`config/bitcoin.sample.conf`](config/bitcoin.sample.conf) | every configuration key at its default |
 | [`validation/`](validation/) | differential test corpus and oracle scripts against Bitcoin Core |
 

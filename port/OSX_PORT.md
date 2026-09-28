@@ -7,9 +7,22 @@ runs NATIVELY on macOS hosts (development machine: M1 Max).
 `main` remains the x86-64 development tree. **Do not develop against main**;
 it is touched only to merge new features into `bmc_osx`.
 
-> **CURRENT STATUS (2026-09-09): fresh start, no ported code yet.** See
-> [`port/OSX_ROADMAP.md`](OSX_ROADMAP.md) for the per-module plan and
-> [`worklog/`](../../worklog/) for the daily trail.
+> **CURRENT STATUS (2026-09-28): the port is complete and in production.**
+> Every x86 assembly module the daemon runs has an AArch64 `.S` in
+> `port/osx/` (the 37 C twins of the first two weeks were converted on
+> 09-26; x86's later additions — safegcd inversion, the square-root chain,
+> the comb / window / GLV multiplies, SHA-1's two bodies — followed within a
+> day of landing). The repo's gate runs natively through
+> `port/osx/run_tests.sh`: 417 PASS, 10 SKIP, 14 N/A (x86-only shadow-twin
+> diffs), 0 FAIL. A mainnet and a signet node run from this branch on an
+> M-series Mac at Core's tip. Dated evidence: [`OSX_STATE.md`](OSX_STATE.md)
+> (newest top); per-module: [`OSX_ROADMAP.md`](OSX_ROADMAP.md) (status
+> summary at its top); the daily trail: `worklog/*-osx.md`.
+>
+> The branch is also where shared-C fixes found on the Mac are made first
+> and sent to `main` as PRs (#322, #325, #337, #340), and `main` is merged
+> in as it advances — the two sides exchange `worklog/*-note-for-osx*.md`
+> and `worklog/*-note-for-x86*.md`.
 
 ## Branch model
 - `main`   : upstream x86-64 development tree. x86 is where features land.
@@ -22,8 +35,11 @@ it is touched only to merge new features into `bmc_osx`.
     git fetch origin
     git merge origin/main
     # C daemon + tests usually merge clean; asm/Makefile edits may conflict.
-    # ANY new/changed upstream .asm module needs a macOS twin below, verified,
-    # before considering the sync done.
+    # ANY new/changed upstream .asm module needs its port/osx/<name>.S
+    # brought level -- a new export the shared C calls fails the link, which
+    # is the signal -- and port/osx/run_tests.sh in full before the sync is
+    # done. A shared-C fix made here goes to main as a PR (cherry-pick onto
+    # origin/main; drop the port/ files).
 
 ## Why a fresh port instead of reusing arm-port
 The `arm-port` branch (kept on origin as reference) produces AArch64 code
@@ -46,12 +62,19 @@ bitcoin_idxscan (19), bitcoin_undo (18), bitcoin_store_fast (17).
 - `port/OSX_ROADMAP.md` — per-module status + verification method (READ FIRST).
 - `port/OSX_STATE.md` — durable port state snapshot, updated whenever status
   materially changes.
-- `worklog/YYYY-MM-DD.md` — dated session logs (repo root, x86 convention).
+- `worklog/YYYY-MM-DD-osx.md` — the Mac side's dated session logs (the x86
+  side owns `worklog/YYYY-MM-DD.md`; separate files so the two sides' merges
+  never conflict on a day file). `worklog/*-note-for-x86*.md` are the notes
+  the Mac side leaves for x86 (shared-C findings, what to take), and
+  `*-note-for-osx*.md` the reverse.
+- `port/osx/test_support/*_twin.c` — the retired C twins, kept as the
+  differential oracles for the `.S` modules.
 - `docs/devlog/LOG.md` — long-running engineering record; port entries are
   appended there for durable developer memory, same as x86 does.
 
 ## Developer memory convention (inherited from x86/arm-port)
-- Every work session appends a section to `worklog/YYYY-MM-DD.md` (UTC date).
+- Every work session appends a section to `worklog/YYYY-MM-DD-osx.md` (UTC
+  date; `OSX_STATE.md` carries the durable version of the same events).
   Terse bullets: action → evidence (test result, probe output, commit id).
 - Meaningful engineering events (bug hunts, root causes, decisions) also go
   into `docs/devlog/LOG.md`.

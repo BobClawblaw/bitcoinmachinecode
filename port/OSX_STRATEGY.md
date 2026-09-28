@@ -3,6 +3,12 @@
 Written 2026-09-09, before any porting. This is the plan-of-record; per-module
 status lives in `OSX_ROADMAP.md`, branch rules in `OSX_PORT.md`.
 
+> **2026-09-28:** the plan was executed as written — C twins first for the
+> whole daemon (phase 1–3 by 09-10), then every twin replaced by AArch64
+> assembly (09-26), differential proof at each step. The end state it argued
+> for ("hand-authored machine code running natively") is what runs on the
+> Mac nodes now; `OSX_STATE.md` has the dated trail.
+
 ## The core decision: port, don't emulate
 
 Two ways to run the x86 tree on Apple silicon:
