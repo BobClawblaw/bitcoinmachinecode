@@ -1222,8 +1222,8 @@ difference.
 | `FSCHACHA20POLY1305_64BYTES` | `bip324_encrypt_64_B` | 2.24 | 4.39 | ns/byte | **1.95x slower** |  |
 | `FSCHACHA20POLY1305_256BYTES` | `bip324_encrypt_256_B` | 1.30 | 2.19 | ns/byte | **1.68x slower** |  |
 | `FSCHACHA20POLY1305_1MB` | `bip324_encrypt_1048576_B` | 0.97 | 1.43 | ns/byte | **1.47x slower** |  |
-| `EllSwiftCreate` | `ellswift_create` | 18,027.24 | 119,786.20 | ns/op | **6.64x slower** |  |
-| `BIP324_ECDH` | `ellswift_ecdh` | 20,965.12 | 66,598.88 | ns/op | **3.18x slower** |  |
+| `EllSwiftCreate` | `ellswift_create` | 18,027.24 | ~~119,786.20~~ → **20,776.04** (2026-09-28) | ns/op | ~~6.64x slower~~ → **1.15x slower** | the key rotates each op, as Core's loop; the constant-time comb (`point_scalar_mul_gen_ct`, 9 µs) replaced the 52 µs ladder, and the encoder draws u and the branch from the hash per attempt as libsecp256k1 does |
+| `BIP324_ECDH` | `ellswift_ecdh` | 20,965.12 | ~~66,598.88~~ → **39,575.22** (2026-09-28) | ns/op | ~~3.18x slower~~ → **1.89x slower** | random encodings on both sides, as Core's bench; the constant-time w=4 window (`point_scalar_mul_win_ct`, 33 µs) replaced the ladder; the rest of the gap is that window against libsecp256k1's GLV `ecmult_const` |
 | `Bech32Encode` | `bech32_encode_(per_input_byte)` | 6.33 | 4.27 | ns/byte | **1.48x faster** |  |
 | `Bech32Decode` | `bech32_decode_+_verify_(per_char)` | 3.33 | 2.80 | ns/byte | **1.19x faster** | decode + checksum verification on both sides |
 | `Base58CheckEncode` | `base58check_encode_(per_byte)` | 47.16 | 145.64 | ns/byte | **3.09x slower** | no plain Base58Encode / Base58Decode on our side |
@@ -1256,9 +1256,25 @@ Reading the table:
     ChaCha20 expansion of one element) is 690 ns against Core's 341 — the
     ChaCha20 keystream in `bitcoin_muhash.asm` at 1.7 ns/byte is the whole
     difference, and 70% of every insert.
-  - **ElligatorSwift, 6.5× on `EllSwiftCreate` and 3.1× on the ECDH.** Both
-    are C (`crypto_ellswift*.c`) over the asm field arithmetic; Core's are
-    libsecp256k1's. Paid once per BIP324 connection.
+  - **ElligatorSwift, 6.5× on `EllSwiftCreate` and 3.1× on the ECDH — 1.15×
+    and 1.9× since 2026-09-28.** Both are C (`crypto_ellswift*.c`) over the
+    asm field arithmetic; Core's are libsecp256k1's. Paid once per BIP324
+    connection. The split (2026-09-28): 52 of create's 108 µs and of the
+    ECDH's 65 were the constant-time ladder (256 complete doubles + 256
+    complete adds), the rest the map's field work — a 2 µs constant-time
+    inverse where a 0.5 µs safegcd will do on public data, a 2.1 µs square
+    root thrown away as a square TEST several times per branch, and 1/2
+    inverted afresh on every branch. Now: `fe_is_square_var` (the Jacobi
+    symbol by safegcd, libsecp256k1's `jacobi64_maybe_var`, 0.62 µs),
+    `fe_inv_var` and a constant 1/2 in the map (decode 8.3 → 2.0 µs); two
+    constant-time multiplies beside the ladder in `secp256k1_point_ct.asm`
+    (a cmov-scanned comb for k·G at 9 µs, a w=4 window for k·P at 33 µs,
+    both over the complete formulas, no secret-indexed load); and the
+    encoder draws u AND the branch from the hash on every attempt as
+    libsecp256k1 does (mean 10.4 µs from 20.2, 12.3 branch attempts per key
+    down to ~4) — which also makes the encoding uniform over the valid
+    (u, t), where the fixed branch order was not. What is left on the ECDH
+    is the window against libsecp256k1's GLV-split `ecmult_const`.
   - **ChaCha20, 1.5–1.65×; the AEAD packet, 1.5–2×.** `crypto_chacha20.c` is
     plain C; Core's is a two-way SSE/AVX implementation. Per byte on the v2
     transport.

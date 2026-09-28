@@ -64,6 +64,7 @@
 ; fixed-base scalar multiply point_scalar_mul_fixed (see end of file). Entry
 ; offset = ((j*15)+(i-1)) * 64 bytes. Auto-generated + validated offline.
 section .rodata
+global G_COMB_TABLE           ; read (cmov-scanned) by secp256k1_point_ct.asm's fixed-base multiply
 %include "g_comb_table.inc"
 
 ; ---- GLV (PERF_SCOPE.md 4.3): beta, the cube root of unity mod p with
