@@ -56,6 +56,25 @@ Jacobi section (40,073), `test_chacha20`'s AVX2 section (3,000 cases),
 `test_muhash` down both keystream bodies, `test_sha1` (both bodies),
 `test_addr`'s 321 Python-generated Base58Check vectors.
 
+## Also today, from the Mac branch (#336, #337)
+
+Three shared fixes the Mac's testnet4 node found on 09-24 and that had never
+reached main — the reorg apply never moving past the gap, a hole below the
+archive tip re-fetched whatever `bmc.bootcatchup` says, the archive frame
+check accepting the chain's magic — landed as #336 (`deploy-20260928f`); and
+the Mac's PR for issues #294 (memtable sizing on the store's shape) and #304
+(a cluster's false claim no longer runs the parallel downloader) as #337
+(`deploy-20260928g`). Each cherry-picked, revert-checked on x86, `-Werror`,
+gated; both issues closed.
+
+## The IBD benchmark on the repaired link
+
+Run 30 (main `1370d041`) synced to the tip in **4 h 54 m 30 s** with the
+MuHash identical to Core's at 968,987 — on a link whose bad backhaul the
+operator had just repaired, so the number compares to nothing measured
+before it. Core v31.1 is being rerun on the same drive and link; the pair is
+`docs/reports/2026-09-28-run30-vs-core.md`, provisional until Core leaves IBD.
+
 ## What is still behind
 
 The ECDH's point arithmetic (complete formulas at 84/117 ns against
