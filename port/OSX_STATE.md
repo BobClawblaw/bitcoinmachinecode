@@ -4,6 +4,12 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-28 (late) — the roadmap brought current; the wallet round-trip gate run
+
+- `OSX_ROADMAP.md` had not been touched since the C-twin era: 42 entries still said "as a C TWIN", four boxes were open (bip341/342, the script VM modules, the wallet CLI gate, Phase 4 parity). A dated status section at its top now states what is true (every daemon-linked x86 module has a `.S`; the 13 shadow twins; the suite; the nodes; parity by vectors), and each open box is closed in place with what closed it.
+- **The wallet round-trip against a running osx node** (the one gate that had never been run): on a throwaway regtest node from the Mac build, `bmc_wallet_cli init` → the daemon loads the store and serves the wallet RPCs (`private_keys_enabled=true`, `getnewaddress` → `bcrt1qe2kgnj…a0s3y`, `ismine`), and the CLI re-derives the same witness program from the mnemonic. `signmessage` over a bech32 address is refused as Core refuses it, so that leg is by design absent.
+- Nothing new from the x86 side since #336; PR #337 (#294/#304) waits on their gate; both nodes clean since the deploy (no FATAL/REJECT/MUTATED, no parallel-downloader run, tips at Core's).
+
 ## 2026-09-28 (evening) — issues #294 and #304 fixed (shared C)
 
 Two open issues from the BlockYard sync of 09-24/25, both in the daemon's C:

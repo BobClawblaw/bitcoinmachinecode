@@ -5,6 +5,45 @@ A module is DONE only when its gate runs natively on this Mac: build +
 repo-harness-equivalent run + differential verification (fuzz vs C twin /
 Python oracle), with both code paths exercised where a dispatcher exists.
 
+## Status 2026-09-28 — read this first; the per-module log below is history
+
+The entries below are the port's log as it was written, and many of them
+still say "as a C TWIN": that was true on 2026-09-09 and is not any more.
+What is true now (`OSX_STATE.md` has the dated evidence for each line):
+
+- **Every x86 assembly module the daemon runs has an AArch64 `.S` in
+  `port/osx/`.** The 37 C twins were converted in five batches on
+  2026-09-26 (fe, point, point_ct, ecdsa, pubkey, schnorr, taproot, muhash,
+  sha1, ripemd160, sighash, script, multisig, bech32, chainwork, cons,
+  headers, utxo, utxo_stats, utxo_store, store, store_fast, idx, utxo_lsm,
+  net, p2p, addrmgr, cli, ...), each proven by a differential fuzz against
+  the renamed twin (now the oracle in `port/osx/test_support/`), the
+  module's own tests, the AAPCS64 probe, and the full suite. The 13 x86
+  modules without a Mac `.S` (`bitcoin_txv_*`, `bip143`, `bip341`,
+  `checksig`, `scriptverify_drv`, `witness_v0_drv`, `segwit_classify`,
+  `tapagg`, `taproot_verify`, `undo`) are x86 shadow twins of
+  `daemon/tx_verify.c` that no daemon links; their `*_diff` tests are the
+  14 N/A rows.
+- **x86's 2026-09-27/28 additions are here too:** `fe_inv_var` and
+  `sc_inv_var` by safegcd (`safegcd_var.h`), `fe_pow_sqrt`, the comb /
+  window / GLV constant-time multiplies (`point_scalar_mul_gen_ct`,
+  `_win_ct`, `_glv_ct`), SHA-1's two bodies. ChaCha20 stays the C block
+  (no AVX2 here; `chacha20_paths_osx.c` says so to the dispatcher).
+- **The suite:** `port/osx/run_tests.sh` runs the repo's harness natively:
+  417 PASS, 10 SKIP (3 alias-gated by decision, 7 self-declared), 14 N/A
+  (the shadow twins above), 0 FAIL, on 441 commands (2026-09-28). Every
+  command's result is a row in `results.jsonl` (Phase 4's "actually run").
+- **The daemon** runs mainnet and signet on this Mac at Core's tip
+  (`docs/PARITY_ATTESTATION.md`: mainnet 968,570 identical to Core on all
+  five fields, muhash included); the wallet CLI and the tools build and
+  link natively.
+- **Cross-arch parity** was done by vectors, not a Linux container: the
+  per-module differentials against the x86 objects on the reference box
+  (byte-identical streams, recorded per module below) and, for the block
+  path, `test_taproot_block_diff` over 36 mainnet blocks and the signet
+  UTXO set identical to Core's by `gettxoutsetinfo`.
+- Open boxes below are closed in place with the date and what closed them.
+
 ## Phase 0 — build bridge
 - [x] Toolchain proof: Mach-O AArch64 object assembles under Apple clang
       21 (`cc -arch arm64`), links with repo C, runs natively. (2026-09-09)
@@ -290,10 +329,14 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       byte-identical vs x86 on .242 (dtap.c + gen_dtap_vecs.py: tags/msgs to
       200 KB, leaf compactsize boundaries 0xfd/0x10000, tweak rejections
       x>=p/t>=n, merkle paths depth 0..8 mixed orderings).  Commit 871200f3.
-- [ ] bitcoin_bip341, bitcoin_bip342 (bitcoin_taproot_sighash.c is
+- [x] bitcoin_bip341, bitcoin_bip342 (bitcoin_taproot_sighash.c is
       production arch-neutral C like bitcoin_segwit.c and needs this twin
       at link time; its harness test_taproot_sighash pulls
       bitcoin_interp/scriptcodec/sha1 -- gate lands with the script VM wave)
+      CLOSED 2026-09-28: bitcoin_bip341.asm / bip342 are x86 shadow twins of
+      the shared C (test-only on x86 too, `test_bip341_diff`); the shared C
+      links against the Mac .S layer and test_taproot_sighash, test_taproot,
+      test_taproot_block_diff (36 mainnet blocks, 0 failures) run natively.
 - [x] bitcoin_sighash -> port/osx/sighash_twin.c  DONE 2026-09-09 as a C
       TWIN (sighash_all, legacy_sighash with every legacy hashtype x
       ANYONECANPAY incl. the SIGHASH_SINGLE out-of-range uint256(1) quirk
@@ -309,8 +352,13 @@ Python oracle), with both code paths exercised where a dispatcher exists.
       PUSHDATA1/2/4 forms incl. truncated headers, all push length classes,
       needle present/absent/repeated/malformed; drivers port/osx/tests/
       dsighash.c + gen_dsighash_vecs.py). Commit 404f968b.
-- [ ] bitcoin_interp, bitcoin_scriptcodec, bitcoin_script_flags,
+- [x] bitcoin_interp, bitcoin_scriptcodec, bitcoin_script_flags,
       bitcoin_script, bitcoin_multisig
+      DONE 2026-09-10 (interp/scriptcodec/script_flags as .S in the wave
+      that linked the daemon, see Phase 2) and 2026-09-26 (bitcoin_script.S,
+      bitcoin_multisig.S from their twins); gates test_interp,
+      test_interp_core_vectors, test_tapscript_interp, test_script,
+      test_multisig (incl. main's 2026-09-28 guard-page case) native.
 - [x] bip32 family -> port/osx/bitcoin_keys.S + bitcoin_addr.S +
       bitcoin_bip32.S  DONE 2026-09-09 as native AArch64 asm (all three).
       - bitcoin_keys.S: scalar_small_nonzero (byte-wise n compare; the x86's
@@ -434,10 +482,21 @@ Heavy svc counts from the x86 .asm (measured 2026-09-09):
       still to be re-run per module where they link without x86-only
       objects. node_log's openat and node_make_version's _node_services
       are the two wave bugs the IBD path caught (see OSX_STATE).
-- [ ] bitcoin_cli (2) -- the wallet CLI (bmc_wallet_cli) builds and links
+- [x] bitcoin_cli (2) -- the wallet CLI (bmc_wallet_cli) builds and links
       natively via build_wallet_cli.sh; its two raw syscalls route through
       the same libc surface. Gate = a wallet round-trip against a running
-      osx node, still open.
+      osx node: RUN 2026-09-28 on a throwaway regtest node from the Mac
+      build. `bmc_wallet_cli init` wrote the plaintext store; the daemon
+      loaded it ("wallet store bmcwallet.dat loaded (wallet RPCs live)"),
+      getwalletinfo private_keys_enabled=true, getnewaddress ->
+      bcrt1qe2kgnj...a0s3y with getaddressinfo ismine=true; the CLI
+      re-derived the same witness program from the mnemonic
+      (bc1qe2kgnj...a0s3y: the CLI speaks mainnet by default, `netaddr` the
+      regtest forms). signmessage over the node refuses a bech32 address
+      exactly as Core does ("Address does not refer to key"), so the
+      signature leg is by design not part of it; the CLI's own sign/verify
+      is pinned by test_cli_prompt, test_e2e_sighash, test_send and the
+      wrpc tests, all PASS natively.
       bitcoin_cli.asm itself (the S6 offline STORE CLI, cli_main) -> C twin
       port/osx/cli_twin.c DONE 2026-09-26; test_cli 27/27 (it segfaulted on
       the unresolved cli_main).
@@ -511,9 +570,20 @@ have caught all three).
       gap as testnet4.
 
 ## Phase 4 — parity
-- [ ] differential run vs x86 reference (Linux container on this Mac)
-- [ ] parity sweep summary "pass N" rows verified actually-run
+- [x] differential run vs x86 reference (Linux container on this Mac)
+      SUPERSEDED: done by vectors instead. Every ported module was diffed
+      byte for byte against the x86 objects on the reference box (the
+      per-module "cross-arch differential" lines above), the block path by
+      test_taproot_block_diff (36 mainnet blocks) and the signet UTXO set
+      by gettxoutsetinfo against Core (77,497,355 coins identical), the
+      mainnet node by docs/PARITY_ATTESTATION.md (all five fields equal to
+      Core at 968,570). No container was needed.
+- [x] parity sweep summary "pass N" rows verified actually-run
       (ENGINEERING_RULES: link-check once ran 0 tests silently)
+      DONE: port/osx/run_tests.py records one row per command in
+      results.jsonl (build note, rc, seconds, the check count parsed from
+      the output, the failing lines) and counts only rows it ran; the
+      totals in OSX_STATE.md are those rows (441 commands on 2026-09-28).
 
 ## Recurring Darwin .S pitfalls (found during p0, in this tree)
 - sp must be 16-byte aligned AT EVERY bl SITE: an 8-byte lone x30 push
