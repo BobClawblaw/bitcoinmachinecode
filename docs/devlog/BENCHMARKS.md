@@ -1173,8 +1173,8 @@ the round count). The spread is in the raw output directory.
 | SHA-256, 1,000,000 B | 0.359 ns/B | 0.410 ns/B | 1.14× slower |
 | SHA-256, 32 B | 36.5 ns | 34.3 ns | **0.94× — faster** |
 | SHA-256d, 64 B × 1024 | 45.5 µs | 52.4 µs | 1.15× slower |
-| SHA-1, 1,000,000 B | 0.637 ns/B | 1.581 ns/B | 2.48× slower |
-| SHA-512, 1,000,000 B | 0.955 ns/B | 1.627 ns/B | 1.70× slower |
+| SHA-1, 1,000,000 B | 0.637 ns/B | ~~1.581~~ → **0.374 ns/B** (2026-09-28, SHA-NI) | ~~2.48× slower~~ → **1.70× faster** |
+| SHA-512, 1,000,000 B | 0.955 ns/B | ~~1.627~~ → **0.993 ns/B** (2026-09-28, unrolled) | ~~1.70× slower~~ → 1.04× — parity band |
 | RIPEMD-160, 1,000,000 B | 1.118 ns/B | 1.170 ns/B | 1.05× — parity |
 | Merkle root, 9,001 leaves | 45.0 ns/leaf | 53.0 ns/leaf | 1.18× slower |
 | CheckBlock, block 413,567 (1,557 tx) | 370 µs | 647 µs (`cons_verify`) | 1.75× slower, Core doing more (see `tests/bench_checkblock.c`) |
@@ -1187,8 +1187,9 @@ What moved since 2026-08-22: ECDSA verify from 23.7 µs to 19.9 (safegcd
 `s^{-1}`, #319) — now ahead of libsecp256k1's 20.9 on the same core; BIP340
 verify from ~31 to 21.8 (#320) against libsecp's 20.9. The hash rows did not
 change: SHA-256 over a megabyte is still 1.25× behind Core's SHA-NI path,
-SHA-1 2.5× and SHA-512 1.7× behind, RIPEMD-160 and the 32-byte SHA-256 at
-parity, the merkle root 1.2× behind. `cons_verify` on block 413,567 is 630 µs
+~~SHA-1 2.5× and SHA-512 1.7× behind~~ (2026-09-28: SHA-1 1.7× ahead by
+SHA-NI, SHA-512 within 4% by unrolling), RIPEMD-160 and the 32-byte SHA-256
+at parity, the merkle root 1.2× behind. `cons_verify` on block 413,567 is 630 µs
 against Core's CheckBlock at 366 µs, with Core doing more (the header of
 `tests/bench_checkblock.c` lists what).
 
@@ -1226,7 +1227,7 @@ difference.
 | `BIP324_ECDH` | `ellswift_ecdh` | 20,965.12 | ~~66,598.88~~ → **39,575.22** (2026-09-28) | ns/op | ~~3.18x slower~~ → **1.89x slower** | random encodings on both sides, as Core's bench; the constant-time w=4 window (`point_scalar_mul_win_ct`, 33 µs) replaced the ladder; the rest of the gap is that window against libsecp256k1's GLV `ecmult_const` |
 | `Bech32Encode` | `bech32_encode_(per_input_byte)` | 6.33 | 4.27 | ns/byte | **1.48x faster** |  |
 | `Bech32Decode` | `bech32_decode_+_verify_(per_char)` | 3.33 | 2.80 | ns/byte | **1.19x faster** | decode + checksum verification on both sides |
-| `Base58CheckEncode` | `base58check_encode_(per_byte)` | 47.16 | 145.64 | ns/byte | **3.09x slower** | no plain Base58Encode / Base58Decode on our side |
+| `Base58CheckEncode` | `base58check_encode_(per_byte)` | 47.16 | ~~145.64~~ → **5.98** (2026-09-28) | ns/byte | ~~3.09x slower~~ → **7.86x faster** | no plain Base58Encode / Base58Decode on our side |
 
 The two filter rows use Core's exact input, 100,000 unique 32-byte elements; ours arrive as the outputs of one 4 MB transaction, which `bf_basic_build` parses first. Core's 61.6 µs for hashing a ~263 KB encoded filter is 0.23 ns/byte, faster than its own 1 MB SHA-256 row (0.36); not understood, and the row stands as measured.
 
@@ -1291,9 +1292,17 @@ Reading the table:
     ahead of Core's op. The AEAD packet follows: 1 MB 1.43 → 0.58 (ahead
     1.7×), 256 B 2.19 → 1.39 (parity), 64 B 4.39 → 3.71 — a 64-byte packet
     is three single ChaCha20 blocks and their latency is the row.
-  - **Base58Check, 3.1×.** `base58check_encode` is the straightforward
-    base conversion; Core's is too, but with a wider limb. Address display
-    only.
+  - **Base58Check, 3.1× — 7.9× ahead since 2026-09-28.** `base58check_encode`
+    divided the number byte by byte, one `div` per byte per digit (~1,600 for
+    a 32-byte payload); it now divides 64-bit limbs by 58¹⁰ and splits each
+    remainder into ten digits (~70 divisions): 4.8 µs → 194 ns for Core's
+    32-byte input, held to Python's big integers on 321 vectors. Address
+    display only.
+  - **SHA-1 (2.5×) and SHA-512 (1.7×) — 2026-09-28.** SHA-1 has a SHA-NI body
+    (`sha1_block_shani`, four rounds per instruction; the scalar body is the
+    fallback and the oracle): 1.58 → 0.37 ns/byte, 1.7× ahead of Core's C++.
+    SHA-512's loop is written out with the state in registers (the per-round
+    chain is the floor Core sits on): 1.63 → 0.99 ns/byte, within 4% of Core.
   - **Script verification, 1.08–1.13× on P2WPKH and P2TR key path.** The
     signature verification itself is level (tier 1); the difference is the
     sighash, which Core's `PrecomputedTransactionData` computes once for the

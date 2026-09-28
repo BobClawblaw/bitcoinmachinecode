@@ -140,139 +140,123 @@ sha512_block:
     ; locals stay where they were at [rbp-8], [rbp-16], [rbp-24]; the schedule
     ; sits BELOW them and the two regions do not overlap.
     sub  rsp, 0x2A0                ; 0x20 locals + 0x280 (80*8) schedule
-    mov  r12, rdi                ; state
-    mov  r13, rsi                ; block
-    lea  rbx, [rbp-0x2A0]        ; W base -- per-call, not per-process
+    ; ---- 2026-09-28: the schedule and the 80 rounds are written out, the
+    ; eight state words live in r8-r15 and rotate by NAME through the macro
+    ; (after eight rounds the assignment is back where it started), T1 and T2
+    ; never touch memory, and nothing branches. The 2026-09-27 benchmark had
+    ; this file 1.7x behind Core's plain C++ (1.63 vs 0.955 ns/byte); the
+    ; per-round chain e -> S1 -> T1 -> e' is ~6.5 cycles and that floor is
+    ; where Core sits, so the win is in reaching it, not in the arithmetic.
+    ; The frame is unchanged (CRY-4: the schedule stays on the stack, per
+    ; call); rsp is the schedule's base (0x280 bytes), the 0x20 above it is
+    ; unused.
+    mov  rbx, rdi                ; state (rbx is callee-saved and pushed above)
 
-    ; ---- W[0..15] = big-endian words ----
-    xor  rcx, rcx
-.load:
-    cmp  rcx, 16
-    jae  .load_done
-    mov  rax, [r13 + rcx*8]
+%assign i 0
+%rep 16
+    mov  rax, [rsi + i*8]
     bswap rax
-    mov  [rbx + rcx*8], rax
-    inc  rcx
-    jmp  .load
-.load_done:
+    mov  [rsp + i*8], rax
+%assign i i+1
+%endrep
 
-    ; ---- W[16..79] ----
-    mov  rcx, 16
-.wloop:
-    cmp  rcx, 80
-    jae  .wloop_done
-    mov  rax, [rbx + (rcx-2)*8]
-    mov  r9, rax
-    ror  r9, 19
-    mov  r10, rax
-    ror  r10, 61
-    xor  r9, r10
-    mov  r10, rax
-    shr  r10, 6
-    xor  r9, r10                     ; r9 = s1(W[t-2])
-    mov  rax, [rbx + (rcx-15)*8]
-    mov  r10, rax
-    ror  r10, 1
-    mov  r11, rax
-    ror  r11, 8
-    xor  r10, r11
-    mov  r11, rax
-    shr  r11, 7
-    xor  r10, r11                    ; r10 = s0(W[t-15])
-    mov  r11, r9
-    add  r11, [rbx + (rcx-7)*8]
-    add  r11, r10
-    add  r11, [rbx + (rcx-16)*8]
-    mov  [rbx + rcx*8], r11
-    inc  rcx
-    jmp  .wloop
-.wloop_done:
+; W[i] = s1(W[i-2]) + W[i-7] + s0(W[i-15]) + W[i-16]
+%macro SHA512_W 1
+    mov  rax, [rsp + ((%1)-2)*8]
+    mov  rcx, rax
+    ror  rax, 19
+    ror  rcx, 61
+    xor  rax, rcx
+    mov  rcx, [rsp + ((%1)-2)*8]
+    shr  rcx, 6
+    xor  rax, rcx                        ; s1
+    mov  rcx, [rsp + ((%1)-15)*8]
+    mov  rdx, rcx
+    ror  rcx, 1
+    ror  rdx, 8
+    xor  rcx, rdx
+    mov  rdx, [rsp + ((%1)-15)*8]
+    shr  rdx, 7
+    xor  rcx, rdx                        ; s0
+    add  rax, rcx
+    add  rax, [rsp + ((%1)-7)*8]
+    add  rax, [rsp + ((%1)-16)*8]
+    mov  [rsp + (%1)*8], rax
+%endmacro
+%assign i 16
+%rep 64
+    SHA512_W i
+%assign i i+1
+%endrep
 
-    ; ---- load a..h ----
-    mov  r14, [r12+0]        ; a
-    mov  r15, [r12+8]        ; b
-    mov  rax, [r12+16]       ; c
-    mov  rcx, [r12+24]       ; d
-    mov  rdx, [r12+32]       ; e
-    mov  rsi, [r12+40]       ; f
-    mov  rdi, [r12+48]       ; g
-    mov  r8,  [r12+56]       ; h
+    mov  r8,  [rbx+0]            ; a
+    mov  r9,  [rbx+8]            ; b
+    mov  r10, [rbx+16]           ; c
+    mov  r11, [rbx+24]           ; d
+    mov  r12, [rbx+32]           ; e
+    mov  r13, [rbx+40]           ; f
+    mov  r14, [rbx+48]           ; g
+    mov  r15, [rbx+56]           ; h
 
-    ; ---- 80 rounds (index in r11; temps r9/r10/rbp-16; T1 at [rbp-8]) ----
-    xor  r11, r11
-.round:
-    cmp  r11, 80
-    jae  .round_done
-    ; S1(e)=ROR(e,14)^ROR(e,18)^ROR(e,41)  -> r9, saved to [rbp-16]
-    mov  r9, rdx
-    ror  r9, 14
-    mov  r10, rdx
-    ror  r10, 18
-    xor  r9, r10
-    mov  r10, rdx
-    ror  r10, 41
-    xor  r9, r10
-    mov  [rbp-16], r9                 ; save S1
-    ; Ch=(e&f)^(~e&g)                 -> r9
-    mov  r9, rdx
-    and  r9, rsi
-    mov  r10, rdx
-    not  r10
-    and  r10, rdi
-    xor  r9, r10                      ; r9 = Ch
-    ; T1 = h + S1 + Ch + K[i] + W[i]  -> [rbp-8]
-    mov  r10, r8
-    add  r10, [rbp-16]
-    add  r10, r9
-    add  r10, [K512 + r11*8]
-    add  r10, [rbx + r11*8]
-    mov  [rbp-8], r10                 ; T1
-    ; Maj=(a&b)^(a&c)^(b&c)           -> r10, saved to [rbp-24]
-    mov  r10, r14
-    and  r10, r15                     ; a&b
-    mov  [rbp-16], r10
-    mov  r10, r14
-    and  r10, rax                     ; a&c
-    xor  r10, [rbp-16]                ; (a&c)^(a&b)
-    mov  r9, r15
-    and  r9, rax                      ; b&c
-    xor  r10, r9                      ; r10 = Maj
-    mov  [rbp-24], r10                ; save Maj
-    ; S0(a)=ROR(a,28)^ROR(a,34)^ROR(a,39) -> r9 (temp r10)
-    mov  r9, r14
-    ror  r9, 28
-    mov  r10, r14
-    ror  r10, 34
-    xor  r9, r10
-    mov  r10, r14
-    ror  r10, 39
-    xor  r9, r10                      ; r9 = S0
-    ; T2 = S0 + Maj                   -> r9
-    add  r9, [rbp-24]                 ; r9 = T2
-    ; shift: h=g g=f f=e e=d+T1 d=c c=b b=a a=T1+T2
-    mov  r8, rdi                      ; h = g
-    mov  rdi, rsi                     ; g = f
-    mov  rsi, rdx                     ; f = e
-    mov  rdx, rcx                     ; e = d
-    add  rdx, [rbp-8]                 ; e = d+T1
-    mov  rcx, rax                     ; d = c
-    mov  rax, r15                     ; c = b
-    mov  r15, r14                     ; b = a
-    mov  r10, [rbp-8]
-    add  r10, r9                      ; T1+T2
-    mov  r14, r10                     ; a = T1+T2
-    inc  r11
-    jmp  .round
-.round_done:
-    ; ---- add a..h into state ----
-    add  [r12+0], r14
-    add  [r12+8], r15
-    add  [r12+16], rax
-    add  [r12+24], rcx
-    add  [r12+32], rdx
-    add  [r12+40], rsi
-    add  [r12+48], rdi
-    add  [r12+56], r8
+; one round: h += S1(e) + Ch(e,f,g) + K[i] + W[i]; d += h; h += S0(a) + Maj(a,b,c)
+; (h then holds the new a; the caller rotates the names)
+%macro SHA512_ROUND 9
+    mov  rax, %5
+    ror  rax, 14
+    mov  rcx, %5
+    ror  rcx, 18
+    xor  rax, rcx
+    mov  rcx, %5
+    ror  rcx, 41
+    xor  rax, rcx                        ; S1(e)
+    mov  rcx, %6
+    xor  rcx, %7
+    and  rcx, %5
+    xor  rcx, %7                         ; Ch = (e & (f ^ g)) ^ g
+    add  %8, [rsp + (%9)*8]
+    add  %8, [K512 + (%9)*8]
+    add  %8, rax
+    add  %8, rcx                         ; T1
+    add  %4, %8                          ; d += T1
+    mov  rax, %1
+    ror  rax, 28
+    mov  rcx, %1
+    ror  rcx, 34
+    xor  rax, rcx
+    mov  rcx, %1
+    ror  rcx, 39
+    xor  rax, rcx                        ; S0(a)
+    mov  rcx, %1
+    or   rcx, %2
+    and  rcx, %3
+    mov  rdx, %1
+    and  rdx, %2
+    or   rcx, rdx                        ; Maj = (a & b) | (c & (a | b))
+    add  %8, rax
+    add  %8, rcx                         ; T1 + T2 = the new a
+%endmacro
+%assign i 0
+%rep 10
+    SHA512_ROUND r8,  r9,  r10, r11, r12, r13, r14, r15, i
+    SHA512_ROUND r15, r8,  r9,  r10, r11, r12, r13, r14, i+1
+    SHA512_ROUND r14, r15, r8,  r9,  r10, r11, r12, r13, i+2
+    SHA512_ROUND r13, r14, r15, r8,  r9,  r10, r11, r12, i+3
+    SHA512_ROUND r12, r13, r14, r15, r8,  r9,  r10, r11, i+4
+    SHA512_ROUND r11, r12, r13, r14, r15, r8,  r9,  r10, i+5
+    SHA512_ROUND r10, r11, r12, r13, r14, r15, r8,  r9,  i+6
+    SHA512_ROUND r9,  r10, r11, r12, r13, r14, r15, r8,  i+7
+%assign i i+8
+%endrep
+
+    add  [rbx+0],  r8
+    add  [rbx+8],  r9
+    add  [rbx+16], r10
+    add  [rbx+24], r11
+    add  [rbx+32], r12
+    add  [rbx+40], r13
+    add  [rbx+48], r14
+    add  [rbx+56], r15
+
     add  rsp, 0x2A0                ; CRY-4: must match the reservation above
     pop  rbp                       ; save area is ABOVE rbp -- rbp pops first
     pop  r15
