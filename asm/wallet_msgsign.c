@@ -62,6 +62,7 @@ extern void fe_sqr(uint64_t r[4], const uint64_t a[4]);
 extern void fe_inv(uint64_t r[4], const uint64_t a[4]);
 extern void sc_mul(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]);
 extern void sc_inv(uint64_t r[4], const uint64_t a[4]);
+extern void point_scalar_mul_gen_ct(uint64_t r[12], const uint64_t k[4]);   /* k*G by the comb (2026-09-28) */
 extern void point_scalar_mul_ct(uint64_t r[12], const uint64_t xy[8],
                                 const uint64_t k[4]);
 extern void point_add_mixed(uint64_t r[12], const uint64_t p[12],
@@ -196,14 +197,6 @@ static const uint64_t N_SC[4] = {
     0xFFFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL
 };
 /* generator G affine (X,Y). */
-static const uint64_t G_X[4] = {
-    0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL,
-    0x55A06295CE870B07ULL, 0x79BE667EF9DCBBACULL
-};
-static const uint64_t G_Y[4] = {
-    0x9C47D08FFB10D4B8ULL, 0xFD17B448A6855419ULL,
-    0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL
-};
 
 /* mod-p field sqrt: for p == 3 (mod 4), sqrt(a) = a^{(p+1)/4} mod p.
  * We compute e = (p+1)/4 by ordinary limb arithmetic on p (guaranteed exact)
@@ -372,9 +365,8 @@ static int ecdsa_recover(const uint64_t r[4], const uint64_t s[4],
 
     /* ---- compute s*R and z*G (Jacobian), then sR - zG, then Q = r^-1*T ---- */
     uint64_t sR[12], zG[12];
-    uint64_t Gaff[8] = {G_X[0],G_X[1],G_X[2],G_X[3], G_Y[0],G_Y[1],G_Y[2],G_Y[3]};
     point_scalar_mul_ct(sR, R_aff, s);
-    point_scalar_mul_ct(zG, Gaff, zdig);
+    point_scalar_mul_gen_ct(zG, zdig);
     /* negate zG (Jacobian: negate Y) */
     fe_neg(zG + 4, zG + 4);
     uint64_t T[12];

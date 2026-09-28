@@ -73,39 +73,42 @@ static unsigned long long bf_map(unsigned long long h, unsigned long long nm){
 }
 
 /* ---- bit writer --------------------------------------------------------- */
-typedef struct { unsigned char* out; unsigned long cap; unsigned long bitpos; int overflow; } bf_bw;
-/* STO-2 (audit 2026-09-03): the writer OWNS every byte it touches.
- *
- * This used to OR into a buffer the CALLER was expected to have zeroed, and
- * bf_basic_build zeroed only the first 64 KiB of it (see the removed memset
- * below). Every caller passes a REUSED buffer -- bfilter_index.c's static
- * BFI_MAX_FILTER malloc, build_block_filters.c's `static u8 filter[1u<<20]`,
- * rpc_chain.c's `static unsigned char flt[1<<20]` -- so any filter whose
- * bitstream ran past 65,536 bytes came out as `previous_filter_bits |
- * this_filter_bits`. A basic filter is ~2.6 bytes per element, so ~25k
- * distinct scripts in one block crosses the line, which consolidation-era and
- * inscription-era mainnet blocks do. The stored filter, its sha256d, and
- * every bf_header after it then diverge from Core permanently.
- *
- * Clearing the byte on FIRST TOUCH removes the caller contract entirely: the
- * bitstream no longer depends on the buffer's prior contents at any size, so
- * there is no zeroing window left to get wrong. It is also strictly cheaper
- * than the memset it replaces -- O(bytes actually written) instead of
- * O(cap) -- which matters because cap is 1 MiB and a typical filter is a few
- * KiB. The trailing bits of the final partial byte are zero for the same
- * reason: that byte was cleared when its first bit was written. */
-static void bw_bit(bf_bw* w, int bit){
-    unsigned long byte = w->bitpos >> 3;
-    unsigned bitidx = (unsigned)(w->bitpos & 7);
-    if (byte >= w->cap){ w->overflow = 1; return; }
-    if (bitidx == 0) w->out[byte] = 0;
-    if (bit) w->out[byte] |= (unsigned char)(0x80u >> bitidx);
-    w->bitpos++;
+typedef struct {
+    unsigned char* out; unsigned long cap;
+    unsigned long bitpos;            /* bits committed to out[] plus those still in acc */
+    int overflow;
+    unsigned long long acc; int nacc; /* the pending bits, MSB first; nacc < 40 */
+} bf_bw;
+/* The Golomb-Rice stream is MSB-first. This writer (2026-09-28) accumulates
+ * up to 32 bits per call in a 64-bit word and stores whole bytes; the old
+ * one stored one BIT per call, and on a 100,000-element filter (2.4 million
+ * bits) that alone was ~5 ms of a 13 ms build. bw_finish pads the last byte
+ * with zeros, as the bit-at-a-time writer's untouched bits were. */
+static void bw_emit(bf_bw* w){
+    while (w->nacc >= 8){
+        unsigned long byte = w->bitpos >> 3;
+        if (byte >= w->cap){ w->overflow = 1; w->nacc = 0; return; }
+        w->out[byte] = (unsigned char)(w->acc >> (w->nacc - 8));
+        w->nacc -= 8; w->bitpos += 8;
+    }
 }
-static void bw_bits(bf_bw* w, unsigned long long v, int n){
-    for (int i = n - 1; i >= 0; i--) bw_bit(w, (int)((v >> i) & 1));
+static void bw_put(bf_bw* w, unsigned long long v, int n){          /* 1 <= n <= 32 */
+    w->acc = (w->acc << n) | (v & ((1ULL << n) - 1));
+    w->nacc += n;
+    bw_emit(w);
 }
-
+static void bw_ones(bf_bw* w, unsigned long long q){
+    while (q >= 32){ bw_put(w, 0xffffffffULL, 32); q -= 32; }
+    if (q) bw_put(w, (1ULL << q) - 1, (int)q);
+}
+static void bw_finish(bf_bw* w){
+    if (w->nacc){
+        unsigned long byte = w->bitpos >> 3;
+        if (byte >= w->cap){ w->overflow = 1; return; }
+        w->out[byte] = (unsigned char)(w->acc << (8 - w->nacc));
+        w->bitpos += (unsigned long)w->nacc; w->nacc = 0;
+    }
+}
 /* ---- element collection ------------------------------------------------- */
 static unsigned long bf_varint(const unsigned char* p, const unsigned char* end,
                                unsigned long* consumed){
@@ -132,24 +135,25 @@ static int bf_element_ok(const unsigned char* spk, unsigned long len){
     return 1;
 }
 
-static int bf_cmp_u64(const void* a, const void* b){
-    unsigned long long x = *(const unsigned long long*)a, y = *(const unsigned long long*)b;
-    return x < y ? -1 : x > y ? 1 : 0;
+/* LSD radix sort of the mapped hashes, 8 passes of 8 bits through a scratch
+ * array (2026-09-28). The values are < N*M < 2^37 for any real filter, so a
+ * pass whose byte is zero everywhere is skipped by its histogram. qsort on
+ * 100,000 values was ~8 ms of a 21 ms filter; this is well under 1 ms. */
+static void bf_radix_sort_u64(unsigned long long* h, unsigned long long* tmp, unsigned long n){
+    unsigned long long* src = h; unsigned long long* dst = tmp;
+    for (int pass = 0; pass < 8; pass++){
+        unsigned long cnt[256]; memset(cnt, 0, sizeof cnt);
+        int shift = pass * 8;
+        for (unsigned long i = 0; i < n; i++) cnt[(src[i] >> shift) & 0xff]++;
+        if (cnt[0] == n) continue;
+        unsigned long pos = 0;
+        for (int b = 0; b < 256; b++){ unsigned long c = cnt[b]; cnt[b] = pos; pos += c; }
+        for (unsigned long i = 0; i < n; i++) dst[cnt[(src[i] >> shift) & 0xff]++] = src[i];
+        unsigned long long* t = src; src = dst; dst = t;
+    }
+    if (src != h) memcpy(h, src, n * sizeof *h);
 }
 
-/* STO-14: order two elements by CONTENT, so equal elements land adjacent and
- * can be dropped. Core keeps its elements in
- * `std::unordered_set<std::vector<unsigned char>>`, which de-duplicates by
- * VALUE; sorting is this implementation's way of reaching the same set
- * without a hash table. The particular order does not matter -- only that
- * equal elements compare equal -- so length first (cheap, and it makes the
- * memcmp safe) then bytes. */
-static int bf_cmp_el(const void* a, const void* b){
-    const bf_script* x = (const bf_script*)a;
-    const bf_script* y = (const bf_script*)b;
-    if (x->len != y->len) return x->len < y->len ? -1 : 1;
-    return memcmp(x->script, y->script, x->len);
-}
 
 long bf_basic_build(const unsigned char* block, unsigned long blocklen,
                     const unsigned char block_hash[32],
@@ -259,51 +263,79 @@ long bf_basic_build(const unsigned char* block, unsigned long blocklen,
      * Cost: one extra sort over (pointer, length) pairs. The elements are not
      * copied; el[] points into the block and the caller's prevout scripts,
      * both of which outlive this function. */
-    qsort(el, n, sizeof *el, bf_cmp_el);
-    { unsigned long w = 0;
-      for (unsigned long i = 0; i < n; i++){
-          if (w > 0 && el[w-1].len == el[i].len &&
-              memcmp(el[w-1].script, el[i].script, el[i].len) == 0) continue;
-          el[w++] = el[i];
-      }
-      n = w; }
-    for (unsigned long i = 0; i < n; i++)
-        h[i] = bf_siphash(k0, k1, el[i].script, el[i].len);
-
-    unsigned long long nm = (unsigned long long)n * 784931ULL;
-    for (unsigned long i = 0; i < n; i++) h[i] = bf_map(h[i], nm);
-    qsort(h, n, sizeof *h, bf_cmp_u64);
-
-    /* serialize: CompactSize(N) then the Golomb-Rice stream */
-    unsigned long o = 0;
-    if (n < 0xfd){ if (o >= cap){ free(el); free(h); return -1; } out[o++] = (unsigned char)n; }
-    else if (n <= 0xffff){
-        if (o + 3 > cap){ free(el); free(h); return -1; }
-        out[o++] = 0xfd; out[o++] = (unsigned char)n; out[o++] = (unsigned char)(n >> 8);
-    } else {
-        if (o + 5 > cap){ free(el); free(h); return -1; }
-        out[o++] = 0xfe;
-        for (int i = 0; i < 4; i++) out[o++] = (unsigned char)(n >> (8*i));
-    }
-    bf_bw w = { out + o, cap - o, 0, 0 };
-    /* No memset: bw_bit clears each byte on first touch (STO-2). */
-    unsigned long long prev = 0;
-    for (unsigned long i = 0; i < n; i++){
-        unsigned long long d = h[i] - prev;
-        prev = h[i];
-        unsigned long long q = d >> 19;
-        while (q--) bw_bit(&w, 1);
-        bw_bit(&w, 0);
-        bw_bits(&w, d & ((1ULL << 19) - 1), 19);
-    }
-    free(el); free(h);
-    if (w.overflow) return -1;
-    return (long)(o + ((w.bitpos + 7) >> 3));
-
+    { long r = bf_build_hashed(k0, k1, el, n, out, cap); free(el); free(h); return r; }
 malformed:
     free(el); free(h);
     return -1;
 }
+
+/* The filter from a collected element list: de-duplicate by content, hash,
+ * sort, Golomb-Rice encode. This is the part Core's GCSFilterConstruct
+ * benchmark times (GCSFilter(params, elements) over 100,000 ready-made
+ * elements); bf_basic_build parses the block and calls it. el[] is sorted in
+ * place. Returns the encoded length, -1 on overflow or allocation failure. */
+long bf_build_hashed(unsigned long long k0, unsigned long long k1,
+                     bf_script* el, unsigned long n,
+                     unsigned char* out, unsigned long cap){
+    unsigned long long* h = malloc((n + 1) * sizeof *h);
+    unsigned long long* tmp = malloc((n + 1) * sizeof *tmp);
+    if (!h || !tmp){ free(h); free(tmp); return -1; }
+    /* De-duplicate by CONTENT (STO-14: Core's element set is keyed by value),
+     * through an open-addressing table on each element's SipHash (2026-09-28;
+     * a qsort by content was ~5 ms of a 13 ms build for 100,000 elements).
+     * Exact: a hash match is confirmed by memcmp, so two distinct elements
+     * that collide on 64 bits are BOTH kept and both hashes go to the filter
+     * -- as Core, which never drops equal hashes. The survivors' hashes are
+     * kept, so the filter's own hashing is this same pass. */
+    { unsigned long tsz = 1; while (tsz < 2 * n + 2) tsz <<= 1;
+      unsigned long* tab = malloc(tsz * sizeof *tab);
+      if (!tab){ free(h); free(tmp); return -1; }
+      memset(tab, 0xff, tsz * sizeof *tab);                /* ~0UL = empty */
+      unsigned long w = 0;
+      for (unsigned long i = 0; i < n; i++){
+          unsigned long long hv = bf_siphash(k0, k1, el[i].script, el[i].len);
+          unsigned long pos = (unsigned long)hv & (tsz - 1);
+          int dup = 0;
+          while (tab[pos] != ~0UL){
+              unsigned long j = tab[pos];
+              if (h[j] == hv && el[j].len == el[i].len && memcmp(el[j].script, el[i].script, el[i].len) == 0){ dup = 1; break; }
+              pos = (pos + 1) & (tsz - 1);
+          }
+          if (!dup){ tab[pos] = w; el[w] = el[i]; h[w] = hv; w++; }
+      }
+      n = w; free(tab); }
+    unsigned long long nm = (unsigned long long)n * 784931ULL;
+    for (unsigned long i = 0; i < n; i++) h[i] = bf_map(h[i], nm);
+    bf_radix_sort_u64(h, tmp, n);
+
+    /* serialize: CompactSize(N) then the Golomb-Rice stream */
+    unsigned long o = 0;
+    if (n < 0xfd){ if (o >= cap){ free(h); free(tmp); return -1; } out[o++] = (unsigned char)n; }
+    else if (n <= 0xffff){
+        if (o + 3 > cap){ free(h); free(tmp); return -1; }
+        out[o++] = 0xfd; out[o++] = (unsigned char)n; out[o++] = (unsigned char)(n >> 8);
+    } else {
+        if (o + 5 > cap){ free(h); free(tmp); return -1; }
+        out[o++] = 0xfe;
+        for (int i = 0; i < 4; i++) out[o++] = (unsigned char)(n >> (8*i));
+    }
+    bf_bw w = { out + o, cap - o, 0, 0, 0, 0 };
+    /* No memset: every byte is stored whole (STO-2 held for the bit writer too). */
+    unsigned long long prev = 0;
+    for (unsigned long i = 0; i < n; i++){
+        unsigned long long d = h[i] - prev;
+        prev = h[i];
+        bw_ones(&w, d >> 19);                           /* the quotient in unary */
+        bw_put(&w, 0, 1);
+        bw_put(&w, d & ((1ULL << 19) - 1), 19);         /* the remainder, P = 19 bits */
+    }
+    bw_finish(&w);
+    free(h); free(tmp);
+    if (w.overflow) return -1;
+    return (long)(o + ((w.bitpos + 7) >> 3));
+
+}
+
 
 void bf_header(const unsigned char* filter, unsigned long len,
                const unsigned char prev_header[32], unsigned char out[32]){

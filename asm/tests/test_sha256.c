@@ -162,6 +162,48 @@ int main(void)
         else { printf("FAIL: dispatch output != explicit sha256_block_shani output\n"); failures++; }
     }
 
+
+    /* ---- multi-block messages, both bodies (2026-09-28) ----
+     * Every vector above fits one block. sha256_full's whole-block run now
+     * goes through sha256_blocks_shani, which keeps the state in registers
+     * across blocks; a defect that only shows from the second block on (the
+     * byte-swap mask reused as scratch, say) needs these. */
+    {
+        extern void sha256_force_path(int p);            /* 0 re-probe, 1 SHA-NI, 2 scalar */
+        extern int  sha256_cpu_has_sha(void);
+        static const uint8_t exp2[32] = {                 /* FIPS 180-4, the 896-bit message */
+            0xcf,0x5b,0x16,0xa7,0x78,0xaf,0x83,0x80,0x03,0x6c,0xe5,0x9e,0x7b,0x04,0x92,0x37,
+            0x0b,0x24,0x9b,0x11,0xe8,0xf0,0x7a,0x51,0xaf,0xac,0x45,0x03,0x7a,0xfe,0xe9,0xd1 };
+        static const uint8_t expm[32] = {                 /* one million 'a' */
+            0xcd,0xc7,0x6e,0x5c,0x99,0x14,0xfb,0x92,0x81,0xa1,0xc7,0xe2,0x84,0xd7,0x3e,0x67,
+            0xf1,0x80,0x9a,0x48,0xa4,0x97,0x20,0x0e,0x04,0x6d,0x39,0xcc,0xc7,0x11,0x2c,0xd0 };
+        const char* m2 = "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu";
+        static uint8_t big[1000000]; memset(big, 'a', sizeof big);
+        int paths[2] = { 2, sha256_cpu_has_sha() ? 1 : 2 };
+        for (int k = 0; k < 2; k++){
+            sha256_force_path(paths[k]);
+            sha256_full(digest, m2, strlen(m2)); check(paths[k] == 1 ? "sha-ni: FIPS two-block message" : "scalar: FIPS two-block message", digest, exp2);
+            sha256_full(digest, big, sizeof big); check(paths[k] == 1 ? "sha-ni: one million 'a'" : "scalar: one million 'a'", digest, expm);
+        }
+        if (sha256_cpu_has_sha()){
+            /* the two bodies against each other on random lengths, including runs of many blocks */
+            unsigned long long rs = 0x5EEDBEEF; long bad = 0;
+            static uint8_t msg[20000];
+            for (int it = 0; it < 500; it++){
+                rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17;
+                unsigned long n = (unsigned long)(rs % 20000);
+                for (unsigned long i = 0; i < n; i++){ rs ^= rs << 13; rs ^= rs >> 7; rs ^= rs << 17; msg[i] = (uint8_t)rs; }
+                uint8_t d1[32], d2[32];
+                sha256_force_path(2); sha256_full(d1, msg, n);
+                sha256_force_path(1); sha256_full(d2, msg, n);
+                if (memcmp(d1, d2, 32)) bad++;
+            }
+            if (bad){ printf("FAIL  scalar vs sha-ni on %ld of 500 random messages\n", bad); failures++; }
+            else printf("PASS  scalar vs sha-ni on 500 random messages (0..19999 bytes)\n");
+        }
+        sha256_force_path(0);
+    }
+
     printf("\n%s (%d failures)\n", failures ? "TESTS FAILED" : "ALL TESTS PASSED", failures);
     return failures ? 1 : 0;
 }

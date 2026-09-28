@@ -484,17 +484,47 @@ sha256_full:
     ; advancing the message pointer until fewer than 64 bytes remain. r15, rbx,
     ; r13, r14 are all callee-saved so they survive the sha256_block calls.
     ; ========================================================================
+    ; 2026-09-28: the whole-block run goes to sha256_blocks_shani in one call
+    ; when the SHA extensions are present (state kept in registers across the
+    ; blocks, no dispatch or copy per block: the 1 MB row 0.447 -> 0.357
+    ; ns/byte, Core's 0.361). The scalar body still takes the run one block at
+    ; a time, in place (this used to `rep movsb` every block into the work
+    ; buffer first).
+    cmp r13, 64
+    jb  .padrun
+    movzx eax, byte [rel shani_ready]
+    test al, al
+    jnz  .have_flag
+    push rbx                ; the probe's CPUID clobbers EBX (our message pointer)
+    call sha256_cpu_has_sha
+    pop  rbx
+    mov  byte [rel shani_ready], 2
+    test eax, eax
+    jz   .have_flag
+    mov  byte [rel shani_ready], 1
+    mov  eax, 1
+.have_flag:
+    cmp  al, 1
+    jne  .blocks
+    mov  rdx, r13
+    shr  rdx, 6             ; whole blocks
+    mov  rax, rdx
+    shl  rax, 6             ; bytes they cover
+    mov  rdi, rsp
+    mov  rsi, rbx
+    push rax
+    sub  rsp, 8             ; keep rsp 16-aligned at the call (it was 0 mod 16)
+    call sha256_blocks_shani
+    add  rsp, 8
+    pop  rax
+    add  rbx, rax
+    sub  r13, rax
+    jmp  .padrun
 .blocks:
     cmp r13, 64
     jb  .padrun             ; < 64 bytes remain -> build the final block(s)
-    ; copy the next 64 message bytes into the work block at [rsp+32]
-    lea rdi, [rsp+32]       ; destination buffer
-    mov rsi, rbx            ; source = current position in msg
-    mov rcx, 64
-    rep movsb               ; copy 64 bytes into the work buffer
-    ; compress that block into the running state
     mov rdi, rsp            ; state = [rsp]
-    lea rsi, [rsp+32]       ; block = [rsp+32]
+    mov rsi, rbx            ; block = the message itself
     call sha256_block
     add rbx, 64             ; advance past the block just consumed
     sub r13, 64             ; 64 fewer bytes remaining
@@ -818,6 +848,197 @@ sha256_cpu_has_sha:
     ret
 
 
+
+; ============================================================================
+; sha256_blocks_shani(state, data, nblocks) -- 2026-09-28: the SHA-NI body
+; over consecutive blocks with the state kept in xmm2/xmm3 (the working
+; layout) across them, so a long message pays the state load, layout shuffle
+; and store once instead of per block, and never goes through the dispatcher
+; between blocks. sha256_full uses it for its run of whole blocks. The rounds
+; are sha256_block_shani's, textually (extracted by script, not retyped).
+; ============================================================================
+global sha256_blocks_shani
+sha256_blocks_shani:
+    test rdx, rdx
+    jz   .done
+    movdqu xmm2, [rdi]
+    movdqu xmm3, [rdi+0x10]
+    movdqu xmm9, [rel _shani_mask]
+    pshufd xmm0, xmm2, 0xb1
+    pshufd xmm2, xmm3, 0x1b
+    movdqa xmm3, xmm0
+    palignr xmm3, xmm2, 0x8
+    pblendw xmm2, xmm0, 0xf0
+.blk:
+    movdqu xmm9, [rel _shani_mask]     ; the rounds reuse xmm9 as scratch: reload per block
+    movdqu xmm7, [rsi]
+    movdqu xmm5, [rsi+0x10]
+    movdqu xmm6, [rsi+0x20]
+    pshufb xmm7, xmm9
+    movdqu xmm8, [rsi+0x30]
+    movdqu xmm0, [rel _shani_K0]
+    pshufb xmm5, xmm9
+    movdqa xmm4, xmm2
+    movdqa xmm1, xmm3
+    pshufb xmm6, xmm9
+    paddd xmm0, xmm7
+    pshufb xmm8, xmm9
+    sha256msg1 xmm7, xmm5
+    sha256rnds2 xmm4, xmm3
+    pshufd xmm0, xmm0, 0xe
+    movdqa xmm9, xmm8
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K1]
+    palignr xmm9, xmm6, 0x4
+    paddd xmm7, xmm9
+    paddd xmm0, xmm5
+    sha256msg2 xmm7, xmm8
+    sha256msg1 xmm5, xmm6
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm0, 0xe
+    movdqa xmm9, xmm7
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K2]
+    palignr xmm9, xmm8, 0x4
+    paddd xmm5, xmm9
+    paddd xmm0, xmm6
+    sha256msg2 xmm5, xmm7
+    sha256msg1 xmm6, xmm8
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm0, 0xe
+    movdqa xmm9, xmm5
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K3]
+    paddd xmm0, xmm8
+    sha256msg1 xmm8, xmm7
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm0, 0xe
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K4]
+    paddd xmm0, xmm7
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm0, 0xe
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K5]
+    paddd xmm0, xmm5
+    palignr xmm5, xmm7, 0x4
+    sha256msg1 xmm7, xmm9
+    paddd xmm6, xmm5
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm0, 0xe
+    sha256msg2 xmm6, xmm9
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K6]
+    movdqa xmm5, xmm6
+    palignr xmm5, xmm9, 0x4
+    paddd xmm0, xmm6
+    sha256msg1 xmm9, xmm6
+    paddd xmm8, xmm5
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm0, 0xe
+    movdqa xmm5, xmm8
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K7]
+    sha256msg2 xmm5, xmm6
+    movdqa xmm8, xmm5
+    paddd xmm0, xmm5
+    palignr xmm8, xmm6, 0x4
+    sha256rnds2 xmm4, xmm1
+    sha256msg1 xmm6, xmm5
+    paddd xmm7, xmm8
+    pshufd xmm0, xmm0, 0xe
+    sha256msg2 xmm7, xmm5
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K8]
+    movdqa xmm8, xmm7
+    palignr xmm8, xmm5, 0x4
+    paddd xmm0, xmm7
+    sha256msg1 xmm5, xmm7
+    paddd xmm9, xmm8
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm0, 0xe
+    sha256msg2 xmm9, xmm7
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K9]
+    movdqa xmm8, xmm9
+    palignr xmm8, xmm7, 0x4
+    paddd xmm0, xmm9
+    sha256msg1 xmm7, xmm9
+    paddd xmm6, xmm8
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm0, 0xe
+    sha256msg2 xmm6, xmm9
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K10]
+    movdqa xmm8, xmm6
+    palignr xmm8, xmm9, 0x4
+    paddd xmm0, xmm6
+    sha256msg1 xmm9, xmm6
+    paddd xmm5, xmm8
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm0, 0xe
+    sha256msg2 xmm5, xmm6
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K11]
+    movdqa xmm8, xmm5
+    palignr xmm8, xmm6, 0x4
+    paddd xmm0, xmm5
+    sha256msg1 xmm6, xmm5
+    paddd xmm7, xmm8
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm0, 0xe
+    sha256msg2 xmm7, xmm5
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K12]
+    movdqa xmm8, xmm7
+    palignr xmm8, xmm5, 0x4
+    paddd xmm0, xmm7
+    sha256msg1 xmm5, xmm7
+    paddd xmm9, xmm8
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm0, 0xe
+    sha256msg2 xmm9, xmm7
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K13]
+    movdqa xmm8, xmm9
+    palignr xmm8, xmm7, 0x4
+    paddd xmm0, xmm9
+    paddd xmm6, xmm8
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm0, 0xe
+    sha256msg2 xmm6, xmm9
+    sha256rnds2 xmm1, xmm4
+    movdqu xmm0, [rel _shani_K14]
+    movdqa xmm7, xmm6
+    palignr xmm7, xmm9, 0x4
+    paddd xmm0, xmm6
+    paddd xmm5, xmm7
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm0, 0xe
+    sha256msg2 xmm5, xmm6
+    paddd xmm5, [rel _shani_K15]
+    sha256rnds2 xmm1, xmm4
+    movdqa xmm0, xmm5
+    sha256rnds2 xmm4, xmm1
+    pshufd xmm0, xmm5, 0xe
+    sha256rnds2 xmm1, xmm4
+    paddd xmm4, xmm2
+    paddd xmm1, xmm3
+    movdqa xmm2, xmm4
+    movdqa xmm3, xmm1
+    add  rsi, 64
+    dec  rdx
+    jnz  .blk
+    ; store: the working layout back to ABCD / EFGH
+    pshufd xmm4, xmm2, 0xb1
+    pshufd xmm1, xmm3, 0x1b
+    movdqa xmm0, xmm1
+    pblendw xmm0, xmm4, 0xf0
+    palignr xmm4, xmm1, 0x8
+    movdqu [rdi], xmm0
+    movdqu [rdi+16], xmm4
+.done:
+    ret
 
 section .note.GNU-stack noalloc noexec nowrite progbits
 
