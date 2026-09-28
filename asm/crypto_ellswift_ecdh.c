@@ -22,8 +22,9 @@
  *
  * The scalar multiplies are constant time -- the scalar is a private key.
  * Since 2026-09-28 they are the comb and window routines of
- * secp256k1_point_ct.asm (k*G by a cmov-scanned table, k*P by a fixed w=4
- * window over the complete formulas) rather than the 256-step ladder, which
+ * secp256k1_point_ct.asm (k*G by a cmov-scanned table, k*P by the GLV
+ * endomorphism over two fixed w=4 windows, both over the complete formulas)
+ * rather than the 256-step ladder, which
  * was the whole of the 6.6x / 3.2x gap to libsecp256k1 (52 us of create's
  * 108 and ECDH's 65). Never point_scalar_mul / _fixed: those index their
  * tables with the digit and skip zero windows, which is fine for a public
@@ -41,7 +42,7 @@ extern void fe_sqr(u64 r[4], const u64 a[4]);
 extern void fe_add(u64 r[4], const u64 a[4], const u64 b[4]);
 extern void fe_inv(u64 r[4], const u64 a[4]);
 extern void point_scalar_mul_gen_ct(u64 r[12], const u64 k[4]);                    /* k*G, constant time */
-extern void point_scalar_mul_win_ct(u64 r[12], const u64 xy[8], const u64 k[4]);   /* k*P, constant time */
+extern void point_scalar_mul_glv_ct(u64 r[12], const u64 xy[8], const u64 k[4]);   /* k*P, constant time, k < n (checked above) */
 extern void sha256_full(unsigned char* out, const void* msg, long long len);
 
 /* group order n, for the range check on the secret key */
@@ -156,7 +157,7 @@ int ellswift_ecdh(unsigned char out32[32],
 
     { u64 aff[8];
       memcpy(aff, x, 32); memcpy(aff + 4, y, 32);
-      point_scalar_mul_win_ct(J, aff, k); }
+      point_scalar_mul_glv_ct(J, aff, k); }
     memset(k, 0, sizeof k);
     if (!jac_x(x, J)) return 0;                  /* our key times their point
                                                   * is infinity only if their

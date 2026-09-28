@@ -43,6 +43,8 @@
 typedef unsigned char u8; typedef uint64_t u64;
 
 /* ---- entry points ------------------------------------------------------ */
+extern void swsig_session_begin(uint64_t key); extern void swsig_session_end(void);
+extern void tapsig_session_begin(uint64_t key); extern void tapsig_session_end(void);
 extern int  p2wpkh_verify(const uint8_t* tx, int64_t txlen, int64_t n_in,
                           const uint8_t* prev_spk, int64_t prev_spklen, uint64_t amount,
                           const uint8_t* vchSig, uint64_t siglen,
@@ -132,8 +134,14 @@ static void bench_verify_script(void){
     static u8 tx[512], spk[64], sig[80], pub[40];
     long txl = unhex(tx, WPKH_TX), spkl = unhex(spk, WPKH_SPK), sigl = unhex(sig, WPKH_SIG), publ = unhex(pub, WPKH_PUB);
     if (txl < 0 || p2wpkh_verify(tx, txl, 0, spk, spkl, WPKH_AMOUNT, sig, (u64)sigl, pub, (u64)publ) != 1){ printf("FAIL: the P2WPKH fixture does not verify\n"); exit(1); }
+    /* Core's bench verifies with a PrecomputedTransactionData; the daemon's
+     * tx_verify begins a sighash session per transaction, which memoises the
+     * BIP143/BIP341 midstates the same way (bitcoin_segwit.c sw_cache,
+     * bitcoin_taproot_sighash.c). The rows run inside such a session, as
+     * production does; without one every call re-hashed the transaction. */
+    swsig_session_begin(0x5e5510); tapsig_session_begin(0x5e5510);
     double ns = MEASURE(2000, p2wpkh_verify(tx, txl, 0, spk, spkl, WPKH_AMOUNT, sig, (u64)sigl, pub, (u64)publ));
-    result("p2wpkh_verify", "VerifyScriptP2WPKH", ns, "ns/op", "(BIP143 sighash + ECDSA, a real mainnet input; Core precomputes its sighash midstates)");
+    result("p2wpkh_verify", "VerifyScriptP2WPKH", ns, "ns/op", "(BIP143 sighash + ECDSA, a real mainnet input, inside a per-tx sighash session as the daemon verifies; Core: PrecomputedTransactionData)");
 
     /* key path: private key 1, an x-only output key WITHOUT a tweak -- the
      * verifier checks the BIP340 signature against the 32 bytes in the
@@ -158,6 +166,7 @@ static void bench_verify_script(void){
     if (taproot_verify_input(v->spk, v->wit, v->witlen, v->nwit, v->tx, v->txlen, 0, v->prevouts, v->amounts, v->spks, v->numin, &reason) != 1){ printf("FAIL: the script-path vector does not verify (%s)\n", reason ? reason : "?"); exit(1); }
     ns = MEASURE(2000, taproot_verify_input(v->spk, v->wit, v->witlen, v->nwit, v->tx, v->txlen, 0, v->prevouts, v->amounts, v->spks, v->numin, &reason));
     result("taproot_verify_input(script)", "VerifyScriptP2TR_ScriptPath", ns, "ns/op", "(control block of a 2-leaf tree + a checksig leaf; Core: a 1-leaf tree)");
+    swsig_session_end(); tapsig_session_end();
 }
 
 /* ---- 2. BlockEncoding --------------------------------------------------- */
@@ -224,8 +233,17 @@ static void bench_gcs(void){
     read_cs(filt, &nel);
     if (nel != NE){ printf("FAIL: the synthetic filter holds %llu elements, not %d\n", (unsigned long long)nel, NE); exit(1); }
     ns = MEASURE(3, bf_basic_build(sb, sblen, hash, NULL, 0, filt, sizeof filt));
-    printf("  synthetic block: 100,000 outputs of 32-byte scripts -> filter %ld bytes, N = %llu\n", sfl, (unsigned long long)nel);
-    result("bf_basic_build (100k elements)", "GCSFilterConstruct", ns, "ns/op", "(one filter over 100,000 unique 32-byte elements, as Core's; ours also parses the 4 MB block that carries them)");
+    printf("  synthetic block: 100,000 outputs of 32-byte scripts -> filter %ld bytes, N = %llu; parse + build %.1f us\n", sfl, (unsigned long long)nel, ns / 1e3);
+    /* Core's exact shape (2026-09-28): GCSFilter(params, elements) over 100,000
+     * ready-made 32-byte elements -- bf_build_hashed, the builder without the
+     * block parse: de-duplicate, SipHash, sort, Golomb-Rice encode. */
+    { static u8 elbuf[NE * 32]; static bf_script els[NE];
+      for (uint32_t i = 0; i < NE; i++){ u8* e = elbuf + (unsigned long)i * 32; e[0] = 0x51; memset(e + 1, 0, 31); put32(e + 1, i); els[i].script = e; els[i].len = 32; }
+      unsigned long long k0 = 0, k1 = 0;
+      long hl = bf_build_hashed(k0, k1, els, NE, filt, sizeof filt);
+      if (hl <= 0){ printf("FAIL: bf_build_hashed over 100,000 elements (%ld)\n", hl); exit(1); }
+      ns = MEASURE(3, for (uint32_t i = 0; i < NE; i++){ els[i].script = elbuf + (unsigned long)i * 32; els[i].len = 32; } bf_build_hashed(k0, k1, els, NE, filt, sizeof filt); k0++);
+      result("bf_build_hashed (100k elements)", "GCSFilterConstruct", ns, "ns/op", "(100,000 unique 32-byte elements handed to the builder, as Core's GCSFilter(params, elements); the SipHash key steps per op as Core's loop does)"); }
     u8 prevh[32] = {0}, out[32];
     ns = MEASURE(50, bf_header(filt, (unsigned long)sfl, prevh, out));
     result("bf_header (100k-element filter)", "GCSBlockFilterGetHash", ns, "ns/op", "(sha256d of the encoded 100,000-element filter plus the header link)");

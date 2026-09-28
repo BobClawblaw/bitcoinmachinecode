@@ -39,7 +39,7 @@ extern fe_sqr
 extern fe_inv
 ; FINDING 1: scalar_to_pubkey multiplies by the SECRET private key, so it
 ; uses the constant-time ladder rather than the variable-time windowed one.
-extern point_scalar_mul_ct
+extern point_scalar_mul_gen_ct
 
 ; ============================================================================
 ; int scalar_small_nonzero(const u8 k[32])
@@ -113,9 +113,8 @@ scalar_to_pubkey:
 
     ; ---- point = k*G (Jacobian) into [rbp-0xc8] ----
     lea  rdi, [rbp-0xc8]
-    lea  rsi, [G_AFF]
-    lea  rdx, [rbp-0x58]
-    call point_scalar_mul_ct
+    lea  rsi, [rbp-0x58]
+    call point_scalar_mul_gen_ct   ; k*G by the cmov-scanned comb (2026-09-28): 9 us, the ladder was 52
 
     ; ---- affinize ----
     ; z2 = Z^2  (Z is element at point+2 => [rbp-0xc8+64])

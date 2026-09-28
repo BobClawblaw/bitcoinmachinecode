@@ -27,7 +27,7 @@ CAVEAT = {
     'VerifyScriptP2WPKH': 'Core precomputes the sighash midstates once; ours hashes per op',
     'VerifyScriptP2TR_KeyPath': 'Core precomputes the sighash midstates once; ours hashes per op',
     'VerifyScriptP2TR_ScriptPath': 'ours spends a 2-leaf tree (one more merkle step); Core a 1-leaf tree',
-    'GCSFilterConstruct': '100,000 unique 32-byte elements on both sides; ours also parses the 4 MB block carrying them',
+    'GCSFilterConstruct': '100,000 unique 32-byte elements handed to the builder on both sides (since 2026-09-28; the row had included our block parse)',
     'GCSBlockFilterGetHash': 'the encoded 100,000-element filter hashed on both sides',
     'ReadRawBlockBench': 'raw bytes on both sides',
     'WriteBlockBench': 'the same block appended each op on both sides',

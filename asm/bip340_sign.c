@@ -11,7 +11,7 @@
 #include <stdint.h>
 typedef unsigned char u8;
 extern void sha256_full(u8 out[32], const void* msg, unsigned long len);
-extern void point_scalar_mul_ct(uint64_t r[12], const uint64_t xy[8], const uint64_t k[4]);
+extern void point_scalar_mul_gen_ct(uint64_t r[12], const uint64_t k[4]);   /* k*G, constant time: the cmov-scanned comb (2026-09-28), 9 us for the ladder's 52 */
 extern void fe_mul(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]);
 extern void fe_sqr(uint64_t r[4], const uint64_t a[4]);
 extern void fe_inv(uint64_t r[4], const uint64_t a[4]);
@@ -19,9 +19,6 @@ extern void sc_add(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]);
 extern void sc_mul(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]);
 
 static const uint64_t N_LIMBS[4] = { 0xBFD25E8CD0364141ULL, 0xBAAEDCE6AF48A03BULL, 0xFFFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL };
-static const uint64_t G_AFF[8] = {
-    0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL, 0x55A06295CE870B07ULL, 0x79BE667EF9DCBBACULL,
-    0x9C47D08FFB10D4B8ULL, 0xFD17B448A6855419ULL, 0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL };
 
 static void be32_to_limbs(uint64_t out[4], const u8 be[32]){
     for (int i = 0; i < 4; i++) out[i] = 0;
@@ -90,7 +87,7 @@ static int tagged(u8 out[32], const char* tag, const u8* a, unsigned long al, co
 int bip340_pubkey(u8 xonly[32], const u8 priv_be[32]){
     uint64_t d[4], J[12]; be32_to_limbs(d, priv_be);
     if (is_zero(d) || limb_cmp(d, N_LIMBS) >= 0) return 0;
-    point_scalar_mul_ct(J, G_AFF, d);
+    point_scalar_mul_gen_ct(J, d);
     int odd; jac_to_x_parity(xonly, &odd, J);
     return 1;
 }
@@ -100,7 +97,7 @@ int bip340_pubkey(u8 xonly[32], const u8 priv_be[32]){
 int bip340_sign(u8 sig[64], const u8* msg, unsigned long msglen, const u8 priv_be[32], const u8 aux[32]){
     uint64_t d0[4], d[4], J[12]; be32_to_limbs(d0, priv_be);
     if (is_zero(d0) || limb_cmp(d0, N_LIMBS) >= 0) return 0;
-    point_scalar_mul_ct(J, G_AFF, d0);
+    point_scalar_mul_gen_ct(J, d0);
     u8 px[32]; int podd; jac_to_x_parity(px, &podd, J);
     if (podd) neg_n(d, d0); else memcpy(d, d0, 32);
     u8 dbe[32]; limbs_to_be32(dbe, d);
@@ -111,7 +108,7 @@ int bip340_sign(u8 sig[64], const u8* msg, unsigned long msglen, const u8 priv_b
     u8 kh[32]; if (!tagged(kh, "BIP0340/nonce", t, 32, px, 32, msg, msglen)) return 0;
     uint64_t k0r[4], k0[4]; be32_to_limbs(k0r, kh); reduce_n(k0, k0r);
     if (is_zero(k0)) return 0;
-    uint64_t R[12]; point_scalar_mul_ct(R, G_AFF, k0);
+    uint64_t R[12]; point_scalar_mul_gen_ct(R, k0);
     u8 rx[32]; int rodd; jac_to_x_parity(rx, &rodd, R);
     uint64_t k[4]; if (rodd) neg_n(k, k0); else memcpy(k, k0, 32);
     /* e = int(TaggedHash("BIP0340/challenge", R || P || m)) mod n */
@@ -129,7 +126,7 @@ int bip340_sign(u8 sig[64], const u8* msg, unsigned long msglen, const u8 priv_b
 int bip340_tweak_privkey(u8 out_priv[32], const u8 priv_be[32], const u8 tweak[32]){
     uint64_t d0[4], d[4], J[12], t[4], r[4]; be32_to_limbs(d0, priv_be);
     if (is_zero(d0) || limb_cmp(d0, N_LIMBS) >= 0) return 0;
-    point_scalar_mul_ct(J, G_AFF, d0);
+    point_scalar_mul_gen_ct(J, d0);
     u8 px[32]; int podd; jac_to_x_parity(px, &podd, J);
     if (podd) neg_n(d, d0); else memcpy(d, d0, 32);
     be32_to_limbs(t, tweak); if (limb_cmp(t, N_LIMBS) >= 0) return 0;

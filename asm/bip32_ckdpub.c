@@ -21,7 +21,7 @@
 extern void fe_mul(uint64_t r[4], const uint64_t a[4], const uint64_t b[4]);
 extern void fe_sqr(uint64_t r[4], const uint64_t a[4]);
 extern void fe_inv(uint64_t r[4], const uint64_t a[4]);
-extern void point_scalar_mul_ct(uint64_t r[12], const uint64_t xy[8], const uint64_t k[4]);
+extern void point_scalar_mul_gen_ct(uint64_t r[12], const uint64_t k[4]);   /* k*G, constant time (the comb, 2026-09-28) */
 extern void point_add(uint64_t r[12], const uint64_t p[12], const uint64_t q[12]);
 extern void hmac_sha512(unsigned char out[64], const void* key, long long keylen,
                         const void* data, long long datalen);
@@ -36,12 +36,6 @@ static const uint64_t N_SC[4] = {
     0xBFD25E8CD0364141ULL, 0xBAAEDCE6AF48A03BULL,
     0xFFFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL };
 /* generator G affine (X,Y). */
-static const uint64_t G_X[4] = {
-    0x59F2815B16F81798ULL, 0x029BFCDB2DCE28D9ULL,
-    0x55A06295CE870B07ULL, 0x79BE667EF9DCBBACULL };
-static const uint64_t G_Y[4] = {
-    0x9C47D08FFB10D4B8ULL, 0xFD17B448A6855419ULL,
-    0x5DA4FBFC0E1108A8ULL, 0x483ADA7726A3C465ULL };
 
 static int  fe_is_zero(const uint64_t a[4]){ return (a[0]|a[1]|a[2]|a[3])==0; }
 static void fe_cpy(uint64_t r[4], const uint64_t a[4]){ memcpy(r,a,32); }
@@ -184,8 +178,7 @@ static int ckdpub_step(const unsigned char Kpar[33], const unsigned char ccpar[3
     be32_to_limbs(IL, I);                               /* IL as scalar */
     if (fe_is_zero(IL) || !lt_n(IL)) return 0;          /* invalid per BIP32 */
     /* point(IL)*G  (Jacobian) */
-    uint64_t Gaff[8] = {G_X[0],G_X[1],G_X[2],G_X[3], G_Y[0],G_Y[1],G_Y[2],G_Y[3]};
-    uint64_t ILG[12]; point_scalar_mul_ct(ILG, Gaff, IL);
+    uint64_t ILG[12]; point_scalar_mul_gen_ct(ILG, IL);
     /* parent point as Jacobian (Z=1) */
     uint64_t Px[4], Py[4];
     if (decompress(Kpar, Px, Py) != 0) return 0;
@@ -236,8 +229,7 @@ int bip32_xonly_tweak_add(const unsigned char x[32], const unsigned char t[32], 
     if (decompress(comp, Px, Py) != 0) return 0;
     uint64_t T[4]; be32_to_limbs(T, t);
     if (fe_is_zero(T) || !lt_n(T)) return 0;
-    uint64_t Gaff[8] = {G_X[0],G_X[1],G_X[2],G_X[3], G_Y[0],G_Y[1],G_Y[2],G_Y[3]};
-    uint64_t TG[12]; point_scalar_mul_ct(TG, Gaff, T);
+    uint64_t TG[12]; point_scalar_mul_gen_ct(TG, T);
     uint64_t Pj[12] = {Px[0],Px[1],Px[2],Px[3], Py[0],Py[1],Py[2],Py[3], 1,0,0,0};
     uint64_t Qj[12]; point_add(Qj, TG, Pj);
     uint64_t Qx[4], Qy[4];
@@ -254,8 +246,7 @@ int bip32_xonly_tweak_add_par(const unsigned char x[32], const unsigned char t[3
     if (decompress(comp, Px, Py) != 0) return 0;
     uint64_t T[4]; be32_to_limbs(T, t);
     if (fe_is_zero(T) || !lt_n(T)) return 0;
-    uint64_t Gaff[8] = {G_X[0],G_X[1],G_X[2],G_X[3], G_Y[0],G_Y[1],G_Y[2],G_Y[3]};
-    uint64_t TG[12]; point_scalar_mul_ct(TG, Gaff, T);
+    uint64_t TG[12]; point_scalar_mul_gen_ct(TG, T);
     uint64_t Pj[12] = {Px[0],Px[1],Px[2],Px[3], Py[0],Py[1],Py[2],Py[3], 1,0,0,0};
     uint64_t Qj[12]; point_add(Qj, TG, Pj);
     uint64_t Qx[4], Qy[4];

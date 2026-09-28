@@ -922,4 +922,327 @@ point_scalar_mul_win_ct:
     pop  rbp
     ret
 
+
+; ----------------------------------------------------------------------------
+; The table scan with AVX2 (2026-09-28). The cmov scan reads 16 entries x 12
+; limbs one qword at a time (~100 ns); with AVX2 each entry is three 32-byte
+; loads blended into three accumulators under a lane mask that is all-ones
+; when the entry index equals the digit (~25 ns). Same property: every entry
+; is read, the digit only ever meets a compare. The probe runs once and is
+; cached; the choice depends on the CPU, never on the scalar.
+;   point_ct_force_scan(edi): 0 re-probe, 1 AVX2, 2 cmov (tests run both).
+; ----------------------------------------------------------------------------
+section .data
+ct_scan_path: db 0
+section .rodata
+align 32
+CT_ONE_DD: dd 1,1,1,1,1,1,1,1
+section .text
+global point_ct_force_scan
+point_ct_force_scan:
+    mov  byte [rel ct_scan_path], dil
+    ret
+ct_scan_probe:                     ; eax = 1 if AVX2 usable (leaf 7 ebx.5, OSXSAVE, XCR0[2:1])
+    push rbx
+    xor  eax, eax
+    cpuid
+    cmp  eax, 7
+    jb   .no
+    mov  eax, 1
+    xor  ecx, ecx
+    cpuid
+    bt   ecx, 27
+    jnc  .no
+    mov  eax, 7
+    xor  ecx, ecx
+    cpuid
+    bt   ebx, 5
+    jnc  .no
+    xor  ecx, ecx
+    xgetbv
+    and  eax, 6
+    cmp  eax, 6
+    jne  .no
+    mov  eax, 1
+    pop  rbx
+    ret
+.no:
+    xor  eax, eax
+    pop  rbx
+    ret
+; sets al = 1 (AVX2) or 2 (cmov) into [rbp-0x1f8] for this call; clobbers rax, rcx, rdx, rbx? no: cpuid inside the probe saves rbx
+%macro CT_SCAN_SELECT 0
+    movzx eax, byte [rel ct_scan_path]
+    test eax, eax
+    jnz  %%have
+    call ct_scan_probe
+    mov  ecx, 2
+    test eax, eax
+    mov  eax, 1
+    cmovz eax, ecx
+    mov  byte [rel ct_scan_path], al
+%%have:
+    mov  byte [rbp-0x1f8], al
+%endmacro
+; T (rbp-0x100) = entry ebx of the 16-entry, 96-byte-entry table at rbp-%1
+%macro GLV_SCAN_AVX2 1
+    vmovd   xmm15, ebx
+    vpbroadcastd ymm15, xmm15          ; the digit in every lane
+    vpxor   ymm14, ymm14, ymm14        ; the running index
+    vmovdqu ymm13, [rel CT_ONE_DD]      ; unaligned: this .rodata is 16-aligned
+    vpxor   ymm0, ymm0, ymm0
+    vpxor   ymm1, ymm1, ymm1
+    vpxor   ymm2, ymm2, ymm2
+    lea  r15, [rbp-%1]
+    mov  ecx, 16
+%%scan:
+    vpcmpeqd ymm3, ymm14, ymm15        ; all-ones lanes when index == digit
+    vpblendvb ymm0, ymm0, [r15+0],  ymm3
+    vpblendvb ymm1, ymm1, [r15+32], ymm3
+    vpblendvb ymm2, ymm2, [r15+64], ymm3
+    vpaddd  ymm14, ymm14, ymm13
+    add  r15, 96
+    dec  ecx
+    jnz  %%scan
+    vmovdqu [rbp-0x100+0],  ymm0
+    vmovdqu [rbp-0x100+32], ymm1
+    vmovdqu [rbp-0x100+64], ymm2
+%endmacro
+; either scan, by the per-call selection at [rbp-0x1f8]
+%macro GLV_SCAN_ANY 1
+    cmp  byte [rbp-0x1f8], 1
+    jne  %%cmov
+    GLV_SCAN_AVX2 %1
+    jmp  %%done
+%%cmov:
+    GLV_SCAN %1
+%%done:
+%endmacro
+
+; ============================================================================
+; point_scalar_mul_glv_ct(out[12], xy[8], k[4]) : out = k*P, CONSTANT TIME,
+;   the GLV endomorphism halving the doublings (2026-09-28, for the BIP324
+;   ECDH: the w=4 window above was 33 of its 40 us against libsecp256k1's
+;   GLV-split ecmult_const).
+;
+;   k = r1 + lambda*r2 (mod n) by sc_split_lambda (secp256k1_scalar.asm --
+;   libsecp256k1's constant-time split: its only branch is the identity
+;   check that fails only on a bug, and the scalar primitives it calls have
+;   none). Each of r1, r2 is either < 2^128 or has a negation mod n that is;
+;   the sign is folded into the POINT (y -> p - y, selected with cmov) so
+;   both scalars are non-negative 128-bit values, and the second base is
+;   lambda*P = (beta*x, y). Then 33 nibble windows (132 bits, the slack the
+;   split's bound leaves) of: four complete doubles, a cmov scan of P's
+;   16-entry table, one complete add, a cmov scan of lambda*P's table, one
+;   complete add. 132 doubles + 66 adds, all complete; no secret reaches an
+;   address or a branch (the digits reach `cmp` only).
+;
+;   Requires k < n (every caller passes a range-checked secret key). If the
+;   split's identity check ever failed the routine falls back to the window
+;   above, which is correct for any k; that branch is taken on a defect,
+;   never on a value.
+;
+;   Slots (rbp-relative): R @ -0xa0, T @ -0x100, r1 @ -0x120, r2 @ -0x140,
+;   P1 @ -0x180 (affine, 64), P2 @ -0x1c0 (64), t @ -0x1e0 (32),
+;   kptr @ -0x1e8, mask @ -0x1f0, scan selection @ -0x1f8, TB1 @ -0x800
+;   (0x600, up to -0x201), TB2 @ -0xe00 (0x600). sub rsp, 0xdd8 (== 8 mod 16).
+; ============================================================================
+extern sc_split_lambda
+extern sc_sub
+extern fe_sub
+section .rodata
+align 16
+CT_ORDER_N: dq 0xBFD25E8CD0364141, 0xBAAEDCE6AF48A03B, 0xFFFFFFFFFFFFFFFE, 0xFFFFFFFFFFFFFFFF
+CT_BETA:    dq 0xC1396C28719501EE, 0x9CF0497512F58995, 0x6E64479EAC3434E9, 0x7AE96A2B657C0710
+CT_ZERO:    dq 0, 0, 0, 0
+section .text
+
+; fold the sign of the scalar at %1 into the affine point built at %2 from
+; x = [r13], y = [r13+32]; %3 = the x to use (address). Clobbers rax, rcx,
+; r8, r9, rdi, rsi, rdx.
+%macro GLV_SIGN_FOLD 3
+    ; t = n - r (branch-free); mask = -(r[3] >> 63); r = mask ? t : r
+    lea  rdi, [rbp-0x1e0]
+    lea  rsi, [rel CT_ORDER_N]
+    lea  rdx, [%1]
+    call sc_sub
+    mov  rcx, [%1+24]
+    sar  rcx, 63                   ; 0 or -1: the "negative" representation
+%assign off 0
+%rep 4
+    mov  r8, [%1+off]
+    mov  r9, [rbp-0x1e0+off]
+    test rcx, rcx
+    cmovnz r8, r9
+    mov  [%1+off], r8
+%assign off off+8
+%endrep
+    ; x
+    mov  rax, [%3+0]
+    mov  [%2+0], rax
+    mov  rax, [%3+8]
+    mov  [%2+8], rax
+    mov  rax, [%3+16]
+    mov  [%2+16], rax
+    mov  rax, [%3+24]
+    mov  [%2+24], rax
+    ; y or p - y
+    lea  rdi, [rbp-0x1e0]
+    lea  rsi, [rel CT_ZERO]
+    lea  rdx, [r13+32]
+    call fe_sub                    ; t = -y
+    mov  rcx, [%1+24]              ; (the sign was consumed above; recompute the mask from the saved copy)
+    mov  rcx, [rbp-0x1f0]
+%assign off 0
+%rep 4
+    mov  r8, [r13+32+off]
+    mov  r9, [rbp-0x1e0+off]
+    test rcx, rcx
+    cmovnz r8, r9
+    mov  [%2+32+off], r8
+%assign off off+8
+%endrep
+%endmacro
+
+; TB at %1 (rbp-relative offset) from the affine point at %2
+%macro GLV_TABLE 2
+    POINTH_SET_IDENTITY rbp-%1
+    lea  rdi, [rbp-%1+96]
+    lea  rsi, [%2]
+    mov  rcx, 8
+    rep movsq
+    mov  qword [rbp-%1+96+64], 1
+    mov  qword [rbp-%1+96+72], 0
+    mov  qword [rbp-%1+96+80], 0
+    mov  qword [rbp-%1+96+88], 0
+    mov  ebx, 2
+%%tab:
+    imul rax, rbx, 96
+    lea  rdi, [rbp-%1]
+    add  rdi, rax
+    lea  rsi, [rdi-96]
+    lea  rdx, [rbp-%1+96]
+    call pointh_add
+    inc  ebx
+    cmp  ebx, 16
+    jb   %%tab
+%endmacro
+
+; T = cmov scan of the table at %1 for the digit in ebx
+%macro GLV_SCAN 1
+    lea  r15, [rbp-%1]
+    xor  ecx, ecx
+%%scan:
+    cmp  ecx, ebx
+%assign off 0
+%rep 12
+    mov  r8, [r15 + off]
+    mov  r9, [rbp-0x100 + off]
+    cmovz r9, r8
+    mov  [rbp-0x100 + off], r9
+%assign off off+8
+%endrep
+    add  r15, 96
+    inc  ecx
+    cmp  ecx, 16
+    jb   %%scan
+%endmacro
+
+global point_scalar_mul_glv_ct
+point_scalar_mul_glv_ct:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    sub  rsp, 0xdd8
+    mov  r12, rdi                  ; out
+    mov  r13, rsi                  ; affine xy
+    mov  [rbp-0x1e8], rdx          ; k
+    CT_SCAN_SELECT                 ; the probe's cpuid clobbers rcx/rdx
+    lea  rdi, [rbp-0x120]
+    lea  rsi, [rbp-0x140]
+    mov  rdx, [rbp-0x1e8]          ; k, reloaded after the selection
+    call sc_split_lambda
+    test eax, eax
+    jz   .fallback
+
+    ; the sign masks are needed twice (scalar fix, then y): save them
+    mov  rcx, [rbp-0x120+24]
+    sar  rcx, 63
+    mov  [rbp-0x1f0], rcx
+    GLV_SIGN_FOLD rbp-0x120, rbp-0x180, r13          ; P1 = +-P
+    mov  rcx, [rbp-0x140+24]
+    sar  rcx, 63
+    mov  [rbp-0x1f0], rcx
+    ; x2 = beta * x
+    lea  rdi, [rbp-0x1e0]
+    lea  rsi, [rel CT_BETA]
+    mov  rdx, r13
+    call fe_mul
+    mov  rax, [rbp-0x1e0+0]
+    mov  [rbp-0x1c0+0], rax
+    mov  rax, [rbp-0x1e0+8]
+    mov  [rbp-0x1c0+8], rax
+    mov  rax, [rbp-0x1e0+16]
+    mov  [rbp-0x1c0+16], rax
+    mov  rax, [rbp-0x1e0+24]
+    mov  [rbp-0x1c0+24], rax
+    GLV_SIGN_FOLD rbp-0x140, rbp-0x1c0, rbp-0x1c0    ; P2 = +-lambda*P (x already in place)
+
+    GLV_TABLE 0x800, rbp-0x180
+    GLV_TABLE 0xe00, rbp-0x1c0
+
+    POINTH_SET_IDENTITY rbp-0xa0
+    mov  r14, 32                   ; nibble 32 downto 0
+.win:
+%rep 4
+    lea  rdi, [rbp-0xa0]
+    lea  rsi, [rbp-0xa0]
+    call pointh_double
+%endrep
+    NIBBLE_OF_K rbp-0x120
+    GLV_SCAN_ANY 0x800
+    lea  rdi, [rbp-0xa0]
+    lea  rsi, [rbp-0xa0]
+    lea  rdx, [rbp-0x100]
+    call pointh_add
+    NIBBLE_OF_K rbp-0x140
+    GLV_SCAN_ANY 0xe00
+    lea  rdi, [rbp-0xa0]
+    lea  rsi, [rbp-0xa0]
+    lea  rdx, [rbp-0x100]
+    call pointh_add
+    dec  r14
+    jns  .win
+    vzeroupper
+
+    mov  rdi, r12
+    lea  rsi, [rbp-0xa0]
+    call pointh_to_jac
+    jmp  .done
+.fallback:
+    mov  rdi, r12
+    mov  rsi, r13
+    mov  rdx, [rbp-0x1e8]
+    call point_scalar_mul_win_ct
+.done:
+    ; scalars and tables held secrets: clear what the caller does not own
+    xor  eax, eax
+%assign off 0
+%rep 8
+    mov  [rbp-0x140+off], rax
+%assign off off+8
+%endrep
+    add  rsp, 0xdd8
+    pop  r15
+    pop  r14
+    pop  r13
+    pop  r12
+    pop  rbx
+    pop  rbp
+    ret
+
 section .note.GNU-stack noalloc noexec nowrite progbits

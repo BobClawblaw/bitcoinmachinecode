@@ -27,6 +27,8 @@ typedef unsigned long long u64;
 extern void point_scalar_mul_ct(u64 r[12], const u64 xy[8], const u64 k[4]);
 extern void point_scalar_mul_gen_ct(u64 r[12], const u64 k[4]);
 extern void point_scalar_mul_win_ct(u64 r[12], const u64 xy[8], const u64 k[4]);
+extern void point_scalar_mul_glv_ct(u64 r[12], const u64 xy[8], const u64 k[4]);   /* k < n */
+extern void point_ct_force_scan(int p);   /* 0 probe, 1 AVX2 blend scan, 2 cmov scan */
 extern void point_scalar_mul(u64 r[12], const u64 xy[8], const u64 k[4]);
 extern void fe_inv(u64 r[4], const u64 a[4]);
 extern void fe_mul(u64 r[4], const u64 a[4], const u64 b[4]);
@@ -80,18 +82,41 @@ static void check_win(const u64 P[8], const u64 k[4], const char* what){
     point_scalar_mul_ct(A, P, k);
     point_scalar_mul_win_ct(B, P, k);
     CK(same_point(A, B), "%s: win_ct != ladder (k0=%016llx)", what, k[0]);
+    if (lt_n(k)){                                  /* the GLV routine requires k < n */
+        u64 G[12]; point_scalar_mul_glv_ct(G, P, k);
+        CK(same_point(A, G), "%s: glv_ct != ladder (k0=%016llx)", what, k[0]);
+    }
     if (lt_n(k) && (k[0] | k[1] | k[2] | k[3])){
         u64 C[12]; point_scalar_mul(C, P, k);
         CK(same_point(A, C), "%s: ladder != point_scalar_mul (k0=%016llx)", what, k[0]);
     }
 }
 
+static int run_all(long n);
 int main(int argc, char** argv){
     long n = argc > 1 ? atol(argv[1]) : 400;
     printf("test_pointmul_ct_variants: n=%ld\n", n);
+    /* first through the probe (the path a real caller takes: its cpuid must not
+     * disturb the arguments), then each scan body forced */
+    { u64 k[4] = { 7, 0, 0, 0 }, A[12], B[12]; point_ct_force_scan(0);
+      point_scalar_mul_glv_ct(A, G_AFF, k); point_scalar_mul_ct(B, G_AFF, k);
+      CK(same_point(A, B), "glv_ct through the CPU probe"); }
+    /* the GLV routine's table scan has an AVX2 body and a cmov body: both run */
+    for (int scan = 2; scan >= 1; scan--){
+        point_ct_force_scan(scan); rs = 0x9E3779B97F4A7C15ULL;
+        printf("-- table scan: %s --\n", scan == 1 ? "AVX2 blend" : "cmov");
+        if (run_all(n)) return 1;
+    }
+    point_ct_force_scan(0);
+    printf("%ld checks\n", checks);
+    if (failures){ printf("\nTESTS FAILED (%ld failures)\n", failures); return 1; }
+    printf("\nALL TESTS PASSED (0 failures)\n");
+    return 0;
+}
+static int run_all(long n){
 
     /* edge scalars */
-    u64 edges[16][4]; int ne = 0; const char* names[16];
+    u64 edges[20][4]; int ne = 0; const char* names[20];
 #define EDGE(nm, a, b, c, d) do{ edges[ne][0]=(a); edges[ne][1]=(b); edges[ne][2]=(c); edges[ne][3]=(d); names[ne++]=(nm); }while(0)
     EDGE("0", 0, 0, 0, 0);
     EDGE("1", 1, 0, 0, 0);
@@ -107,6 +132,9 @@ int main(int argc, char** argv){
     EDGE("0x0F..0F", 0x0F0F0F0F0F0F0F0FULL, 0x0F0F0F0F0F0F0F0FULL, 0x0F0F0F0F0F0F0F0FULL, 0x0F0F0F0F0F0F0F0FULL);
     EDGE("0xF0..F0", 0xF0F0F0F0F0F0F0F0ULL, 0xF0F0F0F0F0F0F0F0ULL, 0xF0F0F0F0F0F0F0F0ULL, 0xF0F0F0F0F0F0F0F0ULL);
     EDGE("0x8000..0001", 1, 0, 0, 1ULL << 63);
+    EDGE("2^128", 0, 0, 1, 0);
+    EDGE("2^128-1", ~0ULL, ~0ULL, 0, 0);
+    EDGE("lambda", 0xDF02967C1B23BD72ULL, 0x122E22EA20816678ULL, 0xA5261C028812645AULL, 0x5363AD4CC05C30E0ULL);
 
     /* the multiples of G that must be infinity or +-G, stated directly */
     { u64 J[12]; point_scalar_mul_gen_ct(J, edges[0]); CK((J[8]|J[9]|J[10]|J[11]) == 0, "gen_ct(0) must be infinity");
@@ -134,8 +162,5 @@ int main(int argc, char** argv){
         check_win(P, k, "random k*P");
         if (i < 8) for (int e = 0; e < ne; e++) check_win(P, edges[e], names[e]);
     }
-    printf("%ld checks\n", checks);
-    if (failures){ printf("\nTESTS FAILED (%ld failures)\n", failures); return 1; }
-    printf("\nALL TESTS PASSED (0 failures)\n");
-    return 0;
+    return failures != 0;
 }

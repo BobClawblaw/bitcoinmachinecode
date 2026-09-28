@@ -16,6 +16,12 @@ long bf_basic_build(const unsigned char* block, unsigned long blocklen,
 
 /* One link of the BIP157 filter-header chain:
  * out = sha256d(sha256d(filter) || prev_header). header(-1) is 32 zeros. */
+/* the filter from a collected element list (de-duplicate, hash, sort,
+ * encode): what Core's GCSFilter(params, elements) does; bf_basic_build parses
+ * the block and calls this. el[] is sorted in place. */
+long bf_build_hashed(unsigned long long k0, unsigned long long k1,
+                     bf_script* el, unsigned long n,
+                     unsigned char* out, unsigned long cap);
 void bf_header(const unsigned char* filter, unsigned long len,
                const unsigned char prev_header[32], unsigned char out[32]);
 
