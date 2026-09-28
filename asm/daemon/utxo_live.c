@@ -43,6 +43,7 @@
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include "node_config.h"
 #include "utxo_walk.h"
 #include "seqlocks.h"
@@ -3024,6 +3025,37 @@ int utxo_live_init(const char* dir){
             (unsigned long long)wb.st_size >= UTXO_LIVE_BULK_WAL_BYTES) {
             fprintf(stderr, "[utxo_live] WAL tail is %lluMB -- bulk-sizing the memtable despite gap=%ld (see incident #32)\n",
                     (unsigned long long)(wb.st_size >> 20), boot_gap);
+            g_bulk_mode = 1;
+        }
+    }
+    /* ...and ALSO when the STORE'S SHAPE says every lookup will be expensive:
+     * the runs at or past the compaction threshold, or their bytes past the
+     * run budget (issue #294: gap 3,345, WAL 0.25 GB, 17 runs of 42 GB --
+     * both rules above stood down, the load ground for 25 minutes in
+     * silence). The manifest is not loaded yet at this point; the run files
+     * are on disk and named utxo_run_%06u.dat, so the directory is scanned.
+     * Whatever the verdict, the shape is said out loud before the load, so a
+     * long load has its reason in the log (utxo_lsm_reload is a WAL replay
+     * against these runs and logs nothing while it runs). */
+    {
+        long runs = 0; unsigned long long run_bytes = 0;
+        DIR* d = opendir(".");
+        if (d){
+            struct dirent* de;
+            while ((de = readdir(d)) != NULL){
+                unsigned no; char tail = 0;
+                if (sscanf(de->d_name, "utxo_run_%6u.dat%c", &no, &tail) == 1){
+                    struct stat rb; if (stat(de->d_name, &rb) == 0){ runs++; run_bytes += (unsigned long long)rb.st_size; }
+                }
+            }
+            closedir(d);
+        }
+        unsigned long long budget = utxo_live_run_budget();
+        if (runs > 0)
+            fprintf(stderr, "[utxo_live] store shape: %ld run file(s), %.1f GB (compaction threshold %ld, run budget %.1f GB) -- a lookup probes up to %ld runs\n",
+                    runs, (double)run_bytes / 1e9, utxo_live_compact_threshold(), (double)budget / 1e9, runs);
+        if (!g_bulk_mode && utxo_live_pick_bulk_shape(runs, run_bytes, utxo_live_compact_threshold(), budget)){
+            fprintf(stderr, "[utxo_live] the store is bulk-shaped -- bulk-sizing the memtable despite gap=%ld (issue #294)\n", boot_gap);
             g_bulk_mode = 1;
         }
     }

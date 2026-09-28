@@ -38,6 +38,32 @@ int main(void){
     ok(!dl_hole_blocks_apply(153885, -1, 153885),        "no hole: nothing");
     ok(!dl_hole_blocks_apply(153885, 153886, 153885),    "the first 'hole' is just past the tip: the ordinary tip, not a hole below it");
     ok(!dl_hole_blocks_apply(153885, 153877, -1),        "no engine (applied -1): nothing");
+    printf("== #304: who is believed (2026-09-28) ==\n");
+    /* the cluster: two Knots peers claiming 974,088 on a 968,553 chain; the
+     * honest peers claim the tip. The second-highest rule alone fires. */
+    { long hs[4] = { 974088, 974088, 968553, 968554 };
+      ok( dl_trigger_height(hs, 4) == 974088, "two agreeing false claims pass the second-highest rule (the #304 runs)"); }
+    ok(!dl_claim_memo_active("203.0.113.7:8333", 1000), "an unknown host is believed");
+    dl_claim_memo_note("203.0.113.7:8333", 974088, 1000);
+    ok( dl_claim_memo_active("203.0.113.7:8333", 1001), "a host whose claim came to nothing is remembered");
+    ok( dl_claim_memo_active("203.0.113.7:8333", 1000 + DL_CLAIM_MEMO_S - 1), "...for DL_CLAIM_MEMO_S");
+    ok(!dl_claim_memo_active("203.0.113.7:8333", 1000 + DL_CLAIM_MEMO_S), "...and then believed again");
+    ok(!dl_claim_memo_active("203.0.113.8:8333", 1001), "another host is unaffected");
+    dl_claim_memo_note("203.0.113.7:8333", 974120, 5000);
+    ok( dl_claim_memo_active("203.0.113.7:8333", 5000 + DL_CLAIM_MEMO_S - 1), "a repeat note extends the same entry");
+    for(int k = 0; k < DL_CLAIM_MEMO + 5; k++){ char h[64]; snprintf(h, sizeof h, "198.51.100.%d:8333", k); dl_claim_memo_note(h, 974000 + k, 6000); }
+    ok( dl_claim_memo_active("198.51.100.36:8333", 6001), "the table wraps: the newest entries are kept");
+    ok(!dl_claim_memo_active("203.0.113.7:8333", 6001), "...and the oldest was evicted");
+    /* the leg-level rule: a failing pass or a remembered host takes the vote away */
+    mux_n_out = 2;
+    snprintf(mux_out_host[0], sizeof mux_out_host[0], "%s", "198.51.100.36:8333"); g_sync_fail_streak[0] = 0;
+    snprintf(mux_out_host[1], sizeof mux_out_host[1], "%s", "192.0.2.1:8333");     g_sync_fail_streak[1] = 0;
+    ok(!dl_claim_believed(0, 6001), "a remembered host's leg does not vote");
+    ok( dl_claim_believed(1, 6001), "a clean leg votes");
+    g_sync_fail_streak[1] = 1;
+    ok(!dl_claim_believed(1, 6001), "a leg whose sync pass is failing does not vote (its headers do not connect)");
+    g_sync_fail_streak[1] = 0;
+    ok( dl_claim_believed(1, 6001), "...and votes again once a pass succeeds");
     printf("\n%s (%d failure%s)\n", fails?"TESTS FAILED":"ALL TESTS PASSED", fails, fails==1?"":"s");
     return fails ? 1 : 0;
 }

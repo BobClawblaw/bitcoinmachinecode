@@ -8223,6 +8223,45 @@ static long dl_trigger_height(const long* hs, int n){
     for(int i=0;i<n;i++){ if(hs[i] > top){ second = top; top = hs[i]; } else if(hs[i] > second) second = hs[i]; }
     return n >= 2 ? second : top;
 }
+/* issue #304 (2026-09-28): two agreeing peers were a CLUSTER. Every claim
+ * above 973,900 on a 968,5xx chain came from /Satoshi:29.4.x/Knots/ peers
+ * following a fork bmc's own reorg probe rejects (6,922 deep at 961,631);
+ * two of them passed the gate, so a synced node ran the full parallel
+ * downloader -- seeds, pool sample, liveness probe, a 2,000-header ranking,
+ * 60-130 s with the worker's loop stopped, 0 blocks -- after every start and
+ * again on a later tip once the re-arm passed. The (claim, tip) memo below
+ * did not survive a new tip, and the cluster's claim grows anyway.
+ * Two rules, both about WHO is believed rather than how large the number is:
+ *   - a leg whose sync pass is failing (g_sync_fail_streak) does not vote:
+ *     those peers' passes end in sync-budget closes, since their headers do
+ *     not connect to our chain;
+ *   - a peer whose claim ran the downloader for nothing is remembered BY
+ *     HOST for DL_CLAIM_MEMO_S, across tips, and does not vote meanwhile --
+ *     whatever it claims next (the false chain keeps growing).
+ * The memo is in-memory (a restart runs once at most, and then remembers). */
+#define DL_CLAIM_MEMO    32
+#define DL_CLAIM_MEMO_S  (6L*3600L)
+typedef struct { char host[128]; long claim; long long until; } dl_claim_t;
+static dl_claim_t g_dl_claims[DL_CLAIM_MEMO];
+static int dl_claim_memo_active(const char* host, long long now_s){
+    for(int i=0;i<DL_CLAIM_MEMO;i++)
+        if(g_dl_claims[i].until > now_s && !strcmp(g_dl_claims[i].host, host)) return 1;
+    return 0;
+}
+static void dl_claim_memo_note(const char* host, long claim, long long now_s){
+    int slot = 0;                                   /* the host's own entry, else the one expiring soonest */
+    for(int i=0;i<DL_CLAIM_MEMO;i++){
+        if(!strcmp(g_dl_claims[i].host, host)){ slot = i; break; }
+        if(g_dl_claims[i].until < g_dl_claims[slot].until) slot = i;
+    }
+    snprintf(g_dl_claims[slot].host, sizeof g_dl_claims[slot].host, "%s", host);
+    g_dl_claims[slot].claim = claim;
+    g_dl_claims[slot].until = now_s + DL_CLAIM_MEMO_S;
+}
+/* does this leg's announce count toward the trigger? */
+static int dl_claim_believed(int i, long long now_s){
+    return g_sync_fail_streak[i] == 0 && !dl_claim_memo_active(mux_out_host[i], now_s);
+}
 /* 2026-09-24: the apply is stopped AT a hole below the archive tip -- the
  * next height it needs is missing while blocks above it are stored. Peers
  * announce nothing past the tip, so the far-behind rule above never fires,
@@ -9558,13 +9597,13 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
              * announce that produced no blocks is not retried while the
              * archive stands still. */
             long hs[RPC_MAX_PEERS]; int nh = 0;
+            long long nows = (long long)time(NULL);
             if(g_node_status)
                 for(int i=0;i<mux_n_out && i<RPC_MAX_PEERS;i++)
-                    if(mux_out_fd[i]>=0 && g_node_status->peers[i].start_height > 0)
+                    if(mux_out_fd[i]>=0 && g_node_status->peers[i].start_height > 0 && dl_claim_believed(i, nows))   /* #304: failing and remembered legs do not vote */
                         hs[nh++] = g_node_status->peers[i].start_height;
             long best = dl_trigger_height(hs, nh);
             long atip = (long)(*(int*)(store_buf+24));
-            long long nows = (long long)time(NULL);
             static long noop_best = -1, noop_tip = -1;
             if(g_dl_parallel_now){ g_dl_parallel_now = 0; noop_best = -1; noop_tip = -1; dl_parallel_last_s = 0; }   /* a reorg handoff: fetch now */
             if(best == noop_best && atip == noop_tip) best = atip;        /* the same claim already came to nothing at this tip */
@@ -9608,7 +9647,18 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
                       fprintf(stderr,"[dl] waited for %d pass helper(s) before the parallel download; %d still running\n", waited, outstanding); }
                 long got = dl_catchup(dir, g_catchup_workers);
                 store_reload(store_buf);
-                if(got <= 0){ noop_best = best; noop_tip = atip; }
+                if(got <= 0){
+                    noop_best = best; noop_tip = atip;
+                    /* #304: the legs that backed the claim are not believed
+                     * again for a while, whatever they claim next */
+                    if(g_node_status && !hole_blocks)
+                        for(int i=0;i<mux_n_out && i<RPC_MAX_PEERS;i++)
+                            if(mux_out_fd[i]>=0 && g_node_status->peers[i].start_height >= best){
+                                dl_claim_memo_note(mux_out_host[i], g_node_status->peers[i].start_height, nows);
+                                fprintf(stderr,"[dl] %s announced %d and the download found nothing above %ld: its announces are not believed for %ld h\n",
+                                        mux_out_host[i], g_node_status->peers[i].start_height, atip, DL_CLAIM_MEMO_S/3600);
+                            }
+                }
                 fprintf(stderr,"[dl] parallel downloader wrote %ld block(s); archive now %d\n", got, *(int*)(store_buf+24));
                 continue;                  /* re-evaluate: apply-first will take over */
             }
