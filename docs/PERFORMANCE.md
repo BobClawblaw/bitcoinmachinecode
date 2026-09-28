@@ -172,9 +172,11 @@ parity on 2026-09-28 by the same safegcd inverse Core uses (the inverse is C
 on both sides and level; the row is 27.9 µs against Core's 28.0);
 ElligatorSwift ~~(6.6×)~~ 1.15× and its ECDH ~~(3.2×)~~ 1.9× since 2026-09-28
 (constant-time comb and window multiplies in place of the ladder, a Jacobi
-square test in the map), ChaCha20 (1.6×), Base58Check (3.1×); ahead on the
-block archive (2.8–3×), MuHash insert (2.7× per op) and the 3072-bit multiply
-(3.8× per multiply) and Bech32.
+square test in the map), ~~ChaCha20 (1.6×)~~ ahead 1.5–2.4× from four blocks
+up since 2026-09-28 (`chacha20_avx2.asm`; the lone 64-byte block stays 1.2×
+behind), Base58Check (3.1×); ahead on the block archive (2.8–3×), MuHash
+insert (6× per op, the AVX2 keystream) and the 3072-bit multiply (3.8× per
+multiply), the AEAD packet from 256 bytes up, and Bech32.
 
 ## Why each difference exists
 

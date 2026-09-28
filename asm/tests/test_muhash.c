@@ -36,6 +36,8 @@ extern long num3072_is_overflow(const void* a);
 extern void num3072_full_reduce(void* a);
 extern void chacha20_keystream_k0(void* out, unsigned long blocks, const unsigned char key[32]);
 extern void num3072_mul_force_path(int p);   /* 0 re-probe, 1 ADX, 2 generic */
+extern void chacha20_k0_force_path(int p);   /* 0 re-probe, 1 AVX2, 2 scalar */
+extern int  chacha20_cpu_has_avx2(void);
 extern int  num3072_mul_current_path(void);
 extern int  num3072_cpu_has_adx(void);
 extern int  num3072_cpu_has_ifma(void);
@@ -99,6 +101,20 @@ int main(void)
 {
     unsigned char buf[384], key[32], a[384], b[384], h[32];
 
+    /* ---- layers 1 and 2 run down BOTH chacha20_keystream_k0 bodies (2026-09-28):
+     * the scalar one, and the AVX2 group in chacha20_avx2.asm that the
+     * dispatcher takes on this box; the vectors are Core's, so a wrong state
+     * word or counter in either body fails here, not at the parity check. */
+    struct { int path; const char* name; int avail; } kpaths[] = {
+        { 2, "k0-scalar/", 1 },
+        { 1, "k0-avx2/",   chacha20_cpu_has_avx2() },
+    };
+    for (size_t kp = 0; kp < sizeof kpaths / sizeof kpaths[0]; kp++) {
+    if (!kpaths[kp].avail) { printf("SKIP %s: this CPU cannot run that keystream body\n", kpaths[kp].name); continue; }
+    chacha20_k0_force_path(kpaths[kp].path);
+    g_path = kpaths[kp].name;
+    printf("---- chacha20_keystream_k0 body: %s ----\n", g_path);
+
     /* ---- layer 1: ChaCha20 keystream ---- */
     for (size_t i = 0; i < sizeof(MUHASH_KS) / sizeof(MUHASH_KS[0]); i++) {
         unhex(MUHASH_KS[i].key, key, sizeof key);
@@ -115,6 +131,9 @@ int main(void)
         muhash_to_num3072(buf, data, dn);
         expect_bytes("to_num3072", (int)i, buf, MUHASH_ELEM[i].num, 384);
     }
+    }
+    chacha20_k0_force_path(0);   /* the multiply layers below run on whatever the CPU picks */
+    g_path = "";
 
     /* ---- layers 3 and up run down EVERY num3072_mul body this CPU has ----
      * num3072_mul dispatches once from CPUID and caches the answer. Without
