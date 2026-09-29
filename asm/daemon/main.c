@@ -8338,6 +8338,12 @@ static void dl_after_gate_rewind(long back){
 static int dl_announce_allowed(unsigned long tip_time, long long now, long maxtipage){
     return now - (long long)tip_time <= maxtipage;      /* a tip in the future is fine: not IBD */
 }
+/* 2026-09-29: the IBD flag as a cached value for the tx relay (tx_relay.c's
+ * txrelay_in_ibd_hook): 1 at boot until the store has a tip, then whatever
+ * dl_new_block_choke last computed from the connected tip's time. Reading the
+ * tip block per inv would be an 8 MB read per message; this is a load. */
+static int g_dl_in_ibd = 1;
+static int dl_in_ibd_cached(void){ return g_dl_in_ibd; }
 /* the Core rule again, for the history repair: the tip is older than maxtipage */
 static int dl_tip_is_ibd(void){
     static unsigned char hb[8u<<20]; long tip = *(int*)(store_buf+24); if (tip < 0) return 1;
@@ -8358,6 +8364,7 @@ static void dl_new_block_choke(void){
         if(store_read_at(store_buf, (unsigned long)now_tip, thb, (long)sizeof thb) >= 80){
             unsigned long tip_time = (unsigned long)thb[68] | ((unsigned long)thb[69]<<8) | ((unsigned long)thb[70]<<16) | ((unsigned long)thb[71]<<24);
             in_ibd = !dl_announce_allowed(tip_time, (long long)time(NULL), g_cfg.maxtipage > 0 ? g_cfg.maxtipage : 86400);
+            g_dl_in_ibd = in_ibd;                                   /* 2026-09-29: the tx relay reads this */
             if(in_ibd){ if(!ibd_said){ ibd_said = 1; fprintf(stderr,"[dl] per-block lines and tip announcements are off while the tip is older than maxtipage (initial block download; Core relays no blocks in IBD) -- they resume at the tip\n"); } }
             else {
                 ibd_said = 0;
@@ -11980,7 +11987,10 @@ int main(int argc, char** argv){
     { long tr = archive_trim_derived_tails();
       if(tr < 0) fprintf(stderr,"[boot] WARNING: could not trim the derived files past the tip: %s\n", strerror(errno)); }
     { extern void par_set(int); par_set(g_cfg.par); }   /* -par: script-verification threads (Core semantics) */
+    { extern int par_script_threads(void);              /* 2026-09-29: said at boot, as Core says "Script verification uses N additional threads" */
+      fprintf(stderr,"[boot] script verification: %d thread(s) including the caller (par=%d; Core's cap is 15 workers + the caller)\n", par_script_threads(), g_cfg.par); }
     if(store_init(store_buf)!=1){ fprintf(stderr,"store_init failed\n"); return 1; }
+    { extern int (*txrelay_in_ibd_hook)(void); txrelay_in_ibd_hook = dl_in_ibd_cached; g_dl_in_ibd = dl_tip_is_ibd(); }   /* 2026-09-29: Core takes no tx announcements in IBD */
     /* Before ANY append can happen, in the parent -- so the serve loop's
      * tip appends and the boot catch-up are covered as well as the download.
      * Children inherit it across fork. */

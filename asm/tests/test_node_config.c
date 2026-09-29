@@ -24,9 +24,9 @@ int main(void){
 
     /* 1. absent file -> compiled defaults, no crash */
     node_config_load("/nonexistent/bitcoin.conf");
-    if (g_cfg.max_connections==200 && g_cfg.max_outbound==8 && g_cfg.dbcache_mb==1024
+    if (g_cfg.max_connections==200 && g_cfg.max_outbound==8 && g_cfg.dbcache_mb==450   /* Core v31.1 DEFAULT_KERNEL_CACHE (2026-09-29; it was 1024, no Core default) */
         && g_cfg.catchup_workers==10)  /* 2026-09-29: Core's preferred-download set, full-relay 8 + block-relay-only 2 (it was 8, the full-relay class alone) */
-        printf("PASS: missing file falls back to compiled defaults (Core v31 dbcache default 1024, 10 download peers)\n");
+        printf("PASS: missing file falls back to compiled defaults (Core v31.1 dbcache default 450, 10 download peers)\n");
     else { printf("FAIL: defaults wrong (conns=%d out=%d dbcache=%d catchupworkers=%d)\n",
                   g_cfg.max_connections,g_cfg.max_outbound,g_cfg.dbcache_mb,g_cfg.catchup_workers); failures++; }
 
