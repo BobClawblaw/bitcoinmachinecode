@@ -766,6 +766,64 @@ node by several thousand blocks.
 | SSD or NVMe only | the platter is archival; never a bench or production datadir |
 | tip agreement | every run's tip is checked by hash against the oracle, not by height |
 
+### The even comparison — every setting, checked line by line (2026-09-29)
+
+The operator's standard for run 31 onward: **bmc's defaults equal Core's
+defaults, and the two bench configs differ only in the port numbers.**
+Everything below was read from Core v31.1's source (the bench binary) and
+from this node's `node_config.c`, not from memory. Where the two disagreed,
+bmc moved. Peer *selection* — which of the ten peers a node keeps — is bmc's
+own and stays so; both nodes start cold from the same DNS seeds.
+
+| setting | Core v31.1 | bmc | evenness |
+|---|---|---|---|
+| `maxconnections` default | 200 | 200 | same; both benches set 48 |
+| outbound classes | full-relay 8, block-relay-only 2, feeler 1 | 8, 2, 1 (`[config] conns:` at boot) | same |
+| inbound slots | `maxconnections` − the outbound classes | same arithmetic | same |
+| download peers in IBD | every outbound peer that can serve blocks (`fPreferredDownload`): 10 | `bmc.catchupworkers` derived as the two classes: 10 (#344) | same since #344; runs 27–30 ran 8 |
+| download window | 1,024 above the connected tip | 1,024 (#344) | same since #344; run 30 ran 4,096 |
+| connections beside the download | none | idle legs closed for an IBD-sized download (#344) | same since #344; run 30 held 4 idle legs |
+| blocks in flight per peer | 16, refilled as each lands | one 40-block chunk per `getdata` | a shape, not a setting; documented |
+| script-verification threads | `-par` 0 = cores, capped at 15 workers + the caller = 16 here | `par` 0 = cores, same cap (`par_script_threads`) = 16 here; said at boot since this batch | same (both default; the operator's "par=16" is what both defaults give on this box) |
+| assumevalid | 938,343 (`00000000…ba5ac`) | the same hash (`chainparams.c`) | same |
+| `dbcache` default | 450 MiB (`DEFAULT_KERNEL_CACHE`) | 450 MiB since this batch (was 1024, a value no Core release defaults to) | same; both benches set 8192 |
+| `maxtipage` (the IBD flag) | 24 h | 86,400 s | same |
+| tx announcements during IBD | ignored (`AddTxAnnouncement` only when not in IBD) | ignored since this batch (`txrelay_in_ibd_hook`); run 30 fetched and rejected them every pass | same |
+| block announcements during IBD | none | none (since 2026-09-08) | same |
+| `timeout` / `peertimeout` | 5,000 ms / 60 s | 5,000 ms / 60 s | same |
+| `maxreceivebuffer` / `maxmempool` | 5,000 / 300 MB | 5,000 / 300 MB | same |
+| indexes | `txindex`, `coinstatsindex`, `blockfilterindex` all on in the bench, built during the sync | the same three, built during the sync | same |
+| ZMQ | the bench publishes `hashblock`, `rawblock`, `hashtx`, `rawtx` to a port nobody reads | bmc's ZMQ is Core's (five topics, per-topic HWM); the harness now publishes the same four to a port nobody reads (`PARITY=1`) | same since this batch; run 30 published none |
+| DNS seeds / fixed seeds | on / on, cold `peers.dat` | on / on, empty address book | same |
+| `prune` / `listen` / `blocksonly` | 0 / on / off | 0 / on / off | same |
+| block files | XOR-obfuscated by default since v28 (`blocksxor`) | plain | Core's own default cost; not matched |
+| scheduling | `Nice=0`, default I/O class | `NICE=0` is the harness default since this batch (it was 10) | same |
+| datadir | `/srv/nvme8tb/bench/core31` | `/srv/nvme8tb/bench/<run>` (harness default) | same NVMe, a path a mount on `/mnt` cannot shadow |
+| RPC during the sync | none (the watcher reads the log) | none (`phase.log` names any client) | same |
+| start of the clock | `BENCH_START.txt`, the instant before `bitcoind` | `epoch.start`, the instant before the daemon | same |
+| **end of the clock** | `Leaving InitialBlockDownload`: the tip within 24 h of now — up to ~144 blocks short of the real tip | `IBD_END`: applied = stored = the oracle's real tip | **not the same line.** The end row is read as *time to reach the same height* from both logs (the earlier run's end tip); the 50k rows already are |
+
+**What is deliberately not matched.** Core XORs its block files and caps its
+script threads at 16; both are Core's own choices and a Core user cannot
+change the second. bmc's chunked `getdata` and its peer selection are bmc's.
+The report names each.
+
+**The box during a timed pair.** Production and the Core oracle run (they
+did for every pair); nothing else — no VM tests, no builds, no other
+benchmark, nothing mounted on `/mnt`. The two runs are sequential, never
+overlapping, back to back on the same NVMe.
+
+**The run 31 command** (after the Core run ends):
+
+```
+DEST=/srv/nvme8tb/bench/run31 SRCREF=main bash validation/fresh_ibd_run.sh
+```
+
+with nothing else set: `PARITY=1`, `NICE=0`, the derived 10 workers and the
+default `par` are the harness's defaults now. `P2P`/`RPC` default to
+8462/8461; pass others if those are taken. The Core side is
+`bitcoin-core-bench.service` as it stands.
+
 The scheduling row was wrong until 2026-09-12. The Core runner launched its
 daemon under `ionice -c3` — the idle I/O class, meaning Core got the disk only
 when nothing else wanted it — while the bmc harness used `nice -n 10` and no

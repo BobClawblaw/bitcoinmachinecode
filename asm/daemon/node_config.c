@@ -47,7 +47,7 @@ node_config_t g_cfg = {
     .utxo_bulk_blob_mb     = 1024,
     .utxo_bulk_gap_blocks  = 50000L,
     .utxo_compact_threshold= 12,
-    .dbcache_mb            = 1024,     /* Core v31 -dbcache default (MiB)    */
+    .dbcache_mb            = 450,      /* Core v31.1 -dbcache default: DEFAULT_KERNEL_CACHE 450 MiB (kernel/caches.h; the dev tree agrees). It was 1024 here, which no Core release defaults to (2026-09-29) */
     .connect_timeout_ms    = 5000,     /* Core v31 -timeout default          */
     .peer_timeout_s        = 60,
     .port                  = 8333,
@@ -374,7 +374,7 @@ static void set_defaults(void){
     g_cfg.utxo_compact_threshold= 12;
     g_cfg.assumevalid_mode      = 0;        /* the chain default (Core defaultAssumeValid) */
     memset(g_cfg.assumevalid, 0, 32);
-    g_cfg.dbcache_mb            = 1024;     /* Core v31 default (MiB) */
+    g_cfg.dbcache_mb            = 450;      /* Core v31.1 default (MiB), 2026-09-29 */
     g_cfg.connect_timeout_ms    = 5000;     /* Core's -timeout default */
     g_cfg.peer_timeout_s        = 60;       /* Core's -peertimeout default */
     g_cfg.port                  = 8333;
@@ -797,9 +797,11 @@ long node_config_load(const char* path){
              * count and means exactly that here (2026-09-06). */
             t=clamp_int(IV,1,64,key,&bad); if(t!=-1){ g_cfg.catchup_workers=t; g_cfg.catchup_workers_explicit=1; applied++; } }
         else if(!strcmp(key,"par")){
-            /* Core -par: worker threads. 0 = auto, and NEGATIVE means "leave
-             * that many cores free", which is why the lower bound is not 0.
-             * Drives the chunk-claiming catch-up worker count. */
+            /* Core -par: script-verification threads, the caller included.
+             * 0 = auto, and NEGATIVE means "leave that many cores free", which
+             * is why the lower bound is not 0. Capped at Core's 15 workers +
+             * the caller in tx_verify.c (par_script_threads); the download
+             * count is bmc.catchupworkers, not this. */
             t=clamp_int(IV,-64,64,key,&bad); if(t!=-1 || IV>=-64){ g_cfg.par=IV; applied++; } }
         else if(!strcmp(key,"maxreceivebuffer")){
             /* Core -maxreceivebuffer is in units of 1000 bytes. Bounds how
