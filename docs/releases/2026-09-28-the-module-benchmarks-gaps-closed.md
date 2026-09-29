@@ -73,7 +73,7 @@ Run 30 (main `1370d041`) synced to the tip in **4 h 54 m 30 s** with the
 MuHash identical to Core's at 968,987 — on a link whose bad backhaul the
 operator had just repaired, so the number compares to nothing measured
 before it. Core v31.1 is being rerun on the same drive and link; the pair is
-`docs/reports/2026-09-28-run30-vs-core.md`, provisional until Core leaves IBD.
+`docs/reports/2026-09-28-run30-vs-core.md` (the Core run was later cut short at 924,616 by a fault outside both nodes; the report says so).
 
 ## What is still behind
 
