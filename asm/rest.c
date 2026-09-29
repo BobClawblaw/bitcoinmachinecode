@@ -27,8 +27,10 @@ static int is_hex64(const char* s){ if (strlen(s) != 64) return 0; for (int i = 
 static void hash_le(u8 out[32], const char* hex){ u8 t[32]; unhex(hex, t, 32); for (int i = 0; i < 32; i++) out[i] = t[31 - i]; }   /* display hex -> internal bytes */
 static void (*g_lock)(void) = 0; static void (*g_unlock)(void) = 0;
 void rest_set_exec_lock(void (*lock)(void), void (*unlock)(void)){ g_lock = lock; g_unlock = unlock; }
+extern void rpc_exec_set_label(const char*) __attribute__((weak));   /* rpc_server.c: names this dispatch in an exec-lock line; absent in the unit tests */
 static rj_val* call(const rpc_wallet* w, const char* method, rj_val* params, long* ec, const char** em){
     rj_val* r = 0; long e = 0; const char* m = 0;
+    if (rpc_exec_set_label) rpc_exec_set_label(method);
     if (g_lock) g_lock();
     int ok = rpc_dispatch(method, params, w, &r, &e, &m);
     if (g_unlock) g_unlock();

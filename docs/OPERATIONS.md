@@ -870,6 +870,18 @@ Outside the chain directory: `<datadir>/bitcoin.conf` or
   `logsourcelocations=1` change the stderr prefix from the point the config
   is read; `shrinkdebugfile` (default 1) truncates a `debuglogfile` over
   10 MB to its last 200 KB at start-up.
+  **`[rpc] exec lock:` lines** (2026-09-29): every RPC but the lock-free few
+  runs under one execution lock, and four times in three days the whole
+  surface stalled for over 90 s right after a block with nothing to say who
+  held it. A wait or a hold of `BMC_RPC_EXEC_LOG_MS` or longer (an environment
+  variable on the unit; default 2000 ms, 0 switches it off) now logs one line
+  naming the JSON-RPC method, or the facade / REST route and the method it
+  dispatched: `... getmininginfo (excl) waited 90123 ms; the last exclusive
+  holder was esplora GET /internal/block/<hash>/txs -> getrawtransaction (held
+  90101 ms); 3 still waiting`, and the holder's own `... held 90101 ms (waited 0
+  ms); 3 waiting behind it`. A waiter names the last *exclusive* holder because
+  that is what the writer-preferring lock made it wait for; a hold shorter than
+  the wait means the wait was behind readers.
 - `includeconf=<file>` (relative to the main file's directory) is read after
   it; an included file may not include another.
 - Core options that are accepted WITHOUT effect are each named at start-up

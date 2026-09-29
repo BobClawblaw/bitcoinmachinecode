@@ -108,4 +108,18 @@ int  rpc_auth_add(const char* spec);
 int  rpc_auth_count(void);
 void rpc_auth_clear(void);
 
+/* ---- the execution lock's wait/hold log (2026-09-29) ---------------------
+ * A wait for, or a hold of, g_exec_lock lasting BMC_RPC_EXEC_LOG_MS or longer
+ * (default 2000 ms; 0 = off) is one "[rpc] exec lock:" line naming the
+ * JSON-RPC method, or the facade/REST route and the method it dispatched.
+ * The facade and REST set the names (weakly linked from their files); the
+ * rest are test hooks. */
+void rpc_exec_set_label(const char* method);
+void rpc_exec_set_context(const char* who, const char* verb, size_t vlen, const char* path, size_t plen);
+void rpc_exec_set_log_ms(long ms);
+long rpc_exec_log_ms(void);
+long rpc_exec_slow_events(void);
+void rpc_exec_slow_log(char* out, size_t cap);
+int  rpc_exec_waiters(void);
+
 #endif /* RPC_SERVER_H */

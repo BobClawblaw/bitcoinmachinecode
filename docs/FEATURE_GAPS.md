@@ -2289,6 +2289,18 @@ and mempool state that the serial model currently protects for free, and that
 is a design change with its own correctness argument to make — not audit
 cleanup. What was wrong was that the cost was undocumented.
 
+**2026-09-29: the cost is now MEASURED as well.** Four times in three days
+(09-27 03:20:52 and 15:40:39, 09-28 12:43:11, 09-29 22:54:21, each within two
+seconds of a new block) the whole surface -- JSON-RPC and the Esplora facade --
+answered nothing for more than 90 s, seen by BlockYard's poll tiers and the
+mempool.space backend at the same instants, and the log could not say which
+handler held the lock. `rpc_server.c` times every take and release of
+`g_exec_lock` and writes one `[rpc] exec lock:` line for a wait or a hold of
+`BMC_RPC_EXEC_LOG_MS` (default 2000 ms) or longer, naming the JSON-RPC method
+or the facade/REST route plus the method it dispatched, and, for a waiter, the
+last exclusive holder (OPERATIONS.md, "Logging"). `tests/test_rpc_responsive`
+holds the write side and checks both lines. The next stall names itself.
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`

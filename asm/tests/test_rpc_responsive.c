@@ -55,6 +55,11 @@ extern long store_append(void* st, const unsigned char* hash32, const void* blk,
 extern void sha256d(unsigned char out[32], const void* data, unsigned long len);
 /* rpc_server.c test hook: hold / release the execution lock's write side */
 extern void rpc_exec_hold_for_test(int take);
+/* rpc_server.c: the exec-lock wait/hold log (2026-09-29) -- its threshold,
+ * how many lines went out, and the last four of them */
+extern void rpc_exec_set_log_ms(long ms);
+extern long rpc_exec_slow_events(void);
+extern void rpc_exec_slow_log(char* out, size_t cap);
 
 static int fails = 0;
 static void ck(const char* l, int c){ printf("%s %s\n", c ? "ok  :" : "FAIL:", l); if (!c) fails++; }
@@ -195,6 +200,38 @@ int main(void){
 
     /* ---- B. the execution lock's write side held ---- */
     for (unsigned i = 0; i < NTRIV; i++) scenario_lock(TRIVIAL[i]);
+
+    /* ---- D. a slow holder is NAMED in the log (2026-09-29) ----
+     * Four stalls of the whole RPC surface in three days, each over 90 s and
+     * each right after a block, and not one line saying which handler held
+     * the lock. The write side is held 700 ms with the threshold at 200 ms
+     * and an exclusive method sent into the wait: the hold must be logged
+     * with the holder's name, the wait with the waiter's name AND the
+     * holder's, and at threshold 0 nothing is logged at all. The scenarios
+     * above hold the lock for the same 700 ms at the shipped 2000 ms
+     * threshold and must have written nothing. */
+    { ck("the 700 ms holds above the threshold wrote no line", rpc_exec_slow_events() == 0);
+      rpc_exec_set_log_ms(200);
+      long before = rpc_exec_slow_events();
+      pthread_t th; pthread_create(&th, NULL, hold_lock, (void*)700L);
+      struct timespec settle = { 0, 150 * 1000000L }; nanosleep(&settle, NULL);
+      char out[4096]; double ms = call_ms("getblockhash", "[1]", out, sizeof out);   /* EXCL: queues behind the hold */
+      pthread_join(th, NULL);
+      ck("the exclusive call waited for the hold", ms > 400 && strstr(out, "\"result\"") != NULL);
+      long n = rpc_exec_slow_events() - before;
+      char log[2048]; rpc_exec_slow_log(log, sizeof log);
+      printf("      %ld line(s):\n%s", n, log);
+      ck("two lines: the hold and the wait", n == 2);
+      ck("the hold names its holder and its length", strstr(log, "test hold (excl) held ") != NULL);
+      ck("the wait names the waiter, and who it waited for", strstr(log, "getblockhash (excl) waited ") != NULL && strstr(log, "the last exclusive holder was test hold (held ") != NULL);
+      rpc_exec_set_log_ms(0);
+      before = rpc_exec_slow_events();
+      pthread_create(&th, NULL, hold_lock, (void*)400L);
+      nanosleep(&settle, NULL);
+      call_ms("getblockhash", "[1]", out, sizeof out);
+      pthread_join(th, NULL);
+      ck("threshold 0 switches the lines off", rpc_exec_slow_events() == before);
+      rpc_exec_set_log_ms(2000); }
 
     /* ---- C. getindexinfo against a 67 MB txospender tail that keeps growing ---- */
     { extern void rpc_chain_set_index_config(int, int, int, int, int);
