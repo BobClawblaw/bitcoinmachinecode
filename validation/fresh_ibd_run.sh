@@ -31,7 +31,7 @@ set -u
 DEST=${DEST:-/mnt/2tbssd/bmc-bench}
 SRCREF=${SRCREF:-HEAD}
 P2P=${P2P:-8462}; RPC=${RPC:-8461}
-WORKERS=${WORKERS:-8}
+WORKERS=${WORKERS:-}   # empty = the daemon's derived default, Core's preferred-download set: bmc.maxoutbound + bmc.blockrelayonly = 10 (2026-09-29)
 # NICE: the daemon's CPU niceness. 10 suits a correctness run sharing the box;
 # a TIMED run against Core must use 0, because the Core baseline runs at
 # Nice=0 under systemd and a niced node measures the scheduler, not the code.
@@ -49,7 +49,7 @@ ph(){ echo "$(ts) $*" | tee -a "$PH"; }
 mkdir -p "$DEST" && cd "$DEST" || exit 2
 : > "$PH"; : > "$PROG"; rm -f RESULT 2>/dev/null
 
-ph "START host=$(hostname) kernel=$(uname -r) workers=$WORKERS"
+ph "START host=$(hostname) kernel=$(uname -r) workers=${WORKERS:-derived(10)}"
 [ -d src ] || git clone -q /storage/bitcoinmachinecode src
 # Hard-reset to the REMOTE ref. `checkout <branch>` on an existing clone keeps
 # whatever that branch pointed at when it was cloned, which silently built the
@@ -81,13 +81,13 @@ port=$P2P
 rpcport=$RPC
 dbcache=8192
 bmc.bootcatchup=0
-bmc.catchupworkers=$WORKERS
+${WORKERS:+bmc.catchupworkers=$WORKERS}
 # THE POINT OF THIS RUN: a per-height muhash record, so a set that diverges
 # from Core names the block it diverged on instead of only the tip.
 coinstatsindex=1
 CONF
 [ -n "$EXTRA_CONF" ] && printf '%s\n' "$EXTRA_CONF" >> data/bitcoin.conf
-ph "CONF port=$P2P rpcport=$RPC dbcache=8192 workers=$WORKERS coinstatsindex=1 nice=$NICE extra=[$(printf '%s' "$EXTRA_CONF" | tr '\n' ' ')]"
+ph "CONF port=$P2P rpcport=$RPC dbcache=8192 workers=${WORKERS:-derived(10)} coinstatsindex=1 nice=$NICE extra=[$(printf '%s' "$EXTRA_CONF" | tr '\n' ' ')]"
 
 T0=$(date +%s); echo "$T0" > epoch.start
 setsid nohup nice -n "$NICE" src/asm/daemon/bmcbitcoind serve "$DEST/data" > console.log 2>&1 < /dev/null &

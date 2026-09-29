@@ -760,7 +760,7 @@ node by several thousand blocks.
 | control | how it is enforced |
 |---|---|
 | same box, same disk, same cache | both `dbcache=8192` on the same SSD, runs never concurrent |
-| same download concurrency | 8 peers a side; ours via `bmc.catchupworkers`, Core's is fixed at 8 |
+| same download concurrency | 10 peers a side from run 31 (2026-09-29): Core downloads from its 8 full-relay + 2 block-relay-only peers, ours from `bmc.catchupworkers` derived as the same two classes, with the idle legs closed for the download. Runs 27-30 ran 8 against Core's 10 (the register had counted the full-relay class alone), a window of 4,096 against Core's 1,024, and 4 idle legs beside the workers. |
 | fresh datadir | no `assumeutxo`, no pruning, no reused chainstate |
 | same scheduling priority | `nice -n 10` on both, **default I/O class on both** |
 | SSD or NVMe only | the platter is archival; never a bench or production datadir |

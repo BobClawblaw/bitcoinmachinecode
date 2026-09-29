@@ -151,7 +151,11 @@ typedef struct {
     int  esplora_port;            /* bmc.esploraport: the Esplora facade listener (0 = off) */
     char esplora_bind[64];        /* bmc.esplorabind: its address (default 127.0.0.1) */
     int upload_rate_limit_kbps;   /* bmc.uploadratelimit: max bytes SENT to peers, KB/s, node-wide (0 = off) */
-    int catchup_workers;   /* bmc.catchupworkers: parallel download chunk workers (NOT -par) */
+    int catchup_workers;   /* bmc.catchupworkers: parallel download chunk workers (NOT -par).
+                              Absent from the file: derived at the end of the load as
+                              max_outbound + max_block_relay_only -- Core's preferred-download
+                              set (every outbound peer that can serve blocks; 2026-09-29) */
+    int catchup_workers_explicit; /* 1 = bmc.catchupworkers= appeared, so it is not derived */
     int  maxrecvbuffer_kb;       /* Core -maxreceivebuffer: n*1000 bytes     */
     long maxmempool_mb;          /* Core -maxmempool (MB, 0 = built-in 2MiB) */
     long mempoolexpiry_h;        /* Core -mempoolexpiry (hours, 0 = never)   */

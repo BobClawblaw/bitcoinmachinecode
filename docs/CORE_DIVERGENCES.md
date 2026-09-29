@@ -8,7 +8,7 @@ An inventory taken after the 09-09 leg and compact-block work, extended the same
 |---|---|---|---|---|---|
 | 1 | mempool overlap with the network | a peer's mempool holds nearly every transaction a new block carries | **REMEASURED 2026-09-16 and largely CLOSED.** 73 compact blocks over heights 967,199-967,270: steady-state overlap (more than 20 min after a restart) **median 95.8%**, `getblocktxn` **median 34 KB**. The row was written from two blocks at 40% and 65% fetching 690 KB and 460 KB; inbound relay at 100% and 12 outbound legs have closed that. Within 20 min of a restart the median is 89.5% at 143 KB, which is the pool refilling and not a coverage gap. | what did NOT change: **89% of the transactions still fetched were never announced to us** (the row said 98% and 87%), so the residual really is coverage rather than request handling -- announced-not-requested is 267 of 70,400. | nothing to do on overlap. The remaining bandwidth is now dominated by REPEAT RECONSTRUCTIONS, recorded as row 4 below. |
 
-| ~~2~~ | ~~download occupancy~~ **CLOSED 2026-09-16 — it was never an open divergence** | Core fixes block-download concurrency at 8 (`MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`, not configurable) | this row read "8 workers is a configured cap, not an architectural one, with 112 peers sitting free", which frames a PARITY DECISION as a limitation. `bmc.catchupworkers` exists so this node can be set to MATCH Core; 8 is the value that does. The register already says so two sections below, and said the opposite here. | the row's own fix column named `validation/download_worker_sweep.sh` as what would answer it — and that script was RETIRED on 2026-09-14 with the note "it answers a question this project should not act on, and answering it cost a day and an outage" (four failed runs and the LAN saturation). So the row demanded a measurement whose instrument had been deliberately destroyed, for a number it must not change. The performance question is separately answered: run 23, at 8 workers, is the fastest of four runs in every segment and on the total, beating an unhandicapped Core v31.1 by nine minutes (`docs/reports/2026-09-11-ibd-vs-core.md`). | nothing to do. Raising the count would also make every future Core comparison measure peer count rather than implementation. The one REAL observation inside this row is not about worker count and survives as row 5. |
+| ~~2~~ | ~~download occupancy~~ **CLOSED 2026-09-16 — it was never an open divergence** | Core fixes block-download concurrency at 8 (`MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`, not configurable) | this row read "8 workers is a configured cap, not an architectural one, with 112 peers sitting free", which frames a PARITY DECISION as a limitation. `bmc.catchupworkers` exists so this node can be set to MATCH Core; 8 is the value that does. The register already says so two sections below, and said the opposite here. | the row's own fix column named `validation/download_worker_sweep.sh` as what would answer it — and that script was RETIRED on 2026-09-14 with the note "it answers a question this project should not act on, and answering it cost a day and an outage" (four failed runs and the LAN saturation). So the row demanded a measurement whose instrument had been deliberately destroyed, for a number it must not change. The performance question is separately answered: run 23, at 8 workers, is the fastest of four runs in every segment and on the total, beating an unhandicapped Core v31.1 by nine minutes (`docs/reports/2026-09-11-ibd-vs-core.md`). | nothing to do. Raising the count would also make every future Core comparison measure peer count rather than implementation. The one REAL observation inside this row is not about worker count and survives as row 5. **Corrected 2026-09-29:** Core's download set is 10 (full-relay 8 + block-relay-only 2, `fPreferredDownload`), not 8; the default now follows the classes (see the section below). |
 
 | ~~3~~ | ~~UTXO set metadata after a fresh sync~~ **DISPROVED 2026-09-12 — do not re-open on the old evidence** | — | run 22's UTXO set is byte-identical to Core: walked OFFLINE with `bmc_utxo_setinfo --muhash` at height 966,496 it gives `df1b0340…073d0165`, matching the oracle on muhash, txouts, bogosize and total_amount alike. Run 23 matches at 966,674 (`b75303cd…71290099`). There is no coin-height bug. | the capstone had hashed a LIVE, still-flushing set: a walk over a moving LSM is not a set, and `txouts` agreed because it is a maintained counter, not the walk's own count — aggregates matching while the hash differed was the signature of a torn read, not of correct data with wrong metadata | nothing to fix. The harness lesson landed instead: pin the height on BOTH sides, take our applied height from a quiesced walk, then ask Core for that height. |
 
@@ -235,40 +235,47 @@ v31.1.
 
 ---
 
-## `bmc.catchupworkers` is pinned at 8 because Core's is, and is not a tuning knob
+## `bmc.catchupworkers` follows Core's preferred-download set (10), and is not a tuning knob
 
-Recorded 2026-09-14, after retiring `validation/download_worker_sweep.sh`.
+Recorded 2026-09-14 as "pinned at 8 because Core's is"; **corrected 2026-09-29**:
+the 8 was Core's full-relay class alone, and Core downloads from more than that.
 
-Core's block-download concurrency is **fixed**: `MAX_OUTBOUND_FULL_RELAY_CONNECTIONS`
-is 8 and is not configurable. This node exposes `bmc.catchupworkers`, which
-looks like a tuning knob and is not one — it exists so this node can be set to
-**match** Core, and 8 is the value that does.
+**What Core actually does during IBD** (`net_processing.cpp`, v31.1): a peer is
+a *preferred download* peer when it is outbound, not an addr-fetch connection,
+and can serve blocks (`fPreferredDownload`). That is every full-relay peer
+(`MAX_OUTBOUND_FULL_RELAY_CONNECTIONS` = 8) **and** every block-relay-only peer
+(`MAX_BLOCK_RELAY_ONLY_CONNECTIONS` = 2): ten peers, each with up to 16 blocks
+in flight (`MAX_BLOCKS_IN_TRANSIT_PER_PEER`), requested no further than 1,024
+blocks above the connected tip (`BLOCK_DOWNLOAD_WINDOW`). Inbound peers are
+used only when there is no preferred peer or nothing is in flight. None of it
+is configurable.
 
-**Why this is written down rather than left to judgement.** The count has twice
-been set from an unmeasured number: 64 arrived as the size of the worker arrays,
-and 8 replaced it on a comparison the release note itself called "not a
-controlled A/B". A sweep was then built to measure it properly, and the
-measurement was the wrong thing to want:
+**What this node does now** (2026-09-29): `bmc.catchupworkers` left unset is
+derived at the end of the config load as `bmc.maxoutbound + bmc.blockrelayonly`,
+10 at the defaults, so it tracks the classes the way Core's set does. Set, it is
+a fixed ceiling. The download window is Core's 1,024 above the connected tip
+(it was six times the claimed chunks, never under 4,096). And while the archive
+tip is older than `maxtipage` — Core's IBD clause — the idle legs are closed
+before the parallel download, so the download peers are the outbound set, as
+they are in Core (run 30 held four idle legs beside its eight workers).
 
-1. Raising the count above 8 makes Core comparisons meaningless. The IBD report
-   states it directly — earlier runs at 16 to 64 against Core's 8 "is not a
-   comparison of anything". A benchmark at a different peer count measures peer
-   count, not implementation.
-2. The performance question is already answered where it can be asked honestly:
-   run 23, at 8 workers, is the fastest of four measured runs and beats an
-   unhandicapped Core v31.1.
-3. Each additional download slot is another connection to a stranger's node, for
-   our benefit. Core chose 8 deliberately.
+**Why this is written down rather than left to judgement.** The count has three
+times been set from a number that was not Core's: 64 arrived as the size of the
+worker arrays, 8 replaced it as "Core's" on the full-relay class alone, and
+each was defended as parity. The rule now is the one Core's source states,
+with the citation above; a change to it belongs here with its own entry.
 
-**What remains genuinely open** is peer *selection*, not peer count. Download
-workers spend 17 to 31% of their wall-clock blocked before the first byte —
-slots held by peers that cannot fill the pipe. Adding slots does not fix that;
-choosing better peers might. Measure it against the local oracle's sixteen
-loopback listeners, where no stranger's node is involved.
+**What remains genuinely different** is the shape inside a peer, not the
+count: a worker asks for one 40-block chunk in a single `getdata` where Core
+keeps 16 blocks in flight and refills as each lands (see
+`docs/CORE_BEHAVIORAL_COMPAT.md`, "Blocks in flight per peer"). And peer
+*selection* is still the open question the 09-14 entry named: workers spend
+17 to 31% of their wall-clock blocked before the first byte.
 
-Raising `bmc.catchupworkers` above 8 for a benchmark invalidates that benchmark.
-Raising it in production is a deliberate divergence from Core and belongs in this
-file with its own entry.
+Setting `bmc.catchupworkers` to anything but the derived 10 for a benchmark
+against Core makes that benchmark measure peer count, not implementation.
+Runs 27 to 30 ran at 8 and Core's baselines at 10; the pairs are still fair
+in Core's favour, and run 31 is the first at 10.
 
 ---
 
