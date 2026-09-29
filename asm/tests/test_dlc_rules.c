@@ -36,8 +36,9 @@ int main(void){
     ck("a 40-block handoff: one helper, not 64 (row 3)", dlc_workers_for(124, 64, 40) == 1);
     ck("a 41-block span: two helpers", dlc_workers_for(124, 64, 41) == 2);
     ck("a 1,000-block span: 25 helpers", dlc_workers_for(124, 64, 1000) == 25);
-    ck("the window is six times what is in flight: 64 x 40 x 6 = 15,360", dlc_window_blocks(64, 40) == 15360);
-    ck("...never under 4,096 (16 workers: 3,840 in flight would be 1.6x, run 11's stall)", dlc_window_blocks(16, 40) == 4096);
+    ck("the window is Core's 1,024 above the connected tip (10 workers x 40 claimed fit inside it)", dlc_window_blocks(10, 40) == 1024);
+    ck("...and 8 workers get the same 1,024, not six times their chunks", dlc_window_blocks(8, 40) == 1024);
+    ck("...never below what the workers claim at once: 64 x 40 = 2,560", dlc_window_blocks(64, 40) == 2560);
     ck("anchor: the connected tip + 1 when the engine is here", dlc_window_anchor(700001, 700970) == 700001);
     ck("anchor: the first hole when there is no engine (-1)", dlc_window_anchor(-1, 700970) == 700970);
     ck("anchor: never above the first hole", dlc_window_anchor(700980, 700970) == 700970);

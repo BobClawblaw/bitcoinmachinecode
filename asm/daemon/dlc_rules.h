@@ -48,8 +48,7 @@ static inline int dlc_chain_falls_short(long chain_tip, long announced){
  * against 124 live peers, a window from the download's own frontier, an
  * EMA ranking and a rate floor. The rules below are the pure parts. */
 #define DLC_WORKERS_HARD_MAX 64
-#define DLC_WINDOW_MIN 4096L
-#define DLC_WINDOW_INFLIGHT_MULT 6L        /* Core: 1,024 over ~160 in flight */
+#define DLC_BLOCK_DOWNLOAD_WINDOW 1024L    /* Core: BLOCK_DOWNLOAD_WINDOW, above the connected tip (2026-09-29) */
 #define DLC_STALL_TIMEOUT_MIN_S 2L         /* BLOCK_STALLING_TIMEOUT_DEFAULT */
 #define DLC_STALL_TIMEOUT_MAX_S 64L        /* BLOCK_STALLING_TIMEOUT_MAX */
 /* every live peer downloads, up to the operator's cap and the arrays' 64 --
@@ -63,10 +62,15 @@ static inline int dlc_workers_for(int nlive, int cap, long span_blocks){
     if (n > DLC_WORKERS_HARD_MAX) n = DLC_WORKERS_HARD_MAX;
     return n;
 }
-/* the window scales with what is in flight (Core's ratio), never under the old 4,096 */
+/* Core's window: 1,024 blocks above the connected tip, whatever the peer
+ * count (2026-09-29; it was six times the claimed chunks, never under 4,096,
+ * and run 30's download sat at that window's edge for the whole sync -- the
+ * apply was the pace, and a 4,096 runway against Core's 1,024 was a setting
+ * the A/B did not share). Never smaller than what the workers claim at once
+ * (nw x chunk), or they could not all hold a chunk. */
 static inline long dlc_window_blocks(int nw, long chunk){
-    long w = (long)nw * chunk * DLC_WINDOW_INFLIGHT_MULT;
-    return w < DLC_WINDOW_MIN ? DLC_WINDOW_MIN : w;
+    long claimed = (long)nw * chunk;
+    return claimed > DLC_BLOCK_DOWNLOAD_WINDOW ? claimed : DLC_BLOCK_DOWNLOAD_WINDOW;
 }
 /* the window is anchored to the CONNECTED tip when the engine is in this
  * process (applied_plus1 >= 0), else to the archive's first hole */
