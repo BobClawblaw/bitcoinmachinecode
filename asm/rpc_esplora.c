@@ -148,8 +148,13 @@ int esplora_merkle_branch(const u8 (*txids)[32], long n, long pos, u8 (*branch)[
  * JSON-RPC callers interleave. rpc_server.c installs the hooks. */
 static void (*g_lock)(void) = 0; static void (*g_unlock)(void) = 0;
 void esplora_set_exec_lock(void (*lock)(void), void (*unlock)(void)){ g_lock = lock; g_unlock = unlock; }
+/* rpc_server.c names this dispatch (the route, then the method) in its
+ * exec-lock wait/hold lines; weak, so the unit tests link without it. */
+extern void rpc_exec_set_label(const char*) __attribute__((weak));
+extern void rpc_exec_set_context(const char*, const char*, size_t, const char*, size_t) __attribute__((weak));
 static rj_val* call(const rpc_wallet* w, const char* method, rj_val* params, long* ec, const char** em){
     rj_val* r = 0; long e = 0; const char* m = 0;
+    if (rpc_exec_set_label) rpc_exec_set_label(method);
     if (g_lock) g_lock();
     int ok = rpc_dispatch(method, params, w, &r, &e, &m);
     if (g_unlock) g_unlock();
@@ -865,6 +870,7 @@ int esplora_handle(const char* method, size_t mlen, const char* path, size_t ple
                    const char* body, size_t blen, const rpc_wallet* w,
                    char** out, size_t* outlen, int* status, const char** ctype){
     resp_t r = { out, outlen, status, ctype };
+    if (rpc_exec_set_context) rpc_exec_set_context("esplora", method, mlen, path, plen);   /* this thread is this route until the next one */
     int get = (mlen == 3 && !memcmp(method, "GET", 3)), post = (mlen == 4 && !memcmp(method, "POST", 4));
     /* split the path (without the query) into segments */
     size_t pl = plen; { const char* q = memchr(path, '?', plen); if (q) pl = (size_t)(q - path); }
