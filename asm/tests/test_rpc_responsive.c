@@ -162,6 +162,19 @@ static void* slow_wait(void* a){
     s->ms = now_ms() - t0;
     return NULL;
 }
+/* F: a pool whose lock this test holds (the hooks' lock pointer) */
+static pthread_mutex_t g_pool_mu = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_pool_waits;
+static void fake_pool_lock(void){ __sync_fetch_and_add(&g_pool_waits, 1); pthread_mutex_lock(&g_pool_mu); }
+static void fake_pool_unlock(void){ pthread_mutex_unlock(&g_pool_mu); }
+static const unsigned char* fake_pool_get(void* mp, const unsigned char* txid, unsigned long* len){ (void)mp; (void)txid; *len = 0; return NULL; }
+typedef struct { const char* m; double ms; char out[4096]; } probe_t;
+static void* probe_thread(void* a){ probe_t* p = a; p->ms = call_ms(p->m, "[]", p->out, sizeof p->out); return NULL; }
+static void* rawtx_wait(void* a){
+    submit_t* s = a;
+    s->ms = call_ms("getrawtransaction", "[\"1111111111111111111111111111111111111111111111111111111111111111\"]", s->out, sizeof s->out);
+    return NULL;
+}
 static void* hold_lock(void* a){
     long ms = (long)a;
     rpc_exec_hold_for_test(1);
@@ -348,6 +361,44 @@ int main(void){
       ck("the submit itself timed out honestly (-4) after its 2.5 s wait", sb.ms >= 2400 && strstr(sb.out, "\"code\":-4") != NULL);
       ck("the execution lock was yielded for the wait", rpc_exec_yields() > y0);
       rpc_node_set_submit_wait_ms_for_test(0); }
+
+    /* ---- F. getrawtransaction's mempool consult waits on the POOL lock, not
+     * the surface (2026-09-30) ----
+     * The lock log named the facade's getrawtransaction holding the execution
+     * lock for 2,045 ms at a 78k pool, of which its own work was under 20:
+     * the rest was rpc_node_mempool_rawtx waiting for the pool lock, held by
+     * the download worker in another process. Here the pool's lock is a
+     * mutex this test holds for 2 s (the hooks' lock pointer); the consult
+     * must wait on it with the execution lock yielded, so every trivial
+     * method and an exclusive one answer within the bound meanwhile, and
+     * the call itself completes once the lock is released. */
+    { pthread_mutex_lock(&g_pool_mu);
+      static unsigned char fake_pool[64];
+      rpc_mempool_hooks h; memset(&h, 0, sizeof h);
+      h.mp = fake_pool; h.get = fake_pool_get; h.lock = fake_pool_lock; h.unlock = fake_pool_unlock;
+      rpc_node_set_mempool(&h);
+      long y0 = rpc_exec_yields();
+      pthread_t th; static submit_t rb; memset(&rb, 0, sizeof rb);
+      pthread_create(&th, NULL, rawtx_wait, &rb);
+      struct timespec settle = { 0, 300 * 1000000L }; nanosleep(&settle, NULL);
+      ck("F: the consult is waiting on the pool lock", g_pool_waits == 1);
+      for (unsigned i = 0; i < NTRIV; i++) probe_one("getrawtransaction waiting on the pool lock", TRIVIAL[i]);
+      /* the exclusive probe on its own thread: without the yield it waits
+       * for the consult, which waits for the mutex THIS thread holds -- a
+       * synchronous probe here would deadlock the test instead of failing
+       * it (that is the production stall's exact shape, seen from inside) */
+      pthread_t pth; static probe_t pb; memset(&pb, 0, sizeof pb); pb.m = "getchaintips";
+      pthread_create(&pth, NULL, probe_thread, &pb);
+      struct timespec hold = { 1, 700 * 1000000L }; nanosleep(&hold, NULL);
+      pthread_mutex_unlock(&g_pool_mu);
+      pthread_join(pth, NULL);
+      { char label[200]; snprintf(label, sizeof label, "F: an EXCLUSIVE call answers while the consult waits: getchaintips in %.1f ms (bound 100 ms)", pb.ms);
+        ck(label, pb.ms < 100.0 && strstr(pb.out, "\"result\"") != NULL); }
+      pthread_join(th, NULL);
+      printf("      getrawtransaction answered after %.0f ms: %.120s\n", rb.ms, strstr(rb.out, "{") ? strstr(rb.out, "{") : rb.out);
+      ck("F: the call completed after the pool lock was released (>= 1.9 s, an answer)", rb.ms >= 1900 && strstr(rb.out, "\"error\"") != NULL);
+      ck("F: the execution lock was yielded for the consult", rpc_exec_yields() > y0);
+      rpc_node_set_mempool(NULL); }
 
     rpc_server_stop();
     printf(fails ? "\nTESTS FAILED (%d failures)\n" : "\nALL TESTS PASSED (%d failures)\n", fails);

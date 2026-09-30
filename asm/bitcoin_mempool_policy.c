@@ -1320,6 +1320,12 @@ static void remove_node(void* st, void* mp, int ci){
  * runs once per removed node, before anything moves, exactly as
  * remove_node does it. Only the POSITIONAL work is batched.
  * ========================================================================== */
+/* The pool lock's hold log (daemon/mempool_lock.h) names the step a holder
+ * is in; block connect runs under that lock in the download worker, so its
+ * steps are named here. Weak: the tools that link this file without the
+ * daemon's mempool_cfg.c have no lock to name. */
+extern void mp_lock_phase(const char*) __attribute__((weak));
+static void mpol_phase(const char* p){ if (mp_lock_phase) mp_lock_phase(p); }
 /* Batch removal is on by default. The switch exists so the test suite can run
  * the SAME block connect both ways from an identical starting state and
  * compare the resulting pool -- the claim a batch makes is not "it is fast"
@@ -1368,6 +1374,7 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
     uint8_t* mark = g_rm_mark;
     uint32_t* remap = g_rm_remap;
 
+    mpol_phase("rm/seq");
     /* ---- 0. the sequence hook, in BLOCK order ----
      * Core's removeForBlock walks the block: for each transaction, the
      * transaction itself leaves (numbered, unpublished), then whatever
@@ -1405,6 +1412,7 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
         }
     }
 
+    mpol_phase("rm/bookkeeping");
     /* ---- 1. per-node bookkeeping, while indices are still valid ---- */
     long nremoved = 0;
     for (uint32_t i = 0; i < n; i++){
@@ -1429,6 +1437,7 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
     }
     if (!nremoved) return 0;
 
+    mpol_phase("rm/claims");
     /* ---- 2. claims: drop those a removed node claimed, keep order ---- */
     { mpol_claim* c = mpol_claims_base(st);
       uint32_t* ncl = (uint32_t*)((char*)st+12);
@@ -1441,6 +1450,7 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
       }
       *ncl = w; }
 
+    mpol_phase("rm/outreg");
     /* ---- 3. outreg: drop the outputs of removed transactions.
      * The node index still answers, so this is a lookup per entry rather
      * than a scan per removed node. ---- */
@@ -1455,6 +1465,7 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
       }
       *no = w; }
 
+    mpol_phase("rm/compact");
     /* ---- 4. compact the nodes, building the remap ---- */
     uint32_t w = 0;
     for (uint32_t i = 0; i < n; i++){
@@ -1465,6 +1476,7 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
     }
     *(uint32_t*)((char*)st+16) = w;
 
+    mpol_phase("rm/relink");
     /* ---- 5. ONE pass over the survivors' parent lists. A parent that moved
      * is renumbered; a parent that is gone becomes 0xFFFFFFFF. The old code
      * needed a full sweep for each of those, per removal. ---- */
@@ -1486,6 +1498,7 @@ static long mpol_remove_marked(void* st, void* mp, uint32_t n){
           c[i].claimer = (cl < n && remap[cl] != MPOL_IDX_NONE) ? remap[cl] : cl;
       } }
 
+    mpol_phase("rm/reindex");
     /* ---- 7. rebuild the three indices. Every array moved, so patching each
      * chain would cost more than starting again -- and starting again cannot
      * leave a stale link behind, which is the failure mode that matters. ---- */
@@ -2978,6 +2991,7 @@ long mpool_policy_block_connect(void* st, void* mp,
                                 const unsigned char* block, unsigned long blen){
     if (!tx_parse || !tx_txid) return -1;
     if (!st || *(uint32_t*)st != MPOL_MAGIC || blen < 81) return -1;
+    mpol_phase("mark");
     /* Everything this call removes left because it was MINED. A transaction
      * the block CONFLICTS with (it spends an output the block spent elsewhere)
      * also leaves here; that is recorded as mined too, which would be wrong --
@@ -3069,7 +3083,8 @@ long mpool_policy_block_connect(void* st, void* mp,
         }
         p += txlen;
     }
-    if (batch) removed += mpol_remove_marked(st, mp, n_nodes);
+    if (batch){ mpol_phase("remove_marked"); removed += mpol_remove_marked(st, mp, n_nodes); }   /* the per-tx fallback removed inside "mark" */
+    mpol_phase("rejects_clear+note");
     /* MEM-10: Core resets m_recent_rejects on every new block, because a
      * block can make a previously-invalid transaction valid -- its missing
      * input just confirmed -- and a stale "no" would stop us ever fetching

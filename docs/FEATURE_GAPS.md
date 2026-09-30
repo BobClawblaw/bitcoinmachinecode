@@ -2386,6 +2386,55 @@ any NOLOCK call. What remains on the exclusive lock from the pollers' set:
 `getblock`, `getrawtransaction`, `getblockstats`, `gettxout`, and the
 facade's and REST's own dispatch (`esp_lock`).
 
+**2026-09-30, evening: the holds were waits on the POOL lock, so that lock
+is timed now, and `getrawtransaction`'s consult of it left the surface.**
+Measured on production, the handlers the exec-lock log had named cost
+10-13 ms (`getmempoolinfo`, `getrawmempool` after the cache) and 550-640 ms
+(`getrawtransaction`) of their own; the seconds were spent inside `mpl()`,
+waiting for the mempool's cross-process lock (`daemon/mempool_cfg.c`
+`mp_lock`), which the download worker holds while it removes a block's
+transactions from the pool -- the same lock every accept in every serve
+child takes, and the one lock on the node that the RPC process cannot see
+the other side of. The 90-second stalls at a block have that shape one
+size up, and nothing timed that lock either. Now (`daemon/mempool_lock.h`):
+every take is named (`mp_lock_at(site)`: the function in the worker and
+the serve children, the RPC method for the RPC thread's hook), every take
+and release is timed, and a wait or a hold of `BMC_MEMPOOL_LOCK_LOG_MS`
+(default 1000 ms; 0 = off) or longer is one `[mempool] pool lock:` line.
+A holder that spans steps names them (`mp_lock_phase`): block connect
+reports `fest_begin`, `mark`, `remove_marked` and inside it `rm/seq`,
+`rm/bookkeeping`, `rm/claims`, `rm/outreg`, `rm/compact`, `rm/relink`,
+`rm/reindex`, then `rejects_clear+note`, `fest_end`, `seq_C`, each with
+its milliseconds, so the line says not just that block connect held the
+lock but which of its passes did. The holder's site and pid live in the
+lock's shared page, so a waiter in the RPC process names a holder in the
+worker: `getrawtransaction (pid 12602) waited 3467 ms; the holder was
+tx_accept_block_connect_h/rm/reindex (pid 12606, held 3450 ms)`.
+`tests/test_mempool_lock_log` pins the two lines, the steps, the
+cross-process naming (a forked holder), the threshold and the no-op cases
+(OPERATIONS.md, "Logging"). The next block-time stall names its pass; the
+fix follows the name, not the other way round.
+
+And the one exclusive handler that consults the pool on every poll --
+`getrawtransaction`, the facade's second most-dispatched call, which asks
+the mempool before the index as Core does -- no longer holds the execution
+lock while it asks: `rpc_chain.c` releases it around
+`rpc_node_mempool_rawtx` and takes it back before the index, the block
+buffer or the tip are touched (`rpc_exec_yield_begin` / `_end`, as the
+worker waits were done above; the copy lands in a per-thread buffer, and
+the tip is re-read after). `tests/test_rpc_responsive` scenario F: with the
+pool's lock a mutex the test holds for 2 s, the consult waits on it while
+every trivial method and an exclusive `getchaintips` answer within 100 ms,
+the call completes once the mutex is released, and the yield counter moved;
+with the yield made a no-op, `getchaintips` waited 1,710 ms behind the
+consult -- and a synchronous probe deadlocked the test outright, which is
+the production stall seen from inside (the probe runs on its own thread
+for that reason). `getblock`, `getblockstats`, `gettxout` and the facade's
+`esp_lock` dispatch stay on the exclusive lock; none of them consults the
+pool, so none of them waits on the worker there (`getblocktemplate` does,
+under the exclusive lock, and stays so: a miner's call, not a poller's).
+The block lane with a private buffer remains the next step for `getblock`.
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`

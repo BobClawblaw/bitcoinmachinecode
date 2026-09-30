@@ -882,6 +882,23 @@ Outside the chain directory: `<datadir>/bitcoin.conf` or
   ms); 3 waiting behind it`. A waiter names the last *exclusive* holder because
   that is what the writer-preferring lock made it wait for; a hold shorter than
   the wait means the wait was behind readers.
+  **`[mempool] pool lock:` lines** (2026-09-30): the mempool's own lock is
+  shared by the download worker, every inbound serve child and the RPC
+  process, and the seconds the lines above attributed to `getrawmempool`,
+  `getmempoolinfo` and `getrawtransaction` were spent waiting for it while
+  the worker held it at a new block. A wait or a hold of
+  `BMC_MEMPOOL_LOCK_LOG_MS` or longer (environment; default 1000 ms, 0
+  switches it off) logs one line from the process that waited or held,
+  naming the site (the worker's or child's function, or the RPC method) and
+  the pid: `... getrawtransaction (pid 12602) waited 3467 ms; the holder was
+  tx_accept_block_connect_h/rm/reindex (pid 12606, held 3450 ms); 2 still
+  waiting`, and the holder's own `... tx_accept_block_connect_h (pid 12606)
+  held 3450 ms (waited 0 ms): fest_begin 0 ms, mark 118 ms, remove_marked 0
+  ms, rm/seq 12 ms, ..., rm/reindex 2900 ms, seq_C 1 ms; 2 waiting behind
+  it` -- the steps are block connect's passes, so the line says which one.
+  Each line is written by the process that waited or held, on its stderr,
+  which every process of the node shares (the worker's, a serve child's and
+  the RPC process's lines land in the same log, interleaved).
 - `includeconf=<file>` (relative to the main file's directory) is read after
   it; an included file may not include another.
 - Core options that are accepted WITHOUT effect are each named at start-up
