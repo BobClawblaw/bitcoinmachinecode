@@ -121,5 +121,9 @@ long rpc_exec_log_ms(void);
 long rpc_exec_slow_events(void);
 void rpc_exec_slow_log(char* out, size_t cap);
 int  rpc_exec_waiters(void);
+/* a handler releases the execution lock around a wait on the worker and takes it back (2026-09-30) */
+void rpc_exec_yield_begin(void);
+void rpc_exec_yield_end(void);
+long rpc_exec_yields(void);        /* test hook: waits that ran with the lock released */
 
 #endif /* RPC_SERVER_H */

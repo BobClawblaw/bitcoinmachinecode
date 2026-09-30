@@ -920,6 +920,9 @@ static long g_exec_log_ms = RPC_EXEC_LOG_MS_DEFAULT;
 static __thread struct timespec g_exec_took;      /* when this thread got the lock */
 static __thread long g_exec_waited_ms;
 static __thread int g_exec_cls;                   /* RPC_CLASS_EXCL / RPC_CLASS_SHARED while held */
+static __thread int g_exec_held;                  /* 1 between exec_take and exec_unlock on this thread */
+static __thread int g_exec_yield_cls;             /* the class to re-take after a yield (0 = not yielded) */
+static long g_exec_yields;                        /* how many waits ran with the lock released; test hook */
 static pthread_mutex_t g_exec_log_mu = PTHREAD_MUTEX_INITIALIZER;
 static char g_exec_last_holder[256];              /* the last EXCLUSIVE holder's label */
 static long g_exec_last_hold_ms;
@@ -947,7 +950,7 @@ static void exec_take(int cls){
     __sync_fetch_and_sub(&g_exec_waiters, 1);
     clock_gettime(CLOCK_MONOTONIC, &g_exec_took);
     g_exec_waited_ms = ms_between(&t0, &g_exec_took);
-    g_exec_cls = cls;
+    g_exec_cls = cls; g_exec_held = 1;
     if (g_exec_log_ms > 0 && g_exec_waited_ms >= g_exec_log_ms){
         char me[256]; exec_label_of(me, sizeof me);
         char last[256]; long last_ms;
@@ -975,6 +978,7 @@ static void exec_unlock(void){
         pthread_mutex_unlock(&g_exec_log_mu);
     }
     int waiting = g_exec_waiters;
+    g_exec_held = 0;
     pthread_rwlock_unlock(&g_exec_lock);
     if (g_exec_log_ms > 0 && held >= g_exec_log_ms){
         char line[640];
@@ -984,6 +988,31 @@ static void exec_unlock(void){
     }
 }
 int rpc_exec_waiters(void){ return g_exec_waiters; }
+/* 2026-09-30: a handler that waits on the WORKER -- another process, reached
+ * through the submit, block and control channels -- must not hold the
+ * execution lock while it waits. sendrawtransaction spun up to 90 s for the
+ * worker's ack with the write side held, and the worker picks the channel up
+ * only at the top of its serve loop, so a broadcast that landed while the
+ * worker was inside a new block's passes parked the whole surface -- JSON-RPC,
+ * facade and REST -- behind it (four 90 s stalls in three days, each within
+ * two seconds of a block). The handler releases the lock around the wait and
+ * takes it back, in the class it held, before it touches anything the lock
+ * protects; the channel has its own mutex (rpc_node.c g_submit_lock), which
+ * is taken and released inside the yield so a second submitter waits on the
+ * mutex, not on the surface. No-ops when this thread holds nothing (the FAST
+ * and NOLOCK lanes, the unit tests that link rpc_node without the server). */
+void rpc_exec_yield_begin(void){
+    if (!g_exec_held || g_exec_yield_cls) return;
+    g_exec_yield_cls = g_exec_cls;
+    exec_unlock();
+    __sync_fetch_and_add(&g_exec_yields, 1);
+}
+void rpc_exec_yield_end(void){
+    if (!g_exec_yield_cls) return;
+    int cls = g_exec_yield_cls; g_exec_yield_cls = 0;
+    exec_take(cls);
+}
+long rpc_exec_yields(void){ return g_exec_yields; }
 /* The facade and REST name what they dispatch (rpc_esplora.c / rest.c call
  * these through weak references, so their unit tests link without us). */
 void rpc_exec_set_label(const char* method){ g_exec_label = method; }

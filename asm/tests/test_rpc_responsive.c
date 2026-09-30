@@ -49,6 +49,7 @@
 #include <stdint.h>
 #include "test_tmpdir.h"
 #include "../daemon/txosp_format.h"
+#include "../rpc_node.h"        /* E: a status block with no worker behind it (2026-09-30) */
 
 extern int  store_init(void* st);
 extern long store_append(void* st, const unsigned char* hash32, const void* blk, long len);
@@ -77,7 +78,7 @@ static int connect_port(void){
     return fd;
 }
 static int send_call(int fd, const char* method, const char* params){
-    char body[512], req[1024];
+    char body[2048], req[3072];      /* E sends a real 285-byte transaction as hex */
     int bl = snprintf(body, sizeof body, "{\"jsonrpc\":\"1.0\",\"id\":7,\"method\":\"%s\",\"params\":%s}", method, params);
     int rl = snprintf(req, sizeof req, "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Basic " AUTH "\r\n"
                       "Content-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", bl, body);
@@ -110,6 +111,15 @@ static void probe_one(const char* scenario, const char* m){
     ck(label, ok200 && worst < 100.0);
 }
 
+/* E: a sendrawtransaction that waits on a worker which never answers (2026-09-30) */
+static const char* E_TX_HEX = "01000000000101ad2bb91208eef398def3ed3e784d9ee9b7befeb56a3053c3561849b88bc4cedf0000000000ffffffff037a3e0100000000001600148d7a0a3461e3891723e5fdf8129caa0075060cff7a3e0100000000001600148d7a0a3461e3891723e5fdf8129caa0075060cff0000000000000000256a2342697462616e6b20496e632e204a6170616e20737570706f727473205365675769742102483045022100a6e33a7aff720ba9f33a0a8346a16fdd022196862796d511d31978c40c9ad48b02206fb8f67bd699a8c952b3386a81d122c366d2d36cd08e2de21207e6aa6f96ce9501210283409659355b6d1cc3c32decd5d561abaac86c37a353b52895a5e6c196d6f44800000000";
+typedef struct { double ms; char out[4096]; } submit_t;
+static void* submit_wait(void* a){
+    submit_t* s = a; char params[1024];
+    snprintf(params, sizeof params, "[\"%s\"]", E_TX_HEX);
+    s->ms = call_ms("sendrawtransaction", params, s->out, sizeof s->out);
+    return NULL;
+}
 /* waitfornewblock in flight: send the request and keep the socket open */
 #define WAIT_MS 800
 typedef struct { int fd; double ms; char out[4096]; } slow_t;
@@ -279,6 +289,33 @@ int main(void){
       printf("      getindexinfo on a growing 67 MB tail: at most %.3f ms of CPU per call\n", worst_cpu_ms);
       ck("getindexinfo reports the tail's coverage (300, synced)", right);
       ck("getindexinfo's cost does not scale with the tail: < 0.5 ms CPU per call", worst_cpu_ms < 0.5); }
+
+    /* ---- E. a submit waiting on the worker does not hold the surface (2026-09-30) ----
+     * The four 90 s stalls of the whole surface, each within two seconds of
+     * a block, have the shape of sendrawtransaction spinning for the
+     * worker's ack with the execution lock held while the worker is inside a
+     * block's passes. Here the worker never answers: a status block with
+     * nobody behind it, and the wait cut from 90 s to 2.5 s. While the
+     * submit waits, every trivial method AND an exclusive one must answer
+     * within the 100 ms bound; the submit itself must then time out
+     * honestly (-4), and the lock must have been yielded for the wait. Last,
+     * because the status block changes what the chain methods report. */
+    { static node_status_t fake; memset(&fake, 0, sizeof fake);
+      rpc_node_set_status_rw(&fake);
+      rpc_node_set_submit_wait_ms_for_test(2500);
+      long y0 = rpc_exec_yields();
+      pthread_t th; static submit_t sb; memset(&sb, 0, sizeof sb);
+      pthread_create(&th, NULL, submit_wait, &sb);
+      struct timespec settle = { 0, 300 * 1000000L }; nanosleep(&settle, NULL);
+      for (unsigned i = 0; i < NTRIV; i++) probe_one("sendrawtransaction waiting on the worker", TRIVIAL[i]);
+      { char out[4096]; double ms = call_ms("getblockhash", "[1]", out, sizeof out);
+        char label[200]; snprintf(label, sizeof label, "an EXCLUSIVE call answers while the submit waits: getblockhash in %.1f ms (bound 100 ms)", ms);
+        ck(label, ms < 100.0 && strstr(out, "\"result\"") != NULL); }
+      pthread_join(th, NULL);
+      printf("      the submit answered after %.0f ms: %.120s\n", sb.ms, strstr(sb.out, "{") ? strstr(sb.out, "{") : sb.out);
+      ck("the submit itself timed out honestly (-4) after its 2.5 s wait", sb.ms >= 2400 && strstr(sb.out, "\"code\":-4") != NULL);
+      ck("the execution lock was yielded for the wait", rpc_exec_yields() > y0);
+      rpc_node_set_submit_wait_ms_for_test(0); }
 
     rpc_server_stop();
     printf(fails ? "\nTESTS FAILED (%d failures)\n" : "\nALL TESTS PASSED (%d failures)\n", fails);
