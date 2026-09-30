@@ -2348,6 +2348,18 @@ block scan), `getblockstats`, `gettxout`; the facade's and REST's own
 dispatch takes the exclusive lock too (`esp_lock`). A block lane with a
 private buffer is the next step on this path.
 
+**2026-09-30 07:21Z: the first holders named.** With the log threshold at
+2 s and a 77,800-transaction mempool, production wrote its first lines:
+`getrawmempool (excl) held 3467 ms; 2 waiting behind it`,
+`getmempoolinfo (shared) waited 2569 ms` behind it, then
+`getmempoolinfo (shared) held 2885 ms` and `held 2083 ms` with a
+`getrawmempool (excl)` waiting 2053 ms behind those. Not the 90 s stall,
+but its shape in miniature: the mempool reads hold the surface for seconds
+at a 78k pool, a SHARED holder parks the next writer, and the
+writer-preferring lock parks every reader behind that writer. The mempool
+methods are the next lane candidates, and their cost at this pool size is
+a row for the module benchmark.
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`
