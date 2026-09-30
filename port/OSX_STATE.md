@@ -4,6 +4,10 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-30 — main #343–#355 merged (`93a509e9`): the RPC lock work, Core's download shape, run 30/31 final
+
+Shared C only (no new assembly exports), so no port step. Two conflicts, both ours-against-theirs on the same lines: `rpc_node.c`'s five submit-wait loops take main's test-settable bound (`g_srt_wait_us`) and keep the ARM64 acquire fence after the ack; `test_tx_relay.c` keeps both new sections (our case 20, the gettxout wake; main's IBD announcement drop). Built and linked first time; full suite 417 PASS, 10 SKIP, 14 N/A, 0 FAIL with main's new RPC tests in. Deployed to signet and mainnet; the mainnet node serves the same RPCs the batch moved off the execution lock.
+
 ## 2026-09-28 (night, 2) — the port's debug prints removed from the shared C
 
 The x86 side's audit of `bmc_osx` against `main` (their 09-28 worklog, #341) took every shared fix and left "Darwin-guarded code, ARM64 fences and Mac-side debug printfs" behind. The printfs were the port's own debugging from the twin era, never meant to stay: `[ls-cs]` and `[wv0-cs]` env-gated hex dumps in `bitcoin_scriptverify.c` / `bitcoin_witness_v0.c`, an unconditional `[dbg-ctx]` dump of the script, prevouts and witness on every failed tapscript in `bitcoin_taproot_sighash.c`, and `ibd_pipeline.c` writing a failing block to `/tmp/ibd_bad_*.bin`. All four removed, with the includes that served only them; those files now differ from `main` only by the `BMC_TLS_BUF` thread-local shims (`ibd_pipeline.c` is identical). The covering tests (scriptverify, segwit, tapscript, taproot block diff, IBD pipeline) pass unchanged.
