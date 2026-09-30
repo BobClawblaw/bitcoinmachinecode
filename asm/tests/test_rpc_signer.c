@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <fcntl.h>      /* open: the killed fixture parks stderr on /dev/null */
+#include <unistd.h>     /* dup, dup2 */
 #include "test_tmpdir.h"
 #include "../rpc_signer.h"
 
@@ -130,7 +132,19 @@ int main(void){
       char cmd[1100]; snprintf(cmd, sizeof cmd, "%s/killed", tt_workdir());
       rpc_signer_set_cmd(cmd);
       r = NULL; ec = 0;
+      /* 2026-09-30: the shell popen() runs reports its child's death on OUR
+       * stderr -- "Segmentation fault (core dumped)" -- and that is the gate
+       * auditor's crash marker verbatim. Every gate on the 29th and 30th
+       * failed gate-log-check on this one line while every test passed
+       * (gate-execlock.log, gate-attest.log, gate-dlinfo.log, gate-prefix.log),
+       * and a rule that ignored a segfault line would blunt the auditor for
+       * the real thing. The fixture dies on purpose; stderr is parked on
+       * /dev/null for exactly this call and restored after. The test's own
+       * verdicts are on stdout, untouched. */
+      int saved_err = dup(2); int devnull = open("/dev/null", O_WRONLY);
+      if (devnull >= 0){ fflush(stderr); dup2(devnull, 2); close(devnull); }
       int rc2 = rpc_signer_enumerate(&r, &ec, &em);
+      if (saved_err >= 0){ fflush(stderr); dup2(saved_err, 2); close(saved_err); }
       ck("RPC-17: a signer killed by a signal is refused",
          rc2 == 0 && ec == -1);
       /* Which one depends on /bin/sh: dash forks the script and exits 139;
