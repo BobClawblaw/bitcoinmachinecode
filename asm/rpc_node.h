@@ -621,6 +621,8 @@ const char* rpc_node_method_at(int i);
 
 /* Dispatch a live-node method. Returns 1 (result set), 0 (error: ec and em
  * set), or -1 (not ours -- caller keeps looking). */
+int  rpc_node_method_lane(const char* method);   /* 2 = the mempool lane: no execution lock, its own mutex (2026-09-30) */
+void rpc_node_mpc_stats(long* hits, long* parses); /* the per-slot parse cache's counters; test hook */
 int rpc_node_dispatch(const char* method, const rj_val* params,
                       rj_val** result, long* ec, const char** em);
 

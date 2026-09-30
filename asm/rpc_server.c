@@ -859,14 +859,15 @@ static void exec_lock_init(void){
  * A method goes on the FAST or NOLOCK list only when its handler has been
  * made independent of what the write lock protects (see "lanes" in
  * rpc_chain.c). Adding one without that is a data race, not a slow query. */
+extern int rpc_node_method_lane(const char*) __attribute__((weak));   /* rpc_node.c: the mempool lane (2026-09-30); absent in some unit tests */
 static int rpc_method_class(const char* m){
     int lane = rpc_chain_method_lane(m);
+    if (!lane && rpc_node_method_lane) lane = rpc_node_method_lane(m);
     if (lane == 1) return RPC_CLASS_FAST;
     if (lane == 2) return RPC_CLASS_NOLOCK;
     if (!strcmp(m, "getpeerinfo") || !strcmp(m, "getconnectioncount") || !strcmp(m, "getnetworkinfo"))
         return RPC_CLASS_FAST;
-    if (!strcmp(m, "getmempoolinfo")) return RPC_CLASS_SHARED;
-    return RPC_CLASS_EXCL;
+    return RPC_CLASS_EXCL;   /* getmempoolinfo took the read side until 2026-09-30; it is in the mempool lane now */
 }
 /* Can this whole request run on the intake thread? Only when EVERY entry is
  * FAST: a single object, or a non-empty batch of them. Anything else --

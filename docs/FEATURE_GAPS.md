@@ -2360,6 +2360,32 @@ writer-preferring lock parks every reader behind that writer. The mempool
 methods are the next lane candidates, and their cost at this pool size is
 a row for the module benchmark.
 
+**2026-09-30, later: the mempool readers are cached and in a lane of their
+own.** The cost had a cause: `getmempoolinfo` summed vsize by PARSING every
+transaction in the pool on every call, and `getrawmempool` rebuilt its
+weight/RBF table the same way -- 77,800 parses per call. Core keeps the
+totals incrementally; this node's pool is shared memory the worker owns,
+so the RPC side now keeps a per-slot cache of each entry's parsed weight
+and RBF flag, keyed by the slot's txid and length: a walk of an unchanged
+pool is a memcmp per slot, and only slots that changed are parsed
+(`rpc_node.c` `mpc_weight`; `rpc_node_mpc_stats` counts hits and parses).
+And the readers no longer take the execution lock at all: `getmempoolinfo`,
+`getrawmempool`, `getmempoolentry`, `getmempoolancestors`,
+`getmempooldescendants`, `gettxspendingprevout` and `getmempoolcluster` are
+the *mempool lane* (`rpc_node_method_lane` = 2, NOLOCK in the server),
+serialised by their own recursive mutex inside `rpc_node_dispatch`; they
+read the pool under its own lock and share only this file's per-call
+tables, the slot cache and one static block buffer, none of which a
+write-locked handler touches. A slow `getrawmempool` now waits only its
+own kind. `tests/test_rpc_node`: a second walk parses nothing and answers
+the same bytes; `tests/test_rpc_server`: the lock-class rows;
+`tests/test_rpc_responsive`: both answer in 0.1 ms under the held write lock
+(with the lane removed, 549 ms). They are NOLOCK, not FAST: served by the
+worker threads, so six queued waits on four threads still delay them, as
+any NOLOCK call. What remains on the exclusive lock from the pollers' set:
+`getblock`, `getrawtransaction`, `getblockstats`, `gettxout`, and the
+facade's and REST's own dispatch (`esp_lock`).
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`
