@@ -891,11 +891,16 @@ Outside the chain directory: `<datadir>/bitcoin.conf` or
   switches it off) logs one line from the process that waited or held,
   naming the site (the worker's or child's function, or the RPC method) and
   the pid: `... getrawtransaction (pid 12602) waited 3467 ms; the holder was
-  tx_accept_block_connect_h/rm/reindex (pid 12606, held 3450 ms); 2 still
-  waiting`, and the holder's own `... tx_accept_block_connect_h (pid 12606)
+  tx_accept_block_connect_h/rm/reindex (pid 12606, held 3450 ms); 0 other
+  take(s) went by during the wait, the longest of them held 3450 ms (...);
+  2 still waiting`, and the holder's own `... tx_accept_block_connect_h (pid 12606)
   held 3450 ms (waited 0 ms): fest_begin 0 ms, mark 118 ms, remove_marked 0
   ms, rm/seq 12 ms, ..., rm/reindex 2900 ms, seq_C 1 ms; 2 waiting behind
   it` -- the steps are block connect's passes, so the line says which one.
+  A wait with *many* takes gone by and a short longest hold is a convoy of
+  short holds (`... waited 1193 ms; the holder was tx_accept_validate (pid
+  12631, held 3 ms); 101 other take(s) went by during the wait, the longest
+  of them held 5 ms ...`), not one slow holder: the remedy differs.
   Each line is written by the process that waited or held, on its stderr,
   which every process of the node shares (the worker's, a serve child's and
   the RPC process's lines land in the same log, interleaved).

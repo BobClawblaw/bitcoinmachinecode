@@ -109,6 +109,14 @@ typedef struct {
     uint32_t last_pid;
     long     last_held_ms;
     char     last_site[96];
+    /* 2026-09-30 (x86's first lines): a wait can be a CONVOY of short holds
+     * rather than one long one, and the last release cannot tell them
+     * apart. So: every take counts, and while anyone is waiting each
+     * release keeps the longest hold of the convoy; a waiter's line reports
+     * how many takes went by during its wait and that longest hold. */
+    uint64_t takes;                  /* every take, under the lock */
+    long     conv_max_ms;            /* the longest hold released while someone waited */
+    char     conv_max_site[96];
 } mp_lockpage_t;
 static mp_lockpage_t*   g_mp_page  = 0;
 static pthread_mutex_t* g_mp_mutex = 0;   /* &g_mp_page->lk.mu */
@@ -311,6 +319,7 @@ void mp_lock_at(const char* site){
         site = sitebuf[0] ? sitebuf : "(unnamed)";
     }
     struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0);
+    uint64_t takes0 = __atomic_load_n(&g_mp_page->takes, __ATOMIC_SEQ_CST);
     __atomic_add_fetch(&g_mp_page->waiting, 1, __ATOMIC_SEQ_CST);
 #ifdef __APPLE__
     int r = mp_rlock_lock(MP_RL);
@@ -324,6 +333,13 @@ void mp_lock_at(const char* site){
     /* the release that let us in, read before we overwrite the holder fields */
     uint32_t last_pid = g_mp_page->last_pid; long last_ms = g_mp_page->last_held_ms;
     char last[96]; snprintf(last, sizeof last, "%s", g_mp_page->last_site[0] ? g_mp_page->last_site : "(none yet)");
+    /* the convoy this wait sat through: takes that went by, and the longest
+     * hold released while someone was waiting; the last waiter out resets it */
+    __atomic_add_fetch(&g_mp_page->takes, 1, __ATOMIC_SEQ_CST);
+    uint64_t went_by = g_mp_page->takes - takes0 - 1;
+    long conv_ms = g_mp_page->conv_max_ms;
+    char conv[96]; snprintf(conv, sizeof conv, "%s", g_mp_page->conv_max_site[0] ? g_mp_page->conv_max_site : "?");
+    if (__atomic_load_n(&g_mp_page->waiting, __ATOMIC_SEQ_CST) == 0){ g_mp_page->conv_max_ms = 0; g_mp_page->conv_max_site[0] = 0; }
     g_mp_page->holder_pid = (uint32_t)getpid();
     g_mp_page->holder_since_ns = (uint64_t)g_ml_took.tv_sec * 1000000000ull + (uint64_t)g_ml_took.tv_nsec;
     ml_holder_site_set(NULL);
@@ -343,8 +359,9 @@ void mp_lock_at(const char* site){
     long thr = ml_log_ms();
     if (thr > 0 && g_ml_waited_ms >= thr){
         char line[640];
-        snprintf(line, sizeof line, "[mempool] pool lock: %s (pid %d) waited %ld ms; the holder was %s (pid %u, held %ld ms); %u still waiting",
-                 site, (int)getpid(), g_ml_waited_ms, last, (unsigned)last_pid, last_ms, (unsigned)g_mp_page->waiting);
+        snprintf(line, sizeof line, "[mempool] pool lock: %s (pid %d) waited %ld ms; the holder was %s (pid %u, held %ld ms); %llu other take(s) went by during the wait, the longest of them held %ld ms (%s); %u still waiting",
+                 site, (int)getpid(), g_ml_waited_ms, last, (unsigned)last_pid, last_ms,
+                 (unsigned long long)went_by, conv_ms, conv, (unsigned)g_mp_page->waiting);
         ml_log_line(line);
     }
 }
@@ -359,6 +376,10 @@ void mp_unlock(void){
     /* the last release, for the next taker's line; then free */
     g_mp_page->last_pid = (uint32_t)getpid();
     g_mp_page->last_held_ms = held;
+    if (__atomic_load_n(&g_mp_page->waiting, __ATOMIC_SEQ_CST) && held >= g_mp_page->conv_max_ms){
+        g_mp_page->conv_max_ms = held;
+        memcpy(g_mp_page->conv_max_site, g_mp_page->holder_site, sizeof g_mp_page->conv_max_site);
+    }
     memcpy(g_mp_page->last_site, g_mp_page->holder_site, sizeof g_mp_page->last_site);
     g_mp_page->holder_pid = 0; g_mp_page->holder_site[0] = 0;
     unsigned waiting = g_mp_page->waiting;

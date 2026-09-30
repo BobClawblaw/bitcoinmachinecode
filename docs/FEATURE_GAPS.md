@@ -2415,6 +2415,20 @@ cross-process naming (a forked holder), the threshold and the no-op cases
 (OPERATIONS.md, "Logging"). The next block-time stall names its pass; the
 fix follows the name, not the other way round.
 
+*Night:* x86's first lines (their 23:00Z resume) were a **convoy**, not a
+holder -- during the mempool.dat reload two waiters saw ~1.2 s while the
+releases that let them in had held 0 and 3 ms, and nobody logged a hold:
+the wait was many short holds, and a line that names only the last
+releaser cannot say so. Now every take is counted in the lock's page, each
+release made while anyone waits keeps the convoy's longest hold and its
+site, and a waiter's line adds `N other take(s) went by during the wait,
+the longest of them held M ms (site)`: many takes and a short longest hold
+is a convoy (`test_mempool_lock_log` case E: three threads taking 3 ms
+holds back to back, the waiter reports 101 takes gone by, longest 3 ms,
+wait 374 ms), zero takes and a long one is a holder. The remedies differ
+-- a convoy is fixed by fewer takes per unit of work (the reload's
+per-transaction takes are x86's suspect), a holder by a shorter hold.
+
 And the one exclusive handler that consults the pool on every poll --
 `getrawtransaction`, the facade's second most-dispatched call, which asks
 the mempool before the index as Core does -- no longer holds the execution
