@@ -2301,6 +2301,32 @@ or the facade/REST route plus the method it dispatched, and, for a waiter, the
 last exclusive holder (OPERATIONS.md, "Logging"). `tests/test_rpc_responsive`
 holds the write side and checks both lines. The next stall names itself.
 
+**2026-09-30: the one wait with a 90 s signature no longer holds the lock.**
+Every handler that waits on the WORKER -- another process, through the
+submit channel (`sendrawtransaction`, `submitpackage`, `testmempoolaccept`,
+`importmempool`), the block channel (`submitblock`, a `getblocktemplate`
+proposal) and the control channel (`addnode`, `setban`, `disconnectnode`) --
+spun for the worker's ack with the execution lock held, and the worker picks
+those channels up only at the top of its serve loop, which at a new block is
+inside the block's passes (each leg allowed 60 s). A broadcast landing in
+that window parked the whole surface for up to `SRT_WAIT_MS` = 90 s -- the
+size and the timing of all four stalls. `rpc_node.c` now takes the channel
+mutex through `submit_lock()` / `submit_unlock()`, which release the
+execution lock around the wait and take it back in the class it held
+(`rpc_server.c` `rpc_exec_yield_begin` / `_end`); a second submitter waits on
+the channel mutex, not on the surface. What a handler reads after the wait
+is its own (the reply buffers went from static to local or thread-local; the
+two package handlers hold the mutex from their parse to their reply, since
+their staging arrays are static). `tests/test_rpc_responsive` scenario E:
+with a status block nobody answers and the wait cut to 2.5 s, every trivial
+method and an exclusive `getblockhash` answer within 100 ms while a
+`sendrawtransaction` waits, the submit then times out honestly (-4), and
+the yield counter moved; with the yield made a no-op, `getblockhash` waited
+2,473 ms -- the stall, reproduced. The submitter itself still waits up to
+90 s; the worker servicing the channel between legs (not only at the top of
+its rotation) is the next step, and the #348 line names the holder if the
+next stall is something else.
+
 ### The wallet has no reorg awareness (WAL-13)
 
 `wallet_scan.c`'s on-disk record is `u32 height | txid | vout | value`

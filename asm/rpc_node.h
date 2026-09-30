@@ -510,6 +510,7 @@ typedef struct {
 void rpc_node_set_status(const node_status_t* st);
 void rpc_node_set_user_agent(const char* ua);   /* -uacomment: getnetworkinfo subversion */
 void rpc_node_set_status_rw(node_status_t* st);
+void rpc_node_set_submit_wait_ms_for_test(long ms);   /* the submit channel's ack wait; 0 restores the shipped 90 s (2026-09-30) */
 
 /* Hand the RPC layer the SHARED mempool (daemon/mempool_cfg.c's MAP_SHARED
  * pre-fork region) so getrawmempool/getmempoolinfo/getmempoolentry report the

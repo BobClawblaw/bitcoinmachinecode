@@ -81,6 +81,18 @@ static int rpc_wrong_type(long* ec, const char** em, char* buf, size_t cap,
 static const node_status_t* g_status;
 static node_status_t*       g_status_rw;     /* writable handle for submission */
 static pthread_mutex_t      g_submit_lock = PTHREAD_MUTEX_INITIALIZER;
+/* 2026-09-30: every take of the submit channel's mutex releases the RPC
+ * execution lock first and takes it back after the release (rpc_server.c
+ * rpc_exec_yield_*): a handler spinning for the worker's ack must not park
+ * the whole surface behind it. Weak: the standalone bitcoin_rpcd and the unit
+ * tests link this file without the server, where there is no lock to yield.
+ * Everything a handler reads AFTER submit_unlock() must be its own -- a
+ * local, or copied out under the mutex -- because another thread's handler
+ * runs during the wait. */
+extern void rpc_exec_yield_begin(void) __attribute__((weak));
+extern void rpc_exec_yield_end(void) __attribute__((weak));
+static void submit_lock(void){ if (rpc_exec_yield_begin) rpc_exec_yield_begin(); pthread_mutex_lock(&g_submit_lock); }
+static void submit_unlock(void){ pthread_mutex_unlock(&g_submit_lock); if (rpc_exec_yield_end) rpc_exec_yield_end(); }
 
 void rpc_node_set_status(const node_status_t* st){ g_status = st; }
 /* -uacomment: the runtime user agent main.c built (getnetworkinfo subversion). */
@@ -1152,7 +1164,7 @@ static int cmd_getmempoolinfo(rj_val** res){
 
 static int ctl_send(int op, const char* arg, long long num,
                     long* ec, const char** em, int* result_out, char* out, size_t outcap){
-    static char reason[128];
+    char reason[128];                               /* 2026-09-30: read after the wait, so not shared */
     if (!g_status_rw){
         *ec = -4;
         *em = "peer control is unavailable: no download worker is attached, so "
@@ -1160,7 +1172,7 @@ static int ctl_send(int op, const char* arg, long long num,
         return 0;
     }
     node_status_t* s = g_status_rw;
-    pthread_mutex_lock(&g_submit_lock);
+    submit_lock();
     snprintf((char*)s->ctl_arg, sizeof s->ctl_arg, "%s", arg ? arg : "");
     s->ctl_num = num;
     s->ctl_op = op;
@@ -1182,10 +1194,10 @@ static int ctl_send(int op, const char* arg, long long num,
         struct timespec ts = {0, CTL_POLL_US * 1000L}; nanosleep(&ts, NULL);
         waited += CTL_POLL_US;
     }
-    pthread_mutex_unlock(&g_submit_lock);
+    submit_unlock();
     if (!done){ *ec = -4; *em = "the download worker did not answer the control request"; return 0; }
     if (result < 0){
-        static char embuf[160];
+        static __thread char embuf[160];            /* returned through *em: per thread (2026-09-30) */
         snprintf(embuf, sizeof embuf, "%s", reason[0] ? reason : "peer control failed");
         *ec = result; *em = embuf;
         return 0;
@@ -2285,11 +2297,11 @@ static long sbk_stage(const char* hex, int proposal, int* result,
     unsigned long n = (unsigned long)(hl/2);
     if (!g_status_rw) return -1;
 
-    pthread_mutex_lock(&g_submit_lock);
+    submit_lock();
     node_status_t* st = g_status_rw;
     for (unsigned long i = 0; i < n; i++){
         int hi = srt_hex1(hex[i*2]), lo = srt_hex1(hex[i*2+1]);
-        if (hi < 0 || lo < 0){ pthread_mutex_unlock(&g_submit_lock); return -2; }
+        if (hi < 0 || lo < 0){ submit_unlock(); return -2; }
         st->blk_submit_buf[i] = (unsigned char)((hi<<4)|lo);
     }
     st->blk_submit_len = n;
@@ -2314,7 +2326,7 @@ static long sbk_stage(const char* hex, int proposal, int* result,
         struct timespec ts = {0, SBK_POLL_US*1000L}; nanosleep(&ts, NULL);
         waited += SBK_POLL_US;
     }
-    pthread_mutex_unlock(&g_submit_lock);
+    submit_unlock();
     return done ? 1 : -3;
 }
 
@@ -2332,7 +2344,7 @@ static int cmd_submitblock(const rj_val* params, rj_val** res, long* ec, const c
         params->items[0]->typ != RJ_STR){
         *ec = -1; *em = "submitblock requires a hex block"; return 0; }
     int result = 0;
-    static char reason[64]; reason[0] = 0;
+    char reason[64]; reason[0] = 0;                 /* 2026-09-30: filled under the mutex, read after it */
     long r = sbk_stage(params->items[0]->str, 0, &result, reason, sizeof reason);
     if (r == -2){ *ec = -22; *em = "Block decode failed"; return 0; }
     if (r == -1){ *ec = -4; *em = "Block submission unavailable (no download worker)"; return 0; }
@@ -2446,6 +2458,9 @@ static int cmd_getprioritisedtransactions(rj_val** res){
  * daemon (which has the worker + peer legs); the standalone bitcoin_rpcd has no
  * worker, so g_status_rw is NULL and this reports the node as unavailable. */
 #define SRT_WAIT_MS   90000     /* worker pickup can wait behind a 60s leg sync */
+/* the submit wait in microseconds; a test shortens it (2026-09-30) */
+static long g_srt_wait_us = SRT_WAIT_MS * 1000L;
+void rpc_node_set_submit_wait_ms_for_test(long ms){ g_srt_wait_us = ms > 0 ? ms * 1000L : SRT_WAIT_MS * 1000L; }
 #define SRT_POLL_US   500       /* was 3000: a 10k-entry mempool.dat reload took ~20 min at the submitter's poll rate (2026-09-01) */
 
 /* ==== savemempool / importmempool -- Core's mempool.dat ====================
@@ -2639,8 +2654,8 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
       if (c0->aborted){ c0->rejected++; c0->rej_other++; return 0; } }   /* aborted: drain the rest */
     if (!g_status_rw) return -1;
     node_status_t* st = g_status_rw;
-    pthread_mutex_lock(&g_submit_lock);
-    if (len > RPC_TXSUBMIT_MAX){ pthread_mutex_unlock(&g_submit_lock); c->rejected++; c->rej_other++; return 0; }
+    submit_lock();
+    if (len > RPC_TXSUBMIT_MAX){ submit_unlock(); c->rejected++; c->rej_other++; return 0; }
     memcpy((void*)st->tx_submit_buf, tx, len);
     st->tx_submit_len = len;
     st->tx_submit_test = 0;
@@ -2650,7 +2665,7 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
     __sync_synchronize();
     st->tx_submit_seq = myseq;
     int waited = 0, ok = 0, acked = 0;
-    while (waited < SRT_WAIT_MS*1000){
+    while (waited < g_srt_wait_us){
         if (st->tx_submit_ack == myseq){ ok = (st->tx_submit_result == 1); acked = 1; break; }
         if (g_mpd_shutdown_flag && *g_mpd_shutdown_flag){ c->aborted = 1; c->abort_why = "shutdown requested"; break; }
         struct timespec ts = {0, MPD_POLL_US*1000L}; nanosleep(&ts, NULL);   /* the worker acks within ~0.5 ms once it is servicing the stream */
@@ -2687,7 +2702,7 @@ static int mpd_import_one(void* vctx, const unsigned char* tx, unsigned long len
         else if (why[0])                  why_class = 5;
         else                              why_class = 6;
     }
-    pthread_mutex_unlock(&g_submit_lock);
+    submit_unlock();
     #define MPD_COUNT_REFUSAL() do { switch (why_class){ \
             case 1: c->rej_noack++;    break; case 2: c->rej_missing++;  break; \
             case 3: c->rej_conflict++; break; case 5: c->rej_policy++;   break; \
@@ -2811,19 +2826,19 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     if ((hl & 1) || hl/2 == 0 || hl/2 > RPC_TXSUBMIT_MAX){ *ec = -22; *em = "TX decode failed"; return 0; }
     unsigned long n = (unsigned long)(hl/2);
     static unsigned char stage[RPC_TXSUBMIT_MAX];   /* under g_submit_lock */
-    static char          txidhex[65];
-    static char          reason[128];
+    char                 txidhex[65];               /* 2026-09-30: read after the wait, so not shared */
+    char                 reason[128];
 
     if (!g_status_rw){ *ec = -4; *em = "Transaction relay unavailable (no download worker)"; return 0; }
 
-    pthread_mutex_lock(&g_submit_lock);
+    submit_lock();
     int okhex = 1;
     for (unsigned long i=0;i<n;i++){ int hi=srt_hex1(hex[i*2]),lo=srt_hex1(hex[i*2+1]); if(hi<0||lo<0){okhex=0;break;} stage[i]=(unsigned char)((hi<<4)|lo); }
-    if (!okhex){ pthread_mutex_unlock(&g_submit_lock); *ec=-22; *em="TX decode failed"; return 0; }
+    if (!okhex){ submit_unlock(); *ec=-22; *em="TX decode failed"; return 0; }
 
     /* txid for the success result (display order) */
     { unsigned char id[32]; static unsigned char scratch[RPC_TXID_SCRATCH];   /* RPC-20 */
-      if (!tx_txid(id, stage, n, scratch, sizeof scratch)){ pthread_mutex_unlock(&g_submit_lock); *ec=-22; *em="TX decode failed"; return 0; }
+      if (!tx_txid(id, stage, n, scratch, sizeof scratch)){ submit_unlock(); *ec=-22; *em="TX decode failed"; return 0; }
       static const char* HEXD = "0123456789abcdef";
       for (int i=0;i<32;i++){ unsigned char b=id[31-i]; txidhex[i*2]=HEXD[b>>4]; txidhex[i*2+1]=HEXD[b&15]; }
       txidhex[64]=0; }
@@ -2834,7 +2849,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
      * Tor/I2P connections instead of entering the mempool; refused up front when
      * neither anonymity network is reachable (Core's exact words). */
     if (s->pb_enabled && !s->pb_reachable){
-        pthread_mutex_unlock(&g_submit_lock);
+        submit_unlock();
         *ec = -1;
         *em = "-privatebroadcast is enabled, but none of the Tor or I2P networks is "
               "reachable. Maybe the location of the Tor proxy couldn't be retrieved "
@@ -2858,7 +2873,7 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
     /* wait for the worker to ack this exact seq */
     int waited = 0, done = 0, result = 0;
     reason[0] = 0;
-    while (waited < SRT_WAIT_MS*1000){
+    while (waited < g_srt_wait_us){
         if (s->tx_submit_ack == myseq){
             result = s->tx_submit_result;
             memcpy(reason, (const void*)s->tx_submit_reason, sizeof reason);
@@ -2868,12 +2883,12 @@ static int cmd_sendrawtransaction(const rj_val* params, rj_val** res, long* ec, 
         struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
         waited += SRT_POLL_US;
     }
-    pthread_mutex_unlock(&g_submit_lock);
+    submit_unlock();
 
     if (!done){ *ec=-4; *em="Transaction submission timed out"; return 0; }
     if (result == 1){ *res = rj_str(txidhex); return 1; }
     /* worker put a negative Core error code in result and the reason text */
-    static char embuf[160];
+    static __thread char embuf[160];                /* returned through *em: per thread since the wait released the lock (2026-09-30) */
     snprintf(embuf, sizeof embuf, "%s", reason[0] ? reason : "transaction rejected");
     *ec = result < 0 ? result : -26; *em = embuf;
     return 0;
@@ -2915,7 +2930,7 @@ static int tma_stage(node_status_t* s, const unsigned char* tx, unsigned long n,
     __sync_synchronize();
     s->tx_submit_seq = myseq;
     int waited = 0;
-    while (waited < SRT_WAIT_MS*1000){
+    while (waited < g_srt_wait_us){
         if (s->tx_submit_ack == myseq){
             *result_out = s->tx_submit_result;
             *fee_out = s->tx_submit_fee;
@@ -2985,6 +3000,7 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
         *ec = -4; *em = "no download worker is attached, so nothing can validate a package"; return 0; }
 
     int n = (int)list->nitems;
+    submit_lock();   /* 2026-09-30: from here to the reply -- raw/off/tlen and the r_* arrays are statics read after the wait */
     static unsigned char raw[RPC_TXSUBMIT_MAX];
     static unsigned long off[RPC_PKG_MAX];
     static unsigned long tlen[RPC_PKG_MAX];
@@ -2992,20 +3008,19 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
     for (int i = 0; i < n; i++){
         const rj_val* e = list->items[i];
         if (!e || e->typ != RJ_STR || !e->str){
-            *ec = -22; *em = "TX decode failed"; return 0; }
+            submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
         size_t hl = strlen(e->str);
         if (hl % 2 || hl/2 == 0 || total + hl/2 > sizeof raw){
-            *ec = -22; *em = "TX decode failed"; return 0; }
+            submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
         for (size_t k = 0; k < hl/2; k++){
             int a = srt_hex1(e->str[k*2]), b = srt_hex1(e->str[k*2+1]);
-            if (a < 0 || b < 0){ *ec = -22; *em = "TX decode failed"; return 0; }
+            if (a < 0 || b < 0){ submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
             raw[total + k] = (unsigned char)((a<<4)|b);
         }
         off[i] = total; tlen[i] = hl/2; total += hl/2;
     }
 
     node_status_t* st = g_status_rw;
-    pthread_mutex_lock(&g_submit_lock);
     memcpy((void*)st->tx_submit_buf, raw, total);
     st->tx_submit_len = total;
     st->tx_submit_test = 0;
@@ -3016,7 +3031,7 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
     __sync_synchronize();
     st->tx_submit_seq = myseq;
     int waited = 0, got = 0;
-    while (waited < SRT_WAIT_MS*1000){
+    while (waited < g_srt_wait_us){
         if (st->tx_submit_ack == myseq){ got = 1; break; }
         struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
         waited += SRT_POLL_US;
@@ -3042,10 +3057,9 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
         if (n_replaced > 0) memcpy(replaced, (const void*)st->pkg_replaced, (size_t)n_replaced * 32);
     }
     st->tx_submit_pkg_n = 0;          /* leave the channel as a single-tx one */
-    pthread_mutex_unlock(&g_submit_lock);
 
     if (!got){
-        *ec = -4; *em = "the download worker did not answer within the submission timeout"; return 0; }
+        submit_unlock(); *ec = -4; *em = "the download worker did not answer within the submission timeout"; return 0; }
 
     rj_val* o = rj_obj();
     rj_obj_set(o, "package_msg", rj_str(pmsg[0] ? pmsg : "success"));
@@ -3096,6 +3110,7 @@ static int cmd_submitpackage(const rj_val* params, rj_val** res, long* ec, const
       }
       rj_obj_set(o, "replaced-transactions", rep); }
     *res = o;
+    submit_unlock();
     return 1;
 }
 
@@ -3121,6 +3136,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
         *ec = -8; *em = "Array must contain between 1 and 25 transactions"; return 0; }
     if (!g_status_rw){
         *ec = -4; *em = "Mempool acceptance testing unavailable (no download worker)"; return 0; }
+    submit_lock();   /* 2026-09-30: from here to the reply -- stage[][] and the r_* arrays are statics read after the wait */
 
     /* decode every transaction BEFORE staging any of them: a bad hex string
      * in the middle would otherwise leave the caller with a half-length
@@ -3128,13 +3144,13 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
     static unsigned char stage[TMA_MAX][RPC_TXSUBMIT_MAX];
     unsigned long lens[TMA_MAX];
     for (size_t i = 0; i < list->nitems; i++){
-        if (list->items[i]->typ != RJ_STR){ *ec = -22; *em = "TX decode failed"; return 0; }
+        if (list->items[i]->typ != RJ_STR){ submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
         const char* hex = list->items[i]->str; size_t hl = strlen(hex);
-        if ((hl & 1) || hl/2 < 10 || hl/2 > RPC_TXSUBMIT_MAX){ *ec = -22; *em = "TX decode failed"; return 0; }
+        if ((hl & 1) || hl/2 < 10 || hl/2 > RPC_TXSUBMIT_MAX){ submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
         lens[i] = (unsigned long)(hl/2);
         for (unsigned long k = 0; k < lens[i]; k++){
             int hi = srt_hex1(hex[k*2]), lo = srt_hex1(hex[k*2+1]);
-            if (hi < 0 || lo < 0){ *ec = -22; *em = "TX decode failed"; return 0; }
+            if (hi < 0 || lo < 0){ submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
             stage[i][k] = (unsigned char)((hi<<4)|lo);
         }
     }
@@ -3152,11 +3168,10 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
         unsigned long off[TMA_MAX]; unsigned long total = 0;
         for (int i = 0; i < n; i++){
             if (total + lens[i] > sizeof raw){
-                *ec = -22; *em = "TX decode failed"; return 0; }
+                submit_unlock(); *ec = -22; *em = "TX decode failed"; return 0; }
             memcpy(raw + total, stage[i], lens[i]);
             off[i] = total; total += lens[i];
         }
-        pthread_mutex_lock(&g_submit_lock);
         memcpy((void*)s->tx_submit_buf, raw, total);
         s->tx_submit_len   = total;
         s->tx_submit_test  = 1;          /* dry run: pass 1 only, commits nothing */
@@ -3167,7 +3182,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
         __sync_synchronize();
         s->tx_submit_seq = myseq;
         int waited = 0, got = 0;
-        while (waited < SRT_WAIT_MS*1000){
+        while (waited < g_srt_wait_us){
             if (s->tx_submit_ack == myseq){ got = 1; break; }
             struct timespec ts = {0, SRT_POLL_US*1000L}; nanosleep(&ts, NULL);
             waited += SRT_POLL_US;
@@ -3189,9 +3204,8 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
         }
         s->tx_submit_pkg_n = 0;
         s->tx_submit_test  = 0;
-        pthread_mutex_unlock(&g_submit_lock);
         if (!got){
-            *ec = -4; *em = "the download worker did not answer within the submission timeout"; return 0; }
+            submit_unlock(); *ec = -4; *em = "the download worker did not answer within the submission timeout"; return 0; }
 
         /* a package-level rejection is reported on EVERY entry, because none
          * of them got an individual verdict -- that is what Core's
@@ -3250,10 +3264,10 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
             rj_arr_push(arr, e);
         }
         *res = arr;
+        submit_unlock();
         return 1;
     }
 
-    pthread_mutex_lock(&g_submit_lock);
     for (size_t i = 0; i < list->nitems; i++){
         rj_val* e = rj_obj();
         unsigned char id[32], wid[32];
@@ -3296,7 +3310,7 @@ static int cmd_testmempoolaccept(const rj_val* params, rj_val** res, long* ec, c
         rj_arr_push(arr, e);
     }
     s->tx_submit_test = 0;
-    pthread_mutex_unlock(&g_submit_lock);
+    submit_unlock();
     *res = arr;
     return 1;
 }
