@@ -10,12 +10,12 @@ node over RPC during its sync.
 
 ## The short version
 
-| | bmc run 30 | Core v31.1 rerun #4 |
-|---|---:|---:|
-| started | 2026-09-28 06:47:10Z | 2026-09-29 13:54:00Z |
-| time to height 968,987 (run 30's end) | **4 h 54 m 30 s** | **11 h 01 m 00 s** |
-| ratio | | **bmc in 44.6% of Core's time: 2.24× faster, 55.4% ahead** |
-| capstone | MuHash of the UTXO set identical to Core's at 968,987 | — |
+| | bmc run 30 (its old settings) | bmc run 31 (matched to Core) | Core v31.1 rerun #4 |
+|---|---:|---:|---:|
+| started | 2026-09-28 06:47:10Z | 2026-09-30 01:14:07Z | 2026-09-29 13:54:00Z |
+| time to height 968,987 (run 30's end) | **4 h 54 m 30 s** | **≤ 5 h 28 m 11 s** | **11 h 01 m 00 s** |
+| ratio to Core | 44.6% of Core's time, 2.24× | ≤ 49.7%, 2.01× | |
+| capstone | MuHash identical to Core's at 968,987 | MuHash identical to Core's at 969,273 | — |
 
 The margin is flat from 350,000 to the end (55–62% ahead at every 50,000),
 and run 30's own status lines say why: its download waited on its apply for
@@ -24,8 +24,9 @@ connect blocks, and the ratio is the apply rate. Run 30 ran on the *less*
 favourable network settings of the two (8 download peers to Core's 10, a
 4,096-block window to Core's 1,024, idle legs held beside the workers);
 those defaults were matched to Core's on 2026-09-29, and run 31, the first
-bmc sync on the matched defaults, started at 01:14Z on 2026-09-30 and is in
-progress as this is written.
+bmc sync on the matched defaults, finished at 06:42Z on 2026-09-30: 2.01×
+Core, with the matched window costing bmc 11.5% against run 30 (its own
+section below says why).
 
 ## The box, the drive, the link
 
@@ -182,14 +183,57 @@ either node:
   quiesced at 968,987, its MuHash equalled Core's for the same height, and
   the live answer agreed with the indexed record.
 
-## Run 31, in progress
+## Run 31 — the first bmc sync on the matched defaults (2026-09-30 01:14:07Z to 06:42:18Z)
 
-Started 2026-09-30T01:14:07Z, main `49e26354`, on the matched defaults. Its
-log shows the three markers the matching predicts: 16 script threads, 10
-download workers derived from the outbound classes, and its 5 idle legs
-closed before the parallel download. It will be reported against Core
-rerun #4 by the same rule, time to the same height, with the bmc side's
-run-to-run spread (run 30 vs run 31) as a new row of evidence.
+Main `49e26354`, `PARITY=1`, `NICE=0`, the derived 10 download workers,
+the 1,024-block window, the idle legs closed before the parallel download
+(the log shows all three), the three indexes, `maxconnections=48`, the four
+ZMQ topics, 16 script threads. `IBD_END` at 06:42:18Z: **5 h 28 m 11 s** to
+its real tip, 969,273. Capstone **PASS**: MuHash identical to Core's at
+969,273 (`25640fa6…`), the live answer agreeing with the indexed row.
+
+| height | run 30 (old settings) | run 31 (matched) | Core #4 | run 31 ahead of Core |
+|---:|---:|---:|---:|---:|
+| 50,000 | 0:02:23 | 0:04:15 | 0:09:54 | 57% |
+| 100,000 | 0:02:45 | 0:05:48 | 0:10:43 | 46% |
+| 200,000 | 0:04:33 | 0:09:58 | 0:15:34 | 36% |
+| 300,000 | 0:09:40 | 0:16:59 | 0:29:56 | 43% |
+| 400,000 | 0:24:13 | 0:34:25 | 1:02:57 | 45% |
+| 500,000 | 0:54:17 | 1:05:55 | 2:11:51 | 50% |
+| 600,000 | 1:28:54 | 1:44:37 | 3:23:46 | 49% |
+| 700,000 | 2:10:21 | 2:29:03 | 4:53:24 | 49% |
+| 800,000 | 2:51:55 | 3:15:50 | 7:01:59 | 54% |
+| 900,000 | 4:11:32 | 4:39:32 | 9:27:42 | 51% |
+| 950,000 | 4:42:20 | 5:11:52 | 10:32:45 | 51% |
+| **968,987** | **4:54:30** | **≤ 5:28:11** | **11:01:00** | **≥ 50.3%, 2.01×** |
+
+(Run 31's end height was 286 blocks past 968,987, so its time at 968,987 is
+bounded by its end time; the periodic progress line puts it at 5:29:45,
+which lags the apply by a status interval.)
+
+**Verdict.** On settings equal to Core's, bmc synced the chain in at most
+49.7% of Core's time, 2.01× faster, with the margin 43–54% from 300,000 on.
+The capstone passed.
+
+**The matched defaults cost bmc 33 m 41 s, 11.5%, against run 30**, and
+the run's status lines say where: its download lag sat at either the full
+1,024-block window or at zero, alternating, where run 30's sat at the
+4,096 window's edge throughout. At lag zero the apply had caught the
+download and was waiting on the next chunk. bmc fetches 40-block chunks;
+inside a 1,024-block runway ten workers hold only two or three chunks of
+headroom each, so one late chunk starves the apply, and the early chain
+(small blocks, chunk latency dominant) paid most: 300,000 in 16:59 against
+9:40. Core's shape, 16 blocks in flight per peer refilled as each lands,
+copes with 1,024 because its requests are finer. The setting is now equal
+and the *shape* is the difference that remains, which is the honest
+finding: the 4,096 window was worth 11.5% to bmc, and the next
+improvement on bmc's side is finer-grained requests inside Core's window,
+not a wider window.
+
+Two other differences between the two bmc runs, neither controlled: the
+faster backhaul (run 30 ran on the repaired link, run 31 on the new one),
+and the day's peers. Stall/eviction events: 1,193 in run 31 against 1,025
+in run 30.
 
 ## Sources
 

@@ -820,7 +820,10 @@ DEST=/srv/nvme8tb/bench/run31 SRCREF=main bash validation/fresh_ibd_run.sh
 ```
 
 with nothing else set: `PARITY=1`, `NICE=0`, the derived 10 workers and the
-default `par` are the harness's defaults now. `P2P`/`RPC` default to
+default `par` are the harness's defaults now. **Run 31 ran it (2026-09-30):
+5 h 28 m 11 s, 2.01× Core rerun #4 at the same height, capstone PASS; the
+matched 1,024 window cost 11.5% against run 30's 4,096 because our 40-block
+chunks starve the apply in a short runway (`docs/reports/2026-09-30-ibd-benchmarks-bmc-vs-core.md`).** `P2P`/`RPC` default to
 8462/8461; pass others if those are taken. The Core side is
 `bitcoin-core-bench.service` as it stands.
 
