@@ -10313,11 +10313,29 @@ static void serve_download_worker(const char* dir, const char* peers[], int pool
             char storedbuf[40]; storedbuf[0]=0;
             { long pt = node_public_tip(store_buf), stt = *(int*)(store_buf+24);
               if(stt != pt) snprintf(storedbuf, sizeof storedbuf, " stored=%ld", stt); }
+            /* 2026-09-30: the tx relay's IBD gate (g_dl_in_ibd, #344) was
+             * rewritten only by the new-block choke point, so its boot value
+             * stood until the first block connected after a restart -- the
+             * Mac nodes took no announcements for the whole first inter-block
+             * gap after the #343-#355 deploy (mempool frozen at the loaded
+             * count, every leg's invs dropped whole). Refresh it here, once a
+             * heartbeat, from the tip itself; say when it flips; and while it
+             * is closed, or the tx-accept path never came up, say so in the
+             * heartbeat line, with the count of announcements dropped. */
+            char relaybuf[64]; relaybuf[0]=0;
+            { int ib = dl_tip_is_ibd();
+              if(ib != g_dl_in_ibd){
+                  fprintf(stderr, ib ? "[dl] tx announcements are dropped from here: the tip is older than maxtipage (initial block download)\n"
+                                     : "[dl] tx announcements are taken again: the tip is within maxtipage (the flag had stood at 'in IBD' since boot or the last stale tip)\n");
+                  g_dl_in_ibd = ib; }
+              extern long txrelay_ibd_dropped_count(void);
+              if(g_dl_in_ibd) snprintf(relaybuf, sizeof relaybuf, " relay=off(ibd, %ld dropped)", txrelay_ibd_dropped_count());
+              else if(!txsub_worker_ready()) snprintf(relaybuf, sizeof relaybuf, " txsub=not-ready"); }
             if(g_dialmem) fprintf(stderr,"[dial] memory: %d address(es) remembered, %llu candidate(s) skipped under backoff; blocks: %lu claimed, %lu duplicate fetch(es) avoided\n", dialmem_count(g_dialmem), (unsigned long long)g_dialmem->skips, g_inflight.claims, g_inflight.refused);
-            fprintf(stderr,"[dl] heartbeat: tip=%ld%s peers=%d/%d txouts=%ld uptime=%s%s%s\n",
+            fprintf(stderr,"[dl] heartbeat: tip=%ld%s peers=%d/%d txouts=%ld uptime=%s%s%s%s\n",
                     node_public_tip(store_buf), storedbuf, live_peers, mux_n_out,
                     utxo_live_ok?live_utxo_disp():-1L,
-                    fmt_uptime(upbuf, (now_ms-boot_ms)/1000), failbuf,
+                    fmt_uptime(upbuf, (now_ms-boot_ms)/1000), failbuf, relaybuf,
                     utxo_live_halted() ? "  [UTXO HALTED -- inconsistent after recovery; drop and rebuild]"
                     : utxo_fail_streak ? "  [UTXO DEGRADED -- retrying]" : "");
             if(g_cfg.maxuploadtarget_mb > 0)

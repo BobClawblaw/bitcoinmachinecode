@@ -4,6 +4,11 @@ Updated whenever status materially changes. Newest section top.
 (Companion to `OSX_PORT.md` (branch model), `OSX_ROADMAP.md` (per-module
 status) and `OSX_STRATEGY.md` (phased plan-of-record, PR #130).)
 
+## 2026-09-30 (afternoon) — after the #343–#355 deploy the tx relay was dead until the next block; fixed at the heartbeat
+
+Both nodes accepted nothing for 20 minutes after the restart: #344's IBD gate (`g_dl_in_ibd`, evaluated once at boot in the parent and otherwise rewritten only when a new block connects) had stood at "in IBD" since boot. Found by the absence of `[tx_accept]` lines and a mempool frozen at the loaded count while the legs' inv bytes kept arriving unrequested. The heartbeat now refreshes the flag from the tip and prints `relay=off(ibd, N dropped)` while it is closed; the first heartbeat of the fixed build flipped it on both nodes and relay resumed (+214 accepted on mainnet in the next window). Note item 21 for the x86 side, which has the same code. The signet health gate in my deploy script was also too strict (it demanded an accepted-tx line inside the first minute, which a quiet signet mempool cannot promise) — the second deploy went on heartbeat + clean log, which is the real evidence.
+- **Full suite:** 416 PASS, 10 SKIP, 14 N/A, 1 FAIL — `test_cmpct_recv`'s 3× timing ratio, measured while both nodes restarted under the suite; PASS three times alone.
+
 ## 2026-09-30 — main #343–#355 merged (`93a509e9`): the RPC lock work, Core's download shape, run 30/31 final
 
 Shared C only (no new assembly exports), so no port step. Two conflicts, both ours-against-theirs on the same lines: `rpc_node.c`'s five submit-wait loops take main's test-settable bound (`g_srt_wait_us`) and keep the ARM64 acquire fence after the ack; `test_tx_relay.c` keeps both new sections (our case 20, the gettxout wake; main's IBD announcement drop). Built and linked first time; full suite 417 PASS, 10 SKIP, 14 N/A, 0 FAIL with main's new RPC tests in. Deployed to signet and mainnet; the mainnet node serves the same RPCs the batch moved off the execution lock.
